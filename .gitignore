@@ -150,3 +150,6 @@ dist
 .pnp.*
 tmp/
 *.pdf
+
+# OpenAPI cache (generated at runtime)
+api/
