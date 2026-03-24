@@ -1,6 +1,6 @@
 # Design: Native Engine Test Setup
 
-**Status:** Proposed  
+**Status:** Approved — implementation authorised. Update to `Implemented` when authoritative docs are updated.  
 **Author:** Axle (Engine Developer)  
 **Date:** 2025-07-11  
 **Backlog item:** Engine — Test setup design

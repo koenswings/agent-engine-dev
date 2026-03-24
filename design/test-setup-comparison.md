@@ -1,6 +1,6 @@
 # Comparison: Docker Battery vs Native Engine Test Setup
 
-**Status:** Decision pending  
+**Status:** Approved — Proposal B selected. See `design/test-setup-native.md` for the adopted design.  
 **Author:** Axle (Engine Developer)  
 **Date:** 2025-07-11
 

@@ -67,6 +67,15 @@ pnpm test                             # Run tests
 - `src/data/Instance.ts` — app instance building and startup
 - `src/store/` — Automerge state management
 
+## Documentation Rules
+
+- **Implementing a design?** The same PR must: (1) update the relevant authoritative doc
+  (`docs/ARCHITECTURE.md` or similar) to reflect what was built, and (2) update the
+  design doc status to `Implemented`. These are not optional follow-ups.
+- Authoritative docs (`docs/`) describe only what is implemented — present tense, no
+  future-tense sections or `[planned]` blocks.
+- Design proposals live in `design/`. See `design/README.md` for the full convention.
+
 ## Safety Rules
 
 - Never run destructive commands (`reset-engine --all`, `rm -rf`) without explicit confirmation

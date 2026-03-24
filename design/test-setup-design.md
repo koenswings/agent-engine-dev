@@ -1,6 +1,6 @@
 # Design: Automated Test Setup
 
-**Status:** Proposed  
+**Status:** Superseded — Proposal B (native engine) was chosen. See `design/test-setup-native.md`.  
 **Author:** Axle (Engine Developer)  
 **Date:** 2025-07-11  
 **Backlog item:** Engine — Test setup design
