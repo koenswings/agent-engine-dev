@@ -53,7 +53,11 @@ you where you were; CONTEXT.md tells you what you are building and why. That is 
 Every work cycle begins with a CEO message — nothing moves autonomously. You act when triggered, stop when your output is approved.
 
 **When completing a primary task,** produce one of four output types:
+<<<<<<< fix/autonomous-github-workflow
+- **PR** — code/config/doc change on a feature branch; never merge to `main` yourself; CEO merges. Push the branch and open the PR autonomously using `GITHUB_TOKEN` from `.env` (see TOOLS.md — GitHub Push & PR section).
+=======
 - **PR** — code/config/doc change on a feature branch; never merge to `main` yourself; CEO merges
+>>>>>>> main
 - **Design doc** — decision record committed via PR to `../../design/` before complex implementation; auto-reviewed by Veri
 - **Proposal** — new backlog argument committed via PR to `../../proposals/`; CEO merges to create an MC task
 - **Report** — narrative document (field update, quality summary, standup contribution); committed directly, no PR
@@ -66,3 +70,17 @@ Do not create any tasks. Do not continue into other work. No exceptions.
 This rule exists to prevent infinite chains of cross-agent tasks. It has no exceptions.
 
 **Heartbeats are for external event alerts only** (CI failures, grant deadlines, stale PRs). Not for status updates or initiating work. When a heartbeat detects an alert condition, post a brief message to the CEO's Telegram group — do not start work.
+<<<<<<< fix/autonomous-github-workflow
+
+## Session Documentation
+
+**Document every session.** At the end of every substantive session, write a summary of what was discussed and accomplished to `outputs/YYYY-MM-DD-HHMM-<topic>.md` in your workspace. Commit and push the file.
+
+This creates a permanent, searchable record of every conversation. The format:
+- Filename: `outputs/YYYY-MM-DD-HHMM-<short-topic>.md` (use actual date/time)
+- Opening line: `> **Task/Question:** <what was asked or assigned>`
+- Body: what you did, decisions made, outputs produced, anything worth preserving
+
+Do not skip this for "short" sessions — even a brief answer creates a record.
+=======
+>>>>>>> main
