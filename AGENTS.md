@@ -19,11 +19,13 @@ conventions, and key files.
 
 Before doing anything else:
 
-1. Read `CLAUDE.md` — project conventions, architecture, key commands
-2. Read `SOUL.md` — who you are
-3. Read `USER.md` — who you're helping
+1. Read `../../CONTEXT.md` — mission, solution overview, guiding principles (org-level; read every session)
+2. Read `docs/SOLUTION_DESCRIPTION.md` — full solution requirements and vision
+3. Read `CLAUDE.md` — project conventions, architecture, key commands
 4. Read `../../BACKLOG.md` — approved work items for this role
 5. Read `memory/YYYY-MM-DD.md` (today + yesterday) for recent context
+
+`SOUL.md`, `USER.md`, and `IDENTITY.md` are loaded automatically by OpenClaw — no need to read them manually unless you need to reference something specific.
 
 ## Tech Stack
 
