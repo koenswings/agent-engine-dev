@@ -66,6 +66,12 @@ first-class feature. Tests gracefully skip if no peers are found, so the suite r
 runnable on a single machine. Remote Pi control uses SSH or the engine's own command
 system — the same path used in production.
 
+App distribution across engines uses sorted round-robin: fixtures are sorted by appId,
+then assigned `engines[i % N]`. This is deterministic, balanced, and requires no
+configuration. It scales gracefully — if there are more engines than apps, the extra
+engines still run startup and sync tests; if there are more apps than engines, some
+engines host multiple instances (a realistic and useful scenario to test).
+
 **Winner: B for realism, A for reproducibility.** B tests the actual peer discovery
 path. A can run anywhere without hardware. The right choice depends on how important
 mDNS coverage is and whether a Pi battery is available.
@@ -199,6 +205,37 @@ The failure modes that actually matter are:
 
 ---
 
+### 9. Offline / Field Diagnostic Capability
+
+**A — Docker Battery**
+
+Not applicable. The battery requires Docker containers wrapping the engine — that
+infrastructure is not available on a production Pi in a school. No diagnostic mode
+is possible with this approach.
+
+**B — Native Engine**
+
+The test harness can run in **diagnostic mode** (`pnpm test:diagnostic`) directly on a
+production Pi. Because `testMode: true` only skips `sudo mount/umount`, and app disks
+are already physically mounted at `/disks/<device>/`, the harness can replay dock/undock
+events via the `/dev/engine/<device>` sentinel file without touching the actual mount.
+The disk stays mounted; the engine re-processes it exactly as it would after a real
+plug event.
+
+The diagnostic:
+- Discovers all currently mounted disks
+- Cycles each disk (undock → dock via sentinel) and waits for the instance to reach `Running`
+- Runs HTTP smoke tests against each restarted app — no internet, no image pulls required
+- Checks mDNS sync if peer engines are present
+- Reports per-app pass/fail
+
+This gives technicians a tool to verify a school setup on-site, and gives the engine a
+self-test capability that runs on real hardware against real data.
+
+**Winner: B by a large margin.** A has no equivalent capability.
+
+---
+
 ## Recommendation
 
 **Choose B (Native Engine).**
@@ -227,6 +264,7 @@ Before deciding, answer these:
 2. Is a Pi battery (2–3 devices) available for permanent test infrastructure?
 3. How important is it to test mDNS discovery in the automated suite?
 4. Are app startup failures and real Docker behaviour considered in scope for `pnpm test`?
+5. Do technicians need a tool to verify and diagnose production engines in the field?
 
-If the answer to 2, 3, and 4 is yes: choose **B**.  
+If the answer to 2, 3, 4, and 5 is yes: choose **B**.  
 If CI must run on cloud and Pi hardware is not available: choose **A** for CI, **B** for Pi lab.

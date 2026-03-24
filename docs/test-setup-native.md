@@ -222,21 +222,123 @@ export const skipIfNoPeers = (peers: string[]): void => {
 
 ---
 
+## Multi-Engine App Assignment
+
+When running Tier 2 tests with N engines and M app disks (fixtures), the harness must
+decide which fixture goes to which engine. The goal: deterministic, balanced, and
+trivially scalable.
+
+**Scheme: sorted round-robin**
+
+Sort all app fixture identifiers alphabetically, then assign by index modulo engine
+count:
+
+```typescript
+// test/harness/networkDiscovery.ts
+
+export const assignAppsToEngines = (
+    apps: AppFixture[],
+    engines: EngineHost[],
+): Array<{ app: AppFixture; engine: EngineHost }> => {
+    const sorted = [...apps].sort((a, b) => a.appId.localeCompare(b.appId))
+    return sorted.map((app, i) => ({ app, engine: engines[i % engines.length] }))
+}
+```
+
+This scales to any N and M:
+
+| Situation | Result |
+|---|---|
+| N = 1 | All apps on local engine — degrades to Tier 1 |
+| N = M | One app per engine — cleanest case |
+| N < M | Some engines host multiple apps — tests concurrent instance lifecycle |
+| N > M | Some engines get no apps — still tested for startup, mDNS, and sync |
+
+The harness docks each fixture to its assigned engine. For remote engines this is done
+via SSH: copy the fixture directory to the Pi, then touch the sentinel file. For the
+local engine the existing `diskSim.ts` helpers are used directly.
+
+---
+
+## Diagnostic Mode (Offline / Field)
+
+A production engine in a school can be tested in the field — no internet, no fixture
+disks, no CI. The diagnostic mode reuses the same harness infrastructure but operates
+on the real system as found.
+
+**Key principle:** `testMode: true` skips `sudo mount/umount` only. In the field, app
+disks are already physically mounted at `/disks/<device>/`. Enabling `testMode`
+therefore lets the harness replay dock/undock events via the `/dev/engine/<device>`
+sentinel file without touching the actual mount. The disk stays mounted; the engine
+just re-processes it.
+
+`testMode` serves double duty:
+- **Dev/CI:** disk content is a fixture directory; sentinel triggers first processing
+- **Field diagnostic:** disk content is real (already mounted); sentinel triggers
+  re-processing without unmounting — the OS mount is never touched
+
+**Running a diagnostic:**
+```bash
+pnpm test:diagnostic
+```
+
+This switches the harness into discovery mode:
+
+1. **Discover** — enumerate currently mounted disks from `/disks/` and from Automerge
+   store (so peers' disks are included if engines are networked)
+2. **Cycle** — for each local disk: remove sentinel → wait for instance to stop →
+   recreate sentinel → wait for instance to reach `Running`
+3. **Smoke test** — run HTTP health checks against each restarted instance; no image
+   pulls, no network required
+4. **Sync check** — if mDNS peers are present, confirm that the cycled disk's
+   Automerge state propagates to at least one peer within the discovery window
+5. **Report** — per-app pass/fail; any instance that fails to reach `Running` within
+   the timeout is flagged
+
+**Constraints in diagnostic mode:**
+
+- **No image pulls.** All required Docker images must already be present in the local
+  cache. Tests that would require a pull are skipped, not failed.
+- **No fixtures.** The harness does not copy any fixture directories; it tests what is
+  physically connected.
+- **No destructive steps.** The diagnostic never removes disk content, never runs
+  `docker compose down --volumes`, and never modifies Automerge state beyond what the
+  normal dock/undock cycle would do.
+- **`testMode` must be enabled** in `config.yaml` for the diagnostic to work without
+  requiring physical plug/unplug. On a system where `testMode` is not set, the
+  diagnostic skips the cycle step and runs smoke tests only against already-running
+  instances.
+
+**Diagnostic vs standard test suite:**
+
+| | Standard (`pnpm test`) | Diagnostic (`pnpm test:diagnostic`) |
+|---|---|---|
+| Disk content | Fixtures | Real disks |
+| Docker images | Pre-pulled (or pulled at setup) | Must already be cached |
+| Internet required | For image pull | Never |
+| Runs on | Dev machine or Pi | Production Pi only |
+| Dock/undock | Simulated via sentinel | Replayed via sentinel (disk stays mounted) |
+| Destructive | No | No |
+
+---
+
 ## Test Structure
 
 ```
 test/
-  00-config.test.ts          config loading and validation
+  00-config.test.ts              config loading and validation
   automated/
-    engine-startup.test.ts   engine starts, store initialises
-    disk-dock-undock.test.ts disk dock/undock → Automerge state
-    instance-lifecycle.test.ts start, Running, stop cycle
-    app-versioning.test.ts   version read from disk, appDB populated
-    app-upgrade.test.ts      minor/major upgrade proposal logic
-    app-smoke.test.ts        dock real disk → app Running → smoke tests pass
-    app-ui.test.ts           dock real disk → Playwright UI tests pass
-    network-sync.test.ts     (tier 2) mDNS, CRDT sync, remote commands
-    engine-join-leave.test.ts (tier 2) remove/add remote engine, sync resumes
+    engine-startup.test.ts       engine starts, store initialises
+    disk-dock-undock.test.ts     disk dock/undock → Automerge state
+    instance-lifecycle.test.ts   start, Running, stop cycle
+    app-versioning.test.ts       version read from disk, appDB populated
+    app-upgrade.test.ts          minor/major upgrade proposal logic
+    app-smoke.test.ts            dock real disk → app Running → smoke tests pass
+    app-ui.test.ts               dock real disk → Playwright UI tests pass
+    network-sync.test.ts         (tier 2) mDNS, CRDT sync, remote commands
+    engine-join-leave.test.ts    (tier 2) remove/add remote engine, sync resumes
+  diagnostic/
+    field-health.test.ts         discover real disks, cycle dock/undock, smoke test
   fixtures/
     disk-kolibri-v1/
     disk-kolibri-v1.1/
@@ -245,46 +347,53 @@ test/
   harness/
     diskSim.ts
     appRunner.ts
-    networkDiscovery.ts
+    networkDiscovery.ts          includes assignAppsToEngines()
     waitFor.ts
 ```
 
 `pnpm test` runs everything. Tier 2 tests auto-skip if no peers are found.
+`pnpm test:diagnostic` runs field-health tests only against real connected disks.
 
 ---
 
 ## Prerequisites
 
-| Requirement | Local only | With remote engines |
-|---|---|---|
-| Docker installed and running | ✓ | ✓ |
-| App images pre-pulled | ✓ | ✓ |
-| Playwright browsers installed | ✓ | ✓ |
-| SSH key on remote Pis | — | ✓ |
-| Remote Pis on same LAN | — | ✓ |
-| Remote Pis running engine service | — | ✓ |
+| Requirement | Local only | With remote engines | Diagnostic |
+|---|---|---|---|
+| Docker installed and running | ✓ | ✓ | ✓ |
+| App images pre-pulled | ✓ | ✓ | must already be cached |
+| Playwright browsers installed | ✓ | ✓ | — |
+| SSH key on remote Pis | — | ✓ | — |
+| Remote Pis on same LAN | — | ✓ | optional |
+| Remote Pis running engine service | — | ✓ | optional |
+| Real app disks connected | — | — | ✓ |
+| Internet access | for image pull | for image pull | never |
+| `testMode: true` in config | ✓ | ✓ | recommended |
 
 ---
 
 ## What This Covers
 
-| Area | Coverage |
-|---|---|
-| Engine config and startup | ✓ |
-| Disk dock/undock (simulated hardware) | ✓ |
-| App metadata read and stored | ✓ |
-| App containers start (real Docker) | ✓ |
-| App smoke tests (HTTP) | ✓ |
-| App UI tests (Playwright) | ✓ |
-| Version detection and comparison | ✓ |
-| Upgrade proposal (minor/major logic) | ✓ |
-| Data survival across minor upgrade | ✓ |
-| mDNS advertisement and discovery | ✓ (tier 2) |
-| CRDT sync across engines | ✓ (tier 2) |
-| Engine join and leave | ✓ (tier 2) |
-| Remote command propagation | ✓ (tier 2) |
-| USB mount/unmount syscalls | ✗ (simulated) |
-| Real USB hardware detection | ✗ (simulated) |
+| Area | Standard tests | Diagnostic mode |
+|---|---|---|
+| Engine config and startup | ✓ | — |
+| Disk dock/undock (simulated hardware) | ✓ | ✓ (real disk, sentinel replay) |
+| App metadata read and stored | ✓ | ✓ |
+| App containers start (real Docker) | ✓ | ✓ |
+| App smoke tests (HTTP) | ✓ | ✓ |
+| App UI tests (Playwright) | ✓ | — |
+| Version detection and comparison | ✓ | — |
+| Upgrade proposal (minor/major logic) | ✓ | — |
+| Data survival across minor upgrade | ✓ | — |
+| mDNS advertisement and discovery | ✓ (tier 2) | ✓ (if peers present) |
+| CRDT sync across engines | ✓ (tier 2) | ✓ (if peers present) |
+| Engine join and leave | ✓ (tier 2) | — |
+| Remote command propagation | ✓ (tier 2) | — |
+| Multi-engine app assignment (round-robin) | ✓ (tier 2) | — (test real layout) |
+| USB mount/unmount syscalls | ✗ (simulated) | ✗ (simulated) |
+| Real USB hardware detection | ✗ (simulated) | ✗ (simulated) |
+| Works without internet | ✗ (image pull) | ✓ |
+| Works on production system | ✗ (fixtures needed) | ✓ |
 
 ---
 
@@ -312,7 +421,20 @@ test/
 - Add SSH remote control helpers
 - Update Pi provisioning to install test SSH key
 
-**PR 4 — Framework migration**
+**PR 4 — Multi-engine tests**
+- Write `test/harness/networkDiscovery.ts` with `assignAppsToEngines()` (round-robin)
+- Write `test/automated/network-sync.test.ts`
+- Write `test/automated/engine-join-leave.test.ts`
+- Add SSH remote control helpers
+- Update Pi provisioning to install test SSH key
+
+**PR 5 — Diagnostic mode**
+- Add `pnpm test:diagnostic` script
+- Write `test/diagnostic/field-health.test.ts`
+- Harness discovers real disks, replays sentinel dock/undock, runs smoke tests
+- Report per-app pass/fail to terminal; skip any test requiring image pull
+
+**PR 6 — Framework migration**
 - Migrate from Mocha → Vitest
 - Update `pnpm test` script
 - Retire `test/01-e2e-execution.test.ts` (superseded)
@@ -332,3 +454,13 @@ test/
 
 4. **Port allocation** — multiple app instances in one test run need non-conflicting ports.
    The engine assigns ports; tests should read from Automerge rather than hardcoding.
+
+5. **Diagnostic `testMode` in production** — enabling `testMode` in production `config.yaml`
+   lets the diagnostic cycle disks without physical plug/unplug. Should `testMode` be the
+   default on Pi builds so diagnostics always work, or should it be an explicit opt-in set
+   by the technician running the test? (Implication: if `testMode` is off on a production
+   system, the diagnostic can only smoke-test already-running instances, not cycle them.)
+
+6. **Diagnostic reporting** — output format for field use: terminal only, or write a
+   machine-readable report file to the disk (e.g., `META.yaml` test-results block) that
+   can be read back when the disk is returned to base?
