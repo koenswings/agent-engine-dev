@@ -7,7 +7,7 @@
 This document compares two proposed automated test setups for the Engine. Read the
 individual design documents for full detail on each approach.
 
-- **Proposal A** — `docs/test-setup-design.md` — Docker Battery
+- **Proposal A** — `design/test-setup-virtual.md` — Docker Battery
 - **Proposal B** — `docs/test-setup-native.md` — Native Engine
 
 ---
