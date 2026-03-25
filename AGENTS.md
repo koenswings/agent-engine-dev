@@ -68,7 +68,7 @@ pnpm test                             # Run tests
 4. Edit source in `src/`
 5. Run `pnpm build` to compile; `pnpm test` before any commit
 6. Open a PR — never push directly to `main`
-7. Quality Manager reviews; CEO merges
+7. Atlas (operations-manager) reviews; CEO merges
 
 ## Important Files
 
