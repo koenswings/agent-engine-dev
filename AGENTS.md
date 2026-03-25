@@ -12,7 +12,7 @@ between peers on the same network.
 Engine runs unattended in schools with no internet, no IT support, and no second chances.
 **Reliability is the top priority. Stability beats features.**
 
-Read `CLAUDE.md` in this directory for the full project guide: architecture, commands,
+Read `PROJECT.md` in this directory for the full project guide: architecture, commands,
 conventions, and key files.
 
 ## Every Session
