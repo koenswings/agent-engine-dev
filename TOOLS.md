@@ -1,22 +1,7 @@
-<<<<<<< fix/autonomous-github-workflow
-# TOOLS.md — Engine Developer
-
-## Environment
-
-- **Pi hostname:** engine-pi (or check `hostname` in the container)
-- **Projects root (host):** `/home/pi/idea/`
-- **Projects root (container):** `/home/node/workspace/`
-- **Engine repo:** `/home/node/workspace/agents/agent-engine-dev`
-- **Org root:** `/home/node/workspace/` (CONTEXT.md, BACKLOG.md, proposals/, etc.)
-- **OpenClaw data:** `/root/.openclaw/` (container)
-
-## API Credentials
-
-=======
 # TOOLS.md — Axle, Engine Developer
 
 ## API Credentials
->>>>>>> main
+
 - `BASE_URL=http://172.18.0.1:8000`
 - `AUTH_TOKEN` — load from `.env` in this directory (gitignored, never committed)
 - `AGENT_NAME=Axle`
@@ -26,9 +11,17 @@
 - `WORKSPACE_PATH=/home/node/workspace/agents/agent-engine-dev`
 - Required tools: `curl`, `jq`
 
-<<<<<<< fix/autonomous-github-workflow
 See the **mc-api** shared skill for OpenAPI refresh, discovery policy, and usage examples:
 `/home/node/workspace/skills/mc-api/SKILL.md`
+
+## Environment
+
+- **Pi hostname:** engine-pi (or check `hostname` in the container)
+- **Projects root (host):** `/home/pi/idea/`
+- **Projects root (container):** `/home/node/workspace/`
+- **Engine repo:** `/home/node/workspace/agents/agent-engine-dev`
+- **Org root:** `/home/node/workspace/` (CONTEXT.md, BACKLOG.md, proposals/, etc.)
+- **OpenClaw data:** `/root/.openclaw/` (container)
 
 ## SSH
 
@@ -40,11 +33,6 @@ See the **mc-api** shared skill for OpenAPI refresh, discovery policy, and usage
 - Engine source: `src/`
 - Tests: `src/**/*.test.ts`
 - Built output: `dist/`
-- Udev rules: check Engine docs for hardware-specific paths
-
-## Notes
-
-_(Add local setup quirks here as you discover them — device names, port numbers, hardware-specific observations.)_
 
 ## GitHub Push & PR
 
@@ -72,33 +60,4 @@ curl -s -X POST "https://api.github.com/repos/koenswings/agent-engine-dev/pulls"
   }" | python3 -c "import sys,json; print(json.load(sys.stdin).get('html_url','error'))"
 ```
 
-Replace `agent-engine-dev` and `BRANCH_NAME` with the actual values for your repo.
 `GITHUB_TOKEN` must be present in `.env` (gitignored, never committed).
-=======
-## OpenAPI refresh (run before API-heavy work)
-
-```bash
-mkdir -p api
-curl -fsS "http://172.18.0.1:8000/openapi.json" -o api/openapi.json
-jq -r '
-  .paths | to_entries[] as $p
-  | $p.value | to_entries[]
-  | select((.value.tags // []) | index("agent-lead"))
-  | "\(.key|ascii_upcase)\t\($p.key)\t\(.value.operationId // "-")\t\(.value["x-llm-intent"] // "-")\t\(.value["x-when-to-use"] // [] | join(" | "))\t\(.value["x-routing-policy"] // [] | join(" | "))"
-' api/openapi.json | sort > api/agent-lead-operations.tsv
-```
-
-## API source of truth
-- `api/openapi.json`
-- `api/agent-lead-operations.tsv`
-  - Columns: METHOD, PATH, OP_ID, X_LLM_INTENT, X_WHEN_TO_USE, X_ROUTING_POLICY
-
-## API discovery policy
-- Use operations tagged `agent-lead`.
-- Prefer operations whose `x-llm-intent` and `x-when-to-use` match the current objective.
-- Derive method/path/schema from `api/openapi.json` at runtime.
-- Do not hardcode endpoint paths in markdown files.
-
-## API safety
-If no confident match exists for current intent, ask one clarifying question.
->>>>>>> main
