@@ -1,6 +1,7 @@
 settings:
   mdns: true
   isDev: false
+  testMode: false   # Set to true to skip sudo mount/umount (for automated tests and field diagnostics)
   port: 4321
   storeDataFolder: store-data
   storeIdentityFolder: store-identity

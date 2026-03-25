@@ -28,7 +28,8 @@
     "testDB": "tsc --build --clean && tsc && YPERSISTENCE=./yjs-db mocha 'dist/test/*.js' --exit",
     "testdevDB": "tsc --build --clean && tsc && YPERSISTENCE=./yjs-db VERBOSITY=3 mocha --reporter list 'dist/test/*.js' --exit",
     "test": "pnpm test:full",
-    "test:full": "pnpm build && mocha 'dist/test/0*.test.js' --exit",
+    "test:full": "pnpm build && IDEA_TEST_MODE=true mocha 'dist/test/0*.test.js' 'dist/test/automated/*.test.js' --exit",
+    "test:unit": "pnpm build && IDEA_TEST_MODE=true mocha 'dist/test/automated/*.test.js' --exit",
     "test:auto": "TEST_MODE=automated pnpm build && mocha 'dist/test/01-e2e-execution.test.js' --exit",
     "test:config": "pnpm build && mocha 'dist/test/00-config.test.js' --exit",
     "bundle-context": "tsx script/bundle-context.ts"

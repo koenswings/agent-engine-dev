@@ -51,9 +51,9 @@ const devMeta: DiskMeta = {
 export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMeta> => {
   let path
   let device: DeviceName
-  // If the config file has the isDev option set to true, we return the devMeta
-  if (config.settings.isDev) {
-    log(`Running in development mode, returning devMeta`)
+  // If the config file has the isDev or testMode option set to true, we return the devMeta
+  if (config.settings.isDev || config.settings.testMode) {
+    log(`Running in ${config.settings.isDev ? 'development' : 'test'} mode, returning devMeta`)
     return devMeta
   }
   try {

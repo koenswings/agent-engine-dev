@@ -10,6 +10,7 @@ import { dirname, join } from 'path';
 export interface Settings {
     mdns: boolean;
     isDev: boolean;
+    testMode: boolean;
     port: number;
     storeDataFolder: string;
     storeIdentityFolder: string;
@@ -98,6 +99,7 @@ function validateSettings(obj: any, path: string): string[] {
     const errors: string[] = [];
     if (typeof obj.mdns !== 'boolean') errors.push(`'${path}mdns' must be a boolean.`);
     if (typeof obj.isDev !== 'boolean') errors.push(`'${path}isDev' must be a boolean.`);
+    if (typeof obj.testMode !== 'boolean') errors.push(`'${path}testMode' must be a boolean.`);
     if (typeof obj.port !== 'number') errors.push(`'${path}port' must be a number.`);
     if (typeof obj.storeDataFolder !== 'string') errors.push(`'${path}storeDataFolder' must be a string.`);
     if (typeof obj.storeIdentityFolder !== 'string') errors.push(`'${path}storeIdentityFolder' must be a string.`);
@@ -189,3 +191,9 @@ const readConfig = (path: string): Config => {
 }
 
 export const config = readConfig('./config.yaml');
+
+// Allow IDEA_TEST_MODE=true env var to force testMode on without editing config.yaml.
+// This must be set before any module that reads config at import time (e.g. Engine.ts).
+if (process.env.IDEA_TEST_MODE === 'true') {
+    config.settings.testMode = true;
+}
