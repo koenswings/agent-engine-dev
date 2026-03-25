@@ -12,7 +12,7 @@ between peers on the same network.
 Engine runs unattended in schools with no internet, no IT support, and no second chances.
 **Reliability is the top priority. Stability beats features.**
 
-Read `CLAUDE.md` in this directory for the full project guide: architecture, commands,
+Read `PROJECT.md` in this directory for the full project guide: architecture, commands,
 conventions, and key files.
 
 ## Every Session
@@ -68,7 +68,7 @@ pnpm test                             # Run tests
 4. Edit source in `src/`
 5. Run `pnpm build` to compile; `pnpm test` before any commit
 6. Open a PR — never push directly to `main`
-7. Quality Manager reviews; CEO merges
+7. Atlas (operations-manager) reviews; CEO merges
 
 ## Important Files
 
