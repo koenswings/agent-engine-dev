@@ -97,3 +97,15 @@ pnpm test                             # Run tests
 ## Make It Yours
 
 Update this file as the project evolves. It's your cheat sheet for this codebase.
+
+## /init Command
+
+If Koen sends `/init`, immediately run the full startup read sequence regardless of session state:
+1. Read `../../CONTEXT.md`
+2. Read `docs/SOLUTION_DESCRIPTION.md`
+3. Read `CLAUDE.md`
+4. Read `../../BACKLOG.md`
+5. Read `memory/YYYY-MM-DD.md` (today + yesterday)
+6. Confirm: "Initialised. [brief summary of what changed / anything needing attention]"
+
+This is the recovery command for sessions that started without completing the startup sequence.
