@@ -67,6 +67,6 @@ Draft → Proposed → Approved → Implemented
 
 | File | Status | Summary |
 |---|---|---|
-| `test-setup-design.md` | Superseded | Proposal A: Docker Battery approach |
+| `test-setup-virtual.md` | Superseded | Proposal A: Docker Battery (virtual/container) approach |
 | `test-setup-native.md` | Approved | Proposal B: Native Engine approach (adopted) |
 | `test-setup-comparison.md` | Approved | 9-dimension comparison; Proposal B selected |

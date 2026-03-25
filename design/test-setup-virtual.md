@@ -1,4 +1,4 @@
-# Design: Automated Test Setup
+# Design: Automated Test Setup — Proposal A (Virtual/Docker Battery)
 
 **Status:** Superseded — Proposal B (native engine) was chosen. See `design/test-setup-native.md`.  
 **Author:** Axle (Engine Developer)  
