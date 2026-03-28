@@ -21,6 +21,7 @@ import {
     dockFixture,
     triggerUndock,
     cleanupDisk,
+    cleanupContainers,
     waitFor,
     TEST_DEVICE,
     SENTINEL,
@@ -44,10 +45,12 @@ describe('Disk dock / undock (automated, testMode)', () => {
         await enableUsbDeviceMonitor(storeHandle)
     })
 
-    after(async () => {
-        // Clean up filesystem — sentinel and disk copy
+    after(async function () {
+        this.timeout(15_000)
+        // Clean up filesystem and any containers started during tests
         await fs.remove(SENTINEL).catch(() => {})
         await cleanupDisk(TEST_DEVICE)
+        await cleanupContainers('sample-00000000-test1')
     })
 
     it('registers a disk in the store when a fixture is docked', async function () {
