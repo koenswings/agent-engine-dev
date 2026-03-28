@@ -5,8 +5,8 @@
  * dock and undock event without any physical hardware.
  *
  * Uses testMode (via IDEA_TEST_MODE=true) so usbDeviceMonitor skips sudo
- * mount/umount. The harness copies a fixture directory to /disks/sdz1/
- * and touches /dev/engine/sdz1 to simulate the chokidar event.
+ * mount/umount. The harness copies a synthetic fixture (disk-sample-v1) to
+ * /disks/sdz1/ and touches /dev/engine/sdz1 to simulate the chokidar event.
  */
 
 import { describe, it, before, after } from 'mocha'
@@ -28,7 +28,7 @@ import {
 } from '../harness/diskSim.js'
 import { fs } from 'zx'
 
-const FIXTURE_KOLIBRI_V1 = path.resolve(FIXTURES_DIR, 'disk-kolibri-v1')
+const FIXTURE_SAMPLE_V1 = path.resolve(FIXTURES_DIR, 'disk-sample-v1')
 
 describe('Disk dock / undock (automated, testMode)', () => {
     let storeHandle: DocHandle<Store>
@@ -53,7 +53,7 @@ describe('Disk dock / undock (automated, testMode)', () => {
     it('registers a disk in the store when a fixture is docked', async function () {
         this.timeout(15_000)
 
-        await dockFixture(FIXTURE_KOLIBRI_V1)
+        await dockFixture(FIXTURE_SAMPLE_V1)
 
         const docked = await waitFor(storeHandle, store => {
             return Object.values(store.diskDB).some(
@@ -67,7 +67,7 @@ describe('Disk dock / undock (automated, testMode)', () => {
         const store = storeHandle.doc()!
         const disk = Object.values(store.diskDB).find(d => d.device === TEST_DEVICE)
         expect(disk).to.exist
-        expect(disk!.id).to.include('test-fixture-kolibri')
+        expect(disk!.id).to.include('test-fixture-sample')
     })
 
     // Tests 2 and 3 depend on the store state established by Test 1 (disk docked).
@@ -90,7 +90,7 @@ describe('Disk dock / undock (automated, testMode)', () => {
     it('re-registers the disk after a second dock', async function () {
         this.timeout(15_000)
 
-        await dockFixture(FIXTURE_KOLIBRI_V1)
+        await dockFixture(FIXTURE_SAMPLE_V1)
 
         const redocked = await waitFor(storeHandle, store => {
             return Object.values(store.diskDB).some(
