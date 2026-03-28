@@ -11,6 +11,12 @@
  */
 
 import { fs, path } from 'zx'
+
+// Resolve fixtures from the repo root (process.cwd()), not from __dirname.
+// Compiled files land in dist/test/harness/ — __dirname-relative paths to
+// test/fixtures/ would be wrong. process.cwd() is always the repo root when
+// tests are run via pnpm scripts.
+export const FIXTURES_DIR = path.resolve(process.cwd(), 'test/fixtures')
 import { Repo, DocHandle } from '@automerge/automerge-repo'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'

@@ -51,8 +51,11 @@ const devMeta: DiskMeta = {
 export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMeta> => {
   let path
   let device: DeviceName
-  // If the config file has the isDev or testMode option set to true, we return the devMeta
-  if (config.settings.isDev || config.settings.testMode) {
+  // In dev/test mode with no specific device: return devMeta so the engine can start
+  // without its own system disk present (prevents process.exit on dev machines / CI).
+  // When a deviceSpec IS provided (an app disk), fall through and read the actual
+  // META.yaml — but skip hardware ID lookup (see below).
+  if ((config.settings.isDev || config.settings.testMode) && !deviceSpec) {
     log(`Running in ${config.settings.isDev ? 'development' : 'test'} mode, returning devMeta`)
     return devMeta
   }
@@ -77,18 +80,26 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
       log(`meta: ${deepPrint(meta)}`)
       let update = false
 
-      // Find the hardware id
-      let diskId = await readHardwareId(device) as DiskID
-      if (!diskId) {
-        log(`No hardware id found for device ${device}`)
-        if (meta.hasOwnProperty('isHardwareId') && meta.isHardwareId) {
-          log(`The disk id in the META file is a hardware id, so must come from another disk. So this disk is a clone and it is cloned onto media without a hardware id. Generating a new hardware id`)
-          diskId = uuid() as DiskID
-          // Resetting the isHardwareId flag
-          meta.isHardwareId = false
-        } else {
-          log(`The disk id in the META file is a user-assigned id. Keeping it as is`)
-          diskId = meta.diskId
+      // Find the hardware id.
+      // In testMode/isDev: skip block device access and use the id from the META file as-is.
+      // Fixture disks have isHardwareId: false and a stable generated id — no hardware lookup needed.
+      let diskId: DiskID
+      if (config.settings.isDev || config.settings.testMode) {
+        log(`testMode/isDev: using diskId from META file (${meta.diskId}), skipping hardware id lookup`)
+        diskId = meta.diskId
+      } else {
+        diskId = await readHardwareId(device) as DiskID
+        if (!diskId) {
+          log(`No hardware id found for device ${device}`)
+          if (meta.hasOwnProperty('isHardwareId') && meta.isHardwareId) {
+            log(`The disk id in the META file is a hardware id, so must come from another disk. So this disk is a clone and it is cloned onto media without a hardware id. Generating a new hardware id`)
+            diskId = uuid() as DiskID
+            // Resetting the isHardwareId flag
+            meta.isHardwareId = false
+          } else {
+            log(`The disk id in the META file is a user-assigned id. Keeping it as is`)
+            diskId = meta.diskId
+          }
         }
       }
 
@@ -120,8 +131,9 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
         update = true
       }
 
-      // Update the META file if necessary
-      if (update) {
+      // Update the META file if necessary.
+      // Skip in testMode/isDev — writeMeta requires sudo and we don't want to mutate fixtures.
+      if (update && !config.settings.isDev && !config.settings.testMode) {
         await writeMeta(meta, path)
       }
       return meta

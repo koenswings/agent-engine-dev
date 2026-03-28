@@ -9,3 +9,6 @@ x-app:
   title: "Kolibri"
   description: "Digital learning platform for offline environments"
   category: "education"
+  url: "https://learningequality.org/kolibri/"
+  icon: ""
+  author: "Learning Equality"

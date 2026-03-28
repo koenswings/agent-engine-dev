@@ -12,7 +12,6 @@
 import { describe, it, before, after } from 'mocha'
 import { expect } from 'chai'
 import path from 'path'
-import { fileURLToPath } from 'url'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Store } from '../../src/data/Store.js'
 import { localEngineId } from '../../src/data/Engine.js'
@@ -25,11 +24,11 @@ import {
     waitFor,
     TEST_DEVICE,
     SENTINEL,
+    FIXTURES_DIR,
 } from '../harness/diskSim.js'
 import { fs } from 'zx'
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const FIXTURE_KOLIBRI_V1 = path.resolve(__dirname, '../fixtures/disk-kolibri-v1')
+const FIXTURE_KOLIBRI_V1 = path.resolve(FIXTURES_DIR, 'disk-kolibri-v1')
 
 describe('Disk dock / undock (automated, testMode)', () => {
     let storeHandle: DocHandle<Store>
