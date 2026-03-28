@@ -15,8 +15,11 @@ import { Repo, DocHandle } from '@automerge/automerge-repo'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 
-// Fixed device name used for all single-disk tests. Must not clash with real devices.
-export const TEST_DEVICE = 'sdtest1'
+// Fixed device name used for all single-disk tests.
+// Must match validDevice() pattern: sd[a-z][1-2] or sd[a-z].
+// sdz1 is chosen as very unlikely to conflict with real block devices on a test machine.
+// testMode skips actual mount/umount, so there is no risk of touching real hardware.
+export const TEST_DEVICE = 'sdz1'
 
 // Paths the harness manages
 export const DISKS_ROOT   = '/disks'

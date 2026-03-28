@@ -5,8 +5,8 @@
  * dock and undock event without any physical hardware.
  *
  * Uses testMode (via IDEA_TEST_MODE=true) so usbDeviceMonitor skips sudo
- * mount/umount. The harness copies a fixture directory to /disks/sdtest1/
- * and touches /dev/engine/sdtest1 to simulate the chokidar event.
+ * mount/umount. The harness copies a fixture directory to /disks/sdz1/
+ * and touches /dev/engine/sdz1 to simulate the chokidar event.
  */
 
 import { describe, it, before, after } from 'mocha'
@@ -71,6 +71,9 @@ describe('Disk dock / undock (automated, testMode)', () => {
         expect(disk!.id).to.include('test-fixture-kolibri')
     })
 
+    // Tests 2 and 3 depend on the store state established by Test 1 (disk docked).
+    // They run in sequence: dock → undock → re-dock. This is intentional: the
+    // dock/undock cycle is inherently stateful and is best verified as a sequence.
     it('removes the disk from the store when undocked', async function () {
         this.timeout(15_000)
 

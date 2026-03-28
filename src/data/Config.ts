@@ -193,6 +193,10 @@ const readConfig = (path: string): Config => {
 export const config = readConfig('./config.yaml');
 
 // Allow IDEA_TEST_MODE=true env var to force testMode on without editing config.yaml.
+// NOTE: This mutates the already-exported config object at module load time.
+// Safe only because all consumers read config.settings.testMode inside function bodies,
+// not at module scope. If any future module reads testMode at import time, this will
+// silently not apply to that module — move to a getter pattern at that point.
 // This must be set before any module that reads config at import time (e.g. Engine.ts).
 if (process.env.IDEA_TEST_MODE === 'true') {
     config.settings.testMode = true;
