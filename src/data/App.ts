@@ -10,14 +10,14 @@ export interface App {
     name: AppName;
     version: Version;
     title: string;
-    description: string;
-    url: URL
+    description: string | null;
+    url: URL | null;
     category: AppCategory;
-    icon: URL;
-    author: string;
+    icon: URL | null;
+    author: string | null;
 }
 
-type AppCategory = 'Productivity' | 'Utilities' | 'Games';
+type AppCategory = 'Productivity' | 'Utilities' | 'Games' | 'education' | 'office' | 'it' | string;
 
 export const createAppId = (appName: AppName, version: Version): AppID => {
     return appName + "-" + version as AppID
@@ -46,6 +46,8 @@ export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: Ap
         const appCompose = YAML.parse(appComposeFile.stdout)
         storeHandle.change(doc => {
             const storedApp: App | undefined = doc.appDB[appId]
+            // Automerge rejects undefined — use null for absent optional fields
+            const xapp = appCompose['x-app']
             if (!storedApp) {
                 // Create a new app object
                 log(chalk.green(`Creating new app ${appId} on disk ${diskID}`))
@@ -53,12 +55,12 @@ export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: Ap
                     id: appId as AppID,
                     name: appName,
                     version: appVersion,
-                    title: appCompose['x-app'].title,
-                    description: appCompose['x-app'].description,
-                    url: appCompose['x-app'].url,
-                    category: appCompose['x-app'].category,
-                    icon: appCompose['x-app'].icon,
-                    author: appCompose['x-app'].author
+                    title: xapp.title,
+                    description: xapp.description ?? null,
+                    url: xapp.url ?? null,
+                    category: xapp.category,
+                    icon: xapp.icon ?? null,
+                    author: xapp.author ?? null
                 }
                 // Store the new app object in the store
                 doc.appDB[appId] = app
@@ -68,12 +70,12 @@ export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: Ap
                 app = storedApp
                 app.name = appName
                 app.version = appVersion
-                app.title = appCompose['x-app'].title
-                app.description = appCompose['x-app'].description
-                app.url = appCompose['x-app'].url
-                app.category = appCompose['x-app'].category
-                app.icon = appCompose['x-app'].icon
-                app.author = appCompose['x-app'].author
+                app.title = xapp.title
+                app.description = xapp.description ?? null
+                app.url = xapp.url ?? null
+                app.category = xapp.category
+                app.icon = xapp.icon ?? null
+                app.author = xapp.author ?? null
             }
         })
     return app!

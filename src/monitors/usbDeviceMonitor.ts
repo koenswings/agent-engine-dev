@@ -40,14 +40,18 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
             log(`The disk on device ${device} has a valid device name`)
             log(`Processing the disk on device ${device}`)
             try {
-                const mountOutput = await $`mount -t ext4`
-                if (mountOutput.stdout.includes(`/dev/${device} on /disks/${device} type ext4`)) {
-                    log(`Device ${device} already mounted`)
+                if (config.settings.testMode) {
+                    log(`testMode: skipping mount for device ${device} — fixture expected at /disks/${device}`)
                 } else {
-                    log(`Mounting device ${device}`)
-                    await $`sudo mkdir -p /disks/${device}`
-                    await $`sudo mount /dev/${device} /disks/${device}`
-                    log(`Device ${device} has been successfully mounted`)
+                    const mountOutput = await $`mount -t ext4`
+                    if (mountOutput.stdout.includes(`/dev/${device} on /disks/${device} type ext4`)) {
+                        log(`Device ${device} already mounted`)
+                    } else {
+                        log(`Mounting device ${device}`)
+                        await $`sudo mkdir -p /disks/${device}`
+                        await $`sudo mount /dev/${device} /disks/${device}`
+                        log(`Device ${device} has been successfully mounted`)
+                    }
                 }
 
                 let meta: DiskMeta
@@ -109,7 +113,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         }
     }
 
-    if (!config.settings.isDev) {
+    if (!config.settings.isDev && !config.settings.testMode) {
         try {
             log(`Cleaning up the /disks/old folder`)
             await $`sudo rm -fr /disks/old/*`
@@ -119,7 +123,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         }
     }
 
-    const actualDevices = config.settings.isDev ? [] : (await $`ls /dev/engine`).toString().split('\n').filter(device => validDevice(device))
+    const actualDevices = (config.settings.isDev || config.settings.testMode) ? [] : (await $`ls /dev/engine`).toString().split('\n').filter(device => validDevice(device))
     log(`Actual devices: ${actualDevices}`)
 
     log(`Removing from the network database disks that were attached before the current boot but are no longer attached now...`)
@@ -145,7 +149,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     }
 
     log(`Cleaning the mount points...`)
-    const previousMounts = config.settings.isDev ? [] : (await $`ls /disks`).toString().split('\n').filter(device => validDevice(device))
+    const previousMounts = (config.settings.isDev || config.settings.testMode) ? [] : (await $`ls /disks`).toString().split('\n').filter(device => validDevice(device))
     log(`Previously mounted devices: ${previousMounts}`)
     const mountOutput = await $`mount -t ext4`
     for (let device of previousMounts) {
@@ -187,20 +191,24 @@ const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
         return
     }
     try {
-        log(`Attempting to unmount device ${device}`)
-        try {
-            await $`sudo umount /disks/${device}`
-            log(`Device ${device} has been successfully unmounted`)
-        } catch (e: any) {
-            // If the error indicates it wasn't mounted, we can proceed. 
-            // Otherwise, we must abort to avoid deleting data on a mounted disk.
-            if (!e.stderr.includes('not mounted')) {
-                throw new Error(`Failed to unmount ${device}: ${e.message}`)
+        if (config.settings.testMode) {
+            log(`testMode: skipping umount and rm for device ${device}`)
+        } else {
+            log(`Attempting to unmount device ${device}`)
+            try {
+                await $`sudo umount /disks/${device}`
+                log(`Device ${device} has been successfully unmounted`)
+            } catch (e: any) {
+                // If the error indicates it wasn't mounted, we can proceed.
+                // Otherwise, we must abort to avoid deleting data on a mounted disk.
+                if (!e.stderr.includes('not mounted')) {
+                    throw new Error(`Failed to unmount ${device}: ${e.message}`)
+                }
+                log(`Device ${device} was not mounted`)
             }
-            log(`Device ${device} was not mounted`)
+            await $`sudo rm -fr /disks/${device}`
+            log(`Mount point /disks/${device} has been removed`)
         }
-        await $`sudo rm -fr /disks/${device}`
-        log(`Mount point /disks/${device} has been removed`)
         storeHandle.change(doc => {
             const dsk = doc.diskDB[disk.id]
             if (dsk) {

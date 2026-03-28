@@ -1,6 +1,6 @@
 # Design: Native Engine Test Setup
 
-**Status:** Approved — implementation authorised. Update to `Implemented` when authoritative docs are updated.  
+**Status:** Partially Implemented (PR 1 of 6 complete — disk simulation infrastructure)  
 **Author:** Axle (Engine Developer)  
 **Date:** 2025-07-11  
 **Backlog item:** Engine — Test setup design
@@ -69,15 +69,15 @@ settings:
 
 **Test harness helpers (`test/harness/diskSim.ts`):**
 ```typescript
-export const dockDisk = async (device: string, diskDir: string): Promise<void> => {
-    // 1. Place the fixture disk directory at the expected mount point
-    await $`cp -r ${diskDir} /disks/${device}`
-    // 2. Touch sentinel file — triggers chokidar watcher → Engine processes disk
-    await $`touch /dev/engine/${device}`
+export const dockFixture = async (fixturePath: string, device = TEST_DEVICE): Promise<void> => {
+    await fs.ensureDir(DISKS_ROOT)   // /disks/ — must be writable by the test runner
+    await fs.ensureDir(DEV_ROOT)     // /dev/engine/ — must be writable by the test runner
+    await fs.copy(fixturePath, `${DISKS_ROOT}/${device}`, { overwrite: true })
+    await fs.writeFile(`${DEV_ROOT}/${device}`, '')  // triggers chokidar → addDevice()
 }
 
-export const undockDisk = async (device: string): Promise<void> => {
-    await $`rm /dev/engine/${device}`
+export const triggerUndock = async (device = TEST_DEVICE): Promise<void> => {
+    await fs.remove(`${DEV_ROOT}/${device}`)
     // Engine detects removal, stops instances, cleans state
 }
 ```
@@ -361,6 +361,7 @@ test/
 | Requirement | Local only | With remote engines | Diagnostic |
 |---|---|---|---|
 | Docker installed and running | ✓ | ✓ | ✓ |
+| `/disks/` and `/dev/engine/` writable by test runner | ✓ | ✓ | ✓ |
 | App images pre-pulled | ✓ | ✓ | must already be cached |
 | Playwright browsers installed | ✓ | ✓ | — |
 | SSH key on remote Pis | — | ✓ | — |
