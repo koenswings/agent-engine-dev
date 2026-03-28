@@ -30,9 +30,11 @@ import {
 import { fs } from 'zx'
 
 const FIXTURE_SAMPLE_V1 = path.resolve(FIXTURES_DIR, 'disk-sample-v1')
+const TEST_INSTANCE_ID = 'sample-00000000-test1'
 
 describe('Disk dock / undock (automated, testMode)', () => {
     let storeHandle: DocHandle<Store>
+    let watcher: Awaited<ReturnType<typeof enableUsbDeviceMonitor>>
 
     before(async function () {
         this.timeout(15_000)
@@ -42,15 +44,19 @@ describe('Disk dock / undock (automated, testMode)', () => {
         storeHandle = ctx.storeHandle
 
         // Start the USB device monitor (no mDNS, no WebSocket — disk events only)
-        await enableUsbDeviceMonitor(storeHandle)
+        watcher = await enableUsbDeviceMonitor(storeHandle)
     })
 
     after(async function () {
-        this.timeout(15_000)
-        // Clean up filesystem and any containers started during tests
+        this.timeout(30_000)
+        // Close the watcher before cleanup — prevents it from firing on subsequent test suites
+        // that run in the same mocha process.
+        await watcher?.close()
+        // Remove sentinel and force-remove any containers started by the dock events.
+        // cleanupContainers must run before cleanupDisk (needs the disk to exist).
         await fs.remove(SENTINEL).catch(() => {})
+        await cleanupContainers(TEST_INSTANCE_ID)
         await cleanupDisk(TEST_DEVICE)
-        await cleanupContainers('sample-00000000-test1')
     })
 
     it('registers a disk in the store when a fixture is docked', async function () {

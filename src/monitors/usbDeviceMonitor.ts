@@ -181,6 +181,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         .on('error', error => log(`Watcher error: ${error}`))
 
     log(`Watching ${watchDir} for USB devices`)
+    return watcher
 }
 
 const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {

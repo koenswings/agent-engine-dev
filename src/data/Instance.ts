@@ -10,6 +10,7 @@ import { network } from "./Network.js";
 import { createAppId } from "./App.js";
 import { Docker } from "node-docker-api";
 import { createMeta } from '../data/Meta.js'
+import { config } from '../data/Config.js'
 import { error } from "console";
 import { DocHandle } from "@automerge/automerge-repo";
 
@@ -453,11 +454,16 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     const composeFile = await $`cat /disks/${disk.device}/instances/${instance.id}/compose.yaml`
     const compose = YAML.parse(composeFile.stdout)
     const services = compose.services
-    for (const serviceName in services) {
-      const serviceImage = services[serviceName].image
-      // Load the service image from the saved tar file
-      log(`Loading the service image ${serviceImage} from the saved tar file`)
-      await $`docker image load < /disks/${disk.device}/services/${serviceImage.replace(/\//g, '_')}.tar`
+    if (!config.settings.testMode) {
+      // In production: load images from pre-saved tar files on the disk (no internet required)
+      for (const serviceName in services) {
+        const serviceImage = services[serviceName].image
+        log(`Loading the service image ${serviceImage} from the saved tar file`)
+        await $`docker image load < /disks/${disk.device}/services/${serviceImage.replace(/\//g, '_')}.tar`
+      }
+    } else {
+      // In testMode: no tar files in fixtures — Docker pulls the image at create time if not cached
+      log(`testMode: skipping image load from tar; Docker will pull images as needed`)
     }
 
     // **************************
@@ -646,12 +652,10 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
     }
 
     log(`Creating containers of app instance '${instance.id}' on disk ${disk.id} of engine ${localEngineId}.`)
-    // await $`docker compose -f /disks/${disk.device}/instances/${instance.id}/compose.yaml create`
     await $`cd /disks/${disk.device}/instances/${instance.id} && docker compose create`
-    // Set the instance status to Pauzed
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
-      inst.status = 'Pauzed' as Status // Set the status to Pauzed when the instance is created
+      inst.status = 'Pauzed' as Status
     })
   } catch (e) {
     console.log(chalk.red(`Error creating the containers of app instance ${instance.id}`))
@@ -697,9 +701,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
     }
 
     // Compose up the app
-    //await $`docker compose -f /disks/${disk.device}/instances/${instance.id}/compose.yaml up -d`
     await $`cd /disks/${disk.device}/instances/${instance.id} && docker compose up -d`
-
 
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
