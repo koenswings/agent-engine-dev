@@ -39,8 +39,9 @@ Write important context, decisions, and lessons to `memory/YYYY-MM-DD.md` each s
 
 1. Commit memory files to the `memory/updates` branch
 2. Push to `origin/memory/updates`
-3. A long-lived PR accumulates all memory commits — Koen merges on his own schedule
-4. After a merge, recreate `memory/updates` from the new `main`
+3. Verify there is an open PR for `memory/updates → main`. If none exists, create one.
+4. When reporting memory or output commits to the CEO, always include the PR link.
+5. After a merge, recreate `memory/updates` from the new `main`
 
 `SOUL.md`, `USER.md`, and `IDENTITY.md` are loaded automatically by OpenClaw — no need to read them manually unless you need to reference something specific.
 
