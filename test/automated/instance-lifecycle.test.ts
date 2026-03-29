@@ -21,6 +21,26 @@
  * (e.g. 172.20.0.1) when running inside a sandbox container where the Docker
  * daemon is the host's daemon — published ports are bound on the host, not
  * on the container's loopback. On the Pi (native or via SSH), 'localhost' is correct.
+ *
+ * Store assertions (full coverage):
+ *
+ *   After dock (Running):
+ *     instanceDB[id].status        === 'Running'
+ *     instanceDB[id].port          > 0
+ *     instanceDB[id].storedOn      is a string (disk id)
+ *     instanceDB[id].instanceOf    is a string containing the app name
+ *     instanceDB[id].name          is a non-empty string
+ *     instanceDB[id].serviceImages is a non-empty array
+ *     instanceDB[id].created       > 0 (set at first dock)
+ *     instanceDB[id].lastStarted   > 0 (set in runInstance)
+ *     appDB                        has at least one entry for the docked app
+ *     HTTP GET on localhost:${port} returns 2xx
+ *
+ *   After undock:
+ *     instanceDB[id]               still exists (retained by design — not deleted on undock)
+ *     instanceDB[id].status        === 'Undocked'
+ *     diskDB                       has no active (dockedTo != null) entry for test device
+ *     HTTP GET on same port        times out (no response)
  */
 
 import { describe, it, before, after } from 'mocha'
@@ -77,9 +97,30 @@ describe('Instance lifecycle (automated, real containers)', () => {
         const store = storeHandle.doc()!
         const instance = store.instanceDB[TEST_INSTANCE_ID as any]
         expect(instance, 'instance should exist in instanceDB').to.exist
+
+        // ── core fields ──────────────────────────────────────────────────────
         expect(instance.port, 'instance should have a port assigned').to.be.greaterThan(0)
         expect(instance.storedOn, 'instance should reference its disk').to.be.a('string')
 
+        // ── identity fields ──────────────────────────────────────────────────
+        expect(instance.instanceOf, 'instanceOf should reference the app id').to.be.a('string').that.includes('sample')
+        expect(instance.name, 'name should be a non-empty string').to.be.a('string').that.is.not.empty
+
+        // ── service metadata ─────────────────────────────────────────────────
+        expect(instance.serviceImages, 'serviceImages should be a non-empty array').to.be.an('array').that.is.not.empty
+
+        // ── timestamps ───────────────────────────────────────────────────────
+        expect(instance.created, 'created timestamp should be set at first dock').to.be.greaterThan(0)
+        expect(instance.lastStarted, 'lastStarted should be set after reaching Running').to.be.greaterThan(0)
+
+        // ── appDB cross-check ─────────────────────────────────────────────────
+        // Apps are registered when the disk is processed; verify at least one app
+        // was written for the docked fixture.
+        const appIds = Object.keys(store.appDB)
+        const sampleApp = appIds.find(id => id.includes('sample'))
+        expect(sampleApp, 'appDB should contain an entry for the sample app after dock').to.exist
+
+        // ── HTTP health check ─────────────────────────────────────────────────
         // Verify the container is actually serving traffic — not just that the
         // engine set a Running status flag.
         // TEST_HOST defaults to 'localhost' (correct on Pi); override with Docker
@@ -99,6 +140,26 @@ describe('Instance lifecycle (automated, real containers)', () => {
         const undocked = await waitForStatus(storeHandle, TEST_INSTANCE_ID, 'Undocked', 20_000)
         expect(undocked, 'instance should reach Undocked within 20 s').to.be.true
 
+        const store = storeHandle.doc()!
+
+        // ── instanceDB retention ──────────────────────────────────────────────
+        // By design: undockDisk sets status to Undocked but does NOT remove the
+        // entry. This preserves instance history and allows re-dock to resume
+        // rather than starting fresh. This assertion documents that contract.
+        const retained = store.instanceDB[TEST_INSTANCE_ID as any]
+        expect(retained, 'instanceDB entry should be retained after undock (not deleted)').to.exist
+        expect(retained.status, 'retained entry status should be Undocked').to.equal('Undocked')
+
+        // ── diskDB cross-check ────────────────────────────────────────────────
+        // undockDisk sets dsk.dockedTo = null. Verify no active docked entry
+        // remains for the test device (entry may persist with dockedTo=null, but
+        // must not still point to an engine).
+        const activeDiskEntry = Object.values(store.diskDB).find(
+            (disk: any) => disk.device === TEST_DEVICE && disk.dockedTo !== null
+        )
+        expect(activeDiskEntry, 'diskDB should have no active (dockedTo) entry for test device after undock').to.be.undefined
+
+        // ── HTTP health check ─────────────────────────────────────────────────
         // Verify the container is no longer serving traffic
         const stillAlive = await waitForHttp(`http://${TEST_HOST}:${instancePort}/`, 3_000)
         expect(stillAlive, 'container should not respond after undock').to.be.false
