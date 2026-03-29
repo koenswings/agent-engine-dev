@@ -1,6 +1,6 @@
 import { $, YAML, chalk, fs, os } from 'zx';
 import { deepPrint, log } from '../utils/utils.js';
-import { App, createOrUpdateApp } from './App.js'
+import { App, createOrUpdateApp, isMajorUpgrade } from './App.js'
 import { Instance, Status, createOrUpdateInstance, startInstance } from './Instance.js'
 import { AppID, DeviceName, DiskID, EngineID, DiskName, InstanceID, Timestamp } from './CommonTypes.js';
 import { Store, getAppsOfDisk, getInstance, getInstancesOfDisk } from './Store.js';
@@ -309,9 +309,24 @@ export const removeApp = (store: Store, disk: Disk, appId: AppID): void => {
 }
 
 export const processInstance = async (storeHandle: DocHandle<Store>, disk: Disk, instanceId: InstanceID): Promise<Instance | undefined> => {
+    // Capture the existing appId BEFORE createOrUpdateInstance overwrites it.
+    // Used below to detect major version upgrades.
+    const existingInstanceOf = storeHandle.doc()?.instanceDB[instanceId]?.instanceOf ?? null
+
     const instance = await createOrUpdateInstance(storeHandle, instanceId, disk)
     if (instance) {
-        await startInstance(storeHandle, instance, disk)
+        if (existingInstanceOf && isMajorUpgrade(existingInstanceOf, instance.instanceOf)) {
+            // Major version upgrade detected (e.g. sample-1.x → sample-2.x).
+            // Block automatic startup: the operator must explicitly migrate data
+            // before the new version can run. Leave status as 'Docked'.
+            log(`Major version upgrade detected for ${instanceId}: ${existingInstanceOf} → ${instance.instanceOf}. Blocking startup — operator action required.`)
+            storeHandle.change(doc => {
+                const inst = doc.instanceDB[instanceId]
+                if (inst) inst.status = 'Docked' as Status
+            })
+        } else {
+            await startInstance(storeHandle, instance, disk)
+        }
     }
     return instance
 }

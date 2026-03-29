@@ -1,0 +1,17 @@
+services:
+  sample:
+    image: traefik/whoami
+    ports:
+      - "${port}:80"
+    restart: "no"
+
+x-app:
+  name: sample
+  version: "1.1"
+  instanceName: sample-instance-1
+  title: "Sample App Instance"
+  description: "Synthetic test instance — minor upgrade from 1.0"
+  category: "education"
+  url: "http://localhost:${port}"
+  icon: ""
+  author: "IDEA Test Harness"

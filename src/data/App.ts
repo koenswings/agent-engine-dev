@@ -31,6 +31,31 @@ export const extractAppVersion = (appId: AppID): Version => {
     return appId.split('-')[1] as Version
 }
 
+/**
+ * Returns the major version number from an appId (e.g. 'sample-1.0' → 1).
+ * Major-only comparison is sufficient for current apps: all versions use
+ * integer-major style (1.x, 2.x). No 0.x or pre-release versions in use.
+ */
+export const extractMajorVersion = (appId: AppID): number => {
+    const version = extractAppVersion(appId)   // e.g. "1.0"
+    return parseInt(version.split('.')[0], 10)
+}
+
+/**
+ * Returns true if docking newAppId onto a disk that already has an instance
+ * of oldAppId represents a major (breaking) version change.
+ *
+ * Major upgrade (1.x → 2.x): engine blocks instance startup — the operator
+ * must explicitly migrate data before the new version can run.
+ *
+ * Minor upgrade (1.0 → 1.1): allowed — engine restarts the instance with the
+ * new version automatically.
+ */
+export const isMajorUpgrade = (oldAppId: AppID, newAppId: AppID): boolean => {
+    if (oldAppId === newAppId) return false
+    return extractMajorVersion(oldAppId) !== extractMajorVersion(newAppId)
+}
+
 export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: AppID, disk: Disk) => {
     const store: Store = storeHandle.doc()
     const device: DeviceName = disk.device as DeviceName;

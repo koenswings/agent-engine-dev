@@ -1,6 +1,6 @@
 # Design: Native Engine Test Setup
 
-**Status:** Partially Implemented (PR 2 of 6 complete — disk simulation + instance lifecycle)  
+**Status:** Partially Implemented (PR 3 of 6 complete — disk simulation + instance lifecycle + app versioning)  
 **Author:** Axle (Engine Developer)  
 **Date:** 2025-07-11  
 **Backlog item:** Engine — Test setup design

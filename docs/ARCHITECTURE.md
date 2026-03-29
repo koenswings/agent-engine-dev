@@ -31,6 +31,9 @@ The application uses a "Monitor" pattern. Monitors listen for system events (USB
     *   When a disk is inserted, it mounts the drive, reads its `META.yaml` identity, and scans for App instances.
     *   It updates the `Disk` and `Instance` objects in the Automerge Store.
     *   It triggers the execution of apps (via Docker).
+    *   **App version handling on re-dock:** When a disk is docked and the store already holds an instance with the same ID, the Engine compares the major version of the stored `instanceOf` against the new disk's version (`isMajorUpgrade` in `App.ts`):
+        *   **Minor upgrade (e.g. 1.0 → 1.1):** Allowed. The Engine restarts the instance with the new version automatically. `instanceOf` and `lastStarted` are updated in the store.
+        *   **Major upgrade (e.g. 1.x → 2.x):** Blocked. The Engine updates `instanceOf` in the store to reflect what is on the disk, but sets `status = 'Docked'` and does **not** call `startInstance`. The instance remains dormant until the operator explicitly takes action. This prevents silent data corruption when a breaking-change version is docked.
 
 *   **mDNS Monitor (`mdnsMonitor.ts`):**
     *   Uses the `ciao` library to advertise the local Engine's presence on the LAN via mDNS, so other Engines and Console UIs can find it without any configuration.
