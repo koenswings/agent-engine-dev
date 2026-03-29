@@ -39,8 +39,9 @@ Write important context, decisions, and lessons to `memory/YYYY-MM-DD.md` each s
 
 1. Commit memory files to the `memory/updates` branch
 2. Push to `origin/memory/updates`
-3. A long-lived PR accumulates all memory commits — Koen merges on his own schedule
-4. After a merge, recreate `memory/updates` from the new `main`
+3. Verify there is an open PR for `memory/updates → main`. If none exists, create one.
+4. When reporting memory or output commits to the CEO, always include the PR link.
+5. After a merge, recreate `memory/updates` from the new `main`
 
 `SOUL.md`, `USER.md`, and `IDENTITY.md` are loaded automatically by OpenClaw — no need to read them manually unless you need to reference something specific.
 
@@ -121,3 +122,18 @@ If Koen sends `/init`, immediately run the full startup read sequence regardless
 12. Confirm: "Initialised. [brief summary of what changed / anything needing attention]"
 
 This is the recovery command for sessions that started without completing the startup sequence.
+
+## Outputs
+
+Write an output file for every substantive response — immediately after delivering it.
+
+**File:** `outputs/YYYY-MM-DD-HHMM-<topic>.md`  
+**Start with:** `> **Task/Question:** <the user's exact message>`  
+**Then:** commit and push to `memory/updates` immediately
+
+**Substantive** = any response containing analysis, a decision, a plan, a recommendation, or a work product.  
+**Exempt** = one-liner confirmations, status ACKs, and pure yes/no answers.
+
+Commit message: `outputs: YYYY-MM-DD <topic>`
+
+**When reporting a PR or task, always include the clickable URL** inline — GitHub PR link, MC task URL, or both. The CEO reviews on mobile; one tap to open beats searching every time.
