@@ -74,5 +74,11 @@
     "ws": "^8.18.3",
     "yaml": "^2.8.1",
     "zx": "^7.2.4"
+  },
+  "pnpm": {
+    "overrides": {
+      "minimatch@5": "^5.1.7",
+      "serialize-javascript@6": "^7.0.3"
+    }
   }
 }
