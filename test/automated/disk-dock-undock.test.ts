@@ -30,9 +30,11 @@ import {
 import { fs } from 'zx'
 
 const FIXTURE_SAMPLE_V1 = path.resolve(FIXTURES_DIR, 'disk-sample-v1')
+const TEST_INSTANCE_ID = 'sample-00000000-test1'
 
 describe('Disk dock / undock (automated, testMode)', () => {
     let storeHandle: DocHandle<Store>
+    let watcher: Awaited<ReturnType<typeof enableUsbDeviceMonitor>>
 
     before(async function () {
         this.timeout(15_000)
@@ -42,15 +44,23 @@ describe('Disk dock / undock (automated, testMode)', () => {
         storeHandle = ctx.storeHandle
 
         // Start the USB device monitor (no mDNS, no WebSocket — disk events only)
-        await enableUsbDeviceMonitor(storeHandle)
+        watcher = await enableUsbDeviceMonitor(storeHandle)
     })
 
     after(async function () {
-        this.timeout(15_000)
-        // Clean up filesystem and any containers started during tests
+        this.timeout(30_000)
+        // Close the watcher — no new dock events will fire after this.
+        await watcher?.close()
         await fs.remove(SENTINEL).catch(() => {})
+        // Remove the disk FIRST: any in-flight startInstance triggered by the re-dock
+        // test will fail when it next tries to read compose.yaml or write .env. This
+        // cuts off new container creation before we clean up what already exists.
         await cleanupDisk(TEST_DEVICE)
-        await cleanupContainers('sample-00000000-test1')
+        // Allow in-flight Docker operations to fail and release their handles.
+        await new Promise(r => setTimeout(r, 2_000))
+        // Final container cleanup — removes anything that was created before the disk
+        // was removed. cleanupContainers uses docker rm -f and does not need the disk.
+        await cleanupContainers(TEST_INSTANCE_ID)
     })
 
     it('registers a disk in the store when a fixture is docked', async function () {
