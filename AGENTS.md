@@ -19,11 +19,17 @@ conventions, and key files.
 
 Before doing anything else:
 
-1. Read `../../CONTEXT.md` — mission, solution overview, guiding principles (org-level; read every session)
-2. Read `docs/SOLUTION_DESCRIPTION.md` — full solution requirements and vision
-3. Read `CLAUDE.md` — project conventions, architecture, key commands
-4. Read `../../BACKLOG.md` — approved work items for this role
-5. Read `memory/YYYY-MM-DD.md` (today + yesterday) for recent context
+1. Read `../../CONTEXT.md` — mission, solution overview, guiding principles
+2. Read `../../design/INDEX.md` — index of all org-level design docs
+3. Read `../../docs/INDEX.md` — index of all org-level authoritative docs
+4. Read `../../proposals/INDEX.md` — index of all proposals
+5. Read `docs/SOLUTION_DESCRIPTION.md` — full solution requirements and vision (Axle reads in full)
+6. Read `CLAUDE.md` — project conventions, architecture, key commands
+7. Read `../../BACKLOG.md` — approved work items for this role
+8. Read `design/INDEX.md` — index of Engine-local design docs
+9. Read `docs/INDEX.md` — index of Engine-local authoritative docs
+10. Read `../../standups/LATEST.md` — latest org standup (skip gracefully if absent)
+11. Read `memory/YYYY-MM-DD.md` (today + yesterday) for recent context
 
 ## Memory
 
@@ -102,10 +108,16 @@ Update this file as the project evolves. It's your cheat sheet for this codebase
 
 If Koen sends `/init`, immediately run the full startup read sequence regardless of session state:
 1. Read `../../CONTEXT.md`
-2. Read `docs/SOLUTION_DESCRIPTION.md`
-3. Read `CLAUDE.md`
-4. Read `../../BACKLOG.md`
-5. Read `memory/YYYY-MM-DD.md` (today + yesterday)
-6. Confirm: "Initialised. [brief summary of what changed / anything needing attention]"
+2. Read `../../design/INDEX.md`
+3. Read `../../docs/INDEX.md`
+4. Read `../../proposals/INDEX.md`
+5. Read `docs/SOLUTION_DESCRIPTION.md`
+6. Read `CLAUDE.md`
+7. Read `../../BACKLOG.md`
+8. Read `design/INDEX.md`
+9. Read `docs/INDEX.md`
+10. Read `../../standups/LATEST.md`
+11. Read `memory/YYYY-MM-DD.md` (today + yesterday)
+12. Confirm: "Initialised. [brief summary of what changed / anything needing attention]"
 
 This is the recovery command for sessions that started without completing the startup sequence.
