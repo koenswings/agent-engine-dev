@@ -1,6 +1,6 @@
 # Design: Native Engine Test Setup
 
-**Status:** Partially Implemented (PR 1 of 6 complete — disk simulation infrastructure)  
+**Status:** Partially Implemented (PR 2 of 6 complete — disk simulation + instance lifecycle)  
 **Author:** Axle (Engine Developer)  
 **Date:** 2025-07-11  
 **Backlog item:** Engine — Test setup design
@@ -395,6 +395,106 @@ test/
 | Real USB hardware detection | ✗ (simulated) | ✗ (simulated) |
 | Works without internet | ✗ (image pull) | ✓ |
 | Works on production system | ✗ (fixtures needed) | ✓ |
+
+---
+
+## Store Assertions
+
+Every test that touches the Automerge store must verify specific fields — not just that
+the engine "did something". The tables below document the complete assertion contract
+for each test file. Fields in _italics_ are not yet asserted (planned in the PR noted).
+
+---
+
+### PR 1 — `disk-dock-undock.test.ts`
+
+Assertions against `diskDB` only.
+
+| Test | Store field | Assertion |
+|---|---|---|
+| dock | `diskDB[*].device` | some entry has `device === TEST_DEVICE` |
+| dock | `diskDB[*].dockedTo` | that entry has `dockedTo === localEngineId` |
+| dock | `diskDB[*].id` | that entry's `id` includes the fixture name |
+| undock | `diskDB[*]` | no entry with `device === TEST_DEVICE` AND `dockedTo === localEngineId` |
+| re-dock | `diskDB[*].device` + `.dockedTo` | same as dock |
+
+---
+
+### PR 2 — `instance-lifecycle.test.ts`
+
+Assertions against `instanceDB`, `appDB`, `diskDB`, and one out-of-store HTTP check.
+
+**After dock (instance reaches `Running`):**
+
+| Store field | Assertion |
+|---|---|
+| `instanceDB[id].status` | `=== 'Running'` |
+| `instanceDB[id].port` | `> 0` |
+| `instanceDB[id].storedOn` | is a string (disk id) |
+| `instanceDB[id].instanceOf` | is a string containing the app name |
+| `instanceDB[id].name` | is a non-empty string |
+| `instanceDB[id].serviceImages` | is a non-empty array |
+| `instanceDB[id].created` | `> 0` (set at first dock) |
+| `instanceDB[id].lastStarted` | `> 0` (set when `runInstance` fires) |
+| `appDB` | at least one entry whose key includes the app name |
+| _(out of store)_ | HTTP GET on `localhost:${port}` returns 2xx |
+
+**After undock (instance reaches `Undocked`):**
+
+| Store field | Assertion |
+|---|---|
+| `instanceDB[id]` | entry still exists (retained by design — not deleted on undock) |
+| `instanceDB[id].status` | `=== 'Undocked'` |
+| `diskDB` | no entry with `device === TEST_DEVICE` AND `dockedTo !== null` |
+| _(out of store)_ | HTTP GET on same port times out (no response) |
+
+---
+
+### PR 3 — `app-versioning.test.ts` and `app-upgrade.test.ts`
+
+| Test | Store field | Assertion |
+|---|---|---|
+| minor upgrade | `instanceDB[id].lastStarted` | updated on re-dock with new version |
+| minor upgrade | `instanceDB[id].instanceOf` | reflects new `appId` (e.g. `sample-1.1`) |
+| minor upgrade | `appDB` | entry for new version exists; old version entry still present |
+| major upgrade | engine behaviour | instance stays `Docked`, never reaches `Running` (blocked) |
+| major upgrade | `instanceDB[id].status` | `=== 'Docked'` — upgrade refused, not an `Error` |
+
+---
+
+### PR 4 — `network-sync.test.ts` and `engine-join-leave.test.ts`
+
+| Test | Store field | Assertion |
+|---|---|---|
+| engine startup | `engineDB[localEngineId]` | entry exists with correct `id` and `hostname` |
+| engine startup | `engineDB[localEngineId].lastBooted` | `> 0` |
+| mDNS discovery | `engineDB[remoteEngineId]` | entry appears within discovery window |
+| CRDT sync | remote store `diskDB[id]` | reflects local dock after sync window |
+| CRDT sync | remote store `instanceDB[id].status` | `=== 'Running'` after sync |
+| engine leave | `engineDB[remoteEngineId].lastHalted` | `> lastBooted` |
+| engine rejoin | `engineDB[remoteEngineId].lastBooted` | updated on restart; sync resumes |
+
+---
+
+### PR 5 — `field-health.test.ts` (diagnostic mode)
+
+| Test | Store field | Assertion |
+|---|---|---|
+| dock cycle | `instanceDB[id].created` | valid ISO-compatible timestamp (> 0) |
+| dock cycle | `instanceDB[id].lastStarted` | updated after re-dock |
+| dock cycle | `instanceDB[id].lastBackedUp` | `=== 0` or a valid timestamp (never `undefined`) |
+| dock cycle | `instanceDB[id].serviceImages` | non-empty array matching compose service names |
+| smoke test | _(out of store)_ | HTTP GET on `localhost:${port}` returns 2xx |
+
+---
+
+### Not asserted (by design)
+
+| Field | Reason |
+|---|---|
+| `instanceDB[id].lastBackedUp` (PR 1–4) | Backup feature not yet implemented; field stays `0` |
+| `engineDB` in Tier 1 tests | Only meaningful in multi-engine context (PR 4) |
+| `diskDB` during lifecycle tests (PR 1) | Covered in `disk-dock-undock.test.ts`; lifecycle tests cross-check only after undock |
 
 ---
 
