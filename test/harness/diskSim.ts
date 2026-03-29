@@ -174,3 +174,35 @@ export const waitForHttp = async (
     }
     return false
 }
+
+/**
+ * Poll an HTTP URL until the connection is refused (container is down), or the
+ * timeout is reached. Returns true if the port went silent, false if it was
+ * still responding when the timeout expired.
+ *
+ * Use this for post-undock assertions — waitForHttp(url, 3s) is unreliable
+ * because the engine sets status=Undocked immediately after container.stop(),
+ * but the kernel may still deliver packets for a brief moment while the
+ * container process exits. waitForHttpDown confirms the port is actually closed.
+ */
+export const waitForHttpDown = async (
+    url: string,
+    timeoutMs = 10_000,
+    intervalMs = 300,
+): Promise<boolean> => {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+        try {
+            const controller = new AbortController()
+            const timer = setTimeout(() => controller.abort(), intervalMs)
+            await fetch(url, { signal: controller.signal })
+            clearTimeout(timer)
+            // Got a response — container still up; keep polling
+        } catch {
+            // Connection refused or aborted — container is down
+            return true
+        }
+        await new Promise(r => setTimeout(r, intervalMs))
+    }
+    return false // still responding at timeout
+}

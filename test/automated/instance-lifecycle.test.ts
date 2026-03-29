@@ -40,7 +40,7 @@
  *     instanceDB[id]               still exists (retained by design — not deleted on undock)
  *     instanceDB[id].status        === 'Undocked'
  *     diskDB                       has no active (dockedTo != null) entry for test device
- *     HTTP GET on same port        times out (no response)
+ *     port                         goes silent within 10 s (waitForHttpDown)
  */
 
 import { describe, it, before, after } from 'mocha'
@@ -56,6 +56,7 @@ import {
     cleanupDisk,
     waitForStatus,
     waitForHttp,
+    waitForHttpDown,
     cleanupContainers,
     FIXTURES_DIR,
     TEST_DEVICE,
@@ -73,6 +74,10 @@ describe('Instance lifecycle (automated, real containers)', () => {
 
     before(async function () {
         this.timeout(15_000)
+        // Defensive cleanup: disk-dock-undock after() removes disk + containers, but a
+        // second cleanupContainers pass here ensures no orphan containers remain before
+        // we create a fresh store and watcher.
+        await cleanupContainers(TEST_INSTANCE_ID)
         const ctx = await createTestStore()
         storeHandle = ctx.storeHandle
         await enableUsbDeviceMonitor(storeHandle)
@@ -160,8 +165,11 @@ describe('Instance lifecycle (automated, real containers)', () => {
         expect(activeDiskEntry, 'diskDB should have no active (dockedTo) entry for test device after undock').to.be.undefined
 
         // ── HTTP health check ─────────────────────────────────────────────────
-        // Verify the container is no longer serving traffic
-        const stillAlive = await waitForHttp(`http://${TEST_HOST}:${instancePort}/`, 3_000)
-        expect(stillAlive, 'container should not respond after undock').to.be.false
+        // waitForHttpDown polls until the port is closed (connection refused).
+        // This is more reliable than a one-shot check: the engine sets status=Undocked
+        // immediately after container.stop(), but the kernel may still deliver packets
+        // for a brief moment while the container process fully exits.
+        const wentDown = await waitForHttpDown(`http://${TEST_HOST}:${instancePort}/`, 10_000)
+        expect(wentDown, 'container should stop responding within 10 s after undock').to.be.true
     })
 })

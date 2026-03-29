@@ -49,14 +49,18 @@ describe('Disk dock / undock (automated, testMode)', () => {
 
     after(async function () {
         this.timeout(30_000)
-        // Close the watcher before cleanup — prevents it from firing on subsequent test suites
-        // that run in the same mocha process.
+        // Close the watcher — no new dock events will fire after this.
         await watcher?.close()
-        // Remove sentinel and force-remove any containers started by the dock events.
-        // cleanupContainers must run before cleanupDisk (needs the disk to exist).
         await fs.remove(SENTINEL).catch(() => {})
-        await cleanupContainers(TEST_INSTANCE_ID)
+        // Remove the disk FIRST: any in-flight startInstance triggered by the re-dock
+        // test will fail when it next tries to read compose.yaml or write .env. This
+        // cuts off new container creation before we clean up what already exists.
         await cleanupDisk(TEST_DEVICE)
+        // Allow in-flight Docker operations to fail and release their handles.
+        await new Promise(r => setTimeout(r, 2_000))
+        // Final container cleanup — removes anything that was created before the disk
+        // was removed. cleanupContainers uses docker rm -f and does not need the disk.
+        await cleanupContainers(TEST_INSTANCE_ID)
     })
 
     it('registers a disk in the store when a fixture is docked', async function () {
