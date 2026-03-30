@@ -14,19 +14,19 @@ Unix users:
 
 | Actor | User | Creates files in |
 |---|---|---|
-| Engine process (pm2, runtime) | root (see below) | `store-data/`, `store-identity/`, `/disks/` |
-| OpenClaw sandbox (AI agent) | root (container uid 0) | `dist/`, `node_modules/` |
+| Engine process (pm2, runtime) | root (see §Current State) | `store-data/`, `store-identity/` |
+| OpenClaw sandbox (AI agent) | root (Docker default) | `dist/`, `node_modules/` |
 | Pi shell / `run-tests.sh` | `pi` | `dist/` (via `pnpm build`) |
 | `build-engine` provisioning | `pi` (SSH as pi) | whole repo |
 
-The build step (`pnpm clean && tsc`) writes to `dist/`. `pnpm clean` does `rm -fr dist/*`.
-
 When the sandbox runs a build, `dist/` is created owned by root. When `run-tests.sh`
-then runs as `pi`, `pnpm clean` fails: *Permission denied*. This blocks every SSH-triggered
-test run until someone manually fixes ownership.
+then runs as `pi`, `pnpm clean` (`rm -fr dist/*`) fails: *Permission denied*.
 
-This is a symptom of an inconsistency in the run architecture. The deeper question:
-**which user should own what, and which user should the Engine run as?**
+This is a symptom of two overlapping problems:
+1. The Engine runs as root when it should not.
+2. The OpenClaw sandbox also runs as root — but it does not have to.
+
+Both are addressed below.
 
 ---
 
@@ -56,78 +56,46 @@ Looking at `usbDeviceMonitor.ts` and `Instance.ts`:
 | Remove mount point | `sudo rm -fr /disks/${device}` | root (directory ownership) |
 | Create mount point | `sudo mkdir -p /disks/${device}` | root (writing to `/disks/`) |
 | Docker operations | `docker compose up/down` | docker group membership |
-| Nextcloud post-start | `sudo docker exec ... runuser ...` | root |
+| Nextcloud post-start | `sudo docker exec ... runuser ...` | unnecessary once Engine runs as `pi` |
 
 ### Source file ownership
 
-`build-engine.ts` explicitly sets source ownership to `pi`:
+`build-engine.ts` explicitly sets source ownership to `pi:pi`:
 
 ```ts
 await exec`sudo chown -R pi:pi ${permanentEnginePath}`
 ```
 
 So the intended owner of the source tree is `pi` — but the pm2 process runs as root.
+This inconsistency is the root cause.
 
 ### What the `pi` user can do
 
-- Full `sudo` (Raspberry Pi OS default: `pi ALL=(ALL) NOPASSWD: ALL`)
+- Full passwordless `sudo` (Raspberry Pi OS default: `pi ALL=(ALL) NOPASSWD: ALL`)
 - In `docker` group (added by `installDocker`)
 
 ---
 
-## The Conflict
+## Problem 1: Engine running as root
 
-Root cause: **two different actors write to the same directories under different uids.**
+### Why it is wrong
 
-```
-Sandbox (root) ──→ builds dist/ ──→ dist/ owned by root:root
-Pi / run-tests.sh (pi) ──→ pnpm clean → rm -fr dist/* → PERMISSION DENIED
-```
+Running application code as root is a security anti-pattern regardless of environment.
+More practically: if the Engine (as root) ever writes a file into the source tree at
+runtime, that file becomes root-owned and `pi` cannot modify it. Any future split
+between "what the Engine writes" and "what the developer edits" becomes a permission
+problem.
 
-A second conflict exists between the Engine runtime (root) and development tooling (pi):
-if the Engine ever writes to a file in the source tree at runtime, that file becomes
-root-owned and `pi` cannot modify it.
-
-The root of both problems is the same: **the Engine runs as root when it should not.**
-
----
-
-## Proposed Architecture
-
-### Decision: Engine runs as `pi`, not root
+### Fix: Engine runs as `pi`, not root
 
 The Engine does not need to run as root. It needs:
 1. `sudo` for a small, fixed set of mount/umount commands
 2. Docker group membership for `docker compose`
 
-Both of these are available to the `pi` user already. The correct pattern is:
-**run the Engine as `pi`, grant `pi` passwordless sudo for the specific commands it needs.**
+Both are already available to `pi`. The correct pattern: run as `pi`, grant `pi`
+passwordless sudo for the specific commands it needs.
 
-This is standard Unix practice for services that require limited elevated operations.
-
-### Changes required
-
-#### 1. Sudoers rule — targeted sudo for Engine operations
-
-Create `/etc/sudoers.d/engine` on each Pi:
-
-```
-# Engine — passwordless sudo for disk mount/unmount operations only
-pi ALL=(root) NOPASSWD: /bin/mount -t ext4 /dev/* /disks/*
-pi ALL=(root) NOPASSWD: /bin/umount /disks/*
-pi ALL=(root) NOPASSWD: /bin/mkdir -p /disks/*
-pi ALL=(root) NOPASSWD: /bin/rm -fr /disks/*
-pi ALL=(root) NOPASSWD: /bin/rm -fr /disks/old/*
-pi ALL=(root) NOPASSWD: /bin/mv /disks/* /disks/old/*
-```
-
-This replaces the current `NOPASSWD: ALL` pattern with minimal, auditable permissions.
-
-> **Note:** Raspberry Pi OS ships with `pi ALL=(ALL) NOPASSWD: ALL` by default.
-> That broad grant already covers what the Engine needs. The change here is to make
-> the intent explicit and to open the door to removing the blanket grant later.
-
-#### 2. pm2 startup — run as `pi`, not root
+#### Change A — pm2 startup as `pi`
 
 Change `build-engine.ts` from:
 
@@ -140,131 +108,177 @@ await exec`sudo pm2 startup`
 To:
 
 ```ts
-// Start engine as pi (no sudo — pi is the acting user)
-await exec`pm2 start pm2.config.cjs --env production`
+await exec`pm2 start pm2.config.cjs --env production`  // no sudo — pi is the acting user
 await exec`pm2 save`
-// Generate startup script (this still needs root to install the systemd unit)
 const startupCmd = (await exec`pm2 startup systemd -u pi --hp /home/pi`).stdout.trim()
-// The output of pm2 startup is a sudo command — run it
-await exec`${startupCmd}`
+await exec`${startupCmd}`  // pm2 startup prints a sudo command; run it
 ```
 
-`pm2 startup systemd -u pi --hp /home/pi` generates a systemd unit that runs the pm2
-daemon as the `pi` user. The Engine process it manages also runs as `pi`.
+`pm2 startup systemd -u pi --hp /home/pi` generates a systemd unit that runs pm2 as
+`pi`. The Engine it manages also runs as `pi`.
 
-#### 3. Source tree and build artifacts — owned by `pi:pi`
+#### Change B — targeted sudoers rule for mount operations
 
-No change to the existing `chown -R pi:pi` in `build-engine.ts`. This is already correct.
+Create `/etc/sudoers.d/engine`:
 
-What changes: the sandbox (OpenClaw container, root) must not leave root-owned files in
-the source tree. Two mechanisms enforce this:
-
-**a) `run-tests.sh` — defensive cleanup before build (already fixed in PR #17):**
-
-```bash
-sudo rm -rf "$ENGINE_DIR/dist/"
+```sudoers
+# Engine — passwordless sudo for disk mount/unmount operations only
+pi ALL=(root) NOPASSWD: /bin/mount -t ext4 /dev/* /disks/*
+pi ALL=(root) NOPASSWD: /bin/umount /disks/*
+pi ALL=(root) NOPASSWD: /bin/mkdir -p /disks/*
+pi ALL=(root) NOPASSWD: /bin/rm -fr /disks/*
+pi ALL=(root) NOPASSWD: /bin/rm -fr /disks/old/*
+pi ALL=(root) NOPASSWD: /bin/mv /disks/* /disks/old/*
 ```
 
-This handles any root-owned `dist/` left by sandbox builds. Safe: `dist/` is gitignored.
+**This file must be deployed via `build-engine.ts` provisioning,** using the same
+`copyAsset()` mechanism already used for the udev rules:
 
-**b) Sandbox test scripts — clean up after builds:**
-
-After every sandbox build or test run, the sandbox should run `pnpm clean`. The sandbox
-runs as root, so it can delete root-owned files. The Pi never sees them.
-
-This should be added to the engine's test scripts:
-
-```json
-"test:unit": "pnpm build && ... vitest run ... && pnpm clean"
+```ts
+await copyAsset(exec, enginePath, '10-engine.sudoers', '/etc/sudoers.d', false, '0440', '0:0')
 ```
 
-> This is belt-and-suspenders with (a). Either one alone is sufficient; together they
-> guarantee the Pi always starts with a clean slate.
+The asset `script/build_image_assets/10-engine.sudoers` must be created and copied
+alongside the existing `90-docking.rules` step in `installUdev()`. Every Pi that runs
+the Engine provisioning script gets this rule automatically.
 
-#### 4. `/disks/` directory — owned by root, writable by Engine via sudo
+> Note: Raspberry Pi OS ships with `pi ALL=(ALL) NOPASSWD: ALL`. The targeted rule
+> is redundant in the short term but makes the intent explicit and is required if the
+> broad grant is ever removed as part of security hardening.
 
-`/disks/` is the mount point for App Disks. It should be owned by root with no world
-write permission. The Engine accesses it exclusively via `sudo mkdir`, `sudo mount`,
-`sudo umount`, `sudo rm` — the sudoers rule in (1) covers all of these.
+---
+
+## Problem 2: OpenClaw sandbox running as root
+
+### Why this is not inevitable
+
+Docker containers default to running as root because most images do not specify a `USER`.
+This is a convenience default, not a requirement. OpenClaw's sandbox can be started with:
 
 ```
-drwxr-xr-x  root:root  /disks/
+--user 1000:1000
 ```
 
-No change needed here — this is the natural state when `mkdir /disks` is run as root
-during provisioning.
+(where 1000 is the `pi` user's uid/gid on a standard Raspberry Pi OS install)
 
-#### 5. Nextcloud-specific `sudo docker exec`
+If the sandbox runs as `pi`, every file it creates — `dist/`, `node_modules/`, outputs —
+is owned by `pi`. The Pi's `pnpm clean`, `git pull`, and `run-tests.sh` all work without
+`sudo`. The workaround in `run-tests.sh` (`sudo rm -rf dist/`) becomes unnecessary.
 
-`Instance.ts` uses `sudo docker exec` for Nextcloud post-start configuration. Once the
-Engine runs as `pi` and `pi` is in the `docker` group, these commands do not need
-`sudo`. The `sudo` prefix should be removed.
+### Two paths to fix this
 
-> This is an implementation detail — do not change it in this design phase. Flag it as
-> a known TODO in the code comment.
+#### Option 2A — Run OpenClaw sandbox container as `pi` (uid 1000)
+
+Pass `--user 1000:1000` to the Docker run command that starts the OpenClaw sandbox.
+
+Pros: minimal change; OpenClaw remains containerised; ownership problem eliminated at source.  
+Cons: requires knowing the Pi's uid (1000 on standard Raspberry Pi OS); may need to ensure
+the container user can write to shared paths.
+
+This is the right fix if OpenClaw stays in Docker. It should be done regardless of whether
+Problem 1 is fixed, because it eliminates the ownership conflict class entirely.
+
+> **Action:** Koen to check whether OpenClaw's Docker Compose or start command allows
+> `--user` override. If so, add `user: "1000:1000"` to the OpenClaw service definition
+> in `openclaw.json` or the relevant compose file. This is an Atlas (operations) task.
+
+#### Option 2B — Run OpenClaw natively on the Pi (no Docker)
+
+Instead of running OpenClaw in a container, install and run it directly on the Pi as the
+`pi` user.
+
+Pros:
+- OpenClaw runs as `pi` by default — no ownership conflict, ever
+- Simpler mental model: one filesystem, one user, no container boundary
+- No `--user` configuration needed; works correctly on any Pi regardless of uid
+- Eliminates an entire class of permission bugs permanently
+- The Engine source directory is just a local directory; no shared-filesystem complexity
+
+Cons:
+- Reduced isolation: OpenClaw's `exec` tool has direct access to the Pi's filesystem as `pi`
+  (though it already has this via the shared volume in Docker mode)
+- Updates: `pnpm update` or `git pull` instead of `docker pull`
+- Any OpenClaw dependencies installed globally affect the Pi's system Node.js
+
+Assessment: **For the IDEA use case, this is a reasonable choice.** The Pi is a trusted
+development machine, not a public-facing server. The isolation Docker provides is minimal
+in practice — the sandbox already has access to the full source tree via the shared volume.
+Native OpenClaw is simpler, more transparent, and eliminates the ownership problem by design.
+
+**Recommendation:** Evaluate Option 2B seriously. If it works with OpenClaw's current
+install path, prefer it over Option 2A.
 
 ---
 
 ## Ownership Map (target state)
 
+Assuming Problem 1 (Engine as `pi`) and Problem 2 (sandbox as `pi`) are both fixed:
+
 | Path | Owner | Writable by |
 |---|---|---|
-| `/home/pi/idea/agents/agent-engine-dev/` | `pi:pi` | `pi` (git, pnpm, tests) |
-| `dist/` | `pi:pi` | `pi` (tsc); sandbox cleans up after itself |
+| `/home/pi/idea/agents/agent-engine-dev/` | `pi:pi` | `pi` (all actors) |
+| `dist/` | `pi:pi` | `pi` (tsc, sandbox, run-tests.sh) |
 | `node_modules/` | `pi:pi` | `pi` (pnpm install) |
 | `store-data/` | `pi:pi` | Engine process (as `pi`) |
 | `store-identity/` | `pi:pi` | Engine process (as `pi`); read-only after init |
-| `/disks/` | `root:root` | Engine process (as `pi`) via sudoers |
+| `/disks/` | `root:root` | Engine (as `pi`) via sudoers |
 | `/disks/sdX1/` (mount points) | `root:root` | Engine via `sudo mount/umount` |
+
+If only Problem 1 is fixed (sandbox still runs as root), the `run-tests.sh` workaround
+(`sudo rm -rf dist/`) is still needed, and builds triggered by the sandbox leave
+root-owned files until they are cleaned up.
 
 ---
 
 ## What this does NOT change
 
-- The `pi` user's broad sudo grant (`NOPASSWD: ALL`) is not removed in this design.
-  That is a separate security hardening task (healthcheck skill scope).
 - App Disk format, META.yaml, instance lifecycle — unchanged.
-- Docker Compose invocations — unchanged (already work without root).
-- The OpenClaw sandbox runs as root — unchanged. The sandbox cleans up its own
-  build artifacts as part of this design.
+- Docker Compose invocations for app instances — unchanged (already work without root).
+- The `pi` user's broad sudo grant — not removed in this design (separate hardening task).
 
 ---
 
 ## Open Questions
 
-1. **`node_modules/` ownership after sandbox `pnpm install`:** If the sandbox runs
-   `pnpm install` (e.g. to add a new devDependency), `node_modules/` may become
-   partially root-owned. `run-tests.sh` uses `CI=true pnpm install --frozen-lockfile`
-   which updates node_modules in-place. If the lockfile hasn't changed since the
-   last Pi-local install, pnpm skips the update entirely and ownership is preserved.
-   If the lockfile has changed and pnpm needs to install new packages into existing
-   root-owned directories, it may fail. **Mitigation:** `run-tests.sh` could also
-   run `sudo chown -R pi:pi node_modules/` before the install step, but this is slow
-   (~30 s on Pi). Accept the current behaviour for now; address if it causes failures.
+1. **OpenClaw Docker user:** Can `--user 1000:1000` be passed via `openclaw.json` or the
+   compose file? Does the OpenClaw image work correctly as non-root?
 
-2. **Nextcloud `sudo docker exec`:** Once Engine runs as `pi` (in docker group), the
-   `sudo` prefix on these commands is unnecessary. Remove in a follow-up code change.
+2. **Native OpenClaw viability:** Does OpenClaw support a native (non-Docker) install on
+   Raspberry Pi OS (arm64)? What does the install look like?
 
-3. **`/disks/` creation during provisioning:** Currently `build-engine.ts` creates
-   `/disks/` as root. After this design, the Engine running as `pi` will call
-   `sudo mkdir -p /disks/${device}` per the sudoers rule. Verify the sudoers pattern
-   covers `mkdir` on nested paths (e.g. `/disks/sda1`).
+3. **`node_modules/` after sandbox `pnpm install`:** If the sandbox (as root or as pi)
+   runs `pnpm install` to add a new devDependency, the lockfile changes. The next
+   `run-tests.sh` pull and `pnpm install` must succeed. Verify this works with
+   `CI=true pnpm install --frozen-lockfile` once the sandbox user is fixed.
+
+4. **Nextcloud `sudo docker exec`:** These lines use `sudo docker exec` unnecessarily
+   once the Engine runs as `pi` (which is in the docker group). Remove `sudo` prefix
+   in a follow-up code change.
+
+5. **`/disks/` mkdir during provisioning:** `build-engine.ts` creates `/disks/` as root.
+   The Engine running as `pi` will use `sudo mkdir -p /disks/${device}` per the sudoers
+   rule. Verify the sudoers pattern covers nested paths (e.g. `/disks/sda1`).
 
 ---
 
 ## Implementation Plan
 
-This design requires changes in two repos:
+Depends on decision for Problem 2 (Option 2A vs 2B):
 
-**`agent-engine-dev` repo (Axle):**
-- [ ] Remove `sudo` prefix from `pm2 start`, `pm2 save`; update `pm2 startup` call in `Engine.ts`
-- [ ] Add `pnpm clean` step at end of `test:unit` and `test:diagnostic` scripts
-- [ ] Add TODO comment on Nextcloud `sudo docker exec` lines
+**Both options require (Engine repo — Axle):**
+- [ ] Add `script/build_image_assets/10-engine.sudoers`
+- [ ] Add `copyAsset()` call in `installUdev()` in `Engine.ts` to deploy it
+- [ ] Update `startEngine()` in `Engine.ts`: remove `sudo` from `pm2 start`/`pm2 save`; update `pm2 startup` call
+- [ ] Remove `sudo` from Nextcloud `docker exec` lines in `Instance.ts` (follow-up)
 
-**`idea` org repo (Atlas — provisioning):**
-- [ ] Add sudoers rule file `build_image_assets/10-engine.sudoers`
-- [ ] Add `copyAsset(exec, enginePath, '10-engine.sudoers', '/etc/sudoers.d', true, '0440', '0:0')` to `build-engine.ts`
-- [ ] Update `build-engine.ts` pm2 startup sequence
+**If Option 2A (Docker, `--user 1000:1000`) — Atlas:**
+- [ ] Add `user: "1000:1000"` to OpenClaw service definition
+- [ ] Remove `sudo rm -rf dist/` workaround from `run-tests.sh` (no longer needed)
 
-These changes are **not** a single atomic commit — the sudoers rule and pm2 fix must
-land together (if pm2 changes before the sudoers rule exists, mount operations will fail).
+**If Option 2B (native OpenClaw) — Atlas:**
+- [ ] Remove OpenClaw Docker service; install OpenClaw natively as `pi`
+- [ ] Remove `sudo rm -rf dist/` workaround from `run-tests.sh` (no longer needed)
+- [ ] Update `openclaw/README.md` with native install instructions
+
+**pm2 + sudoers must land together** — if pm2 changes before the sudoers rule is
+deployed, mount operations will fail.
