@@ -1,6 +1,6 @@
 # Design: Native Engine Test Setup
 
-**Status:** Partially Implemented (PR 4 of 6 complete — disk simulation + instance lifecycle + app versioning + engine network)  
+**Status:** Partially Implemented (PR 5 of 6 complete — disk simulation + instance lifecycle + app versioning + engine network + field health diagnostic)  
 **Author:** Axle (Engine Developer)  
 **Date:** 2025-07-11  
 **Backlog item:** Engine — Test setup design
@@ -507,15 +507,33 @@ proposed (data-format incompatible). See `isMajorUpgrade()` in `App.ts`.
 
 ---
 
-### PR 5 — `field-health.test.ts` (diagnostic mode)
+### PR 5 — `test/diagnostic/field-health.test.ts`
 
-| Test | Store field | Assertion |
-|---|---|---|
-| dock cycle | `instanceDB[id].created` | valid ISO-compatible timestamp (> 0) |
-| dock cycle | `instanceDB[id].lastStarted` | updated after re-dock |
-| dock cycle | `instanceDB[id].lastBackedUp` | `=== 0` or a valid timestamp (never `undefined`) |
-| dock cycle | `instanceDB[id].serviceImages` | non-empty array matching compose service names |
-| smoke test | _(out of store)_ | HTTP GET on `localhost:${port}` returns 2xx |
+Two modes: **fixture** (default, always runs) and **live** (`IDEA_DIAGNOSTIC_LIVE=true`).
+
+Run with: `pnpm test:diagnostic` — writes a timestamped report to `test/testresults/`.
+
+**Fixture mode (12 tests):**
+
+| Field | Assertion |
+|---|---|
+| `id` | non-empty string |
+| `instanceOf` | non-empty string containing app name |
+| `name` | non-empty string |
+| `status` | `=== 'Running'` |
+| `port` | `> 0` |
+| `storedOn` | non-empty string (disk id) |
+| `serviceImages` | non-empty array; each element is a Docker image reference string |
+| `created` | `> 0` (timestamp, set at first dock) |
+| `lastStarted` | `> 0` (timestamp, set when `runInstance` fires) |
+| `lastBackedUp` | `>= 0` (0 = never backed up; must never be `undefined`) |
+| HTTP health | GET on `localhost:${port}` returns 2xx |
+
+**Live mode (2 tests, skips unless `IDEA_DIAGNOSTIC_LIVE=true`):**
+
+Reads the real store from `./store-identity/store-url.txt`. Checks all currently
+running instances. If no instances are running, passes with no assertions.
+Use on a field Pi to verify system health without touching hardware.
 
 ---
 

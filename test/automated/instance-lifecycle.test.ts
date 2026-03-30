@@ -30,7 +30,8 @@
  *     instanceDB[id].storedOn      is a string (disk id)
  *     instanceDB[id].instanceOf    is a string containing the app name
  *     instanceDB[id].name          is a non-empty string
- *     instanceDB[id].serviceImages is a non-empty array
+ *     instanceDB[id].serviceImages is a non-empty array; each element is the Docker image name
+ *     instanceDB[id].lastBackedUp  >= 0 (0 = never backed up; never undefined)
  *     instanceDB[id].created       > 0 (set at first dock)
  *     instanceDB[id].lastStarted   > 0 (set in runInstance)
  *     appDB                        has at least one entry for the docked app
@@ -113,10 +114,23 @@ describe('Instance lifecycle (automated, real containers)', () => {
 
         // ── service metadata ─────────────────────────────────────────────────
         expect(instance.serviceImages, 'serviceImages should be a non-empty array').to.be.an('array').that.is.not.empty
+        // Content check: each element should be a non-empty image reference string
+        for (const image of instance.serviceImages) {
+            expect(image, 'each serviceImage should be a non-empty string').to.be.a('string').that.is.not.empty
+        }
+        // The fixture uses traefik/whoami — verify the image is recorded correctly
+        expect(instance.serviceImages, 'serviceImages should contain the fixture image')
+            .to.include('traefik/whoami')
 
         // ── timestamps ───────────────────────────────────────────────────────
         expect(instance.created, 'created timestamp should be set at first dock').to.be.greaterThan(0)
         expect(instance.lastStarted, 'lastStarted should be set after reaching Running').to.be.greaterThan(0)
+
+        // ── backup state ──────────────────────────────────────────────────────
+        // lastBackedUp is initialised to 0 (never backed up). It must always be a
+        // number — never undefined or null — so the Console can safely display it.
+        expect(instance.lastBackedUp, 'lastBackedUp should be a number (0 = never backed up)')
+            .to.be.a('number').that.is.at.least(0)
 
         // ── appDB cross-check ─────────────────────────────────────────────────
         // Apps are registered when the disk is processed; verify at least one app
