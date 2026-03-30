@@ -9,8 +9,7 @@
  * /disks/sdz1/ and touches /dev/engine/sdz1 to simulate the chokidar event.
  */
 
-import { describe, it, before, after } from 'mocha'
-import { expect } from 'chai'
+import { describe, it, beforeAll, afterAll, expect } from 'vitest'
 import path from 'path'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Store } from '../../src/data/Store.js'
@@ -36,19 +35,16 @@ describe('Disk dock / undock (automated, testMode)', () => {
     let storeHandle: DocHandle<Store>
     let watcher: Awaited<ReturnType<typeof enableUsbDeviceMonitor>>
 
-    before(async function () {
-        this.timeout(15_000)
-
+    beforeAll(async () => {
         // Create in-memory store with local engine registered
         const ctx = await createTestStore()
         storeHandle = ctx.storeHandle
 
         // Start the USB device monitor (no mDNS, no WebSocket — disk events only)
         watcher = await enableUsbDeviceMonitor(storeHandle)
-    })
+    }, 15_000)
 
-    after(async function () {
-        this.timeout(30_000)
+    afterAll(async () => {
         // Close the watcher — no new dock events will fire after this.
         await watcher?.close()
         await fs.remove(SENTINEL).catch(() => {})
@@ -61,11 +57,9 @@ describe('Disk dock / undock (automated, testMode)', () => {
         // Final container cleanup — removes anything that was created before the disk
         // was removed. cleanupContainers uses docker rm -f and does not need the disk.
         await cleanupContainers(TEST_INSTANCE_ID)
-    })
+    }, 30_000)
 
-    it('registers a disk in the store when a fixture is docked', async function () {
-        this.timeout(15_000)
-
+    it('registers a disk in the store when a fixture is docked', { timeout: 15_000 }, async () => {
         await dockFixture(FIXTURE_SAMPLE_V1)
 
         const docked = await waitFor(storeHandle, store => {
@@ -86,9 +80,7 @@ describe('Disk dock / undock (automated, testMode)', () => {
     // Tests 2 and 3 depend on the store state established by Test 1 (disk docked).
     // They run in sequence: dock → undock → re-dock. This is intentional: the
     // dock/undock cycle is inherently stateful and is best verified as a sequence.
-    it('removes the disk from the store when undocked', async function () {
-        this.timeout(15_000)
-
+    it('removes the disk from the store when undocked', { timeout: 15_000 }, async () => {
         await triggerUndock()
 
         const undocked = await waitFor(storeHandle, store => {
@@ -100,9 +92,7 @@ describe('Disk dock / undock (automated, testMode)', () => {
         expect(undocked, 'disk should be removed from store within 10 s').to.be.true
     })
 
-    it('re-registers the disk after a second dock', async function () {
-        this.timeout(15_000)
-
+    it('re-registers the disk after a second dock', { timeout: 15_000 }, async () => {
         await dockFixture(FIXTURE_SAMPLE_V1)
 
         const redocked = await waitFor(storeHandle, store => {

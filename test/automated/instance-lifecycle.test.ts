@@ -44,8 +44,7 @@
  *     port                         goes silent within 10 s (waitForHttpDown)
  */
 
-import { describe, it, before, after } from 'mocha'
-import { expect } from 'chai'
+import { describe, it, beforeAll, afterAll, expect } from 'vitest'
 import path from 'path'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Store } from '../../src/data/Store.js'
@@ -73,27 +72,24 @@ describe('Instance lifecycle (automated, real containers)', () => {
     let storeHandle: DocHandle<Store>
     let instancePort: number
 
-    before(async function () {
-        this.timeout(15_000)
-        // Defensive cleanup: disk-dock-undock after() removes disk + containers, but a
+    beforeAll(async () => {
+        // Defensive cleanup: disk-dock-undock afterAll() removes disk + containers, but a
         // second cleanupContainers pass here ensures no orphan containers remain before
         // we create a fresh store and watcher.
         await cleanupContainers(TEST_INSTANCE_ID)
         const ctx = await createTestStore()
         storeHandle = ctx.storeHandle
         await enableUsbDeviceMonitor(storeHandle)
-    })
+    }, 15_000)
 
-    after(async function () {
-        this.timeout(30_000)
+    afterAll(async () => {
         await fs.remove(SENTINEL).catch(() => {})
         await cleanupContainers(TEST_INSTANCE_ID)
         await cleanupDisk(TEST_DEVICE)
-    })
+    }, 30_000)
 
-    it('instance reaches Running and container responds to HTTP after dock', async function () {
+    it('instance reaches Running and container responds to HTTP after dock', { timeout: 120_000 }, async () => {
         // Allow up to 90 s: Docker pull (first run) + compose create + compose up
-        this.timeout(120_000)
 
         await dockFixture(FIXTURE_SAMPLE_V1)
 
@@ -149,8 +145,7 @@ describe('Instance lifecycle (automated, real containers)', () => {
         expect(healthy, `traefik/whoami should respond on http://${TEST_HOST}:${instancePort}/`).to.be.true
     })
 
-    it('instance reaches Undocked and container stops responding after undock', async function () {
-        this.timeout(30_000)
+    it('instance reaches Undocked and container stops responding after undock', { timeout: 30_000 }, async () => {
 
         await triggerUndock()
 

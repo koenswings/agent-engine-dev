@@ -28,11 +28,9 @@
     "testDB": "tsc --build --clean && tsc && YPERSISTENCE=./yjs-db mocha 'dist/test/*.js' --exit",
     "testdevDB": "tsc --build --clean && tsc && YPERSISTENCE=./yjs-db VERBOSITY=3 mocha --reporter list 'dist/test/*.js' --exit",
     "test": "pnpm test:full",
-    "test:full": "pnpm build && bash -c 'mkdir -p test/testresults; OUT=test/testresults/test-full-$(date -u +%Y-%m-%d-%H%M).log; { echo \"Suite: test:full | $(date -u) | Branch: $(git branch --show-current) | Commit: $(git rev-parse --short HEAD)\"; echo \"---\"; IDEA_TEST_MODE=true node_modules/.bin/mocha dist/test/0*.test.js dist/test/automated/*.test.js --exit; } 2>&1 | tee $OUT; RET=${PIPESTATUS[0]}; echo \"Results written to $OUT\"; exit $RET'",
-    "test:unit": "pnpm build && bash -c 'mkdir -p test/testresults; OUT=test/testresults/test-unit-$(date -u +%Y-%m-%d-%H%M).log; { echo \"Suite: test:unit | $(date -u) | Branch: $(git branch --show-current) | Commit: $(git rev-parse --short HEAD)\"; echo \"---\"; IDEA_TEST_MODE=true node_modules/.bin/mocha dist/test/automated/*.test.js --exit; } 2>&1 | tee $OUT; RET=${PIPESTATUS[0]}; echo \"Results written to $OUT\"; exit $RET'",
-    "test:diagnostic": "pnpm build && bash -c 'mkdir -p test/testresults; OUT=test/testresults/test-diagnostic-$(date -u +%Y-%m-%d-%H%M).log; { echo \"Suite: test:diagnostic | $(date -u) | Branch: $(git branch --show-current) | Commit: $(git rev-parse --short HEAD)\"; echo \"---\"; IDEA_TEST_MODE=true node_modules/.bin/mocha dist/test/diagnostic/*.test.js --reporter spec --exit; } 2>&1 | tee $OUT; RET=${PIPESTATUS[0]}; echo \"Results written to $OUT\"; exit $RET'",
-    "test:auto": "TEST_MODE=automated pnpm build && mocha 'dist/test/01-e2e-execution.test.js' --exit",
-    "test:config": "pnpm build && mocha 'dist/test/00-config.test.js' --exit",
+    "test:full": "pnpm build && bash -c 'mkdir -p test/testresults; OUT=test/testresults/test-full-$(date -u +%Y-%m-%d-%H%M).log; { echo \"Suite: test:full | $(date -u) | Branch: $(git branch --show-current) | Commit: $(git rev-parse --short HEAD)\"; echo \"---\"; IDEA_TEST_MODE=true node_modules/.bin/vitest run dist/test/automated/; } 2>&1 | tee $OUT; RET=${PIPESTATUS[0]}; echo \"Results written to $OUT\"; exit $RET'",
+    "test:unit": "pnpm build && bash -c 'mkdir -p test/testresults; OUT=test/testresults/test-unit-$(date -u +%Y-%m-%d-%H%M).log; { echo \"Suite: test:unit | $(date -u) | Branch: $(git branch --show-current) | Commit: $(git rev-parse --short HEAD)\"; echo \"---\"; IDEA_TEST_MODE=true node_modules/.bin/vitest run dist/test/automated/; } 2>&1 | tee $OUT; RET=${PIPESTATUS[0]}; echo \"Results written to $OUT\"; exit $RET'",
+    "test:diagnostic": "pnpm build && bash -c 'mkdir -p test/testresults; OUT=test/testresults/test-diagnostic-$(date -u +%Y-%m-%d-%H%M).log; { echo \"Suite: test:diagnostic | $(date -u) | Branch: $(git branch --show-current) | Commit: $(git rev-parse --short HEAD)\"; echo \"---\"; IDEA_TEST_MODE=true node_modules/.bin/vitest run dist/test/diagnostic/; } 2>&1 | tee $OUT; RET=${PIPESTATUS[0]}; echo \"Results written to $OUT\"; exit $RET'",
     "bundle-context": "tsx script/bundle-context.ts"
   },
   "keywords": [],
@@ -52,7 +50,8 @@
     "nodemon": "^3.1.10",
     "ts-morph": "^23.0.0",
     "ts-node": "^10.9.2",
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "vitest": "^4.1.2"
   },
   "dependencies": {
     "@automerge/automerge": "3.1.1-alpha.0",

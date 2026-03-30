@@ -31,8 +31,7 @@
  * A timestamped diagnostic report is written to test/testresults/ after each run.
  */
 
-import { describe, it, before, after } from 'mocha'
-import { expect } from 'chai'
+import { describe, it, beforeAll, afterAll, expect } from 'vitest'
 import path from 'path'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Store, getRunningEngines, getInstances } from '../../src/data/Store.js'
@@ -96,77 +95,70 @@ const writeReport = async (instancesChecked: number) => {
 
 // ── Fixture mode ──────────────────────────────────────────────────────────────
 
-describe('Field health diagnostic (fixture mode)', function () {
+describe.skipIf(LIVE_MODE)('Field health diagnostic (fixture mode)', () => {
     let storeHandle: DocHandle<Store>
     let watcher: Awaited<ReturnType<typeof enableUsbDeviceMonitor>>
-    let instancePort: number
 
-    before(async function () {
-        if (LIVE_MODE) return this.skip()
-        this.timeout(15_000)
+    beforeAll(async () => {
         await cleanupContainers(TEST_INSTANCE_ID)
         const ctx = await createTestStore()
         storeHandle = ctx.storeHandle
         watcher = await enableUsbDeviceMonitor(storeHandle)
-    })
+    }, 15_000)
 
-    after(async function () {
-        if (LIVE_MODE) return
-        this.timeout(30_000)
+    afterAll(async () => {
         await watcher?.close()
         await fs.remove(SENTINEL).catch(() => {})
         await cleanupDisk(TEST_DEVICE)
         await new Promise(r => setTimeout(r, 2_000))
         await cleanupContainers(TEST_INSTANCE_ID)
         await writeReport(1)
-    })
+    }, 30_000)
 
-    it('instance reaches Running after dock', async function () {
-        this.timeout(120_000)
+    it('instance reaches Running after dock', { timeout: 120_000 }, async () => {
         await dockFixture(FIXTURE_SAMPLE_V1)
         const running = await waitForStatus(storeHandle, TEST_INSTANCE_ID, 'Running', 90_000)
         expect(running, 'instance should reach Running within 90 s').to.be.true
     })
 
-    it('id — non-empty string', function () {
+    it('id — non-empty string', () => {
         const inst = storeHandle.doc()!.instanceDB[TEST_INSTANCE_ID as any]
         check('id', inst.id)
         expect(inst.id, 'id should be a non-empty string').to.be.a('string').that.is.not.empty
     })
 
-    it('instanceOf — non-empty string containing app name and version', function () {
+    it('instanceOf — non-empty string containing app name and version', () => {
         const inst = storeHandle.doc()!.instanceDB[TEST_INSTANCE_ID as any]
         check('instanceOf', inst.instanceOf)
         expect(inst.instanceOf, 'instanceOf should be a non-empty string').to.be.a('string').that.is.not.empty
         expect(inst.instanceOf, 'instanceOf should contain app name').to.include('sample')
     })
 
-    it('name — non-empty string', function () {
+    it('name — non-empty string', () => {
         const inst = storeHandle.doc()!.instanceDB[TEST_INSTANCE_ID as any]
         check('name', inst.name)
         expect(inst.name, 'name should be a non-empty string').to.be.a('string').that.is.not.empty
     })
 
-    it('status — Running', function () {
+    it('status — Running', () => {
         const inst = storeHandle.doc()!.instanceDB[TEST_INSTANCE_ID as any]
         check('status', inst.status)
         expect(inst.status).to.equal('Running')
     })
 
-    it('port — positive integer', function () {
+    it('port — positive integer', () => {
         const inst = storeHandle.doc()!.instanceDB[TEST_INSTANCE_ID as any]
-        instancePort = inst.port
         check('port', inst.port)
         expect(inst.port, 'port should be > 0').to.be.greaterThan(0)
     })
 
-    it('storedOn — non-empty string (disk id)', function () {
+    it('storedOn — non-empty string (disk id)', () => {
         const inst = storeHandle.doc()!.instanceDB[TEST_INSTANCE_ID as any]
         check('storedOn', inst.storedOn)
         expect(inst.storedOn, 'storedOn should reference a disk id').to.be.a('string').that.is.not.empty
     })
 
-    it('serviceImages — non-empty array of Docker image references', function () {
+    it('serviceImages — non-empty array of Docker image references', () => {
         const inst = storeHandle.doc()!.instanceDB[TEST_INSTANCE_ID as any]
         check('serviceImages', JSON.stringify(inst.serviceImages))
         expect(inst.serviceImages, 'serviceImages should be a non-empty array').to.be.an('array').that.is.not.empty
@@ -176,27 +168,26 @@ describe('Field health diagnostic (fixture mode)', function () {
         }
     })
 
-    it('created — positive timestamp (set at first dock)', function () {
+    it('created — positive timestamp (set at first dock)', () => {
         const inst = storeHandle.doc()!.instanceDB[TEST_INSTANCE_ID as any]
         check('created', inst.created, 'first dock timestamp')
         expect(inst.created, 'created should be > 0').to.be.greaterThan(0)
     })
 
-    it('lastStarted — positive timestamp (set when runInstance fires)', function () {
+    it('lastStarted — positive timestamp (set when runInstance fires)', () => {
         const inst = storeHandle.doc()!.instanceDB[TEST_INSTANCE_ID as any]
         check('lastStarted', inst.lastStarted, 'set by runInstance')
         expect(inst.lastStarted, 'lastStarted should be > 0').to.be.greaterThan(0)
     })
 
-    it('lastBackedUp — number >= 0 (0 = never backed up)', function () {
+    it('lastBackedUp — number >= 0 (0 = never backed up)', () => {
         const inst = storeHandle.doc()!.instanceDB[TEST_INSTANCE_ID as any]
         check('lastBackedUp', inst.lastBackedUp, inst.lastBackedUp === 0 ? 'never backed up' : 'backup timestamp')
         expect(inst.lastBackedUp, 'lastBackedUp must be a number, never undefined')
             .to.be.a('number').that.is.at.least(0)
     })
 
-    it('HTTP health — container responds 2xx on assigned port', async function () {
-        this.timeout(15_000)
+    it('HTTP health — container responds 2xx on assigned port', { timeout: 15_000 }, async () => {
         const inst = storeHandle.doc()!.instanceDB[TEST_INSTANCE_ID as any]
         const url = `http://${TEST_HOST}:${inst.port}/`
         const healthy = await waitForHttp(url, 10_000)
@@ -207,88 +198,84 @@ describe('Field health diagnostic (fixture mode)', function () {
 
 // ── Live mode ─────────────────────────────────────────────────────────────────
 
-describe('Field health diagnostic (live mode — skips unless IDEA_DIAGNOSTIC_LIVE=true)', function () {
-    let liveInstances: Instance[] = []
+describe.skipIf(!LIVE_MODE)(
+    'Field health diagnostic (live mode — skips unless IDEA_DIAGNOSTIC_LIVE=true)',
+    () => {
+        let liveInstances: Instance[] = []
 
-    before(async function () {
-        if (!LIVE_MODE) return this.skip()
-        this.timeout(10_000)
+        beforeAll(async () => {
+            // Load the real store from disk
+            const storeUrlPath = './store-identity/store-url.txt'
+            if (!fs.existsSync(storeUrlPath)) {
+                process.stdout.write('\nLive mode: store-url.txt not found — engine not initialised on this machine.\n')
+                liveInstances = []
+                return
+            }
 
-        // Load the real store from disk
-        const storeUrlPath = './store-identity/store-url.txt'
-        if (!fs.existsSync(storeUrlPath)) {
-            process.stdout.write('\nLive mode: store-url.txt not found — engine not initialised on this machine.\n')
-            return this.skip()
-        }
+            try {
+                const { Repo } = await import('@automerge/automerge-repo')
+                const { NodeFSStorageAdapter } = await import('@automerge/automerge-repo-storage-nodefs')
+                const storeDataFolder = './store-data'
+                const storeUrlStr     = fs.readFileSync(storeUrlPath, 'utf-8').trim()
+                const storeDocId      = storeUrlStr.replace('automerge:', '') as any
 
-        try {
-            const { Repo } = await import('@automerge/automerge-repo')
-            const { NodeFSStorageAdapter } = await import('@automerge/automerge-repo-storage-nodefs')
-            const storeIdentityFolder = './store-identity'
-            const storeDataFolder     = './store-data'
-            const storeUrlStr         = fs.readFileSync(storeUrlPath, 'utf-8').trim()
-            const storeDocId          = storeUrlStr.replace('automerge:', '') as any
+                const repo = new Repo({
+                    storage: new NodeFSStorageAdapter(storeDataFolder),
+                    network: [],
+                })
+                const handle = await repo.find<Store>(storeDocId)
+                await handle.whenReady()
+                const store = handle.doc()!
 
-            const repo = new Repo({
-                storage: new NodeFSStorageAdapter(storeDataFolder),
-                network: [],
-            })
-            const handle = await repo.find<Store>(storeDocId)
-            await handle.whenReady()
-            const store = handle.doc()!
+                // Collect running instances from the local engine
+                liveInstances = getInstances(store)
+                process.stdout.write(`\nLive mode: found ${liveInstances.length} running instance(s)\n`)
+            } catch (e) {
+                process.stdout.write(`\nLive mode: failed to load store — ${e}\n`)
+                liveInstances = []
+            }
+        }, 10_000)
 
-            // Collect running instances from the local engine
-            liveInstances = getInstances(store)
-            process.stdout.write(`\nLive mode: found ${liveInstances.length} running instance(s)\n`)
-        } catch (e) {
-            process.stdout.write(`\nLive mode: failed to load store — ${e}\n`)
-            return this.skip()
-        }
-    })
+        afterAll(async () => {
+            await writeReport(liveInstances.length)
+        })
 
-    after(async function () {
-        if (!LIVE_MODE) return
-        await writeReport(liveInstances.length)
-    })
+        it('all running instances have required fields set', async () => {
+            if (liveInstances.length === 0) {
+                process.stdout.write('Live mode: no running instances — nothing to check\n')
+                return // pass: empty system is valid
+            }
 
-    it('all running instances have required fields set', async function () {
-        if (!LIVE_MODE) return this.skip()
-        if (liveInstances.length === 0) {
-            process.stdout.write('Live mode: no running instances — nothing to check\n')
-            return // pass: empty system is valid
-        }
+            for (const inst of liveInstances) {
+                check(`${inst.id}.instanceOf`,    inst.instanceOf)
+                check(`${inst.id}.name`,          inst.name)
+                check(`${inst.id}.status`,        inst.status)
+                check(`${inst.id}.port`,          inst.port)
+                check(`${inst.id}.storedOn`,      inst.storedOn ?? '')
+                check(`${inst.id}.serviceImages`, JSON.stringify(inst.serviceImages))
+                check(`${inst.id}.created`,       inst.created)
+                check(`${inst.id}.lastStarted`,   inst.lastStarted)
+                check(`${inst.id}.lastBackedUp`,  inst.lastBackedUp, inst.lastBackedUp === 0 ? 'never backed up' : 'backed up')
 
-        for (const inst of liveInstances) {
-            check(`${inst.id}.instanceOf`,    inst.instanceOf)
-            check(`${inst.id}.name`,          inst.name)
-            check(`${inst.id}.status`,        inst.status)
-            check(`${inst.id}.port`,          inst.port)
-            check(`${inst.id}.storedOn`,      inst.storedOn ?? '')
-            check(`${inst.id}.serviceImages`, JSON.stringify(inst.serviceImages))
-            check(`${inst.id}.created`,       inst.created)
-            check(`${inst.id}.lastStarted`,   inst.lastStarted)
-            check(`${inst.id}.lastBackedUp`,  inst.lastBackedUp, inst.lastBackedUp === 0 ? 'never backed up' : 'backed up')
+                expect(inst.instanceOf).to.be.a('string').that.is.not.empty
+                expect(inst.name).to.be.a('string').that.is.not.empty
+                expect(inst.status).to.equal('Running')
+                expect(inst.port).to.be.greaterThan(0)
+                expect(inst.storedOn).to.be.a('string').that.is.not.empty
+                expect(inst.serviceImages).to.be.an('array').that.is.not.empty
+                expect(inst.created).to.be.greaterThan(0)
+                expect(inst.lastStarted).to.be.greaterThan(0)
+                expect(inst.lastBackedUp).to.be.a('number').that.is.at.least(0)
+            }
+        })
 
-            expect(inst.instanceOf).to.be.a('string').that.is.not.empty
-            expect(inst.name).to.be.a('string').that.is.not.empty
-            expect(inst.status).to.equal('Running')
-            expect(inst.port).to.be.greaterThan(0)
-            expect(inst.storedOn).to.be.a('string').that.is.not.empty
-            expect(inst.serviceImages).to.be.an('array').that.is.not.empty
-            expect(inst.created).to.be.greaterThan(0)
-            expect(inst.lastStarted).to.be.greaterThan(0)
-            expect(inst.lastBackedUp).to.be.a('number').that.is.at.least(0)
-        }
-    })
-
-    it('all running instances respond to HTTP health check', async function () {
-        if (!LIVE_MODE) return this.skip()
-        this.timeout(30_000)
-        for (const inst of liveInstances) {
-            const url = `http://localhost:${inst.port}/`
-            const healthy = await waitForHttp(url, 5_000)
-            check(`${inst.id}.HTTP`, healthy ? '2xx' : 'no response', url)
-            expect(healthy, `${inst.id} should respond on ${url}`).to.be.true
-        }
-    })
-})
+        it('all running instances respond to HTTP health check', { timeout: 30_000 }, async () => {
+            for (const inst of liveInstances) {
+                const url = `http://localhost:${inst.port}/`
+                const healthy = await waitForHttp(url, 5_000)
+                check(`${inst.id}.HTTP`, healthy ? '2xx' : 'no response', url)
+                expect(healthy, `${inst.id} should respond on ${url}`).to.be.true
+            }
+        })
+    }
+)

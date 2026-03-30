@@ -1,6 +1,6 @@
 # Design: Native Engine Test Setup
 
-**Status:** Partially Implemented (PR 5 of 6 complete — disk simulation + instance lifecycle + app versioning + engine network + field health diagnostic)  
+**Status:** Implemented (PR 6 of 6 complete — disk simulation + instance lifecycle + app versioning + engine network + field health diagnostic + Vitest migration)  
 **Author:** Axle (Engine Developer)  
 **Date:** 2025-07-11  
 **Backlog item:** Engine — Test setup design
@@ -585,9 +585,14 @@ Use on a field Pi to verify system health without touching hardware.
 - Report per-app pass/fail to terminal; skip any test requiring image pull
 
 **PR 6 — Framework migration**
-- Migrate from Mocha → Vitest
-- Update `pnpm test` script
-- Retire `test/01-e2e-execution.test.ts` (superseded)
+
+Migrated from Mocha → Vitest across all test files.
+
+- `vitest.config.ts` — `environment: node`, `pool: forks`, sequential, default timeouts
+- All 5 test files updated: `mocha` + `chai` imports → `vitest`; `before/after` → `beforeAll/afterAll`; `this.timeout(n)` → per-test/hook timeout options; `this.skip()` → `describe.skipIf(condition)`
+- `package.json` — `test:unit`, `test:diagnostic`, `test:full` scripts updated to use `vitest run`
+- `test/legacy/` — `00-config.test.ts` and `01-e2e-execution.test.ts` moved here (superseded, not deleted)
+- `mocha` + `chai` devDeps retained (referenced by `src/test.ts` legacy runner)
 
 ---
 

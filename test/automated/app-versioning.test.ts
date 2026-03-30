@@ -34,8 +34,7 @@
  *   See backlog task: "Implement cross-disk upgrade detection".
  */
 
-import { describe, it, before, after } from 'mocha'
-import { expect } from 'chai'
+import { describe, it, beforeAll, afterAll, expect } from 'vitest'
 import path from 'path'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Store } from '../../src/data/Store.js'
@@ -61,26 +60,23 @@ describe('App versioning (automated, real containers)', () => {
     let storeHandle: DocHandle<Store>
     let watcher: Awaited<ReturnType<typeof enableUsbDeviceMonitor>>
 
-    before(async function () {
-        this.timeout(15_000)
+    beforeAll(async () => {
         // Defensive cleanup: ensure no orphan containers from the lifecycle suite.
         await cleanupContainers(TEST_INSTANCE_ID)
         const ctx = await createTestStore()
         storeHandle = ctx.storeHandle
         watcher = await enableUsbDeviceMonitor(storeHandle)
-    })
+    }, 15_000)
 
-    after(async function () {
-        this.timeout(30_000)
+    afterAll(async () => {
         await watcher?.close()
         await fs.remove(SENTINEL).catch(() => {})
         await cleanupDisk(TEST_DEVICE)
         await new Promise(r => setTimeout(r, 2_000))
         await cleanupContainers(TEST_INSTANCE_ID)
-    })
+    }, 30_000)
 
-    it('v1.0 dock: version is read from disk and stored in instanceOf', async function () {
-        this.timeout(120_000)
+    it('v1.0 dock: version is read from disk and stored in instanceOf', { timeout: 120_000 }, async () => {
 
         await dockFixture(FIXTURE_SAMPLE_V1)
 
@@ -93,8 +89,7 @@ describe('App versioning (automated, real containers)', () => {
         expect(instance.lastStarted, 'lastStarted should be set on first dock').to.be.greaterThan(0)
     })
 
-    it('v1.0 undock: instance reaches Undocked', async function () {
-        this.timeout(30_000)
+    it('v1.0 undock: instance reaches Undocked', { timeout: 30_000 }, async () => {
 
         await triggerUndock()
 
@@ -102,8 +97,7 @@ describe('App versioning (automated, real containers)', () => {
         expect(undocked, 'instance should reach Undocked after disk removal').to.be.true
     })
 
-    it('minor upgrade (v1.0→v1.1): instanceOf updated, lastStarted refreshed', async function () {
-        this.timeout(120_000)
+    it('minor upgrade (v1.0→v1.1): instanceOf updated, lastStarted refreshed', { timeout: 120_000 }, async () => {
 
         // Record the previous lastStarted — the minor upgrade must produce a fresh timestamp.
         const prevLastStarted = storeHandle.doc()!.instanceDB[TEST_INSTANCE_ID as any]?.lastStarted ?? 0
@@ -121,8 +115,7 @@ describe('App versioning (automated, real containers)', () => {
             .to.be.greaterThan(prevLastStarted)
     })
 
-    it('minor upgrade: undock v1.1', async function () {
-        this.timeout(30_000)
+    it('minor upgrade: undock v1.1', { timeout: 30_000 }, async () => {
 
         await triggerUndock()
 
