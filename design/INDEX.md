@@ -13,10 +13,16 @@ Proposal B selected — see `test-setup-native.md` for the adopted design.
 → [design/test-setup-comparison.md](test-setup-comparison.md)
 
 ## test-setup-native.md
-**Status:** Partially Implemented (PR 1 of 6 complete)  ·  **Date:** 2025-07-11  ·  **Author:** Axle
+**Status:** Implemented  ·  **Date:** 2025-07-11  ·  **Author:** Axle
 Adopted design for native engine test setup: runs tests on the Pi host via SSH from the
 OpenClaw container. SSH command= restriction via `scripts/run-tests.sh` wrapper (see `../../design/ssh-key-management.md`).
 → [design/test-setup-native.md](test-setup-native.md)
+
+## run-architecture.md
+**Status:** Proposed  ·  **Date:** 2026-03-30  ·  **Author:** Axle
+Run architecture review: which user runs the Engine, file ownership, and permission model.
+Proposes Engine run as `pi` with targeted sudoers rules rather than root via `sudo pm2`.
+→ [design/run-architecture.md](run-architecture.md)
 
 ## test-setup-virtual.md
 **Status:** Superseded  ·  **Date:** 2025-07-11  ·  **Author:** Axle
