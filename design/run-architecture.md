@@ -206,8 +206,8 @@ in practice — the sandbox already has access to the full source tree via the s
 Native OpenClaw is simpler, more transparent, and eliminates the ownership problem by design.
 
 **Decision (2026-03-30, Koen):** OpenClaw supports native install on Raspberry Pi OS arm64.
-**Option 2B is selected.** OpenClaw will be installed natively on the Pi as the `pi` user.
-Option 2A is not needed.
+**Option 2B is selected** as the primary approach. Option 2A (Docker `--user 1000:1000`)
+is retained as a fallback — it must be tested before being relied upon (see Open Questions).
 
 ---
 
@@ -241,8 +241,11 @@ root-owned files until they are cleaned up.
 
 ## Open Questions
 
-1. ~~**OpenClaw Docker user:** Can `--user 1000:1000` be passed?~~ **Resolved — not needed.**
-   Option 2B (native) selected; Docker sandbox is being retired.
+1. **OpenClaw Docker user (`--user 1000:1000`):** Option 2A remains a valid fallback if
+   native OpenClaw is not practical in a given deployment. **Must be tested** — it is not
+   confirmed that OpenClaw's Docker image functions correctly as a non-root user. Test by
+   adding `user: "1000:1000"` to the OpenClaw service definition and verifying all agent
+   operations (file reads/writes, exec, git) work without permission errors.
 
 2. ~~**Native OpenClaw viability:** Does OpenClaw support native install on arm64?~~
    **Resolved (2026-03-30):** Yes. OpenClaw installs natively on Raspberry Pi OS arm64.
@@ -272,9 +275,10 @@ root-owned files until they are cleaned up.
 - [ ] Remove `sudo` from Nextcloud `docker exec` lines in `Instance.ts` (follow-up, lower priority)
 
 ### Idea org repo — Atlas
-- [ ] Install OpenClaw natively on the Pi as `pi` (replaces Docker-based sandbox)
+- [ ] Install OpenClaw natively on the Pi as `pi` (Option 2B — primary)
 - [ ] Update `openclaw/README.md` with native install instructions
-- [ ] Remove `sudo rm -rf dist/` workaround from `run-tests.sh` (no longer needed once sandbox is `pi`; safe to keep as belt-and-suspenders)
+- [ ] Remove `sudo rm -rf dist/` workaround from `run-tests.sh` (no longer needed once sandbox runs as `pi`; safe to keep as belt-and-suspenders)
+- [ ] **If native install is not viable:** test `user: "1000:1000"` in OpenClaw service definition (Option 2A fallback — must be verified before use)
 
 ### Sequencing constraint
 **pm2 change + sudoers rule must land together.** If the pm2 startup is changed to run
