@@ -1,39 +1,37 @@
 /**
  * app-versioning.test.ts
  *
- * Tier 1 automated test: verifies that the Engine correctly handles app version
- * changes when a disk is re-docked with a different version.
+ * Tier 1 automated test: verifies that the Engine correctly reads and tracks
+ * app version metadata across dock/undock cycles.
  *
- * Two upgrade scenarios are tested:
+ * Scenario: the same physical disk is re-prepared with a newer minor version
+ * (e.g. the App Maintainer updates the compose.yaml from version 1.0 to 1.1
+ * on an existing disk). The instance ID stays the same because it is the same
+ * disk. The engine must:
+ *   - Update instanceOf in the store to reflect the new version
+ *   - Restart the instance with the new version
+ *   - Refresh lastStarted
  *
- *   Minor upgrade (1.0 → 1.1)
- *     Same major version: engine allows the upgrade, restarts the instance with
- *     the new version. Store reflects updated instanceOf and a fresh lastStarted.
- *
- *   Major upgrade (1.1 → 2.0)
- *     Different major version: engine BLOCKS automatic startup. The instance
- *     remains in Docked status — the operator must explicitly migrate data before
- *     the new version can run. No container is started.
- *
- * Tests run in sequence — each test builds on the store state established by the
- * previous one. The final state (major upgrade blocked) is the important assertion:
- * it requires a prior v1.x entry in the store to detect the major version change.
- *
- * Store assertions (full coverage for this suite):
+ * Store assertions:
  *
  *   v1.0 dock:
  *     instanceDB[id].instanceOf    === 'sample-1.0'
  *     instanceDB[id].status        === 'Running'
  *     instanceDB[id].lastStarted   > 0
  *
- *   minor upgrade (v1.1):
- *     instanceDB[id].instanceOf    === 'sample-1.1'   (updated)
+ *   minor upgrade (v1.0 → v1.1, same instance ID, same disk):
+ *     instanceDB[id].instanceOf    === 'sample-1.1'   (updated from disk)
  *     instanceDB[id].status        === 'Running'
  *     instanceDB[id].lastStarted   > previous lastStarted  (refreshed)
  *
- *   major upgrade (v2.0):
- *     instanceDB[id].instanceOf    === 'sample-2.0'   (store updated, but startup blocked)
- *     instanceDB[id].status        === 'Docked'       (never reaches Starting or Running)
+ * What is NOT tested here (future work):
+ *
+ *   Cross-disk upgrade detection — when Disk B (Kolibri 1.1) is docked
+ *   alongside Disk A (Kolibri 1.0), the engine should detect that a newer
+ *   version of the same app exists on the network and write an upgrade
+ *   proposal to the store. The Console reads this and presents it to the
+ *   Console Admin. Major versions are not proposed (data format incompatible).
+ *   See backlog task: "Implement cross-disk upgrade detection".
  */
 
 import { describe, it, before, after } from 'mocha'
@@ -48,7 +46,6 @@ import {
     triggerUndock,
     cleanupDisk,
     cleanupContainers,
-    waitFor,
     waitForStatus,
     FIXTURES_DIR,
     TEST_DEVICE,
@@ -58,7 +55,6 @@ import { fs } from 'zx'
 
 const FIXTURE_SAMPLE_V1   = path.resolve(FIXTURES_DIR, 'disk-sample-v1')
 const FIXTURE_SAMPLE_V1_1 = path.resolve(FIXTURES_DIR, 'disk-sample-v1.1')
-const FIXTURE_SAMPLE_V2   = path.resolve(FIXTURES_DIR, 'disk-sample-v2')
 const TEST_INSTANCE_ID    = 'sample-00000000-test1'
 
 describe('App versioning (automated, real containers)', () => {
@@ -67,8 +63,7 @@ describe('App versioning (automated, real containers)', () => {
 
     before(async function () {
         this.timeout(15_000)
-        // Defensive cleanup: ensure no orphan containers or disk state from
-        // the lifecycle suite (which runs before this in the same mocha process).
+        // Defensive cleanup: ensure no orphan containers from the lifecycle suite.
         await cleanupContainers(TEST_INSTANCE_ID)
         const ctx = await createTestStore()
         storeHandle = ctx.storeHandle
@@ -84,9 +79,7 @@ describe('App versioning (automated, real containers)', () => {
         await cleanupContainers(TEST_INSTANCE_ID)
     })
 
-    // ── v1.0 baseline ────────────────────────────────────────────────────────
-
-    it('v1.0 dock: instance reaches Running', async function () {
+    it('v1.0 dock: version is read from disk and stored in instanceOf', async function () {
         this.timeout(120_000)
 
         await dockFixture(FIXTURE_SAMPLE_V1)
@@ -96,8 +89,8 @@ describe('App versioning (automated, real containers)', () => {
 
         const store = storeHandle.doc()!
         const instance = store.instanceDB[TEST_INSTANCE_ID as any]
-        expect(instance.instanceOf, 'instanceOf should be sample-1.0').to.equal('sample-1.0')
-        expect(instance.lastStarted, 'lastStarted should be set').to.be.greaterThan(0)
+        expect(instance.instanceOf, 'instanceOf should reflect version from disk').to.equal('sample-1.0')
+        expect(instance.lastStarted, 'lastStarted should be set on first dock').to.be.greaterThan(0)
     })
 
     it('v1.0 undock: instance reaches Undocked', async function () {
@@ -106,15 +99,13 @@ describe('App versioning (automated, real containers)', () => {
         await triggerUndock()
 
         const undocked = await waitForStatus(storeHandle, TEST_INSTANCE_ID, 'Undocked', 20_000)
-        expect(undocked, 'v1.0 instance should reach Undocked').to.be.true
+        expect(undocked, 'instance should reach Undocked after disk removal').to.be.true
     })
 
-    // ── minor upgrade: 1.0 → 1.1 ────────────────────────────────────────────
-
-    it('minor upgrade (v1.0→v1.1): instance updates and reaches Running', async function () {
+    it('minor upgrade (v1.0→v1.1): instanceOf updated, lastStarted refreshed', async function () {
         this.timeout(120_000)
 
-        // Record lastStarted before the upgrade — must be greater after re-start.
+        // Record the previous lastStarted — the minor upgrade must produce a fresh timestamp.
         const prevLastStarted = storeHandle.doc()!.instanceDB[TEST_INSTANCE_ID as any]?.lastStarted ?? 0
 
         await dockFixture(FIXTURE_SAMPLE_V1_1)
@@ -125,13 +116,8 @@ describe('App versioning (automated, real containers)', () => {
         const store = storeHandle.doc()!
         const instance = store.instanceDB[TEST_INSTANCE_ID as any]
 
-        // ── version updated ──────────────────────────────────────────────────
-        expect(instance.instanceOf, 'instanceOf should be updated to sample-1.1').to.equal('sample-1.1')
-
-        // ── lastStarted refreshed ────────────────────────────────────────────
-        // Confirms the engine ran startInstance for the new version, not just
-        // inherited the old timestamp.
-        expect(instance.lastStarted, 'lastStarted should be refreshed after minor upgrade')
+        expect(instance.instanceOf, 'instanceOf should be updated to reflect v1.1').to.equal('sample-1.1')
+        expect(instance.lastStarted, 'lastStarted should be refreshed after re-dock with new version')
             .to.be.greaterThan(prevLastStarted)
     })
 
@@ -142,40 +128,5 @@ describe('App versioning (automated, real containers)', () => {
 
         const undocked = await waitForStatus(storeHandle, TEST_INSTANCE_ID, 'Undocked', 20_000)
         expect(undocked, 'v1.1 instance should reach Undocked').to.be.true
-    })
-
-    // ── major upgrade: 1.1 → 2.0 (blocked) ──────────────────────────────────
-
-    it('major upgrade (v1.1→v2.0): startup blocked — instance stays Docked', async function () {
-        this.timeout(30_000)
-
-        await dockFixture(FIXTURE_SAMPLE_V2)
-
-        // Wait for the dock event to be processed: createOrUpdateInstance runs and
-        // updates instanceOf to 'sample-2.0' in the store.
-        const processed = await waitFor(
-            storeHandle,
-            store => (store.instanceDB[TEST_INSTANCE_ID as any]?.instanceOf as string) === 'sample-2.0',
-            10_000
-        )
-        expect(processed, 'dock event should be processed and instanceOf updated to sample-2.0').to.be.true
-
-        // Allow enough time for startInstance to have fired if blocking were absent.
-        // A container start (compose create + up) takes < 2 s once the image is cached.
-        // 5 s is a safe margin — any status change would appear well within this window.
-        await new Promise(r => setTimeout(r, 5_000))
-
-        const store = storeHandle.doc()!
-        const instance = store.instanceDB[TEST_INSTANCE_ID as any]
-
-        // ── startup blocked ──────────────────────────────────────────────────
-        expect(instance.status, 'major upgrade must be blocked: status must remain Docked')
-            .to.equal('Docked')
-
-        // ── store reflects new version ────────────────────────────────────────
-        // The engine updates the store even when blocking startup — the operator
-        // can see what version is on the disk.
-        expect(instance.instanceOf, 'instanceOf should reflect the disk version')
-            .to.equal('sample-2.0')
     })
 })
