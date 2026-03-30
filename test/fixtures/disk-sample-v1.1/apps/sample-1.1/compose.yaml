@@ -1,0 +1,14 @@
+services:
+  sample:
+    image: traefik/whoami
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+x-app:
+  title: "Sample App"
+  description: "Synthetic test fixture — not a real IDEA app"
+  category: "education"
+  url: "https://example.com"
+  icon: ""
+  author: "IDEA Test Harness"

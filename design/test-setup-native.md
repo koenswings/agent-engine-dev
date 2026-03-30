@@ -1,6 +1,6 @@
 # Design: Native Engine Test Setup
 
-**Status:** Partially Implemented (PR 2 of 6 complete — disk simulation + instance lifecycle)  
+**Status:** Partially Implemented (PR 3 of 6 complete — disk simulation + instance lifecycle + app versioning)  
 **Author:** Axle (Engine Developer)  
 **Date:** 2025-07-11  
 **Backlog item:** Engine — Test setup design
@@ -450,15 +450,23 @@ Assertions against `instanceDB`, `appDB`, `diskDB`, and one out-of-store HTTP ch
 
 ---
 
-### PR 3 — `app-versioning.test.ts` and `app-upgrade.test.ts`
+### PR 3 — `app-versioning.test.ts`
+
+Tests version tracking when the same disk is re-docked with a newer minor version
+(same instance ID, updated `x-app.version` in compose.yaml).
 
 | Test | Store field | Assertion |
 |---|---|---|
-| minor upgrade | `instanceDB[id].lastStarted` | updated on re-dock with new version |
-| minor upgrade | `instanceDB[id].instanceOf` | reflects new `appId` (e.g. `sample-1.1`) |
-| minor upgrade | `appDB` | entry for new version exists; old version entry still present |
-| major upgrade | engine behaviour | instance stays `Docked`, never reaches `Running` (blocked) |
-| major upgrade | `instanceDB[id].status` | `=== 'Docked'` — upgrade refused, not an `Error` |
+| v1.0 dock | `instanceDB[id].instanceOf` | `=== 'sample-1.0'` |
+| v1.0 dock | `instanceDB[id].lastStarted` | `> 0` |
+| minor upgrade (v1.1) | `instanceDB[id].instanceOf` | `=== 'sample-1.1'` (updated from disk) |
+| minor upgrade (v1.1) | `instanceDB[id].lastStarted` | `>` previous `lastStarted` (refreshed) |
+
+**Not tested here — cross-disk upgrade detection (planned, separate PR):**
+
+When Disk B (newer version) is docked alongside Disk A (older version of same app),
+the Engine should write an upgrade proposal to the store. Major versions are not
+proposed (data-format incompatible). See `isMajorUpgrade()` in `App.ts`.
 
 ---
 

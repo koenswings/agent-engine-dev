@@ -31,6 +31,8 @@ The application uses a "Monitor" pattern. Monitors listen for system events (USB
     *   When a disk is inserted, it mounts the drive, reads its `META.yaml` identity, and scans for App instances.
     *   It updates the `Disk` and `Instance` objects in the Automerge Store.
     *   It triggers the execution of apps (via Docker).
+    *   **App version tracking:** When a disk is docked, the Engine reads the `version` field from the instance's `compose.yaml` (`x-app.version`) and stores it as `instanceOf` in the store (e.g. `'kolibri-1.1'`). If the disk has been re-prepared with a newer version since its last dock, `instanceOf` is updated automatically and the instance restarts with the new version. `lastStarted` is refreshed in the store.
+    *   **Cross-disk upgrade detection (planned):** When a new App Disk is docked, the Engine will scan running instances for the same app name at a different version. If a newer minor-version disk is found alongside an older one, the Engine writes an upgrade proposal to the store. The Console reads this and presents it to the Console Admin, who can initiate the upgrade (data migration via rsync from old instance to new instance). Major version changes are not proposed — they are flagged as data-format incompatible and require explicit operator action outside the normal upgrade flow. See `App.ts`: `isMajorUpgrade()`, `extractMajorVersion()`.
 
 *   **mDNS Monitor (`mdnsMonitor.ts`):**
     *   Uses the `ciao` library to advertise the local Engine's presence on the LAN via mDNS, so other Engines and Console UIs can find it without any configuration.
