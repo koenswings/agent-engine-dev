@@ -205,8 +205,9 @@ development machine, not a public-facing server. The isolation Docker provides i
 in practice — the sandbox already has access to the full source tree via the shared volume.
 Native OpenClaw is simpler, more transparent, and eliminates the ownership problem by design.
 
-**Recommendation:** Evaluate Option 2B seriously. If it works with OpenClaw's current
-install path, prefer it over Option 2A.
+**Decision (2026-03-30, Koen):** OpenClaw supports native install on Raspberry Pi OS arm64.
+**Option 2B is selected.** OpenClaw will be installed natively on the Pi as the `pi` user.
+Option 2A is not needed.
 
 ---
 
@@ -240,20 +241,19 @@ root-owned files until they are cleaned up.
 
 ## Open Questions
 
-1. **OpenClaw Docker user:** Can `--user 1000:1000` be passed via `openclaw.json` or the
-   compose file? Does the OpenClaw image work correctly as non-root?
+1. ~~**OpenClaw Docker user:** Can `--user 1000:1000` be passed?~~ **Resolved — not needed.**
+   Option 2B (native) selected; Docker sandbox is being retired.
 
-2. **Native OpenClaw viability:** Does OpenClaw support a native (non-Docker) install on
-   Raspberry Pi OS (arm64)? What does the install look like?
+2. ~~**Native OpenClaw viability:** Does OpenClaw support native install on arm64?~~
+   **Resolved (2026-03-30):** Yes. OpenClaw installs natively on Raspberry Pi OS arm64.
 
-3. **`node_modules/` after sandbox `pnpm install`:** If the sandbox (as root or as pi)
-   runs `pnpm install` to add a new devDependency, the lockfile changes. The next
-   `run-tests.sh` pull and `pnpm install` must succeed. Verify this works with
-   `CI=true pnpm install --frozen-lockfile` once the sandbox user is fixed.
+3. **`node_modules/` after sandbox `pnpm install`:** Once OpenClaw runs natively as `pi`,
+   `pnpm install` from any context creates `pi`-owned files. This question is resolved
+   by the fix itself — no further action needed.
 
 4. **Nextcloud `sudo docker exec`:** These lines use `sudo docker exec` unnecessarily
-   once the Engine runs as `pi` (which is in the docker group). Remove `sudo` prefix
-   in a follow-up code change.
+   once the Engine runs as `pi` (in the docker group). Remove `sudo` prefix in a
+   follow-up code change.
 
 5. **`/disks/` mkdir during provisioning:** `build-engine.ts` creates `/disks/` as root.
    The Engine running as `pi` will use `sudo mkdir -p /disks/${device}` per the sudoers
@@ -263,22 +263,20 @@ root-owned files until they are cleaned up.
 
 ## Implementation Plan
 
-Depends on decision for Problem 2 (Option 2A vs 2B):
+**Decision: Option 2B (native OpenClaw) selected.**
 
-**Both options require (Engine repo — Axle):**
+### Engine repo — Axle
 - [ ] Add `script/build_image_assets/10-engine.sudoers`
-- [ ] Add `copyAsset()` call in `installUdev()` in `Engine.ts` to deploy it
+- [ ] Add `copyAsset()` call in `installUdev()` in `Engine.ts` to deploy it to every Pi
 - [ ] Update `startEngine()` in `Engine.ts`: remove `sudo` from `pm2 start`/`pm2 save`; update `pm2 startup` call
-- [ ] Remove `sudo` from Nextcloud `docker exec` lines in `Instance.ts` (follow-up)
+- [ ] Remove `sudo` from Nextcloud `docker exec` lines in `Instance.ts` (follow-up, lower priority)
 
-**If Option 2A (Docker, `--user 1000:1000`) — Atlas:**
-- [ ] Add `user: "1000:1000"` to OpenClaw service definition
-- [ ] Remove `sudo rm -rf dist/` workaround from `run-tests.sh` (no longer needed)
-
-**If Option 2B (native OpenClaw) — Atlas:**
-- [ ] Remove OpenClaw Docker service; install OpenClaw natively as `pi`
-- [ ] Remove `sudo rm -rf dist/` workaround from `run-tests.sh` (no longer needed)
+### Idea org repo — Atlas
+- [ ] Install OpenClaw natively on the Pi as `pi` (replaces Docker-based sandbox)
 - [ ] Update `openclaw/README.md` with native install instructions
+- [ ] Remove `sudo rm -rf dist/` workaround from `run-tests.sh` (no longer needed once sandbox is `pi`; safe to keep as belt-and-suspenders)
 
-**pm2 + sudoers must land together** — if pm2 changes before the sudoers rule is
-deployed, mount operations will fail.
+### Sequencing constraint
+**pm2 change + sudoers rule must land together.** If the pm2 startup is changed to run
+as `pi` before the sudoers rule is in place, `sudo mount` / `sudo umount` will prompt
+for a password and hang. Deploy both in a single provisioning run or in rapid sequence.
