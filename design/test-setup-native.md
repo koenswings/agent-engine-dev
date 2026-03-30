@@ -1,6 +1,6 @@
 # Design: Native Engine Test Setup
 
-**Status:** Partially Implemented (PR 3 of 6 complete — disk simulation + instance lifecycle + app versioning)  
+**Status:** Partially Implemented (PR 4 of 6 complete — disk simulation + instance lifecycle + app versioning + engine network)  
 **Author:** Axle (Engine Developer)  
 **Date:** 2025-07-11  
 **Backlog item:** Engine — Test setup design
@@ -470,17 +470,40 @@ proposed (data-format incompatible). See `isMajorUpgrade()` in `App.ts`.
 
 ---
 
-### PR 4 — `network-sync.test.ts` and `engine-join-leave.test.ts`
+### PR 4 — `engine-network.test.ts`
 
-| Test | Store field | Assertion |
-|---|---|---|
-| engine startup | `engineDB[localEngineId]` | entry exists with correct `id` and `hostname` |
-| engine startup | `engineDB[localEngineId].lastBooted` | `> 0` |
-| mDNS discovery | `engineDB[remoteEngineId]` | entry appears within discovery window |
-| CRDT sync | remote store `diskDB[id]` | reflects local dock after sync window |
-| CRDT sync | remote store `instanceDB[id].status` | `=== 'Running'` after sync |
-| engine leave | `engineDB[remoteEngineId].lastHalted` | `> lastBooted` |
-| engine rejoin | `engineDB[remoteEngineId].lastBooted` | updated on restart; sync resumes |
+**Suite 1 — Engine registration (always runs):**
+
+| Store field | Assertion |
+|---|---|
+| `engineDB[localEngineId]` | exists after store initialisation |
+| `engineDB[localEngineId].id` | `=== localEngineId` |
+| `engineDB[localEngineId].hostname` | non-empty string |
+| `engineDB[localEngineId].lastBooted` | `> 0` |
+| `engineDB[localEngineId].lastHalted` | `=== null` (first boot) |
+| `engineDB[localEngineId].version` | non-empty string |
+| `getLocalEngine(store)` | returns the registered engine |
+| `getRunningEngines(store)` | includes localEngineId |
+
+**Suite 2 — `assignAppsToEngines()` (always runs, pure function):**
+
+| Scenario | Assertion |
+|---|---|
+| 0 engines | returns empty Map |
+| 1 engine, 3 instances | all 3 assigned to the single engine |
+| 2 engines, 4 instances | 2 each (round-robin) |
+| 2 engines, 3 instances | 2 and 1 |
+| halted engine | excluded from assignment |
+| repeated calls | deterministic — identical output each time |
+
+**Suite 3 — Multi-engine network (skips unless `IDEA_NETWORK_TESTS=true`):**
+
+| Store field | Assertion |
+|---|---|
+| `engineDB[remoteEngineId]` | appears within mDNS discovery window |
+| `getRunningEngines(store)` | includes both local and remote engines |
+| CRDT sync | remote store reflects local `diskDB`/`instanceDB` changes |
+| `engineDB[remoteEngineId].lastHalted` | `> lastBooted` after peer disconnect |
 
 ---
 

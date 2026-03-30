@@ -381,3 +381,32 @@ export const getInstance = (store: Store, instanceId: InstanceID): Instance | un
         return undefined
     }
 }
+
+/**
+ * Deterministically distribute all known instances across the currently running
+ * engines using round-robin assignment.
+ *
+ * Sorting both engines and instances before assignment guarantees that any two
+ * peers computing this function independently (from the same CRDT state) arrive
+ * at the same result — no coordination required.
+ *
+ * Returns a Map of engineId → instanceId[].
+ * Returns an empty Map when no engines are running.
+ */
+export const assignAppsToEngines = (store: Store): Map<EngineID, InstanceID[]> => {
+    const runningEngines = getRunningEngines(store)
+    if (runningEngines.length === 0) return new Map()
+
+    const sortedEngines = [...runningEngines].sort((a, b) => a.id.localeCompare(b.id))
+    const sortedInstances = (Object.keys(store.instanceDB) as InstanceID[]).sort()
+
+    const result = new Map<EngineID, InstanceID[]>()
+    sortedEngines.forEach(engine => result.set(engine.id, []))
+
+    sortedInstances.forEach((instanceId, index) => {
+        const engine = sortedEngines[index % sortedEngines.length]
+        result.get(engine.id)!.push(instanceId)
+    })
+
+    return result
+}
