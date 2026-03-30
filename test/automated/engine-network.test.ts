@@ -42,8 +42,7 @@
  *     engineDB[remoteEngineId].lastHalted > lastBooted after peer disconnect
  */
 
-import { describe, it, before } from 'mocha'
-import { expect } from 'chai'
+import { describe, it, beforeAll, expect } from 'vitest'
 import { DocHandle } from '@automerge/automerge-repo'
 import {
     Store,
@@ -60,11 +59,10 @@ import { EngineID, InstanceID } from '../../src/data/CommonTypes.js'
 describe('Engine registration (automated)', () => {
     let storeHandle: DocHandle<Store>
 
-    before(async function () {
-        this.timeout(10_000)
+    beforeAll(async () => {
         const ctx = await createTestStore()
         storeHandle = ctx.storeHandle
-    })
+    }, 10_000)
 
     it('engineDB contains the local engine after store initialisation', function () {
         const store = storeHandle.doc()!
@@ -207,27 +205,24 @@ describe('App distribution across engines — assignAppsToEngines() (automated)'
 
 // ── Suite 3: Multi-engine network ─────────────────────────────────────────────
 
-describe('Multi-engine network (automated — skips unless IDEA_NETWORK_TESTS=true)', function () {
-    before(function () {
-        if (process.env.IDEA_NETWORK_TESTS !== 'true') {
-            this.skip()
-        }
-    })
+describe.skipIf(process.env.IDEA_NETWORK_TESTS !== 'true')(
+    'Multi-engine network (automated — skips unless IDEA_NETWORK_TESTS=true)',
+    () => {
+        it.skip('remote engine appears in engineDB within mDNS discovery window', () => {
+            // Requires two engines on the same LAN with mDNS advertising enabled.
+            // Run with: IDEA_NETWORK_TESTS=true pnpm test:unit
+            //
+            // Assertion: engineDB[remoteEngineId] exists and hostname is non-empty
+            // after a 15 s mDNS discovery window.
+            // placeholder — implement when second Pi is available
+        })
 
-    it('remote engine appears in engineDB within mDNS discovery window', function () {
-        // Requires two engines on the same LAN with mDNS advertising enabled.
-        // Run with: IDEA_NETWORK_TESTS=true pnpm test:unit
-        //
-        // Assertion: engineDB[remoteEngineId] exists and hostname is non-empty
-        // after a 15 s mDNS discovery window.
-        this.skip() // placeholder — implement when second Pi is available
-    })
+        it.skip('CRDT sync: local diskDB changes appear on remote engine within sync window', () => {
+            // placeholder
+        })
 
-    it('CRDT sync: local diskDB changes appear on remote engine within sync window', function () {
-        this.skip() // placeholder
-    })
-
-    it('engineDB[remoteEngineId].lastHalted is set after peer disconnect', function () {
-        this.skip() // placeholder
-    })
-})
+        it.skip('engineDB[remoteEngineId].lastHalted is set after peer disconnect', () => {
+            // placeholder
+        })
+    }
+)

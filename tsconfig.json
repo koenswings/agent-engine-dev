@@ -16,5 +16,8 @@
     "src",
     "script",
     "test"  
-, "script/client.ts", "pm2.config.cjs"] 
+, "script/client.ts", "pm2.config.cjs"],
+  "exclude": [
+    "test/legacy"
+  ]
 }
