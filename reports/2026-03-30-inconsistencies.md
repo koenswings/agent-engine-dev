@@ -281,3 +281,184 @@ The Solution Description also hints at this:
 Items 2–4 map to existing backlog tasks:
 - `c9cb8515` — Update Architecture doc from Solution Description
 - `3b0f08f6` — Review and improve Solution Description
+
+---
+
+## Part 2 — Unimplemented Features Scan
+
+A systematic scan of `docs/SOLUTION_DESCRIPTION.md` against the codebase.
+Each item is a feature described in the Solution Description that has no corresponding
+working implementation.
+
+### Disk types
+
+| Disk type | Status | Notes |
+|---|---|---|
+| **App Disk** | ✅ Implemented (partial) | Apps start on dock; offline tar loading exists but untested in prod |
+| **Backup Disk** | ❌ Not implemented | `isBackupDisk` always returns `false`; no backup config, no BorgBackup |
+| **Files Disk** | ❌ Not implemented | `isFilesDisk` always returns `false`; no network mount |
+| **Upgrade Disk** | ❌ Not implemented | `isUpgradeDisk` always returns `false`; no script execution |
+| **Engine Disk** | ❌ Not implemented | No Engine Disk detection or Engine upgrade flow |
+| **App Catalog Disk** | ❌ Not implemented | Described as a Backup Disk variant (on-demand only); neither is implemented |
+| **Empty Disk** | ❌ Not implemented | Detected (no special folders found) but no action taken |
+| **Client Disk** | ❌ Not implemented | Not a runtime concern but also not documented as out-of-scope |
+
+---
+
+### App Disk — missing features
+
+**1. Minor upgrade proposal**
+
+Solution Description: *"App upgrades are possible when an App Disk is docked that has a
+newer version than another App Disk that is already running on the network… an upgrade
+operation is only made possible if the newer version is a minor update."*
+
+Status: `isMajorUpgrade()` and `extractMajorVersion()` exist in `App.ts` as utilities.
+No cross-disk version comparison or upgrade proposal is wired into `processAppDisk`.
+
+**2. Offline Docker images from `services/` directory**
+
+Solution Description: *"This folder contains the service images of all services used by
+all Apps stored on the App Disk. They are stored on the Disk itself so that no Internet
+access is required to download them from Docker Hub."*
+
+Status: Code in `Instance.ts` loads tar images from `/disks/${device}/services/`. This
+path is skipped in `testMode` (Docker Hub is used instead). Whether this path works
+in a production, offline-only deployment has not been tested or documented.
+
+**3. User notifications when an app becomes available**
+
+Solution Description: *"A notification is sent to all users that the App has become
+available… users get notified when the new App becomes available… When an already opened
+App gets undocked, users get notified."*
+
+Status: No push notification mechanism exists. The Console (when it connects) gets
+real-time data via Automerge sync — but there is no proactive notification sent to
+clients. No `chrome.notifications` API integration, no WebSocket push, no webhook.
+
+---
+
+### Commands — not implemented
+
+Solution Description and `COMMANDS.md` describe these commands. Implemented vs not:
+
+| Command | Implemented |
+|---|---|
+| `ls`, `engines`, `disks`, `apps`, `instances` | ✅ |
+| `createInstance`, `startInstance`, `runInstance`, `stopInstance` | ✅ |
+| `reboot`, `buildEngine`, `connect`, `disconnect` | ✅ |
+| **ejectDisk** | ❌ |
+| **copyApp** (rsync App from one disk to another) | ❌ |
+| **moveApp** (rsync App, preserve instance ID) | ❌ |
+| **backupApp** | ❌ |
+| **restoreApp** | ❌ |
+| **upgradeApp** | ❌ |
+| **upgradeEngine** | ❌ |
+
+---
+
+### Engine management — not implemented
+
+**4. Engine self-upgrade detection and proposal**
+
+Solution Description: *"The system proposes an upgrade of an Engine when a newer Engine
+is started in the network with an updated system software."*
+
+Status: `Engine.version` is stored in the store and synced. No version comparison logic
+exists anywhere in the runtime. No upgrade proposal is generated when a higher-versioned
+Engine appears in `engineDB`.
+
+**5. Per-engine SSH key generation**
+
+Solution Description: *"To generate a unique ssh key"* (listed as a reason for Engine
+identity). Also described in the Engine Identity section and backlog task `904feb39`.
+
+Status: `build-engine.ts` installs SSH. No per-engine keypair generation code exists in
+the runtime. No key exchange mechanism between Engines.
+
+**6. rsync-based remote App copy and move**
+
+Solution Description: *"Remote file copy operations are performed to copy an App from an
+App Disk on one Engine to another App Disk on another Engine. rsync is used."*
+
+Status: `rsync` is installed by `build-engine.ts`. No `rsync` commands exist in the
+Engine runtime source (`src/`). No copy or move operations are implemented.
+
+**7. Multi-engine app distribution**
+
+Solution Description: *"Performance is optimized by adding Appdockers and redistributing
+the apps over the Appdockers."*
+
+Status: `assignAppsToEngines()` exists in `Store.ts` as a pure utility function. It is
+never called in the runtime flow. No redistribution logic is triggered by engine addition.
+
+**8. Docker metrics collection**
+
+Solution Description / Console: CPU%, MEM USAGE/LIMIT, MEM%, NET I/O, DISK I/O per App.
+
+Status: `DockerMetrics`, `DockerLogs`, `DockerEvents` types exist in `CommonTypes.ts`.
+All code that reads these from Docker is commented out in `Instance.ts`.
+
+---
+
+### Infrastructure — not implemented
+
+**9. Backup Disk operations (all)**
+
+Solution Description describes three backup modes (immediate, scheduled, on-demand),
+BorgBackup integration, link between App and Backup Disk, progress reporting via store.
+
+Status: None implemented. `isBackupDisk` returns `false`. No backup-related fields on
+`Disk` or `Instance` beyond `lastBackedUp` (always `0`).
+
+**10. Files Disk — network filesystem**
+
+Solution Description: *"Contains a File System that is automatically network mounted
+when docked… also auto-mounted into Apps that have been created with the ability to work
+with Files Disks."*
+
+Status: `isFilesDisk` returns `false`. No mount logic.
+
+**11. USB Gadget mode**
+
+Solution Description describes a Raspberry Pi USB Gadget configuration: *"It can be
+attached to any computer with a USB-C connection and it will automatically power from
+that connection and execute any attached App Disks."*
+
+Status: `build-engine.ts` has a `--gadget` flag and `rpi4-usb.sh` asset. The Engine
+runtime has no gadget-specific detection or behaviour.
+
+**12. HTTPS support**
+
+Solution Description explicitly flags this as future work: *"All Apps are currently
+accessed using http only. But for some use cases, https is required."*
+
+Status: Confirmed not implemented. No TLS termination, no certificate generation.
+Documented as a known limitation.
+
+---
+
+### Summary table
+
+| Feature | Category | Priority signal |
+|---|---|---|
+| Backup Disk (all modes + BorgBackup) | Disk type | High — core feature |
+| Files Disk (network mount) | Disk type | High — core feature |
+| Upgrade Disk (script execution) | Disk type | Medium |
+| Engine Disk handling | Disk type | Medium |
+| App Catalog Disk | Disk type | Low |
+| Empty Disk (UI actions) | Disk type | Medium |
+| Minor upgrade proposal | App lifecycle | High |
+| User notifications | Realtime UX | High |
+| ejectDisk command | Commands | High |
+| copyApp / moveApp commands | Commands | High |
+| backupApp / restoreApp commands | Commands | High |
+| upgradeApp / upgradeEngine commands | Commands | High |
+| Engine upgrade detection + proposal | Engine mgmt | Medium |
+| Per-engine SSH keypair | Infrastructure | Medium |
+| rsync App copy/move | Infrastructure | High |
+| Multi-engine app distribution | Infrastructure | Low |
+| Docker metrics collection | Monitoring | Low |
+| Offline tar image loading (verified) | App Disk | Medium |
+| HTTPS support | Infrastructure | Low |
+| USB Gadget mode | Hardware | Low |
