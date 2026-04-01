@@ -184,6 +184,7 @@ export const buildEngine = async (args: any) => {
   }
 
   await startEnginePM2(exec, enginePath, config.defaults.enginePath, productionMode);
+  await grantNetBindCapability(exec);
 
   if (gadget) await usbGadget(exec, enginePath);
 
@@ -578,6 +579,24 @@ export const startEnginePM2 = async (exec: any, enginePath: string, permanentEng
     process.exit(1);
   }
   console.log(chalk.green('Engine started with pm2'))
+}
+
+/**
+ * Grants the Node.js binary the capability to bind to privileged ports (< 1024),
+ * e.g. port 80 for the Console HTTP server.
+ *
+ * This allows the Engine to serve on port 80 without running as root.
+ * Must be re-applied after any Node.js binary update.
+ */
+export const grantNetBindCapability = async (exec: any) => {
+  console.log(chalk.blue('Granting node cap_net_bind_service (port 80 access)...'))
+  try {
+    await exec`sudo setcap 'cap_net_bind_service=+ep' $(readlink -f $(which node))`
+    console.log(chalk.green('cap_net_bind_service granted to node'))
+  } catch (e) {
+    console.log(chalk.red('Error granting cap_net_bind_service — port 80 may not work as non-root'))
+    console.error(e)
+  }
 }
 
 export const installVarious = async (exec: any) => {

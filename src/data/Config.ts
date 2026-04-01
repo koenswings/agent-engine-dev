@@ -105,6 +105,8 @@ function validateSettings(obj: any, path: string): string[] {
     if (typeof obj.port !== 'number') errors.push(`'${path}port' must be a number.`);
     if (typeof obj.storeDataFolder !== 'string') errors.push(`'${path}storeDataFolder' must be a string.`);
     if (typeof obj.storeIdentityFolder !== 'string') errors.push(`'${path}storeIdentityFolder' must be a string.`);
+    if (typeof obj.httpPort !== 'number') errors.push(`'${path}httpPort' must be a number.`);
+    if (typeof obj.consolePath !== 'string') errors.push(`'${path}consolePath' must be a string.`);
     return errors;
 }
 
