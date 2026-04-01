@@ -6,7 +6,7 @@ import { deepPrint, log } from './utils/utils.js'
 import { config } from './data/Config.js'
 import { createOrUpdateEngine, localEngineId } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
-import { enableIndexServer } from './monitors/instancesMonitor.js'
+import { enableHttpMonitor } from './monitors/httpMonitor.js'
 import { DocumentId, Repo, DocHandle } from '@automerge/automerge-repo'
 import { startAutomergeServer } from './repo.js'
 import { enableMulticastDNSEngineMonitor } from './monitors/mdnsMonitor.js'
@@ -99,9 +99,9 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // Check for undocked apps after restart
     await checkAndSetUndockedApps(storeHandle)
 
-    // Start the app index server
-    log(chalk.bgMagenta('STARTING THE INDEX SERVER'))
-    await enableIndexServer(storeHandle)
+    // Start the HTTP server (serves Console UI + /api/store-url)
+    log(chalk.bgMagenta('STARTING HTTP SERVER'))
+    enableHttpMonitor()
 
     // Start the instances monitor
     // log(chalk.bgMagenta('STARTING INSTANCES MONITOR'))

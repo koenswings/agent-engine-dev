@@ -3,7 +3,7 @@ import { Store } from '../data/Store.js'
 import { log, deepPrint } from '../utils/utils.js'
 import { EngineID, InstanceID } from '../data/CommonTypes.js'
 import { handleCommand } from '../utils/commandUtils.js'
-import { generateHTML } from './instancesMonitor.js'
+// instancesMonitor.ts HTML server removed — replaced by httpMonitor.ts
 import { commands } from '../data/Commands.js';
 
 
@@ -65,8 +65,6 @@ const instancesMonitor = (patch, storeHandle): boolean => {
         const instanceId = patch.path[1] as InstanceID
         const status = patch.value as string
         log(`Instance ${instanceId} status changed to: ${status}`)
-        // Update the HTML
-        generateHTML(storeHandle)
         return true
     } else {
         return false

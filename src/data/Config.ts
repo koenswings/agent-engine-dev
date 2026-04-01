@@ -12,6 +12,8 @@ export interface Settings {
     isDev: boolean;
     testMode: boolean;
     port: number;
+    httpPort: number;
+    consolePath: string;
     storeDataFolder: string;
     storeIdentityFolder: string;
 }
