@@ -53,6 +53,7 @@ export const createTestStore = async (): Promise<{ repo: Repo; storeHandle: DocH
         diskDB: {},
         appDB: {},
         instanceDB: {},
+        userDB: {},
     })
 
     await storeHandle.whenReady()

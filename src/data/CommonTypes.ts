@@ -34,6 +34,8 @@ export type Timestamp = Brand<number, "TIMESTAMP">
 
 export type Command = Brand<string, "COMMAND">
 
+export type UserID = Brand<string, "USERID">
+
 // References to top-level YMaps and YArrays in the Yjs document
 // export type YMapRef = string
 // export type YArrayRef = string
