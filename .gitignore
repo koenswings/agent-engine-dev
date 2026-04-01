@@ -159,3 +159,16 @@ api/
 .claude/
 
 test/testresults/
+
+# Identity files — governed by Atlas, backed up to agent-identities repo
+AGENTS.md
+SOUL.md
+IDENTITY.md
+USER.md
+TOOLS.md
+HEARTBEAT.md
+
+# Memory files — live files, backed up to agent-identities repo nightly
+MEMORY.md
+memory/
+outputs/
