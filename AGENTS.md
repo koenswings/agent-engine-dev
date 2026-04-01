@@ -19,7 +19,7 @@ conventions, and key files.
 
 Before doing anything else:
 
-0. Run `git pull origin main` in your workspace — AGENTS.md and other files may have been updated by Atlas between sessions
+0. Run `git fetch origin main && git merge --ff-only origin/main` — safely pull latest AGENTS.md and config changes. If it fails (uncommitted work present), log the warning and continue with current files
 1. Read `../../CONTEXT.md` — mission, solution overview, guiding principles
 2. Read `../../design/INDEX.md` — index of all org-level design docs
 3. Read `../../docs/INDEX.md` — index of all org-level authoritative docs
@@ -123,7 +123,7 @@ Koen reads it and forwards it manually. The target agent responds in their own g
 ## /init Command
 
 If Koen sends `/init`, immediately run the full startup read sequence regardless of session state:
-0. Run `git pull origin main` — get the latest AGENTS.md and files before re-reading
+0. Run `git fetch origin main && git merge --ff-only origin/main` — get the latest files. If it fails, continue with current files
 1. Read `../../CONTEXT.md`
 2. Read `../../design/INDEX.md`
 3. Read `../../docs/INDEX.md`
