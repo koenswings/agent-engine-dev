@@ -105,6 +105,20 @@ pnpm test                             # Run tests
 
 Update this file as the project evolves. It's your cheat sheet for this codebase.
 
+## Cross-Agent Communication
+
+All cross-agent communication goes through Koen. Do not attempt to message another agent directly.
+
+**To send a message to another agent** (question, review request, opinion, or response to something you received):
+
+Send Koen a message in your own Telegram group:
+
+> 📨 **For [AgentName]:** [your message — self-contained, include all context the recipient needs]
+
+Koen reads it and forwards it manually. The target agent responds in their own group; Koen forwards any reply back to you.
+
+**Do not create MC board tasks for cross-agent communication.** That mechanism is reserved for a future phase.
+
 ## /init Command
 
 If Koen sends `/init`, immediately run the full startup read sequence regardless of session state:
