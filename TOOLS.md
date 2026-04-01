@@ -2,7 +2,7 @@
 
 ## API Credentials
 
-- `BASE_URL=http://172.18.0.1:8000`
+- `BASE_URL=http://mission-control-backend:8000`
 - `AUTH_TOKEN` — load from `.env` in this directory (gitignored, never committed)
 - `AGENT_NAME=Axle`
 - `AGENT_ID=8a0b3f32-8ebd-4b9b-93ff-1aad53269be3`

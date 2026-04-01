@@ -31,18 +31,16 @@ Before doing anything else:
 9. Read `docs/INDEX.md` — index of Engine-local authoritative docs
 10. Read `../../standups/LATEST.md` — latest org standup (skip gracefully if absent)
 11. Read `memory/YYYY-MM-DD.md` (today + yesterday) for recent context
+12. Read `MEMORY.md` — long-term persistent facts (board IDs, key decisions, open items)
 
 ## Memory
 
 Write important context, decisions, and lessons to `memory/YYYY-MM-DD.md` each session.
+Update `MEMORY.md` with durable facts that should survive across many sessions.
 
-**All repos are branch-protected — never push directly to `main`.** Memory commits go on a persistent branch:
-
-1. Commit memory files to the `memory/updates` branch
-2. Push to `origin/memory/updates`
-3. Verify there is an open PR for `memory/updates → main`. If none exists, create one.
-4. When reporting memory or output commits to the CEO, always include the PR link.
-5. After a merge, recreate `memory/updates` from the new `main`
+Memory files are **live immediately** — write to disk, they're active. No commits or PRs needed.
+A nightly backup cron copies all memory and identity files to the `agent-identities` repo on GitHub.
+You do not manage this backup. Just write your memory files.
 
 `SOUL.md`, `USER.md`, and `IDENTITY.md` are loaded automatically by OpenClaw — no need to read them manually unless you need to reference something specific.
 
@@ -135,9 +133,19 @@ If Koen sends `/init`, immediately run the full startup read sequence regardless
 9. Read `docs/INDEX.md`
 10. Read `../../standups/LATEST.md`
 11. Read `memory/YYYY-MM-DD.md` (today + yesterday)
-12. Confirm: "Initialised. [brief summary of what changed / anything needing attention]"
+12. Read `MEMORY.md` — long-term persistent facts
+13. Confirm: "Initialised. [brief summary of what changed / anything needing attention]"
 
 This is the recovery command for sessions that started without completing the startup sequence.
+
+## Identity Change Protocol
+
+Your identity files (AGENTS.md, SOUL.md, IDENTITY.md, USER.md, TOOLS.md, HEARTBEAT.md) are
+governed by Atlas. To request a change, send Atlas a message via the Telegram relay:
+
+> 📨 **For Atlas:** I'd like to change [file]: [what and why]
+
+Atlas discusses with Koen and makes the change directly. Do not edit your own identity files.
 
 ## Outputs
 
@@ -145,11 +153,13 @@ Write an output file for every substantive response — immediately after delive
 
 **File:** `outputs/YYYY-MM-DD-HHMM-<topic>.md`  
 **Start with:** `> **Task/Question:** <the user's exact message>`  
-**Then:** commit and push to `memory/updates` immediately
+**Then:** write to disk immediately — no commit or PR needed; the nightly backup captures it.
 
 **Substantive** = any response containing analysis, a decision, a plan, a recommendation, or a work product.  
 **Exempt** = one-liner confirmations, status ACKs, and pure yes/no answers.
 
-Commit message: `outputs: YYYY-MM-DD <topic>`
-
 **When reporting a PR or task, always include the clickable URL** inline — GitHub PR link, MC task URL, or both. The CEO reviews on mobile; one tap to open beats searching every time.
+
+**Telegram tables:** Never send raw markdown or ASCII tables to Telegram — they don't render on mobile. For tabular data, render as a PNG using:
+`/home/node/workspace/skills/telegram-table/scripts/render_table.py`
+Use plain bullets for simple lists where layout doesn't add clarity.
