@@ -312,10 +312,6 @@
             *   Revisiting Certificates
             *   How to set up https
 *   **Data Syncing**
-    *   [[TBD]] Since Engine syncing has not been released yet, the procedure below will be subject to change once we proceed with the project
-        *   Allow for any name of the appdocker
-        *   Bootstrap the process by asking the user to specify at least one name of an appdocker, and making that name editable in the UI
-            *   The system will keep track of all names found so far and can scan these names at the start of the Console to find an appdocker that is up and running
     *   Onboarding
         *   Appdockers are given standardized names
             *   Using `appdocker` as a prefix
