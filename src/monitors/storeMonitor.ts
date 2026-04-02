@@ -3,7 +3,6 @@ import { Store } from '../data/Store.js'
 import { log, deepPrint } from '../utils/utils.js'
 import { EngineID, InstanceID } from '../data/CommonTypes.js'
 import { handleCommand } from '../utils/commandUtils.js'
-// instancesMonitor.ts HTML server removed — replaced by httpMonitor.ts
 import { commands } from '../data/Commands.js';
 
 

@@ -1,1 +1,1 @@
-KERNEL=="sd?|sd?2", SYMLINK+="engine/%k"
+KERNEL=="sd?|sd?1|sd?2", SYMLINK+="engine/%k"
