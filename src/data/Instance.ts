@@ -28,12 +28,13 @@ export interface Instance {
   storedOn: DiskID | null;  // The disk that this instance is stored on. null if we do not know it yet
 }
 
-export type Status = 'Undocked'      // 
+export type Status = 'Undocked'      // Disk is not currently docked; instance data is intact on the disk
   | 'Docked'
   | 'Starting'
   | 'Running'
   | 'Pauzed'        // Stopped running but containers are still there (so still consuming resources)
   | 'Stopped'       // Stopped running and containers are removed (so not consuming resources)
+  | 'Missing'       // Instance directory no longer found on the disk (deleted or moved to another disk)
   | 'Error';
 
 

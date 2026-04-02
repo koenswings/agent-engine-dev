@@ -321,10 +321,15 @@ export const removeInstance = (storeHandle: DocHandle<Store>, disk: Disk, instan
     storeHandle.change(doc => {
         const instance = getInstance(doc, instanceId)
         if (instance) {
-            instance.status = 'Undocked' as Status // Set the status to Undocked when the instance is removed
-            instance.storedOn = null // Clear the storedOn property
-            // Remove the instance from the instanceDB
-            delete doc.instanceDB[instanceId]
+            // Mark as Missing — the instance directory is no longer on this disk (deleted or moved).
+            // We preserve the instanceDB entry so that:
+            //   1. Instance history is not lost.
+            //   2. If the instance was moved to another disk, docking that disk will find this entry
+            //      by instanceId and restore it (updating storedOn) without creating a duplicate.
+            // This is distinct from 'Undocked', where the disk is simply not currently docked and
+            // the instance data is known to still be physically present on it.
+            instance.status = 'Missing' as Status
+            instance.storedOn = null
         }
     })
 }
