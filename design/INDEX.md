@@ -19,9 +19,11 @@ OpenClaw container. SSH command= restriction via `scripts/run-tests.sh` wrapper 
 → [design/test-setup-native.md](test-setup-native.md)
 
 ## run-architecture.md
-**Status:** Proposed  ·  **Date:** 2026-03-30  ·  **Author:** Axle
+**Status:** Approved — implementation deferred  ·  **Date:** 2026-03-30  ·  **Author:** Axle
 Run architecture review: which user runs the Engine, file ownership, and permission model.
 Proposes Engine run as `pi` with targeted sudoers rules rather than root via `sudo pm2`.
+The approach is confirmed valid; implementation is deliberately deferred — the current
+restricted Docker environment for OpenClaw is considered acceptable for now.
 → [design/run-architecture.md](run-architecture.md)
 
 ## test-setup-virtual.md

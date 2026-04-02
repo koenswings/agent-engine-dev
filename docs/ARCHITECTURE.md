@@ -27,10 +27,14 @@ The project moved away from Yjs/Valtio (referenced in brainstorming notes) to **
 The application uses a "Monitor" pattern. Monitors listen for system events (USB insertion, network changes, time) and update the Automerge Repo. The Repo then syncs these changes to other peers.
 
 *   **USB Device Monitor (`usbDeviceMonitor.ts`):**
-    *   Watches the `/dev/engine` directory for new storage devices.
+    *   Watches the `/dev/engine` directory for new storage devices. The udev rule `90-docking.rules` creates symlinks there for three device patterns:
+        *   `sd?` — whole-disk device (no partition table; e.g. `sda`)
+        *   `sd?1` — first partition (single-partition disks; e.g. `sda1`)
+        *   `sd?2` — second partition (dual-partition disks; e.g. `sda2`)
     *   When a disk is inserted, it mounts the drive, reads its `META.yaml` identity, and scans for App instances.
     *   It updates the `Disk` and `Instance` objects in the Automerge Store.
     *   It triggers the execution of apps (via Docker).
+    *   **Disk type detection:** There is no explicit `type` field on the `Disk` interface. Disk type is determined at runtime by inspecting the filesystem content of the mounted drive: presence of an `apps/` directory indicates an App Disk; other disk types (Backup, Files, Upgrade) are identified by their own structural markers. This allows a single disk to serve multiple purposes simultaneously. The detection functions (`isAppDisk`, `isBackupDisk`, `isFilesDisk`, `isUpgradeDisk`) in `Disk.ts` implement this logic; only `isAppDisk` is currently active — the others are stubs pending implementation.
     *   **App version tracking:** When a disk is docked, the Engine reads the `version` field from the instance's `compose.yaml` (`x-app.version`) and stores it as `instanceOf` in the store (e.g. `'kolibri-1.1'`). If the disk has been re-prepared with a newer version since its last dock, `instanceOf` is updated automatically and the instance restarts with the new version. `lastStarted` is refreshed in the store.
     *   **Cross-disk upgrade detection (planned):** When a new App Disk is docked, the Engine will scan running instances for the same app name at a different version. If a newer minor-version disk is found alongside an older one, the Engine writes an upgrade proposal to the store. The Console reads this and presents it to the Console Admin, who can initiate the upgrade (data migration via rsync from old instance to new instance). Major version changes are not proposed — they are flagged as data-format incompatible and require explicit operator action outside the normal upgrade flow. See `App.ts`: `isMajorUpgrade()`, `extractMajorVersion()`.
 
