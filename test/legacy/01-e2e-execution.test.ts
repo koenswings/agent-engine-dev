@@ -9,7 +9,8 @@ import { Command, EngineID } from '../src/data/CommonTypes.js';
 import { commands } from '../src/data/Commands.js';
 import { Config, TestAction, TestSequenceItem } from '../src/data/Config.js';
 import { pEvent } from 'p-event';
-import _ from 'lodash';
+// lodash removed — replaced with minimal inline helper (lodash dependency removed in fix/remove-lodash)
+const _ = { get: (obj: any, path: string): any => path.split('.').reduce((acc: any, k: string) => acc?.[k], obj) };
 import { testContext } from './testContext.js';
 import { handleCommand } from '../src/utils/commandUtils.js';
 import { isEngineOnline } from '../src/utils/utils.js';

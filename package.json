@@ -63,7 +63,6 @@
     "chokidar": "^3.6.0",
     "fast-deep-equal": "^3.1.3",
     "lib0": "^0.2.114",
-    "lodash": "^4.17.21",
     "network-interfaces-listener": "^1.0.1",
     "node-dns-sd": "^1.0.1",
     "node-docker-api": "^1.1.22",
