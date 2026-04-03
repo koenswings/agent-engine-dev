@@ -1,4 +1,5 @@
-import { $, ssh, argv, chalk, path, cd } from 'zx';
+import { $, argv, chalk, path, cd } from 'zx';
+import { ssh } from '../src/utils/ssh.js'
 import { config } from '../src/data/Config.js';
 import pack from '../package.json' with { type: "json" };
 import { addMeta } from '../src/data/Meta.js';

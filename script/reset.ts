@@ -1,4 +1,5 @@
-import { $, ssh, argv, cd, chalk, fs, question } from 'zx'
+import { $, argv, cd, chalk, fs, question } from 'zx'
+import { ssh } from '../src/utils/ssh.js'
 import pack from '../package.json' with { type: "json" }
 import { reset } from '../src/utils/utils.js'
 
