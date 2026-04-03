@@ -11,8 +11,10 @@ import type { ProcessPromise } from 'zx'
  *   const exec = ssh('pi@192.168.1.1')
  *   await exec`sudo apt-get update`
  *   await exec`cd ${path} && pnpm install`
+ *
+ * The optional `shell` parameter allows injecting a mock `$` in tests.
  */
-export function ssh(host: string) {
+export function ssh(host: string, shell: typeof $ = $) {
     return (pieces: TemplateStringsArray, ...args: unknown[]): ProcessPromise => {
         const cmd = pieces.reduce((acc: string, piece: string, i: number) => {
             if (i >= args.length) return acc + piece
@@ -20,6 +22,6 @@ export function ssh(host: string) {
             const escaped = "'" + String(args[i]).replace(/'/g, "'\\''") + "'"
             return acc + piece + escaped
         }, '')
-        return $`ssh -o StrictHostKeyChecking=no ${host} -- ${cmd}`
+        return shell`ssh -o StrictHostKeyChecking=no ${host} -- ${cmd}`
     }
 }
