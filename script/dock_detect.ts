@@ -1,4 +1,5 @@
-import { $, echo, ssh, argv, cd, chalk, fs, question } from 'zx'
+import { $, echo, argv, cd, chalk, fs, question } from 'zx'
+import { ssh } from '../src/utils/ssh.js'
 import pack from '../package.json' with { type: "json" }
 
 const p = $`dmesg -wH | grep --line-buffered "Attached SCSI disk"`

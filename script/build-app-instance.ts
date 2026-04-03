@@ -1,7 +1,8 @@
 #! ../../node_modules/.bin/tsx
 
 import { strict as assert } from 'assert';
-import { $, argv, chalk, cd, fs, ssh } from 'zx'
+import { $, argv, chalk, cd, fs } from 'zx'
+import { ssh } from '../src/utils/ssh.js'
 import pack from '../package.json' with { type: "json" };
 import { config } from '../src/data/Config.js'
 import { buildInstance } from '../src/data/Instance.js';

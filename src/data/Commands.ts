@@ -5,7 +5,8 @@ import { buildInstance, startInstance, runInstance, stopInstance } from "./Insta
 import { buildEngine, syncEngine, clearKnownHost, rebootEngine } from "./Engine.js";
 import { AppName, Command, DiskName, EngineID, Hostname, InstanceName, Version } from "./CommonTypes.js";
 import { localEngineId } from "./Engine.js";
-import { chalk, ssh, fs, $ } from "zx";
+import { chalk, fs, $ } from "zx";
+import { ssh } from '../utils/ssh.js'
 
 $.verbose = false;
 import { DocHandle, Repo } from "@automerge/automerge-repo";

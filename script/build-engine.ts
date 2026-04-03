@@ -1,4 +1,5 @@
-import { $, ssh, argv, chalk, fs, question } from 'zx';
+import { $, argv, chalk, fs, question } from 'zx';
+import { ssh } from '../src/utils/ssh.js'
 
 $.verbose = false;
 import { fileURLToPath } from 'url';
