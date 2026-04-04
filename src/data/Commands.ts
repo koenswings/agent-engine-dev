@@ -14,6 +14,7 @@ import { config } from "./Config.js";
 import { generateHostName } from "../utils/nameGenerator.js";
 import pack from '../../package.json' with { type: "json" };
 import { sendCommand } from "../utils/commandUtils.js";
+import { undockDisk } from "../monitors/usbDeviceMonitor.js";
 import { testContext } from "../../test/testContext.js";
 
 
@@ -239,6 +240,28 @@ const rebootWrapper = async (storeHandle: DocHandle<Store> | null) => {
     await rebootEngine(storeHandle, localEngine);
 }
 
+const ejectDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskName: DiskName) => {
+    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+    const store = storeHandle.doc();
+    const disk = findDiskByName(store, diskName);
+    if (!disk) {
+        console.error(chalk.red(`Disk '${diskName}' not found.`));
+        return;
+    }
+    if (!disk.device) {
+        console.error(chalk.red(`Disk '${diskName}' is not currently docked.`));
+        return;
+    }
+    const localEngine = getLocalEngine(store);
+    if (disk.dockedTo !== localEngine?.id) {
+        console.error(chalk.red(`Disk '${diskName}' is not docked to this engine.`));
+        return;
+    }
+    console.log(chalk.blue(`Ejecting disk '${diskName}'...`));
+    await undockDisk(storeHandle, disk);
+    console.log(chalk.green(`Disk '${diskName}' ejected successfully.`));
+}
+
 export const commands: CommandDefinition[] = [
     { name: "ls", execute: ls, args: [], scope: 'any' },
     { name: "engines", execute: lsEngines, args: [], scope: 'any' },
@@ -269,4 +292,5 @@ export const commands: CommandDefinition[] = [
     },
     { name: "connect", execute: connect, args: [{ type: "string" }], scope: 'any' },
     { name: "disconnect", execute: disconnect, args: [], scope: 'any' },
+    { name: "ejectDisk", execute: ejectDiskWrapper, args: [{ type: "string" }], scope: 'engine' },
 ];
