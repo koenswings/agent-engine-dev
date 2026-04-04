@@ -26,6 +26,13 @@ The approach is confirmed valid; implementation is deliberately deferred — the
 restricted Docker environment for OpenClaw is considered acceptable for now.
 → [design/run-architecture.md](run-architecture.md)
 
+## backup-disk.md
+**Status:** Proposed  ·  **Date:** 2026-04-04  ·  **Author:** Axle
+Backup Disk format (BACKUP.yaml, archive layout), `isBackupDisk` detection, auto-trigger on
+dock (Immediate and On Demand), `backupApp` command, `restoreApp` command, store impact,
+test approach, and open questions.
+→ [design/backup-disk.md](backup-disk.md)
+
 ## test-setup-virtual.md
 **Status:** Superseded  ·  **Date:** 2025-07-11  ·  **Author:** Axle
 Proposal A (virtual/Docker battery) — not chosen. Retained as decision record.
