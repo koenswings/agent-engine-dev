@@ -184,7 +184,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     return watcher
 }
 
-const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
+export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
     const store: Store = storeHandle.doc()
     const device = disk.device
     if (!device) {
