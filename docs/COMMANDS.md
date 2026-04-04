@@ -64,6 +64,11 @@ These commands perform actions on the system. Some are restricted to an `engine`
 - **Usage:** `stopInstance <instanceName> <diskName>`
 - **Scope:** `engine`
 
+### `ejectDisk`
+- **Description:** Safely ejects a docked disk from this engine. Stops all running instances on the disk, unmounts it, and updates the shared store to reflect the undocked state. Equivalent to a clean physical removal.
+- **Usage:** `ejectDisk <diskName>`
+- **Scope:** `engine`
+
 ### `reboot`
 - **Description:** Reboots the engine device.
 - **Usage:** `reboot`
