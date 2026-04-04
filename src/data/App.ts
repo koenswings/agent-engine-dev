@@ -24,11 +24,14 @@ export const createAppId = (appName: AppName, version: Version): AppID => {
 }
 
 export const extractAppName = (appId: AppID): AppName => {
-    return appId.split('-')[0] as AppName
+    // Use lastIndexOf so hyphenated names like 'kolibri-with-plugins-1.0' work correctly.
+    // The convention is: last hyphen separates the name from the version.
+    return appId.slice(0, appId.lastIndexOf('-')) as AppName
 }
 
 export const extractAppVersion = (appId: AppID): Version => {
-    return appId.split('-')[1] as Version
+    // Use lastIndexOf so hyphenated names like 'kolibri-with-plugins-1.0' work correctly.
+    return appId.slice(appId.lastIndexOf('-') + 1) as Version
 }
 
 /**
