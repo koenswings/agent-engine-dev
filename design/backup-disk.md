@@ -12,24 +12,32 @@
 App Instances store all their data on the App Disk they live on. If that disk is lost, corrupted,
 or physically destroyed, all data is gone. There is no recovery path.
 
-Backup Disks are the solution: a dedicated USB drive that archives one or more App Instances on
-a configurable schedule or on demand.
+Backup Disks are the solution: a dedicated drive that archives one or more App Instances on a
+configurable schedule or on demand, using a deduplicating backup tool for efficiency and
+resilience.
 
-## Scope
+---
 
-This design covers:
-- Backup Disk format (filesystem structure and config file)
-- `isBackupDisk` detection
-- Auto-trigger on dock (Immediate and On Demand modes; Scheduled deferred)
-- `backupApp` command — manual or programmatic trigger
-- `restoreApp` command — restore from latest archive to a target disk
-- Store state changes
-- Test approach
+## Backup Tool: BorgBackup
 
-Out of scope (deferred):
-- Scheduled backup mode (requires a cron/timer infrastructure not yet in Engine)
-- Backup Disk creation from Empty Disk (Console responsibility)
-- Multi-disk restore selection (Console UI concern)
+Backups use **BorgBackup** (`borg`), not tar archives.
+
+**Why Borg:**
+- **Deduplicating** — only changed chunks are written; re-running a backup after an interruption
+  is fast because unchanged data is already stored
+- **Atomic archives** — a `borg create` that is interrupted does not corrupt the repository;
+  the partial archive is silently discarded and the repository remains valid
+- **Idempotent** — initiating a backup that was previously interrupted simply creates a new
+  archive from scratch, but deduplication means it completes in near-O(delta) time. Effectively
+  continues where it stopped.
+- **Self-contained repository** — all archives for an instance live in one Borg repository
+  directory; no external index or manifest required
+- **Efficient restore** — `borg extract` extracts a specific archive or the latest
+
+**Dependency:** `borg` must be installed on the Pi. Add to provisioning:
+```bash
+apt-get install -y borgbackup
+```
 
 ---
 
@@ -39,61 +47,166 @@ A disk is a Backup Disk if it has a `BACKUP.yaml` file in its root.
 
 ```
 /disks/<device>/
-  BACKUP.yaml        ← identifies this as a Backup Disk; contains config
-  META.yaml          ← standard disk identity file
+  META.yaml          ← standard disk identity
+  BACKUP.yaml        ← identifies as Backup Disk; contains config and link state
   backups/
-    <instanceId>/
-      <timestamp>-<instanceId>.tar.gz   ← one archive per backup run
+    <instanceId>/    ← Borg repository (one per linked instance)
+      config         ← Borg repo config (created by borg init)
+      data/
+      index.*
+      ...
 ```
 
 ### BACKUP.yaml
 
 ```yaml
 mode: on-demand      # immediate | on-demand  (scheduled: future)
-links:               # instance IDs this disk is configured to back up
-  - instanceId: sample-00000000-abc1
-    lastBackup: 1712345678000     # Unix ms timestamp; 0 if never backed up
+links:
   - instanceId: kolibri-00000000-xyz2
+    lastBackup: 1712345678000   # Unix ms; 0 if never backed up; updated by Engine after each run
+  - instanceId: sample-00000000-abc1
     lastBackup: 0
 ```
 
 **`mode`:**
-- `immediate` — backup runs automatically as soon as the disk is docked; each linked App
-  Instance is stopped, archived, then restarted in sequence
-- `on-demand` — no auto-trigger; backup must be initiated via `backupApp` command from Console
+- `immediate` — backup runs automatically whenever a linked instance's App Disk is docked
+  (either the Backup Disk docks while App Disk is already present, or the App Disk docks while
+  the Backup Disk is already present)
+- `on-demand` — no auto-trigger; backup must be initiated via the `backupApp` command
 
-**`links`:** List of App Instance IDs this disk is responsible for. The instance ID is the
-authoritative link (not app name) — this prevents accidental cross-network overwrites when
-the same backup disk is carried between sites.
+**`links`:** list of App Instance IDs this disk is responsible for. Linking is by instance ID
+(not app name) — this prevents cross-site accidents when the same backup disk is carried
+between schools.
 
-The Engine writes `lastBackup` back to `BACKUP.yaml` after each successful backup.
-
----
-
-## Archive Format
-
-Each backup is a gzipped tar of the instance directory:
-
-```
-tar -czf <timestamp>-<instanceId>.tar.gz -C /disks/<appDevice>/instances <instanceId>/
-```
-
-This captures:
-- `compose.yaml` (service definitions)
-- All bind-mounted data volumes (Nextcloud files, Kolibri content, etc.)
-- Any `.env` written by the Engine
-
-Archive naming: `<unix-ms-timestamp>-<instanceId>.tar.gz`  
-e.g. `1712345678000-kolibri-00000000-xyz2.tar.gz`
-
-**Retention:** no automatic pruning in V1 — archives accumulate. The operator manages disk space
-manually. Future: add `maxBackups` field to BACKUP.yaml.
+The Engine writes `lastBackup` back to `BACKUP.yaml` after each successful backup run.
 
 ---
 
-## Detection
+## Reactive Triggers
 
-`isBackupDisk(disk)` in `Disk.ts`:
+This section defines all the events the Engine reacts to in the context of Backup Disks.
+
+| Event | Condition | Action |
+|---|---|---|
+| Backup Disk docked | `mode=immediate`; linked App Disk is already docked | Start backup for each linked instance whose App Disk is present |
+| App Disk docked | A docked Backup Disk is linked to one or more instances on this App Disk; `mode=immediate` | Start backup for those instances |
+| `backupApp` command | Any mode; named instance + backup disk found | Start backup for the named instance |
+| `restoreApp` command | Named instance has an archive on a docked Backup Disk | Restore to target disk |
+
+**Not triggered by:**
+- Backup Disk undock (no action; in-flight backups log an error and stop)
+- App Disk undock (instance stops normally via existing undock path; no backup)
+- Engine boot (no automatic catch-up; missed backups are not retroactively triggered)
+
+### Reactive implementation
+
+**Backup Disk docked** → `processBackupDisk(storeHandle, backupDisk)`:
+- Read BACKUP.yaml
+- If `mode=immediate`: for each linked `instanceId`, find its App Disk via `instanceDB[id].storedOn → diskDB`; if that disk is currently docked, call `backupInstance`
+
+**App Disk docked** → `processAppDisk` (existing function) calls a new hook
+`checkPendingBackups(storeHandle, appDisk)`:
+- Scan all docked Backup Disks (from `diskDB` where `device != null`)
+- For each, read its `BACKUP.yaml`
+- If `mode=immediate` and any linked instance lives on `appDisk`, call `backupInstance`
+
+---
+
+## Idempotency
+
+A backup is **idempotent**: initiating it when a previous run was interrupted is safe and efficient.
+
+Borg guarantees this:
+- An interrupted `borg create` leaves no partial archive in the repository
+- Re-running `borg create` on the same data deduplicates against existing chunks — only the
+  delta is written
+- Result: the backup "continues" from the perspective of time and I/O, with no manual
+  intervention required
+
+The Engine does not need to track "in-progress" state for backup. It simply calls
+`borg create` and handles success or error. If the disk is removed mid-backup, Borg leaves
+the repository intact.
+
+---
+
+## `backupInstance` — Core Backup Logic
+
+```
+backupInstance(storeHandle, instanceId, backupDisk):
+  1. Resolve instance → App Disk (via instanceDB.storedOn → diskDB)
+  2. Verify App Disk is docked; error and return if not
+  3. Init Borg repo if first backup:
+       borg init --encryption=none /disks/<backupDevice>/backups/<instanceId>/
+  4. If instance is Running: stopInstance (stops Docker containers)
+  5. Create archive:
+       borg create \
+         /disks/<backupDevice>/backups/<instanceId>::{now} \
+         /disks/<appDevice>/instances/<instanceId>/
+  6. If instance was Running: startInstance (restart Docker containers)
+  7. Write updated lastBackup timestamp to BACKUP.yaml on backup disk
+  8. Log success
+  Error path: if borg create fails, attempt to restart instance if it was stopped; log error;
+  do NOT update lastBackup
+```
+
+Archive name: `{now}` — Borg's built-in ISO timestamp placeholder.
+
+**Instance stop/start:** Stopping the instance before backup ensures filesystem consistency
+(no open database files). The instance is always restarted after, regardless of backup outcome.
+
+---
+
+## `backupApp` Command
+
+**Usage:** `backupApp <instanceId> [backupDiskName]`  
+**Scope:** `engine`
+
+- If `backupDiskName` omitted: use the first docked Backup Disk linked to `instanceId`
+- If no linked Backup Disk docked: error
+- Calls `backupInstance(storeHandle, instanceId, backupDisk)`
+
+---
+
+## `restoreApp` Command
+
+**Usage:** `restoreApp <instanceId> <targetDiskName>`  
+**Scope:** `engine`
+
+Restores the latest archive for `instanceId` from any docked Backup Disk onto `targetDisk`.
+
+```
+restoreApp:
+  1. Find a docked Backup Disk with backups/<instanceId>/ (a valid Borg repo)
+  2. If instance is currently Running on any disk: stopInstance
+  3. Ensure /disks/<targetDevice>/instances/ exists
+  4. Extract latest archive:
+       borg extract \
+         /disks/<backupDevice>/backups/<instanceId>::latest \
+         --strip-components 0 \
+         --target /disks/<targetDevice>/instances/
+  5. Call processInstance(storeHandle, targetDisk, instanceId)
+     → registers instance in instanceDB, sets storedOn = targetDisk, starts containers
+```
+
+**Overwrite behaviour:** restoring to a disk where `instanceId` already exists overwrites the
+instance directory. This is intentional — restore means "put this instance here, as archived".
+
+**Multiple Backup Disks:** if more than one docked Backup Disk has archives for `instanceId`,
+the first found is used. Console selection is a future iteration.
+
+---
+
+## Store Changes
+
+No new fields on `Disk` or `Instance` in the Automerge store for V1.
+
+Rationale: backup state (last run, archive list) is the Backup Disk's concern, not the
+Engine's shared state. BACKUP.yaml on the disk is the source of truth. This avoids polluting
+the CRDT store with per-disk operational data that other Engines don't need.
+
+---
+
+## `isBackupDisk` Detection
 
 ```typescript
 export const isBackupDisk = async (disk: Disk): Promise<boolean> => {
@@ -108,124 +221,56 @@ export const isBackupDisk = async (disk: Disk): Promise<boolean> => {
 
 ---
 
-## Dock Processing
+## Provisioning Dependency
 
-When `processDisk` detects a Backup Disk, it calls `processBackupDisk(storeHandle, disk)`:
+`borgbackup` must be present on the Pi. Add to `install.sh`:
 
+```bash
+apt-get install -y borgbackup
 ```
-processBackupDisk:
-  1. Read BACKUP.yaml
-  2. If mode = immediate:
-       For each linked instanceId:
-         Find the App Disk where the instance lives (via instanceDB.storedOn → diskDB)
-         If the App Disk is docked and the instance is Running/Stopped:
-           run backupInstance(storeHandle, instanceId, backupDisk)
-  3. If mode = on-demand:
-       Log that disk is available; no action taken
-  4. Update store: mark disk as docked (already done by createOrUpdateDisk)
-```
-
-If a linked instance's App Disk is not currently docked, the backup for that instance is
-skipped with a log warning. The Engine does not wait or retry.
-
----
-
-## backupApp Command
-
-**Usage:** `backupApp <instanceId> [backupDiskName]`
-
-- If `backupDiskName` is omitted, use the first docked Backup Disk linked to `instanceId`
-- If no linked Backup Disk is found, error
-- Calls `backupInstance(storeHandle, instanceId, backupDisk)`
-
-**`backupInstance` sequence:**
-1. Find instance in `instanceDB`; find its App Disk via `storedOn`
-2. Verify App Disk is docked (`device != null`)
-3. If instance status is `Running`: call `stopInstance` (stops containers)
-4. Create `backups/<instanceId>/` on the Backup Disk if it doesn't exist
-5. `tar -czf <timestamp>-<instanceId>.tar.gz ...` on the App Disk, write to Backup Disk
-6. If instance was Running: call `startInstance` to restart it
-7. Write updated `lastBackup` timestamp to `BACKUP.yaml` on the Backup Disk
-8. Update store: log backup event (timestamp on instance or a new backupLog field — TBD)
-
-**Error handling:**
-- If tar fails: restart the instance (if it was stopped for backup), log error, do not update
-  `lastBackup`
-- If the Backup Disk becomes unavailable mid-backup: log error, attempt instance restart
-
----
-
-## restoreApp Command
-
-**Usage:** `restoreApp <instanceId> <targetDiskName>`
-
-Restores the latest archive for `instanceId` from any docked Backup Disk onto `targetDisk`.
-
-**Sequence:**
-1. Find any docked Backup Disk that has `backups/<instanceId>/` with at least one archive
-2. Select the latest archive (highest timestamp in filename)
-3. Verify `targetDisk` is docked and has an `instances/` directory (or create it)
-4. If `instanceDB[instanceId]` already exists and is Running/Stopped on `targetDisk`:
-   stop the running instance first
-5. Extract archive: `tar -xzf <archive> -C /disks/<targetDevice>/instances/`
-6. Call `processInstance(storeHandle, targetDisk, instanceId)` — registers and starts the
-   restored instance
-
-**Notes:**
-- Restore overwrites the instance directory if it already exists on the target disk
-- This matches the Solution Description: "there is no explicit Restore operation (at least
-  not in the UI). We just add an App from a backup source"
-- If no Backup Disk with a matching archive is docked, error
-
----
-
-## Store Changes
-
-No new fields on the `Disk` interface. Backup state lives on the disk (BACKUP.yaml) not in
-the Engine store. Rationale: the Backup Disk is the source of truth; Engine store is ephemeral.
-
-One optional addition: an `events` or `lastBackup` timestamp on `Instance` to surface in
-Console. Deferred — Console can derive this from BACKUP.yaml if needed.
 
 ---
 
 ## Open Questions
 
-1. **What if the backup disk and the app disk are on different Engines?**  
-   V1: backupApp only runs when both disks are docked to the same Engine. Cross-engine backup
-   requires rsync (Group B infrastructure) — deferred.
+1. **App Disk and Backup Disk on different Engines** — V1 requires both docked on the same
+   Engine. Cross-engine backup needs Group B (rsync/network transfer). Confirm out of scope?
 
-2. **Should BACKUP.yaml be written by Engine or by the Console provisioning flow?**  
-   Both. Engine reads it and updates `lastBackup`. Console creates it when provisioning an
-   Empty Disk as a Backup Disk (Group G). For V1, manual creation of BACKUP.yaml is acceptable
-   for testing.
+2. **Backup Disk created by Console** — Group G (Empty Disk provisioning) is responsible for
+   writing the initial BACKUP.yaml and calling `borg init`. For now, manually created
+   BACKUP.yaml + `borg init` is acceptable for testing.
 
-3. **Multiple Backup Disks for the same instance — which to use for restore?**  
-   V1: pick the first docked one with an archive. Console selects in a future iteration.
+3. **`borg init` encryption** — using `--encryption=none` for V1 simplicity. If disk
+   encryption is ever added, this is the place to change it.
 
 ---
 
 ## Test Approach
 
-- `isBackupDisk` unit test: fixture disk with/without `BACKUP.yaml`
-- `backupApp` integration: dock App Disk fixture + Backup Disk fixture, trigger backup, verify
-  archive created and `lastBackup` updated in BACKUP.yaml
-- `restoreApp` integration: dock Backup Disk with a pre-built archive, restore to a second
-  disk fixture, verify instance directory and instanceDB state
-- Immediate-mode auto-trigger: dock a Backup Disk with `mode: immediate`, verify backup runs
-  without manual command
+- `isBackupDisk`: fixture with/without `BACKUP.yaml`
+- `backupInstance`: dock App Disk fixture + Backup Disk fixture; run backup; verify Borg repo
+  has a new archive; verify BACKUP.yaml `lastBackup` updated
+- Immediate auto-trigger (Backup Disk docked first): dock Backup Disk with `mode: immediate`,
+  then dock linked App Disk; verify backup runs without `backupApp` command
+- Immediate auto-trigger (App Disk docked first): dock App Disk, then dock Backup Disk with
+  `mode: immediate`; verify backup runs
+- Idempotency: interrupt a backup mid-run; re-trigger; verify repo is intact and backup completes
+- `restoreApp`: dock Backup Disk with an existing Borg repo; run restoreApp to a second disk
+  fixture; verify instance directory and instanceDB state
 
 Test fixtures needed:
-- `disk-backup-v1/` — a Backup Disk fixture with `BACKUP.yaml` and an existing archive
-- Extension to existing `disk-sample-v1/` fixture or a new App Disk fixture
+- `disk-backup-v1/` — Backup Disk fixture with `BACKUP.yaml`; a pre-seeded Borg repo with
+  one archive for `sample-00000000-test1`
 
 ---
 
 ## Implementation Order
 
-1. `isBackupDisk` — detection
-2. `processBackupDisk` + BACKUP.yaml read/write
-3. `backupInstance` (core backup logic)
-4. `backupApp` command
-5. `restoreApp` command
-6. Tests
+1. Add `borg` to provisioning (`install.sh`)
+2. `isBackupDisk` — detection
+3. `processBackupDisk` — reads BACKUP.yaml, triggers `backupInstance` for immediate mode
+4. `checkPendingBackups` hook in `processAppDisk` — second reactive trigger
+5. `backupInstance` — core Borg backup logic
+6. `backupApp` command registration
+7. `restoreApp` command registration
+8. Tests + fixtures
