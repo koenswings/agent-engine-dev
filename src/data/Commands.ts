@@ -243,7 +243,9 @@ const rebootWrapper = async (storeHandle: DocHandle<Store> | null) => {
 const ejectDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskName: DiskName) => {
     if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
     const store = storeHandle.doc();
-    const disk = findDiskByName(store, diskName);
+    // Search all diskDB entries (not just currently docked ones) so we can give a
+    // meaningful "not currently docked" error instead of a misleading "not found".
+    const disk = Object.values(store.diskDB).find(d => d.name === diskName);
     if (!disk) {
         console.error(chalk.red(`Disk '${diskName}' not found.`));
         return;
