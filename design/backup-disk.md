@@ -312,26 +312,30 @@ the first found is used. Console selection is a future iteration.
 
 ## Store Changes
 
-### Disk: `diskType`
+### Disk: `diskTypes`
 
-Add `diskType: 'app' | 'backup' | 'empty' | 'unknown'` to the `Disk` interface:
+Add `diskTypes: DiskType[]` to the `Disk` interface, where:
 
 ```typescript
+export type DiskType = 'app' | 'backup' | 'empty' | 'upgrade' | 'files'
+
 export interface Disk {
     // ... existing fields ...
-    diskType: 'app' | 'backup' | 'empty' | 'unknown'
+    diskTypes: DiskType[]   // empty array until processDisk runs; may contain multiple types
 }
 ```
 
-Set in `processDisk` after type detection, before calling the type-specific processor.
-Default: `'unknown'` on creation; updated to the detected type(s) when the disk is processed.
-Note: multi-purpose disks are possible — if a disk is both an App Disk and a Backup Disk, set
-the most specific type or use a combined value (TBD — likely `'app'` takes precedence for V1).
+Set in `processDisk` after all type-detection checks have run — each check that returns true
+appends its type to the list. A disk that is both an App Disk and a Backup Disk will have
+`diskTypes: ['app', 'backup']`.
 
-**Rationale:** The Console has no filesystem access and cannot call `isBackupDisk` itself. It
-needs `diskType` in the Automerge store to distinguish disk types in the UI.
+Default: `[]` on disk creation. Populated during `processDisk`. Cleared to `[]` on undock.
 
-Cleared back to `'unknown'` on undock (`undockDisk`).
+**Rationale:** The Solution Description explicitly allows multi-purpose disks. A single
+`diskType` string forces a hierarchy that does not reflect reality. A list models the actual
+state correctly and lets the Console render all applicable UI sections for a disk.
+
+Cleared to `[]` on undock (`undockDisk`).
 
 ### Disk: `backupConfig`
 
@@ -465,9 +469,9 @@ Test fixtures needed:
 1. Add `borg` to provisioning (`install.sh`)
 2. **Store field changes** (one PR):
    - Rename `lastBackedUp` → `lastBackup: Timestamp | null` in `Instance.ts`
-   - Add `diskType: 'app' | 'backup' | 'empty' | 'unknown'` to `Disk.ts`
+   - Add `diskTypes: DiskType[]` + `DiskType` type alias to `Disk.ts`; populate in `processDisk` across all type checks (`isAppDisk` → `'app'`, `isBackupDisk` → `'backup'`, etc.); clear on undock
    - Add `backupConfig: { mode, links } | null` to `Disk.ts`
-3. `isBackupDisk` — detection; set `diskType='backup'` in `processDisk`
+3. `isBackupDisk` — detection; appends `'backup'` to `diskTypes` in `processDisk`
 4. `backupInstance` — core Borg backup logic (lock file, `activeBackups` mutex, stop, borg create, restart, store update)
 5. `processBackupDisk` — reads BACKUP.yaml; sets `backupConfig` in store; immediate trigger; stale lock scan; scheduled stub
 6. `checkPendingBackups` hook in `processAppDisk` — second reactive trigger
