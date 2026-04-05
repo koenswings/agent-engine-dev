@@ -312,18 +312,66 @@ the first found is used. Console selection is a future iteration.
 
 ## Store Changes
 
-### Instance: `lastBackup`
+### Disk: `diskType`
 
-Add `lastBackup: Timestamp | null` to the `Instance` interface (`Instance.ts`):
+Add `diskType: 'app' | 'backup' | 'empty' | 'unknown'` to the `Disk` interface:
 
 ```typescript
-export interface Instance {
+export interface Disk {
     // ... existing fields ...
-    lastBackup: Timestamp | null   // Unix ms of last successful backup; null if never backed up
+    diskType: 'app' | 'backup' | 'empty' | 'unknown'
 }
 ```
 
-Set by the Engine in `instanceDB` after each successful `backupInstance` run:
+Set in `processDisk` after type detection, before calling the type-specific processor.
+Default: `'unknown'` on creation; updated to the detected type(s) when the disk is processed.
+Note: multi-purpose disks are possible — if a disk is both an App Disk and a Backup Disk, set
+the most specific type or use a combined value (TBD — likely `'app'` takes precedence for V1).
+
+**Rationale:** The Console has no filesystem access and cannot call `isBackupDisk` itself. It
+needs `diskType` in the Automerge store to distinguish disk types in the UI.
+
+Cleared back to `'unknown'` on undock (`undockDisk`).
+
+### Disk: `backupConfig`
+
+Add `backupConfig: { mode: 'immediate' | 'on-demand' | 'scheduled'; links: InstanceID[] } | null`
+to the `Disk` interface:
+
+```typescript
+export interface Disk {
+    // ... existing fields ...
+    backupConfig: { mode: BackupMode; links: InstanceID[] } | null
+}
+```
+
+Set in `processBackupDisk` after reading `BACKUP.yaml`. Cleared to `null` on undock.
+
+**Rationale:** Lets the Console display which instances a Backup Disk is linked to, and what
+mode it runs in, without reading the disk directly.
+
+### Instance: `lastBackup` (rename from `lastBackedUp`)
+
+The existing `Instance` interface has `lastBackedUp: Timestamp` (initialized to `0`).
+
+**Rename to `lastBackup: Timestamp | null`**, treating `null` as "never backed up":
+
+```typescript
+export interface Instance {
+    // replaces lastBackedUp: Timestamp
+    lastBackup: Timestamp | null   // Unix ms of last successful backup; null if never
+}
+```
+
+Migration: existing records have `lastBackedUp: 0`. The rename PR will:
+1. Remove `lastBackedUp` from the interface and all write sites
+2. Add `lastBackup: null` as the initialisation value
+3. Update all read sites to use `lastBackup`
+
+Since `lastBackedUp = 0` was never used by any consumer (backup not yet implemented),
+this is a clean rename with no data migration concern.
+
+Set by the Engine after each successful `backupInstance` run:
 
 ```typescript
 storeHandle.change(doc => {
@@ -332,10 +380,20 @@ storeHandle.change(doc => {
 })
 ```
 
-**Rationale:** Console needs to show "last backed up" per instance in the UI. Storing it in the
-CRDT means all peers on the network see the value in real-time without reading BACKUP.yaml from
-the disk. `lastBackup` in BACKUP.yaml is still written (as the on-disk record), but the store
-is the live display source.
+### `createBackupDisk` command
+
+New Engine command (added in the implementation PR):
+
+**Usage:** `createBackupDisk <diskName> <mode> <instanceId...>`  
+**Scope:** `engine`
+
+1. Find disk by name; verify it is docked and has no existing apps or instances (empty)
+2. Write `BACKUP.yaml` to the disk with the specified mode and linked instance IDs
+3. Call `processDisk(storeHandle, disk)` — triggers `processBackupDisk`, sets `diskType` and
+   `backupConfig` in the store
+4. `borg init` is deferred to first `backupInstance` run (as per design)
+
+This is the Engine-side counterpart to the Console's Backup Disk provisioning UI.
 
 ---
 
@@ -405,11 +463,15 @@ Test fixtures needed:
 ## Implementation Order
 
 1. Add `borg` to provisioning (`install.sh`)
-2. Add `lastBackup: Timestamp | null` to `Instance` interface (`Instance.ts`)
-3. `isBackupDisk` — detection
+2. **Store field changes** (one PR):
+   - Rename `lastBackedUp` → `lastBackup: Timestamp | null` in `Instance.ts`
+   - Add `diskType: 'app' | 'backup' | 'empty' | 'unknown'` to `Disk.ts`
+   - Add `backupConfig: { mode, links } | null` to `Disk.ts`
+3. `isBackupDisk` — detection; set `diskType='backup'` in `processDisk`
 4. `backupInstance` — core Borg backup logic (lock file, `activeBackups` mutex, stop, borg create, restart, store update)
-5. `processBackupDisk` — reads BACKUP.yaml; immediate trigger; stale lock scan; scheduled mode stub
+5. `processBackupDisk` — reads BACKUP.yaml; sets `backupConfig` in store; immediate trigger; stale lock scan; scheduled stub
 6. `checkPendingBackups` hook in `processAppDisk` — second reactive trigger
-7. `backupApp` command registration
-8. `restoreApp` command registration
-9. Tests + fixtures
+7. `backupApp` command
+8. `restoreApp` command
+9. `createBackupDisk` command
+10. Tests + fixtures
