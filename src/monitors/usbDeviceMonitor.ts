@@ -213,10 +213,10 @@ export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
         storeHandle.change(doc => {
             const dsk = doc.diskDB[disk.id]
             if (dsk) {
-                // Move the disk to the 'Undocked' state
                 dsk.dockedTo = null
-                // Set the disk's device to null    
                 dsk.device = null
+                dsk.diskTypes = []
+                dsk.backupConfig = null
             }
         })
         // Stop all instances of the disk and move them to the 'Undocked' state

@@ -10,7 +10,7 @@ echo "--- Starting Engine Bootstrap Installation ---"
 # 1. Install base system dependencies and Node.js tools
 echo "--> Installing git, curl, and Node.js environment..."
 apt-get update -y
-apt-get install -y npm git curl
+apt-get install -y npm git curl borgbackup
 npm install -g n pnpm
 echo "--> Setting Node.js version for script execution..."
 n 20

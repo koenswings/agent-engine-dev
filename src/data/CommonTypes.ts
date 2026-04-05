@@ -36,6 +36,9 @@ export type Command = Brand<string, "COMMAND">
 
 export type UserID = Brand<string, "USERID">
 
+export type DiskType = 'app' | 'backup' | 'empty' | 'upgrade' | 'files'
+export type BackupMode = 'immediate' | 'on-demand' | 'scheduled'
+
 // References to top-level YMaps and YArrays in the Yjs document
 // export type YMapRef = string
 // export type YArrayRef = string

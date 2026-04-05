@@ -64,6 +64,21 @@ These commands perform actions on the system. Some are restricted to an `engine`
 - **Usage:** `stopInstance <instanceName> <diskName>`
 - **Scope:** `engine`
 
+### `backupApp`
+- **Description:** Backs up an app instance to a Backup Disk. Stops the instance briefly for filesystem consistency, runs a BorgBackup archive, then restarts it. If no Backup Disk name is given, the first docked Backup Disk linked to the instance is used.
+- **Usage:** `backupApp <instanceName> [backupDiskName]`
+- **Scope:** `engine`
+
+### `restoreApp`
+- **Description:** Restores the latest backup archive for an instance from any docked Backup Disk onto a target disk. Extracts the archive and calls processInstance to register and start the restored instance.
+- **Usage:** `restoreApp <instanceName> <targetDiskName>`
+- **Scope:** `engine`
+
+### `createBackupDisk`
+- **Description:** Writes a BACKUP.yaml configuration onto a docked disk, turning it into a Backup Disk. Specify the mode (`immediate`, `on-demand`, or `scheduled`) and one or more instance names to link.
+- **Usage:** `createBackupDisk <diskName> <mode> <instanceName...>`
+- **Scope:** `engine`
+
 ### `ejectDisk`
 - **Description:** Safely ejects a docked disk from this engine. Stops all running instances on the disk, unmounts it, and updates the shared store to reflect the undocked state. Equivalent to a clean physical removal.
 - **Usage:** `ejectDisk <diskName>`

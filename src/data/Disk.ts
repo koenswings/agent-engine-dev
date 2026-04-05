@@ -2,13 +2,18 @@ import { $, YAML, chalk, fs, os } from 'zx';
 import { deepPrint, log } from '../utils/utils.js';
 import { App, createOrUpdateApp } from './App.js'
 import { Instance, Status, createOrUpdateInstance, startInstance } from './Instance.js'
-import { AppID, DeviceName, DiskID, EngineID, DiskName, InstanceID, Timestamp } from './CommonTypes.js';
+import { AppID, BackupMode, DeviceName, DiskID, DiskType, EngineID, DiskName, InstanceID, Timestamp } from './CommonTypes.js';
 import { Store, getAppsOfDisk, getInstance, getInstancesOfDisk } from './Store.js';
 import { DocHandle } from '@automerge/automerge-repo';
 
 
 
 // Disks are multi-purpose  - they can be used for engines, apps, backups, etc.
+
+export interface BackupConfig {
+    mode: BackupMode
+    links: InstanceID[]
+}
 
 export interface Disk {
     id: DiskID;                   // The serial number of the disk, or a user-defined id if the disk has no serial number
@@ -17,8 +22,8 @@ export interface Disk {
     created: Timestamp;           // We must use a timestamp number as Date objects are not supported in YJS
     lastDocked: Timestamp;        // We must use a timestamp number as Date objects are not supported in YJS
     dockedTo: EngineID | null;    // The engine to which this disk is currently docked. null if it is not docked to an engine
-    // apps: { [key: AppID]: boolean };
-    // instances: { [key: InstanceID]: boolean };
+    diskTypes: DiskType[];        // Types detected for this disk (may be multiple); empty until processDisk runs
+    backupConfig: BackupConfig | null;  // Set when disk is a Backup Disk; null otherwise
 }
 
 
@@ -96,7 +101,9 @@ export const createOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: Engi
                 device: device,
                 dockedTo: engineId,
                 created: created,
-                lastDocked: new Date().getTime() as Timestamp
+                lastDocked: new Date().getTime() as Timestamp,
+                diskTypes: [],
+                backupConfig: null,
             };
             doc.diskDB[diskId] = disk;
         } else {
@@ -107,6 +114,8 @@ export const createOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: Engi
             disk.device = device;
             disk.created = created;
             disk.lastDocked = new Date().getTime() as Timestamp;
+            disk.diskTypes = [];        // reset; will be repopulated by processDisk
+            disk.backupConfig = null;   // reset; will be repopulated if Backup Disk
         }
     });
     return disk!; // Non-null assertion
@@ -124,7 +133,9 @@ export const OLDcreateOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: E
             device: device,
             dockedTo: engineId,
             created: created,
-            lastDocked: new Date().getTime() as Timestamp
+            lastDocked: new Date().getTime() as Timestamp,
+            diskTypes: [],
+            backupConfig: null,
         }
         storeHandle.change(doc => {
             doc.diskDB[diskId] = disk
@@ -149,45 +160,44 @@ export const OLDcreateOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: E
 export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Promise<void> => {
     log(`Processing disk ${disk.id} on engine ${disk.dockedTo}`)
 
-    const store: Store = storeHandle.doc()
-    // Check if the disk is an app disk, backup disk, upgrade disk, or files disk and perform the necessary actions
-    // NOTE: we currently allow Disks to be multi-purpose and be used for apps, backups, upgrades, etc. This might change in the 
-    // future towards a model in which Disks are only used for one purpose
-    
-    // Check if the disk is an app disk
+    const detectedTypes: DiskType[] = []
+
     if (await isAppDisk(disk)) {
-        log(`Disk ${disk.id} is an app disk`)   
+        log(`Disk ${disk.id} is an app disk`)
+        detectedTypes.push('app')
         await processAppDisk(storeHandle, disk)
     }
 
-    // Check if the disk is a backup disk
     if (await isBackupDisk(disk)) {
         log(`Disk ${disk.id} is a backup disk`)
-        // TODO: Implement backup disk processing
-        // -  Read the backup configuration from the disk
-        // -  Perform the backup if the backup type is IMMEDIATE
-        // -  Schedule the backup if the backup type is SCHEDULED
+        detectedTypes.push('backup')
+        // processBackupDisk is imported from backupMonitor to avoid circular deps
+        const { processBackupDisk } = await import('../monitors/backupMonitor.js')
+        await processBackupDisk(storeHandle, disk)
     }
 
-    // Check if the disk is an upgrade disk
     if (await isUpgradeDisk(disk)) {
         log(`Disk ${disk.id} is an upgrade disk`)
+        detectedTypes.push('upgrade')
         // TODO: Implement upgrade disk processing
-        // - Execute the upgrade script if the disk is an upgrade disk
     }
 
-    // Check if the disk is a files disk
     if (await isFilesDisk(disk)) {
         log(`Disk ${disk.id} is a files disk`)
+        detectedTypes.push('files')
         // TODO: Implement files disk processing
-        // - Do a network mount of the files on the disk
     }
 
-    // If the disk is not an app disk, backup disk, upgrade disk, or files disk, itis a freshly created empty disk
-    // Just log it
-    if (!(await isAppDisk(disk) || await isBackupDisk(disk) || await isUpgradeDisk(disk) || await isFilesDisk(disk))) {
+    if (detectedTypes.length === 0) {
         log(`Disk ${disk.id} is an empty disk`)
+        detectedTypes.push('empty')
     }
+
+    // Persist detected types to the store
+    storeHandle.change(doc => {
+        const d = doc.diskDB[disk.id]
+        if (d) d.diskTypes = detectedTypes
+    })
 }
 
 export const isAppDisk = async (disk: Disk): Promise<boolean> => {
@@ -201,9 +211,12 @@ export const isAppDisk = async (disk: Disk): Promise<boolean> => {
 }
 
 export const isBackupDisk = async (disk: Disk): Promise<boolean> => {
-    // Create dummy code that always returns false
-    // To be updated later
-    return false
+    try {
+        await $`test -f /disks/${disk.device}/BACKUP.yaml`
+        return true
+    } catch {
+        return false
+    }
 }
 
 export const isUpgradeDisk = async (disk: Disk): Promise<boolean> => {
@@ -279,13 +292,14 @@ export const processAppDisk = async (storeHandle: DocHandle<Store>, disk: Disk):
 
     // Remove instances that are no longer on disk
     storedInstances.forEach((storedInstance) => {
-        // if (!actualInstances.includes(storedInstance)) {
-        //     removeInstance(storeHandle, disk, storedInstance.id)
-        // }
         if (!actualInstances.some(actualInstance => actualInstance.id === storedInstance.id)) {
             removeInstance(storeHandle, disk, storedInstance.id)
         }
     })
+
+    // Trigger backups on any docked Backup Disk linked to instances on this App Disk
+    const { checkPendingBackups } = await import('../monitors/backupMonitor.js')
+    await checkPendingBackups(storeHandle, disk)
 }
 
 export const processApp = async (storeHandle: DocHandle<Store>, disk: Disk, appID: AppID): Promise<App | undefined> => {
