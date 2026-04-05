@@ -29,3 +29,9 @@ with usage examples.
 Reference for provisioning and utility scripts (`install.sh` and others): purpose,
 parameters, and usage.
 → [docs/SCRIPTS.md](SCRIPTS.md)
+
+## PI_FLEET.md
+**Status:** Authoritative  ·  **Maintained by:** Axle
+IDEA Pi test fleet: node inventory (idea01–idea04), hardware specs, provisioning
+procedure, SSH access, and fleet management commands.
+→ [docs/PI_FLEET.md](PI_FLEET.md)
