@@ -88,8 +88,9 @@ This section defines all the events the Engine reacts to in the context of Backu
 
 | Event | Condition | Action |
 |---|---|---|
-| Backup Disk docked | `mode=immediate`; linked App Disk is already docked | Start backup for each linked instance whose App Disk is present |
-| App Disk docked | A docked Backup Disk is linked to one or more instances on this App Disk; `mode=immediate` | Start backup for those instances |
+| Backup Disk docked | `mode=immediate`; linked App Disk already docked | Start backup for each linked instance whose App Disk is present |
+| Backup Disk docked | Stale `.backup-in-progress` lock file found in `backups/*/` | Re-trigger backup for each stale instance (regardless of mode) once App Disk is confirmed docked |
+| App Disk docked | A docked Backup Disk is linked to instances on this App Disk; `mode=immediate` | Start backup for those instances |
 | `backupApp` command | Any mode; named instance + backup disk found | Start backup for the named instance |
 | `restoreApp` command | Named instance has an archive on a docked Backup Disk | Restore to target disk |
 
@@ -112,7 +113,9 @@ This section defines all the events the Engine reacts to in the context of Backu
 
 ---
 
-## Idempotency
+## Idempotency and Boot Resume
+
+### Idempotency
 
 A backup is **idempotent**: initiating it when a previous run was interrupted is safe and efficient.
 
@@ -120,12 +123,42 @@ Borg guarantees this:
 - An interrupted `borg create` leaves no partial archive in the repository
 - Re-running `borg create` on the same data deduplicates against existing chunks — only the
   delta is written
-- Result: the backup "continues" from the perspective of time and I/O, with no manual
-  intervention required
+- Result: the backup effectively "continues" from the perspective of time and I/O
 
-The Engine does not need to track "in-progress" state for backup. It simply calls
-`borg create` and handles success or error. If the disk is removed mid-backup, Borg leaves
-the repository intact.
+### Boot Resume (interrupted backup)
+
+If the Engine reboots during an active backup, the backup must resume automatically when the
+Backup Disk is next docked (typically on the next boot if the disk stays connected).
+
+**Mechanism: lock file on the Backup Disk**
+
+Before calling `borg create`, the Engine writes a lock file:
+
+```
+/disks/<backupDevice>/backups/<instanceId>/.backup-in-progress
+```
+
+Contents: `{ "instanceId": "...", "startedAt": <unix-ms> }`
+
+After a successful backup (and after updating BACKUP.yaml), the lock file is removed.
+
+If the Engine reboots mid-backup:
+- The Backup Disk is re-detected by chokidar on the next boot (or on re-dock)
+- `processBackupDisk` checks for `.backup-in-progress` lock files in `backups/*/`
+- For each stale lock found, it queues a `backupInstance` call (after linked App Disk is
+  confirmed docked)
+
+**Stale lock detection** — when `processBackupDisk` runs:
+
+```
+For each instanceId in backups/:
+  If .backup-in-progress exists:
+    → queue backupInstance(instanceId, backupDisk) once its App Disk is confirmed docked
+```
+
+This runs **in addition to** the normal mode logic — a stale lock triggers re-backup
+regardless of `mode` (on-demand or immediate), since the backup was already explicitly
+initiated before the crash.
 
 ---
 
@@ -137,16 +170,23 @@ backupInstance(storeHandle, instanceId, backupDisk):
   2. Verify App Disk is docked; error and return if not
   3. Init Borg repo if first backup:
        borg init --encryption=none /disks/<backupDevice>/backups/<instanceId>/
-  4. If instance is Running: stopInstance (stops Docker containers)
-  5. Create archive:
+  4. Write lock file: /disks/<backupDevice>/backups/<instanceId>/.backup-in-progress
+       { "instanceId": "...", "startedAt": <unix-ms> }
+  5. If instance is Running: stopInstance (stops Docker containers)
+  6. Create archive:
        borg create \
          /disks/<backupDevice>/backups/<instanceId>::{now} \
          /disks/<appDevice>/instances/<instanceId>/
-  6. If instance was Running: startInstance (restart Docker containers)
-  7. Write updated lastBackup timestamp to BACKUP.yaml on backup disk
-  8. Log success
-  Error path: if borg create fails, attempt to restart instance if it was stopped; log error;
-  do NOT update lastBackup
+  7. If instance was Running: startInstance (restart Docker containers)
+  8. Update lastBackup in Automerge store: instanceDB[instanceId].lastBackup = Date.now()
+  9. Write updated lastBackup timestamp to BACKUP.yaml on backup disk
+  10. Remove lock file: /disks/<backupDevice>/backups/<instanceId>/.backup-in-progress
+  11. Log success
+
+  Error path (borg create fails or disk removed):
+    - Attempt to restart instance if it was stopped (always)
+    - Log error; do NOT update lastBackup in store or BACKUP.yaml
+    - Leave lock file in place (signals interrupted backup for boot-resume)
 ```
 
 Archive name: `{now}` — Borg's built-in ISO timestamp placeholder.
@@ -198,11 +238,30 @@ the first found is used. Console selection is a future iteration.
 
 ## Store Changes
 
-No new fields on `Disk` or `Instance` in the Automerge store for V1.
+### Instance: `lastBackup`
 
-Rationale: backup state (last run, archive list) is the Backup Disk's concern, not the
-Engine's shared state. BACKUP.yaml on the disk is the source of truth. This avoids polluting
-the CRDT store with per-disk operational data that other Engines don't need.
+Add `lastBackup: Timestamp | null` to the `Instance` interface (`Instance.ts`):
+
+```typescript
+export interface Instance {
+    // ... existing fields ...
+    lastBackup: Timestamp | null   // Unix ms of last successful backup; null if never backed up
+}
+```
+
+Set by the Engine in `instanceDB` after each successful `backupInstance` run:
+
+```typescript
+storeHandle.change(doc => {
+    const inst = doc.instanceDB[instanceId]
+    if (inst) inst.lastBackup = Date.now() as Timestamp
+})
+```
+
+**Rationale:** Console needs to show "last backed up" per instance in the UI. Storing it in the
+CRDT means all peers on the network see the value in real-time without reading BACKUP.yaml from
+the disk. `lastBackup` in BACKUP.yaml is still written (as the on-disk record), but the store
+is the live display source.
 
 ---
 
@@ -238,10 +297,14 @@ apt-get install -y borgbackup
 
 2. **Backup Disk created by Console** — Group G (Empty Disk provisioning) is responsible for
    writing the initial BACKUP.yaml and calling `borg init`. For now, manually created
-   BACKUP.yaml + `borg init` is acceptable for testing.
+   BACKUP.yaml is acceptable for testing; `borg init` is called by Engine on first backup.
 
 3. **`borg init` encryption** — using `--encryption=none` for V1 simplicity. If disk
    encryption is ever added, this is the place to change it.
+
+4. **`lastBackup` initialisation** — existing Instance records in the store have no
+   `lastBackup` field. Automerge handles missing fields gracefully (reads as `undefined`);
+   treat `undefined` the same as `null` in display logic.
 
 ---
 
@@ -249,12 +312,17 @@ apt-get install -y borgbackup
 
 - `isBackupDisk`: fixture with/without `BACKUP.yaml`
 - `backupInstance`: dock App Disk fixture + Backup Disk fixture; run backup; verify Borg repo
-  has a new archive; verify BACKUP.yaml `lastBackup` updated
+  has a new archive; verify BACKUP.yaml `lastBackup` updated; verify `instanceDB[id].lastBackup`
+  set in store
 - Immediate auto-trigger (Backup Disk docked first): dock Backup Disk with `mode: immediate`,
   then dock linked App Disk; verify backup runs without `backupApp` command
 - Immediate auto-trigger (App Disk docked first): dock App Disk, then dock Backup Disk with
   `mode: immediate`; verify backup runs
-- Idempotency: interrupt a backup mid-run; re-trigger; verify repo is intact and backup completes
+- Boot-resume: pre-seed a `.backup-in-progress` lock file in the Backup Disk fixture; dock the
+  Backup Disk + linked App Disk; verify `backupInstance` is triggered automatically; verify
+  lock file is removed after success
+- Idempotency: run backup; simulate interruption (leave lock file); re-trigger; verify repo is
+  intact, backup completes, lock file removed
 - `restoreApp`: dock Backup Disk with an existing Borg repo; run restoreApp to a second disk
   fixture; verify instance directory and instanceDB state
 
@@ -267,10 +335,12 @@ Test fixtures needed:
 ## Implementation Order
 
 1. Add `borg` to provisioning (`install.sh`)
-2. `isBackupDisk` — detection
-3. `processBackupDisk` — reads BACKUP.yaml, triggers `backupInstance` for immediate mode
-4. `checkPendingBackups` hook in `processAppDisk` — second reactive trigger
-5. `backupInstance` — core Borg backup logic
-6. `backupApp` command registration
-7. `restoreApp` command registration
-8. Tests + fixtures
+2. Add `lastBackup: Timestamp | null` to `Instance` interface (`Instance.ts`)
+3. `isBackupDisk` — detection
+4. `processBackupDisk` — reads BACKUP.yaml; triggers `backupInstance` for immediate mode;
+   scans for stale lock files and re-queues interrupted backups
+5. `checkPendingBackups` hook in `processAppDisk` — second reactive trigger
+6. `backupInstance` — core Borg backup logic (lock file, stop, borg create, restart, store update)
+7. `backupApp` command registration
+8. `restoreApp` command registration
+9. Tests + fixtures
