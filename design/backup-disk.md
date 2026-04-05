@@ -82,34 +82,108 @@ The Engine writes `lastBackup` back to `BACKUP.yaml` after each successful backu
 
 ---
 
+## Modes
+
+| Mode | Meaning |
+|---|---|
+| `immediate` | Backup triggers automatically on dock events (Backup Disk docked, App Disk docked) |
+| `on-demand` | Backup only when explicitly triggered by `backupApp` command from Console |
+| `scheduled` | Backup runs on a cron schedule while both disks are docked; **implementation deferred** |
+
+## Scenarios × Modes
+
+The five hardware/lifecycle scenarios and how each mode responds:
+
+| Scenario | Immediate | On-demand | Scheduled |
+|---|---|---|---|
+| **Dock Backup Disk** (App Disk already docked) | Check stale locks → re-trigger interrupted backups. Trigger backup for each linked instance whose App Disk is docked. | Check stale locks → re-trigger interrupted backups. Register disk; no auto-backup. | Check stale locks → re-trigger interrupted backups. Start backup scheduler. |
+| **Dock App Disk** (Backup Disk already docked) | `checkPendingBackups`: trigger backup for linked instances on this disk. | No action. | No action (scheduler already handles timing). |
+| **Reboot** (both disks re-dock via chokidar) | Same as the two dock scenarios above, in sequence. **Race risk** — see below. In-memory mutex prevents double-backup. Stale lock files re-trigger interrupted backups. | Stale lock files re-trigger interrupted backups. No other auto-action. | Scheduler restarts on Backup Disk dock. Stale lock files re-trigger interrupted backups. |
+| **Undock Backup Disk** | In-flight backup fails (disk removed); error logged; lock file stays on disk for boot-resume; instance restarted. | No active backup. Disk deregistered from available list. | Scheduler cancelled. In-flight backup fails; lock file stays. |
+| **Undock App Disk** | In-flight backup fails (source path gone); error logged; lock file stays. Instance set to `Undocked` via existing path. | No active backup. Instance set to `Undocked`. | Scheduler continues running; next scheduled run finds App Disk undocked → error logged. Instance set to `Undocked`. |
+
+**Additional triggers not listed above:**
+- `backupApp` command — initiates `backupInstance` directly regardless of mode; this is the primary On-demand trigger
+- Scheduled timer fires — while both disks remain docked, `backupInstance` runs on schedule (Scheduled mode only)
+
+**Additional scenarios not listed above:**
+- None identified beyond the five. The Backup Disk missing a link for the docked App Disk's instances is handled by `checkPendingBackups` finding no match → no action.
+
+## Reboot Race Condition
+
+After a reboot, chokidar fires `add` for every device in `/dev/engine`. `addDevice` is async.
+At each `await` point, another `addDevice` call can interleave. This creates a race when both
+an App Disk and a Backup Disk are docked:
+
+```
+addDevice(appDisk)  → createOrUpdateDisk → diskDB[appDisk].device set
+                    → AWAIT processDisk...
+  addDevice(backupDisk) → createOrUpdateDisk → diskDB[backupDisk].device set
+                        → AWAIT processDisk...
+    processAppDisk → checkPendingBackups → sees backupDisk docked → triggers backupInstance
+    processBackupDisk → sees appDisk docked → ALSO triggers backupInstance
+```
+
+Both `backupInstance` calls run for the same `instanceId`. Borg's internal repo lock prevents
+corruption, but the outcome is unpredictable: the second caller may block, create a redundant
+archive, or fail — and may leave a stale lock file even after a successful backup.
+
+**Fix: in-memory `activeBackups` set**
+
+A module-level `Set<InstanceID>` tracks in-flight backups:
+
+```typescript
+const activeBackups = new Set<InstanceID>()
+
+const backupInstance = async (...) => {
+    if (activeBackups.has(instanceId)) {
+        log(`Backup for ${instanceId} already in progress — skipping duplicate trigger`)
+        return
+    }
+    activeBackups.add(instanceId)
+    try {
+        // ... backup logic ...
+    } finally {
+        activeBackups.delete(instanceId)
+    }
+}
+```
+
+This is safe in single-threaded Node.js (no true concurrent access between the `has` check and
+`add` call). The first trigger wins; duplicates are silently discarded.
+
 ## Reactive Triggers
 
-This section defines all the events the Engine reacts to in the context of Backup Disks.
+Full trigger table after the above analysis:
 
-| Event | Condition | Action |
+| Trigger | Condition | Action |
 |---|---|---|
-| Backup Disk docked | `mode=immediate`; linked App Disk already docked | Start backup for each linked instance whose App Disk is present |
-| Backup Disk docked | Stale `.backup-in-progress` lock file found in `backups/*/` | Re-trigger backup for each stale instance (regardless of mode) once App Disk is confirmed docked |
-| App Disk docked | A docked Backup Disk is linked to instances on this App Disk; `mode=immediate` | Start backup for those instances |
-| `backupApp` command | Any mode; named instance + backup disk found | Start backup for the named instance |
-| `restoreApp` command | Named instance has an archive on a docked Backup Disk | Restore to target disk |
+| Backup Disk docked | `mode=immediate`; linked App Disk docked | Start backup (via `activeBackups` mutex) |
+| Backup Disk docked | Stale `.backup-in-progress` lock found | Re-trigger backup once App Disk confirmed docked |
+| Backup Disk docked | `mode=scheduled` | Start scheduler |
+| App Disk docked | Linked Backup Disk docked; `mode=immediate` | Start backup (via `activeBackups` mutex) |
+| `backupApp` command | Any mode; named instance + backup disk docked | Start backup |
+| `restoreApp` command | Named instance has archive on a docked Backup Disk | Restore to target disk |
+| Scheduled timer fires | Both disks docked; `mode=scheduled` | Start backup |
+| Backup Disk undocked | Backup in-flight | Borg fails; error logged; lock file remains; instance restarted |
+| App Disk undocked | Backup in-flight | Borg fails; error logged; lock file remains; instance → Undocked |
 
-**Not triggered by:**
-- Backup Disk undock (no action; in-flight backups log an error and stop)
-- App Disk undock (instance stops normally via existing undock path; no backup)
-- Engine boot (no automatic catch-up; missed backups are not retroactively triggered)
+**Not triggered:**
+- App Disk undocked (no backup action — existing `undockDisk` path handles instance lifecycle)
+- Engine boot with no disks present (nothing to process)
 
 ### Reactive implementation
 
 **Backup Disk docked** → `processBackupDisk(storeHandle, backupDisk)`:
 - Read BACKUP.yaml
-- If `mode=immediate`: for each linked `instanceId`, find its App Disk via `instanceDB[id].storedOn → diskDB`; if that disk is currently docked, call `backupInstance`
+- Scan `backups/*/` for stale lock files → queue `backupInstance` for each stale instance once its App Disk is confirmed docked
+- If `mode=immediate`: for each linked `instanceId`, find App Disk via `instanceDB[id].storedOn → diskDB`; if docked, call `backupInstance` (guarded by `activeBackups`)
+- If `mode=scheduled`: start scheduler
 
-**App Disk docked** → `processAppDisk` (existing function) calls a new hook
-`checkPendingBackups(storeHandle, appDisk)`:
-- Scan all docked Backup Disks (from `diskDB` where `device != null`)
+**App Disk docked** → `processAppDisk` calls new hook `checkPendingBackups(storeHandle, appDisk)`:
+- Scan all docked Backup Disks (`diskDB` where `device != null`)
 - For each, read its `BACKUP.yaml`
-- If `mode=immediate` and any linked instance lives on `appDisk`, call `backupInstance`
+- If `mode=immediate` and a linked instance lives on `appDisk`, call `backupInstance` (guarded by `activeBackups`)
 
 ---
 
@@ -290,21 +364,17 @@ apt-get install -y borgbackup
 
 ---
 
-## Open Questions
+## Resolved Decisions
 
-1. **App Disk and Backup Disk on different Engines** — V1 requires both docked on the same
-   Engine. Cross-engine backup needs Group B (rsync/network transfer). Confirm out of scope?
-
-2. **Backup Disk created by Console** — Group G (Empty Disk provisioning) is responsible for
-   writing the initial BACKUP.yaml and calling `borg init`. For now, manually created
-   BACKUP.yaml is acceptable for testing; `borg init` is called by Engine on first backup.
-
-3. **`borg init` encryption** — using `--encryption=none` for V1 simplicity. If disk
-   encryption is ever added, this is the place to change it.
-
-4. **`lastBackup` initialisation** — existing Instance records in the store have no
-   `lastBackup` field. Automerge handles missing fields gracefully (reads as `undefined`);
-   treat `undefined` the same as `null` in display logic.
+- **`lastBackup` null/undefined = never backed up.** Console treats both the same.
+- **No encryption.** `borg init --encryption=none` for V1. Encryption revisited if needed.
+- **Backup Disk created by Console** (Group G / Empty Disk provisioning). BACKUP.yaml is written
+  by Console; `borg init` is called by Engine on first `backupInstance` run.
+- **Cross-engine backup: out of scope for V1.** Both disks must be docked on the same Engine.
+  A future task has been created to implement cross-engine backup after a multi-engine test hub
+  is available. (See MC task for cross-engine backup.)
+- **`lastBackup` field on existing Instance records** — Automerge reads missing fields as
+  `undefined`; Engine and Console treat `undefined` the same as `null` (never backed up).
 
 ---
 
@@ -337,10 +407,9 @@ Test fixtures needed:
 1. Add `borg` to provisioning (`install.sh`)
 2. Add `lastBackup: Timestamp | null` to `Instance` interface (`Instance.ts`)
 3. `isBackupDisk` — detection
-4. `processBackupDisk` — reads BACKUP.yaml; triggers `backupInstance` for immediate mode;
-   scans for stale lock files and re-queues interrupted backups
-5. `checkPendingBackups` hook in `processAppDisk` — second reactive trigger
-6. `backupInstance` — core Borg backup logic (lock file, stop, borg create, restart, store update)
+4. `backupInstance` — core Borg backup logic (lock file, `activeBackups` mutex, stop, borg create, restart, store update)
+5. `processBackupDisk` — reads BACKUP.yaml; immediate trigger; stale lock scan; scheduled mode stub
+6. `checkPendingBackups` hook in `processAppDisk` — second reactive trigger
 7. `backupApp` command registration
 8. `restoreApp` command registration
 9. Tests + fixtures
