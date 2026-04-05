@@ -23,7 +23,7 @@ export interface Instance {
   port: PortNumber;
   serviceImages: ServiceImage[];
   created: Timestamp;       // We must use a timestamp number as Date objects are not supported in YJS
-  lastBackedUp: Timestamp;  // We must use a timestamp number as Date objects are not supported in YJS
+  lastBackup: Timestamp | null;  // Unix ms of last successful backup; null if never backed up
   lastStarted: Timestamp;   // We must use a timestamp number as Date objects are not supported in YJS
   storedOn: DiskID | null;  // The disk that this instance is stored on. null if we do not know it yet
 }
@@ -251,7 +251,7 @@ export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, inst
           port: 0 as PortNumber, // Will be set later
           serviceImages: servicesImages as ServiceImage[],
           created: new Date().getTime() as Timestamp,
-          lastBackedUp: 0 as Timestamp,
+          lastBackup: null,
           lastStarted: 0 as Timestamp,
         }
         doc.instanceDB[instanceId] = instance

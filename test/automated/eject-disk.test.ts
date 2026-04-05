@@ -42,6 +42,8 @@ const addDockedDisk = (storeHandle: DocHandle<Store>, diskId: DiskID, diskName: 
             dockedTo: engineId,
             created: Date.now() as Timestamp,
             lastDocked: Date.now() as Timestamp,
+            diskTypes: [],
+            backupConfig: null,
         }
     })
 }
@@ -84,6 +86,8 @@ describe('ejectDisk command', () => {
                 dockedTo: null,
                 created: Date.now() as Timestamp,
                 lastDocked: Date.now() as Timestamp,
+                diskTypes: [],
+                backupConfig: null,
             }
         })
         await handleCommand(commands, storeHandle, 'engine', 'ejectDisk UndockedDisk')

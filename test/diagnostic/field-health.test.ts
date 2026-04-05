@@ -25,7 +25,7 @@
  *   serviceImages  non-empty array; each element is a Docker image reference
  *   created        > 0 (timestamp, set at first dock)
  *   lastStarted    > 0 (timestamp, set when runInstance fires)
- *   lastBackedUp   >= 0 (0 = never backed up; must not be undefined)
+ *   lastBackup   >= 0 (0 = never backed up; must not be undefined)
  *   HTTP health    GET on port returns 2xx
  *
  * A timestamped diagnostic report is written to test/testresults/ after each run.
@@ -180,11 +180,11 @@ describe.skipIf(LIVE_MODE)('Field health diagnostic (fixture mode)', () => {
         expect(inst.lastStarted, 'lastStarted should be > 0').to.be.greaterThan(0)
     })
 
-    it('lastBackedUp — number >= 0 (0 = never backed up)', () => {
+    it('lastBackup — Timestamp | null (null = never backed up)', () => {
         const inst = storeHandle.doc()!.instanceDB[TEST_INSTANCE_ID as any]
-        check('lastBackedUp', inst.lastBackedUp, inst.lastBackedUp === 0 ? 'never backed up' : 'backup timestamp')
-        expect(inst.lastBackedUp, 'lastBackedUp must be a number, never undefined')
-            .to.be.a('number').that.is.at.least(0)
+        check('lastBackup', inst.lastBackup, inst.lastBackup == null ? 'never backed up' : 'backup timestamp')
+        expect(inst.lastBackup, 'lastBackup must be null or a positive number')
+            .to.satisfy((v: any) => v === null || (typeof v === 'number' && v > 0))
     })
 
     it('HTTP health — container responds 2xx on assigned port', { timeout: 15_000 }, async () => {
@@ -255,7 +255,7 @@ describe.skipIf(!LIVE_MODE)(
                 check(`${inst.id}.serviceImages`, JSON.stringify(inst.serviceImages))
                 check(`${inst.id}.created`,       inst.created)
                 check(`${inst.id}.lastStarted`,   inst.lastStarted)
-                check(`${inst.id}.lastBackedUp`,  inst.lastBackedUp, inst.lastBackedUp === 0 ? 'never backed up' : 'backed up')
+                check(`${inst.id}.lastBackup`,  inst.lastBackup, inst.lastBackup == null ? 'never backed up' : 'backed up')
 
                 expect(inst.instanceOf).to.be.a('string').that.is.not.empty
                 expect(inst.name).to.be.a('string').that.is.not.empty
@@ -265,7 +265,7 @@ describe.skipIf(!LIVE_MODE)(
                 expect(inst.serviceImages).to.be.an('array').that.is.not.empty
                 expect(inst.created).to.be.greaterThan(0)
                 expect(inst.lastStarted).to.be.greaterThan(0)
-                expect(inst.lastBackedUp).to.be.a('number').that.is.at.least(0)
+                expect(inst.lastBackup).to.satisfy((v: any) => v === null || (typeof v === 'number' && v > 0))
             }
         })
 

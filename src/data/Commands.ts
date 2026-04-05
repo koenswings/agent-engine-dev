@@ -15,6 +15,7 @@ import { generateHostName } from "../utils/nameGenerator.js";
 import pack from '../../package.json' with { type: "json" };
 import { sendCommand } from "../utils/commandUtils.js";
 import { undockDisk } from "../monitors/usbDeviceMonitor.js";
+import { backupInstance, restoreApp, createBackupDiskConfig } from "../monitors/backupMonitor.js";
 import { testContext } from "../../test/testContext.js";
 
 
@@ -240,6 +241,64 @@ const rebootWrapper = async (storeHandle: DocHandle<Store> | null) => {
     await rebootEngine(storeHandle, localEngine);
 }
 
+const backupAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, backupDiskName?: DiskName) => {
+    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+    const store = storeHandle.doc()
+    const instance = Object.values(store.instanceDB).find(i => i.name === instanceName)
+    if (!instance) { console.error(chalk.red(`Instance '${instanceName}' not found.`)); return; }
+
+    // Find backup disk: named or first linked docked Backup Disk
+    let backupDisk = backupDiskName
+        ? Object.values(store.diskDB).find(d => d.name === backupDiskName && d.device != null)
+        : Object.values(store.diskDB).find(d =>
+            d.device != null &&
+            d.diskTypes?.includes('backup') &&
+            d.backupConfig?.links.includes(instance.id)
+          )
+
+    if (!backupDisk) {
+        console.error(chalk.red(`No docked Backup Disk found${backupDiskName ? ` named '${backupDiskName}'` : ` linked to instance '${instanceName}'`}.`))
+        return
+    }
+    console.log(chalk.blue(`Backing up instance '${instanceName}' to disk '${backupDisk.name}'...`))
+    await backupInstance(storeHandle, instance.id, backupDisk as any)
+}
+
+const restoreAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, targetDiskName: DiskName) => {
+    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+    const store = storeHandle.doc()
+    const instance = Object.values(store.instanceDB).find(i => i.name === instanceName)
+    if (!instance) { console.error(chalk.red(`Instance '${instanceName}' not found in store.`)); return; }
+
+    const targetDisk = Object.values(store.diskDB).find(d => d.name === targetDiskName && d.device != null)
+    if (!targetDisk) { console.error(chalk.red(`Target disk '${targetDiskName}' not found or not docked.`)); return; }
+
+    console.log(chalk.blue(`Restoring instance '${instanceName}' to disk '${targetDiskName}'...`))
+    await restoreApp(storeHandle, instance.id, targetDisk as any)
+}
+
+const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskName: DiskName, mode: string, ...instanceNames: InstanceName[]) => {
+    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+    const validModes = ['immediate', 'on-demand', 'scheduled']
+    if (!validModes.includes(mode)) {
+        console.error(chalk.red(`Invalid mode '${mode}'. Valid modes: ${validModes.join(', ')}`))
+        return
+    }
+    const store = storeHandle.doc()
+    const disk = Object.values(store.diskDB).find(d => d.name === diskName && d.device != null)
+    if (!disk) { console.error(chalk.red(`Disk '${diskName}' not found or not docked.`)); return; }
+
+    const instanceIds = instanceNames.map(name => {
+        const inst = Object.values(store.instanceDB).find(i => i.name === name)
+        if (!inst) console.warn(chalk.yellow(`Warning: instance '${name}' not found — it will be added to the links list anyway`))
+        return inst?.id
+    }).filter(Boolean) as any[]
+
+    console.log(chalk.blue(`Creating Backup Disk config on '${diskName}' (mode: ${mode})...`))
+    await createBackupDiskConfig(storeHandle, disk as any, mode as any, instanceIds)
+    console.log(chalk.green(`Backup Disk '${diskName}' configured.`))
+}
+
 const ejectDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskName: DiskName) => {
     if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
     const store = storeHandle.doc();
@@ -295,4 +354,7 @@ export const commands: CommandDefinition[] = [
     { name: "connect", execute: connect, args: [{ type: "string" }], scope: 'any' },
     { name: "disconnect", execute: disconnect, args: [], scope: 'any' },
     { name: "ejectDisk", execute: ejectDiskWrapper, args: [{ type: "string" }], scope: 'engine' },
+    { name: "backupApp", execute: backupAppWrapper, args: [{ type: "string" }, { type: "string" }], scope: 'engine' },
+    { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string" }, { type: "string" }], scope: 'engine' },
+    { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string" }, { type: "string" }, { type: "string" }], scope: 'engine' },
 ];

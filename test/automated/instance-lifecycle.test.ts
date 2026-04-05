@@ -31,7 +31,7 @@
  *     instanceDB[id].instanceOf    is a string containing the app name
  *     instanceDB[id].name          is a non-empty string
  *     instanceDB[id].serviceImages is a non-empty array; each element is the Docker image name
- *     instanceDB[id].lastBackedUp  >= 0 (0 = never backed up; never undefined)
+ *     instanceDB[id].lastBackup  is null (never backed up) or a positive Timestamp
  *     instanceDB[id].created       > 0 (set at first dock)
  *     instanceDB[id].lastStarted   > 0 (set in runInstance)
  *     appDB                        has at least one entry for the docked app
@@ -123,10 +123,9 @@ describe('Instance lifecycle (automated, real containers)', () => {
         expect(instance.lastStarted, 'lastStarted should be set after reaching Running').to.be.greaterThan(0)
 
         // ── backup state ──────────────────────────────────────────────────────
-        // lastBackedUp is initialised to 0 (never backed up). It must always be a
-        // number — never undefined or null — so the Console can safely display it.
-        expect(instance.lastBackedUp, 'lastBackedUp should be a number (0 = never backed up)')
-            .to.be.a('number').that.is.at.least(0)
+        // lastBackup is null when never backed up.
+        expect(instance.lastBackup, 'lastBackup should be null (never backed up) or a positive timestamp')
+            .to.satisfy((v: any) => v === null || (typeof v === 'number' && v > 0))
 
         // ── appDB cross-check ─────────────────────────────────────────────────
         // Apps are registered when the disk is processed; verify at least one app
