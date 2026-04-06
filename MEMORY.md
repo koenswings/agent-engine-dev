@@ -13,9 +13,13 @@
 - MC_PLATFORM_TOKEN: in `.env` (admin, for cross-board writes)
 - GITHUB_TOKEN: in `.env` (gitignored, never commit)
 - GitHub repo: `koenswings/agent-engine-dev`
-- Pi host: `172.20.0.1` (Docker bridge gateway); hostname `wizardry-hugle`
-- Engine on Pi: `/home/pi/idea/agents/agent-engine-dev/`
-- SSH key (container→Pi): `/home/node/workspace/.ssh/id_ed25519`
+- **Runtime:** OpenClaw native (systemd, user `pi`) since 2026-04-06 — no Docker container
+- Pi hostname: `wizardly-hugle` (Linux), `openclaw-pi` (Tailscale: `openclaw-pi.tail2d60.ts.net`)
+- OpenClaw config: `/home/pi/.openclaw/openclaw.json`
+- Engine on Pi: `/home/pi/idea/agents/agent-engine-dev/` (= `/home/node/workspace/agents/agent-engine-dev/`)
+- **Direct `/dev/` access** — hardware tests (udev, USB) run locally on the Pi without Docker workarounds
+- Test fleet SSH: `ssh pi@<fleet-ip>` (idea01–idea04, LAN-only)
+- SSH key (agent→test fleet): `/home/node/workspace/.ssh/id_ed25519`
 
 ## Architecture (current, as built)
 - Engine: TypeScript / Node.js 22+, Automerge CRDTs, Docker Compose, pnpm, Vitest
@@ -66,3 +70,16 @@
 - git push needs GITHUB_TOKEN in remote URL; reset URL after push
 - PR body newlines break inline JSON in curl — use Python urllib.request for multi-line bodies
 - docker-compose-plugin (v2) must be installed separately
+- rsync not in sandbox by default — install with apt-get install rsync
+- sshpass IS in sandbox — use for initial SSH key push to new Pis
+
+## Pi Test Fleet (idea01–idea04)
+- idea01: Pi 5, 240 GB SSD — IP TBD (LAN, not Tailscale)
+- idea02: Pi 4, 240 GB SSD — IP TBD
+- idea03: Pi 5, 240 GB SSD — IP TBD
+- idea04: Pi 4, 240 GB SSD — IP TBD
+- SSH user: pi; engine path: /home/pi/projects/engine
+- Provisioning: PI_PASS=<pw> ./script/provision-fleet.sh idea01=<ip>,model=pi5 ...
+- Health check: ./script/check-fleet.sh
+- Not on Tailscale; LAN access via Docker bridge routing
+- PR #41 open: feat/pi-fleet (provisioning scripts + docs/PI_FLEET.md)

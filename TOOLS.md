@@ -16,17 +16,28 @@ See the **mc-api** shared skill for OpenAPI refresh, discovery policy, and usage
 
 ## Environment
 
-- **Pi hostname:** engine-pi (or check `hostname` in the container)
-- **Projects root (host):** `/home/pi/idea/`
-- **Projects root (container):** `/home/node/workspace/`
+- **Runtime:** OpenClaw runs **natively on the Pi as user `pi`** — no Docker container. You are running directly on the hardware.
+- **Pi hostname:** `wizardly-hugle` (Linux), `openclaw-pi` (Tailscale)
+- **Projects root:** `/home/pi/idea/` (same as `/home/node/workspace/` via symlink)
 - **Engine repo:** `/home/node/workspace/agents/agent-engine-dev`
 - **Org root:** `/home/node/workspace/` (CONTEXT.md, BACKLOG.md, proposals/, etc.)
-- **OpenClaw data:** `/root/.openclaw/` (container)
+- **OpenClaw data:** `/home/pi/.openclaw/`
 
 ## SSH
 
-- Pi is on Tailscale. Connect via: `ssh pi@<tailscale-ip>`
-- Use `./script/sync-engine --machine <host>` to push code to the Pi
+- **You are already on the Pi.** No SSH needed for normal dev work.
+- **Test fleet** (idea01–idea04, LAN-only): `ssh pi@<fleet-ip>`
+- **External access** (Tailscale): `ssh pi@openclaw-pi.tail2d60.ts.net`
+- Use `./script/sync-engine --machine <host>` to push code to test fleet Pis
+
+## Native Runtime — What Changed
+
+OpenClaw was migrated from Docker to native systemd on 2026-04-06. Key implications:
+
+- **Direct hardware access** — `/dev/` devices (USB, I2C, etc.) are accessible without Docker `--device` flags. `pnpm test` can run udev/hardware tests locally on the Pi.
+- **No container UID mismatch** — files created by the agent are owned by `pi`. No more root-owned workspace files.
+- **Restart OpenClaw:** `systemctl --user restart openclaw-gateway` (or via the `gateway` tool)
+- **Test fleet Pis** (idea01–idea04) are separate LAN machines; still access via SSH.
 
 ## Key Paths
 

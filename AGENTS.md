@@ -93,12 +93,22 @@ pnpm test                             # Run tests
   future-tense sections or `[planned]` blocks.
 - Design proposals live in `design/`. See `design/README.md` for the full convention.
 
+## Runtime Environment
+
+OpenClaw runs **natively on the Pi as user `pi`** (since 2026-04-06 — migrated from Docker).
+
+- You are running **directly on the Pi hardware** — no container. `/dev/` devices, USB, udev events are all accessible.
+- **Hardware and udev tests can run locally** — no need to SSH to a separate test Pi for udev/USB tests. The Pi you run on IS the test machine.
+- Test fleet (idea01–idea04) is still available via SSH for multi-machine tests.
+- `pnpm test` runs directly; `TEST_HOST=localhost` or `127.0.0.1` for local Pi tests.
+- Files you create are owned by `pi` — no more root-owned workspace issues.
+
 ## Safety Rules
 
 - Never run destructive commands (`reset-engine --all`, `rm -rf`) without explicit confirmation
 - Always `pnpm test` before suggesting a commit
-- Hardware tests (udev, mDNS) require a physical Pi — don't fake them
-- Prefer `pnpm dev` output to confirm changes work before syncing to hardware
+- Hardware tests (udev, mDNS) can now run locally on this Pi — no need to fake or skip them
+- Prefer `pnpm dev` output to confirm changes work before syncing to test fleet
 
 ## Make It Yours
 
