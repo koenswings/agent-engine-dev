@@ -70,8 +70,8 @@ settings:
 **Test harness helpers (`test/harness/diskSim.ts`):**
 ```typescript
 export const dockFixture = async (fixturePath: string, device = TEST_DEVICE): Promise<void> => {
-    await fs.ensureDir(DISKS_ROOT)   // /disks/ — must be writable by the test runner
-    await fs.ensureDir(DEV_ROOT)     // /dev/engine/ — must be writable by the test runner
+    await fs.ensureDir(DISKS_ROOT)   // /disks/ — must be writable by pi (owned by pi; created at boot)
+    await fs.ensureDir(DEV_ROOT)     // /dev/engine/ — must be writable by pi (see script/setup-dev.sh)
     await fs.copy(fixturePath, `${DISKS_ROOT}/${device}`, { overwrite: true })
     await fs.writeFile(`${DEV_ROOT}/${device}`, '')  // triggers chokidar → addDevice()
 }
@@ -361,7 +361,7 @@ test/
 | Requirement | Local only | With remote engines | Diagnostic |
 |---|---|---|---|
 | Docker installed and running | ✓ | ✓ | ✓ |
-| `/disks/` and `/dev/engine/` writable by test runner | ✓ | ✓ | ✓ |
+| `/disks/` and `/dev/engine/` writable by `pi` (handled by `script/install.sh` — applied on all Pis, dev and production) | ✓ | ✓ | ✓ |
 | App images pre-pulled | ✓ | ✓ | must already be cached |
 | Playwright browsers installed | ✓ | ✓ | — |
 | SSH key on remote Pis | — | ✓ | — |

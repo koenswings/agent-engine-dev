@@ -26,7 +26,18 @@ cd /tmp/engine-install
 echo "--> Installing project dependencies..."
 pnpm install --no-frozen-lockfile
 
-# 4. Run the main provisioning script in Local Mode
+# 4. Configure /dev/engine ownership
+# /dev/engine is created by udev for disk sentinel detection. The Engine runs
+# as 'pi', so pi must own the directory — on every Pi, dev and production alike.
+echo "--> Configuring /dev/engine ownership ..."
+tee /etc/tmpfiles.d/idea-engine.conf > /dev/null << 'EOF'
+# /dev/engine is created by udev for the IDEA Engine disk detection mechanism.
+# The Engine runs as pi, so pi owns this directory on all Pis.
+z /dev/engine 0775 pi pi -
+EOF
+systemd-tmpfiles --create /etc/tmpfiles.d/idea-engine.conf
+
+# 5. Run the main provisioning script in Local Mode
 echo "--> Executing main build script in Local Mode..."
 # Execute the main build script using its new wrapper
 ./build-engine
