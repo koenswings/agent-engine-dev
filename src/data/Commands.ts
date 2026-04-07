@@ -2,6 +2,7 @@ import { CommandDefinition } from "./CommandDefinition.js";
 import { Store, getApps, getDisks, getRunningEngines, getInstances, getEngine, findDiskByName, findInstanceByName, getLocalEngine, createClientStore } from "./Store.js";
 import { deepPrint } from "../utils/utils.js";
 import { buildInstance, startInstance, runInstance, stopInstance } from "./Instance.js";
+import { copyApp, moveApp } from "./App.js";
 import { buildEngine, syncEngine, clearKnownHost, rebootEngine } from "./Engine.js";
 import { AppName, Command, DiskName, EngineID, Hostname, InstanceName, Version } from "./CommonTypes.js";
 import { localEngineId } from "./Engine.js";
@@ -15,6 +16,7 @@ import { generateHostName } from "../utils/nameGenerator.js";
 import pack from '../../package.json' with { type: "json" };
 import { sendCommand } from "../utils/commandUtils.js";
 import { undockDisk } from "../monitors/usbDeviceMonitor.js";
+import { DiskID, InstanceID } from "./CommonTypes.js";
 import { backupInstance, restoreApp, createBackupDiskConfig } from "../monitors/backupMonitor.js";
 import { testContext } from "../../test/testContext.js";
 
@@ -323,6 +325,34 @@ const ejectDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskName: 
     console.log(chalk.green(`Disk '${diskName}' ejected successfully.`));
 }
 
+const copyAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: string, sourceDiskName: string, targetDiskName: string) => {
+    if (!storeHandle) { console.error(chalk.red('No store handle')); return }
+    const store = storeHandle.doc()
+    const sourceDisk = findDiskByName(store, sourceDiskName)
+    if (!sourceDisk) { console.error(chalk.red(`Source disk '${sourceDiskName}' not found or not docked`)); return }
+    const targetDisk = findDiskByName(store, targetDiskName)
+    if (!targetDisk) { console.error(chalk.red(`Target disk '${targetDiskName}' not found or not docked`)); return }
+    const instance = Object.values(store.instanceDB).find(i => i.name === instanceName)
+    if (!instance) { console.error(chalk.red(`Instance '${instanceName}' not found`)); return }
+    console.log(chalk.blue(`Copying instance '${instanceName}' from '${sourceDiskName}' to '${targetDiskName}'...`))
+    await copyApp(storeHandle, instance.id as InstanceID, sourceDisk.id as DiskID, targetDisk.id as DiskID)
+    console.log(chalk.green(`Copy started. Track progress in operationDB.`))
+}
+
+const moveAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: string, sourceDiskName: string, targetDiskName: string) => {
+    if (!storeHandle) { console.error(chalk.red('No store handle')); return }
+    const store = storeHandle.doc()
+    const sourceDisk = findDiskByName(store, sourceDiskName)
+    if (!sourceDisk) { console.error(chalk.red(`Source disk '${sourceDiskName}' not found or not docked`)); return }
+    const targetDisk = findDiskByName(store, targetDiskName)
+    if (!targetDisk) { console.error(chalk.red(`Target disk '${targetDiskName}' not found or not docked`)); return }
+    const instance = Object.values(store.instanceDB).find(i => i.name === instanceName)
+    if (!instance) { console.error(chalk.red(`Instance '${instanceName}' not found`)); return }
+    console.log(chalk.blue(`Moving instance '${instanceName}' from '${sourceDiskName}' to '${targetDiskName}'...`))
+    await moveApp(storeHandle, instance.id as InstanceID, sourceDisk.id as DiskID, targetDisk.id as DiskID)
+    console.log(chalk.green(`Move complete.`))
+}
+
 export const commands: CommandDefinition[] = [
     { name: "ls", execute: ls, args: [], scope: 'any' },
     { name: "engines", execute: lsEngines, args: [], scope: 'any' },
@@ -357,4 +387,6 @@ export const commands: CommandDefinition[] = [
     { name: "backupApp", execute: backupAppWrapper, args: [{ type: "string" }, { type: "string" }], scope: 'engine' },
     { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string" }, { type: "string" }], scope: 'engine' },
     { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string" }, { type: "string" }, { type: "string" }], scope: 'engine' },
+    { name: "copyApp", execute: copyAppWrapper, args: [{ type: "string" }, { type: "string" }, { type: "string" }], scope: 'engine' },
+    { name: "moveApp", execute: moveAppWrapper, args: [{ type: "string" }, { type: "string" }, { type: "string" }], scope: 'engine' },
 ];

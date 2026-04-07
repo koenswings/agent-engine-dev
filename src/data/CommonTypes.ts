@@ -39,6 +39,27 @@ export type UserID = Brand<string, "USERID">
 export type DiskType = 'app' | 'backup' | 'empty' | 'upgrade' | 'files'
 export type BackupMode = 'immediate' | 'on-demand' | 'scheduled'
 
+export type OperationStatus = 'Pending' | 'Running' | 'Done' | 'Failed'
+export type OperationKind =
+  | 'copyApp'
+  | 'moveApp'
+  | 'backupApp'
+  | 'restoreApp'
+  | 'upgradeApp'
+  | 'upgradeEngine'
+
+export interface Operation {
+  id: string
+  kind: OperationKind
+  args: { [key: string]: string }   // command-specific payload
+  engineId: EngineID
+  status: OperationStatus
+  progressPercent: number | null
+  startedAt: Timestamp
+  completedAt: Timestamp | null
+  error: string | null
+}
+
 // References to top-level YMaps and YArrays in the Yjs document
 // export type YMapRef = string
 // export type YArrayRef = string
