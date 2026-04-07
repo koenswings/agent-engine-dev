@@ -33,6 +33,12 @@ Backup Disk format (BACKUP.yaml, BorgBackup repos), `isBackupDisk`, `processBack
 `createBackupDisk`, `diskTypes`/`backupConfig`/`lastBackup` store fields.
 → [design/backup-disk.md](backup-disk.md)
 
+## copy-move-app.md
+**Status:** Approved  ·  **Date:** 2026-04-07  ·  **Author:** Axle
+Design for `copyApp` + `moveApp` commands and the rsync infrastructure that underpins them.
+Covers file layout, generalised `Operation` store type, progress tracking, crash recovery, same-engine phase 1, and test strategy.
+→ [design/copy-move-app.md](copy-move-app.md)
+
 ## test-setup-virtual.md
 **Status:** Superseded  ·  **Date:** 2025-07-11  ·  **Author:** Axle
 Proposal A (virtual/Docker battery) — not chosen. Retained as decision record.
