@@ -39,6 +39,13 @@ Design for `copyApp` + `moveApp` commands and the rsync infrastructure that unde
 Covers file layout, generalised `Operation` store type, progress tracking, crash recovery, same-engine phase 1, and test strategy.
 → [design/copy-move-app.md](copy-move-app.md)
 
+## cross-engine-tests.md
+**Status:** Implemented  ·  **Date:** 2026-04-09  ·  **Author:** Axle
+Cross-engine integration test design: mDNS discovery, CRDT sync propagation, and remote
+command execution (stopInstance/startInstance) across real fleet Pis. Covers store URL
+architecture, remote client harness, SSH fixture helpers, and test scope.
+→ [design/cross-engine-tests.md](cross-engine-tests.md)
+
 ## test-setup-virtual.md
 **Status:** Superseded  ·  **Date:** 2025-07-11  ·  **Author:** Axle
 Proposal A (virtual/Docker battery) — not chosen. Retained as decision record.
