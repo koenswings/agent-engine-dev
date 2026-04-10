@@ -13,17 +13,19 @@
  *   5. Undock propagation              — undock on primary, observe on ALL others
  *
  * Fleet discovery:
- *   The test runner connects to a seed engine (SEED_HOST, default: idea01.local),
- *   waits for its engineDB to populate via mDNS, then connects to all discovered peers.
- *   The engines do their own mDNS discovery — the test runner reads that result from
- *   the shared Automerge store. At least 2 engines must be reachable or beforeAll fails.
+ *   The test runner behaves like a Console client. It connects to the local Engine
+ *   on this machine (localhost) and reads engineDB from the shared Automerge store.
+ *   The engines have already done mDNS discovery and registered all peers there.
+ *   No pre-knowledge of remote hostnames is required — the fleet is whatever the
+ *   local Engine has discovered, exactly as a Console would see it.
  *
- *   Seed engine: SEED_HOST env var (default: idea01.local)
- *   Override full fleet: FLEET_HOSTS=host1,host2 (bypasses store lookup entirely)
+ *   At least 2 engines must appear in engineDB or beforeAll fails.
+ *   Override with FLEET_HOSTS=host1,host2 to bypass store lookup.
  *
  * Prerequisites:
- *   - 2+ engines provisioned from this repo (share store-identity/store-url.txt)
- *   - SSH key auth from this Pi to all fleet engines (installed during provisioning)
+ *   - Local Engine running on this machine (localhost:ENGINE_PORT)
+ *   - 2+ peer engines reachable on the LAN (discovered by local Engine via mDNS)
+ *   - SSH key auth from this machine to all fleet engines
  *   - traefik/whoami image available on primary engine (pulled in beforeAll if absent)
  *
  * Run:
@@ -31,17 +33,10 @@
  *
  * Not run in CI — requires physical fleet on LAN.
  *
- * Known issues found during initial testing (to be fixed separately):
- *
- * Test 1 — mDNS discovery:
- *   The store template may carry stale ENGINE_DevEngine entries with old lastBooted.
- *   Workaround: filter engines by lastBooted > Date.now() - 300_000.
- *   Fix: regenerate store template after provisioning.
- *
- * Test 3 — stopInstance:
- *   stopInstanceWrapper calls findDiskByName() → getDisks() (dockedTo != null filter).
- *   If CRDT state accumulation leaves the disk appearing undocked, stopInstance fails.
- *   Fix: look up disk by ID from instance.storedOn rather than by name.
+ * Known issues:
+ *   Test 3 — stopInstance: stopInstanceWrapper uses findDiskByName() → getDisks()
+ *   which only returns disks with dockedTo != null. Fix: look up disk by ID from
+ *   instance.storedOn. Tracked as follow-up PR.
  */
 
 import { describe, it, beforeAll, afterAll, expect } from 'vitest'
@@ -75,14 +70,14 @@ const TEST_INSTANCE_NAME = 'sample-instance-1'
 // Disk name from META.yaml diskName — used in commands (no spaces: command parser splits on spaces)
 const TEST_DISK_NAME = 'test-sample-v1'
 
-// ── Fleet state (populated in beforeAll / Test 1) ─────────────────────────────
+// ── Fleet state (populated in beforeAll) ────────────────────────────────────
 
-let fleetHosts: string[]                  // all discovered hosts, ordered
-let fleetRepos: Repo[]                    // one Repo per host
-let fleetStores: DocHandle<Store>[]       // one store handle per host
-let fleetEngineIds: (string | null)[]     // engine ID per host, populated in beforeAll
+let fleetHosts: string[]                  // all fleet hostnames, e.g. ['idea02.local', 'idea03.local']
+let fleetRepos: Repo[]                    // one Automerge Repo per fleet host
+let fleetStores: DocHandle<Store>[]       // one store handle per fleet host
+let fleetEngineIds: (string | null)[]     // engine ID per fleet host
 let primaryHost: string                   // fleetHosts[0] — dock / command target
-let primaryEngineId: string | null        // engine ID for the primary host, set in beforeAll
+let primaryEngineId: string | null        // engine ID for primaryHost
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -121,105 +116,73 @@ const waitForAll = async (
 // ── Setup & teardown ──────────────────────────────────────────────────────────
 
 beforeAll(async () => {
-    // ── Step 1: Connect to seed engine ──────────────────────────────────────
-    // The engines do their own mDNS discovery and populate engineDB. We connect
-    // to a single seed, wait for its engineDB to stabilise, then read the full
-    // fleet from there. This avoids running node-dns-sd on this Pi (blocked by
-    // avahi-daemon) and avoids the double-connect pattern.
-    const seedHost = process.env.FLEET_HOSTS
-        ? process.env.FLEET_HOSTS.split(',')[0].trim()
-        : (process.env.SEED_HOST ?? 'idea01.local')
+    // ── Step 1: Connect to local Engine as a Console client ──────────────────
+    // The test runner connects to the Engine on this machine (localhost) exactly
+    // as a Console client would. No pre-knowledge of remote fleet hosts is needed:
+    // the local Engine has already done mDNS discovery and populated engineDB.
+    //
+    // Prerequisite: this machine must be running a fleet Engine (pm2 engine, port 4321).
+    // Once the DevEngine identity is removed (every Pi reads its real hardware ID),
+    // this machine will have a unique engine ID and can be provisioned as a fleet member.
+    //
+    // LOCAL_ENGINE env var overrides the local host (e.g. LOCAL_ENGINE=idea01.local
+    // during the transition period before this machine is a fleet member).
+    const localHost = process.env.LOCAL_ENGINE ?? 'localhost'
+    const storeDocId = await getCachedStoreDocId(localHost)
+    console.log(`[test] Connecting to local engine at ${localHost}, store ID: ${storeDocId}`)
 
-    if (!(await isEngineRunning(seedHost))) {
-        throw new Error(`Seed engine ${seedHost} is not reachable — cannot discover fleet`)
-    }
+    const localConn = await connectToEngine(localHost, 'local', storeDocId)
 
-    const storeDocId = await getCachedStoreDocId(seedHost)
-    console.log(`[test] Seed: ${seedHost}  Store ID: ${storeDocId}`)
-
-    const seedConn = await connectToEngine(seedHost, 'seed', storeDocId)
-
-    // ── Step 2: Discover fleet from engineDB ─────────────────────────────────
-    // Wait up to 30 s for the seed's engineDB to contain at least 1 peer engine
-    // (in addition to itself). mDNS runs every 10 s; allow 3 cycles.
-    // We do not filter by lastBooted here — engines booted long ago are still valid peers.
-    // The stale template ENGINE_DevEngine entry is handled by resolveEngineId() matching
-    // on hostname (it won't match a real fleet hostname if names differ).
-    const enoughEngines = await waitFor(
-        seedConn.storeHandle,
-        store => Object.keys(store.engineDB).length >= 2,
-        30_000,
-    )
-
+    // ── Step 2: Read fleet from engineDB ─────────────────────────────────────
+    // Wait up to 30 s for engineDB to contain at least 2 engines.
+    // mDNS runs every 10 s; engines booted long ago are still valid peers.
     if (process.env.FLEET_HOSTS) {
         fleetHosts = process.env.FLEET_HOSTS.split(',').map(h => h.trim()).filter(Boolean)
         console.log(`[test] FLEET_HOSTS override: ${fleetHosts.join(', ')}`)
-    } else if (enoughEngines) {
-        const seedStore = seedConn.storeHandle.doc()!
-        // Use engines from engineDB directly — these are the real fleet members.
-        // The seed itself (management Pi) is not in the fleet: it discovers others
-        // via mDNS but doesn't register itself in the shared store.
-        fleetHosts = Object.values(seedStore.engineDB)
+        await disconnectFromEngine(localConn.repo).catch(() => {})
+    } else {
+        const enoughEngines = await waitFor(
+            localConn.storeHandle,
+            store => Object.keys(store.engineDB).length >= 2,
+            30_000,
+        )
+        const localStore = localConn.storeHandle.doc()!
+        fleetHosts = Object.values(localStore.engineDB)
             .filter(e => !!(e.hostname as string))
             .map(e => `${e.hostname as string}.local`)
-        console.log(`[test] Fleet from engineDB: ${fleetHosts.join(', ')}`)
-    } else {
-        // Seed found no peers after 30 s — fleet is too small
-        fleetHosts = []
-    }
+        await disconnectFromEngine(localConn.repo).catch(() => {})
 
-    if (fleetHosts.length < 2) {
-        await disconnectFromEngine(seedConn.repo).catch(() => {})
-        throw new Error(
-            `Cross-engine tests require at least 2 live engines — found: ${fleetHosts.length || 'none'}. ` +
-            `Ensure all engines are running and have had time to discover each other via mDNS. ` +
-            `Or set FLEET_HOSTS=host1,host2 to override discovery.`
-        )
+        if (!enoughEngines || fleetHosts.length < 2) {
+            throw new Error(
+                `Cross-engine tests require at least 2 engines in engineDB — found: ${fleetHosts.length}. ` +
+                `Ensure fleet engines are running and the local Engine has had time to discover them via mDNS. ` +
+                `Or set FLEET_HOSTS=host1,host2 to override.`
+            )
+        }
     }
+    console.log(`[test] Fleet: ${fleetHosts.join(', ')}`)
 
     primaryHost = fleetHosts[0]
 
     // ── Step 3: Pre-pull fixture image on primary ─────────────────────────────
     await ensureImagePulled(primaryHost, 'traefik/whoami')
 
-    // ── Step 4: Connect to all fleet engines ─────────────────────────────────
-    // The seed connection becomes fleetStores[0]; connect to remaining hosts.
-    const seedIndex = fleetHosts.findIndex(h => h === seedHost)
-    const otherHosts = fleetHosts.filter(h => h !== seedHost)
-
-    const otherConnections = await Promise.all(
-        otherHosts.map((host, i) => connectToEngine(host, `engine-${i + 1}`, storeDocId))
+    // ── Step 4: Connect to each fleet engine ─────────────────────────────────
+    const connections = await Promise.all(
+        fleetHosts.map((host, i) => connectToEngine(host, `engine-${i}`, storeDocId))
     )
-
-    // Build ordered arrays: seed first, then others in discovery order
-    if (seedIndex === 0 || seedIndex === -1) {
-        fleetRepos   = [seedConn.repo,   ...otherConnections.map(c => c.repo)]
-        fleetStores  = [seedConn.storeHandle, ...otherConnections.map(c => c.storeHandle)]
-    } else {
-        // seed is not fleetHosts[0] — reorder so primary (fleetHosts[0]) is first
-        const primaryHost0 = fleetHosts[0]
-        const primaryConn = await connectToEngine(primaryHost0, 'engine-0', storeDocId)
-        await disconnectFromEngine(seedConn.repo).catch(() => {})
-        const remainingHosts = fleetHosts.slice(1)
-        const remainingConns = await Promise.all(
-            remainingHosts.map((host, i) => connectToEngine(host, `engine-${i + 1}`, storeDocId))
-        )
-        fleetRepos   = [primaryConn.repo,   ...remainingConns.map(c => c.repo)]
-        fleetStores  = [primaryConn.storeHandle, ...remainingConns.map(c => c.storeHandle)]
-    }
-
+    fleetRepos   = connections.map(c => c.repo)
+    fleetStores  = connections.map(c => c.storeHandle)
     fleetEngineIds = new Array(fleetHosts.length).fill(null)
-    console.log(`[test] Connected to ${fleetHosts.length} engines: ${fleetHosts.join(', ')}`)
 
-    // ── Step 5: Capture engine IDs now while the store is confirmed populated ─────
-    // beforeAll already waited for the engineDB to contain ≥2 recent engines.
-    // Test 1 asserts these values rather than re-waiting.
+    // ── Step 5: Capture engine IDs from the confirmed store ───────────────────
     const confirmedStore = fleetStores[0].doc()!
     for (let i = 0; i < fleetHosts.length; i++) {
         fleetEngineIds[i] = resolveEngineId(confirmedStore, fleetHosts[i])
         if (fleetEngineIds[i]) console.log(`[test] ${fleetHosts[i]} → ${fleetEngineIds[i]}`)
     }
     primaryEngineId = fleetEngineIds[0]
+    console.log(`[test] Connected to ${fleetHosts.length} fleet engines`)
 }, 120_000)
 
 afterAll(async () => {

@@ -28,15 +28,19 @@ const SSH_OPTS = [
 ]
 
 export const getStoreDocId = async (primaryHost: string): Promise<DocumentId> => {
-    try {
-        const result = await $`ssh ${SSH_OPTS} pi@${primaryHost} cat /home/pi/projects/engine/store-identity/store-url.txt`
-        const url = result.stdout.trim()
-        if (url.startsWith('automerge:')) {
-            console.log(`[remoteClient] Using store URL from ${primaryHost}: ${url}`)
-            return url.replace('automerge:', '') as DocumentId
+    // For localhost (or when local file exists and host is this machine), read directly.
+    const isLocal = primaryHost === 'localhost' || primaryHost === '127.0.0.1'
+    if (!isLocal) {
+        try {
+            const result = await $`ssh ${SSH_OPTS} pi@${primaryHost} cat /home/pi/projects/engine/store-identity/store-url.txt`
+            const url = result.stdout.trim()
+            if (url.startsWith('automerge:')) {
+                console.log(`[remoteClient] Using store URL from ${primaryHost}: ${url}`)
+                return url.replace('automerge:', '') as DocumentId
+            }
+        } catch (e) {
+            console.warn(`[remoteClient] Could not read store URL from ${primaryHost}, falling back to local file`)
         }
-    } catch (e) {
-        console.warn(`[remoteClient] Could not read store URL from ${primaryHost}, falling back to local file`)
     }
     const localUrl = fs.readFileSync(LOCAL_STORE_URL_PATH, 'utf-8').trim()
     console.log(`[remoteClient] Using local store URL: ${localUrl}`)
