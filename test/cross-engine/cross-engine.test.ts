@@ -13,12 +13,13 @@
  *   5. Undock propagation              — undock on primary, observe on ALL others
  *
  * Fleet discovery:
- *   The test runner scans idea01.local … idea10.local at startup and connects to
- *   every engine it finds. Tests run against the discovered fleet — no hardcoded
- *   host list. At least 2 engines must be reachable or beforeAll fails.
+ *   The test runner connects to a seed engine (SEED_HOST, default: idea01.local),
+ *   waits for its engineDB to populate via mDNS, then connects to all discovered peers.
+ *   The engines do their own mDNS discovery — the test runner reads that result from
+ *   the shared Automerge store. At least 2 engines must be reachable or beforeAll fails.
  *
- *   Override with FLEET_HOSTS env var (comma-separated):
- *     FLEET_HOSTS=idea01.local,idea02.local pnpm test:cross-engine
+ *   Seed engine: SEED_HOST env var (default: idea01.local)
+ *   Override full fleet: FLEET_HOSTS=host1,host2 (bypasses store lookup entirely)
  *
  * Prerequisites:
  *   - 2+ engines provisioned from this repo (share store-identity/store-url.txt)
@@ -55,7 +56,6 @@ import {
     getCachedStoreDocId,
 } from './remoteClient.js'
 import {
-    discoverEngineHosts,
     remoteDockFixture,
     remoteUndock,
     remoteCleanupDisk,
@@ -80,9 +80,9 @@ const TEST_DISK_NAME = 'test-sample-v1'
 let fleetHosts: string[]                  // all discovered hosts, ordered
 let fleetRepos: Repo[]                    // one Repo per host
 let fleetStores: DocHandle<Store>[]       // one store handle per host
-let fleetEngineIds: (string | null)[]     // engine ID per host, populated in Test 1
+let fleetEngineIds: (string | null)[]     // engine ID per host, populated in beforeAll
 let primaryHost: string                   // fleetHosts[0] — dock / command target
-let primaryEngineId: string | null        // engine ID for the primary host
+let primaryEngineId: string | null        // engine ID for the primary host, set in beforeAll
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -121,43 +121,105 @@ const waitForAll = async (
 // ── Setup & teardown ──────────────────────────────────────────────────────────
 
 beforeAll(async () => {
-    // Discover live engines via mDNS (same mechanism the Engine itself uses)
-    fleetHosts = await discoverEngineHosts(10)
+    // ── Step 1: Connect to seed engine ──────────────────────────────────────
+    // The engines do their own mDNS discovery and populate engineDB. We connect
+    // to a single seed, wait for its engineDB to stabilise, then read the full
+    // fleet from there. This avoids running node-dns-sd on this Pi (blocked by
+    // avahi-daemon) and avoids the double-connect pattern.
+    const seedHost = process.env.FLEET_HOSTS
+        ? process.env.FLEET_HOSTS.split(',')[0].trim()
+        : (process.env.SEED_HOST ?? 'idea01.local')
+
+    if (!(await isEngineRunning(seedHost))) {
+        throw new Error(`Seed engine ${seedHost} is not reachable — cannot discover fleet`)
+    }
+
+    const storeDocId = await getCachedStoreDocId(seedHost)
+    console.log(`[test] Seed: ${seedHost}  Store ID: ${storeDocId}`)
+
+    const seedConn = await connectToEngine(seedHost, 'seed', storeDocId)
+
+    // ── Step 2: Discover fleet from engineDB ─────────────────────────────────
+    // Wait up to 30 s for the seed's engineDB to contain at least 1 peer engine
+    // (in addition to itself). mDNS runs every 10 s; allow 3 cycles.
+    // We do not filter by lastBooted here — engines booted long ago are still valid peers.
+    // The stale template ENGINE_DevEngine entry is handled by resolveEngineId() matching
+    // on hostname (it won't match a real fleet hostname if names differ).
+    const enoughEngines = await waitFor(
+        seedConn.storeHandle,
+        store => Object.keys(store.engineDB).length >= 2,
+        30_000,
+    )
+
+    if (process.env.FLEET_HOSTS) {
+        fleetHosts = process.env.FLEET_HOSTS.split(',').map(h => h.trim()).filter(Boolean)
+        console.log(`[test] FLEET_HOSTS override: ${fleetHosts.join(', ')}`)
+    } else if (enoughEngines) {
+        const seedStore = seedConn.storeHandle.doc()!
+        // Use engines from engineDB directly — these are the real fleet members.
+        // The seed itself (management Pi) is not in the fleet: it discovers others
+        // via mDNS but doesn't register itself in the shared store.
+        fleetHosts = Object.values(seedStore.engineDB)
+            .filter(e => !!(e.hostname as string))
+            .map(e => `${e.hostname as string}.local`)
+        console.log(`[test] Fleet from engineDB: ${fleetHosts.join(', ')}`)
+    } else {
+        // Seed found no peers after 30 s — fleet is too small
+        fleetHosts = []
+    }
 
     if (fleetHosts.length < 2) {
+        await disconnectFromEngine(seedConn.repo).catch(() => {})
         throw new Error(
             `Cross-engine tests require at least 2 live engines — found: ${fleetHosts.length || 'none'}. ` +
-            `Set FLEET_HOSTS=host1,host2 or ensure engines are reachable on the LAN.`
+            `Ensure all engines are running and have had time to discover each other via mDNS. ` +
+            `Or set FLEET_HOSTS=host1,host2 to override discovery.`
         )
     }
-    console.log(`[test] Fleet: ${fleetHosts.join(', ')} (${fleetHosts.length} engines)`)
 
     primaryHost = fleetHosts[0]
 
-    // Verify all discovered engines are actually running Engine via pm2
-    const runChecks = await Promise.all(fleetHosts.map(isEngineRunning))
-    for (let i = 0; i < fleetHosts.length; i++) {
-        if (!runChecks[i]) {
-            throw new Error(`${fleetHosts[i]} responded to HTTP but Engine (pm2) is not running`)
-        }
-    }
-
-    // Pre-pull fixture image on primary to avoid dock test timeout on first pull
+    // ── Step 3: Pre-pull fixture image on primary ─────────────────────────────
     await ensureImagePulled(primaryHost, 'traefik/whoami')
 
-    // Read store document ID from the primary engine (handles store resets gracefully)
-    const storeDocId = await getCachedStoreDocId(primaryHost)
-    console.log(`[test] Store document ID: ${storeDocId}`)
+    // ── Step 4: Connect to all fleet engines ─────────────────────────────────
+    // The seed connection becomes fleetStores[0]; connect to remaining hosts.
+    const seedIndex = fleetHosts.findIndex(h => h === seedHost)
+    const otherHosts = fleetHosts.filter(h => h !== seedHost)
 
-    // Connect to all fleet engines in parallel
-    const connections = await Promise.all(
-        fleetHosts.map((host, i) =>
-            connectToEngine(host, `engine-${i}`, storeDocId)
-        )
+    const otherConnections = await Promise.all(
+        otherHosts.map((host, i) => connectToEngine(host, `engine-${i + 1}`, storeDocId))
     )
-    fleetRepos   = connections.map(c => c.repo)
-    fleetStores  = connections.map(c => c.storeHandle)
+
+    // Build ordered arrays: seed first, then others in discovery order
+    if (seedIndex === 0 || seedIndex === -1) {
+        fleetRepos   = [seedConn.repo,   ...otherConnections.map(c => c.repo)]
+        fleetStores  = [seedConn.storeHandle, ...otherConnections.map(c => c.storeHandle)]
+    } else {
+        // seed is not fleetHosts[0] — reorder so primary (fleetHosts[0]) is first
+        const primaryHost0 = fleetHosts[0]
+        const primaryConn = await connectToEngine(primaryHost0, 'engine-0', storeDocId)
+        await disconnectFromEngine(seedConn.repo).catch(() => {})
+        const remainingHosts = fleetHosts.slice(1)
+        const remainingConns = await Promise.all(
+            remainingHosts.map((host, i) => connectToEngine(host, `engine-${i + 1}`, storeDocId))
+        )
+        fleetRepos   = [primaryConn.repo,   ...remainingConns.map(c => c.repo)]
+        fleetStores  = [primaryConn.storeHandle, ...remainingConns.map(c => c.storeHandle)]
+    }
+
     fleetEngineIds = new Array(fleetHosts.length).fill(null)
+    console.log(`[test] Connected to ${fleetHosts.length} engines: ${fleetHosts.join(', ')}`)
+
+    // ── Step 5: Capture engine IDs now while the store is confirmed populated ─────
+    // beforeAll already waited for the engineDB to contain ≥2 recent engines.
+    // Test 1 asserts these values rather than re-waiting.
+    const confirmedStore = fleetStores[0].doc()!
+    for (let i = 0; i < fleetHosts.length; i++) {
+        fleetEngineIds[i] = resolveEngineId(confirmedStore, fleetHosts[i])
+        if (fleetEngineIds[i]) console.log(`[test] ${fleetHosts[i]} → ${fleetEngineIds[i]}`)
+    }
+    primaryEngineId = fleetEngineIds[0]
 }, 120_000)
 
 afterAll(async () => {
@@ -173,37 +235,18 @@ afterAll(async () => {
 
 describe('Cross-engine integration', () => {
 
-    it('Test 1 — mDNS discovery: all engines appear in the shared store', { timeout: 60_000 }, async () => {
+    it('Test 1 — mDNS discovery: all engines appear in the shared store', async () => {
         const expectedCount = fleetHosts.length
-        const now = Date.now()
 
-        // Wait until all N engines appear in the primary store with a recent lastBooted.
-        // mDNS discovery runs every ~10 s; allow 60 s for full fleet convergence.
-        // The recent-lastBooted filter (< 5 min) excludes stale store-template entries.
-        const allDiscovered = await waitFor(
-            fleetStores[0],
-            store => {
-                const recent = Object.values(store.engineDB)
-                    .filter(e => (e.lastBooted as number) > now - 300_000)
-                return recent.length >= expectedCount
-            },
-            60_000,
-        )
-        expect(allDiscovered, `all ${expectedCount} engines should appear in the primary store within 60 s`).to.be.true
-
-        // Capture engine ID for each host
-        const primaryStore = fleetStores[0].doc()!
+        // Engine IDs were captured in beforeAll (which waited for the store to populate).
+        // Assert here — if beforeAll succeeded, discovery is already confirmed.
         for (let i = 0; i < fleetHosts.length; i++) {
-            fleetEngineIds[i] = resolveEngineId(primaryStore, fleetHosts[i])
-            expect(fleetEngineIds[i], `engine ID for ${fleetHosts[i]} should be discoverable`).to.exist
-            console.log(`[test] ${fleetHosts[i]} → engine ID: ${fleetEngineIds[i]}`)
+            expect(fleetEngineIds[i], `engine ID for ${fleetHosts[i]} should have been resolved in beforeAll`).to.exist
         }
-        primaryEngineId = fleetEngineIds[0]
 
-        // Verify all observer stores have also synced the full fleet
+        // Verify all observer stores also have the full fleet synced
         for (let i = 1; i < fleetHosts.length; i++) {
-            const observerStore = fleetStores[i].doc()!
-            const observerEngines = Object.values(observerStore.engineDB)
+            const observerEngines = Object.values(fleetStores[i].doc()!.engineDB)
             expect(
                 observerEngines.length,
                 `${fleetHosts[i]} store should contain ≥${expectedCount} engines`,

@@ -1,5 +1,5 @@
 /**
- * remoteSSH.ts — SSH helpers for cross-engine test fixture management and fleet discovery.
+ * remoteSSH.ts — SSH helpers for cross-engine test fixture management.
  *
  * Simulates disk dock/undock events on a remote fleet engine by writing and
  * removing fixture files over SSH. This is the cross-engine equivalent of
@@ -11,7 +11,6 @@
 
 import { $ } from 'zx'
 import path from 'path'
-import mDnsSd from 'node-dns-sd'
 
 // Paths on the remote engine (must match usbDeviceMonitor expectations)
 const REMOTE_DISKS_ROOT = '/disks'
@@ -31,50 +30,6 @@ const SSH_OPTS = [
     '-o', 'ConnectTimeout=10',
 ]
 
-// ── Fleet discovery ──────────────────────────────────────────────────────────
-
-/**
- * Discover live Engine hosts via mDNS — exactly as the Engine itself does.
- *
- * Uses node-dns-sd to query _engine._tcp.local and returns the hostname
- * (or IP address as fallback) of each responding engine. This is the same
- * mechanism the Engine's mDNS monitor uses; the test runner participates in
- * discovery the same way any peer would.
- *
- * Override with FLEET_HOSTS env var (comma-separated IPs or hostnames) to bypass
- * mDNS — useful when mDNS is unreliable on a subnet:
- *   FLEET_HOSTS=192.168.0.138,192.168.0.180 pnpm test:cross-engine
- *
- * @param waitSecs  mDNS query duration in seconds (default: 10 — one full mDNS cycle)
- */
-export const discoverEngineHosts = async (waitSecs = 10): Promise<string[]> => {
-    if (process.env.FLEET_HOSTS) {
-        const manual = process.env.FLEET_HOSTS.split(',').map(h => h.trim()).filter(Boolean)
-        console.log(`[remoteSSH] FLEET_HOSTS override: ${manual.join(', ')}`)
-        return manual
-    }
-
-    console.log(`[remoteSSH] Discovering engines via mDNS (_engine._tcp.local, ${waitSecs}s)...`)
-    let deviceList: any[] = []
-    try {
-        deviceList = await mDnsSd.discover({ name: '_engine._tcp.local', wait: waitSecs })
-    } catch (err) {
-        console.warn(`[remoteSSH] mDNS discovery error:`, err)
-    }
-
-    const hosts = deviceList
-        .map(device => {
-            const txt = device.packet?.additionals?.find((a: any) => a.type === 'TXT')
-            const hostname: string | undefined = txt?.rdata?.name
-            const address: string | undefined = device.address
-            // Prefer <hostname>.local if available (matches SSH config), fall back to IP
-            return hostname ? `${hostname}.local` : address
-        })
-        .filter((h): h is string => !!h)
-
-    console.log(`[remoteSSH] Discovered ${hosts.length} engine(s) via mDNS: ${hosts.join(', ')}`)
-    return hosts
-}
 
 /**
  * Copy a fixture directory to /disks/<device>/ on the remote engine and create
