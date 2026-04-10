@@ -705,6 +705,22 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
     // This ensures the CRDT reflects Running immediately so observers can
     // observe it during the docker compose up / Recreate cycle rather than
     // only after it completes. On failure the catch block sets Error.
+    //
+    // Guard: verify the disk is still docked AND the instance is still in a
+    // startable state before writing Running. A stale startInstance from a
+    // previous run may complete after the disk has been undocked or the instance
+    // has been moved to Undocked by the test teardown. In that case, skip.
+    const snap = storeHandle.doc()
+    const currentDisk = snap?.diskDB[disk.id as any]
+    const currentInst = snap?.instanceDB[instance.id as any]
+    if (!currentDisk || !currentDisk.dockedTo) {
+      log(`Disk ${disk.id} is no longer docked — skipping Running status update for ${instance.id}`)
+      return
+    }
+    if (currentInst?.status === 'Undocked') {
+      log(`Instance ${instance.id} is already Undocked — skipping Running status update`)
+      return
+    }
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
       inst.lastStarted = new Date().getTime() as Timestamp

@@ -65,6 +65,15 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                         log('Error processing the META file on the disk: ' + error)
                     }
                 } else {
+                    // Before creating a new disk entry, check if a disk is already
+                    // registered for this device in the store. This prevents spurious
+                    // empty-disk entries when addDevice fires for a device that's already
+                    // docked (e.g. during docker compose up -d Recreate cycles).
+                    const existingDisk = findDiskByDevice(storeHandle.doc(), device as DeviceName)
+                    if (existingDisk) {
+                        log(`Device ${device} already has a registered disk (${existingDisk.id}) — skipping new disk creation`)
+                        return
+                    }
                     log('Could not find a META file. Creating one now.')
                     const diskId = await readHardwareId(device) as DiskID
                     // The disk name should be the name of the volume if available, otherwise 'Unnamed Disk'
