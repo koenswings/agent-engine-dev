@@ -139,6 +139,29 @@ export const waitForInstanceStatus = async (
  * @param engineId     ID of the engine that should execute the command
  * @param command      Command string, e.g. 'stopInstance foo disk-bar'
  */
+/**
+ * Clear the command queue for all engines in the store.
+ * Call before running tests to prevent stale commands from previous runs
+ * interfering with test assertions.
+ */
+export const clearAllCommands = (
+    storeHandle: DocHandle<Store>,
+): void => {
+    const store = storeHandle.doc()
+    if (!store) return
+    const engineIds = Object.keys(store.engineDB)
+    if (engineIds.length === 0) return
+    storeHandle.change(doc => {
+        for (const engineId of engineIds) {
+            const engine = doc.engineDB[engineId as any]
+            if (engine && engine.commands && (engine.commands as any[]).length > 0) {
+                console.log(`[remoteClient] Clearing ${(engine.commands as any[]).length} stale command(s) from engine ${engineId}`)
+                ;(engine.commands as any[]).splice(0)
+            }
+        }
+    })
+}
+
 export const sendCommand = (
     storeHandle: DocHandle<Store>,
     engineId: string,

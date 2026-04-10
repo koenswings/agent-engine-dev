@@ -49,6 +49,7 @@ import {
     waitFor,
     waitForInstanceStatus,
     sendCommand,
+    clearAllCommands,
     getCachedStoreDocId,
 } from './remoteClient.js'
 import {
@@ -185,6 +186,13 @@ beforeAll(async () => {
     }
     primaryEngineId = fleetEngineIds[0]
     console.log(`[test] Connected to ${fleetHosts.length} fleet engines`)
+
+    // ── Step 6: Clear stale commands from previous runs ───────────────────────
+    // Commands accumulate across test runs and cause unexpected state transitions.
+    // Clear them before running tests.
+    clearAllCommands(fleetStores[0])
+    // Allow a moment for the clear to sync across all peers
+    await new Promise(r => setTimeout(r, 500))
 }, 120_000)
 
 afterAll(async () => {

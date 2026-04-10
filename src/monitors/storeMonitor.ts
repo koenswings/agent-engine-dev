@@ -4,6 +4,7 @@ import { log, deepPrint } from '../utils/utils.js'
 import { EngineID, InstanceID } from '../data/CommonTypes.js'
 import { handleCommand } from '../utils/commandUtils.js'
 import { commands } from '../data/Commands.js';
+import { localEngineId } from '../data/Engine.js';
 
 
 
@@ -31,6 +32,13 @@ const engineCommandsMonitor = (patch, storeHandle): boolean => {
         typeof patch.path[3] === 'number') {
         const command = patch.value as string
         const engineId = patch.path[1] as EngineID
+        // Only execute commands addressed to this engine.
+        // Commands are stored in the shared CRDT and sync to all peers,
+        // but must only be executed by the targeted engine.
+        if (engineId !== localEngineId) {
+            log(`Command for engine ${engineId} ignored by this engine (${localEngineId}): ${command}`)
+            return true
+        }
         log(`New command added for engine ${engineId}: ${command}`)
         handleCommand(commands, storeHandle, 'engine', command)
         return true
