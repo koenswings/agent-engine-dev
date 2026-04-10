@@ -23,36 +23,43 @@ const engineSetMonitor = (patch, storeHandle): boolean => {
     }
 }
 
+// Track which command string is currently being executed per engine.
+// We match on the command string itself rather than using a boolean lock,
+// so that a newly queued *different* command is always picked up.
+const _currentlyExecuting: Map<EngineID, string> = new Map()
+
 const engineCommandsMonitor = (patch, storeHandle): boolean => {
-    // Automerge emits 'put' when pushing to a non-empty list (path length 4,
-    // path[3] = numeric index). The value is the new command string.
-    if (patch.action === 'put' &&
-        patch.path.length === 4 &&
+    const isCommandPath =
+        patch.path.length >= 3 &&
         patch.path[0] === 'engineDB' &&
-        typeof patch.path[1] === 'string' && // engineId
-        patch.path[2] === 'commands' &&
-        typeof patch.path[3] === 'number') {
-        const command = patch.value as string
-        const engineId = patch.path[1] as EngineID
-        // Only execute commands addressed to this engine.
-        if (engineId !== localEngineId) {
-            log(`Command for engine ${engineId} ignored by this engine (${localEngineId}): ${command}`)
-            return true
-        }
-        log(`New command added for engine ${engineId}: ${command}`)
-        const cmdIndex = patch.path[3] as number
-        handleCommand(commands, storeHandle, 'engine', command).then(() => {
-            // Remove the command from the queue after it has been processed.
-            // This prevents re-execution on engine restart and keeps the queue clean.
-            storeHandle.change(doc => {
-                const eng = doc.engineDB[engineId as any]
-                if (eng) (eng.commands as any[]).splice(cmdIndex, 1)
-            })
+        typeof patch.path[1] === 'string' &&
+        patch.path[2] === 'commands'
+
+    if (!isCommandPath) return false
+
+    const engineId = patch.path[1] as EngineID
+    if (engineId !== localEngineId) return true
+
+    const doc = storeHandle.doc()
+    const queue = doc?.engineDB[engineId as any]?.commands as string[] | undefined
+    if (!queue?.length) return true
+
+    const command = queue[0]
+    if (!command || !command.includes(' ')) return true
+
+    // Skip if this exact command is already in flight.
+    if (_currentlyExecuting.get(engineId) === command) return true
+
+    _currentlyExecuting.set(engineId, command)
+    log(`Processing command for engine ${engineId}: ${command}`)
+    handleCommand(commands, storeHandle, 'engine', command).then(() => {
+        _currentlyExecuting.delete(engineId)
+        storeHandle.change(doc => {
+            const eng = doc.engineDB[engineId as any]
+            if (eng) (eng.commands as any[]).splice(0, 1)
         })
-        return true
-    } else {
-        return false
-    }
+    })
+    return true
 }
 
 const engineLastRunMonitor = (patch, storeHandle): boolean => {
@@ -107,23 +114,21 @@ export const enableStoreMonitor = (storeHandle: DocHandle<Store>): void => {
     // On startup, process any commands already queued for this engine.
     // The storeMonitor only fires on new patches, so commands written before
     // this engine started (or while it was offline) would otherwise be silently ignored.
-    const store = storeHandle.doc()
-    if (store?.engineDB[localEngineId]) {
-        const pending = [...(store.engineDB[localEngineId].commands as string[])]
-        if (pending?.length) {
-            log(`Processing ${pending.length} pending command(s) from queue on startup`)
-            // Process commands in order, removing each after execution.
-            // We process them serially to avoid concurrent state mutations.
-            ;(async () => {
-                for (let i = 0; i < pending.length; i++) {
-                    await handleCommand(commands, storeHandle, 'engine', pending[i])
-                    storeHandle.change(doc => {
-                        const eng = doc.engineDB[localEngineId as any]
-                        // Always remove from index 0 since we process in order
-                        if (eng) (eng.commands as any[]).splice(0, 1)
-                    })
-                }
-            })()
-        }
+    // Replay any commands already in the queue at startup.
+    const startupStore = storeHandle.doc()
+    const startupCmds = [...((startupStore?.engineDB[localEngineId]?.commands as string[]) ?? [])]
+    if (startupCmds.length) {
+        log(`Replaying ${startupCmds.length} pending command(s) from queue on startup`)
+        ;(async () => {
+            for (const cmd of startupCmds) {
+                _currentlyExecuting.set(localEngineId, cmd)
+                await handleCommand(commands, storeHandle, 'engine', cmd)
+                _currentlyExecuting.delete(localEngineId)
+                storeHandle.change(doc => {
+                    const eng = doc.engineDB[localEngineId as any]
+                    if (eng) (eng.commands as any[]).splice(0, 1)
+                })
+            }
+        })()
     }
 }
