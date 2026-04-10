@@ -701,14 +701,18 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
       log(chalk.red(`Error extracting port number from .env file for instance ${instance.id}`))
     }
 
-    // Compose up the app
-    await $`cd /disks/${disk.device}/instances/${instance.id} && docker compose up -d`
-
+    // Set status to Running before starting the containers.
+    // This ensures the CRDT reflects Running immediately so observers can
+    // observe it during the docker compose up / Recreate cycle rather than
+    // only after it completes. On failure the catch block sets Error.
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
       inst.lastStarted = new Date().getTime() as Timestamp
       inst.status = 'Running' as Status
     })
+
+    // Compose up the app
+    await $`cd /disks/${disk.device}/instances/${instance.id} && docker compose up -d`
     // Modify the dockerMetrics of the instance
     // instance.dockerMetrics = {
     //   memory: os.totalmem().toString(),
