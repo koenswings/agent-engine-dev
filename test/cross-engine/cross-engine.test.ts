@@ -326,6 +326,14 @@ describe('Cross-engine integration', () => {
     })
 
     it('Test 5 — Undock propagation: undock on primary, observe Undocked on all engines', { timeout: 30_000 }, async () => {
+        // Wait for all observers to confirm Running before undocking.
+        // This prevents a race where the undock fires while startInstance is still
+        // propagating Running to observers, causing them to see Undocked instead.
+        await waitForAll(
+            store => store.instanceDB[TEST_INSTANCE_ID as any]?.status === 'Running',
+            5_000,
+            'Running confirmed before undock',
+        )
         await remoteUndock(primaryHost, TEST_DEVICE)
 
         // Assert Undocked on primary first

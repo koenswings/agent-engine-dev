@@ -179,13 +179,16 @@ const startInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instan
     if (!storeHandle) { console.error(chalk.red("Store is not available.")); return; }
     const store = storeHandle.doc()
     const instance = findInstanceByName(store, instanceName)
-    const disk = findDiskByName(store, diskName)
     if (!instance) {
         console.log(chalk.red(`Instance ${instanceName} not found`))
         return
     }
+    // Look up disk by ID from instance.storedOn — same fix as stopInstanceWrapper.
+    // findDiskByName uses getDisks() which filters dockedTo != null and misses
+    // disks that appear undocked in the CRDT but are physically still attached.
+    const disk = (instance.storedOn ? getDisk(store, instance.storedOn) : undefined) ?? findDiskByName(store, diskName)
     if (!disk) {
-        console.log(chalk.red(`Disk ${diskName} not found`))
+        console.log(chalk.red(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`))
         return
     }
     startInstance(storeHandle, instance, disk)
