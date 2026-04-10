@@ -23,7 +23,7 @@ export interface DiskMeta {
   // The timestamp when the disk was last docked (for all other disks) or when the engine was last booted (in case of a system disk)
 }
 
-// Create a sample META.yaml file for an appdisk with id AA000000000000000724 and a create timestamp corresponding to 2024-12-12 and a lastDocked timestamp corresponding to 2025-01-07
+// Sample META for reference only — not used at runtime.
 const sampleMeta: DiskMeta = {
   diskId: 'AA000000000000000724' as DiskID,
   isHardwareId: true,
@@ -32,33 +32,11 @@ const sampleMeta: DiskMeta = {
   lastDocked: 1733673600000 as Timestamp
 }
 
-const devMeta: DiskMeta = {
-  diskId: 'DevEngine' as DiskID,
-  isHardwareId: true,
-  diskName: 'DevelopmentEngine' as DiskName,
-  created: 1731446400000 as Timestamp,
-  lastDocked: 1733673600000 as Timestamp,
-  version: '1.0.0' as Version
-}
-
-// The corresponding YAML string
-// diskId: 'AA000000000000000724'
-// isHardwareId: true
-// diskName: 'Nextcloud' 
-// created:    1731446400000 
-// lastDocked: 1733673600000 
-
 export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMeta> => {
   let path
   let device: DeviceName
-  // In dev/test mode with no specific device: return devMeta so the engine can start
-  // without its own system disk present (prevents process.exit on dev machines / CI).
-  // When a deviceSpec IS provided (an app disk), fall through and read the actual
-  // META.yaml — but skip hardware ID lookup (see below).
-  if ((config.settings.isDev || config.settings.testMode) && !deviceSpec) {
-    log(`Running in ${config.settings.isDev ? 'development' : 'test'} mode, returning devMeta`)
-    return devMeta
-  }
+  // Every Engine runs on a Pi with a real /META.yaml. We always read it.
+  // testMode only affects hardware ID lookup (skipped) and writeMeta (skipped) — not identity.
   try {
     if (deviceSpec) {
       path = `/disks/${deviceSpec}/META.yaml`
