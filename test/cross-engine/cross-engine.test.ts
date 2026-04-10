@@ -121,8 +121,8 @@ const waitForAll = async (
 // ── Setup & teardown ──────────────────────────────────────────────────────────
 
 beforeAll(async () => {
-    // Discover live engines
-    fleetHosts = await discoverEngineHosts()
+    // Discover live engines via mDNS (same mechanism the Engine itself uses)
+    fleetHosts = await discoverEngineHosts(10)
 
     if (fleetHosts.length < 2) {
         throw new Error(

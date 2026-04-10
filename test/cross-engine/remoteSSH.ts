@@ -11,6 +11,7 @@
 
 import { $ } from 'zx'
 import path from 'path'
+import mDnsSd from 'node-dns-sd'
 
 // Paths on the remote engine (must match usbDeviceMonitor expectations)
 const REMOTE_DISKS_ROOT = '/disks'
@@ -21,9 +22,6 @@ const FIXTURES_DIR = path.resolve(process.cwd(), 'test/fixtures')
 
 // Fixed test device — same as single-engine tests
 export const TEST_DEVICE = 'sdz1'
-
-// HTTP port used to probe live engines during discovery
-const HTTP_PORT = 80
 
 // SSH options shared across all commands
 const SSH_OPTS = [
@@ -36,66 +34,46 @@ const SSH_OPTS = [
 // ── Fleet discovery ──────────────────────────────────────────────────────────
 
 /**
- * Return default candidate hostnames to scan: idea01.local … idea10.local.
+ * Discover live Engine hosts via mDNS — exactly as the Engine itself does.
+ *
+ * Uses node-dns-sd to query _engine._tcp.local and returns the hostname
+ * (or IP address as fallback) of each responding engine. This is the same
+ * mechanism the Engine's mDNS monitor uses; the test runner participates in
+ * discovery the same way any peer would.
+ *
+ * Override with FLEET_HOSTS env var (comma-separated IPs or hostnames) to bypass
+ * mDNS — useful when mDNS is unreliable on a subnet:
+ *   FLEET_HOSTS=192.168.0.138,192.168.0.180 pnpm test:cross-engine
+ *
+ * @param waitSecs  mDNS query duration in seconds (default: 10 — one full mDNS cycle)
  */
-const defaultCandidates = (): string[] =>
-    Array.from({ length: 10 }, (_, i) => `idea${String(i + 1).padStart(2, '0')}.local`)
-
-/**
- * Probe a single host by hitting its /api/store-url HTTP endpoint.
- * Returns true if the engine responds with HTTP 200.
- */
-const checkEngineReachable = async (host: string, timeoutMs: number): Promise<boolean> => {
-    try {
-        const controller = new AbortController()
-        const timer = setTimeout(() => controller.abort(), timeoutMs)
-        try {
-            const resp = await fetch(`http://${host}:${HTTP_PORT}/api/store-url`, {
-                signal: controller.signal,
-            })
-            return resp.ok
-        } finally {
-            clearTimeout(timer)
-        }
-    } catch {
-        return false
-    }
-}
-
-/**
- * Discover live Engine hosts on the LAN.
- *
- * Scans candidate hostnames in parallel using the HTTP /api/store-url endpoint as
- * a health check and returns those that respond. This allows tests to run against
- * whatever fleet is online — no hardcoded host list needed.
- *
- * Override with FLEET_HOSTS env var (comma-separated) to target specific machines:
- *   FLEET_HOSTS=idea01.local,idea02.local pnpm test:cross-engine
- *
- * Default scan range: idea01.local … idea10.local
- *
- * @param candidates  Hostnames to probe (default: idea01.local … idea10.local)
- * @param timeoutMs   Per-host timeout in ms (default: 3000)
- */
-export const discoverEngineHosts = async (
-    candidates: string[] = defaultCandidates(),
-    timeoutMs = 3000,
-): Promise<string[]> => {
+export const discoverEngineHosts = async (waitSecs = 10): Promise<string[]> => {
     if (process.env.FLEET_HOSTS) {
         const manual = process.env.FLEET_HOSTS.split(',').map(h => h.trim()).filter(Boolean)
         console.log(`[remoteSSH] FLEET_HOSTS override: ${manual.join(', ')}`)
         return manual
     }
-    console.log(`[remoteSSH] Scanning ${candidates.length} candidate hosts (timeout ${timeoutMs} ms each)...`)
-    const results = await Promise.allSettled(
-        candidates.map(host => checkEngineReachable(host, timeoutMs))
-    )
-    const live = results
-        .map((r, i) => ({ r, host: candidates[i] }))
-        .filter(({ r }) => r.status === 'fulfilled' && (r as PromiseFulfilledResult<boolean>).value)
-        .map(({ host }) => host)
-    console.log(`[remoteSSH] Discovered ${live.length} live engine(s): ${live.join(', ')}`)
-    return live
+
+    console.log(`[remoteSSH] Discovering engines via mDNS (_engine._tcp.local, ${waitSecs}s)...`)
+    let deviceList: any[] = []
+    try {
+        deviceList = await mDnsSd.discover({ name: '_engine._tcp.local', wait: waitSecs })
+    } catch (err) {
+        console.warn(`[remoteSSH] mDNS discovery error:`, err)
+    }
+
+    const hosts = deviceList
+        .map(device => {
+            const txt = device.packet?.additionals?.find((a: any) => a.type === 'TXT')
+            const hostname: string | undefined = txt?.rdata?.name
+            const address: string | undefined = device.address
+            // Prefer <hostname>.local if available (matches SSH config), fall back to IP
+            return hostname ? `${hostname}.local` : address
+        })
+        .filter((h): h is string => !!h)
+
+    console.log(`[remoteSSH] Discovered ${hosts.length} engine(s) via mDNS: ${hosts.join(', ')}`)
+    return hosts
 }
 
 /**
