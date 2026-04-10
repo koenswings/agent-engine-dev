@@ -57,6 +57,7 @@ import {
     remoteCleanupDisk,
     isEngineRunning,
     ensureImagePulled,
+    isLocal,
     TEST_DEVICE,
 } from './remoteSSH.js'
 
@@ -79,6 +80,12 @@ let fleetStores: DocHandle<Store>[]       // one store handle per fleet host
 let fleetEngineIds: (string | null)[]     // engine ID per fleet host
 let primaryHost: string                   // fleetHosts[0] — dock / command target
 let primaryEngineId: string | null        // engine ID for primaryHost
+
+// localhost store handle — kept open throughout tests for near-zero-latency
+// reads from the local Engine. Used in Test 3 to observe the primary’s status
+// without WS round-trip delay (the primary IS this machine).
+let localRepo: Repo
+let localStoreHandle: DocHandle<Store>
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -129,22 +136,22 @@ beforeAll(async () => {
     console.log(`[test] Connecting to local engine at ${localHost}, store ID: ${storeDocId}`)
 
     const localConn = await connectToEngine(localHost, 'local', storeDocId)
+    // Keep the localhost connection open throughout the tests — it gives near-zero
+    // latency reads from the local Engine (no WS round-trip when this machine is primary).
+    localRepo = localConn.repo
+    localStoreHandle = localConn.storeHandle
 
     // ── Step 2: Read fleet from engineDB ─────────────────────────────────────
-    // Wait up to 30 s for engineDB to contain at least 2 engines.
-    // mDNS runs every 10 s; engines booted long ago are still valid peers.
     if (process.env.FLEET_HOSTS) {
         fleetHosts = process.env.FLEET_HOSTS.split(',').map(h => h.trim()).filter(Boolean)
         console.log(`[test] FLEET_HOSTS override: ${fleetHosts.join(', ')}`)
-        await disconnectFromEngine(localConn.repo).catch(() => {})
     } else {
         const enoughEngines = await waitFor(
-            localConn.storeHandle,
+            localStoreHandle,
             store => Object.keys(store.engineDB).length >= 2,
             30_000,
         )
-        const localStore = localConn.storeHandle.doc()!
-        // Deduplicate: mDNS may return the same host across cycles.
+        const localStore = localStoreHandle.doc()!
         const seen = new Set<string>()
         fleetHosts = Object.values(localStore.engineDB)
             .filter(e => {
@@ -152,7 +159,6 @@ beforeAll(async () => {
                 return !!h && !seen.has(h) && seen.add(h)
             })
             .map(e => `${e.hostname as string}.local`)
-        await disconnectFromEngine(localConn.repo).catch(() => {})
 
         if (!enoughEngines || fleetHosts.length < 2) {
             throw new Error(
@@ -208,7 +214,10 @@ afterAll(async () => {
     await remoteUndock(primaryHost, TEST_DEVICE).catch(() => {})
 
     // Disconnect all clients
-    await Promise.all(fleetRepos.map(repo => disconnectFromEngine(repo).catch(() => {})))
+    await Promise.all([
+        ...fleetRepos.map(repo => disconnectFromEngine(repo).catch(() => {})),
+        disconnectFromEngine(localRepo).catch(() => {}),
+    ])
 }, 30_000)
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -267,11 +276,14 @@ describe('Cross-engine integration', () => {
 
         sendCommand(fleetStores[0], primaryEngineId!, `stopInstance ${TEST_INSTANCE_NAME} ${TEST_DISK_NAME}`)
 
-        // Wait for primary to reach Stopped first — this ensures the CRDT write has
-        // happened locally and gives it time to propagate before we check observers.
-        // Without this, Test 4's startInstance may queue before observers see Stopped.
+        // Wait for primary to reach Stopped.
+        // Use localStoreHandle (localhost connection) rather than fleetStores[0]
+        // (external WS to wizardly-hugle.local). Since this machine IS the primary,
+        // the localhost handle reflects status changes with near-zero latency —
+        // no WS round-trip that could cause the brief Stopped window to be missed.
+        const storeToCheck = isLocal(primaryHost) ? localStoreHandle : fleetStores[0]
         const stoppedLocally = await waitFor(
-            fleetStores[0],
+            storeToCheck,
             store => {
                 const status = store.instanceDB[TEST_INSTANCE_ID as any]?.status
                 return status === 'Stopped' || status === 'Undocked'
@@ -297,9 +309,10 @@ describe('Cross-engine integration', () => {
 
         sendCommand(fleetStores[0], primaryEngineId!, `startInstance ${TEST_INSTANCE_NAME} ${TEST_DISK_NAME}`)
 
-        // Assert Running on primary
+        // Assert Running on primary using localStoreHandle for near-zero latency.
+        const storeToCheck4 = isLocal(primaryHost) ? localStoreHandle : fleetStores[0]
         const runningLocally = await waitForInstanceStatus(
-            fleetStores[0], TEST_INSTANCE_ID, 'Running', 30_000,
+            storeToCheck4, TEST_INSTANCE_ID, 'Running', 30_000,
         )
         expect(runningLocally, `instance should return to Running on ${primaryHost} within 30 s`).to.be.true
 
