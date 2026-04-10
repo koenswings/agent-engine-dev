@@ -23,8 +23,8 @@
  *   Override with FLEET_HOSTS=host1,host2 to bypass store lookup.
  *
  * Prerequisites:
- *   - Local Engine running on this machine (localhost:ENGINE_PORT)
- *   - 2+ peer engines reachable on the LAN (discovered by local Engine via mDNS)
+ *   - Engine running on this machine (localhost), provisioned as a fleet member
+ *   - 2+ peer engines on the LAN (discovered via mDNS by the local Engine)
  *   - SSH key auth from this machine to all fleet engines
  *   - traefik/whoami image available on primary engine (pulled in beforeAll if absent)
  *
@@ -41,6 +41,7 @@
 
 import { describe, it, beforeAll, afterAll, expect } from 'vitest'
 import { DocHandle, Repo } from '@automerge/automerge-repo'
+
 import { Store } from '../../src/data/Store.js'
 import {
     connectToEngine,
@@ -122,11 +123,7 @@ beforeAll(async () => {
     // the local Engine has already done mDNS discovery and populated engineDB.
     //
     // Prerequisite: this machine must be running a fleet Engine (pm2 engine, port 4321).
-    // Once the DevEngine identity is removed (every Pi reads its real hardware ID),
-    // this machine will have a unique engine ID and can be provisioned as a fleet member.
-    //
-    // LOCAL_ENGINE env var overrides the local host (e.g. LOCAL_ENGINE=idea01.local
-    // during the transition period before this machine is a fleet member).
+    // Override with LOCAL_ENGINE env var if needed (e.g. LOCAL_ENGINE=idea01.local).
     const localHost = process.env.LOCAL_ENGINE ?? 'localhost'
     const storeDocId = await getCachedStoreDocId(localHost)
     console.log(`[test] Connecting to local engine at ${localHost}, store ID: ${storeDocId}`)
@@ -147,8 +144,13 @@ beforeAll(async () => {
             30_000,
         )
         const localStore = localConn.storeHandle.doc()!
+        // Deduplicate: mDNS may return the same host across cycles.
+        const seen = new Set<string>()
         fleetHosts = Object.values(localStore.engineDB)
-            .filter(e => !!(e.hostname as string))
+            .filter(e => {
+                const h = (e.hostname as string)?.toLowerCase()
+                return !!h && !seen.has(h) && seen.add(h)
+            })
             .map(e => `${e.hostname as string}.local`)
         await disconnectFromEngine(localConn.repo).catch(() => {})
 
@@ -183,6 +185,21 @@ beforeAll(async () => {
     }
     primaryEngineId = fleetEngineIds[0]
     console.log(`[test] Connected to ${fleetHosts.length} fleet engines`)
+
+    // ── Step 6: Wait for any stale commands to drain ─────────────────────
+    // Commands from previous runs may still be queued. The engines will process
+    // them as soon as our connection triggers the storeMonitor. We wait for
+    // all command queues to empty before proceeding, so the store is in a
+    // stable, known state before the tests run.
+    const commandsDrained = await waitFor(
+        fleetStores[0],
+        store => Object.values(store.engineDB)
+            .every(e => !(e.commands as any[])?.length),
+        15_000,
+    )
+    if (!commandsDrained) {
+        console.warn('[test] Warning: some command queues did not drain within 15 s — proceeding anyway')
+    }
 }, 120_000)
 
 afterAll(async () => {
@@ -248,24 +265,31 @@ describe('Cross-engine integration', () => {
     it('Test 3 — Remote command: stopInstance on primary, observe on all others', { timeout: 30_000 }, async () => {
         expect(primaryEngineId, 'primary engine ID must be known (run Test 1 first)').to.exist
 
-        // Send stopInstance to primary via the shared CRDT.
-        // Any connected store handle will do — the change syncs to all peers.
         sendCommand(fleetStores[0], primaryEngineId!, `stopInstance ${TEST_INSTANCE_NAME} ${TEST_DISK_NAME}`)
 
-        // Assert stopped (or undocked — see known issue in file header) on ALL observers
+        // Wait for primary to reach Stopped first — this ensures the CRDT write has
+        // happened locally and gives it time to propagate before we check observers.
+        // Without this, Test 4's startInstance may queue before observers see Stopped.
+        const stoppedLocally = await waitFor(
+            fleetStores[0],
+            store => {
+                const status = store.instanceDB[TEST_INSTANCE_ID as any]?.status
+                return status === 'Stopped' || status === 'Undocked'
+            },
+            15_000,
+        )
+        expect(stoppedLocally, `instance should reach Stopped or Undocked on ${primaryHost} within 15 s`).to.be.true
+
+        // Now assert it propagated to ALL observers
         const allStopped = await waitForAll(
             store => {
                 const status = store.instanceDB[TEST_INSTANCE_ID as any]?.status
                 return status === 'Stopped' || status === 'Undocked'
             },
-            30_000,
+            15_000,
             'Stopped or Undocked after stopInstance',
         )
-        expect(allStopped, 'instance should reach Stopped or Undocked on all observer stores within 30 s').to.be.true
-
-        // Also check primary itself
-        const primaryStatus = fleetStores[0].doc()!.instanceDB[TEST_INSTANCE_ID as any]?.status
-        expect(primaryStatus, 'instance should not still be Running on primary after stopInstance').to.not.equal('Running')
+        expect(allStopped, 'instance should reach Stopped or Undocked on all observer stores within 15 s').to.be.true
     })
 
     it('Test 4 — Remote command: startInstance on primary, observe Running on all others', { timeout: 30_000 }, async () => {

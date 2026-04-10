@@ -1,5 +1,5 @@
 import { CommandDefinition } from "./CommandDefinition.js";
-import { Store, getApps, getDisks, getRunningEngines, getInstances, getEngine, findDiskByName, findInstanceByName, getLocalEngine, createClientStore } from "./Store.js";
+import { Store, getApps, getDisks, getDisk, getRunningEngines, getInstances, getEngine, findDiskByName, findInstanceByName, getLocalEngine, createClientStore } from "./Store.js";
 import { deepPrint } from "../utils/utils.js";
 import { buildInstance, startInstance, runInstance, stopInstance } from "./Instance.js";
 import { buildEngine, syncEngine, clearKnownHost, rebootEngine } from "./Engine.js";
@@ -211,13 +211,15 @@ const stopInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanc
     if (!storeHandle) { console.error(chalk.red("Store is not available.")); return; }
     const store = storeHandle.doc()
     const instance = findInstanceByName(store, instanceName)
-    const disk = findDiskByName(store, diskName)
     if (!instance) {
         console.log(chalk.red(`Instance ${instanceName} not found`))
         return
     }
+    // Look up disk by ID from instance.storedOn — not via getDisks() which filters
+    // to dockedTo != null and would miss disks that appear undocked in the CRDT.
+    const disk = (instance.storedOn ? getDisk(store, instance.storedOn) : undefined) ?? findDiskByName(store, diskName)
     if (!disk) {
-        console.log(chalk.red(`Disk ${diskName} not found`))
+        console.log(chalk.red(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`))
         return
     }
     stopInstance(storeHandle, instance, disk)
