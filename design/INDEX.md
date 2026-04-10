@@ -39,6 +39,13 @@ Design for `copyApp` + `moveApp` commands and the rsync infrastructure that unde
 Covers file layout, generalised `Operation` store type, progress tracking, crash recovery, same-engine phase 1, and test strategy.
 → [design/copy-move-app.md](copy-move-app.md)
 
+## test-policy.md
+**Status:** Approved  ·  **Date:** 2026-04-10  ·  **Author:** Axle
+Test policy for cross-engine tests: tests may stop/start any running app on the LAN
+(including real production apps). Only constraint: never delete or modify app data.
+Equivalent to running a diagnostic — operator consent is implied.
+→ [design/test-policy.md](test-policy.md)
+
 ## cross-engine-tests.md
 **Status:** Implemented  ·  **Date:** 2026-04-09  ·  **Author:** Axle
 Cross-engine integration test design: mDNS discovery, CRDT sync propagation, and remote

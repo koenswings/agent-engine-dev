@@ -49,7 +49,6 @@ import {
     waitFor,
     waitForInstanceStatus,
     sendCommand,
-    clearAllCommands,
     getCachedStoreDocId,
 } from './remoteClient.js'
 import {
@@ -187,12 +186,20 @@ beforeAll(async () => {
     primaryEngineId = fleetEngineIds[0]
     console.log(`[test] Connected to ${fleetHosts.length} fleet engines`)
 
-    // ── Step 6: Clear stale commands from previous runs ───────────────────────
-    // Commands accumulate across test runs and cause unexpected state transitions.
-    // Clear them before running tests.
-    clearAllCommands(fleetStores[0])
-    // Allow a moment for the clear to sync across all peers
-    await new Promise(r => setTimeout(r, 500))
+    // ── Step 6: Wait for any stale commands to drain ─────────────────────
+    // Commands from previous runs may still be queued. The engines will process
+    // them as soon as our connection triggers the storeMonitor. We wait for
+    // all command queues to empty before proceeding, so the store is in a
+    // stable, known state before the tests run.
+    const commandsDrained = await waitFor(
+        fleetStores[0],
+        store => Object.values(store.engineDB)
+            .every(e => !(e.commands as any[])?.length),
+        15_000,
+    )
+    if (!commandsDrained) {
+        console.warn('[test] Warning: some command queues did not drain within 15 s — proceeding anyway')
+    }
 }, 120_000)
 
 afterAll(async () => {
@@ -258,24 +265,31 @@ describe('Cross-engine integration', () => {
     it('Test 3 — Remote command: stopInstance on primary, observe on all others', { timeout: 30_000 }, async () => {
         expect(primaryEngineId, 'primary engine ID must be known (run Test 1 first)').to.exist
 
-        // Send stopInstance to primary via the shared CRDT.
-        // Any connected store handle will do — the change syncs to all peers.
         sendCommand(fleetStores[0], primaryEngineId!, `stopInstance ${TEST_INSTANCE_NAME} ${TEST_DISK_NAME}`)
 
-        // Assert stopped (or undocked — see known issue in file header) on ALL observers
+        // Wait for primary to reach Stopped first — this ensures the CRDT write has
+        // happened locally and gives it time to propagate before we check observers.
+        // Without this, Test 4's startInstance may queue before observers see Stopped.
+        const stoppedLocally = await waitFor(
+            fleetStores[0],
+            store => {
+                const status = store.instanceDB[TEST_INSTANCE_ID as any]?.status
+                return status === 'Stopped' || status === 'Undocked'
+            },
+            15_000,
+        )
+        expect(stoppedLocally, `instance should reach Stopped or Undocked on ${primaryHost} within 15 s`).to.be.true
+
+        // Now assert it propagated to ALL observers
         const allStopped = await waitForAll(
             store => {
                 const status = store.instanceDB[TEST_INSTANCE_ID as any]?.status
                 return status === 'Stopped' || status === 'Undocked'
             },
-            30_000,
+            15_000,
             'Stopped or Undocked after stopInstance',
         )
-        expect(allStopped, 'instance should reach Stopped or Undocked on all observer stores within 30 s').to.be.true
-
-        // Also check primary itself
-        const primaryStatus = fleetStores[0].doc()!.instanceDB[TEST_INSTANCE_ID as any]?.status
-        expect(primaryStatus, 'instance should not still be Running on primary after stopInstance').to.not.equal('Running')
+        expect(allStopped, 'instance should reach Stopped or Undocked on all observer stores within 15 s').to.be.true
     })
 
     it('Test 4 — Remote command: startInstance on primary, observe Running on all others', { timeout: 30_000 }, async () => {
