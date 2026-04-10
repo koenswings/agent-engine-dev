@@ -41,7 +41,7 @@
 
 import { describe, it, beforeAll, afterAll, expect } from 'vitest'
 import { DocHandle, Repo } from '@automerge/automerge-repo'
-import os from 'os'
+
 import { Store } from '../../src/data/Store.js'
 import {
     connectToEngine,
@@ -144,15 +144,12 @@ beforeAll(async () => {
             30_000,
         )
         const localStore = localConn.storeHandle.doc()!
-        const localHostname = os.hostname().toLowerCase()
-        // Exclude this machine from the fleet — it's the test runner / observer.
-        // Dock/undock targets must be remote Pis reachable via SSH.
-        // Also deduplicate: a peer may appear multiple times if mDNS cycles overlap.
+        // Deduplicate: mDNS may return the same host across cycles.
         const seen = new Set<string>()
         fleetHosts = Object.values(localStore.engineDB)
             .filter(e => {
                 const h = (e.hostname as string)?.toLowerCase()
-                return !!h && !h.includes(localHostname) && !seen.has(h) && seen.add(h)
+                return !!h && !seen.has(h) && seen.add(h)
             })
             .map(e => `${e.hostname as string}.local`)
         await disconnectFromEngine(localConn.repo).catch(() => {})
