@@ -23,10 +23,10 @@ const engineSetMonitor = (patch, storeHandle): boolean => {
     }
 }
 
-// Track which command string is currently being executed per engine.
-// We match on the command string itself rather than using a boolean lock,
-// so that a newly queued *different* command is always picked up.
-const _currentlyExecuting: Map<EngineID, string> = new Map()
+// Track which commands are currently in-flight, keyed by engineId + command string.
+// Commands for different instances can execute concurrently; commands for the same
+// engine still execute serially (queue[0] is always processed next).
+const _currentlyExecuting = new Set<string>()
 
 const engineCommandsMonitor = (patch, storeHandle): boolean => {
     const isCommandPath =
@@ -47,13 +47,15 @@ const engineCommandsMonitor = (patch, storeHandle): boolean => {
     const command = queue[0]
     if (!command || !command.includes(' ')) return true
 
-    // Skip if this exact command is already in flight.
-    if (_currentlyExecuting.get(engineId) === command) return true
+    // Use engineId+command as the dedup key so a new command with the same text
+    // (but on a different instance) can still run concurrently.
+    const key = `${engineId}:${command}`
+    if (_currentlyExecuting.has(key)) return true
 
-    _currentlyExecuting.set(engineId, command)
+    _currentlyExecuting.add(key)
     log(`Processing command for engine ${engineId}: ${command}`)
     handleCommand(commands, storeHandle, 'engine', command).then(() => {
-        _currentlyExecuting.delete(engineId)
+        _currentlyExecuting.delete(key)
         storeHandle.change(doc => {
             const eng = doc.engineDB[engineId as any]
             if (eng) (eng.commands as any[]).splice(0, 1)
@@ -121,9 +123,10 @@ export const enableStoreMonitor = (storeHandle: DocHandle<Store>): void => {
         log(`Replaying ${startupCmds.length} pending command(s) from queue on startup`)
         ;(async () => {
             for (const cmd of startupCmds) {
-                _currentlyExecuting.set(localEngineId, cmd)
+                const startupKey = `${localEngineId}:${cmd}`
+                _currentlyExecuting.add(startupKey)
                 await handleCommand(commands, storeHandle, 'engine', cmd)
-                _currentlyExecuting.delete(localEngineId)
+                _currentlyExecuting.delete(startupKey)
                 storeHandle.change(doc => {
                     const eng = doc.engineDB[localEngineId as any]
                     if (eng) (eng.commands as any[]).splice(0, 1)
