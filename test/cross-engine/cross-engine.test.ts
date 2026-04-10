@@ -23,8 +23,8 @@
  *   Override with FLEET_HOSTS=host1,host2 to bypass store lookup.
  *
  * Prerequisites:
- *   - Local Engine running on this machine (localhost:ENGINE_PORT)
- *   - 2+ peer engines reachable on the LAN (discovered by local Engine via mDNS)
+ *   - Engine running on this machine (localhost), provisioned as a fleet member
+ *   - 2+ peer engines on the LAN (discovered via mDNS by the local Engine)
  *   - SSH key auth from this machine to all fleet engines
  *   - traefik/whoami image available on primary engine (pulled in beforeAll if absent)
  *
@@ -41,6 +41,7 @@
 
 import { describe, it, beforeAll, afterAll, expect } from 'vitest'
 import { DocHandle, Repo } from '@automerge/automerge-repo'
+import os from 'os'
 import { Store } from '../../src/data/Store.js'
 import {
     connectToEngine,
@@ -122,11 +123,7 @@ beforeAll(async () => {
     // the local Engine has already done mDNS discovery and populated engineDB.
     //
     // Prerequisite: this machine must be running a fleet Engine (pm2 engine, port 4321).
-    // Once the DevEngine identity is removed (every Pi reads its real hardware ID),
-    // this machine will have a unique engine ID and can be provisioned as a fleet member.
-    //
-    // LOCAL_ENGINE env var overrides the local host (e.g. LOCAL_ENGINE=idea01.local
-    // during the transition period before this machine is a fleet member).
+    // Override with LOCAL_ENGINE env var if needed (e.g. LOCAL_ENGINE=idea01.local).
     const localHost = process.env.LOCAL_ENGINE ?? 'localhost'
     const storeDocId = await getCachedStoreDocId(localHost)
     console.log(`[test] Connecting to local engine at ${localHost}, store ID: ${storeDocId}`)
@@ -147,8 +144,16 @@ beforeAll(async () => {
             30_000,
         )
         const localStore = localConn.storeHandle.doc()!
+        const localHostname = os.hostname().toLowerCase()
+        // Exclude this machine from the fleet — it's the test runner / observer.
+        // Dock/undock targets must be remote Pis reachable via SSH.
+        // Also deduplicate: a peer may appear multiple times if mDNS cycles overlap.
+        const seen = new Set<string>()
         fleetHosts = Object.values(localStore.engineDB)
-            .filter(e => !!(e.hostname as string))
+            .filter(e => {
+                const h = (e.hostname as string)?.toLowerCase()
+                return !!h && !h.includes(localHostname) && !seen.has(h) && seen.add(h)
+            })
             .map(e => `${e.hostname as string}.local`)
         await disconnectFromEngine(localConn.repo).catch(() => {})
 
