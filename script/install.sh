@@ -33,7 +33,7 @@ echo "--> Configuring /dev/engine ownership ..."
 tee /etc/tmpfiles.d/idea-engine.conf > /dev/null << 'EOF'
 # /dev/engine is created by udev for the IDEA Engine disk detection mechanism.
 # The Engine runs as pi, so pi owns this directory on all Pis.
-z /dev/engine 0775 pi pi -
+d /dev/engine 0775 pi pi -
 EOF
 systemd-tmpfiles --create /etc/tmpfiles.d/idea-engine.conf
 

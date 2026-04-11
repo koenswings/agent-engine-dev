@@ -52,7 +52,10 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
     if (await fileExists(path)) {
 
       // Read the META.yaml file
-      const metaContent = (await $`cat ${path}`).stdout.trim()
+      // /META.yaml is root-owned (600) so we need sudo for the system disk.
+      // Disk META files under /disks/ are pi-owned and don't need it.
+      const catCmd = path === '/META.yaml' ? $`sudo cat ${path}` : $`cat ${path}`
+      const metaContent = (await catCmd).stdout.trim()
       const meta: DiskMeta = YAML.parse(metaContent)
       log(`metaContent: ${metaContent}`)
       log(`meta: ${deepPrint(meta)}`)
