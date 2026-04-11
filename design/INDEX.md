@@ -39,6 +39,13 @@ Design for `copyApp` + `moveApp` commands and the rsync infrastructure that unde
 Covers file layout, generalised `Operation` store type, progress tracking, crash recovery, same-engine phase 1, and test strategy.
 → [design/copy-move-app.md](copy-move-app.md)
 
+## duration-tests.md
+**Status:** Proposed  ·  **Date:** 2026-04-11  ·  **Author:** Axle
+Markov-model duration tests: simulate a school day of real-world activity (reboots, disk swaps,
+engine changes). YAML scenario files drive the Markov chain. Each transition triggers actions
+and verifies invariants including Automerge convergence across all engines.
+→ [design/duration-tests.md](duration-tests.md)
+
 ## test-policy.md
 **Status:** Approved  ·  **Date:** 2026-04-10  ·  **Author:** Axle
 Test policy for cross-engine tests: tests may stop/start any running app on the LAN
