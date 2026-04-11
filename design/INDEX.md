@@ -64,18 +64,3 @@ architecture, remote client harness, SSH fixture helpers, and test scope.
 **Status:** Superseded  ·  **Date:** 2025-07-11  ·  **Author:** Axle
 Proposal A (virtual/Docker battery) — not chosen. Retained as decision record.
 → [design/test-setup-virtual.md](test-setup-virtual.md)
-
-## install-app.md
-**Status:** Proposed  ·  **Date:** 2026-04-11  ·  **Author:** Axle
-Unified `installApp` command replacing `createInstance`. Covers naming convention cleanup
-(`*App` vs `*Instance`), source routing (local disk vs GitHub with internet probe), `appDB`
-extension for Backup/Catalog Disk visibility, deprecated `createInstance` alias, and
-four-phase implementation plan.
-→ [design/install-app.md](install-app.md)
-
-## duration-tests.md
-**Status:** Proposed  ·  **Date:** 2026-04-11  ·  **Author:** Axle
-Markov-model duration tests: simulate a school day of real-world activity (reboots, disk swaps,
-engine changes). YAML scenario files drive the Markov chain. Each transition triggers actions
-and verifies invariants including Automerge convergence across all engines.
-→ [design/duration-tests.md](duration-tests.md)
