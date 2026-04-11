@@ -66,8 +66,9 @@ const updateOperation = (
 
 /**
  * Returns available bytes on the filesystem containing `path`.
+ * Exported so tests can mock it.
  */
-const availableBytes = async (path: string): Promise<number> => {
+export const availableBytes = async (path: string): Promise<number> => {
     // df -k outputs 1K-blocks; Available is column 4
     const result = await $`df -k ${path} | awk 'NR==2{print $4}'`
     const kb = parseInt(result.stdout.trim(), 10)
@@ -76,8 +77,9 @@ const availableBytes = async (path: string): Promise<number> => {
 
 /**
  * Returns total size in bytes of `path` (recursive).
+ * Exported so tests can mock it.
  */
-const directoryBytes = async (path: string): Promise<number> => {
+export const directoryBytes = async (path: string): Promise<number> => {
     const result = await $`du -sk ${path} | awk '{print $1}'`
     const kb = parseInt(result.stdout.trim(), 10)
     return kb * 1024
@@ -327,11 +329,22 @@ export const moveApp = async (
         log(`moveApp: registering instance ${instance.id} on disk '${targetDiskName}'`)
         await processInstance(storeHandle, targetDisk, instance.id)
 
-        // 7. Remove source instance directory
+        // 7. Mark source disk's record of this instance as Missing in store.
+        //    Do this BEFORE checking remaining instances so getInstancesOfDisk
+        //    no longer counts this instance when deciding whether to delete the app master.
+        storeHandle.change(doc => {
+            const inst = doc.instanceDB[instance.id]
+            if (inst) {
+                inst.status = 'Missing'
+                inst.storedOn = null
+            }
+        })
+
+        // 8. Remove source instance directory
         log(`moveApp: removing source instance directory ${instanceSrc}`)
         await fs.remove(instanceSrc)
 
-        // 8. Remove source app master only if no other instance on the source disk uses it
+        // 9. Remove source app master only if no other instance on the source disk uses it
         const remainingInstances = getInstancesOfDisk(storeHandle.doc(), sourceDisk)
         const stillNeedsAppMaster = remainingInstances.some(i => i.instanceOf === appId)
         if (!stillNeedsAppMaster) {
@@ -340,15 +353,6 @@ export const moveApp = async (
         } else {
             log(`moveApp: keeping app master ${appMasterSrc} (other instances still use it)`)
         }
-
-        // 9. Mark source disk's record of this instance as Missing in store
-        storeHandle.change(doc => {
-            const inst = doc.instanceDB[instance.id]
-            if (inst) {
-                inst.status = 'Missing'
-                inst.storedOn = null
-            }
-        })
 
         updateOperation(storeHandle, opId, {
             status: 'Done',
