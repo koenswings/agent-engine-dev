@@ -30,6 +30,38 @@ The Markov model is loaded from a **YAML file** (the "scenario file"), making it
 
 ---
 
+## State diagram
+
+The diagram below shows the states and transitions for the default `school-day` scenario.
+Numbers on arrows are transition probabilities (weights normalised to 1.0).
+Self-loops model dwell time — the system often stays in the same state across ticks.
+
+```mermaid
+graph LR
+    idle((idle))
+    kd(("kolibri\ndocked"))
+    dm(("disk\nmoved"))
+    er(("engine\nreboot"))
+
+    idle -->|0.55| idle
+    idle -->|0.40| kd
+    idle -->|0.05| er
+
+    kd -->|0.65| kd
+    kd -->|0.20| idle
+    kd -->|0.10| dm
+    kd -->|0.05| er
+
+    dm -->|0.50| kd
+    dm -->|0.30| idle
+    dm -->|0.20| er
+
+    er -->|0.60| idle
+    er -->|0.40| kd
+```
+
+---
+
 ## Architecture
 
 ### 1. Scenario file (YAML)
