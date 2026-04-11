@@ -14,6 +14,7 @@ import { $, YAML, chalk, fs } from 'zx'
 import { log } from '../utils/utils.js'
 import { config } from '../data/Config.js'
 import { Disk, BackupConfig, isBackupDisk, processDisk } from '../data/Disk.js'
+import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { stopInstance, startInstance } from '../data/Instance.js'
 import { BackupMode, DiskID, DiskName, InstanceID, Timestamp } from '../data/CommonTypes.js'
 import { Store, getInstance, getDisks, findDiskByName } from '../data/Store.js'
@@ -209,6 +210,9 @@ export const processBackupDisk = async (
         const d = doc.diskDB[backupDisk.id]
         if (d) d.backupConfig = { mode, links }
     })
+
+    // Phase 2: index any app bundles on this disk into appDB for installApp / Console
+    await indexBackupDiskApps(storeHandle, backupDisk)
 
     // Scan for stale lock files (interrupted backups from before a reboot)
     const backupsBase = `/disks/${backupDevice}/backups`

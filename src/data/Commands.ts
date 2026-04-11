@@ -14,6 +14,7 @@ import { config } from "./Config.js";
 import { generateHostName } from "../utils/nameGenerator.js";
 import pack from '../../package.json' with { type: "json" };
 import { sendCommand } from "../utils/commandUtils.js";
+import { installApp } from './InstallApp.js';
 import { undockDisk } from "../monitors/usbDeviceMonitor.js";
 import { backupInstance, restoreApp, createBackupDiskConfig } from "../monitors/backupMonitor.js";
 import { testContext } from "../../test/testContext.js";
@@ -161,12 +162,40 @@ const lsInstances = (storeHandle: DocHandle<Store> | null): void => {
     console.log(deepPrint(instances, 2));
 }
 
-const buildInstanceWrapper = async (storeHandle: DocHandle<Store>, instanceName: InstanceName, appName: AppName, gitAccount: string, gitTag: string, diskName: DiskName) => {
-    const store = storeHandle.doc()
-    if (!store) {
-        console.error(chalk.red("Store is not available to create instance."));
-        return;
+/**
+ * installApp command wrapper.
+ * Usage: installApp <appId> <targetDiskName> [--source <sourceDiskName>] [--name <instanceName>]
+ *
+ * All arguments are passed as a single string and parsed here.
+ */
+const installAppWrapper = async (storeHandle: DocHandle<Store> | null, argsString: string) => {
+    if (!storeHandle) { console.error(chalk.red("Store is not available.")); return; }
+
+    // Parse: installApp kolibri-1.0 my-disk --source catalog-disk --name my-kolibri
+    const parts = argsString.trim().split(/\s+/)
+    const appId = parts[0] as any
+    const targetDiskName = parts[1] as any
+    if (!appId || !targetDiskName) {
+        console.error(chalk.red('Usage: installApp <appId> <targetDiskName> [--source <sourceDiskName>] [--name <instanceName>]'))
+        return
     }
+    const sourceIdx = parts.indexOf('--source')
+    const nameIdx = parts.indexOf('--name')
+    const sourceDiskName = sourceIdx !== -1 ? parts[sourceIdx + 1] as any : undefined
+    const instanceName = nameIdx !== -1 ? parts[nameIdx + 1] as any : undefined
+
+    await installApp(storeHandle, { appId, targetDiskName, sourceDiskName, instanceName })
+}
+
+/**
+ * @deprecated Use installApp instead.
+ * createInstance is kept as an alias for backward compatibility.
+ * It calls installApp with explicit GitHub routing (no internet probe).
+ */
+const createInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, appName: AppName, gitAccount: string, gitTag: string, diskName: DiskName) => {
+    console.warn(chalk.yellow('createInstance is deprecated — use installApp instead'))
+    const store = storeHandle?.doc()
+    if (!store) { console.error(chalk.red("Store is not available to create instance.")); return; }
     const disk = findDiskByName(store, diskName)
     if (!disk || !disk.device) {
         console.log(chalk.red(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`))
@@ -340,7 +369,8 @@ export const commands: CommandDefinition[] = [
         args: [{ type: "string" }],
         scope: 'any'
     },
-    { name: "createInstance", execute: buildInstanceWrapper, args: [{ type: "string" }, { type: "string" }, { type: "string" }, { type: "string" }, { type: "string" }], scope: 'engine' },
+    { name: "installApp", execute: installAppWrapper, args: [{ type: "string" }], scope: 'engine' },
+    { name: "createInstance", execute: createInstanceWrapper, args: [{ type: "string" }, { type: "string" }, { type: "string" }, { type: "string" }, { type: "string" }], scope: 'engine' },
     { name: "startInstance", execute: startInstanceWrapper, args: [{ type: "string" }, { type: "string" }], scope: 'engine' },
     { name: "runInstance", execute: runInstanceWrapper, args: [{ type: "string" }, { type: "string" }], scope: 'engine' },
     { name: "stopInstance", execute: stopInstanceWrapper, args: [{ type: "string" }, { type: "string" }], scope: 'engine' },

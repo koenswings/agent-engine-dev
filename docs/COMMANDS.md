@@ -44,8 +44,20 @@ These commands perform actions on the system. Some are restricted to an `engine`
 - **Usage:** `send <engineId> <command> [args...]`
 - **Scope:** `any`
 
-### `createInstance`
-- **Description:** Builds a new application instance on an engine from a git repository. This involves cloning the code, setting up the instance directory, and preparing service images.
+### `installApp`
+- **Description:** Installs an application onto a target disk. Routes to the appropriate source automatically:
+  - `--source` given: copies the app bundle from a docked disk (works offline).
+  - No `--source`, internet available: clones from GitHub (same as the old `createInstance`).
+  - No `--source`, no internet: searches `appDB` for a locally known source disk; fails with a clear message if none found.
+- **Usage:** `installApp <appId> <targetDiskName> [--source <sourceDiskName>] [--name <instanceName>]`
+- **Scope:** `engine`
+- **Examples:**
+  - `installApp kolibri-1.0 my-disk` — auto-route (online → GitHub, offline → appDB lookup)
+  - `installApp kolibri-1.0 my-disk --source catalog-disk` — copy from a docked catalog disk
+  - `installApp kolibri-1.0 my-disk --source catalog-disk --name school-kolibri` — custom instance name
+
+### `createInstance` *(deprecated)*
+- **Description:** Deprecated alias for `installApp`. Use `installApp` instead. Builds a new application instance from a git repository.
 - **Usage:** `createInstance <instanceName> <appName> <gitAccount> <gitTag> <diskName>`
 - **Scope:** `engine`
 
