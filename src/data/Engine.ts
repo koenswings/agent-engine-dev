@@ -417,6 +417,18 @@ export const installUdev = async (exec: any, enginePath: string) => {
     await exec`sudo apt install udev -y`;
     await copyAsset(exec, enginePath, '90-docking.rules', '/etc/udev/rules.d')
     await createDir(exec, '/disks', "0755", "0:0")
+
+    // Configure /dev/engine ownership so the pi user can write sentinel files.
+    // udev creates /dev/engine as root:root; we use systemd-tmpfiles with 'd'
+    // (create if absent AND always apply mode/ownership) to ensure pi:pi 0775
+    // survives every reboot — not just the first provisioning run.
+    console.log(chalk.blue('  - Configuring /dev/engine ownership via tmpfiles.d...'))
+    await exec`sudo tee /etc/tmpfiles.d/idea-engine.conf > /dev/null << 'EOF'
+# /dev/engine is created by udev for the IDEA Engine disk sentinel mechanism.
+# 'd' creates the directory if absent and always applies mode/ownership.
+d /dev/engine 0775 pi pi -
+EOF`
+    await exec`sudo systemd-tmpfiles --create /etc/tmpfiles.d/idea-engine.conf`
   } catch (e) {
     console.log(chalk.red('Error installing udev and udev rules'));
     console.error(e);
