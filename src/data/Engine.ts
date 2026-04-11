@@ -164,6 +164,7 @@ export const buildEngine = async (args: any) => {
   await buildAppsInfrastructure(exec);
 
   if (raspap) await installRaspAP(exec, enginePath);
+  await installTailscale(exec, enginePath)
   if (zerotier) await installZerotier(exec, enginePath);
 
   await addMeta(exec, hostname, version);
@@ -473,6 +474,73 @@ export const installRaspAP = async (exec: any, enginePath: string) => {
     process.exit(1);
   }
   console.log(chalk.green('RaspAP installed'));
+}
+
+/**
+ * Install Tailscale on a newly provisioned Pi.
+ *
+ * Design: design/tailscale-remote-management.md
+ *
+ * Tailscale is installed in "latent" mode:
+ *   - Binaries present, systemd service DISABLED and NOT started
+ *   - Auth key stored at /etc/tailscale/debug-authkey (600, root)
+ *   - Activation script installed at /usr/local/bin/tailscale-debug-activate.sh
+ *
+ * The Pi remains fully offline during normal operation.
+ * A coordinator activates debug mode by running the activation script over SSH.
+ *
+ * Auth key source (in priority order):
+ *   1. TAILSCALE_AUTHKEY env var (set on the management Pi running buildEngine)
+ *   2. /home/pi/openclaw/secrets/tailscale_authkey.txt (Atlas's secrets dir on this Pi)
+ */
+export const installTailscale = async (exec: any, enginePath: string) => {
+  console.log(chalk.blue('Installing Tailscale (latent debug mode)...'))
+
+  // Resolve auth key
+  const authKey = process.env.TAILSCALE_AUTHKEY
+    ?? (fs.existsSync('/home/pi/openclaw/secrets/tailscale_authkey.txt')
+        ? fs.readFileSync('/home/pi/openclaw/secrets/tailscale_authkey.txt', 'utf-8').trim()
+        : null)
+
+  if (!authKey) {
+    console.error(chalk.red('installTailscale: no auth key found. Set TAILSCALE_AUTHKEY env var or ensure /home/pi/openclaw/secrets/tailscale_authkey.txt exists.'))
+    process.exit(1)
+  }
+
+  try {
+    // 1. Download and install Tailscale static binaries (arm64)
+    // curl-installs the official static tarball so no package manager changes are needed.
+    // The service is NOT enabled after installation.
+    // Shell command uses $TSVER which must not be interpolated by TypeScript.
+    // We pass it as a regular string argument to avoid template literal interpolation.
+    await exec(['bash', '-c',
+      'TSVER=$(curl -sL https://pkgs.tailscale.com/stable/ | grep -oP \'tailscale_\\K[\\d.]+(?=_arm64.tgz)\' | head -1)' +
+      ' && curl -sL "https://pkgs.tailscale.com/stable/tailscale_${TSVER}_arm64.tgz"' +
+      ' | sudo tar -xz --strip-components=1 -C /usr/sbin' +
+      ' "tailscale_${TSVER}_arm64/tailscale" "tailscale_${TSVER}_arm64/tailscaled"'
+    ])
+
+    // 2. Install systemd service (disabled — does not start on boot)
+    await exec`sudo cp ${enginePath}/script/build_image_assets/tailscaled.service /etc/systemd/system/tailscaled.service`
+    await exec`sudo systemctl daemon-reload`
+    // explicitly do NOT enable: tailscale must be activated manually
+
+    // 3. Store auth key (root-only, 600)
+    await exec`sudo mkdir -p /etc/tailscale`
+    await exec`echo ${authKey} | sudo tee /etc/tailscale/debug-authkey > /dev/null`
+    await exec`sudo chmod 600 /etc/tailscale/debug-authkey`
+    await exec`sudo chown root:root /etc/tailscale/debug-authkey`
+
+    // 4. Install activation script
+    await exec`sudo cp ${enginePath}/script/build_image_assets/tailscale-debug-activate.sh /usr/local/bin/tailscale-debug-activate.sh`
+    await exec`sudo chmod 755 /usr/local/bin/tailscale-debug-activate.sh`
+
+    console.log(chalk.green('Tailscale installed (service disabled — latent debug mode ready)'))
+  } catch (e) {
+    console.log(chalk.red('Error installing Tailscale'))
+    console.error(e)
+    process.exit(1)
+  }
 }
 
 export const installZerotier = async (exec: any, enginePath: string) => {

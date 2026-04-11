@@ -54,32 +54,43 @@ vi.mock('../../src/data/Instance.js', async (importOriginal) => {
 // Mock the fs calls inside CopyMoveApp so no real disk access occurs.
 // We do this by patching at the zx level but only for the functions CopyMoveApp uses:
 // pathExists, readdir, ensureDir, remove. readFileSync must remain real for Config.
-vi.mock('../../src/data/CopyMoveApp.js', async (importOriginal) => {
-    // Patch fs used inside CopyMoveApp via a module-level intercept
-    const mod = await importOriginal<any>()
-    return mod  // real module — we'll mock at the $ / fs level below
+// Mock zx — $ and fs — used by CopyMoveApp at runtime.
+// vi.mock is hoisted so this runs before any imports (including Config.ts).
+// We preserve sync fs methods that Config.ts needs at startup.
+vi.mock('zx', async (importOriginal) => {
+    const actual = await importOriginal<any>()
+    // Replace $ with a mock that returns safe defaults for df/du
+    // and falls through to actual for other commands Config needs at startup.
+    const mockedDollar = vi.fn(async (strings: any, ...vals: any[]) => {
+        const cmd = Array.isArray(strings) ? strings.join('') : String(strings ?? '')
+        if (cmd.includes('df')) return { stdout: '1048576\n' }  // 1 GB in KB
+        if (cmd.includes('du')) return { stdout: '102400\n' }   // 100 MB in KB
+        // Fall through to real $ for anything else (META.yaml reads, docker, etc.)
+        return actual.$(strings, ...vals)
+    }) as any
+    // copy tag/raw so zx internals still work
+    mockedDollar.sync = actual.$.sync
+    return {
+        ...actual,
+        $: mockedDollar,
+        fs: {
+            ...actual.fs,
+            pathExists: vi.fn(async () => true),
+            readdir:    vi.fn(async (path: string) => {
+                // Return the app ID when listing the apps directory so validate() finds it
+                if (typeof path === 'string' && path.includes('/apps')) return [APP_ID]
+                return []
+            }),
+            ensureDir:  vi.fn(async () => undefined),
+            remove:     vi.fn(async () => undefined),
+            copy:       vi.fn(async () => undefined),
+            // preserve sync methods Config needs at import time
+            readFileSync:  actual.fs.readFileSync,
+            existsSync:    actual.fs.existsSync,
+            writeFileSync: actual.fs.writeFileSync,
+        },
+    }
 })
-
-// Intercept $ (shell) and fs methods used by CopyMoveApp.
-// We use vi.mock on 'zx' for the pieces CopyMoveApp needs, while ensuring
-// that Config's readFileSync still works (it's called at import time, before this runs).
-// Strategy: replace the module-level $ reference after import.
-// This is done by mocking the utility that wraps disk-space checks.
-
-// Actually the cleanest approach for this test structure: mock the internal helpers
-// (directoryBytes / availableBytes) by intercepting at the $ level only for our calls.
-// We provide a factory-based mock for zx that keeps fs.readFileSync intact.
-
-// NOTE: CopyMoveApp calls:
-//   $`df -k ...`       → available space
-//   $`du -sk ...`      → directory size
-//   fs.pathExists      → check app master / instance exist
-//   fs.readdir         → list instances (getInstancesOfDisk uses Store, not fs)
-//   fs.ensureDir       → create dirs
-//   fs.remove          → delete dirs
-//
-// We mock these by wrapping them in spies injected via vi.doMock inside each test.
-// This avoids the top-level hoisting problem with vi.mock + zx.
 
 // ── Store helpers ─────────────────────────────────────────────────────────────
 
@@ -139,38 +150,13 @@ const makeHandle = async (instanceStatus = 'Stopped'): Promise<{ repo: Repo; han
     return { repo, handle }
 }
 
-// Patch the fs / $ calls that CopyMoveApp makes at runtime via the zx module.
-// We grab the live zx module and spy on its methods.
-const patchZxForCopyMove = async () => {
-    const zx = await import('zx')
-
-    // $ mock: return 1GB available for df, 100MB for du
-    const dollarSpy = vi.spyOn(zx, '$' as any).mockImplementation(async (strings: any, ...vals: any[]) => {
-        const cmd = String(strings[0] ?? '')
-        if (cmd.includes('df')) return { stdout: '1048576' }   // 1GB in KB
-        if (cmd.includes('du')) return { stdout: '102400' }    // 100MB in KB
-        return { stdout: '' }
-    })
-
-    const pathExistsSpy = vi.spyOn(zx.fs, 'pathExists' as any).mockResolvedValue(true)
-    const readdirSpy = vi.spyOn(zx.fs, 'readdir' as any).mockResolvedValue([])
-    const ensureDirSpy = vi.spyOn(zx.fs, 'ensureDir' as any).mockResolvedValue(undefined)
-    const removeSpy = vi.spyOn(zx.fs, 'remove' as any).mockResolvedValue(undefined)
-    const copySpy = vi.spyOn(zx.fs, 'copy' as any).mockResolvedValue(undefined)
-
-    return { dollarSpy, pathExistsSpy, readdirSpy, ensureDirSpy, removeSpy, copySpy }
-}
+// Helper to grab the mocked fs for assertions
+const getMockedFs = async () => (await import('zx')).fs
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('copyApp', () => {
-    let spies: Awaited<ReturnType<typeof patchZxForCopyMove>>
-
-    beforeEach(async () => {
-        vi.clearAllMocks()
-        spies = await patchZxForCopyMove()
-    })
-
+    beforeEach(() => { vi.clearAllMocks() })
     afterEach(() => { vi.restoreAllMocks() })
 
     it('creates an operation record with status Done on success', async () => {
@@ -242,13 +228,7 @@ describe('copyApp', () => {
 })
 
 describe('moveApp', () => {
-    let spies: Awaited<ReturnType<typeof patchZxForCopyMove>>
-
-    beforeEach(async () => {
-        vi.clearAllMocks()
-        spies = await patchZxForCopyMove()
-    })
-
+    beforeEach(() => { vi.clearAllMocks() })
     afterEach(() => { vi.restoreAllMocks() })
 
     it('creates an operation record with status Done on success', async () => {
@@ -281,7 +261,8 @@ describe('moveApp', () => {
     it('removes source instance directory after successful move', async () => {
         const { handle } = await makeHandle()
         await moveApp(handle, 'my-kolibri' as any, 'source-disk' as any, 'target-disk' as any)
-        expect(spies.removeSpy).toHaveBeenCalledWith(
+        const mfs = await getMockedFs()
+        expect(vi.mocked(mfs.remove)).toHaveBeenCalledWith(
             expect.stringContaining(`/instances/${INSTANCE_ID}`)
         )
     })
@@ -291,7 +272,8 @@ describe('moveApp', () => {
         // After the move, instanceDB shows this instance as Missing/null storedOn,
         // so getInstancesOfDisk (which uses instanceDB) returns empty → app master removed.
         await moveApp(handle, 'my-kolibri' as any, 'source-disk' as any, 'target-disk' as any)
-        const removeCalls = spies.removeSpy.mock.calls.map(c => c[0] as string)
+        const mfs = await getMockedFs()
+        const removeCalls = vi.mocked(mfs.remove).mock.calls.map(c => c[0] as string)
         expect(removeCalls.some(p => p.includes(`/apps/${APP_ID}`))).toBe(true)
     })
 
@@ -313,7 +295,8 @@ describe('moveApp', () => {
             }
         })
         await moveApp(handle, 'my-kolibri' as any, 'source-disk' as any, 'target-disk' as any)
-        const removeCalls = spies.removeSpy.mock.calls.map(c => c[0] as string)
+        const mfs = await getMockedFs()
+        const removeCalls = vi.mocked(mfs.remove).mock.calls.map(c => c[0] as string)
         expect(removeCalls.some(p => p.includes(`/apps/${APP_ID}`))).toBe(false)
     })
 
