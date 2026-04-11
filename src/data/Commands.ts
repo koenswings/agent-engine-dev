@@ -16,6 +16,7 @@ import pack from '../../package.json' with { type: "json" };
 import { sendCommand } from "../utils/commandUtils.js";
 import { installApp } from './InstallApp.js';
 import { copyApp, moveApp } from './CopyMoveApp.js';
+import { resourceLock, diskKey } from '../utils/ResourceLock.js';
 import { undockDisk } from "../monitors/usbDeviceMonitor.js";
 import { backupInstance, restoreApp, createBackupDiskConfig } from "../monitors/backupMonitor.js";
 import { testContext } from "../../test/testContext.js";
@@ -362,6 +363,12 @@ const ejectDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskName: 
     if (disk.dockedTo !== localEngine?.id) {
         console.error(chalk.red(`Disk '${diskName}' is not docked to this engine.`));
         return;
+    }
+    // Refuse to eject if an operation is actively using this disk
+    if (resourceLock.isLocked(diskKey(disk.id))) {
+        const info = resourceLock.getLockInfo(diskKey(disk.id))
+        console.error(chalk.red(`Disk '${diskName}' is locked by an active '${info?.kind}' operation. Stop or wait for it to complete before ejecting.`))
+        return
     }
     console.log(chalk.blue(`Ejecting disk '${diskName}'...`));
     await undockDisk(storeHandle, disk);

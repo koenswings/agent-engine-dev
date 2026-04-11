@@ -16,6 +16,7 @@ import { config } from '../data/Config.js'
 import { Disk, BackupConfig, isBackupDisk, processDisk } from '../data/Disk.js'
 import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { createOperation, updateOperation } from '../data/Operations.js'
+import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
 import { stopInstance, startInstance } from '../data/Instance.js'
 import { BackupMode, DiskID, DiskName, InstanceID, Timestamp } from '../data/CommonTypes.js'
 import { Store, getInstance, getDisks, findDiskByName } from '../data/Store.js'
@@ -77,6 +78,14 @@ export const backupInstance = async (
     }
     activeBackups.add(instanceId)
     let wasRunning = false
+
+    // Acquire lock on the instance for the duration of the backup
+    const backupLockKey = instanceKey(instanceId)
+    if (!resourceLock.acquire(backupLockKey, 'backupApp')) {
+        log(chalk.yellow(`backupInstance: instance ${instanceId} is locked — skipping (another operation is running)`))
+        activeBackups.delete(instanceId)
+        return
+    }
 
     const opId = existingOpId ?? createOperation(storeHandle, 'backupApp', {
         instanceId,
@@ -196,6 +205,7 @@ export const backupInstance = async (
         // Lock file intentionally left in place — signals boot-resume on next dock
     } finally {
         activeBackups.delete(instanceId)
+        resourceLock.release(backupLockKey)
     }
 }
 
@@ -335,6 +345,13 @@ export const restoreApp = async (
     targetDisk: Disk,
     existingOpId?: string
 ): Promise<void> => {
+    // Acquire lock: instance + target disk
+    const restoreLockKeys = [instanceKey(instanceId), diskKey(targetDisk.id)]
+    if (!resourceLock.acquireAll(restoreLockKeys, 'restoreApp')) {
+        console.error(chalk.red(`restoreApp: resource locked — another operation is already running on instance or target disk. Retry when it completes.`))
+        return
+    }
+
     const opId = existingOpId ?? createOperation(storeHandle, 'restoreApp', {
         instanceId,
         targetDiskId: targetDisk.id,
@@ -402,6 +419,8 @@ export const restoreApp = async (
             completedAt: Date.now() as Timestamp,
         })
         log(chalk.red(`Restore of instance ${instanceId} failed: ${e.message ?? e}`))
+    } finally {
+        resourceLock.releaseAll(restoreLockKeys)
     }
 }
 
