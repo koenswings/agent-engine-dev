@@ -333,7 +333,8 @@ describe('recoverInterruptedOperations', () => {
                 startedAt: 0 as Timestamp, completedAt: 1 as Timestamp, error: null,
             }
         })
-        recoverInterruptedOperations(handle)
+        // Pass empty handlers so all ops fall through to 'fail' strategy
+        await recoverInterruptedOperations(handle, {})
         expect(handle.doc().operationDB['op1'].status).toBe('Failed')
         expect(handle.doc().operationDB['op2'].status).toBe('Failed')
         expect(handle.doc().operationDB['op3'].status).toBe('Done')

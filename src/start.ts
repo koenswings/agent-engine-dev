@@ -12,7 +12,9 @@ import { startAutomergeServer } from './repo.js'
 import { enableMulticastDNSEngineMonitor } from './monitors/mdnsMonitor.js'
 import { createServerStore, initialiseServerStore } from './data/Store.js'
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
-import { recoverInterruptedOperations } from './data/CopyMoveApp.js'
+import { recoverInterruptedOperations } from './data/Operations.js'
+import { copyApp, moveApp } from './data/CopyMoveApp.js'
+import { backupInstance } from './monitors/backupMonitor.js'
 import { InstanceID } from './data/CommonTypes.js'
 import { Status } from './data/Instance.js'
 import { Store } from './data/Store.js'
@@ -100,8 +102,23 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // Check for undocked apps after restart
     await checkAndSetUndockedApps(storeHandle)
 
-    // Mark any operations that were Running at shutdown as Failed (crash recovery)
-    recoverInterruptedOperations(storeHandle)
+    // Crash recovery: retry idempotent interrupted ops; mark others Failed
+    await recoverInterruptedOperations(storeHandle, {
+        copyApp: async (args, handle) => {
+            await copyApp(handle, args.instanceId as any, args.sourceDiskId as any, args.targetDiskId as any)
+        },
+        moveApp: async (args, handle) => {
+            await moveApp(handle, args.instanceId as any, args.sourceDiskId as any, args.targetDiskId as any)
+        },
+        backupApp: async (args, handle) => {
+            const store = handle.doc()
+            const backupDisk = store.diskDB[args.backupDiskId]
+            if (backupDisk) {
+                await backupInstance(handle, args.instanceId as any, backupDisk as any)
+            }
+        },
+        // restoreApp: strategy='fail', no retry handler needed
+    })
 
     // Start the HTTP server (serves Console UI + /api/store-url)
     log(chalk.bgMagenta('STARTING HTTP SERVER'))
