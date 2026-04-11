@@ -15,6 +15,7 @@ import { generateHostName } from "../utils/nameGenerator.js";
 import pack from '../../package.json' with { type: "json" };
 import { sendCommand } from "../utils/commandUtils.js";
 import { installApp } from './InstallApp.js';
+import { copyApp, moveApp } from './CopyMoveApp.js';
 import { undockDisk } from "../monitors/usbDeviceMonitor.js";
 import { backupInstance, restoreApp, createBackupDiskConfig } from "../monitors/backupMonitor.js";
 import { testContext } from "../../test/testContext.js";
@@ -333,6 +334,16 @@ const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, dis
     console.log(chalk.green(`Backup Disk '${diskName}' configured.`))
 }
 
+const copyAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, sourceDiskName: DiskName, targetDiskName: DiskName) => {
+    if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
+    await copyApp(storeHandle, instanceName, sourceDiskName, targetDiskName)
+}
+
+const moveAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, sourceDiskName: DiskName, targetDiskName: DiskName) => {
+    if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
+    await moveApp(storeHandle, instanceName, sourceDiskName, targetDiskName)
+}
+
 const ejectDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskName: DiskName) => {
     if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
     const store = storeHandle.doc();
@@ -388,6 +399,8 @@ export const commands: CommandDefinition[] = [
     },
     { name: "connect", execute: connect, args: [{ type: "string" }], scope: 'any' },
     { name: "disconnect", execute: disconnect, args: [], scope: 'any' },
+    { name: "copyApp", execute: copyAppWrapper, args: [{ type: "string" }, { type: "string" }, { type: "string" }], scope: 'engine' },
+    { name: "moveApp", execute: moveAppWrapper, args: [{ type: "string" }, { type: "string" }, { type: "string" }], scope: 'engine' },
     { name: "ejectDisk", execute: ejectDiskWrapper, args: [{ type: "string" }], scope: 'engine' },
     { name: "backupApp", execute: backupAppWrapper, args: [{ type: "string" }, { type: "string" }], scope: 'engine' },
     { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string" }, { type: "string" }], scope: 'engine' },
