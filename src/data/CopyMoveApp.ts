@@ -20,6 +20,7 @@ import { stopInstance, startInstance } from './Instance.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { uuid } from '../utils/utils.js'
 import { createOperation, updateOperation } from './Operations.js'
+import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
 
 // ── Disk free-space check ─────────────────────────────────────────────────────
 
@@ -128,6 +129,13 @@ export const copyApp = async (
     }
     const { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc } = v
 
+    // Acquire per-resource locks: source instance + target disk
+    const lockKeys = [instanceKey(instance.id), diskKey(targetDisk.id)]
+    if (!resourceLock.acquireAll(lockKeys, 'copyApp')) {
+        console.error(chalk.red(`copyApp: resource locked — another operation is already running on instance '${instanceName}' or target disk '${targetDisk.name}'. Retry when it completes.`))
+        return
+    }
+
     const opId = createOperation(storeHandle, 'copyApp', {
         instanceId: instance.id,
         sourceDiskId: sourceDisk.id,
@@ -197,6 +205,7 @@ export const copyApp = async (
         })
         console.error(chalk.red(`copyApp: failed — ${e.message ?? e}`))
     } finally {
+        resourceLock.releaseAll(lockKeys)
         // Always restart source instance if we stopped it
         if (wasRunning) {
             try {
@@ -235,6 +244,13 @@ export const moveApp = async (
         return
     }
     const { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc } = v
+
+    // Acquire per-resource locks: instance + both disks
+    const moveLockKeys = [instanceKey(instance.id), diskKey(sourceDisk.id), diskKey(targetDisk.id)]
+    if (!resourceLock.acquireAll(moveLockKeys, 'moveApp')) {
+        console.error(chalk.red(`moveApp: resource locked — another operation is already running on instance '${instanceName}' or one of its disks. Retry when it completes.`))
+        return
+    }
 
     const opId = createOperation(storeHandle, 'moveApp', {
         instanceId: instance.id,
@@ -341,6 +357,8 @@ export const moveApp = async (
                 console.error(chalk.red(`moveApp: failed to restart source instance: ${restartErr.message}`))
             }
         }
+    } finally {
+        resourceLock.releaseAll(moveLockKeys)
     }
 }
 
