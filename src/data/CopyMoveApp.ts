@@ -11,56 +11,15 @@ import { chalk, fs, $ } from 'zx'
 import { log } from '../utils/utils.js'
 import { rsyncDirectory } from '../utils/rsync.js'
 import {
-    EngineID, InstanceID, DiskID, DiskName, InstanceName, Timestamp,
-    Operation, OperationKind, OperationStatus
+    InstanceID, DiskID, DiskName, InstanceName, Timestamp,
+    OperationKind
 } from './CommonTypes.js'
-import { Store, findDiskByName, findInstanceByName, getDisk, getInstance, getInstancesOfDisk } from './Store.js'
+import { Store, findDiskByName, getDisk, getInstance, getInstancesOfDisk } from './Store.js'
 import { Disk, processInstance } from './Disk.js'
 import { stopInstance, startInstance } from './Instance.js'
-import { localEngineId } from './Engine.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { uuid } from '../utils/utils.js'
-
-// ── Operation helpers ─────────────────────────────────────────────────────────
-
-const createOperation = (
-    storeHandle: DocHandle<Store>,
-    kind: OperationKind,
-    args: Record<string, string>
-): string => {
-    const id = uuid()
-    const op: Operation = {
-        id,
-        kind,
-        args,
-        engineId: localEngineId,
-        status: 'Pending',
-        progressPercent: null,
-        startedAt: Date.now() as Timestamp,
-        completedAt: null,
-        error: null,
-    }
-    storeHandle.change(doc => {
-        if (!doc.operationDB) (doc as any).operationDB = {}
-        doc.operationDB[id] = op
-    })
-    return id
-}
-
-const updateOperation = (
-    storeHandle: DocHandle<Store>,
-    id: string,
-    patch: Partial<Pick<Operation, 'status' | 'progressPercent' | 'completedAt' | 'error'>>
-): void => {
-    storeHandle.change(doc => {
-        const op = doc.operationDB?.[id]
-        if (!op) return
-        if (patch.status !== undefined) op.status = patch.status
-        if (patch.progressPercent !== undefined) op.progressPercent = patch.progressPercent
-        if (patch.completedAt !== undefined) op.completedAt = patch.completedAt
-        if (patch.error !== undefined) op.error = patch.error
-    })
-}
+import { createOperation, updateOperation } from './Operations.js'
 
 // ── Disk free-space check ─────────────────────────────────────────────────────
 
@@ -385,31 +344,5 @@ export const moveApp = async (
     }
 }
 
-// ── Boot-time crash recovery ──────────────────────────────────────────────────
-
-/**
- * Called during engine startup. Any operation still in 'Running' state from a
- * previous session was interrupted by a crash or reboot — mark it Failed so the
- * operator can re-issue the command.
- *
- * copyApp and moveApp are both idempotent (rsync diffs), so re-issuing is safe.
- */
-export const recoverInterruptedOperations = (storeHandle: DocHandle<Store>): void => {
-    const store = storeHandle.doc()
-    if (!store.operationDB) return
-
-    const runningOps = Object.values(store.operationDB).filter(op => op.status === 'Running' || op.status === 'Pending')
-    if (runningOps.length === 0) return
-
-    log(`recoverInterruptedOperations: marking ${runningOps.length} interrupted operation(s) as Failed`)
-    storeHandle.change(doc => {
-        for (const op of runningOps) {
-            const stored = doc.operationDB?.[op.id]
-            if (stored) {
-                stored.status = 'Failed'
-                stored.error = 'Engine restarted while operation was in progress — re-issue to retry'
-                stored.completedAt = Date.now() as Timestamp
-            }
-        }
-    })
-}
+// recoverInterruptedOperations moved to Operations.ts
+export { recoverInterruptedOperations } from './Operations.js'
