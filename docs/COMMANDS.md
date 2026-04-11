@@ -76,6 +76,16 @@ These commands perform actions on the system. Some are restricted to an `engine`
 - **Usage:** `stopInstance <instanceName> <diskName>`
 - **Scope:** `engine`
 
+### `copyApp`
+- **Description:** Copies an app instance from one disk to another. The copy receives a brand new InstanceID — it is treated as a fresh instance. The original instance is stopped during the file copy (for a consistent snapshot) and restarted afterwards. Progress is tracked in `operationDB` in the store and visible to all Consoles.
+- **Usage:** `copyApp <instanceName> <sourceDiskName> <targetDiskName>`
+- **Scope:** `engine`
+
+### `moveApp`
+- **Description:** Moves an app instance from one disk to another. The instance keeps its original InstanceID so backup disk links remain intact. The source instance directory (and app master, if no other instance on the source disk uses it) is removed after a successful transfer.
+- **Usage:** `moveApp <instanceName> <sourceDiskName> <targetDiskName>`
+- **Scope:** `engine`
+
 ### `backupApp`
 - **Description:** Backs up an app instance to a Backup Disk. Stops the instance briefly for filesystem consistency, runs a BorgBackup archive, then restarts it. If no Backup Disk name is given, the first docked Backup Disk linked to the instance is used.
 - **Usage:** `backupApp <instanceName> [backupDiskName]`

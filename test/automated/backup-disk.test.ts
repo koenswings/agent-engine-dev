@@ -30,6 +30,7 @@ const createMinimalStore = async (): Promise<{ repo: Repo; storeHandle: DocHandl
         appDB: {},
         instanceDB: {},
         userDB: {},
+        operationDB: {},
     })
     await storeHandle.whenReady()
     await createOrUpdateEngine(storeHandle, localEngineId)

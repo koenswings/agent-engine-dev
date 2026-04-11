@@ -5,7 +5,7 @@ import { deepPrint, getKeys, log } from '../utils/utils.js'
 import { App } from './App.js'
 import { Instance } from './Instance.js'
 import { User } from './User.js'
-import { AppID, DeviceName, DiskID, EngineID, Hostname, InstanceID, UserID } from './CommonTypes.js'
+import { AppID, DeviceName, DiskID, EngineID, Hostname, InstanceID, UserID, Operation } from './CommonTypes.js'
 import { DocHandle, DocumentId, PeerId, Repo } from '@automerge/automerge-repo'
 import { chalk, fs } from "zx"
 //import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websocket'
@@ -25,6 +25,7 @@ export interface Store {
     appDB: { [key: AppID]: App },
     instanceDB: { [key: InstanceID]: Instance },
     userDB: { [key: UserID]: User },
+    operationDB: { [id: string]: Operation },
 }
 
 // };
@@ -42,6 +43,7 @@ export const initialiseServerStore = async (repo: Repo, STORE_TEMPLATE_PATH: str
         appDB: {},
         instanceDB: {},
         userDB: {},
+        operationDB: {},
     });
     log("Empty store document created successfully.")
     // Save the document to a binary file
