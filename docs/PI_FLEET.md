@@ -23,14 +23,14 @@ The IDEA test fleet consists of four Raspberry Pi nodes used for remote automate
 | idea04 | TBD | idea04.local | pi |
 
 IPs are assigned by the local DHCP server (see router for current assignments).  
-These nodes are **not on Tailscale** — direct LAN access only.
+These nodes are on the local LAN. Tailscale is not yet active on the fleet — see [Tailscale status](#tailscale-status) below.
 
 ## Access
 
 SSH key: `/home/node/workspace/.ssh/id_ed25519` (openclaw-axle@idea)
 
 SSH config entries (managed by `script/provision-fleet.sh`) are in `~/.ssh/config`.  
-`/etc/hosts` in the sandbox maps `<ip> idea<n>.local` so mDNS names resolve without avahi.
+mDNS names (`idea0N.local`) resolve via avahi on the LAN.
 
 ```bash
 ssh pi@idea01.local          # Direct SSH
@@ -118,5 +118,15 @@ fleet Pis have direct SSH access for all commands.
 
 - Pi 5 nodes (idea01, idea03) have PCIe USB — different from Pi 4's DWC2 USB controller
 - 240 GB SSD provides ample space for Docker images and test data
-- These nodes do NOT connect to Tailscale — LAN access only (sandbox reaches them via Docker host bridge routing)
 - borgbackup is installed on all nodes for Backup Disk tests
+
+## Tailscale Status
+
+Tailscale latent remote-access is designed and approved (`design/tailscale-remote-management.md`) but not yet installed on the fleet. The `buildEngine` provisioning path does not include Tailscale installation. The remaining Phase 1 steps are:
+
+1. Koen generates a reusable ephemeral auth key in the Tailscale admin console (tag: `tag:school-pi`) and provisions it into the repo secrets / USB package
+2. `installUdev()` (or a new `installTailscale()` step) in `Engine.ts` is extended to install Tailscale binaries, the disabled systemd service, and store the auth key at `/etc/tailscale/debug-authkey`
+3. The activation script (`scripts/upgrade-tailscale/tailscale-debug-activate.sh`) is baked into the Pi image
+4. Fleet nodes are re-provisioned or upgraded in-place via the USB upgrade package
+
+Until then, fleet access is LAN-only via SSH key.
