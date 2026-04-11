@@ -122,11 +122,21 @@ fleet Pis have direct SSH access for all commands.
 
 ## Tailscale Status
 
-Tailscale latent remote-access is designed and approved (`design/tailscale-remote-management.md`) but not yet installed on the fleet. The `buildEngine` provisioning path does not include Tailscale installation. The remaining Phase 1 steps are:
+Tailscale latent remote-access is **installed and ready** on all three fleet nodes (2026-04-11).
 
-1. Koen generates a reusable ephemeral auth key in the Tailscale admin console (tag: `tag:school-pi`) and provisions it into the repo secrets / USB package
-2. `installUdev()` (or a new `installTailscale()` step) in `Engine.ts` is extended to install Tailscale binaries, the disabled systemd service, and store the auth key at `/etc/tailscale/debug-authkey`
-3. The activation script (`scripts/upgrade-tailscale/tailscale-debug-activate.sh`) is baked into the Pi image
-4. Fleet nodes are re-provisioned or upgraded in-place via the USB upgrade package
+| Node | Binary | Service | Auth key | Activation script |
+|------|--------|---------|----------|-------------------|
+| idea01 (192.168.0.138) | ✅ | disabled | ✅ 600 root | ✅ |
+| idea02 (192.168.0.180) | ✅ | disabled | ✅ 600 root | ✅ |
+| idea03 (192.168.0.228) | ✅ | disabled | ✅ 600 root | ✅ |
 
-Until then, fleet access is LAN-only via SSH key.
+**To activate debug mode on a fleet Pi:**
+```bash
+ssh pi@idea01.local
+sudo /usr/local/bin/tailscale-debug-activate.sh
+```
+The script checks internet connectivity, joins the IDEA Tailnet (ephemeral), and prints the Tailscale IP. Press Enter when done — Pi leaves the Tailnet automatically.
+
+**Fresh Pi provisioning:** `buildEngine` now calls `installTailscale()` automatically. Auth key is read from `TAILSCALE_AUTHKEY` env var or `/home/pi/openclaw/secrets/tailscale_authkey.txt` on wizardly-hugle.
+
+See `design/tailscale-remote-management.md` for full design and Phase 2 (Console UI toggle).
