@@ -1,7 +1,7 @@
 settings:
   mdns: true
   isDev: false
-  testMode: false   # Set to true to skip sudo mount/umount (for automated tests and field diagnostics)
+  testMode: true   # Set to true to skip sudo mount/umount (for automated tests and field diagnostics)
   port: 4321
   httpPort: 80      # HTTP server port: serves Console UI and /api/store-url
   consolePath: ""   # Absolute path to Console dist/ directory. Empty = Console UI not served.
