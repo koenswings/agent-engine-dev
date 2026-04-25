@@ -331,8 +331,11 @@ export const getDisksOfEngine = (store: Store, engine: Engine): Disk[] => {
     })
 }
 
-export const findDiskByDevice = (store: Store, deviceName: DeviceName): Disk | undefined => {
-    return getDisks(store).find(disk => disk.device === deviceName)
+export const findDiskByDevice = (store: Store, deviceName: DeviceName, engineId?: EngineID): Disk | undefined => {
+    const disks = engineId
+        ? getDisksOfEngine(store, store.engineDB[engineId])
+        : getDisks(store)
+    return disks.find(disk => disk.device === deviceName)
 }
 
 export const findDiskByName = (store: Store, diskName: string): Disk | undefined => {

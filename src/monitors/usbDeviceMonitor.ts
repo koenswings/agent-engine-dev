@@ -26,6 +26,29 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         throw new Error(`No local engine found in the store`)
     }
 
+    // Detect the root partition (e.g. sda2) at startup so we can handle it as a system disk
+    // and skip the whole-disk device (e.g. sda) and boot partition (e.g. sda1).
+    let systemDevice: DeviceName | null = null
+    let systemParentDevice: string | null = null  // e.g. 'sda' — the whole-disk entry to skip
+    let systemBootDevice: string | null = null   // e.g. 'sda1' — the boot partition to skip
+    if (!config.settings.testMode && !config.settings.isDev) {
+        try {
+            const rootSource = (await $`findmnt -n -o SOURCE /`).stdout.trim()
+            // rootSource is e.g. /dev/sda2 — strip the /dev/ prefix
+            const rootDev = rootSource.replace('/dev/', '') as DeviceName
+            if (rootDev.match(/^sd[a-z][0-9]+$/)) {
+                systemDevice = rootDev
+                // Parent is the disk without trailing partition digit(s), e.g. sda2 → sda
+                systemParentDevice = rootDev.replace(/[0-9]+$/, '')
+                // Boot partition is parent + '1', e.g. sda1
+                systemBootDevice = systemParentDevice + '1'
+                log(`System disk detected: root=${systemDevice}, parent=${systemParentDevice}, boot=${systemBootDevice}`)
+            }
+        } catch (e) {
+            log(`Could not detect system device: ${e}`)
+        }
+    }
+
     const validDevice = function (device: string): boolean {
         // Check if the device begins with "sd", is then followed by a letter and ends with the number 2
         // We need the m flag - see https://regexr.com/7rvpq 
@@ -38,8 +61,34 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
 
         if (validDevice(device)) {
             log(`The disk on device ${device} has a valid device name`)
+
+            // Skip the whole-disk entry (e.g. sda) and boot partition (e.g. sda1) —
+            // these are never useful for app storage.
+            if (systemParentDevice && device === systemParentDevice) {
+                log(`Device ${device} is the system disk's parent device — skipping`)
+                return
+            }
+            if (systemBootDevice && device === systemBootDevice) {
+                log(`Device ${device} is the system disk's boot partition — skipping`)
+                return
+            }
+
             log(`Processing the disk on device ${device}`)
             try {
+                // System disk (root partition): already mounted at /, no mount needed.
+                // Read identity from /META.yaml and register as a system disk.
+                if (systemDevice && device === systemDevice) {
+                    log(`Device ${device} is the system disk (root partition) — registering as system disk`)
+                    try {
+                        const meta = await readMetaUpdateId()  // reads /META.yaml, no device arg
+                        const disk: Disk = createOrUpdateDisk(storeHandle, localEngine.id, device, meta.diskId, meta.diskName, meta.created)
+                        await processDisk(storeHandle, disk)
+                    } catch (e) {
+                        log(`Error processing system disk: ${e}`)
+                    }
+                    return
+                }
+
                 if (config.settings.testMode) {
                     log(`testMode: skipping mount for device ${device} — fixture expected at /disks/${device}`)
                 } else {
@@ -66,12 +115,14 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                     }
                 } else {
                     // Before creating a new disk entry, check if a disk is already
-                    // registered for this device in the store. This prevents spurious
-                    // empty-disk entries when addDevice fires for a device that's already
-                    // docked (e.g. during docker compose up -d Recreate cycles).
-                    const existingDisk = findDiskByDevice(storeHandle.doc(), device as DeviceName)
+                    // registered for this device on THIS engine in the store. This prevents
+                    // spurious empty-disk entries when addDevice fires for a device that's
+                    // already docked (e.g. during docker compose up -d Recreate cycles).
+                    // Scoped to localEngine.id to avoid false matches on other engines' disks
+                    // in the shared CRDT store (e.g. all Pis having sda2 as the root device).
+                    const existingDisk = findDiskByDevice(storeHandle.doc(), device as DeviceName, localEngine.id)
                     if (existingDisk) {
-                        log(`Device ${device} already has a registered disk (${existingDisk.id}) — skipping new disk creation`)
+                        log(`Device ${device} already has a registered disk (${existingDisk.id}) on this engine — skipping new disk creation`)
                         return
                     }
                     log('Could not find a META file. Creating one now.')

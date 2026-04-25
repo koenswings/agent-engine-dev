@@ -36,7 +36,7 @@ export type Command = Brand<string, "COMMAND">
 
 export type UserID = Brand<string, "USERID">
 
-export type DiskType = 'app' | 'backup' | 'empty' | 'upgrade' | 'files'
+export type DiskType = 'app' | 'backup' | 'empty' | 'upgrade' | 'files' | 'system'
 export type BackupMode = 'immediate' | 'on-demand' | 'scheduled'
 
 export type OperationStatus = 'Pending' | 'Running' | 'Done' | 'Failed'
