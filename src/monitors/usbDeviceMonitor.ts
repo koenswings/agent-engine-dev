@@ -62,14 +62,18 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         if (validDevice(device)) {
             log(`The disk on device ${device} has a valid device name`)
 
-            // Skip the whole-disk entry (e.g. sda) and boot partition (e.g. sda1) —
-            // these are never useful for app storage.
-            if (systemParentDevice && device === systemParentDevice) {
-                log(`Device ${device} is the system disk's parent device — skipping`)
+            // Skip the whole-disk entry (e.g. sda) — a raw block device with no
+            // partition table visible; never directly mountable as a filesystem.
+            if (device.match(/^sd[a-z]$/)) {
+                log(`Device ${device} is a whole-disk entry — skipping`)
                 return
             }
-            if (systemBootDevice && device === systemBootDevice) {
-                log(`Device ${device} is the system disk's boot partition — skipping`)
+
+            // Skip partition 1 of sda (the Pi OS boot partition, FAT32).
+            // On all IDEA Pis, sda is the OS SSD: sda1=bootfs, sda2=rootfs.
+            // Partition 1 of any other disk (sdb1, sdc1, …) is a valid app disk partition.
+            if (device === 'sda1' as DeviceName) {
+                log(`Device ${device} is the OS boot partition — skipping`)
                 return
             }
 
