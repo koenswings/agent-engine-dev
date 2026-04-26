@@ -65,6 +65,7 @@ vi.mock('zx', async (importOriginal) => {
         const cmd = Array.isArray(strings) ? strings.join('') : String(strings ?? '')
         if (cmd.includes('df')) return { stdout: '1048576\n' }  // 1 GB in KB
         if (cmd.includes('du')) return { stdout: '102400\n' }   // 100 MB in KB
+        if (cmd.includes('sudo') && cmd.includes('rm')) return { stdout: '' }  // sudo rm -rf (instance dir removal)
         // Fall through to real $ for anything else (META.yaml reads, docker, etc.)
         return actual.$(strings, ...vals)
     }) as any
@@ -260,11 +261,20 @@ describe('moveApp', () => {
 
     it('removes source instance directory after successful move', async () => {
         const { handle } = await makeHandle()
+        const { $ } = await import('zx')
         await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
-        const mfs = await getMockedFs()
-        expect(vi.mocked(mfs.remove)).toHaveBeenCalledWith(
-            expect.stringContaining(`/instances/${INSTANCE_ID}`)
-        )
+        // Instance dir is removed via `sudo rm -rf` (files may be docker-owned)
+        // The template literal passes 'sudo rm -rf ' in the strings and the path as an interpolated value.
+        const rmCalls = vi.mocked($).mock.calls
+        const didSudoRm = rmCalls.some((args: any) => {
+            const [strings, ...vals] = args
+            const allParts = [
+                ...(Array.isArray(strings) ? strings : [String(strings ?? '')]),
+                ...vals.map(String)
+            ].join('')
+            return allParts.includes('sudo') && allParts.includes('rm') && allParts.includes(INSTANCE_ID)
+        })
+        expect(didSudoRm).toBe(true)
     })
 
     it('removes app master when no other instance on source disk uses it', async () => {
