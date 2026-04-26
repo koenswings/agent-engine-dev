@@ -39,7 +39,7 @@ export type UserID = Brand<string, "USERID">
 export type DiskType = 'app' | 'backup' | 'empty' | 'upgrade' | 'files' | 'system'
 export type BackupMode = 'immediate' | 'on-demand' | 'scheduled'
 
-export type OperationStatus = 'Pending' | 'Running' | 'Done' | 'Failed'
+export type OperationStatus = 'Pending' | 'Running' | 'Done' | 'Failed' | 'Cancelled'
 export type OperationKind =
   | 'copyApp'
   | 'moveApp'

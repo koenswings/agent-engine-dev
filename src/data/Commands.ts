@@ -19,6 +19,7 @@ import { copyApp, moveApp } from './CopyMoveApp.js';
 import { resourceLock, diskKey } from '../utils/ResourceLock.js';
 import { undockDisk } from "../monitors/usbDeviceMonitor.js";
 import { backupInstance, restoreApp, createBackupDiskConfig } from "../monitors/backupMonitor.js";
+import { cancelOperation } from './Operations.js';
 import { testContext } from "../../test/testContext.js";
 
 
@@ -412,4 +413,10 @@ export const commands: CommandDefinition[] = [
     { name: "backupApp", execute: backupAppWrapper, args: [{ type: "string" }, { type: "string" }], scope: 'engine' },
     { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string" }, { type: "string" }], scope: 'engine' },
     { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string" }, { type: "string" }, { type: "string" }], scope: 'engine' },
+    { name: "cancelOperation", execute: async (storeHandle: DocHandle<Store> | null, opId: string) => {
+        if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
+        const err = cancelOperation(storeHandle, opId)
+        if (err) console.error(chalk.red(`cancelOperation: ${err}`))
+        else console.log(chalk.green(`Operation ${opId} cancelled`))
+    }, args: [{ type: "string" }], scope: 'engine' },
 ];
