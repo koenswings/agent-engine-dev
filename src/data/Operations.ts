@@ -80,6 +80,78 @@ export const updateOperation = (
     })
 }
 
+// ── Cancel operation ────────────────────────────────────────────────────────
+
+/**
+ * Cancel an operation by ID.
+ *
+ * Phase 1 behaviour:
+ *  - Pending: splice the matching command from engine.commands[], mark Cancelled
+ *  - Failed:  mark Cancelled (lock already released at failure time)
+ *  - Running: return an error message — Phase 2 (SIGTERM) not yet implemented
+ *  - Done / Cancelled: no-op
+ *
+ * Returns an error string on failure, undefined on success.
+ */
+export const cancelOperation = (
+    storeHandle: DocHandle<Store>,
+    opId: string
+): string | undefined => {
+    const store = storeHandle.doc()
+    const op = store.operationDB?.[opId]
+    if (!op) return `Operation '${opId}' not found`
+
+    if (op.status === 'Done' || op.status === 'Cancelled') {
+        log(`cancelOperation: op ${opId} is already ${op.status} — no-op`)
+        return undefined
+    }
+
+    if (op.status === 'Running') {
+        return `Operation '${opId}' is Running — cancellation of in-progress operations is not yet supported (Phase 2)`
+    }
+
+    // Pending: remove from the engine command queue
+    if (op.status === 'Pending') {
+        storeHandle.change(doc => {
+            const eng = doc.engineDB[op.engineId as any]
+            if (eng?.commands) {
+                // Scan queue for a command whose opId is referenced in the operation args.
+                // Commands are strings like "copyApp <instanceName> <srcDiskId> <tgtDiskId>".
+                // We match by checking if any arg value appears in the command string AND
+                // the op's args values are a subset of the command tokens.
+                const queue = eng.commands as string[]
+                // Match by disk IDs stored in operation args — these appear verbatim
+                // in the command string (e.g. "copyApp <name> <srcDiskId> <tgtDiskId>").
+                // instanceId is an internal ID that does NOT appear in the command string.
+                const diskArgs = Object.entries(op.args)
+                    .filter(([k]) => k.toLowerCase().includes('disk'))
+                    .map(([, v]) => v)
+                const idx = diskArgs.length > 0
+                    ? queue.findIndex(cmd => diskArgs.every(v => cmd.includes(v)))
+                    : -1
+                if (idx !== -1) {
+                    log(`cancelOperation: splicing command at index ${idx} from engine ${op.engineId} queue`)
+                    ;(eng.commands as any[]).splice(idx, 1)
+                } else {
+                    log(`cancelOperation: command not found in queue for op ${opId} — may have already started`)
+                }
+            }
+        })
+    }
+
+    // Pending or Failed: mark Cancelled
+    storeHandle.change(doc => {
+        const o = doc.operationDB?.[opId]
+        if (o) {
+            o.status = 'Cancelled' as OperationStatus
+            o.completedAt = Date.now() as Timestamp
+        }
+    })
+
+    log(`cancelOperation: op ${opId} (${op.kind}) marked Cancelled`)
+    return undefined
+}
+
 // ── Startup crash recovery ────────────────────────────────────────────────────
 
 /**
