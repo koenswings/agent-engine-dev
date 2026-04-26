@@ -317,10 +317,13 @@ export const moveApp = async (
         })
 
         // 8. Remove source instance directory
+        // Use sudo rm -rf because instance data dirs may contain files owned by
+        // Docker container users (e.g. Kolibri data owned by root inside the container).
         log(`moveApp: removing source instance directory ${instanceSrc}`)
-        await fs.remove(instanceSrc)
+        await $`sudo rm -rf ${instanceSrc}`
 
         // 9. Remove source app master only if no other instance on the source disk uses it
+        // App master files are pi-owned, so fs.remove is sufficient.
         const remainingInstances = getInstancesOfDisk(storeHandle.doc(), sourceDisk)
         const stillNeedsAppMaster = remainingInstances.some(i => i.instanceOf === appId)
         if (!stillNeedsAppMaster) {
