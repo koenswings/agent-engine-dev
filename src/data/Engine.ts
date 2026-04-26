@@ -624,12 +624,12 @@ export const installPm2 = async (exec: any, enginePath: string) => {
 
 export const installEnginePM2 = async (exec: any, enginePath: string) => {
   console.log(chalk.blue('Installing the engine...'))
-  await exec`cd ${enginePath} && sudo pnpm install_packages`
+  await exec`cd ${enginePath} && pnpm install_packages`
 }
 
 export const buildEnginePM2 = async (exec: any, enginePath: string) => {
   console.log(chalk.blue('Building the engine with tsc...'))
-  await exec`cd ${enginePath} && sudo pnpm build`
+  await exec`cd ${enginePath} && pnpm build`
 }
 
 export const startEnginePM2 = async (exec: any, enginePath: string, permanentEnginePath: string, productionMode: boolean) => {
