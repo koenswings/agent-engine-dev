@@ -13,7 +13,7 @@
 import { $, YAML, chalk, fs } from 'zx'
 import { log } from '../utils/utils.js'
 import { config } from '../data/Config.js'
-import { Disk, BackupConfig, isBackupDisk, processDisk } from '../data/Disk.js'
+import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot } from '../data/Disk.js'
 import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { createOperation, updateOperation } from '../data/Operations.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
@@ -144,7 +144,7 @@ export const backupInstance = async (
         const archiveName = new Date().toISOString().replace(/[:.]/g, '-')
         if (!config.settings.testMode) {
             log(`Running borg create for instance ${instanceId}`)
-            await $`borg create ${repoPath}::${archiveName} /disks/${appDevice}/instances/${instanceId}`
+            await $`borg create ${repoPath}::${archiveName} ${await diskMountRoot(appDisk)}/instances/${instanceId}`
         } else {
             log(`testMode: skipping borg create for instance ${instanceId}`)
         }
@@ -384,7 +384,7 @@ export const restoreApp = async (
         }
 
         const repoPath = backupDir(backupDevice, instanceId)
-        const instancesDir = `/disks/${targetDevice}/instances`
+        const instancesDir = `${await diskMountRoot(targetDisk)}/instances`
 
         // Stop instance if currently running
         const instance = getInstance(store, instanceId)

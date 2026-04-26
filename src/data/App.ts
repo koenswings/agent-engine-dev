@@ -2,7 +2,7 @@ import { $, YAML, chalk } from 'zx';
 import { Version, URL, AppID, AppName, Hostname, DeviceName, DiskName, DiskID } from './CommonTypes.js';
 import { log } from '../utils/utils.js';
 import { Store } from './Store.js';
-import { Disk } from './Disk.js';
+import { Disk, diskMountRoot } from './Disk.js';
 import { DocHandle } from '@automerge/automerge-repo';
 
 export interface App {
@@ -70,7 +70,7 @@ export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: Ap
         const appVersion = extractAppVersion(appId)
 
         // Read the compose.yaml file in the app folder
-        const appComposeFile = await $`cat /disks/${device}/apps/${appId}/compose.yaml`
+        const appComposeFile = await $`cat ${await diskMountRoot(disk)}/apps/${appId}/compose.yaml`
         const appCompose = YAML.parse(appComposeFile.stdout)
         storeHandle.change(doc => {
             const storedApp: App | undefined = doc.appDB[appId]

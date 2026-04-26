@@ -24,7 +24,7 @@ import { Store, getDisk, findDiskByName } from './Store.js'
 import { buildInstance } from './Instance.js'
 import { AppID, AppName, DiskID, DiskName, InstanceName, Version } from './CommonTypes.js'
 import { DocHandle } from '@automerge/automerge-repo'
-import { Disk } from './Disk.js'
+import { Disk, diskMountRoot } from './Disk.js'
 import { App, createOrUpdateApp } from './App.js'
 
 // ── Internet probe ────────────────────────────────────────────────────────────
@@ -62,18 +62,20 @@ export const installAppFromDisk = async (
     if (!targetDevice) throw new Error(`Target disk '${targetDisk.name}' is not docked`)
 
     // Locate app bundle on source disk (App Disk: apps/<appId>/, Backup Disk: apps/<appId>/)
-    const sourcePath = `/disks/${sourceDevice}/apps/${appId}`
+    const sourceMountRoot = await diskMountRoot(sourceDisk)
+    const sourcePath = `${sourceMountRoot}/apps/${appId}`
     if (!await fs.pathExists(sourcePath)) {
         throw new Error(`App '${appId}' not found on disk '${sourceDisk.name}' at ${sourcePath}`)
     }
 
     // Ensure target has the required directory structure
-    await fs.ensureDir(`/disks/${targetDevice}/apps`)
-    await fs.ensureDir(`/disks/${targetDevice}/instances`)
-    await fs.ensureDir(`/disks/${targetDevice}/services`)
+    const targetMountRoot = await diskMountRoot(targetDisk)
+    await fs.ensureDir(`${targetMountRoot}/apps`)
+    await fs.ensureDir(`${targetMountRoot}/instances`)
+    await fs.ensureDir(`${targetMountRoot}/services`)
 
     // Copy app bundle
-    const targetAppPath = `/disks/${targetDevice}/apps/${appId}`
+    const targetAppPath = `${targetMountRoot}/apps/${appId}`
     log(`Copying app bundle: ${sourcePath} → ${targetAppPath}`)
     await fs.copy(sourcePath, targetAppPath, { overwrite: true })
 
@@ -84,8 +86,8 @@ export const installAppFromDisk = async (
     const { uuid } = await import('../utils/utils.js')
     const instanceId = uuid()
 
-    const sourceInstanceBase = `/disks/${sourceDevice}/instances`
-    const targetInstanceBase = `/disks/${targetDevice}/instances`
+    const sourceInstanceBase = `${sourceMountRoot}/instances`
+    const targetInstanceBase = `${targetMountRoot}/instances`
 
     // If source has an instance of this app, copy its data as the starting point
     let sourceInstanceId: string | null = null
@@ -212,7 +214,7 @@ export const indexBackupDiskApps = async (
     const device = backupDisk.device
     if (!device) return
 
-    const appsDir = `/disks/${device}/apps`
+    const appsDir = `${await diskMountRoot(backupDisk)}/apps`
     if (!await fs.pathExists(appsDir)) {
         log(`indexBackupDiskApps: no apps/ directory on disk ${backupDisk.name}`)
         return
