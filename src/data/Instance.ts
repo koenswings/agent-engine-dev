@@ -4,7 +4,7 @@ $.verbose = false;
 import { addOrUpdateEnvVariable, deepPrint, log, randomPort, readEnvVariable, uuid } from "../utils/utils.js";
 import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber, ServiceImage, Timestamp, Version, DeviceName, InstanceName, AppName, Hostname, DiskID } from "./CommonTypes.js";
 import { Store, getDisk, getEngine, getLocalEngine, getInstancesOfEngine, } from "./Store.js";
-import { Disk } from "./Disk.js";
+import { Disk, diskMountRoot, diskFsRoot } from "./Disk.js";
 import { localEngineId } from "./Engine.js";
 import { network } from "./Network.js";
 import { createAppId } from "./App.js";
@@ -231,7 +231,7 @@ export const extractAppName = (instanceId: InstanceID): InstanceName => {
 export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, instanceId: InstanceID, disk: Disk): Promise<Instance | undefined> => {
   let instance: Instance
   try {
-    const composeFile = await $`cat /disks/${disk.device}/instances/${instanceId}/compose.yaml`
+    const composeFile = await $`cat ${await diskMountRoot(disk)}/instances/${instanceId}/compose.yaml`
     const compose = YAML.parse(composeFile.stdout)
     const services = Object.keys(compose.services)
     const servicesImages = services.map(service => compose.services[service].image)
@@ -330,9 +330,10 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 
   try {
 
+    const mountRoot = await diskMountRoot(disk)
     // Create an empty .env file if it does not yet exist
-    if (!fs.existsSync(`/disks/${disk.device}/instances/${instance.id}/.env`)) {
-      await $`touch /disks/${disk.device}/instances/${instance.id}/.env`
+    if (!fs.existsSync(`${mountRoot}/instances/${instance.id}/.env`)) {
+      await $`touch ${mountRoot}/instances/${instance.id}/.env`
     }
 
     // **************************
@@ -361,7 +362,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
       log(`Trying to find a port number for instance ${instance.id} in the .env file`)
       // const envContent = (await $`cat /disks/${disk.device}/instances/${instance.id}/.env`).stdout
       // port = parseInt(envContent.split('=')[1].slice(0, -1)) as PortNumber
-      port = parseInt(await readEnvVariable(`/disks/${disk.device}/instances/${instance.id}/.env`, 'port') as string) as PortNumber
+      port = parseInt(await readEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'port') as string) as PortNumber
     } catch (e) {
       log(`No .env file found for instance ${instance.id}`)
     }
@@ -389,8 +390,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
         } else {
           port = await createPortNumber(store)
           // Write the new port number to the .env file
-          // await $`echo "port=${port}" > /disks/${disk.device}/instances/${instance.id}/.env`
-          await addOrUpdateEnvVariable(`/disks/${disk.device}/instances/${instance.id}/.env`, 'port', port.toString())
+          await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'port', port.toString())
         }
       } else {
         log(`Port ${port} is not in use`)
@@ -408,8 +408,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
         port = await createPortNumber(store)
       }
       // Write a .env file in which you define the port variable
-      // await $`echo "port=${port}" > /disks/${disk.device}/instances/${instance.id}/.env`  
-      await addOrUpdateEnvVariable(`/disks/${disk.device}/instances/${instance.id}/.env`, 'port', port.toString())
+      await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'port', port.toString())
     }
 
     console.log(`Found a port number for instance ${instance.id}: ${port}`)
@@ -428,7 +427,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     // Check if the pass is already defined in the .env file
     try {
       log(`Trying to find a pass for instance ${instance.id} in the .env file`)
-      pass = await readEnvVariable(`/disks/${disk.device}/instances/${instance.id}/.env`, 'pass') as string
+      pass = await readEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'pass') as string
     } catch (e) {
       log(`No .env file found for instance ${instance.id}`)
     }
@@ -440,7 +439,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
       pass = await uuid()
       log(`Generated pass: ${pass}`)
       // Write the password to the .env file
-      await addOrUpdateEnvVariable(`/disks/${disk.device}/instances/${instance.id}/.env`, 'pass', pass)
+      await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'pass', pass)
     }
 
 
@@ -452,7 +451,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     // Extract the service images of the services from the compose file, and pull them
     // Open the compose.yaml file of the app instance
     log(`Reading and parsing the compose.yaml file of the app instance`)
-    const composeFile = await $`cat /disks/${disk.device}/instances/${instance.id}/compose.yaml`
+    const composeFile = await $`cat ${mountRoot}/instances/${instance.id}/compose.yaml`
     const compose = YAML.parse(composeFile.stdout)
     const services = compose.services
     if (!config.settings.testMode) {
@@ -460,7 +459,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
       for (const serviceName in services) {
         const serviceImage = services[serviceName].image
         log(`Loading the service image ${serviceImage} from the saved tar file`)
-        await $`docker image load < /disks/${disk.device}/services/${serviceImage.replace(/\//g, '_')}.tar`
+        await $`docker image load < ${mountRoot}/services/${serviceImage.replace(/\//g, '_')}.tar`
       }
     } else {
       // In testMode: no tar files in fixtures — Docker pulls the image at create time if not cached
@@ -618,6 +617,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 
 export const createInstanceContainers = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk) => {
   const store: Store = storeHandle.doc()
+  const mountRoot = await diskMountRoot(disk)
   try {
     log(`Creating the containers for the services of the app instance`)
 
@@ -629,7 +629,7 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
       const localEngine = getLocalEngine(store)
       const hostname = localEngine.hostname
       if (hostname) {
-        await addOrUpdateEnvVariable(`/disks/${disk.device}/instances/${instance.id}/.env`, 'hostname', hostname)
+        await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'hostname', hostname)
       }
 
       // Pass the ip address to the compose file via .env
@@ -637,8 +637,7 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
       const ip = interfaceData["eth0"]?.find((iface) => iface.family === "IPv4")?.address
       if (ip) {
         log(`Found IP address ${ip} for instance ${instance.id}`)
-        // await $`echo "ip=${ip}" >> /disks/${disk.device}/instances/${instance.id}/.env`
-        await addOrUpdateEnvVariable(`/disks/${disk.device}/instances/${instance.id}/.env`, 'ip', ip)
+        await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'ip', ip)
       } else {
         log(chalk.red(`No IP address found for instance ${instance.id}`))
       }
@@ -653,7 +652,7 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
     }
 
     log(`Creating containers of app instance '${instance.id}' on disk ${disk.id} of engine ${localEngineId}.`)
-    await $`cd /disks/${disk.device}/instances/${instance.id} && docker compose create`
+    await $`cd ${mountRoot}/instances/${instance.id} && docker compose create`
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
       inst.status = 'Pauzed' as Status
@@ -683,7 +682,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
     // Split using '=' and take the second element
     // Also remove the newline at the end
     //const port = envContent.split('=')[1].slice(0, -1)
-    const port = await readEnvVariable(`/disks/${disk.device}/instances/${instance.id}/.env`, 'port')
+    const port = await readEnvVariable(`${await diskMountRoot(disk)}/instances/${instance.id}/.env`, 'port')
     console.log(`Ports: ${deepPrint(port)}`)
     if (port) {
       const parsedPort = parseInt(port)
@@ -728,7 +727,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
     })
 
     // Compose up the app
-    await $`cd /disks/${disk.device}/instances/${instance.id} && docker compose up -d`
+    await $`cd ${await diskMountRoot(disk)}/instances/${instance.id} && docker compose up -d`
     // Modify the dockerMetrics of the instance
     // instance.dockerMetrics = {
     //   memory: os.totalmem().toString(),
@@ -749,7 +748,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
     //    find the IP address of the server and store it in IPADDRESS
     //    issue the following command: runuser --user www-data -- php occ config:app:set --value=http://<${PADDRESS}:9980 richdocuments wopi_url
     const app = store.appDB[instance.instanceOf]
-    const ip = await readEnvVariable(`/disks/${disk.device}/instances/${instance.id}/.env`, 'ip')
+    const ip = await readEnvVariable(`${await diskMountRoot(disk)}/instances/${instance.id}/.env`, 'ip')
     if (app && app.name === 'nextcloud') {
       if (ip) {
         try {

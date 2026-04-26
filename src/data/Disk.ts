@@ -165,7 +165,7 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
     // System disk: root partition of the Pi itself, mounted at /.
     // Apps and instances live at /apps/<id> and /instances/<id>.
     // Must be checked first so it is not misidentified as an empty disk.
-    if (isSystemDisk(disk)) {
+    if (await isSystemDisk(disk)) {
         log(`Disk ${disk.id} is the system disk`)
         detectedTypes.push('system')
         await processSystemDisk(storeHandle, disk)
@@ -210,22 +210,51 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
 }
 
 /**
- * A system disk is the root partition of the Pi itself.
- * It is pre-identified by usbDeviceMonitor (via findmnt) and has no
- * /disks/<device> mount point — its effective mount root is /.
- * We detect it here by the absence of the /disks/<device> directory.
+ * A system disk is the root partition of the Pi itself (sda2 on IDEA Pis).
+ *
+ * Detection: compare the disk device name against the device that is mounted
+ * at /. We use `findmnt / -no SOURCE` which returns e.g. `/dev/sda2`, then
+ * strip `/dev/` to get just the device name.
+ *
+ * This is robust in all environments:
+ *   - Production Pi: root is /dev/sda2 → isSystemDisk('sda2') === true
+ *   - Test fixtures:  /disks/test-xxx exists but is not the root device → false
+ *   - Non-disk ids (no device):  returns false immediately
  */
-export const isSystemDisk = (disk: Disk): boolean => {
+let _rootDevice: string | null = null
+const getRootDevice = async (): Promise<string> => {
+    if (_rootDevice) return _rootDevice
+    try {
+        const src = (await $`findmnt / -no SOURCE`).stdout.trim()  // e.g. /dev/sda2
+        _rootDevice = src.replace(/^\/dev\//, '')                   // e.g. sda2
+    } catch {
+        _rootDevice = ''
+    }
+    return _rootDevice
+}
+
+export const isSystemDisk = async (disk: Disk): Promise<boolean> => {
     if (!disk.device) return false
-    return !fs.existsSync(`/disks/${disk.device}`)
+    const rootDev = await getRootDevice()
+    return disk.device === rootDev
 }
 
 /**
- * Returns the filesystem root for a disk's app/instance directories.
- * Regular app disks mount at /disks/<device>; the system disk mounts at /.
+ * Returns the path prefix for a disk's app/instance/services directories.
+ * System disk: '' (so paths become /apps/…, /instances/…)
+ * Regular disk: '/disks/<device>'
  */
-export const diskMountRoot = (disk: Disk): string => {
-    return isSystemDisk(disk) ? '' : `/disks/${disk.device}`
+export const diskMountRoot = async (disk: Disk): Promise<string> => {
+    return (await isSystemDisk(disk)) ? '' : `/disks/${disk.device}`
+}
+
+/**
+ * Returns the filesystem root for free-space checks and similar operations
+ * that need the actual mount point.
+ * System disk: '/'   Regular disk: '/disks/<device>'
+ */
+export const diskFsRoot = async (disk: Disk): Promise<string> => {
+    return (await isSystemDisk(disk)) ? '/' : `/disks/${disk.device}`
 }
 
 /**
@@ -253,11 +282,11 @@ export const processSystemDisk = async (storeHandle: DocHandle<Store>, disk: Dis
     }
 
     // Remove apps no longer on disk
-    storedApps.forEach(storedApp => {
+    for (const storedApp of storedApps) {
         if (!actualApps.some(a => a.id === storedApp.id)) {
-            removeApp(store, disk, storedApp.id)
+            await removeApp(store, disk, storedApp.id)
         }
-    })
+    }
 
     // Instances
     const storedInstances = getInstancesOfDisk(store, disk)
@@ -368,7 +397,7 @@ export const processSystemInstance = async (storeHandle: DocHandle<Store>, disk:
 export const isAppDisk = async (disk: Disk): Promise<boolean> => {
     // Check if the disk has an apps folder
     try {
-        await $`test -d /disks/${disk.device}/apps`;
+        await $`test -d ${await diskMountRoot(disk)}/apps`;
         return true;
     } catch {
         return false;
@@ -377,7 +406,7 @@ export const isAppDisk = async (disk: Disk): Promise<boolean> => {
 
 export const isBackupDisk = async (disk: Disk): Promise<boolean> => {
     try {
-        await $`test -f /disks/${disk.device}/BACKUP.yaml`
+        await $`test -f ${await diskMountRoot(disk)}/BACKUP.yaml`
         return true
     } catch {
         return false
@@ -405,11 +434,13 @@ export const processAppDisk = async (storeHandle: DocHandle<Store>, disk: Disk):
     const storedApps = getAppsOfDisk(store, disk)
     const actualApps: App[] = []
 
-    // Call processApp for each folder found in /disks/diskName/apps
+    const mountRoot = await diskMountRoot(disk)
+
+    // Call processApp for each folder found in <mountRoot>/apps
     // First check if it has an apps folder
-    if (await $`test -d /disks/${disk.device}/apps`.then(() => true).catch(() => false)) {
+    if (await $`test -d ${mountRoot}/apps`.then(() => true).catch(() => false)) {
         log(`Apps folder found on disk ${disk.id}`)
-        const appIds = (await $`ls /disks/${disk.device}/apps`).stdout.split('\n')
+        const appIds = (await $`ls ${mountRoot}/apps`).stdout.split('\n')
         log(`App ids found on disk ${disk.id}: ${appIds}`)
         for (let appId of appIds) {
             if (!(appId === "") && !(disk.device == null)) {
@@ -425,22 +456,19 @@ export const processAppDisk = async (storeHandle: DocHandle<Store>, disk: Disk):
     log(`Stored apps: ${storedApps.map(app => app.id)}`)
 
     // Remove apps that are no longer on disk
-    storedApps.forEach((storedApp) => {
-        // if (!actualApps.includes(storedApp)) {
-        //     removeApp(store, disk, storedApp.id)
-        // }
+    for (const storedApp of storedApps) {
         if (!actualApps.some(actualApp => actualApp.id === storedApp.id)) {
-            removeApp(store, disk, storedApp.id)
+            await removeApp(store, disk, storedApp.id)
         }
-    })
+    }
 
     // Instances
     const storedInstances = getInstancesOfDisk(store, disk)
     const actualInstances: Instance[] = []
 
-    // Call processInstance for each folder found in /instances
-    if (await $`test -d /disks/${disk.device}/instances`.then(() => true).catch(() => false)) {
-        const instanceIds = (await $`ls /disks/${disk.device}/instances`).stdout.split('\n')
+    // Call processInstance for each folder found in <mountRoot>/instances
+    if (await $`test -d ${mountRoot}/instances`.then(() => true).catch(() => false)) {
+        const instanceIds = (await $`ls ${mountRoot}/instances`).stdout.split('\n')
         log(`Instance Ids found on disk ${disk.id}: ${instanceIds}`)
         for (let instanceId of instanceIds) {
             if (!(instanceId === "")) {
@@ -474,7 +502,7 @@ export const processApp = async (storeHandle: DocHandle<Store>, disk: Disk, appI
 }
 
 
-export const removeApp = (store: Store, disk: Disk, appId: AppID): void => {
+export const removeApp = async (store: Store, disk: Disk, appId: AppID): Promise<void> => {
     log(`App ${appId} no longer found on disk ${disk.id}`)
     // There is nothing that we need to do as we do not record on which disks Apps are stored
     // However,  we need to check if there are instances of this app on the disk and signal an error if this is the case
@@ -482,7 +510,7 @@ export const removeApp = (store: Store, disk: Disk, appId: AppID): void => {
     //   If it is, then this is an error and we should log an error message as the Instance will fail to start
     const instance = getInstancesOfDisk(store, disk).find(instance => instance.instanceOf === appId)
     // Check if the instance is still physically on the file system of the disk and signal an error
-    if (instance && fs.existsSync(`/disks/${disk.device}/instances/${instance.id}`)) {
+    if (instance && fs.existsSync(`${await diskMountRoot(disk)}/instances/${instance.id}`)) {
         log(`Error: Instance ${instance.id} of app ${appId} is still physically on the disk ${disk.id} but the app is being removed. This is an error and should not happen.`)
     }
 }

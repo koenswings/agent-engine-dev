@@ -15,7 +15,7 @@ import {
     OperationKind
 } from './CommonTypes.js'
 import { Store, findDiskByName, getDisk, getInstance, getInstancesOfDisk } from './Store.js'
-import { Disk, processInstance } from './Disk.js'
+import { Disk, processInstance, diskMountRoot, diskFsRoot } from './Disk.js'
 import { stopInstance, startInstance } from './Instance.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { uuid } from '../utils/utils.js'
@@ -87,8 +87,9 @@ const validate = async (
     const sourceDevice = sourceDisk.device
     const targetDevice = targetDisk.device
 
-    // Locate app master: /disks/<src>/apps/<appId>/
-    const appsDir = `/disks/${sourceDevice}/apps`
+    // Locate app master: <mountRoot>/apps/<appId>/
+    const sourceMountRoot = await diskMountRoot(sourceDisk)
+    const appsDir = `${sourceMountRoot}/apps`
     let appId: string | null = null
     if (await fs.pathExists(appsDir)) {
         const entries = await fs.readdir(appsDir)
@@ -98,8 +99,8 @@ const validate = async (
     }
     if (!appId) return `App master for '${instance.instanceOf}' not found on source disk`
 
-    const appMasterSrc = `/disks/${sourceDevice}/apps/${appId}`
-    const instanceSrc = `/disks/${sourceDevice}/instances/${instance.id}`
+    const appMasterSrc = `${sourceMountRoot}/apps/${appId}`
+    const instanceSrc = `${sourceMountRoot}/instances/${instance.id}`
 
     if (!await fs.pathExists(appMasterSrc)) return `App master directory not found: ${appMasterSrc}`
     if (!await fs.pathExists(instanceSrc)) return `Instance directory not found: ${instanceSrc}`
@@ -157,7 +158,7 @@ export const copyApp = async (
 
         // 2. Check free space
         const needed = await directoryBytes(appMasterSrc) + await directoryBytes(instanceSrc)
-        const available = await availableBytes(`/disks/${targetDevice}`)
+        const available = await availableBytes(await diskFsRoot(targetDisk))
         if (available < needed) {
             throw new Error(
                 `Not enough space on '${targetDiskName}': need ${Math.ceil(needed / 1024 / 1024)}MB, ` +
@@ -166,12 +167,13 @@ export const copyApp = async (
         }
 
         // 3. Ensure target directory structure
-        await fs.ensureDir(`/disks/${targetDevice}/apps`)
-        await fs.ensureDir(`/disks/${targetDevice}/instances`)
-        await fs.ensureDir(`/disks/${targetDevice}/services`)
+        const targetMountRoot = await diskMountRoot(targetDisk)
+        await fs.ensureDir(`${targetMountRoot}/apps`)
+        await fs.ensureDir(`${targetMountRoot}/instances`)
+        await fs.ensureDir(`${targetMountRoot}/services`)
 
         // 4. rsync app master (idempotent — skips if already present and identical)
-        const appMasterDest = `/disks/${targetDevice}/apps/${appId}`
+        const appMasterDest = `${targetMountRoot}/apps/${appId}`
         log(`copyApp: syncing app master ${appMasterSrc} → ${appMasterDest}`)
         await rsyncDirectory(appMasterSrc, appMasterDest, ({ progressPercent }) => {
             // app master typically small — report first half of progress
@@ -179,7 +181,7 @@ export const copyApp = async (
         })
 
         // 5. rsync instance data into a NEW instance directory (new ID)
-        const instanceDest = `/disks/${targetDevice}/instances/${newInstanceId}`
+        const instanceDest = `${targetMountRoot}/instances/${newInstanceId}`
         await fs.ensureDir(instanceDest)
         log(`copyApp: syncing instance data ${instanceSrc} → ${instanceDest}`)
         await rsyncDirectory(instanceSrc, instanceDest, ({ progressPercent }) => {
@@ -272,7 +274,7 @@ export const moveApp = async (
 
         // 2. Check free space
         const needed = await directoryBytes(appMasterSrc) + await directoryBytes(instanceSrc)
-        const available = await availableBytes(`/disks/${targetDevice}`)
+        const available = await availableBytes(await diskFsRoot(targetDisk))
         if (available < needed) {
             throw new Error(
                 `Not enough space on '${targetDiskName}': need ${Math.ceil(needed / 1024 / 1024)}MB, ` +
@@ -281,19 +283,20 @@ export const moveApp = async (
         }
 
         // 3. Ensure target directory structure
-        await fs.ensureDir(`/disks/${targetDevice}/apps`)
-        await fs.ensureDir(`/disks/${targetDevice}/instances`)
-        await fs.ensureDir(`/disks/${targetDevice}/services`)
+        const targetMountRoot = await diskMountRoot(targetDisk)
+        await fs.ensureDir(`${targetMountRoot}/apps`)
+        await fs.ensureDir(`${targetMountRoot}/instances`)
+        await fs.ensureDir(`${targetMountRoot}/services`)
 
         // 4. rsync app master
-        const appMasterDest = `/disks/${targetDevice}/apps/${appId}`
+        const appMasterDest = `${targetMountRoot}/apps/${appId}`
         log(`moveApp: syncing app master ${appMasterSrc} → ${appMasterDest}`)
         await rsyncDirectory(appMasterSrc, appMasterDest, ({ progressPercent }) => {
             updateOperation(storeHandle, opId, { progressPercent: Math.round(progressPercent * 0.4) })
         })
 
         // 5. rsync instance data — same instance ID, new location
-        const instanceDest = `/disks/${targetDevice}/instances/${instance.id}`
+        const instanceDest = `${targetMountRoot}/instances/${instance.id}`
         await fs.ensureDir(instanceDest)
         log(`moveApp: syncing instance data ${instanceSrc} → ${instanceDest}`)
         await rsyncDirectory(instanceSrc, instanceDest, ({ progressPercent }) => {
