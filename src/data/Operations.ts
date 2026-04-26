@@ -10,6 +10,7 @@
  */
 
 import { chalk } from 'zx'
+import { ChildProcess } from 'child_process'
 import { log } from '../utils/utils.js'
 import {
     EngineID, Timestamp,
@@ -80,15 +81,35 @@ export const updateOperation = (
     })
 }
 
+// ── Active process registry ──────────────────────────────────────────────
+
+/**
+ * Maps operationId → the rsync ChildProcess currently running for it.
+ * Populated by rsyncDirectory when an opId is provided; cleared on close/error.
+ * Used by cancelOperation to SIGTERM in-flight rsyncs (Phase 2).
+ */
+const _activeProcesses = new Map<string, ChildProcess>()
+
+export const registerProcess = (opId: string, proc: ChildProcess): void => {
+    _activeProcesses.set(opId, proc)
+    log(`registerProcess: registered process for op ${opId} (pid ${proc.pid})`)
+}
+
+export const deregisterProcess = (opId: string): void => {
+    _activeProcesses.delete(opId)
+    log(`deregisterProcess: cleared process for op ${opId}`)
+}
+
 // ── Cancel operation ────────────────────────────────────────────────────────
 
 /**
  * Cancel an operation by ID.
  *
- * Phase 1 behaviour:
- *  - Pending: splice the matching command from engine.commands[], mark Cancelled
- *  - Failed:  mark Cancelled (lock already released at failure time)
- *  - Running: return an error message — Phase 2 (SIGTERM) not yet implemented
+ * Behaviour:
+ *  - Pending:   splice the matching command from engine.commands[], mark Cancelled
+ *  - Running:   SIGTERM the registered rsync process, mark Cancelled (process close handler
+ *               fires the rejection which the operation try/catch handles)
+ *  - Failed:    mark Cancelled (lock already released at failure time)
  *  - Done / Cancelled: no-op
  *
  * Returns an error string on failure, undefined on success.
@@ -107,7 +128,23 @@ export const cancelOperation = (
     }
 
     if (op.status === 'Running') {
-        return `Operation '${opId}' is Running — cancellation of in-progress operations is not yet supported (Phase 2)`
+        const proc = _activeProcesses.get(opId)
+        if (!proc) {
+            return `Operation '${opId}' is Running but no cancellable process is registered — it may be in a non-rsync phase`
+        }
+        log(`cancelOperation: sending SIGTERM to pid ${proc.pid} for op ${opId}`)
+        proc.kill('SIGTERM')
+        // Mark Cancelled immediately — the process close handler will reject the rsync
+        // promise, which the operation try/catch will catch (status is already Cancelled).
+        storeHandle.change(doc => {
+            const o = doc.operationDB?.[opId]
+            if (o) {
+                o.status = 'Cancelled' as OperationStatus
+                o.completedAt = Date.now() as Timestamp
+            }
+        })
+        log(`cancelOperation: op ${opId} (${op.kind}) marked Cancelled (SIGTERM sent)`)
+        return undefined
     }
 
     // Pending: remove from the engine command queue

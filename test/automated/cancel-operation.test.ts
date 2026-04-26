@@ -8,12 +8,12 @@
  *  - Done/Cancelled op: no-op
  */
 
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { Repo, DocHandle } from '@automerge/automerge-repo'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import { DiskID, EngineID, OperationStatus, Timestamp } from '../../src/data/CommonTypes.js'
-import { cancelOperation } from '../../src/data/Operations.js'
+import { cancelOperation, registerProcess } from '../../src/data/Operations.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -100,15 +100,30 @@ describe('cancelOperation', () => {
         expect(queue).toHaveLength(0)
     })
 
-    it('returns an error for a Running op (Phase 2 not yet implemented)', async () => {
+    it('returns an error for a Running op with no registered process', async () => {
         const { handle } = await makeStore()
-        const opId = 'op-running-1'
+        const opId = 'op-running-no-proc'
         addOp(handle, opId, 'Running')
 
         const err = cancelOperation(handle, opId)
-        expect(err).toMatch(/Running/)
-        // Status should be unchanged
+        expect(err).toMatch(/no cancellable process/)
         expect(handle.doc()!.operationDB[opId].status).toBe('Running')
+    })
+
+    it('SIGTERMs the registered process and marks Running op as Cancelled', async () => {
+        const { handle } = await makeStore()
+        const opId = 'op-running-with-proc'
+        addOp(handle, opId, 'Running')
+
+        // Register a mock process
+        const mockProc = { pid: 99999, kill: vi.fn() } as any
+        registerProcess(opId, mockProc)
+
+        const err = cancelOperation(handle, opId)
+        expect(err).toBeUndefined()
+        expect(mockProc.kill).toHaveBeenCalledWith('SIGTERM')
+        expect(handle.doc()!.operationDB[opId].status).toBe('Cancelled')
+        expect(handle.doc()!.operationDB[opId].completedAt).toBeGreaterThan(0)
     })
 
     it('is a no-op for a Done op', async () => {

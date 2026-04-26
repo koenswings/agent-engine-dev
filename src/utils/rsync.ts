@@ -8,8 +8,9 @@
  */
 
 import { chalk } from 'zx'
-import { spawn } from 'child_process'
+import { spawn, ChildProcess } from 'child_process'
 import { log } from './utils.js'
+import { registerProcess, deregisterProcess } from '../data/Operations.js'
 
 export interface RsyncProgress {
     progressPercent: number
@@ -31,7 +32,8 @@ export type RsyncProgressCallback = (progress: RsyncProgress) => void
 export const rsyncDirectory = (
     src: string,
     dest: string,
-    onProgress?: RsyncProgressCallback
+    onProgress?: RsyncProgressCallback,
+    opId?: string
 ): Promise<void> => {
     return new Promise((resolve, reject) => {
         // Ensure src has trailing slash so rsync copies contents, not the directory itself
@@ -48,6 +50,7 @@ export const rsyncDirectory = (
         log(`rsync ${args.join(' ')}`)
 
         const proc = spawn('rsync', args)
+        if (opId) registerProcess(opId, proc)
 
         let stderr = ''
 
@@ -68,16 +71,20 @@ export const rsyncDirectory = (
             stderr += chunk.toString()
         })
 
-        proc.on('close', (code) => {
+        proc.on('close', (code, signal) => {
+            if (opId) deregisterProcess(opId)
             if (code === 0) {
                 if (onProgress) onProgress({ progressPercent: 100 })
                 resolve()
+            } else if (signal === 'SIGTERM') {
+                reject(new Error(`rsync cancelled (SIGTERM)`))
             } else {
                 reject(new Error(`rsync exited with code ${code}: ${stderr.trim()}`))
             }
         })
 
         proc.on('error', (err) => {
+            if (opId) deregisterProcess(opId)
             reject(new Error(`rsync spawn error: ${err.message}`))
         })
     })
