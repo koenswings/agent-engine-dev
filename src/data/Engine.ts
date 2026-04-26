@@ -624,12 +624,12 @@ export const installPm2 = async (exec: any, enginePath: string) => {
 
 export const installEnginePM2 = async (exec: any, enginePath: string) => {
   console.log(chalk.blue('Installing the engine...'))
-  await exec`cd ${enginePath} && sudo pnpm install_packages`
+  await exec`cd ${enginePath} && pnpm install_packages`
 }
 
 export const buildEnginePM2 = async (exec: any, enginePath: string) => {
   console.log(chalk.blue('Building the engine with tsc...'))
-  await exec`cd ${enginePath} && sudo pnpm build`
+  await exec`cd ${enginePath} && pnpm build`
 }
 
 export const startEnginePM2 = async (exec: any, enginePath: string, permanentEnginePath: string, productionMode: boolean) => {
@@ -645,15 +645,25 @@ export const startEnginePM2 = async (exec: any, enginePath: string, permanentEng
         await exec`sudo chown pi:pi ${permanentEnginePath}/pm2.config.cjs`
       }
 
+      // Run pm2 as the pi user (no sudo) so the engine process is owned by pi.
       if (productionMode) {
-        await exec`cd ${permanentEnginePath} && sudo pm2 start pm2.config.cjs --env production`
+        await exec`cd ${permanentEnginePath} && pm2 start pm2.config.cjs --env production`
       } else {
-        await exec`cd ${permanentEnginePath} && sudo pm2 start pm2.config.cjs --env development`
+        await exec`cd ${permanentEnginePath} && pm2 start pm2.config.cjs --env development`
       }
       console.log(chalk.blue('Saving the pm2 process list...'))
-      await exec`cd ${permanentEnginePath} && sudo pm2 save`
+      await exec`pm2 save`
       console.log(chalk.blue('Enabling pm2 to start on boot...'))
-      await exec`cd ${permanentEnginePath} && sudo pm2 startup`
+      // Generate the startup command for the pi user and run it with sudo.
+      // pm2 startup outputs a line beginning with 'sudo env PATH=...' — extract and execute it.
+      const startupOutput = (await exec`pm2 startup systemd -u pi --hp /home/pi`).stdout
+      const startupCmd = startupOutput.split('\n').find((l: string) => l.trimStart().startsWith('sudo env PATH='))
+      if (startupCmd) {
+        await exec`${startupCmd.trim()}`
+      } else {
+        console.log(chalk.yellow('Could not extract pm2 startup command from output — run manually if needed'))
+        console.log(startupOutput)
+      }
     }
   } catch (e) {
     console.log(chalk.red('Error starting the engine with pm2'));

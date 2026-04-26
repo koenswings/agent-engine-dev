@@ -7,6 +7,7 @@ $.verbose = false;
 import { Disk, createOrUpdateDisk, processDisk } from '../data/Disk.js'
 import { findDiskByDevice, Store, getDisksOfEngine, getLocalEngine } from '../data/Store.js'
 import { DeviceName, DiskID, DiskName, InstanceID, Timestamp } from '../data/CommonTypes.js'
+
 import { Instance, Status, stopInstance } from '../data/Instance.js';
 import { config } from '../data/Config.js'
 import { DocHandle } from '@automerge/automerge-repo';
@@ -26,27 +27,25 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         throw new Error(`No local engine found in the store`)
     }
 
-    // Detect the root partition (e.g. sda2) at startup so we can handle it as a system disk
-    // and skip the whole-disk device (e.g. sda) and boot partition (e.g. sda1).
+    // Detect the root partition (e.g. sda2) at startup so we can:
+    //   - register it as a system disk
+    //   - skip the whole-disk parent (e.g. sda) and the boot partition (e.g. sda1)
+    // findmnt reads procfs — safe to run in all modes, no sudo needed.
     let systemDevice: DeviceName | null = null
-    let systemParentDevice: string | null = null  // e.g. 'sda' — the whole-disk entry to skip
-    let systemBootDevice: string | null = null   // e.g. 'sda1' — the boot partition to skip
-    if (!config.settings.testMode && !config.settings.isDev) {
-        try {
-            const rootSource = (await $`findmnt -n -o SOURCE /`).stdout.trim()
-            // rootSource is e.g. /dev/sda2 — strip the /dev/ prefix
-            const rootDev = rootSource.replace('/dev/', '') as DeviceName
-            if (rootDev.match(/^sd[a-z][0-9]+$/)) {
-                systemDevice = rootDev
-                // Parent is the disk without trailing partition digit(s), e.g. sda2 → sda
-                systemParentDevice = rootDev.replace(/[0-9]+$/, '')
-                // Boot partition is parent + '1', e.g. sda1
-                systemBootDevice = systemParentDevice + '1'
-                log(`System disk detected: root=${systemDevice}, parent=${systemParentDevice}, boot=${systemBootDevice}`)
-            }
-        } catch (e) {
-            log(`Could not detect system device: ${e}`)
+    let systemBootDevice: DeviceName | null = null   // e.g. 'sda1' — the boot partition to skip
+    try {
+        const rootSource = (await $`findmnt -n -o SOURCE /`).stdout.trim()
+        // rootSource is e.g. /dev/sda2 — strip the /dev/ prefix
+        const rootDev = rootSource.replace('/dev/', '') as DeviceName
+        if (rootDev.match(/^sd[a-z][0-9]+$/)) {
+            systemDevice = rootDev
+            // Boot partition is parent (strip trailing digits) + '1', e.g. sda2 → sda1
+            const parentDev = rootDev.replace(/[0-9]+$/, '')
+            systemBootDevice = (parentDev + '1') as DeviceName
+            log(`System disk detected: root=${systemDevice}, boot=${systemBootDevice}`)
         }
+    } catch (e) {
+        log(`Could not detect system device via findmnt: ${e}`)
     }
 
     const validDevice = function (device: string): boolean {
@@ -62,14 +61,17 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         if (validDevice(device)) {
             log(`The disk on device ${device} has a valid device name`)
 
-            // Skip the whole-disk entry (e.g. sda) and boot partition (e.g. sda1) —
-            // these are never useful for app storage.
-            if (systemParentDevice && device === systemParentDevice) {
-                log(`Device ${device} is the system disk's parent device — skipping`)
+            // Skip whole-disk entries (e.g. sda, sdb) — raw block devices with no
+            // filesystem; never directly mountable.
+            if (device.match(/^sd[a-z]$/)) {
+                log(`Device ${device} is a whole-disk entry — skipping`)
                 return
             }
+
+            // Skip the OS boot partition (e.g. sda1 on most Pis, but derived from
+            // the actual root device so it works regardless of disk letter).
             if (systemBootDevice && device === systemBootDevice) {
-                log(`Device ${device} is the system disk's boot partition — skipping`)
+                log(`Device ${device} is the OS boot partition — skipping`)
                 return
             }
 
@@ -81,7 +83,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                     log(`Device ${device} is the system disk (root partition) — registering as system disk`)
                     try {
                         const meta = await readMetaUpdateId()  // reads /META.yaml, no device arg
-                        const disk: Disk = createOrUpdateDisk(storeHandle, localEngine.id, device, meta.diskId, meta.diskName, meta.created)
+                        const disk: Disk = createOrUpdateDisk(storeHandle, localEngine.id, device, meta.diskId, 'System Disk' as DiskName, meta.created)
                         await processDisk(storeHandle, disk)
                     } catch (e) {
                         log(`Error processing system disk: ${e}`)
