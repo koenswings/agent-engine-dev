@@ -3,7 +3,7 @@ import { Store, getApps, getDisks, getDisk, getRunningEngines, getInstances, get
 import { deepPrint } from "../utils/utils.js";
 import { buildInstance, startInstance, runInstance, stopInstance } from "./Instance.js";
 import { buildEngine, syncEngine, clearKnownHost, rebootEngine } from "./Engine.js";
-import { AppName, Command, DiskName, EngineID, Hostname, InstanceName, Version } from "./CommonTypes.js";
+import { AppName, Command, DiskID, DiskName, EngineID, Hostname, InstanceName, Version } from "./CommonTypes.js";
 import { localEngineId } from "./Engine.js";
 import { chalk, fs, $ } from "zx";
 import { ssh } from '../utils/ssh.js'
@@ -335,14 +335,14 @@ const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, dis
     console.log(chalk.green(`Backup Disk '${diskName}' configured.`))
 }
 
-const copyAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, sourceDiskName: DiskName, targetDiskName: DiskName) => {
+const copyAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, sourceDiskId: DiskID, targetDiskId: DiskID) => {
     if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
-    await copyApp(storeHandle, instanceName, sourceDiskName, targetDiskName)
+    await copyApp(storeHandle, instanceName, sourceDiskId, targetDiskId)
 }
 
-const moveAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, sourceDiskName: DiskName, targetDiskName: DiskName) => {
+const moveAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, sourceDiskId: DiskID, targetDiskId: DiskID) => {
     if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
-    await moveApp(storeHandle, instanceName, sourceDiskName, targetDiskName)
+    await moveApp(storeHandle, instanceName, sourceDiskId, targetDiskId)
 }
 
 const ejectDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskName: DiskName) => {

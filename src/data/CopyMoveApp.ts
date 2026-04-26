@@ -14,7 +14,7 @@ import {
     InstanceID, DiskID, DiskName, InstanceName, Timestamp,
     OperationKind
 } from './CommonTypes.js'
-import { Store, findDiskByName, getDisk, getInstance, getInstancesOfDisk } from './Store.js'
+import { Store, getDisk, getInstance, getInstancesOfDisk } from './Store.js'
 import { Disk, processInstance, diskMountRoot, diskFsRoot } from './Disk.js'
 import { stopInstance, startInstance } from './Instance.js'
 import { DocHandle } from '@automerge/automerge-repo'
@@ -61,27 +61,25 @@ interface ValidatedCopyMove {
 const validate = async (
     store: Store,
     instanceName: InstanceName,
-    sourceDiskName: DiskName,
-    targetDiskName: DiskName
+    sourceDiskId: DiskID,
+    targetDiskId: DiskID
 ): Promise<ValidatedCopyMove | string> => {
     // Look up instance — search all (not just Running) so we can copy stopped instances too
     const instance = Object.values(store.instanceDB).find(i => i.name === instanceName)
     if (!instance) return `Instance '${instanceName}' not found`
 
-    const sourceDisk = (findDiskByName(store, sourceDiskName)
-        ?? Object.values(store.diskDB).find(d => d.name === sourceDiskName)) as Disk | undefined
-    if (!sourceDisk) return `Source disk '${sourceDiskName}' not found`
-    if (!sourceDisk.device) return `Source disk '${sourceDiskName}' is not docked`
+    const sourceDisk = getDisk(store, sourceDiskId) as Disk | undefined
+    if (!sourceDisk) return `Source disk '${sourceDiskId}' not found`
+    if (!sourceDisk.device) return `Source disk '${sourceDiskId}' is not docked`
 
-    const targetDisk = (findDiskByName(store, targetDiskName)
-        ?? Object.values(store.diskDB).find(d => d.name === targetDiskName)) as Disk | undefined
-    if (!targetDisk) return `Target disk '${targetDiskName}' not found`
-    if (!targetDisk.device) return `Target disk '${targetDiskName}' is not docked`
+    const targetDisk = getDisk(store, targetDiskId) as Disk | undefined
+    if (!targetDisk) return `Target disk '${targetDiskId}' not found`
+    if (!targetDisk.device) return `Target disk '${targetDiskId}' is not docked`
 
     if (sourceDisk.id === targetDisk.id) return `Source and target disk are the same`
 
     if (instance.storedOn !== sourceDisk.id) {
-        return `Instance '${instanceName}' is not stored on disk '${sourceDiskName}'`
+        return `Instance '${instanceName}' is not stored on disk '${sourceDiskId}'`
     }
 
     const sourceDevice = sourceDisk.device
@@ -118,12 +116,12 @@ const validate = async (
 export const copyApp = async (
     storeHandle: DocHandle<Store>,
     instanceName: InstanceName,
-    sourceDiskName: DiskName,
-    targetDiskName: DiskName
+    sourceDiskId: DiskID,
+    targetDiskId: DiskID
 ): Promise<void> => {
     const store = storeHandle.doc()
 
-    const v = await validate(store, instanceName, sourceDiskName, targetDiskName)
+    const v = await validate(store, instanceName, sourceDiskId, targetDiskId)
     if (typeof v === 'string') {
         console.error(chalk.red(`copyApp: ${v}`))
         return
@@ -161,7 +159,7 @@ export const copyApp = async (
         const available = await availableBytes(await diskFsRoot(targetDisk))
         if (available < needed) {
             throw new Error(
-                `Not enough space on '${targetDiskName}': need ${Math.ceil(needed / 1024 / 1024)}MB, ` +
+                `Not enough space on disk '${targetDisk.name}' (${targetDisk.id}): need ${Math.ceil(needed / 1024 / 1024)}MB, ` +
                 `have ${Math.ceil(available / 1024 / 1024)}MB`
             )
         }
@@ -189,7 +187,7 @@ export const copyApp = async (
         })
 
         // 6. Register the new instance in the store and start it
-        log(`copyApp: registering new instance ${newInstanceId} on disk '${targetDiskName}'`)
+        log(`copyApp: registering new instance ${newInstanceId} on disk '${targetDisk.name}' (${targetDisk.id})`)
         await processInstance(storeHandle, targetDisk, newInstanceId)
 
         updateOperation(storeHandle, opId, {
@@ -197,7 +195,7 @@ export const copyApp = async (
             progressPercent: 100,
             completedAt: Date.now() as Timestamp,
         })
-        log(chalk.green(`copyApp: done — new instance ${newInstanceId} on '${targetDiskName}'`))
+        log(chalk.green(`copyApp: done — new instance ${newInstanceId} on '${targetDisk.name}' (${targetDisk.id})`))
 
     } catch (e: any) {
         updateOperation(storeHandle, opId, {
@@ -235,12 +233,12 @@ export const copyApp = async (
 export const moveApp = async (
     storeHandle: DocHandle<Store>,
     instanceName: InstanceName,
-    sourceDiskName: DiskName,
-    targetDiskName: DiskName
+    sourceDiskId: DiskID,
+    targetDiskId: DiskID
 ): Promise<void> => {
     const store = storeHandle.doc()
 
-    const v = await validate(store, instanceName, sourceDiskName, targetDiskName)
+    const v = await validate(store, instanceName, sourceDiskId, targetDiskId)
     if (typeof v === 'string') {
         console.error(chalk.red(`moveApp: ${v}`))
         return
@@ -277,7 +275,7 @@ export const moveApp = async (
         const available = await availableBytes(await diskFsRoot(targetDisk))
         if (available < needed) {
             throw new Error(
-                `Not enough space on '${targetDiskName}': need ${Math.ceil(needed / 1024 / 1024)}MB, ` +
+                `Not enough space on disk '${targetDisk.name}' (${targetDisk.id}): need ${Math.ceil(needed / 1024 / 1024)}MB, ` +
                 `have ${Math.ceil(available / 1024 / 1024)}MB`
             )
         }
@@ -304,7 +302,7 @@ export const moveApp = async (
         })
 
         // 6. Register on target disk (updates storedOn, starts instance)
-        log(`moveApp: registering instance ${instance.id} on disk '${targetDiskName}'`)
+        log(`moveApp: registering instance ${instance.id} on disk '${targetDisk.name}' (${targetDisk.id})`)
         await processInstance(storeHandle, targetDisk, instance.id)
 
         // 7. Mark source disk's record of this instance as Missing in store.
@@ -337,7 +335,7 @@ export const moveApp = async (
             progressPercent: 100,
             completedAt: Date.now() as Timestamp,
         })
-        log(chalk.green(`moveApp: done — instance ${instance.id} moved to '${targetDiskName}'`))
+        log(chalk.green(`moveApp: done — instance ${instance.id} moved to '${targetDisk.name}' (${targetDisk.id})`))
 
     } catch (e: any) {
         updateOperation(storeHandle, opId, {
