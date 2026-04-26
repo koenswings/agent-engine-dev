@@ -176,7 +176,7 @@ export const copyApp = async (
         await rsyncDirectory(appMasterSrc, appMasterDest, ({ progressPercent }) => {
             // app master typically small — report first half of progress
             updateOperation(storeHandle, opId, { progressPercent: Math.round(progressPercent * 0.4) })
-        })
+        }, opId)
 
         // 5. rsync instance data into a NEW instance directory (new ID)
         const instanceDest = `${targetMountRoot}/instances/${newInstanceId}`
@@ -184,7 +184,7 @@ export const copyApp = async (
         log(`copyApp: syncing instance data ${instanceSrc} → ${instanceDest}`)
         await rsyncDirectory(instanceSrc, instanceDest, ({ progressPercent }) => {
             updateOperation(storeHandle, opId, { progressPercent: 40 + Math.round(progressPercent * 0.55) })
-        })
+        }, opId)
 
         // 6. Register the new instance in the store and start it
         log(`copyApp: registering new instance ${newInstanceId} on disk '${targetDisk.name}' (${targetDisk.id})`)
@@ -198,11 +198,15 @@ export const copyApp = async (
         log(chalk.green(`copyApp: done — new instance ${newInstanceId} on '${targetDisk.name}' (${targetDisk.id})`))
 
     } catch (e: any) {
-        updateOperation(storeHandle, opId, {
-            status: 'Failed',
-            error: e.message ?? String(e),
-            completedAt: Date.now() as Timestamp,
-        })
+        // Don't overwrite Cancelled status (set by cancelOperation before SIGTERM completes)
+        const currentStatus = storeHandle.doc()?.operationDB?.[opId]?.status
+        if (currentStatus !== 'Cancelled') {
+            updateOperation(storeHandle, opId, {
+                status: 'Failed',
+                error: e.message ?? String(e),
+                completedAt: Date.now() as Timestamp,
+            })
+        }
         console.error(chalk.red(`copyApp: failed — ${e.message ?? e}`))
     } finally {
         resourceLock.releaseAll(lockKeys)
@@ -291,7 +295,7 @@ export const moveApp = async (
         log(`moveApp: syncing app master ${appMasterSrc} → ${appMasterDest}`)
         await rsyncDirectory(appMasterSrc, appMasterDest, ({ progressPercent }) => {
             updateOperation(storeHandle, opId, { progressPercent: Math.round(progressPercent * 0.4) })
-        })
+        }, opId)
 
         // 5. rsync instance data — same instance ID, new location
         const instanceDest = `${targetMountRoot}/instances/${instance.id}`
@@ -299,7 +303,7 @@ export const moveApp = async (
         log(`moveApp: syncing instance data ${instanceSrc} → ${instanceDest}`)
         await rsyncDirectory(instanceSrc, instanceDest, ({ progressPercent }) => {
             updateOperation(storeHandle, opId, { progressPercent: 40 + Math.round(progressPercent * 0.55) })
-        })
+        }, opId)
 
         // 6. Register on target disk (updates storedOn, starts instance)
         log(`moveApp: registering instance ${instance.id} on disk '${targetDisk.name}' (${targetDisk.id})`)
@@ -341,11 +345,15 @@ export const moveApp = async (
         log(chalk.green(`moveApp: done — instance ${instance.id} moved to '${targetDisk.name}' (${targetDisk.id})`))
 
     } catch (e: any) {
-        updateOperation(storeHandle, opId, {
-            status: 'Failed',
-            error: e.message ?? String(e),
-            completedAt: Date.now() as Timestamp,
-        })
+        // Don't overwrite Cancelled status (set by cancelOperation before SIGTERM completes)
+        const currentStatus = storeHandle.doc()?.operationDB?.[opId]?.status
+        if (currentStatus !== 'Cancelled') {
+            updateOperation(storeHandle, opId, {
+                status: 'Failed',
+                error: e.message ?? String(e),
+                completedAt: Date.now() as Timestamp,
+            })
+        }
         console.error(chalk.red(`moveApp: failed — ${e.message ?? e}`))
 
         // On failure, try to restart the source instance if we stopped it
