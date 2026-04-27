@@ -37,7 +37,17 @@ vi.mock('../../src/data/Disk.js', async (importOriginal) => {
     const actual = await importOriginal<any>()
     return {
         ...actual,
-        processInstance: vi.fn(async (_h: any, _d: any, _id: any) => undefined as any),
+        processInstance: vi.fn(async (handle: any, disk: any, instanceId: any) => {
+            // Simulate processInstance updating storedOn so moveApp's guard check passes
+            handle.change((doc: any) => {
+                const inst = doc.instanceDB[instanceId]
+                if (inst) {
+                    inst.storedOn = disk.id
+                    inst.status = 'Stopped'
+                }
+            })
+            return undefined as any
+        }),
     }
 })
 
@@ -175,7 +185,7 @@ describe('copyApp', () => {
         const { handle } = await makeHandle()
         const { processInstance } = await import('../../src/data/Disk.js')
         let capturedId: string | null = null
-        vi.mocked(processInstance).mockImplementation(async (_h, _d, id) => {
+        vi.mocked(processInstance).mockImplementationOnce(async (_h, _d, id) => {
             capturedId = id; return undefined as any
         })
         await copyApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
@@ -244,19 +254,24 @@ describe('moveApp', () => {
         const { handle } = await makeHandle()
         const { processInstance } = await import('../../src/data/Disk.js')
         let capturedId: string | null = null
-        vi.mocked(processInstance).mockImplementation(async (_h, _d, id) => {
+        vi.mocked(processInstance).mockImplementationOnce(async (_h, _d, id) => {
             capturedId = id; return undefined as any
         })
         await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
         expect(capturedId).toBe(INSTANCE_ID)
     })
 
-    it('marks source instance as Missing with storedOn=null after a successful move', async () => {
+    it('calls processInstance with the target disk after rsync completes', async () => {
         const { handle } = await makeHandle()
+        const { processInstance } = await import('../../src/data/Disk.js')
         await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
-        const inst = handle.doc().instanceDB[INSTANCE_ID]
-        expect(inst.status).toBe('Missing')
-        expect(inst.storedOn).toBeNull()
+        // processInstance must be called with the target disk — this is what registers
+        // the instance on the target before any source cleanup happens
+        expect(vi.mocked(processInstance)).toHaveBeenCalledWith(
+            handle,
+            expect.objectContaining({ id: TARGET_DISK_ID }),
+            INSTANCE_ID
+        )
     })
 
     it('removes source instance directory after successful move', async () => {
@@ -279,8 +294,8 @@ describe('moveApp', () => {
 
     it('removes app master when no other instance on source disk uses it', async () => {
         const { handle } = await makeHandle()
-        // After the move, instanceDB shows this instance as Missing/null storedOn,
-        // so getInstancesOfDisk (which uses instanceDB) returns empty → app master removed.
+        // After the move, processInstance updates storedOn to TARGET_DISK_ID,
+        // so getInstancesOfDisk(sourceDisk) returns empty → app master removed.
         await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
         const mfs = await getMockedFs()
         const removeCalls = vi.mocked(mfs.remove).mock.calls.map(c => c[0] as string)
