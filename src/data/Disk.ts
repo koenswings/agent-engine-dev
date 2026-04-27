@@ -369,6 +369,7 @@ export const processSystemInstance = async (storeHandle: DocHandle<Store>, disk:
                     name: instanceName,
                     storedOn: disk.id,
                     status: 'Docked' as Status,
+                    statusCondition: null,
                     port: 0 as PortNumber,
                     serviceImages: serviceImages as ServiceImage[],
                     created: new Date().getTime() as Timestamp,

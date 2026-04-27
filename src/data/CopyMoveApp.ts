@@ -240,6 +240,7 @@ export const copyApp = async (
                     name: instance.name,
                     storedOn: targetDisk.id,
                     status: 'Docked' as Status,
+                    statusCondition: null,
                     port: 0 as any,
                     serviceImages: serviceImages as ServiceImage[],
                     created: Date.now() as Timestamp,

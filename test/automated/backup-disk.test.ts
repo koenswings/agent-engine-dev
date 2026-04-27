@@ -69,6 +69,7 @@ const addInstanceToStore = (
             created: Date.now() as Timestamp,
             lastBackup: null,
             lastStarted: Date.now() as Timestamp,
+            statusCondition: null,
             storedOn: diskId,
         }
     })
