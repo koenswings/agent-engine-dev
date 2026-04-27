@@ -236,7 +236,7 @@ const getRootDevice = async (): Promise<string> => {
 export const isSystemDisk = async (disk: Disk): Promise<boolean> => {
     if (!disk.device) return false
     const rootDev = await getRootDevice()
-    return disk.device === rootDev
+    return String(disk.device) === String(rootDev)
 }
 
 /**

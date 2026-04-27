@@ -335,11 +335,11 @@ export const findDiskByDevice = (store: Store, deviceName: DeviceName, engineId?
     const disks = engineId
         ? getDisksOfEngine(store, store.engineDB[engineId])
         : getDisks(store)
-    return disks.find(disk => disk.device === deviceName)
+    return disks.find(disk => String(disk.device) === String(deviceName))
 }
 
 export const findDiskByName = (store: Store, diskName: string): Disk | undefined => {
-    return getDisks(store).find(disk => disk.name === diskName)
+    return getDisks(store).find(disk => String(disk.name) === String(diskName))
 }
 
 export const findDisksByApp = (store: Store, appId: AppID): Disk[] => {
