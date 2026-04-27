@@ -78,7 +78,7 @@ const validate = async (
 
     if (sourceDisk.id === targetDisk.id) return `Source and target disk are the same`
 
-    if (instance.storedOn !== sourceDisk.id) {
+    if (String(instance.storedOn) !== String(sourceDisk.id)) {
         return `Instance '${instanceName}' is not stored on disk '${sourceDiskId}'`
     }
 

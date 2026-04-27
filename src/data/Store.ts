@@ -297,7 +297,7 @@ export const getEngineOfInstance = (store: Store, instance: Instance): Engine | 
 export const getInstancesOfDisk = (store: Store, disk: Disk): Instance[] => {
     return Object.keys(store.instanceDB).flatMap(instanceId => {
         const instance = getInstance(store, instanceId as InstanceID)
-        if (instance && instance.storedOn === disk.id) {
+        if (instance && String(instance.storedOn) === String(disk.id)) {
             return [instance]
         } else {
             return []
@@ -323,7 +323,7 @@ export const getDisks = (store: Store): Disk[] => {
 export const getDisksOfEngine = (store: Store, engine: Engine): Disk[] => {
     return Object.keys(store.diskDB).flatMap(diskId => {
         const disk = getDisk(store, diskId as DiskID)
-        if (disk && disk.dockedTo === engine.id) {
+        if (disk && String(disk.dockedTo) === String(engine.id)) {
             return [disk]
         } else {
             return []

@@ -32,7 +32,9 @@
     "test:unit": "pnpm build && bash -c 'mkdir -p test/testresults; OUT=test/testresults/test-unit-$(date -u +%Y-%m-%d-%H%M).log; { echo \"Suite: test:unit | $(date -u) | Branch: $(git branch --show-current) | Commit: $(git rev-parse --short HEAD)\"; echo \"---\"; IDEA_TEST_MODE=true node_modules/.bin/vitest run dist/test/automated/; } 2>&1 | tee $OUT; RET=${PIPESTATUS[0]}; echo \"Results written to $OUT\"; exit $RET'",
     "test:diagnostic": "pnpm build && bash -c 'mkdir -p test/testresults; OUT=test/testresults/test-diagnostic-$(date -u +%Y-%m-%d-%H%M).log; { echo \"Suite: test:diagnostic | $(date -u) | Branch: $(git branch --show-current) | Commit: $(git rev-parse --short HEAD)\"; echo \"---\"; IDEA_TEST_MODE=true node_modules/.bin/vitest run dist/test/diagnostic/; } 2>&1 | tee $OUT; RET=${PIPESTATUS[0]}; echo \"Results written to $OUT\"; exit $RET'",
     "test:cross-engine": "pnpm build && bash -c 'mkdir -p test/testresults; OUT=test/testresults/test-cross-engine-$(date -u +%Y-%m-%d-%H%M).log; { echo \"Suite: test:cross-engine | $(date -u) | Branch: $(git branch --show-current) | Commit: $(git rev-parse --short HEAD)\"; echo \"---\"; node_modules/.bin/vitest run dist/test/cross-engine/; } 2>&1 | tee $OUT; RET=${PIPESTATUS[0]}; echo \"Results written to $OUT\"; exit $RET'",
-    "bundle-context": "tsx script/bundle-context.ts"
+    "bundle-context": "tsx script/bundle-context.ts",
+    "dump-store": "npx tsx script/dump-store.ts",
+    "cleanup-store": "npx tsx script/cleanup-store.ts"
   },
   "keywords": [],
   "author": "Koen Swings",
@@ -60,7 +62,7 @@
     "@automerge/automerge-repo-network-websocket": "2.3.0-alpha.0",
     "@automerge/automerge-repo-storage-nodefs": "^2.2.0",
     "@homebridge/ciao": "^1.3.4",
-    "automerge-repo-storage-node�efs@2.3.0-alpha.0": "link:@automerge/automerge-repo-storage-node�efs@2.3.0-alpha.0",
+    "automerge-repo-storage-node\ufffdefs@2.3.0-alpha.0": "link:@automerge/automerge-repo-storage-node\ufffdefs@2.3.0-alpha.0",
     "chokidar": "^3.6.0",
     "fast-deep-equal": "^3.1.3",
     "lib0": "^0.2.114",

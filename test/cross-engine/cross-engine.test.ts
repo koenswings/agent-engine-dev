@@ -55,6 +55,7 @@ import {
     remoteDockFixture,
     remoteUndock,
     remoteCleanupDisk,
+    remoteCleanupStore,
     isEngineRunning,
     ensureImagePulled,
     isLocal,
@@ -226,6 +227,7 @@ afterAll(async () => {
     await remoteUndock(primaryHost, TEST_DEVICE).catch(() => {})
     await new Promise(r => setTimeout(r, 1000)) // let usbDeviceMonitor process the undock
     await remoteCleanupDisk(primaryHost, TEST_DEVICE).catch(() => {})
+    await remoteCleanupStore(primaryHost).catch(() => {}) // remove orphaned disk/instance/app entries
 
     // Disconnect all clients
     await Promise.all([

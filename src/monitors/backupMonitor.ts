@@ -303,7 +303,7 @@ export const checkPendingBackups = async (
 
         // Check if any linked instance lives on the newly docked App Disk
         const instancesOnAppDisk = Object.values(store.instanceDB)
-            .filter(inst => inst.storedOn === appDisk.id)
+            .filter(inst => String(inst.storedOn) === String(appDisk.id))
 
         for (const instance of instancesOnAppDisk) {
             if (candidate.backupConfig.links.includes(instance.id)) {
@@ -322,7 +322,7 @@ export const checkPendingBackups = async (
                     if (await fs.pathExists(lockPath)) {
                         const staleId = entry as InstanceID
                         const staleInstance = getInstance(store, staleId)
-                        if (staleInstance?.storedOn === appDisk.id) {
+                        if (String(staleInstance?.storedOn) === String(appDisk.id)) {
                             log(`checkPendingBackups: stale lock for ${staleId} — re-triggering backup`)
                             await backupInstance(storeHandle, staleId, candidate as Disk)
                         }
