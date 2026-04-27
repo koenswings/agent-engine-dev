@@ -305,20 +305,11 @@ export const moveApp = async (
             updateOperation(storeHandle, opId, { progressPercent: 40 + Math.round(progressPercent * 0.55) })
         }, opId)
 
-        // 6. Register on target disk (updates storedOn, starts instance)
+        // 6. Register on target disk (storedOn + status set here; instance starts).
+        //    This MUST succeed before we touch the source record — if cancelled before
+        //    this point the source record is untouched and the operator can retry cleanly.
         log(`moveApp: registering instance ${instance.id} on disk '${targetDisk.name}' (${targetDisk.id})`)
         await processInstance(storeHandle, targetDisk, instance.id)
-
-        // 7. Mark source disk's record of this instance as Missing in store.
-        //    Do this BEFORE checking remaining instances so getInstancesOfDisk
-        //    no longer counts this instance when deciding whether to delete the app master.
-        storeHandle.change(doc => {
-            const inst = doc.instanceDB[instance.id]
-            if (inst) {
-                inst.status = 'Missing'
-                inst.storedOn = null
-            }
-        })
 
         // 8. Remove source instance directory
         // Use sudo rm -rf because instance data dirs may contain files owned by

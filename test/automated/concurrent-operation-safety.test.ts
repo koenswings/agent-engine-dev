@@ -243,7 +243,7 @@ describe('concurrent operation safety — ejectDisk blocked when disk locked', (
         const { copyApp } = await import('../../src/data/CopyMoveApp.js')
         const { handle } = await makeHandle()
 
-        await copyApp(handle, 'my-kolibri' as any, 'source-disk' as any, 'target-disk' as any)
+        await copyApp(handle, 'my-kolibri' as any, 'DISK_source' as DiskID, 'DISK_target' as DiskID)
 
         expect(consoleSpy).toHaveBeenCalledWith(
             expect.stringContaining('resource locked')
