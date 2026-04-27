@@ -129,6 +129,23 @@ export const remoteCleanupDisk = async (
 }
 
 /**
+ * Remove test fixture disk entries (and orphaned instances/apps) from the
+ * primary engine's live store. Call in afterAll() after remoteUndock().
+ *
+ * A disk is considered a test fixture if:
+ *   - it has no active device (device=null)
+ *   - its id is NOT a known engine/system-disk id
+ * Orphaned instances (storedOn=null or pointing at a removed disk) and apps
+ * with no remaining instance are also deleted.
+ */
+export const remoteCleanupStore = async (host: string): Promise<void> => {
+    console.log(`[remoteSSH] Cleaning up test fixture store entries on ${host}`)
+    await execOn(host)`npx tsx /home/pi/projects/engine/script/cleanup-store.ts --commit`.catch(
+        (e: Error) => console.warn(`[remoteSSH] remoteCleanupStore warning: ${e.message}`)
+    )
+}
+
+/**
  * Check whether the Engine process on the target host is running via pm2.
  */
 export const isEngineRunning = async (host: string): Promise<boolean> => {
