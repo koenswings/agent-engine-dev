@@ -20,6 +20,7 @@ export interface Instance {
   instanceOf: AppID;   // Reference by name since we can store the AppMaster object only once in Yjs
   name: InstanceName;
   status: Status;
+  statusCondition: string | null;  // Human-readable error diagnosis; null when not in Error state
   port: PortNumber;
   serviceImages: ServiceImage[];
   created: Timestamp;       // We must use a timestamp number as Date objects are not supported in YJS
@@ -248,6 +249,7 @@ export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, inst
           name: instanceName as InstanceName,
           storedOn: disk.id,
           status: 'Docked' as Status,
+          statusCondition: null,
           port: 0 as PortNumber, // Will be set later
           serviceImages: servicesImages as ServiceImage[],
           created: new Date().getTime() as Timestamp,
@@ -319,6 +321,40 @@ export const checkPortNumber = async (port: PortNumber): Promise<boolean> => {
 }
 // KSW - UNTESTED <<<
 
+/**
+ * Build a human-readable diagnosis string when an instance fails.
+ * Collects: the caught error message + recent docker logs for each service container.
+ * Safe to call in a catch block — never throws.
+ */
+export const diagnoseInstance = async (instance: Instance, disk: Disk, caughtError: unknown): Promise<string> => {
+  const parts: string[] = []
+
+  // 1. Engine-level error message
+  if (caughtError) {
+    const msg = caughtError instanceof Error ? caughtError.message : String(caughtError)
+    parts.push(`Engine error: ${msg}`)
+  }
+
+  // 2. Docker container logs (last 20 lines per service)
+  if (!config.settings.testMode) {
+    for (const image of (instance.serviceImages ?? [])) {
+      // Container name convention: <instanceId>-<serviceName>-1
+      // Derive service name from image: last path segment before tag
+      const serviceName = image.split('/').pop()?.split(':')[0] ?? 'service'
+      const containerName = `${instance.id}-${serviceName}-1`
+      try {
+        const logs = await $`docker logs --tail=20 ${containerName}`.quiet()
+        const output = (logs.stdout + logs.stderr).trim()
+        if (output) {
+          parts.push(`Container logs (${serviceName}):\n${output.split('\n').map(l => '  ' + l).join('\n')}`)
+        }
+      } catch { /* container may not exist yet */ }
+    }
+  }
+
+  return parts.join('\n\n') || 'Unknown error'
+}
+
 export const startInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk): Promise<void> => {
   const store: Store = storeHandle.doc()
   console.log(`Starting instance '${instance.id}' on disk ${disk.id} of engine '${localEngineId}'.`)
@@ -334,6 +370,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
         storeHandle.change(doc => {
           const inst = doc.instanceDB[instance.id]
           inst.status = 'Running' as Status
+          inst.statusCondition = null
           if (port > 0) inst.port = port as PortNumber
           inst.lastStarted = Date.now() as Timestamp
         })
@@ -501,9 +538,11 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 
   catch (e) {
     console.log(chalk.red('Error starting app instance'))
+    const condition = await diagnoseInstance(instance, disk, e)
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
-      inst.status = 'Error' as Status // Set the status to Error when the instance fails to start
+      inst.status = 'Error' as Status
+      inst.statusCondition = condition
     })
     console.error(e)
   }
@@ -680,9 +719,11 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
   } catch (e) {
     console.log(chalk.red(`Error creating the containers of app instance ${instance.id}`))
     console.error(e)
+    const condition = await diagnoseInstance(instance, disk, e)
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
-      inst.status = 'Error' as Status // Set the status to Error when the instance fails to create
+      inst.status = 'Error' as Status
+      inst.statusCondition = condition
     })
   }
 }
@@ -744,6 +785,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
       const inst = doc.instanceDB[instance.id]
       inst.lastStarted = new Date().getTime() as Timestamp
       inst.status = 'Running' as Status
+      inst.statusCondition = null  // clear any previous error diagnosis
     })
 
     // Compose up the app
@@ -786,9 +828,11 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
         } catch (e) {
           log(chalk.red(`Error configuring nextcloud office to use the Collabora server at ${ip}:9980`))
           console.error(e)
+          const condition = await diagnoseInstance(instance, disk, e)
           storeHandle.change(doc => {
             const inst = doc.instanceDB[instance.id]
-            inst.status = 'Error' as Status // Set the status to Error when the instance fails to configure
+            inst.status = 'Error' as Status
+            inst.statusCondition = condition
           })
         }
       }
@@ -796,12 +840,13 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
 
 
   } catch (e) {
-
     console.log(chalk.red(`Error running app instance ${instance.id}`))
     console.error(e)
+    const condition = await diagnoseInstance(instance, disk, e)
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
-      inst.status = 'Error' as Status // Set the status to Error when the instance fails to run
+      inst.status = 'Error' as Status
+      inst.statusCondition = condition
     })
   }
 }
@@ -858,9 +903,11 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
   } catch (e) {
     console.log(chalk.red(`Error stopping app instance ${instance.id}`))
     console.error(e)
+    const condition = await diagnoseInstance(instance, disk, e)
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
-      inst.status = 'Error' as Status // Set the status to Error when the instance fails to stop
+      inst.status = 'Error' as Status
+      inst.statusCondition = condition
     })
   }
 }

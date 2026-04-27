@@ -184,7 +184,7 @@ const makeHandle = async (): Promise<{ repo: Repo; handle: DocHandle<Store> }> =
                 port: 3000 as any,
                 serviceImages: [],
                 created: 0 as Timestamp, lastBackup: null, lastStarted: 0 as Timestamp,
-                storedOn: 'DISK_source' as DiskID,
+                statusCondition: null, storedOn: 'DISK_source' as DiskID,
             },
         },
         userDB: {},

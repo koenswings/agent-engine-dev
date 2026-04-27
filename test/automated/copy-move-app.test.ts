@@ -150,6 +150,7 @@ const makeHandle = async (instanceStatus = 'Stopped'): Promise<{ repo: Repo; han
                 created: 0 as Timestamp,
                 lastBackup: null,
                 lastStarted: 0 as Timestamp,
+                statusCondition: null,
                 storedOn: SOURCE_DISK_ID,
             },
         },
@@ -316,6 +317,7 @@ describe('moveApp', () => {
                 created: 0 as Timestamp,
                 lastBackup: null,
                 lastStarted: 0 as Timestamp,
+                statusCondition: null,
                 storedOn: SOURCE_DISK_ID,
             }
         })
