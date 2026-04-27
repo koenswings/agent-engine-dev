@@ -12,7 +12,7 @@
  */
 
 import { Repo } from '@automerge/automerge-repo'
-import { NodeWSServerAdapter } from '@automerge/automerge-repo-network-websocket'
+import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websocket'
 import { NodeFSStorageAdapter } from '@automerge/automerge-repo-storage-nodefs'
 import { DocumentId } from '@automerge/automerge-repo'
 import { fs, chalk } from 'zx'
@@ -42,13 +42,31 @@ const docId = storeUrl.replace('automerge:', '') as DocumentId
 // ── Repo setup ──────────────────────────────────────────────────────────────
 
 let repo: Repo
+const wsPort = 4321
+const wsHost = remote ? host : '127.0.0.1'
+const wsUrl = `ws://${wsHost}:${wsPort}`
 
-if (remote) {
-    const wsUrl = `ws://${host}:4444`
-    process.stderr.write(chalk.dim(`Connecting to ${wsUrl} …\n`))
-    const adapter = new NodeWSServerAdapter(new (await import('ws')).default(wsUrl) as any)
+// Prefer live WebSocket connection (gets in-memory state from the running engine).
+// Fall back to disk storage if the engine isn't reachable.
+let usedWS = false
+try {
+    const ws = new (await import('ws')).default(wsUrl)
+    await new Promise<void>((resolve, reject) => {
+        ws.once('open', resolve)
+        ws.once('error', reject)
+        setTimeout(() => reject(new Error('timeout')), 2000)
+    })
+    ws.close()
+    process.stderr.write(chalk.dim(`Connected to live engine at ${wsUrl}\n`))
+    const adapter = new WebSocketClientAdapter(wsUrl)
     repo = new Repo({ network: [adapter], storage: undefined })
-} else {
+    usedWS = true
+} catch {
+    if (remote) {
+        console.error(chalk.red(`Cannot reach engine at ${wsUrl}`))
+        process.exit(1)
+    }
+    process.stderr.write(chalk.dim(`Engine not reachable — reading from disk storage\n`))
     const storageDir = path.join(ROOT, 'store-data')
     repo = new Repo({ network: [], storage: new NodeFSStorageAdapter(storageDir) })
 }
@@ -57,6 +75,8 @@ if (remote) {
 
 const handle = await repo.find(docId)
 await handle.whenReady(['ready', 'unavailable'])
+// Give the WS connection a moment to receive the latest state from the engine
+if (usedWS) await new Promise(r => setTimeout(r, 1500))
 
 const store = handle.doc() as any
 if (!store) {
