@@ -322,6 +322,26 @@ export const checkPortNumber = async (port: PortNumber): Promise<boolean> => {
 export const startInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk): Promise<void> => {
   const store: Store = storeHandle.doc()
   console.log(`Starting instance '${instance.id}' on disk ${disk.id} of engine '${localEngineId}'.`)
+
+  // Short-circuit: if containers are already running (e.g. engine restarted while app was up),
+  // just update the status to Running and return — no need to recreate containers.
+  if (!config.settings.testMode) {
+    try {
+      const ps = await $`docker ps --filter name=${instance.id} --format {{.Names}}`
+      if (ps.stdout.trim().length > 0) {
+        log(`Instance '${instance.id}' containers already running — updating status to Running`)
+        const port = parseInt(await readEnvVariable(`${await diskMountRoot(disk)}/instances/${instance.id}/.env`, 'port') as string) || 0
+        storeHandle.change(doc => {
+          const inst = doc.instanceDB[instance.id]
+          inst.status = 'Running' as Status
+          if (port > 0) inst.port = port as PortNumber
+          inst.lastStarted = Date.now() as Timestamp
+        })
+        return
+      }
+    } catch { /* docker not available or no containers — continue with normal start */ }
+  }
+
   // Set the instance status to Starting
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
