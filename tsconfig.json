@@ -18,6 +18,7 @@
     "test"  
 , "script/client.ts", "pm2.config.cjs"],
   "exclude": [
-    "test/legacy"
+    "test/legacy",
+    "script/dump-store.ts"
   ]
 }

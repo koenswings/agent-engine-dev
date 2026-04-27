@@ -94,7 +94,7 @@ export const installAppFromDisk = async (
     if (await fs.pathExists(sourceInstanceBase)) {
         const store = storeHandle.doc()
         const sourceInstance = Object.values(store.instanceDB).find(
-            i => i.instanceOf === appId && i.storedOn === sourceDisk.id
+            i => String(i.instanceOf) === String(appId) && String(i.storedOn) === String(sourceDisk.id)
         )
         if (sourceInstance) sourceInstanceId = sourceInstance.id
     }

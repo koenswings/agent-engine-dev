@@ -282,7 +282,7 @@ export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
             }
         })
         // Stop all instances of the disk and move them to the 'Undocked' state
-        const instancesOnDisk = Object.values(store.instanceDB).filter(instance => instance.storedOn === disk.id);
+        const instancesOnDisk = Object.values(store.instanceDB).filter(instance => String(instance.storedOn) === String(disk.id));
         for (const instance of instancesOnDisk) {
             await stopInstance(storeHandle, instance, disk)
             log(`Instance ${instance.id} stopped`)
