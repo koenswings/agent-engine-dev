@@ -78,6 +78,15 @@ const validate = async (
 
     if (sourceDisk.id === targetDisk.id) return `Source and target disk are the same`
 
+    // Reject cross-engine operations — rsync only runs locally; remote disk support is Phase 2.
+    const { localEngineId } = await import('./Engine.js')
+    if (String(targetDisk.dockedTo) !== String(localEngineId)) {
+        return `Target disk '${targetDisk.name}' is docked to a remote engine ('${targetDisk.dockedTo}'). Cross-engine copy/move is not yet supported — use the target engine's UI or CLI.`
+    }
+    if (String(sourceDisk.dockedTo) !== String(localEngineId)) {
+        return `Source disk '${sourceDisk.name}' is docked to a remote engine ('${sourceDisk.dockedTo}'). Cross-engine copy/move is not yet supported.`
+    }
+
     if (String(instance.storedOn) !== String(sourceDisk.id)) {
         return `Instance '${instanceName}' is not stored on disk '${sourceDiskId}'`
     }
