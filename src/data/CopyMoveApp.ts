@@ -3,8 +3,9 @@
  *
  * Design: design/copy-move-app.md
  *
- * Phase 1: same-engine only. Both source and target disks must be docked to
- * the local engine. Cross-engine (remote rsync) is deferred to phase 2.
+ * Phase 1: same-engine — source and target on local engine.
+ * Phase 2: cross-engine — source on local engine, target on remote engine;
+ *   rsync over SSH, remote start via sendCommand.
  */
 
 import { chalk, fs, $ } from 'zx'
@@ -12,7 +13,7 @@ import { log } from '../utils/utils.js'
 import { rsyncDirectory } from '../utils/rsync.js'
 import {
     InstanceID, DiskID, DiskName, InstanceName, Timestamp,
-    OperationKind
+    OperationKind, ServiceImage
 } from './CommonTypes.js'
 import { Store, getDisk, getInstance, getInstancesOfDisk } from './Store.js'
 import { Disk, processInstance, diskMountRoot, diskFsRoot } from './Disk.js'
@@ -21,6 +22,11 @@ import { DocHandle } from '@automerge/automerge-repo'
 import { uuid } from '../utils/utils.js'
 import { createOperation, updateOperation } from './Operations.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
+import { sendCommand } from '../utils/commandUtils.js'
+import { getEngineAddress } from './Network.js'
+import { Instance, Status } from './Instance.js'
+import { IPAddress } from './CommonTypes.js'
+import os from 'os'
 
 // ── Disk free-space check ─────────────────────────────────────────────────────
 
@@ -78,13 +84,20 @@ const validate = async (
 
     if (sourceDisk.id === targetDisk.id) return `Source and target disk are the same`
 
-    // Reject cross-engine operations — rsync only runs locally; remote disk support is Phase 2.
+    // Source must always be local — we rsync FROM local paths.
     const { localEngineId } = await import('./Engine.js')
-    if (String(targetDisk.dockedTo) !== String(localEngineId)) {
-        return `Target disk '${targetDisk.name}' is docked to a remote engine ('${targetDisk.dockedTo}'). Cross-engine copy/move is not yet supported — use the target engine's UI or CLI.`
-    }
     if (String(sourceDisk.dockedTo) !== String(localEngineId)) {
-        return `Source disk '${sourceDisk.name}' is docked to a remote engine ('${sourceDisk.dockedTo}'). Cross-engine copy/move is not yet supported.`
+        return `Source disk '${sourceDisk.name}' is docked to a remote engine. Copy/move must be initiated from that engine.`
+    }
+
+    // Target may be local or remote (cross-engine Phase 2).
+    // If remote, validate that the engine is reachable (has an address in network.connections).
+    if (String(targetDisk.dockedTo) !== String(localEngineId)) {
+        const targetEngineId = targetDisk.dockedTo!
+        const remoteAddress = getEngineAddress(targetEngineId as any)
+        if (!remoteAddress) {
+            return `Target engine '${targetEngineId}' is not currently reachable (not in network connections). Ensure it is online and connected.`
+        }
     }
 
     if (String(instance.storedOn) !== String(sourceDisk.id)) {
@@ -153,6 +166,13 @@ export const copyApp = async (
     const newInstanceId = uuid() as InstanceID
     let wasRunning = false
 
+    // Detect cross-engine: target disk is on a different engine
+    const { localEngineId } = await import('./Engine.js')
+    const isCrossEngine = String(targetDisk.dockedTo) !== String(localEngineId)
+    const remoteAddress = isCrossEngine
+        ? getEngineAddress(targetDisk.dockedTo as any) as string
+        : undefined
+
     try {
         // 1. Stop source instance if running
         if (instance.status === 'Running' || instance.status === 'Starting') {
@@ -163,41 +183,79 @@ export const copyApp = async (
 
         updateOperation(storeHandle, opId, { status: 'Running' })
 
-        // 2. Check free space
-        const needed = await directoryBytes(appMasterSrc) + await directoryBytes(instanceSrc)
-        const available = await availableBytes(await diskFsRoot(targetDisk))
-        if (available < needed) {
-            throw new Error(
-                `Not enough space on disk '${targetDisk.name}' (${targetDisk.id}): need ${Math.ceil(needed / 1024 / 1024)}MB, ` +
-                `have ${Math.ceil(available / 1024 / 1024)}MB`
-            )
+        // 2. Check free space (local only — skip for cross-engine)
+        if (!isCrossEngine) {
+            const needed = await directoryBytes(appMasterSrc) + await directoryBytes(instanceSrc)
+            const available = await availableBytes(await diskFsRoot(targetDisk))
+            if (available < needed) {
+                throw new Error(
+                    `Not enough space on disk '${targetDisk.name}' (${targetDisk.id}): need ${Math.ceil(needed / 1024 / 1024)}MB, ` +
+                    `have ${Math.ceil(available / 1024 / 1024)}MB`
+                )
+            }
         }
 
         // 3. Ensure target directory structure
-        const targetMountRoot = await diskMountRoot(targetDisk)
-        await fs.ensureDir(`${targetMountRoot}/apps`)
-        await fs.ensureDir(`${targetMountRoot}/instances`)
-        await fs.ensureDir(`${targetMountRoot}/services`)
+        // For cross-engine: SSH mkdir on remote Pi
+        const targetMountRoot = await diskMountRoot(targetDisk) // '' for system disk (both local and remote)
+        if (isCrossEngine) {
+            log(`copyApp: ensuring remote directories on ${remoteAddress}`)
+            await $`ssh -o StrictHostKeyChecking=no pi@${remoteAddress} sudo mkdir -p ${targetMountRoot}/apps ${targetMountRoot}/instances ${targetMountRoot}/services && sudo chown -R pi:pi ${targetMountRoot}/apps ${targetMountRoot}/instances ${targetMountRoot}/services`
+        } else {
+            await fs.ensureDir(`${targetMountRoot}/apps`)
+            await fs.ensureDir(`${targetMountRoot}/instances`)
+            await fs.ensureDir(`${targetMountRoot}/services`)
+        }
 
         // 4. rsync app master (idempotent — skips if already present and identical)
         const appMasterDest = `${targetMountRoot}/apps/${appId}`
-        log(`copyApp: syncing app master ${appMasterSrc} → ${appMasterDest}`)
+        log(`copyApp: syncing app master ${appMasterSrc} → ${isCrossEngine ? remoteAddress + ':' : ''}${appMasterDest}`)
         await rsyncDirectory(appMasterSrc, appMasterDest, ({ progressPercent }) => {
-            // app master typically small — report first half of progress
             updateOperation(storeHandle, opId, { progressPercent: Math.round(progressPercent * 0.4) })
-        }, opId)
+        }, opId, remoteAddress)
 
         // 5. rsync instance data into a NEW instance directory (new ID)
         const instanceDest = `${targetMountRoot}/instances/${newInstanceId}`
-        await fs.ensureDir(instanceDest)
-        log(`copyApp: syncing instance data ${instanceSrc} → ${instanceDest}`)
+        if (!isCrossEngine) await fs.ensureDir(instanceDest)
+        else await $`ssh -o StrictHostKeyChecking=no pi@${remoteAddress} mkdir -p ${instanceDest}`
+        log(`copyApp: syncing instance data ${instanceSrc} → ${isCrossEngine ? remoteAddress + ':' : ''}${instanceDest}`)
         await rsyncDirectory(instanceSrc, instanceDest, ({ progressPercent }) => {
             updateOperation(storeHandle, opId, { progressPercent: 40 + Math.round(progressPercent * 0.55) })
-        }, opId)
+        }, opId, remoteAddress)
 
-        // 6. Register the new instance in the store and start it
-        log(`copyApp: registering new instance ${newInstanceId} on disk '${targetDisk.name}' (${targetDisk.id})`)
-        await processInstance(storeHandle, targetDisk, newInstanceId)
+        // 6. Register/start the new instance
+        if (isCrossEngine) {
+            // Cross-engine: create instance record in shared store (as Docked),
+            // then tell the remote engine to start it via sendCommand.
+            log(`copyApp: registering new instance ${newInstanceId} on remote disk '${targetDisk.name}' (${targetDisk.id})`)
+            const composeContent = (await $`cat ${instanceSrc}/compose.yaml`).stdout
+            const { parse: parseYAML } = await import('yaml')
+            const compose = parseYAML(composeContent)
+            const services = Object.keys(compose.services)
+            const serviceImages = services.map((s: string) => compose.services[s].image)
+            storeHandle.change(doc => {
+                const newInst: Instance = {
+                    id: newInstanceId,
+                    instanceOf: instance.instanceOf,
+                    name: instance.name,
+                    storedOn: targetDisk.id,
+                    status: 'Docked' as Status,
+                    port: 0 as any,
+                    serviceImages: serviceImages as ServiceImage[],
+                    created: Date.now() as Timestamp,
+                    lastBackup: null,
+                    lastStarted: 0 as Timestamp,
+                }
+                doc.instanceDB[newInstanceId] = newInst
+            })
+            // Tell the remote engine to start this instance
+            log(`copyApp: sending startInstance command to remote engine '${targetDisk.dockedTo}'`)
+            sendCommand(storeHandle, targetDisk.dockedTo as any, `startInstance ${instance.name} ${targetDisk.id}` as any)
+        } else {
+            // Local: use existing processInstance flow
+            log(`copyApp: registering new instance ${newInstanceId} on disk '${targetDisk.name}' (${targetDisk.id})`)
+            await processInstance(storeHandle, targetDisk, newInstanceId)
+        }
 
         updateOperation(storeHandle, opId, {
             status: 'Done',
@@ -257,6 +315,14 @@ export const moveApp = async (
         return
     }
     const { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc } = v
+
+    // moveApp does not support cross-engine targets (data integrity risk if move fails midway).
+    // Use copyApp + manual delete instead.
+    const { localEngineId: localId } = await import('./Engine.js')
+    if (String(targetDisk.dockedTo) !== String(localId)) {
+        console.error(chalk.red(`moveApp: Target disk '${targetDisk.name}' is on a remote engine. Cross-engine move is not supported — use copyApp instead, then delete the source.`))
+        return
+    }
 
     // Acquire per-resource locks: instance + both disks
     const moveLockKeys = [instanceKey(instance.id), diskKey(sourceDisk.id), diskKey(targetDisk.id)]
