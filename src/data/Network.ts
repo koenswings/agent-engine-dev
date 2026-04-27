@@ -156,6 +156,20 @@ export const connectEngine = async (repo:Repo, address: IPAddress, hostname: Hos
   }
 }
 
+/**
+ * Returns the IP address of a connected engine by its engineId, or undefined if not connected.
+ * Looks up from the live network.connections map populated by mDNS discovery.
+ */
+export const getEngineAddress = (engineId: EngineID): IPAddress | undefined => {
+    for (const [key, conn] of Object.entries(network.connections)) {
+        if (String(conn.engineId) === String(engineId)) {
+            // key is 'address:port' — return just the address part
+            return key.split(':')[0] as IPAddress
+        }
+    }
+    return undefined
+}
+
 export const isEngineConnected = (network: Network, ip: IPAddress):boolean => {
   return network.connections.hasOwnProperty(ip) && network.connections[ip] !== undefined && network.connections[ip].adapter.isReady()
 }

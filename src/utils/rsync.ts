@@ -4,7 +4,7 @@
  * Design: design/copy-move-app.md
  *
  * Phase 1: same-engine, local paths only.
- * Phase 2 (future): pass a remote path like 'pi@host:/disks/...' for cross-engine.
+ * Phase 2: cross-engine — pass remoteHost to rsync over SSH to pi@host.
  */
 
 import { chalk } from 'zx'
@@ -26,26 +26,34 @@ export type RsyncProgressCallback = (progress: RsyncProgress) => void
  * - Idempotent: re-running after interruption transfers only the delta
  * - Throws on non-zero exit
  *
- * src and dest must be absolute paths (phase 1: both local).
+ * src must be a local absolute path.
+ * dest must be an absolute path. If remoteHost is provided, rsync runs over
+ * SSH to `pi@<remoteHost>:<dest>` (cross-engine Phase 2).
  * Trailing slash is appended to src so rsync copies the *contents*.
  */
 export const rsyncDirectory = (
     src: string,
     dest: string,
     onProgress?: RsyncProgressCallback,
-    opId?: string
+    opId?: string,
+    remoteHost?: string,
 ): Promise<void> => {
     return new Promise((resolve, reject) => {
         // Ensure src has trailing slash so rsync copies contents, not the directory itself
         const srcArg = src.endsWith('/') ? src : src + '/'
+        const destArg = remoteHost ? `pi@${remoteHost}:${dest}` : dest
 
         const args = [
             '-a',
             '--info=progress2',
             '--no-inc-recursive',  // required for accurate total-progress reporting
-            srcArg,
-            dest,
         ]
+
+        if (remoteHost) {
+            args.push('-e', 'ssh -o StrictHostKeyChecking=no')
+        }
+
+        args.push(srcArg, destArg)
 
         log(`rsync ${args.join(' ')}`)
 
