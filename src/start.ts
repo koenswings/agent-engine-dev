@@ -169,8 +169,9 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
 
     await sleep(1000)
     log(chalk.bgMagenta('STARTING HEARTBEAT GENERATION'))
+    const heartbeatIntervalMs = config.settings.heartbeatIntervalMs ?? 50000
     generateHeartBeat(storeHandle)
-    enableTimeMonitor(50000, () => generateHeartBeat(storeHandle))
+    enableTimeMonitor(heartbeatIntervalMs, () => generateHeartBeat(storeHandle))
 
 
 }

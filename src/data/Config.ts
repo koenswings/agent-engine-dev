@@ -16,6 +16,7 @@ export interface Settings {
     consolePath: string;
     storeDataFolder: string;
     storeIdentityFolder: string;
+    heartbeatIntervalMs: number;  // How often the engine writes a heartbeat to the store (default: 50000ms)
 }
 
 export interface Defaults {
@@ -107,6 +108,7 @@ function validateSettings(obj: any, path: string): string[] {
     if (typeof obj.storeIdentityFolder !== 'string') errors.push(`'${path}storeIdentityFolder' must be a string.`);
     if (typeof obj.httpPort !== 'number') errors.push(`'${path}httpPort' must be a number.`);
     if (typeof obj.consolePath !== 'string') errors.push(`'${path}consolePath' must be a string.`);
+    if (obj.heartbeatIntervalMs !== undefined && typeof obj.heartbeatIntervalMs !== 'number') errors.push(`'${path}heartbeatIntervalMs' must be a number.`);
     return errors;
 }
 
