@@ -1,0 +1,79 @@
+{
+    "lo": [
+        {
+            "address": "127.0.0.1",
+            "netmask": "255.0.0.0",
+            "family": "IPv4",
+            "mac": "00:00:00:00:00:00",
+            "internal": true,
+            "cidr": "127.0.0.1/8"
+        },
+        {
+            "address": "::1",
+            "netmask": "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "family": "IPv6",
+            "mac": "00:00:00:00:00:00",
+            "internal": true,
+            "cidr": "::1/128",
+            "scopeid": 0
+        }
+    ],
+    "eth0": [
+        {
+            "address": "192.168.0.139",
+            "netmask": "255.255.255.0",
+            "family": "IPv4",
+            "mac": "dc:a6:32:7e:76:96",
+            "internal": false,
+            "cidr": "192.168.0.139/24"
+        },
+        {
+            "address": "2a02:1810:3819:f400:6495:1c70:dca7:508a",
+            "netmask": "ffff:ffff:ffff:ffff::",
+            "family": "IPv6",
+            "mac": "dc:a6:32:7e:76:96",
+            "internal": false,
+            "cidr": "2a02:1810:3819:f400:6495:1c70:dca7:508a/64",
+            "scopeid": 0
+        },
+        {
+            "address": "fe80::bd01:e324:f586:2bf9",
+            "netmask": "ffff:ffff:ffff:ffff::",
+            "family": "IPv6",
+            "mac": "dc:a6:32:7e:76:96",
+            "internal": false,
+            "cidr": "fe80::bd01:e324:f586:2bf9/64",
+            "scopeid": 2
+        }
+    ],
+    "br-1dcc318fe31d": [
+        {
+            "address": "172.18.0.1",
+            "netmask": "255.255.0.0",
+            "family": "IPv4",
+            "mac": "02:42:97:84:97:a0",
+            "internal": false,
+            "cidr": "172.18.0.1/16"
+        },
+        {
+            "address": "fe80::42:97ff:fe84:97a0",
+            "netmask": "ffff:ffff:ffff:ffff::",
+            "family": "IPv6",
+            "mac": "02:42:97:84:97:a0",
+            "internal": false,
+            "cidr": "fe80::42:97ff:fe84:97a0/64",
+            "scopeid": 5
+        }
+    ],
+    "veth35aa42e": [
+        {
+            "address": "fe80::7076:9cff:feb8:ced4",
+            "netmask": "ffff:ffff:ffff:ffff::",
+            "family": "IPv6",
+            "mac": "72:76:9c:b8:ce:d4",
+            "internal": false,
+            "cidr": "fe80::7076:9cff:feb8:ced4/64",
+            "scopeid": 7
+        }
+    ]
+}
