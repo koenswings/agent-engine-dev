@@ -246,6 +246,9 @@ export const copyApp = async (
                     created: Date.now() as Timestamp,
                     lastBackup: null,
                     lastStarted: 0 as Timestamp,
+                    currentStep: null,
+                    totalSteps: null,
+                    stepLabel: null,
                 }
                 doc.instanceDB[newInstanceId] = newInst
             })

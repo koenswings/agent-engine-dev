@@ -55,6 +55,9 @@ export const createOperation = (
         engineId: localEngineId,
         status: 'Pending',
         progressPercent: null,
+        currentStep: null,
+        totalSteps: null,
+        stepLabel: null,
         startedAt: Date.now() as Timestamp,
         completedAt: null,
         error: null,
@@ -69,15 +72,24 @@ export const createOperation = (
 export const updateOperation = (
     storeHandle: DocHandle<Store>,
     id: string,
-    patch: Partial<Pick<Operation, 'status' | 'progressPercent' | 'completedAt' | 'error'>>
+    patch: Partial<Pick<Operation, 'status' | 'progressPercent' | 'currentStep' | 'totalSteps' | 'stepLabel' | 'completedAt' | 'error'>>
 ): void => {
     storeHandle.change(doc => {
         const op = doc.operationDB?.[id]
         if (!op) return
         if (patch.status !== undefined) op.status = patch.status
         if (patch.progressPercent !== undefined) op.progressPercent = patch.progressPercent
+        if (patch.currentStep !== undefined) op.currentStep = patch.currentStep
+        if (patch.totalSteps !== undefined) op.totalSteps = patch.totalSteps
+        if (patch.stepLabel !== undefined) op.stepLabel = patch.stepLabel
         if (patch.completedAt !== undefined) op.completedAt = patch.completedAt
         if (patch.error !== undefined) op.error = patch.error
+        // Clear step progress when operation reaches a terminal state
+        if (patch.status === 'Done' || patch.status === 'Failed' || patch.status === 'Cancelled') {
+            op.currentStep = null
+            op.totalSteps = null
+            op.stepLabel = null
+        }
     })
 }
 

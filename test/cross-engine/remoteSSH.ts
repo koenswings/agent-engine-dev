@@ -132,6 +132,10 @@ export const remoteCleanupDisk = async (
  * Remove test fixture disk entries (and orphaned instances/apps) from the
  * primary engine's live store. Call in afterAll() after remoteUndock().
  *
+ * Stops the engine, runs cleanup-store --commit, then restarts the engine.
+ * cleanup-store exits with code 1 if the engine is running, so we must stop
+ * it first — otherwise the cleanup silently fails and fixtures remain in store.
+ *
  * A disk is considered a test fixture if:
  *   - it has no active device (device=null)
  *   - its id is NOT a known engine/system-disk id
@@ -140,9 +144,20 @@ export const remoteCleanupDisk = async (
  */
 export const remoteCleanupStore = async (host: string): Promise<void> => {
     console.log(`[remoteSSH] Cleaning up test fixture store entries on ${host}`)
-    await execOn(host)`npx tsx /home/pi/projects/engine/script/cleanup-store.ts --commit`.catch(
-        (e: Error) => console.warn(`[remoteSSH] remoteCleanupStore warning: ${e.message}`)
-    )
+    try {
+        // Stop engine so cleanup-store can safely write to the Automerge store on disk.
+        // If the engine is running during cleanup, its in-memory CRDT wins on next
+        // restart and restores all deleted entries.
+        await execOn(host)`sudo -u pi pm2 stop engine`.catch(() => {})
+        await execOn(host)`npx tsx /home/pi/projects/engine/script/cleanup-store.ts --commit`
+    } catch (e: any) {
+        console.warn(`[remoteSSH] remoteCleanupStore warning: ${e.message}`)
+    } finally {
+        // Always restart the engine, even if cleanup failed.
+        await execOn(host)`sudo -u pi pm2 start engine`.catch(
+            (e: Error) => console.warn(`[remoteSSH] remoteCleanupStore: failed to restart engine: ${e.message}`)
+        )
+    }
 }
 
 /**
