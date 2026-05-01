@@ -198,12 +198,19 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
 
         for (let device of storedDevices) {
             if (!actualDevices.includes(device)) {
-                log(`Removing disk from previously mounted device ${device}`)
                 const disk = findDiskByDevice(store, device as DeviceName)
-                if (disk) {
-                    await undockDisk(storeHandle, disk)
-                    log(`Disk ${disk.id} removed from local engine`)
+                if (!disk) continue
+                // Never undock the system disk based on /dev/engine listing —
+                // the root partition is always present and /dev/engine may not
+                // be populated yet (e.g. tmpfiles.d race) or may be empty in
+                // testMode. System disk presence is guaranteed by the OS itself.
+                if (disk.diskTypes?.includes('system')) {
+                    log(`Skipping undock of system disk ${disk.id} on device ${device} — system disk is always present`)
+                    continue
                 }
+                log(`Removing disk from previously mounted device ${device}`)
+                await undockDisk(storeHandle, disk)
+                log(`Disk ${disk.id} removed from local engine`)
             }
         }
     } else {
