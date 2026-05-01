@@ -74,6 +74,7 @@ const addInstanceToStore = (
             currentStep: null,
             totalSteps: null,
             stepLabel: null,
+                metrics: null,
         }
     })
 }

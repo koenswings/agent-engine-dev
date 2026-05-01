@@ -155,6 +155,7 @@ const makeHandle = async (instanceStatus = 'Stopped'): Promise<{ repo: Repo; han
                 currentStep: null,
                 totalSteps: null,
                 stepLabel: null,
+                metrics: null,
             },
         },
         userDB: {},
@@ -325,6 +326,7 @@ describe('moveApp', () => {
                 currentStep: null,
                 totalSteps: null,
                 stepLabel: null,
+                metrics: null,
             }
         })
         await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)

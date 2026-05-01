@@ -69,10 +69,15 @@ export interface Operation {
 // export type YArrayRef = string
 
 export interface DockerMetrics {
-  cpu: string;
-  memory: string;
-  network: string;
-  disk: string;
+  cpuPercent: number | null;
+  memUsageBytes: number | null;
+  memLimitBytes: number | null;
+  memPercent: number | null;
+  netRxBytes: number | null;
+  netTxBytes: number | null;
+  blockReadBytes: number | null;
+  blockWriteBytes: number | null;
+  sampledAt: number | null;       // Unix ms timestamp of last sample
 }
 
 export interface DockerLogs {

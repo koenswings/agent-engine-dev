@@ -295,8 +295,11 @@ export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
             log(`Instance ${instance.id} stopped`)
             storeHandle.change(doc => {
                 const inst = doc.instanceDB[instance.id]
-                // Move the instance to the 'Undocked' state
-                if (inst) inst.status = 'Undocked' as Status
+                // Move the instance to the 'Undocked' state and clear metrics
+                if (inst) {
+                    inst.status = 'Undocked' as Status
+                    inst.metrics = null
+                }
             })
             log(`Instance ${instance.id} has been moved to the 'Undocked' state`)
         }
