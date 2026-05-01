@@ -169,7 +169,9 @@ export const readHardwareIdIntenso = async (device: DeviceName): Promise<DiskID 
     log(`hdparm is at ${hdparm}`)
     //const info = (await $`hdparm -I /dev/${device}`).stdout
     //log(`Info is ${info}`)
-    const sn = (await $`hdparm -I /dev/${device} | grep 'Serial\ Number'`).stdout
+    // hdparm -I requires read access to the block device (root-only on Linux).
+    // The engine runs as pi with passwordless sudo, so prefix with sudo.
+    const sn = (await $`sudo hdparm -I /dev/${device} | grep 'Serial\ Number'`).stdout
     log(`Serial number is ${sn}`)
     const id = sn.trim().split(':')
     log(`split ID is ${id}`)
