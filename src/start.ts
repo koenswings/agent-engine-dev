@@ -13,6 +13,7 @@ import { enableMulticastDNSEngineMonitor } from './monitors/mdnsMonitor.js'
 import { createServerStore, initialiseServerStore } from './data/Store.js'
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
 import { recoverInterruptedOperations } from './data/Operations.js'
+import { enableDockerMetricsMonitor } from './monitors/dockerMetricsMonitor.js'
 import { copyApp, moveApp } from './data/CopyMoveApp.js'
 import { backupInstance } from './monitors/backupMonitor.js'
 import { InstanceID } from './data/CommonTypes.js'
@@ -174,6 +175,9 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     enableUsbDeviceMonitor(storeHandle)
 
     await sleep(1000)
+    log(chalk.bgMagenta('STARTING DOCKER METRICS MONITOR'))
+    enableDockerMetricsMonitor(storeHandle)
+
     log(chalk.bgMagenta('STARTING HEARTBEAT GENERATION'))
     const heartbeatIntervalMs = config.settings.heartbeatIntervalMs ?? 50000
     generateHeartBeat(storeHandle)

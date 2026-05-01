@@ -39,6 +39,7 @@ const clearStep = (storeHandle: DocHandle<Store>, instanceId: InstanceID) => {
     inst.currentStep = null
     inst.totalSteps = null
     inst.stepLabel = null
+    inst.metrics = null  // clear live metrics when instance is no longer running
   })
 }
 
@@ -85,6 +86,8 @@ export interface Instance {
   currentStep: number | null;
   totalSteps: number | null;
   stepLabel: string | null;
+  /** Live Docker resource metrics. Null when instance is not Running. */
+  metrics: DockerMetrics | null;
 }
 
 export type Status = 'Undocked'      // Disk is not currently docked; instance data is intact on the disk
@@ -316,6 +319,7 @@ export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, inst
           currentStep: null,
           totalSteps: null,
           stepLabel: null,
+          metrics: null,
         }
         doc.instanceDB[instanceId] = instance
       } else {
