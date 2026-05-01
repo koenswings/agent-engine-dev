@@ -152,6 +152,9 @@ const makeHandle = async (instanceStatus = 'Stopped'): Promise<{ repo: Repo; han
                 lastStarted: 0 as Timestamp,
                 statusCondition: null,
                 storedOn: SOURCE_DISK_ID,
+                currentStep: null,
+                totalSteps: null,
+                stepLabel: null,
             },
         },
         userDB: {},
@@ -319,6 +322,9 @@ describe('moveApp', () => {
                 lastStarted: 0 as Timestamp,
                 statusCondition: null,
                 storedOn: SOURCE_DISK_ID,
+                currentStep: null,
+                totalSteps: null,
+                stepLabel: null,
             }
         })
         await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
@@ -347,16 +353,19 @@ describe('recoverInterruptedOperations', () => {
             doc.operationDB['op1'] = {
                 id: 'op1', kind: 'copyApp', args: {}, engineId: localEngineId,
                 status: 'Running', progressPercent: 50,
+                currentStep: null, totalSteps: null, stepLabel: null,
                 startedAt: 0 as Timestamp, completedAt: null, error: null,
             }
             doc.operationDB['op2'] = {
                 id: 'op2', kind: 'moveApp', args: {}, engineId: localEngineId,
                 status: 'Pending', progressPercent: null,
+                currentStep: null, totalSteps: null, stepLabel: null,
                 startedAt: 0 as Timestamp, completedAt: null, error: null,
             }
             doc.operationDB['op3'] = {
                 id: 'op3', kind: 'copyApp', args: {}, engineId: localEngineId,
                 status: 'Done', progressPercent: 100,
+                currentStep: null, totalSteps: null, stepLabel: null,
                 startedAt: 0 as Timestamp, completedAt: 1 as Timestamp, error: null,
             }
         })

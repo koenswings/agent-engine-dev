@@ -71,6 +71,9 @@ const addInstanceToStore = (
             lastStarted: Date.now() as Timestamp,
             statusCondition: null,
             storedOn: diskId,
+            currentStep: null,
+            totalSteps: null,
+            stepLabel: null,
         }
     })
 }

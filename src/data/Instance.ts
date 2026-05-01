@@ -14,6 +14,60 @@ import { config } from '../data/Config.js'
 import { error } from "console";
 import { DocHandle } from "@automerge/automerge-repo";
 
+// ── Step-progress helpers ─────────────────────────────────────────────────────
+
+const setStep = (
+  storeHandle: DocHandle<Store>,
+  instanceId: InstanceID,
+  step: number,
+  total: number,
+  label: string
+) => {
+  storeHandle.change(doc => {
+    const inst = doc.instanceDB[instanceId]
+    if (!inst) return
+    inst.currentStep = step
+    inst.totalSteps = total
+    inst.stepLabel = label
+  })
+}
+
+const clearStep = (storeHandle: DocHandle<Store>, instanceId: InstanceID) => {
+  storeHandle.change(doc => {
+    const inst = doc.instanceDB[instanceId]
+    if (!inst) return
+    inst.currentStep = null
+    inst.totalSteps = null
+    inst.stepLabel = null
+  })
+}
+
+// ── Start / stop step definitions ────────────────────────────────────────────
+// These are the canonical step labels exposed to the Console.
+// Pixel can use these verbatim in a step-based progress window.
+
+export const START_STEPS = [
+  'Checking if already running',     // 0  (pre-check, skipped if not needed)
+  'Generating port',                  // 1
+  'Generating password',             // 2
+  'Loading service images',          // 3
+  'Creating containers',             // 4
+  'Starting containers',             // 5
+] as const
+
+export const STOP_STEPS = [
+  'Finding containers',              // 0
+  'Stopping containers',             // 1
+] as const
+
+export const BACKUP_STEPS = [
+  'Initialising backup repository',  // 0
+  'Stopping app',                    // 1
+  'Running backup',                  // 2
+  'Restarting app',                  // 3
+  'Updating backup index',           // 4
+] as const
+
 
 export interface Instance {
   id: InstanceID;
@@ -27,6 +81,10 @@ export interface Instance {
   lastBackup: Timestamp | null;  // Unix ms of last successful backup; null if never backed up
   lastStarted: Timestamp;   // We must use a timestamp number as Date objects are not supported in YJS
   storedOn: DiskID | null;  // The disk that this instance is stored on. null if we do not know it yet
+  /** Step-based progress for start/stop. Null when no active operation. */
+  currentStep: number | null;
+  totalSteps: number | null;
+  stepLabel: string | null;
 }
 
 export type Status = 'Undocked'      // Disk is not currently docked; instance data is intact on the disk
@@ -255,6 +313,9 @@ export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, inst
           created: new Date().getTime() as Timestamp,
           lastBackup: null,
           lastStarted: 0 as Timestamp,
+          currentStep: null,
+          totalSteps: null,
+          stepLabel: null,
         }
         doc.instanceDB[instanceId] = instance
       } else {
@@ -379,6 +440,8 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     } catch { /* docker not available or no containers — continue with normal start */ }
   }
 
+  const totalStartSteps = START_STEPS.length
+
   // Set the instance status to Starting
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
@@ -396,6 +459,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     // **************************
     // STEP 1 - Port generation
     // **************************
+    setStep(storeHandle, instance.id, 1, totalStartSteps, START_STEPS[1])
 
     // Generate a port  number for the app  and assign it to the variable port
     // Start from port number 3000 and check if the port is already in use by another app
@@ -476,6 +540,11 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     })
 
     // **************************
+    // STEP 2 - Password generation
+    // **************************
+    setStep(storeHandle, instance.id, 2, totalStartSteps, START_STEPS[2])
+
+    // **************************
     // STEP 1b - Generate a password for the app
     // **************************
 
@@ -501,8 +570,9 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 
 
     // **************************
-    // STEP 2 - Preloading of services
+    // STEP 3 - Preloading of services
     // **************************
+    setStep(storeHandle, instance.id, 3, totalStartSteps, START_STEPS[3])
 
     log(`Preloading the service images of the services from the compose file`)
     // Extract the service images of the services from the compose file, and pull them
@@ -524,14 +594,16 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     }
 
     // **************************
-    // STEP 3 - Container creation
+    // STEP 4 - Container creation
     // **************************
+    setStep(storeHandle, instance.id, 4, totalStartSteps, START_STEPS[4])
 
     await createInstanceContainers(storeHandle, instance, disk)
 
     // **************************
-    // STEP 4 - run the Instance
+    // STEP 5 - Run the Instance
     // **************************
+    setStep(storeHandle, instance.id, 5, totalStartSteps, START_STEPS[5])
 
     await runInstance(storeHandle, instance, disk)
   }
@@ -544,6 +616,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
       inst.status = 'Error' as Status
       inst.statusCondition = condition
     })
+    clearStep(storeHandle, instance.id)
     console.error(e)
   }
 }
@@ -804,6 +877,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
     // instance.dockerEvents = { events: await $`docker events ${instanceName}` }  // This is not correct, we need to use the right container name
 
     console.log(chalk.green(`App ${instance.id} running`))
+    clearStep(storeHandle, instance.id)
 
     // App-specific post-processing commands
     // If the app on which the instance is based is nextcloud, 
@@ -867,8 +941,11 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
   //   console.error(e)
   // }
 
+  const totalStopSteps = STOP_STEPS.length
+
   // New implementation using Docker API
   try {
+    setStep(storeHandle, instance.id, 0, totalStopSteps, STOP_STEPS[0])
     // Find all containers running in the compose started by the instance
     // NOTE: this implementation requires all containers of an instance to be namespaced with the instance id
     log(`Filter for all running containers whose names start with the instance id`)
@@ -883,6 +960,7 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
     instanceContainers.forEach(container => {
       log(container.data['Names'][0])
     })
+    setStep(storeHandle, instance.id, 1, totalStopSteps, STOP_STEPS[1])
     for (let container of instanceContainers) {
       // First try to stop the container gracefully  If that does not work, kill it  
       try {
@@ -900,6 +978,7 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
       const inst = doc.instanceDB[instance.id]
       inst.status = 'Stopped' as Status // Set the status to Stopped when the instance is stopped
     })
+    clearStep(storeHandle, instance.id)
   } catch (e) {
     console.log(chalk.red(`Error stopping app instance ${instance.id}`))
     console.error(e)
@@ -909,5 +988,6 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
       inst.status = 'Error' as Status
       inst.statusCondition = condition
     })
+    clearStep(storeHandle, instance.id)
   }
 }

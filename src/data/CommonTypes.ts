@@ -55,6 +55,10 @@ export interface Operation {
   engineId: EngineID
   status: OperationStatus
   progressPercent: number | null
+  /** Step-based progress. Null when not applicable or operation is complete. */
+  currentStep: number | null
+  totalSteps: number | null
+  stepLabel: string | null
   startedAt: Timestamp
   completedAt: Timestamp | null
   error: string | null

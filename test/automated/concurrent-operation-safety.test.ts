@@ -185,6 +185,7 @@ const makeHandle = async (): Promise<{ repo: Repo; handle: DocHandle<Store> }> =
                 serviceImages: [],
                 created: 0 as Timestamp, lastBackup: null, lastStarted: 0 as Timestamp,
                 statusCondition: null, storedOn: 'DISK_source' as DiskID,
+                currentStep: null, totalSteps: null, stepLabel: null,
             },
         },
         userDB: {},
