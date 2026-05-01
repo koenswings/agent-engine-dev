@@ -211,7 +211,7 @@ export const copyApp = async (
         const appMasterDest = `${targetMountRoot}/apps/${appId}`
         log(`copyApp: syncing app master ${appMasterSrc} → ${isCrossEngine ? remoteAddress + ':' : ''}${appMasterDest}`)
         await rsyncDirectory(appMasterSrc, appMasterDest, ({ progressPercent }) => {
-            updateOperation(storeHandle, opId, { progressPercent: Math.round(progressPercent * 0.4) })
+            updateOperation(storeHandle, opId, { progressPercent: Math.round(progressPercent * 0.25) })
         }, opId, remoteAddress)
 
         // 5. rsync instance data into a NEW instance directory (new ID)
@@ -220,8 +220,36 @@ export const copyApp = async (
         else await $`ssh -o StrictHostKeyChecking=no pi@${remoteAddress} mkdir -p ${instanceDest}`
         log(`copyApp: syncing instance data ${instanceSrc} → ${isCrossEngine ? remoteAddress + ':' : ''}${instanceDest}`)
         await rsyncDirectory(instanceSrc, instanceDest, ({ progressPercent }) => {
-            updateOperation(storeHandle, opId, { progressPercent: 40 + Math.round(progressPercent * 0.55) })
+            updateOperation(storeHandle, opId, { progressPercent: 25 + Math.round(progressPercent * 0.30) })
         }, opId, remoteAddress)
+
+        // 5b. rsync service image tars needed by this instance
+        //     services/ holds the Docker image tars that startInstance loads via
+        //     `docker image load`. Without them the copied instance cannot start.
+        const sourceMountRootCopy = await diskMountRoot(sourceDisk)
+        const copyServicesSrcDir = `${sourceMountRootCopy}/services`
+        const copyServicesDestDir = `${targetMountRoot}/services`
+        if (instance.serviceImages?.length) {
+            let servicesDone = 0
+            for (const serviceImage of instance.serviceImages) {
+                const tarName = (serviceImage as string).replace(/\//g, '_') + '.tar'
+                const tarSrc = `${copyServicesSrcDir}/${tarName}`
+                if (await fs.pathExists(tarSrc)) {
+                    log(`copyApp: syncing service image ${tarName}`)
+                    if (isCrossEngine) {
+                        await $`rsync -a -e ${'ssh -o StrictHostKeyChecking=no'} ${tarSrc} pi@${remoteAddress}:${copyServicesDestDir}/`
+                    } else {
+                        await $`rsync -a ${tarSrc} ${copyServicesDestDir}/`
+                    }
+                } else {
+                    log(`copyApp: service image tar not found at ${tarSrc} — skipping`)
+                }
+                servicesDone++
+                updateOperation(storeHandle, opId, {
+                    progressPercent: 55 + Math.round((servicesDone / instance.serviceImages.length) * 38),
+                })
+            }
+        }
 
         // 6. Register/start the new instance
         if (isCrossEngine) {
@@ -246,6 +274,9 @@ export const copyApp = async (
                     created: Date.now() as Timestamp,
                     lastBackup: null,
                     lastStarted: 0 as Timestamp,
+                    currentStep: null,
+                    totalSteps: null,
+                    stepLabel: null,
                 }
                 doc.instanceDB[newInstanceId] = newInst
             })
@@ -370,7 +401,7 @@ export const moveApp = async (
         const appMasterDest = `${targetMountRoot}/apps/${appId}`
         log(`moveApp: syncing app master ${appMasterSrc} → ${appMasterDest}`)
         await rsyncDirectory(appMasterSrc, appMasterDest, ({ progressPercent }) => {
-            updateOperation(storeHandle, opId, { progressPercent: Math.round(progressPercent * 0.4) })
+            updateOperation(storeHandle, opId, { progressPercent: Math.round(progressPercent * 0.25) })
         }, opId)
 
         // 5. rsync instance data — same instance ID, new location
@@ -378,8 +409,32 @@ export const moveApp = async (
         await fs.ensureDir(instanceDest)
         log(`moveApp: syncing instance data ${instanceSrc} → ${instanceDest}`)
         await rsyncDirectory(instanceSrc, instanceDest, ({ progressPercent }) => {
-            updateOperation(storeHandle, opId, { progressPercent: 40 + Math.round(progressPercent * 0.55) })
+            updateOperation(storeHandle, opId, { progressPercent: 25 + Math.round(progressPercent * 0.30) })
         }, opId)
+
+        // 5b. rsync service image tars needed by this instance
+        //     services/ holds the Docker image tars that startInstance loads via
+        //     `docker image load`. Without them the moved instance cannot start.
+        const sourceMountRootMove = await diskMountRoot(sourceDisk)
+        const moveServicesSrcDir = `${sourceMountRootMove}/services`
+        const moveServicesDestDir = `${targetMountRoot}/services`
+        if (instance.serviceImages?.length) {
+            let servicesDone = 0
+            for (const serviceImage of instance.serviceImages) {
+                const tarName = (serviceImage as string).replace(/\//g, '_') + '.tar'
+                const tarSrc = `${moveServicesSrcDir}/${tarName}`
+                if (await fs.pathExists(tarSrc)) {
+                    log(`moveApp: syncing service image ${tarName}`)
+                    await $`rsync -a ${tarSrc} ${moveServicesDestDir}/`
+                } else {
+                    log(`moveApp: service image tar not found at ${tarSrc} — skipping`)
+                }
+                servicesDone++
+                updateOperation(storeHandle, opId, {
+                    progressPercent: 55 + Math.round((servicesDone / instance.serviceImages.length) * 35),
+                })
+            }
+        }
 
         // 6. Register on target disk (storedOn + status set here; instance starts).
         //    This MUST succeed before we touch the source record — if cancelled before

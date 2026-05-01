@@ -17,7 +17,7 @@ import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot } from '..
 import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { createOperation, updateOperation } from '../data/Operations.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
-import { stopInstance, startInstance } from '../data/Instance.js'
+import { stopInstance, startInstance, BACKUP_STEPS } from '../data/Instance.js'
 import { BackupMode, DiskID, DiskName, InstanceID, Timestamp } from '../data/CommonTypes.js'
 import { Store, getInstance, getDisks, findDiskByName } from '../data/Store.js'
 import { DocHandle } from '@automerge/automerge-repo'
@@ -116,9 +116,23 @@ export const backupInstance = async (
         const repoPath = backupDir(backupDevice, instanceId)
         const lockPath = lockFilePath(backupDevice, instanceId)
 
+        const totalBackupSteps = BACKUP_STEPS.length
+
+        const setBackupStep = (step: number, label: string) => {
+            storeHandle.change(doc => {
+                const op = doc.operationDB?.[opId]
+                if (!op) return
+                op.currentStep = step
+                op.totalSteps = totalBackupSteps
+                op.stepLabel = label
+                op.progressPercent = Math.round((step / (totalBackupSteps - 1)) * 100)
+            })
+        }
+
         log(`Starting backup of instance ${instanceId} from ${appDevice} to ${backupDevice}`)
 
         // 1. Init Borg repo if this is the first backup
+        setBackupStep(0, BACKUP_STEPS[0])
         const repoExists = await fs.pathExists(`${repoPath}/config`)
         if (!repoExists) {
             log(`Initialising Borg repo at ${repoPath}`)
@@ -137,10 +151,12 @@ export const backupInstance = async (
         if (instance.status === 'Running') {
             wasRunning = true
             log(`Stopping instance ${instanceId} before backup`)
+            setBackupStep(1, BACKUP_STEPS[1])
             await stopInstance(storeHandle, instance, appDisk)
         }
 
         // 4. Run borg create
+        setBackupStep(2, BACKUP_STEPS[2])
         const archiveName = new Date().toISOString().replace(/[:.]/g, '-')
         if (!config.settings.testMode) {
             log(`Running borg create for instance ${instanceId}`)
@@ -152,10 +168,12 @@ export const backupInstance = async (
         // 5. Restart instance if it was running
         if (wasRunning) {
             log(`Restarting instance ${instanceId} after backup`)
+            setBackupStep(3, BACKUP_STEPS[3])
             await startInstance(storeHandle, instance, appDisk)
         }
 
         // 6. Update store: set lastBackup on the instance
+        setBackupStep(4, BACKUP_STEPS[4])
         storeHandle.change(doc => {
             const inst = doc.instanceDB[instanceId]
             if (inst) inst.lastBackup = Date.now() as Timestamp

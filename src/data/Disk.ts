@@ -375,6 +375,9 @@ export const processSystemInstance = async (storeHandle: DocHandle<Store>, disk:
                     created: new Date().getTime() as Timestamp,
                     lastBackup: null,
                     lastStarted: 0 as Timestamp,
+                    currentStep: null,
+                    totalSteps: null,
+                    stepLabel: null,
                 }
                 doc.instanceDB[instanceId] = newInst
                 instance = newInst
