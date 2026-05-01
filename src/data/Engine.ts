@@ -85,6 +85,65 @@ export const createOrUpdateEngine = async (storeHandle: DocHandle<Store>, engine
 
 export const localEngineId = await getLocalEngineId()
 
+/**
+ * Remove phantom engine entries from the shared CRDT store.
+ *
+ * A "phantom" engine is any engineDB entry that:
+ *   - has the same hostname as this machine, but a different id (stale IDs
+ *     generated before the sudo-hdparm fix caused a new UUID on every boot), OR
+ *   - has an id that is not its own map key (internal id/key mismatch)
+ *
+ * An "orphan" disk is any diskDB entry whose dockedTo field points to an
+ * engine that no longer exists in engineDB.
+ *
+ * Both are deleted in a single storeHandle.change() call so the Automerge
+ * tombstone has the current vector clock and permanently wins over the old
+ * inserts when it propagates to peer engines on the next sync.
+ *
+ * Called once at startup, after createOrUpdateEngine() and before any
+ * monitors are started (so there is no racing writer).
+ */
+export const cleanupPhantomEngines = (storeHandle: DocHandle<Store>): void => {
+  const store = storeHandle.doc()
+  const localHostname = os.hostname() as Hostname
+  const validEngineIds = new Set(Object.keys(store.engineDB))
+
+  // Engines with this hostname but a different id than localEngineId
+  const phantomEngineKeys = Object.keys(store.engineDB).filter(key => {
+    const eng = store.engineDB[key]
+    return (
+      (eng.hostname === localHostname && key !== String(localEngineId)) ||
+      (eng.id && String(eng.id) !== key)   // key/id mismatch — CRDT anomaly
+    )
+  })
+
+  // Disks whose dockedTo points to an engine key that no longer exists
+  const orphanDiskKeys = Object.keys(store.diskDB).filter(key => {
+    const disk = store.diskDB[key]
+    return disk.dockedTo && !validEngineIds.has(String(disk.dockedTo))
+  })
+
+  if (phantomEngineKeys.length === 0 && orphanDiskKeys.length === 0) {
+    log('[cleanup] No phantom engines or orphan disks found — store is clean')
+    return
+  }
+
+  log(chalk.yellow(`[cleanup] Removing ${phantomEngineKeys.length} phantom engine(s) and ${orphanDiskKeys.length} orphan disk(s) from store`))
+  for (const k of phantomEngineKeys) log(chalk.yellow(`  phantom engine: ${k} (hostname=${store.engineDB[k].hostname}, id=${store.engineDB[k].id})`))
+  for (const k of orphanDiskKeys) log(chalk.yellow(`  orphan disk: ${k} (dockedTo=${store.diskDB[k].dockedTo})`))
+
+  storeHandle.change(doc => {
+    for (const k of phantomEngineKeys) {
+      delete (doc.engineDB as any)[k]
+    }
+    for (const k of orphanDiskKeys) {
+      delete (doc.diskDB as any)[k]
+    }
+  })
+
+  log(chalk.green('[cleanup] Phantom cleanup complete — tombstones will propagate to peers on next sync'))
+}
+
 export const rebootEngine = async (storeHandle: DocHandle<Store>, engine: Engine) => {
   log(`Gracefully rebooting engine ${engine.hostname}`);
   storeHandle.change(doc => {

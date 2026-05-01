@@ -4,7 +4,7 @@ import { enableTimeMonitor, generateHeartBeat } from './monitors/timeMonitor.js'
 import { $, chalk, fs, sleep } from 'zx'
 import { deepPrint, log } from './utils/utils.js'
 import { config } from './data/Config.js'
-import { createOrUpdateEngine, localEngineId } from './data/Engine.js'
+import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
 import { enableHttpMonitor } from './monitors/httpMonitor.js'
 import { DocumentId, Repo, DocHandle } from '@automerge/automerge-repo'
@@ -100,6 +100,12 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     const engine = await createOrUpdateEngine(storeHandle, localEngineId)
     await storeHandle.whenReady()
     const store = storeHandle.doc()
+
+    // Remove any phantom engine entries and orphan disks that accumulated
+    // from previous boots (e.g. before the sudo-hdparm fix). Runs before any
+    // monitors start so there is no racing writer; tombstones propagate to
+    // all peers on the next Automerge sync.
+    cleanupPhantomEngines(storeHandle)
 
     // Check for undocked apps after restart
     await checkAndSetUndockedApps(storeHandle)
