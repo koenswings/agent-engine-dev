@@ -58,13 +58,21 @@ export const handleCommand = async (
 
     // ── Trace setup ──────────────────────────────────────────────────────────
     const traceId = crypto.randomUUID();
-    const traceCtx = { traceId, command: commandName, args: JSON.stringify(stringArgs) };
+    // Build a named args object when the CommandDefinition has arg names defined,
+    // otherwise fall back to a positional array. The Console filters traces by
+    // args['instanceName'] or args['instanceId'], so named args are required.
+    const namedArgs: Record<string, string> | string[] =
+        command.args.every(a => a.name)
+            ? Object.fromEntries(command.args.map((a, i) => [a.name!, stringArgs[i] ?? null]))
+            : stringArgs
+    const argsJson = JSON.stringify(namedArgs);
+    const traceCtx = { traceId, command: commandName, args: argsJson };
 
     if (commandLogHandle) {
         addTrace(commandLogHandle, {
             traceId,
             command: commandName,
-            args: JSON.stringify(stringArgs),
+            args: argsJson,
             startedAt: Date.now(),
             completedAt: null,
             status: 'running',

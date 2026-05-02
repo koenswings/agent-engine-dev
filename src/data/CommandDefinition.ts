@@ -16,6 +16,7 @@ interface ObjectSpec {
 // Updated ArgumentDescriptor to include ObjectSpec
 export interface ArgumentDescriptor {
     type: ArgumentType;
+    name?: string;        // Human-readable arg name, used to build named trace args
     objectSpec?: ObjectSpec;
 }
 
