@@ -2,7 +2,7 @@ import { DocHandle } from "@automerge/automerge-repo";
 import { Store } from "../data/Store.js";
 import { Command, EngineID } from "../data/CommonTypes.js";
 import { ArgumentDescriptor, CommandDefinition } from "../data/CommandDefinition.js";
-import { CommandLogStore, addTrace, closeTrace } from "../data/CommandLogStore.js";
+import { CommandLogStore, addTrace, closeTrace, getCommandLogHandle } from "../data/CommandLogStore.js";
 import { runWithTrace, flushTrace } from "./CommandLogger.js";
 
 
@@ -108,6 +108,25 @@ export const sendCommand = (storeHandle: DocHandle<Store>, engineId: EngineID, c
     if (!store?.engineDB[engineId]) {
         console.error(`Cannot send command: Engine ${engineId} not found in store.`);
         return;
+    }
+
+    // Trace the dispatch on the originating engine so the Console shows
+    // cross-engine commands in history (e.g. copyApp dispatching startInstance
+    // to a remote engine). This is a one-shot trace with no log lines.
+    const cmdLogHandle = getCommandLogHandle()
+    if (cmdLogHandle) {
+        const commandName = String(command).split(' ')[0]
+        const traceId = crypto.randomUUID()
+        addTrace(cmdLogHandle, {
+            traceId,
+            command: commandName,
+            args: JSON.stringify({ dispatchedTo: engineId, command: String(command) }),
+            startedAt: Date.now(),
+            completedAt: Date.now(),
+            status: 'running',
+            errorMessage: null,
+        })
+        closeTrace(cmdLogHandle, traceId, 'ok')
     }
 
     storeHandle.change(doc => {
