@@ -138,8 +138,8 @@ export const connectEngine = async (repo:Repo, address: IPAddress, hostname: Hos
     await handle.whenReady(); // Ensure it's loaded before returning
     log(`Handle is ready. State: ${handle.state}`);
 
-    handle.on('change', ({ doc }) => {
-      log(`Document changed on connection to ${address}:${port}. Current doc: ${JSON.stringify(doc)}`);
+    handle.on('change', () => {
+      // no-op: CRDT sync events are handled by storeMonitor
     });
 
     network.connections[`${address}:${port}`] = { adapter: clientConnection, missedDiscoveryCount: 0, hostname, engineId };
