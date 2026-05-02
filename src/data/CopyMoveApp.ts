@@ -353,7 +353,7 @@ export const moveApp = async (
     // Use copyApp + manual delete instead.
     const { localEngineId: localId } = await import('./Engine.js')
     if (String(targetDisk.dockedTo) !== String(localId)) {
-        console.error(chalk.red(`moveApp: Target disk '${targetDisk.name}' is on a remote engine. Cross-engine move is not supported — use copyApp instead, then delete the source.`))
+        log(`moveApp: Target disk '${targetDisk.name}' is on a remote engine. Cross-engine move is not supported — use copyApp instead, then delete the source.`)
         return
     }
 
