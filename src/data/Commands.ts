@@ -390,9 +390,9 @@ export const commands: CommandDefinition[] = [
     },
     { name: "installApp", execute: installAppWrapper, args: [{ type: "string" }], scope: 'engine' },
     { name: "createInstance", execute: createInstanceWrapper, args: [{ type: "string" }, { type: "string" }, { type: "string" }, { type: "string" }, { type: "string" }], scope: 'engine' },
-    { name: "startInstance", execute: startInstanceWrapper, args: [{ type: "string" }, { type: "string" }], scope: 'engine' },
-    { name: "runInstance", execute: runInstanceWrapper, args: [{ type: "string" }, { type: "string" }], scope: 'engine' },
-    { name: "stopInstance", execute: stopInstanceWrapper, args: [{ type: "string" }, { type: "string" }], scope: 'engine' },
+    { name: "startInstance", execute: startInstanceWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "diskId" }], scope: 'engine' },
+    { name: "runInstance", execute: runInstanceWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "diskId" }], scope: 'engine' },
+    { name: "stopInstance", execute: stopInstanceWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "diskId" }], scope: 'engine' },
     {
         name: "reboot",
         execute: rebootWrapper,
@@ -407,12 +407,12 @@ export const commands: CommandDefinition[] = [
     },
     { name: "connect", execute: connect, args: [{ type: "string" }], scope: 'any' },
     { name: "disconnect", execute: disconnect, args: [], scope: 'any' },
-    { name: "copyApp", execute: copyAppWrapper, args: [{ type: "string" }, { type: "string" }, { type: "string" }], scope: 'engine' },
-    { name: "moveApp", execute: moveAppWrapper, args: [{ type: "string" }, { type: "string" }, { type: "string" }], scope: 'engine' },
-    { name: "ejectDisk", execute: ejectDiskWrapper, args: [{ type: "string" }], scope: 'engine' },
-    { name: "backupApp", execute: backupAppWrapper, args: [{ type: "string" }, { type: "string" }], scope: 'engine' },
-    { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string" }, { type: "string" }], scope: 'engine' },
-    { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string" }, { type: "string" }, { type: "string" }], scope: 'engine' },
+    { name: "copyApp", execute: copyAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
+    { name: "moveApp", execute: moveAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
+    { name: "ejectDisk", execute: ejectDiskWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
+    { name: "backupApp", execute: backupAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
+    { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
+    { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
     { name: "cancelOperation", execute: async (storeHandle: DocHandle<Store> | null, opId: string) => {
         if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
         const err = cancelOperation(storeHandle, opId)
