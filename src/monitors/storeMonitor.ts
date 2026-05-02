@@ -110,7 +110,6 @@ export const enableStoreMonitor = (storeHandle: DocHandle<Store>, commandLogHand
     // Monitor for the addition or removal of engines in the store
     storeHandle.on('change', ({ doc, patches }) => {
         for (const patch of patches) {
-            log(`StoreMonitor handles the following change: ${deepPrint(patch)}`)
             applyUntilTrue([engineSetMonitor, engineCommandsMonitor, engineLastRunMonitor, instancesMonitor], patch, storeHandle)
         }
     })
