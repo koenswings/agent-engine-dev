@@ -5,6 +5,9 @@ import { Instance, Status, createOrUpdateInstance, startInstance } from './Insta
 import { AppID, BackupMode, DeviceName, DiskID, DiskType, EngineID, DiskName, InstanceID, PortNumber, ServiceImage, Timestamp } from './CommonTypes.js';
 import { Store, getAppsOfDisk, getInstance, getInstancesOfDisk } from './Store.js';
 import { DocHandle } from '@automerge/automerge-repo';
+import { getCommandLogHandle } from './CommandLogStore.js';
+import { addTrace, closeTrace } from './CommandLogStore.js';
+import { runWithTrace } from '../utils/CommandLogger.js';
 
 
 
@@ -394,7 +397,7 @@ export const processSystemInstance = async (storeHandle: DocHandle<Store>, disk:
         return undefined
     }
     if (instance) {
-        await startInstance(storeHandle, instance, disk)
+        await tracedStartInstance(storeHandle, instance, disk)
     }
     return instance
 }
@@ -523,9 +526,42 @@ export const removeApp = async (store: Store, disk: Disk, appId: AppID): Promise
 export const processInstance = async (storeHandle: DocHandle<Store>, disk: Disk, instanceId: InstanceID): Promise<Instance | undefined> => {
     const instance = await createOrUpdateInstance(storeHandle, instanceId, disk)
     if (instance) {
-        await startInstance(storeHandle, instance, disk)
+        await tracedStartInstance(storeHandle, instance, disk)
     }
     return instance
+}
+
+/**
+ * Wraps startInstance with a commandLog trace so that auto-starts triggered
+ * by disk docking appear in the Console command history, just like starts
+ * issued explicitly via the 'startInstance' command.
+ */
+const tracedStartInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk): Promise<void> => {
+    const cmdLogHandle = getCommandLogHandle()
+    const traceId = crypto.randomUUID()
+    const traceCtx = {
+        traceId,
+        command: 'startInstance',
+        args: JSON.stringify({ instanceName: instance.name, diskId: disk.id }),
+    }
+    if (cmdLogHandle) {
+        addTrace(cmdLogHandle, {
+            traceId,
+            command: 'startInstance',
+            args: traceCtx.args,
+            startedAt: Date.now(),
+            completedAt: null,
+            status: 'running',
+            errorMessage: null,
+        })
+    }
+    try {
+        await runWithTrace(traceCtx, () => startInstance(storeHandle, instance, disk))
+        if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'ok')
+    } catch (e: any) {
+        if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'error', e.message ?? String(e))
+        throw e
+    }
 }
 
 export const removeInstance = (storeHandle: DocHandle<Store>, disk: Disk, instanceId: InstanceID): void => {
