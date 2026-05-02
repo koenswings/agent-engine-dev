@@ -11,6 +11,8 @@ import { DeviceName, DiskID, DiskName, InstanceID, Timestamp } from '../data/Com
 import { Instance, Status, stopInstance } from '../data/Instance.js';
 import { config } from '../data/Config.js'
 import { DocHandle } from '@automerge/automerge-repo';
+import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js';
+import { runWithTrace } from '../utils/CommandLogger.js';
 
 export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
 
@@ -291,7 +293,16 @@ export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
         // Stop all instances of the disk and move them to the 'Undocked' state
         const instancesOnDisk = Object.values(store.instanceDB).filter(instance => String(instance.storedOn) === String(disk.id));
         for (const instance of instancesOnDisk) {
-            await stopInstance(storeHandle, instance, disk)
+            const cmdLogHandle = getCommandLogHandle()
+            const traceId = crypto.randomUUID()
+            const traceCtx = { traceId, command: 'stopInstance', args: JSON.stringify({ instanceName: instance.name, diskId: disk.id, reason: 'disk-undocked' }) }
+            if (cmdLogHandle) addTrace(cmdLogHandle, { traceId, command: 'stopInstance', args: traceCtx.args, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
+            try {
+                await runWithTrace(traceCtx, () => stopInstance(storeHandle, instance, disk))
+                if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'ok')
+            } catch (e: any) {
+                if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'error', e.message ?? String(e))
+            }
             log(`Instance ${instance.id} stopped`)
             storeHandle.change(doc => {
                 const inst = doc.instanceDB[instance.id]

@@ -20,6 +20,7 @@ import { Store } from './Store.js'
 import { localEngineId } from './Engine.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { uuid } from '../utils/utils.js'
+import { getCommandLogHandle, addTrace, closeTrace } from './CommandLogStore.js'
 
 // ── Recovery strategy per operation kind ─────────────────────────────────────
 
@@ -231,25 +232,40 @@ export const recoverInterruptedOperations = async (
     for (const op of interrupted) {
         const strategy = RECOVERY_STRATEGY[op.kind] ?? 'fail'
         const handler = retryHandlers[op.kind]
+        const cmdLogHandle = getCommandLogHandle()
+        const traceId = crypto.randomUUID()
+        const traceArgs = JSON.stringify({ ...op.args, recoveredOpId: op.id })
 
         if (strategy === 'retry' && handler) {
             log(chalk.blue(`  ${op.id.slice(0, 8)} ${op.kind}: retrying (idempotent)`))
+            if (cmdLogHandle) addTrace(cmdLogHandle, { traceId, command: op.kind, args: traceArgs, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
             // Mark as Pending before retry so it's visible in the store
             updateOperation(storeHandle, op.id, {
                 status: 'Pending',
                 error: 'Retrying after interrupted run',
             })
             // Fire-and-forget: retry runs in background; startup continues
-            handler(op.args, storeHandle).catch(err => {
+            handler(op.args, storeHandle).then(() => {
+                if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'ok')
+            }).catch(err => {
                 log(chalk.red(`  ${op.id.slice(0, 8)} ${op.kind}: retry failed — ${err.message}`))
                 updateOperation(storeHandle, op.id, {
                     status: 'Failed',
                     error: `Retry failed: ${err.message}`,
                     completedAt: Date.now() as Timestamp,
                 })
+                if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'error', `Retry failed: ${err.message}`)
             })
         } else {
             log(chalk.yellow(`  ${op.id.slice(0, 8)} ${op.kind}: marking Failed (strategy: ${strategy}${strategy === 'retry' ? ', no handler' : ''})`))
+            if (cmdLogHandle) {
+                addTrace(cmdLogHandle, { traceId, command: op.kind, args: traceArgs, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
+                closeTrace(cmdLogHandle, traceId, 'error',
+                    strategy === 'retry'
+                        ? 'Engine restarted while operation was in progress — re-issue to retry'
+                        : 'Engine restarted while operation was in progress — re-issue manually'
+                )
+            }
             updateOperation(storeHandle, op.id, {
                 status: 'Failed',
                 error: strategy === 'retry'
