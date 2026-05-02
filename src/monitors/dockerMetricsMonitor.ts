@@ -117,9 +117,12 @@ const collectMetrics = async (
     if (instanceIds.length === 0) return result
 
     try {
-        // --filter accepts one value per flag; build a filter list
+        // docker stats does not support --filter; resolve container names via docker ps first
         const filterArgs = instanceIds.flatMap(id => ['--filter', `name=${id}`])
-        const proc = await $`docker stats --no-stream --format json ${filterArgs}`
+        const psProc = await $`docker ps --format {{.Names}} ${filterArgs}`
+        const containerNames = psProc.stdout.split('\n').map(l => l.trim()).filter(Boolean)
+        if (containerNames.length === 0) return result
+        const proc = await $`docker stats --no-stream --format json ${containerNames}`
         const lines = proc.stdout.split('\n').filter(l => l.trim())
 
         for (const line of lines) {
