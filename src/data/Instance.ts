@@ -455,6 +455,11 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
   try {
 
     const mountRoot = await diskMountRoot(disk)
+    // Verify the instance directory exists on this engine before proceeding.
+    // If it doesn't, the disk's data isn't here — fail early with a clear error.
+    if (!fs.existsSync(`${mountRoot}/instances/${instance.id}`)) {
+      throw new Error(`Instance directory not found at '${mountRoot}/instances/${instance.id}'. The disk may not be docked to this engine.`)
+    }
     // Create an empty .env file if it does not yet exist
     if (!fs.existsSync(`${mountRoot}/instances/${instance.id}/.env`)) {
       await $`touch ${mountRoot}/instances/${instance.id}/.env`

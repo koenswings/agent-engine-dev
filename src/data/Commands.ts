@@ -223,11 +223,6 @@ const startInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instan
         console.log(chalk.red(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`))
         return
     }
-    // Guard: only start instances whose disk is docked to this engine
-    if (disk.dockedTo && String(disk.dockedTo) !== String(localEngineId)) {
-        log(`startInstance: disk '${disk.name}' is docked to remote engine '${disk.dockedTo}' — skipping local start of '${instanceName}'`)
-        return
-    }
     startInstance(storeHandle, instance, disk)
 }
 
