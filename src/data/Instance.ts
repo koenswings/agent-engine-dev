@@ -2,7 +2,8 @@ import { $, YAML, chalk, fs, os, sleep } from "zx";
 
 $.verbose = false;
 import { addOrUpdateEnvVariable, deepPrint, log, randomPort, readEnvVariable, uuid } from "../utils/utils.js";
-import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber, ServiceImage, Timestamp, Version, DeviceName, InstanceName, AppName, Hostname, DiskID } from "./CommonTypes.js";
+import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber, ServiceImage, Timestamp, Version, DeviceName, InstanceName, AppName, Hostname, DiskID, OperationCause } from "./CommonTypes.js";
+import { createOperation, updateOperation } from './Operations.js'
 import { Store, getDisk, getEngine, getLocalEngine, getInstancesOfEngine, } from "./Store.js";
 import { Disk, diskMountRoot, diskFsRoot } from "./Disk.js";
 import { localEngineId } from "./Engine.js";
@@ -21,7 +22,8 @@ const setStep = (
   instanceId: InstanceID,
   step: number,
   total: number,
-  label: string
+  label: string,
+  opId?: string,
 ) => {
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instanceId]
@@ -30,6 +32,15 @@ const setStep = (
     inst.totalSteps = total
     inst.stepLabel = label
   })
+  // Mirror step progress into the unified Operation record when provided
+  if (opId) {
+    updateOperation(storeHandle, opId, {
+      currentStep: step,
+      totalSteps: total,
+      stepLabel: label,
+      progressPercent: total > 0 ? Math.round((step / total) * 100) : null,
+    })
+  }
 }
 
 const clearStep = (storeHandle: DocHandle<Store>, instanceId: InstanceID) => {
@@ -420,7 +431,7 @@ export const diagnoseInstance = async (instance: Instance, disk: Disk, caughtErr
   return parts.join('\n\n') || 'Unknown error'
 }
 
-export const startInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk): Promise<void> => {
+export const startInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> => {
   const store: Store = storeHandle.doc()
   console.log(`Starting instance '${instance.id}' on disk ${disk.id} of engine '${localEngineId}'.`)
 
@@ -448,6 +459,16 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 
   const totalStartSteps = START_STEPS.length
 
+  // Create an Operation record so start progress appears in operationDB
+  // alongside copy/move/backup ops and is visible to the UI uniformly.
+  const startOpId = createOperation(
+    storeHandle, 'startApp',
+    { instanceId: instance.id, diskId: disk.id },
+    cause,
+    { type: 'instance', id: instance.id },
+  )
+  updateOperation(storeHandle, startOpId, { status: 'Running' })
+
   // Set the instance status to Starting
   log(`Setting instance '${instance.id}' status to Starting`)
   storeHandle.change(doc => {
@@ -473,7 +494,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     // **************************
     // STEP 1 - Port generation
     // **************************
-    setStep(storeHandle, instance.id, 1, totalStartSteps, START_STEPS[1])
+    setStep(storeHandle, instance.id, 1, totalStartSteps, START_STEPS[1], startOpId)
 
     // Generate a port  number for the app  and assign it to the variable port
     // Start from port number 3000 and check if the port is already in use by another app
@@ -556,7 +577,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     // **************************
     // STEP 2 - Password generation
     // **************************
-    setStep(storeHandle, instance.id, 2, totalStartSteps, START_STEPS[2])
+    setStep(storeHandle, instance.id, 2, totalStartSteps, START_STEPS[2], startOpId)
 
     // **************************
     // STEP 1b - Generate a password for the app
@@ -586,7 +607,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     // **************************
     // STEP 3 - Preloading of services
     // **************************
-    setStep(storeHandle, instance.id, 3, totalStartSteps, START_STEPS[3])
+    setStep(storeHandle, instance.id, 3, totalStartSteps, START_STEPS[3], startOpId)
 
     log(`Preloading the service images of the services from the compose file`)
     // Extract the service images of the services from the compose file, and pull them
@@ -610,16 +631,20 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     // **************************
     // STEP 4 - Container creation
     // **************************
-    setStep(storeHandle, instance.id, 4, totalStartSteps, START_STEPS[4])
+    setStep(storeHandle, instance.id, 4, totalStartSteps, START_STEPS[4], startOpId)
 
     await createInstanceContainers(storeHandle, instance, disk)
 
     // **************************
     // STEP 5 - Run the Instance
     // **************************
-    setStep(storeHandle, instance.id, 5, totalStartSteps, START_STEPS[5])
+    setStep(storeHandle, instance.id, 5, totalStartSteps, START_STEPS[5], startOpId)
 
     await runInstance(storeHandle, instance, disk)
+    updateOperation(storeHandle, startOpId, {
+      status: 'Done',
+      completedAt: Date.now() as Timestamp,
+    })
   }
 
   catch (e) {
@@ -632,6 +657,11 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
       inst.statusCondition = condition
     })
     clearStep(storeHandle, instance.id)
+    updateOperation(storeHandle, startOpId, {
+      status: 'Failed',
+      error: errMsg,
+      completedAt: Date.now() as Timestamp,
+    })
   }
 }
 
@@ -939,7 +969,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
   }
 }
 
-export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk): Promise<void> => {
+export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> => {
   console.log(`Stopping app '${instance.id}' on disk '${disk.id}' of engine '${localEngineId}'.`)
 
   // Old implementation using Docker Compose
@@ -957,9 +987,18 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
 
   const totalStopSteps = STOP_STEPS.length
 
+  // Create an Operation record so stop progress appears in operationDB uniformly
+  const stopOpId = createOperation(
+    storeHandle, 'stopApp',
+    { instanceId: instance.id, diskId: disk.id },
+    cause,
+    { type: 'instance', id: instance.id },
+  )
+  updateOperation(storeHandle, stopOpId, { status: 'Running' })
+
   // New implementation using Docker API
   try {
-    setStep(storeHandle, instance.id, 0, totalStopSteps, STOP_STEPS[0])
+    setStep(storeHandle, instance.id, 0, totalStopSteps, STOP_STEPS[0], stopOpId)
     // Find all containers running in the compose started by the instance
     // NOTE: this implementation requires all containers of an instance to be namespaced with the instance id
     log(`Filter for all running containers whose names start with the instance id`)
@@ -974,7 +1013,7 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
     instanceContainers.forEach(container => {
       log(container.data['Names'][0])
     })
-    setStep(storeHandle, instance.id, 1, totalStopSteps, STOP_STEPS[1])
+    setStep(storeHandle, instance.id, 1, totalStopSteps, STOP_STEPS[1], stopOpId)
     for (let container of instanceContainers) {
       // First try to stop the container gracefully  If that does not work, kill it  
       try {
@@ -993,7 +1032,12 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
       inst.status = 'Stopped' as Status // Set the status to Stopped when the instance is stopped
     })
     clearStep(storeHandle, instance.id)
+    updateOperation(storeHandle, stopOpId, {
+      status: 'Done',
+      completedAt: Date.now() as Timestamp,
+    })
   } catch (e) {
+    const errMsg = e instanceof Error ? e.message : String(e)
     console.log(chalk.red(`Error stopping app instance ${instance.id}`))
     console.error(e)
     const condition = await diagnoseInstance(instance, disk, e)
@@ -1003,5 +1047,10 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
       inst.statusCondition = condition
     })
     clearStep(storeHandle, instance.id)
+    updateOperation(storeHandle, stopOpId, {
+      status: 'Failed',
+      error: errMsg,
+      completedAt: Date.now() as Timestamp,
+    })
   }
 }

@@ -1,12 +1,10 @@
 /**
  * Operations.ts — shared helpers for operationDB lifecycle management
  *
- * Design: design/copy-move-app.md (Operation store type)
- * Group R: Interrupted task recovery
- *
- * All long-running commands (copyApp, moveApp, backupApp, restoreApp, installApp)
- * create and update Operation records here. recoverInterruptedOperations() is called
- * at startup to handle any ops left Running/Pending by a crash.
+ * All long-running operations (copyApp, moveApp, backupApp, restoreApp,
+ * startApp, stopApp, upgradeApp, upgradeEngine) create and update Operation
+ * records here.  recoverInterruptedOperations() is called at startup to handle
+ * any ops left Running/Pending by a crash.
  */
 
 import { chalk } from 'zx'
@@ -14,7 +12,7 @@ import { ChildProcess } from 'child_process'
 import { log } from '../utils/utils.js'
 import {
     EngineID, Timestamp,
-    Operation, OperationKind, OperationStatus
+    Operation, OperationKind, OperationStatus, OperationCause, OperationSubject
 } from './CommonTypes.js'
 import { Store } from './Store.js'
 import { localEngineId } from './Engine.js'
@@ -39,6 +37,8 @@ export const RECOVERY_STRATEGY: Record<OperationKind, RecoveryStrategy> = {
     restoreApp:    'fail',    // restore may have partially written target — safer to fail
     upgradeApp:    'fail',    // not yet implemented
     upgradeEngine: 'fail',    // not yet implemented
+    startApp:      'fail',    // partial start state unknown — operator must re-issue
+    stopApp:       'fail',    // partial stop state unknown — operator must re-issue
 }
 
 // ── Operation CRUD ────────────────────────────────────────────────────────────
@@ -46,13 +46,17 @@ export const RECOVERY_STRATEGY: Record<OperationKind, RecoveryStrategy> = {
 export const createOperation = (
     storeHandle: DocHandle<Store>,
     kind: OperationKind,
-    args: Record<string, string>
+    args: Record<string, string>,
+    cause: OperationCause,
+    subject?: OperationSubject | null,
 ): string => {
     const id = uuid()
     const op: Operation = {
         id,
         kind,
         args,
+        cause,
+        subject: subject ?? null,
         engineId: localEngineId,
         status: 'Pending',
         progressPercent: null,

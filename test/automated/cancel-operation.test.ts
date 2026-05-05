@@ -43,6 +43,8 @@ const addOp = (
             id,
             kind: 'copyApp',
             args,
+            cause: 'console-command',
+            subject: null,
             engineId: localEngineId as EngineID,
             status,
             progressPercent: null,

@@ -556,7 +556,7 @@ const tracedStartInstance = async (storeHandle: DocHandle<Store>, instance: Inst
         })
     }
     try {
-        await runWithTrace(traceCtx, () => startInstance(storeHandle, instance, disk))
+        await runWithTrace(traceCtx, () => startInstance(storeHandle, instance, disk, 'disk-docked'))
         if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'ok')
     } catch (e: any) {
         if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'error', e.message ?? String(e))
