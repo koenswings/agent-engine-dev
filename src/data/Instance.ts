@@ -440,6 +440,8 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
           inst.lastStarted = Date.now() as Timestamp
         })
         return
+      } else {
+        log(`Instance '${instance.id}' containers are not running — proceeding with full start`)
       }
     } catch { /* docker not available or no containers — continue with normal start */ }
   }
@@ -447,19 +449,22 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
   const totalStartSteps = START_STEPS.length
 
   // Set the instance status to Starting
+  log(`Setting instance '${instance.id}' status to Starting`)
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
-    inst.status = 'Starting' as Status // Set the status to Starting when the instance is started
+    inst.status = 'Starting' as Status
   })
 
   try {
 
     const mountRoot = await diskMountRoot(disk)
+    log(`Checking instance directory at '${mountRoot}/instances/${instance.id}'`)
     // Verify the instance directory exists on this engine before proceeding.
     // If it doesn't, the disk's data isn't here — fail early with a clear error.
     if (!fs.existsSync(`${mountRoot}/instances/${instance.id}`)) {
       throw new Error(`Instance directory not found at '${mountRoot}/instances/${instance.id}'. The disk may not be docked to this engine.`)
     }
+    log(`Instance directory found — proceeding`)
     // Create an empty .env file if it does not yet exist
     if (!fs.existsSync(`${mountRoot}/instances/${instance.id}/.env`)) {
       await $`touch ${mountRoot}/instances/${instance.id}/.env`
@@ -618,7 +623,8 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
   }
 
   catch (e) {
-    console.log(chalk.red('Error starting app instance'))
+    const errMsg = e instanceof Error ? e.message : String(e)
+    console.log(chalk.red(`Error starting app instance '${instance.id}': ${errMsg}`))
     const condition = await diagnoseInstance(instance, disk, e)
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
@@ -626,7 +632,6 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
       inst.statusCondition = condition
     })
     clearStep(storeHandle, instance.id)
-    console.error(e)
   }
 }
 
