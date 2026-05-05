@@ -89,7 +89,7 @@ const instancesMonitor = (patch, storeHandle): boolean => {
         typeof patch.path[1] === 'string' && // instanceId
         patch.path[2] === 'status') {
         const instanceId = patch.path[1] as InstanceID
-        const status = patch.value as string
+        const status = (patch.value ?? storeHandle.doc()?.instanceDB?.[instanceId]?.status) as string
         log(`Instance ${instanceId} status changed to: ${status}`)
         return true
     } else {

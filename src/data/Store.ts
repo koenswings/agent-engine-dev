@@ -270,11 +270,7 @@ export const getAppsOfDisk = (store: Store, disk: Disk): App[] => {
 export const getInstances = (store: Store): Instance[] => {
     return Object.keys(store.instanceDB).flatMap(instanceId => {
         const instance = getInstance(store, instanceId as InstanceID)
-        if (instance && instance.status === 'Running') {
-            return [instance]
-        } else {
-            return []
-        }
+        return instance ? [instance] : []
     })
 }
 
