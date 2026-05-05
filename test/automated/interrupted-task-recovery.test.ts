@@ -40,6 +40,8 @@ const addOp = (handle: DocHandle<Store>, id: string, kind: OperationKind, status
     handle.change(doc => {
         doc.operationDB[id] = {
             id, kind, args,
+            cause: 'console-command',
+            subject: null,
             engineId: localEngineId,
             status: status as any,
             progressPercent: status === 'Done' ? 100 : 50,

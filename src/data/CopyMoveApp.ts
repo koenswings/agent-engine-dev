@@ -13,7 +13,7 @@ import { log } from '../utils/utils.js'
 import { rsyncDirectory } from '../utils/rsync.js'
 import {
     InstanceID, DiskID, DiskName, InstanceName, Timestamp,
-    OperationKind, ServiceImage
+    OperationKind, OperationCause, ServiceImage
 } from './CommonTypes.js'
 import { Store, getDisk, getInstance, getInstancesOfDisk } from './Store.js'
 import { Disk, processInstance, diskMountRoot, diskFsRoot } from './Disk.js'
@@ -139,7 +139,8 @@ export const copyApp = async (
     storeHandle: DocHandle<Store>,
     instanceName: InstanceName,
     sourceDiskId: DiskID,
-    targetDiskId: DiskID
+    targetDiskId: DiskID,
+    cause: OperationCause = 'console-command',
 ): Promise<void> => {
     const store = storeHandle.doc()
 
@@ -161,7 +162,7 @@ export const copyApp = async (
         instanceId: instance.id,
         sourceDiskId: sourceDisk.id,
         targetDiskId: targetDisk.id,
-    })
+    }, cause, { type: 'instance', id: instance.id })
 
     const newInstanceId = uuid() as InstanceID
     let wasRunning = false
@@ -178,7 +179,7 @@ export const copyApp = async (
         if (instance.status === 'Running' || instance.status === 'Starting') {
             wasRunning = true
             log(`copyApp: stopping instance '${instanceName}' for consistent snapshot`)
-            await stopInstance(storeHandle, instance, sourceDisk)
+            await stopInstance(storeHandle, instance, sourceDisk, 'post-copy')
         }
 
         updateOperation(storeHandle, opId, { status: 'Running' })
@@ -283,7 +284,7 @@ export const copyApp = async (
             })
             // Tell the remote engine to start this instance
             log(`copyApp: sending startInstance command to remote engine '${targetDisk.dockedTo}'`)
-            sendCommand(storeHandle, targetDisk.dockedTo as any, `startInstance ${instance.name} ${targetDisk.id}` as any)
+            sendCommand(storeHandle, targetDisk.dockedTo as any, `startInstance ${instance.name} ${targetDisk.id} --cause cross-engine-cmd` as any)
         } else {
             // Local: use existing processInstance flow
             log(`copyApp: registering new instance ${newInstanceId} on disk '${targetDisk.name}' (${targetDisk.id})`)
@@ -317,7 +318,7 @@ export const copyApp = async (
                 const freshInstance = getInstance(freshStore, instance.id)
                 if (freshInstance) {
                     log(`copyApp: restarting source instance '${instanceName}'`)
-                    await startInstance(storeHandle, freshInstance, sourceDisk)
+                    await startInstance(storeHandle, freshInstance, sourceDisk, 'post-copy')
                 }
             } catch (restartErr: any) {
                 console.error(chalk.red(`copyApp: failed to restart source instance: ${restartErr.message}`))
@@ -338,7 +339,8 @@ export const moveApp = async (
     storeHandle: DocHandle<Store>,
     instanceName: InstanceName,
     sourceDiskId: DiskID,
-    targetDiskId: DiskID
+    targetDiskId: DiskID,
+    cause: OperationCause = 'console-command',
 ): Promise<void> => {
     const store = storeHandle.doc()
 
@@ -368,7 +370,7 @@ export const moveApp = async (
         instanceId: instance.id,
         sourceDiskId: sourceDisk.id,
         targetDiskId: targetDisk.id,
-    })
+    }, cause, { type: 'instance', id: instance.id })
 
     let wasRunning = false
 
@@ -377,7 +379,7 @@ export const moveApp = async (
         if (instance.status === 'Running' || instance.status === 'Starting') {
             wasRunning = true
             log(`moveApp: stopping instance '${instanceName}'`)
-            await stopInstance(storeHandle, instance, sourceDisk)
+            await stopInstance(storeHandle, instance, sourceDisk, 'post-move')
         }
 
         updateOperation(storeHandle, opId, { status: 'Running' })
@@ -486,7 +488,7 @@ export const moveApp = async (
                 const freshInstance = getInstance(freshStore, instance.id)
                 if (freshInstance) {
                     log(`moveApp: restarting source instance '${instanceName}' after failure`)
-                    await startInstance(storeHandle, freshInstance, sourceDisk)
+                    await startInstance(storeHandle, freshInstance, sourceDisk, 'post-move')
                 }
             } catch (restartErr: any) {
                 console.error(chalk.red(`moveApp: failed to restart source instance: ${restartErr.message}`))

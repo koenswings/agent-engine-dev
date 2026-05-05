@@ -114,16 +114,16 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // Crash recovery: retry idempotent interrupted ops; mark others Failed
     await recoverInterruptedOperations(storeHandle, {
         copyApp: async (args, handle) => {
-            await copyApp(handle, args.instanceId as any, args.sourceDiskId as any, args.targetDiskId as any)
+            await copyApp(handle, args.instanceId as any, args.sourceDiskId as any, args.targetDiskId as any, 'crash-recovery')
         },
         moveApp: async (args, handle) => {
-            await moveApp(handle, args.instanceId as any, args.sourceDiskId as any, args.targetDiskId as any)
+            await moveApp(handle, args.instanceId as any, args.sourceDiskId as any, args.targetDiskId as any, 'crash-recovery')
         },
         backupApp: async (args, handle) => {
             const store = handle.doc()
             const backupDisk = store.diskDB[args.backupDiskId]
             if (backupDisk) {
-                await backupInstance(handle, args.instanceId as any, backupDisk as any)
+                await backupInstance(handle, args.instanceId as any, backupDisk as any, undefined, 'crash-recovery')
             }
         },
         // restoreApp: strategy='fail', no retry handler needed

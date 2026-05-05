@@ -353,19 +353,19 @@ describe('recoverInterruptedOperations', () => {
         const { handle } = await makeHandle()
         handle.change(doc => {
             doc.operationDB['op1'] = {
-                id: 'op1', kind: 'copyApp', args: {}, engineId: localEngineId,
+                id: 'op1', kind: 'copyApp', args: {}, cause: 'console-command', subject: null, engineId: localEngineId,
                 status: 'Running', progressPercent: 50,
                 currentStep: null, totalSteps: null, stepLabel: null,
                 startedAt: 0 as Timestamp, completedAt: null, error: null,
             }
             doc.operationDB['op2'] = {
-                id: 'op2', kind: 'moveApp', args: {}, engineId: localEngineId,
+                id: 'op2', kind: 'moveApp', args: {}, cause: 'console-command', subject: null, engineId: localEngineId,
                 status: 'Pending', progressPercent: null,
                 currentStep: null, totalSteps: null, stepLabel: null,
                 startedAt: 0 as Timestamp, completedAt: null, error: null,
             }
             doc.operationDB['op3'] = {
-                id: 'op3', kind: 'copyApp', args: {}, engineId: localEngineId,
+                id: 'op3', kind: 'copyApp', args: {}, cause: 'console-command', subject: null, engineId: localEngineId,
                 status: 'Done', progressPercent: 100,
                 currentStep: null, totalSteps: null, stepLabel: null,
                 startedAt: 0 as Timestamp, completedAt: 1 as Timestamp, error: null,

@@ -298,7 +298,7 @@ export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
             const traceCtx = { traceId, command: 'stopInstance', args: JSON.stringify({ instanceName: instance.name, diskId: disk.id, reason: 'disk-undocked' }) }
             if (cmdLogHandle) addTrace(cmdLogHandle, { traceId, command: 'stopInstance', args: traceCtx.args, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
             try {
-                await runWithTrace(traceCtx, () => stopInstance(storeHandle, instance, disk))
+                await runWithTrace(traceCtx, () => stopInstance(storeHandle, instance, disk, 'disk-undocked'))
                 if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'ok')
             } catch (e: any) {
                 if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'error', e.message ?? String(e))

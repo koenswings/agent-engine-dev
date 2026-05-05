@@ -207,8 +207,13 @@ const createInstanceWrapper = async (storeHandle: DocHandle<Store> | null, insta
     await buildInstance(instanceName, appName, gitAccount, gitTag as Version, disk.device)
 }
 
-const startInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName) => {
+const startInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName, ...rest: string[]) => {
     if (!storeHandle) { console.error(chalk.red("Store is not available.")); return; }
+    // Parse optional --cause flag forwarded by cross-engine copyApp dispatch
+    const causeFlag = rest.find(a => a.startsWith('--cause'))
+    const cause: import('./CommonTypes.js').OperationCause =
+        causeFlag ? (causeFlag.split('=')[1] ?? rest[rest.indexOf(causeFlag) + 1] ?? 'cross-engine-cmd') as any
+        : 'console-command'
     const store = storeHandle.doc()
     const instance = findInstanceByName(store, instanceName)
     if (!instance) {
@@ -223,7 +228,7 @@ const startInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instan
         console.log(chalk.red(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`))
         return
     }
-    startInstance(storeHandle, instance, disk)
+    startInstance(storeHandle, instance, disk, cause)
 }
 
 const runInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName) => {
@@ -257,7 +262,7 @@ const stopInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanc
         console.log(chalk.red(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`))
         return
     }
-    stopInstance(storeHandle, instance, disk)
+    stopInstance(storeHandle, instance, disk, 'console-command')
 }
 
 const sendWrapper = (storeHandle: DocHandle<Store> | null, args: string) => {
@@ -298,7 +303,7 @@ const backupAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceNa
         return
     }
     console.log(chalk.blue(`Backing up instance '${instanceName}' to disk '${backupDisk.name}'...`))
-    await backupInstance(storeHandle, instance.id, backupDisk as any)
+    await backupInstance(storeHandle, instance.id, backupDisk as any, undefined, 'console-command')
 }
 
 const restoreAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, targetDiskName: DiskName) => {
@@ -311,7 +316,7 @@ const restoreAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceN
     if (!targetDisk) { console.error(chalk.red(`Target disk '${targetDiskName}' not found or not docked.`)); return; }
 
     console.log(chalk.blue(`Restoring instance '${instanceName}' to disk '${targetDiskName}'...`))
-    await restoreApp(storeHandle, instance.id, targetDisk as any)
+    await restoreApp(storeHandle, instance.id, targetDisk as any, undefined, 'console-command')
 }
 
 const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskName: DiskName, mode: string, ...instanceNames: InstanceName[]) => {
@@ -338,12 +343,12 @@ const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, dis
 
 const copyAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, sourceDiskId: DiskID, targetDiskId: DiskID) => {
     if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
-    await copyApp(storeHandle, instanceName, sourceDiskId, targetDiskId)
+    await copyApp(storeHandle, instanceName, sourceDiskId, targetDiskId, 'console-command')
 }
 
 const moveAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, sourceDiskId: DiskID, targetDiskId: DiskID) => {
     if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
-    await moveApp(storeHandle, instanceName, sourceDiskId, targetDiskId)
+    await moveApp(storeHandle, instanceName, sourceDiskId, targetDiskId, 'console-command')
 }
 
 const ejectDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskName: DiskName) => {
