@@ -339,7 +339,13 @@ export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, inst
         instance = storedInstance
         instance.instanceOf = createAppId(compose['x-app'].name, compose['x-app'].version) as AppID
         instance.name = instanceName as InstanceName
-        instance.status = 'Docked' as Status;
+        // Preserve Stopped status — the operator explicitly stopped this instance.
+        // Only reset to Docked if the instance was in a transient or detached state
+        // (Missing, Undocked, Error) so it can be started again after re-dock.
+        // Running / Starting / Stopped are intentional states that must not be overwritten here.
+        if (instance.status === 'Missing' || instance.status === 'Undocked' || instance.status === 'Error') {
+          instance.status = 'Docked' as Status
+        }
         instance.storedOn = disk.id
         instance.serviceImages = servicesImages as ServiceImage[]
 
