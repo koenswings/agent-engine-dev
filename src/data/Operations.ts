@@ -79,13 +79,20 @@ export const updateOperation = (
     id: string,
     patch: Partial<Pick<Operation, 'status' | 'progressPercent' | 'currentStep' | 'totalSteps' | 'stepLabel' | 'completedAt' | 'error'>>
 ): void => {
-    // Log a step-advance marker before mutating the store so we can compare old vs new
+    // Log a step-advance marker before mutating the store.
+    // Uses console.log directly (not log()) so it always lands in the CommandLog trace
+    // regardless of verbosity level, and is visible in the Console log panel.
     if (patch.currentStep != null) {
         const op = storeHandle.doc()?.operationDB?.[id]
         if (op && patch.currentStep !== op.currentStep) {
             const total = patch.totalSteps ?? op.totalSteps ?? '?'
+            const step  = patch.currentStep + 1
             const label = patch.stepLabel ?? op.stepLabel ?? ''
-            log(chalk.cyan(`▶ [${op.kind} ${id.slice(0, 8)}] step ${patch.currentStep + 1}/${total}${label ? ` — ${label}` : ''}`))
+            const line  = label ? `  Step ${step}/${total}  │  ${label}  ` : `  Step ${step}/${total}  `
+            const bar   = '─'.repeat(line.length)
+            console.log(`┌${bar}┐`)
+            console.log(`│${line}│`)
+            console.log(`└${bar}┘`)
         }
     }
     storeHandle.change(doc => {

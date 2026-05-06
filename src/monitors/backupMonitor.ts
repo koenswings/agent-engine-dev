@@ -21,6 +21,8 @@ import { stopInstance, startInstance, BACKUP_STEPS } from '../data/Instance.js'
 import { BackupMode, DiskID, DiskName, InstanceID, Timestamp, OperationCause } from '../data/CommonTypes.js'
 import { Store, getInstance, getDisks, findDiskByName } from '../data/Store.js'
 import { DocHandle } from '@automerge/automerge-repo'
+import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js'
+import { runWithTrace, flushTrace, getActiveTrace } from '../utils/CommandLogger.js'
 
 $.verbose = false
 
@@ -73,6 +75,21 @@ export const backupInstance = async (
     existingOpId?: string,  // pass when retrying an interrupted op
     cause: OperationCause = 'console-command',
 ): Promise<void> => {
+    // If there is no active trace (called from backup monitor, not via Console command),
+    // create one so that step markers and log lines land in the Console log panel.
+    if (!getActiveTrace()) {
+        const cmdLogHandle = getCommandLogHandle()
+        const traceId = crypto.randomUUID()
+        const traceArgs = JSON.stringify({ instanceId, backupDiskId: backupDisk.id, cause })
+        if (cmdLogHandle) addTrace(cmdLogHandle, { traceId, command: 'backupApp', args: traceArgs, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
+        return runWithTrace({ traceId, command: 'backupApp', args: traceArgs }, async () => {
+            await backupInstance(storeHandle, instanceId, backupDisk, existingOpId, cause)
+            if (cmdLogHandle) { await flushTrace(traceId); closeTrace(cmdLogHandle, traceId, 'ok') }
+        }).catch(async (err: any) => {
+            if (cmdLogHandle) { await flushTrace(traceId); closeTrace(cmdLogHandle, traceId, 'error', err?.message ?? String(err)) }
+        })
+    }
+
     if (activeBackups.has(instanceId)) {
         log(`Backup for ${instanceId} already in progress — skipping duplicate trigger`)
         return
@@ -120,7 +137,11 @@ export const backupInstance = async (
         const totalBackupSteps = BACKUP_STEPS.length
 
         const setBackupStep = (step: number, label: string) => {
-            log(chalk.cyan(`▶ [backupApp ${opId.slice(0, 8)}] step ${step + 1}/${totalBackupSteps} — ${label}`))
+            const line = `  Step ${step + 1}/${totalBackupSteps}  │  ${label}  `
+            const bar  = '─'.repeat(line.length)
+            console.log(`┌${bar}┐`)
+            console.log(`│${line}│`)
+            console.log(`└${bar}┘`)
             storeHandle.change(doc => {
                 const op = doc.operationDB?.[opId]
                 if (!op) return
