@@ -79,6 +79,15 @@ export const updateOperation = (
     id: string,
     patch: Partial<Pick<Operation, 'status' | 'progressPercent' | 'currentStep' | 'totalSteps' | 'stepLabel' | 'completedAt' | 'error'>>
 ): void => {
+    // Log a step-advance marker before mutating the store so we can compare old vs new
+    if (patch.currentStep != null) {
+        const op = storeHandle.doc()?.operationDB?.[id]
+        if (op && patch.currentStep !== op.currentStep) {
+            const total = patch.totalSteps ?? op.totalSteps ?? '?'
+            const label = patch.stepLabel ?? op.stepLabel ?? ''
+            log(chalk.cyan(`▶ [${op.kind} ${id.slice(0, 8)}] step ${patch.currentStep + 1}/${total}${label ? ` — ${label}` : ''}`))
+        }
+    }
     storeHandle.change(doc => {
         const op = doc.operationDB?.[id]
         if (!op) return
