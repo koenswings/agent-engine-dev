@@ -120,6 +120,7 @@ export const backupInstance = async (
         const totalBackupSteps = BACKUP_STEPS.length
 
         const setBackupStep = (step: number, label: string) => {
+            log(chalk.cyan(`▶ [backupApp ${opId.slice(0, 8)}] step ${step + 1}/${totalBackupSteps} — ${label}`))
             storeHandle.change(doc => {
                 const op = doc.operationDB?.[opId]
                 if (!op) return

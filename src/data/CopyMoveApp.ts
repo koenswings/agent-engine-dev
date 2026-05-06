@@ -174,17 +174,31 @@ export const copyApp = async (
         ? getEngineAddress(targetDisk.dockedTo as any) as string
         : undefined
 
+    // ── step definitions ──────────────────────────────────────────────────────
+    const COPY_STEPS = [
+        'Stopping instance',          // 0
+        'Checking free space',        // 1
+        'Syncing app master',         // 2
+        'Syncing instance data',      // 3
+        'Syncing service images',     // 4
+        'Registering on target disk', // 5
+    ]
+    const setCopyStep = (step: number) =>
+        updateOperation(storeHandle, opId, { currentStep: step, totalSteps: COPY_STEPS.length, stepLabel: COPY_STEPS[step] })
+
     try {
         // 1. Stop source instance if running
         if (instance.status === 'Running' || instance.status === 'Starting') {
             wasRunning = true
             log(`copyApp: stopping instance '${instanceName}' for consistent snapshot`)
+            setCopyStep(0)
             await stopInstance(storeHandle, instance, sourceDisk, 'post-copy')
         }
 
         updateOperation(storeHandle, opId, { status: 'Running' })
 
         // 2. Check free space (local only — skip for cross-engine)
+        setCopyStep(1)
         if (!isCrossEngine) {
             const needed = await directoryBytes(appMasterSrc) + await directoryBytes(instanceSrc)
             const available = await availableBytes(await diskFsRoot(targetDisk))
@@ -209,6 +223,7 @@ export const copyApp = async (
         }
 
         // 4. rsync app master (idempotent — skips if already present and identical)
+        setCopyStep(2)
         const appMasterDest = `${targetMountRoot}/apps/${appId}`
         log(`copyApp: syncing app master ${appMasterSrc} → ${isCrossEngine ? remoteAddress + ':' : ''}${appMasterDest}`)
         await rsyncDirectory(appMasterSrc, appMasterDest, ({ progressPercent }) => {
@@ -216,6 +231,7 @@ export const copyApp = async (
         }, opId, remoteAddress)
 
         // 5. rsync instance data into a NEW instance directory (new ID)
+        setCopyStep(3)
         const instanceDest = `${targetMountRoot}/instances/${newInstanceId}`
         if (!isCrossEngine) await fs.ensureDir(instanceDest)
         else await $`ssh -o StrictHostKeyChecking=no pi@${remoteAddress} mkdir -p ${instanceDest}`
@@ -227,6 +243,7 @@ export const copyApp = async (
         // 5b. rsync service image tars needed by this instance
         //     services/ holds the Docker image tars that startInstance loads via
         //     `docker image load`. Without them the copied instance cannot start.
+        setCopyStep(4)
         const sourceMountRootCopy = await diskMountRoot(sourceDisk)
         const copyServicesSrcDir = `${sourceMountRootCopy}/services`
         const copyServicesDestDir = `${targetMountRoot}/services`
@@ -253,6 +270,7 @@ export const copyApp = async (
         }
 
         // 6. Register/start the new instance
+        setCopyStep(5)
         if (isCrossEngine) {
             // Cross-engine: create instance record in shared store (as Docked),
             // then tell the remote engine to start it via sendCommand.
@@ -374,17 +392,32 @@ export const moveApp = async (
 
     let wasRunning = false
 
+    // ── step definitions ──────────────────────────────────────────────────────
+    const MOVE_STEPS = [
+        'Stopping instance',          // 0
+        'Checking free space',        // 1
+        'Syncing app master',         // 2
+        'Syncing instance data',      // 3
+        'Syncing service images',     // 4
+        'Registering on target disk', // 5
+        'Removing source data',       // 6
+    ]
+    const setMoveStep = (step: number) =>
+        updateOperation(storeHandle, opId, { currentStep: step, totalSteps: MOVE_STEPS.length, stepLabel: MOVE_STEPS[step] })
+
     try {
         // 1. Stop source instance if running
         if (instance.status === 'Running' || instance.status === 'Starting') {
             wasRunning = true
             log(`moveApp: stopping instance '${instanceName}'`)
+            setMoveStep(0)
             await stopInstance(storeHandle, instance, sourceDisk, 'post-move')
         }
 
         updateOperation(storeHandle, opId, { status: 'Running' })
 
         // 2. Check free space
+        setMoveStep(1)
         const needed = await directoryBytes(appMasterSrc) + await directoryBytes(instanceSrc)
         const available = await availableBytes(await diskFsRoot(targetDisk))
         if (available < needed) {
@@ -401,6 +434,7 @@ export const moveApp = async (
         await fs.ensureDir(`${targetMountRoot}/services`)
 
         // 4. rsync app master
+        setMoveStep(2)
         const appMasterDest = `${targetMountRoot}/apps/${appId}`
         log(`moveApp: syncing app master ${appMasterSrc} → ${appMasterDest}`)
         await rsyncDirectory(appMasterSrc, appMasterDest, ({ progressPercent }) => {
@@ -408,6 +442,7 @@ export const moveApp = async (
         }, opId)
 
         // 5. rsync instance data — same instance ID, new location
+        setMoveStep(3)
         const instanceDest = `${targetMountRoot}/instances/${instance.id}`
         await fs.ensureDir(instanceDest)
         log(`moveApp: syncing instance data ${instanceSrc} → ${instanceDest}`)
@@ -418,6 +453,7 @@ export const moveApp = async (
         // 5b. rsync service image tars needed by this instance
         //     services/ holds the Docker image tars that startInstance loads via
         //     `docker image load`. Without them the moved instance cannot start.
+        setMoveStep(4)
         const sourceMountRootMove = await diskMountRoot(sourceDisk)
         const moveServicesSrcDir = `${sourceMountRootMove}/services`
         const moveServicesDestDir = `${targetMountRoot}/services`
@@ -442,10 +478,12 @@ export const moveApp = async (
         // 6. Register on target disk (storedOn + status set here; instance starts).
         //    This MUST succeed before we touch the source record — if cancelled before
         //    this point the source record is untouched and the operator can retry cleanly.
+        setMoveStep(5)
         log(`moveApp: registering instance ${instance.id} on disk '${targetDisk.name}' (${targetDisk.id})`)
         await processInstance(storeHandle, targetDisk, instance.id)
 
         // 8. Remove source instance directory
+        setMoveStep(6)
         // Use sudo rm -rf because instance data dirs may contain files owned by
         // Docker container users (e.g. Kolibri data owned by root inside the container).
         log(`moveApp: removing source instance directory ${instanceSrc}`)
