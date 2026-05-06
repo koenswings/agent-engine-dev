@@ -1,6 +1,6 @@
 import { DocHandle } from '@automerge/automerge-repo'
 import { Store } from '../data/Store.js'
-import { log, deepPrint } from '../utils/utils.js'
+import { log } from '../utils/utils.js'
 import { EngineID, InstanceID } from '../data/CommonTypes.js'
 import { handleCommand } from '../utils/commandUtils.js'
 import { commands } from '../data/Commands.js';
@@ -17,7 +17,6 @@ const engineSetMonitor = (patch, storeHandle): boolean => {
     ) {
         const engineId = patch.path[1].toString() as EngineID
         log(`New engine added with ID: ${engineId}`)
-        log(`Doc now contains: ${deepPrint(storeHandle.doc(), 2)}`)
         return true
     } else {
         return false
@@ -75,7 +74,6 @@ const engineLastRunMonitor = (patch, storeHandle): boolean => {
         const lastRun = patch.value as number
         const engineId = patch.path[1] as EngineID
         log(`Engine ${engineId} last run updated to: ${lastRun}`)
-        log(`Doc now contains: ${deepPrint(storeHandle.doc(), 2)}`)
         return true
     } else {
         return false
