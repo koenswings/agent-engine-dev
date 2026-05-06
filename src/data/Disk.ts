@@ -388,7 +388,11 @@ export const processSystemInstance = async (storeHandle: DocHandle<Store>, disk:
             } else {
                 log(`Updating existing system instance ${instanceId}`)
                 stored.storedOn = disk.id
-                stored.status = 'Docked' as Status
+                // Preserve Stopped status — same rule as createOrUpdateInstance:
+                // only reset to Docked from transient/detached states.
+                if (stored.status === 'Missing' || stored.status === 'Undocked' || stored.status === 'Error') {
+                    stored.status = 'Docked' as Status
+                }
                 instance = stored
             }
         })
@@ -537,6 +541,13 @@ export const processInstance = async (storeHandle: DocHandle<Store>, disk: Disk,
  * issued explicitly via the 'startInstance' command.
  */
 const tracedStartInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk): Promise<void> => {
+    // Never auto-start an instance that was explicitly stopped by the operator.
+    // processInstance is called on every disk-dock event; without this guard a
+    // re-dock (or a spurious udev re-add) would restart a stopped instance.
+    if (instance.status === 'Stopped') {
+        log(`tracedStartInstance: skipping auto-start of '${instance.name}' (${instance.id}) — status is Stopped`)
+        return
+    }
     const cmdLogHandle = getCommandLogHandle()
     const traceId = crypto.randomUUID()
     const traceCtx = {
