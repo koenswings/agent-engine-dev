@@ -136,7 +136,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
 
     // Start the HTTP server (serves Console UI + /api/store-url)
     log(chalk.bgMagenta('STARTING HTTP SERVER'))
-    enableHttpMonitor(undefined, undefined, commandLogHandle)
+    const httpServer = enableHttpMonitor(undefined, undefined, commandLogHandle)
 
     // Start the instances monitor
     // log(chalk.bgMagenta('STARTING INSTANCES MONITOR'))
@@ -147,14 +147,14 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         // this will be fired when you kill the app with ctrl + c.
         log('Shutting down automerge')
         log('*** SIGINT received ****');
-        await shutdownProcedure(repo)
+        await shutdownProcedure(repo, httpServer)
         process.exit(0)
     })
     process.on('SIGTERM', async () => {
         // this will be fired by the Linux shutdown command
         log('Shutting down automerge')
         log('*** SIGTERM received ****');
-        await shutdownProcedure(repo)
+        await shutdownProcedure(repo, httpServer)
         process.exit(0)
     })
 
@@ -210,7 +210,14 @@ export const checkAndSetUndockedApps = async (storeHandle: DocHandle<Store>): Pr
     await Promise.all(promises);
 };
 
-async function shutdownProcedure(repo:Repo):Promise<void> {
+async function shutdownProcedure(repo: Repo, httpServer?: import('http').Server): Promise<void> {
     console.log('*** Engine is now closing ***');
+    // Close the HTTP server first so the port is released before the process exits.
+    // Without this, PM2 restarts the engine before the OS releases the port, causing
+    // EADDRINUSE on startup and leaving the engine unreachable until TIME_WAIT expires.
+    if (httpServer) {
+        await new Promise<void>(resolve => httpServer.close(() => resolve()))
+        log('HTTP server closed')
+    }
     if (repo) await repo.shutdown()
 }
