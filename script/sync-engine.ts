@@ -133,6 +133,10 @@ const syncEngine = async () => {
     const $$ = ssh(`${user}@${machine}`);
     try {
       await $$`command -v pm2`;
+      // Apply setcap so node can bind to ports 80 and 4321 without root
+      console.log(chalk.blue(`Applying setcap on ${machine}...`));
+      const nodePath = (await $$`which node`).stdout.trim();
+      await $$`sudo setcap cap_net_bind_service=+ep ${nodePath}`;
       await $$`cd ${enginePath} && sudo pm2 start pm2.config.cjs`;
       await $$`sudo pm2 save`;
     } catch (e) {
