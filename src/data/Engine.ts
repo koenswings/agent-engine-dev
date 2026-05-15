@@ -363,16 +363,15 @@ export const installTemperature = async (exec: any) => {
   }
   console.log(chalk.green('lm-sensors installed'));
 
-  console.log(chalk.blue('Running sensors...'));
+  console.log(chalk.blue('Running sensors (best-effort — may show no data on first boot)...'));
   try {
     const ret = await exec`sensors`
     console.log(ret.stdout)
   } catch (e) {
-    console.log(chalk.red('Error running sensors'));
-    console.error(e);
-    process.exit(1);
+    // sensors-detect hasn’t been run yet on a fresh Pi — not fatal
+    console.log(chalk.yellow('sensors returned no data (run sensors-detect manually to configure modules)'));
   }
-  console.log(chalk.green('Sensors run'));
+  console.log(chalk.green('lm-sensors ready'));
 }
 
 export const setHostname = async (exec: any, hostname: string) => {
