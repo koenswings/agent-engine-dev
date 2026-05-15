@@ -90,10 +90,10 @@ for spec in "$@"; do
   # ── Step 2: Add /etc/hosts entry so <name>.local resolves ─────────────
   echo "[2/4] Adding /etc/hosts entry: $IP -> $NAME.local"
   HOSTS_FILE="/etc/hosts"
-  # Remove existing entry for this name if present
+  # Remove existing entry for this name if present, then add the new one
   grep -v "$NAME.local" "$HOSTS_FILE" > /tmp/hosts.new 2>/dev/null || cp "$HOSTS_FILE" /tmp/hosts.new
   echo "$IP $NAME.local" >> /tmp/hosts.new
-  cp /tmp/hosts.new "$HOSTS_FILE"
+  sudo cp /tmp/hosts.new "$HOSTS_FILE"   # sudo required — /etc/hosts is root-owned
   echo "  Added: $IP $NAME.local"
 
   # ── Step 3: Add SSH config entry ──────────────────────────────────────
@@ -136,7 +136,10 @@ EOF
   fi
 
   cd "$REPO_ROOT"
-  # Use tsx-based wrapper (same as documented dev workflow)
+  # Use tsx-based wrapper (same as documented dev workflow).
+  # Note: build-engine ends with a reboot, so the SSH connection drops and the
+  # script exits non-zero even on success. We treat exit 255 (SSH disconnect)
+  # as a successful completion rather than an error.
   ./build-engine \
     --machine "${NAME}.local" \
     --user "$SSH_USER" \
@@ -145,10 +148,12 @@ EOF
     --keyboard "us" \
     $EXTRA_FLAGS \
     --prod \
-    2>&1 | tee "/tmp/provision-${NAME}.log" || {
-      echo "ERROR: build-engine failed for $NAME. Log: /tmp/provision-${NAME}.log"
-      continue
-    }
+    2>&1 | tee "/tmp/provision-${NAME}.log"
+  BUILD_EXIT=${PIPESTATUS[0]}
+  if [[ $BUILD_EXIT -ne 0 && $BUILD_EXIT -ne 255 ]]; then
+    echo "ERROR: build-engine failed for $NAME (exit $BUILD_EXIT). Log: /tmp/provision-${NAME}.log"
+    continue
+  fi
 
   echo ""
   echo "✓ $NAME provisioning complete. Pi will reboot and come up as $NAME.local"
