@@ -157,14 +157,14 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         // this will be fired when you kill the app with ctrl + c.
         log('Shutting down automerge')
         log('*** SIGINT received ****');
-        await shutdownProcedure(repo, httpServer)
+        await shutdownProcedure(repo, httpServer, mdnsHandle)
         process.exit(0)
     })
     process.on('SIGTERM', async () => {
         // this will be fired by the Linux shutdown command
         log('Shutting down automerge')
         log('*** SIGTERM received ****');
-        await shutdownProcedure(repo, httpServer)
+        await shutdownProcedure(repo, httpServer, mdnsHandle)
         process.exit(0)
     })
 
@@ -173,10 +173,11 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     enableStoreMonitor(storeHandle, commandLogHandle)
 
     const configMDNS = config.settings.mdns
+    let mdnsHandle: { end: () => Promise<void> } | undefined
     if (!disableMDNS && configMDNS) {
         await sleep(1000)
         log(chalk.bgMagenta('STARTING MULTICAST DNS MONITOR'))
-        enableMulticastDNSEngineMonitor(storeHandle, repo)
+        mdnsHandle = enableMulticastDNSEngineMonitor(storeHandle, repo)
     }
 
 
@@ -220,8 +221,15 @@ export const checkAndSetUndockedApps = async (storeHandle: DocHandle<Store>): Pr
     await Promise.all(promises);
 };
 
-async function shutdownProcedure(repo: Repo, httpServer?: import('http').Server): Promise<void> {
+async function shutdownProcedure(repo: Repo, httpServer?: import('http').Server, mdnsHandle?: { end: () => Promise<void> }): Promise<void> {
     console.log('*** Engine is now closing ***');
+    // Send mDNS goodbye packets so peers immediately know this engine is gone.
+    // Without this, stale records linger until TTL expiry and cause name conflicts
+    // on the next startup (ciao renames the service to 'hostname (2)').
+    if (mdnsHandle) {
+        try { await mdnsHandle.end() } catch (_) {}
+        log('mDNS service ended')
+    }
     // Close the HTTP server first so the port is released before the process exits.
     // Without this, PM2 restarts the engine before the OS releases the port, causing
     // EADDRINUSE on startup and leaving the engine unreachable until TIME_WAIT expires.
