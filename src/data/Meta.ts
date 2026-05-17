@@ -223,36 +223,15 @@ export const createMeta = async (device: DeviceName, engineVersion: Version | un
 const writeMeta = async (meta: DiskMeta, rootPath: string): Promise<void> => {
   log(`Writing metadata ${deepPrint(meta)} to ${rootPath}`)
   try {
-    // const enginePath = `/home/pi`
-    // Remove the old META file
-    // await $`sudo rm -f ${enginePath}/METAtemp.yaml`
-    // await $`sudo touch ${enginePath}/METAtemp.yaml`
-    // await $`sudo echo 'diskId: ${meta.diskId}' >> ${enginePath}/METAtemp.yaml`
-    // await $`sudo echo 'diskName: ${meta.diskName}' >> ${enginePath}/METAtemp.yaml`
-    // await $`sudo echo 'created: ${meta.created}' >> ${enginePath}/METAtemp.yaml`
-    // await $`sudo echo 'lastDocked: ${meta.lastDocked}' >> ${enginePath}/METAtemp.yaml`
-    // if (meta.version) {
-    //   await $`sudo echo 'version: ${meta.version}' >> ${enginePath}/METAtemp.yaml`
-    // }
-    // if (meta.isHardwareId) {
-    //   await $`sudo echo 'isHardwareId: true' >> ${enginePath}/METAtemp.yaml`
-    // }
-    // // Move the META.yaml file to the root directory
-    // await $`sudo mv ${enginePath}/METAtemp.yaml ${rootPath}`
-
-    // Generate a temporary file in /home/pi using mktemp
-    const tmpFile = (await $`sudo mktemp --suffix=.yaml --tmpdir=/home/pi`).stdout.trim()
-    await $`sudo echo 'diskId: ${meta.diskId}' >> ${tmpFile}`
-    await $`sudo echo 'diskName: ${meta.diskName}' >> ${tmpFile}`
-    await $`sudo echo 'created: ${meta.created}' >> ${tmpFile}`
-    await $`sudo echo 'lastDocked: ${meta.lastDocked}' >> ${tmpFile}`
-    if (meta.version) {
-      await $`sudo echo 'version: ${meta.version}' >> ${tmpFile}`
-    }
-    if (meta.isHardwareId) {
-      await $`sudo echo 'isHardwareId: true' >> ${tmpFile}`
-    }
-    // Move the META.yaml file to the root directory
+    // Build the YAML content in memory — avoids the sudo-echo-redirect pattern which
+    // fails because shell redirection (>>) runs as pi, not root, so it can't write
+    // to a root-owned temp file created by `sudo mktemp`.
+    //
+    // Strategy: write to a pi-owned temp file (no sudo needed), then sudo mv it into
+    // place. This is safe and atomic on the same filesystem.
+    const yamlContent = YAML.stringify(meta)
+    const tmpFile = (await $`mktemp --suffix=.yaml`).stdout.trim()
+    await $`echo ${yamlContent} > ${tmpFile}`
     await $`sudo mv ${tmpFile} ${rootPath}`
 
   } catch (e) {
