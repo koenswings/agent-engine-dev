@@ -93,6 +93,15 @@ export const disconnectEngine = (repo: Repo, address: IPAddress, port: PortNumbe
   if (connection) {
     log(`Disconnecting from engine at ${connectionKey}`);
     try {
+      // Suppress the async 'error' event that ws emits when closed in CONNECTING state.
+      // Without this, the event goes unhandled and crashes Node even though the synchronous
+      // throw from ws.close() is already caught below.
+      const ws = (connection.adapter as any).socket;
+      if (ws && typeof ws.on === 'function') {
+        ws.on('error', (err: Error) => {
+          log(`Suppressed async WebSocket error during disconnect: ${err.message}`);
+        });
+      }
       repo.networkSubsystem.removeNetworkAdapter(connection.adapter);
       const engine = findRunningEngineByHostname(storeHandle.doc(), hostname);
       if (engine) {
@@ -107,7 +116,7 @@ export const disconnectEngine = (repo: Repo, address: IPAddress, port: PortNumbe
       if (e.message === 'WebSocket was closed before the connection was established') {
         log(`Ignoring expected error during disconnect: ${e.message}`);
       } else {
-        throw e;
+        log(`Unexpected error during disconnect from ${connectionKey}: ${e.message}`);
       }
     }
     delete network.connections[connectionKey];

@@ -142,6 +142,16 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // log(chalk.bgMagenta('STARTING INSTANCES MONITOR'))
     // await enableInstanceStatusMonitor(storeHandle)
     
+    // Safety net: log unhandled async errors instead of crashing.
+    // The primary fix is suppressing the WebSocket async error event in Network.ts,
+    // but this catches anything else that slips through.
+    process.on('uncaughtException', (err: Error) => {
+        log(`[uncaughtException] ${err.message}\n${err.stack}`);
+    });
+    process.on('unhandledRejection', (reason: any) => {
+        log(`[unhandledRejection] ${reason instanceof Error ? reason.stack : String(reason)}`);
+    });
+
     // If this process is killed, shut down automerge
     process.on('SIGINT', async () => {
         // this will be fired when you kill the app with ctrl + c.
