@@ -17,6 +17,7 @@ export interface Settings {
     storeDataFolder: string;
     storeIdentityFolder: string;
     heartbeatIntervalMs: number;  // How often the engine writes a heartbeat to the store (default: 50000ms)
+    systemDiskSkip?: boolean;     // If true, skip registering the Pi boot disk as a system disk (for test harnesses)
 }
 
 export interface Defaults {
@@ -206,4 +207,25 @@ export const config = readConfig('./config.yaml');
 // This must be set before any module that reads config at import time (e.g. Engine.ts).
 if (process.env.IDEA_TEST_MODE === 'true') {
     config.settings.testMode = true;
+}
+
+// Allow IDEA_ENGINE_PORT=<number> to override the WebSocket port from config.yaml.
+// Used by Kit's test harness to run a second engine alongside the production instance.
+if (process.env.IDEA_ENGINE_PORT) {
+    const port = parseInt(process.env.IDEA_ENGINE_PORT, 10);
+    if (!isNaN(port)) {
+        config.settings.port = port;
+    }
+}
+
+// Allow IDEA_STORE_DIR=<path> to override the store data folder from config.yaml.
+// Used by Kit's test harness to give the test engine an isolated store directory.
+if (process.env.IDEA_STORE_DIR) {
+    config.settings.storeDataFolder = process.env.IDEA_STORE_DIR;
+}
+
+// Allow IDEA_SYSTEM_DISK_SKIP=true to skip registering the Pi boot disk as a system disk.
+// Used by Kit's test harness to avoid conflicts with the production engine on the same Pi.
+if (process.env.IDEA_SYSTEM_DISK_SKIP === 'true') {
+    config.settings.systemDiskSkip = true;
 }
