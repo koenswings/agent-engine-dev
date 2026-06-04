@@ -81,7 +81,13 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
             try {
                 // System disk (root partition): already mounted at /, no mount needed.
                 // Read identity from /META.yaml and register as a system disk.
+                // Skip if IDEA_SYSTEM_DISK_SKIP=true (used by Kit's test harness to avoid
+                // conflicts when a second engine runs alongside the production instance).
                 if (systemDevice && device === systemDevice) {
+                    if (config.settings.systemDiskSkip) {
+                        log(`Device ${device} is the system disk — skipping registration (IDEA_SYSTEM_DISK_SKIP=true)`)
+                        return
+                    }
                     log(`Device ${device} is the system disk (root partition) — registering as system disk`)
                     try {
                         const meta = await readMetaUpdateId()  // reads /META.yaml, no device arg
