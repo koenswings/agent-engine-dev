@@ -229,3 +229,10 @@ if (process.env.IDEA_STORE_DIR) {
 if (process.env.IDEA_SYSTEM_DISK_SKIP === 'true') {
     config.settings.systemDiskSkip = true;
 }
+
+// Allow IDEA_MDNS_DISABLE=true to suppress mDNS advertisement and peer discovery.
+// Used by Kit's test harness to prevent the test engine from conflicting with the
+// production engine's mDNS service name and attempting to sync with its store.
+if (process.env.IDEA_MDNS_DISABLE === 'true') {
+    config.settings.mdns = false;
+}
