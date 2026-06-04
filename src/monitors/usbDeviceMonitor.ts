@@ -193,7 +193,8 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         }
     }
 
-    const actualDevices = (config.settings.isDev || config.settings.testMode) ? [] : (await $`ls /dev/engine`).toString().split('\n').filter(device => validDevice(device))
+    const engineWatchDir = process.env.IDEA_WATCH_DIR || '/dev/engine'
+    const actualDevices = (config.settings.isDev || config.settings.testMode) ? [] : (await $`ls ${engineWatchDir}`).toString().split('\n').filter(device => validDevice(device))
     log(`Actual devices: ${actualDevices}`)
 
     log(`Removing from the network database disks that were attached before the current boot but are no longer attached now...`)
@@ -249,7 +250,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         }
     }
 
-    const watchDir = '/dev/engine'
+    const watchDir = process.env.IDEA_WATCH_DIR || '/dev/engine'
     const watcher = chokidar.watch(watchDir, { persistent: true })
 
     watcher
