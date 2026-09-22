@@ -16,7 +16,7 @@ import { config } from './Config.js'
 
 // ── Types (also exported for use in CommonTypes consumers) ───────────────────
 
-export type LogLevel = 'log' | 'warn' | 'error' | 'debug'
+export type LogLevel = 'log' | 'warn' | 'error' | 'debug' | 'info'
 
 export interface LogEntry {
   level: LogLevel

@@ -8,7 +8,7 @@
  * Usage:
  *   1. Call initCommandLogger(handle) once at engine startup.
  *   2. Wrap every command dispatch in runWithTrace(ctx, fn).
- *   3. Everything inside fn() that calls console.log/warn/error/debug
+ *   3. Everything inside fn() that calls console.log/info/warn/error/debug
  *      is automatically collected into that trace's log list.
  */
 
@@ -98,6 +98,7 @@ const patchConsole = (): void => {
 
   const originals = {
     log:   console.log.bind(console),
+    info:  console.info.bind(console),
     warn:  console.warn.bind(console),
     error: console.error.bind(console),
     debug: console.debug.bind(console),
@@ -120,6 +121,7 @@ const patchConsole = (): void => {
   }
 
   patch('log')
+  patch('info')
   patch('warn')
   patch('error')
   patch('debug')

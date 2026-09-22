@@ -1,7 +1,7 @@
 import path from 'path'
 import { Engine, localEngineId } from './Engine.js'
 import { Disk } from './Disk.js'
-import { deepPrint, getKeys, log } from '../utils/utils.js'
+import { deepPrint, getKeys, log, print } from '../utils/utils.js'
 import { App } from './App.js'
 import { Instance } from './Instance.js'
 import { User } from './User.js'
@@ -142,14 +142,14 @@ import { config } from './Config.js'
 // ... (other imports)
 
 export const createClientStore = async (hostnames: string[], clientPeerId: PeerId, storeDocId: DocumentId, timeout?: number): Promise<{handle: DocHandle<Store>, repo: Repo}> => {
-    console.log(`Connecting to hosts ${hostnames.join(', ')} with peer ID ${clientPeerId}`);
+    print(`Connecting to hosts ${hostnames.join(', ')} with peer ID ${clientPeerId}`);
     
     const connectPromise = (async () => {
         const urls = await Promise.all(hostnames.map(async (hostname) => {
             try {
-                console.log(chalk.blue(`Resolving hostname ${hostname}...`));
+                print(chalk.blue(`Resolving hostname ${hostname}...`));
                 const { address } = await lookup(hostname);
-                console.log(chalk.green(`  - Resolved to ${address}`));
+                print(chalk.green(`  - Resolved to ${address}`));
                 const port = config.settings.port || 4321;
                 return `ws://${address}:${port}`;
             } catch (e) {
@@ -173,17 +173,17 @@ export const createClientStore = async (hostnames: string[], clientPeerId: PeerI
     try {
         let result;
         if (timeout) {
-            console.log(chalk.blue(`Attempting to connect with a ${timeout} second timeout...`));
+            print(chalk.blue(`Attempting to connect with a ${timeout} second timeout...`));
             const timeoutPromise = new Promise<never>((_, reject) => 
                 setTimeout(() => reject(new Error(`Connection timed out after ${timeout} seconds`)), timeout * 1000)
             );
             result = await Promise.race([connectPromise, timeoutPromise]);
         } else {
-            console.log(chalk.blue(`Attempting to connect with no timeout...`));
+            print(chalk.blue(`Attempting to connect with no timeout...`));
             result = await connectPromise;
         }
         
-        console.log(`Connected successfully with peer ID ${clientPeerId}`);
+        print(`Connected successfully with peer ID ${clientPeerId}`);
         return result;
 
     } catch (e) {

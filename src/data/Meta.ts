@@ -1,5 +1,5 @@
 import { $, chalk, YAML } from 'zx'
-import { deepPrint, fileExists, log, stripPartition, uuid } from '../utils/utils.js'
+import { deepPrint, fileExists, log, stripPartition, uuid, print } from '../utils/utils.js'
 import { DeviceName, DiskID, DiskName, Timestamp, Version } from './CommonTypes.js'
 import { config } from './Config.js'
 
@@ -43,8 +43,18 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
       device = deviceSpec as DeviceName
     } else {
       path = `/META.yaml`
-      device = (await $`findmnt / -no SOURCE`).stdout.split('/')[2].trim() as DeviceName
-      //log(`last character of device is ${device[device.length - 1]}`)
+      // findmnt may return /dev/sda2 (Pi) or "overlay"/tmpfs (containers/VMs).
+      // Only /dev/... paths have a usable device name at split('/')[2].
+      const rootSource = (await $`findmnt / -no SOURCE`).stdout.trim()
+      const sourceParts = rootSource.split('/').filter(Boolean)
+      if (rootSource.startsWith('/dev/') && sourceParts.length >= 2) {
+        device = sourceParts[1] as DeviceName  // e.g. sda2 from /dev/sda2
+      } else {
+        // Non-block root (overlay, etc.) — device is only used for hardware-id
+        // lookup, which is skipped in testMode/isDev. Use a stable placeholder.
+        device = 'system' as DeviceName
+        log(`Root SOURCE is '${rootSource}' (non-/dev); using device placeholder '${device}'`)
+      }
     }
     log(`Reading metadata for device ${device} at path ${path}`)
 
@@ -215,7 +225,7 @@ export const createMeta = async (device: DeviceName, engineVersion: Version | un
     // Create the META.yaml file
     await writeMeta(meta, `/disks/${device}/META.yaml`)
   } catch (e) {
-    console.log(chalk.red('Error creating metadata'));
+    print(chalk.red('Error creating metadata'));
   }
   return meta
 }
@@ -235,7 +245,7 @@ const writeMeta = async (meta: DiskMeta, rootPath: string): Promise<void> => {
     await $`sudo mv ${tmpFile} ${rootPath}`
 
   } catch (e) {
-    console.log(chalk.red('Error writing metadata'))
+    print(chalk.red('Error writing metadata'))
     console.error(e)
   }
 }
@@ -269,11 +279,11 @@ export const readRemoteDiskId = async (exec: any): Promise<DiskID | undefined> =
 export const addMeta = async (exec: any, hostname: string, version: string) => {
   let id = await readRemoteDiskId(exec)
   if (id === undefined) {
-    console.log(chalk.yellow(`Disk id is ${id}`));
-    console.log(chalk.red('Remote disk has no disk id.  Generating one.'))
+    print(chalk.yellow(`Disk id is ${id}`));
+    print(chalk.red('Remote disk has no disk id.  Generating one.'))
     id = uuid() as DiskID
   }
-  console.log(chalk.blue('Adding metadata...'));
+  print(chalk.blue('Adding metadata...'));
   try {
     await exec`sudo rm -f /META.yaml`;
     await exec`echo 'diskId: ${id}' | sudo tee -a /META.yaml`;
@@ -283,7 +293,7 @@ export const addMeta = async (exec: any, hostname: string, version: string) => {
     await exec`echo 'version: ${version}' | sudo tee -a /META.yaml`;
     await exec`echo 'lastDocked: ${new Date().getTime()}' | sudo tee -a /META.yaml`;
   } catch (e) {
-    console.log(chalk.red('Error adding metadata'));
+    print(chalk.red('Error adding metadata'));
     console.error(e);
     process.exit(1);
   }
@@ -318,11 +328,11 @@ export const addMeta = async (exec: any, hostname: string, version: string) => {
 // export const addMeta = async (exec: any, hostname: string, version: string) => {
 //   let id = await readRemoteDiskId(exec)
 //   if (id === undefined) {
-//     console.log(chalk.yellow(`Disk id is ${id}`));
-//     console.log(chalk.red('Remote disk has no disk id.  Generating one.'))
+//     was-console-log(chalk.yellow(`Disk id is ${id}`));
+//     was-console-log(chalk.red('Remote disk has no disk id.  Generating one.'))
 //     id = uuid() as DiskID
 //   }
-//   console.log(chalk.blue('Adding metadata...'));
+//   was-console-log(chalk.blue('Adding metadata...'));
 //   try {
 //     await exec`sudo rm -f /META.yaml`;
 //     await exec`echo 'diskId: ${id}' | sudo tee -a /META.yaml`;
@@ -332,7 +342,7 @@ export const addMeta = async (exec: any, hostname: string, version: string) => {
 //     await exec`echo 'version: ${version}' | sudo tee -a /META.yaml`;
 //     await exec`echo 'lastDocked: ${new Date().getTime()}' | sudo tee -a /META.yaml`;
 //   } catch (e) {
-//     console.log(chalk.red('Error adding metadata'));
+//     was-console-log(chalk.red('Error adding metadata'));
 //     console.error(e);
 //     process.exit(1);
 //   }

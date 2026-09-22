@@ -11,7 +11,7 @@
  */
 
 import { $, YAML, chalk, fs } from 'zx'
-import { log } from '../utils/utils.js'
+import { log, print } from '../utils/utils.js'
 import { config } from '../data/Config.js'
 import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot } from '../data/Disk.js'
 import { indexBackupDiskApps } from '../data/InstallApp.js'
@@ -139,9 +139,9 @@ export const backupInstance = async (
         const setBackupStep = (step: number, label: string) => {
             const line = `  Step ${step + 1}/${totalBackupSteps}  │  ${label}  `
             const bar  = '─'.repeat(line.length)
-            console.log(`┌${bar}┐`)
-            console.log(`│${line}│`)
-            console.log(`└${bar}┘`)
+            print(`┌${bar}┐`)
+            print(`│${line}│`)
+            print(`└${bar}┘`)
             storeHandle.change(doc => {
                 const op = doc.operationDB?.[opId]
                 if (!op) return

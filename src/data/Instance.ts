@@ -1,7 +1,7 @@
 import { $, YAML, chalk, fs, os, sleep } from "zx";
 
 $.verbose = false;
-import { addOrUpdateEnvVariable, deepPrint, log, randomPort, readEnvVariable, uuid } from "../utils/utils.js";
+import { addOrUpdateEnvVariable, deepPrint, log, randomPort, readEnvVariable, uuid, print } from "../utils/utils.js";
 import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber, ServiceImage, Timestamp, Version, DeviceName, InstanceName, AppName, Hostname, DiskID, OperationCause } from "./CommonTypes.js";
 import { createOperation, updateOperation } from './Operations.js'
 import { Store, getDisk, getEngine, getLocalEngine, getInstancesOfEngine, } from "./Store.js";
@@ -12,7 +12,6 @@ import { createAppId } from "./App.js";
 import { Docker } from "node-docker-api";
 import { createMeta } from '../data/Meta.js'
 import { config } from '../data/Config.js'
-import { error } from "console";
 import { DocHandle } from "@automerge/automerge-repo";
 
 // ── Step-progress helpers ─────────────────────────────────────────────────────
@@ -112,7 +111,7 @@ export type Status = 'Undocked'      // Disk is not currently docked; instance d
 
 
 export const buildInstance = async (instanceName: InstanceName, appName: AppName, gitAccount: string, version: Version, device: DeviceName): Promise<void> => {
-  console.log(`Building new instance '${instanceName}' from version ${version} of app '${appName}' on device '${device}' of the local engine.`)
+  print(`Building new instance '${instanceName}' from version ${version} of app '${appName}' on device '${device}' of the local engine.`)
 
   // CODING STYLE: only use absolute pathnames !
   // CODING STYLE: use try/catch for error handling
@@ -125,7 +124,7 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     // Do it
     // const disk = findDiskByDevice(store, getLocalEngine(store), device)
     // if (!disk) {
-    //   console.log(chalk.red(`Disk ${device} not found on engine ${getLocalEngine(store).hostname}`))
+    //   was-console-log(chalk.red(`Disk ${device} not found on engine ${getLocalEngine(store).hostname}`))
     //   return
     // } else {
     //   instanceId = createInstanceId(instanceName, appName, disk.id).toString() as InstanceID
@@ -136,8 +135,8 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
 
 
     // Create the app infrastructure if it does not exist
-    // TODO: This should be done when creating the disk
-    // TODO: Here we should only be checking if it is an apps disk! 
+    // TODO: This should be done when creating the disk — https://github.com/koenswings/idea/issues/46
+    // TODO: Here we should only be checking if it is an apps disk! — https://github.com/koenswings/idea/issues/46
     await $`mkdir -p /disks/${device}/apps /disks/${device}/services /disks/${device}/instances`
 
     // **************************
@@ -148,17 +147,17 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     // Remove /tmp/apps/${typeName} if it exists
     await $`rm -rf /tmp/apps/${appName}`
     let appVersion = ""
-    console.log(`Cloning version ${version} of app ${appName} from git account ${gitAccount}`)
+    print(`Cloning version ${version} of app ${appName} from git account ${gitAccount}`)
     if (version === "latest") {
-      console.log(`Cloning the latest development version of app ${appName} from git account ${gitAccount}`)
+      print(`Cloning the latest development version of app ${appName} from git account ${gitAccount}`)
       await $`git clone https://github.com/${gitAccount}/app-${appName} /tmp/apps/${appName}`
       // Set appVersion to the latest commit hash
       const gitLog = await $`cd /tmp/apps/${appName} && git log -n 1 --pretty=format:%H`
       appVersion = gitLog.stdout.trim()
-      console.log(`App version: ${appVersion}`)
+      print(`App version: ${appVersion}`)
 
     } else {
-      console.log(`Cloning version ${version} of app ${appName} from git account ${gitAccount}`)
+      print(`Cloning version ${version} of app ${appName} from git account ${gitAccount}`)
       await $`git clone -b ${version} https://github.com/koenswings/app-${appName} /tmp/apps/${appName}`
       appVersion = version
     }
@@ -197,7 +196,7 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
 
     // If the app has an init_data.tar.gz file, unpack it in the app folder
     if (fs.existsSync(`/disks/${device}/instances/${instanceId}/init_data.tar.gz`)) {
-      console.log(`Unpacking the init_data.tar.gz file in the app folder`)
+      print(`Unpacking the init_data.tar.gz file in the app folder`)
       await $`tar -xzf /disks/${device}/instances/${instanceId}/init_data.tar.gz -C /disks/${device}/instances/${instanceId}`
       // Rename the folder init_data to data
       await $`mv /disks/${device}/instances/${instanceId}/init_data /disks/${device}/instances/${instanceId}/data`
@@ -211,7 +210,7 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     // }
 
     // Open the compose.yaml file of the app instance and add the version info to the compose file and the instance name
-    console.log(`Opening the compose.yaml file of the app instance and adding the version info to the compose file (${appVersion}) and the instance name (${instanceName})`)
+    print(`Opening the compose.yaml file of the app instance and adding the version info to the compose file (${appVersion}) and the instance name (${instanceName})`)
     const composeFile = await $`cat /disks/${device}/instances/${instanceId}/compose.yaml`
     const compose = YAML.parse(composeFile.stdout)
     compose['x-app'].version = appVersion
@@ -233,9 +232,9 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
       // Pull the sercice image
       const serviceImageFile = serviceImage.replace(/\//g, '_')
       if (fs.existsSync(`/disks/${device}/services/${serviceImageFile}.tar`)) {
-        console.log(`Service image ${serviceImage} already exists`)
+        print(`Service image ${serviceImage} already exists`)
       } else {
-        console.log(`Pulling service image ${serviceImage}`)
+        print(`Pulling service image ${serviceImage}`)
         await $`docker image pull ${serviceImage}`
         // Save the service image
         await $`docker save ${serviceImage} > /disks/${device}/services/${serviceImageFile}.tar`
@@ -250,14 +249,14 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
       log(`Creating META.yaml file on disk ${device}`)
       createMeta(device)
     } else {
-      console.log(`META.yaml file already exists on disk ${device}`)
+      print(`META.yaml file already exists on disk ${device}`)
     }
 
     // OBSOLETE 
     // Create the META.yaml file
     // Do it
     // await addMetadata(instanceId)
-    // console.log(chalk.blue('Adding metadata...'));
+    // was-console-log(chalk.blue('Adding metadata...'));
     // try {
     //     // Convert the diskMetadata object to a YAML string 
     //     // const diskMetadataYAML = YAML.stringify(diskMetadata)
@@ -276,16 +275,16 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     //     // Move the META.yaml file to the root directory
     //     await $`sudo mv ${metaPath}/META.yaml /META.yaml`
     // } catch (e) {
-    //   console.log(chalk.red('Error adding metadata'));
+    //   was-console-log(chalk.red('Error adding metadata'));
     //   console.error(e);
     //   process.exit(1);
     // }
 
 
 
-    console.log(chalk.green(`Instance ${instanceId} built`))
+    print(chalk.green(`Instance ${instanceId} built`))
   } catch (e) {
-    console.log(chalk.red('Error building app instance'))
+    print(chalk.red('Error building app instance'))
     console.error(e)
   }
 }
@@ -439,7 +438,7 @@ export const diagnoseInstance = async (instance: Instance, disk: Disk, caughtErr
 
 export const startInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> => {
   const store: Store = storeHandle.doc()
-  console.log(`Starting instance '${instance.id}' on disk ${disk.id} of engine '${localEngineId}'.`)
+  print(`Starting instance '${instance.id}' on disk ${disk.id} of engine '${localEngineId}'.`)
 
   // Short-circuit: if containers are already running (e.g. engine restarted while app was up),
   // just update the status to Running and return — no need to recreate containers.
@@ -507,7 +506,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     // The port is in use by another app if an app can be found in networkdata with the same port
     // let port = 3000
     // const instances = getEngineInstances(store, getLocalEngine(store))
-    // console.log(`Searching for an available port number for instance ${instance.id}. Current instances: ${deepPrint(instances)}.`)
+    // was-console-log(`Searching for an available port number for instance ${instance.id}. Current instances: ${deepPrint(instances)}.`)
     // while (true) {
     //   const inst = instances.find(instance => instance && instance.port == port)
     //   if (inst) {
@@ -573,7 +572,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
       await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'port', port.toString())
     }
 
-    console.log(`Found a port number for instance ${instance.id}: ${port}`)
+    print(`Found a port number for instance ${instance.id}: ${port}`)
     // Assign the port number to the instance object
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
@@ -655,7 +654,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 
   catch (e) {
     const errMsg = e instanceof Error ? e.message : String(e)
-    console.log(chalk.red(`Error starting app instance '${instance.id}': ${errMsg}`))
+    print(chalk.red(`Error starting app instance '${instance.id}': ${errMsg}`))
     const condition = await diagnoseInstance(instance, disk, e)
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
@@ -673,7 +672,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 
 
 // export const oldStartInstance = async (store: Store, instance: Instance, disk: Disk): Promise<void> => {
-//   console.log(`Starting instance '${instance.id}' on disk ${disk.id} of engine '${getLocalEngine(store).hostname}'.`)
+//   was-console-log(`Starting instance '${instance.id}' on disk ${disk.id} of engine '${getLocalEngine(store).hostname}'.`)
 
 //   try {
 
@@ -688,7 +687,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 //     // The port is in use by another app if an app can be found in networkdata with the same port
 //     // let port = 3000
 //     // const instances = getEngineInstances(store, getLocalEngine(store))
-//     // console.log(`Searching for an available port number for instance ${instance.id}. Current instances: ${deepPrint(instances)}.`)
+//     // was-console-log(`Searching for an available port number for instance ${instance.id}. Current instances: ${deepPrint(instances)}.`)
 //     // while (true) {
 //     //   const inst = instances.find(instance => instance && instance.port == port)
 //     //   if (inst) {
@@ -705,7 +704,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 //     const docker = new Docker({ socketPath: '/var/run/docker.sock' });
 //     const containers = await docker.container.list()
 //     containers.forEach(container => {
-//       console.log(container.data['Names'][0])
+//       was-console-log(container.data['Names'][0])
 //     })
 //     const container = containers.find(container => container.data['Names'][0].includes(instance.id))
 //     if (container) {
@@ -755,7 +754,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 //       }
 //     }
 
-//     console.log(`Found a port number for instance ${instance.id}: ${port}`)
+//     was-console-log(`Found a port number for instance ${instance.id}: ${port}`)
 //     instance.port = port as PortNumber
 
 //     // Update the .env file
@@ -792,7 +791,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 //   }
 
 //   catch (e) {
-//     console.log(chalk.red('Error starting app instance'))
+//     was-console-log(chalk.red('Error starting app instance'))
 //     console.error(e)
 //   }
 // }
@@ -840,7 +839,7 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
       inst.status = 'Pauzed' as Status
     })
   } catch (e) {
-    console.log(chalk.red(`Error creating the containers of app instance ${instance.id}`))
+    print(chalk.red(`Error creating the containers of app instance ${instance.id}`))
     console.error(e)
     const condition = await diagnoseInstance(instance, disk, e)
     storeHandle.change(doc => {
@@ -867,7 +866,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
     // Also remove the newline at the end
     //const port = envContent.split('=')[1].slice(0, -1)
     const port = await readEnvVariable(`${await diskMountRoot(disk)}/instances/${instance.id}/.env`, 'port')
-    console.log(`Ports: ${deepPrint(port)}`)
+    print(`Ports: ${deepPrint(port)}`)
     if (port) {
       const parsedPort = parseInt(port)
       // If parsedPort is not NaN, assign it to the instance port
@@ -926,7 +925,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
     // Modify the dockerEvents of the instance
     // instance.dockerEvents = { events: await $`docker events ${instanceName}` }  // This is not correct, we need to use the right container name
 
-    console.log(chalk.green(`App ${instance.id} running`))
+    print(chalk.green(`App ${instance.id} running`))
     clearStep(storeHandle, instance.id)
 
     // App-specific post-processing commands
@@ -964,7 +963,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
 
 
   } catch (e) {
-    console.log(chalk.red(`Error running app instance ${instance.id}`))
+    print(chalk.red(`Error running app instance ${instance.id}`))
     console.error(e)
     const condition = await diagnoseInstance(instance, disk, e)
     storeHandle.change(doc => {
@@ -976,7 +975,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
 }
 
 export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> => {
-  console.log(`Stopping app '${instance.id}' on disk '${disk.id}' of engine '${localEngineId}'.`)
+  print(`Stopping app '${instance.id}' on disk '${disk.id}' of engine '${localEngineId}'.`)
 
   // Old implementation using Docker Compose
   // Problem with this approach: stopping an instance is not possible when its disk has already been removed
@@ -985,9 +984,9 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
   //   // Do it
   //   // await $`docker compose -f /disks/${disk.device}/instances/${instance.id}/compose.yaml stop`
   //   await $`cd /disks/${disk.device}/instances/${instance.id} && docker compose down`
-  //   console.log(chalk.green(`App ${instance.id} stopped`))
+  //   was-console-log(chalk.green(`App ${instance.id} stopped`))
   // } catch (e) {
-  //   console.log(chalk.red(`Error stopping app instance ${instance.id}`))
+  //   was-console-log(chalk.red(`Error stopping app instance ${instance.id}`))
   //   console.error(e)
   // }
 
@@ -1044,7 +1043,7 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
     })
   } catch (e) {
     const errMsg = e instanceof Error ? e.message : String(e)
-    console.log(chalk.red(`Error stopping app instance ${instance.id}`))
+    print(chalk.red(`Error stopping app instance ${instance.id}`))
     console.error(e)
     const condition = await diagnoseInstance(instance, disk, e)
     storeHandle.change(doc => {
