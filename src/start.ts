@@ -2,7 +2,7 @@ import os from 'os'
 import { enableUsbDeviceMonitor } from './monitors/usbDeviceMonitor.js'
 import { enableTimeMonitor, generateHeartBeat } from './monitors/timeMonitor.js'
 import { $, chalk, fs, sleep } from 'zx'
-import { deepPrint, log } from './utils/utils.js'
+import { deepPrint, log, print } from './utils/utils.js'
 import { config } from './data/Config.js'
 import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
@@ -222,7 +222,7 @@ export const checkAndSetUndockedApps = async (storeHandle: DocHandle<Store>): Pr
 };
 
 async function shutdownProcedure(repo: Repo, httpServer?: import('http').Server, mdnsHandle?: { end: () => Promise<void> }): Promise<void> {
-    console.log('*** Engine is now closing ***');
+    print('*** Engine is now closing ***');
     // Send mDNS goodbye packets so peers immediately know this engine is gone.
     // Without this, stale records linger until TTL expiry and cause name conflicts
     // on the next startup (ciao renames the service to 'hostname (2)').

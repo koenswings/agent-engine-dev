@@ -1,5 +1,6 @@
 import { Suite, Runner } from 'mocha'
 import Mocha from 'mocha';
+import { print } from './utils/utils.js';
 
 // First, you need to instantiate a Mocha instance
 
@@ -26,7 +27,7 @@ runner.run(function(failures) {
     // the json reporter gets a testResults JSON object on end
     //var testResults = mochaReporter.testResults;
 
-    //console.log(testResults);
+    //was-console-log(testResults);
     // send your email here
-    console.log('done')
+    print('done')
 });

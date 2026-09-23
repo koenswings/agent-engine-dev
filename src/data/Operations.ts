@@ -9,7 +9,7 @@
 
 import { chalk } from 'zx'
 import { ChildProcess } from 'child_process'
-import { log } from '../utils/utils.js'
+import { log, print } from '../utils/utils.js'
 import {
     EngineID, Timestamp,
     Operation, OperationKind, OperationStatus, OperationCause, OperationSubject
@@ -90,9 +90,9 @@ export const updateOperation = (
             const label = patch.stepLabel ?? op.stepLabel ?? ''
             const line  = label ? `  Step ${step}/${total}  │  ${label}  ` : `  Step ${step}/${total}  `
             const bar   = '─'.repeat(line.length)
-            console.log(`┌${bar}┐`)
-            console.log(`│${line}│`)
-            console.log(`└${bar}┘`)
+            print(`┌${bar}┐`)
+            print(`│${line}│`)
+            print(`└${bar}┘`)
         }
     }
     storeHandle.change(doc => {

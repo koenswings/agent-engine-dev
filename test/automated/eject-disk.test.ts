@@ -122,7 +122,7 @@ describe('ejectDisk command', () => {
     })
 
     it('is rejected when called from console scope', async () => {
-        const scopeSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+        const scopeSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
         await handleCommand(commands, storeHandle, 'console', 'ejectDisk MyDisk')
         expect(scopeSpy).toHaveBeenCalledWith(expect.stringContaining("can only be executed on an engine"))
         scopeSpy.mockRestore()

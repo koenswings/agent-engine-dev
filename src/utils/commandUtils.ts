@@ -4,6 +4,7 @@ import { Command, EngineID } from "../data/CommonTypes.js";
 import { ArgumentDescriptor, CommandDefinition } from "../data/CommandDefinition.js";
 import { CommandLogStore, addTrace, closeTrace, getCommandLogHandle } from "../data/CommandLogStore.js";
 import { runWithTrace, flushTrace } from "./CommandLogger.js";
+import { print } from './utils.js';
 
 
 export const handleCommand = async (
@@ -18,7 +19,7 @@ export const handleCommand = async (
     const command = commands.find(cmd => cmd.name === commandName);
 
     if (!command) {
-        console.log(`Unknown command: ${commandName}`);
+        print(`Unknown command: ${commandName}`);
         return;
     }
 
@@ -35,12 +36,12 @@ export const handleCommand = async (
 
     // Scope checking
     if (context === 'console' && command.scope === 'engine') {
-        console.log(`Error: Command '${commandName}' can only be executed on an engine. Use 'send <engineId> ${commandName} ...' to execute it remotely.`);
+        print(`Error: Command '${commandName}' can only be executed on an engine. Use 'send <engineId> ${commandName} ...' to execute it remotely.`);
         return;
     }
 
     if (context === 'engine' && command.scope === 'console') {
-        console.log(`Error: Command '${commandName}' can only be executed on a console.`);
+        print(`Error: Command '${commandName}' can only be executed on a console.`);
         return;
     }
 
@@ -102,7 +103,7 @@ export const handleCommand = async (
  * This is used by tests and the 'send' command definition.
  */
 export const sendCommand = (storeHandle: DocHandle<Store>, engineId: EngineID, command: Command): void => {
-    console.log(`Sending command '${command}' to engine ${engineId}`);
+    print(`Sending command '${command}' to engine ${engineId}`);
 
     const store = storeHandle.doc();
     if (!store?.engineDB[engineId]) {

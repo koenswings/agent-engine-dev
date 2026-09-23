@@ -5,11 +5,11 @@ import { WebSocketServer } from "ws";
 import { WebSocketServerAdapter } from "@automerge/automerge-repo-network-websocket";
 import os from "os";
 
-console.log("Starting Automerge server...");
+console.info("Starting Automerge server...");
 
 // Define the directory for storing Automerge data.
 const dataDir = `./automerge-data`;
-console.log(`Using data directory: ${dataDir}`);
+console.info(`Using data directory: ${dataDir}`);
 
 // 1. Create a storage adapter for the server to persist data.
 const storage = new NodeFSStorageAdapter(dataDir);
@@ -24,4 +24,4 @@ const repo = new Repo({
   network: [network]
 });
 
-console.log("Automerge server is running on ws://localhost:3030");
+console.info("Automerge server is running on ws://localhost:3030");

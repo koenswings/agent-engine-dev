@@ -55,7 +55,7 @@ export const logTimeCallback = () => {
 //                 app.name = app.name + 'X'
 //             }
 //         })
-//         console.log(`Deep change to apps: ${JSON.stringify(apps.toArray())}`)
+//         was-console-log(`Deep change to apps: ${JSON.stringify(apps.toArray())}`)
 //     }
 // }
 

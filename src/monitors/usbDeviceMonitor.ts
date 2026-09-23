@@ -16,7 +16,7 @@ import { runWithTrace } from '../utils/CommandLogger.js';
 
 export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
 
-    // TODO: Alternative implementations for usb device detection:
+    // TODO: Alternative implementations for usb device detection — https://github.com/koenswings/idea/issues/46:
     // 1. Monitor /dev iso /dev/engine
     // 2. Monitor /dev/disk/by-label
     // 3. Monitor dmesg output

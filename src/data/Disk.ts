@@ -190,13 +190,13 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
         if (await isUpgradeDisk(disk)) {
             log(`Disk ${disk.id} is an upgrade disk`)
             detectedTypes.push('upgrade')
-            // TODO: Implement upgrade disk processing
+            // TODO: Implement upgrade disk processing — https://github.com/koenswings/idea/issues/46
         }
 
         if (await isFilesDisk(disk)) {
             log(`Disk ${disk.id} is a files disk`)
             detectedTypes.push('files')
-            // TODO: Implement files disk processing
+            // TODO: Implement files disk processing — https://github.com/koenswings/idea/issues/46
         }
 
         if (detectedTypes.length === 0) {

@@ -36,7 +36,7 @@ export const startAutomergeServer = async (dataDir:string, port:PortNumber):Prom
 
     // handle.on("change", ({ doc, patches }) => {
     //     log(`repo.ts: Document received with handle.on: ${deepPrint(doc, 2)}`);
-    //     console.log(`Changes received with handle.on: ${JSON.stringify(patches)}`);
+    //     was-console-log(`Changes received with handle.on: ${JSON.stringify(patches)}`);
     // })
 
     // handle.change(doc => {
@@ -60,7 +60,7 @@ export const startAutomergeServer = async (dataDir:string, port:PortNumber):Prom
 
     // // Subscribe to changes in the `cards` array
     // Automerge.subscribe(doc1, (changes) => {
-    //   console.log("Changes in doc1:", changes);
+    //   was-console-log("Changes in doc1:", changes);
     // });
 
     return repo;
