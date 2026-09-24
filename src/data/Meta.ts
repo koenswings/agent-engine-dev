@@ -67,6 +67,10 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
       const catCmd = path === '/META.yaml' ? $`sudo cat ${path}` : $`cat ${path}`
       const metaContent = (await catCmd).stdout.trim()
       const meta: DiskMeta = YAML.parse(metaContent)
+      // YAML 1.1 coerces unquoted 1.0 → number 1; Version is always a string.
+      if (meta.version != null) {
+        meta.version = String(meta.version) as Version
+      }
       log(`metaContent: ${metaContent}`)
       log(`meta: ${deepPrint(meta)}`)
       let update = false
@@ -290,7 +294,7 @@ export const addMeta = async (exec: any, hostname: string, version: string) => {
     await exec`echo 'diskName: ${id}' | sudo tee -a /META.yaml`;
     await exec`echo 'hostname: ${hostname}' | sudo tee -a /META.yaml`;
     await exec`echo 'created: ${new Date().getTime()}' | sudo tee -a /META.yaml`;
-    await exec`echo 'version: ${version}' | sudo tee -a /META.yaml`;
+    await exec`echo 'version: "${version}"' | sudo tee -a /META.yaml`;
     await exec`echo 'lastDocked: ${new Date().getTime()}' | sudo tee -a /META.yaml`;
   } catch (e) {
     print(chalk.red('Error adding metadata'));

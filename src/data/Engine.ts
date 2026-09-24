@@ -42,7 +42,8 @@ export const initialiseLocalEngine = async (): Promise<Engine> => {
     const localEngine: Engine = {
       id: createEngineIdFromDiskId(meta.diskId),
       hostname: os.hostname() as Hostname,
-      version: meta.version ? meta.version : "0.0.1" as Version,
+      // Always string: META YAML may have parsed version as a number (e.g. 1.0 → 1).
+      version: (meta.version != null ? String(meta.version) : "0.0.1") as Version,
       hostOS: os.type(),
       created: meta.created,
       lastBooted: (new Date()).getTime() as Timestamp,
@@ -71,6 +72,7 @@ export const createOrUpdateEngine = async (storeHandle: DocHandle<Store>, engine
         log(`Granularly updating existing engine object ${engineId}`)
         engine = doc.engineDB[engineId]
         engine.hostname = os.hostname() as Hostname
+        engine.version = newEngine.version
         engine.lastBooted = (new Date()).getTime() as Timestamp
         engine.lastRun = (new Date()).getTime() as Timestamp
       }
