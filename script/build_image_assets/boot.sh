@@ -21,7 +21,7 @@ if [[ -f $FLAG ]]; then
 
   # 3. Set hostname and META.yaml by calling the zx script
   echo "--> Setting hostname and META.yaml via zx script" >> /home/pi/boot.out
-  zx /home/pi/projects/engine/script/build-image.ts --personalize >> /home/pi/boot.out 2>&1
+  zx /home/pi/idea/agents/agent-engine-dev/script/build-image.ts --personalize >> /home/pi/boot.out 2>&1
 
   # 4. Preventing from running again
   echo "--> Personalization complete. Removing flag file." >> /home/pi/boot.out

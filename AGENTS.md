@@ -55,7 +55,7 @@ The fleet deploy scripts handle all deployment logic. Grok Build's job is to pro
 ```yaml
 settings:
   httpPort: 80          # Serves Console web app + /api/store-url
-  consolePath: /home/pi/console-dist
+  consolePath: /home/pi/idea/agents/agent-console-dev/dist
   port: 4321            # Automerge WebSocket port
   testMode: false       # true = skip sudo mount/umount (tests)
 ```

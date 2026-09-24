@@ -39,7 +39,7 @@ ssh pi@idea01.local          # Direct SSH
 
 ## Engine Installation
 
-Engine path on each node: `/home/pi/projects/engine`  
+Engine path on each node: `/home/pi/idea/agents/agent-engine-dev`  
 Started via pm2, auto-starts on boot.
 
 ### Provisioning a node

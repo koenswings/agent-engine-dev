@@ -343,7 +343,7 @@ export const installCrontabs = async (exec: any, enginePath: string) => {
   print(chalk.blue('Installing crontabs...'));
   try {
     await copyAsset(exec, enginePath, 'boot.sh', '/usr/local/bin', true)
-    await exec`sudo sed -i "s|/home/pi/projects/engine|${config.defaults.enginePath}|g" /usr/local/bin/boot.sh`
+    await exec`sudo sed -i "s|/home/pi/idea/agents/agent-engine-dev|${config.defaults.enginePath}|g" /usr/local/bin/boot.sh`
     await exec`sudo crontab ${enginePath}/script/build_image_assets/crondefs`
   } catch (e) {
     print(chalk.red('Error installing crontabs'));

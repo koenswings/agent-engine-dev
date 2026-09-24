@@ -149,7 +149,7 @@ export const remoteCleanupStore = async (host: string): Promise<void> => {
         // If the engine is running during cleanup, its in-memory CRDT wins on next
         // restart and restores all deleted entries.
         await execOn(host)`sudo -u pi pm2 stop engine`.catch(() => {})
-        await execOn(host)`npx tsx /home/pi/projects/engine/script/cleanup-store.ts --commit`
+        await execOn(host)`npx tsx /home/pi/idea/agents/agent-engine-dev/script/cleanup-store.ts --commit`
     } catch (e: any) {
         console.warn(`[remoteSSH] remoteCleanupStore warning: ${e.message}`)
     } finally {
