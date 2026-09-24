@@ -14,7 +14,7 @@
     "devtest": "tsc --build --clean && tsc && mocha --bail --reporter list 'dist/test/*.js' --exit",
     "pm2start": "tsc && VERBOSITY=3 pm2 start dist/src/index.js --watch",
     "tsc": "tsc",
-    "sync": "rsync -av --exclude='node_modules' --exclude='.git' --exclude='dist' --exclude='scratchpad' --exclude='.vscode' --exclude='.pnpm-store' ./ pi@raspberrypi.local:/home/pi/engine",
+    "sync": "rsync -av --exclude='node_modules' --exclude='.git' --exclude='dist' --exclude='scratchpad' --exclude='.vscode' --exclude='.pnpm-store' ./ pi@raspberrypi.local:/home/pi/idea/agents/agent-engine-dev",
     "reset": "chmod +x script/reset && script/reset",
     "ptest": "tsc && YPERSISTENCE=./yjs-db node dist/src/test.js",
     "test3": "mocha --config x.mocharc.json --es-module-specifier-resolution=node --reporter list 'test/*.ts'",

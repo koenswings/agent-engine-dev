@@ -10,7 +10,7 @@ set -uo pipefail
 
 SSH_KEY="${HOME}/.ssh/id_ed25519"
 SSH_USER="pi"
-ENGINE_PATH="/home/pi/projects/engine"
+ENGINE_PATH="/home/pi/idea/agents/agent-engine-dev"
 
 # Read fleet nodes from /etc/hosts (lines added by provision-fleet.sh)
 NODES=$(grep "idea0[0-9]\.local" /etc/hosts | awk '{print $2}' | sort -u)
