@@ -13,7 +13,11 @@
  *
  * The Console uses /api/store-url as:
  *   GET http://<engine-hostname>/api/store-url
- *   → { "url": "automerge:<hash>" }
+ *   → { "url": "automerge:<hash>", "wsPort": 4321 }
+ *
+ * `wsPort` is the Engine's effective WebSocket port (config.yaml settings.port,
+ * after the IDEA_ENGINE_PORT override in Config.ts), so the Console does not
+ * have to assume the default. `url` is unchanged for backward compatibility.
  */
 
 import http from 'http'
@@ -47,6 +51,24 @@ const MIME_TYPES: Record<string, string> = {
     '.woff2':'font/woff2',
     '.ttf':  'font/ttf',
 }
+
+/** JSON payload returned by GET /api/store-url. */
+export interface StoreUrlPayload {
+    url: string
+    wsPort: number
+}
+
+/**
+ * Build the /api/store-url response body.
+ *
+ * @param storeUrl Automerge store document URL (as read from store-url.txt)
+ * @param wsPort   Effective WebSocket port (default: config.settings.port, which
+ *                 already has the IDEA_ENGINE_PORT override applied)
+ */
+export const buildStoreUrlPayload = (
+    storeUrl: string,
+    wsPort: number = config.settings.port
+): StoreUrlPayload => ({ url: storeUrl, wsPort })
 
 const mimeType = (filePath: string): string => {
     const ext = path.extname(filePath).toLowerCase()
@@ -86,7 +108,7 @@ export const enableHttpMonitor = (
                     'Content-Type': 'application/json',
                     'Access-Control-Allow-Origin': '*',  // Console may be on a different origin during dev
                 })
-                res.end(JSON.stringify({ url: storeUrl }))
+                res.end(JSON.stringify(buildStoreUrlPayload(storeUrl)))
             } catch (e) {
                 log(`[http] /api/store-url: failed to read store URL — ${e}`)
                 res.writeHead(503, { 'Content-Type': 'application/json' })
