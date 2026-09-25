@@ -23,9 +23,13 @@ export const handleCommand = async (
         return;
     }
 
+    // A variadic last arg takes all remaining tokens (see ArgumentDescriptor.variadic)
+    const lastArg = command.args[command.args.length - 1];
+    const isVariadic = lastArg?.variadic === true;
+
     let stringArgs: string[] = [];
     // Special case for commands that take the entire rest of the line as a single argument
-    if (command.args.length === 1) {
+    if (command.args.length === 1 && !isVariadic) {
         const firstSpaceIndex = trimmedInput.indexOf(' ');
         if (firstSpaceIndex !== -1) {
             stringArgs.push(trimmedInput.substring(firstSpaceIndex + 1));
@@ -48,8 +52,9 @@ export const handleCommand = async (
     let args: any[];
     try {
         args = stringArgs.map((arg, index) => {
-            if (index >= command.args.length) throw new Error("Too many arguments");
-            return convertToType(arg, command.args[index]);
+            const descriptor = isVariadic && index >= command.args.length - 1 ? lastArg : command.args[index];
+            if (!descriptor) throw new Error("Too many arguments");
+            return convertToType(arg, descriptor);
         });
         if (args.length < command.args.length) throw new Error("Insufficient arguments");
     } catch (error: any) {
@@ -62,9 +67,11 @@ export const handleCommand = async (
     // Build a named args object when the CommandDefinition has arg names defined,
     // otherwise fall back to a positional array. The Console filters traces by
     // args['instanceName'] or args['instanceId'], so named args are required.
-    const namedArgs: Record<string, string> | string[] =
+    // A variadic last arg is recorded as an array of all its tokens.
+    const namedArgs: Record<string, string | string[] | null> | string[] =
         command.args.every(a => a.name)
-            ? Object.fromEntries(command.args.map((a, i) => [a.name!, stringArgs[i] ?? null]))
+            ? Object.fromEntries(command.args.map((a, i) =>
+                [a.name!, a.variadic ? stringArgs.slice(i) : stringArgs[i] ?? null]))
             : stringArgs
     const argsJson = JSON.stringify(namedArgs);
     const traceCtx = { traceId, command: commandName, args: argsJson };

@@ -18,6 +18,7 @@ export interface ArgumentDescriptor {
     type: ArgumentType;
     name?: string;        // Human-readable arg name, used to build named trace args
     objectSpec?: ObjectSpec;
+    variadic?: boolean;   // Last arg only: takes all remaining tokens (at least one), passed as separate args
 }
 
 // Interface for commands
