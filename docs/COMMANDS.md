@@ -62,7 +62,7 @@ These commands perform actions on the system. Some are restricted to an `engine`
 - **Scope:** `engine`
 
 ### `startInstance`
-- **Description:** Starts a previously created application instance. This involves preloading services and creating and running the Docker containers. The instance becomes `Running` only after `docker compose up` succeeded; any failure sets it to `Error` and closes the command's trace as failed (idea#109).
+- **Description:** Starts a previously created application instance. This involves preloading services and creating and running the Docker containers. The instance becomes `Running` only after `docker compose up` succeeded; any failure sets it to `Error` and closes the command's trace as failed (idea#109). A missing or unloadable `services/<image>.tar` is only a warning (a `warn` log line in the trace): Docker pulls the image at create time if it can.
 - **Usage:** `startInstance <instanceName> <diskName>`
 - **Scope:** `engine`
 

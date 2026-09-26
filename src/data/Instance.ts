@@ -13,7 +13,7 @@ import { Docker } from "node-docker-api";
 import { createMeta } from '../data/Meta.js'
 import { config, disksRoot, skipImageLoad } from '../data/Config.js'
 import { DocHandle } from "@automerge/automerge-repo";
-import { CommandLogStore, getCommandLogHandle, addTrace, closeTrace } from './CommandLogStore.js'
+import { CommandLogStore, LogEntry, getCommandLogHandle, addTrace, closeTrace, flushLogs } from './CommandLogStore.js'
 import { getActiveTrace, flushTrace } from '../utils/CommandLogger.js'
 
 // ── Step-progress helpers ─────────────────────────────────────────────────────
@@ -55,9 +55,68 @@ const clearStep = (storeHandle: DocHandle<Store>, instanceId: InstanceID) => {
   })
 }
 
-// ── Failed start → command log (idea#109) ────────────────────────────────────
+// ── Start outcome → command log (idea#109) ───────────────────────────────────
 
 export const START_INSTANCE_COMMAND = 'startInstance'
+
+/**
+ * The traceId of the `startInstance` trace this start runs inside (the Console
+ * command, or the dock auto-start in Disk.ts), or null when there is none
+ * (post-copy, post-move, backup-post-start).
+ */
+const activeStartTraceId = (handle: DocHandle<CommandLogStore>): string | null => {
+  const active = getActiveTrace()
+  if (active && active.command === START_INSTANCE_COMMAND && handle.doc()?.traces[active.traceId]) {
+    return active.traceId
+  }
+  return null
+}
+
+/**
+ * Add a start warning (e.g. a service image that could not be loaded from the
+ * App Disk) to the start's History entry as a log line with level 'warn'.
+ * Inside a `startInstance` trace it is appended right away and true is
+ * returned. Otherwise false is returned and the caller keeps the entry for
+ * recordInstanceStartWarnings / recordInstanceStartFailure. Never throws.
+ */
+export const addInstanceStartWarning = async (
+  entry: LogEntry,
+  handle: DocHandle<CommandLogStore> | null = getCommandLogHandle(),
+): Promise<boolean> => {
+  if (!handle) return false
+  try {
+    const traceId = activeStartTraceId(handle)
+    if (!traceId) return false
+    await flushTrace(traceId)
+    flushLogs(handle, traceId, [entry])
+    return true
+  } catch (e) {
+    log(`Could not record a start warning in the command log: ${e}`)
+    return false
+  }
+}
+
+/** A standalone `startInstance` trace for a start that runs outside one. */
+const addStandaloneStartTrace = (
+  handle: DocHandle<CommandLogStore>,
+  instance: Instance,
+  disk: Disk,
+  cause: OperationCause,
+  pendingWarnings: LogEntry[],
+): string => {
+  const traceId = crypto.randomUUID()
+  addTrace(handle, {
+    traceId,
+    command: START_INSTANCE_COMMAND,
+    args: JSON.stringify({ instanceName: instance.name, instanceId: instance.id, diskId: disk.id, cause }),
+    startedAt: pendingWarnings[0]?.timestamp ?? Date.now(),
+    completedAt: null,
+    status: 'running',
+    errorMessage: null,
+  })
+  flushLogs(handle, traceId, pendingWarnings)
+  return traceId
+}
 
 /**
  * Record a failed instance start in the command log, so it appears in the
@@ -65,13 +124,12 @@ export const START_INSTANCE_COMMAND = 'startInstance'
  * `diskDetection` traces of idea#82; the Console matches traces by
  * args.instanceId / args.instanceName).
  *
- * - Inside a `startInstance` trace (the Console command, or the dock
- *   auto-start in Disk.ts): that trace is closed with status 'error'.
+ * - Inside a `startInstance` trace: that trace is closed with status 'error'.
  *   closeTrace never turns an 'error' trace back into 'ok', so the caller's
  *   own closing call cannot hide the failure.
- * - Otherwise (post-copy, post-move, backup-post-start): a completed
- *   `startInstance` trace with status 'error' is added, with args
- *   { instanceName, instanceId, diskId, cause }.
+ * - Otherwise: a completed `startInstance` trace with status 'error' is added,
+ *   with args { instanceName, instanceId, diskId, cause } and the pending
+ *   warnings as 'warn' log lines.
  *
  * Never throws: recording the failure must not break the caller.
  */
@@ -80,29 +138,48 @@ export const recordInstanceStartFailure = async (
   disk: Disk,
   cause: OperationCause,
   message: string,
+  pendingWarnings: LogEntry[] = [],
   handle: DocHandle<CommandLogStore> | null = getCommandLogHandle(),
 ): Promise<void> => {
   if (!handle) return
   try {
-    const active = getActiveTrace()
-    if (active && active.command === START_INSTANCE_COMMAND && handle.doc()?.traces[active.traceId]) {
-      await flushTrace(active.traceId)
-      closeTrace(handle, active.traceId, 'error', message)
-      return
+    let traceId = activeStartTraceId(handle)
+    if (traceId) {
+      await flushTrace(traceId)
+      flushLogs(handle, traceId, pendingWarnings)
+    } else {
+      traceId = addStandaloneStartTrace(handle, instance, disk, cause, pendingWarnings)
     }
-    const traceId = crypto.randomUUID()
-    addTrace(handle, {
-      traceId,
-      command: START_INSTANCE_COMMAND,
-      args: JSON.stringify({ instanceName: instance.name, instanceId: instance.id, diskId: disk.id, cause }),
-      startedAt: Date.now(),
-      completedAt: null,
-      status: 'running',
-      errorMessage: null,
-    })
     closeTrace(handle, traceId, 'error', message)
   } catch (e) {
     log(`Could not record the failed start of instance '${instance.id}' in the command log: ${e}`)
+  }
+}
+
+/**
+ * Record the warnings of a start that succeeded outside a `startInstance`
+ * trace: a completed `startInstance` trace with status 'ok' whose logs hold the
+ * warnings. Does nothing without warnings. Never throws.
+ */
+export const recordInstanceStartWarnings = async (
+  instance: Instance,
+  disk: Disk,
+  cause: OperationCause,
+  pendingWarnings: LogEntry[],
+  handle: DocHandle<CommandLogStore> | null = getCommandLogHandle(),
+): Promise<void> => {
+  if (!handle || pendingWarnings.length === 0) return
+  try {
+    let traceId = activeStartTraceId(handle)
+    if (traceId) {
+      await flushTrace(traceId)
+      flushLogs(handle, traceId, pendingWarnings)
+      return
+    }
+    traceId = addStandaloneStartTrace(handle, instance, disk, cause, pendingWarnings)
+    closeTrace(handle, traceId, 'ok')
+  } catch (e) {
+    log(`Could not record the start warnings of instance '${instance.id}' in the command log: ${e}`)
   }
 }
 
@@ -557,6 +634,15 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     inst.status = 'Starting' as Status
   })
 
+  // Start warnings not yet in a History entry (the start runs outside a
+  // startInstance trace); recorded when the start ends.
+  const pendingWarnings: LogEntry[] = []
+  const startWarning = async (message: string): Promise<void> => {
+    log(`Warning while starting instance '${instance.id}': ${message}`)
+    const entry: LogEntry = { level: 'warn', message, timestamp: Date.now() }
+    if (!(await addInstanceStartWarning(entry))) pendingWarnings.push(entry)
+  }
+
   try {
 
     const mountRoot = await diskMountRoot(disk)
@@ -700,10 +786,24 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     if (!skipImageLoad()) {
       // Load images from pre-saved tar files on the disk (no internet required).
       // Always on in production; tests turn it on with settings.skipImageLoad = false (idea#81).
+      // A missing tar or a failed load does not stop the start (idea#109 follow-up):
+      // it becomes a warning in the start's History entry, and compose create/up
+      // pull the image if it is not local and the Engine has internet. The start
+      // fails only if create or up fails.
       for (const serviceName in services) {
         const serviceImage = services[serviceName].image
-        log(`Loading the service image ${serviceImage} from the saved tar file`)
-        await $`docker image load < ${serviceImageTarPath(mountRoot, serviceImage)}`
+        const tarPath = serviceImageTarPath(mountRoot, serviceImage)
+        if (!fs.existsSync(tarPath)) {
+          await startWarning(`Service image ${serviceImage}: saved image ${tarPath} not found; continuing (Docker pulls the image if it is not local and the Engine has internet)`)
+          continue
+        }
+        log(`Loading the service image ${serviceImage} from ${tarPath}`)
+        try {
+          await $`docker image load < ${tarPath}`
+        } catch (e) {
+          const reason = (e instanceof Error ? e.message : String(e)).trim().split('\n')[0]
+          await startWarning(`Service image ${serviceImage}: loading ${tarPath} failed (${reason}); continuing (Docker pulls the image if it is not local and the Engine has internet)`)
+        }
       }
     } else {
       // Tests by default: fixtures have no tar files — Docker pulls the image at create time if not cached
@@ -727,6 +827,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
       status: 'Done',
       completedAt: Date.now() as Timestamp,
     })
+    await recordInstanceStartWarnings(instance, disk, cause, pendingWarnings)
   }
 
   catch (e) {
@@ -741,7 +842,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
       error: errMsg,
       completedAt: Date.now() as Timestamp,
     })
-    await recordInstanceStartFailure(instance, disk, cause, errMsg)
+    await recordInstanceStartFailure(instance, disk, cause, errMsg, pendingWarnings)
   }
 }
 
