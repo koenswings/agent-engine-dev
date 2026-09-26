@@ -146,7 +146,8 @@ const buildFixtureDisk = async (c: EnvCase): Promise<void> => {
         image: IMAGE,
         pull_policy: 'never',
         labels: { [TEST_CONTAINER_LABEL_KEY]: TEST_CONTAINER_LABEL_VALUE },
-        ports: ['${port}:80'],
+        // No published port: the test needs no traffic, and a host port could
+        // clash with another test's container on a busy runner.
         environment: { APP_DB_PASSWORD: '${APP_DB_PASSWORD:-}', APP_API_TOKEN: '${APP_API_TOKEN:-}' },
         restart: 'no',
     }
