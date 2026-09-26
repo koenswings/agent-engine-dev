@@ -47,3 +47,7 @@ copyApp + moveApp commands and rsync infrastructure. Covers Operation store type
 ## command-logging.md
 **Status:** Implemented · **Author:** Axle
 Per-command log capture via AsyncLocalStorage + Automerge CommandLogStore.
+
+## duration-tests.md
+**Status:** Proposed · **Author:** Axle
+Markov-model duration tests: simulate a school day (reboots, disk swaps, engine changes) from YAML scenarios and verify invariants, including Automerge convergence across all engines.
