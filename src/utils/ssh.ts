@@ -2,6 +2,11 @@ import { $ } from 'zx'
 import type { ProcessPromise } from 'zx'
 
 /**
+ * Single-quotes a value for a POSIX shell: 'it'\''s' → one shell word, no expansion.
+ */
+export const shellQuote = (value: string): string => "'" + value.replace(/'/g, "'\\''") + "'"
+
+/**
  * Minimal ssh() helper — replaces zx v7's built-in ssh() which was removed in v8.
  *
  * Creates a tagged-template executor that runs commands on a remote host via SSH.
@@ -19,7 +24,7 @@ export function ssh(host: string, shell: typeof $ = $) {
         const cmd = pieces.reduce((acc: string, piece: string, i: number) => {
             if (i >= args.length) return acc + piece
             // Single-quote escape — args are developer-controlled paths/values, not user input
-            const escaped = "'" + String(args[i]).replace(/'/g, "'\\''") + "'"
+            const escaped = shellQuote(String(args[i]))
             return acc + piece + escaped
         }, '')
         return shell`ssh -o StrictHostKeyChecking=no ${host} -- ${cmd}`

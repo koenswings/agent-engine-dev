@@ -16,6 +16,7 @@ import path from 'path'
 import { $, fs, YAML } from 'zx'
 import { diskPath, uniqueTestDevice } from '../harness/diskSim.js'
 import { createMeta } from '../../src/data/Meta.js'
+import { SYSTEM_DISK_ENSURE_DIRS, remoteEnsureDirsCommand } from '../../src/data/CopyMoveApp.js'
 import { DeviceName } from '../../src/data/CommonTypes.js'
 
 const ROOT = process.cwd()
@@ -66,7 +67,7 @@ describe('Engine sudoers asset (idea#80)', () => {
 
     it('grants only pi, only as root, and uses no wide /disks/* or /dev/* patterns', () => {
         const rules = sudoers.split('\n').filter(l => /^\s*pi\s/.test(l))
-        expect(rules).toEqual(['pi ALL=(root) NOPASSWD: ENGINE_MOUNT, ENGINE_DIRS, ENGINE_META, ENGINE_POWER'])
+        expect(rules).toEqual(['pi ALL=(root) NOPASSWD: ENGINE_MOUNT, ENGINE_DIRS, ENGINE_META, ENGINE_POWER, ENGINE_APPDIRS'])
         expect(rulesText).not.toMatch(/\/disks\/\*/)
         expect(rulesText).not.toMatch(/\/dev\/\*/)
         expect(rulesText).not.toMatch(/-t ext4/)
@@ -92,6 +93,11 @@ describe('Engine sudoers asset (idea#80)', () => {
         expect(meta).toContain('$({ input: yamlContent })`sudo tee /META.yaml > /dev/null`')
         expect(meta).not.toMatch(/sudo mv/)
         expect(src('src/data/Engine.ts')).toContain('$`sudo reboot now`')
+        // CopyMoveApp.ts: cross-engine copy onto a remote system disk (the only remote sudo)
+        const appDirs = SYSTEM_DISK_ENSURE_DIRS.split(' && ')
+        expect(appDirs.every(c => c.startsWith('sudo /usr/bin/'))).toBe(true)
+        for (const c of appDirs) expect(rulesText).toContain(c.replace(/^sudo /, '').replace(/:/g, '\\:'))
+        expect(remoteEnsureDirsCommand('/disks/sda1')).not.toMatch(/sudo/)
         // ...and each of those binaries/arguments is in the sudoers file
         for (const rule of [
             '/usr/bin/mount /dev/sd[a-z][12] /disks/sd[a-z][12]',
@@ -105,6 +111,8 @@ describe('Engine sudoers asset (idea#80)', () => {
             '/usr/bin/tee /META.yaml',
             '/usr/sbin/hdparm -I /dev/sd[a-z][12]',
             '/usr/sbin/reboot now',
+            '/usr/bin/mkdir -p /apps /instances /services',
+            '/usr/bin/chown pi\\:pi /apps /instances /services',
         ]) expect(rulesText).toContain(rule)
     })
 

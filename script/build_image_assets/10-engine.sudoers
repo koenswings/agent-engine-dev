@@ -7,6 +7,7 @@
 #   ENGINE_DIRS   src/monitors/usbDeviceMonitor.ts (mount points, /disks/old cleanup)
 #   ENGINE_META   src/data/Meta.ts (read/write /META.yaml, disk serial via hdparm)
 #   ENGINE_POWER  src/data/Engine.ts (reboot command)
+#   ENGINE_APPDIRS src/data/CopyMoveApp.ts (cross-engine copy onto the system disk)
 #
 # Patterns are narrow on purpose (sd[a-z][12], never /disks/*): in sudoers a '*' in
 # arguments also matches spaces, '/' and '..'.
@@ -25,4 +26,6 @@ Cmnd_Alias ENGINE_META  = /usr/bin/cat /META.yaml, \
                           /usr/sbin/hdparm -I /dev/sd[a-z], \
                           /usr/sbin/hdparm -I /dev/sd[a-z][12]
 Cmnd_Alias ENGINE_POWER = /usr/sbin/reboot now
-pi ALL=(root) NOPASSWD: ENGINE_MOUNT, ENGINE_DIRS, ENGINE_META, ENGINE_POWER
+Cmnd_Alias ENGINE_APPDIRS = /usr/bin/mkdir -p /apps /instances /services, \
+                            /usr/bin/chown pi\:pi /apps /instances /services
+pi ALL=(root) NOPASSWD: ENGINE_MOUNT, ENGINE_DIRS, ENGINE_META, ENGINE_POWER, ENGINE_APPDIRS

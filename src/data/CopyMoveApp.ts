@@ -11,6 +11,7 @@
 import { chalk, fs, $ } from 'zx'
 import { log } from '../utils/utils.js'
 import { rsyncDirectory } from '../utils/rsync.js'
+import { shellQuote } from '../utils/ssh.js'
 import {
     InstanceID, DiskID, DiskName, InstanceName, Timestamp,
     OperationKind, OperationCause, ServiceImage
@@ -131,6 +132,32 @@ const validate = async (
 // ── copyApp ───────────────────────────────────────────────────────────────────
 
 /**
+ * The remote command that creates apps/, instances/ and services/ on the target disk of a
+ * cross-engine copy (idea#80). It runs entirely on the remote Engine, as pi.
+ *
+ * - System disk (mount root '' or '/'): the folders live in '/', which only root can write.
+ *   Uses the exact commands allowed by 10-engine.sudoers (full binary paths, non-recursive
+ *   chown to pi). The paths are fixed, so no quoting is needed.
+ * - App Disk (<disksRoot>/<device>): the disk root is writable by pi, so no sudo. The
+ *   paths are single-quoted, so spaces or quotes in them stay one shell word.
+ */
+export const SYSTEM_DISK_ENSURE_DIRS =
+    'sudo /usr/bin/mkdir -p /apps /instances /services && sudo /usr/bin/chown pi:pi /apps /instances /services'
+
+export const remoteEnsureDirsCommand = (targetMountRoot: string): string => {
+    if (targetMountRoot === '' || targetMountRoot === '/') return SYSTEM_DISK_ENSURE_DIRS
+    const dirs = ['apps', 'instances', 'services'].map(d => shellQuote(`${targetMountRoot}/${d}`))
+    return `mkdir -p ${dirs.join(' ')}`
+}
+
+/**
+ * The argv for the ssh call: the whole remote command is ONE argument, so nothing
+ * in it (such as '&&') is run by the local shell.
+ */
+export const remoteEnsureDirsSshArgs = (remoteAddress: string, targetMountRoot: string): string[] =>
+    ['ssh', '-o', 'StrictHostKeyChecking=no', `pi@${remoteAddress}`, '--', remoteEnsureDirsCommand(targetMountRoot)]
+
+/**
  * Copy an app instance from sourceDisk to targetDisk.
  * The copy receives a fresh InstanceID — it is a brand new instance.
  * The original keeps running (it is stopped during the file copy, then restarted).
@@ -215,7 +242,7 @@ export const copyApp = async (
         const targetMountRoot = await diskMountRoot(targetDisk) // '' for system disk (both local and remote)
         if (isCrossEngine) {
             log(`copyApp: ensuring remote directories on ${remoteAddress}`)
-            await $`ssh -o StrictHostKeyChecking=no pi@${remoteAddress} sudo mkdir -p ${targetMountRoot}/apps ${targetMountRoot}/instances ${targetMountRoot}/services && sudo chown -R pi:pi ${targetMountRoot}/apps ${targetMountRoot}/instances ${targetMountRoot}/services`
+            await $`${remoteEnsureDirsSshArgs(remoteAddress!, targetMountRoot)}`
         } else {
             await fs.ensureDir(`${targetMountRoot}/apps`)
             await fs.ensureDir(`${targetMountRoot}/instances`)
