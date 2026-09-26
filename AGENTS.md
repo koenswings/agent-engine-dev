@@ -65,7 +65,9 @@ live Engine (idea#105):
 - Pre-flight (`script/test-preflight.sh`) refuses to run (exit 1) when it finds a live
   Engine: pm2 `engine` online (or a `node …/dist/src/index.js` process), running
   containers without the test label, `/instances/*`, or App Disks under `/disks`
-  / `sd*` sentinels in `/dev/engine`. Override at your own risk: `IDEA_TEST_ALLOW_LIVE=1`.
+  / `sd*` sentinels in `/dev/engine`. The Pi's own root disk (from
+  `findmnt -n -o SOURCE /`, e.g. `sda` with `sda1`/`sda2`) and all its partitions
+  are excluded from the App Disk check (`script/test-preflight-lib.sh`). Override at your own risk: `IDEA_TEST_ALLOW_LIVE=1`.
   `IDEA_DIAGNOSTIC_LIVE=true pnpm test:diagnostic` reads a live store, so it needs
   the override on purpose.
 

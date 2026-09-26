@@ -10,13 +10,18 @@
  *   4. Tests run from dist-test/, never dist/
  *   6. Fixture containers carry the test label; cleanup filters on it
  *
- * (Requirement 5, the pre-flight check, lives in script/test-preflight.sh and
- * runs before vitest starts.)
+ *   5. Pre-flight App Disk detection (script/test-preflight-lib.sh) ignores the
+ *      Pi's own root disk and its partitions, but still flags other disks
+ *
+ * (The rest of the pre-flight check lives in script/test-preflight.sh and runs
+ * before vitest starts.)
  */
 
 import { describe, it, expect } from 'vitest'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import os from 'os'
+import { execFileSync } from 'child_process'
 import { fs, YAML } from 'zx'
 import {
     assertTestIsolation,
@@ -145,5 +150,111 @@ describe('Test container labelling', () => {
         } finally {
             await fs.remove(root)
         }
+    })
+})
+
+// ── Pre-flight App Disk detection (script/test-preflight-lib.sh) ─────────────
+
+const PREFLIGHT_LIB = path.resolve(process.cwd(), 'script/test-preflight-lib.sh')
+
+/** Run a function from the pre-flight library in bash and return its output lines. */
+const preflightLib = (fn: string, ...args: string[]): string[] => {
+    const out = execFileSync('bash', ['-c', `source "$0" && ${fn} "$@"`, PREFLIGHT_LIB, ...args], { encoding: 'utf-8' })
+    return out.split('\n').filter(l => l.length > 0)
+}
+
+describe('Pre-flight App Disk detection excludes the root disk', () => {
+    let tmp: string
+    let disksRoot: string
+    let watchDir: string
+
+    /** Fake machine state: sentinels in the watch dir, disk folders with META.yaml under the mount root. */
+    const setup = async (sentinels: string[], disks: string[] = []) => {
+        tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-preflight-'))
+        disksRoot = path.join(tmp, 'disks')
+        watchDir = path.join(tmp, 'engine')
+        await fs.ensureDir(watchDir)
+        for (const s of sentinels) await fs.writeFile(path.join(watchDir, s), '')
+        for (const d of disks) {
+            await fs.ensureDir(path.join(disksRoot, d))
+            await fs.writeFile(path.join(disksRoot, d, 'META.yaml'), 'diskId: x\n')
+        }
+    }
+
+    /** App Disks the pre-flight would report, with the root disk derived from a findmnt SOURCE. */
+    const appDisksFor = (rootSource: string): string[] => {
+        const rootDisk = preflightLib('root_disk_from_source', rootSource)[0] ?? ''
+        return preflightLib('find_app_disks', disksRoot, watchDir, rootDisk).map(p => path.basename(p))
+    }
+
+    const teardown = async () => { if (tmp) await fs.remove(tmp) }
+
+    it('root disk sda: /dev/engine/sda, sda1 and sda2 do NOT refuse', async () => {
+        await setup(['sda', 'sda1', 'sda2'])
+        try {
+            expect(appDisksFor('/dev/sda2')).toEqual([])
+        } finally { await teardown() }
+    })
+
+    it('root disk sda: a non-root sdb1 still refuses (sentinel and mounted disk)', async () => {
+        await setup(['sda1', 'sda2', 'sdb1'], ['sdb1'])
+        try {
+            expect(appDisksFor('/dev/sda2').sort()).toEqual(['sdb1', 'sdb1'])
+        } finally { await teardown() }
+    })
+
+    it('root disk sda: a /disks/sda2 folder is not an App Disk', async () => {
+        await setup([], ['sda2', 'sdc1'])
+        try {
+            expect(appDisksFor('/dev/sda2')).toEqual(['sdc1'])
+        } finally { await teardown() }
+    })
+
+    it('root on mmcblk0p2: sda1 still refuses', async () => {
+        await setup(['sda1'])
+        try {
+            expect(appDisksFor('/dev/mmcblk0p2')).toEqual(['sda1'])
+        } finally { await teardown() }
+    })
+
+    it('root on nvme0n1p2: sda1 still refuses', async () => {
+        await setup(['sda1'])
+        try {
+            expect(appDisksFor('/dev/nvme0n1p2')).toEqual(['sda1'])
+        } finally { await teardown() }
+    })
+
+    it('unknown root (overlay / empty findmnt output): nothing is excluded', async () => {
+        await setup(['sda1', 'sda2'])
+        try {
+            expect(appDisksFor('overlay').sort()).toEqual(['sda1', 'sda2'])
+            expect(appDisksFor('').sort()).toEqual(['sda1', 'sda2'])
+        } finally { await teardown() }
+    })
+
+    it('parent_disk_of maps partitions to their disk', () => {
+        const cases: Record<string, string> = {
+            sda2: 'sda', sda: 'sda', '/dev/sdb1': 'sdb',
+            mmcblk0p2: 'mmcblk0', mmcblk0: 'mmcblk0',
+            nvme0n1p2: 'nvme0n1', nvme0n1: 'nvme0n1',
+        }
+        for (const [dev, disk] of Object.entries(cases)) {
+            expect(preflightLib('parent_disk_of', dev), dev).toEqual([disk])
+        }
+        expect(preflightLib('parent_disk_of', 'overlay')).toEqual([])
+        expect(preflightLib('parent_disk_of', 'idea-test-1')).toEqual([])
+    })
+
+    it('is_on_disk only matches the disk itself and its partitions', () => {
+        const onDisk = (dev: string, disk: string): boolean => {
+            try { preflightLib('is_on_disk', dev, disk); return true } catch { return false }
+        }
+        expect(onDisk('sda', 'sda')).toBe(true)
+        expect(onDisk('sda1', 'sda')).toBe(true)
+        expect(onDisk('sda12', 'sda')).toBe(true)
+        expect(onDisk('sdaa1', 'sda')).toBe(false)
+        expect(onDisk('sdb1', 'sda')).toBe(false)
+        expect(onDisk('mmcblk0p2', 'mmcblk0')).toBe(true)
+        expect(onDisk('sda1', '')).toBe(false)
     })
 })

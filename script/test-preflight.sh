@@ -10,7 +10,8 @@
 #      label org.idea.test=true; every other running container counts as live
 #   3. /instances/* exist (system-disk app instances)
 #   4. real App Disks are present (<name>/META.yaml or <name>/apps under /disks,
-#      or sd* sentinels under /dev/engine)
+#      or sd* sentinels under /dev/engine) — the Pi's own root disk (found via
+#      `findmnt -n -o SOURCE /`) and all its partitions are excluded
 #
 # Override (at your own risk): IDEA_TEST_ALLOW_LIVE=1
 #
@@ -63,24 +64,14 @@ if compgen -G '/instances/*' >/dev/null 2>&1; then
 fi
 
 # ── 4. Real App Disks ──────────────────────────────────────────────────────
-real_disks=()
-if [ -d "$LIVE_DISKS_ROOT" ]; then
-    for d in "$LIVE_DISKS_ROOT"/*/; do
-        [ -d "$d" ] || continue
-        name=$(basename "$d")
-        [ "$name" = "old" ] && continue
-        if [ -e "$d/META.yaml" ] || [ -d "$d/apps" ]; then
-            real_disks+=("$LIVE_DISKS_ROOT/$name")
-        fi
-    done
-fi
-if [ -d "$LIVE_WATCH_DIR" ]; then
-    for s in "$LIVE_WATCH_DIR"/sd*; do
-        [ -e "$s" ] && real_disks+=("$s")
-    done
-fi
+# The Pi's own boot/root disk (e.g. sda1/sda2) also appears in /dev/engine; it is
+# excluded (whole disk and all partitions) — see script/test-preflight-lib.sh.
+# shellcheck source=script/test-preflight-lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/test-preflight-lib.sh"
+root_disk=$(detect_root_disk)
+mapfile -t real_disks < <(find_app_disks "$LIVE_DISKS_ROOT" "$LIVE_WATCH_DIR" "$root_disk")
 if [ ${#real_disks[@]} -gt 0 ]; then
-    findings+=("App Disks are present: ${real_disks[*]}")
+    findings+=("App Disks are present: ${real_disks[*]}${root_disk:+ (root disk $root_disk excluded)}")
 fi
 
 # ── Verdict ────────────────────────────────────────────────────────────────
