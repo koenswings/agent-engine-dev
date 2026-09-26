@@ -31,6 +31,7 @@ The application uses a "Monitor" pattern. Monitors listen for system events (USB
         *   `sd?` — whole-disk device (no partition table; e.g. `sda`)
         *   `sd?1` — first partition (single-partition disks; e.g. `sda1`)
         *   `sd?2` — second partition (dual-partition disks; e.g. `sda2`)
+    *   **Detection health (idea#82):** `boot.sh` reinstalls the udev rule on every boot when it is missing or differs from the shipped asset, then reloads and re-triggers udev. At startup the Engine runs a read-only self-check (`diskDetection.ts`: rule present and matching, `/dev/engine` present, a `/dev/engine/<name>` entry for every `sd?`/`sd?1`/`sd?2` in `/sys/class/block`, after `udevadm settle` and one delayed re-check). Self-check problems and monitor start, watcher, mount, META read, dock and undock failures are written to the command log as failed traces with command `diskDetection` (args `{ step, device, ... }`), so they appear in Console History without a store schema change.
     *   When a disk is inserted, it mounts the drive, reads its `META.yaml` identity, and scans for App instances.
     *   It updates the `Disk` and `Instance` objects in the Automerge Store.
     *   It triggers the execution of apps (via Docker).

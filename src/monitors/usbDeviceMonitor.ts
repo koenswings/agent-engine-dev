@@ -13,6 +13,7 @@ import { config, disksRoot } from '../data/Config.js'
 import { DocHandle } from '@automerge/automerge-repo';
 import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js';
 import { runWithTrace } from '../utils/CommandLogger.js';
+import { recordDiskDetectionFailure, errorMessage } from './diskDetection.js';
 
 /**
  * Pretend disks created by the test harness use names that real hardware never
@@ -24,10 +25,10 @@ export const isTestDeviceName = (device: string | undefined | null): boolean =>
 
 export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
 
-    // TODO: Alternative implementations for usb device detection — https://github.com/koenswings/idea/issues/46:
-    // 1. Monitor /dev iso /dev/engine
-    // 2. Monitor /dev/disk/by-label
-    // 3. Monitor dmesg output
+    // Detection relies on the udev rule 90-docking.rules (repaired by boot.sh and
+    // verified by the startup self-check in diskDetection.ts, idea#82). A fallback
+    // watcher (/dev/disk/by-label, dmesg) was ruled out for now: see
+    // https://github.com/koenswings/idea/issues/82 and /issues/46.
 
     const store: Store = storeHandle.doc()
     const localEngine = getLocalEngine(store)
@@ -107,6 +108,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                         await processDisk(storeHandle, disk)
                     } catch (e) {
                         log(`Error processing system disk: ${e}`)
+                        recordDiskDetectionFailure('readMeta', `Could not read /META.yaml of the system disk on ${device}: ${errorMessage(e)}`, { device })
                     }
                     return
                 }
@@ -119,8 +121,13 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                         log(`Device ${device} already mounted`)
                     } else {
                         log(`Mounting device ${device}`)
-                        await $`sudo mkdir -p ${disksRoot()}/${device}`
-                        await $`sudo mount /dev/${device} ${disksRoot()}/${device}`
+                        try {
+                            await $`sudo mkdir -p ${disksRoot()}/${device}`
+                            await $`sudo mount /dev/${device} ${disksRoot()}/${device}`
+                        } catch (e) {
+                            recordDiskDetectionFailure('mount', `Could not mount /dev/${device} on ${disksRoot()}/${device}: ${errorMessage(e)}`, { device })
+                            return
+                        }
                         log(`Device ${device} has been successfully mounted`)
                     }
                 }
@@ -134,6 +141,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                         await processDisk(storeHandle, disk)
                     } catch (error) {
                         log('Error processing the META file on the disk: ' + error)
+                        recordDiskDetectionFailure('readMeta', `Could not process META.yaml on ${device}: ${errorMessage(error)}`, { device })
                     }
                 } else {
                     // Before creating a new disk entry, check if a disk is already
@@ -174,6 +182,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
             } catch (e) {
                 log(`Error processing device ${device}`)
                 log(e)
+                recordDiskDetectionFailure('dock', `Could not process the disk on ${device}: ${errorMessage(e)}`, { device })
             }
         } else {
             log(`The disk on device ${device} is not on a supported device name`)
@@ -271,7 +280,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     watcher
         .on('add', addDevice)
         .on('unlink', removeDevice)
-        .on('error', error => log(`Watcher error: ${error}`))
+        .on('error', error => recordDiskDetectionFailure('watcher', `Watcher error on ${watchDir}: ${errorMessage(error)}`, { watchDir }))
 
     log(`Watching ${watchDir} for USB devices`)
     return watcher
@@ -339,5 +348,6 @@ export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
     } catch (e) {
         log(`Error unmounting device ${device}`)
         log(e)
+        recordDiskDetectionFailure('undock', `Could not undock the disk on ${device}: ${errorMessage(e)}`, { device, diskId: disk.id })
     }
 }

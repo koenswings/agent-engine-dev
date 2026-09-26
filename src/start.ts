@@ -1,5 +1,6 @@
 import os from 'os'
 import { enableUsbDeviceMonitor } from './monitors/usbDeviceMonitor.js'
+import { runDiskDetectionSelfCheck, recordDiskDetectionFailure, errorMessage } from './monitors/diskDetection.js'
 import { enableTimeMonitor, generateHeartBeat } from './monitors/timeMonitor.js'
 import { $, chalk, fs, sleep } from 'zx'
 import { deepPrint, log, print } from './utils/utils.js'
@@ -183,7 +184,14 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
 
     await sleep(1000)
     log(chalk.bgMagenta('STARTING MONITORING OF USB DEVICES'))
-    enableUsbDeviceMonitor(storeHandle)
+    // Report udev problems the boot.sh self-repair could not fix (idea#82).
+    // Read-only and not awaited: it may re-check after a delay.
+    runDiskDetectionSelfCheck().catch(e =>
+        recordDiskDetectionFailure('selfCheck', `Disk detection self-check crashed: ${errorMessage(e)}`))
+    // Not awaited (startup continues), but a start failure (e.g. `ls /dev/engine`
+    // fails) is reported instead of silently disabling disk detection.
+    enableUsbDeviceMonitor(storeHandle).catch(e =>
+        recordDiskDetectionFailure('monitorStart', `USB device monitor failed to start; disks will not be detected: ${errorMessage(e)}`))
 
     await sleep(1000)
     log(chalk.bgMagenta('STARTING DOCKER METRICS MONITOR'))

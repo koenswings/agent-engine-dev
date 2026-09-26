@@ -27,6 +27,7 @@ const src = (rel: string): string => fs.readFileSync(path.join(ROOT, rel), 'utf8
 // in Engine.ts (build-engine) runs interactively and is out of scope for the sudoers file.
 const RUNTIME_FILES = [
     'src/monitors/usbDeviceMonitor.ts',
+    'src/monitors/diskDetection.ts',
     'src/data/Instance.ts',
     'src/data/CopyMoveApp.ts',
 ]
