@@ -72,6 +72,11 @@ describe('Engine sudoers asset (idea#80)', () => {
         expect(rulesText).not.toMatch(/\/disks\/\*/)
         expect(rulesText).not.toMatch(/\/dev\/\*/)
         expect(rulesText).not.toMatch(/-t ext4/)
+        // reboot via systemctl with pinned args only (/usr/sbin/reboot is a symlink to
+        // systemctl on Pi OS and sudo matches by inode)
+        expect(rulesText).not.toMatch(/\/s?bin\/reboot/)
+        expect(rulesText).toMatch(/ENGINE_POWER = \/usr\/bin\/systemctl reboot\s*$/m)
+        expect([...rulesText.matchAll(/systemctl/g)]).toHaveLength(1)
     })
 
     it('covers every runtime sudo call in src/', () => {
@@ -93,7 +98,8 @@ describe('Engine sudoers asset (idea#80)', () => {
         expect(meta).toContain("$`sudo hdparm -I /dev/${device} | grep 'Serial\\ Number'`")
         expect(meta).toContain('$({ input: yamlContent })`sudo tee /META.yaml > /dev/null`')
         expect(meta).not.toMatch(/sudo mv/)
-        expect(src('src/data/Engine.ts')).toContain('$`sudo reboot now`')
+        expect(src('src/data/Engine.ts')).toContain('$`sudo /usr/bin/systemctl reboot`')
+        expect(src('src/data/Engine.ts')).not.toMatch(/\$`sudo reboot now`/)
         // CopyMoveApp.ts: cross-engine copy onto a remote system disk (the only remote sudo)
         const appDirs = SYSTEM_DISK_ENSURE_DIRS.split(' && ')
         expect(appDirs.every(c => c.startsWith('sudo /usr/bin/'))).toBe(true)
@@ -111,7 +117,7 @@ describe('Engine sudoers asset (idea#80)', () => {
             '/usr/bin/cat /META.yaml',
             '/usr/bin/tee /META.yaml',
             '/usr/sbin/hdparm -I /dev/sd[a-z][12]',
-            '/usr/sbin/reboot now',
+            '/usr/bin/systemctl reboot',
             '/usr/bin/mkdir -p /apps /instances /services',
             '/usr/bin/chown pi\\:pi /apps /instances /services',
         ]) expect(rulesText).toContain(rule)

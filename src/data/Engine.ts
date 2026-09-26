@@ -160,7 +160,10 @@ export const rebootEngine = async (storeHandle: DocHandle<Store>, engine: Engine
   await sleep(5000);
 
   log(`Executing reboot command for ${engine.hostname}`);
-  $`sudo reboot now`;
+  // Explicit systemctl path with pinned arguments: on Pi OS /usr/sbin/reboot is a
+  // symlink to systemctl and sudo matches by inode, so a `reboot` sudoers entry
+  // would grant all of systemctl (see 10-engine.sudoers).
+  $`sudo /usr/bin/systemctl reboot`;
 }
 export const inspectEngine = (store: Store, engine: Engine) => {
   log(chalk.bgGray(`Engine: ${deepPrint(engine)}`))

@@ -12,6 +12,10 @@
 # Patterns are narrow on purpose (sd[a-z][12], never /disks/*): in sudoers a '*' in
 # arguments also matches spaces, '/' and '..'.
 # Paths are for Raspberry Pi OS (merged /usr).
+# Reboot is /usr/bin/systemctl reboot with exact arguments, not /usr/sbin/reboot: on
+# Pi OS reboot is a symlink to systemctl and sudo matches commands by inode, so a
+# reboot entry would allow any systemctl call. With arguments given, sudo allows
+# only exactly "systemctl reboot".
 # Pi OS's blanket "pi ALL=(ALL) NOPASSWD: ALL" is kept for now; removing it is a
 # separate follow-up once this file has run cleanly on the fleet.
 Cmnd_Alias ENGINE_MOUNT = /usr/bin/mount /dev/sd[a-z][12] /disks/sd[a-z][12], \
@@ -25,7 +29,7 @@ Cmnd_Alias ENGINE_META  = /usr/bin/cat /META.yaml, \
                           /usr/bin/tee /META.yaml, \
                           /usr/sbin/hdparm -I /dev/sd[a-z], \
                           /usr/sbin/hdparm -I /dev/sd[a-z][12]
-Cmnd_Alias ENGINE_POWER = /usr/sbin/reboot now
+Cmnd_Alias ENGINE_POWER = /usr/bin/systemctl reboot
 Cmnd_Alias ENGINE_APPDIRS = /usr/bin/mkdir -p /apps /instances /services, \
                             /usr/bin/chown pi\:pi /apps /instances /services
 pi ALL=(root) NOPASSWD: ENGINE_MOUNT, ENGINE_DIRS, ENGINE_META, ENGINE_POWER, ENGINE_APPDIRS
