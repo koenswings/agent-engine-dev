@@ -212,8 +212,8 @@ describe('Service images load from services/*.tar on the App Disk (idea#81, real
 
         expect(await imageExists(good.image), `${good.image} should be loaded from the tar`).to.be.true
 
-        // Running is written just before `docker compose up`; confirm the container really runs.
-        expect(await waitForRunningContainer(good.instanceId, 30_000), 'the labelled container should be running').to.be.true
+        // Running is written only after `docker compose up` succeeded (idea#109); the container must run.
+        expect(await waitForRunningContainer(good.instanceId, 5_000), 'the labelled container should be running at Running').to.be.true
 
         const instance = storeHandle.doc()!.instanceDB[good.instanceId as any]
         expect(instance.serviceImages).to.include(good.image)
