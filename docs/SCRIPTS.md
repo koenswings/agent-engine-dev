@@ -31,7 +31,7 @@ This document provides a reference for the main provisioning and utility scripts
     -   `--upgrade`, `--argon`, `--zerotier`, `--raspap`, `--gadget`, `--temperature`: Turn on optional parts of the build.
     -   `--prod`: Build in production mode.
     -   `--personalize`: Personalize Mode (see above).
--   **Details:** A full build handles everything from setting the hostname and installing Docker to deploying the Engine software itself.
+-   **Details:** A full build handles everything from setting the hostname and installing Docker to deploying the Engine software itself. It also installs `/etc/sudoers.d/10-engine` from `script/build_image_assets/10-engine.sudoers` (validated with `visudo` first): the exact commands the Engine, running as `pi`, may run as root. pm2 and `pm2-logrotate` are installed into pi's pm2.
 
 ---
 
@@ -64,7 +64,15 @@ This document provides a reference for the main provisioning and utility scripts
 
 -   **Purpose:** A utility script to synchronize code changes from a Development System to a running Runtime System (a Raspberry Pi).
 -   **Usage:** `./script/sync-engine --machine <pi-address>`
--   **Details:** This script uses `rsync` to efficiently copy only the changed files, making it ideal for rapid development and testing cycles.
+-   **Details:** This script uses `rsync` to efficiently copy only the changed files, making it ideal for rapid development and testing cycles. It connects as `pi`, builds with a plain `pnpm build` and stops/starts the Engine with pi's pm2 (never `sudo pm2`, which would target root's process list).
+
+---
+
+### `reset-engine.ts`
+
+-   **Purpose:** Resets the store data, store identity, `/META.yaml` and/or the code of one or more Engines (or the local one).
+-   **Usage:** `./reset-engine [-d] [-i] [-m] [-c] [-a] [engineName1] [engineName2] ...` (see `./reset-engine -h`).
+-   **Details:** Remote targets are reached over SSH as `pi`. It builds with a plain `pnpm build` and uses pi's pm2, so run it as `pi`: a local reset refuses to run as root.
 
 ---
 

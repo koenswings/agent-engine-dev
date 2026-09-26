@@ -1,0 +1,28 @@
+# /etc/sudoers.d/10-engine: installed by build-engine (installUdev -> installEngineSudoers),
+# mode 0440, owner root:root. Validate with: visudo -cf <file>
+#
+# The only commands the Engine (running as pi under pm2) runs as root (idea#80,
+# proposals/run-architecture.md). Keep this file in sync with the code:
+#   ENGINE_MOUNT  src/monitors/usbDeviceMonitor.ts (mount, umount)
+#   ENGINE_DIRS   src/monitors/usbDeviceMonitor.ts (mount points, /disks/old cleanup)
+#   ENGINE_META   src/data/Meta.ts (read/write /META.yaml, disk serial via hdparm)
+#   ENGINE_POWER  src/data/Engine.ts (reboot command)
+#
+# Patterns are narrow on purpose (sd[a-z][12], never /disks/*): in sudoers a '*' in
+# arguments also matches spaces, '/' and '..'.
+# Paths are for Raspberry Pi OS (merged /usr).
+# Pi OS's blanket "pi ALL=(ALL) NOPASSWD: ALL" is kept for now; removing it is a
+# separate follow-up once this file has run cleanly on the fleet.
+Cmnd_Alias ENGINE_MOUNT = /usr/bin/mount /dev/sd[a-z][12] /disks/sd[a-z][12], \
+                          /usr/bin/umount /disks/sd[a-z][12]
+Cmnd_Alias ENGINE_DIRS  = /usr/bin/mkdir -p /disks/sd[a-z][12], \
+                          /usr/bin/mkdir -p /disks/old, \
+                          /usr/bin/mv /disks/sd[a-z][12] /disks/old/sd[a-z][12], \
+                          /usr/bin/rm -fr /disks/sd[a-z][12], \
+                          /usr/bin/rm -fr /disks/old
+Cmnd_Alias ENGINE_META  = /usr/bin/cat /META.yaml, \
+                          /usr/bin/tee /META.yaml, \
+                          /usr/sbin/hdparm -I /dev/sd[a-z], \
+                          /usr/sbin/hdparm -I /dev/sd[a-z][12]
+Cmnd_Alias ENGINE_POWER = /usr/sbin/reboot now
+pi ALL=(root) NOPASSWD: ENGINE_MOUNT, ENGINE_DIRS, ENGINE_META, ENGINE_POWER

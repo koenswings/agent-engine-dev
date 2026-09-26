@@ -484,10 +484,16 @@ export const moveApp = async (
 
         // 8. Remove source instance directory
         setMoveStep(6)
-        // Use sudo rm -rf because instance data dirs may contain files owned by
-        // Docker container users (e.g. Kolibri data owned by root inside the container).
+        // Removed as pi, without sudo (idea#80): instance folders on disks must be
+        // removable by pi, and the Engine's sudoers file does not allow rm on them.
+        // The instance already runs from the target disk at this point, so a failure
+        // (e.g. files a container created as root) is logged and does not fail the move.
         log(`moveApp: removing source instance directory ${instanceSrc}`)
-        await $`sudo rm -rf ${instanceSrc}`
+        try {
+            await fs.remove(instanceSrc)
+        } catch (e: any) {
+            log(chalk.yellow(`moveApp: could not fully remove ${instanceSrc} as pi: ${e.message}. Remove the leftover folder by hand.`))
+        }
 
         // 9. Remove source app master only if no other instance on the source disk uses it
         // App master files are pi-owned, so fs.remove is sufficient.

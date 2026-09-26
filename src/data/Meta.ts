@@ -1,4 +1,4 @@
-import { $, chalk, YAML } from 'zx'
+import { $, chalk, fs, YAML } from 'zx'
 import { deepPrint, fileExists, log, stripPartition, uuid, print } from '../utils/utils.js'
 import { DeviceName, DiskID, DiskName, Timestamp, Version } from './CommonTypes.js'
 import { config, disksRoot } from './Config.js'
@@ -127,7 +127,7 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
       }
 
       // Update the META file if necessary.
-      // Skip in testMode/isDev — writeMeta requires sudo and we don't want to mutate fixtures.
+      // Skip in testMode/isDev — we don't want to mutate fixtures (or /META.yaml, which needs sudo).
       if (update && !config.settings.isDev && !config.settings.testMode) {
         await writeMeta(meta, path)
       }
@@ -237,17 +237,15 @@ export const createMeta = async (device: DeviceName, engineVersion: Version | un
 const writeMeta = async (meta: DiskMeta, rootPath: string): Promise<void> => {
   log(`Writing metadata ${deepPrint(meta)} to ${rootPath}`)
   try {
-    // Build the YAML content in memory — avoids the sudo-echo-redirect pattern which
-    // fails because shell redirection (>>) runs as pi, not root, so it can't write
-    // to a root-owned temp file created by `sudo mktemp`.
-    //
-    // Strategy: write to a pi-owned temp file (no sudo needed), then sudo mv it into
-    // place. This is safe and atomic on the same filesystem.
     const yamlContent = YAML.stringify(meta)
-    const tmpFile = (await $`mktemp --suffix=.yaml`).stdout.trim()
-    await $`echo ${yamlContent} > ${tmpFile}`
-    await $`sudo mv ${tmpFile} ${rootPath}`
-
+    if (rootPath === '/META.yaml') {
+      // Only the system disk's /META.yaml is root-owned. Pipe the YAML into
+      // `sudo tee /META.yaml`: a fixed command the Engine's sudoers file allows (idea#80).
+      await $({ input: yamlContent })`sudo tee /META.yaml > /dev/null`
+    } else {
+      // META.yaml files on App Disks (under the mount points) are written as pi.
+      await fs.writeFile(rootPath, yamlContent)
+    }
   } catch (e) {
     print(chalk.red('Error writing metadata'))
     console.error(e)
@@ -264,7 +262,8 @@ export const readRemoteDiskId = async (exec: any): Promise<DiskID | undefined> =
       log('hdparm command not found on remote machine.');
       return undefined;
     }
-    const sn = (await exec`${hdparmPath} -I /dev/${rootDevice} | grep 'Serial\\ Number'`).stdout;
+    // hdparm -I needs root; callers run as pi (reset-engine, personalize from boot.sh).
+    const sn = (await exec`sudo ${hdparmPath} -I /dev/${rootDevice} | grep 'Serial\\ Number'`).stdout;
     const id = sn.trim().split(':');
     if (id.length === 2) {
       const diskId = id[1].trim();

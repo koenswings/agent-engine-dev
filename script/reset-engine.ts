@@ -63,7 +63,8 @@ const cleanup = async (exec: any, target: string, enginePath: string, opts: type
             const gitUrl = `https://github.com/${config.defaults.gitAccount}/engine.git`;
 
             console.log(chalk.blue(`  - Stopping and deleting engine process...`));
-            await exec`sudo pm2 delete engine || true`;
+            // pm2 runs as pi (idea#80): use pi's process list, never root's.
+            await exec`pm2 delete engine || true`;
 
             // If running locally, change CWD to parent directory to avoid ENOENT when the current directory is moved
             if (target === 'local engine') {
@@ -108,13 +109,13 @@ const cleanup = async (exec: any, target: string, enginePath: string, opts: type
             await exec`cd ${enginePath} && pnpm build`;
 
             console.log(chalk.blue(`  - Registering and starting engine with PM2...`));
-            await exec`cd ${enginePath} && sudo pm2 start pm2.config.cjs`;
-            await exec`sudo pm2 save`;
+            await exec`cd ${enginePath} && pm2 start pm2.config.cjs`;
+            await exec`pm2 save`;
 
         } else {
             // Standard cleanup (no code reset)
             console.log(chalk.blue(`  - Stopping engine on ${target}...`));
-            await exec`sudo pm2 stop engine || true`;
+            await exec`pm2 stop engine || true`;
 
             if (opts.data) await exec`sudo rm -rf ${enginePath}/store-data/*`;
             if (opts.identity) await exec`sudo rm -rf ${enginePath}/store-identity/*`;
@@ -125,13 +126,13 @@ const cleanup = async (exec: any, target: string, enginePath: string, opts: type
             }
 
             console.log(chalk.blue(`  - Rebuilding engine on ${target}...`));
-            await exec`cd ${enginePath} && sudo pnpm build`;
+            await exec`cd ${enginePath} && pnpm build`;
 
             console.log(chalk.blue(`  - Flushing logs on ${target}...`));
-            await exec`sudo pm2 flush engine`;
+            await exec`pm2 flush engine`;
             
             console.log(chalk.blue(`  - Restarting engine on ${target}...`));
-            await exec`cd ${enginePath} && sudo pm2 start pm2.config.cjs`;
+            await exec`cd ${enginePath} && pm2 start pm2.config.cjs`;
         }
     } catch (e: any) {
         console.error(chalk.red(`Cleanup failed for ${target}: ${e.message}`));
@@ -177,6 +178,12 @@ const main = async () => {
             console.log(chalk.green('Performing reset on local development machine...'));
             await cleanupDev($, 'localhost', './store-data', options);
         } else {
+            // pm2 and the build must run as pi (idea#80). Under sudo, pm2 would
+            // target root's process list and the build would leave root-owned files.
+            if (process.getuid?.() === 0) {
+                console.error(chalk.red('Run reset-engine as pi, not as root or with sudo.'));
+                process.exit(1);
+            }
             console.log(chalk.green('Performing reset on local engine...'));
             const machine = 'local engine';
             const enginePath = config.defaults.enginePath;

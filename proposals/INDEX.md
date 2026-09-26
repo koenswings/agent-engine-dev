@@ -29,8 +29,8 @@ Test categorisation policy: automated, diagnostic, cross-engine. Which tests run
 Cross-engine test design: Group Q tests across multiple Pis, test sequence and assertions.
 
 ## run-architecture.md
-**Status:** Approved — deferred · **Author:** Axle
-Engine run architecture: which user runs the Engine, file ownership, permission model. Confirms pi user + targeted sudoers. Implementation deferred.
+**Status:** Approved — Engine part implemented (idea#80) · **Author:** Axle
+Engine run architecture: which user runs the Engine, file ownership, permission model. Confirms pi user + targeted sudoers (`script/build_image_assets/10-engine.sudoers`).
 
 ## backup-disk.md
 **Status:** Implemented · **Author:** Axle

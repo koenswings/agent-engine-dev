@@ -100,6 +100,7 @@ settings:
 
 - store-template.json: all Engines share the same Automerge doc ID. Regenerating it permanently breaks cross-Engine merging.
 - udev rule 90-docking.rules must be present for USB detection. Installed by install.sh.
-- pm2 must run as pi user only. Root pm2 and pi pm2 are separate process lists.
+- pm2 must run as pi user only. Root pm2 and pi pm2 are separate process lists. Never `sudo pm2`: `sync-engine`, `reset-engine` and build-engine (incl. `pm2-logrotate`) all use pi's pm2 and a plain `pnpm build`. Run `reset-engine` locally as pi (it refuses to run as root).
+- The Engine's root commands are listed in `script/build_image_assets/10-engine.sudoers`, installed by build-engine (`installUdev` → `installEngineSudoers`, validated with `visudo`) as `/etc/sudoers.d/10-engine` (0440 root:root; no `.` in the installed name, or sudo ignores it). If you add a `sudo` call to src/, add the exact command to that file in the same PR, with narrow patterns (`sd[a-z][12]`, never `/disks/*`). App Disk files (META.yaml, instance folders) are written and removed as pi, without sudo. Pi OS's blanket `pi ALL=(ALL) NOPASSWD: ALL` is still in place (removal is a follow-up).
 - pnpm test:full compiles into dist-test/ itself; it never rebuilds dist/. Run `pnpm build` separately when you need a fresh dist/ for the Engine.
 - Leftover pretend disks from pre-idea#105 test runs (e.g. /disks/sdz1) make the pre-flight refuse; remove them by hand.
