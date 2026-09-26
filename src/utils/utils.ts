@@ -24,7 +24,9 @@ export const readEnvVariable = async (path: string, variable: string): Promise<s
   try {
     const envContent = (await $`cat ${path}`).stdout
     const values = envContent.match(new RegExp(`^${variable}=(.*)`, 'm'))
-    log(`Values: ${deepPrint(values)}`)
+    // Log the variable name only, never its value: .env files hold app
+    // passwords and History is readable from the Console (idea#111).
+    log(`Read variable ${variable} from .env file ${path}: ${values ? 'found' : 'not set'}`)
     if (values && values.length >= 1) {
       const value = values[1]
       return value
@@ -35,6 +37,14 @@ export const readEnvVariable = async (path: string, variable: string): Promise<s
     return null
   }
 }
+
+/**
+ * Replace every occurrence of the given secret values in `text` with
+ * `[redacted]`, for log lines and error messages that may echo a value
+ * (idea#111). Empty values are ignored.
+ */
+export const redactValues = (text: string, values: (string | null | undefined)[]): string =>
+  values.reduce<string>((acc, v) => (v ? acc.split(v).join('[redacted]') : acc), text)
 
 // Write a function that adds or updates a variable to a .env file
 // The function should take the path to the .env file, the name of the variable and its value as input
@@ -55,7 +65,7 @@ export const addOrUpdateEnvVariable = async (path: string, variable: string, val
   } catch (e) {
     // Add the variable to the .env file
     log(`Error adding or updating variable ${variable} in .env file ${path}`)
-    log(`error: ${e}`)
+    log(`error: ${redactValues(String(e), [value])}`)
     //await $`echo "${variable}=${value}" >> ${path}`
   }
 }
@@ -340,10 +350,9 @@ export const secureRandomString = (
 
 // Generate a uuid: disk, instance and operation ids, and the app password that
 // startInstance writes to an instance's .env (idea#114: crypto source, not Math.random).
+// Not logged: it generates the app password (idea#111).
 export const uuid = ():string => {
-  const id = secureRandomString(SECRET_ID_LENGTH)
-  log(`Generated uuid: ${id}`)
-  return id
+  return secureRandomString(SECRET_ID_LENGTH)
 }
 
 export const uuidLight = ():string => {
