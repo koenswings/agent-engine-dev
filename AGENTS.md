@@ -62,6 +62,11 @@ live Engine (idea#105):
   `pnpm build` is no longer part of `test:*`.
 - Test containers carry the label `org.idea.test=true`; test cleanup only removes
   labelled containers.
+- `test/automated/service-image-tar-load.test.ts` (idea#81) runs the real offline
+  image load: it tags `traefik/whoami` as `idea-test/tarload:<nonce>`, `docker save`s
+  it into `services/` of a temp fixture disk, removes the tag, docks with
+  `skipImageLoad = false` and `pull_policy: never`. It needs `traefik/whoami` cached
+  locally (it pulls it once in setup if missing) and only removes its own nonce tags.
 - Pre-flight (`script/test-preflight.sh`) refuses to run (exit 1) when it finds a live
   Engine: pm2 `engine` online (or a `node …/dist/src/index.js` process), running
   containers without the test label, `/instances/*`, or App Disks under `/disks`
@@ -83,7 +88,15 @@ settings:
   consolePath: /home/pi/idea/agents/agent-console-dev/dist
   port: 4321            # Automerge WebSocket port
   testMode: false       # true = skip sudo mount/umount (tests)
+  # skipImageLoad:      # optional; unset = follows testMode (idea#81). false = load
+                        # services/<image>.tar at app start (production), true = skip
 ```
+
+`skipImageLoad` (env override `IDEA_SKIP_IMAGE_LOAD=true|false`) is separate from
+`testMode`: testMode only skips the mount, the offline image load follows
+`skipImageLoad()` in `src/data/Config.ts`. Production leaves both unset/false, so
+Engines load every service image from the App Disk's `services/` folder
+(`serviceImageTarPath()`: `/` in the image name → `_`).
 
 ## Quality rules (every PR, no exceptions)
 
