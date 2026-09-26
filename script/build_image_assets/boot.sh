@@ -45,6 +45,36 @@ echo "******************************" >> /home/pi/boot.out
 sudo growpart /dev/sda 2 >> /home/pi/boot.out 2>&1 || true
 sudo resize2fs /dev/sda2 >> /home/pi/boot.out 2>&1 || true
 
+# Self-repair of USB disk detection (idea#82). The Engine watches /dev/engine,
+# whose links are created by the udev rule 90-docking.rules. tmpfiles.d always
+# creates /dev/engine, so without the rule docking silently does nothing.
+# Reinstall the rule when it is missing or differs from the shipped asset, then
+# reload udev and re-trigger it so disks that are already plugged in appear.
+# The Engine's startup self-check reports anything this could not fix.
+# (installCrontabs rewrites the engine path below to config.defaults.enginePath.)
+# --- ensure_docking_rule: begin (extracted and run by test/automated/disk-detection.test.ts)
+DOCKING_RULE_SRC="${DOCKING_RULE_SRC:-/home/pi/idea/agents/agent-engine-dev/script/build_image_assets/90-docking.rules}"
+DOCKING_RULE_DST="${DOCKING_RULE_DST:-/etc/udev/rules.d/90-docking.rules}"
+ensure_docking_rule() {
+  if [[ ! -f "$DOCKING_RULE_SRC" ]]; then
+    echo "udev rule asset $DOCKING_RULE_SRC not found; cannot check $DOCKING_RULE_DST"
+    return 1
+  fi
+  if cmp -s "$DOCKING_RULE_SRC" "$DOCKING_RULE_DST"; then
+    echo "udev rule $DOCKING_RULE_DST is in place"
+    return 0
+  fi
+  echo "udev rule $DOCKING_RULE_DST is missing or differs; reinstalling it"
+  if ! { mkdir -p "$(dirname "$DOCKING_RULE_DST")" && install -m 0644 "$DOCKING_RULE_SRC" "$DOCKING_RULE_DST"; }; then
+    echo "could not write $DOCKING_RULE_DST"
+    return 1
+  fi
+  udevadm control --reload && udevadm trigger
+}
+# --- ensure_docking_rule: end
+echo "Checking the USB docking udev rule" >> /home/pi/boot.out
+ensure_docking_rule >> /home/pi/boot.out 2>&1 || echo "udev rule self-repair failed" >> /home/pi/boot.out
+
 # Restart Avahi to pick up any hostname changes
 echo "Restarting Avahi daemon" >> /home/pi/boot.out
 sudo systemctl restart avahi-daemon >> /home/pi/boot.out 2>&1
