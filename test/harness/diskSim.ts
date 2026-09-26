@@ -254,6 +254,20 @@ export const cleanupContainers = async (instanceId: string): Promise<void> => {
 }
 
 /**
+ * Remove the Compose network(s) of a test instance (`<instanceId>_default`),
+ * which `docker compose create/up` leave behind after the containers are gone.
+ * Only networks whose compose project label equals the instance id are removed.
+ * Leaked networks eventually exhaust Docker's address pools ("could not find
+ * an available, non-overlapping IPv4 address pool"). Safe to call when none exist.
+ */
+export const cleanupNetworks = async (instanceId: string): Promise<void> => {
+    const r = await $`docker network ls -q --filter label=com.docker.compose.project=${instanceId}`.quiet().nothrow()
+    for (const id of r.stdout.trim().split('\n').filter(x => x.trim())) {
+        await $`docker network rm ${id}`.quiet().nothrow()
+    }
+}
+
+/**
  * Poll an HTTP URL until it returns a 2xx response, or the timeout is reached.
  * Returns true if a successful response was received, false if timed out.
  * Used to verify that a container is actually serving traffic after startup.
