@@ -2,6 +2,7 @@ import util from 'util';
 import { $, chalk, fs, os, question } from 'zx';
 import { IPAddress, PortNumber } from '../data/CommonTypes.js';
 import net from 'net';
+import crypto from 'crypto';
 
 
 // Dummy key
@@ -313,9 +314,34 @@ export const prompt = (level:number, message: string) => {
   return question(chalk.bgMagentaBright(spaces+'Press ENTER when ready'))
 }
 
-// Generate a uuid
+/** Characters of generated ids and app passwords: lowercase base-36, as before idea#114. */
+export const SECRET_ID_ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyz'
+/**
+ * Length of generated ids and app passwords. The old Math.random + timestamp ids
+ * were 15-22 characters, 19 in almost all cases, so 19 keeps them the same shape
+ * (idea#114). 19 base-36 characters is about 98 bits of randomness.
+ */
+export const SECRET_ID_LENGTH = 19
+
+/**
+ * A random string from `alphabet`, drawn from Node's CSPRNG. Each character uses
+ * crypto.randomInt, which rejection-samples, so there is no modulo bias (idea#114).
+ * `randomInt` can be swapped in tests only.
+ */
+export const secureRandomString = (
+  length: number,
+  alphabet: string = SECRET_ID_ALPHABET,
+  randomInt: (max: number) => number = crypto.randomInt,
+): string => {
+  let out = ''
+  for (let i = 0; i < length; i++) out += alphabet[randomInt(alphabet.length)]
+  return out
+}
+
+// Generate a uuid: disk, instance and operation ids, and the app password that
+// startInstance writes to an instance's .env (idea#114: crypto source, not Math.random).
 export const uuid = ():string => {
-  const id = Math.random().toString(36).substring(2) + Date.now().toString(36)
+  const id = secureRandomString(SECRET_ID_LENGTH)
   log(`Generated uuid: ${id}`)
   return id
 }
