@@ -30,6 +30,9 @@ and chosen for fast startup in tests, not for production use.
 
 Add a new directory following the same structure. Keep fixtures minimal:
 - No `init_data.tar.gz`
-- No `services/` folder (Docker images are pulled at test time if needed)
+- No `services/` folder (Docker images are pulled at test time if needed; tests skip
+  the tar load by default because `skipImageLoad()` follows testMode). The offline
+  tar-load path is covered by `test/automated/service-image-tar-load.test.ts`, which
+  builds its own temporary disk with a `services/<image>.tar` (idea#81)
 - Use the `sample` app name or another clearly synthetic name
 - Use `${port}` for published ports (never a fixed host port) and add the test label

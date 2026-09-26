@@ -19,6 +19,7 @@ export interface Settings {
     heartbeatIntervalMs: number;  // How often the engine writes a heartbeat to the store (default: 50000ms)
     systemDiskSkip?: boolean;     // If true, skip registering the Pi boot disk as a system disk (for test harnesses)
     disksRoot?: string;           // Mount root for App Disks (default: /disks). Tests point this at a private temp folder.
+    skipImageLoad?: boolean;      // If true, don't load service images from services/*.tar at app start (default: same as testMode). See skipImageLoad().
 }
 
 export interface Defaults {
@@ -112,6 +113,7 @@ function validateSettings(obj: any, path: string): string[] {
     if (typeof obj.consolePath !== 'string') errors.push(`'${path}consolePath' must be a string.`);
     if (obj.heartbeatIntervalMs !== undefined && typeof obj.heartbeatIntervalMs !== 'number') errors.push(`'${path}heartbeatIntervalMs' must be a number.`);
     if (obj.disksRoot !== undefined && typeof obj.disksRoot !== 'string') errors.push(`'${path}disksRoot' must be a string.`);
+    if (obj.skipImageLoad !== undefined && typeof obj.skipImageLoad !== 'boolean') errors.push(`'${path}skipImageLoad' must be a boolean.`);
     return errors;
 }
 
@@ -245,6 +247,26 @@ if (process.env.IDEA_MDNS_DISABLE === 'true') {
 if (process.env.IDEA_DISKS_ROOT) {
     config.settings.disksRoot = process.env.IDEA_DISKS_ROOT;
 }
+
+// Allow IDEA_SKIP_IMAGE_LOAD=true|false to override whether service images are
+// loaded from services/*.tar at app start (idea#81). Unset: follows testMode.
+if (process.env.IDEA_SKIP_IMAGE_LOAD === 'true' || process.env.IDEA_SKIP_IMAGE_LOAD === 'false') {
+    config.settings.skipImageLoad = process.env.IDEA_SKIP_IMAGE_LOAD === 'true';
+}
+
+/**
+ * Whether startInstance skips loading service images from the App Disk's
+ * services/<image>.tar files (idea#81).
+ *
+ * testMode used to control two unrelated things: skipping sudo mount/umount
+ * (needed for fixture disks) and skipping the tar load. They are now separate:
+ * settings.skipImageLoad, when set, decides the tar load on its own; when unset
+ * it follows testMode, so production (testMode off) always loads the tars and
+ * ordinary tests (fixtures without services/) keep skipping them. A test can
+ * set skipImageLoad = false to exercise the real offline tar-load path on a
+ * fixture disk. Read at call time so overrides always apply.
+ */
+export const skipImageLoad = (): boolean => config.settings.skipImageLoad ?? config.settings.testMode;
 
 export const DEFAULT_DISKS_ROOT = '/disks';
 

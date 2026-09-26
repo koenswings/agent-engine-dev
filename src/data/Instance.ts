@@ -11,7 +11,7 @@ import { network } from "./Network.js";
 import { createAppId } from "./App.js";
 import { Docker } from "node-docker-api";
 import { createMeta } from '../data/Meta.js'
-import { config, disksRoot } from '../data/Config.js'
+import { config, disksRoot, skipImageLoad } from '../data/Config.js'
 import { DocHandle } from "@automerge/automerge-repo";
 
 // ── Step-progress helpers ─────────────────────────────────────────────────────
@@ -230,14 +230,14 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     for (const serviceName in services) {
       const serviceImage = services[serviceName].image
       // Pull the sercice image
-      const serviceImageFile = serviceImage.replace(/\//g, '_')
-      if (fs.existsSync(`${disksRoot()}/${device}/services/${serviceImageFile}.tar`)) {
+      const serviceImageTar = serviceImageTarPath(`${disksRoot()}/${device}`, serviceImage)
+      if (fs.existsSync(serviceImageTar)) {
         print(`Service image ${serviceImage} already exists`)
       } else {
         print(`Pulling service image ${serviceImage}`)
         await $`docker image pull ${serviceImage}`
         // Save the service image
-        await $`docker save ${serviceImage} > ${disksRoot()}/${device}/services/${serviceImageFile}.tar`
+        await $`docker save ${serviceImage} > ${serviceImageTar}`
       }
     }
 
@@ -288,6 +288,16 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     console.error(e)
   }
 }
+
+/**
+ * Path of the saved image tar for a service image on an App Disk:
+ * <diskRoot>/services/<image with every / replaced by _>.tar
+ * e.g. traefik/whoami:v1 → <diskRoot>/services/traefik_whoami:v1.tar
+ * Used both when building an instance (docker save) and when starting it
+ * (docker image load), so the two always agree.
+ */
+export const serviceImageTarPath = (diskRoot: string, serviceImage: string): string =>
+  `${diskRoot}/services/${serviceImage.replace(/\//g, '_')}.tar`
 
 export const createInstanceId = (appName: AppName): InstanceID => {
   const id = uuid()
@@ -621,16 +631,17 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     const composeFile = await $`cat ${mountRoot}/instances/${instance.id}/compose.yaml`
     const compose = YAML.parse(composeFile.stdout)
     const services = compose.services
-    if (!config.settings.testMode) {
-      // In production: load images from pre-saved tar files on the disk (no internet required)
+    if (!skipImageLoad()) {
+      // Load images from pre-saved tar files on the disk (no internet required).
+      // Always on in production; tests turn it on with settings.skipImageLoad = false (idea#81).
       for (const serviceName in services) {
         const serviceImage = services[serviceName].image
         log(`Loading the service image ${serviceImage} from the saved tar file`)
-        await $`docker image load < ${mountRoot}/services/${serviceImage.replace(/\//g, '_')}.tar`
+        await $`docker image load < ${serviceImageTarPath(mountRoot, serviceImage)}`
       }
     } else {
-      // In testMode: no tar files in fixtures — Docker pulls the image at create time if not cached
-      log(`testMode: skipping image load from tar; Docker will pull images as needed`)
+      // Tests by default: fixtures have no tar files — Docker pulls the image at create time if not cached
+      log(`skipImageLoad: skipping image load from tar; Docker will pull images as needed`)
     }
 
     // **************************
