@@ -12,7 +12,7 @@
 
 import { $, YAML, chalk, fs } from 'zx'
 import { log, print } from '../utils/utils.js'
-import { config } from '../data/Config.js'
+import { config, disksRoot } from '../data/Config.js'
 import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot } from '../data/Disk.js'
 import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { createOperation, updateOperation } from '../data/Operations.js'
@@ -43,14 +43,14 @@ const LOCK_FILE = '.backup-in-progress'
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 const backupDir = (backupDevice: string, instanceId: InstanceID) =>
-    `/disks/${backupDevice}/backups/${instanceId}`
+    `${disksRoot()}/${backupDevice}/backups/${instanceId}`
 
 const lockFilePath = (backupDevice: string, instanceId: InstanceID) =>
     `${backupDir(backupDevice, instanceId)}/${LOCK_FILE}`
 
 const readBackupYaml = async (backupDevice: string): Promise<BackupYaml | null> => {
     try {
-        const raw = await fs.readFile(`/disks/${backupDevice}/${BACKUP_YAML}`, 'utf-8')
+        const raw = await fs.readFile(`${disksRoot()}/${backupDevice}/${BACKUP_YAML}`, 'utf-8')
         return YAML.parse(raw) as BackupYaml
     } catch {
         return null
@@ -58,7 +58,7 @@ const readBackupYaml = async (backupDevice: string): Promise<BackupYaml | null> 
 }
 
 const writeBackupYaml = async (backupDevice: string, yaml: BackupYaml): Promise<void> => {
-    await fs.writeFile(`/disks/${backupDevice}/${BACKUP_YAML}`, YAML.stringify(yaml))
+    await fs.writeFile(`${disksRoot()}/${backupDevice}/${BACKUP_YAML}`, YAML.stringify(yaml))
 }
 
 // ── Core backup logic ─────────────────────────────────────────────────────────
@@ -284,7 +284,7 @@ export const processBackupDisk = async (
     await indexBackupDiskApps(storeHandle, backupDisk)
 
     // Scan for stale lock files (interrupted backups from before a reboot)
-    const backupsBase = `/disks/${backupDevice}/backups`
+    const backupsBase = `${disksRoot()}/${backupDevice}/backups`
     if (await fs.pathExists(backupsBase)) {
         const entries = await fs.readdir(backupsBase)
         for (const entry of entries) {
@@ -355,7 +355,7 @@ export const checkPendingBackups = async (
 
         // Also check for stale locks for instances on this App Disk
         if (candidate.device) {
-            const backupsBase = `/disks/${candidate.device}/backups`
+            const backupsBase = `${disksRoot()}/${candidate.device}/backups`
             if (await fs.pathExists(backupsBase)) {
                 const entries = await fs.readdir(backupsBase)
                 for (const entry of entries) {

@@ -18,6 +18,7 @@ export interface Settings {
     storeIdentityFolder: string;
     heartbeatIntervalMs: number;  // How often the engine writes a heartbeat to the store (default: 50000ms)
     systemDiskSkip?: boolean;     // If true, skip registering the Pi boot disk as a system disk (for test harnesses)
+    disksRoot?: string;           // Mount root for App Disks (default: /disks). Tests point this at a private temp folder.
 }
 
 export interface Defaults {
@@ -110,6 +111,7 @@ function validateSettings(obj: any, path: string): string[] {
     if (typeof obj.httpPort !== 'number') errors.push(`'${path}httpPort' must be a number.`);
     if (typeof obj.consolePath !== 'string') errors.push(`'${path}consolePath' must be a string.`);
     if (obj.heartbeatIntervalMs !== undefined && typeof obj.heartbeatIntervalMs !== 'number') errors.push(`'${path}heartbeatIntervalMs' must be a number.`);
+    if (obj.disksRoot !== undefined && typeof obj.disksRoot !== 'string') errors.push(`'${path}disksRoot' must be a string.`);
     return errors;
 }
 
@@ -236,3 +238,19 @@ if (process.env.IDEA_SYSTEM_DISK_SKIP === 'true') {
 if (process.env.IDEA_MDNS_DISABLE === 'true') {
     config.settings.mdns = false;
 }
+
+// Allow IDEA_DISKS_ROOT=<path> to override the App Disk mount root (default: /disks).
+// Used by the test harness (script/test-run.sh) so tests use a private, per-run
+// mount root and never touch the live Engine's /disks or /disks/old (idea#105).
+if (process.env.IDEA_DISKS_ROOT) {
+    config.settings.disksRoot = process.env.IDEA_DISKS_ROOT;
+}
+
+export const DEFAULT_DISKS_ROOT = '/disks';
+
+/**
+ * The folder under which App Disks are mounted (one sub-folder per device).
+ * Production: /disks. Tests: a private temp folder set via IDEA_DISKS_ROOT.
+ * Read at call time (not import time) so the env override always applies.
+ */
+export const disksRoot = (): string => config.settings.disksRoot || DEFAULT_DISKS_ROOT;

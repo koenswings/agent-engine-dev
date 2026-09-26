@@ -34,7 +34,7 @@ const createMinimalStore = async (): Promise<{ repo: Repo; storeHandle: DocHandl
     return { repo, storeHandle }
 }
 
-const addDockedDisk = (storeHandle: DocHandle<Store>, diskId: DiskID, diskName: DiskName, engineId: EngineID, device = 'sdz1'): void => {
+const addDockedDisk = (storeHandle: DocHandle<Store>, diskId: DiskID, diskName: DiskName, engineId: EngineID, device = 'idea-test-1'): void => {
     storeHandle.change(doc => {
         doc.diskDB[diskId] = {
             id: diskId,
@@ -109,7 +109,7 @@ describe('ejectDisk command', () => {
         addDockedDisk(storeHandle, diskId, diskName, localEngineId as EngineID)
 
         // Confirm it starts docked
-        expect(storeHandle.doc()!.diskDB[diskId].device).to.equal('sdz1')
+        expect(storeHandle.doc()!.diskDB[diskId].device).to.equal('idea-test-1')
         expect(storeHandle.doc()!.diskDB[diskId].dockedTo).to.equal(localEngineId)
 
         // Eject it

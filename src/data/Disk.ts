@@ -8,6 +8,7 @@ import { DocHandle } from '@automerge/automerge-repo';
 import { getCommandLogHandle } from './CommandLogStore.js';
 import { addTrace, closeTrace } from './CommandLogStore.js';
 import { runWithTrace } from '../utils/CommandLogger.js';
+import { disksRoot } from './Config.js';
 
 
 
@@ -221,7 +222,7 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
  *
  * This is robust in all environments:
  *   - Production Pi: root is /dev/sda2 → isSystemDisk('sda2') === true
- *   - Test fixtures:  /disks/test-xxx exists but is not the root device → false
+ *   - Test fixtures:  <disksRoot>/idea-test-N exists but is not the root device → false
  *   - Non-disk ids (no device):  returns false immediately
  */
 let _rootDevice: string | null = null
@@ -245,19 +246,19 @@ export const isSystemDisk = async (disk: Disk): Promise<boolean> => {
 /**
  * Returns the path prefix for a disk's app/instance/services directories.
  * System disk: '' (so paths become /apps/…, /instances/…)
- * Regular disk: '/disks/<device>'
+ * Regular disk: '<disksRoot>/<device>' (disksRoot defaults to /disks)
  */
 export const diskMountRoot = async (disk: Disk): Promise<string> => {
-    return (await isSystemDisk(disk)) ? '' : `/disks/${disk.device}`
+    return (await isSystemDisk(disk)) ? '' : `${disksRoot()}/${disk.device}`
 }
 
 /**
  * Returns the filesystem root for free-space checks and similar operations
  * that need the actual mount point.
- * System disk: '/'   Regular disk: '/disks/<device>'
+ * System disk: '/'   Regular disk: '<disksRoot>/<device>' (disksRoot defaults to /disks)
  */
 export const diskFsRoot = async (disk: Disk): Promise<string> => {
-    return (await isSystemDisk(disk)) ? '/' : `/disks/${disk.device}`
+    return (await isSystemDisk(disk)) ? '/' : `${disksRoot()}/${disk.device}`
 }
 
 /**

@@ -24,7 +24,8 @@ test/
 script/            Provisioning and utility scripts
 docs/              Authoritative docs — .md, .pdf, .png, .svg ONLY
 proposals/         Proposals and historical design reasoning
-dist/              Compiled output (gitignored)
+dist/              Compiled output the Engine runs from (gitignored)
+dist-test/         Compiled output tests run from (gitignored) — never dist/
 config.yaml        Runtime configuration
 store-template.json  Automerge bootstrap — NEVER MODIFY
 ```
@@ -39,12 +40,36 @@ pnpm build          # TypeScript → dist/ (pnpm clean && tsc)
 ## Test (required before any PR)
 
 ```bash
-pnpm test:full      # build + vitest run dist/test/automated/
-                    # results → test/testresults/ (include in PR)
+pnpm test:full      # pre-flight + compile into dist-test/ + vitest run dist-test/test/automated/
+                    # results → test/testresults/ (gitignored — cite the log filename in the PR)
 pnpm test:unit      # unit tests only
 pnpm test:diagnostic  # field health checks
-pnpm test:cross-engine  # requires 2+ Pis both running
+pnpm test:cross-engine  # requires 2+ Pis both running (no pre-flight, no testMode)
+pnpm test:preflight # run only the live-Engine pre-flight check
+pnpm build:test     # compile into dist-test/ only
 ```
+
+All `test:*` scripts go through `script/test-run.sh`. Tests share nothing with a
+live Engine (idea#105):
+
+- `IDEA_SYSTEM_DISK_SKIP=true` is always set — tests never register the system disk
+  or touch `/instances/*`.
+- Each run gets a private temp folder: `IDEA_WATCH_DIR` (replaces `/dev/engine`)
+  and `IDEA_DISKS_ROOT` (replaces `/disks`). `test/harness/diskSim.ts` refuses to
+  load without them. Nothing in the tests touches `/dev/engine`, `/disks` or `/disks/old`.
+- Pretend disks are named `idea-test-N`; a live Engine (testMode off) ignores such names.
+- Tests compile into `dist-test/`, never `dist/` (which pm2 runs the live Engine from).
+  `pnpm build` is no longer part of `test:*`.
+- Test containers carry the label `org.idea.test=true`; test cleanup only removes
+  labelled containers.
+- Pre-flight (`script/test-preflight.sh`) refuses to run (exit 1) when it finds a live
+  Engine: pm2 `engine` online (or a `node …/dist/src/index.js` process), running
+  containers without the test label, `/instances/*`, or App Disks under `/disks`
+  / `sd*` sentinels in `/dev/engine`. The Pi's own root disk (from
+  `findmnt -n -o SOURCE /`, e.g. `sda` with `sda1`/`sda2`) and all its partitions
+  are excluded from the App Disk check (`script/test-preflight-lib.sh`). Override at your own risk: `IDEA_TEST_ALLOW_LIVE=1`.
+  `IDEA_DIAGNOSTIC_LIVE=true pnpm test:diagnostic` reads a live store, so it needs
+  the override on purpose.
 
 ## Deploy (Ops Bot calls deploy.sh — do not deploy manually)
 
@@ -76,4 +101,5 @@ settings:
 - store-template.json: all Engines share the same Automerge doc ID. Regenerating it permanently breaks cross-Engine merging.
 - udev rule 90-docking.rules must be present for USB detection. Installed by install.sh.
 - pm2 must run as pi user only. Root pm2 and pi pm2 are separate process lists.
-- pnpm test:full runs on compiled dist/. Always rebuild before testing.
+- pnpm test:full compiles into dist-test/ itself; it never rebuilds dist/. Run `pnpm build` separately when you need a fresh dist/ for the Engine.
+- Leftover pretend disks from pre-idea#105 test runs (e.g. /disks/sdz1) make the pre-flight refuse; remove them by hand.

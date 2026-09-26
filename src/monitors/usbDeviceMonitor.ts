@@ -9,10 +9,18 @@ import { findDiskByDevice, Store, getDisksOfEngine, getLocalEngine } from '../da
 import { DeviceName, DiskID, DiskName, InstanceID, Timestamp } from '../data/CommonTypes.js'
 
 import { Instance, Status, stopInstance } from '../data/Instance.js';
-import { config } from '../data/Config.js'
+import { config, disksRoot } from '../data/Config.js'
 import { DocHandle } from '@automerge/automerge-repo';
 import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js';
 import { runWithTrace } from '../utils/CommandLogger.js';
+
+/**
+ * Pretend disks created by the test harness use names that real hardware never
+ * produces (e.g. `idea-test-1`). Only an Engine in testMode accepts them.
+ */
+export const TEST_DEVICE_PATTERN = /^idea-test-[0-9]+$/
+export const isTestDeviceName = (device: string | undefined | null): boolean =>
+    !!device && TEST_DEVICE_PATTERN.test(device)
 
 export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
 
@@ -51,6 +59,10 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     }
 
     const validDevice = function (device: string): boolean {
+        // Test-only device names (idea-test-N) are accepted only in testMode.
+        // A live Engine (testMode off) ignores them, so a pretend disk can never
+        // be picked up and mounted by a live Engine (idea#105).
+        if (isTestDeviceName(device)) return config.settings.testMode
         // Check if the device begins with "sd", is then followed by a letter and ends with the number 2
         // We need the m flag - see https://regexr.com/7rvpq 
         return device && (device.match(/^sd[a-z][1-2]$/m) || device.match(/^sd[a-z]$/m)) ? true : false
@@ -100,21 +112,21 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                 }
 
                 if (config.settings.testMode) {
-                    log(`testMode: skipping mount for device ${device} — fixture expected at /disks/${device}`)
+                    log(`testMode: skipping mount for device ${device} — fixture expected at ${disksRoot()}/${device}`)
                 } else {
                     const mountOutput = await $`mount -t ext4`
-                    if (mountOutput.stdout.includes(`/dev/${device} on /disks/${device} type ext4`)) {
+                    if (mountOutput.stdout.includes(`/dev/${device} on ${disksRoot()}/${device} type ext4`)) {
                         log(`Device ${device} already mounted`)
                     } else {
                         log(`Mounting device ${device}`)
-                        await $`sudo mkdir -p /disks/${device}`
-                        await $`sudo mount /dev/${device} /disks/${device}`
+                        await $`sudo mkdir -p ${disksRoot()}/${device}`
+                        await $`sudo mount /dev/${device} ${disksRoot()}/${device}`
                         log(`Device ${device} has been successfully mounted`)
                     }
                 }
 
                 let meta: DiskMeta
-                if (fs.existsSync(`/disks/${device}/META.yaml`)) {
+                if (fs.existsSync(`${disksRoot()}/${device}/META.yaml`)) {
                     log(`Found a META file on device ${device}. This disk has been processed by the system before.`)
                     try {
                         meta = await readMetaUpdateId(device)
@@ -185,10 +197,10 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
 
     if (!config.settings.isDev && !config.settings.testMode) {
         try {
-            log(`Cleaning up the /disks/old folder`)
-            await $`sudo rm -fr /disks/old/*`
+            log(`Cleaning up the ${disksRoot()}/old folder`)
+            await $`sudo rm -fr ${disksRoot()}/old/*`
         } catch (e) {
-            log(`Error cleaning up the /disks/old folder`)
+            log(`Error cleaning up the ${disksRoot()}/old folder`)
             log(e)
         }
     }
@@ -227,20 +239,20 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     }
 
     log(`Cleaning the mount points...`)
-    const previousMounts = (config.settings.isDev || config.settings.testMode) ? [] : (await $`ls /disks`).toString().split('\n').filter(device => validDevice(device))
+    const previousMounts = (config.settings.isDev || config.settings.testMode) ? [] : (await $`ls ${disksRoot()}`).toString().split('\n').filter(device => validDevice(device))
     log(`Previously mounted devices: ${previousMounts}`)
     const mountOutput = await $`mount -t ext4`
     for (let device of previousMounts) {
         log(`Checking if device ${device} is still actual or mounted`)
-        if (!actualDevices.includes(device) && !mountOutput.stdout.includes(`/dev/${device} on /disks/${device} type ext4`)) {
+        if (!actualDevices.includes(device) && !mountOutput.stdout.includes(`/dev/${device} on ${disksRoot()}/${device} type ext4`)) {
             log(`Cleaning up stale mount point for ${device}`)
             try {
-                await $`sudo umount /disks/${device}`
+                await $`sudo umount ${disksRoot()}/${device}`
             } catch (e: any) {
                 if (e.stderr.includes('not mounted')) {
-                    await $`sudo mkdir -p /disks/old`
-                    await $`sudo mv /disks/${device} /disks/old/${device}`
-                    log(`Device ${device} has been moved to /disks/old`)
+                    await $`sudo mkdir -p ${disksRoot()}/old`
+                    await $`sudo mv ${disksRoot()}/${device} ${disksRoot()}/old/${device}`
+                    log(`Device ${device} has been moved to ${disksRoot()}/old`)
                 } else {
                     log(`Error unmounting device during cleaning ${device}`)
                     log(e)
@@ -275,7 +287,7 @@ export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
         } else {
             log(`Attempting to unmount device ${device}`)
             try {
-                await $`sudo umount /disks/${device}`
+                await $`sudo umount ${disksRoot()}/${device}`
                 log(`Device ${device} has been successfully unmounted`)
             } catch (e: any) {
                 // If the error indicates it wasn't mounted, we can proceed.
@@ -285,8 +297,8 @@ export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
                 }
                 log(`Device ${device} was not mounted`)
             }
-            await $`sudo rm -fr /disks/${device}`
-            log(`Mount point /disks/${device} has been removed`)
+            await $`sudo rm -fr ${disksRoot()}/${device}`
+            log(`Mount point ${disksRoot()}/${device} has been removed`)
         }
         storeHandle.change(doc => {
             const dsk = doc.diskDB[disk.id]

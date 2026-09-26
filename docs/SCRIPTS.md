@@ -81,3 +81,24 @@ This document provides a reference for the main provisioning and utility scripts
 -   **Purpose:** Bundles the project source code into a single Markdown file (`docs/source-bundle.md`). This is useful for providing context to LLMs like NotebookLM or Gemini.
 -   **Usage:** `pnpm bundle-context`
 -   **Details:** Ignores `node_modules` and `dist`.
+
+---
+
+### `test-run.sh` (`script/test-run.sh`)
+
+-   **Purpose:** Runs an Engine test suite fully isolated from any live Engine on the same machine (idea#105). All `pnpm test:*` scripts call it.
+-   **Usage:** `script/test-run.sh <suite> <test-subdir>` (e.g. `script/test-run.sh full automated`). Normally run via `pnpm test:full`, `pnpm test:unit`, `pnpm test:diagnostic` or `pnpm test:cross-engine`.
+-   **Details:**
+    -   Sets `IDEA_SYSTEM_DISK_SKIP=true` so the test watcher never registers the system disk.
+    -   Runs `test-preflight.sh` first (skipped for `cross-engine`, which drives live fleet Engines by design).
+    -   Compiles into `dist-test/` (`tsc --outDir dist-test`), never `dist/`.
+    -   Creates a private temp folder per run and exports `IDEA_WATCH_DIR` (replaces `/dev/engine`) and `IDEA_DISKS_ROOT` (replaces `/disks`); removes it on exit.
+    -   Sets `IDEA_TEST_MODE=true` (not for `cross-engine`) and writes the log to `test/testresults/test-<suite>-<UTC timestamp>.log`.
+
+---
+
+### `test-preflight.sh` (`script/test-preflight.sh`)
+
+-   **Purpose:** Refuses to run tests on a machine with a live Engine (idea#105).
+-   **Usage:** `pnpm test:preflight` or `bash script/test-preflight.sh`. Exit code 0 = safe, 1 = live Engine detected.
+-   **Details:** Refuses when any of these is true: pm2 process `engine` is online (or a `node …/dist/src/index.js` process runs); running Docker containers without the `org.idea.test=true` label; `/instances/*` exist; App Disks are present (`/disks/<name>/META.yaml` or `/disks/<name>/apps`, or `sd*` sentinels in `/dev/engine`). The App Disk check skips the machine's own root disk and all its partitions: the root device comes from `findmnt -n -o SOURCE /`, its parent disk from `lsblk -no PKNAME` (falling back to name parsing for `sdX`, `mmcblkN` and `nvmeNnM`). When the root is not a `/dev` device (e.g. `overlay` in a container), nothing is excluded. The helpers live in `script/test-preflight-lib.sh` and are unit-tested in `test/automated/test-isolation.test.ts`. Override at your own risk with `IDEA_TEST_ALLOW_LIVE=1`.
