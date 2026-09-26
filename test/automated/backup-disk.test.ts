@@ -2,7 +2,8 @@
  * backup-disk.test.ts
  *
  * Tests for Backup Disk processing, backupInstance, and boot-resume.
- * Uses /disks/<device>/ directories (same paths the production code uses).
+ * Uses <DISKS_ROOT>/<device>/ directories under the private per-run mount root
+ * (IDEA_DISKS_ROOT, set by script/test-run.sh) — never the live /disks.
  * All borg create/extract commands are skipped in testMode; store updates,
  * BACKUP.yaml writes, and lock file logic are fully exercised.
  */
@@ -15,7 +16,7 @@ import { DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/dat
 import { Disk } from '../../src/data/Disk.js'
 import { backupInstance, processBackupDisk } from '../../src/monitors/backupMonitor.js'
 import { fs } from 'zx'
-import { randomUUID } from 'crypto'
+import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
 
 // ── Test harness ──────────────────────────────────────────────────────────────
 
@@ -83,20 +84,19 @@ const addInstanceToStore = (
 
 beforeEach(async () => {
     // Use unique device names so parallel test runs don't collide
-    const id = randomUUID().slice(0, 8)
-    appDevice = `test-app-${id}`
-    backupDevice = `test-bak-${id}`
-    await fs.ensureDir(`/disks/${appDevice}/instances/inst-1`)
-    await fs.ensureDir(`/disks/${backupDevice}/backups/inst-1`)
+    appDevice = uniqueTestDevice()
+    do { backupDevice = uniqueTestDevice() } while (backupDevice === appDevice)
+    await fs.ensureDir(`${DISKS_ROOT}/${appDevice}/instances/inst-1`)
+    await fs.ensureDir(`${DISKS_ROOT}/${backupDevice}/backups/inst-1`)
     // Pre-create a fake Borg repo config so borg init is skipped
-    await fs.writeFile(`/disks/${backupDevice}/backups/inst-1/config`, '[repository]\nid = fake\n')
-    await fs.writeFile(`/disks/${backupDevice}/BACKUP.yaml`,
+    await fs.writeFile(`${DISKS_ROOT}/${backupDevice}/backups/inst-1/config`, '[repository]\nid = fake\n')
+    await fs.writeFile(`${DISKS_ROOT}/${backupDevice}/BACKUP.yaml`,
         'mode: on-demand\nlinks:\n  - instanceId: inst-1\n    lastBackup: 0\n')
 })
 
 afterEach(async () => {
-    await fs.remove(`/disks/${appDevice}`)
-    await fs.remove(`/disks/${backupDevice}`)
+    await fs.remove(`${DISKS_ROOT}/${appDevice}`)
+    await fs.remove(`${DISKS_ROOT}/${backupDevice}`)
 })
 
 // ── isBackupDisk ──────────────────────────────────────────────────────────────
@@ -157,7 +157,7 @@ describe('backupInstance', () => {
 
         // Lock file must be cleaned up
         expect(
-            await fs.pathExists(`/disks/${backupDevice}/backups/inst-1/.backup-in-progress`),
+            await fs.pathExists(`${DISKS_ROOT}/${backupDevice}/backups/inst-1/.backup-in-progress`),
             'lock file should be removed after success'
         ).to.be.false
 
@@ -182,7 +182,7 @@ describe('backupInstance', () => {
         ])
         logSpy.mockRestore()
         // No errors; lock file removed; only one backup ran
-        expect(await fs.pathExists(`/disks/${backupDevice}/backups/inst-1/.backup-in-progress`)).to.be.false
+        expect(await fs.pathExists(`${DISKS_ROOT}/${backupDevice}/backups/inst-1/.backup-in-progress`)).to.be.false
     })
 })
 
@@ -199,7 +199,7 @@ describe('boot-resume (stale lock detection)', () => {
 
         // Pre-seed a stale lock file (simulates interrupted backup before reboot)
         await fs.writeFile(
-            `/disks/${backupDevice}/backups/inst-1/.backup-in-progress`,
+            `${DISKS_ROOT}/${backupDevice}/backups/inst-1/.backup-in-progress`,
             JSON.stringify({ instanceId: 'inst-1', startedAt: Date.now() - 60000 })
         )
 
@@ -208,7 +208,7 @@ describe('boot-resume (stale lock detection)', () => {
         logSpy.mockRestore()
 
         // Lock file should be removed (re-triggered backup succeeded)
-        expect(await fs.pathExists(`/disks/${backupDevice}/backups/inst-1/.backup-in-progress`)).to.be.false
+        expect(await fs.pathExists(`${DISKS_ROOT}/${backupDevice}/backups/inst-1/.backup-in-progress`)).to.be.false
 
         // lastBackup should be set
         expect(storeHandle.doc()!.instanceDB['inst-1' as any]?.lastBackup)
@@ -222,7 +222,7 @@ describe('processBackupDisk', () => {
     it('sets backupConfig on the disk in the store', async () => {
         const { storeHandle } = await createMinimalStore()
         // Write immediate-mode BACKUP.yaml
-        await fs.writeFile(`/disks/${backupDevice}/BACKUP.yaml`,
+        await fs.writeFile(`${DISKS_ROOT}/${backupDevice}/BACKUP.yaml`,
             'mode: immediate\nlinks:\n  - instanceId: inst-abc\n    lastBackup: 0\n')
         const backupDisk = makeDisk('bd1', 'BackupDisk', backupDevice, true)
         addDiskToStore(storeHandle, backupDisk)

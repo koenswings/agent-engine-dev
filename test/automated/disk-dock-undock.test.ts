@@ -6,7 +6,8 @@
  *
  * Uses testMode (via IDEA_TEST_MODE=true) so usbDeviceMonitor skips sudo
  * mount/umount. The harness copies a synthetic fixture (disk-sample-v1) to
- * /disks/sdz1/ and touches /dev/engine/sdz1 to simulate the chokidar event.
+ * <IDEA_DISKS_ROOT>/idea-test-1/ and touches <IDEA_WATCH_DIR>/idea-test-1 to simulate
+ * the chokidar event (private per-run folders — never /disks or /dev/engine).
  */
 
 import { describe, it, beforeAll, afterAll, expect } from 'vitest'

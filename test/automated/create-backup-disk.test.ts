@@ -8,8 +8,9 @@
  *   - createBackupDisk end to end via handleCommand: 1 instance, 2+ instances,
  *     bad mode, unknown disk
  *
- * No physical hardware required — the disk is a /disks/<device>/ directory
- * (same paths the production code uses) and disk state is set up in the store.
+ * No physical hardware required — the disk is a <DISKS_ROOT>/<device>/ directory
+ * under the private per-run mount root (IDEA_DISKS_ROOT, set by script/test-run.sh)
+ * and disk state is set up in the store.
  */
 
 import { describe, it, beforeEach, afterEach, expect, vi } from 'vitest'
@@ -22,7 +23,7 @@ import { CommandDefinition } from '../../src/data/CommandDefinition.js'
 import { CommandLogStore } from '../../src/data/CommandLogStore.js'
 import { DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/data/CommonTypes.js'
 import { fs, YAML } from 'zx'
-import { randomUUID } from 'crypto'
+import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -172,14 +173,14 @@ describe('createBackupDisk command', () => {
     const diskName = 'backup-disk' as DiskName
 
     const readBackupYaml = async () =>
-        YAML.parse(await fs.readFile(`/disks/${device}/BACKUP.yaml`, 'utf-8'))
+        YAML.parse(await fs.readFile(`${DISKS_ROOT}/${device}/BACKUP.yaml`, 'utf-8'))
 
     beforeEach(async () => {
         const ctx = await createMinimalStore()
         storeHandle = ctx.storeHandle
         repo = ctx.repo
-        device = `test-cbd-${randomUUID().slice(0, 8)}`
-        await fs.ensureDir(`/disks/${device}`)
+        device = uniqueTestDevice()
+        await fs.ensureDir(`${DISKS_ROOT}/${device}`)
         addDockedDisk(storeHandle, diskId, diskName, device)
         addInstance(storeHandle, 'INST_kolibri' as InstanceID, 'kolibri', diskId)
         addInstance(storeHandle, 'INST_nextcloud' as InstanceID, 'nextcloud', diskId)
@@ -189,7 +190,7 @@ describe('createBackupDisk command', () => {
 
     afterEach(async () => {
         errorSpy.mockRestore()
-        await fs.remove(`/disks/${device}`)
+        await fs.remove(`${DISKS_ROOT}/${device}`)
     })
 
     it('declares diskName, mode and a variadic instanceNames arg', () => {
@@ -235,18 +236,18 @@ describe('createBackupDisk command', () => {
     it('rejects the command when no instance is given', async () => {
         await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskName} on-demand`)
         expect(errorSpy).toHaveBeenCalledWith('Error: Insufficient arguments')
-        expect(await fs.pathExists(`/disks/${device}/BACKUP.yaml`)).toBe(false)
+        expect(await fs.pathExists(`${DISKS_ROOT}/${device}/BACKUP.yaml`)).toBe(false)
     })
 
     it('rejects an invalid mode', async () => {
         await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskName} sometimes kolibri nextcloud`)
         expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Invalid mode 'sometimes'"))
-        expect(await fs.pathExists(`/disks/${device}/BACKUP.yaml`)).toBe(false)
+        expect(await fs.pathExists(`${DISKS_ROOT}/${device}/BACKUP.yaml`)).toBe(false)
     })
 
     it('rejects an unknown disk', async () => {
         await handleCommand(commands, storeHandle, 'engine', 'createBackupDisk no-such-disk on-demand kolibri nextcloud')
         expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Disk 'no-such-disk' not found or not docked"))
-        expect(await fs.pathExists(`/disks/${device}/BACKUP.yaml`)).toBe(false)
+        expect(await fs.pathExists(`${DISKS_ROOT}/${device}/BACKUP.yaml`)).toBe(false)
     })
 })

@@ -160,7 +160,7 @@ const makeHandle = async (): Promise<{ repo: Repo; handle: DocHandle<Store> }> =
             [SOURCE_DISK_ID]: {
                 id: SOURCE_DISK_ID,
                 name: 'source-disk' as DiskName,
-                device: 'sdz1' as any,
+                device: 'idea-test-1' as any,
                 dockedTo: localEngineId,
                 created: 0 as Timestamp, lastDocked: 0 as Timestamp,
                 diskTypes: ['app'], backupConfig: null,
@@ -168,7 +168,7 @@ const makeHandle = async (): Promise<{ repo: Repo; handle: DocHandle<Store> }> =
             [TARGET_DISK_ID]: {
                 id: TARGET_DISK_ID,
                 name: 'target-disk' as DiskName,
-                device: 'sdz2' as any,
+                device: 'idea-test-2' as any,
                 dockedTo: localEngineId,
                 created: 0 as Timestamp, lastDocked: 0 as Timestamp,
                 diskTypes: ['app'], backupConfig: null,

@@ -78,7 +78,7 @@ const syncEngine = async () => {
 
       //console.log(chalk.blue(`Syncing the engine to user ${user} on remote machine ${machine}`))
       //console.log(chalk.blue(`Using command rsync -av --chmod=Du=rwx,Dg=rx,Do=rx,Fu=rw,Fg=r,Fo=r --perms --exclude='node_modules' --exclude='.git' --exclude='dist' --exclude='scratchpad' --exclude='.vscode' --exclude='.pnpm-store' --exclude='yjs-db' --exclude='${storeDataFolder}' ./ ${user}@${machine}:${enginePath}`))
-      await $`rsync -av --chmod=Du=rwx,Dg=rx,Do=rx,Fu=rw,Fg=r,Fo=r --perms --exclude='node_modules' --exclude='.git' --exclude='dist' --exclude='scratchpad' --exclude='.vscode' --exclude='.pnpm-store' --exclude='yjs-db' --exclude='${storeDataFolder}' ./ ${user}@${machine}:${enginePath}`
+      await $`rsync -av --chmod=Du=rwx,Dg=rx,Do=rx,Fu=rw,Fg=r,Fo=r --perms --exclude='node_modules' --exclude='.git' --exclude='dist' --exclude='dist-test' --exclude='scratchpad' --exclude='.vscode' --exclude='.pnpm-store' --exclude='yjs-db' --exclude='${storeDataFolder}' ./ ${user}@${machine}:${enginePath}`
       //await $`rsync -av --chmod=Du=rwx,Dg=rx,Do=rx,Fu=rw,Fg=r,Fo=r --perms --exclude='node_modules' --exclude='.git' --exclude='dist' --exclude='scratchpad' --exclude='.vscode' --exclude='.pnpm-store' --exclude='yjs-db' ./ ${user}@${machine}:${enginePath}`
       // Install the dependencies on the remote machine 
       //console.log(chalk.blue(`Installing dependencies on remote machine`));

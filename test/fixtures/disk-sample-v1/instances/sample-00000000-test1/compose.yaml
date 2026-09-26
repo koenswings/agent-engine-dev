@@ -1,6 +1,9 @@
 services:
   sample:
     image: traefik/whoami
+    labels:
+      # Marks containers created by tests; test cleanup only removes labelled containers (idea#105)
+      org.idea.test: "true"
     ports:
       - "${port}:80"
     restart: "no"

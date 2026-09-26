@@ -1,7 +1,7 @@
 import { $, chalk, YAML } from 'zx'
 import { deepPrint, fileExists, log, stripPartition, uuid, print } from '../utils/utils.js'
 import { DeviceName, DiskID, DiskName, Timestamp, Version } from './CommonTypes.js'
-import { config } from './Config.js'
+import { config, disksRoot } from './Config.js'
 
 export interface DiskMeta {
   diskId: DiskID         
@@ -39,7 +39,7 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
   // testMode only affects hardware ID lookup (skipped) and writeMeta (skipped) — not identity.
   try {
     if (deviceSpec) {
-      path = `/disks/${deviceSpec}/META.yaml`
+      path = `${disksRoot()}/${deviceSpec}/META.yaml`
       device = deviceSpec as DeviceName
     } else {
       path = `/META.yaml`
@@ -227,7 +227,7 @@ export const createMeta = async (device: DeviceName, engineVersion: Version | un
 
   try {
     // Create the META.yaml file
-    await writeMeta(meta, `/disks/${device}/META.yaml`)
+    await writeMeta(meta, `${disksRoot()}/${device}/META.yaml`)
   } catch (e) {
     print(chalk.red('Error creating metadata'));
   }
