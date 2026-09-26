@@ -55,8 +55,10 @@ systemctl start tailscaled
 sleep 2
 
 info "Joining IDEA Tailnet (ephemeral)..."
+# --auth-key=file:<path>: tailscale reads the key from the root-only file, so the
+# key itself is never a command-line argument (visible with ps) (idea#115).
 tailscale up \
-  --authkey "$(cat "$AUTH_KEY_FILE")" \
+  --auth-key="file:$AUTH_KEY_FILE" \
   --ephemeral \
   --advertise-tags=tag:school-pi \
   --hostname="$(hostname)"

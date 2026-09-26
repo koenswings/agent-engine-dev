@@ -572,6 +572,40 @@ export const installRaspAP = async (exec: any, enginePath: string) => {
   print(chalk.green('RaspAP installed'));
 }
 
+/** Where installTailscale stores the auth key on the Pi (root-only, 0600). */
+export const TAILSCALE_AUTHKEY_PATH = '/etc/tailscale/debug-authkey'
+const TAILSCALE_AUTHKEY_DIR = '/etc/tailscale'
+const TAILSCALE_AUTHKEY_SECRETS_FILE = '/home/pi/openclaw/secrets/tailscale_authkey.txt'
+
+/** TAILSCALE_AUTHKEY env var first, then the secrets file on the management Pi. */
+export const resolveTailscaleAuthKey = (): string | null => {
+  const fromEnv = process.env.TAILSCALE_AUTHKEY?.trim()
+  if (fromEnv) return fromEnv
+  return fs.existsSync(TAILSCALE_AUTHKEY_SECRETS_FILE)
+    ? fs.readFileSync(TAILSCALE_AUTHKEY_SECRETS_FILE, 'utf-8').trim() || null
+    : null
+}
+
+/**
+ * Store the Tailscale auth key on the Pi without it ever being a command-line
+ * argument (idea#115). The key goes over the command's stdin (through ssh when
+ * `exec` is the ssh() helper, whose arguments are shellQuote'd) into `sudo tee`,
+ * under umask 077 inside a root-only (0700) folder, so the file is created as
+ * root with mode 0600 and nobody else can read it at any point. `tee` reads fd 0
+ * directly (`install /dev/stdin` fails when stdin is a socket, as with Node child
+ * processes). Before idea#115 it was `echo <key> | sudo tee …`, so the key was in
+ * the ssh and remote shell arguments, visible with `ps`.
+ */
+export const storeTailscaleAuthKey = async (exec: any, authKey: string): Promise<void> => {
+  await exec`sudo install -d -m 700 -o root -g root ${TAILSCALE_AUTHKEY_DIR}`
+  const write = exec`umask 077 && sudo tee ${TAILSCALE_AUTHKEY_PATH} > /dev/null`
+  write.stdin.end(authKey + '\n')
+  await write
+  // An existing file keeps its old mode and owner under tee: set them explicitly.
+  await exec`sudo chmod 600 ${TAILSCALE_AUTHKEY_PATH}`
+  await exec`sudo chown root:root ${TAILSCALE_AUTHKEY_PATH}`
+}
+
 /**
  * Install Tailscale on a newly provisioned Pi.
  *
@@ -579,27 +613,26 @@ export const installRaspAP = async (exec: any, enginePath: string) => {
  *
  * Tailscale is installed in "latent" mode:
  *   - Binaries present, systemd service DISABLED and NOT started
- *   - Auth key stored at /etc/tailscale/debug-authkey (600, root)
- *   - Activation script installed at /usr/local/bin/tailscale-debug-activate.sh
+ *   - Auth key stored at /etc/tailscale/debug-authkey (600, root), see storeTailscaleAuthKey
+ *   - Activation script installed at /usr/local/bin/tailscale-debug-activate.sh; it
+ *     passes the key to `tailscale up` as `--auth-key=file:<path>`, never the key itself
  *
  * The Pi remains fully offline during normal operation.
  * A coordinator activates debug mode by running the activation script over SSH.
  *
- * Auth key source (in priority order):
+ * Auth key source (in priority order), see resolveTailscaleAuthKey:
  *   1. TAILSCALE_AUTHKEY env var (set on the management Pi running buildEngine)
  *   2. /home/pi/openclaw/secrets/tailscale_authkey.txt (Atlas's secrets dir on this Pi)
+ * Use a short-lived, single-use key (docs/PI_FLEET.md). The key is never logged
+ * and never passed as a command argument (idea#115).
  */
 export const installTailscale = async (exec: any, enginePath: string) => {
   print(chalk.blue('Installing Tailscale (latent debug mode)...'))
 
-  // Resolve auth key
-  const authKey = process.env.TAILSCALE_AUTHKEY
-    ?? (fs.existsSync('/home/pi/openclaw/secrets/tailscale_authkey.txt')
-        ? fs.readFileSync('/home/pi/openclaw/secrets/tailscale_authkey.txt', 'utf-8').trim()
-        : null)
+  const authKey = resolveTailscaleAuthKey()
 
   if (!authKey) {
-    console.error(chalk.red('installTailscale: no auth key found. Set TAILSCALE_AUTHKEY env var or ensure /home/pi/openclaw/secrets/tailscale_authkey.txt exists.'))
+    console.error(chalk.red(`installTailscale: no auth key found. Set TAILSCALE_AUTHKEY env var or ensure ${TAILSCALE_AUTHKEY_SECRETS_FILE} exists.`))
     process.exit(1)
   }
 
@@ -607,25 +640,22 @@ export const installTailscale = async (exec: any, enginePath: string) => {
     // 1. Download and install Tailscale static binaries (arm64)
     // curl-installs the official static tarball so no package manager changes are needed.
     // The service is NOT enabled after installation.
-    // Shell command uses $TSVER which must not be interpolated by TypeScript.
-    // We pass it as a regular string argument to avoid template literal interpolation.
-    await exec(['bash', '-c',
+    // The script is one interpolated (quoted) argument, so $TSVER is expanded by
+    // the bash on the Pi, not by TypeScript or the local shell.
+    const downloadScript =
       'TSVER=$(curl -sL https://pkgs.tailscale.com/stable/ | grep -oP \'tailscale_\\K[\\d.]+(?=_arm64.tgz)\' | head -1)' +
       ' && curl -sL "https://pkgs.tailscale.com/stable/tailscale_${TSVER}_arm64.tgz"' +
       ' | sudo tar -xz --strip-components=1 -C /usr/sbin' +
       ' "tailscale_${TSVER}_arm64/tailscale" "tailscale_${TSVER}_arm64/tailscaled"'
-    ])
+    await exec`bash -c ${downloadScript}`
 
     // 2. Install systemd service (disabled — does not start on boot)
     await exec`sudo cp ${enginePath}/script/build_image_assets/tailscaled.service /etc/systemd/system/tailscaled.service`
     await exec`sudo systemctl daemon-reload`
     // explicitly do NOT enable: tailscale must be activated manually
 
-    // 3. Store auth key (root-only, 600)
-    await exec`sudo mkdir -p /etc/tailscale`
-    await exec`echo ${authKey} | sudo tee /etc/tailscale/debug-authkey > /dev/null`
-    await exec`sudo chmod 600 /etc/tailscale/debug-authkey`
-    await exec`sudo chown root:root /etc/tailscale/debug-authkey`
+    // 3. Store auth key (root-only, 600) — over stdin, never as an argument
+    await storeTailscaleAuthKey(exec, authKey)
 
     // 4. Install activation script
     await exec`sudo cp ${enginePath}/script/build_image_assets/tailscale-debug-activate.sh /usr/local/bin/tailscale-debug-activate.sh`
@@ -634,7 +664,8 @@ export const installTailscale = async (exec: any, enginePath: string) => {
     print(chalk.green('Tailscale installed (service disabled — latent debug mode ready)'))
   } catch (e) {
     print(chalk.red('Error installing Tailscale'))
-    console.error(e)
+    // Error text holds stderr only; strip the key anyway in case a tool echoes it.
+    console.error(String(e).split(authKey).join('[redacted]'))
     process.exit(1)
   }
 }
