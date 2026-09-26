@@ -23,6 +23,22 @@ export const TEST_DEVICE_PATTERN = /^idea-test-[0-9]+$/
 export const isTestDeviceName = (device: string | undefined | null): boolean =>
     !!device && TEST_DEVICE_PATTERN.test(device)
 
+/**
+ * Options for the watcher on the udev watch folder (/dev/engine).
+ *
+ * udev creates /dev/engine/<device> as a symlink to /dev/<device> (root:disk 0660).
+ * The Engine runs as pi, which is not in the disk group, so following the links
+ * made chokidar put an inotify watch on the block device itself and fail with
+ * EACCES (idea#110). With followSymlinks off, chokidar only watches the folder and
+ * reports links being added and removed; mounting goes through sudo, so the
+ * Engine never needs to open the block device. Do not add pi to the disk group
+ * instead: that gives raw read access to every drive.
+ */
+export const DEVICE_WATCH_OPTIONS = { persistent: true, followSymlinks: false } as const
+
+/** Watch the udev watch folder for device links (see DEVICE_WATCH_OPTIONS). */
+export const watchDeviceFolder = (watchDir: string) => chokidar.watch(watchDir, { ...DEVICE_WATCH_OPTIONS })
+
 export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
 
     // Detection relies on the udev rule 90-docking.rules (repaired by boot.sh and
@@ -275,7 +291,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     }
 
     const watchDir = process.env.IDEA_WATCH_DIR || '/dev/engine'
-    const watcher = chokidar.watch(watchDir, { persistent: true })
+    const watcher = watchDeviceFolder(watchDir)
 
     watcher
         .on('add', addDevice)
