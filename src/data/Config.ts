@@ -179,6 +179,16 @@ function validateConfig(obj: any): string[] {
 // Configuration Loading
 // ##################################################################################################
 
+/**
+ * One-line summary of a config.yaml read/parse error. YAML parse errors quote
+ * the offending lines of the file, which can hold credentials (defaults.password),
+ * so only the first line (message + line/column) is kept (idea#111).
+ */
+export const configErrorSummary = (e: unknown): string => {
+  const message = e instanceof Error ? e.message : String(e)
+  return message.split('\n')[0].trim()
+}
+
 const readConfig = (path: string): Config => {
   try {
     const configFile = fs.readFileSync(path, 'utf8');
@@ -196,7 +206,7 @@ const readConfig = (path: string): Config => {
 
   } catch (e) {
     log(chalk.red('Error reading or parsing config.yaml!'));
-    console.error(e);
+    console.error(chalk.red(configErrorSummary(e)));
     process.exit(1);
   }
 }

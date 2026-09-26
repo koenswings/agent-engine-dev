@@ -761,11 +761,11 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     }
     // Check if port is undefined or NaN
     if (pass && !(pass == "")) {
-      log(`Found a pass for instance ${instance.id} in the .env file: ${pass}`)
+      log(`Found a pass for instance ${instance.id} in the .env file`)
     } else {
       log(`No pass has previously been generated. Generating a new pass.`)
       pass = await uuid()
-      log(`Generated pass: ${pass}`)
+      log(`Generated a new pass for instance ${instance.id}`)
       // Write the password to the .env file
       await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'pass', pass)
     }
@@ -1044,7 +1044,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
         inst.port = parsedPort as PortNumber
       })
     } else {
-      log(chalk.red(`Error parsing port number from .env file for instance ${instance.id}. Got ${parsedPort} from ${port}`))
+      log(chalk.red(`Error parsing port number from .env file for instance ${instance.id}: the port variable is not a number`))
     }
   } else {
     log(chalk.red(`Error extracting port number from .env file for instance ${instance.id}`))
