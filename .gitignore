@@ -11,8 +11,11 @@ store-data/
 # The Yjs persistent storage folder
 yjs-db
 
-# Github access token
-scripts/build_image_assets/gh_token.txt
+# GitHub access tokens: never commit one (idea#116). The old rule said scripts/
+# (plural), so it never matched script/build_image_assets/gh_token.txt.
+script/build_image_assets/gh_token.txt
+**/gh_token.txt
+*.token
 
 # Logs
 logs
