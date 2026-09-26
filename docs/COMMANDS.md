@@ -44,8 +44,20 @@ These commands perform actions on the system. Some are restricted to an `engine`
 - **Usage:** `send <engineId> <command> [args...]`
 - **Scope:** `any`
 
-### `createInstance`
-- **Description:** Builds a new application instance on an engine from a git repository. This involves cloning the code, setting up the instance directory, and preparing service images.
+### `installApp`
+- **Description:** Installs an application onto a target disk. Routes to the appropriate source automatically:
+  - `--source` given: copies the app bundle from a docked disk (works offline).
+  - No `--source`, internet available: clones from GitHub (same as the old `createInstance`).
+  - No `--source`, no internet: searches `appDB` for a locally known source disk; fails with a clear message if none found.
+- **Usage:** `installApp <appId> <targetDiskName> [--source <sourceDiskName>] [--name <instanceName>]`
+- **Scope:** `engine`
+- **Examples:**
+  - `installApp kolibri-1.0 my-disk` — auto-route (online → GitHub, offline → appDB lookup)
+  - `installApp kolibri-1.0 my-disk --source catalog-disk` — copy from a docked catalog disk
+  - `installApp kolibri-1.0 my-disk --source catalog-disk --name school-kolibri` — custom instance name
+
+### `createInstance` *(deprecated)*
+- **Description:** Deprecated alias for `installApp`. Use `installApp` instead. Builds a new application instance from a git repository.
 - **Usage:** `createInstance <instanceName> <appName> <gitAccount> <gitTag> <diskName>`
 - **Scope:** `engine`
 
@@ -62,6 +74,16 @@ These commands perform actions on the system. Some are restricted to an `engine`
 ### `stopInstance`
 - **Description:** Stops a running application instance and its associated Docker containers.
 - **Usage:** `stopInstance <instanceName> <diskName>`
+- **Scope:** `engine`
+
+### `copyApp`
+- **Description:** Copies an app instance from one disk to another. The copy receives a brand new InstanceID — it is treated as a fresh instance. The original instance is stopped during the file copy (for a consistent snapshot) and restarted afterwards. Progress is tracked in `operationDB` in the store and visible to all Consoles.
+- **Usage:** `copyApp <instanceName> <sourceDiskName> <targetDiskName>`
+- **Scope:** `engine`
+
+### `moveApp`
+- **Description:** Moves an app instance from one disk to another. The instance keeps its original InstanceID so backup disk links remain intact. The source instance directory (and app master, if no other instance on the source disk uses it) is removed after a successful transfer.
+- **Usage:** `moveApp <instanceName> <sourceDiskName> <targetDiskName>`
 - **Scope:** `engine`
 
 ### `backupApp`

@@ -30,6 +30,7 @@ const createMinimalStore = async (): Promise<{ repo: Repo; storeHandle: DocHandl
         appDB: {},
         instanceDB: {},
         userDB: {},
+        operationDB: {},
     })
     await storeHandle.whenReady()
     await createOrUpdateEngine(storeHandle, localEngineId)
@@ -68,7 +69,12 @@ const addInstanceToStore = (
             created: Date.now() as Timestamp,
             lastBackup: null,
             lastStarted: Date.now() as Timestamp,
+            statusCondition: null,
             storedOn: diskId,
+            currentStep: null,
+            totalSteps: null,
+            stepLabel: null,
+                metrics: null,
         }
     })
 }
@@ -117,7 +123,7 @@ describe('backupInstance', () => {
         const backupDisk = makeDisk('bd1', 'BackupDisk', backupDevice, true)
         addDiskToStore(storeHandle, backupDisk)
 
-        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+        const logSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
         await backupInstance(storeHandle, 'nonexistent' as InstanceID, backupDisk)
         logSpy.mockRestore()
     })
@@ -130,7 +136,7 @@ describe('backupInstance', () => {
         addDiskToStore(storeHandle, backupDisk)
         addInstanceToStore(storeHandle, 'inst-1' as InstanceID, 'ad1' as DiskID)
 
-        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+        const logSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
         await backupInstance(storeHandle, 'inst-1' as InstanceID, backupDisk)
         logSpy.mockRestore()
 
@@ -145,7 +151,7 @@ describe('backupInstance', () => {
         addDiskToStore(storeHandle, backupDisk)
         addInstanceToStore(storeHandle, 'inst-1' as InstanceID, 'ad1' as DiskID, 'Stopped')
 
-        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+        const logSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
         await backupInstance(storeHandle, 'inst-1' as InstanceID, backupDisk)
         logSpy.mockRestore()
 
@@ -168,7 +174,7 @@ describe('backupInstance', () => {
         addDiskToStore(storeHandle, backupDisk)
         addInstanceToStore(storeHandle, 'inst-1' as InstanceID, 'ad1' as DiskID, 'Stopped')
 
-        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+        const logSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
         // Both calls in flight simultaneously
         await Promise.all([
             backupInstance(storeHandle, 'inst-1' as InstanceID, backupDisk),
@@ -197,7 +203,7 @@ describe('boot-resume (stale lock detection)', () => {
             JSON.stringify({ instanceId: 'inst-1', startedAt: Date.now() - 60000 })
         )
 
-        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+        const logSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
         await processBackupDisk(storeHandle, backupDisk)
         logSpy.mockRestore()
 
@@ -221,7 +227,7 @@ describe('processBackupDisk', () => {
         const backupDisk = makeDisk('bd1', 'BackupDisk', backupDevice, true)
         addDiskToStore(storeHandle, backupDisk)
 
-        const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {})
+        const logSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
         await processBackupDisk(storeHandle, backupDisk)
         logSpy.mockRestore()
 

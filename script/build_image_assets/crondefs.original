@@ -1,0 +1,10 @@
+# Original crondefs — nightly reboot enabled
+# Backed up before disabling on 2026-04-26 by Atlas
+# To restore: uncomment the shutdown line in crondefs and re-deploy to all engines via:
+#   sudo crontab /path/to/crondefs   (on each engine)
+# or re-run provisioning.
+
+# crontab commands
+0 5 * * * /sbin/shutdown -r now
+0 * * * * systemctl restart avahi-daemon
+@reboot /usr/local/bin/boot.sh

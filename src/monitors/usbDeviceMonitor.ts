@@ -7,13 +7,16 @@ $.verbose = false;
 import { Disk, createOrUpdateDisk, processDisk } from '../data/Disk.js'
 import { findDiskByDevice, Store, getDisksOfEngine, getLocalEngine } from '../data/Store.js'
 import { DeviceName, DiskID, DiskName, InstanceID, Timestamp } from '../data/CommonTypes.js'
+
 import { Instance, Status, stopInstance } from '../data/Instance.js';
 import { config } from '../data/Config.js'
 import { DocHandle } from '@automerge/automerge-repo';
+import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js';
+import { runWithTrace } from '../utils/CommandLogger.js';
 
 export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
 
-    // TODO: Alternative implementations for usb device detection:
+    // TODO: Alternative implementations for usb device detection — https://github.com/koenswings/idea/issues/46:
     // 1. Monitor /dev iso /dev/engine
     // 2. Monitor /dev/disk/by-label
     // 3. Monitor dmesg output
@@ -24,6 +27,27 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     if (!localEngine) {
         log(`No local engine found in the store`)
         throw new Error(`No local engine found in the store`)
+    }
+
+    // Detect the root partition (e.g. sda2) at startup so we can:
+    //   - register it as a system disk
+    //   - skip the whole-disk parent (e.g. sda) and the boot partition (e.g. sda1)
+    // findmnt reads procfs — safe to run in all modes, no sudo needed.
+    let systemDevice: DeviceName | null = null
+    let systemBootDevice: DeviceName | null = null   // e.g. 'sda1' — the boot partition to skip
+    try {
+        const rootSource = (await $`findmnt -n -o SOURCE /`).stdout.trim()
+        // rootSource is e.g. /dev/sda2 — strip the /dev/ prefix
+        const rootDev = rootSource.replace('/dev/', '') as DeviceName
+        if (rootDev.match(/^sd[a-z][0-9]+$/)) {
+            systemDevice = rootDev
+            // Boot partition is parent (strip trailing digits) + '1', e.g. sda2 → sda1
+            const parentDev = rootDev.replace(/[0-9]+$/, '')
+            systemBootDevice = (parentDev + '1') as DeviceName
+            log(`System disk detected: root=${systemDevice}, boot=${systemBootDevice}`)
+        }
+    } catch (e) {
+        log(`Could not detect system device via findmnt: ${e}`)
     }
 
     const validDevice = function (device: string): boolean {
@@ -38,8 +62,43 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
 
         if (validDevice(device)) {
             log(`The disk on device ${device} has a valid device name`)
+
+            // Skip whole-disk entries (e.g. sda, sdb) — raw block devices with no
+            // filesystem; never directly mountable.
+            if (device.match(/^sd[a-z]$/)) {
+                log(`Device ${device} is a whole-disk entry — skipping`)
+                return
+            }
+
+            // Skip the OS boot partition (e.g. sda1 on most Pis, but derived from
+            // the actual root device so it works regardless of disk letter).
+            if (systemBootDevice && device === systemBootDevice) {
+                log(`Device ${device} is the OS boot partition — skipping`)
+                return
+            }
+
             log(`Processing the disk on device ${device}`)
             try {
+                // System disk (root partition): already mounted at /, no mount needed.
+                // Read identity from /META.yaml and register as a system disk.
+                // Skip if IDEA_SYSTEM_DISK_SKIP=true (used by Kit's test harness to avoid
+                // conflicts when a second engine runs alongside the production instance).
+                if (systemDevice && device === systemDevice) {
+                    if (config.settings.systemDiskSkip) {
+                        log(`Device ${device} is the system disk — skipping registration (IDEA_SYSTEM_DISK_SKIP=true)`)
+                        return
+                    }
+                    log(`Device ${device} is the system disk (root partition) — registering as system disk`)
+                    try {
+                        const meta = await readMetaUpdateId()  // reads /META.yaml, no device arg
+                        const disk: Disk = createOrUpdateDisk(storeHandle, localEngine.id, device, meta.diskId, 'System Disk' as DiskName, meta.created)
+                        await processDisk(storeHandle, disk)
+                    } catch (e) {
+                        log(`Error processing system disk: ${e}`)
+                    }
+                    return
+                }
+
                 if (config.settings.testMode) {
                     log(`testMode: skipping mount for device ${device} — fixture expected at /disks/${device}`)
                 } else {
@@ -66,12 +125,14 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                     }
                 } else {
                     // Before creating a new disk entry, check if a disk is already
-                    // registered for this device in the store. This prevents spurious
-                    // empty-disk entries when addDevice fires for a device that's already
-                    // docked (e.g. during docker compose up -d Recreate cycles).
-                    const existingDisk = findDiskByDevice(storeHandle.doc(), device as DeviceName)
+                    // registered for this device on THIS engine in the store. This prevents
+                    // spurious empty-disk entries when addDevice fires for a device that's
+                    // already docked (e.g. during docker compose up -d Recreate cycles).
+                    // Scoped to localEngine.id to avoid false matches on other engines' disks
+                    // in the shared CRDT store (e.g. all Pis having sda2 as the root device).
+                    const existingDisk = findDiskByDevice(storeHandle.doc(), device as DeviceName, localEngine.id)
                     if (existingDisk) {
-                        log(`Device ${device} already has a registered disk (${existingDisk.id}) — skipping new disk creation`)
+                        log(`Device ${device} already has a registered disk (${existingDisk.id}) on this engine — skipping new disk creation`)
                         return
                     }
                     log('Could not find a META file. Creating one now.')
@@ -132,7 +193,8 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         }
     }
 
-    const actualDevices = (config.settings.isDev || config.settings.testMode) ? [] : (await $`ls /dev/engine`).toString().split('\n').filter(device => validDevice(device))
+    const engineWatchDir = process.env.IDEA_WATCH_DIR || '/dev/engine'
+    const actualDevices = (config.settings.isDev || config.settings.testMode) ? [] : (await $`ls ${engineWatchDir}`).toString().split('\n').filter(device => validDevice(device))
     log(`Actual devices: ${actualDevices}`)
 
     log(`Removing from the network database disks that were attached before the current boot but are no longer attached now...`)
@@ -145,12 +207,19 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
 
         for (let device of storedDevices) {
             if (!actualDevices.includes(device)) {
-                log(`Removing disk from previously mounted device ${device}`)
                 const disk = findDiskByDevice(store, device as DeviceName)
-                if (disk) {
-                    await undockDisk(storeHandle, disk)
-                    log(`Disk ${disk.id} removed from local engine`)
+                if (!disk) continue
+                // Never undock the system disk based on /dev/engine listing —
+                // the root partition is always present and /dev/engine may not
+                // be populated yet (e.g. tmpfiles.d race) or may be empty in
+                // testMode. System disk presence is guaranteed by the OS itself.
+                if (disk.diskTypes?.includes('system')) {
+                    log(`Skipping undock of system disk ${disk.id} on device ${device} — system disk is always present`)
+                    continue
                 }
+                log(`Removing disk from previously mounted device ${device}`)
+                await undockDisk(storeHandle, disk)
+                log(`Disk ${disk.id} removed from local engine`)
             }
         }
     } else {
@@ -181,7 +250,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         }
     }
 
-    const watchDir = '/dev/engine'
+    const watchDir = process.env.IDEA_WATCH_DIR || '/dev/engine'
     const watcher = chokidar.watch(watchDir, { persistent: true })
 
     watcher
@@ -229,14 +298,26 @@ export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
             }
         })
         // Stop all instances of the disk and move them to the 'Undocked' state
-        const instancesOnDisk = Object.values(store.instanceDB).filter(instance => instance.storedOn === disk.id);
+        const instancesOnDisk = Object.values(store.instanceDB).filter(instance => String(instance.storedOn) === String(disk.id));
         for (const instance of instancesOnDisk) {
-            await stopInstance(storeHandle, instance, disk)
+            const cmdLogHandle = getCommandLogHandle()
+            const traceId = crypto.randomUUID()
+            const traceCtx = { traceId, command: 'stopInstance', args: JSON.stringify({ instanceName: instance.name, diskId: disk.id, reason: 'disk-undocked' }) }
+            if (cmdLogHandle) addTrace(cmdLogHandle, { traceId, command: 'stopInstance', args: traceCtx.args, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
+            try {
+                await runWithTrace(traceCtx, () => stopInstance(storeHandle, instance, disk, 'disk-undocked'))
+                if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'ok')
+            } catch (e: any) {
+                if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'error', e.message ?? String(e))
+            }
             log(`Instance ${instance.id} stopped`)
             storeHandle.change(doc => {
                 const inst = doc.instanceDB[instance.id]
-                // Move the instance to the 'Undocked' state
-                if (inst) inst.status = 'Undocked' as Status
+                // Move the instance to the 'Undocked' state and clear metrics
+                if (inst) {
+                    inst.status = 'Undocked' as Status
+                    inst.metrics = null
+                }
             })
             log(`Instance ${instance.id} has been moved to the 'Undocked' state`)
         }

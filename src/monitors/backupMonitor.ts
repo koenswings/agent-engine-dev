@@ -11,13 +11,18 @@
  */
 
 import { $, YAML, chalk, fs } from 'zx'
-import { log } from '../utils/utils.js'
+import { log, print } from '../utils/utils.js'
 import { config } from '../data/Config.js'
-import { Disk, BackupConfig, isBackupDisk, processDisk } from '../data/Disk.js'
-import { stopInstance, startInstance } from '../data/Instance.js'
-import { BackupMode, DiskID, DiskName, InstanceID, Timestamp } from '../data/CommonTypes.js'
+import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot } from '../data/Disk.js'
+import { indexBackupDiskApps } from '../data/InstallApp.js'
+import { createOperation, updateOperation } from '../data/Operations.js'
+import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
+import { stopInstance, startInstance, BACKUP_STEPS } from '../data/Instance.js'
+import { BackupMode, DiskID, DiskName, InstanceID, Timestamp, OperationCause } from '../data/CommonTypes.js'
 import { Store, getInstance, getDisks, findDiskByName } from '../data/Store.js'
 import { DocHandle } from '@automerge/automerge-repo'
+import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js'
+import { runWithTrace, flushTrace, getActiveTrace } from '../utils/CommandLogger.js'
 
 $.verbose = false
 
@@ -66,8 +71,25 @@ const writeBackupYaml = async (backupDevice: string, yaml: BackupYaml): Promise<
 export const backupInstance = async (
     storeHandle: DocHandle<Store>,
     instanceId: InstanceID,
-    backupDisk: Disk
+    backupDisk: Disk,
+    existingOpId?: string,  // pass when retrying an interrupted op
+    cause: OperationCause = 'console-command',
 ): Promise<void> => {
+    // If there is no active trace (called from backup monitor, not via Console command),
+    // create one so that step markers and log lines land in the Console log panel.
+    if (!getActiveTrace()) {
+        const cmdLogHandle = getCommandLogHandle()
+        const traceId = crypto.randomUUID()
+        const traceArgs = JSON.stringify({ instanceId, backupDiskId: backupDisk.id, cause })
+        if (cmdLogHandle) addTrace(cmdLogHandle, { traceId, command: 'backupApp', args: traceArgs, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
+        return runWithTrace({ traceId, command: 'backupApp', args: traceArgs }, async () => {
+            await backupInstance(storeHandle, instanceId, backupDisk, existingOpId, cause)
+            if (cmdLogHandle) { await flushTrace(traceId); closeTrace(cmdLogHandle, traceId, 'ok') }
+        }).catch(async (err: any) => {
+            if (cmdLogHandle) { await flushTrace(traceId); closeTrace(cmdLogHandle, traceId, 'error', err?.message ?? String(err)) }
+        })
+    }
+
     if (activeBackups.has(instanceId)) {
         log(`Backup for ${instanceId} already in progress — skipping duplicate trigger`)
         return
@@ -75,7 +97,21 @@ export const backupInstance = async (
     activeBackups.add(instanceId)
     let wasRunning = false
 
+    // Acquire lock on the instance for the duration of the backup
+    const backupLockKey = instanceKey(instanceId)
+    if (!resourceLock.acquire(backupLockKey, 'backupApp')) {
+        log(chalk.yellow(`backupInstance: instance ${instanceId} is locked — skipping (another operation is running)`))
+        activeBackups.delete(instanceId)
+        return
+    }
+
+    const opId = existingOpId ?? createOperation(storeHandle, 'backupApp', {
+        instanceId,
+        backupDiskId: backupDisk.id,
+    }, cause, { type: 'instance', id: instanceId })
+
     try {
+        updateOperation(storeHandle, opId, { status: 'Running' })
         const store = storeHandle.doc()
         const instance = getInstance(store, instanceId)
         if (!instance) {
@@ -98,9 +134,28 @@ export const backupInstance = async (
         const repoPath = backupDir(backupDevice, instanceId)
         const lockPath = lockFilePath(backupDevice, instanceId)
 
+        const totalBackupSteps = BACKUP_STEPS.length
+
+        const setBackupStep = (step: number, label: string) => {
+            const line = `  Step ${step + 1}/${totalBackupSteps}  │  ${label}  `
+            const bar  = '─'.repeat(line.length)
+            print(`┌${bar}┐`)
+            print(`│${line}│`)
+            print(`└${bar}┘`)
+            storeHandle.change(doc => {
+                const op = doc.operationDB?.[opId]
+                if (!op) return
+                op.currentStep = step
+                op.totalSteps = totalBackupSteps
+                op.stepLabel = label
+                op.progressPercent = Math.round((step / (totalBackupSteps - 1)) * 100)
+            })
+        }
+
         log(`Starting backup of instance ${instanceId} from ${appDevice} to ${backupDevice}`)
 
         // 1. Init Borg repo if this is the first backup
+        setBackupStep(0, BACKUP_STEPS[0])
         const repoExists = await fs.pathExists(`${repoPath}/config`)
         if (!repoExists) {
             log(`Initialising Borg repo at ${repoPath}`)
@@ -119,14 +174,16 @@ export const backupInstance = async (
         if (instance.status === 'Running') {
             wasRunning = true
             log(`Stopping instance ${instanceId} before backup`)
-            await stopInstance(storeHandle, instance, appDisk)
+            setBackupStep(1, BACKUP_STEPS[1])
+            await stopInstance(storeHandle, instance, appDisk, 'backup-pre-stop')
         }
 
         // 4. Run borg create
+        setBackupStep(2, BACKUP_STEPS[2])
         const archiveName = new Date().toISOString().replace(/[:.]/g, '-')
         if (!config.settings.testMode) {
             log(`Running borg create for instance ${instanceId}`)
-            await $`borg create ${repoPath}::${archiveName} /disks/${appDevice}/instances/${instanceId}`
+            await $`borg create ${repoPath}::${archiveName} ${await diskMountRoot(appDisk)}/instances/${instanceId}`
         } else {
             log(`testMode: skipping borg create for instance ${instanceId}`)
         }
@@ -134,10 +191,12 @@ export const backupInstance = async (
         // 5. Restart instance if it was running
         if (wasRunning) {
             log(`Restarting instance ${instanceId} after backup`)
-            await startInstance(storeHandle, instance, appDisk)
+            setBackupStep(3, BACKUP_STEPS[3])
+            await startInstance(storeHandle, instance, appDisk, 'backup-post-start')
         }
 
         // 6. Update store: set lastBackup on the instance
+        setBackupStep(4, BACKUP_STEPS[4])
         storeHandle.change(doc => {
             const inst = doc.instanceDB[instanceId]
             if (inst) inst.lastBackup = Date.now() as Timestamp
@@ -156,9 +215,19 @@ export const backupInstance = async (
         // 8. Remove lock file (success)
         await fs.remove(lockPath)
 
+        updateOperation(storeHandle, opId, {
+            status: 'Done',
+            progressPercent: 100,
+            completedAt: Date.now() as Timestamp,
+        })
         log(chalk.green(`Backup of instance ${instanceId} completed successfully`))
 
     } catch (e: any) {
+        updateOperation(storeHandle, opId, {
+            status: 'Failed',
+            error: e.message ?? String(e),
+            completedAt: Date.now() as Timestamp,
+        })
         log(chalk.red(`Backup of instance ${instanceId} failed: ${e.message ?? e}`))
         // Always restart instance if it was stopped (even on failure)
         if (wasRunning) {
@@ -168,7 +237,7 @@ export const backupInstance = async (
                 const appDisk = instance?.storedOn ? store.diskDB[instance.storedOn] : null
                 if (instance && appDisk) {
                     log(`Restarting instance ${instanceId} after failed backup`)
-                    await startInstance(storeHandle, instance, appDisk)
+                    await startInstance(storeHandle, instance, appDisk, 'backup-post-start')
                 }
             } catch (restartErr) {
                 log(chalk.red(`Failed to restart instance ${instanceId} after backup error: ${restartErr}`))
@@ -177,6 +246,7 @@ export const backupInstance = async (
         // Lock file intentionally left in place — signals boot-resume on next dock
     } finally {
         activeBackups.delete(instanceId)
+        resourceLock.release(backupLockKey)
     }
 }
 
@@ -210,6 +280,9 @@ export const processBackupDisk = async (
         if (d) d.backupConfig = { mode, links }
     })
 
+    // Phase 2: index any app bundles on this disk into appDB for installApp / Console
+    await indexBackupDiskApps(storeHandle, backupDisk)
+
     // Scan for stale lock files (interrupted backups from before a reboot)
     const backupsBase = `/disks/${backupDevice}/backups`
     if (await fs.pathExists(backupsBase)) {
@@ -225,7 +298,7 @@ export const processBackupDisk = async (
                     ? store.diskDB[instance.storedOn]?.device != null
                     : false
                 if (appDiskDocked) {
-                    await backupInstance(storeHandle, staleInstanceId, backupDisk)
+                    await backupInstance(storeHandle, staleInstanceId, backupDisk, undefined, 'backup-stale-lock')
                 } else {
                     log(`App Disk for ${staleInstanceId} not yet docked — stale lock will be handled when App Disk docks`)
                 }
@@ -241,7 +314,7 @@ export const processBackupDisk = async (
             if (!instance?.storedOn) continue
             const appDisk = store.diskDB[instance.storedOn]
             if (appDisk?.device) {
-                await backupInstance(storeHandle, instanceId, backupDisk)
+                await backupInstance(storeHandle, instanceId, backupDisk, undefined, 'console-command')
             } else {
                 log(`Instance ${instanceId}: App Disk not docked — backup will trigger when App Disk docks`)
             }
@@ -271,12 +344,12 @@ export const checkPendingBackups = async (
 
         // Check if any linked instance lives on the newly docked App Disk
         const instancesOnAppDisk = Object.values(store.instanceDB)
-            .filter(inst => inst.storedOn === appDisk.id)
+            .filter(inst => String(inst.storedOn) === String(appDisk.id))
 
         for (const instance of instancesOnAppDisk) {
             if (candidate.backupConfig.links.includes(instance.id)) {
                 log(`checkPendingBackups: triggering backup for instance ${instance.id}`)
-                await backupInstance(storeHandle, instance.id, candidate as Disk)
+                await backupInstance(storeHandle, instance.id, candidate as Disk, undefined, 'backup-app-docked')
             }
         }
 
@@ -290,9 +363,9 @@ export const checkPendingBackups = async (
                     if (await fs.pathExists(lockPath)) {
                         const staleId = entry as InstanceID
                         const staleInstance = getInstance(store, staleId)
-                        if (staleInstance?.storedOn === appDisk.id) {
+                        if (String(staleInstance?.storedOn) === String(appDisk.id)) {
                             log(`checkPendingBackups: stale lock for ${staleId} — re-triggering backup`)
-                            await backupInstance(storeHandle, staleId, candidate as Disk)
+                            await backupInstance(storeHandle, staleId, candidate as Disk, undefined, 'backup-stale-lock')
                         }
                     }
                 }
@@ -310,61 +383,87 @@ export const checkPendingBackups = async (
 export const restoreApp = async (
     storeHandle: DocHandle<Store>,
     instanceId: InstanceID,
-    targetDisk: Disk
+    targetDisk: Disk,
+    existingOpId?: string,
+    cause: OperationCause = 'console-command',
 ): Promise<void> => {
-    const store = storeHandle.doc()
+    // Acquire lock: instance + target disk
+    const restoreLockKeys = [instanceKey(instanceId), diskKey(targetDisk.id)]
+    if (!resourceLock.acquireAll(restoreLockKeys, 'restoreApp')) {
+        console.error(chalk.red(`restoreApp: resource locked — another operation is already running on instance or target disk. Retry when it completes.`))
+        return
+    }
 
-    // Find a docked Backup Disk with an archive for this instance
-    const dockedDisks = Object.values(store.diskDB).filter(d => d.device != null)
-    let backupDisk: Disk | null = null
-    for (const candidate of dockedDisks) {
-        if (!candidate.diskTypes?.includes('backup')) continue
-        const repoPath = backupDir(candidate.device!, instanceId)
-        if (await fs.pathExists(`${repoPath}/config`)) {
-            backupDisk = candidate as Disk
-            break
+    const opId = existingOpId ?? createOperation(storeHandle, 'restoreApp', {
+        instanceId,
+        targetDiskId: targetDisk.id,
+    }, cause, { type: 'instance', id: instanceId })
+
+    try {
+        updateOperation(storeHandle, opId, { status: 'Running' })
+        const store = storeHandle.doc()
+
+        // Find a docked Backup Disk with an archive for this instance
+        const dockedDisks = Object.values(store.diskDB).filter(d => d.device != null)
+        let backupDisk: Disk | null = null
+        for (const candidate of dockedDisks) {
+            if (!candidate.diskTypes?.includes('backup')) continue
+            const repoPath = backupDir(candidate.device!, instanceId)
+            if (await fs.pathExists(`${repoPath}/config`)) {
+                backupDisk = candidate as Disk
+                break
+            }
         }
+
+        if (!backupDisk) {
+            throw new Error(`No docked Backup Disk with archives for instance ${instanceId}`)
+        }
+
+        const backupDevice = backupDisk.device!
+        const targetDevice = targetDisk.device
+        if (!targetDevice) {
+            throw new Error(`Target disk ${targetDisk.id} is not docked`)
+        }
+
+        const repoPath = backupDir(backupDevice, instanceId)
+        const instancesDir = `${await diskMountRoot(targetDisk)}/instances`
+
+        // Stop instance if currently running
+        const instance = getInstance(store, instanceId)
+        if (instance?.status === 'Running') {
+            const currentDisk = instance.storedOn ? store.diskDB[instance.storedOn] : null
+            if (currentDisk) await stopInstance(storeHandle, instance, currentDisk, 'backup-pre-stop')
+        }
+
+        await fs.ensureDir(instancesDir)
+
+        if (!config.settings.testMode) {
+            log(`Restoring instance ${instanceId} from ${backupDevice} to ${targetDevice}`)
+            await $`bash -c ${'cd ' + instancesDir + ' && borg extract ' + repoPath + '::latest'}`
+        } else {
+            log(`testMode: skipping borg extract for instance ${instanceId}`)
+        }
+
+        const { processInstance } = await import('../data/Disk.js')
+        await processInstance(storeHandle, targetDisk, instanceId)
+
+        updateOperation(storeHandle, opId, {
+            status: 'Done',
+            progressPercent: 100,
+            completedAt: Date.now() as Timestamp,
+        })
+        log(chalk.green(`Restore of instance ${instanceId} to disk ${targetDisk.name} completed`))
+
+    } catch (e: any) {
+        updateOperation(storeHandle, opId, {
+            status: 'Failed',
+            error: e.message ?? String(e),
+            completedAt: Date.now() as Timestamp,
+        })
+        log(chalk.red(`Restore of instance ${instanceId} failed: ${e.message ?? e}`))
+    } finally {
+        resourceLock.releaseAll(restoreLockKeys)
     }
-
-    if (!backupDisk) {
-        log(chalk.red(`restoreApp: no docked Backup Disk with archives for instance ${instanceId}`))
-        return
-    }
-
-    const backupDevice = backupDisk.device!
-    const targetDevice = targetDisk.device
-    if (!targetDevice) {
-        log(chalk.red(`restoreApp: target disk ${targetDisk.id} is not docked`))
-        return
-    }
-
-    const repoPath = backupDir(backupDevice, instanceId)
-    const instancesDir = `/disks/${targetDevice}/instances`
-
-    // Stop instance if currently running
-    const instance = getInstance(store, instanceId)
-    let wasRunning = false
-    if (instance?.status === 'Running') {
-        wasRunning = true
-        const currentDisk = instance.storedOn ? store.diskDB[instance.storedOn] : null
-        if (currentDisk) await stopInstance(storeHandle, instance, currentDisk)
-    }
-
-    await fs.ensureDir(instancesDir)
-
-    if (!config.settings.testMode) {
-        log(`Restoring instance ${instanceId} from ${backupDevice} to ${targetDevice}`)
-        // borg extract extracts relative to cwd; use bash -c to cd first
-        await $`bash -c ${'cd ' + instancesDir + ' && borg extract ' + repoPath + '::latest'}`
-    } else {
-        log(`testMode: skipping borg extract for instance ${instanceId}`)
-    }
-
-    // Register and start the restored instance
-    const { processInstance } = await import('../data/Disk.js')
-    await processInstance(storeHandle, targetDisk, instanceId)
-
-    log(chalk.green(`Restore of instance ${instanceId} to disk ${targetDisk.name} completed`))
 }
 
 // ── createBackupDisk ──────────────────────────────────────────────────────────

@@ -13,7 +13,11 @@
  *
  * The Console uses /api/store-url as:
  *   GET http://<engine-hostname>/api/store-url
- *   → { "url": "automerge:<hash>" }
+ *   → { "url": "automerge:<hash>", "wsPort": 4321 }
+ *
+ * `wsPort` is the Engine's effective WebSocket port (config.yaml settings.port,
+ * after the IDEA_ENGINE_PORT override in Config.ts), so the Console does not
+ * have to assume the default. `url` is unchanged for backward compatibility.
  */
 
 import http from 'http'
@@ -21,10 +25,17 @@ import path from 'path'
 import { fs } from 'zx'
 import { log } from '../utils/utils.js'
 import { config } from '../data/Config.js'
+import type { DocHandle } from '@automerge/automerge-repo'
+import type { CommandLogStore } from '../data/CommandLogStore.js'
 
 const STORE_URL_FILE = path.join(
     config.settings.storeIdentityFolder,
     'store-url.txt'
+)
+
+const COMMAND_LOG_URL_FILE = path.join(
+    config.settings.storeIdentityFolder,
+    'command-log-url.txt'
 )
 
 const MIME_TYPES: Record<string, string> = {
@@ -41,6 +52,24 @@ const MIME_TYPES: Record<string, string> = {
     '.ttf':  'font/ttf',
 }
 
+/** JSON payload returned by GET /api/store-url. */
+export interface StoreUrlPayload {
+    url: string
+    wsPort: number
+}
+
+/**
+ * Build the /api/store-url response body.
+ *
+ * @param storeUrl Automerge store document URL (as read from store-url.txt)
+ * @param wsPort   Effective WebSocket port (default: config.settings.port, which
+ *                 already has the IDEA_ENGINE_PORT override applied)
+ */
+export const buildStoreUrlPayload = (
+    storeUrl: string,
+    wsPort: number = config.settings.port
+): StoreUrlPayload => ({ url: storeUrl, wsPort })
+
 const mimeType = (filePath: string): string => {
     const ext = path.extname(filePath).toLowerCase()
     return MIME_TYPES[ext] ?? 'application/octet-stream'
@@ -54,7 +83,8 @@ const mimeType = (filePath: string): string => {
  */
 export const enableHttpMonitor = (
     port: number = config.settings.httpPort,
-    consolePath: string = config.settings.consolePath
+    consolePath: string = config.settings.consolePath,
+    _commandLogHandle?: DocHandle<CommandLogStore> | null   // unused at runtime — URL comes from disk
 ): http.Server => {
 
     const hasConsole = consolePath && fs.existsSync(consolePath)
@@ -78,11 +108,27 @@ export const enableHttpMonitor = (
                     'Content-Type': 'application/json',
                     'Access-Control-Allow-Origin': '*',  // Console may be on a different origin during dev
                 })
-                res.end(JSON.stringify({ url: storeUrl }))
+                res.end(JSON.stringify(buildStoreUrlPayload(storeUrl)))
             } catch (e) {
                 log(`[http] /api/store-url: failed to read store URL — ${e}`)
                 res.writeHead(503, { 'Content-Type': 'application/json' })
                 res.end(JSON.stringify({ error: 'Store URL not available yet' }))
+            }
+            return
+        }
+
+        if (url === '/api/command-log-url' || url === '/api/command-log-url/') {
+            try {
+                const logUrl = (await fs.readFile(COMMAND_LOG_URL_FILE, 'utf-8')).trim()
+                res.writeHead(200, {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                })
+                res.end(JSON.stringify({ url: logUrl }))
+            } catch (e) {
+                log(`[http] /api/command-log-url: failed to read URL — ${e}`)
+                res.writeHead(503, { 'Content-Type': 'application/json' })
+                res.end(JSON.stringify({ error: 'Command log URL not available yet' }))
             }
             return
         }

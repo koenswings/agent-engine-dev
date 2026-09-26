@@ -1,4 +1,4 @@
-# Design: Markov-Model Duration Tests
+# Proposal: Markov-Model Duration Tests
 
 **Status:** Proposed  
 **Author:** Axle  

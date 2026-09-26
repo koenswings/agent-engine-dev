@@ -1,10 +1,13 @@
 import { $, YAML, chalk, fs, os } from 'zx';
 import { deepPrint, log } from '../utils/utils.js';
-import { App, createOrUpdateApp } from './App.js'
+import { App, createAppId, createOrUpdateApp, extractAppName, extractAppVersion } from './App.js'
 import { Instance, Status, createOrUpdateInstance, startInstance } from './Instance.js'
-import { AppID, BackupMode, DeviceName, DiskID, DiskType, EngineID, DiskName, InstanceID, Timestamp } from './CommonTypes.js';
+import { AppID, BackupMode, DeviceName, DiskID, DiskType, EngineID, DiskName, InstanceID, PortNumber, ServiceImage, Timestamp } from './CommonTypes.js';
 import { Store, getAppsOfDisk, getInstance, getInstancesOfDisk } from './Store.js';
 import { DocHandle } from '@automerge/automerge-repo';
+import { getCommandLogHandle } from './CommandLogStore.js';
+import { addTrace, closeTrace } from './CommandLogStore.js';
+import { runWithTrace } from '../utils/CommandLogger.js';
 
 
 
@@ -162,35 +165,44 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
 
     const detectedTypes: DiskType[] = []
 
-    if (await isAppDisk(disk)) {
-        log(`Disk ${disk.id} is an app disk`)
-        detectedTypes.push('app')
-        await processAppDisk(storeHandle, disk)
-    }
+    // System disk: root partition of the Pi itself, mounted at /.
+    // Apps and instances live at /apps/<id> and /instances/<id>.
+    // Must be checked first so it is not misidentified as an empty disk.
+    if (await isSystemDisk(disk)) {
+        log(`Disk ${disk.id} is the system disk`)
+        detectedTypes.push('system')
+        await processSystemDisk(storeHandle, disk)
+    } else {
+        if (await isAppDisk(disk)) {
+            log(`Disk ${disk.id} is an app disk`)
+            detectedTypes.push('app')
+            await processAppDisk(storeHandle, disk)
+        }
 
-    if (await isBackupDisk(disk)) {
-        log(`Disk ${disk.id} is a backup disk`)
-        detectedTypes.push('backup')
-        // processBackupDisk is imported from backupMonitor to avoid circular deps
-        const { processBackupDisk } = await import('../monitors/backupMonitor.js')
-        await processBackupDisk(storeHandle, disk)
-    }
+        if (await isBackupDisk(disk)) {
+            log(`Disk ${disk.id} is a backup disk`)
+            detectedTypes.push('backup')
+            // processBackupDisk is imported from backupMonitor to avoid circular deps
+            const { processBackupDisk } = await import('../monitors/backupMonitor.js')
+            await processBackupDisk(storeHandle, disk)
+        }
 
-    if (await isUpgradeDisk(disk)) {
-        log(`Disk ${disk.id} is an upgrade disk`)
-        detectedTypes.push('upgrade')
-        // TODO: Implement upgrade disk processing
-    }
+        if (await isUpgradeDisk(disk)) {
+            log(`Disk ${disk.id} is an upgrade disk`)
+            detectedTypes.push('upgrade')
+            // TODO: Implement upgrade disk processing — https://github.com/koenswings/idea/issues/46
+        }
 
-    if (await isFilesDisk(disk)) {
-        log(`Disk ${disk.id} is a files disk`)
-        detectedTypes.push('files')
-        // TODO: Implement files disk processing
-    }
+        if (await isFilesDisk(disk)) {
+            log(`Disk ${disk.id} is a files disk`)
+            detectedTypes.push('files')
+            // TODO: Implement files disk processing — https://github.com/koenswings/idea/issues/46
+        }
 
-    if (detectedTypes.length === 0) {
-        log(`Disk ${disk.id} is an empty disk`)
-        detectedTypes.push('empty')
+        if (detectedTypes.length === 0) {
+            log(`Disk ${disk.id} is an empty disk`)
+            detectedTypes.push('empty')
+        }
     }
 
     // Persist detected types to the store
@@ -200,10 +212,204 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
     })
 }
 
+/**
+ * A system disk is the root partition of the Pi itself (sda2 on IDEA Pis).
+ *
+ * Detection: compare the disk device name against the device that is mounted
+ * at /. We use `findmnt / -no SOURCE` which returns e.g. `/dev/sda2`, then
+ * strip `/dev/` to get just the device name.
+ *
+ * This is robust in all environments:
+ *   - Production Pi: root is /dev/sda2 → isSystemDisk('sda2') === true
+ *   - Test fixtures:  /disks/test-xxx exists but is not the root device → false
+ *   - Non-disk ids (no device):  returns false immediately
+ */
+let _rootDevice: string | null = null
+const getRootDevice = async (): Promise<string> => {
+    if (_rootDevice) return _rootDevice
+    try {
+        const src = (await $`findmnt / -no SOURCE`).stdout.trim()  // e.g. /dev/sda2
+        _rootDevice = src.replace(/^\/dev\//, '')                   // e.g. sda2
+    } catch {
+        _rootDevice = ''
+    }
+    return _rootDevice
+}
+
+export const isSystemDisk = async (disk: Disk): Promise<boolean> => {
+    if (!disk.device) return false
+    const rootDev = await getRootDevice()
+    return String(disk.device) === String(rootDev)
+}
+
+/**
+ * Returns the path prefix for a disk's app/instance/services directories.
+ * System disk: '' (so paths become /apps/…, /instances/…)
+ * Regular disk: '/disks/<device>'
+ */
+export const diskMountRoot = async (disk: Disk): Promise<string> => {
+    return (await isSystemDisk(disk)) ? '' : `/disks/${disk.device}`
+}
+
+/**
+ * Returns the filesystem root for free-space checks and similar operations
+ * that need the actual mount point.
+ * System disk: '/'   Regular disk: '/disks/<device>'
+ */
+export const diskFsRoot = async (disk: Disk): Promise<string> => {
+    return (await isSystemDisk(disk)) ? '/' : `/disks/${disk.device}`
+}
+
+/**
+ * Process the system disk: scan /apps and /instances at the root filesystem.
+ * Apps live at /apps/<appId>/ and instances at /instances/<instanceId>/.
+ * This mirrors processAppDisk but uses / as the mount root instead of /disks/<device>/.
+ */
+export const processSystemDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Promise<void> => {
+    log(`Processing system disk ${disk.id} (mount root: /)`)
+
+    const store: Store = storeHandle.doc()
+
+    // Apps
+    const storedApps = getAppsOfDisk(store, disk)
+    const actualApps: App[] = []
+
+    if (await $`test -d /apps`.then(() => true).catch(() => false)) {
+        log(`/apps directory found on system disk ${disk.id}`)
+        const appIds = (await $`ls /apps`).stdout.split('\n').filter(Boolean)
+        log(`App ids on system disk: ${appIds}`)
+        for (const appId of appIds) {
+            const app = await processSystemApp(storeHandle, disk, appId as AppID)
+            if (app) actualApps.push(app)
+        }
+    }
+
+    // Remove apps no longer on disk
+    for (const storedApp of storedApps) {
+        if (!actualApps.some(a => a.id === storedApp.id)) {
+            await removeApp(store, disk, storedApp.id)
+        }
+    }
+
+    // Instances
+    const storedInstances = getInstancesOfDisk(store, disk)
+    const actualInstances: Instance[] = []
+
+    if (await $`test -d /instances`.then(() => true).catch(() => false)) {
+        const instanceIds = (await $`ls /instances`).stdout.split('\n').filter(Boolean)
+        log(`Instance ids on system disk: ${instanceIds}`)
+        for (const instanceId of instanceIds) {
+            const instance = await processSystemInstance(storeHandle, disk, instanceId as InstanceID)
+            if (instance) actualInstances.push(instance)
+        }
+    }
+
+    // Remove instances no longer on disk
+    storedInstances.forEach(storedInstance => {
+        if (!actualInstances.some(i => i.id === storedInstance.id)) {
+            removeInstance(storeHandle, disk, storedInstance.id)
+        }
+    })
+}
+
+/**
+ * Process a single app on the system disk (reads from /apps/<appId>/compose.yaml).
+ */
+export const processSystemApp = async (storeHandle: DocHandle<Store>, disk: Disk, appId: AppID): Promise<App | undefined> => {
+    try {
+        const appComposeFile = await $`cat /apps/${appId}/compose.yaml`
+        const appCompose = YAML.parse(appComposeFile.stdout)
+        let app: App
+        storeHandle.change(doc => {
+            const storedApp: App | undefined = doc.appDB[appId]
+            const xapp = appCompose['x-app']
+            if (!storedApp) {
+                log(`Creating new system app ${appId}`)
+                app = {
+                    id: appId,
+                    name: extractAppName(appId),
+                    version: extractAppVersion(appId),
+                    title: xapp.title,
+                    description: xapp.description ?? null,
+                    url: xapp.url ?? null,
+                    category: xapp.category,
+                    icon: xapp.icon ?? null,
+                    author: xapp.author ?? null,
+                }
+                doc.appDB[appId] = app
+            } else {
+                log(`Updating existing system app ${appId}`)
+                app = storedApp
+            }
+        })
+        return app!
+    } catch (e) {
+        log(`Error processing system app ${appId}: ${e}`)
+        return undefined
+    }
+}
+
+/**
+ * Process a single instance on the system disk.
+ * Reads compose.yaml from /instances/<instanceId>/ (not /disks/<device>/instances/).
+ */
+export const processSystemInstance = async (storeHandle: DocHandle<Store>, disk: Disk, instanceId: InstanceID): Promise<Instance | undefined> => {
+    const { startInstance } = await import('./Instance.js')
+    let instance: Instance | undefined
+    try {
+        const composeFile = await $`cat /instances/${instanceId}/compose.yaml`
+        const compose = YAML.parse(composeFile.stdout)
+        const services = Object.keys(compose.services)
+        const serviceImages = services.map((s: string) => compose.services[s].image)
+        const instanceName = compose['x-app'].instanceName
+        storeHandle.change(doc => {
+            const stored = doc.instanceDB[instanceId]
+            if (!stored) {
+                log(`Creating new system instance ${instanceId}`)
+                const newInst: Instance = {
+                    id: instanceId,
+                    instanceOf: createAppId(compose['x-app'].name, compose['x-app'].version) as AppID,
+                    name: instanceName,
+                    storedOn: disk.id,
+                    status: 'Docked' as Status,
+                    statusCondition: null,
+                    port: 0 as PortNumber,
+                    serviceImages: serviceImages as ServiceImage[],
+                    created: new Date().getTime() as Timestamp,
+                    lastBackup: null,
+                    lastStarted: 0 as Timestamp,
+                    currentStep: null,
+                    totalSteps: null,
+                    stepLabel: null,
+                    metrics: null,
+                }
+                doc.instanceDB[instanceId] = newInst
+                instance = newInst
+            } else {
+                log(`Updating existing system instance ${instanceId}`)
+                stored.storedOn = disk.id
+                // Preserve Stopped status — same rule as createOrUpdateInstance:
+                // only reset to Docked from transient/detached states.
+                if (stored.status === 'Missing' || stored.status === 'Undocked' || stored.status === 'Error') {
+                    stored.status = 'Docked' as Status
+                }
+                instance = stored
+            }
+        })
+    } catch (e) {
+        log(`Error processing system instance ${instanceId}: ${e}`)
+        return undefined
+    }
+    if (instance) {
+        await tracedStartInstance(storeHandle, instance, disk)
+    }
+    return instance
+}
+
 export const isAppDisk = async (disk: Disk): Promise<boolean> => {
     // Check if the disk has an apps folder
     try {
-        await $`test -d /disks/${disk.device}/apps`;
+        await $`test -d ${await diskMountRoot(disk)}/apps`;
         return true;
     } catch {
         return false;
@@ -212,7 +418,7 @@ export const isAppDisk = async (disk: Disk): Promise<boolean> => {
 
 export const isBackupDisk = async (disk: Disk): Promise<boolean> => {
     try {
-        await $`test -f /disks/${disk.device}/BACKUP.yaml`
+        await $`test -f ${await diskMountRoot(disk)}/BACKUP.yaml`
         return true
     } catch {
         return false
@@ -240,11 +446,13 @@ export const processAppDisk = async (storeHandle: DocHandle<Store>, disk: Disk):
     const storedApps = getAppsOfDisk(store, disk)
     const actualApps: App[] = []
 
-    // Call processApp for each folder found in /disks/diskName/apps
+    const mountRoot = await diskMountRoot(disk)
+
+    // Call processApp for each folder found in <mountRoot>/apps
     // First check if it has an apps folder
-    if (await $`test -d /disks/${disk.device}/apps`.then(() => true).catch(() => false)) {
+    if (await $`test -d ${mountRoot}/apps`.then(() => true).catch(() => false)) {
         log(`Apps folder found on disk ${disk.id}`)
-        const appIds = (await $`ls /disks/${disk.device}/apps`).stdout.split('\n')
+        const appIds = (await $`ls ${mountRoot}/apps`).stdout.split('\n')
         log(`App ids found on disk ${disk.id}: ${appIds}`)
         for (let appId of appIds) {
             if (!(appId === "") && !(disk.device == null)) {
@@ -260,22 +468,19 @@ export const processAppDisk = async (storeHandle: DocHandle<Store>, disk: Disk):
     log(`Stored apps: ${storedApps.map(app => app.id)}`)
 
     // Remove apps that are no longer on disk
-    storedApps.forEach((storedApp) => {
-        // if (!actualApps.includes(storedApp)) {
-        //     removeApp(store, disk, storedApp.id)
-        // }
+    for (const storedApp of storedApps) {
         if (!actualApps.some(actualApp => actualApp.id === storedApp.id)) {
-            removeApp(store, disk, storedApp.id)
+            await removeApp(store, disk, storedApp.id)
         }
-    })
+    }
 
     // Instances
     const storedInstances = getInstancesOfDisk(store, disk)
     const actualInstances: Instance[] = []
 
-    // Call processInstance for each folder found in /instances
-    if (await $`test -d /disks/${disk.device}/instances`.then(() => true).catch(() => false)) {
-        const instanceIds = (await $`ls /disks/${disk.device}/instances`).stdout.split('\n')
+    // Call processInstance for each folder found in <mountRoot>/instances
+    if (await $`test -d ${mountRoot}/instances`.then(() => true).catch(() => false)) {
+        const instanceIds = (await $`ls ${mountRoot}/instances`).stdout.split('\n')
         log(`Instance Ids found on disk ${disk.id}: ${instanceIds}`)
         for (let instanceId of instanceIds) {
             if (!(instanceId === "")) {
@@ -309,7 +514,7 @@ export const processApp = async (storeHandle: DocHandle<Store>, disk: Disk, appI
 }
 
 
-export const removeApp = (store: Store, disk: Disk, appId: AppID): void => {
+export const removeApp = async (store: Store, disk: Disk, appId: AppID): Promise<void> => {
     log(`App ${appId} no longer found on disk ${disk.id}`)
     // There is nothing that we need to do as we do not record on which disks Apps are stored
     // However,  we need to check if there are instances of this app on the disk and signal an error if this is the case
@@ -317,7 +522,7 @@ export const removeApp = (store: Store, disk: Disk, appId: AppID): void => {
     //   If it is, then this is an error and we should log an error message as the Instance will fail to start
     const instance = getInstancesOfDisk(store, disk).find(instance => instance.instanceOf === appId)
     // Check if the instance is still physically on the file system of the disk and signal an error
-    if (instance && fs.existsSync(`/disks/${disk.device}/instances/${instance.id}`)) {
+    if (instance && fs.existsSync(`${await diskMountRoot(disk)}/instances/${instance.id}`)) {
         log(`Error: Instance ${instance.id} of app ${appId} is still physically on the disk ${disk.id} but the app is being removed. This is an error and should not happen.`)
     }
 }
@@ -325,9 +530,49 @@ export const removeApp = (store: Store, disk: Disk, appId: AppID): void => {
 export const processInstance = async (storeHandle: DocHandle<Store>, disk: Disk, instanceId: InstanceID): Promise<Instance | undefined> => {
     const instance = await createOrUpdateInstance(storeHandle, instanceId, disk)
     if (instance) {
-        await startInstance(storeHandle, instance, disk)
+        await tracedStartInstance(storeHandle, instance, disk)
     }
     return instance
+}
+
+/**
+ * Wraps startInstance with a commandLog trace so that auto-starts triggered
+ * by disk docking appear in the Console command history, just like starts
+ * issued explicitly via the 'startInstance' command.
+ */
+const tracedStartInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk): Promise<void> => {
+    // Never auto-start an instance that was explicitly stopped by the operator.
+    // processInstance is called on every disk-dock event; without this guard a
+    // re-dock (or a spurious udev re-add) would restart a stopped instance.
+    if (instance.status === 'Stopped') {
+        log(`tracedStartInstance: skipping auto-start of '${instance.name}' (${instance.id}) — status is Stopped`)
+        return
+    }
+    const cmdLogHandle = getCommandLogHandle()
+    const traceId = crypto.randomUUID()
+    const traceCtx = {
+        traceId,
+        command: 'startInstance',
+        args: JSON.stringify({ instanceName: instance.name, diskId: disk.id }),
+    }
+    if (cmdLogHandle) {
+        addTrace(cmdLogHandle, {
+            traceId,
+            command: 'startInstance',
+            args: traceCtx.args,
+            startedAt: Date.now(),
+            completedAt: null,
+            status: 'running',
+            errorMessage: null,
+        })
+    }
+    try {
+        await runWithTrace(traceCtx, () => startInstance(storeHandle, instance, disk, 'disk-docked'))
+        if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'ok')
+    } catch (e: any) {
+        if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'error', e.message ?? String(e))
+        throw e
+    }
 }
 
 export const removeInstance = (storeHandle: DocHandle<Store>, disk: Disk, instanceId: InstanceID): void => {

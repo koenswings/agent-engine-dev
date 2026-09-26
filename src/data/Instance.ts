@@ -1,18 +1,83 @@
 import { $, YAML, chalk, fs, os, sleep } from "zx";
 
 $.verbose = false;
-import { addOrUpdateEnvVariable, deepPrint, log, randomPort, readEnvVariable, uuid } from "../utils/utils.js";
-import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber, ServiceImage, Timestamp, Version, DeviceName, InstanceName, AppName, Hostname, DiskID } from "./CommonTypes.js";
+import { addOrUpdateEnvVariable, deepPrint, log, randomPort, readEnvVariable, uuid, print } from "../utils/utils.js";
+import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber, ServiceImage, Timestamp, Version, DeviceName, InstanceName, AppName, Hostname, DiskID, OperationCause } from "./CommonTypes.js";
+import { createOperation, updateOperation } from './Operations.js'
 import { Store, getDisk, getEngine, getLocalEngine, getInstancesOfEngine, } from "./Store.js";
-import { Disk } from "./Disk.js";
+import { Disk, diskMountRoot, diskFsRoot } from "./Disk.js";
 import { localEngineId } from "./Engine.js";
 import { network } from "./Network.js";
 import { createAppId } from "./App.js";
 import { Docker } from "node-docker-api";
 import { createMeta } from '../data/Meta.js'
 import { config } from '../data/Config.js'
-import { error } from "console";
 import { DocHandle } from "@automerge/automerge-repo";
+
+// ── Step-progress helpers ─────────────────────────────────────────────────────
+
+const setStep = (
+  storeHandle: DocHandle<Store>,
+  instanceId: InstanceID,
+  step: number,
+  total: number,
+  label: string,
+  opId?: string,
+) => {
+  storeHandle.change(doc => {
+    const inst = doc.instanceDB[instanceId]
+    if (!inst) return
+    inst.currentStep = step
+    inst.totalSteps = total
+    inst.stepLabel = label
+  })
+  // Mirror step progress into the unified Operation record when provided
+  if (opId) {
+    updateOperation(storeHandle, opId, {
+      currentStep: step,
+      totalSteps: total,
+      stepLabel: label,
+      progressPercent: total > 0 ? Math.round((step / total) * 100) : null,
+    })
+  }
+}
+
+const clearStep = (storeHandle: DocHandle<Store>, instanceId: InstanceID) => {
+  storeHandle.change(doc => {
+    const inst = doc.instanceDB[instanceId]
+    if (!inst) return
+    inst.currentStep = null
+    inst.totalSteps = null
+    inst.stepLabel = null
+    inst.metrics = null  // clear live metrics when instance is no longer running
+  })
+}
+
+// ── Start / stop step definitions ────────────────────────────────────────────
+// These are the canonical step labels exposed to the Console.
+// Pixel can use these verbatim in a step-based progress window.
+
+export const START_STEPS = [
+  'Checking if already running',     // 0  (pre-check, skipped if not needed)
+  'Generating port',                  // 1
+  'Generating password',             // 2
+  'Loading service images',          // 3
+  'Creating containers',             // 4
+  'Starting containers',             // 5
+] as const
+
+export const STOP_STEPS = [
+  'Finding containers',              // 0
+  'Stopping containers',             // 1
+] as const
+
+export const BACKUP_STEPS = [
+  'Initialising backup repository',  // 0
+  'Stopping app',                    // 1
+  'Running backup',                  // 2
+  'Restarting app',                  // 3
+  'Updating backup index',           // 4
+] as const
 
 
 export interface Instance {
@@ -20,12 +85,19 @@ export interface Instance {
   instanceOf: AppID;   // Reference by name since we can store the AppMaster object only once in Yjs
   name: InstanceName;
   status: Status;
+  statusCondition: string | null;  // Human-readable error diagnosis; null when not in Error state
   port: PortNumber;
   serviceImages: ServiceImage[];
   created: Timestamp;       // We must use a timestamp number as Date objects are not supported in YJS
   lastBackup: Timestamp | null;  // Unix ms of last successful backup; null if never backed up
   lastStarted: Timestamp;   // We must use a timestamp number as Date objects are not supported in YJS
   storedOn: DiskID | null;  // The disk that this instance is stored on. null if we do not know it yet
+  /** Step-based progress for start/stop. Null when no active operation. */
+  currentStep: number | null;
+  totalSteps: number | null;
+  stepLabel: string | null;
+  /** Live Docker resource metrics. Null when instance is not Running. */
+  metrics: DockerMetrics | null;
 }
 
 export type Status = 'Undocked'      // Disk is not currently docked; instance data is intact on the disk
@@ -39,7 +111,7 @@ export type Status = 'Undocked'      // Disk is not currently docked; instance d
 
 
 export const buildInstance = async (instanceName: InstanceName, appName: AppName, gitAccount: string, version: Version, device: DeviceName): Promise<void> => {
-  console.log(`Building new instance '${instanceName}' from version ${version} of app '${appName}' on device '${device}' of the local engine.`)
+  print(`Building new instance '${instanceName}' from version ${version} of app '${appName}' on device '${device}' of the local engine.`)
 
   // CODING STYLE: only use absolute pathnames !
   // CODING STYLE: use try/catch for error handling
@@ -52,7 +124,7 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     // Do it
     // const disk = findDiskByDevice(store, getLocalEngine(store), device)
     // if (!disk) {
-    //   console.log(chalk.red(`Disk ${device} not found on engine ${getLocalEngine(store).hostname}`))
+    //   was-console-log(chalk.red(`Disk ${device} not found on engine ${getLocalEngine(store).hostname}`))
     //   return
     // } else {
     //   instanceId = createInstanceId(instanceName, appName, disk.id).toString() as InstanceID
@@ -63,8 +135,8 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
 
 
     // Create the app infrastructure if it does not exist
-    // TODO: This should be done when creating the disk
-    // TODO: Here we should only be checking if it is an apps disk! 
+    // TODO: This should be done when creating the disk — https://github.com/koenswings/idea/issues/46
+    // TODO: Here we should only be checking if it is an apps disk! — https://github.com/koenswings/idea/issues/46
     await $`mkdir -p /disks/${device}/apps /disks/${device}/services /disks/${device}/instances`
 
     // **************************
@@ -75,17 +147,17 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     // Remove /tmp/apps/${typeName} if it exists
     await $`rm -rf /tmp/apps/${appName}`
     let appVersion = ""
-    console.log(`Cloning version ${version} of app ${appName} from git account ${gitAccount}`)
+    print(`Cloning version ${version} of app ${appName} from git account ${gitAccount}`)
     if (version === "latest") {
-      console.log(`Cloning the latest development version of app ${appName} from git account ${gitAccount}`)
+      print(`Cloning the latest development version of app ${appName} from git account ${gitAccount}`)
       await $`git clone https://github.com/${gitAccount}/app-${appName} /tmp/apps/${appName}`
       // Set appVersion to the latest commit hash
       const gitLog = await $`cd /tmp/apps/${appName} && git log -n 1 --pretty=format:%H`
       appVersion = gitLog.stdout.trim()
-      console.log(`App version: ${appVersion}`)
+      print(`App version: ${appVersion}`)
 
     } else {
-      console.log(`Cloning version ${version} of app ${appName} from git account ${gitAccount}`)
+      print(`Cloning version ${version} of app ${appName} from git account ${gitAccount}`)
       await $`git clone -b ${version} https://github.com/koenswings/app-${appName} /tmp/apps/${appName}`
       appVersion = version
     }
@@ -124,7 +196,7 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
 
     // If the app has an init_data.tar.gz file, unpack it in the app folder
     if (fs.existsSync(`/disks/${device}/instances/${instanceId}/init_data.tar.gz`)) {
-      console.log(`Unpacking the init_data.tar.gz file in the app folder`)
+      print(`Unpacking the init_data.tar.gz file in the app folder`)
       await $`tar -xzf /disks/${device}/instances/${instanceId}/init_data.tar.gz -C /disks/${device}/instances/${instanceId}`
       // Rename the folder init_data to data
       await $`mv /disks/${device}/instances/${instanceId}/init_data /disks/${device}/instances/${instanceId}/data`
@@ -138,7 +210,7 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     // }
 
     // Open the compose.yaml file of the app instance and add the version info to the compose file and the instance name
-    console.log(`Opening the compose.yaml file of the app instance and adding the version info to the compose file (${appVersion}) and the instance name (${instanceName})`)
+    print(`Opening the compose.yaml file of the app instance and adding the version info to the compose file (${appVersion}) and the instance name (${instanceName})`)
     const composeFile = await $`cat /disks/${device}/instances/${instanceId}/compose.yaml`
     const compose = YAML.parse(composeFile.stdout)
     compose['x-app'].version = appVersion
@@ -160,9 +232,9 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
       // Pull the sercice image
       const serviceImageFile = serviceImage.replace(/\//g, '_')
       if (fs.existsSync(`/disks/${device}/services/${serviceImageFile}.tar`)) {
-        console.log(`Service image ${serviceImage} already exists`)
+        print(`Service image ${serviceImage} already exists`)
       } else {
-        console.log(`Pulling service image ${serviceImage}`)
+        print(`Pulling service image ${serviceImage}`)
         await $`docker image pull ${serviceImage}`
         // Save the service image
         await $`docker save ${serviceImage} > /disks/${device}/services/${serviceImageFile}.tar`
@@ -177,14 +249,14 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
       log(`Creating META.yaml file on disk ${device}`)
       createMeta(device)
     } else {
-      console.log(`META.yaml file already exists on disk ${device}`)
+      print(`META.yaml file already exists on disk ${device}`)
     }
 
     // OBSOLETE 
     // Create the META.yaml file
     // Do it
     // await addMetadata(instanceId)
-    // console.log(chalk.blue('Adding metadata...'));
+    // was-console-log(chalk.blue('Adding metadata...'));
     // try {
     //     // Convert the diskMetadata object to a YAML string 
     //     // const diskMetadataYAML = YAML.stringify(diskMetadata)
@@ -203,16 +275,16 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     //     // Move the META.yaml file to the root directory
     //     await $`sudo mv ${metaPath}/META.yaml /META.yaml`
     // } catch (e) {
-    //   console.log(chalk.red('Error adding metadata'));
+    //   was-console-log(chalk.red('Error adding metadata'));
     //   console.error(e);
     //   process.exit(1);
     // }
 
 
 
-    console.log(chalk.green(`Instance ${instanceId} built`))
+    print(chalk.green(`Instance ${instanceId} built`))
   } catch (e) {
-    console.log(chalk.red('Error building app instance'))
+    print(chalk.red('Error building app instance'))
     console.error(e)
   }
 }
@@ -231,7 +303,7 @@ export const extractAppName = (instanceId: InstanceID): InstanceName => {
 export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, instanceId: InstanceID, disk: Disk): Promise<Instance | undefined> => {
   let instance: Instance
   try {
-    const composeFile = await $`cat /disks/${disk.device}/instances/${instanceId}/compose.yaml`
+    const composeFile = await $`cat ${await diskMountRoot(disk)}/instances/${instanceId}/compose.yaml`
     const compose = YAML.parse(composeFile.stdout)
     const services = Object.keys(compose.services)
     const servicesImages = services.map(service => compose.services[service].image)
@@ -248,11 +320,16 @@ export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, inst
           name: instanceName as InstanceName,
           storedOn: disk.id,
           status: 'Docked' as Status,
+          statusCondition: null,
           port: 0 as PortNumber, // Will be set later
           serviceImages: servicesImages as ServiceImage[],
           created: new Date().getTime() as Timestamp,
           lastBackup: null,
           lastStarted: 0 as Timestamp,
+          currentStep: null,
+          totalSteps: null,
+          stepLabel: null,
+          metrics: null,
         }
         doc.instanceDB[instanceId] = instance
       } else {
@@ -261,7 +338,13 @@ export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, inst
         instance = storedInstance
         instance.instanceOf = createAppId(compose['x-app'].name, compose['x-app'].version) as AppID
         instance.name = instanceName as InstanceName
-        instance.status = 'Docked' as Status;
+        // Preserve Stopped status — the operator explicitly stopped this instance.
+        // Only reset to Docked if the instance was in a transient or detached state
+        // (Missing, Undocked, Error) so it can be started again after re-dock.
+        // Running / Starting / Stopped are intentional states that must not be overwritten here.
+        if (instance.status === 'Missing' || instance.status === 'Undocked' || instance.status === 'Error') {
+          instance.status = 'Docked' as Status
+        }
         instance.storedOn = disk.id
         instance.serviceImages = servicesImages as ServiceImage[]
 
@@ -319,32 +402,111 @@ export const checkPortNumber = async (port: PortNumber): Promise<boolean> => {
 }
 // KSW - UNTESTED <<<
 
-export const startInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk): Promise<void> => {
+/**
+ * Build a human-readable diagnosis string when an instance fails.
+ * Collects: the caught error message + recent docker logs for each service container.
+ * Safe to call in a catch block — never throws.
+ */
+export const diagnoseInstance = async (instance: Instance, disk: Disk, caughtError: unknown): Promise<string> => {
+  const parts: string[] = []
+
+  // 1. Engine-level error message
+  if (caughtError) {
+    const msg = caughtError instanceof Error ? caughtError.message : String(caughtError)
+    parts.push(`Engine error: ${msg}`)
+  }
+
+  // 2. Docker container logs (last 20 lines per service)
+  if (!config.settings.testMode) {
+    for (const image of (instance.serviceImages ?? [])) {
+      // Container name convention: <instanceId>-<serviceName>-1
+      // Derive service name from image: last path segment before tag
+      const serviceName = image.split('/').pop()?.split(':')[0] ?? 'service'
+      const containerName = `${instance.id}-${serviceName}-1`
+      try {
+        const logs = await $`docker logs --tail=20 ${containerName}`.quiet()
+        const output = (logs.stdout + logs.stderr).trim()
+        if (output) {
+          parts.push(`Container logs (${serviceName}):\n${output.split('\n').map(l => '  ' + l).join('\n')}`)
+        }
+      } catch { /* container may not exist yet */ }
+    }
+  }
+
+  return parts.join('\n\n') || 'Unknown error'
+}
+
+export const startInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> => {
   const store: Store = storeHandle.doc()
-  console.log(`Starting instance '${instance.id}' on disk ${disk.id} of engine '${localEngineId}'.`)
+  print(`Starting instance '${instance.id}' on disk ${disk.id} of engine '${localEngineId}'.`)
+
+  // Short-circuit: if containers are already running (e.g. engine restarted while app was up),
+  // just update the status to Running and return — no need to recreate containers.
+  if (!config.settings.testMode) {
+    try {
+      const ps = await $`docker ps --filter name=${instance.id} --format {{.Names}}`
+      if (ps.stdout.trim().length > 0) {
+        log(`Instance '${instance.id}' containers already running — updating status to Running`)
+        const port = parseInt(await readEnvVariable(`${await diskMountRoot(disk)}/instances/${instance.id}/.env`, 'port') as string) || 0
+        storeHandle.change(doc => {
+          const inst = doc.instanceDB[instance.id]
+          inst.status = 'Running' as Status
+          inst.statusCondition = null
+          if (port > 0) inst.port = port as PortNumber
+          inst.lastStarted = Date.now() as Timestamp
+        })
+        return
+      } else {
+        log(`Instance '${instance.id}' containers are not running — proceeding with full start`)
+      }
+    } catch { /* docker not available or no containers — continue with normal start */ }
+  }
+
+  const totalStartSteps = START_STEPS.length
+
+  // Create an Operation record so start progress appears in operationDB
+  // alongside copy/move/backup ops and is visible to the UI uniformly.
+  const startOpId = createOperation(
+    storeHandle, 'startApp',
+    { instanceId: instance.id, diskId: disk.id },
+    cause,
+    { type: 'instance', id: instance.id },
+  )
+  updateOperation(storeHandle, startOpId, { status: 'Running' })
+
   // Set the instance status to Starting
+  log(`Setting instance '${instance.id}' status to Starting`)
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
-    inst.status = 'Starting' as Status // Set the status to Starting when the instance is started
+    inst.status = 'Starting' as Status
   })
 
   try {
 
+    const mountRoot = await diskMountRoot(disk)
+    log(`Checking instance directory at '${mountRoot}/instances/${instance.id}'`)
+    // Verify the instance directory exists on this engine before proceeding.
+    // If it doesn't, the disk's data isn't here — fail early with a clear error.
+    if (!fs.existsSync(`${mountRoot}/instances/${instance.id}`)) {
+      throw new Error(`Instance directory not found at '${mountRoot}/instances/${instance.id}'. The disk may not be docked to this engine.`)
+    }
+    log(`Instance directory found — proceeding`)
     // Create an empty .env file if it does not yet exist
-    if (!fs.existsSync(`/disks/${disk.device}/instances/${instance.id}/.env`)) {
-      await $`touch /disks/${disk.device}/instances/${instance.id}/.env`
+    if (!fs.existsSync(`${mountRoot}/instances/${instance.id}/.env`)) {
+      await $`touch ${mountRoot}/instances/${instance.id}/.env`
     }
 
     // **************************
     // STEP 1 - Port generation
     // **************************
+    setStep(storeHandle, instance.id, 1, totalStartSteps, START_STEPS[1], startOpId)
 
     // Generate a port  number for the app  and assign it to the variable port
     // Start from port number 3000 and check if the port is already in use by another app
     // The port is in use by another app if an app can be found in networkdata with the same port
     // let port = 3000
     // const instances = getEngineInstances(store, getLocalEngine(store))
-    // console.log(`Searching for an available port number for instance ${instance.id}. Current instances: ${deepPrint(instances)}.`)
+    // was-console-log(`Searching for an available port number for instance ${instance.id}. Current instances: ${deepPrint(instances)}.`)
     // while (true) {
     //   const inst = instances.find(instance => instance && instance.port == port)
     //   if (inst) {
@@ -361,7 +523,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
       log(`Trying to find a port number for instance ${instance.id} in the .env file`)
       // const envContent = (await $`cat /disks/${disk.device}/instances/${instance.id}/.env`).stdout
       // port = parseInt(envContent.split('=')[1].slice(0, -1)) as PortNumber
-      port = parseInt(await readEnvVariable(`/disks/${disk.device}/instances/${instance.id}/.env`, 'port') as string) as PortNumber
+      port = parseInt(await readEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'port') as string) as PortNumber
     } catch (e) {
       log(`No .env file found for instance ${instance.id}`)
     }
@@ -389,8 +551,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
         } else {
           port = await createPortNumber(store)
           // Write the new port number to the .env file
-          // await $`echo "port=${port}" > /disks/${disk.device}/instances/${instance.id}/.env`
-          await addOrUpdateEnvVariable(`/disks/${disk.device}/instances/${instance.id}/.env`, 'port', port.toString())
+          await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'port', port.toString())
         }
       } else {
         log(`Port ${port} is not in use`)
@@ -408,16 +569,20 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
         port = await createPortNumber(store)
       }
       // Write a .env file in which you define the port variable
-      // await $`echo "port=${port}" > /disks/${disk.device}/instances/${instance.id}/.env`  
-      await addOrUpdateEnvVariable(`/disks/${disk.device}/instances/${instance.id}/.env`, 'port', port.toString())
+      await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'port', port.toString())
     }
 
-    console.log(`Found a port number for instance ${instance.id}: ${port}`)
+    print(`Found a port number for instance ${instance.id}: ${port}`)
     // Assign the port number to the instance object
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
       inst.port = port as PortNumber
     })
+
+    // **************************
+    // STEP 2 - Password generation
+    // **************************
+    setStep(storeHandle, instance.id, 2, totalStartSteps, START_STEPS[2], startOpId)
 
     // **************************
     // STEP 1b - Generate a password for the app
@@ -428,7 +593,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     // Check if the pass is already defined in the .env file
     try {
       log(`Trying to find a pass for instance ${instance.id} in the .env file`)
-      pass = await readEnvVariable(`/disks/${disk.device}/instances/${instance.id}/.env`, 'pass') as string
+      pass = await readEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'pass') as string
     } catch (e) {
       log(`No .env file found for instance ${instance.id}`)
     }
@@ -440,19 +605,20 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
       pass = await uuid()
       log(`Generated pass: ${pass}`)
       // Write the password to the .env file
-      await addOrUpdateEnvVariable(`/disks/${disk.device}/instances/${instance.id}/.env`, 'pass', pass)
+      await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'pass', pass)
     }
 
 
     // **************************
-    // STEP 2 - Preloading of services
+    // STEP 3 - Preloading of services
     // **************************
+    setStep(storeHandle, instance.id, 3, totalStartSteps, START_STEPS[3], startOpId)
 
     log(`Preloading the service images of the services from the compose file`)
     // Extract the service images of the services from the compose file, and pull them
     // Open the compose.yaml file of the app instance
     log(`Reading and parsing the compose.yaml file of the app instance`)
-    const composeFile = await $`cat /disks/${disk.device}/instances/${instance.id}/compose.yaml`
+    const composeFile = await $`cat ${mountRoot}/instances/${instance.id}/compose.yaml`
     const compose = YAML.parse(composeFile.stdout)
     const services = compose.services
     if (!config.settings.testMode) {
@@ -460,7 +626,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
       for (const serviceName in services) {
         const serviceImage = services[serviceName].image
         log(`Loading the service image ${serviceImage} from the saved tar file`)
-        await $`docker image load < /disks/${disk.device}/services/${serviceImage.replace(/\//g, '_')}.tar`
+        await $`docker image load < ${mountRoot}/services/${serviceImage.replace(/\//g, '_')}.tar`
       }
     } else {
       // In testMode: no tar files in fixtures — Docker pulls the image at create time if not cached
@@ -468,31 +634,45 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     }
 
     // **************************
-    // STEP 3 - Container creation
+    // STEP 4 - Container creation
     // **************************
+    setStep(storeHandle, instance.id, 4, totalStartSteps, START_STEPS[4], startOpId)
 
     await createInstanceContainers(storeHandle, instance, disk)
 
     // **************************
-    // STEP 4 - run the Instance
+    // STEP 5 - Run the Instance
     // **************************
+    setStep(storeHandle, instance.id, 5, totalStartSteps, START_STEPS[5], startOpId)
 
     await runInstance(storeHandle, instance, disk)
+    updateOperation(storeHandle, startOpId, {
+      status: 'Done',
+      completedAt: Date.now() as Timestamp,
+    })
   }
 
   catch (e) {
-    console.log(chalk.red('Error starting app instance'))
+    const errMsg = e instanceof Error ? e.message : String(e)
+    print(chalk.red(`Error starting app instance '${instance.id}': ${errMsg}`))
+    const condition = await diagnoseInstance(instance, disk, e)
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
-      inst.status = 'Error' as Status // Set the status to Error when the instance fails to start
+      inst.status = 'Error' as Status
+      inst.statusCondition = condition
     })
-    console.error(e)
+    clearStep(storeHandle, instance.id)
+    updateOperation(storeHandle, startOpId, {
+      status: 'Failed',
+      error: errMsg,
+      completedAt: Date.now() as Timestamp,
+    })
   }
 }
 
 
 // export const oldStartInstance = async (store: Store, instance: Instance, disk: Disk): Promise<void> => {
-//   console.log(`Starting instance '${instance.id}' on disk ${disk.id} of engine '${getLocalEngine(store).hostname}'.`)
+//   was-console-log(`Starting instance '${instance.id}' on disk ${disk.id} of engine '${getLocalEngine(store).hostname}'.`)
 
 //   try {
 
@@ -507,7 +687,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 //     // The port is in use by another app if an app can be found in networkdata with the same port
 //     // let port = 3000
 //     // const instances = getEngineInstances(store, getLocalEngine(store))
-//     // console.log(`Searching for an available port number for instance ${instance.id}. Current instances: ${deepPrint(instances)}.`)
+//     // was-console-log(`Searching for an available port number for instance ${instance.id}. Current instances: ${deepPrint(instances)}.`)
 //     // while (true) {
 //     //   const inst = instances.find(instance => instance && instance.port == port)
 //     //   if (inst) {
@@ -524,7 +704,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 //     const docker = new Docker({ socketPath: '/var/run/docker.sock' });
 //     const containers = await docker.container.list()
 //     containers.forEach(container => {
-//       console.log(container.data['Names'][0])
+//       was-console-log(container.data['Names'][0])
 //     })
 //     const container = containers.find(container => container.data['Names'][0].includes(instance.id))
 //     if (container) {
@@ -574,7 +754,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 //       }
 //     }
 
-//     console.log(`Found a port number for instance ${instance.id}: ${port}`)
+//     was-console-log(`Found a port number for instance ${instance.id}: ${port}`)
 //     instance.port = port as PortNumber
 
 //     // Update the .env file
@@ -611,13 +791,14 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 //   }
 
 //   catch (e) {
-//     console.log(chalk.red('Error starting app instance'))
+//     was-console-log(chalk.red('Error starting app instance'))
 //     console.error(e)
 //   }
 // }
 
 export const createInstanceContainers = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk) => {
   const store: Store = storeHandle.doc()
+  const mountRoot = await diskMountRoot(disk)
   try {
     log(`Creating the containers for the services of the app instance`)
 
@@ -629,7 +810,7 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
       const localEngine = getLocalEngine(store)
       const hostname = localEngine.hostname
       if (hostname) {
-        await addOrUpdateEnvVariable(`/disks/${disk.device}/instances/${instance.id}/.env`, 'hostname', hostname)
+        await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'hostname', hostname)
       }
 
       // Pass the ip address to the compose file via .env
@@ -637,8 +818,7 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
       const ip = interfaceData["eth0"]?.find((iface) => iface.family === "IPv4")?.address
       if (ip) {
         log(`Found IP address ${ip} for instance ${instance.id}`)
-        // await $`echo "ip=${ip}" >> /disks/${disk.device}/instances/${instance.id}/.env`
-        await addOrUpdateEnvVariable(`/disks/${disk.device}/instances/${instance.id}/.env`, 'ip', ip)
+        await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'ip', ip)
       } else {
         log(chalk.red(`No IP address found for instance ${instance.id}`))
       }
@@ -653,17 +833,19 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
     }
 
     log(`Creating containers of app instance '${instance.id}' on disk ${disk.id} of engine ${localEngineId}.`)
-    await $`cd /disks/${disk.device}/instances/${instance.id} && docker compose create`
+    await $`cd ${mountRoot}/instances/${instance.id} && docker compose create`
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
       inst.status = 'Pauzed' as Status
     })
   } catch (e) {
-    console.log(chalk.red(`Error creating the containers of app instance ${instance.id}`))
+    print(chalk.red(`Error creating the containers of app instance ${instance.id}`))
     console.error(e)
+    const condition = await diagnoseInstance(instance, disk, e)
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
-      inst.status = 'Error' as Status // Set the status to Error when the instance fails to create
+      inst.status = 'Error' as Status
+      inst.statusCondition = condition
     })
   }
 }
@@ -683,8 +865,8 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
     // Split using '=' and take the second element
     // Also remove the newline at the end
     //const port = envContent.split('=')[1].slice(0, -1)
-    const port = await readEnvVariable(`/disks/${disk.device}/instances/${instance.id}/.env`, 'port')
-    console.log(`Ports: ${deepPrint(port)}`)
+    const port = await readEnvVariable(`${await diskMountRoot(disk)}/instances/${instance.id}/.env`, 'port')
+    print(`Ports: ${deepPrint(port)}`)
     if (port) {
       const parsedPort = parseInt(port)
       // If parsedPort is not NaN, assign it to the instance port
@@ -725,10 +907,11 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
       const inst = doc.instanceDB[instance.id]
       inst.lastStarted = new Date().getTime() as Timestamp
       inst.status = 'Running' as Status
+      inst.statusCondition = null  // clear any previous error diagnosis
     })
 
     // Compose up the app
-    await $`cd /disks/${disk.device}/instances/${instance.id} && docker compose up -d`
+    await $`cd ${await diskMountRoot(disk)}/instances/${instance.id} && docker compose up -d`
     // Modify the dockerMetrics of the instance
     // instance.dockerMetrics = {
     //   memory: os.totalmem().toString(),
@@ -742,14 +925,15 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
     // Modify the dockerEvents of the instance
     // instance.dockerEvents = { events: await $`docker events ${instanceName}` }  // This is not correct, we need to use the right container name
 
-    console.log(chalk.green(`App ${instance.id} running`))
+    print(chalk.green(`App ${instance.id} running`))
+    clearStep(storeHandle, instance.id)
 
     // App-specific post-processing commands
     // If the app on which the instance is based is nextcloud, 
     //    find the IP address of the server and store it in IPADDRESS
     //    issue the following command: runuser --user www-data -- php occ config:app:set --value=http://<${PADDRESS}:9980 richdocuments wopi_url
     const app = store.appDB[instance.instanceOf]
-    const ip = await readEnvVariable(`/disks/${disk.device}/instances/${instance.id}/.env`, 'ip')
+    const ip = await readEnvVariable(`${await diskMountRoot(disk)}/instances/${instance.id}/.env`, 'ip')
     if (app && app.name === 'nextcloud') {
       if (ip) {
         try {
@@ -767,9 +951,11 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
         } catch (e) {
           log(chalk.red(`Error configuring nextcloud office to use the Collabora server at ${ip}:9980`))
           console.error(e)
+          const condition = await diagnoseInstance(instance, disk, e)
           storeHandle.change(doc => {
             const inst = doc.instanceDB[instance.id]
-            inst.status = 'Error' as Status // Set the status to Error when the instance fails to configure
+            inst.status = 'Error' as Status
+            inst.statusCondition = condition
           })
         }
       }
@@ -777,18 +963,19 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
 
 
   } catch (e) {
-
-    console.log(chalk.red(`Error running app instance ${instance.id}`))
+    print(chalk.red(`Error running app instance ${instance.id}`))
     console.error(e)
+    const condition = await diagnoseInstance(instance, disk, e)
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
-      inst.status = 'Error' as Status // Set the status to Error when the instance fails to run
+      inst.status = 'Error' as Status
+      inst.statusCondition = condition
     })
   }
 }
 
-export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk): Promise<void> => {
-  console.log(`Stopping app '${instance.id}' on disk '${disk.id}' of engine '${localEngineId}'.`)
+export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> => {
+  print(`Stopping app '${instance.id}' on disk '${disk.id}' of engine '${localEngineId}'.`)
 
   // Old implementation using Docker Compose
   // Problem with this approach: stopping an instance is not possible when its disk has already been removed
@@ -797,14 +984,26 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
   //   // Do it
   //   // await $`docker compose -f /disks/${disk.device}/instances/${instance.id}/compose.yaml stop`
   //   await $`cd /disks/${disk.device}/instances/${instance.id} && docker compose down`
-  //   console.log(chalk.green(`App ${instance.id} stopped`))
+  //   was-console-log(chalk.green(`App ${instance.id} stopped`))
   // } catch (e) {
-  //   console.log(chalk.red(`Error stopping app instance ${instance.id}`))
+  //   was-console-log(chalk.red(`Error stopping app instance ${instance.id}`))
   //   console.error(e)
   // }
 
+  const totalStopSteps = STOP_STEPS.length
+
+  // Create an Operation record so stop progress appears in operationDB uniformly
+  const stopOpId = createOperation(
+    storeHandle, 'stopApp',
+    { instanceId: instance.id, diskId: disk.id },
+    cause,
+    { type: 'instance', id: instance.id },
+  )
+  updateOperation(storeHandle, stopOpId, { status: 'Running' })
+
   // New implementation using Docker API
   try {
+    setStep(storeHandle, instance.id, 0, totalStopSteps, STOP_STEPS[0], stopOpId)
     // Find all containers running in the compose started by the instance
     // NOTE: this implementation requires all containers of an instance to be namespaced with the instance id
     log(`Filter for all running containers whose names start with the instance id`)
@@ -819,6 +1018,7 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
     instanceContainers.forEach(container => {
       log(container.data['Names'][0])
     })
+    setStep(storeHandle, instance.id, 1, totalStopSteps, STOP_STEPS[1], stopOpId)
     for (let container of instanceContainers) {
       // First try to stop the container gracefully  If that does not work, kill it  
       try {
@@ -836,12 +1036,26 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
       const inst = doc.instanceDB[instance.id]
       inst.status = 'Stopped' as Status // Set the status to Stopped when the instance is stopped
     })
+    clearStep(storeHandle, instance.id)
+    updateOperation(storeHandle, stopOpId, {
+      status: 'Done',
+      completedAt: Date.now() as Timestamp,
+    })
   } catch (e) {
-    console.log(chalk.red(`Error stopping app instance ${instance.id}`))
+    const errMsg = e instanceof Error ? e.message : String(e)
+    print(chalk.red(`Error stopping app instance ${instance.id}`))
     console.error(e)
+    const condition = await diagnoseInstance(instance, disk, e)
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
-      inst.status = 'Error' as Status // Set the status to Error when the instance fails to stop
+      inst.status = 'Error' as Status
+      inst.statusCondition = condition
+    })
+    clearStep(storeHandle, instance.id)
+    updateOperation(storeHandle, stopOpId, {
+      status: 'Failed',
+      error: errMsg,
+      completedAt: Date.now() as Timestamp,
     })
   }
 }

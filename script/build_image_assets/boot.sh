@@ -19,9 +19,12 @@ if [[ -f $FLAG ]]; then
   rm -f /etc/ssh/ssh_host_*
   dpkg-reconfigure -f noninteractive openssh-server >> /home/pi/boot.out 2>&1
 
-  # 3. Set hostname and META.yaml by calling the zx script
-  echo "--> Setting hostname and META.yaml via zx script" >> /home/pi/boot.out
-  zx /home/pi/projects/engine/script/build-image.ts --personalize >> /home/pi/boot.out 2>&1
+  # 3. Set hostname and META.yaml via build-engine.ts --personalize.
+  #    Same invocation as the ./build-engine wrapper: run from the engine dir
+  #    (config.yaml is read relative to cwd) with the project's tsx (resolves
+  #    the .js imports to .ts sources). /usr/local/bin holds the node from `n`.
+  echo "--> Setting hostname and META.yaml via build-engine.ts --personalize" >> /home/pi/boot.out
+  (cd /home/pi/idea/agents/agent-engine-dev && PATH=/usr/local/bin:$PATH ./node_modules/.bin/tsx script/build-engine.ts --personalize) >> /home/pi/boot.out 2>&1
 
   # 4. Preventing from running again
   echo "--> Personalization complete. Removing flag file." >> /home/pi/boot.out

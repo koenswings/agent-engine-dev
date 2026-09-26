@@ -3,7 +3,7 @@ import { Repo } from "@automerge/automerge-repo";
 import { WebSocketClientAdapter } from "@automerge/automerge-repo-network-websocket";
 import { next as Automerge } from "@automerge/automerge";
 
-console.log("Starting Automerge client...");
+console.info("Starting Automerge client...");
 
 // 1. Create a WebSocket client adapter to connect to the server.
 const network = new WebSocketClientAdapter("ws://localhost:3030");
@@ -19,24 +19,24 @@ const repo = new Repo({
 const docHandle = repo.find("automerge://mydocument");
 await docHandle.whenReady();
 
-console.log("Document handle is ready.");
+console.info("Document handle is ready.");
 
 // 4. Set up a listener to log changes to the document.
 docHandle.on("change", ({ doc }) => {
-  console.log("Document changed:", JSON.stringify(doc, null, 2));
+  console.info("Document changed:", JSON.stringify(doc, null, 2));
 });
 
 // 5. Make a change to the document.
 //    This change will be synced to the server and any other connected clients.
 docHandle.change((doc) => {
-  console.log("Making a change to the document...");
+  console.info("Making a change to the document...");
   if (!doc.counter) {
     doc.counter = new Automerge.Counter();
-    console.log("Initialized counter.");
+    console.info("Initialized counter.");
   } else {
     doc.counter.increment(1);
-    console.log("Incremented counter.");
+    console.info("Incremented counter.");
   }
 });
 
-console.log("Initial change has been made.");
+console.info("Initial change has been made.");

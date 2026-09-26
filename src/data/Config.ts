@@ -16,6 +16,8 @@ export interface Settings {
     consolePath: string;
     storeDataFolder: string;
     storeIdentityFolder: string;
+    heartbeatIntervalMs: number;  // How often the engine writes a heartbeat to the store (default: 50000ms)
+    systemDiskSkip?: boolean;     // If true, skip registering the Pi boot disk as a system disk (for test harnesses)
 }
 
 export interface Defaults {
@@ -107,6 +109,7 @@ function validateSettings(obj: any, path: string): string[] {
     if (typeof obj.storeIdentityFolder !== 'string') errors.push(`'${path}storeIdentityFolder' must be a string.`);
     if (typeof obj.httpPort !== 'number') errors.push(`'${path}httpPort' must be a number.`);
     if (typeof obj.consolePath !== 'string') errors.push(`'${path}consolePath' must be a string.`);
+    if (obj.heartbeatIntervalMs !== undefined && typeof obj.heartbeatIntervalMs !== 'number') errors.push(`'${path}heartbeatIntervalMs' must be a number.`);
     return errors;
 }
 
@@ -204,4 +207,32 @@ export const config = readConfig('./config.yaml');
 // This must be set before any module that reads config at import time (e.g. Engine.ts).
 if (process.env.IDEA_TEST_MODE === 'true') {
     config.settings.testMode = true;
+}
+
+// Allow IDEA_ENGINE_PORT=<number> to override the WebSocket port from config.yaml.
+// Used by Kit's test harness to run a second engine alongside the production instance.
+if (process.env.IDEA_ENGINE_PORT) {
+    const port = parseInt(process.env.IDEA_ENGINE_PORT, 10);
+    if (!isNaN(port)) {
+        config.settings.port = port;
+    }
+}
+
+// Allow IDEA_STORE_DIR=<path> to override the store data folder from config.yaml.
+// Used by Kit's test harness to give the test engine an isolated store directory.
+if (process.env.IDEA_STORE_DIR) {
+    config.settings.storeDataFolder = process.env.IDEA_STORE_DIR;
+}
+
+// Allow IDEA_SYSTEM_DISK_SKIP=true to skip registering the Pi boot disk as a system disk.
+// Used by Kit's test harness to avoid conflicts with the production engine on the same Pi.
+if (process.env.IDEA_SYSTEM_DISK_SKIP === 'true') {
+    config.settings.systemDiskSkip = true;
+}
+
+// Allow IDEA_MDNS_DISABLE=true to suppress mDNS advertisement and peer discovery.
+// Used by Kit's test harness to prevent the test engine from conflicting with the
+// production engine's mDNS service name and attempting to sync with its store.
+if (process.env.IDEA_MDNS_DISABLE === 'true') {
+    config.settings.mdns = false;
 }

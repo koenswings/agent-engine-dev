@@ -4,9 +4,10 @@ settings:
   testMode: false   # Set to true to skip sudo mount/umount (for automated tests and field diagnostics)
   port: 4321
   httpPort: 80      # HTTP server port: serves Console UI and /api/store-url
-  consolePath: ""   # Absolute path to Console dist/ directory. Empty = Console UI not served.
+  consolePath: /home/pi/idea/agents/agent-console-dev/dist  # Absolute path to Console dist/. Empty = Console UI not served.
   storeDataFolder: store-data
   storeIdentityFolder: store-identity
+  heartbeatIntervalMs: 30000  # How often the engine writes a heartbeat to the store (milliseconds)
 defaults:
   user: pi
   machine: raspberrypi.local
@@ -25,7 +26,7 @@ defaults:
   gadget: true
   nodocker: true   # Whether the engine itself will be dockerized
   gitAccount: koenswings
-  enginePath: /home/pi/projects/engine
+  enginePath: /home/pi/idea/agents/agent-engine-dev
 testSetup:
   resetBeforeTest: true
   engines:

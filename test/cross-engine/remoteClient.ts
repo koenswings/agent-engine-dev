@@ -32,7 +32,7 @@ export const getStoreDocId = async (primaryHost: string): Promise<DocumentId> =>
     const isLocal = primaryHost === 'localhost' || primaryHost === '127.0.0.1'
     if (!isLocal) {
         try {
-            const result = await $`ssh ${SSH_OPTS} pi@${primaryHost} cat /home/pi/projects/engine/store-identity/store-url.txt`
+            const result = await $`ssh ${SSH_OPTS} pi@${primaryHost} cat /home/pi/idea/agents/agent-engine-dev/store-identity/store-url.txt`
             const url = result.stdout.trim()
             if (url.startsWith('automerge:')) {
                 console.log(`[remoteClient] Using store URL from ${primaryHost}: ${url}`)

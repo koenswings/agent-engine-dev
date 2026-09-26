@@ -29,3 +29,34 @@ with usage examples.
 Reference for provisioning and utility scripts (`install.sh` and others): purpose,
 parameters, and usage.
 → [docs/SCRIPTS.md](SCRIPTS.md)
+
+## PI_FLEET.md
+**Status:** Authoritative  ·  **Maintained by:** Axle
+IDEA Pi test fleet: node inventory (idea01–idea04), hardware specs, provisioning
+procedure, SSH access, and fleet management commands.
+→ [docs/PI_FLEET.md](PI_FLEET.md)
+
+## interfaces.json
+**Status:** Supporting asset  ·  **Maintained by:** Axle
+Generated/supporting JSON describing Engine interfaces (not narrative docs).
+→ [docs/interfaces.json](interfaces.json)
+
+## source-bundle.md
+**Status:** Generated bundle  ·  **Maintained by:** Axle
+Generated source bundle of Engine docs/code for offline review and PDF export.
+→ [docs/source-bundle.md](source-bundle.md)
+
+## styles/markdown-pdf.css
+**Status:** Supporting asset (PDF styles)  ·  **Maintained by:** Axle
+CSS stylesheet used by markdown-to-PDF rendering for Engine documentation.
+→ [docs/styles/markdown-pdf.css](styles/markdown-pdf.css)
+
+## styles/markdown.css
+**Status:** Supporting asset (styles)  ·  **Maintained by:** Axle
+Base CSS stylesheet for rendered Engine markdown documentation.
+→ [docs/styles/markdown.css](styles/markdown.css)
+
+## styles/tomorrow.css
+**Status:** Supporting asset (styles)  ·  **Maintained by:** Axle
+Syntax-highlight / theme CSS (Tomorrow) for rendered Engine markdown documentation.
+→ [docs/styles/tomorrow.css](styles/tomorrow.css)

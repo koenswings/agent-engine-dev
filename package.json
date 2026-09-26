@@ -14,7 +14,7 @@
     "devtest": "tsc --build --clean && tsc && mocha --bail --reporter list 'dist/test/*.js' --exit",
     "pm2start": "tsc && VERBOSITY=3 pm2 start dist/src/index.js --watch",
     "tsc": "tsc",
-    "sync": "rsync -av --exclude='node_modules' --exclude='.git' --exclude='dist' --exclude='scratchpad' --exclude='.vscode' --exclude='.pnpm-store' ./ pi@raspberrypi.local:/home/pi/engine",
+    "sync": "rsync -av --exclude='node_modules' --exclude='.git' --exclude='dist' --exclude='scratchpad' --exclude='.vscode' --exclude='.pnpm-store' ./ pi@raspberrypi.local:/home/pi/idea/agents/agent-engine-dev",
     "reset": "chmod +x script/reset && script/reset",
     "ptest": "tsc && YPERSISTENCE=./yjs-db node dist/src/test.js",
     "test3": "mocha --config x.mocharc.json --es-module-specifier-resolution=node --reporter list 'test/*.ts'",
@@ -32,7 +32,9 @@
     "test:unit": "pnpm build && bash -c 'mkdir -p test/testresults; OUT=test/testresults/test-unit-$(date -u +%Y-%m-%d-%H%M).log; { echo \"Suite: test:unit | $(date -u) | Branch: $(git branch --show-current) | Commit: $(git rev-parse --short HEAD)\"; echo \"---\"; IDEA_TEST_MODE=true node_modules/.bin/vitest run dist/test/automated/; } 2>&1 | tee $OUT; RET=${PIPESTATUS[0]}; echo \"Results written to $OUT\"; exit $RET'",
     "test:diagnostic": "pnpm build && bash -c 'mkdir -p test/testresults; OUT=test/testresults/test-diagnostic-$(date -u +%Y-%m-%d-%H%M).log; { echo \"Suite: test:diagnostic | $(date -u) | Branch: $(git branch --show-current) | Commit: $(git rev-parse --short HEAD)\"; echo \"---\"; IDEA_TEST_MODE=true node_modules/.bin/vitest run dist/test/diagnostic/; } 2>&1 | tee $OUT; RET=${PIPESTATUS[0]}; echo \"Results written to $OUT\"; exit $RET'",
     "test:cross-engine": "pnpm build && bash -c 'mkdir -p test/testresults; OUT=test/testresults/test-cross-engine-$(date -u +%Y-%m-%d-%H%M).log; { echo \"Suite: test:cross-engine | $(date -u) | Branch: $(git branch --show-current) | Commit: $(git rev-parse --short HEAD)\"; echo \"---\"; node_modules/.bin/vitest run dist/test/cross-engine/; } 2>&1 | tee $OUT; RET=${PIPESTATUS[0]}; echo \"Results written to $OUT\"; exit $RET'",
-    "bundle-context": "tsx script/bundle-context.ts"
+    "bundle-context": "tsx script/bundle-context.ts",
+    "dump-store": "npx tsx script/dump-store.ts",
+    "cleanup-store": "npx tsx script/cleanup-store.ts"
   },
   "keywords": [],
   "author": "Koen Swings",
@@ -52,6 +54,7 @@
     "ts-morph": "^23.0.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.2",
+    "vite": "^8.0.12",
     "vitest": "^4.1.2"
   },
   "dependencies": {
@@ -60,7 +63,6 @@
     "@automerge/automerge-repo-network-websocket": "2.3.0-alpha.0",
     "@automerge/automerge-repo-storage-nodefs": "^2.2.0",
     "@homebridge/ciao": "^1.3.4",
-    "automerge-repo-storage-node�efs@2.3.0-alpha.0": "link:@automerge/automerge-repo-storage-node�efs@2.3.0-alpha.0",
     "chokidar": "^3.6.0",
     "fast-deep-equal": "^3.1.3",
     "lib0": "^0.2.114",
@@ -72,12 +74,17 @@
     "tsx": "^4.20.4",
     "valtio": "^1.13.2",
     "ws": "^8.18.3",
-    "yaml": "^2.8.1",
+    "yaml": "^2.8.3",
     "zx": "^8.8.5"
   },
   "pnpm": {
     "overrides": {
       "minimatch@5": "^5.1.7",
+      "minimatch@9": "^9.0.6",
+      "brace-expansion@>=4.0.0": "^5.0.5",
+      "picomatch@2": "^2.3.2",
+      "postcss": "^8.5.10",
+      "vite@8": "^8.0.5",
       "serialize-javascript@6": "^7.0.3"
     }
   }

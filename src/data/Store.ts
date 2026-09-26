@@ -1,11 +1,11 @@
 import path from 'path'
 import { Engine, localEngineId } from './Engine.js'
 import { Disk } from './Disk.js'
-import { deepPrint, getKeys, log } from '../utils/utils.js'
+import { deepPrint, getKeys, log, print } from '../utils/utils.js'
 import { App } from './App.js'
 import { Instance } from './Instance.js'
 import { User } from './User.js'
-import { AppID, DeviceName, DiskID, EngineID, Hostname, InstanceID, UserID } from './CommonTypes.js'
+import { AppID, DeviceName, DiskID, EngineID, Hostname, InstanceID, UserID, Operation } from './CommonTypes.js'
 import { DocHandle, DocumentId, PeerId, Repo } from '@automerge/automerge-repo'
 import { chalk, fs } from "zx"
 //import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websocket'
@@ -25,6 +25,7 @@ export interface Store {
     appDB: { [key: AppID]: App },
     instanceDB: { [key: InstanceID]: Instance },
     userDB: { [key: UserID]: User },
+    operationDB: { [id: string]: Operation },
 }
 
 // };
@@ -42,6 +43,7 @@ export const initialiseServerStore = async (repo: Repo, STORE_TEMPLATE_PATH: str
         appDB: {},
         instanceDB: {},
         userDB: {},
+        operationDB: {},
     });
     log("Empty store document created successfully.")
     // Save the document to a binary file
@@ -140,14 +142,14 @@ import { config } from './Config.js'
 // ... (other imports)
 
 export const createClientStore = async (hostnames: string[], clientPeerId: PeerId, storeDocId: DocumentId, timeout?: number): Promise<{handle: DocHandle<Store>, repo: Repo}> => {
-    console.log(`Connecting to hosts ${hostnames.join(', ')} with peer ID ${clientPeerId}`);
+    print(`Connecting to hosts ${hostnames.join(', ')} with peer ID ${clientPeerId}`);
     
     const connectPromise = (async () => {
         const urls = await Promise.all(hostnames.map(async (hostname) => {
             try {
-                console.log(chalk.blue(`Resolving hostname ${hostname}...`));
+                print(chalk.blue(`Resolving hostname ${hostname}...`));
                 const { address } = await lookup(hostname);
-                console.log(chalk.green(`  - Resolved to ${address}`));
+                print(chalk.green(`  - Resolved to ${address}`));
                 const port = config.settings.port || 4321;
                 return `ws://${address}:${port}`;
             } catch (e) {
@@ -171,17 +173,17 @@ export const createClientStore = async (hostnames: string[], clientPeerId: PeerI
     try {
         let result;
         if (timeout) {
-            console.log(chalk.blue(`Attempting to connect with a ${timeout} second timeout...`));
+            print(chalk.blue(`Attempting to connect with a ${timeout} second timeout...`));
             const timeoutPromise = new Promise<never>((_, reject) => 
                 setTimeout(() => reject(new Error(`Connection timed out after ${timeout} seconds`)), timeout * 1000)
             );
             result = await Promise.race([connectPromise, timeoutPromise]);
         } else {
-            console.log(chalk.blue(`Attempting to connect with no timeout...`));
+            print(chalk.blue(`Attempting to connect with no timeout...`));
             result = await connectPromise;
         }
         
-        console.log(`Connected successfully with peer ID ${clientPeerId}`);
+        print(`Connected successfully with peer ID ${clientPeerId}`);
         return result;
 
     } catch (e) {
@@ -268,11 +270,7 @@ export const getAppsOfDisk = (store: Store, disk: Disk): App[] => {
 export const getInstances = (store: Store): Instance[] => {
     return Object.keys(store.instanceDB).flatMap(instanceId => {
         const instance = getInstance(store, instanceId as InstanceID)
-        if (instance && instance.status === 'Running') {
-            return [instance]
-        } else {
-            return []
-        }
+        return instance ? [instance] : []
     })
 }
 
@@ -295,7 +293,7 @@ export const getEngineOfInstance = (store: Store, instance: Instance): Engine | 
 export const getInstancesOfDisk = (store: Store, disk: Disk): Instance[] => {
     return Object.keys(store.instanceDB).flatMap(instanceId => {
         const instance = getInstance(store, instanceId as InstanceID)
-        if (instance && instance.storedOn === disk.id) {
+        if (instance && String(instance.storedOn) === String(disk.id)) {
             return [instance]
         } else {
             return []
@@ -321,7 +319,7 @@ export const getDisks = (store: Store): Disk[] => {
 export const getDisksOfEngine = (store: Store, engine: Engine): Disk[] => {
     return Object.keys(store.diskDB).flatMap(diskId => {
         const disk = getDisk(store, diskId as DiskID)
-        if (disk && disk.dockedTo === engine.id) {
+        if (disk && String(disk.dockedTo) === String(engine.id)) {
             return [disk]
         } else {
             return []
@@ -329,12 +327,15 @@ export const getDisksOfEngine = (store: Store, engine: Engine): Disk[] => {
     })
 }
 
-export const findDiskByDevice = (store: Store, deviceName: DeviceName): Disk | undefined => {
-    return getDisks(store).find(disk => disk.device === deviceName)
+export const findDiskByDevice = (store: Store, deviceName: DeviceName, engineId?: EngineID): Disk | undefined => {
+    const disks = engineId
+        ? getDisksOfEngine(store, store.engineDB[engineId])
+        : getDisks(store)
+    return disks.find(disk => String(disk.device) === String(deviceName))
 }
 
 export const findDiskByName = (store: Store, diskName: string): Disk | undefined => {
-    return getDisks(store).find(disk => disk.name === diskName)
+    return getDisks(store).find(disk => String(disk.name) === String(diskName))
 }
 
 export const findDisksByApp = (store: Store, appId: AppID): Disk[] => {

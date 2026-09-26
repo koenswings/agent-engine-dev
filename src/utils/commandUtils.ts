@@ -2,21 +2,34 @@ import { DocHandle } from "@automerge/automerge-repo";
 import { Store } from "../data/Store.js";
 import { Command, EngineID } from "../data/CommonTypes.js";
 import { ArgumentDescriptor, CommandDefinition } from "../data/CommandDefinition.js";
+import { CommandLogStore, addTrace, closeTrace, getCommandLogHandle } from "../data/CommandLogStore.js";
+import { runWithTrace, flushTrace } from "./CommandLogger.js";
+import { print } from './utils.js';
 
 
-export const handleCommand = async (commands: CommandDefinition[], storeHandle: DocHandle<Store> | null, context: 'console' | 'engine', input: string):Promise<void> => {
+export const handleCommand = async (
+    commands: CommandDefinition[],
+    storeHandle: DocHandle<Store> | null,
+    context: 'console' | 'engine',
+    input: string,
+    commandLogHandle?: DocHandle<CommandLogStore> | null
+): Promise<void> => {
     const trimmedInput = input.trim();
     const commandName = trimmedInput.split(' ')[0];
     const command = commands.find(cmd => cmd.name === commandName);
 
     if (!command) {
-        console.log(`Unknown command: ${commandName}`);
+        print(`Unknown command: ${commandName}`);
         return;
     }
 
+    // A variadic last arg takes all remaining tokens (see ArgumentDescriptor.variadic)
+    const lastArg = command.args[command.args.length - 1];
+    const isVariadic = lastArg?.variadic === true;
+
     let stringArgs: string[] = [];
     // Special case for commands that take the entire rest of the line as a single argument
-    if (command.args.length === 1) {
+    if (command.args.length === 1 && !isVariadic) {
         const firstSpaceIndex = trimmedInput.indexOf(' ');
         if (firstSpaceIndex !== -1) {
             stringArgs.push(trimmedInput.substring(firstSpaceIndex + 1));
@@ -27,26 +40,67 @@ export const handleCommand = async (commands: CommandDefinition[], storeHandle: 
 
     // Scope checking
     if (context === 'console' && command.scope === 'engine') {
-        console.log(`Error: Command '${commandName}' can only be executed on an engine. Use 'send <engineId> ${commandName} ...' to execute it remotely.`);
+        print(`Error: Command '${commandName}' can only be executed on an engine. Use 'send <engineId> ${commandName} ...' to execute it remotely.`);
         return;
     }
 
     if (context === 'engine' && command.scope === 'console') {
-        console.log(`Error: Command '${commandName}' can only be executed on a console.`);
+        print(`Error: Command '${commandName}' can only be executed on a console.`);
         return;
     }
 
+    let args: any[];
     try {
-        const args = stringArgs.map((arg, index) => {
-            if (index >= command.args.length) throw new Error("Too many arguments");
-            return convertToType(arg, command.args[index]);
+        args = stringArgs.map((arg, index) => {
+            const descriptor = isVariadic && index >= command.args.length - 1 ? lastArg : command.args[index];
+            if (!descriptor) throw new Error("Too many arguments");
+            return convertToType(arg, descriptor);
         });
-
         if (args.length < command.args.length) throw new Error("Insufficient arguments");
-
-        await command.execute(storeHandle, ...args);
-    } catch (error) { // @ts-ignore
+    } catch (error: any) {
         console.error(`Error: ${error.message}`);
+        return;
+    }
+
+    // ── Trace setup ──────────────────────────────────────────────────────────
+    const traceId = crypto.randomUUID();
+    // Build a named args object when the CommandDefinition has arg names defined,
+    // otherwise fall back to a positional array. The Console filters traces by
+    // args['instanceName'] or args['instanceId'], so named args are required.
+    // A variadic last arg is recorded as an array of all its tokens.
+    const namedArgs: Record<string, string | string[] | null> | string[] =
+        command.args.every(a => a.name)
+            ? Object.fromEntries(command.args.map((a, i) =>
+                [a.name!, a.variadic ? stringArgs.slice(i) : stringArgs[i] ?? null]))
+            : stringArgs
+    const argsJson = JSON.stringify(namedArgs);
+    const traceCtx = { traceId, command: commandName, args: argsJson };
+
+    if (commandLogHandle) {
+        addTrace(commandLogHandle, {
+            traceId,
+            command: commandName,
+            args: argsJson,
+            startedAt: Date.now(),
+            completedAt: null,
+            status: 'running',
+            errorMessage: null,
+        });
+    }
+
+    // ── Execute inside trace context ─────────────────────────────────────────
+    try {
+        await runWithTrace(traceCtx, async () => { await command.execute(storeHandle, ...args); });
+        if (commandLogHandle) {
+            await flushTrace(traceId);
+            closeTrace(commandLogHandle, traceId, 'ok');
+        }
+    } catch (error: any) {
+        console.error(`Error: ${error.message}`);
+        if (commandLogHandle) {
+            await flushTrace(traceId);
+            closeTrace(commandLogHandle, traceId, 'error', error.message);
+        }
     }
 }
 
@@ -56,12 +110,31 @@ export const handleCommand = async (commands: CommandDefinition[], storeHandle: 
  * This is used by tests and the 'send' command definition.
  */
 export const sendCommand = (storeHandle: DocHandle<Store>, engineId: EngineID, command: Command): void => {
-    console.log(`Sending command '${command}' to engine ${engineId}`);
+    print(`Sending command '${command}' to engine ${engineId}`);
 
     const store = storeHandle.doc();
     if (!store?.engineDB[engineId]) {
         console.error(`Cannot send command: Engine ${engineId} not found in store.`);
         return;
+    }
+
+    // Trace the dispatch on the originating engine so the Console shows
+    // cross-engine commands in history (e.g. copyApp dispatching startInstance
+    // to a remote engine). This is a one-shot trace with no log lines.
+    const cmdLogHandle = getCommandLogHandle()
+    if (cmdLogHandle) {
+        const commandName = String(command).split(' ')[0]
+        const traceId = crypto.randomUUID()
+        addTrace(cmdLogHandle, {
+            traceId,
+            command: commandName,
+            args: JSON.stringify({ dispatchedTo: engineId, command: String(command) }),
+            startedAt: Date.now(),
+            completedAt: Date.now(),
+            status: 'running',
+            errorMessage: null,
+        })
+        closeTrace(cmdLogHandle, traceId, 'ok')
     }
 
     storeHandle.change(doc => {

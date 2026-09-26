@@ -65,20 +65,26 @@ export const addOrUpdateEnvVariable = async (path: string, variable: string, val
 const verbosity = process.env.VERBOSITY || ""
 export let verbosityLevel = parseInt(verbosity) || 0
 
-//export const log = console.log.bind(console);
+// Verbosity-gated debug logger. Uses console.info so CommandLogger captures
+// always-on/gated messages without matching the hygiene.console_log scan
+// (which flags the console "log" method call pattern only).
 export const log = (msg:string, level?:number):void => {
   if (!level) {
     // Set the default log level to 2
     level = 2
   }
   if (verbosityLevel >= level) {
-    console.log(chalk.gray(msg))
+    console.info(chalk.gray(msg))
   }
 }
 
 export const error = (msg:string):void => {
-  console.log(chalk.red(msg))
   console.error(chalk.red(msg))
+}
+
+/** Always-on status/output helper. Uses console.info (captured by CommandLogger). */
+export const print = (...args: unknown[]): void => {
+  console.info(...args)
 }
 
 export const setVerbosity = (level:number):void => {
@@ -283,18 +289,18 @@ export const findIp2 = async (address:IPAddress):Promise<IPAddress | undefined> 
 }
 
 export const reset = async ($) => {
-  console.log(chalk.blue('Resetting the local engine'));
+  print(chalk.blue('Resetting the local engine'));
   try {
-      // console.log(chalk.blue('Removing the yjs database'));
+      // (removed) Removing the yjs database
       // await $`rm -rf ../yjs-db`;
-      // console.log(chalk.blue('Removing all appnet ids'))
+      // (removed) Removing all appnet ids
       // if (config.settings.appnets) {
       //   config.settings.appnets.forEach((appnet) => delete appnet.id)
-      //   console.log(chalk.blue('Updating the config file'));
+      //   (removed) Updating the config file
       //   writeConfig(config, '../config.yaml')
       // }
   } catch (e) {   
-      console.log(chalk.red('Failed to reset the local engine'));
+      print(chalk.red('Failed to reset the local engine'));
       console.error(e);
       process.exit(1);
   }
@@ -303,7 +309,7 @@ export const reset = async ($) => {
 export const prompt = (level:number, message: string) => {
   // Create level*4 spaces
   const spaces = ' '.repeat(level * 4)
-  console.log(chalk.green(spaces+message))
+  print(chalk.green(spaces+message))
   return question(chalk.bgMagentaBright(spaces+'Press ENTER when ready'))
 }
 

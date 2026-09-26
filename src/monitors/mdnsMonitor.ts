@@ -3,12 +3,12 @@ import { deepPrint, log, error } from '../utils/utils.js';
 import { chalk } from 'zx';
 import { Store, getLocalEngine } from '../data/Store.js';
 import { manageDiscoveredPeers } from '../data/Network.js'
-import ciao from '@homebridge/ciao'
+import ciao, { CiaoService } from '@homebridge/ciao'
 import { DocHandle, DocumentId, Repo } from '@automerge/automerge-repo';
 import { EngineID, Hostname, IPAddress } from '../data/CommonTypes.js';
 import { config } from '../data/Config.js';
 
-export const startAdvertising = (store: Store): void => {
+export const startAdvertising = (store: Store): CiaoService => {
     const engine = getLocalEngine(store)
     if (!engine) {
         log(`No local engine found in the store`)
@@ -17,27 +17,36 @@ export const startAdvertising = (store: Store): void => {
     const engineName = engine.hostname
     const engineVersion = engine.version
     const responder = ciao.getResponder()
-    let service
 
-    if (engineName) {
-        log(`Advertising on all interfaces  `)
-        service = responder.createService({
-            name: engineName.toString(),
-            type: 'engine',
-            port: config.settings.port,
-            txt: {
-                name: engineName,
-                id: engine.id,
-                version: engineVersion
-            }
-        })
-    } 
+    if (!engineName) {
+        throw new Error(`No engine hostname found in the store`)
+    }
+
+    log(`Advertising on all interfaces`)
+    const service = responder.createService({
+        name: engineName.toString(),
+        type: 'engine',
+        port: config.settings.port,
+        txt: {
+            name: engineName,
+            id: engine.id,
+            version: engineVersion
+        }
+    })
+
+    // Log name conflicts without updating the store — the (2) suffix is a service
+    // advertisement detail, not the machine hostname.
+    service.on('name-change', (newName: string) => {
+        log(`mDNS service name changed to '${newName}' due to conflict — hostname in store unchanged`);
+    });
 
     service.advertise().then(() => {
-        log(`The following service is published on all interfaces: ${service.name}._engine._tcp.local`);
+        log(`The following service is published on all interfaces: ${engineName}._engine._tcp.local`);
     }).catch((err) => {
         error(`Error advertising mDNS service: ${err}`)
     })
+
+    return service
 }
 
 const discoverEngines = async (storeHandle: DocHandle<Store>, repo:Repo): Promise<void> => {
@@ -86,8 +95,8 @@ const discoverEngines = async (storeHandle: DocHandle<Store>, repo:Repo): Promis
     }
 }
 
-export const enableMulticastDNSEngineMonitor = (storeHandle: DocHandle<Store>, repo:Repo): void => {
-    startAdvertising(storeHandle.doc())
+export const enableMulticastDNSEngineMonitor = (storeHandle: DocHandle<Store>, repo: Repo): { end: () => Promise<void> } => {
+    const service = startAdvertising(storeHandle.doc())
     
     const runDiscovery = async () => {
         await discoverEngines(storeHandle, repo);
@@ -95,4 +104,9 @@ export const enableMulticastDNSEngineMonitor = (storeHandle: DocHandle<Store>, r
     };
 
     runDiscovery();
+
+    // Return shutdown handle so the caller can send mDNS goodbye packets on exit.
+    return {
+        end: () => service.end()
+    }
 }

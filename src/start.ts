@@ -2,9 +2,9 @@ import os from 'os'
 import { enableUsbDeviceMonitor } from './monitors/usbDeviceMonitor.js'
 import { enableTimeMonitor, generateHeartBeat } from './monitors/timeMonitor.js'
 import { $, chalk, fs, sleep } from 'zx'
-import { deepPrint, log } from './utils/utils.js'
+import { deepPrint, log, print } from './utils/utils.js'
 import { config } from './data/Config.js'
-import { createOrUpdateEngine, localEngineId } from './data/Engine.js'
+import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
 import { enableHttpMonitor } from './monitors/httpMonitor.js'
 import { DocumentId, Repo, DocHandle } from '@automerge/automerge-repo'
@@ -12,9 +12,15 @@ import { startAutomergeServer } from './repo.js'
 import { enableMulticastDNSEngineMonitor } from './monitors/mdnsMonitor.js'
 import { createServerStore, initialiseServerStore } from './data/Store.js'
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
+import { recoverInterruptedOperations } from './data/Operations.js'
+import { enableDockerMetricsMonitor } from './monitors/dockerMetricsMonitor.js'
+import { copyApp, moveApp } from './data/CopyMoveApp.js'
+import { backupInstance } from './monitors/backupMonitor.js'
 import { InstanceID } from './data/CommonTypes.js'
 import { Status } from './data/Instance.js'
 import { Store } from './data/Store.js'
+import { createCommandLogStore } from './data/CommandLogStore.js'
+import { initCommandLogger } from './utils/CommandLogger.js'
 
 
 
@@ -96,42 +102,82 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     await storeHandle.whenReady()
     const store = storeHandle.doc()
 
+    // Remove any phantom engine entries and orphan disks that accumulated
+    // from previous boots (e.g. before the sudo-hdparm fix). Runs before any
+    // monitors start so there is no racing writer; tombstones propagate to
+    // all peers on the next Automerge sync.
+    cleanupPhantomEngines(storeHandle)
+
     // Check for undocked apps after restart
     await checkAndSetUndockedApps(storeHandle)
 
+    // Crash recovery: retry idempotent interrupted ops; mark others Failed
+    await recoverInterruptedOperations(storeHandle, {
+        copyApp: async (args, handle) => {
+            await copyApp(handle, args.instanceId as any, args.sourceDiskId as any, args.targetDiskId as any, 'crash-recovery')
+        },
+        moveApp: async (args, handle) => {
+            await moveApp(handle, args.instanceId as any, args.sourceDiskId as any, args.targetDiskId as any, 'crash-recovery')
+        },
+        backupApp: async (args, handle) => {
+            const store = handle.doc()
+            const backupDisk = store.diskDB[args.backupDiskId]
+            if (backupDisk) {
+                await backupInstance(handle, args.instanceId as any, backupDisk as any, undefined, 'crash-recovery')
+            }
+        },
+        // restoreApp: strategy='fail', no retry handler needed
+    })
+
+    // Create the command log store and initialise the console patcher
+    log(chalk.bgMagenta('STARTING COMMAND LOG STORE'))
+    const commandLogHandle = await createCommandLogStore(repo)
+    initCommandLogger(commandLogHandle)
+
     // Start the HTTP server (serves Console UI + /api/store-url)
     log(chalk.bgMagenta('STARTING HTTP SERVER'))
-    enableHttpMonitor()
+    const httpServer = enableHttpMonitor(undefined, undefined, commandLogHandle)
 
     // Start the instances monitor
     // log(chalk.bgMagenta('STARTING INSTANCES MONITOR'))
     // await enableInstanceStatusMonitor(storeHandle)
     
+    // Safety net: log unhandled async errors instead of crashing.
+    // The primary fix is suppressing the WebSocket async error event in Network.ts,
+    // but this catches anything else that slips through.
+    process.on('uncaughtException', (err: Error) => {
+        log(`[uncaughtException] ${err.message}\n${err.stack}`);
+    });
+    process.on('unhandledRejection', (reason: any) => {
+        log(`[unhandledRejection] ${reason instanceof Error ? reason.stack : String(reason)}`);
+    });
+
     // If this process is killed, shut down automerge
     process.on('SIGINT', async () => {
         // this will be fired when you kill the app with ctrl + c.
         log('Shutting down automerge')
         log('*** SIGINT received ****');
-        await shutdownProcedure(repo)
+        await shutdownProcedure(repo, httpServer, mdnsHandle)
         process.exit(0)
     })
     process.on('SIGTERM', async () => {
         // this will be fired by the Linux shutdown command
         log('Shutting down automerge')
         log('*** SIGTERM received ****');
-        await shutdownProcedure(repo)
+        await shutdownProcedure(repo, httpServer, mdnsHandle)
         process.exit(0)
     })
 
     await sleep(1000)
     log(chalk.bgMagenta('STARTING STORE MONITOR'))
-    enableStoreMonitor(storeHandle)
+    enableStoreMonitor(storeHandle, commandLogHandle)
 
     const configMDNS = config.settings.mdns
+    let mdnsHandle: { end: () => Promise<void> } | undefined
     if (!disableMDNS && configMDNS) {
         await sleep(1000)
         log(chalk.bgMagenta('STARTING MULTICAST DNS MONITOR'))
-        enableMulticastDNSEngineMonitor(storeHandle, repo)
+        mdnsHandle = enableMulticastDNSEngineMonitor(storeHandle, repo)
     }
 
 
@@ -140,9 +186,13 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     enableUsbDeviceMonitor(storeHandle)
 
     await sleep(1000)
+    log(chalk.bgMagenta('STARTING DOCKER METRICS MONITOR'))
+    enableDockerMetricsMonitor(storeHandle)
+
     log(chalk.bgMagenta('STARTING HEARTBEAT GENERATION'))
+    const heartbeatIntervalMs = config.settings.heartbeatIntervalMs ?? 50000
     generateHeartBeat(storeHandle)
-    enableTimeMonitor(50000, () => generateHeartBeat(storeHandle))
+    enableTimeMonitor(heartbeatIntervalMs, () => generateHeartBeat(storeHandle))
 
 
 }
@@ -171,7 +221,21 @@ export const checkAndSetUndockedApps = async (storeHandle: DocHandle<Store>): Pr
     await Promise.all(promises);
 };
 
-async function shutdownProcedure(repo:Repo):Promise<void> {
-    console.log('*** Engine is now closing ***');
+async function shutdownProcedure(repo: Repo, httpServer?: import('http').Server, mdnsHandle?: { end: () => Promise<void> }): Promise<void> {
+    print('*** Engine is now closing ***');
+    // Send mDNS goodbye packets so peers immediately know this engine is gone.
+    // Without this, stale records linger until TTL expiry and cause name conflicts
+    // on the next startup (ciao renames the service to 'hostname (2)').
+    if (mdnsHandle) {
+        try { await mdnsHandle.end() } catch (_) {}
+        log('mDNS service ended')
+    }
+    // Close the HTTP server first so the port is released before the process exits.
+    // Without this, PM2 restarts the engine before the OS releases the port, causing
+    // EADDRINUSE on startup and leaving the engine unreachable until TIME_WAIT expires.
+    if (httpServer) {
+        await new Promise<void>(resolve => httpServer.close(() => resolve()))
+        log('HTTP server closed')
+    }
     if (repo) await repo.shutdown()
 }

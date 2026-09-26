@@ -93,6 +93,15 @@ export const disconnectEngine = (repo: Repo, address: IPAddress, port: PortNumbe
   if (connection) {
     log(`Disconnecting from engine at ${connectionKey}`);
     try {
+      // Suppress the async 'error' event that ws emits when closed in CONNECTING state.
+      // Without this, the event goes unhandled and crashes Node even though the synchronous
+      // throw from ws.close() is already caught below.
+      const ws = (connection.adapter as any).socket;
+      if (ws && typeof ws.on === 'function') {
+        ws.on('error', (err: Error) => {
+          log(`Suppressed async WebSocket error during disconnect: ${err.message}`);
+        });
+      }
       repo.networkSubsystem.removeNetworkAdapter(connection.adapter);
       const engine = findRunningEngineByHostname(storeHandle.doc(), hostname);
       if (engine) {
@@ -107,7 +116,7 @@ export const disconnectEngine = (repo: Repo, address: IPAddress, port: PortNumbe
       if (e.message === 'WebSocket was closed before the connection was established') {
         log(`Ignoring expected error during disconnect: ${e.message}`);
       } else {
-        throw e;
+        log(`Unexpected error during disconnect from ${connectionKey}: ${e.message}`);
       }
     }
     delete network.connections[connectionKey];
@@ -138,8 +147,8 @@ export const connectEngine = async (repo:Repo, address: IPAddress, hostname: Hos
     await handle.whenReady(); // Ensure it's loaded before returning
     log(`Handle is ready. State: ${handle.state}`);
 
-    handle.on('change', ({ doc }) => {
-      log(`Document changed on connection to ${address}:${port}. Current doc: ${JSON.stringify(doc)}`);
+    handle.on('change', () => {
+      // no-op: CRDT sync events are handled by storeMonitor
     });
 
     network.connections[`${address}:${port}`] = { adapter: clientConnection, missedDiscoveryCount: 0, hostname, engineId };
@@ -154,6 +163,20 @@ export const connectEngine = async (repo:Repo, address: IPAddress, hostname: Hos
     }
     return undefined
   }
+}
+
+/**
+ * Returns the IP address of a connected engine by its engineId, or undefined if not connected.
+ * Looks up from the live network.connections map populated by mDNS discovery.
+ */
+export const getEngineAddress = (engineId: EngineID): IPAddress | undefined => {
+    for (const [key, conn] of Object.entries(network.connections)) {
+        if (String(conn.engineId) === String(engineId)) {
+            // key is 'address:port' — return just the address part
+            return key.split(':')[0] as IPAddress
+        }
+    }
+    return undefined
 }
 
 export const isEngineConnected = (network: Network, ip: IPAddress):boolean => {

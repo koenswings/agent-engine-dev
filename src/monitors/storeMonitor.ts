@@ -1,10 +1,11 @@
 import { DocHandle } from '@automerge/automerge-repo'
 import { Store } from '../data/Store.js'
-import { log, deepPrint } from '../utils/utils.js'
+import { log } from '../utils/utils.js'
 import { EngineID, InstanceID } from '../data/CommonTypes.js'
 import { handleCommand } from '../utils/commandUtils.js'
 import { commands } from '../data/Commands.js';
 import { localEngineId } from '../data/Engine.js';
+import { CommandLogStore } from '../data/CommandLogStore.js';
 
 
 
@@ -16,7 +17,6 @@ const engineSetMonitor = (patch, storeHandle): boolean => {
     ) {
         const engineId = patch.path[1].toString() as EngineID
         log(`New engine added with ID: ${engineId}`)
-        log(`Doc now contains: ${deepPrint(storeHandle.doc(), 2)}`)
         return true
     } else {
         return false
@@ -54,7 +54,8 @@ const engineCommandsMonitor = (patch, storeHandle): boolean => {
 
     _currentlyExecuting.add(key)
     log(`Processing command for engine ${engineId}: ${command}`)
-    handleCommand(commands, storeHandle, 'engine', command).then(() => {
+    const cmdLogHandle = (storeHandle as any).__commandLogHandle ?? null
+    handleCommand(commands, storeHandle, 'engine', command, cmdLogHandle).then(() => {
         _currentlyExecuting.delete(key)
         storeHandle.change(doc => {
             const eng = doc.engineDB[engineId as any]
@@ -73,7 +74,6 @@ const engineLastRunMonitor = (patch, storeHandle): boolean => {
         const lastRun = patch.value as number
         const engineId = patch.path[1] as EngineID
         log(`Engine ${engineId} last run updated to: ${lastRun}`)
-        log(`Doc now contains: ${deepPrint(storeHandle.doc(), 2)}`)
         return true
     } else {
         return false
@@ -87,7 +87,7 @@ const instancesMonitor = (patch, storeHandle): boolean => {
         typeof patch.path[1] === 'string' && // instanceId
         patch.path[2] === 'status') {
         const instanceId = patch.path[1] as InstanceID
-        const status = patch.value as string
+        const status = (patch.value ?? storeHandle.doc()?.instanceDB?.[instanceId]?.status) as string
         log(`Instance ${instanceId} status changed to: ${status}`)
         return true
     } else {
@@ -104,14 +104,17 @@ const applyUntilTrue = (functions: ((patch, storeHandle) => boolean)[], patch, s
     return false
 }
 
-export const enableStoreMonitor = (storeHandle: DocHandle<Store>): void => {
+export const enableStoreMonitor = (storeHandle: DocHandle<Store>, commandLogHandle?: DocHandle<CommandLogStore> | null): void => {
     // Monitor for the addition or removal of engines in the store
     storeHandle.on('change', ({ doc, patches }) => {
         for (const patch of patches) {
-            log(`StoreMonitor handles the following change: ${deepPrint(patch)}`)
             applyUntilTrue([engineSetMonitor, engineCommandsMonitor, engineLastRunMonitor, instancesMonitor], patch, storeHandle)
         }
     })
+
+    // Inject commandLogHandle into the monitor closure so engineCommandsMonitor
+    // can pass it through to handleCommand
+    ;(storeHandle as any).__commandLogHandle = commandLogHandle ?? null
 
     // On startup, process any commands already queued for this engine.
     // The storeMonitor only fires on new patches, so commands written before
@@ -125,7 +128,7 @@ export const enableStoreMonitor = (storeHandle: DocHandle<Store>): void => {
             for (const cmd of startupCmds) {
                 const startupKey = `${localEngineId}:${cmd}`
                 _currentlyExecuting.add(startupKey)
-                await handleCommand(commands, storeHandle, 'engine', cmd)
+                await handleCommand(commands, storeHandle, 'engine', cmd, commandLogHandle)
                 _currentlyExecuting.delete(startupKey)
                 storeHandle.change(doc => {
                     const eng = doc.engineDB[localEngineId as any]

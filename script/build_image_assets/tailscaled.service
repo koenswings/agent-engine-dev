@@ -1,0 +1,15 @@
+[Unit]
+Description=Tailscale node agent
+Documentation=https://tailscale.com/kb/
+After=network-pre.target
+Wants=network-pre.target
+
+[Service]
+ExecStart=/usr/sbin/tailscaled
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=tailscale
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target
