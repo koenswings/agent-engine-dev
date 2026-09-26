@@ -56,7 +56,8 @@ const syncEngine = async () => {
     const $$ = ssh(`${user}@${machine}`);
     try {
       await $$`command -v pm2`;
-      await $$`sudo pm2 delete engine` || true;
+      // pm2 runs as pi (idea#80): use pi's process list, never root's.
+      await $$`pm2 delete engine` || true;
     } catch (e) {
       console.log(chalk.yellow(`pm2 not found on ${machine}, skipping stop. This is expected on a fresh install.`));
     }
@@ -103,7 +104,7 @@ const syncEngine = async () => {
       //await $$`cd ${enginePath} && pnpm build`
       //await $$`cd ${enginePath} && pm2 start engine`
       console.log(chalk.blue(`Building the engine on machine ${machine}`));
-      await $$`cd ${enginePath} && sudo pnpm build`;
+      await $$`cd ${enginePath} && pnpm build`;
       if (clearStore) {
         console.log(chalk.yellow(`Clearing store data directory on ${machine}...`));
         await $$`sudo rm -rf ${enginePath}/${storeDataFolder}/*`;
@@ -112,7 +113,7 @@ const syncEngine = async () => {
       console.log(chalk.blue(`Flushing the engine logs on machine ${machine}`));
       try {
         await $$`command -v pm2`;
-        await $$`sudo pm2 flush engine`;
+        await $$`pm2 flush engine`;
       } catch (e) {
         console.log(chalk.yellow(`pm2 not found on ${machine}, skipping log flush.`));
       }
@@ -137,8 +138,8 @@ const syncEngine = async () => {
       console.log(chalk.blue(`Applying setcap on ${machine}...`));
       const nodePath = (await $$`which node`).stdout.trim();
       await $$`sudo setcap cap_net_bind_service=+ep ${nodePath}`;
-      await $$`cd ${enginePath} && sudo pm2 start pm2.config.cjs`;
-      await $$`sudo pm2 save`;
+      await $$`cd ${enginePath} && pm2 start pm2.config.cjs`;
+      await $$`pm2 save`;
     } catch (e) {
       console.log(chalk.yellow(`pm2 not found on ${machine}, skipping start. The build script will handle this.`));
     }

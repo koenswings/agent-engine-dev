@@ -283,10 +283,11 @@ describe('moveApp', () => {
         const { handle } = await makeHandle()
         const { $ } = await import('zx')
         await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
-        // Instance dir is removed via `sudo rm -rf` (files may be docker-owned)
-        // The template literal passes 'sudo rm -rf ' in the strings and the path as an interpolated value.
-        const rmCalls = vi.mocked($).mock.calls
-        const didSudoRm = rmCalls.some((args: any) => {
+        // Instance dir is removed as pi with fs.remove, without sudo (idea#80).
+        const mfs = await getMockedFs()
+        const removeCalls = vi.mocked(mfs.remove).mock.calls.map(c => c[0] as string)
+        expect(removeCalls.some(p => p.includes(`/instances/${INSTANCE_ID}`))).toBe(true)
+        const didSudoRm = vi.mocked($).mock.calls.some((args: any) => {
             const [strings, ...vals] = args
             const allParts = [
                 ...(Array.isArray(strings) ? strings : [String(strings ?? '')]),
@@ -294,7 +295,7 @@ describe('moveApp', () => {
             ].join('')
             return allParts.includes('sudo') && allParts.includes('rm') && allParts.includes(INSTANCE_ID)
         })
-        expect(didSudoRm).toBe(true)
+        expect(didSudoRm).toBe(false)
     })
 
     it('removes app master when no other instance on source disk uses it', async () => {

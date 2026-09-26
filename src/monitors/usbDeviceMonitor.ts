@@ -198,7 +198,10 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     if (!config.settings.isDev && !config.settings.testMode) {
         try {
             log(`Cleaning up the ${disksRoot()}/old folder`)
-            await $`sudo rm -fr ${disksRoot()}/old/*`
+            // Remove the folder itself, not old/*: the shell would expand the glob
+            // before sudo runs, and the Engine's sudoers file only allows this exact
+            // command (idea#80). /disks/old is recreated with mkdir -p when needed.
+            await $`sudo rm -fr ${disksRoot()}/old`
         } catch (e) {
             log(`Error cleaning up the ${disksRoot()}/old folder`)
             log(e)

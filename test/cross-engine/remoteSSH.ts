@@ -165,7 +165,7 @@ export const remoteCleanupStore = async (host: string): Promise<void> => {
  */
 export const isEngineRunning = async (host: string): Promise<boolean> => {
     try {
-        const result = await execOn(host)`sudo pm2 show engine`
+        const result = await execOn(host)`sudo -u pi pm2 show engine`
         return result.stdout.includes('online')
     } catch {
         return false

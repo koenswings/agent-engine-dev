@@ -264,14 +264,14 @@ export const clearKnownHost = async (machine: string) => {
   }
 }
 
-export const copyAsset = async (exec: any, enginePath: string, asset: string, destination: string, executable: boolean = false, chmod: string | null = "0644", chown: string | null = "0:0") => {
-  print(chalk.blue(`Copying asset ${asset} to ${destination}`));
+export const copyAsset = async (exec: any, enginePath: string, asset: string, destination: string, executable: boolean = false, chmod: string | null = "0644", chown: string | null = "0:0", destName: string = asset) => {
+  print(chalk.blue(`Copying asset ${asset} to ${destination}/${destName}`));
   try {
-    await exec`sudo cp ${enginePath}/script/build_image_assets/${asset} ${destination}`;
-    await exec`sudo chmod ${chmod} ${destination}/${asset}`;
-    await exec`sudo chown ${chown} ${destination}/${asset}`;
+    await exec`sudo cp ${enginePath}/script/build_image_assets/${asset} ${destination}/${destName}`;
+    await exec`sudo chmod ${chmod} ${destination}/${destName}`;
+    await exec`sudo chown ${chown} ${destination}/${destName}`;
     if (executable) {
-      await exec`sudo chmod +x ${destination}/${asset}`;
+      await exec`sudo chmod +x ${destination}/${destName}`;
     }
   } catch (e) {
     print(chalk.red(`Error copying asset ${asset} to ${destination}`));
@@ -477,6 +477,7 @@ export const installUdev = async (exec: any, enginePath: string) => {
   try {
     await exec`sudo apt install udev -y`;
     await copyAsset(exec, enginePath, '90-docking.rules', '/etc/udev/rules.d')
+    await installEngineSudoers(exec, enginePath)
     await createDir(exec, '/disks', "0755", "0:0")
 
     // Configure /dev/engine ownership so the pi user can write sentinel files.
@@ -496,6 +497,38 @@ EOF`
     process.exit(1);
   }
   print(chalk.green('Udev and udev rules installed'));
+}
+
+/**
+ * Installs /etc/sudoers.d/10-engine: the narrow list of root commands the Engine
+ * (running as pi) needs (idea#80, proposals/run-architecture.md).
+ *
+ * The asset is validated with `visudo -cf` before it is copied, because a broken
+ * sudoers file can lock sudo out. The installed name has no '.' in it: sudo skips
+ * files in /etc/sudoers.d whose name contains a '.'. After copying, the whole
+ * sudoers configuration is checked again; on failure the file is removed.
+ */
+export const installEngineSudoers = async (exec: any, enginePath: string) => {
+  const asset = '10-engine.sudoers'
+  const installed = '/etc/sudoers.d/10-engine'
+  print(chalk.blue(`Validating ${asset} with visudo...`))
+  try {
+    await exec`sudo visudo -cf ${enginePath}/script/build_image_assets/${asset}`
+  } catch (e) {
+    print(chalk.red(`${asset} failed visudo validation; not installing it`))
+    console.error(e)
+    process.exit(1)
+  }
+  await copyAsset(exec, enginePath, asset, '/etc/sudoers.d', false, '0440', '0:0', '10-engine')
+  try {
+    await exec`sudo visudo -c`
+  } catch (e) {
+    print(chalk.red(`sudoers check failed after installing ${installed}; removing it`))
+    await exec`sudo rm -f ${installed}`
+    console.error(e)
+    process.exit(1)
+  }
+  print(chalk.green(`${installed} installed`))
 }
 
 export const rebootSystem = async (exec: any) => {
@@ -673,7 +706,8 @@ export const installPm2 = async (exec: any, enginePath: string) => {
     await exec`sudo npm install -g pm2`
     await exec`cd ${enginePath}`
     print(chalk.blue('Installing pm2-logrotate...'))
-    await exec`cd ${enginePath} && sudo pm2 install pm2-logrotate`
+    // Install into pi's pm2 (no sudo), the same process list startEnginePM2 uses (idea#80).
+    await exec`cd ${enginePath} && pm2 install pm2-logrotate`
   } catch (e) {
     print(chalk.red('Error installing pm2'));
     console.error(e);

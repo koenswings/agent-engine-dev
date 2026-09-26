@@ -1,6 +1,6 @@
 # Design: Engine Run Architecture — User, Ownership, and Permissions
 
-**Status:** Proposed  
+**Status:** Approved (Engine part implemented in idea#80)  
 **Author:** Axle (Engine Developer)  
 **Date:** 2026-03-30  
 **Backlog item:** Engine — Review run architecture: which user? File ownership and permissions?
@@ -269,10 +269,10 @@ root-owned files until they are cleaned up.
 **Decision: Option 2B (native OpenClaw) selected.**
 
 ### Engine repo — Axle
-- [ ] Add `script/build_image_assets/10-engine.sudoers`
-- [ ] Add `copyAsset()` call in `installUdev()` in `Engine.ts` to deploy it to every Pi
-- [ ] Update `startEngine()` in `Engine.ts`: remove `sudo` from `pm2 start`/`pm2 save`; update `pm2 startup` call
-- [ ] Remove `sudo` from Nextcloud `docker exec` lines in `Instance.ts` (follow-up, lower priority)
+- [x] Add `script/build_image_assets/10-engine.sudoers` (idea#80; the draft rule in Change B above is superseded by the asset, which uses narrow `sd[a-z][12]` patterns and no `-t ext4`)
+- [x] Add `copyAsset()` call in `installUdev()` in `Engine.ts` to deploy it to every Pi (idea#80: `installEngineSudoers()`, validated with `visudo`, installed as `/etc/sudoers.d/10-engine`)
+- [x] Update `startEngine()` in `Engine.ts`: remove `sudo` from `pm2 start`/`pm2 save`; update `pm2 startup` call (`sync-engine`, `reset-engine` and `pm2-logrotate` follow in idea#80)
+- [x] Remove `sudo` from Nextcloud `docker exec` lines in `Instance.ts` (idea#80)
 
 ### Idea org repo — Atlas
 - [ ] Install OpenClaw natively on the Pi as `pi` (Option 2B — primary)
