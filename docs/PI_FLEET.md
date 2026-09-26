@@ -139,4 +139,23 @@ The script checks internet connectivity, joins the IDEA Tailnet (ephemeral), and
 
 **Fresh Pi provisioning:** `buildEngine` now calls `installTailscale()` automatically. Auth key is read from `TAILSCALE_AUTHKEY` env var or `/home/pi/openclaw/secrets/tailscale_authkey.txt` on wizardly-hugle.
 
+**How the auth key is handled (idea#115):** the key is never a command-line argument, so it can't be seen with `ps`, and it never goes into logs, shell history or Console History.
+- `installTailscale()` sends it over the stdin of `umask 077 && sudo tee /etc/tailscale/debug-authkey` (through ssh). The file is `0600 root:root`, in a `0700` folder.
+- `tailscale-debug-activate.sh` passes `--auth-key=file:/etc/tailscale/debug-authkey`, so `tailscale up` reads the key from the file.
+- Never put the key on a command line yourself, e.g. `tailscale up --authkey tskey-…` or `echo tskey-… | …`.
+
+**Use short-lived, single-use auth keys.** Create them in the Tailscale admin console (Settings → Keys → Generate auth key) with these settings:
+- **Reusable: off.** A single-use key is spent the first time a Pi joins, so a leaked copy can't add more machines.
+- **Ephemeral: on.** The Pi leaves the Tailnet on disconnect, which the activation script expects.
+- **Tags:** `tag:school-pi`.
+- **Expiry:** as short as practical. Days, not the 90-day maximum.
+
+Generate the key just before provisioning or just before a planned debug session, and revoke any key that is no longer needed.
+
+Because a single-use key only works once, a Pi needs a fresh key for each later debug session, and also when the stored key has expired. To replace the stored key without it appearing on any command line, put the new key in a local file only you can read (`chmod 600`), then run:
+```bash
+ssh pi@idea01.local 'sudo install -d -m 700 /etc/tailscale && umask 077 && sudo tee /etc/tailscale/debug-authkey > /dev/null' < ./new-authkey.txt
+shred -u ./new-authkey.txt
+```
+
 See `design/tailscale-remote-management.md` for full design and Phase 2 (Console UI toggle).
