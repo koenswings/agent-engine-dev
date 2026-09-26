@@ -52,6 +52,15 @@ let _handle: DocHandle<CommandLogStore> | null = null
 
 export const getCommandLogHandle = (): DocHandle<CommandLogStore> | null => _handle
 
+/**
+ * Point the module-level handle at an existing doc. createCommandLogStore sets
+ * it in production; tests use this to record into an in-memory doc without
+ * touching store-identity/.
+ */
+export const setCommandLogHandle = (handle: DocHandle<CommandLogStore> | null): void => {
+  _handle = handle
+}
+
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
 /**
@@ -142,6 +151,9 @@ export const flushLogs = (
 
 /**
  * Mark a trace as completed. Call after the command resolves or rejects.
+ * A trace already closed as 'error' stays 'error': a later 'ok' close (e.g. the
+ * wrapper of a command whose inner work recorded a failure, idea#109) does not
+ * hide the failure.
  */
 export const closeTrace = (
   handle: DocHandle<CommandLogStore>,
@@ -152,6 +164,7 @@ export const closeTrace = (
   handle.change(doc => {
     const trace = doc.traces[traceId]
     if (!trace) return
+    if (trace.status === 'error' && status === 'ok') return
     trace.status = status
     trace.completedAt = Date.now()
     if (errorMessage) trace.errorMessage = errorMessage

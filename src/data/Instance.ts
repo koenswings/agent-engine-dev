@@ -13,6 +13,8 @@ import { Docker } from "node-docker-api";
 import { createMeta } from '../data/Meta.js'
 import { config, disksRoot, skipImageLoad } from '../data/Config.js'
 import { DocHandle } from "@automerge/automerge-repo";
+import { CommandLogStore, LogEntry, getCommandLogHandle, addTrace, closeTrace, flushLogs } from './CommandLogStore.js'
+import { getActiveTrace, flushTrace } from '../utils/CommandLogger.js'
 
 // ── Step-progress helpers ─────────────────────────────────────────────────────
 
@@ -50,6 +52,147 @@ const clearStep = (storeHandle: DocHandle<Store>, instanceId: InstanceID) => {
     inst.totalSteps = null
     inst.stepLabel = null
     inst.metrics = null  // clear live metrics when instance is no longer running
+  })
+}
+
+// ── Start outcome → command log (idea#109) ───────────────────────────────────
+
+export const START_INSTANCE_COMMAND = 'startInstance'
+
+/**
+ * The traceId of the `startInstance` trace this start runs inside (the Console
+ * command, or the dock auto-start in Disk.ts), or null when there is none
+ * (post-copy, post-move, backup-post-start).
+ */
+const activeStartTraceId = (handle: DocHandle<CommandLogStore>): string | null => {
+  const active = getActiveTrace()
+  if (active && active.command === START_INSTANCE_COMMAND && handle.doc()?.traces[active.traceId]) {
+    return active.traceId
+  }
+  return null
+}
+
+/**
+ * Add a start warning (e.g. a service image that could not be loaded from the
+ * App Disk) to the start's History entry as a log line with level 'warn'.
+ * Inside a `startInstance` trace it is appended right away and true is
+ * returned. Otherwise false is returned and the caller keeps the entry for
+ * recordInstanceStartWarnings / recordInstanceStartFailure. Never throws.
+ */
+export const addInstanceStartWarning = async (
+  entry: LogEntry,
+  handle: DocHandle<CommandLogStore> | null = getCommandLogHandle(),
+): Promise<boolean> => {
+  if (!handle) return false
+  try {
+    const traceId = activeStartTraceId(handle)
+    if (!traceId) return false
+    await flushTrace(traceId)
+    flushLogs(handle, traceId, [entry])
+    return true
+  } catch (e) {
+    log(`Could not record a start warning in the command log: ${e}`)
+    return false
+  }
+}
+
+/** A standalone `startInstance` trace for a start that runs outside one. */
+const addStandaloneStartTrace = (
+  handle: DocHandle<CommandLogStore>,
+  instance: Instance,
+  disk: Disk,
+  cause: OperationCause,
+  pendingWarnings: LogEntry[],
+): string => {
+  const traceId = crypto.randomUUID()
+  addTrace(handle, {
+    traceId,
+    command: START_INSTANCE_COMMAND,
+    args: JSON.stringify({ instanceName: instance.name, instanceId: instance.id, diskId: disk.id, cause }),
+    startedAt: pendingWarnings[0]?.timestamp ?? Date.now(),
+    completedAt: null,
+    status: 'running',
+    errorMessage: null,
+  })
+  flushLogs(handle, traceId, pendingWarnings)
+  return traceId
+}
+
+/**
+ * Record a failed instance start in the command log, so it appears in the
+ * Console History panel of that instance (the same pattern as the failed
+ * `diskDetection` traces of idea#82; the Console matches traces by
+ * args.instanceId / args.instanceName).
+ *
+ * - Inside a `startInstance` trace: that trace is closed with status 'error'.
+ *   closeTrace never turns an 'error' trace back into 'ok', so the caller's
+ *   own closing call cannot hide the failure.
+ * - Otherwise: a completed `startInstance` trace with status 'error' is added,
+ *   with args { instanceName, instanceId, diskId, cause } and the pending
+ *   warnings as 'warn' log lines.
+ *
+ * Never throws: recording the failure must not break the caller.
+ */
+export const recordInstanceStartFailure = async (
+  instance: Instance,
+  disk: Disk,
+  cause: OperationCause,
+  message: string,
+  pendingWarnings: LogEntry[] = [],
+  handle: DocHandle<CommandLogStore> | null = getCommandLogHandle(),
+): Promise<void> => {
+  if (!handle) return
+  try {
+    let traceId = activeStartTraceId(handle)
+    if (traceId) {
+      await flushTrace(traceId)
+      flushLogs(handle, traceId, pendingWarnings)
+    } else {
+      traceId = addStandaloneStartTrace(handle, instance, disk, cause, pendingWarnings)
+    }
+    closeTrace(handle, traceId, 'error', message)
+  } catch (e) {
+    log(`Could not record the failed start of instance '${instance.id}' in the command log: ${e}`)
+  }
+}
+
+/**
+ * Record the warnings of a start that succeeded outside a `startInstance`
+ * trace: a completed `startInstance` trace with status 'ok' whose logs hold the
+ * warnings. Does nothing without warnings. Never throws.
+ */
+export const recordInstanceStartWarnings = async (
+  instance: Instance,
+  disk: Disk,
+  cause: OperationCause,
+  pendingWarnings: LogEntry[],
+  handle: DocHandle<CommandLogStore> | null = getCommandLogHandle(),
+): Promise<void> => {
+  if (!handle || pendingWarnings.length === 0) return
+  try {
+    let traceId = activeStartTraceId(handle)
+    if (traceId) {
+      await flushTrace(traceId)
+      flushLogs(handle, traceId, pendingWarnings)
+      return
+    }
+    traceId = addStandaloneStartTrace(handle, instance, disk, cause, pendingWarnings)
+    closeTrace(handle, traceId, 'ok')
+  } catch (e) {
+    log(`Could not record the start warnings of instance '${instance.id}' in the command log: ${e}`)
+  }
+}
+
+/**
+ * Set an instance to Error with a diagnosis in statusCondition.
+ */
+export const markInstanceError = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, e: unknown): Promise<void> => {
+  const condition = await diagnoseInstance(instance, disk, e)
+  storeHandle.change(doc => {
+    const inst = doc.instanceDB[instance.id]
+    if (!inst) return
+    inst.status = 'Error' as Status
+    inst.statusCondition = condition
   })
 }
 
@@ -491,6 +634,15 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     inst.status = 'Starting' as Status
   })
 
+  // Start warnings not yet in a History entry (the start runs outside a
+  // startInstance trace); recorded when the start ends.
+  const pendingWarnings: LogEntry[] = []
+  const startWarning = async (message: string): Promise<void> => {
+    log(`Warning while starting instance '${instance.id}': ${message}`)
+    const entry: LogEntry = { level: 'warn', message, timestamp: Date.now() }
+    if (!(await addInstanceStartWarning(entry))) pendingWarnings.push(entry)
+  }
+
   try {
 
     const mountRoot = await diskMountRoot(disk)
@@ -634,10 +786,24 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     if (!skipImageLoad()) {
       // Load images from pre-saved tar files on the disk (no internet required).
       // Always on in production; tests turn it on with settings.skipImageLoad = false (idea#81).
+      // A missing tar or a failed load does not stop the start (idea#109 follow-up):
+      // it becomes a warning in the start's History entry, and compose create/up
+      // pull the image if it is not local and the Engine has internet. The start
+      // fails only if create or up fails.
       for (const serviceName in services) {
         const serviceImage = services[serviceName].image
-        log(`Loading the service image ${serviceImage} from the saved tar file`)
-        await $`docker image load < ${serviceImageTarPath(mountRoot, serviceImage)}`
+        const tarPath = serviceImageTarPath(mountRoot, serviceImage)
+        if (!fs.existsSync(tarPath)) {
+          await startWarning(`Service image ${serviceImage}: saved image ${tarPath} not found; continuing (Docker pulls the image if it is not local and the Engine has internet)`)
+          continue
+        }
+        log(`Loading the service image ${serviceImage} from ${tarPath}`)
+        try {
+          await $`docker image load < ${tarPath}`
+        } catch (e) {
+          const reason = (e instanceof Error ? e.message : String(e)).trim().split('\n')[0]
+          await startWarning(`Service image ${serviceImage}: loading ${tarPath} failed (${reason}); continuing (Docker pulls the image if it is not local and the Engine has internet)`)
+        }
       }
     } else {
       // Tests by default: fixtures have no tar files — Docker pulls the image at create time if not cached
@@ -661,23 +827,22 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
       status: 'Done',
       completedAt: Date.now() as Timestamp,
     })
+    await recordInstanceStartWarnings(instance, disk, cause, pendingWarnings)
   }
 
   catch (e) {
     const errMsg = e instanceof Error ? e.message : String(e)
     print(chalk.red(`Error starting app instance '${instance.id}': ${errMsg}`))
-    const condition = await diagnoseInstance(instance, disk, e)
-    storeHandle.change(doc => {
-      const inst = doc.instanceDB[instance.id]
-      inst.status = 'Error' as Status
-      inst.statusCondition = condition
-    })
+    // Any failure (port, tar load, compose create, compose up) ends in Error,
+    // never Running, and is recorded in the command log (idea#109).
+    await markInstanceError(storeHandle, instance, disk, e)
     clearStep(storeHandle, instance.id)
     updateOperation(storeHandle, startOpId, {
       status: 'Failed',
       error: errMsg,
       completedAt: Date.now() as Timestamp,
     })
+    await recordInstanceStartFailure(instance, disk, cause, errMsg, pendingWarnings)
   }
 }
 
@@ -807,181 +972,149 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 //   }
 // }
 
-export const createInstanceContainers = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk) => {
+/**
+ * Create the containers of an instance (`docker compose create`) and set it to
+ * Pauzed. Errors propagate to the caller (idea#109): startInstance turns them
+ * into Error status and a failed command-log trace.
+ */
+export const createInstanceContainers = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk): Promise<void> => {
   const store: Store = storeHandle.doc()
   const mountRoot = await diskMountRoot(disk)
-  try {
-    log(`Creating the containers for the services of the app instance`)
+  log(`Creating the containers for the services of the app instance`)
 
-    // App-specific pre-processing commands
-    const app = store.appDB[instance.instanceOf]
-    if (app && app.name === 'nextcloud') {
+  // App-specific pre-processing commands
+  const app = store.appDB[instance.instanceOf]
+  if (app && app.name === 'nextcloud') {
 
-      // Pass the hostname to the compose file via .env
-      const localEngine = getLocalEngine(store)
-      const hostname = localEngine.hostname
-      if (hostname) {
-        await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'hostname', hostname)
-      }
-
-      // Pass the ip address to the compose file via .env
-      const interfaceData = os.networkInterfaces()
-      const ip = interfaceData["eth0"]?.find((iface) => iface.family === "IPv4")?.address
-      if (ip) {
-        log(`Found IP address ${ip} for instance ${instance.id}`)
-        await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'ip', ip)
-      } else {
-        log(chalk.red(`No IP address found for instance ${instance.id}`))
-      }
-      // const connections = network.connections
-      // if (connections && connections["eth0"]) {
-      //   const ip = connections["eth0"].ip4
-      //   // Write the ip address to the .env file
-      //   // await $`echo "ip=${ip}" >> /disks/${disk.device}/instances/${instance.id}/.env`
-      //   await addOrUpdateEnvVariable(`/disks/${disk.device}/instances/${instance.id}/.env`, 'ip', ip)
-      // }
-
+    // Pass the hostname to the compose file via .env
+    const localEngine = getLocalEngine(store)
+    const hostname = localEngine.hostname
+    if (hostname) {
+      await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'hostname', hostname)
     }
 
-    log(`Creating containers of app instance '${instance.id}' on disk ${disk.id} of engine ${localEngineId}.`)
+    // Pass the ip address to the compose file via .env
+    const interfaceData = os.networkInterfaces()
+    const ip = interfaceData["eth0"]?.find((iface) => iface.family === "IPv4")?.address
+    if (ip) {
+      log(`Found IP address ${ip} for instance ${instance.id}`)
+      await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'ip', ip)
+    } else {
+      log(chalk.red(`No IP address found for instance ${instance.id}`))
+    }
+  }
+
+  log(`Creating containers of app instance '${instance.id}' on disk ${disk.id} of engine ${localEngineId}.`)
+  try {
     await $`cd ${mountRoot}/instances/${instance.id} && docker compose create`
-    storeHandle.change(doc => {
-      const inst = doc.instanceDB[instance.id]
-      inst.status = 'Pauzed' as Status
-    })
   } catch (e) {
     print(chalk.red(`Error creating the containers of app instance ${instance.id}`))
-    console.error(e)
-    const condition = await diagnoseInstance(instance, disk, e)
-    storeHandle.change(doc => {
-      const inst = doc.instanceDB[instance.id]
-      inst.status = 'Error' as Status
-      inst.statusCondition = condition
-    })
+    throw e
   }
+  storeHandle.change(doc => {
+    const inst = doc.instanceDB[instance.id]
+    inst.status = 'Pauzed' as Status
+  })
 }
 
 
 
+/**
+ * Start the containers of an instance (`docker compose up -d`) and set it to
+ * Running. Running is written only after `compose up` has succeeded (idea#109):
+ * an instance never shows Running while its containers failed to start.
+ * Errors from `compose up` propagate to the caller, which sets Error
+ * (startInstance also records a failed command-log trace).
+ */
 export const runInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk): Promise<void> => {
   const store: Store = storeHandle.doc()
-  try {
+  const mountRoot = await diskMountRoot(disk)
 
-    log(`Running instance '${instance.id}' on disk ${disk.id} of engine '${localEngineId}'.`)
+  log(`Running instance '${instance.id}' on disk ${disk.id} of engine '${localEngineId}'.`)
 
-    // Extract the port number from the .env file containing "port=<portNumber>"
-    // const envContent = (await $`cat /disks/${disk.device}/instances/${instance.id}/.env`).stdout
-    // Look for a line with port=<portNumber> and extract the portNumber
-    // const ports = envContent.match(/port=(\d+)/g)
-    // Split using '=' and take the second element
-    // Also remove the newline at the end
-    //const port = envContent.split('=')[1].slice(0, -1)
-    const port = await readEnvVariable(`${await diskMountRoot(disk)}/instances/${instance.id}/.env`, 'port')
-    print(`Ports: ${deepPrint(port)}`)
-    if (port) {
-      const parsedPort = parseInt(port)
-      // If parsedPort is not NaN, assign it to the instance port
-      if (!isNaN(parsedPort)) {
-        log(`Port number extracted from .env file for instance ${instance.id}: ${parsedPort}`)
-        storeHandle.change(doc => {
-          const inst = doc.instanceDB[instance.id]
-          inst.port = parsedPort as PortNumber
-        })
-      } else {
-        log(chalk.red(`Error parsing port number from .env file for instance ${instance.id}. Got ${parsedPort} from ${port}`))
-      }
+  const port = await readEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'port')
+  print(`Ports: ${deepPrint(port)}`)
+  if (port) {
+    const parsedPort = parseInt(port)
+    // If parsedPort is not NaN, assign it to the instance port
+    if (!isNaN(parsedPort)) {
+      log(`Port number extracted from .env file for instance ${instance.id}: ${parsedPort}`)
+      storeHandle.change(doc => {
+        const inst = doc.instanceDB[instance.id]
+        inst.port = parsedPort as PortNumber
+      })
     } else {
-      log(chalk.red(`Error extracting port number from .env file for instance ${instance.id}`))
+      log(chalk.red(`Error parsing port number from .env file for instance ${instance.id}. Got ${parsedPort} from ${port}`))
     }
+  } else {
+    log(chalk.red(`Error extracting port number from .env file for instance ${instance.id}`))
+  }
 
-    // Set status to Running before starting the containers.
-    // This ensures the CRDT reflects Running immediately so observers can
-    // observe it during the docker compose up / Recreate cycle rather than
-    // only after it completes. On failure the catch block sets Error.
-    //
-    // Guard: verify the disk is still docked AND the instance is still in a
-    // startable state before writing Running. A stale startInstance from a
-    // previous run may complete after the disk has been undocked or the instance
-    // has been moved to Undocked by the test teardown. In that case, skip.
+  // Guard: the disk must still be docked and the instance not Undocked. A stale
+  // startInstance from a previous run may reach this point after the disk has
+  // been undocked (or the instance moved to Undocked by a test teardown).
+  const stillStartable = (when: string): boolean => {
     const snap = storeHandle.doc()
     const currentDisk = snap?.diskDB[disk.id as any]
     const currentInst = snap?.instanceDB[instance.id as any]
     if (!currentDisk || !currentDisk.dockedTo) {
-      log(`Disk ${disk.id} is no longer docked — skipping Running status update for ${instance.id}`)
-      return
+      log(`Disk ${disk.id} is no longer docked ${when} — skipping Running status update for ${instance.id}`)
+      return false
     }
     if (currentInst?.status === 'Undocked') {
-      log(`Instance ${instance.id} is already Undocked — skipping Running status update`)
-      return
+      log(`Instance ${instance.id} is already Undocked ${when} — skipping Running status update`)
+      return false
     }
-    storeHandle.change(doc => {
-      const inst = doc.instanceDB[instance.id]
-      inst.lastStarted = new Date().getTime() as Timestamp
-      inst.status = 'Running' as Status
-      inst.statusCondition = null  // clear any previous error diagnosis
-    })
+    return true
+  }
+  if (!stillStartable('before compose up')) return
 
-    // Compose up the app
-    await $`cd ${await diskMountRoot(disk)}/instances/${instance.id} && docker compose up -d`
-    // Modify the dockerMetrics of the instance
-    // instance.dockerMetrics = {
-    //   memory: os.totalmem().toString(),
-    //   cpu: os.loadavg().toString(),
-    //   network: "",
-    //   disk: ""
-    // }
-
-    // Modify the dockerLogs of the instance
-    // instance.dockerLogs = { logs: await $`docker logs ${instanceName}` }  // This is not correct, we need to use the right container name
-    // Modify the dockerEvents of the instance
-    // instance.dockerEvents = { events: await $`docker events ${instanceName}` }  // This is not correct, we need to use the right container name
-
-    print(chalk.green(`App ${instance.id} running`))
-    clearStep(storeHandle, instance.id)
-
-    // App-specific post-processing commands
-    // If the app on which the instance is based is nextcloud, 
-    //    find the IP address of the server and store it in IPADDRESS
-    //    issue the following command: runuser --user www-data -- php occ config:app:set --value=http://<${PADDRESS}:9980 richdocuments wopi_url
-    const app = store.appDB[instance.instanceOf]
-    const ip = await readEnvVariable(`${await diskMountRoot(disk)}/instances/${instance.id}/.env`, 'ip')
-    if (app && app.name === 'nextcloud') {
-      if (ip) {
-        try {
-          // For unclear reasons, the occ command sometimes does not work, preventing the start of the container
-          // So we catch the error so that the container can still start
-          log(`Configuring nextcloud office`)
-          log('Sleeping for 20 seconds to allow the app to start')
-          await sleep(20000)
-          log(`Running the occ command to use the Collabora server at ${ip}:9980`)
-          await $`docker exec ${instance.id}-nextcloud-app-1 runuser --user www-data -- php occ config:app:set --value=http://${ip}:9980 richdocuments wopi_url`
-          log('Running the occ commands to set the trusted domains')
-          await $`docker exec ${instance.id}-nextcloud-app-1 runuser --user www-data -- php occ config:system:set trusted_domains 0 --value=*.local:*`
-          await $`docker exec ${instance.id}-nextcloud-app-1 runuser --user www-data -- php occ config:system:set trusted_domains 2 --value=192.168.0.*:*`
-          log(`occ commands executed`)
-        } catch (e) {
-          log(chalk.red(`Error configuring nextcloud office to use the Collabora server at ${ip}:9980`))
-          console.error(e)
-          const condition = await diagnoseInstance(instance, disk, e)
-          storeHandle.change(doc => {
-            const inst = doc.instanceDB[instance.id]
-            inst.status = 'Error' as Status
-            inst.statusCondition = condition
-          })
-        }
-      }
-    }
-
-
+  // Compose up the app. A failure throws and the instance never becomes Running.
+  try {
+    await $`cd ${mountRoot}/instances/${instance.id} && docker compose up -d`
   } catch (e) {
     print(chalk.red(`Error running app instance ${instance.id}`))
-    console.error(e)
-    const condition = await diagnoseInstance(instance, disk, e)
-    storeHandle.change(doc => {
-      const inst = doc.instanceDB[instance.id]
-      inst.status = 'Error' as Status
-      inst.statusCondition = condition
-    })
+    throw e
+  }
+
+  // The disk may have been undocked while compose up ran.
+  if (!stillStartable('after compose up')) return
+  storeHandle.change(doc => {
+    const inst = doc.instanceDB[instance.id]
+    inst.lastStarted = new Date().getTime() as Timestamp
+    inst.status = 'Running' as Status
+    inst.statusCondition = null  // clear any previous error diagnosis
+  })
+
+  print(chalk.green(`App ${instance.id} running`))
+  clearStep(storeHandle, instance.id)
+
+  // App-specific post-processing commands
+  // If the app on which the instance is based is nextcloud, 
+  //    find the IP address of the server and store it in IPADDRESS
+  //    issue the following command: runuser --user www-data -- php occ config:app:set --value=http://<${PADDRESS}:9980 richdocuments wopi_url
+  const app = store.appDB[instance.instanceOf]
+  const ip = await readEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'ip')
+  if (app && app.name === 'nextcloud') {
+    if (ip) {
+      try {
+        // For unclear reasons, the occ command sometimes does not work, preventing the start of the container
+        // So we catch the error so that the container can still start
+        log(`Configuring nextcloud office`)
+        log('Sleeping for 20 seconds to allow the app to start')
+        await sleep(20000)
+        log(`Running the occ command to use the Collabora server at ${ip}:9980`)
+        await $`docker exec ${instance.id}-nextcloud-app-1 runuser --user www-data -- php occ config:app:set --value=http://${ip}:9980 richdocuments wopi_url`
+        log('Running the occ commands to set the trusted domains')
+        await $`docker exec ${instance.id}-nextcloud-app-1 runuser --user www-data -- php occ config:system:set trusted_domains 0 --value=*.local:*`
+        await $`docker exec ${instance.id}-nextcloud-app-1 runuser --user www-data -- php occ config:system:set trusted_domains 2 --value=192.168.0.*:*`
+        log(`occ commands executed`)
+      } catch (e) {
+        log(chalk.red(`Error configuring nextcloud office to use the Collabora server at ${ip}:9980`))
+        console.error(e)
+        await markInstanceError(storeHandle, instance, disk, e)
+      }
+    }
   }
 }
 

@@ -65,7 +65,8 @@ live Engine (idea#105):
 - `test/automated/service-image-tar-load.test.ts` (idea#81) runs the real offline
   image load: it tags `traefik/whoami` as `idea-test/tarload:<nonce>`, `docker save`s
   it into `services/` of a temp fixture disk, removes the tag, docks with
-  `skipImageLoad = false` and `pull_policy: never`. It needs `traefik/whoami` cached
+  `skipImageLoad = false` and `pull_policy: never` (a missing tar is only a History
+  warning, so its no-tar case ends in Error from `compose create`, idea#109). It needs `traefik/whoami` cached
   locally (it pulls it once in setup if missing) and only removes its own nonce tags.
 - Pre-flight (`script/test-preflight.sh`) refuses to run (exit 1) when it finds a live
   Engine: pm2 `engine` online (or a `node …/dist/src/index.js` process), running
@@ -96,7 +97,8 @@ settings:
 `testMode`: testMode only skips the mount, the offline image load follows
 `skipImageLoad()` in `src/data/Config.ts`. Production leaves both unset/false, so
 Engines load every service image from the App Disk's `services/` folder
-(`serviceImageTarPath()`: `/` in the image name → `_`).
+(`serviceImageTarPath()`: `/` in the image name → `_`). A missing tar or failed load
+is a warning, not a failure: compose then pulls the image if the Pi has internet (idea#109).
 
 ## Quality rules (every PR, no exceptions)
 

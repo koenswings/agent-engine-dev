@@ -17,8 +17,11 @@
  *      runs and answers HTTP. The compose file sets `pull_policy: never`, so
  *      Docker never tries to fetch anything.
  *
- * A second disk whose tar is missing checks the negative case: the instance
- * must end in Error and the image must not appear (no network fallback).
+ * A second disk whose tar is missing checks the negative case. A missing tar
+ * alone does not stop a start (production may pull, idea#109): it is a 'warn'
+ * line in the start's History entry. Here the fixture's `pull_policy: never`
+ * makes `compose create` fail, so the instance ends in Error from the create
+ * step, and the image must not appear from anywhere.
  *
  * Cleanup removes only this run's nonce-tagged images and its own labelled
  * containers — never any other image.
@@ -31,7 +34,9 @@ import { $, fs, path, YAML } from 'zx'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Store } from '../../src/data/Store.js'
 import { config, skipImageLoad } from '../../src/data/Config.js'
-import { serviceImageTarPath } from '../../src/data/Instance.js'
+import { serviceImageTarPath, START_INSTANCE_COMMAND } from '../../src/data/Instance.js'
+import { Repo } from '@automerge/automerge-repo'
+import { CommandLogStore, CommandTrace, setCommandLogHandle } from '../../src/data/CommandLogStore.js'
 import { enableUsbDeviceMonitor } from '../../src/monitors/usbDeviceMonitor.js'
 import {
     createTestStore,
@@ -39,7 +44,9 @@ import {
     triggerUndock,
     cleanupDisk,
     cleanupContainers,
+    cleanupNetworks,
     waitForStatus,
+    waitFor,
     waitForHttp,
     uniqueTestDevice,
     TEST_CONTAINER_LABEL,
@@ -132,6 +139,7 @@ const buildFixtureDisk = async (c: TarLoadCase, saveTar: boolean): Promise<void>
 const cleanupCase = async (c: TarLoadCase): Promise<void> => {
     await triggerUndock(c.device).catch(() => {})
     await cleanupContainers(c.instanceId)
+    await cleanupNetworks(c.instanceId)
     await cleanupDisk(c.device).catch(() => {})
     if (c.fixtureDir) await fs.remove(c.fixtureDir).catch(() => {})
     // Only ever remove this run's own nonce tag (untags; the base image stays).
@@ -170,6 +178,13 @@ describe('Service images load from services/*.tar on the App Disk (idea#81, real
     const savedSkip = config.settings.skipImageLoad
     const good = newCase()
     const missing = newCase()
+    const logHandle = new Repo({ network: [], storage: undefined })
+        .create<CommandLogStore>({ traces: {}, recentTraceIds: [] })
+    const startTracesOf = (instanceName: string): CommandTrace[] =>
+        logHandle.doc()!.recentTraceIds.map(id => logHandle.doc()!.traces[id]).filter(t => {
+            if (t.command !== START_INSTANCE_COMMAND) return false
+            try { return JSON.parse(t.args).instanceName === instanceName } catch { return false }
+        })
 
     beforeAll(async () => {
         // Setup only: the base image must be local so we can tag it. The Engine
@@ -188,6 +203,7 @@ describe('Service images load from services/*.tar on the App Disk (idea#81, real
 
         // Run the real tar-load path; testMode stays on (mount skipped for fixtures).
         config.settings.skipImageLoad = false
+        setCommandLogHandle(logHandle)
         const ctx = await createTestStore()
         storeHandle = ctx.storeHandle
         await enableUsbDeviceMonitor(storeHandle)
@@ -197,6 +213,7 @@ describe('Service images load from services/*.tar on the App Disk (idea#81, real
         await cleanupCase(good)
         await cleanupCase(missing)
         config.settings.skipImageLoad = savedSkip
+        setCommandLogHandle(null)
     }, 60_000)
 
     it('the fixture tar uses the Engine file name', () => {
@@ -212,8 +229,8 @@ describe('Service images load from services/*.tar on the App Disk (idea#81, real
 
         expect(await imageExists(good.image), `${good.image} should be loaded from the tar`).to.be.true
 
-        // Running is written just before `docker compose up`; confirm the container really runs.
-        expect(await waitForRunningContainer(good.instanceId, 30_000), 'the labelled container should be running').to.be.true
+        // Running is written only after `docker compose up` succeeded (idea#109); the container must run.
+        expect(await waitForRunningContainer(good.instanceId, 5_000), 'the labelled container should be running at Running').to.be.true
 
         const instance = storeHandle.doc()!.instanceDB[good.instanceId as any]
         expect(instance.serviceImages).to.include(good.image)
@@ -221,16 +238,30 @@ describe('Service images load from services/*.tar on the App Disk (idea#81, real
         const healthy = await waitForHttp(`http://${TEST_HOST}:${instance.port}/`, 30_000)
         expect(healthy, 'container started from the loaded image should answer HTTP').to.be.true
         expect(storeHandle.doc()!.instanceDB[good.instanceId as any].status).to.equal('Running')
+        expect(await waitFor(storeHandle, () => startTracesOf(`tarload-${good.nonce}`).some(x => x.status === 'ok'), 10_000)).to.be.true
+        const t = startTracesOf(`tarload-${good.nonce}`)
+        expect(t.map(x => x.status)).to.deep.equal(['ok'])
+        expect(t[0].logs.filter(l => l.level === 'warn'), 'loaded from the tar: no warning').to.deep.equal([])
     })
 
-    it('fails with Error (no network fallback) when the tar is missing', { timeout: 120_000 }, async () => {
+    it('missing tar: a History warning, then Error from compose create (pull_policy: never)', { timeout: 120_000 }, async () => {
         await dockFixture(missing.fixtureDir, missing.device)
 
         const errored = await waitForStatus(storeHandle, missing.instanceId, 'Error', 90_000)
-        expect(errored, 'instance without its tar should end in Error').to.be.true
+        expect(errored, 'instance without its tar (and no pull allowed) should end in Error').to.be.true
 
         const condition = storeHandle.doc()!.instanceDB[missing.instanceId as any].statusCondition ?? ''
-        expect(condition, 'the error should point at the missing tar').to.include('idea-test_tarload')
+        // compose create (pull_policy: never) fails with "No such image: <image>"; the image load is not the cause.
+        expect(condition, 'the error comes from compose create, not from the image load').to.include(`No such image: ${missing.image}`)
+        expect(condition).to.not.include('.tar')
+
+        expect(await waitFor(storeHandle, () => startTracesOf(`tarload-${missing.nonce}`).some(x => x.status === 'error'), 10_000)).to.be.true
+        const t = startTracesOf(`tarload-${missing.nonce}`)
+        expect(t.map(x => x.status), 'one failed startInstance entry').to.deep.equal(['error'])
+        const warnings = t[0].logs.filter(l => l.level === 'warn').map(l => l.message)
+        expect(warnings, 'the missing tar is a warning in that entry').to.have.length(1)
+        expect(warnings[0]).to.include(`idea-test_tarload:${missing.nonce}.tar`)
+        expect(warnings[0]).to.include('not found')
         expect(await imageExists(missing.image), 'the image must not appear from anywhere else').to.be.false
         const ps = await $`docker ps -aq --filter label=${TEST_CONTAINER_LABEL} --filter name=${missing.instanceId}`
         expect(ps.stdout.trim(), 'no container should be created').to.equal('')

@@ -1,7 +1,7 @@
 import { CommandDefinition } from "./CommandDefinition.js";
 import { Store, getApps, getDisks, getDisk, getRunningEngines, getInstances, getEngine, findDiskByName, findInstanceByName, getLocalEngine, createClientStore } from "./Store.js";
 import { deepPrint, log, print } from "../utils/utils.js";
-import { buildInstance, startInstance, runInstance, stopInstance } from "./Instance.js";
+import { buildInstance, startInstance, runInstance, stopInstance, markInstanceError } from "./Instance.js";
 import { buildEngine, syncEngine, clearKnownHost, rebootEngine } from "./Engine.js";
 import { AppName, Command, DiskID, DiskName, EngineID, Hostname, InstanceName, Version } from "./CommonTypes.js";
 import { localEngineId } from "./Engine.js";
@@ -244,7 +244,14 @@ const runInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instance
         print(chalk.red(`Disk ${diskName} not found`))
         return
     }
-    runInstance(storeHandle, instance, disk)
+    // runInstance propagates compose up failures (idea#109): mark the instance
+    // Error and rethrow, so handleCommand closes this command's trace as failed.
+    try {
+        await runInstance(storeHandle, instance, disk)
+    } catch (e) {
+        await markInstanceError(storeHandle, instance, disk, e)
+        throw e
+    }
 }
 
 const stopInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName) => {
