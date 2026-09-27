@@ -15,7 +15,7 @@ This document provides a reference for the main provisioning and utility scripts
 ### `build-engine` (`script/build-engine.ts`)
 
 -   **Purpose:** The primary, all-in-one script for provisioning a full Engine device. It runs via the `./build-engine` wrapper in the repo root (which calls `tsx script/build-engine.ts`). It has three modes:
-    1.  **Remote Mode** (`--machine` given): First syncs the code to the Pi with `sync-engine` (asks for a GitHub token if `script/build_image_assets/gh_token.txt` is missing), then configures the Pi over SSH.
+    1.  **Remote Mode** (`--machine` given): First syncs the code to the Pi with `sync-engine`, then configures the Pi over SSH. No GitHub token is needed or asked for: the Engine repo is public (idea#116).
     2.  **Local Mode** (no `--machine`): Configures the machine it is running on (used by `install.sh`).
     3.  **Personalize Mode** (`--personalize`): Only sets the hostname and rewrites `/META.yaml` (disk id from the disk serial via `hdparm`, or a new random id if there is none; hostname; version; timestamps). It does not build the Engine and asks no questions. `script/build_image_assets/boot.sh` runs it on the first boot of a freshly flashed master image (when `/boot/MASTER` exists). On every boot, `boot.sh` also reinstalls the udev rule `/etc/udev/rules.d/90-docking.rules` from `script/build_image_assets/90-docking.rules` when it is missing or differs, then reloads and re-triggers udev (idea#82; output in `/home/pi/boot.out`).
 -   **Usage (Remote):** `./build-engine --machine <pi-address> [options]`
@@ -64,7 +64,7 @@ This document provides a reference for the main provisioning and utility scripts
 
 -   **Purpose:** A utility script to synchronize code changes from a Development System to a running Runtime System (a Raspberry Pi).
 -   **Usage:** `./script/sync-engine --machine <pi-address>`
--   **Details:** This script uses `rsync` to efficiently copy only the changed files, making it ideal for rapid development and testing cycles. It connects as `pi`, builds with a plain `pnpm build` and stops/starts the Engine with pi's pm2 (never `sudo pm2`, which would target root's process list).
+-   **Details:** This script uses `rsync` to efficiently copy only the changed files, making it ideal for rapid development and testing cycles. It never copies a `gh_token.txt` (`--exclude='gh_token.txt'`, idea#116), so an old local token file cannot reach a Pi. It connects as `pi`, builds with a plain `pnpm build` and stops/starts the Engine with pi's pm2 (never `sudo pm2`, which would target root's process list).
 
 ---
 

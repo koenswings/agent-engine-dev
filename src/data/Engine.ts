@@ -1,4 +1,4 @@
-import { $, chalk, os, question, YAML, fs, path, sleep } from 'zx';
+import { $, chalk, os, YAML, fs, path, sleep } from 'zx';
 
 $.verbose = false;
 import { deepPrint, log, uuid, print } from '../utils/utils.js';
@@ -182,10 +182,6 @@ export const inspectEngine = (store: Store, engine: Engine) => {
 export const syncEngine = async (user: string, machine: string) => {
   print(chalk.blue('Syncing the engine to the remote machine'))
   try {
-    if (!fs.existsSync('./script/build_image_assets/gh_token.txt')) {
-      const githubToken = await question('Enter the GitHub token: ');
-      fs.writeFileSync('./script/build_image_assets/gh_token.txt', githubToken);
-    }
     const targetName = machine.endsWith('.local') ? machine.slice(0, -6) : machine;
     await $`./sync-engine --user ${user} ${targetName}`;
   } catch (e) {
@@ -457,22 +453,6 @@ export const installGh = async (exec: any) => {
     process.exit(1);
   }
   print(chalk.green('gh installed'));
-}
-
-export const cloneRepo = async (exec: any, enginePath: string, engineParentPath: string, githubToken: string) => {
-  print(chalk.blue('Cloning the engine repo...'));
-  try {
-    await exec`git config --global user.email "koen@swings.be"`;
-    await exec`git config --global user.name "Koen Swings"`;
-    await exec`gh auth login --with-token < ${enginePath}/script/build_image_assets/gh_token.txt`;
-    await exec`if [ -d ${enginePath} ]; then sudo rm -rf ${enginePath}; fi`;
-    await exec`cd ${engineParentPath} && git clone https://koenswings:${githubToken}@github.com/koenswings/engine.git`;
-  } catch (e) {
-    print(chalk.red('Error cloning the engine repo'));
-    console.error(e);
-    process.exit(1);
-  }
-  print(chalk.green('Engine repo cloned'));
 }
 
 export const installUdev = async (exec: any, enginePath: string) => {
