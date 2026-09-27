@@ -5,13 +5,9 @@ import { EngineID, Hostname, IPAddress, InterfaceName, PortNumber, Timestamp } f
 import { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
 import { config } from './Config.js';
 import { Store, findRunningEngineByHostname } from "./Store.js";
-import { fs } from "zx";
+import { readStoreDocId } from "./StoreIdentity.js";
 
 const settings = config.settings
-const STORE_IDENTITY_PATH = "./"+config.settings.storeIdentityFolder
-const STORE_URL_PATH = STORE_IDENTITY_PATH + "/store-url.txt"
-const storeDocUrlStr = fs.readFileSync(STORE_URL_PATH, 'utf-8');
-const storeDocId = storeDocUrlStr.replace('automerge:', '') as DocumentId;
 
 
 // **********
@@ -72,7 +68,8 @@ export const manageDiscoveredPeers = async (repo: Repo, discoveredPeers: Map<IPA
       if (network.connections[connectionKey]) {
           network.connections[connectionKey].missedDiscoveryCount = 0;
       } else {
-          await connectEngine(repo, address, peerInfo.hostname, peerInfo.engineId, storeDocId);
+          // Read when needed, not at module load: startup writes a missing store-url.txt first (idea#120).
+          await connectEngine(repo, address, peerInfo.hostname, peerInfo.engineId, readStoreDocId());
       }
   }
 
