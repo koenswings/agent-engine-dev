@@ -144,15 +144,19 @@ The script checks internet connectivity, joins the IDEA Tailnet (ephemeral), and
 - `tailscale-debug-activate.sh` passes `--auth-key=file:/etc/tailscale/debug-authkey`, so `tailscale up` reads the key from the file.
 - Never put the key on a command line yourself, e.g. `tailscale up --authkey tskey-…` or `echo tskey-… | …`.
 
-**Use short-lived, single-use auth keys.** Create them in the Tailscale admin console (Settings → Keys → Generate auth key) with these settings:
-- **Reusable: off.** A single-use key is spent the first time a Pi joins, so a leaked copy can't add more machines.
-- **Ephemeral: on.** The Pi leaves the Tailnet on disconnect, which the activation script expects.
-- **Tags:** `tag:school-pi`.
-- **Expiry:** as short as practical. Days, not the 90-day maximum.
+**Field Pis use one reusable, ephemeral fleet auth key (idea#117).** Every field Pi stores the same key at `/etc/tailscale/debug-authkey` (`0600 root:root`, never on a command line, see above).
+- **Why:** during an intervention, someone at the school runs `tailscale-debug-activate.sh`, and the Pi joins the tailnet with that key.
+- **Reusable:** the key has to work for every session on every field Pi. We usually can't reach a Pi in the field to give it a new key, so a single-use key would be spent after its first session.
+- **Ephemeral:** the Pi drops off the tailnet when the session ends. That way it doesn't keep using a device slot, which keeps the licence count low.
+- **The current key:** "idea fleet authentication", created in the Tailscale admin console (Settings → Keys). It expires 2026-12-20. Koen is keeping it, so don't revoke it.
 
-Generate the key just before provisioning or just before a planned debug session, and revoke any key that is no longer needed.
+The permanent fleet Pis (idea02, idea03) didn't join with this key and aren't ephemeral.
 
-Because a single-use key only works once, a Pi needs a fresh key for each later debug session, and also when the stored key has expired. To replace the stored key without it appearing on any command line, put the new key in a local file only you can read (`chmod 600`), then run:
+**Refresh the key before it expires.** Tailscale auth keys expire after at most 90 days. Once the stored key has expired, a field Pi can no longer join the tailnet, so every Pi's stored key must be replaced with a new fleet key before that happens. How the refresh works in the field is still open in [idea#117](https://github.com/koenswings/idea/issues/117). That issue also covers the key's tag and the tailnet access rules. Options for the refresh include refreshing during site visits or pushing a new key while a Pi is connected.
+
+To replace the stored key on a Pi you can reach, without the key appearing on any command line:
+1. Put the new key in a local file only you can read (`chmod 600`).
+2. Run:
 ```bash
 ssh pi@idea01.local 'sudo install -d -m 700 /etc/tailscale && umask 077 && sudo tee /etc/tailscale/debug-authkey > /dev/null' < ./new-authkey.txt
 shred -u ./new-authkey.txt
