@@ -11,7 +11,8 @@ import { enableHttpMonitor } from './monitors/httpMonitor.js'
 import { DocumentId, Repo, DocHandle } from '@automerge/automerge-repo'
 import { startAutomergeServer } from './repo.js'
 import { enableMulticastDNSEngineMonitor } from './monitors/mdnsMonitor.js'
-import { createServerStore, initialiseServerStore } from './data/Store.js'
+import { createServerStore } from './data/Store.js'
+import { prepareStoreIdentity, storeIdentityPaths } from './data/StoreIdentity.js'
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
 import { recoverInterruptedOperations } from './data/Operations.js'
 import { enableDockerMetricsMonitor } from './monitors/dockerMetricsMonitor.js'
@@ -51,8 +52,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     const settings = config.settings
     const STORE_DATA_PATH = "./"+config.settings.storeDataFolder
     const STORE_IDENTITY_PATH = "./"+config.settings.storeIdentityFolder
-    const STORE_URL_PATH = STORE_IDENTITY_PATH + "/store-url.txt"
-    const STORE_TEMPLATE_PATH = STORE_IDENTITY_PATH + "/store-template.json" 
+    const storeIdentity = storeIdentityPaths(STORE_IDENTITY_PATH)
 
     // Create the store data directory if it does not yet exist
     if (!fs.existsSync(STORE_DATA_PATH)) {
@@ -69,16 +69,11 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     log(`Starting Automerge server...`)
     const repo = await startAutomergeServer(STORE_DATA_PATH, settings.port as PortNumber || 1234 as PortNumber)
 
-    // If the store URL file does not exist, create it and an initial store document
-    // This should only happen if we change the structure of the store document
-    // and we want to force the creation of a new initial store document by deleting the old one
-    if (!fs.existsSync(STORE_URL_PATH) || !fs.existsSync(STORE_TEMPLATE_PATH)) {
-        log(`No URL file found at ${STORE_URL_PATH} or template file found at ${STORE_TEMPLATE_PATH}. Recreating them.`);
-        await initialiseServerStore(repo, STORE_TEMPLATE_PATH, STORE_URL_PATH);
-    }
-
-    const storeDocUrlStr = fs.readFileSync(STORE_URL_PATH, 'utf-8');
-    const storeDocId = storeDocUrlStr.replace('automerge:', '') as DocumentId;
+    // Store identity (idea#120): a missing store-url.txt is written back with the
+    // shared fleet store URL; an existing one is used as it is. store-template.json
+    // is never written; if it is missing, startup stops with a clear error.
+    const { storeDocId, restored } = await prepareStoreIdentity(storeIdentity)
+    if (restored) print(chalk.yellow(`store-url.txt was missing: restored the fleet store URL`))
     log(`Using document ID: ${storeDocId}`)
 
     // HACK: Force save on remote changes
@@ -96,7 +91,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // })
 
     log(`Initialising store`)
-    const storeHandle = await createServerStore(repo, storeDocId, STORE_DATA_PATH, STORE_TEMPLATE_PATH)
+    const storeHandle = await createServerStore(repo, storeDocId, STORE_DATA_PATH, storeIdentity.templatePath)
 
     // Create or update the local engine object
     const engine = await createOrUpdateEngine(storeHandle, localEngineId)

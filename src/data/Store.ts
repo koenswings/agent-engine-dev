@@ -30,35 +30,8 @@ export interface Store {
 
 // };
 
-/**
- * Creates a document URL for the project
- * Creates the template file containing the binary representation of an empty store.
- * This should be run once, or whenever the template needs to be updated.
- */
-export const initialiseServerStore = async (repo: Repo, STORE_TEMPLATE_PATH: string, STORE_URL_PATH: string): Promise<DocHandle<Store>> => {
-    log(`Creating empty store document`);
-    const handle = await repo.create<Store>({
-        engineDB: {},
-        diskDB: {},
-        appDB: {},
-        instanceDB: {},
-        userDB: {},
-        operationDB: {},
-    });
-    log("Empty store document created successfully.")
-    // Save the document to a binary file
-    const bytes = await repo.export(handle.url);
-    if (!bytes) {
-        log(`Failed to export a new template store to bytes`);
-        throw new Error(`Failed to export the store to bytes`);
-    }
-    await fs.writeFile(STORE_TEMPLATE_PATH, bytes);
-    log("Store template file created successfully.");
-    // Now write the URL to the store URL file
-    await fs.writeFile(STORE_URL_PATH, handle.url);
-    log(`Store URL file created successfully with url: ${handle.url}`);
-    return handle;
-}
+// initialiseServerStore (created a random new store and overwrote store-template.json)
+// was removed in idea#120: all Engines share one store; see StoreIdentity.ts.
 
 /**
  * Finds or creates the main Store document using a robust, non-blocking method.

@@ -11,6 +11,7 @@ import { ssh } from '../utils/ssh.js'
 $.verbose = false;
 import { DocHandle, Repo } from "@automerge/automerge-repo";
 import { config } from "./Config.js";
+import { readStoreDocId } from "./StoreIdentity.js";
 import { generateHostName } from "../utils/nameGenerator.js";
 import pack from '../../package.json' with { type: "json" };
 import { sendCommand } from "../utils/commandUtils.js";
@@ -42,8 +43,7 @@ const connect = async (storeHandle: DocHandle<Store> | null, args: string) => {
     });
 
     const peerId = 'testrunner-' + Math.random().toString(36).substring(2);
-    const storeDocUrlStr = fs.readFileSync("./store-identity/store-url.txt", 'utf-8');
-    const DOCUMENT_ID = storeDocUrlStr.trim() as any;
+    const DOCUMENT_ID = readStoreDocId() as any;
 
     // createClientStore now handles DNS resolution and timeouts
     const { handle, repo } = await createClientStore(hostnames, peerId as any, DOCUMENT_ID, timeoutSeconds);
