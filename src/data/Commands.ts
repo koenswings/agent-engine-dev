@@ -19,7 +19,7 @@ import { installApp } from './InstallApp.js';
 import { copyApp, moveApp } from './CopyMoveApp.js';
 import { resourceLock, diskKey } from '../utils/ResourceLock.js';
 import { undockDisk } from "../monitors/usbDeviceMonitor.js";
-import { backupInstance, restoreApp, createBackupDiskConfig } from "../monitors/backupMonitor.js";
+import { backupInstance, restoreApp, createBackupDiskConfig, runningBackupOnDisk } from "../monitors/backupMonitor.js";
 import { cancelOperation } from './Operations.js';
 import { testContext } from "../../test/testContext.js";
 
@@ -381,6 +381,13 @@ const ejectDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskName: 
     if (resourceLock.isLocked(diskKey(disk.id))) {
         const info = resourceLock.getLockInfo(diskKey(disk.id))
         console.error(chalk.red(`Disk '${diskName}' is locked by an active '${info?.kind}' operation. Stop or wait for it to complete before ejecting.`))
+        return
+    }
+    // Refuse to eject a Backup Disk while a backup writes to it (idea#126). Checked by
+    // the backupApp operation's backupDiskId, so scheduled and automatic backups count too.
+    const backup = runningBackupOnDisk(store, disk.id)
+    if (backup) {
+        console.error(chalk.red(`Disk '${diskName}' is in use by a running backup of instance ${backup.args.instanceId}. Wait for it to complete before ejecting.`))
         return
     }
     print(chalk.blue(`Ejecting disk '${diskName}'...`));
