@@ -165,14 +165,7 @@ checkout agent-engine-dev "$ENGINE_REF"
 checkout agent-console-dev "$CONSOLE_REF"
 ( cd agent-engine-dev && pnpm install --frozen-lockfile )
 ( cd agent-console-dev && pnpm install --frozen-lockfile && pnpm build )
-# A fresh Pi has no /META.yaml, and the Engine exits at import without it
-# (idea#145). Seed a minimal one; addMeta fills in the real values.
-if ! sudo test -f /META.yaml; then
-  now=$(date +%s%3N)
-  printf 'diskId: %s-boot\ndiskName: %s-boot\ncreated: %s\nlastDocked: %s\nversion: "1"\n' \
-    "$(hostname)" "$(hostname)" "$now" "$now" | sudo tee /META.yaml >/dev/null
-  sudo chmod 600 /META.yaml
-fi
+# /META.yaml: Engine creates it on first start when missing (idea#145 / #131).
 echo BOOTSTRAP-OK
 REMOTE
   then
@@ -229,7 +222,7 @@ REMOTE
     echo "ERROR: $NAME did not come back over SSH within 6 minutes."
     RESULTS+=("$NAME: FAILED (no SSH after reboot)"); FAILED=1; continue
   fi
-  sleep 30   # give pm2 and the Engine time to start
+  sleep 45   # pm2 + Engine; allow command-log 10 s timeout on a fresh Pi (idea#145)
   HEALTH=$(rssh 'cd /home/pi/idea/agents/agent-engine-dev
     port=$(sed -n "s/^  httpPort: *\([0-9]*\).*/\1/p" config.yaml | head -1); port=${port:-80}
     engine=$(pm2 jlist 2>/dev/null | jq -r ".[] | select(.name==\"engine\") | .pm2_env.status" | head -1)
@@ -239,8 +232,8 @@ REMOTE
   if [[ "$HEALTH" == *"engine=online"* && "$HEALTH" == *"http=200"* ]]; then
     RESULTS+=("$NAME: OK ($HEALTH)")
   else
-    echo "  WARN: the Engine is not serving the Console yet. On a Pi with no peers, a fresh Engine can"
-    echo "        hang on the shared command log (idea#145); check 'pm2 logs engine'."
+    echo "  WARN: the Engine is not serving the Console yet; check 'pm2 logs engine'."
+    echo "        Fresh starts can take ~10 s longer while the command-log load times out (idea#145)."
     RESULTS+=("$NAME: CHECK ($HEALTH)"); FAILED=1
   fi
 done
