@@ -1,6 +1,8 @@
 # AGENTS.md — Engine (agent-engine-dev)
 
-You are Grok Build running on an ARM64 Raspberry Pi runner.
+You are the Engine Dev Bot (Axle). You implement with your own tools (clone, edit, commit, open PRs via GitHub), run tests over SSH on a claimed idle non-golden pool Pi, pass the QC gate and open a PR. Ops Bot deploys it to a review Pi; Koen evaluates it on real Pi hardware and squash-merges. Read this file at the start of every implementation task.
+
+Grok Build on a self-hosted Pi runner is **parked** (idea#147): do not trigger Grok Build or Pi runners. See [Parked: Grok Build / self-hosted runner coding](#parked-grok-build--self-hosted-runner-coding).
 
 ## What this repo is
 
@@ -77,9 +79,44 @@ live Engine (idea#105):
   `IDEA_DIAGNOSTIC_LIVE=true pnpm test:diagnostic` reads a live store, so it needs
   the override on purpose.
 
+## Workflow (idea#147)
+
+1. Read the GitHub issue and the agreed-approach comment (no comment → ask Lead Bot). Implement with your own tools and read this file.
+2. Claim an idle pool Pi, run the tests over SSH (see [Testing on a fleet Pi](#testing-on-a-fleet-pi-claim-protocol)), then release the Pi.
+3. Run the QC gate (see Quality rules). FAIL → fix + one retry; still failing → escalate to Lead Bot with what failed, what was tried and the likely cause.
+4. PASS → open the PR, post the full PR URL on the issue, and notify Ops Bot and Lead Bot with it (`https://github.com/koenswings/<repo>/pull/<N>`).
+5. Ops Bot runs `find-available-pi.sh` and `deploy.sh` to a review Pi. Koen evaluates the PR on real Pi hardware and squash-merges. Ops Bot runs teardown and `update-golden.sh`.
+
+## Testing on a fleet Pi (claim protocol)
+
+Follows idea `docs/grok-bot-setup.md` §4.6. The pool is **idea01, idea03, idea04**. **Never use golden idea02.** One job per Pi, and never take more than one Pi down at a time.
+
+Claim before any SSH work (pick a Pi that is `idle`; `find-available-pi.sh` returns only idle Pis). Put the bot name in the claim note and do not overwrite the Pi's existing `note` field (it holds its isolation details):
+
+```bash
+BOT_NAME=<bot> tools/fleet/update-fleet-state.sh <pi> status testing
+BOT_NAME=<bot> tools/fleet/update-fleet-state.sh <pi> claim "<bot>: <repo>#<issue/PR>"
+```
+
+Engine test rules on a claimed Pi:
+
+- Leave the Pi's isolated store, `mdns: false` and its local `config.yaml` untouched.
+- Stop the pm2 Engine as pi before testing (`pm2 stop engine`, never `sudo pm2`): the Engine needs exclusive USB/udev and `/disks`, and the test pre-flight refuses to run next to a live Engine.
+- Test from a separate checkout, not the deployed tree (`/home/pi/idea/agents/agent-engine-dev`), kept off the fleet store.
+- Keep `IDEA_NETWORK_TESTS` off unless an issue asks for it.
+- Sudoers: you may install your PR's version of `11-engine-files` with `installEngineSudoers` **only** on a Pi you have claimed, and must restore main's version before releasing it. Golden idea02 sudoers stays with Atlas.
+- Never modify `store-identity/store-template.json`, on any Pi or in the repo.
+
+Release when done: restore main in every tree you touched (and main's sudoers if you changed them), restart the Engine with pm2 as pi (`pm2 restart engine`), then:
+
+```bash
+BOT_NAME=<bot> tools/fleet/update-fleet-state.sh --null <pi> claim
+BOT_NAME=<bot> tools/fleet/update-fleet-state.sh <pi> status idle
+```
+
 ## Deploy (Ops Bot calls deploy.sh — do not deploy manually)
 
-The fleet deploy scripts handle all deployment logic. Grok Build's job is to produce a passing test suite and open a PR.
+The fleet deploy scripts handle all deployment logic. The Dev Bot's job is to produce a passing test suite and open a PR — Ops Bot does the rest.
 
 ## config.yaml key settings
 
@@ -129,3 +166,12 @@ Engine writes the disk's identity once and every later dock reads the same diskI
 - No GitHub token is used anywhere in the build or sync (idea#116): build-engine no longer asks for one, `sync-engine` excludes `gh_token.txt`, and `.gitignore` ignores `**/gh_token.txt` and `*.token`. The Engine repo is public; never add token files or token prompts back.
 - pnpm test:full compiles into dist-test/ itself; it never rebuilds dist/. Run `pnpm build` separately when you need a fresh dist/ for the Engine.
 - Leftover pretend disks from pre-idea#105 test runs (e.g. /disks/sdz1) make the pre-flight refuse; remove them by hand.
+
+## Parked: Grok Build / self-hosted runner coding
+
+**PARKED (2026-09-28, idea#147).** Do not use for new work unless Koen deliberately revives this path. Kept here so it is easy to revive; see idea `docs/grok-bot-setup.md` §2.2 and §9.
+
+- History: Grok Build ran on a GitHub Actions self-hosted runner on an ARM64 Raspberry Pi, triggered headless, and its job was to produce a passing test suite and open a PR.
+- Current state: Grok Build 1.0.40 (default model grok-4.6) stays installed on idea02; the runner service is stopped and `fleet-state.json` has `runner: parked`. The only workflow is the manual `runner-test.yml`.
+- Reference for revival: Grok Build reads AGENTS.md natively at the start of a run; Plan Mode; headless `grok -p "task"`; install with `curl -fsSL https://x.ai/cli/install.sh | bash`, then `grok auth login`.
+- Pis are test / review / golden hardware, not coding agents.
