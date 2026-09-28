@@ -56,7 +56,9 @@ export const handleCommand = async (
             if (!descriptor) throw new Error("Too many arguments");
             return convertToType(arg, descriptor);
         });
-        if (args.length < command.args.length) throw new Error("Insufficient arguments");
+        // An optional variadic last arg may take zero tokens (idea#128)
+        const required = isVariadic && lastArg.optional ? command.args.length - 1 : command.args.length;
+        if (args.length < required) throw new Error("Insufficient arguments");
     } catch (error: any) {
         console.error(`Error: ${error.message}`);
         return;

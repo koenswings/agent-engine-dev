@@ -124,6 +124,8 @@ BOT_NAME=<bot> tools/fleet/update-fleet-state.sh <pi> status idle
 
 The fleet deploy scripts handle all deployment logic. The Dev Bot's job is to produce a passing test suite and open a PR — Ops Bot does the rest.
 
+- **pm2 config changes (idea#128):** `pm2 restart engine` does not re-read `pm2.config.cjs`. A PR that changes it (e.g. `kill_timeout: 10000`) needs, as pi, `pm2 delete engine && pm2 start pm2.config.cjs && pm2 save` (or `pm2 reload pm2.config.cjs`) at deploy. Check with `pm2 describe engine` (`kill timeout` should read 10000). Say so in the PR body.
+
 ## config.yaml key settings
 
 ```yaml

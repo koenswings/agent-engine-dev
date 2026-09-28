@@ -1,5 +1,5 @@
 # Project Source Code Context
-Generated on 2026-09-28T18:34:47.646Z
+Generated on 2026-09-28T20:48:22.745Z
 
 ## File: package.json
 ```typescript
@@ -829,6 +829,7 @@ export interface ArgumentDescriptor {
     name?: string;        // Human-readable arg name, used to build named trace args
     objectSpec?: ObjectSpec;
     variadic?: boolean;   // Last arg only: takes all remaining tokens (at least one), passed as separate args
+    optional?: boolean;   // With variadic only: the tokens may be absent (zero tokens → no args, trace records []) (idea#128)
 }
 
 // Interface for commands
@@ -1115,6 +1116,7 @@ import { resourceLock, diskKey } from '../utils/ResourceLock.js';
 import { undockDisk } from "../monitors/usbDeviceMonitor.js";
 import { backupInstance, restoreApp, createBackupDiskConfig, runningBackupOnDisk } from "../monitors/backupMonitor.js";
 import { cancelOperation } from './Operations.js';
+import { DiskArgResult, lookupDiskArg, resolveDiskArg } from './DiskArg.js';
 import { testContext } from "../../test/testContext.js";
 
 
@@ -1260,28 +1262,33 @@ const lsInstances = (storeHandle: DocHandle<Store> | null): void => {
 }
 
 /**
- * installApp command wrapper.
- * Usage: installApp <appId> <targetDiskName> [--source <sourceDiskName>] [--name <instanceName>]
+ * installApp command wrapper (idea#128).
+ * Usage: installApp <appId> <targetDiskId> [--source <sourceDiskId>] [--name <instanceName>]
  *
- * All arguments are passed as a single string and parsed here.
+ * All arguments are passed as a single string and parsed here. Disk arguments
+ * go through resolveDiskArg (a unique disk name still works, with a warning).
+ * Refusals throw, so the trace ends as `error`.
  */
+const INSTALL_APP_USAGE = 'Usage: installApp <appId> <targetDiskId> [--source <sourceDiskId>] [--name <instanceName>]'
 const installAppWrapper = async (storeHandle: DocHandle<Store> | null, argsString: string) => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available.")); return; }
+    if (!storeHandle) throw new Error("Store is not available.")
 
-    // Parse: installApp kolibri-1.0 my-disk --source catalog-disk --name my-kolibri
-    const parts = argsString.trim().split(/\s+/)
+    // Parse: installApp kolibri-1.0 <targetDiskId> --source <sourceDiskId> --name my-kolibri
+    const parts = (argsString ?? '').trim().split(/\s+/).filter(Boolean)
     const appId = parts[0] as any
-    const targetDiskName = parts[1] as any
-    if (!appId || !targetDiskName) {
-        console.error(chalk.red('Usage: installApp <appId> <targetDiskName> [--source <sourceDiskName>] [--name <instanceName>]'))
-        return
+    const targetDiskId = parts[1]
+    if (!appId || !targetDiskId || targetDiskId.startsWith('--')) throw new Error(INSTALL_APP_USAGE)
+    const flagValue = (flag: string): string | undefined => {
+        const i = parts.indexOf(flag)
+        if (i === -1) return undefined
+        const v = parts[i + 1]
+        if (!v || v.startsWith('--')) throw new Error(`installApp: ${flag} needs a value. ${INSTALL_APP_USAGE}`)
+        return v
     }
-    const sourceIdx = parts.indexOf('--source')
-    const nameIdx = parts.indexOf('--name')
-    const sourceDiskName = sourceIdx !== -1 ? parts[sourceIdx + 1] as any : undefined
-    const instanceName = nameIdx !== -1 ? parts[nameIdx + 1] as any : undefined
+    const sourceDiskId = flagValue('--source')
+    const instanceName = flagValue('--name') as any
 
-    await installApp(storeHandle, { appId, targetDiskName, sourceDiskName, instanceName })
+    await installApp(storeHandle, { appId, targetDiskId, sourceDiskId, instanceName })
 }
 
 /**
@@ -1420,16 +1427,16 @@ const restoreAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceN
     await restoreApp(storeHandle, instance.id, targetDisk as any, undefined, 'console-command')
 }
 
-const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskName: DiskName, mode: string, ...instanceNames: InstanceName[]) => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+/**
+ * createBackupDisk <diskId> <mode> <instanceName…> (idea#128). The disk goes
+ * through resolveDiskArg; refusals throw, so the trace ends as `error`.
+ */
+const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskId: string, mode: string, ...instanceNames: InstanceName[]) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     const validModes = ['immediate', 'on-demand', 'scheduled']
-    if (!validModes.includes(mode)) {
-        console.error(chalk.red(`Invalid mode '${mode}'. Valid modes: ${validModes.join(', ')}`))
-        return
-    }
+    if (!validModes.includes(mode)) throw new Error(`Invalid mode '${mode}'. Valid modes: ${validModes.join(', ')}`)
     const store = storeHandle.doc()
-    const disk = Object.values(store.diskDB).find(d => d.name === diskName && d.device != null)
-    if (!disk) { console.error(chalk.red(`Disk '${diskName}' not found or not docked.`)); return; }
+    const disk = resolveDiskArg(store, getLocalEngine(store)?.id, diskId, 'createBackupDisk')
 
     const instanceIds = instanceNames.map(name => {
         const inst = Object.values(store.instanceDB).find(i => i.name === name)
@@ -1437,9 +1444,9 @@ const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, dis
         return inst?.id
     }).filter(Boolean) as any[]
 
-    print(chalk.blue(`Creating Backup Disk config on '${diskName}' (mode: ${mode})...`))
+    print(chalk.blue(`Creating Backup Disk config on '${disk.name}' (${disk.id}, mode: ${mode})...`))
     await createBackupDiskConfig(storeHandle, disk as any, mode as any, instanceIds)
-    print(chalk.green(`Backup Disk '${diskName}' configured.`))
+    print(chalk.green(`Backup Disk '${disk.name}' (${disk.id}) configured.`))
 }
 
 const copyAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, sourceDiskId: DiskID, targetDiskId: DiskID) => {
@@ -1452,34 +1459,11 @@ const moveAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName
     await moveApp(storeHandle, instanceName, sourceDiskId, targetDiskId, 'console-command')
 }
 
-export type EjectTarget = { ok: true, disk: Disk } | { ok: false, message: string }
+export type EjectTarget = DiskArgResult
 
-/**
- * Resolve the argument of `ejectDisk` (idea#152).
- *   1. A disk id (the Console sends disk.id): that record, which must be docked
- *      to this engine with a device.
- *   2. Otherwise a name, for older Consoles and the CLI: only records docked to
- *      this engine with a device count. Two or more such records → refused as
- *      ambiguous (eject by id instead). Stale undocked records with the same name
- *      are ignored, so they can no longer hide the live disk.
- */
-export const resolveEjectTarget = (store: Store, arg: string, engineId: EngineID | undefined): EjectTarget => {
-    const byId = store.diskDB[arg as DiskID]
-    if (byId) {
-        if (!byId.device) return { ok: false, message: `Disk '${byId.name}' (${byId.id}) is not currently docked.` }
-        if (String(byId.dockedTo) !== String(engineId)) return { ok: false, message: `Disk '${byId.name}' (${byId.id}) is not docked to this engine.` }
-        return { ok: true, disk: byId }
-    }
-    const named = Object.values(store.diskDB).filter(d => d.name === arg)
-    if (named.length === 0) return { ok: false, message: `Disk '${arg}' not found.` }
-    const dockedHere = named.filter(d => d.device != null && String(d.dockedTo) === String(engineId))
-    if (dockedHere.length === 1) return { ok: true, disk: dockedHere[0] }
-    if (dockedHere.length > 1) {
-        return { ok: false, message: `Disk name '${arg}' is ambiguous: ${dockedHere.map(d => `${d.id} (${d.device})`).join(', ')} are docked to this engine. Eject by disk id.` }
-    }
-    if (named.some(d => d.device != null)) return { ok: false, message: `Disk '${arg}' is not docked to this engine.` }
-    return { ok: false, message: `Disk '${arg}' is not currently docked.` }
-}
+/** The ejectDisk lookup (idea#152), now the shared disk-argument lookup (idea#128). */
+export const resolveEjectTarget = (store: Store, arg: string, engineId: EngineID | undefined): EjectTarget =>
+    lookupDiskArg(store, engineId, arg)
 
 /**
  * ejectDisk <diskId> (idea#152). A name still works (see resolveEjectTarget).
@@ -1490,9 +1474,7 @@ const ejectDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskIdOrNa
     if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     const store = storeHandle.doc();
     const localEngine = getLocalEngine(store);
-    const target = resolveEjectTarget(store, diskIdOrName, localEngine?.id)
-    if (!target.ok) throw new Error(target.message)
-    const disk = target.disk
+    const disk = resolveDiskArg(store, localEngine?.id, diskIdOrName, 'ejectDisk')
     const label = `'${disk.name}' (${disk.id})`
     // Never eject the Pi's own system disk, however it was named (idea#152)
     if (await isSystemDiskRecord(disk)) {
@@ -1554,7 +1536,7 @@ export const commands: CommandDefinition[] = [
     { name: "ejectDisk", execute: ejectDiskWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
     { name: "backupApp", execute: backupAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
-    { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string", name: "diskName" }, { type: "string", name: "mode" }, { type: "string", name: "instanceNames", variadic: true }], scope: 'engine' },
+    { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "mode" }, { type: "string", name: "instanceNames", variadic: true }], scope: 'engine' },
     { name: "cancelOperation", execute: async (storeHandle: DocHandle<Store> | null, opId: string) => {
         if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
         const err = cancelOperation(storeHandle, opId)
@@ -3292,6 +3274,68 @@ export const removeInstance = (storeHandle: DocHandle<Store>, disk: Disk, instan
 
 ```
 
+## File: src/data/DiskArg.ts
+```typescript
+/**
+ * DiskArg.ts: one resolver for every disk argument of a command (idea#128)
+ *
+ * Files Disk step 0b: disk-targeting commands take the disk ID (installApp
+ * target and --source, createBackupDisk, ejectDisk). The rules come from
+ * idea#152 (#134, ejectDisk):
+ *   1. A disk id: that record, which must be docked to this engine with a device.
+ *   2. Otherwise a disk name, for older Consoles and the CLI (mixed versions):
+ *      only records docked to this engine with a device count. Exactly one
+ *      → accepted, with a deprecation warning naming the command and the disk.
+ *      Two or more → refused as ambiguous. None → refused (not found, not
+ *      docked, or docked to another engine).
+ * The system disk resolves like any disk (it is a valid installApp target);
+ * ejectDisk refuses it separately.
+ *
+ * resolveDiskArg() throws on a refusal, so the command trace ends as `error`.
+ */
+
+import { Store } from './Store.js'
+import { Disk } from './Disk.js'
+import { DiskID, EngineID } from './CommonTypes.js'
+
+export type DiskArgResult =
+    | { ok: true, disk: Disk, byName: boolean }
+    | { ok: false, message: string }
+
+/** Resolve without side effects (no warning, no throw). */
+export const lookupDiskArg = (store: Store, engineId: EngineID | undefined, arg: string): DiskArgResult => {
+    const byId = store.diskDB[arg as DiskID]
+    if (byId) {
+        if (!byId.device) return { ok: false, message: `Disk '${byId.name}' (${byId.id}) is not currently docked.` }
+        if (String(byId.dockedTo) !== String(engineId)) return { ok: false, message: `Disk '${byId.name}' (${byId.id}) is not docked to this engine.` }
+        return { ok: true, disk: byId, byName: false }
+    }
+    const named = Object.values(store.diskDB).filter(d => d.name === arg)
+    if (named.length === 0) return { ok: false, message: `Disk '${arg}' not found.` }
+    const dockedHere = named.filter(d => d.device != null && String(d.dockedTo) === String(engineId))
+    if (dockedHere.length === 1) return { ok: true, disk: dockedHere[0], byName: true }
+    if (dockedHere.length > 1) {
+        return { ok: false, message: `Disk name '${arg}' is ambiguous: ${dockedHere.map(d => `${d.id} (${d.device})`).join(', ')} are docked to this engine. Use the disk id.` }
+    }
+    if (named.some(d => d.device != null)) return { ok: false, message: `Disk '${arg}' is not docked to this engine.` }
+    return { ok: false, message: `Disk '${arg}' is not currently docked.` }
+}
+
+/**
+ * Resolve a disk argument of `command` on this engine. Throws on a refusal;
+ * warns (console.warn, so it lands in the trace) when a name was used.
+ */
+export const resolveDiskArg = (store: Store, engineId: EngineID | undefined, arg: string, command: string): Disk => {
+    const r = lookupDiskArg(store, engineId, arg)
+    if (!r.ok) throw new Error(r.message)
+    if (r.byName) {
+        console.warn(`${command}: disk '${r.disk.name}' was given by name; use the disk id ${r.disk.id} (names are deprecated, idea#128).`)
+    }
+    return r.disk
+}
+
+```
+
 ## File: src/data/Engine.ts
 ```typescript
 import { $, chalk, os, YAML, fs, path, sleep } from 'zx';
@@ -3313,7 +3357,22 @@ export interface Engine {
   lastRun: Timestamp;
   lastHalted: Timestamp | null;
   commands: Command[];
+  /** What this Engine build supports (idea#128); rewritten as a whole list at every startup */
+  capabilities?: string[];
+  /** The lastBooted of the startup that wrote `capabilities` (idea#128) */
+  capabilitiesBootedAt?: Timestamp;
 }
+
+/**
+ * Capabilities this Engine build advertises (idea#128, Files Disk step 0b).
+ *   diskIdArgs: installApp, createBackupDisk and ejectDisk take disk ids.
+ * Written at every startup as a whole new list, with capabilitiesBootedAt set
+ * to that startup's lastBooted. A Console counts a capability only when
+ * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
+ * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
+ * stamp, so it is treated as old at once.
+ */
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs']
 
 import { config } from './Config.js';
 
@@ -3337,6 +3396,7 @@ export const createEngineIdFromDiskId = (diskId: DiskID): EngineID => {
 export const initialiseLocalEngine = async (): Promise<Engine> => {
   try {
     const meta: DiskMeta = await readMetaUpdateId()
+    const booted = (new Date()).getTime() as Timestamp
     const localEngine: Engine = {
       id: createEngineIdFromDiskId(meta.diskId),
       hostname: os.hostname() as Hostname,
@@ -3344,10 +3404,12 @@ export const initialiseLocalEngine = async (): Promise<Engine> => {
       version: (meta.version != null ? String(meta.version) : "0.0.1") as Version,
       hostOS: os.type(),
       created: meta.created,
-      lastBooted: (new Date()).getTime() as Timestamp,
-      lastRun: (new Date()).getTime() as Timestamp,
+      lastBooted: booted,
+      lastRun: booted,
       lastHalted: null,
-      commands: []
+      commands: [],
+      capabilities: [...ENGINE_CAPABILITIES],
+      capabilitiesBootedAt: booted
     }
     return localEngine
   } catch (e) {
@@ -3371,8 +3433,13 @@ export const createOrUpdateEngine = async (storeHandle: DocHandle<Store>, engine
         engine = doc.engineDB[engineId]
         engine.hostname = os.hostname() as Hostname
         engine.version = newEngine.version
-        engine.lastBooted = (new Date()).getTime() as Timestamp
-        engine.lastRun = (new Date()).getTime() as Timestamp
+        // One timestamp for lastBooted and the capability stamp (idea#128)
+        const booted = (new Date()).getTime() as Timestamp
+        engine.lastBooted = booted
+        engine.lastRun = booted
+        // Whole new list, never appended: a stale or extra entry disappears
+        engine.capabilities = [...ENGINE_CAPABILITIES]
+        engine.capabilitiesBootedAt = booted
       }
     })
   return engine!
@@ -4381,7 +4448,8 @@ const startDockerEngine = async (exec: any, enginePath: string, productionMode: 
 import { chalk, fs } from 'zx'
 import * as net from 'net'
 import { log } from '../utils/utils.js'
-import { Store, getDisk, findDiskByName } from './Store.js'
+import { Store, getDisk, getLocalEngine } from './Store.js'
+import { resolveDiskArg } from './DiskArg.js'
 import { buildInstance } from './Instance.js'
 import { AppID, AppName, DiskID, DiskName, InstanceName, Version } from './CommonTypes.js'
 import { DocHandle } from '@automerge/automerge-repo'
@@ -4485,8 +4553,8 @@ export const installAppFromDisk = async (
 
 export interface InstallAppOptions {
     appId: AppID
-    targetDiskName: DiskName
-    sourceDiskName?: DiskName    // --source flag; omit for auto-routing
+    targetDiskId: string         // disk id (a unique disk name still resolves, deprecated; idea#128)
+    sourceDiskId?: string        // --source flag; omit for auto-routing
     instanceName?: InstanceName  // --name flag; defaults to appId
     gitAccount?: string          // for GitHub path; defaults to 'koenswings'
 }
@@ -4503,23 +4571,15 @@ export const installApp = async (
     const instanceName = (opts.instanceName ?? opts.appId) as InstanceName
     const gitAccount = opts.gitAccount ?? 'koenswings'
 
-    // Resolve target disk
-    const targetDisk = findDiskByName(store, opts.targetDiskName)
-        ?? Object.values(store.diskDB).find(d => d.name === opts.targetDiskName)
-    if (!targetDisk || !targetDisk.device) {
-        console.error(chalk.red(`installApp: target disk '${opts.targetDiskName}' not found or not docked`))
-        return
-    }
+    // Resolve the disks on this engine (idea#128): by id, or a unique docked name
+    // with a deprecation warning; refusals throw so the trace ends as `error`
+    const engineId = getLocalEngine(store)?.id
+    const targetDisk = resolveDiskArg(store, engineId, opts.targetDiskId, 'installApp')
 
     // ── Route 1: --source given → local path ──────────────────────────────
-    if (opts.sourceDiskName) {
-        const sourceDisk = findDiskByName(store, opts.sourceDiskName)
-            ?? Object.values(store.diskDB).find(d => d.name === opts.sourceDiskName)
-        if (!sourceDisk || !sourceDisk.device) {
-            console.error(chalk.red(`installApp: source disk '${opts.sourceDiskName}' not found or not docked`))
-            return
-        }
-        log(chalk.blue(`installApp: local path — source '${opts.sourceDiskName}'`))
+    if (opts.sourceDiskId) {
+        const sourceDisk = resolveDiskArg(store, engineId, opts.sourceDiskId, 'installApp --source')
+        log(chalk.blue(`installApp: local path — source '${sourceDisk.name}' (${sourceDisk.id})`))
         await installAppFromDisk(storeHandle, opts.appId, sourceDisk, targetDisk as Disk, instanceName)
         return
     }
@@ -4552,10 +4612,10 @@ export const installApp = async (
 
     // No local source found
     const appName = opts.appId.slice(0, opts.appId.lastIndexOf('-')) as AppName
-    console.error(chalk.red(
-        `installApp: App '${appName}' not found locally.\n` +
+    throw new Error(
+        `installApp: App '${appName}' not found locally. ` +
         `Insert a disk containing '${appName}' or connect to the internet.`
-    ))
+    )
 }
 
 // ── Phase 2: appDB population for Backup/Catalog Disks ───────────────────────
@@ -9925,7 +9985,9 @@ export const handleCommand = async (
             if (!descriptor) throw new Error("Too many arguments");
             return convertToType(arg, descriptor);
         });
-        if (args.length < command.args.length) throw new Error("Insufficient arguments");
+        // An optional variadic last arg may take zero tokens (idea#128)
+        const required = isVariadic && lastArg.optional ? command.args.length - 1 : command.args.length;
+        if (args.length < required) throw new Error("Insufficient arguments");
     } catch (error: any) {
         console.error(`Error: ${error.message}`);
         return;
