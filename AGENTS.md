@@ -111,7 +111,7 @@ Engine test rules on a claimed Pi:
 - Never modify `store-identity/store-template.json`, on any Pi or in the repo.
 - **Disk PRs must pass the on-Pi hardware round trip before hand-off (idea#152).** This covers any change to docking, undocking, eject, mounting or disk records. On the claimed Pi, with the pm2 Engine stopped, run the PR's Engine from your separate checkout (own store, `mdns: false`, `httpPort` other than the fleet's, stdout to a log file). Dock a USB test disk that has at least two partitions (idea03's Ugreen SSD: vfat `system-boot` + ext4 `writable`). Then run, from that checkout:
   `pnpm test:hw --engine-log <engine stdout log> --cycles 2`
-  It must pass twice in a row. Put the command and the `RESULT PASS` log lines in the PR body. It uses the tester's own `sudo` for the sysfs unplug/re-plug (never the Engine sudoers) and never touches the system drive or golden idea02.
+  On idea03 this is `cd /home/pi/axle-tests/<checkout> && pnpm test:hw --engine-log $(ls -t engine-run-*.log | head -1) --cycles 2`. The recorded test disk is matched by its IDs from `script/hw-roundtrip-disks.json`, and the run aborts before touching anything if they don't match. On another Pi, add its test disk to that file or pass `--stick-usb-serial`, `--disk-serial` and `--uuid`. It must pass twice in a row. Put the command and the `RESULT PASS` log lines in the PR body. It uses the tester's own `sudo` for the sysfs unplug/re-plug (never the Engine sudoers) and never touches the system drive or golden idea02.
 
 Release when done: restore main in every tree you touched (and main's sudoers if you changed them), restart the Engine with pm2 as pi (`pm2 restart engine`), then:
 

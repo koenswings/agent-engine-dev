@@ -1,0 +1,9 @@
+{
+  "idea03": {
+    "source": "idea fleet-state.json idea03 note @6970af8; idea PR #154",
+    "usbSerial": "26A1EE83197F",
+    "diskSerial": "3813430-532011020",
+    "uuids": ["3E50-902A", "378383c9-0612-4c82-9c07-8c34d15253ba"],
+    "refuseSerials": ["AA202000000000004820"]
+  }
+}
