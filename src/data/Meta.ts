@@ -234,18 +234,27 @@ export const createMeta = async (device: DeviceName, engineVersion: Version | un
   return meta
 }
 
-const writeMeta = async (meta: DiskMeta, rootPath: string): Promise<void> => {
+/**
+ * Write a META.yaml file and throw when it cannot be written (idea#121).
+ * Callers that must know whether the write worked (e.g. the first dock of a
+ * disk without META.yaml) use this; writeMeta() below logs and swallows errors.
+ */
+export const writeMetaFile = async (meta: DiskMeta, rootPath: string): Promise<void> => {
   log(`Writing metadata ${deepPrint(meta)} to ${rootPath}`)
+  const yamlContent = YAML.stringify(meta)
+  if (rootPath === '/META.yaml') {
+    // Only the system disk's /META.yaml is root-owned. Pipe the YAML into
+    // `sudo tee /META.yaml`: a fixed command the Engine's sudoers file allows (idea#80).
+    await $({ input: yamlContent })`sudo tee /META.yaml > /dev/null`
+  } else {
+    // META.yaml files on App Disks (under the mount points) are written as pi.
+    await fs.writeFile(rootPath, yamlContent)
+  }
+}
+
+const writeMeta = async (meta: DiskMeta, rootPath: string): Promise<void> => {
   try {
-    const yamlContent = YAML.stringify(meta)
-    if (rootPath === '/META.yaml') {
-      // Only the system disk's /META.yaml is root-owned. Pipe the YAML into
-      // `sudo tee /META.yaml`: a fixed command the Engine's sudoers file allows (idea#80).
-      await $({ input: yamlContent })`sudo tee /META.yaml > /dev/null`
-    } else {
-      // META.yaml files on App Disks (under the mount points) are written as pi.
-      await fs.writeFile(rootPath, yamlContent)
-    }
+    await writeMetaFile(meta, rootPath)
   } catch (e) {
     print(chalk.red('Error writing metadata'))
     console.error(e)

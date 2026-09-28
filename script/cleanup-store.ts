@@ -9,11 +9,20 @@
  *   - Instance entries whose storedOn disk no longer exists
  *   - App entries that no longer have any instance
  *
+ * Orphan disk entries (idea#121) are a subset of the undocked disks: entries
+ * left behind when a disk without META.yaml got a new random id on every dock.
+ * They are listed separately (see findOrphanDiskIds in cleanup-store-lib.ts).
+ * With --orphans-only, only the orphan disk entries are removed; undocked disks
+ * that still hold instances, Backup Disks, instances and apps are all kept.
+ * Use that on a real store where undocked App Disks must stay known.
+ *
  * Safe to run multiple times. Always dry-run first (default), pass --commit to write.
  *
  * Usage:
- *   npx tsx script/cleanup-store.ts           # dry run
- *   npx tsx script/cleanup-store.ts --commit  # write changes
+ *   npx tsx script/cleanup-store.ts                          # dry run
+ *   npx tsx script/cleanup-store.ts --commit                 # write changes
+ *   npx tsx script/cleanup-store.ts --orphans-only           # dry run, orphan disks only
+ *   npx tsx script/cleanup-store.ts --orphans-only --commit  # remove orphan disks only
  */
 
 import { Repo } from '@automerge/automerge-repo'
@@ -22,11 +31,13 @@ import { DocumentId } from '@automerge/automerge-repo'
 import { fs, chalk } from 'zx'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { findOrphanDiskIds, findSystemDiskIds } from './cleanup-store-lib.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT = path.resolve(__dirname, '..')
 
 const commit = process.argv.includes('--commit')
+const orphansOnly = process.argv.includes('--orphans-only')
 
 if (commit) {
     // Warn if the engine is running — its in-memory CRDT will win on next restart
@@ -51,26 +62,22 @@ const handle = await repo.find(docId)
 await handle.whenReady()
 const store = handle.doc() as any
 
-const engines = store.engineDB as Record<string, any>
 const disks   = store.diskDB   as Record<string, any>
 const apps    = store.appDB    as Record<string, any>
 const insts   = store.instanceDB as Record<string, any>
 const ops     = store.operationDB as Record<string, any>
-
-const engineIds = new Set(Object.keys(engines))
 
 // ── Compute what to remove ───────────────────────────────────────────────────
 
 // Disks: keep if they have an active device OR are a system disk.
 // System disk id == hardware serial; engine id == 'ENGINE_' + serial.
 // A disk is a system disk if any engine has id = 'ENGINE_' + diskId.
-const systemDiskIds = new Set(
-    Object.keys(disks).filter(diskId =>
-        engineIds.has('ENGINE_' + diskId) || (disks[diskId].diskTypes ?? []).includes('system')
-    )
-)
+const systemDiskIds = findSystemDiskIds(store)
 
-const diskIdsToRemove = Object.keys(disks).filter(id => {
+// Orphan disk entries left by the first-dock bug (idea#121)
+const orphanDiskIds = findOrphanDiskIds(store)
+
+const diskIdsToRemove = orphansOnly ? orphanDiskIds : Object.keys(disks).filter(id => {
     const d = disks[id]
     const isSystemDisk = systemDiskIds.has(id)
     const isActiveDisk = !!d.device || !!d.dockedTo       // currently docked
@@ -78,7 +85,7 @@ const diskIdsToRemove = Object.keys(disks).filter(id => {
 })
 
 // Instances: remove if Missing/storedOn=null, or if storedOn points to a disk we're removing
-const instIdsToRemove = Object.keys(insts).filter(id => {
+const instIdsToRemove = orphansOnly ? [] : Object.keys(insts).filter(id => {
     const i = insts[id]
     if (!i.storedOn) return true                          // Missing
     if (diskIdsToRemove.includes(i.storedOn)) return true // disk being removed
@@ -92,18 +99,19 @@ const remainingInstanceOf = new Set(
         .filter(id => !instIdsToRemove.includes(id))
         .map(id => insts[id].instanceOf)
 )
-const appIdsToRemove = Object.keys(apps).filter(id => !remainingInstanceOf.has(id))
+const appIdsToRemove = orphansOnly ? [] : Object.keys(apps).filter(id => !remainingInstanceOf.has(id))
 
 // ── Report ───────────────────────────────────────────────────────────────────
 
 const mode = commit ? chalk.bold.red('COMMIT') : chalk.bold.yellow('DRY RUN')
 console.log()
-console.log(chalk.bold(`Store cleanup — ${mode}${commit ? '' : ' (pass --commit to apply)'}`) )
+console.log(chalk.bold(`Store cleanup — ${mode}${orphansOnly ? ' — orphan disks only' : ''}${commit ? '' : ' (pass --commit to apply)'}`) )
 console.log()
 
-console.log(chalk.bold.cyan(`Disks to remove (${diskIdsToRemove.length}):`))
+console.log(chalk.bold.cyan(`Disks to remove (${diskIdsToRemove.length}, of which ${orphanDiskIds.length} orphan entries, idea#121):`))
 for (const id of diskIdsToRemove) {
-    console.log(`  ${chalk.dim('✗')} ${chalk.yellow(id)}  ${chalk.dim(disks[id].name ?? '')}`)
+    const tag = orphanDiskIds.includes(id) ? chalk.dim(' [orphan]') : ''
+    console.log(`  ${chalk.dim('✗')} ${chalk.yellow(id)}  ${chalk.dim(disks[id].name ?? '')}${tag}`)
 }
 
 console.log()

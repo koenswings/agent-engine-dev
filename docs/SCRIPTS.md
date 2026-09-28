@@ -92,6 +92,17 @@ This document provides a reference for the main provisioning and utility scripts
 
 ---
 
+### `cleanup-store.ts` (`script/cleanup-store.ts`)
+
+-   **Purpose:** Removes stale entries from the Engine's local Automerge store (`store-data/`, document from `store-identity/store-url.txt`).
+-   **Usage:** `pnpm cleanup-store` (dry run), `npx tsx script/cleanup-store.ts --commit` (write), add `--orphans-only` to remove only orphan disk entries. Stop the Engine first (`sudo -u pi pm2 stop engine`); with `--commit` the script refuses to run while pm2 shows it online.
+-   **Details:**
+    -   Default mode removes every undocked disk that is not a system disk, instances that are `Missing` or stored on a removed or unknown disk, and apps without instances. Meant for stores full of test fixture entries.
+    -   **Orphan disk entries (idea#121):** before idea#121 a disk without `META.yaml` and without a readable hardware serial got a new random diskId on every dock, leaving one `diskDB` entry per dock. `findOrphanDiskIds()` in `script/cleanup-store-lib.ts` marks an entry as an orphan when it is undocked (no `dockedTo`, no `device`), not a system disk, no instance is stored on it, it has no `backupConfig`, and no operation names it in its args. Orphans are tagged `[orphan]` in the report. `--orphans-only` removes only those and keeps everything else (undocked App Disks with instances, Backup Disks, instances, apps), so it is safe on a real store. Removing an orphan loses no data: a disk that has a `META.yaml` gets its entry back with the same id on its next dock.
+    -   The rule is unit-tested in `test/automated/meta-first-dock.test.ts`.
+
+---
+
 ### `test-run.sh` (`script/test-run.sh`)
 
 -   **Purpose:** Runs an Engine test suite fully isolated from any live Engine on the same machine (idea#105). All `pnpm test:*` scripts call it.

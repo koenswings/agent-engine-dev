@@ -1,6 +1,6 @@
 import chokidar from 'chokidar'
 import { getKeys, log, uuid } from '../utils/utils.js'
-import { DiskMeta, readHardwareId, readMetaUpdateId } from '../data/Meta.js';
+import { DiskMeta, readHardwareId, readMetaUpdateId, writeMetaFile } from '../data/Meta.js';
 import { $, fs, YAML, chalk } from 'zx'
 
 $.verbose = false;
@@ -9,7 +9,7 @@ import { findDiskByDevice, Store, getDisksOfEngine, getLocalEngine } from '../da
 import { DeviceName, DiskID, DiskName, InstanceID, Timestamp } from '../data/CommonTypes.js'
 
 import { Instance, Status, stopInstance } from '../data/Instance.js';
-import { config, disksRoot } from '../data/Config.js'
+import { config, disksRoot, skipMetaWrite } from '../data/Config.js'
 import { DocHandle } from '@automerge/automerge-repo';
 import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js';
 import { runWithTrace } from '../utils/CommandLogger.js';
@@ -191,6 +191,21 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                         diskName: diskName,
                         created: Date.now() as Timestamp,
                         lastDocked: Date.now() as Timestamp
+                    }
+                    // Persist the identity on the disk (idea#121). Without this every
+                    // dock generated a new diskId (when there is no hardware serial)
+                    // and left an orphan diskDB entry behind. A failed write (read-only
+                    // or root-owned mount) is recorded and the disk is still registered.
+                    const metaPath = `${disksRoot()}/${device}/META.yaml`
+                    if (skipMetaWrite()) {
+                        log(`Not writing ${metaPath} (skipMetaWrite)`)
+                    } else {
+                        try {
+                            await writeMetaFile(meta, metaPath)
+                        } catch (e) {
+                            const idNote = meta.isHardwareId ? 'its id comes from the hardware serial' : 'it will get a new id on its next dock'
+                            recordDiskDetectionFailure('writeMeta', `Could not write META.yaml on ${device} (${idNote}); registering the disk anyway: ${errorMessage(e)}`, { device, diskId: meta.diskId })
+                        }
                     }
                     const disk: Disk = createOrUpdateDisk(storeHandle, localEngine.id, device, meta.diskId, meta.diskName, meta.created)
                     await processDisk(storeHandle, disk)

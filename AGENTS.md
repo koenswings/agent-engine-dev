@@ -91,6 +91,8 @@ settings:
   testMode: false       # true = skip sudo mount/umount (tests)
   # skipImageLoad:      # optional; unset = follows testMode (idea#81). false = load
                         # services/<image>.tar at app start (production), true = skip
+  # skipMetaWrite:      # optional; unset = follows testMode (idea#121). false = write
+                        # META.yaml on the first dock of a disk without one (production)
 ```
 
 `skipImageLoad` (env override `IDEA_SKIP_IMAGE_LOAD=true|false`) is separate from
@@ -99,6 +101,11 @@ settings:
 Engines load every service image from the App Disk's `services/` folder
 (`serviceImageTarPath()`: `/` in the image name → `_`). A missing tar or failed load
 is a warning, not a failure: compose then pulls the image if the Pi has internet (idea#109).
+
+`skipMetaWrite` (env override `IDEA_SKIP_META_WRITE=true|false`) works the same way
+for the META.yaml written on the first dock of a disk that has none (idea#121,
+`skipMetaWrite()` in `src/data/Config.ts`). Production leaves it unset, so the
+Engine writes the disk's identity once and every later dock reads the same diskId.
 
 ## Quality rules (every PR, no exceptions)
 
