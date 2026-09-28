@@ -28,7 +28,8 @@ This document provides a reference for the main provisioning and utility scripts
     -   `-m, --machine <address>`: The Pi's hostname or IP address. Leave it out for Local Mode.
     -   `--hostname <name>`: The hostname to set (default: randomly generated).
     -   `-l, --language <locale>`, `-k, --keyboard <layout>`, `-t, --timezone <tz>`: Localisation settings.
-    -   `--upgrade`, `--argon`, `--zerotier`, `--raspap`, `--gadget`, `--temperature`: Turn on optional parts of the build.
+    -   `--upgrade`, `--argon`, `--zerotier`, `--raspap`, `--gadget`, `--temperature`: Optional parts of the build. Every one of these can be turned off with `--no-<option>` or `--<option>=false` (idea#146), which is required for argon/gadget on spare and Pi 5 profiles.
+    -   `--model pi4|pi5`: Selects the Pi model. On pi5, gadget mode is forced off and an explicit `--gadget` is refused.
     -   `--prod`: Build in production mode.
     -   `--personalize`: Personalize Mode (see above).
 -   **Details:** A full build handles everything from setting the hostname and installing Docker to deploying the Engine software itself.
