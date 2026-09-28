@@ -31,7 +31,7 @@ This document provides a reference for the main provisioning and utility scripts
     -   `--upgrade`, `--argon`, `--zerotier`, `--raspap`, `--gadget`, `--temperature`: Turn on optional parts of the build.
     -   `--prod`: Build in production mode.
     -   `--personalize`: Personalize Mode (see above).
--   **Details:** A full build handles everything from setting the hostname and installing Docker to deploying the Engine software itself. It also installs `/etc/sudoers.d/10-engine` from `script/build_image_assets/10-engine.sudoers` (validated with `visudo` first): the exact commands the Engine, running as `pi`, may run as root. pm2 and `pm2-logrotate` are installed into pi's pm2.
+-   **Details:** A full build handles everything from setting the hostname and installing Docker to deploying the Engine software itself. It also installs the Engine's two sudoers files (`installEngineSudoers`, each validated with `visudo` first, mode 0440, owner root:root): `/etc/sudoers.d/10-engine` from `script/build_image_assets/10-engine.sudoers`, the exact commands the Engine, running as `pi`, may run as root; and `/etc/sudoers.d/11-engine-files` from `script/build_image_assets/11-engine-files.sudoers`, the files it may write as root on App Disks (`/usr/bin/tee /disks/sd[a-z][12]/META.yaml`, idea#121). pm2 and `pm2-logrotate` are installed into pi's pm2.
 
 ---
 
@@ -89,6 +89,17 @@ This document provides a reference for the main provisioning and utility scripts
 -   **Purpose:** Bundles the project source code into a single Markdown file (`docs/source-bundle.md`). This is useful for providing context to LLMs like NotebookLM or Gemini.
 -   **Usage:** `pnpm bundle-context`
 -   **Details:** Ignores `node_modules` and `dist`.
+
+---
+
+### `cleanup-store.ts` (`script/cleanup-store.ts`)
+
+-   **Purpose:** Removes stale entries from the Engine's local Automerge store (`store-data/`, document from `store-identity/store-url.txt`).
+-   **Usage:** `pnpm cleanup-store` (dry run), `npx tsx script/cleanup-store.ts --commit` (write), add `--orphans-only` to remove only orphan disk entries. Stop the Engine first (`sudo -u pi pm2 stop engine`); with `--commit` the script refuses to run while pm2 shows it online.
+-   **Details:**
+    -   Default mode removes every undocked disk that is not a system disk, instances that are `Missing` or stored on a removed or unknown disk, and apps without instances. Meant for stores full of test fixture entries.
+    -   **Orphan disk entries (idea#121):** before idea#121 a disk without `META.yaml` and without a readable hardware serial got a new random diskId on every dock, leaving one `diskDB` entry per dock. `findOrphanDiskIds()` in `script/cleanup-store-lib.ts` marks an entry as an orphan when it is undocked (no `dockedTo`, no `device`), not a system disk, no instance is stored on it, it has no `backupConfig`, and no operation names it in its args. Orphans are tagged `[orphan]` in the report. `--orphans-only` removes only those and keeps everything else (undocked App Disks with instances, Backup Disks, instances, apps), so it is safe on a real store. Removing an orphan loses no data: a disk that has a `META.yaml` gets its entry back with the same id on its next dock.
+    -   The rule is unit-tested in `test/automated/meta-first-dock.test.ts`.
 
 ---
 

@@ -1,4 +1,5 @@
 import { $, chalk, fs, YAML } from 'zx'
+import { posix } from 'path'
 import { deepPrint, fileExists, log, stripPartition, uuid, print } from '../utils/utils.js'
 import { DeviceName, DiskID, DiskName, Timestamp, Version } from './CommonTypes.js'
 import { config, disksRoot } from './Config.js'
@@ -234,18 +235,56 @@ export const createMeta = async (device: DeviceName, engineVersion: Version | un
   return meta
 }
 
+/**
+ * App Disk META.yaml paths that may be written through sudo (idea#121).
+ *
+ * Mount roots under /disks are root:root, so the Engine (running as pi) cannot
+ * create META.yaml there. /etc/sudoers.d/11-engine-files allows exactly
+ * `/usr/bin/tee /disks/sd[a-z][12]/META.yaml`; this regex is the same pattern.
+ * Other roots (test and fixture roots set with IDEA_DISKS_ROOT) are pi-owned and
+ * are not covered by that entry, so they are written without sudo.
+ */
+export const SUDO_META_PATH = /^\/disks\/sd[a-z][12]\/META\.yaml$/
+export const SUDO_TEE = '/usr/bin/tee'
+
+/**
+ * Runs `sudo /usr/bin/tee <metaPath> > /dev/null` with the YAML on stdin. The
+ * arguments sudo sees are exactly `/usr/bin/tee <metaPath>`, which is what the
+ * 11-engine-files entry matches. Injectable so tests can check the call.
+ */
+export type SudoTeeRunner = (metaPath: string, content: string) => Promise<void>
+export const runSudoTee: SudoTeeRunner = async (metaPath, content) => {
+  await $({ input: content })`sudo ${SUDO_TEE} ${metaPath} > /dev/null`
+}
+
+/**
+ * Write a META.yaml file and throw when it cannot be written (idea#121).
+ * Callers that must know whether the write worked (e.g. the first dock of a
+ * disk without META.yaml) use this; writeMeta() below logs and swallows errors.
+ *
+ *   - /META.yaml (system disk): `sudo tee /META.yaml` (10-engine, idea#80)
+ *   - /disks/sd[a-z][12]/META.yaml (App Disk mount roots, root:root):
+ *     `sudo /usr/bin/tee <path>` (11-engine-files, idea#121)
+ *   - any other path (test/fixture roots owned by pi): a plain write as pi
+ */
+export const writeMetaFile = async (meta: DiskMeta, rootPath: string, sudoTee: SudoTeeRunner = runSudoTee): Promise<void> => {
+  const metaPath = posix.normalize(rootPath)
+  log(`Writing metadata ${deepPrint(meta)} to ${metaPath}`)
+  const yamlContent = YAML.stringify(meta)
+  if (metaPath === '/META.yaml') {
+    // Only the system disk's /META.yaml is root-owned. Pipe the YAML into
+    // `sudo tee /META.yaml`: a fixed command the Engine's sudoers file allows (idea#80).
+    await $({ input: yamlContent })`sudo tee /META.yaml > /dev/null`
+  } else if (SUDO_META_PATH.test(metaPath)) {
+    await sudoTee(metaPath, yamlContent)
+  } else {
+    await fs.writeFile(metaPath, yamlContent)
+  }
+}
+
 const writeMeta = async (meta: DiskMeta, rootPath: string): Promise<void> => {
-  log(`Writing metadata ${deepPrint(meta)} to ${rootPath}`)
   try {
-    const yamlContent = YAML.stringify(meta)
-    if (rootPath === '/META.yaml') {
-      // Only the system disk's /META.yaml is root-owned. Pipe the YAML into
-      // `sudo tee /META.yaml`: a fixed command the Engine's sudoers file allows (idea#80).
-      await $({ input: yamlContent })`sudo tee /META.yaml > /dev/null`
-    } else {
-      // META.yaml files on App Disks (under the mount points) are written as pi.
-      await fs.writeFile(rootPath, yamlContent)
-    }
+    await writeMetaFile(meta, rootPath)
   } catch (e) {
     print(chalk.red('Error writing metadata'))
     console.error(e)

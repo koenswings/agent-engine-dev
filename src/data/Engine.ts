@@ -483,35 +483,47 @@ EOF`
 }
 
 /**
- * Installs /etc/sudoers.d/10-engine: the narrow list of root commands the Engine
- * (running as pi) needs (idea#80, proposals/run-architecture.md).
+ * The Engine's sudoers files (asset in script/build_image_assets -> installed file).
+ *   - 10-engine: the narrow list of root commands the Engine (running as pi)
+ *     needs (idea#80, proposals/run-architecture.md)
+ *   - 11-engine-files: files the Engine writes as root on App Disks, e.g.
+ *     META.yaml on the first dock (idea#121)
+ * Installed names have no '.' in them: sudo skips files in /etc/sudoers.d whose
+ * name contains a '.'.
+ */
+export const ENGINE_SUDOERS_FILES: { asset: string, installed: string }[] = [
+  { asset: '10-engine.sudoers', installed: '/etc/sudoers.d/10-engine' },
+  { asset: '11-engine-files.sudoers', installed: '/etc/sudoers.d/11-engine-files' },
+]
+
+/**
+ * Installs every file in ENGINE_SUDOERS_FILES (0440, owner 0:0).
  *
- * The asset is validated with `visudo -cf` before it is copied, because a broken
- * sudoers file can lock sudo out. The installed name has no '.' in it: sudo skips
- * files in /etc/sudoers.d whose name contains a '.'. After copying, the whole
- * sudoers configuration is checked again; on failure the file is removed.
+ * Each asset is validated with `visudo -cf` before it is copied, because a broken
+ * sudoers file can lock sudo out. After copying, the whole sudoers configuration
+ * is checked again; on failure that file is removed.
  */
 export const installEngineSudoers = async (exec: any, enginePath: string) => {
-  const asset = '10-engine.sudoers'
-  const installed = '/etc/sudoers.d/10-engine'
-  print(chalk.blue(`Validating ${asset} with visudo...`))
-  try {
-    await exec`sudo visudo -cf ${enginePath}/script/build_image_assets/${asset}`
-  } catch (e) {
-    print(chalk.red(`${asset} failed visudo validation; not installing it`))
-    console.error(e)
-    process.exit(1)
+  for (const { asset, installed } of ENGINE_SUDOERS_FILES) {
+    print(chalk.blue(`Validating ${asset} with visudo...`))
+    try {
+      await exec`sudo visudo -cf ${enginePath}/script/build_image_assets/${asset}`
+    } catch (e) {
+      print(chalk.red(`${asset} failed visudo validation; not installing it`))
+      console.error(e)
+      process.exit(1)
+    }
+    await copyAsset(exec, enginePath, asset, path.dirname(installed), false, '0440', '0:0', path.basename(installed))
+    try {
+      await exec`sudo visudo -c`
+    } catch (e) {
+      print(chalk.red(`sudoers check failed after installing ${installed}; removing it`))
+      await exec`sudo rm -f ${installed}`
+      console.error(e)
+      process.exit(1)
+    }
+    print(chalk.green(`${installed} installed`))
   }
-  await copyAsset(exec, enginePath, asset, '/etc/sudoers.d', false, '0440', '0:0', '10-engine')
-  try {
-    await exec`sudo visudo -c`
-  } catch (e) {
-    print(chalk.red(`sudoers check failed after installing ${installed}; removing it`))
-    await exec`sudo rm -f ${installed}`
-    console.error(e)
-    process.exit(1)
-  }
-  print(chalk.green(`${installed} installed`))
 }
 
 export const rebootSystem = async (exec: any) => {

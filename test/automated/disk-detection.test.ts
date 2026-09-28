@@ -234,9 +234,9 @@ describe('disk detection failures are reported, not only logged (idea#82)', () =
         expect(start).not.toMatch(/^\s*enableUsbDeviceMonitor\(storeHandle\)\s*$/m)
     })
 
-    it('usbDeviceMonitor.ts records mount, META, dock, undock and watcher failures', () => {
+    it('usbDeviceMonitor.ts records mount, META read and write, dock, undock and watcher failures', () => {
         const monitor = src('src/monitors/usbDeviceMonitor.ts')
-        for (const step of ['mount', 'readMeta', 'dock', 'undock', 'watcher']) {
+        for (const step of ['mount', 'readMeta', 'writeMeta', 'dock', 'undock', 'watcher']) {
             expect(monitor, step).toContain(`recordDiskDetectionFailure('${step}'`)
         }
     })

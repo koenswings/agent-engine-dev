@@ -11,7 +11,7 @@
  *
  *   - runs a startup self-check that reports what the self-repair could not fix
  *   - records disk detection failures (self-check, monitor start, mount, META
- *     read, undock) as failed `diskDetection` traces in the command log, so they
+ *     read, META write, undock) as failed `diskDetection` traces in the command log, so they
  *     appear in the Console History panel (no store schema change)
  */
 
@@ -30,7 +30,7 @@ export const SYS_BLOCK_DIR = '/sys/class/block'
 // Devices the udev rule links into /dev/engine: KERNEL=="sd?|sd?1|sd?2"
 export const RULE_DEVICE_PATTERN = /^sd[a-z][12]?$/
 
-export type DiskDetectionStep = 'selfCheck' | 'monitorStart' | 'watcher' | 'mount' | 'readMeta' | 'dock' | 'undock'
+export type DiskDetectionStep = 'selfCheck' | 'monitorStart' | 'watcher' | 'mount' | 'readMeta' | 'writeMeta' | 'dock' | 'undock'
 
 /**
  * Record a disk detection failure: always logged, and added to the command log

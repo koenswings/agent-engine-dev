@@ -20,6 +20,7 @@ export interface Settings {
     systemDiskSkip?: boolean;     // If true, skip registering the Pi boot disk as a system disk (for test harnesses)
     disksRoot?: string;           // Mount root for App Disks (default: /disks). Tests point this at a private temp folder.
     skipImageLoad?: boolean;      // If true, don't load service images from services/*.tar at app start (default: same as testMode). See skipImageLoad().
+    skipMetaWrite?: boolean;      // If true, don't write META.yaml on the first dock of a disk without one (default: same as testMode). See skipMetaWrite().
 }
 
 export interface Defaults {
@@ -114,6 +115,7 @@ function validateSettings(obj: any, path: string): string[] {
     if (obj.heartbeatIntervalMs !== undefined && typeof obj.heartbeatIntervalMs !== 'number') errors.push(`'${path}heartbeatIntervalMs' must be a number.`);
     if (obj.disksRoot !== undefined && typeof obj.disksRoot !== 'string') errors.push(`'${path}disksRoot' must be a string.`);
     if (obj.skipImageLoad !== undefined && typeof obj.skipImageLoad !== 'boolean') errors.push(`'${path}skipImageLoad' must be a boolean.`);
+    if (obj.skipMetaWrite !== undefined && typeof obj.skipMetaWrite !== 'boolean') errors.push(`'${path}skipMetaWrite' must be a boolean.`);
     return errors;
 }
 
@@ -277,6 +279,23 @@ if (process.env.IDEA_SKIP_IMAGE_LOAD === 'true' || process.env.IDEA_SKIP_IMAGE_L
  * fixture disk. Read at call time so overrides always apply.
  */
 export const skipImageLoad = (): boolean => config.settings.skipImageLoad ?? config.settings.testMode;
+
+// Allow IDEA_SKIP_META_WRITE=true|false to override whether META.yaml is written
+// on the first dock of a disk without one (idea#121). Unset: follows testMode.
+if (process.env.IDEA_SKIP_META_WRITE === 'true' || process.env.IDEA_SKIP_META_WRITE === 'false') {
+    config.settings.skipMetaWrite = process.env.IDEA_SKIP_META_WRITE === 'true';
+}
+
+/**
+ * Whether the USB device monitor skips writing META.yaml when a disk without
+ * one is docked for the first time (idea#121).
+ *
+ * Like readMetaUpdateId(), the write is skipped in testMode so ordinary tests
+ * never change their fixture copies. settings.skipMetaWrite, when set, decides
+ * on its own, so a test can set it to false to exercise the real first-dock
+ * write. Read at call time so overrides always apply.
+ */
+export const skipMetaWrite = (): boolean => config.settings.skipMetaWrite ?? config.settings.testMode;
 
 export const DEFAULT_DISKS_ROOT = '/disks';
 
