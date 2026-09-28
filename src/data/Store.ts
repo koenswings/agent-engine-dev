@@ -307,6 +307,18 @@ export const findDiskByDevice = (store: Store, deviceName: DeviceName, engineId?
     return disks.find(disk => String(disk.device) === String(deviceName))
 }
 
+/**
+ * Every disk record on a device (idea#152). A stale record can share the device
+ * with the live one (e.g. an old undock that never reached the store), so callers
+ * that dock, undock or dedupe must look at all of them, not just the first.
+ */
+export const findDisksByDevice = (store: Store, deviceName: DeviceName, engineId?: EngineID): Disk[] => {
+    const disks = engineId
+        ? getDisksOfEngine(store, store.engineDB[engineId])
+        : getDisks(store)
+    return disks.filter(disk => String(disk.device) === String(deviceName))
+}
+
 export const findDiskByName = (store: Store, diskName: string): Disk | undefined => {
     return getDisks(store).find(disk => String(disk.name) === String(diskName))
 }

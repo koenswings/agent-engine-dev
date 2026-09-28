@@ -102,8 +102,8 @@ These commands perform actions on the system. Some are restricted to an `engine`
 - **Scope:** `engine`
 
 ### `ejectDisk`
-- **Description:** Safely ejects a docked disk from this engine. Stops all running instances on the disk, unmounts it, and updates the shared store to reflect the undocked state. Equivalent to a clean physical removal.
-- **Usage:** `ejectDisk <diskName>`
+- **Description:** Safely ejects a docked disk from this engine. Stops all running instances on the disk, unmounts it, and updates the shared store to reflect the undocked state. Equivalent to a clean physical removal. Any stale store record that still claims the same device is undocked too (idea#152).
+- **Usage:** `ejectDisk <diskId>` (the Console sends `disk.id`). A disk name is still accepted for older Consoles and the CLI: it only matches disks docked to this engine with a device, and is refused as ambiguous when two such disks share the name (eject by id instead). A refusal ends the command trace as `error` with the reason.
 - **Scope:** `engine`
 
 ### `reboot`

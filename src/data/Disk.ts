@@ -93,9 +93,32 @@ export interface Disk {
 
 
 
+/**
+ * idea#152: undock, in the store only, every other disk record that claims
+ * <engineId, device>. Call inside a storeHandle.change callback. The physical
+ * device belongs to the record being kept, so nothing is unmounted here.
+ * Returns the ids that were cleared.
+ */
+export const clearDuplicateDiskRecords = (doc: Store, engineId: EngineID, device: DeviceName, keepDiskId: DiskID): DiskID[] => {
+    const cleared: DiskID[] = []
+    for (const other of Object.values(doc.diskDB)) {
+        if (!other || String(other.id) === String(keepDiskId)) continue
+        if (String(other.dockedTo) !== String(engineId) || String(other.device) !== String(device)) continue
+        other.dockedTo = null
+        other.device = null
+        other.diskTypes = []
+        other.backupConfig = null
+        cleared.push(other.id)
+    }
+    return cleared
+}
+
 export const createOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: EngineID, device: DeviceName, diskId: DiskID, diskName: DiskName, created: Timestamp): Disk => {
     let disk: Disk
+    let cleared: DiskID[] = []
     storeHandle.change(doc => {
+        // A device holds one disk: undock any other record on this engine+device (idea#152)
+        cleared = clearDuplicateDiskRecords(doc, engineId, device, diskId)
         let storedDisk = doc.diskDB[diskId];
         if (!storedDisk) {
             log(`Creating disk ${diskId} on engine ${engineId}`);
@@ -122,6 +145,7 @@ export const createOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: Engi
             disk.backupConfig = null;   // reset; will be repopulated if Backup Disk
         }
     });
+    if (cleared.length > 0) log(`Undocked stale disk record(s) ${cleared.join(', ')} on ${device}: device now holds disk ${diskId}`)
     return disk!; // Non-null assertion
 }   
 
