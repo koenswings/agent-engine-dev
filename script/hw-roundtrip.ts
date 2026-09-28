@@ -259,9 +259,10 @@ const plug = async () => {
 function finish(code?: number) {
     if (finished) return
     finished = true
-    stopUdev()
+    udev?.kill()
+    udev = null
     const result = code ?? (failures.length ? 1 : 0)
-    write(`RESULT ${result === 0 ? 'PASS' : 'FAIL'}: ${passes} passed, ${failures.length} failed`)
+    write(`RESULT ${result === 0 ? 'PASS' : result === 2 ? 'ABORT' : 'FAIL'}: ${passes} passed, ${failures.length} failed`)
     failures.forEach(f => write(`  failed: ${f}`))
     write(`log: ${LOG_FILE}`)
     process.exitCode = result
