@@ -21,7 +21,7 @@ import { backupInstance } from './monitors/backupMonitor.js'
 import { InstanceID } from './data/CommonTypes.js'
 import { Status } from './data/Instance.js'
 import { Store } from './data/Store.js'
-import { createCommandLogStore } from './data/CommandLogStore.js'
+import { createCommandLogStore, shutdownRepo } from './data/CommandLogStore.js'
 import { initCommandLogger } from './utils/CommandLogger.js'
 
 
@@ -240,5 +240,5 @@ async function shutdownProcedure(repo: Repo, httpServer?: import('http').Server,
         await new Promise<void>(resolve => httpServer.close(() => resolve()))
         log('HTTP server closed')
     }
-    if (repo) await repo.shutdown()
+    if (repo) await shutdownRepo(repo)
 }
