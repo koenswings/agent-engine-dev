@@ -35,6 +35,7 @@
     "test:unit": "IDEA_SYSTEM_DISK_SKIP=true bash script/test-run.sh unit automated",
     "test:diagnostic": "IDEA_SYSTEM_DISK_SKIP=true bash script/test-run.sh diagnostic diagnostic",
     "test:cross-engine": "IDEA_SYSTEM_DISK_SKIP=true bash script/test-run.sh cross-engine cross-engine",
+    "test:hw": "npx tsx script/hw-roundtrip.ts",
     "bundle-context": "tsx script/bundle-context.ts",
     "dump-store": "npx tsx script/dump-store.ts",
     "cleanup-store": "npx tsx script/cleanup-store.ts"

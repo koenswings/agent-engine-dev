@@ -48,6 +48,7 @@ pnpm test:unit      # unit tests only
 pnpm test:diagnostic  # field health checks
 pnpm test:cross-engine  # requires 2+ Pis both running (no pre-flight, no testMode)
 pnpm test:preflight # run only the live-Engine pre-flight check
+pnpm test:hw        # on a claimed Pi only: hardware eject → unplug/re-plug round trip + system-disk checks (docs/SCRIPTS.md)
 pnpm build:test     # compile into dist-test/ only
 ```
 
@@ -106,6 +107,9 @@ Engine test rules on a claimed Pi:
 - Keep `IDEA_NETWORK_TESTS` off unless an issue asks for it.
 - Sudoers: you may install your PR's version of `11-engine-files` with `installEngineSudoers` **only** on a Pi you have claimed, and must restore main's version before releasing it. Golden idea02 sudoers stays with Atlas.
 - Never modify `store-identity/store-template.json`, on any Pi or in the repo.
+- **Disk PRs must pass the on-Pi hardware round trip before hand-off (idea#152).** This covers any change to docking, undocking, eject, mounting or disk records. On the claimed Pi, with the pm2 Engine stopped, run the PR's Engine from your separate checkout (own store, `mdns: false`, `httpPort` other than the fleet's, stdout to a log file). Dock a USB test disk that has at least two partitions (idea03's Ugreen SSD: vfat `system-boot` + ext4 `writable`). Then run, from that checkout:
+  `pnpm test:hw --engine-log <engine stdout log> --cycles 2`
+  It must pass twice in a row. Put the command and the `RESULT PASS` log lines in the PR body. It uses the tester's own `sudo` for the sysfs unplug/re-plug (never the Engine sudoers) and never touches the system drive or golden idea02.
 
 Release when done: restore main in every tree you touched (and main's sudoers if you changed them), restart the Engine with pm2 as pi (`pm2 restart engine`), then:
 

@@ -1,5 +1,5 @@
 # Project Source Code Context
-Generated on 2026-09-28T16:52:53.748Z
+Generated on 2026-09-28T18:34:47.646Z
 
 ## File: package.json
 ```typescript
@@ -40,6 +40,7 @@ Generated on 2026-09-28T16:52:53.748Z
     "test:unit": "IDEA_SYSTEM_DISK_SKIP=true bash script/test-run.sh unit automated",
     "test:diagnostic": "IDEA_SYSTEM_DISK_SKIP=true bash script/test-run.sh diagnostic diagnostic",
     "test:cross-engine": "IDEA_SYSTEM_DISK_SKIP=true bash script/test-run.sh cross-engine cross-engine",
+    "test:hw": "npx tsx script/hw-roundtrip.ts",
     "bundle-context": "tsx script/bundle-context.ts",
     "dump-store": "npx tsx script/dump-store.ts",
     "cleanup-store": "npx tsx script/cleanup-store.ts"
@@ -596,4106 +597,6 @@ runner.run(function(failures) {
 });
 ```
 
-## File: src/monitors/backupMonitor.ts
-```typescript
-/**
- * backupMonitor.ts — Backup Disk processing, backup/restore operations
- *
- * Design: design/backup-disk.md
- *
- * Key design points:
- *  - BorgBackup for deduplicating, atomic, resumable archives
- *  - activeBackups Set prevents double-backup on reboot race
- *  - Lock file (.backup-in-progress) enables boot-resume after interrupted backup
- *  - testMode: skips borg commands but exercises all other logic (store updates, YAML, lock files)
- */
-
-import { $, YAML, chalk, fs } from 'zx'
-import { log, print } from '../utils/utils.js'
-import { config, disksRoot } from '../data/Config.js'
-import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot } from '../data/Disk.js'
-import { indexBackupDiskApps } from '../data/InstallApp.js'
-import { createOperation, updateOperation } from '../data/Operations.js'
-import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
-import { stopInstance, startInstance, BACKUP_STEPS } from '../data/Instance.js'
-import { BackupMode, DiskID, DiskName, InstanceID, Timestamp, OperationCause, Operation } from '../data/CommonTypes.js'
-import { Store, getInstance, getDisks, findDiskByName } from '../data/Store.js'
-import { DocHandle } from '@automerge/automerge-repo'
-import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js'
-import { runWithTrace, flushTrace, getActiveTrace } from '../utils/CommandLogger.js'
-
-$.verbose = false
-
-// ── In-memory mutex ──────────────────────────────────────────────────────────
-// Prevents double-backup when both App Disk and Backup Disk dock at the same
-// time after a reboot (see design/backup-disk.md — Reboot Race Condition).
-const activeBackups = new Set<InstanceID>()
-
-// ── BACKUP.yaml shape ────────────────────────────────────────────────────────
-interface BackupYaml {
-    mode: BackupMode
-    links: Array<{ instanceId: string; lastBackup: number }>
-}
-
-const BACKUP_YAML = 'BACKUP.yaml'
-const LOCK_FILE = '.backup-in-progress'
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-const backupDir = (backupDevice: string, instanceId: InstanceID) =>
-    `${disksRoot()}/${backupDevice}/backups/${instanceId}`
-
-const lockFilePath = (backupDevice: string, instanceId: InstanceID) =>
-    `${backupDir(backupDevice, instanceId)}/${LOCK_FILE}`
-
-const readBackupYaml = async (backupDevice: string): Promise<BackupYaml | null> => {
-    try {
-        const raw = await fs.readFile(`${disksRoot()}/${backupDevice}/${BACKUP_YAML}`, 'utf-8')
-        return YAML.parse(raw) as BackupYaml
-    } catch {
-        return null
-    }
-}
-
-const writeBackupYaml = async (backupDevice: string, yaml: BackupYaml): Promise<void> => {
-    await fs.writeFile(`${disksRoot()}/${backupDevice}/${BACKUP_YAML}`, YAML.stringify(yaml))
-}
-
-// ── Core backup logic ─────────────────────────────────────────────────────────
-
-/**
- * Run a Borg backup of one instance to a Backup Disk.
- * Idempotent: if interrupted and re-triggered, Borg deduplicates against
- * existing chunks and completes in near-O(delta) time.
- */
-export const backupInstance = async (
-    storeHandle: DocHandle<Store>,
-    instanceId: InstanceID,
-    backupDisk: Disk,
-    existingOpId?: string,  // pass when retrying an interrupted op
-    cause: OperationCause = 'console-command',
-): Promise<void> => {
-    // If there is no active trace (called from backup monitor, not via Console command),
-    // create one so that step markers and log lines land in the Console log panel.
-    if (!getActiveTrace()) {
-        const cmdLogHandle = getCommandLogHandle()
-        const traceId = crypto.randomUUID()
-        const traceArgs = JSON.stringify({ instanceId, backupDiskId: backupDisk.id, cause })
-        if (cmdLogHandle) addTrace(cmdLogHandle, { traceId, command: 'backupApp', args: traceArgs, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
-        return runWithTrace({ traceId, command: 'backupApp', args: traceArgs }, async () => {
-            await backupInstance(storeHandle, instanceId, backupDisk, existingOpId, cause)
-            if (cmdLogHandle) { await flushTrace(traceId); closeTrace(cmdLogHandle, traceId, 'ok') }
-        }).catch(async (err: any) => {
-            if (cmdLogHandle) { await flushTrace(traceId); closeTrace(cmdLogHandle, traceId, 'error', err?.message ?? String(err)) }
-        })
-    }
-
-    if (activeBackups.has(instanceId)) {
-        log(`Backup for ${instanceId} already in progress — skipping duplicate trigger`)
-        return
-    }
-    activeBackups.add(instanceId)
-    let wasRunning = false
-
-    // Take the instance lock and the Backup Disk lock together, as restore does
-    // (idea#126, Files Disk step 0): nothing else may change the instance or the
-    // Backup Disk (eject, erase, another backup or restore) while Borg writes.
-    const backupLockKeys = backupLockKeysFor(instanceId, backupDisk.id)
-    if (!resourceLock.acquireAll(backupLockKeys, 'backupApp')) {
-        activeBackups.delete(instanceId)
-        const held = backupLockKeys.map(k => resourceLock.getLockInfo(k)).find(Boolean)
-        throw new Error(`Backup of instance ${instanceId} to disk ${backupDisk.id} not started: the instance or the Backup Disk is locked${held ? ` by '${held.kind}'` : ''} (another operation is running)`)
-    }
-
-    const opId = existingOpId ?? createOperation(storeHandle, 'backupApp', {
-        instanceId,
-        backupDiskId: backupDisk.id,
-    }, cause, { type: 'instance', id: instanceId })
-
-    try {
-        updateOperation(storeHandle, opId, { status: 'Running' })
-        const store = storeHandle.doc()
-        const instance = getInstance(store, instanceId)
-        if (!instance) {
-            throw new Error(`Instance ${instanceId} not found in store`)
-        }
-        if (!instance.storedOn) {
-            throw new Error(`Instance ${instanceId} has no storedOn disk`)
-        }
-
-        const appDisk = store.diskDB[instance.storedOn]
-        if (!appDisk || !appDisk.device) {
-            throw new Error(`App Disk for instance ${instanceId} is not docked`)
-        }
-
-        const backupDevice = backupDisk.device!
-        const appDevice = appDisk.device
-        const repoPath = backupDir(backupDevice, instanceId)
-        const lockPath = lockFilePath(backupDevice, instanceId)
-
-        const totalBackupSteps = BACKUP_STEPS.length
-
-        const setBackupStep = (step: number, label: string) => {
-            const line = `  Step ${step + 1}/${totalBackupSteps}  │  ${label}  `
-            const bar  = '─'.repeat(line.length)
-            print(`┌${bar}┐`)
-            print(`│${line}│`)
-            print(`└${bar}┘`)
-            storeHandle.change(doc => {
-                const op = doc.operationDB?.[opId]
-                if (!op) return
-                op.currentStep = step
-                op.totalSteps = totalBackupSteps
-                op.stepLabel = label
-                op.progressPercent = Math.round((step / (totalBackupSteps - 1)) * 100)
-            })
-        }
-
-        log(`Starting backup of instance ${instanceId} from ${appDevice} to ${backupDevice}`)
-
-        // 1. Init Borg repo if this is the first backup
-        setBackupStep(0, BACKUP_STEPS[0])
-        const repoExists = await fs.pathExists(`${repoPath}/config`)
-        if (!repoExists) {
-            log(`Initialising Borg repo at ${repoPath}`)
-            await fs.ensureDir(repoPath)
-            if (!config.settings.testMode) {
-                await $`borg init --encryption=none ${repoPath}`
-            } else {
-                log(`testMode: skipping borg init`)
-            }
-        }
-
-        // 2. Write lock file (signals in-progress backup for boot-resume)
-        await fs.writeFile(lockPath, JSON.stringify({ instanceId, startedAt: Date.now() }))
-
-        // 3. Stop the instance if running (ensures filesystem consistency)
-        if (instance.status === 'Running') {
-            wasRunning = true
-            log(`Stopping instance ${instanceId} before backup`)
-            setBackupStep(1, BACKUP_STEPS[1])
-            await stopInstance(storeHandle, instance, appDisk, 'backup-pre-stop')
-        }
-
-        // 4. Run borg create
-        setBackupStep(2, BACKUP_STEPS[2])
-        const archiveName = new Date().toISOString().replace(/[:.]/g, '-')
-        if (!config.settings.testMode) {
-            log(`Running borg create for instance ${instanceId}`)
-            await $`borg create ${repoPath}::${archiveName} ${await diskMountRoot(appDisk)}/instances/${instanceId}`
-        } else {
-            log(`testMode: skipping borg create for instance ${instanceId}`)
-        }
-
-        // 5. Restart instance if it was running
-        if (wasRunning) {
-            log(`Restarting instance ${instanceId} after backup`)
-            setBackupStep(3, BACKUP_STEPS[3])
-            await startInstance(storeHandle, instance, appDisk, 'backup-post-start')
-        }
-
-        // 6. Update store: set lastBackup on the instance
-        setBackupStep(4, BACKUP_STEPS[4])
-        storeHandle.change(doc => {
-            const inst = doc.instanceDB[instanceId]
-            if (inst) inst.lastBackup = Date.now() as Timestamp
-        })
-
-        // 7. Update BACKUP.yaml on the disk
-        const yaml = await readBackupYaml(backupDevice)
-        if (yaml) {
-            const link = yaml.links.find(l => l.instanceId === instanceId)
-            if (link) {
-                link.lastBackup = Date.now()
-            }
-            await writeBackupYaml(backupDevice, yaml)
-        }
-
-        // 8. Remove lock file (success)
-        await fs.remove(lockPath)
-
-        updateOperation(storeHandle, opId, {
-            status: 'Done',
-            progressPercent: 100,
-            completedAt: Date.now() as Timestamp,
-        })
-        log(chalk.green(`Backup of instance ${instanceId} completed successfully`))
-
-    } catch (e: any) {
-        updateOperation(storeHandle, opId, {
-            status: 'Failed',
-            error: e.message ?? String(e),
-            completedAt: Date.now() as Timestamp,
-        })
-        log(chalk.red(`Backup of instance ${instanceId} failed: ${e.message ?? e}`))
-        // Always restart instance if it was stopped (even on failure)
-        if (wasRunning) {
-            try {
-                const store = storeHandle.doc()
-                const instance = getInstance(store, instanceId)
-                const appDisk = instance?.storedOn ? store.diskDB[instance.storedOn] : null
-                if (instance && appDisk) {
-                    log(`Restarting instance ${instanceId} after failed backup`)
-                    await startInstance(storeHandle, instance, appDisk, 'backup-post-start')
-                }
-            } catch (restartErr) {
-                log(chalk.red(`Failed to restart instance ${instanceId} after backup error: ${restartErr}`))
-            }
-        }
-        // Lock file intentionally left in place — signals boot-resume on next dock
-        // Rethrow so the backup's trace ends with status 'error' and this message
-        throw e
-    } finally {
-        activeBackups.delete(instanceId)
-        resourceLock.releaseAll(backupLockKeys)
-    }
-}
-
-/** Lock keys a backup holds: the instance and the Backup Disk (idea#126). */
-export const backupLockKeysFor = (instanceId: string, backupDiskId: string): string[] =>
-    [instanceKey(instanceId), diskKey(backupDiskId)]
-
-/**
- * The running (or pending) backupApp operation writing to a disk, if any
- * (idea#126). Eject (and a later erase) check this by the operation's
- * backupDiskId, so every backup is covered, whatever started it (console,
- * immediate mode, stale lock, crash recovery, a schedule).
- */
-export const runningBackupOnDisk = (store: Store, diskId: string): Operation | undefined =>
-    Object.values(store.operationDB ?? {}).find(op =>
-        op?.kind === 'backupApp' &&
-        (op.status === 'Running' || op.status === 'Pending') &&
-        op.args?.backupDiskId === diskId) as Operation | undefined
-
-/**
- * Start a backup from a monitor loop: failures are already recorded in the
- * backup's trace and operation, so they are logged here and the loop goes on.
- */
-const triggerBackup = async (
-    storeHandle: DocHandle<Store>,
-    instanceId: InstanceID,
-    backupDisk: Disk,
-    cause: OperationCause,
-): Promise<void> => {
-    try {
-        await backupInstance(storeHandle, instanceId, backupDisk, undefined, cause)
-    } catch (e: any) {
-        log(chalk.red(`Backup of instance ${instanceId} failed: ${e?.message ?? e}`))
-    }
-}
-
-// ── Backup Disk processing ────────────────────────────────────────────────────
-
-/**
- * Called by processDisk when a Backup Disk is detected.
- * - Reads BACKUP.yaml and sets backupConfig in the store
- * - Scans for stale lock files and re-queues interrupted backups
- * - Triggers backupInstance for immediate mode
- */
-export const processBackupDisk = async (
-    storeHandle: DocHandle<Store>,
-    backupDisk: Disk
-): Promise<void> => {
-    const backupDevice = backupDisk.device!
-    log(`Processing Backup Disk ${backupDisk.id} on device ${backupDevice}`)
-
-    const yaml = await readBackupYaml(backupDevice)
-    if (!yaml) {
-        log(`No BACKUP.yaml found on disk ${backupDisk.id} — skipping backup processing`)
-        return
-    }
-
-    const mode = yaml.mode
-    const links = yaml.links.map(l => l.instanceId as InstanceID)
-
-    // Set backupConfig in store
-    storeHandle.change(doc => {
-        const d = doc.diskDB[backupDisk.id]
-        if (d) d.backupConfig = { mode, links }
-    })
-
-    // Phase 2: index any app bundles on this disk into appDB for installApp / Console
-    await indexBackupDiskApps(storeHandle, backupDisk)
-
-    // Scan for stale lock files (interrupted backups from before a reboot)
-    const backupsBase = `${disksRoot()}/${backupDevice}/backups`
-    if (await fs.pathExists(backupsBase)) {
-        const entries = await fs.readdir(backupsBase)
-        for (const entry of entries) {
-            const lockPath = `${backupsBase}/${entry}/${LOCK_FILE}`
-            if (await fs.pathExists(lockPath)) {
-                const staleInstanceId = entry as InstanceID
-                log(`Stale lock file found for instance ${staleInstanceId} — re-triggering backup`)
-                const store = storeHandle.doc()
-                const instance = getInstance(store, staleInstanceId)
-                const appDiskDocked = instance?.storedOn
-                    ? store.diskDB[instance.storedOn]?.device != null
-                    : false
-                if (appDiskDocked) {
-                    await triggerBackup(storeHandle, staleInstanceId, backupDisk, 'backup-stale-lock')
-                } else {
-                    log(`App Disk for ${staleInstanceId} not yet docked — stale lock will be handled when App Disk docks`)
-                }
-            }
-        }
-    }
-
-    // Trigger immediate backups for all linked instances whose App Disk is docked
-    if (mode === 'immediate') {
-        const store = storeHandle.doc()
-        for (const instanceId of links) {
-            const instance = getInstance(store, instanceId)
-            if (!instance?.storedOn) continue
-            const appDisk = store.diskDB[instance.storedOn]
-            if (appDisk?.device) {
-                await triggerBackup(storeHandle, instanceId, backupDisk, 'console-command')
-            } else {
-                log(`Instance ${instanceId}: App Disk not docked — backup will trigger when App Disk docks`)
-            }
-        }
-    }
-}
-
-// ── App Disk hook ─────────────────────────────────────────────────────────────
-
-/**
- * Called from processAppDisk when an App Disk docks.
- * Checks all docked Backup Disks for links to instances on this App Disk
- * and triggers backup for immediate-mode disks.
- */
-export const checkPendingBackups = async (
-    storeHandle: DocHandle<Store>,
-    appDisk: Disk
-): Promise<void> => {
-    const store = storeHandle.doc()
-
-    // Find all currently docked Backup Disks
-    const dockedDisks = Object.values(store.diskDB).filter(d => d.device != null)
-    for (const candidate of dockedDisks) {
-        if (!candidate.diskTypes?.includes('backup')) continue
-        if (!candidate.backupConfig) continue
-        if (candidate.backupConfig.mode !== 'immediate') continue
-
-        // Check if any linked instance lives on the newly docked App Disk
-        const instancesOnAppDisk = Object.values(store.instanceDB)
-            .filter(inst => String(inst.storedOn) === String(appDisk.id))
-
-        for (const instance of instancesOnAppDisk) {
-            if (candidate.backupConfig.links.includes(instance.id)) {
-                log(`checkPendingBackups: triggering backup for instance ${instance.id}`)
-                await triggerBackup(storeHandle, instance.id, candidate as Disk, 'backup-app-docked')
-            }
-        }
-
-        // Also check for stale locks for instances on this App Disk
-        if (candidate.device) {
-            const backupsBase = `${disksRoot()}/${candidate.device}/backups`
-            if (await fs.pathExists(backupsBase)) {
-                const entries = await fs.readdir(backupsBase)
-                for (const entry of entries) {
-                    const lockPath = `${backupsBase}/${entry}/${LOCK_FILE}`
-                    if (await fs.pathExists(lockPath)) {
-                        const staleId = entry as InstanceID
-                        const staleInstance = getInstance(store, staleId)
-                        if (String(staleInstance?.storedOn) === String(appDisk.id)) {
-                            log(`checkPendingBackups: stale lock for ${staleId} — re-triggering backup`)
-                            await triggerBackup(storeHandle, staleId, candidate as Disk, 'backup-stale-lock')
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ── restoreApp ────────────────────────────────────────────────────────────────
-
-/**
- * Restore the latest archive for instanceId from any docked Backup Disk
- * onto targetDisk.
- */
-export const restoreApp = async (
-    storeHandle: DocHandle<Store>,
-    instanceId: InstanceID,
-    targetDisk: Disk,
-    existingOpId?: string,
-    cause: OperationCause = 'console-command',
-): Promise<void> => {
-    // Acquire lock: instance + target disk
-    const restoreLockKeys = [instanceKey(instanceId), diskKey(targetDisk.id)]
-    if (!resourceLock.acquireAll(restoreLockKeys, 'restoreApp')) {
-        console.error(chalk.red(`restoreApp: resource locked — another operation is already running on instance or target disk. Retry when it completes.`))
-        return
-    }
-
-    const opId = existingOpId ?? createOperation(storeHandle, 'restoreApp', {
-        instanceId,
-        targetDiskId: targetDisk.id,
-    }, cause, { type: 'instance', id: instanceId })
-
-    try {
-        updateOperation(storeHandle, opId, { status: 'Running' })
-        const store = storeHandle.doc()
-
-        // Find a docked Backup Disk with an archive for this instance
-        const dockedDisks = Object.values(store.diskDB).filter(d => d.device != null)
-        let backupDisk: Disk | null = null
-        for (const candidate of dockedDisks) {
-            if (!candidate.diskTypes?.includes('backup')) continue
-            const repoPath = backupDir(candidate.device!, instanceId)
-            if (await fs.pathExists(`${repoPath}/config`)) {
-                backupDisk = candidate as Disk
-                break
-            }
-        }
-
-        if (!backupDisk) {
-            throw new Error(`No docked Backup Disk with archives for instance ${instanceId}`)
-        }
-
-        const backupDevice = backupDisk.device!
-        const targetDevice = targetDisk.device
-        if (!targetDevice) {
-            throw new Error(`Target disk ${targetDisk.id} is not docked`)
-        }
-
-        const repoPath = backupDir(backupDevice, instanceId)
-        const instancesDir = `${await diskMountRoot(targetDisk)}/instances`
-
-        // Stop instance if currently running
-        const instance = getInstance(store, instanceId)
-        if (instance?.status === 'Running') {
-            const currentDisk = instance.storedOn ? store.diskDB[instance.storedOn] : null
-            if (currentDisk) await stopInstance(storeHandle, instance, currentDisk, 'backup-pre-stop')
-        }
-
-        await fs.ensureDir(instancesDir)
-
-        if (!config.settings.testMode) {
-            log(`Restoring instance ${instanceId} from ${backupDevice} to ${targetDevice}`)
-            await $`bash -c ${'cd ' + instancesDir + ' && borg extract ' + repoPath + '::latest'}`
-        } else {
-            log(`testMode: skipping borg extract for instance ${instanceId}`)
-        }
-
-        const { processInstance } = await import('../data/Disk.js')
-        await processInstance(storeHandle, targetDisk, instanceId)
-
-        updateOperation(storeHandle, opId, {
-            status: 'Done',
-            progressPercent: 100,
-            completedAt: Date.now() as Timestamp,
-        })
-        log(chalk.green(`Restore of instance ${instanceId} to disk ${targetDisk.name} completed`))
-
-    } catch (e: any) {
-        updateOperation(storeHandle, opId, {
-            status: 'Failed',
-            error: e.message ?? String(e),
-            completedAt: Date.now() as Timestamp,
-        })
-        log(chalk.red(`Restore of instance ${instanceId} failed: ${e.message ?? e}`))
-    } finally {
-        resourceLock.releaseAll(restoreLockKeys)
-    }
-}
-
-// ── createBackupDisk ──────────────────────────────────────────────────────────
-
-/**
- * Write BACKUP.yaml on a disk and trigger processDisk to register it as a Backup Disk.
- * Called by the createBackupDisk command from Console.
- */
-export const createBackupDiskConfig = async (
-    storeHandle: DocHandle<Store>,
-    disk: Disk,
-    mode: BackupMode,
-    instanceIds: InstanceID[]
-): Promise<void> => {
-    if (!disk.device) {
-        log(chalk.red(`createBackupDiskConfig: disk ${disk.id} is not docked`))
-        return
-    }
-
-    const yaml: BackupYaml = {
-        mode,
-        links: instanceIds.map(id => ({ instanceId: id, lastBackup: 0 }))
-    }
-
-    await writeBackupYaml(disk.device, yaml)
-    log(`Written BACKUP.yaml to disk ${disk.name} (mode: ${mode}, links: ${instanceIds.join(', ')})`)
-
-    // Re-process the disk so diskTypes and backupConfig are set in the store
-    await processDisk(storeHandle, disk)
-}
-
-```
-
-## File: src/monitors/diskDetection.ts
-```typescript
-/**
- * diskDetection.ts
- *
- * Makes USB disk detection failures visible (idea#82).
- *
- * Disk detection depends on the udev rule 90-docking.rules, which creates the
- * /dev/engine/<device> links the USB device monitor watches. tmpfiles.d always
- * creates /dev/engine, so a missing rule leaves an empty folder and docking
- * silently does nothing. boot.sh reinstalls the rule on every boot when it is
- * missing or differs from the shipped asset (self-repair). This module:
- *
- *   - runs a startup self-check that reports what the self-repair could not fix
- *   - records disk detection failures (self-check, monitor start, mount, META
- *     read, META write, undock) as failed `diskDetection` traces in the command log, so they
- *     appear in the Console History panel (no store schema change)
- */
-
-import path from 'path'
-import { $, fs, sleep } from 'zx'
-import { DocHandle } from '@automerge/automerge-repo'
-import { log } from '../utils/utils.js'
-import { CommandLogStore, getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js'
-
-export const DISK_DETECTION_COMMAND = 'diskDetection'
-export const UDEV_RULE_PATH = '/etc/udev/rules.d/90-docking.rules'
-export const UDEV_RULE_ASSET = 'script/build_image_assets/90-docking.rules'
-export const ENGINE_WATCH_DIR = '/dev/engine'
-export const SYS_BLOCK_DIR = '/sys/class/block'
-
-// Devices the udev rule links into /dev/engine: KERNEL=="sd?|sd?1|sd?2"
-export const RULE_DEVICE_PATTERN = /^sd[a-z][12]?$/
-
-export type DiskDetectionStep = 'selfCheck' | 'monitorStart' | 'watcher' | 'mount' | 'readMeta' | 'writeMeta' | 'dock' | 'undock'
-
-/**
- * Record a disk detection failure: always logged, and added to the command log
- * as a completed trace with status 'error' (shows up in Console History).
- */
-export const recordDiskDetectionFailure = (
-    step: DiskDetectionStep,
-    message: string,
-    details: Record<string, unknown> = {},
-    handle: DocHandle<CommandLogStore> | null = getCommandLogHandle()
-): void => {
-    log(`[diskDetection] ${step} failed: ${message}`)
-    if (!handle) return
-    try {
-        const traceId = crypto.randomUUID()
-        const now = Date.now()
-        addTrace(handle, {
-            traceId,
-            command: DISK_DETECTION_COMMAND,
-            args: JSON.stringify({ step, ...details }),
-            startedAt: now,
-            completedAt: null,
-            status: 'running',
-            errorMessage: null,
-        })
-        closeTrace(handle, traceId, 'error', message)
-    } catch (e) {
-        log(`[diskDetection] could not record the failure in the command log: ${e}`)
-    }
-}
-
-export const errorMessage = (e: unknown): string =>
-    e instanceof Error ? e.message : String(e)
-
-export interface DiskDetectionPaths {
-    rulePath: string
-    ruleAsset: string
-    watchDir: string
-    sysBlockDir: string
-}
-
-export const defaultDiskDetectionPaths = (): DiskDetectionPaths => ({
-    rulePath: UDEV_RULE_PATH,
-    // The Engine runs from its repo folder (config.yaml is read relative to cwd)
-    ruleAsset: path.resolve(UDEV_RULE_ASSET),
-    watchDir: ENGINE_WATCH_DIR,
-    sysBlockDir: SYS_BLOCK_DIR,
-})
-
-/**
- * Check the udev setup disk detection relies on. Returns the problems found
- * (empty when everything is in place):
- *   - the udev rule file exists (and matches the shipped asset, when present)
- *   - the watch folder (/dev/engine) exists
- *   - every sd* device covered by the rule has a matching /dev/engine/<name> entry
- */
-export const checkDiskDetection = (paths: DiskDetectionPaths): string[] => {
-    const problems: string[] = []
-
-    if (!fs.existsSync(paths.rulePath)) {
-        problems.push(`udev rule ${paths.rulePath} is missing`)
-    } else if (fs.existsSync(paths.ruleAsset)) {
-        const installed = fs.readFileSync(paths.rulePath, 'utf8').trim()
-        const shipped = fs.readFileSync(paths.ruleAsset, 'utf8').trim()
-        if (installed !== shipped) problems.push(`udev rule ${paths.rulePath} differs from ${paths.ruleAsset}`)
-    }
-
-    if (!fs.existsSync(paths.watchDir)) {
-        problems.push(`${paths.watchDir} does not exist`)
-        return problems
-    }
-
-    let devices: string[] = []
-    try {
-        devices = fs.readdirSync(paths.sysBlockDir).filter(d => RULE_DEVICE_PATTERN.test(d))
-    } catch (e) {
-        problems.push(`cannot list ${paths.sysBlockDir}: ${errorMessage(e)}`)
-    }
-    const present = new Set(fs.readdirSync(paths.watchDir))
-    const missing = devices.filter(d => !present.has(d)).sort()
-    if (missing.length > 0) {
-        problems.push(`no ${paths.watchDir} entry for ${missing.join(', ')}`)
-    }
-    return problems
-}
-
-export interface SelfCheckOptions {
-    paths?: DiskDetectionPaths
-    settle?: () => Promise<void>
-    retryDelayMs?: number
-    handle?: DocHandle<CommandLogStore> | null
-}
-
-const udevSettle = async (): Promise<void> => {
-    // Wait until udev has processed its event queue (no root needed).
-    await $`udevadm settle --timeout=10`.nothrow()
-}
-
-/**
- * Engine startup self-check. Skipped in test runs (IDEA_WATCH_DIR is set: tests
- * use a private watch folder, idea#105). Waits for udev to settle, then checks.
- * boot.sh may still be repairing the rule when the Engine starts, so problems are
- * re-checked once after a delay; only what is still wrong is reported, as one
- * failed `diskDetection` trace. Returns the reported problems.
- */
-export const runDiskDetectionSelfCheck = async (opts: SelfCheckOptions = {}): Promise<string[]> => {
-    if (process.env.IDEA_WATCH_DIR) {
-        log(`[diskDetection] IDEA_WATCH_DIR is set — skipping the udev self-check`)
-        return []
-    }
-    const paths = opts.paths ?? defaultDiskDetectionPaths()
-    const settle = opts.settle ?? udevSettle
-    const retryDelayMs = opts.retryDelayMs ?? 30_000
-
-    await settle()
-    let problems = checkDiskDetection(paths)
-    if (problems.length > 0) {
-        log(`[diskDetection] self-check found problems, re-checking in ${retryDelayMs} ms: ${problems.join('; ')}`)
-        await sleep(retryDelayMs)
-        await settle()
-        problems = checkDiskDetection(paths)
-    }
-    if (problems.length === 0) {
-        log(`[diskDetection] self-check passed`)
-        return []
-    }
-    recordDiskDetectionFailure(
-        'selfCheck',
-        `USB disk detection is not working: ${problems.join('; ')}`,
-        { problems },
-        opts.handle === undefined ? getCommandLogHandle() : opts.handle
-    )
-    return problems
-}
-
-```
-
-## File: src/monitors/dockerMetricsMonitor.ts
-```typescript
-/**
- * dockerMetricsMonitor.ts
- *
- * Polls `docker stats --no-stream --format json` every POLL_INTERVAL_MS for
- * all containers belonging to Running instances on the local engine, then
- * writes parsed metrics to instance.metrics in the Automerge store.
- *
- * When an instance stops running (status !== 'Running'), metrics is set to null.
- *
- * The Console reads instance.metrics and formats the raw numbers itself.
- */
-
-import { $ } from 'zx'
-import { log } from '../utils/utils.js'
-import { DocHandle } from '@automerge/automerge-repo'
-import { Store, getLocalEngine, getInstancesOfEngine } from '../data/Store.js'
-import { DockerMetrics } from '../data/CommonTypes.js'
-import { localEngineId } from '../data/Engine.js'
-import { config } from '../data/Config.js'
-
-$.verbose = false
-
-const POLL_INTERVAL_MS = 15_000
-
-// ── Byte-string parser ────────────────────────────────────────────────────────
-// docker stats JSON emits strings like "256MiB", "1.5GiB", "1.23kB", "10MB"
-
-const UNIT_MULTIPLIERS: Record<string, number> = {
-    b:   1,
-    kb:  1000,
-    mb:  1000 ** 2,
-    gb:  1000 ** 3,
-    tb:  1000 ** 4,
-    kib: 1024,
-    mib: 1024 ** 2,
-    gib: 1024 ** 3,
-    tib: 1024 ** 4,
-}
-
-const parseBytes = (raw: string): number | null => {
-    if (!raw) return null
-    const m = raw.trim().match(/^([\d.]+)\s*([a-zA-Z]+)$/)
-    if (!m) return null
-    const value = parseFloat(m[1])
-    const unit = m[2].toLowerCase()
-    const mult = UNIT_MULTIPLIERS[unit]
-    if (mult === undefined || isNaN(value)) return null
-    return Math.round(value * mult)
-}
-
-const parsePercent = (raw: string): number | null => {
-    if (!raw) return null
-    const m = raw.trim().match(/^([\d.]+)\s*%$/)
-    if (!m) return null
-    const v = parseFloat(m[1])
-    return isNaN(v) ? null : v
-}
-
-// ── docker stats output shape ─────────────────────────────────────────────────
-// `docker stats --no-stream --format json` outputs one JSON object per line.
-// Fields (from Docker docs): Container, Name, CPUPerc, MemUsage, MemPerc,
-// NetIO, BlockIO, PIDs.
-
-interface RawDockerStats {
-    Container?: string
-    Name?: string
-    CPUPerc?: string
-    MemUsage?: string    // e.g. "256MiB / 1GiB"
-    MemPerc?: string
-    NetIO?: string       // e.g. "1.23kB / 456B"
-    BlockIO?: string     // e.g. "10MB / 5MB"
-}
-
-const parseStatsLine = (line: string): { name: string; metrics: DockerMetrics } | null => {
-    let raw: RawDockerStats
-    try {
-        raw = JSON.parse(line)
-    } catch {
-        return null
-    }
-
-    const name = raw.Name ?? raw.Container ?? ''
-    if (!name) return null
-
-    // MemUsage: "256MiB / 1GiB"
-    const [memUsageStr, memLimitStr] = (raw.MemUsage ?? '').split('/').map(s => s.trim())
-
-    // NetIO: "1.23kB / 456B"
-    const [netRxStr, netTxStr] = (raw.NetIO ?? '').split('/').map(s => s.trim())
-
-    // BlockIO: "10MB / 5MB"
-    const [blockReadStr, blockWriteStr] = (raw.BlockIO ?? '').split('/').map(s => s.trim())
-
-    const metrics: DockerMetrics = {
-        cpuPercent:     parsePercent(raw.CPUPerc ?? ''),
-        memUsageBytes:  parseBytes(memUsageStr ?? ''),
-        memLimitBytes:  parseBytes(memLimitStr ?? ''),
-        memPercent:     parsePercent(raw.MemPerc ?? ''),
-        netRxBytes:     parseBytes(netRxStr ?? ''),
-        netTxBytes:     parseBytes(netTxStr ?? ''),
-        blockReadBytes: parseBytes(blockReadStr ?? ''),
-        blockWriteBytes:parseBytes(blockWriteStr ?? ''),
-        sampledAt:      Date.now(),
-    }
-
-    return { name, metrics }
-}
-
-// ── Collect metrics for a set of instance IDs ─────────────────────────────────
-
-const collectMetrics = async (
-    instanceIds: string[]
-): Promise<Map<string, DockerMetrics>> => {
-    // docker stats container names follow the pattern: <instanceId>-<service>-1
-    // We filter containers by name prefix matching any of the instance IDs.
-    const result = new Map<string, DockerMetrics>()
-    if (instanceIds.length === 0) return result
-
-    try {
-        // docker stats does not support --filter; resolve container names via docker ps first
-        const filterArgs = instanceIds.flatMap(id => ['--filter', `name=${id}`])
-        const psProc = await $`docker ps --format {{.Names}} ${filterArgs}`
-        const containerNames = psProc.stdout.split('\n').map(l => l.trim()).filter(Boolean)
-        if (containerNames.length === 0) return result
-        const proc = await $`docker stats --no-stream --format json ${containerNames}`
-        const lines = proc.stdout.split('\n').filter(l => l.trim())
-
-        for (const line of lines) {
-            const parsed = parseStatsLine(line)
-            if (!parsed) continue
-            // Map container name back to instance ID
-            const instanceId = instanceIds.find(id => parsed.name.startsWith(id))
-            if (!instanceId) continue
-            // Merge: if multiple containers belong to the same instance, accumulate
-            const existing = result.get(instanceId)
-            if (!existing) {
-                result.set(instanceId, parsed.metrics)
-            } else {
-                // Sum CPU and net/block across containers; use latest sampledAt
-                existing.cpuPercent     = (existing.cpuPercent    ?? 0) + (parsed.metrics.cpuPercent    ?? 0)
-                existing.memUsageBytes  = (existing.memUsageBytes ?? 0) + (parsed.metrics.memUsageBytes ?? 0)
-                existing.netRxBytes     = (existing.netRxBytes    ?? 0) + (parsed.metrics.netRxBytes    ?? 0)
-                existing.netTxBytes     = (existing.netTxBytes    ?? 0) + (parsed.metrics.netTxBytes    ?? 0)
-                existing.blockReadBytes = (existing.blockReadBytes ?? 0) + (parsed.metrics.blockReadBytes ?? 0)
-                existing.blockWriteBytes= (existing.blockWriteBytes ?? 0) + (parsed.metrics.blockWriteBytes ?? 0)
-                existing.sampledAt      = Date.now()
-            }
-        }
-    } catch (e: any) {
-        log(`[dockerMetrics] docker stats error: ${e.message ?? e}`)
-    }
-
-    return result
-}
-
-// ── Main monitor loop ─────────────────────────────────────────────────────────
-
-const poll = async (storeHandle: DocHandle<Store>): Promise<void> => {
-    if (config.settings.testMode) return  // no Docker in test mode
-
-    const store = storeHandle.doc()
-    const localEngine = getLocalEngine(store)
-    if (!localEngine) return
-
-    const allInstances = getInstancesOfEngine(store, localEngine)
-    const runningInstances = allInstances.filter(i => i.status === 'Running')
-    const runningIds = runningInstances.map(i => i.id as string)
-
-    // Collect live metrics for running containers
-    const metricsMap = await collectMetrics(runningIds)
-
-    // Write back to store — one change() call covers all instances
-    storeHandle.change(doc => {
-        for (const inst of allInstances) {
-            const instanceInDoc = doc.instanceDB[inst.id as any]
-            if (!instanceInDoc) continue
-
-            if (inst.status === 'Running') {
-                const m = metricsMap.get(inst.id as string)
-                // If running but no container found yet (brief window during start), keep previous metrics
-                if (m) {
-                    instanceInDoc.metrics = m as any
-                }
-            } else {
-                // Not running — clear metrics
-                if (instanceInDoc.metrics !== null) {
-                    instanceInDoc.metrics = null
-                }
-            }
-        }
-    })
-}
-
-export const enableDockerMetricsMonitor = (storeHandle: DocHandle<Store>): void => {
-    log('[dockerMetrics] Starting Docker metrics monitor')
-
-    const run = async () => {
-        try {
-            await poll(storeHandle)
-        } catch (e: any) {
-            log(`[dockerMetrics] Unhandled error in poll: ${e.message ?? e}`)
-        }
-        setTimeout(run, POLL_INTERVAL_MS)
-    }
-
-    // First poll after a short delay (give instances time to start on engine boot)
-    setTimeout(run, 5_000)
-}
-
-```
-
-## File: src/monitors/httpMonitor.ts
-```typescript
-/**
- * httpMonitor.ts — Engine HTTP server
- *
- * Responsibilities:
- *   1. Serve the Console production web app (static files from `consolePath`)
- *   2. Expose GET /api/store-url — returns the Automerge document URL so the
- *      Console can discover it automatically without manual configuration
- *
- * Port: configurable via `config.yaml` settings.httpPort (default 80).
- *
- * If `consolePath` is empty or the directory does not exist, the static file
- * serving is skipped but /api/store-url is still available.
- *
- * The Console uses /api/store-url as:
- *   GET http://<engine-hostname>/api/store-url
- *   → { "url": "automerge:<hash>", "wsPort": 4321 }
- *
- * `wsPort` is the Engine's effective WebSocket port (config.yaml settings.port,
- * after the IDEA_ENGINE_PORT override in Config.ts), so the Console does not
- * have to assume the default. `url` is unchanged for backward compatibility.
- */
-
-import http from 'http'
-import path from 'path'
-import { fs } from 'zx'
-import { log } from '../utils/utils.js'
-import { config } from '../data/Config.js'
-import type { DocHandle } from '@automerge/automerge-repo'
-import type { CommandLogStore } from '../data/CommandLogStore.js'
-
-const STORE_URL_FILE = path.join(
-    config.settings.storeIdentityFolder,
-    'store-url.txt'
-)
-
-const COMMAND_LOG_URL_FILE = path.join(
-    config.settings.storeIdentityFolder,
-    'command-log-url.txt'
-)
-
-const MIME_TYPES: Record<string, string> = {
-    '.html': 'text/html; charset=utf-8',
-    '.js':   'application/javascript; charset=utf-8',
-    '.mjs':  'application/javascript; charset=utf-8',
-    '.css':  'text/css; charset=utf-8',
-    '.json': 'application/json; charset=utf-8',
-    '.png':  'image/png',
-    '.svg':  'image/svg+xml',
-    '.ico':  'image/x-icon',
-    '.woff': 'font/woff',
-    '.woff2':'font/woff2',
-    '.ttf':  'font/ttf',
-}
-
-/** JSON payload returned by GET /api/store-url. */
-export interface StoreUrlPayload {
-    url: string
-    wsPort: number
-}
-
-/**
- * Build the /api/store-url response body.
- *
- * @param storeUrl Automerge store document URL (as read from store-url.txt)
- * @param wsPort   Effective WebSocket port (default: config.settings.port, which
- *                 already has the IDEA_ENGINE_PORT override applied)
- */
-export const buildStoreUrlPayload = (
-    storeUrl: string,
-    wsPort: number = config.settings.port
-): StoreUrlPayload => ({ url: storeUrl, wsPort })
-
-const mimeType = (filePath: string): string => {
-    const ext = path.extname(filePath).toLowerCase()
-    return MIME_TYPES[ext] ?? 'application/octet-stream'
-}
-
-/**
- * Start the Engine HTTP server.
- *
- * @param port        TCP port to listen on (default: config.settings.httpPort)
- * @param consolePath Absolute path to Console dist/ directory (default: config.settings.consolePath)
- */
-export const enableHttpMonitor = (
-    port: number = config.settings.httpPort,
-    consolePath: string = config.settings.consolePath,
-    _commandLogHandle?: DocHandle<CommandLogStore> | null   // unused at runtime — URL comes from disk
-): http.Server => {
-
-    const hasConsole = consolePath && fs.existsSync(consolePath)
-
-    if (consolePath && !hasConsole) {
-        log(`[http] consolePath "${consolePath}" not found — Console UI will not be served`)
-    } else if (hasConsole) {
-        log(`[http] Serving Console UI from ${consolePath}`)
-    } else {
-        log(`[http] No consolePath configured — Console UI will not be served`)
-    }
-
-    const server = http.createServer(async (req, res) => {
-        const url = req.url ?? '/'
-
-        // ── API routes ──────────────────────────────────────────────────────
-        if (url === '/api/store-url' || url === '/api/store-url/') {
-            try {
-                const storeUrl = (await fs.readFile(STORE_URL_FILE, 'utf-8')).trim()
-                res.writeHead(200, {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',  // Console may be on a different origin during dev
-                })
-                res.end(JSON.stringify(buildStoreUrlPayload(storeUrl)))
-            } catch (e) {
-                log(`[http] /api/store-url: failed to read store URL — ${e}`)
-                res.writeHead(503, { 'Content-Type': 'application/json' })
-                res.end(JSON.stringify({ error: 'Store URL not available yet' }))
-            }
-            return
-        }
-
-        if (url === '/api/command-log-url' || url === '/api/command-log-url/') {
-            try {
-                const logUrl = (await fs.readFile(COMMAND_LOG_URL_FILE, 'utf-8')).trim()
-                res.writeHead(200, {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',
-                })
-                res.end(JSON.stringify({ url: logUrl }))
-            } catch (e) {
-                log(`[http] /api/command-log-url: failed to read URL — ${e}`)
-                res.writeHead(503, { 'Content-Type': 'application/json' })
-                res.end(JSON.stringify({ error: 'Command log URL not available yet' }))
-            }
-            return
-        }
-
-        // ── Static Console files ────────────────────────────────────────────
-        if (!hasConsole) {
-            res.writeHead(404, { 'Content-Type': 'text/plain' })
-            res.end('Console UI not configured on this Engine')
-            return
-        }
-
-        // Resolve the requested path to a file under consolePath.
-        // Any path that doesn't resolve to a real file falls back to index.html
-        // (SPA client-side routing).
-        let filePath = path.join(consolePath, url === '/' ? 'index.html' : url)
-
-        // Strip query strings
-        filePath = filePath.split('?')[0]
-
-        if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
-            filePath = path.join(consolePath, 'index.html')
-        }
-
-        try {
-            const data = await fs.readFile(filePath)
-            res.writeHead(200, { 'Content-Type': mimeType(filePath) })
-            res.end(data)
-        } catch (e) {
-            log(`[http] Failed to serve ${filePath}: ${e}`)
-            res.writeHead(500, { 'Content-Type': 'text/plain' })
-            res.end('Internal error')
-        }
-    })
-
-    server.on('error', (e: NodeJS.ErrnoException) => {
-        if (e.code === 'EACCES') {
-            log(`[http] Permission denied on port ${port}. Run with sudo or use a port > 1024.`)
-        } else if (e.code === 'EADDRINUSE') {
-            log(`[http] Port ${port} already in use.`)
-        } else {
-            log(`[http] Server error: ${e}`)
-        }
-    })
-
-    server.listen(port, () => {
-        log(`[http] Engine HTTP server listening on port ${port}`)
-    })
-
-    return server
-}
-
-```
-
-## File: src/monitors/mdnsMonitor.ts
-```typescript
-import mDnsSd from 'node-dns-sd'
-import { deepPrint, log, error } from '../utils/utils.js';
-import { chalk } from 'zx';
-import { Store, getLocalEngine } from '../data/Store.js';
-import { manageDiscoveredPeers } from '../data/Network.js'
-import ciao, { CiaoService } from '@homebridge/ciao'
-import { DocHandle, DocumentId, Repo } from '@automerge/automerge-repo';
-import { EngineID, Hostname, IPAddress } from '../data/CommonTypes.js';
-import { config } from '../data/Config.js';
-
-export const startAdvertising = (store: Store): CiaoService => {
-    const engine = getLocalEngine(store)
-    if (!engine) {
-        log(`No local engine found in the store`)
-        throw new Error(`No local engine found in the store`)
-    }
-    const engineName = engine.hostname
-    const engineVersion = engine.version
-    const responder = ciao.getResponder()
-
-    if (!engineName) {
-        throw new Error(`No engine hostname found in the store`)
-    }
-
-    log(`Advertising on all interfaces`)
-    const service = responder.createService({
-        name: engineName.toString(),
-        type: 'engine',
-        port: config.settings.port,
-        txt: {
-            name: engineName,
-            id: engine.id,
-            version: engineVersion
-        }
-    })
-
-    // Log name conflicts without updating the store — the (2) suffix is a service
-    // advertisement detail, not the machine hostname.
-    service.on('name-change', (newName: string) => {
-        log(`mDNS service name changed to '${newName}' due to conflict — hostname in store unchanged`);
-    });
-
-    service.advertise().then(() => {
-        log(`The following service is published on all interfaces: ${engineName}._engine._tcp.local`);
-    }).catch((err) => {
-        error(`Error advertising mDNS service: ${err}`)
-    })
-
-    return service
-}
-
-const discoverEngines = async (storeHandle: DocHandle<Store>, repo:Repo): Promise<void> => {
-    const localEngine = getLocalEngine(storeHandle.doc());
-    try {
-        const deviceList = await mDnsSd.discover({ name: '_engine._tcp.local' });
-        const discoveredPeers = new Map<IPAddress, {hostname: Hostname, engineId: EngineID}>();
-
-        if (deviceList.length > 0) {
-            log(chalk.bgBlackBright(`Discovered engines:`));
-        }
-
-        deviceList.forEach(device => {
-            const txt = device.packet.additionals.find((add: any) => ((typeof add == 'object') && add.hasOwnProperty('type') && add.type === 'TXT'));
-
-            if (!txt || !txt.rdata) {
-                log(chalk.redBright(`  - No TXT record for ${device.modelName || device.address}. Skipping.`));
-                return;
-            }
-
-            const txtRecord = txt.rdata;
-            const engineId = txtRecord.id as EngineID;
-            const hostname = txtRecord.name as Hostname;
-            const address = device.address as IPAddress;
-            const port = device.service?.port;
-
-            log(`  - Name: ${hostname || 'N/A'}, ID: ${engineId || 'N/A'}, Address: ${address || 'N/A'}:${port || 'N/A'}`);
-
-            if (engineId && engineId === localEngine.id) {
-                return; // Skip local engine
-            }
-
-            if (address && hostname && engineId) {
-                discoveredPeers.set(address, { hostname, engineId });
-            }
-        });
-
-        await manageDiscoveredPeers(repo, discoveredPeers, storeHandle);
-
-        if (deviceList.length === 0) {
-            log(chalk.bgBlackBright(`No remote engines found`))
-        }
-    } catch (error) {
-        log(`***node-dns-sd*** Error discovering engines`)
-        console.error(error);
-    }
-}
-
-export const enableMulticastDNSEngineMonitor = (storeHandle: DocHandle<Store>, repo: Repo): { end: () => Promise<void> } => {
-    const service = startAdvertising(storeHandle.doc())
-    
-    const runDiscovery = async () => {
-        await discoverEngines(storeHandle, repo);
-        setTimeout(runDiscovery, 10000);
-    };
-
-    runDiscovery();
-
-    // Return shutdown handle so the caller can send mDNS goodbye packets on exit.
-    return {
-        end: () => service.end()
-    }
-}
-
-```
-
-## File: src/monitors/mounts.ts
-```typescript
-/**
- * mounts.ts — mounting and unmounting App Disk partitions safely (idea#126)
- *
- * Files Disk step 0, Q5 safety fix:
- *   - "Already mounted" is detected with findmnt (it reads /proc/self/mountinfo)
- *     by target AND by source, so it works for every filesystem type. Before
- *     this, `mount -t ext4` output was searched, which missed vfat partitions:
- *     after an Engine restart a docked vfat partition was mounted a second time
- *     on top of itself (Atlas, idea03).
- *   - Mounting onto a target that is already a mount point is refused.
- *   - Unmounting repeats `umount` until `mountpoint -q` says the target is no
- *     longer a mount point (a stacked double mount needs one umount per layer),
- *     then removes the empty folder with rmdir. Never `rm -fr`: rmdir only
- *     removes an empty folder, so a still-mounted disk's data cannot be deleted.
- *   - The filesystem UUID is recorded at mount time (lsblk -no UUID) for
- *     Disk.unmountError and the startup cleanup.
- *
- * Root commands: mkdir, mount and umount are in 10-engine; rmdir of
- * /disks/sd[a-z][12] is in 11-engine-files. findmnt, mountpoint and lsblk need no
- * root. The commands are behind MountOps so tests can inject fakes.
- */
-
-import { $, fs, sleep } from 'zx'
-import { log } from '../utils/utils.js'
-import { disksRoot } from '../data/Config.js'
-import type { DocHandle } from '@automerge/automerge-repo'
-import type { Store } from '../data/Store.js'
-import type { Disk } from '../data/Disk.js'
-import type { DiskID, EngineID } from '../data/CommonTypes.js'
-
-export interface MountEntry {
-    source: string   // e.g. /dev/sdb1 (bind-mount suffixes like [/dir] removed)
-    target: string   // e.g. /disks/sdb1
-    fstype: string
-}
-
-export interface MountOps {
-    /** Every mount on the system: `findmnt -J -l -o SOURCE,TARGET,FSTYPE` */
-    listMounts(): Promise<MountEntry[]>
-    /** `mountpoint -q <path>`: true only when the path is a mount point */
-    isMountPoint(path: string): Promise<boolean>
-    /** Filesystem UUID of a device: `lsblk -no UUID /dev/<device>`, null if unknown */
-    fsUuidOfDevice(device: string): Promise<string | null>
-    /** UUID of the filesystem mounted at a path: `findmnt -no UUID <path>`, null if none */
-    fsUuidAt(mountPoint: string): Promise<string | null>
-    /** `sudo mkdir -p <disksRoot>/<device>` */
-    mkdir(device: string): Promise<void>
-    /** `sudo mount /dev/<device> <disksRoot>/<device>` */
-    mount(device: string): Promise<void>
-    /** `sudo umount <disksRoot>/<device>` (removes the top mount only) */
-    umount(device: string): Promise<void>
-    /** Remove the empty mount point folder (see removeMountPointFolder) */
-    rmdir(mountPoint: string): Promise<void>
-}
-
-/** Mount points the 11-engine-files entry `/usr/bin/rmdir /disks/sd[a-z][12]` covers. */
-export const SUDO_RMDIR_PATH = /^\/disks\/sd[a-z][12]$/
-export const SUDO_RMDIR = '/usr/bin/rmdir'
-
-/**
- * Remove an empty mount point folder. /disks/sd[a-z][12] folders are created
- * with sudo under the root-owned /disks, so they are removed with exactly
- * `sudo /usr/bin/rmdir /disks/<device>` (11-engine-files). Other roots (test and
- * fixture roots from IDEA_DISKS_ROOT) are owned by pi and use a plain rmdir.
- * Both fail on a folder that is not empty.
- */
-export const removeMountPointFolder = async (mountPoint: string): Promise<void> => {
-    if (SUDO_RMDIR_PATH.test(mountPoint)) {
-        await $`sudo ${SUDO_RMDIR} ${mountPoint}`
-    } else {
-        await fs.rmdir(mountPoint)
-    }
-}
-
-const stripBindSuffix = (source: string): string => source.replace(/\[.*\]$/, '')
-
-export const defaultMountOps: MountOps = {
-    listMounts: async () => {
-        const out = await $`findmnt -J -l -o SOURCE,TARGET,FSTYPE`.nothrow()
-        if (out.exitCode !== 0 || !out.stdout.trim()) return []
-        const parsed = JSON.parse(out.stdout) as { filesystems?: Array<{ source?: string, target?: string, fstype?: string }> }
-        return (parsed.filesystems ?? []).map(f => ({
-            source: stripBindSuffix(f.source ?? ''),
-            target: f.target ?? '',
-            fstype: f.fstype ?? '',
-        }))
-    },
-    isMountPoint: async (path) => (await $`mountpoint -q ${path}`.nothrow()).exitCode === 0,
-    fsUuidOfDevice: async (device) => {
-        const out = await $`lsblk -no UUID /dev/${device}`.nothrow()
-        const uuid = out.exitCode === 0 ? out.stdout.trim().split('\n')[0].trim() : ''
-        return uuid || null
-    },
-    fsUuidAt: async (mountPoint) => {
-        const out = await $`findmnt -no UUID ${mountPoint}`.nothrow()
-        if (out.exitCode !== 0) return null
-        // A stacked mount lists one line per layer: the last one is on top
-        const lines = out.stdout.split('\n').map(l => l.trim()).filter(Boolean)
-        return lines.length ? lines[lines.length - 1] : null
-    },
-    mkdir: async (device) => { await $`sudo mkdir -p ${disksRoot()}/${device}` },
-    mount: async (device) => { await $`sudo mount /dev/${device} ${disksRoot()}/${device}` },
-    umount: async (device) => { await $`sudo umount ${disksRoot()}/${device}` },
-    rmdir: removeMountPointFolder,
-}
-
-let currentOps: MountOps = defaultMountOps
-
-/** The MountOps in use (the real commands unless a test injected fakes). */
-export const mountOps = (): MountOps => currentOps
-
-/** Tests: replace some or all MountOps; pass null to restore the real commands. */
-export const setMountOps = (ops: Partial<MountOps> | null): void => {
-    currentOps = ops ? { ...defaultMountOps, ...ops } : defaultMountOps
-}
-
-/**
- * Whether mount commands really run. testMode skips the real (sudo) commands
- * because fixture disks are plain folders; a test that injects MountOps runs the
- * full mount/unmount logic against its fakes.
- */
-export const mountCommandsActive = (testMode: boolean): boolean => !testMode || currentOps !== defaultMountOps
-
-export const mountPointOf = (device: string): string => `${disksRoot()}/${device}`
-
-// ── Mounting ────────────────────────────────────────────────────────────────
-
-export type MountCheck =
-    | { state: 'free' }                                  // nothing there: mount
-    | { state: 'mounted' }                               // this device is already mounted at its target
-    | { state: 'targetBusy', mounts: MountEntry[] }      // something else is mounted at the target
-    | { state: 'deviceElsewhere', mounts: MountEntry[] } // this device is mounted somewhere else
-
-/**
- * Check, before mounting, what findmnt says about the device and its target.
- * Looks at both the target and the source, for every filesystem type.
- */
-export const checkMountState = async (device: string, ops: MountOps = mountOps()): Promise<MountCheck> => {
-    const target = mountPointOf(device)
-    const source = `/dev/${device}`
-    const mounts = await ops.listMounts()
-    const atTarget = mounts.filter(m => m.target === target)
-    const ofSource = mounts.filter(m => m.source === source)
-    if (atTarget.length > 0) {
-        return atTarget.every(m => m.source === source)
-            ? { state: 'mounted' }
-            : { state: 'targetBusy', mounts: atTarget }
-    }
-    if (ofSource.length > 0) return { state: 'deviceElsewhere', mounts: ofSource }
-    // Not in the mount table, but still a mount point (e.g. a bind mount findmnt
-    // shows with another source path): refuse as well.
-    if (await ops.isMountPoint(target)) return { state: 'targetBusy', mounts: [] }
-    return { state: 'free' }
-}
-
-export type MountResult =
-    | { ok: true, alreadyMounted: boolean, fsUuid: string | null }
-    | { ok: false, message: string }
-
-/**
- * Mount /dev/<device> on <disksRoot>/<device> unless it is already mounted there.
- * Never mounts a second time and never mounts onto an existing mount point.
- * Returns the filesystem UUID (lsblk -no UUID) for Disk.unmountError.
- */
-export const safeMount = async (device: string, ops: MountOps = mountOps()): Promise<MountResult> => {
-    const target = mountPointOf(device)
-    const check = await checkMountState(device, ops)
-    const describe = (ms: MountEntry[]) => ms.map(m => `${m.source} on ${m.target} (${m.fstype})`).join(', ')
-    if (check.state === 'targetBusy') {
-        return { ok: false, message: `Refusing to mount /dev/${device}: ${target} is already a mount point${check.mounts.length ? ` (${describe(check.mounts)})` : ''}` }
-    }
-    if (check.state === 'deviceElsewhere') {
-        return { ok: false, message: `Refusing to mount /dev/${device} on ${target}: it is already mounted (${describe(check.mounts)})` }
-    }
-    const alreadyMounted = check.state === 'mounted'
-    if (alreadyMounted) {
-        log(`Device ${device} already mounted on ${target}`)
-    } else {
-        try {
-            await ops.mkdir(device)
-            await ops.mount(device)
-        } catch (e) {
-            return { ok: false, message: `Could not mount /dev/${device} on ${target}: ${e instanceof Error ? e.message : String(e)}` }
-        }
-    }
-    const fsUuid = await ops.fsUuidOfDevice(device).catch(() => null)
-    return { ok: true, alreadyMounted, fsUuid }
-}
-
-// ── Unmounting ──────────────────────────────────────────────────────────────
-
-/**
- * Unmount retry policy (idea#126, documented in docs/ARCHITECTURE.md):
- * at most UMOUNT_MAX_ATTEMPTS umount calls per undock, with UMOUNT_RETRY_DELAY_MS
- * between a failed attempt and the next one. Every successful umount removes
- * one layer of a stacked mount, so 5 attempts cover a double mount plus three
- * busy retries (about 3 s) for a process that is just letting go of the disk.
- */
-export const UMOUNT_MAX_ATTEMPTS = 5
-export const UMOUNT_RETRY_DELAY_MS = 1000
-
-export type UnmountResult =
-    | { ok: true, attempts: number, removed: boolean }
-    | { ok: false, attempts: number, message: string }
-
-/**
- * Repeat `umount` until `mountpoint -q <mountPoint>` is false, then rmdir the
- * mount point. If it is still a mount point after UMOUNT_MAX_ATTEMPTS, nothing
- * is removed and the result says why. Never rm -fr.
- */
-export const unmountAndRemove = async (
-    device: string,
-    ops: MountOps = mountOps(),
-    maxAttempts = UMOUNT_MAX_ATTEMPTS,
-    retryDelayMs = UMOUNT_RETRY_DELAY_MS,
-): Promise<UnmountResult> => {
-    const mountPoint = mountPointOf(device)
-    let attempts = 0
-    let lastError = ''
-    while (await ops.isMountPoint(mountPoint)) {
-        if (attempts >= maxAttempts) {
-            return {
-                ok: false, attempts,
-                message: `${mountPoint} is still mounted after ${attempts} umount attempts${lastError ? `: ${lastError}` : ''}`,
-            }
-        }
-        attempts++
-        try {
-            await ops.umount(device)
-            log(`umount ${mountPoint}: attempt ${attempts} removed one mount`)
-        } catch (e: any) {
-            lastError = (e?.stderr || e?.message || String(e)).toString().trim()
-            log(`umount ${mountPoint}: attempt ${attempts} failed: ${lastError}`)
-            if (attempts < maxAttempts) await sleep(retryDelayMs)
-        }
-    }
-    if (!(await fs.pathExists(mountPoint))) return { ok: true, attempts, removed: false }
-    await ops.rmdir(mountPoint)
-    return { ok: true, attempts, removed: true }
-}
-
-// ── Startup cleanup ─────────────────────────────────────────────────────────
-
-/**
- * Engine startup (idea#126): clear every Disk.unmountError recorded by this
- * Engine unless the same filesystem is still mounted at its mountPoint.
- *   - mountPoint not mounted (findmnt -no UUID gives nothing) → cleared
- *   - another filesystem mounted there (UUID differs from fsUuid; device names
- *     get reused) → cleared
- *   - the same filesystem still mounted there (same UUID) → kept
- *   - fsUuid unknown (null) and something is still mounted there → kept, since
- *     it cannot be ruled out that it is the same disk
- * Errors recorded by other Engines are never touched.
- * Returns the ids of the disks whose error was cleared.
- */
-export const clearStaleUnmountErrors = async (
-    storeHandle: DocHandle<Store>,
-    engineId: EngineID,
-    ops: MountOps = mountOps(),
-): Promise<string[]> => {
-    const store = storeHandle.doc()
-    if (!store) return []
-    const toClear: string[] = []
-    for (const [diskId, disk] of Object.entries(store.diskDB ?? {})) {
-        const err = (disk as Disk).unmountError
-        if (!err || err.engineId !== engineId) continue
-        const uuidNow = await ops.fsUuidAt(err.mountPoint).catch(() => null)
-        const stillSameFs = uuidNow !== null && (err.fsUuid === null || uuidNow === err.fsUuid)
-        if (stillSameFs) {
-            log(`Keeping the unmount error of disk ${diskId}: ${err.mountPoint} is still mounted (UUID ${uuidNow})`)
-        } else {
-            toClear.push(diskId)
-        }
-    }
-    if (toClear.length) {
-        storeHandle.change(doc => {
-            for (const id of toClear) {
-                const d = doc.diskDB[id as DiskID]
-                if (d && d.unmountError) d.unmountError = null
-            }
-        })
-        log(`Cleared stale unmount errors for disks: ${toClear.join(', ')}`)
-    }
-    return toClear
-}
-
-```
-
-## File: src/monitors/storeMonitor.ts
-```typescript
-import { DocHandle } from '@automerge/automerge-repo'
-import { Store } from '../data/Store.js'
-import { log } from '../utils/utils.js'
-import { EngineID, InstanceID } from '../data/CommonTypes.js'
-import { handleCommand } from '../utils/commandUtils.js'
-import { commands } from '../data/Commands.js';
-import { localEngineId } from '../data/Engine.js';
-import { CommandLogStore } from '../data/CommandLogStore.js';
-
-
-
-const engineSetMonitor = (patch, storeHandle): boolean => {
-    if (patch.action === 'put' &&  // Since we never change the object value, we know that 'put' means an addition 
-        patch.path.length === 2 &&
-        patch.path[0] === 'engineDB' &&
-        typeof patch.path[1] === 'string' // engineId
-    ) {
-        const engineId = patch.path[1].toString() as EngineID
-        log(`New engine added with ID: ${engineId}`)
-        return true
-    } else {
-        return false
-    }
-}
-
-// Track which commands are currently in-flight, keyed by engineId + command string.
-// Commands for different instances can execute concurrently; commands for the same
-// engine still execute serially (queue[0] is always processed next).
-const _currentlyExecuting = new Set<string>()
-
-const engineCommandsMonitor = (patch, storeHandle): boolean => {
-    const isCommandPath =
-        patch.path.length >= 3 &&
-        patch.path[0] === 'engineDB' &&
-        typeof patch.path[1] === 'string' &&
-        patch.path[2] === 'commands'
-
-    if (!isCommandPath) return false
-
-    const engineId = patch.path[1] as EngineID
-    if (engineId !== localEngineId) return true
-
-    const doc = storeHandle.doc()
-    const queue = doc?.engineDB[engineId as any]?.commands as string[] | undefined
-    if (!queue?.length) return true
-
-    const command = queue[0]
-    if (!command || !command.includes(' ')) return true
-
-    // Use engineId+command as the dedup key so a new command with the same text
-    // (but on a different instance) can still run concurrently.
-    const key = `${engineId}:${command}`
-    if (_currentlyExecuting.has(key)) return true
-
-    _currentlyExecuting.add(key)
-    log(`Processing command for engine ${engineId}: ${command}`)
-    const cmdLogHandle = (storeHandle as any).__commandLogHandle ?? null
-    handleCommand(commands, storeHandle, 'engine', command, cmdLogHandle).then(() => {
-        _currentlyExecuting.delete(key)
-        storeHandle.change(doc => {
-            const eng = doc.engineDB[engineId as any]
-            if (eng) (eng.commands as any[]).splice(0, 1)
-        })
-    })
-    return true
-}
-
-const engineLastRunMonitor = (patch, storeHandle): boolean => {
-    if (patch.action === 'put' &&
-        patch.path.length === 3 &&
-        patch.path[0] === 'engineDB' &&
-        typeof patch.path[1] === 'string' && // engineId
-        patch.path[2] === 'lastRun') {
-        const lastRun = patch.value as number
-        const engineId = patch.path[1] as EngineID
-        log(`Engine ${engineId} last run updated to: ${lastRun}`)
-        return true
-    } else {
-        return false
-    }
-}
-
-const instancesMonitor = (patch, storeHandle): boolean => {
-    if (patch.action === 'put' &&
-        patch.path.length === 3 &&
-        patch.path[0] === 'instanceDB' &&
-        typeof patch.path[1] === 'string' && // instanceId
-        patch.path[2] === 'status') {
-        const instanceId = patch.path[1] as InstanceID
-        const status = (patch.value ?? storeHandle.doc()?.instanceDB?.[instanceId]?.status) as string
-        log(`Instance ${instanceId} status changed to: ${status}`)
-        return true
-    } else {
-        return false
-    }
-}
-
-const applyUntilTrue = (functions: ((patch, storeHandle) => boolean)[], patch, storeHandle): boolean => {
-    for (const func of functions) {
-        if (func(patch, storeHandle)) {
-            return true
-        }
-    }
-    return false
-}
-
-export const enableStoreMonitor = (storeHandle: DocHandle<Store>, commandLogHandle?: DocHandle<CommandLogStore> | null): void => {
-    // Monitor for the addition or removal of engines in the store
-    storeHandle.on('change', ({ doc, patches }) => {
-        for (const patch of patches) {
-            applyUntilTrue([engineSetMonitor, engineCommandsMonitor, engineLastRunMonitor, instancesMonitor], patch, storeHandle)
-        }
-    })
-
-    // Inject commandLogHandle into the monitor closure so engineCommandsMonitor
-    // can pass it through to handleCommand
-    ;(storeHandle as any).__commandLogHandle = commandLogHandle ?? null
-
-    // On startup, process any commands already queued for this engine.
-    // The storeMonitor only fires on new patches, so commands written before
-    // this engine started (or while it was offline) would otherwise be silently ignored.
-    // Replay any commands already in the queue at startup.
-    const startupStore = storeHandle.doc()
-    const startupCmds = [...((startupStore?.engineDB[localEngineId]?.commands as string[]) ?? [])]
-    if (startupCmds.length) {
-        log(`Replaying ${startupCmds.length} pending command(s) from queue on startup`)
-        ;(async () => {
-            for (const cmd of startupCmds) {
-                const startupKey = `${localEngineId}:${cmd}`
-                _currentlyExecuting.add(startupKey)
-                await handleCommand(commands, storeHandle, 'engine', cmd, commandLogHandle)
-                _currentlyExecuting.delete(startupKey)
-                storeHandle.change(doc => {
-                    const eng = doc.engineDB[localEngineId as any]
-                    if (eng) (eng.commands as any[]).splice(0, 1)
-                })
-            }
-        })()
-    }
-}
-```
-
-## File: src/monitors/timeMonitor.ts
-```typescript
-
-import { doc } from 'lib0/dom.js'
-import { Timestamp } from '../data/CommonTypes.js'
-import { inspectEngine } from '../data/Engine.js'
-import { Store, getLocalEngine } from '../data/Store.js'
-import { log, contains, deepPrint } from '../utils/utils.js'
-
-export const enableTimeMonitor = (interval, callback) => {
-    setInterval(callback, interval)
-}
-
-export const logTimeCallback = () => {
-    log(`Time callback at ${new Date()}`)
-}
-
-// export const generateRandomArrayPopulationCallback = (apps: Array<string>) => {
-//     // Randomly populate and depopulate the apps array with app names every 5 seconds. 
-//     // Choose from a list of app names such as "app1", "app2", "app3", "app4", "app5" etc.
-//     // The array should contain between 0 and 5 app names at any given time.
-//     // Make sure that any app name only appears once in the array.
-//     // Do it
-//     const appNames = ['app1', 'app2', 'app3', 'app4', 'app5']
-//     // If the array is empty, add a random app name
-//     // If the array is full, remove a random app name
-//     // If the array is not empty and not full, randomly decide whether to add or remove an app name and only select an app name that is not already in the array
-//     return () => {
-//         if (apps.length === 0) {
-//             apps.insert(0, [appNames[Math.floor(Math.random() * appNames.length)]])
-//         } else if (apps.length === 5) {
-//             apps.delete(Math.floor(Math.random() * 5))
-//         } else {
-//             if (Math.random() < 0.5) {
-//                 const randomAppName = appNames[Math.floor(Math.random() * appNames.length)]
-//                 if (!contains(apps, randomAppName)) {
-//                     apps.insert(0, [randomAppName])
-//                 }
-//             } else {
-//                 apps.delete(Math.floor(Math.random() * apps.length))
-//             }
-//         }
-//     }
-// }
-
-
-// const generateRandomArrayModification = (apps: Array<object>) => {
-//     apps.insert(0, [{ name: 'app1' }, { name: 'app2' }, { name: 'app3' }, { name: 'app4' }, { name: 'app5' }])
-//     log(`Initialising apps array with app names`)
-//     // Create a function that first removes any x letters from all app names and then 
-//     // randomly puts a capital x behind the name of an app in the apps array 
-//     // Do it
-//     return () => {
-//         apps.forEach((app: { name: string }, index: number) => {
-//             app.name = app.name.replace('X', '')
-//             if (Math.random() < 0.5) {
-//                 app.name = app.name + 'X'
-//             }
-//         })
-//         was-console-log(`Deep change to apps: ${JSON.stringify(apps.toArray())}`)
-//     }
-// }
-
-// export const changeTest = (store:Store) => {
-//     const localEngine = getLocalEngine(store)
-//     if (localEngine && localEngine.lastBooted) {
-//         localEngine.lastBooted = localEngine.lastBooted + 1 as Timestamp
-//         log(`CHANGING ENGINE LASTBOOTED TO ${localEngine.lastBooted}`)
-//         log(deepPrint(localEngine))
-//     } else {
-//         log(`CHANGETEST: Engine not yet available ********`)
-//     }
-// }
-
-let runs = 0
-
-export const generateHeartBeat = (storeHandle) => {
-    runs++
-    storeHandle.change(doc => {
-        const lastRun = (new Date()).getTime() as Timestamp
-        log(`UPDATING ENGINE LASTRUN TO ${lastRun}`)
-        //log(`This is the doc to change: ${deepPrint(doc, 2)}`)
-        const localEngine = getLocalEngine(doc)
-        localEngine.lastRun = lastRun
-        //inspectEngine(store, localEngine)
-    })
-} 
-```
-
-## File: src/monitors/usbDeviceMonitor.ts
-```typescript
-import chokidar from 'chokidar'
-import { getKeys, log, uuid } from '../utils/utils.js'
-import { DiskMeta, readHardwareId, readMetaUpdateId, writeMetaFile } from '../data/Meta.js';
-import { $, fs, YAML, chalk } from 'zx'
-
-$.verbose = false;
-import { Disk, clearDuplicateDiskRecords, createOrUpdateDisk, processDisk } from '../data/Disk.js'
-import { findDiskByDevice, findDisksByDevice, Store, getDisksOfEngine, getLocalEngine } from '../data/Store.js'
-import { DeviceName, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../data/CommonTypes.js'
-
-import { Instance, Status, stopInstance } from '../data/Instance.js';
-import { config, disksRoot, skipMetaWrite } from '../data/Config.js'
-import { DocHandle } from '@automerge/automerge-repo';
-import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js';
-import { runWithTrace } from '../utils/CommandLogger.js';
-import { recordDiskDetectionFailure, errorMessage } from './diskDetection.js';
-import { safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointOf } from './mounts.js';
-
-/**
- * Filesystem UUID of each mounted device, recorded at mount time (or when an
- * existing mount is found) with lsblk -no UUID. Used for Disk.unmountError
- * (idea#126).
- */
-const mountedFsUuids = new Map<string, string | null>()
-
-/**
- * Pretend disks created by the test harness use names that real hardware never
- * produces (e.g. `idea-test-1`). Only an Engine in testMode accepts them.
- */
-export const TEST_DEVICE_PATTERN = /^idea-test-[0-9]+$/
-export const isTestDeviceName = (device: string | undefined | null): boolean =>
-    !!device && TEST_DEVICE_PATTERN.test(device)
-
-/**
- * Options for the watcher on the udev watch folder (/dev/engine).
- *
- * udev creates /dev/engine/<device> as a symlink to /dev/<device> (root:disk 0660).
- * The Engine runs as pi, which is not in the disk group, so following the links
- * made chokidar put an inotify watch on the block device itself and fail with
- * EACCES (idea#110). With followSymlinks off, chokidar only watches the folder and
- * reports links being added and removed; mounting goes through sudo, so the
- * Engine never needs to open the block device. Do not add pi to the disk group
- * instead: that gives raw read access to every drive.
- */
-export const DEVICE_WATCH_OPTIONS = { persistent: true, followSymlinks: false } as const
-
-/** Watch the udev watch folder for device links (see DEVICE_WATCH_OPTIONS). */
-export const watchDeviceFolder = (watchDir: string) => chokidar.watch(watchDir, { ...DEVICE_WATCH_OPTIONS })
-
-export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
-
-    // Detection relies on the udev rule 90-docking.rules (repaired by boot.sh and
-    // verified by the startup self-check in diskDetection.ts, idea#82). A fallback
-    // watcher (/dev/disk/by-label, dmesg) was ruled out for now: see
-    // https://github.com/koenswings/idea/issues/82 and /issues/46.
-
-    const store: Store = storeHandle.doc()
-    const localEngine = getLocalEngine(store)
-
-    if (!localEngine) {
-        log(`No local engine found in the store`)
-        throw new Error(`No local engine found in the store`)
-    }
-
-    // Detect the root partition (e.g. sda2) at startup so we can:
-    //   - register it as a system disk
-    //   - skip the whole-disk parent (e.g. sda) and the boot partition (e.g. sda1)
-    // findmnt reads procfs — safe to run in all modes, no sudo needed.
-    let systemDevice: DeviceName | null = null
-    let systemBootDevice: DeviceName | null = null   // e.g. 'sda1' — the boot partition to skip
-    try {
-        const rootSource = (await $`findmnt -n -o SOURCE /`).stdout.trim()
-        // rootSource is e.g. /dev/sda2 — strip the /dev/ prefix
-        const rootDev = rootSource.replace('/dev/', '') as DeviceName
-        if (rootDev.match(/^sd[a-z][0-9]+$/)) {
-            systemDevice = rootDev
-            // Boot partition is parent (strip trailing digits) + '1', e.g. sda2 → sda1
-            const parentDev = rootDev.replace(/[0-9]+$/, '')
-            systemBootDevice = (parentDev + '1') as DeviceName
-            log(`System disk detected: root=${systemDevice}, boot=${systemBootDevice}`)
-        }
-    } catch (e) {
-        log(`Could not detect system device via findmnt: ${e}`)
-    }
-
-    const validDevice = function (device: string): boolean {
-        // Test-only device names (idea-test-N) are accepted only in testMode.
-        // A live Engine (testMode off) ignores them, so a pretend disk can never
-        // be picked up and mounted by a live Engine (idea#105).
-        if (isTestDeviceName(device)) return config.settings.testMode
-        // Check if the device begins with "sd", is then followed by a letter and ends with the number 2
-        // We need the m flag - see https://regexr.com/7rvpq 
-        return device && (device.match(/^sd[a-z][1-2]$/m) || device.match(/^sd[a-z]$/m)) ? true : false
-    }
-
-    const addDevice = async function (path: string) {
-        log(`A disk on device ${path} has been added`)
-        const device = path.split('/').pop() as DeviceName
-
-        if (validDevice(device)) {
-            log(`The disk on device ${device} has a valid device name`)
-
-            // Skip whole-disk entries (e.g. sda, sdb) — raw block devices with no
-            // filesystem; never directly mountable.
-            if (device.match(/^sd[a-z]$/)) {
-                log(`Device ${device} is a whole-disk entry — skipping`)
-                return
-            }
-
-            // Skip the OS boot partition (e.g. sda1 on most Pis, but derived from
-            // the actual root device so it works regardless of disk letter).
-            if (systemBootDevice && device === systemBootDevice) {
-                log(`Device ${device} is the OS boot partition — skipping`)
-                return
-            }
-
-            log(`Processing the disk on device ${device}`)
-            try {
-                // System disk (root partition): already mounted at /, no mount needed.
-                // Read identity from /META.yaml and register as a system disk.
-                // Skip if IDEA_SYSTEM_DISK_SKIP=true (used by Kit's test harness to avoid
-                // conflicts when a second engine runs alongside the production instance).
-                if (systemDevice && device === systemDevice) {
-                    if (config.settings.systemDiskSkip) {
-                        log(`Device ${device} is the system disk — skipping registration (IDEA_SYSTEM_DISK_SKIP=true)`)
-                        return
-                    }
-                    log(`Device ${device} is the system disk (root partition) — registering as system disk`)
-                    try {
-                        const meta = await readMetaUpdateId()  // reads /META.yaml, no device arg
-                        const disk: Disk = createOrUpdateDisk(storeHandle, localEngine.id, device, meta.diskId, 'System Disk' as DiskName, meta.created)
-                        await processDisk(storeHandle, disk)
-                    } catch (e) {
-                        log(`Error processing system disk: ${e}`)
-                        recordDiskDetectionFailure('readMeta', `Could not read /META.yaml of the system disk on ${device}: ${errorMessage(e)}`, { device })
-                    }
-                    return
-                }
-
-                if (!mountCommandsActive(config.settings.testMode)) {
-                    log(`testMode: skipping mount for device ${device} — fixture expected at ${disksRoot()}/${device}`)
-                } else {
-                    // findmnt-based check by target and source, for every filesystem
-                    // type; never mounts twice or onto an existing mount point (idea#126)
-                    const result = await safeMount(device)
-                    if (!result.ok) {
-                        recordDiskDetectionFailure('mount', result.message, { device })
-                        return
-                    }
-                    mountedFsUuids.set(device, result.fsUuid)
-                    log(result.alreadyMounted ? `Device ${device} already mounted` : `Device ${device} has been successfully mounted`)
-                }
-
-                let meta: DiskMeta
-                if (fs.existsSync(`${disksRoot()}/${device}/META.yaml`)) {
-                    log(`Found a META file on device ${device}. This disk has been processed by the system before.`)
-                    try {
-                        meta = await readMetaUpdateId(device)
-                        const disk: Disk = createOrUpdateDisk(storeHandle, localEngine.id, device, meta.diskId, meta.diskName, meta.created)
-                        await processDisk(storeHandle, disk)
-                    } catch (error) {
-                        log('Error processing the META file on the disk: ' + error)
-                        recordDiskDetectionFailure('readMeta', `Could not process META.yaml on ${device}: ${errorMessage(error)}`, { device })
-                    }
-                } else {
-                    // Before creating a new disk entry, check if a disk is already
-                    // registered for this device on THIS engine in the store. This prevents
-                    // spurious empty-disk entries when addDevice fires for a device that's
-                    // already docked (e.g. during docker compose up -d Recreate cycles).
-                    // Scoped to localEngine.id to avoid false matches on other engines' disks
-                    // in the shared CRDT store (e.g. all Pis having sda2 as the root device).
-                    const existingDisk = findDiskByDevice(storeHandle.doc(), device as DeviceName, localEngine.id)
-                    if (existingDisk) {
-                        log(`Device ${device} already has a registered disk (${existingDisk.id}) on this engine — skipping new disk creation`)
-                        return
-                    }
-                    log('Could not find a META file. Creating one now.')
-                    const diskId = await readHardwareId(device) as DiskID
-                    // The disk name should be the name of the volume if available, otherwise 'Unnamed Disk'
-                    let diskName: DiskName = 'Unnamed Disk' as DiskName
-                    try {
-                        const volumeNameOutput = await $`lsblk -no LABEL /dev/${device}`
-                        const volumeName = volumeNameOutput.stdout.trim()
-                        // Check if it is a valid volume name (not empty) - it should also not have any newlines
-                        if (volumeName && volumeName.length > 0 && !volumeName.includes('\n')) {
-                            diskName = volumeName as DiskName
-                        }
-                    } catch (e) {
-                        log(`Error reading volume name for device ${device}: ${e}`)
-                    }
-                    meta = {
-                        diskId: diskId ? diskId : uuid() as DiskID,
-                        isHardwareId: !!diskId,
-                        diskName: diskName,
-                        created: Date.now() as Timestamp,
-                        lastDocked: Date.now() as Timestamp
-                    }
-                    // Persist the identity on the disk (idea#121). Without this every
-                    // dock generated a new diskId (when there is no hardware serial)
-                    // and left an orphan diskDB entry behind. Under /disks the write goes through
-                    // sudo tee (11-engine-files). A failed write (read-only
-                    // mount, sudoers entry missing) is recorded and the disk is still registered.
-                    const metaPath = `${disksRoot()}/${device}/META.yaml`
-                    if (skipMetaWrite()) {
-                        log(`Not writing ${metaPath} (skipMetaWrite)`)
-                    } else {
-                        try {
-                            await writeMetaFile(meta, metaPath)
-                        } catch (e) {
-                            const idNote = meta.isHardwareId ? 'its id comes from the hardware serial' : 'it will get a new id on its next dock'
-                            recordDiskDetectionFailure('writeMeta', `Could not write META.yaml on ${device} (${idNote}); registering the disk anyway: ${errorMessage(e)}`, { device, diskId: meta.diskId })
-                        }
-                    }
-                    const disk: Disk = createOrUpdateDisk(storeHandle, localEngine.id, device, meta.diskId, meta.diskName, meta.created)
-                    await processDisk(storeHandle, disk)
-                }
-            } catch (e) {
-                log(`Error processing device ${device}`)
-                log(e)
-                recordDiskDetectionFailure('dock', `Could not process the disk on ${device}: ${errorMessage(e)}`, { device })
-            }
-        } else {
-            log(`The disk on device ${device} is not on a supported device name`)
-        }
-    }
-
-    const removeDevice = async (path: string) => {
-        const device = path.split('/').pop()
-        if (validDevice(device!)) {
-            log(`Processing the removal of USB device ${device}`)
-            // Every record on the device, not just the first (idea#152)
-            const undocked = await undockAllOnDevice(storeHandle, localEngine.id, device as DeviceName)
-            if (undocked.length === 0) {
-                log(`No disk found on ${device}`)
-            }
-        } else {
-            log(`Non-USB device ${device} has been removed`)
-        }
-    }
-
-    if (!config.settings.isDev && !config.settings.testMode) {
-        try {
-            log(`Cleaning up the ${disksRoot()}/old folder`)
-            // Remove the folder itself, not old/*: the shell would expand the glob
-            // before sudo runs, and the Engine's sudoers file only allows this exact
-            // command (idea#80). /disks/old is recreated with mkdir -p when needed.
-            await $`sudo rm -fr ${disksRoot()}/old`
-        } catch (e) {
-            log(`Error cleaning up the ${disksRoot()}/old folder`)
-            log(e)
-        }
-    }
-
-    const engineWatchDir = process.env.IDEA_WATCH_DIR || '/dev/engine'
-    const actualDevices = (config.settings.isDev || config.settings.testMode) ? [] : (await $`ls ${engineWatchDir}`).toString().split('\n').filter(device => validDevice(device))
-    log(`Actual devices: ${actualDevices}`)
-
-    log(`Removing from the network database disks that were attached before the current boot but are no longer attached now...`)
-
-    const storedDisks = getDisksOfEngine(store, localEngine)
-    if (storedDisks.length !== 0) {
-        log(`The engine object shows previously mounted disks: ${storedDisks.map(d => d.id)}`)
-        const storedDevices = storedDisks.map(disk => disk.device).filter((device): device is DeviceName => device !== undefined && device !== null)
-        log(`Which were on devices: ${storedDevices}`)
-
-        for (let device of [...new Set(storedDevices)]) {
-            const disks = findDisksByDevice(storeHandle.doc(), device, localEngine.id)
-            if (disks.length === 0) continue
-            // Never undock the system disk based on /dev/engine listing —
-            // the root partition is always present and /dev/engine may not
-            // be populated yet (e.g. tmpfiles.d race) or may be empty in
-            // testMode. System disk presence is guaranteed by the OS itself.
-            const systemDisk = disks.find(d => d.diskTypes?.includes('system'))
-            if (systemDisk) {
-                log(`Skipping undock of system disk ${systemDisk.id} on device ${device} — system disk is always present`)
-                continue
-            }
-            if (!actualDevices.includes(device)) {
-                log(`Removing disk from previously mounted device ${device}`)
-                const undocked = await undockAllOnDevice(storeHandle, localEngine.id, device)
-                log(`Disk(s) ${undocked.join(', ')} removed from local engine`)
-            } else {
-                // Still attached: if stale records share the device, keep the one
-                // META.yaml names (idea#152)
-                await resolveDuplicateDisksOnDevice(storeHandle, localEngine.id, device)
-            }
-        }
-    } else {
-        log(`No previous disks found in the network database`)
-    }
-
-    log(`Cleaning the mount points...`)
-    const previousMounts = (config.settings.isDev || config.settings.testMode) ? [] : (await $`ls ${disksRoot()}`).toString().split('\n').filter(device => validDevice(device))
-    log(`Previously mounted devices: ${previousMounts}`)
-    // Stale mount point folders of devices that are no longer attached. A folder
-    // that is still a mount point (by findmnt target or mountpoint -q) is left
-    // alone; an empty one is removed with rmdir, never rm -fr (idea#126).
-    for (let device of previousMounts) {
-        log(`Checking if device ${device} is still actual or mounted`)
-        if (actualDevices.includes(device)) continue
-        try {
-            const mounts = await mountOps().listMounts()
-            const mountPoint = mountPointOf(device)
-            if (mounts.some(m => m.target === mountPoint) || await mountOps().isMountPoint(mountPoint)) {
-                log(`Stale mount point ${mountPoint} is still mounted — leaving it`)
-                continue
-            }
-            log(`Cleaning up stale mount point for ${device}`)
-            await mountOps().rmdir(mountPoint)
-            log(`Device ${device} has been successfully cleaned up`)
-        } catch (e) {
-            log(`Error cleaning up the stale mount point of ${device}: ${errorMessage(e)}`)
-        }
-    }
-
-    const watchDir = process.env.IDEA_WATCH_DIR || '/dev/engine'
-    const watcher = watchDeviceFolder(watchDir)
-
-    watcher
-        .on('add', addDevice)
-        .on('unlink', removeDevice)
-        .on('error', error => recordDiskDetectionFailure('watcher', `Watcher error on ${watchDir}: ${errorMessage(error)}`, { watchDir }))
-
-    log(`Watching ${watchDir} for USB devices`)
-    return watcher
-}
-
-/**
- * diskId from <disksRoot>/<device>/META.yaml, read only (no lastDocked update, no
- * sudo). null when there is no readable META.yaml or it has no diskId.
- */
-export const readMetaDiskIdOnDevice = async (device: DeviceName): Promise<DiskID | null> => {
-    const metaPath = `${disksRoot()}/${device}/META.yaml`
-    try {
-        if (!(await fs.pathExists(metaPath))) return null
-        const meta = YAML.parse(await fs.readFile(metaPath, 'utf-8'))
-        return meta?.diskId ? String(meta.diskId) as DiskID : null
-    } catch (e) {
-        log(`Could not read ${metaPath}: ${errorMessage(e)}`)
-        return null
-    }
-}
-
-/**
- * Startup, device still attached (idea#152): when several records on this engine
- * claim the device, keep the one whose id matches the device's META.yaml and
- * undock the others in the store. Without a matching META.yaml nothing changes
- * here; the dock of the device (createOrUpdateDisk) clears the others. Returns
- * the ids that were undocked.
- */
-export const resolveDuplicateDisksOnDevice = async (
-    storeHandle: DocHandle<Store>,
-    engineId: EngineID,
-    device: DeviceName,
-    readMetaDiskId: (device: DeviceName) => Promise<DiskID | null> = readMetaDiskIdOnDevice,
-): Promise<DiskID[]> => {
-    const disks = findDisksByDevice(storeHandle.doc(), device, engineId)
-    if (disks.length < 2) return []
-    const metaDiskId = await readMetaDiskId(device)
-    const keep = metaDiskId ? disks.find(d => String(d.id) === String(metaDiskId)) : undefined
-    if (!keep) {
-        log(`Disk records ${disks.map(d => d.id).join(', ')} share ${device} and none matches its META.yaml (${metaDiskId ?? 'none'}); the next dock of ${device} resolves them`)
-        return []
-    }
-    let cleared: DiskID[] = []
-    storeHandle.change(doc => { cleared = clearDuplicateDiskRecords(doc, engineId, device, keep.id) })
-    log(`Undocked stale disk record(s) ${cleared.join(', ')} on ${device}; kept ${keep.id} (META.yaml)`)
-    return cleared
-}
-
-/**
- * Undock every record on this engine that claims the device (idea#152). The
- * extra records are cleared in the store first; the first one goes through
- * undockDisk (unmount, instances, store). Returns all undocked ids.
- */
-export const undockAllOnDevice = async (storeHandle: DocHandle<Store>, engineId: EngineID, device: DeviceName): Promise<DiskID[]> => {
-    const disks = findDisksByDevice(storeHandle.doc(), device, engineId)
-    if (disks.length === 0) return []
-    const primary = disks[0]
-    let cleared: DiskID[] = []
-    if (disks.length > 1) {
-        storeHandle.change(doc => { cleared = clearDuplicateDiskRecords(doc, engineId, device, primary.id) })
-        log(`Undocked stale disk record(s) ${cleared.join(', ')} on ${device}`)
-    }
-    await undockDisk(storeHandle, primary)
-    return [primary.id, ...cleared]
-}
-
-export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
-    const store: Store = storeHandle.doc()
-    const device = disk.device
-    if (!device) {
-        log(`Disk ${disk.id} is not mounted on any device. Nothing to undock.`)
-        return
-    }
-    try {
-        // The store is updated whatever happens to the unmount below (idea#126)
-        storeHandle.change(doc => {
-            const dsk = doc.diskDB[disk.id]
-            if (dsk) {
-                dsk.dockedTo = null
-                dsk.device = null
-                dsk.diskTypes = []
-                dsk.backupConfig = null
-            }
-        })
-        // Stop all instances of the disk and move them to the 'Undocked' state
-        const instancesOnDisk = Object.values(store.instanceDB).filter(instance => String(instance.storedOn) === String(disk.id));
-        for (const instance of instancesOnDisk) {
-            const cmdLogHandle = getCommandLogHandle()
-            const traceId = crypto.randomUUID()
-            const traceCtx = { traceId, command: 'stopInstance', args: JSON.stringify({ instanceName: instance.name, diskId: disk.id, reason: 'disk-undocked' }) }
-            if (cmdLogHandle) addTrace(cmdLogHandle, { traceId, command: 'stopInstance', args: traceCtx.args, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
-            try {
-                await runWithTrace(traceCtx, () => stopInstance(storeHandle, instance, disk, 'disk-undocked'))
-                if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'ok')
-            } catch (e: any) {
-                if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'error', e.message ?? String(e))
-            }
-            log(`Instance ${instance.id} stopped`)
-            storeHandle.change(doc => {
-                const inst = doc.instanceDB[instance.id]
-                // Move the instance to the 'Undocked' state and clear metrics
-                if (inst) {
-                    inst.status = 'Undocked' as Status
-                    inst.metrics = null
-                }
-            })
-            log(`Instance ${instance.id} has been moved to the 'Undocked' state`)
-        }
-        // Unmount after the instances are stopped (their containers keep files on
-        // the disk open). Repeat umount until the folder is no longer a mount
-        // point, then rmdir it; never rm -fr (idea#126).
-        if (!mountCommandsActive(config.settings.testMode)) {
-            log(`testMode: skipping umount and rmdir for device ${device}`)
-        } else {
-            await unmountDisk(storeHandle, disk, device, store)
-        }
-    } catch (e) {
-        log(`Error unmounting device ${device}`)
-        log(e)
-        recordDiskDetectionFailure('undock', `Could not undock the disk on ${device}: ${errorMessage(e)}`, { device, diskId: disk.id })
-    }
-}
-
-/**
- * Unmount a disk on undock (idea#126): unmountAndRemove() repeats umount until
- * `mountpoint -q` is false (at most UMOUNT_MAX_ATTEMPTS), then rmdirs the mount
- * point. On a busy unmount: a failed `diskDetection` trace (step 'undock') and
- * Disk.unmountError { engineId, mountPoint, fsUuid, message }, for every disk
- * type. The caller has already updated the store.
- */
-const unmountDisk = async (storeHandle: DocHandle<Store>, disk: Disk, device: DeviceName, store: Store): Promise<void> => {
-    const mountPoint = mountPointOf(device)
-    log(`Attempting to unmount device ${device}`)
-    let result
-    try {
-        result = await unmountAndRemove(device)
-    } catch (e) {
-        // Unmounted, but the folder could not be removed (e.g. not empty): no data at risk
-        recordDiskDetectionFailure('undock', `Unmounted ${mountPoint} but could not remove the folder: ${errorMessage(e)}`, { device, diskId: disk.id, mountPoint })
-        mountedFsUuids.delete(device)
-        return
-    }
-    if (result.ok) {
-        log(`Device ${device} unmounted after ${result.attempts} umount call(s)${result.removed ? `; ${mountPoint} removed` : ''}`)
-        mountedFsUuids.delete(device)
-        return
-    }
-    const engineId = (getLocalEngine(store)?.id ?? disk.dockedTo) as EngineID
-    const fsUuid = mountedFsUuids.get(device) ?? null
-    const message = `Could not unmount ${mountPoint}: ${result.message}. Restart this Pi to release the disk.`
-    recordDiskDetectionFailure('undock', message, { device, diskId: disk.id, mountPoint, fsUuid })
-    storeHandle.change(doc => {
-        const dsk = doc.diskDB[disk.id]
-        if (dsk) dsk.unmountError = { engineId, mountPoint, fsUuid, message }
-    })
-}
-
-```
-
-## File: src/utils/CommandLogger.ts
-```typescript
-/**
- * CommandLogger.ts
- *
- * Captures console output per command invocation using AsyncLocalStorage.
- * Each command gets a unique trace context that flows automatically through
- * every async call in its chain — no changes needed in individual commands.
- *
- * Usage:
- *   1. Call initCommandLogger(handle) once at engine startup.
- *   2. Wrap every command dispatch in runWithTrace(ctx, fn).
- *   3. Everything inside fn() that calls console.log/info/warn/error/debug
- *      is automatically collected into that trace's log list.
- */
-
-import { AsyncLocalStorage } from 'async_hooks'
-import type { DocHandle } from '@automerge/automerge-repo'
-import type { CommandLogStore, LogEntry } from '../data/CommandLogStore.js'
-import { flushLogs } from '../data/CommandLogStore.js'
-
-export interface TraceContext {
-  traceId: string
-  command: string
-  args: string
-}
-
-// ── AsyncLocalStorage instance ───────────────────────────────────────────────
-
-const storage = new AsyncLocalStorage<TraceContext>()
-
-export const getActiveTrace = (): TraceContext | undefined => storage.getStore()
-
-export const runWithTrace = async <T>(
-  ctx: TraceContext,
-  fn: () => Promise<T>
-): Promise<T> => {
-  return storage.run(ctx, fn)
-}
-
-// ── Per-trace pending buffers and debounced flush ────────────────────────────
-
-const pendingBuffers = new Map<string, LogEntry[]>()
-const flushTimers    = new Map<string, ReturnType<typeof setTimeout>>()
-const FLUSH_DEBOUNCE_MS = 50
-
-let _handle: DocHandle<CommandLogStore> | null = null
-
-const scheduleFlush = (traceId: string): void => {
-  const existing = flushTimers.get(traceId)
-  if (existing) clearTimeout(existing)
-
-  const timer = setTimeout(() => {
-    flushTimers.delete(traceId)
-    const buffer = pendingBuffers.get(traceId)
-    if (buffer && buffer.length > 0 && _handle) {
-      const batch = buffer.splice(0)           // drain in-place
-      flushLogs(_handle, traceId, batch)
-    }
-  }, FLUSH_DEBOUNCE_MS)
-
-  flushTimers.set(traceId, timer)
-}
-
-/**
- * Append a log entry to a trace's pending buffer and schedule a flush.
- * Called from the patched console methods.
- */
-export const appendToTrace = (traceId: string, entry: LogEntry): void => {
-  if (!pendingBuffers.has(traceId)) pendingBuffers.set(traceId, [])
-  pendingBuffers.get(traceId)!.push(entry)
-  scheduleFlush(traceId)
-}
-
-/**
- * Force-flush any remaining buffered entries for a trace immediately.
- * Call this right before closeTrace so logs aren't lost on fast commands.
- */
-export const flushTrace = async (traceId: string): Promise<void> => {
-  const timer = flushTimers.get(traceId)
-  if (timer) {
-    clearTimeout(timer)
-    flushTimers.delete(traceId)
-  }
-  const buffer = pendingBuffers.get(traceId)
-  if (buffer && buffer.length > 0 && _handle) {
-    const batch = buffer.splice(0)
-    flushLogs(_handle, traceId, batch)
-  }
-  pendingBuffers.delete(traceId)
-}
-
-// ── Console patch ────────────────────────────────────────────────────────────
-
-let _patched = false
-
-const patchConsole = (): void => {
-  if (_patched) return
-  _patched = true
-
-  const originals = {
-    log:   console.log.bind(console),
-    info:  console.info.bind(console),
-    warn:  console.warn.bind(console),
-    error: console.error.bind(console),
-    debug: console.debug.bind(console),
-  } as const
-
-  type Level = keyof typeof originals
-
-  const patch = (level: Level) => {
-    console[level] = (...args: unknown[]) => {
-      originals[level](...args)              // always write to stdout
-      const ctx = getActiveTrace()
-      if (ctx) {
-        appendToTrace(ctx.traceId, {
-          level,
-          message: args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '),
-          timestamp: Date.now(),
-        })
-      }
-    }
-  }
-
-  patch('log')
-  patch('info')
-  patch('warn')
-  patch('error')
-  patch('debug')
-}
-
-// ── Public init ──────────────────────────────────────────────────────────────
-
-/**
- * Call once at engine startup, after the CommandLogStore doc is created.
- * Patches console and connects the logger to the Automerge doc handle.
- */
-export const initCommandLogger = (handle: DocHandle<CommandLogStore>): void => {
-  _handle = handle
-  patchConsole()
-}
-
-```
-
-## File: src/utils/ResourceLock.ts
-```typescript
-/**
- * ResourceLock.ts — per-resource mutual exclusion for long-running operations
- *
- * Group P: Concurrent operation safety
- *
- * Prevents two operations from mutating the same resource simultaneously.
- * Resources are identified by string keys (instanceId, diskId, or compound).
- *
- * Design:
- *   - In-memory only — not persisted to the store. Locks are engine-local and
- *     reset on restart (acceptable: operationDB recovery handles restart cases).
- *   - acquire() returns false immediately if the resource is locked (non-blocking).
- *     Callers must check and surface a 409-style error to the operator.
- *   - All long-running commands (copyApp, moveApp, backupApp, restoreApp) acquire
- *     locks on their affected resources before starting and release in finally{}.
- *
- * Resource key conventions:
- *   - Instance-level ops: `instance:<instanceId>`
- *   - Disk-level ops:     `disk:<diskId>`
- *   - Multi-resource ops (e.g. copyApp): acquire both source and target instance keys
- */
-
-import { log } from './utils.js'
-import { chalk } from 'zx'
-
-export interface LockInfo {
-    kind: string        // operation kind holding the lock
-    acquiredAt: number  // unix ms
-}
-
-class ResourceLockManager {
-    private locks = new Map<string, LockInfo>()
-
-    /**
-     * Attempt to acquire a lock on `key` for operation `kind`.
-     * Returns true if acquired, false if already locked.
-     */
-    acquire(key: string, kind: string): boolean {
-        if (this.locks.has(key)) {
-            const held = this.locks.get(key)!
-            log(chalk.yellow(`ResourceLock: '${key}' already locked by '${held.kind}' (since ${new Date(held.acquiredAt).toISOString()})`))
-            return false
-        }
-        this.locks.set(key, { kind, acquiredAt: Date.now() })
-        log(`ResourceLock: acquired '${key}' for '${kind}'`)
-        return true
-    }
-
-    /**
-     * Acquire multiple keys atomically (all-or-nothing).
-     * Returns true if all acquired, false if any were already locked.
-     * On failure, no locks are held (rolled back).
-     */
-    acquireAll(keys: string[], kind: string): boolean {
-        const acquired: string[] = []
-        for (const key of keys) {
-            if (!this.acquire(key, kind)) {
-                // Roll back already-acquired keys
-                acquired.forEach(k => this.release(k))
-                return false
-            }
-            acquired.push(key)
-        }
-        return true
-    }
-
-    /**
-     * Release a lock. Safe to call even if the key is not locked.
-     */
-    release(key: string): void {
-        if (this.locks.has(key)) {
-            this.locks.delete(key)
-            log(`ResourceLock: released '${key}'`)
-        }
-    }
-
-    /**
-     * Release multiple keys.
-     */
-    releaseAll(keys: string[]): void {
-        keys.forEach(k => this.release(k))
-    }
-
-    /**
-     * Check if a key is currently locked.
-     */
-    isLocked(key: string): boolean {
-        return this.locks.has(key)
-    }
-
-    /**
-     * Return current lock info for a key, or undefined if unlocked.
-     */
-    getLockInfo(key: string): LockInfo | undefined {
-        return this.locks.get(key)
-    }
-
-    /**
-     * Return all currently held locks (for diagnostics).
-     */
-    allLocks(): Map<string, LockInfo> {
-        return new Map(this.locks)
-    }
-}
-
-// Singleton — one lock manager per engine process
-export const resourceLock = new ResourceLockManager()
-
-// Key helpers
-export const instanceKey = (instanceId: string) => `instance:${instanceId}`
-export const diskKey = (diskId: string) => `disk:${diskId}`
-
-```
-
-## File: src/utils/cliFlags.ts
-```typescript
-/**
- * Boolean command-line flags for build-engine (idea#146).
- *
- * zx's `argv` is minimist without declared booleans, so a flag can arrive as:
- *   --argon            true
- *   --no-argon         false
- *   --argon=false      'false' (a string)
- *   --argon false      'false' (a string)
- *   (absent)           undefined
- *
- * The old `argv.argon || defaults.argon` could never turn off an option whose
- * config default is true (argon, gadget). parseBoolFlag uses the flag whenever it
- * is present and falls back to the default only when it is absent.
- */
-const TRUE_WORDS = ['true', 'yes', 'on', '1']
-const FALSE_WORDS = ['false', 'no', 'off', '0']
-
-export const parseBoolFlag = (value: unknown, fallback: boolean): boolean => {
-    if (value === undefined || value === null) return fallback
-    if (typeof value === 'boolean') return value
-    if (typeof value === 'number') return value !== 0
-    if (typeof value === 'string') {
-        const v = value.trim().toLowerCase()
-        if (v === '') return true            // `--argon=` counts as present
-        if (TRUE_WORDS.includes(v)) return true
-        if (FALSE_WORDS.includes(v)) return false
-    }
-    // Arrays (flag given twice) and anything else: the last value wins.
-    if (Array.isArray(value) && value.length > 0) return parseBoolFlag(value[value.length - 1], fallback)
-    throw new Error(`Not a boolean flag value: ${JSON.stringify(value)} (use --flag, --no-flag or --flag=true|false)`)
-}
-
-/** Raspberry Pi models build-engine knows about. */
-export type PiModel = 'pi4' | 'pi5'
-
-export const parseModel = (value: unknown): PiModel | undefined => {
-    if (value === undefined || value === null || value === '') return undefined
-    const v = String(value).trim().toLowerCase()
-    if (v === 'pi4' || v === 'pi5') return v
-    throw new Error(`Unknown --model ${JSON.stringify(value)}; expected pi4 or pi5`)
-}
-
-/**
- * Resolve the gadget setting for a model. USB gadget mode needs the Pi 4's DWC2
- * USB controller; the Pi 5 has a PCIe USB controller, so gadget mode must stay off.
- * Asking for it explicitly on a Pi 5 is an error; a config default of true is
- * silently overridden.
- */
-export const resolveGadget = (flag: unknown, fallback: boolean, model: PiModel | undefined): boolean => {
-    const gadget = parseBoolFlag(flag, fallback)
-    if (model === 'pi5' && gadget) {
-        if (flag !== undefined && parseBoolFlag(flag, false)) {
-            throw new Error('--gadget is not supported on a Pi 5 (PCIe USB controller); leave it out or pass --no-gadget')
-        }
-        return false
-    }
-    return gadget
-}
-
-```
-
-## File: src/utils/commandUtils.ts
-```typescript
-import { DocHandle } from "@automerge/automerge-repo";
-import { Store } from "../data/Store.js";
-import { Command, EngineID } from "../data/CommonTypes.js";
-import { ArgumentDescriptor, CommandDefinition } from "../data/CommandDefinition.js";
-import { CommandLogStore, addTrace, closeTrace, getCommandLogHandle } from "../data/CommandLogStore.js";
-import { runWithTrace, flushTrace } from "./CommandLogger.js";
-import { print } from './utils.js';
-
-
-export const handleCommand = async (
-    commands: CommandDefinition[],
-    storeHandle: DocHandle<Store> | null,
-    context: 'console' | 'engine',
-    input: string,
-    commandLogHandle?: DocHandle<CommandLogStore> | null
-): Promise<void> => {
-    const trimmedInput = input.trim();
-    const commandName = trimmedInput.split(' ')[0];
-    const command = commands.find(cmd => cmd.name === commandName);
-
-    if (!command) {
-        print(`Unknown command: ${commandName}`);
-        return;
-    }
-
-    // A variadic last arg takes all remaining tokens (see ArgumentDescriptor.variadic)
-    const lastArg = command.args[command.args.length - 1];
-    const isVariadic = lastArg?.variadic === true;
-
-    let stringArgs: string[] = [];
-    // Special case for commands that take the entire rest of the line as a single argument
-    if (command.args.length === 1 && !isVariadic) {
-        const firstSpaceIndex = trimmedInput.indexOf(' ');
-        if (firstSpaceIndex !== -1) {
-            stringArgs.push(trimmedInput.substring(firstSpaceIndex + 1));
-        }
-    } else {
-        stringArgs = trimmedInput.split(' ').slice(1).filter(arg => arg.length > 0);
-    }
-
-    // Scope checking
-    if (context === 'console' && command.scope === 'engine') {
-        print(`Error: Command '${commandName}' can only be executed on an engine. Use 'send <engineId> ${commandName} ...' to execute it remotely.`);
-        return;
-    }
-
-    if (context === 'engine' && command.scope === 'console') {
-        print(`Error: Command '${commandName}' can only be executed on a console.`);
-        return;
-    }
-
-    let args: any[];
-    try {
-        args = stringArgs.map((arg, index) => {
-            const descriptor = isVariadic && index >= command.args.length - 1 ? lastArg : command.args[index];
-            if (!descriptor) throw new Error("Too many arguments");
-            return convertToType(arg, descriptor);
-        });
-        if (args.length < command.args.length) throw new Error("Insufficient arguments");
-    } catch (error: any) {
-        console.error(`Error: ${error.message}`);
-        return;
-    }
-
-    // ── Trace setup ──────────────────────────────────────────────────────────
-    const traceId = crypto.randomUUID();
-    // Build a named args object when the CommandDefinition has arg names defined,
-    // otherwise fall back to a positional array. The Console filters traces by
-    // args['instanceName'] or args['instanceId'], so named args are required.
-    // A variadic last arg is recorded as an array of all its tokens.
-    const namedArgs: Record<string, string | string[] | null> | string[] =
-        command.args.every(a => a.name)
-            ? Object.fromEntries(command.args.map((a, i) =>
-                [a.name!, a.variadic ? stringArgs.slice(i) : stringArgs[i] ?? null]))
-            : stringArgs
-    const argsJson = JSON.stringify(namedArgs);
-    const traceCtx = { traceId, command: commandName, args: argsJson };
-
-    if (commandLogHandle) {
-        addTrace(commandLogHandle, {
-            traceId,
-            command: commandName,
-            args: argsJson,
-            startedAt: Date.now(),
-            completedAt: null,
-            status: 'running',
-            errorMessage: null,
-        });
-    }
-
-    // ── Execute inside trace context ─────────────────────────────────────────
-    try {
-        await runWithTrace(traceCtx, async () => { await command.execute(storeHandle, ...args); });
-        if (commandLogHandle) {
-            await flushTrace(traceId);
-            closeTrace(commandLogHandle, traceId, 'ok');
-        }
-    } catch (error: any) {
-        console.error(`Error: ${error.message}`);
-        if (commandLogHandle) {
-            await flushTrace(traceId);
-            closeTrace(commandLogHandle, traceId, 'error', error.message);
-        }
-    }
-}
-
-
-/**
- * A dependency-free utility to add a command to a specific engine's command array in the store.
- * This is used by tests and the 'send' command definition.
- */
-export const sendCommand = (storeHandle: DocHandle<Store>, engineId: EngineID, command: Command): void => {
-    print(`Sending command '${command}' to engine ${engineId}`);
-
-    const store = storeHandle.doc();
-    if (!store?.engineDB[engineId]) {
-        console.error(`Cannot send command: Engine ${engineId} not found in store.`);
-        return;
-    }
-
-    // Trace the dispatch on the originating engine so the Console shows
-    // cross-engine commands in history (e.g. copyApp dispatching startInstance
-    // to a remote engine). This is a one-shot trace with no log lines.
-    const cmdLogHandle = getCommandLogHandle()
-    if (cmdLogHandle) {
-        const commandName = String(command).split(' ')[0]
-        const traceId = crypto.randomUUID()
-        addTrace(cmdLogHandle, {
-            traceId,
-            command: commandName,
-            args: JSON.stringify({ dispatchedTo: engineId, command: String(command) }),
-            startedAt: Date.now(),
-            completedAt: Date.now(),
-            status: 'running',
-            errorMessage: null,
-        })
-        closeTrace(cmdLogHandle, traceId, 'ok')
-    }
-
-    storeHandle.change(doc => {
-        const engine = doc.engineDB[engineId];
-        if (engine) {
-            engine.commands.push(command);
-        }
-    });
-}
-const convertToType = (str: string, descriptor: ArgumentDescriptor): any => {
-    switch (descriptor.type) {
-        case "number":
-            const num = parseFloat(str);
-            if (isNaN(num)) throw new Error("Cannot convert to number");
-            return num;
-        case "string":
-            return str;
-        case "object":
-            if (!descriptor.objectSpec) throw new Error("Object specification is missing");
-            try {
-                const obj = JSON.parse(str);
-                for (const [key, fieldSpec] of Object.entries(descriptor.objectSpec)) {
-                    if (!(key in obj)) throw new Error(`Missing key '${key}' in object`);
-                    switch (fieldSpec.type) {
-                        case 'number':
-                            const value = parseFloat(obj[key]);
-                            if (isNaN(value)) throw new Error(`Key '${key}' is not a valid number`);
-                            obj[key] = value;
-                            break;
-                        case 'string':
-                            if (typeof obj[key] !== 'string') throw new Error(`Key '${key}' is not a valid string`);
-                            break;
-                    }
-                }
-                return obj;
-            } catch {
-                throw new Error("Cannot convert to object");
-            }
-        default:
-            throw new Error("Unsupported type");
-    }
-}
-
-```
-
-## File: src/utils/nameGenerator.ts
-```typescript
-import util from 'util';
-import { Hostname } from '../data/CommonTypes.js';
-
-// Docker-style name generation
-// Inspired by
-// - https://github.com/moby/moby/blob/39f7b2b6d0156811d9683c6cb0743118ae516a11/pkg/namesgenerator/names-generator.go#L852-L863 
-// - https://github.com/subfuzion/docker-namesgenerator/blob/master/namesgenerator.js
-  
-  const adjectives = [
-    "admiring",
-          "adoring",
-          "affectionate",
-          "agitated",
-          "amazing",
-          "angry",
-          "awesome",
-          "beautiful",
-          "blissful",
-          "bold",
-          "boring",
-          "brave",
-          "busy",
-          "charming",
-          "clever",
-          "cool",
-          "compassionate",
-          "competent",
-          "condescending",
-          "confident",
-          "cranky",
-          "crazy",
-          "dazzling",
-          "determined",
-          "distracted",
-          "dreamy",
-          "eager",
-          "ecstatic",
-          "elastic",
-          "elated",
-          "elegant",
-          "eloquent",
-          "epic",
-          "exciting",
-          "fervent",
-          "festive",
-          "flamboyant",
-          "focused",
-          "friendly",
-          "frosty",
-          "funny",
-          "gallant",
-          "gifted",
-          "goofy",
-          "gracious",
-          "great",
-          "happy",
-          "hardcore",
-          "heuristic",
-          "hopeful",
-          "hungry",
-          "infallible",
-          "inspiring",
-          "intelligent",
-          "interesting",
-          "jolly",
-          "jovial",
-          "keen",
-          "kind",
-          "laughing",
-          "loving",
-          "lucid",
-          "magical",
-          "mystifying",
-          "modest",
-          "musing",
-          "naughty",
-          "nervous",
-          "nice",
-          "nifty",
-          "nostalgic",
-          "objective",
-          "optimistic",
-          "peaceful",
-          "pedantic",
-          "pensive",
-          "practical",
-          "priceless",
-          "quirky",
-          "quizzical",
-          "recursing",
-          "relaxed",
-          "reverent",
-          "romantic",
-          "sad",
-          "serene",
-          "sharp",
-          "silly",
-          "sleepy",
-          "stoic",
-          "strange",
-          "stupefied",
-          "suspicious",
-          "sweet",
-          "tender",
-          "thirsty",
-          "trusting",
-          "unruffled",
-          "upbeat",
-          "vibrant",
-          "vigilant",
-          "vigorous",
-          "wizardly",
-          "wonderful",
-          "xenodochial",
-          "youthful",
-          "zealous",
-          "zen",
-  ]
-  
-  const scientists = [
-    // Maria Gaetana Agnesi - Italian mathematician, philosopher, theologian and humanitarian. She was the first woman to write a mathematics handbook and the first woman appointed as a Mathematics Professor at a University. https://en.wikipedia.org/wiki/Maria_Gaetana_Agnesi
-    "agnesi",
-  
-    // Muhammad ibn Jābir al-Ḥarrānī al-Battānī was a founding father of astronomy. https://en.wikipedia.org/wiki/Mu%E1%B8%A5ammad_ibn_J%C4%81bir_al-%E1%B8%A4arr%C4%81n%C4%AB_al-Batt%C4%81n%C4%AB
-    "albattani",
-  
-    // Frances E. Allen, became the first female IBM Fellow in 1989. In 2006, she became the first female recipient of the ACM's Turing Award. https://en.wikipedia.org/wiki/Frances_E._Allen
-    "allen",
-  
-    // June Almeida - Scottish virologist who took the first pictures of the rubella virus - https://en.wikipedia.org/wiki/June_Almeida
-    "almeida",
-  
-    // Kathleen Antonelli, American computer programmer and one of the six original programmers of the ENIAC - https://en.wikipedia.org/wiki/Kathleen_Antonelli
-    "antonelli",
-  
-    // Archimedes was a physicist, engineer and mathematician who invented too many things to list them here. https://en.wikipedia.org/wiki/Archimedes
-    "archimedes",
-  
-    // Maria Ardinghelli - Italian translator, mathematician and physicist - https://en.wikipedia.org/wiki/Maria_Ardinghelli
-    "ardinghelli",
-  
-    // Aryabhata - Ancient Indian mathematician-astronomer during 476-550 CE https://en.wikipedia.org/wiki/Aryabhata
-    "aryabhata",
-  
-    // Wanda Austin - Wanda Austin is the President and CEO of The Aerospace Corporation, a leading architect for the US security space programs. https://en.wikipedia.org/wiki/Wanda_Austin
-    "austin",
-  
-    // Charles Babbage invented the concept of a programmable computer. https://en.wikipedia.org/wiki/Charles_Babbage.
-    "babbage",
-  
-    // Stefan Banach - Polish mathematician, was one of the founders of modern functional analysis. https://en.wikipedia.org/wiki/Stefan_Banach
-    "banach",
-  
-    // Buckaroo Banzai and his mentor Dr. Hikita perfected the "oscillation overthruster", a device that allows one to pass through solid matter. - https://en.wikipedia.org/wiki/The_Adventures_of_Buckaroo_Banzai_Across_the_8th_Dimension
-    "banzai",
-  
-    // John Bardeen co-invented the transistor - https://en.wikipedia.org/wiki/John_Bardeen
-    "bardeen",
-  
-    // Jean Bartik, born Betty Jean Jennings, was one of the original programmers for the ENIAC computer. https://en.wikipedia.org/wiki/Jean_Bartik
-    "bartik",
-  
-    // Laura Bassi, the world's first female professor https://en.wikipedia.org/wiki/Laura_Bassi
-    "bassi",
-  
-    // Hugh Beaver, British engineer, founder of the Guinness Book of World Records https://en.wikipedia.org/wiki/Hugh_Beaver
-    "beaver",
-  
-    // Alexander Graham Bell - an eminent Scottish-born scientist, inventor, engineer and innovator who is credited with inventing the first practical telephone - https://en.wikipedia.org/wiki/Alexander_Graham_Bell
-    "bell",
-  
-    // Karl Friedrich Benz - a German automobile engineer. Inventor of the first practical motorcar. https://en.wikipedia.org/wiki/Karl_Benz
-    "benz",
-  
-    // Homi J Bhabha - was an Indian nuclear physicist, founding director, and professor of physics at the Tata Institute of Fundamental Research. Colloquially known as "father of Indian nuclear programme"- https://en.wikipedia.org/wiki/Homi_J._Bhabha
-    "bhabha",
-  
-    // Bhaskara II - Ancient Indian mathematician-astronomer whose work on calculus predates Newton and Leibniz by over half a millennium - https://en.wikipedia.org/wiki/Bh%C4%81skara_II#Calculus
-    "bhaskara",
-  
-    // Sue Black - British computer scientist and campaigner. She has been instrumental in saving Bletchley Park, the site of World War II codebreaking - https://en.wikipedia.org/wiki/Sue_Black_(computer_scientist)
-    "black",
-  
-    // Elizabeth Helen Blackburn - Australian-American Nobel laureate; best known for co-discovering telomerase. https://en.wikipedia.org/wiki/Elizabeth_Blackburn
-    "blackburn",
-  
-    // Elizabeth Blackwell - American doctor and first American woman to receive a medical degree - https://en.wikipedia.org/wiki/Elizabeth_Blackwell
-    "blackwell",
-  
-    // Niels Bohr is the father of quantum theory. https://en.wikipedia.org/wiki/Niels_Bohr.
-    "bohr",
-  
-    // Kathleen Booth, she's credited with writing the first assembly language. https://en.wikipedia.org/wiki/Kathleen_Booth
-    "booth",
-  
-    // Anita Borg - Anita Borg was the founding director of the Institute for Women and Technology (IWT). https://en.wikipedia.org/wiki/Anita_Borg
-    "borg",
-  
-    // Satyendra Nath Bose - He provided the foundation for Bose–Einstein statistics and the theory of the Bose–Einstein condensate. - https://en.wikipedia.org/wiki/Satyendra_Nath_Bose
-    "bose",
-  
-    // Katherine Louise Bouman is an imaging scientist and Assistant Professor of Computer Science at the California Institute of Technology. She researches computational methods for imaging, and developed an algorithm that made possible the picture first visualization of a black hole using the Event Horizon Telescope. - https://en.wikipedia.org/wiki/Katie_Bouman
-    "bouman",
-  
-    // Evelyn Boyd Granville - She was one of the first African-American woman to receive a Ph.D. in mathematics; she earned it in 1949 from Yale University. https://en.wikipedia.org/wiki/Evelyn_Boyd_Granville
-    "boyd",
-  
-    // Brahmagupta - Ancient Indian mathematician during 598-670 CE who gave rules to compute with zero - https://en.wikipedia.org/wiki/Brahmagupta#Zero
-    "brahmagupta",
-  
-    // Walter Houser Brattain co-invented the transistor - https://en.wikipedia.org/wiki/Walter_Houser_Brattain
-    "brattain",
-  
-    // Emmett Brown invented time travel. https://en.wikipedia.org/wiki/Emmett_Brown (thanks Brian Goff)
-    "brown",
-  
-    // Linda Brown Buck - American biologist and Nobel laureate best known for her genetic and molecular analyses of the mechanisms of smell. https://en.wikipedia.org/wiki/Linda_B._Buck
-    "buck",
-  
-    // Dame Susan Jocelyn Bell Burnell - Northern Irish astrophysicist who discovered radio pulsars and was the first to analyse them. https://en.wikipedia.org/wiki/Jocelyn_Bell_Burnell
-    "burnell",
-  
-    // Annie Jump Cannon - pioneering female astronomer who classified hundreds of thousands of stars and created the system we use to understand stars today. https://en.wikipedia.org/wiki/Annie_Jump_Cannon
-    "cannon",
-  
-    // Rachel Carson - American marine biologist and conservationist, her book Silent Spring and other writings are credited with advancing the global environmental movement. https://en.wikipedia.org/wiki/Rachel_Carson
-    "carson",
-  
-    // Dame Mary Lucy Cartwright - British mathematician who was one of the first to study what is now known as chaos theory. Also known for Cartwright's theorem which finds applications in signal processing. https://en.wikipedia.org/wiki/Mary_Cartwright
-    "cartwright",
-  
-    // George Washington Carver - American agricultural scientist and inventor. He was the most prominent black scientist of the early 20th century. https://en.wikipedia.org/wiki/George_Washington_Carver
-    "carver",
-  
-    // Vinton Gray Cerf - American Internet pioneer, recognised as one of "the fathers of the Internet". With Robert Elliot Kahn, he designed TCP and IP, the primary data communication protocols of the Internet and other computer networks. https://en.wikipedia.org/wiki/Vint_Cerf
-    "cerf",
-  
-    // Subrahmanyan Chandrasekhar - Astrophysicist known for his mathematical theory on different stages and evolution in structures of the stars. He has won nobel prize for physics - https://en.wikipedia.org/wiki/Subrahmanyan_Chandrasekhar
-    "chandrasekhar",
-  
-    // Sergey Alexeyevich Chaplygin (Russian: Серге́й Алексе́евич Чаплы́гин; April 5, 1869 – October 8, 1942) was a Russian and Soviet physicist, mathematician, and mechanical engineer. He is known for mathematical formulas such as Chaplygin's equation and for a hypothetical substance in cosmology called Chaplygin gas, named after him. https://en.wikipedia.org/wiki/Sergey_Chaplygin
-    "chaplygin",
-  
-    // Émilie du Châtelet - French natural philosopher, mathematician, physicist, and author during the early 1730s, known for her translation of and commentary on Isaac Newton's book Principia containing basic laws of physics. https://en.wikipedia.org/wiki/%C3%89milie_du_Ch%C3%A2telet
-    "chatelet",
-  
-    // Asima Chatterjee was an Indian organic chemist noted for her research on vinca alkaloids, development of drugs for treatment of epilepsy and malaria - https://en.wikipedia.org/wiki/Asima_Chatterjee
-    "chatterjee",
-  
-    // David Lee Chaum - American computer scientist and cryptographer. Known for his seminal contributions in the field of anonymous communication. https://en.wikipedia.org/wiki/David_Chaum
-    "chaum",
-  
-    // Pafnuty Chebyshev - Russian mathematician. He is known fo his works on probability, statistics, mechanics, analytical geometry and number theory https://en.wikipedia.org/wiki/Pafnuty_Chebyshev
-    "chebyshev",
-  
-    // Joan Clarke - Bletchley Park code breaker during the Second World War who pioneered techniques that remained top secret for decades. Also an accomplished numismatist https://en.wikipedia.org/wiki/Joan_Clarke
-    "clarke",
-  
-    // Bram Cohen - American computer programmer and author of the BitTorrent peer-to-peer protocol. https://en.wikipedia.org/wiki/Bram_Cohen
-    "cohen",
-  
-    // Jane Colden - American botanist widely considered the first female American botanist - https://en.wikipedia.org/wiki/Jane_Colden
-    "colden",
-  
-    // Gerty Theresa Cori - American biochemist who became the third woman—and first American woman—to win a Nobel Prize in science, and the first woman to be awarded the Nobel Prize in Physiology or Medicine. Cori was born in Prague. https://en.wikipedia.org/wiki/Gerty_Cori
-    "cori",
-  
-    // Seymour Roger Cray was an American electrical engineer and supercomputer architect who designed a series of computers that were the fastest in the world for decades. https://en.wikipedia.org/wiki/Seymour_Cray
-    "cray",
-  
-    // This entry reflects a husband and wife team who worked together:
-    // Joan Curran was a Welsh scientist who developed radar and invented chaff, a radar countermeasure. https://en.wikipedia.org/wiki/Joan_Curran
-    // Samuel Curran was an Irish physicist who worked alongside his wife during WWII and invented the proximity fuse. https://en.wikipedia.org/wiki/Samuel_Curran
-    "curran",
-  
-    // Marie Curie discovered radioactivity. https://en.wikipedia.org/wiki/Marie_Curie.
-    "curie",
-  
-    // Charles Darwin established the principles of natural evolution. https://en.wikipedia.org/wiki/Charles_Darwin.
-    "darwin",
-  
-    // Leonardo Da Vinci invented too many things to list here. https://en.wikipedia.org/wiki/Leonardo_da_Vinci.
-    "davinci",
-  
-    // A. K. (Alexander Keewatin) Dewdney, Canadian mathematician, computer scientist, author and filmmaker. Contributor to Scientific American's "Computer Recreations" from 1984 to 1991. Author of Core War (program), The Planiverse, The Armchair Universe, The Magic Machine, The New Turing Omnibus, and more. https://en.wikipedia.org/wiki/Alexander_Dewdney
-    "dewdney",
-  
-    // Satish Dhawan - Indian mathematician and aerospace engineer, known for leading the successful and indigenous development of the Indian space programme. https://en.wikipedia.org/wiki/Satish_Dhawan
-    "dhawan",
-  
-    // Bailey Whitfield Diffie - American cryptographer and one of the pioneers of public-key cryptography. https://en.wikipedia.org/wiki/Whitfield_Diffie
-    "diffie",
-  
-    // Edsger Wybe Dijkstra was a Dutch computer scientist and mathematical scientist. https://en.wikipedia.org/wiki/Edsger_W._Dijkstra.
-    "dijkstra",
-  
-    // Paul Adrien Maurice Dirac - English theoretical physicist who made fundamental contributions to the early development of both quantum mechanics and quantum electrodynamics. https://en.wikipedia.org/wiki/Paul_Dirac
-    "dirac",
-  
-    // Agnes Meyer Driscoll - American cryptanalyst during World Wars I and II who successfully cryptanalysed a number of Japanese ciphers. She was also the co-developer of one of the cipher machines of the US Navy, the CM. https://en.wikipedia.org/wiki/Agnes_Meyer_Driscoll
-    "driscoll",
-  
-    // Donna Dubinsky - played an integral role in the development of personal digital assistants (PDAs) serving as CEO of Palm, Inc. and co-founding Handspring. https://en.wikipedia.org/wiki/Donna_Dubinsky
-    "dubinsky",
-  
-    // Annie Easley - She was a leading member of the team which developed software for the Centaur rocket stage and one of the first African-Americans in her field. https://en.wikipedia.org/wiki/Annie_Easley
-    "easley",
-  
-    // Thomas Alva Edison, prolific inventor https://en.wikipedia.org/wiki/Thomas_Edison
-    "edison",
-  
-    // Albert Einstein invented the general theory of relativity. https://en.wikipedia.org/wiki/Albert_Einstein
-    "einstein",
-  
-    // Alexandra Asanovna Elbakyan (Russian: Алекса́ндра Аса́новна Элбакя́н) is a Kazakhstani graduate student, computer programmer, internet pirate in hiding, and the creator of the site Sci-Hub. Nature has listed her in 2016 in the top ten people that mattered in science, and Ars Technica has compared her to Aaron Swartz. - https://en.wikipedia.org/wiki/Alexandra_Elbakyan
-    "elbakyan",
-  
-    // Taher A. ElGamal - Egyptian cryptographer best known for the ElGamal discrete log cryptosystem and the ElGamal digital signature scheme. https://en.wikipedia.org/wiki/Taher_Elgamal
-    "elgamal",
-  
-    // Gertrude Elion - American biochemist, pharmacologist and the 1988 recipient of the Nobel Prize in Medicine - https://en.wikipedia.org/wiki/Gertrude_Elion
-    "elion",
-  
-    // James Henry Ellis - British engineer and cryptographer employed by the GCHQ. Best known for conceiving for the first time, the idea of public-key cryptography. https://en.wikipedia.org/wiki/James_H._Ellis
-    "ellis",
-  
-    // Douglas Engelbart gave the mother of all demos: https://en.wikipedia.org/wiki/Douglas_Engelbart
-    "engelbart",
-  
-    // Euclid invented geometry. https://en.wikipedia.org/wiki/Euclid
-    "euclid",
-  
-    // Leonhard Euler invented large parts of modern mathematics. https://de.wikipedia.org/wiki/Leonhard_Euler
-    "euler",
-  
-    // Michael Faraday - British scientist who contributed to the study of electromagnetism and electrochemistry. https://en.wikipedia.org/wiki/Michael_Faraday
-    "faraday",
-  
-    // Horst Feistel - German-born American cryptographer who was one of the earliest non-government researchers to study the design and theory of block ciphers. Co-developer of DES and Lucifer. Feistel networks, a symmetric structure used in the construction of block ciphers are named after him. https://en.wikipedia.org/wiki/Horst_Feistel
-    "feistel",
-  
-    // Pierre de Fermat pioneered several aspects of modern mathematics. https://en.wikipedia.org/wiki/Pierre_de_Fermat
-    "fermat",
-  
-    // Enrico Fermi invented the first nuclear reactor. https://en.wikipedia.org/wiki/Enrico_Fermi.
-    "fermi",
-  
-    // Richard Feynman was a key contributor to quantum mechanics and particle physics. https://en.wikipedia.org/wiki/Richard_Feynman
-    "feynman",
-  
-    // Benjamin Franklin is famous for his experiments in electricity and the invention of the lightning rod.
-    "franklin",
-  
-    // Yuri Alekseyevich Gagarin - Soviet pilot and cosmonaut, best known as the first human to journey into outer space. https://en.wikipedia.org/wiki/Yuri_Gagarin
-    "gagarin",
-  
-    // Galileo was a founding father of modern astronomy, and faced politics and obscurantism to establish scientific truth.  https://en.wikipedia.org/wiki/Galileo_Galilei
-    "galileo",
-  
-    // Évariste Galois - French mathematician whose work laid the foundations of Galois theory and group theory, two major branches of abstract algebra, and the subfield of Galois connections, all while still in his late teens. https://en.wikipedia.org/wiki/%C3%89variste_Galois
-    "galois",
-  
-    // Kadambini Ganguly - Indian physician, known for being the first South Asian female physician, trained in western medicine, to graduate in South Asia. https://en.wikipedia.org/wiki/Kadambini_Ganguly
-    "ganguly",
-  
-    // William Henry "Bill" Gates III is an American business magnate, philanthropist, investor, computer programmer, and inventor. https://en.wikipedia.org/wiki/Bill_Gates
-    "gates",
-  
-    // Johann Carl Friedrich Gauss - German mathematician who made significant contributions to many fields, including number theory, algebra, statistics, analysis, differential geometry, geodesy, geophysics, mechanics, electrostatics, magnetic fields, astronomy, matrix theory, and optics. https://en.wikipedia.org/wiki/Carl_Friedrich_Gauss
-    "gauss",
-  
-    // Marie-Sophie Germain - French mathematician, physicist and philosopher. Known for her work on elasticity theory, number theory and philosophy. https://en.wikipedia.org/wiki/Sophie_Germain
-    "germain",
-  
-    // Adele Goldberg, was one of the designers and developers of the Smalltalk language. https://en.wikipedia.org/wiki/Adele_Goldberg_(computer_scientist)
-    "goldberg",
-  
-    // Adele Goldstine, born Adele Katz, wrote the complete technical description for the first electronic digital computer, ENIAC. https://en.wikipedia.org/wiki/Adele_Goldstine
-    "goldstine",
-  
-    // Shafi Goldwasser is a computer scientist known for creating theoretical foundations of modern cryptography. Winner of 2012 ACM Turing Award. https://en.wikipedia.org/wiki/Shafi_Goldwasser
-    "goldwasser",
-  
-    // James Golick, all around gangster.
-    "golick",
-  
-    // Jane Goodall - British primatologist, ethologist, and anthropologist who is considered to be the world's foremost expert on chimpanzees - https://en.wikipedia.org/wiki/Jane_Goodall
-    "goodall",
-  
-    // Stephen Jay Gould was was an American paleontologist, evolutionary biologist, and historian of science. He is most famous for the theory of punctuated equilibrium - https://en.wikipedia.org/wiki/Stephen_Jay_Gould
-    "gould",
-  
-    // Carolyn Widney Greider - American molecular biologist and joint winner of the 2009 Nobel Prize for Physiology or Medicine for the discovery of telomerase. https://en.wikipedia.org/wiki/Carol_W._Greider
-    "greider",
-  
-    // Alexander Grothendieck - German-born French mathematician who became a leading figure in the creation of modern algebraic geometry. https://en.wikipedia.org/wiki/Alexander_Grothendieck
-    "grothendieck",
-  
-    // Lois Haibt - American computer scientist, part of the team at IBM that developed FORTRAN - https://en.wikipedia.org/wiki/Lois_Haibt
-    "haibt",
-  
-    // Margaret Hamilton - Director of the Software Engineering Division of the MIT Instrumentation Laboratory, which developed on-board flight software for the Apollo space program. https://en.wikipedia.org/wiki/Margaret_Hamilton_(scientist)
-    "hamilton",
-  
-    // Caroline Harriet Haslett - English electrical engineer, electricity industry administrator and champion of women's rights. Co-author of British Standard 1363 that specifies AC power plugs and sockets used across the United Kingdom (which is widely considered as one of the safest designs). https://en.wikipedia.org/wiki/Caroline_Haslett
-    "haslett",
-  
-    // Stephen Hawking pioneered the field of cosmology by combining general relativity and quantum mechanics. https://en.wikipedia.org/wiki/Stephen_Hawking
-    "hawking",
-  
-    // Martin Edward Hellman - American cryptologist, best known for his invention of public-key cryptography in co-operation with Whitfield Diffie and Ralph Merkle. https://en.wikipedia.org/wiki/Martin_Hellman
-    "hellman",
-  
-    // Werner Heisenberg was a founding father of quantum mechanics. https://en.wikipedia.org/wiki/Werner_Heisenberg
-    "heisenberg",
-  
-    // Grete Hermann was a German philosopher noted for her philosophical work on the foundations of quantum mechanics. https://en.wikipedia.org/wiki/Grete_Hermann
-    "hermann",
-  
-    // Caroline Lucretia Herschel - German astronomer and discoverer of several comets. https://en.wikipedia.org/wiki/Caroline_Herschel
-    "herschel",
-  
-    // Heinrich Rudolf Hertz - German physicist who first conclusively proved the existence of the electromagnetic waves. https://en.wikipedia.org/wiki/Heinrich_Hertz
-    "hertz",
-  
-    // Jaroslav Heyrovský was the inventor of the polarographic method, father of the electroanalytical method, and recipient of the Nobel Prize in 1959. His main field of work was polarography. https://en.wikipedia.org/wiki/Jaroslav_Heyrovsk%C3%BD
-    "heyrovsky",
-  
-    // Dorothy Hodgkin was a British biochemist, credited with the development of protein crystallography. She was awarded the Nobel Prize in Chemistry in 1964. https://en.wikipedia.org/wiki/Dorothy_Hodgkin
-    "hodgkin",
-  
-    // Douglas R. Hofstadter is an American professor of cognitive science and author of the Pulitzer Prize and American Book Award-winning work Goedel, Escher, Bach: An Eternal Golden Braid in 1979. A mind-bending work which coined Hofstadter's Law: "It always takes longer than you expect, even when you take into account Hofstadter's Law." https://en.wikipedia.org/wiki/Douglas_Hofstadter
-    "hofstadter",
-  
-    // Erna Schneider Hoover revolutionized modern communication by inventing a computerized telephone switching method. https://en.wikipedia.org/wiki/Erna_Schneider_Hoover
-    "hoover",
-  
-    // Grace Hopper developed the first compiler for a computer programming language and  is credited with popularizing the term "debugging" for fixing computer glitches. https://en.wikipedia.org/wiki/Grace_Hopper
-    "hopper",
-  
-    // Frances Hugle, she was an American scientist, engineer, and inventor who contributed to the understanding of semiconductors, integrated circuitry, and the unique electrical principles of microscopic materials. https://en.wikipedia.org/wiki/Frances_Hugle
-    "hugle",
-  
-    // Hypatia - Greek Alexandrine Neoplatonist philosopher in Egypt who was one of the earliest mothers of mathematics - https://en.wikipedia.org/wiki/Hypatia
-    "hypatia",
-  
-    // Teruko Ishizaka - Japanese scientist and immunologist who co-discovered the antibody class Immunoglobulin E. https://en.wikipedia.org/wiki/Teruko_Ishizaka
-    "ishizaka",
-  
-    // Mary Jackson, American mathematician and aerospace engineer who earned the highest title within NASA's engineering department - https://en.wikipedia.org/wiki/Mary_Jackson_(engineer)
-    "jackson",
-  
-    // Yeong-Sil Jang was a Korean scientist and astronomer during the Joseon Dynasty; he invented the first metal printing press and water gauge. https://en.wikipedia.org/wiki/Jang_Yeong-sil
-    "jang",
-  
-    // Mae Carol Jemison -  is an American engineer, physician, and former NASA astronaut. She became the first black woman to travel in space when she served as a mission specialist aboard the Space Shuttle Endeavour - https://en.wikipedia.org/wiki/Mae_Jemison
-    "jemison",
-  
-    // Betty Jennings - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Jean_Bartik
-    "jennings",
-  
-    // Mary Lou Jepsen, was the founder and chief technology officer of One Laptop Per Child (OLPC), and the founder of Pixel Qi. https://en.wikipedia.org/wiki/Mary_Lou_Jepsen
-    "jepsen",
-  
-    // Katherine Coleman Goble Johnson - American physicist and mathematician contributed to the NASA. https://en.wikipedia.org/wiki/Katherine_Johnson
-    "johnson",
-  
-    // Irène Joliot-Curie - French scientist who was awarded the Nobel Prize for Chemistry in 1935. Daughter of Marie and Pierre Curie. https://en.wikipedia.org/wiki/Ir%C3%A8ne_Joliot-Curie
-    "joliot",
-  
-    // Karen Spärck Jones came up with the concept of inverse document frequency, which is used in most search engines today. https://en.wikipedia.org/wiki/Karen_Sp%C3%A4rck_Jones
-    "jones",
-  
-    // A. P. J. Abdul Kalam - is an Indian scientist aka Missile Man of India for his work on the development of ballistic missile and launch vehicle technology - https://en.wikipedia.org/wiki/A._P._J._Abdul_Kalam
-    "kalam",
-  
-    // Sergey Petrovich Kapitsa (Russian: Серге́й Петро́вич Капи́ца; 14 February 1928 – 14 August 2012) was a Russian physicist and demographer. He was best known as host of the popular and long-running Russian scientific TV show, Evident, but Incredible. His father was the Nobel laureate Soviet-era physicist Pyotr Kapitsa, and his brother was the geographer and Antarctic explorer Andrey Kapitsa. - https://en.wikipedia.org/wiki/Sergey_Kapitsa
-    "kapitsa",
-  
-    // Susan Kare, created the icons and many of the interface elements for the original Apple Macintosh in the 1980s, and was an original employee of NeXT, working as the Creative Director. https://en.wikipedia.org/wiki/Susan_Kare
-    "kare",
-  
-    // Mstislav Keldysh - a Soviet scientist in the field of mathematics and mechanics, academician of the USSR Academy of Sciences (1946), President of the USSR Academy of Sciences (1961–1975), three times Hero of Socialist Labor (1956, 1961, 1971), fellow of the Royal Society of Edinburgh (1968). https://en.wikipedia.org/wiki/Mstislav_Keldysh
-    "keldysh",
-  
-    // Mary Kenneth Keller, Sister Mary Kenneth Keller became the first American woman to earn a PhD in Computer Science in 1965. https://en.wikipedia.org/wiki/Mary_Kenneth_Keller
-    "keller",
-  
-    // Johannes Kepler, German astronomer known for his three laws of planetary motion - https://en.wikipedia.org/wiki/Johannes_Kepler
-    "kepler",
-  
-    // Omar Khayyam - Persian mathematician, astronomer and poet. Known for his work on the classification and solution of cubic equations, for his contribution to the understanding of Euclid's fifth postulate and for computing the length of a year very accurately. https://en.wikipedia.org/wiki/Omar_Khayyam
-    "khayyam",
-  
-    // Har Gobind Khorana - Indian-American biochemist who shared the 1968 Nobel Prize for Physiology - https://en.wikipedia.org/wiki/Har_Gobind_Khorana
-    "khorana",
-  
-    // Jack Kilby invented silicon integrated circuits and gave Silicon Valley its name. - https://en.wikipedia.org/wiki/Jack_Kilby
-    "kilby",
-  
-    // Maria Kirch - German astronomer and first woman to discover a comet - https://en.wikipedia.org/wiki/Maria_Margarethe_Kirch
-    "kirch",
-  
-    // Donald Knuth - American computer scientist, author of "The Art of Computer Programming" and creator of the TeX typesetting system. https://en.wikipedia.org/wiki/Donald_Knuth
-    "knuth",
-  
-    // Sophie Kowalevski - Russian mathematician responsible for important original contributions to analysis, differential equations and mechanics - https://en.wikipedia.org/wiki/Sofia_Kovalevskaya
-    "kowalevski",
-  
-    // Marie-Jeanne de Lalande - French astronomer, mathematician and cataloguer of stars - https://en.wikipedia.org/wiki/Marie-Jeanne_de_Lalande
-    "lalande",
-  
-    // Hedy Lamarr - Actress and inventor. The principles of her work are now incorporated into modern Wi-Fi, CDMA and Bluetooth technology. https://en.wikipedia.org/wiki/Hedy_Lamarr
-    "lamarr",
-  
-    // Leslie B. Lamport - American computer scientist. Lamport is best known for his seminal work in distributed systems and was the winner of the 2013 Turing Award. https://en.wikipedia.org/wiki/Leslie_Lamport
-    "lamport",
-  
-    // Mary Leakey - British paleoanthropologist who discovered the first fossilized Proconsul skull - https://en.wikipedia.org/wiki/Mary_Leakey
-    "leakey",
-  
-    // Henrietta Swan Leavitt - she was an American astronomer who discovered the relation between the luminosity and the period of Cepheid variable stars. https://en.wikipedia.org/wiki/Henrietta_Swan_Leavitt
-    "leavitt",
-  
-    // Esther Miriam Zimmer Lederberg - American microbiologist and a pioneer of bacterial genetics. https://en.wikipedia.org/wiki/Esther_Lederberg
-    "lederberg",
-  
-    // Inge Lehmann - Danish seismologist and geophysicist. Known for discovering in 1936 that the Earth has a solid inner core inside a molten outer core. https://en.wikipedia.org/wiki/Inge_Lehmann
-    "lehmann",
-  
-    // Daniel Lewin - Mathematician, Akamai co-founder, soldier, 9/11 victim-- Developed optimization techniques for routing traffic on the internet. Died attempting to stop the 9-11 hijackers. https://en.wikipedia.org/wiki/Daniel_Lewin
-    "lewin",
-  
-    // Ruth Lichterman - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Ruth_Teitelbaum
-    "lichterman",
-  
-    // Barbara Liskov - co-developed the Liskov substitution principle. Liskov was also the winner of the Turing Prize in 2008. - https://en.wikipedia.org/wiki/Barbara_Liskov
-    "liskov",
-  
-    // Ada Lovelace invented the first algorithm. https://en.wikipedia.org/wiki/Ada_Lovelace (thanks James Turnbull)
-    "lovelace",
-  
-    // Auguste and Louis Lumière - the first filmmakers in history - https://en.wikipedia.org/wiki/Auguste_and_Louis_Lumi%C3%A8re
-    "lumiere",
-  
-    // Mahavira - Ancient Indian mathematician during 9th century AD who discovered basic algebraic identities - https://en.wikipedia.org/wiki/Mah%C4%81v%C4%ABra_(mathematician)
-    "mahavira",
-  
-    // Lynn Margulis (b. Lynn Petra Alexander) - an American evolutionary theorist and biologist, science author, educator, and popularizer, and was the primary modern proponent for the significance of symbiosis in evolution. - https://en.wikipedia.org/wiki/Lynn_Margulis
-    "margulis",
-  
-    // Yukihiro Matsumoto - Japanese computer scientist and software programmer best known as the chief designer of the Ruby programming language. https://en.wikipedia.org/wiki/Yukihiro_Matsumoto
-    "matsumoto",
-  
-    // James Clerk Maxwell - Scottish physicist, best known for his formulation of electromagnetic theory. https://en.wikipedia.org/wiki/James_Clerk_Maxwell
-    "maxwell",
-  
-    // Maria Mayer - American theoretical physicist and Nobel laureate in Physics for proposing the nuclear shell model of the atomic nucleus - https://en.wikipedia.org/wiki/Maria_Mayer
-    "mayer",
-  
-    // John McCarthy invented LISP: https://en.wikipedia.org/wiki/John_McCarthy_(computer_scientist)
-    "mccarthy",
-  
-    // Barbara McClintock - a distinguished American cytogeneticist, 1983 Nobel Laureate in Physiology or Medicine for discovering transposons. https://en.wikipedia.org/wiki/Barbara_McClintock
-    "mcclintock",
-  
-    // Anne Laura Dorinthea McLaren - British developmental biologist whose work helped lead to human in-vitro fertilisation. https://en.wikipedia.org/wiki/Anne_McLaren
-    "mclaren",
-  
-    // Malcolm McLean invented the modern shipping container: https://en.wikipedia.org/wiki/Malcom_McLean
-    "mclean",
-  
-    // Kay McNulty - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Kathleen_Antonelli
-    "mcnulty",
-  
-    // Gregor Johann Mendel - Czech scientist and founder of genetics. https://en.wikipedia.org/wiki/Gregor_Mendel
-    "mendel",
-  
-    // Dmitri Mendeleev - a chemist and inventor. He formulated the Periodic Law, created a farsighted version of the periodic table of elements, and used it to correct the properties of some already discovered elements and also to predict the properties of eight elements yet to be discovered. https://en.wikipedia.org/wiki/Dmitri_Mendeleev
-    "mendeleev",
-  
-    // Lise Meitner - Austrian/Swedish physicist who was involved in the discovery of nuclear fission. The element meitnerium is named after her - https://en.wikipedia.org/wiki/Lise_Meitner
-    "meitner",
-  
-    // Carla Meninsky, was the game designer and programmer for Atari 2600 games Dodge 'Em and Warlords. https://en.wikipedia.org/wiki/Carla_Meninsky
-    "meninsky",
-  
-    // Ralph C. Merkle - American computer scientist, known for devising Merkle's puzzles - one of the very first schemes for public-key cryptography. Also, inventor of Merkle trees and co-inventor of the Merkle-Damgård construction for building collision-resistant cryptographic hash functions and the Merkle-Hellman knapsack cryptosystem. https://en.wikipedia.org/wiki/Ralph_Merkle
-    "merkle",
-  
-    // Johanna Mestorf - German prehistoric archaeologist and first female museum director in Germany - https://en.wikipedia.org/wiki/Johanna_Mestorf
-    "mestorf",
-  
-    // Maryam Mirzakhani - an Iranian mathematician and the first woman to win the Fields Medal. https://en.wikipedia.org/wiki/Maryam_Mirzakhani
-    "mirzakhani",
-  
-    // Rita Levi-Montalcini - Won Nobel Prize in Physiology or Medicine jointly with colleague Stanley Cohen for the discovery of nerve growth factor (https://en.wikipedia.org/wiki/Rita_Levi-Montalcini)
-    "montalcini",
-  
-    // Gordon Earle Moore - American engineer, Silicon Valley founding father, author of Moore's law. https://en.wikipedia.org/wiki/Gordon_Moore
-    "moore",
-  
-    // Samuel Morse - contributed to the invention of a single-wire telegraph system based on European telegraphs and was a co-developer of the Morse code - https://en.wikipedia.org/wiki/Samuel_Morse
-    "morse",
-  
-    // Ian Murdock - founder of the Debian project - https://en.wikipedia.org/wiki/Ian_Murdock
-    "murdock",
-  
-    // May-Britt Moser - Nobel prize winner neuroscientist who contributed to the discovery of grid cells in the brain. https://en.wikipedia.org/wiki/May-Britt_Moser
-    "moser",
-  
-    // John Napier of Merchiston - Scottish landowner known as an astronomer, mathematician and physicist. Best known for his discovery of logarithms. https://en.wikipedia.org/wiki/John_Napier
-    "napier",
-  
-    // John Forbes Nash, Jr. - American mathematician who made fundamental contributions to game theory, differential geometry, and the study of partial differential equations. https://en.wikipedia.org/wiki/John_Forbes_Nash_Jr.
-    "nash",
-  
-    // John von Neumann - todays computer architectures are based on the von Neumann architecture. https://en.wikipedia.org/wiki/Von_Neumann_architecture
-    "neumann",
-  
-    // Isaac Newton invented classic mechanics and modern optics. https://en.wikipedia.org/wiki/Isaac_Newton
-    "newton",
-  
-    // Florence Nightingale, more prominently known as a nurse, was also the first female member of the Royal Statistical Society and a pioneer in statistical graphics https://en.wikipedia.org/wiki/Florence_Nightingale#Statistics_and_sanitary_reform
-    "nightingale",
-  
-    // Alfred Nobel - a Swedish chemist, engineer, innovator, and armaments manufacturer (inventor of dynamite) - https://en.wikipedia.org/wiki/Alfred_Nobel
-    "nobel",
-  
-    // Emmy Noether, German mathematician. Noether's Theorem is named after her. https://en.wikipedia.org/wiki/Emmy_Noether
-    "noether",
-  
-    // Poppy Northcutt. Poppy Northcutt was the first woman to work as part of NASA’s Mission Control. http://www.businessinsider.com/poppy-northcutt-helped-apollo-astronauts-2014-12?op=1
-    "northcutt",
-  
-    // Robert Noyce invented silicon integrated circuits and gave Silicon Valley its name. - https://en.wikipedia.org/wiki/Robert_Noyce
-    "noyce",
-  
-    // Panini - Ancient Indian linguist and grammarian from 4th century CE who worked on the world's first formal system - https://en.wikipedia.org/wiki/P%C4%81%E1%B9%87ini#Comparison_with_modern_formal_systems
-    "panini",
-  
-    // Ambroise Pare invented modern surgery. https://en.wikipedia.org/wiki/Ambroise_Par%C3%A9
-    "pare",
-  
-    // Blaise Pascal, French mathematician, physicist, and inventor - https://en.wikipedia.org/wiki/Blaise_Pascal
-    "pascal",
-  
-    // Louis Pasteur discovered vaccination, fermentation and pasteurization. https://en.wikipedia.org/wiki/Louis_Pasteur.
-    "pasteur",
-  
-    // Cecilia Payne-Gaposchkin was an astronomer and astrophysicist who, in 1925, proposed in her Ph.D. thesis an explanation for the composition of stars in terms of the relative abundances of hydrogen and helium. https://en.wikipedia.org/wiki/Cecilia_Payne-Gaposchkin
-    "payne",
-  
-    // Radia Perlman is a software designer and network engineer and most famous for her invention of the spanning-tree protocol (STP). https://en.wikipedia.org/wiki/Radia_Perlman
-    "perlman",
-  
-    // Rob Pike was a key contributor to Unix, Plan 9, the X graphic system, utf-8, and the Go programming language. https://en.wikipedia.org/wiki/Rob_Pike
-    "pike",
-  
-    // Henri Poincaré made fundamental contributions in several fields of mathematics. https://en.wikipedia.org/wiki/Henri_Poincar%C3%A9
-    "poincare",
-  
-    // Laura Poitras is a director and producer whose work, made possible by open source crypto tools, advances the causes of truth and freedom of information by reporting disclosures by whistleblowers such as Edward Snowden. https://en.wikipedia.org/wiki/Laura_Poitras
-    "poitras",
-  
-    // Tat’yana Avenirovna Proskuriakova (Russian: Татья́на Авени́ровна Проскуряко́ва) (January 23 [O.S. January 10] 1909 – August 30, 1985) was a Russian-American Mayanist scholar and archaeologist who contributed significantly to the deciphering of Maya hieroglyphs, the writing system of the pre-Columbian Maya civilization of Mesoamerica. https://en.wikipedia.org/wiki/Tatiana_Proskouriakoff
-    "proskuriakova",
-  
-    // Claudius Ptolemy - a Greco-Egyptian writer of Alexandria, known as a mathematician, astronomer, geographer, astrologer, and poet of a single epigram in the Greek Anthology - https://en.wikipedia.org/wiki/Ptolemy
-    "ptolemy",
-  
-    // C. V. Raman - Indian physicist who won the Nobel Prize in 1930 for proposing the Raman effect. - https://en.wikipedia.org/wiki/C._V._Raman
-    "raman",
-  
-    // Srinivasa Ramanujan - Indian mathematician and autodidact who made extraordinary contributions to mathematical analysis, number theory, infinite series, and continued fractions. - https://en.wikipedia.org/wiki/Srinivasa_Ramanujan
-    "ramanujan",
-  
-    // Sally Kristen Ride was an American physicist and astronaut. She was the first American woman in space, and the youngest American astronaut. https://en.wikipedia.org/wiki/Sally_Ride
-    "ride",
-  
-    // Dennis Ritchie - co-creator of UNIX and the C programming language. - https://en.wikipedia.org/wiki/Dennis_Ritchie
-    "ritchie",
-  
-    // Ida Rhodes - American pioneer in computer programming, designed the first computer used for Social Security. https://en.wikipedia.org/wiki/Ida_Rhodes
-    "rhodes",
-  
-    // Julia Hall Bowman Robinson - American mathematician renowned for her contributions to the fields of computability theory and computational complexity theory. https://en.wikipedia.org/wiki/Julia_Robinson
-    "robinson",
-  
-    // Wilhelm Conrad Röntgen - German physicist who was awarded the first Nobel Prize in Physics in 1901 for the discovery of X-rays (Röntgen rays). https://en.wikipedia.org/wiki/Wilhelm_R%C3%B6ntgen
-    "roentgen",
-  
-    // Rosalind Franklin - British biophysicist and X-ray crystallographer whose research was critical to the understanding of DNA - https://en.wikipedia.org/wiki/Rosalind_Franklin
-    "rosalind",
-  
-    // Vera Rubin - American astronomer who pioneered work on galaxy rotation rates. https://en.wikipedia.org/wiki/Vera_Rubin
-    "rubin",
-  
-    // Meghnad Saha - Indian astrophysicist best known for his development of the Saha equation, used to describe chemical and physical conditions in stars - https://en.wikipedia.org/wiki/Meghnad_Saha
-    "saha",
-  
-    // Jean E. Sammet developed FORMAC, the first widely used computer language for symbolic manipulation of mathematical formulas. https://en.wikipedia.org/wiki/Jean_E._Sammet
-    "sammet",
-  
-    // Mildred Sanderson - American mathematician best known for Sanderson's theorem concerning modular invariants. https://en.wikipedia.org/wiki/Mildred_Sanderson
-    "sanderson",
-  
-    // Satoshi Nakamoto is the name used by the unknown person or group of people who developed bitcoin, authored the bitcoin white paper, and created and deployed bitcoin's original reference implementation. https://en.wikipedia.org/wiki/Satoshi_Nakamoto
-    "satoshi",
-  
-    // Adi Shamir - Israeli cryptographer whose numerous inventions and contributions to cryptography include the Ferge Fiat Shamir identification scheme, the Rivest Shamir Adleman (RSA) public-key cryptosystem, the Shamir's secret sharing scheme, the breaking of the Merkle-Hellman cryptosystem, the TWINKLE and TWIRL factoring devices and the discovery of differential cryptanalysis (with Eli Biham). https://en.wikipedia.org/wiki/Adi_Shamir
-    "shamir",
-  
-    // Claude Shannon - The father of information theory and founder of digital circuit design theory. (https://en.wikipedia.org/wiki/Claude_Shannon)
-    "shannon",
-  
-    // Carol Shaw - Originally an Atari employee, Carol Shaw is said to be the first female video game designer. https://en.wikipedia.org/wiki/Carol_Shaw_(video_game_designer)
-    "shaw",
-  
-    // Dame Stephanie "Steve" Shirley - Founded a software company in 1962 employing women working from home. https://en.wikipedia.org/wiki/Steve_Shirley
-    "shirley",
-  
-    // William Shockley co-invented the transistor - https://en.wikipedia.org/wiki/William_Shockley
-    "shockley",
-  
-    // Lina Solomonovna Stern (or Shtern; Russian: Лина Соломоновна Штерн; 26 August 1878 – 7 March 1968) was a Soviet biochemist, physiologist and humanist whose medical discoveries saved thousands of lives at the fronts of World War II. She is best known for her pioneering work on blood–brain barrier, which she described as hemato-encephalic barrier in 1921. https://en.wikipedia.org/wiki/Lina_Stern
-    "shtern",
-  
-    // Françoise Barré-Sinoussi - French virologist and Nobel Prize Laureate in Physiology or Medicine; her work was fundamental in identifying HIV as the cause of AIDS. https://en.wikipedia.org/wiki/Fran%C3%A7oise_Barr%C3%A9-Sinoussi
-    "sinoussi",
-  
-    // Betty Snyder - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Betty_Holberton
-    "snyder",
-  
-    // Cynthia Solomon - Pioneer in the fields of artificial intelligence, computer science and educational computing. Known for creation of Logo, an educational programming language.  https://en.wikipedia.org/wiki/Cynthia_Solomon
-    "solomon",
-  
-    // Frances Spence - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Frances_Spence
-    "spence",
-  
-    // Michael Stonebraker is a database research pioneer and architect of Ingres, Postgres, VoltDB and SciDB. Winner of 2014 ACM Turing Award. https://en.wikipedia.org/wiki/Michael_Stonebraker
-    "stonebraker",
-  
-    // Ivan Edward Sutherland - American computer scientist and Internet pioneer, widely regarded as the father of computer graphics. https://en.wikipedia.org/wiki/Ivan_Sutherland
-    "sutherland",
-  
-    // Janese Swanson (with others) developed the first of the Carmen Sandiego games. She went on to found Girl Tech. https://en.wikipedia.org/wiki/Janese_Swanson
-    "swanson",
-  
-    // Aaron Swartz was influential in creating RSS, Markdown, Creative Commons, Reddit, and much of the internet as we know it today. He was devoted to freedom of information on the web. https://en.wikiquote.org/wiki/Aaron_Swartz
-    "swartz",
-  
-    // Bertha Swirles was a theoretical physicist who made a number of contributions to early quantum theory. https://en.wikipedia.org/wiki/Bertha_Swirles
-    "swirles",
-  
-    // Helen Brooke Taussig - American cardiologist and founder of the field of paediatric cardiology. https://en.wikipedia.org/wiki/Helen_B._Taussig
-    "taussig",
-  
-    // Valentina Tereshkova is a Russian engineer, cosmonaut and politician. She was the first woman to fly to space in 1963. In 2013, at the age of 76, she offered to go on a one-way mission to Mars. https://en.wikipedia.org/wiki/Valentina_Tereshkova
-    "tereshkova",
-  
-    // Nikola Tesla invented the AC electric system and every gadget ever used by a James Bond villain. https://en.wikipedia.org/wiki/Nikola_Tesla
-    "tesla",
-  
-    // Marie Tharp - American geologist and oceanic cartographer who co-created the first scientific map of the Atlantic Ocean floor. Her work led to the acceptance of the theories of plate tectonics and continental drift. https://en.wikipedia.org/wiki/Marie_Tharp
-    "tharp",
-  
-    // Ken Thompson - co-creator of UNIX and the C programming language - https://en.wikipedia.org/wiki/Ken_Thompson
-    "thompson",
-  
-    // Linus Torvalds invented Linux and Git. https://en.wikipedia.org/wiki/Linus_Torvalds
-    "torvalds",
-  
-    // Youyou Tu - Chinese pharmaceutical chemist and educator known for discovering artemisinin and dihydroartemisinin, used to treat malaria, which has saved millions of lives. Joint winner of the 2015 Nobel Prize in Physiology or Medicine. https://en.wikipedia.org/wiki/Tu_Youyou
-    "tu",
-  
-    // Alan Turing was a founding father of computer science. https://en.wikipedia.org/wiki/Alan_Turing.
-    "turing",
-  
-    // Varahamihira - Ancient Indian mathematician who discovered trigonometric formulae during 505-587 CE - https://en.wikipedia.org/wiki/Var%C4%81hamihira#Contributions
-    "varahamihira",
-  
-    // Dorothy Vaughan was a NASA mathematician and computer programmer on the SCOUT launch vehicle program that put America's first satellites into space - https://en.wikipedia.org/wiki/Dorothy_Vaughan
-    "vaughan",
-  
-    // Cédric Villani - French mathematician, won Fields Medal, Fermat Prize and Poincaré Price for his work in differential geometry and statistical mechanics. https://en.wikipedia.org/wiki/C%C3%A9dric_Villani
-    "villani",
-  
-    // Sir Mokshagundam Visvesvaraya - is a notable Indian engineer.  He is a recipient of the Indian Republic's highest honour, the Bharat Ratna, in 1955. On his birthday, 15 September is celebrated as Engineer's Day in India in his memory - https://en.wikipedia.org/wiki/Visvesvaraya
-    "visvesvaraya",
-  
-    // Christiane Nüsslein-Volhard - German biologist, won Nobel Prize in Physiology or Medicine in 1995 for research on the genetic control of embryonic development. https://en.wikipedia.org/wiki/Christiane_N%C3%BCsslein-Volhard
-    "volhard",
-  
-    // Marlyn Wescoff - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Marlyn_Meltzer
-    "wescoff",
-  
-    // Sylvia B. Wilbur - British computer scientist who helped develop the ARPANET, was one of the first to exchange email in the UK and a leading researcher in computer-supported collaborative work. https://en.wikipedia.org/wiki/Sylvia_Wilbur
-    "wilbur",
-  
-    // Andrew Wiles - Notable British mathematician who proved the enigmatic Fermat's Last Theorem - https://en.wikipedia.org/wiki/Andrew_Wiles
-    "wiles",
-  
-    // Roberta Williams, did pioneering work in graphical adventure games for personal computers, particularly the King's Quest series. https://en.wikipedia.org/wiki/Roberta_Williams
-    "williams",
-  
-    // Malcolm John Williamson - British mathematician and cryptographer employed by the GCHQ. Developed in 1974 what is now known as Diffie-Hellman key exchange (Diffie and Hellman first published the scheme in 1976). https://en.wikipedia.org/wiki/Malcolm_J._Williamson
-    "williamson",
-  
-    // Sophie Wilson designed the first Acorn Micro-Computer and the instruction set for ARM processors. https://en.wikipedia.org/wiki/Sophie_Wilson
-    "wilson",
-  
-    // Jeannette Wing - co-developed the Liskov substitution principle. - https://en.wikipedia.org/wiki/Jeannette_Wing
-    "wing",
-  
-    // Steve Wozniak invented the Apple I and Apple II. https://en.wikipedia.org/wiki/Steve_Wozniak
-    "wozniak",
-  
-    // The Wright brothers, Orville and Wilbur - credited with inventing and building the world's first successful airplane and making the first controlled, powered and sustained heavier-than-air human flight - https://en.wikipedia.org/wiki/Wright_brothers
-    "wright",
-  
-    // Chien-Shiung Wu - Chinese-American experimental physicist who made significant contributions to nuclear physics. https://en.wikipedia.org/wiki/Chien-Shiung_Wu
-    "wu",
-  
-    // Rosalyn Sussman Yalow - Rosalyn Sussman Yalow was an American medical physicist, and a co-winner of the 1977 Nobel Prize in Physiology or Medicine for development of the radioimmunoassay technique. https://en.wikipedia.org/wiki/Rosalyn_Sussman_Yalow
-    "yalow",
-  
-    // Ada Yonath - an Israeli crystallographer, the first woman from the Middle East to win a Nobel prize in the sciences. https://en.wikipedia.org/wiki/Ada_Yonath
-    "yonath",
-  
-    // Nikolay Yegorovich Zhukovsky (Russian: Никола́й Его́рович Жуко́вский, January 17 1847 – March 17, 1921) was a Russian scientist, mathematician and engineer, and a founding father of modern aero- and hydrodynamics. Whereas contemporary scientists scoffed at the idea of human flight, Zhukovsky was the first to undertake the study of airflow. He is often called the Father of Russian Aviation. https://en.wikipedia.org/wiki/Nikolay_Yegorovich_Zhukovsky
-    "zhukovsky",
-  ]
-  
-  export const generateHostName = ():Hostname => {
-    return util.format('%s-%s', randelem(adjectives), randelem(scientists)) as Hostname
-  }
-  
-  function randnum(n:number):number {
-    return Math.floor(Math.random() * n);
-  }
-  
-  function randelem(a:string[]):string {
-    return a[randnum(a.length)];
-  }
-```
-
-## File: src/utils/rsync.ts
-```typescript
-/**
- * rsync.ts — rsync primitive for App copy/move operations
- *
- * Design: design/copy-move-app.md
- *
- * Phase 1: same-engine, local paths only.
- * Phase 2: cross-engine — pass remoteHost to rsync over SSH to pi@host.
- */
-
-import { chalk } from 'zx'
-import { spawn, ChildProcess } from 'child_process'
-import { log } from './utils.js'
-import { registerProcess, deregisterProcess } from '../data/Operations.js'
-
-export interface RsyncProgress {
-    progressPercent: number
-}
-
-export type RsyncProgressCallback = (progress: RsyncProgress) => void
-
-/**
- * Copy src/ to dest/ using rsync.
- *
- * - Preserves permissions, symlinks, timestamps (-a / archive mode)
- * - Reports per-transfer progress via onProgress callback (0-100)
- * - Idempotent: re-running after interruption transfers only the delta
- * - Throws on non-zero exit
- *
- * src must be a local absolute path.
- * dest must be an absolute path. If remoteHost is provided, rsync runs over
- * SSH to `pi@<remoteHost>:<dest>` (cross-engine Phase 2).
- * Trailing slash is appended to src so rsync copies the *contents*.
- */
-export const rsyncDirectory = (
-    src: string,
-    dest: string,
-    onProgress?: RsyncProgressCallback,
-    opId?: string,
-    remoteHost?: string,
-): Promise<void> => {
-    return new Promise((resolve, reject) => {
-        // Ensure src has trailing slash so rsync copies contents, not the directory itself
-        const srcArg = src.endsWith('/') ? src : src + '/'
-        const destArg = remoteHost ? `pi@${remoteHost}:${dest}` : dest
-
-        const args = [
-            '-a',
-            '--info=progress2',
-            '--no-inc-recursive',  // required for accurate total-progress reporting
-        ]
-
-        if (remoteHost) {
-            args.push('-e', 'ssh -o StrictHostKeyChecking=no')
-        }
-
-        args.push(srcArg, destArg)
-
-        log(`rsync ${args.join(' ')}`)
-
-        const proc = spawn('rsync', args)
-        if (opId) registerProcess(opId, proc)
-
-        let stderr = ''
-
-        proc.stdout.on('data', (chunk: Buffer) => {
-            const text = chunk.toString()
-            // progress2 lines look like: "  1,234,567  42%    1.23MB/s    0:00:05"
-            // We scan for the percentage value.
-            const matches = text.match(/\s(\d{1,3})%/)
-            if (matches && onProgress) {
-                const pct = parseInt(matches[1], 10)
-                if (!isNaN(pct)) {
-                    onProgress({ progressPercent: pct })
-                }
-            }
-        })
-
-        proc.stderr.on('data', (chunk: Buffer) => {
-            stderr += chunk.toString()
-        })
-
-        proc.on('close', (code, signal) => {
-            if (opId) deregisterProcess(opId)
-            if (code === 0) {
-                if (onProgress) onProgress({ progressPercent: 100 })
-                resolve()
-            } else if (signal === 'SIGTERM') {
-                reject(new Error(`rsync cancelled (SIGTERM)`))
-            } else {
-                reject(new Error(`rsync exited with code ${code}: ${stderr.trim()}`))
-            }
-        })
-
-        proc.on('error', (err) => {
-            if (opId) deregisterProcess(opId)
-            reject(new Error(`rsync spawn error: ${err.message}`))
-        })
-    })
-}
-
-```
-
-## File: src/utils/ssh.ts
-```typescript
-import { $ } from 'zx'
-import type { ProcessPromise } from 'zx'
-
-/**
- * Single-quotes a value for a POSIX shell: 'it'\''s' → one shell word, no expansion.
- */
-export const shellQuote = (value: string): string => "'" + value.replace(/'/g, "'\\''") + "'"
-
-/**
- * Minimal ssh() helper — replaces zx v7's built-in ssh() which was removed in v8.
- *
- * Creates a tagged-template executor that runs commands on a remote host via SSH.
- * Each interpolated argument is single-quote shell-escaped before being sent.
- *
- * Usage (identical to zx v7 ssh):
- *   const exec = ssh('pi@192.168.1.1')
- *   await exec`sudo apt-get update`
- *   await exec`cd ${path} && pnpm install`
- *
- * The optional `shell` parameter allows injecting a mock `$` in tests.
- */
-export function ssh(host: string, shell: typeof $ = $) {
-    return (pieces: TemplateStringsArray, ...args: unknown[]): ProcessPromise => {
-        const cmd = pieces.reduce((acc: string, piece: string, i: number) => {
-            if (i >= args.length) return acc + piece
-            // Single-quote escape — args are developer-controlled paths/values, not user input
-            const escaped = shellQuote(String(args[i]))
-            return acc + piece + escaped
-        }, '')
-        return shell`ssh -o StrictHostKeyChecking=no ${host} -- ${cmd}`
-    }
-}
-
-```
-
-## File: src/utils/utils.ts
-```typescript
-import util from 'util';
-import { $, chalk, fs, os, question } from 'zx';
-import { IPAddress, PortNumber } from '../data/CommonTypes.js';
-import net from 'net';
-import crypto from 'crypto';
-
-
-// Dummy key
-export const dummyKey = "_dummy"
-
-export const getKeys = (obj) => {
-  return Object.keys(obj).filter(key => !(key === `${dummyKey}`))
-}
-
-// Generate a random port number between 49152-65535
-export const randomPort = ():PortNumber => {
-  return Math.floor(Math.random() * 16383) + 49152 as PortNumber
-}
-// Write a function that reads a .env file and extracts the value of a variable from it
-// The function should take the path to the .env file and the name of the variable as input
-// It should return the value of the variable
-// If the variable is not found, it should return null
-export const readEnvVariable = async (path: string, variable: string): Promise<string | null> => {
-  try {
-    const envContent = (await $`cat ${path}`).stdout
-    const values = envContent.match(new RegExp(`^${variable}=(.*)`, 'm'))
-    // Log the variable name only, never its value: .env files hold app
-    // passwords and History is readable from the Console (idea#111).
-    log(`Read variable ${variable} from .env file ${path}: ${values ? 'found' : 'not set'}`)
-    if (values && values.length >= 1) {
-      const value = values[1]
-      return value
-    } else {
-      return null
-    }
-  } catch (e) {
-    return null
-  }
-}
-
-/**
- * Replace every occurrence of the given secret values in `text` with
- * `[redacted]`, for log lines and error messages that may echo a value
- * (idea#111). Empty values are ignored.
- */
-export const redactValues = (text: string, values: (string | null | undefined)[]): string =>
-  values.reduce<string>((acc, v) => (v ? acc.split(v).join('[redacted]') : acc), text)
-
-// Write a function that adds or updates a variable to a .env file
-// The function should take the path to the .env file, the name of the variable and its value as input
-// If the variable is already present in the .env file, it should update its value
-// If the variable is not present in the .env file, it should add it
-export const addOrUpdateEnvVariable = async (path: string, variable: string, value: string): Promise<void> => {
-  try {
-    const envContent = (await $`cat ${path}`).stdout
-    const values = envContent.match(new RegExp(`^${variable}=(.*)`, 'm'))
-    if (values && values.length >= 1) {
-      // Update the value of the variable
-      await $`sed -i 's|^${variable}=.*|${variable}=${value}|' ${path}`
-    } else {
-      // Add the variable to the .env file
-      await $`echo "${variable}=${value}" >> ${path}`
-    }
-    log(`Added or updated variable ${variable} in .env file ${path}`)
-  } catch (e) {
-    // Add the variable to the .env file
-    log(`Error adding or updating variable ${variable} in .env file ${path}`)
-    log(`error: ${redactValues(String(e), [value])}`)
-    //await $`echo "${variable}=${value}" >> ${path}`
-  }
-}
-
-
-
-// Read verbosityLevel from the environmnet
-const verbosity = process.env.VERBOSITY || ""
-export let verbosityLevel = parseInt(verbosity) || 0
-
-// Verbosity-gated debug logger. Uses console.info so CommandLogger captures
-// always-on/gated messages without matching the hygiene.console_log scan
-// (which flags the console "log" method call pattern only).
-export const log = (msg:string, level?:number):void => {
-  if (!level) {
-    // Set the default log level to 2
-    level = 2
-  }
-  if (verbosityLevel >= level) {
-    console.info(chalk.gray(msg))
-  }
-}
-
-export const error = (msg:string):void => {
-  console.error(chalk.red(msg))
-}
-
-/** Always-on status/output helper. Uses console.info (captured by CommandLogger). */
-export const print = (...args: unknown[]): void => {
-  console.info(...args)
-}
-
-export const setVerbosity = (level:number):void => {
-  verbosityLevel = level
-}
-
-export const isEngineOnline = (hostname: string, port: number): Promise<boolean> => {
-  return new Promise((resolve) => {
-    const socket = new net.Socket();
-    const timeout = 2000; // 2 seconds
-    socket.setTimeout(timeout);
-
-    socket.on('connect', () => {
-      socket.destroy();
-      resolve(true);
-    });
-
-    socket.on('timeout', () => {
-      socket.destroy();
-      resolve(false);
-    });
-
-    socket.on('error', () => {
-      socket.destroy();
-      resolve(false);
-    });
-
-    socket.connect(port, hostname);
-  });
-};
-
-// // Execute promises sequentially
-// export const sequential = (promises) => {
-//   return promises.reduce((promise, func) => {
-//     return promise.then(func)
-//   }, Promise.resolve())
-// }
-
-// export const executePromisesSequentially = async (promises) => {
-//     for (let promise of promises) {
-//       await promise
-//     }
-// }
-
-
-
-
-
-
-// Write a function that uses zx to test if a path exists
-// export const dirExists = async (path: string) => {
-//     try {
-//         await $`test -d ${path}`
-//         return true
-//     } catch (e) {
-//         return false
-//     }
-// }
-
-// export const dirExists = async (path: string) => {
-//   return await $`test -d ${path}`.then(() => true).catch(() => false)
-// }
-
-// export const fileExists = async (path: string) => {
-//   try {
-//       await $`test -f ${path}`
-//       return true
-//   } catch (e) {
-//       return false
-//   }
-// }
-
-// export const fileExists = async (path: string) => {
-//   return await $`test -f ${path}`.then(() => true).catch(() => false)
-// }
-
-export const fileExists = (path: string):boolean => {
-  return fs.existsSync(path)
-}
-
-// Check if the root folder contains the folder yjs-db  If so, set firstBoot to false, otherwise set it to true
-// This is a way to check if the engine has been booted before
-// export const firstBoot: boolean = fs.existsSync('../yjs-db') ? false : true 
-// export const firstBoot: boolean = !(await fileExists('./yjs-db'))
-// log(`First boot: ${firstBoot}`)
-
-
-
-
-// Write a function that checks if a given yarray contains a specific value
-// Use the Y.Array API of the Yjs library (which does not have a built-in method for this)
-// Do it
-export const contains = (yarray, value) => {
-    let found = false
-    yarray.forEach((item) => {
-      if (item === value) {
-        found = true
-      }
-    })
-    return found
-  }
-
-export const deepPrint = (obj, depth:(number | null)=null) => {
-    return util.inspect(obj, {showHidden: false, depth: depth, colors: true})
-    // Alternative: return JSON.stringify(obj, null, 2)
-    // Alternative: return console.dir(obj, {depth: null, colors: true})
-}
-
-
-// Write a function that tests if a string is a valid IP4 address
-export const isIP4 = (str: string): boolean => {
-  const ip4Regex = /^(\d{1,3}\.){3}\d{1,3}$/
-  return ip4Regex.test(str)
-}
-
-export const isNetmask = isIP4
-
-// See https://stackoverflow.com/questions/503052/how-to-check-if-ip-is-in-one-of-these-subnets
-
-
-// const ip2long = (ip) => {
-//   var components;
-//   if(components = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/))
-//   {
-//       var iplong = 0;
-//       var power  = 1;
-//       for(var i=4; i>=1; i-=1)
-//       {
-//           iplong += power * parseInt(components[i]);
-//           power  *= 256;
-//       }
-//       return iplong;
-//   }
-//   else return -1;
-// };
-
-// THIS FUNCTION IS WRONG
-// export const inSubNet = (ip, subnet) => {   
-//   var mask, base_ip, long_ip = ip2long(ip);
-//   if( (mask = subnet.match(/^(.*?)\/(\d{1,2})$/)) && ((base_ip=ip2long(mask[1])) >= 0) )
-//   {
-//       var freedom = Math.pow(2, 32 - parseInt(mask[2]));
-//       return (long_ip > base_ip) && (long_ip < base_ip + freedom - 1);
-//   }
-//   else return false;
-// }
-
-export const IPnumber = (ip:IPAddress):number => {
-//  var ip = IPaddress.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
-//  if(ip) {
-//      return (+ip[1]<<24) + (+ip[2]<<16) + (+ip[3]<<8) + (+ip[4]);
-//  }
-  return (+ip[1]<<24) + (+ip[2]<<16) + (+ip[3]<<8) + (+ip[4]);
-}
-
-export const isIPAddress = (str: string): str is IPAddress => {
-  // return str.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
-  const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/
-  // const ipRegex = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/
-  return ipRegex.test(str)
-}
-
-export const sameNet = (IP1:any, IP2:any, mask:any) => {
-  //log(`${IPnumber(IP1) & IPnumber(mask)} == ${IPnumber(IP2) & IPnumber(mask)}`)
-  // Check if the IP addresses are strings
-  if (isIPAddress(IP1) && isIPAddress(IP2) && isNetmask(mask)) {
-    return (IPnumber(IP1) & IPnumber(mask)) == (IPnumber(IP2) & IPnumber(mask))
-  } else {
-    return false
-  }
-}
-
-export const findIp = async (address:IPAddress):Promise<IPAddress | undefined> => {
-  // Use a shell command to resolve the ip address
-  // REmove the trailing \n from the ip address
-  try {
-    const interfaceData = os.networkInterfaces()
-    const ip = interfaceData["eth0"]?.find((iface) => iface.family === "IPv4")?.address
-    if (ip && isIPAddress(ip)) {
-      return ip
-    } else {
-      return undefined
-    }
-  } catch (e) {
-    return undefined
-  }
-}
-
-export const findIp2 = async (address:IPAddress):Promise<IPAddress | undefined> => {
-  // Use a shell command to resolve the ip address
-  // REmove the trailing \n from the ip address
-  try {
-    const ip = (await $`ping -c 1 ${address} | grep PING | awk '{print $3}' | tr -d '()'`).stdout.replace(/\n$/, '')
-    if (isIPAddress(ip)) {
-      return ip
-    } else {
-      return undefined
-    }
-  } catch (e) {
-    return undefined
-  }
-}
-
-export const reset = async ($) => {
-  print(chalk.blue('Resetting the local engine'));
-  try {
-      // (removed) Removing the yjs database
-      // await $`rm -rf ../yjs-db`;
-      // (removed) Removing all appnet ids
-      // if (config.settings.appnets) {
-      //   config.settings.appnets.forEach((appnet) => delete appnet.id)
-      //   (removed) Updating the config file
-      //   writeConfig(config, '../config.yaml')
-      // }
-  } catch (e) {   
-      print(chalk.red('Failed to reset the local engine'));
-      console.error(e);
-      process.exit(1);
-  }
-}
-
-export const prompt = (level:number, message: string) => {
-  // Create level*4 spaces
-  const spaces = ' '.repeat(level * 4)
-  print(chalk.green(spaces+message))
-  return question(chalk.bgMagentaBright(spaces+'Press ENTER when ready'))
-}
-
-/** Characters of generated ids and app passwords: lowercase base-36, as before idea#114. */
-export const SECRET_ID_ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyz'
-/**
- * Length of generated ids and app passwords. The old Math.random + timestamp ids
- * were 15-22 characters, 19 in almost all cases, so 19 keeps them the same shape
- * (idea#114). 19 base-36 characters is about 98 bits of randomness.
- */
-export const SECRET_ID_LENGTH = 19
-
-/**
- * A random string from `alphabet`, drawn from Node's CSPRNG. Each character uses
- * crypto.randomInt, which rejection-samples, so there is no modulo bias (idea#114).
- * `randomInt` can be swapped in tests only.
- */
-export const secureRandomString = (
-  length: number,
-  alphabet: string = SECRET_ID_ALPHABET,
-  randomInt: (max: number) => number = crypto.randomInt,
-): string => {
-  let out = ''
-  for (let i = 0; i < length; i++) out += alphabet[randomInt(alphabet.length)]
-  return out
-}
-
-// Generate a uuid: disk, instance and operation ids, and the app password that
-// startInstance writes to an instance's .env (idea#114: crypto source, not Math.random).
-// Not logged: it generates the app password (idea#111).
-export const uuid = ():string => {
-  return secureRandomString(SECRET_ID_LENGTH)
-}
-
-export const uuidLight = ():string => {
-  return uuid().substring(0, 8)
-}
-
-
-// A function to strip the trailing partition number from a device name
-export const stripPartition = (device: string):string => {
-  if (device.startsWith('nvme') || device.startsWith('mmcblk')) {
-    return device.replace(/p[0-9]+$/, '')
-  }
-  return device.replace(/[0-9]+$/, '')
-}
-
-```
-
 ## File: src/data/App.ts
 ```typescript
 import { $, YAML, chalk } from 'zx';
@@ -5192,7 +1093,7 @@ export const closeTrace = (
 ```typescript
 import { CommandDefinition } from "./CommandDefinition.js";
 import { Store, getApps, getDisks, getDisk, getRunningEngines, getInstances, getEngine, findDiskByName, findInstanceByName, getLocalEngine, createClientStore } from "./Store.js";
-import { Disk, clearDuplicateDiskRecords } from "./Disk.js";
+import { Disk, clearDuplicateDiskRecords, isSystemDiskRecord } from "./Disk.js";
 import { deepPrint, log, print } from "../utils/utils.js";
 import { buildInstance, startInstance, runInstance, stopInstance, markInstanceError } from "./Instance.js";
 import { buildEngine, syncEngine, clearKnownHost, rebootEngine } from "./Engine.js";
@@ -5593,6 +1494,10 @@ const ejectDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskIdOrNa
     if (!target.ok) throw new Error(target.message)
     const disk = target.disk
     const label = `'${disk.name}' (${disk.id})`
+    // Never eject the Pi's own system disk, however it was named (idea#152)
+    if (await isSystemDiskRecord(disk)) {
+        throw new Error(`Disk ${label} is this Pi's system disk and cannot be ejected.`)
+    }
     // Refuse to eject if an operation is actively using this disk
     if (resourceLock.isLocked(diskKey(disk.id))) {
         const info = resourceLock.getLockInfo(diskKey(disk.id))
@@ -6926,6 +2831,12 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
     if (await isSystemDisk(disk)) {
         log(`Disk ${disk.id} is the system disk`)
         detectedTypes.push('system')
+        // Mark it before scanning /apps and /instances, so the record never shows
+        // a device without the 'system' marker (idea#152)
+        storeHandle.change(doc => {
+            const d = doc.diskDB[disk.id]
+            if (d) d.diskTypes = ['system']
+        })
         await processSystemDisk(storeHandle, disk)
     } else {
         if (await isAppDisk(disk)) {
@@ -6996,6 +2907,32 @@ export const isSystemDisk = async (disk: Disk): Promise<boolean> => {
     const rootDev = await getRootDevice()
     return String(disk.device) === String(rootDev)
 }
+
+/** Tests only: pretend the root filesystem is on this device (null: detect it again). */
+export const setRootDeviceForTests = (device: string | null): void => { _rootDevice = device }
+
+/** Whole-drive name of a partition: sda2 → sda, mmcblk0p2 → mmcblk0, nvme0n1p2 → nvme0n1 */
+export const driveOf = (device: string): string =>
+    /^(mmcblk\d+|nvme\d+n\d+)p\d+$/.test(device) ? device.replace(/p\d+$/, '') : device.replace(/\d+$/, '')
+
+/**
+ * True when the device is a partition of the drive this Pi runs from: the root
+ * partition (sda2) or any other partition on that drive, e.g. the boot partition
+ * (sda1 on /boot/firmware). idea#152: these are never ejected or undocked.
+ */
+export const isOnSystemDrive = async (device: string | null | undefined): Promise<boolean> => {
+    if (!device) return false
+    const root = await getRootDevice()
+    if (!/^(sd[a-z]+\d+|mmcblk\d+p\d+|nvme\d+n\d+p\d+)$/.test(root)) return false
+    return String(device) === root || driveOf(String(device)) === driveOf(root)
+}
+
+/**
+ * The system disk record, by its marker (diskTypes 'system', the field the
+ * Console gates the eject button on) or by its device (on the system drive).
+ */
+export const isSystemDiskRecord = async (disk: Disk): Promise<boolean> =>
+    (disk.diskTypes ?? []).includes('system') || await isOnSystemDrive(disk.device)
 
 /**
  * Returns the path prefix for a disk's app/instance/services directories.
@@ -11363,6 +7300,4115 @@ export interface User {
     passwordHash: string   // bcrypt hash — never stored in plain text
     role: 'operator'       // only operators have accounts
     created: Timestamp     // unix ms — set on createOperator()
+}
+
+```
+
+## File: src/monitors/backupMonitor.ts
+```typescript
+/**
+ * backupMonitor.ts — Backup Disk processing, backup/restore operations
+ *
+ * Design: design/backup-disk.md
+ *
+ * Key design points:
+ *  - BorgBackup for deduplicating, atomic, resumable archives
+ *  - activeBackups Set prevents double-backup on reboot race
+ *  - Lock file (.backup-in-progress) enables boot-resume after interrupted backup
+ *  - testMode: skips borg commands but exercises all other logic (store updates, YAML, lock files)
+ */
+
+import { $, YAML, chalk, fs } from 'zx'
+import { log, print } from '../utils/utils.js'
+import { config, disksRoot } from '../data/Config.js'
+import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot } from '../data/Disk.js'
+import { indexBackupDiskApps } from '../data/InstallApp.js'
+import { createOperation, updateOperation } from '../data/Operations.js'
+import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
+import { stopInstance, startInstance, BACKUP_STEPS } from '../data/Instance.js'
+import { BackupMode, DiskID, DiskName, InstanceID, Timestamp, OperationCause, Operation } from '../data/CommonTypes.js'
+import { Store, getInstance, getDisks, findDiskByName } from '../data/Store.js'
+import { DocHandle } from '@automerge/automerge-repo'
+import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js'
+import { runWithTrace, flushTrace, getActiveTrace } from '../utils/CommandLogger.js'
+
+$.verbose = false
+
+// ── In-memory mutex ──────────────────────────────────────────────────────────
+// Prevents double-backup when both App Disk and Backup Disk dock at the same
+// time after a reboot (see design/backup-disk.md — Reboot Race Condition).
+const activeBackups = new Set<InstanceID>()
+
+// ── BACKUP.yaml shape ────────────────────────────────────────────────────────
+interface BackupYaml {
+    mode: BackupMode
+    links: Array<{ instanceId: string; lastBackup: number }>
+}
+
+const BACKUP_YAML = 'BACKUP.yaml'
+const LOCK_FILE = '.backup-in-progress'
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+const backupDir = (backupDevice: string, instanceId: InstanceID) =>
+    `${disksRoot()}/${backupDevice}/backups/${instanceId}`
+
+const lockFilePath = (backupDevice: string, instanceId: InstanceID) =>
+    `${backupDir(backupDevice, instanceId)}/${LOCK_FILE}`
+
+const readBackupYaml = async (backupDevice: string): Promise<BackupYaml | null> => {
+    try {
+        const raw = await fs.readFile(`${disksRoot()}/${backupDevice}/${BACKUP_YAML}`, 'utf-8')
+        return YAML.parse(raw) as BackupYaml
+    } catch {
+        return null
+    }
+}
+
+const writeBackupYaml = async (backupDevice: string, yaml: BackupYaml): Promise<void> => {
+    await fs.writeFile(`${disksRoot()}/${backupDevice}/${BACKUP_YAML}`, YAML.stringify(yaml))
+}
+
+// ── Core backup logic ─────────────────────────────────────────────────────────
+
+/**
+ * Run a Borg backup of one instance to a Backup Disk.
+ * Idempotent: if interrupted and re-triggered, Borg deduplicates against
+ * existing chunks and completes in near-O(delta) time.
+ */
+export const backupInstance = async (
+    storeHandle: DocHandle<Store>,
+    instanceId: InstanceID,
+    backupDisk: Disk,
+    existingOpId?: string,  // pass when retrying an interrupted op
+    cause: OperationCause = 'console-command',
+): Promise<void> => {
+    // If there is no active trace (called from backup monitor, not via Console command),
+    // create one so that step markers and log lines land in the Console log panel.
+    if (!getActiveTrace()) {
+        const cmdLogHandle = getCommandLogHandle()
+        const traceId = crypto.randomUUID()
+        const traceArgs = JSON.stringify({ instanceId, backupDiskId: backupDisk.id, cause })
+        if (cmdLogHandle) addTrace(cmdLogHandle, { traceId, command: 'backupApp', args: traceArgs, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
+        return runWithTrace({ traceId, command: 'backupApp', args: traceArgs }, async () => {
+            await backupInstance(storeHandle, instanceId, backupDisk, existingOpId, cause)
+            if (cmdLogHandle) { await flushTrace(traceId); closeTrace(cmdLogHandle, traceId, 'ok') }
+        }).catch(async (err: any) => {
+            if (cmdLogHandle) { await flushTrace(traceId); closeTrace(cmdLogHandle, traceId, 'error', err?.message ?? String(err)) }
+        })
+    }
+
+    if (activeBackups.has(instanceId)) {
+        log(`Backup for ${instanceId} already in progress — skipping duplicate trigger`)
+        return
+    }
+    activeBackups.add(instanceId)
+    let wasRunning = false
+
+    // Take the instance lock and the Backup Disk lock together, as restore does
+    // (idea#126, Files Disk step 0): nothing else may change the instance or the
+    // Backup Disk (eject, erase, another backup or restore) while Borg writes.
+    const backupLockKeys = backupLockKeysFor(instanceId, backupDisk.id)
+    if (!resourceLock.acquireAll(backupLockKeys, 'backupApp')) {
+        activeBackups.delete(instanceId)
+        const held = backupLockKeys.map(k => resourceLock.getLockInfo(k)).find(Boolean)
+        throw new Error(`Backup of instance ${instanceId} to disk ${backupDisk.id} not started: the instance or the Backup Disk is locked${held ? ` by '${held.kind}'` : ''} (another operation is running)`)
+    }
+
+    const opId = existingOpId ?? createOperation(storeHandle, 'backupApp', {
+        instanceId,
+        backupDiskId: backupDisk.id,
+    }, cause, { type: 'instance', id: instanceId })
+
+    try {
+        updateOperation(storeHandle, opId, { status: 'Running' })
+        const store = storeHandle.doc()
+        const instance = getInstance(store, instanceId)
+        if (!instance) {
+            throw new Error(`Instance ${instanceId} not found in store`)
+        }
+        if (!instance.storedOn) {
+            throw new Error(`Instance ${instanceId} has no storedOn disk`)
+        }
+
+        const appDisk = store.diskDB[instance.storedOn]
+        if (!appDisk || !appDisk.device) {
+            throw new Error(`App Disk for instance ${instanceId} is not docked`)
+        }
+
+        const backupDevice = backupDisk.device!
+        const appDevice = appDisk.device
+        const repoPath = backupDir(backupDevice, instanceId)
+        const lockPath = lockFilePath(backupDevice, instanceId)
+
+        const totalBackupSteps = BACKUP_STEPS.length
+
+        const setBackupStep = (step: number, label: string) => {
+            const line = `  Step ${step + 1}/${totalBackupSteps}  │  ${label}  `
+            const bar  = '─'.repeat(line.length)
+            print(`┌${bar}┐`)
+            print(`│${line}│`)
+            print(`└${bar}┘`)
+            storeHandle.change(doc => {
+                const op = doc.operationDB?.[opId]
+                if (!op) return
+                op.currentStep = step
+                op.totalSteps = totalBackupSteps
+                op.stepLabel = label
+                op.progressPercent = Math.round((step / (totalBackupSteps - 1)) * 100)
+            })
+        }
+
+        log(`Starting backup of instance ${instanceId} from ${appDevice} to ${backupDevice}`)
+
+        // 1. Init Borg repo if this is the first backup
+        setBackupStep(0, BACKUP_STEPS[0])
+        const repoExists = await fs.pathExists(`${repoPath}/config`)
+        if (!repoExists) {
+            log(`Initialising Borg repo at ${repoPath}`)
+            await fs.ensureDir(repoPath)
+            if (!config.settings.testMode) {
+                await $`borg init --encryption=none ${repoPath}`
+            } else {
+                log(`testMode: skipping borg init`)
+            }
+        }
+
+        // 2. Write lock file (signals in-progress backup for boot-resume)
+        await fs.writeFile(lockPath, JSON.stringify({ instanceId, startedAt: Date.now() }))
+
+        // 3. Stop the instance if running (ensures filesystem consistency)
+        if (instance.status === 'Running') {
+            wasRunning = true
+            log(`Stopping instance ${instanceId} before backup`)
+            setBackupStep(1, BACKUP_STEPS[1])
+            await stopInstance(storeHandle, instance, appDisk, 'backup-pre-stop')
+        }
+
+        // 4. Run borg create
+        setBackupStep(2, BACKUP_STEPS[2])
+        const archiveName = new Date().toISOString().replace(/[:.]/g, '-')
+        if (!config.settings.testMode) {
+            log(`Running borg create for instance ${instanceId}`)
+            await $`borg create ${repoPath}::${archiveName} ${await diskMountRoot(appDisk)}/instances/${instanceId}`
+        } else {
+            log(`testMode: skipping borg create for instance ${instanceId}`)
+        }
+
+        // 5. Restart instance if it was running
+        if (wasRunning) {
+            log(`Restarting instance ${instanceId} after backup`)
+            setBackupStep(3, BACKUP_STEPS[3])
+            await startInstance(storeHandle, instance, appDisk, 'backup-post-start')
+        }
+
+        // 6. Update store: set lastBackup on the instance
+        setBackupStep(4, BACKUP_STEPS[4])
+        storeHandle.change(doc => {
+            const inst = doc.instanceDB[instanceId]
+            if (inst) inst.lastBackup = Date.now() as Timestamp
+        })
+
+        // 7. Update BACKUP.yaml on the disk
+        const yaml = await readBackupYaml(backupDevice)
+        if (yaml) {
+            const link = yaml.links.find(l => l.instanceId === instanceId)
+            if (link) {
+                link.lastBackup = Date.now()
+            }
+            await writeBackupYaml(backupDevice, yaml)
+        }
+
+        // 8. Remove lock file (success)
+        await fs.remove(lockPath)
+
+        updateOperation(storeHandle, opId, {
+            status: 'Done',
+            progressPercent: 100,
+            completedAt: Date.now() as Timestamp,
+        })
+        log(chalk.green(`Backup of instance ${instanceId} completed successfully`))
+
+    } catch (e: any) {
+        updateOperation(storeHandle, opId, {
+            status: 'Failed',
+            error: e.message ?? String(e),
+            completedAt: Date.now() as Timestamp,
+        })
+        log(chalk.red(`Backup of instance ${instanceId} failed: ${e.message ?? e}`))
+        // Always restart instance if it was stopped (even on failure)
+        if (wasRunning) {
+            try {
+                const store = storeHandle.doc()
+                const instance = getInstance(store, instanceId)
+                const appDisk = instance?.storedOn ? store.diskDB[instance.storedOn] : null
+                if (instance && appDisk) {
+                    log(`Restarting instance ${instanceId} after failed backup`)
+                    await startInstance(storeHandle, instance, appDisk, 'backup-post-start')
+                }
+            } catch (restartErr) {
+                log(chalk.red(`Failed to restart instance ${instanceId} after backup error: ${restartErr}`))
+            }
+        }
+        // Lock file intentionally left in place — signals boot-resume on next dock
+        // Rethrow so the backup's trace ends with status 'error' and this message
+        throw e
+    } finally {
+        activeBackups.delete(instanceId)
+        resourceLock.releaseAll(backupLockKeys)
+    }
+}
+
+/** Lock keys a backup holds: the instance and the Backup Disk (idea#126). */
+export const backupLockKeysFor = (instanceId: string, backupDiskId: string): string[] =>
+    [instanceKey(instanceId), diskKey(backupDiskId)]
+
+/**
+ * The running (or pending) backupApp operation writing to a disk, if any
+ * (idea#126). Eject (and a later erase) check this by the operation's
+ * backupDiskId, so every backup is covered, whatever started it (console,
+ * immediate mode, stale lock, crash recovery, a schedule).
+ */
+export const runningBackupOnDisk = (store: Store, diskId: string): Operation | undefined =>
+    Object.values(store.operationDB ?? {}).find(op =>
+        op?.kind === 'backupApp' &&
+        (op.status === 'Running' || op.status === 'Pending') &&
+        op.args?.backupDiskId === diskId) as Operation | undefined
+
+/**
+ * Start a backup from a monitor loop: failures are already recorded in the
+ * backup's trace and operation, so they are logged here and the loop goes on.
+ */
+const triggerBackup = async (
+    storeHandle: DocHandle<Store>,
+    instanceId: InstanceID,
+    backupDisk: Disk,
+    cause: OperationCause,
+): Promise<void> => {
+    try {
+        await backupInstance(storeHandle, instanceId, backupDisk, undefined, cause)
+    } catch (e: any) {
+        log(chalk.red(`Backup of instance ${instanceId} failed: ${e?.message ?? e}`))
+    }
+}
+
+// ── Backup Disk processing ────────────────────────────────────────────────────
+
+/**
+ * Called by processDisk when a Backup Disk is detected.
+ * - Reads BACKUP.yaml and sets backupConfig in the store
+ * - Scans for stale lock files and re-queues interrupted backups
+ * - Triggers backupInstance for immediate mode
+ */
+export const processBackupDisk = async (
+    storeHandle: DocHandle<Store>,
+    backupDisk: Disk
+): Promise<void> => {
+    const backupDevice = backupDisk.device!
+    log(`Processing Backup Disk ${backupDisk.id} on device ${backupDevice}`)
+
+    const yaml = await readBackupYaml(backupDevice)
+    if (!yaml) {
+        log(`No BACKUP.yaml found on disk ${backupDisk.id} — skipping backup processing`)
+        return
+    }
+
+    const mode = yaml.mode
+    const links = yaml.links.map(l => l.instanceId as InstanceID)
+
+    // Set backupConfig in store
+    storeHandle.change(doc => {
+        const d = doc.diskDB[backupDisk.id]
+        if (d) d.backupConfig = { mode, links }
+    })
+
+    // Phase 2: index any app bundles on this disk into appDB for installApp / Console
+    await indexBackupDiskApps(storeHandle, backupDisk)
+
+    // Scan for stale lock files (interrupted backups from before a reboot)
+    const backupsBase = `${disksRoot()}/${backupDevice}/backups`
+    if (await fs.pathExists(backupsBase)) {
+        const entries = await fs.readdir(backupsBase)
+        for (const entry of entries) {
+            const lockPath = `${backupsBase}/${entry}/${LOCK_FILE}`
+            if (await fs.pathExists(lockPath)) {
+                const staleInstanceId = entry as InstanceID
+                log(`Stale lock file found for instance ${staleInstanceId} — re-triggering backup`)
+                const store = storeHandle.doc()
+                const instance = getInstance(store, staleInstanceId)
+                const appDiskDocked = instance?.storedOn
+                    ? store.diskDB[instance.storedOn]?.device != null
+                    : false
+                if (appDiskDocked) {
+                    await triggerBackup(storeHandle, staleInstanceId, backupDisk, 'backup-stale-lock')
+                } else {
+                    log(`App Disk for ${staleInstanceId} not yet docked — stale lock will be handled when App Disk docks`)
+                }
+            }
+        }
+    }
+
+    // Trigger immediate backups for all linked instances whose App Disk is docked
+    if (mode === 'immediate') {
+        const store = storeHandle.doc()
+        for (const instanceId of links) {
+            const instance = getInstance(store, instanceId)
+            if (!instance?.storedOn) continue
+            const appDisk = store.diskDB[instance.storedOn]
+            if (appDisk?.device) {
+                await triggerBackup(storeHandle, instanceId, backupDisk, 'console-command')
+            } else {
+                log(`Instance ${instanceId}: App Disk not docked — backup will trigger when App Disk docks`)
+            }
+        }
+    }
+}
+
+// ── App Disk hook ─────────────────────────────────────────────────────────────
+
+/**
+ * Called from processAppDisk when an App Disk docks.
+ * Checks all docked Backup Disks for links to instances on this App Disk
+ * and triggers backup for immediate-mode disks.
+ */
+export const checkPendingBackups = async (
+    storeHandle: DocHandle<Store>,
+    appDisk: Disk
+): Promise<void> => {
+    const store = storeHandle.doc()
+
+    // Find all currently docked Backup Disks
+    const dockedDisks = Object.values(store.diskDB).filter(d => d.device != null)
+    for (const candidate of dockedDisks) {
+        if (!candidate.diskTypes?.includes('backup')) continue
+        if (!candidate.backupConfig) continue
+        if (candidate.backupConfig.mode !== 'immediate') continue
+
+        // Check if any linked instance lives on the newly docked App Disk
+        const instancesOnAppDisk = Object.values(store.instanceDB)
+            .filter(inst => String(inst.storedOn) === String(appDisk.id))
+
+        for (const instance of instancesOnAppDisk) {
+            if (candidate.backupConfig.links.includes(instance.id)) {
+                log(`checkPendingBackups: triggering backup for instance ${instance.id}`)
+                await triggerBackup(storeHandle, instance.id, candidate as Disk, 'backup-app-docked')
+            }
+        }
+
+        // Also check for stale locks for instances on this App Disk
+        if (candidate.device) {
+            const backupsBase = `${disksRoot()}/${candidate.device}/backups`
+            if (await fs.pathExists(backupsBase)) {
+                const entries = await fs.readdir(backupsBase)
+                for (const entry of entries) {
+                    const lockPath = `${backupsBase}/${entry}/${LOCK_FILE}`
+                    if (await fs.pathExists(lockPath)) {
+                        const staleId = entry as InstanceID
+                        const staleInstance = getInstance(store, staleId)
+                        if (String(staleInstance?.storedOn) === String(appDisk.id)) {
+                            log(`checkPendingBackups: stale lock for ${staleId} — re-triggering backup`)
+                            await triggerBackup(storeHandle, staleId, candidate as Disk, 'backup-stale-lock')
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── restoreApp ────────────────────────────────────────────────────────────────
+
+/**
+ * Restore the latest archive for instanceId from any docked Backup Disk
+ * onto targetDisk.
+ */
+export const restoreApp = async (
+    storeHandle: DocHandle<Store>,
+    instanceId: InstanceID,
+    targetDisk: Disk,
+    existingOpId?: string,
+    cause: OperationCause = 'console-command',
+): Promise<void> => {
+    // Acquire lock: instance + target disk
+    const restoreLockKeys = [instanceKey(instanceId), diskKey(targetDisk.id)]
+    if (!resourceLock.acquireAll(restoreLockKeys, 'restoreApp')) {
+        console.error(chalk.red(`restoreApp: resource locked — another operation is already running on instance or target disk. Retry when it completes.`))
+        return
+    }
+
+    const opId = existingOpId ?? createOperation(storeHandle, 'restoreApp', {
+        instanceId,
+        targetDiskId: targetDisk.id,
+    }, cause, { type: 'instance', id: instanceId })
+
+    try {
+        updateOperation(storeHandle, opId, { status: 'Running' })
+        const store = storeHandle.doc()
+
+        // Find a docked Backup Disk with an archive for this instance
+        const dockedDisks = Object.values(store.diskDB).filter(d => d.device != null)
+        let backupDisk: Disk | null = null
+        for (const candidate of dockedDisks) {
+            if (!candidate.diskTypes?.includes('backup')) continue
+            const repoPath = backupDir(candidate.device!, instanceId)
+            if (await fs.pathExists(`${repoPath}/config`)) {
+                backupDisk = candidate as Disk
+                break
+            }
+        }
+
+        if (!backupDisk) {
+            throw new Error(`No docked Backup Disk with archives for instance ${instanceId}`)
+        }
+
+        const backupDevice = backupDisk.device!
+        const targetDevice = targetDisk.device
+        if (!targetDevice) {
+            throw new Error(`Target disk ${targetDisk.id} is not docked`)
+        }
+
+        const repoPath = backupDir(backupDevice, instanceId)
+        const instancesDir = `${await diskMountRoot(targetDisk)}/instances`
+
+        // Stop instance if currently running
+        const instance = getInstance(store, instanceId)
+        if (instance?.status === 'Running') {
+            const currentDisk = instance.storedOn ? store.diskDB[instance.storedOn] : null
+            if (currentDisk) await stopInstance(storeHandle, instance, currentDisk, 'backup-pre-stop')
+        }
+
+        await fs.ensureDir(instancesDir)
+
+        if (!config.settings.testMode) {
+            log(`Restoring instance ${instanceId} from ${backupDevice} to ${targetDevice}`)
+            await $`bash -c ${'cd ' + instancesDir + ' && borg extract ' + repoPath + '::latest'}`
+        } else {
+            log(`testMode: skipping borg extract for instance ${instanceId}`)
+        }
+
+        const { processInstance } = await import('../data/Disk.js')
+        await processInstance(storeHandle, targetDisk, instanceId)
+
+        updateOperation(storeHandle, opId, {
+            status: 'Done',
+            progressPercent: 100,
+            completedAt: Date.now() as Timestamp,
+        })
+        log(chalk.green(`Restore of instance ${instanceId} to disk ${targetDisk.name} completed`))
+
+    } catch (e: any) {
+        updateOperation(storeHandle, opId, {
+            status: 'Failed',
+            error: e.message ?? String(e),
+            completedAt: Date.now() as Timestamp,
+        })
+        log(chalk.red(`Restore of instance ${instanceId} failed: ${e.message ?? e}`))
+    } finally {
+        resourceLock.releaseAll(restoreLockKeys)
+    }
+}
+
+// ── createBackupDisk ──────────────────────────────────────────────────────────
+
+/**
+ * Write BACKUP.yaml on a disk and trigger processDisk to register it as a Backup Disk.
+ * Called by the createBackupDisk command from Console.
+ */
+export const createBackupDiskConfig = async (
+    storeHandle: DocHandle<Store>,
+    disk: Disk,
+    mode: BackupMode,
+    instanceIds: InstanceID[]
+): Promise<void> => {
+    if (!disk.device) {
+        log(chalk.red(`createBackupDiskConfig: disk ${disk.id} is not docked`))
+        return
+    }
+
+    const yaml: BackupYaml = {
+        mode,
+        links: instanceIds.map(id => ({ instanceId: id, lastBackup: 0 }))
+    }
+
+    await writeBackupYaml(disk.device, yaml)
+    log(`Written BACKUP.yaml to disk ${disk.name} (mode: ${mode}, links: ${instanceIds.join(', ')})`)
+
+    // Re-process the disk so diskTypes and backupConfig are set in the store
+    await processDisk(storeHandle, disk)
+}
+
+```
+
+## File: src/monitors/diskDetection.ts
+```typescript
+/**
+ * diskDetection.ts
+ *
+ * Makes USB disk detection failures visible (idea#82).
+ *
+ * Disk detection depends on the udev rule 90-docking.rules, which creates the
+ * /dev/engine/<device> links the USB device monitor watches. tmpfiles.d always
+ * creates /dev/engine, so a missing rule leaves an empty folder and docking
+ * silently does nothing. boot.sh reinstalls the rule on every boot when it is
+ * missing or differs from the shipped asset (self-repair). This module:
+ *
+ *   - runs a startup self-check that reports what the self-repair could not fix
+ *   - records disk detection failures (self-check, monitor start, mount, META
+ *     read, META write, undock) as failed `diskDetection` traces in the command log, so they
+ *     appear in the Console History panel (no store schema change)
+ */
+
+import path from 'path'
+import { $, fs, sleep } from 'zx'
+import { DocHandle } from '@automerge/automerge-repo'
+import { log } from '../utils/utils.js'
+import { CommandLogStore, getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js'
+
+export const DISK_DETECTION_COMMAND = 'diskDetection'
+export const UDEV_RULE_PATH = '/etc/udev/rules.d/90-docking.rules'
+export const UDEV_RULE_ASSET = 'script/build_image_assets/90-docking.rules'
+export const ENGINE_WATCH_DIR = '/dev/engine'
+export const SYS_BLOCK_DIR = '/sys/class/block'
+
+// Devices the udev rule links into /dev/engine: KERNEL=="sd?|sd?1|sd?2"
+export const RULE_DEVICE_PATTERN = /^sd[a-z][12]?$/
+
+export type DiskDetectionStep = 'selfCheck' | 'monitorStart' | 'watcher' | 'mount' | 'readMeta' | 'writeMeta' | 'dock' | 'undock'
+
+/**
+ * Record a disk detection failure: always logged, and added to the command log
+ * as a completed trace with status 'error' (shows up in Console History).
+ */
+export const recordDiskDetectionFailure = (
+    step: DiskDetectionStep,
+    message: string,
+    details: Record<string, unknown> = {},
+    handle: DocHandle<CommandLogStore> | null = getCommandLogHandle()
+): void => {
+    log(`[diskDetection] ${step} failed: ${message}`)
+    if (!handle) return
+    try {
+        const traceId = crypto.randomUUID()
+        const now = Date.now()
+        addTrace(handle, {
+            traceId,
+            command: DISK_DETECTION_COMMAND,
+            args: JSON.stringify({ step, ...details }),
+            startedAt: now,
+            completedAt: null,
+            status: 'running',
+            errorMessage: null,
+        })
+        closeTrace(handle, traceId, 'error', message)
+    } catch (e) {
+        log(`[diskDetection] could not record the failure in the command log: ${e}`)
+    }
+}
+
+export const errorMessage = (e: unknown): string =>
+    e instanceof Error ? e.message : String(e)
+
+export interface DiskDetectionPaths {
+    rulePath: string
+    ruleAsset: string
+    watchDir: string
+    sysBlockDir: string
+}
+
+export const defaultDiskDetectionPaths = (): DiskDetectionPaths => ({
+    rulePath: UDEV_RULE_PATH,
+    // The Engine runs from its repo folder (config.yaml is read relative to cwd)
+    ruleAsset: path.resolve(UDEV_RULE_ASSET),
+    watchDir: ENGINE_WATCH_DIR,
+    sysBlockDir: SYS_BLOCK_DIR,
+})
+
+/**
+ * Check the udev setup disk detection relies on. Returns the problems found
+ * (empty when everything is in place):
+ *   - the udev rule file exists (and matches the shipped asset, when present)
+ *   - the watch folder (/dev/engine) exists
+ *   - every sd* device covered by the rule has a matching /dev/engine/<name> entry
+ */
+export const checkDiskDetection = (paths: DiskDetectionPaths): string[] => {
+    const problems: string[] = []
+
+    if (!fs.existsSync(paths.rulePath)) {
+        problems.push(`udev rule ${paths.rulePath} is missing`)
+    } else if (fs.existsSync(paths.ruleAsset)) {
+        const installed = fs.readFileSync(paths.rulePath, 'utf8').trim()
+        const shipped = fs.readFileSync(paths.ruleAsset, 'utf8').trim()
+        if (installed !== shipped) problems.push(`udev rule ${paths.rulePath} differs from ${paths.ruleAsset}`)
+    }
+
+    if (!fs.existsSync(paths.watchDir)) {
+        problems.push(`${paths.watchDir} does not exist`)
+        return problems
+    }
+
+    let devices: string[] = []
+    try {
+        devices = fs.readdirSync(paths.sysBlockDir).filter(d => RULE_DEVICE_PATTERN.test(d))
+    } catch (e) {
+        problems.push(`cannot list ${paths.sysBlockDir}: ${errorMessage(e)}`)
+    }
+    const present = new Set(fs.readdirSync(paths.watchDir))
+    const missing = devices.filter(d => !present.has(d)).sort()
+    if (missing.length > 0) {
+        problems.push(`no ${paths.watchDir} entry for ${missing.join(', ')}`)
+    }
+    return problems
+}
+
+export interface SelfCheckOptions {
+    paths?: DiskDetectionPaths
+    settle?: () => Promise<void>
+    retryDelayMs?: number
+    handle?: DocHandle<CommandLogStore> | null
+}
+
+const udevSettle = async (): Promise<void> => {
+    // Wait until udev has processed its event queue (no root needed).
+    await $`udevadm settle --timeout=10`.nothrow()
+}
+
+/**
+ * Engine startup self-check. Skipped in test runs (IDEA_WATCH_DIR is set: tests
+ * use a private watch folder, idea#105). Waits for udev to settle, then checks.
+ * boot.sh may still be repairing the rule when the Engine starts, so problems are
+ * re-checked once after a delay; only what is still wrong is reported, as one
+ * failed `diskDetection` trace. Returns the reported problems.
+ */
+export const runDiskDetectionSelfCheck = async (opts: SelfCheckOptions = {}): Promise<string[]> => {
+    if (process.env.IDEA_WATCH_DIR) {
+        log(`[diskDetection] IDEA_WATCH_DIR is set — skipping the udev self-check`)
+        return []
+    }
+    const paths = opts.paths ?? defaultDiskDetectionPaths()
+    const settle = opts.settle ?? udevSettle
+    const retryDelayMs = opts.retryDelayMs ?? 30_000
+
+    await settle()
+    let problems = checkDiskDetection(paths)
+    if (problems.length > 0) {
+        log(`[diskDetection] self-check found problems, re-checking in ${retryDelayMs} ms: ${problems.join('; ')}`)
+        await sleep(retryDelayMs)
+        await settle()
+        problems = checkDiskDetection(paths)
+    }
+    if (problems.length === 0) {
+        log(`[diskDetection] self-check passed`)
+        return []
+    }
+    recordDiskDetectionFailure(
+        'selfCheck',
+        `USB disk detection is not working: ${problems.join('; ')}`,
+        { problems },
+        opts.handle === undefined ? getCommandLogHandle() : opts.handle
+    )
+    return problems
+}
+
+```
+
+## File: src/monitors/dockerMetricsMonitor.ts
+```typescript
+/**
+ * dockerMetricsMonitor.ts
+ *
+ * Polls `docker stats --no-stream --format json` every POLL_INTERVAL_MS for
+ * all containers belonging to Running instances on the local engine, then
+ * writes parsed metrics to instance.metrics in the Automerge store.
+ *
+ * When an instance stops running (status !== 'Running'), metrics is set to null.
+ *
+ * The Console reads instance.metrics and formats the raw numbers itself.
+ */
+
+import { $ } from 'zx'
+import { log } from '../utils/utils.js'
+import { DocHandle } from '@automerge/automerge-repo'
+import { Store, getLocalEngine, getInstancesOfEngine } from '../data/Store.js'
+import { DockerMetrics } from '../data/CommonTypes.js'
+import { localEngineId } from '../data/Engine.js'
+import { config } from '../data/Config.js'
+
+$.verbose = false
+
+const POLL_INTERVAL_MS = 15_000
+
+// ── Byte-string parser ────────────────────────────────────────────────────────
+// docker stats JSON emits strings like "256MiB", "1.5GiB", "1.23kB", "10MB"
+
+const UNIT_MULTIPLIERS: Record<string, number> = {
+    b:   1,
+    kb:  1000,
+    mb:  1000 ** 2,
+    gb:  1000 ** 3,
+    tb:  1000 ** 4,
+    kib: 1024,
+    mib: 1024 ** 2,
+    gib: 1024 ** 3,
+    tib: 1024 ** 4,
+}
+
+const parseBytes = (raw: string): number | null => {
+    if (!raw) return null
+    const m = raw.trim().match(/^([\d.]+)\s*([a-zA-Z]+)$/)
+    if (!m) return null
+    const value = parseFloat(m[1])
+    const unit = m[2].toLowerCase()
+    const mult = UNIT_MULTIPLIERS[unit]
+    if (mult === undefined || isNaN(value)) return null
+    return Math.round(value * mult)
+}
+
+const parsePercent = (raw: string): number | null => {
+    if (!raw) return null
+    const m = raw.trim().match(/^([\d.]+)\s*%$/)
+    if (!m) return null
+    const v = parseFloat(m[1])
+    return isNaN(v) ? null : v
+}
+
+// ── docker stats output shape ─────────────────────────────────────────────────
+// `docker stats --no-stream --format json` outputs one JSON object per line.
+// Fields (from Docker docs): Container, Name, CPUPerc, MemUsage, MemPerc,
+// NetIO, BlockIO, PIDs.
+
+interface RawDockerStats {
+    Container?: string
+    Name?: string
+    CPUPerc?: string
+    MemUsage?: string    // e.g. "256MiB / 1GiB"
+    MemPerc?: string
+    NetIO?: string       // e.g. "1.23kB / 456B"
+    BlockIO?: string     // e.g. "10MB / 5MB"
+}
+
+const parseStatsLine = (line: string): { name: string; metrics: DockerMetrics } | null => {
+    let raw: RawDockerStats
+    try {
+        raw = JSON.parse(line)
+    } catch {
+        return null
+    }
+
+    const name = raw.Name ?? raw.Container ?? ''
+    if (!name) return null
+
+    // MemUsage: "256MiB / 1GiB"
+    const [memUsageStr, memLimitStr] = (raw.MemUsage ?? '').split('/').map(s => s.trim())
+
+    // NetIO: "1.23kB / 456B"
+    const [netRxStr, netTxStr] = (raw.NetIO ?? '').split('/').map(s => s.trim())
+
+    // BlockIO: "10MB / 5MB"
+    const [blockReadStr, blockWriteStr] = (raw.BlockIO ?? '').split('/').map(s => s.trim())
+
+    const metrics: DockerMetrics = {
+        cpuPercent:     parsePercent(raw.CPUPerc ?? ''),
+        memUsageBytes:  parseBytes(memUsageStr ?? ''),
+        memLimitBytes:  parseBytes(memLimitStr ?? ''),
+        memPercent:     parsePercent(raw.MemPerc ?? ''),
+        netRxBytes:     parseBytes(netRxStr ?? ''),
+        netTxBytes:     parseBytes(netTxStr ?? ''),
+        blockReadBytes: parseBytes(blockReadStr ?? ''),
+        blockWriteBytes:parseBytes(blockWriteStr ?? ''),
+        sampledAt:      Date.now(),
+    }
+
+    return { name, metrics }
+}
+
+// ── Collect metrics for a set of instance IDs ─────────────────────────────────
+
+const collectMetrics = async (
+    instanceIds: string[]
+): Promise<Map<string, DockerMetrics>> => {
+    // docker stats container names follow the pattern: <instanceId>-<service>-1
+    // We filter containers by name prefix matching any of the instance IDs.
+    const result = new Map<string, DockerMetrics>()
+    if (instanceIds.length === 0) return result
+
+    try {
+        // docker stats does not support --filter; resolve container names via docker ps first
+        const filterArgs = instanceIds.flatMap(id => ['--filter', `name=${id}`])
+        const psProc = await $`docker ps --format {{.Names}} ${filterArgs}`
+        const containerNames = psProc.stdout.split('\n').map(l => l.trim()).filter(Boolean)
+        if (containerNames.length === 0) return result
+        const proc = await $`docker stats --no-stream --format json ${containerNames}`
+        const lines = proc.stdout.split('\n').filter(l => l.trim())
+
+        for (const line of lines) {
+            const parsed = parseStatsLine(line)
+            if (!parsed) continue
+            // Map container name back to instance ID
+            const instanceId = instanceIds.find(id => parsed.name.startsWith(id))
+            if (!instanceId) continue
+            // Merge: if multiple containers belong to the same instance, accumulate
+            const existing = result.get(instanceId)
+            if (!existing) {
+                result.set(instanceId, parsed.metrics)
+            } else {
+                // Sum CPU and net/block across containers; use latest sampledAt
+                existing.cpuPercent     = (existing.cpuPercent    ?? 0) + (parsed.metrics.cpuPercent    ?? 0)
+                existing.memUsageBytes  = (existing.memUsageBytes ?? 0) + (parsed.metrics.memUsageBytes ?? 0)
+                existing.netRxBytes     = (existing.netRxBytes    ?? 0) + (parsed.metrics.netRxBytes    ?? 0)
+                existing.netTxBytes     = (existing.netTxBytes    ?? 0) + (parsed.metrics.netTxBytes    ?? 0)
+                existing.blockReadBytes = (existing.blockReadBytes ?? 0) + (parsed.metrics.blockReadBytes ?? 0)
+                existing.blockWriteBytes= (existing.blockWriteBytes ?? 0) + (parsed.metrics.blockWriteBytes ?? 0)
+                existing.sampledAt      = Date.now()
+            }
+        }
+    } catch (e: any) {
+        log(`[dockerMetrics] docker stats error: ${e.message ?? e}`)
+    }
+
+    return result
+}
+
+// ── Main monitor loop ─────────────────────────────────────────────────────────
+
+const poll = async (storeHandle: DocHandle<Store>): Promise<void> => {
+    if (config.settings.testMode) return  // no Docker in test mode
+
+    const store = storeHandle.doc()
+    const localEngine = getLocalEngine(store)
+    if (!localEngine) return
+
+    const allInstances = getInstancesOfEngine(store, localEngine)
+    const runningInstances = allInstances.filter(i => i.status === 'Running')
+    const runningIds = runningInstances.map(i => i.id as string)
+
+    // Collect live metrics for running containers
+    const metricsMap = await collectMetrics(runningIds)
+
+    // Write back to store — one change() call covers all instances
+    storeHandle.change(doc => {
+        for (const inst of allInstances) {
+            const instanceInDoc = doc.instanceDB[inst.id as any]
+            if (!instanceInDoc) continue
+
+            if (inst.status === 'Running') {
+                const m = metricsMap.get(inst.id as string)
+                // If running but no container found yet (brief window during start), keep previous metrics
+                if (m) {
+                    instanceInDoc.metrics = m as any
+                }
+            } else {
+                // Not running — clear metrics
+                if (instanceInDoc.metrics !== null) {
+                    instanceInDoc.metrics = null
+                }
+            }
+        }
+    })
+}
+
+export const enableDockerMetricsMonitor = (storeHandle: DocHandle<Store>): void => {
+    log('[dockerMetrics] Starting Docker metrics monitor')
+
+    const run = async () => {
+        try {
+            await poll(storeHandle)
+        } catch (e: any) {
+            log(`[dockerMetrics] Unhandled error in poll: ${e.message ?? e}`)
+        }
+        setTimeout(run, POLL_INTERVAL_MS)
+    }
+
+    // First poll after a short delay (give instances time to start on engine boot)
+    setTimeout(run, 5_000)
+}
+
+```
+
+## File: src/monitors/httpMonitor.ts
+```typescript
+/**
+ * httpMonitor.ts — Engine HTTP server
+ *
+ * Responsibilities:
+ *   1. Serve the Console production web app (static files from `consolePath`)
+ *   2. Expose GET /api/store-url — returns the Automerge document URL so the
+ *      Console can discover it automatically without manual configuration
+ *
+ * Port: configurable via `config.yaml` settings.httpPort (default 80).
+ *
+ * If `consolePath` is empty or the directory does not exist, the static file
+ * serving is skipped but /api/store-url is still available.
+ *
+ * The Console uses /api/store-url as:
+ *   GET http://<engine-hostname>/api/store-url
+ *   → { "url": "automerge:<hash>", "wsPort": 4321 }
+ *
+ * `wsPort` is the Engine's effective WebSocket port (config.yaml settings.port,
+ * after the IDEA_ENGINE_PORT override in Config.ts), so the Console does not
+ * have to assume the default. `url` is unchanged for backward compatibility.
+ */
+
+import http from 'http'
+import path from 'path'
+import { fs } from 'zx'
+import { log } from '../utils/utils.js'
+import { config } from '../data/Config.js'
+import type { DocHandle } from '@automerge/automerge-repo'
+import type { CommandLogStore } from '../data/CommandLogStore.js'
+
+const STORE_URL_FILE = path.join(
+    config.settings.storeIdentityFolder,
+    'store-url.txt'
+)
+
+const COMMAND_LOG_URL_FILE = path.join(
+    config.settings.storeIdentityFolder,
+    'command-log-url.txt'
+)
+
+const MIME_TYPES: Record<string, string> = {
+    '.html': 'text/html; charset=utf-8',
+    '.js':   'application/javascript; charset=utf-8',
+    '.mjs':  'application/javascript; charset=utf-8',
+    '.css':  'text/css; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.png':  'image/png',
+    '.svg':  'image/svg+xml',
+    '.ico':  'image/x-icon',
+    '.woff': 'font/woff',
+    '.woff2':'font/woff2',
+    '.ttf':  'font/ttf',
+}
+
+/** JSON payload returned by GET /api/store-url. */
+export interface StoreUrlPayload {
+    url: string
+    wsPort: number
+}
+
+/**
+ * Build the /api/store-url response body.
+ *
+ * @param storeUrl Automerge store document URL (as read from store-url.txt)
+ * @param wsPort   Effective WebSocket port (default: config.settings.port, which
+ *                 already has the IDEA_ENGINE_PORT override applied)
+ */
+export const buildStoreUrlPayload = (
+    storeUrl: string,
+    wsPort: number = config.settings.port
+): StoreUrlPayload => ({ url: storeUrl, wsPort })
+
+const mimeType = (filePath: string): string => {
+    const ext = path.extname(filePath).toLowerCase()
+    return MIME_TYPES[ext] ?? 'application/octet-stream'
+}
+
+/**
+ * Start the Engine HTTP server.
+ *
+ * @param port        TCP port to listen on (default: config.settings.httpPort)
+ * @param consolePath Absolute path to Console dist/ directory (default: config.settings.consolePath)
+ */
+export const enableHttpMonitor = (
+    port: number = config.settings.httpPort,
+    consolePath: string = config.settings.consolePath,
+    _commandLogHandle?: DocHandle<CommandLogStore> | null   // unused at runtime — URL comes from disk
+): http.Server => {
+
+    const hasConsole = consolePath && fs.existsSync(consolePath)
+
+    if (consolePath && !hasConsole) {
+        log(`[http] consolePath "${consolePath}" not found — Console UI will not be served`)
+    } else if (hasConsole) {
+        log(`[http] Serving Console UI from ${consolePath}`)
+    } else {
+        log(`[http] No consolePath configured — Console UI will not be served`)
+    }
+
+    const server = http.createServer(async (req, res) => {
+        const url = req.url ?? '/'
+
+        // ── API routes ──────────────────────────────────────────────────────
+        if (url === '/api/store-url' || url === '/api/store-url/') {
+            try {
+                const storeUrl = (await fs.readFile(STORE_URL_FILE, 'utf-8')).trim()
+                res.writeHead(200, {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',  // Console may be on a different origin during dev
+                })
+                res.end(JSON.stringify(buildStoreUrlPayload(storeUrl)))
+            } catch (e) {
+                log(`[http] /api/store-url: failed to read store URL — ${e}`)
+                res.writeHead(503, { 'Content-Type': 'application/json' })
+                res.end(JSON.stringify({ error: 'Store URL not available yet' }))
+            }
+            return
+        }
+
+        if (url === '/api/command-log-url' || url === '/api/command-log-url/') {
+            try {
+                const logUrl = (await fs.readFile(COMMAND_LOG_URL_FILE, 'utf-8')).trim()
+                res.writeHead(200, {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*',
+                })
+                res.end(JSON.stringify({ url: logUrl }))
+            } catch (e) {
+                log(`[http] /api/command-log-url: failed to read URL — ${e}`)
+                res.writeHead(503, { 'Content-Type': 'application/json' })
+                res.end(JSON.stringify({ error: 'Command log URL not available yet' }))
+            }
+            return
+        }
+
+        // ── Static Console files ────────────────────────────────────────────
+        if (!hasConsole) {
+            res.writeHead(404, { 'Content-Type': 'text/plain' })
+            res.end('Console UI not configured on this Engine')
+            return
+        }
+
+        // Resolve the requested path to a file under consolePath.
+        // Any path that doesn't resolve to a real file falls back to index.html
+        // (SPA client-side routing).
+        let filePath = path.join(consolePath, url === '/' ? 'index.html' : url)
+
+        // Strip query strings
+        filePath = filePath.split('?')[0]
+
+        if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
+            filePath = path.join(consolePath, 'index.html')
+        }
+
+        try {
+            const data = await fs.readFile(filePath)
+            res.writeHead(200, { 'Content-Type': mimeType(filePath) })
+            res.end(data)
+        } catch (e) {
+            log(`[http] Failed to serve ${filePath}: ${e}`)
+            res.writeHead(500, { 'Content-Type': 'text/plain' })
+            res.end('Internal error')
+        }
+    })
+
+    server.on('error', (e: NodeJS.ErrnoException) => {
+        if (e.code === 'EACCES') {
+            log(`[http] Permission denied on port ${port}. Run with sudo or use a port > 1024.`)
+        } else if (e.code === 'EADDRINUSE') {
+            log(`[http] Port ${port} already in use.`)
+        } else {
+            log(`[http] Server error: ${e}`)
+        }
+    })
+
+    server.listen(port, () => {
+        log(`[http] Engine HTTP server listening on port ${port}`)
+    })
+
+    return server
+}
+
+```
+
+## File: src/monitors/mdnsMonitor.ts
+```typescript
+import mDnsSd from 'node-dns-sd'
+import { deepPrint, log, error } from '../utils/utils.js';
+import { chalk } from 'zx';
+import { Store, getLocalEngine } from '../data/Store.js';
+import { manageDiscoveredPeers } from '../data/Network.js'
+import ciao, { CiaoService } from '@homebridge/ciao'
+import { DocHandle, DocumentId, Repo } from '@automerge/automerge-repo';
+import { EngineID, Hostname, IPAddress } from '../data/CommonTypes.js';
+import { config } from '../data/Config.js';
+
+export const startAdvertising = (store: Store): CiaoService => {
+    const engine = getLocalEngine(store)
+    if (!engine) {
+        log(`No local engine found in the store`)
+        throw new Error(`No local engine found in the store`)
+    }
+    const engineName = engine.hostname
+    const engineVersion = engine.version
+    const responder = ciao.getResponder()
+
+    if (!engineName) {
+        throw new Error(`No engine hostname found in the store`)
+    }
+
+    log(`Advertising on all interfaces`)
+    const service = responder.createService({
+        name: engineName.toString(),
+        type: 'engine',
+        port: config.settings.port,
+        txt: {
+            name: engineName,
+            id: engine.id,
+            version: engineVersion
+        }
+    })
+
+    // Log name conflicts without updating the store — the (2) suffix is a service
+    // advertisement detail, not the machine hostname.
+    service.on('name-change', (newName: string) => {
+        log(`mDNS service name changed to '${newName}' due to conflict — hostname in store unchanged`);
+    });
+
+    service.advertise().then(() => {
+        log(`The following service is published on all interfaces: ${engineName}._engine._tcp.local`);
+    }).catch((err) => {
+        error(`Error advertising mDNS service: ${err}`)
+    })
+
+    return service
+}
+
+const discoverEngines = async (storeHandle: DocHandle<Store>, repo:Repo): Promise<void> => {
+    const localEngine = getLocalEngine(storeHandle.doc());
+    try {
+        const deviceList = await mDnsSd.discover({ name: '_engine._tcp.local' });
+        const discoveredPeers = new Map<IPAddress, {hostname: Hostname, engineId: EngineID}>();
+
+        if (deviceList.length > 0) {
+            log(chalk.bgBlackBright(`Discovered engines:`));
+        }
+
+        deviceList.forEach(device => {
+            const txt = device.packet.additionals.find((add: any) => ((typeof add == 'object') && add.hasOwnProperty('type') && add.type === 'TXT'));
+
+            if (!txt || !txt.rdata) {
+                log(chalk.redBright(`  - No TXT record for ${device.modelName || device.address}. Skipping.`));
+                return;
+            }
+
+            const txtRecord = txt.rdata;
+            const engineId = txtRecord.id as EngineID;
+            const hostname = txtRecord.name as Hostname;
+            const address = device.address as IPAddress;
+            const port = device.service?.port;
+
+            log(`  - Name: ${hostname || 'N/A'}, ID: ${engineId || 'N/A'}, Address: ${address || 'N/A'}:${port || 'N/A'}`);
+
+            if (engineId && engineId === localEngine.id) {
+                return; // Skip local engine
+            }
+
+            if (address && hostname && engineId) {
+                discoveredPeers.set(address, { hostname, engineId });
+            }
+        });
+
+        await manageDiscoveredPeers(repo, discoveredPeers, storeHandle);
+
+        if (deviceList.length === 0) {
+            log(chalk.bgBlackBright(`No remote engines found`))
+        }
+    } catch (error) {
+        log(`***node-dns-sd*** Error discovering engines`)
+        console.error(error);
+    }
+}
+
+export const enableMulticastDNSEngineMonitor = (storeHandle: DocHandle<Store>, repo: Repo): { end: () => Promise<void> } => {
+    const service = startAdvertising(storeHandle.doc())
+    
+    const runDiscovery = async () => {
+        await discoverEngines(storeHandle, repo);
+        setTimeout(runDiscovery, 10000);
+    };
+
+    runDiscovery();
+
+    // Return shutdown handle so the caller can send mDNS goodbye packets on exit.
+    return {
+        end: () => service.end()
+    }
+}
+
+```
+
+## File: src/monitors/mounts.ts
+```typescript
+/**
+ * mounts.ts — mounting and unmounting App Disk partitions safely (idea#126)
+ *
+ * Files Disk step 0, Q5 safety fix:
+ *   - "Already mounted" is detected with findmnt (it reads /proc/self/mountinfo)
+ *     by target AND by source, so it works for every filesystem type. Before
+ *     this, `mount -t ext4` output was searched, which missed vfat partitions:
+ *     after an Engine restart a docked vfat partition was mounted a second time
+ *     on top of itself (Atlas, idea03).
+ *   - Mounting onto a target that is already a mount point is refused.
+ *   - Unmounting repeats `umount` until `mountpoint -q` says the target is no
+ *     longer a mount point (a stacked double mount needs one umount per layer),
+ *     then removes the empty folder with rmdir. Never `rm -fr`: rmdir only
+ *     removes an empty folder, so a still-mounted disk's data cannot be deleted.
+ *   - The filesystem UUID is recorded at mount time (lsblk -no UUID) for
+ *     Disk.unmountError and the startup cleanup.
+ *
+ * Root commands: mkdir, mount and umount are in 10-engine; rmdir of
+ * /disks/sd[a-z][12] is in 11-engine-files. findmnt, mountpoint and lsblk need no
+ * root. The commands are behind MountOps so tests can inject fakes.
+ */
+
+import { $, fs, sleep } from 'zx'
+import { log } from '../utils/utils.js'
+import { disksRoot } from '../data/Config.js'
+import type { DocHandle } from '@automerge/automerge-repo'
+import type { Store } from '../data/Store.js'
+import type { Disk } from '../data/Disk.js'
+import type { DiskID, EngineID } from '../data/CommonTypes.js'
+
+export interface MountEntry {
+    source: string   // e.g. /dev/sdb1 (bind-mount suffixes like [/dir] removed)
+    target: string   // e.g. /disks/sdb1
+    fstype: string
+}
+
+export interface MountOps {
+    /** Every mount on the system: `findmnt -J -l -o SOURCE,TARGET,FSTYPE` */
+    listMounts(): Promise<MountEntry[]>
+    /** `mountpoint -q <path>`: true only when the path is a mount point */
+    isMountPoint(path: string): Promise<boolean>
+    /** Filesystem UUID of a device: `lsblk -no UUID /dev/<device>`, null if unknown */
+    fsUuidOfDevice(device: string): Promise<string | null>
+    /** UUID of the filesystem mounted at a path: `findmnt -no UUID <path>`, null if none */
+    fsUuidAt(mountPoint: string): Promise<string | null>
+    /** `sudo mkdir -p <disksRoot>/<device>` */
+    mkdir(device: string): Promise<void>
+    /** `sudo mount /dev/<device> <disksRoot>/<device>` */
+    mount(device: string): Promise<void>
+    /** `sudo umount <disksRoot>/<device>` (removes the top mount only) */
+    umount(device: string): Promise<void>
+    /** Remove the empty mount point folder (see removeMountPointFolder) */
+    rmdir(mountPoint: string): Promise<void>
+}
+
+/** Mount points the 11-engine-files entry `/usr/bin/rmdir /disks/sd[a-z][12]` covers. */
+export const SUDO_RMDIR_PATH = /^\/disks\/sd[a-z][12]$/
+export const SUDO_RMDIR = '/usr/bin/rmdir'
+
+/**
+ * Remove an empty mount point folder. /disks/sd[a-z][12] folders are created
+ * with sudo under the root-owned /disks, so they are removed with exactly
+ * `sudo /usr/bin/rmdir /disks/<device>` (11-engine-files). Other roots (test and
+ * fixture roots from IDEA_DISKS_ROOT) are owned by pi and use a plain rmdir.
+ * Both fail on a folder that is not empty.
+ */
+export const removeMountPointFolder = async (mountPoint: string): Promise<void> => {
+    if (SUDO_RMDIR_PATH.test(mountPoint)) {
+        await $`sudo ${SUDO_RMDIR} ${mountPoint}`
+    } else {
+        await fs.rmdir(mountPoint)
+    }
+}
+
+const stripBindSuffix = (source: string): string => source.replace(/\[.*\]$/, '')
+
+export const defaultMountOps: MountOps = {
+    listMounts: async () => {
+        const out = await $`findmnt -J -l -o SOURCE,TARGET,FSTYPE`.nothrow()
+        if (out.exitCode !== 0 || !out.stdout.trim()) return []
+        const parsed = JSON.parse(out.stdout) as { filesystems?: Array<{ source?: string, target?: string, fstype?: string }> }
+        return (parsed.filesystems ?? []).map(f => ({
+            source: stripBindSuffix(f.source ?? ''),
+            target: f.target ?? '',
+            fstype: f.fstype ?? '',
+        }))
+    },
+    isMountPoint: async (path) => (await $`mountpoint -q ${path}`.nothrow()).exitCode === 0,
+    fsUuidOfDevice: async (device) => {
+        const out = await $`lsblk -no UUID /dev/${device}`.nothrow()
+        const uuid = out.exitCode === 0 ? out.stdout.trim().split('\n')[0].trim() : ''
+        return uuid || null
+    },
+    fsUuidAt: async (mountPoint) => {
+        const out = await $`findmnt -no UUID ${mountPoint}`.nothrow()
+        if (out.exitCode !== 0) return null
+        // A stacked mount lists one line per layer: the last one is on top
+        const lines = out.stdout.split('\n').map(l => l.trim()).filter(Boolean)
+        return lines.length ? lines[lines.length - 1] : null
+    },
+    mkdir: async (device) => { await $`sudo mkdir -p ${disksRoot()}/${device}` },
+    mount: async (device) => { await $`sudo mount /dev/${device} ${disksRoot()}/${device}` },
+    umount: async (device) => { await $`sudo umount ${disksRoot()}/${device}` },
+    rmdir: removeMountPointFolder,
+}
+
+let currentOps: MountOps = defaultMountOps
+
+/** The MountOps in use (the real commands unless a test injected fakes). */
+export const mountOps = (): MountOps => currentOps
+
+/** Tests: replace some or all MountOps; pass null to restore the real commands. */
+export const setMountOps = (ops: Partial<MountOps> | null): void => {
+    currentOps = ops ? { ...defaultMountOps, ...ops } : defaultMountOps
+}
+
+/**
+ * Whether mount commands really run. testMode skips the real (sudo) commands
+ * because fixture disks are plain folders; a test that injects MountOps runs the
+ * full mount/unmount logic against its fakes.
+ */
+export const mountCommandsActive = (testMode: boolean): boolean => !testMode || currentOps !== defaultMountOps
+
+export const mountPointOf = (device: string): string => `${disksRoot()}/${device}`
+
+// ── Mounting ────────────────────────────────────────────────────────────────
+
+export type MountCheck =
+    | { state: 'free' }                                  // nothing there: mount
+    | { state: 'mounted' }                               // this device is already mounted at its target
+    | { state: 'targetBusy', mounts: MountEntry[] }      // something else is mounted at the target
+    | { state: 'deviceElsewhere', mounts: MountEntry[] } // this device is mounted somewhere else
+
+/**
+ * Check, before mounting, what findmnt says about the device and its target.
+ * Looks at both the target and the source, for every filesystem type.
+ */
+export const checkMountState = async (device: string, ops: MountOps = mountOps()): Promise<MountCheck> => {
+    const target = mountPointOf(device)
+    const source = `/dev/${device}`
+    const mounts = await ops.listMounts()
+    const atTarget = mounts.filter(m => m.target === target)
+    const ofSource = mounts.filter(m => m.source === source)
+    if (atTarget.length > 0) {
+        return atTarget.every(m => m.source === source)
+            ? { state: 'mounted' }
+            : { state: 'targetBusy', mounts: atTarget }
+    }
+    if (ofSource.length > 0) return { state: 'deviceElsewhere', mounts: ofSource }
+    // Not in the mount table, but still a mount point (e.g. a bind mount findmnt
+    // shows with another source path): refuse as well.
+    if (await ops.isMountPoint(target)) return { state: 'targetBusy', mounts: [] }
+    return { state: 'free' }
+}
+
+export type MountResult =
+    | { ok: true, alreadyMounted: boolean, fsUuid: string | null }
+    | { ok: false, message: string }
+
+/**
+ * Mount /dev/<device> on <disksRoot>/<device> unless it is already mounted there.
+ * Never mounts a second time and never mounts onto an existing mount point.
+ * Returns the filesystem UUID (lsblk -no UUID) for Disk.unmountError.
+ */
+export const safeMount = async (device: string, ops: MountOps = mountOps()): Promise<MountResult> => {
+    const target = mountPointOf(device)
+    const check = await checkMountState(device, ops)
+    const describe = (ms: MountEntry[]) => ms.map(m => `${m.source} on ${m.target} (${m.fstype})`).join(', ')
+    if (check.state === 'targetBusy') {
+        return { ok: false, message: `Refusing to mount /dev/${device}: ${target} is already a mount point${check.mounts.length ? ` (${describe(check.mounts)})` : ''}` }
+    }
+    if (check.state === 'deviceElsewhere') {
+        return { ok: false, message: `Refusing to mount /dev/${device} on ${target}: it is already mounted (${describe(check.mounts)})` }
+    }
+    const alreadyMounted = check.state === 'mounted'
+    if (alreadyMounted) {
+        log(`Device ${device} already mounted on ${target}`)
+    } else {
+        try {
+            await ops.mkdir(device)
+            await ops.mount(device)
+        } catch (e) {
+            return { ok: false, message: `Could not mount /dev/${device} on ${target}: ${e instanceof Error ? e.message : String(e)}` }
+        }
+    }
+    const fsUuid = await ops.fsUuidOfDevice(device).catch(() => null)
+    return { ok: true, alreadyMounted, fsUuid }
+}
+
+// ── Unmounting ──────────────────────────────────────────────────────────────
+
+/**
+ * Unmount retry policy (idea#126, documented in docs/ARCHITECTURE.md):
+ * at most UMOUNT_MAX_ATTEMPTS umount calls per undock, with UMOUNT_RETRY_DELAY_MS
+ * between a failed attempt and the next one. Every successful umount removes
+ * one layer of a stacked mount, so 5 attempts cover a double mount plus three
+ * busy retries (about 3 s) for a process that is just letting go of the disk.
+ */
+export const UMOUNT_MAX_ATTEMPTS = 5
+export const UMOUNT_RETRY_DELAY_MS = 1000
+
+export type UnmountResult =
+    | { ok: true, attempts: number, removed: boolean }
+    | { ok: false, attempts: number, message: string }
+
+/**
+ * Repeat `umount` until `mountpoint -q <mountPoint>` is false, then rmdir the
+ * mount point. If it is still a mount point after UMOUNT_MAX_ATTEMPTS, nothing
+ * is removed and the result says why. Never rm -fr.
+ */
+export const unmountAndRemove = async (
+    device: string,
+    ops: MountOps = mountOps(),
+    maxAttempts = UMOUNT_MAX_ATTEMPTS,
+    retryDelayMs = UMOUNT_RETRY_DELAY_MS,
+): Promise<UnmountResult> => {
+    const mountPoint = mountPointOf(device)
+    let attempts = 0
+    let lastError = ''
+    while (await ops.isMountPoint(mountPoint)) {
+        if (attempts >= maxAttempts) {
+            return {
+                ok: false, attempts,
+                message: `${mountPoint} is still mounted after ${attempts} umount attempts${lastError ? `: ${lastError}` : ''}`,
+            }
+        }
+        attempts++
+        try {
+            await ops.umount(device)
+            log(`umount ${mountPoint}: attempt ${attempts} removed one mount`)
+        } catch (e: any) {
+            lastError = (e?.stderr || e?.message || String(e)).toString().trim()
+            log(`umount ${mountPoint}: attempt ${attempts} failed: ${lastError}`)
+            if (attempts < maxAttempts) await sleep(retryDelayMs)
+        }
+    }
+    if (!(await fs.pathExists(mountPoint))) return { ok: true, attempts, removed: false }
+    await ops.rmdir(mountPoint)
+    return { ok: true, attempts, removed: true }
+}
+
+// ── Startup cleanup ─────────────────────────────────────────────────────────
+
+/**
+ * Engine startup (idea#126): clear every Disk.unmountError recorded by this
+ * Engine unless the same filesystem is still mounted at its mountPoint.
+ *   - mountPoint not mounted (findmnt -no UUID gives nothing) → cleared
+ *   - another filesystem mounted there (UUID differs from fsUuid; device names
+ *     get reused) → cleared
+ *   - the same filesystem still mounted there (same UUID) → kept
+ *   - fsUuid unknown (null) and something is still mounted there → kept, since
+ *     it cannot be ruled out that it is the same disk
+ * Errors recorded by other Engines are never touched.
+ * Returns the ids of the disks whose error was cleared.
+ */
+export const clearStaleUnmountErrors = async (
+    storeHandle: DocHandle<Store>,
+    engineId: EngineID,
+    ops: MountOps = mountOps(),
+): Promise<string[]> => {
+    const store = storeHandle.doc()
+    if (!store) return []
+    const toClear: string[] = []
+    for (const [diskId, disk] of Object.entries(store.diskDB ?? {})) {
+        const err = (disk as Disk).unmountError
+        if (!err || err.engineId !== engineId) continue
+        const uuidNow = await ops.fsUuidAt(err.mountPoint).catch(() => null)
+        const stillSameFs = uuidNow !== null && (err.fsUuid === null || uuidNow === err.fsUuid)
+        if (stillSameFs) {
+            log(`Keeping the unmount error of disk ${diskId}: ${err.mountPoint} is still mounted (UUID ${uuidNow})`)
+        } else {
+            toClear.push(diskId)
+        }
+    }
+    if (toClear.length) {
+        storeHandle.change(doc => {
+            for (const id of toClear) {
+                const d = doc.diskDB[id as DiskID]
+                if (d && d.unmountError) d.unmountError = null
+            }
+        })
+        log(`Cleared stale unmount errors for disks: ${toClear.join(', ')}`)
+    }
+    return toClear
+}
+
+```
+
+## File: src/monitors/storeMonitor.ts
+```typescript
+import { DocHandle } from '@automerge/automerge-repo'
+import { Store } from '../data/Store.js'
+import { log } from '../utils/utils.js'
+import { EngineID, InstanceID } from '../data/CommonTypes.js'
+import { handleCommand } from '../utils/commandUtils.js'
+import { commands } from '../data/Commands.js';
+import { localEngineId } from '../data/Engine.js';
+import { CommandLogStore } from '../data/CommandLogStore.js';
+
+
+
+const engineSetMonitor = (patch, storeHandle): boolean => {
+    if (patch.action === 'put' &&  // Since we never change the object value, we know that 'put' means an addition 
+        patch.path.length === 2 &&
+        patch.path[0] === 'engineDB' &&
+        typeof patch.path[1] === 'string' // engineId
+    ) {
+        const engineId = patch.path[1].toString() as EngineID
+        log(`New engine added with ID: ${engineId}`)
+        return true
+    } else {
+        return false
+    }
+}
+
+// Track which commands are currently in-flight, keyed by engineId + command string.
+// Commands for different instances can execute concurrently; commands for the same
+// engine still execute serially (queue[0] is always processed next).
+const _currentlyExecuting = new Set<string>()
+
+const engineCommandsMonitor = (patch, storeHandle): boolean => {
+    const isCommandPath =
+        patch.path.length >= 3 &&
+        patch.path[0] === 'engineDB' &&
+        typeof patch.path[1] === 'string' &&
+        patch.path[2] === 'commands'
+
+    if (!isCommandPath) return false
+
+    const engineId = patch.path[1] as EngineID
+    if (engineId !== localEngineId) return true
+
+    const doc = storeHandle.doc()
+    const queue = doc?.engineDB[engineId as any]?.commands as string[] | undefined
+    if (!queue?.length) return true
+
+    const command = queue[0]
+    if (!command || !command.includes(' ')) return true
+
+    // Use engineId+command as the dedup key so a new command with the same text
+    // (but on a different instance) can still run concurrently.
+    const key = `${engineId}:${command}`
+    if (_currentlyExecuting.has(key)) return true
+
+    _currentlyExecuting.add(key)
+    log(`Processing command for engine ${engineId}: ${command}`)
+    const cmdLogHandle = (storeHandle as any).__commandLogHandle ?? null
+    handleCommand(commands, storeHandle, 'engine', command, cmdLogHandle).then(() => {
+        _currentlyExecuting.delete(key)
+        storeHandle.change(doc => {
+            const eng = doc.engineDB[engineId as any]
+            if (eng) (eng.commands as any[]).splice(0, 1)
+        })
+    })
+    return true
+}
+
+const engineLastRunMonitor = (patch, storeHandle): boolean => {
+    if (patch.action === 'put' &&
+        patch.path.length === 3 &&
+        patch.path[0] === 'engineDB' &&
+        typeof patch.path[1] === 'string' && // engineId
+        patch.path[2] === 'lastRun') {
+        const lastRun = patch.value as number
+        const engineId = patch.path[1] as EngineID
+        log(`Engine ${engineId} last run updated to: ${lastRun}`)
+        return true
+    } else {
+        return false
+    }
+}
+
+const instancesMonitor = (patch, storeHandle): boolean => {
+    if (patch.action === 'put' &&
+        patch.path.length === 3 &&
+        patch.path[0] === 'instanceDB' &&
+        typeof patch.path[1] === 'string' && // instanceId
+        patch.path[2] === 'status') {
+        const instanceId = patch.path[1] as InstanceID
+        const status = (patch.value ?? storeHandle.doc()?.instanceDB?.[instanceId]?.status) as string
+        log(`Instance ${instanceId} status changed to: ${status}`)
+        return true
+    } else {
+        return false
+    }
+}
+
+const applyUntilTrue = (functions: ((patch, storeHandle) => boolean)[], patch, storeHandle): boolean => {
+    for (const func of functions) {
+        if (func(patch, storeHandle)) {
+            return true
+        }
+    }
+    return false
+}
+
+export const enableStoreMonitor = (storeHandle: DocHandle<Store>, commandLogHandle?: DocHandle<CommandLogStore> | null): void => {
+    // Monitor for the addition or removal of engines in the store
+    storeHandle.on('change', ({ doc, patches }) => {
+        for (const patch of patches) {
+            applyUntilTrue([engineSetMonitor, engineCommandsMonitor, engineLastRunMonitor, instancesMonitor], patch, storeHandle)
+        }
+    })
+
+    // Inject commandLogHandle into the monitor closure so engineCommandsMonitor
+    // can pass it through to handleCommand
+    ;(storeHandle as any).__commandLogHandle = commandLogHandle ?? null
+
+    // On startup, process any commands already queued for this engine.
+    // The storeMonitor only fires on new patches, so commands written before
+    // this engine started (or while it was offline) would otherwise be silently ignored.
+    // Replay any commands already in the queue at startup.
+    const startupStore = storeHandle.doc()
+    const startupCmds = [...((startupStore?.engineDB[localEngineId]?.commands as string[]) ?? [])]
+    if (startupCmds.length) {
+        log(`Replaying ${startupCmds.length} pending command(s) from queue on startup`)
+        ;(async () => {
+            for (const cmd of startupCmds) {
+                const startupKey = `${localEngineId}:${cmd}`
+                _currentlyExecuting.add(startupKey)
+                await handleCommand(commands, storeHandle, 'engine', cmd, commandLogHandle)
+                _currentlyExecuting.delete(startupKey)
+                storeHandle.change(doc => {
+                    const eng = doc.engineDB[localEngineId as any]
+                    if (eng) (eng.commands as any[]).splice(0, 1)
+                })
+            }
+        })()
+    }
+}
+```
+
+## File: src/monitors/timeMonitor.ts
+```typescript
+
+import { doc } from 'lib0/dom.js'
+import { Timestamp } from '../data/CommonTypes.js'
+import { inspectEngine } from '../data/Engine.js'
+import { Store, getLocalEngine } from '../data/Store.js'
+import { log, contains, deepPrint } from '../utils/utils.js'
+
+export const enableTimeMonitor = (interval, callback) => {
+    setInterval(callback, interval)
+}
+
+export const logTimeCallback = () => {
+    log(`Time callback at ${new Date()}`)
+}
+
+// export const generateRandomArrayPopulationCallback = (apps: Array<string>) => {
+//     // Randomly populate and depopulate the apps array with app names every 5 seconds. 
+//     // Choose from a list of app names such as "app1", "app2", "app3", "app4", "app5" etc.
+//     // The array should contain between 0 and 5 app names at any given time.
+//     // Make sure that any app name only appears once in the array.
+//     // Do it
+//     const appNames = ['app1', 'app2', 'app3', 'app4', 'app5']
+//     // If the array is empty, add a random app name
+//     // If the array is full, remove a random app name
+//     // If the array is not empty and not full, randomly decide whether to add or remove an app name and only select an app name that is not already in the array
+//     return () => {
+//         if (apps.length === 0) {
+//             apps.insert(0, [appNames[Math.floor(Math.random() * appNames.length)]])
+//         } else if (apps.length === 5) {
+//             apps.delete(Math.floor(Math.random() * 5))
+//         } else {
+//             if (Math.random() < 0.5) {
+//                 const randomAppName = appNames[Math.floor(Math.random() * appNames.length)]
+//                 if (!contains(apps, randomAppName)) {
+//                     apps.insert(0, [randomAppName])
+//                 }
+//             } else {
+//                 apps.delete(Math.floor(Math.random() * apps.length))
+//             }
+//         }
+//     }
+// }
+
+
+// const generateRandomArrayModification = (apps: Array<object>) => {
+//     apps.insert(0, [{ name: 'app1' }, { name: 'app2' }, { name: 'app3' }, { name: 'app4' }, { name: 'app5' }])
+//     log(`Initialising apps array with app names`)
+//     // Create a function that first removes any x letters from all app names and then 
+//     // randomly puts a capital x behind the name of an app in the apps array 
+//     // Do it
+//     return () => {
+//         apps.forEach((app: { name: string }, index: number) => {
+//             app.name = app.name.replace('X', '')
+//             if (Math.random() < 0.5) {
+//                 app.name = app.name + 'X'
+//             }
+//         })
+//         was-console-log(`Deep change to apps: ${JSON.stringify(apps.toArray())}`)
+//     }
+// }
+
+// export const changeTest = (store:Store) => {
+//     const localEngine = getLocalEngine(store)
+//     if (localEngine && localEngine.lastBooted) {
+//         localEngine.lastBooted = localEngine.lastBooted + 1 as Timestamp
+//         log(`CHANGING ENGINE LASTBOOTED TO ${localEngine.lastBooted}`)
+//         log(deepPrint(localEngine))
+//     } else {
+//         log(`CHANGETEST: Engine not yet available ********`)
+//     }
+// }
+
+let runs = 0
+
+export const generateHeartBeat = (storeHandle) => {
+    runs++
+    storeHandle.change(doc => {
+        const lastRun = (new Date()).getTime() as Timestamp
+        log(`UPDATING ENGINE LASTRUN TO ${lastRun}`)
+        //log(`This is the doc to change: ${deepPrint(doc, 2)}`)
+        const localEngine = getLocalEngine(doc)
+        localEngine.lastRun = lastRun
+        //inspectEngine(store, localEngine)
+    })
+} 
+```
+
+## File: src/monitors/usbDeviceMonitor.ts
+```typescript
+import chokidar from 'chokidar'
+import { getKeys, log, uuid } from '../utils/utils.js'
+import { DiskMeta, readHardwareId, readMetaUpdateId, writeMetaFile } from '../data/Meta.js';
+import { $, fs, YAML, chalk } from 'zx'
+
+$.verbose = false;
+import { Disk, clearDuplicateDiskRecords, createOrUpdateDisk, isSystemDiskRecord, processDisk } from '../data/Disk.js'
+import { findDiskByDevice, findDisksByDevice, Store, getDisksOfEngine, getLocalEngine } from '../data/Store.js'
+import { DeviceName, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../data/CommonTypes.js'
+
+import { Instance, Status, stopInstance } from '../data/Instance.js';
+import { config, disksRoot, skipMetaWrite } from '../data/Config.js'
+import { DocHandle } from '@automerge/automerge-repo';
+import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js';
+import { runWithTrace } from '../utils/CommandLogger.js';
+import { recordDiskDetectionFailure, errorMessage } from './diskDetection.js';
+import { safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointOf } from './mounts.js';
+
+/**
+ * Filesystem UUID of each mounted device, recorded at mount time (or when an
+ * existing mount is found) with lsblk -no UUID. Used for Disk.unmountError
+ * (idea#126).
+ */
+const mountedFsUuids = new Map<string, string | null>()
+
+/**
+ * Pretend disks created by the test harness use names that real hardware never
+ * produces (e.g. `idea-test-1`). Only an Engine in testMode accepts them.
+ */
+export const TEST_DEVICE_PATTERN = /^idea-test-[0-9]+$/
+export const isTestDeviceName = (device: string | undefined | null): boolean =>
+    !!device && TEST_DEVICE_PATTERN.test(device)
+
+/**
+ * Options for the watcher on the udev watch folder (/dev/engine).
+ *
+ * udev creates /dev/engine/<device> as a symlink to /dev/<device> (root:disk 0660).
+ * The Engine runs as pi, which is not in the disk group, so following the links
+ * made chokidar put an inotify watch on the block device itself and fail with
+ * EACCES (idea#110). With followSymlinks off, chokidar only watches the folder and
+ * reports links being added and removed; mounting goes through sudo, so the
+ * Engine never needs to open the block device. Do not add pi to the disk group
+ * instead: that gives raw read access to every drive.
+ */
+export const DEVICE_WATCH_OPTIONS = { persistent: true, followSymlinks: false } as const
+
+/** Watch the udev watch folder for device links (see DEVICE_WATCH_OPTIONS). */
+export const watchDeviceFolder = (watchDir: string) => chokidar.watch(watchDir, { ...DEVICE_WATCH_OPTIONS })
+
+export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
+
+    // Detection relies on the udev rule 90-docking.rules (repaired by boot.sh and
+    // verified by the startup self-check in diskDetection.ts, idea#82). A fallback
+    // watcher (/dev/disk/by-label, dmesg) was ruled out for now: see
+    // https://github.com/koenswings/idea/issues/82 and /issues/46.
+
+    const store: Store = storeHandle.doc()
+    const localEngine = getLocalEngine(store)
+
+    if (!localEngine) {
+        log(`No local engine found in the store`)
+        throw new Error(`No local engine found in the store`)
+    }
+
+    // Detect the root partition (e.g. sda2) at startup so we can:
+    //   - register it as a system disk
+    //   - skip the whole-disk parent (e.g. sda) and the boot partition (e.g. sda1)
+    // findmnt reads procfs — safe to run in all modes, no sudo needed.
+    let systemDevice: DeviceName | null = null
+    let systemBootDevice: DeviceName | null = null   // e.g. 'sda1' — the boot partition to skip
+    try {
+        const rootSource = (await $`findmnt -n -o SOURCE /`).stdout.trim()
+        // rootSource is e.g. /dev/sda2 — strip the /dev/ prefix
+        const rootDev = rootSource.replace('/dev/', '') as DeviceName
+        if (rootDev.match(/^sd[a-z][0-9]+$/)) {
+            systemDevice = rootDev
+            // Boot partition is parent (strip trailing digits) + '1', e.g. sda2 → sda1
+            const parentDev = rootDev.replace(/[0-9]+$/, '')
+            systemBootDevice = (parentDev + '1') as DeviceName
+            log(`System disk detected: root=${systemDevice}, boot=${systemBootDevice}`)
+        }
+    } catch (e) {
+        log(`Could not detect system device via findmnt: ${e}`)
+    }
+
+    const validDevice = function (device: string): boolean {
+        // Test-only device names (idea-test-N) are accepted only in testMode.
+        // A live Engine (testMode off) ignores them, so a pretend disk can never
+        // be picked up and mounted by a live Engine (idea#105).
+        if (isTestDeviceName(device)) return config.settings.testMode
+        // Check if the device begins with "sd", is then followed by a letter and ends with the number 2
+        // We need the m flag - see https://regexr.com/7rvpq 
+        return device && (device.match(/^sd[a-z][1-2]$/m) || device.match(/^sd[a-z]$/m)) ? true : false
+    }
+
+    const addDevice = async function (path: string) {
+        log(`A disk on device ${path} has been added`)
+        const device = path.split('/').pop() as DeviceName
+
+        if (validDevice(device)) {
+            log(`The disk on device ${device} has a valid device name`)
+
+            // Skip whole-disk entries (e.g. sda, sdb) — raw block devices with no
+            // filesystem; never directly mountable.
+            if (device.match(/^sd[a-z]$/)) {
+                log(`Device ${device} is a whole-disk entry — skipping`)
+                return
+            }
+
+            // Skip the OS boot partition (e.g. sda1 on most Pis, but derived from
+            // the actual root device so it works regardless of disk letter).
+            if (systemBootDevice && device === systemBootDevice) {
+                log(`Device ${device} is the OS boot partition — skipping`)
+                return
+            }
+
+            log(`Processing the disk on device ${device}`)
+            try {
+                // System disk (root partition): already mounted at /, no mount needed.
+                // Read identity from /META.yaml and register as a system disk.
+                // Skip if IDEA_SYSTEM_DISK_SKIP=true (used by Kit's test harness to avoid
+                // conflicts when a second engine runs alongside the production instance).
+                if (systemDevice && device === systemDevice) {
+                    if (config.settings.systemDiskSkip) {
+                        log(`Device ${device} is the system disk — skipping registration (IDEA_SYSTEM_DISK_SKIP=true)`)
+                        return
+                    }
+                    log(`Device ${device} is the system disk (root partition) — registering as system disk`)
+                    try {
+                        const meta = await readMetaUpdateId()  // reads /META.yaml, no device arg
+                        const disk: Disk = createOrUpdateDisk(storeHandle, localEngine.id, device, meta.diskId, 'System Disk' as DiskName, meta.created)
+                        // The marker the Console gates eject on, set with the device (idea#152)
+                        storeHandle.change(doc => {
+                            const d = doc.diskDB[disk.id]
+                            if (d) d.diskTypes = ['system']
+                        })
+                        await processDisk(storeHandle, disk)
+                    } catch (e) {
+                        log(`Error processing system disk: ${e}`)
+                        recordDiskDetectionFailure('readMeta', `Could not read /META.yaml of the system disk on ${device}: ${errorMessage(e)}`, { device })
+                    }
+                    return
+                }
+
+                if (!mountCommandsActive(config.settings.testMode)) {
+                    log(`testMode: skipping mount for device ${device} — fixture expected at ${disksRoot()}/${device}`)
+                } else {
+                    // findmnt-based check by target and source, for every filesystem
+                    // type; never mounts twice or onto an existing mount point (idea#126)
+                    const result = await safeMount(device)
+                    if (!result.ok) {
+                        recordDiskDetectionFailure('mount', result.message, { device })
+                        return
+                    }
+                    mountedFsUuids.set(device, result.fsUuid)
+                    log(result.alreadyMounted ? `Device ${device} already mounted` : `Device ${device} has been successfully mounted`)
+                }
+
+                let meta: DiskMeta
+                if (fs.existsSync(`${disksRoot()}/${device}/META.yaml`)) {
+                    log(`Found a META file on device ${device}. This disk has been processed by the system before.`)
+                    try {
+                        meta = await readMetaUpdateId(device)
+                        const disk: Disk = createOrUpdateDisk(storeHandle, localEngine.id, device, meta.diskId, meta.diskName, meta.created)
+                        await processDisk(storeHandle, disk)
+                    } catch (error) {
+                        log('Error processing the META file on the disk: ' + error)
+                        recordDiskDetectionFailure('readMeta', `Could not process META.yaml on ${device}: ${errorMessage(error)}`, { device })
+                    }
+                } else {
+                    // Before creating a new disk entry, check if a disk is already
+                    // registered for this device on THIS engine in the store. This prevents
+                    // spurious empty-disk entries when addDevice fires for a device that's
+                    // already docked (e.g. during docker compose up -d Recreate cycles).
+                    // Scoped to localEngine.id to avoid false matches on other engines' disks
+                    // in the shared CRDT store (e.g. all Pis having sda2 as the root device).
+                    const existingDisk = findDiskByDevice(storeHandle.doc(), device as DeviceName, localEngine.id)
+                    if (existingDisk) {
+                        log(`Device ${device} already has a registered disk (${existingDisk.id}) on this engine — skipping new disk creation`)
+                        return
+                    }
+                    log('Could not find a META file. Creating one now.')
+                    const diskId = await readHardwareId(device) as DiskID
+                    // The disk name should be the name of the volume if available, otherwise 'Unnamed Disk'
+                    let diskName: DiskName = 'Unnamed Disk' as DiskName
+                    try {
+                        const volumeNameOutput = await $`lsblk -no LABEL /dev/${device}`
+                        const volumeName = volumeNameOutput.stdout.trim()
+                        // Check if it is a valid volume name (not empty) - it should also not have any newlines
+                        if (volumeName && volumeName.length > 0 && !volumeName.includes('\n')) {
+                            diskName = volumeName as DiskName
+                        }
+                    } catch (e) {
+                        log(`Error reading volume name for device ${device}: ${e}`)
+                    }
+                    meta = {
+                        diskId: diskId ? diskId : uuid() as DiskID,
+                        isHardwareId: !!diskId,
+                        diskName: diskName,
+                        created: Date.now() as Timestamp,
+                        lastDocked: Date.now() as Timestamp
+                    }
+                    // Persist the identity on the disk (idea#121). Without this every
+                    // dock generated a new diskId (when there is no hardware serial)
+                    // and left an orphan diskDB entry behind. Under /disks the write goes through
+                    // sudo tee (11-engine-files). A failed write (read-only
+                    // mount, sudoers entry missing) is recorded and the disk is still registered.
+                    const metaPath = `${disksRoot()}/${device}/META.yaml`
+                    if (skipMetaWrite()) {
+                        log(`Not writing ${metaPath} (skipMetaWrite)`)
+                    } else {
+                        try {
+                            await writeMetaFile(meta, metaPath)
+                        } catch (e) {
+                            const idNote = meta.isHardwareId ? 'its id comes from the hardware serial' : 'it will get a new id on its next dock'
+                            recordDiskDetectionFailure('writeMeta', `Could not write META.yaml on ${device} (${idNote}); registering the disk anyway: ${errorMessage(e)}`, { device, diskId: meta.diskId })
+                        }
+                    }
+                    const disk: Disk = createOrUpdateDisk(storeHandle, localEngine.id, device, meta.diskId, meta.diskName, meta.created)
+                    await processDisk(storeHandle, disk)
+                }
+            } catch (e) {
+                log(`Error processing device ${device}`)
+                log(e)
+                recordDiskDetectionFailure('dock', `Could not process the disk on ${device}: ${errorMessage(e)}`, { device })
+            }
+        } else {
+            log(`The disk on device ${device} is not on a supported device name`)
+        }
+    }
+
+    const removeDevice = async (path: string) => {
+        const device = path.split('/').pop()
+        if (validDevice(device!)) {
+            log(`Processing the removal of USB device ${device}`)
+            // Every record on the device, not just the first (idea#152)
+            const undocked = await undockAllOnDevice(storeHandle, localEngine.id, device as DeviceName)
+            if (undocked.length === 0) {
+                log(`No disk found on ${device}`)
+            }
+        } else {
+            log(`Non-USB device ${device} has been removed`)
+        }
+    }
+
+    if (!config.settings.isDev && !config.settings.testMode) {
+        try {
+            log(`Cleaning up the ${disksRoot()}/old folder`)
+            // Remove the folder itself, not old/*: the shell would expand the glob
+            // before sudo runs, and the Engine's sudoers file only allows this exact
+            // command (idea#80). /disks/old is recreated with mkdir -p when needed.
+            await $`sudo rm -fr ${disksRoot()}/old`
+        } catch (e) {
+            log(`Error cleaning up the ${disksRoot()}/old folder`)
+            log(e)
+        }
+    }
+
+    const engineWatchDir = process.env.IDEA_WATCH_DIR || '/dev/engine'
+    const actualDevices = (config.settings.isDev || config.settings.testMode) ? [] : (await $`ls ${engineWatchDir}`).toString().split('\n').filter(device => validDevice(device))
+    log(`Actual devices: ${actualDevices}`)
+
+    log(`Removing from the network database disks that were attached before the current boot but are no longer attached now...`)
+
+    const storedDisks = getDisksOfEngine(store, localEngine)
+    if (storedDisks.length !== 0) {
+        log(`The engine object shows previously mounted disks: ${storedDisks.map(d => d.id)}`)
+        const storedDevices = storedDisks.map(disk => disk.device).filter((device): device is DeviceName => device !== undefined && device !== null)
+        log(`Which were on devices: ${storedDevices}`)
+
+        for (let device of [...new Set(storedDevices)]) {
+            const disks = findDisksByDevice(storeHandle.doc(), device, localEngine.id)
+            if (disks.length === 0) continue
+            // Never undock the system disk based on /dev/engine listing —
+            // the root partition is always present and /dev/engine may not
+            // be populated yet (e.g. tmpfiles.d race) or may be empty in
+            // testMode. System disk presence is guaranteed by the OS itself.
+            const systemDisk = disks.find(d => d.diskTypes?.includes('system'))
+            if (systemDisk) {
+                log(`Skipping undock of system disk ${systemDisk.id} on device ${device} — system disk is always present`)
+                continue
+            }
+            if (!actualDevices.includes(device)) {
+                log(`Removing disk from previously mounted device ${device}`)
+                const undocked = await undockAllOnDevice(storeHandle, localEngine.id, device)
+                log(`Disk(s) ${undocked.join(', ')} removed from local engine`)
+            } else {
+                // Still attached: if stale records share the device, keep the one
+                // META.yaml names (idea#152)
+                await resolveDuplicateDisksOnDevice(storeHandle, localEngine.id, device)
+            }
+        }
+    } else {
+        log(`No previous disks found in the network database`)
+    }
+
+    log(`Cleaning the mount points...`)
+    const previousMounts = (config.settings.isDev || config.settings.testMode) ? [] : (await $`ls ${disksRoot()}`).toString().split('\n').filter(device => validDevice(device))
+    log(`Previously mounted devices: ${previousMounts}`)
+    // Stale mount point folders of devices that are no longer attached. A folder
+    // that is still a mount point (by findmnt target or mountpoint -q) is left
+    // alone; an empty one is removed with rmdir, never rm -fr (idea#126).
+    for (let device of previousMounts) {
+        log(`Checking if device ${device} is still actual or mounted`)
+        if (actualDevices.includes(device)) continue
+        try {
+            const mounts = await mountOps().listMounts()
+            const mountPoint = mountPointOf(device)
+            if (mounts.some(m => m.target === mountPoint) || await mountOps().isMountPoint(mountPoint)) {
+                log(`Stale mount point ${mountPoint} is still mounted — leaving it`)
+                continue
+            }
+            log(`Cleaning up stale mount point for ${device}`)
+            await mountOps().rmdir(mountPoint)
+            log(`Device ${device} has been successfully cleaned up`)
+        } catch (e) {
+            log(`Error cleaning up the stale mount point of ${device}: ${errorMessage(e)}`)
+        }
+    }
+
+    const watchDir = process.env.IDEA_WATCH_DIR || '/dev/engine'
+    const watcher = watchDeviceFolder(watchDir)
+
+    watcher
+        .on('add', addDevice)
+        .on('unlink', removeDevice)
+        .on('error', error => recordDiskDetectionFailure('watcher', `Watcher error on ${watchDir}: ${errorMessage(error)}`, { watchDir }))
+
+    log(`Watching ${watchDir} for USB devices`)
+    return watcher
+}
+
+/**
+ * diskId from <disksRoot>/<device>/META.yaml, read only (no lastDocked update, no
+ * sudo). null when there is no readable META.yaml or it has no diskId.
+ */
+export const readMetaDiskIdOnDevice = async (device: DeviceName): Promise<DiskID | null> => {
+    const metaPath = `${disksRoot()}/${device}/META.yaml`
+    try {
+        if (!(await fs.pathExists(metaPath))) return null
+        const meta = YAML.parse(await fs.readFile(metaPath, 'utf-8'))
+        return meta?.diskId ? String(meta.diskId) as DiskID : null
+    } catch (e) {
+        log(`Could not read ${metaPath}: ${errorMessage(e)}`)
+        return null
+    }
+}
+
+/**
+ * Startup, device still attached (idea#152): when several records on this engine
+ * claim the device, keep the one whose id matches the device's META.yaml and
+ * undock the others in the store. Without a matching META.yaml nothing changes
+ * here; the dock of the device (createOrUpdateDisk) clears the others. Returns
+ * the ids that were undocked.
+ */
+export const resolveDuplicateDisksOnDevice = async (
+    storeHandle: DocHandle<Store>,
+    engineId: EngineID,
+    device: DeviceName,
+    readMetaDiskId: (device: DeviceName) => Promise<DiskID | null> = readMetaDiskIdOnDevice,
+): Promise<DiskID[]> => {
+    const disks = findDisksByDevice(storeHandle.doc(), device, engineId)
+    if (disks.length < 2) return []
+    const metaDiskId = await readMetaDiskId(device)
+    const keep = metaDiskId ? disks.find(d => String(d.id) === String(metaDiskId)) : undefined
+    if (!keep) {
+        log(`Disk records ${disks.map(d => d.id).join(', ')} share ${device} and none matches its META.yaml (${metaDiskId ?? 'none'}); the next dock of ${device} resolves them`)
+        return []
+    }
+    let cleared: DiskID[] = []
+    storeHandle.change(doc => { cleared = clearDuplicateDiskRecords(doc, engineId, device, keep.id) })
+    log(`Undocked stale disk record(s) ${cleared.join(', ')} on ${device}; kept ${keep.id} (META.yaml)`)
+    return cleared
+}
+
+/**
+ * Undock every record on this engine that claims the device (idea#152). The
+ * extra records are cleared in the store first; the first one goes through
+ * undockDisk (unmount, instances, store). Returns all undocked ids.
+ */
+export const undockAllOnDevice = async (storeHandle: DocHandle<Store>, engineId: EngineID, device: DeviceName): Promise<DiskID[]> => {
+    const disks = findDisksByDevice(storeHandle.doc(), device, engineId)
+    if (disks.length === 0) return []
+    const primary = disks[0]
+    let cleared: DiskID[] = []
+    if (disks.length > 1) {
+        storeHandle.change(doc => { cleared = clearDuplicateDiskRecords(doc, engineId, device, primary.id) })
+        log(`Undocked stale disk record(s) ${cleared.join(', ')} on ${device}`)
+    }
+    await undockDisk(storeHandle, primary)
+    return [primary.id, ...cleared]
+}
+
+export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
+    const store: Store = storeHandle.doc()
+    const device = disk.device
+    if (!device) {
+        log(`Disk ${disk.id} is not mounted on any device. Nothing to undock.`)
+        return
+    }
+    if (await isSystemDiskRecord(disk)) {
+        log(`Disk ${disk.id} on ${device} is this Pi's system disk — never undocked`)
+        return
+    }
+    try {
+        // The store is updated whatever happens to the unmount below (idea#126)
+        storeHandle.change(doc => {
+            const dsk = doc.diskDB[disk.id]
+            if (dsk) {
+                dsk.dockedTo = null
+                dsk.device = null
+                dsk.diskTypes = []
+                dsk.backupConfig = null
+            }
+        })
+        // Stop all instances of the disk and move them to the 'Undocked' state
+        const instancesOnDisk = Object.values(store.instanceDB).filter(instance => String(instance.storedOn) === String(disk.id));
+        for (const instance of instancesOnDisk) {
+            const cmdLogHandle = getCommandLogHandle()
+            const traceId = crypto.randomUUID()
+            const traceCtx = { traceId, command: 'stopInstance', args: JSON.stringify({ instanceName: instance.name, diskId: disk.id, reason: 'disk-undocked' }) }
+            if (cmdLogHandle) addTrace(cmdLogHandle, { traceId, command: 'stopInstance', args: traceCtx.args, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
+            try {
+                await runWithTrace(traceCtx, () => stopInstance(storeHandle, instance, disk, 'disk-undocked'))
+                if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'ok')
+            } catch (e: any) {
+                if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'error', e.message ?? String(e))
+            }
+            log(`Instance ${instance.id} stopped`)
+            storeHandle.change(doc => {
+                const inst = doc.instanceDB[instance.id]
+                // Move the instance to the 'Undocked' state and clear metrics
+                if (inst) {
+                    inst.status = 'Undocked' as Status
+                    inst.metrics = null
+                }
+            })
+            log(`Instance ${instance.id} has been moved to the 'Undocked' state`)
+        }
+        // Unmount after the instances are stopped (their containers keep files on
+        // the disk open). Repeat umount until the folder is no longer a mount
+        // point, then rmdir it; never rm -fr (idea#126).
+        if (!mountCommandsActive(config.settings.testMode)) {
+            log(`testMode: skipping umount and rmdir for device ${device}`)
+        } else {
+            await unmountDisk(storeHandle, disk, device, store)
+        }
+    } catch (e) {
+        log(`Error unmounting device ${device}`)
+        log(e)
+        recordDiskDetectionFailure('undock', `Could not undock the disk on ${device}: ${errorMessage(e)}`, { device, diskId: disk.id })
+    }
+}
+
+/**
+ * Unmount a disk on undock (idea#126): unmountAndRemove() repeats umount until
+ * `mountpoint -q` is false (at most UMOUNT_MAX_ATTEMPTS), then rmdirs the mount
+ * point. On a busy unmount: a failed `diskDetection` trace (step 'undock') and
+ * Disk.unmountError { engineId, mountPoint, fsUuid, message }, for every disk
+ * type. The caller has already updated the store.
+ */
+const unmountDisk = async (storeHandle: DocHandle<Store>, disk: Disk, device: DeviceName, store: Store): Promise<void> => {
+    const mountPoint = mountPointOf(device)
+    log(`Attempting to unmount device ${device}`)
+    let result
+    try {
+        result = await unmountAndRemove(device)
+    } catch (e) {
+        // Unmounted, but the folder could not be removed (e.g. not empty): no data at risk
+        recordDiskDetectionFailure('undock', `Unmounted ${mountPoint} but could not remove the folder: ${errorMessage(e)}`, { device, diskId: disk.id, mountPoint })
+        mountedFsUuids.delete(device)
+        return
+    }
+    if (result.ok) {
+        log(`Device ${device} unmounted after ${result.attempts} umount call(s)${result.removed ? `; ${mountPoint} removed` : ''}`)
+        mountedFsUuids.delete(device)
+        return
+    }
+    const engineId = (getLocalEngine(store)?.id ?? disk.dockedTo) as EngineID
+    const fsUuid = mountedFsUuids.get(device) ?? null
+    const message = `Could not unmount ${mountPoint}: ${result.message}. Restart this Pi to release the disk.`
+    recordDiskDetectionFailure('undock', message, { device, diskId: disk.id, mountPoint, fsUuid })
+    storeHandle.change(doc => {
+        const dsk = doc.diskDB[disk.id]
+        if (dsk) dsk.unmountError = { engineId, mountPoint, fsUuid, message }
+    })
+}
+
+```
+
+## File: src/utils/CommandLogger.ts
+```typescript
+/**
+ * CommandLogger.ts
+ *
+ * Captures console output per command invocation using AsyncLocalStorage.
+ * Each command gets a unique trace context that flows automatically through
+ * every async call in its chain — no changes needed in individual commands.
+ *
+ * Usage:
+ *   1. Call initCommandLogger(handle) once at engine startup.
+ *   2. Wrap every command dispatch in runWithTrace(ctx, fn).
+ *   3. Everything inside fn() that calls console.log/info/warn/error/debug
+ *      is automatically collected into that trace's log list.
+ */
+
+import { AsyncLocalStorage } from 'async_hooks'
+import type { DocHandle } from '@automerge/automerge-repo'
+import type { CommandLogStore, LogEntry } from '../data/CommandLogStore.js'
+import { flushLogs } from '../data/CommandLogStore.js'
+
+export interface TraceContext {
+  traceId: string
+  command: string
+  args: string
+}
+
+// ── AsyncLocalStorage instance ───────────────────────────────────────────────
+
+const storage = new AsyncLocalStorage<TraceContext>()
+
+export const getActiveTrace = (): TraceContext | undefined => storage.getStore()
+
+export const runWithTrace = async <T>(
+  ctx: TraceContext,
+  fn: () => Promise<T>
+): Promise<T> => {
+  return storage.run(ctx, fn)
+}
+
+// ── Per-trace pending buffers and debounced flush ────────────────────────────
+
+const pendingBuffers = new Map<string, LogEntry[]>()
+const flushTimers    = new Map<string, ReturnType<typeof setTimeout>>()
+const FLUSH_DEBOUNCE_MS = 50
+
+let _handle: DocHandle<CommandLogStore> | null = null
+
+const scheduleFlush = (traceId: string): void => {
+  const existing = flushTimers.get(traceId)
+  if (existing) clearTimeout(existing)
+
+  const timer = setTimeout(() => {
+    flushTimers.delete(traceId)
+    const buffer = pendingBuffers.get(traceId)
+    if (buffer && buffer.length > 0 && _handle) {
+      const batch = buffer.splice(0)           // drain in-place
+      flushLogs(_handle, traceId, batch)
+    }
+  }, FLUSH_DEBOUNCE_MS)
+
+  flushTimers.set(traceId, timer)
+}
+
+/**
+ * Append a log entry to a trace's pending buffer and schedule a flush.
+ * Called from the patched console methods.
+ */
+export const appendToTrace = (traceId: string, entry: LogEntry): void => {
+  if (!pendingBuffers.has(traceId)) pendingBuffers.set(traceId, [])
+  pendingBuffers.get(traceId)!.push(entry)
+  scheduleFlush(traceId)
+}
+
+/**
+ * Force-flush any remaining buffered entries for a trace immediately.
+ * Call this right before closeTrace so logs aren't lost on fast commands.
+ */
+export const flushTrace = async (traceId: string): Promise<void> => {
+  const timer = flushTimers.get(traceId)
+  if (timer) {
+    clearTimeout(timer)
+    flushTimers.delete(traceId)
+  }
+  const buffer = pendingBuffers.get(traceId)
+  if (buffer && buffer.length > 0 && _handle) {
+    const batch = buffer.splice(0)
+    flushLogs(_handle, traceId, batch)
+  }
+  pendingBuffers.delete(traceId)
+}
+
+// ── Console patch ────────────────────────────────────────────────────────────
+
+let _patched = false
+
+const patchConsole = (): void => {
+  if (_patched) return
+  _patched = true
+
+  const originals = {
+    log:   console.log.bind(console),
+    info:  console.info.bind(console),
+    warn:  console.warn.bind(console),
+    error: console.error.bind(console),
+    debug: console.debug.bind(console),
+  } as const
+
+  type Level = keyof typeof originals
+
+  const patch = (level: Level) => {
+    console[level] = (...args: unknown[]) => {
+      originals[level](...args)              // always write to stdout
+      const ctx = getActiveTrace()
+      if (ctx) {
+        appendToTrace(ctx.traceId, {
+          level,
+          message: args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '),
+          timestamp: Date.now(),
+        })
+      }
+    }
+  }
+
+  patch('log')
+  patch('info')
+  patch('warn')
+  patch('error')
+  patch('debug')
+}
+
+// ── Public init ──────────────────────────────────────────────────────────────
+
+/**
+ * Call once at engine startup, after the CommandLogStore doc is created.
+ * Patches console and connects the logger to the Automerge doc handle.
+ */
+export const initCommandLogger = (handle: DocHandle<CommandLogStore>): void => {
+  _handle = handle
+  patchConsole()
+}
+
+```
+
+## File: src/utils/ResourceLock.ts
+```typescript
+/**
+ * ResourceLock.ts — per-resource mutual exclusion for long-running operations
+ *
+ * Group P: Concurrent operation safety
+ *
+ * Prevents two operations from mutating the same resource simultaneously.
+ * Resources are identified by string keys (instanceId, diskId, or compound).
+ *
+ * Design:
+ *   - In-memory only — not persisted to the store. Locks are engine-local and
+ *     reset on restart (acceptable: operationDB recovery handles restart cases).
+ *   - acquire() returns false immediately if the resource is locked (non-blocking).
+ *     Callers must check and surface a 409-style error to the operator.
+ *   - All long-running commands (copyApp, moveApp, backupApp, restoreApp) acquire
+ *     locks on their affected resources before starting and release in finally{}.
+ *
+ * Resource key conventions:
+ *   - Instance-level ops: `instance:<instanceId>`
+ *   - Disk-level ops:     `disk:<diskId>`
+ *   - Multi-resource ops (e.g. copyApp): acquire both source and target instance keys
+ */
+
+import { log } from './utils.js'
+import { chalk } from 'zx'
+
+export interface LockInfo {
+    kind: string        // operation kind holding the lock
+    acquiredAt: number  // unix ms
+}
+
+class ResourceLockManager {
+    private locks = new Map<string, LockInfo>()
+
+    /**
+     * Attempt to acquire a lock on `key` for operation `kind`.
+     * Returns true if acquired, false if already locked.
+     */
+    acquire(key: string, kind: string): boolean {
+        if (this.locks.has(key)) {
+            const held = this.locks.get(key)!
+            log(chalk.yellow(`ResourceLock: '${key}' already locked by '${held.kind}' (since ${new Date(held.acquiredAt).toISOString()})`))
+            return false
+        }
+        this.locks.set(key, { kind, acquiredAt: Date.now() })
+        log(`ResourceLock: acquired '${key}' for '${kind}'`)
+        return true
+    }
+
+    /**
+     * Acquire multiple keys atomically (all-or-nothing).
+     * Returns true if all acquired, false if any were already locked.
+     * On failure, no locks are held (rolled back).
+     */
+    acquireAll(keys: string[], kind: string): boolean {
+        const acquired: string[] = []
+        for (const key of keys) {
+            if (!this.acquire(key, kind)) {
+                // Roll back already-acquired keys
+                acquired.forEach(k => this.release(k))
+                return false
+            }
+            acquired.push(key)
+        }
+        return true
+    }
+
+    /**
+     * Release a lock. Safe to call even if the key is not locked.
+     */
+    release(key: string): void {
+        if (this.locks.has(key)) {
+            this.locks.delete(key)
+            log(`ResourceLock: released '${key}'`)
+        }
+    }
+
+    /**
+     * Release multiple keys.
+     */
+    releaseAll(keys: string[]): void {
+        keys.forEach(k => this.release(k))
+    }
+
+    /**
+     * Check if a key is currently locked.
+     */
+    isLocked(key: string): boolean {
+        return this.locks.has(key)
+    }
+
+    /**
+     * Return current lock info for a key, or undefined if unlocked.
+     */
+    getLockInfo(key: string): LockInfo | undefined {
+        return this.locks.get(key)
+    }
+
+    /**
+     * Return all currently held locks (for diagnostics).
+     */
+    allLocks(): Map<string, LockInfo> {
+        return new Map(this.locks)
+    }
+}
+
+// Singleton — one lock manager per engine process
+export const resourceLock = new ResourceLockManager()
+
+// Key helpers
+export const instanceKey = (instanceId: string) => `instance:${instanceId}`
+export const diskKey = (diskId: string) => `disk:${diskId}`
+
+```
+
+## File: src/utils/cliFlags.ts
+```typescript
+/**
+ * Boolean command-line flags for build-engine (idea#146).
+ *
+ * zx's `argv` is minimist without declared booleans, so a flag can arrive as:
+ *   --argon            true
+ *   --no-argon         false
+ *   --argon=false      'false' (a string)
+ *   --argon false      'false' (a string)
+ *   (absent)           undefined
+ *
+ * The old `argv.argon || defaults.argon` could never turn off an option whose
+ * config default is true (argon, gadget). parseBoolFlag uses the flag whenever it
+ * is present and falls back to the default only when it is absent.
+ */
+const TRUE_WORDS = ['true', 'yes', 'on', '1']
+const FALSE_WORDS = ['false', 'no', 'off', '0']
+
+export const parseBoolFlag = (value: unknown, fallback: boolean): boolean => {
+    if (value === undefined || value === null) return fallback
+    if (typeof value === 'boolean') return value
+    if (typeof value === 'number') return value !== 0
+    if (typeof value === 'string') {
+        const v = value.trim().toLowerCase()
+        if (v === '') return true            // `--argon=` counts as present
+        if (TRUE_WORDS.includes(v)) return true
+        if (FALSE_WORDS.includes(v)) return false
+    }
+    // Arrays (flag given twice) and anything else: the last value wins.
+    if (Array.isArray(value) && value.length > 0) return parseBoolFlag(value[value.length - 1], fallback)
+    throw new Error(`Not a boolean flag value: ${JSON.stringify(value)} (use --flag, --no-flag or --flag=true|false)`)
+}
+
+/** Raspberry Pi models build-engine knows about. */
+export type PiModel = 'pi4' | 'pi5'
+
+export const parseModel = (value: unknown): PiModel | undefined => {
+    if (value === undefined || value === null || value === '') return undefined
+    const v = String(value).trim().toLowerCase()
+    if (v === 'pi4' || v === 'pi5') return v
+    throw new Error(`Unknown --model ${JSON.stringify(value)}; expected pi4 or pi5`)
+}
+
+/**
+ * Resolve the gadget setting for a model. USB gadget mode needs the Pi 4's DWC2
+ * USB controller; the Pi 5 has a PCIe USB controller, so gadget mode must stay off.
+ * Asking for it explicitly on a Pi 5 is an error; a config default of true is
+ * silently overridden.
+ */
+export const resolveGadget = (flag: unknown, fallback: boolean, model: PiModel | undefined): boolean => {
+    const gadget = parseBoolFlag(flag, fallback)
+    if (model === 'pi5' && gadget) {
+        if (flag !== undefined && parseBoolFlag(flag, false)) {
+            throw new Error('--gadget is not supported on a Pi 5 (PCIe USB controller); leave it out or pass --no-gadget')
+        }
+        return false
+    }
+    return gadget
+}
+
+```
+
+## File: src/utils/commandUtils.ts
+```typescript
+import { DocHandle } from "@automerge/automerge-repo";
+import { Store } from "../data/Store.js";
+import { Command, EngineID } from "../data/CommonTypes.js";
+import { ArgumentDescriptor, CommandDefinition } from "../data/CommandDefinition.js";
+import { CommandLogStore, addTrace, closeTrace, getCommandLogHandle } from "../data/CommandLogStore.js";
+import { runWithTrace, flushTrace } from "./CommandLogger.js";
+import { print } from './utils.js';
+
+
+export const handleCommand = async (
+    commands: CommandDefinition[],
+    storeHandle: DocHandle<Store> | null,
+    context: 'console' | 'engine',
+    input: string,
+    commandLogHandle?: DocHandle<CommandLogStore> | null
+): Promise<void> => {
+    const trimmedInput = input.trim();
+    const commandName = trimmedInput.split(' ')[0];
+    const command = commands.find(cmd => cmd.name === commandName);
+
+    if (!command) {
+        print(`Unknown command: ${commandName}`);
+        return;
+    }
+
+    // A variadic last arg takes all remaining tokens (see ArgumentDescriptor.variadic)
+    const lastArg = command.args[command.args.length - 1];
+    const isVariadic = lastArg?.variadic === true;
+
+    let stringArgs: string[] = [];
+    // Special case for commands that take the entire rest of the line as a single argument
+    if (command.args.length === 1 && !isVariadic) {
+        const firstSpaceIndex = trimmedInput.indexOf(' ');
+        if (firstSpaceIndex !== -1) {
+            stringArgs.push(trimmedInput.substring(firstSpaceIndex + 1));
+        }
+    } else {
+        stringArgs = trimmedInput.split(' ').slice(1).filter(arg => arg.length > 0);
+    }
+
+    // Scope checking
+    if (context === 'console' && command.scope === 'engine') {
+        print(`Error: Command '${commandName}' can only be executed on an engine. Use 'send <engineId> ${commandName} ...' to execute it remotely.`);
+        return;
+    }
+
+    if (context === 'engine' && command.scope === 'console') {
+        print(`Error: Command '${commandName}' can only be executed on a console.`);
+        return;
+    }
+
+    let args: any[];
+    try {
+        args = stringArgs.map((arg, index) => {
+            const descriptor = isVariadic && index >= command.args.length - 1 ? lastArg : command.args[index];
+            if (!descriptor) throw new Error("Too many arguments");
+            return convertToType(arg, descriptor);
+        });
+        if (args.length < command.args.length) throw new Error("Insufficient arguments");
+    } catch (error: any) {
+        console.error(`Error: ${error.message}`);
+        return;
+    }
+
+    // ── Trace setup ──────────────────────────────────────────────────────────
+    const traceId = crypto.randomUUID();
+    // Build a named args object when the CommandDefinition has arg names defined,
+    // otherwise fall back to a positional array. The Console filters traces by
+    // args['instanceName'] or args['instanceId'], so named args are required.
+    // A variadic last arg is recorded as an array of all its tokens.
+    const namedArgs: Record<string, string | string[] | null> | string[] =
+        command.args.every(a => a.name)
+            ? Object.fromEntries(command.args.map((a, i) =>
+                [a.name!, a.variadic ? stringArgs.slice(i) : stringArgs[i] ?? null]))
+            : stringArgs
+    const argsJson = JSON.stringify(namedArgs);
+    const traceCtx = { traceId, command: commandName, args: argsJson };
+
+    if (commandLogHandle) {
+        addTrace(commandLogHandle, {
+            traceId,
+            command: commandName,
+            args: argsJson,
+            startedAt: Date.now(),
+            completedAt: null,
+            status: 'running',
+            errorMessage: null,
+        });
+    }
+
+    // ── Execute inside trace context ─────────────────────────────────────────
+    try {
+        await runWithTrace(traceCtx, async () => { await command.execute(storeHandle, ...args); });
+        if (commandLogHandle) {
+            await flushTrace(traceId);
+            closeTrace(commandLogHandle, traceId, 'ok');
+        }
+    } catch (error: any) {
+        console.error(`Error: ${error.message}`);
+        if (commandLogHandle) {
+            await flushTrace(traceId);
+            closeTrace(commandLogHandle, traceId, 'error', error.message);
+        }
+    }
+}
+
+
+/**
+ * A dependency-free utility to add a command to a specific engine's command array in the store.
+ * This is used by tests and the 'send' command definition.
+ */
+export const sendCommand = (storeHandle: DocHandle<Store>, engineId: EngineID, command: Command): void => {
+    print(`Sending command '${command}' to engine ${engineId}`);
+
+    const store = storeHandle.doc();
+    if (!store?.engineDB[engineId]) {
+        console.error(`Cannot send command: Engine ${engineId} not found in store.`);
+        return;
+    }
+
+    // Trace the dispatch on the originating engine so the Console shows
+    // cross-engine commands in history (e.g. copyApp dispatching startInstance
+    // to a remote engine). This is a one-shot trace with no log lines.
+    const cmdLogHandle = getCommandLogHandle()
+    if (cmdLogHandle) {
+        const commandName = String(command).split(' ')[0]
+        const traceId = crypto.randomUUID()
+        addTrace(cmdLogHandle, {
+            traceId,
+            command: commandName,
+            args: JSON.stringify({ dispatchedTo: engineId, command: String(command) }),
+            startedAt: Date.now(),
+            completedAt: Date.now(),
+            status: 'running',
+            errorMessage: null,
+        })
+        closeTrace(cmdLogHandle, traceId, 'ok')
+    }
+
+    storeHandle.change(doc => {
+        const engine = doc.engineDB[engineId];
+        if (engine) {
+            engine.commands.push(command);
+        }
+    });
+}
+const convertToType = (str: string, descriptor: ArgumentDescriptor): any => {
+    switch (descriptor.type) {
+        case "number":
+            const num = parseFloat(str);
+            if (isNaN(num)) throw new Error("Cannot convert to number");
+            return num;
+        case "string":
+            return str;
+        case "object":
+            if (!descriptor.objectSpec) throw new Error("Object specification is missing");
+            try {
+                const obj = JSON.parse(str);
+                for (const [key, fieldSpec] of Object.entries(descriptor.objectSpec)) {
+                    if (!(key in obj)) throw new Error(`Missing key '${key}' in object`);
+                    switch (fieldSpec.type) {
+                        case 'number':
+                            const value = parseFloat(obj[key]);
+                            if (isNaN(value)) throw new Error(`Key '${key}' is not a valid number`);
+                            obj[key] = value;
+                            break;
+                        case 'string':
+                            if (typeof obj[key] !== 'string') throw new Error(`Key '${key}' is not a valid string`);
+                            break;
+                    }
+                }
+                return obj;
+            } catch {
+                throw new Error("Cannot convert to object");
+            }
+        default:
+            throw new Error("Unsupported type");
+    }
+}
+
+```
+
+## File: src/utils/nameGenerator.ts
+```typescript
+import util from 'util';
+import { Hostname } from '../data/CommonTypes.js';
+
+// Docker-style name generation
+// Inspired by
+// - https://github.com/moby/moby/blob/39f7b2b6d0156811d9683c6cb0743118ae516a11/pkg/namesgenerator/names-generator.go#L852-L863 
+// - https://github.com/subfuzion/docker-namesgenerator/blob/master/namesgenerator.js
+  
+  const adjectives = [
+    "admiring",
+          "adoring",
+          "affectionate",
+          "agitated",
+          "amazing",
+          "angry",
+          "awesome",
+          "beautiful",
+          "blissful",
+          "bold",
+          "boring",
+          "brave",
+          "busy",
+          "charming",
+          "clever",
+          "cool",
+          "compassionate",
+          "competent",
+          "condescending",
+          "confident",
+          "cranky",
+          "crazy",
+          "dazzling",
+          "determined",
+          "distracted",
+          "dreamy",
+          "eager",
+          "ecstatic",
+          "elastic",
+          "elated",
+          "elegant",
+          "eloquent",
+          "epic",
+          "exciting",
+          "fervent",
+          "festive",
+          "flamboyant",
+          "focused",
+          "friendly",
+          "frosty",
+          "funny",
+          "gallant",
+          "gifted",
+          "goofy",
+          "gracious",
+          "great",
+          "happy",
+          "hardcore",
+          "heuristic",
+          "hopeful",
+          "hungry",
+          "infallible",
+          "inspiring",
+          "intelligent",
+          "interesting",
+          "jolly",
+          "jovial",
+          "keen",
+          "kind",
+          "laughing",
+          "loving",
+          "lucid",
+          "magical",
+          "mystifying",
+          "modest",
+          "musing",
+          "naughty",
+          "nervous",
+          "nice",
+          "nifty",
+          "nostalgic",
+          "objective",
+          "optimistic",
+          "peaceful",
+          "pedantic",
+          "pensive",
+          "practical",
+          "priceless",
+          "quirky",
+          "quizzical",
+          "recursing",
+          "relaxed",
+          "reverent",
+          "romantic",
+          "sad",
+          "serene",
+          "sharp",
+          "silly",
+          "sleepy",
+          "stoic",
+          "strange",
+          "stupefied",
+          "suspicious",
+          "sweet",
+          "tender",
+          "thirsty",
+          "trusting",
+          "unruffled",
+          "upbeat",
+          "vibrant",
+          "vigilant",
+          "vigorous",
+          "wizardly",
+          "wonderful",
+          "xenodochial",
+          "youthful",
+          "zealous",
+          "zen",
+  ]
+  
+  const scientists = [
+    // Maria Gaetana Agnesi - Italian mathematician, philosopher, theologian and humanitarian. She was the first woman to write a mathematics handbook and the first woman appointed as a Mathematics Professor at a University. https://en.wikipedia.org/wiki/Maria_Gaetana_Agnesi
+    "agnesi",
+  
+    // Muhammad ibn Jābir al-Ḥarrānī al-Battānī was a founding father of astronomy. https://en.wikipedia.org/wiki/Mu%E1%B8%A5ammad_ibn_J%C4%81bir_al-%E1%B8%A4arr%C4%81n%C4%AB_al-Batt%C4%81n%C4%AB
+    "albattani",
+  
+    // Frances E. Allen, became the first female IBM Fellow in 1989. In 2006, she became the first female recipient of the ACM's Turing Award. https://en.wikipedia.org/wiki/Frances_E._Allen
+    "allen",
+  
+    // June Almeida - Scottish virologist who took the first pictures of the rubella virus - https://en.wikipedia.org/wiki/June_Almeida
+    "almeida",
+  
+    // Kathleen Antonelli, American computer programmer and one of the six original programmers of the ENIAC - https://en.wikipedia.org/wiki/Kathleen_Antonelli
+    "antonelli",
+  
+    // Archimedes was a physicist, engineer and mathematician who invented too many things to list them here. https://en.wikipedia.org/wiki/Archimedes
+    "archimedes",
+  
+    // Maria Ardinghelli - Italian translator, mathematician and physicist - https://en.wikipedia.org/wiki/Maria_Ardinghelli
+    "ardinghelli",
+  
+    // Aryabhata - Ancient Indian mathematician-astronomer during 476-550 CE https://en.wikipedia.org/wiki/Aryabhata
+    "aryabhata",
+  
+    // Wanda Austin - Wanda Austin is the President and CEO of The Aerospace Corporation, a leading architect for the US security space programs. https://en.wikipedia.org/wiki/Wanda_Austin
+    "austin",
+  
+    // Charles Babbage invented the concept of a programmable computer. https://en.wikipedia.org/wiki/Charles_Babbage.
+    "babbage",
+  
+    // Stefan Banach - Polish mathematician, was one of the founders of modern functional analysis. https://en.wikipedia.org/wiki/Stefan_Banach
+    "banach",
+  
+    // Buckaroo Banzai and his mentor Dr. Hikita perfected the "oscillation overthruster", a device that allows one to pass through solid matter. - https://en.wikipedia.org/wiki/The_Adventures_of_Buckaroo_Banzai_Across_the_8th_Dimension
+    "banzai",
+  
+    // John Bardeen co-invented the transistor - https://en.wikipedia.org/wiki/John_Bardeen
+    "bardeen",
+  
+    // Jean Bartik, born Betty Jean Jennings, was one of the original programmers for the ENIAC computer. https://en.wikipedia.org/wiki/Jean_Bartik
+    "bartik",
+  
+    // Laura Bassi, the world's first female professor https://en.wikipedia.org/wiki/Laura_Bassi
+    "bassi",
+  
+    // Hugh Beaver, British engineer, founder of the Guinness Book of World Records https://en.wikipedia.org/wiki/Hugh_Beaver
+    "beaver",
+  
+    // Alexander Graham Bell - an eminent Scottish-born scientist, inventor, engineer and innovator who is credited with inventing the first practical telephone - https://en.wikipedia.org/wiki/Alexander_Graham_Bell
+    "bell",
+  
+    // Karl Friedrich Benz - a German automobile engineer. Inventor of the first practical motorcar. https://en.wikipedia.org/wiki/Karl_Benz
+    "benz",
+  
+    // Homi J Bhabha - was an Indian nuclear physicist, founding director, and professor of physics at the Tata Institute of Fundamental Research. Colloquially known as "father of Indian nuclear programme"- https://en.wikipedia.org/wiki/Homi_J._Bhabha
+    "bhabha",
+  
+    // Bhaskara II - Ancient Indian mathematician-astronomer whose work on calculus predates Newton and Leibniz by over half a millennium - https://en.wikipedia.org/wiki/Bh%C4%81skara_II#Calculus
+    "bhaskara",
+  
+    // Sue Black - British computer scientist and campaigner. She has been instrumental in saving Bletchley Park, the site of World War II codebreaking - https://en.wikipedia.org/wiki/Sue_Black_(computer_scientist)
+    "black",
+  
+    // Elizabeth Helen Blackburn - Australian-American Nobel laureate; best known for co-discovering telomerase. https://en.wikipedia.org/wiki/Elizabeth_Blackburn
+    "blackburn",
+  
+    // Elizabeth Blackwell - American doctor and first American woman to receive a medical degree - https://en.wikipedia.org/wiki/Elizabeth_Blackwell
+    "blackwell",
+  
+    // Niels Bohr is the father of quantum theory. https://en.wikipedia.org/wiki/Niels_Bohr.
+    "bohr",
+  
+    // Kathleen Booth, she's credited with writing the first assembly language. https://en.wikipedia.org/wiki/Kathleen_Booth
+    "booth",
+  
+    // Anita Borg - Anita Borg was the founding director of the Institute for Women and Technology (IWT). https://en.wikipedia.org/wiki/Anita_Borg
+    "borg",
+  
+    // Satyendra Nath Bose - He provided the foundation for Bose–Einstein statistics and the theory of the Bose–Einstein condensate. - https://en.wikipedia.org/wiki/Satyendra_Nath_Bose
+    "bose",
+  
+    // Katherine Louise Bouman is an imaging scientist and Assistant Professor of Computer Science at the California Institute of Technology. She researches computational methods for imaging, and developed an algorithm that made possible the picture first visualization of a black hole using the Event Horizon Telescope. - https://en.wikipedia.org/wiki/Katie_Bouman
+    "bouman",
+  
+    // Evelyn Boyd Granville - She was one of the first African-American woman to receive a Ph.D. in mathematics; she earned it in 1949 from Yale University. https://en.wikipedia.org/wiki/Evelyn_Boyd_Granville
+    "boyd",
+  
+    // Brahmagupta - Ancient Indian mathematician during 598-670 CE who gave rules to compute with zero - https://en.wikipedia.org/wiki/Brahmagupta#Zero
+    "brahmagupta",
+  
+    // Walter Houser Brattain co-invented the transistor - https://en.wikipedia.org/wiki/Walter_Houser_Brattain
+    "brattain",
+  
+    // Emmett Brown invented time travel. https://en.wikipedia.org/wiki/Emmett_Brown (thanks Brian Goff)
+    "brown",
+  
+    // Linda Brown Buck - American biologist and Nobel laureate best known for her genetic and molecular analyses of the mechanisms of smell. https://en.wikipedia.org/wiki/Linda_B._Buck
+    "buck",
+  
+    // Dame Susan Jocelyn Bell Burnell - Northern Irish astrophysicist who discovered radio pulsars and was the first to analyse them. https://en.wikipedia.org/wiki/Jocelyn_Bell_Burnell
+    "burnell",
+  
+    // Annie Jump Cannon - pioneering female astronomer who classified hundreds of thousands of stars and created the system we use to understand stars today. https://en.wikipedia.org/wiki/Annie_Jump_Cannon
+    "cannon",
+  
+    // Rachel Carson - American marine biologist and conservationist, her book Silent Spring and other writings are credited with advancing the global environmental movement. https://en.wikipedia.org/wiki/Rachel_Carson
+    "carson",
+  
+    // Dame Mary Lucy Cartwright - British mathematician who was one of the first to study what is now known as chaos theory. Also known for Cartwright's theorem which finds applications in signal processing. https://en.wikipedia.org/wiki/Mary_Cartwright
+    "cartwright",
+  
+    // George Washington Carver - American agricultural scientist and inventor. He was the most prominent black scientist of the early 20th century. https://en.wikipedia.org/wiki/George_Washington_Carver
+    "carver",
+  
+    // Vinton Gray Cerf - American Internet pioneer, recognised as one of "the fathers of the Internet". With Robert Elliot Kahn, he designed TCP and IP, the primary data communication protocols of the Internet and other computer networks. https://en.wikipedia.org/wiki/Vint_Cerf
+    "cerf",
+  
+    // Subrahmanyan Chandrasekhar - Astrophysicist known for his mathematical theory on different stages and evolution in structures of the stars. He has won nobel prize for physics - https://en.wikipedia.org/wiki/Subrahmanyan_Chandrasekhar
+    "chandrasekhar",
+  
+    // Sergey Alexeyevich Chaplygin (Russian: Серге́й Алексе́евич Чаплы́гин; April 5, 1869 – October 8, 1942) was a Russian and Soviet physicist, mathematician, and mechanical engineer. He is known for mathematical formulas such as Chaplygin's equation and for a hypothetical substance in cosmology called Chaplygin gas, named after him. https://en.wikipedia.org/wiki/Sergey_Chaplygin
+    "chaplygin",
+  
+    // Émilie du Châtelet - French natural philosopher, mathematician, physicist, and author during the early 1730s, known for her translation of and commentary on Isaac Newton's book Principia containing basic laws of physics. https://en.wikipedia.org/wiki/%C3%89milie_du_Ch%C3%A2telet
+    "chatelet",
+  
+    // Asima Chatterjee was an Indian organic chemist noted for her research on vinca alkaloids, development of drugs for treatment of epilepsy and malaria - https://en.wikipedia.org/wiki/Asima_Chatterjee
+    "chatterjee",
+  
+    // David Lee Chaum - American computer scientist and cryptographer. Known for his seminal contributions in the field of anonymous communication. https://en.wikipedia.org/wiki/David_Chaum
+    "chaum",
+  
+    // Pafnuty Chebyshev - Russian mathematician. He is known fo his works on probability, statistics, mechanics, analytical geometry and number theory https://en.wikipedia.org/wiki/Pafnuty_Chebyshev
+    "chebyshev",
+  
+    // Joan Clarke - Bletchley Park code breaker during the Second World War who pioneered techniques that remained top secret for decades. Also an accomplished numismatist https://en.wikipedia.org/wiki/Joan_Clarke
+    "clarke",
+  
+    // Bram Cohen - American computer programmer and author of the BitTorrent peer-to-peer protocol. https://en.wikipedia.org/wiki/Bram_Cohen
+    "cohen",
+  
+    // Jane Colden - American botanist widely considered the first female American botanist - https://en.wikipedia.org/wiki/Jane_Colden
+    "colden",
+  
+    // Gerty Theresa Cori - American biochemist who became the third woman—and first American woman—to win a Nobel Prize in science, and the first woman to be awarded the Nobel Prize in Physiology or Medicine. Cori was born in Prague. https://en.wikipedia.org/wiki/Gerty_Cori
+    "cori",
+  
+    // Seymour Roger Cray was an American electrical engineer and supercomputer architect who designed a series of computers that were the fastest in the world for decades. https://en.wikipedia.org/wiki/Seymour_Cray
+    "cray",
+  
+    // This entry reflects a husband and wife team who worked together:
+    // Joan Curran was a Welsh scientist who developed radar and invented chaff, a radar countermeasure. https://en.wikipedia.org/wiki/Joan_Curran
+    // Samuel Curran was an Irish physicist who worked alongside his wife during WWII and invented the proximity fuse. https://en.wikipedia.org/wiki/Samuel_Curran
+    "curran",
+  
+    // Marie Curie discovered radioactivity. https://en.wikipedia.org/wiki/Marie_Curie.
+    "curie",
+  
+    // Charles Darwin established the principles of natural evolution. https://en.wikipedia.org/wiki/Charles_Darwin.
+    "darwin",
+  
+    // Leonardo Da Vinci invented too many things to list here. https://en.wikipedia.org/wiki/Leonardo_da_Vinci.
+    "davinci",
+  
+    // A. K. (Alexander Keewatin) Dewdney, Canadian mathematician, computer scientist, author and filmmaker. Contributor to Scientific American's "Computer Recreations" from 1984 to 1991. Author of Core War (program), The Planiverse, The Armchair Universe, The Magic Machine, The New Turing Omnibus, and more. https://en.wikipedia.org/wiki/Alexander_Dewdney
+    "dewdney",
+  
+    // Satish Dhawan - Indian mathematician and aerospace engineer, known for leading the successful and indigenous development of the Indian space programme. https://en.wikipedia.org/wiki/Satish_Dhawan
+    "dhawan",
+  
+    // Bailey Whitfield Diffie - American cryptographer and one of the pioneers of public-key cryptography. https://en.wikipedia.org/wiki/Whitfield_Diffie
+    "diffie",
+  
+    // Edsger Wybe Dijkstra was a Dutch computer scientist and mathematical scientist. https://en.wikipedia.org/wiki/Edsger_W._Dijkstra.
+    "dijkstra",
+  
+    // Paul Adrien Maurice Dirac - English theoretical physicist who made fundamental contributions to the early development of both quantum mechanics and quantum electrodynamics. https://en.wikipedia.org/wiki/Paul_Dirac
+    "dirac",
+  
+    // Agnes Meyer Driscoll - American cryptanalyst during World Wars I and II who successfully cryptanalysed a number of Japanese ciphers. She was also the co-developer of one of the cipher machines of the US Navy, the CM. https://en.wikipedia.org/wiki/Agnes_Meyer_Driscoll
+    "driscoll",
+  
+    // Donna Dubinsky - played an integral role in the development of personal digital assistants (PDAs) serving as CEO of Palm, Inc. and co-founding Handspring. https://en.wikipedia.org/wiki/Donna_Dubinsky
+    "dubinsky",
+  
+    // Annie Easley - She was a leading member of the team which developed software for the Centaur rocket stage and one of the first African-Americans in her field. https://en.wikipedia.org/wiki/Annie_Easley
+    "easley",
+  
+    // Thomas Alva Edison, prolific inventor https://en.wikipedia.org/wiki/Thomas_Edison
+    "edison",
+  
+    // Albert Einstein invented the general theory of relativity. https://en.wikipedia.org/wiki/Albert_Einstein
+    "einstein",
+  
+    // Alexandra Asanovna Elbakyan (Russian: Алекса́ндра Аса́новна Элбакя́н) is a Kazakhstani graduate student, computer programmer, internet pirate in hiding, and the creator of the site Sci-Hub. Nature has listed her in 2016 in the top ten people that mattered in science, and Ars Technica has compared her to Aaron Swartz. - https://en.wikipedia.org/wiki/Alexandra_Elbakyan
+    "elbakyan",
+  
+    // Taher A. ElGamal - Egyptian cryptographer best known for the ElGamal discrete log cryptosystem and the ElGamal digital signature scheme. https://en.wikipedia.org/wiki/Taher_Elgamal
+    "elgamal",
+  
+    // Gertrude Elion - American biochemist, pharmacologist and the 1988 recipient of the Nobel Prize in Medicine - https://en.wikipedia.org/wiki/Gertrude_Elion
+    "elion",
+  
+    // James Henry Ellis - British engineer and cryptographer employed by the GCHQ. Best known for conceiving for the first time, the idea of public-key cryptography. https://en.wikipedia.org/wiki/James_H._Ellis
+    "ellis",
+  
+    // Douglas Engelbart gave the mother of all demos: https://en.wikipedia.org/wiki/Douglas_Engelbart
+    "engelbart",
+  
+    // Euclid invented geometry. https://en.wikipedia.org/wiki/Euclid
+    "euclid",
+  
+    // Leonhard Euler invented large parts of modern mathematics. https://de.wikipedia.org/wiki/Leonhard_Euler
+    "euler",
+  
+    // Michael Faraday - British scientist who contributed to the study of electromagnetism and electrochemistry. https://en.wikipedia.org/wiki/Michael_Faraday
+    "faraday",
+  
+    // Horst Feistel - German-born American cryptographer who was one of the earliest non-government researchers to study the design and theory of block ciphers. Co-developer of DES and Lucifer. Feistel networks, a symmetric structure used in the construction of block ciphers are named after him. https://en.wikipedia.org/wiki/Horst_Feistel
+    "feistel",
+  
+    // Pierre de Fermat pioneered several aspects of modern mathematics. https://en.wikipedia.org/wiki/Pierre_de_Fermat
+    "fermat",
+  
+    // Enrico Fermi invented the first nuclear reactor. https://en.wikipedia.org/wiki/Enrico_Fermi.
+    "fermi",
+  
+    // Richard Feynman was a key contributor to quantum mechanics and particle physics. https://en.wikipedia.org/wiki/Richard_Feynman
+    "feynman",
+  
+    // Benjamin Franklin is famous for his experiments in electricity and the invention of the lightning rod.
+    "franklin",
+  
+    // Yuri Alekseyevich Gagarin - Soviet pilot and cosmonaut, best known as the first human to journey into outer space. https://en.wikipedia.org/wiki/Yuri_Gagarin
+    "gagarin",
+  
+    // Galileo was a founding father of modern astronomy, and faced politics and obscurantism to establish scientific truth.  https://en.wikipedia.org/wiki/Galileo_Galilei
+    "galileo",
+  
+    // Évariste Galois - French mathematician whose work laid the foundations of Galois theory and group theory, two major branches of abstract algebra, and the subfield of Galois connections, all while still in his late teens. https://en.wikipedia.org/wiki/%C3%89variste_Galois
+    "galois",
+  
+    // Kadambini Ganguly - Indian physician, known for being the first South Asian female physician, trained in western medicine, to graduate in South Asia. https://en.wikipedia.org/wiki/Kadambini_Ganguly
+    "ganguly",
+  
+    // William Henry "Bill" Gates III is an American business magnate, philanthropist, investor, computer programmer, and inventor. https://en.wikipedia.org/wiki/Bill_Gates
+    "gates",
+  
+    // Johann Carl Friedrich Gauss - German mathematician who made significant contributions to many fields, including number theory, algebra, statistics, analysis, differential geometry, geodesy, geophysics, mechanics, electrostatics, magnetic fields, astronomy, matrix theory, and optics. https://en.wikipedia.org/wiki/Carl_Friedrich_Gauss
+    "gauss",
+  
+    // Marie-Sophie Germain - French mathematician, physicist and philosopher. Known for her work on elasticity theory, number theory and philosophy. https://en.wikipedia.org/wiki/Sophie_Germain
+    "germain",
+  
+    // Adele Goldberg, was one of the designers and developers of the Smalltalk language. https://en.wikipedia.org/wiki/Adele_Goldberg_(computer_scientist)
+    "goldberg",
+  
+    // Adele Goldstine, born Adele Katz, wrote the complete technical description for the first electronic digital computer, ENIAC. https://en.wikipedia.org/wiki/Adele_Goldstine
+    "goldstine",
+  
+    // Shafi Goldwasser is a computer scientist known for creating theoretical foundations of modern cryptography. Winner of 2012 ACM Turing Award. https://en.wikipedia.org/wiki/Shafi_Goldwasser
+    "goldwasser",
+  
+    // James Golick, all around gangster.
+    "golick",
+  
+    // Jane Goodall - British primatologist, ethologist, and anthropologist who is considered to be the world's foremost expert on chimpanzees - https://en.wikipedia.org/wiki/Jane_Goodall
+    "goodall",
+  
+    // Stephen Jay Gould was was an American paleontologist, evolutionary biologist, and historian of science. He is most famous for the theory of punctuated equilibrium - https://en.wikipedia.org/wiki/Stephen_Jay_Gould
+    "gould",
+  
+    // Carolyn Widney Greider - American molecular biologist and joint winner of the 2009 Nobel Prize for Physiology or Medicine for the discovery of telomerase. https://en.wikipedia.org/wiki/Carol_W._Greider
+    "greider",
+  
+    // Alexander Grothendieck - German-born French mathematician who became a leading figure in the creation of modern algebraic geometry. https://en.wikipedia.org/wiki/Alexander_Grothendieck
+    "grothendieck",
+  
+    // Lois Haibt - American computer scientist, part of the team at IBM that developed FORTRAN - https://en.wikipedia.org/wiki/Lois_Haibt
+    "haibt",
+  
+    // Margaret Hamilton - Director of the Software Engineering Division of the MIT Instrumentation Laboratory, which developed on-board flight software for the Apollo space program. https://en.wikipedia.org/wiki/Margaret_Hamilton_(scientist)
+    "hamilton",
+  
+    // Caroline Harriet Haslett - English electrical engineer, electricity industry administrator and champion of women's rights. Co-author of British Standard 1363 that specifies AC power plugs and sockets used across the United Kingdom (which is widely considered as one of the safest designs). https://en.wikipedia.org/wiki/Caroline_Haslett
+    "haslett",
+  
+    // Stephen Hawking pioneered the field of cosmology by combining general relativity and quantum mechanics. https://en.wikipedia.org/wiki/Stephen_Hawking
+    "hawking",
+  
+    // Martin Edward Hellman - American cryptologist, best known for his invention of public-key cryptography in co-operation with Whitfield Diffie and Ralph Merkle. https://en.wikipedia.org/wiki/Martin_Hellman
+    "hellman",
+  
+    // Werner Heisenberg was a founding father of quantum mechanics. https://en.wikipedia.org/wiki/Werner_Heisenberg
+    "heisenberg",
+  
+    // Grete Hermann was a German philosopher noted for her philosophical work on the foundations of quantum mechanics. https://en.wikipedia.org/wiki/Grete_Hermann
+    "hermann",
+  
+    // Caroline Lucretia Herschel - German astronomer and discoverer of several comets. https://en.wikipedia.org/wiki/Caroline_Herschel
+    "herschel",
+  
+    // Heinrich Rudolf Hertz - German physicist who first conclusively proved the existence of the electromagnetic waves. https://en.wikipedia.org/wiki/Heinrich_Hertz
+    "hertz",
+  
+    // Jaroslav Heyrovský was the inventor of the polarographic method, father of the electroanalytical method, and recipient of the Nobel Prize in 1959. His main field of work was polarography. https://en.wikipedia.org/wiki/Jaroslav_Heyrovsk%C3%BD
+    "heyrovsky",
+  
+    // Dorothy Hodgkin was a British biochemist, credited with the development of protein crystallography. She was awarded the Nobel Prize in Chemistry in 1964. https://en.wikipedia.org/wiki/Dorothy_Hodgkin
+    "hodgkin",
+  
+    // Douglas R. Hofstadter is an American professor of cognitive science and author of the Pulitzer Prize and American Book Award-winning work Goedel, Escher, Bach: An Eternal Golden Braid in 1979. A mind-bending work which coined Hofstadter's Law: "It always takes longer than you expect, even when you take into account Hofstadter's Law." https://en.wikipedia.org/wiki/Douglas_Hofstadter
+    "hofstadter",
+  
+    // Erna Schneider Hoover revolutionized modern communication by inventing a computerized telephone switching method. https://en.wikipedia.org/wiki/Erna_Schneider_Hoover
+    "hoover",
+  
+    // Grace Hopper developed the first compiler for a computer programming language and  is credited with popularizing the term "debugging" for fixing computer glitches. https://en.wikipedia.org/wiki/Grace_Hopper
+    "hopper",
+  
+    // Frances Hugle, she was an American scientist, engineer, and inventor who contributed to the understanding of semiconductors, integrated circuitry, and the unique electrical principles of microscopic materials. https://en.wikipedia.org/wiki/Frances_Hugle
+    "hugle",
+  
+    // Hypatia - Greek Alexandrine Neoplatonist philosopher in Egypt who was one of the earliest mothers of mathematics - https://en.wikipedia.org/wiki/Hypatia
+    "hypatia",
+  
+    // Teruko Ishizaka - Japanese scientist and immunologist who co-discovered the antibody class Immunoglobulin E. https://en.wikipedia.org/wiki/Teruko_Ishizaka
+    "ishizaka",
+  
+    // Mary Jackson, American mathematician and aerospace engineer who earned the highest title within NASA's engineering department - https://en.wikipedia.org/wiki/Mary_Jackson_(engineer)
+    "jackson",
+  
+    // Yeong-Sil Jang was a Korean scientist and astronomer during the Joseon Dynasty; he invented the first metal printing press and water gauge. https://en.wikipedia.org/wiki/Jang_Yeong-sil
+    "jang",
+  
+    // Mae Carol Jemison -  is an American engineer, physician, and former NASA astronaut. She became the first black woman to travel in space when she served as a mission specialist aboard the Space Shuttle Endeavour - https://en.wikipedia.org/wiki/Mae_Jemison
+    "jemison",
+  
+    // Betty Jennings - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Jean_Bartik
+    "jennings",
+  
+    // Mary Lou Jepsen, was the founder and chief technology officer of One Laptop Per Child (OLPC), and the founder of Pixel Qi. https://en.wikipedia.org/wiki/Mary_Lou_Jepsen
+    "jepsen",
+  
+    // Katherine Coleman Goble Johnson - American physicist and mathematician contributed to the NASA. https://en.wikipedia.org/wiki/Katherine_Johnson
+    "johnson",
+  
+    // Irène Joliot-Curie - French scientist who was awarded the Nobel Prize for Chemistry in 1935. Daughter of Marie and Pierre Curie. https://en.wikipedia.org/wiki/Ir%C3%A8ne_Joliot-Curie
+    "joliot",
+  
+    // Karen Spärck Jones came up with the concept of inverse document frequency, which is used in most search engines today. https://en.wikipedia.org/wiki/Karen_Sp%C3%A4rck_Jones
+    "jones",
+  
+    // A. P. J. Abdul Kalam - is an Indian scientist aka Missile Man of India for his work on the development of ballistic missile and launch vehicle technology - https://en.wikipedia.org/wiki/A._P._J._Abdul_Kalam
+    "kalam",
+  
+    // Sergey Petrovich Kapitsa (Russian: Серге́й Петро́вич Капи́ца; 14 February 1928 – 14 August 2012) was a Russian physicist and demographer. He was best known as host of the popular and long-running Russian scientific TV show, Evident, but Incredible. His father was the Nobel laureate Soviet-era physicist Pyotr Kapitsa, and his brother was the geographer and Antarctic explorer Andrey Kapitsa. - https://en.wikipedia.org/wiki/Sergey_Kapitsa
+    "kapitsa",
+  
+    // Susan Kare, created the icons and many of the interface elements for the original Apple Macintosh in the 1980s, and was an original employee of NeXT, working as the Creative Director. https://en.wikipedia.org/wiki/Susan_Kare
+    "kare",
+  
+    // Mstislav Keldysh - a Soviet scientist in the field of mathematics and mechanics, academician of the USSR Academy of Sciences (1946), President of the USSR Academy of Sciences (1961–1975), three times Hero of Socialist Labor (1956, 1961, 1971), fellow of the Royal Society of Edinburgh (1968). https://en.wikipedia.org/wiki/Mstislav_Keldysh
+    "keldysh",
+  
+    // Mary Kenneth Keller, Sister Mary Kenneth Keller became the first American woman to earn a PhD in Computer Science in 1965. https://en.wikipedia.org/wiki/Mary_Kenneth_Keller
+    "keller",
+  
+    // Johannes Kepler, German astronomer known for his three laws of planetary motion - https://en.wikipedia.org/wiki/Johannes_Kepler
+    "kepler",
+  
+    // Omar Khayyam - Persian mathematician, astronomer and poet. Known for his work on the classification and solution of cubic equations, for his contribution to the understanding of Euclid's fifth postulate and for computing the length of a year very accurately. https://en.wikipedia.org/wiki/Omar_Khayyam
+    "khayyam",
+  
+    // Har Gobind Khorana - Indian-American biochemist who shared the 1968 Nobel Prize for Physiology - https://en.wikipedia.org/wiki/Har_Gobind_Khorana
+    "khorana",
+  
+    // Jack Kilby invented silicon integrated circuits and gave Silicon Valley its name. - https://en.wikipedia.org/wiki/Jack_Kilby
+    "kilby",
+  
+    // Maria Kirch - German astronomer and first woman to discover a comet - https://en.wikipedia.org/wiki/Maria_Margarethe_Kirch
+    "kirch",
+  
+    // Donald Knuth - American computer scientist, author of "The Art of Computer Programming" and creator of the TeX typesetting system. https://en.wikipedia.org/wiki/Donald_Knuth
+    "knuth",
+  
+    // Sophie Kowalevski - Russian mathematician responsible for important original contributions to analysis, differential equations and mechanics - https://en.wikipedia.org/wiki/Sofia_Kovalevskaya
+    "kowalevski",
+  
+    // Marie-Jeanne de Lalande - French astronomer, mathematician and cataloguer of stars - https://en.wikipedia.org/wiki/Marie-Jeanne_de_Lalande
+    "lalande",
+  
+    // Hedy Lamarr - Actress and inventor. The principles of her work are now incorporated into modern Wi-Fi, CDMA and Bluetooth technology. https://en.wikipedia.org/wiki/Hedy_Lamarr
+    "lamarr",
+  
+    // Leslie B. Lamport - American computer scientist. Lamport is best known for his seminal work in distributed systems and was the winner of the 2013 Turing Award. https://en.wikipedia.org/wiki/Leslie_Lamport
+    "lamport",
+  
+    // Mary Leakey - British paleoanthropologist who discovered the first fossilized Proconsul skull - https://en.wikipedia.org/wiki/Mary_Leakey
+    "leakey",
+  
+    // Henrietta Swan Leavitt - she was an American astronomer who discovered the relation between the luminosity and the period of Cepheid variable stars. https://en.wikipedia.org/wiki/Henrietta_Swan_Leavitt
+    "leavitt",
+  
+    // Esther Miriam Zimmer Lederberg - American microbiologist and a pioneer of bacterial genetics. https://en.wikipedia.org/wiki/Esther_Lederberg
+    "lederberg",
+  
+    // Inge Lehmann - Danish seismologist and geophysicist. Known for discovering in 1936 that the Earth has a solid inner core inside a molten outer core. https://en.wikipedia.org/wiki/Inge_Lehmann
+    "lehmann",
+  
+    // Daniel Lewin - Mathematician, Akamai co-founder, soldier, 9/11 victim-- Developed optimization techniques for routing traffic on the internet. Died attempting to stop the 9-11 hijackers. https://en.wikipedia.org/wiki/Daniel_Lewin
+    "lewin",
+  
+    // Ruth Lichterman - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Ruth_Teitelbaum
+    "lichterman",
+  
+    // Barbara Liskov - co-developed the Liskov substitution principle. Liskov was also the winner of the Turing Prize in 2008. - https://en.wikipedia.org/wiki/Barbara_Liskov
+    "liskov",
+  
+    // Ada Lovelace invented the first algorithm. https://en.wikipedia.org/wiki/Ada_Lovelace (thanks James Turnbull)
+    "lovelace",
+  
+    // Auguste and Louis Lumière - the first filmmakers in history - https://en.wikipedia.org/wiki/Auguste_and_Louis_Lumi%C3%A8re
+    "lumiere",
+  
+    // Mahavira - Ancient Indian mathematician during 9th century AD who discovered basic algebraic identities - https://en.wikipedia.org/wiki/Mah%C4%81v%C4%ABra_(mathematician)
+    "mahavira",
+  
+    // Lynn Margulis (b. Lynn Petra Alexander) - an American evolutionary theorist and biologist, science author, educator, and popularizer, and was the primary modern proponent for the significance of symbiosis in evolution. - https://en.wikipedia.org/wiki/Lynn_Margulis
+    "margulis",
+  
+    // Yukihiro Matsumoto - Japanese computer scientist and software programmer best known as the chief designer of the Ruby programming language. https://en.wikipedia.org/wiki/Yukihiro_Matsumoto
+    "matsumoto",
+  
+    // James Clerk Maxwell - Scottish physicist, best known for his formulation of electromagnetic theory. https://en.wikipedia.org/wiki/James_Clerk_Maxwell
+    "maxwell",
+  
+    // Maria Mayer - American theoretical physicist and Nobel laureate in Physics for proposing the nuclear shell model of the atomic nucleus - https://en.wikipedia.org/wiki/Maria_Mayer
+    "mayer",
+  
+    // John McCarthy invented LISP: https://en.wikipedia.org/wiki/John_McCarthy_(computer_scientist)
+    "mccarthy",
+  
+    // Barbara McClintock - a distinguished American cytogeneticist, 1983 Nobel Laureate in Physiology or Medicine for discovering transposons. https://en.wikipedia.org/wiki/Barbara_McClintock
+    "mcclintock",
+  
+    // Anne Laura Dorinthea McLaren - British developmental biologist whose work helped lead to human in-vitro fertilisation. https://en.wikipedia.org/wiki/Anne_McLaren
+    "mclaren",
+  
+    // Malcolm McLean invented the modern shipping container: https://en.wikipedia.org/wiki/Malcom_McLean
+    "mclean",
+  
+    // Kay McNulty - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Kathleen_Antonelli
+    "mcnulty",
+  
+    // Gregor Johann Mendel - Czech scientist and founder of genetics. https://en.wikipedia.org/wiki/Gregor_Mendel
+    "mendel",
+  
+    // Dmitri Mendeleev - a chemist and inventor. He formulated the Periodic Law, created a farsighted version of the periodic table of elements, and used it to correct the properties of some already discovered elements and also to predict the properties of eight elements yet to be discovered. https://en.wikipedia.org/wiki/Dmitri_Mendeleev
+    "mendeleev",
+  
+    // Lise Meitner - Austrian/Swedish physicist who was involved in the discovery of nuclear fission. The element meitnerium is named after her - https://en.wikipedia.org/wiki/Lise_Meitner
+    "meitner",
+  
+    // Carla Meninsky, was the game designer and programmer for Atari 2600 games Dodge 'Em and Warlords. https://en.wikipedia.org/wiki/Carla_Meninsky
+    "meninsky",
+  
+    // Ralph C. Merkle - American computer scientist, known for devising Merkle's puzzles - one of the very first schemes for public-key cryptography. Also, inventor of Merkle trees and co-inventor of the Merkle-Damgård construction for building collision-resistant cryptographic hash functions and the Merkle-Hellman knapsack cryptosystem. https://en.wikipedia.org/wiki/Ralph_Merkle
+    "merkle",
+  
+    // Johanna Mestorf - German prehistoric archaeologist and first female museum director in Germany - https://en.wikipedia.org/wiki/Johanna_Mestorf
+    "mestorf",
+  
+    // Maryam Mirzakhani - an Iranian mathematician and the first woman to win the Fields Medal. https://en.wikipedia.org/wiki/Maryam_Mirzakhani
+    "mirzakhani",
+  
+    // Rita Levi-Montalcini - Won Nobel Prize in Physiology or Medicine jointly with colleague Stanley Cohen for the discovery of nerve growth factor (https://en.wikipedia.org/wiki/Rita_Levi-Montalcini)
+    "montalcini",
+  
+    // Gordon Earle Moore - American engineer, Silicon Valley founding father, author of Moore's law. https://en.wikipedia.org/wiki/Gordon_Moore
+    "moore",
+  
+    // Samuel Morse - contributed to the invention of a single-wire telegraph system based on European telegraphs and was a co-developer of the Morse code - https://en.wikipedia.org/wiki/Samuel_Morse
+    "morse",
+  
+    // Ian Murdock - founder of the Debian project - https://en.wikipedia.org/wiki/Ian_Murdock
+    "murdock",
+  
+    // May-Britt Moser - Nobel prize winner neuroscientist who contributed to the discovery of grid cells in the brain. https://en.wikipedia.org/wiki/May-Britt_Moser
+    "moser",
+  
+    // John Napier of Merchiston - Scottish landowner known as an astronomer, mathematician and physicist. Best known for his discovery of logarithms. https://en.wikipedia.org/wiki/John_Napier
+    "napier",
+  
+    // John Forbes Nash, Jr. - American mathematician who made fundamental contributions to game theory, differential geometry, and the study of partial differential equations. https://en.wikipedia.org/wiki/John_Forbes_Nash_Jr.
+    "nash",
+  
+    // John von Neumann - todays computer architectures are based on the von Neumann architecture. https://en.wikipedia.org/wiki/Von_Neumann_architecture
+    "neumann",
+  
+    // Isaac Newton invented classic mechanics and modern optics. https://en.wikipedia.org/wiki/Isaac_Newton
+    "newton",
+  
+    // Florence Nightingale, more prominently known as a nurse, was also the first female member of the Royal Statistical Society and a pioneer in statistical graphics https://en.wikipedia.org/wiki/Florence_Nightingale#Statistics_and_sanitary_reform
+    "nightingale",
+  
+    // Alfred Nobel - a Swedish chemist, engineer, innovator, and armaments manufacturer (inventor of dynamite) - https://en.wikipedia.org/wiki/Alfred_Nobel
+    "nobel",
+  
+    // Emmy Noether, German mathematician. Noether's Theorem is named after her. https://en.wikipedia.org/wiki/Emmy_Noether
+    "noether",
+  
+    // Poppy Northcutt. Poppy Northcutt was the first woman to work as part of NASA’s Mission Control. http://www.businessinsider.com/poppy-northcutt-helped-apollo-astronauts-2014-12?op=1
+    "northcutt",
+  
+    // Robert Noyce invented silicon integrated circuits and gave Silicon Valley its name. - https://en.wikipedia.org/wiki/Robert_Noyce
+    "noyce",
+  
+    // Panini - Ancient Indian linguist and grammarian from 4th century CE who worked on the world's first formal system - https://en.wikipedia.org/wiki/P%C4%81%E1%B9%87ini#Comparison_with_modern_formal_systems
+    "panini",
+  
+    // Ambroise Pare invented modern surgery. https://en.wikipedia.org/wiki/Ambroise_Par%C3%A9
+    "pare",
+  
+    // Blaise Pascal, French mathematician, physicist, and inventor - https://en.wikipedia.org/wiki/Blaise_Pascal
+    "pascal",
+  
+    // Louis Pasteur discovered vaccination, fermentation and pasteurization. https://en.wikipedia.org/wiki/Louis_Pasteur.
+    "pasteur",
+  
+    // Cecilia Payne-Gaposchkin was an astronomer and astrophysicist who, in 1925, proposed in her Ph.D. thesis an explanation for the composition of stars in terms of the relative abundances of hydrogen and helium. https://en.wikipedia.org/wiki/Cecilia_Payne-Gaposchkin
+    "payne",
+  
+    // Radia Perlman is a software designer and network engineer and most famous for her invention of the spanning-tree protocol (STP). https://en.wikipedia.org/wiki/Radia_Perlman
+    "perlman",
+  
+    // Rob Pike was a key contributor to Unix, Plan 9, the X graphic system, utf-8, and the Go programming language. https://en.wikipedia.org/wiki/Rob_Pike
+    "pike",
+  
+    // Henri Poincaré made fundamental contributions in several fields of mathematics. https://en.wikipedia.org/wiki/Henri_Poincar%C3%A9
+    "poincare",
+  
+    // Laura Poitras is a director and producer whose work, made possible by open source crypto tools, advances the causes of truth and freedom of information by reporting disclosures by whistleblowers such as Edward Snowden. https://en.wikipedia.org/wiki/Laura_Poitras
+    "poitras",
+  
+    // Tat’yana Avenirovna Proskuriakova (Russian: Татья́на Авени́ровна Проскуряко́ва) (January 23 [O.S. January 10] 1909 – August 30, 1985) was a Russian-American Mayanist scholar and archaeologist who contributed significantly to the deciphering of Maya hieroglyphs, the writing system of the pre-Columbian Maya civilization of Mesoamerica. https://en.wikipedia.org/wiki/Tatiana_Proskouriakoff
+    "proskuriakova",
+  
+    // Claudius Ptolemy - a Greco-Egyptian writer of Alexandria, known as a mathematician, astronomer, geographer, astrologer, and poet of a single epigram in the Greek Anthology - https://en.wikipedia.org/wiki/Ptolemy
+    "ptolemy",
+  
+    // C. V. Raman - Indian physicist who won the Nobel Prize in 1930 for proposing the Raman effect. - https://en.wikipedia.org/wiki/C._V._Raman
+    "raman",
+  
+    // Srinivasa Ramanujan - Indian mathematician and autodidact who made extraordinary contributions to mathematical analysis, number theory, infinite series, and continued fractions. - https://en.wikipedia.org/wiki/Srinivasa_Ramanujan
+    "ramanujan",
+  
+    // Sally Kristen Ride was an American physicist and astronaut. She was the first American woman in space, and the youngest American astronaut. https://en.wikipedia.org/wiki/Sally_Ride
+    "ride",
+  
+    // Dennis Ritchie - co-creator of UNIX and the C programming language. - https://en.wikipedia.org/wiki/Dennis_Ritchie
+    "ritchie",
+  
+    // Ida Rhodes - American pioneer in computer programming, designed the first computer used for Social Security. https://en.wikipedia.org/wiki/Ida_Rhodes
+    "rhodes",
+  
+    // Julia Hall Bowman Robinson - American mathematician renowned for her contributions to the fields of computability theory and computational complexity theory. https://en.wikipedia.org/wiki/Julia_Robinson
+    "robinson",
+  
+    // Wilhelm Conrad Röntgen - German physicist who was awarded the first Nobel Prize in Physics in 1901 for the discovery of X-rays (Röntgen rays). https://en.wikipedia.org/wiki/Wilhelm_R%C3%B6ntgen
+    "roentgen",
+  
+    // Rosalind Franklin - British biophysicist and X-ray crystallographer whose research was critical to the understanding of DNA - https://en.wikipedia.org/wiki/Rosalind_Franklin
+    "rosalind",
+  
+    // Vera Rubin - American astronomer who pioneered work on galaxy rotation rates. https://en.wikipedia.org/wiki/Vera_Rubin
+    "rubin",
+  
+    // Meghnad Saha - Indian astrophysicist best known for his development of the Saha equation, used to describe chemical and physical conditions in stars - https://en.wikipedia.org/wiki/Meghnad_Saha
+    "saha",
+  
+    // Jean E. Sammet developed FORMAC, the first widely used computer language for symbolic manipulation of mathematical formulas. https://en.wikipedia.org/wiki/Jean_E._Sammet
+    "sammet",
+  
+    // Mildred Sanderson - American mathematician best known for Sanderson's theorem concerning modular invariants. https://en.wikipedia.org/wiki/Mildred_Sanderson
+    "sanderson",
+  
+    // Satoshi Nakamoto is the name used by the unknown person or group of people who developed bitcoin, authored the bitcoin white paper, and created and deployed bitcoin's original reference implementation. https://en.wikipedia.org/wiki/Satoshi_Nakamoto
+    "satoshi",
+  
+    // Adi Shamir - Israeli cryptographer whose numerous inventions and contributions to cryptography include the Ferge Fiat Shamir identification scheme, the Rivest Shamir Adleman (RSA) public-key cryptosystem, the Shamir's secret sharing scheme, the breaking of the Merkle-Hellman cryptosystem, the TWINKLE and TWIRL factoring devices and the discovery of differential cryptanalysis (with Eli Biham). https://en.wikipedia.org/wiki/Adi_Shamir
+    "shamir",
+  
+    // Claude Shannon - The father of information theory and founder of digital circuit design theory. (https://en.wikipedia.org/wiki/Claude_Shannon)
+    "shannon",
+  
+    // Carol Shaw - Originally an Atari employee, Carol Shaw is said to be the first female video game designer. https://en.wikipedia.org/wiki/Carol_Shaw_(video_game_designer)
+    "shaw",
+  
+    // Dame Stephanie "Steve" Shirley - Founded a software company in 1962 employing women working from home. https://en.wikipedia.org/wiki/Steve_Shirley
+    "shirley",
+  
+    // William Shockley co-invented the transistor - https://en.wikipedia.org/wiki/William_Shockley
+    "shockley",
+  
+    // Lina Solomonovna Stern (or Shtern; Russian: Лина Соломоновна Штерн; 26 August 1878 – 7 March 1968) was a Soviet biochemist, physiologist and humanist whose medical discoveries saved thousands of lives at the fronts of World War II. She is best known for her pioneering work on blood–brain barrier, which she described as hemato-encephalic barrier in 1921. https://en.wikipedia.org/wiki/Lina_Stern
+    "shtern",
+  
+    // Françoise Barré-Sinoussi - French virologist and Nobel Prize Laureate in Physiology or Medicine; her work was fundamental in identifying HIV as the cause of AIDS. https://en.wikipedia.org/wiki/Fran%C3%A7oise_Barr%C3%A9-Sinoussi
+    "sinoussi",
+  
+    // Betty Snyder - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Betty_Holberton
+    "snyder",
+  
+    // Cynthia Solomon - Pioneer in the fields of artificial intelligence, computer science and educational computing. Known for creation of Logo, an educational programming language.  https://en.wikipedia.org/wiki/Cynthia_Solomon
+    "solomon",
+  
+    // Frances Spence - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Frances_Spence
+    "spence",
+  
+    // Michael Stonebraker is a database research pioneer and architect of Ingres, Postgres, VoltDB and SciDB. Winner of 2014 ACM Turing Award. https://en.wikipedia.org/wiki/Michael_Stonebraker
+    "stonebraker",
+  
+    // Ivan Edward Sutherland - American computer scientist and Internet pioneer, widely regarded as the father of computer graphics. https://en.wikipedia.org/wiki/Ivan_Sutherland
+    "sutherland",
+  
+    // Janese Swanson (with others) developed the first of the Carmen Sandiego games. She went on to found Girl Tech. https://en.wikipedia.org/wiki/Janese_Swanson
+    "swanson",
+  
+    // Aaron Swartz was influential in creating RSS, Markdown, Creative Commons, Reddit, and much of the internet as we know it today. He was devoted to freedom of information on the web. https://en.wikiquote.org/wiki/Aaron_Swartz
+    "swartz",
+  
+    // Bertha Swirles was a theoretical physicist who made a number of contributions to early quantum theory. https://en.wikipedia.org/wiki/Bertha_Swirles
+    "swirles",
+  
+    // Helen Brooke Taussig - American cardiologist and founder of the field of paediatric cardiology. https://en.wikipedia.org/wiki/Helen_B._Taussig
+    "taussig",
+  
+    // Valentina Tereshkova is a Russian engineer, cosmonaut and politician. She was the first woman to fly to space in 1963. In 2013, at the age of 76, she offered to go on a one-way mission to Mars. https://en.wikipedia.org/wiki/Valentina_Tereshkova
+    "tereshkova",
+  
+    // Nikola Tesla invented the AC electric system and every gadget ever used by a James Bond villain. https://en.wikipedia.org/wiki/Nikola_Tesla
+    "tesla",
+  
+    // Marie Tharp - American geologist and oceanic cartographer who co-created the first scientific map of the Atlantic Ocean floor. Her work led to the acceptance of the theories of plate tectonics and continental drift. https://en.wikipedia.org/wiki/Marie_Tharp
+    "tharp",
+  
+    // Ken Thompson - co-creator of UNIX and the C programming language - https://en.wikipedia.org/wiki/Ken_Thompson
+    "thompson",
+  
+    // Linus Torvalds invented Linux and Git. https://en.wikipedia.org/wiki/Linus_Torvalds
+    "torvalds",
+  
+    // Youyou Tu - Chinese pharmaceutical chemist and educator known for discovering artemisinin and dihydroartemisinin, used to treat malaria, which has saved millions of lives. Joint winner of the 2015 Nobel Prize in Physiology or Medicine. https://en.wikipedia.org/wiki/Tu_Youyou
+    "tu",
+  
+    // Alan Turing was a founding father of computer science. https://en.wikipedia.org/wiki/Alan_Turing.
+    "turing",
+  
+    // Varahamihira - Ancient Indian mathematician who discovered trigonometric formulae during 505-587 CE - https://en.wikipedia.org/wiki/Var%C4%81hamihira#Contributions
+    "varahamihira",
+  
+    // Dorothy Vaughan was a NASA mathematician and computer programmer on the SCOUT launch vehicle program that put America's first satellites into space - https://en.wikipedia.org/wiki/Dorothy_Vaughan
+    "vaughan",
+  
+    // Cédric Villani - French mathematician, won Fields Medal, Fermat Prize and Poincaré Price for his work in differential geometry and statistical mechanics. https://en.wikipedia.org/wiki/C%C3%A9dric_Villani
+    "villani",
+  
+    // Sir Mokshagundam Visvesvaraya - is a notable Indian engineer.  He is a recipient of the Indian Republic's highest honour, the Bharat Ratna, in 1955. On his birthday, 15 September is celebrated as Engineer's Day in India in his memory - https://en.wikipedia.org/wiki/Visvesvaraya
+    "visvesvaraya",
+  
+    // Christiane Nüsslein-Volhard - German biologist, won Nobel Prize in Physiology or Medicine in 1995 for research on the genetic control of embryonic development. https://en.wikipedia.org/wiki/Christiane_N%C3%BCsslein-Volhard
+    "volhard",
+  
+    // Marlyn Wescoff - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Marlyn_Meltzer
+    "wescoff",
+  
+    // Sylvia B. Wilbur - British computer scientist who helped develop the ARPANET, was one of the first to exchange email in the UK and a leading researcher in computer-supported collaborative work. https://en.wikipedia.org/wiki/Sylvia_Wilbur
+    "wilbur",
+  
+    // Andrew Wiles - Notable British mathematician who proved the enigmatic Fermat's Last Theorem - https://en.wikipedia.org/wiki/Andrew_Wiles
+    "wiles",
+  
+    // Roberta Williams, did pioneering work in graphical adventure games for personal computers, particularly the King's Quest series. https://en.wikipedia.org/wiki/Roberta_Williams
+    "williams",
+  
+    // Malcolm John Williamson - British mathematician and cryptographer employed by the GCHQ. Developed in 1974 what is now known as Diffie-Hellman key exchange (Diffie and Hellman first published the scheme in 1976). https://en.wikipedia.org/wiki/Malcolm_J._Williamson
+    "williamson",
+  
+    // Sophie Wilson designed the first Acorn Micro-Computer and the instruction set for ARM processors. https://en.wikipedia.org/wiki/Sophie_Wilson
+    "wilson",
+  
+    // Jeannette Wing - co-developed the Liskov substitution principle. - https://en.wikipedia.org/wiki/Jeannette_Wing
+    "wing",
+  
+    // Steve Wozniak invented the Apple I and Apple II. https://en.wikipedia.org/wiki/Steve_Wozniak
+    "wozniak",
+  
+    // The Wright brothers, Orville and Wilbur - credited with inventing and building the world's first successful airplane and making the first controlled, powered and sustained heavier-than-air human flight - https://en.wikipedia.org/wiki/Wright_brothers
+    "wright",
+  
+    // Chien-Shiung Wu - Chinese-American experimental physicist who made significant contributions to nuclear physics. https://en.wikipedia.org/wiki/Chien-Shiung_Wu
+    "wu",
+  
+    // Rosalyn Sussman Yalow - Rosalyn Sussman Yalow was an American medical physicist, and a co-winner of the 1977 Nobel Prize in Physiology or Medicine for development of the radioimmunoassay technique. https://en.wikipedia.org/wiki/Rosalyn_Sussman_Yalow
+    "yalow",
+  
+    // Ada Yonath - an Israeli crystallographer, the first woman from the Middle East to win a Nobel prize in the sciences. https://en.wikipedia.org/wiki/Ada_Yonath
+    "yonath",
+  
+    // Nikolay Yegorovich Zhukovsky (Russian: Никола́й Его́рович Жуко́вский, January 17 1847 – March 17, 1921) was a Russian scientist, mathematician and engineer, and a founding father of modern aero- and hydrodynamics. Whereas contemporary scientists scoffed at the idea of human flight, Zhukovsky was the first to undertake the study of airflow. He is often called the Father of Russian Aviation. https://en.wikipedia.org/wiki/Nikolay_Yegorovich_Zhukovsky
+    "zhukovsky",
+  ]
+  
+  export const generateHostName = ():Hostname => {
+    return util.format('%s-%s', randelem(adjectives), randelem(scientists)) as Hostname
+  }
+  
+  function randnum(n:number):number {
+    return Math.floor(Math.random() * n);
+  }
+  
+  function randelem(a:string[]):string {
+    return a[randnum(a.length)];
+  }
+```
+
+## File: src/utils/rsync.ts
+```typescript
+/**
+ * rsync.ts — rsync primitive for App copy/move operations
+ *
+ * Design: design/copy-move-app.md
+ *
+ * Phase 1: same-engine, local paths only.
+ * Phase 2: cross-engine — pass remoteHost to rsync over SSH to pi@host.
+ */
+
+import { chalk } from 'zx'
+import { spawn, ChildProcess } from 'child_process'
+import { log } from './utils.js'
+import { registerProcess, deregisterProcess } from '../data/Operations.js'
+
+export interface RsyncProgress {
+    progressPercent: number
+}
+
+export type RsyncProgressCallback = (progress: RsyncProgress) => void
+
+/**
+ * Copy src/ to dest/ using rsync.
+ *
+ * - Preserves permissions, symlinks, timestamps (-a / archive mode)
+ * - Reports per-transfer progress via onProgress callback (0-100)
+ * - Idempotent: re-running after interruption transfers only the delta
+ * - Throws on non-zero exit
+ *
+ * src must be a local absolute path.
+ * dest must be an absolute path. If remoteHost is provided, rsync runs over
+ * SSH to `pi@<remoteHost>:<dest>` (cross-engine Phase 2).
+ * Trailing slash is appended to src so rsync copies the *contents*.
+ */
+export const rsyncDirectory = (
+    src: string,
+    dest: string,
+    onProgress?: RsyncProgressCallback,
+    opId?: string,
+    remoteHost?: string,
+): Promise<void> => {
+    return new Promise((resolve, reject) => {
+        // Ensure src has trailing slash so rsync copies contents, not the directory itself
+        const srcArg = src.endsWith('/') ? src : src + '/'
+        const destArg = remoteHost ? `pi@${remoteHost}:${dest}` : dest
+
+        const args = [
+            '-a',
+            '--info=progress2',
+            '--no-inc-recursive',  // required for accurate total-progress reporting
+        ]
+
+        if (remoteHost) {
+            args.push('-e', 'ssh -o StrictHostKeyChecking=no')
+        }
+
+        args.push(srcArg, destArg)
+
+        log(`rsync ${args.join(' ')}`)
+
+        const proc = spawn('rsync', args)
+        if (opId) registerProcess(opId, proc)
+
+        let stderr = ''
+
+        proc.stdout.on('data', (chunk: Buffer) => {
+            const text = chunk.toString()
+            // progress2 lines look like: "  1,234,567  42%    1.23MB/s    0:00:05"
+            // We scan for the percentage value.
+            const matches = text.match(/\s(\d{1,3})%/)
+            if (matches && onProgress) {
+                const pct = parseInt(matches[1], 10)
+                if (!isNaN(pct)) {
+                    onProgress({ progressPercent: pct })
+                }
+            }
+        })
+
+        proc.stderr.on('data', (chunk: Buffer) => {
+            stderr += chunk.toString()
+        })
+
+        proc.on('close', (code, signal) => {
+            if (opId) deregisterProcess(opId)
+            if (code === 0) {
+                if (onProgress) onProgress({ progressPercent: 100 })
+                resolve()
+            } else if (signal === 'SIGTERM') {
+                reject(new Error(`rsync cancelled (SIGTERM)`))
+            } else {
+                reject(new Error(`rsync exited with code ${code}: ${stderr.trim()}`))
+            }
+        })
+
+        proc.on('error', (err) => {
+            if (opId) deregisterProcess(opId)
+            reject(new Error(`rsync spawn error: ${err.message}`))
+        })
+    })
+}
+
+```
+
+## File: src/utils/ssh.ts
+```typescript
+import { $ } from 'zx'
+import type { ProcessPromise } from 'zx'
+
+/**
+ * Single-quotes a value for a POSIX shell: 'it'\''s' → one shell word, no expansion.
+ */
+export const shellQuote = (value: string): string => "'" + value.replace(/'/g, "'\\''") + "'"
+
+/**
+ * Minimal ssh() helper — replaces zx v7's built-in ssh() which was removed in v8.
+ *
+ * Creates a tagged-template executor that runs commands on a remote host via SSH.
+ * Each interpolated argument is single-quote shell-escaped before being sent.
+ *
+ * Usage (identical to zx v7 ssh):
+ *   const exec = ssh('pi@192.168.1.1')
+ *   await exec`sudo apt-get update`
+ *   await exec`cd ${path} && pnpm install`
+ *
+ * The optional `shell` parameter allows injecting a mock `$` in tests.
+ */
+export function ssh(host: string, shell: typeof $ = $) {
+    return (pieces: TemplateStringsArray, ...args: unknown[]): ProcessPromise => {
+        const cmd = pieces.reduce((acc: string, piece: string, i: number) => {
+            if (i >= args.length) return acc + piece
+            // Single-quote escape — args are developer-controlled paths/values, not user input
+            const escaped = shellQuote(String(args[i]))
+            return acc + piece + escaped
+        }, '')
+        return shell`ssh -o StrictHostKeyChecking=no ${host} -- ${cmd}`
+    }
+}
+
+```
+
+## File: src/utils/utils.ts
+```typescript
+import util from 'util';
+import { $, chalk, fs, os, question } from 'zx';
+import { IPAddress, PortNumber } from '../data/CommonTypes.js';
+import net from 'net';
+import crypto from 'crypto';
+
+
+// Dummy key
+export const dummyKey = "_dummy"
+
+export const getKeys = (obj) => {
+  return Object.keys(obj).filter(key => !(key === `${dummyKey}`))
+}
+
+// Generate a random port number between 49152-65535
+export const randomPort = ():PortNumber => {
+  return Math.floor(Math.random() * 16383) + 49152 as PortNumber
+}
+// Write a function that reads a .env file and extracts the value of a variable from it
+// The function should take the path to the .env file and the name of the variable as input
+// It should return the value of the variable
+// If the variable is not found, it should return null
+export const readEnvVariable = async (path: string, variable: string): Promise<string | null> => {
+  try {
+    const envContent = (await $`cat ${path}`).stdout
+    const values = envContent.match(new RegExp(`^${variable}=(.*)`, 'm'))
+    // Log the variable name only, never its value: .env files hold app
+    // passwords and History is readable from the Console (idea#111).
+    log(`Read variable ${variable} from .env file ${path}: ${values ? 'found' : 'not set'}`)
+    if (values && values.length >= 1) {
+      const value = values[1]
+      return value
+    } else {
+      return null
+    }
+  } catch (e) {
+    return null
+  }
+}
+
+/**
+ * Replace every occurrence of the given secret values in `text` with
+ * `[redacted]`, for log lines and error messages that may echo a value
+ * (idea#111). Empty values are ignored.
+ */
+export const redactValues = (text: string, values: (string | null | undefined)[]): string =>
+  values.reduce<string>((acc, v) => (v ? acc.split(v).join('[redacted]') : acc), text)
+
+// Write a function that adds or updates a variable to a .env file
+// The function should take the path to the .env file, the name of the variable and its value as input
+// If the variable is already present in the .env file, it should update its value
+// If the variable is not present in the .env file, it should add it
+export const addOrUpdateEnvVariable = async (path: string, variable: string, value: string): Promise<void> => {
+  try {
+    const envContent = (await $`cat ${path}`).stdout
+    const values = envContent.match(new RegExp(`^${variable}=(.*)`, 'm'))
+    if (values && values.length >= 1) {
+      // Update the value of the variable
+      await $`sed -i 's|^${variable}=.*|${variable}=${value}|' ${path}`
+    } else {
+      // Add the variable to the .env file
+      await $`echo "${variable}=${value}" >> ${path}`
+    }
+    log(`Added or updated variable ${variable} in .env file ${path}`)
+  } catch (e) {
+    // Add the variable to the .env file
+    log(`Error adding or updating variable ${variable} in .env file ${path}`)
+    log(`error: ${redactValues(String(e), [value])}`)
+    //await $`echo "${variable}=${value}" >> ${path}`
+  }
+}
+
+
+
+// Read verbosityLevel from the environmnet
+const verbosity = process.env.VERBOSITY || ""
+export let verbosityLevel = parseInt(verbosity) || 0
+
+// Verbosity-gated debug logger. Uses console.info so CommandLogger captures
+// always-on/gated messages without matching the hygiene.console_log scan
+// (which flags the console "log" method call pattern only).
+export const log = (msg:string, level?:number):void => {
+  if (!level) {
+    // Set the default log level to 2
+    level = 2
+  }
+  if (verbosityLevel >= level) {
+    console.info(chalk.gray(msg))
+  }
+}
+
+export const error = (msg:string):void => {
+  console.error(chalk.red(msg))
+}
+
+/** Always-on status/output helper. Uses console.info (captured by CommandLogger). */
+export const print = (...args: unknown[]): void => {
+  console.info(...args)
+}
+
+export const setVerbosity = (level:number):void => {
+  verbosityLevel = level
+}
+
+export const isEngineOnline = (hostname: string, port: number): Promise<boolean> => {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    const timeout = 2000; // 2 seconds
+    socket.setTimeout(timeout);
+
+    socket.on('connect', () => {
+      socket.destroy();
+      resolve(true);
+    });
+
+    socket.on('timeout', () => {
+      socket.destroy();
+      resolve(false);
+    });
+
+    socket.on('error', () => {
+      socket.destroy();
+      resolve(false);
+    });
+
+    socket.connect(port, hostname);
+  });
+};
+
+// // Execute promises sequentially
+// export const sequential = (promises) => {
+//   return promises.reduce((promise, func) => {
+//     return promise.then(func)
+//   }, Promise.resolve())
+// }
+
+// export const executePromisesSequentially = async (promises) => {
+//     for (let promise of promises) {
+//       await promise
+//     }
+// }
+
+
+
+
+
+
+// Write a function that uses zx to test if a path exists
+// export const dirExists = async (path: string) => {
+//     try {
+//         await $`test -d ${path}`
+//         return true
+//     } catch (e) {
+//         return false
+//     }
+// }
+
+// export const dirExists = async (path: string) => {
+//   return await $`test -d ${path}`.then(() => true).catch(() => false)
+// }
+
+// export const fileExists = async (path: string) => {
+//   try {
+//       await $`test -f ${path}`
+//       return true
+//   } catch (e) {
+//       return false
+//   }
+// }
+
+// export const fileExists = async (path: string) => {
+//   return await $`test -f ${path}`.then(() => true).catch(() => false)
+// }
+
+export const fileExists = (path: string):boolean => {
+  return fs.existsSync(path)
+}
+
+// Check if the root folder contains the folder yjs-db  If so, set firstBoot to false, otherwise set it to true
+// This is a way to check if the engine has been booted before
+// export const firstBoot: boolean = fs.existsSync('../yjs-db') ? false : true 
+// export const firstBoot: boolean = !(await fileExists('./yjs-db'))
+// log(`First boot: ${firstBoot}`)
+
+
+
+
+// Write a function that checks if a given yarray contains a specific value
+// Use the Y.Array API of the Yjs library (which does not have a built-in method for this)
+// Do it
+export const contains = (yarray, value) => {
+    let found = false
+    yarray.forEach((item) => {
+      if (item === value) {
+        found = true
+      }
+    })
+    return found
+  }
+
+export const deepPrint = (obj, depth:(number | null)=null) => {
+    return util.inspect(obj, {showHidden: false, depth: depth, colors: true})
+    // Alternative: return JSON.stringify(obj, null, 2)
+    // Alternative: return console.dir(obj, {depth: null, colors: true})
+}
+
+
+// Write a function that tests if a string is a valid IP4 address
+export const isIP4 = (str: string): boolean => {
+  const ip4Regex = /^(\d{1,3}\.){3}\d{1,3}$/
+  return ip4Regex.test(str)
+}
+
+export const isNetmask = isIP4
+
+// See https://stackoverflow.com/questions/503052/how-to-check-if-ip-is-in-one-of-these-subnets
+
+
+// const ip2long = (ip) => {
+//   var components;
+//   if(components = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/))
+//   {
+//       var iplong = 0;
+//       var power  = 1;
+//       for(var i=4; i>=1; i-=1)
+//       {
+//           iplong += power * parseInt(components[i]);
+//           power  *= 256;
+//       }
+//       return iplong;
+//   }
+//   else return -1;
+// };
+
+// THIS FUNCTION IS WRONG
+// export const inSubNet = (ip, subnet) => {   
+//   var mask, base_ip, long_ip = ip2long(ip);
+//   if( (mask = subnet.match(/^(.*?)\/(\d{1,2})$/)) && ((base_ip=ip2long(mask[1])) >= 0) )
+//   {
+//       var freedom = Math.pow(2, 32 - parseInt(mask[2]));
+//       return (long_ip > base_ip) && (long_ip < base_ip + freedom - 1);
+//   }
+//   else return false;
+// }
+
+export const IPnumber = (ip:IPAddress):number => {
+//  var ip = IPaddress.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+//  if(ip) {
+//      return (+ip[1]<<24) + (+ip[2]<<16) + (+ip[3]<<8) + (+ip[4]);
+//  }
+  return (+ip[1]<<24) + (+ip[2]<<16) + (+ip[3]<<8) + (+ip[4]);
+}
+
+export const isIPAddress = (str: string): str is IPAddress => {
+  // return str.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/
+  // const ipRegex = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/
+  return ipRegex.test(str)
+}
+
+export const sameNet = (IP1:any, IP2:any, mask:any) => {
+  //log(`${IPnumber(IP1) & IPnumber(mask)} == ${IPnumber(IP2) & IPnumber(mask)}`)
+  // Check if the IP addresses are strings
+  if (isIPAddress(IP1) && isIPAddress(IP2) && isNetmask(mask)) {
+    return (IPnumber(IP1) & IPnumber(mask)) == (IPnumber(IP2) & IPnumber(mask))
+  } else {
+    return false
+  }
+}
+
+export const findIp = async (address:IPAddress):Promise<IPAddress | undefined> => {
+  // Use a shell command to resolve the ip address
+  // REmove the trailing \n from the ip address
+  try {
+    const interfaceData = os.networkInterfaces()
+    const ip = interfaceData["eth0"]?.find((iface) => iface.family === "IPv4")?.address
+    if (ip && isIPAddress(ip)) {
+      return ip
+    } else {
+      return undefined
+    }
+  } catch (e) {
+    return undefined
+  }
+}
+
+export const findIp2 = async (address:IPAddress):Promise<IPAddress | undefined> => {
+  // Use a shell command to resolve the ip address
+  // REmove the trailing \n from the ip address
+  try {
+    const ip = (await $`ping -c 1 ${address} | grep PING | awk '{print $3}' | tr -d '()'`).stdout.replace(/\n$/, '')
+    if (isIPAddress(ip)) {
+      return ip
+    } else {
+      return undefined
+    }
+  } catch (e) {
+    return undefined
+  }
+}
+
+export const reset = async ($) => {
+  print(chalk.blue('Resetting the local engine'));
+  try {
+      // (removed) Removing the yjs database
+      // await $`rm -rf ../yjs-db`;
+      // (removed) Removing all appnet ids
+      // if (config.settings.appnets) {
+      //   config.settings.appnets.forEach((appnet) => delete appnet.id)
+      //   (removed) Updating the config file
+      //   writeConfig(config, '../config.yaml')
+      // }
+  } catch (e) {   
+      print(chalk.red('Failed to reset the local engine'));
+      console.error(e);
+      process.exit(1);
+  }
+}
+
+export const prompt = (level:number, message: string) => {
+  // Create level*4 spaces
+  const spaces = ' '.repeat(level * 4)
+  print(chalk.green(spaces+message))
+  return question(chalk.bgMagentaBright(spaces+'Press ENTER when ready'))
+}
+
+/** Characters of generated ids and app passwords: lowercase base-36, as before idea#114. */
+export const SECRET_ID_ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyz'
+/**
+ * Length of generated ids and app passwords. The old Math.random + timestamp ids
+ * were 15-22 characters, 19 in almost all cases, so 19 keeps them the same shape
+ * (idea#114). 19 base-36 characters is about 98 bits of randomness.
+ */
+export const SECRET_ID_LENGTH = 19
+
+/**
+ * A random string from `alphabet`, drawn from Node's CSPRNG. Each character uses
+ * crypto.randomInt, which rejection-samples, so there is no modulo bias (idea#114).
+ * `randomInt` can be swapped in tests only.
+ */
+export const secureRandomString = (
+  length: number,
+  alphabet: string = SECRET_ID_ALPHABET,
+  randomInt: (max: number) => number = crypto.randomInt,
+): string => {
+  let out = ''
+  for (let i = 0; i < length; i++) out += alphabet[randomInt(alphabet.length)]
+  return out
+}
+
+// Generate a uuid: disk, instance and operation ids, and the app password that
+// startInstance writes to an instance's .env (idea#114: crypto source, not Math.random).
+// Not logged: it generates the app password (idea#111).
+export const uuid = ():string => {
+  return secureRandomString(SECRET_ID_LENGTH)
+}
+
+export const uuidLight = ():string => {
+  return uuid().substring(0, 8)
+}
+
+
+// A function to strip the trailing partition number from a device name
+export const stripPartition = (device: string):string => {
+  if (device.startsWith('nvme') || device.startsWith('mmcblk')) {
+    return device.replace(/p[0-9]+$/, '')
+  }
+  return device.replace(/[0-9]+$/, '')
 }
 
 ```
