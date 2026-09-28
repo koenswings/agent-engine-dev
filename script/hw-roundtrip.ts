@@ -22,15 +22,20 @@
  *                           default: this checkout)
  *     --port <n>            Engine WebSocket port (default 4321)
  *     --engine-log <file>   Engine stdout log to check (default ~/.pm2/logs/engine-out.log)
- *     --device <sdX>        USB test disk (default: the only non-system USB disk)
+ *     --stick-config <file> recorded test disks by hostname (default script/hw-roundtrip-disks.json)
+ *     --stick-usb-serial <s> --disk-serial <s> --uuid <u> (repeatable) --refuse-serial <s> (repeatable):
+ *                           override the recorded IDs (see hw-roundtrip-guard.ts)
  *     --cycles <n>          eject + re-plug cycles (default 2)
  *     --method <m>          unplug simulation: unbind (default) | authorized
  *     --timeout <s>         per-step timeout in seconds (default 60)
  *
  * Root: only the unplug simulation (a write to /sys/bus/usb/...) needs root.
  * It runs as `sudo -n tee <sysfs file>` with the tester's own sudo; it is NOT
- * in the Engine sudoers. Refuses to run on idea02 (golden) and refuses any USB
- * device that is, or sits above, the device of the system drive.
+ * in the Engine sudoers. Refuses to run on idea02 (golden). Touches only the
+ * recorded test disk, matched by filesystem UUIDs, disk serial and USB serial
+ * (never by a device name like sdb), checked before anything is ejected and again
+ * before every unplug; refuses the root SSD serial and the drive backing / or
+ * /boot/firmware (hw-roundtrip-guard.ts).
  *
  * Exit code 0 only when every check passes. Log: test/testresults/hw-roundtrip-<UTC yyyy-mm-dd-hhmmss>.log
  */
@@ -42,6 +47,7 @@ import os from 'os'
 import path from 'path'
 import { spawn, ChildProcess } from 'child_process'
 import { fileURLToPath } from 'url'
+import { collectBlockFacts, loadExpectation, resolveStick } from './hw-roundtrip-guard.js'
 
 $.verbose = false
 
@@ -59,7 +65,8 @@ const ENGINE_LOG = opt('engine-log', path.join(os.homedir(), '.pm2/logs/engine-o
 const CYCLES = parseInt(opt('cycles', '2'), 10)
 const METHOD = opt('method', 'unbind')
 const TIMEOUT_MS = parseInt(opt('timeout', '60'), 10) * 1000
-let DEVICE = opt('device', '')
+const STICK_CONFIG = path.resolve(opt('stick-config', path.join(ROOT, 'script', 'hw-roundtrip-disks.json')))
+let DEVICE = ''
 
 // ── Log ─────────────────────────────────────────────────────────────────────
 
@@ -139,19 +146,22 @@ for (const d of systemDisks) { const u = await usbDevicePath(d); if (u) systemUs
 write(`hw-roundtrip on ${os.hostname()}: engine-dir=${ENGINE_DIR} port=${PORT} log=${ENGINE_LOG} cycles=${CYCLES} method=${METHOD}`)
 info(`system drive: root=${rootSource} boot=${bootSource || '(none)'} disks=${[...systemDisks].join(',')} usb=${[...systemUsb].join(',') || '(not USB)'}`)
 
-if (!DEVICE) {
-    const disks = (await sh(`lsblk -dno NAME,TRAN`)).split('\n').map(l => l.trim().split(/\s+/)).filter(p => p[1] === 'usb' && !systemDisks.has(p[0])).map(p => p[0])
-    if (disks.length !== 1) abort(`need exactly one non-system USB disk, found: ${disks.join(',') || 'none'} (pass --device)`)
-    DEVICE = disks[0]
+const expected = loadExpectation(argv, STICK_CONFIG, os.hostname())
+info(`expected test disk: usbSerial=${expected.usbSerial || '?'} diskSerial=${expected.diskSerial || '?'} uuids=${expected.uuids.join(',') || '?'} refused serials=${expected.refuseSerials.join(',') || 'none'} (${STICK_CONFIG})`)
+
+/** Resolve the recorded test disk by its IDs; abort on any mismatch (before touching anything) */
+const verifyStick = async (when: string) => {
+    const r = resolveStick(expected, await collectBlockFacts())
+    if (!r.ok) abort(`test disk check (${when}) failed: ${r.reason}`)
+    if (r.ok) {
+        if (DEVICE && r.disk !== DEVICE) info(`test disk is now ${r.disk} (was ${DEVICE})`)
+        DEVICE = r.disk
+        usbId = r.usbId
+        write(`PASS  test disk verified (${when}): ${r.disk} [${r.partitions.join(',')}] on USB ${r.usbId}, disk serial ${expected.diskSerial}, USB serial ${expected.usbSerial}`)
+    }
 }
-if (systemDisks.has(DEVICE)) abort(`${DEVICE} is the system drive`)
-const usbPath = await usbDevicePath(DEVICE)
-if (!usbPath) abort(`${DEVICE} is not a USB device`)
-for (const s of systemUsb) {
-    if (s === usbPath || s.startsWith(usbPath + '/')) abort(`${DEVICE}'s USB device ${usbPath} is (or is above) the system drive's USB device ${s}`)
-}
-const usbId = path.basename(usbPath!)
-info(`test disk ${DEVICE} on USB device ${usbId} (${usbPath})`)
+let usbId = ''
+await verifyStick('start')
 
 // ── Store ───────────────────────────────────────────────────────────────────
 
@@ -336,6 +346,7 @@ const roundTrip = async () => {
         let off = logOffset()
         startUdev()
         await sleep(500)
+        await verifyStick(`cycle ${c}, before unplug`)
         info(`unplug: ${METHOD === 'unbind' ? 'unbind' : 'authorized=0'} ${usbId}`)
         await unplug()
         check(await waitFor(`/dev/${DEVICE} gone`, async () => !fs.existsSync(`/dev/${DEVICE}`)), `cycle ${c}: /dev/${DEVICE} gone after unplug`)
