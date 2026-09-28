@@ -28,6 +28,21 @@ export interface Disk {
     dockedTo: EngineID | null;    // The engine to which this disk is currently docked. null if it is not docked to an engine
     diskTypes: DiskType[];        // Types detected for this disk (may be multiple); empty until processDisk runs
     backupConfig: BackupConfig | null;  // Set when disk is a Backup Disk; null otherwise
+    unmountError?: UnmountError | null; // Set when the last undock could not unmount the disk (idea#126); null/absent otherwise
+}
+
+/**
+ * A busy unmount (idea#126, Files Disk Q5). Set by undockDisk for every disk type
+ * when the mount point is still mounted after the umount retries. Kept after
+ * undock (device is then null, hence mountPoint), cleared on the next successful
+ * mount (createOrUpdateDisk) and at Engine startup unless the same filesystem
+ * (fsUuid) is still mounted at mountPoint (clearStaleUnmountErrors).
+ */
+export interface UnmountError {
+    engineId: EngineID;         // Engine on which the unmount failed
+    mountPoint: string;         // e.g. /disks/sdb1
+    fsUuid: string | null;      // filesystem UUID recorded at mount time (lsblk -no UUID); null if unknown
+    message: string;            // why the unmount failed
 }
 
 
@@ -131,6 +146,7 @@ export const createOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: Engi
                 lastDocked: new Date().getTime() as Timestamp,
                 diskTypes: [],
                 backupConfig: null,
+                unmountError: null,
             };
             doc.diskDB[diskId] = disk;
         } else {
@@ -143,6 +159,7 @@ export const createOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: Engi
             disk.lastDocked = new Date().getTime() as Timestamp;
             disk.diskTypes = [];        // reset; will be repopulated by processDisk
             disk.backupConfig = null;   // reset; will be repopulated if Backup Disk
+            disk.unmountError = null;   // mounted again: a previous busy unmount no longer applies (idea#126)
         }
     });
     if (cleared.length > 0) log(`Undocked stale disk record(s) ${cleared.join(', ')} on ${device}: device now holds disk ${diskId}`)

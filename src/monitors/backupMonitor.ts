@@ -18,7 +18,7 @@ import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { createOperation, updateOperation } from '../data/Operations.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
 import { stopInstance, startInstance, BACKUP_STEPS } from '../data/Instance.js'
-import { BackupMode, DiskID, DiskName, InstanceID, Timestamp, OperationCause } from '../data/CommonTypes.js'
+import { BackupMode, DiskID, DiskName, InstanceID, Timestamp, OperationCause, Operation } from '../data/CommonTypes.js'
 import { Store, getInstance, getDisks, findDiskByName } from '../data/Store.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js'
@@ -97,12 +97,14 @@ export const backupInstance = async (
     activeBackups.add(instanceId)
     let wasRunning = false
 
-    // Acquire lock on the instance for the duration of the backup
-    const backupLockKey = instanceKey(instanceId)
-    if (!resourceLock.acquire(backupLockKey, 'backupApp')) {
-        log(chalk.yellow(`backupInstance: instance ${instanceId} is locked — skipping (another operation is running)`))
+    // Take the instance lock and the Backup Disk lock together, as restore does
+    // (idea#126, Files Disk step 0): nothing else may change the instance or the
+    // Backup Disk (eject, erase, another backup or restore) while Borg writes.
+    const backupLockKeys = backupLockKeysFor(instanceId, backupDisk.id)
+    if (!resourceLock.acquireAll(backupLockKeys, 'backupApp')) {
         activeBackups.delete(instanceId)
-        return
+        const held = backupLockKeys.map(k => resourceLock.getLockInfo(k)).find(Boolean)
+        throw new Error(`Backup of instance ${instanceId} to disk ${backupDisk.id} not started: the instance or the Backup Disk is locked${held ? ` by '${held.kind}'` : ''} (another operation is running)`)
     }
 
     const opId = existingOpId ?? createOperation(storeHandle, 'backupApp', {
@@ -115,18 +117,15 @@ export const backupInstance = async (
         const store = storeHandle.doc()
         const instance = getInstance(store, instanceId)
         if (!instance) {
-            log(`backupInstance: instance ${instanceId} not found in store`)
-            return
+            throw new Error(`Instance ${instanceId} not found in store`)
         }
         if (!instance.storedOn) {
-            log(`backupInstance: instance ${instanceId} has no storedOn disk`)
-            return
+            throw new Error(`Instance ${instanceId} has no storedOn disk`)
         }
 
         const appDisk = store.diskDB[instance.storedOn]
         if (!appDisk || !appDisk.device) {
-            log(`backupInstance: App Disk for instance ${instanceId} is not docked`)
-            return
+            throw new Error(`App Disk for instance ${instanceId} is not docked`)
         }
 
         const backupDevice = backupDisk.device!
@@ -244,9 +243,44 @@ export const backupInstance = async (
             }
         }
         // Lock file intentionally left in place — signals boot-resume on next dock
+        // Rethrow so the backup's trace ends with status 'error' and this message
+        throw e
     } finally {
         activeBackups.delete(instanceId)
-        resourceLock.release(backupLockKey)
+        resourceLock.releaseAll(backupLockKeys)
+    }
+}
+
+/** Lock keys a backup holds: the instance and the Backup Disk (idea#126). */
+export const backupLockKeysFor = (instanceId: string, backupDiskId: string): string[] =>
+    [instanceKey(instanceId), diskKey(backupDiskId)]
+
+/**
+ * The running (or pending) backupApp operation writing to a disk, if any
+ * (idea#126). Eject (and a later erase) check this by the operation's
+ * backupDiskId, so every backup is covered, whatever started it (console,
+ * immediate mode, stale lock, crash recovery, a schedule).
+ */
+export const runningBackupOnDisk = (store: Store, diskId: string): Operation | undefined =>
+    Object.values(store.operationDB ?? {}).find(op =>
+        op?.kind === 'backupApp' &&
+        (op.status === 'Running' || op.status === 'Pending') &&
+        op.args?.backupDiskId === diskId) as Operation | undefined
+
+/**
+ * Start a backup from a monitor loop: failures are already recorded in the
+ * backup's trace and operation, so they are logged here and the loop goes on.
+ */
+const triggerBackup = async (
+    storeHandle: DocHandle<Store>,
+    instanceId: InstanceID,
+    backupDisk: Disk,
+    cause: OperationCause,
+): Promise<void> => {
+    try {
+        await backupInstance(storeHandle, instanceId, backupDisk, undefined, cause)
+    } catch (e: any) {
+        log(chalk.red(`Backup of instance ${instanceId} failed: ${e?.message ?? e}`))
     }
 }
 
@@ -298,7 +332,7 @@ export const processBackupDisk = async (
                     ? store.diskDB[instance.storedOn]?.device != null
                     : false
                 if (appDiskDocked) {
-                    await backupInstance(storeHandle, staleInstanceId, backupDisk, undefined, 'backup-stale-lock')
+                    await triggerBackup(storeHandle, staleInstanceId, backupDisk, 'backup-stale-lock')
                 } else {
                     log(`App Disk for ${staleInstanceId} not yet docked — stale lock will be handled when App Disk docks`)
                 }
@@ -314,7 +348,7 @@ export const processBackupDisk = async (
             if (!instance?.storedOn) continue
             const appDisk = store.diskDB[instance.storedOn]
             if (appDisk?.device) {
-                await backupInstance(storeHandle, instanceId, backupDisk, undefined, 'console-command')
+                await triggerBackup(storeHandle, instanceId, backupDisk, 'console-command')
             } else {
                 log(`Instance ${instanceId}: App Disk not docked — backup will trigger when App Disk docks`)
             }
@@ -349,7 +383,7 @@ export const checkPendingBackups = async (
         for (const instance of instancesOnAppDisk) {
             if (candidate.backupConfig.links.includes(instance.id)) {
                 log(`checkPendingBackups: triggering backup for instance ${instance.id}`)
-                await backupInstance(storeHandle, instance.id, candidate as Disk, undefined, 'backup-app-docked')
+                await triggerBackup(storeHandle, instance.id, candidate as Disk, 'backup-app-docked')
             }
         }
 
@@ -365,7 +399,7 @@ export const checkPendingBackups = async (
                         const staleInstance = getInstance(store, staleId)
                         if (String(staleInstance?.storedOn) === String(appDisk.id)) {
                             log(`checkPendingBackups: stale lock for ${staleId} — re-triggering backup`)
-                            await backupInstance(storeHandle, staleId, candidate as Disk, undefined, 'backup-stale-lock')
+                            await triggerBackup(storeHandle, staleId, candidate as Disk, 'backup-stale-lock')
                         }
                     }
                 }

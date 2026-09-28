@@ -87,7 +87,7 @@ These commands perform actions on the system. Some are restricted to an `engine`
 - **Scope:** `engine`
 
 ### `backupApp`
-- **Description:** Backs up an app instance to a Backup Disk. Stops the instance briefly for filesystem consistency, runs a BorgBackup archive, then restarts it. If no Backup Disk name is given, the first docked Backup Disk linked to the instance is used.
+- **Description:** Backs up an app instance to a Backup Disk. Stops the instance briefly for filesystem consistency, runs a BorgBackup archive, then restarts it. If no Backup Disk name is given, the first docked Backup Disk linked to the instance is used. The backup holds the instance lock and the Backup Disk lock together (idea#126); if another operation holds either, the backup is not started and the command fails with the reason. A failure during the backup fails the command with its message.
 - **Usage:** `backupApp <instanceName> [backupDiskName]`
 - **Scope:** `engine`
 
@@ -102,8 +102,8 @@ These commands perform actions on the system. Some are restricted to an `engine`
 - **Scope:** `engine`
 
 ### `ejectDisk`
-- **Description:** Safely ejects a docked disk from this engine. Stops all running instances on the disk, unmounts it, and updates the shared store to reflect the undocked state. Equivalent to a clean physical removal. Any stale store record that still claims the same device is undocked too (idea#152).
-- **Usage:** `ejectDisk <diskId>` (the Console sends `disk.id`). A disk name is still accepted for older Consoles and the CLI: it only matches disks docked to this engine with a device, and is refused as ambiguous when two such disks share the name (eject by id instead). A refusal ends the command trace as `error` with the reason.
+- **Description:** Safely ejects a docked disk from this engine. Updates the shared store to reflect the undocked state, stops all running instances on the disk, then unmounts it: `umount` is repeated (at most 5 times, 1 s apart after a failure) until the mount point is no longer a mount point, and the empty mount point is removed with `rmdir`, never `rm -fr` (idea#126). If it stays busy, nothing is removed, a failed `diskDetection` trace is written and the disk gets `unmountError` (restart the Pi to release it). Refused while the disk is locked by an operation or while a `backupApp` operation writing to it is pending or running. Any stale store record that still claims the same device is undocked too (idea#152). Equivalent to a clean physical removal.
+- **Usage:** `ejectDisk <diskId>` (the Console sends `disk.id`). A disk name is still accepted for older Consoles and the CLI: it only matches disks docked to this engine with a device, and is refused as ambiguous when two such disks share the name (eject by id instead). Every refusal ends the command trace as `error` with the reason (idea#152).
 - **Scope:** `engine`
 
 ### `reboot`

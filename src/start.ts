@@ -18,6 +18,7 @@ import { recoverInterruptedOperations } from './data/Operations.js'
 import { enableDockerMetricsMonitor } from './monitors/dockerMetricsMonitor.js'
 import { copyApp, moveApp } from './data/CopyMoveApp.js'
 import { backupInstance } from './monitors/backupMonitor.js'
+import { clearStaleUnmountErrors } from './monitors/mounts.js'
 import { InstanceID } from './data/CommonTypes.js'
 import { Status } from './data/Instance.js'
 import { Store } from './data/Store.js'
@@ -103,6 +104,10 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // monitors start so there is no racing writer; tombstones propagate to
     // all peers on the next Automerge sync.
     cleanupPhantomEngines(storeHandle)
+
+    // Clear unmount errors (idea#126) this Engine recorded for disks whose mount
+    // point is no longer mounted, or now holds another filesystem (fsUuid).
+    await clearStaleUnmountErrors(storeHandle, localEngineId).catch(e => log(`Could not clear stale unmount errors: ${e}`))
 
     // Check for undocked apps after restart
     await checkAndSetUndockedApps(storeHandle)

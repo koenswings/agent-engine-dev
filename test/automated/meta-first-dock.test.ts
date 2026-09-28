@@ -233,10 +233,12 @@ describe('META.yaml under /disks is written with sudo tee (idea#121)', () => {
     const sudoArgs = async (): Promise<string[]> =>
         (await fs.readFile(argsFile, 'utf-8')).split('\n').slice(0, -1)
 
-    // The command part of the single pi rule in 11-engine-files, as a regex
+    // The command part of the tee rule in 11-engine-files (the file also has the
+    // rmdir rule from idea#126), as a regex
     // (sudo globbing: [..] is a character class, everything else is literal here).
     const sudoersCommand = (): string => {
-        const rules = fs.readFileSync(SUDOERS_11, 'utf-8').split('\n').filter(l => /^\s*pi\s/.test(l))
+        const rules = fs.readFileSync(SUDOERS_11, 'utf-8').split('\n')
+            .filter(l => /^\s*pi\s/.test(l) && l.includes(`${SUDO_TEE} `))
         expect(rules).toHaveLength(1)
         const m = rules[0].match(/^pi ALL=\(root\) NOPASSWD: (.+)$/)
         expect(m, rules[0]).not.toBeNull()
