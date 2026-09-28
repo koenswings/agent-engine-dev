@@ -1,11 +1,12 @@
 # Project Source Code Context
-Generated on 2026-09-28T12:30:08.034Z
+Generated on 2026-09-28T15:25:18.000Z
 
 ## File: package.json
 ```typescript
 {
   "name": "engine",
   "version": "1.0",
+  "packageManager": "pnpm@10.33.0",
   "description": "",
   "main": "index.js",
   "type": "module",
@@ -331,7 +332,7 @@ import { clearStaleUnmountErrors } from './monitors/mounts.js'
 import { InstanceID } from './data/CommonTypes.js'
 import { Status } from './data/Instance.js'
 import { Store } from './data/Store.js'
-import { createCommandLogStore } from './data/CommandLogStore.js'
+import { createCommandLogStore, shutdownRepo } from './data/CommandLogStore.js'
 import { initCommandLogger } from './utils/CommandLogger.js'
 
 
@@ -554,7 +555,7 @@ async function shutdownProcedure(repo: Repo, httpServer?: import('http').Server,
         await new Promise<void>(resolve => httpServer.close(() => resolve()))
         log('HTTP server closed')
     }
-    if (repo) await repo.shutdown()
+    if (repo) await shutdownRepo(repo)
 }
 ```
 
@@ -850,7 +851,7 @@ export interface CommandDefinition {
  * The doc URL is exposed at GET /api/command-log-url (added to httpMonitor).
  */
 
-import { DocHandle, Repo } from '@automerge/automerge-repo'
+import { DocHandle, Repo, isValidAutomergeUrl } from '@automerge/automerge-repo'
 import { log } from '../utils/utils.js'
 import { fs } from 'zx'
 import path from 'path'
@@ -906,26 +907,80 @@ export const setCommandLogHandle = (handle: DocHandle<CommandLogStore> | null): 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
 /**
+ * How long createCommandLogStore waits for the doc named in
+ * command-log-url.txt (idea#145). The doc is normally in local storage and
+ * loads in milliseconds. On a fresh Engine the tracked URL points at the
+ * fleet's shared log, which no peer may have (a new school Pi has no peers),
+ * and after a store-data wipe the Engine's own previous log is gone: then
+ * repo.find()/whenReady() could wait forever and the Console never came up.
+ */
+export const COMMAND_LOG_LOAD_TIMEOUT_MS = 10_000
+
+export interface CommandLogStoreOptions {
+  /** Default: <storeIdentityFolder>/command-log-url.txt */
+  urlFile?: string
+  /** Default: COMMAND_LOG_LOAD_TIMEOUT_MS */
+  timeoutMs?: number
+}
+
+/**
+ * Load the doc at `url`, giving up after `timeoutMs` (idea#145). Rejects when
+ * the doc is unavailable (not in storage, no peer has it) or the time runs out;
+ * the pending find is aborted.
+ */
+export const findCommandLogWithTimeout = async (
+  repo: Repo,
+  url: string,
+  timeoutMs: number,
+): Promise<DocHandle<CommandLogStore>> => {
+  if (!isValidAutomergeUrl(url)) throw new Error(`'${url}' is not a valid Automerge URL`)
+  const controller = new AbortController()
+  let timer: NodeJS.Timeout | undefined
+  const load = async () => {
+    const handle = await repo.find<CommandLogStore>(url, { signal: controller.signal })
+    await handle.whenReady()
+    return handle
+  }
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort()
+      reject(new Error(`not available after ${timeoutMs} ms (not in local storage and no peer supplied it)`))
+    }, timeoutMs)
+  })
+  try {
+    return await Promise.race([load(), timeout])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
  * Create the CommandLogStore Automerge doc inside the given Repo.
  * Persists the doc URL next to the main store URL so it survives restarts.
+ *
+ * If command-log-url.txt names a doc that cannot be loaded within the timeout
+ * (fresh Engine whose tracked URL no peer has, or store-data wiped), a fresh
+ * CommandLogStore is created and its URL is written to command-log-url.txt, so
+ * startup never hangs (idea#145). The command log is ephemeral history, so
+ * nothing needed is lost; the main store is not affected.
  */
 export const createCommandLogStore = async (
-  repo: Repo
+  repo: Repo,
+  options: CommandLogStoreOptions = {},
 ): Promise<DocHandle<CommandLogStore>> => {
-  const identityDir = './' + config.settings.storeIdentityFolder
-  const urlFile = path.join(identityDir, 'command-log-url.txt')
+  const urlFile = options.urlFile ?? path.join('./' + config.settings.storeIdentityFolder, 'command-log-url.txt')
+  const timeoutMs = options.timeoutMs ?? COMMAND_LOG_LOAD_TIMEOUT_MS
 
   let handle: DocHandle<CommandLogStore>
 
-  if (fs.existsSync(urlFile)) {
-    const existingUrl = (await fs.readFile(urlFile, 'utf-8')).trim() as any
-    log(`[commandLog] Loading existing CommandLogStore from ${existingUrl}`)
+  const existingUrl = fs.existsSync(urlFile) ? (await fs.readFile(urlFile, 'utf-8')).trim() : ''
+  if (existingUrl) {
+    log(`[commandLog] Loading existing CommandLogStore from ${existingUrl} (timeout ${timeoutMs} ms)`)
     try {
-      handle = await repo.find<CommandLogStore>(existingUrl)
-      await handle.whenReady()
+      handle = await findCommandLogWithTimeout(repo, existingUrl, timeoutMs)
       log(`[commandLog] CommandLogStore loaded, state: ${handle.state}`)
     } catch (e) {
-      log(`[commandLog] Failed to load existing doc (${e}), creating fresh one`)
+      log(`[commandLog] Could not load ${existingUrl}: ${e instanceof Error ? e.message : e}. Creating a fresh CommandLogStore and rewriting ${urlFile}`)
       handle = await _createFresh(repo, urlFile)
     }
   } else {
@@ -937,6 +992,23 @@ export const createCommandLogStore = async (
   return handle
 }
 
+/**
+ * Shut a Repo down without failing on a handle that never became ready
+ * (idea#145). repo.shutdown() flushes every cached handle and throws
+ * "DocHandle is not ready" for one that is still unavailable, such as a
+ * command log that timed out. Then only the ready handles are flushed again,
+ * so the store and the new command log are still saved.
+ */
+export const shutdownRepo = async (repo: Repo): Promise<void> => {
+  try {
+    await repo.shutdown()
+  } catch (e) {
+    log(`[repo] shutdown flush failed (${e instanceof Error ? e.message : e}); flushing the ready documents only`)
+    const ready = Object.values(repo.handles).filter(h => h.isReady()).map(h => h.documentId)
+    await repo.flush(ready)
+  }
+}
+
 const _createFresh = async (
   repo: Repo,
   urlFile: string
@@ -946,6 +1018,7 @@ const _createFresh = async (
     recentTraceIds: [],
   })
   await handle.whenReady()
+  await fs.ensureDir(path.dirname(urlFile))
   await fs.writeFile(urlFile, handle.url)
   log(`[commandLog] Created new CommandLogStore: ${handle.url}`)
   return handle
@@ -3163,7 +3236,9 @@ const getLocalEngineId = async (): Promise<EngineID> => {
     const meta: DiskMeta = await readMetaUpdateId()
     return createEngineIdFromDiskId(meta.diskId)
   } catch (error) {
-    console.error(`Error getting local engine id: ${error}`)
+    // Readable reason for the exit instead of a bare import-time crash (idea#145):
+    // ensureSystemMeta's errors say how to fix a missing /META.yaml.
+    console.error(`Cannot start the Engine: could not determine the local Engine id: ${error instanceof Error ? error.message : error}`)
     process.exit(1)
   }
 }
@@ -3610,6 +3685,15 @@ export const installUdev = async (exec: any, enginePath: string) => {
 d /dev/engine 0775 pi pi -
 EOF`
     await exec`sudo systemd-tmpfiles --create /etc/tmpfiles.d/idea-engine.conf`
+
+    // Apply the docking rules now, not only after the final reboot (idea#146): if
+    // the build stops early, the Engine's disk self-check otherwise fails with
+    // "no /dev/engine entry for sda" until the next reboot. Replaying "add" for
+    // block devices is what udev does at boot.
+    print(chalk.blue('  - Reloading udev rules and replaying block devices...'))
+    await exec`sudo udevadm control --reload-rules`
+    await exec`sudo udevadm trigger --subsystem-match=block --action=add`
+    await exec`sudo udevadm settle --timeout=30`
   } catch (e) {
     print(chalk.red('Error installing udev and udev rules'));
     console.error(e);
@@ -3823,12 +3907,22 @@ export const installRSync = async (exec: any) => {
   print(chalk.green('rsync installed'));
 }
 
+/**
+ * The pnpm version every Engine install uses (idea#146). It must equal the
+ * `packageManager` field in package.json (a test checks this). Never install the
+ * latest pnpm: pnpm 12 rejects our lockfile settings and refuses `sudo pnpm setup`.
+ */
+export const PNPM_VERSION = '10.33.0'
+/** The Node.js version `n` installs for the Engine. */
+export const NODE_VERSION = '22.20.0'
+
 export const installBaseNpm = async (exec: any) => {
-  print(chalk.blue('Installing base node, n, npm and pnpm for script execution...'));
+  print(chalk.blue(`Installing base node ${NODE_VERSION}, n, npm and pnpm ${PNPM_VERSION} for script execution...`));
   try {
     await exec`sudo apt install npm -y`
-    await exec`sudo npm install -g -y n pnpm`
-    await exec`sudo n 22.20.0`
+    // Pinned pnpm, never latest (idea#146)
+    await exec`sudo npm install -g -y n pnpm@${PNPM_VERSION}`
+    await exec`sudo n ${NODE_VERSION}`
   } catch (e) {
     print(chalk.red('Error installing base node, n, npm and pnpm...'));
     console.error(e);
@@ -3840,7 +3934,7 @@ export const installBaseNpm = async (exec: any) => {
 export const installEngineNode = async (exec: any) => {
   print(chalk.blue('Installing node version for engine...'));
   try {
-    await exec`sudo n 22.20.0`
+    await exec`sudo n ${NODE_VERSION}`
   } catch (e) {
     print(chalk.red('Error installing engine node version...'));
     console.error(e);
@@ -3849,16 +3943,36 @@ export const installEngineNode = async (exec: any) => {
   print(chalk.green('Engine node version installed'));
 }
 
+/**
+ * Check the pinned pnpm is the one on PATH, then run `pnpm setup` as the build
+ * user (pi), not with sudo (idea#146). `sudo pnpm setup` only configured root's
+ * home, and pnpm 12 refuses it outright (ERR_PNPM_SUDO_NOT_SUPPORTED), which used
+ * to abort the build before the Engine was installed and before the final reboot.
+ * `pnpm setup` only adds PNPM_HOME to the user's shell profile; nothing later in
+ * the build needs it, so a failure there is a warning, not a stop.
+ */
 export const configurePnpm = async (exec: any) => {
   print(chalk.blue('Setting up pnpm...'));
+  let installed = ''
   try {
-    await exec`sudo pnpm setup`
+    const out = await exec`pnpm --version`
+    installed = String(out.stdout ?? out).trim()
   } catch (e) {
-    print(chalk.red('Error setting up pnpm...'));
+    print(chalk.red('pnpm is not on PATH after installBaseNpm'));
     console.error(e);
     process.exit(1);
   }
-  print(chalk.green('pnpm set up'));
+  if (installed !== PNPM_VERSION) {
+    print(chalk.red(`pnpm ${installed} is installed, but the Engine needs pnpm ${PNPM_VERSION} (idea#146)`));
+    process.exit(1);
+  }
+  try {
+    await exec`pnpm setup`
+  } catch (e) {
+    print(chalk.yellow('pnpm setup failed; continuing (only the shell profile is affected)'));
+    console.error(e);
+  }
+  print(chalk.green(`pnpm ${PNPM_VERSION} set up`));
 }
 
 
@@ -5619,6 +5733,7 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
 ```typescript
 import { $, chalk, fs, YAML } from 'zx'
 import { posix } from 'path'
+import pack from '../../package.json' with { type: "json" }
 import { deepPrint, fileExists, log, stripPartition, uuid, print } from '../utils/utils.js'
 import { DeviceName, DiskID, DiskName, Timestamp, Version } from './CommonTypes.js'
 import { config, disksRoot } from './Config.js'
@@ -5652,6 +5767,74 @@ const sampleMeta: DiskMeta = {
   lastDocked: 1733673600000 as Timestamp
 }
 
+export const SYSTEM_META_PATH = '/META.yaml'
+
+/** What to do when /META.yaml is missing, shown in errors (idea#145). */
+export const SYSTEM_META_HELP =
+  'Run ./build-engine --personalize on this Pi to create /META.yaml, or check that ' +
+  '/etc/sudoers.d/10-engine allows pi to run /usr/bin/tee /META.yaml'
+
+export interface SystemMetaDeps {
+  exists: (path: string) => boolean
+  readHardwareId: (device: DeviceName) => Promise<DiskID | undefined>
+  write: (meta: DiskMeta, path: string) => Promise<void>
+  now: () => number
+}
+
+const defaultSystemMetaDeps: SystemMetaDeps = {
+  exists: (p) => fileExists(p),
+  readHardwareId: (device) => readHardwareId(device),
+  write: (meta, p) => writeMetaFile(meta, p),
+  now: () => Date.now(),
+}
+
+/**
+ * Create the system disk's /META.yaml when it is missing (idea#145).
+ *
+ * A freshly flashed Pi may have no /META.yaml (it used to be written only by
+ * build-engine's addMeta / --personalize), and the Engine then exited at import
+ * while determining its id. Now, like a disk META.yaml on first dock (#121),
+ * the Engine writes one itself: diskId from the root disk's hardware serial
+ * when readHardwareId finds one, otherwise a random UUID; diskName = diskId (as
+ * addMeta does); the Engine version from package.json. It is written with
+ * `sudo tee /META.yaml` (writeMetaFile, 10-engine). build-engine --personalize
+ * may later replace it, as before.
+ *
+ * Returns the new meta, or null when the file already exists. With
+ * allowCreate false (testMode/isDev, which never write /META.yaml) or when the
+ * write fails, it throws an Error that says what to do (SYSTEM_META_HELP).
+ */
+export const ensureSystemMeta = async (
+  device: DeviceName,
+  options: { path?: string, allowCreate?: boolean, deps?: Partial<SystemMetaDeps> } = {},
+): Promise<DiskMeta | null> => {
+  const metaPath = options.path ?? SYSTEM_META_PATH
+  const deps = { ...defaultSystemMetaDeps, ...options.deps }
+  if (deps.exists(metaPath)) return null
+  if (options.allowCreate === false) {
+    throw new Error(`${metaPath} is missing and is not created in testMode/isDev. ${SYSTEM_META_HELP}`)
+  }
+  log(`${metaPath} is missing: creating it (first run of this Engine)`)
+  const hardwareId = await deps.readHardwareId(device).catch(() => undefined)
+  const diskId = (hardwareId ? hardwareId : uuid()) as DiskID
+  const now = deps.now() as Timestamp
+  const meta: DiskMeta = {
+    diskId,
+    isHardwareId: !!hardwareId,
+    diskName: diskId.toString() as DiskName,
+    created: now,
+    lastDocked: now,
+    version: String(pack.version) as Version,
+  }
+  try {
+    await deps.write(meta, metaPath)
+  } catch (e) {
+    throw new Error(`${metaPath} is missing and could not be created: ${e instanceof Error ? e.message : e}. ${SYSTEM_META_HELP}`)
+  }
+  log(`Created ${metaPath} with diskId ${diskId} (${hardwareId ? 'hardware serial' : 'generated'})`)
+  return meta
+}
+
 export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMeta> => {
   let path
   let device: DeviceName
@@ -5677,6 +5860,11 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
       }
     }
     log(`Reading metadata for device ${device} at path ${path}`)
+
+    // The system disk's /META.yaml: create it when it is missing (idea#145)
+    if (!deviceSpec) {
+      await ensureSystemMeta(device, { allowCreate: !config.settings.isDev && !config.settings.testMode })
+    }
 
     //log(`Our current dir is ${await $`pwd`} with content ${await $`ls`} and path ${path}`)
     if (await fileExists(path)) {
@@ -9438,6 +9626,69 @@ export const resourceLock = new ResourceLockManager()
 // Key helpers
 export const instanceKey = (instanceId: string) => `instance:${instanceId}`
 export const diskKey = (diskId: string) => `disk:${diskId}`
+
+```
+
+## File: src/utils/cliFlags.ts
+```typescript
+/**
+ * Boolean command-line flags for build-engine (idea#146).
+ *
+ * zx's `argv` is minimist without declared booleans, so a flag can arrive as:
+ *   --argon            true
+ *   --no-argon         false
+ *   --argon=false      'false' (a string)
+ *   --argon false      'false' (a string)
+ *   (absent)           undefined
+ *
+ * The old `argv.argon || defaults.argon` could never turn off an option whose
+ * config default is true (argon, gadget). parseBoolFlag uses the flag whenever it
+ * is present and falls back to the default only when it is absent.
+ */
+const TRUE_WORDS = ['true', 'yes', 'on', '1']
+const FALSE_WORDS = ['false', 'no', 'off', '0']
+
+export const parseBoolFlag = (value: unknown, fallback: boolean): boolean => {
+    if (value === undefined || value === null) return fallback
+    if (typeof value === 'boolean') return value
+    if (typeof value === 'number') return value !== 0
+    if (typeof value === 'string') {
+        const v = value.trim().toLowerCase()
+        if (v === '') return true            // `--argon=` counts as present
+        if (TRUE_WORDS.includes(v)) return true
+        if (FALSE_WORDS.includes(v)) return false
+    }
+    // Arrays (flag given twice) and anything else: the last value wins.
+    if (Array.isArray(value) && value.length > 0) return parseBoolFlag(value[value.length - 1], fallback)
+    throw new Error(`Not a boolean flag value: ${JSON.stringify(value)} (use --flag, --no-flag or --flag=true|false)`)
+}
+
+/** Raspberry Pi models build-engine knows about. */
+export type PiModel = 'pi4' | 'pi5'
+
+export const parseModel = (value: unknown): PiModel | undefined => {
+    if (value === undefined || value === null || value === '') return undefined
+    const v = String(value).trim().toLowerCase()
+    if (v === 'pi4' || v === 'pi5') return v
+    throw new Error(`Unknown --model ${JSON.stringify(value)}; expected pi4 or pi5`)
+}
+
+/**
+ * Resolve the gadget setting for a model. USB gadget mode needs the Pi 4's DWC2
+ * USB controller; the Pi 5 has a PCIe USB controller, so gadget mode must stay off.
+ * Asking for it explicitly on a Pi 5 is an error; a config default of true is
+ * silently overridden.
+ */
+export const resolveGadget = (flag: unknown, fallback: boolean, model: PiModel | undefined): boolean => {
+    const gadget = parseBoolFlag(flag, fallback)
+    if (model === 'pi5' && gadget) {
+        if (flag !== undefined && parseBoolFlag(flag, false)) {
+            throw new Error('--gadget is not supported on a Pi 5 (PCIe USB controller); leave it out or pass --no-gadget')
+        }
+        return false
+    }
+    return gadget
+}
 
 ```
 
