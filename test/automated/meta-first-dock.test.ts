@@ -10,6 +10,12 @@
  * readMetaUpdateId). These tests set settings.skipMetaWrite = false to run the
  * real write on fixture disks without META.yaml.
  *
+ * On a real Engine the mount roots under /disks are root:root, so META.yaml is
+ * written with `sudo /usr/bin/tee /disks/<device>/META.yaml` (sudoers file
+ * 11-engine-files). The sudo tests put a fake `sudo` first on PATH that records
+ * the arguments and stdin it gets, so they prove the exact command line without
+ * root and without touching /disks.
+ *
  * Also unit-tests the orphan rule used by script/cleanup-store.ts.
  */
 
@@ -24,6 +30,8 @@ import { localEngineId } from '../../src/data/Engine.js'
 import { enableUsbDeviceMonitor } from '../../src/monitors/usbDeviceMonitor.js'
 import { DISK_DETECTION_COMMAND } from '../../src/monitors/diskDetection.js'
 import { findOrphanDiskIds } from '../../script/cleanup-store-lib.js'
+import { DiskMeta, SUDO_META_PATH, SUDO_TEE, writeMetaFile } from '../../src/data/Meta.js'
+import { $ } from 'zx'
 import {
     createTestStore,
     dockFixture,
@@ -184,5 +192,124 @@ describe('cleanup-store orphan disk entries (idea#121)', () => {
 
     it('an empty store has no orphans', () => {
         expect(findOrphanDiskIds({})).toEqual([])
+    })
+})
+
+describe('META.yaml under /disks is written with sudo tee (idea#121)', () => {
+    const SUDOERS_11 = path.join(process.cwd(), 'script/build_image_assets/11-engine-files.sudoers')
+    const meta = {
+        diskId: 'test-disk-121', isHardwareId: false, diskName: 'Unnamed Disk',
+        created: 1, lastDocked: 1,
+    } as unknown as DiskMeta
+    let binDir = ''
+    let argsFile = ''
+    let stdinFile = ''
+    const savedPath = process.env.PATH
+    const savedExit = process.env.FAKE_SUDO_EXIT
+
+    beforeAll(async () => {
+        // Fake sudo: records its arguments (one per line) and stdin, exits with FAKE_SUDO_EXIT
+        binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-121-fake-sudo-'))
+        argsFile = path.join(binDir, 'args')
+        stdinFile = path.join(binDir, 'stdin')
+        await fs.writeFile(path.join(binDir, 'sudo'),
+            `#!/bin/sh\nprintf '%s\\n' "$@" > '${argsFile}'\ncat > '${stdinFile}'\nexit \${FAKE_SUDO_EXIT:-0}\n`,
+            { mode: 0o755 })
+        process.env.PATH = `${binDir}:${savedPath}`
+    })
+
+    afterAll(async () => {
+        process.env.PATH = savedPath
+        if (savedExit === undefined) delete process.env.FAKE_SUDO_EXIT
+        else process.env.FAKE_SUDO_EXIT = savedExit
+        if (binDir) await fs.remove(binDir).catch(() => {})
+    })
+
+    const resetFake = async () => {
+        await fs.remove(argsFile)
+        await fs.remove(stdinFile)
+        delete process.env.FAKE_SUDO_EXIT
+    }
+    const sudoArgs = async (): Promise<string[]> =>
+        (await fs.readFile(argsFile, 'utf-8')).split('\n').slice(0, -1)
+
+    // The command part of the single pi rule in 11-engine-files, as a regex
+    // (sudo globbing: [..] is a character class, everything else is literal here).
+    const sudoersCommand = (): string => {
+        const rules = fs.readFileSync(SUDOERS_11, 'utf-8').split('\n').filter(l => /^\s*pi\s/.test(l))
+        expect(rules).toHaveLength(1)
+        const m = rules[0].match(/^pi ALL=\(root\) NOPASSWD: (.+)$/)
+        expect(m, rules[0]).not.toBeNull()
+        return m![1]
+    }
+    const globToRegex = (glob: string): RegExp =>
+        new RegExp('^' + glob.split(/(\[[^\]]+\])/).map(part =>
+            part.startsWith('[') ? part : part.replace(/[.*+?^${}()|\\/]/g, c => (c === '*' ? '.*' : '\\' + c))
+        ).join('') + '$')
+
+    it('a plain write as pi fails under /disks, the sudo tee path succeeds with the exact sudoers arguments', async () => {
+        await resetFake()
+        const target = '/disks/sdz1/META.yaml'
+        // Without sudo the write fails: the folder is not the Engine user's
+        // (on an Engine it is root:root; on a dev box /disks/sdz1 does not exist).
+        const plain = await fs.writeFile(target, 'x').then(() => null, (e: NodeJS.ErrnoException) => e.code)
+        expect(plain, 'plain write to /disks/sdz1 unexpectedly worked').not.toBeNull()
+
+        await writeMetaFile(meta, target)
+
+        const args = await sudoArgs()
+        expect(args).toEqual(['/usr/bin/tee', '/disks/sdz1/META.yaml'])
+        expect(args[0]).toBe(SUDO_TEE)
+        expect(YAML.parse(await fs.readFile(stdinFile, 'utf-8'))).toEqual(meta)
+        // What sudo sees matches the sudoers entry exactly
+        expect(args.join(' ')).toMatch(globToRegex(sudoersCommand()))
+    })
+
+    it('11-engine-files has exactly the agreed entry, matching SUDO_META_PATH', async (ctx) => {
+        expect(sudoersCommand()).toBe(`${SUDO_TEE} /disks/sd[a-z][12]/META.yaml`)
+        const rule = globToRegex(sudoersCommand())
+        for (const device of ['sda1', 'sda2', 'sdb1', 'sdz2']) {
+            const p = `/disks/${device}/META.yaml`
+            expect(SUDO_META_PATH.test(p), p).toBe(true)
+            expect(`${SUDO_TEE} ${p}`, p).toMatch(rule)
+        }
+        for (const p of ['/disks/sda/META.yaml', '/disks/sda3/META.yaml', '/disks/old/sda1/META.yaml',
+                         '/disks/sda1/META.yaml.bak', '/disks/sda1/x/META.yaml', '/tmp/disks/sda1/META.yaml']) {
+            expect(SUDO_META_PATH.test(p), p).toBe(false)
+            expect(`${SUDO_TEE} ${p}`, p).not.toMatch(rule)
+        }
+        const visudo = ['/usr/sbin/visudo', '/sbin/visudo'].find(p => fs.existsSync(p))
+        if (!visudo) ctx.skip()
+        const out = await $`${visudo} -cf ${SUDOERS_11}`.nothrow()
+        expect(out.exitCode, out.stderr).toBe(0)
+    })
+
+    it('the path is normalised before matching, so the command still matches the entry', async () => {
+        const calls: [string, string][] = []
+        await writeMetaFile(meta, '/disks//sdb2/./META.yaml', async (p, c) => { calls.push([p, c]) })
+        expect(calls).toHaveLength(1)
+        expect(calls[0][0]).toBe('/disks/sdb2/META.yaml')
+    })
+
+    it('a failing sudo tee makes writeMetaFile throw (the monitor records writeMeta)', async () => {
+        await resetFake()
+        process.env.FAKE_SUDO_EXIT = '1'
+        await expect(writeMetaFile(meta, '/disks/sdz2/META.yaml')).rejects.toThrow()
+        delete process.env.FAKE_SUDO_EXIT
+    })
+
+    it('test and fixture roots (not /disks/sdXN) are written as pi without sudo', async () => {
+        await resetFake()
+        const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-121-root-'))
+        try {
+            const target = path.join(dir, 'sda1', 'META.yaml')
+            await fs.ensureDir(path.dirname(target))
+            await writeMetaFile(meta, target)
+            expect(fs.existsSync(argsFile), 'sudo was called').toBe(false)
+            expect(YAML.parse(await fs.readFile(target, 'utf-8'))).toEqual(meta)
+            expect(fs.statSync(target).uid).toBe(process.getuid!())
+        } finally {
+            await fs.remove(dir)
+        }
     })
 })

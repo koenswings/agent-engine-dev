@@ -194,8 +194,9 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                     }
                     // Persist the identity on the disk (idea#121). Without this every
                     // dock generated a new diskId (when there is no hardware serial)
-                    // and left an orphan diskDB entry behind. A failed write (read-only
-                    // or root-owned mount) is recorded and the disk is still registered.
+                    // and left an orphan diskDB entry behind. Under /disks the write goes through
+                    // sudo tee (11-engine-files). A failed write (read-only
+                    // mount, sudoers entry missing) is recorded and the disk is still registered.
                     const metaPath = `${disksRoot()}/${device}/META.yaml`
                     if (skipMetaWrite()) {
                         log(`Not writing ${metaPath} (skipMetaWrite)`)

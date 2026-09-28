@@ -2,9 +2,12 @@
  * run-as-pi.test.ts
  *
  * Verifies idea#80: the Engine runs as pi, and the only root commands it runs are
- * the ones listed in script/build_image_assets/10-engine.sudoers.
+ * the ones listed in script/build_image_assets/10-engine.sudoers and
+ * 11-engine-files.sudoers (idea#121).
  *
- *   1. App Disk META.yaml files are written as the Engine user, without sudo
+ *   1. META.yaml under a pi-owned (test) mount root is written as the Engine user,
+ *      without sudo. Real /disks/sdXN roots go through sudo tee (idea#121, tested
+ *      in meta-first-dock.test.ts)
  *   2. The sudoers asset is valid sudoers syntax (visudo -cf) and uses narrow patterns
  *   3. Every runtime `sudo` call in src/ is covered by the sudoers asset
  *   4. sync-engine / reset-engine / build-engine never use root's pm2 (`sudo pm2`)
@@ -38,7 +41,7 @@ const sudoCalls = (text: string): string[] =>
         .filter(m => !text.slice(text.lastIndexOf('\n', m.index!) + 1, m.index!).trimStart().startsWith('//'))
         .map(m => m[1])
 
-describe('App Disk META.yaml is written as pi (idea#80)', () => {
+describe('META.yaml under a pi-owned mount root is written as pi (idea#80)', () => {
     const device = uniqueTestDevice()
     afterEach(async () => { await fs.remove(diskPath(device)) })
 
@@ -97,6 +100,9 @@ describe('Engine sudoers asset (idea#80)', () => {
         expect(meta).toContain('$`sudo cat ${path}`')
         expect(meta).toContain("$`sudo hdparm -I /dev/${device} | grep 'Serial\\ Number'`")
         expect(meta).toContain('$({ input: yamlContent })`sudo tee /META.yaml > /dev/null`')
+        // App Disk META.yaml through 11-engine-files (idea#121)
+        expect(meta).toContain('$({ input: content })`sudo ${SUDO_TEE} ${metaPath} > /dev/null`')
+        expect(meta).toContain("export const SUDO_TEE = '/usr/bin/tee'")
         expect(meta).not.toMatch(/sudo mv/)
         expect(src('src/data/Engine.ts')).toContain('$`sudo /usr/bin/systemctl reboot`')
         expect(src('src/data/Engine.ts')).not.toMatch(/\$`sudo reboot now`/)
@@ -121,6 +127,17 @@ describe('Engine sudoers asset (idea#80)', () => {
             '/usr/bin/mkdir -p /apps /instances /services',
             '/usr/bin/chown pi\\:pi /apps /instances /services',
         ]) expect(rulesText).toContain(rule)
+    })
+
+    it('11-engine-files is valid, grants only pi as root, and 10-engine has no /disks tee (idea#121)', async (ctx) => {
+        const files = fs.readFileSync(path.join(ROOT, 'script/build_image_assets/11-engine-files.sudoers'), 'utf8')
+        const rules = files.split('\n').filter(l => l.trim() && !l.trimStart().startsWith('#'))
+        expect(rules).toEqual(['pi ALL=(root) NOPASSWD: /usr/bin/tee /disks/sd[a-z][12]/META.yaml'])
+        expect(rulesText).not.toMatch(/tee \/disks/)
+        const visudo = ['/usr/sbin/visudo', '/sbin/visudo'].find(p => fs.existsSync(p))
+        if (!visudo) ctx.skip()
+        const out = await $`${visudo} -cf ${path.join(ROOT, 'script/build_image_assets/11-engine-files.sudoers')}`.nothrow()
+        expect(out.exitCode, out.stderr).toBe(0)
     })
 
     it('runtime code no longer needs sudo for instance folders, old/* globs or docker', () => {
@@ -150,6 +167,8 @@ describe('pm2 runs as pi in the sync/reset/build scripts (idea#80)', () => {
         expect(engine).toMatch(/installEngineSudoers\(exec, enginePath\)/)
         expect(engine).toContain("'10-engine.sudoers'")
         expect(engine).toContain("'/etc/sudoers.d/10-engine'")
+        expect(engine).toContain("'11-engine-files.sudoers'")
+        expect(engine).toContain("'/etc/sudoers.d/11-engine-files'")
     })
 
     it('the cross-engine helper checks pi\'s pm2', () => {

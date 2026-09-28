@@ -1,0 +1,15 @@
+# /etc/sudoers.d/11-engine-files: installed by build-engine (installUdev -> installEngineSudoers),
+# mode 0440, owner root:root. Validate with: visudo -cf <file>
+#
+# Files the Engine (running as pi under pm2) writes as root on App Disks (idea#121).
+# 10-engine lists the Engine's other root commands and is not changed by this file.
+# Keep this file in sync with the code:
+#   META.yaml  src/data/Meta.ts (writeMetaFile, runSudoTee: first dock of a disk
+#              without META.yaml; the mount roots under /disks are root:root)
+#
+# The code runs `sudo /usr/bin/tee /disks/<device>/META.yaml > /dev/null` with the
+# YAML on stdin, so sudo sees exactly "/usr/bin/tee /disks/<device>/META.yaml".
+# Patterns are narrow on purpose (sd[a-z][12], never /disks/*): in sudoers a '*' in
+# arguments also matches spaces, '/' and '..'. tee without -a truncates the file.
+# Paths are for Raspberry Pi OS (merged /usr).
+pi ALL=(root) NOPASSWD: /usr/bin/tee /disks/sd[a-z][12]/META.yaml

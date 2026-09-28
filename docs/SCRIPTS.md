@@ -31,7 +31,7 @@ This document provides a reference for the main provisioning and utility scripts
     -   `--upgrade`, `--argon`, `--zerotier`, `--raspap`, `--gadget`, `--temperature`: Turn on optional parts of the build.
     -   `--prod`: Build in production mode.
     -   `--personalize`: Personalize Mode (see above).
--   **Details:** A full build handles everything from setting the hostname and installing Docker to deploying the Engine software itself. It also installs `/etc/sudoers.d/10-engine` from `script/build_image_assets/10-engine.sudoers` (validated with `visudo` first): the exact commands the Engine, running as `pi`, may run as root. pm2 and `pm2-logrotate` are installed into pi's pm2.
+-   **Details:** A full build handles everything from setting the hostname and installing Docker to deploying the Engine software itself. It also installs the Engine's two sudoers files (`installEngineSudoers`, each validated with `visudo` first, mode 0440, owner root:root): `/etc/sudoers.d/10-engine` from `script/build_image_assets/10-engine.sudoers`, the exact commands the Engine, running as `pi`, may run as root; and `/etc/sudoers.d/11-engine-files` from `script/build_image_assets/11-engine-files.sudoers`, the files it may write as root on App Disks (`/usr/bin/tee /disks/sd[a-z][12]/META.yaml`, idea#121). pm2 and `pm2-logrotate` are installed into pi's pm2.
 
 ---
 
