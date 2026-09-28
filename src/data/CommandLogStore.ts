@@ -8,7 +8,7 @@
  * The doc URL is exposed at GET /api/command-log-url (added to httpMonitor).
  */
 
-import { DocHandle, Repo } from '@automerge/automerge-repo'
+import { DocHandle, Repo, isValidAutomergeUrl } from '@automerge/automerge-repo'
 import { log } from '../utils/utils.js'
 import { fs } from 'zx'
 import path from 'path'
@@ -64,26 +64,80 @@ export const setCommandLogHandle = (handle: DocHandle<CommandLogStore> | null): 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
 /**
+ * How long createCommandLogStore waits for the doc named in
+ * command-log-url.txt (idea#145). The doc is normally in local storage and
+ * loads in milliseconds. On a fresh Engine the tracked URL points at the
+ * fleet's shared log, which no peer may have (a new school Pi has no peers),
+ * and after a store-data wipe the Engine's own previous log is gone: then
+ * repo.find()/whenReady() could wait forever and the Console never came up.
+ */
+export const COMMAND_LOG_LOAD_TIMEOUT_MS = 10_000
+
+export interface CommandLogStoreOptions {
+  /** Default: <storeIdentityFolder>/command-log-url.txt */
+  urlFile?: string
+  /** Default: COMMAND_LOG_LOAD_TIMEOUT_MS */
+  timeoutMs?: number
+}
+
+/**
+ * Load the doc at `url`, giving up after `timeoutMs` (idea#145). Rejects when
+ * the doc is unavailable (not in storage, no peer has it) or the time runs out;
+ * the pending find is aborted.
+ */
+export const findCommandLogWithTimeout = async (
+  repo: Repo,
+  url: string,
+  timeoutMs: number,
+): Promise<DocHandle<CommandLogStore>> => {
+  if (!isValidAutomergeUrl(url)) throw new Error(`'${url}' is not a valid Automerge URL`)
+  const controller = new AbortController()
+  let timer: NodeJS.Timeout | undefined
+  const load = async () => {
+    const handle = await repo.find<CommandLogStore>(url, { signal: controller.signal })
+    await handle.whenReady()
+    return handle
+  }
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort()
+      reject(new Error(`not available after ${timeoutMs} ms (not in local storage and no peer supplied it)`))
+    }, timeoutMs)
+  })
+  try {
+    return await Promise.race([load(), timeout])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
  * Create the CommandLogStore Automerge doc inside the given Repo.
  * Persists the doc URL next to the main store URL so it survives restarts.
+ *
+ * If command-log-url.txt names a doc that cannot be loaded within the timeout
+ * (fresh Engine whose tracked URL no peer has, or store-data wiped), a fresh
+ * CommandLogStore is created and its URL is written to command-log-url.txt, so
+ * startup never hangs (idea#145). The command log is ephemeral history, so
+ * nothing needed is lost; the main store is not affected.
  */
 export const createCommandLogStore = async (
-  repo: Repo
+  repo: Repo,
+  options: CommandLogStoreOptions = {},
 ): Promise<DocHandle<CommandLogStore>> => {
-  const identityDir = './' + config.settings.storeIdentityFolder
-  const urlFile = path.join(identityDir, 'command-log-url.txt')
+  const urlFile = options.urlFile ?? path.join('./' + config.settings.storeIdentityFolder, 'command-log-url.txt')
+  const timeoutMs = options.timeoutMs ?? COMMAND_LOG_LOAD_TIMEOUT_MS
 
   let handle: DocHandle<CommandLogStore>
 
-  if (fs.existsSync(urlFile)) {
-    const existingUrl = (await fs.readFile(urlFile, 'utf-8')).trim() as any
-    log(`[commandLog] Loading existing CommandLogStore from ${existingUrl}`)
+  const existingUrl = fs.existsSync(urlFile) ? (await fs.readFile(urlFile, 'utf-8')).trim() : ''
+  if (existingUrl) {
+    log(`[commandLog] Loading existing CommandLogStore from ${existingUrl} (timeout ${timeoutMs} ms)`)
     try {
-      handle = await repo.find<CommandLogStore>(existingUrl)
-      await handle.whenReady()
+      handle = await findCommandLogWithTimeout(repo, existingUrl, timeoutMs)
       log(`[commandLog] CommandLogStore loaded, state: ${handle.state}`)
     } catch (e) {
-      log(`[commandLog] Failed to load existing doc (${e}), creating fresh one`)
+      log(`[commandLog] Could not load ${existingUrl}: ${e instanceof Error ? e.message : e}. Creating a fresh CommandLogStore and rewriting ${urlFile}`)
       handle = await _createFresh(repo, urlFile)
     }
   } else {
@@ -95,6 +149,23 @@ export const createCommandLogStore = async (
   return handle
 }
 
+/**
+ * Shut a Repo down without failing on a handle that never became ready
+ * (idea#145). repo.shutdown() flushes every cached handle and throws
+ * "DocHandle is not ready" for one that is still unavailable, such as a
+ * command log that timed out. Then only the ready handles are flushed again,
+ * so the store and the new command log are still saved.
+ */
+export const shutdownRepo = async (repo: Repo): Promise<void> => {
+  try {
+    await repo.shutdown()
+  } catch (e) {
+    log(`[repo] shutdown flush failed (${e instanceof Error ? e.message : e}); flushing the ready documents only`)
+    const ready = Object.values(repo.handles).filter(h => h.isReady()).map(h => h.documentId)
+    await repo.flush(ready)
+  }
+}
+
 const _createFresh = async (
   repo: Repo,
   urlFile: string
@@ -104,6 +175,7 @@ const _createFresh = async (
     recentTraceIds: [],
   })
   await handle.whenReady()
+  await fs.ensureDir(path.dirname(urlFile))
   await fs.writeFile(urlFile, handle.url)
   log(`[commandLog] Created new CommandLogStore: ${handle.url}`)
   return handle

@@ -27,7 +27,9 @@ const getLocalEngineId = async (): Promise<EngineID> => {
     const meta: DiskMeta = await readMetaUpdateId()
     return createEngineIdFromDiskId(meta.diskId)
   } catch (error) {
-    console.error(`Error getting local engine id: ${error}`)
+    // Readable reason for the exit instead of a bare import-time crash (idea#145):
+    // ensureSystemMeta's errors say how to fix a missing /META.yaml.
+    console.error(`Cannot start the Engine: could not determine the local Engine id: ${error instanceof Error ? error.message : error}`)
     process.exit(1)
   }
 }
