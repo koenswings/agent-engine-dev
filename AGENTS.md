@@ -88,6 +88,8 @@ live Engine (idea#105):
 4. PASS → open the PR, post the full PR URL on the issue, and notify Ops Bot and Lead Bot with it (`https://github.com/koenswings/<repo>/pull/<N>`).
 5. Ops Bot runs `find-available-pi.sh` and `deploy.sh` to a review Pi. Koen evaluates the PR on real Pi hardware and squash-merges. Ops Bot runs teardown and `update-golden.sh`.
 
+**Never ask Koen to run a specific test** (standing rule, Steve 2026-09-28). Any test a change needs is written as an automated test: unit, integration, or on-Pi hardware such as `script/hw-roundtrip.ts`. It must pass before hand-off. A hand-off to Koen contains only the PR URL, the review URL and the automated test evidence, never manual test steps.
+
 ## Testing on a fleet Pi (claim protocol)
 
 Follows idea `docs/grok-bot-setup.md` §4.6. The pool is **idea01, idea03, idea04**. **Never use golden idea02.** One job per Pi, and never take more than one Pi down at a time.
