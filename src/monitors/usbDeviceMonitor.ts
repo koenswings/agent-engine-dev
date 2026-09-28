@@ -6,7 +6,7 @@ import { $, fs, YAML, chalk } from 'zx'
 $.verbose = false;
 import { Disk, createOrUpdateDisk, processDisk } from '../data/Disk.js'
 import { findDiskByDevice, Store, getDisksOfEngine, getLocalEngine } from '../data/Store.js'
-import { DeviceName, DiskID, DiskName, InstanceID, Timestamp } from '../data/CommonTypes.js'
+import { DeviceName, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../data/CommonTypes.js'
 
 import { Instance, Status, stopInstance } from '../data/Instance.js';
 import { config, disksRoot, skipMetaWrite } from '../data/Config.js'
@@ -14,6 +14,14 @@ import { DocHandle } from '@automerge/automerge-repo';
 import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js';
 import { runWithTrace } from '../utils/CommandLogger.js';
 import { recordDiskDetectionFailure, errorMessage } from './diskDetection.js';
+import { safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointOf } from './mounts.js';
+
+/**
+ * Filesystem UUID of each mounted device, recorded at mount time (or when an
+ * existing mount is found) with lsblk -no UUID. Used for Disk.unmountError
+ * (idea#126).
+ */
+const mountedFsUuids = new Map<string, string | null>()
 
 /**
  * Pretend disks created by the test harness use names that real hardware never
@@ -129,23 +137,18 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                     return
                 }
 
-                if (config.settings.testMode) {
+                if (!mountCommandsActive(config.settings.testMode)) {
                     log(`testMode: skipping mount for device ${device} — fixture expected at ${disksRoot()}/${device}`)
                 } else {
-                    const mountOutput = await $`mount -t ext4`
-                    if (mountOutput.stdout.includes(`/dev/${device} on ${disksRoot()}/${device} type ext4`)) {
-                        log(`Device ${device} already mounted`)
-                    } else {
-                        log(`Mounting device ${device}`)
-                        try {
-                            await $`sudo mkdir -p ${disksRoot()}/${device}`
-                            await $`sudo mount /dev/${device} ${disksRoot()}/${device}`
-                        } catch (e) {
-                            recordDiskDetectionFailure('mount', `Could not mount /dev/${device} on ${disksRoot()}/${device}: ${errorMessage(e)}`, { device })
-                            return
-                        }
-                        log(`Device ${device} has been successfully mounted`)
+                    // findmnt-based check by target and source, for every filesystem
+                    // type; never mounts twice or onto an existing mount point (idea#126)
+                    const result = await safeMount(device)
+                    if (!result.ok) {
+                        recordDiskDetectionFailure('mount', result.message, { device })
+                        return
                     }
+                    mountedFsUuids.set(device, result.fsUuid)
+                    log(result.alreadyMounted ? `Device ${device} already mounted` : `Device ${device} has been successfully mounted`)
                 }
 
                 let meta: DiskMeta
@@ -285,24 +288,24 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     log(`Cleaning the mount points...`)
     const previousMounts = (config.settings.isDev || config.settings.testMode) ? [] : (await $`ls ${disksRoot()}`).toString().split('\n').filter(device => validDevice(device))
     log(`Previously mounted devices: ${previousMounts}`)
-    const mountOutput = await $`mount -t ext4`
+    // Stale mount point folders of devices that are no longer attached. A folder
+    // that is still a mount point (by findmnt target or mountpoint -q) is left
+    // alone; an empty one is removed with rmdir, never rm -fr (idea#126).
     for (let device of previousMounts) {
         log(`Checking if device ${device} is still actual or mounted`)
-        if (!actualDevices.includes(device) && !mountOutput.stdout.includes(`/dev/${device} on ${disksRoot()}/${device} type ext4`)) {
-            log(`Cleaning up stale mount point for ${device}`)
-            try {
-                await $`sudo umount ${disksRoot()}/${device}`
-            } catch (e: any) {
-                if (e.stderr.includes('not mounted')) {
-                    await $`sudo mkdir -p ${disksRoot()}/old`
-                    await $`sudo mv ${disksRoot()}/${device} ${disksRoot()}/old/${device}`
-                    log(`Device ${device} has been moved to ${disksRoot()}/old`)
-                } else {
-                    log(`Error unmounting device during cleaning ${device}`)
-                    log(e)
-                }
+        if (actualDevices.includes(device)) continue
+        try {
+            const mounts = await mountOps().listMounts()
+            const mountPoint = mountPointOf(device)
+            if (mounts.some(m => m.target === mountPoint) || await mountOps().isMountPoint(mountPoint)) {
+                log(`Stale mount point ${mountPoint} is still mounted — leaving it`)
+                continue
             }
+            log(`Cleaning up stale mount point for ${device}`)
+            await mountOps().rmdir(mountPoint)
             log(`Device ${device} has been successfully cleaned up`)
+        } catch (e) {
+            log(`Error cleaning up the stale mount point of ${device}: ${errorMessage(e)}`)
         }
     }
 
@@ -326,24 +329,7 @@ export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
         return
     }
     try {
-        if (config.settings.testMode) {
-            log(`testMode: skipping umount and rm for device ${device}`)
-        } else {
-            log(`Attempting to unmount device ${device}`)
-            try {
-                await $`sudo umount ${disksRoot()}/${device}`
-                log(`Device ${device} has been successfully unmounted`)
-            } catch (e: any) {
-                // If the error indicates it wasn't mounted, we can proceed.
-                // Otherwise, we must abort to avoid deleting data on a mounted disk.
-                if (!e.stderr.includes('not mounted')) {
-                    throw new Error(`Failed to unmount ${device}: ${e.message}`)
-                }
-                log(`Device ${device} was not mounted`)
-            }
-            await $`sudo rm -fr ${disksRoot()}/${device}`
-            log(`Mount point ${disksRoot()}/${device} has been removed`)
-        }
+        // The store is updated whatever happens to the unmount below (idea#126)
         storeHandle.change(doc => {
             const dsk = doc.diskDB[disk.id]
             if (dsk) {
@@ -377,9 +363,51 @@ export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
             })
             log(`Instance ${instance.id} has been moved to the 'Undocked' state`)
         }
+        // Unmount after the instances are stopped (their containers keep files on
+        // the disk open). Repeat umount until the folder is no longer a mount
+        // point, then rmdir it; never rm -fr (idea#126).
+        if (!mountCommandsActive(config.settings.testMode)) {
+            log(`testMode: skipping umount and rmdir for device ${device}`)
+        } else {
+            await unmountDisk(storeHandle, disk, device, store)
+        }
     } catch (e) {
         log(`Error unmounting device ${device}`)
         log(e)
         recordDiskDetectionFailure('undock', `Could not undock the disk on ${device}: ${errorMessage(e)}`, { device, diskId: disk.id })
     }
+}
+
+/**
+ * Unmount a disk on undock (idea#126): unmountAndRemove() repeats umount until
+ * `mountpoint -q` is false (at most UMOUNT_MAX_ATTEMPTS), then rmdirs the mount
+ * point. On a busy unmount: a failed `diskDetection` trace (step 'undock') and
+ * Disk.unmountError { engineId, mountPoint, fsUuid, message }, for every disk
+ * type. The caller has already updated the store.
+ */
+const unmountDisk = async (storeHandle: DocHandle<Store>, disk: Disk, device: DeviceName, store: Store): Promise<void> => {
+    const mountPoint = mountPointOf(device)
+    log(`Attempting to unmount device ${device}`)
+    let result
+    try {
+        result = await unmountAndRemove(device)
+    } catch (e) {
+        // Unmounted, but the folder could not be removed (e.g. not empty): no data at risk
+        recordDiskDetectionFailure('undock', `Unmounted ${mountPoint} but could not remove the folder: ${errorMessage(e)}`, { device, diskId: disk.id, mountPoint })
+        mountedFsUuids.delete(device)
+        return
+    }
+    if (result.ok) {
+        log(`Device ${device} unmounted after ${result.attempts} umount call(s)${result.removed ? `; ${mountPoint} removed` : ''}`)
+        mountedFsUuids.delete(device)
+        return
+    }
+    const engineId = (getLocalEngine(store)?.id ?? disk.dockedTo) as EngineID
+    const fsUuid = mountedFsUuids.get(device) ?? null
+    const message = `Could not unmount ${mountPoint}: ${result.message}. Restart this Pi to release the disk.`
+    recordDiskDetectionFailure('undock', message, { device, diskId: disk.id, mountPoint, fsUuid })
+    storeHandle.change(doc => {
+        const dsk = doc.diskDB[disk.id]
+        if (dsk) dsk.unmountError = { engineId, mountPoint, fsUuid, message }
+    })
 }

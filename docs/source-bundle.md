@@ -1,11 +1,12 @@
 # Project Source Code Context
-Generated on 2026-09-28T14:09:17.435Z
+Generated on 2026-09-28T15:25:18.000Z
 
 ## File: package.json
 ```typescript
 {
   "name": "engine",
   "version": "1.0",
+  "packageManager": "pnpm@10.33.0",
   "description": "",
   "main": "index.js",
   "type": "module",
@@ -327,6 +328,7 @@ import { recoverInterruptedOperations } from './data/Operations.js'
 import { enableDockerMetricsMonitor } from './monitors/dockerMetricsMonitor.js'
 import { copyApp, moveApp } from './data/CopyMoveApp.js'
 import { backupInstance } from './monitors/backupMonitor.js'
+import { clearStaleUnmountErrors } from './monitors/mounts.js'
 import { InstanceID } from './data/CommonTypes.js'
 import { Status } from './data/Instance.js'
 import { Store } from './data/Store.js'
@@ -412,6 +414,10 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // monitors start so there is no racing writer; tombstones propagate to
     // all peers on the next Automerge sync.
     cleanupPhantomEngines(storeHandle)
+
+    // Clear unmount errors (idea#126) this Engine recorded for disks whose mount
+    // point is no longer mounted, or now holds another filesystem (fsUuid).
+    await clearStaleUnmountErrors(storeHandle, localEngineId).catch(e => log(`Could not clear stale unmount errors: ${e}`))
 
     // Check for undocked apps after restart
     await checkAndSetUndockedApps(storeHandle)
@@ -1105,7 +1111,7 @@ import { installApp } from './InstallApp.js';
 import { copyApp, moveApp } from './CopyMoveApp.js';
 import { resourceLock, diskKey } from '../utils/ResourceLock.js';
 import { undockDisk } from "../monitors/usbDeviceMonitor.js";
-import { backupInstance, restoreApp, createBackupDiskConfig } from "../monitors/backupMonitor.js";
+import { backupInstance, restoreApp, createBackupDiskConfig, runningBackupOnDisk } from "../monitors/backupMonitor.js";
 import { cancelOperation } from './Operations.js';
 import { testContext } from "../../test/testContext.js";
 
@@ -1467,6 +1473,13 @@ const ejectDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskName: 
     if (resourceLock.isLocked(diskKey(disk.id))) {
         const info = resourceLock.getLockInfo(diskKey(disk.id))
         console.error(chalk.red(`Disk '${diskName}' is locked by an active '${info?.kind}' operation. Stop or wait for it to complete before ejecting.`))
+        return
+    }
+    // Refuse to eject a Backup Disk while a backup writes to it (idea#126). Checked by
+    // the backupApp operation's backupDiskId, so scheduled and automatic backups count too.
+    const backup = runningBackupOnDisk(store, disk.id)
+    if (backup) {
+        console.error(chalk.red(`Disk '${diskName}' is in use by a running backup of instance ${backup.args.instanceId}. Wait for it to complete before ejecting.`))
         return
     }
     print(chalk.blue(`Ejecting disk '${diskName}'...`));
@@ -2602,6 +2615,21 @@ export interface Disk {
     dockedTo: EngineID | null;    // The engine to which this disk is currently docked. null if it is not docked to an engine
     diskTypes: DiskType[];        // Types detected for this disk (may be multiple); empty until processDisk runs
     backupConfig: BackupConfig | null;  // Set when disk is a Backup Disk; null otherwise
+    unmountError?: UnmountError | null; // Set when the last undock could not unmount the disk (idea#126); null/absent otherwise
+}
+
+/**
+ * A busy unmount (idea#126, Files Disk Q5). Set by undockDisk for every disk type
+ * when the mount point is still mounted after the umount retries. Kept after
+ * undock (device is then null, hence mountPoint), cleared on the next successful
+ * mount (createOrUpdateDisk) and at Engine startup unless the same filesystem
+ * (fsUuid) is still mounted at mountPoint (clearStaleUnmountErrors).
+ */
+export interface UnmountError {
+    engineId: EngineID;         // Engine on which the unmount failed
+    mountPoint: string;         // e.g. /disks/sdb1
+    fsUuid: string | null;      // filesystem UUID recorded at mount time (lsblk -no UUID); null if unknown
+    message: string;            // why the unmount failed
 }
 
 
@@ -2682,6 +2710,7 @@ export const createOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: Engi
                 lastDocked: new Date().getTime() as Timestamp,
                 diskTypes: [],
                 backupConfig: null,
+                unmountError: null,
             };
             doc.diskDB[diskId] = disk;
         } else {
@@ -2694,6 +2723,7 @@ export const createOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: Engi
             disk.lastDocked = new Date().getTime() as Timestamp;
             disk.diskTypes = [];        // reset; will be repopulated by processDisk
             disk.backupConfig = null;   // reset; will be repopulated if Backup Disk
+            disk.unmountError = null;   // mounted again: a previous busy unmount no longer applies (idea#126)
         }
     });
     return disk!; // Non-null assertion
@@ -3655,6 +3685,15 @@ export const installUdev = async (exec: any, enginePath: string) => {
 d /dev/engine 0775 pi pi -
 EOF`
     await exec`sudo systemd-tmpfiles --create /etc/tmpfiles.d/idea-engine.conf`
+
+    // Apply the docking rules now, not only after the final reboot (idea#146): if
+    // the build stops early, the Engine's disk self-check otherwise fails with
+    // "no /dev/engine entry for sda" until the next reboot. Replaying "add" for
+    // block devices is what udev does at boot.
+    print(chalk.blue('  - Reloading udev rules and replaying block devices...'))
+    await exec`sudo udevadm control --reload-rules`
+    await exec`sudo udevadm trigger --subsystem-match=block --action=add`
+    await exec`sudo udevadm settle --timeout=30`
   } catch (e) {
     print(chalk.red('Error installing udev and udev rules'));
     console.error(e);
@@ -3868,12 +3907,22 @@ export const installRSync = async (exec: any) => {
   print(chalk.green('rsync installed'));
 }
 
+/**
+ * The pnpm version every Engine install uses (idea#146). It must equal the
+ * `packageManager` field in package.json (a test checks this). Never install the
+ * latest pnpm: pnpm 12 rejects our lockfile settings and refuses `sudo pnpm setup`.
+ */
+export const PNPM_VERSION = '10.33.0'
+/** The Node.js version `n` installs for the Engine. */
+export const NODE_VERSION = '22.20.0'
+
 export const installBaseNpm = async (exec: any) => {
-  print(chalk.blue('Installing base node, n, npm and pnpm for script execution...'));
+  print(chalk.blue(`Installing base node ${NODE_VERSION}, n, npm and pnpm ${PNPM_VERSION} for script execution...`));
   try {
     await exec`sudo apt install npm -y`
-    await exec`sudo npm install -g -y n pnpm`
-    await exec`sudo n 22.20.0`
+    // Pinned pnpm, never latest (idea#146)
+    await exec`sudo npm install -g -y n pnpm@${PNPM_VERSION}`
+    await exec`sudo n ${NODE_VERSION}`
   } catch (e) {
     print(chalk.red('Error installing base node, n, npm and pnpm...'));
     console.error(e);
@@ -3885,7 +3934,7 @@ export const installBaseNpm = async (exec: any) => {
 export const installEngineNode = async (exec: any) => {
   print(chalk.blue('Installing node version for engine...'));
   try {
-    await exec`sudo n 22.20.0`
+    await exec`sudo n ${NODE_VERSION}`
   } catch (e) {
     print(chalk.red('Error installing engine node version...'));
     console.error(e);
@@ -3894,16 +3943,36 @@ export const installEngineNode = async (exec: any) => {
   print(chalk.green('Engine node version installed'));
 }
 
+/**
+ * Check the pinned pnpm is the one on PATH, then run `pnpm setup` as the build
+ * user (pi), not with sudo (idea#146). `sudo pnpm setup` only configured root's
+ * home, and pnpm 12 refuses it outright (ERR_PNPM_SUDO_NOT_SUPPORTED), which used
+ * to abort the build before the Engine was installed and before the final reboot.
+ * `pnpm setup` only adds PNPM_HOME to the user's shell profile; nothing later in
+ * the build needs it, so a failure there is a warning, not a stop.
+ */
 export const configurePnpm = async (exec: any) => {
   print(chalk.blue('Setting up pnpm...'));
+  let installed = ''
   try {
-    await exec`sudo pnpm setup`
+    const out = await exec`pnpm --version`
+    installed = String(out.stdout ?? out).trim()
   } catch (e) {
-    print(chalk.red('Error setting up pnpm...'));
+    print(chalk.red('pnpm is not on PATH after installBaseNpm'));
     console.error(e);
     process.exit(1);
   }
-  print(chalk.green('pnpm set up'));
+  if (installed !== PNPM_VERSION) {
+    print(chalk.red(`pnpm ${installed} is installed, but the Engine needs pnpm ${PNPM_VERSION} (idea#146)`));
+    process.exit(1);
+  }
+  try {
+    await exec`pnpm setup`
+  } catch (e) {
+    print(chalk.yellow('pnpm setup failed; continuing (only the shell profile is affected)'));
+    console.error(e);
+  }
+  print(chalk.green(`pnpm ${PNPM_VERSION} set up`));
 }
 
 
@@ -7158,7 +7227,7 @@ import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { createOperation, updateOperation } from '../data/Operations.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
 import { stopInstance, startInstance, BACKUP_STEPS } from '../data/Instance.js'
-import { BackupMode, DiskID, DiskName, InstanceID, Timestamp, OperationCause } from '../data/CommonTypes.js'
+import { BackupMode, DiskID, DiskName, InstanceID, Timestamp, OperationCause, Operation } from '../data/CommonTypes.js'
 import { Store, getInstance, getDisks, findDiskByName } from '../data/Store.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js'
@@ -7237,12 +7306,14 @@ export const backupInstance = async (
     activeBackups.add(instanceId)
     let wasRunning = false
 
-    // Acquire lock on the instance for the duration of the backup
-    const backupLockKey = instanceKey(instanceId)
-    if (!resourceLock.acquire(backupLockKey, 'backupApp')) {
-        log(chalk.yellow(`backupInstance: instance ${instanceId} is locked — skipping (another operation is running)`))
+    // Take the instance lock and the Backup Disk lock together, as restore does
+    // (idea#126, Files Disk step 0): nothing else may change the instance or the
+    // Backup Disk (eject, erase, another backup or restore) while Borg writes.
+    const backupLockKeys = backupLockKeysFor(instanceId, backupDisk.id)
+    if (!resourceLock.acquireAll(backupLockKeys, 'backupApp')) {
         activeBackups.delete(instanceId)
-        return
+        const held = backupLockKeys.map(k => resourceLock.getLockInfo(k)).find(Boolean)
+        throw new Error(`Backup of instance ${instanceId} to disk ${backupDisk.id} not started: the instance or the Backup Disk is locked${held ? ` by '${held.kind}'` : ''} (another operation is running)`)
     }
 
     const opId = existingOpId ?? createOperation(storeHandle, 'backupApp', {
@@ -7255,18 +7326,15 @@ export const backupInstance = async (
         const store = storeHandle.doc()
         const instance = getInstance(store, instanceId)
         if (!instance) {
-            log(`backupInstance: instance ${instanceId} not found in store`)
-            return
+            throw new Error(`Instance ${instanceId} not found in store`)
         }
         if (!instance.storedOn) {
-            log(`backupInstance: instance ${instanceId} has no storedOn disk`)
-            return
+            throw new Error(`Instance ${instanceId} has no storedOn disk`)
         }
 
         const appDisk = store.diskDB[instance.storedOn]
         if (!appDisk || !appDisk.device) {
-            log(`backupInstance: App Disk for instance ${instanceId} is not docked`)
-            return
+            throw new Error(`App Disk for instance ${instanceId} is not docked`)
         }
 
         const backupDevice = backupDisk.device!
@@ -7384,9 +7452,44 @@ export const backupInstance = async (
             }
         }
         // Lock file intentionally left in place — signals boot-resume on next dock
+        // Rethrow so the backup's trace ends with status 'error' and this message
+        throw e
     } finally {
         activeBackups.delete(instanceId)
-        resourceLock.release(backupLockKey)
+        resourceLock.releaseAll(backupLockKeys)
+    }
+}
+
+/** Lock keys a backup holds: the instance and the Backup Disk (idea#126). */
+export const backupLockKeysFor = (instanceId: string, backupDiskId: string): string[] =>
+    [instanceKey(instanceId), diskKey(backupDiskId)]
+
+/**
+ * The running (or pending) backupApp operation writing to a disk, if any
+ * (idea#126). Eject (and a later erase) check this by the operation's
+ * backupDiskId, so every backup is covered, whatever started it (console,
+ * immediate mode, stale lock, crash recovery, a schedule).
+ */
+export const runningBackupOnDisk = (store: Store, diskId: string): Operation | undefined =>
+    Object.values(store.operationDB ?? {}).find(op =>
+        op?.kind === 'backupApp' &&
+        (op.status === 'Running' || op.status === 'Pending') &&
+        op.args?.backupDiskId === diskId) as Operation | undefined
+
+/**
+ * Start a backup from a monitor loop: failures are already recorded in the
+ * backup's trace and operation, so they are logged here and the loop goes on.
+ */
+const triggerBackup = async (
+    storeHandle: DocHandle<Store>,
+    instanceId: InstanceID,
+    backupDisk: Disk,
+    cause: OperationCause,
+): Promise<void> => {
+    try {
+        await backupInstance(storeHandle, instanceId, backupDisk, undefined, cause)
+    } catch (e: any) {
+        log(chalk.red(`Backup of instance ${instanceId} failed: ${e?.message ?? e}`))
     }
 }
 
@@ -7438,7 +7541,7 @@ export const processBackupDisk = async (
                     ? store.diskDB[instance.storedOn]?.device != null
                     : false
                 if (appDiskDocked) {
-                    await backupInstance(storeHandle, staleInstanceId, backupDisk, undefined, 'backup-stale-lock')
+                    await triggerBackup(storeHandle, staleInstanceId, backupDisk, 'backup-stale-lock')
                 } else {
                     log(`App Disk for ${staleInstanceId} not yet docked — stale lock will be handled when App Disk docks`)
                 }
@@ -7454,7 +7557,7 @@ export const processBackupDisk = async (
             if (!instance?.storedOn) continue
             const appDisk = store.diskDB[instance.storedOn]
             if (appDisk?.device) {
-                await backupInstance(storeHandle, instanceId, backupDisk, undefined, 'console-command')
+                await triggerBackup(storeHandle, instanceId, backupDisk, 'console-command')
             } else {
                 log(`Instance ${instanceId}: App Disk not docked — backup will trigger when App Disk docks`)
             }
@@ -7489,7 +7592,7 @@ export const checkPendingBackups = async (
         for (const instance of instancesOnAppDisk) {
             if (candidate.backupConfig.links.includes(instance.id)) {
                 log(`checkPendingBackups: triggering backup for instance ${instance.id}`)
-                await backupInstance(storeHandle, instance.id, candidate as Disk, undefined, 'backup-app-docked')
+                await triggerBackup(storeHandle, instance.id, candidate as Disk, 'backup-app-docked')
             }
         }
 
@@ -7505,7 +7608,7 @@ export const checkPendingBackups = async (
                         const staleInstance = getInstance(store, staleId)
                         if (String(staleInstance?.storedOn) === String(appDisk.id)) {
                             log(`checkPendingBackups: stale lock for ${staleId} — re-triggering backup`)
-                            await backupInstance(storeHandle, staleId, candidate as Disk, undefined, 'backup-stale-lock')
+                            await triggerBackup(storeHandle, staleId, candidate as Disk, 'backup-stale-lock')
                         }
                     }
                 }
@@ -8325,6 +8428,296 @@ export const enableMulticastDNSEngineMonitor = (storeHandle: DocHandle<Store>, r
 
 ```
 
+## File: src/monitors/mounts.ts
+```typescript
+/**
+ * mounts.ts — mounting and unmounting App Disk partitions safely (idea#126)
+ *
+ * Files Disk step 0, Q5 safety fix:
+ *   - "Already mounted" is detected with findmnt (it reads /proc/self/mountinfo)
+ *     by target AND by source, so it works for every filesystem type. Before
+ *     this, `mount -t ext4` output was searched, which missed vfat partitions:
+ *     after an Engine restart a docked vfat partition was mounted a second time
+ *     on top of itself (Atlas, idea03).
+ *   - Mounting onto a target that is already a mount point is refused.
+ *   - Unmounting repeats `umount` until `mountpoint -q` says the target is no
+ *     longer a mount point (a stacked double mount needs one umount per layer),
+ *     then removes the empty folder with rmdir. Never `rm -fr`: rmdir only
+ *     removes an empty folder, so a still-mounted disk's data cannot be deleted.
+ *   - The filesystem UUID is recorded at mount time (lsblk -no UUID) for
+ *     Disk.unmountError and the startup cleanup.
+ *
+ * Root commands: mkdir, mount and umount are in 10-engine; rmdir of
+ * /disks/sd[a-z][12] is in 11-engine-files. findmnt, mountpoint and lsblk need no
+ * root. The commands are behind MountOps so tests can inject fakes.
+ */
+
+import { $, fs, sleep } from 'zx'
+import { log } from '../utils/utils.js'
+import { disksRoot } from '../data/Config.js'
+import type { DocHandle } from '@automerge/automerge-repo'
+import type { Store } from '../data/Store.js'
+import type { Disk } from '../data/Disk.js'
+import type { DiskID, EngineID } from '../data/CommonTypes.js'
+
+export interface MountEntry {
+    source: string   // e.g. /dev/sdb1 (bind-mount suffixes like [/dir] removed)
+    target: string   // e.g. /disks/sdb1
+    fstype: string
+}
+
+export interface MountOps {
+    /** Every mount on the system: `findmnt -J -l -o SOURCE,TARGET,FSTYPE` */
+    listMounts(): Promise<MountEntry[]>
+    /** `mountpoint -q <path>`: true only when the path is a mount point */
+    isMountPoint(path: string): Promise<boolean>
+    /** Filesystem UUID of a device: `lsblk -no UUID /dev/<device>`, null if unknown */
+    fsUuidOfDevice(device: string): Promise<string | null>
+    /** UUID of the filesystem mounted at a path: `findmnt -no UUID <path>`, null if none */
+    fsUuidAt(mountPoint: string): Promise<string | null>
+    /** `sudo mkdir -p <disksRoot>/<device>` */
+    mkdir(device: string): Promise<void>
+    /** `sudo mount /dev/<device> <disksRoot>/<device>` */
+    mount(device: string): Promise<void>
+    /** `sudo umount <disksRoot>/<device>` (removes the top mount only) */
+    umount(device: string): Promise<void>
+    /** Remove the empty mount point folder (see removeMountPointFolder) */
+    rmdir(mountPoint: string): Promise<void>
+}
+
+/** Mount points the 11-engine-files entry `/usr/bin/rmdir /disks/sd[a-z][12]` covers. */
+export const SUDO_RMDIR_PATH = /^\/disks\/sd[a-z][12]$/
+export const SUDO_RMDIR = '/usr/bin/rmdir'
+
+/**
+ * Remove an empty mount point folder. /disks/sd[a-z][12] folders are created
+ * with sudo under the root-owned /disks, so they are removed with exactly
+ * `sudo /usr/bin/rmdir /disks/<device>` (11-engine-files). Other roots (test and
+ * fixture roots from IDEA_DISKS_ROOT) are owned by pi and use a plain rmdir.
+ * Both fail on a folder that is not empty.
+ */
+export const removeMountPointFolder = async (mountPoint: string): Promise<void> => {
+    if (SUDO_RMDIR_PATH.test(mountPoint)) {
+        await $`sudo ${SUDO_RMDIR} ${mountPoint}`
+    } else {
+        await fs.rmdir(mountPoint)
+    }
+}
+
+const stripBindSuffix = (source: string): string => source.replace(/\[.*\]$/, '')
+
+export const defaultMountOps: MountOps = {
+    listMounts: async () => {
+        const out = await $`findmnt -J -l -o SOURCE,TARGET,FSTYPE`.nothrow()
+        if (out.exitCode !== 0 || !out.stdout.trim()) return []
+        const parsed = JSON.parse(out.stdout) as { filesystems?: Array<{ source?: string, target?: string, fstype?: string }> }
+        return (parsed.filesystems ?? []).map(f => ({
+            source: stripBindSuffix(f.source ?? ''),
+            target: f.target ?? '',
+            fstype: f.fstype ?? '',
+        }))
+    },
+    isMountPoint: async (path) => (await $`mountpoint -q ${path}`.nothrow()).exitCode === 0,
+    fsUuidOfDevice: async (device) => {
+        const out = await $`lsblk -no UUID /dev/${device}`.nothrow()
+        const uuid = out.exitCode === 0 ? out.stdout.trim().split('\n')[0].trim() : ''
+        return uuid || null
+    },
+    fsUuidAt: async (mountPoint) => {
+        const out = await $`findmnt -no UUID ${mountPoint}`.nothrow()
+        if (out.exitCode !== 0) return null
+        // A stacked mount lists one line per layer: the last one is on top
+        const lines = out.stdout.split('\n').map(l => l.trim()).filter(Boolean)
+        return lines.length ? lines[lines.length - 1] : null
+    },
+    mkdir: async (device) => { await $`sudo mkdir -p ${disksRoot()}/${device}` },
+    mount: async (device) => { await $`sudo mount /dev/${device} ${disksRoot()}/${device}` },
+    umount: async (device) => { await $`sudo umount ${disksRoot()}/${device}` },
+    rmdir: removeMountPointFolder,
+}
+
+let currentOps: MountOps = defaultMountOps
+
+/** The MountOps in use (the real commands unless a test injected fakes). */
+export const mountOps = (): MountOps => currentOps
+
+/** Tests: replace some or all MountOps; pass null to restore the real commands. */
+export const setMountOps = (ops: Partial<MountOps> | null): void => {
+    currentOps = ops ? { ...defaultMountOps, ...ops } : defaultMountOps
+}
+
+/**
+ * Whether mount commands really run. testMode skips the real (sudo) commands
+ * because fixture disks are plain folders; a test that injects MountOps runs the
+ * full mount/unmount logic against its fakes.
+ */
+export const mountCommandsActive = (testMode: boolean): boolean => !testMode || currentOps !== defaultMountOps
+
+export const mountPointOf = (device: string): string => `${disksRoot()}/${device}`
+
+// ── Mounting ────────────────────────────────────────────────────────────────
+
+export type MountCheck =
+    | { state: 'free' }                                  // nothing there: mount
+    | { state: 'mounted' }                               // this device is already mounted at its target
+    | { state: 'targetBusy', mounts: MountEntry[] }      // something else is mounted at the target
+    | { state: 'deviceElsewhere', mounts: MountEntry[] } // this device is mounted somewhere else
+
+/**
+ * Check, before mounting, what findmnt says about the device and its target.
+ * Looks at both the target and the source, for every filesystem type.
+ */
+export const checkMountState = async (device: string, ops: MountOps = mountOps()): Promise<MountCheck> => {
+    const target = mountPointOf(device)
+    const source = `/dev/${device}`
+    const mounts = await ops.listMounts()
+    const atTarget = mounts.filter(m => m.target === target)
+    const ofSource = mounts.filter(m => m.source === source)
+    if (atTarget.length > 0) {
+        return atTarget.every(m => m.source === source)
+            ? { state: 'mounted' }
+            : { state: 'targetBusy', mounts: atTarget }
+    }
+    if (ofSource.length > 0) return { state: 'deviceElsewhere', mounts: ofSource }
+    // Not in the mount table, but still a mount point (e.g. a bind mount findmnt
+    // shows with another source path): refuse as well.
+    if (await ops.isMountPoint(target)) return { state: 'targetBusy', mounts: [] }
+    return { state: 'free' }
+}
+
+export type MountResult =
+    | { ok: true, alreadyMounted: boolean, fsUuid: string | null }
+    | { ok: false, message: string }
+
+/**
+ * Mount /dev/<device> on <disksRoot>/<device> unless it is already mounted there.
+ * Never mounts a second time and never mounts onto an existing mount point.
+ * Returns the filesystem UUID (lsblk -no UUID) for Disk.unmountError.
+ */
+export const safeMount = async (device: string, ops: MountOps = mountOps()): Promise<MountResult> => {
+    const target = mountPointOf(device)
+    const check = await checkMountState(device, ops)
+    const describe = (ms: MountEntry[]) => ms.map(m => `${m.source} on ${m.target} (${m.fstype})`).join(', ')
+    if (check.state === 'targetBusy') {
+        return { ok: false, message: `Refusing to mount /dev/${device}: ${target} is already a mount point${check.mounts.length ? ` (${describe(check.mounts)})` : ''}` }
+    }
+    if (check.state === 'deviceElsewhere') {
+        return { ok: false, message: `Refusing to mount /dev/${device} on ${target}: it is already mounted (${describe(check.mounts)})` }
+    }
+    const alreadyMounted = check.state === 'mounted'
+    if (alreadyMounted) {
+        log(`Device ${device} already mounted on ${target}`)
+    } else {
+        try {
+            await ops.mkdir(device)
+            await ops.mount(device)
+        } catch (e) {
+            return { ok: false, message: `Could not mount /dev/${device} on ${target}: ${e instanceof Error ? e.message : String(e)}` }
+        }
+    }
+    const fsUuid = await ops.fsUuidOfDevice(device).catch(() => null)
+    return { ok: true, alreadyMounted, fsUuid }
+}
+
+// ── Unmounting ──────────────────────────────────────────────────────────────
+
+/**
+ * Unmount retry policy (idea#126, documented in docs/ARCHITECTURE.md):
+ * at most UMOUNT_MAX_ATTEMPTS umount calls per undock, with UMOUNT_RETRY_DELAY_MS
+ * between a failed attempt and the next one. Every successful umount removes
+ * one layer of a stacked mount, so 5 attempts cover a double mount plus three
+ * busy retries (about 3 s) for a process that is just letting go of the disk.
+ */
+export const UMOUNT_MAX_ATTEMPTS = 5
+export const UMOUNT_RETRY_DELAY_MS = 1000
+
+export type UnmountResult =
+    | { ok: true, attempts: number, removed: boolean }
+    | { ok: false, attempts: number, message: string }
+
+/**
+ * Repeat `umount` until `mountpoint -q <mountPoint>` is false, then rmdir the
+ * mount point. If it is still a mount point after UMOUNT_MAX_ATTEMPTS, nothing
+ * is removed and the result says why. Never rm -fr.
+ */
+export const unmountAndRemove = async (
+    device: string,
+    ops: MountOps = mountOps(),
+    maxAttempts = UMOUNT_MAX_ATTEMPTS,
+    retryDelayMs = UMOUNT_RETRY_DELAY_MS,
+): Promise<UnmountResult> => {
+    const mountPoint = mountPointOf(device)
+    let attempts = 0
+    let lastError = ''
+    while (await ops.isMountPoint(mountPoint)) {
+        if (attempts >= maxAttempts) {
+            return {
+                ok: false, attempts,
+                message: `${mountPoint} is still mounted after ${attempts} umount attempts${lastError ? `: ${lastError}` : ''}`,
+            }
+        }
+        attempts++
+        try {
+            await ops.umount(device)
+            log(`umount ${mountPoint}: attempt ${attempts} removed one mount`)
+        } catch (e: any) {
+            lastError = (e?.stderr || e?.message || String(e)).toString().trim()
+            log(`umount ${mountPoint}: attempt ${attempts} failed: ${lastError}`)
+            if (attempts < maxAttempts) await sleep(retryDelayMs)
+        }
+    }
+    if (!(await fs.pathExists(mountPoint))) return { ok: true, attempts, removed: false }
+    await ops.rmdir(mountPoint)
+    return { ok: true, attempts, removed: true }
+}
+
+// ── Startup cleanup ─────────────────────────────────────────────────────────
+
+/**
+ * Engine startup (idea#126): clear every Disk.unmountError recorded by this
+ * Engine unless the same filesystem is still mounted at its mountPoint.
+ *   - mountPoint not mounted (findmnt -no UUID gives nothing) → cleared
+ *   - another filesystem mounted there (UUID differs from fsUuid; device names
+ *     get reused) → cleared
+ *   - the same filesystem still mounted there (same UUID) → kept
+ *   - fsUuid unknown (null) and something is still mounted there → kept, since
+ *     it cannot be ruled out that it is the same disk
+ * Errors recorded by other Engines are never touched.
+ * Returns the ids of the disks whose error was cleared.
+ */
+export const clearStaleUnmountErrors = async (
+    storeHandle: DocHandle<Store>,
+    engineId: EngineID,
+    ops: MountOps = mountOps(),
+): Promise<string[]> => {
+    const store = storeHandle.doc()
+    if (!store) return []
+    const toClear: string[] = []
+    for (const [diskId, disk] of Object.entries(store.diskDB ?? {})) {
+        const err = (disk as Disk).unmountError
+        if (!err || err.engineId !== engineId) continue
+        const uuidNow = await ops.fsUuidAt(err.mountPoint).catch(() => null)
+        const stillSameFs = uuidNow !== null && (err.fsUuid === null || uuidNow === err.fsUuid)
+        if (stillSameFs) {
+            log(`Keeping the unmount error of disk ${diskId}: ${err.mountPoint} is still mounted (UUID ${uuidNow})`)
+        } else {
+            toClear.push(diskId)
+        }
+    }
+    if (toClear.length) {
+        storeHandle.change(doc => {
+            for (const id of toClear) {
+                const d = doc.diskDB[id as DiskID]
+                if (d && d.unmountError) d.unmountError = null
+            }
+        })
+        log(`Cleared stale unmount errors for disks: ${toClear.join(', ')}`)
+    }
+    return toClear
+}
+
+```
+
 ## File: src/monitors/storeMonitor.ts
 ```typescript
 import { DocHandle } from '@automerge/automerge-repo'
@@ -8568,7 +8961,7 @@ import { $, fs, YAML, chalk } from 'zx'
 $.verbose = false;
 import { Disk, createOrUpdateDisk, processDisk } from '../data/Disk.js'
 import { findDiskByDevice, Store, getDisksOfEngine, getLocalEngine } from '../data/Store.js'
-import { DeviceName, DiskID, DiskName, InstanceID, Timestamp } from '../data/CommonTypes.js'
+import { DeviceName, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../data/CommonTypes.js'
 
 import { Instance, Status, stopInstance } from '../data/Instance.js';
 import { config, disksRoot, skipMetaWrite } from '../data/Config.js'
@@ -8576,6 +8969,14 @@ import { DocHandle } from '@automerge/automerge-repo';
 import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js';
 import { runWithTrace } from '../utils/CommandLogger.js';
 import { recordDiskDetectionFailure, errorMessage } from './diskDetection.js';
+import { safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointOf } from './mounts.js';
+
+/**
+ * Filesystem UUID of each mounted device, recorded at mount time (or when an
+ * existing mount is found) with lsblk -no UUID. Used for Disk.unmountError
+ * (idea#126).
+ */
+const mountedFsUuids = new Map<string, string | null>()
 
 /**
  * Pretend disks created by the test harness use names that real hardware never
@@ -8691,23 +9092,18 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                     return
                 }
 
-                if (config.settings.testMode) {
+                if (!mountCommandsActive(config.settings.testMode)) {
                     log(`testMode: skipping mount for device ${device} — fixture expected at ${disksRoot()}/${device}`)
                 } else {
-                    const mountOutput = await $`mount -t ext4`
-                    if (mountOutput.stdout.includes(`/dev/${device} on ${disksRoot()}/${device} type ext4`)) {
-                        log(`Device ${device} already mounted`)
-                    } else {
-                        log(`Mounting device ${device}`)
-                        try {
-                            await $`sudo mkdir -p ${disksRoot()}/${device}`
-                            await $`sudo mount /dev/${device} ${disksRoot()}/${device}`
-                        } catch (e) {
-                            recordDiskDetectionFailure('mount', `Could not mount /dev/${device} on ${disksRoot()}/${device}: ${errorMessage(e)}`, { device })
-                            return
-                        }
-                        log(`Device ${device} has been successfully mounted`)
+                    // findmnt-based check by target and source, for every filesystem
+                    // type; never mounts twice or onto an existing mount point (idea#126)
+                    const result = await safeMount(device)
+                    if (!result.ok) {
+                        recordDiskDetectionFailure('mount', result.message, { device })
+                        return
                     }
+                    mountedFsUuids.set(device, result.fsUuid)
+                    log(result.alreadyMounted ? `Device ${device} already mounted` : `Device ${device} has been successfully mounted`)
                 }
 
                 let meta: DiskMeta
@@ -8847,24 +9243,24 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     log(`Cleaning the mount points...`)
     const previousMounts = (config.settings.isDev || config.settings.testMode) ? [] : (await $`ls ${disksRoot()}`).toString().split('\n').filter(device => validDevice(device))
     log(`Previously mounted devices: ${previousMounts}`)
-    const mountOutput = await $`mount -t ext4`
+    // Stale mount point folders of devices that are no longer attached. A folder
+    // that is still a mount point (by findmnt target or mountpoint -q) is left
+    // alone; an empty one is removed with rmdir, never rm -fr (idea#126).
     for (let device of previousMounts) {
         log(`Checking if device ${device} is still actual or mounted`)
-        if (!actualDevices.includes(device) && !mountOutput.stdout.includes(`/dev/${device} on ${disksRoot()}/${device} type ext4`)) {
-            log(`Cleaning up stale mount point for ${device}`)
-            try {
-                await $`sudo umount ${disksRoot()}/${device}`
-            } catch (e: any) {
-                if (e.stderr.includes('not mounted')) {
-                    await $`sudo mkdir -p ${disksRoot()}/old`
-                    await $`sudo mv ${disksRoot()}/${device} ${disksRoot()}/old/${device}`
-                    log(`Device ${device} has been moved to ${disksRoot()}/old`)
-                } else {
-                    log(`Error unmounting device during cleaning ${device}`)
-                    log(e)
-                }
+        if (actualDevices.includes(device)) continue
+        try {
+            const mounts = await mountOps().listMounts()
+            const mountPoint = mountPointOf(device)
+            if (mounts.some(m => m.target === mountPoint) || await mountOps().isMountPoint(mountPoint)) {
+                log(`Stale mount point ${mountPoint} is still mounted — leaving it`)
+                continue
             }
+            log(`Cleaning up stale mount point for ${device}`)
+            await mountOps().rmdir(mountPoint)
             log(`Device ${device} has been successfully cleaned up`)
+        } catch (e) {
+            log(`Error cleaning up the stale mount point of ${device}: ${errorMessage(e)}`)
         }
     }
 
@@ -8888,24 +9284,7 @@ export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
         return
     }
     try {
-        if (config.settings.testMode) {
-            log(`testMode: skipping umount and rm for device ${device}`)
-        } else {
-            log(`Attempting to unmount device ${device}`)
-            try {
-                await $`sudo umount ${disksRoot()}/${device}`
-                log(`Device ${device} has been successfully unmounted`)
-            } catch (e: any) {
-                // If the error indicates it wasn't mounted, we can proceed.
-                // Otherwise, we must abort to avoid deleting data on a mounted disk.
-                if (!e.stderr.includes('not mounted')) {
-                    throw new Error(`Failed to unmount ${device}: ${e.message}`)
-                }
-                log(`Device ${device} was not mounted`)
-            }
-            await $`sudo rm -fr ${disksRoot()}/${device}`
-            log(`Mount point ${disksRoot()}/${device} has been removed`)
-        }
+        // The store is updated whatever happens to the unmount below (idea#126)
         storeHandle.change(doc => {
             const dsk = doc.diskDB[disk.id]
             if (dsk) {
@@ -8939,11 +9318,53 @@ export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
             })
             log(`Instance ${instance.id} has been moved to the 'Undocked' state`)
         }
+        // Unmount after the instances are stopped (their containers keep files on
+        // the disk open). Repeat umount until the folder is no longer a mount
+        // point, then rmdir it; never rm -fr (idea#126).
+        if (!mountCommandsActive(config.settings.testMode)) {
+            log(`testMode: skipping umount and rmdir for device ${device}`)
+        } else {
+            await unmountDisk(storeHandle, disk, device, store)
+        }
     } catch (e) {
         log(`Error unmounting device ${device}`)
         log(e)
         recordDiskDetectionFailure('undock', `Could not undock the disk on ${device}: ${errorMessage(e)}`, { device, diskId: disk.id })
     }
+}
+
+/**
+ * Unmount a disk on undock (idea#126): unmountAndRemove() repeats umount until
+ * `mountpoint -q` is false (at most UMOUNT_MAX_ATTEMPTS), then rmdirs the mount
+ * point. On a busy unmount: a failed `diskDetection` trace (step 'undock') and
+ * Disk.unmountError { engineId, mountPoint, fsUuid, message }, for every disk
+ * type. The caller has already updated the store.
+ */
+const unmountDisk = async (storeHandle: DocHandle<Store>, disk: Disk, device: DeviceName, store: Store): Promise<void> => {
+    const mountPoint = mountPointOf(device)
+    log(`Attempting to unmount device ${device}`)
+    let result
+    try {
+        result = await unmountAndRemove(device)
+    } catch (e) {
+        // Unmounted, but the folder could not be removed (e.g. not empty): no data at risk
+        recordDiskDetectionFailure('undock', `Unmounted ${mountPoint} but could not remove the folder: ${errorMessage(e)}`, { device, diskId: disk.id, mountPoint })
+        mountedFsUuids.delete(device)
+        return
+    }
+    if (result.ok) {
+        log(`Device ${device} unmounted after ${result.attempts} umount call(s)${result.removed ? `; ${mountPoint} removed` : ''}`)
+        mountedFsUuids.delete(device)
+        return
+    }
+    const engineId = (getLocalEngine(store)?.id ?? disk.dockedTo) as EngineID
+    const fsUuid = mountedFsUuids.get(device) ?? null
+    const message = `Could not unmount ${mountPoint}: ${result.message}. Restart this Pi to release the disk.`
+    recordDiskDetectionFailure('undock', message, { device, diskId: disk.id, mountPoint, fsUuid })
+    storeHandle.change(doc => {
+        const dsk = doc.diskDB[disk.id]
+        if (dsk) dsk.unmountError = { engineId, mountPoint, fsUuid, message }
+    })
 }
 
 ```
@@ -9205,6 +9626,69 @@ export const resourceLock = new ResourceLockManager()
 // Key helpers
 export const instanceKey = (instanceId: string) => `instance:${instanceId}`
 export const diskKey = (diskId: string) => `disk:${diskId}`
+
+```
+
+## File: src/utils/cliFlags.ts
+```typescript
+/**
+ * Boolean command-line flags for build-engine (idea#146).
+ *
+ * zx's `argv` is minimist without declared booleans, so a flag can arrive as:
+ *   --argon            true
+ *   --no-argon         false
+ *   --argon=false      'false' (a string)
+ *   --argon false      'false' (a string)
+ *   (absent)           undefined
+ *
+ * The old `argv.argon || defaults.argon` could never turn off an option whose
+ * config default is true (argon, gadget). parseBoolFlag uses the flag whenever it
+ * is present and falls back to the default only when it is absent.
+ */
+const TRUE_WORDS = ['true', 'yes', 'on', '1']
+const FALSE_WORDS = ['false', 'no', 'off', '0']
+
+export const parseBoolFlag = (value: unknown, fallback: boolean): boolean => {
+    if (value === undefined || value === null) return fallback
+    if (typeof value === 'boolean') return value
+    if (typeof value === 'number') return value !== 0
+    if (typeof value === 'string') {
+        const v = value.trim().toLowerCase()
+        if (v === '') return true            // `--argon=` counts as present
+        if (TRUE_WORDS.includes(v)) return true
+        if (FALSE_WORDS.includes(v)) return false
+    }
+    // Arrays (flag given twice) and anything else: the last value wins.
+    if (Array.isArray(value) && value.length > 0) return parseBoolFlag(value[value.length - 1], fallback)
+    throw new Error(`Not a boolean flag value: ${JSON.stringify(value)} (use --flag, --no-flag or --flag=true|false)`)
+}
+
+/** Raspberry Pi models build-engine knows about. */
+export type PiModel = 'pi4' | 'pi5'
+
+export const parseModel = (value: unknown): PiModel | undefined => {
+    if (value === undefined || value === null || value === '') return undefined
+    const v = String(value).trim().toLowerCase()
+    if (v === 'pi4' || v === 'pi5') return v
+    throw new Error(`Unknown --model ${JSON.stringify(value)}; expected pi4 or pi5`)
+}
+
+/**
+ * Resolve the gadget setting for a model. USB gadget mode needs the Pi 4's DWC2
+ * USB controller; the Pi 5 has a PCIe USB controller, so gadget mode must stay off.
+ * Asking for it explicitly on a Pi 5 is an error; a config default of true is
+ * silently overridden.
+ */
+export const resolveGadget = (flag: unknown, fallback: boolean, model: PiModel | undefined): boolean => {
+    const gadget = parseBoolFlag(flag, fallback)
+    if (model === 'pi5' && gadget) {
+        if (flag !== undefined && parseBoolFlag(flag, false)) {
+            throw new Error('--gadget is not supported on a Pi 5 (PCIe USB controller); leave it out or pass --no-gadget')
+        }
+        return false
+    }
+    return gadget
+}
 
 ```
 

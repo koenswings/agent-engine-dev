@@ -87,7 +87,7 @@ These commands perform actions on the system. Some are restricted to an `engine`
 - **Scope:** `engine`
 
 ### `backupApp`
-- **Description:** Backs up an app instance to a Backup Disk. Stops the instance briefly for filesystem consistency, runs a BorgBackup archive, then restarts it. If no Backup Disk name is given, the first docked Backup Disk linked to the instance is used.
+- **Description:** Backs up an app instance to a Backup Disk. Stops the instance briefly for filesystem consistency, runs a BorgBackup archive, then restarts it. If no Backup Disk name is given, the first docked Backup Disk linked to the instance is used. The backup holds the instance lock and the Backup Disk lock together (idea#126); if another operation holds either, the backup is not started and the command fails with the reason. A failure during the backup fails the command with its message.
 - **Usage:** `backupApp <instanceName> [backupDiskName]`
 - **Scope:** `engine`
 
@@ -102,7 +102,7 @@ These commands perform actions on the system. Some are restricted to an `engine`
 - **Scope:** `engine`
 
 ### `ejectDisk`
-- **Description:** Safely ejects a docked disk from this engine. Stops all running instances on the disk, unmounts it, and updates the shared store to reflect the undocked state. Equivalent to a clean physical removal.
+- **Description:** Safely ejects a docked disk from this engine. Updates the shared store to reflect the undocked state, stops all running instances on the disk, then unmounts it: `umount` is repeated (at most 5 times, 1 s apart after a failure) until the mount point is no longer a mount point, and the empty mount point is removed with `rmdir`, never `rm -fr` (idea#126). If it stays busy, nothing is removed, a failed `diskDetection` trace is written and the disk gets `unmountError` (restart the Pi to release it). Refused while the disk is locked by an operation or while a `backupApp` operation writing to it is pending or running. Equivalent to a clean physical removal.
 - **Usage:** `ejectDisk <diskName>`
 - **Scope:** `engine`
 

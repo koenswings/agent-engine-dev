@@ -33,6 +33,7 @@ const RUNTIME_FILES = [
     'src/monitors/diskDetection.ts',
     'src/data/Instance.ts',
     'src/data/CopyMoveApp.ts',
+    'src/monitors/mounts.ts',
 ]
 
 // Every `sudo <cmd> ...` in a zx template literal ($`sudo ...`), with the command.
@@ -91,6 +92,8 @@ describe('Engine sudoers asset (idea#80)', () => {
             'mv ${disksRoot()}/${device} ${disksRoot()}/old/${device}',
             'rm -fr ${disksRoot()}/${device}',
             'rm -fr ${disksRoot()}/old',
+            // 11-engine-files (idea#126): removeMountPointFolder in mounts.ts
+            '${SUDO_RMDIR} ${mountPoint}',
         ]
         const calls = RUNTIME_FILES.flatMap(f => sudoCalls(src(f)))
         expect(calls.length).toBeGreaterThan(0)
@@ -132,12 +135,26 @@ describe('Engine sudoers asset (idea#80)', () => {
     it('11-engine-files is valid, grants only pi as root, and 10-engine has no /disks tee (idea#121)', async (ctx) => {
         const files = fs.readFileSync(path.join(ROOT, 'script/build_image_assets/11-engine-files.sudoers'), 'utf8')
         const rules = files.split('\n').filter(l => l.trim() && !l.trimStart().startsWith('#'))
-        expect(rules).toEqual(['pi ALL=(root) NOPASSWD: /usr/bin/tee /disks/sd[a-z][12]/META.yaml'])
+        expect(rules).toEqual([
+            'pi ALL=(root) NOPASSWD: /usr/bin/tee /disks/sd[a-z][12]/META.yaml',
+            'pi ALL=(root) NOPASSWD: /usr/bin/rmdir /disks/sd[a-z][12]',
+        ])
         expect(rulesText).not.toMatch(/tee \/disks/)
+        expect(rulesText).not.toMatch(/rmdir/)   // the rmdir entry lives in 11-engine-files (idea#126)
         const visudo = ['/usr/sbin/visudo', '/sbin/visudo'].find(p => fs.existsSync(p))
         if (!visudo) ctx.skip()
         const out = await $`${visudo} -cf ${path.join(ROOT, 'script/build_image_assets/11-engine-files.sudoers')}`.nothrow()
         expect(out.exitCode, out.stderr).toBe(0)
+    })
+
+    it('mount points are removed with rmdir, never rm -fr (idea#126)', () => {
+        const mounts = src('src/monitors/mounts.ts')
+        expect(mounts).toContain("export const SUDO_RMDIR = '/usr/bin/rmdir'")
+        expect(mounts).toContain('$`sudo ${SUDO_RMDIR} ${mountPoint}`')
+        for (const f of ['src/monitors/usbDeviceMonitor.ts', 'src/monitors/mounts.ts']) {
+            expect(src(f), f).not.toMatch(/\$`sudo rm -fr \$\{disksRoot\(\)\}\/\$\{device\}`/)
+            expect(src(f), f).not.toMatch(/\$`sudo mv /)
+        }
     })
 
     it('runtime code no longer needs sudo for instance folders, old/* globs or docker', () => {
