@@ -1,5 +1,6 @@
 import { $, chalk, fs, YAML } from 'zx'
 import { posix } from 'path'
+import pack from '../../package.json' with { type: "json" }
 import { deepPrint, fileExists, log, stripPartition, uuid, print } from '../utils/utils.js'
 import { DeviceName, DiskID, DiskName, Timestamp, Version } from './CommonTypes.js'
 import { config, disksRoot } from './Config.js'
@@ -33,6 +34,74 @@ const sampleMeta: DiskMeta = {
   lastDocked: 1733673600000 as Timestamp
 }
 
+export const SYSTEM_META_PATH = '/META.yaml'
+
+/** What to do when /META.yaml is missing, shown in errors (idea#145). */
+export const SYSTEM_META_HELP =
+  'Run ./build-engine --personalize on this Pi to create /META.yaml, or check that ' +
+  '/etc/sudoers.d/10-engine allows pi to run /usr/bin/tee /META.yaml'
+
+export interface SystemMetaDeps {
+  exists: (path: string) => boolean
+  readHardwareId: (device: DeviceName) => Promise<DiskID | undefined>
+  write: (meta: DiskMeta, path: string) => Promise<void>
+  now: () => number
+}
+
+const defaultSystemMetaDeps: SystemMetaDeps = {
+  exists: (p) => fileExists(p),
+  readHardwareId: (device) => readHardwareId(device),
+  write: (meta, p) => writeMetaFile(meta, p),
+  now: () => Date.now(),
+}
+
+/**
+ * Create the system disk's /META.yaml when it is missing (idea#145).
+ *
+ * A freshly flashed Pi may have no /META.yaml (it used to be written only by
+ * build-engine's addMeta / --personalize), and the Engine then exited at import
+ * while determining its id. Now, like a disk META.yaml on first dock (#121),
+ * the Engine writes one itself: diskId from the root disk's hardware serial
+ * when readHardwareId finds one, otherwise a random UUID; diskName = diskId (as
+ * addMeta does); the Engine version from package.json. It is written with
+ * `sudo tee /META.yaml` (writeMetaFile, 10-engine). build-engine --personalize
+ * may later replace it, as before.
+ *
+ * Returns the new meta, or null when the file already exists. With
+ * allowCreate false (testMode/isDev, which never write /META.yaml) or when the
+ * write fails, it throws an Error that says what to do (SYSTEM_META_HELP).
+ */
+export const ensureSystemMeta = async (
+  device: DeviceName,
+  options: { path?: string, allowCreate?: boolean, deps?: Partial<SystemMetaDeps> } = {},
+): Promise<DiskMeta | null> => {
+  const metaPath = options.path ?? SYSTEM_META_PATH
+  const deps = { ...defaultSystemMetaDeps, ...options.deps }
+  if (deps.exists(metaPath)) return null
+  if (options.allowCreate === false) {
+    throw new Error(`${metaPath} is missing and is not created in testMode/isDev. ${SYSTEM_META_HELP}`)
+  }
+  log(`${metaPath} is missing: creating it (first run of this Engine)`)
+  const hardwareId = await deps.readHardwareId(device).catch(() => undefined)
+  const diskId = (hardwareId ? hardwareId : uuid()) as DiskID
+  const now = deps.now() as Timestamp
+  const meta: DiskMeta = {
+    diskId,
+    isHardwareId: !!hardwareId,
+    diskName: diskId.toString() as DiskName,
+    created: now,
+    lastDocked: now,
+    version: String(pack.version) as Version,
+  }
+  try {
+    await deps.write(meta, metaPath)
+  } catch (e) {
+    throw new Error(`${metaPath} is missing and could not be created: ${e instanceof Error ? e.message : e}. ${SYSTEM_META_HELP}`)
+  }
+  log(`Created ${metaPath} with diskId ${diskId} (${hardwareId ? 'hardware serial' : 'generated'})`)
+  return meta
+}
+
 export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMeta> => {
   let path
   let device: DeviceName
@@ -58,6 +127,11 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
       }
     }
     log(`Reading metadata for device ${device} at path ${path}`)
+
+    // The system disk's /META.yaml: create it when it is missing (idea#145)
+    if (!deviceSpec) {
+      await ensureSystemMeta(device, { allowCreate: !config.settings.isDev && !config.settings.testMode })
+    }
 
     //log(`Our current dir is ${await $`pwd`} with content ${await $`ls`} and path ${path}`)
     if (await fileExists(path)) {
