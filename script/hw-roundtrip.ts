@@ -75,6 +75,10 @@ const LOG_DIR = path.join(ROOT, 'test', 'testresults')
 fs.mkdirpSync(LOG_DIR)
 const LOG_FILE = path.join(LOG_DIR, `hw-roundtrip-${stamp}.log`)
 const failures: string[] = []
+// Declared before the first abort() can call finish()
+let finished = false
+let inRun = false
+let udev: ChildProcess | null = null
 let passes = 0
 const write = (line: string) => {
     const l = `${new Date().toISOString()} ${line}`
@@ -90,7 +94,9 @@ const check = (ok: boolean, what: string, detail = ''): boolean => {
 const abort = (m: string): never => {
     write(`ABORT ${m}`)
     finish(2)
-    throw new Error(m)
+    // Inside the run: throw, so the finally block re-plugs the disk if needed
+    if (inRun) throw new Error(m)
+    process.exit(2)
 }
 
 // ── Shell helpers ───────────────────────────────────────────────────────────
@@ -223,7 +229,6 @@ const logSince = (off: number): string => {
     return buf.toString('utf8').replace(/\x1b\[[0-9;]*m/g, '')
 }
 let udevLines: string[] = []
-let udev: ChildProcess | null = null
 const startUdev = () => {
     udevLines = []
     udev = spawn('stdbuf', ['-oL', 'udevadm', 'monitor', '--udev', '--subsystem-match=block'])
@@ -251,7 +256,6 @@ const plug = async () => {
     unplugged = false
 }
 
-let finished = false
 function finish(code?: number) {
     if (finished) return
     finished = true
@@ -384,6 +388,7 @@ const roundTrip = async () => {
 }
 
 try {
+    inRun = true
     await systemChecks('before')
     await roundTrip()
     await systemChecks('after')
