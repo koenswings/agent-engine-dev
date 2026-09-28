@@ -1,6 +1,6 @@
 import { CommandDefinition } from "./CommandDefinition.js";
 import { Store, getApps, getDisks, getDisk, getRunningEngines, getInstances, getEngine, findDiskByName, findInstanceByName, getLocalEngine, createClientStore } from "./Store.js";
-import { Disk, clearDuplicateDiskRecords } from "./Disk.js";
+import { Disk, clearDuplicateDiskRecords, isSystemDiskRecord } from "./Disk.js";
 import { deepPrint, log, print } from "../utils/utils.js";
 import { buildInstance, startInstance, runInstance, stopInstance, markInstanceError } from "./Instance.js";
 import { buildEngine, syncEngine, clearKnownHost, rebootEngine } from "./Engine.js";
@@ -401,6 +401,10 @@ const ejectDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskIdOrNa
     if (!target.ok) throw new Error(target.message)
     const disk = target.disk
     const label = `'${disk.name}' (${disk.id})`
+    // Never eject the Pi's own system disk, however it was named (idea#152)
+    if (await isSystemDiskRecord(disk)) {
+        throw new Error(`Disk ${label} is this Pi's system disk and cannot be ejected.`)
+    }
     // Refuse to eject if an operation is actively using this disk
     if (resourceLock.isLocked(diskKey(disk.id))) {
         const info = resourceLock.getLockInfo(diskKey(disk.id))

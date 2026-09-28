@@ -213,6 +213,12 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
     if (await isSystemDisk(disk)) {
         log(`Disk ${disk.id} is the system disk`)
         detectedTypes.push('system')
+        // Mark it before scanning /apps and /instances, so the record never shows
+        // a device without the 'system' marker (idea#152)
+        storeHandle.change(doc => {
+            const d = doc.diskDB[disk.id]
+            if (d) d.diskTypes = ['system']
+        })
         await processSystemDisk(storeHandle, disk)
     } else {
         if (await isAppDisk(disk)) {
@@ -283,6 +289,32 @@ export const isSystemDisk = async (disk: Disk): Promise<boolean> => {
     const rootDev = await getRootDevice()
     return String(disk.device) === String(rootDev)
 }
+
+/** Tests only: pretend the root filesystem is on this device (null: detect it again). */
+export const setRootDeviceForTests = (device: string | null): void => { _rootDevice = device }
+
+/** Whole-drive name of a partition: sda2 → sda, mmcblk0p2 → mmcblk0, nvme0n1p2 → nvme0n1 */
+export const driveOf = (device: string): string =>
+    /^(mmcblk\d+|nvme\d+n\d+)p\d+$/.test(device) ? device.replace(/p\d+$/, '') : device.replace(/\d+$/, '')
+
+/**
+ * True when the device is a partition of the drive this Pi runs from: the root
+ * partition (sda2) or any other partition on that drive, e.g. the boot partition
+ * (sda1 on /boot/firmware). idea#152: these are never ejected or undocked.
+ */
+export const isOnSystemDrive = async (device: string | null | undefined): Promise<boolean> => {
+    if (!device) return false
+    const root = await getRootDevice()
+    if (!/^(sd[a-z]+\d+|mmcblk\d+p\d+|nvme\d+n\d+p\d+)$/.test(root)) return false
+    return String(device) === root || driveOf(String(device)) === driveOf(root)
+}
+
+/**
+ * The system disk record, by its marker (diskTypes 'system', the field the
+ * Console gates the eject button on) or by its device (on the system drive).
+ */
+export const isSystemDiskRecord = async (disk: Disk): Promise<boolean> =>
+    (disk.diskTypes ?? []).includes('system') || await isOnSystemDrive(disk.device)
 
 /**
  * Returns the path prefix for a disk's app/instance/services directories.

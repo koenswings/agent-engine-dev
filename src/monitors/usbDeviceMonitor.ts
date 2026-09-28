@@ -4,7 +4,7 @@ import { DiskMeta, readHardwareId, readMetaUpdateId, writeMetaFile } from '../da
 import { $, fs, YAML, chalk } from 'zx'
 
 $.verbose = false;
-import { Disk, clearDuplicateDiskRecords, createOrUpdateDisk, processDisk } from '../data/Disk.js'
+import { Disk, clearDuplicateDiskRecords, createOrUpdateDisk, isSystemDiskRecord, processDisk } from '../data/Disk.js'
 import { findDiskByDevice, findDisksByDevice, Store, getDisksOfEngine, getLocalEngine } from '../data/Store.js'
 import { DeviceName, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../data/CommonTypes.js'
 
@@ -129,6 +129,11 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                     try {
                         const meta = await readMetaUpdateId()  // reads /META.yaml, no device arg
                         const disk: Disk = createOrUpdateDisk(storeHandle, localEngine.id, device, meta.diskId, 'System Disk' as DiskName, meta.created)
+                        // The marker the Console gates eject on, set with the device (idea#152)
+                        storeHandle.change(doc => {
+                            const d = doc.diskDB[disk.id]
+                            if (d) d.diskTypes = ['system']
+                        })
                         await processDisk(storeHandle, disk)
                     } catch (e) {
                         log(`Error processing system disk: ${e}`)
@@ -391,6 +396,10 @@ export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
     const device = disk.device
     if (!device) {
         log(`Disk ${disk.id} is not mounted on any device. Nothing to undock.`)
+        return
+    }
+    if (await isSystemDiskRecord(disk)) {
+        log(`Disk ${disk.id} on ${device} is this Pi's system disk — never undocked`)
         return
     }
     try {
