@@ -193,14 +193,14 @@ describe('createBackupDisk command', () => {
         await fs.remove(`${DISKS_ROOT}/${device}`)
     })
 
-    it('declares diskName, mode and a variadic instanceNames arg', () => {
+    it('declares diskId, mode and a variadic instanceNames arg (idea#128)', () => {
         const cmd = commands.find(c => c.name === 'createBackupDisk')!
-        expect(cmd.args.map(a => a.name)).toEqual(['diskName', 'mode', 'instanceNames'])
+        expect(cmd.args.map(a => a.name)).toEqual(['diskId', 'mode', 'instanceNames'])
         expect(cmd.args[2].variadic).toBe(true)
     })
 
     it('configures a Backup Disk with 1 instance', async () => {
-        await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskName} on-demand kolibri`)
+        await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskId} on-demand kolibri`)
         expect(errorSpy).not.toHaveBeenCalled()
         const yaml = await readBackupYaml()
         expect(yaml.mode).toBe('on-demand')
@@ -212,7 +212,7 @@ describe('createBackupDisk command', () => {
 
     it('configures a Backup Disk with 2+ instances', async () => {
         await handleCommand(commands, storeHandle, 'engine',
-            `createBackupDisk ${diskName} on-demand kolibri nextcloud wikipedia`)
+            `createBackupDisk ${diskId} on-demand kolibri nextcloud wikipedia`)
         expect(errorSpy).not.toHaveBeenCalled()
         const yaml = await readBackupYaml()
         expect(yaml.mode).toBe('on-demand')
@@ -225,29 +225,29 @@ describe('createBackupDisk command', () => {
     it('records correctly named trace args', async () => {
         const logHandle = await createCommandLog(repo)
         await handleCommand(commands, storeHandle, 'engine',
-            `createBackupDisk ${diskName} on-demand kolibri nextcloud`, logHandle)
+            `createBackupDisk ${diskId} on-demand kolibri nextcloud`, logHandle)
         const traces = Object.values(logHandle.doc()!.traces).filter(t => t.command === 'createBackupDisk')
         expect(traces).toHaveLength(1)
         expect(JSON.parse(traces[0].args))
-            .toEqual({ diskName: 'backup-disk', mode: 'on-demand', instanceNames: ['kolibri', 'nextcloud'] })
+            .toEqual({ diskId: 'DISK_backup_test', mode: 'on-demand', instanceNames: ['kolibri', 'nextcloud'] })
         expect(traces[0].status).toBe('ok')
     })
 
     it('rejects the command when no instance is given', async () => {
-        await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskName} on-demand`)
+        await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskId} on-demand`)
         expect(errorSpy).toHaveBeenCalledWith('Error: Insufficient arguments')
         expect(await fs.pathExists(`${DISKS_ROOT}/${device}/BACKUP.yaml`)).toBe(false)
     })
 
     it('rejects an invalid mode', async () => {
-        await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskName} sometimes kolibri nextcloud`)
+        await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskId} sometimes kolibri nextcloud`)
         expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Invalid mode 'sometimes'"))
         expect(await fs.pathExists(`${DISKS_ROOT}/${device}/BACKUP.yaml`)).toBe(false)
     })
 
     it('rejects an unknown disk', async () => {
         await handleCommand(commands, storeHandle, 'engine', 'createBackupDisk no-such-disk on-demand kolibri nextcloud')
-        expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Disk 'no-such-disk' not found or not docked"))
+        expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Disk 'no-such-disk' not found."))
         expect(await fs.pathExists(`${DISKS_ROOT}/${device}/BACKUP.yaml`)).toBe(false)
     })
 })

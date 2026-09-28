@@ -22,6 +22,7 @@ import { resourceLock, diskKey } from '../utils/ResourceLock.js';
 import { undockDisk } from "../monitors/usbDeviceMonitor.js";
 import { backupInstance, restoreApp, createBackupDiskConfig, runningBackupOnDisk } from "../monitors/backupMonitor.js";
 import { cancelOperation } from './Operations.js';
+import { DiskArgResult, lookupDiskArg, resolveDiskArg } from './DiskArg.js';
 import { testContext } from "../../test/testContext.js";
 
 
@@ -167,28 +168,33 @@ const lsInstances = (storeHandle: DocHandle<Store> | null): void => {
 }
 
 /**
- * installApp command wrapper.
- * Usage: installApp <appId> <targetDiskName> [--source <sourceDiskName>] [--name <instanceName>]
+ * installApp command wrapper (idea#128).
+ * Usage: installApp <appId> <targetDiskId> [--source <sourceDiskId>] [--name <instanceName>]
  *
- * All arguments are passed as a single string and parsed here.
+ * All arguments are passed as a single string and parsed here. Disk arguments
+ * go through resolveDiskArg (a unique disk name still works, with a warning).
+ * Refusals throw, so the trace ends as `error`.
  */
+const INSTALL_APP_USAGE = 'Usage: installApp <appId> <targetDiskId> [--source <sourceDiskId>] [--name <instanceName>]'
 const installAppWrapper = async (storeHandle: DocHandle<Store> | null, argsString: string) => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available.")); return; }
+    if (!storeHandle) throw new Error("Store is not available.")
 
-    // Parse: installApp kolibri-1.0 my-disk --source catalog-disk --name my-kolibri
-    const parts = argsString.trim().split(/\s+/)
+    // Parse: installApp kolibri-1.0 <targetDiskId> --source <sourceDiskId> --name my-kolibri
+    const parts = (argsString ?? '').trim().split(/\s+/).filter(Boolean)
     const appId = parts[0] as any
-    const targetDiskName = parts[1] as any
-    if (!appId || !targetDiskName) {
-        console.error(chalk.red('Usage: installApp <appId> <targetDiskName> [--source <sourceDiskName>] [--name <instanceName>]'))
-        return
+    const targetDiskId = parts[1]
+    if (!appId || !targetDiskId || targetDiskId.startsWith('--')) throw new Error(INSTALL_APP_USAGE)
+    const flagValue = (flag: string): string | undefined => {
+        const i = parts.indexOf(flag)
+        if (i === -1) return undefined
+        const v = parts[i + 1]
+        if (!v || v.startsWith('--')) throw new Error(`installApp: ${flag} needs a value. ${INSTALL_APP_USAGE}`)
+        return v
     }
-    const sourceIdx = parts.indexOf('--source')
-    const nameIdx = parts.indexOf('--name')
-    const sourceDiskName = sourceIdx !== -1 ? parts[sourceIdx + 1] as any : undefined
-    const instanceName = nameIdx !== -1 ? parts[nameIdx + 1] as any : undefined
+    const sourceDiskId = flagValue('--source')
+    const instanceName = flagValue('--name') as any
 
-    await installApp(storeHandle, { appId, targetDiskName, sourceDiskName, instanceName })
+    await installApp(storeHandle, { appId, targetDiskId, sourceDiskId, instanceName })
 }
 
 /**
@@ -327,16 +333,16 @@ const restoreAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceN
     await restoreApp(storeHandle, instance.id, targetDisk as any, undefined, 'console-command')
 }
 
-const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskName: DiskName, mode: string, ...instanceNames: InstanceName[]) => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+/**
+ * createBackupDisk <diskId> <mode> <instanceName…> (idea#128). The disk goes
+ * through resolveDiskArg; refusals throw, so the trace ends as `error`.
+ */
+const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskId: string, mode: string, ...instanceNames: InstanceName[]) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     const validModes = ['immediate', 'on-demand', 'scheduled']
-    if (!validModes.includes(mode)) {
-        console.error(chalk.red(`Invalid mode '${mode}'. Valid modes: ${validModes.join(', ')}`))
-        return
-    }
+    if (!validModes.includes(mode)) throw new Error(`Invalid mode '${mode}'. Valid modes: ${validModes.join(', ')}`)
     const store = storeHandle.doc()
-    const disk = Object.values(store.diskDB).find(d => d.name === diskName && d.device != null)
-    if (!disk) { console.error(chalk.red(`Disk '${diskName}' not found or not docked.`)); return; }
+    const disk = resolveDiskArg(store, getLocalEngine(store)?.id, diskId, 'createBackupDisk')
 
     const instanceIds = instanceNames.map(name => {
         const inst = Object.values(store.instanceDB).find(i => i.name === name)
@@ -344,9 +350,9 @@ const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, dis
         return inst?.id
     }).filter(Boolean) as any[]
 
-    print(chalk.blue(`Creating Backup Disk config on '${diskName}' (mode: ${mode})...`))
+    print(chalk.blue(`Creating Backup Disk config on '${disk.name}' (${disk.id}, mode: ${mode})...`))
     await createBackupDiskConfig(storeHandle, disk as any, mode as any, instanceIds)
-    print(chalk.green(`Backup Disk '${diskName}' configured.`))
+    print(chalk.green(`Backup Disk '${disk.name}' (${disk.id}) configured.`))
 }
 
 const copyAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, sourceDiskId: DiskID, targetDiskId: DiskID) => {
@@ -359,34 +365,11 @@ const moveAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName
     await moveApp(storeHandle, instanceName, sourceDiskId, targetDiskId, 'console-command')
 }
 
-export type EjectTarget = { ok: true, disk: Disk } | { ok: false, message: string }
+export type EjectTarget = DiskArgResult
 
-/**
- * Resolve the argument of `ejectDisk` (idea#152).
- *   1. A disk id (the Console sends disk.id): that record, which must be docked
- *      to this engine with a device.
- *   2. Otherwise a name, for older Consoles and the CLI: only records docked to
- *      this engine with a device count. Two or more such records → refused as
- *      ambiguous (eject by id instead). Stale undocked records with the same name
- *      are ignored, so they can no longer hide the live disk.
- */
-export const resolveEjectTarget = (store: Store, arg: string, engineId: EngineID | undefined): EjectTarget => {
-    const byId = store.diskDB[arg as DiskID]
-    if (byId) {
-        if (!byId.device) return { ok: false, message: `Disk '${byId.name}' (${byId.id}) is not currently docked.` }
-        if (String(byId.dockedTo) !== String(engineId)) return { ok: false, message: `Disk '${byId.name}' (${byId.id}) is not docked to this engine.` }
-        return { ok: true, disk: byId }
-    }
-    const named = Object.values(store.diskDB).filter(d => d.name === arg)
-    if (named.length === 0) return { ok: false, message: `Disk '${arg}' not found.` }
-    const dockedHere = named.filter(d => d.device != null && String(d.dockedTo) === String(engineId))
-    if (dockedHere.length === 1) return { ok: true, disk: dockedHere[0] }
-    if (dockedHere.length > 1) {
-        return { ok: false, message: `Disk name '${arg}' is ambiguous: ${dockedHere.map(d => `${d.id} (${d.device})`).join(', ')} are docked to this engine. Eject by disk id.` }
-    }
-    if (named.some(d => d.device != null)) return { ok: false, message: `Disk '${arg}' is not docked to this engine.` }
-    return { ok: false, message: `Disk '${arg}' is not currently docked.` }
-}
+/** The ejectDisk lookup (idea#152), now the shared disk-argument lookup (idea#128). */
+export const resolveEjectTarget = (store: Store, arg: string, engineId: EngineID | undefined): EjectTarget =>
+    lookupDiskArg(store, engineId, arg)
 
 /**
  * ejectDisk <diskId> (idea#152). A name still works (see resolveEjectTarget).
@@ -397,9 +380,7 @@ const ejectDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskIdOrNa
     if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     const store = storeHandle.doc();
     const localEngine = getLocalEngine(store);
-    const target = resolveEjectTarget(store, diskIdOrName, localEngine?.id)
-    if (!target.ok) throw new Error(target.message)
-    const disk = target.disk
+    const disk = resolveDiskArg(store, localEngine?.id, diskIdOrName, 'ejectDisk')
     const label = `'${disk.name}' (${disk.id})`
     // Never eject the Pi's own system disk, however it was named (idea#152)
     if (await isSystemDiskRecord(disk)) {
@@ -461,7 +442,7 @@ export const commands: CommandDefinition[] = [
     { name: "ejectDisk", execute: ejectDiskWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
     { name: "backupApp", execute: backupAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
-    { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string", name: "diskName" }, { type: "string", name: "mode" }, { type: "string", name: "instanceNames", variadic: true }], scope: 'engine' },
+    { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "mode" }, { type: "string", name: "instanceNames", variadic: true }], scope: 'engine' },
     { name: "cancelOperation", execute: async (storeHandle: DocHandle<Store> | null, opId: string) => {
         if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
         const err = cancelOperation(storeHandle, opId)

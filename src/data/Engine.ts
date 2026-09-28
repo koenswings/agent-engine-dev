@@ -17,7 +17,22 @@ export interface Engine {
   lastRun: Timestamp;
   lastHalted: Timestamp | null;
   commands: Command[];
+  /** What this Engine build supports (idea#128); rewritten as a whole list at every startup */
+  capabilities?: string[];
+  /** The lastBooted of the startup that wrote `capabilities` (idea#128) */
+  capabilitiesBootedAt?: Timestamp;
 }
+
+/**
+ * Capabilities this Engine build advertises (idea#128, Files Disk step 0b).
+ *   diskIdArgs: installApp, createBackupDisk and ejectDisk take disk ids.
+ * Written at every startup as a whole new list, with capabilitiesBootedAt set
+ * to that startup's lastBooted. A Console counts a capability only when
+ * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
+ * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
+ * stamp, so it is treated as old at once.
+ */
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs']
 
 import { config } from './Config.js';
 
@@ -41,6 +56,7 @@ export const createEngineIdFromDiskId = (diskId: DiskID): EngineID => {
 export const initialiseLocalEngine = async (): Promise<Engine> => {
   try {
     const meta: DiskMeta = await readMetaUpdateId()
+    const booted = (new Date()).getTime() as Timestamp
     const localEngine: Engine = {
       id: createEngineIdFromDiskId(meta.diskId),
       hostname: os.hostname() as Hostname,
@@ -48,10 +64,12 @@ export const initialiseLocalEngine = async (): Promise<Engine> => {
       version: (meta.version != null ? String(meta.version) : "0.0.1") as Version,
       hostOS: os.type(),
       created: meta.created,
-      lastBooted: (new Date()).getTime() as Timestamp,
-      lastRun: (new Date()).getTime() as Timestamp,
+      lastBooted: booted,
+      lastRun: booted,
       lastHalted: null,
-      commands: []
+      commands: [],
+      capabilities: [...ENGINE_CAPABILITIES],
+      capabilitiesBootedAt: booted
     }
     return localEngine
   } catch (e) {
@@ -75,8 +93,13 @@ export const createOrUpdateEngine = async (storeHandle: DocHandle<Store>, engine
         engine = doc.engineDB[engineId]
         engine.hostname = os.hostname() as Hostname
         engine.version = newEngine.version
-        engine.lastBooted = (new Date()).getTime() as Timestamp
-        engine.lastRun = (new Date()).getTime() as Timestamp
+        // One timestamp for lastBooted and the capability stamp (idea#128)
+        const booted = (new Date()).getTime() as Timestamp
+        engine.lastBooted = booted
+        engine.lastRun = booted
+        // Whole new list, never appended: a stale or extra entry disappears
+        engine.capabilities = [...ENGINE_CAPABILITIES]
+        engine.capabilitiesBootedAt = booted
       }
     })
   return engine!

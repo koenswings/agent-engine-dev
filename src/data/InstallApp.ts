@@ -20,7 +20,8 @@
 import { chalk, fs } from 'zx'
 import * as net from 'net'
 import { log } from '../utils/utils.js'
-import { Store, getDisk, findDiskByName } from './Store.js'
+import { Store, getDisk, getLocalEngine } from './Store.js'
+import { resolveDiskArg } from './DiskArg.js'
 import { buildInstance } from './Instance.js'
 import { AppID, AppName, DiskID, DiskName, InstanceName, Version } from './CommonTypes.js'
 import { DocHandle } from '@automerge/automerge-repo'
@@ -124,8 +125,8 @@ export const installAppFromDisk = async (
 
 export interface InstallAppOptions {
     appId: AppID
-    targetDiskName: DiskName
-    sourceDiskName?: DiskName    // --source flag; omit for auto-routing
+    targetDiskId: string         // disk id (a unique disk name still resolves, deprecated; idea#128)
+    sourceDiskId?: string        // --source flag; omit for auto-routing
     instanceName?: InstanceName  // --name flag; defaults to appId
     gitAccount?: string          // for GitHub path; defaults to 'koenswings'
 }
@@ -142,23 +143,15 @@ export const installApp = async (
     const instanceName = (opts.instanceName ?? opts.appId) as InstanceName
     const gitAccount = opts.gitAccount ?? 'koenswings'
 
-    // Resolve target disk
-    const targetDisk = findDiskByName(store, opts.targetDiskName)
-        ?? Object.values(store.diskDB).find(d => d.name === opts.targetDiskName)
-    if (!targetDisk || !targetDisk.device) {
-        console.error(chalk.red(`installApp: target disk '${opts.targetDiskName}' not found or not docked`))
-        return
-    }
+    // Resolve the disks on this engine (idea#128): by id, or a unique docked name
+    // with a deprecation warning; refusals throw so the trace ends as `error`
+    const engineId = getLocalEngine(store)?.id
+    const targetDisk = resolveDiskArg(store, engineId, opts.targetDiskId, 'installApp')
 
     // ── Route 1: --source given → local path ──────────────────────────────
-    if (opts.sourceDiskName) {
-        const sourceDisk = findDiskByName(store, opts.sourceDiskName)
-            ?? Object.values(store.diskDB).find(d => d.name === opts.sourceDiskName)
-        if (!sourceDisk || !sourceDisk.device) {
-            console.error(chalk.red(`installApp: source disk '${opts.sourceDiskName}' not found or not docked`))
-            return
-        }
-        log(chalk.blue(`installApp: local path — source '${opts.sourceDiskName}'`))
+    if (opts.sourceDiskId) {
+        const sourceDisk = resolveDiskArg(store, engineId, opts.sourceDiskId, 'installApp --source')
+        log(chalk.blue(`installApp: local path — source '${sourceDisk.name}' (${sourceDisk.id})`))
         await installAppFromDisk(storeHandle, opts.appId, sourceDisk, targetDisk as Disk, instanceName)
         return
     }
@@ -191,10 +184,10 @@ export const installApp = async (
 
     // No local source found
     const appName = opts.appId.slice(0, opts.appId.lastIndexOf('-')) as AppName
-    console.error(chalk.red(
-        `installApp: App '${appName}' not found locally.\n` +
+    throw new Error(
+        `installApp: App '${appName}' not found locally. ` +
         `Insert a disk containing '${appName}' or connect to the internet.`
-    ))
+    )
 }
 
 // ── Phase 2: appDB population for Backup/Catalog Disks ───────────────────────
