@@ -1,5 +1,5 @@
 # Project Source Code Context
-Generated on 2026-09-28T15:25:18.000Z
+Generated on 2026-09-28T18:34:47.646Z
 
 ## File: package.json
 ```typescript
@@ -40,6 +40,7 @@ Generated on 2026-09-28T15:25:18.000Z
     "test:unit": "IDEA_SYSTEM_DISK_SKIP=true bash script/test-run.sh unit automated",
     "test:diagnostic": "IDEA_SYSTEM_DISK_SKIP=true bash script/test-run.sh diagnostic diagnostic",
     "test:cross-engine": "IDEA_SYSTEM_DISK_SKIP=true bash script/test-run.sh cross-engine cross-engine",
+    "test:hw": "npx tsx script/hw-roundtrip.ts",
     "bundle-context": "tsx script/bundle-context.ts",
     "dump-store": "npx tsx script/dump-store.ts",
     "cleanup-store": "npx tsx script/cleanup-store.ts"
@@ -1092,10 +1093,11 @@ export const closeTrace = (
 ```typescript
 import { CommandDefinition } from "./CommandDefinition.js";
 import { Store, getApps, getDisks, getDisk, getRunningEngines, getInstances, getEngine, findDiskByName, findInstanceByName, getLocalEngine, createClientStore } from "./Store.js";
+import { Disk, clearDuplicateDiskRecords, isSystemDiskRecord } from "./Disk.js";
 import { deepPrint, log, print } from "../utils/utils.js";
 import { buildInstance, startInstance, runInstance, stopInstance, markInstanceError } from "./Instance.js";
 import { buildEngine, syncEngine, clearKnownHost, rebootEngine } from "./Engine.js";
-import { AppName, Command, DiskID, DiskName, EngineID, Hostname, InstanceName, Version } from "./CommonTypes.js";
+import { AppName, Command, DeviceName, DiskID, DiskName, EngineID, Hostname, InstanceName, Version } from "./CommonTypes.js";
 import { localEngineId } from "./Engine.js";
 import { chalk, fs, $ } from "zx";
 import { ssh } from '../utils/ssh.js'
@@ -1450,41 +1452,70 @@ const moveAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName
     await moveApp(storeHandle, instanceName, sourceDiskId, targetDiskId, 'console-command')
 }
 
-const ejectDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskName: DiskName) => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+export type EjectTarget = { ok: true, disk: Disk } | { ok: false, message: string }
+
+/**
+ * Resolve the argument of `ejectDisk` (idea#152).
+ *   1. A disk id (the Console sends disk.id): that record, which must be docked
+ *      to this engine with a device.
+ *   2. Otherwise a name, for older Consoles and the CLI: only records docked to
+ *      this engine with a device count. Two or more such records → refused as
+ *      ambiguous (eject by id instead). Stale undocked records with the same name
+ *      are ignored, so they can no longer hide the live disk.
+ */
+export const resolveEjectTarget = (store: Store, arg: string, engineId: EngineID | undefined): EjectTarget => {
+    const byId = store.diskDB[arg as DiskID]
+    if (byId) {
+        if (!byId.device) return { ok: false, message: `Disk '${byId.name}' (${byId.id}) is not currently docked.` }
+        if (String(byId.dockedTo) !== String(engineId)) return { ok: false, message: `Disk '${byId.name}' (${byId.id}) is not docked to this engine.` }
+        return { ok: true, disk: byId }
+    }
+    const named = Object.values(store.diskDB).filter(d => d.name === arg)
+    if (named.length === 0) return { ok: false, message: `Disk '${arg}' not found.` }
+    const dockedHere = named.filter(d => d.device != null && String(d.dockedTo) === String(engineId))
+    if (dockedHere.length === 1) return { ok: true, disk: dockedHere[0] }
+    if (dockedHere.length > 1) {
+        return { ok: false, message: `Disk name '${arg}' is ambiguous: ${dockedHere.map(d => `${d.id} (${d.device})`).join(', ')} are docked to this engine. Eject by disk id.` }
+    }
+    if (named.some(d => d.device != null)) return { ok: false, message: `Disk '${arg}' is not docked to this engine.` }
+    return { ok: false, message: `Disk '${arg}' is not currently docked.` }
+}
+
+/**
+ * ejectDisk <diskId> (idea#152). A name still works (see resolveEjectTarget).
+ * Refusals throw, so the command trace ends as `error` with the reason and the
+ * Console can show it.
+ */
+const ejectDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskIdOrName: string) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     const store = storeHandle.doc();
-    // Search all diskDB entries (not just currently docked ones) so we can give a
-    // meaningful "not currently docked" error instead of a misleading "not found".
-    const disk = Object.values(store.diskDB).find(d => d.name === diskName);
-    if (!disk) {
-        console.error(chalk.red(`Disk '${diskName}' not found.`));
-        return;
-    }
-    if (!disk.device) {
-        console.error(chalk.red(`Disk '${diskName}' is not currently docked.`));
-        return;
-    }
     const localEngine = getLocalEngine(store);
-    if (disk.dockedTo !== localEngine?.id) {
-        console.error(chalk.red(`Disk '${diskName}' is not docked to this engine.`));
-        return;
+    const target = resolveEjectTarget(store, diskIdOrName, localEngine?.id)
+    if (!target.ok) throw new Error(target.message)
+    const disk = target.disk
+    const label = `'${disk.name}' (${disk.id})`
+    // Never eject the Pi's own system disk, however it was named (idea#152)
+    if (await isSystemDiskRecord(disk)) {
+        throw new Error(`Disk ${label} is this Pi's system disk and cannot be ejected.`)
     }
     // Refuse to eject if an operation is actively using this disk
     if (resourceLock.isLocked(diskKey(disk.id))) {
         const info = resourceLock.getLockInfo(diskKey(disk.id))
-        console.error(chalk.red(`Disk '${diskName}' is locked by an active '${info?.kind}' operation. Stop or wait for it to complete before ejecting.`))
-        return
+        throw new Error(`Disk ${label} is locked by an active '${info?.kind}' operation. Stop or wait for it to complete before ejecting.`)
     }
     // Refuse to eject a Backup Disk while a backup writes to it (idea#126). Checked by
     // the backupApp operation's backupDiskId, so scheduled and automatic backups count too.
     const backup = runningBackupOnDisk(store, disk.id)
     if (backup) {
-        console.error(chalk.red(`Disk '${diskName}' is in use by a running backup of instance ${backup.args.instanceId}. Wait for it to complete before ejecting.`))
-        return
+        throw new Error(`Disk ${label} is in use by a running backup of instance ${backup.args.instanceId}. Wait for it to complete before ejecting.`)
     }
-    print(chalk.blue(`Ejecting disk '${diskName}'...`));
+    print(chalk.blue(`Ejecting disk ${label}...`));
+    // The device is unmounted, so any stale record on it is undocked too (idea#152)
+    let cleared: DiskID[] = []
+    storeHandle.change(doc => { cleared = clearDuplicateDiskRecords(doc, disk.dockedTo as EngineID, disk.device as DeviceName, disk.id) })
+    if (cleared.length > 0) log(`Undocked stale disk record(s) ${cleared.join(', ')} on ${disk.device}`)
     await undockDisk(storeHandle, disk);
-    print(chalk.green(`Disk '${diskName}' ejected successfully.`));
+    print(chalk.green(`Disk ${label} ejected successfully.`));
 }
 
 export const commands: CommandDefinition[] = [
@@ -2695,9 +2726,32 @@ export interface UnmountError {
 
 
 
+/**
+ * idea#152: undock, in the store only, every other disk record that claims
+ * <engineId, device>. Call inside a storeHandle.change callback. The physical
+ * device belongs to the record being kept, so nothing is unmounted here.
+ * Returns the ids that were cleared.
+ */
+export const clearDuplicateDiskRecords = (doc: Store, engineId: EngineID, device: DeviceName, keepDiskId: DiskID): DiskID[] => {
+    const cleared: DiskID[] = []
+    for (const other of Object.values(doc.diskDB)) {
+        if (!other || String(other.id) === String(keepDiskId)) continue
+        if (String(other.dockedTo) !== String(engineId) || String(other.device) !== String(device)) continue
+        other.dockedTo = null
+        other.device = null
+        other.diskTypes = []
+        other.backupConfig = null
+        cleared.push(other.id)
+    }
+    return cleared
+}
+
 export const createOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: EngineID, device: DeviceName, diskId: DiskID, diskName: DiskName, created: Timestamp): Disk => {
     let disk: Disk
+    let cleared: DiskID[] = []
     storeHandle.change(doc => {
+        // A device holds one disk: undock any other record on this engine+device (idea#152)
+        cleared = clearDuplicateDiskRecords(doc, engineId, device, diskId)
         let storedDisk = doc.diskDB[diskId];
         if (!storedDisk) {
             log(`Creating disk ${diskId} on engine ${engineId}`);
@@ -2726,6 +2780,7 @@ export const createOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: Engi
             disk.unmountError = null;   // mounted again: a previous busy unmount no longer applies (idea#126)
         }
     });
+    if (cleared.length > 0) log(`Undocked stale disk record(s) ${cleared.join(', ')} on ${device}: device now holds disk ${diskId}`)
     return disk!; // Non-null assertion
 }   
 
@@ -2776,6 +2831,12 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
     if (await isSystemDisk(disk)) {
         log(`Disk ${disk.id} is the system disk`)
         detectedTypes.push('system')
+        // Mark it before scanning /apps and /instances, so the record never shows
+        // a device without the 'system' marker (idea#152)
+        storeHandle.change(doc => {
+            const d = doc.diskDB[disk.id]
+            if (d) d.diskTypes = ['system']
+        })
         await processSystemDisk(storeHandle, disk)
     } else {
         if (await isAppDisk(disk)) {
@@ -2846,6 +2907,32 @@ export const isSystemDisk = async (disk: Disk): Promise<boolean> => {
     const rootDev = await getRootDevice()
     return String(disk.device) === String(rootDev)
 }
+
+/** Tests only: pretend the root filesystem is on this device (null: detect it again). */
+export const setRootDeviceForTests = (device: string | null): void => { _rootDevice = device }
+
+/** Whole-drive name of a partition: sda2 → sda, mmcblk0p2 → mmcblk0, nvme0n1p2 → nvme0n1 */
+export const driveOf = (device: string): string =>
+    /^(mmcblk\d+|nvme\d+n\d+)p\d+$/.test(device) ? device.replace(/p\d+$/, '') : device.replace(/\d+$/, '')
+
+/**
+ * True when the device is a partition of the drive this Pi runs from: the root
+ * partition (sda2) or any other partition on that drive, e.g. the boot partition
+ * (sda1 on /boot/firmware). idea#152: these are never ejected or undocked.
+ */
+export const isOnSystemDrive = async (device: string | null | undefined): Promise<boolean> => {
+    if (!device) return false
+    const root = await getRootDevice()
+    if (!/^(sd[a-z]+\d+|mmcblk\d+p\d+|nvme\d+n\d+p\d+)$/.test(root)) return false
+    return String(device) === root || driveOf(String(device)) === driveOf(root)
+}
+
+/**
+ * The system disk record, by its marker (diskTypes 'system', the field the
+ * Console gates the eject button on) or by its device (on the system drive).
+ */
+export const isSystemDiskRecord = async (disk: Disk): Promise<boolean> =>
+    (disk.diskTypes ?? []).includes('system') || await isOnSystemDrive(disk.device)
 
 /**
  * Returns the path prefix for a disk's app/instance/services directories.
@@ -7010,6 +7097,18 @@ export const findDiskByDevice = (store: Store, deviceName: DeviceName, engineId?
     return disks.find(disk => String(disk.device) === String(deviceName))
 }
 
+/**
+ * Every disk record on a device (idea#152). A stale record can share the device
+ * with the live one (e.g. an old undock that never reached the store), so callers
+ * that dock, undock or dedupe must look at all of them, not just the first.
+ */
+export const findDisksByDevice = (store: Store, deviceName: DeviceName, engineId?: EngineID): Disk[] => {
+    const disks = engineId
+        ? getDisksOfEngine(store, store.engineDB[engineId])
+        : getDisks(store)
+    return disks.filter(disk => String(disk.device) === String(deviceName))
+}
+
 export const findDiskByName = (store: Store, diskName: string): Disk | undefined => {
     return getDisks(store).find(disk => String(disk.name) === String(diskName))
 }
@@ -8959,8 +9058,8 @@ import { DiskMeta, readHardwareId, readMetaUpdateId, writeMetaFile } from '../da
 import { $, fs, YAML, chalk } from 'zx'
 
 $.verbose = false;
-import { Disk, createOrUpdateDisk, processDisk } from '../data/Disk.js'
-import { findDiskByDevice, Store, getDisksOfEngine, getLocalEngine } from '../data/Store.js'
+import { Disk, clearDuplicateDiskRecords, createOrUpdateDisk, isSystemDiskRecord, processDisk } from '../data/Disk.js'
+import { findDiskByDevice, findDisksByDevice, Store, getDisksOfEngine, getLocalEngine } from '../data/Store.js'
 import { DeviceName, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../data/CommonTypes.js'
 
 import { Instance, Status, stopInstance } from '../data/Instance.js';
@@ -9084,6 +9183,11 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                     try {
                         const meta = await readMetaUpdateId()  // reads /META.yaml, no device arg
                         const disk: Disk = createOrUpdateDisk(storeHandle, localEngine.id, device, meta.diskId, 'System Disk' as DiskName, meta.created)
+                        // The marker the Console gates eject on, set with the device (idea#152)
+                        storeHandle.change(doc => {
+                            const d = doc.diskDB[disk.id]
+                            if (d) d.diskTypes = ['system']
+                        })
                         await processDisk(storeHandle, disk)
                     } catch (e) {
                         log(`Error processing system disk: ${e}`)
@@ -9183,12 +9287,11 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         const device = path.split('/').pop()
         if (validDevice(device!)) {
             log(`Processing the removal of USB device ${device}`)
-            const disk = findDiskByDevice(storeHandle.doc(), device as DeviceName)
-            if (!disk) {
+            // Every record on the device, not just the first (idea#152)
+            const undocked = await undockAllOnDevice(storeHandle, localEngine.id, device as DeviceName)
+            if (undocked.length === 0) {
                 log(`No disk found on ${device}`)
-                return
             }
-            await undockDisk(storeHandle, disk)
         } else {
             log(`Non-USB device ${device} has been removed`)
         }
@@ -9219,21 +9322,26 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         const storedDevices = storedDisks.map(disk => disk.device).filter((device): device is DeviceName => device !== undefined && device !== null)
         log(`Which were on devices: ${storedDevices}`)
 
-        for (let device of storedDevices) {
+        for (let device of [...new Set(storedDevices)]) {
+            const disks = findDisksByDevice(storeHandle.doc(), device, localEngine.id)
+            if (disks.length === 0) continue
+            // Never undock the system disk based on /dev/engine listing —
+            // the root partition is always present and /dev/engine may not
+            // be populated yet (e.g. tmpfiles.d race) or may be empty in
+            // testMode. System disk presence is guaranteed by the OS itself.
+            const systemDisk = disks.find(d => d.diskTypes?.includes('system'))
+            if (systemDisk) {
+                log(`Skipping undock of system disk ${systemDisk.id} on device ${device} — system disk is always present`)
+                continue
+            }
             if (!actualDevices.includes(device)) {
-                const disk = findDiskByDevice(store, device as DeviceName)
-                if (!disk) continue
-                // Never undock the system disk based on /dev/engine listing —
-                // the root partition is always present and /dev/engine may not
-                // be populated yet (e.g. tmpfiles.d race) or may be empty in
-                // testMode. System disk presence is guaranteed by the OS itself.
-                if (disk.diskTypes?.includes('system')) {
-                    log(`Skipping undock of system disk ${disk.id} on device ${device} — system disk is always present`)
-                    continue
-                }
                 log(`Removing disk from previously mounted device ${device}`)
-                await undockDisk(storeHandle, disk)
-                log(`Disk ${disk.id} removed from local engine`)
+                const undocked = await undockAllOnDevice(storeHandle, localEngine.id, device)
+                log(`Disk(s) ${undocked.join(', ')} removed from local engine`)
+            } else {
+                // Still attached: if stale records share the device, keep the one
+                // META.yaml names (idea#152)
+                await resolveDuplicateDisksOnDevice(storeHandle, localEngine.id, device)
             }
         }
     } else {
@@ -9276,11 +9384,76 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     return watcher
 }
 
+/**
+ * diskId from <disksRoot>/<device>/META.yaml, read only (no lastDocked update, no
+ * sudo). null when there is no readable META.yaml or it has no diskId.
+ */
+export const readMetaDiskIdOnDevice = async (device: DeviceName): Promise<DiskID | null> => {
+    const metaPath = `${disksRoot()}/${device}/META.yaml`
+    try {
+        if (!(await fs.pathExists(metaPath))) return null
+        const meta = YAML.parse(await fs.readFile(metaPath, 'utf-8'))
+        return meta?.diskId ? String(meta.diskId) as DiskID : null
+    } catch (e) {
+        log(`Could not read ${metaPath}: ${errorMessage(e)}`)
+        return null
+    }
+}
+
+/**
+ * Startup, device still attached (idea#152): when several records on this engine
+ * claim the device, keep the one whose id matches the device's META.yaml and
+ * undock the others in the store. Without a matching META.yaml nothing changes
+ * here; the dock of the device (createOrUpdateDisk) clears the others. Returns
+ * the ids that were undocked.
+ */
+export const resolveDuplicateDisksOnDevice = async (
+    storeHandle: DocHandle<Store>,
+    engineId: EngineID,
+    device: DeviceName,
+    readMetaDiskId: (device: DeviceName) => Promise<DiskID | null> = readMetaDiskIdOnDevice,
+): Promise<DiskID[]> => {
+    const disks = findDisksByDevice(storeHandle.doc(), device, engineId)
+    if (disks.length < 2) return []
+    const metaDiskId = await readMetaDiskId(device)
+    const keep = metaDiskId ? disks.find(d => String(d.id) === String(metaDiskId)) : undefined
+    if (!keep) {
+        log(`Disk records ${disks.map(d => d.id).join(', ')} share ${device} and none matches its META.yaml (${metaDiskId ?? 'none'}); the next dock of ${device} resolves them`)
+        return []
+    }
+    let cleared: DiskID[] = []
+    storeHandle.change(doc => { cleared = clearDuplicateDiskRecords(doc, engineId, device, keep.id) })
+    log(`Undocked stale disk record(s) ${cleared.join(', ')} on ${device}; kept ${keep.id} (META.yaml)`)
+    return cleared
+}
+
+/**
+ * Undock every record on this engine that claims the device (idea#152). The
+ * extra records are cleared in the store first; the first one goes through
+ * undockDisk (unmount, instances, store). Returns all undocked ids.
+ */
+export const undockAllOnDevice = async (storeHandle: DocHandle<Store>, engineId: EngineID, device: DeviceName): Promise<DiskID[]> => {
+    const disks = findDisksByDevice(storeHandle.doc(), device, engineId)
+    if (disks.length === 0) return []
+    const primary = disks[0]
+    let cleared: DiskID[] = []
+    if (disks.length > 1) {
+        storeHandle.change(doc => { cleared = clearDuplicateDiskRecords(doc, engineId, device, primary.id) })
+        log(`Undocked stale disk record(s) ${cleared.join(', ')} on ${device}`)
+    }
+    await undockDisk(storeHandle, primary)
+    return [primary.id, ...cleared]
+}
+
 export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
     const store: Store = storeHandle.doc()
     const device = disk.device
     if (!device) {
         log(`Disk ${disk.id} is not mounted on any device. Nothing to undock.`)
+        return
+    }
+    if (await isSystemDiskRecord(disk)) {
+        log(`Disk ${disk.id} on ${device} is this Pi's system disk — never undocked`)
         return
     }
     try {

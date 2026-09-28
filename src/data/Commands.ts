@@ -1,9 +1,10 @@
 import { CommandDefinition } from "./CommandDefinition.js";
 import { Store, getApps, getDisks, getDisk, getRunningEngines, getInstances, getEngine, findDiskByName, findInstanceByName, getLocalEngine, createClientStore } from "./Store.js";
+import { Disk, clearDuplicateDiskRecords, isSystemDiskRecord } from "./Disk.js";
 import { deepPrint, log, print } from "../utils/utils.js";
 import { buildInstance, startInstance, runInstance, stopInstance, markInstanceError } from "./Instance.js";
 import { buildEngine, syncEngine, clearKnownHost, rebootEngine } from "./Engine.js";
-import { AppName, Command, DiskID, DiskName, EngineID, Hostname, InstanceName, Version } from "./CommonTypes.js";
+import { AppName, Command, DeviceName, DiskID, DiskName, EngineID, Hostname, InstanceName, Version } from "./CommonTypes.js";
 import { localEngineId } from "./Engine.js";
 import { chalk, fs, $ } from "zx";
 import { ssh } from '../utils/ssh.js'
@@ -358,41 +359,70 @@ const moveAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName
     await moveApp(storeHandle, instanceName, sourceDiskId, targetDiskId, 'console-command')
 }
 
-const ejectDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskName: DiskName) => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+export type EjectTarget = { ok: true, disk: Disk } | { ok: false, message: string }
+
+/**
+ * Resolve the argument of `ejectDisk` (idea#152).
+ *   1. A disk id (the Console sends disk.id): that record, which must be docked
+ *      to this engine with a device.
+ *   2. Otherwise a name, for older Consoles and the CLI: only records docked to
+ *      this engine with a device count. Two or more such records → refused as
+ *      ambiguous (eject by id instead). Stale undocked records with the same name
+ *      are ignored, so they can no longer hide the live disk.
+ */
+export const resolveEjectTarget = (store: Store, arg: string, engineId: EngineID | undefined): EjectTarget => {
+    const byId = store.diskDB[arg as DiskID]
+    if (byId) {
+        if (!byId.device) return { ok: false, message: `Disk '${byId.name}' (${byId.id}) is not currently docked.` }
+        if (String(byId.dockedTo) !== String(engineId)) return { ok: false, message: `Disk '${byId.name}' (${byId.id}) is not docked to this engine.` }
+        return { ok: true, disk: byId }
+    }
+    const named = Object.values(store.diskDB).filter(d => d.name === arg)
+    if (named.length === 0) return { ok: false, message: `Disk '${arg}' not found.` }
+    const dockedHere = named.filter(d => d.device != null && String(d.dockedTo) === String(engineId))
+    if (dockedHere.length === 1) return { ok: true, disk: dockedHere[0] }
+    if (dockedHere.length > 1) {
+        return { ok: false, message: `Disk name '${arg}' is ambiguous: ${dockedHere.map(d => `${d.id} (${d.device})`).join(', ')} are docked to this engine. Eject by disk id.` }
+    }
+    if (named.some(d => d.device != null)) return { ok: false, message: `Disk '${arg}' is not docked to this engine.` }
+    return { ok: false, message: `Disk '${arg}' is not currently docked.` }
+}
+
+/**
+ * ejectDisk <diskId> (idea#152). A name still works (see resolveEjectTarget).
+ * Refusals throw, so the command trace ends as `error` with the reason and the
+ * Console can show it.
+ */
+const ejectDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskIdOrName: string) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     const store = storeHandle.doc();
-    // Search all diskDB entries (not just currently docked ones) so we can give a
-    // meaningful "not currently docked" error instead of a misleading "not found".
-    const disk = Object.values(store.diskDB).find(d => d.name === diskName);
-    if (!disk) {
-        console.error(chalk.red(`Disk '${diskName}' not found.`));
-        return;
-    }
-    if (!disk.device) {
-        console.error(chalk.red(`Disk '${diskName}' is not currently docked.`));
-        return;
-    }
     const localEngine = getLocalEngine(store);
-    if (disk.dockedTo !== localEngine?.id) {
-        console.error(chalk.red(`Disk '${diskName}' is not docked to this engine.`));
-        return;
+    const target = resolveEjectTarget(store, diskIdOrName, localEngine?.id)
+    if (!target.ok) throw new Error(target.message)
+    const disk = target.disk
+    const label = `'${disk.name}' (${disk.id})`
+    // Never eject the Pi's own system disk, however it was named (idea#152)
+    if (await isSystemDiskRecord(disk)) {
+        throw new Error(`Disk ${label} is this Pi's system disk and cannot be ejected.`)
     }
     // Refuse to eject if an operation is actively using this disk
     if (resourceLock.isLocked(diskKey(disk.id))) {
         const info = resourceLock.getLockInfo(diskKey(disk.id))
-        console.error(chalk.red(`Disk '${diskName}' is locked by an active '${info?.kind}' operation. Stop or wait for it to complete before ejecting.`))
-        return
+        throw new Error(`Disk ${label} is locked by an active '${info?.kind}' operation. Stop or wait for it to complete before ejecting.`)
     }
     // Refuse to eject a Backup Disk while a backup writes to it (idea#126). Checked by
     // the backupApp operation's backupDiskId, so scheduled and automatic backups count too.
     const backup = runningBackupOnDisk(store, disk.id)
     if (backup) {
-        console.error(chalk.red(`Disk '${diskName}' is in use by a running backup of instance ${backup.args.instanceId}. Wait for it to complete before ejecting.`))
-        return
+        throw new Error(`Disk ${label} is in use by a running backup of instance ${backup.args.instanceId}. Wait for it to complete before ejecting.`)
     }
-    print(chalk.blue(`Ejecting disk '${diskName}'...`));
+    print(chalk.blue(`Ejecting disk ${label}...`));
+    // The device is unmounted, so any stale record on it is undocked too (idea#152)
+    let cleared: DiskID[] = []
+    storeHandle.change(doc => { cleared = clearDuplicateDiskRecords(doc, disk.dockedTo as EngineID, disk.device as DeviceName, disk.id) })
+    if (cleared.length > 0) log(`Undocked stale disk record(s) ${cleared.join(', ')} on ${disk.device}`)
     await undockDisk(storeHandle, disk);
-    print(chalk.green(`Disk '${diskName}' ejected successfully.`));
+    print(chalk.green(`Disk ${label} ejected successfully.`));
 }
 
 export const commands: CommandDefinition[] = [

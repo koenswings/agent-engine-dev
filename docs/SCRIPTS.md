@@ -122,3 +122,22 @@ This document provides a reference for the main provisioning and utility scripts
 -   **Purpose:** Refuses to run tests on a machine with a live Engine (idea#105).
 -   **Usage:** `pnpm test:preflight` or `bash script/test-preflight.sh`. Exit code 0 = safe, 1 = live Engine detected.
 -   **Details:** Refuses when any of these is true: pm2 process `engine` is online (or a `node …/dist/src/index.js` process runs); running Docker containers without the `org.idea.test=true` label; `/instances/*` exist; App Disks are present (`/disks/<name>/META.yaml` or `/disks/<name>/apps`, or `sd*` sentinels in `/dev/engine`). The App Disk check skips the machine's own root disk and all its partitions: the root device comes from `findmnt -n -o SOURCE /`, its parent disk from `lsblk -no PKNAME` (falling back to name parsing for `sdX`, `mmcblkN` and `nvmeNnM`). When the root is not a `/dev` device (e.g. `overlay` in a container), nothing is excluded. The helpers live in `script/test-preflight-lib.sh` and are unit-tested in `test/automated/test-isolation.test.ts`. Override at your own risk with `IDEA_TEST_ALLOW_LIVE=1`.
+
+---
+
+### `hw-roundtrip.ts` (`script/hw-roundtrip.ts`)
+
+-   **Purpose:** On-Pi hardware round-trip test for disk changes (idea#152). Every PR that touches docking, undocking, eject, mounting or disk records must pass it on a claimed pool Pi before hand-off (see AGENTS.md).
+-   **Usage (on the Pi, Engine running):** `pnpm test:hw [--engine-dir <checkout>] [--port 4321] [--engine-log <file>] [--device sdX] [--cycles 2] [--method unbind|authorized] [--timeout 60]`. Run it from any checkout with `node_modules`. `--engine-dir` is the checkout the running Engine uses (its `store-identity/`; default: this checkout). `--engine-log` is that Engine's stdout (default `~/.pm2/logs/engine-out.log`).
+-   **What it checks:**
+    1.  **System disk:** every store record on the drive holding `/` and `/boot/firmware` carries `diskTypes: ['system']`, so it fails the Console eject rule the test assumes: Console #124's `device !== null && !diskTypes.includes('backup')` plus `!diskTypes.includes('system')`. It also notes when the unchanged #124 rule would still show eject. `ejectDisk` on the system disk, first by name and then by id, must end with trace status `error` ("system disk"), `/` and `/boot/firmware` must stay mounted, and the record must stay docked. This runs before and after the round trip.
+    2.  **Round trip,** for each cycle and for every partition of the USB test disk: `ejectDisk <diskId>` goes through the store command queue (`engineDB[<engine>].commands`, the path the Console uses). Then:
+        -   After the eject: the trace is `ok`; the record is undocked (device null) with no `unmountError`; nothing is mounted by source or target; `/disks/<dev>` is gone.
+        -   A simulated unplug and re-plug of the disk's USB device, both checked for udev `remove`/`add` block events and the Engine's `Processing the removal of USB device <dev>` / `A disk on device /dev/engine/<dev> has been added` log lines.
+        -   After the re-plug: every partition is docked again exactly once, with the same disk id and the same `META.yaml` id, and has one mount by source and one by target. Partitions are matched by filesystem UUID, in case the device name changes.
+-   **Unplug simulation:** `unbind` (default) writes the USB device id (e.g. `4-1`, resolved from `/sys/block/<dev>`) to `/sys/bus/usb/drivers/usb/unbind` and then to `.../bind`. `authorized` writes 0 and then 1 to `/sys/bus/usb/devices/<id>/authorized`. On idea03 both give the same kernel block sequence, udev events and Engine log lines as a real re-plug. The only difference is that the kernel logs no "USB disconnect" or new-device enumeration.
+-   **Safety:**
+    -   The sysfs writes are the only root actions. They run as `sudo -n tee <file>` with the tester's own sudo, not the Engine sudoers.
+    -   The script refuses to run on idea02 (golden). It refuses a disk on the system drive, a non-USB disk, and a USB device that is, or sits above, the system drive's USB device.
+    -   After an error, it always re-plugs the disk.
+-   **Result:** exit code 0 only if every check passes. The log goes to `test/testresults/hw-roundtrip-<UTC yyyy-mm-dd-hhmmss>.log`.

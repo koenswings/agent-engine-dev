@@ -108,9 +108,32 @@ export interface UnmountError {
 
 
 
+/**
+ * idea#152: undock, in the store only, every other disk record that claims
+ * <engineId, device>. Call inside a storeHandle.change callback. The physical
+ * device belongs to the record being kept, so nothing is unmounted here.
+ * Returns the ids that were cleared.
+ */
+export const clearDuplicateDiskRecords = (doc: Store, engineId: EngineID, device: DeviceName, keepDiskId: DiskID): DiskID[] => {
+    const cleared: DiskID[] = []
+    for (const other of Object.values(doc.diskDB)) {
+        if (!other || String(other.id) === String(keepDiskId)) continue
+        if (String(other.dockedTo) !== String(engineId) || String(other.device) !== String(device)) continue
+        other.dockedTo = null
+        other.device = null
+        other.diskTypes = []
+        other.backupConfig = null
+        cleared.push(other.id)
+    }
+    return cleared
+}
+
 export const createOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: EngineID, device: DeviceName, diskId: DiskID, diskName: DiskName, created: Timestamp): Disk => {
     let disk: Disk
+    let cleared: DiskID[] = []
     storeHandle.change(doc => {
+        // A device holds one disk: undock any other record on this engine+device (idea#152)
+        cleared = clearDuplicateDiskRecords(doc, engineId, device, diskId)
         let storedDisk = doc.diskDB[diskId];
         if (!storedDisk) {
             log(`Creating disk ${diskId} on engine ${engineId}`);
@@ -139,6 +162,7 @@ export const createOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: Engi
             disk.unmountError = null;   // mounted again: a previous busy unmount no longer applies (idea#126)
         }
     });
+    if (cleared.length > 0) log(`Undocked stale disk record(s) ${cleared.join(', ')} on ${device}: device now holds disk ${diskId}`)
     return disk!; // Non-null assertion
 }   
 
@@ -189,6 +213,12 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
     if (await isSystemDisk(disk)) {
         log(`Disk ${disk.id} is the system disk`)
         detectedTypes.push('system')
+        // Mark it before scanning /apps and /instances, so the record never shows
+        // a device without the 'system' marker (idea#152)
+        storeHandle.change(doc => {
+            const d = doc.diskDB[disk.id]
+            if (d) d.diskTypes = ['system']
+        })
         await processSystemDisk(storeHandle, disk)
     } else {
         if (await isAppDisk(disk)) {
@@ -259,6 +289,32 @@ export const isSystemDisk = async (disk: Disk): Promise<boolean> => {
     const rootDev = await getRootDevice()
     return String(disk.device) === String(rootDev)
 }
+
+/** Tests only: pretend the root filesystem is on this device (null: detect it again). */
+export const setRootDeviceForTests = (device: string | null): void => { _rootDevice = device }
+
+/** Whole-drive name of a partition: sda2 → sda, mmcblk0p2 → mmcblk0, nvme0n1p2 → nvme0n1 */
+export const driveOf = (device: string): string =>
+    /^(mmcblk\d+|nvme\d+n\d+)p\d+$/.test(device) ? device.replace(/p\d+$/, '') : device.replace(/\d+$/, '')
+
+/**
+ * True when the device is a partition of the drive this Pi runs from: the root
+ * partition (sda2) or any other partition on that drive, e.g. the boot partition
+ * (sda1 on /boot/firmware). idea#152: these are never ejected or undocked.
+ */
+export const isOnSystemDrive = async (device: string | null | undefined): Promise<boolean> => {
+    if (!device) return false
+    const root = await getRootDevice()
+    if (!/^(sd[a-z]+\d+|mmcblk\d+p\d+|nvme\d+n\d+p\d+)$/.test(root)) return false
+    return String(device) === root || driveOf(String(device)) === driveOf(root)
+}
+
+/**
+ * The system disk record, by its marker (diskTypes 'system', the field the
+ * Console gates the eject button on) or by its device (on the system drive).
+ */
+export const isSystemDiskRecord = async (disk: Disk): Promise<boolean> =>
+    (disk.diskTypes ?? []).includes('system') || await isOnSystemDrive(disk.device)
 
 /**
  * Returns the path prefix for a disk's app/instance/services directories.

@@ -102,8 +102,8 @@ These commands perform actions on the system. Some are restricted to an `engine`
 - **Scope:** `engine`
 
 ### `ejectDisk`
-- **Description:** Safely ejects a docked disk from this engine. Updates the shared store to reflect the undocked state, stops all running instances on the disk, then unmounts it: `umount` is repeated (at most 5 times, 1 s apart after a failure) until the mount point is no longer a mount point, and the empty mount point is removed with `rmdir`, never `rm -fr` (idea#126). If it stays busy, nothing is removed, a failed `diskDetection` trace is written and the disk gets `unmountError` (restart the Pi to release it). Refused while the disk is locked by an operation or while a `backupApp` operation writing to it is pending or running. Equivalent to a clean physical removal.
-- **Usage:** `ejectDisk <diskName>`
+- **Description:** Safely ejects a docked disk from this engine. Updates the shared store to reflect the undocked state, stops all running instances on the disk, then unmounts it: `umount` is repeated (at most 5 times, 1 s apart after a failure) until the mount point is no longer a mount point, and the empty mount point is removed with `rmdir`, never `rm -fr` (idea#126). If it stays busy, nothing is removed, a failed `diskDetection` trace is written and the disk gets `unmountError` (restart the Pi to release it). Refused for this Pi's system disk (the record marked `diskTypes: ['system']`, or any record on the drive holding `/` and `/boot/firmware`), whether it is named by id or by name (idea#152). Refused while the disk is locked by an operation or while a `backupApp` operation writing to it is pending or running. Any stale store record that still claims the same device is undocked too (idea#152). Equivalent to a clean physical removal.
+- **Usage:** `ejectDisk <diskId>` (the Console sends `disk.id`). A disk name is still accepted for older Consoles and the CLI: it only matches disks docked to this engine with a device, and is refused as ambiguous when two such disks share the name (eject by id instead). Every refusal ends the command trace as `error` with the reason (idea#152).
 - **Scope:** `engine`
 
 ### `reboot`
