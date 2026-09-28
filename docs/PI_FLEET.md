@@ -29,7 +29,7 @@ These nodes are on the local LAN. Tailscale is not yet active on the fleet — s
 
 SSH key: `/home/node/workspace/.ssh/id_ed25519` (openclaw-axle@idea)
 
-SSH config entries (managed by `script/provision-fleet.sh`) are in `~/.ssh/config`.  
+SSH to a Pi by its Tailscale address or LAN IP. The provisioner no longer writes `~/.ssh/config`.  
 mDNS names (`idea0N.local`) resolve via avahi on the LAN.
 
 ```bash
@@ -44,28 +44,32 @@ Started via pm2, auto-starts on boot.
 
 ### Provisioning a node
 
-```bash
-# Provision a single node (Pi 5 example)
-PI_PASS=<password> ./script/provision-fleet.sh idea01=<ip>,model=pi5
+Key-only SSH (idea#146). The Pi must already accept this machine's key and give `pi` passwordless sudo. The script never uses a password, never edits `/etc/hosts` on the runner, and never writes `~/.ssh/config`.
 
-# Provision all four nodes
-PI_PASS=<password> ./script/provision-fleet.sh \
-  idea01=<ip1>,model=pi5 \
-  idea02=<ip2>,model=pi4 \
-  idea03=<ip3>,model=pi5 \
-  idea04=<ip4>,model=pi4
+```bash
+# Pi 5 reached through idea03 as a jump host; fleet Tailscale key from a local file
+./script/provision-fleet.sh --jump pi@100.126.117.80 --authkey-file ~/fleet-authkey.txt \
+  idea01=192.168.0.138,model=pi5
+
+# Two Pis on the same LAN; the Pi already holds the Tailscale key
+./script/provision-fleet.sh idea04=192.168.0.113,model=pi4 idea05=192.168.0.120,model=pi5
 ```
 
-The provisioner:
-1. Pushes the SSH key via password auth (sshpass)
-2. Updates `/etc/hosts` and `~/.ssh/config` in the sandbox
-3. Syncs engine code via rsync
-4. Installs Node.js 22, pnpm, pm2, Docker, borgbackup
-5. Sets hostname, locale, udev rules
-6. Builds and starts the engine
-7. Reboots the Pi
+What it does per node:
+1. Checks key-based SSH (`BatchMode`) and passwordless sudo
+2. Bootstraps apt packages, Node 22.20.0 and the pinned pnpm from `package.json` (`packageManager`, currently 10.33.0), then clones `/home/pi/idea/agents/<repo>`
+3. Stores the Tailscale fleet key over stdin when `--authkey-file` is given (idea#115)
+4. Runs `build-engine` in **local mode on the Pi** with explicit `--no-argon` / `--no-gadget` (unless you pass `--argon` / `--gadget`; `--gadget` is refused on pi5)
+5. Waits for the reboot and checks that pm2's `engine` is online and the Console HTTP port returns 200
 
 Allow 15–20 minutes per node. The Pi reboots at the end.
+
+Off flags for a manual local `build-engine` run (same as the provisioner):
+
+```bash
+./build-engine --hostname idea01 --model pi5 --timezone Europe/Brussels --keyboard us \
+  --temperature --no-argon --no-gadget --prod
+```
 
 ### Syncing a code update
 
@@ -91,11 +95,12 @@ After provisioning, use `sync-engine` for code updates (no full reinstall needed
 | Node.js 22 | Works | Works |
 | BorgBackup | Works | Works |
 
-Provisioner automatically skips `--gadget` for Pi 5 nodes.
+The provisioner and `build-engine --model pi5` refuse `--gadget` on a Pi 5. Spare and test-fleet profiles leave gadget and argon off (`--no-gadget --no-argon`).
 
 ## OS Details
 
-- OS: Raspberry Pi OS Lite (64-bit, Bookworm / Debian 12)
+- OS: Raspberry Pi OS Lite (64-bit). Fleet nodes idea01–idea04 are on Debian 13 (trixie); older Bookworm images still work.
+- Tooling pin: Node 22.20.0 and pnpm 10.33.0 (`package.json` `packageManager`). Do not float to latest pnpm — pnpm 12 rejects the lockfile and refuses `sudo pnpm setup` (idea#146).
 - Kernel: 6.12+ (Pi 5), 6.6+ (Pi 4)
 - Architecture: arm64 (both)
 

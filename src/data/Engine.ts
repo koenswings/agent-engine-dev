@@ -474,6 +474,15 @@ export const installUdev = async (exec: any, enginePath: string) => {
 d /dev/engine 0775 pi pi -
 EOF`
     await exec`sudo systemd-tmpfiles --create /etc/tmpfiles.d/idea-engine.conf`
+
+    // Apply the docking rules now, not only after the final reboot (idea#146): if
+    // the build stops early, the Engine's disk self-check otherwise fails with
+    // "no /dev/engine entry for sda" until the next reboot. Replaying "add" for
+    // block devices is what udev does at boot.
+    print(chalk.blue('  - Reloading udev rules and replaying block devices...'))
+    await exec`sudo udevadm control --reload-rules`
+    await exec`sudo udevadm trigger --subsystem-match=block --action=add`
+    await exec`sudo udevadm settle --timeout=30`
   } catch (e) {
     print(chalk.red('Error installing udev and udev rules'));
     console.error(e);
@@ -687,12 +696,22 @@ export const installRSync = async (exec: any) => {
   print(chalk.green('rsync installed'));
 }
 
+/**
+ * The pnpm version every Engine install uses (idea#146). It must equal the
+ * `packageManager` field in package.json (a test checks this). Never install the
+ * latest pnpm: pnpm 12 rejects our lockfile settings and refuses `sudo pnpm setup`.
+ */
+export const PNPM_VERSION = '10.33.0'
+/** The Node.js version `n` installs for the Engine. */
+export const NODE_VERSION = '22.20.0'
+
 export const installBaseNpm = async (exec: any) => {
-  print(chalk.blue('Installing base node, n, npm and pnpm for script execution...'));
+  print(chalk.blue(`Installing base node ${NODE_VERSION}, n, npm and pnpm ${PNPM_VERSION} for script execution...`));
   try {
     await exec`sudo apt install npm -y`
-    await exec`sudo npm install -g -y n pnpm`
-    await exec`sudo n 22.20.0`
+    // Pinned pnpm, never latest (idea#146)
+    await exec`sudo npm install -g -y n pnpm@${PNPM_VERSION}`
+    await exec`sudo n ${NODE_VERSION}`
   } catch (e) {
     print(chalk.red('Error installing base node, n, npm and pnpm...'));
     console.error(e);
@@ -704,7 +723,7 @@ export const installBaseNpm = async (exec: any) => {
 export const installEngineNode = async (exec: any) => {
   print(chalk.blue('Installing node version for engine...'));
   try {
-    await exec`sudo n 22.20.0`
+    await exec`sudo n ${NODE_VERSION}`
   } catch (e) {
     print(chalk.red('Error installing engine node version...'));
     console.error(e);
@@ -713,16 +732,36 @@ export const installEngineNode = async (exec: any) => {
   print(chalk.green('Engine node version installed'));
 }
 
+/**
+ * Check the pinned pnpm is the one on PATH, then run `pnpm setup` as the build
+ * user (pi), not with sudo (idea#146). `sudo pnpm setup` only configured root's
+ * home, and pnpm 12 refuses it outright (ERR_PNPM_SUDO_NOT_SUPPORTED), which used
+ * to abort the build before the Engine was installed and before the final reboot.
+ * `pnpm setup` only adds PNPM_HOME to the user's shell profile; nothing later in
+ * the build needs it, so a failure there is a warning, not a stop.
+ */
 export const configurePnpm = async (exec: any) => {
   print(chalk.blue('Setting up pnpm...'));
+  let installed = ''
   try {
-    await exec`sudo pnpm setup`
+    const out = await exec`pnpm --version`
+    installed = String(out.stdout ?? out).trim()
   } catch (e) {
-    print(chalk.red('Error setting up pnpm...'));
+    print(chalk.red('pnpm is not on PATH after installBaseNpm'));
     console.error(e);
     process.exit(1);
   }
-  print(chalk.green('pnpm set up'));
+  if (installed !== PNPM_VERSION) {
+    print(chalk.red(`pnpm ${installed} is installed, but the Engine needs pnpm ${PNPM_VERSION} (idea#146)`));
+    process.exit(1);
+  }
+  try {
+    await exec`pnpm setup`
+  } catch (e) {
+    print(chalk.yellow('pnpm setup failed; continuing (only the shell profile is affected)'));
+    console.error(e);
+  }
+  print(chalk.green(`pnpm ${PNPM_VERSION} set up`));
 }
 
 
