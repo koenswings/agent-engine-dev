@@ -354,11 +354,14 @@ describe('the chown -h path (idea#131)', () => {
 
     it('no other path in src/ runs chown on a disk', async () => {
         const files = (await $`find src -name '*.ts'`.quiet()).stdout.split('\n').filter(Boolean).sort()
-        const withChownH = files.filter(f => /chown -h/.test(fs.readFileSync(path.join(ROOT, f), 'utf8')))
+        // Code lines only: comments may mention the entry
+        const code = (f: string) => fs.readFileSync(path.join(ROOT, f), 'utf8').split('\n')
+            .filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')
+        const withChownH = files.filter(f => /chown -h|SUDO_CHOWN\} -h/.test(code(f)))
         expect(withChownH).toEqual(['src/data/CreateFilesDisk.ts'])
         for (const f of files) {
             if (f === 'src/data/CreateFilesDisk.ts') continue
-            const text = fs.readFileSync(path.join(ROOT, f), 'utf8')
+            const text = code(f)
             expect(text, f).not.toMatch(/chown[^`\n]*(\/disks|disksRoot|SUDO_CHOWN)/)
             expect(text, f).not.toMatch(/runSudoChownRoot|chownRoot\(/)
         }
