@@ -530,8 +530,9 @@ EOF`
  * The Engine's sudoers files (asset in script/build_image_assets -> installed file).
  *   - 10-engine: the narrow list of root commands the Engine (running as pi)
  *     needs (idea#80, proposals/run-architecture.md)
- *   - 11-engine-files: files the Engine writes as root on App Disks, e.g.
- *     META.yaml on the first dock (idea#121)
+ *   - 11-engine-files: files and folders the Engine writes, removes or re-owns
+ *     as root under /disks, e.g. META.yaml on the first dock (idea#121) and the
+ *     disk root owner for createFilesDisk (chown -h, idea#131)
  * Installed names have no '.' in them: sudo skips files in /etc/sudoers.d whose
  * name contains a '.'.
  */

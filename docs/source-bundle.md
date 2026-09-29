@@ -1,5 +1,5 @@
 # Project Source Code Context
-Generated on 2026-09-28T20:49:01.295Z
+Generated on 2026-09-29T02:22:51.297Z
 
 ## File: package.json
 ```typescript
@@ -327,6 +327,8 @@ import { prepareStoreIdentity, storeIdentityPaths } from './data/StoreIdentity.j
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
 import { recoverInterruptedOperations } from './data/Operations.js'
 import { enableDockerMetricsMonitor } from './monitors/dockerMetricsMonitor.js'
+import { enableDiskSizeMonitor } from './data/DiskSize.js'
+import { diskFsRoot } from './data/Disk.js'
 import { copyApp, moveApp } from './data/CopyMoveApp.js'
 import { backupInstance } from './monitors/backupMonitor.js'
 import { clearStaleUnmountErrors } from './monitors/mounts.js'
@@ -508,6 +510,9 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     log(chalk.bgMagenta('STARTING DOCKER METRICS MONITOR'))
     enableDockerMetricsMonitor(storeHandle)
 
+    // Size and free space of docked disks every 10 minutes (idea#131); on dock via processDisk
+    enableDiskSizeMonitor(storeHandle, localEngineId, diskFsRoot)
+
     log(chalk.bgMagenta('STARTING HEARTBEAT GENERATION'))
     const heartbeatIntervalMs = config.settings.heartbeatIntervalMs ?? 50000
     generateHeartBeat(storeHandle)
@@ -595,1879 +600,6 @@ runner.run(function(failures) {
     // send your email here
     print('done')
 });
-```
-
-## File: src/utils/CommandLogger.ts
-```typescript
-/**
- * CommandLogger.ts
- *
- * Captures console output per command invocation using AsyncLocalStorage.
- * Each command gets a unique trace context that flows automatically through
- * every async call in its chain — no changes needed in individual commands.
- *
- * Usage:
- *   1. Call initCommandLogger(handle) once at engine startup.
- *   2. Wrap every command dispatch in runWithTrace(ctx, fn).
- *   3. Everything inside fn() that calls console.log/info/warn/error/debug
- *      is automatically collected into that trace's log list.
- */
-
-import { AsyncLocalStorage } from 'async_hooks'
-import type { DocHandle } from '@automerge/automerge-repo'
-import type { CommandLogStore, LogEntry } from '../data/CommandLogStore.js'
-import { flushLogs } from '../data/CommandLogStore.js'
-
-export interface TraceContext {
-  traceId: string
-  command: string
-  args: string
-}
-
-// ── AsyncLocalStorage instance ───────────────────────────────────────────────
-
-const storage = new AsyncLocalStorage<TraceContext>()
-
-export const getActiveTrace = (): TraceContext | undefined => storage.getStore()
-
-export const runWithTrace = async <T>(
-  ctx: TraceContext,
-  fn: () => Promise<T>
-): Promise<T> => {
-  return storage.run(ctx, fn)
-}
-
-// ── Per-trace pending buffers and debounced flush ────────────────────────────
-
-const pendingBuffers = new Map<string, LogEntry[]>()
-const flushTimers    = new Map<string, ReturnType<typeof setTimeout>>()
-const FLUSH_DEBOUNCE_MS = 50
-
-let _handle: DocHandle<CommandLogStore> | null = null
-
-const scheduleFlush = (traceId: string): void => {
-  const existing = flushTimers.get(traceId)
-  if (existing) clearTimeout(existing)
-
-  const timer = setTimeout(() => {
-    flushTimers.delete(traceId)
-    const buffer = pendingBuffers.get(traceId)
-    if (buffer && buffer.length > 0 && _handle) {
-      const batch = buffer.splice(0)           // drain in-place
-      flushLogs(_handle, traceId, batch)
-    }
-  }, FLUSH_DEBOUNCE_MS)
-
-  flushTimers.set(traceId, timer)
-}
-
-/**
- * Append a log entry to a trace's pending buffer and schedule a flush.
- * Called from the patched console methods.
- */
-export const appendToTrace = (traceId: string, entry: LogEntry): void => {
-  if (!pendingBuffers.has(traceId)) pendingBuffers.set(traceId, [])
-  pendingBuffers.get(traceId)!.push(entry)
-  scheduleFlush(traceId)
-}
-
-/**
- * Force-flush any remaining buffered entries for a trace immediately.
- * Call this right before closeTrace so logs aren't lost on fast commands.
- */
-export const flushTrace = async (traceId: string): Promise<void> => {
-  const timer = flushTimers.get(traceId)
-  if (timer) {
-    clearTimeout(timer)
-    flushTimers.delete(traceId)
-  }
-  const buffer = pendingBuffers.get(traceId)
-  if (buffer && buffer.length > 0 && _handle) {
-    const batch = buffer.splice(0)
-    flushLogs(_handle, traceId, batch)
-  }
-  pendingBuffers.delete(traceId)
-}
-
-// ── Console patch ────────────────────────────────────────────────────────────
-
-let _patched = false
-
-const patchConsole = (): void => {
-  if (_patched) return
-  _patched = true
-
-  const originals = {
-    log:   console.log.bind(console),
-    info:  console.info.bind(console),
-    warn:  console.warn.bind(console),
-    error: console.error.bind(console),
-    debug: console.debug.bind(console),
-  } as const
-
-  type Level = keyof typeof originals
-
-  const patch = (level: Level) => {
-    console[level] = (...args: unknown[]) => {
-      originals[level](...args)              // always write to stdout
-      const ctx = getActiveTrace()
-      if (ctx) {
-        appendToTrace(ctx.traceId, {
-          level,
-          message: args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '),
-          timestamp: Date.now(),
-        })
-      }
-    }
-  }
-
-  patch('log')
-  patch('info')
-  patch('warn')
-  patch('error')
-  patch('debug')
-}
-
-// ── Public init ──────────────────────────────────────────────────────────────
-
-/**
- * Call once at engine startup, after the CommandLogStore doc is created.
- * Patches console and connects the logger to the Automerge doc handle.
- */
-export const initCommandLogger = (handle: DocHandle<CommandLogStore>): void => {
-  _handle = handle
-  patchConsole()
-}
-
-```
-
-## File: src/utils/ResourceLock.ts
-```typescript
-/**
- * ResourceLock.ts — per-resource mutual exclusion for long-running operations
- *
- * Group P: Concurrent operation safety
- *
- * Prevents two operations from mutating the same resource simultaneously.
- * Resources are identified by string keys (instanceId, diskId, or compound).
- *
- * Design:
- *   - In-memory only — not persisted to the store. Locks are engine-local and
- *     reset on restart (acceptable: operationDB recovery handles restart cases).
- *   - acquire() returns false immediately if the resource is locked (non-blocking).
- *     Callers must check and surface a 409-style error to the operator.
- *   - All long-running commands (copyApp, moveApp, backupApp, restoreApp) acquire
- *     locks on their affected resources before starting and release in finally{}.
- *
- * Resource key conventions:
- *   - Instance-level ops: `instance:<instanceId>`
- *   - Disk-level ops:     `disk:<diskId>`
- *   - Multi-resource ops (e.g. copyApp): acquire both source and target instance keys
- */
-
-import { log } from './utils.js'
-import { chalk } from 'zx'
-
-export interface LockInfo {
-    kind: string        // operation kind holding the lock
-    acquiredAt: number  // unix ms
-}
-
-class ResourceLockManager {
-    private locks = new Map<string, LockInfo>()
-
-    /**
-     * Attempt to acquire a lock on `key` for operation `kind`.
-     * Returns true if acquired, false if already locked.
-     */
-    acquire(key: string, kind: string): boolean {
-        if (this.locks.has(key)) {
-            const held = this.locks.get(key)!
-            log(chalk.yellow(`ResourceLock: '${key}' already locked by '${held.kind}' (since ${new Date(held.acquiredAt).toISOString()})`))
-            return false
-        }
-        this.locks.set(key, { kind, acquiredAt: Date.now() })
-        log(`ResourceLock: acquired '${key}' for '${kind}'`)
-        return true
-    }
-
-    /**
-     * Acquire multiple keys atomically (all-or-nothing).
-     * Returns true if all acquired, false if any were already locked.
-     * On failure, no locks are held (rolled back).
-     */
-    acquireAll(keys: string[], kind: string): boolean {
-        const acquired: string[] = []
-        for (const key of keys) {
-            if (!this.acquire(key, kind)) {
-                // Roll back already-acquired keys
-                acquired.forEach(k => this.release(k))
-                return false
-            }
-            acquired.push(key)
-        }
-        return true
-    }
-
-    /**
-     * Release a lock. Safe to call even if the key is not locked.
-     */
-    release(key: string): void {
-        if (this.locks.has(key)) {
-            this.locks.delete(key)
-            log(`ResourceLock: released '${key}'`)
-        }
-    }
-
-    /**
-     * Release multiple keys.
-     */
-    releaseAll(keys: string[]): void {
-        keys.forEach(k => this.release(k))
-    }
-
-    /**
-     * Check if a key is currently locked.
-     */
-    isLocked(key: string): boolean {
-        return this.locks.has(key)
-    }
-
-    /**
-     * Return current lock info for a key, or undefined if unlocked.
-     */
-    getLockInfo(key: string): LockInfo | undefined {
-        return this.locks.get(key)
-    }
-
-    /**
-     * Return all currently held locks (for diagnostics).
-     */
-    allLocks(): Map<string, LockInfo> {
-        return new Map(this.locks)
-    }
-}
-
-// Singleton — one lock manager per engine process
-export const resourceLock = new ResourceLockManager()
-
-// Key helpers
-export const instanceKey = (instanceId: string) => `instance:${instanceId}`
-export const diskKey = (diskId: string) => `disk:${diskId}`
-
-```
-
-## File: src/utils/cliFlags.ts
-```typescript
-/**
- * Boolean command-line flags for build-engine (idea#146).
- *
- * zx's `argv` is minimist without declared booleans, so a flag can arrive as:
- *   --argon            true
- *   --no-argon         false
- *   --argon=false      'false' (a string)
- *   --argon false      'false' (a string)
- *   (absent)           undefined
- *
- * The old `argv.argon || defaults.argon` could never turn off an option whose
- * config default is true (argon, gadget). parseBoolFlag uses the flag whenever it
- * is present and falls back to the default only when it is absent.
- */
-const TRUE_WORDS = ['true', 'yes', 'on', '1']
-const FALSE_WORDS = ['false', 'no', 'off', '0']
-
-export const parseBoolFlag = (value: unknown, fallback: boolean): boolean => {
-    if (value === undefined || value === null) return fallback
-    if (typeof value === 'boolean') return value
-    if (typeof value === 'number') return value !== 0
-    if (typeof value === 'string') {
-        const v = value.trim().toLowerCase()
-        if (v === '') return true            // `--argon=` counts as present
-        if (TRUE_WORDS.includes(v)) return true
-        if (FALSE_WORDS.includes(v)) return false
-    }
-    // Arrays (flag given twice) and anything else: the last value wins.
-    if (Array.isArray(value) && value.length > 0) return parseBoolFlag(value[value.length - 1], fallback)
-    throw new Error(`Not a boolean flag value: ${JSON.stringify(value)} (use --flag, --no-flag or --flag=true|false)`)
-}
-
-/** Raspberry Pi models build-engine knows about. */
-export type PiModel = 'pi4' | 'pi5'
-
-export const parseModel = (value: unknown): PiModel | undefined => {
-    if (value === undefined || value === null || value === '') return undefined
-    const v = String(value).trim().toLowerCase()
-    if (v === 'pi4' || v === 'pi5') return v
-    throw new Error(`Unknown --model ${JSON.stringify(value)}; expected pi4 or pi5`)
-}
-
-/**
- * Resolve the gadget setting for a model. USB gadget mode needs the Pi 4's DWC2
- * USB controller; the Pi 5 has a PCIe USB controller, so gadget mode must stay off.
- * Asking for it explicitly on a Pi 5 is an error; a config default of true is
- * silently overridden.
- */
-export const resolveGadget = (flag: unknown, fallback: boolean, model: PiModel | undefined): boolean => {
-    const gadget = parseBoolFlag(flag, fallback)
-    if (model === 'pi5' && gadget) {
-        if (flag !== undefined && parseBoolFlag(flag, false)) {
-            throw new Error('--gadget is not supported on a Pi 5 (PCIe USB controller); leave it out or pass --no-gadget')
-        }
-        return false
-    }
-    return gadget
-}
-
-```
-
-## File: src/utils/commandUtils.ts
-```typescript
-import { DocHandle } from "@automerge/automerge-repo";
-import { Store } from "../data/Store.js";
-import { Command, EngineID } from "../data/CommonTypes.js";
-import { ArgumentDescriptor, CommandDefinition } from "../data/CommandDefinition.js";
-import { CommandLogStore, addTrace, closeTrace, getCommandLogHandle } from "../data/CommandLogStore.js";
-import { runWithTrace, flushTrace } from "./CommandLogger.js";
-import { print } from './utils.js';
-
-
-export const handleCommand = async (
-    commands: CommandDefinition[],
-    storeHandle: DocHandle<Store> | null,
-    context: 'console' | 'engine',
-    input: string,
-    commandLogHandle?: DocHandle<CommandLogStore> | null
-): Promise<void> => {
-    const trimmedInput = input.trim();
-    const commandName = trimmedInput.split(' ')[0];
-    const command = commands.find(cmd => cmd.name === commandName);
-
-    if (!command) {
-        print(`Unknown command: ${commandName}`);
-        return;
-    }
-
-    // A variadic last arg takes all remaining tokens (see ArgumentDescriptor.variadic)
-    const lastArg = command.args[command.args.length - 1];
-    const isVariadic = lastArg?.variadic === true;
-
-    let stringArgs: string[] = [];
-    // Special case for commands that take the entire rest of the line as a single argument
-    if (command.args.length === 1 && !isVariadic) {
-        const firstSpaceIndex = trimmedInput.indexOf(' ');
-        if (firstSpaceIndex !== -1) {
-            stringArgs.push(trimmedInput.substring(firstSpaceIndex + 1));
-        }
-    } else {
-        stringArgs = trimmedInput.split(' ').slice(1).filter(arg => arg.length > 0);
-    }
-
-    // Scope checking
-    if (context === 'console' && command.scope === 'engine') {
-        print(`Error: Command '${commandName}' can only be executed on an engine. Use 'send <engineId> ${commandName} ...' to execute it remotely.`);
-        return;
-    }
-
-    if (context === 'engine' && command.scope === 'console') {
-        print(`Error: Command '${commandName}' can only be executed on a console.`);
-        return;
-    }
-
-    let args: any[];
-    try {
-        args = stringArgs.map((arg, index) => {
-            const descriptor = isVariadic && index >= command.args.length - 1 ? lastArg : command.args[index];
-            if (!descriptor) throw new Error("Too many arguments");
-            return convertToType(arg, descriptor);
-        });
-        // An optional variadic last arg may take zero tokens (idea#128)
-        const required = isVariadic && lastArg.optional ? command.args.length - 1 : command.args.length;
-        if (args.length < required) throw new Error("Insufficient arguments");
-    } catch (error: any) {
-        console.error(`Error: ${error.message}`);
-        return;
-    }
-
-    // ── Trace setup ──────────────────────────────────────────────────────────
-    const traceId = crypto.randomUUID();
-    // Build a named args object when the CommandDefinition has arg names defined,
-    // otherwise fall back to a positional array. The Console filters traces by
-    // args['instanceName'] or args['instanceId'], so named args are required.
-    // A variadic last arg is recorded as an array of all its tokens.
-    const namedArgs: Record<string, string | string[] | null> | string[] =
-        command.args.every(a => a.name)
-            ? Object.fromEntries(command.args.map((a, i) =>
-                [a.name!, a.variadic ? stringArgs.slice(i) : stringArgs[i] ?? null]))
-            : stringArgs
-    const argsJson = JSON.stringify(namedArgs);
-    const traceCtx = { traceId, command: commandName, args: argsJson };
-
-    if (commandLogHandle) {
-        addTrace(commandLogHandle, {
-            traceId,
-            command: commandName,
-            args: argsJson,
-            startedAt: Date.now(),
-            completedAt: null,
-            status: 'running',
-            errorMessage: null,
-        });
-    }
-
-    // ── Execute inside trace context ─────────────────────────────────────────
-    try {
-        await runWithTrace(traceCtx, async () => { await command.execute(storeHandle, ...args); });
-        if (commandLogHandle) {
-            await flushTrace(traceId);
-            closeTrace(commandLogHandle, traceId, 'ok');
-        }
-    } catch (error: any) {
-        console.error(`Error: ${error.message}`);
-        if (commandLogHandle) {
-            await flushTrace(traceId);
-            closeTrace(commandLogHandle, traceId, 'error', error.message);
-        }
-    }
-}
-
-
-/**
- * A dependency-free utility to add a command to a specific engine's command array in the store.
- * This is used by tests and the 'send' command definition.
- */
-export const sendCommand = (storeHandle: DocHandle<Store>, engineId: EngineID, command: Command): void => {
-    print(`Sending command '${command}' to engine ${engineId}`);
-
-    const store = storeHandle.doc();
-    if (!store?.engineDB[engineId]) {
-        console.error(`Cannot send command: Engine ${engineId} not found in store.`);
-        return;
-    }
-
-    // Trace the dispatch on the originating engine so the Console shows
-    // cross-engine commands in history (e.g. copyApp dispatching startInstance
-    // to a remote engine). This is a one-shot trace with no log lines.
-    const cmdLogHandle = getCommandLogHandle()
-    if (cmdLogHandle) {
-        const commandName = String(command).split(' ')[0]
-        const traceId = crypto.randomUUID()
-        addTrace(cmdLogHandle, {
-            traceId,
-            command: commandName,
-            args: JSON.stringify({ dispatchedTo: engineId, command: String(command) }),
-            startedAt: Date.now(),
-            completedAt: Date.now(),
-            status: 'running',
-            errorMessage: null,
-        })
-        closeTrace(cmdLogHandle, traceId, 'ok')
-    }
-
-    storeHandle.change(doc => {
-        const engine = doc.engineDB[engineId];
-        if (engine) {
-            engine.commands.push(command);
-        }
-    });
-}
-const convertToType = (str: string, descriptor: ArgumentDescriptor): any => {
-    switch (descriptor.type) {
-        case "number":
-            const num = parseFloat(str);
-            if (isNaN(num)) throw new Error("Cannot convert to number");
-            return num;
-        case "string":
-            return str;
-        case "object":
-            if (!descriptor.objectSpec) throw new Error("Object specification is missing");
-            try {
-                const obj = JSON.parse(str);
-                for (const [key, fieldSpec] of Object.entries(descriptor.objectSpec)) {
-                    if (!(key in obj)) throw new Error(`Missing key '${key}' in object`);
-                    switch (fieldSpec.type) {
-                        case 'number':
-                            const value = parseFloat(obj[key]);
-                            if (isNaN(value)) throw new Error(`Key '${key}' is not a valid number`);
-                            obj[key] = value;
-                            break;
-                        case 'string':
-                            if (typeof obj[key] !== 'string') throw new Error(`Key '${key}' is not a valid string`);
-                            break;
-                    }
-                }
-                return obj;
-            } catch {
-                throw new Error("Cannot convert to object");
-            }
-        default:
-            throw new Error("Unsupported type");
-    }
-}
-
-```
-
-## File: src/utils/nameGenerator.ts
-```typescript
-import util from 'util';
-import { Hostname } from '../data/CommonTypes.js';
-
-// Docker-style name generation
-// Inspired by
-// - https://github.com/moby/moby/blob/39f7b2b6d0156811d9683c6cb0743118ae516a11/pkg/namesgenerator/names-generator.go#L852-L863 
-// - https://github.com/subfuzion/docker-namesgenerator/blob/master/namesgenerator.js
-  
-  const adjectives = [
-    "admiring",
-          "adoring",
-          "affectionate",
-          "agitated",
-          "amazing",
-          "angry",
-          "awesome",
-          "beautiful",
-          "blissful",
-          "bold",
-          "boring",
-          "brave",
-          "busy",
-          "charming",
-          "clever",
-          "cool",
-          "compassionate",
-          "competent",
-          "condescending",
-          "confident",
-          "cranky",
-          "crazy",
-          "dazzling",
-          "determined",
-          "distracted",
-          "dreamy",
-          "eager",
-          "ecstatic",
-          "elastic",
-          "elated",
-          "elegant",
-          "eloquent",
-          "epic",
-          "exciting",
-          "fervent",
-          "festive",
-          "flamboyant",
-          "focused",
-          "friendly",
-          "frosty",
-          "funny",
-          "gallant",
-          "gifted",
-          "goofy",
-          "gracious",
-          "great",
-          "happy",
-          "hardcore",
-          "heuristic",
-          "hopeful",
-          "hungry",
-          "infallible",
-          "inspiring",
-          "intelligent",
-          "interesting",
-          "jolly",
-          "jovial",
-          "keen",
-          "kind",
-          "laughing",
-          "loving",
-          "lucid",
-          "magical",
-          "mystifying",
-          "modest",
-          "musing",
-          "naughty",
-          "nervous",
-          "nice",
-          "nifty",
-          "nostalgic",
-          "objective",
-          "optimistic",
-          "peaceful",
-          "pedantic",
-          "pensive",
-          "practical",
-          "priceless",
-          "quirky",
-          "quizzical",
-          "recursing",
-          "relaxed",
-          "reverent",
-          "romantic",
-          "sad",
-          "serene",
-          "sharp",
-          "silly",
-          "sleepy",
-          "stoic",
-          "strange",
-          "stupefied",
-          "suspicious",
-          "sweet",
-          "tender",
-          "thirsty",
-          "trusting",
-          "unruffled",
-          "upbeat",
-          "vibrant",
-          "vigilant",
-          "vigorous",
-          "wizardly",
-          "wonderful",
-          "xenodochial",
-          "youthful",
-          "zealous",
-          "zen",
-  ]
-  
-  const scientists = [
-    // Maria Gaetana Agnesi - Italian mathematician, philosopher, theologian and humanitarian. She was the first woman to write a mathematics handbook and the first woman appointed as a Mathematics Professor at a University. https://en.wikipedia.org/wiki/Maria_Gaetana_Agnesi
-    "agnesi",
-  
-    // Muhammad ibn Jābir al-Ḥarrānī al-Battānī was a founding father of astronomy. https://en.wikipedia.org/wiki/Mu%E1%B8%A5ammad_ibn_J%C4%81bir_al-%E1%B8%A4arr%C4%81n%C4%AB_al-Batt%C4%81n%C4%AB
-    "albattani",
-  
-    // Frances E. Allen, became the first female IBM Fellow in 1989. In 2006, she became the first female recipient of the ACM's Turing Award. https://en.wikipedia.org/wiki/Frances_E._Allen
-    "allen",
-  
-    // June Almeida - Scottish virologist who took the first pictures of the rubella virus - https://en.wikipedia.org/wiki/June_Almeida
-    "almeida",
-  
-    // Kathleen Antonelli, American computer programmer and one of the six original programmers of the ENIAC - https://en.wikipedia.org/wiki/Kathleen_Antonelli
-    "antonelli",
-  
-    // Archimedes was a physicist, engineer and mathematician who invented too many things to list them here. https://en.wikipedia.org/wiki/Archimedes
-    "archimedes",
-  
-    // Maria Ardinghelli - Italian translator, mathematician and physicist - https://en.wikipedia.org/wiki/Maria_Ardinghelli
-    "ardinghelli",
-  
-    // Aryabhata - Ancient Indian mathematician-astronomer during 476-550 CE https://en.wikipedia.org/wiki/Aryabhata
-    "aryabhata",
-  
-    // Wanda Austin - Wanda Austin is the President and CEO of The Aerospace Corporation, a leading architect for the US security space programs. https://en.wikipedia.org/wiki/Wanda_Austin
-    "austin",
-  
-    // Charles Babbage invented the concept of a programmable computer. https://en.wikipedia.org/wiki/Charles_Babbage.
-    "babbage",
-  
-    // Stefan Banach - Polish mathematician, was one of the founders of modern functional analysis. https://en.wikipedia.org/wiki/Stefan_Banach
-    "banach",
-  
-    // Buckaroo Banzai and his mentor Dr. Hikita perfected the "oscillation overthruster", a device that allows one to pass through solid matter. - https://en.wikipedia.org/wiki/The_Adventures_of_Buckaroo_Banzai_Across_the_8th_Dimension
-    "banzai",
-  
-    // John Bardeen co-invented the transistor - https://en.wikipedia.org/wiki/John_Bardeen
-    "bardeen",
-  
-    // Jean Bartik, born Betty Jean Jennings, was one of the original programmers for the ENIAC computer. https://en.wikipedia.org/wiki/Jean_Bartik
-    "bartik",
-  
-    // Laura Bassi, the world's first female professor https://en.wikipedia.org/wiki/Laura_Bassi
-    "bassi",
-  
-    // Hugh Beaver, British engineer, founder of the Guinness Book of World Records https://en.wikipedia.org/wiki/Hugh_Beaver
-    "beaver",
-  
-    // Alexander Graham Bell - an eminent Scottish-born scientist, inventor, engineer and innovator who is credited with inventing the first practical telephone - https://en.wikipedia.org/wiki/Alexander_Graham_Bell
-    "bell",
-  
-    // Karl Friedrich Benz - a German automobile engineer. Inventor of the first practical motorcar. https://en.wikipedia.org/wiki/Karl_Benz
-    "benz",
-  
-    // Homi J Bhabha - was an Indian nuclear physicist, founding director, and professor of physics at the Tata Institute of Fundamental Research. Colloquially known as "father of Indian nuclear programme"- https://en.wikipedia.org/wiki/Homi_J._Bhabha
-    "bhabha",
-  
-    // Bhaskara II - Ancient Indian mathematician-astronomer whose work on calculus predates Newton and Leibniz by over half a millennium - https://en.wikipedia.org/wiki/Bh%C4%81skara_II#Calculus
-    "bhaskara",
-  
-    // Sue Black - British computer scientist and campaigner. She has been instrumental in saving Bletchley Park, the site of World War II codebreaking - https://en.wikipedia.org/wiki/Sue_Black_(computer_scientist)
-    "black",
-  
-    // Elizabeth Helen Blackburn - Australian-American Nobel laureate; best known for co-discovering telomerase. https://en.wikipedia.org/wiki/Elizabeth_Blackburn
-    "blackburn",
-  
-    // Elizabeth Blackwell - American doctor and first American woman to receive a medical degree - https://en.wikipedia.org/wiki/Elizabeth_Blackwell
-    "blackwell",
-  
-    // Niels Bohr is the father of quantum theory. https://en.wikipedia.org/wiki/Niels_Bohr.
-    "bohr",
-  
-    // Kathleen Booth, she's credited with writing the first assembly language. https://en.wikipedia.org/wiki/Kathleen_Booth
-    "booth",
-  
-    // Anita Borg - Anita Borg was the founding director of the Institute for Women and Technology (IWT). https://en.wikipedia.org/wiki/Anita_Borg
-    "borg",
-  
-    // Satyendra Nath Bose - He provided the foundation for Bose–Einstein statistics and the theory of the Bose–Einstein condensate. - https://en.wikipedia.org/wiki/Satyendra_Nath_Bose
-    "bose",
-  
-    // Katherine Louise Bouman is an imaging scientist and Assistant Professor of Computer Science at the California Institute of Technology. She researches computational methods for imaging, and developed an algorithm that made possible the picture first visualization of a black hole using the Event Horizon Telescope. - https://en.wikipedia.org/wiki/Katie_Bouman
-    "bouman",
-  
-    // Evelyn Boyd Granville - She was one of the first African-American woman to receive a Ph.D. in mathematics; she earned it in 1949 from Yale University. https://en.wikipedia.org/wiki/Evelyn_Boyd_Granville
-    "boyd",
-  
-    // Brahmagupta - Ancient Indian mathematician during 598-670 CE who gave rules to compute with zero - https://en.wikipedia.org/wiki/Brahmagupta#Zero
-    "brahmagupta",
-  
-    // Walter Houser Brattain co-invented the transistor - https://en.wikipedia.org/wiki/Walter_Houser_Brattain
-    "brattain",
-  
-    // Emmett Brown invented time travel. https://en.wikipedia.org/wiki/Emmett_Brown (thanks Brian Goff)
-    "brown",
-  
-    // Linda Brown Buck - American biologist and Nobel laureate best known for her genetic and molecular analyses of the mechanisms of smell. https://en.wikipedia.org/wiki/Linda_B._Buck
-    "buck",
-  
-    // Dame Susan Jocelyn Bell Burnell - Northern Irish astrophysicist who discovered radio pulsars and was the first to analyse them. https://en.wikipedia.org/wiki/Jocelyn_Bell_Burnell
-    "burnell",
-  
-    // Annie Jump Cannon - pioneering female astronomer who classified hundreds of thousands of stars and created the system we use to understand stars today. https://en.wikipedia.org/wiki/Annie_Jump_Cannon
-    "cannon",
-  
-    // Rachel Carson - American marine biologist and conservationist, her book Silent Spring and other writings are credited with advancing the global environmental movement. https://en.wikipedia.org/wiki/Rachel_Carson
-    "carson",
-  
-    // Dame Mary Lucy Cartwright - British mathematician who was one of the first to study what is now known as chaos theory. Also known for Cartwright's theorem which finds applications in signal processing. https://en.wikipedia.org/wiki/Mary_Cartwright
-    "cartwright",
-  
-    // George Washington Carver - American agricultural scientist and inventor. He was the most prominent black scientist of the early 20th century. https://en.wikipedia.org/wiki/George_Washington_Carver
-    "carver",
-  
-    // Vinton Gray Cerf - American Internet pioneer, recognised as one of "the fathers of the Internet". With Robert Elliot Kahn, he designed TCP and IP, the primary data communication protocols of the Internet and other computer networks. https://en.wikipedia.org/wiki/Vint_Cerf
-    "cerf",
-  
-    // Subrahmanyan Chandrasekhar - Astrophysicist known for his mathematical theory on different stages and evolution in structures of the stars. He has won nobel prize for physics - https://en.wikipedia.org/wiki/Subrahmanyan_Chandrasekhar
-    "chandrasekhar",
-  
-    // Sergey Alexeyevich Chaplygin (Russian: Серге́й Алексе́евич Чаплы́гин; April 5, 1869 – October 8, 1942) was a Russian and Soviet physicist, mathematician, and mechanical engineer. He is known for mathematical formulas such as Chaplygin's equation and for a hypothetical substance in cosmology called Chaplygin gas, named after him. https://en.wikipedia.org/wiki/Sergey_Chaplygin
-    "chaplygin",
-  
-    // Émilie du Châtelet - French natural philosopher, mathematician, physicist, and author during the early 1730s, known for her translation of and commentary on Isaac Newton's book Principia containing basic laws of physics. https://en.wikipedia.org/wiki/%C3%89milie_du_Ch%C3%A2telet
-    "chatelet",
-  
-    // Asima Chatterjee was an Indian organic chemist noted for her research on vinca alkaloids, development of drugs for treatment of epilepsy and malaria - https://en.wikipedia.org/wiki/Asima_Chatterjee
-    "chatterjee",
-  
-    // David Lee Chaum - American computer scientist and cryptographer. Known for his seminal contributions in the field of anonymous communication. https://en.wikipedia.org/wiki/David_Chaum
-    "chaum",
-  
-    // Pafnuty Chebyshev - Russian mathematician. He is known fo his works on probability, statistics, mechanics, analytical geometry and number theory https://en.wikipedia.org/wiki/Pafnuty_Chebyshev
-    "chebyshev",
-  
-    // Joan Clarke - Bletchley Park code breaker during the Second World War who pioneered techniques that remained top secret for decades. Also an accomplished numismatist https://en.wikipedia.org/wiki/Joan_Clarke
-    "clarke",
-  
-    // Bram Cohen - American computer programmer and author of the BitTorrent peer-to-peer protocol. https://en.wikipedia.org/wiki/Bram_Cohen
-    "cohen",
-  
-    // Jane Colden - American botanist widely considered the first female American botanist - https://en.wikipedia.org/wiki/Jane_Colden
-    "colden",
-  
-    // Gerty Theresa Cori - American biochemist who became the third woman—and first American woman—to win a Nobel Prize in science, and the first woman to be awarded the Nobel Prize in Physiology or Medicine. Cori was born in Prague. https://en.wikipedia.org/wiki/Gerty_Cori
-    "cori",
-  
-    // Seymour Roger Cray was an American electrical engineer and supercomputer architect who designed a series of computers that were the fastest in the world for decades. https://en.wikipedia.org/wiki/Seymour_Cray
-    "cray",
-  
-    // This entry reflects a husband and wife team who worked together:
-    // Joan Curran was a Welsh scientist who developed radar and invented chaff, a radar countermeasure. https://en.wikipedia.org/wiki/Joan_Curran
-    // Samuel Curran was an Irish physicist who worked alongside his wife during WWII and invented the proximity fuse. https://en.wikipedia.org/wiki/Samuel_Curran
-    "curran",
-  
-    // Marie Curie discovered radioactivity. https://en.wikipedia.org/wiki/Marie_Curie.
-    "curie",
-  
-    // Charles Darwin established the principles of natural evolution. https://en.wikipedia.org/wiki/Charles_Darwin.
-    "darwin",
-  
-    // Leonardo Da Vinci invented too many things to list here. https://en.wikipedia.org/wiki/Leonardo_da_Vinci.
-    "davinci",
-  
-    // A. K. (Alexander Keewatin) Dewdney, Canadian mathematician, computer scientist, author and filmmaker. Contributor to Scientific American's "Computer Recreations" from 1984 to 1991. Author of Core War (program), The Planiverse, The Armchair Universe, The Magic Machine, The New Turing Omnibus, and more. https://en.wikipedia.org/wiki/Alexander_Dewdney
-    "dewdney",
-  
-    // Satish Dhawan - Indian mathematician and aerospace engineer, known for leading the successful and indigenous development of the Indian space programme. https://en.wikipedia.org/wiki/Satish_Dhawan
-    "dhawan",
-  
-    // Bailey Whitfield Diffie - American cryptographer and one of the pioneers of public-key cryptography. https://en.wikipedia.org/wiki/Whitfield_Diffie
-    "diffie",
-  
-    // Edsger Wybe Dijkstra was a Dutch computer scientist and mathematical scientist. https://en.wikipedia.org/wiki/Edsger_W._Dijkstra.
-    "dijkstra",
-  
-    // Paul Adrien Maurice Dirac - English theoretical physicist who made fundamental contributions to the early development of both quantum mechanics and quantum electrodynamics. https://en.wikipedia.org/wiki/Paul_Dirac
-    "dirac",
-  
-    // Agnes Meyer Driscoll - American cryptanalyst during World Wars I and II who successfully cryptanalysed a number of Japanese ciphers. She was also the co-developer of one of the cipher machines of the US Navy, the CM. https://en.wikipedia.org/wiki/Agnes_Meyer_Driscoll
-    "driscoll",
-  
-    // Donna Dubinsky - played an integral role in the development of personal digital assistants (PDAs) serving as CEO of Palm, Inc. and co-founding Handspring. https://en.wikipedia.org/wiki/Donna_Dubinsky
-    "dubinsky",
-  
-    // Annie Easley - She was a leading member of the team which developed software for the Centaur rocket stage and one of the first African-Americans in her field. https://en.wikipedia.org/wiki/Annie_Easley
-    "easley",
-  
-    // Thomas Alva Edison, prolific inventor https://en.wikipedia.org/wiki/Thomas_Edison
-    "edison",
-  
-    // Albert Einstein invented the general theory of relativity. https://en.wikipedia.org/wiki/Albert_Einstein
-    "einstein",
-  
-    // Alexandra Asanovna Elbakyan (Russian: Алекса́ндра Аса́новна Элбакя́н) is a Kazakhstani graduate student, computer programmer, internet pirate in hiding, and the creator of the site Sci-Hub. Nature has listed her in 2016 in the top ten people that mattered in science, and Ars Technica has compared her to Aaron Swartz. - https://en.wikipedia.org/wiki/Alexandra_Elbakyan
-    "elbakyan",
-  
-    // Taher A. ElGamal - Egyptian cryptographer best known for the ElGamal discrete log cryptosystem and the ElGamal digital signature scheme. https://en.wikipedia.org/wiki/Taher_Elgamal
-    "elgamal",
-  
-    // Gertrude Elion - American biochemist, pharmacologist and the 1988 recipient of the Nobel Prize in Medicine - https://en.wikipedia.org/wiki/Gertrude_Elion
-    "elion",
-  
-    // James Henry Ellis - British engineer and cryptographer employed by the GCHQ. Best known for conceiving for the first time, the idea of public-key cryptography. https://en.wikipedia.org/wiki/James_H._Ellis
-    "ellis",
-  
-    // Douglas Engelbart gave the mother of all demos: https://en.wikipedia.org/wiki/Douglas_Engelbart
-    "engelbart",
-  
-    // Euclid invented geometry. https://en.wikipedia.org/wiki/Euclid
-    "euclid",
-  
-    // Leonhard Euler invented large parts of modern mathematics. https://de.wikipedia.org/wiki/Leonhard_Euler
-    "euler",
-  
-    // Michael Faraday - British scientist who contributed to the study of electromagnetism and electrochemistry. https://en.wikipedia.org/wiki/Michael_Faraday
-    "faraday",
-  
-    // Horst Feistel - German-born American cryptographer who was one of the earliest non-government researchers to study the design and theory of block ciphers. Co-developer of DES and Lucifer. Feistel networks, a symmetric structure used in the construction of block ciphers are named after him. https://en.wikipedia.org/wiki/Horst_Feistel
-    "feistel",
-  
-    // Pierre de Fermat pioneered several aspects of modern mathematics. https://en.wikipedia.org/wiki/Pierre_de_Fermat
-    "fermat",
-  
-    // Enrico Fermi invented the first nuclear reactor. https://en.wikipedia.org/wiki/Enrico_Fermi.
-    "fermi",
-  
-    // Richard Feynman was a key contributor to quantum mechanics and particle physics. https://en.wikipedia.org/wiki/Richard_Feynman
-    "feynman",
-  
-    // Benjamin Franklin is famous for his experiments in electricity and the invention of the lightning rod.
-    "franklin",
-  
-    // Yuri Alekseyevich Gagarin - Soviet pilot and cosmonaut, best known as the first human to journey into outer space. https://en.wikipedia.org/wiki/Yuri_Gagarin
-    "gagarin",
-  
-    // Galileo was a founding father of modern astronomy, and faced politics and obscurantism to establish scientific truth.  https://en.wikipedia.org/wiki/Galileo_Galilei
-    "galileo",
-  
-    // Évariste Galois - French mathematician whose work laid the foundations of Galois theory and group theory, two major branches of abstract algebra, and the subfield of Galois connections, all while still in his late teens. https://en.wikipedia.org/wiki/%C3%89variste_Galois
-    "galois",
-  
-    // Kadambini Ganguly - Indian physician, known for being the first South Asian female physician, trained in western medicine, to graduate in South Asia. https://en.wikipedia.org/wiki/Kadambini_Ganguly
-    "ganguly",
-  
-    // William Henry "Bill" Gates III is an American business magnate, philanthropist, investor, computer programmer, and inventor. https://en.wikipedia.org/wiki/Bill_Gates
-    "gates",
-  
-    // Johann Carl Friedrich Gauss - German mathematician who made significant contributions to many fields, including number theory, algebra, statistics, analysis, differential geometry, geodesy, geophysics, mechanics, electrostatics, magnetic fields, astronomy, matrix theory, and optics. https://en.wikipedia.org/wiki/Carl_Friedrich_Gauss
-    "gauss",
-  
-    // Marie-Sophie Germain - French mathematician, physicist and philosopher. Known for her work on elasticity theory, number theory and philosophy. https://en.wikipedia.org/wiki/Sophie_Germain
-    "germain",
-  
-    // Adele Goldberg, was one of the designers and developers of the Smalltalk language. https://en.wikipedia.org/wiki/Adele_Goldberg_(computer_scientist)
-    "goldberg",
-  
-    // Adele Goldstine, born Adele Katz, wrote the complete technical description for the first electronic digital computer, ENIAC. https://en.wikipedia.org/wiki/Adele_Goldstine
-    "goldstine",
-  
-    // Shafi Goldwasser is a computer scientist known for creating theoretical foundations of modern cryptography. Winner of 2012 ACM Turing Award. https://en.wikipedia.org/wiki/Shafi_Goldwasser
-    "goldwasser",
-  
-    // James Golick, all around gangster.
-    "golick",
-  
-    // Jane Goodall - British primatologist, ethologist, and anthropologist who is considered to be the world's foremost expert on chimpanzees - https://en.wikipedia.org/wiki/Jane_Goodall
-    "goodall",
-  
-    // Stephen Jay Gould was was an American paleontologist, evolutionary biologist, and historian of science. He is most famous for the theory of punctuated equilibrium - https://en.wikipedia.org/wiki/Stephen_Jay_Gould
-    "gould",
-  
-    // Carolyn Widney Greider - American molecular biologist and joint winner of the 2009 Nobel Prize for Physiology or Medicine for the discovery of telomerase. https://en.wikipedia.org/wiki/Carol_W._Greider
-    "greider",
-  
-    // Alexander Grothendieck - German-born French mathematician who became a leading figure in the creation of modern algebraic geometry. https://en.wikipedia.org/wiki/Alexander_Grothendieck
-    "grothendieck",
-  
-    // Lois Haibt - American computer scientist, part of the team at IBM that developed FORTRAN - https://en.wikipedia.org/wiki/Lois_Haibt
-    "haibt",
-  
-    // Margaret Hamilton - Director of the Software Engineering Division of the MIT Instrumentation Laboratory, which developed on-board flight software for the Apollo space program. https://en.wikipedia.org/wiki/Margaret_Hamilton_(scientist)
-    "hamilton",
-  
-    // Caroline Harriet Haslett - English electrical engineer, electricity industry administrator and champion of women's rights. Co-author of British Standard 1363 that specifies AC power plugs and sockets used across the United Kingdom (which is widely considered as one of the safest designs). https://en.wikipedia.org/wiki/Caroline_Haslett
-    "haslett",
-  
-    // Stephen Hawking pioneered the field of cosmology by combining general relativity and quantum mechanics. https://en.wikipedia.org/wiki/Stephen_Hawking
-    "hawking",
-  
-    // Martin Edward Hellman - American cryptologist, best known for his invention of public-key cryptography in co-operation with Whitfield Diffie and Ralph Merkle. https://en.wikipedia.org/wiki/Martin_Hellman
-    "hellman",
-  
-    // Werner Heisenberg was a founding father of quantum mechanics. https://en.wikipedia.org/wiki/Werner_Heisenberg
-    "heisenberg",
-  
-    // Grete Hermann was a German philosopher noted for her philosophical work on the foundations of quantum mechanics. https://en.wikipedia.org/wiki/Grete_Hermann
-    "hermann",
-  
-    // Caroline Lucretia Herschel - German astronomer and discoverer of several comets. https://en.wikipedia.org/wiki/Caroline_Herschel
-    "herschel",
-  
-    // Heinrich Rudolf Hertz - German physicist who first conclusively proved the existence of the electromagnetic waves. https://en.wikipedia.org/wiki/Heinrich_Hertz
-    "hertz",
-  
-    // Jaroslav Heyrovský was the inventor of the polarographic method, father of the electroanalytical method, and recipient of the Nobel Prize in 1959. His main field of work was polarography. https://en.wikipedia.org/wiki/Jaroslav_Heyrovsk%C3%BD
-    "heyrovsky",
-  
-    // Dorothy Hodgkin was a British biochemist, credited with the development of protein crystallography. She was awarded the Nobel Prize in Chemistry in 1964. https://en.wikipedia.org/wiki/Dorothy_Hodgkin
-    "hodgkin",
-  
-    // Douglas R. Hofstadter is an American professor of cognitive science and author of the Pulitzer Prize and American Book Award-winning work Goedel, Escher, Bach: An Eternal Golden Braid in 1979. A mind-bending work which coined Hofstadter's Law: "It always takes longer than you expect, even when you take into account Hofstadter's Law." https://en.wikipedia.org/wiki/Douglas_Hofstadter
-    "hofstadter",
-  
-    // Erna Schneider Hoover revolutionized modern communication by inventing a computerized telephone switching method. https://en.wikipedia.org/wiki/Erna_Schneider_Hoover
-    "hoover",
-  
-    // Grace Hopper developed the first compiler for a computer programming language and  is credited with popularizing the term "debugging" for fixing computer glitches. https://en.wikipedia.org/wiki/Grace_Hopper
-    "hopper",
-  
-    // Frances Hugle, she was an American scientist, engineer, and inventor who contributed to the understanding of semiconductors, integrated circuitry, and the unique electrical principles of microscopic materials. https://en.wikipedia.org/wiki/Frances_Hugle
-    "hugle",
-  
-    // Hypatia - Greek Alexandrine Neoplatonist philosopher in Egypt who was one of the earliest mothers of mathematics - https://en.wikipedia.org/wiki/Hypatia
-    "hypatia",
-  
-    // Teruko Ishizaka - Japanese scientist and immunologist who co-discovered the antibody class Immunoglobulin E. https://en.wikipedia.org/wiki/Teruko_Ishizaka
-    "ishizaka",
-  
-    // Mary Jackson, American mathematician and aerospace engineer who earned the highest title within NASA's engineering department - https://en.wikipedia.org/wiki/Mary_Jackson_(engineer)
-    "jackson",
-  
-    // Yeong-Sil Jang was a Korean scientist and astronomer during the Joseon Dynasty; he invented the first metal printing press and water gauge. https://en.wikipedia.org/wiki/Jang_Yeong-sil
-    "jang",
-  
-    // Mae Carol Jemison -  is an American engineer, physician, and former NASA astronaut. She became the first black woman to travel in space when she served as a mission specialist aboard the Space Shuttle Endeavour - https://en.wikipedia.org/wiki/Mae_Jemison
-    "jemison",
-  
-    // Betty Jennings - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Jean_Bartik
-    "jennings",
-  
-    // Mary Lou Jepsen, was the founder and chief technology officer of One Laptop Per Child (OLPC), and the founder of Pixel Qi. https://en.wikipedia.org/wiki/Mary_Lou_Jepsen
-    "jepsen",
-  
-    // Katherine Coleman Goble Johnson - American physicist and mathematician contributed to the NASA. https://en.wikipedia.org/wiki/Katherine_Johnson
-    "johnson",
-  
-    // Irène Joliot-Curie - French scientist who was awarded the Nobel Prize for Chemistry in 1935. Daughter of Marie and Pierre Curie. https://en.wikipedia.org/wiki/Ir%C3%A8ne_Joliot-Curie
-    "joliot",
-  
-    // Karen Spärck Jones came up with the concept of inverse document frequency, which is used in most search engines today. https://en.wikipedia.org/wiki/Karen_Sp%C3%A4rck_Jones
-    "jones",
-  
-    // A. P. J. Abdul Kalam - is an Indian scientist aka Missile Man of India for his work on the development of ballistic missile and launch vehicle technology - https://en.wikipedia.org/wiki/A._P._J._Abdul_Kalam
-    "kalam",
-  
-    // Sergey Petrovich Kapitsa (Russian: Серге́й Петро́вич Капи́ца; 14 February 1928 – 14 August 2012) was a Russian physicist and demographer. He was best known as host of the popular and long-running Russian scientific TV show, Evident, but Incredible. His father was the Nobel laureate Soviet-era physicist Pyotr Kapitsa, and his brother was the geographer and Antarctic explorer Andrey Kapitsa. - https://en.wikipedia.org/wiki/Sergey_Kapitsa
-    "kapitsa",
-  
-    // Susan Kare, created the icons and many of the interface elements for the original Apple Macintosh in the 1980s, and was an original employee of NeXT, working as the Creative Director. https://en.wikipedia.org/wiki/Susan_Kare
-    "kare",
-  
-    // Mstislav Keldysh - a Soviet scientist in the field of mathematics and mechanics, academician of the USSR Academy of Sciences (1946), President of the USSR Academy of Sciences (1961–1975), three times Hero of Socialist Labor (1956, 1961, 1971), fellow of the Royal Society of Edinburgh (1968). https://en.wikipedia.org/wiki/Mstislav_Keldysh
-    "keldysh",
-  
-    // Mary Kenneth Keller, Sister Mary Kenneth Keller became the first American woman to earn a PhD in Computer Science in 1965. https://en.wikipedia.org/wiki/Mary_Kenneth_Keller
-    "keller",
-  
-    // Johannes Kepler, German astronomer known for his three laws of planetary motion - https://en.wikipedia.org/wiki/Johannes_Kepler
-    "kepler",
-  
-    // Omar Khayyam - Persian mathematician, astronomer and poet. Known for his work on the classification and solution of cubic equations, for his contribution to the understanding of Euclid's fifth postulate and for computing the length of a year very accurately. https://en.wikipedia.org/wiki/Omar_Khayyam
-    "khayyam",
-  
-    // Har Gobind Khorana - Indian-American biochemist who shared the 1968 Nobel Prize for Physiology - https://en.wikipedia.org/wiki/Har_Gobind_Khorana
-    "khorana",
-  
-    // Jack Kilby invented silicon integrated circuits and gave Silicon Valley its name. - https://en.wikipedia.org/wiki/Jack_Kilby
-    "kilby",
-  
-    // Maria Kirch - German astronomer and first woman to discover a comet - https://en.wikipedia.org/wiki/Maria_Margarethe_Kirch
-    "kirch",
-  
-    // Donald Knuth - American computer scientist, author of "The Art of Computer Programming" and creator of the TeX typesetting system. https://en.wikipedia.org/wiki/Donald_Knuth
-    "knuth",
-  
-    // Sophie Kowalevski - Russian mathematician responsible for important original contributions to analysis, differential equations and mechanics - https://en.wikipedia.org/wiki/Sofia_Kovalevskaya
-    "kowalevski",
-  
-    // Marie-Jeanne de Lalande - French astronomer, mathematician and cataloguer of stars - https://en.wikipedia.org/wiki/Marie-Jeanne_de_Lalande
-    "lalande",
-  
-    // Hedy Lamarr - Actress and inventor. The principles of her work are now incorporated into modern Wi-Fi, CDMA and Bluetooth technology. https://en.wikipedia.org/wiki/Hedy_Lamarr
-    "lamarr",
-  
-    // Leslie B. Lamport - American computer scientist. Lamport is best known for his seminal work in distributed systems and was the winner of the 2013 Turing Award. https://en.wikipedia.org/wiki/Leslie_Lamport
-    "lamport",
-  
-    // Mary Leakey - British paleoanthropologist who discovered the first fossilized Proconsul skull - https://en.wikipedia.org/wiki/Mary_Leakey
-    "leakey",
-  
-    // Henrietta Swan Leavitt - she was an American astronomer who discovered the relation between the luminosity and the period of Cepheid variable stars. https://en.wikipedia.org/wiki/Henrietta_Swan_Leavitt
-    "leavitt",
-  
-    // Esther Miriam Zimmer Lederberg - American microbiologist and a pioneer of bacterial genetics. https://en.wikipedia.org/wiki/Esther_Lederberg
-    "lederberg",
-  
-    // Inge Lehmann - Danish seismologist and geophysicist. Known for discovering in 1936 that the Earth has a solid inner core inside a molten outer core. https://en.wikipedia.org/wiki/Inge_Lehmann
-    "lehmann",
-  
-    // Daniel Lewin - Mathematician, Akamai co-founder, soldier, 9/11 victim-- Developed optimization techniques for routing traffic on the internet. Died attempting to stop the 9-11 hijackers. https://en.wikipedia.org/wiki/Daniel_Lewin
-    "lewin",
-  
-    // Ruth Lichterman - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Ruth_Teitelbaum
-    "lichterman",
-  
-    // Barbara Liskov - co-developed the Liskov substitution principle. Liskov was also the winner of the Turing Prize in 2008. - https://en.wikipedia.org/wiki/Barbara_Liskov
-    "liskov",
-  
-    // Ada Lovelace invented the first algorithm. https://en.wikipedia.org/wiki/Ada_Lovelace (thanks James Turnbull)
-    "lovelace",
-  
-    // Auguste and Louis Lumière - the first filmmakers in history - https://en.wikipedia.org/wiki/Auguste_and_Louis_Lumi%C3%A8re
-    "lumiere",
-  
-    // Mahavira - Ancient Indian mathematician during 9th century AD who discovered basic algebraic identities - https://en.wikipedia.org/wiki/Mah%C4%81v%C4%ABra_(mathematician)
-    "mahavira",
-  
-    // Lynn Margulis (b. Lynn Petra Alexander) - an American evolutionary theorist and biologist, science author, educator, and popularizer, and was the primary modern proponent for the significance of symbiosis in evolution. - https://en.wikipedia.org/wiki/Lynn_Margulis
-    "margulis",
-  
-    // Yukihiro Matsumoto - Japanese computer scientist and software programmer best known as the chief designer of the Ruby programming language. https://en.wikipedia.org/wiki/Yukihiro_Matsumoto
-    "matsumoto",
-  
-    // James Clerk Maxwell - Scottish physicist, best known for his formulation of electromagnetic theory. https://en.wikipedia.org/wiki/James_Clerk_Maxwell
-    "maxwell",
-  
-    // Maria Mayer - American theoretical physicist and Nobel laureate in Physics for proposing the nuclear shell model of the atomic nucleus - https://en.wikipedia.org/wiki/Maria_Mayer
-    "mayer",
-  
-    // John McCarthy invented LISP: https://en.wikipedia.org/wiki/John_McCarthy_(computer_scientist)
-    "mccarthy",
-  
-    // Barbara McClintock - a distinguished American cytogeneticist, 1983 Nobel Laureate in Physiology or Medicine for discovering transposons. https://en.wikipedia.org/wiki/Barbara_McClintock
-    "mcclintock",
-  
-    // Anne Laura Dorinthea McLaren - British developmental biologist whose work helped lead to human in-vitro fertilisation. https://en.wikipedia.org/wiki/Anne_McLaren
-    "mclaren",
-  
-    // Malcolm McLean invented the modern shipping container: https://en.wikipedia.org/wiki/Malcom_McLean
-    "mclean",
-  
-    // Kay McNulty - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Kathleen_Antonelli
-    "mcnulty",
-  
-    // Gregor Johann Mendel - Czech scientist and founder of genetics. https://en.wikipedia.org/wiki/Gregor_Mendel
-    "mendel",
-  
-    // Dmitri Mendeleev - a chemist and inventor. He formulated the Periodic Law, created a farsighted version of the periodic table of elements, and used it to correct the properties of some already discovered elements and also to predict the properties of eight elements yet to be discovered. https://en.wikipedia.org/wiki/Dmitri_Mendeleev
-    "mendeleev",
-  
-    // Lise Meitner - Austrian/Swedish physicist who was involved in the discovery of nuclear fission. The element meitnerium is named after her - https://en.wikipedia.org/wiki/Lise_Meitner
-    "meitner",
-  
-    // Carla Meninsky, was the game designer and programmer for Atari 2600 games Dodge 'Em and Warlords. https://en.wikipedia.org/wiki/Carla_Meninsky
-    "meninsky",
-  
-    // Ralph C. Merkle - American computer scientist, known for devising Merkle's puzzles - one of the very first schemes for public-key cryptography. Also, inventor of Merkle trees and co-inventor of the Merkle-Damgård construction for building collision-resistant cryptographic hash functions and the Merkle-Hellman knapsack cryptosystem. https://en.wikipedia.org/wiki/Ralph_Merkle
-    "merkle",
-  
-    // Johanna Mestorf - German prehistoric archaeologist and first female museum director in Germany - https://en.wikipedia.org/wiki/Johanna_Mestorf
-    "mestorf",
-  
-    // Maryam Mirzakhani - an Iranian mathematician and the first woman to win the Fields Medal. https://en.wikipedia.org/wiki/Maryam_Mirzakhani
-    "mirzakhani",
-  
-    // Rita Levi-Montalcini - Won Nobel Prize in Physiology or Medicine jointly with colleague Stanley Cohen for the discovery of nerve growth factor (https://en.wikipedia.org/wiki/Rita_Levi-Montalcini)
-    "montalcini",
-  
-    // Gordon Earle Moore - American engineer, Silicon Valley founding father, author of Moore's law. https://en.wikipedia.org/wiki/Gordon_Moore
-    "moore",
-  
-    // Samuel Morse - contributed to the invention of a single-wire telegraph system based on European telegraphs and was a co-developer of the Morse code - https://en.wikipedia.org/wiki/Samuel_Morse
-    "morse",
-  
-    // Ian Murdock - founder of the Debian project - https://en.wikipedia.org/wiki/Ian_Murdock
-    "murdock",
-  
-    // May-Britt Moser - Nobel prize winner neuroscientist who contributed to the discovery of grid cells in the brain. https://en.wikipedia.org/wiki/May-Britt_Moser
-    "moser",
-  
-    // John Napier of Merchiston - Scottish landowner known as an astronomer, mathematician and physicist. Best known for his discovery of logarithms. https://en.wikipedia.org/wiki/John_Napier
-    "napier",
-  
-    // John Forbes Nash, Jr. - American mathematician who made fundamental contributions to game theory, differential geometry, and the study of partial differential equations. https://en.wikipedia.org/wiki/John_Forbes_Nash_Jr.
-    "nash",
-  
-    // John von Neumann - todays computer architectures are based on the von Neumann architecture. https://en.wikipedia.org/wiki/Von_Neumann_architecture
-    "neumann",
-  
-    // Isaac Newton invented classic mechanics and modern optics. https://en.wikipedia.org/wiki/Isaac_Newton
-    "newton",
-  
-    // Florence Nightingale, more prominently known as a nurse, was also the first female member of the Royal Statistical Society and a pioneer in statistical graphics https://en.wikipedia.org/wiki/Florence_Nightingale#Statistics_and_sanitary_reform
-    "nightingale",
-  
-    // Alfred Nobel - a Swedish chemist, engineer, innovator, and armaments manufacturer (inventor of dynamite) - https://en.wikipedia.org/wiki/Alfred_Nobel
-    "nobel",
-  
-    // Emmy Noether, German mathematician. Noether's Theorem is named after her. https://en.wikipedia.org/wiki/Emmy_Noether
-    "noether",
-  
-    // Poppy Northcutt. Poppy Northcutt was the first woman to work as part of NASA’s Mission Control. http://www.businessinsider.com/poppy-northcutt-helped-apollo-astronauts-2014-12?op=1
-    "northcutt",
-  
-    // Robert Noyce invented silicon integrated circuits and gave Silicon Valley its name. - https://en.wikipedia.org/wiki/Robert_Noyce
-    "noyce",
-  
-    // Panini - Ancient Indian linguist and grammarian from 4th century CE who worked on the world's first formal system - https://en.wikipedia.org/wiki/P%C4%81%E1%B9%87ini#Comparison_with_modern_formal_systems
-    "panini",
-  
-    // Ambroise Pare invented modern surgery. https://en.wikipedia.org/wiki/Ambroise_Par%C3%A9
-    "pare",
-  
-    // Blaise Pascal, French mathematician, physicist, and inventor - https://en.wikipedia.org/wiki/Blaise_Pascal
-    "pascal",
-  
-    // Louis Pasteur discovered vaccination, fermentation and pasteurization. https://en.wikipedia.org/wiki/Louis_Pasteur.
-    "pasteur",
-  
-    // Cecilia Payne-Gaposchkin was an astronomer and astrophysicist who, in 1925, proposed in her Ph.D. thesis an explanation for the composition of stars in terms of the relative abundances of hydrogen and helium. https://en.wikipedia.org/wiki/Cecilia_Payne-Gaposchkin
-    "payne",
-  
-    // Radia Perlman is a software designer and network engineer and most famous for her invention of the spanning-tree protocol (STP). https://en.wikipedia.org/wiki/Radia_Perlman
-    "perlman",
-  
-    // Rob Pike was a key contributor to Unix, Plan 9, the X graphic system, utf-8, and the Go programming language. https://en.wikipedia.org/wiki/Rob_Pike
-    "pike",
-  
-    // Henri Poincaré made fundamental contributions in several fields of mathematics. https://en.wikipedia.org/wiki/Henri_Poincar%C3%A9
-    "poincare",
-  
-    // Laura Poitras is a director and producer whose work, made possible by open source crypto tools, advances the causes of truth and freedom of information by reporting disclosures by whistleblowers such as Edward Snowden. https://en.wikipedia.org/wiki/Laura_Poitras
-    "poitras",
-  
-    // Tat’yana Avenirovna Proskuriakova (Russian: Татья́на Авени́ровна Проскуряко́ва) (January 23 [O.S. January 10] 1909 – August 30, 1985) was a Russian-American Mayanist scholar and archaeologist who contributed significantly to the deciphering of Maya hieroglyphs, the writing system of the pre-Columbian Maya civilization of Mesoamerica. https://en.wikipedia.org/wiki/Tatiana_Proskouriakoff
-    "proskuriakova",
-  
-    // Claudius Ptolemy - a Greco-Egyptian writer of Alexandria, known as a mathematician, astronomer, geographer, astrologer, and poet of a single epigram in the Greek Anthology - https://en.wikipedia.org/wiki/Ptolemy
-    "ptolemy",
-  
-    // C. V. Raman - Indian physicist who won the Nobel Prize in 1930 for proposing the Raman effect. - https://en.wikipedia.org/wiki/C._V._Raman
-    "raman",
-  
-    // Srinivasa Ramanujan - Indian mathematician and autodidact who made extraordinary contributions to mathematical analysis, number theory, infinite series, and continued fractions. - https://en.wikipedia.org/wiki/Srinivasa_Ramanujan
-    "ramanujan",
-  
-    // Sally Kristen Ride was an American physicist and astronaut. She was the first American woman in space, and the youngest American astronaut. https://en.wikipedia.org/wiki/Sally_Ride
-    "ride",
-  
-    // Dennis Ritchie - co-creator of UNIX and the C programming language. - https://en.wikipedia.org/wiki/Dennis_Ritchie
-    "ritchie",
-  
-    // Ida Rhodes - American pioneer in computer programming, designed the first computer used for Social Security. https://en.wikipedia.org/wiki/Ida_Rhodes
-    "rhodes",
-  
-    // Julia Hall Bowman Robinson - American mathematician renowned for her contributions to the fields of computability theory and computational complexity theory. https://en.wikipedia.org/wiki/Julia_Robinson
-    "robinson",
-  
-    // Wilhelm Conrad Röntgen - German physicist who was awarded the first Nobel Prize in Physics in 1901 for the discovery of X-rays (Röntgen rays). https://en.wikipedia.org/wiki/Wilhelm_R%C3%B6ntgen
-    "roentgen",
-  
-    // Rosalind Franklin - British biophysicist and X-ray crystallographer whose research was critical to the understanding of DNA - https://en.wikipedia.org/wiki/Rosalind_Franklin
-    "rosalind",
-  
-    // Vera Rubin - American astronomer who pioneered work on galaxy rotation rates. https://en.wikipedia.org/wiki/Vera_Rubin
-    "rubin",
-  
-    // Meghnad Saha - Indian astrophysicist best known for his development of the Saha equation, used to describe chemical and physical conditions in stars - https://en.wikipedia.org/wiki/Meghnad_Saha
-    "saha",
-  
-    // Jean E. Sammet developed FORMAC, the first widely used computer language for symbolic manipulation of mathematical formulas. https://en.wikipedia.org/wiki/Jean_E._Sammet
-    "sammet",
-  
-    // Mildred Sanderson - American mathematician best known for Sanderson's theorem concerning modular invariants. https://en.wikipedia.org/wiki/Mildred_Sanderson
-    "sanderson",
-  
-    // Satoshi Nakamoto is the name used by the unknown person or group of people who developed bitcoin, authored the bitcoin white paper, and created and deployed bitcoin's original reference implementation. https://en.wikipedia.org/wiki/Satoshi_Nakamoto
-    "satoshi",
-  
-    // Adi Shamir - Israeli cryptographer whose numerous inventions and contributions to cryptography include the Ferge Fiat Shamir identification scheme, the Rivest Shamir Adleman (RSA) public-key cryptosystem, the Shamir's secret sharing scheme, the breaking of the Merkle-Hellman cryptosystem, the TWINKLE and TWIRL factoring devices and the discovery of differential cryptanalysis (with Eli Biham). https://en.wikipedia.org/wiki/Adi_Shamir
-    "shamir",
-  
-    // Claude Shannon - The father of information theory and founder of digital circuit design theory. (https://en.wikipedia.org/wiki/Claude_Shannon)
-    "shannon",
-  
-    // Carol Shaw - Originally an Atari employee, Carol Shaw is said to be the first female video game designer. https://en.wikipedia.org/wiki/Carol_Shaw_(video_game_designer)
-    "shaw",
-  
-    // Dame Stephanie "Steve" Shirley - Founded a software company in 1962 employing women working from home. https://en.wikipedia.org/wiki/Steve_Shirley
-    "shirley",
-  
-    // William Shockley co-invented the transistor - https://en.wikipedia.org/wiki/William_Shockley
-    "shockley",
-  
-    // Lina Solomonovna Stern (or Shtern; Russian: Лина Соломоновна Штерн; 26 August 1878 – 7 March 1968) was a Soviet biochemist, physiologist and humanist whose medical discoveries saved thousands of lives at the fronts of World War II. She is best known for her pioneering work on blood–brain barrier, which she described as hemato-encephalic barrier in 1921. https://en.wikipedia.org/wiki/Lina_Stern
-    "shtern",
-  
-    // Françoise Barré-Sinoussi - French virologist and Nobel Prize Laureate in Physiology or Medicine; her work was fundamental in identifying HIV as the cause of AIDS. https://en.wikipedia.org/wiki/Fran%C3%A7oise_Barr%C3%A9-Sinoussi
-    "sinoussi",
-  
-    // Betty Snyder - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Betty_Holberton
-    "snyder",
-  
-    // Cynthia Solomon - Pioneer in the fields of artificial intelligence, computer science and educational computing. Known for creation of Logo, an educational programming language.  https://en.wikipedia.org/wiki/Cynthia_Solomon
-    "solomon",
-  
-    // Frances Spence - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Frances_Spence
-    "spence",
-  
-    // Michael Stonebraker is a database research pioneer and architect of Ingres, Postgres, VoltDB and SciDB. Winner of 2014 ACM Turing Award. https://en.wikipedia.org/wiki/Michael_Stonebraker
-    "stonebraker",
-  
-    // Ivan Edward Sutherland - American computer scientist and Internet pioneer, widely regarded as the father of computer graphics. https://en.wikipedia.org/wiki/Ivan_Sutherland
-    "sutherland",
-  
-    // Janese Swanson (with others) developed the first of the Carmen Sandiego games. She went on to found Girl Tech. https://en.wikipedia.org/wiki/Janese_Swanson
-    "swanson",
-  
-    // Aaron Swartz was influential in creating RSS, Markdown, Creative Commons, Reddit, and much of the internet as we know it today. He was devoted to freedom of information on the web. https://en.wikiquote.org/wiki/Aaron_Swartz
-    "swartz",
-  
-    // Bertha Swirles was a theoretical physicist who made a number of contributions to early quantum theory. https://en.wikipedia.org/wiki/Bertha_Swirles
-    "swirles",
-  
-    // Helen Brooke Taussig - American cardiologist and founder of the field of paediatric cardiology. https://en.wikipedia.org/wiki/Helen_B._Taussig
-    "taussig",
-  
-    // Valentina Tereshkova is a Russian engineer, cosmonaut and politician. She was the first woman to fly to space in 1963. In 2013, at the age of 76, she offered to go on a one-way mission to Mars. https://en.wikipedia.org/wiki/Valentina_Tereshkova
-    "tereshkova",
-  
-    // Nikola Tesla invented the AC electric system and every gadget ever used by a James Bond villain. https://en.wikipedia.org/wiki/Nikola_Tesla
-    "tesla",
-  
-    // Marie Tharp - American geologist and oceanic cartographer who co-created the first scientific map of the Atlantic Ocean floor. Her work led to the acceptance of the theories of plate tectonics and continental drift. https://en.wikipedia.org/wiki/Marie_Tharp
-    "tharp",
-  
-    // Ken Thompson - co-creator of UNIX and the C programming language - https://en.wikipedia.org/wiki/Ken_Thompson
-    "thompson",
-  
-    // Linus Torvalds invented Linux and Git. https://en.wikipedia.org/wiki/Linus_Torvalds
-    "torvalds",
-  
-    // Youyou Tu - Chinese pharmaceutical chemist and educator known for discovering artemisinin and dihydroartemisinin, used to treat malaria, which has saved millions of lives. Joint winner of the 2015 Nobel Prize in Physiology or Medicine. https://en.wikipedia.org/wiki/Tu_Youyou
-    "tu",
-  
-    // Alan Turing was a founding father of computer science. https://en.wikipedia.org/wiki/Alan_Turing.
-    "turing",
-  
-    // Varahamihira - Ancient Indian mathematician who discovered trigonometric formulae during 505-587 CE - https://en.wikipedia.org/wiki/Var%C4%81hamihira#Contributions
-    "varahamihira",
-  
-    // Dorothy Vaughan was a NASA mathematician and computer programmer on the SCOUT launch vehicle program that put America's first satellites into space - https://en.wikipedia.org/wiki/Dorothy_Vaughan
-    "vaughan",
-  
-    // Cédric Villani - French mathematician, won Fields Medal, Fermat Prize and Poincaré Price for his work in differential geometry and statistical mechanics. https://en.wikipedia.org/wiki/C%C3%A9dric_Villani
-    "villani",
-  
-    // Sir Mokshagundam Visvesvaraya - is a notable Indian engineer.  He is a recipient of the Indian Republic's highest honour, the Bharat Ratna, in 1955. On his birthday, 15 September is celebrated as Engineer's Day in India in his memory - https://en.wikipedia.org/wiki/Visvesvaraya
-    "visvesvaraya",
-  
-    // Christiane Nüsslein-Volhard - German biologist, won Nobel Prize in Physiology or Medicine in 1995 for research on the genetic control of embryonic development. https://en.wikipedia.org/wiki/Christiane_N%C3%BCsslein-Volhard
-    "volhard",
-  
-    // Marlyn Wescoff - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Marlyn_Meltzer
-    "wescoff",
-  
-    // Sylvia B. Wilbur - British computer scientist who helped develop the ARPANET, was one of the first to exchange email in the UK and a leading researcher in computer-supported collaborative work. https://en.wikipedia.org/wiki/Sylvia_Wilbur
-    "wilbur",
-  
-    // Andrew Wiles - Notable British mathematician who proved the enigmatic Fermat's Last Theorem - https://en.wikipedia.org/wiki/Andrew_Wiles
-    "wiles",
-  
-    // Roberta Williams, did pioneering work in graphical adventure games for personal computers, particularly the King's Quest series. https://en.wikipedia.org/wiki/Roberta_Williams
-    "williams",
-  
-    // Malcolm John Williamson - British mathematician and cryptographer employed by the GCHQ. Developed in 1974 what is now known as Diffie-Hellman key exchange (Diffie and Hellman first published the scheme in 1976). https://en.wikipedia.org/wiki/Malcolm_J._Williamson
-    "williamson",
-  
-    // Sophie Wilson designed the first Acorn Micro-Computer and the instruction set for ARM processors. https://en.wikipedia.org/wiki/Sophie_Wilson
-    "wilson",
-  
-    // Jeannette Wing - co-developed the Liskov substitution principle. - https://en.wikipedia.org/wiki/Jeannette_Wing
-    "wing",
-  
-    // Steve Wozniak invented the Apple I and Apple II. https://en.wikipedia.org/wiki/Steve_Wozniak
-    "wozniak",
-  
-    // The Wright brothers, Orville and Wilbur - credited with inventing and building the world's first successful airplane and making the first controlled, powered and sustained heavier-than-air human flight - https://en.wikipedia.org/wiki/Wright_brothers
-    "wright",
-  
-    // Chien-Shiung Wu - Chinese-American experimental physicist who made significant contributions to nuclear physics. https://en.wikipedia.org/wiki/Chien-Shiung_Wu
-    "wu",
-  
-    // Rosalyn Sussman Yalow - Rosalyn Sussman Yalow was an American medical physicist, and a co-winner of the 1977 Nobel Prize in Physiology or Medicine for development of the radioimmunoassay technique. https://en.wikipedia.org/wiki/Rosalyn_Sussman_Yalow
-    "yalow",
-  
-    // Ada Yonath - an Israeli crystallographer, the first woman from the Middle East to win a Nobel prize in the sciences. https://en.wikipedia.org/wiki/Ada_Yonath
-    "yonath",
-  
-    // Nikolay Yegorovich Zhukovsky (Russian: Никола́й Его́рович Жуко́вский, January 17 1847 – March 17, 1921) was a Russian scientist, mathematician and engineer, and a founding father of modern aero- and hydrodynamics. Whereas contemporary scientists scoffed at the idea of human flight, Zhukovsky was the first to undertake the study of airflow. He is often called the Father of Russian Aviation. https://en.wikipedia.org/wiki/Nikolay_Yegorovich_Zhukovsky
-    "zhukovsky",
-  ]
-  
-  export const generateHostName = ():Hostname => {
-    return util.format('%s-%s', randelem(adjectives), randelem(scientists)) as Hostname
-  }
-  
-  function randnum(n:number):number {
-    return Math.floor(Math.random() * n);
-  }
-  
-  function randelem(a:string[]):string {
-    return a[randnum(a.length)];
-  }
-```
-
-## File: src/utils/rsync.ts
-```typescript
-/**
- * rsync.ts — rsync primitive for App copy/move operations
- *
- * Design: design/copy-move-app.md
- *
- * Phase 1: same-engine, local paths only.
- * Phase 2: cross-engine — pass remoteHost to rsync over SSH to pi@host.
- */
-
-import { chalk } from 'zx'
-import { spawn, ChildProcess } from 'child_process'
-import { log } from './utils.js'
-import { registerProcess, deregisterProcess } from '../data/Operations.js'
-
-export interface RsyncProgress {
-    progressPercent: number
-}
-
-export type RsyncProgressCallback = (progress: RsyncProgress) => void
-
-/**
- * Copy src/ to dest/ using rsync.
- *
- * - Preserves permissions, symlinks, timestamps (-a / archive mode)
- * - Reports per-transfer progress via onProgress callback (0-100)
- * - Idempotent: re-running after interruption transfers only the delta
- * - Throws on non-zero exit
- *
- * src must be a local absolute path.
- * dest must be an absolute path. If remoteHost is provided, rsync runs over
- * SSH to `pi@<remoteHost>:<dest>` (cross-engine Phase 2).
- * Trailing slash is appended to src so rsync copies the *contents*.
- */
-export const rsyncDirectory = (
-    src: string,
-    dest: string,
-    onProgress?: RsyncProgressCallback,
-    opId?: string,
-    remoteHost?: string,
-): Promise<void> => {
-    return new Promise((resolve, reject) => {
-        // Ensure src has trailing slash so rsync copies contents, not the directory itself
-        const srcArg = src.endsWith('/') ? src : src + '/'
-        const destArg = remoteHost ? `pi@${remoteHost}:${dest}` : dest
-
-        const args = [
-            '-a',
-            '--info=progress2',
-            '--no-inc-recursive',  // required for accurate total-progress reporting
-        ]
-
-        if (remoteHost) {
-            args.push('-e', 'ssh -o StrictHostKeyChecking=no')
-        }
-
-        args.push(srcArg, destArg)
-
-        log(`rsync ${args.join(' ')}`)
-
-        const proc = spawn('rsync', args)
-        if (opId) registerProcess(opId, proc)
-
-        let stderr = ''
-
-        proc.stdout.on('data', (chunk: Buffer) => {
-            const text = chunk.toString()
-            // progress2 lines look like: "  1,234,567  42%    1.23MB/s    0:00:05"
-            // We scan for the percentage value.
-            const matches = text.match(/\s(\d{1,3})%/)
-            if (matches && onProgress) {
-                const pct = parseInt(matches[1], 10)
-                if (!isNaN(pct)) {
-                    onProgress({ progressPercent: pct })
-                }
-            }
-        })
-
-        proc.stderr.on('data', (chunk: Buffer) => {
-            stderr += chunk.toString()
-        })
-
-        proc.on('close', (code, signal) => {
-            if (opId) deregisterProcess(opId)
-            if (code === 0) {
-                if (onProgress) onProgress({ progressPercent: 100 })
-                resolve()
-            } else if (signal === 'SIGTERM') {
-                reject(new Error(`rsync cancelled (SIGTERM)`))
-            } else {
-                reject(new Error(`rsync exited with code ${code}: ${stderr.trim()}`))
-            }
-        })
-
-        proc.on('error', (err) => {
-            if (opId) deregisterProcess(opId)
-            reject(new Error(`rsync spawn error: ${err.message}`))
-        })
-    })
-}
-
-```
-
-## File: src/utils/ssh.ts
-```typescript
-import { $ } from 'zx'
-import type { ProcessPromise } from 'zx'
-
-/**
- * Single-quotes a value for a POSIX shell: 'it'\''s' → one shell word, no expansion.
- */
-export const shellQuote = (value: string): string => "'" + value.replace(/'/g, "'\\''") + "'"
-
-/**
- * Minimal ssh() helper — replaces zx v7's built-in ssh() which was removed in v8.
- *
- * Creates a tagged-template executor that runs commands on a remote host via SSH.
- * Each interpolated argument is single-quote shell-escaped before being sent.
- *
- * Usage (identical to zx v7 ssh):
- *   const exec = ssh('pi@192.168.1.1')
- *   await exec`sudo apt-get update`
- *   await exec`cd ${path} && pnpm install`
- *
- * The optional `shell` parameter allows injecting a mock `$` in tests.
- */
-export function ssh(host: string, shell: typeof $ = $) {
-    return (pieces: TemplateStringsArray, ...args: unknown[]): ProcessPromise => {
-        const cmd = pieces.reduce((acc: string, piece: string, i: number) => {
-            if (i >= args.length) return acc + piece
-            // Single-quote escape — args are developer-controlled paths/values, not user input
-            const escaped = shellQuote(String(args[i]))
-            return acc + piece + escaped
-        }, '')
-        return shell`ssh -o StrictHostKeyChecking=no ${host} -- ${cmd}`
-    }
-}
-
-```
-
-## File: src/utils/utils.ts
-```typescript
-import util from 'util';
-import { $, chalk, fs, os, question } from 'zx';
-import { IPAddress, PortNumber } from '../data/CommonTypes.js';
-import net from 'net';
-import crypto from 'crypto';
-
-
-// Dummy key
-export const dummyKey = "_dummy"
-
-export const getKeys = (obj) => {
-  return Object.keys(obj).filter(key => !(key === `${dummyKey}`))
-}
-
-// Generate a random port number between 49152-65535
-export const randomPort = ():PortNumber => {
-  return Math.floor(Math.random() * 16383) + 49152 as PortNumber
-}
-// Write a function that reads a .env file and extracts the value of a variable from it
-// The function should take the path to the .env file and the name of the variable as input
-// It should return the value of the variable
-// If the variable is not found, it should return null
-export const readEnvVariable = async (path: string, variable: string): Promise<string | null> => {
-  try {
-    const envContent = (await $`cat ${path}`).stdout
-    const values = envContent.match(new RegExp(`^${variable}=(.*)`, 'm'))
-    // Log the variable name only, never its value: .env files hold app
-    // passwords and History is readable from the Console (idea#111).
-    log(`Read variable ${variable} from .env file ${path}: ${values ? 'found' : 'not set'}`)
-    if (values && values.length >= 1) {
-      const value = values[1]
-      return value
-    } else {
-      return null
-    }
-  } catch (e) {
-    return null
-  }
-}
-
-/**
- * Replace every occurrence of the given secret values in `text` with
- * `[redacted]`, for log lines and error messages that may echo a value
- * (idea#111). Empty values are ignored.
- */
-export const redactValues = (text: string, values: (string | null | undefined)[]): string =>
-  values.reduce<string>((acc, v) => (v ? acc.split(v).join('[redacted]') : acc), text)
-
-// Write a function that adds or updates a variable to a .env file
-// The function should take the path to the .env file, the name of the variable and its value as input
-// If the variable is already present in the .env file, it should update its value
-// If the variable is not present in the .env file, it should add it
-export const addOrUpdateEnvVariable = async (path: string, variable: string, value: string): Promise<void> => {
-  try {
-    const envContent = (await $`cat ${path}`).stdout
-    const values = envContent.match(new RegExp(`^${variable}=(.*)`, 'm'))
-    if (values && values.length >= 1) {
-      // Update the value of the variable
-      await $`sed -i 's|^${variable}=.*|${variable}=${value}|' ${path}`
-    } else {
-      // Add the variable to the .env file
-      await $`echo "${variable}=${value}" >> ${path}`
-    }
-    log(`Added or updated variable ${variable} in .env file ${path}`)
-  } catch (e) {
-    // Add the variable to the .env file
-    log(`Error adding or updating variable ${variable} in .env file ${path}`)
-    log(`error: ${redactValues(String(e), [value])}`)
-    //await $`echo "${variable}=${value}" >> ${path}`
-  }
-}
-
-
-
-// Read verbosityLevel from the environmnet
-const verbosity = process.env.VERBOSITY || ""
-export let verbosityLevel = parseInt(verbosity) || 0
-
-// Verbosity-gated debug logger. Uses console.info so CommandLogger captures
-// always-on/gated messages without matching the hygiene.console_log scan
-// (which flags the console "log" method call pattern only).
-export const log = (msg:string, level?:number):void => {
-  if (!level) {
-    // Set the default log level to 2
-    level = 2
-  }
-  if (verbosityLevel >= level) {
-    console.info(chalk.gray(msg))
-  }
-}
-
-export const error = (msg:string):void => {
-  console.error(chalk.red(msg))
-}
-
-/** Always-on status/output helper. Uses console.info (captured by CommandLogger). */
-export const print = (...args: unknown[]): void => {
-  console.info(...args)
-}
-
-export const setVerbosity = (level:number):void => {
-  verbosityLevel = level
-}
-
-export const isEngineOnline = (hostname: string, port: number): Promise<boolean> => {
-  return new Promise((resolve) => {
-    const socket = new net.Socket();
-    const timeout = 2000; // 2 seconds
-    socket.setTimeout(timeout);
-
-    socket.on('connect', () => {
-      socket.destroy();
-      resolve(true);
-    });
-
-    socket.on('timeout', () => {
-      socket.destroy();
-      resolve(false);
-    });
-
-    socket.on('error', () => {
-      socket.destroy();
-      resolve(false);
-    });
-
-    socket.connect(port, hostname);
-  });
-};
-
-// // Execute promises sequentially
-// export const sequential = (promises) => {
-//   return promises.reduce((promise, func) => {
-//     return promise.then(func)
-//   }, Promise.resolve())
-// }
-
-// export const executePromisesSequentially = async (promises) => {
-//     for (let promise of promises) {
-//       await promise
-//     }
-// }
-
-
-
-
-
-
-// Write a function that uses zx to test if a path exists
-// export const dirExists = async (path: string) => {
-//     try {
-//         await $`test -d ${path}`
-//         return true
-//     } catch (e) {
-//         return false
-//     }
-// }
-
-// export const dirExists = async (path: string) => {
-//   return await $`test -d ${path}`.then(() => true).catch(() => false)
-// }
-
-// export const fileExists = async (path: string) => {
-//   try {
-//       await $`test -f ${path}`
-//       return true
-//   } catch (e) {
-//       return false
-//   }
-// }
-
-// export const fileExists = async (path: string) => {
-//   return await $`test -f ${path}`.then(() => true).catch(() => false)
-// }
-
-export const fileExists = (path: string):boolean => {
-  return fs.existsSync(path)
-}
-
-// Check if the root folder contains the folder yjs-db  If so, set firstBoot to false, otherwise set it to true
-// This is a way to check if the engine has been booted before
-// export const firstBoot: boolean = fs.existsSync('../yjs-db') ? false : true 
-// export const firstBoot: boolean = !(await fileExists('./yjs-db'))
-// log(`First boot: ${firstBoot}`)
-
-
-
-
-// Write a function that checks if a given yarray contains a specific value
-// Use the Y.Array API of the Yjs library (which does not have a built-in method for this)
-// Do it
-export const contains = (yarray, value) => {
-    let found = false
-    yarray.forEach((item) => {
-      if (item === value) {
-        found = true
-      }
-    })
-    return found
-  }
-
-export const deepPrint = (obj, depth:(number | null)=null) => {
-    return util.inspect(obj, {showHidden: false, depth: depth, colors: true})
-    // Alternative: return JSON.stringify(obj, null, 2)
-    // Alternative: return console.dir(obj, {depth: null, colors: true})
-}
-
-
-// Write a function that tests if a string is a valid IP4 address
-export const isIP4 = (str: string): boolean => {
-  const ip4Regex = /^(\d{1,3}\.){3}\d{1,3}$/
-  return ip4Regex.test(str)
-}
-
-export const isNetmask = isIP4
-
-// See https://stackoverflow.com/questions/503052/how-to-check-if-ip-is-in-one-of-these-subnets
-
-
-// const ip2long = (ip) => {
-//   var components;
-//   if(components = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/))
-//   {
-//       var iplong = 0;
-//       var power  = 1;
-//       for(var i=4; i>=1; i-=1)
-//       {
-//           iplong += power * parseInt(components[i]);
-//           power  *= 256;
-//       }
-//       return iplong;
-//   }
-//   else return -1;
-// };
-
-// THIS FUNCTION IS WRONG
-// export const inSubNet = (ip, subnet) => {   
-//   var mask, base_ip, long_ip = ip2long(ip);
-//   if( (mask = subnet.match(/^(.*?)\/(\d{1,2})$/)) && ((base_ip=ip2long(mask[1])) >= 0) )
-//   {
-//       var freedom = Math.pow(2, 32 - parseInt(mask[2]));
-//       return (long_ip > base_ip) && (long_ip < base_ip + freedom - 1);
-//   }
-//   else return false;
-// }
-
-export const IPnumber = (ip:IPAddress):number => {
-//  var ip = IPaddress.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
-//  if(ip) {
-//      return (+ip[1]<<24) + (+ip[2]<<16) + (+ip[3]<<8) + (+ip[4]);
-//  }
-  return (+ip[1]<<24) + (+ip[2]<<16) + (+ip[3]<<8) + (+ip[4]);
-}
-
-export const isIPAddress = (str: string): str is IPAddress => {
-  // return str.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
-  const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/
-  // const ipRegex = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/
-  return ipRegex.test(str)
-}
-
-export const sameNet = (IP1:any, IP2:any, mask:any) => {
-  //log(`${IPnumber(IP1) & IPnumber(mask)} == ${IPnumber(IP2) & IPnumber(mask)}`)
-  // Check if the IP addresses are strings
-  if (isIPAddress(IP1) && isIPAddress(IP2) && isNetmask(mask)) {
-    return (IPnumber(IP1) & IPnumber(mask)) == (IPnumber(IP2) & IPnumber(mask))
-  } else {
-    return false
-  }
-}
-
-export const findIp = async (address:IPAddress):Promise<IPAddress | undefined> => {
-  // Use a shell command to resolve the ip address
-  // REmove the trailing \n from the ip address
-  try {
-    const interfaceData = os.networkInterfaces()
-    const ip = interfaceData["eth0"]?.find((iface) => iface.family === "IPv4")?.address
-    if (ip && isIPAddress(ip)) {
-      return ip
-    } else {
-      return undefined
-    }
-  } catch (e) {
-    return undefined
-  }
-}
-
-export const findIp2 = async (address:IPAddress):Promise<IPAddress | undefined> => {
-  // Use a shell command to resolve the ip address
-  // REmove the trailing \n from the ip address
-  try {
-    const ip = (await $`ping -c 1 ${address} | grep PING | awk '{print $3}' | tr -d '()'`).stdout.replace(/\n$/, '')
-    if (isIPAddress(ip)) {
-      return ip
-    } else {
-      return undefined
-    }
-  } catch (e) {
-    return undefined
-  }
-}
-
-export const reset = async ($) => {
-  print(chalk.blue('Resetting the local engine'));
-  try {
-      // (removed) Removing the yjs database
-      // await $`rm -rf ../yjs-db`;
-      // (removed) Removing all appnet ids
-      // if (config.settings.appnets) {
-      //   config.settings.appnets.forEach((appnet) => delete appnet.id)
-      //   (removed) Updating the config file
-      //   writeConfig(config, '../config.yaml')
-      // }
-  } catch (e) {   
-      print(chalk.red('Failed to reset the local engine'));
-      console.error(e);
-      process.exit(1);
-  }
-}
-
-export const prompt = (level:number, message: string) => {
-  // Create level*4 spaces
-  const spaces = ' '.repeat(level * 4)
-  print(chalk.green(spaces+message))
-  return question(chalk.bgMagentaBright(spaces+'Press ENTER when ready'))
-}
-
-/** Characters of generated ids and app passwords: lowercase base-36, as before idea#114. */
-export const SECRET_ID_ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyz'
-/**
- * Length of generated ids and app passwords. The old Math.random + timestamp ids
- * were 15-22 characters, 19 in almost all cases, so 19 keeps them the same shape
- * (idea#114). 19 base-36 characters is about 98 bits of randomness.
- */
-export const SECRET_ID_LENGTH = 19
-
-/**
- * A random string from `alphabet`, drawn from Node's CSPRNG. Each character uses
- * crypto.randomInt, which rejection-samples, so there is no modulo bias (idea#114).
- * `randomInt` can be swapped in tests only.
- */
-export const secureRandomString = (
-  length: number,
-  alphabet: string = SECRET_ID_ALPHABET,
-  randomInt: (max: number) => number = crypto.randomInt,
-): string => {
-  let out = ''
-  for (let i = 0; i < length; i++) out += alphabet[randomInt(alphabet.length)]
-  return out
-}
-
-// Generate a uuid: disk, instance and operation ids, and the app password that
-// startInstance writes to an instance's .env (idea#114: crypto source, not Math.random).
-// Not logged: it generates the app password (idea#111).
-export const uuid = ():string => {
-  return secureRandomString(SECRET_ID_LENGTH)
-}
-
-export const uuidLight = ():string => {
-  return uuid().substring(0, 8)
-}
-
-
-// A function to strip the trailing partition number from a device name
-export const stripPartition = (device: string):string => {
-  if (device.startsWith('nvme') || device.startsWith('mmcblk')) {
-    return device.replace(/p[0-9]+$/, '')
-  }
-  return device.replace(/[0-9]+$/, '')
-}
-
 ```
 
 ## File: src/data/App.ts
@@ -2990,6 +1122,7 @@ import { undockDisk } from "../monitors/usbDeviceMonitor.js";
 import { backupInstance, restoreApp, createBackupDiskConfig, runningBackupOnDisk } from "../monitors/backupMonitor.js";
 import { cancelOperation } from './Operations.js';
 import { DiskArgResult, lookupDiskArg, resolveDiskArg } from './DiskArg.js';
+import { createFilesDisk } from './CreateFilesDisk.js';
 import { testContext } from "../../test/testContext.js";
 
 
@@ -3322,6 +1455,18 @@ const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, dis
     print(chalk.green(`Backup Disk '${disk.name}' (${disk.id}) configured.`))
 }
 
+/**
+ * createFilesDisk <diskId> [<shareName…>] (idea#131). The disk ID only (the
+ * command has no old name form); the share name takes the rest of the line and
+ * defaults to "School Files". Refusals throw, so the trace ends as `error`.
+ */
+const createFilesDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskId: string, ...shareNameTokens: string[]) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    const shareName = shareNameTokens.length > 0 ? shareNameTokens.join(' ') : undefined
+    const disk = await createFilesDisk(storeHandle, diskId, shareName)
+    print(chalk.green(`'${disk.name}' (${disk.id}) is now a Files Disk (disk types: ${disk.diskTypes.join(', ')}).`))
+}
+
 const copyAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, sourceDiskId: DiskID, targetDiskId: DiskID) => {
     if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
     await copyApp(storeHandle, instanceName, sourceDiskId, targetDiskId, 'console-command')
@@ -3410,6 +1555,7 @@ export const commands: CommandDefinition[] = [
     { name: "backupApp", execute: backupAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "mode" }, { type: "string", name: "instanceNames", variadic: true }], scope: 'engine' },
+    { name: "createFilesDisk", execute: createFilesDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "shareName", variadic: true, optional: true }], scope: 'engine' },
     { name: "cancelOperation", execute: async (storeHandle: DocHandle<Store> | null, opId: string) => {
         if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
         const err = cancelOperation(storeHandle, opId)
@@ -4469,6 +2615,214 @@ export { recoverInterruptedOperations } from './Operations.js'
 
 ```
 
+## File: src/data/CreateFilesDisk.ts
+```typescript
+/**
+ * CreateFilesDisk.ts: createFilesDisk <diskId> [<shareName…>] (idea#131, Files Disk step 1)
+ *
+ * Adds the Files role to an empty disk or an App and/or Backup Disk: writes
+ * META.yaml if it is missing (the disk ID is always kept), FILES.yaml and an
+ * empty files/ folder, then runs processDisk, which adds 'files' to diskTypes.
+ * Nothing else on the disk is touched, and the filesystem label never changes.
+ *
+ * Checks, each throwing so the command trace ends as `error` (proposals/files-disk.md §7.1):
+ *   0. share name rule (default "School Files"); not while an erase of this disk runs
+ *   1. found here: disk ID only (no name fallback), docked to this engine, has a device
+ *   2. not the system disk
+ *   3. roles: ['empty'], or only 'app' and/or 'backup'; not already a Files Disk,
+ *      not an Upgrade Disk
+ *   4. no non-IDEA entries in the disk root (a stray files/ counts)
+ *   5. ext4
+ *   6. not busy (disk lock, running backup), checked before anything changes, and
+ *      the disk lock is held from here until the files are written
+ *   7. owner: if pi can't write the root, record the previous uid:gid and mode in
+ *      the trace, then run exactly `sudo /usr/bin/chown -h pi:pi /disks/<device>`
+ *      (11-engine-files; root folder only, not recursive, -h never follows a symlink)
+ *   8. writable by pi
+ * createFilesDisk is the only place that changes a disk root's owner.
+ */
+
+import { $, YAML, fs } from 'zx'
+import { DocHandle } from '@automerge/automerge-repo'
+import { Store, getLocalEngine } from './Store.js'
+import { Disk, diskMountRoot, isSystemDiskRecord, processDisk } from './Disk.js'
+import { lookupDiskById } from './DiskArg.js'
+import { DEFAULT_SHARE_NAME, FILES_DIR, FILES_YAML, filesYamlFor, validateShareName } from './FilesDisk.js'
+import { writeMetaFile, DiskMeta } from './Meta.js'
+import { DiskName, EngineID, Timestamp } from './CommonTypes.js'
+import { resourceLock, diskKey } from '../utils/ResourceLock.js'
+import { runningBackupOnDisk } from '../monitors/backupMonitor.js'
+import { log, print } from '../utils/utils.js'
+
+/** The one chown the Engine runs as root, and the mount points it may run on (11-engine-files). */
+export const SUDO_CHOWN = '/usr/bin/chown'
+export const SUDO_CHOWN_ROOT = /^\/disks\/sd[a-z][12]$/
+export const chownRootCommand = (mountPoint: string): string => `${SUDO_CHOWN} -h pi:pi ${mountPoint}`
+
+export const MISSING_PERMISSION_MESSAGE =
+    'this Engine is missing a permission update; ask Ops to install the new 11-engine-files sudoers file'
+
+/**
+ * Runs `sudo -n /usr/bin/chown -h pi:pi <mountPoint>`. sudo sees exactly
+ * "/usr/bin/chown -h pi:pi /disks/<device>", which is what the 11-engine-files
+ * entry matches; -n makes a missing entry fail at once instead of waiting for a
+ * password. Refuses any path outside /disks/sd[a-z][12].
+ */
+export const runSudoChownRoot = async (mountPoint: string): Promise<void> => {
+    if (!SUDO_CHOWN_ROOT.test(mountPoint)) {
+        throw new Error(`${mountPoint} is not an Engine disk mount point (/disks/sd[a-z][12]); its owner is never changed`)
+    }
+    await $`sudo -n ${SUDO_CHOWN} -h pi:pi ${mountPoint}`
+}
+
+/** The filesystem and root-folder operations createFilesDisk uses; replaced in tests. */
+export interface FilesDiskOps {
+    fsType: (mountPoint: string) => Promise<string>
+    rootOwner: (mountPoint: string) => Promise<{ uid: number, gid: number, mode: number }>
+    canWrite: (mountPoint: string) => Promise<boolean>
+    chownRoot: (mountPoint: string) => Promise<void>
+}
+
+export const defaultFilesDiskOps: FilesDiskOps = {
+    fsType: async (mountPoint) => (await $`findmnt -no FSTYPE ${mountPoint}`.nothrow()).stdout.trim(),
+    rootOwner: async (mountPoint) => {
+        const st = await fs.lstat(mountPoint)
+        return { uid: st.uid, gid: st.gid, mode: st.mode & 0o7777 }
+    },
+    canWrite: async (mountPoint) => fs.access(mountPoint, fs.constants.W_OK).then(() => true, () => false),
+    chownRoot: runSudoChownRoot,
+}
+
+let ops: FilesDiskOps = defaultFilesDiskOps
+/** Tests only: replace some of the operations (null: back to the real ones). */
+export const setFilesDiskOpsForTests = (o: Partial<FilesDiskOps> | null): void => {
+    ops = o ? { ...defaultFilesDiskOps, ...o } : defaultFilesDiskOps
+}
+
+/** Root entries each role may have; META.yaml and lost+found are always allowed. */
+const ROLE_ROOT_ENTRIES: Record<string, string[]> = {
+    app: ['apps', 'services', 'instances'],
+    backup: ['BACKUP.yaml', 'backups'],
+}
+
+export const createFilesDisk = async (storeHandle: DocHandle<Store>, diskId: string, shareNameArg?: string): Promise<Disk> => {
+    // 0. Share name and erase check
+    const shareName = shareNameArg === undefined || shareNameArg === '' ? DEFAULT_SHARE_NAME : shareNameArg
+    const nameError = validateShareName(shareName)
+    if (nameError) throw new Error(nameError)
+    const store = storeHandle.doc()
+    const engine = getLocalEngine(store)
+    const erase = engine.eraseInProgress
+    if (erase && String(erase.targetId) === String(diskId)) {
+        throw new Error(`Disk ${diskId} is being erased (${erase.step}). Try again when the erase has finished.`)
+    }
+
+    // 1. Found here, by disk ID only
+    const found = lookupDiskById(store, engine.id, diskId)
+    if (!found.ok) throw new Error(found.message)
+    const disk = found.disk
+    const name = disk.name
+
+    // 2. Not the system disk
+    if (await isSystemDiskRecord(disk)) throw new Error(`${name} is this Pi's system disk; it can't become a Files Disk.`)
+
+    // 3. Allowed roles
+    const root = await diskMountRoot(disk)
+    const types = [...(disk.diskTypes ?? [])]
+    if (types.includes('files') || await fs.pathExists(`${root}/${FILES_YAML}`)) throw new Error(`${name} is already a Files Disk.`)
+    if (types.includes('upgrade')) throw new Error(`${name} is an Upgrade Disk; it can't also be a Files Disk.`)
+    const emptyDisk = types.length === 1 && types[0] === 'empty'
+    const appOrBackup = types.length > 0 && types.every(t => t === 'app' || t === 'backup')
+    if (!emptyDisk && !appOrBackup) {
+        throw new Error(types.length === 0
+            ? `${name} has not been processed yet. Try again in a moment.`
+            : `${name} can't become a Files Disk (disk types: ${types.join(', ')}).`)
+    }
+
+    // 4. No non-IDEA entries in the root
+    const allowed = new Set(['META.yaml', 'lost+found', ...types.flatMap(t => ROLE_ROOT_ENTRIES[t] ?? [])])
+    const others = (await fs.readdir(root)).filter(e => !allowed.has(e)).sort()
+    if (others.length > 0) {
+        const shown = others.slice(0, 5).join(', ') + (others.length > 5 ? `, … (${others.length} in all)` : '')
+        throw new Error(`${name} has other files on it (${shown}). Use Make this a Files Disk to erase it, or empty it on another computer.`)
+    }
+
+    // 5. ext4
+    const fsType = await ops.fsType(root)
+    if (fsType !== 'ext4') {
+        throw new Error(`${name} is not an ext4 disk (filesystem: ${fsType || 'unknown'}). Use Make this a Files Disk to erase it first.`)
+    }
+
+    // 6. Not busy. Checked before anything on the disk changes; the disk lock is
+    // held until FILES.yaml and files/ are written.
+    const backup = runningBackupOnDisk(store, disk.id)
+    if (backup) throw new Error(`${name} is in use by a running backup of instance ${backup.args.instanceId}. Try again when it has finished.`)
+    if (!resourceLock.acquire(diskKey(disk.id), 'createFilesDisk')) {
+        const info = resourceLock.getLockInfo(diskKey(disk.id))
+        throw new Error(`${name} is locked by an active '${info?.kind}' operation. Try again when it has finished.`)
+    }
+    try {
+        // 7. Owner: only when pi can't write the root
+        if (!(await ops.canWrite(root))) {
+            const before = await ops.rootOwner(root)
+            const mode = before.mode.toString(8).padStart(4, '0')
+            print(`createFilesDisk: the root folder ${root} of ${name} (${disk.id}) is not writable by the Engine. Previous owner uid:gid ${before.uid}:${before.gid}, mode ${mode}. Running: sudo ${chownRootCommand(root)}`)
+            try {
+                await ops.chownRoot(root)
+            } catch (e: any) {
+                throw new Error(`${name}: could not change the owner of the disk root: ${MISSING_PERMISSION_MESSAGE} (${(e.stderr || e.message || String(e)).trim()}). Nothing was written to the disk.`)
+            }
+            print(`createFilesDisk: ${root} is now owned by pi:pi (was ${before.uid}:${before.gid}, mode ${mode})`)
+        }
+
+        // 8. Writable
+        if (!(await ops.canWrite(root))) throw new Error(`${name}: the disk root is not writable by the Engine. Nothing was written to the disk.`)
+
+        // META.yaml if missing: the store's disk ID is kept
+        if (!(await fs.pathExists(`${root}/META.yaml`))) {
+            const meta: DiskMeta = {
+                diskId: disk.id,
+                isHardwareId: false,
+                diskName: name as DiskName,
+                created: disk.created,
+                lastDocked: disk.lastDocked,
+            }
+            await writeMetaFile(meta, `${root}/META.yaml`)
+            log(`createFilesDisk: wrote META.yaml with the existing disk ID ${disk.id}`)
+        }
+
+        // files/ as pi, then FILES.yaml (written to a temporary name and renamed,
+        // so a half-written FILES.yaml never marks the disk). files/ is removed
+        // again if FILES.yaml can't be written, so a retry isn't refused.
+        const filesDir = `${root}/${FILES_DIR}`
+        await fs.mkdir(filesDir)
+        try {
+            const yaml = filesYamlFor(shareName, engine.id as EngineID, Date.now() as Timestamp)
+            const tmp = `${root}/.${FILES_YAML}.tmp`
+            await fs.writeFile(tmp, YAML.stringify(yaml))
+            await fs.rename(tmp, `${root}/${FILES_YAML}`)
+        } catch (e) {
+            await fs.rmdir(filesDir).catch(() => {})
+            await fs.remove(`${root}/.${FILES_YAML}.tmp`).catch(() => {})
+            throw e
+        }
+        print(`createFilesDisk: wrote ${FILES_YAML} (share '${shareName}') and ${FILES_DIR}/ on ${name} (${disk.id})`)
+    } finally {
+        resourceLock.release(diskKey(disk.id))
+    }
+
+    // processDisk adds 'files' next to the existing roles; existing instances keep running
+    const current = storeHandle.doc().diskDB[disk.id]
+    await processDisk(storeHandle, current)
+    const after = storeHandle.doc().diskDB[disk.id]
+    if (!after?.diskTypes?.includes('files')) {
+        throw new Error(`${name}: FILES.yaml was written but the disk was not detected as a Files Disk.`)
+    }
+    return after
+}
+
+```
+
 ## File: src/data/Disk.ts
 ```typescript
 import { $, YAML, chalk, fs, os } from 'zx';
@@ -4482,6 +2836,9 @@ import { getCommandLogHandle } from './CommandLogStore.js';
 import { addTrace, closeTrace } from './CommandLogStore.js';
 import { runWithTrace } from '../utils/CommandLogger.js';
 import { disksRoot } from './Config.js';
+import { FilesConfig, hasFilesYaml, processFilesDisk } from './FilesDisk.js';
+import { updateDiskSize } from './DiskSize.js';
+import { recordDiskDetectionFailure } from '../monitors/diskDetection.js';
 
 
 
@@ -4502,6 +2859,9 @@ export interface Disk {
     diskTypes: DiskType[];        // Types detected for this disk (may be multiple); empty until processDisk runs
     backupConfig: BackupConfig | null;  // Set when disk is a Backup Disk; null otherwise
     unmountError?: UnmountError | null; // Set when the last undock could not unmount the disk (idea#126); null/absent otherwise
+    filesConfig?: FilesConfig | null;   // Set when the disk is a Files Disk (FILES.yaml, idea#131); null otherwise
+    sizeBytes?: number | null;          // Docked disks: size in bytes, rounded to MB (idea#131); null when undocked
+    freeBytes?: number | null;          // Docked disks: free bytes, rounded to MB (idea#131); null when undocked
 }
 
 /**
@@ -4596,6 +2956,9 @@ export const clearDuplicateDiskRecords = (doc: Store, engineId: EngineID, device
         other.device = null
         other.diskTypes = []
         other.backupConfig = null
+        other.filesConfig = null
+        other.sizeBytes = null
+        other.freeBytes = null
         cleared.push(other.id)
     }
     return cleared
@@ -4620,6 +2983,9 @@ export const createOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: Engi
                 diskTypes: [],
                 backupConfig: null,
                 unmountError: null,
+                filesConfig: null,
+                sizeBytes: null,
+                freeBytes: null,
             };
             doc.diskDB[diskId] = disk;
         } else {
@@ -4632,6 +2998,7 @@ export const createOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: Engi
             disk.lastDocked = new Date().getTime() as Timestamp;
             disk.diskTypes = [];        // reset; will be repopulated by processDisk
             disk.backupConfig = null;   // reset; will be repopulated if Backup Disk
+            disk.filesConfig = null;    // reset; will be repopulated if Files Disk (idea#131)
             disk.unmountError = null;   // mounted again: a previous busy unmount no longer applies (idea#126)
         }
     });
@@ -4694,6 +3061,20 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
         })
         await processSystemDisk(storeHandle, disk)
     } else {
+        // Files first, then App, Backup and Upgrade (idea#131, Files Disk R5), so an
+        // App on the same disk sees the Files role before its instances start. A
+        // Files-role error is recorded and does not stop the other roles.
+        const mountRoot = await diskMountRoot(disk)
+        try {
+            if (await isFilesDisk(disk)) {
+                log(`Disk ${disk.id} is a files disk`)
+                detectedTypes.push('files')
+                await processFilesDisk(storeHandle, disk.id, disk.name, mountRoot)
+            }
+        } catch (e: any) {
+            recordDiskDetectionFailure('files', `Files Disk ${disk.id}: ${e.message ?? e}`, { device: disk.device, diskId: disk.id })
+        }
+
         if (await isAppDisk(disk)) {
             log(`Disk ${disk.id} is an app disk`)
             detectedTypes.push('app')
@@ -4714,23 +3095,29 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
             // TODO: Implement upgrade disk processing — https://github.com/koenswings/idea/issues/46
         }
 
-        if (await isFilesDisk(disk)) {
-            log(`Disk ${disk.id} is a files disk`)
-            detectedTypes.push('files')
-            // TODO: Implement files disk processing — https://github.com/koenswings/idea/issues/46
-        }
-
         if (detectedTypes.length === 0) {
             log(`Disk ${disk.id} is an empty disk`)
             detectedTypes.push('empty')
         }
     }
 
-    // Persist detected types to the store
+    // Persist detected types to the store. Roles are listed in a fixed order
+    // (app, backup, upgrade, files), whatever order they were processed in.
+    const roleOrder: DiskType[] = ['system', 'app', 'backup', 'upgrade', 'files', 'empty']
+    detectedTypes.sort((a, b) => roleOrder.indexOf(a) - roleOrder.indexOf(b))
     storeHandle.change(doc => {
         const d = doc.diskDB[disk.id]
-        if (d) d.diskTypes = detectedTypes
+        if (!d) return
+        d.diskTypes = detectedTypes
+        if (!detectedTypes.includes('files') && d.filesConfig != null) d.filesConfig = null
     })
+
+    // Size and free space of every docked disk, on dock (idea#131)
+    try {
+        await updateDiskSize(storeHandle, disk.id, await diskFsRoot(disk), true)
+    } catch (e: any) {
+        log(`Could not read the size of disk ${disk.id}: ${e.message ?? e}`)
+    }
 }
 
 /**
@@ -4978,10 +3365,10 @@ export const isUpgradeDisk = async (disk: Disk): Promise<boolean> => {
     return false
 }
 
+/** A Files Disk has FILES.yaml in its root (idea#131). */
 export const isFilesDisk = async (disk: Disk): Promise<boolean> => {
-    // Create dummy code that always returns false
-    // To be updated later
-    return false
+    if (!disk.device) return false
+    return hasFilesYaml(await diskMountRoot(disk))
 }
 
 export const processAppDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Promise<void> => {
@@ -5175,14 +3562,22 @@ export type DiskArgResult =
     | { ok: true, disk: Disk, byName: boolean }
     | { ok: false, message: string }
 
+/**
+ * Look up a disk by id only (no name fallback): for commands that have no old
+ * name form, such as createFilesDisk (idea#131). The record must be docked to
+ * this engine and have a device.
+ */
+export const lookupDiskById = (store: Store, engineId: EngineID | undefined, id: string): DiskArgResult => {
+    const byId = store.diskDB[id as DiskID]
+    if (!byId) return { ok: false, message: `Disk '${id}' not found.` }
+    if (!byId.device) return { ok: false, message: `Disk '${byId.name}' (${byId.id}) is not currently docked.` }
+    if (String(byId.dockedTo) !== String(engineId)) return { ok: false, message: `Disk '${byId.name}' (${byId.id}) is not docked to this engine.` }
+    return { ok: true, disk: byId, byName: false }
+}
+
 /** Resolve without side effects (no warning, no throw). */
 export const lookupDiskArg = (store: Store, engineId: EngineID | undefined, arg: string): DiskArgResult => {
-    const byId = store.diskDB[arg as DiskID]
-    if (byId) {
-        if (!byId.device) return { ok: false, message: `Disk '${byId.name}' (${byId.id}) is not currently docked.` }
-        if (String(byId.dockedTo) !== String(engineId)) return { ok: false, message: `Disk '${byId.name}' (${byId.id}) is not docked to this engine.` }
-        return { ok: true, disk: byId, byName: false }
-    }
+    if (store.diskDB[arg as DiskID]) return lookupDiskById(store, engineId, arg)
     const named = Object.values(store.diskDB).filter(d => d.name === arg)
     if (named.length === 0) return { ok: false, message: `Disk '${arg}' not found.` }
     const dockedHere = named.filter(d => d.device != null && String(d.dockedTo) === String(engineId))
@@ -5205,6 +3600,94 @@ export const resolveDiskArg = (store: Store, engineId: EngineID | undefined, arg
         console.warn(`${command}: disk '${r.disk.name}' was given by name; use the disk id ${r.disk.id} (names are deprecated, idea#128).`)
     }
     return r.disk
+}
+
+```
+
+## File: src/data/DiskSize.ts
+```typescript
+/**
+ * DiskSize.ts: Disk.sizeBytes / Disk.freeBytes (idea#131, Files Disk §7.2, §7.5)
+ *
+ * Every docked disk gets its size and free space, read with fs.statfs on the
+ * mount point (no sudo), on dock and every 10 minutes. To keep the Automerge
+ * document small the values are rounded to whole MB and written only when the
+ * size changed or free space moved by more than 1% of the disk size or more
+ * than 100 MB. Both are cleared on undock.
+ */
+
+import { statfs } from 'fs/promises'
+import { DocHandle } from '@automerge/automerge-repo'
+import { Store } from './Store.js'
+import { Disk } from './Disk.js'
+import { DiskID, EngineID } from './CommonTypes.js'
+import { log } from '../utils/utils.js'
+
+export const SIZE_ROUNDING_BYTES = 1_000_000          // whole MB
+export const FREE_CHANGE_BYTES = 100_000_000          // 100 MB
+export const FREE_CHANGE_FRACTION = 0.01              // 1% of the disk size
+export const DISK_SIZE_INTERVAL_MS = 10 * 60 * 1000   // 10 minutes
+
+export interface DiskSize { sizeBytes: number; freeBytes: number }
+
+export const roundBytes = (n: number): number => Math.round(n / SIZE_ROUNDING_BYTES) * SIZE_ROUNDING_BYTES
+
+/** Size and free space (available to the Engine, i.e. without root's reserve), rounded. */
+export const readDiskSize = async (fsRoot: string): Promise<DiskSize> => {
+    const s = await statfs(fsRoot)
+    return { sizeBytes: roundBytes(s.blocks * s.bsize), freeBytes: roundBytes(s.bavail * s.bsize) }
+}
+
+/** Write rule: first value, a size change, or free space moved by more than 1% of the size or 100 MB. */
+export const sizeNeedsWrite = (old: { sizeBytes?: number | null, freeBytes?: number | null }, next: DiskSize): boolean => {
+    if (old.sizeBytes == null || old.freeBytes == null) return true
+    if (old.sizeBytes !== next.sizeBytes) return true
+    const delta = Math.abs(next.freeBytes - old.freeBytes)
+    return delta > FREE_CHANGE_BYTES || delta > next.sizeBytes * FREE_CHANGE_FRACTION
+}
+
+/**
+ * Read the disk's size at fsRoot and store it when the write rule says so
+ * (always with force, e.g. on dock). Returns true when the store was written.
+ */
+export const updateDiskSize = async (storeHandle: DocHandle<Store>, diskId: DiskID, fsRoot: string, force = false): Promise<boolean> => {
+    const next = await readDiskSize(fsRoot)
+    const current = storeHandle.doc().diskDB[diskId]
+    if (!current || !current.device) return false
+    if (!force && !sizeNeedsWrite(current, next)) return false
+    storeHandle.change(doc => {
+        const d = doc.diskDB[diskId]
+        if (!d) return
+        if (d.sizeBytes !== next.sizeBytes) d.sizeBytes = next.sizeBytes
+        if (d.freeBytes !== next.freeBytes) d.freeBytes = next.freeBytes
+    })
+    return true
+}
+
+/** One pass over the disks docked to this engine (the 10-minute timer). */
+export const refreshDiskSizes = async (storeHandle: DocHandle<Store>, engineId: EngineID, fsRootOf: (disk: Disk) => Promise<string>): Promise<void> => {
+    const disks = Object.values(storeHandle.doc().diskDB)
+        .filter(d => d && d.device != null && String(d.dockedTo) === String(engineId))
+    for (const disk of disks) {
+        try {
+            await updateDiskSize(storeHandle, disk.id, await fsRootOf(disk))
+        } catch (e: any) {
+            log(`[diskSize] could not read the size of disk ${disk.id}: ${e.message ?? e}`)
+        }
+    }
+}
+
+let sizeTimer: NodeJS.Timeout | null = null
+
+export const enableDiskSizeMonitor = (storeHandle: DocHandle<Store>, engineId: EngineID, fsRootOf: (disk: Disk) => Promise<string>, intervalMs = DISK_SIZE_INTERVAL_MS): void => {
+    if (sizeTimer) clearInterval(sizeTimer)
+    sizeTimer = setInterval(() => { refreshDiskSizes(storeHandle, engineId, fsRootOf).catch(() => {}) }, intervalMs)
+    sizeTimer.unref()
+}
+
+export const disableDiskSizeMonitor = (): void => {
+    if (sizeTimer) clearInterval(sizeTimer)
+    sizeTimer = null
 }
 
 ```
@@ -5234,18 +3717,28 @@ export interface Engine {
   capabilities?: string[];
   /** The lastBooted of the startup that wrote `capabilities` (idea#128) */
   capabilitiesBootedAt?: Timestamp;
+  /** Set by eraseDisk for its whole run (Files Disk step 3, not built yet); createFilesDisk refuses that disk meanwhile (idea#131) */
+  eraseInProgress?: EraseInProgress | null;
+}
+
+/** Engine.eraseInProgress (proposals/files-disk.md §7.5); written by eraseDisk (step 3). */
+export interface EraseInProgress {
+  targetId: string;
+  label: string;
+  step: 'checking' | 'stopping and unmounting' | 'partitioning' | 'creating filesystem' | 'mounting';
 }
 
 /**
  * Capabilities this Engine build advertises (idea#128, Files Disk step 0b).
  *   diskIdArgs: installApp, createBackupDisk and ejectDisk take disk ids.
+ *   filesDisk:  the Files Disk role and createFilesDisk <diskId> [<shareName…>] (idea#131).
  * Written at every startup as a whole new list, with capabilitiesBootedAt set
  * to that startup's lastBooted. A Console counts a capability only when
  * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk']
 
 import { config } from './Config.js';
 
@@ -5733,8 +4226,9 @@ EOF`
  * The Engine's sudoers files (asset in script/build_image_assets -> installed file).
  *   - 10-engine: the narrow list of root commands the Engine (running as pi)
  *     needs (idea#80, proposals/run-architecture.md)
- *   - 11-engine-files: files the Engine writes as root on App Disks, e.g.
- *     META.yaml on the first dock (idea#121)
+ *   - 11-engine-files: files and folders the Engine writes, removes or re-owns
+ *     as root under /disks, e.g. META.yaml on the first dock (idea#121) and the
+ *     disk root owner for createFilesDisk (chown -h, idea#131)
  * Installed names have no '.' in them: sudo skips files in /etc/sudoers.d whose
  * name contains a '.'.
  */
@@ -6294,6 +4788,132 @@ const startDockerEngine = async (exec: any, enginePath: string, productionMode: 
   }
   print(chalk.green('Engine composed up'));
 }
+
+```
+
+## File: src/data/FilesDisk.ts
+```typescript
+/**
+ * FilesDisk.ts: the Files Disk role (idea#131, Files Disk step 1)
+ *
+ * A Files Disk is recognised by FILES.yaml in the disk root (proposals/files-disk.md
+ * §6, §7.2). The role can be combined with the App and Backup roles on the same
+ * disk. The shared content lives in files/; mounting it into Apps is step 2.
+ *
+ * FILES.yaml (version 1):
+ *   version: 1               format version
+ *   created: <ms>            when the disk became a Files Disk
+ *   createdBy: <engineId>    Engine that ran createFilesDisk (informational)
+ *   shareName: School Files  name Apps show for this disk
+ *   readOnly: false          reserved, ignored in v1
+ *   password: null           reserved; non-null → not mounted, filesConfig.error set
+ *
+ * The password never goes into the store.
+ */
+
+import { YAML, fs } from 'zx'
+import { DocHandle } from '@automerge/automerge-repo'
+import { Store } from './Store.js'
+import { DiskID, EngineID, Timestamp } from './CommonTypes.js'
+import { log } from '../utils/utils.js'
+
+export const FILES_YAML = 'FILES.yaml'
+export const FILES_DIR = 'files'
+export const FILES_YAML_VERSION = 1
+export const DEFAULT_SHARE_NAME = 'School Files'
+export const FILES_PASSWORD_ERROR = 'password-protected Files Disks are not supported yet'
+
+/** Disk.filesConfig (§7.5). error is only used for a password-protected disk. */
+export interface FilesConfig {
+    shareName: string
+    readOnly: boolean
+    passwordProtected: boolean
+    error: string | null
+}
+
+export interface FilesYaml {
+    version: number
+    created: Timestamp
+    createdBy: EngineID | null
+    shareName: string
+    readOnly: boolean
+    password: string | null
+}
+
+/**
+ * Share name rule (§7.1, E6): 1 to 16 bytes of A–Z a–z 0–9, space, hyphen,
+ * underscore and parentheses (ASCII only, so bytes = characters), no leading
+ * or trailing space. Never used as a filesystem label.
+ */
+export const SHARE_NAME_PATTERN = /^[A-Za-z0-9 _()-]{1,16}$/
+export const validateShareName = (name: string): string | null => {
+    if (!SHARE_NAME_PATTERN.test(name)) {
+        return `Share name '${name}' is not allowed: use at most 16 characters from A–Z, a–z, 0–9, space, hyphen, underscore and parentheses.`
+    }
+    if (name !== name.trim()) return `Share name '${name}' must not start or end with a space.`
+    return null
+}
+
+export const hasFilesYaml = async (mountRoot: string): Promise<boolean> =>
+    fs.pathExists(`${mountRoot}/${FILES_YAML}`)
+
+/**
+ * Read FILES.yaml and turn it into a filesConfig. Throws when the file can't be
+ * read or isn't a YAML mapping. A missing shareName falls back to the disk name.
+ */
+export const readFilesConfig = async (mountRoot: string, diskName: string): Promise<FilesConfig> => {
+    const text = await fs.readFile(`${mountRoot}/${FILES_YAML}`, 'utf-8')
+    let parsed: any
+    try {
+        parsed = YAML.parse(text)
+    } catch (e: any) {
+        throw new Error(`${FILES_YAML} is not valid YAML: ${e.message ?? e}`)
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error(`${FILES_YAML} is not a YAML mapping`)
+    }
+    const shareName = typeof parsed.shareName === 'string' && parsed.shareName.trim() !== '' ? parsed.shareName : diskName
+    const passwordProtected = parsed.password !== undefined && parsed.password !== null
+    return {
+        shareName,
+        readOnly: parsed.readOnly === true,
+        passwordProtected,
+        error: passwordProtected ? FILES_PASSWORD_ERROR : null,
+    }
+}
+
+/**
+ * processFilesDisk (§7.2): read FILES.yaml and set disk.filesConfig. On a
+ * read error filesConfig is cleared and the error is thrown, so processDisk can
+ * record it and go on with the App and Backup roles.
+ */
+export const processFilesDisk = async (storeHandle: DocHandle<Store>, diskId: DiskID, diskName: string, mountRoot: string): Promise<void> => {
+    let filesConfig: FilesConfig
+    try {
+        filesConfig = await readFilesConfig(mountRoot, diskName)
+    } catch (e) {
+        storeHandle.change(doc => {
+            const d = doc.diskDB[diskId]
+            if (d) d.filesConfig = null
+        })
+        throw e
+    }
+    storeHandle.change(doc => {
+        const d = doc.diskDB[diskId]
+        if (d) d.filesConfig = filesConfig
+    })
+    if (filesConfig.passwordProtected) log(`Files Disk ${diskId}: ${FILES_PASSWORD_ERROR}; not mounted`)
+    else log(`Files Disk ${diskId}: share '${filesConfig.shareName}'`)
+}
+
+export const filesYamlFor = (shareName: string, createdBy: EngineID | null, created: Timestamp): FilesYaml => ({
+    version: FILES_YAML_VERSION,
+    created,
+    createdBy,
+    shareName,
+    readOnly: false,
+    password: null,
+})
 
 ```
 
@@ -9237,6 +7857,1879 @@ export interface User {
 
 ```
 
+## File: src/utils/CommandLogger.ts
+```typescript
+/**
+ * CommandLogger.ts
+ *
+ * Captures console output per command invocation using AsyncLocalStorage.
+ * Each command gets a unique trace context that flows automatically through
+ * every async call in its chain — no changes needed in individual commands.
+ *
+ * Usage:
+ *   1. Call initCommandLogger(handle) once at engine startup.
+ *   2. Wrap every command dispatch in runWithTrace(ctx, fn).
+ *   3. Everything inside fn() that calls console.log/info/warn/error/debug
+ *      is automatically collected into that trace's log list.
+ */
+
+import { AsyncLocalStorage } from 'async_hooks'
+import type { DocHandle } from '@automerge/automerge-repo'
+import type { CommandLogStore, LogEntry } from '../data/CommandLogStore.js'
+import { flushLogs } from '../data/CommandLogStore.js'
+
+export interface TraceContext {
+  traceId: string
+  command: string
+  args: string
+}
+
+// ── AsyncLocalStorage instance ───────────────────────────────────────────────
+
+const storage = new AsyncLocalStorage<TraceContext>()
+
+export const getActiveTrace = (): TraceContext | undefined => storage.getStore()
+
+export const runWithTrace = async <T>(
+  ctx: TraceContext,
+  fn: () => Promise<T>
+): Promise<T> => {
+  return storage.run(ctx, fn)
+}
+
+// ── Per-trace pending buffers and debounced flush ────────────────────────────
+
+const pendingBuffers = new Map<string, LogEntry[]>()
+const flushTimers    = new Map<string, ReturnType<typeof setTimeout>>()
+const FLUSH_DEBOUNCE_MS = 50
+
+let _handle: DocHandle<CommandLogStore> | null = null
+
+const scheduleFlush = (traceId: string): void => {
+  const existing = flushTimers.get(traceId)
+  if (existing) clearTimeout(existing)
+
+  const timer = setTimeout(() => {
+    flushTimers.delete(traceId)
+    const buffer = pendingBuffers.get(traceId)
+    if (buffer && buffer.length > 0 && _handle) {
+      const batch = buffer.splice(0)           // drain in-place
+      flushLogs(_handle, traceId, batch)
+    }
+  }, FLUSH_DEBOUNCE_MS)
+
+  flushTimers.set(traceId, timer)
+}
+
+/**
+ * Append a log entry to a trace's pending buffer and schedule a flush.
+ * Called from the patched console methods.
+ */
+export const appendToTrace = (traceId: string, entry: LogEntry): void => {
+  if (!pendingBuffers.has(traceId)) pendingBuffers.set(traceId, [])
+  pendingBuffers.get(traceId)!.push(entry)
+  scheduleFlush(traceId)
+}
+
+/**
+ * Force-flush any remaining buffered entries for a trace immediately.
+ * Call this right before closeTrace so logs aren't lost on fast commands.
+ */
+export const flushTrace = async (traceId: string): Promise<void> => {
+  const timer = flushTimers.get(traceId)
+  if (timer) {
+    clearTimeout(timer)
+    flushTimers.delete(traceId)
+  }
+  const buffer = pendingBuffers.get(traceId)
+  if (buffer && buffer.length > 0 && _handle) {
+    const batch = buffer.splice(0)
+    flushLogs(_handle, traceId, batch)
+  }
+  pendingBuffers.delete(traceId)
+}
+
+// ── Console patch ────────────────────────────────────────────────────────────
+
+let _patched = false
+
+const patchConsole = (): void => {
+  if (_patched) return
+  _patched = true
+
+  const originals = {
+    log:   console.log.bind(console),
+    info:  console.info.bind(console),
+    warn:  console.warn.bind(console),
+    error: console.error.bind(console),
+    debug: console.debug.bind(console),
+  } as const
+
+  type Level = keyof typeof originals
+
+  const patch = (level: Level) => {
+    console[level] = (...args: unknown[]) => {
+      originals[level](...args)              // always write to stdout
+      const ctx = getActiveTrace()
+      if (ctx) {
+        appendToTrace(ctx.traceId, {
+          level,
+          message: args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '),
+          timestamp: Date.now(),
+        })
+      }
+    }
+  }
+
+  patch('log')
+  patch('info')
+  patch('warn')
+  patch('error')
+  patch('debug')
+}
+
+// ── Public init ──────────────────────────────────────────────────────────────
+
+/**
+ * Call once at engine startup, after the CommandLogStore doc is created.
+ * Patches console and connects the logger to the Automerge doc handle.
+ */
+export const initCommandLogger = (handle: DocHandle<CommandLogStore>): void => {
+  _handle = handle
+  patchConsole()
+}
+
+```
+
+## File: src/utils/ResourceLock.ts
+```typescript
+/**
+ * ResourceLock.ts — per-resource mutual exclusion for long-running operations
+ *
+ * Group P: Concurrent operation safety
+ *
+ * Prevents two operations from mutating the same resource simultaneously.
+ * Resources are identified by string keys (instanceId, diskId, or compound).
+ *
+ * Design:
+ *   - In-memory only — not persisted to the store. Locks are engine-local and
+ *     reset on restart (acceptable: operationDB recovery handles restart cases).
+ *   - acquire() returns false immediately if the resource is locked (non-blocking).
+ *     Callers must check and surface a 409-style error to the operator.
+ *   - All long-running commands (copyApp, moveApp, backupApp, restoreApp) acquire
+ *     locks on their affected resources before starting and release in finally{}.
+ *
+ * Resource key conventions:
+ *   - Instance-level ops: `instance:<instanceId>`
+ *   - Disk-level ops:     `disk:<diskId>`
+ *   - Multi-resource ops (e.g. copyApp): acquire both source and target instance keys
+ */
+
+import { log } from './utils.js'
+import { chalk } from 'zx'
+
+export interface LockInfo {
+    kind: string        // operation kind holding the lock
+    acquiredAt: number  // unix ms
+}
+
+class ResourceLockManager {
+    private locks = new Map<string, LockInfo>()
+
+    /**
+     * Attempt to acquire a lock on `key` for operation `kind`.
+     * Returns true if acquired, false if already locked.
+     */
+    acquire(key: string, kind: string): boolean {
+        if (this.locks.has(key)) {
+            const held = this.locks.get(key)!
+            log(chalk.yellow(`ResourceLock: '${key}' already locked by '${held.kind}' (since ${new Date(held.acquiredAt).toISOString()})`))
+            return false
+        }
+        this.locks.set(key, { kind, acquiredAt: Date.now() })
+        log(`ResourceLock: acquired '${key}' for '${kind}'`)
+        return true
+    }
+
+    /**
+     * Acquire multiple keys atomically (all-or-nothing).
+     * Returns true if all acquired, false if any were already locked.
+     * On failure, no locks are held (rolled back).
+     */
+    acquireAll(keys: string[], kind: string): boolean {
+        const acquired: string[] = []
+        for (const key of keys) {
+            if (!this.acquire(key, kind)) {
+                // Roll back already-acquired keys
+                acquired.forEach(k => this.release(k))
+                return false
+            }
+            acquired.push(key)
+        }
+        return true
+    }
+
+    /**
+     * Release a lock. Safe to call even if the key is not locked.
+     */
+    release(key: string): void {
+        if (this.locks.has(key)) {
+            this.locks.delete(key)
+            log(`ResourceLock: released '${key}'`)
+        }
+    }
+
+    /**
+     * Release multiple keys.
+     */
+    releaseAll(keys: string[]): void {
+        keys.forEach(k => this.release(k))
+    }
+
+    /**
+     * Check if a key is currently locked.
+     */
+    isLocked(key: string): boolean {
+        return this.locks.has(key)
+    }
+
+    /**
+     * Return current lock info for a key, or undefined if unlocked.
+     */
+    getLockInfo(key: string): LockInfo | undefined {
+        return this.locks.get(key)
+    }
+
+    /**
+     * Return all currently held locks (for diagnostics).
+     */
+    allLocks(): Map<string, LockInfo> {
+        return new Map(this.locks)
+    }
+}
+
+// Singleton — one lock manager per engine process
+export const resourceLock = new ResourceLockManager()
+
+// Key helpers
+export const instanceKey = (instanceId: string) => `instance:${instanceId}`
+export const diskKey = (diskId: string) => `disk:${diskId}`
+
+```
+
+## File: src/utils/cliFlags.ts
+```typescript
+/**
+ * Boolean command-line flags for build-engine (idea#146).
+ *
+ * zx's `argv` is minimist without declared booleans, so a flag can arrive as:
+ *   --argon            true
+ *   --no-argon         false
+ *   --argon=false      'false' (a string)
+ *   --argon false      'false' (a string)
+ *   (absent)           undefined
+ *
+ * The old `argv.argon || defaults.argon` could never turn off an option whose
+ * config default is true (argon, gadget). parseBoolFlag uses the flag whenever it
+ * is present and falls back to the default only when it is absent.
+ */
+const TRUE_WORDS = ['true', 'yes', 'on', '1']
+const FALSE_WORDS = ['false', 'no', 'off', '0']
+
+export const parseBoolFlag = (value: unknown, fallback: boolean): boolean => {
+    if (value === undefined || value === null) return fallback
+    if (typeof value === 'boolean') return value
+    if (typeof value === 'number') return value !== 0
+    if (typeof value === 'string') {
+        const v = value.trim().toLowerCase()
+        if (v === '') return true            // `--argon=` counts as present
+        if (TRUE_WORDS.includes(v)) return true
+        if (FALSE_WORDS.includes(v)) return false
+    }
+    // Arrays (flag given twice) and anything else: the last value wins.
+    if (Array.isArray(value) && value.length > 0) return parseBoolFlag(value[value.length - 1], fallback)
+    throw new Error(`Not a boolean flag value: ${JSON.stringify(value)} (use --flag, --no-flag or --flag=true|false)`)
+}
+
+/** Raspberry Pi models build-engine knows about. */
+export type PiModel = 'pi4' | 'pi5'
+
+export const parseModel = (value: unknown): PiModel | undefined => {
+    if (value === undefined || value === null || value === '') return undefined
+    const v = String(value).trim().toLowerCase()
+    if (v === 'pi4' || v === 'pi5') return v
+    throw new Error(`Unknown --model ${JSON.stringify(value)}; expected pi4 or pi5`)
+}
+
+/**
+ * Resolve the gadget setting for a model. USB gadget mode needs the Pi 4's DWC2
+ * USB controller; the Pi 5 has a PCIe USB controller, so gadget mode must stay off.
+ * Asking for it explicitly on a Pi 5 is an error; a config default of true is
+ * silently overridden.
+ */
+export const resolveGadget = (flag: unknown, fallback: boolean, model: PiModel | undefined): boolean => {
+    const gadget = parseBoolFlag(flag, fallback)
+    if (model === 'pi5' && gadget) {
+        if (flag !== undefined && parseBoolFlag(flag, false)) {
+            throw new Error('--gadget is not supported on a Pi 5 (PCIe USB controller); leave it out or pass --no-gadget')
+        }
+        return false
+    }
+    return gadget
+}
+
+```
+
+## File: src/utils/commandUtils.ts
+```typescript
+import { DocHandle } from "@automerge/automerge-repo";
+import { Store } from "../data/Store.js";
+import { Command, EngineID } from "../data/CommonTypes.js";
+import { ArgumentDescriptor, CommandDefinition } from "../data/CommandDefinition.js";
+import { CommandLogStore, addTrace, closeTrace, getCommandLogHandle } from "../data/CommandLogStore.js";
+import { runWithTrace, flushTrace } from "./CommandLogger.js";
+import { print } from './utils.js';
+
+
+export const handleCommand = async (
+    commands: CommandDefinition[],
+    storeHandle: DocHandle<Store> | null,
+    context: 'console' | 'engine',
+    input: string,
+    commandLogHandle?: DocHandle<CommandLogStore> | null
+): Promise<void> => {
+    const trimmedInput = input.trim();
+    const commandName = trimmedInput.split(' ')[0];
+    const command = commands.find(cmd => cmd.name === commandName);
+
+    if (!command) {
+        print(`Unknown command: ${commandName}`);
+        return;
+    }
+
+    // A variadic last arg takes all remaining tokens (see ArgumentDescriptor.variadic)
+    const lastArg = command.args[command.args.length - 1];
+    const isVariadic = lastArg?.variadic === true;
+
+    let stringArgs: string[] = [];
+    // Special case for commands that take the entire rest of the line as a single argument
+    if (command.args.length === 1 && !isVariadic) {
+        const firstSpaceIndex = trimmedInput.indexOf(' ');
+        if (firstSpaceIndex !== -1) {
+            stringArgs.push(trimmedInput.substring(firstSpaceIndex + 1));
+        }
+    } else {
+        stringArgs = trimmedInput.split(' ').slice(1).filter(arg => arg.length > 0);
+    }
+
+    // Scope checking
+    if (context === 'console' && command.scope === 'engine') {
+        print(`Error: Command '${commandName}' can only be executed on an engine. Use 'send <engineId> ${commandName} ...' to execute it remotely.`);
+        return;
+    }
+
+    if (context === 'engine' && command.scope === 'console') {
+        print(`Error: Command '${commandName}' can only be executed on a console.`);
+        return;
+    }
+
+    let args: any[];
+    try {
+        args = stringArgs.map((arg, index) => {
+            const descriptor = isVariadic && index >= command.args.length - 1 ? lastArg : command.args[index];
+            if (!descriptor) throw new Error("Too many arguments");
+            return convertToType(arg, descriptor);
+        });
+        // An optional variadic last arg may take zero tokens (idea#128)
+        const required = isVariadic && lastArg.optional ? command.args.length - 1 : command.args.length;
+        if (args.length < required) throw new Error("Insufficient arguments");
+    } catch (error: any) {
+        console.error(`Error: ${error.message}`);
+        return;
+    }
+
+    // ── Trace setup ──────────────────────────────────────────────────────────
+    const traceId = crypto.randomUUID();
+    // Build a named args object when the CommandDefinition has arg names defined,
+    // otherwise fall back to a positional array. The Console filters traces by
+    // args['instanceName'] or args['instanceId'], so named args are required.
+    // A variadic last arg is recorded as an array of all its tokens.
+    const namedArgs: Record<string, string | string[] | null> | string[] =
+        command.args.every(a => a.name)
+            ? Object.fromEntries(command.args.map((a, i) =>
+                [a.name!, a.variadic ? stringArgs.slice(i) : stringArgs[i] ?? null]))
+            : stringArgs
+    const argsJson = JSON.stringify(namedArgs);
+    const traceCtx = { traceId, command: commandName, args: argsJson };
+
+    if (commandLogHandle) {
+        addTrace(commandLogHandle, {
+            traceId,
+            command: commandName,
+            args: argsJson,
+            startedAt: Date.now(),
+            completedAt: null,
+            status: 'running',
+            errorMessage: null,
+        });
+    }
+
+    // ── Execute inside trace context ─────────────────────────────────────────
+    try {
+        await runWithTrace(traceCtx, async () => { await command.execute(storeHandle, ...args); });
+        if (commandLogHandle) {
+            await flushTrace(traceId);
+            closeTrace(commandLogHandle, traceId, 'ok');
+        }
+    } catch (error: any) {
+        console.error(`Error: ${error.message}`);
+        if (commandLogHandle) {
+            await flushTrace(traceId);
+            closeTrace(commandLogHandle, traceId, 'error', error.message);
+        }
+    }
+}
+
+
+/**
+ * A dependency-free utility to add a command to a specific engine's command array in the store.
+ * This is used by tests and the 'send' command definition.
+ */
+export const sendCommand = (storeHandle: DocHandle<Store>, engineId: EngineID, command: Command): void => {
+    print(`Sending command '${command}' to engine ${engineId}`);
+
+    const store = storeHandle.doc();
+    if (!store?.engineDB[engineId]) {
+        console.error(`Cannot send command: Engine ${engineId} not found in store.`);
+        return;
+    }
+
+    // Trace the dispatch on the originating engine so the Console shows
+    // cross-engine commands in history (e.g. copyApp dispatching startInstance
+    // to a remote engine). This is a one-shot trace with no log lines.
+    const cmdLogHandle = getCommandLogHandle()
+    if (cmdLogHandle) {
+        const commandName = String(command).split(' ')[0]
+        const traceId = crypto.randomUUID()
+        addTrace(cmdLogHandle, {
+            traceId,
+            command: commandName,
+            args: JSON.stringify({ dispatchedTo: engineId, command: String(command) }),
+            startedAt: Date.now(),
+            completedAt: Date.now(),
+            status: 'running',
+            errorMessage: null,
+        })
+        closeTrace(cmdLogHandle, traceId, 'ok')
+    }
+
+    storeHandle.change(doc => {
+        const engine = doc.engineDB[engineId];
+        if (engine) {
+            engine.commands.push(command);
+        }
+    });
+}
+const convertToType = (str: string, descriptor: ArgumentDescriptor): any => {
+    switch (descriptor.type) {
+        case "number":
+            const num = parseFloat(str);
+            if (isNaN(num)) throw new Error("Cannot convert to number");
+            return num;
+        case "string":
+            return str;
+        case "object":
+            if (!descriptor.objectSpec) throw new Error("Object specification is missing");
+            try {
+                const obj = JSON.parse(str);
+                for (const [key, fieldSpec] of Object.entries(descriptor.objectSpec)) {
+                    if (!(key in obj)) throw new Error(`Missing key '${key}' in object`);
+                    switch (fieldSpec.type) {
+                        case 'number':
+                            const value = parseFloat(obj[key]);
+                            if (isNaN(value)) throw new Error(`Key '${key}' is not a valid number`);
+                            obj[key] = value;
+                            break;
+                        case 'string':
+                            if (typeof obj[key] !== 'string') throw new Error(`Key '${key}' is not a valid string`);
+                            break;
+                    }
+                }
+                return obj;
+            } catch {
+                throw new Error("Cannot convert to object");
+            }
+        default:
+            throw new Error("Unsupported type");
+    }
+}
+
+```
+
+## File: src/utils/nameGenerator.ts
+```typescript
+import util from 'util';
+import { Hostname } from '../data/CommonTypes.js';
+
+// Docker-style name generation
+// Inspired by
+// - https://github.com/moby/moby/blob/39f7b2b6d0156811d9683c6cb0743118ae516a11/pkg/namesgenerator/names-generator.go#L852-L863 
+// - https://github.com/subfuzion/docker-namesgenerator/blob/master/namesgenerator.js
+  
+  const adjectives = [
+    "admiring",
+          "adoring",
+          "affectionate",
+          "agitated",
+          "amazing",
+          "angry",
+          "awesome",
+          "beautiful",
+          "blissful",
+          "bold",
+          "boring",
+          "brave",
+          "busy",
+          "charming",
+          "clever",
+          "cool",
+          "compassionate",
+          "competent",
+          "condescending",
+          "confident",
+          "cranky",
+          "crazy",
+          "dazzling",
+          "determined",
+          "distracted",
+          "dreamy",
+          "eager",
+          "ecstatic",
+          "elastic",
+          "elated",
+          "elegant",
+          "eloquent",
+          "epic",
+          "exciting",
+          "fervent",
+          "festive",
+          "flamboyant",
+          "focused",
+          "friendly",
+          "frosty",
+          "funny",
+          "gallant",
+          "gifted",
+          "goofy",
+          "gracious",
+          "great",
+          "happy",
+          "hardcore",
+          "heuristic",
+          "hopeful",
+          "hungry",
+          "infallible",
+          "inspiring",
+          "intelligent",
+          "interesting",
+          "jolly",
+          "jovial",
+          "keen",
+          "kind",
+          "laughing",
+          "loving",
+          "lucid",
+          "magical",
+          "mystifying",
+          "modest",
+          "musing",
+          "naughty",
+          "nervous",
+          "nice",
+          "nifty",
+          "nostalgic",
+          "objective",
+          "optimistic",
+          "peaceful",
+          "pedantic",
+          "pensive",
+          "practical",
+          "priceless",
+          "quirky",
+          "quizzical",
+          "recursing",
+          "relaxed",
+          "reverent",
+          "romantic",
+          "sad",
+          "serene",
+          "sharp",
+          "silly",
+          "sleepy",
+          "stoic",
+          "strange",
+          "stupefied",
+          "suspicious",
+          "sweet",
+          "tender",
+          "thirsty",
+          "trusting",
+          "unruffled",
+          "upbeat",
+          "vibrant",
+          "vigilant",
+          "vigorous",
+          "wizardly",
+          "wonderful",
+          "xenodochial",
+          "youthful",
+          "zealous",
+          "zen",
+  ]
+  
+  const scientists = [
+    // Maria Gaetana Agnesi - Italian mathematician, philosopher, theologian and humanitarian. She was the first woman to write a mathematics handbook and the first woman appointed as a Mathematics Professor at a University. https://en.wikipedia.org/wiki/Maria_Gaetana_Agnesi
+    "agnesi",
+  
+    // Muhammad ibn Jābir al-Ḥarrānī al-Battānī was a founding father of astronomy. https://en.wikipedia.org/wiki/Mu%E1%B8%A5ammad_ibn_J%C4%81bir_al-%E1%B8%A4arr%C4%81n%C4%AB_al-Batt%C4%81n%C4%AB
+    "albattani",
+  
+    // Frances E. Allen, became the first female IBM Fellow in 1989. In 2006, she became the first female recipient of the ACM's Turing Award. https://en.wikipedia.org/wiki/Frances_E._Allen
+    "allen",
+  
+    // June Almeida - Scottish virologist who took the first pictures of the rubella virus - https://en.wikipedia.org/wiki/June_Almeida
+    "almeida",
+  
+    // Kathleen Antonelli, American computer programmer and one of the six original programmers of the ENIAC - https://en.wikipedia.org/wiki/Kathleen_Antonelli
+    "antonelli",
+  
+    // Archimedes was a physicist, engineer and mathematician who invented too many things to list them here. https://en.wikipedia.org/wiki/Archimedes
+    "archimedes",
+  
+    // Maria Ardinghelli - Italian translator, mathematician and physicist - https://en.wikipedia.org/wiki/Maria_Ardinghelli
+    "ardinghelli",
+  
+    // Aryabhata - Ancient Indian mathematician-astronomer during 476-550 CE https://en.wikipedia.org/wiki/Aryabhata
+    "aryabhata",
+  
+    // Wanda Austin - Wanda Austin is the President and CEO of The Aerospace Corporation, a leading architect for the US security space programs. https://en.wikipedia.org/wiki/Wanda_Austin
+    "austin",
+  
+    // Charles Babbage invented the concept of a programmable computer. https://en.wikipedia.org/wiki/Charles_Babbage.
+    "babbage",
+  
+    // Stefan Banach - Polish mathematician, was one of the founders of modern functional analysis. https://en.wikipedia.org/wiki/Stefan_Banach
+    "banach",
+  
+    // Buckaroo Banzai and his mentor Dr. Hikita perfected the "oscillation overthruster", a device that allows one to pass through solid matter. - https://en.wikipedia.org/wiki/The_Adventures_of_Buckaroo_Banzai_Across_the_8th_Dimension
+    "banzai",
+  
+    // John Bardeen co-invented the transistor - https://en.wikipedia.org/wiki/John_Bardeen
+    "bardeen",
+  
+    // Jean Bartik, born Betty Jean Jennings, was one of the original programmers for the ENIAC computer. https://en.wikipedia.org/wiki/Jean_Bartik
+    "bartik",
+  
+    // Laura Bassi, the world's first female professor https://en.wikipedia.org/wiki/Laura_Bassi
+    "bassi",
+  
+    // Hugh Beaver, British engineer, founder of the Guinness Book of World Records https://en.wikipedia.org/wiki/Hugh_Beaver
+    "beaver",
+  
+    // Alexander Graham Bell - an eminent Scottish-born scientist, inventor, engineer and innovator who is credited with inventing the first practical telephone - https://en.wikipedia.org/wiki/Alexander_Graham_Bell
+    "bell",
+  
+    // Karl Friedrich Benz - a German automobile engineer. Inventor of the first practical motorcar. https://en.wikipedia.org/wiki/Karl_Benz
+    "benz",
+  
+    // Homi J Bhabha - was an Indian nuclear physicist, founding director, and professor of physics at the Tata Institute of Fundamental Research. Colloquially known as "father of Indian nuclear programme"- https://en.wikipedia.org/wiki/Homi_J._Bhabha
+    "bhabha",
+  
+    // Bhaskara II - Ancient Indian mathematician-astronomer whose work on calculus predates Newton and Leibniz by over half a millennium - https://en.wikipedia.org/wiki/Bh%C4%81skara_II#Calculus
+    "bhaskara",
+  
+    // Sue Black - British computer scientist and campaigner. She has been instrumental in saving Bletchley Park, the site of World War II codebreaking - https://en.wikipedia.org/wiki/Sue_Black_(computer_scientist)
+    "black",
+  
+    // Elizabeth Helen Blackburn - Australian-American Nobel laureate; best known for co-discovering telomerase. https://en.wikipedia.org/wiki/Elizabeth_Blackburn
+    "blackburn",
+  
+    // Elizabeth Blackwell - American doctor and first American woman to receive a medical degree - https://en.wikipedia.org/wiki/Elizabeth_Blackwell
+    "blackwell",
+  
+    // Niels Bohr is the father of quantum theory. https://en.wikipedia.org/wiki/Niels_Bohr.
+    "bohr",
+  
+    // Kathleen Booth, she's credited with writing the first assembly language. https://en.wikipedia.org/wiki/Kathleen_Booth
+    "booth",
+  
+    // Anita Borg - Anita Borg was the founding director of the Institute for Women and Technology (IWT). https://en.wikipedia.org/wiki/Anita_Borg
+    "borg",
+  
+    // Satyendra Nath Bose - He provided the foundation for Bose–Einstein statistics and the theory of the Bose–Einstein condensate. - https://en.wikipedia.org/wiki/Satyendra_Nath_Bose
+    "bose",
+  
+    // Katherine Louise Bouman is an imaging scientist and Assistant Professor of Computer Science at the California Institute of Technology. She researches computational methods for imaging, and developed an algorithm that made possible the picture first visualization of a black hole using the Event Horizon Telescope. - https://en.wikipedia.org/wiki/Katie_Bouman
+    "bouman",
+  
+    // Evelyn Boyd Granville - She was one of the first African-American woman to receive a Ph.D. in mathematics; she earned it in 1949 from Yale University. https://en.wikipedia.org/wiki/Evelyn_Boyd_Granville
+    "boyd",
+  
+    // Brahmagupta - Ancient Indian mathematician during 598-670 CE who gave rules to compute with zero - https://en.wikipedia.org/wiki/Brahmagupta#Zero
+    "brahmagupta",
+  
+    // Walter Houser Brattain co-invented the transistor - https://en.wikipedia.org/wiki/Walter_Houser_Brattain
+    "brattain",
+  
+    // Emmett Brown invented time travel. https://en.wikipedia.org/wiki/Emmett_Brown (thanks Brian Goff)
+    "brown",
+  
+    // Linda Brown Buck - American biologist and Nobel laureate best known for her genetic and molecular analyses of the mechanisms of smell. https://en.wikipedia.org/wiki/Linda_B._Buck
+    "buck",
+  
+    // Dame Susan Jocelyn Bell Burnell - Northern Irish astrophysicist who discovered radio pulsars and was the first to analyse them. https://en.wikipedia.org/wiki/Jocelyn_Bell_Burnell
+    "burnell",
+  
+    // Annie Jump Cannon - pioneering female astronomer who classified hundreds of thousands of stars and created the system we use to understand stars today. https://en.wikipedia.org/wiki/Annie_Jump_Cannon
+    "cannon",
+  
+    // Rachel Carson - American marine biologist and conservationist, her book Silent Spring and other writings are credited with advancing the global environmental movement. https://en.wikipedia.org/wiki/Rachel_Carson
+    "carson",
+  
+    // Dame Mary Lucy Cartwright - British mathematician who was one of the first to study what is now known as chaos theory. Also known for Cartwright's theorem which finds applications in signal processing. https://en.wikipedia.org/wiki/Mary_Cartwright
+    "cartwright",
+  
+    // George Washington Carver - American agricultural scientist and inventor. He was the most prominent black scientist of the early 20th century. https://en.wikipedia.org/wiki/George_Washington_Carver
+    "carver",
+  
+    // Vinton Gray Cerf - American Internet pioneer, recognised as one of "the fathers of the Internet". With Robert Elliot Kahn, he designed TCP and IP, the primary data communication protocols of the Internet and other computer networks. https://en.wikipedia.org/wiki/Vint_Cerf
+    "cerf",
+  
+    // Subrahmanyan Chandrasekhar - Astrophysicist known for his mathematical theory on different stages and evolution in structures of the stars. He has won nobel prize for physics - https://en.wikipedia.org/wiki/Subrahmanyan_Chandrasekhar
+    "chandrasekhar",
+  
+    // Sergey Alexeyevich Chaplygin (Russian: Серге́й Алексе́евич Чаплы́гин; April 5, 1869 – October 8, 1942) was a Russian and Soviet physicist, mathematician, and mechanical engineer. He is known for mathematical formulas such as Chaplygin's equation and for a hypothetical substance in cosmology called Chaplygin gas, named after him. https://en.wikipedia.org/wiki/Sergey_Chaplygin
+    "chaplygin",
+  
+    // Émilie du Châtelet - French natural philosopher, mathematician, physicist, and author during the early 1730s, known for her translation of and commentary on Isaac Newton's book Principia containing basic laws of physics. https://en.wikipedia.org/wiki/%C3%89milie_du_Ch%C3%A2telet
+    "chatelet",
+  
+    // Asima Chatterjee was an Indian organic chemist noted for her research on vinca alkaloids, development of drugs for treatment of epilepsy and malaria - https://en.wikipedia.org/wiki/Asima_Chatterjee
+    "chatterjee",
+  
+    // David Lee Chaum - American computer scientist and cryptographer. Known for his seminal contributions in the field of anonymous communication. https://en.wikipedia.org/wiki/David_Chaum
+    "chaum",
+  
+    // Pafnuty Chebyshev - Russian mathematician. He is known fo his works on probability, statistics, mechanics, analytical geometry and number theory https://en.wikipedia.org/wiki/Pafnuty_Chebyshev
+    "chebyshev",
+  
+    // Joan Clarke - Bletchley Park code breaker during the Second World War who pioneered techniques that remained top secret for decades. Also an accomplished numismatist https://en.wikipedia.org/wiki/Joan_Clarke
+    "clarke",
+  
+    // Bram Cohen - American computer programmer and author of the BitTorrent peer-to-peer protocol. https://en.wikipedia.org/wiki/Bram_Cohen
+    "cohen",
+  
+    // Jane Colden - American botanist widely considered the first female American botanist - https://en.wikipedia.org/wiki/Jane_Colden
+    "colden",
+  
+    // Gerty Theresa Cori - American biochemist who became the third woman—and first American woman—to win a Nobel Prize in science, and the first woman to be awarded the Nobel Prize in Physiology or Medicine. Cori was born in Prague. https://en.wikipedia.org/wiki/Gerty_Cori
+    "cori",
+  
+    // Seymour Roger Cray was an American electrical engineer and supercomputer architect who designed a series of computers that were the fastest in the world for decades. https://en.wikipedia.org/wiki/Seymour_Cray
+    "cray",
+  
+    // This entry reflects a husband and wife team who worked together:
+    // Joan Curran was a Welsh scientist who developed radar and invented chaff, a radar countermeasure. https://en.wikipedia.org/wiki/Joan_Curran
+    // Samuel Curran was an Irish physicist who worked alongside his wife during WWII and invented the proximity fuse. https://en.wikipedia.org/wiki/Samuel_Curran
+    "curran",
+  
+    // Marie Curie discovered radioactivity. https://en.wikipedia.org/wiki/Marie_Curie.
+    "curie",
+  
+    // Charles Darwin established the principles of natural evolution. https://en.wikipedia.org/wiki/Charles_Darwin.
+    "darwin",
+  
+    // Leonardo Da Vinci invented too many things to list here. https://en.wikipedia.org/wiki/Leonardo_da_Vinci.
+    "davinci",
+  
+    // A. K. (Alexander Keewatin) Dewdney, Canadian mathematician, computer scientist, author and filmmaker. Contributor to Scientific American's "Computer Recreations" from 1984 to 1991. Author of Core War (program), The Planiverse, The Armchair Universe, The Magic Machine, The New Turing Omnibus, and more. https://en.wikipedia.org/wiki/Alexander_Dewdney
+    "dewdney",
+  
+    // Satish Dhawan - Indian mathematician and aerospace engineer, known for leading the successful and indigenous development of the Indian space programme. https://en.wikipedia.org/wiki/Satish_Dhawan
+    "dhawan",
+  
+    // Bailey Whitfield Diffie - American cryptographer and one of the pioneers of public-key cryptography. https://en.wikipedia.org/wiki/Whitfield_Diffie
+    "diffie",
+  
+    // Edsger Wybe Dijkstra was a Dutch computer scientist and mathematical scientist. https://en.wikipedia.org/wiki/Edsger_W._Dijkstra.
+    "dijkstra",
+  
+    // Paul Adrien Maurice Dirac - English theoretical physicist who made fundamental contributions to the early development of both quantum mechanics and quantum electrodynamics. https://en.wikipedia.org/wiki/Paul_Dirac
+    "dirac",
+  
+    // Agnes Meyer Driscoll - American cryptanalyst during World Wars I and II who successfully cryptanalysed a number of Japanese ciphers. She was also the co-developer of one of the cipher machines of the US Navy, the CM. https://en.wikipedia.org/wiki/Agnes_Meyer_Driscoll
+    "driscoll",
+  
+    // Donna Dubinsky - played an integral role in the development of personal digital assistants (PDAs) serving as CEO of Palm, Inc. and co-founding Handspring. https://en.wikipedia.org/wiki/Donna_Dubinsky
+    "dubinsky",
+  
+    // Annie Easley - She was a leading member of the team which developed software for the Centaur rocket stage and one of the first African-Americans in her field. https://en.wikipedia.org/wiki/Annie_Easley
+    "easley",
+  
+    // Thomas Alva Edison, prolific inventor https://en.wikipedia.org/wiki/Thomas_Edison
+    "edison",
+  
+    // Albert Einstein invented the general theory of relativity. https://en.wikipedia.org/wiki/Albert_Einstein
+    "einstein",
+  
+    // Alexandra Asanovna Elbakyan (Russian: Алекса́ндра Аса́новна Элбакя́н) is a Kazakhstani graduate student, computer programmer, internet pirate in hiding, and the creator of the site Sci-Hub. Nature has listed her in 2016 in the top ten people that mattered in science, and Ars Technica has compared her to Aaron Swartz. - https://en.wikipedia.org/wiki/Alexandra_Elbakyan
+    "elbakyan",
+  
+    // Taher A. ElGamal - Egyptian cryptographer best known for the ElGamal discrete log cryptosystem and the ElGamal digital signature scheme. https://en.wikipedia.org/wiki/Taher_Elgamal
+    "elgamal",
+  
+    // Gertrude Elion - American biochemist, pharmacologist and the 1988 recipient of the Nobel Prize in Medicine - https://en.wikipedia.org/wiki/Gertrude_Elion
+    "elion",
+  
+    // James Henry Ellis - British engineer and cryptographer employed by the GCHQ. Best known for conceiving for the first time, the idea of public-key cryptography. https://en.wikipedia.org/wiki/James_H._Ellis
+    "ellis",
+  
+    // Douglas Engelbart gave the mother of all demos: https://en.wikipedia.org/wiki/Douglas_Engelbart
+    "engelbart",
+  
+    // Euclid invented geometry. https://en.wikipedia.org/wiki/Euclid
+    "euclid",
+  
+    // Leonhard Euler invented large parts of modern mathematics. https://de.wikipedia.org/wiki/Leonhard_Euler
+    "euler",
+  
+    // Michael Faraday - British scientist who contributed to the study of electromagnetism and electrochemistry. https://en.wikipedia.org/wiki/Michael_Faraday
+    "faraday",
+  
+    // Horst Feistel - German-born American cryptographer who was one of the earliest non-government researchers to study the design and theory of block ciphers. Co-developer of DES and Lucifer. Feistel networks, a symmetric structure used in the construction of block ciphers are named after him. https://en.wikipedia.org/wiki/Horst_Feistel
+    "feistel",
+  
+    // Pierre de Fermat pioneered several aspects of modern mathematics. https://en.wikipedia.org/wiki/Pierre_de_Fermat
+    "fermat",
+  
+    // Enrico Fermi invented the first nuclear reactor. https://en.wikipedia.org/wiki/Enrico_Fermi.
+    "fermi",
+  
+    // Richard Feynman was a key contributor to quantum mechanics and particle physics. https://en.wikipedia.org/wiki/Richard_Feynman
+    "feynman",
+  
+    // Benjamin Franklin is famous for his experiments in electricity and the invention of the lightning rod.
+    "franklin",
+  
+    // Yuri Alekseyevich Gagarin - Soviet pilot and cosmonaut, best known as the first human to journey into outer space. https://en.wikipedia.org/wiki/Yuri_Gagarin
+    "gagarin",
+  
+    // Galileo was a founding father of modern astronomy, and faced politics and obscurantism to establish scientific truth.  https://en.wikipedia.org/wiki/Galileo_Galilei
+    "galileo",
+  
+    // Évariste Galois - French mathematician whose work laid the foundations of Galois theory and group theory, two major branches of abstract algebra, and the subfield of Galois connections, all while still in his late teens. https://en.wikipedia.org/wiki/%C3%89variste_Galois
+    "galois",
+  
+    // Kadambini Ganguly - Indian physician, known for being the first South Asian female physician, trained in western medicine, to graduate in South Asia. https://en.wikipedia.org/wiki/Kadambini_Ganguly
+    "ganguly",
+  
+    // William Henry "Bill" Gates III is an American business magnate, philanthropist, investor, computer programmer, and inventor. https://en.wikipedia.org/wiki/Bill_Gates
+    "gates",
+  
+    // Johann Carl Friedrich Gauss - German mathematician who made significant contributions to many fields, including number theory, algebra, statistics, analysis, differential geometry, geodesy, geophysics, mechanics, electrostatics, magnetic fields, astronomy, matrix theory, and optics. https://en.wikipedia.org/wiki/Carl_Friedrich_Gauss
+    "gauss",
+  
+    // Marie-Sophie Germain - French mathematician, physicist and philosopher. Known for her work on elasticity theory, number theory and philosophy. https://en.wikipedia.org/wiki/Sophie_Germain
+    "germain",
+  
+    // Adele Goldberg, was one of the designers and developers of the Smalltalk language. https://en.wikipedia.org/wiki/Adele_Goldberg_(computer_scientist)
+    "goldberg",
+  
+    // Adele Goldstine, born Adele Katz, wrote the complete technical description for the first electronic digital computer, ENIAC. https://en.wikipedia.org/wiki/Adele_Goldstine
+    "goldstine",
+  
+    // Shafi Goldwasser is a computer scientist known for creating theoretical foundations of modern cryptography. Winner of 2012 ACM Turing Award. https://en.wikipedia.org/wiki/Shafi_Goldwasser
+    "goldwasser",
+  
+    // James Golick, all around gangster.
+    "golick",
+  
+    // Jane Goodall - British primatologist, ethologist, and anthropologist who is considered to be the world's foremost expert on chimpanzees - https://en.wikipedia.org/wiki/Jane_Goodall
+    "goodall",
+  
+    // Stephen Jay Gould was was an American paleontologist, evolutionary biologist, and historian of science. He is most famous for the theory of punctuated equilibrium - https://en.wikipedia.org/wiki/Stephen_Jay_Gould
+    "gould",
+  
+    // Carolyn Widney Greider - American molecular biologist and joint winner of the 2009 Nobel Prize for Physiology or Medicine for the discovery of telomerase. https://en.wikipedia.org/wiki/Carol_W._Greider
+    "greider",
+  
+    // Alexander Grothendieck - German-born French mathematician who became a leading figure in the creation of modern algebraic geometry. https://en.wikipedia.org/wiki/Alexander_Grothendieck
+    "grothendieck",
+  
+    // Lois Haibt - American computer scientist, part of the team at IBM that developed FORTRAN - https://en.wikipedia.org/wiki/Lois_Haibt
+    "haibt",
+  
+    // Margaret Hamilton - Director of the Software Engineering Division of the MIT Instrumentation Laboratory, which developed on-board flight software for the Apollo space program. https://en.wikipedia.org/wiki/Margaret_Hamilton_(scientist)
+    "hamilton",
+  
+    // Caroline Harriet Haslett - English electrical engineer, electricity industry administrator and champion of women's rights. Co-author of British Standard 1363 that specifies AC power plugs and sockets used across the United Kingdom (which is widely considered as one of the safest designs). https://en.wikipedia.org/wiki/Caroline_Haslett
+    "haslett",
+  
+    // Stephen Hawking pioneered the field of cosmology by combining general relativity and quantum mechanics. https://en.wikipedia.org/wiki/Stephen_Hawking
+    "hawking",
+  
+    // Martin Edward Hellman - American cryptologist, best known for his invention of public-key cryptography in co-operation with Whitfield Diffie and Ralph Merkle. https://en.wikipedia.org/wiki/Martin_Hellman
+    "hellman",
+  
+    // Werner Heisenberg was a founding father of quantum mechanics. https://en.wikipedia.org/wiki/Werner_Heisenberg
+    "heisenberg",
+  
+    // Grete Hermann was a German philosopher noted for her philosophical work on the foundations of quantum mechanics. https://en.wikipedia.org/wiki/Grete_Hermann
+    "hermann",
+  
+    // Caroline Lucretia Herschel - German astronomer and discoverer of several comets. https://en.wikipedia.org/wiki/Caroline_Herschel
+    "herschel",
+  
+    // Heinrich Rudolf Hertz - German physicist who first conclusively proved the existence of the electromagnetic waves. https://en.wikipedia.org/wiki/Heinrich_Hertz
+    "hertz",
+  
+    // Jaroslav Heyrovský was the inventor of the polarographic method, father of the electroanalytical method, and recipient of the Nobel Prize in 1959. His main field of work was polarography. https://en.wikipedia.org/wiki/Jaroslav_Heyrovsk%C3%BD
+    "heyrovsky",
+  
+    // Dorothy Hodgkin was a British biochemist, credited with the development of protein crystallography. She was awarded the Nobel Prize in Chemistry in 1964. https://en.wikipedia.org/wiki/Dorothy_Hodgkin
+    "hodgkin",
+  
+    // Douglas R. Hofstadter is an American professor of cognitive science and author of the Pulitzer Prize and American Book Award-winning work Goedel, Escher, Bach: An Eternal Golden Braid in 1979. A mind-bending work which coined Hofstadter's Law: "It always takes longer than you expect, even when you take into account Hofstadter's Law." https://en.wikipedia.org/wiki/Douglas_Hofstadter
+    "hofstadter",
+  
+    // Erna Schneider Hoover revolutionized modern communication by inventing a computerized telephone switching method. https://en.wikipedia.org/wiki/Erna_Schneider_Hoover
+    "hoover",
+  
+    // Grace Hopper developed the first compiler for a computer programming language and  is credited with popularizing the term "debugging" for fixing computer glitches. https://en.wikipedia.org/wiki/Grace_Hopper
+    "hopper",
+  
+    // Frances Hugle, she was an American scientist, engineer, and inventor who contributed to the understanding of semiconductors, integrated circuitry, and the unique electrical principles of microscopic materials. https://en.wikipedia.org/wiki/Frances_Hugle
+    "hugle",
+  
+    // Hypatia - Greek Alexandrine Neoplatonist philosopher in Egypt who was one of the earliest mothers of mathematics - https://en.wikipedia.org/wiki/Hypatia
+    "hypatia",
+  
+    // Teruko Ishizaka - Japanese scientist and immunologist who co-discovered the antibody class Immunoglobulin E. https://en.wikipedia.org/wiki/Teruko_Ishizaka
+    "ishizaka",
+  
+    // Mary Jackson, American mathematician and aerospace engineer who earned the highest title within NASA's engineering department - https://en.wikipedia.org/wiki/Mary_Jackson_(engineer)
+    "jackson",
+  
+    // Yeong-Sil Jang was a Korean scientist and astronomer during the Joseon Dynasty; he invented the first metal printing press and water gauge. https://en.wikipedia.org/wiki/Jang_Yeong-sil
+    "jang",
+  
+    // Mae Carol Jemison -  is an American engineer, physician, and former NASA astronaut. She became the first black woman to travel in space when she served as a mission specialist aboard the Space Shuttle Endeavour - https://en.wikipedia.org/wiki/Mae_Jemison
+    "jemison",
+  
+    // Betty Jennings - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Jean_Bartik
+    "jennings",
+  
+    // Mary Lou Jepsen, was the founder and chief technology officer of One Laptop Per Child (OLPC), and the founder of Pixel Qi. https://en.wikipedia.org/wiki/Mary_Lou_Jepsen
+    "jepsen",
+  
+    // Katherine Coleman Goble Johnson - American physicist and mathematician contributed to the NASA. https://en.wikipedia.org/wiki/Katherine_Johnson
+    "johnson",
+  
+    // Irène Joliot-Curie - French scientist who was awarded the Nobel Prize for Chemistry in 1935. Daughter of Marie and Pierre Curie. https://en.wikipedia.org/wiki/Ir%C3%A8ne_Joliot-Curie
+    "joliot",
+  
+    // Karen Spärck Jones came up with the concept of inverse document frequency, which is used in most search engines today. https://en.wikipedia.org/wiki/Karen_Sp%C3%A4rck_Jones
+    "jones",
+  
+    // A. P. J. Abdul Kalam - is an Indian scientist aka Missile Man of India for his work on the development of ballistic missile and launch vehicle technology - https://en.wikipedia.org/wiki/A._P._J._Abdul_Kalam
+    "kalam",
+  
+    // Sergey Petrovich Kapitsa (Russian: Серге́й Петро́вич Капи́ца; 14 February 1928 – 14 August 2012) was a Russian physicist and demographer. He was best known as host of the popular and long-running Russian scientific TV show, Evident, but Incredible. His father was the Nobel laureate Soviet-era physicist Pyotr Kapitsa, and his brother was the geographer and Antarctic explorer Andrey Kapitsa. - https://en.wikipedia.org/wiki/Sergey_Kapitsa
+    "kapitsa",
+  
+    // Susan Kare, created the icons and many of the interface elements for the original Apple Macintosh in the 1980s, and was an original employee of NeXT, working as the Creative Director. https://en.wikipedia.org/wiki/Susan_Kare
+    "kare",
+  
+    // Mstislav Keldysh - a Soviet scientist in the field of mathematics and mechanics, academician of the USSR Academy of Sciences (1946), President of the USSR Academy of Sciences (1961–1975), three times Hero of Socialist Labor (1956, 1961, 1971), fellow of the Royal Society of Edinburgh (1968). https://en.wikipedia.org/wiki/Mstislav_Keldysh
+    "keldysh",
+  
+    // Mary Kenneth Keller, Sister Mary Kenneth Keller became the first American woman to earn a PhD in Computer Science in 1965. https://en.wikipedia.org/wiki/Mary_Kenneth_Keller
+    "keller",
+  
+    // Johannes Kepler, German astronomer known for his three laws of planetary motion - https://en.wikipedia.org/wiki/Johannes_Kepler
+    "kepler",
+  
+    // Omar Khayyam - Persian mathematician, astronomer and poet. Known for his work on the classification and solution of cubic equations, for his contribution to the understanding of Euclid's fifth postulate and for computing the length of a year very accurately. https://en.wikipedia.org/wiki/Omar_Khayyam
+    "khayyam",
+  
+    // Har Gobind Khorana - Indian-American biochemist who shared the 1968 Nobel Prize for Physiology - https://en.wikipedia.org/wiki/Har_Gobind_Khorana
+    "khorana",
+  
+    // Jack Kilby invented silicon integrated circuits and gave Silicon Valley its name. - https://en.wikipedia.org/wiki/Jack_Kilby
+    "kilby",
+  
+    // Maria Kirch - German astronomer and first woman to discover a comet - https://en.wikipedia.org/wiki/Maria_Margarethe_Kirch
+    "kirch",
+  
+    // Donald Knuth - American computer scientist, author of "The Art of Computer Programming" and creator of the TeX typesetting system. https://en.wikipedia.org/wiki/Donald_Knuth
+    "knuth",
+  
+    // Sophie Kowalevski - Russian mathematician responsible for important original contributions to analysis, differential equations and mechanics - https://en.wikipedia.org/wiki/Sofia_Kovalevskaya
+    "kowalevski",
+  
+    // Marie-Jeanne de Lalande - French astronomer, mathematician and cataloguer of stars - https://en.wikipedia.org/wiki/Marie-Jeanne_de_Lalande
+    "lalande",
+  
+    // Hedy Lamarr - Actress and inventor. The principles of her work are now incorporated into modern Wi-Fi, CDMA and Bluetooth technology. https://en.wikipedia.org/wiki/Hedy_Lamarr
+    "lamarr",
+  
+    // Leslie B. Lamport - American computer scientist. Lamport is best known for his seminal work in distributed systems and was the winner of the 2013 Turing Award. https://en.wikipedia.org/wiki/Leslie_Lamport
+    "lamport",
+  
+    // Mary Leakey - British paleoanthropologist who discovered the first fossilized Proconsul skull - https://en.wikipedia.org/wiki/Mary_Leakey
+    "leakey",
+  
+    // Henrietta Swan Leavitt - she was an American astronomer who discovered the relation between the luminosity and the period of Cepheid variable stars. https://en.wikipedia.org/wiki/Henrietta_Swan_Leavitt
+    "leavitt",
+  
+    // Esther Miriam Zimmer Lederberg - American microbiologist and a pioneer of bacterial genetics. https://en.wikipedia.org/wiki/Esther_Lederberg
+    "lederberg",
+  
+    // Inge Lehmann - Danish seismologist and geophysicist. Known for discovering in 1936 that the Earth has a solid inner core inside a molten outer core. https://en.wikipedia.org/wiki/Inge_Lehmann
+    "lehmann",
+  
+    // Daniel Lewin - Mathematician, Akamai co-founder, soldier, 9/11 victim-- Developed optimization techniques for routing traffic on the internet. Died attempting to stop the 9-11 hijackers. https://en.wikipedia.org/wiki/Daniel_Lewin
+    "lewin",
+  
+    // Ruth Lichterman - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Ruth_Teitelbaum
+    "lichterman",
+  
+    // Barbara Liskov - co-developed the Liskov substitution principle. Liskov was also the winner of the Turing Prize in 2008. - https://en.wikipedia.org/wiki/Barbara_Liskov
+    "liskov",
+  
+    // Ada Lovelace invented the first algorithm. https://en.wikipedia.org/wiki/Ada_Lovelace (thanks James Turnbull)
+    "lovelace",
+  
+    // Auguste and Louis Lumière - the first filmmakers in history - https://en.wikipedia.org/wiki/Auguste_and_Louis_Lumi%C3%A8re
+    "lumiere",
+  
+    // Mahavira - Ancient Indian mathematician during 9th century AD who discovered basic algebraic identities - https://en.wikipedia.org/wiki/Mah%C4%81v%C4%ABra_(mathematician)
+    "mahavira",
+  
+    // Lynn Margulis (b. Lynn Petra Alexander) - an American evolutionary theorist and biologist, science author, educator, and popularizer, and was the primary modern proponent for the significance of symbiosis in evolution. - https://en.wikipedia.org/wiki/Lynn_Margulis
+    "margulis",
+  
+    // Yukihiro Matsumoto - Japanese computer scientist and software programmer best known as the chief designer of the Ruby programming language. https://en.wikipedia.org/wiki/Yukihiro_Matsumoto
+    "matsumoto",
+  
+    // James Clerk Maxwell - Scottish physicist, best known for his formulation of electromagnetic theory. https://en.wikipedia.org/wiki/James_Clerk_Maxwell
+    "maxwell",
+  
+    // Maria Mayer - American theoretical physicist and Nobel laureate in Physics for proposing the nuclear shell model of the atomic nucleus - https://en.wikipedia.org/wiki/Maria_Mayer
+    "mayer",
+  
+    // John McCarthy invented LISP: https://en.wikipedia.org/wiki/John_McCarthy_(computer_scientist)
+    "mccarthy",
+  
+    // Barbara McClintock - a distinguished American cytogeneticist, 1983 Nobel Laureate in Physiology or Medicine for discovering transposons. https://en.wikipedia.org/wiki/Barbara_McClintock
+    "mcclintock",
+  
+    // Anne Laura Dorinthea McLaren - British developmental biologist whose work helped lead to human in-vitro fertilisation. https://en.wikipedia.org/wiki/Anne_McLaren
+    "mclaren",
+  
+    // Malcolm McLean invented the modern shipping container: https://en.wikipedia.org/wiki/Malcom_McLean
+    "mclean",
+  
+    // Kay McNulty - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Kathleen_Antonelli
+    "mcnulty",
+  
+    // Gregor Johann Mendel - Czech scientist and founder of genetics. https://en.wikipedia.org/wiki/Gregor_Mendel
+    "mendel",
+  
+    // Dmitri Mendeleev - a chemist and inventor. He formulated the Periodic Law, created a farsighted version of the periodic table of elements, and used it to correct the properties of some already discovered elements and also to predict the properties of eight elements yet to be discovered. https://en.wikipedia.org/wiki/Dmitri_Mendeleev
+    "mendeleev",
+  
+    // Lise Meitner - Austrian/Swedish physicist who was involved in the discovery of nuclear fission. The element meitnerium is named after her - https://en.wikipedia.org/wiki/Lise_Meitner
+    "meitner",
+  
+    // Carla Meninsky, was the game designer and programmer for Atari 2600 games Dodge 'Em and Warlords. https://en.wikipedia.org/wiki/Carla_Meninsky
+    "meninsky",
+  
+    // Ralph C. Merkle - American computer scientist, known for devising Merkle's puzzles - one of the very first schemes for public-key cryptography. Also, inventor of Merkle trees and co-inventor of the Merkle-Damgård construction for building collision-resistant cryptographic hash functions and the Merkle-Hellman knapsack cryptosystem. https://en.wikipedia.org/wiki/Ralph_Merkle
+    "merkle",
+  
+    // Johanna Mestorf - German prehistoric archaeologist and first female museum director in Germany - https://en.wikipedia.org/wiki/Johanna_Mestorf
+    "mestorf",
+  
+    // Maryam Mirzakhani - an Iranian mathematician and the first woman to win the Fields Medal. https://en.wikipedia.org/wiki/Maryam_Mirzakhani
+    "mirzakhani",
+  
+    // Rita Levi-Montalcini - Won Nobel Prize in Physiology or Medicine jointly with colleague Stanley Cohen for the discovery of nerve growth factor (https://en.wikipedia.org/wiki/Rita_Levi-Montalcini)
+    "montalcini",
+  
+    // Gordon Earle Moore - American engineer, Silicon Valley founding father, author of Moore's law. https://en.wikipedia.org/wiki/Gordon_Moore
+    "moore",
+  
+    // Samuel Morse - contributed to the invention of a single-wire telegraph system based on European telegraphs and was a co-developer of the Morse code - https://en.wikipedia.org/wiki/Samuel_Morse
+    "morse",
+  
+    // Ian Murdock - founder of the Debian project - https://en.wikipedia.org/wiki/Ian_Murdock
+    "murdock",
+  
+    // May-Britt Moser - Nobel prize winner neuroscientist who contributed to the discovery of grid cells in the brain. https://en.wikipedia.org/wiki/May-Britt_Moser
+    "moser",
+  
+    // John Napier of Merchiston - Scottish landowner known as an astronomer, mathematician and physicist. Best known for his discovery of logarithms. https://en.wikipedia.org/wiki/John_Napier
+    "napier",
+  
+    // John Forbes Nash, Jr. - American mathematician who made fundamental contributions to game theory, differential geometry, and the study of partial differential equations. https://en.wikipedia.org/wiki/John_Forbes_Nash_Jr.
+    "nash",
+  
+    // John von Neumann - todays computer architectures are based on the von Neumann architecture. https://en.wikipedia.org/wiki/Von_Neumann_architecture
+    "neumann",
+  
+    // Isaac Newton invented classic mechanics and modern optics. https://en.wikipedia.org/wiki/Isaac_Newton
+    "newton",
+  
+    // Florence Nightingale, more prominently known as a nurse, was also the first female member of the Royal Statistical Society and a pioneer in statistical graphics https://en.wikipedia.org/wiki/Florence_Nightingale#Statistics_and_sanitary_reform
+    "nightingale",
+  
+    // Alfred Nobel - a Swedish chemist, engineer, innovator, and armaments manufacturer (inventor of dynamite) - https://en.wikipedia.org/wiki/Alfred_Nobel
+    "nobel",
+  
+    // Emmy Noether, German mathematician. Noether's Theorem is named after her. https://en.wikipedia.org/wiki/Emmy_Noether
+    "noether",
+  
+    // Poppy Northcutt. Poppy Northcutt was the first woman to work as part of NASA’s Mission Control. http://www.businessinsider.com/poppy-northcutt-helped-apollo-astronauts-2014-12?op=1
+    "northcutt",
+  
+    // Robert Noyce invented silicon integrated circuits and gave Silicon Valley its name. - https://en.wikipedia.org/wiki/Robert_Noyce
+    "noyce",
+  
+    // Panini - Ancient Indian linguist and grammarian from 4th century CE who worked on the world's first formal system - https://en.wikipedia.org/wiki/P%C4%81%E1%B9%87ini#Comparison_with_modern_formal_systems
+    "panini",
+  
+    // Ambroise Pare invented modern surgery. https://en.wikipedia.org/wiki/Ambroise_Par%C3%A9
+    "pare",
+  
+    // Blaise Pascal, French mathematician, physicist, and inventor - https://en.wikipedia.org/wiki/Blaise_Pascal
+    "pascal",
+  
+    // Louis Pasteur discovered vaccination, fermentation and pasteurization. https://en.wikipedia.org/wiki/Louis_Pasteur.
+    "pasteur",
+  
+    // Cecilia Payne-Gaposchkin was an astronomer and astrophysicist who, in 1925, proposed in her Ph.D. thesis an explanation for the composition of stars in terms of the relative abundances of hydrogen and helium. https://en.wikipedia.org/wiki/Cecilia_Payne-Gaposchkin
+    "payne",
+  
+    // Radia Perlman is a software designer and network engineer and most famous for her invention of the spanning-tree protocol (STP). https://en.wikipedia.org/wiki/Radia_Perlman
+    "perlman",
+  
+    // Rob Pike was a key contributor to Unix, Plan 9, the X graphic system, utf-8, and the Go programming language. https://en.wikipedia.org/wiki/Rob_Pike
+    "pike",
+  
+    // Henri Poincaré made fundamental contributions in several fields of mathematics. https://en.wikipedia.org/wiki/Henri_Poincar%C3%A9
+    "poincare",
+  
+    // Laura Poitras is a director and producer whose work, made possible by open source crypto tools, advances the causes of truth and freedom of information by reporting disclosures by whistleblowers such as Edward Snowden. https://en.wikipedia.org/wiki/Laura_Poitras
+    "poitras",
+  
+    // Tat’yana Avenirovna Proskuriakova (Russian: Татья́на Авени́ровна Проскуряко́ва) (January 23 [O.S. January 10] 1909 – August 30, 1985) was a Russian-American Mayanist scholar and archaeologist who contributed significantly to the deciphering of Maya hieroglyphs, the writing system of the pre-Columbian Maya civilization of Mesoamerica. https://en.wikipedia.org/wiki/Tatiana_Proskouriakoff
+    "proskuriakova",
+  
+    // Claudius Ptolemy - a Greco-Egyptian writer of Alexandria, known as a mathematician, astronomer, geographer, astrologer, and poet of a single epigram in the Greek Anthology - https://en.wikipedia.org/wiki/Ptolemy
+    "ptolemy",
+  
+    // C. V. Raman - Indian physicist who won the Nobel Prize in 1930 for proposing the Raman effect. - https://en.wikipedia.org/wiki/C._V._Raman
+    "raman",
+  
+    // Srinivasa Ramanujan - Indian mathematician and autodidact who made extraordinary contributions to mathematical analysis, number theory, infinite series, and continued fractions. - https://en.wikipedia.org/wiki/Srinivasa_Ramanujan
+    "ramanujan",
+  
+    // Sally Kristen Ride was an American physicist and astronaut. She was the first American woman in space, and the youngest American astronaut. https://en.wikipedia.org/wiki/Sally_Ride
+    "ride",
+  
+    // Dennis Ritchie - co-creator of UNIX and the C programming language. - https://en.wikipedia.org/wiki/Dennis_Ritchie
+    "ritchie",
+  
+    // Ida Rhodes - American pioneer in computer programming, designed the first computer used for Social Security. https://en.wikipedia.org/wiki/Ida_Rhodes
+    "rhodes",
+  
+    // Julia Hall Bowman Robinson - American mathematician renowned for her contributions to the fields of computability theory and computational complexity theory. https://en.wikipedia.org/wiki/Julia_Robinson
+    "robinson",
+  
+    // Wilhelm Conrad Röntgen - German physicist who was awarded the first Nobel Prize in Physics in 1901 for the discovery of X-rays (Röntgen rays). https://en.wikipedia.org/wiki/Wilhelm_R%C3%B6ntgen
+    "roentgen",
+  
+    // Rosalind Franklin - British biophysicist and X-ray crystallographer whose research was critical to the understanding of DNA - https://en.wikipedia.org/wiki/Rosalind_Franklin
+    "rosalind",
+  
+    // Vera Rubin - American astronomer who pioneered work on galaxy rotation rates. https://en.wikipedia.org/wiki/Vera_Rubin
+    "rubin",
+  
+    // Meghnad Saha - Indian astrophysicist best known for his development of the Saha equation, used to describe chemical and physical conditions in stars - https://en.wikipedia.org/wiki/Meghnad_Saha
+    "saha",
+  
+    // Jean E. Sammet developed FORMAC, the first widely used computer language for symbolic manipulation of mathematical formulas. https://en.wikipedia.org/wiki/Jean_E._Sammet
+    "sammet",
+  
+    // Mildred Sanderson - American mathematician best known for Sanderson's theorem concerning modular invariants. https://en.wikipedia.org/wiki/Mildred_Sanderson
+    "sanderson",
+  
+    // Satoshi Nakamoto is the name used by the unknown person or group of people who developed bitcoin, authored the bitcoin white paper, and created and deployed bitcoin's original reference implementation. https://en.wikipedia.org/wiki/Satoshi_Nakamoto
+    "satoshi",
+  
+    // Adi Shamir - Israeli cryptographer whose numerous inventions and contributions to cryptography include the Ferge Fiat Shamir identification scheme, the Rivest Shamir Adleman (RSA) public-key cryptosystem, the Shamir's secret sharing scheme, the breaking of the Merkle-Hellman cryptosystem, the TWINKLE and TWIRL factoring devices and the discovery of differential cryptanalysis (with Eli Biham). https://en.wikipedia.org/wiki/Adi_Shamir
+    "shamir",
+  
+    // Claude Shannon - The father of information theory and founder of digital circuit design theory. (https://en.wikipedia.org/wiki/Claude_Shannon)
+    "shannon",
+  
+    // Carol Shaw - Originally an Atari employee, Carol Shaw is said to be the first female video game designer. https://en.wikipedia.org/wiki/Carol_Shaw_(video_game_designer)
+    "shaw",
+  
+    // Dame Stephanie "Steve" Shirley - Founded a software company in 1962 employing women working from home. https://en.wikipedia.org/wiki/Steve_Shirley
+    "shirley",
+  
+    // William Shockley co-invented the transistor - https://en.wikipedia.org/wiki/William_Shockley
+    "shockley",
+  
+    // Lina Solomonovna Stern (or Shtern; Russian: Лина Соломоновна Штерн; 26 August 1878 – 7 March 1968) was a Soviet biochemist, physiologist and humanist whose medical discoveries saved thousands of lives at the fronts of World War II. She is best known for her pioneering work on blood–brain barrier, which she described as hemato-encephalic barrier in 1921. https://en.wikipedia.org/wiki/Lina_Stern
+    "shtern",
+  
+    // Françoise Barré-Sinoussi - French virologist and Nobel Prize Laureate in Physiology or Medicine; her work was fundamental in identifying HIV as the cause of AIDS. https://en.wikipedia.org/wiki/Fran%C3%A7oise_Barr%C3%A9-Sinoussi
+    "sinoussi",
+  
+    // Betty Snyder - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Betty_Holberton
+    "snyder",
+  
+    // Cynthia Solomon - Pioneer in the fields of artificial intelligence, computer science and educational computing. Known for creation of Logo, an educational programming language.  https://en.wikipedia.org/wiki/Cynthia_Solomon
+    "solomon",
+  
+    // Frances Spence - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Frances_Spence
+    "spence",
+  
+    // Michael Stonebraker is a database research pioneer and architect of Ingres, Postgres, VoltDB and SciDB. Winner of 2014 ACM Turing Award. https://en.wikipedia.org/wiki/Michael_Stonebraker
+    "stonebraker",
+  
+    // Ivan Edward Sutherland - American computer scientist and Internet pioneer, widely regarded as the father of computer graphics. https://en.wikipedia.org/wiki/Ivan_Sutherland
+    "sutherland",
+  
+    // Janese Swanson (with others) developed the first of the Carmen Sandiego games. She went on to found Girl Tech. https://en.wikipedia.org/wiki/Janese_Swanson
+    "swanson",
+  
+    // Aaron Swartz was influential in creating RSS, Markdown, Creative Commons, Reddit, and much of the internet as we know it today. He was devoted to freedom of information on the web. https://en.wikiquote.org/wiki/Aaron_Swartz
+    "swartz",
+  
+    // Bertha Swirles was a theoretical physicist who made a number of contributions to early quantum theory. https://en.wikipedia.org/wiki/Bertha_Swirles
+    "swirles",
+  
+    // Helen Brooke Taussig - American cardiologist and founder of the field of paediatric cardiology. https://en.wikipedia.org/wiki/Helen_B._Taussig
+    "taussig",
+  
+    // Valentina Tereshkova is a Russian engineer, cosmonaut and politician. She was the first woman to fly to space in 1963. In 2013, at the age of 76, she offered to go on a one-way mission to Mars. https://en.wikipedia.org/wiki/Valentina_Tereshkova
+    "tereshkova",
+  
+    // Nikola Tesla invented the AC electric system and every gadget ever used by a James Bond villain. https://en.wikipedia.org/wiki/Nikola_Tesla
+    "tesla",
+  
+    // Marie Tharp - American geologist and oceanic cartographer who co-created the first scientific map of the Atlantic Ocean floor. Her work led to the acceptance of the theories of plate tectonics and continental drift. https://en.wikipedia.org/wiki/Marie_Tharp
+    "tharp",
+  
+    // Ken Thompson - co-creator of UNIX and the C programming language - https://en.wikipedia.org/wiki/Ken_Thompson
+    "thompson",
+  
+    // Linus Torvalds invented Linux and Git. https://en.wikipedia.org/wiki/Linus_Torvalds
+    "torvalds",
+  
+    // Youyou Tu - Chinese pharmaceutical chemist and educator known for discovering artemisinin and dihydroartemisinin, used to treat malaria, which has saved millions of lives. Joint winner of the 2015 Nobel Prize in Physiology or Medicine. https://en.wikipedia.org/wiki/Tu_Youyou
+    "tu",
+  
+    // Alan Turing was a founding father of computer science. https://en.wikipedia.org/wiki/Alan_Turing.
+    "turing",
+  
+    // Varahamihira - Ancient Indian mathematician who discovered trigonometric formulae during 505-587 CE - https://en.wikipedia.org/wiki/Var%C4%81hamihira#Contributions
+    "varahamihira",
+  
+    // Dorothy Vaughan was a NASA mathematician and computer programmer on the SCOUT launch vehicle program that put America's first satellites into space - https://en.wikipedia.org/wiki/Dorothy_Vaughan
+    "vaughan",
+  
+    // Cédric Villani - French mathematician, won Fields Medal, Fermat Prize and Poincaré Price for his work in differential geometry and statistical mechanics. https://en.wikipedia.org/wiki/C%C3%A9dric_Villani
+    "villani",
+  
+    // Sir Mokshagundam Visvesvaraya - is a notable Indian engineer.  He is a recipient of the Indian Republic's highest honour, the Bharat Ratna, in 1955. On his birthday, 15 September is celebrated as Engineer's Day in India in his memory - https://en.wikipedia.org/wiki/Visvesvaraya
+    "visvesvaraya",
+  
+    // Christiane Nüsslein-Volhard - German biologist, won Nobel Prize in Physiology or Medicine in 1995 for research on the genetic control of embryonic development. https://en.wikipedia.org/wiki/Christiane_N%C3%BCsslein-Volhard
+    "volhard",
+  
+    // Marlyn Wescoff - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Marlyn_Meltzer
+    "wescoff",
+  
+    // Sylvia B. Wilbur - British computer scientist who helped develop the ARPANET, was one of the first to exchange email in the UK and a leading researcher in computer-supported collaborative work. https://en.wikipedia.org/wiki/Sylvia_Wilbur
+    "wilbur",
+  
+    // Andrew Wiles - Notable British mathematician who proved the enigmatic Fermat's Last Theorem - https://en.wikipedia.org/wiki/Andrew_Wiles
+    "wiles",
+  
+    // Roberta Williams, did pioneering work in graphical adventure games for personal computers, particularly the King's Quest series. https://en.wikipedia.org/wiki/Roberta_Williams
+    "williams",
+  
+    // Malcolm John Williamson - British mathematician and cryptographer employed by the GCHQ. Developed in 1974 what is now known as Diffie-Hellman key exchange (Diffie and Hellman first published the scheme in 1976). https://en.wikipedia.org/wiki/Malcolm_J._Williamson
+    "williamson",
+  
+    // Sophie Wilson designed the first Acorn Micro-Computer and the instruction set for ARM processors. https://en.wikipedia.org/wiki/Sophie_Wilson
+    "wilson",
+  
+    // Jeannette Wing - co-developed the Liskov substitution principle. - https://en.wikipedia.org/wiki/Jeannette_Wing
+    "wing",
+  
+    // Steve Wozniak invented the Apple I and Apple II. https://en.wikipedia.org/wiki/Steve_Wozniak
+    "wozniak",
+  
+    // The Wright brothers, Orville and Wilbur - credited with inventing and building the world's first successful airplane and making the first controlled, powered and sustained heavier-than-air human flight - https://en.wikipedia.org/wiki/Wright_brothers
+    "wright",
+  
+    // Chien-Shiung Wu - Chinese-American experimental physicist who made significant contributions to nuclear physics. https://en.wikipedia.org/wiki/Chien-Shiung_Wu
+    "wu",
+  
+    // Rosalyn Sussman Yalow - Rosalyn Sussman Yalow was an American medical physicist, and a co-winner of the 1977 Nobel Prize in Physiology or Medicine for development of the radioimmunoassay technique. https://en.wikipedia.org/wiki/Rosalyn_Sussman_Yalow
+    "yalow",
+  
+    // Ada Yonath - an Israeli crystallographer, the first woman from the Middle East to win a Nobel prize in the sciences. https://en.wikipedia.org/wiki/Ada_Yonath
+    "yonath",
+  
+    // Nikolay Yegorovich Zhukovsky (Russian: Никола́й Его́рович Жуко́вский, January 17 1847 – March 17, 1921) was a Russian scientist, mathematician and engineer, and a founding father of modern aero- and hydrodynamics. Whereas contemporary scientists scoffed at the idea of human flight, Zhukovsky was the first to undertake the study of airflow. He is often called the Father of Russian Aviation. https://en.wikipedia.org/wiki/Nikolay_Yegorovich_Zhukovsky
+    "zhukovsky",
+  ]
+  
+  export const generateHostName = ():Hostname => {
+    return util.format('%s-%s', randelem(adjectives), randelem(scientists)) as Hostname
+  }
+  
+  function randnum(n:number):number {
+    return Math.floor(Math.random() * n);
+  }
+  
+  function randelem(a:string[]):string {
+    return a[randnum(a.length)];
+  }
+```
+
+## File: src/utils/rsync.ts
+```typescript
+/**
+ * rsync.ts — rsync primitive for App copy/move operations
+ *
+ * Design: design/copy-move-app.md
+ *
+ * Phase 1: same-engine, local paths only.
+ * Phase 2: cross-engine — pass remoteHost to rsync over SSH to pi@host.
+ */
+
+import { chalk } from 'zx'
+import { spawn, ChildProcess } from 'child_process'
+import { log } from './utils.js'
+import { registerProcess, deregisterProcess } from '../data/Operations.js'
+
+export interface RsyncProgress {
+    progressPercent: number
+}
+
+export type RsyncProgressCallback = (progress: RsyncProgress) => void
+
+/**
+ * Copy src/ to dest/ using rsync.
+ *
+ * - Preserves permissions, symlinks, timestamps (-a / archive mode)
+ * - Reports per-transfer progress via onProgress callback (0-100)
+ * - Idempotent: re-running after interruption transfers only the delta
+ * - Throws on non-zero exit
+ *
+ * src must be a local absolute path.
+ * dest must be an absolute path. If remoteHost is provided, rsync runs over
+ * SSH to `pi@<remoteHost>:<dest>` (cross-engine Phase 2).
+ * Trailing slash is appended to src so rsync copies the *contents*.
+ */
+export const rsyncDirectory = (
+    src: string,
+    dest: string,
+    onProgress?: RsyncProgressCallback,
+    opId?: string,
+    remoteHost?: string,
+): Promise<void> => {
+    return new Promise((resolve, reject) => {
+        // Ensure src has trailing slash so rsync copies contents, not the directory itself
+        const srcArg = src.endsWith('/') ? src : src + '/'
+        const destArg = remoteHost ? `pi@${remoteHost}:${dest}` : dest
+
+        const args = [
+            '-a',
+            '--info=progress2',
+            '--no-inc-recursive',  // required for accurate total-progress reporting
+        ]
+
+        if (remoteHost) {
+            args.push('-e', 'ssh -o StrictHostKeyChecking=no')
+        }
+
+        args.push(srcArg, destArg)
+
+        log(`rsync ${args.join(' ')}`)
+
+        const proc = spawn('rsync', args)
+        if (opId) registerProcess(opId, proc)
+
+        let stderr = ''
+
+        proc.stdout.on('data', (chunk: Buffer) => {
+            const text = chunk.toString()
+            // progress2 lines look like: "  1,234,567  42%    1.23MB/s    0:00:05"
+            // We scan for the percentage value.
+            const matches = text.match(/\s(\d{1,3})%/)
+            if (matches && onProgress) {
+                const pct = parseInt(matches[1], 10)
+                if (!isNaN(pct)) {
+                    onProgress({ progressPercent: pct })
+                }
+            }
+        })
+
+        proc.stderr.on('data', (chunk: Buffer) => {
+            stderr += chunk.toString()
+        })
+
+        proc.on('close', (code, signal) => {
+            if (opId) deregisterProcess(opId)
+            if (code === 0) {
+                if (onProgress) onProgress({ progressPercent: 100 })
+                resolve()
+            } else if (signal === 'SIGTERM') {
+                reject(new Error(`rsync cancelled (SIGTERM)`))
+            } else {
+                reject(new Error(`rsync exited with code ${code}: ${stderr.trim()}`))
+            }
+        })
+
+        proc.on('error', (err) => {
+            if (opId) deregisterProcess(opId)
+            reject(new Error(`rsync spawn error: ${err.message}`))
+        })
+    })
+}
+
+```
+
+## File: src/utils/ssh.ts
+```typescript
+import { $ } from 'zx'
+import type { ProcessPromise } from 'zx'
+
+/**
+ * Single-quotes a value for a POSIX shell: 'it'\''s' → one shell word, no expansion.
+ */
+export const shellQuote = (value: string): string => "'" + value.replace(/'/g, "'\\''") + "'"
+
+/**
+ * Minimal ssh() helper — replaces zx v7's built-in ssh() which was removed in v8.
+ *
+ * Creates a tagged-template executor that runs commands on a remote host via SSH.
+ * Each interpolated argument is single-quote shell-escaped before being sent.
+ *
+ * Usage (identical to zx v7 ssh):
+ *   const exec = ssh('pi@192.168.1.1')
+ *   await exec`sudo apt-get update`
+ *   await exec`cd ${path} && pnpm install`
+ *
+ * The optional `shell` parameter allows injecting a mock `$` in tests.
+ */
+export function ssh(host: string, shell: typeof $ = $) {
+    return (pieces: TemplateStringsArray, ...args: unknown[]): ProcessPromise => {
+        const cmd = pieces.reduce((acc: string, piece: string, i: number) => {
+            if (i >= args.length) return acc + piece
+            // Single-quote escape — args are developer-controlled paths/values, not user input
+            const escaped = shellQuote(String(args[i]))
+            return acc + piece + escaped
+        }, '')
+        return shell`ssh -o StrictHostKeyChecking=no ${host} -- ${cmd}`
+    }
+}
+
+```
+
+## File: src/utils/utils.ts
+```typescript
+import util from 'util';
+import { $, chalk, fs, os, question } from 'zx';
+import { IPAddress, PortNumber } from '../data/CommonTypes.js';
+import net from 'net';
+import crypto from 'crypto';
+
+
+// Dummy key
+export const dummyKey = "_dummy"
+
+export const getKeys = (obj) => {
+  return Object.keys(obj).filter(key => !(key === `${dummyKey}`))
+}
+
+// Generate a random port number between 49152-65535
+export const randomPort = ():PortNumber => {
+  return Math.floor(Math.random() * 16383) + 49152 as PortNumber
+}
+// Write a function that reads a .env file and extracts the value of a variable from it
+// The function should take the path to the .env file and the name of the variable as input
+// It should return the value of the variable
+// If the variable is not found, it should return null
+export const readEnvVariable = async (path: string, variable: string): Promise<string | null> => {
+  try {
+    const envContent = (await $`cat ${path}`).stdout
+    const values = envContent.match(new RegExp(`^${variable}=(.*)`, 'm'))
+    // Log the variable name only, never its value: .env files hold app
+    // passwords and History is readable from the Console (idea#111).
+    log(`Read variable ${variable} from .env file ${path}: ${values ? 'found' : 'not set'}`)
+    if (values && values.length >= 1) {
+      const value = values[1]
+      return value
+    } else {
+      return null
+    }
+  } catch (e) {
+    return null
+  }
+}
+
+/**
+ * Replace every occurrence of the given secret values in `text` with
+ * `[redacted]`, for log lines and error messages that may echo a value
+ * (idea#111). Empty values are ignored.
+ */
+export const redactValues = (text: string, values: (string | null | undefined)[]): string =>
+  values.reduce<string>((acc, v) => (v ? acc.split(v).join('[redacted]') : acc), text)
+
+// Write a function that adds or updates a variable to a .env file
+// The function should take the path to the .env file, the name of the variable and its value as input
+// If the variable is already present in the .env file, it should update its value
+// If the variable is not present in the .env file, it should add it
+export const addOrUpdateEnvVariable = async (path: string, variable: string, value: string): Promise<void> => {
+  try {
+    const envContent = (await $`cat ${path}`).stdout
+    const values = envContent.match(new RegExp(`^${variable}=(.*)`, 'm'))
+    if (values && values.length >= 1) {
+      // Update the value of the variable
+      await $`sed -i 's|^${variable}=.*|${variable}=${value}|' ${path}`
+    } else {
+      // Add the variable to the .env file
+      await $`echo "${variable}=${value}" >> ${path}`
+    }
+    log(`Added or updated variable ${variable} in .env file ${path}`)
+  } catch (e) {
+    // Add the variable to the .env file
+    log(`Error adding or updating variable ${variable} in .env file ${path}`)
+    log(`error: ${redactValues(String(e), [value])}`)
+    //await $`echo "${variable}=${value}" >> ${path}`
+  }
+}
+
+
+
+// Read verbosityLevel from the environmnet
+const verbosity = process.env.VERBOSITY || ""
+export let verbosityLevel = parseInt(verbosity) || 0
+
+// Verbosity-gated debug logger. Uses console.info so CommandLogger captures
+// always-on/gated messages without matching the hygiene.console_log scan
+// (which flags the console "log" method call pattern only).
+export const log = (msg:string, level?:number):void => {
+  if (!level) {
+    // Set the default log level to 2
+    level = 2
+  }
+  if (verbosityLevel >= level) {
+    console.info(chalk.gray(msg))
+  }
+}
+
+export const error = (msg:string):void => {
+  console.error(chalk.red(msg))
+}
+
+/** Always-on status/output helper. Uses console.info (captured by CommandLogger). */
+export const print = (...args: unknown[]): void => {
+  console.info(...args)
+}
+
+export const setVerbosity = (level:number):void => {
+  verbosityLevel = level
+}
+
+export const isEngineOnline = (hostname: string, port: number): Promise<boolean> => {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    const timeout = 2000; // 2 seconds
+    socket.setTimeout(timeout);
+
+    socket.on('connect', () => {
+      socket.destroy();
+      resolve(true);
+    });
+
+    socket.on('timeout', () => {
+      socket.destroy();
+      resolve(false);
+    });
+
+    socket.on('error', () => {
+      socket.destroy();
+      resolve(false);
+    });
+
+    socket.connect(port, hostname);
+  });
+};
+
+// // Execute promises sequentially
+// export const sequential = (promises) => {
+//   return promises.reduce((promise, func) => {
+//     return promise.then(func)
+//   }, Promise.resolve())
+// }
+
+// export const executePromisesSequentially = async (promises) => {
+//     for (let promise of promises) {
+//       await promise
+//     }
+// }
+
+
+
+
+
+
+// Write a function that uses zx to test if a path exists
+// export const dirExists = async (path: string) => {
+//     try {
+//         await $`test -d ${path}`
+//         return true
+//     } catch (e) {
+//         return false
+//     }
+// }
+
+// export const dirExists = async (path: string) => {
+//   return await $`test -d ${path}`.then(() => true).catch(() => false)
+// }
+
+// export const fileExists = async (path: string) => {
+//   try {
+//       await $`test -f ${path}`
+//       return true
+//   } catch (e) {
+//       return false
+//   }
+// }
+
+// export const fileExists = async (path: string) => {
+//   return await $`test -f ${path}`.then(() => true).catch(() => false)
+// }
+
+export const fileExists = (path: string):boolean => {
+  return fs.existsSync(path)
+}
+
+// Check if the root folder contains the folder yjs-db  If so, set firstBoot to false, otherwise set it to true
+// This is a way to check if the engine has been booted before
+// export const firstBoot: boolean = fs.existsSync('../yjs-db') ? false : true 
+// export const firstBoot: boolean = !(await fileExists('./yjs-db'))
+// log(`First boot: ${firstBoot}`)
+
+
+
+
+// Write a function that checks if a given yarray contains a specific value
+// Use the Y.Array API of the Yjs library (which does not have a built-in method for this)
+// Do it
+export const contains = (yarray, value) => {
+    let found = false
+    yarray.forEach((item) => {
+      if (item === value) {
+        found = true
+      }
+    })
+    return found
+  }
+
+export const deepPrint = (obj, depth:(number | null)=null) => {
+    return util.inspect(obj, {showHidden: false, depth: depth, colors: true})
+    // Alternative: return JSON.stringify(obj, null, 2)
+    // Alternative: return console.dir(obj, {depth: null, colors: true})
+}
+
+
+// Write a function that tests if a string is a valid IP4 address
+export const isIP4 = (str: string): boolean => {
+  const ip4Regex = /^(\d{1,3}\.){3}\d{1,3}$/
+  return ip4Regex.test(str)
+}
+
+export const isNetmask = isIP4
+
+// See https://stackoverflow.com/questions/503052/how-to-check-if-ip-is-in-one-of-these-subnets
+
+
+// const ip2long = (ip) => {
+//   var components;
+//   if(components = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/))
+//   {
+//       var iplong = 0;
+//       var power  = 1;
+//       for(var i=4; i>=1; i-=1)
+//       {
+//           iplong += power * parseInt(components[i]);
+//           power  *= 256;
+//       }
+//       return iplong;
+//   }
+//   else return -1;
+// };
+
+// THIS FUNCTION IS WRONG
+// export const inSubNet = (ip, subnet) => {   
+//   var mask, base_ip, long_ip = ip2long(ip);
+//   if( (mask = subnet.match(/^(.*?)\/(\d{1,2})$/)) && ((base_ip=ip2long(mask[1])) >= 0) )
+//   {
+//       var freedom = Math.pow(2, 32 - parseInt(mask[2]));
+//       return (long_ip > base_ip) && (long_ip < base_ip + freedom - 1);
+//   }
+//   else return false;
+// }
+
+export const IPnumber = (ip:IPAddress):number => {
+//  var ip = IPaddress.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+//  if(ip) {
+//      return (+ip[1]<<24) + (+ip[2]<<16) + (+ip[3]<<8) + (+ip[4]);
+//  }
+  return (+ip[1]<<24) + (+ip[2]<<16) + (+ip[3]<<8) + (+ip[4]);
+}
+
+export const isIPAddress = (str: string): str is IPAddress => {
+  // return str.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/
+  // const ipRegex = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/
+  return ipRegex.test(str)
+}
+
+export const sameNet = (IP1:any, IP2:any, mask:any) => {
+  //log(`${IPnumber(IP1) & IPnumber(mask)} == ${IPnumber(IP2) & IPnumber(mask)}`)
+  // Check if the IP addresses are strings
+  if (isIPAddress(IP1) && isIPAddress(IP2) && isNetmask(mask)) {
+    return (IPnumber(IP1) & IPnumber(mask)) == (IPnumber(IP2) & IPnumber(mask))
+  } else {
+    return false
+  }
+}
+
+export const findIp = async (address:IPAddress):Promise<IPAddress | undefined> => {
+  // Use a shell command to resolve the ip address
+  // REmove the trailing \n from the ip address
+  try {
+    const interfaceData = os.networkInterfaces()
+    const ip = interfaceData["eth0"]?.find((iface) => iface.family === "IPv4")?.address
+    if (ip && isIPAddress(ip)) {
+      return ip
+    } else {
+      return undefined
+    }
+  } catch (e) {
+    return undefined
+  }
+}
+
+export const findIp2 = async (address:IPAddress):Promise<IPAddress | undefined> => {
+  // Use a shell command to resolve the ip address
+  // REmove the trailing \n from the ip address
+  try {
+    const ip = (await $`ping -c 1 ${address} | grep PING | awk '{print $3}' | tr -d '()'`).stdout.replace(/\n$/, '')
+    if (isIPAddress(ip)) {
+      return ip
+    } else {
+      return undefined
+    }
+  } catch (e) {
+    return undefined
+  }
+}
+
+export const reset = async ($) => {
+  print(chalk.blue('Resetting the local engine'));
+  try {
+      // (removed) Removing the yjs database
+      // await $`rm -rf ../yjs-db`;
+      // (removed) Removing all appnet ids
+      // if (config.settings.appnets) {
+      //   config.settings.appnets.forEach((appnet) => delete appnet.id)
+      //   (removed) Updating the config file
+      //   writeConfig(config, '../config.yaml')
+      // }
+  } catch (e) {   
+      print(chalk.red('Failed to reset the local engine'));
+      console.error(e);
+      process.exit(1);
+  }
+}
+
+export const prompt = (level:number, message: string) => {
+  // Create level*4 spaces
+  const spaces = ' '.repeat(level * 4)
+  print(chalk.green(spaces+message))
+  return question(chalk.bgMagentaBright(spaces+'Press ENTER when ready'))
+}
+
+/** Characters of generated ids and app passwords: lowercase base-36, as before idea#114. */
+export const SECRET_ID_ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyz'
+/**
+ * Length of generated ids and app passwords. The old Math.random + timestamp ids
+ * were 15-22 characters, 19 in almost all cases, so 19 keeps them the same shape
+ * (idea#114). 19 base-36 characters is about 98 bits of randomness.
+ */
+export const SECRET_ID_LENGTH = 19
+
+/**
+ * A random string from `alphabet`, drawn from Node's CSPRNG. Each character uses
+ * crypto.randomInt, which rejection-samples, so there is no modulo bias (idea#114).
+ * `randomInt` can be swapped in tests only.
+ */
+export const secureRandomString = (
+  length: number,
+  alphabet: string = SECRET_ID_ALPHABET,
+  randomInt: (max: number) => number = crypto.randomInt,
+): string => {
+  let out = ''
+  for (let i = 0; i < length; i++) out += alphabet[randomInt(alphabet.length)]
+  return out
+}
+
+// Generate a uuid: disk, instance and operation ids, and the app password that
+// startInstance writes to an instance's .env (idea#114: crypto source, not Math.random).
+// Not logged: it generates the app password (idea#111).
+export const uuid = ():string => {
+  return secureRandomString(SECRET_ID_LENGTH)
+}
+
+export const uuidLight = ():string => {
+  return uuid().substring(0, 8)
+}
+
+
+// A function to strip the trailing partition number from a device name
+export const stripPartition = (device: string):string => {
+  if (device.startsWith('nvme') || device.startsWith('mmcblk')) {
+    return device.replace(/p[0-9]+$/, '')
+  }
+  return device.replace(/[0-9]+$/, '')
+}
+
+```
+
 ## File: src/monitors/backupMonitor.ts
 ```typescript
 /**
@@ -9806,7 +10299,7 @@ export const SYS_BLOCK_DIR = '/sys/class/block'
 // Devices the udev rule links into /dev/engine: KERNEL=="sd?|sd?1|sd?2"
 export const RULE_DEVICE_PATTERN = /^sd[a-z][12]?$/
 
-export type DiskDetectionStep = 'selfCheck' | 'monitorStart' | 'watcher' | 'mount' | 'readMeta' | 'writeMeta' | 'dock' | 'undock'
+export type DiskDetectionStep = 'selfCheck' | 'monitorStart' | 'watcher' | 'mount' | 'readMeta' | 'writeMeta' | 'dock' | 'undock' | 'files'
 
 /**
  * Record a disk detection failure: always logged, and added to the command log
@@ -11398,6 +11891,9 @@ export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
                 dsk.device = null
                 dsk.diskTypes = []
                 dsk.backupConfig = null
+                dsk.filesConfig = null      // idea#131
+                dsk.sizeBytes = null
+                dsk.freeBytes = null
             }
         })
         // Stop all instances of the disk and move them to the 'Undocked' state
