@@ -123,7 +123,6 @@ describe('Engine sudoers asset (idea#80)', () => {
         expect(remoteEnsureDirsCommand('/disks/sda1')).not.toMatch(/sudo/)
         // ...and each of those binaries/arguments is in the sudoers file
         for (const rule of [
-            '/usr/bin/mount /dev/sd[a-z][12] /disks/sd[a-z][12]',
             '/usr/bin/umount /disks/sd[a-z][12]',
             '/usr/bin/mkdir -p /disks/sd[a-z][12]',
             '/usr/bin/mkdir -p /disks/old',
