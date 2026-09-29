@@ -61,7 +61,7 @@ export const SUDO_RMDIR = '/usr/bin/rmdir'
 /**
  * Typed ext4 mount (idea#134). Must match exactly the 11-engine-files entry
  * `/usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]` (same args, same order).
- * Old untyped entry stays in 10-engine until idea#143.
+ * Untyped mount removed from 10-engine in idea#143; only umount remains there.
  */
 export const SUDO_MOUNT = '/usr/bin/mount'
 export const SUDO_MOUNT_PATTERN = '/usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]'
