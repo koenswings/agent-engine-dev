@@ -4,6 +4,7 @@ $.verbose = false;
 import { addOrUpdateEnvVariable, deepPrint, log, randomPort, readEnvVariable, uuid, print } from "../utils/utils.js";
 import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber, ServiceImage, Timestamp, Version, DeviceName, InstanceName, AppName, Hostname, DiskID, OperationCause } from "./CommonTypes.js";
 import { createOperation, updateOperation } from './Operations.js'
+import { composeFileEnv } from './FilesMount.js'
 import { Store, getDisk, getEngine, getLocalEngine, getInstancesOfEngine, } from "./Store.js";
 import { Disk, diskMountRoot, diskFsRoot } from "./Disk.js";
 import { localEngineId } from "./Engine.js";
@@ -241,6 +242,8 @@ export interface Instance {
   stepLabel: string | null;
   /** Live Docker resource metrics. Null when instance is not Running. */
   metrics: DockerMetrics | null;
+  /** Files Disks currently mounted into this instance; written only after a successful compose up (idea#133). */
+  filesMounts?: DiskID[] | null;
 }
 
 export type Status = 'Undocked'      // Disk is not currently docked; instance data is intact on the disk
@@ -483,6 +486,7 @@ export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, inst
           totalSteps: null,
           stepLabel: null,
           metrics: null,
+          filesMounts: null,
         }
         doc.instanceDB[instanceId] = instance
       } else {
@@ -1006,7 +1010,11 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
 
   log(`Creating containers of app instance '${instance.id}' on disk ${disk.id} of engine ${localEngineId}.`)
   try {
-    await $`cd ${mountRoot}/instances/${instance.id} && docker compose create`
+    const composeEnv = await composeFileEnv(store, instance)
+    const createOpts = composeEnv
+      ? { cwd: `${mountRoot}/instances/${instance.id}`, env: { ...process.env, ...composeEnv } }
+      : { cwd: `${mountRoot}/instances/${instance.id}` }
+    await $(createOpts)`docker compose create`
   } catch (e) {
     print(chalk.red(`Error creating the containers of app instance ${instance.id}`))
     throw e
@@ -1070,8 +1078,19 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
   if (!stillStartable('before compose up')) return
 
   // Compose up the app. A failure throws and the instance never becomes Running.
+  // Opted-in Apps get COMPOSE_FILE=compose.yaml:<override> (idea#133).
+  let mountedDiskIds: DiskID[] | null = null
   try {
-    await $`cd ${mountRoot}/instances/${instance.id} && docker compose up -d`
+    const composeEnv = await composeFileEnv(store, instance)
+    const upOpts = composeEnv
+      ? { cwd: `${mountRoot}/instances/${instance.id}`, env: { ...process.env, ...composeEnv } }
+      : { cwd: `${mountRoot}/instances/${instance.id}` }
+    await $(upOpts)`docker compose up -d`
+    if (composeEnv) {
+      // filesMounts only after success — read back from the override we just wrote
+      const { mountableFilesDisks } = await import('./FilesMount.js')
+      mountedDiskIds = mountableFilesDisks(store).map(d => d.id)
+    }
   } catch (e) {
     print(chalk.red(`Error running app instance ${instance.id}`))
     throw e
@@ -1084,6 +1103,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
     inst.lastStarted = new Date().getTime() as Timestamp
     inst.status = 'Running' as Status
     inst.statusCondition = null  // clear any previous error diagnosis
+    if (mountedDiskIds) inst.filesMounts = mountedDiskIds
   })
 
   print(chalk.green(`App ${instance.id} running`))

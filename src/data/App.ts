@@ -4,6 +4,7 @@ import { log } from '../utils/utils.js';
 import { Store } from './Store.js';
 import { Disk, diskMountRoot } from './Disk.js';
 import { DocHandle } from '@automerge/automerge-repo';
+import { AppFilesMount, parseFilesMount } from './FilesMount.js';
 
 export interface App {
     id: AppID;
@@ -15,6 +16,8 @@ export interface App {
     category: AppCategory;
     icon: URL | null;
     author: string | null;
+    /** Opt-in to Files Disk mounts (x-app.filesMount); null when the App does not opt in (idea#133). */
+    filesMount?: AppFilesMount | null;
 }
 
 type AppCategory = 'Productivity' | 'Utilities' | 'Games' | 'education' | 'office' | 'it' | string;
@@ -88,7 +91,8 @@ export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: Ap
                     url: xapp.url ?? null,
                     category: xapp.category,
                     icon: xapp.icon ?? null,
-                    author: xapp.author ?? null
+                    author: xapp.author ?? null,
+                    filesMount: parseFilesMount(xapp),
                 }
                 // Store the new app object in the store
                 doc.appDB[appId] = app
@@ -104,6 +108,7 @@ export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: Ap
                 app.category = xapp.category
                 app.icon = xapp.icon ?? null
                 app.author = xapp.author ?? null
+                app.filesMount = parseFilesMount(xapp)
             }
         })
     return app!

@@ -5,6 +5,7 @@ import { $, fs, YAML, chalk } from 'zx'
 
 $.verbose = false;
 import { Disk, clearDuplicateDiskRecords, createOrUpdateDisk, isSystemDiskRecord, processDisk } from '../data/Disk.js'
+import { flushFilesRemountNow, optedInInstances } from '../data/FilesMount.js'
 import { findDiskByDevice, findDisksByDevice, Store, getDisksOfEngine, getLocalEngine } from '../data/Store.js'
 import { DeviceName, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../data/CommonTypes.js'
 
@@ -403,6 +404,20 @@ export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
         return
     }
     try {
+        // Combined Files Disk eject (§7.3): recreate opted-in instances on *other*
+        // disks without this bind, then stop this disk's own instances, then unmount
+        // once. Same-disk Nextcloud is simply stopped with the disk (no recreate).
+        const wasFiles = (disk.diskTypes ?? []).includes('files') || !!disk.filesConfig
+        if (wasFiles) {
+            log(`Undock of Files Disk ${disk.id}: remounting other-disk opted-in instances without its bind`)
+            await flushFilesRemountNow(storeHandle)  // flush any pending dock remount first
+            // Mark exclude and remount immediately (can't wait for the grouping window)
+            const { remountInstance } = await import('../data/FilesMount.js')
+            for (const inst of optedInInstances(store)) {
+                if (inst.storedOn === disk.id) continue
+                await remountInstance(storeHandle, inst.id, { excludeDiskId: disk.id })
+            }
+        }
         // The store is updated whatever happens to the unmount below (idea#126)
         storeHandle.change(doc => {
             const dsk = doc.diskDB[disk.id]
