@@ -24,14 +24,22 @@ export type DiskArgResult =
     | { ok: true, disk: Disk, byName: boolean }
     | { ok: false, message: string }
 
+/**
+ * Look up a disk by id only (no name fallback): for commands that have no old
+ * name form, such as createFilesDisk (idea#131). The record must be docked to
+ * this engine and have a device.
+ */
+export const lookupDiskById = (store: Store, engineId: EngineID | undefined, id: string): DiskArgResult => {
+    const byId = store.diskDB[id as DiskID]
+    if (!byId) return { ok: false, message: `Disk '${id}' not found.` }
+    if (!byId.device) return { ok: false, message: `Disk '${byId.name}' (${byId.id}) is not currently docked.` }
+    if (String(byId.dockedTo) !== String(engineId)) return { ok: false, message: `Disk '${byId.name}' (${byId.id}) is not docked to this engine.` }
+    return { ok: true, disk: byId, byName: false }
+}
+
 /** Resolve without side effects (no warning, no throw). */
 export const lookupDiskArg = (store: Store, engineId: EngineID | undefined, arg: string): DiskArgResult => {
-    const byId = store.diskDB[arg as DiskID]
-    if (byId) {
-        if (!byId.device) return { ok: false, message: `Disk '${byId.name}' (${byId.id}) is not currently docked.` }
-        if (String(byId.dockedTo) !== String(engineId)) return { ok: false, message: `Disk '${byId.name}' (${byId.id}) is not docked to this engine.` }
-        return { ok: true, disk: byId, byName: false }
-    }
+    if (store.diskDB[arg as DiskID]) return lookupDiskById(store, engineId, arg)
     const named = Object.values(store.diskDB).filter(d => d.name === arg)
     if (named.length === 0) return { ok: false, message: `Disk '${arg}' not found.` }
     const dockedHere = named.filter(d => d.device != null && String(d.dockedTo) === String(engineId))

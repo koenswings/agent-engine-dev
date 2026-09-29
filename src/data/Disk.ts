@@ -9,6 +9,9 @@ import { getCommandLogHandle } from './CommandLogStore.js';
 import { addTrace, closeTrace } from './CommandLogStore.js';
 import { runWithTrace } from '../utils/CommandLogger.js';
 import { disksRoot } from './Config.js';
+import { FilesConfig, hasFilesYaml, processFilesDisk } from './FilesDisk.js';
+import { updateDiskSize } from './DiskSize.js';
+import { recordDiskDetectionFailure } from '../monitors/diskDetection.js';
 
 
 
@@ -29,6 +32,9 @@ export interface Disk {
     diskTypes: DiskType[];        // Types detected for this disk (may be multiple); empty until processDisk runs
     backupConfig: BackupConfig | null;  // Set when disk is a Backup Disk; null otherwise
     unmountError?: UnmountError | null; // Set when the last undock could not unmount the disk (idea#126); null/absent otherwise
+    filesConfig?: FilesConfig | null;   // Set when the disk is a Files Disk (FILES.yaml, idea#131); null otherwise
+    sizeBytes?: number | null;          // Docked disks: size in bytes, rounded to MB (idea#131); null when undocked
+    freeBytes?: number | null;          // Docked disks: free bytes, rounded to MB (idea#131); null when undocked
 }
 
 /**
@@ -123,6 +129,9 @@ export const clearDuplicateDiskRecords = (doc: Store, engineId: EngineID, device
         other.device = null
         other.diskTypes = []
         other.backupConfig = null
+        other.filesConfig = null
+        other.sizeBytes = null
+        other.freeBytes = null
         cleared.push(other.id)
     }
     return cleared
@@ -147,6 +156,9 @@ export const createOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: Engi
                 diskTypes: [],
                 backupConfig: null,
                 unmountError: null,
+                filesConfig: null,
+                sizeBytes: null,
+                freeBytes: null,
             };
             doc.diskDB[diskId] = disk;
         } else {
@@ -159,6 +171,7 @@ export const createOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: Engi
             disk.lastDocked = new Date().getTime() as Timestamp;
             disk.diskTypes = [];        // reset; will be repopulated by processDisk
             disk.backupConfig = null;   // reset; will be repopulated if Backup Disk
+            disk.filesConfig = null;    // reset; will be repopulated if Files Disk (idea#131)
             disk.unmountError = null;   // mounted again: a previous busy unmount no longer applies (idea#126)
         }
     });
@@ -221,6 +234,20 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
         })
         await processSystemDisk(storeHandle, disk)
     } else {
+        // Files first, then App, Backup and Upgrade (idea#131, Files Disk R5), so an
+        // App on the same disk sees the Files role before its instances start. A
+        // Files-role error is recorded and does not stop the other roles.
+        const mountRoot = await diskMountRoot(disk)
+        try {
+            if (await isFilesDisk(disk)) {
+                log(`Disk ${disk.id} is a files disk`)
+                detectedTypes.push('files')
+                await processFilesDisk(storeHandle, disk.id, disk.name, mountRoot)
+            }
+        } catch (e: any) {
+            recordDiskDetectionFailure('files', `Files Disk ${disk.id}: ${e.message ?? e}`, { device: disk.device, diskId: disk.id })
+        }
+
         if (await isAppDisk(disk)) {
             log(`Disk ${disk.id} is an app disk`)
             detectedTypes.push('app')
@@ -241,23 +268,29 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
             // TODO: Implement upgrade disk processing — https://github.com/koenswings/idea/issues/46
         }
 
-        if (await isFilesDisk(disk)) {
-            log(`Disk ${disk.id} is a files disk`)
-            detectedTypes.push('files')
-            // TODO: Implement files disk processing — https://github.com/koenswings/idea/issues/46
-        }
-
         if (detectedTypes.length === 0) {
             log(`Disk ${disk.id} is an empty disk`)
             detectedTypes.push('empty')
         }
     }
 
-    // Persist detected types to the store
+    // Persist detected types to the store. Roles are listed in a fixed order
+    // (app, backup, upgrade, files), whatever order they were processed in.
+    const roleOrder: DiskType[] = ['system', 'app', 'backup', 'upgrade', 'files', 'empty']
+    detectedTypes.sort((a, b) => roleOrder.indexOf(a) - roleOrder.indexOf(b))
     storeHandle.change(doc => {
         const d = doc.diskDB[disk.id]
-        if (d) d.diskTypes = detectedTypes
+        if (!d) return
+        d.diskTypes = detectedTypes
+        if (!detectedTypes.includes('files') && d.filesConfig != null) d.filesConfig = null
     })
+
+    // Size and free space of every docked disk, on dock (idea#131)
+    try {
+        await updateDiskSize(storeHandle, disk.id, await diskFsRoot(disk), true)
+    } catch (e: any) {
+        log(`Could not read the size of disk ${disk.id}: ${e.message ?? e}`)
+    }
 }
 
 /**
@@ -505,10 +538,10 @@ export const isUpgradeDisk = async (disk: Disk): Promise<boolean> => {
     return false
 }
 
+/** A Files Disk has FILES.yaml in its root (idea#131). */
 export const isFilesDisk = async (disk: Disk): Promise<boolean> => {
-    // Create dummy code that always returns false
-    // To be updated later
-    return false
+    if (!disk.device) return false
+    return hasFilesYaml(await diskMountRoot(disk))
 }
 
 export const processAppDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Promise<void> => {

@@ -16,6 +16,8 @@ import { prepareStoreIdentity, storeIdentityPaths } from './data/StoreIdentity.j
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
 import { recoverInterruptedOperations } from './data/Operations.js'
 import { enableDockerMetricsMonitor } from './monitors/dockerMetricsMonitor.js'
+import { enableDiskSizeMonitor } from './data/DiskSize.js'
+import { diskFsRoot } from './data/Disk.js'
 import { copyApp, moveApp } from './data/CopyMoveApp.js'
 import { backupInstance } from './monitors/backupMonitor.js'
 import { clearStaleUnmountErrors } from './monitors/mounts.js'
@@ -196,6 +198,9 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     await sleep(1000)
     log(chalk.bgMagenta('STARTING DOCKER METRICS MONITOR'))
     enableDockerMetricsMonitor(storeHandle)
+
+    // Size and free space of docked disks every 10 minutes (idea#131); on dock via processDisk
+    enableDiskSizeMonitor(storeHandle, localEngineId, diskFsRoot)
 
     log(chalk.bgMagenta('STARTING HEARTBEAT GENERATION'))
     const heartbeatIntervalMs = config.settings.heartbeatIntervalMs ?? 50000
