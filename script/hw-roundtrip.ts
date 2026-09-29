@@ -7,14 +7,17 @@
  *      ejectable: its store record carries diskTypes 'system', so it fails the
  *      Console eject-button rule, and `ejectDisk` by id AND by name is refused
  *      (trace status 'error') while / and /boot/firmware stay mounted.
- *   2. For every partition of one USB test disk, per cycle:
+ *   2. For every **ext4** partition of one USB test disk, per cycle (idea#134:
+ *      the Engine mounts only with `-t ext4`; vfat/exFAT partitions stay
+ *      unmounted and get no META.yaml):
  *        eject (`ejectDisk <diskId>` through the store command queue, the same
  *        path the Console uses) → store undocked, device null, no unmountError;
  *        no mount by source or target; /disks/<dev> gone
  *        → simulated unplug + re-plug of the USB device (sysfs)
  *        → the same udev remove/add events and Engine log lines as a real
- *          re-plug → every partition docked exactly once again, with the same
+ *          re-plug → every ext4 partition docked exactly once again, with the same
  *          disk id, META.yaml id kept, one mount by source and target.
+ *      Non-ext4 partitions on the stick are checked once: not mounted, no dock.
  *
  * Usage (on the Pi, from any Engine checkout with node_modules):
  *   npx tsx script/hw-roundtrip.ts [options]
@@ -112,6 +115,7 @@ const parentOf = async (dev: string) => sh(`lsblk -no PKNAME /dev/${dev.replace(
 const partitionsOf = async (disk: string) =>
     (await sh(`lsblk -rno NAME,TYPE /dev/${disk}`)).split('\n').map(l => l.split(' ')).filter(p => p[1] === 'part').map(p => p[0])
 const uuidOf = async (dev: string) => sh(`lsblk -no UUID /dev/${dev}`)
+const fstypeOf = async (dev: string) => (await sh(`lsblk -no FSTYPE /dev/${dev}`)).trim()
 const deviceByUuid = async (uuid: string) =>
     (await sh(`lsblk -rno NAME,UUID`)).split('\n').map(l => l.split(' ')).find(p => p[1] === uuid)?.[0] ?? null
 
@@ -304,7 +308,7 @@ const systemChecks = async (when: string) => {
 
 // ── 2. Round trip ───────────────────────────────────────────────────────────
 
-interface Part { dev: string, uuid: string, diskId: string, name: string, metaId: string }
+interface Part { dev: string, uuid: string, diskId: string, name: string, metaId: string, fstype: string }
 
 const metaIdOf = async (dev: string) => (await sh(`grep -E '^diskId:' /disks/${dev}/META.yaml | head -1 | sed 's/^diskId:[[:space:]]*//'`)).replace(/['"]/g, '')
 
@@ -322,17 +326,47 @@ const checkDocked = async (parts: Part[], when: string) => {
     }
 }
 
+/** idea#134: non-ext4 partitions must stay unmounted and never get a docked Disk. */
+const checkNonExt4Unmounted = async (devs: { dev: string, fstype: string, uuid: string }[], when: string) => {
+    for (const p of devs) {
+        const bySrc = await mountsBySource(p.dev)
+        check(bySrc.length === 0, `${when}: non-ext4 ${p.dev} (${p.fstype || 'unknown'}) not mounted (idea#134)`, `got ${JSON.stringify(bySrc)}`)
+        check(dockedOn(p.dev).length === 0, `${when}: non-ext4 ${p.dev} has no docked store record`, `found ${dockedOn(p.dev).map(r => r.id).join(',')}`)
+        check(!fs.existsSync(`/disks/${p.dev}/META.yaml`), `${when}: non-ext4 ${p.dev} has no META.yaml under /disks`)
+    }
+}
+
 const roundTrip = async () => {
-    const devs = await partitionsOf(DEVICE)
+    const allDevs = await partitionsOf(DEVICE)
     const parts: Part[] = []
-    for (const dev of devs) {
+    const nonExt4: { dev: string, fstype: string, uuid: string }[] = []
+    for (const dev of allDevs) {
+        const fstype = await fstypeOf(dev)
+        const uuid = await uuidOf(dev)
+        if (fstype !== 'ext4') {
+            nonExt4.push({ dev, fstype, uuid })
+            // Leftover mounts from an older untyped Engine: eject so the stick can unplug cleanly.
+            const leftover = dockedOn(dev)
+            if (leftover.length === 1) {
+                info(`ejecting leftover non-ext4 dock ${dev} (${fstype}) id=${leftover[0].id} before round trip`)
+                const t0 = sendEject(leftover[0].id)
+                const trace = await waitTrace(leftover[0].id, t0)
+                check(!!trace && trace.status === 'ok', `start: eject leftover non-ext4 ${leftover[0].id} (${dev})`, trace ? `status=${trace.status} ${trace.errorMessage ?? ''}` : 'no trace')
+            } else if ((await mountsBySource(dev)).length > 0) {
+                info(`non-ext4 ${dev} is mounted but not in the store — umount via tester sudo so unplug works`)
+                await sh(`sudo -n umount /dev/${dev} || sudo -n umount /disks/${dev} || true`)
+            }
+            continue
+        }
         const recs = dockedOn(dev)
         if (recs.length !== 1) { check(false, `start: exactly one docked record on ${dev}`, `found ${recs.length}`); continue }
-        parts.push({ dev, uuid: await uuidOf(dev), diskId: recs[0].id, name: recs[0].name, metaId: await metaIdOf(dev) })
+        parts.push({ dev, uuid, diskId: recs[0].id, name: recs[0].name, metaId: await metaIdOf(dev), fstype })
     }
-    if (parts.length === 0) abort(`no docked partitions on ${DEVICE}; dock the test disk first`)
-    info(`partitions: ${parts.map(p => `${p.dev} '${p.name}' ${p.diskId} uuid=${p.uuid} meta=${p.metaId}`).join('; ')}`)
+    if (parts.length === 0) abort(`no docked ext4 partitions on ${DEVICE}; dock the test disk first`)
+    info(`ext4 partitions (round-trip): ${parts.map(p => `${p.dev} '${p.name}' ${p.diskId} uuid=${p.uuid} meta=${p.metaId}`).join('; ')}`)
+    if (nonExt4.length) info(`non-ext4 partitions (must stay unmounted, idea#134): ${nonExt4.map(p => `${p.dev} ${p.fstype || '?'}`).join('; ')}`)
     await checkDocked(parts, 'start')
+    await checkNonExt4Unmounted(nonExt4, 'start')
 
     for (let c = 1; c <= CYCLES; c++) {
         write(`== cycle ${c}/${CYCLES}`)
@@ -357,7 +391,8 @@ const roundTrip = async () => {
         check(await waitFor(`/dev/${DEVICE} gone`, async () => !fs.existsSync(`/dev/${DEVICE}`)), `cycle ${c}: /dev/${DEVICE} gone after unplug`)
         await sleep(3000)
         const removedLog = logSince(off)
-        for (const d of [...parts.map(p => p.dev), DEVICE]) {
+        const removeDevs = [...new Set([...parts.map(p => p.dev), ...nonExt4.map(p => p.dev), DEVICE])]
+        for (const d of removeDevs) {
             check(udevSaw('remove', d), `cycle ${c}: udev 'remove' for ${d}`)
             if (off >= 0) check(removedLog.includes(`Processing the removal of USB device ${d}`), `cycle ${c}: Engine logged the removal of ${d}`)
         }
@@ -365,24 +400,30 @@ const roundTrip = async () => {
         udevLines = []
         info(`re-plug: ${METHOD === 'unbind' ? 'bind' : 'authorized=1'} ${usbId}`)
         await plug()
-        const back = await waitFor('all partitions back and docked', async () => {
+        const back = await waitFor('all ext4 partitions back and docked', async () => {
             for (const p of parts) {
                 const dev = await deviceByUuid(p.uuid)
                 if (!dev) return false
                 p.dev = dev
                 if (dockedOn(dev).length === 0 || (await mountsBySource(dev)).length === 0) return false
             }
+            // Refresh non-ext4 device names after re-plug
+            for (const p of nonExt4) {
+                const dev = await deviceByUuid(p.uuid)
+                if (dev) p.dev = dev
+            }
             return true
         })
-        check(back, `cycle ${c}: every partition re-docked after re-plug`, parts.map(p => `${p.name}: ${dockedOn(p.dev).map(r => r.id).join(',') || 'not docked'}`).join('; '))
+        check(back, `cycle ${c}: every ext4 partition re-docked after re-plug`, parts.map(p => `${p.name}: ${dockedOn(p.dev).map(r => r.id).join(',') || 'not docked'}`).join('; '))
         await sleep(3000)   // let any late dock-time dedupe or undock happen before checking
         stopUdev()
         const addedLog = logSince(off)
-        for (const d of [...parts.map(p => p.dev)]) {
+        for (const d of [...parts.map(p => p.dev), ...nonExt4.map(p => p.dev)]) {
             check(udevSaw('add', d), `cycle ${c}: udev 'add' for ${d}`)
             if (off >= 0) check(addedLog.includes(`A disk on device /dev/engine/${d} has been added`), `cycle ${c}: Engine logged the add of ${d}`)
         }
         await checkDocked(parts, `cycle ${c} after re-plug`)
+        await checkNonExt4Unmounted(nonExt4, `cycle ${c} after re-plug`)
         const u = udevLines.length ? '' : ' (no udev lines captured)'
         info(`udev events captured this cycle${u}`)
     }
