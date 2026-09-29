@@ -7,6 +7,32 @@ import { runWithTrace, flushTrace } from "./CommandLogger.js";
 import { print } from './utils.js';
 
 
+/**
+ * One-shot error trace for refusals before execute (unknown command, scope,
+ * argument parse). idea#122: every queued command must leave a trace the
+ * Console can show; previously these paths printed and returned with no trace.
+ */
+const recordErrorTrace = (
+    commandLogHandle: DocHandle<CommandLogStore> | null | undefined,
+    commandName: string,
+    argsJson: string,
+    message: string
+): void => {
+    if (!commandLogHandle) return;
+    const traceId = crypto.randomUUID();
+    addTrace(commandLogHandle, {
+        traceId,
+        command: commandName || '(empty)',
+        args: argsJson,
+        startedAt: Date.now(),
+        completedAt: null,
+        status: 'running',
+        errorMessage: null,
+    });
+    closeTrace(commandLogHandle, traceId, 'error', message);
+}
+
+
 export const handleCommand = async (
     commands: CommandDefinition[],
     storeHandle: DocHandle<Store> | null,
@@ -19,7 +45,14 @@ export const handleCommand = async (
     const command = commands.find(cmd => cmd.name === commandName);
 
     if (!command) {
-        print(`Unknown command: ${commandName}`);
+        const message = `Unknown command: ${commandName}`;
+        print(message);
+        recordErrorTrace(
+            commandLogHandle,
+            commandName || '(empty)',
+            JSON.stringify({ input: trimmedInput }),
+            message
+        );
         return;
     }
 
@@ -40,12 +73,16 @@ export const handleCommand = async (
 
     // Scope checking
     if (context === 'console' && command.scope === 'engine') {
-        print(`Error: Command '${commandName}' can only be executed on an engine. Use 'send <engineId> ${commandName} ...' to execute it remotely.`);
+        const message = `Error: Command '${commandName}' can only be executed on an engine. Use 'send <engineId> ${commandName} ...' to execute it remotely.`;
+        print(message);
+        recordErrorTrace(commandLogHandle, commandName, JSON.stringify(stringArgs), message);
         return;
     }
 
     if (context === 'engine' && command.scope === 'console') {
-        print(`Error: Command '${commandName}' can only be executed on a console.`);
+        const message = `Error: Command '${commandName}' can only be executed on a console.`;
+        print(message);
+        recordErrorTrace(commandLogHandle, commandName, JSON.stringify(stringArgs), message);
         return;
     }
 
@@ -60,7 +97,9 @@ export const handleCommand = async (
         const required = isVariadic && lastArg.optional ? command.args.length - 1 : command.args.length;
         if (args.length < required) throw new Error("Insufficient arguments");
     } catch (error: any) {
-        console.error(`Error: ${error.message}`);
+        const message = `Error: ${error.message}`;
+        console.error(message);
+        recordErrorTrace(commandLogHandle, commandName, JSON.stringify(stringArgs), message);
         return;
     }
 
