@@ -35,6 +35,7 @@ const RUNTIME_FILES = [
     'src/data/CopyMoveApp.ts',
     'src/monitors/mounts.ts',
     'src/data/CreateFilesDisk.ts',
+    'src/data/EraseDisk.ts',
 ]
 
 // Every `sudo <cmd> ...` in a zx template literal ($`sudo ...`), with the command.
@@ -86,7 +87,8 @@ describe('Engine sudoers asset (idea#80)', () => {
 
     it('covers every runtime sudo call in src/', () => {
         const allowed = [
-            'mount /dev/${device} ${disksRoot()}/${device}',
+            // 11-engine-files (idea#134): typed ext4 mount
+            '/usr/bin/mount -t ext4 /dev/${device} ${mp}',
             'mkdir -p ${disksRoot()}/${device}',
             'umount ${disksRoot()}/${device}',
             'mkdir -p ${disksRoot()}/old',
@@ -97,10 +99,12 @@ describe('Engine sudoers asset (idea#80)', () => {
             '${SUDO_RMDIR} ${mountPoint}',
             // 11-engine-files (idea#131): createFilesDisk, disk root folder only
             '-n ${SUDO_CHOWN} -h pi:pi ${mountPoint}',
+            // 11-engine-files (idea#134): eraseDisk script (no arg list in sudoers)
+            '-n ${ERASE_SCRIPT} ${a.device} ${a.serial} ${String(a.sizeBytes)} ${a.label} ${a.stagingDir}',
         ]
         const calls = RUNTIME_FILES.flatMap(f => sudoCalls(src(f)))
         expect(calls.length).toBeGreaterThan(0)
-        for (const call of calls) expect(allowed, `sudo ${call} is not in 10-engine.sudoers`).toContain(call)
+        for (const call of calls) expect(allowed, `sudo ${call} is not in 10-engine / 11-engine-files`).toContain(call)
         // Meta.ts and Engine.ts runtime calls
         const meta = src('src/data/Meta.ts')
         expect(meta).toContain('$`sudo cat ${path}`')
@@ -143,10 +147,13 @@ describe('Engine sudoers asset (idea#80)', () => {
             'pi ALL=(root) NOPASSWD: /usr/bin/rmdir /disks/sd[a-z][12]',
             // createFilesDisk: the disk root folder only, never recursive (idea#131)
             'pi ALL=(root) NOPASSWD: /usr/bin/chown -h pi\\:pi /disks/sd[a-z][12]',
+            'pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-erase-disk',
+            'pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]',
         ])
         expect(rulesText).not.toMatch(/tee \/disks/)
         expect(rulesText).not.toMatch(/rmdir/)   // the rmdir entry lives in 11-engine-files (idea#126)
         expect(rulesText).not.toMatch(/chown -h/) // the chown -h entry lives in 11-engine-files (idea#131)
+        expect(rulesText).not.toMatch(/idea-erase-disk/) // erase script lives in 11-engine-files (idea#134)
         expect(src('src/data/CreateFilesDisk.ts')).toContain("export const SUDO_CHOWN = '/usr/bin/chown'")
         const visudo = ['/usr/sbin/visudo', '/sbin/visudo'].find(p => fs.existsSync(p))
         if (!visudo) ctx.skip()

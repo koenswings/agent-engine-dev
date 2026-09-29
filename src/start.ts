@@ -18,6 +18,8 @@ import { recoverInterruptedOperations } from './data/Operations.js'
 import { enableDockerMetricsMonitor } from './monitors/dockerMetricsMonitor.js'
 import { enableDiskSizeMonitor } from './data/DiskSize.js'
 import { ensureEngineStateDir, setFilesMountStore } from './data/FilesMount.js'
+import { clearStaleEraseStaging } from './data/EraseDisk.js'
+import { refreshUnformattedDisks } from './data/UnformattedDisks.js'
 import { diskFsRoot } from './data/Disk.js'
 import { copyApp, moveApp } from './data/CopyMoveApp.js'
 import { backupInstance } from './monitors/backupMonitor.js'
@@ -207,6 +209,8 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // overrides and the remount scheduler's store handle
     await ensureEngineStateDir()
     setFilesMountStore(storeHandle)
+    await clearStaleEraseStaging()
+    await refreshUnformattedDisks(storeHandle).catch(e => log(`unformattedDisks at startup: ${e}`))
 
     log(chalk.bgMagenta('STARTING HEARTBEAT GENERATION'))
     const heartbeatIntervalMs = config.settings.heartbeatIntervalMs ?? 50000

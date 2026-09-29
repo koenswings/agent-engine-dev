@@ -1,0 +1,162 @@
+#!/bin/bash
+# idea-erase-disk — erase a whole non-system disk to an empty IDEA disk (idea#134)
+#
+# Installed as a root-owned COPY at /usr/local/sbin/idea-erase-disk (never a symlink).
+# Allowed by sudoers with no argument list; this script validates every argument.
+#
+# Usage: idea-erase-disk <device> <serial|-> <sizeBytes> <label> <stagingDir>
+#   device     /^\/dev\/sd[a-z]$/  (whole disk only)
+#   serial     "-" or a short safe string matching the disk
+#   sizeBytes  digits; must match lsblk SIZE
+#   label      /^[A-Za-z0-9 _()-]{1,16}$/  (ext4 limit; always "IDEA Disk" in practice)
+#   stagingDir exactly /home/pi/.local/state/idea-engine/erase-staging/<id>
+#              real directory owned by pi; no symlink in the path; contains only META.yaml
+#
+# On failure after wipefs started, the EXIT trap runs wipefs -a so the disk shows
+# up as unformatted. Never mounts anything. No role-marker refusal.
+
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+LSBLK=/usr/bin/lsblk
+FINDMNT=/usr/bin/findmnt
+WIPEFS=/usr/sbin/wipefs
+SFDISK=/usr/sbin/sfdisk
+MKFS=/usr/sbin/mkfs.ext4
+UDEVADM=/usr/bin/udevadm
+STAT=/usr/bin/stat
+REALPATH=/usr/bin/realpath
+
+die() { echo "refused: $*" >&2; exit 1; }
+step() { echo "STEP:$*"; }
+
+DEVICE="${1:-}"
+SERIAL="${2:-}"
+SIZE_BYTES="${3:-}"
+LABEL="${4:-}"
+STAGING="${5:-}"
+
+# ── Argument checks ──────────────────────────────────────────────────────────
+[[ "$DEVICE" =~ ^/dev/sd[a-z]$ ]] || die "device must be a whole disk /dev/sdX (got '${DEVICE:-}')"
+[[ "$SERIAL" == "-" || "$SERIAL" =~ ^[A-Za-z0-9_.:-]{1,64}$ ]] || die "serial is not a safe string"
+[[ "$SIZE_BYTES" =~ ^[0-9]+$ ]] || die "sizeBytes must be digits"
+[[ "$LABEL" =~ ^[A-Za-z0-9\ _\(\)-]{1,16}$ ]] || die "label must be 1–16 bytes of A–Z a–z 0–9 space - _ ( )"
+# Byte length (ASCII): refuse before mkfs (E10)
+label_bytes=$(printf '%s' "$LABEL" | wc -c)
+[[ "$label_bytes" -le 16 ]] || die "label longer than 16 bytes"
+
+[[ "$STAGING" =~ ^/home/pi/\.local/state/idea-engine/erase-staging/[A-Za-z0-9_-]+$ ]] \
+  || die "stagingDir must be under /home/pi/.local/state/idea-engine/erase-staging/<id>"
+# Refuse any symlink in the staging path
+check="$STAGING"
+while [[ "$check" != "/" && "$check" != "" ]]; do
+  if [[ -L "$check" ]]; then
+    die "staging path contains a symlink ($check)"
+  fi
+  check=$(dirname "$check")
+done
+[[ -d "$STAGING" ]] || die "stagingDir is not a directory"
+owner=$($STAT -c '%U' "$STAGING" 2>/dev/null || true)
+[[ "$owner" == "pi" ]] || die "stagingDir must be owned by pi (got ${owner:-unknown})"
+# Staging must contain only META.yaml (and maybe lost+found never here — empty except META)
+shopt -s nullglob dotglob
+entries=("$STAGING"/*)
+shopt -u nullglob dotglob
+for e in "${entries[@]:-}"; do
+  base=$(basename "$e")
+  [[ "$base" == "META.yaml" ]] || die "stagingDir may contain only META.yaml (found $base)"
+done
+[[ -f "$STAGING/META.yaml" ]] || die "stagingDir is missing META.yaml"
+
+# ── Device re-checks (authoritative) ─────────────────────────────────────────
+step checking
+type=$($LSBLK -dn -o TYPE "$DEVICE" 2>/dev/null | head -1 | tr -d '[:space:]' || true)
+[[ "$type" == "disk" ]] || die "$DEVICE is not TYPE=disk (got '${type:-}')"
+
+actual_serial=$($LSBLK -dn -o SERIAL "$DEVICE" 2>/dev/null | head -1 | tr -d '[:space:]' || true)
+actual_size=$($LSBLK -dn -b -o SIZE "$DEVICE" 2>/dev/null | head -1 | tr -d '[:space:]' || true)
+if [[ "$SERIAL" != "-" ]]; then
+  [[ "$actual_serial" == "$SERIAL" ]] || die "serial mismatch (expected $SERIAL, got ${actual_serial:--})"
+fi
+[[ "$actual_size" == "$SIZE_BYTES" ]] || die "size mismatch (expected $SIZE_BYTES, got ${actual_size:--})"
+
+# System disk: findmnt / and /boot/firmware → PKNAME
+is_system=0
+for mp in / /boot/firmware; do
+  src=$($FINDMNT -n -o SOURCE "$mp" 2>/dev/null | head -1 || true)
+  [[ -n "$src" ]] || continue
+  # Resolve to a block device name
+  src_dev=${src#/dev/}
+  src_dev=${src_dev%%[*]}  # drop bind suffix
+  pk=$($LSBLK -no PKNAME "/dev/$src_dev" 2>/dev/null | head -1 | tr -d '[:space:]' || true)
+  if [[ -z "$pk" ]]; then
+    # Whole disk or name parsing fallback
+    if [[ "$src_dev" =~ ^(sd[a-z])[0-9]+$ ]]; then pk="${BASH_REMATCH[1]}"
+    elif [[ "$src_dev" =~ ^(mmcblk[0-9]+)p[0-9]+$ ]]; then pk="${BASH_REMATCH[1]}"
+    elif [[ "$src_dev" =~ ^(nvme[0-9]+n[0-9]+)p[0-9]+$ ]]; then pk="${BASH_REMATCH[1]}"
+    else pk="$src_dev"
+    fi
+  fi
+  if [[ "/dev/$pk" == "$DEVICE" || "$src" == "$DEVICE" ]]; then
+    is_system=1
+    break
+  fi
+done
+[[ "$is_system" -eq 0 ]] || die "$DEVICE holds the root or boot filesystem"
+
+# Nothing mounted on the device or its partitions; no swap
+while read -r name typ fst mountpoint; do
+  [[ -n "$name" ]] || continue
+  if [[ -n "$mountpoint" && "$mountpoint" != "" ]]; then
+    die "$DEVICE has a mounted partition ($name at $mountpoint)"
+  fi
+  if [[ "$fst" == "swap" ]]; then
+    die "$DEVICE has a swap partition ($name)"
+  fi
+done < <($LSBLK -nr -o NAME,TYPE,FSTYPE,MOUNTPOINT "$DEVICE" 2>/dev/null || true)
+
+# Also refuse if findmnt shows anything under this disk
+if $FINDMNT -S "$DEVICE" -n >/dev/null 2>&1; then
+  die "$DEVICE (or a partition) is still mounted"
+fi
+part_base=${DEVICE#/dev/}
+if $FINDMNT -n 2>/dev/null | grep -E "/dev/${part_base}[0-9]" >/dev/null 2>&1; then
+  die "a partition of $DEVICE is still mounted"
+fi
+
+# ── Destructive path (trap wipefs -a on error) ───────────────────────────────
+ERASE_STARTED=0
+cleanup() {
+  local ec=$?
+  if [[ "$ERASE_STARTED" -eq 1 && "$ec" -ne 0 ]]; then
+    echo "erase failed; wiping signatures on $DEVICE" >&2
+    $WIPEFS -a "$DEVICE" >/dev/null 2>&1 || true
+  fi
+  exit "$ec"
+}
+trap cleanup EXIT
+
+ERASE_STARTED=1
+step partitioning
+$WIPEFS -a "$DEVICE" >/dev/null
+# GPT with one partition covering the disk
+printf 'label: gpt\n,+\n' | $SFDISK "$DEVICE" >/dev/null
+$UDEVADM settle
+PART="${DEVICE}1"
+# Wait briefly for the partition node
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [[ -b "$PART" ]] && break
+  sleep 0.2
+done
+[[ -b "$PART" ]] || die "partition $PART did not appear after sfdisk"
+
+step "creating filesystem"
+$MKFS -F -L "$LABEL" -E root_owner=1000:1000 -d "$STAGING" "$PART" >/dev/null
+$UDEVADM settle
+
+step mounting
+# Engine mounts; script only settles
+ERASE_STARTED=0
+trap - EXIT
+echo "ok: erased $DEVICE as empty IDEA disk (label $LABEL)"
+exit 0

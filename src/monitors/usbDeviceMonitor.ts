@@ -6,6 +6,9 @@ import { $, fs, YAML, chalk } from 'zx'
 $.verbose = false;
 import { Disk, clearDuplicateDiskRecords, createOrUpdateDisk, isSystemDiskRecord, processDisk } from '../data/Disk.js'
 import { flushFilesRemountNow, optedInInstances } from '../data/FilesMount.js'
+import { isSystemDevice, systemDriveNames, driveNameOf } from '../data/SystemDisk.js'
+import { refreshUnformattedDisks } from '../data/UnformattedDisks.js'
+import { isEraseDeviceLocked, setEraseAddDevice } from '../data/EraseDisk.js'
 import { findDiskByDevice, findDisksByDevice, Store, getDisksOfEngine, getLocalEngine } from '../data/Store.js'
 import { DeviceName, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../data/CommonTypes.js'
 
@@ -63,25 +66,31 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         throw new Error(`No local engine found in the store`)
     }
 
-    // Detect the root partition (e.g. sda2) at startup so we can:
-    //   - register it as a system disk
-    //   - skip the whole-disk parent (e.g. sda) and the boot partition (e.g. sda1)
-    // findmnt reads procfs — safe to run in all modes, no sudo needed.
+    // System drives via findmnt / + /boot/firmware and lsblk PKNAME (idea#134).
+    // Covers a USB system disk and idea02's Intenso — never by name/model alone.
     let systemDevice: DeviceName | null = null
-    let systemBootDevice: DeviceName | null = null   // e.g. 'sda1' — the boot partition to skip
+    let systemBootDevice: DeviceName | null = null
+    let systemDrives: string[] = []
     try {
+        systemDrives = await systemDriveNames()
         const rootSource = (await $`findmnt -n -o SOURCE /`).stdout.trim()
-        // rootSource is e.g. /dev/sda2 — strip the /dev/ prefix
-        const rootDev = rootSource.replace('/dev/', '') as DeviceName
-        if (rootDev.match(/^sd[a-z][0-9]+$/)) {
+        const rootDev = rootSource.replace(/^\/dev\//, '').replace(/\[.*\]$/, '') as DeviceName
+        if (rootDev && !rootDev.startsWith('overlay')) {
             systemDevice = rootDev
-            // Boot partition is parent (strip trailing digits) + '1', e.g. sda2 → sda1
-            const parentDev = rootDev.replace(/[0-9]+$/, '')
-            systemBootDevice = (parentDev + '1') as DeviceName
-            log(`System disk detected: root=${systemDevice}, boot=${systemBootDevice}`)
+            const parent = driveNameOf(rootDev)
+            // Boot partition: prefer the findmnt /boot/firmware source's device
+            try {
+                const bootSrc = (await $`findmnt -n -o SOURCE /boot/firmware`).stdout.trim()
+                const bootDev = bootSrc.replace(/^\/dev\//, '').replace(/\[.*\]$/, '')
+                if (bootDev) systemBootDevice = bootDev as DeviceName
+                else systemBootDevice = (parent + '1') as DeviceName
+            } catch {
+                systemBootDevice = (parent + '1') as DeviceName
+            }
+            log(`System disk detected: root=${systemDevice}, boot=${systemBootDevice}, drives=${systemDrives.join(',')}`)
         }
     } catch (e) {
-        log(`Could not detect system device via findmnt: ${e}`)
+        log(`Could not detect system device: ${e}`)
     }
 
     const validDevice = function (device: string): boolean {
@@ -101,10 +110,16 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         if (validDevice(device)) {
             log(`The disk on device ${device} has a valid device name`)
 
-            // Skip whole-disk entries (e.g. sda, sdb) — raw block devices with no
-            // filesystem; never directly mountable.
+            // Skip whole-disk entries for mounting (idea#134): accepted by validDevice
+            // so lsblk can list them as unformatted candidates; never mounted.
             if (device.match(/^sd[a-z]$/)) {
-                log(`Device ${device} is a whole-disk entry — skipping`)
+                log(`Device ${device} is a whole-disk entry — refreshing unformattedDisks, not mounting`)
+                await refreshUnformattedDisks(storeHandle).catch(e => log(`unformatted refresh: ${e}`))
+                return
+            }
+            // Skip devices locked by eraseDisk for the whole erase (idea#134)
+            if (isEraseDeviceLocked(device) || isEraseDeviceLocked(driveNameOf(device))) {
+                log(`Device ${device} is locked for erase — addDevice skipped`)
                 return
             }
 
@@ -229,6 +244,8 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
             log(`The disk on device ${device} is not on a supported device name`)
         }
     }
+
+        setEraseAddDevice(addDevice)
 
     const removeDevice = async (path: string) => {
         const device = path.split('/').pop()

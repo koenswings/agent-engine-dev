@@ -13,6 +13,10 @@
 #   root owner   src/data/CreateFilesDisk.ts (runSudoChownRoot: createFilesDisk, only
 #                when pi can't write the disk root; the previous uid:gid and mode go
 #                into the command trace first; idea#131, Files Disk step 1)
+#   erase disk   /usr/local/sbin/idea-erase-disk (idea#134): no argument list; the
+#                script validates device/serial/size/label/staging itself
+#   typed mount  src/monitors/mounts.ts (safeMount): exactly
+#                /usr/bin/mount -t ext4 /dev/<dev> /disks/<dev> (idea#134)
 #
 # The code runs `sudo /usr/bin/tee /disks/<device>/META.yaml > /dev/null` with the
 # YAML on stdin, so sudo sees exactly "/usr/bin/tee /disks/<device>/META.yaml", and
@@ -27,3 +31,5 @@
 pi ALL=(root) NOPASSWD: /usr/bin/tee /disks/sd[a-z][12]/META.yaml
 pi ALL=(root) NOPASSWD: /usr/bin/rmdir /disks/sd[a-z][12]
 pi ALL=(root) NOPASSWD: /usr/bin/chown -h pi\:pi /disks/sd[a-z][12]
+pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-erase-disk
+pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]

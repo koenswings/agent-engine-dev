@@ -23,7 +23,20 @@ export interface Engine {
   capabilitiesBootedAt?: Timestamp;
   /** Set by eraseDisk for its whole run (Files Disk step 3, not built yet); createFilesDisk refuses that disk meanwhile (idea#131) */
   eraseInProgress?: EraseInProgress | null;
+  /** Whole non-system disks without ext4 (idea#134); rebuilt on dock/undock and at startup */
+  unformattedDisks?: UnformattedDiskPublic[];
 }
+
+export interface UnformattedDiskPublic {
+  candidateId: string
+  device: string
+  sizeBytes: number
+  model: string | null
+  fsType: string | null
+  label: string
+  serial?: string | null
+}
+
 
 /** Engine.eraseInProgress (proposals/files-disk.md §7.5); written by eraseDisk (step 3). */
 export interface EraseInProgress {
@@ -37,13 +50,14 @@ export interface EraseInProgress {
  *   diskIdArgs: installApp, createBackupDisk and ejectDisk take disk ids.
  *   filesDisk:  the Files Disk role and createFilesDisk <diskId> [<shareName…>] (idea#131).
  *   filesMount: Files Disk binds into opted-in Apps (x-app.filesMount, idea#133).
+ *   eraseDisk:  summariseDisk + eraseDisk (idea#134).
  * Written at every startup as a whole new list, with capabilitiesBootedAt set
  * to that startup's lastBooted. A Console counts a capability only when
  * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk']
 
 import { config } from './Config.js';
 
@@ -80,7 +94,9 @@ export const initialiseLocalEngine = async (): Promise<Engine> => {
       lastHalted: null,
       commands: [],
       capabilities: [...ENGINE_CAPABILITIES],
-      capabilitiesBootedAt: booted
+      capabilitiesBootedAt: booted,
+      eraseInProgress: null,
+      unformattedDisks: [],
     }
     return localEngine
   } catch (e) {
@@ -111,6 +127,8 @@ export const createOrUpdateEngine = async (storeHandle: DocHandle<Store>, engine
         // Whole new list, never appended: a stale or extra entry disappears
         engine.capabilities = [...ENGINE_CAPABILITIES]
         engine.capabilitiesBootedAt = booted
+        if (engine.unformattedDisks === undefined) engine.unformattedDisks = []
+        if (engine.eraseInProgress === undefined) engine.eraseInProgress = null
       }
     })
   return engine!
@@ -497,6 +515,10 @@ export const installUdev = async (exec: any, enginePath: string) => {
     await exec`sudo apt install udev -y`;
     await copyAsset(exec, enginePath, '90-docking.rules', '/etc/udev/rules.d')
     await installEngineSudoers(exec, enginePath)
+    // idea-erase-disk: root-owned COPY in /usr/local/sbin (never a symlink) (idea#134)
+    print(chalk.blue('  - Installing idea-erase-disk...'))
+    await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-erase-disk /usr/local/sbin/idea-erase-disk`
+    print(chalk.green('  - /usr/local/sbin/idea-erase-disk installed'))
     await createDir(exec, '/disks', "0755", "0:0")
 
     // Configure /dev/engine ownership so the pi user can write sentinel files.

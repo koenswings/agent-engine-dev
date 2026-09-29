@@ -101,6 +101,17 @@ These commands perform actions on the system. Some are restricted to an `engine`
 - **Usage:** `createBackupDisk <diskId> <mode> <instanceName...>` (idea#128; the argument was `diskName`). The disk is resolved by the shared disk resolver (see [Disk arguments](#disk-arguments)). An unknown, undocked, remote or ambiguous disk, a bad mode or a missing store ends the command trace as `error` with the reason.
 - **Scope:** `engine`
 
+
+### `summariseDisk`
+- **Description:** Content summary for erase confirmation (idea#134). Walks a mounted IDEA disk (or reports `readable: false` for an unformatted candidate) and stores the JSON `contentSummary` on `CommandTrace.result`. Caps: 100 000 entries or 10 s → `partial: true`. Backups from `BACKUP.yaml` + store (no `borg list`).
+- **Usage:** `summariseDisk <diskId|candidateId>`
+- **Capability:** `eraseDisk`
+
+### `eraseDisk`
+- **Description:** Erase any non-system disk to an empty IDEA disk (idea#134): GPT + one ext4 partition, label "IDEA Disk", only `META.yaml`, `diskTypes` `['empty']`. Requires a fresh `summariseDisk` trace (same target, &lt;10 min) and the exact label as confirmation. Eject path first; blockers for backup / instance lock / Nextcloud first-start|upgrade; `docker compose down -v` per instance; instances and app entries removed (E9); backup links to an erased Backup Disk cleared. Script: `/usr/local/sbin/idea-erase-disk` (11-engine-files, no argument list).
+- **Usage:** `eraseDisk <targetId> <summaryTraceId> <confirmName…>`
+- **Capability:** `capabilities.includes('eraseDisk') && capabilitiesBootedAt === lastBooted`
+
 ### `createFilesDisk`
 - **Description:** Adds the Files role to a docked disk (idea#131, Files Disk step 1): writes `FILES.yaml` and an empty `files/` folder in the disk root, plus `META.yaml` if it is missing (the disk ID is always kept), then processes the disk again so `diskTypes` gains `'files'` next to its other roles (for example `['app', 'files']` or `['app', 'backup', 'files']`). Works on an empty ext4 disk (`['empty']`) and on an App and/or Backup Disk. Nothing else on the disk changes: `apps/`, `services/`, `instances/`, `BACKUP.yaml` and `backups/` are untouched, existing instances keep running, and the filesystem label is never changed. Mounting `files/` into opted-in Apps is idea#133 (step 2): `createFilesDisk` ends with `processDisk`, which schedules a remount of other-disk opted-in instances (same-disk instances start with the override via `processAppDisk`).
 - **Usage:** `createFilesDisk <diskId> [<shareName…>]`. The disk **ID** only (the command has no name form, so there is no name fallback). The share name is optional, takes the rest of the line and defaults to `School Files`: 1 to 16 characters from `A–Z a–z 0–9`, space, hyphen, underscore and parentheses, with no leading or trailing space (tokens are joined with one space). The trace records `args.diskId` and `args.shareName` (the tokens, `[]` for the default).
@@ -151,7 +162,7 @@ Every refusal throws, so the command trace ends as `error`. The resolver does no
 
 A Console can tell whether the Engine takes disk ids from the Engine record: `capabilities.includes('diskIdArgs') && capabilitiesBootedAt === lastBooted` (see ARCHITECTURE.md, Engine capabilities).
 
-`createFilesDisk` (idea#131) is new and takes the disk ID only: it uses `lookupDiskById` (the id rule above, without the name fallback). A Console knows the Engine has it when `capabilities.includes('filesDisk') && capabilitiesBootedAt === lastBooted`. Files binds into Apps (`Instance.filesMounts`) need `capabilities.includes('filesMount')` as well (idea#133).
+`createFilesDisk` (idea#131) is new and takes the disk ID only: it uses `lookupDiskById` (the id rule above, without the name fallback). A Console knows the Engine has it when `capabilities.includes('filesDisk') && capabilitiesBootedAt === lastBooted`. Files binds into Apps (`Instance.filesMounts`) need `capabilities.includes('filesMount')` as well (idea#133). Erase needs `capabilities.includes('eraseDisk')` (idea#134).
 
 ---
 

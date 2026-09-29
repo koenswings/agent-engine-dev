@@ -24,6 +24,8 @@ import { backupInstance, restoreApp, createBackupDiskConfig, runningBackupOnDisk
 import { cancelOperation } from './Operations.js';
 import { DiskArgResult, lookupDiskArg, resolveDiskArg } from './DiskArg.js';
 import { createFilesDisk } from './CreateFilesDisk.js';
+import { summariseDisk, attachTraceResult } from './SummariseDisk.js';
+import { eraseDisk } from './EraseDisk.js';
 import { testContext } from "../../test/testContext.js";
 
 
@@ -361,6 +363,24 @@ const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, dis
  * command has no old name form); the share name takes the rest of the line and
  * defaults to "School Files". Refusals throw, so the trace ends as `error`.
  */
+
+/** summariseDisk <diskId|candidateId> (idea#134). Result in CommandTrace.result. */
+const summariseDiskWrapper = async (storeHandle: DocHandle<Store> | null, targetId: string) => {
+    if (!storeHandle) { console.error(chalk.red('Store is not available.')); return }
+    const summary = await summariseDisk(storeHandle, targetId)
+    attachTraceResult(summary)
+    print(chalk.green(`Summary for ${summary.label}: readable=${summary.readable} partial=${summary.partial}`))
+}
+
+/** eraseDisk <targetId> <summaryTraceId> <confirmName…> (idea#134). */
+const eraseDiskWrapper = async (storeHandle: DocHandle<Store> | null, targetId: string, summaryTraceId: string, ...confirmTokens: string[]) => {
+    if (!storeHandle) { console.error(chalk.red('Store is not available.')); return }
+    const confirmName = confirmTokens.join(' ')
+    const result = await eraseDisk(storeHandle, targetId, summaryTraceId, confirmName)
+    attachTraceResult({ diskId: result.diskId, removedInstances: result.removedInstances })
+    print(chalk.green(`Erased → empty IDEA disk ${result.diskId}`))
+}
+
 const createFilesDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskId: string, ...shareNameTokens: string[]) => {
     if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     const shareName = shareNameTokens.length > 0 ? shareNameTokens.join(' ') : undefined
@@ -457,6 +477,8 @@ export const commands: CommandDefinition[] = [
     { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "mode" }, { type: "string", name: "instanceNames", variadic: true }], scope: 'engine' },
     { name: "createFilesDisk", execute: createFilesDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "shareName", variadic: true, optional: true }], scope: 'engine' },
+    { name: "summariseDisk", execute: summariseDiskWrapper, args: [{ type: "string", name: "targetId" }], scope: 'engine' },
+    { name: "eraseDisk", execute: eraseDiskWrapper, args: [{ type: "string", name: "targetId" }, { type: "string", name: "summaryTraceId" }, { type: "string", name: "confirmName", variadic: true }], scope: 'engine' },
     { name: "cancelOperation", execute: async (storeHandle: DocHandle<Store> | null, opId: string) => {
         if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
         const err = cancelOperation(storeHandle, opId)
