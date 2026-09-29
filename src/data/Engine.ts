@@ -21,18 +21,28 @@ export interface Engine {
   capabilities?: string[];
   /** The lastBooted of the startup that wrote `capabilities` (idea#128) */
   capabilitiesBootedAt?: Timestamp;
+  /** Set by eraseDisk for its whole run (Files Disk step 3, not built yet); createFilesDisk refuses that disk meanwhile (idea#131) */
+  eraseInProgress?: EraseInProgress | null;
+}
+
+/** Engine.eraseInProgress (proposals/files-disk.md §7.5); written by eraseDisk (step 3). */
+export interface EraseInProgress {
+  targetId: string;
+  label: string;
+  step: 'checking' | 'stopping and unmounting' | 'partitioning' | 'creating filesystem' | 'mounting';
 }
 
 /**
  * Capabilities this Engine build advertises (idea#128, Files Disk step 0b).
  *   diskIdArgs: installApp, createBackupDisk and ejectDisk take disk ids.
+ *   filesDisk:  the Files Disk role and createFilesDisk <diskId> [<shareName…>] (idea#131).
  * Written at every startup as a whole new list, with capabilitiesBootedAt set
  * to that startup's lastBooted. A Console counts a capability only when
  * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk']
 
 import { config } from './Config.js';
 
