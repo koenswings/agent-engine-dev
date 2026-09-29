@@ -34,6 +34,7 @@ const RUNTIME_FILES = [
     'src/data/Instance.ts',
     'src/data/CopyMoveApp.ts',
     'src/monitors/mounts.ts',
+    'src/data/CreateFilesDisk.ts',
 ]
 
 // Every `sudo <cmd> ...` in a zx template literal ($`sudo ...`), with the command.
@@ -94,6 +95,8 @@ describe('Engine sudoers asset (idea#80)', () => {
             'rm -fr ${disksRoot()}/old',
             // 11-engine-files (idea#126): removeMountPointFolder in mounts.ts
             '${SUDO_RMDIR} ${mountPoint}',
+            // 11-engine-files (idea#131): createFilesDisk, disk root folder only
+            '-n ${SUDO_CHOWN} -h pi:pi ${mountPoint}',
         ]
         const calls = RUNTIME_FILES.flatMap(f => sudoCalls(src(f)))
         expect(calls.length).toBeGreaterThan(0)
@@ -138,9 +141,13 @@ describe('Engine sudoers asset (idea#80)', () => {
         expect(rules).toEqual([
             'pi ALL=(root) NOPASSWD: /usr/bin/tee /disks/sd[a-z][12]/META.yaml',
             'pi ALL=(root) NOPASSWD: /usr/bin/rmdir /disks/sd[a-z][12]',
+            // createFilesDisk: the disk root folder only, never recursive (idea#131)
+            'pi ALL=(root) NOPASSWD: /usr/bin/chown -h pi\\:pi /disks/sd[a-z][12]',
         ])
         expect(rulesText).not.toMatch(/tee \/disks/)
         expect(rulesText).not.toMatch(/rmdir/)   // the rmdir entry lives in 11-engine-files (idea#126)
+        expect(rulesText).not.toMatch(/chown -h/) // the chown -h entry lives in 11-engine-files (idea#131)
+        expect(src('src/data/CreateFilesDisk.ts')).toContain("export const SUDO_CHOWN = '/usr/bin/chown'")
         const visudo = ['/usr/sbin/visudo', '/sbin/visudo'].find(p => fs.existsSync(p))
         if (!visudo) ctx.skip()
         const out = await $`${visudo} -cf ${path.join(ROOT, 'script/build_image_assets/11-engine-files.sudoers')}`.nothrow()

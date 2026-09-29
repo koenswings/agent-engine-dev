@@ -25,6 +25,8 @@ and chosen for fast startup in tests, not for production use.
 |-----------|---------|
 | `disk-sample-v1/` | Baseline fixture — single app at version 1.0 |
 | `disk-sample-v1.1/` | Minor upgrade of `disk-sample-v1` — same instance at version 1.1 |
+| `disk-files/` | Files Disk (idea#131): `META.yaml`, `FILES.yaml` (share "School Files") and `files/` |
+| `disk-files-app/` | App Disk that is also a Files Disk: `sample-files-1.0` opts in with `x-app.filesMount` (used from Files Disk step 2), no instance |
 
 ## Adding fixtures
 

@@ -9,7 +9,7 @@
  *     no fallback to undocked or other-engine records
  *   - createBackupDisk <diskId> …: name path with warning, refusals throw
  *   - optional variadic: zero tokens accepted, recorded as []
- *   - capabilities ['diskIdArgs'] rewritten as a whole list at every startup,
+ *   - capabilities ['diskIdArgs', 'filesDisk'] (idea#131) rewritten as a whole list at every startup,
  *     capabilitiesBootedAt === lastBooted; pm2 kill_timeout
  *
  * testMode: no sudo, no mount; disks are folders under the private DISKS_ROOT.
@@ -244,25 +244,25 @@ describe('optional variadic last arg (idea#128)', () => {
 // ── capabilities ─────────────────────────────────────────────────────────────
 
 describe('capabilities and capabilitiesBootedAt (idea#128)', () => {
-    it('a new engine record gets capabilities [diskIdArgs] stamped with its lastBooted', async () => {
+    it('a new engine record gets capabilities [diskIdArgs, filesDisk] stamped with its lastBooted', async () => {
         const h = await newStore()
         const e = h.doc()!.engineDB[LOCAL]
-        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs'])
-        expect(e.capabilities).toEqual(['diskIdArgs'])
+        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk'])   // filesDisk: idea#131
+        expect(e.capabilities).toEqual(['diskIdArgs', 'filesDisk'])
         expect(e.capabilitiesBootedAt).toBe(e.lastBooted)
     })
     it('every startup rewrites the whole list (stale/extra entries gone) and re-stamps it with the new lastBooted', async () => {
         const h = await newStore()
         h.change(doc => {
             const e = doc.engineDB[LOCAL]
-            e.capabilities = ['diskIdArgs', 'stale-thing']
+            e.capabilities = ['stale-thing', 'diskIdArgs']
             e.capabilitiesBootedAt = 5 as Timestamp
             e.lastBooted = 5 as Timestamp
         })
         await new Promise(r => setTimeout(r, 5))
         await createOrUpdateEngine(h, LOCAL)
         const e = h.doc()!.engineDB[LOCAL]
-        expect(e.capabilities).toEqual(['diskIdArgs'])
+        expect(e.capabilities).toEqual(['diskIdArgs', 'filesDisk'])
         expect(e.lastBooted).toBeGreaterThan(5)
         expect(e.capabilitiesBootedAt).toBe(e.lastBooted)
     })

@@ -23,6 +23,7 @@ import { undockDisk } from "../monitors/usbDeviceMonitor.js";
 import { backupInstance, restoreApp, createBackupDiskConfig, runningBackupOnDisk } from "../monitors/backupMonitor.js";
 import { cancelOperation } from './Operations.js';
 import { DiskArgResult, lookupDiskArg, resolveDiskArg } from './DiskArg.js';
+import { createFilesDisk } from './CreateFilesDisk.js';
 import { testContext } from "../../test/testContext.js";
 
 
@@ -355,6 +356,18 @@ const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, dis
     print(chalk.green(`Backup Disk '${disk.name}' (${disk.id}) configured.`))
 }
 
+/**
+ * createFilesDisk <diskId> [<shareName…>] (idea#131). The disk ID only (the
+ * command has no old name form); the share name takes the rest of the line and
+ * defaults to "School Files". Refusals throw, so the trace ends as `error`.
+ */
+const createFilesDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskId: string, ...shareNameTokens: string[]) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    const shareName = shareNameTokens.length > 0 ? shareNameTokens.join(' ') : undefined
+    const disk = await createFilesDisk(storeHandle, diskId, shareName)
+    print(chalk.green(`'${disk.name}' (${disk.id}) is now a Files Disk (disk types: ${disk.diskTypes.join(', ')}).`))
+}
+
 const copyAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, sourceDiskId: DiskID, targetDiskId: DiskID) => {
     if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
     await copyApp(storeHandle, instanceName, sourceDiskId, targetDiskId, 'console-command')
@@ -443,6 +456,7 @@ export const commands: CommandDefinition[] = [
     { name: "backupApp", execute: backupAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "mode" }, { type: "string", name: "instanceNames", variadic: true }], scope: 'engine' },
+    { name: "createFilesDisk", execute: createFilesDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "shareName", variadic: true, optional: true }], scope: 'engine' },
     { name: "cancelOperation", execute: async (storeHandle: DocHandle<Store> | null, opId: string) => {
         if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
         const err = cancelOperation(storeHandle, opId)

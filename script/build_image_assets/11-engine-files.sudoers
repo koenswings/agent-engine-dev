@@ -1,22 +1,29 @@
 # /etc/sudoers.d/11-engine-files: installed by build-engine (installUdev -> installEngineSudoers),
 # mode 0440, owner root:root. Validate with: visudo -cf <file>
 #
-# Files and folders the Engine (running as pi under pm2) writes or removes as root
-# under /disks (idea#121, idea#126). 10-engine lists the Engine's other root
-# commands and is not changed by this file.
+# Files and folders the Engine (running as pi under pm2) writes, removes or changes
+# the owner of as root under /disks (idea#121, idea#126, idea#131). 10-engine lists
+# the Engine's other root commands and is not changed by this file.
 # Keep this file in sync with the code:
 #   META.yaml    src/data/Meta.ts (writeMetaFile, runSudoTee: first dock of a disk
 #                without META.yaml; the mount roots under /disks are root:root)
 #   mount point  src/monitors/mounts.ts (removeMountPointFolder: undock and startup
 #                cleanup remove /disks/<device> after `mountpoint -q` says it is no
 #                longer a mount point; never rm -fr)
+#   root owner   src/data/CreateFilesDisk.ts (runSudoChownRoot: createFilesDisk, only
+#                when pi can't write the disk root; the previous uid:gid and mode go
+#                into the command trace first; idea#131, Files Disk step 1)
 #
 # The code runs `sudo /usr/bin/tee /disks/<device>/META.yaml > /dev/null` with the
 # YAML on stdin, so sudo sees exactly "/usr/bin/tee /disks/<device>/META.yaml", and
 # `sudo /usr/bin/rmdir /disks/<device>`, so sudo sees exactly that. rmdir only
 # removes an empty folder, so it can never delete a disk's data.
+# createFilesDisk runs `sudo /usr/bin/chown -h pi:pi /disks/<device>`: the disk root
+# folder only, not recursive (no -R), and -h changes a symlink itself, never what it
+# points to. The ':' is escaped as '\:' because it is special in sudoers.
 # Patterns are narrow on purpose (sd[a-z][12], never /disks/*): in sudoers a '*' in
 # arguments also matches spaces, '/' and '..'. tee without -a truncates the file.
 # Paths are for Raspberry Pi OS (merged /usr).
 pi ALL=(root) NOPASSWD: /usr/bin/tee /disks/sd[a-z][12]/META.yaml
 pi ALL=(root) NOPASSWD: /usr/bin/rmdir /disks/sd[a-z][12]
+pi ALL=(root) NOPASSWD: /usr/bin/chown -h pi\:pi /disks/sd[a-z][12]

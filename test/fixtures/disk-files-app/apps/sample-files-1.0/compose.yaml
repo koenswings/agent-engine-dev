@@ -1,0 +1,22 @@
+services:
+  sample:
+    image: traefik/whoami
+    labels:
+      # Marks containers created by tests; test cleanup only removes labelled containers (idea#105)
+      org.idea.test: "true"
+    ports:
+      - "${port}:80"
+    restart: "no"
+
+x-app:
+  title: "Sample Files App"
+  description: "Synthetic test fixture — an App that opts in to Files Disks"
+  category: "education"
+  url: "https://example.com"
+  icon: ""
+  author: "IDEA Test Harness"
+  # Files Disk opt-in (proposals/files-disk.md §7.3). Read by the Engine from step 2
+  # (idea#75); step 1 only needs the fixture.
+  filesMount:
+    path: /mnt/idea-files
+    services: [sample]
