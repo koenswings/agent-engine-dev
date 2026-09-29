@@ -1,5 +1,5 @@
 # Project Source Code Context
-Generated on 2026-09-29T06:52:38.250Z
+Generated on 2026-09-29T07:29:24.831Z
 
 ## File: package.json
 ```typescript
@@ -329,6 +329,8 @@ import { recoverInterruptedOperations } from './data/Operations.js'
 import { enableDockerMetricsMonitor } from './monitors/dockerMetricsMonitor.js'
 import { enableDiskSizeMonitor } from './data/DiskSize.js'
 import { ensureEngineStateDir, setFilesMountStore } from './data/FilesMount.js'
+import { clearStaleEraseStaging } from './data/EraseDisk.js'
+import { refreshUnformattedDisks } from './data/UnformattedDisks.js'
 import { diskFsRoot } from './data/Disk.js'
 import { copyApp, moveApp } from './data/CopyMoveApp.js'
 import { backupInstance } from './monitors/backupMonitor.js'
@@ -518,6 +520,8 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // overrides and the remount scheduler's store handle
     await ensureEngineStateDir()
     setFilesMountStore(storeHandle)
+    await clearStaleEraseStaging()
+    await refreshUnformattedDisks(storeHandle).catch(e => log(`unformattedDisks at startup: ${e}`))
 
     log(chalk.bgMagenta('STARTING HEARTBEAT GENERATION'))
     const heartbeatIntervalMs = config.settings.heartbeatIntervalMs ?? 50000
@@ -1850,9 +1854,10 @@ export const enableMulticastDNSEngineMonitor = (storeHandle: DocHandle<Store>, r
  *   - The filesystem UUID is recorded at mount time (lsblk -no UUID) for
  *     Disk.unmountError and the startup cleanup.
  *
- * Root commands: mkdir, mount and umount are in 10-engine; rmdir of
- * /disks/sd[a-z][12] is in 11-engine-files. findmnt, mountpoint and lsblk need no
- * root. The commands are behind MountOps so tests can inject fakes.
+ * Root commands: mkdir and umount are in 10-engine; the typed ext4 mount and
+ * rmdir of /disks/sd[a-z][12] are in 11-engine-files (idea#134). findmnt,
+ * mountpoint and lsblk need no root. The commands are behind MountOps so tests
+ * can inject fakes.
  */
 
 import { $, fs, sleep } from 'zx'
@@ -1880,7 +1885,7 @@ export interface MountOps {
     fsUuidAt(mountPoint: string): Promise<string | null>
     /** `sudo mkdir -p <disksRoot>/<device>` */
     mkdir(device: string): Promise<void>
-    /** `sudo mount /dev/<device> <disksRoot>/<device>` */
+    /** `sudo /usr/bin/mount -t ext4 /dev/<device> <disksRoot>/<device>` (idea#134) */
     mount(device: string): Promise<void>
     /** `sudo umount <disksRoot>/<device>` (removes the top mount only) */
     umount(device: string): Promise<void>
@@ -1891,6 +1896,16 @@ export interface MountOps {
 /** Mount points the 11-engine-files entry `/usr/bin/rmdir /disks/sd[a-z][12]` covers. */
 export const SUDO_RMDIR_PATH = /^\/disks\/sd[a-z][12]$/
 export const SUDO_RMDIR = '/usr/bin/rmdir'
+
+/**
+ * Typed ext4 mount (idea#134). Must match exactly the 11-engine-files entry
+ * `/usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]` (same args, same order).
+ * Old untyped entry stays in 10-engine until idea#143.
+ */
+export const SUDO_MOUNT = '/usr/bin/mount'
+export const SUDO_MOUNT_PATTERN = '/usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]'
+export const mountExt4Command = (device: string, mountPoint: string): string[] =>
+    [SUDO_MOUNT, '-t', 'ext4', `/dev/${device}`, mountPoint]
 
 /**
  * Remove an empty mount point folder. /disks/sd[a-z][12] folders are created
@@ -1934,7 +1949,11 @@ export const defaultMountOps: MountOps = {
         return lines.length ? lines[lines.length - 1] : null
     },
     mkdir: async (device) => { await $`sudo mkdir -p ${disksRoot()}/${device}` },
-    mount: async (device) => { await $`sudo mount /dev/${device} ${disksRoot()}/${device}` },
+    mount: async (device) => {
+        const mp = `${disksRoot()}/${device}`
+        // Exact argv order required by 11-engine-files (idea#134)
+        await $`sudo /usr/bin/mount -t ext4 /dev/${device} ${mp}`
+    },
     umount: async (device) => { await $`sudo umount ${disksRoot()}/${device}` },
     rmdir: removeMountPointFolder,
 }
@@ -2364,6 +2383,9 @@ import { $, fs, YAML, chalk } from 'zx'
 $.verbose = false;
 import { Disk, clearDuplicateDiskRecords, createOrUpdateDisk, isSystemDiskRecord, processDisk } from '../data/Disk.js'
 import { flushFilesRemountNow, optedInInstances } from '../data/FilesMount.js'
+import { isSystemDevice, systemDriveNames, driveNameOf } from '../data/SystemDisk.js'
+import { refreshUnformattedDisks } from '../data/UnformattedDisks.js'
+import { isEraseDeviceLocked, setEraseAddDevice } from '../data/EraseDisk.js'
 import { findDiskByDevice, findDisksByDevice, Store, getDisksOfEngine, getLocalEngine } from '../data/Store.js'
 import { DeviceName, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../data/CommonTypes.js'
 
@@ -2421,25 +2443,31 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         throw new Error(`No local engine found in the store`)
     }
 
-    // Detect the root partition (e.g. sda2) at startup so we can:
-    //   - register it as a system disk
-    //   - skip the whole-disk parent (e.g. sda) and the boot partition (e.g. sda1)
-    // findmnt reads procfs — safe to run in all modes, no sudo needed.
+    // System drives via findmnt / + /boot/firmware and lsblk PKNAME (idea#134).
+    // Covers a USB system disk and idea02's Intenso — never by name/model alone.
     let systemDevice: DeviceName | null = null
-    let systemBootDevice: DeviceName | null = null   // e.g. 'sda1' — the boot partition to skip
+    let systemBootDevice: DeviceName | null = null
+    let systemDrives: string[] = []
     try {
+        systemDrives = await systemDriveNames()
         const rootSource = (await $`findmnt -n -o SOURCE /`).stdout.trim()
-        // rootSource is e.g. /dev/sda2 — strip the /dev/ prefix
-        const rootDev = rootSource.replace('/dev/', '') as DeviceName
-        if (rootDev.match(/^sd[a-z][0-9]+$/)) {
+        const rootDev = rootSource.replace(/^\/dev\//, '').replace(/\[.*\]$/, '') as DeviceName
+        if (rootDev && !rootDev.startsWith('overlay')) {
             systemDevice = rootDev
-            // Boot partition is parent (strip trailing digits) + '1', e.g. sda2 → sda1
-            const parentDev = rootDev.replace(/[0-9]+$/, '')
-            systemBootDevice = (parentDev + '1') as DeviceName
-            log(`System disk detected: root=${systemDevice}, boot=${systemBootDevice}`)
+            const parent = driveNameOf(rootDev)
+            // Boot partition: prefer the findmnt /boot/firmware source's device
+            try {
+                const bootSrc = (await $`findmnt -n -o SOURCE /boot/firmware`).stdout.trim()
+                const bootDev = bootSrc.replace(/^\/dev\//, '').replace(/\[.*\]$/, '')
+                if (bootDev) systemBootDevice = bootDev as DeviceName
+                else systemBootDevice = (parent + '1') as DeviceName
+            } catch {
+                systemBootDevice = (parent + '1') as DeviceName
+            }
+            log(`System disk detected: root=${systemDevice}, boot=${systemBootDevice}, drives=${systemDrives.join(',')}`)
         }
     } catch (e) {
-        log(`Could not detect system device via findmnt: ${e}`)
+        log(`Could not detect system device: ${e}`)
     }
 
     const validDevice = function (device: string): boolean {
@@ -2459,10 +2487,16 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         if (validDevice(device)) {
             log(`The disk on device ${device} has a valid device name`)
 
-            // Skip whole-disk entries (e.g. sda, sdb) — raw block devices with no
-            // filesystem; never directly mountable.
+            // Skip whole-disk entries for mounting (idea#134): accepted by validDevice
+            // so lsblk can list them as unformatted candidates; never mounted.
             if (device.match(/^sd[a-z]$/)) {
-                log(`Device ${device} is a whole-disk entry — skipping`)
+                log(`Device ${device} is a whole-disk entry — refreshing unformattedDisks, not mounting`)
+                await refreshUnformattedDisks(storeHandle).catch(e => log(`unformatted refresh: ${e}`))
+                return
+            }
+            // Skip devices locked by eraseDisk for the whole erase (idea#134)
+            if (isEraseDeviceLocked(device) || isEraseDeviceLocked(driveNameOf(device))) {
+                log(`Device ${device} is locked for erase — addDevice skipped`)
                 return
             }
 
@@ -2587,6 +2621,8 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
             log(`The disk on device ${device} is not on a supported device name`)
         }
     }
+
+        setEraseAddDevice(addDevice)
 
     const removeDevice = async (path: string) => {
         const device = path.split('/').pop()
@@ -5024,6 +5060,8 @@ export interface CommandTrace {
   completedAt: number | null
   status: TraceStatus
   errorMessage: string | null
+  /** JSON result for commands that return data (summariseDisk, idea#134); null otherwise */
+  result?: string | null
   logs: LogEntry[]          // Automerge list — appended in batches via flushLogs
 }
 
@@ -5263,6 +5301,8 @@ import { backupInstance, restoreApp, createBackupDiskConfig, runningBackupOnDisk
 import { cancelOperation } from './Operations.js';
 import { DiskArgResult, lookupDiskArg, resolveDiskArg } from './DiskArg.js';
 import { createFilesDisk } from './CreateFilesDisk.js';
+import { summariseDisk, attachTraceResult } from './SummariseDisk.js';
+import { eraseDisk } from './EraseDisk.js';
 import { testContext } from "../../test/testContext.js";
 
 
@@ -5600,6 +5640,24 @@ const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, dis
  * command has no old name form); the share name takes the rest of the line and
  * defaults to "School Files". Refusals throw, so the trace ends as `error`.
  */
+
+/** summariseDisk <diskId|candidateId> (idea#134). Result in CommandTrace.result. */
+const summariseDiskWrapper = async (storeHandle: DocHandle<Store> | null, targetId: string) => {
+    if (!storeHandle) { console.error(chalk.red('Store is not available.')); return }
+    const summary = await summariseDisk(storeHandle, targetId)
+    attachTraceResult(summary)
+    print(chalk.green(`Summary for ${summary.label}: readable=${summary.readable} partial=${summary.partial}`))
+}
+
+/** eraseDisk <targetId> <summaryTraceId> <confirmName…> (idea#134). */
+const eraseDiskWrapper = async (storeHandle: DocHandle<Store> | null, targetId: string, summaryTraceId: string, ...confirmTokens: string[]) => {
+    if (!storeHandle) { console.error(chalk.red('Store is not available.')); return }
+    const confirmName = confirmTokens.join(' ')
+    const result = await eraseDisk(storeHandle, targetId, summaryTraceId, confirmName)
+    attachTraceResult({ diskId: result.diskId, removedInstances: result.removedInstances })
+    print(chalk.green(`Erased → empty IDEA disk ${result.diskId}`))
+}
+
 const createFilesDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskId: string, ...shareNameTokens: string[]) => {
     if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     const shareName = shareNameTokens.length > 0 ? shareNameTokens.join(' ') : undefined
@@ -5696,6 +5754,8 @@ export const commands: CommandDefinition[] = [
     { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "mode" }, { type: "string", name: "instanceNames", variadic: true }], scope: 'engine' },
     { name: "createFilesDisk", execute: createFilesDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "shareName", variadic: true, optional: true }], scope: 'engine' },
+    { name: "summariseDisk", execute: summariseDiskWrapper, args: [{ type: "string", name: "targetId" }], scope: 'engine' },
+    { name: "eraseDisk", execute: eraseDiskWrapper, args: [{ type: "string", name: "targetId" }, { type: "string", name: "summaryTraceId" }, { type: "string", name: "confirmName", variadic: true }], scope: 'engine' },
     { name: "cancelOperation", execute: async (storeHandle: DocHandle<Store> | null, opId: string) => {
         if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
         const err = cancelOperation(storeHandle, opId)
@@ -7862,7 +7922,20 @@ export interface Engine {
   capabilitiesBootedAt?: Timestamp;
   /** Set by eraseDisk for its whole run (Files Disk step 3, not built yet); createFilesDisk refuses that disk meanwhile (idea#131) */
   eraseInProgress?: EraseInProgress | null;
+  /** Whole non-system disks without ext4 (idea#134); rebuilt on dock/undock and at startup */
+  unformattedDisks?: UnformattedDiskPublic[];
 }
+
+export interface UnformattedDiskPublic {
+  candidateId: string
+  device: string
+  sizeBytes: number
+  model: string | null
+  fsType: string | null
+  label: string
+  serial?: string | null
+}
+
 
 /** Engine.eraseInProgress (proposals/files-disk.md §7.5); written by eraseDisk (step 3). */
 export interface EraseInProgress {
@@ -7876,13 +7949,14 @@ export interface EraseInProgress {
  *   diskIdArgs: installApp, createBackupDisk and ejectDisk take disk ids.
  *   filesDisk:  the Files Disk role and createFilesDisk <diskId> [<shareName…>] (idea#131).
  *   filesMount: Files Disk binds into opted-in Apps (x-app.filesMount, idea#133).
+ *   eraseDisk:  summariseDisk + eraseDisk (idea#134).
  * Written at every startup as a whole new list, with capabilitiesBootedAt set
  * to that startup's lastBooted. A Console counts a capability only when
  * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk']
 
 import { config } from './Config.js';
 
@@ -7919,7 +7993,9 @@ export const initialiseLocalEngine = async (): Promise<Engine> => {
       lastHalted: null,
       commands: [],
       capabilities: [...ENGINE_CAPABILITIES],
-      capabilitiesBootedAt: booted
+      capabilitiesBootedAt: booted,
+      eraseInProgress: null,
+      unformattedDisks: [],
     }
     return localEngine
   } catch (e) {
@@ -7950,6 +8026,8 @@ export const createOrUpdateEngine = async (storeHandle: DocHandle<Store>, engine
         // Whole new list, never appended: a stale or extra entry disappears
         engine.capabilities = [...ENGINE_CAPABILITIES]
         engine.capabilitiesBootedAt = booted
+        if (engine.unformattedDisks === undefined) engine.unformattedDisks = []
+        if (engine.eraseInProgress === undefined) engine.eraseInProgress = null
       }
     })
   return engine!
@@ -8336,6 +8414,10 @@ export const installUdev = async (exec: any, enginePath: string) => {
     await exec`sudo apt install udev -y`;
     await copyAsset(exec, enginePath, '90-docking.rules', '/etc/udev/rules.d')
     await installEngineSudoers(exec, enginePath)
+    // idea-erase-disk: root-owned COPY in /usr/local/sbin (never a symlink) (idea#134)
+    print(chalk.blue('  - Installing idea-erase-disk...'))
+    await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-erase-disk /usr/local/sbin/idea-erase-disk`
+    print(chalk.green('  - /usr/local/sbin/idea-erase-disk installed'))
     await createDir(exec, '/disks', "0755", "0:0")
 
     // Configure /dev/engine ownership so the pi user can write sentinel files.
@@ -8931,6 +9013,346 @@ const startDockerEngine = async (exec: any, enginePath: string, productionMode: 
     process.exit(1);
   }
   print(chalk.green('Engine composed up'));
+}
+
+```
+
+## File: src/data/EraseDisk.ts
+```typescript
+/**
+ * EraseDisk.ts — erase any non-system disk to an empty IDEA disk (idea#134)
+ *
+ * eraseDisk <targetId> <summaryTraceId> <confirmName…>
+ * Uses a fakeable script runner for tests. Never formats the fleet test stick
+ * in automated tests — success paths inject runEraseScript.
+ */
+
+import os from 'os'
+import path from 'path'
+import { $, chalk, fs, YAML } from 'zx'
+import { DocHandle } from '@automerge/automerge-repo'
+import { Store } from './Store.js'
+import { Disk, diskMountRoot, processDisk, createOrUpdateDisk } from './Disk.js'
+import { localEngineId, EraseInProgress } from './Engine.js'
+import { DiskID, EngineID, Timestamp } from './CommonTypes.js'
+import { resourceLock, diskKey, instanceKey } from '../utils/ResourceLock.js'
+import { remountInstance, optedInInstances, ENGINE_STATE_DIR } from './FilesMount.js'
+import { shouldHoldFilesRemount } from './FilesMount.js'
+import { ContentSummary, readSummaryFromTrace, resolveSummaryTarget } from './SummariseDisk.js'
+import { refreshUnformattedDisks } from './UnformattedDisks.js'
+import { isSystemDevice, driveNameOf } from './SystemDisk.js'
+import { log, print, uuid } from '../utils/utils.js'
+import { disksRoot } from './Config.js'
+
+export const ERASE_SCRIPT = '/usr/local/sbin/idea-erase-disk'
+export const ERASE_STAGING_ROOT = path.join(ENGINE_STATE_DIR, 'erase-staging')
+export const IDEA_DISK_LABEL = 'IDEA Disk'
+
+/** Devices currently locked for erase; addDevice skips these. */
+const lockedDevices = new Set<string>()
+export const isEraseDeviceLocked = (device: string): boolean => lockedDevices.has(device)
+export const eraseLockedDevicesForTests = (): Set<string> => lockedDevices
+
+export interface EraseScriptArgs {
+    device: string       // /dev/sdX
+    serial: string       // or "-"
+    sizeBytes: number
+    label: string
+    stagingDir: string
+}
+
+export interface EraseOps {
+    runScript: (args: EraseScriptArgs) => Promise<{ stdout: string }>
+    udevadmSettle: () => Promise<void>
+    composeDownV: (instanceDir: string) => Promise<void>
+    lsblkSizeSerial: (wholeDevice: string) => Promise<{ sizeBytes: number; serial: string | null }>
+    addDevice: (devicePath: string) => Promise<void>
+}
+
+const defaultOps: EraseOps = {
+    runScript: async (a) => {
+        const out = await $`sudo -n ${ERASE_SCRIPT} ${a.device} ${a.serial} ${String(a.sizeBytes)} ${a.label} ${a.stagingDir}`
+        return { stdout: out.stdout }
+    },
+    udevadmSettle: async () => { await $`udevadm settle` },
+    composeDownV: async (instanceDir) => {
+        await $({ cwd: instanceDir, nothrow: true })`docker compose down -v`
+    },
+    lsblkSizeSerial: async (whole) => {
+        const size = (await $`lsblk -dn -b -o SIZE /dev/${whole}`.nothrow()).stdout.trim()
+        const serial = (await $`lsblk -dn -o SERIAL /dev/${whole}`.nothrow()).stdout.trim()
+        return { sizeBytes: parseInt(size, 10) || 0, serial: serial || null }
+    },
+    addDevice: async () => { /* wired from usb monitor at runtime */ },
+}
+
+let ops = defaultOps
+let addDeviceImpl: ((path: string) => Promise<void>) | null = null
+
+export const setEraseOpsForTests = (o: Partial<EraseOps> | null): void => {
+    ops = o ? { ...defaultOps, ...o } : defaultOps
+}
+/** Wire the live addDevice from enableUsbDeviceMonitor. */
+export const setEraseAddDevice = (fn: ((path: string) => Promise<void>) | null): void => {
+    addDeviceImpl = fn
+}
+
+const setEraseStep = (storeHandle: DocHandle<Store>, step: EraseInProgress['step'], targetId: string, label: string) => {
+    storeHandle.change(doc => {
+        const eng = doc.engineDB[localEngineId]
+        if (eng) eng.eraseInProgress = { targetId, label, step }
+    })
+}
+
+const clearEraseProgress = (storeHandle: DocHandle<Store>) => {
+    storeHandle.change(doc => {
+        const eng = doc.engineDB[localEngineId]
+        if (eng) eng.eraseInProgress = null
+    })
+}
+
+export const clearStaleEraseStaging = async (): Promise<void> => {
+    try {
+        if (!(await fs.pathExists(ERASE_STAGING_ROOT))) return
+        const ids = await fs.readdir(ERASE_STAGING_ROOT)
+        for (const id of ids) {
+            await fs.remove(path.join(ERASE_STAGING_ROOT, id))
+            log(`Deleted stale erase-staging/${id}`)
+        }
+    } catch (e: any) {
+        log(`Could not clear erase-staging: ${e.message ?? e}`)
+    }
+}
+
+const wholeDeviceOf = (device: string): string => {
+    const bare = device.replace(/^\/dev\//, '')
+    return driveNameOf(bare)
+}
+
+/**
+ * Blockers: running backup, held instance lock, Nextcloud first-start/upgrade,
+ * another erase in progress. Returns an error message or null.
+ */
+export const eraseBlocker = async (store: Store, disk: Disk | null): Promise<string | null> => {
+    const eng = store.engineDB[localEngineId]
+    if (eng?.eraseInProgress) return `try again later: an erase is already in progress (${eng.eraseInProgress.label})`
+    if (!disk) return null
+    // Running backup to/from this disk
+    for (const op of Object.values(store.operationDB ?? {})) {
+        if ((op.status === 'Running' || op.status === 'Pending') && op.kind === 'backupApp') {
+            const bid = op.args?.backupDiskId
+            const iid = op.args?.instanceId
+            if (bid === disk.id) return `try again later: a backup is running on this disk`
+            const inst = iid ? store.instanceDB[iid as any] : null
+            if (inst?.storedOn === disk.id) return `try again later: a backup is running for an instance on this disk`
+        }
+    }
+    if (resourceLock.isLocked(diskKey(disk.id))) return `try again later: the disk is locked`
+    for (const inst of Object.values(store.instanceDB)) {
+        if (inst.storedOn !== disk.id) continue
+        if (resourceLock.isLocked(instanceKey(inst.id))) return `try again later: an instance on this disk is busy`
+        if (await shouldHoldFilesRemount(store, inst)) {
+            return `try again later: Nextcloud (or an instance) is in first start or an upgrade`
+        }
+    }
+    return null
+}
+
+export const eraseDisk = async (
+    storeHandle: DocHandle<Store>,
+    targetId: string,
+    summaryTraceId: string,
+    confirmName: string,
+): Promise<{ diskId: DiskID; removedInstances: { id: string; name: string; dataBytes: number }[] }> => {
+    const store = storeHandle.doc()!
+    const eng = store.engineDB[localEngineId]
+    if (!eng) throw new Error(`Local Engine not found`)
+    if (eng.eraseInProgress) throw new Error(`try again later: an erase is already in progress`)
+
+    const summary = readSummaryFromTrace(store, summaryTraceId, targetId)
+    if (!summary) throw new Error(`The summary is missing, for another disk, or older than 10 minutes. Check the disk again.`)
+    if (summary.label !== confirmName) throw new Error(`Typed name does not match the disk label '${summary.label}'.`)
+
+    const target = resolveSummaryTarget(store, targetId)
+    if (!target) throw new Error(`No disk or unformatted candidate '${targetId}' on this Engine.`)
+
+    let whole: string
+    let serial: string
+    let sizeBytes: number
+    let disk: Disk | null = null
+    let keptId: string
+    let devicePartition: string | null = null
+
+    if (target.kind === 'disk') {
+        disk = target.disk!
+        if (!disk.device) throw new Error(`${disk.name} is not docked.`)
+        if (await isSystemDevice(disk.device)) throw new Error(`${disk.name} is this Pi's system disk and cannot be erased.`)
+        devicePartition = disk.device
+        whole = wholeDeviceOf(disk.device)
+        const info = await ops.lsblkSizeSerial(whole)
+        sizeBytes = info.sizeBytes
+        serial = info.serial ?? summary.serial ?? '-'
+        // Summary serial check when both known
+        if (summary.serial && info.serial && summary.serial !== info.serial) {
+            throw new Error(`The summary is for a different disk (serial mismatch). Check the disk again.`)
+        }
+        keptId = disk.id
+    } else {
+        const c = target.candidate!
+        whole = c.device
+        if (await isSystemDevice(whole)) throw new Error(`${c.label} is this Pi's system disk and cannot be erased.`)
+        sizeBytes = c.sizeBytes
+        serial = c.serial ?? c.candidateId
+        if (summary.serial && summary.serial !== serial && summary.serial !== c.candidateId) {
+            throw new Error(`The summary is for a different disk (serial mismatch). Check the disk again.`)
+        }
+        keptId = c.candidateId
+    }
+
+    const blocker = await eraseBlocker(store, disk)
+    if (blocker) throw new Error(blocker)
+
+    setEraseStep(storeHandle, 'checking', targetId, summary.label)
+    lockedDevices.add(whole)
+    const stagingId = keptId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64) || uuid()
+    const stagingDir = path.join(ERASE_STAGING_ROOT, stagingId)
+    const removedInstances: { id: string; name: string; dataBytes: number }[] = []
+
+    try {
+        setEraseStep(storeHandle, 'stopping and unmounting', targetId, summary.label)
+
+        if (disk) {
+            // Recreate other-disk Files mounts without this bind (R1 / §7.3)
+            for (const inst of optedInInstances(storeHandle.doc()!)) {
+                if (inst.storedOn === disk.id) continue
+                await remountInstance(storeHandle, inst.id, { excludeDiskId: disk.id })
+            }
+            // Stop instances + undock (unmount)
+            const instances = Object.values(storeHandle.doc()!.instanceDB).filter(i => i.storedOn === disk!.id)
+            for (const inst of instances) {
+                const instSummary = summary.instances.find(s => s.id === inst.id)
+                removedInstances.push({
+                    id: inst.id,
+                    name: inst.name as string,
+                    dataBytes: instSummary?.dataBytes ?? 0,
+                })
+                const mountRoot = await diskMountRoot(disk)
+                const instanceDir = path.join(mountRoot, 'instances', inst.id)
+                try { await ops.composeDownV(instanceDir) } catch (e: any) {
+                    log(`compose down -v for ${inst.id}: ${e.message ?? e}`)
+                }
+            }
+            // Capture apps on this disk before undock
+            const appIds = new Set<string>()
+            try {
+                const appsRoot = path.join(await diskMountRoot(disk), 'apps')
+                for (const id of await fs.readdir(appsRoot)) appIds.add(id)
+            } catch { /* */ }
+            for (const inst of instances) appIds.add(inst.instanceOf)
+
+            const { undockDisk } = await import('../monitors/usbDeviceMonitor.js')
+            await undockDisk(storeHandle, disk)
+
+            // If still mounted, refuse
+            const mp = `${disksRoot()}/${devicePartition}`
+            const still = await $`mountpoint -q ${mp}`.nothrow()
+            if (still.exitCode === 0) {
+                // Restore
+                await processDisk(storeHandle, disk).catch(() => {})
+                throw new Error(`${summary.label} couldn't be unmounted, so nothing was erased.`)
+            }
+
+            // Remove Disk entry and instances/apps from store
+            storeHandle.change(doc => {
+                for (const inst of instances) delete doc.instanceDB[inst.id]
+                for (const appId of appIds) {
+                    // Drop app entries that came from this disk (E9)
+                    if (doc.appDB[appId as any]) delete doc.appDB[appId as any]
+                }
+                // Clear backup links pointing at this disk
+                for (const d of Object.values(doc.diskDB)) {
+                    if (d.backupConfig?.links) {
+                        const links = (d.backupConfig.links as any[]).filter((l: any) => {
+                            const id = typeof l === 'string' ? l : l?.diskId
+                            return id !== disk!.id
+                        })
+                        if (links.length !== (d.backupConfig.links as any[]).length) {
+                            d.backupConfig = { ...d.backupConfig, links } as any
+                        }
+                    }
+                }
+                if (doc.diskDB[disk!.id]?.backupConfig) {
+                    // The erased disk itself — entry removed below
+                }
+                delete doc.diskDB[disk!.id]
+            })
+        }
+
+        // Staging with only META.yaml
+        await fs.ensureDir(stagingDir)
+        const meta = {
+            diskId: keptId,
+            diskName: IDEA_DISK_LABEL,
+            isHardwareId: false,
+            created: Date.now(),
+            version: '1.0',
+        }
+        await fs.writeFile(path.join(stagingDir, 'META.yaml'), YAML.stringify(meta))
+
+        setEraseStep(storeHandle, 'partitioning', targetId, summary.label)
+        const scriptOut = await ops.runScript({
+            device: `/dev/${whole}`,
+            serial: serial || '-',
+            sizeBytes,
+            label: IDEA_DISK_LABEL,
+            stagingDir,
+        })
+        // Parse STEP markers into eraseInProgress
+        for (const line of scriptOut.stdout.split('\n')) {
+            if (line.startsWith('STEP:')) {
+                const step = line.slice(5).trim()
+                if (step === 'creating filesystem') setEraseStep(storeHandle, 'creating filesystem', targetId, summary.label)
+                else if (step === 'mounting') setEraseStep(storeHandle, 'mounting', targetId, summary.label)
+                else if (step === 'partitioning') setEraseStep(storeHandle, 'partitioning', targetId, summary.label)
+            }
+        }
+
+        setEraseStep(storeHandle, 'mounting', targetId, summary.label)
+        await ops.udevadmSettle()
+        const partition = `${whole}1`
+        // Engine mounts via addDevice
+        const add = addDeviceImpl ?? ops.addDevice
+        await add(`/dev/engine/${partition}`)
+
+        // Wait briefly for the disk to appear as empty
+        let published: Disk | undefined
+        for (let i = 0; i < 20; i++) {
+            const s = storeHandle.doc()!
+            published = Object.values(s.diskDB).find(d => d.id === keptId && d.dockedTo === localEngineId)
+            if (published && published.diskTypes?.includes('empty')) break
+            await new Promise(r => setTimeout(r, 200))
+            if (!published && Object.values(s.diskDB).some(d => d.device === partition)) {
+                published = Object.values(s.diskDB).find(d => d.device === partition)
+                if (published) await processDisk(storeHandle, published)
+            }
+        }
+
+        await refreshUnformattedDisks(storeHandle).catch(() => {})
+
+        const finalDisk = storeHandle.doc()!.diskDB[keptId as DiskID]
+        if (!finalDisk || !finalDisk.diskTypes?.includes('empty')) {
+            throw new Error(`Erase finished but the disk did not come back as empty (id ${keptId}).`)
+        }
+
+        print(chalk.green(`Erased ${summary.label} → empty IDEA disk ${keptId}`))
+        return { diskId: keptId as DiskID, removedInstances }
+    } catch (e) {
+        throw e
+    } finally {
+        lockedDevices.delete(whole)
+        clearEraseProgress(storeHandle)
+        await fs.remove(stagingDir).catch(() => {})
+    }
 }
 
 ```
@@ -12430,6 +12852,532 @@ export const prepareStoreIdentity = async (paths: StoreIdentityPaths = storeIden
     }
     const storeDocId = readStoreDocId(paths.urlPath)
     return { storeDocId, restored }
+}
+
+```
+
+## File: src/data/SummariseDisk.ts
+```typescript
+/**
+ * SummariseDisk.ts — content summary for erase confirmation (idea#134, §7.4)
+ *
+ * summariseDisk <diskId|candidateId> walks a mounted IDEA disk (or reports
+ * readable:false for an unformatted candidate) and stores the JSON result on
+ * CommandTrace.result. Caps: 100_000 entries or 10 seconds → partial: true.
+ * Backups come from BACKUP.yaml + the store, never borg list.
+ */
+
+import path from 'path'
+import { fs, YAML } from 'zx'
+import { DocHandle } from '@automerge/automerge-repo'
+import { Store } from './Store.js'
+import { Disk, diskMountRoot } from './Disk.js'
+import { localEngineId } from './Engine.js'
+import { DiskID, Timestamp } from './CommonTypes.js'
+import { getCommandLogHandle } from './CommandLogStore.js'
+import { getActiveTrace } from '../utils/CommandLogger.js'
+import { log } from '../utils/utils.js'
+
+export const SUMMARY_MAX_ENTRIES = 100_000
+export const SUMMARY_MAX_MS = 10_000
+export const SUMMARY_MAX_AGE_MS = 10 * 60 * 1000
+
+export interface ContentSummary {
+    targetId: string
+    label: string
+    serial: string | null
+    model: string | null
+    sizeBytes: number | null
+    filesystem: string | null
+    usedBytes: number | null
+    readable: boolean
+    partial: boolean
+    apps: { id: string; name: string; version: string }[]
+    instances: { id: string; name: string; status: string; dataBytes: number }[]
+    backups: { instanceName: string; lastBackup: number | null }[]
+    files: { count: number; bytes: number }
+    other: { count: number; bytes: number }
+}
+
+export interface SummariseOps {
+    now: () => number
+    walk: (root: string, onEntry: (rel: string, size: number) => void | false, deadline: number) => Promise<{ truncated: boolean }>
+}
+
+const defaultWalk = async (
+    root: string,
+    onEntry: (rel: string, size: number) => void | false,
+    deadline: number,
+): Promise<{ truncated: boolean }> => {
+    let truncated = false
+    const walkDir = async (dir: string, relBase: string): Promise<boolean> => {
+        if (Date.now() > deadline) { truncated = true; return false }
+        let entries: string[]
+        try { entries = await fs.readdir(dir) } catch { return true }
+        for (const name of entries) {
+            if (Date.now() > deadline) { truncated = true; return false }
+            const full = path.join(dir, name)
+            const rel = relBase ? `${relBase}/${name}` : name
+            let st
+            try { st = await fs.lstat(full) } catch { continue }
+            if (st.isDirectory()) {
+                const cont = onEntry(rel + '/', 0)
+                if (cont === false) { truncated = true; return false }
+                if (!(await walkDir(full, rel))) return false
+            } else {
+                const cont = onEntry(rel, st.size)
+                if (cont === false) { truncated = true; return false }
+            }
+        }
+        return true
+    }
+    await walkDir(root, '')
+    return { truncated }
+}
+
+let ops: SummariseOps = { now: () => Date.now(), walk: defaultWalk }
+export const setSummariseOpsForTests = (o: Partial<SummariseOps> | null): void => {
+    ops = o ? { ...ops, ...o, now: o.now ?? ops.now, walk: o.walk ?? ops.walk } : { now: () => Date.now(), walk: defaultWalk }
+}
+
+/** Resolve a diskId or unformatted candidateId on this Engine. */
+export const resolveSummaryTarget = (store: Store, targetId: string): {
+    kind: 'disk' | 'unformatted'
+    disk?: Disk
+    candidate?: { candidateId: string; device: string; sizeBytes: number; model: string | null; fsType: string | null; label: string; serial?: string | null }
+    label: string
+    serial: string | null
+} | null => {
+    const eng = store.engineDB[localEngineId]
+    const disk = store.diskDB[targetId as DiskID]
+    if (disk && disk.dockedTo === localEngineId && disk.device) {
+        return { kind: 'disk', disk, label: disk.name, serial: null }
+    }
+    const cand = eng?.unformattedDisks?.find(c => c.candidateId === targetId)
+    if (cand) {
+        return { kind: 'unformatted', candidate: cand, label: cand.label, serial: (cand as any).serial ?? cand.candidateId }
+    }
+    return null
+}
+
+export const summariseDisk = async (
+    storeHandle: DocHandle<Store>,
+    targetId: string,
+): Promise<ContentSummary> => {
+    const store = storeHandle.doc()!
+    const target = resolveSummaryTarget(store, targetId)
+    if (!target) throw new Error(`No disk or unformatted candidate '${targetId}' on this Engine.`)
+
+    if (target.kind === 'unformatted') {
+        const c = target.candidate!
+        const summary: ContentSummary = {
+            targetId,
+            label: c.label,
+            serial: (c as any).serial ?? c.candidateId,
+            model: c.model,
+            sizeBytes: c.sizeBytes,
+            filesystem: c.fsType,
+            usedBytes: null,
+            readable: false,
+            partial: false,
+            apps: [], instances: [], backups: [],
+            files: { count: 0, bytes: 0 },
+            other: { count: 0, bytes: 0 },
+        }
+        return summary
+    }
+
+    const disk = target.disk!
+    const root = await diskMountRoot(disk)
+    const deadline = ops.now() + SUMMARY_MAX_MS
+    let entries = 0
+    let filesCount = 0, filesBytes = 0
+    let otherCount = 0, otherBytes = 0
+    let truncated = false
+
+    const underFiles = (rel: string) => rel === 'files' || rel.startsWith('files/')
+    const isIdeaPath = (rel: string) =>
+        rel === 'META.yaml' || rel === 'FILES.yaml' || rel === 'BACKUP.yaml' ||
+        rel === 'apps' || rel.startsWith('apps/') ||
+        rel === 'instances' || rel.startsWith('instances/') ||
+        rel === 'services' || rel.startsWith('services/') ||
+        rel === 'backups' || rel.startsWith('backups/') ||
+        rel === 'lost+found' || rel.startsWith('lost+found/') ||
+        underFiles(rel)
+
+    const walkResult = await ops.walk(root, (rel, size) => {
+        entries++
+        if (entries > SUMMARY_MAX_ENTRIES) return false
+        if (underFiles(rel) && !rel.endsWith('/')) { filesCount++; filesBytes += size }
+        else if (!isIdeaPath(rel) && !rel.endsWith('/')) { otherCount++; otherBytes += size }
+    }, deadline)
+    truncated = walkResult.truncated || entries > SUMMARY_MAX_ENTRIES
+
+    const apps = Object.values(store.appDB)
+        .filter(a => {
+            // Apps that came from this disk: instances stored here reference them,
+            // or apps/ folder listing — use instances on disk + apps folder if present
+            return Object.values(store.instanceDB).some(i => i.storedOn === disk.id && i.instanceOf === a.id)
+        })
+        .map(a => ({ id: a.id, name: a.name as string, version: a.version as string }))
+
+    // Also list apps present on the disk filesystem
+    try {
+        const appDirs = await fs.readdir(path.join(root, 'apps'))
+        for (const id of appDirs) {
+            if (!apps.some(a => a.id === id)) {
+                const dash = id.lastIndexOf('-')
+                apps.push({ id, name: dash > 0 ? id.slice(0, dash) : id, version: dash > 0 ? id.slice(dash + 1) : '' })
+            }
+        }
+    } catch { /* no apps/ */ }
+
+    const instances = Object.values(store.instanceDB)
+        .filter(i => i.storedOn === disk.id)
+        .map(i => {
+            let dataBytes = 0
+            // Approximate from walk of instances/<id> if we can stat quickly
+            return { id: i.id, name: i.name as string, status: i.status, dataBytes }
+        })
+
+    // Fill instance data sizes from a focused walk
+    for (const inst of instances) {
+        const instRoot = path.join(root, 'instances', inst.id)
+        try {
+            const r = await ops.walk(instRoot, (_rel, size) => { inst.dataBytes += size }, deadline)
+            if (r.truncated) truncated = true
+        } catch { /* missing */ }
+    }
+
+    const backups: { instanceName: string; lastBackup: number | null }[] = []
+    try {
+        const text = await fs.readFile(path.join(root, 'BACKUP.yaml'), 'utf8')
+        const parsed = YAML.parse(text)
+        const links = parsed?.links ?? disk.backupConfig?.links ?? []
+        for (const link of links) {
+            const name = typeof link === 'string' ? link : link?.instanceName ?? link?.name
+            if (!name) continue
+            const inst = Object.values(store.instanceDB).find(i => i.name === name || i.id === name)
+            backups.push({ instanceName: name, lastBackup: inst?.lastBackup ?? null })
+        }
+    } catch {
+        if (disk.backupConfig?.links) {
+            for (const link of disk.backupConfig.links as any[]) {
+                const name = typeof link === 'string' ? link : link?.instanceName
+                if (name) backups.push({ instanceName: name, lastBackup: null })
+            }
+        }
+    }
+
+    return {
+        targetId,
+        label: disk.name,
+        serial: null,
+        model: null,
+        sizeBytes: disk.sizeBytes ?? null,
+        filesystem: 'ext4',
+        usedBytes: disk.sizeBytes != null && disk.freeBytes != null ? disk.sizeBytes - disk.freeBytes : null,
+        readable: true,
+        partial: truncated,
+        apps,
+        instances,
+        backups,
+        files: { count: filesCount, bytes: filesBytes },
+        other: { count: otherCount, bytes: otherBytes },
+    }
+}
+
+/** Attach a JSON result to a command trace (defaults to the active one). */
+export const attachTraceResult = (result: unknown, traceId?: string): void => {
+    const h = getCommandLogHandle()
+    const id = traceId ?? getActiveTrace()?.traceId
+    if (!h || !id) return
+    const json = JSON.stringify(result)
+    h.change(doc => {
+        const t = doc.traces[id]
+        if (t) t.result = json
+    })
+}
+
+/** Read a summariseDisk result from a trace; null if missing/invalid/too old. */
+export const readSummaryFromTrace = (
+    store: Store,
+    traceId: string,
+    expectTargetId: string,
+): ContentSummary | null => {
+    const h = getCommandLogHandle()
+    if (!h) return null
+    const t = h.doc()?.traces[traceId]
+    if (!t || t.command !== 'summariseDisk' || t.status !== 'ok') return null
+    if (t.result == null || t.result === '') return null
+    const age = Date.now() - (t.completedAt ?? t.startedAt)
+    if (age > SUMMARY_MAX_AGE_MS) return null
+    try {
+        const summary = JSON.parse(t.result) as ContentSummary
+        if (summary.targetId !== expectTargetId) return null
+        return summary
+    } catch { return null }
+}
+
+```
+
+## File: src/data/SystemDisk.ts
+```typescript
+/**
+ * SystemDisk.ts — identify the Pi's boot/root disk by lookup (idea#134)
+ *
+ * Never by name, connection type or model. Uses findmnt for `/` and
+ * `/boot/firmware`, then lsblk -no PKNAME (with a name-parsing fallback for
+ * sdX / mmcblkNpM / nvmeNnMpP). Covers a USB system disk and idea02's Intenso.
+ */
+
+import { $ } from 'zx'
+import { log } from '../utils/utils.js'
+
+export interface SystemDiskOps {
+    findmntSource: (mountPoint: string) => Promise<string | null>
+    pkname: (devicePath: string) => Promise<string | null>
+}
+
+const defaultOps: SystemDiskOps = {
+    findmntSource: async (mp) => {
+        const out = await $`findmnt -n -o SOURCE ${mp}`.nothrow()
+        if (out.exitCode !== 0) return null
+        const src = out.stdout.trim().split('\n')[0]?.trim() ?? ''
+        return src || null
+    },
+    pkname: async (devicePath) => {
+        const out = await $`lsblk -no PKNAME ${devicePath}`.nothrow()
+        if (out.exitCode !== 0) return null
+        const pk = out.stdout.trim().split('\n')[0]?.trim() ?? ''
+        return pk || null
+    },
+}
+
+let ops: SystemDiskOps = defaultOps
+/** Tests only. Pass null to restore. */
+export const setSystemDiskOpsForTests = (o: Partial<SystemDiskOps> | null): void => {
+    ops = o ? { ...defaultOps, ...o } : defaultOps
+}
+
+/** Parent whole-disk name of a partition: sda2→sda, mmcblk0p2→mmcblk0, nvme0n1p2→nvme0n1. */
+export const driveNameOf = (device: string): string => {
+    const d = device.replace(/^\/dev\//, '')
+    if (/^(mmcblk\d+)p\d+$/.test(d)) return d.replace(/p\d+$/, '')
+    if (/^(nvme\d+n\d+)p\d+$/.test(d)) return d.replace(/p\d+$/, '')
+    if (/^sd[a-z]\d+$/.test(d)) return d.replace(/\d+$/, '')
+    return d
+}
+
+/** Strip /dev/ and any findmnt bind suffix `[/dir]`. */
+export const bareDevice = (source: string): string =>
+    source.replace(/^\/dev\//, '').replace(/\[.*\]$/, '').trim()
+
+/**
+ * Whole-disk device names that hold `/` or `/boot/firmware` (e.g. `sda`).
+ * Empty when findmnt fails (containers with overlay root).
+ */
+export const systemDriveNames = async (): Promise<string[]> => {
+    const drives = new Set<string>()
+    for (const mp of ['/', '/boot/firmware']) {
+        const src = await ops.findmntSource(mp)
+        if (!src) continue
+        const bare = bareDevice(src)
+        if (!bare || bare === 'overlay' || bare.startsWith('tmpfs')) continue
+        const pk = await ops.pkname(`/dev/${bare}`)
+        drives.add(pk || driveNameOf(bare))
+    }
+    return [...drives]
+}
+
+/** True when `device` (e.g. sda, sda1, sda2) is on a system drive. */
+export const isSystemDevice = async (device: string | null | undefined): Promise<boolean> => {
+    if (!device) return false
+    const bare = bareDevice(device)
+    const drives = await systemDriveNames()
+    if (drives.length === 0) return false
+    const drive = driveNameOf(bare)
+    return drives.includes(drive) || drives.includes(bare)
+}
+
+export const logSystemDrives = async (): Promise<void> => {
+    const drives = await systemDriveNames()
+    log(`System drives: ${drives.length ? drives.join(', ') : '(none detected)'}`)
+}
+
+```
+
+## File: src/data/UnformattedDisks.ts
+```typescript
+/**
+ * UnformattedDisks.ts — whole non-system disks without ext4 (idea#134)
+ *
+ * Published on Engine.unformattedDisks so the Console can offer Erase / the
+ * Files erase-first shortcut on non-IDEA sticks. Never mounted. IDs come from
+ * the serial (or a generated id that stays stable while the disk stays plugged).
+ */
+
+import { $ } from 'zx'
+import { DocHandle } from '@automerge/automerge-repo'
+import { Store } from './Store.js'
+import { EngineID } from './CommonTypes.js'
+import { isSystemDevice, driveNameOf } from './SystemDisk.js'
+import { readHardwareId } from './Meta.js'
+import { log, uuid } from '../utils/utils.js'
+import { localEngineId } from './Engine.js'
+
+export interface UnformattedDisk {
+    candidateId: string
+    device: string          // whole-disk name, e.g. sdb
+    sizeBytes: number
+    model: string | null
+    fsType: string | null   // dominant non-ext4 type, or null if none
+    label: string           // typed confirmation text, e.g. "SanDisk 32 GB"
+    serial: string | null   // for eraseDisk summary matching
+}
+
+export interface LsblkDevice {
+    name: string
+    type?: string
+    fstype?: string | null
+    size?: string | number
+    model?: string | null
+    serial?: string | null
+    children?: LsblkDevice[]
+}
+
+export interface UnformattedOps {
+    lsblkJson: () => Promise<LsblkDevice[]>
+}
+
+const defaultOps: UnformattedOps = {
+    lsblkJson: async () => {
+        const out = await $`lsblk -J -b -o NAME,TYPE,FSTYPE,SIZE,MODEL,SERIAL`.nothrow()
+        if (out.exitCode !== 0 || !out.stdout.trim()) return []
+        const parsed = JSON.parse(out.stdout) as { blockdevices?: LsblkDevice[] }
+        return parsed.blockdevices ?? []
+    },
+}
+
+let ops = defaultOps
+export const setUnformattedOpsForTests = (o: Partial<UnformattedOps> | null): void => {
+    ops = o ? { ...defaultOps, ...o } : defaultOps
+}
+
+/** Stable-while-plugged generated ids when there is no serial. */
+const generatedIds = new Map<string, string>()  // device → id
+
+export const clearGeneratedUnformattedIdsForTests = (): void => { generatedIds.clear() }
+
+const hasExt4 = (node: LsblkDevice): boolean => {
+    if ((node.fstype ?? '').toLowerCase() === 'ext4') return true
+    return (node.children ?? []).some(hasExt4)
+}
+
+const firstFsType = (node: LsblkDevice): string | null => {
+    if (node.fstype) return node.fstype
+    for (const c of node.children ?? []) {
+        const t = firstFsType(c)
+        if (t) return t
+    }
+    return null
+}
+
+/** Round size to a short display: "32 GB", "240 GB". */
+export const formatSizeLabel = (sizeBytes: number): string => {
+    if (sizeBytes >= 1_000_000_000) return `${Math.round(sizeBytes / 1_000_000_000)} GB`
+    if (sizeBytes >= 1_000_000) return `${Math.round(sizeBytes / 1_000_000)} MB`
+    return `${sizeBytes} B`
+}
+
+export const labelForUnformatted = (model: string | null, sizeBytes: number): string => {
+    const size = formatSizeLabel(sizeBytes)
+    return model && model.trim() ? `${model.trim()} ${size}` : `USB disk ${size}`
+}
+
+/** Make labels unique among a list by appending " (2)", " (3)", … (display only). */
+export const uniquifyLabels = (items: { label: string }[]): void => {
+    const counts = new Map<string, number>()
+    for (const it of items) {
+        const base = it.label
+        const n = (counts.get(base) ?? 0) + 1
+        counts.set(base, n)
+        if (n > 1) it.label = `${base} (${n})`
+    }
+    // First occurrence of a clashing name also needs (1)? No — only 2nd+ get a suffix.
+    // Re-walk: if any base appears >1, the first stays plain and others get (2),(3).
+    // The loop above already left the first plain and numbered the rest. Good.
+}
+
+/**
+ * Scan lsblk and return whole non-system disks that have no ext4 anywhere
+ * (including partition 3+). System and swap-only handling: a disk with swap but
+ * no ext4 is still listed (erase script refuses swap at erase time); we exclude
+ * nothing here for swap alone — the script is authoritative.
+ */
+export const scanUnformattedDisks = async (): Promise<UnformattedDisk[]> => {
+    const devices = await ops.lsblkJson()
+    const out: UnformattedDisk[] = []
+    // Drop generated ids for devices that disappeared
+    const seen = new Set<string>()
+    for (const d of devices) {
+        if ((d.type ?? 'disk') !== 'disk') continue
+        const name = d.name
+        if (!/^sd[a-z]$/.test(name)) continue  // whole sdX only; partitions 3+ out of scope for listing parents with ext4 on p3 still excluded via hasExt4
+        seen.add(name)
+        if (await isSystemDevice(name)) continue
+        if (hasExt4(d)) continue
+        const sizeBytes = typeof d.size === 'number' ? d.size : parseInt(String(d.size ?? '0'), 10) || 0
+        const model = d.model?.trim() || null
+        const serialRaw = d.serial?.trim() || null
+        // Prefer hardware id for known models (Meta.readHardwareId), else lsblk serial, else generated
+        let candidateId: string
+        let serial: string | null = serialRaw
+        try {
+            const hw = await readHardwareId(name as any)
+            if (hw) { candidateId = hw; serial = hw }
+            else if (serialRaw) candidateId = serialRaw
+            else {
+                if (!generatedIds.has(name)) generatedIds.set(name, uuid())
+                candidateId = generatedIds.get(name)!
+            }
+        } catch {
+            if (serialRaw) candidateId = serialRaw
+            else {
+                if (!generatedIds.has(name)) generatedIds.set(name, uuid())
+                candidateId = generatedIds.get(name)!
+            }
+        }
+        out.push({
+            candidateId,
+            device: name,
+            sizeBytes,
+            model,
+            fsType: firstFsType(d),
+            label: labelForUnformatted(model, sizeBytes),
+            serial,
+        })
+    }
+    for (const k of [...generatedIds.keys()]) if (!seen.has(k)) generatedIds.delete(k)
+    uniquifyLabels(out)
+    return out
+}
+
+/** Write Engine.unformattedDisks for this Engine (whole-list replace). */
+export const refreshUnformattedDisks = async (
+    storeHandle: DocHandle<Store>,
+    engineId: EngineID = localEngineId as EngineID,
+): Promise<UnformattedDisk[]> => {
+    const list = await scanUnformattedDisks()
+    storeHandle.change(doc => {
+        const eng = doc.engineDB[engineId]
+        if (!eng) return
+        eng.unformattedDisks = list.map(({ candidateId, device, sizeBytes, model, fsType, label, serial }) => ({
+            candidateId, device, sizeBytes, model, fsType, label, serial,
+        }))
+    })
+    log(`Unformatted disks: ${list.map(d => `${d.device}(${d.label})`).join(', ') || '(none)'}`)
+    return list
 }
 
 ```

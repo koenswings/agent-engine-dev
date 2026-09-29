@@ -15,9 +15,10 @@
  *   - The filesystem UUID is recorded at mount time (lsblk -no UUID) for
  *     Disk.unmountError and the startup cleanup.
  *
- * Root commands: mkdir, mount and umount are in 10-engine; rmdir of
- * /disks/sd[a-z][12] is in 11-engine-files. findmnt, mountpoint and lsblk need no
- * root. The commands are behind MountOps so tests can inject fakes.
+ * Root commands: mkdir and umount are in 10-engine; the typed ext4 mount and
+ * rmdir of /disks/sd[a-z][12] are in 11-engine-files (idea#134). findmnt,
+ * mountpoint and lsblk need no root. The commands are behind MountOps so tests
+ * can inject fakes.
  */
 
 import { $, fs, sleep } from 'zx'
@@ -45,7 +46,7 @@ export interface MountOps {
     fsUuidAt(mountPoint: string): Promise<string | null>
     /** `sudo mkdir -p <disksRoot>/<device>` */
     mkdir(device: string): Promise<void>
-    /** `sudo mount /dev/<device> <disksRoot>/<device>` */
+    /** `sudo /usr/bin/mount -t ext4 /dev/<device> <disksRoot>/<device>` (idea#134) */
     mount(device: string): Promise<void>
     /** `sudo umount <disksRoot>/<device>` (removes the top mount only) */
     umount(device: string): Promise<void>
@@ -56,6 +57,16 @@ export interface MountOps {
 /** Mount points the 11-engine-files entry `/usr/bin/rmdir /disks/sd[a-z][12]` covers. */
 export const SUDO_RMDIR_PATH = /^\/disks\/sd[a-z][12]$/
 export const SUDO_RMDIR = '/usr/bin/rmdir'
+
+/**
+ * Typed ext4 mount (idea#134). Must match exactly the 11-engine-files entry
+ * `/usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]` (same args, same order).
+ * Old untyped entry stays in 10-engine until idea#143.
+ */
+export const SUDO_MOUNT = '/usr/bin/mount'
+export const SUDO_MOUNT_PATTERN = '/usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]'
+export const mountExt4Command = (device: string, mountPoint: string): string[] =>
+    [SUDO_MOUNT, '-t', 'ext4', `/dev/${device}`, mountPoint]
 
 /**
  * Remove an empty mount point folder. /disks/sd[a-z][12] folders are created
@@ -99,7 +110,11 @@ export const defaultMountOps: MountOps = {
         return lines.length ? lines[lines.length - 1] : null
     },
     mkdir: async (device) => { await $`sudo mkdir -p ${disksRoot()}/${device}` },
-    mount: async (device) => { await $`sudo mount /dev/${device} ${disksRoot()}/${device}` },
+    mount: async (device) => {
+        const mp = `${disksRoot()}/${device}`
+        // Exact argv order required by 11-engine-files (idea#134)
+        await $`sudo /usr/bin/mount -t ext4 /dev/${device} ${mp}`
+    },
     umount: async (device) => { await $`sudo umount ${disksRoot()}/${device}` },
     rmdir: removeMountPointFolder,
 }

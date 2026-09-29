@@ -34,6 +34,8 @@ export interface CommandTrace {
   completedAt: number | null
   status: TraceStatus
   errorMessage: string | null
+  /** JSON result for commands that return data (summariseDisk, idea#134); null otherwise */
+  result?: string | null
   logs: LogEntry[]          // Automerge list — appended in batches via flushLogs
 }
 
