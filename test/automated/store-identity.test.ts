@@ -4,7 +4,9 @@
  * All Engines share one Automerge store: its URL is the tracked
  * store-identity/store-url.txt, its initial content store-template.json.
  *
- *   1. FLEET_STORE_URL matches the tracked store-url.txt
+ *   1. FLEET_STORE_URL matches the tracked store-url.txt. Skipped, with the reason,
+ *      on a Pi that deliberately keeps its own store (idea#155, test/harness/ownStore.ts);
+ *      it still runs, and fails on a real mismatch, everywhere else
  *   2. Start with no store-url.txt: the file is written with the fleet URL, the
  *      store opens under the fleet document ID, store-template.json is byte-for-byte
  *      unchanged; a second start reuses the file and the stored document
@@ -33,6 +35,7 @@ import {
     writeFileAtomic,
     StoreIdentityPaths,
 } from '../../src/data/StoreIdentity.js'
+import { skipIfOwnStore } from '../harness/ownStore.js'
 
 const ROOT = process.cwd()
 const TRACKED_URL = path.join(ROOT, 'store-identity/store-url.txt')
@@ -66,7 +69,8 @@ const startStore = async () => {
 }
 
 describe('store identity at startup (idea#120)', () => {
-    it('FLEET_STORE_URL matches the tracked store-identity/store-url.txt', () => {
+    it('FLEET_STORE_URL matches the tracked store-identity/store-url.txt', (ctx) => {
+        skipIfOwnStore(ctx)
         expect(fs.readFileSync(TRACKED_URL, 'utf8').trim()).to.equal(FLEET_STORE_URL)
     })
 
