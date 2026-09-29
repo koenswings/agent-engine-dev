@@ -10,6 +10,7 @@ import { addTrace, closeTrace } from './CommandLogStore.js';
 import { runWithTrace } from '../utils/CommandLogger.js';
 import { disksRoot } from './Config.js';
 import { FilesConfig, hasFilesYaml, processFilesDisk } from './FilesDisk.js';
+import { parseFilesMount } from './FilesMount.js';
 import { updateDiskSize } from './DiskSize.js';
 import { recordDiskDetectionFailure } from '../monitors/diskDetection.js';
 
@@ -442,11 +443,13 @@ export const processSystemApp = async (storeHandle: DocHandle<Store>, disk: Disk
                     category: xapp.category,
                     icon: xapp.icon ?? null,
                     author: xapp.author ?? null,
+                    filesMount: parseFilesMount(xapp),
                 }
                 doc.appDB[appId] = app
             } else {
                 log(`Updating existing system app ${appId}`)
                 app = storedApp
+                app.filesMount = parseFilesMount(xapp)
             }
         })
         return app!

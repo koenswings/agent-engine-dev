@@ -3,7 +3,7 @@
  *
  * A Files Disk is recognised by FILES.yaml in the disk root (proposals/files-disk.md
  * §6, §7.2). The role can be combined with the App and Backup roles on the same
- * disk. The shared content lives in files/; mounting it into Apps is step 2.
+ * disk. The shared content lives in files/; mounting into Apps is idea#133 (FilesMount).
  *
  * FILES.yaml (version 1):
  *   version: 1               format version
@@ -21,6 +21,7 @@ import { DocHandle } from '@automerge/automerge-repo'
 import { Store } from './Store.js'
 import { DiskID, EngineID, Timestamp } from './CommonTypes.js'
 import { log } from '../utils/utils.js'
+import { scheduleFilesRemount } from './FilesMount.js'
 
 export const FILES_YAML = 'FILES.yaml'
 export const FILES_DIR = 'files'
@@ -107,8 +108,15 @@ export const processFilesDisk = async (storeHandle: DocHandle<Store>, diskId: Di
         const d = doc.diskDB[diskId]
         if (d) d.filesConfig = filesConfig
     })
-    if (filesConfig.passwordProtected) log(`Files Disk ${diskId}: ${FILES_PASSWORD_ERROR}; not mounted`)
-    else log(`Files Disk ${diskId}: share '${filesConfig.shareName}'`)
+    if (filesConfig.passwordProtected) {
+        log(`Files Disk ${diskId}: ${FILES_PASSWORD_ERROR}; not mounted`)
+        return
+    }
+    log(`Files Disk ${diskId}: share '${filesConfig.shareName}'`)
+    // Remount opted-in Apps on *other* disks after the grouping window. Instances
+    // on this same disk are started by processAppDisk with the override already
+    // containing this disk's files/ (R5 / §7.3).
+    scheduleFilesRemount(storeHandle, { skipSameDiskId: diskId })
 }
 
 export const filesYamlFor = (shareName: string, createdBy: EngineID | null, created: Timestamp): FilesYaml => ({
