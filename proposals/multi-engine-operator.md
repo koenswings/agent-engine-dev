@@ -1,8 +1,8 @@
 # Proposal: Multi-Engine Operator Console Markov
 
 **Status:** Proposal draft for discussion — companion to [`multi-engine-classroom.md`](./multi-engine-classroom.md).  
-**Revision:** 2026-09-30d — Koen feedback: rename Test Scenarios → **UI Interactions**; entry/arrival UI only on source-state actions; state sections as H2; graph edge labels = UI Interaction names.  
-**Author:** Steve (Lead Bot), 2026-09-30 (rev. 2026-09-30d)  
+**Revision:** 2026-09-30e — Koen feedback: States heading; actions unique to departing state; action (not “UI labels”); plain selector wording.  
+**Author:** Steve (Lead Bot), 2026-09-30 (rev. 2026-09-30e)  
 **Audience:** Koen / IDEA leads  
 **Scope boundary:** This graph is **only** authenticated operator manage/alter flows. Classroom learner/teacher **usage** (Kolibri / Nextcloud / Wikipedia) stays in the classroom doc and its Markov — do not mix the graphs.
 
@@ -108,9 +108,9 @@ Sources: `agent-console-dev/README.md`, `docs/ARCHITECTURE.md`, `proposals/conso
 - **Arrival UI rule:** open / confirm / land-on sequences belong on the **outgoing action of the state you leave**, not as content of the destination. Destination state sections describe only what you do **while in** that state.
 - **Separate files** from classroom usage: [`multi-engine-operator-markov.dot`](./multi-engine-operator-markov.dot) (+ png/svg).
 
-**Wiring rule:** actions belong to the state where they happen. From `op_overview` you **Open disk inventory** (enter `op_disk`) — you do **not** **Erase disk** or **Install App** as edges from overview. Those fire only from `op_disk` (or the dedicated erase/install states they enter).
+**Actions are unique to the state they depart from** — an action from state A cannot leave or affect another state; you only take actions listed on the current state. Example: from `op_overview` you **Open disk inventory** (enter `op_disk`) — you do **not** **Erase disk** or **Install App** as edges from overview. Those fire only from `op_disk` (or the dedicated erase/install states they enter).
 
-### States (final list)
+### States
 
 | State | Meaning |
 |---|---|
@@ -215,7 +215,7 @@ stateDiagram-v2
 
 Multi-Engine story: operator may open Console on **any** of idea-A / idea-B / idea-C; after login the NetworkTree shows the **school mesh** (shared store). Commands are sent to the Engine that owns the target disk (`dockedTo`).
 
-UI labels match Console components (`NetworkTree`, `EmptyDiskPanel`, `DiskView`, `InstanceRow`, `EjectConfirm`, `EraseDialog`, `AccountScreen`, `SettingsPanel`). Exact Playwright selectors belong in a later harness.
+**Action** names match Console UI surfaces (`NetworkTree`, `EmptyDiskPanel`, `DiskView`, `InstanceRow`, `EjectConfirm`, `EraseDialog`, `AccountScreen`, `SettingsPanel`). Detailed CSS selectors wait for the Playwright harness.
 
 ---
 

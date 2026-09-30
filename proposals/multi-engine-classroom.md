@@ -1,8 +1,8 @@
 # Proposal: Multi-Engine Classroom
 
 **Status:** Proposal draft for discussion — supersedes [`multi-engine-classroom-scenarios.md`](./multi-engine-classroom-scenarios.md) (2026-09-28).  
-**Revision:** 2026-09-30d — Koen feedback: rename Test Scenarios → **UI Interactions**; entry/arrival UI only on source-state actions; state sections as H2; graph edge labels = UI Interaction names.  
-**Author:** Steve (Lead Bot), 2026-09-29 (rev. 2026-09-30d)  
+**Revision:** 2026-09-30e — Koen feedback: States heading; actions unique to departing state; action (not “UI labels”); plain Console wording; Typical clicks under UI Interactions.  
+**Author:** Steve (Lead Bot), 2026-09-29 (rev. 2026-09-30e)  
 **Audience:** Koen / IDEA leads  
 **Companion capacity issue:** [idea#159](https://github.com/koenswings/idea/issues/159) — measure safe concurrent Kolibri video streams per instance
 
@@ -141,7 +141,7 @@ Discussable outcomes — **not** UI click scripts. Each item maps to Markov **st
 
 **Operator Console Markov (separate):** managing/altering the multi-Engine setup (login, NetworkTree, dock/eject, install, start/stop, copy/move, Files/Backup/erase, operators, settings) lives in sibling [`multi-engine-operator.md`](./multi-engine-operator.md) with graph files `multi-engine-operator-markov.{dot,png,svg}`. This classroom usage graph stays usage-only.
 
-### States (final list)
+### States
 
 | State | Who | Colour | Meaning |
 |---|---|---|---|
@@ -236,11 +236,11 @@ stateDiagram-v2
 
 Each Markov **state** is a coarse place someone can be. An **action** leaves that place for another (or stays via a self-loop). Inside a state, a real test does **not** invent a new state for every mouse click — that would explode the graph. Instead the harness expands the action into an **ordered UI Interaction** (login → sidebar → form → Save) taken from Marco’s classroom presentations. Create an extra state only when the action changes **who** is acting, **which app surface** they are on, or **resource pressure** (e.g. video stream vs browse). Probabilities below are still placeholders.
 
-**Critical wiring rule:** actions that belong to an app state must **not** be edges from Console entry states. From `console_teacher` you may only **Open Kolibri as teacher**, **Open Nextcloud as teacher**, **Open Wikipedia as teacher**, or **Stay on teacher overview**. Coaching actions (**Create class**, **Enroll learners**, …) exist only as actions **inside** `kolibri_manage`. Same pattern for Nextcloud/Wikipedia.
+**Actions are unique to the state they depart from** — an action from state A cannot leave or affect another state; you only take actions listed on the current state. Example: from `console_teacher` you may only **Open Kolibri as teacher**, **Open Nextcloud as teacher**, **Open Wikipedia as teacher**, or **Stay on teacher overview**. Coaching actions (**Create class**, **Enroll learners**, …) exist only as actions **inside** `kolibri_manage`. Same pattern for Nextcloud/Wikipedia.
 
 **Arrival UI rule:** login / open / land-on-home click sequences live on the **source state’s outgoing action** (and its UI Interaction). Destination state sections never re-list how you got there.
 
-UI labels match Marco’s field decks and quick-reference cards (`kolibri-classroom-setup`, `kolibri-lessons-and-quizzes`, `nextcloud-user-registration`, `nextcloud-classroom-use`, `quick-reference-kolibri.md`, `quick-reference-nextcloud.md`) — confirmed with Marco 2026-09-29. Console steps assume the school-wide app overview any Engine’s Console shows (reason 1 / 3). Exact selectors belong in the Playwright harness later.
+**Action** names match Marco’s field decks and quick-reference cards (`kolibri-classroom-setup`, `kolibri-lessons-and-quizzes`, `nextcloud-user-registration`, `nextcloud-classroom-use`, `quick-reference-kolibri.md`, `quick-reference-nextcloud.md`) — confirmed with Marco 2026-09-29. Any Engine’s Console shows the same school-wide app list (reason 1 / 3). Detailed CSS selectors wait for the Playwright harness.
 
 ---
 
@@ -514,6 +514,16 @@ Preload content so every click target exists.
 1. From Console overview → click **Kiwix** / Wikipedia app (Running on idea-A).
 2. Kiwix library / Wikipedia ZIM opens in the browser.
 
+**Typical clicks (Marco) for coaching actions:**
+
+| Action | Clicks |
+|---|---|
+| Create class | Left sidebar **Classes** → **+ New class** → type name (e.g. `Grade 5A`) → **Save** |
+| Enroll learners | Open class → **Learners** tab → **Enroll learners** → tick students → **Confirm** |
+| Build lesson | Class → **Lessons** → **+ New lesson** (or open existing) → name → **Add resources** → pick video + exercise from **Library / Channels** → **Save** → set **Recipients** to the class → toggle **Visible** |
+| Create quiz | Class → **Quizzes** → **+ New quiz** → **Add questions** from exercise channels → set count → **Finish** → toggle **Active** |
+| Read reports | Left sidebar **Reports** → **Classes** → class → **Lessons** or **Quizzes** → open item → scan learner table |
+
 ### Create class
 
 **Role:** teacher · *Requires already in `kolibri_manage`.*
@@ -745,7 +755,7 @@ Full YAML / runner design stays with the existing Markov duration-tests proposal
 |---|---|
 | `agent-engine-dev/proposals/solution-description.md` | Vision: autofind Appdockers; add Appdockers + redistribute apps for performance |
 | [`multi-engine-classroom-scenarios.md`](./multi-engine-classroom-scenarios.md) (+ `.pdf`) | Prior draft — **superseded** (implementation-heavy; incorrectly framed multi-Engine as undocumented) |
-| Marco / programme-manager: `presentations/kolibri-classroom-setup`, `kolibri-lessons-and-quizzes`, `nextcloud-user-registration`, `nextcloud-classroom-use`; `reference-cards/quick-reference-kolibri.md`, `quick-reference-nextcloud.md` | Exact UI labels for Markov story + UI Interactions (Classes, Learn, Share, File request, …) |
+| Marco / programme-manager: `presentations/kolibri-classroom-setup`, `kolibri-lessons-and-quizzes`, `nextcloud-user-registration`, `nextcloud-classroom-use`; `reference-cards/quick-reference-kolibri.md`, `quick-reference-nextcloud.md` | Exact **action** names / UI wording for Markov story + UI Interactions (Classes, Learn, Share, File request, …) |
 | Marco field: `field/troubleshooting-guide.md` (via prior draft + local copy) | Many devices → performance drop; limit one group at a time |
 | [`duration-tests.md`](./duration-tests.md) | Existing Markov duration-test design (implementation later) |
 | idea#159 (+ multi-quality comment) | Kolibri concurrent stream capacity — planning 64/32/32/12 by quality |
