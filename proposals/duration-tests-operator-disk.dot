@@ -9,10 +9,7 @@ digraph DurationTestsOperatorDisk {
   splines=true;
   node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10, width=1.40, height=0.48, margin="0.08,0.06"];
   edge [fontname="Helvetica", fontsize=7, color="#555555"];
-
-  start_return [label="", shape=circle, width=0.28, height=0.28, fixedsize=true, fillcolor="black", style=filled, color="black", xlabel="Return to start"];
-
-  op_overview [label="op_overview\n(hub)", fillcolor="#85C1E9"];
+op_overview [label="op_overview\n(hub)", fillcolor="#85C1E9"];
   op_disk    [label="op_disk\n(disk inventory)", fillcolor="#FCF3CF"];
   op_install [label="op_install", fillcolor="#ABEBC6"];
   op_files   [label="op_files", fillcolor="#D7BDE2"];
@@ -67,13 +64,23 @@ digraph DurationTestsOperatorDisk {
   op_copy_move -> op_disk     [label="Stay on source disk 0.30"];
   op_copy_move -> op_instance [label="Open copied instance 0.15"];
 
-  op_overview -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  op_disk -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  op_eject -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  op_instance -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  op_install -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  op_copy_move -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  op_files -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  op_backup -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  op_erase -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
+  // Per-state Return-to-start shortcuts (dedicated black circles)
+  op_backup_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  op_backup -> op_backup_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  op_copy_move_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  op_copy_move -> op_copy_move_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  op_disk_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  op_disk -> op_disk_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  op_eject_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  op_eject -> op_eject_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  op_erase_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  op_erase -> op_erase_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  op_files_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  op_files -> op_files_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  op_install_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  op_install -> op_install_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  op_instance_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  op_instance -> op_instance_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  op_overview_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  op_overview -> op_overview_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
 }

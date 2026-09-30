@@ -2,7 +2,7 @@
 
 **Status:** Proposed — unified source of truth (absorbs classroom usage + operator Console + infra/fleet execution)  
 **Authors:** Axle (infra/runner foundation); Steve (Lead Bot) (usage + operator Markov); unified 2026-09-30 per Koen + Steve agreement  
-**Revision:** 2026-09-30h — single canonical duration-tests doc; Return-to-start black-circle shortcut; shared-store policy; fleet isolation  
+**Revision:** 2026-09-30i — Koen feedback: drop initial scenario lists; per-state Return black circles; YAML for all layers; Implementation chapter; top-level Composite walks / How a walk becomes a test; UI Interactions hierarchy  
 **Audience:** Koen / IDEA leads  
 **Companion capacity issue:** [idea#159](https://github.com/koenswings/idea/issues/159) — measure safe concurrent Kolibri video streams per instance  
 **Backups (SUPERSEDED, content retained):** [`duration-tests-infra-backup.md`](./duration-tests-infra-backup.md), [`multi-engine-classroom.md`](./multi-engine-classroom.md), [`multi-engine-operator.md`](./multi-engine-operator.md)
@@ -29,13 +29,13 @@ This proposal is the **single canonical** Markov model and execution design for 
 | **Operator** | Console manage/alter (dock/eject, install, start/stop, copy/move, backup/erase, operators, settings) | Open Console as operator → `op_entry` |
 | **Infra / fleet** | Dock, move, reboot + Automerge invariants (YAML actions / runner) | **One** transition from `start` into the infra subgraph root (`infra_idle`) |
 
-Layers share one Markov walker and one Intent-style action naming convention. Usage and operator keep H2 state sections, actions unique to the departing state, and a UI Interactions chapter. Infra folds the former YAML/runner/invariants design as the **execution** chapter, updated for current fleet isolation.
+Layers share one Markov walker and one Intent-style action naming convention. Usage and operator keep H2 state sections, actions unique to the departing state, and a UI Interactions chapter. The overall Markov graph is modeled as **YAML for all layers** (usage, operator, infra). Invariant specs are primarily for infra (optional light checks for usage/operator). Runner / stability / file-layout conclusions live in the **Implementation** chapter.
 
 ### Return to start (every state)
 
 **Every** state has a **Return to start** action so one walker can cover all three layer types in a single long run (leave usage → start → enter operator or infra, etc.).
 
-**Graphviz convention:** do **not** draw large arrows from every state back to `start`. Use a **shortcut arrow to a filled black circle** node (`start_return`) labeled **Return to start** (Intent name). Semantically that edge returns the walker to `start`; visually the black circle is the compact hub for those shortcuts.
+**Graphviz convention:** do **not** draw large arrows from every state back to `start`, and do **not** use one shared black sink for all returns. Each state that returns gets its **own small dedicated filled black circle**, with a **short dashed shortcut arrow** from that state to its circle (edge label ≈`0.05`). Semantically the edge returns the walker to `start`; visually the per-state black circle cuts clutter versus long spokes into a common hub.
 
 Placeholder ≈probability for Return to start on each state: **0.05** (runner renormalises weights). Adjust when field frequencies exist.
 
@@ -144,12 +144,12 @@ Diagrams are split into panels so Intent labels stay readable. Combined / panel 
 
 | Panel | File stem | Content |
 |---|---|---|
-| Hub | `duration-tests-hub` | `start` → usage / operator / infra roots; `start_return` black circle legend |
-| Usage A | `duration-tests-usage-kolibri` | Console + Kolibri (+ Return shortcuts) |
-| Usage B | `duration-tests-usage-files` | Console + Nextcloud + Wikipedia (+ Return shortcuts) |
-| Operator A | `duration-tests-operator-hub` | Auth, school hub, Account, Settings (+ Return) |
-| Operator B | `duration-tests-operator-disk` | Disk inventory and deep actions (+ Return) |
-| Infra | `duration-tests-infra` | Fleet dock / move / reboot subgraph (+ Return) |
+| Hub | `duration-tests-hub` | `start` → usage / operator / infra roots; per-state Return black-circle convention legend |
+| Usage A | `duration-tests-usage-kolibri` | Console + Kolibri (+ per-state Return shortcuts) |
+| Usage B | `duration-tests-usage-files` | Console + Nextcloud + Wikipedia (+ per-state Return shortcuts) |
+| Operator A | `duration-tests-operator-hub` | Auth, school hub, Account, Settings (+ per-state Return) |
+| Operator B | `duration-tests-operator-disk` | Disk inventory and deep actions (+ per-state Return) |
+| Infra | `duration-tests-infra` | Fleet dock / move / reboot subgraph (+ per-state Return) |
 
 ![Duration tests — start hub](./duration-tests-hub.png)
 
@@ -192,37 +192,6 @@ Classroom learner/teacher **usage** of Kolibri / Nextcloud / Wikipedia. Operator
 
 ![Usage Markov — Console, Nextcloud, Wikipedia](./duration-tests-usage-files.png)
 
-## Initial scenario list (for discussion)
-
-Discussable outcomes — **not** UI click scripts. Each item maps to Markov **states** / **actions** (and thus a UI Interaction) where the usage graph covers it; items that are operator-side or not yet in the graph are marked explicitly.
-
-**Reason 1 — distribute apps / load**
-
-- **S1 Add Engine, plug demanding app:** School adds idea-C; docks a heavy Kolibri (or Nextcloud media) disk onto it; app appears in every Console’s integrated list without renaming Consoles or teaching users a new hostname.
-- **S2 Redistribute load:** Move or copy a demanding instance from idea-A onto idea-B so A stays responsive for shared services; app list and Open links remain coherent school-wide.
-- **S3 Invisible Engine identity:** Student or teacher opens Console on idea-B or idea-C and sees the same app catalog/status as on idea-A.
-
-**Reason 2 — scale one app**
-
-- **S4 Kolibri stream ceiling:** Class exceeds safe concurrent streams on one instance → second Kolibri on another Engine; students assigned so neither instance exceeds the [idea#159](https://github.com/koenswings/idea/issues/159) planning N for that video quality (**64 @ 360p / 32 @ 480p–720p / 12 @ 1080p**).
-- **S5 Nextcloud media twin:** Same idea for Nextcloud video / large file concurrent access — second instance + cohort assignment when one Pi is the bottleneck.
-
-**Reason 3 — per-class Engine + Console-anywhere**
-
-- **S6 Class-only content:** Grade 5A Kolibri/Nextcloud live only on idea-B; Form 3 only on idea-C; shared Wikipedia (Kiwix) stays on idea-A.
-- **S7 Manage from the other room:** Teacher or operator on idea-A’s Console starts/stops, checks status, or prepares disks for apps that run on idea-B and idea-C.
-- **S8 Cross-class share without moving rooms:** Teacher on idea-B Console shares a Nextcloud folder with Form 3’s group whose home instance is on idea-C (management is school-wide; data placement follows class Engines).
-
-**Usage / field-aligned (Marco)**
-
-- **S9 Kolibri teaching cycle:** Teacher builds class → enrolls learners → assigns lesson with videos → students watch/complete → quiz → teacher reads Reports (from Marco Kolibri presentations).
-- **S10 Nextcloud classroom workflow:** Class groups; view-only material share; File Drop homework; collaborative doc; Talk for support (from Marco Nextcloud presentations). Field note: many devices → performance drop → prefer one group at a time unless multi-Engine capacity is in play.
-- **S11 Offline Wikipedia:** Learner (or teacher) opens Kiwix from Console (idea-A), searches/browses articles, dwells, leaves.
-
-**Coverage vs this usage graph** (after rewrite): see [Initial scenarios ↔ Markov coverage](#initial-scenarios--markov-coverage).
-
----
-
 
 ## State: `console_teacher`
 
@@ -238,13 +207,13 @@ The teacher is on the **Engine / apps overview**: Engines present, apps docked, 
 | **Open Nextcloud as teacher** | 0.20 | `nc_browse` | [Open Nextcloud as teacher](#open-nextcloud-as-teacher) |
 | **Open Wikipedia as teacher** | 0.10 | `wiki_browse` | [Open Wikipedia as teacher](#open-wikipedia-as-teacher) |
 | **Stay on teacher overview** | 0.50 | `console_teacher` | [Stay on teacher overview](#stay-on-teacher-overview) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
 ## State: `console_learner`
 
-A student is on Console with the **same unified app list** as teachers (reason 1 / S3). They are not managing Engines — just picking Kolibri, Nextcloud, or Wikipedia.
+A student is on Console with the **same unified app list** as teachers (reason 1). They are not managing Engines — just picking Kolibri, Nextcloud, or Wikipedia.
 
 **While here:** see integrated app list (class Kolibri/Nextcloud, Kiwix on idea-A, …); choose an app or dwell.
 
@@ -256,7 +225,7 @@ A student is on Console with the **same unified app list** as teachers (reason 1
 | **Open Nextcloud as learner** | 0.25 | `nc_browse` | [Open Nextcloud as learner](#open-nextcloud-as-learner) |
 | **Open Wikipedia as learner** | 0.20 | `wiki_browse` | [Open Wikipedia as learner](#open-wikipedia-as-learner) |
 | **Stay on learner overview** | 0.15 | `console_learner` | [Stay on learner overview](#stay-on-learner-overview) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
@@ -277,7 +246,7 @@ The teacher is on Kolibri’s **facility / coaching** side (Classes, Lessons, Qu
 | **Read reports** | 0.08 | `kolibri_manage` | [Read reports](#read-reports) |
 | **Preview as learner** | 0.20 | `kolibri_home` | [Preview as learner](#preview-as-learner) |
 | **Back to Console** | 0.25 | `console_teacher` | [Back to Console](#back-to-console) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 Composite walks (Teacher prepares Grade 5A lesson, Quiz and reports) chain several of these — see [Composite walks](#composite-walks).
 
@@ -297,7 +266,7 @@ A student (or teacher previewing) is on the **learner** side after login — Lea
 | **Open exercise** | 0.25 | `kolibri_exercise` | [Open exercise](#open-exercise) |
 | **Browse classes** | 0.20 | `kolibri_home` | [Browse classes](#browse-classes) |
 | **Leave Kolibri** | 0.10 | `console_learner` | [Leave Kolibri](#leave-kolibri) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
@@ -314,7 +283,7 @@ Capacity-sensitive state (reason 2 / idea#159). Many concurrent walkers here is 
 | **Keep watching** | 0.60 | `kolibri_watching` | [Keep watching](#keep-watching) |
 | **Next resource** | 0.25 | `kolibri_exercise` | [Next resource](#next-resource) |
 | **Exit lesson** | 0.15 | `kolibri_home` | [Exit lesson](#exit-lesson) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
@@ -328,7 +297,7 @@ Capacity-sensitive state (reason 2 / idea#159). Many concurrent walkers here is 
 |---|---:|---|---|
 | **Finish exercise** | 0.70 | `kolibri_home` | [Finish exercise](#finish-exercise) |
 | **Next video** | 0.30 | `kolibri_watching` | [Next video](#next-video) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 *(Quiz-taking can reuse exercise-like clicks under Learn → Quizzes, or stay under `kolibri_home` until a distinct load profile justifies a `kolibri_quiz` state. See [Composite walks](#composite-walks).)*
 
@@ -350,7 +319,7 @@ Hub for Marco’s classroom file workflow. **Files** app is the central UI (manu
 | **Browse folders** | 0.15 | `nc_browse` | [Browse folders](#browse-folders) |
 | **Leave Nextcloud as learner** | 0.13 | `console_learner` | [Leave Nextcloud as learner](#leave-nextcloud-as-learner) |
 | **Leave Nextcloud as teacher** | 0.10 | `console_teacher` | [Leave Nextcloud as teacher](#leave-nextcloud-as-teacher) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
@@ -364,7 +333,7 @@ Hub for Marco’s classroom file workflow. **Files** app is the central UI (manu
 |---|---:|---|---|
 | **Done sharing** | 0.80 | `nc_browse` | [Done sharing](#done-sharing) |
 | **Back to Console from share** | 0.20 | `console_teacher` | [Back to Console from share](#back-to-console-from-share) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
@@ -378,7 +347,7 @@ Hub for Marco’s classroom file workflow. **Files** app is the central UI (manu
 |---|---:|---|---|
 | **After upload** | 0.85 | `nc_browse` | [After upload](#after-upload) |
 | **Leave File Drop** | 0.15 | `console_learner` | [Leave File Drop](#leave-file-drop) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
@@ -392,7 +361,7 @@ Hub for Marco’s classroom file workflow. **Files** app is the central UI (manu
 |---|---:|---|---|
 | **Close doc** | 0.70 | `nc_browse` | [Close doc](#close-doc) |
 | **Keep editing** | 0.30 | `nc_collab` | [Keep editing](#keep-editing) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
@@ -409,28 +378,11 @@ Shared service on **idea-A** (school golden hub). Light load relative to Kolibri
 | **Search / browse Wikipedia** | 0.65 | `wiki_browse` | [Search / browse Wikipedia](#search--browse-wikipedia) |
 | **Leave Wikipedia as learner** | 0.20 | `console_learner` | [Leave Wikipedia as learner](#leave-wikipedia-as-learner) |
 | **Leave Wikipedia as teacher** | 0.15 | `console_teacher` | [Leave Wikipedia as teacher](#leave-wikipedia-as-teacher) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
 
-## Initial scenarios ↔ Markov coverage
-
-| Initial item | In usage graph? | States / actions | UI Interaction(s) |
-|---|---|---|---|
-| **S1** Add Engine, plug demanding app | **Partial** — usage asserts catalog equality; dock/install is operator | `console_teacher` / `console_learner` **Stay on … overview**, **Open Kolibri / Nextcloud / Wikipedia as …** | [Stay on teacher overview](#stay-on-teacher-overview), [Stay on learner overview](#stay-on-learner-overview); dock/install → operator layer |
-| **S2** Redistribute load | **Not in usage graph yet** — copy/move is operator Console | — | Operator: Copy app / Move app ([Layer: Operator](#layer-operator-console)) |
-| **S3** Invisible Engine identity | **Yes** | `console_teacher`, `console_learner` + open-app actions from any Engine’s Console | [Open Console as teacher](#open-console-as-teacher), [Open Console as learner](#open-console-as-learner), open-app UI Interactions |
-| **S4** Kolibri stream ceiling | **Yes** (usage dwell); second instance start is operator | `kolibri_watching` **Keep watching** (N walkers) | [Keep watching](#keep-watching) |
-| **S5** Nextcloud media twin | **Not in usage graph yet** — no Nextcloud video-watching state; twin instance is operator | — | Aspirational until NC media dwell state is designed; operator install/start for second instance |
-| **S6** Class-only content | **Yes** (placement story; same states, class Engines) | Open Kolibri/Nextcloud/Wikipedia from Console toward class vs shared instances | Open-app UI Interactions; [Search / browse Wikipedia](#search--browse-wikipedia) |
-| **S7** Manage from the other room | **Partial** — teacher open-app from idea-A Console **yes**; operator start/stop/disk **operator layer** | `console_teacher` **Open Nextcloud as teacher** / **Open Kolibri as teacher** while app runs on B/C | [Open Nextcloud as teacher](#open-nextcloud-as-teacher), [Open Kolibri as teacher](#open-kolibri-as-teacher); operator start/stop elsewhere |
-| **S8** Cross-class share | **Yes** | `nc_browse` **Share to class** → `nc_share` | [Share to class](#share-to-class), [Done sharing](#done-sharing) |
-| **S9** Kolibri teaching cycle | **Yes** | `kolibri_manage` coaching actions + learner path | [Create class](#create-class) … [Read reports](#read-reports), [Open video](#open-video), [Open exercise](#open-exercise); [Composite walks](#composite-walks) |
-| **S10** Nextcloud classroom workflow | **Yes** (Talk optional / light) | `nc_browse`, `nc_share`, `nc_drop`, `nc_collab` | [Share to class](#share-to-class), [Open File Drop](#open-file-drop), [Open collab doc](#open-collab-doc); [Composite walks](#composite-walks) |
-| **S11** Offline Wikipedia | **Yes** | `wiki_browse` **Search / browse Wikipedia** | [Search / browse Wikipedia](#search--browse-wikipedia) |
-
----
 
 ## Layer: Operator (Console)
 
@@ -558,7 +510,7 @@ Operator is elevating into operator mode (or finishing first-time setup). Browse
 |---|---:|---|---|
 | **Sign in** | 0.85 | `op_overview` | [Sign in](#sign-in) |
 | **Retry login / first-time setup** | 0.15 | `op_entry` | [Retry login / first-time setup](#retry-login--first-time-setup) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
@@ -579,7 +531,7 @@ Hub state. Operator sees Engines (idea-A / B / C), disks with role badges, insta
 | **Open Settings** | 0.06 | `op_settings` | [Open Settings](#open-settings) |
 | **Stay on overview** | 0.20 | `op_overview` | [Stay on overview](#stay-on-overview) |
 | **Notice USB dock** | 0.12 | `op_overview` | [Notice USB dock](#notice-usb-dock) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
@@ -604,7 +556,7 @@ Empty disk → `EmptyDiskPanel` cards. App/Backup/Files disk → `DiskView` sect
 | **Erase disk** | 0.08 | `op_erase` | [Erase disk](#erase-disk) |
 | **Eject disk** | 0.08 | `op_eject` | [Eject disk](#eject-disk) |
 | **Back to overview** | 0.10 | `op_overview` | [Back to overview](#back-to-overview) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
@@ -618,7 +570,7 @@ Empty disk → `EmptyDiskPanel` cards. App/Backup/Files disk → `DiskView` sect
 |---|---:|---|---|
 | **Confirm eject** | 0.70 | `op_overview` | [Confirm eject](#confirm-eject) |
 | **Cancel eject** | 0.30 | `op_overview` | [Cancel eject](#cancel-eject) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
@@ -640,7 +592,7 @@ On `InstanceRow`: Start, Stop, Open ↗, Backup (disk picker). Stay in-state for
 | **Move app** | 0.10 | `op_copy_move` | [Move app](#move-app) |
 | **Back to disk** | 0.20 | `op_disk` | [Back to disk](#back-to-disk) |
 | **Back to overview** | 0.15 | `op_overview` | [Back to overview](#back-to-overview) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
@@ -655,7 +607,7 @@ On `InstanceRow`: Start, Stop, Open ↗, Backup (disk picker). Stay in-state for
 | **Start after install** | 0.55 | `op_instance` | [Start after install](#start-after-install) |
 | **Stay on disk** | 0.30 | `op_disk` | [Stay on disk](#stay-on-disk) |
 | **Back to overview** | 0.15 | `op_overview` | [Back to overview](#back-to-overview) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
@@ -672,7 +624,7 @@ Vision “redistribute apps over Appdockers” = **Copy app** / **Move app** (+ 
 | **Done redistribute** | 0.55 | `op_overview` | [Done redistribute](#done-redistribute) |
 | **Stay on source disk** | 0.30 | `op_disk` | [Stay on source disk](#stay-on-source-disk) |
 | **Open copied instance** | 0.15 | `op_instance` | [Open copied instance](#open-copied-instance) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
@@ -686,7 +638,7 @@ Vision “redistribute apps over Appdockers” = **Copy app** / **Move app** (+ 
 |---|---:|---|---|
 | **Files role added** | 0.80 | `op_disk` | [Files role added](#files-role-added) |
 | **Back to overview** | 0.20 | `op_overview` | [Back to overview](#back-to-overview) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
@@ -700,7 +652,7 @@ Vision “redistribute apps over Appdockers” = **Copy app** / **Move app** (+ 
 |---|---:|---|---|
 | **Backup configured / restored** | 0.75 | `op_disk` | [Backup configured / restored](#backup-configured--restored) |
 | **Back to overview** | 0.25 | `op_overview` | [Back to overview](#back-to-overview) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
@@ -714,7 +666,7 @@ Vision “redistribute apps over Appdockers” = **Copy app** / **Move app** (+ 
 |---|---:|---|---|
 | **Confirm erase** | 0.70 | `op_disk` | [Confirm erase](#confirm-erase) |
 | **Cancel erase** | 0.30 | `op_overview` | [Cancel erase](#cancel-erase) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
@@ -731,7 +683,7 @@ Vision “redistribute apps over Appdockers” = **Copy app** / **Move app** (+ 
 | **Change password** | 0.20 | `op_account` | [Change password](#change-password) |
 | **Close Account** | 0.35 | `op_overview` | [Close Account](#close-account) |
 | **Log out** | 0.10 | `op_entry` | [Log out](#log-out) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
@@ -746,7 +698,7 @@ Vision “redistribute apps over Appdockers” = **Copy app** / **Move app** (+ 
 | **Close Settings** | 0.50 | `op_overview` | [Close Settings](#close-settings) |
 | **Switch Engine** | 0.25 | `op_settings` | [Switch Engine](#switch-engine) |
 | **Reboot Engine** | 0.25 | `op_settings` | [Reboot Engine](#reboot-engine) |
-| **Return to start** | 0.05 | `start` (via black-circle shortcut) | [Return to start](#return-to-start) |
+| **Return to start** | 0.05 | `start` (via dedicated black-circle shortcut) | [Return to start](#return-to-start) |
 
 ---
 
@@ -755,7 +707,7 @@ Vision “redistribute apps over Appdockers” = **Copy app** / **Move app** (+ 
 
 ## Layer: Infra / fleet (execution)
 
-Fleet / harness actions that stress docking, disk moves, reboots, and **Automerge invariants**. Entered from `start` by **one** transition into the infra subgraph root `infra_idle` (Intent: **Enter infra fleet walk**). This layer absorbs the former standalone duration-tests YAML/runner design ([`duration-tests-infra-backup.md`](./duration-tests-infra-backup.md)).
+Fleet / harness actions that stress docking, disk moves, reboots, and **Automerge invariants**. Entered from `start` by **one** transition into the infra subgraph root `infra_idle` (Intent: **Enter infra fleet walk**). Scenario YAML and the walker cover **all** layers (see Scenario file below and [Implementation](#implementation)); this layer’s states/actions/invariants are the infra portion. Absorbs the former standalone duration-tests design ([`duration-tests-infra-backup.md`](./duration-tests-infra-backup.md)).
 
 ### Infra graph
 
@@ -775,7 +727,9 @@ Fleet / harness actions that stress docking, disk moves, reboots, and **Automerg
 - **Single-Pi** runs: unique store + discovery off — skip multi-Engine convergence asserts; still check local invariants.
 - **Multi-Engine** runs: shared store + discovery on — require store convergence across participants.
 
-### Scenario file (YAML)
+### Scenario file (YAML) — all layers
+
+The **overall** Markov graph is modeled in YAML for **all** layers (usage, operator, infra) — not infra-only. One scenario file can mix layer entries from `start`. Intent names on transitions match UI Interactions (usage/operator) or infra action functions.
 
 ```yaml
 # scenarios/school-day.yaml
@@ -785,7 +739,81 @@ seed: 42                # optional RNG seed for reproducibility
 exclude_engines: [idea02]  # golden — never reboot / destructive infra
 
 states:
+  start:
+    description: Neutral hub — sample layer entry
+    transitions:
+      - to: console_teacher
+        weight: 25
+        action: open_console_as_teacher
+      - to: console_learner
+        weight: 35
+        action: open_console_as_learner
+      - to: op_entry
+        weight: 25
+        action: open_console_as_operator
+      - to: infra_idle
+        weight: 15
+        action: enter_infra_fleet_walk
+
+  # --- Usage (excerpt) ---
+  console_learner:
+    layer: usage
+    transitions:
+      - to: kolibri_home
+        weight: 40
+        action: open_kolibri_as_learner
+      - to: nc_browse
+        weight: 25
+        action: open_nextcloud_as_learner
+      - to: wiki_browse
+        weight: 20
+        action: open_wikipedia_as_learner
+      - to: console_learner
+        weight: 15
+        action: stay_on_learner_overview
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  kolibri_watching:
+    layer: usage
+    transitions:
+      - to: kolibri_watching
+        weight: 60
+        action: keep_watching
+      - to: kolibri_exercise
+        weight: 25
+        action: next_resource
+      - to: kolibri_home
+        weight: 15
+        action: exit_lesson
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  # --- Operator (excerpt) ---
+  op_overview:
+    layer: operator
+    transitions:
+      - to: op_disk
+        weight: 28
+        action: open_disk_inventory
+      - to: op_instance
+        weight: 18
+        action: open_instance_controls
+      - to: op_eject
+        weight: 10
+        action: eject_disk
+      - to: op_overview
+        weight: 20
+        action: stay_on_overview
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  # --- Infra ---
   infra_idle:
+    layer: infra
     description: All participating engines up, fixture disks undocked
     transitions:
       - to: infra_docked
@@ -794,11 +822,12 @@ states:
         weight: 5
       - to: infra_idle
         weight: 50
-      - to: start          # Return to start (walker may enter usage/operator)
+      - to: start
         weight: 5
         action: return_to_start
 
   infra_docked:
+    layer: infra
     description: Fixture disk docked on a pool engine
     transitions:
       - to: infra_idle
@@ -814,6 +843,7 @@ states:
         action: return_to_start
 
   infra_disk_moved:
+    layer: infra
     description: Disk physically moved to a different pool engine
     transitions:
       - to: infra_docked
@@ -827,6 +857,7 @@ states:
         action: return_to_start
 
   infra_reboot:
+    layer: infra
     description: One non-golden pool engine reboots
     transitions:
       - to: infra_idle
@@ -838,10 +869,11 @@ states:
         action: return_to_start
 
 initial_state: start
-# From start, weights choose usage entry, operator entry, or Enter infra fleet walk → infra_idle
 ```
 
-**Weights** are relative — the runner normalises them. States map to **actions** and **invariants** after settling.
+**Weights** are relative — the runner normalises them. Full state tables in this document are the design source; YAML mirrors them for the walker. States map to **actions** (UI Interaction or infra function) and optional **invariants** after settling.
+
+**Invariant specs** are **primarily for infra** (store convergence, phantom docks, zombie instances, golden untouched). Usage/operator may optionally declare light smoke asserts (e.g. catalog visible, NetworkTree present) — not required for every UI transition.
 
 ### State actions (TypeScript)
 
@@ -857,7 +889,7 @@ Implemented as async functions in `test/duration/actions.ts`. YAML references ac
 
 ### Invariant verification
 
-After each transition, wait for the system to **settle** (CRDT convergence when multi-Engine shared store) then verify invariants.
+After each transition, wait for the system to **settle** (CRDT convergence when multi-Engine shared store) then verify invariants. **Primary focus: infra layer.** Usage/operator invariants are optional smoke checks only.
 
 **Global invariants** (multi-Engine shared-store runs, after every infra transition):
 
@@ -890,7 +922,66 @@ await waitForConvergence(fleetStores, timeoutMs)
 
 Polls until serialised stores are equal or timeout (logged as convergence failure). Primary Automerge eventual-consistency check for multi-Engine runs.
 
+---
+
+## Composite walks
+
+Optional multi-action stories for discussion (not extra graph edges). Each step is a named UI Interaction (usage or operator) or infra Intent. Applies across **all** graphs / layers.
+
+### Usage
+
+| Walk | Chain |
+|---|---|
+| Teacher prepares Grade 5A lesson | Open Kolibri as teacher → Create class *(skip if preloaded)* → Enroll learners → Build lesson → optional Read reports → Preview as learner or Back to Console |
+| Student completes assigned lesson | Open Console as learner → Open Kolibri as learner → Open video → Keep watching → Next resource → Finish exercise → Leave Kolibri |
+| Quiz and reports | Create quiz → *(students: Learn → Quizzes → Start → answer)* → Read reports |
+| Teacher share File Drop and collab | Open Nextcloud as teacher → Share to class → *(prep File Drop / create collab, often preload)* → students: Open File Drop / Open collab doc |
+| Class hits stream ceiling | N × (Open Kolibri as learner → Open video → Keep watching); second instance start is operator |
+
+### Operator
+
+| Walk | Story | Chain |
+|---|---|---|
+| Add capacity | New empty disk on idea-C → install Kolibri → start | Notice USB dock → Open disk inventory → Install App → Start after install |
+| Redistribute load | Move heavy instance idea-B → idea-C | Open disk inventory → Move app → Done redistribute |
+| Safe disk carry | Eject on idea-B → (unplug) → dock on idea-A | Eject disk → Confirm eject → Notice USB dock → Open disk inventory |
+| Files for Nextcloud | Make Files Disk on idea-A → start Nextcloud | Make Files Disk → Files role added → Open instance controls → Start instance |
+| Backup drill | Make Backup Disk → backupApp → restore elsewhere | Make Backup Disk → Backup configured / restored → Backup instance → Restore from Backup → Backup configured / restored |
+
+### Infra (illustrative)
+
+| Walk | Chain |
+|---|---|
+| Dock–settle–undock | Enter infra fleet walk → (dock weights) → Return to start |
+| Disk move across pool Engines | `infra_docked` → `infra_disk_moved` → `infra_docked` / `infra_idle` |
+| Non-golden reboot drill | `infra_reboot` → `infra_idle` (assert golden untouched) |
+
+---
+
+## How a walk becomes a test
+
+Applies to **all** layers — usage UI, operator UI, and infra actions — driven by the same Markov walker and scenario YAML.
+
+1. Preload Kolibri with a class, enrolled learners, and a lesson that includes at least one video and one exercise (Marco Week 1–2 content shape).
+2. Preload Nextcloud with class groups, a view-only materials folder, a File Drop folder, and one collaborative document (Marco classroom-use shape).
+3. Preload / confirm Kiwix ZIM available on idea-A.
+4. Sample a walk: e.g. `console_learner → kolibri_home → … → kolibri_watching` (N concurrent walkers = N “students” hitting video — bounded by idea#159 quality table), or `console_teacher → kolibri_manage` for coaching scripts.
+5. Multi-Engine walks assign walkers to instances on idea-B vs idea-C when testing reason 2; Console actions may start on any Engine’s Console (reason 3).
+
+6. Operator walks preload three Engines in store (idea-A/B/C), an empty USB disk, an App Disk with a Stopped instance, and a Backup Disk when testing restore; each step expands to an Operator UI Interaction.
+7. Infra walks use pool Engines only (never golden `idea02`); after each transition run infra invariants (and convergence when shared-store multi-Engine).
+8. Any state may **Return to start** (dedicated black-circle shortcut) so one long run can leave usage, enter operator or infra, and continue.
+
+Implementation of the walker, YAML loader, and action dispatch is in [Implementation](#implementation).
+
+---
+
+## Implementation
+
+Follow-up implementation conclusions for the **unified** walker. Assessed: **yes — generalisation to all graphs is possible and intended.** One YAML schema, one runner, one action registry keyed by Intent name; usage/operator resolve to Playwright (or equivalent) UI Interactions, infra resolves to fleet harness functions. Layer tags on states (`usage` / `operator` / `infra`) select the dispatcher and which invariant suite runs. Return-to-start and shared-store / unique-doc mode switches are cross-cutting, not per-layer forks.
+
 ### Test runner
+
 
 ```
 pnpm test:duration [--scenario school-day] [--iterations 200] [--fast]
@@ -904,15 +995,18 @@ Runner steps: parse YAML → connect to participating engines (`localStoreHandle
 
 ### Stability monitoring
 
+
 During dwell, background probe ~every 30s: ping WS, `docker ps` for Running instances, unexpected status transitions. Logged; fail only after threshold (e.g. 3 consecutive failures).
 
 ### File layout
+
 
 ```
 test/
   duration/
     runner.ts           ← Markov walker + action dispatcher + invariant checker
-    actions.ts          ← dock, undock, reboot (pool-only), return_to_start, …
+    actions.ts          ← infra dock/undock/reboot (pool-only) + return_to_start
+    ui/                 ← Playwright (or equiv.) adapters for usage + operator Intents
     convergence.ts      ← waitForConvergence + store equality checks
     invariants.ts       ← invariant type registry + evaluation
     scenarios/
@@ -923,6 +1017,7 @@ test/
 
 ### Scenarios to ship
 
+
 | Scenario | Description | Focus | Duration |
 |---|---|---|---|
 | `school-day` | Typical day; usage + operator + infra from start hub | 3 layers | 8h simulated |
@@ -931,10 +1026,13 @@ test/
 
 ### Implementation phases
 
+
 **Phase 1:** Runner + YAML loader + infra dock/undock/restart (pool-only) + convergence check + Return to start  
 **Phase 2:** Invariant registry + structured logs + shared-store / unique-doc mode switch  
 **Phase 3:** Wire usage + operator UI Interactions (Playwright) into the same walker  
 **Phase 4:** Stability monitoring + stress + CI `minimal`
+
+**Generalisation note:** Phase 1–2 can ship infra-only YAML subsets; Phase 3 adds usage + operator states into the **same** schema without a second runner. Do not maintain parallel walkers per layer.
 
 ---
 
@@ -942,9 +1040,13 @@ test/
 
 Usage and operator **ordered UI click sequences**. Each name matches a graph action Intent. Markov actions link **forward** only; this chapter does not re-describe the graph.
 
+**Hierarchy:** this section is the parent; **Usage UI Interactions** and **Operator UI Interactions** are the two subsections. Infra fleet steps are action functions (see Layer: Infra), not UI clicks here.
+
+Usage and operator **ordered UI click sequences**. Each name matches a graph action Intent. Markov actions link **forward** only; this chapter does not re-describe the graph.
+
 ### Return to start
 
-**Role:** any walker · **From:** any state · **To:** `start` (via black-circle shortcut).
+**Role:** any walker · **From:** any state · **To:** `start` (via dedicated black-circle shortcut).
 
 1. End the current UI / infra context (close dialogs if needed; do not leave the system dirty beyond what the departing state's invariants already allow).
 2. Clear layer-specific walker context (signed-in app session may end; operator may remain elevated only if the next sampled entry expects it — default: return to neutral `start`).
@@ -952,33 +1054,31 @@ Usage and operator **ordered UI click sequences**. Each name matches a graph act
 
 ### Usage UI Interactions
 
-These are **ordered UI click sequences** that implement one graph **action**. Each has a single consistent Intent-style name (no cryptic IDs). Markov actions link **forward** to these names only; this chapter does **not** re-describe the Markov graph.
+Classroom teacher/learner UI click sequences. Intent-style names only (no cryptic IDs). Preload content so every click target exists.
 
-Preload content so every click target exists.
-
-### Open Console as teacher
+#### Open Console as teacher
 
 **Role:** teacher · **Engines:** any Console (idea-A / B / C equivalent).
 
 1. Open Chromium (or any browser) on the school LAN → Console for any Engine (field habit today: hostname like `engine-1.local`; multi-Engine story: idea-A / idea-B / idea-C Consoles must be equivalent).
 2. Land on Engine / apps overview (Running apps, Engine rows).
 
-### Open Console as learner
+#### Open Console as learner
 
 **Role:** student · **Engines:** any Console.
 
 1. Open browser on school LAN → any Engine’s Console.
 2. Land on unified app list (same catalog as teachers).
 
-### Stay on teacher overview
+#### Stay on teacher overview
 
 **Role:** teacher · Dwell on school-wide Console overview; refresh while students work; assert catalog visible without opening an app.
 
-### Stay on learner overview
+#### Stay on learner overview
 
 **Role:** student · Dwell on unified app list without opening an app yet.
 
-### Open Kolibri as teacher
+#### Open Kolibri as teacher
 
 **Role:** teacher · Arrives in `kolibri_manage`.
 
@@ -986,7 +1086,7 @@ Preload content so every click target exists.
 2. Kolibri login → type **teacher username** / **password** → Sign in.
 3. Land on teacher home / facility UI (left sidebar visible) — ready for coaching actions.
 
-### Open Kolibri as learner
+#### Open Kolibri as learner
 
 **Role:** student · Arrives in `kolibri_home`.
 
@@ -994,7 +1094,7 @@ Preload content so every click target exists.
 2. Kolibri login → **learner username** / **password** → Sign in.
 3. Top menu **Learn** → see enrolled classes / assigned Lessons (and Quizzes if active).
 
-### Open Nextcloud as teacher
+#### Open Nextcloud as teacher
 
 **Role:** teacher · Arrives in `nc_browse`.
 
@@ -1002,7 +1102,7 @@ Preload content so every click target exists.
 2. Nextcloud login → teacher username / password.
 3. Open **Files** (default home) → ready to browse / share.
 
-### Open Nextcloud as learner
+#### Open Nextcloud as learner
 
 **Role:** student · Arrives in `nc_browse`.
 
@@ -1010,33 +1110,33 @@ Preload content so every click target exists.
 2. Nextcloud login → student username / password.
 3. Open **Files** → class materials / Drop Zone / shared docs.
 
-### Open Wikipedia as teacher
+#### Open Wikipedia as teacher
 
 **Role:** teacher · Arrives in `wiki_browse`.
 
 1. From Console overview → click **Kiwix** / Wikipedia app (Running on idea-A).
 2. Kiwix library / Wikipedia ZIM opens in the browser.
 
-### Open Wikipedia as learner
+#### Open Wikipedia as learner
 
 **Role:** student · Arrives in `wiki_browse`.
 
 1. From Console overview → click **Kiwix** / Wikipedia app (Running on idea-A).
 2. Kiwix library / Wikipedia ZIM opens in the browser.
 
-### Create class
+#### Create class
 
 **Role:** teacher · *Requires already in `kolibri_manage`.*
 
 1. Left sidebar **Classes** → **+ New class** → type name (e.g. `Grade 5A`) → **Save**.
 
-### Enroll learners
+#### Enroll learners
 
 **Role:** teacher · *Requires class (preload or Create class).*
 
 1. Open class → **Learners** tab → **Enroll learners** → tick students → **Confirm**.
 
-### Build lesson
+#### Build lesson
 
 **Role:** teacher
 
@@ -1044,89 +1144,89 @@ Preload content so every click target exists.
 2. **Add resources** → Library/Channels → select **1 video** + **1 exercise** → **Save**.
 3. Confirm **Recipients** = class → toggle lesson **Visible**.
 
-### Create quiz
+#### Create quiz
 
 **Role:** teacher
 
 1. Class → **Quizzes** → **+ New quiz** → **Add questions** from exercise channel → set count (e.g. 5–10) → **Finish** → toggle **Active**.
 
-### Read reports
+#### Read reports
 
 **Role:** teacher
 
 1. Left sidebar **Reports** → **Classes** → class → **Lessons** or **Quizzes** → open item → scan learner table (scores / completion).
 
-### Preview as learner
+#### Preview as learner
 
 **Role:** teacher · Leaves coaching for Learn (`kolibri_home`).
 
 1. From coaching UI, open learner view / Learn (or sign in as a test learner).
 2. See assigned lessons as a student would.
 
-### Back to Console
+#### Back to Console
 
 **Role:** teacher · Leaves Kolibri coaching for `console_teacher`.
 
 1. Close / navigate away from Kolibri → Console overview visible again.
 
-### Open video
+#### Open video
 
 **Role:** student · From Learn / lesson list.
 
 1. Open class → open assigned lesson.
 2. Click video resource → player starts (enters `kolibri_watching`).
 
-### Open exercise
+#### Open exercise
 
 **Role:** student
 
 1. Open class → open assigned lesson (or from lesson list).
 2. Click exercise resource → exercise UI loads (enters `kolibri_exercise`).
 
-### Browse classes
+#### Browse classes
 
 **Role:** student · Stay in `kolibri_home`.
 
 1. On Learn, open / close classes, scan assigned Lessons and Quizzes without starting a resource.
 
-### Leave Kolibri
+#### Leave Kolibri
 
 **Role:** student · Returns to `console_learner`.
 
 1. Leave Kolibri (close tab / navigate back) → Console unified app list.
 
-### Keep watching
+#### Keep watching
 
 **Role:** student · Self-loop in `kolibri_watching`.
 
 1. Continue playing / pause / seek; Kolibri records progress.
 2. *Concurrency note (S4):* N walkers dwelling here = N streams; if N > planning N for that quality on idea-B, second Kolibri on idea-C is an **operator** action.
 
-### Next resource
+#### Next resource
 
 **Role:** student · Video → exercise in the same lesson.
 
 1. Finish or leave video player → open the exercise resource in the lesson → `kolibri_exercise`.
 
-### Exit lesson
+#### Exit lesson
 
 **Role:** student · Returns to `kolibri_home`.
 
 1. Exit lesson / back to Learn or class list.
 
-### Finish exercise
+#### Finish exercise
 
 **Role:** student · Returns to `kolibri_home`.
 
 1. Answer remaining items → submit → return to Learn / class.
 
-### Next video
+#### Next video
 
 **Role:** student · Exercise → another video.
 
 1. From exercise (or lesson list) open the next video resource → `kolibri_watching`.
 
-### Share to class
+#### Share to class
 
 **Role:** teacher · Enters `nc_share`.
 
@@ -1137,19 +1237,19 @@ Preload content so every click target exists.
 
 *(Group must already exist — Accounts → Groups → **+** — often a preload step.)*
 
-### Done sharing
+#### Done sharing
 
 **Role:** teacher · Returns to `nc_browse`.
 
 1. Close Share dialog → back in Files browse.
 
-### Back to Console from share
+#### Back to Console from share
 
 **Role:** teacher · Leaves Nextcloud for `console_teacher`.
 
 1. From Share / Files, leave Nextcloud → Console overview.
 
-### Open File Drop
+#### Open File Drop
 
 **Role:** student (teacher prep optional) · Enters `nc_drop`.
 
@@ -1157,107 +1257,80 @@ Preload content so every click target exists.
 2. Student: open the File Drop / file-request link.
 3. See empty “Click or drop to upload” UI (cannot see others’ files).
 
-### After upload
+#### After upload
 
 **Role:** student · Returns to `nc_browse`.
 
 1. Choose file(s) / drop → upload completes → return to Files browse.
 
-### Leave File Drop
+#### Leave File Drop
 
 **Role:** student · Returns to `console_learner`.
 
 1. Leave File Drop page → Console.
 
-### Open collab doc
+#### Open collab doc
 
 **Role:** student (teacher create often preload) · Enters `nc_collab`.
 
 1. *(Teacher create / preload:)* Files → **+ New** → **New Document** → name → pick template → Share with group → **Allow editing**.
 2. Student: open shared file from Files → editor loads; peer **avatars** top-right.
 
-### Close doc
+#### Close doc
 
 **Role:** student · Returns to `nc_browse`.
 
 1. Close editor → Files browse.
 
-### Keep editing
+#### Keep editing
 
 **Role:** student · Self-loop in `nc_collab`.
 
 1. Continue typing / collaborating; cursors move live.
 
-### Browse folders
+#### Browse folders
 
 **Role:** student or teacher · Self-loop in `nc_browse`.
 
 1. Navigate folders (class materials, Drop Zone, school shares) without starting share / drop / collab.
 
-### Leave Nextcloud as learner
+#### Leave Nextcloud as learner
 
 **Role:** student · Returns to `console_learner`.
 
 1. Leave Nextcloud → Console unified app list.
 
-### Leave Nextcloud as teacher
+#### Leave Nextcloud as teacher
 
 **Role:** teacher · Returns to `console_teacher`.
 
 1. Leave Nextcloud → Console overview.
 
-### Search / browse Wikipedia
+#### Search / browse Wikipedia
 
 **Role:** learner or teacher · Self-loop in `wiki_browse`.
 
 1. Search box: type a topic → open an article.
 2. Follow internal links / browse categories; dwell reading.
 
-### Leave Wikipedia as learner
+#### Leave Wikipedia as learner
 
 **Role:** student · Returns to `console_learner`.
 
 1. Leave Kiwix → Console.
 
-### Leave Wikipedia as teacher
+#### Leave Wikipedia as teacher
 
 **Role:** teacher · Returns to `console_teacher`.
 
 1. Leave Kiwix → Console.
 
-### Composite walks
-
-Optional multi-action stories for discussion (not extra graph edges). Each step is a named UI Interaction above.
-
-| Walk | Chain |
-|---|---|
-| Teacher prepares Grade 5A lesson | Open Kolibri as teacher → Create class *(skip if preloaded)* → Enroll learners → Build lesson → optional Read reports → Preview as learner or Back to Console |
-| Student completes assigned lesson | Open Console as learner → Open Kolibri as learner → Open video → Keep watching → Next resource → Finish exercise → Leave Kolibri |
-| Quiz and reports | Create quiz → *(students: Learn → Quizzes → Start → answer)* → Read reports |
-| Teacher share File Drop and collab | Open Nextcloud as teacher → Share to class → *(prep File Drop / create collab, often preload)* → students: Open File Drop / Open collab doc |
-| Class hits stream ceiling | N × (Open Kolibri as learner → Open video → Keep watching); second instance start is operator |
-
-### How a walk becomes a test
-
-1. Preload Kolibri with a class, enrolled learners, and a lesson that includes at least one video and one exercise (Marco Week 1–2 content shape).
-2. Preload Nextcloud with class groups, a view-only materials folder, a File Drop folder, and one collaborative document (Marco classroom-use shape).
-3. Preload / confirm Kiwix ZIM available on idea-A.
-4. Sample a walk: e.g. `console_learner → kolibri_home → … → kolibri_watching` (N concurrent walkers = N “students” hitting video — bounded by idea#159 quality table), or `console_teacher → kolibri_manage` for coaching scripts.
-5. Multi-Engine walks assign walkers to instances on idea-B vs idea-C when testing reason 2; Console actions may start on any Engine’s Console (reason 3).
-
-Full YAML / runner design stays with the existing Markov duration-tests proposal (this document, idea#85) when implementation starts — not here.
-
----
-
-
 
 ### Operator UI Interactions
 
-These are **ordered UI click sequences** that implement one graph **action**. Each has a single consistent Intent-style name. Markov actions link **forward** to these names only; this chapter does **not** re-describe the Markov graph.
+Authenticated operator Console UI click sequences. Intent-style names only. Preload: three Engines visible in store (idea-A/B/C), at least one empty USB disk, one App Disk with a Stopped instance, one Backup Disk when testing restore.
 
-Preload: three Engines visible in store (idea-A/B/C), at least one empty USB disk, one App Disk with a Stopped instance, one Backup Disk when testing restore.
-
-### Open Console as operator
+#### Open Console as operator
 
 **Role:** operator · **Engines:** any Console (idea-A / B / C).
 
@@ -1265,7 +1338,7 @@ Preload: three Engines visible in store (idea-A/B/C), at least one empty USB dis
 2. If needed: Settings → discover / Connect to an Engine (hostname).
 3. Land in user-mode AppBrowser if not yet elevated — ready for **Sign in**.
 
-### Sign in
+#### Sign in
 
 **Role:** operator · Enters `op_overview`.
 
@@ -1273,7 +1346,7 @@ Preload: three Engines visible in store (idea-A/B/C), at least one empty USB dis
 2. UI switches to operator layout: **NetworkTree** (left) + instances/disk detail.
 3. Assert: NetworkTree visible with multiple Engines when mesh is up.
 
-### Retry login / first-time setup
+#### Retry login / first-time setup
 
 **Role:** operator · Stays in / returns to `op_entry`.
 
@@ -1281,211 +1354,199 @@ Preload: three Engines visible in store (idea-A/B/C), at least one empty USB dis
 2. Or: failed login → correct credentials and retry Log in.
 3. On success the next walk step is usually **Sign in** landing in overview (or setup completes into operator mode).
 
-### Stay on overview
+#### Stay on overview
 
 1. Expand idea-A, idea-B, idea-C in NetworkTree.
 2. Note disk badges (app / backup / files / empty) and instance status dots.
 3. Dwell (CRDT updates) without changing selection.
 
-### Notice USB dock
+#### Notice USB dock
 
 1. From overview, note disk list.
 2. *(Hardware / fleet harness)* Plug formatted or unformatted SSD into idea-C (or B).
 3. Wait until new disk row appears under that Engine (still in `op_overview`; next step often **Open disk inventory**).
 
-### Open disk inventory
+#### Open disk inventory
 
 1. Click an empty disk under idea-B → EmptyDiskPanel cards visible.
 2. Or click an App Disk → DiskView Apps / Files / etc.
 3. Arrives in `op_disk`.
 
-### Open instance controls
+#### Open instance controls
 
 1. From overview or disk inventory, select an instance row (`InstanceRow` visible with Start / Stop / Open / Backup).
 2. Arrives in `op_instance`.
 
-### Eject disk
+#### Eject disk
 
 **Enters `op_eject`.**
 
 1. On a non-system, non-pure-backup disk with device: click **Eject**.
 2. `EjectConfirm` dialog opens.
 
-### Confirm eject
+#### Confirm eject
 
 1. Confirm in `EjectConfirm`.
 2. Assert: disk undocked / removed from that Engine’s docked list; instances stopped → back to `op_overview`.
 
-### Cancel eject
+#### Cancel eject
 
 1. Cancel in `EjectConfirm` → back to `op_overview` (disk still docked).
 
-### Open Account
+#### Open Account
 
 1. 👤 → Account / Manage Operators screen → `op_account`.
 
-### Open Settings
+#### Open Settings
 
 1. ⚙ → Settings panel (Engine Connection / Account / About) → `op_settings`.
 
-### Install App
+#### Install App
 
 **Enters `op_install`.**
 
 1. Empty (or eligible) disk → **Install App** → pick app from catalog (e.g. Kolibri) → optional name → Install.
 2. Wait `OperationProgress`.
 
-### Start after install
+#### Start after install
 
 1. After install succeeds → **Start** → enter `op_instance` controls on the new instance.
-2. Assert (classroom S1): instance appears in every Console’s catalog.
+2. Assert (reason 1): instance appears in every Console’s catalog.
 
-### Stay on disk
+#### Stay on disk
 
 1. After install (or from install state) remain on DiskView / EmptyDiskPanel without starting → `op_disk`.
 
-### Make Files Disk
+#### Make Files Disk
 
 **Enters `op_files`.**
 
 1. Empty disk → **Make this a Files Disk** → share name (default `School Files`) → submit `createFilesDisk`.
 
-### Add Files role
+#### Add Files role
 
 **Enters `op_files`.**
 
 1. App (or backup) Disk → **Add Files** → share name → submit.
 
-### Files role added
+#### Files role added
 
 1. Assert: `files` badge; availability text updates when opted-in apps run → return to `op_disk`.
 
-### Make Backup Disk
+#### Make Backup Disk
 
 **Enters `op_backup`.**
 
 1. Empty disk → **Make this a Backup Disk** → mode on-demand / immediate / scheduled → select instance(s) → Configure.
 
-### Restore from Backup
+#### Restore from Backup
 
 **Enters `op_backup`.**
 
 1. Select Backup Disk → Restore panel → pick instance archive → target App Disk → confirm Restore.
 
-### Backup configured / restored
+#### Backup configured / restored
 
 1. Assert: `backup` badge (make) or restored instance present (restore) → return to `op_disk`.
 
-### Copy app
+#### Copy app
 
 **Enters `op_copy_move`.**
 
 1. From disk inventory or instance row on idea-B, **Copy** to App Disk on idea-C (drag or mobile sheet).
 2. Wait `copyApp` operation → new InstanceID on target.
 
-### Move app
+#### Move app
 
 **Enters `op_copy_move`.**
 
 1. **Move** demanding Kolibri from idea-A disk to idea-B disk (same InstanceID).
 2. Wait `moveApp`; assert backup links intact; source cleaned; catalog still unified.
 
-### Done redistribute
+#### Done redistribute
 
 1. After copy/move completes → focus NetworkTree / school overview → `op_overview`.
 
-### Stay on source disk
+#### Stay on source disk
 
 1. After copy/move → remain on source DiskView → `op_disk`.
 
-### Open copied instance
+#### Open copied instance
 
 1. Select the new (or moved) instance on the target disk → `op_instance`.
 
-### Erase disk
+#### Erase disk
 
 **Enters `op_erase`.**
 
 1. From disk inventory: **Erase this disk…** → `EraseDialog` → wait `summariseDisk` summary.
 
-### Confirm erase
+#### Confirm erase
 
 1. Type exact label → confirm `eraseDisk`.
 2. Assert: disk `empty`; prior instances gone → `op_disk` EmptyDiskPanel.
 
-### Cancel erase
+#### Cancel erase
 
 1. Cancel `EraseDialog` → `op_overview` (or leave erase without wiping).
 
-### Start instance
+#### Start instance
 
 1. Select Stopped instance on idea-B App Disk.
 2. **Start** → wait until Running (or Error + History).
 
-### Stop instance
+#### Stop instance
 
 1. On Running instance → **Stop** → Stopped / Docked as applicable.
 
-### Open app
+#### Open app
 
 1. Running instance → **Open ↗** → app URL loads (smoke only; deep app use is classroom graph).
 
-### Backup instance
+#### Backup instance
 
 1. Running (or eligible) instance → **Backup** → pick Backup Disk → `backupApp`.
 2. Watch OperationProgress; cancel only if testing cancel path.
 
-### Back to disk
+#### Back to disk
 
 1. From instance controls, clear instance focus / select parent disk → `op_disk`.
 
-### Back to overview
+#### Back to overview
 
 1. Clear disk/instance selection or click school hub → NetworkTree overview → `op_overview`.
 
-### Add operator
+#### Add operator
 
 1. Manage Operators → Add operator (username + password) → stay in `op_account`.
 
-### Remove operator
+#### Remove operator
 
 1. Manage Operators → Remove selected operator → stay in `op_account`.
 
-### Change password
+#### Change password
 
 1. Account → Change password (min 8) → stay in `op_account`.
 
-### Close Account
+#### Close Account
 
 1. Close Account screen → `op_overview`.
 
-### Log out
+#### Log out
 
 1. Account → **Log out** → back to `op_entry` / user mode.
 
-### Close Settings
+#### Close Settings
 
 1. Close Settings panel → `op_overview`.
 
-### Switch Engine
+#### Switch Engine
 
 1. ⚙ → Engine Connection → Connect to another discovered Engine (or manual hostname) → stay in `op_settings` (tree refreshes for connected Engine).
 
-### Reboot Engine
+#### Reboot Engine
 
 1. NetworkTree **Reboot** on a selected Engine (modelled from settings/hub) → wait reconnect → stay in `op_settings` until **Close Settings**.
-
-### Composite walks
-
-Optional multi-action stories (not extra graph edges). Each step is a named UI Interaction above.
-
-| Walk | Story | Chain |
-|---|---|---|
-| Add capacity | New empty disk on idea-C → install Kolibri → start | Notice USB dock → Open disk inventory → Install App → Start after install |
-| Redistribute load | Move heavy instance idea-B → idea-C | Open disk inventory → Move app → Done redistribute |
-| Safe disk carry | Eject on idea-B → (unplug) → dock on idea-A | Eject disk → Confirm eject → Notice USB dock → Open disk inventory |
-| Files for Nextcloud | Make Files Disk on idea-A → start Nextcloud | Make Files Disk → Files role added → Open instance controls → Start instance |
-| Backup drill | Make Backup Disk → backupApp → restore elsewhere | Make Backup Disk → Backup configured / restored → Backup instance → Restore from Backup → Backup configured / restored |
 
 ---
 
@@ -1511,7 +1572,8 @@ Optional multi-action stories (not extra graph edges). Each step is a named UI I
 ## Ask of Koen
 
 1. Confirm **one** `duration-tests.md` as canonical; classroom/operator files remain backups only.  
-2. Confirm **Return to start** on every state via **black-circle** Graphviz shortcut.  
+2. Confirm **Return to start** on every state via a **dedicated per-state black-circle** Graphviz shortcut (not one shared sink).  
 3. Confirm **shared-store policy** table (single-Pi unique+discovery off; multi-Engine/production shared+discovery on; golden protected).  
 4. Confirm infra entry is **one** transition from `start` into `infra_idle`.  
-5. Prioritise which layer / composite walks to deepen first for implementation (idea#85 lineage).
+5. Confirm scenario **YAML models all layers**; invariants primarily infra (optional usage/operator smoke).  
+6. Prioritise which layer / composite walks to deepen first for implementation (idea#85 lineage).

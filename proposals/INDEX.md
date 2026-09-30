@@ -50,7 +50,7 @@ Per-command log capture via AsyncLocalStorage + Automerge CommandLogStore.
 
 ## duration-tests.md
 **Status:** Proposed — unified source of truth · **Authors:** Axle; Steve (Lead Bot); unified 2026-09-30
-Canonical Markov **duration tests** for continuous long-running school operation: one graph / one runner with **Usage** (classroom), **Operator** (Console manage/alter), and **Infra/fleet** layers; Return-to-start black-circle shortcut on every state; shared-store policy; Automerge invariants. Graphs: `duration-tests-{hub,usage-*,operator-*,infra}.{dot,png,svg}` (+ pdf).
+Canonical Markov **duration tests** for continuous long-running school operation: one graph / one runner with **Usage** (classroom), **Operator** (Console manage/alter), and **Infra/fleet** layers; per-state Return-to-start black-circle shortcuts; YAML for all layers; Implementation chapter; shared-store policy; Automerge invariants. Graphs: `duration-tests-{hub,usage-*,operator-*,infra}.{dot,png,svg}` (+ pdf).
 
 ## multi-engine-classroom.md
 **Status:** SUPERSEDED by [`duration-tests.md`](./duration-tests.md) — backup retained · **Author:** Steve (Lead Bot)

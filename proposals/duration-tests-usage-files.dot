@@ -13,9 +13,7 @@ digraph DurationTestsUsageFiles {
   edge [fontname="Helvetica", fontsize=7, color="#555555"];
 
   start [label="start", shape=circle, width=0.40, height=0.40, fixedsize=true, fillcolor="#eeeeee", style=filled, fontsize=9];
-  start_return [label="", shape=circle, width=0.28, height=0.28, fixedsize=true, fillcolor="black", style=filled, color="black", xlabel="Return to start"];
-
-  subgraph cluster_console {
+subgraph cluster_console {
     label="Console";
     fontsize=11;
     style=rounded;
@@ -74,11 +72,19 @@ digraph DurationTestsUsageFiles {
   wiki_browse -> console_learner  [label="Leave Wikipedia as learner 0.20"];
   wiki_browse -> console_teacher  [label="Leave Wikipedia as teacher 0.15"];
 
-  console_teacher -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  console_learner -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  nc_browse -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  nc_share -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  nc_drop -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  nc_collab -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  wiki_browse -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
+  // Per-state Return-to-start shortcuts (dedicated black circles)
+  console_learner_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  console_learner -> console_learner_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  console_teacher_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  console_teacher -> console_teacher_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  nc_browse_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  nc_browse -> nc_browse_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  nc_collab_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  nc_collab -> nc_collab_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  nc_drop_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  nc_drop -> nc_drop_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  nc_share_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  nc_share -> nc_share_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  wiki_browse_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  wiki_browse -> wiki_browse_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
 }

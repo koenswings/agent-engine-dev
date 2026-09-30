@@ -13,9 +13,7 @@ digraph DurationTestsUsageKolibri {
   edge [fontname="Helvetica", fontsize=7, color="#555555"];
 
   start [label="start", shape=circle, width=0.40, height=0.40, fixedsize=true, fillcolor="#eeeeee", style=filled, fontsize=9];
-  start_return [label="", shape=circle, width=0.28, height=0.28, fixedsize=true, fillcolor="black", style=filled, color="black", xlabel="Return to start"];
-
-  subgraph cluster_console {
+subgraph cluster_console {
     label="Console";
     fontsize=11;
     style=rounded;
@@ -63,10 +61,17 @@ digraph DurationTestsUsageKolibri {
   kolibri_exercise -> kolibri_home     [label="Finish exercise 0.70"];
   kolibri_exercise -> kolibri_watching [label="Next video 0.30"];
 
-  console_teacher -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  console_learner -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  kolibri_home -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  kolibri_watching -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  kolibri_exercise -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  kolibri_manage -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
+  // Per-state Return-to-start shortcuts (dedicated black circles)
+  console_learner_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  console_learner -> console_learner_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  console_teacher_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  console_teacher -> console_teacher_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  kolibri_exercise_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  kolibri_exercise -> kolibri_exercise_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  kolibri_home_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  kolibri_home -> kolibri_home_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  kolibri_manage_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  kolibri_manage -> kolibri_manage_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  kolibri_watching_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  kolibri_watching -> kolibri_watching_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
 }

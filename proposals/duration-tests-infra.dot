@@ -11,9 +11,7 @@ digraph DurationTestsInfra {
   edge [fontname="Helvetica", fontsize=8, color="#555555"];
 
   start [label="start", shape=circle, width=0.45, height=0.45, fixedsize=true, fillcolor="#eeeeee", style=filled, fontsize=10];
-  start_return [label="", shape=circle, width=0.28, height=0.28, fixedsize=true, fillcolor="black", style=filled, color="black", xlabel="Return to start"];
-
-  subgraph cluster_infra {
+subgraph cluster_infra {
     label="Infra / fleet (pool Engines only — never golden idea02)";
     fontsize=11;
     style=rounded;
@@ -42,8 +40,13 @@ digraph DurationTestsInfra {
   infra_reboot -> infra_idle [label="0.55"];
   infra_reboot -> infra_docked [label="0.40"];
 
-  infra_idle -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  infra_docked -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  infra_disk_moved -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
-  infra_reboot -> start_return [label="Return to start 0.05", style=dashed, color="#333333"];
+  // Per-state Return-to-start shortcuts (dedicated black circles)
+  infra_disk_moved_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  infra_disk_moved -> infra_disk_moved_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  infra_docked_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  infra_docked -> infra_docked_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  infra_idle_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  infra_idle -> infra_idle_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  infra_reboot_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  infra_reboot -> infra_reboot_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
 }
