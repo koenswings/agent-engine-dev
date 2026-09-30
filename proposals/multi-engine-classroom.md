@@ -1,8 +1,8 @@
 # Proposal: Multi-Engine Classroom
 
 **Status:** Proposal draft for discussion — supersedes [`multi-engine-classroom-scenarios.md`](./multi-engine-classroom-scenarios.md) (2026-09-28).  
-**Revision:** 2026-09-30e — Koen feedback: States heading; actions unique to departing state; action (not “UI labels”); plain Console wording; Typical clicks under UI Interactions.  
-**Author:** Steve (Lead Bot), 2026-09-29 (rev. 2026-09-30e)  
+**Revision:** 2026-09-30f — Koen feedback: remove redundant edge prose and coaching-click table; coaching actions remain inside `kolibri_manage`.  
+**Author:** Steve (Lead Bot), 2026-09-29 (rev. 2026-09-30f)  
 **Audience:** Koen / IDEA leads  
 **Companion capacity issue:** [idea#159](https://github.com/koenswings/idea/issues/159) — measure safe concurrent Kolibri video streams per instance
 
@@ -280,7 +280,7 @@ A student is on Console with the **same unified app list** as teachers (reason 1
 
 ## State: `kolibri_manage`
 
-The teacher is on Kolibri’s **facility / coaching** side (Classes, Lessons, Quizzes, Reports) — not the learner Learn tab. Coaching Intents are **actions inside this state** (self-loops or leave), not edges from `console_teacher`.
+The teacher is on Kolibri’s **facility / coaching** side (Classes, Lessons, Quizzes, Reports) — not the learner Learn tab. Coaching Intents are **actions inside this state** (self-loops or leave).
 
 **While here:** left sidebar visible; coach classes / lessons / quizzes / reports, or preview Learn / leave to Console.
 
@@ -513,16 +513,6 @@ Preload content so every click target exists.
 
 1. From Console overview → click **Kiwix** / Wikipedia app (Running on idea-A).
 2. Kiwix library / Wikipedia ZIM opens in the browser.
-
-**Typical clicks (Marco) for coaching actions:**
-
-| Action | Clicks |
-|---|---|
-| Create class | Left sidebar **Classes** → **+ New class** → type name (e.g. `Grade 5A`) → **Save** |
-| Enroll learners | Open class → **Learners** tab → **Enroll learners** → tick students → **Confirm** |
-| Build lesson | Class → **Lessons** → **+ New lesson** (or open existing) → name → **Add resources** → pick video + exercise from **Library / Channels** → **Save** → set **Recipients** to the class → toggle **Visible** |
-| Create quiz | Class → **Quizzes** → **+ New quiz** → **Add questions** from exercise channels → set count → **Finish** → toggle **Active** |
-| Read reports | Left sidebar **Reports** → **Classes** → class → **Lessons** or **Quizzes** → open item → scan learner table |
 
 ### Create class
 

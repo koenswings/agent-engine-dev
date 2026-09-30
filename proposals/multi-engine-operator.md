@@ -1,8 +1,8 @@
 # Proposal: Multi-Engine Operator Console Markov
 
 **Status:** Proposal draft for discussion — companion to [`multi-engine-classroom.md`](./multi-engine-classroom.md).  
-**Revision:** 2026-09-30e — Koen feedback: States heading; actions unique to departing state; action (not “UI labels”); plain selector wording.  
-**Author:** Steve (Lead Bot), 2026-09-30 (rev. 2026-09-30e)  
+**Revision:** 2026-09-30f — Koen feedback: trim redundant edge-prose in the state-action rule.  
+**Author:** Steve (Lead Bot), 2026-09-30 (rev. 2026-09-30f)  
 **Audience:** Koen / IDEA leads  
 **Scope boundary:** This graph is **only** authenticated operator manage/alter flows. Classroom learner/teacher **usage** (Kolibri / Nextcloud / Wikipedia) stays in the classroom doc and its Markov — do not mix the graphs.
 
@@ -108,7 +108,7 @@ Sources: `agent-console-dev/README.md`, `docs/ARCHITECTURE.md`, `proposals/conso
 - **Arrival UI rule:** open / confirm / land-on sequences belong on the **outgoing action of the state you leave**, not as content of the destination. Destination state sections describe only what you do **while in** that state.
 - **Separate files** from classroom usage: [`multi-engine-operator-markov.dot`](./multi-engine-operator-markov.dot) (+ png/svg).
 
-**Actions are unique to the state they depart from** — an action from state A cannot leave or affect another state; you only take actions listed on the current state. Example: from `op_overview` you **Open disk inventory** (enter `op_disk`) — you do **not** **Erase disk** or **Install App** as edges from overview. Those fire only from `op_disk` (or the dedicated erase/install states they enter).
+**Actions are unique to the state they depart from** — an action from state A cannot leave or affect another state; you only take actions listed on the current state. Example: from `op_overview` you **Open disk inventory** (enter `op_disk`). **Erase disk** and **Install App** fire only from `op_disk` (or the dedicated erase/install states they enter).
 
 ### States
 
