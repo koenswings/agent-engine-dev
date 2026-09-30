@@ -1,0 +1,116 @@
+digraph MultiEngineOperatorMarkov {
+  rankdir=LR;
+  bgcolor="white";
+  pad="0.4";
+  nodesep="0.45";
+  ranksep="0.70";
+  fontname="Helvetica";
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, width=1.55, height=0.55];
+  edge [fontname="Helvetica", fontsize=8, color="#555555"];
+
+  // Start
+  start [label="*", shape=circle, width=0.35, height=0.35, fixedsize=true, fillcolor="#eeeeee", style=filled];
+
+  // Entry / auth
+  op_entry    [label="op_entry\n(open / login)", fillcolor="#D6EAF8"];
+
+  // Hub
+  op_overview [label="op_overview\n(school NetworkTree)", fillcolor="#85C1E9"];
+
+  // Disk-centric
+  op_disk     [label="op_disk\n(disk inventory)", fillcolor="#FCF3CF"];
+  op_eject    [label="op_eject\n(confirm eject)", fillcolor="#F5B7B1"];
+  op_erase    [label="op_erase\n(summarise + erase)", fillcolor="#F5B7B1"];
+  op_files    [label="op_files\n(Files Disk role)", fillcolor="#D7BDE2"];
+  op_backup   [label="op_backup\n(Backup Disk / restore)", fillcolor="#D5F5E3"];
+  op_install  [label="op_install\n(installApp)", fillcolor="#ABEBC6"];
+
+  // Instance / redistribute
+  op_instance [label="op_instance\n(start / stop / open)", fillcolor="#AED6F1"];
+  op_copy_move [label="op_copy_move\n(copy / move app)", fillcolor="#F9E79F"];
+
+  // Account / settings
+  op_account  [label="op_account\n(operators / password)", fillcolor="#D5DBDB"];
+  op_settings [label="op_settings\n(connect / reboot)", fillcolor="#D5DBDB"];
+
+  // Entry
+  start -> op_entry [label="operator"];
+
+  // Login → hub
+  op_entry -> op_overview [label="signed in 0.85\n[O1]"];
+  op_entry -> op_entry    [label="retry / first-time 0.15\n[O1]"];
+
+  // Overview hub (school Engines idea-A/B/C)
+  op_overview -> op_disk      [label="select disk 0.28\n[O3]"];
+  op_overview -> op_instance  [label="select instance 0.18\n[O6]"];
+  op_overview -> op_eject     [label="eject disk 0.10\n[O5]"];
+  op_overview -> op_account   [label="Account 👤 0.06\n[O17]"];
+  op_overview -> op_settings  [label="Settings ⚙ 0.06\n[O18]"];
+  op_overview -> op_overview  [label="dwell / refresh /\nUSB dock appears 0.32\n[O2 / O4]"];
+
+  // Disk inventory (EmptyDiskPanel or DiskView)
+  op_disk -> op_install   [label="Install App 0.18\n[O9]"];
+  op_disk -> op_files     [label="Make / Add Files 0.14\n[O12]"];
+  op_disk -> op_backup    [label="Backup Disk / restore 0.14\n[O13 / O15]"];
+  op_disk -> op_instance  [label="instance actions 0.18\n[O6]"];
+  op_disk -> op_copy_move [label="copy / move 0.10\n[O10 / O11]"];
+  op_disk -> op_erase     [label="Erase… 0.08\n[O16]"];
+  op_disk -> op_eject     [label="Eject 0.08\n[O5]"];
+  op_disk -> op_overview  [label="back / other Engine 0.10"];
+
+  // Eject
+  op_eject -> op_overview [label="confirm / cancel 1.00\n[O5]"];
+
+  // Erase
+  op_erase -> op_disk     [label="erased → empty 0.70\n[O16]"];
+  op_erase -> op_overview [label="cancel / done 0.30"];
+
+  // Files Disk
+  op_files -> op_disk     [label="role added 0.80\n[O12]"];
+  op_files -> op_overview [label="leave 0.20"];
+
+  // Backup Disk / restore
+  op_backup -> op_disk     [label="configured / restored 0.75\n[O13 / O15]"];
+  op_backup -> op_overview [label="leave 0.25"];
+
+  // Install
+  op_install -> op_instance [label="installed → start 0.55\n[O9 → O6]"];
+  op_install -> op_disk     [label="done / wait op 0.30"];
+  op_install -> op_overview [label="leave 0.15"];
+
+  // Instance ops
+  op_instance -> op_instance  [label="start / stop / open /\nbackupApp 0.45\n[O6 / O7 / O8 / O14]"];
+  op_instance -> op_copy_move [label="copy / move 0.20\n[O10 / O11]"];
+  op_instance -> op_disk      [label="back to disk 0.20"];
+  op_instance -> op_overview  [label="back to tree 0.15"];
+
+  // Copy / move (redistribute across disks / Engines)
+  op_copy_move -> op_overview [label="done (target Engine) 0.55\n[O10 / O11]"];
+  op_copy_move -> op_disk     [label="stay on source 0.30"];
+  op_copy_move -> op_instance [label="open copy 0.15"];
+
+  // Account
+  op_account -> op_account  [label="add / remove / pw 0.55\n[O17]"];
+  op_account -> op_overview [label="close 0.35"];
+  op_account -> op_entry    [label="Log out 0.10"];
+
+  // Settings
+  op_settings -> op_overview [label="connected / close 0.70\n[O18]"];
+  op_settings -> op_settings [label="switch Engine /\nreboot wait 0.30\n[O18]"];
+
+  // Legend
+  subgraph cluster_legend {
+    label="Legend — Operator Console (separate from classroom usage)";
+    fontsize=10;
+    style=dashed;
+    color="#aaaaaa";
+    node [width=1.45, height=0.38, fontsize=9];
+    L1 [label="Entry / login", fillcolor="#D6EAF8"];
+    L2 [label="School overview", fillcolor="#85C1E9"];
+    L3 [label="Disk / install", fillcolor="#FCF3CF"];
+    L4 [label="Instance / move", fillcolor="#AED6F1"];
+    L5 [label="Destructive", fillcolor="#F5B7B1"];
+    L6 [label="Account / settings", fillcolor="#D5DBDB"];
+    L1 -> L2 -> L3 -> L4 -> L5 -> L6 [style=invis];
+  }
+}

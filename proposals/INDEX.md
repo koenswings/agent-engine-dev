@@ -51,3 +51,16 @@ Per-command log capture via AsyncLocalStorage + Automerge CommandLogStore.
 ## duration-tests.md
 **Status:** Proposed · **Author:** Axle
 Markov-model duration tests: simulate a school day (reboots, disk swaps, engine changes) from YAML scenarios and verify invariants, including Automerge convergence across all engines.
+See also conceptual classroom / operator Markov usage profiles: [`multi-engine-classroom.md`](./multi-engine-classroom.md), [`multi-engine-operator.md`](./multi-engine-operator.md).
+
+## multi-engine-classroom.md
+**Status:** Conceptual draft · **Author:** Steve (Lead Bot)
+Multi-Engine classroom framing and learner/teacher Markov usage graph (Kolibri / Nextcloud / Wikipedia). Companion assets: `multi-engine-markov.{dot,png,svg}` (+ html/pdf). Can later feed richer YAML scenarios for [`duration-tests.md`](./duration-tests.md). See also [`multi-engine-operator.md`](./multi-engine-operator.md).
+
+## multi-engine-operator.md
+**Status:** Conceptual draft · **Author:** Steve (Lead Bot)
+Operator Console Markov for managing/altering a multi-Engine setup (dock/eject, install, start/stop, copy/move, backup/erase, operators, settings). Companion assets: `multi-engine-operator-markov.{dot,png,svg}` (+ html/pdf). Sibling to [`multi-engine-classroom.md`](./multi-engine-classroom.md); can later feed [`duration-tests.md`](./duration-tests.md) YAML scenarios.
+
+## multi-engine-classroom-scenarios.md
+**Status:** Superseded by multi-engine-classroom.md · **Author:** Steve (Lead Bot)
+Prior implementation-heavy draft of multi-Engine classroom scenarios. Kept for historical research only; do not treat as current proposal. (+ `.pdf`)

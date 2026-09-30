@@ -4,6 +4,10 @@
 **Author:** Axle  
 **Date:** 2026-04-11  
 
+**Related:** Conceptual classroom / operator Markov usage profiles that can later feed richer YAML scenarios:
+[`multi-engine-classroom.md`](./multi-engine-classroom.md) (learners + teachers using Kolibri / Nextcloud / Wikipedia) and
+[`multi-engine-operator.md`](./multi-engine-operator.md) (operators managing Engines / disks / instances).
+
 ---
 
 ## Problem
