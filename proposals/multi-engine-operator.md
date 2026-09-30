@@ -1,8 +1,8 @@
 # Proposal: Multi-Engine Operator Console Markov
 
 **Status:** Proposal draft for discussion — companion to [`multi-engine-classroom.md`](./multi-engine-classroom.md).  
-**Revision:** 2026-09-30f — Koen feedback: trim redundant edge-prose in the state-action rule.  
-**Author:** Steve (Lead Bot), 2026-09-30 (rev. 2026-09-30f)  
+**Revision:** 2026-09-30g — Koen feedback: remove out-of-scope/speculative section; retain the Ask of Koen decisions.  
+**Author:** Steve (Lead Bot), 2026-09-30 (rev. 2026-09-30g)  
 **Audience:** Koen / IDEA leads  
 **Scope boundary:** This graph is **only** authenticated operator manage/alter flows. Classroom learner/teacher **usage** (Kolibri / Nextcloud / Wikipedia) stays in the classroom doc and its Markov — do not mix the graphs.
 
@@ -673,17 +673,6 @@ Classroom scenarios S1 / S7 mention operator dock/start only as story context; t
 | `agent-engine-dev/proposals/install-app.md`, `copy-move-app.md`, `backup-disk.md` | Merged proposal behaviour |
 | `PI_FLEET.md` | Confirms fleet claim is **test infra**, not Console UI |
 | [`multi-engine-classroom.md`](./multi-engine-classroom.md) | Conventions for states / actions / UI Interactions |
-
----
-
-## Out of scope / speculative
-
-- Playwright harness wiring (later; same duration-tests family as classroom).
-- **Claim Engine** Console UX — **does not exist**; do not add without a real design.
-- Automatic redistribute wizard beyond copy/move + physical dock.
-- Upgrade Disk one-click Console flow (badge + operation kinds only — **speculative** as a dedicated UI Interaction until UI confirms).
-- `buildEngine` provisioning walks.
-- Messaging Koen — parent/Steve owns review handoff.
 
 ---
 

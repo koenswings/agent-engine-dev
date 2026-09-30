@@ -1,8 +1,8 @@
 # Proposal: Multi-Engine Classroom
 
 **Status:** Proposal draft for discussion — supersedes [`multi-engine-classroom-scenarios.md`](./multi-engine-classroom-scenarios.md) (2026-09-28).  
-**Revision:** 2026-09-30f — Koen feedback: remove redundant edge prose and coaching-click table; coaching actions remain inside `kolibri_manage`.  
-**Author:** Steve (Lead Bot), 2026-09-29 (rev. 2026-09-30f)  
+**Revision:** 2026-09-30g — Koen feedback: remove out-of-scope section; retain the Ask of Koen decisions.  
+**Author:** Steve (Lead Bot), 2026-09-29 (rev. 2026-09-30g)  
 **Audience:** Koen / IDEA leads  
 **Companion capacity issue:** [idea#159](https://github.com/koenswings/idea/issues/159) — measure safe concurrent Kolibri video streams per instance
 
@@ -12,7 +12,7 @@
 
 Koen asked for a clean framing of **why a school runs more than one Engine**, how that looks with a small named fleet, what classroom scenarios matter, and how a Markov usage graph can drive realistic tests later.
 
-This document is a **proposal draft**. Implementation, discovery protocol, auth, Playwright harnesses, fleet claim scripts, and Engine code changes are explicitly out of scope here (see final section). The Markov usage graph itself is a **concrete state/action model** for later tests — not labeled conceptual.
+This document is a **proposal draft**. Implementation, discovery protocol, auth, Playwright harnesses, fleet claim scripts, and Engine code changes are explicitly outside this proposal. The Markov usage graph itself is a **concrete state/action model** for later tests — not labeled conceptual.
 
 ---
 
@@ -749,22 +749,6 @@ Full YAML / runner design stays with the existing Markov duration-tests proposal
 | Marco field: `field/troubleshooting-guide.md` (via prior draft + local copy) | Many devices → performance drop; limit one group at a time |
 | [`duration-tests.md`](./duration-tests.md) | Existing Markov duration-test design (implementation later) |
 | idea#159 (+ multi-quality comment) | Kolibri concurrent stream capacity — planning 64/32/32/12 by quality |
-
----
-
-## Out of scope for now
-
-Flagged for later proposals / issues — **not** designed here:
-
-- Implementation of multi-Engine discovery / peering changes
-- Auth, operator roles, and student-assignment UX between Kolibri instances
-- Playwright / Console e2e harness, fleet claim scripts, fixture disks
-- Exact Engine APIs for “assign students across instances”
-- Hardware power-cut, USB disk carry automation, golden-Pi rules
-- PDF/print packaging of field guides
-- ~~**Operator Console Markov graph**~~ — **done as sibling:** [`multi-engine-operator.md`](./multi-engine-operator.md) + `multi-engine-operator-markov.*` (kept separate from this usage graph)
-
-When Koen agrees the shape, Steve can split follow-ups (Engine / Console / App Dev / Ops) without baking premature design into this doc.
 
 ---
 
