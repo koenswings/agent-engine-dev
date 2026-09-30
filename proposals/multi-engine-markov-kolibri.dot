@@ -37,12 +37,11 @@ digraph MultiEngineMarkovKolibri {
   start -> console_teacher [label="Open Console as teacher"];
   start -> console_learner  [label="Open Console as learner"];
 
-  console_teacher -> kolibri_manage  [label="Open Kolibri 0.20"];
-  console_teacher -> console_teacher [label="Stay on overview 0.50"];
-  // open Nextcloud/Wikipedia exist but shown on files diagram
+  console_teacher -> kolibri_manage  [label="Open Kolibri as teacher 0.20"];
+  console_teacher -> console_teacher [label="Stay on teacher overview 0.50"];
 
-  console_learner -> kolibri_home    [label="Open Kolibri 0.40"];
-  console_learner -> console_learner [label="Stay on overview 0.15"];
+  console_learner -> kolibri_home    [label="Open Kolibri as learner 0.40"];
+  console_learner -> console_learner [label="Stay on learner overview 0.15"];
 
   kolibri_manage -> kolibri_manage  [label="Create class 0.12"];
   kolibri_manage -> kolibri_manage  [label="Enroll learners 0.12"];

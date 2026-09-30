@@ -66,7 +66,6 @@ digraph MultiEngineOperatorMarkov {
   op_entry -> op_overview [label="Sign in 0.85"];
   op_entry -> op_entry    [label="Retry login /\nfirst-time setup 0.15"];
 
-  // Overview — open surfaces only (not Install / Erase / Files / Backup)
   op_overview -> op_disk     [label="Open disk inventory 0.28"];
   op_overview -> op_instance [label="Open instance controls 0.18"];
   op_overview -> op_eject    [label="Eject disk 0.10"];
@@ -75,7 +74,6 @@ digraph MultiEngineOperatorMarkov {
   op_overview -> op_overview [label="Stay on overview 0.20"];
   op_overview -> op_overview [label="Notice USB dock 0.12"];
 
-  // Disk — deep actions belong here
   op_disk -> op_install   [label="Install App 0.18"];
   op_disk -> op_files     [label="Make Files Disk 0.08"];
   op_disk -> op_files     [label="Add Files role 0.06"];
@@ -104,7 +102,6 @@ digraph MultiEngineOperatorMarkov {
   op_install -> op_disk     [label="Stay on disk 0.30"];
   op_install -> op_overview [label="Back to overview 0.15"];
 
-  // Instance — concrete self-loop actions
   op_instance -> op_instance  [label="Start instance 0.15"];
   op_instance -> op_instance  [label="Stop instance 0.12"];
   op_instance -> op_instance  [label="Open app 0.10"];

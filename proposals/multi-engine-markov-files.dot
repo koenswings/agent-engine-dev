@@ -45,23 +45,23 @@ digraph MultiEngineMarkovFiles {
   start -> console_teacher [label="Open Console as teacher"];
   start -> console_learner  [label="Open Console as learner"];
 
-  console_teacher -> nc_browse       [label="Open Nextcloud 0.20"];
-  console_teacher -> wiki_browse     [label="Open Wikipedia 0.10"];
-  console_teacher -> console_teacher [label="Stay on overview 0.50"];
+  console_teacher -> nc_browse       [label="Open Nextcloud as teacher 0.20"];
+  console_teacher -> wiki_browse     [label="Open Wikipedia as teacher 0.10"];
+  console_teacher -> console_teacher [label="Stay on teacher overview 0.50"];
 
-  console_learner -> nc_browse       [label="Open Nextcloud 0.25"];
-  console_learner -> wiki_browse     [label="Open Wikipedia 0.20"];
-  console_learner -> console_learner [label="Stay on overview 0.15"];
+  console_learner -> nc_browse       [label="Open Nextcloud as learner 0.25"];
+  console_learner -> wiki_browse     [label="Open Wikipedia as learner 0.20"];
+  console_learner -> console_learner [label="Stay on learner overview 0.15"];
 
   nc_browse -> nc_share        [label="Share to class 0.18"];
   nc_browse -> nc_drop         [label="Open File Drop 0.22"];
   nc_browse -> nc_collab       [label="Open collab doc 0.22"];
   nc_browse -> nc_browse       [label="Browse folders 0.15"];
-  nc_browse -> console_learner [label="Leave (learner) 0.13"];
-  nc_browse -> console_teacher [label="Leave (teacher) 0.10"];
+  nc_browse -> console_learner [label="Leave Nextcloud as learner 0.13"];
+  nc_browse -> console_teacher [label="Leave Nextcloud as teacher 0.10"];
 
   nc_share -> nc_browse       [label="Done sharing 0.80"];
-  nc_share -> console_teacher [label="Back to Console 0.20"];
+  nc_share -> console_teacher [label="Back to Console from share 0.20"];
 
   nc_drop -> nc_browse       [label="After upload 0.85"];
   nc_drop -> console_learner [label="Leave File Drop 0.15"];
@@ -69,7 +69,7 @@ digraph MultiEngineMarkovFiles {
   nc_collab -> nc_browse [label="Close doc 0.70"];
   nc_collab -> nc_collab [label="Keep editing 0.30"];
 
-  wiki_browse -> wiki_browse     [label="Search / browse 0.65"];
-  wiki_browse -> console_learner [label="Leave (learner) 0.20"];
-  wiki_browse -> console_teacher [label="Leave (teacher) 0.15"];
+  wiki_browse -> wiki_browse     [label="Search / browse Wikipedia 0.65"];
+  wiki_browse -> console_learner [label="Leave Wikipedia as learner 0.20"];
+  wiki_browse -> console_teacher [label="Leave Wikipedia as teacher 0.15"];
 }
