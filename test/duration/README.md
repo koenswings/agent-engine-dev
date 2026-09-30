@@ -3,6 +3,18 @@
 Canonical design: `proposals/duration-tests.md` (PR #144 docs — do not merge unless Koen asks).  
 Parent: [idea#166](https://github.com/koenswings/idea/issues/166).
 
+## Fixtures (Kid / agent-app-dev#10)
+
+| Pack | diskId | instanceId |
+|------|--------|------------|
+| Kolibri Grade 5A | `duration-kolibri-grade5a-001` | `kolibri-grade5a-001` |
+| Nextcloud Grade 5A | `duration-nextcloud-grade5a-001` | `nextcloud-grade5a-001` |
+| Kiwix | — | deferred Phase 3 |
+
+Paths live under `agent-app-dev/tests/duration-tests/fixtures/`. Scenario YAML `fixtures:` maps these IDs; do not invent others. See Kid `walker-ref.yaml`.
+
+Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/pull/167); Pixel Console [agent-console-dev#134](https://github.com/koenswings/agent-console-dev/pull/134).
+
 ## Phase 1–2 (this tree)
 
 - YAML loader + Markov walker + action dispatcher

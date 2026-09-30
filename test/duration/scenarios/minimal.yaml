@@ -6,7 +6,18 @@ seed: 42
 exclude_engines: [idea02]
 pool_engines: [idea01, idea03]
 store_mode: shared
-fixture_disk: duration-fixture-app
+fixtures:
+  kolibri:
+    path: tests/duration-tests/fixtures/kolibri   # agent-app-dev (PR #10)
+    diskId: duration-kolibri-grade5a-001
+    instanceId: kolibri-grade5a-001
+    infra_disk: true
+  nextcloud:
+    path: tests/duration-tests/fixtures/nextcloud
+    diskId: duration-nextcloud-grade5a-001
+    instanceId: nextcloud-grade5a-001
+    infra_disk: true
+  # kiwix: deferred (Phase 3 / optional)
 
 states:
   start:
@@ -76,7 +87,7 @@ states:
         action: return_to_start
     invariants:
       - type: disk_docked
-        disk: duration-fixture-app
+        disk: duration-kolibri-grade5a-001
         engine: any_pool
 
   infra_disk_moved:
@@ -97,7 +108,7 @@ states:
         action: return_to_start
     invariants:
       - type: disk_docked
-        disk: duration-fixture-app
+        disk: duration-kolibri-grade5a-001
         engine: any_pool
 
   infra_reboot:

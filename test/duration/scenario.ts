@@ -7,12 +7,16 @@ import { readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parse as parseYaml } from 'yaml'
-import type { Layer, Scenario, StateDef, StoreMode, Transition } from './types.js'
+import type { FixtureRef, Layer, Scenario, StateDef, StoreMode, Transition } from './types.js'
 
 const GOLDEN_DEFAULT = 'idea02'
 const DEFAULT_POOL = ['idea01', 'idea03', 'idea04']
 /** Synthetic fixture id — NEVER the idea03 hw-roundtrip stick (USB 26A1EE83197F / vfat 3E50-902A). */
-export const DEFAULT_FIXTURE_DISK = 'duration-fixture-app'
+/** Primary infra dock target — Kid Kolibri Grade 5A pack (agent-app-dev#10). */
+export const DEFAULT_FIXTURE_DISK = 'duration-kolibri-grade5a-001'
+export const DEFAULT_FIXTURE_INSTANCE = 'kolibri-grade5a-001'
+export const NEXTCLOUD_FIXTURE_DISK = 'duration-nextcloud-grade5a-001'
+export const NEXTCLOUD_FIXTURE_INSTANCE = 'nextcloud-grade5a-001'
 
 const FORBIDDEN_FIXTURE_MARKERS = [
     '26A1EE83197F',
@@ -102,6 +106,56 @@ export const assertSafeFixtureDisk = (fixtureDisk: string): void => {
     }
 }
 
+
+const DEFAULT_FIXTURES: FixtureRef[] = [
+    {
+        name: 'kolibri',
+        path: 'tests/duration-tests/fixtures/kolibri',
+        diskId: DEFAULT_FIXTURE_DISK,
+        instanceId: DEFAULT_FIXTURE_INSTANCE,
+        infra_disk: true,
+    },
+    {
+        name: 'nextcloud',
+        path: 'tests/duration-tests/fixtures/nextcloud',
+        diskId: NEXTCLOUD_FIXTURE_DISK,
+        instanceId: NEXTCLOUD_FIXTURE_INSTANCE,
+        infra_disk: true,
+    },
+]
+
+const parseFixtures = (raw: unknown, path: string): FixtureRef[] => {
+    if (raw === undefined || raw === null) return DEFAULT_FIXTURES.map(f => ({ ...f }))
+    if (typeof raw !== 'object' || Array.isArray(raw)) {
+        throw new Error(`Scenario ${path}: fixtures must be a map of pack name → { diskId, instanceId, ... }`)
+    }
+    const out: FixtureRef[] = []
+    for (const [name, val] of Object.entries(raw as Record<string, unknown>)) {
+        if (name === 'kiwix') continue // deferred Phase 3
+        if (!val || typeof val !== 'object') {
+            throw new Error(`Scenario ${path}: fixtures.${name} must be an object`)
+        }
+        const v = val as Record<string, unknown>
+        const diskId = typeof v.diskId === 'string' ? v.diskId : undefined
+        const instanceId = typeof v.instanceId === 'string' ? v.instanceId : undefined
+        if (!diskId || !instanceId) {
+            throw new Error(`Scenario ${path}: fixtures.${name} requires diskId + instanceId`)
+        }
+        assertSafeFixtureDisk(diskId)
+        out.push({
+            name,
+            path: typeof v.path === 'string' ? v.path : undefined,
+            diskId,
+            instanceId,
+            infra_disk: v.infra_disk !== false,
+        })
+    }
+    if (out.length === 0) {
+        throw new Error(`Scenario ${path}: fixtures map empty after omitting deferred packs`)
+    }
+    return out
+}
+
 export const loadScenario = (nameOrPath: string): Scenario => {
     const path = nameOrPath.endsWith('.yaml') || nameOrPath.endsWith('.yml') || nameOrPath.includes('/')
         ? resolve(nameOrPath)
@@ -140,8 +194,12 @@ export const loadScenario = (nameOrPath: string): Scenario => {
         exclude.push(GOLDEN_DEFAULT)
     }
 
-    const fixtureDisk = typeof raw.fixture_disk === 'string' ? raw.fixture_disk : DEFAULT_FIXTURE_DISK
+    const fixtures = parseFixtures(raw.fixtures, path)
+    const fixtureDisk = typeof raw.fixture_disk === 'string'
+        ? raw.fixture_disk
+        : (fixtures.find(f => f.name === 'kolibri')?.diskId ?? fixtures[0]!.diskId)
     assertSafeFixtureDisk(fixtureDisk)
+    for (const f of fixtures) assertSafeFixtureDisk(f.diskId)
 
     const pool = Array.isArray(raw.pool_engines)
         ? (raw.pool_engines as unknown[]).map(String).filter(e => !exclude.includes(e))
@@ -159,6 +217,7 @@ export const loadScenario = (nameOrPath: string): Scenario => {
         pool_engines: pool,
         store_mode: asStoreMode(raw.store_mode) ?? (pool.length >= 2 ? 'shared' : 'unique'),
         fixture_disk: fixtureDisk,
+        fixtures,
         states,
         initial_state: raw.initial_state,
     }

@@ -18,6 +18,14 @@ import type { Scenario, SemanticStoreView } from '../duration/types.js'
 
 const minimalScenario = (): Scenario => loadScenario('minimal')
 
+const KID_FIXTURES = {
+    'duration-kolibri-grade5a-001': 'kolibri-grade5a-001',
+    'duration-nextcloud-grade5a-001': 'nextcloud-grade5a-001',
+} as const
+
+const fakeOps = (partial: ConstructorParameters<typeof FakeFleetOps>[0]) =>
+    new FakeFleetOps({ fixtureInstances: { ...KID_FIXTURES }, ...partial })
+
 describe('duration scenario YAML loader', () => {
     it('loads minimal.yaml with shared transition shape and excludes golden', () => {
         const s = minimalScenario()
@@ -35,6 +43,17 @@ describe('duration scenario YAML loader', () => {
                 expect(t.action, `${name} missing action`).toBeTruthy()
             }
         }
+    })
+
+    it('loads Kid fixture diskIds (agent-app-dev#10)', () => {
+        const s = minimalScenario()
+        expect(s.fixtures?.map(f => f.diskId).sort()).toEqual([
+            'duration-kolibri-grade5a-001',
+            'duration-nextcloud-grade5a-001',
+        ].sort())
+        expect(s.fixture_disk).toBe('duration-kolibri-grade5a-001')
+        expect(s.fixtures?.find(f => f.name === 'kolibri')?.instanceId).toBe('kolibri-grade5a-001')
+        expect(s.fixtures?.find(f => f.name === 'nextcloud')?.instanceId).toBe('nextcloud-grade5a-001')
     })
 
     it('loads school-day and stress scenarios', () => {
@@ -64,13 +83,13 @@ describe('semantic store equality + convergence', () => {
     const view = (engineId: string, dockedTo: string | null): SemanticStoreView => ({
         engineId,
         instanceDB: dockedTo
-            ? { 'duration-fixture-app-main': { id: 'duration-fixture-app-main', status: 'Running', diskId: 'duration-fixture-app' } }
-            : { 'duration-fixture-app-main': { id: 'duration-fixture-app-main', status: 'Undocked', diskId: 'duration-fixture-app' } },
+            ? { 'kolibri-grade5a-001': { id: 'kolibri-grade5a-001', status: 'Running', diskId: 'duration-kolibri-grade5a-001' } }
+            : { 'kolibri-grade5a-001': { id: 'kolibri-grade5a-001', status: 'Undocked', diskId: 'duration-kolibri-grade5a-001' } },
         diskDB: {
-            'duration-fixture-app': {
-                id: 'duration-fixture-app',
+            'duration-kolibri-grade5a-001': {
+                id: 'duration-kolibri-grade5a-001',
                 dockedTo,
-                name: 'duration-fixture-app',
+                name: 'duration-kolibri-grade5a-001',
                 device: dockedTo ? 'idea-test-duration' : null,
             },
         },
@@ -89,18 +108,18 @@ describe('semantic store equality + convergence', () => {
     })
 
     it('waitForConvergence succeeds on FakeFleetOps shared mode after dock', async () => {
-        const ops = new FakeFleetOps({
+        const ops = fakeOps({
             poolEngines: ['idea01', 'idea03'],
             excludeEngines: ['idea02'],
             storeMode: 'shared',
         })
-        await ops.dockFixture('idea01', 'duration-fixture-app')
+        await ops.dockFixture('idea01', 'duration-kolibri-grade5a-001')
         const result = await waitForConvergence(ops, ['idea01', 'idea03'], 1000)
         expect(result.ok).toBe(true)
     })
 
     it('unique mode skips cross-engine equality', async () => {
-        const ops = new FakeFleetOps({
+        const ops = fakeOps({
             poolEngines: ['idea01'],
             storeMode: 'unique',
         })
@@ -125,20 +144,20 @@ describe('invariant registry', () => {
     })
 
     it('golden_untouched fails if fixture docked on idea02', async () => {
-        const ops = new FakeFleetOps({
+        const ops = fakeOps({
             poolEngines: ['idea01', 'idea03'],
             excludeEngines: ['idea02'],
             storeMode: 'shared',
         })
         // Force a bad dock by mutating via read+manual — FakeFleetOps refuses dock on golden,
         // so simulate by docking on pool then lying in walker state.
-        await ops.dockFixture('idea01', 'duration-fixture-app')
+        await ops.dockFixture('idea01', 'duration-kolibri-grade5a-001')
         const results = await evaluateInvariants(DEFAULT_INFRA_INVARIANTS, {
             ops,
             walker: { current: 'infra_docked', layer: 'infra', dockedEngine: 'idea02', step: 1 },
             excludeEngines: ['idea02'],
             poolEngines: ['idea01', 'idea03'],
-            fixtureDisk: 'duration-fixture-app',
+            fixtureDisk: 'duration-kolibri-grade5a-001',
             engines: ['idea01', 'idea03'],
         })
         const golden = results.find(r => r.type === 'golden_untouched')
@@ -146,12 +165,12 @@ describe('invariant registry', () => {
     })
 
     it('no_zombie_instances catches Running on undocked disk', async () => {
-        const ops = new FakeFleetOps({
+        const ops = fakeOps({
             poolEngines: ['idea01', 'idea03'],
             storeMode: 'shared',
         })
-        await ops.dockFixture('idea01', 'duration-fixture-app')
-        await ops.undockFixtures(['idea01'], 'duration-fixture-app')
+        await ops.dockFixture('idea01', 'duration-kolibri-grade5a-001')
+        await ops.undockFixtures(['idea01'], 'duration-kolibri-grade5a-001')
         // Fake sets Undocked on undock — force Running to simulate zombie
         const store = await ops.readStore('idea01')
         // Re-apply zombie via a second Fake with custom mutate: dock then manually break
@@ -161,35 +180,35 @@ describe('invariant registry', () => {
             walker: { current: 'infra_idle', layer: 'infra', dockedEngine: null, step: 1 },
             excludeEngines: ['idea02'],
             poolEngines: ['idea01', 'idea03'],
-            fixtureDisk: 'duration-fixture-app',
+            fixtureDisk: 'duration-kolibri-grade5a-001',
             engines: ['idea01'],
         })
         expect(clean[0]?.ok).toBe(true)
-        expect(store.diskDB['duration-fixture-app']?.dockedTo).toBeNull()
+        expect(store.diskDB['duration-kolibri-grade5a-001']?.dockedTo).toBeNull()
     })
 })
 
 describe('FakeFleetOps pool-only + store mode switch', () => {
     it('refuses dock/reboot on golden idea02', async () => {
-        const ops = new FakeFleetOps({
+        const ops = fakeOps({
             poolEngines: ['idea01', 'idea03'],
             excludeEngines: ['idea02'],
         })
-        await expect(ops.dockFixture('idea02', 'duration-fixture-app')).rejects.toThrow(/excluded/)
+        await expect(ops.dockFixture('idea02', 'duration-kolibri-grade5a-001')).rejects.toThrow(/excluded/)
         await expect(ops.rebootEngine('idea02', true)).rejects.toThrow(/excluded/)
     })
 
     it('applyStoreMode switches shared ↔ unique', async () => {
-        const ops = new FakeFleetOps({
+        const ops = fakeOps({
             poolEngines: ['idea01', 'idea03'],
             storeMode: 'shared',
         })
         expect(ops.getStoreMode()).toBe('shared')
-        await ops.dockFixture('idea01', 'duration-fixture-app')
+        await ops.dockFixture('idea01', 'duration-kolibri-grade5a-001')
         await ops.applyStoreMode('unique')
         expect(ops.getStoreMode()).toBe('unique')
         const a = await ops.readStore('idea01')
-        expect(a.diskDB['duration-fixture-app']?.dockedTo).toBe('idea01')
+        expect(a.diskDB['duration-kolibri-grade5a-001']?.dockedTo).toBe('idea01')
         await ops.applyStoreMode('shared')
         expect(ops.getStoreMode()).toBe('shared')
     })
@@ -198,7 +217,7 @@ describe('FakeFleetOps pool-only + store mode switch', () => {
 describe('Markov walker (FakeFleetOps)', () => {
     it('runs minimal scenario for 40 steps without failure', async () => {
         const scenario = minimalScenario()
-        const ops = new FakeFleetOps({
+        const ops = fakeOps({
             poolEngines: scenario.pool_engines!,
             excludeEngines: scenario.exclude_engines,
             storeMode: scenario.store_mode,
@@ -224,7 +243,7 @@ describe('Markov walker (FakeFleetOps)', () => {
 
     it('return_to_start undocks fixtures (hygiene)', async () => {
         const scenario = minimalScenario()
-        const ops = new FakeFleetOps({
+        const ops = fakeOps({
             poolEngines: scenario.pool_engines!,
             excludeEngines: scenario.exclude_engines,
             storeMode: 'shared',
@@ -249,14 +268,14 @@ describe('Markov walker (FakeFleetOps)', () => {
         // After any return, store should show undocked fixture
         if (returns.length > 0) {
             const store = await ops.readStore('idea01')
-            const disk = store.diskDB['duration-fixture-app']
+            const disk = store.diskDB['duration-kolibri-grade5a-001']
             if (disk) expect(disk.dockedTo).toBeNull()
         }
     })
 
     it('school-day stub walk mixes layers without abort', async () => {
         const scenario = loadScenario('school-day')
-        const ops = new FakeFleetOps({
+        const ops = fakeOps({
             poolEngines: scenario.pool_engines!,
             excludeEngines: scenario.exclude_engines,
             storeMode: scenario.store_mode,
@@ -279,7 +298,7 @@ describe('Markov walker (FakeFleetOps)', () => {
 
     it('emits structured log fields', async () => {
         const scenario = minimalScenario()
-        const ops = new FakeFleetOps({
+        const ops = fakeOps({
             poolEngines: scenario.pool_engines!,
             excludeEngines: scenario.exclude_engines,
         })

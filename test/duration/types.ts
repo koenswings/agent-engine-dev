@@ -28,6 +28,17 @@ export interface StateDef {
     invariants?: InvariantSpec[]
 }
 
+export interface FixtureRef {
+    /** Logical pack name (kolibri / nextcloud). */
+    name: string
+    /** Path in agent-app-dev (documentation / future pack load). */
+    path?: string
+    diskId: string
+    instanceId: string
+    /** When true, eligible for infra_dock_fixture / move / undock. */
+    infra_disk?: boolean
+}
+
 export interface Scenario {
     name: string
     duration_minutes?: number
@@ -38,8 +49,10 @@ export interface Scenario {
     pool_engines?: string[]
     /** Store / discovery mode for this scenario. */
     store_mode?: StoreMode
-    /** Fixture disk id used by infra dock/undock (never hw-roundtrip stick). */
+    /** @deprecated prefer fixtures[]; kept as primary infra dock target. */
     fixture_disk?: string
+    /** Kid pack refs (agent-app-dev idea#166). */
+    fixtures?: FixtureRef[]
     states: Record<string, StateDef>
     initial_state: string
 }

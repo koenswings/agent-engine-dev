@@ -56,11 +56,14 @@ const main = async () => {
         ?? (scenario.name.toLowerCase().includes('minimal') ? 40 : 100)
     const seed = args.seed ?? scenario.seed
     const pool = scenario.pool_engines ?? ['idea01', 'idea03']
+    const fixtureInstances: Record<string, string> = {}
+    for (const f of scenario.fixtures ?? []) fixtureInstances[f.diskId] = f.instanceId
     const ops = new FakeFleetOps({
         poolEngines: pool,
         excludeEngines: scenario.exclude_engines,
         storeMode: scenario.store_mode,
         settleDelayMs: 0,
+        fixtureInstances,
     })
 
     console.log(JSON.stringify({

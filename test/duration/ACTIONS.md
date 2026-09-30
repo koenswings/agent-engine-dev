@@ -36,3 +36,12 @@ Prefer proposal Intent titles snake_cased when naming YAML edges:
 - `open_disk_inventory`, `open_instance_controls`, `eject_disk`
 
 Phase 3: `test/duration/ui/` Playwright adapters keyed by the same names.
+
+## Fixture disk targets (Kid / agent-app-dev#10)
+
+| Action | diskId | instanceId |
+|---|---|---|
+| `infra_dock_fixture` (primary) | `duration-kolibri-grade5a-001` | `kolibri-grade5a-001` |
+| `infra_dock_fixture` / undock / move (also) | `duration-nextcloud-grade5a-001` | `nextcloud-grade5a-001` |
+
+`infra_undock_fixtures` undocks **all** infra-eligible fixture disks. Kiwix omitted Phase 1–2.

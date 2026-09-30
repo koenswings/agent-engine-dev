@@ -39,7 +39,17 @@ export const runWalk = async (opts: DurationOptions): Promise<WalkerResult> => {
     const exclude = scenario.exclude_engines
     const pool = (scenario.pool_engines ?? fullOpts.ops.listPoolEngines())
         .filter(e => !exclude.includes(e))
-    const fixtureDisk = scenario.fixture_disk ?? 'duration-fixture-app'
+    const fixtures = scenario.fixtures ?? []
+    const fixtureDisk = scenario.fixture_disk
+        ?? fixtures.find(f => f.name === 'kolibri')?.diskId
+        ?? 'duration-kolibri-grade5a-001'
+    const fixtureInstance = fixtures.find(f => f.diskId === fixtureDisk)?.instanceId
+        ?? 'kolibri-grade5a-001'
+    const fixtureDisks = (fixtures.filter(f => f.infra_disk !== false).map(f => f.diskId))
+    if (!fixtureDisks.includes(fixtureDisk)) fixtureDisks.unshift(fixtureDisk)
+    const fixtureInstances: Record<string, string> = {}
+    for (const f of fixtures) fixtureInstances[f.diskId] = f.instanceId
+    if (!fixtureInstances[fixtureDisk]) fixtureInstances[fixtureDisk] = fixtureInstance
 
     await fullOpts.ops.applyStoreMode(scenario.store_mode ?? fullOpts.ops.getStoreMode())
 
@@ -78,6 +88,9 @@ export const runWalk = async (opts: DurationOptions): Promise<WalkerResult> => {
             excludeEngines: exclude,
             poolEngines: pool,
             fixtureDisk,
+            fixtureInstance,
+            fixtureDisks,
+            fixtureInstances,
         }
 
         let ok = true

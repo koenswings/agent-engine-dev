@@ -75,7 +75,14 @@ export interface ActionContext {
     action: string
     excludeEngines: string[]
     poolEngines: string[]
+    /** Primary infra dock target (Kid kolibri pack by default). */
     fixtureDisk: string
+    /** Instance id for primary fixture (kolibri-grade5a-001). */
+    fixtureInstance: string
+    /** All infra-eligible fixture disk ids (kolibri + nextcloud). */
+    fixtureDisks: string[]
+    /** diskId → instanceId for semantic store. */
+    fixtureInstances: Record<string, string>
 }
 
 const pickPoolEngine = (ctx: ActionContext, preferDifferentFrom?: string | null): string => {
@@ -108,9 +115,11 @@ const settleParticipants = async (ctx: ActionContext, engines: string[]): Promis
 
 const infraUndockFixtures = async (ctx: ActionContext): Promise<ActionResult> => {
     const engines = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
-    await ctx.opts.ops.undockFixtures(engines, ctx.fixtureDisk)
+    for (const diskId of ctx.fixtureDisks) {
+        await ctx.opts.ops.undockFixtures(engines, diskId)
+    }
     await settleParticipants(ctx, engines)
-    return { ok: true, message: 'fixtures undocked', dockedEngine: null, layer: 'infra' }
+    return { ok: true, message: `fixtures undocked (${ctx.fixtureDisks.join(', ')})`, dockedEngine: null, layer: 'infra' }
 }
 
 const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
@@ -164,7 +173,9 @@ const infraRebootEngine = async (ctx: ActionContext): Promise<ActionResult> => {
 const returnToStart = async (ctx: ActionContext): Promise<ActionResult> => {
     if (ctx.walker.dockedEngine) {
         const engines = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
-        await ctx.opts.ops.undockFixtures(engines, ctx.fixtureDisk)
+        for (const diskId of ctx.fixtureDisks) {
+            await ctx.opts.ops.undockFixtures(engines, diskId)
+        }
         await settleParticipants(ctx, engines)
     }
     return {
@@ -179,7 +190,9 @@ const returnToStart = async (ctx: ActionContext): Promise<ActionResult> => {
 const enterInfra = async (ctx: ActionContext): Promise<ActionResult> => {
     // Entering infra: ensure fixtures undocked so infra_idle is honest.
     const engines = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
-    await ctx.opts.ops.undockFixtures(engines, ctx.fixtureDisk)
+    for (const diskId of ctx.fixtureDisks) {
+        await ctx.opts.ops.undockFixtures(engines, diskId)
+    }
     await settleParticipants(ctx, engines)
     return { ok: true, message: 'entered infra fleet walk', dockedEngine: null, layer: 'infra' }
 }
@@ -243,6 +256,8 @@ export interface FakeFleetOptions {
     settleDelayMs?: number
     /** Engines that start with WS down until reboot/dock brings them up. */
     initiallyDown?: string[]
+    /** Kid pack diskId → instanceId map. */
+    fixtureInstances?: Record<string, string>
 }
 
 /**
@@ -258,12 +273,15 @@ export class FakeFleetOps implements FleetOps {
     private readonly settleDelayMs: number
     /** Shared backing store when mode=shared; per-engine copies when unique. */
     private shared: SemanticStoreView | null = null
+    /** diskId → instanceId (Kid packs). */
+    private fixtureInstanceMap: Record<string, string>
 
     constructor(opts: FakeFleetOptions) {
         this.pool = [...opts.poolEngines]
         this.exclude = [...(opts.excludeEngines ?? ['idea02'])]
         this.mode = opts.storeMode ?? (this.pool.length >= 2 ? 'shared' : 'unique')
         this.settleDelayMs = opts.settleDelayMs ?? 0
+        this.fixtureInstanceMap = { ...(opts.fixtureInstances ?? {}) }
         const down = new Set(opts.initiallyDown ?? [])
         const engineDB: SemanticStoreView['engineDB'] = {}
         for (const id of this.pool) {
@@ -374,12 +392,12 @@ export class FakeFleetOps implements FleetOps {
                 device: 'idea-test-duration',
             }
             // Fixture instance becomes Running when docked (semantic smoke).
-            const instId = `${diskId}-main`
+            const instId = this.fixtureInstanceMap[diskId] ?? `${diskId}-main`
             doc.instanceDB[instId] = {
                 id: instId,
                 status: 'Running',
                 diskId,
-                name: 'duration-main',
+                name: instId,
             }
         })
         this.ready.set(engineId, true)
