@@ -8,10 +8,10 @@ blockquote { border-left: 3px solid #ccc; margin-left: 0; padding-left: 0.8em; c
 details { margin: 0.6em 0; } summary { cursor: pointer; font-weight: bold; }
 ul, ol { padding-left: 1.4em; }
 </style></head><body>
-<h1 id="proposal-multi-engine-operator-console-markov-separate">Proposal: Multi-Engine Operator Console Markov (separate)</h1>
-<p><strong>Status:</strong> Conceptual draft for discussion — companion to <a href="./multi-engine-classroom.md"><code>multi-engine-classroom.md</code></a>.<br />
-<strong>Revision:</strong> 2026-09-30 — first operator Console graph (manage / alter multi-Engine setup).<br />
-<strong>Author:</strong> Steve (Lead Bot), 2026-09-30<br />
+<h1 id="proposal-multi-engine-operator-console-markov">Proposal: Multi-Engine Operator Console Markov</h1>
+<p><strong>Status:</strong> Proposal draft for discussion — companion to <a href="./multi-engine-classroom.md"><code>multi-engine-classroom.md</code></a>.<br />
+<strong>Revision:</strong> 2026-09-30c — Koen review: Markov chapter uses <strong>states</strong> / <strong>actions</strong> only; Intent action names; overview edges are honest open-surface actions (no Install/Erase from overview); Test Scenarios chapter separated; graph layout fixed for PDF.<br />
+<strong>Author:</strong> Steve (Lead Bot), 2026-09-30 (rev. 2026-09-30c)<br />
 <strong>Audience:</strong> Koen / IDEA leads<br />
 <strong>Scope boundary:</strong> This graph is <strong>only</strong> authenticated operator manage/alter flows. Classroom learner/teacher <strong>usage</strong> (Kolibri / Nextcloud / Wikipedia) stays in the classroom doc and its Markov — do not mix the graphs.</p>
 <hr />
@@ -223,7 +223,7 @@ ul, ol { padding-left: 1.4em; }
 </tr>
 <tr>
 <td>Dedicated <strong>uninstall / removeApp</strong> button</td>
-<td><strong>No</strong> Console command helper. Removing an app’s instances is via <strong>erase disk</strong> (or stop + leave Stopped). Do not invent a remove-app node.</td>
+<td><strong>No</strong> Console command helper. Removing an app’s instances is via <strong>erase disk</strong> (or stop + leave Stopped). Do not invent a remove-app state.</td>
 </tr>
 <tr>
 <td><strong>buildEngine</strong> provisioning</td>
@@ -237,460 +237,754 @@ ul, ol { padding-left: 1.4em; }
 </table>
 <p><strong>Confidence:</strong> High for commands in <code>src/store/commands.ts</code> and panels under <code>src/components/</code> listed above. Medium for Upgrade Disk operator <em>workflow</em> (badge + operation kinds exist; no dedicated upgrade click script). Low/N/A for claim — confirmed absent from Console.</p>
 <hr />
-<h2 id="markov-operator-graph-conceptual">Markov operator graph (conceptual)</h2>
+<h2 id="markov-operator-graph">Markov operator graph</h2>
 <h3 id="idea">Idea</h3>
 <ul>
-<li><strong>Nodes</strong> = coarse operator places in the Console (not one node per click).</li>
-<li><strong>Transitions</strong> = manage actions with placeholder probabilities + scenario IDs <code>O1</code>… on edges.</li>
-<li>Click scripts under <a href="#detailed-ui-scenarios-expand-nodes-into-clicks">Detailed UI scenarios</a> expand nodes.</li>
-<li><strong>Separate files</strong> from classroom usage: <a href="./multi-engine-operator-markov.dot"><code>multi-engine-operator-markov.dot</code></a> (+ png/svg). Classroom graph untouched except a pointer.</li>
+<li><strong>States</strong> = coarse operator places in the Console (not one state per click).</li>
+<li><strong>Actions</strong> = manage transitions with placeholder probabilities. Intent-style names only (e.g. <strong>Open disk inventory</strong>, <strong>Erase disk</strong>, <strong>Start instance</strong>) — no scenario IDs and no <code>*</code> wildcards on the graph.</li>
+<li>Click scripts under <a href="#test-scenarios">Test Scenarios</a> expand actions. Forward link from action → scenario name only.</li>
+<li><strong>Separate files</strong> from classroom usage: <a href="./multi-engine-operator-markov.dot"><code>multi-engine-operator-markov.dot</code></a> (+ png/svg).</li>
 </ul>
-<h3 id="nodes">Nodes</h3>
+<p><strong>Wiring rule:</strong> actions belong to the state where they happen. From <code>op_overview</code> you <strong>Open disk inventory</strong> (enter <code>op_disk</code>) — you do <strong>not</strong> <strong>Erase disk</strong> or <strong>Install App</strong> as edges from overview. Those fire only from <code>op_disk</code> (or the dedicated erase/install states they enter).</p>
+<h3 id="states-final-list">States (final list)</h3>
 <table>
 <thead>
 <tr>
-<th>Node</th>
+<th>State</th>
 <th>Meaning</th>
-<th>Scenario IDs</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><code>op_entry</code></td>
 <td>Open Console, connect/discover, Log in or first-time setup</td>
-<td><code>O1</code></td>
 </tr>
 <tr>
 <td><code>op_overview</code></td>
 <td>Operator NetworkTree — idea-A/B/C, disks, status (hub)</td>
-<td><code>O2</code>, <code>O4</code> (USB dock appears)</td>
 </tr>
 <tr>
 <td><code>op_disk</code></td>
 <td>Selected disk — EmptyDiskPanel or DiskView inventory</td>
-<td><code>O3</code></td>
 </tr>
 <tr>
 <td><code>op_eject</code></td>
 <td>Eject confirm dialog</td>
-<td><code>O5</code></td>
 </tr>
 <tr>
 <td><code>op_instance</code></td>
 <td>Start / Stop / Open / on-demand Backup on an instance</td>
-<td><code>O6</code>, <code>O7</code>, <code>O8</code>, <code>O14</code></td>
 </tr>
 <tr>
 <td><code>op_install</code></td>
 <td>Install App onto a disk</td>
-<td><code>O9</code></td>
 </tr>
 <tr>
 <td><code>op_copy_move</code></td>
 <td>Copy or Move app to another disk (possibly other Engine)</td>
-<td><code>O10</code>, <code>O11</code></td>
 </tr>
 <tr>
 <td><code>op_files</code></td>
 <td>Make / Add Files Disk role</td>
-<td><code>O12</code></td>
 </tr>
 <tr>
 <td><code>op_backup</code></td>
 <td>Configure Backup Disk; Restore from Backup Disk</td>
-<td><code>O13</code>, <code>O15</code></td>
 </tr>
 <tr>
 <td><code>op_erase</code></td>
 <td>Summarise + typed confirm erase</td>
-<td><code>O16</code></td>
 </tr>
 <tr>
 <td><code>op_account</code></td>
 <td>Operators list / add / remove / change password / logout</td>
-<td><code>O17</code></td>
 </tr>
 <tr>
 <td><code>op_settings</code></td>
 <td>Settings: Engine Connection, reboot, About</td>
-<td><code>O18</code></td>
 </tr>
 </tbody>
 </table>
-<h3 id="transitions-probabilities-are-placeholders">Transitions (probabilities are placeholders)</h3>
-<p>Graphviz: <a href="./multi-engine-operator-markov.dot"><code>multi-engine-operator-markov.dot</code></a>. Rendered:</p>
-<p><img alt="Operator Console Markov graph" src="./multi-engine-operator-markov.png" /></p>
+<h3 id="graph">Graph</h3>
+<p>The operator graph is shown as <strong>two diagrams</strong> so every Intent label stays readable on a letter page (same states and actions; <code>op_overview</code> / <code>op_disk</code> repeated as hubs). Combined source also kept: <a href="./multi-engine-operator-markov.dot"><code>multi-engine-operator-markov.dot</code></a> → <a href="./multi-engine-operator-markov.png"><code>multi-engine-operator-markov.png</code></a>.</p>
+<p><strong>Diagram A — Auth, school hub, Account, Settings</strong> (<a href="./multi-engine-operator-markov-hub.dot"><code>multi-engine-operator-markov-hub.dot</code></a>):</p>
+<p><img alt="Operator Markov — hub" src="./multi-engine-operator-markov-hub.png" /></p>
+<p><strong>Diagram B — Disk inventory and deep actions</strong> (<a href="./multi-engine-operator-markov-disk.dot"><code>multi-engine-operator-markov-disk.dot</code></a>):</p>
+<p><img alt="Operator Markov — disk actions" src="./multi-engine-operator-markov-disk.png" /></p>
 <details>
 <summary>Same graph as Mermaid (editable)</summary>
 
 
 <pre><code class="language-mermaid">stateDiagram-v2
-    [*] --&gt; op_entry: operator
+    [*] --&gt; op_entry: Open Console as operator
 
-    op_entry --&gt; op_overview: signed in 0.85 [O1]
-    op_entry --&gt; op_entry: retry / first-time 0.15 [O1]
+    op_entry --&gt; op_overview: Sign in 0.85
+    op_entry --&gt; op_entry: Retry login / first-time setup 0.15
 
-    op_overview --&gt; op_disk: select disk 0.28 [O3]
-    op_overview --&gt; op_instance: select instance 0.18 [O6]
-    op_overview --&gt; op_eject: eject disk 0.10 [O5]
-    op_overview --&gt; op_account: Account 0.06 [O17]
-    op_overview --&gt; op_settings: Settings 0.06 [O18]
-    op_overview --&gt; op_overview: dwell / refresh / USB dock 0.32 [O2 / O4]
+    op_overview --&gt; op_disk: Open disk inventory 0.28
+    op_overview --&gt; op_instance: Open instance controls 0.18
+    op_overview --&gt; op_eject: Eject disk 0.10
+    op_overview --&gt; op_account: Open Account 0.06
+    op_overview --&gt; op_settings: Open Settings 0.06
+    op_overview --&gt; op_overview: Stay on overview 0.20
+    op_overview --&gt; op_overview: Notice USB dock 0.12
 
-    op_disk --&gt; op_install: Install App 0.18 [O9]
-    op_disk --&gt; op_files: Make / Add Files 0.14 [O12]
-    op_disk --&gt; op_backup: Backup Disk / restore 0.14 [O13 / O15]
-    op_disk --&gt; op_instance: instance actions 0.18 [O6]
-    op_disk --&gt; op_copy_move: copy / move 0.10 [O10 / O11]
-    op_disk --&gt; op_erase: Erase 0.08 [O16]
-    op_disk --&gt; op_eject: Eject 0.08 [O5]
-    op_disk --&gt; op_overview: back 0.10
+    op_disk --&gt; op_install: Install App 0.18
+    op_disk --&gt; op_files: Make Files Disk 0.08
+    op_disk --&gt; op_files: Add Files role 0.06
+    op_disk --&gt; op_backup: Make Backup Disk 0.08
+    op_disk --&gt; op_backup: Restore from Backup 0.06
+    op_disk --&gt; op_instance: Open instance controls 0.18
+    op_disk --&gt; op_copy_move: Copy app 0.05
+    op_disk --&gt; op_copy_move: Move app 0.05
+    op_disk --&gt; op_erase: Erase disk 0.08
+    op_disk --&gt; op_eject: Eject disk 0.08
+    op_disk --&gt; op_overview: Back to overview 0.10
 
-    op_eject --&gt; op_overview: confirm / cancel 1.00 [O5]
+    op_eject --&gt; op_overview: Confirm eject 0.70
+    op_eject --&gt; op_overview: Cancel eject 0.30
 
-    op_erase --&gt; op_disk: erased → empty 0.70 [O16]
-    op_erase --&gt; op_overview: cancel / done 0.30
+    op_erase --&gt; op_disk: Confirm erase 0.70
+    op_erase --&gt; op_overview: Cancel erase 0.30
 
-    op_files --&gt; op_disk: role added 0.80 [O12]
-    op_files --&gt; op_overview: leave 0.20
+    op_files --&gt; op_disk: Files role added 0.80
+    op_files --&gt; op_overview: Back to overview 0.20
 
-    op_backup --&gt; op_disk: configured / restored 0.75 [O13 / O15]
-    op_backup --&gt; op_overview: leave 0.25
+    op_backup --&gt; op_disk: Backup configured / restored 0.75
+    op_backup --&gt; op_overview: Back to overview 0.25
 
-    op_install --&gt; op_instance: installed → start 0.55 [O9 → O6]
-    op_install --&gt; op_disk: done / wait 0.30
-    op_install --&gt; op_overview: leave 0.15
+    op_install --&gt; op_instance: Start after install 0.55
+    op_install --&gt; op_disk: Stay on disk 0.30
+    op_install --&gt; op_overview: Back to overview 0.15
 
-    op_instance --&gt; op_instance: start/stop/open/backup 0.45 [O6/O7/O8/O14]
-    op_instance --&gt; op_copy_move: copy / move 0.20 [O10 / O11]
-    op_instance --&gt; op_disk: back to disk 0.20
-    op_instance --&gt; op_overview: back to tree 0.15
+    op_instance --&gt; op_instance: Start instance 0.15
+    op_instance --&gt; op_instance: Stop instance 0.12
+    op_instance --&gt; op_instance: Open app 0.10
+    op_instance --&gt; op_instance: Backup instance 0.08
+    op_instance --&gt; op_copy_move: Copy app 0.10
+    op_instance --&gt; op_copy_move: Move app 0.10
+    op_instance --&gt; op_disk: Back to disk 0.20
+    op_instance --&gt; op_overview: Back to overview 0.15
 
-    op_copy_move --&gt; op_overview: done 0.55 [O10 / O11]
-    op_copy_move --&gt; op_disk: stay on source 0.30
-    op_copy_move --&gt; op_instance: open copy 0.15
+    op_copy_move --&gt; op_overview: Done redistribute 0.55
+    op_copy_move --&gt; op_disk: Stay on source disk 0.30
+    op_copy_move --&gt; op_instance: Open copied instance 0.15
 
-    op_account --&gt; op_account: add / remove / pw 0.55 [O17]
-    op_account --&gt; op_overview: close 0.35
+    op_account --&gt; op_account: Add operator 0.20
+    op_account --&gt; op_account: Remove operator 0.15
+    op_account --&gt; op_account: Change password 0.20
+    op_account --&gt; op_overview: Close Account 0.35
     op_account --&gt; op_entry: Log out 0.10
 
-    op_settings --&gt; op_overview: connected / close 0.70 [O18]
-    op_settings --&gt; op_settings: switch Engine / reboot 0.30 [O18]
+    op_settings --&gt; op_overview: Close Settings 0.50
+    op_settings --&gt; op_settings: Switch Engine 0.25
+    op_settings --&gt; op_settings: Reboot Engine 0.25
 </code></pre>
 
 
 </details>
 
-<hr />
-<h2 id="story-walkthrough-nodes-real-clicks">Story walkthrough (nodes → real clicks)</h2>
-<p><strong>How this maps to tests.</strong> Each Markov <strong>node</strong> is a coarse place an operator can be. Inside a node, the harness expands into an <strong>ordered UI script</strong> — no node-per-click. Scenario IDs in <code>[brackets]</code> on edges name the scripts below. Probabilities are placeholders.</p>
-<p>UI labels match Console components (<code>NetworkTree</code>, <code>EmptyDiskPanel</code>, <code>DiskView</code>, <code>InstanceRow</code>, <code>EjectConfirm</code>, <code>EraseDialog</code>, <code>AccountScreen</code>, <code>SettingsPanel</code>). Exact Playwright selectors belong in a later harness.</p>
 <p>Multi-Engine story: operator may open Console on <strong>any</strong> of idea-A / idea-B / idea-C; after login the NetworkTree shows the <strong>school mesh</strong> (shared store). Commands are sent to the Engine that owns the target disk (<code>dockedTo</code>).</p>
-<h4 id="op_entry-open-console-sign-in"><code>op_entry</code> — open Console / sign in</h4>
+<p>UI labels match Console components (<code>NetworkTree</code>, <code>EmptyDiskPanel</code>, <code>DiskView</code>, <code>InstanceRow</code>, <code>EjectConfirm</code>, <code>EraseDialog</code>, <code>AccountScreen</code>, <code>SettingsPanel</code>). Exact Playwright selectors belong in a later harness.</p>
+<hr />
+<h3 id="state-op_entry">State: <code>op_entry</code></h3>
 <p>Operator opens a browser (or Chrome extension) on the school LAN, lands on user-mode AppBrowser if already connected, then elevates to operator mode.</p>
-<p><strong>Concrete UI (scenario <code>O1</code>):</strong></p>
+<p><strong>Concrete UI:</strong></p>
 <ol>
 <li>Open Console URL for any Engine (e.g. idea-A) — or Settings → connect via discovery / hostname.</li>
 <li>If <code>userDB</code> empty → <strong>First-time setup</strong>: create admin username + password → lands in operator mode.</li>
 <li>Else: status bar <strong>👤 Account</strong> (or Log in) → Username / Password → <strong>Log in</strong>.</li>
-<li>UI switches to operator layout: <strong>NetworkTree</strong> (left) + instances/disk detail → <a href="#op_overview--school-networktree"><code>op_overview</code></a>.</li>
+<li>UI switches to operator layout: <strong>NetworkTree</strong> (left) + instances/disk detail → <code>op_overview</code>.</li>
 </ol>
-<h4 id="op_overview-school-networktree"><code>op_overview</code> — school NetworkTree</h4>
-<p>Hub state. Operator sees Engines (idea-A / B / C), disks with role badges, instance status. Dwells, refreshes mentally as CRDT updates arrive, or reacts when a USB disk is docked.</p>
-<p><strong>Typical actions:</strong></p>
-<ol>
-<li><strong>Dwell / refresh</strong> (~0.32) — watch status dots; wait for a new disk after physical USB dock (<code>O2</code> / <code>O4</code>).</li>
-<li><strong>Select a disk</strong> → <a href="#op_disk--disk-inventory"><code>op_disk</code></a> (<code>O3</code>).</li>
-<li><strong>Select / act on instance</strong> → <a href="#op_instance--start--stop--open--backup"><code>op_instance</code></a> (<code>O6</code>).</li>
-<li><strong>Eject</strong> control on a disk → <a href="#op_eject--confirm-eject"><code>op_eject</code></a> (<code>O5</code>).</li>
-<li><strong>👤 Account</strong> → <a href="#op_account--operators--password"><code>op_account</code></a> (<code>O17</code>).</li>
-<li><strong>⚙ Settings</strong> → <a href="#op_settings--connect--reboot"><code>op_settings</code></a> (<code>O18</code>).</li>
-</ol>
-<p><em>Physical dock (<code>O4</code>):</em> plug SSD into idea-B (or C); disk row appears under that Engine; select it → <code>op_disk</code>. Not a Console button.</p>
-<h4 id="op_disk-disk-inventory"><code>op_disk</code> — disk inventory</h4>
-<p>Empty disk → <code>EmptyDiskPanel</code> cards. App/Backup/Files disk → <code>DiskView</code> sections (Apps, Backups, Files).</p>
-<p><strong>Branch by panel:</strong></p>
+<p><strong>Actions from this state:</strong></p>
 <table>
 <thead>
 <tr>
 <th>Action</th>
-<th>→ node</th>
-<th>ID</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Sign in</strong></td>
+<td style="text-align: right;">0.85</td>
+<td><code>op_overview</code></td>
+<td><a href="#operator-opens-console-and-signs-in">Operator opens Console and signs in</a></td>
+</tr>
+<tr>
+<td><strong>Retry login / first-time setup</strong></td>
+<td style="text-align: right;">0.15</td>
+<td><code>op_entry</code></td>
+<td><a href="#operator-opens-console-and-signs-in">Operator opens Console and signs in</a></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="state-op_overview">State: <code>op_overview</code></h3>
+<p>Hub state. Operator sees Engines (idea-A / B / C), disks with role badges, instance status. Dwells, refreshes mentally as CRDT updates arrive, or reacts when a USB disk is docked.</p>
+<p><strong>Actions from this state</strong> (open surfaces only — not Install / Erase / Files / Backup):</p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Open disk inventory</strong></td>
+<td style="text-align: right;">0.28</td>
+<td><code>op_disk</code></td>
+<td><a href="#select-disk-inventory">Select disk inventory</a></td>
+</tr>
+<tr>
+<td><strong>Open instance controls</strong></td>
+<td style="text-align: right;">0.18</td>
+<td><code>op_instance</code></td>
+<td><a href="#start-instance">Start instance</a></td>
+</tr>
+<tr>
+<td><strong>Eject disk</strong></td>
+<td style="text-align: right;">0.10</td>
+<td><code>op_eject</code></td>
+<td><a href="#eject-disk">Eject disk</a></td>
+</tr>
+<tr>
+<td><strong>Open Account</strong></td>
+<td style="text-align: right;">0.06</td>
+<td><code>op_account</code></td>
+<td><a href="#manage-operators">Manage operators</a></td>
+</tr>
+<tr>
+<td><strong>Open Settings</strong></td>
+<td style="text-align: right;">0.06</td>
+<td><code>op_settings</code></td>
+<td><a href="#settings-switch-engine-reboot">Settings switch Engine reboot</a></td>
+</tr>
+<tr>
+<td><strong>Stay on overview</strong></td>
+<td style="text-align: right;">0.20</td>
+<td><code>op_overview</code></td>
+<td><a href="#inspect-school-overview">Inspect school overview</a></td>
+</tr>
+<tr>
+<td><strong>Notice USB dock</strong></td>
+<td style="text-align: right;">0.12</td>
+<td><code>op_overview</code></td>
+<td><a href="#physical-dock-appears">Physical dock appears</a></td>
+</tr>
+</tbody>
+</table>
+<p><em>Physical dock:</em> plug SSD into idea-B (or C); disk row appears under that Engine; then <strong>Open disk inventory</strong> → <code>op_disk</code>. Not a Console button.</p>
+<hr />
+<h3 id="state-op_disk">State: <code>op_disk</code></h3>
+<p>Empty disk → <code>EmptyDiskPanel</code> cards. App/Backup/Files disk → <code>DiskView</code> sections (Apps, Backups, Files). <strong>Deep actions belong here.</strong></p>
+<p><strong>Actions from this state:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><strong>Install App</strong></td>
+<td style="text-align: right;">0.18</td>
 <td><code>op_install</code></td>
-<td><code>O9</code></td>
+<td><a href="#install-app">Install App</a></td>
 </tr>
 <tr>
-<td><strong>Make this a Files Disk</strong> / <strong>Add Files</strong></td>
+<td><strong>Make Files Disk</strong></td>
+<td style="text-align: right;">0.08</td>
 <td><code>op_files</code></td>
-<td><code>O12</code></td>
+<td><a href="#make-or-add-files-disk">Make or Add Files Disk</a></td>
 </tr>
 <tr>
-<td><strong>Make this a Backup Disk</strong> / open Backups restore</td>
+<td><strong>Add Files role</strong></td>
+<td style="text-align: right;">0.06</td>
+<td><code>op_files</code></td>
+<td><a href="#make-or-add-files-disk">Make or Add Files Disk</a></td>
+</tr>
+<tr>
+<td><strong>Make Backup Disk</strong></td>
+<td style="text-align: right;">0.08</td>
 <td><code>op_backup</code></td>
-<td><code>O13</code> / <code>O15</code></td>
+<td><a href="#make-backup-disk">Make Backup Disk</a></td>
 </tr>
 <tr>
-<td>Instance Start/Stop/Open/Backup</td>
+<td><strong>Restore from Backup</strong></td>
+<td style="text-align: right;">0.06</td>
+<td><code>op_backup</code></td>
+<td><a href="#restore-from-backup-disk">Restore from Backup Disk</a></td>
+</tr>
+<tr>
+<td><strong>Open instance controls</strong></td>
+<td style="text-align: right;">0.18</td>
 <td><code>op_instance</code></td>
-<td><code>O6</code>…</td>
+<td><a href="#start-instance">Start instance</a></td>
 </tr>
 <tr>
-<td>Copy / Move instance</td>
+<td><strong>Copy app</strong></td>
+<td style="text-align: right;">0.05</td>
 <td><code>op_copy_move</code></td>
-<td><code>O10</code> / <code>O11</code></td>
+<td><a href="#copy-app">Copy app</a></td>
 </tr>
 <tr>
-<td><strong>Erase this disk…</strong></td>
+<td><strong>Move app</strong></td>
+<td style="text-align: right;">0.05</td>
+<td><code>op_copy_move</code></td>
+<td><a href="#move-app">Move app</a></td>
+</tr>
+<tr>
+<td><strong>Erase disk</strong></td>
+<td style="text-align: right;">0.08</td>
 <td><code>op_erase</code></td>
-<td><code>O16</code></td>
+<td><a href="#erase-disk">Erase disk</a></td>
 </tr>
 <tr>
-<td><strong>Eject</strong></td>
+<td><strong>Eject disk</strong></td>
+<td style="text-align: right;">0.08</td>
 <td><code>op_eject</code></td>
-<td><code>O5</code></td>
+<td><a href="#eject-disk">Eject disk</a></td>
+</tr>
+<tr>
+<td><strong>Back to overview</strong></td>
+<td style="text-align: right;">0.10</td>
+<td><code>op_overview</code></td>
+<td>—</td>
 </tr>
 </tbody>
 </table>
-<h4 id="op_eject-confirm-eject"><code>op_eject</code> — confirm eject</h4>
-<p><strong>Scenario <code>O5</code>:</strong> Eject control → <code>EjectConfirm</code> → confirm → <code>ejectDisk</code> → disk undocks in tree → operator may physically unplug → back to <code>op_overview</code>.</p>
-<h4 id="op_instance-start-stop-open-backup"><code>op_instance</code> — start / stop / open / backup</h4>
-<p><strong>Scenarios <code>O6</code> / <code>O7</code> / <code>O8</code> / <code>O14</code>:</strong> On <code>InstanceRow</code>: <strong>Start</strong>, <strong>Stop</strong>, <strong>Open ↗</strong>, <strong>Backup</strong> (disk picker). Stay in-node for several toggles; leave to copy/move, disk, or overview.</p>
-<h4 id="op_install-installapp"><code>op_install</code> — installApp</h4>
-<p><strong>Scenario <code>O9</code>:</strong> Empty (or eligible) disk → <strong>Install App</strong> → pick app from catalog → optional name → Install → wait <code>OperationProgress</code> → often <strong>Start</strong> (<code>O6</code>).</p>
-<h4 id="op_copy_move-redistribute"><code>op_copy_move</code> — redistribute</h4>
-<p><strong>Scenarios <code>O10</code> (copy) / <code>O11</code> (move):</strong> Drag instance to another App Disk (possibly on another Engine in the tree) or use mobile sheet <strong>Copy</strong> / <strong>Move</strong>. Vision “redistribute apps over Appdockers” = these commands (+ eject/dock). Target disk must be docked to the Engine that receives the command.</p>
-<h4 id="op_files-files-disk-role"><code>op_files</code> — Files Disk role</h4>
-<p><strong>Scenario <code>O12</code>:</strong> <strong>Make this a Files Disk</strong> (empty) or <strong>Add Files</strong> (app/backup disk) → share name (default <code>School Files</code>) → <code>createFilesDisk</code>. Optional erase-then-files path uses <code>op_erase</code> first.</p>
-<h4 id="op_backup-backup-disk-restore"><code>op_backup</code> — Backup Disk / restore</h4>
-<p><strong>Scenarios <code>O13</code> / <code>O15</code>:</strong> Empty → <strong>Make this a Backup Disk</strong> (mode: on-demand / immediate / scheduled + link instances). On a Backup Disk section → pick archive → target App Disk → <strong>Restore</strong> (<code>restoreApp</code>). On-demand <code>backupApp</code> from an instance can also start from <code>op_instance</code> (<code>O14</code>).</p>
-<h4 id="op_erase-erase"><code>op_erase</code> — erase</h4>
-<p><strong>Scenario <code>O16</code>:</strong> <strong>Erase this disk…</strong> → <code>EraseDialog</code> → Engine <code>summariseDisk</code> → type exact label → <code>eraseDisk</code> → disk becomes empty → often return to <code>op_disk</code> EmptyDiskPanel.</p>
-<h4 id="op_account-operators-password"><code>op_account</code> — operators / password</h4>
-<p><strong>Scenario <code>O17</code>:</strong> 👤 → Manage Operators (add / remove) / change password / <strong>Log out</strong> → <code>op_entry</code>.</p>
-<h4 id="op_settings-connect-reboot"><code>op_settings</code> — connect / reboot</h4>
-<p><strong>Scenario <code>O18</code>:</strong> ⚙ → Engine Connection (discover / Connect / manual hostname) / Account tab / About. Reboot from NetworkTree may be modelled as leaving overview into a wait on settings/overview self-loop after <code>reboot</code>.</p>
 <hr />
-<h2 id="detailed-ui-scenarios-expand-nodes-into-clicks">Detailed UI scenarios (expand nodes into clicks)</h2>
-<p>These are <strong>test scripts</strong>, not extra Markov nodes. Preload: three Engines visible in store (idea-A/B/C), at least one empty USB disk, one App Disk with a Stopped instance, one Backup Disk when testing restore.</p>
+<h3 id="state-op_eject">State: <code>op_eject</code></h3>
+<p><strong>UI:</strong> Eject control → <code>EjectConfirm</code> → confirm → <code>ejectDisk</code> → disk undocks in tree → operator may physically unplug.</p>
+<p><strong>Actions from this state:</strong></p>
 <table>
 <thead>
 <tr>
-<th>Scenario ID</th>
-<th>Markov node(s)</th>
-<th>Matches</th>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>O1</code></td>
-<td><code>*</code> → <code>op_entry</code> → <code>op_overview</code></td>
-<td>Connect + login / first-time</td>
-</tr>
-<tr>
-<td><code>O2</code></td>
+<td><strong>Confirm eject</strong></td>
+<td style="text-align: right;">0.70</td>
 <td><code>op_overview</code></td>
-<td>Inspect school tree (dwell)</td>
+<td><a href="#eject-disk">Eject disk</a></td>
 </tr>
 <tr>
-<td><code>O3</code></td>
-<td><code>op_overview</code> → <code>op_disk</code></td>
-<td>Select disk inventory</td>
-</tr>
-<tr>
-<td><code>O4</code></td>
-<td><code>op_overview</code> (self) → <code>op_disk</code></td>
-<td>Physical USB dock appears</td>
-</tr>
-<tr>
-<td><code>O5</code></td>
-<td><code>op_overview</code> / <code>op_disk</code> → <code>op_eject</code> → <code>op_overview</code></td>
-<td>Eject confirm</td>
-</tr>
-<tr>
-<td><code>O6</code></td>
-<td>→ <code>op_instance</code></td>
-<td>Start instance</td>
-</tr>
-<tr>
-<td><code>O7</code></td>
-<td><code>op_instance</code></td>
-<td>Stop instance</td>
-</tr>
-<tr>
-<td><code>O8</code></td>
-<td><code>op_instance</code></td>
-<td>Open app (ops check)</td>
-</tr>
-<tr>
-<td><code>O9</code></td>
-<td><code>op_disk</code> → <code>op_install</code></td>
-<td>Install App</td>
-</tr>
-<tr>
-<td><code>O10</code></td>
-<td>→ <code>op_copy_move</code></td>
-<td>Copy app to another disk</td>
-</tr>
-<tr>
-<td><code>O11</code></td>
-<td>→ <code>op_copy_move</code></td>
-<td>Move app (redistribute)</td>
-</tr>
-<tr>
-<td><code>O12</code></td>
-<td><code>op_disk</code> → <code>op_files</code></td>
-<td>Make / Add Files Disk</td>
-</tr>
-<tr>
-<td><code>O13</code></td>
-<td><code>op_disk</code> → <code>op_backup</code></td>
-<td>Make Backup Disk</td>
-</tr>
-<tr>
-<td><code>O14</code></td>
-<td><code>op_instance</code></td>
-<td>On-demand backupApp</td>
-</tr>
-<tr>
-<td><code>O15</code></td>
-<td><code>op_disk</code> → <code>op_backup</code></td>
-<td>Restore from Backup Disk</td>
-</tr>
-<tr>
-<td><code>O16</code></td>
-<td><code>op_disk</code> → <code>op_erase</code></td>
-<td>Erase disk</td>
-</tr>
-<tr>
-<td><code>O17</code></td>
-<td><code>op_overview</code> → <code>op_account</code></td>
-<td>Manage operators / password</td>
-</tr>
-<tr>
-<td><code>O18</code></td>
-<td><code>op_overview</code> → <code>op_settings</code></td>
-<td>Settings / switch Engine / reboot</td>
+<td><strong>Cancel eject</strong></td>
+<td style="text-align: right;">0.30</td>
+<td><code>op_overview</code></td>
+<td><a href="#eject-disk">Eject disk</a></td>
 </tr>
 </tbody>
 </table>
-<h4 id="scenario-o1-operator-opens-console-and-signs-in">Scenario <code>O1</code> — Operator opens Console and signs in</h4>
-<p><strong>Role:</strong> operator · <strong>Engines:</strong> any Console (idea-A / B / C).<br />
-<strong>Markov:</strong> <code>*</code> → <code>op_entry</code> → <code>op_overview</code>.</p>
+<hr />
+<h3 id="state-op_instance">State: <code>op_instance</code></h3>
+<p>On <code>InstanceRow</code>: Start, Stop, Open ↗, Backup (disk picker). Stay in-state for several toggles; leave to copy/move, disk, or overview.</p>
+<p><strong>Actions from this state:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Start instance</strong></td>
+<td style="text-align: right;">0.15</td>
+<td><code>op_instance</code></td>
+<td><a href="#start-instance">Start instance</a></td>
+</tr>
+<tr>
+<td><strong>Stop instance</strong></td>
+<td style="text-align: right;">0.12</td>
+<td><code>op_instance</code></td>
+<td><a href="#stop-instance">Stop instance</a></td>
+</tr>
+<tr>
+<td><strong>Open app</strong></td>
+<td style="text-align: right;">0.10</td>
+<td><code>op_instance</code></td>
+<td><a href="#open-app-ops-check">Open app ops check</a></td>
+</tr>
+<tr>
+<td><strong>Backup instance</strong></td>
+<td style="text-align: right;">0.08</td>
+<td><code>op_instance</code></td>
+<td><a href="#on-demand-backup">On-demand backup</a></td>
+</tr>
+<tr>
+<td><strong>Copy app</strong></td>
+<td style="text-align: right;">0.10</td>
+<td><code>op_copy_move</code></td>
+<td><a href="#copy-app">Copy app</a></td>
+</tr>
+<tr>
+<td><strong>Move app</strong></td>
+<td style="text-align: right;">0.10</td>
+<td><code>op_copy_move</code></td>
+<td><a href="#move-app">Move app</a></td>
+</tr>
+<tr>
+<td><strong>Back to disk</strong></td>
+<td style="text-align: right;">0.20</td>
+<td><code>op_disk</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>Back to overview</strong></td>
+<td style="text-align: right;">0.15</td>
+<td><code>op_overview</code></td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="state-op_install">State: <code>op_install</code></h3>
+<p><strong>UI:</strong> Empty (or eligible) disk → <strong>Install App</strong> → pick app from catalog → optional name → Install → wait <code>OperationProgress</code> → often <strong>Start</strong>.</p>
+<p><strong>Actions from this state:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Start after install</strong></td>
+<td style="text-align: right;">0.55</td>
+<td><code>op_instance</code></td>
+<td><a href="#install-app">Install App</a></td>
+</tr>
+<tr>
+<td><strong>Stay on disk</strong></td>
+<td style="text-align: right;">0.30</td>
+<td><code>op_disk</code></td>
+<td><a href="#install-app">Install App</a></td>
+</tr>
+<tr>
+<td><strong>Back to overview</strong></td>
+<td style="text-align: right;">0.15</td>
+<td><code>op_overview</code></td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="state-op_copy_move">State: <code>op_copy_move</code></h3>
+<p>Vision “redistribute apps over Appdockers” = <strong>Copy app</strong> / <strong>Move app</strong> (+ eject/dock). Target disk must be docked to the Engine that receives the command.</p>
+<p><strong>Actions from this state:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Done redistribute</strong></td>
+<td style="text-align: right;">0.55</td>
+<td><code>op_overview</code></td>
+<td><a href="#copy-app">Copy app</a> / <a href="#move-app">Move app</a></td>
+</tr>
+<tr>
+<td><strong>Stay on source disk</strong></td>
+<td style="text-align: right;">0.30</td>
+<td><code>op_disk</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>Open copied instance</strong></td>
+<td style="text-align: right;">0.15</td>
+<td><code>op_instance</code></td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="state-op_files">State: <code>op_files</code></h3>
+<p><strong>UI:</strong> <strong>Make this a Files Disk</strong> (empty) or <strong>Add Files</strong> (app/backup disk) → share name (default <code>School Files</code>) → <code>createFilesDisk</code>. Optional erase-then-files path uses <code>op_erase</code> first.</p>
+<p><strong>Actions from this state:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Files role added</strong></td>
+<td style="text-align: right;">0.80</td>
+<td><code>op_disk</code></td>
+<td><a href="#make-or-add-files-disk">Make or Add Files Disk</a></td>
+</tr>
+<tr>
+<td><strong>Back to overview</strong></td>
+<td style="text-align: right;">0.20</td>
+<td><code>op_overview</code></td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="state-op_backup">State: <code>op_backup</code></h3>
+<p>Empty → <strong>Make this a Backup Disk</strong> (mode: on-demand / immediate / scheduled + link instances). On a Backup Disk section → pick archive → target App Disk → <strong>Restore</strong>. On-demand <code>backupApp</code> from an instance can also start from <code>op_instance</code>.</p>
+<p><strong>Actions from this state:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Backup configured / restored</strong></td>
+<td style="text-align: right;">0.75</td>
+<td><code>op_disk</code></td>
+<td><a href="#make-backup-disk">Make Backup Disk</a> / <a href="#restore-from-backup-disk">Restore from Backup Disk</a></td>
+</tr>
+<tr>
+<td><strong>Back to overview</strong></td>
+<td style="text-align: right;">0.25</td>
+<td><code>op_overview</code></td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="state-op_erase">State: <code>op_erase</code></h3>
+<p><strong>UI:</strong> <strong>Erase this disk…</strong> → <code>EraseDialog</code> → Engine <code>summariseDisk</code> → type exact label → <code>eraseDisk</code> → disk becomes empty → often return to <code>op_disk</code> EmptyDiskPanel.</p>
+<p><strong>Actions from this state:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Confirm erase</strong></td>
+<td style="text-align: right;">0.70</td>
+<td><code>op_disk</code></td>
+<td><a href="#erase-disk">Erase disk</a></td>
+</tr>
+<tr>
+<td><strong>Cancel erase</strong></td>
+<td style="text-align: right;">0.30</td>
+<td><code>op_overview</code></td>
+<td><a href="#erase-disk">Erase disk</a></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="state-op_account">State: <code>op_account</code></h3>
+<p>👤 → Manage Operators (add / remove) / change password / <strong>Log out</strong>.</p>
+<p><strong>Actions from this state:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Add operator</strong></td>
+<td style="text-align: right;">0.20</td>
+<td><code>op_account</code></td>
+<td><a href="#manage-operators">Manage operators</a></td>
+</tr>
+<tr>
+<td><strong>Remove operator</strong></td>
+<td style="text-align: right;">0.15</td>
+<td><code>op_account</code></td>
+<td><a href="#manage-operators">Manage operators</a></td>
+</tr>
+<tr>
+<td><strong>Change password</strong></td>
+<td style="text-align: right;">0.20</td>
+<td><code>op_account</code></td>
+<td><a href="#manage-operators">Manage operators</a></td>
+</tr>
+<tr>
+<td><strong>Close Account</strong></td>
+<td style="text-align: right;">0.35</td>
+<td><code>op_overview</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>Log out</strong></td>
+<td style="text-align: right;">0.10</td>
+<td><code>op_entry</code></td>
+<td><a href="#manage-operators">Manage operators</a></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="state-op_settings">State: <code>op_settings</code></h3>
+<p>⚙ → Engine Connection (discover / Connect / manual hostname) / Account tab / About. Reboot from NetworkTree may be modelled as a self-loop here after <code>reboot</code>.</p>
+<p><strong>Actions from this state:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Close Settings</strong></td>
+<td style="text-align: right;">0.50</td>
+<td><code>op_overview</code></td>
+<td><a href="#settings-switch-engine-reboot">Settings switch Engine reboot</a></td>
+</tr>
+<tr>
+<td><strong>Switch Engine</strong></td>
+<td style="text-align: right;">0.25</td>
+<td><code>op_settings</code></td>
+<td><a href="#settings-switch-engine-reboot">Settings switch Engine reboot</a></td>
+</tr>
+<tr>
+<td><strong>Reboot Engine</strong></td>
+<td style="text-align: right;">0.25</td>
+<td><code>op_settings</code></td>
+<td><a href="#settings-switch-engine-reboot">Settings switch Engine reboot</a></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="test-scenarios">Test Scenarios</h2>
+<p>These are <strong>test scripts</strong>, not extra Markov states. Each has a single consistent Intent-style name. Describe what the scenario does. Markov actions link <strong>forward</strong> to these names; this chapter does <strong>not</strong> re-describe the Markov graph.</p>
+<p>Preload: three Engines visible in store (idea-A/B/C), at least one empty USB disk, one App Disk with a Stopped instance, one Backup Disk when testing restore.</p>
+<h3 id="operator-opens-console-and-signs-in">Operator opens Console and signs in</h3>
+<p><strong>Role:</strong> operator · <strong>Engines:</strong> any Console (idea-A / B / C).</p>
 <ol>
 <li>Browser → Console on school LAN.</li>
 <li>If needed: Settings → discover / Connect to an Engine.</li>
 <li>👤 → username / password → Log in (or First-time setup).</li>
 <li>Assert: NetworkTree visible with multiple Engines when mesh is up.</li>
 </ol>
-<h4 id="scenario-o2-inspect-school-overview">Scenario <code>O2</code> — Inspect school overview</h4>
-<p><strong>Markov:</strong> <code>op_overview</code> self-loop.</p>
+<h3 id="inspect-school-overview">Inspect school overview</h3>
 <ol>
 <li>Expand idea-A, idea-B, idea-C in NetworkTree.</li>
 <li>Note disk badges (app / backup / files / empty) and instance status dots.</li>
 <li>Dwell (CRDT updates) without changing selection.</li>
 </ol>
-<h4 id="scenario-o3-select-disk-inventory">Scenario <code>O3</code> — Select disk inventory</h4>
-<p><strong>Markov:</strong> <code>op_overview</code> → <code>op_disk</code>.</p>
+<h3 id="select-disk-inventory">Select disk inventory</h3>
 <ol>
 <li>Click an empty disk under idea-B → EmptyDiskPanel cards visible.</li>
 <li>Or click an App Disk → DiskView Apps / Files / etc.</li>
 </ol>
-<h4 id="scenario-o4-physical-dock-appears">Scenario <code>O4</code> — Physical dock appears</h4>
-<p><strong>Markov:</strong> <code>op_overview</code> (USB event) → select new disk → <code>op_disk</code>.</p>
+<h3 id="physical-dock-appears">Physical dock appears</h3>
 <ol>
-<li>From <code>op_overview</code>, note disk list.</li>
+<li>From overview, note disk list.</li>
 <li><em>(Hardware / fleet harness)</em> Plug formatted or unformatted SSD into idea-C.</li>
-<li>Wait until new disk row appears under idea-C → select it → <code>op_disk</code>.</li>
+<li>Wait until new disk row appears under idea-C → Open disk inventory on it.</li>
 </ol>
-<h4 id="scenario-o5-eject-disk">Scenario <code>O5</code> — Eject disk</h4>
-<p><strong>Markov:</strong> → <code>op_eject</code> → <code>op_overview</code>.</p>
+<h3 id="eject-disk">Eject disk</h3>
 <ol>
 <li>On a non-system, non-pure-backup disk with device: Eject.</li>
-<li>Confirm in <code>EjectConfirm</code>.</li>
+<li>Confirm in <code>EjectConfirm</code> (or cancel).</li>
 <li>Assert: disk undocked / removed from that Engine’s docked list; instances stopped.</li>
 </ol>
-<h4 id="scenario-o6-start-instance">Scenario <code>O6</code> — Start instance</h4>
-<p><strong>Markov:</strong> → <code>op_instance</code>.</p>
+<h3 id="start-instance">Start instance</h3>
 <ol>
 <li>Select Stopped instance on idea-B App Disk.</li>
 <li><strong>Start</strong> → wait until Running (or Error + History).</li>
-<li>Optional: <strong>Open ↗</strong> (<code>O8</code>).</li>
+<li>Optional: <strong>Open ↗</strong>.</li>
 </ol>
-<h4 id="scenario-o7-stop-instance">Scenario <code>O7</code> — Stop instance</h4>
-<p><strong>Markov:</strong> <code>op_instance</code>.</p>
+<h3 id="stop-instance">Stop instance</h3>
 <ol>
 <li>On Running instance → <strong>Stop</strong> → Stopped / Docked as applicable.</li>
 </ol>
-<h4 id="scenario-o8-open-app-ops-check">Scenario <code>O8</code> — Open app (ops check)</h4>
-<p><strong>Markov:</strong> <code>op_instance</code>.</p>
+<h3 id="open-app-ops-check">Open app ops check</h3>
 <ol>
 <li>Running instance → <strong>Open ↗</strong> → app URL loads (smoke only; deep app use is classroom graph).</li>
 </ol>
-<h4 id="scenario-o9-install-app">Scenario <code>O9</code> — Install App</h4>
-<p><strong>Markov:</strong> <code>op_disk</code> → <code>op_install</code> → often <code>op_instance</code>.</p>
+<h3 id="install-app">Install App</h3>
 <ol>
 <li>Empty disk on idea-C → <strong>Install App</strong> → pick Kolibri (or Nextcloud) → Install.</li>
-<li>Wait operation → <strong>Start</strong> (<code>O6</code>).</li>
+<li>Wait operation → <strong>Start</strong>.</li>
 <li>Assert: instance appears in every Console’s catalog (classroom S1 / reason 1).</li>
 </ol>
-<h4 id="scenario-o10-copy-app">Scenario <code>O10</code> — Copy app</h4>
-<p><strong>Markov:</strong> → <code>op_copy_move</code>.</p>
+<h3 id="copy-app">Copy app</h3>
 <ol>
 <li>From instance on idea-B App Disk, Copy to App Disk on idea-C (drag or mobile sheet).</li>
 <li>Wait <code>copyApp</code> operation → new InstanceID on target.</li>
 </ol>
-<h4 id="scenario-o11-move-app-redistribute">Scenario <code>O11</code> — Move app (redistribute)</h4>
-<p><strong>Markov:</strong> → <code>op_copy_move</code>.</p>
+<h3 id="move-app">Move app</h3>
 <ol>
 <li>Move demanding Kolibri from idea-A disk to idea-B disk (same InstanceID).</li>
 <li>Assert: backup links intact; source cleaned; catalog still unified.</li>
 </ol>
-<h4 id="scenario-o12-make-add-files-disk">Scenario <code>O12</code> — Make / Add Files Disk</h4>
-<p><strong>Markov:</strong> <code>op_disk</code> → <code>op_files</code>.</p>
+<h3 id="make-or-add-files-disk">Make or Add Files Disk</h3>
 <ol>
 <li>Empty disk → <strong>Make this a Files Disk</strong> → share name <code>School Files</code> (or custom) → submit.</li>
 <li>Or App Disk → <strong>Add Files</strong> → same.</li>
 <li>Assert: <code>files</code> badge; availability text updates when opted-in apps run.</li>
 </ol>
-<h4 id="scenario-o13-make-backup-disk">Scenario <code>O13</code> — Make Backup Disk</h4>
-<p><strong>Markov:</strong> <code>op_disk</code> → <code>op_backup</code>.</p>
+<h3 id="make-backup-disk">Make Backup Disk</h3>
 <ol>
 <li>Empty disk → <strong>Make this a Backup Disk</strong> → mode on-demand → select instance(s) → Configure.</li>
 <li>Assert: <code>backup</code> badge.</li>
 </ol>
-<h4 id="scenario-o14-on-demand-backup">Scenario <code>O14</code> — On-demand backup</h4>
-<p><strong>Markov:</strong> <code>op_instance</code>.</p>
+<h3 id="on-demand-backup">On-demand backup</h3>
 <ol>
 <li>Running (or eligible) instance → <strong>Backup</strong> → pick Backup Disk → <code>backupApp</code>.</li>
 <li>Watch OperationProgress; cancel only if testing cancel path.</li>
 </ol>
-<h4 id="scenario-o15-restore-from-backup-disk">Scenario <code>O15</code> — Restore from Backup Disk</h4>
-<p><strong>Markov:</strong> <code>op_disk</code> → <code>op_backup</code>.</p>
+<h3 id="restore-from-backup-disk">Restore from Backup Disk</h3>
 <ol>
 <li>Select Backup Disk → Restore panel → pick instance archive → target App Disk → confirm Restore.</li>
 </ol>
-<h4 id="scenario-o16-erase-disk">Scenario <code>O16</code> — Erase disk</h4>
-<p><strong>Markov:</strong> <code>op_disk</code> → <code>op_erase</code> → <code>op_disk</code> (empty).</p>
+<h3 id="erase-disk">Erase disk</h3>
 <ol>
-<li><strong>Erase this disk…</strong> → wait summary → type exact label → confirm.</li>
+<li>From disk inventory: <strong>Erase this disk…</strong> → wait summary → type exact label → confirm.</li>
 <li>Assert: disk <code>empty</code>; prior instances gone from store for that disk.</li>
 </ol>
-<h4 id="scenario-o17-manage-operators">Scenario <code>O17</code> — Manage operators</h4>
-<p><strong>Markov:</strong> <code>op_overview</code> → <code>op_account</code>.</p>
+<h3 id="manage-operators">Manage operators</h3>
 <ol>
 <li>👤 → Manage Operators → Add operator / Remove / Change password.</li>
-<li>Optional: Log out → <code>op_entry</code>.</li>
+<li>Optional: Log out → back to entry.</li>
 </ol>
-<h4 id="scenario-o18-settings-switch-engine-reboot">Scenario <code>O18</code> — Settings / switch Engine / reboot</h4>
-<p><strong>Markov:</strong> <code>op_overview</code> → <code>op_settings</code>.</p>
+<h3 id="settings-switch-engine-reboot">Settings switch Engine reboot</h3>
 <ol>
 <li>⚙ → Engine Connection → Connect to another discovered Engine (or manual hostname).</li>
-<li>Optional: NetworkTree <strong>Reboot</strong> on a selected Engine → wait reconnect → <code>op_overview</code>.</li>
+<li>Optional: NetworkTree <strong>Reboot</strong> on a selected Engine → wait reconnect → overview.</li>
 </ol>
 <h3 id="composite-walks-multi-engine-alter">Composite walks (multi-Engine alter)</h3>
 <table>
@@ -705,27 +999,27 @@ ul, ol { padding-left: 1.4em; }
 <tr>
 <td>Add capacity</td>
 <td>New empty disk on idea-C → install Kolibri → start</td>
-<td><code>O4</code> → <code>O9</code> → <code>O6</code></td>
+<td>Physical dock appears → Install App → Start instance</td>
 </tr>
 <tr>
 <td>Redistribute load</td>
 <td>Move heavy instance idea-B → idea-C</td>
-<td><code>O3</code> → <code>O11</code></td>
+<td>Select disk inventory → Move app</td>
 </tr>
 <tr>
 <td>Safe disk carry</td>
 <td>Eject on idea-B → (unplug) → dock on idea-A</td>
-<td><code>O5</code> → <code>O4</code> → <code>O3</code></td>
+<td>Eject disk → Physical dock appears → Select disk inventory</td>
 </tr>
 <tr>
 <td>Files for Nextcloud</td>
 <td>Make Files Disk on idea-A → start Nextcloud</td>
-<td><code>O12</code> → <code>O6</code></td>
+<td>Make or Add Files Disk → Start instance</td>
 </tr>
 <tr>
 <td>Backup drill</td>
 <td>Make Backup Disk → backupApp → restore elsewhere</td>
-<td><code>O13</code> → <code>O14</code> → <code>O15</code></td>
+<td>Make Backup Disk → On-demand backup → Restore from Backup Disk</td>
 </tr>
 </tbody>
 </table>
@@ -752,7 +1046,7 @@ ul, ol { padding-left: 1.4em; }
 </tr>
 </tbody>
 </table>
-<p>Classroom scenarios S1 / S7 mention operator dock/start only as story context; their scripts stay usage-side. Operator click paths live here (<code>O*</code>).</p>
+<p>Classroom scenarios S1 / S7 mention operator dock/start only as story context; their usage scripts stay usage-side. Operator click paths live here.</p>
 <hr />
 <h2 id="sources-consulted">Sources consulted</h2>
 <table>
@@ -797,7 +1091,7 @@ ul, ol { padding-left: 1.4em; }
 </tr>
 <tr>
 <td><a href="./multi-engine-classroom.md"><code>multi-engine-classroom.md</code></a></td>
-<td>Conventions for nodes / scenario IDs / story walkthrough</td>
+<td>Conventions for states / actions / Test Scenarios</td>
 </tr>
 </tbody>
 </table>
@@ -815,7 +1109,7 @@ ul, ol { padding-left: 1.4em; }
 <h2 id="ask-of-koen">Ask of Koen</h2>
 <ol>
 <li>Confirm operator graph stays <strong>separate</strong> from classroom usage Markov.  </li>
-<li>Confirm node coarseness (12 nodes) and scenario IDs <code>O1</code>–<code>O18</code>.  </li>
+<li>Confirm state coarseness (12 states) and Intent action names.  </li>
 <li>Confirm omission of <strong>claim Engine</strong> from the graph (not Console UI).  </li>
 <li>Prioritise which composite walks (add capacity / redistribute / eject-carry / backup drill) to deepen first.</li>
 </ol>

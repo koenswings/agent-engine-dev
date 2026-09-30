@@ -8,16 +8,16 @@ blockquote { border-left: 3px solid #ccc; margin-left: 0; padding-left: 0.8em; c
 details { margin: 0.6em 0; } summary { cursor: pointer; font-weight: bold; }
 ul, ol { padding-left: 1.4em; }
 </style></head><body>
-<h1 id="proposal-multi-engine-classroom-conceptual">Proposal: Multi-Engine Classroom (conceptual)</h1>
-<p><strong>Status:</strong> Conceptual draft for discussion — supersedes <code>/workspace/proposals/multi-engine-classroom-scenarios.md</code> (2026-09-28).<br />
-<strong>Revision:</strong> 2026-09-30b — pointer to separate Operator Console Markov (<a href="./multi-engine-operator.md"><code>multi-engine-operator.md</code></a>). Usage Markov (Kolibri / Nextcloud / Wikipedia) unchanged.<br />
-<strong>Author:</strong> Steve (Lead Bot), 2026-09-29 (rev. 2026-09-30b)<br />
+<h1 id="proposal-multi-engine-classroom">Proposal: Multi-Engine Classroom</h1>
+<p><strong>Status:</strong> Proposal draft for discussion — supersedes <a href="./multi-engine-classroom-scenarios.md"><code>multi-engine-classroom-scenarios.md</code></a> (2026-09-28).<br />
+<strong>Revision:</strong> 2026-09-30c — Koen review: Markov chapter uses <strong>states</strong> / <strong>actions</strong> only; <code>console_teacher</code> rename; manage actions wired only inside <code>kolibri_manage</code>; Test Scenarios chapter separated; graph layout fixed for PDF.<br />
+<strong>Author:</strong> Steve (Lead Bot), 2026-09-29 (rev. 2026-09-30c)<br />
 <strong>Audience:</strong> Koen / IDEA leads<br />
 <strong>Companion capacity issue:</strong> <a href="https://github.com/koenswings/idea/issues/159">idea#159</a> — measure safe concurrent Kolibri video streams per instance</p>
 <hr />
 <h2 id="why-this-exists">Why this exists</h2>
-<p>Koen asked for a clean conceptual framing of <strong>why a school runs more than one Engine</strong>, how that looks with a small named fleet, what classroom scenarios matter, and how a Markov usage graph can drive realistic tests later.</p>
-<p>This document stays <strong>conceptual</strong>. Implementation, discovery protocol, auth, Playwright harnesses, fleet claim scripts, and Engine code changes are explicitly out of scope here (see final section).</p>
+<p>Koen asked for a clean framing of <strong>why a school runs more than one Engine</strong>, how that looks with a small named fleet, what classroom scenarios matter, and how a Markov usage graph can drive realistic tests later.</p>
+<p>This document is a <strong>proposal draft</strong>. Implementation, discovery protocol, auth, Playwright harnesses, fleet claim scripts, and Engine code changes are explicitly out of scope here (see final section). The Markov usage graph itself is a <strong>concrete state/action model</strong> for later tests — not labeled conceptual.</p>
 <hr />
 <h2 id="vision-cite-this-is-already-documented">Vision cite (this is already documented)</h2>
 <p>Prior drafting treated multi-Engine load distribution as an undocumented assumption. That was wrong.</p>
@@ -26,8 +26,7 @@ ul, ol { padding-left: 1.4em; }
 <p>All Appdockers on the same LAN will automatically find one another and when a new Appdocker device is added, the catalog of available apps is automatically extended with the apps docked onto the new device.<br />
 Performance is optimized by adding Appdockers and redistributing the apps over the Appdockers.</p>
 </blockquote>
-<p><strong>Source:</strong> <a href="https://github.com/koenswings/agent-engine-dev/blob/main/proposals/solution-description.md"><code>agent-engine-dev/proposals/solution-description.md</code></a><br />
-(local clones also under e.g. <code>/workspace/research/agent-engine-dev/proposals/solution-description.md</code>)</p>
+<p><strong>Source:</strong> <a href="https://github.com/koenswings/agent-engine-dev/blob/main/proposals/solution-description.md"><code>agent-engine-dev/proposals/solution-description.md</code></a></p>
 <p>Referenced from <code>idea/docs/grok-bot-setup.md</code> as the Engine vision and intent doc.</p>
 <p>The multi-Engine classroom story below <strong>extends</strong> that vision into classroom roles and usage scenarios; it does not invent the load-spread principle.</p>
 <hr />
@@ -123,7 +122,7 @@ Performance is optimized by adding Appdockers and redistributing the apps over t
 <p>Discovery, Console overview, and “users don’t pick an Engine” stay the same rules; only inventory and assignment grow.</p>
 <hr />
 <h2 id="initial-scenario-list-for-discussion">Initial scenario list (for discussion)</h2>
-<p>Discussable outcomes — <strong>not</strong> test scripts. Named UI scripts that expand Markov nodes live under <a href="#detailed-ui-scenarios-expand-nodes-into-clicks">Detailed UI scenarios</a>.</p>
+<p>Discussable outcomes — <strong>not</strong> test scripts. Each item maps to Markov <strong>states</strong> / <strong>actions</strong> (and thus a Test Scenario) where the usage graph covers it; items that are operator-side or not yet in the graph are marked explicitly.</p>
 <p><strong>Reason 1 — distribute apps / load</strong></p>
 <ul>
 <li><strong>S1 Add Engine, plug demanding app:</strong> School adds idea-C; docks a heavy Kolibri (or Nextcloud media) disk onto it; app appears in every Console’s integrated list without renaming Consoles or teaching users a new hostname.</li>
@@ -143,315 +142,531 @@ Performance is optimized by adding Appdockers and redistributing the apps over t
 </ul>
 <p><strong>Usage / field-aligned (Marco)</strong></p>
 <ul>
-<li><strong>S9 Kolibri teaching cycle:</strong> Teacher builds class → enrolls learners → assigns lesson with videos → students watch/complete → quiz → teacher reads Reports (from Marco Kolibri presentations). Scripts: <code>K-manage-*</code>, <code>K2</code>, <code>K4</code>.</li>
-<li><strong>S10 Nextcloud classroom workflow:</strong> Class groups; view-only material share; File Drop homework; collaborative doc; Talk for support (from Marco Nextcloud presentations). Scripts: <code>NC-share</code>, <code>NC-drop</code>, <code>NC-collab</code>, <code>NC1</code>/<code>NC2</code>. Field note: many devices → performance drop → prefer one group at a time unless multi-Engine capacity is in play.</li>
-<li><strong>S11 Offline Wikipedia:</strong> Learner (or teacher) opens Kiwix from Console (idea-A), searches/browses articles, dwells, leaves. Script: <code>W1</code>.</li>
+<li><strong>S9 Kolibri teaching cycle:</strong> Teacher builds class → enrolls learners → assigns lesson with videos → students watch/complete → quiz → teacher reads Reports (from Marco Kolibri presentations).</li>
+<li><strong>S10 Nextcloud classroom workflow:</strong> Class groups; view-only material share; File Drop homework; collaborative doc; Talk for support (from Marco Nextcloud presentations). Field note: many devices → performance drop → prefer one group at a time unless multi-Engine capacity is in play.</li>
+<li><strong>S11 Offline Wikipedia:</strong> Learner (or teacher) opens Kiwix from Console (idea-A), searches/browses articles, dwells, leaves.</li>
 </ul>
+<p><strong>Coverage vs this usage graph</strong> (after rewrite): see <a href="#initial-scenarios--markov-coverage">Initial scenarios ↔ Markov coverage</a> at the end of the Markov chapter.</p>
 <hr />
-<h2 id="markov-usage-graph-conceptual">Markov usage graph (conceptual)</h2>
+<h2 id="markov-usage-graph">Markov usage graph</h2>
 <h3 id="idea">Idea</h3>
 <ul>
-<li><strong>Nodes</strong> = usage states (what a person is doing in an app or Console), not disk-dock hardware states alone.</li>
-<li><strong>Transitions</strong> = actions with probabilities (initial guesses until field frequencies exist). Compact <strong>scenario IDs</strong> on edges (e.g. <code>[L-entry]</code>, <code>[K-manage-*]</code>, <code>[W1]</code>) mark where a transition is the <strong>start</strong> of a named UI script; the harness expands the destination node into ordered clicks.</li>
-<li>A <strong>real test scenario</strong> = a <strong>random walk</strong> on this graph for some duration or step count.</li>
+<li><strong>States</strong> = usage places (what a person is doing in an app or Console), not disk-dock hardware states alone.</li>
+<li><strong>Actions</strong> = labeled transitions with probabilities (initial guesses until field frequencies exist). Action names are Intent-style (e.g. <strong>Open Kolibri</strong>, <strong>Stay on overview</strong>, <strong>Create class</strong>) — no scenario IDs and no <code>*</code> wildcards on the graph.</li>
+<li>A <strong>real test</strong> = a <strong>random walk</strong> on this graph for some duration or step count. Each action may reference a <strong>Test Scenario</strong> by the same Intent name (forward link only).</li>
 <li>Test instances of each app ship with <strong>preloaded content</strong>; legal actions are derived from that content (e.g. which lessons/videos exist, which folders/groups exist).</li>
 <li>Incorporate Marco’s file-sharing (students/teachers) and Kolibri classroom management, plus content-access actions for Kolibri, Nextcloud, and offline Wikipedia (Kiwix on idea-A).</li>
 </ul>
-<p><strong>Operator Console Markov (separate):</strong> managing/altering the multi-Engine setup (login, NetworkTree, dock/eject, install, start/stop, copy/move, Files/Backup/erase, operators, settings) lives in sibling <a href="./multi-engine-operator.md"><code>multi-engine-operator.md</code></a> with graph files <code>multi-engine-operator-markov.{dot,png,svg}</code>. This classroom usage graph is unchanged aside from this pointer.</p>
-<h3 id="example-nodes-small-set">Example nodes (small set)</h3>
+<p><strong>Operator Console Markov (separate):</strong> managing/altering the multi-Engine setup (login, NetworkTree, dock/eject, install, start/stop, copy/move, Files/Backup/erase, operators, settings) lives in sibling <a href="./multi-engine-operator.md"><code>multi-engine-operator.md</code></a> with graph files <code>multi-engine-operator-markov.{dot,png,svg}</code>. This classroom usage graph stays usage-only.</p>
+<h3 id="states-final-list">States (final list)</h3>
 <table>
 <thead>
 <tr>
-<th>Node</th>
+<th>State</th>
 <th>Who</th>
 <th>Colour</th>
 <th>Meaning</th>
-<th>Scenario IDs that expand it</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>console_overview</code></td>
-<td>Teacher / operator</td>
+<td><code>console_teacher</code></td>
+<td>Teacher</td>
 <td>blue</td>
-<td>School-wide Engine/app status; opens apps as coach</td>
-<td>entry for <code>K-manage-*</code>, <code>NC1</code>, <code>W1</code> (teacher)</td>
+<td>School-wide Engine/app overview; opens apps as coach</td>
 </tr>
 <tr>
 <td><code>console_learner</code></td>
 <td>Student</td>
 <td>mid-blue</td>
 <td>Same unified app list; student opens an app to work</td>
-<td><code>L-entry</code></td>
 </tr>
 <tr>
 <td><code>kolibri_home</code></td>
 <td>Student or teacher</td>
 <td>green</td>
 <td>Kolibri signed in, Learn</td>
-<td><code>K2</code> (learner start of lesson)</td>
 </tr>
 <tr>
 <td><code>kolibri_watching</code></td>
 <td>Student</td>
 <td>green</td>
 <td>Playing an assigned lesson video</td>
-<td><code>K2</code>, <code>K3</code> (capacity dwell)</td>
 </tr>
 <tr>
 <td><code>kolibri_exercise</code></td>
 <td>Student</td>
 <td>green</td>
 <td>Doing an exercise in a lesson</td>
-<td><code>K2</code></td>
 </tr>
 <tr>
 <td><code>kolibri_manage</code></td>
 <td>Teacher</td>
 <td>green (dark)</td>
 <td>Classes, lessons, quizzes, Reports</td>
-<td><code>K-manage-class</code>, <code>K-manage-enroll</code>, <code>K-manage-lesson</code>, <code>K-manage-quiz</code>, <code>K-manage-reports</code> (+ composite <code>K1</code> / <code>K4</code>)</td>
 </tr>
 <tr>
 <td><code>nc_browse</code></td>
 <td>Student or teacher</td>
 <td>yellow</td>
 <td>Nextcloud Files browse</td>
-<td>hub for <code>NC-share</code> / <code>NC-drop</code> / <code>NC-collab</code> / <code>NC1</code></td>
 </tr>
 <tr>
 <td><code>nc_share</code></td>
 <td>Teacher</td>
 <td>yellow (dark)</td>
 <td>View-only share to a class group</td>
-<td><code>NC-share</code></td>
 </tr>
 <tr>
 <td><code>nc_drop</code></td>
 <td>Student</td>
 <td>yellow (dark)</td>
 <td>Uploading to a File Drop</td>
-<td><code>NC-drop</code></td>
 </tr>
 <tr>
 <td><code>nc_collab</code></td>
 <td>Student</td>
 <td>yellow (dark)</td>
 <td>Editing a shared collaborative doc</td>
-<td><code>NC-collab</code></td>
 </tr>
 <tr>
 <td><code>wiki_browse</code></td>
 <td>Student or teacher</td>
 <td>purple</td>
 <td>Kiwix / offline Wikipedia on idea-A</td>
-<td><code>W1</code></td>
 </tr>
 </tbody>
 </table>
-<h3 id="example-transitions-probabilities-are-placeholders">Example transitions (probabilities are placeholders)</h3>
-<p>Graphviz source: <a href="./multi-engine-markov.dot"><code>multi-engine-markov.dot</code></a>. Rendered:</p>
-<p><img alt="Markov usage graph" src="./multi-engine-markov.png" /></p>
+<h3 id="graph">Graph</h3>
+<p>The full state/action set is dense for one letter page, so the usage graph is shown as <strong>two diagrams</strong> (same states and actions; Console repeated as the shared hub). Combined source also kept: <a href="./multi-engine-markov.dot"><code>multi-engine-markov.dot</code></a> → <a href="./multi-engine-markov.png"><code>multi-engine-markov.png</code></a>.</p>
+<p><strong>Diagram A — Console + Kolibri</strong> (<a href="./multi-engine-markov-kolibri.dot"><code>multi-engine-markov-kolibri.dot</code></a>):</p>
+<p><img alt="Markov usage graph — Console and Kolibri" src="./multi-engine-markov-kolibri.png" /></p>
+<p><strong>Diagram B — Console + Nextcloud + Wikipedia</strong> (<a href="./multi-engine-markov-files.dot"><code>multi-engine-markov-files.dot</code></a>):</p>
+<p><img alt="Markov usage graph — Console, Nextcloud, Wikipedia" src="./multi-engine-markov-files.png" /></p>
 <details>
 <summary>Same graph as Mermaid (editable)</summary>
 
 
 <pre><code class="language-mermaid">stateDiagram-v2
-    [*] --&gt; console_overview: teacher / op
-    [*] --&gt; console_learner: learner
+    [*] --&gt; console_teacher: Open Console as teacher
+    [*] --&gt; console_learner: Open Console as learner
 
-    console_overview --&gt; kolibri_manage: open Kolibri 0.20 [K-manage-*]
-    console_overview --&gt; nc_browse: open Nextcloud 0.20 [NC1 / NC-share]
-    console_overview --&gt; wiki_browse: open Wikipedia 0.10 [W1]
-    console_overview --&gt; console_overview: dwell / refresh 0.50
+    console_teacher --&gt; kolibri_manage: Open Kolibri 0.20
+    console_teacher --&gt; nc_browse: Open Nextcloud 0.20
+    console_teacher --&gt; wiki_browse: Open Wikipedia 0.10
+    console_teacher --&gt; console_teacher: Stay on overview 0.50
 
-    console_learner --&gt; kolibri_home: open Kolibri 0.40 [L-entry]
-    console_learner --&gt; nc_browse: open Nextcloud 0.25 [L-entry]
-    console_learner --&gt; wiki_browse: open Wikipedia 0.20 [L-entry / W1]
-    console_learner --&gt; console_learner: dwell 0.15
+    console_learner --&gt; kolibri_home: Open Kolibri 0.40
+    console_learner --&gt; nc_browse: Open Nextcloud 0.25
+    console_learner --&gt; wiki_browse: Open Wikipedia 0.20
+    console_learner --&gt; console_learner: Stay on overview 0.15
 
-    kolibri_manage --&gt; kolibri_home: preview as learner 0.20
-    kolibri_manage --&gt; kolibri_manage: edit / reports 0.55 [K-manage-*]
-    kolibri_manage --&gt; console_overview: back to Console 0.25
+    kolibri_manage --&gt; kolibri_manage: Create class 0.12
+    kolibri_manage --&gt; kolibri_manage: Enroll learners 0.12
+    kolibri_manage --&gt; kolibri_manage: Build lesson 0.14
+    kolibri_manage --&gt; kolibri_manage: Create quiz 0.09
+    kolibri_manage --&gt; kolibri_manage: Read reports 0.08
+    kolibri_manage --&gt; kolibri_home: Preview as learner 0.20
+    kolibri_manage --&gt; console_teacher: Back to Console 0.25
 
-    kolibri_home --&gt; kolibri_watching: open video 0.45 [K2]
-    kolibri_home --&gt; kolibri_exercise: open exercise 0.25 [K2]
-    kolibri_home --&gt; kolibri_home: browse classes 0.20
-    kolibri_home --&gt; console_learner: leave 0.10
+    kolibri_home --&gt; kolibri_watching: Open video 0.45
+    kolibri_home --&gt; kolibri_exercise: Open exercise 0.25
+    kolibri_home --&gt; kolibri_home: Browse classes 0.20
+    kolibri_home --&gt; console_learner: Leave Kolibri 0.10
 
-    kolibri_watching --&gt; kolibri_watching: keep watching 0.60 [K3]
-    kolibri_watching --&gt; kolibri_exercise: next resource 0.25
-    kolibri_watching --&gt; kolibri_home: exit lesson 0.15
+    kolibri_watching --&gt; kolibri_watching: Keep watching 0.60
+    kolibri_watching --&gt; kolibri_exercise: Next resource 0.25
+    kolibri_watching --&gt; kolibri_home: Exit lesson 0.15
 
-    kolibri_exercise --&gt; kolibri_home: finish / exit 0.70
-    kolibri_exercise --&gt; kolibri_watching: next video 0.30
+    kolibri_exercise --&gt; kolibri_home: Finish exercise 0.70
+    kolibri_exercise --&gt; kolibri_watching: Next video 0.30
 
-    nc_browse --&gt; nc_share: share to class 0.18 [NC-share]
-    nc_browse --&gt; nc_drop: File Drop 0.22 [NC-drop]
-    nc_browse --&gt; nc_collab: open collab 0.22 [NC-collab]
-    nc_browse --&gt; nc_browse: browse folders 0.15
-    nc_browse --&gt; console_learner: leave (learner) 0.13
-    nc_browse --&gt; console_overview: leave (teacher) 0.10
+    nc_browse --&gt; nc_share: Share to class 0.18
+    nc_browse --&gt; nc_drop: Open File Drop 0.22
+    nc_browse --&gt; nc_collab: Open collab doc 0.22
+    nc_browse --&gt; nc_browse: Browse folders 0.15
+    nc_browse --&gt; console_learner: Leave (learner) 0.13
+    nc_browse --&gt; console_teacher: Leave (teacher) 0.10
 
-    nc_share --&gt; nc_browse: done sharing 0.80
-    nc_share --&gt; console_overview: leave 0.20
+    nc_share --&gt; nc_browse: Done sharing 0.80
+    nc_share --&gt; console_teacher: Back to Console 0.20
 
-    nc_drop --&gt; nc_browse: after upload 0.85
-    nc_drop --&gt; console_learner: leave 0.15
+    nc_drop --&gt; nc_browse: After upload 0.85
+    nc_drop --&gt; console_learner: Leave File Drop 0.15
 
-    nc_collab --&gt; nc_browse: close doc 0.70
-    nc_collab --&gt; nc_collab: keep editing 0.30
+    nc_collab --&gt; nc_browse: Close doc 0.70
+    nc_collab --&gt; nc_collab: Keep editing 0.30
 
-    wiki_browse --&gt; wiki_browse: search / browse 0.65 [W1]
-    wiki_browse --&gt; console_learner: leave (learner) 0.20
-    wiki_browse --&gt; console_overview: leave (teacher) 0.15
+    wiki_browse --&gt; wiki_browse: Search / browse 0.65
+    wiki_browse --&gt; console_learner: Leave (learner) 0.20
+    wiki_browse --&gt; console_teacher: Leave (teacher) 0.15
 </code></pre>
 
 
 </details>
 
-<h3 id="story-walkthrough-nodes-real-clicks">Story walkthrough (nodes → real clicks)</h3>
-<p><strong>How this maps to tests.</strong> Each Markov <strong>node</strong> is a coarse place someone can be (learner Console, teacher Console, Kolibri coaching, watching a video, Wikipedia, …). A <strong>transition</strong> is leaving that place for another. Inside a node, a real test does <strong>not</strong> invent a new node for every mouse click — that would explode the graph. Instead the harness expands the node into an <strong>ordered UI script</strong> (login → sidebar → form → Save) taken from Marco’s classroom presentations. Create an extra node only when the action changes <strong>who</strong> is acting, <strong>which app surface</strong> they are on, or <strong>resource pressure</strong> (e.g. video stream vs browse). Probabilities below are still placeholders. Scenario IDs in <code>[brackets]</code> on edges/nodes name the scripts under <a href="#detailed-ui-scenarios-expand-nodes-into-clicks">Detailed UI scenarios</a>.</p>
-<p>UI labels below match Marco’s field decks and quick-reference cards (<code>kolibri-classroom-setup</code>, <code>kolibri-lessons-and-quizzes</code>, <code>nextcloud-user-registration</code>, <code>nextcloud-classroom-use</code>, <code>quick-reference-kolibri.md</code>, <code>quick-reference-nextcloud.md</code>) — confirmed with Marco 2026-09-29. Console steps assume the school-wide app overview any Engine’s Console shows (reason 1 / 3). Exact selectors belong in the Playwright harness later — this doc names the human-visible controls.</p>
-<h4 id="console_overview-teacher-operator-opens-the-console"><code>console_overview</code> — teacher / operator opens the Console</h4>
-<p>The teacher or operator opens a browser on the school LAN (or already has Console open) and lands on the <strong>Engine / apps overview</strong>: Engines present, apps docked, status. They are inspecting what is available on the network, not choosing a “home” Pi. <strong>Operator-specific Console actions</strong> (dock/eject disks, start/stop instances, install/move/backup/erase, operators/settings) are <strong>not</strong> on this usage graph — see the separate Operator Console Markov: <a href="./multi-engine-operator.md"><code>multi-engine-operator.md</code></a> (<code>O1</code>–<code>O18</code>, <code>multi-engine-operator-markov.*</code>).</p>
+<h3 id="how-states-map-to-tests">How states map to tests</h3>
+<p>Each Markov <strong>state</strong> is a coarse place someone can be. An <strong>action</strong> leaves that place for another (or stays via a self-loop). Inside a state, a real test does <strong>not</strong> invent a new state for every mouse click — that would explode the graph. Instead the harness expands the action into an <strong>ordered UI script</strong> (login → sidebar → form → Save) taken from Marco’s classroom presentations. Create an extra state only when the action changes <strong>who</strong> is acting, <strong>which app surface</strong> they are on, or <strong>resource pressure</strong> (e.g. video stream vs browse). Probabilities below are still placeholders.</p>
+<p><strong>Critical wiring rule:</strong> actions that belong to an app state must <strong>not</strong> be edges from Console entry states. From <code>console_teacher</code> you may only <strong>Open Kolibri</strong> (enter <code>kolibri_manage</code>), <strong>Open Nextcloud</strong>, <strong>Open Wikipedia</strong>, or <strong>Stay on overview</strong>. Coaching actions (<strong>Create class</strong>, <strong>Enroll learners</strong>, …) exist only as actions <strong>inside</strong> <code>kolibri_manage</code>. Same pattern for Nextcloud/Wikipedia.</p>
+<p>UI labels match Marco’s field decks and quick-reference cards (<code>kolibri-classroom-setup</code>, <code>kolibri-lessons-and-quizzes</code>, <code>nextcloud-user-registration</code>, <code>nextcloud-classroom-use</code>, <code>quick-reference-kolibri.md</code>, <code>quick-reference-nextcloud.md</code>) — confirmed with Marco 2026-09-29. Console steps assume the school-wide app overview any Engine’s Console shows (reason 1 / 3). Exact selectors belong in the Playwright harness later.</p>
+<hr />
+<h3 id="state-console_teacher">State: <code>console_teacher</code></h3>
+<p>The teacher opens a browser on the school LAN (or already has Console open) and lands on the <strong>Engine / apps overview</strong>: Engines present, apps docked, status. They are inspecting what is available on the network, not choosing a “home” Pi. <strong>Operator-specific Console actions</strong> (dock/eject disks, start/stop instances, install/move/backup/erase, operators/settings) are <strong>not</strong> on this usage graph — see <a href="./multi-engine-operator.md"><code>multi-engine-operator.md</code></a>.</p>
 <p><strong>Concrete UI (when a walk starts here):</strong></p>
 <ol>
 <li>Open Chromium (or any browser) on the school LAN → Console for any Engine (field habit today: hostname like <code>engine-1.local</code>; multi-Engine story: idea-A / idea-B / idea-C Consoles must be equivalent).</li>
 <li>Scan the integrated app list — apps show <strong>Running</strong> (etc.) — and Engine rows.</li>
 <li>Optionally refresh / wait while students work.</li>
 </ol>
-<p><strong>Scenario IDs started from here:</strong> <code>K-manage-*</code> (open Kolibri as teacher), <code>NC1</code> / <code>NC-share</code> (open Nextcloud), <code>W1</code> (open Wikipedia as teacher), plus dwell.</p>
-<p><strong>From here the walk can:</strong></p>
-<ol>
-<li><strong>Open Kolibri as teacher</strong> (~0.20) <code>[K-manage-*]</code> — click the Kolibri app (Running) → <strong>Sign in</strong> on Kolibri → go to <a href="#kolibri_manage--teacher-in-kolibri-coaching"><code>kolibri_manage</code></a>.</li>
-<li><strong>Open Nextcloud</strong> (~0.20) <code>[NC1 / NC-share]</code> — click the Nextcloud app → Log in → go to <a href="#nc_browse--anyone-in-nextcloud-files"><code>nc_browse</code></a>.</li>
-<li><strong>Open Wikipedia / Kiwix</strong> (~0.10) <code>[W1]</code> — click the Kiwix / Wikipedia app (on idea-A) → go to <a href="#wiki_browse--kiwix--offline-wikipedia"><code>wiki_browse</code></a>.</li>
-<li><strong>Stay on overview</strong> (~0.50) — refresh / dwell → remain on <strong><code>console_overview</code></strong>.</li>
-</ol>
-<p><em>Test note:</em> opening an app is one transition; the login form that follows belongs to the destination node’s script, not a separate Console node.</p>
-<h4 id="console_learner-student-opens-the-console"><code>console_learner</code> — student opens the Console</h4>
-<p>The <strong>learner</strong> entry that was missing from the earlier draft. A student opens Console, sees the <strong>same unified app list</strong> as teachers (reason 1 / S3), and opens an app to start work. They are not managing Engines — just picking Kolibri, Nextcloud, or Wikipedia.</p>
-<p><strong>Concrete UI (walk starts here — scenario <code>L-entry</code>):</strong></p>
+<p><strong>Actions from this state:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Open Kolibri</strong></td>
+<td style="text-align: right;">0.20</td>
+<td><code>kolibri_manage</code></td>
+<td><a href="#open-kolibri-as-teacher">Open Kolibri as teacher</a></td>
+</tr>
+<tr>
+<td><strong>Open Nextcloud</strong></td>
+<td style="text-align: right;">0.20</td>
+<td><code>nc_browse</code></td>
+<td><a href="#open-nextcloud-as-teacher">Open Nextcloud as teacher</a></td>
+</tr>
+<tr>
+<td><strong>Open Wikipedia</strong></td>
+<td style="text-align: right;">0.10</td>
+<td><code>wiki_browse</code></td>
+<td><a href="#browse-offline-wikipedia">Browse offline Wikipedia</a></td>
+</tr>
+<tr>
+<td><strong>Stay on overview</strong></td>
+<td style="text-align: right;">0.50</td>
+<td><code>console_teacher</code></td>
+<td><a href="#stay-on-teacher-overview">Stay on teacher overview</a></td>
+</tr>
+</tbody>
+</table>
+<p><em>Test note:</em> opening an app is one action; the login form that follows belongs to the destination state’s script, not a separate Console state.</p>
+<hr />
+<h3 id="state-console_learner">State: <code>console_learner</code></h3>
+<p>A student opens Console, sees the <strong>same unified app list</strong> as teachers (reason 1 / S3), and opens an app to start work. They are not managing Engines — just picking Kolibri, Nextcloud, or Wikipedia.</p>
+<p><strong>Concrete UI:</strong></p>
 <ol>
 <li>Open browser on school LAN → any Engine’s Console (idea-A / B / C equivalent).</li>
 <li>See integrated app list (Kolibri class instance, Nextcloud class instance, Kiwix on idea-A, …).</li>
-<li>Click one app → destination node’s login / home script runs.</li>
+<li>Click one app → destination state’s login / home script runs.</li>
 </ol>
-<p><strong>Scenario IDs:</strong> <code>L-entry</code> (this node + open-app transitions); destination scripts <code>K2</code> / <code>NC-drop</code> / <code>NC-collab</code> / <code>W1</code> continue after landing.</p>
-<p><strong>From here the walk can:</strong></p>
-<ol>
-<li><strong>Open Kolibri</strong> (~0.40) <code>[L-entry]</code> → <a href="#kolibri_home--learner-on-kolibri-learn"><code>kolibri_home</code></a>.</li>
-<li><strong>Open Nextcloud</strong> (~0.25) <code>[L-entry]</code> → <a href="#nc_browse--anyone-in-nextcloud-files"><code>nc_browse</code></a>.</li>
-<li><strong>Open Wikipedia / Kiwix</strong> (~0.20) <code>[L-entry / W1]</code> → <a href="#wiki_browse--kiwix--offline-wikipedia"><code>wiki_browse</code></a>.</li>
-<li><strong>Dwell</strong> (~0.15) → remain on <strong><code>console_learner</code></strong>.</li>
-</ol>
-<h4 id="kolibri_manage-teacher-in-kolibri-coaching"><code>kolibri_manage</code> — teacher in Kolibri coaching</h4>
-<p>The teacher is on Kolibri’s <strong>facility / coaching</strong> side (Classes, Lessons, Quizzes, Reports) — not the learner Learn tab. This node <strong>generalises</strong> several coaching tasks; a single visit expands into <strong>one</strong> of the <code>K-manage-*</code> scripts below (create class, enroll, build lesson, quiz, reports). The graph does <strong>not</strong> add nodes for “click Learners tab” vs “click Save” — those are steps inside the script.</p>
+<p><strong>Actions from this state:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Open Kolibri</strong></td>
+<td style="text-align: right;">0.40</td>
+<td><code>kolibri_home</code></td>
+<td><a href="#student-opens-console-and-starts-work">Student opens Console and starts work</a></td>
+</tr>
+<tr>
+<td><strong>Open Nextcloud</strong></td>
+<td style="text-align: right;">0.25</td>
+<td><code>nc_browse</code></td>
+<td><a href="#student-opens-console-and-starts-work">Student opens Console and starts work</a></td>
+</tr>
+<tr>
+<td><strong>Open Wikipedia</strong></td>
+<td style="text-align: right;">0.20</td>
+<td><code>wiki_browse</code></td>
+<td><a href="#browse-offline-wikipedia">Browse offline Wikipedia</a></td>
+</tr>
+<tr>
+<td><strong>Stay on overview</strong></td>
+<td style="text-align: right;">0.15</td>
+<td><code>console_learner</code></td>
+<td><a href="#stay-on-learner-overview">Stay on learner overview</a></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="state-kolibri_manage">State: <code>kolibri_manage</code></h3>
+<p>The teacher is on Kolibri’s <strong>facility / coaching</strong> side (Classes, Lessons, Quizzes, Reports) — not the learner Learn tab. Coaching Intents are <strong>actions inside this state</strong> (self-loops or stay-and-act), not edges from <code>console_teacher</code>.</p>
 <p><strong>Entry UI (always, if not already signed in):</strong></p>
 <ol>
 <li>Kolibri login page → type <strong>teacher username</strong> and <strong>password</strong> → Sign in.</li>
 <li>Land on teacher home / facility UI (left sidebar visible).</li>
 </ol>
-<p><strong>Typical actions inside this node (pick one path per visit; stay in-node until done) — each row = one named scenario:</strong></p>
+<p><strong>Actions from this state:</strong></p>
 <table>
 <thead>
 <tr>
-<th>Intent</th>
-<th>Clicks (Marco)</th>
-<th>Scenario ID</th>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Create class</strong></td>
+<td style="text-align: right;">0.12</td>
+<td><code>kolibri_manage</code></td>
+<td><a href="#create-class">Create class</a></td>
+</tr>
+<tr>
+<td><strong>Enroll learners</strong></td>
+<td style="text-align: right;">0.12</td>
+<td><code>kolibri_manage</code></td>
+<td><a href="#enroll-learners">Enroll learners</a></td>
+</tr>
+<tr>
+<td><strong>Build lesson</strong></td>
+<td style="text-align: right;">0.14</td>
+<td><code>kolibri_manage</code></td>
+<td><a href="#build-lesson">Build lesson</a></td>
+</tr>
+<tr>
+<td><strong>Create quiz</strong></td>
+<td style="text-align: right;">0.09</td>
+<td><code>kolibri_manage</code></td>
+<td><a href="#create-quiz">Create quiz</a></td>
+</tr>
+<tr>
+<td><strong>Read reports</strong></td>
+<td style="text-align: right;">0.08</td>
+<td><code>kolibri_manage</code></td>
+<td><a href="#read-reports">Read reports</a></td>
+</tr>
+<tr>
+<td><strong>Preview as learner</strong></td>
+<td style="text-align: right;">0.20</td>
+<td><code>kolibri_home</code></td>
+<td><a href="#preview-as-learner">Preview as learner</a></td>
+</tr>
+<tr>
+<td><strong>Back to Console</strong></td>
+<td style="text-align: right;">0.25</td>
+<td><code>console_teacher</code></td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Typical clicks (Marco) for coaching actions:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th>Clicks</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td>Create class</td>
 <td>Left sidebar <strong>Classes</strong> → <strong>+ New class</strong> → type name (e.g. <code>Grade 5A</code>) → <strong>Save</strong></td>
-<td><code>K-manage-class</code></td>
 </tr>
 <tr>
 <td>Enroll learners</td>
 <td>Open class → <strong>Learners</strong> tab → <strong>Enroll learners</strong> → tick students → <strong>Confirm</strong></td>
-<td><code>K-manage-enroll</code></td>
 </tr>
 <tr>
-<td>Build / enrich lesson</td>
+<td>Build lesson</td>
 <td>Class → <strong>Lessons</strong> → <strong>+ New lesson</strong> (or open existing) → name → <strong>Add resources</strong> → pick video + exercise from <strong>Library / Channels</strong> → <strong>Save</strong> → set <strong>Recipients</strong> to the class → toggle <strong>Visible</strong></td>
-<td><code>K-manage-lesson</code></td>
 </tr>
 <tr>
 <td>Create quiz</td>
 <td>Class → <strong>Quizzes</strong> → <strong>+ New quiz</strong> → <strong>Add questions</strong> from exercise channels → set count → <strong>Finish</strong> → toggle <strong>Active</strong></td>
-<td><code>K-manage-quiz</code></td>
 </tr>
 <tr>
-<td>Read progress</td>
+<td>Read reports</td>
 <td>Left sidebar <strong>Reports</strong> → <strong>Classes</strong> → class → <strong>Lessons</strong> or <strong>Quizzes</strong> → open item → scan learner table</td>
-<td><code>K-manage-reports</code></td>
 </tr>
 </tbody>
 </table>
-<p><strong>Scenario IDs that expand this node:</strong> <code>K-manage-class</code>, <code>K-manage-enroll</code>, <code>K-manage-lesson</code>, <code>K-manage-quiz</code>, <code>K-manage-reports</code>. Composite walks: <code>K1</code> (class+enroll+lesson), <code>K4</code> (quiz+reports with learner take).</p>
-<p><strong>From here the walk can leave to:</strong></p>
-<ol>
-<li><strong>Preview as learner</strong> (~0.20) — open learner view / Learn (or sign in as a test learner) → <a href="#kolibri_home--learner-on-kolibri-learn"><code>kolibri_home</code></a>.</li>
-<li><strong>Keep coaching</strong> (~0.55) <code>[K-manage-*]</code> — another coaching intent from the table → stay on <strong><code>kolibri_manage</code></strong>.</li>
-<li><strong>Back to Console</strong> (~0.25) — leave Kolibri tab / return to Console URL → <a href="#console_overview--teacher--operator-opens-the-console"><code>console_overview</code></a>.</li>
-</ol>
-<h4 id="kolibri_home-learner-on-kolibri-learn"><code>kolibri_home</code> — learner on Kolibri Learn</h4>
+<p>Composite walks (Teacher prepares Grade 5A lesson, Quiz and reports) chain several of these actions — see <a href="#test-scenarios">Test Scenarios</a>.</p>
+<hr />
+<h3 id="state-kolibri_home">State: <code>kolibri_home</code></h3>
 <p>A student (or teacher previewing) is on the <strong>learner</strong> side after login.</p>
 <p><strong>Entry UI:</strong></p>
 <ol>
-<li>Kolibri login → <strong>learner username</strong> / <strong>password</strong> → Sign in. <em>(Reached via <code>L-entry</code> from <code>console_learner</code>, or teacher preview from <code>kolibri_manage</code>.)</em></li>
+<li>Kolibri login → <strong>learner username</strong> / <strong>password</strong> → Sign in.</li>
 <li>Top menu <strong>Learn</strong>.</li>
 <li>See enrolled classes → open class → see assigned <strong>Lessons</strong> (and <strong>Quizzes</strong> if active).</li>
 </ol>
-<p><strong>Scenario IDs:</strong> <code>K2</code> (open video / exercise); learner half of <code>K4</code> (open quiz).</p>
-<p><strong>From here:</strong></p>
-<ol>
-<li><strong>Open a lesson video</strong> (~0.45) <code>[K2]</code> — open lesson → click the <strong>video</strong> resource → player starts → <a href="#kolibri_watching--student-in-the-video-player"><code>kolibri_watching</code></a>.</li>
-<li><strong>Open an exercise</strong> (~0.25) <code>[K2]</code> — open lesson → click an <strong>exercise</strong> resource → <a href="#kolibri_exercise--student-in-an-exercise"><code>kolibri_exercise</code></a>.</li>
-<li><strong>Browse only</strong> (~0.20) — move between classes / lessons without starting a resource → stay on <strong><code>kolibri_home</code></strong>.</li>
-<li><strong>Leave</strong> (~0.10) → <a href="#console_learner--student-opens-the-console"><code>console_learner</code></a> (or close app).</li>
-</ol>
-<h4 id="kolibri_watching-student-in-the-video-player"><code>kolibri_watching</code> — student in the video player</h4>
-<p>Capacity-sensitive node (reason 2 / idea#159). Many concurrent walkers here is what forces a second Kolibri instance. Planning N depends on video quality: <strong>64 @ 360p / 32 @ 480p–720p / 12 @ 1080p</strong> (idea01 Pi 5 / 4 GB).</p>
+<p><strong>Actions from this state:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Open video</strong></td>
+<td style="text-align: right;">0.45</td>
+<td><code>kolibri_watching</code></td>
+<td><a href="#student-completes-assigned-lesson">Student completes assigned lesson</a></td>
+</tr>
+<tr>
+<td><strong>Open exercise</strong></td>
+<td style="text-align: right;">0.25</td>
+<td><code>kolibri_exercise</code></td>
+<td><a href="#student-completes-assigned-lesson">Student completes assigned lesson</a></td>
+</tr>
+<tr>
+<td><strong>Browse classes</strong></td>
+<td style="text-align: right;">0.20</td>
+<td><code>kolibri_home</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>Leave Kolibri</strong></td>
+<td style="text-align: right;">0.10</td>
+<td><code>console_learner</code></td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="state-kolibri_watching">State: <code>kolibri_watching</code></h3>
+<p>Capacity-sensitive state (reason 2 / idea#159). Many concurrent walkers here is what forces a second Kolibri instance. Planning N depends on video quality: <strong>64 @ 360p / 32 @ 480p–720p / 12 @ 1080p</strong> (idea01 Pi 5 / 4 GB).</p>
 <p><strong>UI while here:</strong> video playing in-browser (no download); student may pause/seek; Kolibri records progress in the background.</p>
-<p><strong>Scenario IDs:</strong> <code>K2</code> (playthrough), <code>K3</code> (N walkers dwell for stream ceiling).</p>
-<p><strong>From here:</strong></p>
-<ol>
-<li><strong>Keep watching</strong> (~0.60) <code>[K3]</code> → stay on <strong><code>kolibri_watching</code></strong>.</li>
-<li><strong>Next resource</strong> (~0.25) — leave player, open next lesson item (often exercise) → <a href="#kolibri_exercise--student-in-an-exercise"><code>kolibri_exercise</code></a>.</li>
-<li><strong>Exit lesson</strong> (~0.15) — back to class / Learn → <a href="#kolibri_home--learner-on-kolibri-learn"><code>kolibri_home</code></a>.</li>
-</ol>
-<h4 id="kolibri_exercise-student-in-an-exercise"><code>kolibri_exercise</code> — student in an exercise</h4>
+<p><strong>Actions from this state:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Keep watching</strong></td>
+<td style="text-align: right;">0.60</td>
+<td><code>kolibri_watching</code></td>
+<td><a href="#class-hits-stream-ceiling">Class hits stream ceiling</a></td>
+</tr>
+<tr>
+<td><strong>Next resource</strong></td>
+<td style="text-align: right;">0.25</td>
+<td><code>kolibri_exercise</code></td>
+<td><a href="#student-completes-assigned-lesson">Student completes assigned lesson</a></td>
+</tr>
+<tr>
+<td><strong>Exit lesson</strong></td>
+<td style="text-align: right;">0.15</td>
+<td><code>kolibri_home</code></td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="state-kolibri_exercise">State: <code>kolibri_exercise</code></h3>
 <p><strong>UI:</strong> exercise questions with immediate feedback; student answers and submits; Kolibri records started / completed / score.</p>
-<p><strong>Scenario IDs:</strong> <code>K2</code> (exercise half of lesson).</p>
-<p><strong>From here:</strong></p>
-<ol>
-<li><strong>Finish / exit</strong> (~0.70) → <a href="#kolibri_home--learner-on-kolibri-learn"><code>kolibri_home</code></a>.</li>
-<li><strong>Next video</strong> (~0.30) → <a href="#kolibri_watching--student-in-the-video-player"><code>kolibri_watching</code></a>.</li>
-</ol>
-<p><em>(Quiz-taking can reuse this node or stay inside <code>kolibri_home</code> → open </em><em>Quizzes</em><em> → </em><em>Start</em><em> → answer → submit; if quizzes become a distinct load profile later, split a <code>kolibri_quiz</code> node then. Mapped in scenario <code>K4</code> / <code>K-manage-quiz</code>.)</em></p>
-<h4 id="nc_browse-anyone-in-nextcloud-files"><code>nc_browse</code> — anyone in Nextcloud Files</h4>
+<p><strong>Actions from this state:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Finish exercise</strong></td>
+<td style="text-align: right;">0.70</td>
+<td><code>kolibri_home</code></td>
+<td><a href="#student-completes-assigned-lesson">Student completes assigned lesson</a></td>
+</tr>
+<tr>
+<td><strong>Next video</strong></td>
+<td style="text-align: right;">0.30</td>
+<td><code>kolibri_watching</code></td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p><em>(Quiz-taking can reuse this state or stay inside <code>kolibri_home</code> → open </em><em>Quizzes</em><em> → </em><em>Start</em><em> → answer → submit; if quizzes become a distinct load profile later, split a <code>kolibri_quiz</code> state then. Mapped in <a href="#quiz-and-reports">Quiz and reports</a>.)</em></p>
+<hr />
+<h3 id="state-nc_browse">State: <code>nc_browse</code></h3>
 <p>Hub for Marco’s classroom file workflow. <strong>Files</strong> app is the central UI (manual p.12 in Marco’s deck).</p>
 <p><strong>Entry UI:</strong></p>
 <ol>
-<li>Nextcloud login → username / password (teacher via <code>console_overview</code>, student via <code>L-entry</code> / <code>console_learner</code>).</li>
+<li>Nextcloud login → username / password (teacher via <code>console_teacher</code>, student via <code>console_learner</code>).</li>
 <li>Open <strong>Files</strong> (default home).</li>
 <li>Browse folders (class materials, Drop Zone, school shares).</li>
 </ol>
-<p><strong>Scenario IDs started from here:</strong> <code>NC-share</code>, <code>NC-drop</code>, <code>NC-collab</code> (and composite <code>NC1</code>).</p>
-<p><strong>From here:</strong></p>
-<ol>
-<li><strong>Share to class</strong> (teacher, ~0.18) <code>[NC-share]</code> → <a href="#nc_share--teacher-sharing-a-folder"><code>nc_share</code></a>.</li>
-<li><strong>File Drop</strong> (student on drop link, or teacher preparing drop, ~0.22) <code>[NC-drop]</code> → <a href="#nc_drop--file-drop-upload"><code>nc_drop</code></a>.</li>
-<li><strong>Open collab doc</strong> (~0.22) <code>[NC-collab]</code> → <a href="#nc_collab--live-document-editing"><code>nc_collab</code></a>.</li>
-<li><strong>Keep browsing</strong> (~0.15) → stay on <strong><code>nc_browse</code></strong>.</li>
-<li><strong>Leave as learner</strong> (~0.13) → <a href="#console_learner--student-opens-the-console"><code>console_learner</code></a>.</li>
-<li><strong>Leave as teacher</strong> (~0.10) → <a href="#console_overview--teacher--operator-opens-the-console"><code>console_overview</code></a>.</li>
-</ol>
-<h4 id="nc_share-teacher-sharing-a-folder"><code>nc_share</code> — teacher sharing a folder</h4>
-<p><strong>Matches table / scenario <code>NC-share</code> (view-only materials row of the Nextcloud classroom workflow).</strong></p>
+<p><strong>Actions from this state:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Share to class</strong></td>
+<td style="text-align: right;">0.18</td>
+<td><code>nc_share</code></td>
+<td><a href="#view-only-share-to-class-group">View-only share to class group</a></td>
+</tr>
+<tr>
+<td><strong>Open File Drop</strong></td>
+<td style="text-align: right;">0.22</td>
+<td><code>nc_drop</code></td>
+<td><a href="#file-drop-homework-upload">File Drop homework upload</a></td>
+</tr>
+<tr>
+<td><strong>Open collab doc</strong></td>
+<td style="text-align: right;">0.22</td>
+<td><code>nc_collab</code></td>
+<td><a href="#collaborative-document">Collaborative document</a></td>
+</tr>
+<tr>
+<td><strong>Browse folders</strong></td>
+<td style="text-align: right;">0.15</td>
+<td><code>nc_browse</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>Leave (learner)</strong></td>
+<td style="text-align: right;">0.13</td>
+<td><code>console_learner</code></td>
+<td>—</td>
+</tr>
+<tr>
+<td><strong>Leave (teacher)</strong></td>
+<td style="text-align: right;">0.10</td>
+<td><code>console_teacher</code></td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="state-nc_share">State: <code>nc_share</code></h3>
 <p><strong>UI script (view-only materials):</strong></p>
 <ol>
 <li>In Files, hover the folder (e.g. <code>Videos to watch</code>).</li>
@@ -459,303 +674,375 @@ Performance is optimized by adding Appdockers and redistributing the apps over t
 <li>Under <strong>Internal shares</strong>, type class group name (e.g. <code>Class2A</code> / <code>Grade 5A</code>) → select group.</li>
 <li>Set permission <strong>View only</strong>.</li>
 </ol>
-<p>Group must already exist (Accounts → Groups → <strong>+</strong> — see scenario <code>NC1</code> preload; that admin path can stay a preload step, not a graph node).</p>
-<p><strong>From here:</strong></p>
-<ol>
-<li><strong>Done sharing</strong> (~0.80) → <a href="#nc_browse--anyone-in-nextcloud-files"><code>nc_browse</code></a>.</li>
-<li><strong>Leave</strong> (~0.20) → <a href="#console_overview--teacher--operator-opens-the-console"><code>console_overview</code></a>.</li>
-</ol>
-<h4 id="nc_drop-file-drop-upload"><code>nc_drop</code> — File Drop upload</h4>
-<p><strong>Matches scenario <code>NC-drop</code>.</strong></p>
+<p>Group must already exist (Accounts → Groups → <strong>+</strong> — often a preload step, not a graph state).</p>
+<p><strong>Actions from this state:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Done sharing</strong></td>
+<td style="text-align: right;">0.80</td>
+<td><code>nc_browse</code></td>
+<td><a href="#view-only-share-to-class-group">View-only share to class group</a></td>
+</tr>
+<tr>
+<td><strong>Back to Console</strong></td>
+<td style="text-align: right;">0.20</td>
+<td><code>console_teacher</code></td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="state-nc_drop">State: <code>nc_drop</code></h3>
 <p><strong>Teacher prep (often preload, or expand inside a long <code>nc_browse</code> visit):</strong> Share icon on <code>Drop Zone</code> → <strong>+</strong> beside Create public link → <strong>File request</strong> → copy link (clipboard) → optionally paste into Talk.</p>
-<p><strong>Student UI (this node):</strong></p>
+<p><strong>Student UI (this state):</strong></p>
 <ol>
 <li>Open the File Drop / file-request link.</li>
 <li>See empty “Click or drop to upload” UI (cannot see others’ files).</li>
 <li>Choose file(s) / drop → upload completes.</li>
 </ol>
-<p><strong>From here:</strong></p>
-<ol>
-<li><strong>After upload</strong> (~0.85) → <a href="#nc_browse--anyone-in-nextcloud-files"><code>nc_browse</code></a> (or close link).</li>
-<li><strong>Leave</strong> (~0.15) → <a href="#console_learner--student-opens-the-console"><code>console_learner</code></a>.</li>
-</ol>
-<h4 id="nc_collab-live-document-editing"><code>nc_collab</code> — live document editing</h4>
-<p><strong>Matches scenario <code>NC-collab</code>.</strong></p>
+<p><strong>Actions from this state:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>After upload</strong></td>
+<td style="text-align: right;">0.85</td>
+<td><code>nc_browse</code></td>
+<td><a href="#file-drop-homework-upload">File Drop homework upload</a></td>
+</tr>
+<tr>
+<td><strong>Leave File Drop</strong></td>
+<td style="text-align: right;">0.15</td>
+<td><code>console_learner</code></td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="state-nc_collab">State: <code>nc_collab</code></h3>
 <p><strong>UI:</strong></p>
 <ol>
 <li>(Teacher create, often preload:) Files → <strong>+ New</strong> → <strong>New Document</strong> → name → pick template → Share with group → <strong>Allow editing</strong>.</li>
 <li>Student: open shared file from Files → editor loads; peer <strong>avatars</strong> top-right; cursors move live.</li>
 </ol>
-<p><strong>From here:</strong></p>
-<ol>
-<li><strong>Close doc</strong> (~0.70) → <a href="#nc_browse--anyone-in-nextcloud-files"><code>nc_browse</code></a>.</li>
-<li><strong>Keep editing</strong> (~0.30) → stay on <strong><code>nc_collab</code></strong>.</li>
-</ol>
-<h4 id="wiki_browse-kiwix-offline-wikipedia"><code>wiki_browse</code> — Kiwix / offline Wikipedia</h4>
-<p>Shared service on <strong>idea-A</strong> (school golden hub). Learners and teachers reach it from Console (<code>L-entry</code> / <code>W1</code> from <code>console_learner</code>, or <code>W1</code> from <code>console_overview</code>). Light load relative to Kolibri video — still a first-class classroom usage state.</p>
+<p><strong>Actions from this state:</strong></p>
+<table>
+<thead>
+<tr>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Close doc</strong></td>
+<td style="text-align: right;">0.70</td>
+<td><code>nc_browse</code></td>
+<td><a href="#collaborative-document">Collaborative document</a></td>
+</tr>
+<tr>
+<td><strong>Keep editing</strong></td>
+<td style="text-align: right;">0.30</td>
+<td><code>nc_collab</code></td>
+<td><a href="#collaborative-document">Collaborative document</a></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="state-wiki_browse">State: <code>wiki_browse</code></h3>
+<p>Shared service on <strong>idea-A</strong> (school golden hub). Learners and teachers reach it from Console. Light load relative to Kolibri video — still a first-class classroom usage state.</p>
 <p><strong>Entry UI:</strong></p>
 <ol>
 <li>From Console, click <strong>Kiwix</strong> / Wikipedia app (Running on idea-A).</li>
 <li>Kiwix library / Wikipedia ZIM opens in the browser.</li>
 <li>Use search box or browse categories / random article.</li>
 </ol>
-<p><strong>Scenario IDs:</strong> <code>W1</code>.</p>
-<p><strong>From here:</strong></p>
-<ol>
-<li><strong>Search / browse</strong> (~0.65) <code>[W1]</code> — type a query, open articles, follow links, dwell reading → stay on <strong><code>wiki_browse</code></strong>.</li>
-<li><strong>Leave as learner</strong> (~0.20) → <a href="#console_learner--student-opens-the-console"><code>console_learner</code></a>.</li>
-<li><strong>Leave as teacher</strong> (~0.15) → <a href="#console_overview--teacher--operator-opens-the-console"><code>console_overview</code></a>.</li>
-</ol>
-<hr />
-<h3 id="detailed-ui-scenarios-expand-nodes-into-clicks">Detailed UI scenarios (expand nodes into clicks)</h3>
-<p>These are <strong>test scripts</strong>, not extra Markov nodes. Each script names the Markov node(s) it expands and, where relevant, the matching table row. A walker that lands on <code>kolibri_manage</code> for “build lesson” runs <code>K-manage-lesson</code>; N concurrent <code>kolibri_watching</code> walkers are <code>K3</code> (capacity). Preload content so every click target exists.</p>
-<p><strong>Mapping summary</strong></p>
+<p><strong>Actions from this state:</strong></p>
 <table>
 <thead>
 <tr>
-<th>Scenario ID</th>
-<th>Markov node(s)</th>
-<th>Matches</th>
+<th>Action</th>
+<th style="text-align: right;">≈p</th>
+<th>Destination</th>
+<th>Test Scenario</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>L-entry</code></td>
-<td><code>console_learner</code> → <code>kolibri_home</code> / <code>nc_browse</code> / <code>wiki_browse</code></td>
-<td>Learner opens Console, picks an app</td>
+<td><strong>Search / browse</strong></td>
+<td style="text-align: right;">0.65</td>
+<td><code>wiki_browse</code></td>
+<td><a href="#browse-offline-wikipedia">Browse offline Wikipedia</a></td>
 </tr>
 <tr>
-<td><code>K-manage-class</code></td>
-<td><code>kolibri_manage</code></td>
-<td>Manage table: Create class</td>
+<td><strong>Leave (learner)</strong></td>
+<td style="text-align: right;">0.20</td>
+<td><code>console_learner</code></td>
+<td>—</td>
 </tr>
 <tr>
-<td><code>K-manage-enroll</code></td>
-<td><code>kolibri_manage</code></td>
-<td>Manage table: Enroll learners</td>
-</tr>
-<tr>
-<td><code>K-manage-lesson</code></td>
-<td><code>kolibri_manage</code></td>
-<td>Manage table: Build / enrich lesson</td>
-</tr>
-<tr>
-<td><code>K-manage-quiz</code></td>
-<td><code>kolibri_manage</code></td>
-<td>Manage table: Create quiz</td>
-</tr>
-<tr>
-<td><code>K-manage-reports</code></td>
-<td><code>kolibri_manage</code></td>
-<td>Manage table: Read progress</td>
-</tr>
-<tr>
-<td><code>K1</code></td>
-<td><code>console_overview</code> → <code>kolibri_manage</code> (chains class+enroll+lesson)</td>
-<td>Composite of three manage rows</td>
-</tr>
-<tr>
-<td><code>K2</code></td>
-<td><code>console_learner</code> → <code>kolibri_home</code> → <code>kolibri_watching</code> / <code>kolibri_exercise</code></td>
-<td>Student completes assigned lesson</td>
-</tr>
-<tr>
-<td><code>K3</code></td>
-<td>N× <code>kolibri_watching</code> dwell</td>
-<td>Stream ceiling / S4 / idea#159</td>
-</tr>
-<tr>
-<td><code>K4</code></td>
-<td><code>kolibri_manage</code> (<code>K-manage-quiz</code> + <code>K-manage-reports</code>) + learner quiz take</td>
-<td>Quiz + Reports</td>
-</tr>
-<tr>
-<td><code>NC-share</code></td>
-<td><code>nc_browse</code> → <code>nc_share</code></td>
-<td>View-only share to class group</td>
-</tr>
-<tr>
-<td><code>NC-drop</code></td>
-<td><code>nc_browse</code> → <code>nc_drop</code></td>
-<td>File Drop upload</td>
-</tr>
-<tr>
-<td><code>NC-collab</code></td>
-<td><code>nc_browse</code> → <code>nc_collab</code></td>
-<td>Collaborative doc edit</td>
-</tr>
-<tr>
-<td><code>NC1</code></td>
-<td><code>console_overview</code> → <code>nc_browse</code> + share/drop/collab</td>
-<td>Composite S10 teacher→students</td>
-</tr>
-<tr>
-<td><code>NC2</code></td>
-<td><code>console_overview</code> (idea-A) → class NC on idea-B</td>
-<td>Manage from other room / S7</td>
-</tr>
-<tr>
-<td><code>W1</code></td>
-<td><code>console_*</code> → <code>wiki_browse</code></td>
-<td>Open Kiwix, search/browse, leave</td>
-</tr>
-<tr>
-<td><code>C1</code></td>
-<td><code>console_overview</code> dwell / open-app</td>
-<td>Add Engine, app appears everywhere / S1</td>
+<td><strong>Leave (teacher)</strong></td>
+<td style="text-align: right;">0.15</td>
+<td><code>console_teacher</code></td>
+<td>—</td>
 </tr>
 </tbody>
 </table>
-<h4 id="scenario-l-entry-student-opens-console-and-starts-work">Scenario <code>L-entry</code> — Student opens Console and starts work</h4>
-<p><strong>Role:</strong> student · <strong>Engines:</strong> any Console; destination app may be on idea-A (Kiwix), idea-B (class Kolibri/Nextcloud), etc.<br />
-<strong>Markov:</strong> <code>*</code> → <code>console_learner</code> → (<code>kolibri_home</code> | <code>nc_browse</code> | <code>wiki_browse</code>).</p>
+<hr />
+<h3 id="initial-scenarios-markov-coverage">Initial scenarios ↔ Markov coverage</h3>
+<table>
+<thead>
+<tr>
+<th>Initial item</th>
+<th>In usage graph?</th>
+<th>States / actions</th>
+<th>Test Scenario(s)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>S1</strong> Add Engine, plug demanding app</td>
+<td><strong>Partial</strong> — usage asserts catalog equality; dock/install is operator</td>
+<td><code>console_teacher</code> / <code>console_learner</code> <strong>Stay on overview</strong>, <strong>Open *</strong></td>
+<td><a href="#add-engine-app-appears-everywhere">Add Engine app appears everywhere</a>; dock/install → operator graph</td>
+</tr>
+<tr>
+<td><strong>S2</strong> Redistribute load</td>
+<td><strong>Not in usage graph yet</strong> — copy/move is operator Console</td>
+<td>—</td>
+<td>Operator: Copy app / Move app (<a href="./multi-engine-operator.md"><code>multi-engine-operator.md</code></a>)</td>
+</tr>
+<tr>
+<td><strong>S3</strong> Invisible Engine identity</td>
+<td><strong>Yes</strong></td>
+<td><code>console_teacher</code>, <code>console_learner</code> + open-app actions from any Engine’s Console</td>
+<td><a href="#stay-on-teacher-overview">Stay on teacher overview</a>, <a href="#student-opens-console-and-starts-work">Student opens Console and starts work</a></td>
+</tr>
+<tr>
+<td><strong>S4</strong> Kolibri stream ceiling</td>
+<td><strong>Yes</strong> (usage dwell); second instance start is operator</td>
+<td><code>kolibri_watching</code> <strong>Keep watching</strong> (N walkers)</td>
+<td><a href="#class-hits-stream-ceiling">Class hits stream ceiling</a></td>
+</tr>
+<tr>
+<td><strong>S5</strong> Nextcloud media twin</td>
+<td><strong>Not in usage graph yet</strong> — no Nextcloud video-watching state; twin instance is operator</td>
+<td>—</td>
+<td>Aspirational until NC media dwell state is designed; operator install/start for second instance</td>
+</tr>
+<tr>
+<td><strong>S6</strong> Class-only content</td>
+<td><strong>Yes</strong> (placement story; same states, class Engines)</td>
+<td>Open Kolibri/Nextcloud/Wikipedia from Console toward class vs shared instances</td>
+<td><a href="#student-opens-console-and-starts-work">Student opens Console and starts work</a>, <a href="#browse-offline-wikipedia">Browse offline Wikipedia</a></td>
+</tr>
+<tr>
+<td><strong>S7</strong> Manage from the other room</td>
+<td><strong>Partial</strong> — teacher open-app from idea-A Console <strong>yes</strong>; operator start/stop/disk <strong>operator graph</strong></td>
+<td><code>console_teacher</code> <strong>Open Nextcloud</strong> / <strong>Open Kolibri</strong> while app runs on B/C</td>
+<td><a href="#manage-class-nextcloud-from-another-room">Manage class Nextcloud from another room</a>; operator start/stop elsewhere</td>
+</tr>
+<tr>
+<td><strong>S8</strong> Cross-class share</td>
+<td><strong>Yes</strong></td>
+<td><code>nc_browse</code> <strong>Share to class</strong> → <code>nc_share</code></td>
+<td><a href="#view-only-share-to-class-group">View-only share to class group</a></td>
+</tr>
+<tr>
+<td><strong>S9</strong> Kolibri teaching cycle</td>
+<td><strong>Yes</strong></td>
+<td><code>kolibri_manage</code> coaching actions + learner path</td>
+<td><a href="#create-class">Create class</a> … <a href="#read-reports">Read reports</a>, <a href="#student-completes-assigned-lesson">Student completes assigned lesson</a>, <a href="#quiz-and-reports">Quiz and reports</a></td>
+</tr>
+<tr>
+<td><strong>S10</strong> Nextcloud classroom workflow</td>
+<td><strong>Yes</strong> (Talk optional / light)</td>
+<td><code>nc_browse</code>, <code>nc_share</code>, <code>nc_drop</code>, <code>nc_collab</code></td>
+<td><a href="#view-only-share-to-class-group">View-only share…</a>, <a href="#file-drop-homework-upload">File Drop…</a>, <a href="#collaborative-document">Collaborative document</a>, <a href="#teacher-share-file-drop-and-collab">Teacher share File Drop and collab</a></td>
+</tr>
+<tr>
+<td><strong>S11</strong> Offline Wikipedia</td>
+<td><strong>Yes</strong></td>
+<td><code>wiki_browse</code> <strong>Search / browse</strong></td>
+<td><a href="#browse-offline-wikipedia">Browse offline Wikipedia</a></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="test-scenarios">Test Scenarios</h2>
+<p>These are <strong>test scripts</strong>, not extra Markov states. Each has a single consistent Intent-style name (no IDs like <code>L-entry</code> / <code>K-manage-class</code>). Describe what the scenario does. Markov actions link <strong>forward</strong> to these names; this chapter does <strong>not</strong> re-describe the Markov graph.</p>
+<p>Preload content so every click target exists.</p>
+<h3 id="student-opens-console-and-starts-work">Student opens Console and starts work</h3>
+<p><strong>Role:</strong> student · <strong>Engines:</strong> any Console; destination app may be on idea-A (Kiwix), idea-B (class Kolibri/Nextcloud), etc.</p>
 <ol>
 <li>Browser → Console on school LAN (idea-A / B / C — same catalog).</li>
 <li>Scan unified app list (Running apps).</li>
-<li>Click <strong>Kolibri</strong> → learner login → land on <code>kolibri_home</code> <em>(continue with <code>K2</code>)</em>, <strong>or</strong></li>
-<li>Click <strong>Nextcloud</strong> → student login → land on <code>nc_browse</code> <em>(continue with <code>NC-drop</code> / <code>NC-collab</code>)</em>, <strong>or</strong></li>
-<li>Click <strong>Kiwix / Wikipedia</strong> → land on <code>wiki_browse</code> <em>(continue with <code>W1</code>)</em>.</li>
+<li>Click <strong>Kolibri</strong> → learner login → land on Learn, <strong>or</strong></li>
+<li>Click <strong>Nextcloud</strong> → student login → land on Files, <strong>or</strong></li>
+<li>Click <strong>Kiwix / Wikipedia</strong> → land on Kiwix library.</li>
 </ol>
-<h4 id="scenario-k-manage-class-create-class">Scenario <code>K-manage-class</code> — Create class</h4>
-<p><strong>Role:</strong> teacher · <strong>Markov:</strong> <code>console_overview</code> → <code>kolibri_manage</code> (self-loop / visit).<br />
-<strong>Table row:</strong> Create class.</p>
+<h3 id="stay-on-teacher-overview">Stay on teacher overview</h3>
+<p><strong>Role:</strong> teacher · Dwell on school-wide Console overview; refresh while students work; assert catalog visible without opening an app.</p>
+<h3 id="stay-on-learner-overview">Stay on learner overview</h3>
+<p><strong>Role:</strong> student · Dwell on unified app list without opening an app yet.</p>
+<h3 id="open-kolibri-as-teacher">Open Kolibri as teacher</h3>
+<p><strong>Role:</strong> teacher</p>
 <ol>
-<li>Console → Open Kolibri (class instance on idea-B) → teacher login → <code>kolibri_manage</code>.</li>
-<li>Left sidebar <strong>Classes</strong> → <strong>+ New class</strong> → type name (e.g. <code>Grade 5A</code>) → <strong>Save</strong>.</li>
-<li>Stay on <code>kolibri_manage</code> or back to <code>console_overview</code>.</li>
+<li>From Console overview → click Kolibri (Running) → teacher login → facility / coaching UI.</li>
+<li>Ready for coaching actions (Create class, Enroll learners, …).</li>
 </ol>
-<h4 id="scenario-k-manage-enroll-enroll-learners">Scenario <code>K-manage-enroll</code> — Enroll learners</h4>
-<p><strong>Role:</strong> teacher · <strong>Markov:</strong> <code>kolibri_manage</code>.<br />
-<strong>Table row:</strong> Enroll learners. <em>Requires class (preload or <code>K-manage-class</code>).</em></p>
+<h3 id="open-nextcloud-as-teacher">Open Nextcloud as teacher</h3>
+<p><strong>Role:</strong> teacher</p>
+<ol>
+<li>From Console overview → click Nextcloud → teacher login → Files.</li>
+</ol>
+<h3 id="create-class">Create class</h3>
+<p><strong>Role:</strong> teacher</p>
+<ol>
+<li>In Kolibri coaching: left sidebar <strong>Classes</strong> → <strong>+ New class</strong> → type name (e.g. <code>Grade 5A</code>) → <strong>Save</strong>.</li>
+</ol>
+<h3 id="enroll-learners">Enroll learners</h3>
+<p><strong>Role:</strong> teacher · <em>Requires class (preload or Create class).</em></p>
 <ol>
 <li>Open class → <strong>Learners</strong> tab → <strong>Enroll learners</strong> → tick students → <strong>Confirm</strong>.</li>
-<li>Stay on <code>kolibri_manage</code> or leave to Console.</li>
 </ol>
-<h4 id="scenario-k-manage-lesson-build-lesson-assign">Scenario <code>K-manage-lesson</code> — Build lesson + assign</h4>
-<p><strong>Role:</strong> teacher · <strong>Markov:</strong> <code>kolibri_manage</code>.<br />
-<strong>Table row:</strong> Build / enrich lesson.</p>
+<h3 id="build-lesson">Build lesson</h3>
+<p><strong>Role:</strong> teacher</p>
 <ol>
 <li>Class → <strong>Lessons</strong> → <strong>+ New lesson</strong> (or open existing) → name (e.g. <code>Week 1: Fractions Introduction</code>).</li>
 <li><strong>Add resources</strong> → Library/Channels → select <strong>1 video</strong> + <strong>1 exercise</strong> → <strong>Save</strong>.</li>
 <li>Confirm <strong>Recipients</strong> = class → toggle lesson <strong>Visible</strong>.</li>
-<li>Stay on <code>kolibri_manage</code>, preview as learner → <code>kolibri_home</code>, or back to Console.</li>
 </ol>
-<h4 id="scenario-k-manage-quiz-new-quiz">Scenario <code>K-manage-quiz</code> — New quiz</h4>
-<p><strong>Role:</strong> teacher · <strong>Markov:</strong> <code>kolibri_manage</code>.<br />
-<strong>Table row:</strong> Create quiz.</p>
+<h3 id="create-quiz">Create quiz</h3>
+<p><strong>Role:</strong> teacher</p>
 <ol>
 <li>Class → <strong>Quizzes</strong> → <strong>+ New quiz</strong> → <strong>Add questions</strong> from exercise channel → set count (e.g. 5–10) → <strong>Finish</strong> → toggle <strong>Active</strong>.</li>
-<li>Stay on <code>kolibri_manage</code> (often followed by <code>K-manage-reports</code> after learners take it — see <code>K4</code>).</li>
 </ol>
-<h4 id="scenario-k-manage-reports-read-reports">Scenario <code>K-manage-reports</code> — Read Reports</h4>
-<p><strong>Role:</strong> teacher · <strong>Markov:</strong> <code>kolibri_manage</code>.<br />
-<strong>Table row:</strong> Read progress.</p>
+<h3 id="read-reports">Read reports</h3>
+<p><strong>Role:</strong> teacher</p>
 <ol>
 <li>Left sidebar <strong>Reports</strong> → <strong>Classes</strong> → class → <strong>Lessons</strong> or <strong>Quizzes</strong> → open item → scan learner table (scores / completion).</li>
-<li>Stay on <code>kolibri_manage</code> or back to <code>console_overview</code>.</li>
 </ol>
-<h4 id="scenario-k1-teacher-prepares-grade-5a-lesson-composite">Scenario <code>K1</code> — Teacher prepares Grade 5A lesson (composite)</h4>
+<h3 id="preview-as-learner">Preview as learner</h3>
+<p><strong>Role:</strong> teacher</p>
+<ol>
+<li>From coaching UI, open learner view / Learn (or sign in as a test learner).</li>
+<li>See assigned lessons as a student would.</li>
+</ol>
+<h3 id="teacher-prepares-grade-5a-lesson">Teacher prepares Grade 5A lesson</h3>
 <p><strong>Role:</strong> teacher · <strong>Engines:</strong> Console on idea-A or idea-B; Kolibri on idea-B.<br />
-<strong>Markov:</strong> <code>console_overview</code> → <code>kolibri_manage</code> (chains <strong><code>K-manage-class</code> → <code>K-manage-enroll</code> → <code>K-manage-lesson</code></strong>, optional <code>K-manage-reports</code>).</p>
+<strong>Composite:</strong> Create class → Enroll learners → Build lesson (optional Read reports).</p>
 <ol>
-<li>Console: open Kolibri for Grade 5A → transition <code>console_overview</code> → <code>kolibri_manage</code>.</li>
-<li>Run <code>K-manage-class</code> <em>(skip if class preloaded)</em>.</li>
-<li>Run <code>K-manage-enroll</code>.</li>
-<li>Run <code>K-manage-lesson</code> (video + exercise, Visible).</li>
-<li>Optional: <code>K-manage-reports</code> <em>(empty progress yet)</em>.</li>
-<li>Either stay (<code>kolibri_manage</code> self-loop) or <strong>preview as learner</strong> → <code>kolibri_home</code>, or back to Console.</li>
+<li>Open Kolibri as teacher for Grade 5A.</li>
+<li>Run Create class <em>(skip if class preloaded)</em>.</li>
+<li>Run Enroll learners.</li>
+<li>Run Build lesson (video + exercise, Visible).</li>
+<li>Optional: Read reports <em>(empty progress yet)</em>.</li>
+<li>Either stay coaching, Preview as learner, or Back to Console.</li>
 </ol>
-<h4 id="scenario-k2-student-completes-assigned-lesson">Scenario <code>K2</code> — Student completes assigned lesson</h4>
-<p><strong>Role:</strong> student · <strong>Engine:</strong> same Kolibri as teacher prep.<br />
-<strong>Markov:</strong> <code>console_learner</code> <code>[L-entry]</code> → <code>kolibri_home</code> → <code>kolibri_watching</code> / <code>kolibri_exercise</code>.</p>
+<h3 id="student-completes-assigned-lesson">Student completes assigned lesson</h3>
+<p><strong>Role:</strong> student · <strong>Engine:</strong> same Kolibri as teacher prep.</p>
 <ol>
-<li><code>L-entry</code>: Console → Open Kolibri → login learner credentials → <code>kolibri_home</code>.</li>
-<li><strong>Learn</strong> → open <code>Grade 5A</code> → open assigned lesson.</li>
-<li>Click video resource → <code>kolibri_watching</code> (play through or paced load-test equivalent).</li>
-<li>Click exercise resource → <code>kolibri_exercise</code> → answer items → submit.</li>
-<li>Return to Learn / class → <code>kolibri_home</code>, or leave to <code>console_learner</code>.</li>
+<li>Student opens Console and starts work → Open Kolibri → login learner → Learn.</li>
+<li>Open <code>Grade 5A</code> → open assigned lesson.</li>
+<li>Click video resource → play through (or paced load-test equivalent).</li>
+<li>Click exercise resource → answer items → submit.</li>
+<li>Return to Learn / class, or leave to Console.</li>
 </ol>
-<h4 id="scenario-k3-class-hits-stream-ceiling-reason-2-s4">Scenario <code>K3</code> — Class hits stream ceiling (reason 2 / S4)</h4>
+<h3 id="class-hits-stream-ceiling">Class hits stream ceiling</h3>
 <p><strong>Setup:</strong> lesson with a video pre-visible; idea#159 planning N by quality — <strong>64 @ 360p / 32 @ 480p–720p / 12 @ 1080p</strong> (idea01 Pi 5 / 4 GB).<br />
-<strong>Markov:</strong> N walkers dwell in <code>kolibri_watching</code> (still one node — concurrency is walker count).</p>
+<strong>Concurrency:</strong> N walkers dwell via <strong>Keep watching</strong> (still one state — concurrency is walker count).</p>
 <ol>
-<li>N student walkers each run <code>K2</code> steps 1–3 and <strong>dwell</strong> in <code>kolibri_watching</code>.</li>
-<li>If N &gt; planning N for that quality on idea-B’s Kolibri: start second Kolibri on idea-C; assign half the walkers to each instance (same lesson content shape).</li>
+<li>N student walkers each reach the video player and <strong>Keep watching</strong>.</li>
+<li>If N &gt; planning N for that quality on idea-B’s Kolibri: start second Kolibri on idea-C <em>(operator)</em>; assign half the walkers to each instance (same lesson content shape).</li>
 <li>Console on idea-A still lists both apps; teachers do not pick Engine by hostname (S3).</li>
 </ol>
-<h4 id="scenario-k4-quiz-reports">Scenario <code>K4</code> — Quiz + Reports</h4>
-<p><strong>Markov:</strong> <code>kolibri_manage</code> (<code>K-manage-quiz</code> + later <code>K-manage-reports</code>) + short learner visit on <code>kolibri_home</code> / exercise-like load.</p>
+<h3 id="quiz-and-reports">Quiz and reports</h3>
 <ol>
-<li>Teacher: run <code>K-manage-quiz</code> (Active).</li>
-<li>Students (<code>kolibri_home</code> via <code>L-entry</code>): class → <strong>Quizzes</strong> → <strong>Start</strong> → answer → submit <em>(treat as exercise-like load or keep under home until a quiz node is justified)</em>.</li>
-<li>Teacher: run <code>K-manage-reports</code> on that quiz → read scores / drill into a learner.</li>
+<li>Teacher: Create quiz (Active).</li>
+<li>Students: class → <strong>Quizzes</strong> → <strong>Start</strong> → answer → submit <em>(exercise-like load or under home until a quiz state is justified)</em>.</li>
+<li>Teacher: Read reports on that quiz → read scores / drill into a learner.</li>
 </ol>
-<h4 id="scenario-nc-share-view-only-share-to-class-group">Scenario <code>NC-share</code> — View-only share to class group</h4>
-<p><strong>Role:</strong> teacher · <strong>Markov:</strong> <code>nc_browse</code> → <code>nc_share</code> → <code>nc_browse</code>.<br />
-<strong>Matches:</strong> Nextcloud classroom “share materials view-only” row.</p>
+<h3 id="view-only-share-to-class-group">View-only share to class group</h3>
+<p><strong>Role:</strong> teacher</p>
 <ol>
 <li>In Files, hover folder (e.g. <code>Videos to watch</code>) → <strong>Share</strong>.</li>
 <li>Internal share to class group (e.g. <code>Grade 5A</code>) → permission <strong>View only</strong>.</li>
-<li>Done → back to <code>nc_browse</code> (or leave to <code>console_overview</code>).</li>
+<li>Done → back to Files browse (or leave to Console).</li>
 </ol>
-<h4 id="scenario-nc-drop-file-drop-homework-upload">Scenario <code>NC-drop</code> — File Drop homework upload</h4>
-<p><strong>Role:</strong> student (teacher prep optional) · <strong>Markov:</strong> <code>nc_browse</code> → <code>nc_drop</code> → <code>nc_browse</code> / <code>console_learner</code>.<br />
-<strong>Matches:</strong> File Drop / file-request row.</p>
+<h3 id="file-drop-homework-upload">File Drop homework upload</h3>
+<p><strong>Role:</strong> student (teacher prep optional)</p>
 <ol>
 <li><em>(Teacher prep / preload:)</em> <code>Drop Zone</code> → Share → public link <strong>+</strong> → <strong>File request</strong> → copy link.</li>
-<li>Student: open File Drop link → upload file(s) → <code>nc_drop</code>.</li>
-<li>After upload → <code>nc_browse</code> or leave to <code>console_learner</code>.</li>
+<li>Student: open File Drop link → upload file(s).</li>
+<li>After upload → Files browse or leave to Console.</li>
 </ol>
-<h4 id="scenario-nc-collab-collaborative-document">Scenario <code>NC-collab</code> — Collaborative document</h4>
-<p><strong>Role:</strong> student (teacher create often preload) · <strong>Markov:</strong> <code>nc_browse</code> → <code>nc_collab</code>.<br />
-<strong>Matches:</strong> collaborative doc row.</p>
+<h3 id="collaborative-document">Collaborative document</h3>
+<p><strong>Role:</strong> student (teacher create often preload)</p>
 <ol>
 <li><em>(Teacher create / preload:)</em> <strong>+ New</strong> → <strong>New Document</strong> → share group with <strong>Allow editing</strong>.</li>
-<li>Student: open shared file from Files → edit live (<code>nc_collab</code>) → close → <code>nc_browse</code>.</li>
+<li>Student: open shared file from Files → edit live → close → Files browse.</li>
 </ol>
-<h4 id="scenario-nc1-teacher-share-file-drop-collab-s10-composite">Scenario <code>NC1</code> — Teacher share + File Drop + collab (S10 composite)</h4>
+<h3 id="teacher-share-file-drop-and-collab">Teacher share File Drop and collab</h3>
 <p><strong>Role:</strong> teacher then students · <strong>Engine:</strong> class Nextcloud on idea-B.<br />
-<strong>Markov:</strong> <code>console_overview</code> → <code>nc_browse</code> + <code>NC-share</code> / <code>NC-drop</code> / <code>NC-collab</code>.</p>
+<strong>Composite</strong> for S10.</p>
 <ol>
-<li>Console → Open Nextcloud → <code>nc_browse</code> (teacher login).</li>
+<li>Open Nextcloud as teacher → Files.</li>
 <li><em>(Preload or once)</em> Profile → <strong>Accounts</strong> → Groups <strong>+</strong> → <code>Grade 5A</code>; <strong>+ New account</strong> students into that group.</li>
-<li>Run <code>NC-share</code> on <code>Videos to watch</code>.</li>
-<li>Prepare File Drop on <code>Drop Zone</code> <em>(Talk optional: top menu Talk → + conversation → share link)</em>.</li>
+<li>View-only share on <code>Videos to watch</code>.</li>
+<li>Prepare File Drop on <code>Drop Zone</code> <em>(Talk optional)</em>.</li>
 <li>Create collab doc + share with editing.</li>
-<li>Students via <code>L-entry</code>: open shared folder (<code>nc_browse</code>); run <code>NC-drop</code>; run <code>NC-collab</code>.</li>
+<li>Students: open shared folder; File Drop homework upload; Collaborative document.</li>
 </ol>
-<h4 id="scenario-nc2-manage-class-nextcloud-from-another-room-s7">Scenario <code>NC2</code> — Manage class Nextcloud from another room (S7)</h4>
-<p><strong>Markov:</strong> <code>console_overview</code> on idea-A while class NC runs on idea-B.</p>
+<h3 id="manage-class-nextcloud-from-another-room">Manage class Nextcloud from another room</h3>
+<p><strong>Asserts reason 3 / S7 (teacher side).</strong></p>
 <ol>
-<li>Teacher opens <strong>Console on idea-A</strong> (<code>console_overview</code>) while Grade 5A Nextcloud runs on idea-B.</li>
-<li>Open that Nextcloud from the integrated list → same <code>NC1</code> / <code>NC-share</code> steps.</li>
-<li>Assert: management works without walking to idea-B’s physical Console (reason 3).</li>
+<li>Teacher opens <strong>Console on idea-A</strong> while Grade 5A Nextcloud runs on idea-B.</li>
+<li>Open that Nextcloud from the integrated list → same share / Files steps.</li>
+<li>Assert: management works without walking to idea-B’s physical Console.</li>
 </ol>
-<h4 id="scenario-w1-browse-offline-wikipedia-kiwix-on-idea-a">Scenario <code>W1</code> — Browse offline Wikipedia (Kiwix on idea-A)</h4>
-<p><strong>Role:</strong> learner or teacher · <strong>Engine:</strong> Kiwix on idea-A.<br />
-<strong>Markov:</strong> <code>console_learner</code> or <code>console_overview</code> → <code>wiki_browse</code> (self-loop) → leave to matching Console.</p>
+<h3 id="browse-offline-wikipedia">Browse offline Wikipedia</h3>
+<p><strong>Role:</strong> learner or teacher · <strong>Engine:</strong> Kiwix on idea-A.</p>
 <ol>
-<li>Console → Open <strong>Kiwix / Wikipedia</strong> → <code>wiki_browse</code>.</li>
-<li>Search box: type a topic (e.g. class-related keyword) → open an article.</li>
-<li>Follow internal links / browse categories; dwell reading (self-loop).</li>
-<li>Leave → <code>console_learner</code> (student) or <code>console_overview</code> (teacher).</li>
+<li>Console → Open <strong>Kiwix / Wikipedia</strong>.</li>
+<li>Search box: type a topic → open an article.</li>
+<li>Follow internal links / browse categories; dwell reading.</li>
+<li>Leave → matching Console (learner or teacher).</li>
 </ol>
-<h4 id="scenario-c1-add-engine-app-appears-everywhere-s1">Scenario <code>C1</code> — Add Engine, app appears everywhere (S1)</h4>
+<h3 id="add-engine-app-appears-everywhere">Add Engine app appears everywhere</h3>
 <ol>
-<li>Operator on idea-A Console: note app list. <em>(Operator dock/start actions are </em><em>not</em><em> modelled in this usage graph — see <a href="./multi-engine-operator.md"><code>multi-engine-operator.md</code></a> scenarios <code>O4</code> / <code>O9</code> / <code>O6</code>.)</em></li>
-<li>idea-C comes online with a docked Kolibri/Nextcloud (hardware/Ops outside Markov).</li>
+<li>Operator on idea-A Console: note app list. <em>(Operator dock/start actions are </em><em>not</em><em> modelled in this usage graph — see <a href="./multi-engine-operator.md"><code>multi-engine-operator.md</code></a>.)</em></li>
+<li>idea-C comes online with a docked Kolibri/Nextcloud (hardware/Ops outside this graph).</li>
 <li>Refresh Console on idea-A <strong>and</strong> idea-B <strong>and</strong> a learner Console view: new app row present → Open works → enters <code>kolibri_manage</code> / <code>kolibri_home</code> / <code>nc_browse</code> as usual.</li>
-<li>No new Markov nodes — still <code>console_overview</code> / <code>console_learner</code> dwell / open-app transitions; assertion is catalog equality across Consoles.</li>
+<li>Assertion is catalog equality across Consoles (S1 usage side).</li>
 </ol>
 <h3 id="how-a-walk-becomes-a-test">How a walk becomes a test</h3>
 <ol>
 <li>Preload Kolibri with a class, enrolled learners, and a lesson that includes at least one video and one exercise (Marco Week 1–2 content shape).</li>
 <li>Preload Nextcloud with class groups, a view-only materials folder, a File Drop folder, and one collaborative document (Marco classroom-use shape).</li>
 <li>Preload / confirm Kiwix ZIM available on idea-A.</li>
-<li>Sample a walk: e.g. <code>console_learner → kolibri_home → … → kolibri_watching</code> (N concurrent walkers = N “students” hitting video — bounded by idea#159 quality table), or <code>console_overview → kolibri_manage</code> for coaching scripts.</li>
+<li>Sample a walk: e.g. <code>console_learner → kolibri_home → … → kolibri_watching</code> (N concurrent walkers = N “students” hitting video — bounded by idea#159 quality table), or <code>console_teacher → kolibri_manage</code> for coaching scripts.</li>
 <li>Multi-Engine walks assign walkers to instances on idea-B vs idea-C when testing reason 2; Console actions may start on any Engine’s Console (reason 3).</li>
 </ol>
-<p>Full YAML / runner design stays with the existing Markov duration-tests proposal (<code>agent-engine-dev/proposals/duration-tests.md</code>, idea#85) when implementation starts — not here.</p>
+<p>Full YAML / runner design stays with the existing Markov duration-tests proposal (<a href="./duration-tests.md"><code>duration-tests.md</code></a>, idea#85) when implementation starts — not here.</p>
 <hr />
 <h2 id="sources-consulted">Sources consulted</h2>
 <table>
@@ -771,7 +1058,7 @@ Performance is optimized by adding Appdockers and redistributing the apps over t
 <td>Vision: autofind Appdockers; add Appdockers + redistribute apps for performance</td>
 </tr>
 <tr>
-<td><code>/workspace/proposals/multi-engine-classroom-scenarios.md</code> (+ <code>.pdf</code>)</td>
+<td><a href="./multi-engine-classroom-scenarios.md"><code>multi-engine-classroom-scenarios.md</code></a> (+ <code>.pdf</code>)</td>
 <td>Prior draft — <strong>superseded</strong> (implementation-heavy; incorrectly framed multi-Engine as undocumented)</td>
 </tr>
 <tr>
@@ -783,7 +1070,7 @@ Performance is optimized by adding Appdockers and redistributing the apps over t
 <td>Many devices → performance drop; limit one group at a time</td>
 </tr>
 <tr>
-<td><code>agent-engine-dev/proposals/duration-tests.md</code></td>
+<td><a href="./duration-tests.md"><code>duration-tests.md</code></a></td>
 <td>Existing Markov duration-test design (implementation later)</td>
 </tr>
 <tr>
@@ -804,13 +1091,13 @@ Performance is optimized by adding Appdockers and redistributing the apps over t
 <li>PDF/print packaging of field guides</li>
 <li>~~<strong>Operator Console Markov graph</strong>~~ — <strong>done as sibling:</strong> <a href="./multi-engine-operator.md"><code>multi-engine-operator.md</code></a> + <code>multi-engine-operator-markov.*</code> (kept separate from this usage graph)</li>
 </ul>
-<p>When Koen agrees the conceptual shape, Steve can split follow-ups (Engine / Console / App Dev / Ops) without baking premature design into this doc.</p>
+<p>When Koen agrees the shape, Steve can split follow-ups (Engine / Console / App Dev / Ops) without baking premature design into this doc.</p>
 <hr />
 <h2 id="ask-of-koen">Ask of Koen</h2>
 <ol>
 <li>Confirm the <strong>three reasons</strong> match intent.  </li>
 <li>Confirm <strong>idea-A / idea-B / idea-C</strong> as the named 3-Engine story (or rename).  </li>
-<li>Confirm <strong>learner Console</strong> (<code>console_learner</code>) + <strong>Wikipedia</strong> (<code>wiki_browse</code>) + <strong><code>K-manage-*</code> ↔ manage table</strong> wiring.  </li>
+<li>Confirm <strong><code>console_teacher</code></strong> + <strong><code>console_learner</code></strong> + <strong><code>wiki_browse</code></strong> and coaching actions only inside <strong><code>kolibri_manage</code></strong>.  </li>
 <li>Prioritise which of S1–S11 to deepen next; review the separate Operator Console Markov (<a href="./multi-engine-operator.md"><code>multi-engine-operator.md</code></a>).  </li>
 <li>Treat idea#159 quality table (64/32/32/12) as the capacity gate for reason-2 scenarios.</li>
 </ol>

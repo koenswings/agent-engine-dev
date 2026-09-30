@@ -1,0 +1,67 @@
+digraph MultiEngineOperatorDisk {
+  rankdir=TB;
+  bgcolor="white";
+  pad="0.4";
+  nodesep="0.40";
+  ranksep="0.55";
+  fontname="Helvetica";
+  splines=true;
+  overlap=false;
+  size="11,9!";
+  ratio=fill;
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=12, width=1.50, height=0.52, margin="0.10,0.08"];
+  edge [fontname="Helvetica", fontsize=9, color="#555555"];
+
+  op_overview [label="op_overview\n(hub)", fillcolor="#85C1E9"];
+  op_disk     [label="op_disk\n(disk inventory)", fillcolor="#FCF3CF"];
+  op_install  [label="op_install", fillcolor="#ABEBC6"];
+  op_files    [label="op_files", fillcolor="#D7BDE2"];
+  op_backup   [label="op_backup", fillcolor="#D5F5E3"];
+  op_erase    [label="op_erase", fillcolor="#F5B7B1"];
+  op_eject    [label="op_eject", fillcolor="#F5B7B1"];
+  op_instance [label="op_instance", fillcolor="#AED6F1"];
+  op_copy_move [label="op_copy_move", fillcolor="#F9E79F"];
+
+  op_overview -> op_disk [label="Open disk inventory"];
+
+  op_disk -> op_install   [label="Install App 0.18"];
+  op_disk -> op_files     [label="Make Files Disk 0.08"];
+  op_disk -> op_files     [label="Add Files role 0.06"];
+  op_disk -> op_backup    [label="Make Backup Disk 0.08"];
+  op_disk -> op_backup    [label="Restore from Backup 0.06"];
+  op_disk -> op_instance  [label="Open instance controls 0.18"];
+  op_disk -> op_copy_move [label="Copy app 0.05"];
+  op_disk -> op_copy_move [label="Move app 0.05"];
+  op_disk -> op_erase     [label="Erase disk 0.08"];
+  op_disk -> op_eject     [label="Eject disk 0.08"];
+  op_disk -> op_overview  [label="Back to overview 0.10"];
+
+  op_eject -> op_overview [label="Confirm eject 0.70"];
+  op_eject -> op_overview [label="Cancel eject 0.30"];
+
+  op_erase -> op_disk     [label="Confirm erase 0.70"];
+  op_erase -> op_overview [label="Cancel erase 0.30"];
+
+  op_files -> op_disk     [label="Files role added 0.80"];
+  op_files -> op_overview [label="Back to overview 0.20"];
+
+  op_backup -> op_disk     [label="Backup configured /\nrestored 0.75"];
+  op_backup -> op_overview [label="Back to overview 0.25"];
+
+  op_install -> op_instance [label="Start after install 0.55"];
+  op_install -> op_disk     [label="Stay on disk 0.30"];
+  op_install -> op_overview [label="Back to overview 0.15"];
+
+  op_instance -> op_instance  [label="Start instance 0.15"];
+  op_instance -> op_instance  [label="Stop instance 0.12"];
+  op_instance -> op_instance  [label="Open app 0.10"];
+  op_instance -> op_instance  [label="Backup instance 0.08"];
+  op_instance -> op_copy_move [label="Copy app 0.10"];
+  op_instance -> op_copy_move [label="Move app 0.10"];
+  op_instance -> op_disk      [label="Back to disk 0.20"];
+  op_instance -> op_overview  [label="Back to overview 0.15"];
+
+  op_copy_move -> op_overview [label="Done redistribute 0.55"];
+  op_copy_move -> op_disk     [label="Stay on source disk 0.30"];
+  op_copy_move -> op_instance [label="Open copied instance 0.15"];
+}

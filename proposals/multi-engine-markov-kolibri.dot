@@ -1,0 +1,66 @@
+digraph MultiEngineMarkovKolibri {
+  rankdir=TB;
+  bgcolor="white";
+  pad="0.4";
+  nodesep="0.45";
+  ranksep="0.65";
+  fontname="Helvetica";
+  splines=true;
+  overlap=false;
+  size="11,8!";
+  ratio=fill;
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=12, width=1.55, height=0.55, margin="0.10,0.08"];
+  edge [fontname="Helvetica", fontsize=9, color="#555555"];
+
+  start [label="start", shape=circle, width=0.45, height=0.45, fixedsize=true, fillcolor="#eeeeee", style=filled, fontsize=10];
+
+  subgraph cluster_console {
+    label="Console";
+    fontsize=13;
+    style=rounded;
+    color="#5DADE2";
+    console_teacher [label="console_teacher\n(teacher)", fillcolor="#D6EAF8"];
+    console_learner  [label="console_learner\n(student)", fillcolor="#85C1E9"];
+  }
+
+  subgraph cluster_kolibri {
+    label="Kolibri";
+    fontsize=13;
+    style=rounded;
+    color="#58D68D";
+    kolibri_home     [label="kolibri_home", fillcolor="#D5F5E3"];
+    kolibri_watching [label="kolibri_watching", fillcolor="#D5F5E3"];
+    kolibri_exercise [label="kolibri_exercise", fillcolor="#D5F5E3"];
+    kolibri_manage   [label="kolibri_manage\n(teacher)", fillcolor="#ABEBC6"];
+  }
+
+  start -> console_teacher [label="Open Console as teacher"];
+  start -> console_learner  [label="Open Console as learner"];
+
+  console_teacher -> kolibri_manage  [label="Open Kolibri 0.20"];
+  console_teacher -> console_teacher [label="Stay on overview 0.50"];
+  // open Nextcloud/Wikipedia exist but shown on files diagram
+
+  console_learner -> kolibri_home    [label="Open Kolibri 0.40"];
+  console_learner -> console_learner [label="Stay on overview 0.15"];
+
+  kolibri_manage -> kolibri_manage  [label="Create class 0.12"];
+  kolibri_manage -> kolibri_manage  [label="Enroll learners 0.12"];
+  kolibri_manage -> kolibri_manage  [label="Build lesson 0.14"];
+  kolibri_manage -> kolibri_manage  [label="Create quiz 0.09"];
+  kolibri_manage -> kolibri_manage  [label="Read reports 0.08"];
+  kolibri_manage -> kolibri_home    [label="Preview as learner 0.20"];
+  kolibri_manage -> console_teacher [label="Back to Console 0.25"];
+
+  kolibri_home -> kolibri_watching [label="Open video 0.45"];
+  kolibri_home -> kolibri_exercise [label="Open exercise 0.25"];
+  kolibri_home -> kolibri_home     [label="Browse classes 0.20"];
+  kolibri_home -> console_learner  [label="Leave Kolibri 0.10"];
+
+  kolibri_watching -> kolibri_watching [label="Keep watching 0.60"];
+  kolibri_watching -> kolibri_exercise [label="Next resource 0.25"];
+  kolibri_watching -> kolibri_home     [label="Exit lesson 0.15"];
+
+  kolibri_exercise -> kolibri_home     [label="Finish exercise 0.70"];
+  kolibri_exercise -> kolibri_watching [label="Next video 0.30"];
+}

@@ -1,0 +1,75 @@
+digraph MultiEngineMarkovFiles {
+  rankdir=TB;
+  bgcolor="white";
+  pad="0.4";
+  nodesep="0.45";
+  ranksep="0.65";
+  fontname="Helvetica";
+  splines=true;
+  overlap=false;
+  size="11,8!";
+  ratio=fill;
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=12, width=1.55, height=0.55, margin="0.10,0.08"];
+  edge [fontname="Helvetica", fontsize=9, color="#555555"];
+
+  start [label="start", shape=circle, width=0.45, height=0.45, fixedsize=true, fillcolor="#eeeeee", style=filled, fontsize=10];
+
+  subgraph cluster_console {
+    label="Console";
+    fontsize=13;
+    style=rounded;
+    color="#5DADE2";
+    console_teacher [label="console_teacher\n(teacher)", fillcolor="#D6EAF8"];
+    console_learner  [label="console_learner\n(student)", fillcolor="#85C1E9"];
+  }
+
+  subgraph cluster_nextcloud {
+    label="Nextcloud";
+    fontsize=13;
+    style=rounded;
+    color="#F4D03F";
+    nc_browse [label="nc_browse", fillcolor="#FCF3CF"];
+    nc_share  [label="nc_share\n(teacher)", fillcolor="#F9E79F"];
+    nc_drop   [label="nc_drop\n(student)", fillcolor="#F9E79F"];
+    nc_collab [label="nc_collab", fillcolor="#F9E79F"];
+  }
+
+  subgraph cluster_wiki {
+    label="Wikipedia / Kiwix";
+    fontsize=13;
+    style=rounded;
+    color="#AF7AC5";
+    wiki_browse [label="wiki_browse", fillcolor="#E8DAEF"];
+  }
+
+  start -> console_teacher [label="Open Console as teacher"];
+  start -> console_learner  [label="Open Console as learner"];
+
+  console_teacher -> nc_browse       [label="Open Nextcloud 0.20"];
+  console_teacher -> wiki_browse     [label="Open Wikipedia 0.10"];
+  console_teacher -> console_teacher [label="Stay on overview 0.50"];
+
+  console_learner -> nc_browse       [label="Open Nextcloud 0.25"];
+  console_learner -> wiki_browse     [label="Open Wikipedia 0.20"];
+  console_learner -> console_learner [label="Stay on overview 0.15"];
+
+  nc_browse -> nc_share        [label="Share to class 0.18"];
+  nc_browse -> nc_drop         [label="Open File Drop 0.22"];
+  nc_browse -> nc_collab       [label="Open collab doc 0.22"];
+  nc_browse -> nc_browse       [label="Browse folders 0.15"];
+  nc_browse -> console_learner [label="Leave (learner) 0.13"];
+  nc_browse -> console_teacher [label="Leave (teacher) 0.10"];
+
+  nc_share -> nc_browse       [label="Done sharing 0.80"];
+  nc_share -> console_teacher [label="Back to Console 0.20"];
+
+  nc_drop -> nc_browse       [label="After upload 0.85"];
+  nc_drop -> console_learner [label="Leave File Drop 0.15"];
+
+  nc_collab -> nc_browse [label="Close doc 0.70"];
+  nc_collab -> nc_collab [label="Keep editing 0.30"];
+
+  wiki_browse -> wiki_browse     [label="Search / browse 0.65"];
+  wiki_browse -> console_learner [label="Leave (learner) 0.20"];
+  wiki_browse -> console_teacher [label="Leave (teacher) 0.15"];
+}
