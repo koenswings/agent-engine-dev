@@ -38,7 +38,8 @@
     "test:hw": "npx tsx script/hw-roundtrip.ts",
     "bundle-context": "tsx script/bundle-context.ts",
     "dump-store": "npx tsx script/dump-store.ts",
-    "cleanup-store": "npx tsx script/cleanup-store.ts"
+    "cleanup-store": "npx tsx script/cleanup-store.ts",
+    "test:duration": "npx tsx test/duration/cli.ts"
   },
   "keywords": [],
   "author": "Koen Swings",

@@ -1,0 +1,117 @@
+# CI / box gate — 2 pool engines, infra-focused, no golden.
+# Action keys: locked contract (idea#166 / ACTIONS.md).
+name: Minimal infra CI gate
+duration_minutes: 10
+seed: 42
+exclude_engines: [idea02]
+pool_engines: [idea01, idea03]
+store_mode: shared
+fixture_disk: duration-fixture-app
+
+states:
+  start:
+    description: Neutral hub — sample layer entry
+    transitions:
+      - to: infra_idle
+        weight: 70
+        action: enter_infra_fleet_walk
+      - to: console_learner
+        weight: 15
+        action: open_console_as_learner
+      - to: op_entry
+        weight: 15
+        action: open_console_as_operator
+
+  console_learner:
+    layer: usage
+    transitions:
+      - to: start
+        weight: 1
+        action: return_to_start
+
+  op_entry:
+    layer: operator
+    transitions:
+      - to: start
+        weight: 1
+        action: return_to_start
+
+  infra_idle:
+    layer: infra
+    description: Pool engines up; fixture disks undocked
+    transitions:
+      - to: infra_docked
+        weight: 40
+        action: infra_dock_fixture
+      - to: infra_reboot
+        weight: 5
+        action: infra_reboot_engine
+      - to: infra_idle
+        weight: 50
+        action: infra_undock_fixtures
+      - to: start
+        weight: 5
+        action: return_to_start
+    invariants:
+      - type: golden_untouched
+
+  infra_docked:
+    layer: infra
+    description: Fixture disk docked on a pool engine
+    transitions:
+      - to: infra_idle
+        weight: 20
+        action: infra_undock_fixtures
+      - to: infra_disk_moved
+        weight: 10
+        action: infra_move_disk
+      - to: infra_docked
+        weight: 60
+        action: infra_dock_fixture
+      - to: infra_reboot
+        weight: 5
+        action: infra_reboot_engine
+      - to: start
+        weight: 5
+        action: return_to_start
+    invariants:
+      - type: disk_docked
+        disk: duration-fixture-app
+        engine: any_pool
+
+  infra_disk_moved:
+    layer: infra
+    description: Disk moved to a different pool engine
+    transitions:
+      - to: infra_docked
+        weight: 50
+        action: infra_dock_fixture
+      - to: infra_idle
+        weight: 25
+        action: infra_undock_fixtures
+      - to: infra_reboot
+        weight: 20
+        action: infra_reboot_engine
+      - to: start
+        weight: 5
+        action: return_to_start
+    invariants:
+      - type: disk_docked
+        disk: duration-fixture-app
+        engine: any_pool
+
+  infra_reboot:
+    layer: infra
+    description: One non-golden pool engine reboots / pm2 restarts (--fast)
+    transitions:
+      - to: infra_idle
+        weight: 55
+        action: infra_undock_fixtures
+      - to: infra_docked
+        weight: 40
+        action: infra_dock_fixture
+      - to: start
+        weight: 5
+        action: return_to_start
+
+initial_state: start

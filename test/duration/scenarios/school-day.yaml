@@ -1,0 +1,207 @@
+# Typical school day stub — mixes usage / operator / infra from start.
+# Deeper usage/operator Intents are stubbed in Phase 1–2 (Pixel wires Playwright later).
+name: Typical school day
+duration_minutes: 480
+seed: 7
+exclude_engines: [idea02]
+pool_engines: [idea01, idea03, idea04]
+store_mode: shared
+fixture_disk: duration-fixture-app
+
+states:
+  start:
+    description: Neutral hub — sample layer entry
+    transitions:
+      - to: console_teacher
+        weight: 25
+        action: open_console_as_teacher
+      - to: console_learner
+        weight: 35
+        action: open_console_as_learner
+      - to: op_entry
+        weight: 25
+        action: open_console_as_operator
+      - to: infra_idle
+        weight: 15
+        action: enter_infra_fleet_walk
+
+  console_teacher:
+    layer: usage
+    transitions:
+      - to: kolibri_manage
+        weight: 40
+        action: open_kolibri_as_teacher
+      - to: console_teacher
+        weight: 55
+        action: stay_on_teacher_overview
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  console_learner:
+    layer: usage
+    transitions:
+      - to: kolibri_home
+        weight: 40
+        action: open_kolibri_as_learner
+      - to: nc_browse
+        weight: 25
+        action: open_nextcloud_as_learner
+      - to: console_learner
+        weight: 30
+        action: stay_on_learner_overview
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  kolibri_manage:
+    layer: usage
+    transitions:
+      - to: console_teacher
+        weight: 50
+        action: stay_on_teacher_overview
+      - to: start
+        weight: 5
+        action: return_to_start
+      - to: kolibri_manage
+        weight: 45
+        action: open_kolibri_as_teacher
+
+  kolibri_home:
+    layer: usage
+    transitions:
+      - to: kolibri_watching
+        weight: 50
+        action: keep_watching
+      - to: console_learner
+        weight: 45
+        action: stay_on_learner_overview
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  kolibri_watching:
+    layer: usage
+    transitions:
+      - to: kolibri_watching
+        weight: 60
+        action: keep_watching
+      - to: kolibri_home
+        weight: 35
+        action: exit_lesson
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  nc_browse:
+    layer: usage
+    transitions:
+      - to: console_learner
+        weight: 95
+        action: stay_on_learner_overview
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  op_entry:
+    layer: operator
+    transitions:
+      - to: op_overview
+        weight: 95
+        action: stay_on_overview
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  op_overview:
+    layer: operator
+    transitions:
+      - to: op_disk
+        weight: 28
+        action: open_disk_inventory
+      - to: op_overview
+        weight: 67
+        action: stay_on_overview
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  op_disk:
+    layer: operator
+    transitions:
+      - to: op_overview
+        weight: 95
+        action: stay_on_overview
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  infra_idle:
+    layer: infra
+    transitions:
+      - to: infra_docked
+        weight: 40
+        action: infra_dock_fixture
+      - to: infra_reboot
+        weight: 5
+        action: infra_reboot_engine
+      - to: infra_idle
+        weight: 50
+        action: infra_undock_fixtures
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  infra_docked:
+    layer: infra
+    transitions:
+      - to: infra_idle
+        weight: 20
+        action: infra_undock_fixtures
+      - to: infra_disk_moved
+        weight: 10
+        action: infra_move_disk
+      - to: infra_docked
+        weight: 60
+        action: infra_dock_fixture
+      - to: infra_reboot
+        weight: 5
+        action: infra_reboot_engine
+      - to: start
+        weight: 5
+        action: return_to_start
+    invariants:
+      - type: disk_docked
+        disk: duration-fixture-app
+        engine: any_pool
+
+  infra_disk_moved:
+    layer: infra
+    transitions:
+      - to: infra_docked
+        weight: 50
+        action: infra_dock_fixture
+      - to: infra_idle
+        weight: 25
+        action: infra_undock_fixtures
+      - to: infra_reboot
+        weight: 20
+        action: infra_reboot_engine
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  infra_reboot:
+    layer: infra
+    transitions:
+      - to: infra_idle
+        weight: 55
+        action: infra_undock_fixtures
+      - to: infra_docked
+        weight: 40
+        action: infra_dock_fixture
+      - to: start
+        weight: 5
+        action: return_to_start
+
+initial_state: start
