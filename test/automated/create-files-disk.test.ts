@@ -331,10 +331,13 @@ describe('createFilesDisk <diskId> [<shareName…>] (idea#131)', () => {
         expect(resourceLock.isLocked(diskKey('lk-2'))).toBe(false)
     })
 
-    it('createFilesDisk with no disk ID is a usage error (no trace)', async () => {
+    it('createFilesDisk with no disk ID leaves an error trace (idea#122)', async () => {
         const n = logH.doc()!.recentTraceIds.length
         await handleCommand(commands, h, 'engine', 'createFilesDisk', logH)
-        expect(logH.doc()!.recentTraceIds.length).toBe(n)
+        expect(logH.doc()!.recentTraceIds.length).toBe(n + 1)
+        const t = lastTrace(logH)
+        expect(t.status).toBe('error')
+        expect(t.errorMessage).toMatch(/Insufficient arguments/)
     })
 })
 

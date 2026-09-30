@@ -301,10 +301,11 @@ const rebootWrapper = async (storeHandle: DocHandle<Store> | null) => {
 }
 
 const backupAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, backupDiskName?: DiskName) => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+    // Refusals throw so the command-log trace closes as error (idea#122).
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     const store = storeHandle.doc()
     const instance = Object.values(store.instanceDB).find(i => i.name === instanceName)
-    if (!instance) { console.error(chalk.red(`Instance '${instanceName}' not found.`)); return; }
+    if (!instance) throw new Error(`Instance '${instanceName}' not found.`)
 
     // Find backup disk: named or first linked docked Backup Disk
     let backupDisk = backupDiskName
@@ -316,21 +317,21 @@ const backupAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceNa
           )
 
     if (!backupDisk) {
-        console.error(chalk.red(`No docked Backup Disk found${backupDiskName ? ` named '${backupDiskName}'` : ` linked to instance '${instanceName}'`}.`))
-        return
+        throw new Error(`No docked Backup Disk found${backupDiskName ? ` named '${backupDiskName}'` : ` linked to instance '${instanceName}'`}.`)
     }
     print(chalk.blue(`Backing up instance '${instanceName}' to disk '${backupDisk.name}'...`))
     await backupInstance(storeHandle, instance.id, backupDisk as any, undefined, 'console-command')
 }
 
 const restoreAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, targetDiskName: DiskName) => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+    // Refusals throw so the command-log trace closes as error (idea#122).
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     const store = storeHandle.doc()
     const instance = Object.values(store.instanceDB).find(i => i.name === instanceName)
-    if (!instance) { console.error(chalk.red(`Instance '${instanceName}' not found in store.`)); return; }
+    if (!instance) throw new Error(`Instance '${instanceName}' not found in store.`)
 
     const targetDisk = Object.values(store.diskDB).find(d => d.name === targetDiskName && d.device != null)
-    if (!targetDisk) { console.error(chalk.red(`Target disk '${targetDiskName}' not found or not docked.`)); return; }
+    if (!targetDisk) throw new Error(`Target disk '${targetDiskName}' not found or not docked.`)
 
     print(chalk.blue(`Restoring instance '${instanceName}' to disk '${targetDiskName}'...`))
     await restoreApp(storeHandle, instance.id, targetDisk as any, undefined, 'console-command')
@@ -366,7 +367,7 @@ const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, dis
 
 /** summariseDisk <diskId|candidateId> (idea#134). Result in CommandTrace.result. */
 const summariseDiskWrapper = async (storeHandle: DocHandle<Store> | null, targetId: string) => {
-    if (!storeHandle) { console.error(chalk.red('Store is not available.')); return }
+    if (!storeHandle) throw new Error('Store is not available.')
     const summary = await summariseDisk(storeHandle, targetId)
     attachTraceResult(summary)
     print(chalk.green(`Summary for ${summary.label}: readable=${summary.readable} partial=${summary.partial}`))
@@ -374,7 +375,7 @@ const summariseDiskWrapper = async (storeHandle: DocHandle<Store> | null, target
 
 /** eraseDisk <targetId> <summaryTraceId> <confirmName…> (idea#134). */
 const eraseDiskWrapper = async (storeHandle: DocHandle<Store> | null, targetId: string, summaryTraceId: string, ...confirmTokens: string[]) => {
-    if (!storeHandle) { console.error(chalk.red('Store is not available.')); return }
+    if (!storeHandle) throw new Error('Store is not available.')
     const confirmName = confirmTokens.join(' ')
     const result = await eraseDisk(storeHandle, targetId, summaryTraceId, confirmName)
     attachTraceResult({ diskId: result.diskId, removedInstances: result.removedInstances })
