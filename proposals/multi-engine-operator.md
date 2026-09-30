@@ -1,5 +1,11 @@
 # Proposal: Multi-Engine Operator Console Markov
 
+> **SUPERSEDED / absorbed into [`duration-tests.md`](./duration-tests.md)** (2026-09-30).
+> This file is a **backup** of the pre-unification operator Console Markov proposal.
+> Canonical source of truth for continuous long-running (duration) tests is now [`duration-tests.md`](./duration-tests.md).
+> Content below is retained unchanged for reference; do not extend this file.
+
+
 **Status:** Proposal draft for discussion — companion to [`multi-engine-classroom.md`](./multi-engine-classroom.md).  
 **Revision:** 2026-09-30g — Koen feedback: remove out-of-scope/speculative section; retain the Ask of Koen decisions.  
 **Author:** Steve (Lead Bot), 2026-09-30 (rev. 2026-09-30g)  

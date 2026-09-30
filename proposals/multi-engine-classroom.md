@@ -1,5 +1,11 @@
 # Proposal: Multi-Engine Classroom
 
+> **SUPERSEDED / absorbed into [`duration-tests.md`](./duration-tests.md)** (2026-09-30).
+> This file is a **backup** of the pre-unification classroom / usage Markov proposal.
+> Canonical source of truth for continuous long-running (duration) tests is now [`duration-tests.md`](./duration-tests.md).
+> Content below is retained unchanged for reference; do not extend this file.
+
+
 **Status:** Proposal draft for discussion — supersedes [`multi-engine-classroom-scenarios.md`](./multi-engine-classroom-scenarios.md) (2026-09-28).  
 **Revision:** 2026-09-30g — Koen feedback: remove out-of-scope section; retain the Ask of Koen decisions.  
 **Author:** Steve (Lead Bot), 2026-09-29 (rev. 2026-09-30g)  

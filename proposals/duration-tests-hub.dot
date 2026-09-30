@@ -1,0 +1,26 @@
+digraph DurationTestsHub {
+  rankdir=LR;
+  size="12,5!";
+  bgcolor="white";
+  pad="0.40";
+  nodesep="0.45";
+  ranksep="0.70";
+  fontname="Helvetica";
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, margin="0.10,0.08"];
+  edge [fontname="Helvetica", fontsize=9, color="#555555"];
+
+  start [label="start", shape=circle, width=0.55, height=0.55, fixedsize=true, fillcolor="#eeeeee", style=filled, fontsize=11];
+  start_return [label="", shape=circle, width=0.35, height=0.35, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  legend [label="Black circle = Return to start\n(shortcut from every state;\ndo not draw long arrows to start)", shape=note, fillcolor="#FFFDE7", fontsize=9];
+
+  usage_root [label="Usage layer\nconsole_teacher / console_learner", fillcolor="#D6EAF8"];
+  op_root [label="Operator layer\nop_entry", fillcolor="#85C1E9"];
+  infra_root [label="Infra layer\ninfra_idle", fillcolor="#F5B7B1"];
+
+  start -> usage_root [label="Open Console as teacher\nOpen Console as learner"];
+  start -> op_root [label="Open Console as operator"];
+  start -> infra_root [label="Enter infra fleet walk\n(one transition)"];
+
+  start_return -> start [label="(semantic return)", style=dotted, color="#888888"];
+  legend -> start_return [style=invis];
+}
