@@ -230,6 +230,17 @@ steps:
   - from: op_backup
     to: op_disk
     action: backup_configured_restored
+  # Prefer A — restore Confirm may SIGTERM source instance; start before move_app
+  # so the docker-missing stability probe does not abort.
+  - from: op_disk
+    to: op_instance
+    action: open_instance_controls
+  - from: op_instance
+    to: op_instance
+    action: start_instance
+  - from: op_instance
+    to: op_disk
+    action: back_to_disk
   - from: op_disk
     to: op_copy_move
     action: move_app
