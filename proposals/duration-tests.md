@@ -1553,6 +1553,25 @@ Authenticated operator Console UI click sequences. Intent-style names only. Prel
 
 ---
 
+## Proposal revisions
+
+*(idea#168 / Axle executor — logical consistency only; Steve may accept or rewrite.)*
+
+1. **Implementation phase renumber (Steve/Koen greenlight vs original §):**
+   - Original: Phase 3 = stability monitoring + multiple scenario files; Phase 4 = stress + CI `minimal`.
+   - **Active interpretation (idea#168):** Phase 3 = Playwright UI Intent dispatch from the ONE YAML walker (`test/duration/ui/` → Pixel `e2e/intents`); Phase 4 = dwell stability probes + `stress.yaml` + CI `minimal` on FakeFleetOps.
+   - Multiple scenario files and `stress.yaml` already shipped in Phase 1–2; Phase 4 therefore focuses on **probes + CI green**, not inventing a second scenario tree.
+
+2. **YAML transition shape:** early examples in this doc omit `action:` keys. Design Review locked `{ to, weight, action }` for **all** layers — treat example YAML without `action` as superseded.
+
+3. **Open question #2** ("Multi-disk … Phase 2"): Phase 2 is complete; multi-disk simultaneous flight remains optional/future — strike the "Phase 2" schedule tag.
+
+4. **Stability probe §7:** keep as Phase 4 dwell behaviour (30s interval, fail after 3 consecutive). `--fast` compresses dwell so CI still exercises ≥1 probe per gap without wall-clock 30s.
+
+5. **File layout:** add `test/duration/ui/` (Playwright/Stub drivers), `test/duration/stability.ts`, and Intent contract `ACTIONS.md`. No second runner.
+
+6. **Intent rename (Pixel#134 @9502201):** `add_files` → `add_files_role`. Engine YAML/ACTIONS must use `add_files_role`. Engine UI driver calls `runDurationIntent` / `hasDurationIntent` from `idea-console/duration-intents` (sibling path fallback) — do not re-implement Console selectors.
+
 ## Sources consulted
 
 | Source | Use |
