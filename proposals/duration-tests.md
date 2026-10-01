@@ -2,7 +2,7 @@
 
 **Status:** Proposed — unified source of truth (absorbs classroom usage + operator Console + infra/fleet execution)  
 **Authors:** Axle (infra/runner foundation); Steve (Lead Bot) (usage + operator Markov); unified 2026-09-30 per Koen + Steve agreement  
-**Revision:** 2026-10-01a — Koen course correction: one canonical Markov YAML only; stress/minimal/2-engine = CLI run modes; Implementation + proposal revisions aligned  
+**Revision:** 2026-10-01b — Koen: drop 2-Pi product mode; `--scenario` = `random` | deterministic walk name (not alternate Markov graphs)  
 **Audience:** Koen / IDEA leads  
 **Companion capacity issue:** [idea#159](https://github.com/koenswings/idea/issues/159) — measure safe concurrent Kolibri video streams per instance  
 **Backups (SUPERSEDED, content retained):** [`duration-tests-infra-backup.md`](./duration-tests-infra-backup.md), [`multi-engine-classroom.md`](./multi-engine-classroom.md), [`multi-engine-operator.md`](./multi-engine-operator.md)
@@ -44,7 +44,7 @@ Placeholder ≈probability for Return to start on each state: **0.05** (runner r
 - **Actions are unique to the state they depart from** — you only take actions listed on the current state.
 - **Arrival / entry UI** (login, open app, land on home) belongs on the **outgoing action of the state you leave**, not as content of the destination.
 - Action name = edge label = UI Interaction name (Intent-style; no cryptic IDs; no `*` wildcards on the graph).
-- A **real test** = a **random walk** for some duration or step count; each action expands into its UI Interaction (usage/operator) or infra action function (fleet).
+- A **real test** = a **random walk** for some duration or step count (optionally preceded by a **deterministic cover walk** that hits all / as many graph actions as possible); each action expands into its UI Interaction (usage/operator) or infra action function (fleet).
 
 ---
 
@@ -984,13 +984,13 @@ Follow-up implementation conclusions for the **unified** walker. Assessed: **yes
 
 
 ```
-pnpm test:duration [--scenario unified] [--iterations 200] [--fast]
+pnpm test:duration [--scenario random|<walk-name>] [--iterations 200] [--fast]
 ```
 
-- `--scenario`: loads the **one** canonical graph (`scenarios/unified.yaml`; `school-day` may alias/load it until deleted)
-- `--iterations`: transition count (default from YAML duration × avg dwell)
+- `--scenario`: either **`random`** (Markov simulation on the single canonical graph `scenarios/unified.yaml`) **or** the name of a **deterministic walk file** that lists an explicit action sequence covering all (or as many as possible) graph actions before a long random duration run. At least one cover-all walk file will ship (Axle implementing on [#145](https://github.com/koenswings/agent-engine-dev/pull/145)). `--scenario` does **not** select alternate Markov graphs.
+- `--iterations`: transition count (default from YAML duration × avg dwell); applies to the random-duration portion
 - `--fast`: `pm2 restart` instead of reboot; compresses dwell to seconds
-- Hosts / store / weight presets (stress, CI minimal, 2-engine live) are **CLI run modes** on that same YAML — not peer scenario files
+- Hosts / store / weight presets (stress, CI minimal) are **CLI run modes** on that same YAML — not peer scenario files. Live host pool is **idea01+idea03+idea04**; golden **idea02** never. Unique-store / Running-fixture are live **caveats** only — **not** a 2-Pi-only product mode.
 
 Runner steps: parse YAML → connect to participating engines (`localStoreHandle` + WS, same idea as cross-engine tests) → walk Markov chain (usage UI / operator UI / infra actions) → structured log → on failure dump state + store snapshots + failing invariant.
 
@@ -1012,20 +1012,21 @@ test/
     invariants.ts       ← invariant type registry + evaluation
     scenarios/
       unified.yaml      ← sole Markov graph (full school-day; all layers from start)
+    walks/              ← deterministic cover sequences (`--scenario <walk-name>`; Axle #145)
     README.md           ← CLI run-mode / preset flags (not alternate graphs)
 ```
 
-Stress / minimal / 2-engine are **not** shipped as peer YAMLs. Document them as flags in the duration README (see Run modes below).
+Stress / minimal are **not** shipped as peer YAMLs. Document them as flags in the duration README (see Run modes below). Do **not** ship a 2-Pi-only product mode or alternate Markov graph.
 
 ### Run modes (CLI)
 
 
-| Mode | How to invoke (same `unified.yaml`) | Focus | Duration |
+| Mode | How to invoke (same `unified.yaml` graph) | Focus | Duration |
 |---|---|---|---|
-| Full school-day (canonical) | `--scenario unified` (multi-hour / high `--iterations`; optional `--seed`) | 3 layers | 8h simulated — multi-hour random walk is the proof |
+| Random duration (canonical) | `--scenario random` (multi-hour / high `--iterations`; optional `--seed`) | 3 layers | 8h simulated — multi-hour random walk is the proof |
+| Cover-then-random | `--scenario <walk-name>` (deterministic cover-all sequence, then long random run) | Hit all / max actions, then soak | cover + multi-hour random |
 | Stress | `--preset stress` or infra-biased weights + higher `--iterations` | Infra | ~2h simulated |
-| CI minimal | `--scenario unified --iterations 40 --fast` (+ optional `--layer infra` if added) | Infra (+ optional smoke usage) | ~10 min |
-| 2-engine live UI | `--live --ui --hosts idea01=…,idea03=… --store-mode unique` | Same graph; hosts/store knobs | as configured |
+| CI minimal | `--scenario random --iterations 40 --fast` (+ optional `--layer infra` if added) | Infra (+ optional smoke usage) | ~10 min |
 
 ### Implementation phases
 
@@ -1576,9 +1577,10 @@ Authenticated operator Console UI click sequences. Intent-style names only. Prel
 6. **Intent rename (Pixel#134 @9502201):** `add_files` → `add_files_role`. Engine YAML/ACTIONS must use `add_files_role`. Engine UI driver calls `runDurationIntent` / `hasDurationIntent` from `idea-console/duration-intents` (sibling path fallback) — do not re-implement Console selectors.
 7. **Live Console URL for duration `--ui` / Playwright:** use the Engine-served Console on port **8080** (for example, `http://idea01:8080`), not port 80. Fleet Pis serve Console on :8080; docs/CLI examples using `:80` or bare `http://idea01` without a port are superseded.
 
-8. **2-engine live UI caveats (not a second graph):** current 2-host live `--ui` claims need idea01+idea03, `store_mode: unique`, and no idea04 — express via **CLI** (`--hosts`, `--store-mode unique`) on the same `unified.yaml`. Do **not** ship `school-day-2engine.yaml` (or any peer YAML) as an alternate Markov graph. Unique-store / host-pool facts remain live run caveats only.
+8. **Live host-pool / store caveats (not a product mode):** pool Engines are **idea01+idea03+idea04**; golden **idea02** never. Unique-store and Running-fixture constraints remain live-run **caveats** only — they do **not** justify a 2-Pi-only product mode or an alternate Markov graph. Do **not** ship `school-day-2engine.yaml` (or any peer YAML) as an alternate graph.
 9. **App-open / Running-fixture live caveat (idea#168 FAIL @5e253d3):** live `--ui` timed out on `open_nextcloud_as_learner` waiting `[data-testid="instance-nextcloud-grade5a-001"]` because the pool had no Running Kid fixture instances. `infra_dock_fixture` / RealFleetOps dock defaults to **dock-only** (strips `instances/`; no auto-start). Console App-open Intents (`open_kolibri_*` / `open_nextcloud_*` / `open_video` / `open_exercise`) require a visible Running instance card + Open button. Until fixtures are Running (`startInstances` + images, or provisioned), live runs may skip or gate App-open edges — still on the **one** unified graph, not a trimmed alternate YAML. FakeFleetOps stub path unchanged.
-10. **Koen 2026-10-01 course correction — one graph only:** ship **one** canonical Markov YAML (`unified.yaml` / full school-day). Stress, minimal, and 2-engine are **CLI run modes / presets**, not alternate scenario files. The proof is a **multi-hour random walk** on that single graph. Scenario files must not encode alternate Markov graphs.
+10. **Koen 2026-10-01 course correction — one graph only:** ship **one** canonical Markov YAML (`unified.yaml` / full school-day). Stress and minimal are **CLI run modes / presets**, not alternate scenario files. The proof is a **multi-hour random walk** on that single graph. Scenario files must not encode alternate Markov graphs.
+11. **Koen 2026-10-01 — drop 2-Pi special setup; `--scenario` = `random` | deterministic walk name:** Do not treat 2-Pi-only live setups as a product mode. Pool is idea01+idea03+idea04 (golden idea02 never). `--scenario` is either `random` (Markov simulation on the single `unified.yaml` graph) or the name of a deterministic walk file (explicit action sequence covering all / as many graph actions as possible, then a long random duration run). At least one cover-all walk ships (Axle on [#145](https://github.com/koenswings/agent-engine-dev/pull/145)). Not alternate Markov graphs.
 
 ## Sources consulted
 
