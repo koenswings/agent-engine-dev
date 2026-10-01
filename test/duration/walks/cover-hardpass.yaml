@@ -9,6 +9,11 @@
 # reboot/move cycle runs later from infra_idle (avoids startInstances zombie on pm2 restart).
 # Path A `--start-instances` preserves dock across return_to_start.
 # cover-all = strict full graph (failLoud on Pixel-missing under --ui).
+#
+# INTERIM (Steve 2026-10-01): skip copy_app / move_app (+ dependents done_redistribute,
+# stay_on_source_disk, open_copied_instance) until Pixel multi-disk copy_app (Path A) lands.
+# Prefer Pixel A for multi-disk; B interim OK now. Reconnect via back_to_overview so the
+# path stays graph-valid. Restore those steps when A ships, then re-run live hardpass --record-walk.
 kind: walk
 name: cover-hardpass
 graph: unified
@@ -100,12 +105,16 @@ steps:
   - from: op_disk
     to: op_instance
     action: open_instance_controls
+  # INTERIM skip until Pixel multi-disk copy_app (Path A):
+  # - from: op_instance
+  #   to: op_copy_move
+  #   action: copy_app
+  # - from: op_copy_move
+  #   to: op_overview
+  #   action: done_redistribute
   - from: op_instance
-    to: op_copy_move
-    action: copy_app
-  - from: op_copy_move
     to: op_overview
-    action: done_redistribute
+    action: back_to_overview
   - from: op_overview
     to: op_eject
     action: eject_disk
@@ -208,12 +217,13 @@ steps:
   - from: op_backup
     to: op_disk
     action: backup_configured_restored
-  - from: op_disk
-    to: op_copy_move
-    action: move_app
-  - from: op_copy_move
-    to: op_disk
-    action: stay_on_source_disk
+  # INTERIM skip until Pixel multi-disk move_app (Path A):
+  # - from: op_disk
+  #   to: op_copy_move
+  #   action: move_app
+  # - from: op_copy_move
+  #   to: op_disk
+  #   action: stay_on_source_disk
   - from: op_disk
     to: op_erase
     action: erase_disk
@@ -250,12 +260,13 @@ steps:
   - from: op_install
     to: op_instance
     action: start_after_install
-  - from: op_instance
-    to: op_copy_move
-    action: copy_app
-  - from: op_copy_move
-    to: op_instance
-    action: open_copied_instance
+  # INTERIM skip until Pixel multi-disk copy_app (Path A):
+  # - from: op_instance
+  #   to: op_copy_move
+  #   action: copy_app
+  # - from: op_copy_move
+  #   to: op_instance
+  #   action: open_copied_instance
   - from: op_instance
     to: op_disk
     action: back_to_disk
