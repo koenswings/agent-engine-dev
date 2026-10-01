@@ -35,8 +35,9 @@ Live overnight smoke (dock-free; unique stores; --fast pm2 restart):
 
 Env: DURATION_FLEET_HOSTS=idea01=…,idea03=…  (same format as --hosts)
 
-Never put idea02 in the pool. Kid USB fixtures are not on the Pis — use
-minimal-live (no dock/move). See test/duration/README.md.
+Never put idea02 in the pool. Prefer minimal-dock for Kid testMode dock
+(copy+sentinel under duration-disks/duration-watch). Use minimal-live for
+reboot-only. See test/duration/README.md.
 `)
 }
 
@@ -171,8 +172,10 @@ const main = async () => {
         fast: args.fast,
         ops,
         stubUi: true,
+        // Live --fast: align settle with RealFleetOps PM2_RECONNECT_TIMEOUT_MS (150s).
+        // Overnight smoke: 60s was insufficient after rapid pm2 on idea03.
         settleTimeoutMs: args.live
-            ? (args.fast ? 60_000 : 180_000)
+            ? (args.fast ? 150_000 : 180_000)
             : (args.fast ? 1000 : 3000),
         rng: seed !== undefined ? makeRng(seed) : undefined,
         onLog: (e) => {

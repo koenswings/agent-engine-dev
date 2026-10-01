@@ -1,8 +1,11 @@
 /**
  * RealFleetOps — live fleet adapter for duration-tests (idea#166).
  *
- * Connects over Tailscale/SSH + Automerge WS. Prefer Engine eject commands over
- * physical USB. Physical dock/move requires Kid fixture disks (not on Pis yet).
+ * Connects over Tailscale/SSH + Automerge WS. Prefer Engine ejectDisk over
+ * physical USB yank. Kid fixture dock (testMode) =
+ *   copy pack → private IDEA_DISKS_ROOT/idea-test-N/ + sentinel under IDEA_WATCH_DIR
+ * Defaults (Atlas-approved): /home/pi/idea/duration-disks + duration-watch.
+ * NEVER /disks, NEVER /dev/engine, NEVER idea03 sdb1, NEVER golden idea02.
  *
  * Connection helpers are inlined (adapted from test/cross-engine/remoteClient.ts)
  * so unique-store mode can open a distinct store URL per host without the shared
@@ -25,6 +28,30 @@ $.verbose = false
 const DEFAULT_SSH_USER = 'pi'
 const DEFAULT_ENGINE_PORT = 4321
 const GOLDEN_DEFAULT = 'idea02'
+
+/** Atlas-approved private roots on pool Pis — never /disks or /dev/engine. */
+export const DEFAULT_DURATION_DISKS_ROOT = '/home/pi/idea/duration-disks'
+export const DEFAULT_DURATION_WATCH_DIR = '/home/pi/idea/duration-watch'
+/** Kid packs on the Pi workspace (agent-app-dev#10). */
+export const DEFAULT_DURATION_FIXTURE_SOURCE_ROOT =
+    '/home/pi/idea/agents/agent-app-dev/tests/duration-tests/fixtures'
+
+/**
+ * After infra_reboot_engine --fast (pm2 restart), 60s was insufficient on overnight
+ * smoke (~step 22): Automerge withTimeout while idea03 was still reconnecting after
+ * rapid pm2 restarts. Duration-test-only bump (RealFleetOps), not production Engine.
+ */
+export const PM2_RECONNECT_TIMEOUT_MS = 150_000
+export const FULL_REBOOT_RECONNECT_TIMEOUT_MS = 180_000
+
+const FORBIDDEN_DISKS_ROOTS = ['/disks', '/disks/']
+const FORBIDDEN_WATCH_DIRS = ['/dev/engine', '/dev/engine/']
+
+const DISK_ID_TO_PACK: Record<string, string> = {
+    'duration-kolibri-grade5a-001': 'kolibri',
+    'duration-nextcloud-grade5a-001': 'nextcloud',
+}
+
 
 /** idea03 Intenso hw-roundtrip stick — NEVER eject/erase for duration tests. */
 export const PROTECTED_DISK_MARKERS = [
@@ -80,6 +107,26 @@ export interface RealFleetOptions {
     healthWrapAfter?: string
     /** Override store URL per logical engine (automerge:… or bare doc id). */
     storeUrls?: Record<string, string>
+    /**
+     * Private App Disk mount root on the Pi (testMode fixture trees).
+     * Default: /home/pi/idea/duration-disks. NEVER /disks.
+     */
+    disksRoot?: string
+    /**
+     * Private chokidar watch dir for idea-test-N sentinels.
+     * Default: /home/pi/idea/duration-watch. NEVER /dev/engine.
+     */
+    watchDir?: string
+    /** Kid fixture pack root on the Pi. */
+    fixtureSourceRoot?: string
+    /**
+     * When false (default for duration dock smoke), copy fixture without instances/
+     * so Engine docks the disk but does not auto-start Kolibri/Nextcloud.
+     * Image pull is not required for dock-only smoke.
+     */
+    startInstances?: boolean
+    /** waitReady timeout after pm2 restart (default PM2_RECONNECT_TIMEOUT_MS). */
+    pm2ReconnectTimeoutMs?: number
 }
 
 interface Conn {
@@ -99,6 +146,36 @@ const sshOpts = [
 ]
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
+
+export const assertPrivateDurationRoots = (disksRoot: string, watchDir: string): void => {
+    const d = disksRoot.replace(/\/+$/, '') || disksRoot
+    const w = watchDir.replace(/\/+$/, '') || watchDir
+    if (d === '/disks' || FORBIDDEN_DISKS_ROOTS.includes(disksRoot) || d.startsWith('/disks/')) {
+        throw new Error(
+            `RealFleetOps: refuse IDEA_DISKS_ROOT='${disksRoot}' (never /disks; use ${DEFAULT_DURATION_DISKS_ROOT})`,
+        )
+    }
+    if (w === '/dev/engine' || FORBIDDEN_WATCH_DIRS.includes(watchDir) || w.startsWith('/dev/engine/')) {
+        throw new Error(
+            `RealFleetOps: refuse IDEA_WATCH_DIR='${watchDir}' (never /dev/engine; use ${DEFAULT_DURATION_WATCH_DIR})`,
+        )
+    }
+    if (d.includes('sdb') || w.includes('sdb')) {
+        throw new Error(`RealFleetOps: refuse roots that mention sdb (never idea03 hw stick)`)
+    }
+}
+
+/** Map Kid diskId → pack folder name under fixtureSourceRoot. */
+export const resolveDurationFixturePack = (diskId: string): string => {
+    const pack = DISK_ID_TO_PACK[diskId]
+    if (!pack) {
+        throw new Error(
+            `RealFleetOps: unknown duration fixture diskId '${diskId}' ` +
+            `(expected ${Object.keys(DISK_ID_TO_PACK).join(' | ')})`,
+        )
+    }
+    return pack
+}
 
 export const parseHostsFlag = (raw: string): Record<string, string> => {
     const out: Record<string, string> = {}
@@ -141,11 +218,20 @@ export class RealFleetOps implements FleetOps {
     private readonly healthWrapBefore?: string
     private readonly healthWrapAfter?: string
     private readonly storeUrls: Record<string, string>
+    private readonly disksRoot: string
+    private readonly watchDir: string
+    private readonly fixtureSourceRoot: string
+    private readonly startInstances: boolean
+    private readonly pm2ReconnectTimeoutMs: number
     private readonly conns = new Map<string, Conn>()
     /** logical pool id → live engineDB key */
     private readonly liveIds = new Map<string, string>()
     /** live engineDB key → logical pool id */
     private readonly logicalIds = new Map<string, string>()
+    /** logicalEngine → diskId → idea-test-N device slot */
+    private readonly deviceByEngineDisk = new Map<string, Map<string, string>>()
+    /** logicalEngine → set of idea-test-N in use */
+    private readonly usedDevices = new Map<string, Set<string>>()
 
     constructor(opts: RealFleetOptions) {
         this.pool = [...opts.poolEngines]
@@ -158,6 +244,18 @@ export class RealFleetOps implements FleetOps {
         this.healthWrapBefore = opts.healthWrapBefore
         this.healthWrapAfter = opts.healthWrapAfter
         this.storeUrls = { ...(opts.storeUrls ?? {}) }
+        this.disksRoot = (opts.disksRoot
+            ?? process.env.IDEA_DISKS_ROOT
+            ?? DEFAULT_DURATION_DISKS_ROOT).replace(/\/+$/, '')
+        this.watchDir = (opts.watchDir
+            ?? process.env.IDEA_WATCH_DIR
+            ?? DEFAULT_DURATION_WATCH_DIR).replace(/\/+$/, '')
+        this.fixtureSourceRoot = (opts.fixtureSourceRoot
+            ?? process.env.DURATION_FIXTURE_SOURCE_ROOT
+            ?? DEFAULT_DURATION_FIXTURE_SOURCE_ROOT).replace(/\/+$/, '')
+        this.startInstances = opts.startInstances === true
+        this.pm2ReconnectTimeoutMs = opts.pm2ReconnectTimeoutMs ?? PM2_RECONNECT_TIMEOUT_MS
+        assertPrivateDurationRoots(this.disksRoot, this.watchDir)
 
         for (const id of this.pool) {
             if (this.exclude.includes(id)) {
@@ -427,11 +525,17 @@ export class RealFleetOps implements FleetOps {
         if (fast) {
             console.log(`[RealFleetOps] pm2 restart engine on ${engineId} (${host})`)
             await this.ssh(host, 'pm2 restart engine')
-            // Brief pause then wait for WS
+            // Brief pause then wait for WS.
+            // Overnight smoke (idea#166): 60s withTimeout was too short after rapid
+            // pm2 restarts on idea03 — Automerge reconnect lagged. Use 150s
+            // (PM2_RECONNECT_TIMEOUT_MS) for duration-test RealFleetOps only.
             await sleep(2000)
-            const ready = await this.waitReady(engineId, 60_000)
+            const ready = await this.waitReady(engineId, this.pm2ReconnectTimeoutMs)
             if (!ready.wsUp) {
-                throw new Error(`RealFleetOps: ${engineId} WS not up after pm2 restart`)
+                throw new Error(
+                    `RealFleetOps: ${engineId} WS not up after pm2 restart ` +
+                    `(waited ${this.pm2ReconnectTimeoutMs}ms)`,
+                )
             }
         } else {
             console.log(`[RealFleetOps] sudo reboot on ${engineId} (${host})`)
@@ -454,7 +558,7 @@ export class RealFleetOps implements FleetOps {
                 }
             }
             if (!sshUp) throw new Error(`RealFleetOps: SSH to ${engineId} did not return after reboot`)
-            const ready = await this.waitReady(engineId, 180_000)
+            const ready = await this.waitReady(engineId, FULL_REBOOT_RECONNECT_TIMEOUT_MS)
             if (!ready.wsUp) {
                 throw new Error(`RealFleetOps: ${engineId} WS not up after reboot`)
             }
@@ -523,6 +627,15 @@ export class RealFleetOps implements FleetOps {
                         | undefined
                     if (eng) eng.commands.push(`ejectDisk ${diskId}` as never)
                 })
+                // Drop Kid sentinel so chokidar does not re-add; keep fixture tree.
+                const device = this.deviceMap(logicalId).get(diskId)
+                    ?? (disk.device && /^idea-test-[0-9]+$/.test(String(disk.device))
+                        ? String(disk.device)
+                        : null)
+                if (device) {
+                    await this.sshRemoveSentinel(logicalId, device)
+                    this.releaseTestDevice(logicalId, diskId)
+                }
             } catch (e) {
                 if (e instanceof Error && /refuse to eject/.test(e.message)) throw e
                 console.warn(`[RealFleetOps] undockFixtures ${logicalId}/${diskId}: ${e}`)
@@ -530,22 +643,172 @@ export class RealFleetOps implements FleetOps {
         }
     }
 
+    private deviceMap(engineId: string): Map<string, string> {
+        let m = this.deviceByEngineDisk.get(engineId)
+        if (!m) {
+            m = new Map()
+            this.deviceByEngineDisk.set(engineId, m)
+        }
+        return m
+    }
+
+    private usedSet(engineId: string): Set<string> {
+        let s = this.usedDevices.get(engineId)
+        if (!s) {
+            s = new Set()
+            this.usedDevices.set(engineId, s)
+        }
+        return s
+    }
+
+    /** Allocate idea-test-N on this engine for diskId (stable if already assigned). */
+    private allocateTestDevice(engineId: string, diskId: string): string {
+        const map = this.deviceMap(engineId)
+        const existing = map.get(diskId)
+        if (existing) return existing
+        const used = this.usedSet(engineId)
+        let n = 1
+        while (used.has(`idea-test-${n}`)) n++
+        if (n > 64) {
+            throw new Error(`RealFleetOps: no free idea-test-N slots on ${engineId}`)
+        }
+        const device = `idea-test-${n}`
+        used.add(device)
+        map.set(diskId, device)
+        return device
+    }
+
+    private releaseTestDevice(engineId: string, diskId: string): void {
+        const map = this.deviceMap(engineId)
+        const device = map.get(diskId)
+        if (!device) return
+        map.delete(diskId)
+        this.usedSet(engineId).delete(device)
+    }
+
+    private fixtureSourcePath(diskId: string): string {
+        const pack = resolveDurationFixturePack(diskId)
+        return `${this.fixtureSourceRoot}/${pack}`
+    }
+
+    /**
+     * Kid dock (testMode): copy pack tree → IDEA_DISKS_ROOT/idea-test-N/ + touch
+     * sentinel under IDEA_WATCH_DIR. Excludes instances/ unless startInstances.
+     * Does not start Kolibri/Nextcloud — image not required for dock-only smoke.
+     */
+    private async sshDockCopy(engineId: string, diskId: string, device: string): Promise<void> {
+        if (!/^idea-test-[0-9]+$/.test(device)) {
+            throw new Error(`RealFleetOps: refuse non-test device '${device}' (must be idea-test-N)`)
+        }
+        if (device.includes('sdb') || diskId.includes('sdb')) {
+            throw new Error('RealFleetOps: refuse sdb device/diskId')
+        }
+        assertPrivateDurationRoots(this.disksRoot, this.watchDir)
+        const host = this.hostOf(engineId)
+        const src = this.fixtureSourcePath(diskId)
+        const dest = `${this.disksRoot}/${device}`
+        const sentinel = `${this.watchDir}/${device}`
+        // Single remote bash: copy tree + sentinel. Never touches /disks or sdb.
+        // Prefer cp -a (always on Pi). Drop instances/ unless startInstances so
+        // Engine docks without auto-starting Kolibri/Nextcloud (image not required).
+        const stripInstances = this.startInstances ? ':' : `rm -rf '${dest}/instances'`
+        const remote = [
+            'set -euo pipefail',
+            `test -d '${src}' || { echo "missing fixture source ${src}" >&2; exit 2; }`,
+            `mkdir -p '${this.disksRoot}' '${this.watchDir}'`,
+            `rm -rf '${dest}'`,
+            `mkdir -p '${dest}'`,
+            `cp -a '${src}/.' '${dest}/'`,
+            stripInstances,
+            `test -f '${dest}/META.yaml' || { echo "META.yaml missing after copy into ${dest}" >&2; exit 3; }`,
+            `touch '${sentinel}'`,
+        ].join('; ')
+        console.log(
+            `[RealFleetOps] dock copy ${diskId} → ${engineId}:${dest} ` +
+            `(sentinel ${sentinel}, startInstances=${this.startInstances})`,
+        )
+        await this.ssh(host, remote)
+    }
+
+    private async sshRemoveSentinel(engineId: string, device: string): Promise<void> {
+        if (!/^idea-test-[0-9]+$/.test(device)) return
+        assertPrivateDurationRoots(this.disksRoot, this.watchDir)
+        const host = this.hostOf(engineId)
+        const sentinel = `${this.watchDir}/${device}`
+        await this.ssh(host, `rm -f '${sentinel}'`).catch(e => {
+            console.warn(`[RealFleetOps] sentinel rm ${engineId}:${sentinel}: ${e}`)
+        })
+    }
+
+    private async waitDiskDocked(
+        engineId: string,
+        diskId: string,
+        timeoutMs = 60_000,
+    ): Promise<void> {
+        const start = Date.now()
+        while (Date.now() - start < timeoutMs) {
+            try {
+                const view = await this.readStore(engineId)
+                const disk = view.diskDB[diskId]
+                if (disk && disk.dockedTo === engineId) return
+                // Also accept dockedTo = live engine id mapped to this logical
+                if (disk?.dockedTo) {
+                    const live = this.liveIds.get(engineId)
+                    if (disk.dockedTo === live || disk.dockedTo === engineId) return
+                }
+            } catch (e) {
+                console.warn(`[RealFleetOps] waitDiskDocked ${engineId}/${diskId}: ${e}`)
+            }
+            await sleep(500)
+        }
+        throw new Error(
+            `RealFleetOps: disk ${diskId} not docked on ${engineId} within ${timeoutMs}ms ` +
+            `(check Engine testMode + IDEA_DISKS_ROOT/IDEA_WATCH_DIR on the Pi)`,
+        )
+    }
+
     async dockFixture(engineId: string, diskId: string): Promise<void> {
         this.assertNotExcluded(engineId, 'dockFixture')
-        throw new Error(
-            `RealFleetOps: dockFixture requires physical Kid fixture disk ${diskId} on ${engineId}; ` +
-            `not present (duration-kolibri-grade5a-001 / duration-nextcloud-grade5a-001). ` +
-            `Use scenario minimal-live for reboot-only smoke.`,
-        )
+        if (looksLikeProtectedHwDisk(diskId)) {
+            throw new Error(`RealFleetOps: refuse to dock protected disk '${diskId}'`)
+        }
+        resolveDurationFixturePack(diskId) // validate known Kid id
+        assertPrivateDurationRoots(this.disksRoot, this.watchDir)
+
+        // If already docked here, treat as success (idempotent).
+        try {
+            const view = await this.readStore(engineId)
+            const disk = view.diskDB[diskId]
+            const live = this.liveIds.get(engineId)
+            if (disk?.dockedTo === engineId || (live && disk?.dockedTo === live)) {
+                console.log(`[RealFleetOps] dockFixture: ${diskId} already on ${engineId}`)
+                return
+            }
+            // Docked elsewhere in this unique-store view — eject first on this engine only.
+            if (disk?.dockedTo) {
+                await this.undockFixtures([engineId], diskId)
+            }
+        } catch {
+            // store not ready yet — proceed with copy
+        }
+
+        const device = this.allocateTestDevice(engineId, diskId)
+        await this.sshDockCopy(engineId, diskId, device)
+        await this.waitDiskDocked(engineId, diskId, 60_000)
     }
 
     async moveDisk(fromEngine: string, toEngine: string, diskId: string): Promise<void> {
         this.assertNotExcluded(fromEngine, 'moveDisk(from)')
         this.assertNotExcluded(toEngine, 'moveDisk(to)')
-        throw new Error(
-            `RealFleetOps: moveDisk requires physical Kid fixture disk ${diskId} ` +
-            `(${fromEngine}→${toEngine}); not present. Use scenario minimal-live for reboot-only smoke.`,
-        )
+        if (fromEngine === toEngine) {
+            await this.dockFixture(toEngine, diskId)
+            return
+        }
+        if (looksLikeProtectedHwDisk(diskId)) {
+            throw new Error(`RealFleetOps: refuse to move protected disk '${diskId}'`)
+        }
+        await this.undockFixtures([fromEngine], diskId)
+        await this.dockFixture(toEngine, diskId)
     }
 
     /** Drop all open WS connections (tests / process exit). */
@@ -553,4 +816,7 @@ export class RealFleetOps implements FleetOps {
         const ids = [...this.conns.keys()]
         for (const id of ids) await this.disconnect(id)
     }
+
+    getDisksRoot(): string { return this.disksRoot }
+    getWatchDir(): string { return this.watchDir }
 }

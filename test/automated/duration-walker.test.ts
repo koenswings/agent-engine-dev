@@ -9,9 +9,14 @@ import { semanticStoresEqual, waitForConvergence } from '../duration/convergence
 import { evaluateInvariants, DEFAULT_INFRA_INVARIANTS, listInvariantTypes } from '../duration/invariants.js'
 import { runWalk } from '../duration/runner.js'
 import {
+    assertPrivateDurationRoots,
+    DEFAULT_DURATION_DISKS_ROOT,
+    DEFAULT_DURATION_WATCH_DIR,
     looksLikeProtectedHwDisk,
     parseHostsFlag,
+    PM2_RECONNECT_TIMEOUT_MS,
     RealFleetOps,
+    resolveDurationFixturePack,
 } from '../duration/realFleetOps.js'
 import {
     assertSafeFixtureDisk,
@@ -61,9 +66,10 @@ describe('duration scenario YAML loader', () => {
         expect(s.fixtures?.find(f => f.name === 'nextcloud')?.instanceId).toBe('nextcloud-grade5a-001')
     })
 
-    it('loads school-day and stress scenarios', () => {
+    it('loads school-day, stress, and minimal-dock scenarios', () => {
         expect(loadScenario('school-day').states.infra_idle).toBeTruthy()
         expect(loadScenario('stress').states.infra_reboot).toBeTruthy()
+        expect(loadScenario('minimal-dock').states.infra_docked).toBeTruthy()
     })
 
     it('refuses hw-roundtrip stick fixture markers', () => {
@@ -357,16 +363,43 @@ describe('RealFleetOps guard clauses (no network)', () => {
         expect(ops.getStoreMode()).toBe('unique')
     })
 
-    it('dockFixture / moveDisk throw clear fixture Errors', async () => {
+    it('defaults to Atlas-approved private duration roots (never /disks)', () => {
+        // Explicit roots — process env may set IDEA_DISKS_ROOT for the vitest harness.
+        const ops = new RealFleetOps({
+            poolEngines: ['idea01', 'idea03'],
+            excludeEngines: ['idea02'],
+            hosts: fakeHosts,
+            disksRoot: DEFAULT_DURATION_DISKS_ROOT,
+            watchDir: DEFAULT_DURATION_WATCH_DIR,
+        })
+        expect(ops.getDisksRoot()).toBe(DEFAULT_DURATION_DISKS_ROOT)
+        expect(ops.getWatchDir()).toBe(DEFAULT_DURATION_WATCH_DIR)
+        expect(PM2_RECONNECT_TIMEOUT_MS).toBe(150_000)
+        expect(resolveDurationFixturePack('duration-kolibri-grade5a-001')).toBe('kolibri')
+        expect(resolveDurationFixturePack('duration-nextcloud-grade5a-001')).toBe('nextcloud')
+        expect(() => resolveDurationFixturePack('sdb1')).toThrow(/unknown/)
+        expect(() => assertPrivateDurationRoots('/disks', DEFAULT_DURATION_WATCH_DIR)).toThrow(/never \/disks/)
+        expect(() => assertPrivateDurationRoots(DEFAULT_DURATION_DISKS_ROOT, '/dev/engine')).toThrow(/never \/dev\/engine/)
+        expect(() => new RealFleetOps({
+            poolEngines: ['idea01', 'idea03'],
+            hosts: fakeHosts,
+            disksRoot: '/disks',
+            watchDir: DEFAULT_DURATION_WATCH_DIR,
+        })).toThrow(/never \/disks/)
+    })
+
+    it('dockFixture refuses protected / golden without contacting Pis', async () => {
         const ops = new RealFleetOps({
             poolEngines: ['idea01', 'idea03'],
             excludeEngines: ['idea02'],
             hosts: fakeHosts,
         })
-        await expect(ops.dockFixture('idea01', 'duration-kolibri-grade5a-001'))
-            .rejects.toThrow(/physical Kid fixture|minimal-live/)
-        await expect(ops.moveDisk('idea01', 'idea03', 'duration-kolibri-grade5a-001'))
-            .rejects.toThrow(/physical Kid fixture|minimal-live/)
+        await expect(ops.dockFixture('idea02', 'duration-kolibri-grade5a-001'))
+            .rejects.toThrow(/excluded|golden/)
+        await expect(ops.dockFixture('idea01', 'stick-26A1EE83197F'))
+            .rejects.toThrow(/protected|unknown/)
+        await expect(ops.moveDisk('idea01', 'idea02', 'duration-kolibri-grade5a-001'))
+            .rejects.toThrow(/excluded|golden/)
     })
 
     it('looksLikeProtectedHwDisk catches Intenso markers', () => {
@@ -416,5 +449,39 @@ describe('minimal-live scenario (FakeFleetOps)', () => {
         expect(result.aborted).toBe(false)
         expect(result.failures).toBe(0)
         expect(result.logs.some(l => l.action === 'infra_reboot_engine')).toBe(true)
+    })
+})
+
+describe('minimal-dock scenario (FakeFleetOps)', () => {
+    it('loads dock scenario and walks dock/undock/move on FakeFleetOps', async () => {
+        const scenario = loadScenario('minimal-dock')
+        expect(scenario.name).toMatch(/dock/i)
+        expect(scenario.store_mode).toBe('unique')
+        expect(scenario.exclude_engines).toContain('idea02')
+        expect(scenario.fixtures?.some(f => f.infra_disk !== false)).toBe(true)
+        const actions = new Set<string>()
+        for (const def of Object.values(scenario.states)) {
+            for (const t of def.transitions) actions.add(t.action)
+        }
+        expect(actions.has('infra_dock_fixture')).toBe(true)
+        expect(actions.has('infra_undock_fixtures')).toBe(true)
+        expect(actions.has('infra_move_disk')).toBe(true)
+        const ops = fakeOps({
+            poolEngines: scenario.pool_engines!,
+            excludeEngines: scenario.exclude_engines,
+            storeMode: 'unique',
+        })
+        const result = await runWalk({
+            scenario,
+            iterations: 30,
+            fast: true,
+            ops,
+            stubUi: true,
+            settleTimeoutMs: 500,
+            rng: makeRng(scenario.seed ?? 11),
+        })
+        expect(result.aborted).toBe(false)
+        expect(result.failures).toBe(0)
+        expect(result.logs.some(l => l.action === 'infra_dock_fixture')).toBe(true)
     })
 })

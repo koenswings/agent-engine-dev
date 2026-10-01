@@ -13,7 +13,9 @@ Parent: [idea#166](https://github.com/koenswings/idea/issues/166).
 
 Paths live under `agent-app-dev/tests/duration-tests/fixtures/`. Scenario YAML `fixtures:` maps these IDs; do not invent others. See Kid `walker-ref.yaml`.
 
-**Physical Kid USB fixtures are not on the fleet Pis.** Live overnight smoke must use `minimal-live` (dock-free). Never eject/erase the idea03 Intenso Files Disk.
+**Kid testMode dock** uses private roots on pool Pis (`IDEA_DISKS_ROOT=/home/pi/idea/duration-disks`,
+`IDEA_WATCH_DIR=/home/pi/idea/duration-watch`) — never `/disks`, never idea03 `sdb1`, never golden idea02.
+Live dock smoke: `minimal-dock`. Reboot-only: `minimal-live`. Never eject/erase the idea03 Intenso Files Disk.
 
 Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/pull/167); Pixel Console [agent-console-dev#134](https://github.com/koenswings/agent-console-dev/pull/134).
 
@@ -27,7 +29,7 @@ Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/
 - Shared-store (`shared` + mDNS-on) vs unique-doc (`unique` + mDNS-off) mode switch
 - Structured JSON logs on `pnpm test:duration`
 
-**Not yet:** Playwright UI Interactions (Phase 3), stability probe (Phase 4), physical dock/move on live fleet (needs Kid USB + Ops shared store).
+**Not yet:** Playwright UI Interactions (Phase 3), stability probe (Phase 4), shared-store live mode (Ops), instance-start after dock (Kolibri image).
 
 ## Run (no Pis — FakeFleetOps)
 
@@ -55,7 +57,11 @@ Requires Tailscale reachability + SSH key `~/.ssh/id_ed25519` as `pi@<host>`.
 **Host map flag is `--hosts`** (not `--engine-urls`). Same format via env `DURATION_FLEET_HOSTS`.
 
 ```bash
-# Dock-free overnight smoke (unique stores; --fast = pm2 restart)
+# Minimal dock smoke (Kid copy+sentinel; no instance start; --fast = pm2 restart)
+pnpm test:duration -- --live --scenario minimal-dock --fast --iterations 20 \
+  --hosts idea01=100.99.231.94,idea03=100.126.117.80
+
+# Dock-free reboot-only smoke
 pnpm test:duration -- --live --scenario minimal-live --fast --iterations 30 \
   --hosts idea01=100.99.231.94,idea03=100.126.117.80
 
@@ -72,7 +78,8 @@ pnpm test:duration -- --live --scenario minimal-live --fast \
 
 - Claim **pool** Pis only (`idea01` / `idea03`). **Never golden idea02.**
 - Tonight’s Pis use **unique** stores + `mdns:false`. `applyStoreMode('shared')` throws until Ops provisions shared store+mDNS.
-- `dockFixture` / `moveDisk` throw until Kid fixture USBs are present — do **not** soft-fake docks into the live CRDT.
+- `dockFixture` = rsync Kid pack → `duration-disks/idea-test-N/` + touch sentinel under `duration-watch` (excludes `instances/` so Engine does not auto-start apps). `undock` = `ejectDisk` + remove sentinel. `moveDisk` = undock then dock.
+- Engine on Pis must run with `testMode:true` and `IDEA_SYSTEM_DISK_SKIP=true` plus the private roots above (Atlas).
 - Fixture disks must **never** be the idea03 hw-roundtrip Intenso
   (USB serial `26A1EE83197F` / disk serial `3813430-532011020` /
   UUID `a0bf8374-274e-4bef-b32e-cfbfd09d2884` / label `IDEA Disk`).
