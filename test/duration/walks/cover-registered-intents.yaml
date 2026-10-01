@@ -24,9 +24,12 @@
 # Engine tip: after confirm_erase, redockEmpty002AfterErase fresh-docks empty-002
 # (EMPTY stays 001). Path A should still prefer erase republish Empty.
 # Prefer A r35/r36 FAIL@90: start_after_install fills empty-002 with kolibri → second
-# late install_app / later erase need EmptyDiskPanel again. Engine tip: after
-# open_copied_instance, redockEmpty002BeforeSecondInstall fresh-docks empty-002
-# and purges Automerge instanceDB storedOn=empty-002 (r36; hasInstancesOn is store-keyed).
+# late install_app needs EmptyDiskPanel again. Engine tip: after open_copied_instance,
+# redockEmpty002BeforeSecondInstall fresh-docks empty-002 and purges Automerge
+# instanceDB storedOn=empty-002 (r36; hasInstancesOn is store-keyed).
+# Prefer A r37 FAIL@92: second late install_app fills empty-002 again → erase needs
+# EmptyDiskPanel. Engine tip: after stay_on_disk, redockEmpty002BeforeErase mirrors
+# BeforeSecondInstall (fresh dock + store purge).
 # Optional DURATION_COPY_SOURCE_DISK / DURATION_COPY_TARGET_DISK /
 # DURATION_COPY_INSTANCE_ID (default kolibri→nextcloud).
 # Wait for Atlas :8080 GO + Path A re-dock layout (kolibri/:18080, empties) before
@@ -334,6 +337,8 @@ steps:
   - from: op_install
     to: op_disk
     action: stay_on_disk
+  # Prefer A r37 FAIL@92: after stay_on_disk, Engine redockEmpty002BeforeErase fresh-docks
+  # empty-002 Empty + store purge (second late install_app left it as app disk again).
   - from: op_disk
     to: op_erase
     action: erase_disk

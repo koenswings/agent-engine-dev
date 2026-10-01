@@ -270,10 +270,10 @@ export const waitEmpty002PostInstallRunning = async (
  * no-ops when already on the same engine). Does NOT change DURATION_EMPTY_DISK_ID
  * (=001); Pixel ensureEmptyDiskPanel discovers any empty-badge row. Never idea02.
  * FakeFleetOps: undock pool-wide + synthetic dockFixture (CRI stays green).
- * purgeStoreInstances (BeforeSecondInstall only / Prefer A r36): FS wipe is not
- * enough — Automerge instanceDB rows with storedOn=empty-002 survive; Console
- * hasInstancesOn keys off store → still shows app / no EmptyDiskPanel. AfterErase
- * must NOT purge (erase already cleared instances).
+ * purgeStoreInstances (BeforeSecondInstall + BeforeErase / Prefer A r36/r37): FS
+ * wipe is not enough — Automerge instanceDB rows with storedOn=empty-002 survive;
+ * Console hasInstancesOn keys off store → still shows app / no EmptyDiskPanel.
+ * AfterErase must NOT purge (erase already cleared instances).
  */
 const redockEmpty002Fresh = async (
     ctx: ActionContext,
@@ -330,13 +330,29 @@ export const redockEmpty002AfterErase = async (ctx: ActionContext): Promise<stri
  * is backup). Mirror AfterErase undock+dockFixture, PLUS purgeStoreInstances (r36):
  * Automerge instanceDB rows with storedOn=empty-002 survive FS wipe; Console
  * hasInstancesOn keys off store (AfterErase does not need this — erase cleared
- * instances). Hooked after open_copied_instance. Later erase_disk also needs EmptyDiskPanel.
+ * instances). Hooked after open_copied_instance.
  */
 export const redockEmpty002BeforeSecondInstall = async (ctx: ActionContext): Promise<string> =>
     redockEmpty002Fresh(
         ctx,
         'redockEmpty002BeforeSecondInstall',
         'before second late install_app (Empty fresh pack + store purge)',
+        { purgeStoreInstances: true },
+    )
+
+/**
+ * Prefer A r37 live safety net: second late install_app@90 fills empty-002 with
+ * kolibri again (app disk). stay_on_disk@91 then erase_disk@92 needs EmptyDiskPanel
+ * (empty-001 remains backup; empty-badge rows=0 otherwise). Mirror
+ * BeforeSecondInstall: undock+dockFixture + purgeStoreInstances. Hooked after
+ * stay_on_disk (only CRI occurrence; precedes late erase). Do not regress
+ * AfterErase (no purge) or BeforeSecondInstall.
+ */
+export const redockEmpty002BeforeErase = async (ctx: ActionContext): Promise<string> =>
+    redockEmpty002Fresh(
+        ctx,
+        'redockEmpty002BeforeErase',
+        'before late erase_disk (Empty fresh pack + store purge)',
         { purgeStoreInstances: true },
     )
 
@@ -716,6 +732,21 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             return {
                 ok: false,
                 message: `open_copied_instance ok but empty-002 re-dock failed: ${err}`,
+                layer,
+            }
+        }
+    }
+    // Prefer A r37: after stay_on_disk (precedes late erase), re-dock empty-002 Empty
+    // before erase_disk (second late install_app left empty-002 as app disk again).
+    if (result.ok && ctx.action === 'stay_on_disk') {
+        try {
+            const note = await redockEmpty002BeforeErase(ctx)
+            message = `${message}; ${note}`
+        } catch (e) {
+            const err = e instanceof Error ? e.message : String(e)
+            return {
+                ok: false,
+                message: `stay_on_disk ok but empty-002 re-dock failed: ${err}`,
                 layer,
             }
         }
