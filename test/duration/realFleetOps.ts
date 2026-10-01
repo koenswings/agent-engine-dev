@@ -726,6 +726,30 @@ export class RealFleetOps implements FleetOps {
         return s
     }
 
+
+    /** SSH: does IDEA_DISKS_ROOT/idea-test-N/META.yaml exist for this disk's preferred slot? */
+    private async hasHealthyFixtureTree(engineId: string, diskId: string): Promise<string | null> {
+        const map = this.deviceMap(engineId)
+        const preferred = map.get(diskId)
+        const host = this.hostOf(engineId)
+        const candidates = preferred
+            ? [preferred]
+            : ['idea-test-1', 'idea-test-2', 'idea-test-3', 'idea-test-4']
+        for (const device of candidates) {
+            if (!/^idea-test-[0-9]+$/.test(device)) continue
+            const meta = `${this.disksRoot}/${device}/META.yaml`
+            try {
+                await this.ssh(host, `test -f '${meta}'`)
+                map.set(diskId, device)
+                this.usedSet(engineId).add(device)
+                return device
+            } catch {
+                /* try next */
+            }
+        }
+        return null
+    }
+
     /** Allocate idea-test-N on this engine for diskId (stable if already assigned). */
     private allocateTestDevice(engineId: string, diskId: string): string {
         const map = this.deviceMap(engineId)
@@ -782,8 +806,8 @@ export class RealFleetOps implements FleetOps {
         const remote = [
             'set -euo pipefail',
             `mkdir -p '${this.disksRoot}' '${this.watchDir}'`,
-            // Single-line if — must not split then/fi across ';'-joined fragments
-            `if test -f '${dest}/META.yaml'; then echo "RealFleetOps: reuse existing Path A tree at ${dest}"; touch '${sentinel}'; exit 0; fi`,
+            // Reuse any existing dest (META may be gone after partial rm; instances/ often docker-owned)
+            `if test -d '${dest}'; then echo "RealFleetOps: reuse existing Path A tree at ${dest}"; touch '${sentinel}'; exit 0; fi`,
             `test -d '${src}' || { echo "missing fixture source ${src}" >&2; exit 2; }`,
             `rm -rf '${dest}'`,
             `mkdir -p '${dest}'`,
@@ -890,9 +914,23 @@ export class RealFleetOps implements FleetOps {
             // store not ready yet — proceed with copy
         }
 
-        const device = this.allocateTestDevice(engineId, diskId)
-        await this.sshDockCopy(engineId, diskId, device)
-        await this.waitDiskDocked(engineId, diskId, 60_000)
+        // Prefer an engine that already has a healthy Path A META.yaml tree
+        let target = engineId
+        let device = await this.hasHealthyFixtureTree(engineId, diskId)
+        if (!device) {
+            for (const id of this.pool) {
+                if (this.exclude.includes(id) || id === engineId) continue
+                device = await this.hasHealthyFixtureTree(id, diskId)
+                if (device) {
+                    target = id
+                    console.log(`[RealFleetOps] dockFixture: prefer ${target} (healthy tree ${device})`)
+                    break
+                }
+            }
+        }
+        if (!device) device = this.allocateTestDevice(target, diskId)
+        await this.sshDockCopy(target, diskId, device)
+        await this.waitDiskDocked(target, diskId, 60_000)
     }
 
     async moveDisk(fromEngine: string, toEngine: string, diskId: string): Promise<void> {
