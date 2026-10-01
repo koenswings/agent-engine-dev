@@ -80,6 +80,8 @@ CLI `--start-instances` → `RealFleetOps({ startInstances: true })` (keep `inst
 
 Path A re-dock after eject: RealFleetOps does `rm -f` sentinel, `sleep 5`, then `touch` (Atlas — chokidar needs unlink before create, not mtime-only touch; Atlas Ops proof: 5s before touch). `dockFixture` waits up to **120s** for store dock, and on first timeout re-fires the sentinel once then waits again before failing.
 
+Path A `infra_dock_fixture` re-dock (findDockedEngine miss / no walker dock): prefer non-excluded `poolEngines[0]` (Console host / idea01) — not RNG; also dock sibling `fixtureDisks` on the same engine.
+
 Path A / `infra_reboot_engine --fast`: `rebootEngine` stops `kolibri-grade5a` / `nextcloud-grade5a` / `duration-*` containers (never `idea166-*`) before `pm2 restart`, then `reconcileDurationZombies` after `waitReady` so Automerge Running+Undocked fixtures do not trip `no_zombie_instances`.
 
 

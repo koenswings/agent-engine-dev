@@ -201,26 +201,42 @@ const infraUndockFixtures = async (ctx: ActionContext): Promise<ActionResult> =>
 const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
     // Prefer Atlas/Kid pre-docked engine (Path A) — RealFleetOps.findDockedEngine when live.
     const opsAny = ctx.opts.ops as FleetOps & { findDockedEngine?: (diskId: string) => Promise<string | null> }
-    let engine = ctx.walker.dockedEngine && !ctx.excludeEngines.includes(ctx.walker.dockedEngine)
-        ? ctx.walker.dockedEngine
-        : pickPoolEngine(ctx)
     if (typeof opsAny.findDockedEngine === 'function') {
         const existing = await opsAny.findDockedEngine(ctx.fixtureDisk)
         if (existing && !ctx.excludeEngines.includes(existing)) {
-            engine = existing
             await settleParticipants(ctx, ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e)))
             return {
                 ok: true,
-                message: `fixture ${ctx.fixtureDisk} already docked on ${engine} (no-op)`,
-                dockedEngine: engine,
+                message: `fixture ${ctx.fixtureDisk} already docked on ${existing} (no-op)`,
+                dockedEngine: existing,
                 layer: 'infra',
             }
         }
     }
+    // Path A re-dock after undock: prefer Console host pool[0] (idea01), never RNG —
+    // unique-store inventory is empty if fixtures land on idea03/idea04.
+    let engine: string
+    if (ctx.walker.dockedEngine && !ctx.excludeEngines.includes(ctx.walker.dockedEngine)) {
+        engine = ctx.walker.dockedEngine
+    } else if (ctx.opts.preserveDockedOnReturn) {
+        const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
+        if (pool.length === 0) {
+            throw new Error('No pool engines available (all excluded — golden-only fleet?)')
+        }
+        engine = pool[0]!
+    } else {
+        engine = pickPoolEngine(ctx)
+    }
     assertNotGolden(ctx, engine, 'infra_dock_fixture')
     await ctx.opts.ops.dockFixture(engine, ctx.fixtureDisk)
+    // Sibling fixtures (nextcloud) on the same engine so inventory sees both packs.
+    const siblings = ctx.fixtureDisks.filter(d => d !== ctx.fixtureDisk)
+    for (const diskId of siblings) {
+        await ctx.opts.ops.dockFixture(engine, diskId)
+    }
     await settleParticipants(ctx, ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e)))
-    return { ok: true, message: `docked ${ctx.fixtureDisk} on ${engine}`, dockedEngine: engine, layer: 'infra' }
+    const sibMsg = siblings.length ? ` (+ ${siblings.join(', ')})` : ''
+    return { ok: true, message: `docked ${ctx.fixtureDisk}${sibMsg} on ${engine}`, dockedEngine: engine, layer: 'infra' }
 }
 
 const infraMoveDisk = async (ctx: ActionContext): Promise<ActionResult> => {
