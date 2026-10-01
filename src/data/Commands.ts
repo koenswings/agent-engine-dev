@@ -370,7 +370,8 @@ const summariseDiskWrapper = async (storeHandle: DocHandle<Store> | null, target
     if (!storeHandle) throw new Error('Store is not available.')
     const summary = await summariseDisk(storeHandle, targetId)
     attachTraceResult(summary)
-    print(chalk.green(`Summary for ${summary.label}: readable=${summary.readable} partial=${summary.partial}`))
+    const partial = !!(summary.files?.partial || summary.other?.partial)
+    print(chalk.green(`Summary for ${summary.label}: readable=${summary.readable} partial=${partial}`))
 }
 
 /** eraseDisk <targetId> <summaryTraceId> <confirmName…> (idea#134). */
