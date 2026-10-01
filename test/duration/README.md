@@ -33,7 +33,7 @@ Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/
 
 **Deferred / blockers:** live Playwright claim (Axle→Atlas); shared-store live mode (Ops); instance-start after dock (Kolibri image); `keep_watching` / `open_wikipedia_*` (Pixel deferred).
 
-**2-engine UI claims:** use `school-day-2engine` (idea01+idea03, `store_mode: unique`, no deferred Intents). Full `school-day` still lists idea04 + shared store + deferred lesson Intents — not for current 2-host live claims.
+**2-engine UI claims:** use `school-day-2engine` (idea01+idea03, `store_mode: unique`, hub/console/operator Intents only — no App-open; no deferred Intents). Full `school-day` still lists idea04 + shared store + deferred lesson Intents — not for current 2-host live claims. App-open (`open_kolibri_*` / `open_nextcloud_*` / `open_video` / `open_exercise`) needs Running Kid fixtures (not dock-only).
 
 ## Run (no Pis — FakeFleetOps)
 
@@ -71,7 +71,7 @@ pnpm test:duration -- --live --scenario minimal-dock --fast --iterations 20 \
 pnpm test:duration -- --live --scenario minimal-live --fast --iterations 30 \
   --hosts idea01=100.99.231.94,idea03=100.126.117.80
 
-# 2-engine UI school-day (no idea04; unique store; hardpass Intents)
+# 2-engine UI school-day (no idea04; unique; hub/console/operator only — no App-open)
 pnpm test:duration -- --live --ui --scenario school-day-2engine --fast --iterations 40 \
   --hosts idea01=100.99.231.94,idea03=100.126.117.80 \
   --console-url http://idea01:8080

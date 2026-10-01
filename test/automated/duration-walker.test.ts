@@ -417,9 +417,22 @@ describe('Markov walker (FakeFleetOps)', () => {
         expect(actions.size).toBeGreaterThan(1)
     })
 
-    it('school-day-2engine Fake walk stays on idea01+idea03 without deferred Intents', async () => {
+    it('school-day-2engine Fake walk stays on idea01+idea03 without deferred or App-open Intents', async () => {
         const scenario = loadScenario('school-day-2engine')
         expect(scenario.pool_engines).toEqual(['idea01', 'idea03'])
+        // Scenario must not even declare App-open edges (live --ui needs Running fixtures).
+        const yamlActions = new Set<string>()
+        for (const st of Object.values(scenario.states)) {
+            for (const tr of st.transitions) yamlActions.add(tr.action)
+        }
+        for (const banned of [
+            'open_kolibri_as_teacher', 'open_kolibri_as_learner',
+            'open_nextcloud_as_teacher', 'open_nextcloud_as_learner',
+            'open_video', 'open_exercise',
+            'keep_watching', 'next_resource', 'exit_lesson',
+        ]) {
+            expect(yamlActions.has(banned)).toBe(false)
+        }
         const ops = fakeOps({
             poolEngines: scenario.pool_engines!,
             excludeEngines: scenario.exclude_engines,
@@ -438,7 +451,9 @@ describe('Markov walker (FakeFleetOps)', () => {
         expect(result.aborted).toBe(false)
         expect(result.failures).toBe(0)
         for (const step of result.logs) {
-            expect(step.action).not.toMatch(/keep_watching|next_resource|exit_lesson|open_wikipedia/)
+            expect(step.action).not.toMatch(
+                /keep_watching|next_resource|exit_lesson|open_wikipedia|open_kolibri|open_nextcloud|open_video|open_exercise/,
+            )
         }
         const actions = new Set(result.logs.map(l => l.action))
         expect(actions.size).toBeGreaterThan(1)

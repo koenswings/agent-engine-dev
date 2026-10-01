@@ -2,6 +2,17 @@
 # Does NOT require pool engine idea04. Does NOT use deferred Intents
 # (keep_watching / next_resource / exit_lesson / open_wikipedia_*).
 # store_mode unique matches live fleet (shared+mDNS not provisioned).
+#
+# Hub / console / operator Intents ONLY — NO App-open edges:
+#   open_kolibri_*, open_nextcloud_*, open_video, open_exercise
+# Those require Running Kid fixture instances on the Console overview.
+# RealFleetOps infra_dock_fixture defaults to dock-only (strips instances/),
+# so live --ui cannot reach App-open without startInstances+images or
+# provisioned Running instances. Overnight 2-engine UI therefore stays on
+# return_to_start / open_console_as_* / stay_on_* / open_disk_inventory
+# (+ light infra). Full App-open walks belong in a later scenario once
+# fixtures are Running on the pool.
+#
 # Prefer: pnpm test:duration -- --live --ui --scenario school-day-2engine --fast \
 #   --hosts idea01=…,idea03=… --console-url http://idea01:8080
 name: School day 2-engine UI
@@ -25,7 +36,7 @@ fixtures:
 
 states:
   start:
-    description: Neutral hub — usage / operator / light infra (no idea04)
+    description: Neutral hub — usage / operator / light infra (no idea04; no App-open)
     transitions:
       - to: console_teacher
         weight: 25
@@ -42,12 +53,10 @@ states:
 
   console_teacher:
     layer: usage
+    description: Teacher overview dwell only (no open_kolibri — needs Running fixture)
     transitions:
-      - to: kolibri_manage
-        weight: 40
-        action: open_kolibri_as_teacher
       - to: console_teacher
-        weight: 55
+        weight: 95
         action: stay_on_teacher_overview
       - to: start
         weight: 5
@@ -55,80 +64,7 @@ states:
 
   console_learner:
     layer: usage
-    transitions:
-      - to: kolibri_home
-        weight: 40
-        action: open_kolibri_as_learner
-      - to: nc_browse
-        weight: 25
-        action: open_nextcloud_as_learner
-      - to: console_learner
-        weight: 30
-        action: stay_on_learner_overview
-      - to: start
-        weight: 5
-        action: return_to_start
-
-  kolibri_manage:
-    layer: usage
-    transitions:
-      - to: console_teacher
-        weight: 50
-        action: stay_on_teacher_overview
-      - to: kolibri_manage
-        weight: 45
-        action: open_kolibri_as_teacher
-      - to: start
-        weight: 5
-        action: return_to_start
-
-  kolibri_home:
-    layer: usage
-    description: Learner Kolibri — open_video / open_exercise with Kid pins (no deferred chrome)
-    transitions:
-      - to: kolibri_watching
-        weight: 40
-        action: open_video
-      - to: kolibri_exercise
-        weight: 25
-        action: open_exercise
-      - to: console_learner
-        weight: 30
-        action: stay_on_learner_overview
-      - to: start
-        weight: 5
-        action: return_to_start
-
-  kolibri_watching:
-    layer: usage
-    description: After open_video — leave via hardpass Intents only (no keep_watching / exit_lesson)
-    transitions:
-      - to: kolibri_home
-        weight: 50
-        action: open_kolibri_as_learner
-      - to: console_learner
-        weight: 45
-        action: stay_on_learner_overview
-      - to: start
-        weight: 5
-        action: return_to_start
-
-  kolibri_exercise:
-    layer: usage
-    description: After open_exercise — leave via hardpass Intents only
-    transitions:
-      - to: kolibri_home
-        weight: 50
-        action: open_kolibri_as_learner
-      - to: console_learner
-        weight: 45
-        action: stay_on_learner_overview
-      - to: start
-        weight: 5
-        action: return_to_start
-
-  nc_browse:
-    layer: usage
+    description: Learner overview dwell only (no open_kolibri/nextcloud — needs Running fixture)
     transitions:
       - to: console_learner
         weight: 95
