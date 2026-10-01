@@ -17,6 +17,7 @@ import type {
 } from './types.js'
 import { waitForConvergence } from './convergence.js'
 import { finalizeRecordedFrame, framePath } from './recordWalk.js'
+import { DURATION_UI_FIXTURES } from './ui/fixtures.js'
 
 export const HUB_ACTIONS = [
     'return_to_start',
@@ -187,6 +188,47 @@ const settleParticipants = async (ctx: ActionContext, engines: string[]): Promis
     if (!result.ok) {
         throw new Error(`settle gate failed: ${result.reason ?? 'unknown'}`)
     }
+}
+
+
+/**
+ * Prefer A r26/r27 live safety net: Path A confirm_erase of empty-002 undocks
+ * idea-test-4 mid-walk (disk ABSENT / META-only sparse) so late install_app has
+ * empty-badge rows=0. Re-dock Kid pack empty-002/ fresh onto Console host
+ * pool[0] (or walker.dockedEngine). Does NOT change DURATION_EMPTY_DISK_ID (=001);
+ * Pixel ensureEmptyDiskPanel already discovers any empty-badge row.
+ * Force undock-then-dock so RealFleetOps empty always-fresh-copy runs (dockFixture
+ * no-ops when already on the same engine). Path A should still prefer erase
+ * republish Empty — this is the Engine mid-walk mitigation.
+ */
+export const redockEmpty002AfterErase = async (ctx: ActionContext): Promise<string> => {
+    const diskId = DURATION_UI_FIXTURES.empty2.diskId
+    const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
+    if (pool.length === 0) {
+        throw new Error('redockEmpty002AfterErase: no pool engines available')
+    }
+    // Prefer existing dock holder, else Console host pool[0] (Path A empty dock pattern).
+    const engine =
+        (ctx.walker.dockedEngine && !ctx.excludeEngines.includes(ctx.walker.dockedEngine)
+            ? ctx.walker.dockedEngine
+            : null) ?? pool[0]!
+    assertNotGolden(ctx, engine, 'redockEmpty002AfterErase')
+
+    const opsAny = ctx.opts.ops as FleetOps & {
+        findDockedEngine?: (id: string) => Promise<string | null>
+    }
+    if (typeof opsAny.findDockedEngine === 'function') {
+        const already = await opsAny.findDockedEngine(diskId)
+        if (already) {
+            await ctx.opts.ops.undockFixtures([already], diskId)
+        }
+    } else {
+        // Fake / no findDockedEngine: undock pool-wide (idempotent if absent).
+        await ctx.opts.ops.undockFixtures(pool, diskId)
+    }
+    await ctx.opts.ops.dockFixture(engine, diskId)
+    await settleParticipants(ctx, pool)
+    return `re-docked ${diskId} on ${engine} after confirm_erase (Empty fresh pack)`
 }
 
 const infraUndockFixtures = async (ctx: ActionContext): Promise<ActionResult> => {
@@ -522,9 +564,24 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             })
         }
     }
+    let message = result.message ?? `${result.mode}: ${ctx.action}`
+    // Prefer A r26: after successful confirm_erase, re-dock empty-002 Empty for late install_app.
+    if (result.ok && ctx.action === 'confirm_erase') {
+        try {
+            const note = await redockEmpty002AfterErase(ctx)
+            message = `${message}; ${note}`
+        } catch (e) {
+            const err = e instanceof Error ? e.message : String(e)
+            return {
+                ok: false,
+                message: `confirm_erase ok but empty-002 re-dock failed: ${err}`,
+                layer,
+            }
+        }
+    }
     return {
         ok: result.ok,
-        message: result.message ?? `${result.mode}: ${ctx.action}`,
+        message,
         layer,
     }
 }

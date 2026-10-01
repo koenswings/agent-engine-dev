@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { FakeFleetOps } from '../duration/actions.js'
+import { FakeFleetOps, dispatchAction, redockEmpty002AfterErase } from '../duration/actions.js'
 import { semanticStoresEqual, waitForConvergence } from '../duration/convergence.js'
 import { evaluateInvariants, DEFAULT_INFRA_INVARIANTS, listInvariantTypes } from '../duration/invariants.js'
 import { runWalk } from '../duration/runner.js'
@@ -820,6 +820,89 @@ describe('Phase 3 UI Intent dispatch (StubUiDriver)', () => {
         if (dir) {
             expect(dir).toMatch(/e2e\/intents/)
         }
+    })
+})
+
+
+describe('Prefer A empty-002 re-dock after confirm_erase (Fake)', () => {
+    it('redockEmpty002AfterErase docks empty-002 on pool[0]', async () => {
+        const ops = fakeOps({
+            poolEngines: ['idea01', 'idea03'],
+            excludeEngines: ['idea02'],
+            storeMode: 'shared',
+        })
+        const ctx = {
+            opts: {
+                ops,
+                rng: () => 0,
+                settleTimeoutMs: 500,
+                fast: true,
+                stubUi: true,
+            },
+            walker: { current: 'op_disk', layer: 'operator' as const, dockedEngine: null, step: 76 },
+            from: 'op_erase',
+            to: 'op_disk',
+            action: 'confirm_erase',
+            excludeEngines: ['idea02'],
+            poolEngines: ['idea01', 'idea03'],
+            fixtureDisk: 'duration-kolibri-grade5a-001',
+            fixtureInstance: 'kolibri-grade5a-001',
+            fixtureDisks: [
+                'duration-kolibri-grade5a-001',
+                'duration-nextcloud-grade5a-001',
+                'duration-empty-001',
+                'duration-empty-002',
+            ],
+            fixtureInstances: { ...KID_FIXTURES },
+        }
+        const note = await redockEmpty002AfterErase(ctx as any)
+        expect(note).toMatch(/re-docked duration-empty-002 on idea01/)
+        const view = await ops.readStore('idea01')
+        expect(view.diskDB['duration-empty-002']?.dockedTo).toBe('idea01')
+    })
+
+    it('dispatchAction confirm_erase re-docks empty-002 via StubUiDriver', async () => {
+        const ops = fakeOps({
+            poolEngines: ['idea01', 'idea03'],
+            excludeEngines: ['idea02'],
+            storeMode: 'shared',
+        })
+        // Simulate r26 post-erase: empty-002 absent
+        await ops.dockFixture('idea01', 'duration-empty-001')
+        const driver = new StubUiDriver()
+        const result = await dispatchAction({
+            opts: {
+                ops,
+                rng: () => 0,
+                settleTimeoutMs: 500,
+                fast: true,
+                stubUi: true,
+                uiDriver: driver,
+            },
+            walker: { current: 'op_erase', layer: 'operator', dockedEngine: 'idea01', step: 75 },
+            from: 'op_erase',
+            to: 'op_disk',
+            action: 'confirm_erase',
+            excludeEngines: ['idea02'],
+            poolEngines: ['idea01', 'idea03'],
+            fixtureDisk: 'duration-kolibri-grade5a-001',
+            fixtureInstance: 'kolibri-grade5a-001',
+            fixtureDisks: [
+                'duration-kolibri-grade5a-001',
+                'duration-nextcloud-grade5a-001',
+                'duration-empty-001',
+                'duration-empty-002',
+            ],
+            fixtureInstances: { ...KID_FIXTURES },
+        } as any)
+        expect(result.ok).toBe(true)
+        expect(result.message).toMatch(/re-docked duration-empty-002/)
+        expect(driver.calls).toContain('confirm_erase')
+        const view = await ops.readStore('idea01')
+        expect(view.diskDB['duration-empty-002']?.dockedTo).toBe('idea01')
+        // Primary EMPTY id unchanged contract — we only re-dock 002
+        expect(DURATION_UI_FIXTURES.empty.diskId).toBe('duration-empty-001')
+        expect(DURATION_UI_FIXTURES.empty2.diskId).toBe('duration-empty-002')
     })
 })
 
