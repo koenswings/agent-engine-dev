@@ -30,7 +30,7 @@ Never eject/erase the idea03 Intenso Files Disk.
 
 **Live App-open (later):** Kid sidecar `post-dock-restore-running.sh` → `idea166-kolibri-live` :18080. Fake walks do not require live.
 
-Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/pull/167); Pixel Console [agent-console-dev#134](https://github.com/koenswings/agent-console-dev/pull/134).
+Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/pull/167); Pixel Console [agent-console-dev#134](https://github.com/koenswings/agent-console-dev/pull/134) tip **`128f2d3`** (58 Intents + `captureAfterIntent` / `screenshotPath`).
 
 ## Phase 1–4 (this tree)
 
@@ -41,11 +41,11 @@ Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/
 - Return-to-start hygiene (undock when leaving `infra_docked`)
 - Shared-store (`shared` + mDNS-on) vs unique-doc (`unique` + mDNS-off) mode switch
 - Structured JSON logs on `pnpm test:duration`
-- **Phase 3:** `test/duration/ui/` → StubUiDriver (CI / missing-Intent) or PlaywrightUiDriver (`--ui`) calling Pixel `runDurationIntent` / `captureAfterIntent`
+- **Phase 3:** `test/duration/ui/` → StubUiDriver (CI / missing-Intent) or PlaywrightUiDriver (`--ui`) calling Pixel `runDurationIntent` / `captureAfterIntent` (Console#134 @ `128f2d3`)
 - **Phase 4:** dwell stability probes (~30s / `--fast` compressed) on FakeFleetOps
 - **Walk recording:** `--record-walk <dir>` → `step-NNNN-<action>.png` + `walk.mp4` (ffmpeg)
 
-**Deferred / blockers:** live Playwright claim (Axle→Atlas); shared-store live mode (Ops); instance-start after dock (Kid Running sidecar); Pixel deferred + ~50 Pixel-missing Intents (Fake no-ops; see ACTIONS.md).
+**Deferred / blockers:** live Playwright claim (Axle→Atlas); shared-store live mode (Ops); instance-start after dock (Kid Running sidecar); Pixel deferred + remaining Pixel-missing Intents (Fake no-ops; see ACTIONS.md).
 
 ## Run modes (CLI — not separate graphs)
 
@@ -122,10 +122,10 @@ pnpm test:duration -- --live --scenario unified --fast \
 
 1. Creates `<dir>` if needed.
 2. After each **UI** Intent (and any step with a live Playwright page), writes `step-NNNN-<action>.png`.
-3. Soft-detect Pixel capture (Engine):
-   1. Pass `screenshotPath` into `runDurationIntent` when Pixel supports it
-   2. Else `bridge.captureAfterIntent(page, { path, intent })` (Pixel locked name)
-   3. Else `page.screenshot({ path, fullPage: true })`
+3. Soft-detect Pixel capture (aligned Console#134 @ `128f2d3`):
+   1. Pass `screenshotPath` into `runDurationIntent` (Pixel may settle + write PNG once)
+   2. Soft-detect `bridge.captureAfterIntent(page, { path, intent })` — **skip if PNG already exists** (no second capture)
+   3. Else fallback `page.screenshot({ path, fullPage: true })`
 4. At walk end (success or abort): `ffmpeg` → `walk.mp4` in `<dir>`. Logs `record_walk_frame` / `record_walk_video` / `record_walk_skip`.
 5. Without `--ui`: Fake Stub logs `record_walk_skip` per UI step (flag dry-run); no PNGs → skip video.
 

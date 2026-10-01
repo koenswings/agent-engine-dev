@@ -4,7 +4,7 @@
 **Locked** by Steve Design Review for idea#166 — do not rename without reporting a clash.  
 **Phase 3+4 (idea#168):** walker dispatches usage/operator Intents via `test/duration/ui/` → Pixel `e2e/intents` (`getIntent`).  
 **ONE graph:** `scenarios/unified.yaml` is the only Markov state table. Run modes = CLI knobs.  
-**Pixel registry:** Console#134 head `f26f737` — **47** Intent keys (Engine ACTIONS.md on #145 is source for walker contract).
+**Pixel registry:** Console#134 tip `128f2d3` — **58** Intent keys (+ `captureAfterIntent` / `screenshotPath` for `--record-walk`). Engine ACTIONS.md on #145 is source for walker contract.
 
 YAML transition shape (all layers): `{ to, weight, action }`.
 
@@ -35,12 +35,13 @@ Recording + cover-all / random with `--ui --live` (+ `--record-walk <dir>`) is t
 
 Fake/CI default: `StubUiDriver` (no browser). Live UI: `pnpm test:duration -- --live --ui` → `PlaywrightUiDriver` loads Pixel `runDurationIntent` / optional `captureAfterIntent` from `idea-console/duration-intents` or `agent-console-dev/e2e/intents` (or `DURATION_CONSOLE_INTENTS`).
 
-### Pixel-registered (47 — Console#134 @ f26f737)
+### Pixel-registered (58 — Console#134 @ 128f2d3)
 
 Hub/dwell: `open_console_as_*`, `return_to_start`, `stay_on_*`  
 App-open: `open_kolibri_as_*`, `open_nextcloud_as_*`, `open_video`, `open_exercise`  
 Operator: `open_disk_inventory`, `open_instance_controls`, `eject_disk`, `confirm_eject`, `cancel_eject`, `erase_disk`, `confirm_erase`, `cancel_erase`, `start_instance`, `stop_instance`, `open_account`, `close_account`, `open_settings`, `close_settings`, `sign_in`, `make_files_disk`, `add_files_role`  
-**+17 operator deep:** `install_app`, `start_after_install`, `stay_on_disk`, `make_backup_disk`, `restore_from_backup`, `open_app`, `backup_instance`, `back_to_disk`, `back_to_overview`, `log_out`, `notice_usb_dock`, `retry_login_first_time_setup`, `change_password`, `add_operator`, `remove_operator`, `copy_app`, `move_app`
+Operator deep: `install_app`, `start_after_install`, `stay_on_disk`, `make_backup_disk`, `restore_from_backup`, `open_app`, `backup_instance`, `back_to_disk`, `back_to_overview`, `log_out`, `notice_usb_dock`, `retry_login_first_time_setup`, `change_password`, `add_operator`, `remove_operator`, `copy_app`, `move_app`  
+**Part B leftovers + leave/back (@ 128f2d3):** `files_role_added`, `backup_configured_restored`, `done_redistribute`, `stay_on_source_disk`, `open_copied_instance`, `switch_engine`, `reboot_engine`, `back_to_console`, `leave_kolibri`, `leave_nextcloud_as_teacher`, `leave_nextcloud_as_learner`
 
 ### Deferred (clear message, not silent)
 
@@ -50,13 +51,11 @@ Operator: `open_disk_inventory`, `open_instance_controls`, `eject_disk`, `confir
 
 Do **not** silently drop these edges from `unified.yaml`.
 
-**Kolibri coaching / navigation:** `create_class`, `enroll_learners`, `build_lesson`, `create_quiz`, `read_reports`, `preview_as_learner`, `back_to_console`, `browse_classes`, `leave_kolibri`, `finish_exercise`, `next_video`
+**Kolibri coaching / navigation:** `create_class`, `enroll_learners`, `build_lesson`, `create_quiz`, `read_reports`, `preview_as_learner`, `browse_classes`, `finish_exercise`, `next_video`
 
-**Nextcloud deep:** `share_to_class`, `done_sharing`, `back_to_console_from_share`, `open_file_drop`, `after_upload`, `leave_file_drop`, `open_collab_doc`, `close_doc`, `keep_editing`, `browse_folders`, `leave_nextcloud_as_learner`, `leave_nextcloud_as_teacher`
+**Nextcloud deep:** `share_to_class`, `done_sharing`, `back_to_console_from_share`, `open_file_drop`, `after_upload`, `leave_file_drop`, `open_collab_doc`, `close_doc`, `keep_editing`, `browse_folders`
 
 **Wikipedia leave/search:** `search_browse_wikipedia`, `leave_wikipedia_as_learner`, `leave_wikipedia_as_teacher`
-
-**Operator still missing:** `backup_configured_restored`, `files_role_added`, `done_redistribute`, `stay_on_source_disk`, `open_copied_instance`, `switch_engine`, `reboot_engine`
 
 ### Engine-owned (not Pixel)
 

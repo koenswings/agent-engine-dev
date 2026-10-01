@@ -35,11 +35,11 @@ export const INFRA_ACTIONS = [
 
 /**
  * Usage/operator Intent keys present in unified.yaml.
- * Pixel-registered + deferred + Pixel-missing (~50) — Fake StubUiDriver no-ops all;
+ * Pixel-registered + deferred + Pixel-missing — Fake StubUiDriver no-ops all;
  * live --ui needs Pixel adapters for deferred/missing before those edges are real.
  */
 export const UI_STUB_ACTIONS = [
-    // Pixel-registered (47 @ Console#134 f26f737)
+    // Pixel-registered (58 @ Console#134 128f2d3)
     'open_kolibri_as_teacher',
     'open_kolibri_as_learner',
     'open_nextcloud_as_learner',
@@ -83,6 +83,18 @@ export const UI_STUB_ACTIONS = [
     'remove_operator',
     'copy_app',
     'move_app',
+    // Part B leftovers + leave/back (registered @ 128f2d3)
+    'files_role_added',
+    'backup_configured_restored',
+    'done_redistribute',
+    'stay_on_source_disk',
+    'open_copied_instance',
+    'switch_engine',
+    'reboot_engine',
+    'back_to_console',
+    'leave_kolibri',
+    'leave_nextcloud_as_teacher',
+    'leave_nextcloud_as_learner',
     // Deferred (Pixel clear message)
     'open_wikipedia_as_learner',
     'open_wikipedia_as_teacher',
@@ -96,9 +108,7 @@ export const UI_STUB_ACTIONS = [
     'create_quiz',
     'read_reports',
     'preview_as_learner',
-    'back_to_console',
     'browse_classes',
-    'leave_kolibri',
     'finish_exercise',
     'next_video',
     'share_to_class',
@@ -111,18 +121,9 @@ export const UI_STUB_ACTIONS = [
     'close_doc',
     'keep_editing',
     'browse_folders',
-    'leave_nextcloud_as_learner',
-    'leave_nextcloud_as_teacher',
     'search_browse_wikipedia',
     'leave_wikipedia_as_learner',
     'leave_wikipedia_as_teacher',
-    'backup_configured_restored',
-    'files_role_added',
-    'done_redistribute',
-    'stay_on_source_disk',
-    'open_copied_instance',
-    'switch_engine',
-    'reboot_engine',
 ] as const
 
 export type KnownAction =

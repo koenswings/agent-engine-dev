@@ -11,9 +11,9 @@
  *
  * Base URL: DURATION_CONSOLE_URL or http://idea01 (Engine :80 — never Vite 5173).
  *
- * --record-walk soft-detect order (after Intent):
- *   1) pass screenshotPath into runDurationIntent (Pixel may write PNG)
- *   2) else typeof bridge.captureAfterIntent === 'function'
+ * --record-walk soft-detect (Pixel Console#134 @ 128f2d3):
+ *   1) pass screenshotPath into runDurationIntent (Pixel may write PNG once)
+ *   2) soft-detect bridge.captureAfterIntent — skip if PNG already exists
  *   3) else page.screenshot({ path, fullPage: true })
  */
 import { createRequire } from 'node:module'
@@ -238,21 +238,21 @@ export class PlaywrightUiDriver implements UiDriver {
 
     /**
      * Soft-detect capture after Intent (or for bare page screenshot).
-     * Order: runDurationIntent already wrote file → captureAfterIntent → page.screenshot.
+     * Prefer captureAfterIntent; skip second capture if screenshotPath already wrote PNG.
      */
     private async captureFrame(path: string, intent?: string): Promise<void> {
         mkdirSync(dirname(path), { recursive: true })
-        // 1) If Pixel runDurationIntent already wrote via screenshotPath, done.
+        // Skip second capture when runDurationIntent already wrote via screenshotPath.
         if (existsSync(path)) return
 
         const bridge = this.bridge
-        // 2) Pixel locked export: captureAfterIntent(page, { path, intent?, settleMs? })
+        // Soft-detect Pixel locked export first: captureAfterIntent(page, { path, intent?, settleMs? })
         if (bridge && typeof bridge.captureAfterIntent === 'function') {
             await bridge.captureAfterIntent(this.page, { path, intent })
             return
         }
 
-        // 3) Fallback: Playwright page.screenshot
+        // Fallback: Playwright page.screenshot (fullPage ok)
         const page = this.page as {
             screenshot?: (o: { path: string; fullPage?: boolean }) => Promise<Buffer | void>
         } | null
