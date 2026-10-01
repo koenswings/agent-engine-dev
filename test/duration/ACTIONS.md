@@ -78,6 +78,8 @@ Sticky `localStorage.demoMode==='true'` (Pixel `bootDemo`) must not mask Kid fix
 
 CLI `--start-instances` → `RealFleetOps({ startInstances: true })` (keep `instances/` on dock so Console shows Running cards) **and** `preserveDockedOnReturn` so `return_to_start` after infra dock does **not** undock — required for cover-hardpass **dock-before-inventory** (`infra_dock_fixture` → … → `open_disk_inventory` on `disk-duration-kolibri-grade5a-001`). Fake default still undocks on return (hygiene).
 
+Path A re-dock after eject: RealFleetOps does `rm -f` sentinel then `touch` (Atlas — chokidar needs unlink+create, not mtime-only touch).
+
 
 ## Multi-disk copy_app / move_app preload (Pixel Prefer A @b63e1ec)
 
