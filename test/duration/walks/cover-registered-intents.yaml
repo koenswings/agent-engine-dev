@@ -310,6 +310,8 @@ steps:
   - from: op_install
     to: op_instance
     action: start_after_install
+  # Prefer A r34: after move_app, grade5a is on nextcloud; Pixel copy_app must target a different disk (data-source-disk-id != target).
+  # Same-disk nextcloud is rejected by NetworkTree, so the modal never opens (FAIL@87).
   - from: op_instance
     to: op_copy_move
     action: copy_app
