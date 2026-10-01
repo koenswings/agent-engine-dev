@@ -264,15 +264,16 @@ steps:
   - from: op_overview
     to: op_instance
     action: open_instance_controls
+  # Open while the instance is Running; stopping first leaves the app unavailable.
   - from: op_instance
     to: op_instance
     action: start_instance
   - from: op_instance
     to: op_instance
-    action: stop_instance
+    action: open_app
   - from: op_instance
     to: op_instance
-    action: open_app
+    action: stop_instance
   - from: op_instance
     to: op_instance
     action: backup_instance

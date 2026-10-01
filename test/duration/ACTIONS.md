@@ -45,6 +45,8 @@ Operator deep: `install_app`, `start_after_install`, `stay_on_disk`, `make_backu
 
 **Part B leftovers + leave/back (@ ba0cfa1; `back_to_console` hardened):** `files_role_added`, `backup_configured_restored`, `done_redistribute`, `stay_on_source_disk`, `open_copied_instance`, `switch_engine`, `reboot_engine`, `back_to_console`, `leave_kolibri`, `leave_nextcloud_as_teacher`, `leave_nextcloud_as_learner`
 
+**Registered-intents instance walk:** `start_instance` → `open_app` → `stop_instance` → `backup_instance` so `open_app` runs while the instance is Running.
+
 ### Deferred (clear message, not silent)
 
 `keep_watching`, `next_resource`, `exit_lesson`, `open_wikipedia_as_teacher`, `open_wikipedia_as_learner`
