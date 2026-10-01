@@ -7,10 +7,10 @@ import { readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parse as parseYaml } from 'yaml'
-import type { FixtureRef, Layer, Scenario, StateDef, StoreMode, Transition } from './types.js'
+import type { FixtureRef, Layer, Scenario, StateDef, StoreMode, Transition, WalkDefinition, WalkStep } from './types.js'
 
 const GOLDEN_DEFAULT = 'idea02'
-const DEFAULT_POOL = ['idea01', 'idea03', 'idea04']
+export const DEFAULT_POOL = ['idea01', 'idea03', 'idea04']
 /** Synthetic fixture id — NEVER the idea03 hw-roundtrip stick (USB 26A1EE83197F / vfat 3E50-902A). */
 /** Primary infra dock target — Kid Kolibri Grade 5A pack (agent-app-dev#10). */
 export const DEFAULT_FIXTURE_DISK = 'duration-kolibri-grade5a-001'
@@ -33,8 +33,10 @@ export const SCENARIO_ALIASES: Record<string, string> = {
     'minimal-dock': 'unified',
     stress: 'unified',
     'school-day': 'unified',
-    'school-day-2engine': 'unified',
 }
+
+/** Markov / random synonyms — all load scenarios/unified.yaml (not a walk). */
+export const MARKOV_SCENARIO_NAMES = new Set(['unified', 'random', ''])
 
 export const scenariosDir = (): string => {
     // Prefer source tree (tsx / repo root); fall back relative to this file.
@@ -45,6 +47,17 @@ export const scenariosDir = (): string => {
     } catch {
         const here = dirname(fileURLToPath(import.meta.url))
         return join(here, 'scenarios')
+    }
+}
+
+export const walksDir = (): string => {
+    const fromCwd = resolve(process.cwd(), 'test/duration/walks')
+    try {
+        readFileSync(join(fromCwd, 'cover-all.yaml'), 'utf8')
+        return fromCwd
+    } catch {
+        const here = dirname(fileURLToPath(import.meta.url))
+        return join(here, 'walks')
     }
 }
 
@@ -167,11 +180,93 @@ const parseFixtures = (raw: unknown, path: string): FixtureRef[] => {
     return out
 }
 
+/**
+ * Resolve CLI --scenario name for Markov graphs.
+ * `random` (and empty) → unified. Walk names (e.g. cover-all) are NOT aliases —
+ * use isWalkScenario / loadWalk instead.
+ */
 export const resolveScenarioName = (nameOrPath: string): string => {
+    if (!nameOrPath || nameOrPath === 'random') return 'unified'
     if (nameOrPath.endsWith('.yaml') || nameOrPath.endsWith('.yml') || nameOrPath.includes('/')) {
         return nameOrPath
     }
     return SCENARIO_ALIASES[nameOrPath] ?? nameOrPath
+}
+
+/** True when --scenario names a deterministic walk (not the Markov graph). */
+export const isWalkScenario = (nameOrPath: string): boolean => {
+    if (!nameOrPath || nameOrPath === 'random' || nameOrPath === 'unified') return false
+    if (SCENARIO_ALIASES[nameOrPath]) return false
+    if (nameOrPath.endsWith('.walk.yaml') || nameOrPath.endsWith('.walk.yml')) return true
+    // Bare name: prefer walks/<name>.yaml when present
+    try {
+        readFileSync(join(walksDir(), `${nameOrPath}.yaml`), 'utf8')
+        return true
+    } catch {
+        return false
+    }
+}
+
+export const loadWalk = (nameOrPath: string): WalkDefinition => {
+    const path = nameOrPath.endsWith('.yaml') || nameOrPath.endsWith('.yml') || nameOrPath.includes('/')
+        ? resolve(nameOrPath)
+        : join(walksDir(), `${nameOrPath}.yaml`)
+
+    const text = readFileSync(path, 'utf8')
+    const raw = parseYaml(text) as Record<string, unknown>
+    if (!raw || typeof raw !== 'object') {
+        throw new Error(`Walk ${path}: empty or invalid YAML`)
+    }
+    if (raw.kind !== 'walk') {
+        throw new Error(`Walk ${path}: kind must be 'walk' (got ${JSON.stringify(raw.kind)})`)
+    }
+    if (typeof raw.name !== 'string' || !raw.name) {
+        throw new Error(`Walk ${path}: missing name`)
+    }
+    if (typeof raw.graph !== 'string' || !raw.graph) {
+        throw new Error(`Walk ${path}: missing graph (e.g. unified)`)
+    }
+    if (!Array.isArray(raw.steps) || raw.steps.length === 0) {
+        throw new Error(`Walk ${path}: steps must be a non-empty array`)
+    }
+
+    const scenario = loadScenario(raw.graph)
+    const steps: WalkStep[] = raw.steps.map((step, i) => {
+        if (!step || typeof step !== 'object') {
+            throw new Error(`Walk ${path}: steps[${i}] expected object`)
+        }
+        const st = step as Record<string, unknown>
+        if (typeof st.to !== 'string' || !st.to) {
+            throw new Error(`Walk ${path}: steps[${i}] missing 'to'`)
+        }
+        if (typeof st.action !== 'string' || !st.action) {
+            throw new Error(`Walk ${path}: steps[${i}] missing 'action'`)
+        }
+        if (!scenario.states[st.to]) {
+            throw new Error(`Walk ${path}: steps[${i}] to unknown state '${st.to}'`)
+        }
+        if (st.from !== undefined) {
+            if (typeof st.from !== 'string' || !st.from) {
+                throw new Error(`Walk ${path}: steps[${i}] from must be a string`)
+            }
+            if (!scenario.states[st.from]) {
+                throw new Error(`Walk ${path}: steps[${i}] from unknown state '${st.from}'`)
+            }
+        }
+        return {
+            from: typeof st.from === 'string' ? st.from : undefined,
+            to: st.to,
+            action: st.action,
+        }
+    })
+
+    return {
+        kind: 'walk',
+        name: raw.name,
+        graph: raw.graph,
+        steps,
+        scenario,
+    }
 }
 
 export const loadScenario = (nameOrPath: string): Scenario => {

@@ -38,21 +38,29 @@ Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/
 
 ## Run modes (CLI — not separate graphs)
 
-Deprecated aliases that still resolve to `unified.yaml`: `minimal`, `minimal-live`, `minimal-dock`, `stress`, `school-day`, `school-day-2engine`.
+**`--scenario` semantics:**
+- `random` / `unified` / default → **Markov** simulation on `scenarios/unified.yaml`
+- `cover-all` → **deterministic walk** (`walks/cover-all.yaml`) covering every graph action once — regression before a long random soak
+- Do **not** invent alternate Markov graphs
 
-| Intent | Flags (same graph) |
+Deprecated aliases that still resolve to `unified.yaml`: `minimal`, `minimal-live`, `minimal-dock`, `stress`, `school-day`.
+
+Canonical Fake pool: **idea01 + idea03 + idea04** (never idea02). Live `--hosts` takes whatever Atlas provides.
+
+| Intent | Flags |
 |---|---|
-| Fake CI smoke | `--scenario unified --iterations 40 --fast` |
-| Fake multi-hour proof | `--scenario unified --iterations 2000 --seed 42 --fast` |
-| Live reboot-biased | `--live --fast --hosts …` (same YAML) |
-| Live dock | `--live --fast --hosts …` (same YAML; RealFleetOps dock) |
-| 2-host live UI | `--live --ui --hosts idea01=…,idea03=… --console-url http://idea01:8080` (same YAML; App-open needs Kid Running) |
+| Fake Markov smoke | `--scenario random --iterations 40 --fast` |
+| Fake cover-all walk | `--scenario cover-all --fast` |
+| Fake multi-hour proof | `--scenario random --iterations 2000 --seed 42 --fast` |
+| Live reboot / dock | `--live --fast --hosts idea01=…,idea03=…,idea04=…` (same YAML) |
+| Live UI | `--live --ui --hosts idea01=…,idea03=…,idea04=… --console-url http://idea01:8080` |
 
 ## Run (no Pis — FakeFleetOps)
 
 ```bash
-pnpm test:duration                          # unified, 40 steps (Fake + Stub UI + probes)
-pnpm test:duration -- --scenario unified --iterations 2000 --seed 42 --fast
+pnpm test:duration                          # Markov random/unified, 40 steps (Fake + Stub UI + probes)
+pnpm test:duration -- --scenario cover-all --fast
+pnpm test:duration -- --scenario random --iterations 2000 --seed 42 --fast
 pnpm test:duration -- --ui --console-url http://idea01:8080   # Playwright → Pixel (needs claim)
 ```
 
@@ -74,17 +82,17 @@ Requires Tailscale reachability + SSH key `~/.ssh/id_ed25519` as `pi@<host>`.
 **Host map flag is `--hosts`** (not `--engine-urls`). Same format via env `DURATION_FLEET_HOSTS`.
 
 ```bash
-# Same unified graph — hosts/store knobs only
+# Same unified graph — hosts/store knobs only (pool idea01+idea03+idea04)
 pnpm test:duration -- --live --scenario unified --fast --iterations 20 \
-  --hosts idea01=100.99.231.94,idea03=100.126.117.80
+  --hosts idea01=100.99.231.94,idea03=100.126.117.80,idea04=<ip>
 
 pnpm test:duration -- --live --ui --scenario unified --fast --iterations 40 \
-  --hosts idea01=100.99.231.94,idea03=100.126.117.80 \
+  --hosts idea01=100.99.231.94,idea03=100.126.117.80,idea04=<ip> \
   --console-url http://idea01:8080
 
 # Optional health wraps around reboot (Atlas PAUSED); {pis} → pool IPs
 pnpm test:duration -- --live --scenario unified --fast \
-  --hosts idea01=100.99.231.94,idea03=100.126.117.80 \
+  --hosts idea01=100.99.231.94,idea03=100.126.117.80,idea04=<ip> \
   --health-wrap-before 'echo pause {pis}' \
   --health-wrap-after 'echo resume {pis}'
 ```
@@ -93,7 +101,7 @@ pnpm test:duration -- --live --scenario unified --fast \
 
 ### Live caveats
 
-- Claim **pool** Pis only (`idea01` / `idea03`). **Never golden idea02.**
+- Claim **pool** Pis only (`idea01` / `idea03` / `idea04`). **Never golden idea02.**
 - Tonight’s Pis use **unique** stores + `mdns:false`. `applyStoreMode('shared')` throws until Ops provisions shared store+mDNS.
 - `dockFixture` = rsync Kid pack → `duration-disks/idea-test-N/` + touch sentinel under `duration-watch` (excludes `instances/` so Engine does not auto-start apps). `undock` = `ejectDisk` + remove sentinel. `moveDisk` = undock then dock.
 - Engine on Pis must run with `testMode:true` and `IDEA_SYSTEM_DISK_SKIP=true` plus the private roots above (Atlas).

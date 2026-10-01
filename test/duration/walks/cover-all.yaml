@@ -1,0 +1,365 @@
+# Deterministic cover-all walk — NOT a Markov graph.
+# Loads states/invariants/fixtures/pool from scenarios/unified.yaml.
+# Covers 90/90 distinct action names (re-enters via return_to_start / layer hubs).
+# Prefer short cycles per layer (usage → operator → infra). Gaps: none — full action coverage.
+kind: walk
+name: cover-all
+graph: unified
+steps:
+  - from: start
+    to: console_teacher
+    action: open_console_as_teacher
+  - from: console_teacher
+    to: kolibri_manage
+    action: open_kolibri_as_teacher
+  - from: kolibri_manage
+    to: kolibri_manage
+    action: create_class
+  - from: kolibri_manage
+    to: kolibri_manage
+    action: enroll_learners
+  - from: kolibri_manage
+    to: kolibri_manage
+    action: build_lesson
+  - from: kolibri_manage
+    to: kolibri_manage
+    action: create_quiz
+  - from: kolibri_manage
+    to: kolibri_manage
+    action: read_reports
+  - from: kolibri_manage
+    to: kolibri_home
+    action: preview_as_learner
+  - from: kolibri_home
+    to: kolibri_watching
+    action: open_video
+  - from: kolibri_watching
+    to: kolibri_watching
+    action: keep_watching
+  - from: kolibri_watching
+    to: kolibri_exercise
+    action: next_resource
+  - from: kolibri_exercise
+    to: kolibri_home
+    action: finish_exercise
+  - from: kolibri_home
+    to: kolibri_exercise
+    action: open_exercise
+  - from: kolibri_exercise
+    to: kolibri_watching
+    action: next_video
+  - from: kolibri_watching
+    to: kolibri_home
+    action: exit_lesson
+  - from: kolibri_home
+    to: kolibri_home
+    action: browse_classes
+  - from: kolibri_home
+    to: console_learner
+    action: leave_kolibri
+  - from: console_learner
+    to: kolibri_home
+    action: open_kolibri_as_learner
+  - from: kolibri_home
+    to: start
+    action: return_to_start
+  - from: start
+    to: console_learner
+    action: open_console_as_learner
+  - from: console_learner
+    to: nc_browse
+    action: open_nextcloud_as_learner
+  - from: nc_browse
+    to: nc_share
+    action: share_to_class
+  - from: nc_share
+    to: nc_browse
+    action: done_sharing
+  - from: nc_browse
+    to: nc_drop
+    action: open_file_drop
+  - from: nc_drop
+    to: nc_browse
+    action: after_upload
+  - from: nc_browse
+    to: nc_collab
+    action: open_collab_doc
+  - from: nc_collab
+    to: nc_browse
+    action: close_doc
+  - from: nc_browse
+    to: nc_browse
+    action: browse_folders
+  - from: nc_browse
+    to: console_learner
+    action: leave_nextcloud_as_learner
+  - from: console_learner
+    to: wiki_browse
+    action: open_wikipedia_as_learner
+  - from: wiki_browse
+    to: wiki_browse
+    action: search_browse_wikipedia
+  - from: wiki_browse
+    to: console_learner
+    action: leave_wikipedia_as_learner
+  - from: console_learner
+    to: console_learner
+    action: stay_on_learner_overview
+  - from: console_learner
+    to: start
+    action: return_to_start
+  - from: start
+    to: op_entry
+    action: open_console_as_operator
+  - from: op_entry
+    to: op_overview
+    action: sign_in
+  - from: op_overview
+    to: op_disk
+    action: open_disk_inventory
+  - from: op_disk
+    to: op_instance
+    action: open_instance_controls
+  - from: op_instance
+    to: op_copy_move
+    action: copy_app
+  - from: op_copy_move
+    to: op_overview
+    action: done_redistribute
+  - from: op_overview
+    to: op_eject
+    action: eject_disk
+  - from: op_eject
+    to: op_overview
+    action: confirm_eject
+  - from: op_overview
+    to: op_account
+    action: open_account
+  - from: op_account
+    to: op_account
+    action: add_operator
+  - from: op_account
+    to: op_account
+    action: remove_operator
+  - from: op_account
+    to: op_account
+    action: change_password
+  - from: op_account
+    to: op_overview
+    action: close_account
+  - from: op_overview
+    to: op_settings
+    action: open_settings
+  - from: op_settings
+    to: op_overview
+    action: close_settings
+  - from: op_overview
+    to: op_overview
+    action: stay_on_overview
+  - from: op_overview
+    to: op_overview
+    action: notice_usb_dock
+  - from: op_overview
+    to: start
+    action: return_to_start
+  - from: start
+    to: infra_idle
+    action: enter_infra_fleet_walk
+  - from: infra_idle
+    to: infra_docked
+    action: infra_dock_fixture
+  - from: infra_docked
+    to: infra_reboot
+    action: infra_reboot_engine
+  - from: infra_reboot
+    to: infra_idle
+    action: infra_undock_fixtures
+  - from: infra_idle
+    to: infra_docked
+    action: infra_dock_fixture
+  - from: infra_docked
+    to: infra_disk_moved
+    action: infra_move_disk
+  - from: infra_disk_moved
+    to: start
+    action: return_to_start
+  - from: start
+    to: console_teacher
+    action: open_console_as_teacher
+  - from: console_teacher
+    to: nc_browse
+    action: open_nextcloud_as_teacher
+  - from: nc_browse
+    to: console_teacher
+    action: leave_nextcloud_as_teacher
+  - from: console_teacher
+    to: wiki_browse
+    action: open_wikipedia_as_teacher
+  - from: wiki_browse
+    to: console_teacher
+    action: leave_wikipedia_as_teacher
+  - from: console_teacher
+    to: console_teacher
+    action: stay_on_teacher_overview
+  - from: console_teacher
+    to: kolibri_manage
+    action: open_kolibri_as_teacher
+  - from: kolibri_manage
+    to: console_teacher
+    action: back_to_console
+  - from: console_teacher
+    to: nc_browse
+    action: open_nextcloud_as_teacher
+  - from: nc_browse
+    to: nc_share
+    action: share_to_class
+  - from: nc_share
+    to: console_teacher
+    action: back_to_console_from_share
+  - from: console_teacher
+    to: nc_browse
+    action: open_nextcloud_as_teacher
+  - from: nc_browse
+    to: nc_drop
+    action: open_file_drop
+  - from: nc_drop
+    to: console_learner
+    action: leave_file_drop
+  - from: console_learner
+    to: nc_browse
+    action: open_nextcloud_as_learner
+  - from: nc_browse
+    to: nc_collab
+    action: open_collab_doc
+  - from: nc_collab
+    to: nc_collab
+    action: keep_editing
+  - from: nc_collab
+    to: start
+    action: return_to_start
+  - from: start
+    to: op_entry
+    action: open_console_as_operator
+  - from: op_entry
+    to: op_entry
+    action: retry_login_first_time_setup
+  - from: op_entry
+    to: op_overview
+    action: sign_in
+  - from: op_overview
+    to: op_disk
+    action: open_disk_inventory
+  - from: op_disk
+    to: op_install
+    action: install_app
+  - from: op_install
+    to: op_overview
+    action: back_to_overview
+  - from: op_overview
+    to: op_disk
+    action: open_disk_inventory
+  - from: op_disk
+    to: op_files
+    action: make_files_disk
+  - from: op_files
+    to: op_disk
+    action: files_role_added
+  - from: op_disk
+    to: op_files
+    action: add_files_role
+  - from: op_files
+    to: op_disk
+    action: files_role_added
+  - from: op_disk
+    to: op_backup
+    action: make_backup_disk
+  - from: op_backup
+    to: op_disk
+    action: backup_configured_restored
+  - from: op_disk
+    to: op_backup
+    action: restore_from_backup
+  - from: op_backup
+    to: op_disk
+    action: backup_configured_restored
+  - from: op_disk
+    to: op_copy_move
+    action: move_app
+  - from: op_copy_move
+    to: op_disk
+    action: stay_on_source_disk
+  - from: op_disk
+    to: op_erase
+    action: erase_disk
+  - from: op_erase
+    to: op_disk
+    action: confirm_erase
+  - from: op_disk
+    to: op_eject
+    action: eject_disk
+  - from: op_eject
+    to: op_overview
+    action: cancel_eject
+  - from: op_overview
+    to: op_instance
+    action: open_instance_controls
+  - from: op_instance
+    to: op_instance
+    action: start_instance
+  - from: op_instance
+    to: op_instance
+    action: stop_instance
+  - from: op_instance
+    to: op_instance
+    action: open_app
+  - from: op_instance
+    to: op_instance
+    action: backup_instance
+  - from: op_instance
+    to: op_disk
+    action: back_to_disk
+  - from: op_disk
+    to: op_install
+    action: install_app
+  - from: op_install
+    to: op_instance
+    action: start_after_install
+  - from: op_instance
+    to: op_copy_move
+    action: copy_app
+  - from: op_copy_move
+    to: op_instance
+    action: open_copied_instance
+  - from: op_instance
+    to: op_disk
+    action: back_to_disk
+  - from: op_disk
+    to: op_install
+    action: install_app
+  - from: op_install
+    to: op_disk
+    action: stay_on_disk
+  - from: op_disk
+    to: op_erase
+    action: erase_disk
+  - from: op_erase
+    to: op_overview
+    action: cancel_erase
+  - from: op_overview
+    to: op_account
+    action: open_account
+  - from: op_account
+    to: op_entry
+    action: log_out
+  - from: op_entry
+    to: op_overview
+    action: sign_in
+  - from: op_overview
+    to: op_settings
+    action: open_settings
+  - from: op_settings
+    to: op_settings
+    action: switch_engine
+  - from: op_settings
+    to: op_settings
+    action: reboot_engine

@@ -21,9 +21,14 @@ import {
 import {
     assertSafeFixtureDisk,
     DEFAULT_FIXTURE_DISK,
+    DEFAULT_POOL,
+    isWalkScenario,
     loadScenario,
+    loadWalk,
     makeRng,
+    resolveScenarioName,
 } from '../duration/scenario.js'
+import { runDeterministicWalk } from '../duration/runner.js'
 import type { Scenario, SemanticStoreView } from '../duration/types.js'
 import {
     StubUiDriver,
@@ -107,10 +112,53 @@ describe('duration scenario YAML loader', () => {
             'sign_in', 'retry_login_first_time_setup', 'return_to_start',
         ]))
         // Deprecated aliases still load the same graph
-        for (const alias of ['minimal', 'stress', 'school-day', 'school-day-2engine', 'minimal-live', 'minimal-dock']) {
+        for (const alias of ['minimal', 'stress', 'school-day', 'minimal-live', 'minimal-dock', 'random']) {
             expect(loadScenario(alias).name).toBe(s.name)
             expect(Object.keys(loadScenario(alias).states).length).toBe(28)
         }
+    })
+
+    it('resolves random→unified; cover-all is a walk not a Markov alias', () => {
+        expect(resolveScenarioName('random')).toBe('unified')
+        expect(resolveScenarioName('')).toBe('unified')
+        expect(resolveScenarioName('unified')).toBe('unified')
+        expect(isWalkScenario('cover-all')).toBe(true)
+        expect(isWalkScenario('random')).toBe(false)
+        expect(isWalkScenario('unified')).toBe(false)
+        expect(isWalkScenario('school-day')).toBe(false)
+        const walk = loadWalk('cover-all')
+        expect(walk.kind).toBe('walk')
+        expect(walk.graph).toBe('unified')
+        expect(walk.steps.length).toBeGreaterThan(50)
+        expect(walk.scenario.pool_engines).toEqual(DEFAULT_POOL)
+        // Every walk action appears at least once on the graph
+        const graphActions = new Set<string>()
+        for (const def of Object.values(walk.scenario.states)) {
+            for (const t of def.transitions) graphActions.add(t.action)
+        }
+        const walkActions = new Set(walk.steps.map(s => s.action))
+        for (const a of walkActions) expect(graphActions.has(a), a).toBe(true)
+        // Cover-all aims for full action coverage
+        expect(walkActions.size).toBe(graphActions.size)
+    })
+
+    it('runs cover-all deterministic Fake walk', async () => {
+        const walk = loadWalk('cover-all')
+        const ops = fakeOps({
+            poolEngines: [...DEFAULT_POOL],
+            excludeEngines: ['idea02'],
+            storeMode: 'shared',
+            settleDelayMs: 0,
+        })
+        const result = await runDeterministicWalk(walk, {
+            fast: true,
+            ops,
+            stubUi: true,
+            skipStability: true,
+        })
+        expect(result.failures).toBe(0)
+        expect(result.aborted).toBe(false)
+        expect(result.steps).toBe(walk.steps.length)
     })
 
     it('refuses hw-roundtrip stick fixture markers', () => {

@@ -178,3 +178,25 @@ export interface WalkerState {
     dockedEngine: string | null
     step: number
 }
+
+/** One step in a deterministic walk file (kind: walk). */
+export interface WalkStep {
+    /** Optional; when set, runner validates walker.current matches before dispatch. */
+    from?: string
+    to: string
+    action: string
+}
+
+/**
+ * Deterministic walk — NOT a Markov graph.
+ * Loads states/invariants/fixtures/pool from the referenced graph scenario.
+ */
+export interface WalkDefinition {
+    kind: 'walk'
+    name: string
+    /** Graph scenario name (always unified today). */
+    graph: string
+    steps: WalkStep[]
+    /** Resolved Markov scenario (states, pool, fixtures, …). */
+    scenario: Scenario
+}

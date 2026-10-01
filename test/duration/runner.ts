@@ -22,6 +22,7 @@ import type {
     Layer,
     StructuredLogEntry,
     Transition,
+    WalkDefinition,
     WalkerResult,
     WalkerState,
 } from './types.js'
@@ -40,9 +41,38 @@ const pickTransition = (transitions: Transition[], rng: () => number): Transitio
 const nowIso = () => new Date().toISOString()
 
 export const runWalk = async (opts: DurationOptions): Promise<WalkerResult> => {
+    return runWalkWithSteps(opts)
+}
+
+/**
+ * Deterministic walk runner — executes WalkDefinition.steps in order.
+ * Same action dispatch, invariants, dwell/stability as Markov runWalk.
+ * `--iterations` defaults to steps.length and is capped at steps.length.
+ */
+export const runDeterministicWalk = async (
+    walk: WalkDefinition,
+    opts: Omit<DurationOptions, 'scenario' | 'iterations'> & {
+        iterations?: number
+    },
+): Promise<WalkerResult> => {
+    const maxSteps = walk.steps.length
+    const iterations = Math.min(opts.iterations ?? maxSteps, maxSteps)
+    return runWalkWithSteps({
+        ...opts,
+        scenario: walk.scenario,
+        iterations,
+        steps: walk.steps.slice(0, iterations),
+    })
+}
+
+type StepSpec = { from?: string; to: string; action: string }
+
+/** Shared executor: Markov-picked transitions OR explicit walk steps. */
+const runWalkWithSteps = async (
+    opts: DurationOptions & { steps?: StepSpec[] },
+): Promise<WalkerResult> => {
     const scenario = opts.scenario
     const rng = opts.rng ?? (scenario.seed !== undefined ? makeRng(scenario.seed) : Math.random)
-    // Ensure opts.rng is set for action helpers that pick engines.
     const fullOpts: DurationOptions = { ...opts, rng, stubUi: opts.stubUi !== false }
 
     const exclude = scenario.exclude_engines
@@ -55,7 +85,6 @@ export const runWalk = async (opts: DurationOptions): Promise<WalkerResult> => {
     const fixtureInstance = fixtures.find(f => f.diskId === fixtureDisk)?.instanceId
         ?? 'kolibri-grade5a-001'
     const fixtureDisks = fixtures.filter(f => f.infra_disk !== false).map(f => f.diskId)
-    // Only force-include primary when it is itself infra-eligible (minimal-live uses infra_disk:false).
     const primaryIsInfra = fixtures.some(f => f.diskId === fixtureDisk && f.infra_disk !== false)
         || fixtures.length === 0
     if (primaryIsInfra && !fixtureDisks.includes(fixtureDisk)) fixtureDisks.unshift(fixtureDisk)
@@ -77,7 +106,10 @@ export const runWalk = async (opts: DurationOptions): Promise<WalkerResult> => {
     let aborted = false
     let abortReason: string | undefined
 
-    for (let i = 0; i < fullOpts.iterations; i++) {
+    const useExplicit = Array.isArray(opts.steps) && opts.steps.length > 0
+    const limit = useExplicit ? opts.steps!.length : fullOpts.iterations
+
+    for (let i = 0; i < limit; i++) {
         const stateDef = scenario.states[walker.current]
         if (!stateDef) {
             aborted = true
@@ -85,10 +117,32 @@ export const runWalk = async (opts: DurationOptions): Promise<WalkerResult> => {
             break
         }
 
-        const transition = pickTransition(stateDef.transitions, rng)
+        let to: string
+        let action: string
+        if (useExplicit) {
+            const step = opts.steps![i]!
+            if (step.from !== undefined && step.from !== walker.current) {
+                aborted = true
+                abortReason =
+                    `walk step ${i + 1}: expected from '${step.from}' but current is '${walker.current}'`
+                break
+            }
+            const edgeOk = stateDef.transitions.some(t => t.to === step.to && t.action === step.action)
+            if (!edgeOk) {
+                aborted = true
+                abortReason =
+                    `walk step ${i + 1}: no edge ${walker.current} --${step.action}--> ${step.to}`
+                break
+            }
+            to = step.to
+            action = step.action
+        } else {
+            const transition = pickTransition(stateDef.transitions, rng)
+            to = transition.to
+            action = transition.action
+        }
+
         const from = walker.current
-        const to = transition.to
-        const action = transition.action
         const started = Date.now()
 
         const ctx: ActionContext = {
@@ -115,21 +169,17 @@ export const runWalk = async (opts: DurationOptions): Promise<WalkerResult> => {
             message = result.message
             if (result.dockedEngine !== undefined) walker.dockedEngine = result.dockedEngine
             if (result.layer !== undefined) walker.layer = result.layer
-            // Advance state (return_to_start forces start).
             walker.current = result.forceState ?? to
             if (result.forceState === 'start') walker.layer = null
 
-            // Layer tag from destination state when present.
             const dest = scenario.states[walker.current]
             if (dest?.layer) walker.layer = dest.layer
 
-            // Invariants after settle (infra primary; optional per-state specs).
             const layer: Layer | null = walker.layer
             const specs = [
                 ...(layer === 'infra' ? DEFAULT_INFRA_INVARIANTS : []),
                 ...(dest?.invariants ?? []),
             ]
-            // Dedupe by type (state-specific overrides first occurrence).
             const seen = new Set<string>()
             const deduped = specs.filter(s => {
                 if (seen.has(s.type)) return false
@@ -159,9 +209,8 @@ export const runWalk = async (opts: DurationOptions): Promise<WalkerResult> => {
             message = err instanceof Error ? err.message : String(err)
         }
 
-        // Phase 4: stability probes during dwell (skip on failed action / skipStability / last iter).
         let probeResults: StructuredLogEntry['probes'] = []
-        if (ok && !fullOpts.skipStability && i < fullOpts.iterations - 1) {
+        if (ok && !fullOpts.skipStability && i < limit - 1) {
             const dwellMs = fullOpts.dwellMs
                 ?? (fullOpts.fast ? FAST_DWELL_MS : DEFAULT_DWELL_MS)
             const intervalMs = fullOpts.probeIntervalMs

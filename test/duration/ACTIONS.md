@@ -60,12 +60,12 @@ Do **not** silently drop these edges from `unified.yaml`.
 
 ## Live Console / Kid App-open
 
-Base URL live: Engine-served Console on port **8080** (`http://idea01:8080`). Prefer idea01+idea03 for Playwright.
+Base URL live: Engine-served Console on port **8080** (`http://idea01:8080`). Canonical pool idea01+idea03+idea04 (never idea02).
 
 **Kid Running after dock (later live App-open — do not block Fake):**  
 `post-dock-restore-running.sh` → restores instances under `idea166-kolibri-live` on **:18080** (behind Engine :80 proxy). RealFleetOps `dockFixture` defaults to dock-only (strips `instances/`). Until Kid sidecar leaves Running cards, live `--ui` App-open Intents may fail — use Fake Stub for full-graph proof.
 
-Deprecated CLI aliases (`school-day-2engine`, `minimal-*`, `stress`, `school-day`) all load **`unified.yaml`** — they are flags/presets only, not separate state tables. Prefer `--scenario unified` + `--hosts` / `--iterations` / `--live` / `--ui`.
+Deprecated CLI aliases (`minimal-*`, `stress`, `school-day`) load **`unified.yaml`** (Markov). Prefer `--scenario random` / `unified` for Markov, or `--scenario cover-all` for the deterministic walk. Hosts/iterations/live/ui are CLI knobs — not alternate graphs.
 
 ## Fixture disk targets (Kid / agent-app-dev#10)
 
@@ -84,6 +84,6 @@ During dwell between transitions (~30s; `--fast` → ~80ms): WS ping + docker ps
 
 ## Live fleet (`--live` / RealFleetOps)
 
-- Default remains FakeFleetOps. Pass `--live` + `--hosts idea01=IP,idea03=IP`.
+- Default remains FakeFleetOps. Pass `--live` + `--hosts idea01=IP,idea03=IP,idea04=IP`.
 - Never target idea02. Never eject the idea03 Intenso Files Disk.
 - Do not claim Pis from this doc — Axle coords Atlas.

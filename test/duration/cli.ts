@@ -1,8 +1,10 @@
 #!/usr/bin/env npx tsx
 /**
- * pnpm test:duration [--scenario unified] [--iterations 50] [--fast] [--live] [--ui]
+ * pnpm test:duration [--scenario random|unified|cover-all] [--iterations N] [--fast] [--live] [--ui]
  *
- * Default: FakeFleetOps (no Pis) + StubUiDriver + canonical unified.yaml.
+ * Default: FakeFleetOps (no Pis) + StubUiDriver + Markov on unified.yaml.
+ * --scenario random|unified|default → Markov simulation on scenarios/unified.yaml
+ * --scenario cover-all → deterministic walk (walks/cover-all.yaml), not a second graph
  * Deprecated aliases (minimal, stress, school-day, …) resolve to unified — not separate graphs.
  * --live: RealFleetOps over Tailscale/SSH (requires --hosts or DURATION_FLEET_HOSTS).
  * --ui: PlaywrightUiDriver → Pixel e2e/intents (DURATION_CONSOLE_URL / idea01 :8080).
@@ -10,21 +12,31 @@
 
 import { FakeFleetOps } from './actions.js'
 import { RealFleetOps, parseHostsFlag } from './realFleetOps.js'
-import { runWalk } from './runner.js'
-import { loadScenario, makeRng, resolveScenarioName, SCENARIO_ALIASES } from './scenario.js'
+import { runDeterministicWalk, runWalk } from './runner.js'
+import {
+    DEFAULT_POOL,
+    isWalkScenario,
+    loadScenario,
+    loadWalk,
+    makeRng,
+    resolveScenarioName,
+    SCENARIO_ALIASES,
+} from './scenario.js'
 import { createUiDriver } from './ui/index.js'
+import type { StructuredLogEntry } from './types.js'
 
 const usage = () => {
     console.log(`Usage: pnpm test:duration [options]
 
-  --scenario <name>     scenarios/<name>.yaml (default: unified)
+  --scenario <name>     Markov: random|unified (default) → scenarios/unified.yaml
+                        Walk:   cover-all → walks/cover-all.yaml (deterministic)
                         Deprecated aliases → unified: ${Object.keys(SCENARIO_ALIASES).join(', ')}
-  --iterations <n>      Markov steps (default: 40)
+  --iterations <n>      Markov steps (default: 40). Walks default to steps.length.
   --fast                pm2 restart instead of reboot; shorter settle / dwell
-  --seed <n>            RNG seed (overrides YAML seed)
+  --seed <n>            RNG seed (Markov only; overrides YAML seed)
   --live                Use RealFleetOps against fleet Pis (default: FakeFleetOps)
   --hosts <map>         Required with --live unless DURATION_FLEET_HOSTS is set.
-                        Format: idea01=100.99.231.94,idea03=100.126.117.80
+                        Format: idea01=IP,idea03=IP,idea04=IP
   --health-wrap-before <cmd>   Shell before reboot; {pis} → pool host IPs
   --health-wrap-after <cmd>    Shell after waitReady post-reboot; {pis} ok
   --ui                  Playwright UI Intents via Pixel e2e/intents (Phase 3)
@@ -33,15 +45,19 @@ const usage = () => {
   --dwell-ms <n>        Dwell between transitions (default: 30000 / --fast 80)
   --help                this message
 
-Fake (CI / box, no fleet) — ONE canonical graph:
+Fake Markov (CI / box, no fleet) — ONE canonical graph:
   pnpm test:duration
+  pnpm test:duration -- --scenario random --iterations 2000 --seed 42 --fast
   pnpm test:duration -- --scenario unified --iterations 2000 --seed 42 --fast
+
+Fake deterministic cover-all walk (regression before long random soak):
+  pnpm test:duration -- --scenario cover-all --fast
 
 Live (same unified graph; hosts/store are CLI knobs — not alternate YAMLs):
   pnpm test:duration -- --live --scenario unified --fast --iterations 30 \\
-    --hosts idea01=100.99.231.94,idea03=100.126.117.80
+    --hosts idea01=100.99.231.94,idea03=100.126.117.80,idea04=<ip>
 
-Env: DURATION_FLEET_HOSTS=idea01=…,idea03=…  (same format as --hosts)
+Env: DURATION_FLEET_HOSTS=idea01=…,idea03=…,idea04=…  (same format as --hosts)
 
 Never put idea02 in the pool. Live App-open later uses Kid sidecar
 post-dock-restore-running.sh → idea166-kolibri-live :18080 (see ACTIONS.md).
@@ -66,7 +82,7 @@ interface ParsedArgs {
 }
 
 const parseArgs = (argv: string[]): ParsedArgs => {
-    let scenario = 'unified'
+    let scenario = 'random'
     let iterations: number | undefined
     let fast = false
     let seed: number | undefined
@@ -119,8 +135,14 @@ const main = async () => {
         process.exit(0)
     }
 
-    const resolvedName = resolveScenarioName(args.scenario)
-    if (resolvedName !== args.scenario && SCENARIO_ALIASES[args.scenario]) {
+    const walkMode = isWalkScenario(args.scenario)
+    const walk = walkMode ? loadWalk(args.scenario) : null
+    const scenario = walk ? walk.scenario : loadScenario(args.scenario)
+    const resolvedName = walk
+        ? args.scenario
+        : resolveScenarioName(args.scenario)
+
+    if (!walk && resolvedName !== args.scenario && SCENARIO_ALIASES[args.scenario]) {
         console.error(JSON.stringify({
             event: 'duration_scenario_alias',
             requested: args.scenario,
@@ -128,10 +150,12 @@ const main = async () => {
             note: 'Deprecated preset name — loads unified.yaml (one-graph rule)',
         }))
     }
-    const scenario = loadScenario(args.scenario)
-    const iterations = args.iterations ?? 40
+
+    const iterations = walk
+        ? Math.min(args.iterations ?? walk.steps.length, walk.steps.length)
+        : (args.iterations ?? 40)
     const seed = args.seed ?? scenario.seed
-    const pool = scenario.pool_engines ?? ['idea01', 'idea03']
+    const pool = scenario.pool_engines ?? [...DEFAULT_POOL]
     const fixtureInstances: Record<string, string> = {}
     for (const f of scenario.fixtures ?? []) fixtureInstances[f.diskId] = f.instanceId
 
@@ -147,7 +171,7 @@ const main = async () => {
         const hostsSource = args.hostsRaw ?? process.env.DURATION_FLEET_HOSTS
         if (!hostsSource) {
             console.error(
-                '--live requires --hosts idea01=IP,idea03=IP (or DURATION_FLEET_HOSTS env)',
+                '--live requires --hosts idea01=IP,idea03=IP,idea04=IP (or DURATION_FLEET_HOSTS env)',
             )
             process.exit(2)
         }
@@ -188,10 +212,12 @@ const main = async () => {
         failLoud: true,
     })
 
-    console.log(JSON.stringify({
+    const commonStart = {
         event: 'duration_start',
-        scenario: scenario.name,
+        scenario: walk ? walk.name : scenario.name,
         scenario_file: resolvedName,
+        mode: walk ? 'walk' as const : 'markov' as const,
+        walk_file: walk ? args.scenario : null,
         iterations,
         fast: args.fast,
         seed: seed ?? null,
@@ -204,27 +230,41 @@ const main = async () => {
         uiDriver: uiDriver.kind,
         hosts: hosts ?? null,
         stability: !args.noStability,
-    }))
+    }
+    console.log(JSON.stringify(commonStart))
 
-    const result = await runWalk({
-        scenario,
-        iterations,
-        fast: args.fast,
-        ops,
-        stubUi: !args.ui,
-        uiDriver,
-        skipStability: args.noStability,
-        dwellMs: args.dwellMs,
-        // Live --fast: align settle with RealFleetOps PM2_RECONNECT_TIMEOUT_MS (150s).
-        // Overnight smoke: 60s was insufficient after rapid pm2 on idea03.
-        settleTimeoutMs: args.live
-            ? (args.fast ? 150_000 : 180_000)
-            : (args.fast ? 1000 : 3000),
-        rng: seed !== undefined ? makeRng(seed) : undefined,
-        onLog: (e) => {
-            console.log(JSON.stringify({ event: 'duration_step', ...e }))
-        },
-    })
+    const onLog = (e: StructuredLogEntry) => {
+        console.log(JSON.stringify({ event: 'duration_step', ...e }))
+    }
+    const settleTimeoutMs = args.live
+        ? (args.fast ? 150_000 : 180_000)
+        : (args.fast ? 1000 : 3000)
+
+    const result = walk
+        ? await runDeterministicWalk(walk, {
+            fast: args.fast,
+            ops,
+            stubUi: !args.ui,
+            uiDriver,
+            skipStability: args.noStability,
+            dwellMs: args.dwellMs,
+            settleTimeoutMs,
+            iterations,
+            onLog,
+        })
+        : await runWalk({
+            scenario,
+            iterations,
+            fast: args.fast,
+            ops,
+            stubUi: !args.ui,
+            uiDriver,
+            skipStability: args.noStability,
+            dwellMs: args.dwellMs,
+            settleTimeoutMs,
+            rng: seed !== undefined ? makeRng(seed) : undefined,
+            onLog,
+        })
 
     await uiDriver.close?.().catch(() => {})
     if (ops instanceof RealFleetOps) {
@@ -233,6 +273,7 @@ const main = async () => {
 
     console.log(JSON.stringify({
         event: 'duration_done',
+        mode: walk ? 'walk' : 'markov',
         steps: result.steps,
         failures: result.failures,
         finalState: result.finalState,

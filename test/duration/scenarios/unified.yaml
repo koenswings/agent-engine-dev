@@ -1,6 +1,7 @@
 # Canonical Markov graph — ONE scenario file (proposals/duration-tests.md).
-# Run modes (CI / live / stress / 2-host) are CLI knobs only — not alternate YAMLs.
+# Run modes (CI / live / stress) are CLI knobs only — not alternate YAMLs.
 # Alternate names (minimal, stress, school-day, …) resolve to this file as deprecated aliases.
+# Deterministic walks live under test/duration/walks/ (kind: walk) and reference this graph.
 name: Unified school day
 duration_minutes: 480
 seed: 42
