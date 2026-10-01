@@ -257,7 +257,8 @@ test/
 
 | Scenario | Description | States | Duration |
 |----------|-------------|--------|----------|
-| `school-day` | Typical day, Kolibri + Nextcloud, 3 engines | 8 | 8h simulated |
+| `school-day` | Typical day, Kolibri + Nextcloud, 3 engines (idea04 + shared + deferred Intents) | 8 | 8h simulated |
+| `school-day-2engine` | 2-engine UI walk for idea01+idea03 claims; unique store; hardpass Intents only | ~14 | 2h simulated |
 | `stress` | High reboot rate, fast disk swaps | 6 | 2h simulated |
 | `minimal` | 2 engines, 3 states, for CI gate | 3 | 10 min |
 
@@ -301,3 +302,4 @@ test/
 
 6. **Intent rename (Pixel#134 @9502201):** `add_files` → `add_files_role`. Engine YAML/ACTIONS must use `add_files_role`. Engine UI driver calls `runDurationIntent` / `hasDurationIntent` from `idea-console/duration-intents` (sibling path fallback) — do not re-implement Console selectors.
 7. **Live Console URL for duration `--ui` / Playwright:** use the Engine-served Console on port **8080** (for example, `http://idea01:8080`), not port 80. Fleet Pis serve Console on :8080; docs/CLI examples using `:80` or bare `http://idea01` without a port are superseded.
+8. **2-engine UI scenario (`school-day-2engine`):** full `school-day` lists `pool_engines: [idea01, idea03, idea04]`, `store_mode: shared`, and deferred lesson Intents (`keep_watching` / `exit_lesson` / …). That combination is **not** suitable for current 2-host live `--ui` claims (no idea04; live stores unique; Pixel deferred chrome). Prefer `test/duration/scenarios/school-day-2engine.yaml` (idea01+idea03, unique store, hardpass Intents only — including Kid-pinned `open_video` / `open_exercise`). Does not remove `school-day`; supersedes the assumption that school-day needs idea04 for 2-host claims.

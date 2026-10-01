@@ -80,8 +80,20 @@ describe('duration scenario YAML loader', () => {
         expect(s.fixtures?.find(f => f.name === 'nextcloud')?.instanceId).toBe('nextcloud-grade5a-001')
     })
 
-    it('loads school-day, stress, and minimal-dock scenarios', () => {
+    it('loads school-day, school-day-2engine, stress, and minimal-dock scenarios', () => {
         expect(loadScenario('school-day').states.infra_idle).toBeTruthy()
+        const two = loadScenario('school-day-2engine')
+        expect(two.pool_engines).toEqual(['idea01', 'idea03'])
+        expect(two.pool_engines).not.toContain('idea04')
+        expect(two.store_mode).toBe('unique')
+        expect(two.states.kolibri_watching).toBeTruthy()
+        expect(two.states.kolibri_exercise).toBeTruthy()
+        // No deferred lesson / wikipedia Intents
+        for (const def of Object.values(two.states)) {
+            for (const t of def.transitions) {
+                expect(t.action).not.toMatch(/keep_watching|next_resource|exit_lesson|open_wikipedia/)
+            }
+        }
         expect(loadScenario('stress').states.infra_reboot).toBeTruthy()
         expect(loadScenario('minimal-dock').states.infra_docked).toBeTruthy()
     })
@@ -402,6 +414,33 @@ describe('Markov walker (FakeFleetOps)', () => {
         expect(result.failures).toBe(0)
         const actions = new Set(result.logs.map(l => l.action))
         // Hub entry + at least one infra or UI stub should appear with this seed
+        expect(actions.size).toBeGreaterThan(1)
+    })
+
+    it('school-day-2engine Fake walk stays on idea01+idea03 without deferred Intents', async () => {
+        const scenario = loadScenario('school-day-2engine')
+        expect(scenario.pool_engines).toEqual(['idea01', 'idea03'])
+        const ops = fakeOps({
+            poolEngines: scenario.pool_engines!,
+            excludeEngines: scenario.exclude_engines,
+            storeMode: scenario.store_mode,
+        })
+        const result = await runWalk({
+            scenario,
+            iterations: 60,
+            fast: true,
+            ops,
+            stubUi: true,
+            settleTimeoutMs: 500,
+            rng: makeRng(21),
+            skipStability: true,
+        })
+        expect(result.aborted).toBe(false)
+        expect(result.failures).toBe(0)
+        for (const step of result.logs) {
+            expect(step.action).not.toMatch(/keep_watching|next_resource|exit_lesson|open_wikipedia/)
+        }
+        const actions = new Set(result.logs.map(l => l.action))
         expect(actions.size).toBeGreaterThan(1)
     })
 

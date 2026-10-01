@@ -33,11 +33,14 @@ Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/
 
 **Deferred / blockers:** live Playwright claim (Axle→Atlas); shared-store live mode (Ops); instance-start after dock (Kolibri image); `keep_watching` / `open_wikipedia_*` (Pixel deferred).
 
+**2-engine UI claims:** use `school-day-2engine` (idea01+idea03, `store_mode: unique`, no deferred Intents). Full `school-day` still lists idea04 + shared store + deferred lesson Intents — not for current 2-host live claims.
+
 ## Run (no Pis — FakeFleetOps)
 
 ```bash
 pnpm test:duration                          # minimal scenario, 40 steps (Fake + Stub UI + probes)
 pnpm test:duration -- --scenario school-day --iterations 80 --fast
+pnpm test:duration -- --scenario school-day-2engine --iterations 80 --fast
 pnpm test:duration -- --scenario stress --iterations 100 --seed 99
 pnpm test:duration -- --ui --console-url http://idea01   # Playwright → Pixel (needs claim)
 ```
@@ -67,6 +70,11 @@ pnpm test:duration -- --live --scenario minimal-dock --fast --iterations 20 \
 # Dock-free reboot-only smoke
 pnpm test:duration -- --live --scenario minimal-live --fast --iterations 30 \
   --hosts idea01=100.99.231.94,idea03=100.126.117.80
+
+# 2-engine UI school-day (no idea04; unique store; hardpass Intents)
+pnpm test:duration -- --live --ui --scenario school-day-2engine --fast --iterations 40 \
+  --hosts idea01=100.99.231.94,idea03=100.126.117.80 \
+  --console-url http://idea01:8080
 
 # Optional health wraps around reboot (Atlas PAUSED); {pis} → pool IPs
 pnpm test:duration -- --live --scenario minimal-live --fast \

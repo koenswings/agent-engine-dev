@@ -38,6 +38,8 @@ Fake/CI default: `StubUiDriver` (no browser). Live UI: `pnpm test:duration -- --
 
 Base URL live: Engine port 80 `http://idea01` (NOT Vite 5173). Prefer idea01+idea03 for Playwright (Kolibri live on idea01).
 
+**2-engine UI scenario:** `school-day-2engine` — pool idea01+idea03 only; unique store; hardpass Intents including `open_video` / `open_exercise` (Kid pins); no deferred chrome.
+
 ## Fixture disk targets (Kid / agent-app-dev#10)
 
 | Action | diskId | instanceId |
