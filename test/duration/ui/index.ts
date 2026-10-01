@@ -22,7 +22,7 @@ import { StubUiDriver } from './stubDriver.js'
 import type { UiDriver } from './types.js'
 
 export interface CreateUiDriverOpts {
-    /** When true, use StubUiDriver (Fake CI). When false, try Playwright. */
+    /** When true, use StubUiDriver (Fake CI / missing-Intent). When false, Playwright (prefer --live --ui). */
     stub: boolean
     baseUrl?: string
     intentsDir?: string
@@ -30,7 +30,7 @@ export interface CreateUiDriverOpts {
     failLoud?: boolean
 }
 
-/** Factory used by cli / runner — stub for Fake; Playwright when --ui. */
+/** Factory: Stub for Fake/CI; Playwright when --ui (never silent Stub fallback for registered Intents). */
 export const createUiDriver = (opts: CreateUiDriverOpts): UiDriver => {
     if (opts.stub) return new StubUiDriver()
     // Prefer package idea-console/duration-intents; sibling e2e/intents is fallback.

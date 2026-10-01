@@ -2,16 +2,19 @@
 /**
  * pnpm test:duration [--scenario random|unified|cover-all] [--iterations N] [--fast] [--live] [--ui]
  *
- * Default: FakeFleetOps (no Pis) + StubUiDriver + Markov on unified.yaml.
+ * Preferred verification (once Pixel+Atlas ready): `--live --ui` for real Console walks.
+ * Default Fake: FakeFleetOps + StubUiDriver (CI / missing-Intent only) + Markov on unified.yaml.
  * --scenario random|unified|default → Markov simulation on scenarios/unified.yaml
  * --scenario cover-all → deterministic walk (walks/cover-all.yaml), not a second graph
  * Deprecated aliases (minimal, stress, school-day, …) resolve to unified — not separate graphs.
  * --live: RealFleetOps over Tailscale/SSH (requires --hosts or DURATION_FLEET_HOSTS).
  * --ui: PlaywrightUiDriver → Pixel e2e/intents (DURATION_CONSOLE_URL / idea01 :8080).
+ * --record-walk <dir>: screenshots after UI/live-page steps + ffmpeg walk.mp4 (best with --ui).
  */
 
 import { FakeFleetOps } from './actions.js'
 import { RealFleetOps, parseHostsFlag } from './realFleetOps.js'
+import { ensureRecordWalkDir } from './recordWalk.js'
 import { runDeterministicWalk, runWalk } from './runner.js'
 import {
     DEFAULT_POOL,
@@ -39,11 +42,19 @@ const usage = () => {
                         Format: idea01=IP,idea03=IP,idea04=IP
   --health-wrap-before <cmd>   Shell before reboot; {pis} → pool host IPs
   --health-wrap-after <cmd>    Shell after waitReady post-reboot; {pis} ok
-  --ui                  Playwright UI Intents via Pixel e2e/intents (Phase 3)
+  --ui                  Playwright UI Intents via Pixel e2e/intents (prefer with --live)
   --console-url <url>   Console origin for --ui (default DURATION_CONSOLE_URL or http://idea01:8080)
+  --record-walk <dir>   Save step-NNNN-<action>.png after UI/live-page steps; assemble walk.mp4
+                        (real PNGs need Playwright page — use with --ui; Fake stub logs record_walk_skip)
   --no-stability        Skip Phase 4 dwell probes
   --dwell-ms <n>        Dwell between transitions (default: 30000 / --fast 80)
   --help                this message
+
+Prefer real UI (Pixel Intents hardening; Fake Stub only for CI / missing Intents):
+  pnpm test:duration -- --live --ui --scenario cover-all --fast \\
+    --hosts idea01=…,idea03=…,idea04=… --console-url http://idea01:8080
+  pnpm test:duration -- --live --ui --scenario random --iterations 40 --seed 42 --fast \\
+    --hosts idea01=…,idea03=…,idea04=… --record-walk /tmp/dur-walk
 
 Fake Markov (CI / box, no fleet) — ONE canonical graph:
   pnpm test:duration
@@ -52,6 +63,7 @@ Fake Markov (CI / box, no fleet) — ONE canonical graph:
 
 Fake deterministic cover-all walk (regression before long random soak):
   pnpm test:duration -- --scenario cover-all --fast
+  pnpm test:duration -- --scenario cover-all --fast --record-walk /tmp/dur-rec   # dry-run flag (0 frames)
 
 Live (same unified graph; hosts/store are CLI knobs — not alternate YAMLs):
   pnpm test:duration -- --live --scenario unified --fast --iterations 30 \\
@@ -61,7 +73,8 @@ Env: DURATION_FLEET_HOSTS=idea01=…,idea03=…,idea04=…  (same format as --ho
 
 Never put idea02 in the pool. Live App-open later uses Kid sidecar
 post-dock-restore-running.sh → idea166-kolibri-live :18080 (see ACTIONS.md).
-See test/duration/README.md.
+Recording + cover-all / random with --ui --live is the intended verification path
+once Pixel+Atlas are ready. See test/duration/README.md.
 `)
 }
 
@@ -79,6 +92,7 @@ interface ParsedArgs {
     consoleUrl?: string
     noStability: boolean
     dwellMs?: number
+    recordWalkDir?: string
 }
 
 const parseArgs = (argv: string[]): ParsedArgs => {
@@ -94,6 +108,7 @@ const parseArgs = (argv: string[]): ParsedArgs => {
     let consoleUrl: string | undefined
     let noStability = false
     let dwellMs: number | undefined
+    let recordWalkDir: string | undefined
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]!
         if (a === '--') continue
@@ -110,6 +125,7 @@ const parseArgs = (argv: string[]): ParsedArgs => {
         else if (a === '--health-wrap-after') healthWrapAfter = argv[++i]
         else if (a === '--ui') ui = true
         else if (a === '--console-url') consoleUrl = argv[++i]
+        else if (a === '--record-walk') recordWalkDir = argv[++i]
         else if (a === '--no-stability') noStability = true
         else if (a === '--dwell-ms') dwellMs = Number(argv[++i])
         else if (a === '--engine-urls') {
@@ -124,7 +140,7 @@ const parseArgs = (argv: string[]): ParsedArgs => {
     return {
         help: false, scenario, iterations, fast, seed, live,
         hostsRaw, healthWrapBefore, healthWrapAfter,
-        ui, consoleUrl, noStability, dwellMs,
+        ui, consoleUrl, noStability, dwellMs, recordWalkDir,
     }
 }
 
@@ -133,6 +149,20 @@ const main = async () => {
     if (args.help) {
         usage()
         process.exit(0)
+    }
+
+    if (args.recordWalkDir) {
+        ensureRecordWalkDir(args.recordWalkDir)
+        if (!args.ui) {
+            console.error(JSON.stringify({
+                event: 'record_walk_warn',
+                message:
+                    '--record-walk without --ui: Fake Stub has no Playwright page; ' +
+                    'UI steps log record_walk_skip (dry-run of flag wiring). ' +
+                    'Prefer --record-walk with --ui (and --live) for real PNGs + walk.mp4.',
+                dir: args.recordWalkDir,
+            }))
+        }
     }
 
     const walkMode = isWalkScenario(args.scenario)
@@ -205,6 +235,8 @@ const main = async () => {
         })
     }
 
+    // --ui → Playwright always (never silently force Stub for registered Intents).
+    // Deferred / unregistered soft-skip or clear-fail via failLoud.
     const uiDriver = createUiDriver({
         stub: !args.ui,
         baseUrl: args.consoleUrl,
@@ -228,6 +260,7 @@ const main = async () => {
         live: args.live,
         ui: args.ui,
         uiDriver: uiDriver.kind,
+        record_walk: args.recordWalkDir ?? null,
         hosts: hosts ?? null,
         stability: !args.noStability,
     }
@@ -240,30 +273,28 @@ const main = async () => {
         ? (args.fast ? 150_000 : 180_000)
         : (args.fast ? 1000 : 3000)
 
+    const sharedOpts = {
+        fast: args.fast,
+        ops,
+        stubUi: !args.ui,
+        uiDriver,
+        skipStability: args.noStability,
+        dwellMs: args.dwellMs,
+        settleTimeoutMs,
+        recordWalkDir: args.recordWalkDir,
+        onLog,
+    }
+
     const result = walk
         ? await runDeterministicWalk(walk, {
-            fast: args.fast,
-            ops,
-            stubUi: !args.ui,
-            uiDriver,
-            skipStability: args.noStability,
-            dwellMs: args.dwellMs,
-            settleTimeoutMs,
+            ...sharedOpts,
             iterations,
-            onLog,
         })
         : await runWalk({
             scenario,
             iterations,
-            fast: args.fast,
-            ops,
-            stubUi: !args.ui,
-            uiDriver,
-            skipStability: args.noStability,
-            dwellMs: args.dwellMs,
-            settleTimeoutMs,
+            ...sharedOpts,
             rng: seed !== undefined ? makeRng(seed) : undefined,
-            onLog,
         })
 
     await uiDriver.close?.().catch(() => {})
@@ -281,6 +312,7 @@ const main = async () => {
         abortReason: result.abortReason ?? null,
         live: args.live,
         scenario_file: resolvedName,
+        record_walk: args.recordWalkDir ?? null,
     }))
 
     process.exit(result.failures > 0 || result.aborted ? 1 : 0)

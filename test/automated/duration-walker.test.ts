@@ -44,6 +44,15 @@ import {
     runStabilityDuringDwell,
     snapshotRunning,
 } from '../duration/stability.js'
+import {
+    assembleWalkVideo,
+    framePath,
+    listFramePngs,
+    sanitizeActionForFilename,
+} from '../duration/recordWalk.js'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 const unifiedScenario = (): Scenario => loadScenario('unified')
 
@@ -862,5 +871,57 @@ describe('Phase 4 stability probes (FakeFleetOps)', () => {
         }]
         const snap = snapshotRunning(views)
         expect(snap.get('idea01:kolibri-grade5a-001')).toBe('Running')
+    })
+})
+
+
+describe('duration --record-walk helpers', () => {
+    it('builds zero-padded frame paths and sanitizes action names', () => {
+        expect(framePath('/tmp/rec', 7, 'open_kolibri_as_teacher')).toBe(
+            '/tmp/rec/step-0007-open_kolibri_as_teacher.png',
+        )
+        expect(sanitizeActionForFilename('a/b c')).toBe('a_b_c')
+    })
+
+    it('assembleWalkVideo skips when no PNGs (Fake dry-run)', () => {
+        const dir = mkdtempSync(join(tmpdir(), 'dur-rec-'))
+        try {
+            const r = assembleWalkVideo(dir, () => {})
+            expect(r.ok).toBe(false)
+            expect(r.frames).toBe(0)
+            expect(r.reason).toBe('no_png_frames')
+            expect(listFramePngs(dir)).toEqual([])
+        } finally {
+            rmSync(dir, { recursive: true, force: true })
+        }
+    })
+
+    it('Fake cover-all with recordWalkDir completes without crashing', async () => {
+        const dir = mkdtempSync(join(tmpdir(), 'dur-rec-walk-'))
+        try {
+            const walk = loadWalk('cover-all')
+            const ops = fakeOps({
+                poolEngines: [...DEFAULT_POOL],
+                excludeEngines: ['idea02'],
+                storeMode: 'shared',
+                settleDelayMs: 0,
+            })
+            const result = await runDeterministicWalk(walk, {
+                fast: true,
+                ops,
+                stubUi: true,
+                uiDriver: new StubUiDriver(),
+                skipStability: true,
+                settleTimeoutMs: 500,
+                recordWalkDir: dir,
+                iterations: 5,
+            })
+            expect(result.aborted).toBe(false)
+            expect(result.failures).toBe(0)
+            expect(result.steps).toBe(5)
+            expect(listFramePngs(dir)).toEqual([])
+        } finally {
+            rmSync(dir, { recursive: true, force: true })
+        }
     })
 })

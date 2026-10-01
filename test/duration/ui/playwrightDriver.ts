@@ -2,16 +2,22 @@
  * PlaywrightUiDriver — Phase 3 real browser dispatch (idea#168).
  *
  * Prefers Pixel package `idea-console/duration-intents`:
- *   runDurationIntent({ action, page, diskId?, instanceId? })
+ *   runDurationIntent({ action, page, diskId?, instanceId?, screenshotPath? })
  *   hasDurationIntent(action)
+ *   captureAfterIntent?(page, { path, intent?, settleMs? })  — Pixel locked name
  *
  * Fallback: sibling checkout path import of e2e/intents (same exports).
  * Does NOT re-implement selectors — ONE contract, Pixel owns adapters.
  *
  * Base URL: DURATION_CONSOLE_URL or http://idea01 (Engine :80 — never Vite 5173).
+ *
+ * --record-walk soft-detect order (after Intent):
+ *   1) pass screenshotPath into runDurationIntent (Pixel may write PNG)
+ *   2) else typeof bridge.captureAfterIntent === 'function'
+ *   3) else page.screenshot({ path, fullPage: true })
  */
 import { createRequire } from 'node:module'
-import { existsSync } from 'node:fs'
+import { existsSync, mkdirSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
@@ -45,9 +51,16 @@ type RunDurationIntent = (opts: {
     diskId?: string
     engineId?: string
     instanceId?: string
+    /** Pixel opt-in: write PNG after Intent when supported. */
+    screenshotPath?: string
 }) => Promise<DurationIntentResult>
 
 type HasDurationIntent = (action: string) => boolean
+
+type CaptureAfterIntent = (
+    page: unknown,
+    opts: { path: string; intent?: string; settleMs?: number },
+) => Promise<void>
 
 type PlaywrightModule = {
     chromium: {
@@ -114,6 +127,7 @@ const loadPlaywright = async (): Promise<PlaywrightModule> => {
 type PixelBridge = {
     runDurationIntent: RunDurationIntent
     hasDurationIntent: HasDurationIntent
+    captureAfterIntent?: CaptureAfterIntent
 }
 
 /**
@@ -130,14 +144,25 @@ const loadPixelBridge = async (intentsDir: string | null): Promise<PixelBridge> 
             return {
                 runDurationIntent: mod.runDurationIntent,
                 hasDurationIntent: mod.hasDurationIntent,
+                captureAfterIntent: typeof mod.captureAfterIntent === 'function'
+                    ? (mod.captureAfterIntent as CaptureAfterIntent)
+                    : undefined,
             }
         }
     } catch {
         /* fall through */
     }
     try {
-        const mod = require(pkgSpec) as PixelBridge
-        if (typeof mod.runDurationIntent === 'function') return mod
+        const mod = require(pkgSpec) as PixelBridge & Record<string, unknown>
+        if (typeof mod.runDurationIntent === 'function') {
+            return {
+                runDurationIntent: mod.runDurationIntent,
+                hasDurationIntent: mod.hasDurationIntent,
+                captureAfterIntent: typeof mod.captureAfterIntent === 'function'
+                    ? (mod.captureAfterIntent as CaptureAfterIntent)
+                    : undefined,
+            }
+        }
     } catch {
         /* fall through */
     }
@@ -155,13 +180,19 @@ const loadPixelBridge = async (intentsDir: string | null): Promise<PixelBridge> 
     if (!entry) {
         throw new Error(`PlaywrightUiDriver: no durationBridge/index in ${intentsDir}`)
     }
-    const mod = await import(pathToFileURL(entry).href)
+    const mod = await import(pathToFileURL(entry).href) as Record<string, unknown>
     const runDurationIntent = mod.runDurationIntent as RunDurationIntent | undefined
     const hasDurationIntent = mod.hasDurationIntent as HasDurationIntent | undefined
     if (typeof runDurationIntent !== 'function' || typeof hasDurationIntent !== 'function') {
         throw new Error(`PlaywrightUiDriver: runDurationIntent/hasDurationIntent missing from ${entry}`)
     }
-    return { runDurationIntent, hasDurationIntent }
+    return {
+        runDurationIntent,
+        hasDurationIntent,
+        captureAfterIntent: typeof mod.captureAfterIntent === 'function'
+            ? (mod.captureAfterIntent as CaptureAfterIntent)
+            : undefined,
+    }
 }
 
 export class PlaywrightUiDriver implements UiDriver {
@@ -205,6 +236,31 @@ export class PlaywrightUiDriver implements UiDriver {
         await this.initPromise
     }
 
+    /**
+     * Soft-detect capture after Intent (or for bare page screenshot).
+     * Order: runDurationIntent already wrote file → captureAfterIntent → page.screenshot.
+     */
+    private async captureFrame(path: string, intent?: string): Promise<void> {
+        mkdirSync(dirname(path), { recursive: true })
+        // 1) If Pixel runDurationIntent already wrote via screenshotPath, done.
+        if (existsSync(path)) return
+
+        const bridge = this.bridge
+        // 2) Pixel locked export: captureAfterIntent(page, { path, intent?, settleMs? })
+        if (bridge && typeof bridge.captureAfterIntent === 'function') {
+            await bridge.captureAfterIntent(this.page, { path, intent })
+            return
+        }
+
+        // 3) Fallback: Playwright page.screenshot
+        const page = this.page as {
+            screenshot?: (o: { path: string; fullPage?: boolean }) => Promise<Buffer | void>
+        } | null
+        if (page && typeof page.screenshot === 'function') {
+            await page.screenshot({ path, fullPage: true })
+        }
+    }
+
     async runIntent(ctx: UiIntentContext): Promise<UiIntentResult> {
         if (isDeferredUiIntent(ctx.action)) {
             const msg = `UI deferred (Pixel not registered): ${ctx.action} — one of [${DEFERRED_UI_INTENTS.join(', ')}]`
@@ -227,13 +283,29 @@ export class PlaywrightUiDriver implements UiDriver {
                 }
             }
             const defaults = defaultIdsForIntent(ctx.action)
-            const result = await bridge.runDurationIntent({
+            const runOpts: Parameters<RunDurationIntent>[0] = {
                 action: ctx.action,
                 page: this.page,
                 diskId: ctx.diskId ?? defaults.diskId,
                 instanceId: ctx.instanceId ?? defaults.instanceId,
                 engineId: ctx.engineId,
-            })
+            }
+            // 1) Prefer Pixel screenshotPath on runDurationIntent when recording.
+            if (ctx.screenshotPath) {
+                runOpts.screenshotPath = ctx.screenshotPath
+            }
+            const result = await bridge.runDurationIntent(runOpts)
+
+            // Soft-detect post-Intent capture (success or fail — useful for debugging).
+            if (ctx.screenshotPath) {
+                try {
+                    await this.captureFrame(ctx.screenshotPath, ctx.action)
+                } catch (capErr) {
+                    // Do not override Intent result on capture failure; frame finalize will skip.
+                    void capErr
+                }
+            }
+
             if (!result.ok) {
                 const missing = /not found|timeout|missing|blocker|not landed|visible|not registered/i
                     .test(result.message ?? '')
@@ -257,6 +329,15 @@ export class PlaywrightUiDriver implements UiDriver {
                 message: `Playwright Intent '${ctx.action}' failed: ${raw}`,
             }
         }
+    }
+
+    /**
+     * Capture current page when already open (infra / non-Intent steps under --record-walk --ui).
+     * No-op if browser/page not started yet.
+     */
+    async screenshot(path: string): Promise<void> {
+        if (!this.page) return
+        await this.captureFrame(path)
     }
 
     async close(): Promise<void> {

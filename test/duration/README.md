@@ -4,6 +4,16 @@ Canonical design: `proposals/duration-tests.md` (PR #144 docs — do not merge u
 Parent: [idea#166](https://github.com/koenswings/idea/issues/166).  
 **ONE canonical graph:** `test/duration/scenarios/unified.yaml` (28 states). Alternate scenario YAMLs are **demoted** — run modes are CLI flags only.
 
+## Prefer real UI over stubs
+
+**Policy:** once Pixel Intents harden and Atlas can claim the pool, prefer **`--live --ui`** for real Console walks (recording + cover-all / random).  
+`StubUiDriver` / Fake is for **CI and missing-Intent dry-runs only**.
+
+- With `--ui`, the runner always uses `PlaywrightUiDriver` (never silently forces Stub for registered Intents).
+- Deferred / unregistered Intents soft-skip or clear-fail via existing `failLoud` — they do not fall back to Stub.
+- Intended verification path when Pixel+Atlas are ready:  
+  `--live --ui --scenario cover-all|random --record-walk <dir>`
+
 ## Fixtures (Kid / agent-app-dev#10)
 
 | Pack | diskId | instanceId |
@@ -31,8 +41,9 @@ Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/
 - Return-to-start hygiene (undock when leaving `infra_docked`)
 - Shared-store (`shared` + mDNS-on) vs unique-doc (`unique` + mDNS-off) mode switch
 - Structured JSON logs on `pnpm test:duration`
-- **Phase 3:** `test/duration/ui/` → StubUiDriver (CI) or PlaywrightUiDriver (`--ui`) calling Pixel `getIntent`
+- **Phase 3:** `test/duration/ui/` → StubUiDriver (CI / missing-Intent) or PlaywrightUiDriver (`--ui`) calling Pixel `runDurationIntent` / `captureAfterIntent`
 - **Phase 4:** dwell stability probes (~30s / `--fast` compressed) on FakeFleetOps
+- **Walk recording:** `--record-walk <dir>` → `step-NNNN-<action>.png` + `walk.mp4` (ffmpeg)
 
 **Deferred / blockers:** live Playwright claim (Axle→Atlas); shared-store live mode (Ops); instance-start after dock (Kid Running sidecar); Pixel deferred + ~50 Pixel-missing Intents (Fake no-ops; see ACTIONS.md).
 
@@ -53,7 +64,8 @@ Canonical Fake pool: **idea01 + idea03 + idea04** (never idea02). Live `--hosts`
 | Fake cover-all walk | `--scenario cover-all --fast` |
 | Fake multi-hour proof | `--scenario random --iterations 2000 --seed 42 --fast` |
 | Live reboot / dock | `--live --fast --hosts idea01=…,idea03=…,idea04=…` (same YAML) |
-| Live UI | `--live --ui --hosts idea01=…,idea03=…,idea04=… --console-url http://idea01:8080` |
+| **Live UI (preferred)** | `--live --ui --hosts idea01=…,idea03=…,idea04=… --console-url http://idea01:8080` |
+| Record walk (real PNGs) | add `--record-walk /tmp/dur-walk` (pair with `--ui`) |
 
 ## Run (no Pis — FakeFleetOps)
 
@@ -61,7 +73,8 @@ Canonical Fake pool: **idea01 + idea03 + idea04** (never idea02). Live `--hosts`
 pnpm test:duration                          # Markov random/unified, 40 steps (Fake + Stub UI + probes)
 pnpm test:duration -- --scenario cover-all --fast
 pnpm test:duration -- --scenario random --iterations 2000 --seed 42 --fast
-pnpm test:duration -- --ui --console-url http://idea01:8080   # Playwright → Pixel (needs claim)
+# Dry-run --record-walk wiring (stub steps → record_walk_skip, 0 frames, no video):
+pnpm test:duration -- --scenario cover-all --fast --record-walk /tmp/dur-rec
 ```
 
 Unit tests (fakes, part of automated suite):
@@ -75,20 +88,26 @@ pnpm build:test && IDEA_SYSTEM_DISK_SKIP=true IDEA_TEST_MODE=true \
 
 Or via the normal suite: `pnpm test:unit` / `pnpm test:full` (includes `duration-walker.test.ts`).
 
-## Run live (RealFleetOps / `--live`)
+## Run live (RealFleetOps / `--live`) — prefer with `--ui`
 
 Requires Tailscale reachability + SSH key `~/.ssh/id_ed25519` as `pi@<host>`.
 
 **Host map flag is `--hosts`** (not `--engine-urls`). Same format via env `DURATION_FLEET_HOSTS`.
 
 ```bash
-# Same unified graph — hosts/store knobs only (pool idea01+idea03+idea04)
-pnpm test:duration -- --live --scenario unified --fast --iterations 20 \
-  --hosts idea01=100.99.231.94,idea03=100.126.117.80,idea04=<ip>
+# Preferred: real UI walks once Pixel+Atlas ready
+pnpm test:duration -- --live --ui --scenario cover-all --fast \
+  --hosts idea01=100.99.231.94,idea03=100.126.117.80,idea04=<ip> \
+  --console-url http://idea01:8080 \
+  --record-walk /tmp/dur-walk
 
 pnpm test:duration -- --live --ui --scenario unified --fast --iterations 40 \
   --hosts idea01=100.99.231.94,idea03=100.126.117.80,idea04=<ip> \
   --console-url http://idea01:8080
+
+# Infra-only live (no UI)
+pnpm test:duration -- --live --scenario unified --fast --iterations 20 \
+  --hosts idea01=100.99.231.94,idea03=100.126.117.80,idea04=<ip>
 
 # Optional health wraps around reboot (Atlas PAUSED); {pis} → pool IPs
 pnpm test:duration -- --live --scenario unified --fast \
@@ -97,7 +116,20 @@ pnpm test:duration -- --live --scenario unified --fast \
   --health-wrap-after 'echo resume {pis}'
 ```
 
-`duration_start` JSON includes `live:true` and the resolved `hosts` map.
+`duration_start` JSON includes `live`, `ui`, `uiDriver`, `record_walk`, and the resolved `hosts` map.
+
+### `--record-walk <dir>`
+
+1. Creates `<dir>` if needed.
+2. After each **UI** Intent (and any step with a live Playwright page), writes `step-NNNN-<action>.png`.
+3. Soft-detect Pixel capture (Engine):
+   1. Pass `screenshotPath` into `runDurationIntent` when Pixel supports it
+   2. Else `bridge.captureAfterIntent(page, { path, intent })` (Pixel locked name)
+   3. Else `page.screenshot({ path, fullPage: true })`
+4. At walk end (success or abort): `ffmpeg` → `walk.mp4` in `<dir>`. Logs `record_walk_frame` / `record_walk_video` / `record_walk_skip`.
+5. Without `--ui`: Fake Stub logs `record_walk_skip` per UI step (flag dry-run); no PNGs → skip video.
+
+ffmpeg on this box: `/usr/bin/ffmpeg`.
 
 ### Live caveats
 
@@ -109,7 +141,8 @@ pnpm test:duration -- --live --scenario unified --fast \
   (USB serial `26A1EE83197F` / disk serial `3813430-532011020` /
   UUID `a0bf8374-274e-4bef-b32e-cfbfd09d2884` / label `IDEA Disk`).
 - Ask Atlas for health-wrap before intentional reboot churn.
+- Do **not** claim fleet / run live without Atlas coordination.
 
 ## Intent keys
 
-See [ACTIONS.md](./ACTIONS.md) — shared contract for Pixel Playwright stubs (registered / deferred / Pixel-missing).
+See [ACTIONS.md](./ACTIONS.md) — shared contract for Pixel Playwright adapters (registered / deferred / Pixel-missing).

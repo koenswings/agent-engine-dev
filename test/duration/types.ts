@@ -152,12 +152,17 @@ export interface DurationOptions {
     fast: boolean
     ops: FleetOps
     /**
-     * When true (default), UI Intents use StubUiDriver / no-op.
-     * When false, require opts.uiDriver (Playwright) — Phase 3.
+     * When true (default), UI Intents use StubUiDriver / no-op (CI / missing-Intent).
+     * When false, require opts.uiDriver (Playwright) — prefer `--live --ui` for real walks.
      */
     stubUi?: boolean
     /** Phase 3: Playwright or Stub driver for usage/operator Intents. */
     uiDriver?: import('./ui/types.js').UiDriver
+    /**
+     * Opt-in walk recording dir (`--record-walk`). After UI / live-page steps write
+     * step-NNNN-<action>.png; at walk end assemble walk.mp4 via ffmpeg.
+     */
+    recordWalkDir?: string
     /** Phase 4: dwell between transitions (ms). Override; else fast→80 / real→30000. */
     dwellMs?: number
     /** Phase 4: probe interval during dwell (ms). Default 30000 / fast 40. */

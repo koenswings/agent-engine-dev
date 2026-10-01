@@ -6,8 +6,14 @@
  * Phase 4: dwell stability probes between transitions.
  */
 
+import { existsSync } from 'node:fs'
 import { dispatchAction, type ActionContext } from './actions.js'
 import { DEFAULT_INFRA_INVARIANTS, evaluateInvariants } from './invariants.js'
+import {
+    assembleWalkVideo,
+    finalizeRecordedFrame,
+    framePath,
+} from './recordWalk.js'
 import { makeRng } from './scenario.js'
 import {
     DEFAULT_DWELL_MS,
@@ -247,12 +253,39 @@ const runWalkWithSteps = async (
         logs.push(entry)
         fullOpts.onLog?.(entry)
 
+        // --record-walk: if Playwright page is live and this step has no PNG yet
+        // (infra / non-UI), capture a frame. UI Intents already recorded in actions.
+        const recDir = fullOpts.recordWalkDir
+        if (recDir && fullOpts.uiDriver?.kind === 'playwright') {
+            const shot = framePath(recDir, walker.step, action)
+            if (!existsSync(shot) && typeof fullOpts.uiDriver.screenshot === 'function') {
+                try {
+                    await fullOpts.uiDriver.screenshot(shot)
+                } catch {
+                    /* finalize below */
+                }
+                finalizeRecordedFrame({
+                    dir: recDir,
+                    step: walker.step,
+                    action,
+                    path: shot,
+                    skipped: !existsSync(shot),
+                    skipReason: existsSync(shot) ? undefined : 'live_page_unavailable',
+                })
+            }
+        }
+
         if (!ok) {
             failures++
             aborted = true
             abortReason = message ?? `step ${walker.step} failed`
             break
         }
+    }
+
+    // Assemble walk.mp4 on success or abort when --record-walk was set.
+    if (fullOpts.recordWalkDir) {
+        assembleWalkVideo(fullOpts.recordWalkDir)
     }
 
     return {

@@ -29,7 +29,11 @@ YAML transition shape (all layers): `{ to, weight, action }`.
 
 ## Usage / operator Intent registry
 
-Fake/CI default: `StubUiDriver` (no browser). Live UI: `pnpm test:duration -- --ui` → `PlaywrightUiDriver` loads Pixel `getIntent` from `agent-console-dev/e2e/intents` (or `DURATION_CONSOLE_INTENTS`).
+**Prefer real UI:** `--live --ui` once Pixel adapters harden (Fake `StubUiDriver` = CI / missing-Intent only).  
+With `--ui`, Engine always uses `PlaywrightUiDriver` — deferred / unregistered Intents soft-skip or clear-fail via `failLoud`; never silently force Stub for registered Intents.  
+Recording + cover-all / random with `--ui --live` (+ `--record-walk <dir>`) is the intended verification path once Pixel+Atlas are ready.
+
+Fake/CI default: `StubUiDriver` (no browser). Live UI: `pnpm test:duration -- --live --ui` → `PlaywrightUiDriver` loads Pixel `runDurationIntent` / optional `captureAfterIntent` from `idea-console/duration-intents` or `agent-console-dev/e2e/intents` (or `DURATION_CONSOLE_INTENTS`).
 
 ### Pixel-registered (47 — Console#134 @ f26f737)
 
@@ -63,7 +67,7 @@ Do **not** silently drop these edges from `unified.yaml`.
 Base URL live: Engine-served Console on port **8080** (`http://idea01:8080`). Canonical pool idea01+idea03+idea04 (never idea02).
 
 **Kid Running after dock (later live App-open — do not block Fake):**  
-`post-dock-restore-running.sh` → restores instances under `idea166-kolibri-live` on **:18080** (behind Engine :80 proxy). RealFleetOps `dockFixture` defaults to dock-only (strips `instances/`). Until Kid sidecar leaves Running cards, live `--ui` App-open Intents may fail — use Fake Stub for full-graph proof.
+`post-dock-restore-running.sh` → restores instances under `idea166-kolibri-live` on **:18080** (behind Engine :80 proxy). RealFleetOps `dockFixture` defaults to dock-only (strips `instances/`). Until Kid sidecar leaves Running cards, live `--ui` App-open Intents may fail — Fake Stub remains OK for full-graph CI proof; prefer `--live --ui` for real walks as Pixel+Kid land.
 
 Deprecated CLI aliases (`minimal-*`, `stress`, `school-day`) load **`unified.yaml`** (Markov). Prefer `--scenario random` / `unified` for Markov, or `--scenario cover-all` for the deterministic walk. Hosts/iterations/live/ui are CLI knobs — not alternate graphs.
 

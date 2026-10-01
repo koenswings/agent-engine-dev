@@ -16,6 +16,7 @@ import type {
     WalkerState,
 } from './types.js'
 import { waitForConvergence } from './convergence.js'
+import { finalizeRecordedFrame, framePath } from './recordWalk.js'
 
 export const HUB_ACTIONS = [
     'return_to_start',
@@ -254,12 +255,24 @@ const returnToStart = async (ctx: ActionContext): Promise<ActionResult> => {
     // Phase 3: dismiss Console modals via Pixel return_to_start when Playwright is live.
     let uiMsg = ''
     if (ctx.opts.uiDriver && ctx.opts.uiDriver.kind === 'playwright') {
+        const recDir = ctx.opts.recordWalkDir
+        const stepNum = ctx.walker.step + 1
+        const shotPath = recDir ? framePath(recDir, stepNum, 'return_to_start') : undefined
         const ui = await ctx.opts.uiDriver.runIntent({
             action: 'return_to_start',
             diskId: ctx.fixtureDisk,
             instanceId: ctx.fixtureInstance,
             engineId: ctx.poolEngines[0],
+            screenshotPath: shotPath,
         })
+        if (recDir && shotPath) {
+            finalizeRecordedFrame({
+                dir: recDir,
+                step: stepNum,
+                action: 'return_to_start',
+                path: shotPath,
+            })
+        }
         if (!ui.ok) {
             return {
                 ok: false,
@@ -384,9 +397,22 @@ const layerForUiAction = (action: string, fallback: Layer | null): Layer => {
 const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<ActionResult> => {
     const layer = layerForUiAction(ctx.action, layerHint)
     const driver = ctx.opts.uiDriver
+    const recDir = ctx.opts.recordWalkDir
+    const stepNum = ctx.walker.step + 1
+    const shotPath = recDir ? framePath(recDir, stepNum, ctx.action) : undefined
     if (!driver) {
         if (ctx.opts.stubUi === false) {
             return { ok: false, message: `UI Intent '${ctx.action}' requires uiDriver (pass --ui)` }
+        }
+        if (recDir && shotPath) {
+            finalizeRecordedFrame({
+                dir: recDir,
+                step: stepNum,
+                action: ctx.action,
+                path: shotPath,
+                skipped: true,
+                skipReason: 'no_ui_driver',
+            })
         }
         // Backward-compatible no-driver stub (unit tests that omit uiDriver).
         return { ok: true, message: `UI stub: ${ctx.action}`, layer }
@@ -416,7 +442,27 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
         diskId,
         instanceId,
         engineId: ctx.walker.dockedEngine ?? ctx.poolEngines[0],
+        screenshotPath: shotPath,
     })
+    if (recDir && shotPath) {
+        if (driver.kind === 'stub') {
+            finalizeRecordedFrame({
+                dir: recDir,
+                step: stepNum,
+                action: ctx.action,
+                path: shotPath,
+                skipped: true,
+                skipReason: 'stub_ui_no_page',
+            })
+        } else {
+            finalizeRecordedFrame({
+                dir: recDir,
+                step: stepNum,
+                action: ctx.action,
+                path: shotPath,
+            })
+        }
+    }
     return {
         ok: result.ok,
         message: result.message ?? `${result.mode}: ${ctx.action}`,
