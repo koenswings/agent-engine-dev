@@ -19,9 +19,12 @@
 # make_backup empty-001 is backup — Pixel ensureEmptyDiskPanel discovers empty-002
 # (loud-fail if none). Walk: back_to_overview → open_disk_inventory before erase.
 # Never erase Grade5A. Engine infra_dock_fixture siblings include empty-002.
+# Late install_app after erase: empty-002 must stay docked Empty (Pixel empty-badge
+# discover; no DURATION_EMPTY_DISK_ID_2). r24 FAIL@85: erase undocked empty-002.
 # Optional DURATION_COPY_SOURCE_DISK / DURATION_COPY_TARGET_DISK /
 # DURATION_COPY_INSTANCE_ID (default kolibri→nextcloud).
-# Wait for Atlas :8080 @48a4a05 GO + both empties docked before live --ui --record-walk.
+# Wait for Atlas :8080 @48a4a05 GO + both empties docked (empty-002 survives erase)
+# before live --ui --record-walk.
 kind: walk
 name: cover-registered-intents
 graph: unified
@@ -252,6 +255,8 @@ steps:
   # discovers docked duration-empty-002 (empty-badge). Env keeps EMPTY=001 /
   # BACKUP=001. Mirror Backup Disk select: back_to_overview → open_disk_inventory.
   # Never erase Grade5A app disks.
+  # After confirm_erase: empty-002 must republish docked Empty for late install_app
+  # (Pixel discover; EMPTY stays 001). r24: erase left empty-002 absent → FAIL@85.
   - from: op_disk
     to: op_overview
     action: back_to_overview
