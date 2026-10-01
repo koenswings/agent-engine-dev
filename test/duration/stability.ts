@@ -2,7 +2,8 @@
  * Phase 4 stability monitoring during dwell (idea#168 / proposals/duration-tests.md §7).
  *
  * Every ~30s (or compressed under --fast): WS ping + optional docker/status probe.
- * Fail the walk after `failAfter` consecutive probe failures (default 3).
+ * Fail the walk after `failAfter` consecutive probe failures (default 3),
+ * except for a docker-missing anomaly, which aborts on its first failure.
  */
 import type { FleetOps, SemanticStoreView } from './types.js'
 
@@ -31,6 +32,16 @@ export interface StabilityProbeResult {
     consecutiveFailures: number
     abortReason?: string
 }
+
+/**
+ * A Running instance without its container is a ghost Running state, not a
+ * transient WS blip. Keep this classification at the stability layer so the
+ * Real adapter can continue returning the useful semantic detail while Fake
+ * probes remain docker-neutral.
+ */
+export const isDockerMissingProbeFailure = (sample: StabilityProbeSample): boolean =>
+    /docker missing/i.test(sample.detail ?? '')
+    || sample.engines.some(e => /docker missing/i.test(e.statusAnomaly ?? ''))
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
 
@@ -66,7 +77,8 @@ export const detectStatusAnomalies = (
 
 /**
  * Run probes for `dwellMs`, sampling every `intervalMs`.
- * Returns ok:false when consecutive failures hit failAfter.
+ * Returns ok:false when consecutive failures hit failAfter. Docker-missing
+ * anomalies are hard failures and abort after their first occurrence.
  */
 export const runStabilityDuringDwell = async (
     opts: StabilityProbeOptions,
@@ -138,7 +150,7 @@ export const runStabilityDuringDwell = async (
             consecutive = 0
         } else {
             consecutive++
-            if (consecutive >= opts.failAfter) {
+            if (isDockerMissingProbeFailure(sample) || consecutive >= opts.failAfter) {
                 return {
                     ok: false,
                     samples,

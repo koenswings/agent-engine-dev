@@ -44,6 +44,7 @@ import {
     DEFAULT_FAIL_AFTER,
     FAST_DWELL_MS,
     detectStatusAnomalies,
+    isDockerMissingProbeFailure,
     runStabilityDuringDwell,
     snapshotRunning,
 } from '../duration/stability.js'
@@ -856,6 +857,35 @@ describe('Phase 4 stability probes (FakeFleetOps)', () => {
         expect(result.ok).toBe(false)
         expect(result.consecutiveFailures).toBeGreaterThanOrEqual(DEFAULT_FAIL_AFTER)
         expect(result.abortReason).toMatch(/stability probe failed/)
+    })
+
+    it('aborts on the first docker-missing probe without changing WS failAfter', async () => {
+        const ops = fakeOps({
+            poolEngines: ['idea01'],
+            excludeEngines: ['idea02'],
+        })
+        ops.probeStability = async () => ({
+            ok: false,
+            detail: 'idea01: docker missing for kolibri-grade5a-001',
+            engines: [{
+                id: 'idea01',
+                wsUp: true,
+                dockerOk: false,
+                statusAnomaly: 'docker missing for kolibri-grade5a-001',
+            }],
+        })
+        const result = await runStabilityDuringDwell({
+            ops,
+            engines: ['idea01'],
+            intervalMs: 5,
+            failAfter: DEFAULT_FAIL_AFTER,
+            dwellMs: 200,
+        })
+        expect(isDockerMissingProbeFailure(result.samples[0]!)).toBe(true)
+        expect(result.ok).toBe(false)
+        expect(result.samples).toHaveLength(1)
+        expect(result.consecutiveFailures).toBe(1)
+        expect(result.abortReason).toMatch(/docker missing/)
     })
 
     it('unified walk with dwell probes stays green on FakeFleetOps', async () => {

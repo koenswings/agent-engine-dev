@@ -124,7 +124,7 @@ Content pins (stable): `open_video` contentId `e60662de-b15c-52f9-b003-359f7d91f
 
 ## Phase 4 stability
 
-During dwell between transitions (~30s; `--fast` → ~80ms): WS ping + docker ps / status anomaly. Fail after 3 consecutive probe failures. `--no-stability` to skip.
+During dwell between transitions (~30s; `--fast` → ~80ms): WS ping + docker ps / status anomaly. Fail after 3 consecutive probe failures; a `docker missing` anomaly is a hard abort on its first failure (transient WS ping failures retain 3). `--no-stability` to skip.
 
 ## Live fleet (`--live` / RealFleetOps)
 
