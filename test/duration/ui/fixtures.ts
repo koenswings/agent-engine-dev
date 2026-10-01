@@ -79,11 +79,75 @@ export const DEFERRED_UI_INTENTS = [
     'open_wikipedia_as_learner',
 ] as const
 
+/**
+ * Proposal Intents required by unified.yaml but not yet in Pixel registry (~50).
+ * StubUiDriver Fake no-ops these; live --ui needs Pixel adapters — do not drop YAML edges.
+ */
+export const PIXEL_MISSING_INTENTS = [
+    // Kolibri coaching / navigation
+    'create_class',
+    'enroll_learners',
+    'build_lesson',
+    'create_quiz',
+    'read_reports',
+    'preview_as_learner',
+    'back_to_console',
+    'browse_classes',
+    'leave_kolibri',
+    'finish_exercise',
+    'next_video',
+    // Nextcloud deep
+    'share_to_class',
+    'done_sharing',
+    'back_to_console_from_share',
+    'open_file_drop',
+    'after_upload',
+    'leave_file_drop',
+    'open_collab_doc',
+    'close_doc',
+    'keep_editing',
+    'browse_folders',
+    'leave_nextcloud_as_learner',
+    'leave_nextcloud_as_teacher',
+    // Wikipedia leave/search (open_* already deferred)
+    'search_browse_wikipedia',
+    'leave_wikipedia_as_learner',
+    'leave_wikipedia_as_teacher',
+    // Operator deep
+    'retry_login_first_time_setup',
+    'notice_usb_dock',
+    'install_app',
+    'start_after_install',
+    'stay_on_disk',
+    'make_backup_disk',
+    'restore_from_backup',
+    'backup_configured_restored',
+    'files_role_added',
+    'copy_app',
+    'move_app',
+    'done_redistribute',
+    'stay_on_source_disk',
+    'open_copied_instance',
+    'open_app',
+    'backup_instance',
+    'back_to_disk',
+    'back_to_overview',
+    'add_operator',
+    'remove_operator',
+    'change_password',
+    'log_out',
+    'switch_engine',
+    'reboot_engine',
+] as const
+
 export const isPixelIntent = (name: string): name is PixelIntentName =>
     (PIXEL_REGISTERED_INTENTS as readonly string[]).includes(name)
 
 export const isDeferredUiIntent = (name: string): boolean =>
     (DEFERRED_UI_INTENTS as readonly string[]).includes(name)
+
+export const isPixelMissingUiIntent = (name: string): boolean =>
+    (PIXEL_MISSING_INTENTS as readonly string[]).includes(name)
 
 /** Resolve default disk/instance for an Intent from Kid pins. */
 export const defaultIdsForIntent = (action: string): { diskId?: string; instanceId?: string } => {

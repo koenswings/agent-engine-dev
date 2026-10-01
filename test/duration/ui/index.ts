@@ -2,8 +2,10 @@ export {
     DURATION_UI_FIXTURES,
     PIXEL_REGISTERED_INTENTS,
     DEFERRED_UI_INTENTS,
+    PIXEL_MISSING_INTENTS,
     isPixelIntent,
     isDeferredUiIntent,
+    isPixelMissingUiIntent,
     defaultIdsForIntent,
 } from './fixtures.js'
 export type { PixelIntentName } from './fixtures.js'

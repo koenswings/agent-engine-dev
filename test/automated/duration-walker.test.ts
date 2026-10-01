@@ -40,7 +40,7 @@ import {
     snapshotRunning,
 } from '../duration/stability.js'
 
-const minimalScenario = (): Scenario => loadScenario('minimal')
+const unifiedScenario = (): Scenario => loadScenario('unified')
 
 const KID_FIXTURES = {
     'duration-kolibri-grade5a-001': 'kolibri-grade5a-001',
@@ -51,9 +51,9 @@ const fakeOps = (partial: ConstructorParameters<typeof FakeFleetOps>[0]) =>
     new FakeFleetOps({ fixtureInstances: { ...KID_FIXTURES }, ...partial })
 
 describe('duration scenario YAML loader', () => {
-    it('loads minimal.yaml with shared transition shape and excludes golden', () => {
-        const s = minimalScenario()
-        expect(s.name).toMatch(/minimal/i)
+    it('loads unified.yaml with shared transition shape and excludes golden', () => {
+        const s = unifiedScenario()
+        expect(s.name).toMatch(/unified/i)
         expect(s.exclude_engines).toContain('idea02')
         expect(s.pool_engines).not.toContain('idea02')
         expect(s.initial_state).toBe('start')
@@ -70,7 +70,7 @@ describe('duration scenario YAML loader', () => {
     })
 
     it('loads Kid fixture diskIds (agent-app-dev#10)', () => {
-        const s = minimalScenario()
+        const s = unifiedScenario()
         expect(s.fixtures?.map(f => f.diskId).sort()).toEqual([
             'duration-kolibri-grade5a-001',
             'duration-nextcloud-grade5a-001',
@@ -80,26 +80,37 @@ describe('duration scenario YAML loader', () => {
         expect(s.fixtures?.find(f => f.name === 'nextcloud')?.instanceId).toBe('nextcloud-grade5a-001')
     })
 
-    it('loads school-day, school-day-2engine, stress, and minimal-dock scenarios', () => {
-        expect(loadScenario('school-day').states.infra_idle).toBeTruthy()
-        const two = loadScenario('school-day-2engine')
-        expect(two.pool_engines).toEqual(['idea01', 'idea03'])
-        expect(two.pool_engines).not.toContain('idea04')
-        expect(two.store_mode).toBe('unique')
-        expect(two.states.console_learner).toBeTruthy()
-        expect(two.states.op_overview).toBeTruthy()
-        expect(two.states.kolibri_watching).toBeUndefined()
-        expect(two.states.nc_browse).toBeUndefined()
-        // No deferred lesson / wikipedia / App-open Intents
-        for (const def of Object.values(two.states)) {
-            for (const t of def.transitions) {
-                expect(t.action).not.toMatch(
-                    /keep_watching|next_resource|exit_lesson|open_wikipedia|open_kolibri|open_nextcloud|open_video|open_exercise/,
-                )
-            }
+    it('loads unified with all 28 proposal states; deprecated aliases resolve to unified', () => {
+        const s = loadScenario('unified')
+        const expected = [
+            'start',
+            'console_teacher', 'console_learner', 'kolibri_home', 'kolibri_watching',
+            'kolibri_exercise', 'kolibri_manage', 'nc_browse', 'nc_share', 'nc_drop',
+            'nc_collab', 'wiki_browse',
+            'op_entry', 'op_overview', 'op_disk', 'op_eject', 'op_instance', 'op_install',
+            'op_copy_move', 'op_files', 'op_backup', 'op_erase', 'op_account', 'op_settings',
+            'infra_idle', 'infra_docked', 'infra_disk_moved', 'infra_reboot',
+        ]
+        expect(Object.keys(s.states).sort()).toEqual([...expected].sort())
+        // Fixed wrong edges from gap analysis
+        const homeActions = s.states.kolibri_home!.transitions.map(t => t.action)
+        expect(homeActions).toEqual(expect.arrayContaining([
+            'open_video', 'open_exercise', 'browse_classes', 'leave_kolibri', 'return_to_start',
+        ]))
+        expect(homeActions).not.toContain('keep_watching')
+        const manageActions = s.states.kolibri_manage!.transitions.map(t => t.action)
+        expect(manageActions).toEqual(expect.arrayContaining([
+            'create_class', 'enroll_learners', 'back_to_console',
+        ]))
+        const entryActions = s.states.op_entry!.transitions.map(t => t.action)
+        expect(entryActions).toEqual(expect.arrayContaining([
+            'sign_in', 'retry_login_first_time_setup', 'return_to_start',
+        ]))
+        // Deprecated aliases still load the same graph
+        for (const alias of ['minimal', 'stress', 'school-day', 'school-day-2engine', 'minimal-live', 'minimal-dock']) {
+            expect(loadScenario(alias).name).toBe(s.name)
+            expect(Object.keys(loadScenario(alias).states).length).toBe(28)
         }
-        expect(loadScenario('stress').states.infra_reboot).toBeTruthy()
-        expect(loadScenario('minimal-dock').states.infra_docked).toBeTruthy()
     })
 
     it('refuses hw-roundtrip stick fixture markers', () => {
@@ -340,8 +351,8 @@ describe('FakeFleetOps pool-only + store mode switch', () => {
 })
 
 describe('Markov walker (FakeFleetOps)', () => {
-    it('runs minimal scenario for 40 steps without failure', async () => {
-        const scenario = minimalScenario()
+    it('runs unified scenario for 40 steps without failure', async () => {
+        const scenario = unifiedScenario()
         const ops = fakeOps({
             poolEngines: scenario.pool_engines!,
             excludeEngines: scenario.exclude_engines,
@@ -367,7 +378,7 @@ describe('Markov walker (FakeFleetOps)', () => {
     })
 
     it('return_to_start undocks fixtures (hygiene)', async () => {
-        const scenario = minimalScenario()
+        const scenario = unifiedScenario()
         const ops = fakeOps({
             poolEngines: scenario.pool_engines!,
             excludeEngines: scenario.exclude_engines,
@@ -398,8 +409,8 @@ describe('Markov walker (FakeFleetOps)', () => {
         }
     })
 
-    it('school-day stub walk mixes layers without abort', async () => {
-        const scenario = loadScenario('school-day')
+    it('unified stub walk mixes layers without abort', async () => {
+        const scenario = loadScenario('unified')
         const ops = fakeOps({
             poolEngines: scenario.pool_engines!,
             excludeEngines: scenario.exclude_engines,
@@ -417,54 +428,50 @@ describe('Markov walker (FakeFleetOps)', () => {
         expect(result.aborted).toBe(false)
         expect(result.failures).toBe(0)
         const actions = new Set(result.logs.map(l => l.action))
-        // Hub entry + at least one infra or UI stub should appear with this seed
         expect(actions.size).toBeGreaterThan(1)
     })
 
-    it('school-day-2engine Fake walk stays on idea01+idea03 without deferred or App-open Intents', async () => {
-        const scenario = loadScenario('school-day-2engine')
-        expect(scenario.pool_engines).toEqual(['idea01', 'idea03'])
-        // Scenario must not even declare App-open edges (live --ui needs Running fixtures).
+    it('unified Fake walk covers App-open and Pixel-missing Intents via StubUiDriver', async () => {
+        const scenario = loadScenario('unified')
         const yamlActions = new Set<string>()
         for (const st of Object.values(scenario.states)) {
             for (const tr of st.transitions) yamlActions.add(tr.action)
         }
-        for (const banned of [
+        // Full proposal keeps App-open + coaching edges on the one graph
+        for (const required of [
             'open_kolibri_as_teacher', 'open_kolibri_as_learner',
             'open_nextcloud_as_teacher', 'open_nextcloud_as_learner',
-            'open_video', 'open_exercise',
-            'keep_watching', 'next_resource', 'exit_lesson',
+            'open_video', 'open_exercise', 'create_class', 'back_to_console',
+            'sign_in', 'install_app',
         ]) {
-            expect(yamlActions.has(banned)).toBe(false)
+            expect(yamlActions.has(required)).toBe(true)
         }
         const ops = fakeOps({
             poolEngines: scenario.pool_engines!,
             excludeEngines: scenario.exclude_engines,
             storeMode: scenario.store_mode,
         })
+        const driver = new StubUiDriver()
         const result = await runWalk({
             scenario,
-            iterations: 60,
+            iterations: 80,
             fast: true,
             ops,
             stubUi: true,
+            uiDriver: driver,
             settleTimeoutMs: 500,
             rng: makeRng(21),
             skipStability: true,
         })
         expect(result.aborted).toBe(false)
         expect(result.failures).toBe(0)
-        for (const step of result.logs) {
-            expect(step.action).not.toMatch(
-                /keep_watching|next_resource|exit_lesson|open_wikipedia|open_kolibri|open_nextcloud|open_video|open_exercise/,
-            )
-        }
+        expect(driver.calls.length).toBeGreaterThan(0)
         const actions = new Set(result.logs.map(l => l.action))
         expect(actions.size).toBeGreaterThan(1)
     })
 
     it('emits structured log fields', async () => {
-        const scenario = minimalScenario()
+        const scenario = unifiedScenario()
         const ops = fakeOps({
             poolEngines: scenario.pool_engines!,
             excludeEngines: scenario.exclude_engines,
@@ -577,42 +584,9 @@ describe('RealFleetOps guard clauses (no network)', () => {
     })
 })
 
-describe('minimal-live scenario (FakeFleetOps)', () => {
-    it('loads dock-free unique scenario and walks without dock actions', async () => {
-        const scenario = loadScenario('minimal-live')
-        expect(scenario.store_mode).toBe('unique')
-        expect(scenario.exclude_engines).toContain('idea02')
-        expect(scenario.fixtures?.every(f => f.infra_disk === false)).toBe(true)
-        for (const def of Object.values(scenario.states)) {
-            for (const t of def.transitions) {
-                expect(t.action).not.toMatch(/infra_dock_fixture|infra_move_disk/)
-            }
-        }
-        const ops = fakeOps({
-            poolEngines: scenario.pool_engines!,
-            excludeEngines: scenario.exclude_engines,
-            storeMode: 'unique',
-        })
-        const result = await runWalk({
-            scenario,
-            iterations: 25,
-            fast: true,
-            ops,
-            stubUi: true,
-            settleTimeoutMs: 500,
-            rng: makeRng(scenario.seed ?? 7),
-        })
-        expect(result.aborted).toBe(false)
-        expect(result.failures).toBe(0)
-        expect(result.logs.some(l => l.action === 'infra_reboot_engine')).toBe(true)
-    })
-})
-
-describe('minimal-dock scenario (FakeFleetOps)', () => {
-    it('loads dock scenario and walks dock/undock/move on FakeFleetOps', async () => {
-        const scenario = loadScenario('minimal-dock')
-        expect(scenario.name).toMatch(/dock/i)
-        expect(scenario.store_mode).toBe('unique')
+describe('unified infra coverage (FakeFleetOps)', () => {
+    it('unified graph includes dock/undock/move/reboot and walks green', async () => {
+        const scenario = loadScenario('unified')
         expect(scenario.exclude_engines).toContain('idea02')
         expect(scenario.fixtures?.some(f => f.infra_disk !== false)).toBe(true)
         const actions = new Set<string>()
@@ -622,23 +596,24 @@ describe('minimal-dock scenario (FakeFleetOps)', () => {
         expect(actions.has('infra_dock_fixture')).toBe(true)
         expect(actions.has('infra_undock_fixtures')).toBe(true)
         expect(actions.has('infra_move_disk')).toBe(true)
+        expect(actions.has('infra_reboot_engine')).toBe(true)
         const ops = fakeOps({
             poolEngines: scenario.pool_engines!,
             excludeEngines: scenario.exclude_engines,
-            storeMode: 'unique',
+            storeMode: scenario.store_mode,
         })
         const result = await runWalk({
             scenario,
-            iterations: 30,
+            iterations: 40,
             fast: true,
             ops,
             stubUi: true,
             settleTimeoutMs: 500,
-            rng: makeRng(scenario.seed ?? 11),
+            rng: makeRng(11),
+            skipStability: true,
         })
         expect(result.aborted).toBe(false)
         expect(result.failures).toBe(0)
-        expect(result.logs.some(l => l.action === 'infra_dock_fixture')).toBe(true)
     })
 })
 
@@ -663,6 +638,14 @@ describe('Phase 3 UI Intent dispatch (StubUiDriver)', () => {
         expect(r.mode).toBe('deferred')
     })
 
+    it('Pixel-missing Intents Fake no-op without aborting', async () => {
+        const driver = new StubUiDriver()
+        const r = await driver.runIntent({ action: 'create_class' })
+        expect(r.ok).toBe(true)
+        expect(r.mode).toBe('stub')
+        expect(r.message).toMatch(/Pixel-missing/)
+    })
+
     it('bakes Kid content pins (App#10)', () => {
         expect(DURATION_UI_FIXTURES.kolibri.diskId).toBe('duration-kolibri-grade5a-001')
         expect(DURATION_UI_FIXTURES.kolibri.video.contentId).toBe('e60662de-b15c-52f9-b003-359f7d91f8fd')
@@ -671,8 +654,8 @@ describe('Phase 3 UI Intent dispatch (StubUiDriver)', () => {
         expect(DURATION_UI_FIXTURES.nextcloud.instanceId).toBe('nextcloud-grade5a-001')
     })
 
-    it('walker dispatches usage Intents through uiDriver on school-day', async () => {
-        const scenario = loadScenario('school-day')
+    it('walker dispatches usage Intents through uiDriver on unified', async () => {
+        const scenario = loadScenario('unified')
         const ops = fakeOps({
             poolEngines: scenario.pool_engines!,
             excludeEngines: scenario.exclude_engines,
@@ -692,7 +675,7 @@ describe('Phase 3 UI Intent dispatch (StubUiDriver)', () => {
         })
         expect(result.aborted).toBe(false)
         expect(result.failures).toBe(0)
-        // school-day seed 7 enters usage — StubUiDriver should see hub/classroom keys
+        // unified seed 7 enters usage — StubUiDriver should see hub/classroom keys
         const uiActions = result.logs
             .map(l => l.action)
             .filter(a =>
@@ -754,8 +737,8 @@ describe('Phase 4 stability probes (FakeFleetOps)', () => {
         expect(result.abortReason).toMatch(/stability probe failed/)
     })
 
-    it('minimal walk with dwell probes stays green on FakeFleetOps', async () => {
-        const scenario = minimalScenario()
+    it('unified walk with dwell probes stays green on FakeFleetOps', async () => {
+        const scenario = unifiedScenario()
         const ops = fakeOps({
             poolEngines: scenario.pool_engines!,
             excludeEngines: scenario.exclude_engines,
@@ -781,8 +764,8 @@ describe('Phase 4 stability probes (FakeFleetOps)', () => {
         expect(withProbes.length).toBeGreaterThan(0)
     })
 
-    it('stress.yaml walks green on FakeFleetOps', async () => {
-        const scenario = loadScenario('stress')
+    it('unified high-iteration Fake walk stays green (former stress preset)', async () => {
+        const scenario = loadScenario('unified')
         expect(scenario.exclude_engines).toContain('idea02')
         const ops = fakeOps({
             poolEngines: scenario.pool_engines!,

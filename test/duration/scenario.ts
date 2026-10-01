@@ -26,11 +26,21 @@ const FORBIDDEN_FIXTURE_MARKERS = [
     'a0bf8374-274e-4bef-b32e-cfbfd09d2884',
 ]
 
+/** Deprecated CLI/scenario names → canonical unified.yaml (one-graph rule). */
+export const SCENARIO_ALIASES: Record<string, string> = {
+    minimal: 'unified',
+    'minimal-live': 'unified',
+    'minimal-dock': 'unified',
+    stress: 'unified',
+    'school-day': 'unified',
+    'school-day-2engine': 'unified',
+}
+
 export const scenariosDir = (): string => {
     // Prefer source tree (tsx / repo root); fall back relative to this file.
     const fromCwd = resolve(process.cwd(), 'test/duration/scenarios')
     try {
-        readFileSync(join(fromCwd, 'minimal.yaml'), 'utf8')
+        readFileSync(join(fromCwd, 'unified.yaml'), 'utf8')
         return fromCwd
     } catch {
         const here = dirname(fileURLToPath(import.meta.url))
@@ -157,10 +167,18 @@ const parseFixtures = (raw: unknown, path: string): FixtureRef[] => {
     return out
 }
 
+export const resolveScenarioName = (nameOrPath: string): string => {
+    if (nameOrPath.endsWith('.yaml') || nameOrPath.endsWith('.yml') || nameOrPath.includes('/')) {
+        return nameOrPath
+    }
+    return SCENARIO_ALIASES[nameOrPath] ?? nameOrPath
+}
+
 export const loadScenario = (nameOrPath: string): Scenario => {
-    const path = nameOrPath.endsWith('.yaml') || nameOrPath.endsWith('.yml') || nameOrPath.includes('/')
-        ? resolve(nameOrPath)
-        : join(scenariosDir(), `${nameOrPath}.yaml`)
+    const resolved = resolveScenarioName(nameOrPath)
+    const path = resolved.endsWith('.yaml') || resolved.endsWith('.yml') || resolved.includes('/')
+        ? resolve(resolved)
+        : join(scenariosDir(), `${resolved}.yaml`)
 
     const text = readFileSync(path, 'utf8')
     const raw = parseYaml(text) as Record<string, unknown>

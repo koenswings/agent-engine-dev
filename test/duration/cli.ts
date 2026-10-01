@@ -1,24 +1,26 @@
 #!/usr/bin/env npx tsx
 /**
- * pnpm test:duration [--scenario minimal] [--iterations 50] [--fast] [--live] [--ui]
+ * pnpm test:duration [--scenario unified] [--iterations 50] [--fast] [--live] [--ui]
  *
- * Default: FakeFleetOps (no Pis) + StubUiDriver.
+ * Default: FakeFleetOps (no Pis) + StubUiDriver + canonical unified.yaml.
+ * Deprecated aliases (minimal, stress, school-day, …) resolve to unified — not separate graphs.
  * --live: RealFleetOps over Tailscale/SSH (requires --hosts or DURATION_FLEET_HOSTS).
- * --ui: PlaywrightUiDriver → Pixel e2e/intents (DURATION_CONSOLE_URL / idea01 :80).
+ * --ui: PlaywrightUiDriver → Pixel e2e/intents (DURATION_CONSOLE_URL / idea01 :8080).
  */
 
 import { FakeFleetOps } from './actions.js'
 import { RealFleetOps, parseHostsFlag } from './realFleetOps.js'
 import { runWalk } from './runner.js'
-import { loadScenario, makeRng } from './scenario.js'
+import { loadScenario, makeRng, resolveScenarioName, SCENARIO_ALIASES } from './scenario.js'
 import { createUiDriver } from './ui/index.js'
 
 const usage = () => {
     console.log(`Usage: pnpm test:duration [options]
 
-  --scenario <name>     scenarios/<name>.yaml (default: minimal)
-  --iterations <n>      Markov steps (default: 40 for *minimal*, else 100)
-  --fast                pm2 restart instead of reboot; shorter settle
+  --scenario <name>     scenarios/<name>.yaml (default: unified)
+                        Deprecated aliases → unified: ${Object.keys(SCENARIO_ALIASES).join(', ')}
+  --iterations <n>      Markov steps (default: 40)
+  --fast                pm2 restart instead of reboot; shorter settle / dwell
   --seed <n>            RNG seed (overrides YAML seed)
   --live                Use RealFleetOps against fleet Pis (default: FakeFleetOps)
   --hosts <map>         Required with --live unless DURATION_FLEET_HOSTS is set.
@@ -26,24 +28,24 @@ const usage = () => {
   --health-wrap-before <cmd>   Shell before reboot; {pis} → pool host IPs
   --health-wrap-after <cmd>    Shell after waitReady post-reboot; {pis} ok
   --ui                  Playwright UI Intents via Pixel e2e/intents (Phase 3)
-  --console-url <url>   Console origin for --ui (default DURATION_CONSOLE_URL or http://idea01)
+  --console-url <url>   Console origin for --ui (default DURATION_CONSOLE_URL or http://idea01:8080)
   --no-stability        Skip Phase 4 dwell probes
   --dwell-ms <n>        Dwell between transitions (default: 30000 / --fast 80)
   --help                this message
 
-Fake (CI / box, no fleet):
+Fake (CI / box, no fleet) — ONE canonical graph:
   pnpm test:duration
-  pnpm test:duration -- --scenario minimal --iterations 15 --fast --seed 42
+  pnpm test:duration -- --scenario unified --iterations 2000 --seed 42 --fast
 
-Live overnight smoke (dock-free; unique stores; --fast pm2 restart):
-  pnpm test:duration -- --live --scenario minimal-live --fast --iterations 30 \\
+Live (same unified graph; hosts/store are CLI knobs — not alternate YAMLs):
+  pnpm test:duration -- --live --scenario unified --fast --iterations 30 \\
     --hosts idea01=100.99.231.94,idea03=100.126.117.80
 
 Env: DURATION_FLEET_HOSTS=idea01=…,idea03=…  (same format as --hosts)
 
-Never put idea02 in the pool. Prefer minimal-dock for Kid testMode dock
-(copy+sentinel under duration-disks/duration-watch). Use minimal-live for
-reboot-only. See test/duration/README.md.
+Never put idea02 in the pool. Live App-open later uses Kid sidecar
+post-dock-restore-running.sh → idea166-kolibri-live :18080 (see ACTIONS.md).
+See test/duration/README.md.
 `)
 }
 
@@ -64,7 +66,7 @@ interface ParsedArgs {
 }
 
 const parseArgs = (argv: string[]): ParsedArgs => {
-    let scenario = 'minimal'
+    let scenario = 'unified'
     let iterations: number | undefined
     let fast = false
     let seed: number | undefined
@@ -117,9 +119,17 @@ const main = async () => {
         process.exit(0)
     }
 
+    const resolvedName = resolveScenarioName(args.scenario)
+    if (resolvedName !== args.scenario && SCENARIO_ALIASES[args.scenario]) {
+        console.error(JSON.stringify({
+            event: 'duration_scenario_alias',
+            requested: args.scenario,
+            resolved: resolvedName,
+            note: 'Deprecated preset name — loads unified.yaml (one-graph rule)',
+        }))
+    }
     const scenario = loadScenario(args.scenario)
-    const iterations = args.iterations
-        ?? (scenario.name.toLowerCase().includes('minimal') ? 40 : 100)
+    const iterations = args.iterations ?? 40
     const seed = args.seed ?? scenario.seed
     const pool = scenario.pool_engines ?? ['idea01', 'idea03']
     const fixtureInstances: Record<string, string> = {}
@@ -181,6 +191,7 @@ const main = async () => {
     console.log(JSON.stringify({
         event: 'duration_start',
         scenario: scenario.name,
+        scenario_file: resolvedName,
         iterations,
         fast: args.fast,
         seed: seed ?? null,
@@ -228,6 +239,7 @@ const main = async () => {
         aborted: result.aborted,
         abortReason: result.abortReason ?? null,
         live: args.live,
+        scenario_file: resolvedName,
     }))
 
     process.exit(result.failures > 0 || result.aborted ? 1 : 0)

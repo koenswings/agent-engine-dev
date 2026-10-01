@@ -32,19 +32,19 @@ export const INFRA_ACTIONS = [
     'infra_reboot_engine',
 ] as const
 
-/** Phase 1–2 stubbed usage/operator Intents that may appear in YAML. */
+/**
+ * Usage/operator Intent keys present in unified.yaml.
+ * Pixel-registered + deferred + Pixel-missing (~50) — Fake StubUiDriver no-ops all;
+ * live --ui needs Pixel adapters for deferred/missing before those edges are real.
+ */
 export const UI_STUB_ACTIONS = [
+    // Pixel-registered
     'open_kolibri_as_teacher',
     'open_kolibri_as_learner',
     'open_nextcloud_as_learner',
     'open_nextcloud_as_teacher',
-    'open_wikipedia_as_learner',
-    'open_wikipedia_as_teacher',
     'stay_on_learner_overview',
     'stay_on_teacher_overview',
-    'keep_watching',
-    'next_resource',
-    'exit_lesson',
     'open_disk_inventory',
     'open_instance_controls',
     'eject_disk',
@@ -65,6 +65,63 @@ export const UI_STUB_ACTIONS = [
     'sign_in',
     'make_files_disk',
     'add_files_role',
+    // Deferred (Pixel clear message)
+    'open_wikipedia_as_learner',
+    'open_wikipedia_as_teacher',
+    'keep_watching',
+    'next_resource',
+    'exit_lesson',
+    // Pixel-missing — Fake no-op; keep on YAML (do not drop edges)
+    'create_class',
+    'enroll_learners',
+    'build_lesson',
+    'create_quiz',
+    'read_reports',
+    'preview_as_learner',
+    'back_to_console',
+    'browse_classes',
+    'leave_kolibri',
+    'finish_exercise',
+    'next_video',
+    'share_to_class',
+    'done_sharing',
+    'back_to_console_from_share',
+    'open_file_drop',
+    'after_upload',
+    'leave_file_drop',
+    'open_collab_doc',
+    'close_doc',
+    'keep_editing',
+    'browse_folders',
+    'leave_nextcloud_as_learner',
+    'leave_nextcloud_as_teacher',
+    'search_browse_wikipedia',
+    'leave_wikipedia_as_learner',
+    'leave_wikipedia_as_teacher',
+    'retry_login_first_time_setup',
+    'notice_usb_dock',
+    'install_app',
+    'start_after_install',
+    'stay_on_disk',
+    'make_backup_disk',
+    'restore_from_backup',
+    'backup_configured_restored',
+    'files_role_added',
+    'copy_app',
+    'move_app',
+    'done_redistribute',
+    'stay_on_source_disk',
+    'open_copied_instance',
+    'open_app',
+    'backup_instance',
+    'back_to_disk',
+    'back_to_overview',
+    'add_operator',
+    'remove_operator',
+    'change_password',
+    'log_out',
+    'switch_engine',
+    'reboot_engine',
 ] as const
 
 export type KnownAction =
@@ -251,7 +308,31 @@ const layerForUiAction = (action: string, fallback: Layer | null): Layer => {
         action === 'open_settings' ||
         action === 'close_settings' ||
         action === 'sign_in' ||
-        action === 'open_console_as_operator'
+        action === 'open_console_as_operator' ||
+        action === 'retry_login_first_time_setup' ||
+        action === 'notice_usb_dock' ||
+        action === 'install_app' ||
+        action === 'start_after_install' ||
+        action === 'stay_on_disk' ||
+        action === 'make_backup_disk' ||
+        action === 'restore_from_backup' ||
+        action === 'backup_configured_restored' ||
+        action === 'files_role_added' ||
+        action === 'copy_app' ||
+        action === 'move_app' ||
+        action === 'done_redistribute' ||
+        action === 'stay_on_source_disk' ||
+        action === 'open_copied_instance' ||
+        action === 'open_app' ||
+        action === 'backup_instance' ||
+        action === 'back_to_disk' ||
+        action === 'back_to_overview' ||
+        action === 'add_operator' ||
+        action === 'remove_operator' ||
+        action === 'change_password' ||
+        action === 'log_out' ||
+        action === 'switch_engine' ||
+        action === 'reboot_engine'
     ) {
         return 'operator'
     }
@@ -265,7 +346,31 @@ const layerForUiAction = (action: string, fallback: Layer | null): Layer => {
         action === 'open_exercise' ||
         action === 'keep_watching' ||
         action === 'next_resource' ||
-        action === 'exit_lesson'
+        action === 'exit_lesson' ||
+        action === 'create_class' ||
+        action === 'enroll_learners' ||
+        action === 'build_lesson' ||
+        action === 'create_quiz' ||
+        action === 'read_reports' ||
+        action === 'preview_as_learner' ||
+        action === 'back_to_console' ||
+        action === 'browse_classes' ||
+        action === 'leave_kolibri' ||
+        action === 'finish_exercise' ||
+        action === 'next_video' ||
+        action === 'share_to_class' ||
+        action === 'done_sharing' ||
+        action === 'back_to_console_from_share' ||
+        action === 'open_file_drop' ||
+        action === 'after_upload' ||
+        action === 'leave_file_drop' ||
+        action === 'open_collab_doc' ||
+        action === 'close_doc' ||
+        action === 'keep_editing' ||
+        action === 'browse_folders' ||
+        action.startsWith('leave_nextcloud') ||
+        action === 'search_browse_wikipedia' ||
+        action.startsWith('leave_wikipedia')
     ) {
         return 'usage'
     }
