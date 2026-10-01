@@ -10,10 +10,11 @@
 # Path A `--start-instances` preserves dock across return_to_start.
 # cover-all = strict full graph (failLoud on Pixel-missing under --ui).
 #
-# INTERIM (Steve 2026-10-01): skip copy_app / move_app (+ dependents done_redistribute,
-# stay_on_source_disk, open_copied_instance) until Pixel multi-disk copy_app (Path A) lands.
-# Prefer Pixel A for multi-disk; B interim OK now. Reconnect via back_to_overview so the
-# path stays graph-valid. Restore those steps when A ships, then re-run live hardpass --record-walk.
+# Pixel Prefer A (Console#134 @b63e1ec): copy_app/move_app multi-disk landed — keep these
+# steps in the walk. Live preload: demoMode=false (PlaywrightUiDriver); both duration
+# disks docked (kolibri + nextcloud); optional DURATION_COPY_SOURCE_DISK /
+# DURATION_COPY_TARGET_DISK / DURATION_COPY_INSTANCE_ID (default kolibri→nextcloud).
+# Wait for Atlas :8080 @b63e1ec GO before live --ui --record-walk.
 kind: walk
 name: cover-hardpass
 graph: unified
@@ -105,16 +106,12 @@ steps:
   - from: op_disk
     to: op_instance
     action: open_instance_controls
-  # INTERIM skip until Pixel multi-disk copy_app (Path A):
-  # - from: op_instance
-  #   to: op_copy_move
-  #   action: copy_app
-  # - from: op_copy_move
-  #   to: op_overview
-  #   action: done_redistribute
   - from: op_instance
+    to: op_copy_move
+    action: copy_app
+  - from: op_copy_move
     to: op_overview
-    action: back_to_overview
+    action: done_redistribute
   - from: op_overview
     to: op_eject
     action: eject_disk
@@ -217,13 +214,12 @@ steps:
   - from: op_backup
     to: op_disk
     action: backup_configured_restored
-  # INTERIM skip until Pixel multi-disk move_app (Path A):
-  # - from: op_disk
-  #   to: op_copy_move
-  #   action: move_app
-  # - from: op_copy_move
-  #   to: op_disk
-  #   action: stay_on_source_disk
+  - from: op_disk
+    to: op_copy_move
+    action: move_app
+  - from: op_copy_move
+    to: op_disk
+    action: stay_on_source_disk
   - from: op_disk
     to: op_erase
     action: erase_disk
@@ -260,13 +256,12 @@ steps:
   - from: op_install
     to: op_instance
     action: start_after_install
-  # INTERIM skip until Pixel multi-disk copy_app (Path A):
-  # - from: op_instance
-  #   to: op_copy_move
-  #   action: copy_app
-  # - from: op_copy_move
-  #   to: op_instance
-  #   action: open_copied_instance
+  - from: op_instance
+    to: op_copy_move
+    action: copy_app
+  - from: op_copy_move
+    to: op_instance
+    action: open_copied_instance
   - from: op_instance
     to: op_disk
     action: back_to_disk

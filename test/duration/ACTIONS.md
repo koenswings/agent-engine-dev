@@ -31,7 +31,7 @@ YAML transition shape (all layers): `{ to, weight, action }`.
 
 **Prefer real UI:** `--live --ui` once Pixel adapters harden (Fake `StubUiDriver` = CI / missing-Intent only).  
 With `--ui`, Engine always uses `PlaywrightUiDriver` — deferred / unregistered Intents soft-skip or clear-fail via `failLoud`; never silently force Stub for registered Intents.  
-Recording + **cover-hardpass** (Pixel-registered demo + infra; live `--ui` demo; **interim:** skips `copy_app`/`move_app` until Pixel multi-disk Path A) or cover-all (strict full graph) / random with `--ui --live` (+ `--record-walk <dir>`) is the intended verification path once Pixel+Atlas are ready. cover-all under `--ui` keeps failLoud abort on Pixel-missing (no soft-skip); a live cover-all retry requires Console@`ba0cfa1`.
+Recording + **cover-hardpass** (Pixel-registered demo + infra; live `--ui` demo; `copy_app`/`move_app` require Console#134 @`b63e1ec`+ multi-disk) or cover-all (strict full graph) / random with `--ui --live` (+ `--record-walk <dir>`) is the intended verification path once Pixel+Atlas are ready. cover-all under `--ui` keeps failLoud abort on Pixel-missing (no soft-skip); a live cover-all retry requires Console@`ba0cfa1`.
 
 Fake/CI default: `StubUiDriver` (no browser). Live UI: `pnpm test:duration -- --live --ui` → `PlaywrightUiDriver` loads Pixel `runDurationIntent` / optional `captureAfterIntent` from `idea-console/duration-intents` or `agent-console-dev/e2e/intents` (or `DURATION_CONSOLE_INTENTS`).
 
@@ -77,6 +77,17 @@ Sticky `localStorage.demoMode==='true'` (Pixel `bootDemo`) must not mask Kid fix
 ## Path A — `--start-instances`
 
 CLI `--start-instances` → `RealFleetOps({ startInstances: true })` (keep `instances/` on dock so Console shows Running cards) **and** `preserveDockedOnReturn` so `return_to_start` after infra dock does **not** undock — required for cover-hardpass **dock-before-inventory** (`infra_dock_fixture` → … → `open_disk_inventory` on `disk-duration-kolibri-grade5a-001`). Fake default still undocks on return (hygiene).
+
+
+## Multi-disk copy_app / move_app preload (Pixel Prefer A @b63e1ec)
+
+Live `--ui` hardpass needs Console#134 **@b63e1ec+** (real HTML5 drag + Copy/Move modal). Preload:
+
+1. **demoMode=false** — `PlaywrightUiDriver` initScript (already); production web ignores sticky demo.
+2. **Both duration disks docked** — `duration-kolibri-grade5a-001` + `duration-nextcloud-grade5a-001` (Path A `--start-instances` keeps instances/).
+3. **Optional env** — `DURATION_COPY_SOURCE_DISK`, `DURATION_COPY_TARGET_DISK`, `DURATION_COPY_INSTANCE_ID` (Pixel defaults: kolibri → nextcloud). Sidecars: `DURATION_KOLIBRI_URL` / `DURATION_NEXTCLOUD_URL` as needed.
+
+Do **not** live-run until Atlas confirms idea01 `:8080` serves Console @`b63e1ec`.
 
 ## Live Console / Kid App-open
 
