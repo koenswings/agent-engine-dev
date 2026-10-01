@@ -51,11 +51,14 @@ const DISK_ID_TO_PACK: Record<string, string> = {
     'duration-kolibri-grade5a-001': 'kolibri',
     'duration-nextcloud-grade5a-001': 'nextcloud',
     'duration-empty-001': 'empty',
+    /** Prefer A r17 second empty (Kid App#10 pack empty-002/). */
+    'duration-empty-002': 'empty-002',
 }
 
-/** Prefer Atlas dock slot when allocating (empty → idea-test-3). */
+/** Prefer Atlas dock slot when allocating (empty → idea-test-3; empty2 → idea-test-4). */
 const DISK_ID_PREFERRED_DEVICE: Record<string, string> = {
     'duration-empty-001': 'idea-test-3',
+    'duration-empty-002': 'idea-test-4',
 }
 
 /** Known Path A instance ids (no duration- prefix on the container/instance). */
@@ -215,9 +218,10 @@ export type SshDockCopyRemoteArgs = {
 
 /**
  * Build the remote bash for Kid dockFixture copy.
- * Empty pack (`duration-empty-001`): never reuse Path A tree — always rm -rf + cp -a
- * so prior install_app/make_backup apps/ cannot leave isAppDisk / hide EmptyDiskPanel.
- * Kolibri/Nextcloud Grade5A: reuse matching META tree (docker-owned instances → no wipe).
+ * Empty packs (duration-empty-001 → pack empty/; duration-empty-002 → pack empty-002/):
+ * never reuse Path A tree — always rm -rf + cp -a so prior install_app/make_backup
+ * apps/ cannot leave isAppDisk / hide EmptyDiskPanel. Kolibri/Nextcloud Grade5A: reuse
+ * matching META tree (docker-owned instances → no wipe).
  */
 export const buildSshDockCopyRemote = (args: SshDockCopyRemoteArgs): string => {
     const { diskId, pack, src, dest, sentinel, disksRoot, watchDir, startInstances } = args
@@ -226,7 +230,7 @@ export const buildSshDockCopyRemote = (args: SshDockCopyRemoteArgs): string => {
         'set -euo pipefail',
         `mkdir -p '${disksRoot}' '${watchDir}'`,
     ]
-    if (pack === 'empty') {
+    if (pack === 'empty' || pack === 'empty-002') {
         // Empty has no docker-owned instance files — wipe is safe. Refuse only when
         // dest META belongs to a different diskId (never steal kolibri/nextcloud slot).
         parts.push(

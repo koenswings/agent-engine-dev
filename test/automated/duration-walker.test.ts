@@ -608,6 +608,7 @@ describe('RealFleetOps guard clauses (no network)', () => {
         expect(resolveDurationFixturePack('duration-kolibri-grade5a-001')).toBe('kolibri')
         expect(resolveDurationFixturePack('duration-nextcloud-grade5a-001')).toBe('nextcloud')
         expect(resolveDurationFixturePack('duration-empty-001')).toBe('empty')
+        expect(resolveDurationFixturePack('duration-empty-002')).toBe('empty-002')
         expect(() => resolveDurationFixturePack('sdb1')).toThrow(/unknown/)
         expect(() => assertPrivateDurationRoots('/disks', DEFAULT_DURATION_WATCH_DIR)).toThrow(/never \/disks/)
         expect(() => assertPrivateDurationRoots(DEFAULT_DURATION_DISKS_ROOT, '/dev/engine')).toThrow(/never \/dev\/engine/)
@@ -641,6 +642,20 @@ describe('RealFleetOps guard clauses (no network)', () => {
         // Still refuse when META belongs to a different diskId
         expect(emptyRemote).toMatch(/! grep -Fq 'diskId: duration-empty-001'/)
         expect(emptyRemote).toMatch(/exit 4/)
+
+        const empty2Remote = buildSshDockCopyRemote({
+            ...base,
+            dest: '/home/pi/idea/duration-disks/idea-test-4',
+            sentinel: '/home/pi/idea/duration-watch/idea-test-4',
+            diskId: 'duration-empty-002',
+            pack: 'empty-002',
+            src: '/fixtures/empty-002',
+        })
+        expect(empty2Remote).toMatch(/empty pack always fresh-copy/)
+        expect(empty2Remote).toMatch(/rm -rf '\/home\/pi\/idea\/duration-disks\/idea-test-4'/)
+        expect(empty2Remote).toMatch(/cp -a '\/fixtures\/empty-002\/\.'/)
+        expect(empty2Remote).not.toMatch(/reuse existing Path A tree/)
+        expect(empty2Remote).toMatch(/! grep -Fq 'diskId: duration-empty-002'/)
 
         const kolibriRemote = buildSshDockCopyRemote({
             ...base,

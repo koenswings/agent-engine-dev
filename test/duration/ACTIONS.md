@@ -80,21 +80,21 @@ CLI `--start-instances` → `RealFleetOps({ startInstances: true })` (keep `inst
 
 Path A re-dock after eject: RealFleetOps does `rm -f` sentinel, `sleep 5`, then `touch` (Atlas — chokidar needs unlink before create, not mtime-only touch; Atlas Ops proof: 5s before touch). `dockFixture` waits up to **120s** for store dock, and on first timeout re-fires the sentinel once then waits again before failing.
 
-Path A `infra_dock_fixture` re-dock (findDockedEngine miss / no walker dock): prefer non-excluded `poolEngines[0]` (Console host / idea01) — not RNG; also dock sibling `fixtureDisks` (nextcloud + empty) on the same engine. Empty pack prefers `IDEA_DISKS_ROOT/.../idea-test-3`.
+Path A `infra_dock_fixture` re-dock (findDockedEngine miss / no walker dock): prefer non-excluded `poolEngines[0]` (Console host / idea01) — not RNG; also dock sibling `fixtureDisks` (nextcloud + empty-001 + empty-002) on the same engine. Empty packs prefer `idea-test-3` / `idea-test-4`.
 
 Path A / `infra_reboot_engine --fast`: `rebootEngine` stops `kolibri-grade5a` / `nextcloud-grade5a` / `duration-*` containers (never `idea166-*`) before `pm2 restart`, then `reconcileDurationZombies` after `waitReady` so Automerge Running+Undocked fixtures do not trip `no_zombie_instances`.
 
 
 ## Multi-disk Prefer A preload (Pixel @b63e1ec + EmptyDiskPanel @db21bf4)
 
-Live `--ui` Prefer A needs Console#134 **@db21bf4+** (Copy/Move + EmptyDiskPanel `DURATION_EMPTY_DISK_ID` / `data-role=empty`). Preload:
+Live `--ui` Prefer A needs Console#134 **@48a4a05+** (Copy/Move + EmptyDiskPanel + erase empty-only / eject survivor). Preload:
 
 1. **demoMode=false** — `PlaywrightUiDriver` initScript (already); production web ignores sticky demo.
-2. **Three Path A disks docked on Console host (pool[0]/idea01)** — `duration-kolibri-grade5a-001` + `duration-nextcloud-grade5a-001` + `duration-empty-001` (Kid App#10 @`6167046` pack `tests/duration-tests/fixtures/empty/`). Prefer slots **idea-test-1 / idea-test-2 / idea-test-3** under `IDEA_DISKS_ROOT` (empty → **idea-test-3** when free). Path A `--start-instances` keeps instances/ on app disks. **Empty must be fresh from Kid pack before EmptyDiskPanel Intents** — Engine `sshDockCopy` always `rm -rf` + `cp -a` for pack `empty` / `duration-empty-001` on every `dockFixture` (never Path A reuse). Prior `install_app` / `make_backup` leaves `apps/` → Engine `isAppDisk` → app badge / no EmptyDiskPanel; empty packs have no docker-owned instance files so wipe is safe. Kolibri/Nextcloud Grade5A keep reuse (docker-owned `instances/`).
-3. **Live env** — `DURATION_EMPTY_DISK_ID=duration-empty-001` so EmptyDiskPanel Intents (`install_app` / `make_files_*` / `make_backup_*` / erase-on-empty) select the empty disk — do **not** remap onto Kolibri Grade5A. **`DURATION_BACKUP_DISK_ID=duration-empty-001`** after `make_backup_disk` (same pack; role becomes backup) so `open_disk_inventory` before `restore_from_backup` focuses the Backup Disk — restore-panel is not on Grade5A app disks; Pixel also discovers backup role. Optional: `DURATION_COPY_SOURCE_DISK`, `DURATION_COPY_TARGET_DISK`, `DURATION_COPY_INSTANCE_ID` (default kolibri → nextcloud). Fixture source: `DURATION_FIXTURE_SOURCE_ROOT` (default Kid packs on Pi workspace).
-4. **cover-registered-intents** includes EmptyDiskPanel walk steps; erase targets empty via Pixel selection (do not erase Grade5A app disks). **`restore_from_backup` requires Backup Disk selected** (walk: `back_to_overview` → `open_disk_inventory` with `DURATION_BACKUP_DISK_ID` before restore).
+2. **Four Path A disks docked on Console host (pool[0]/idea01)** — `duration-kolibri-grade5a-001` + `duration-nextcloud-grade5a-001` + `duration-empty-001` + **`duration-empty-002`** (Kid App#10 @`f945203` packs `fixtures/empty/` + `fixtures/empty-002/`). Prefer slots **idea-test-1 / idea-test-2 / idea-test-3 / idea-test-4** under `IDEA_DISKS_ROOT` (empty-001 → **idea-test-3**, empty-002 → **idea-test-4** when free). Path A `--start-instances` keeps instances/ on app disks. **Empty packs must be fresh from Kid pack before EmptyDiskPanel Intents** — Engine `sshDockCopy` always `rm -rf` + `cp -a` for packs `empty` / `empty-002` on every `dockFixture` (never Path A reuse). Prior `install_app` / `make_backup` leaves `apps/` → Engine `isAppDisk` → app badge / no EmptyDiskPanel; empty packs have no docker-owned instance files so wipe is safe. Kolibri/Nextcloud Grade5A keep reuse (docker-owned `instances/`).
+3. **Live env (Prefer A r17)** — `DURATION_EMPTY_DISK_ID=duration-empty-001` for early EmptyDiskPanel / `make_backup_*` — do **not** remap onto Kolibri Grade5A. **`DURATION_BACKUP_DISK_ID=duration-empty-001`** after `make_backup_disk` (same pack; role=backup) for `restore_from_backup`. Keep **`duration-empty-002` docked** so Pixel @`48a4a05` `erase_disk` → `ensureEmptyDiskPanel` can **discover** `data-role=empty` after empty-001 became backup (loud-fail if no empty). **`DURATION_EJECT_DISK_ID=duration-nextcloud-grade5a-001`** for post-erase `eject_disk`. Optional: `DURATION_COPY_SOURCE_DISK`, `DURATION_COPY_TARGET_DISK`, `DURATION_COPY_INSTANCE_ID` (default kolibri → nextcloud). Fixture source: `DURATION_FIXTURE_SOURCE_ROOT`.
+4. **cover-registered-intents** — erase selects empty via Pixel EmptyDiskPanel discover (empty-002) — never Grade5A / never Backup (walk: `back_to_overview` → `open_disk_inventory` before `erase_disk` / `confirm_erase`). **`restore_from_backup`:** `back_to_overview` → `open_disk_inventory` with `DURATION_BACKUP_DISK_ID` before restore. Post-erase eject: `DURATION_EJECT_DISK_ID=duration-nextcloud-grade5a-001`.
 
-Do **not** live-run until Atlas confirms idea01 `:8080` serves Console @`db21bf4` **and** `duration-empty-001` is docked.
+Do **not** live-run until Atlas confirms idea01 `:8080` serves Console @`48a4a05` **and** both `duration-empty-001` + `duration-empty-002` are docked.
 
 ## Live Console / Kid App-open
 
@@ -111,8 +111,10 @@ Deprecated CLI aliases (`minimal-*`, `stress`, `school-day`) load **`unified.yam
 |---|---|---|
 | `infra_dock_fixture` (primary) | `duration-kolibri-grade5a-001` | `kolibri-grade5a-001` |
 | nextcloud pack | `duration-nextcloud-grade5a-001` | `nextcloud-grade5a-001` |
-| empty pack (EmptyDiskPanel) | `duration-empty-001` | — (no instance; slot idea-test-3) |
-| Backup Disk (post `make_backup_disk`) | `duration-empty-001` via `DURATION_BACKUP_DISK_ID` | — (same pack; role=backup; required before `restore_from_backup`) |
+| empty pack (EmptyDiskPanel / make_backup) | `duration-empty-001` | — (no instance; slot idea-test-3; early `DURATION_EMPTY_DISK_ID`) |
+| empty pack #2 (Prefer A r17 erase discover) | `duration-empty-002` | — (Kid pack `empty-002/`; slot idea-test-4; docked for erase empty-badge discover) |
+| Backup Disk (post `make_backup_disk`) | `duration-empty-001` via `DURATION_BACKUP_DISK_ID` | — (role=backup; required before `restore_from_backup`; **not** erase target) |
+| eject after erase (late walk) | `duration-nextcloud-grade5a-001` via `DURATION_EJECT_DISK_ID` | — Prefer A post-erase survivor; Pixel also discovers ejectable row |
 
 Content pins (stable): `open_video` contentId `e60662de-b15c-52f9-b003-359f7d91f8fd` / nodeId `4a1a1b92-3f6d-59eb-a94c-3f91f0011dd5`; `open_exercise` contentId `7eb9de46-96eb-53d0-bcc1-2fb270b96f03` / nodeId `94a47ec7-f30d-5cd1-93f8-ad08c42b6c2a`. Auth Morango IDs are re-provision mutable.
 

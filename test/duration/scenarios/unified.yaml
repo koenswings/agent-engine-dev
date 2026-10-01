@@ -23,6 +23,11 @@ fixtures:
     path: tests/duration-tests/fixtures/empty
     diskId: duration-empty-001
     infra_disk: true
+  # Prefer A r17: Kid App#10 pack empty-002/ (stays empty after make_backup on empty-001).
+  empty2:
+    path: tests/duration-tests/fixtures/empty-002
+    diskId: duration-empty-002
+    infra_disk: true
   # kiwix: deferred (Kid pack when wiki_browse goes live)
 
 states:

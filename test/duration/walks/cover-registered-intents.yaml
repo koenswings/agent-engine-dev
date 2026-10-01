@@ -10,16 +10,18 @@
 # Path A `--start-instances` preserves dock across return_to_start.
 # cover-all = strict full graph (failLoud on Pixel-missing under --ui).
 #
-# Pixel Prefer A (Console#134 @b63e1ec + EmptyDiskPanel @db21bf4): copy_app/move_app
-# multi-disk + EmptyDiskPanel Intents. Live preload: demoMode=false; three Path A
-# disks docked (kolibri + nextcloud + duration-empty-001 on idea-test-1/2/3);
-# export DURATION_EMPTY_DISK_ID=duration-empty-001 (Pixel selects data-role=empty).
-# restore_from_backup requires Backup Disk selected (not Grade5A app disk): after
-# make_backup_disk, open_disk_inventory with DURATION_BACKUP_DISK_ID=duration-empty-001
-# (same pack; role is backup post make_backup_disk). Pixel also discovers backup role.
+# Pixel Prefer A (Console#134 @48a4a05+): copy_app/move_app multi-disk +
+# EmptyDiskPanel + erase empty-only. Live preload: demoMode=false; four Path A
+# disks docked (kolibri + nextcloud + duration-empty-001 + duration-empty-002 on
+# idea-test-1/2/3/4). Env: DURATION_EMPTY_DISK_ID=duration-empty-001 (make_backup),
+# DURATION_BACKUP_DISK_ID=duration-empty-001, empty-002 docked for erase discover,
+# DURATION_EJECT_DISK_ID=duration-nextcloud-grade5a-001. Prefer A r17: after
+# make_backup empty-001 is backup — Pixel ensureEmptyDiskPanel discovers empty-002
+# (loud-fail if none). Walk: back_to_overview → open_disk_inventory before erase.
+# Never erase Grade5A. Engine infra_dock_fixture siblings include empty-002.
 # Optional DURATION_COPY_SOURCE_DISK / DURATION_COPY_TARGET_DISK /
 # DURATION_COPY_INSTANCE_ID (default kolibri→nextcloud).
-# Wait for Atlas :8080 @db21bf4 GO + empty docked before live --ui --record-walk.
+# Wait for Atlas :8080 @48a4a05 GO + both empties docked before live --ui --record-walk.
 kind: walk
 name: cover-registered-intents
 graph: unified
@@ -234,12 +236,25 @@ steps:
   - from: op_copy_move
     to: op_disk
     action: stay_on_source_disk
+  # Prefer A r17: select still-empty pack before erase (not Grade5A / not Backup).
+  # After make_backup, empty-001 is backup — Pixel @48a4a05 ensureEmptyDiskPanel
+  # discovers docked duration-empty-002 (empty-badge). Env keeps EMPTY=001 /
+  # BACKUP=001. Mirror Backup Disk select: back_to_overview → open_disk_inventory.
+  # Never erase Grade5A app disks.
+  - from: op_disk
+    to: op_overview
+    action: back_to_overview
+  - from: op_overview
+    to: op_disk
+    action: open_disk_inventory
   - from: op_disk
     to: op_erase
     action: erase_disk
   - from: op_erase
     to: op_disk
     action: confirm_erase
+  # Post-erase eject: DURATION_EJECT_DISK_ID=duration-nextcloud-grade5a-001
+  # (Pixel also discovers a surviving ejectable disk).
   - from: op_disk
     to: op_eject
     action: eject_disk

@@ -38,6 +38,12 @@ export const DURATION_UI_FIXTURES = {
         /** Pixel EmptyDiskPanel: DURATION_EMPTY_DISK_ID / data-role=empty */
         preferredDevice: 'idea-test-3',
     },
+    /** Prefer A r17: Kid pack empty-002/ — erase discover after make_backup on empty-001. */
+    empty2: {
+        diskId: 'duration-empty-002',
+        packPath: 'tests/duration-tests/fixtures/empty-002',
+        preferredDevice: 'idea-test-4',
+    },
 } as const
 
 /** Pixel Console Intent names registered in agent-console-dev#134 e2e/intents (65 @ ba0cfa1). */
