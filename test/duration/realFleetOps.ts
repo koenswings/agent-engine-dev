@@ -1058,8 +1058,30 @@ export class RealFleetOps implements FleetOps {
     }
 
     /**
+     * Wait until diskId is not docked on any pool engine (post-eject Automerge settle).
+     * Unique-store: ejectDisk is async via engine commands — dockFixture must not
+     * treat a stale dockedTo as "already docked" and no-op a move.
+     */
+    private async waitDiskUndocked(diskId: string, timeoutMs = 60_000): Promise<void> {
+        const start = Date.now()
+        while (Date.now() - start < timeoutMs) {
+            try {
+                const already = await this.findDockedEngine(diskId)
+                if (!already) return
+            } catch (e) {
+                console.warn(`[RealFleetOps] waitDiskUndocked ${diskId}: ${e}`)
+            }
+            await sleep(500)
+        }
+        throw new Error(
+            `RealFleetOps: disk ${diskId} still docked after eject within ${timeoutMs}ms`,
+        )
+    }
+
+    /**
      * If diskId is already docked on any pool engine, return that logical id.
      * Used so infra_dock_fixture can no-op when Atlas/Kid Path A pre-docked.
+     * Resolves live uuid → logical; never attributes an unknown dockedTo to pool[0].
      */
     async findDockedEngine(diskId: string): Promise<string | null> {
         for (const id of this.pool) {
@@ -1068,10 +1090,18 @@ export class RealFleetOps implements FleetOps {
                 const view = await this.readStore(id)
                 const disk = view.diskDB[diskId]
                 if (!disk?.dockedTo) continue
+                const docked = disk.dockedTo
+                // toSemanticView usually already mapped live→logical
+                if (this.pool.includes(docked) || this.exclude.includes(docked)) return docked
                 const live = this.liveIds.get(id)
-                if (disk.dockedTo === id || (live && disk.dockedTo === live)) return id
-                // unique-store: dockedTo may be live uuid — still counts as docked on this view
-                if (disk.dockedTo) return id
+                if (docked === id || (live && docked === live)) return id
+                const mapped = this.logicalIds.get(docked)
+                if (mapped) return mapped
+                for (const pid of this.pool) {
+                    if (this.exclude.includes(pid)) continue
+                    const plive = this.liveIds.get(pid)
+                    if (plive && docked === plive) return pid
+                }
             } catch {
                 /* try next */
             }
@@ -1087,11 +1117,20 @@ export class RealFleetOps implements FleetOps {
         resolveDurationFixturePack(diskId) // validate known Kid id
         assertPrivateDurationRoots(this.disksRoot, this.watchDir)
 
-        // Pool-wide no-op when Atlas/Kid already Path A docked.
+        // No-op only when already on the *requested* host. A pool-wide no-op
+        // breaks infra_move_disk: after eject, unique-store may still show
+        // dockedTo=from briefly — treat that as "move in progress", not done.
         const already = await this.findDockedEngine(diskId)
-        if (already) {
+        if (already === engineId) {
             console.log(`[RealFleetOps] dockFixture: ${diskId} already docked on ${already} (no-op)`)
             return
+        }
+        if (already && already !== engineId) {
+            console.log(
+                `[RealFleetOps] dockFixture: ${diskId} on ${already}; ejecting before dock on ${engineId}`,
+            )
+            await this.undockFixtures([already], diskId)
+            await this.waitDiskUndocked(diskId, 60_000)
         }
 
         // If already docked here, treat as success (idempotent).
@@ -1184,6 +1223,9 @@ export class RealFleetOps implements FleetOps {
             throw new Error(`RealFleetOps: refuse to move protected disk '${diskId}'`)
         }
         await this.undockFixtures([fromEngine], diskId)
+        // Eject is async (engine command + Automerge); wait before dock or
+        // dockFixture may see stale dockedTo and skip the target host (r25).
+        await this.waitDiskUndocked(diskId, 60_000)
         await this.dockFixture(toEngine, diskId)
     }
 

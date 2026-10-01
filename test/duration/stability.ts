@@ -49,7 +49,7 @@ export const isDockerMissingProbeFailure = (sample: StabilityProbeSample): boole
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
 
-const MOVE_COPY_ACTIONS = new Set(['move_app', 'copy_app'])
+const MOVE_COPY_ACTIONS = new Set(['move_app', 'copy_app', 'infra_move_disk'])
 export const DEFAULT_DOCKER_MISSING_SETTLE_MS = 90_000
 export const FAST_DOCKER_MISSING_SETTLE_MS = 1_000
 

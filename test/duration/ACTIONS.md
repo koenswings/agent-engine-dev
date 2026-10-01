@@ -24,7 +24,7 @@ YAML transition shape (all layers): `{ to, weight, action }`.
 |---|---|
 | `infra_undock_fixtures` | `infra_idle` — Engine eject/undock fixture disks |
 | `infra_dock_fixture` | `infra_docked` — Engine dock fixture on a pool engine |
-| `infra_move_disk` | `infra_disk_moved` — undock then dock on another pool engine |
+| `infra_move_disk` | `infra_disk_moved` — undock then dock on another pool engine (wait undock settle; dockFixture no-op only if already on *target*; docker settle grace like move_app) |
 | `infra_reboot_engine` | `infra_reboot` — SSH reboot; `--fast` → `pm2 restart engine` (Path A: stop duration docker zombies before/after pm2 so `no_zombie_instances` holds) |
 
 ## Usage / operator Intent registry

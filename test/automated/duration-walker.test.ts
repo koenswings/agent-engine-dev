@@ -91,6 +91,7 @@ describe('duration scenario YAML loader', () => {
         const s = unifiedScenario()
         expect(s.fixtures?.map(f => f.diskId).sort()).toEqual([
             'duration-empty-001',
+            'duration-empty-002',
             'duration-kolibri-grade5a-001',
             'duration-nextcloud-grade5a-001',
         ].sort())
@@ -916,6 +917,46 @@ describe('Phase 4 stability probes (FakeFleetOps)', () => {
             failAfter: DEFAULT_FAIL_AFTER,
             dwellMs: 10,
             justCompletedAction: 'move_app',
+            dockerMissingSettleMs: 20,
+        })
+        expect(result.ok).toBe(true)
+        expect(probes).toBeGreaterThanOrEqual(3)
+        expect(result.samples.some(sample => isDockerMissingProbeFailure(sample))).toBe(true)
+    })
+
+    it('settles a transient docker-missing probe after infra_move_disk', async () => {
+        // Prefer A r25: infra_move_disk eject→dock needs the same grace as move_app
+        // (containers restart on the target host while Automerge may still say Running).
+        const ops = fakeOps({
+            poolEngines: ['idea01', 'idea03'],
+            excludeEngines: ['idea02'],
+        })
+        await ops.dockFixture('idea01', 'duration-kolibri-grade5a-001')
+        await ops.moveDisk('idea01', 'idea03', 'duration-kolibri-grade5a-001')
+        const after = await ops.readStore('idea03')
+        expect(after.diskDB['duration-kolibri-grade5a-001']?.dockedTo).toBe('idea03')
+        let probes = 0
+        ops.probeStability = async () => {
+            probes++
+            const missing = probes <= 2
+            return {
+                ok: !missing,
+                detail: missing ? 'idea03: docker missing for kolibri-grade5a-001' : 'fake probe ok',
+                engines: [{
+                    id: 'idea03',
+                    wsUp: true,
+                    dockerOk: !missing,
+                    statusAnomaly: missing ? 'docker missing for kolibri-grade5a-001' : undefined,
+                }],
+            }
+        }
+        const result = await runStabilityDuringDwell({
+            ops,
+            engines: ['idea01', 'idea03'],
+            intervalMs: 1,
+            failAfter: DEFAULT_FAIL_AFTER,
+            dwellMs: 10,
+            justCompletedAction: 'infra_move_disk',
             dockerMissingSettleMs: 20,
         })
         expect(result.ok).toBe(true)
