@@ -3,7 +3,8 @@
 **Contract owner:** Axle (Engine walker). Pixel matches Playwright adapters to these keys.  
 **Locked** by Steve Design Review for idea#166 — do not rename without reporting a clash.  
 **Phase 3+4 (idea#168):** walker dispatches usage/operator Intents via `test/duration/ui/` → Pixel `e2e/intents` (`getIntent`).  
-**ONE graph:** `scenarios/unified.yaml` is the only Markov state table. Run modes = CLI knobs.
+**ONE graph:** `scenarios/unified.yaml` is the only Markov state table. Run modes = CLI knobs.  
+**Pixel registry:** Console#134 head `f26f737` — **47** Intent keys (Engine ACTIONS.md on #145 is source for walker contract).
 
 YAML transition shape (all layers): `{ to, weight, action }`.
 
@@ -30,17 +31,20 @@ YAML transition shape (all layers): `{ to, weight, action }`.
 
 Fake/CI default: `StubUiDriver` (no browser). Live UI: `pnpm test:duration -- --ui` → `PlaywrightUiDriver` loads Pixel `getIntent` from `agent-console-dev/e2e/intents` (or `DURATION_CONSOLE_INTENTS`).
 
-### Pixel-registered (Console#134)
+### Pixel-registered (47 — Console#134 @ f26f737)
 
-`open_console_as_*`, `return_to_start`, `stay_on_*`, `open_kolibri_as_*`, `open_nextcloud_as_*`, `open_video`, `open_exercise`, `open_disk_inventory`, `open_instance_controls`, `eject_disk`, `confirm_eject`, `cancel_eject`, `erase_disk`, `confirm_erase`, `cancel_erase`, `start_instance`, `stop_instance`, `open_account`, `close_account`, `open_settings`, `close_settings`, `sign_in`, `make_files_disk`, `add_files_role`
+Hub/dwell: `open_console_as_*`, `return_to_start`, `stay_on_*`  
+App-open: `open_kolibri_as_*`, `open_nextcloud_as_*`, `open_video`, `open_exercise`  
+Operator: `open_disk_inventory`, `open_instance_controls`, `eject_disk`, `confirm_eject`, `cancel_eject`, `erase_disk`, `confirm_erase`, `cancel_erase`, `start_instance`, `stop_instance`, `open_account`, `close_account`, `open_settings`, `close_settings`, `sign_in`, `make_files_disk`, `add_files_role`  
+**+17 operator deep:** `install_app`, `start_after_install`, `stay_on_disk`, `make_backup_disk`, `restore_from_backup`, `open_app`, `backup_instance`, `back_to_disk`, `back_to_overview`, `log_out`, `notice_usb_dock`, `retry_login_first_time_setup`, `change_password`, `add_operator`, `remove_operator`, `copy_app`, `move_app`
 
 ### Deferred (clear message, not silent)
 
 `keep_watching`, `next_resource`, `exit_lesson`, `open_wikipedia_as_teacher`, `open_wikipedia_as_learner`
 
-### Pixel-missing (~50 — Fake StubUiDriver no-op; keep on YAML)
+### Pixel-missing (still on unified.yaml — Fake Stub no-op / live clear-miss)
 
-Do **not** silently drop these edges from `unified.yaml`. Live `--ui` needs Pixel adapters before they are real.
+Do **not** silently drop these edges from `unified.yaml`.
 
 **Kolibri coaching / navigation:** `create_class`, `enroll_learners`, `build_lesson`, `create_quiz`, `read_reports`, `preview_as_learner`, `back_to_console`, `browse_classes`, `leave_kolibri`, `finish_exercise`, `next_video`
 
@@ -48,7 +52,7 @@ Do **not** silently drop these edges from `unified.yaml`. Live `--ui` needs Pixe
 
 **Wikipedia leave/search:** `search_browse_wikipedia`, `leave_wikipedia_as_learner`, `leave_wikipedia_as_teacher`
 
-**Operator deep:** `retry_login_first_time_setup`, `notice_usb_dock`, `install_app`, `start_after_install`, `stay_on_disk`, `make_backup_disk`, `restore_from_backup`, `backup_configured_restored`, `files_role_added`, `copy_app`, `move_app`, `done_redistribute`, `stay_on_source_disk`, `open_copied_instance`, `open_app`, `backup_instance`, `back_to_disk`, `back_to_overview`, `add_operator`, `remove_operator`, `change_password`, `log_out`, `switch_engine`, `reboot_engine`
+**Operator still missing:** `backup_configured_restored`, `files_role_added`, `done_redistribute`, `stay_on_source_disk`, `open_copied_instance`, `switch_engine`, `reboot_engine`
 
 ### Engine-owned (not Pixel)
 

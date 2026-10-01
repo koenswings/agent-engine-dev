@@ -34,7 +34,7 @@ export const DURATION_UI_FIXTURES = {
     },
 } as const
 
-/** Pixel Console Intent names registered in agent-console-dev#134 e2e/intents. */
+/** Pixel Console Intent names registered in agent-console-dev#134 e2e/intents (47 @ f26f737). */
 export const PIXEL_REGISTERED_INTENTS = [
     'open_console_as_teacher',
     'open_console_as_learner',
@@ -66,6 +66,24 @@ export const PIXEL_REGISTERED_INTENTS = [
     'sign_in',
     'make_files_disk',
     'add_files_role',
+    // +17 operator deep (Console#134 @ f26f737)
+    'install_app',
+    'start_after_install',
+    'stay_on_disk',
+    'make_backup_disk',
+    'restore_from_backup',
+    'open_app',
+    'backup_instance',
+    'back_to_disk',
+    'back_to_overview',
+    'log_out',
+    'notice_usb_dock',
+    'retry_login_first_time_setup',
+    'change_password',
+    'add_operator',
+    'remove_operator',
+    'copy_app',
+    'move_app',
 ] as const
 
 export type PixelIntentName = (typeof PIXEL_REGISTERED_INTENTS)[number]
@@ -80,11 +98,12 @@ export const DEFERRED_UI_INTENTS = [
 ] as const
 
 /**
- * Proposal Intents required by unified.yaml but not yet in Pixel registry (~50).
- * StubUiDriver Fake no-ops these; live --ui needs Pixel adapters — do not drop YAML edges.
+ * Proposal Intents on unified.yaml still not in Pixel's 47-key registry.
+ * StubUiDriver Fake no-ops; live --ui clear-miss until Pixel adapters — do not drop YAML edges.
+ * Lesson chrome keep_watching/next_resource/exit_lesson + open_wikipedia_* live under DEFERRED_UI_INTENTS.
  */
 export const PIXEL_MISSING_INTENTS = [
-    // Kolibri coaching / navigation
+    // Kolibri coaching / navigation (finish_exercise/next_video not deferred — clear Fake no-op)
     'create_class',
     'enroll_learners',
     'build_lesson',
@@ -109,33 +128,16 @@ export const PIXEL_MISSING_INTENTS = [
     'browse_folders',
     'leave_nextcloud_as_learner',
     'leave_nextcloud_as_teacher',
-    // Wikipedia leave/search (open_* already deferred)
+    // Wikipedia leave/search (open_* deferred)
     'search_browse_wikipedia',
     'leave_wikipedia_as_learner',
     'leave_wikipedia_as_teacher',
-    // Operator deep
-    'retry_login_first_time_setup',
-    'notice_usb_dock',
-    'install_app',
-    'start_after_install',
-    'stay_on_disk',
-    'make_backup_disk',
-    'restore_from_backup',
+    // Operator still missing after Console#134 @ f26f737
     'backup_configured_restored',
     'files_role_added',
-    'copy_app',
-    'move_app',
     'done_redistribute',
     'stay_on_source_disk',
     'open_copied_instance',
-    'open_app',
-    'backup_instance',
-    'back_to_disk',
-    'back_to_overview',
-    'add_operator',
-    'remove_operator',
-    'change_password',
-    'log_out',
     'switch_engine',
     'reboot_engine',
 ] as const
