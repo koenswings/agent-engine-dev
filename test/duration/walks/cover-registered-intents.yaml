@@ -300,7 +300,9 @@ steps:
     to: op_disk
     action: back_to_disk
   # Prefer A r27 FAIL@86: start_after_install must target NEW empty-002 install uuid
-  # (Pixel discover non-grade5a), not kolibri-grade5a-001. install_app waits settle.
+  # (Pixel discover non-grade5a @2c55756), not kolibri-grade5a-001. install_app waits settle.
+  # Prefer A r31: late install must not use stale --source empty-001 (backup, no apps/);
+  # Engine installApp falls back to GitHub / docked bundle when --source apps missing.
   - from: op_disk
     to: op_install
     action: install_app
