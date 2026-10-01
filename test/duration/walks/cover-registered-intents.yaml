@@ -275,7 +275,7 @@ steps:
   - from: op_overview
     to: op_instance
     action: open_instance_controls
-  # Open while the instance is Running; stopping first leaves the app unavailable.
+  # Prefer A — Back up while Running; stop first leaves backup disabled/locked.
   - from: op_instance
     to: op_instance
     action: start_instance
@@ -284,10 +284,10 @@ steps:
     action: open_app
   - from: op_instance
     to: op_instance
-    action: stop_instance
+    action: backup_instance
   - from: op_instance
     to: op_instance
-    action: backup_instance
+    action: stop_instance
   - from: op_instance
     to: op_disk
     action: back_to_disk
