@@ -888,6 +888,41 @@ describe('Phase 4 stability probes (FakeFleetOps)', () => {
         expect(result.abortReason).toMatch(/docker missing/)
     })
 
+    it('settles a transient docker-missing probe after move_app', async () => {
+        const ops = fakeOps({
+            poolEngines: ['idea01'],
+            excludeEngines: ['idea02'],
+        })
+        await ops.dockFixture('idea01', 'duration-kolibri-grade5a-001')
+        let probes = 0
+        ops.probeStability = async () => {
+            probes++
+            const missing = probes <= 2
+            return {
+                ok: !missing,
+                detail: missing ? 'idea01: docker missing for kolibri-grade5a-001' : 'fake probe ok',
+                engines: [{
+                    id: 'idea01',
+                    wsUp: true,
+                    dockerOk: !missing,
+                    statusAnomaly: missing ? 'docker missing for kolibri-grade5a-001' : undefined,
+                }],
+            }
+        }
+        const result = await runStabilityDuringDwell({
+            ops,
+            engines: ['idea01'],
+            intervalMs: 1,
+            failAfter: DEFAULT_FAIL_AFTER,
+            dwellMs: 10,
+            justCompletedAction: 'move_app',
+            dockerMissingSettleMs: 20,
+        })
+        expect(result.ok).toBe(true)
+        expect(probes).toBeGreaterThanOrEqual(3)
+        expect(result.samples.some(sample => isDockerMissingProbeFailure(sample))).toBe(true)
+    })
+
     it('unified walk with dwell probes stays green on FakeFleetOps', async () => {
         const scenario = unifiedScenario()
         const ops = fakeOps({

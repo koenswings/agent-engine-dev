@@ -19,8 +19,10 @@ import {
     DEFAULT_DWELL_MS,
     DEFAULT_FAIL_AFTER,
     DEFAULT_PROBE_INTERVAL_MS,
+    DEFAULT_DOCKER_MISSING_SETTLE_MS,
     FAST_DWELL_MS,
     FAST_PROBE_INTERVAL_MS,
+    FAST_DOCKER_MISSING_SETTLE_MS,
     runStabilityDuringDwell,
 } from './stability.js'
 import type {
@@ -230,6 +232,9 @@ const runWalkWithSteps = async (
                 intervalMs,
                 failAfter,
                 dwellMs,
+                justCompletedAction: action,
+                dockerMissingSettleMs: fullOpts.dockerMissingSettleMs
+                    ?? (fullOpts.fast ? FAST_DOCKER_MISSING_SETTLE_MS : DEFAULT_DOCKER_MISSING_SETTLE_MS),
             })
             probeResults = stab.samples.map(s => ({ ok: s.ok, detail: s.detail }))
             if (!stab.ok) {

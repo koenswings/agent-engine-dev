@@ -170,6 +170,8 @@ export interface DurationOptions {
     probeIntervalMs?: number
     /** Phase 4: abort after N consecutive probe failures (default 3). */
     probeFailAfter?: number
+    /** Post-move/copy docker settle grace; default 90s (1s under --fast). */
+    dockerMissingSettleMs?: number
     /** Disable dwell probes entirely. */
     skipStability?: boolean
     /**
