@@ -34,7 +34,7 @@ export const DURATION_UI_FIXTURES = {
     },
 } as const
 
-/** Pixel Console Intent names registered in agent-console-dev#134 e2e/intents (58 @ 128f2d3). */
+/** Pixel Console Intent names registered in agent-console-dev#134 e2e/intents (65 @ ba0cfa1). */
 export const PIXEL_REGISTERED_INTENTS = [
     'open_console_as_teacher',
     'open_console_as_learner',
@@ -43,12 +43,20 @@ export const PIXEL_REGISTERED_INTENTS = [
     'stay_on_teacher_overview',
     'stay_on_learner_overview',
     'stay_on_overview',
-    'open_kolibri_as_teacher',
+    'open_kolibri_as_teacher', // /en/coach/#/classes
     'open_kolibri_as_learner',
     'open_nextcloud_as_teacher',
     'open_nextcloud_as_learner',
     'open_video',
     'open_exercise',
+    // Pixel coaching set (Console#134 @ ba0cfa1)
+    'create_class',
+    'enroll_learners',
+    'build_lesson',
+    'create_quiz',
+    'read_reports',
+    'preview_as_learner',
+    'browse_classes',
     'open_disk_inventory',
     'open_instance_controls',
     'eject_disk',
@@ -84,7 +92,7 @@ export const PIXEL_REGISTERED_INTENTS = [
     'remove_operator',
     'copy_app',
     'move_app',
-    // Part B leftovers + leave/back (Console#134 @ 128f2d3)
+    // Part B leftovers + leave/back (Console#134 @ ba0cfa1)
     'files_role_added',
     'backup_configured_restored',
     'done_redistribute',
@@ -92,7 +100,7 @@ export const PIXEL_REGISTERED_INTENTS = [
     'open_copied_instance',
     'switch_engine',
     'reboot_engine',
-    'back_to_console',
+    'back_to_console', // hardened in Console#134 @ ba0cfa1
     'leave_kolibri',
     'leave_nextcloud_as_teacher',
     'leave_nextcloud_as_learner',
@@ -110,19 +118,12 @@ export const DEFERRED_UI_INTENTS = [
 ] as const
 
 /**
- * Proposal Intents on unified.yaml still not in Pixel's 58-key registry (@ 128f2d3).
+ * Proposal Intents on unified.yaml still not in Pixel's 65-key registry (@ ba0cfa1).
  * StubUiDriver Fake no-ops; live --ui clear-miss until Pixel adapters — do not drop YAML edges.
  * Lesson chrome keep_watching/next_resource/exit_lesson + open_wikipedia_* live under DEFERRED_UI_INTENTS.
  */
 export const PIXEL_MISSING_INTENTS = [
-    // Kolibri coaching / navigation (finish_exercise/next_video not deferred — clear Fake no-op)
-    'create_class',
-    'enroll_learners',
-    'build_lesson',
-    'create_quiz',
-    'read_reports',
-    'preview_as_learner',
-    'browse_classes',
+    // Kolibri navigation (finish_exercise/next_video not deferred — clear Fake no-op)
     'finish_exercise',
     'next_video',
     // Nextcloud deep

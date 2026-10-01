@@ -1,9 +1,9 @@
 # Deterministic cover-hardpass walk — NOT a Markov graph.
 # Loads states/invariants/fixtures/pool from scenarios/unified.yaml.
-# Covers Pixel-registered Intents (58/58 @ Console#134 128f2d3)
+# Covers the current Pixel-registered demo subset (58 actions; registry 65 @ Console#134 ba0cfa1)
 # plus Engine infra FleetOps (dock/undock/move/reboot via RealFleetOps).
 # Excludes every action in DEFERRED_UI_INTENTS + PIXEL_MISSING_INTENTS
-# (create_class, enroll_learners, keep_watching, wikipedia, etc.).
+# (coaching Intents are registered but not yet expanded here; keep_watching, wikipedia, etc.).
 # Prefer short layer cycles; re-enter via return_to_start / hubs.
 # Live --ui demo now. cover-all = strict full graph (failLoud on Pixel-missing under --ui).
 kind: walk

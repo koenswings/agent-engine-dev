@@ -11,7 +11,7 @@
  *
  * Base URL: DURATION_CONSOLE_URL or http://idea01 (Engine :80 — never Vite 5173).
  *
- * --record-walk soft-detect (Pixel Console#134 @ 128f2d3):
+ * --record-walk soft-detect (Pixel Console#134 @ ba0cfa1):
  *   1) pass screenshotPath into runDurationIntent (Pixel may write PNG once)
  *   2) soft-detect bridge.captureAfterIntent — skip if PNG already exists
  *   3) else page.screenshot({ path, fullPage: true })

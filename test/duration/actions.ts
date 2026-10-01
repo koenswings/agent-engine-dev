@@ -39,7 +39,7 @@ export const INFRA_ACTIONS = [
  * live --ui needs Pixel adapters for deferred/missing before those edges are real.
  */
 export const UI_STUB_ACTIONS = [
-    // Pixel-registered (58 @ Console#134 128f2d3)
+    // Pixel-registered (65 @ Console#134 ba0cfa1)
     'open_kolibri_as_teacher',
     'open_kolibri_as_learner',
     'open_nextcloud_as_learner',
@@ -83,7 +83,7 @@ export const UI_STUB_ACTIONS = [
     'remove_operator',
     'copy_app',
     'move_app',
-    // Part B leftovers + leave/back (registered @ 128f2d3)
+    // Part B leftovers + leave/back (registered @ ba0cfa1; back_to_console hardened)
     'files_role_added',
     'backup_configured_restored',
     'done_redistribute',
@@ -101,7 +101,7 @@ export const UI_STUB_ACTIONS = [
     'keep_watching',
     'next_resource',
     'exit_lesson',
-    // Pixel-missing — Fake no-op; keep on YAML (do not drop edges)
+    // Coaching registered @ ba0cfa1; remaining Kolibri navigation is Pixel-missing
     'create_class',
     'enroll_learners',
     'build_lesson',
@@ -109,6 +109,7 @@ export const UI_STUB_ACTIONS = [
     'read_reports',
     'preview_as_learner',
     'browse_classes',
+    // Pixel-missing — Fake no-op; keep on YAML (do not drop edges)
     'finish_exercise',
     'next_video',
     'share_to_class',

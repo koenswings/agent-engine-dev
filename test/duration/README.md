@@ -30,7 +30,9 @@ Never eject/erase the idea03 Intenso Files Disk.
 
 **Live App-open (later):** Kid sidecar `post-dock-restore-running.sh` → `idea166-kolibri-live` :18080. Fake walks do not require live.
 
-Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/pull/167); Pixel Console [agent-console-dev#134](https://github.com/koenswings/agent-console-dev/pull/134) tip **`128f2d3`** (58 Intents + `captureAfterIntent` / `screenshotPath`).
+Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/pull/167); Pixel Console [agent-console-dev#134](https://github.com/koenswings/agent-console-dev/pull/134) tip **`ba0cfa1`** (65 Intents + `captureAfterIntent` / `screenshotPath`).
+
+Pixel coaching set now registered at Console@`ba0cfa1`: `create_class`, `enroll_learners`, `build_lesson`, `create_quiz`, `read_reports`, `preview_as_learner`, `browse_classes`; `open_kolibri_as_teacher` opens `/en/coach/#/classes`. `back_to_console` is hardened.
 
 ## Phase 1–4 (this tree)
 
@@ -41,7 +43,7 @@ Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/
 - Return-to-start hygiene (undock when leaving `infra_docked`)
 - Shared-store (`shared` + mDNS-on) vs unique-doc (`unique` + mDNS-off) mode switch
 - Structured JSON logs on `pnpm test:duration`
-- **Phase 3:** `test/duration/ui/` → StubUiDriver (CI / missing-Intent) or PlaywrightUiDriver (`--ui`) calling Pixel `runDurationIntent` / `captureAfterIntent` (Console#134 @ `128f2d3`)
+- **Phase 3:** `test/duration/ui/` → StubUiDriver (CI / missing-Intent) or PlaywrightUiDriver (`--ui`) calling Pixel `runDurationIntent` / `captureAfterIntent` (Console#134 @ `ba0cfa1`)
 - **Phase 4:** dwell stability probes (~30s / `--fast` compressed) on FakeFleetOps
 - **Walk recording:** `--record-walk <dir>` → `step-NNNN-<action>.png` + `walk.mp4` (ffmpeg)
 
@@ -51,8 +53,8 @@ Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/
 
 **`--scenario` semantics:**
 - `random` / `unified` / default → **Markov** simulation on `scenarios/unified.yaml`
-- `cover-all` → **deterministic walk** (`walks/cover-all.yaml`) covering every graph action once — strict full-graph regression (under `--ui`, Pixel-missing still **failLoud** abort)
-- `cover-hardpass` → **deterministic walk** (`walks/cover-hardpass.yaml`) covering Pixel-registered Intents (~58) + Engine infra FleetOps — **live `--ui` demo now** (excludes DEFERRED + PIXEL_MISSING)
+- `cover-all` → **deterministic walk** (`walks/cover-all.yaml`) covering every graph action once — strict full-graph regression (under `--ui`, Pixel-missing still **failLoud** abort; live retry requires Console@`ba0cfa1`)
+- `cover-hardpass` → **deterministic walk** (`walks/cover-hardpass.yaml`) covering the current Pixel-registered demo subset + Engine infra FleetOps — **live `--ui` demo now** (coaching Intents are registered but walk expansion is deferred; excludes DEFERRED + PIXEL_MISSING)
 - Do **not** invent alternate Markov graphs
 
 Deprecated aliases that still resolve to `unified.yaml`: `minimal`, `minimal-live`, `minimal-dock`, `stress`, `school-day`.
@@ -66,7 +68,7 @@ Canonical Fake pool: **idea01 + idea03 + idea04** (never idea02). Live `--hosts`
 | Fake cover-hardpass (live --ui demo) | `--scenario cover-hardpass --fast` |
 | Fake multi-hour proof | `--scenario random --iterations 2000 --seed 42 --fast` |
 | Live reboot / dock | `--live --fast --hosts idea01=…,idea03=…,idea04=…` (same YAML) |
-| **Live UI (preferred)** | `--live --ui --hosts idea01=…,idea03=…,idea04=… --console-url http://idea01:8080` |
+| **Live UI (preferred; cover-all requires Console@`ba0cfa1`)** | `--live --ui --hosts idea01=…,idea03=…,idea04=… --console-url http://idea01:8080` |
 | Record walk (real PNGs) | add `--record-walk /tmp/dur-walk` (pair with `--ui`) |
 
 ## Run (no Pis — FakeFleetOps)
@@ -127,7 +129,7 @@ pnpm test:duration -- --live --scenario unified --fast \
 
 1. Creates `<dir>` if needed.
 2. After each **UI** Intent (and any step with a live Playwright page), writes `step-NNNN-<action>.png`.
-3. Soft-detect Pixel capture (aligned Console#134 @ `128f2d3`):
+3. Soft-detect Pixel capture (aligned Console#134 @ `ba0cfa1`):
    1. Pass `screenshotPath` into `runDurationIntent` (Pixel may settle + write PNG once)
    2. Soft-detect `bridge.captureAfterIntent(page, { path, intent })` — **skip if PNG already exists** (no second capture)
    3. Else fallback `page.screenshot({ path, fullPage: true })`
