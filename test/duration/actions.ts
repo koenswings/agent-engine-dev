@@ -199,9 +199,24 @@ const infraUndockFixtures = async (ctx: ActionContext): Promise<ActionResult> =>
 }
 
 const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
-    const engine = ctx.walker.dockedEngine && !ctx.excludeEngines.includes(ctx.walker.dockedEngine)
+    // Prefer Atlas/Kid pre-docked engine (Path A) — RealFleetOps.findDockedEngine when live.
+    const opsAny = ctx.opts.ops as FleetOps & { findDockedEngine?: (diskId: string) => Promise<string | null> }
+    let engine = ctx.walker.dockedEngine && !ctx.excludeEngines.includes(ctx.walker.dockedEngine)
         ? ctx.walker.dockedEngine
         : pickPoolEngine(ctx)
+    if (typeof opsAny.findDockedEngine === 'function') {
+        const existing = await opsAny.findDockedEngine(ctx.fixtureDisk)
+        if (existing && !ctx.excludeEngines.includes(existing)) {
+            engine = existing
+            await settleParticipants(ctx, ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e)))
+            return {
+                ok: true,
+                message: `fixture ${ctx.fixtureDisk} already docked on ${engine} (no-op)`,
+                dockedEngine: engine,
+                layer: 'infra',
+            }
+        }
+    }
     assertNotGolden(ctx, engine, 'infra_dock_fixture')
     await ctx.opts.ops.dockFixture(engine, ctx.fixtureDisk)
     await settleParticipants(ctx, ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e)))

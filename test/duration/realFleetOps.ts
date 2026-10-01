@@ -777,10 +777,17 @@ export class RealFleetOps implements FleetOps {
         // Prefer cp -a (always on Pi). Drop instances/ unless startInstances so
         // Engine docks without auto-starting Kolibri/Nextcloud (image not required).
         const stripInstances = this.startInstances ? ':' : `rm -rf '${dest}/instances'`
+        // Reuse Atlas/Kid Path A tree when present — never rm -rf over live instance data
+        // (docker-owned files → Permission denied). Parent: infra_dock may no-op/ok.
         const remote = [
             'set -euo pipefail',
-            `test -d '${src}' || { echo "missing fixture source ${src}" >&2; exit 2; }`,
             `mkdir -p '${this.disksRoot}' '${this.watchDir}'`,
+            `if test -f '${dest}/META.yaml'; then`,
+            `  echo "RealFleetOps: reuse existing Path A tree at ${dest}"`,
+            `  touch '${sentinel}'`,
+            `  exit 0`,
+            `fi`,
+            `test -d '${src}' || { echo "missing fixture source ${src}" >&2; exit 2; }`,
             `rm -rf '${dest}'`,
             `mkdir -p '${dest}'`,
             `cp -a '${src}/.' '${dest}/'`,
@@ -832,6 +839,28 @@ export class RealFleetOps implements FleetOps {
         )
     }
 
+    /**
+     * If diskId is already docked on any pool engine, return that logical id.
+     * Used so infra_dock_fixture can no-op when Atlas/Kid Path A pre-docked.
+     */
+    async findDockedEngine(diskId: string): Promise<string | null> {
+        for (const id of this.pool) {
+            if (this.exclude.includes(id)) continue
+            try {
+                const view = await this.readStore(id)
+                const disk = view.diskDB[diskId]
+                if (!disk?.dockedTo) continue
+                const live = this.liveIds.get(id)
+                if (disk.dockedTo === id || (live && disk.dockedTo === live)) return id
+                // unique-store: dockedTo may be live uuid — still counts as docked on this view
+                if (disk.dockedTo) return id
+            } catch {
+                /* try next */
+            }
+        }
+        return null
+    }
+
     async dockFixture(engineId: string, diskId: string): Promise<void> {
         this.assertNotExcluded(engineId, 'dockFixture')
         if (looksLikeProtectedHwDisk(diskId)) {
@@ -839,6 +868,13 @@ export class RealFleetOps implements FleetOps {
         }
         resolveDurationFixturePack(diskId) // validate known Kid id
         assertPrivateDurationRoots(this.disksRoot, this.watchDir)
+
+        // Pool-wide no-op when Atlas/Kid already Path A docked.
+        const already = await this.findDockedEngine(diskId)
+        if (already) {
+            console.log(`[RealFleetOps] dockFixture: ${diskId} already docked on ${already} (no-op)`)
+            return
+        }
 
         // If already docked here, treat as success (idempotent).
         try {
