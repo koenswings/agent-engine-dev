@@ -10,6 +10,7 @@ import { evaluateInvariants, DEFAULT_INFRA_INVARIANTS, listInvariantTypes } from
 import { runWalk } from '../duration/runner.js'
 import {
     assertPrivateDurationRoots,
+    buildSshDockCopyRemote,
     DEFAULT_DURATION_DISKS_ROOT,
     DEFAULT_DURATION_WATCH_DIR,
     looksLikeProtectedHwDisk,
@@ -88,6 +89,7 @@ describe('duration scenario YAML loader', () => {
     it('loads Kid fixture diskIds (agent-app-dev#10)', () => {
         const s = unifiedScenario()
         expect(s.fixtures?.map(f => f.diskId).sort()).toEqual([
+            'duration-empty-001',
             'duration-kolibri-grade5a-001',
             'duration-nextcloud-grade5a-001',
         ].sort())
@@ -605,6 +607,7 @@ describe('RealFleetOps guard clauses (no network)', () => {
         expect(PM2_RECONNECT_TIMEOUT_MS).toBe(150_000)
         expect(resolveDurationFixturePack('duration-kolibri-grade5a-001')).toBe('kolibri')
         expect(resolveDurationFixturePack('duration-nextcloud-grade5a-001')).toBe('nextcloud')
+        expect(resolveDurationFixturePack('duration-empty-001')).toBe('empty')
         expect(() => resolveDurationFixturePack('sdb1')).toThrow(/unknown/)
         expect(() => assertPrivateDurationRoots('/disks', DEFAULT_DURATION_WATCH_DIR)).toThrow(/never \/disks/)
         expect(() => assertPrivateDurationRoots(DEFAULT_DURATION_DISKS_ROOT, '/dev/engine')).toThrow(/never \/dev\/engine/)
@@ -614,6 +617,44 @@ describe('RealFleetOps guard clauses (no network)', () => {
             disksRoot: '/disks',
             watchDir: DEFAULT_DURATION_WATCH_DIR,
         })).toThrow(/never \/disks/)
+    })
+
+    it('buildSshDockCopyRemote: empty always fresh-copy; Grade5A keeps Path A reuse', () => {
+        const base = {
+            src: '/fixtures/empty',
+            dest: '/home/pi/idea/duration-disks/idea-test-3',
+            sentinel: '/home/pi/idea/duration-watch/idea-test-3',
+            disksRoot: DEFAULT_DURATION_DISKS_ROOT,
+            watchDir: DEFAULT_DURATION_WATCH_DIR,
+            startInstances: false,
+        }
+        const emptyRemote = buildSshDockCopyRemote({
+            ...base,
+            diskId: 'duration-empty-001',
+            pack: 'empty',
+            src: '/fixtures/empty',
+        })
+        expect(emptyRemote).toMatch(/empty pack always fresh-copy/)
+        expect(emptyRemote).toMatch(/rm -rf '\/home\/pi\/idea\/duration-disks\/idea-test-3'/)
+        expect(emptyRemote).toMatch(/cp -a '\/fixtures\/empty\/\.'/)
+        expect(emptyRemote).not.toMatch(/reuse existing Path A tree/)
+        // Still refuse when META belongs to a different diskId
+        expect(emptyRemote).toMatch(/! grep -Fq 'diskId: duration-empty-001'/)
+        expect(emptyRemote).toMatch(/exit 4/)
+
+        const kolibriRemote = buildSshDockCopyRemote({
+            ...base,
+            diskId: 'duration-kolibri-grade5a-001',
+            pack: 'kolibri',
+            src: '/fixtures/kolibri',
+            dest: '/home/pi/idea/duration-disks/idea-test-1',
+            sentinel: '/home/pi/idea/duration-watch/idea-test-1',
+        })
+        expect(kolibriRemote).toMatch(/reuse existing Path A tree/)
+        expect(kolibriRemote).toMatch(/grep -Fq 'diskId: duration-kolibri-grade5a-001'/)
+        // Reuse early-exit must appear before wipe for Grade5A
+        expect(kolibriRemote.indexOf('reuse existing Path A tree'))
+            .toBeLessThan(kolibriRemote.indexOf("rm -rf '/home/pi/idea/duration-disks/idea-test-1'"))
     })
 
     it('dockFixture refuses protected / golden without contacting Pis', async () => {

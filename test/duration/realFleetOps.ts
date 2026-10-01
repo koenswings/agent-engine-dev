@@ -201,6 +201,65 @@ export const resolveDurationFixturePack = (diskId: string): string => {
     return pack
 }
 
+export type SshDockCopyRemoteArgs = {
+    diskId: string
+    pack: string
+    src: string
+    dest: string
+    sentinel: string
+    disksRoot: string
+    watchDir: string
+    /** When true, keep instances/ (Path A --start-instances). */
+    startInstances: boolean
+}
+
+/**
+ * Build the remote bash for Kid dockFixture copy.
+ * Empty pack (`duration-empty-001`): never reuse Path A tree — always rm -rf + cp -a
+ * so prior install_app/make_backup apps/ cannot leave isAppDisk / hide EmptyDiskPanel.
+ * Kolibri/Nextcloud Grade5A: reuse matching META tree (docker-owned instances → no wipe).
+ */
+export const buildSshDockCopyRemote = (args: SshDockCopyRemoteArgs): string => {
+    const { diskId, pack, src, dest, sentinel, disksRoot, watchDir, startInstances } = args
+    const stripInstances = startInstances ? ':' : `rm -rf '${dest}/instances'`
+    const parts: string[] = [
+        'set -euo pipefail',
+        `mkdir -p '${disksRoot}' '${watchDir}'`,
+    ]
+    if (pack === 'empty') {
+        // Empty has no docker-owned instance files — wipe is safe. Refuse only when
+        // dest META belongs to a different diskId (never steal kolibri/nextcloud slot).
+        parts.push(
+            `if test -f '${dest}/META.yaml' && ! grep -Fq 'diskId: ${diskId}' '${dest}/META.yaml'; then ` +
+            `echo "RealFleetOps: refuse overwrite occupied ${dest} (no matching META for ${diskId})" >&2; exit 4; fi`,
+            `echo "RealFleetOps: empty pack always fresh-copy into ${dest} (no Path A reuse)"`,
+        )
+    } else {
+        // Reuse Atlas/Kid Path A tree when present — never rm -rf over live instance data
+        // (docker-owned files → Permission denied). Parent: infra_dock may no-op/ok.
+        // Reuse only when META.yaml diskId matches (never steal nextcloud slot for kolibri).
+        // Atlas: chokidar needs unlink+create after eject, not mtime-only touch.
+        parts.push(
+            `if test -f '${dest}/META.yaml' && grep -Fq 'diskId: ${diskId}' '${dest}/META.yaml'; then ` +
+            `echo "RealFleetOps: reuse existing Path A tree at ${dest}"; ` +
+            `rm -f '${sentinel}'; sleep 5; touch '${sentinel}'; exit 0; fi`,
+            `if test -d '${dest}'; then ` +
+            `echo "RealFleetOps: refuse overwrite occupied ${dest} (no matching META for ${diskId})" >&2; exit 4; fi`,
+        )
+    }
+    parts.push(
+        `test -d '${src}' || { echo "missing fixture source ${src}" >&2; exit 2; }`,
+        `rm -rf '${dest}'`,
+        `mkdir -p '${dest}'`,
+        `cp -a '${src}/.' '${dest}/'`,
+        stripInstances,
+        `test -f '${dest}/META.yaml' || { echo "META.yaml missing after copy into ${dest}" >&2; exit 3; }`,
+        // Atlas: chokidar needs unlink+create after eject, not mtime-only touch.
+        `rm -f '${sentinel}'; sleep 5; touch '${sentinel}'`,
+    )
+    return parts.join('; ')
+}
+
 export const parseHostsFlag = (raw: string): Record<string, string> => {
     const out: Record<string, string> = {}
     for (const part of raw.split(',').map(s => s.trim()).filter(Boolean)) {
@@ -939,25 +998,17 @@ export class RealFleetOps implements FleetOps {
         // Single remote bash: copy tree + sentinel. Never touches /disks or sdb.
         // Prefer cp -a (always on Pi). Drop instances/ unless startInstances so
         // Engine docks without auto-starting Kolibri/Nextcloud (image not required).
-        const stripInstances = this.startInstances ? ':' : `rm -rf '${dest}/instances'`
-        // Reuse Atlas/Kid Path A tree when present — never rm -rf over live instance data
-        // (docker-owned files → Permission denied). Parent: infra_dock may no-op/ok.
-        const remote = [
-            'set -euo pipefail',
-            `mkdir -p '${this.disksRoot}' '${this.watchDir}'`,
-            // Reuse only when META.yaml diskId matches (never steal nextcloud slot for kolibri)
-            // Atlas: chokidar needs unlink+create after eject, not mtime-only touch.
-            `if test -f '${dest}/META.yaml' && grep -Fq 'diskId: ${diskId}' '${dest}/META.yaml'; then echo "RealFleetOps: reuse existing Path A tree at ${dest}"; rm -f '${sentinel}'; sleep 5; touch '${sentinel}'; exit 0; fi`,
-            `if test -d '${dest}'; then echo "RealFleetOps: refuse overwrite occupied ${dest} (no matching META for ${diskId})" >&2; exit 4; fi`,
-            `test -d '${src}' || { echo "missing fixture source ${src}" >&2; exit 2; }`,
-            `rm -rf '${dest}'`,
-            `mkdir -p '${dest}'`,
-            `cp -a '${src}/.' '${dest}/'`,
-            stripInstances,
-            `test -f '${dest}/META.yaml' || { echo "META.yaml missing after copy into ${dest}" >&2; exit 3; }`,
-            // Atlas: chokidar needs unlink+create after eject, not mtime-only touch.
-            `rm -f '${sentinel}'; sleep 5; touch '${sentinel}'`,
-        ].join('; ')
+        const pack = resolveDurationFixturePack(diskId)
+        const remote = buildSshDockCopyRemote({
+            diskId,
+            pack,
+            src,
+            dest,
+            sentinel,
+            disksRoot: this.disksRoot,
+            watchDir: this.watchDir,
+            startInstances: this.startInstances,
+        })
         console.log(
             `[RealFleetOps] dock copy ${diskId} → ${engineId}:${dest} ` +
             `(sentinel ${sentinel}, startInstances=${this.startInstances})`,
