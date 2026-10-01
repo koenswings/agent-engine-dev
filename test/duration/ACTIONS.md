@@ -25,7 +25,7 @@ YAML transition shape (all layers): `{ to, weight, action }`.
 | `infra_undock_fixtures` | `infra_idle` — Engine eject/undock fixture disks |
 | `infra_dock_fixture` | `infra_docked` — Engine dock fixture on a pool engine |
 | `infra_move_disk` | `infra_disk_moved` — undock then dock on another pool engine |
-| `infra_reboot_engine` | `infra_reboot` — SSH reboot; `--fast` → `pm2 restart engine` |
+| `infra_reboot_engine` | `infra_reboot` — SSH reboot; `--fast` → `pm2 restart engine` (Path A: stop duration docker zombies before/after pm2 so `no_zombie_instances` holds) |
 
 ## Usage / operator Intent registry
 
@@ -79,6 +79,8 @@ Sticky `localStorage.demoMode==='true'` (Pixel `bootDemo`) must not mask Kid fix
 CLI `--start-instances` → `RealFleetOps({ startInstances: true })` (keep `instances/` on dock so Console shows Running cards) **and** `preserveDockedOnReturn` so `return_to_start` after infra dock does **not** undock — required for cover-hardpass **dock-before-inventory** (`infra_dock_fixture` → … → `open_disk_inventory` on `disk-duration-kolibri-grade5a-001`). Fake default still undocks on return (hygiene).
 
 Path A re-dock after eject: RealFleetOps does `rm -f` sentinel, `sleep 5`, then `touch` (Atlas — chokidar needs unlink before create, not mtime-only touch; Atlas Ops proof: 5s before touch). `dockFixture` waits up to **120s** for store dock, and on first timeout re-fires the sentinel once then waits again before failing.
+
+Path A / `infra_reboot_engine --fast`: `rebootEngine` stops `kolibri-grade5a` / `nextcloud-grade5a` / `duration-*` containers (never `idea166-*`) before `pm2 restart`, then `reconcileDurationZombies` after `waitReady` so Automerge Running+Undocked fixtures do not trip `no_zombie_instances`.
 
 
 ## Multi-disk copy_app / move_app preload (Pixel Prefer A @b63e1ec)

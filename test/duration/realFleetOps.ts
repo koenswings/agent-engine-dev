@@ -52,6 +52,24 @@ const DISK_ID_TO_PACK: Record<string, string> = {
     'duration-nextcloud-grade5a-001': 'nextcloud',
 }
 
+/** Known Path A instance ids (no duration- prefix on the container/instance). */
+const DURATION_FIXTURE_INSTANCE_IDS = new Set([
+    'kolibri-grade5a-001',
+    'nextcloud-grade5a-001',
+])
+
+/**
+ * True for Path A duration fixture disk/instance ids only.
+ * Never idea166-* sidecars, Intenso, or unrelated containers.
+ */
+export const looksLikeDurationFixtureId = (id: string): boolean => {
+    if (!id || id.includes('idea166-')) return false
+    if (id in DISK_ID_TO_PACK) return true
+    if (DURATION_FIXTURE_INSTANCE_IDS.has(id)) return true
+    if (id.startsWith('duration-')) return true
+    if (id.includes('kolibri-grade5a') || id.includes('nextcloud-grade5a')) return true
+    return false
+}
 
 /** idea03 Intenso hw-roundtrip stick — NEVER eject/erase for duration tests. */
 export const PROTECTED_DISK_MARKERS = [
@@ -581,6 +599,104 @@ export class RealFleetOps implements FleetOps {
         await $`bash -lc ${cmd}`
     }
 
+    /**
+     * Best-effort: stop Path A duration fixture containers on host by safe name list.
+     * Names must contain kolibri-grade5a / nextcloud-grade5a / duration-; never idea166-*.
+     * Used before pm2 restart so containers do not survive as orphans.
+     */
+    private async stopDurationFixtureContainers(host: string): Promise<string[]> {
+        // List names first (audit), then stop+rm only safe duration fixtures.
+        const listRemote = [
+            'docker ps -a --format "{{.Names}}" 2>/dev/null || true',
+        ].join('; ')
+        try {
+            const listed = (await this.ssh(host, listRemote)).trim()
+            const names = listed.split(/\s+/).map(n => n.replace(/^\//, '')).filter(Boolean)
+            const targets = names.filter(n =>
+                !n.includes('idea166-') &&
+                (n.includes('kolibri-grade5a') || n.includes('nextcloud-grade5a') || n.includes('duration-')),
+            )
+            if (!targets.length) return []
+            // Stop by exact container name (docker --filter name is substring; use name=exact).
+            for (const name of targets) {
+                const safe = name.replace(/'/g, '')
+                await this.ssh(
+                    host,
+                    `docker ps -aq --filter name='${safe}' 2>/dev/null | xargs -r docker stop; ` +
+                    `docker ps -aq --filter name='${safe}' 2>/dev/null | xargs -r docker rm`,
+                ).catch(e => {
+                    console.warn(`[RealFleetOps] docker stop/rm ${safe} on ${host}: ${e}`)
+                })
+            }
+            console.log(
+                `[RealFleetOps] stopped duration fixture containers on ${host}: ${targets.join(', ')}`,
+            )
+            return targets
+        } catch (e) {
+            console.warn(`[RealFleetOps] stopDurationFixtureContainers on ${host} failed (best-effort): ${e}`)
+            return []
+        }
+    }
+
+    /**
+     * After Engine reconnect: clear Path A Running/Starting instances whose disk is
+     * missing or Undocked (no_zombie_instances). Stops docker by exact instance id only.
+     */
+    private async reconcileDurationZombies(engineId: string): Promise<void> {
+        const host = this.hostOf(engineId)
+        let view: SemanticStoreView
+        try {
+            view = await this.readStore(engineId)
+        } catch (e) {
+            console.warn(`[RealFleetOps] reconcileDurationZombies: readStore failed on ${engineId}: ${e}`)
+            return
+        }
+        const stopped: string[] = []
+        for (const inst of Object.values(view.instanceDB)) {
+            if (inst.status !== 'Running' && inst.status !== 'Starting') continue
+            const disk = inst.diskId ? view.diskDB[inst.diskId] : undefined
+            if (disk && disk.dockedTo !== null) continue
+            const idHits =
+                looksLikeDurationFixtureId(inst.id) ||
+                (inst.diskId != null && looksLikeDurationFixtureId(inst.diskId))
+            if (!idHits) continue
+            // Exact instance id filter only — never broad docker ps.
+            const needle = inst.id.replace(/'/g, '')
+            if (!needle || needle.includes('idea166-')) continue
+            try {
+                const remote =
+                    `ids=$(docker ps -aq --filter name='${needle}' 2>/dev/null); ` +
+                    `if test -n "$ids"; then echo "$ids" | xargs -r docker stop; ` +
+                    `echo "$ids" | xargs -r docker rm; echo '${needle}'; ` +
+                    `else echo ""; fi`
+                const out = (await this.ssh(host, remote)).trim()
+                if (out) {
+                    stopped.push(needle)
+                } else {
+                    console.log(
+                        `[RealFleetOps] reconcileDurationZombies: ${inst.id} is ${inst.status} ` +
+                        `but disk ${inst.diskId ?? '?'} Undocked/missing — no docker match on ${host}`,
+                    )
+                }
+            } catch (e) {
+                console.warn(
+                    `[RealFleetOps] reconcileDurationZombies: docker stop ${inst.id} on ${host} failed: ${e}`,
+                )
+            }
+        }
+        if (stopped.length) {
+            console.log(
+                `[RealFleetOps] reconcileDurationZombies on ${engineId}: stopped ${stopped.join(', ')}`,
+            )
+        }
+        await sleep(2500)
+        try {
+            await this.readStore(engineId)
+        } catch {
+            // best-effort — invariant runs after action returns
+        }
+    }
+
     async rebootEngine(engineId: string, fast: boolean): Promise<void> {
         this.assertNotExcluded(engineId, 'rebootEngine')
         const host = this.hostOf(engineId)
@@ -588,6 +704,8 @@ export class RealFleetOps implements FleetOps {
         await this.disconnect(engineId)
 
         if (fast) {
+            // Clear Path A duration containers before pm2 so they do not survive as orphans.
+            await this.stopDurationFixtureContainers(host)
             console.log(`[RealFleetOps] pm2 restart engine on ${engineId} (${host})`)
             await this.ssh(host, 'pm2 restart engine')
             // Brief pause then wait for WS.
@@ -628,6 +746,11 @@ export class RealFleetOps implements FleetOps {
                 throw new Error(`RealFleetOps: ${engineId} WS not up after reboot`)
             }
         }
+
+        // Docker containers can survive pm2 restart; Automerge may reconnect with
+        // Running instances whose disks are Undocked → no_zombie_instances. Clear
+        // Path A duration fixtures only (never idea166-* / Intenso).
+        await this.reconcileDurationZombies(engineId)
 
         await this.runHealthWrap(this.healthWrapAfter)
     }
