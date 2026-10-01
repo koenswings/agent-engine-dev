@@ -243,11 +243,15 @@ const infraRebootEngine = async (ctx: ActionContext): Promise<ActionResult> => {
 }
 
 /**
- * Return to start: clear layer context; if leaving infra_docked with a fixture
- * still docked, undock first (return-to-start hygiene).
+ * Return to start: clear layer context. Default: undock if leaving infra_docked
+ * (return-to-start hygiene). Path A (`preserveDockedOnReturn` / `--start-instances`):
+ * keep fixtures docked for subsequent operator Kid-disk Intents.
  */
 const returnToStart = async (ctx: ActionContext): Promise<ActionResult> => {
-    if (ctx.walker.dockedEngine) {
+    // Default hygiene: undock when leaving infra_docked. Path A (`--start-instances`
+    // → preserveDockedOnReturn) keeps fixtures so cover-hardpass can dock-before-inventory
+    // then open_disk_inventory on Kid testids without remapping to demo disks.
+    if (ctx.walker.dockedEngine && !ctx.opts.preserveDockedOnReturn) {
         const engines = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
         for (const diskId of ctx.fixtureDisks) {
             await ctx.opts.ops.undockFixtures(engines, diskId)
@@ -276,20 +280,24 @@ const returnToStart = async (ctx: ActionContext): Promise<ActionResult> => {
             })
         }
         if (!ui.ok) {
+            const keptFail = Boolean(ctx.opts.preserveDockedOnReturn && ctx.walker.dockedEngine)
             return {
                 ok: false,
                 message: `return_to_start UI failed: ${ui.message ?? 'unknown'}`,
-                dockedEngine: null,
+                dockedEngine: keptFail ? ctx.walker.dockedEngine : null,
                 layer: null,
                 forceState: 'start',
             }
         }
         uiMsg = `; ${ui.message ?? 'UI cleared'}`
     }
+    const kept = Boolean(ctx.opts.preserveDockedOnReturn && ctx.walker.dockedEngine)
     return {
         ok: true,
-        message: `cleared layer context; next sample from start${uiMsg}`,
-        dockedEngine: null,
+        message: kept
+            ? `cleared layer context; fixtures preserved for Path A${uiMsg}`
+            : `cleared layer context; next sample from start${uiMsg}`,
+        dockedEngine: kept ? ctx.walker.dockedEngine : null,
         layer: null,
         forceState: 'start',
     }

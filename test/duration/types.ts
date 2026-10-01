@@ -171,6 +171,12 @@ export interface DurationOptions {
     probeFailAfter?: number
     /** Disable dwell probes entirely. */
     skipStability?: boolean
+    /**
+     * Path A (`--start-instances`): when true, return_to_start clears layer/UI but
+     * keeps fixtures docked so subsequent operator Intents see Kid disks.
+     * Default false — Fake Markov hygiene still undocks on return_to_start.
+     */
+    preserveDockedOnReturn?: boolean
     settleTimeoutMs?: number
     rng?: () => number
     onLog?: (entry: StructuredLogEntry) => void

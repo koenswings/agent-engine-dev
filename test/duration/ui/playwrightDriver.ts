@@ -11,6 +11,10 @@
  *
  * Base URL: DURATION_CONSOLE_URL or http://idea01 (Engine :80 — never Vite 5173).
  *
+ * Live production Console (non-localhost): context.addInitScript sets
+ * localStorage.demoMode='false' before first goto — sticky demo must not mask Kid fixtures.
+ * Do not remap Intents to demo disk IDs; no DURATION_ALLOW_DEMO.
+ *
  * --record-walk soft-detect (Pixel Console#134 @ ba0cfa1):
  *   1) pass screenshotPath into runDurationIntent (Pixel may write PNG once)
  *   2) soft-detect bridge.captureAfterIntent — skip if PNG already exists
@@ -195,6 +199,19 @@ const loadPixelBridge = async (intentsDir: string | null): Promise<PixelBridge> 
     }
 }
 
+
+/** True when Console base URL is Engine-hosted (not localhost / 127.0.0.1). */
+export const shouldForceDemoModeOff = (baseUrl: string): boolean => {
+    try {
+        const u = new URL(baseUrl.includes('://') ? baseUrl : `http://${baseUrl}`)
+        const host = u.hostname.toLowerCase()
+        if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return false
+        return true
+    } catch {
+        return !/localhost|127\.0\.0\.1/i.test(baseUrl)
+    }
+}
+
 export class PlaywrightUiDriver implements UiDriver {
     readonly kind = 'playwright' as const
     private readonly opts: {
@@ -230,6 +247,15 @@ export class PlaywrightUiDriver implements UiDriver {
                 const pw = await loadPlaywright()
                 this.browser = await pw.chromium.launch({ headless: this.opts.headless })
                 this.context = await this.browser.newContext({ baseURL: this.opts.baseUrl })
+                // Force demoMode OFF before first Console goto (idea01:8080 / not localhost).
+                // Sticky localStorage.demoMode==='true' (Pixel bootDemo) must not override
+                // production Engine-hosted Console. No Intent remap to demo disk IDs;
+                // no DURATION_ALLOW_DEMO. Pixel#134 @cdcfdb1 also ignores stored demo in prod web.
+                if (shouldForceDemoModeOff(this.opts.baseUrl)) {
+                    await this.context.addInitScript(() => {
+                        localStorage.setItem('demoMode', 'false')
+                    })
+                }
                 this.page = await this.context.newPage()
             })()
         }

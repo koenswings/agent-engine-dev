@@ -4,7 +4,7 @@
 **Locked** by Steve Design Review for idea#166 — do not rename without reporting a clash.  
 **Phase 3+4 (idea#168):** walker dispatches usage/operator Intents via `test/duration/ui/` → Pixel `e2e/intents` (`getIntent`).  
 **ONE graph:** `scenarios/unified.yaml` is the only Markov state table. Run modes = CLI knobs.  
-**Pixel registry:** Console#134 tip `ba0cfa1` — **65** Intent keys (+ `captureAfterIntent` / `screenshotPath` for `--record-walk`). Engine ACTIONS.md on #145 is source for walker contract.
+**Pixel registry:** Console#134 tip `cdcfdb1` — **65** Intent keys (+ `captureAfterIntent` / `screenshotPath` for `--record-walk`; production web ignores sticky `demoMode`). Engine ACTIONS.md on #145 is source for walker contract.
 
 YAML transition shape (all layers): `{ to, weight, action }`.
 
@@ -12,7 +12,7 @@ YAML transition shape (all layers): `{ to, weight, action }`.
 
 | Key | Meaning |
 |---|---|
-| `return_to_start` | Clear layer context; undock fixtures if leaving infra_docked; Pixel dismisses modals when `--ui` |
+| `return_to_start` | Clear layer context; undock fixtures if leaving infra_docked (default hygiene); Path A `--start-instances` preserves dock; Pixel dismisses modals when `--ui` |
 | `enter_infra_fleet_walk` | Enter infra subgraph at `infra_idle` (undock fixtures first) — **Engine-owned, not in Pixel registry** |
 | `open_console_as_teacher` | Usage entry → `console_teacher` |
 | `open_console_as_learner` | Usage entry → `console_learner` |
@@ -62,6 +62,21 @@ Do **not** silently drop these edges from `unified.yaml`.
 ### Engine-owned (not Pixel)
 
 `enter_infra_fleet_walk`, all `infra_*`
+
+
+## Live demoMode OFF (PlaywrightUiDriver)
+
+Before first `goto` to Engine-hosted Console (**idea01:8080** / any non-localhost base URL), `PlaywrightUiDriver` registers:
+
+```ts
+await context.addInitScript(() => { localStorage.setItem('demoMode', 'false') })
+```
+
+Sticky `localStorage.demoMode==='true'` (Pixel `bootDemo`) must not mask Kid fixtures on production web. **Do not** remap Intents to demo disk IDs (`DISK001` / `kolibri-disk`). **No** `DURATION_ALLOW_DEMO`. Pixel#134 @`cdcfdb1` also forces demo off via `isProductionWebMode()`.
+
+## Path A — `--start-instances`
+
+CLI `--start-instances` → `RealFleetOps({ startInstances: true })` (keep `instances/` on dock so Console shows Running cards) **and** `preserveDockedOnReturn` so `return_to_start` after infra dock does **not** undock — required for cover-hardpass **dock-before-inventory** (`infra_dock_fixture` → … → `open_disk_inventory` on `disk-duration-kolibri-grade5a-001`). Fake default still undocks on return (hygiene).
 
 ## Live Console / Kid App-open
 

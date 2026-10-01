@@ -30,7 +30,7 @@ Never eject/erase the idea03 Intenso Files Disk.
 
 **Live App-open (later):** Kid sidecar `post-dock-restore-running.sh` → `idea166-kolibri-live` :18080. Fake walks do not require live.
 
-Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/pull/167); Pixel Console [agent-console-dev#134](https://github.com/koenswings/agent-console-dev/pull/134) tip **`ba0cfa1`** (65 Intents + `captureAfterIntent` / `screenshotPath`).
+Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/pull/167); Pixel Console [agent-console-dev#134](https://github.com/koenswings/agent-console-dev/pull/134) tip **`cdcfdb1`** (65 Intents + prod-web ignores sticky demoMode + `captureAfterIntent` / `screenshotPath`).
 
 Pixel coaching set now registered at Console@`ba0cfa1`: `create_class`, `enroll_learners`, `build_lesson`, `create_quiz`, `read_reports`, `preview_as_learner`, `browse_classes`; `open_kolibri_as_teacher` opens `/en/coach/#/classes`. `back_to_console` is hardened.
 
@@ -43,7 +43,7 @@ Pixel coaching set now registered at Console@`ba0cfa1`: `create_class`, `enroll_
 - Return-to-start hygiene (undock when leaving `infra_docked`)
 - Shared-store (`shared` + mDNS-on) vs unique-doc (`unique` + mDNS-off) mode switch
 - Structured JSON logs on `pnpm test:duration`
-- **Phase 3:** `test/duration/ui/` → StubUiDriver (CI / missing-Intent) or PlaywrightUiDriver (`--ui`) calling Pixel `runDurationIntent` / `captureAfterIntent` (Console#134 @ `ba0cfa1`)
+- **Phase 3:** `test/duration/ui/` → StubUiDriver (CI / missing-Intent) or PlaywrightUiDriver (`--ui`) calling Pixel `runDurationIntent` / `captureAfterIntent` (Console#134 @ `cdcfdb1`); non-localhost `addInitScript` forces `demoMode=false`
 - **Phase 4:** dwell stability probes (~30s / `--fast` compressed) on FakeFleetOps
 - **Walk recording:** `--record-walk <dir>` → `step-NNNN-<action>.png` + `walk.mp4` (ffmpeg)
 
@@ -68,7 +68,8 @@ Canonical Fake pool: **idea01 + idea03 + idea04** (never idea02). Live `--hosts`
 | Fake cover-hardpass (live --ui demo) | `--scenario cover-hardpass --fast` |
 | Fake multi-hour proof | `--scenario random --iterations 2000 --seed 42 --fast` |
 | Live reboot / dock | `--live --fast --hosts idea01=…,idea03=…,idea04=…` (same YAML) |
-| **Live UI (preferred; cover-all requires Console@`ba0cfa1`)** | `--live --ui --hosts idea01=…,idea03=…,idea04=… --console-url http://idea01:8080` |
+| **Live UI (preferred; Console@`cdcfdb1`)** | `--live --ui --start-instances --hosts idea01=…,idea03=…,idea04=… --console-url http://idea01:8080` |
+| Path A start instances | `--start-instances` → RealFleetOps `startInstances:true` + preserve dock on return |
 | Record walk (real PNGs) | add `--record-walk /tmp/dur-walk` (pair with `--ui`) |
 
 ## Run (no Pis — FakeFleetOps)

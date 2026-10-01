@@ -48,6 +48,8 @@ const usage = () => {
   --console-url <url>   Console origin for --ui (default DURATION_CONSOLE_URL or http://idea01:8080)
   --record-walk <dir>   Save step-NNNN-<action>.png after UI/live-page steps; assemble walk.mp4
                         (real PNGs need Playwright page — use with --ui; Fake stub logs record_walk_skip)
+  --start-instances     Path A: RealFleetOps startInstances:true (keep instances/ on dock) +
+                        preserveDockedOnReturn so cover-hardpass dock-before-inventory stays visible
   --no-stability        Skip Phase 4 dwell probes
   --dwell-ms <n>        Dwell between transitions (default: 30000 / --fast 80)
   --help                this message
@@ -98,6 +100,7 @@ interface ParsedArgs {
     noStability: boolean
     dwellMs?: number
     recordWalkDir?: string
+    startInstances: boolean
 }
 
 const parseArgs = (argv: string[]): ParsedArgs => {
@@ -114,11 +117,12 @@ const parseArgs = (argv: string[]): ParsedArgs => {
     let noStability = false
     let dwellMs: number | undefined
     let recordWalkDir: string | undefined
+    let startInstances = false
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]!
         if (a === '--') continue
         if (a === '--help' || a === '-h') return {
-            help: true, scenario, fast, live, ui: false, noStability: false,
+            help: true, scenario, fast, live, ui: false, noStability: false, startInstances: false,
         }
         if (a === '--scenario') scenario = argv[++i] ?? scenario
         else if (a === '--iterations') iterations = Number(argv[++i])
@@ -131,21 +135,22 @@ const parseArgs = (argv: string[]): ParsedArgs => {
         else if (a === '--ui') ui = true
         else if (a === '--console-url') consoleUrl = argv[++i]
         else if (a === '--record-walk') recordWalkDir = argv[++i]
+        else if (a === '--start-instances') startInstances = true
         else if (a === '--no-stability') noStability = true
         else if (a === '--dwell-ms') dwellMs = Number(argv[++i])
         else if (a === '--engine-urls') {
             console.error('Unknown flag: --engine-urls (use --hosts name=ip,…)')
-            return { help: true, scenario, fast, live, ui: false, noStability: false }
+            return { help: true, scenario, fast, live, ui: false, noStability: false, startInstances: false }
         }
         else if (a.startsWith('-')) {
             console.error(`Unknown flag: ${a}`)
-            return { help: true, scenario, fast, live, ui: false, noStability: false }
+            return { help: true, scenario, fast, live, ui: false, noStability: false, startInstances: false }
         }
     }
     return {
         help: false, scenario, iterations, fast, seed, live,
         hostsRaw, healthWrapBefore, healthWrapAfter,
-        ui, consoleUrl, noStability, dwellMs, recordWalkDir,
+        ui, consoleUrl, noStability, dwellMs, recordWalkDir, startInstances,
     }
 }
 
@@ -229,6 +234,7 @@ const main = async () => {
             fixtureInstances,
             healthWrapBefore: args.healthWrapBefore,
             healthWrapAfter: args.healthWrapAfter,
+            startInstances: args.startInstances,
         })
     } else {
         ops = new FakeFleetOps({
@@ -266,6 +272,7 @@ const main = async () => {
         ui: args.ui,
         uiDriver: uiDriver.kind,
         record_walk: args.recordWalkDir ?? null,
+        start_instances: args.startInstances,
         hosts: hosts ?? null,
         stability: !args.noStability,
     }
@@ -287,6 +294,7 @@ const main = async () => {
         dwellMs: args.dwellMs,
         settleTimeoutMs,
         recordWalkDir: args.recordWalkDir,
+        preserveDockedOnReturn: args.startInstances,
         onLog,
     }
 

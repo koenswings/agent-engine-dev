@@ -1,11 +1,13 @@
 # Deterministic cover-hardpass walk — NOT a Markov graph.
 # Loads states/invariants/fixtures/pool from scenarios/unified.yaml.
-# Covers the current Pixel-registered demo subset (58 actions; registry 65 @ Console#134 ba0cfa1)
+# Covers the current Pixel-registered demo subset (58 actions; registry 65 @ Console#134 cdcfdb1)
 # plus Engine infra FleetOps (dock/undock/move/reboot via RealFleetOps).
 # Excludes every action in DEFERRED_UI_INTENTS + PIXEL_MISSING_INTENTS
 # (coaching Intents are registered but not yet expanded here; keep_watching, wikipedia, etc.).
 # Prefer short layer cycles; re-enter via return_to_start / hubs.
-# Live --ui demo now. cover-all = strict full graph (failLoud on Pixel-missing under --ui).
+# Live --ui demo: infra enter + infra_dock_fixture (duration-kolibri-grade5a-001) BEFORE
+# first open_disk_inventory. Path A `--start-instances` preserves dock across return_to_start.
+# cover-all = strict full graph (failLoud on Pixel-missing under --ui).
 kind: walk
 name: cover-hardpass
 graph: unified
@@ -77,6 +79,27 @@ steps:
     to: start
     action: return_to_start
   - from: start
+    to: infra_idle
+    action: enter_infra_fleet_walk
+  - from: infra_idle
+    to: infra_docked
+    action: infra_dock_fixture
+  - from: infra_docked
+    to: infra_reboot
+    action: infra_reboot_engine
+  - from: infra_reboot
+    to: infra_idle
+    action: infra_undock_fixtures
+  - from: infra_idle
+    to: infra_docked
+    action: infra_dock_fixture
+  - from: infra_docked
+    to: infra_disk_moved
+    action: infra_move_disk
+  - from: infra_disk_moved
+    to: start
+    action: return_to_start
+  - from: start
     to: op_entry
     action: open_console_as_operator
   - from: op_entry
@@ -128,27 +151,6 @@ steps:
     to: op_overview
     action: notice_usb_dock
   - from: op_overview
-    to: start
-    action: return_to_start
-  - from: start
-    to: infra_idle
-    action: enter_infra_fleet_walk
-  - from: infra_idle
-    to: infra_docked
-    action: infra_dock_fixture
-  - from: infra_docked
-    to: infra_reboot
-    action: infra_reboot_engine
-  - from: infra_reboot
-    to: infra_idle
-    action: infra_undock_fixtures
-  - from: infra_idle
-    to: infra_docked
-    action: infra_dock_fixture
-  - from: infra_docked
-    to: infra_disk_moved
-    action: infra_move_disk
-  - from: infra_disk_moved
     to: start
     action: return_to_start
   - from: start
