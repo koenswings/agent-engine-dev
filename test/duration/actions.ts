@@ -192,6 +192,79 @@ const settleParticipants = async (ctx: ActionContext, engines: string[]): Promis
 
 
 /**
+ * Prefer A r32: late install_app soft-returns while Engine installApp auto-starts
+ * the new empty-002 instance. start_after_install then races Start locked under
+ * title="Operation in progress" / UI "Starting containers" (~468ms, no wait).
+ *
+ * Engine settle before Pixel Intent: poll store until a non-grade5a instance on
+ * duration-empty-002 is Running (Starting→Running). Fake dock creates
+ * duration-empty-002-main Running after redock — returns immediately.
+ * If no empty-002 instance appears (stub / install still soft), proceed so Pixel
+ * waitForInstallAppSettled / discover can loud-fail. If Starting stuck past budget
+ * on live → loud-fail (do not race Intent).
+ * Does not wait after early install_app (would starve EmptyDiskPanel make_files).
+ */
+export const waitEmpty002PostInstallRunning = async (
+    ctx: ActionContext,
+): Promise<string> => {
+    const diskId = DURATION_UI_FIXTURES.empty2.diskId
+    const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
+    if (pool.length === 0) {
+        return 'post-install settle skipped (no pool engines)'
+    }
+    // RealFleetOps exposes findDockedEngine; Fake does not.
+    const opsAny = ctx.opts.ops as FleetOps & { findDockedEngine?: unknown }
+    const isLive = typeof opsAny.findDockedEngine === 'function'
+    // Fake: synthetic empty-002-main already Running after redock — short budget.
+    // Live: installApp + compose start can take minutes even under --fast dwell.
+    const budget = isLive
+        ? (ctx.opts.fast ? 120_000 : 5 * 60_000)
+        : (ctx.opts.fast ? 800 : 3_000)
+    const deadline = Date.now() + budget
+    let lastIds: string[] = []
+    let sawStarting: { id: string; status: string } | null = null
+
+    while (Date.now() < deadline) {
+        lastIds = []
+        for (const eng of pool) {
+            let view: SemanticStoreView
+            try {
+                view = await ctx.opts.ops.readStore(eng)
+            } catch {
+                continue
+            }
+            for (const inst of Object.values(view.instanceDB)) {
+                if (inst.diskId !== diskId) continue
+                if (/grade5a/i.test(inst.id) || /grade5a/i.test(inst.name ?? '')) continue
+                lastIds.push(`${inst.id}:${inst.status}`)
+                const st = (inst.status ?? '').trim()
+                if (st === 'Running') {
+                    return `post-install settle: ${inst.id} Running on ${diskId} (${eng})`
+                }
+                if (/^Starting/i.test(st) || st === 'Starting') {
+                    sawStarting = { id: inst.id, status: st }
+                }
+            }
+        }
+        await new Promise<void>(r => setTimeout(r, Math.min(500, Math.max(50, deadline - Date.now()))))
+    }
+
+    if (sawStarting) {
+        throw new Error(
+            `waitEmpty002PostInstallRunning: instance ${sawStarting.id} still ` +
+                `${sawStarting.status} on ${diskId} after ${budget}ms ` +
+                `(seen=[${lastIds.join(', ')}]). installApp auto-start did not reach Running. ` +
+                `Prefer A r32: do not call start_after_install while Operation in progress. No soft-pass.`,
+        )
+    }
+    // No empty-002 post-install instance yet — Pixel Intent may still be settling install.
+    return (
+        `post-install settle: no non-grade5a instance on ${diskId} within ${budget}ms ` +
+        `(seen=[${lastIds.join(', ')}]); proceeding to start_after_install Intent`
+    )
+}
+
+/**
  * Prefer A r26/r27 live safety net: Path A confirm_erase of empty-002 undocks
  * idea-test-4 mid-walk (disk ABSENT / META-only sparse) so late install_app has
  * empty-badge rows=0. Re-dock Kid pack empty-002/ fresh onto Console host
@@ -538,6 +611,20 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             instanceId = k[1]
         }
     }
+    let preStartSettleNote: string | null = null
+    // Prefer A r32: settle empty-002 auto-start before start_after_install Intent.
+    if (ctx.action === 'start_after_install') {
+        try {
+            preStartSettleNote = await waitEmpty002PostInstallRunning(ctx)
+        } catch (e) {
+            const err = e instanceof Error ? e.message : String(e)
+            return {
+                ok: false,
+                message: `start_after_install aborted before Intent: ${err}`,
+                layer,
+            }
+        }
+    }
     const result = await driver.runIntent({
         action: ctx.action,
         diskId,
@@ -565,6 +652,9 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
         }
     }
     let message = result.message ?? `${result.mode}: ${ctx.action}`
+    if (preStartSettleNote) {
+        message = `${message}; ${preStartSettleNote}`
+    }
     // Prefer A r26: after successful confirm_erase, re-dock empty-002 Empty for late install_app.
     if (result.ok && ctx.action === 'confirm_erase') {
         try {
