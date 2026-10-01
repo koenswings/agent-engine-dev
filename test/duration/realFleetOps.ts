@@ -782,11 +782,8 @@ export class RealFleetOps implements FleetOps {
         const remote = [
             'set -euo pipefail',
             `mkdir -p '${this.disksRoot}' '${this.watchDir}'`,
-            `if test -f '${dest}/META.yaml'; then`,
-            `  echo "RealFleetOps: reuse existing Path A tree at ${dest}"`,
-            `  touch '${sentinel}'`,
-            `  exit 0`,
-            `fi`,
+            // Single-line if — must not split then/fi across ';'-joined fragments
+            `if test -f '${dest}/META.yaml'; then echo "RealFleetOps: reuse existing Path A tree at ${dest}"; touch '${sentinel}'; exit 0; fi`,
             `test -d '${src}' || { echo "missing fixture source ${src}" >&2; exit 2; }`,
             `rm -rf '${dest}'`,
             `mkdir -p '${dest}'`,
