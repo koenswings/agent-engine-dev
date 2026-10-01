@@ -1,9 +1,9 @@
 /**
- * Duration-test action dispatcher (Phase 1–2).
+ * Duration-test action dispatcher (Phase 1–4 / idea#168).
  *
  * Locked Intent keys (Steve Design Review / idea#166) — see ACTIONS.md.
  * Infra uses Engine eject/dock commands via FleetOps (physical USB stubbed).
- * Usage/operator Intents are no-op stubs until Pixel wires Playwright.
+ * Usage/operator Intents: StubUiDriver (Fake CI) or PlaywrightUiDriver → Pixel getIntent.
  */
 
 import type {
@@ -49,6 +49,22 @@ export const UI_STUB_ACTIONS = [
     'open_instance_controls',
     'eject_disk',
     'stay_on_overview',
+    'open_video',
+    'open_exercise',
+    'confirm_eject',
+    'cancel_eject',
+    'erase_disk',
+    'confirm_erase',
+    'cancel_erase',
+    'start_instance',
+    'stop_instance',
+    'open_account',
+    'close_account',
+    'open_settings',
+    'close_settings',
+    'sign_in',
+    'make_files_disk',
+    'add_files_role',
 ] as const
 
 export type KnownAction =
@@ -178,9 +194,29 @@ const returnToStart = async (ctx: ActionContext): Promise<ActionResult> => {
         }
         await settleParticipants(ctx, engines)
     }
+    // Phase 3: dismiss Console modals via Pixel return_to_start when Playwright is live.
+    let uiMsg = ''
+    if (ctx.opts.uiDriver && ctx.opts.uiDriver.kind === 'playwright') {
+        const ui = await ctx.opts.uiDriver.runIntent({
+            action: 'return_to_start',
+            diskId: ctx.fixtureDisk,
+            instanceId: ctx.fixtureInstance,
+            engineId: ctx.poolEngines[0],
+        })
+        if (!ui.ok) {
+            return {
+                ok: false,
+                message: `return_to_start UI failed: ${ui.message ?? 'unknown'}`,
+                dockedEngine: null,
+                layer: null,
+                forceState: 'start',
+            }
+        }
+        uiMsg = `; ${ui.message ?? 'UI cleared'}`
+    }
     return {
         ok: true,
-        message: 'cleared layer context; next sample from start',
+        message: `cleared layer context; next sample from start${uiMsg}`,
         dockedEngine: null,
         layer: null,
         forceState: 'start',
@@ -197,11 +233,90 @@ const enterInfra = async (ctx: ActionContext): Promise<ActionResult> => {
     return { ok: true, message: 'entered infra fleet walk', dockedEngine: null, layer: 'infra' }
 }
 
-const uiStub = async (ctx: ActionContext, layer: Layer): Promise<ActionResult> => {
-    if (ctx.opts.stubUi === false) {
-        return { ok: false, message: `UI Intent '${ctx.action}' not wired (Phase 3)` }
+const layerForUiAction = (action: string, fallback: Layer | null): Layer => {
+    if (
+        action.startsWith('open_disk') ||
+        action.startsWith('open_instance') ||
+        action === 'eject_disk' ||
+        action === 'stay_on_overview' ||
+        action.startsWith('confirm_') ||
+        action.startsWith('cancel_') ||
+        action.startsWith('erase_') ||
+        action === 'start_instance' ||
+        action === 'stop_instance' ||
+        action === 'make_files_disk' ||
+        action === 'add_files_role' ||
+        action === 'open_account' ||
+        action === 'close_account' ||
+        action === 'open_settings' ||
+        action === 'close_settings' ||
+        action === 'sign_in' ||
+        action === 'open_console_as_operator'
+    ) {
+        return 'operator'
     }
-    return { ok: true, message: `UI stub: ${ctx.action}`, layer }
+    if (
+        action.startsWith('open_console') ||
+        action.startsWith('open_kolibri') ||
+        action.startsWith('open_nextcloud') ||
+        action.startsWith('open_wikipedia') ||
+        action.startsWith('stay_on_') ||
+        action === 'open_video' ||
+        action === 'open_exercise' ||
+        action === 'keep_watching' ||
+        action === 'next_resource' ||
+        action === 'exit_lesson'
+    ) {
+        return 'usage'
+    }
+    return fallback ?? 'usage'
+}
+
+/**
+ * Dispatch a usage/operator Intent via UiDriver (Phase 3).
+ * StubUiDriver when stubUi≠false / no driver; PlaywrightUiDriver when --ui.
+ */
+const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<ActionResult> => {
+    const layer = layerForUiAction(ctx.action, layerHint)
+    const driver = ctx.opts.uiDriver
+    if (!driver) {
+        if (ctx.opts.stubUi === false) {
+            return { ok: false, message: `UI Intent '${ctx.action}' requires uiDriver (pass --ui)` }
+        }
+        // Backward-compatible no-driver stub (unit tests that omit uiDriver).
+        return { ok: true, message: `UI stub: ${ctx.action}`, layer }
+    }
+    const defaults = {
+        diskId: ctx.fixtureDisk,
+        instanceId: ctx.fixtureInstance,
+    }
+    // Prefer pack-specific ids when Intent names the app.
+    let diskId = defaults.diskId
+    let instanceId = defaults.instanceId
+    if (ctx.action.includes('nextcloud')) {
+        const nc = Object.entries(ctx.fixtureInstances).find(([d]) => d.includes('nextcloud'))
+        if (nc) {
+            diskId = nc[0]
+            instanceId = nc[1]
+        }
+    } else if (ctx.action.includes('kolibri') || ctx.action === 'open_video' || ctx.action === 'open_exercise') {
+        const k = Object.entries(ctx.fixtureInstances).find(([d]) => d.includes('kolibri'))
+        if (k) {
+            diskId = k[0]
+            instanceId = k[1]
+        }
+    }
+    const result = await driver.runIntent({
+        action: ctx.action,
+        diskId,
+        instanceId,
+        engineId: ctx.walker.dockedEngine ?? ctx.poolEngines[0],
+    })
+    return {
+        ok: result.ok,
+        message: result.message ?? `${result.mode}: ${ctx.action}`,
+        layer,
+    }
 }
 
 export const dispatchAction = async (ctx: ActionContext): Promise<ActionResult> => {
@@ -219,21 +334,20 @@ export const dispatchAction = async (ctx: ActionContext): Promise<ActionResult> 
         case 'infra_reboot_engine':
             return infraRebootEngine(ctx)
         case 'open_console_as_teacher':
-            return uiStub(ctx, 'usage')
+            return runUiIntent(ctx, 'usage')
         case 'open_console_as_learner':
-            return uiStub(ctx, 'usage')
+            return runUiIntent(ctx, 'usage')
         case 'open_console_as_operator':
-            return uiStub(ctx, 'operator')
+            return runUiIntent(ctx, 'operator')
         default:
-            // Unknown or deeper usage/operator Intent — stub in Phase 1–2.
+            // Usage/operator Intents → UiDriver (stub or Playwright).
             if ((UI_STUB_ACTIONS as readonly string[]).includes(ctx.action)) {
-                const layer: Layer = ctx.action.startsWith('open_disk') ||
-                    ctx.action.startsWith('open_instance') ||
-                    ctx.action === 'eject_disk' ||
-                    ctx.action === 'stay_on_overview'
-                    ? 'operator'
-                    : 'usage'
-                return uiStub(ctx, layer)
+                return runUiIntent(ctx, layerForUiAction(ctx.action, ctx.walker.layer))
+            }
+            // return_to_start already handled; infra handled above.
+            // Unknown: try UI driver when present, else stub/fail.
+            if (ctx.opts.uiDriver) {
+                return runUiIntent(ctx, ctx.walker.layer ?? 'usage')
             }
             if (ctx.opts.stubUi !== false) {
                 return {
@@ -436,6 +550,31 @@ export class FakeFleetOps implements FleetOps {
         if (this.settleDelayMs) await sleep(this.settleDelayMs)
         this.ready.set(engineId, true)
         if (this.settleDelayMs) await sleep(this.settleDelayMs)
+    }
+
+
+    async probeStability(engineIds: string[]): Promise<import('./types.js').FleetStabilityProbe> {
+        const engines: import('./types.js').FleetStabilityProbe['engines'] = []
+        let ok = true
+        for (const id of engineIds) {
+            const wsUp = !!this.ready.get(id)
+            // Fake: no docker — treat Running instances as dockerOk when WS up.
+            let dockerOk: boolean | undefined = undefined
+            if (wsUp) {
+                const view = this.stores.get(id)
+                const running = view
+                    ? Object.values(view.instanceDB).filter(i => i.status === 'Running')
+                    : []
+                dockerOk = true // in-memory always "containers match" when WS up
+                void running
+            } else {
+                dockerOk = false
+                ok = false
+            }
+            engines.push({ id, wsUp, dockerOk })
+            if (!wsUp) ok = false
+        }
+        return { ok, detail: ok ? 'fake probe ok' : 'fake probe: WS down', engines }
     }
 
     async waitReady(engineId: string, timeoutMs: number): Promise<SettleReady> {

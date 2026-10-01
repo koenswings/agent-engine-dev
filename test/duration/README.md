@@ -19,24 +19,27 @@ Live dock smoke: `minimal-dock`. Reboot-only: `minimal-live`. Never eject/erase 
 
 Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/pull/167); Pixel Console [agent-console-dev#134](https://github.com/koenswings/agent-console-dev/pull/134).
 
-## Phase 1–2 (this tree)
+## Phase 1–4 (this tree)
 
-- YAML loader + Markov walker + action dispatcher
+- YAML loader + Markov walker + action dispatcher (**ONE** walker / schema)
 - Infra dock / undock / move / reboot via `FleetOps` (**FakeFleetOps** default; **RealFleetOps** with `--live`)
 - Settle gate (`waitForConvergence` + WS ready)
 - Semantic invariants (instanceDB / diskDB / engineDB fields — not Automerge blobs)
 - Return-to-start hygiene (undock when leaving `infra_docked`)
 - Shared-store (`shared` + mDNS-on) vs unique-doc (`unique` + mDNS-off) mode switch
 - Structured JSON logs on `pnpm test:duration`
+- **Phase 3:** `test/duration/ui/` → StubUiDriver (CI) or PlaywrightUiDriver (`--ui`) calling Pixel `getIntent`
+- **Phase 4:** dwell stability probes (~30s / `--fast` compressed) + `stress.yaml` CI on FakeFleetOps
 
-**Not yet:** Playwright UI Interactions (Phase 3), stability probe (Phase 4), shared-store live mode (Ops), instance-start after dock (Kolibri image).
+**Deferred / blockers:** live Playwright claim (Axle→Atlas); shared-store live mode (Ops); instance-start after dock (Kolibri image); `keep_watching` / `open_wikipedia_*` (Pixel deferred).
 
 ## Run (no Pis — FakeFleetOps)
 
 ```bash
-pnpm test:duration                          # minimal scenario, 40 steps
+pnpm test:duration                          # minimal scenario, 40 steps (Fake + Stub UI + probes)
 pnpm test:duration -- --scenario school-day --iterations 80 --fast
 pnpm test:duration -- --scenario stress --iterations 100 --seed 99
+pnpm test:duration -- --ui --console-url http://idea01   # Playwright → Pixel (needs claim)
 ```
 
 Unit tests (fakes, part of automated suite):

@@ -25,6 +25,20 @@ import {
     makeRng,
 } from '../duration/scenario.js'
 import type { Scenario, SemanticStoreView } from '../duration/types.js'
+import {
+    StubUiDriver,
+    createUiDriver,
+    DURATION_UI_FIXTURES,
+    isPixelIntent,
+    resolveConsoleIntentsDir,
+} from '../duration/ui/index.js'
+import {
+    DEFAULT_FAIL_AFTER,
+    FAST_DWELL_MS,
+    detectStatusAnomalies,
+    runStabilityDuringDwell,
+    snapshotRunning,
+} from '../duration/stability.js'
 
 const minimalScenario = (): Scenario => loadScenario('minimal')
 
@@ -567,5 +581,188 @@ describe('minimal-dock scenario (FakeFleetOps)', () => {
         expect(result.aborted).toBe(false)
         expect(result.failures).toBe(0)
         expect(result.logs.some(l => l.action === 'infra_dock_fixture')).toBe(true)
+    })
+})
+
+// ── Phase 3 UI dispatch + Phase 4 stability (idea#168) ───────────────────────
+
+describe('Phase 3 UI Intent dispatch (StubUiDriver)', () => {
+    it('createUiDriver(stub) records Pixel hub Intent names', async () => {
+        const driver = createUiDriver({ stub: true }) as StubUiDriver
+        expect(driver.kind).toBe('stub')
+        const r = await driver.runIntent({ action: 'open_console_as_teacher' })
+        expect(r.ok).toBe(true)
+        expect(r.mode).toBe('stub')
+        expect(driver.calls).toContain('open_console_as_teacher')
+        expect(isPixelIntent('open_console_as_teacher')).toBe(true)
+        expect(isPixelIntent('infra_dock_fixture')).toBe(false)
+    })
+
+    it('deferred Intents return mode deferred without aborting stub walks', async () => {
+        const driver = new StubUiDriver()
+        const r = await driver.runIntent({ action: 'keep_watching' })
+        expect(r.ok).toBe(true)
+        expect(r.mode).toBe('deferred')
+    })
+
+    it('bakes Kid content pins (App#10)', () => {
+        expect(DURATION_UI_FIXTURES.kolibri.diskId).toBe('duration-kolibri-grade5a-001')
+        expect(DURATION_UI_FIXTURES.kolibri.video.contentId).toBe('e60662de-b15c-52f9-b003-359f7d91f8fd')
+        expect(DURATION_UI_FIXTURES.kolibri.exercise.contentId).toBe('7eb9de46-96eb-53d0-bcc1-2fb270b96f03')
+        expect(DURATION_UI_FIXTURES.kolibri.channelId).toBe('30b6c263-4b96-5a62-93bd-dcf9a5cad7ca')
+        expect(DURATION_UI_FIXTURES.nextcloud.instanceId).toBe('nextcloud-grade5a-001')
+    })
+
+    it('walker dispatches usage Intents through uiDriver on school-day', async () => {
+        const scenario = loadScenario('school-day')
+        const ops = fakeOps({
+            poolEngines: scenario.pool_engines!,
+            excludeEngines: scenario.exclude_engines,
+            storeMode: scenario.store_mode,
+        })
+        const driver = new StubUiDriver()
+        const result = await runWalk({
+            scenario,
+            iterations: 40,
+            fast: true,
+            ops,
+            stubUi: true,
+            uiDriver: driver,
+            skipStability: true,
+            settleTimeoutMs: 500,
+            rng: makeRng(7),
+        })
+        expect(result.aborted).toBe(false)
+        expect(result.failures).toBe(0)
+        // school-day seed 7 enters usage — StubUiDriver should see hub/classroom keys
+        const uiActions = result.logs
+            .map(l => l.action)
+            .filter(a =>
+                a.startsWith('open_console') ||
+                a.startsWith('stay_on') ||
+                a.startsWith('open_kolibri') ||
+                a.startsWith('open_nextcloud'),
+            )
+        expect(uiActions.length).toBeGreaterThan(0)
+        expect(driver.calls.length).toBeGreaterThan(0)
+        for (const a of uiActions) {
+            expect(driver.calls).toContain(a)
+        }
+    })
+
+    it('resolves Pixel intents dir when agent-console-dev is a sibling', () => {
+        const dir = resolveConsoleIntentsDir()
+        // On this box sibling checkout exists; if missing, null is ok (Playwright path deferred).
+        if (dir) {
+            expect(dir).toMatch(/e2e\/intents/)
+        }
+    })
+})
+
+describe('Phase 4 stability probes (FakeFleetOps)', () => {
+    it('detectStatusAnomalies flags Running→Error', () => {
+        const before = new Map([['idea01:kolibri-grade5a-001', 'Running']])
+        const after = new Map([['idea01:kolibri-grade5a-001', 'Error']])
+        expect(detectStatusAnomalies(before, after)).toEqual(['idea01:kolibri-grade5a-001 Running→Error'])
+        expect(detectStatusAnomalies(before, new Map([['idea01:kolibri-grade5a-001', 'Running']]))).toEqual([])
+    })
+
+    it('FakeFleetOps.probeStability reports WS up', async () => {
+        const ops = fakeOps({
+            poolEngines: ['idea01', 'idea03'],
+            excludeEngines: ['idea02'],
+        })
+        const sample = await ops.probeStability!(['idea01', 'idea03'])
+        expect(sample.ok).toBe(true)
+        expect(sample.engines.every(e => e.wsUp)).toBe(true)
+    })
+
+    it('runStabilityDuringDwell fails after consecutive WS-down probes', async () => {
+        const ops = fakeOps({
+            poolEngines: ['idea01', 'idea03'],
+            excludeEngines: ['idea02'],
+            initiallyDown: ['idea01', 'idea03'],
+        })
+        // Keep engines down — Fake waitReady / probe will fail.
+        const result = await runStabilityDuringDwell({
+            ops,
+            engines: ['idea01', 'idea03'],
+            intervalMs: 5,
+            failAfter: 3,
+            dwellMs: 200,
+        })
+        expect(result.ok).toBe(false)
+        expect(result.consecutiveFailures).toBeGreaterThanOrEqual(DEFAULT_FAIL_AFTER)
+        expect(result.abortReason).toMatch(/stability probe failed/)
+    })
+
+    it('minimal walk with dwell probes stays green on FakeFleetOps', async () => {
+        const scenario = minimalScenario()
+        const ops = fakeOps({
+            poolEngines: scenario.pool_engines!,
+            excludeEngines: scenario.exclude_engines,
+            storeMode: scenario.store_mode,
+        })
+        const result = await runWalk({
+            scenario,
+            iterations: 15,
+            fast: true,
+            ops,
+            stubUi: true,
+            uiDriver: new StubUiDriver(),
+            skipStability: false,
+            dwellMs: FAST_DWELL_MS,
+            probeIntervalMs: 30,
+            settleTimeoutMs: 500,
+            rng: makeRng(42),
+        })
+        expect(result.aborted).toBe(false)
+        expect(result.failures).toBe(0)
+        // Most steps (except last) should have probe samples
+        const withProbes = result.logs.filter(l => (l.probes?.length ?? 0) > 0)
+        expect(withProbes.length).toBeGreaterThan(0)
+    })
+
+    it('stress.yaml walks green on FakeFleetOps', async () => {
+        const scenario = loadScenario('stress')
+        expect(scenario.exclude_engines).toContain('idea02')
+        const ops = fakeOps({
+            poolEngines: scenario.pool_engines!,
+            excludeEngines: scenario.exclude_engines,
+            storeMode: scenario.store_mode,
+        })
+        const result = await runWalk({
+            scenario,
+            iterations: 40,
+            fast: true,
+            ops,
+            stubUi: true,
+            uiDriver: new StubUiDriver(),
+            skipStability: false,
+            dwellMs: FAST_DWELL_MS,
+            probeIntervalMs: 30,
+            settleTimeoutMs: 500,
+            rng: makeRng(scenario.seed ?? 99),
+        })
+        expect(result.aborted).toBe(false)
+        expect(result.failures).toBe(0)
+        expect(result.logs.some(l => l.action === 'infra_reboot_engine' || l.action === 'infra_dock_fixture')).toBe(true)
+    })
+
+    it('snapshotRunning keys by engine:instance', () => {
+        const views = [{
+            engineId: 'idea01',
+            instanceDB: {
+                'kolibri-grade5a-001': {
+                    id: 'kolibri-grade5a-001',
+                    status: 'Running',
+                    diskId: 'duration-kolibri-grade5a-001',
+                },
+            },
+            diskDB: {},
+            engineDB: {},
+        }]
+        const snap = snapshotRunning(views)
+        expect(snap.get('idea01:kolibri-grade5a-001')).toBe('Running')
     })
 })

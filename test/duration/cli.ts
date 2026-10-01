@@ -1,15 +1,17 @@
 #!/usr/bin/env npx tsx
 /**
- * pnpm test:duration [--scenario minimal] [--iterations 50] [--fast] [--live]
+ * pnpm test:duration [--scenario minimal] [--iterations 50] [--fast] [--live] [--ui]
  *
- * Default: FakeFleetOps (no Pis).
+ * Default: FakeFleetOps (no Pis) + StubUiDriver.
  * --live: RealFleetOps over Tailscale/SSH (requires --hosts or DURATION_FLEET_HOSTS).
+ * --ui: PlaywrightUiDriver → Pixel e2e/intents (DURATION_CONSOLE_URL / idea01 :80).
  */
 
 import { FakeFleetOps } from './actions.js'
 import { RealFleetOps, parseHostsFlag } from './realFleetOps.js'
 import { runWalk } from './runner.js'
 import { loadScenario, makeRng } from './scenario.js'
+import { createUiDriver } from './ui/index.js'
 
 const usage = () => {
     console.log(`Usage: pnpm test:duration [options]
@@ -23,6 +25,10 @@ const usage = () => {
                         Format: idea01=100.99.231.94,idea03=100.126.117.80
   --health-wrap-before <cmd>   Shell before reboot; {pis} → pool host IPs
   --health-wrap-after <cmd>    Shell after waitReady post-reboot; {pis} ok
+  --ui                  Playwright UI Intents via Pixel e2e/intents (Phase 3)
+  --console-url <url>   Console origin for --ui (default DURATION_CONSOLE_URL or http://idea01)
+  --no-stability        Skip Phase 4 dwell probes
+  --dwell-ms <n>        Dwell between transitions (default: 30000 / --fast 80)
   --help                this message
 
 Fake (CI / box, no fleet):
@@ -51,6 +57,10 @@ interface ParsedArgs {
     hostsRaw?: string
     healthWrapBefore?: string
     healthWrapAfter?: string
+    ui: boolean
+    consoleUrl?: string
+    noStability: boolean
+    dwellMs?: number
 }
 
 const parseArgs = (argv: string[]): ParsedArgs => {
@@ -62,11 +72,15 @@ const parseArgs = (argv: string[]): ParsedArgs => {
     let hostsRaw: string | undefined
     let healthWrapBefore: string | undefined
     let healthWrapAfter: string | undefined
+    let ui = false
+    let consoleUrl: string | undefined
+    let noStability = false
+    let dwellMs: number | undefined
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]!
         if (a === '--') continue
         if (a === '--help' || a === '-h') return {
-            help: true, scenario, fast, live,
+            help: true, scenario, fast, live, ui: false, noStability: false,
         }
         if (a === '--scenario') scenario = argv[++i] ?? scenario
         else if (a === '--iterations') iterations = Number(argv[++i])
@@ -76,18 +90,23 @@ const parseArgs = (argv: string[]): ParsedArgs => {
         else if (a === '--hosts') hostsRaw = argv[++i]
         else if (a === '--health-wrap-before') healthWrapBefore = argv[++i]
         else if (a === '--health-wrap-after') healthWrapAfter = argv[++i]
+        else if (a === '--ui') ui = true
+        else if (a === '--console-url') consoleUrl = argv[++i]
+        else if (a === '--no-stability') noStability = true
+        else if (a === '--dwell-ms') dwellMs = Number(argv[++i])
         else if (a === '--engine-urls') {
             console.error('Unknown flag: --engine-urls (use --hosts name=ip,…)')
-            return { help: true, scenario, fast, live }
+            return { help: true, scenario, fast, live, ui: false, noStability: false }
         }
         else if (a.startsWith('-')) {
             console.error(`Unknown flag: ${a}`)
-            return { help: true, scenario, fast, live }
+            return { help: true, scenario, fast, live, ui: false, noStability: false }
         }
     }
     return {
         help: false, scenario, iterations, fast, seed, live,
         hostsRaw, healthWrapBefore, healthWrapAfter,
+        ui, consoleUrl, noStability, dwellMs,
     }
 }
 
@@ -152,6 +171,13 @@ const main = async () => {
         })
     }
 
+    const uiDriver = createUiDriver({
+        stub: !args.ui,
+        baseUrl: args.consoleUrl,
+        headless: true,
+        failLoud: true,
+    })
+
     console.log(JSON.stringify({
         event: 'duration_start',
         scenario: scenario.name,
@@ -163,7 +189,10 @@ const main = async () => {
         exclude_engines: scenario.exclude_engines,
         fixture_disk: scenario.fixture_disk,
         live: args.live,
+        ui: args.ui,
+        uiDriver: uiDriver.kind,
         hosts: hosts ?? null,
+        stability: !args.noStability,
     }))
 
     const result = await runWalk({
@@ -171,7 +200,10 @@ const main = async () => {
         iterations,
         fast: args.fast,
         ops,
-        stubUi: true,
+        stubUi: !args.ui,
+        uiDriver,
+        skipStability: args.noStability,
+        dwellMs: args.dwellMs,
         // Live --fast: align settle with RealFleetOps PM2_RECONNECT_TIMEOUT_MS (150s).
         // Overnight smoke: 60s was insufficient after rapid pm2 on idea03.
         settleTimeoutMs: args.live
@@ -183,6 +215,7 @@ const main = async () => {
         },
     })
 
+    await uiDriver.close?.().catch(() => {})
     if (ops instanceof RealFleetOps) {
         await ops.close().catch(() => {})
     }

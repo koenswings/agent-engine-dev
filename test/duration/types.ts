@@ -89,6 +89,13 @@ export interface SettleReady {
     storeSynced: boolean
 }
 
+/** Phase 4 dwell probe sample (FleetOps.probeStability). */
+export interface FleetStabilityProbe {
+    ok: boolean
+    detail?: string
+    engines: { id: string; wsUp: boolean; dockerOk?: boolean; statusAnomaly?: string }[]
+}
+
 export interface StructuredLogEntry {
     ts: string
     step: number
@@ -100,6 +107,8 @@ export interface StructuredLogEntry {
     durationMs: number
     message?: string
     invariants?: { type: string; ok: boolean; detail?: string }[]
+    /** Phase 4: stability samples taken during post-action dwell. */
+    probes?: { ok: boolean; detail?: string }[]
 }
 
 export interface WalkerResult {
@@ -130,6 +139,11 @@ export interface FleetOps {
     /** Apply shared-store / unique-doc + mDNS policy. */
     applyStoreMode(mode: StoreMode): Promise<void>
     getStoreMode(): StoreMode
+    /**
+     * Phase 4: one stability sample (WS ping + optional docker ps / status).
+     * Optional — Fake + Real implement; runners fall back to waitReady.
+     */
+    probeStability?(engineIds: string[]): Promise<FleetStabilityProbe>
 }
 
 export interface DurationOptions {
@@ -137,8 +151,21 @@ export interface DurationOptions {
     iterations: number
     fast: boolean
     ops: FleetOps
-    /** When true, UI Intents are no-op stubs (Phase 1–2). */
+    /**
+     * When true (default), UI Intents use StubUiDriver / no-op.
+     * When false, require opts.uiDriver (Playwright) — Phase 3.
+     */
     stubUi?: boolean
+    /** Phase 3: Playwright or Stub driver for usage/operator Intents. */
+    uiDriver?: import('./ui/types.js').UiDriver
+    /** Phase 4: dwell between transitions (ms). Override; else fast→80 / real→30000. */
+    dwellMs?: number
+    /** Phase 4: probe interval during dwell (ms). Default 30000 / fast 40. */
+    probeIntervalMs?: number
+    /** Phase 4: abort after N consecutive probe failures (default 3). */
+    probeFailAfter?: number
+    /** Disable dwell probes entirely. */
+    skipStability?: boolean
     settleTimeoutMs?: number
     rng?: () => number
     onLog?: (entry: StructuredLogEntry) => void

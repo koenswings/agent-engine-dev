@@ -1,13 +1,22 @@
 /**
- * Markov walker + action dispatcher + invariant checker (Phase 1–2).
+ * Markov walker + action dispatcher + invariant checker (Phase 1–4 / idea#168).
  *
  * One YAML schema / one runner for usage + operator + infra.
- * Phase 1–2: infra actions live; usage/operator Intents stubbed.
+ * Phase 3: usage/operator Intents via UiDriver (stub or Playwright → Pixel).
+ * Phase 4: dwell stability probes between transitions.
  */
 
 import { dispatchAction, type ActionContext } from './actions.js'
 import { DEFAULT_INFRA_INVARIANTS, evaluateInvariants } from './invariants.js'
 import { makeRng } from './scenario.js'
+import {
+    DEFAULT_DWELL_MS,
+    DEFAULT_FAIL_AFTER,
+    DEFAULT_PROBE_INTERVAL_MS,
+    FAST_DWELL_MS,
+    FAST_PROBE_INTERVAL_MS,
+    runStabilityDuringDwell,
+} from './stability.js'
 import type {
     DurationOptions,
     Layer,
@@ -150,6 +159,28 @@ export const runWalk = async (opts: DurationOptions): Promise<WalkerResult> => {
             message = err instanceof Error ? err.message : String(err)
         }
 
+        // Phase 4: stability probes during dwell (skip on failed action / skipStability / last iter).
+        let probeResults: StructuredLogEntry['probes'] = []
+        if (ok && !fullOpts.skipStability && i < fullOpts.iterations - 1) {
+            const dwellMs = fullOpts.dwellMs
+                ?? (fullOpts.fast ? FAST_DWELL_MS : DEFAULT_DWELL_MS)
+            const intervalMs = fullOpts.probeIntervalMs
+                ?? (fullOpts.fast ? FAST_PROBE_INTERVAL_MS : DEFAULT_PROBE_INTERVAL_MS)
+            const failAfter = fullOpts.probeFailAfter ?? DEFAULT_FAIL_AFTER
+            const stab = await runStabilityDuringDwell({
+                ops: fullOpts.ops,
+                engines: pool,
+                intervalMs,
+                failAfter,
+                dwellMs,
+            })
+            probeResults = stab.samples.map(s => ({ ok: s.ok, detail: s.detail }))
+            if (!stab.ok) {
+                ok = false
+                message = stab.abortReason ?? 'stability probe threshold exceeded'
+            }
+        }
+
         walker.step = i + 1
         const entry: StructuredLogEntry = {
             ts: nowIso(),
@@ -162,6 +193,7 @@ export const runWalk = async (opts: DurationOptions): Promise<WalkerResult> => {
             durationMs: Date.now() - started,
             message,
             invariants: invResults,
+            probes: probeResults,
         }
         logs.push(entry)
         fullOpts.onLog?.(entry)

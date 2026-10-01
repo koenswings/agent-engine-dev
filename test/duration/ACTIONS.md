@@ -1,7 +1,8 @@
 # Duration-test Intent action keys
 
-**Contract owner:** Axle (Engine walker). Pixel matches Playwright stubs to these keys.  
-**Locked** by Steve Design Review for idea#166 Phase 1–2 — do not rename without reporting a clash.
+**Contract owner:** Axle (Engine walker). Pixel matches Playwright adapters to these keys.  
+**Locked** by Steve Design Review for idea#166 — do not rename without reporting a clash.  
+**Phase 3+4 (idea#168):** walker dispatches usage/operator Intents via `test/duration/ui/` → Pixel `e2e/intents` (`getIntent`).
 
 YAML transition shape (all layers): `{ to, weight, action }`.
 
@@ -9,11 +10,11 @@ YAML transition shape (all layers): `{ to, weight, action }`.
 
 | Key | Meaning |
 |---|---|
-| `return_to_start` | Clear layer context; undock fixtures if leaving infra_docked; next sample from `start` |
-| `enter_infra_fleet_walk` | Enter infra subgraph at `infra_idle` (undock fixtures first) |
-| `open_console_as_teacher` | Usage entry → `console_teacher` (Phase 1–2: UI stub) |
-| `open_console_as_learner` | Usage entry → `console_learner` (UI stub) |
-| `open_console_as_operator` | Operator entry → `op_entry` (UI stub) |
+| `return_to_start` | Clear layer context; undock fixtures if leaving infra_docked; Pixel dismisses modals when `--ui` |
+| `enter_infra_fleet_walk` | Enter infra subgraph at `infra_idle` (undock fixtures first) — **Engine-owned, not in Pixel registry** |
+| `open_console_as_teacher` | Usage entry → `console_teacher` |
+| `open_console_as_learner` | Usage entry → `console_learner` |
+| `open_console_as_operator` | Operator entry → `op_entry` |
 
 ## Infra (pool-only; never golden idea02)
 
@@ -24,31 +25,36 @@ YAML transition shape (all layers): `{ to, weight, action }`.
 | `infra_move_disk` | `infra_disk_moved` — undock then dock on another pool engine |
 | `infra_reboot_engine` | `infra_reboot` — SSH reboot; `--fast` → `pm2 restart engine` |
 
-## Usage / operator stubs (Phase 1–2 no-op; Pixel wires later)
+## Usage / operator (Phase 3 → Pixel Playwright)
 
-Prefer proposal Intent titles snake_cased when naming YAML edges:
+Fake/CI default: `StubUiDriver` (no browser). Live UI: `pnpm test:duration -- --ui` → `PlaywrightUiDriver` loads Pixel `getIntent` from `agent-console-dev/e2e/intents` (or `DURATION_CONSOLE_INTENTS`).
 
-- `open_kolibri_as_teacher`, `open_kolibri_as_learner`
-- `open_nextcloud_as_teacher`, `open_nextcloud_as_learner`
-- `open_wikipedia_as_teacher`, `open_wikipedia_as_learner`
-- `stay_on_teacher_overview`, `stay_on_learner_overview`, `stay_on_overview`
-- `keep_watching`, `next_resource`, `exit_lesson`
-- `open_disk_inventory`, `open_instance_controls`, `eject_disk`
+**Pixel-registered (Console#134):**  
+`open_console_as_*`, `return_to_start`, `stay_on_*`, `open_kolibri_as_*`, `open_nextcloud_as_*`, `open_video`, `open_exercise`, `open_disk_inventory`, `open_instance_controls`, `eject_disk`, `confirm_eject`, `cancel_eject`, `erase_disk`, `confirm_erase`, `cancel_erase`, `start_instance`, `stop_instance`, `open_account`, `close_account`, `open_settings`, `close_settings`, `sign_in`, `make_files_disk`, `add_files_role`
 
-Phase 3: `test/duration/ui/` Playwright adapters keyed by the same names.
+**Deferred (clear message, not silent):** `keep_watching`, `next_resource`, `exit_lesson`, `open_wikipedia_*`
+
+**Not registered (Engine-owned):** `enter_infra_fleet_walk`, all `infra_*`
+
+Base URL live: Engine port 80 `http://idea01` (NOT Vite 5173). Prefer idea01+idea03 for Playwright (Kolibri live on idea01).
 
 ## Fixture disk targets (Kid / agent-app-dev#10)
 
 | Action | diskId | instanceId |
 |---|---|---|
 | `infra_dock_fixture` (primary) | `duration-kolibri-grade5a-001` | `kolibri-grade5a-001` |
-| `infra_dock_fixture` / undock / move (also) | `duration-nextcloud-grade5a-001` | `nextcloud-grade5a-001` |
+| nextcloud pack | `duration-nextcloud-grade5a-001` | `nextcloud-grade5a-001` |
 
-`infra_undock_fixtures` undocks **all** infra-eligible fixture disks. Kiwix omitted Phase 1–2.
+Content pins (stable): `open_video` contentId `e60662de-b15c-52f9-b003-359f7d91f8fd` / nodeId `4a1a1b92-3f6d-59eb-a94c-3f91f0011dd5`; `open_exercise` contentId `7eb9de46-96eb-53d0-bcc1-2fb270b96f03` / nodeId `94a47ec7-f30d-5cd1-93f8-ad08c42b6c2a`. Auth Morango IDs are re-provision mutable.
+
+`infra_undock_fixtures` undocks **all** infra-eligible fixture disks. Kiwix omitted.
+
+## Phase 4 stability
+
+During dwell between transitions (~30s; `--fast` → ~80ms): WS ping + docker ps / status anomaly. Fail after 3 consecutive probe failures. `--no-stability` to skip.
 
 ## Live fleet (`--live` / RealFleetOps)
 
 - Default remains FakeFleetOps. Pass `--live` + `--hosts idea01=IP,idea03=IP`.
-- Scenario `minimal-live`: dock-free (`infra_reboot_engine` + hub stubs only).
-- `infra_dock_fixture` / `infra_move_disk` require physical Kid USB fixtures — not on Pis yet.
 - Never target idea02. Never eject the idea03 Intenso Files Disk.
+- Do not claim Pis from this doc — Axle coords Atlas.

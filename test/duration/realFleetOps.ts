@@ -456,6 +456,71 @@ export class RealFleetOps implements FleetOps {
         return { engineId: logicalId, instanceDB, diskDB, engineDB }
     }
 
+
+    /**
+     * Phase 4 dwell probe: WS ping + docker ps for Running instances (SSH).
+     * Unexpected container absence → ok:false for that engine.
+     */
+    async probeStability(engineIds: string[]): Promise<import('./types.js').FleetStabilityProbe> {
+        const engines: import('./types.js').FleetStabilityProbe['engines'] = []
+        let ok = true
+        const details: string[] = []
+        for (const id of engineIds) {
+            if (this.exclude.includes(id)) continue
+            let wsUp = false
+            try {
+                const ready = await this.waitReady(id, 3_000)
+                wsUp = ready.wsUp
+            } catch {
+                wsUp = false
+            }
+            let dockerOk: boolean | undefined
+            let statusAnomaly: string | undefined
+            if (wsUp) {
+                try {
+                    const view = await this.readStore(id)
+                    const running = Object.values(view.instanceDB).filter(i => i.status === 'Running')
+                    if (running.length === 0) {
+                        dockerOk = true // nothing expected running
+                    } else {
+                        const host = this.hosts[id]
+                        if (!host) {
+                            dockerOk = undefined
+                        } else {
+                            // docker ps — names often contain instance id
+                            const result = await this.ssh(host, 'docker ps --format "{{.Names}}" 2>/dev/null || true')
+                            const names = (result ?? '').toLowerCase()
+                            const missing = running.filter(i => !names.includes(i.id.toLowerCase())
+                                && !names.includes((i.name ?? '').toLowerCase()))
+                            if (missing.length) {
+                                dockerOk = false
+                                statusAnomaly = `docker missing for ${missing.map(m => m.id).join(',')}`
+                                ok = false
+                                details.push(`${id}: ${statusAnomaly}`)
+                            } else {
+                                dockerOk = true
+                            }
+                        }
+                    }
+                } catch (e) {
+                    dockerOk = false
+                    statusAnomaly = e instanceof Error ? e.message : String(e)
+                    ok = false
+                    details.push(`${id}: ${statusAnomaly}`)
+                }
+            } else {
+                ok = false
+                details.push(`${id}: WS down`)
+            }
+            engines.push({ id, wsUp, dockerOk, statusAnomaly })
+        }
+        return {
+            ok,
+            detail: ok ? 'stability ok' : details.join('; '),
+            engines,
+        }
+    }
+
     async waitReady(engineId: string, timeoutMs: number): Promise<SettleReady> {
         const start = Date.now()
         let wsUp = false
