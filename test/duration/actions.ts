@@ -320,12 +320,30 @@ const returnToStart = async (ctx: ActionContext): Promise<ActionResult> => {
 
 const enterInfra = async (ctx: ActionContext): Promise<ActionResult> => {
     // Entering infra: ensure fixtures undocked so infra_idle is honest.
+    // Path A (`preserveDockedOnReturn` / `--start-instances`): keep Atlas/Kid
+    // pre-docked fixtures so infra_dock_fixture can no-op without destructive re-copy.
     const engines = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
-    for (const diskId of ctx.fixtureDisks) {
-        await ctx.opts.ops.undockFixtures(engines, diskId)
+    if (!ctx.opts.preserveDockedOnReturn) {
+        for (const diskId of ctx.fixtureDisks) {
+            await ctx.opts.ops.undockFixtures(engines, diskId)
+        }
+        await settleParticipants(ctx, engines)
+        return { ok: true, message: 'entered infra fleet walk', dockedEngine: null, layer: 'infra' }
+    }
+    const opsAny = ctx.opts.ops as FleetOps & { findDockedEngine?: (diskId: string) => Promise<string | null> }
+    let kept: string | null = null
+    if (typeof opsAny.findDockedEngine === 'function') {
+        kept = await opsAny.findDockedEngine(ctx.fixtureDisk)
     }
     await settleParticipants(ctx, engines)
-    return { ok: true, message: 'entered infra fleet walk', dockedEngine: null, layer: 'infra' }
+    return {
+        ok: true,
+        message: kept
+            ? `entered infra fleet walk (Path A keep dock on ${kept})`
+            : 'entered infra fleet walk (Path A; no undock)',
+        dockedEngine: kept,
+        layer: 'infra',
+    }
 }
 
 const layerForUiAction = (action: string, fallback: Layer | null): Layer => {
