@@ -91,8 +91,8 @@ Live `--ui` Prefer A needs Console#134 **@db21bf4+** (Copy/Move + EmptyDiskPanel
 
 1. **demoMode=false** — `PlaywrightUiDriver` initScript (already); production web ignores sticky demo.
 2. **Three Path A disks docked on Console host (pool[0]/idea01)** — `duration-kolibri-grade5a-001` + `duration-nextcloud-grade5a-001` + `duration-empty-001` (Kid App#10 @`6167046` pack `tests/duration-tests/fixtures/empty/`). Prefer slots **idea-test-1 / idea-test-2 / idea-test-3** under `IDEA_DISKS_ROOT` (empty → **idea-test-3** when free). Path A `--start-instances` keeps instances/ on app disks.
-3. **Live env** — `DURATION_EMPTY_DISK_ID=duration-empty-001` so EmptyDiskPanel Intents (`install_app` / `make_files_*` / `make_backup_*` / erase-on-empty) select the empty disk — do **not** remap onto Kolibri Grade5A. Optional: `DURATION_COPY_SOURCE_DISK`, `DURATION_COPY_TARGET_DISK`, `DURATION_COPY_INSTANCE_ID` (default kolibri → nextcloud). Fixture source: `DURATION_FIXTURE_SOURCE_ROOT` (default Kid packs on Pi workspace).
-4. **cover-registered-intents** includes EmptyDiskPanel walk steps; erase targets empty via Pixel selection (do not erase Grade5A app disks).
+3. **Live env** — `DURATION_EMPTY_DISK_ID=duration-empty-001` so EmptyDiskPanel Intents (`install_app` / `make_files_*` / `make_backup_*` / erase-on-empty) select the empty disk — do **not** remap onto Kolibri Grade5A. **`DURATION_BACKUP_DISK_ID=duration-empty-001`** after `make_backup_disk` (same pack; role becomes backup) so `open_disk_inventory` before `restore_from_backup` focuses the Backup Disk — restore-panel is not on Grade5A app disks; Pixel also discovers backup role. Optional: `DURATION_COPY_SOURCE_DISK`, `DURATION_COPY_TARGET_DISK`, `DURATION_COPY_INSTANCE_ID` (default kolibri → nextcloud). Fixture source: `DURATION_FIXTURE_SOURCE_ROOT` (default Kid packs on Pi workspace).
+4. **cover-registered-intents** includes EmptyDiskPanel walk steps; erase targets empty via Pixel selection (do not erase Grade5A app disks). **`restore_from_backup` requires Backup Disk selected** (walk: `back_to_overview` → `open_disk_inventory` with `DURATION_BACKUP_DISK_ID` before restore).
 
 Do **not** live-run until Atlas confirms idea01 `:8080` serves Console @`db21bf4` **and** `duration-empty-001` is docked.
 
@@ -112,6 +112,7 @@ Deprecated CLI aliases (`minimal-*`, `stress`, `school-day`) load **`unified.yam
 | `infra_dock_fixture` (primary) | `duration-kolibri-grade5a-001` | `kolibri-grade5a-001` |
 | nextcloud pack | `duration-nextcloud-grade5a-001` | `nextcloud-grade5a-001` |
 | empty pack (EmptyDiskPanel) | `duration-empty-001` | — (no instance; slot idea-test-3) |
+| Backup Disk (post `make_backup_disk`) | `duration-empty-001` via `DURATION_BACKUP_DISK_ID` | — (same pack; role=backup; required before `restore_from_backup`) |
 
 Content pins (stable): `open_video` contentId `e60662de-b15c-52f9-b003-359f7d91f8fd` / nodeId `4a1a1b92-3f6d-59eb-a94c-3f91f0011dd5`; `open_exercise` contentId `7eb9de46-96eb-53d0-bcc1-2fb270b96f03` / nodeId `94a47ec7-f30d-5cd1-93f8-ad08c42b6c2a`. Auth Morango IDs are re-provision mutable.
 

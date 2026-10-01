@@ -14,6 +14,9 @@
 # multi-disk + EmptyDiskPanel Intents. Live preload: demoMode=false; three Path A
 # disks docked (kolibri + nextcloud + duration-empty-001 on idea-test-1/2/3);
 # export DURATION_EMPTY_DISK_ID=duration-empty-001 (Pixel selects data-role=empty).
+# restore_from_backup requires Backup Disk selected (not Grade5A app disk): after
+# make_backup_disk, open_disk_inventory with DURATION_BACKUP_DISK_ID=duration-empty-001
+# (same pack; role is backup post make_backup_disk). Pixel also discovers backup role.
 # Optional DURATION_COPY_SOURCE_DISK / DURATION_COPY_TARGET_DISK /
 # DURATION_COPY_INSTANCE_ID (default kolibri→nextcloud).
 # Wait for Atlas :8080 @db21bf4 GO + empty docked before live --ui --record-walk.
@@ -210,6 +213,15 @@ steps:
   - from: op_backup
     to: op_disk
     action: backup_configured_restored
+  # Select Backup Disk before restore (not Grade5A). Graph: open_disk_inventory
+  # only from op_overview — back_to_overview then re-open with
+  # DURATION_BACKUP_DISK_ID=duration-empty-001 (post make_backup_disk role).
+  - from: op_disk
+    to: op_overview
+    action: back_to_overview
+  - from: op_overview
+    to: op_disk
+    action: open_disk_inventory
   - from: op_disk
     to: op_backup
     action: restore_from_backup
