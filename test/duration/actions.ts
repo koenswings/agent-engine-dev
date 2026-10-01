@@ -270,11 +270,16 @@ export const waitEmpty002PostInstallRunning = async (
  * no-ops when already on the same engine). Does NOT change DURATION_EMPTY_DISK_ID
  * (=001); Pixel ensureEmptyDiskPanel discovers any empty-badge row. Never idea02.
  * FakeFleetOps: undock pool-wide + synthetic dockFixture (CRI stays green).
+ * purgeStoreInstances (BeforeSecondInstall only / Prefer A r36): FS wipe is not
+ * enough — Automerge instanceDB rows with storedOn=empty-002 survive; Console
+ * hasInstancesOn keys off store → still shows app / no EmptyDiskPanel. AfterErase
+ * must NOT purge (erase already cleared instances).
  */
 const redockEmpty002Fresh = async (
     ctx: ActionContext,
     label: string,
     noteSuffix: string,
+    opts?: { purgeStoreInstances?: boolean },
 ): Promise<string> => {
     const diskId = DURATION_UI_FIXTURES.empty2.diskId
     const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
@@ -300,6 +305,9 @@ const redockEmpty002Fresh = async (
         // Fake / no findDockedEngine: undock pool-wide (idempotent if absent).
         await ctx.opts.ops.undockFixtures(pool, diskId)
     }
+    if (opts?.purgeStoreInstances) {
+        await ctx.opts.ops.purgeInstancesStoredOn(engine, diskId)
+    }
     await ctx.opts.ops.dockFixture(engine, diskId)
     await settleParticipants(ctx, pool)
     return `re-docked ${diskId} on ${engine} ${noteSuffix}`
@@ -316,18 +324,20 @@ export const redockEmpty002AfterErase = async (ctx: ActionContext): Promise<stri
     redockEmpty002Fresh(ctx, 'redockEmpty002AfterErase', 'after confirm_erase (Empty fresh pack)')
 
 /**
- * Prefer A r35 live safety net: late install_app@85 + start_after_install@86 fills
+ * Prefer A r35/r36 live safety net: late install_app@85 + start_after_install@86 fills
  * duration-empty-002 with kolibri (app disk). copy_app@87 / open_copied@88 /
  * back_to_disk@89 then second install_app@90 needs EmptyDiskPanel again (empty-001
- * is backup). Mirror AfterErase: force undock + fresh Kid empty-002 pack before
- * the second late install (hooked after open_copied_instance). Later erase_disk
- * also needs EmptyDiskPanel.
+ * is backup). Mirror AfterErase undock+dockFixture, PLUS purgeStoreInstances (r36):
+ * Automerge instanceDB rows with storedOn=empty-002 survive FS wipe; Console
+ * hasInstancesOn keys off store (AfterErase does not need this — erase cleared
+ * instances). Hooked after open_copied_instance. Later erase_disk also needs EmptyDiskPanel.
  */
 export const redockEmpty002BeforeSecondInstall = async (ctx: ActionContext): Promise<string> =>
     redockEmpty002Fresh(
         ctx,
         'redockEmpty002BeforeSecondInstall',
-        'before second late install_app (Empty fresh pack)',
+        'before second late install_app (Empty fresh pack + store purge)',
+        { purgeStoreInstances: true },
     )
 
 const infraUndockFixtures = async (ctx: ActionContext): Promise<ActionResult> => {
@@ -984,6 +994,22 @@ export class FakeFleetOps implements FleetOps {
             await sleep(5)
         }
         return { wsUp: !!this.ready.get(engineId), storeSynced: false }
+    }
+
+    /**
+     * Prefer A r36: drop synthetic instanceDB rows for diskId so Fake hasInstancesOn
+     * semantics stay Empty after BeforeSecondInstall redock (CRI stays green).
+     */
+    async purgeInstancesStoredOn(_engineId: string, diskId: string): Promise<void> {
+        this.mutate(doc => {
+            for (const id of Object.keys(doc.instanceDB)) {
+                const inst = doc.instanceDB[id]
+                if (inst && inst.diskId === diskId) {
+                    delete doc.instanceDB[id]
+                }
+            }
+        })
+        if (this.settleDelayMs) await sleep(this.settleDelayMs)
     }
 
     async readStore(engineId: string): Promise<SemanticStoreView> {

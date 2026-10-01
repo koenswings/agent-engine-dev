@@ -129,6 +129,12 @@ export interface FleetOps {
     /** Prefer Engine eject/dock commands over physical USB. */
     dockFixture(engineId: string, diskId: string): Promise<void>
     undockFixtures(engineIds: string[], diskId: string): Promise<void>
+    /**
+     * Prefer A r36: delete Automerge instanceDB rows with storedOn=diskId so Console
+     * hasInstancesOn / EmptyDiskPanel see Empty after FS wipe + redock. Optionally
+     * set disk.diskTypes=['empty']. Duration fixtures only (RealFleetOps).
+     */
+    purgeInstancesStoredOn(engineId: string, diskId: string): Promise<void>
     /** Move: undock then dock on another pool engine. */
     moveDisk(fromEngine: string, toEngine: string, diskId: string): Promise<void>
     /** Reboot pool engine; fast=true → pm2 restart instead of sudo reboot. */

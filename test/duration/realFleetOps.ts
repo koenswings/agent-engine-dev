@@ -1229,6 +1229,90 @@ export class RealFleetOps implements FleetOps {
         await this.dockFixture(toEngine, diskId)
     }
 
+    /**
+     * Prefer A r36: Automerge instanceDB rows with storedOn=diskId survive FS wipe
+     * (dockFixture empty always-fresh-copy). Console hasInstancesOn keys off store
+     * → still shows app / no EmptyDiskPanel after redock alone. Delete matching
+     * keys; stop Running/Starting duration docker by exact instance id (same
+     * careful filter as reconcileDurationZombies — duration fixtures only, never
+     * idea166-*). Set disk.diskTypes=['empty'] when the disk row is present.
+     */
+    async purgeInstancesStoredOn(engineId: string, diskId: string): Promise<void> {
+        this.assertNotExcluded(engineId, 'purgeInstancesStoredOn')
+        if (looksLikeProtectedHwDisk(diskId)) {
+            throw new Error(`RealFleetOps: refuse to purge instances on protected disk '${diskId}'`)
+        }
+        if (!looksLikeDurationFixtureId(diskId)) {
+            throw new Error(
+                `RealFleetOps: refuse to purge instances on non-duration disk '${diskId}'`,
+            )
+        }
+        const conn = await this.connect(engineId)
+        const doc = conn.storeHandle.doc()
+        if (!doc) {
+            throw new Error(`RealFleetOps: store doc not ready for ${engineId}`)
+        }
+        const host = this.hostOf(engineId)
+        const toPurge: { id: string; status: string }[] = []
+        for (const [id, inst] of Object.entries(doc.instanceDB ?? {})) {
+            if (!inst) continue
+            if (String((inst as { storedOn?: unknown }).storedOn) !== String(diskId)) continue
+            toPurge.push({
+                id: String((inst as { id?: unknown }).id ?? id),
+                status: String((inst as { status?: unknown }).status ?? ''),
+            })
+        }
+        const stopped: string[] = []
+        for (const inst of toPurge) {
+            if (inst.status !== 'Running' && inst.status !== 'Starting') continue
+            const idHits =
+                looksLikeDurationFixtureId(inst.id) || looksLikeDurationFixtureId(diskId)
+            if (!idHits) continue
+            const needle = inst.id.replace(/'/g, '')
+            if (!needle || needle.includes('idea166-')) continue
+            try {
+                const remote =
+                    `ids=$(docker ps -aq --filter name='${needle}' 2>/dev/null); ` +
+                    `if test -n "$ids"; then echo "$ids" | xargs -r docker stop; ` +
+                    `echo "$ids" | xargs -r docker rm; echo '${needle}'; ` +
+                    `else echo ""; fi`
+                const out = (await this.ssh(host, remote)).trim()
+                if (out) stopped.push(needle)
+            } catch (e) {
+                console.warn(
+                    `[RealFleetOps] purgeInstancesStoredOn: docker stop ${inst.id} ` +
+                    `on ${host} failed: ${e}`,
+                )
+            }
+        }
+        if (stopped.length) {
+            console.log(
+                `[RealFleetOps] purgeInstancesStoredOn: stopped docker ` +
+                `${stopped.join(', ')} on ${host}`,
+            )
+            await sleep(1500)
+        }
+        const purgeIds = toPurge.map(i => i.id)
+        conn.storeHandle.change(s => {
+            for (const id of purgeIds) {
+                if (s.instanceDB[id as keyof typeof s.instanceDB]) {
+                    delete s.instanceDB[id as keyof typeof s.instanceDB]
+                }
+            }
+            const disk = s.diskDB[diskId as keyof typeof s.diskDB] as
+                | { diskTypes?: string[] }
+                | undefined
+            if (disk) {
+                disk.diskTypes = ['empty']
+            }
+        })
+        console.log(
+            `[RealFleetOps] purgeInstancesStoredOn: deleted ${purgeIds.length} instance(s) ` +
+            `storedOn=${diskId} on ${engineId}` +
+            (purgeIds.length ? ` (${purgeIds.join(', ')})` : ''),
+        )
+    }
+
     /** Drop all open WS connections (tests / process exit). */
     async close(): Promise<void> {
         const ids = [...this.conns.keys()]
