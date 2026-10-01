@@ -38,6 +38,20 @@ export const SCENARIO_ALIASES: Record<string, string> = {
 /** Markov / random synonyms — all load scenarios/unified.yaml (not a walk). */
 export const MARKOV_SCENARIO_NAMES = new Set(['unified', 'random', ''])
 
+/** Deprecated walk CLI names → canonical walks/<name>.yaml basename (brief compat). */
+export const WALK_ALIASES: Record<string, string> = {
+    'cover-hardpass': 'cover-registered-intents',
+}
+
+/** Resolve walk CLI name (alias → canonical basename; paths unchanged). */
+export const resolveWalkName = (nameOrPath: string): string => {
+    if (!nameOrPath) return nameOrPath
+    if (nameOrPath.endsWith('.yaml') || nameOrPath.endsWith('.yml') || nameOrPath.includes('/')) {
+        return nameOrPath
+    }
+    return WALK_ALIASES[nameOrPath] ?? nameOrPath
+}
+
 export const scenariosDir = (): string => {
     // Prefer source tree (tsx / repo root); fall back relative to this file.
     const fromCwd = resolve(process.cwd(), 'test/duration/scenarios')
@@ -182,7 +196,7 @@ const parseFixtures = (raw: unknown, path: string): FixtureRef[] => {
 
 /**
  * Resolve CLI --scenario name for Markov graphs.
- * `random` (and empty) → unified. Walk names (e.g. cover-all) are NOT aliases —
+ * `random` (and empty) → unified. Walk names (e.g. cover-all / cover-registered-intents) are NOT Markov aliases —
  * use isWalkScenario / loadWalk instead.
  */
 export const resolveScenarioName = (nameOrPath: string): string => {
@@ -198,9 +212,10 @@ export const isWalkScenario = (nameOrPath: string): boolean => {
     if (!nameOrPath || nameOrPath === 'random' || nameOrPath === 'unified') return false
     if (SCENARIO_ALIASES[nameOrPath]) return false
     if (nameOrPath.endsWith('.walk.yaml') || nameOrPath.endsWith('.walk.yml')) return true
-    // Bare name: prefer walks/<name>.yaml when present
+    const walkName = resolveWalkName(nameOrPath)
+    // Bare name: prefer walks/<name>.yaml when present (after walk alias resolve)
     try {
-        readFileSync(join(walksDir(), `${nameOrPath}.yaml`), 'utf8')
+        readFileSync(join(walksDir(), `${walkName}.yaml`), 'utf8')
         return true
     } catch {
         return false
@@ -208,9 +223,10 @@ export const isWalkScenario = (nameOrPath: string): boolean => {
 }
 
 export const loadWalk = (nameOrPath: string): WalkDefinition => {
-    const path = nameOrPath.endsWith('.yaml') || nameOrPath.endsWith('.yml') || nameOrPath.includes('/')
-        ? resolve(nameOrPath)
-        : join(walksDir(), `${nameOrPath}.yaml`)
+    const resolved = resolveWalkName(nameOrPath)
+    const path = resolved.endsWith('.yaml') || resolved.endsWith('.yml') || resolved.includes('/')
+        ? resolve(resolved)
+        : join(walksDir(), `${resolved}.yaml`)
 
     const text = readFileSync(path, 'utf8')
     const raw = parseYaml(text) as Record<string, unknown>

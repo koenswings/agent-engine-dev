@@ -1,12 +1,12 @@
 #!/usr/bin/env npx tsx
 /**
- * pnpm test:duration [--scenario random|unified|cover-all|cover-hardpass] [--iterations N] [--fast] [--live] [--ui]
+ * pnpm test:duration [--scenario random|unified|cover-all|cover-registered-intents|cover-hardpass] [--iterations N] [--fast] [--live] [--ui]
  *
  * Preferred verification (once Pixel+Atlas ready): `--live --ui` for real Console walks.
  * Default Fake: FakeFleetOps + StubUiDriver (CI / missing-Intent only) + Markov on unified.yaml.
  * --scenario random|unified|default → Markov simulation on scenarios/unified.yaml
  * --scenario cover-all → deterministic full-graph walk (walks/cover-all.yaml)
- * --scenario cover-hardpass → Pixel-registered + infra walk (walks/cover-hardpass.yaml); live --ui demo
+ * --scenario cover-registered-intents → Pixel-registered + infra walk (walks/cover-registered-intents.yaml); live --ui demo
  * Deprecated aliases (minimal, stress, school-day, …) resolve to unified — not separate graphs.
  * --live: RealFleetOps over Tailscale/SSH (requires --hosts or DURATION_FLEET_HOSTS).
  * --ui: PlaywrightUiDriver → Pixel e2e/intents (DURATION_CONSOLE_URL / idea01 :8080).
@@ -34,7 +34,7 @@ const usage = () => {
 
   --scenario <name>     Markov: random|unified (default) → scenarios/unified.yaml
                         Walk:   cover-all → walks/cover-all.yaml (strict full graph)
-                        Walk:   cover-hardpass → walks/cover-hardpass.yaml (Pixel-registered + infra; live --ui demo)
+                        Walk:   cover-registered-intents → walks/cover-registered-intents.yaml (registered-intents walk; alias cover-hardpass)
                         Deprecated aliases → unified: ${Object.keys(SCENARIO_ALIASES).join(', ')}
   --iterations <n>      Markov steps (default: 40). Walks default to steps.length.
   --fast                pm2 restart instead of reboot; shorter settle / dwell
@@ -49,13 +49,13 @@ const usage = () => {
   --record-walk <dir>   Save step-NNNN-<action>.png after UI/live-page steps; assemble walk.mp4
                         (real PNGs need Playwright page — use with --ui; Fake stub logs record_walk_skip)
   --start-instances     Path A: RealFleetOps startInstances:true (keep instances/ on dock) +
-                        preserveDockedOnReturn so cover-hardpass dock-before-inventory stays visible
+                        preserveDockedOnReturn so cover-registered-intents dock-before-inventory stays visible
   --no-stability        Skip Phase 4 dwell probes
   --dwell-ms <n>        Dwell between transitions (default: 30000 / --fast 80)
   --help                this message
 
 Prefer real UI (Pixel Intents hardening; Fake Stub only for CI / missing Intents):
-  pnpm test:duration -- --live --ui --scenario cover-hardpass --fast \\
+  pnpm test:duration -- --live --ui --scenario cover-registered-intents --fast \\
     --hosts idea01=…,idea03=…,idea04=… --console-url http://idea01:8080
   pnpm test:duration -- --live --ui --scenario cover-all --fast \\
     --hosts idea01=…,idea03=…,idea04=… --console-url http://idea01:8080   # strict; failLoud on Pixel-missing
@@ -69,8 +69,8 @@ Fake Markov (CI / box, no fleet) — ONE canonical graph:
 
 Fake deterministic walks (regression before long random soak):
   pnpm test:duration -- --scenario cover-all --fast          # strict full graph (90 actions)
-  pnpm test:duration -- --scenario cover-hardpass --fast     # Pixel-registered + infra (live --ui demo)
-  pnpm test:duration -- --scenario cover-hardpass --fast --record-walk /tmp/dur-rec   # dry-run flag (0 frames)
+  pnpm test:duration -- --scenario cover-registered-intents --fast     # registered-intents walk (alias cover-hardpass)
+  pnpm test:duration -- --scenario cover-registered-intents --fast --record-walk /tmp/dur-rec   # dry-run flag (0 frames)
 
 Live (same unified graph; hosts/store are CLI knobs — not alternate YAMLs):
   pnpm test:duration -- --live --scenario unified --fast --iterations 30 \\
@@ -80,7 +80,7 @@ Env: DURATION_FLEET_HOSTS=idea01=…,idea03=…,idea04=…  (same format as --ho
 
 Never put idea02 in the pool. Live App-open later uses Kid sidecar
 post-dock-restore-running.sh → idea166-kolibri-live :18080 (see ACTIONS.md).
-Recording + cover-hardpass (or cover-all) / random with --ui --live is the intended verification path
+Recording + cover-registered-intents (alias cover-hardpass; or cover-all) / random with --ui --live is the intended verification path
 once Pixel+Atlas are ready. See test/duration/README.md.
 `)
 }

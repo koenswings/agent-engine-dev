@@ -31,7 +31,7 @@ YAML transition shape (all layers): `{ to, weight, action }`.
 
 **Prefer real UI:** `--live --ui` once Pixel adapters harden (Fake `StubUiDriver` = CI / missing-Intent only).  
 With `--ui`, Engine always uses `PlaywrightUiDriver` — deferred / unregistered Intents soft-skip or clear-fail via `failLoud`; never silently force Stub for registered Intents.  
-Recording + **cover-hardpass** (Pixel-registered demo + infra; live `--ui` demo; `copy_app`/`move_app` require Console#134 @`b63e1ec`+ multi-disk) or cover-all (strict full graph) / random with `--ui --live` (+ `--record-walk <dir>`) is the intended verification path once Pixel+Atlas are ready. cover-all under `--ui` keeps failLoud abort on Pixel-missing (no soft-skip); a live cover-all retry requires Console@`ba0cfa1`.
+Recording + **cover-registered-intents** (Pixel-registered demo + infra; live `--ui` demo; `copy_app`/`move_app` require Console#134 @`b63e1ec`+ multi-disk) or cover-all (strict full graph) / random with `--ui --live` (+ `--record-walk <dir>`) is the intended verification path once Pixel+Atlas are ready. cover-all under `--ui` keeps failLoud abort on Pixel-missing (no soft-skip); a live cover-all retry requires Console@`ba0cfa1`.
 
 Fake/CI default: `StubUiDriver` (no browser). Live UI: `pnpm test:duration -- --live --ui` → `PlaywrightUiDriver` loads Pixel `runDurationIntent` / optional `captureAfterIntent` from `idea-console/duration-intents` or `agent-console-dev/e2e/intents` (or `DURATION_CONSOLE_INTENTS`).
 
@@ -76,7 +76,7 @@ Sticky `localStorage.demoMode==='true'` (Pixel `bootDemo`) must not mask Kid fix
 
 ## Path A — `--start-instances`
 
-CLI `--start-instances` → `RealFleetOps({ startInstances: true })` (keep `instances/` on dock so Console shows Running cards) **and** `preserveDockedOnReturn` so `return_to_start` after infra dock does **not** undock — required for cover-hardpass **dock-before-inventory** (`infra_dock_fixture` → … → `open_disk_inventory` on `disk-duration-kolibri-grade5a-001`). Fake default still undocks on return (hygiene).
+CLI `--start-instances` → `RealFleetOps({ startInstances: true })` (keep `instances/` on dock so Console shows Running cards) **and** `preserveDockedOnReturn` so `return_to_start` after infra dock does **not** undock — required for cover-registered-intents **dock-before-inventory** (`infra_dock_fixture` → … → `open_disk_inventory` on `disk-duration-kolibri-grade5a-001`). Fake default still undocks on return (hygiene).
 
 Path A re-dock after eject: RealFleetOps does `rm -f` sentinel, `sleep 5`, then `touch` (Atlas — chokidar needs unlink before create, not mtime-only touch; Atlas Ops proof: 5s before touch). `dockFixture` waits up to **120s** for store dock, and on first timeout re-fires the sentinel once then waits again before failing.
 
@@ -102,7 +102,7 @@ Base URL live: Engine-served Console on port **8080** (`http://idea01:8080`). Ca
 **Kid Running after dock (later live App-open — do not block Fake):**  
 `post-dock-restore-running.sh` → restores instances under `idea166-kolibri-live` on **:18080** (behind Engine :80 proxy). RealFleetOps `dockFixture` defaults to dock-only (strips `instances/`). Until Kid sidecar leaves Running cards, live `--ui` App-open Intents may fail — Fake Stub remains OK for full-graph CI proof; prefer `--live --ui` for real walks as Pixel+Kid land.
 
-Deprecated CLI aliases (`minimal-*`, `stress`, `school-day`) load **`unified.yaml`** (Markov). Prefer `--scenario random` / `unified` for Markov, `--scenario cover-hardpass` for the live `--ui` demo walk, or `--scenario cover-all` for the strict full-graph walk. Hosts/iterations/live/ui are CLI knobs — not alternate graphs.
+Deprecated CLI aliases (`minimal-*`, `stress`, `school-day`) load **`unified.yaml`** (Markov). Prefer `--scenario random` / `unified` for Markov, `--scenario cover-registered-intents` (alias `cover-hardpass`; chat: registered-intents walk) for the live `--ui` demo walk, or `--scenario cover-all` for the strict full-graph walk. Hosts/iterations/live/ui are CLI knobs — not alternate graphs.
 
 ## Fixture disk targets (Kid / agent-app-dev#10)
 

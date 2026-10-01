@@ -6,13 +6,13 @@ Parent: [idea#166](https://github.com/koenswings/idea/issues/166).
 
 ## Prefer real UI over stubs
 
-**Policy:** once Pixel Intents harden and Atlas can claim the pool, prefer **`--live --ui`** for real Console walks (recording + cover-hardpass / cover-all / random).  
+**Policy:** once Pixel Intents harden and Atlas can claim the pool, prefer **`--live --ui`** for real Console walks (recording + cover-registered-intents (alias cover-hardpass) / cover-all / random).  
 `StubUiDriver` / Fake is for **CI and missing-Intent dry-runs only**.
 
 - With `--ui`, the runner always uses `PlaywrightUiDriver` (never silently forces Stub for registered Intents).
 - Deferred / unregistered Intents soft-skip or clear-fail via existing `failLoud` — they do not fall back to Stub.
 - Intended verification path when Pixel+Atlas are ready:  
-  `--live --ui --scenario cover-hardpass|cover-all|random --record-walk <dir>`
+  `--live --ui --scenario cover-registered-intents|cover-all|random --record-walk <dir>`
 
 ## Fixtures (Kid / agent-app-dev#10)
 
@@ -54,7 +54,7 @@ Pixel coaching set now registered at Console@`ba0cfa1`: `create_class`, `enroll_
 **`--scenario` semantics:**
 - `random` / `unified` / default → **Markov** simulation on `scenarios/unified.yaml`
 - `cover-all` → **deterministic walk** (`walks/cover-all.yaml`) covering every graph action once — strict full-graph regression (under `--ui`, Pixel-missing still **failLoud** abort; live retry requires Console@`ba0cfa1`)
-- `cover-hardpass` → **deterministic walk** (`walks/cover-hardpass.yaml`) covering the current Pixel-registered demo subset + Engine infra FleetOps — **live `--ui` demo now** (coaching Intents are registered but walk expansion is deferred; excludes DEFERRED + PIXEL_MISSING)
+- `cover-registered-intents` (chat: **registered-intents walk**; alias `cover-hardpass`) → **deterministic walk** (`walks/cover-registered-intents.yaml`) covering the current Pixel-registered demo subset + Engine infra FleetOps — **live `--ui` demo now** (coaching Intents are registered but walk expansion is deferred; excludes DEFERRED + PIXEL_MISSING)
 - Do **not** invent alternate Markov graphs
 
 Deprecated aliases that still resolve to `unified.yaml`: `minimal`, `minimal-live`, `minimal-dock`, `stress`, `school-day`.
@@ -65,7 +65,7 @@ Canonical Fake pool: **idea01 + idea03 + idea04** (never idea02). Live `--hosts`
 |---|---|
 | Fake Markov smoke | `--scenario random --iterations 40 --fast` |
 | Fake cover-all walk (strict) | `--scenario cover-all --fast` |
-| Fake cover-hardpass (live --ui demo) | `--scenario cover-hardpass --fast` |
+| Fake cover-registered-intents / registered-intents walk | `--scenario cover-registered-intents --fast` (alias `cover-hardpass`) |
 | Fake multi-hour proof | `--scenario random --iterations 2000 --seed 42 --fast` |
 | Live reboot / dock | `--live --fast --hosts idea01=…,idea03=…,idea04=…` (same YAML) |
 | **Live UI (preferred; Console@`cdcfdb1`)** | `--live --ui --start-instances --hosts idea01=…,idea03=…,idea04=… --console-url http://idea01:8080` |
@@ -77,10 +77,10 @@ Canonical Fake pool: **idea01 + idea03 + idea04** (never idea02). Live `--hosts`
 ```bash
 pnpm test:duration                          # Markov random/unified, 40 steps (Fake + Stub UI + probes)
 pnpm test:duration -- --scenario cover-all --fast
-pnpm test:duration -- --scenario cover-hardpass --fast
+pnpm test:duration -- --scenario cover-registered-intents --fast
 pnpm test:duration -- --scenario random --iterations 2000 --seed 42 --fast
 # Dry-run --record-walk wiring (stub steps → record_walk_skip, 0 frames, no video):
-pnpm test:duration -- --scenario cover-hardpass --fast --record-walk /tmp/dur-rec
+pnpm test:duration -- --scenario cover-registered-intents --fast --record-walk /tmp/dur-rec
 ```
 
 Unit tests (fakes, part of automated suite):
@@ -102,7 +102,7 @@ Requires Tailscale reachability + SSH key `~/.ssh/id_ed25519` as `pi@<host>`.
 
 ```bash
 # Preferred: real UI walks once Pixel+Atlas ready
-pnpm test:duration -- --live --ui --scenario cover-hardpass --fast \
+pnpm test:duration -- --live --ui --scenario cover-registered-intents --fast \
   --hosts idea01=…,idea03=…,idea04=… --console-url http://idea01:8080
 pnpm test:duration -- --live --ui --scenario cover-all --fast \
   --hosts idea01=100.99.231.94,idea03=100.126.117.80,idea04=<ip> \

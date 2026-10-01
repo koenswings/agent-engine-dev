@@ -27,6 +27,8 @@ import {
     loadWalk,
     makeRng,
     resolveScenarioName,
+    resolveWalkName,
+    WALK_ALIASES,
 } from '../duration/scenario.js'
 import { runDeterministicWalk } from '../duration/runner.js'
 import type { Scenario, SemanticStoreView } from '../duration/types.js'
@@ -127,15 +129,21 @@ describe('duration scenario YAML loader', () => {
         }
     })
 
-    it('resolves random→unified; cover-all is a walk not a Markov alias', () => {
+    it('resolves random→unified; cover-all / cover-registered-intents walks; cover-hardpass alias', () => {
         expect(resolveScenarioName('random')).toBe('unified')
         expect(resolveScenarioName('')).toBe('unified')
         expect(resolveScenarioName('unified')).toBe('unified')
         expect(isWalkScenario('cover-all')).toBe(true)
+        expect(isWalkScenario('cover-registered-intents')).toBe(true)
+        expect(isWalkScenario('cover-hardpass')).toBe(true) // brief alias
+        expect(resolveWalkName('cover-hardpass')).toBe('cover-registered-intents')
+        expect(WALK_ALIASES['cover-hardpass']).toBe('cover-registered-intents')
         expect(isWalkScenario('random')).toBe(false)
         expect(isWalkScenario('unified')).toBe(false)
         expect(isWalkScenario('school-day')).toBe(false)
         const walk = loadWalk('cover-all')
+        expect(loadWalk('cover-hardpass').name).toBe('cover-registered-intents')
+        expect(loadWalk('cover-registered-intents').name).toBe('cover-registered-intents')
         expect(walk.kind).toBe('walk')
         expect(walk.graph).toBe('unified')
         expect(walk.steps.length).toBeGreaterThan(50)

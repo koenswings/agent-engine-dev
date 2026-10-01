@@ -1,4 +1,4 @@
-# Deterministic cover-hardpass walk — NOT a Markov graph.
+# Deterministic cover-registered-intents walk ("registered-intents walk") — NOT a Markov graph.
 # Loads states/invariants/fixtures/pool from scenarios/unified.yaml.
 # Covers the current Pixel-registered demo subset (58 actions; registry 65 @ Console#134 cdcfdb1)
 # plus Engine infra FleetOps (dock/undock/move/reboot via RealFleetOps).
@@ -16,7 +16,7 @@
 # DURATION_COPY_TARGET_DISK / DURATION_COPY_INSTANCE_ID (default kolibri→nextcloud).
 # Wait for Atlas :8080 @b63e1ec GO before live --ui --record-walk.
 kind: walk
-name: cover-hardpass
+name: cover-registered-intents
 graph: unified
 steps:
   - from: start

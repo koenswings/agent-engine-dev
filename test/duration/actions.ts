@@ -280,7 +280,7 @@ const infraRebootEngine = async (ctx: ActionContext): Promise<ActionResult> => {
  */
 const returnToStart = async (ctx: ActionContext): Promise<ActionResult> => {
     // Default hygiene: undock when leaving infra_docked. Path A (`--start-instances`
-    // → preserveDockedOnReturn) keeps fixtures so cover-hardpass can dock-before-inventory
+    // → preserveDockedOnReturn) keeps fixtures so cover-registered-intents can dock-before-inventory
     // then open_disk_inventory on Kid testids without remapping to demo disks.
     if (ctx.walker.dockedEngine && !ctx.opts.preserveDockedOnReturn) {
         const engines = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
