@@ -172,6 +172,14 @@ export const defaultIdsForIntent = (action: string): { diskId?: string; instance
             instanceId: DURATION_UI_FIXTURES.nextcloud.instanceId,
         }
     }
+    // Prefer A r27: late install / start_after_install target empty-disk install uuid —
+    // do NOT pass kolibri-grade5a-001 (Path A start_instance keeps grade5a below).
+    if (action === 'install_app' || action === 'start_after_install') {
+        return {
+            diskId: DURATION_UI_FIXTURES.empty.diskId,
+            // omit instanceId → Pixel discovers newly installed non-grade5a start-*
+        }
+    }
     if (
         action.includes('kolibri') ||
         action === 'open_video' ||

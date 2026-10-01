@@ -299,6 +299,8 @@ steps:
   - from: op_instance
     to: op_disk
     action: back_to_disk
+  # Prefer A r27 FAIL@86: start_after_install must target NEW empty-002 install uuid
+  # (Pixel discover non-grade5a), not kolibri-grade5a-001. install_app waits settle.
   - from: op_disk
     to: op_install
     action: install_app
