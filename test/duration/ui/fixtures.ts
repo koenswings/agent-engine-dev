@@ -32,6 +32,12 @@ export const DURATION_UI_FIXTURES = {
         instanceId: 'nextcloud-grade5a-001',
         packPath: 'tests/duration-tests/fixtures/nextcloud',
     },
+    empty: {
+        diskId: 'duration-empty-001',
+        packPath: 'tests/duration-tests/fixtures/empty',
+        /** Pixel EmptyDiskPanel: DURATION_EMPTY_DISK_ID / data-role=empty */
+        preferredDevice: 'idea-test-3',
+    },
 } as const
 
 /** Pixel Console Intent names registered in agent-console-dev#134 e2e/intents (65 @ ba0cfa1). */

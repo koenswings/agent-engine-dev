@@ -95,8 +95,10 @@ const runWalkWithSteps = async (
         || fixtures.length === 0
     if (primaryIsInfra && !fixtureDisks.includes(fixtureDisk)) fixtureDisks.unshift(fixtureDisk)
     const fixtureInstances: Record<string, string> = {}
-    for (const f of fixtures) fixtureInstances[f.diskId] = f.instanceId
-    if (!fixtureInstances[fixtureDisk]) fixtureInstances[fixtureDisk] = fixtureInstance
+    for (const f of fixtures) {
+        if (f.instanceId) fixtureInstances[f.diskId] = f.instanceId
+    }
+    if (fixtureInstance && !fixtureInstances[fixtureDisk]) fixtureInstances[fixtureDisk] = fixtureInstance
 
     await fullOpts.ops.applyStoreMode(scenario.store_mode ?? fullOpts.ops.getStoreMode())
 

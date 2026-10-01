@@ -19,6 +19,10 @@ fixtures:
     diskId: duration-nextcloud-grade5a-001
     instanceId: nextcloud-grade5a-001
     infra_disk: true
+  empty:
+    path: tests/duration-tests/fixtures/empty
+    diskId: duration-empty-001
+    infra_disk: true
   # kiwix: deferred (Kid pack when wiki_browse goes live)
 
 states:

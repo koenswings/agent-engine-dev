@@ -34,7 +34,8 @@ export interface FixtureRef {
     /** Path in agent-app-dev (documentation / future pack load). */
     path?: string
     diskId: string
-    instanceId: string
+    /** Omit for empty-disk packs (no app instance). */
+    instanceId?: string
     /** When true, eligible for infra_dock_fixture / move / undock. */
     infra_disk?: boolean
 }

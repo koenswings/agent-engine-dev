@@ -10,11 +10,13 @@
 # Path A `--start-instances` preserves dock across return_to_start.
 # cover-all = strict full graph (failLoud on Pixel-missing under --ui).
 #
-# Pixel Prefer A (Console#134 @b63e1ec): copy_app/move_app multi-disk landed — keep these
-# steps in the walk. Live preload: demoMode=false (PlaywrightUiDriver); both duration
-# disks docked (kolibri + nextcloud); optional DURATION_COPY_SOURCE_DISK /
-# DURATION_COPY_TARGET_DISK / DURATION_COPY_INSTANCE_ID (default kolibri→nextcloud).
-# Wait for Atlas :8080 @b63e1ec GO before live --ui --record-walk.
+# Pixel Prefer A (Console#134 @b63e1ec + EmptyDiskPanel @db21bf4): copy_app/move_app
+# multi-disk + EmptyDiskPanel Intents. Live preload: demoMode=false; three Path A
+# disks docked (kolibri + nextcloud + duration-empty-001 on idea-test-1/2/3);
+# export DURATION_EMPTY_DISK_ID=duration-empty-001 (Pixel selects data-role=empty).
+# Optional DURATION_COPY_SOURCE_DISK / DURATION_COPY_TARGET_DISK /
+# DURATION_COPY_INSTANCE_ID (default kolibri→nextcloud).
+# Wait for Atlas :8080 @db21bf4 GO + empty docked before live --ui --record-walk.
 kind: walk
 name: cover-registered-intents
 graph: unified

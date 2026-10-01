@@ -50,6 +50,12 @@ const FORBIDDEN_WATCH_DIRS = ['/dev/engine', '/dev/engine/']
 const DISK_ID_TO_PACK: Record<string, string> = {
     'duration-kolibri-grade5a-001': 'kolibri',
     'duration-nextcloud-grade5a-001': 'nextcloud',
+    'duration-empty-001': 'empty',
+}
+
+/** Prefer Atlas dock slot when allocating (empty → idea-test-3). */
+const DISK_ID_PREFERRED_DEVICE: Record<string, string> = {
+    'duration-empty-001': 'idea-test-3',
 }
 
 /** Known Path A instance ids (no duration- prefix on the container/instance). */
@@ -883,6 +889,12 @@ export class RealFleetOps implements FleetOps {
         const existing = map.get(diskId)
         if (existing) return existing
         const used = this.usedSet(engineId)
+        const preferred = DISK_ID_PREFERRED_DEVICE[diskId]
+        if (preferred && !used.has(preferred)) {
+            used.add(preferred)
+            map.set(diskId, preferred)
+            return preferred
+        }
         let n = 1
         while (used.has(`idea-test-${n}`)) n++
         if (n > 64) {
@@ -1059,10 +1071,14 @@ export class RealFleetOps implements FleetOps {
             }
         }
         if (!device) {
-            // Try idea-test-N slots until copy accepts (skip occupied/mismatched trees)
+            // Try idea-test-N slots until copy accepts (skip occupied/mismatched trees).
+            // Prefer Atlas slot for empty (idea-test-3) when free.
             let lastErr: unknown
-            for (let n = 1; n <= 8; n++) {
-                const candidate = `idea-test-${n}`
+            const preferred = DISK_ID_PREFERRED_DEVICE[diskId]
+            const slotOrder = preferred
+                ? [preferred, ...Array.from({ length: 8 }, (_, i) => `idea-test-${i + 1}`).filter(s => s !== preferred)]
+                : Array.from({ length: 8 }, (_, i) => `idea-test-${i + 1}`)
+            for (const candidate of slotOrder) {
                 if (this.usedSet(target).has(candidate) && this.deviceMap(target).get(diskId) !== candidate) {
                     continue
                 }

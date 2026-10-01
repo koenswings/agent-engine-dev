@@ -176,15 +176,15 @@ const parseFixtures = (raw: unknown, path: string): FixtureRef[] => {
         const v = val as Record<string, unknown>
         const diskId = typeof v.diskId === 'string' ? v.diskId : undefined
         const instanceId = typeof v.instanceId === 'string' ? v.instanceId : undefined
-        if (!diskId || !instanceId) {
-            throw new Error(`Scenario ${path}: fixtures.${name} requires diskId + instanceId`)
+        if (!diskId) {
+            throw new Error(`Scenario ${path}: fixtures.${name} requires diskId`)
         }
         assertSafeFixtureDisk(diskId)
         out.push({
             name,
             path: typeof v.path === 'string' ? v.path : undefined,
             diskId,
-            instanceId,
+            ...(instanceId ? { instanceId } : {}),
             infra_disk: v.infra_disk !== false,
         })
     }

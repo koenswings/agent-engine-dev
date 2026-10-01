@@ -197,7 +197,9 @@ const main = async () => {
     const seed = args.seed ?? scenario.seed
     const pool = scenario.pool_engines ?? [...DEFAULT_POOL]
     const fixtureInstances: Record<string, string> = {}
-    for (const f of scenario.fixtures ?? []) fixtureInstances[f.diskId] = f.instanceId
+    for (const f of scenario.fixtures ?? []) {
+        if (f.instanceId) fixtureInstances[f.diskId] = f.instanceId
+    }
 
     if (args.live && pool.includes('idea02')) {
         console.error('Refusing --live with idea02 in pool_engines (golden)')

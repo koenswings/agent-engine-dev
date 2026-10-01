@@ -80,20 +80,21 @@ CLI `--start-instances` → `RealFleetOps({ startInstances: true })` (keep `inst
 
 Path A re-dock after eject: RealFleetOps does `rm -f` sentinel, `sleep 5`, then `touch` (Atlas — chokidar needs unlink before create, not mtime-only touch; Atlas Ops proof: 5s before touch). `dockFixture` waits up to **120s** for store dock, and on first timeout re-fires the sentinel once then waits again before failing.
 
-Path A `infra_dock_fixture` re-dock (findDockedEngine miss / no walker dock): prefer non-excluded `poolEngines[0]` (Console host / idea01) — not RNG; also dock sibling `fixtureDisks` on the same engine.
+Path A `infra_dock_fixture` re-dock (findDockedEngine miss / no walker dock): prefer non-excluded `poolEngines[0]` (Console host / idea01) — not RNG; also dock sibling `fixtureDisks` (nextcloud + empty) on the same engine. Empty pack prefers `IDEA_DISKS_ROOT/.../idea-test-3`.
 
 Path A / `infra_reboot_engine --fast`: `rebootEngine` stops `kolibri-grade5a` / `nextcloud-grade5a` / `duration-*` containers (never `idea166-*`) before `pm2 restart`, then `reconcileDurationZombies` after `waitReady` so Automerge Running+Undocked fixtures do not trip `no_zombie_instances`.
 
 
-## Multi-disk copy_app / move_app preload (Pixel Prefer A @b63e1ec)
+## Multi-disk Prefer A preload (Pixel @b63e1ec + EmptyDiskPanel @db21bf4)
 
-Live `--ui` hardpass needs Console#134 **@b63e1ec+** (real HTML5 drag + Copy/Move modal). Preload:
+Live `--ui` Prefer A needs Console#134 **@db21bf4+** (Copy/Move + EmptyDiskPanel `DURATION_EMPTY_DISK_ID` / `data-role=empty`). Preload:
 
 1. **demoMode=false** — `PlaywrightUiDriver` initScript (already); production web ignores sticky demo.
-2. **Both duration disks docked** — `duration-kolibri-grade5a-001` + `duration-nextcloud-grade5a-001` (Path A `--start-instances` keeps instances/).
-3. **Optional env** — `DURATION_COPY_SOURCE_DISK`, `DURATION_COPY_TARGET_DISK`, `DURATION_COPY_INSTANCE_ID` (Pixel defaults: kolibri → nextcloud). Sidecars: `DURATION_KOLIBRI_URL` / `DURATION_NEXTCLOUD_URL` as needed.
+2. **Three Path A disks docked on Console host (pool[0]/idea01)** — `duration-kolibri-grade5a-001` + `duration-nextcloud-grade5a-001` + `duration-empty-001` (Kid App#10 @`6167046` pack `tests/duration-tests/fixtures/empty/`). Prefer slots **idea-test-1 / idea-test-2 / idea-test-3** under `IDEA_DISKS_ROOT` (empty → **idea-test-3** when free). Path A `--start-instances` keeps instances/ on app disks.
+3. **Live env** — `DURATION_EMPTY_DISK_ID=duration-empty-001` so EmptyDiskPanel Intents (`install_app` / `make_files_*` / `make_backup_*` / erase-on-empty) select the empty disk — do **not** remap onto Kolibri Grade5A. Optional: `DURATION_COPY_SOURCE_DISK`, `DURATION_COPY_TARGET_DISK`, `DURATION_COPY_INSTANCE_ID` (default kolibri → nextcloud). Fixture source: `DURATION_FIXTURE_SOURCE_ROOT` (default Kid packs on Pi workspace).
+4. **cover-registered-intents** includes EmptyDiskPanel walk steps; erase targets empty via Pixel selection (do not erase Grade5A app disks).
 
-Do **not** live-run until Atlas confirms idea01 `:8080` serves Console @`b63e1ec`.
+Do **not** live-run until Atlas confirms idea01 `:8080` serves Console @`db21bf4` **and** `duration-empty-001` is docked.
 
 ## Live Console / Kid App-open
 
@@ -110,6 +111,7 @@ Deprecated CLI aliases (`minimal-*`, `stress`, `school-day`) load **`unified.yam
 |---|---|---|
 | `infra_dock_fixture` (primary) | `duration-kolibri-grade5a-001` | `kolibri-grade5a-001` |
 | nextcloud pack | `duration-nextcloud-grade5a-001` | `nextcloud-grade5a-001` |
+| empty pack (EmptyDiskPanel) | `duration-empty-001` | — (no instance; slot idea-test-3) |
 
 Content pins (stable): `open_video` contentId `e60662de-b15c-52f9-b003-359f7d91f8fd` / nodeId `4a1a1b92-3f6d-59eb-a94c-3f91f0011dd5`; `open_exercise` contentId `7eb9de46-96eb-53d0-bcc1-2fb270b96f03` / nodeId `94a47ec7-f30d-5cd1-93f8-ad08c42b6c2a`. Auth Morango IDs are re-provision mutable.
 
