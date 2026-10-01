@@ -727,7 +727,7 @@ export class RealFleetOps implements FleetOps {
     }
 
 
-    /** SSH: does IDEA_DISKS_ROOT/idea-test-N/META.yaml exist for this disk's preferred slot? */
+    /** SSH: idea-test-N whose META.yaml diskId matches (not merely META present). */
     private async hasHealthyFixtureTree(engineId: string, diskId: string): Promise<string | null> {
         const map = this.deviceMap(engineId)
         const preferred = map.get(diskId)
@@ -738,8 +738,12 @@ export class RealFleetOps implements FleetOps {
         for (const device of candidates) {
             if (!/^idea-test-[0-9]+$/.test(device)) continue
             const meta = `${this.disksRoot}/${device}/META.yaml`
+            // Quote diskId for grep -F; refuse mismatched packs (e.g. nextcloud slot for kolibri).
             try {
-                await this.ssh(host, `test -f '${meta}'`)
+                await this.ssh(
+                    host,
+                    `test -f '${meta}' && grep -Fq 'diskId: ${diskId}' '${meta}'`,
+                )
                 map.set(diskId, device)
                 this.usedSet(engineId).add(device)
                 return device
@@ -806,8 +810,9 @@ export class RealFleetOps implements FleetOps {
         const remote = [
             'set -euo pipefail',
             `mkdir -p '${this.disksRoot}' '${this.watchDir}'`,
-            // Reuse any existing dest (META may be gone after partial rm; instances/ often docker-owned)
-            `if test -d '${dest}'; then echo "RealFleetOps: reuse existing Path A tree at ${dest}"; touch '${sentinel}'; exit 0; fi`,
+            // Reuse only when META.yaml diskId matches (never steal nextcloud slot for kolibri)
+            `if test -f '${dest}/META.yaml' && grep -Fq 'diskId: ${diskId}' '${dest}/META.yaml'; then echo "RealFleetOps: reuse existing Path A tree at ${dest}"; touch '${sentinel}'; exit 0; fi`,
+            `if test -d '${dest}'; then echo "RealFleetOps: refuse overwrite occupied ${dest} (no matching META for ${diskId})" >&2; exit 4; fi`,
             `test -d '${src}' || { echo "missing fixture source ${src}" >&2; exit 2; }`,
             `rm -rf '${dest}'`,
             `mkdir -p '${dest}'`,
@@ -928,8 +933,37 @@ export class RealFleetOps implements FleetOps {
                 }
             }
         }
-        if (!device) device = this.allocateTestDevice(target, diskId)
-        await this.sshDockCopy(target, diskId, device)
+        if (!device) {
+            // Try idea-test-N slots until copy accepts (skip occupied/mismatched trees)
+            let lastErr: unknown
+            for (let n = 1; n <= 8; n++) {
+                const candidate = `idea-test-${n}`
+                if (this.usedSet(target).has(candidate) && this.deviceMap(target).get(diskId) !== candidate) {
+                    continue
+                }
+                this.usedSet(target).add(candidate)
+                this.deviceMap(target).set(diskId, candidate)
+                try {
+                    await this.sshDockCopy(target, diskId, candidate)
+                    device = candidate
+                    lastErr = null
+                    break
+                } catch (e) {
+                    lastErr = e
+                    this.deviceMap(target).delete(diskId)
+                    this.usedSet(target).delete(candidate)
+                    const msg = e instanceof Error ? e.message : String(e)
+                    if (!/refuse overwrite occupied|exit code: 4/.test(msg)) throw e
+                }
+            }
+            if (!device) {
+                throw lastErr instanceof Error
+                    ? lastErr
+                    : new Error(`RealFleetOps: no free idea-test-N for ${diskId} on ${target}`)
+            }
+        } else {
+            await this.sshDockCopy(target, diskId, device)
+        }
         await this.waitDiskDocked(target, diskId, 60_000)
     }
 
