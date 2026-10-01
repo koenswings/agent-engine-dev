@@ -812,7 +812,7 @@ export class RealFleetOps implements FleetOps {
             `mkdir -p '${this.disksRoot}' '${this.watchDir}'`,
             // Reuse only when META.yaml diskId matches (never steal nextcloud slot for kolibri)
             // Atlas: chokidar needs unlink+create after eject, not mtime-only touch.
-            `if test -f '${dest}/META.yaml' && grep -Fq 'diskId: ${diskId}' '${dest}/META.yaml'; then echo "RealFleetOps: reuse existing Path A tree at ${dest}"; rm -f '${sentinel}'; sleep 1; touch '${sentinel}'; exit 0; fi`,
+            `if test -f '${dest}/META.yaml' && grep -Fq 'diskId: ${diskId}' '${dest}/META.yaml'; then echo "RealFleetOps: reuse existing Path A tree at ${dest}"; rm -f '${sentinel}'; sleep 5; touch '${sentinel}'; exit 0; fi`,
             `if test -d '${dest}'; then echo "RealFleetOps: refuse overwrite occupied ${dest} (no matching META for ${diskId})" >&2; exit 4; fi`,
             `test -d '${src}' || { echo "missing fixture source ${src}" >&2; exit 2; }`,
             `rm -rf '${dest}'`,
@@ -821,7 +821,7 @@ export class RealFleetOps implements FleetOps {
             stripInstances,
             `test -f '${dest}/META.yaml' || { echo "META.yaml missing after copy into ${dest}" >&2; exit 3; }`,
             // Atlas: chokidar needs unlink+create after eject, not mtime-only touch.
-            `rm -f '${sentinel}'; sleep 1; touch '${sentinel}'`,
+            `rm -f '${sentinel}'; sleep 5; touch '${sentinel}'`,
         ].join('; ')
         console.log(
             `[RealFleetOps] dock copy ${diskId} → ${engineId}:${dest} ` +
