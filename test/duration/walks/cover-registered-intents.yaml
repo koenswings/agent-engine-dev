@@ -23,6 +23,9 @@
 # discover; no DURATION_EMPTY_DISK_ID_2). r24/r26 FAIL@85: erase undocked empty-002.
 # Engine tip: after confirm_erase, redockEmpty002AfterErase fresh-docks empty-002
 # (EMPTY stays 001). Path A should still prefer erase republish Empty.
+# Prefer A r35 FAIL@90: start_after_install fills empty-002 with kolibri → second
+# late install_app / later erase need EmptyDiskPanel again. Engine tip: after
+# open_copied_instance, redockEmpty002BeforeSecondInstall fresh-docks empty-002.
 # Optional DURATION_COPY_SOURCE_DISK / DURATION_COPY_TARGET_DISK /
 # DURATION_COPY_INSTANCE_ID (default kolibri→nextcloud).
 # Wait for Atlas :8080 GO + Path A re-dock layout (kolibri/:18080, empties) before
@@ -321,6 +324,9 @@ steps:
   - from: op_instance
     to: op_disk
     action: back_to_disk
+  # Prefer A r35 FAIL@90: after open_copied, Engine redockEmpty002BeforeSecondInstall
+  # fresh-docks empty-002 Empty (start_after_install left it as kolibri app disk;
+  # empty-001 is backup). Second late install_app + later erase need EmptyDiskPanel.
   - from: op_disk
     to: op_install
     action: install_app

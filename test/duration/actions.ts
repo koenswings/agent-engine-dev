@@ -265,27 +265,28 @@ export const waitEmpty002PostInstallRunning = async (
 }
 
 /**
- * Prefer A r26/r27 live safety net: Path A confirm_erase of empty-002 undocks
- * idea-test-4 mid-walk (disk ABSENT / META-only sparse) so late install_app has
- * empty-badge rows=0. Re-dock Kid pack empty-002/ fresh onto Console host
- * pool[0] (or walker.dockedEngine). Does NOT change DURATION_EMPTY_DISK_ID (=001);
- * Pixel ensureEmptyDiskPanel already discovers any empty-badge row.
+ * Shared Prefer A empty-002 fresh re-dock (Kid pack always rm+cp via dockFixture).
  * Force undock-then-dock so RealFleetOps empty always-fresh-copy runs (dockFixture
- * no-ops when already on the same engine). Path A should still prefer erase
- * republish Empty — this is the Engine mid-walk mitigation.
+ * no-ops when already on the same engine). Does NOT change DURATION_EMPTY_DISK_ID
+ * (=001); Pixel ensureEmptyDiskPanel discovers any empty-badge row. Never idea02.
+ * FakeFleetOps: undock pool-wide + synthetic dockFixture (CRI stays green).
  */
-export const redockEmpty002AfterErase = async (ctx: ActionContext): Promise<string> => {
+const redockEmpty002Fresh = async (
+    ctx: ActionContext,
+    label: string,
+    noteSuffix: string,
+): Promise<string> => {
     const diskId = DURATION_UI_FIXTURES.empty2.diskId
     const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
     if (pool.length === 0) {
-        throw new Error('redockEmpty002AfterErase: no pool engines available')
+        throw new Error(`${label}: no pool engines available`)
     }
     // Prefer existing dock holder, else Console host pool[0] (Path A empty dock pattern).
     const engine =
         (ctx.walker.dockedEngine && !ctx.excludeEngines.includes(ctx.walker.dockedEngine)
             ? ctx.walker.dockedEngine
             : null) ?? pool[0]!
-    assertNotGolden(ctx, engine, 'redockEmpty002AfterErase')
+    assertNotGolden(ctx, engine, label)
 
     const opsAny = ctx.opts.ops as FleetOps & {
         findDockedEngine?: (id: string) => Promise<string | null>
@@ -301,8 +302,33 @@ export const redockEmpty002AfterErase = async (ctx: ActionContext): Promise<stri
     }
     await ctx.opts.ops.dockFixture(engine, diskId)
     await settleParticipants(ctx, pool)
-    return `re-docked ${diskId} on ${engine} after confirm_erase (Empty fresh pack)`
+    return `re-docked ${diskId} on ${engine} ${noteSuffix}`
 }
+
+/**
+ * Prefer A r26/r27 live safety net: Path A confirm_erase of empty-002 undocks
+ * idea-test-4 mid-walk (disk ABSENT / META-only sparse) so late install_app has
+ * empty-badge rows=0. Re-dock Kid pack empty-002/ fresh onto Console host
+ * pool[0] (or walker.dockedEngine). Path A should still prefer erase republish
+ * Empty — this is the Engine mid-walk mitigation.
+ */
+export const redockEmpty002AfterErase = async (ctx: ActionContext): Promise<string> =>
+    redockEmpty002Fresh(ctx, 'redockEmpty002AfterErase', 'after confirm_erase (Empty fresh pack)')
+
+/**
+ * Prefer A r35 live safety net: late install_app@85 + start_after_install@86 fills
+ * duration-empty-002 with kolibri (app disk). copy_app@87 / open_copied@88 /
+ * back_to_disk@89 then second install_app@90 needs EmptyDiskPanel again (empty-001
+ * is backup). Mirror AfterErase: force undock + fresh Kid empty-002 pack before
+ * the second late install (hooked after open_copied_instance). Later erase_disk
+ * also needs EmptyDiskPanel.
+ */
+export const redockEmpty002BeforeSecondInstall = async (ctx: ActionContext): Promise<string> =>
+    redockEmpty002Fresh(
+        ctx,
+        'redockEmpty002BeforeSecondInstall',
+        'before second late install_app (Empty fresh pack)',
+    )
 
 const infraUndockFixtures = async (ctx: ActionContext): Promise<ActionResult> => {
     const engines = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
@@ -665,6 +691,21 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             return {
                 ok: false,
                 message: `confirm_erase ok but empty-002 re-dock failed: ${err}`,
+                layer,
+            }
+        }
+    }
+    // Prefer A r35: after open_copied_instance, re-dock empty-002 Empty before second
+    // late install_app (start_after_install left empty-002 as app disk; empty-001 is backup).
+    if (result.ok && ctx.action === 'open_copied_instance') {
+        try {
+            const note = await redockEmpty002BeforeSecondInstall(ctx)
+            message = `${message}; ${note}`
+        } catch (e) {
+            const err = e instanceof Error ? e.message : String(e)
+            return {
+                ok: false,
+                message: `open_copied_instance ok but empty-002 re-dock failed: ${err}`,
                 layer,
             }
         }
