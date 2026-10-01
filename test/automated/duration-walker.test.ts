@@ -86,12 +86,16 @@ describe('duration scenario YAML loader', () => {
         expect(two.pool_engines).toEqual(['idea01', 'idea03'])
         expect(two.pool_engines).not.toContain('idea04')
         expect(two.store_mode).toBe('unique')
-        expect(two.states.kolibri_watching).toBeTruthy()
-        expect(two.states.kolibri_exercise).toBeTruthy()
-        // No deferred lesson / wikipedia Intents
+        expect(two.states.console_learner).toBeTruthy()
+        expect(two.states.op_overview).toBeTruthy()
+        expect(two.states.kolibri_watching).toBeUndefined()
+        expect(two.states.nc_browse).toBeUndefined()
+        // No deferred lesson / wikipedia / App-open Intents
         for (const def of Object.values(two.states)) {
             for (const t of def.transitions) {
-                expect(t.action).not.toMatch(/keep_watching|next_resource|exit_lesson|open_wikipedia/)
+                expect(t.action).not.toMatch(
+                    /keep_watching|next_resource|exit_lesson|open_wikipedia|open_kolibri|open_nextcloud|open_video|open_exercise/,
+                )
             }
         }
         expect(loadScenario('stress').states.infra_reboot).toBeTruthy()
