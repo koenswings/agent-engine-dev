@@ -96,11 +96,17 @@ const evalGoldenUntouched: Evaluator = (_spec, ctx, views) => {
 const evalDiskDocked: Evaluator = (spec, ctx, views) => {
     const diskId = String(spec.disk ?? ctx.fixtureDisk)
     const engineWant = spec.engine
+    // Unique-store mode: each engine has its own diskDB. After undock+redock on a
+    // different host, the previous host often still has a residual record with
+    // dockedTo=null. Skip missing/null entries and succeed if ANY view shows the
+    // disk docked as required (do not fail on the first residual null).
+    let seenResidualUndocked = false
     for (const view of views) {
         const disk = view.diskDB[diskId]
         if (!disk) continue
         if (disk.dockedTo === null) {
-            return { type: 'disk_docked', ok: false, detail: `${diskId} not docked on ${view.engineId}` }
+            seenResidualUndocked = true
+            continue
         }
         if (engineWant === 'any_pool') {
             if (!ctx.poolEngines.includes(disk.dockedTo) || ctx.excludeEngines.includes(disk.dockedTo)) {
@@ -113,13 +119,13 @@ const evalDiskDocked: Evaluator = (spec, ctx, views) => {
             return { type: 'disk_docked', ok: true, detail: `docked to pool ${disk.dockedTo}` }
         }
         if (typeof engineWant === 'string' && disk.dockedTo !== engineWant) {
-            return {
-                type: 'disk_docked',
-                ok: false,
-                detail: `${diskId} dockedTo ${disk.dockedTo}, expected ${engineWant}`,
-            }
+            // Wrong host in this view — keep scanning; another unique store may be correct.
+            continue
         }
-        return { type: 'disk_docked', ok: true }
+        return { type: 'disk_docked', ok: true, detail: `docked to ${disk.dockedTo}` }
+    }
+    if (seenResidualUndocked) {
+        return { type: 'disk_docked', ok: false, detail: `${diskId} not docked (only undocked residual records)` }
     }
     return { type: 'disk_docked', ok: false, detail: `disk ${diskId} not found in any view` }
 }

@@ -175,6 +175,90 @@ describe('invariant registry', () => {
         expect(golden?.ok).toBe(false)
     })
 
+    it('disk_docked any_pool ignores unique-store residual undocked on other host', async () => {
+        // Live minimal-dock regression (idea#166): after move idea03→idea01 then
+        // return_to_start + re-dock on idea03, idea01 still has dockedTo=null.
+        const diskId = 'duration-kolibri-grade5a-001'
+        const engineDB = {
+            idea01: { id: 'idea01', hostname: 'idea01.local' },
+            idea03: { id: 'idea03', hostname: 'idea03.local' },
+        }
+        const views: Record<string, SemanticStoreView> = {
+            idea01: {
+                engineId: 'idea01',
+                instanceDB: {},
+                diskDB: {
+                    [diskId]: { id: diskId, name: diskId, dockedTo: null, device: null },
+                },
+                engineDB,
+            },
+            idea03: {
+                engineId: 'idea03',
+                instanceDB: {},
+                diskDB: {
+                    [diskId]: {
+                        id: diskId,
+                        name: diskId,
+                        dockedTo: 'idea03',
+                        device: 'idea-test-1',
+                    },
+                },
+                engineDB,
+            },
+        }
+        const ops = {
+            getStoreMode: () => 'unique' as const,
+            readStore: async (id: string) => structuredClone(views[id]!),
+            waitReady: async () => ({ wsUp: true, storeSynced: true }),
+        }
+        const results = await evaluateInvariants(
+            [{ type: 'disk_docked', disk: diskId, engine: 'any_pool' }],
+            {
+                ops: ops as never,
+                walker: { current: 'infra_docked', layer: 'infra', dockedEngine: 'idea03', step: 6 },
+                excludeEngines: ['idea02'],
+                poolEngines: ['idea01', 'idea03'],
+                fixtureDisk: diskId,
+                engines: ['idea01', 'idea03'],
+            },
+        )
+        expect(results[0]?.ok).toBe(true)
+        expect(results[0]?.detail).toMatch(/idea03/)
+    })
+
+    it('disk_docked fails when every unique-store view is undocked residual', async () => {
+        const diskId = 'duration-kolibri-grade5a-001'
+        const engineDB = {
+            idea01: { id: 'idea01' },
+            idea03: { id: 'idea03' },
+        }
+        const undocked: SemanticStoreView = {
+            engineId: 'idea01',
+            instanceDB: {},
+            diskDB: { [diskId]: { id: diskId, dockedTo: null, device: null } },
+            engineDB,
+        }
+        const ops = {
+            getStoreMode: () => 'unique' as const,
+            readStore: async (id: string) =>
+                structuredClone({ ...undocked, engineId: id }),
+            waitReady: async () => ({ wsUp: true, storeSynced: true }),
+        }
+        const results = await evaluateInvariants(
+            [{ type: 'disk_docked', disk: diskId, engine: 'any_pool' }],
+            {
+                ops: ops as never,
+                walker: { current: 'infra_docked', layer: 'infra', dockedEngine: 'idea03', step: 1 },
+                excludeEngines: ['idea02'],
+                poolEngines: ['idea01', 'idea03'],
+                fixtureDisk: diskId,
+                engines: ['idea01', 'idea03'],
+            },
+        )
+        expect(results[0]?.ok).toBe(false)
+        expect(results[0]?.detail).toMatch(/not docked/)
+    })
+
     it('no_zombie_instances catches Running on undocked disk', async () => {
         const ops = fakeOps({
             poolEngines: ['idea01', 'idea03'],
