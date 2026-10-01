@@ -2,7 +2,7 @@
 
 **Status:** Proposed — unified source of truth (absorbs classroom usage + operator Console + infra/fleet execution)  
 **Authors:** Axle (infra/runner foundation); Steve (Lead Bot) (usage + operator Markov); unified 2026-09-30 per Koen + Steve agreement  
-**Revision:** 2026-09-30i — Koen feedback: drop initial scenario lists; per-state Return black circles; YAML for all layers; Implementation chapter; top-level Composite walks / How a walk becomes a test; UI Interactions hierarchy  
+**Revision:** 2026-10-01a — Koen course correction: one canonical Markov YAML only; stress/minimal/2-engine = CLI run modes; Implementation + proposal revisions aligned  
 **Audience:** Koen / IDEA leads  
 **Companion capacity issue:** [idea#159](https://github.com/koenswings/idea/issues/159) — measure safe concurrent Kolibri video streams per instance  
 **Backups (SUPERSEDED, content retained):** [`duration-tests-infra-backup.md`](./duration-tests-infra-backup.md), [`multi-engine-classroom.md`](./multi-engine-classroom.md), [`multi-engine-operator.md`](./multi-engine-operator.md)
@@ -984,12 +984,13 @@ Follow-up implementation conclusions for the **unified** walker. Assessed: **yes
 
 
 ```
-pnpm test:duration [--scenario school-day] [--iterations 200] [--fast]
+pnpm test:duration [--scenario unified] [--iterations 200] [--fast]
 ```
 
-- `--scenario`: loads `scenarios/<name>.yaml`
+- `--scenario`: loads the **one** canonical graph (`scenarios/unified.yaml`; `school-day` may alias/load it until deleted)
 - `--iterations`: transition count (default from YAML duration × avg dwell)
 - `--fast`: `pm2 restart` instead of reboot; compresses dwell to seconds
+- Hosts / store / weight presets (stress, CI minimal, 2-engine live) are **CLI run modes** on that same YAML — not peer scenario files
 
 Runner steps: parse YAML → connect to participating engines (`localStoreHandle` + WS, same idea as cross-engine tests) → walk Markov chain (usage UI / operator UI / infra actions) → structured log → on failure dump state + store snapshots + failing invariant.
 
@@ -1010,19 +1011,21 @@ test/
     convergence.ts      ← waitForConvergence + store equality checks
     invariants.ts       ← invariant type registry + evaluation
     scenarios/
-      school-day.yaml   ← default (may mix layer entries from start)
-      stress.yaml       ← high-churn infra
-      minimal.yaml      ← 2-engine / CI gate (non-golden)
+      unified.yaml      ← sole Markov graph (full school-day; all layers from start)
+    README.md           ← CLI run-mode / preset flags (not alternate graphs)
 ```
 
-### Scenarios to ship
+Stress / minimal / 2-engine are **not** shipped as peer YAMLs. Document them as flags in the duration README (see Run modes below).
+
+### Run modes (CLI)
 
 
-| Scenario | Description | Focus | Duration |
+| Mode | How to invoke (same `unified.yaml`) | Focus | Duration |
 |---|---|---|---|
-| `school-day` | Typical day; usage + operator + infra from start hub | 3 layers | 8h simulated |
-| `stress` | High reboot / disk-swap rate (pool only) | Infra | 2h simulated |
-| `minimal` | 2 pool engines, small state space, CI gate | Infra (+ optional smoke usage) | 10 min |
+| Full school-day (canonical) | `--scenario unified` (multi-hour / high `--iterations`; optional `--seed`) | 3 layers | 8h simulated — multi-hour random walk is the proof |
+| Stress | `--preset stress` or infra-biased weights + higher `--iterations` | Infra | ~2h simulated |
+| CI minimal | `--scenario unified --iterations 40 --fast` (+ optional `--layer infra` if added) | Infra (+ optional smoke usage) | ~10 min |
+| 2-engine live UI | `--live --ui --hosts idea01=…,idea03=… --store-mode unique` | Same graph; hosts/store knobs | as configured |
 
 ### Implementation phases
 
@@ -1030,9 +1033,9 @@ test/
 **Phase 1:** Runner + YAML loader + infra dock/undock/restart (pool-only) + convergence check + Return to start  
 **Phase 2:** Invariant registry + structured logs + shared-store / unique-doc mode switch  
 **Phase 3:** Wire usage + operator UI Interactions (Playwright) into the same walker  
-**Phase 4:** Stability monitoring + stress + CI `minimal`
+**Phase 4:** Stability monitoring + stress-as-preset + CI minimal **run mode** on FakeFleetOps
 
-**Generalisation note:** Phase 1–2 can ship infra-only YAML subsets; Phase 3 adds usage + operator states into the **same** schema without a second runner. Do not maintain parallel walkers per layer.
+**Generalisation note:** Phase 1–2 may exercise infra-heavy **CLI run modes** on the one YAML; Phase 3 adds usage + operator Intent dispatch into the **same** schema without a second runner. Do not maintain parallel walkers or alternate Markov graphs per layer/mode.
 
 ---
 
@@ -1559,8 +1562,8 @@ Authenticated operator Console UI click sequences. Intent-style names only. Prel
 
 1. **Implementation phase renumber (Steve/Koen greenlight vs original §):**
    - Original: Phase 3 = stability monitoring + multiple scenario files; Phase 4 = stress + CI `minimal`.
-   - **Active interpretation (idea#168):** Phase 3 = Playwright UI Intent dispatch from the ONE YAML walker (`test/duration/ui/` → Pixel `e2e/intents`); Phase 4 = dwell stability probes + `stress.yaml` + CI `minimal` on FakeFleetOps.
-   - Multiple scenario files and `stress.yaml` already shipped in Phase 1–2; Phase 4 therefore focuses on **probes + CI green**, not inventing a second scenario tree.
+   - **Active interpretation (idea#168 + Koen 2026-10-01):** Phase 3 = Playwright UI Intent dispatch from the ONE YAML walker (`test/duration/ui/` → Pixel `e2e/intents`); Phase 4 = dwell stability probes + **stress-as-preset** + CI **minimal run mode** on FakeFleetOps.
+   - Success is **one** canonical graph exercised via CLI run modes — **not** “multiple scenario files already shipped.” Phase 4 focuses on **probes + CI green** on that one graph.
 
 2. **YAML transition shape:** early examples in this doc omit `action:` keys. Design Review locked `{ to, weight, action }` for **all** layers — treat example YAML without `action` as superseded.
 
@@ -1568,13 +1571,14 @@ Authenticated operator Console UI click sequences. Intent-style names only. Prel
 
 4. **Stability probe §7:** keep as Phase 4 dwell behaviour (30s interval, fail after 3 consecutive). `--fast` compresses dwell so CI still exercises ≥1 probe per gap without wall-clock 30s.
 
-5. **File layout:** add `test/duration/ui/` (Playwright/Stub drivers), `test/duration/stability.ts`, and Intent contract `ACTIONS.md`. No second runner.
+5. **File layout:** add `test/duration/ui/` (Playwright/Stub drivers), `test/duration/stability.ts`, and Intent contract `ACTIONS.md`. Sole Markov file: `scenarios/unified.yaml`. No second runner; no peer alternate graphs.
 
 6. **Intent rename (Pixel#134 @9502201):** `add_files` → `add_files_role`. Engine YAML/ACTIONS must use `add_files_role`. Engine UI driver calls `runDurationIntent` / `hasDurationIntent` from `idea-console/duration-intents` (sibling path fallback) — do not re-implement Console selectors.
 7. **Live Console URL for duration `--ui` / Playwright:** use the Engine-served Console on port **8080** (for example, `http://idea01:8080`), not port 80. Fleet Pis serve Console on :8080; docs/CLI examples using `:80` or bare `http://idea01` without a port are superseded.
 
-8. **2-engine UI scenario (`school-day-2engine`):** full `school-day` lists `pool_engines: [idea01, idea03, idea04]`, `store_mode: shared`, and deferred lesson Intents (`keep_watching` / `exit_lesson` / …). That combination is **not** suitable for current 2-host live `--ui` claims (no idea04; live stores unique; Pixel deferred chrome). Prefer `test/duration/scenarios/school-day-2engine.yaml` (idea01+idea03, unique store). Does not remove `school-day`; supersedes the assumption that school-day needs idea04 for 2-host claims.
-9. **`school-day-2engine` App-open trim (idea#168 live FAIL @5e253d3):** live `--ui` timed out on `open_nextcloud_as_learner` waiting `[data-testid="instance-nextcloud-grade5a-001"]` because the pool had no Running Kid fixture instances. `infra_dock_fixture` / RealFleetOps dock defaults to **dock-only** (strips `instances/`; no auto-start). Console App-open Intents (`open_kolibri_*` / `open_nextcloud_*` / `open_video` / `open_exercise`) require a visible Running instance card + Open button. Therefore overnight `school-day-2engine` is trimmed to **hub/console/operator Intents only** (`open_console_as_*`, `stay_on_*`, `return_to_start`, `open_disk_inventory` + light infra). App-open edges move to a later scenario once fixtures are Running (`startInstances` + images, or provisioned). FakeFleetOps stub path unchanged.
+8. **2-engine live UI caveats (not a second graph):** current 2-host live `--ui` claims need idea01+idea03, `store_mode: unique`, and no idea04 — express via **CLI** (`--hosts`, `--store-mode unique`) on the same `unified.yaml`. Do **not** ship `school-day-2engine.yaml` (or any peer YAML) as an alternate Markov graph. Unique-store / host-pool facts remain live run caveats only.
+9. **App-open / Running-fixture live caveat (idea#168 FAIL @5e253d3):** live `--ui` timed out on `open_nextcloud_as_learner` waiting `[data-testid="instance-nextcloud-grade5a-001"]` because the pool had no Running Kid fixture instances. `infra_dock_fixture` / RealFleetOps dock defaults to **dock-only** (strips `instances/`; no auto-start). Console App-open Intents (`open_kolibri_*` / `open_nextcloud_*` / `open_video` / `open_exercise`) require a visible Running instance card + Open button. Until fixtures are Running (`startInstances` + images, or provisioned), live runs may skip or gate App-open edges — still on the **one** unified graph, not a trimmed alternate YAML. FakeFleetOps stub path unchanged.
+10. **Koen 2026-10-01 course correction — one graph only:** ship **one** canonical Markov YAML (`unified.yaml` / full school-day). Stress, minimal, and 2-engine are **CLI run modes / presets**, not alternate scenario files. The proof is a **multi-hour random walk** on that single graph. Scenario files must not encode alternate Markov graphs.
 
 ## Sources consulted
 
