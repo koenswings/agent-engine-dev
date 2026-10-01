@@ -1,11 +1,12 @@
 #!/usr/bin/env npx tsx
 /**
- * pnpm test:duration [--scenario random|unified|cover-all] [--iterations N] [--fast] [--live] [--ui]
+ * pnpm test:duration [--scenario random|unified|cover-all|cover-hardpass] [--iterations N] [--fast] [--live] [--ui]
  *
  * Preferred verification (once Pixel+Atlas ready): `--live --ui` for real Console walks.
  * Default Fake: FakeFleetOps + StubUiDriver (CI / missing-Intent only) + Markov on unified.yaml.
  * --scenario random|unified|default → Markov simulation on scenarios/unified.yaml
- * --scenario cover-all → deterministic walk (walks/cover-all.yaml), not a second graph
+ * --scenario cover-all → deterministic full-graph walk (walks/cover-all.yaml)
+ * --scenario cover-hardpass → Pixel-registered + infra walk (walks/cover-hardpass.yaml); live --ui demo
  * Deprecated aliases (minimal, stress, school-day, …) resolve to unified — not separate graphs.
  * --live: RealFleetOps over Tailscale/SSH (requires --hosts or DURATION_FLEET_HOSTS).
  * --ui: PlaywrightUiDriver → Pixel e2e/intents (DURATION_CONSOLE_URL / idea01 :8080).
@@ -32,7 +33,8 @@ const usage = () => {
     console.log(`Usage: pnpm test:duration [options]
 
   --scenario <name>     Markov: random|unified (default) → scenarios/unified.yaml
-                        Walk:   cover-all → walks/cover-all.yaml (deterministic)
+                        Walk:   cover-all → walks/cover-all.yaml (strict full graph)
+                        Walk:   cover-hardpass → walks/cover-hardpass.yaml (Pixel-registered + infra; live --ui demo)
                         Deprecated aliases → unified: ${Object.keys(SCENARIO_ALIASES).join(', ')}
   --iterations <n>      Markov steps (default: 40). Walks default to steps.length.
   --fast                pm2 restart instead of reboot; shorter settle / dwell
@@ -51,8 +53,10 @@ const usage = () => {
   --help                this message
 
 Prefer real UI (Pixel Intents hardening; Fake Stub only for CI / missing Intents):
-  pnpm test:duration -- --live --ui --scenario cover-all --fast \\
+  pnpm test:duration -- --live --ui --scenario cover-hardpass --fast \\
     --hosts idea01=…,idea03=…,idea04=… --console-url http://idea01:8080
+  pnpm test:duration -- --live --ui --scenario cover-all --fast \\
+    --hosts idea01=…,idea03=…,idea04=… --console-url http://idea01:8080   # strict; failLoud on Pixel-missing
   pnpm test:duration -- --live --ui --scenario random --iterations 40 --seed 42 --fast \\
     --hosts idea01=…,idea03=…,idea04=… --record-walk /tmp/dur-walk
 
@@ -61,9 +65,10 @@ Fake Markov (CI / box, no fleet) — ONE canonical graph:
   pnpm test:duration -- --scenario random --iterations 2000 --seed 42 --fast
   pnpm test:duration -- --scenario unified --iterations 2000 --seed 42 --fast
 
-Fake deterministic cover-all walk (regression before long random soak):
-  pnpm test:duration -- --scenario cover-all --fast
-  pnpm test:duration -- --scenario cover-all --fast --record-walk /tmp/dur-rec   # dry-run flag (0 frames)
+Fake deterministic walks (regression before long random soak):
+  pnpm test:duration -- --scenario cover-all --fast          # strict full graph (90 actions)
+  pnpm test:duration -- --scenario cover-hardpass --fast     # Pixel-registered + infra (live --ui demo)
+  pnpm test:duration -- --scenario cover-hardpass --fast --record-walk /tmp/dur-rec   # dry-run flag (0 frames)
 
 Live (same unified graph; hosts/store are CLI knobs — not alternate YAMLs):
   pnpm test:duration -- --live --scenario unified --fast --iterations 30 \\
@@ -73,7 +78,7 @@ Env: DURATION_FLEET_HOSTS=idea01=…,idea03=…,idea04=…  (same format as --ho
 
 Never put idea02 in the pool. Live App-open later uses Kid sidecar
 post-dock-restore-running.sh → idea166-kolibri-live :18080 (see ACTIONS.md).
-Recording + cover-all / random with --ui --live is the intended verification path
+Recording + cover-hardpass (or cover-all) / random with --ui --live is the intended verification path
 once Pixel+Atlas are ready. See test/duration/README.md.
 `)
 }
