@@ -2,46 +2,92 @@
 /**
  * pnpm test:duration [--scenario minimal] [--iterations 50] [--fast] [--live]
  *
- * Default: FakeFleetOps (no Pis). Pass --live later when fleet + real FleetOps exist.
+ * Default: FakeFleetOps (no Pis).
+ * --live: RealFleetOps over Tailscale/SSH (requires --hosts or DURATION_FLEET_HOSTS).
  */
 
 import { FakeFleetOps } from './actions.js'
+import { RealFleetOps, parseHostsFlag } from './realFleetOps.js'
 import { runWalk } from './runner.js'
 import { loadScenario, makeRng } from './scenario.js'
 
 const usage = () => {
-    console.log(`Usage: pnpm test:duration [--scenario <name>] [--iterations <n>] [--fast] [--seed <n>]
+    console.log(`Usage: pnpm test:duration [options]
 
-  --scenario    scenarios/<name>.yaml (default: minimal)
-  --iterations  Markov steps (default: 40 for minimal, else 100)
-  --fast        pm2 restart instead of reboot; shorter settle
-  --seed        RNG seed (overrides YAML seed)
-  --help        this message
+  --scenario <name>     scenarios/<name>.yaml (default: minimal)
+  --iterations <n>      Markov steps (default: 40 for *minimal*, else 100)
+  --fast                pm2 restart instead of reboot; shorter settle
+  --seed <n>            RNG seed (overrides YAML seed)
+  --live                Use RealFleetOps against fleet Pis (default: FakeFleetOps)
+  --hosts <map>         Required with --live unless DURATION_FLEET_HOSTS is set.
+                        Format: idea01=100.99.231.94,idea03=100.126.117.80
+  --health-wrap-before <cmd>   Shell before reboot; {pis} → pool host IPs
+  --health-wrap-after <cmd>    Shell after waitReady post-reboot; {pis} ok
+  --help                this message
 
-Phase 1–2 runs against FakeFleetOps (no fleet required). Fleet prerequisites for
-a future --live path: see test/duration/README.md.
+Fake (CI / box, no fleet):
+  pnpm test:duration
+  pnpm test:duration -- --scenario minimal --iterations 15 --fast --seed 42
+
+Live overnight smoke (dock-free; unique stores; --fast pm2 restart):
+  pnpm test:duration -- --live --scenario minimal-live --fast --iterations 30 \\
+    --hosts idea01=100.99.231.94,idea03=100.126.117.80
+
+Env: DURATION_FLEET_HOSTS=idea01=…,idea03=…  (same format as --hosts)
+
+Never put idea02 in the pool. Kid USB fixtures are not on the Pis — use
+minimal-live (no dock/move). See test/duration/README.md.
 `)
 }
 
-const parseArgs = (argv: string[]) => {
+interface ParsedArgs {
+    help: boolean
+    scenario: string
+    iterations?: number
+    fast: boolean
+    seed?: number
+    live: boolean
+    hostsRaw?: string
+    healthWrapBefore?: string
+    healthWrapAfter?: string
+}
+
+const parseArgs = (argv: string[]): ParsedArgs => {
     let scenario = 'minimal'
     let iterations: number | undefined
     let fast = false
     let seed: number | undefined
+    let live = false
+    let hostsRaw: string | undefined
+    let healthWrapBefore: string | undefined
+    let healthWrapAfter: string | undefined
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]!
-        if (a === '--') continue // pnpm forwards a bare --
-        if (a === '--help' || a === '-h') return { help: true as const }
+        if (a === '--') continue
+        if (a === '--help' || a === '-h') return {
+            help: true, scenario, fast, live,
+        }
         if (a === '--scenario') scenario = argv[++i] ?? scenario
         else if (a === '--iterations') iterations = Number(argv[++i])
         else if (a === '--fast') fast = true
         else if (a === '--seed') seed = Number(argv[++i])
+        else if (a === '--live') live = true
+        else if (a === '--hosts') hostsRaw = argv[++i]
+        else if (a === '--health-wrap-before') healthWrapBefore = argv[++i]
+        else if (a === '--health-wrap-after') healthWrapAfter = argv[++i]
+        else if (a === '--engine-urls') {
+            console.error('Unknown flag: --engine-urls (use --hosts name=ip,…)')
+            return { help: true, scenario, fast, live }
+        }
         else if (a.startsWith('-')) {
             console.error(`Unknown flag: ${a}`)
-            return { help: true as const }
+            return { help: true, scenario, fast, live }
         }
     }
-    return { help: false as const, scenario, iterations, fast, seed }
+    return {
+        help: false, scenario, iterations, fast, seed, live,
+        hostsRaw, healthWrapBefore, healthWrapAfter,
+    }
 }
 
 const main = async () => {
@@ -58,13 +104,52 @@ const main = async () => {
     const pool = scenario.pool_engines ?? ['idea01', 'idea03']
     const fixtureInstances: Record<string, string> = {}
     for (const f of scenario.fixtures ?? []) fixtureInstances[f.diskId] = f.instanceId
-    const ops = new FakeFleetOps({
-        poolEngines: pool,
-        excludeEngines: scenario.exclude_engines,
-        storeMode: scenario.store_mode,
-        settleDelayMs: 0,
-        fixtureInstances,
-    })
+
+    if (args.live && pool.includes('idea02')) {
+        console.error('Refusing --live with idea02 in pool_engines (golden)')
+        process.exit(2)
+    }
+
+    let ops: FakeFleetOps | RealFleetOps
+    let hosts: Record<string, string> | undefined
+
+    if (args.live) {
+        const hostsSource = args.hostsRaw ?? process.env.DURATION_FLEET_HOSTS
+        if (!hostsSource) {
+            console.error(
+                '--live requires --hosts idea01=IP,idea03=IP (or DURATION_FLEET_HOSTS env)',
+            )
+            process.exit(2)
+        }
+        hosts = parseHostsFlag(hostsSource)
+        for (const id of pool) {
+            if (!hosts[id]) {
+                console.error(`--live: missing host for pool engine '${id}' in --hosts`)
+                process.exit(2)
+            }
+        }
+        if (hosts['idea02'] && pool.includes('idea02')) {
+            console.error('Refusing --live with idea02 in pool')
+            process.exit(2)
+        }
+        ops = new RealFleetOps({
+            poolEngines: pool,
+            excludeEngines: scenario.exclude_engines,
+            hosts,
+            storeMode: scenario.store_mode ?? 'unique',
+            fixtureInstances,
+            healthWrapBefore: args.healthWrapBefore,
+            healthWrapAfter: args.healthWrapAfter,
+        })
+    } else {
+        ops = new FakeFleetOps({
+            poolEngines: pool,
+            excludeEngines: scenario.exclude_engines,
+            storeMode: scenario.store_mode,
+            settleDelayMs: 0,
+            fixtureInstances,
+        })
+    }
 
     console.log(JSON.stringify({
         event: 'duration_start',
@@ -76,6 +161,8 @@ const main = async () => {
         pool,
         exclude_engines: scenario.exclude_engines,
         fixture_disk: scenario.fixture_disk,
+        live: args.live,
+        hosts: hosts ?? null,
     }))
 
     const result = await runWalk({
@@ -84,12 +171,18 @@ const main = async () => {
         fast: args.fast,
         ops,
         stubUi: true,
-        settleTimeoutMs: args.fast ? 1000 : 3000,
+        settleTimeoutMs: args.live
+            ? (args.fast ? 60_000 : 180_000)
+            : (args.fast ? 1000 : 3000),
         rng: seed !== undefined ? makeRng(seed) : undefined,
         onLog: (e) => {
             console.log(JSON.stringify({ event: 'duration_step', ...e }))
         },
     })
+
+    if (ops instanceof RealFleetOps) {
+        await ops.close().catch(() => {})
+    }
 
     console.log(JSON.stringify({
         event: 'duration_done',
@@ -98,6 +191,7 @@ const main = async () => {
         finalState: result.finalState,
         aborted: result.aborted,
         abortReason: result.abortReason ?? null,
+        live: args.live,
     }))
 
     process.exit(result.failures > 0 || result.aborted ? 1 : 0)

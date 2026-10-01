@@ -13,19 +13,21 @@ Parent: [idea#166](https://github.com/koenswings/idea/issues/166).
 
 Paths live under `agent-app-dev/tests/duration-tests/fixtures/`. Scenario YAML `fixtures:` maps these IDs; do not invent others. See Kid `walker-ref.yaml`.
 
+**Physical Kid USB fixtures are not on the fleet Pis.** Live overnight smoke must use `minimal-live` (dock-free). Never eject/erase the idea03 Intenso Files Disk.
+
 Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/pull/167); Pixel Console [agent-console-dev#134](https://github.com/koenswings/agent-console-dev/pull/134).
 
 ## Phase 1–2 (this tree)
 
 - YAML loader + Markov walker + action dispatcher
-- Infra dock / undock / move / reboot via `FleetOps` (fake by default)
+- Infra dock / undock / move / reboot via `FleetOps` (**FakeFleetOps** default; **RealFleetOps** with `--live`)
 - Settle gate (`waitForConvergence` + WS ready)
 - Semantic invariants (instanceDB / diskDB / engineDB fields — not Automerge blobs)
 - Return-to-start hygiene (undock when leaving `infra_docked`)
 - Shared-store (`shared` + mDNS-on) vs unique-doc (`unique` + mDNS-off) mode switch
 - Structured JSON logs on `pnpm test:duration`
 
-**Not yet:** Playwright UI Interactions (Phase 3), stability probe (Phase 4), live fleet `FleetOps`.
+**Not yet:** Playwright UI Interactions (Phase 3), stability probe (Phase 4), physical dock/move on live fleet (needs Kid USB + Ops shared store).
 
 ## Run (no Pis — FakeFleetOps)
 
@@ -46,15 +48,35 @@ pnpm build:test && IDEA_SYSTEM_DISK_SKIP=true IDEA_TEST_MODE=true \
 
 Or via the normal suite: `pnpm test:unit` / `pnpm test:full` (includes `duration-walker.test.ts`).
 
-## Fleet prerequisites (future --live)
+## Run live (RealFleetOps / `--live`)
 
-- Claim **pool** Pis only (`idea01` / `idea03` / `idea04`). **Never golden idea02.**
-- `exclude_engines: [idea02]` always.
-- Multi-Engine: shared store + mDNS on. Single-Pi: unique store + mDNS off.
-- Prefer Engine eject/dock commands over physical USB.
-- Fixture disks must **never** be the idea03 hw-roundtrip stick
-  (USB serial `26A1EE83197F` / vfat `3E50-902A` / disk serial `3813430-532011020`).
-- Atlas Tailscale / claim hooks when available; health PAUSED around intentional reboots.
+Requires Tailscale reachability + SSH key `~/.ssh/id_ed25519` as `pi@<host>`.
+
+**Host map flag is `--hosts`** (not `--engine-urls`). Same format via env `DURATION_FLEET_HOSTS`.
+
+```bash
+# Dock-free overnight smoke (unique stores; --fast = pm2 restart)
+pnpm test:duration -- --live --scenario minimal-live --fast --iterations 30 \
+  --hosts idea01=100.99.231.94,idea03=100.126.117.80
+
+# Optional health wraps around reboot (Atlas PAUSED); {pis} → pool IPs
+pnpm test:duration -- --live --scenario minimal-live --fast \
+  --hosts idea01=100.99.231.94,idea03=100.126.117.80 \
+  --health-wrap-before 'echo pause {pis}' \
+  --health-wrap-after 'echo resume {pis}'
+```
+
+`duration_start` JSON includes `live:true` and the resolved `hosts` map.
+
+### Live caveats
+
+- Claim **pool** Pis only (`idea01` / `idea03`). **Never golden idea02.**
+- Tonight’s Pis use **unique** stores + `mdns:false`. `applyStoreMode('shared')` throws until Ops provisions shared store+mDNS.
+- `dockFixture` / `moveDisk` throw until Kid fixture USBs are present — do **not** soft-fake docks into the live CRDT.
+- Fixture disks must **never** be the idea03 hw-roundtrip Intenso
+  (USB serial `26A1EE83197F` / disk serial `3813430-532011020` /
+  UUID `a0bf8374-274e-4bef-b32e-cfbfd09d2884` / label `IDEA Disk`).
+- Ask Atlas for health-wrap before intentional reboot churn.
 
 ## Intent keys
 

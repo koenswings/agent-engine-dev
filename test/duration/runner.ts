@@ -45,8 +45,11 @@ export const runWalk = async (opts: DurationOptions): Promise<WalkerResult> => {
         ?? 'duration-kolibri-grade5a-001'
     const fixtureInstance = fixtures.find(f => f.diskId === fixtureDisk)?.instanceId
         ?? 'kolibri-grade5a-001'
-    const fixtureDisks = (fixtures.filter(f => f.infra_disk !== false).map(f => f.diskId))
-    if (!fixtureDisks.includes(fixtureDisk)) fixtureDisks.unshift(fixtureDisk)
+    const fixtureDisks = fixtures.filter(f => f.infra_disk !== false).map(f => f.diskId)
+    // Only force-include primary when it is itself infra-eligible (minimal-live uses infra_disk:false).
+    const primaryIsInfra = fixtures.some(f => f.diskId === fixtureDisk && f.infra_disk !== false)
+        || fixtures.length === 0
+    if (primaryIsInfra && !fixtureDisks.includes(fixtureDisk)) fixtureDisks.unshift(fixtureDisk)
     const fixtureInstances: Record<string, string> = {}
     for (const f of fixtures) fixtureInstances[f.diskId] = f.instanceId
     if (!fixtureInstances[fixtureDisk]) fixtureInstances[fixtureDisk] = fixtureInstance

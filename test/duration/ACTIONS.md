@@ -45,3 +45,10 @@ Phase 3: `test/duration/ui/` Playwright adapters keyed by the same names.
 | `infra_dock_fixture` / undock / move (also) | `duration-nextcloud-grade5a-001` | `nextcloud-grade5a-001` |
 
 `infra_undock_fixtures` undocks **all** infra-eligible fixture disks. Kiwix omitted Phase 1–2.
+
+## Live fleet (`--live` / RealFleetOps)
+
+- Default remains FakeFleetOps. Pass `--live` + `--hosts idea01=IP,idea03=IP`.
+- Scenario `minimal-live`: dock-free (`infra_reboot_engine` + hub stubs only).
+- `infra_dock_fixture` / `infra_move_disk` require physical Kid USB fixtures — not on Pis yet.
+- Never target idea02. Never eject the idea03 Intenso Files Disk.

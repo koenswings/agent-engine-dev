@@ -9,6 +9,11 @@ import { semanticStoresEqual, waitForConvergence } from '../duration/convergence
 import { evaluateInvariants, DEFAULT_INFRA_INVARIANTS, listInvariantTypes } from '../duration/invariants.js'
 import { runWalk } from '../duration/runner.js'
 import {
+    looksLikeProtectedHwDisk,
+    parseHostsFlag,
+    RealFleetOps,
+} from '../duration/realFleetOps.js'
+import {
     assertSafeFixtureDisk,
     DEFAULT_FIXTURE_DISK,
     loadScenario,
@@ -323,5 +328,93 @@ describe('Markov walker (FakeFleetOps)', () => {
             },
         })
         expect(collected).toHaveLength(5)
+    })
+})
+
+
+describe('RealFleetOps guard clauses (no network)', () => {
+    const fakeHosts = { idea01: '127.0.0.1', idea03: '127.0.0.2' }
+
+    it('parseHostsFlag parses name=host pairs', () => {
+        expect(parseHostsFlag('idea01=100.99.231.94,idea03=100.126.117.80')).toEqual({
+            idea01: '100.99.231.94',
+            idea03: '100.126.117.80',
+        })
+        expect(() => parseHostsFlag('idea01')).toThrow(/Invalid/)
+    })
+
+    it('refuses golden reboot and shared store mode without contacting Pis', async () => {
+        const ops = new RealFleetOps({
+            poolEngines: ['idea01', 'idea03'],
+            excludeEngines: ['idea02'],
+            hosts: fakeHosts,
+            storeMode: 'unique',
+        })
+        await expect(ops.rebootEngine('idea02', true)).rejects.toThrow(/excluded|golden/)
+        await expect(ops.applyStoreMode('shared')).rejects.toThrow(/Ops must provision|shared/)
+        expect(ops.getStoreMode()).toBe('unique')
+        await ops.applyStoreMode('unique') // no-op
+        expect(ops.getStoreMode()).toBe('unique')
+    })
+
+    it('dockFixture / moveDisk throw clear fixture Errors', async () => {
+        const ops = new RealFleetOps({
+            poolEngines: ['idea01', 'idea03'],
+            excludeEngines: ['idea02'],
+            hosts: fakeHosts,
+        })
+        await expect(ops.dockFixture('idea01', 'duration-kolibri-grade5a-001'))
+            .rejects.toThrow(/physical Kid fixture|minimal-live/)
+        await expect(ops.moveDisk('idea01', 'idea03', 'duration-kolibri-grade5a-001'))
+            .rejects.toThrow(/physical Kid fixture|minimal-live/)
+    })
+
+    it('looksLikeProtectedHwDisk catches Intenso markers', () => {
+        expect(looksLikeProtectedHwDisk('a0bf8374-274e-4bef-b32e-cfbfd09d2884')).toBe(true)
+        expect(looksLikeProtectedHwDisk('x', { name: 'IDEA Disk' })).toBe(true)
+        expect(looksLikeProtectedHwDisk('stick-26A1EE83197F')).toBe(true)
+        expect(looksLikeProtectedHwDisk('duration-kolibri-grade5a-001')).toBe(false)
+    })
+
+    it('constructor refuses missing hosts / idea02 in pool', () => {
+        expect(() => new RealFleetOps({
+            poolEngines: ['idea01', 'idea02'],
+            hosts: { idea01: '1.1.1.1', idea02: '2.2.2.2' },
+        })).toThrow(/golden|excluded/)
+        expect(() => new RealFleetOps({
+            poolEngines: ['idea01'],
+            hosts: {},
+        })).toThrow(/missing host/)
+    })
+})
+
+describe('minimal-live scenario (FakeFleetOps)', () => {
+    it('loads dock-free unique scenario and walks without dock actions', async () => {
+        const scenario = loadScenario('minimal-live')
+        expect(scenario.store_mode).toBe('unique')
+        expect(scenario.exclude_engines).toContain('idea02')
+        expect(scenario.fixtures?.every(f => f.infra_disk === false)).toBe(true)
+        for (const def of Object.values(scenario.states)) {
+            for (const t of def.transitions) {
+                expect(t.action).not.toMatch(/infra_dock_fixture|infra_move_disk/)
+            }
+        }
+        const ops = fakeOps({
+            poolEngines: scenario.pool_engines!,
+            excludeEngines: scenario.exclude_engines,
+            storeMode: 'unique',
+        })
+        const result = await runWalk({
+            scenario,
+            iterations: 25,
+            fast: true,
+            ops,
+            stubUi: true,
+            settleTimeoutMs: 500,
+            rng: makeRng(scenario.seed ?? 7),
+        })
+        expect(result.aborted).toBe(false)
+        expect(result.failures).toBe(0)
+        expect(result.logs.some(l => l.action === 'infra_reboot_engine')).toBe(true)
     })
 })

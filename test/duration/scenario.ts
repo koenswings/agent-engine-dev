@@ -23,6 +23,7 @@ const FORBIDDEN_FIXTURE_MARKERS = [
     '3E50-902A',
     '3813430-532011020',
     '378383c9-0612-4c82-9c07-8c34d15253ba',
+    'a0bf8374-274e-4bef-b32e-cfbfd09d2884',
 ]
 
 export const scenariosDir = (): string => {
