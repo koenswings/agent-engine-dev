@@ -1,0 +1,549 @@
+# Canonical Markov graph — ONE scenario file (proposals/duration-tests.md).
+# Run modes (CI / live / stress) are CLI knobs only — not alternate YAMLs.
+# Alternate names (minimal, stress, school-day, …) resolve to this file as deprecated aliases.
+# Deterministic walks live under test/duration/walks/ (kind: walk) and reference this graph.
+name: Unified school day
+duration_minutes: 480
+seed: 42
+exclude_engines: [idea02]
+pool_engines: [idea01, idea03, idea04]
+store_mode: shared
+fixtures:
+  kolibri:
+    path: tests/duration-tests/fixtures/kolibri
+    diskId: duration-kolibri-grade5a-001
+    instanceId: kolibri-grade5a-001
+    infra_disk: true
+  nextcloud:
+    path: tests/duration-tests/fixtures/nextcloud
+    diskId: duration-nextcloud-grade5a-001
+    instanceId: nextcloud-grade5a-001
+    infra_disk: true
+  empty:
+    path: tests/duration-tests/fixtures/empty
+    diskId: duration-empty-001
+    infra_disk: true
+  # Prefer A r17: Kid App#10 pack empty-002/ (stays empty after make_backup on empty-001).
+  empty2:
+    path: tests/duration-tests/fixtures/empty-002
+    diskId: duration-empty-002
+    infra_disk: true
+  # kiwix: deferred (Kid pack when wiki_browse goes live)
+
+states:
+  start:
+    description: Neutral hub — sample layer entry
+    transitions:
+      - to: console_teacher
+        weight: 25
+        action: open_console_as_teacher
+      - to: console_learner
+        weight: 35
+        action: open_console_as_learner
+      - to: op_entry
+        weight: 25
+        action: open_console_as_operator
+      - to: infra_idle
+        weight: 15
+        action: enter_infra_fleet_walk
+
+  # ── Usage (11) ──────────────────────────────────────────────────────────
+  console_teacher:
+    layer: usage
+    transitions:
+      - to: kolibri_manage
+        weight: 20
+        action: open_kolibri_as_teacher
+      - to: nc_browse
+        weight: 20
+        action: open_nextcloud_as_teacher
+      - to: wiki_browse
+        weight: 10
+        action: open_wikipedia_as_teacher
+      - to: console_teacher
+        weight: 50
+        action: stay_on_teacher_overview
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  console_learner:
+    layer: usage
+    transitions:
+      - to: kolibri_home
+        weight: 40
+        action: open_kolibri_as_learner
+      - to: nc_browse
+        weight: 25
+        action: open_nextcloud_as_learner
+      - to: wiki_browse
+        weight: 20
+        action: open_wikipedia_as_learner
+      - to: console_learner
+        weight: 15
+        action: stay_on_learner_overview
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  kolibri_manage:
+    layer: usage
+    transitions:
+      - to: kolibri_manage
+        weight: 12
+        action: create_class
+      - to: kolibri_manage
+        weight: 12
+        action: enroll_learners
+      - to: kolibri_manage
+        weight: 14
+        action: build_lesson
+      - to: kolibri_manage
+        weight: 9
+        action: create_quiz
+      - to: kolibri_manage
+        weight: 8
+        action: read_reports
+      - to: kolibri_home
+        weight: 20
+        action: preview_as_learner
+      - to: console_teacher
+        weight: 25
+        action: back_to_console
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  kolibri_home:
+    layer: usage
+    transitions:
+      - to: kolibri_watching
+        weight: 45
+        action: open_video
+      - to: kolibri_exercise
+        weight: 25
+        action: open_exercise
+      - to: kolibri_home
+        weight: 20
+        action: browse_classes
+      - to: console_learner
+        weight: 10
+        action: leave_kolibri
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  kolibri_watching:
+    layer: usage
+    transitions:
+      - to: kolibri_watching
+        weight: 60
+        action: keep_watching
+      - to: kolibri_exercise
+        weight: 25
+        action: next_resource
+      - to: kolibri_home
+        weight: 15
+        action: exit_lesson
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  kolibri_exercise:
+    layer: usage
+    transitions:
+      - to: kolibri_home
+        weight: 70
+        action: finish_exercise
+      - to: kolibri_watching
+        weight: 30
+        action: next_video
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  nc_browse:
+    layer: usage
+    transitions:
+      - to: nc_share
+        weight: 18
+        action: share_to_class
+      - to: nc_drop
+        weight: 22
+        action: open_file_drop
+      - to: nc_collab
+        weight: 22
+        action: open_collab_doc
+      - to: nc_browse
+        weight: 15
+        action: browse_folders
+      - to: console_learner
+        weight: 13
+        action: leave_nextcloud_as_learner
+      - to: console_teacher
+        weight: 10
+        action: leave_nextcloud_as_teacher
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  nc_share:
+    layer: usage
+    transitions:
+      - to: nc_browse
+        weight: 80
+        action: done_sharing
+      - to: console_teacher
+        weight: 20
+        action: back_to_console_from_share
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  nc_drop:
+    layer: usage
+    transitions:
+      - to: nc_browse
+        weight: 85
+        action: after_upload
+      - to: console_learner
+        weight: 15
+        action: leave_file_drop
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  nc_collab:
+    layer: usage
+    transitions:
+      - to: nc_browse
+        weight: 70
+        action: close_doc
+      - to: nc_collab
+        weight: 30
+        action: keep_editing
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  wiki_browse:
+    layer: usage
+    transitions:
+      - to: wiki_browse
+        weight: 65
+        action: search_browse_wikipedia
+      - to: console_learner
+        weight: 20
+        action: leave_wikipedia_as_learner
+      - to: console_teacher
+        weight: 15
+        action: leave_wikipedia_as_teacher
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  # ── Operator (12) ───────────────────────────────────────────────────────
+  op_entry:
+    layer: operator
+    transitions:
+      - to: op_overview
+        weight: 85
+        action: sign_in
+      - to: op_entry
+        weight: 15
+        action: retry_login_first_time_setup
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  op_overview:
+    layer: operator
+    transitions:
+      - to: op_disk
+        weight: 28
+        action: open_disk_inventory
+      - to: op_instance
+        weight: 18
+        action: open_instance_controls
+      - to: op_eject
+        weight: 10
+        action: eject_disk
+      - to: op_account
+        weight: 6
+        action: open_account
+      - to: op_settings
+        weight: 6
+        action: open_settings
+      - to: op_overview
+        weight: 20
+        action: stay_on_overview
+      - to: op_overview
+        weight: 12
+        action: notice_usb_dock
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  op_disk:
+    layer: operator
+    transitions:
+      - to: op_install
+        weight: 18
+        action: install_app
+      - to: op_files
+        weight: 8
+        action: make_files_disk
+      - to: op_files
+        weight: 6
+        action: add_files_role
+      - to: op_backup
+        weight: 8
+        action: make_backup_disk
+      - to: op_backup
+        weight: 6
+        action: restore_from_backup
+      - to: op_instance
+        weight: 18
+        action: open_instance_controls
+      - to: op_copy_move
+        weight: 5
+        action: copy_app
+      - to: op_copy_move
+        weight: 5
+        action: move_app
+      - to: op_erase
+        weight: 8
+        action: erase_disk
+      - to: op_eject
+        weight: 8
+        action: eject_disk
+      - to: op_overview
+        weight: 10
+        action: back_to_overview
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  op_eject:
+    layer: operator
+    transitions:
+      - to: op_overview
+        weight: 70
+        action: confirm_eject
+      - to: op_overview
+        weight: 30
+        action: cancel_eject
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  op_instance:
+    layer: operator
+    transitions:
+      - to: op_instance
+        weight: 15
+        action: start_instance
+      - to: op_instance
+        weight: 12
+        action: stop_instance
+      - to: op_instance
+        weight: 10
+        action: open_app
+      - to: op_instance
+        weight: 8
+        action: backup_instance
+      - to: op_copy_move
+        weight: 10
+        action: copy_app
+      - to: op_copy_move
+        weight: 10
+        action: move_app
+      - to: op_disk
+        weight: 20
+        action: back_to_disk
+      - to: op_overview
+        weight: 15
+        action: back_to_overview
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  op_install:
+    layer: operator
+    transitions:
+      - to: op_instance
+        weight: 55
+        action: start_after_install
+      - to: op_disk
+        weight: 30
+        action: stay_on_disk
+      - to: op_overview
+        weight: 15
+        action: back_to_overview
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  op_copy_move:
+    layer: operator
+    transitions:
+      - to: op_overview
+        weight: 55
+        action: done_redistribute
+      - to: op_disk
+        weight: 30
+        action: stay_on_source_disk
+      - to: op_instance
+        weight: 15
+        action: open_copied_instance
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  op_files:
+    layer: operator
+    transitions:
+      - to: op_disk
+        weight: 80
+        action: files_role_added
+      - to: op_overview
+        weight: 20
+        action: back_to_overview
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  op_backup:
+    layer: operator
+    transitions:
+      - to: op_disk
+        weight: 75
+        action: backup_configured_restored
+      - to: op_overview
+        weight: 25
+        action: back_to_overview
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  op_erase:
+    layer: operator
+    transitions:
+      - to: op_disk
+        weight: 70
+        action: confirm_erase
+      - to: op_overview
+        weight: 30
+        action: cancel_erase
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  op_account:
+    layer: operator
+    transitions:
+      - to: op_account
+        weight: 20
+        action: add_operator
+      - to: op_account
+        weight: 15
+        action: remove_operator
+      - to: op_account
+        weight: 20
+        action: change_password
+      - to: op_overview
+        weight: 35
+        action: close_account
+      - to: op_entry
+        weight: 10
+        action: log_out
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  op_settings:
+    layer: operator
+    transitions:
+      - to: op_overview
+        weight: 50
+        action: close_settings
+      - to: op_settings
+        weight: 25
+        action: switch_engine
+      - to: op_settings
+        weight: 25
+        action: reboot_engine
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  # ── Infra (4) ───────────────────────────────────────────────────────────
+  infra_idle:
+    layer: infra
+    transitions:
+      - to: infra_docked
+        weight: 40
+        action: infra_dock_fixture
+      - to: infra_reboot
+        weight: 5
+        action: infra_reboot_engine
+      - to: infra_idle
+        weight: 50
+        action: infra_undock_fixtures
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  infra_docked:
+    layer: infra
+    transitions:
+      - to: infra_idle
+        weight: 20
+        action: infra_undock_fixtures
+      - to: infra_disk_moved
+        weight: 10
+        action: infra_move_disk
+      - to: infra_docked
+        weight: 60
+        action: infra_dock_fixture
+      - to: infra_reboot
+        weight: 5
+        action: infra_reboot_engine
+      - to: start
+        weight: 5
+        action: return_to_start
+    invariants:
+      - type: disk_docked
+        disk: duration-kolibri-grade5a-001
+        engine: any_pool
+
+  infra_disk_moved:
+    layer: infra
+    transitions:
+      - to: infra_docked
+        weight: 50
+        action: infra_dock_fixture
+      - to: infra_idle
+        weight: 25
+        action: infra_undock_fixtures
+      - to: infra_reboot
+        weight: 20
+        action: infra_reboot_engine
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  infra_reboot:
+    layer: infra
+    transitions:
+      - to: infra_idle
+        weight: 55
+        action: infra_undock_fixtures
+      - to: infra_docked
+        weight: 40
+        action: infra_dock_fixture
+      - to: start
+        weight: 5
+        action: return_to_start
+
+initial_state: start

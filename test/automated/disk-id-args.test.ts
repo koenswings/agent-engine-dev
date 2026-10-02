@@ -138,10 +138,10 @@ describe('installApp <appId> <targetDiskId> [--source <sourceDiskId>] (idea#128)
 
     const run = async (cmd: string) => { const log = newLog(); await handleCommand(commands, h, 'engine', cmd, log); return lastTrace(log) }
 
-    it('by id: source and target resolve by id (reaches the copy: app bundle missing on the source)', async () => {
+    it('by id: stale --source missing bundle does not hard-fail on source path (Prefer A r31)', async () => {
         const t = await run('installApp kolibri-1.0 tgt-id --source src-id --name my-kolibri')
-        expect(t.status).toBe('error')
-        expect(t.errorMessage).toContain(`App 'kolibri-1.0' not found on disk 'Catalog' at ${DISKS_ROOT}/${src}/apps/kolibri-1.0`)
+        // Must not be the old Route-1 hard-fail; falls through to GitHub / alt disk
+        expect(t.errorMessage ?? '').not.toMatch(/not found on disk 'Catalog' at .*\/apps\/kolibri-1\.0/)
         expect(warn).not.toHaveBeenCalled()
     })
     it('by id: installs from the source onto the chosen one of two same-named disks', async () => {
@@ -151,9 +151,23 @@ describe('installApp <appId> <targetDiskId> [--source <sourceDiskId>] (idea#128)
         expect(await fs.pathExists(`${DISKS_ROOT}/${twin}/apps/demo-1.0/compose.yaml`)).toBe(true)
         expect(await fs.pathExists(`${DISKS_ROOT}/${tgt}/apps/demo-1.0`)).toBe(false)
     })
+    it('stale --source: copies from another docked disk that still has the bundle (Prefer A r31)', async () => {
+        await fs.ensureDir(`${DISKS_ROOT}/${twin}/apps/demo-1.0`)
+        await fs.writeFile(`${DISKS_ROOT}/${twin}/apps/demo-1.0/compose.yaml`, 'x-app:\n  name: demo\n  version: "1.0"\n')
+        const prev = process.env.IDEA_INSTALL_FORCE_OFFLINE
+        process.env.IDEA_INSTALL_FORCE_OFFLINE = 'true'
+        try {
+            const t = await run('installApp demo-1.0 tgt-id --source src-id')
+            expect(t.status).toBe('ok')
+            expect(await fs.pathExists(`${DISKS_ROOT}/${tgt}/apps/demo-1.0/compose.yaml`)).toBe(true)
+        } finally {
+            if (prev === undefined) delete process.env.IDEA_INSTALL_FORCE_OFFLINE
+            else process.env.IDEA_INSTALL_FORCE_OFFLINE = prev
+        }
+    })
     it('by name: a unique source name resolves with a deprecation warning', async () => {
         const t = await run('installApp kolibri-1.0 tgt-id --source Catalog')
-        expect(t.errorMessage).toContain("not found on disk 'Catalog'")
+        expect(t.errorMessage ?? '').not.toMatch(/not found on disk 'Catalog' at .*\/apps\/kolibri-1\.0/)
         expect(warn).toHaveBeenCalledWith(expect.stringContaining("installApp --source: disk 'Catalog' was given by name"))
     })
     it('ambiguous target name: refused, trace error, nothing written', async () => {

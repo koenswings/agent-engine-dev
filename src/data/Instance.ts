@@ -515,6 +515,140 @@ export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, inst
   }
 }
 
+
+/**
+ * Host ports reserved for Engine / Console on host-network fleets.
+ * Prefer A r30: never allocate these to apps (Console serves :8080; :80 legacy/proxy).
+ * Live grade5a Kolibri uses :18080 by fixture — that is instance-owned, not reserved here.
+ */
+export const RESERVED_HOST_PORTS: ReadonlySet<number> = new Set([
+  80,
+  8080,
+])
+
+export const isReservedHostPort = (port: number): boolean => RESERVED_HOST_PORTS.has(port)
+
+/**
+ * Prefer A r30: app-kolibri tag 1.0 host-network compose does not wire `${port}` into
+ * KOLIBRI_HTTP_PORT / KOLIBRI_LISTEN_PORT (process defaults to 8080 → Console collision).
+ * Duration fixtures hardcode 18080. After Engine allocates a free port, keep compose listen
+ * env in sync so the container binds the same port Automerge / Console proxy use.
+ */
+export const syncKolibriHostListenPort = async (composePath: string, port: PortNumber): Promise<void> => {
+  if (!fs.existsSync(composePath)) return
+  const raw = await fs.readFile(composePath, 'utf8')
+  let compose: any
+  try {
+    compose = YAML.parse(raw)
+  } catch {
+    return
+  }
+  const services = compose?.services
+  if (!services || typeof services !== 'object') return
+
+  let changed = false
+  for (const name of Object.keys(services)) {
+    const svc = services[name]
+    if (!svc || typeof svc !== 'object') continue
+    if (svc.network_mode !== 'host') continue
+    const img = String(svc.image ?? '')
+    const isKolibri = name.includes('kolibri') || img.includes('kolibri')
+    if (!isKolibri) continue
+
+    const portStr = String(port)
+    const env = svc.environment
+    if (Array.isArray(env)) {
+      const next = [...env]
+      const setEnv = (key: string) => {
+        const idx = next.findIndex((e: unknown) => typeof e === 'string' && (e as string).startsWith(`${key}=`))
+        const line = `${key}=${portStr}`
+        if (idx >= 0) {
+          if (next[idx] !== line) { next[idx] = line; changed = true }
+        } else {
+          next.push(line)
+          changed = true
+        }
+      }
+      setEnv('KOLIBRI_HTTP_PORT')
+      setEnv('KOLIBRI_LISTEN_PORT')
+      svc.environment = next
+    } else if (env && typeof env === 'object') {
+      if (String(env.KOLIBRI_HTTP_PORT ?? '') !== portStr) { env.KOLIBRI_HTTP_PORT = portStr; changed = true }
+      if (String(env.KOLIBRI_LISTEN_PORT ?? '') !== portStr) { env.KOLIBRI_LISTEN_PORT = portStr; changed = true }
+      svc.environment = env
+    } else {
+      svc.environment = [
+        `KOLIBRI_HTTP_PORT=${portStr}`,
+        `KOLIBRI_LISTEN_PORT=${portStr}`,
+      ]
+      changed = true
+    }
+  }
+
+  if (changed) {
+    await fs.writeFile(composePath, YAML.stringify(compose))
+    log(`Synced KOLIBRI_HTTP_PORT/KOLIBRI_LISTEN_PORT=${port} in ${composePath}`)
+  }
+}
+
+/**
+ * Prefer A r30: `docker compose up -d` can succeed while a host-network process
+ * immediately Exits (e.g. "Port 8080 is occupied"). Probe shortly after up and
+ * throw so startInstance marks Error — never Automerge Running with docker missing.
+ */
+export const assertComposeContainersHealthy = async (instanceDir: string, instanceId: InstanceID): Promise<void> => {
+  void instanceDir
+  await sleep(2500)
+  let psOut = ''
+  try {
+    const format = '{{.Names}}\t{{.Status}}\t{{.ID}}'
+    const r = await $`docker ps -a --filter name=${instanceId} --format ${format}`
+    psOut = (r.stdout || '').trim()
+  } catch (e) {
+    log(`assertComposeContainersHealthy: docker ps failed for ${instanceId}: ${e instanceof Error ? e.message : String(e)}`)
+    return
+  }
+  if (!psOut) {
+    log(`assertComposeContainersHealthy: no containers matching ${instanceId}`)
+    return
+  }
+  const lines = psOut.split('\n').filter(Boolean)
+  const exited: { name: string; status: string; id: string }[] = []
+  for (const line of lines) {
+    const [name, status, id] = line.split('\t')
+    if (!name) continue
+    if (/Exited|Dead/i.test(status || '')) {
+      exited.push({ name, status: status || '', id: id || '' })
+    }
+  }
+  if (exited.length === 0) return
+
+  const parts: string[] = []
+  for (const c of exited) {
+    let logs = ''
+    try {
+      const lr = await $`docker logs --tail 60 ${c.name}`.quiet()
+      logs = `${lr.stdout || ''}${lr.stderr || ''}`.trim()
+    } catch {
+      try {
+        const lr = await $`docker logs --tail 60 ${c.id}`.quiet()
+        logs = `${lr.stdout || ''}${lr.stderr || ''}`.trim()
+      } catch { /* ignore */ }
+    }
+    const occupied = logs.match(/Port\s+\d+\s+is occupied\.?/i)
+    if (occupied) {
+      parts.push(`${c.name}: ${occupied[0]} (${c.status})`)
+    } else {
+      const tail = logs.split('\n').slice(-8).join(' | ')
+      parts.push(`${c.name}: ${c.status}${tail ? ` — ${tail}` : ''}`)
+    }
+  }
+  throw new Error(
+    `Container(s) exited after compose up for ${instanceId}. ` +
+    `Automerge must not stay Running. ${parts.join('; ')}`
+  )
+}
+
 export const createPortNumber = async (store: Store): Promise<PortNumber> => {
   let port = randomPort()
   let portInUse = true
@@ -522,8 +656,13 @@ export const createPortNumber = async (store: Store): Promise<PortNumber> => {
   const localEngine = getLocalEngine(store)
   const instances = getInstancesOfEngine(store, localEngine)
 
-  // Check if the port is already in use on the system
+  // Check if the port is already in use on the system / reserved for Console
   while (portInUse) {
+    if (isReservedHostPort(port)) {
+      log(`Port ${port} is reserved for Engine/Console. Generating a new one.`)
+      port = randomPort()
+      continue
+    }
     log(`Checking if port ${port} is in use`)
     try {
       portInUseResult = await $`netstat -tuln | grep -w ${port}`
@@ -697,46 +836,30 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     if (!(port == 0) && !isNaN(port)) {
       log(`Found a port number for instance ${instance.id} in the .env file: ${port}`)
 
-      // >>> KSW - UNTESTED
-      // Check if the port is already in use on the system
+      // Prefer A r30: if .env port is in use OR reserved (Console :8080), reallocate for
+      // every app — including kolibri. Old kolibri path waited 10s then threw
+      // "Port N is still in use" (copy ghost on :18080) or hardcoded fresh installs to 8080.
       const portInUse = await checkPortNumber(port)
-      if (portInUse) {
-        log(`Port ${port} is already in use. Generating a new port number.`)
-        // If the app is kolibri, it means that it has a fixed port and so either another kolibri instance is already running, ]
-        // or it is still running after being stopped because the disk was disconnected. 
-        // If the instance was still running after being stopped, lets wait for 10 secs and try again. If it is still running, we throw an error.
-        if (instance.instanceOf.startsWith('kolibri' as AppID)) {
-          log(`Instance ${instance.id} is a kolibri instance. Waiting 10 seconds to see if the port becomes free.`)
-          await sleep(10000)
-          const portStillInUse = await checkPortNumber(port)
-          if (portStillInUse) {
-            throw new Error(`Port ${port} is still in use after waiting. Cannot start kolibri instance ${instance.id}.`)
-          } else {
-            log(`Port ${port} is now free.`)
-          }
-        } else {
-          port = await createPortNumber(store)
-          // Write the new port number to the .env file
-          await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'port', port.toString())
-        }
+      const portReserved = isReservedHostPort(port)
+      if (portInUse || portReserved) {
+        log(`Port ${port} is ${portReserved ? 'reserved for Engine/Console' : 'already in use'}. Generating a new port number.`)
+        port = await createPortNumber(store)
+        await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'port', port.toString())
       } else {
         log(`Port ${port} is not in use`)
       }
-      // KSW UNTESTED <<<
 
     } else {
       log(`No port number has previously been generated.`)
-      // If the app is kolibri, assign it port 8080
-      if (instance.instanceOf.startsWith('kolibri' as AppID)) {
-        port = 8080 as PortNumber
-        log(`Instance ${instance.id} is a kolibri instance. Assigning it port ${port}.`)
-      } else {
-        log(`Generating a new port number for instance ${instance.id}.`)
-        port = await createPortNumber(store)
-      }
+      // Prefer A r30: never hardcode kolibri → 8080 (collides with host-net Console).
+      log(`Generating a new port number for instance ${instance.id}.`)
+      port = await createPortNumber(store)
       // Write a .env file in which you define the port variable
       await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'port', port.toString())
     }
+
+    // Host-network Kolibri must listen on the Engine-allocated port (tag 1.0 omit; fixtures hardcode 18080).
+    await syncKolibriHostListenPort(`${mountRoot}/instances/${instance.id}/compose.yaml`, port)
 
     print(`Found a port number for instance ${instance.id}: ${port}`)
     // Assign the port number to the instance object
@@ -1086,6 +1209,8 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
       ? { cwd: `${mountRoot}/instances/${instance.id}`, env: { ...process.env, ...composeEnv } }
       : { cwd: `${mountRoot}/instances/${instance.id}` }
     await $(upOpts)`docker compose up -d`
+    // Prefer A r30: fail loud if host-net process Exits immediately (port occupied, etc.)
+    await assertComposeContainersHealthy(`${mountRoot}/instances/${instance.id}`, instance.id)
     if (composeEnv) {
       // filesMounts only after success — read back from the override we just wrote
       const { mountableFilesDisks } = await import('./FilesMount.js')

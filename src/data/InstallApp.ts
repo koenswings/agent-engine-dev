@@ -6,9 +6,10 @@
  * Replaces the old `createInstance` (GitHub-only) command with a unified
  * `installApp` that routes to the right source automatically:
  *
- *   --source given          → local copy from docked disk (offline-capable)
+ *   --source given + bundle present → local copy from docked disk (offline-capable)
+ *   --source given but apps/<appId> missing → treat as omitted (Prefer A r31 stale catalog)
  *   --source omitted + net  → GitHub clone (existing buildInstance logic)
- *   --source omitted, no net, appDB has local source → auto-select local disk
+ *   --source omitted, no net, usable local source → auto-select docked disk with bundle
  *   --source omitted, no net, no local source → clear error
  *
  * Phases implemented here:
@@ -34,13 +35,16 @@ import { App, createOrUpdateApp } from './App.js'
  * Check internet availability with a short TCP connect to 1.1.1.1:53.
  * No HTTP request — no data sent. Timeout: 2 seconds.
  */
-export const hasInternet = (): Promise<boolean> =>
-    new Promise(resolve => {
+export const hasInternet = (): Promise<boolean> => {
+    // Test hook: Prefer A r31 unit coverage for offline alt-disk fallback
+    if (process.env.IDEA_INSTALL_FORCE_OFFLINE === 'true') return Promise.resolve(false)
+    return new Promise(resolve => {
         const socket = net.createConnection({ host: '1.1.1.1', port: 53 })
         const timer = setTimeout(() => { socket.destroy(); resolve(false) }, 2000)
         socket.on('connect', () => { clearTimeout(timer); socket.destroy(); resolve(true) })
         socket.on('error', () => { clearTimeout(timer); resolve(false) })
     })
+}
 
 // ── Local install path ────────────────────────────────────────────────────────
 
@@ -135,6 +139,26 @@ export interface InstallAppOptions {
  * Unified installApp — routes to local or GitHub path based on --source and
  * internet availability.
  */
+/** True when docked disk still has apps/<appId> on disk (not stale appDB). */
+const diskHasAppBundle = async (disk: Disk, appId: AppID): Promise<boolean> => {
+    if (!disk.device) return false
+    const root = await diskMountRoot(disk)
+    return fs.pathExists(`${root}/apps/${appId}`)
+}
+
+/**
+ * Prefer A r31: find a docked disk that still has apps/<appId>.
+ * Skips stale backup/empty sources that appDB may still advertise.
+ */
+const findDockedDiskWithApp = async (store: Store, appId: AppID, excludeDiskId?: string): Promise<Disk | undefined> => {
+    for (const disk of Object.values(store.diskDB) as Disk[]) {
+        if (!disk?.device) continue
+        if (excludeDiskId && String(disk.id) === String(excludeDiskId)) continue
+        if (await diskHasAppBundle(disk, appId)) return disk
+    }
+    return undefined
+}
+
 export const installApp = async (
     storeHandle: DocHandle<Store>,
     opts: InstallAppOptions
@@ -148,15 +172,24 @@ export const installApp = async (
     const engineId = getLocalEngine(store)?.id
     const targetDisk = resolveDiskArg(store, engineId, opts.targetDiskId, 'installApp')
 
-    // ── Route 1: --source given → local path ──────────────────────────────
+    // ── Route 1: --source given → local path if bundle still present ───────
+    // Prefer A r31: Console EmptyDiskPanel may pass stale appDB.sourceDiskId
+    // (e.g. empty-001 after make_backup wiped apps/). Missing bundle → fall
+    // through to GitHub (online) or another docked disk that still has apps/.
     if (opts.sourceDiskId) {
         const sourceDisk = resolveDiskArg(store, engineId, opts.sourceDiskId, 'installApp --source')
-        log(chalk.blue(`installApp: local path — source '${sourceDisk.name}' (${sourceDisk.id})`))
-        await installAppFromDisk(storeHandle, opts.appId, sourceDisk, targetDisk as Disk, instanceName)
-        return
+        if (await diskHasAppBundle(sourceDisk as Disk, opts.appId)) {
+            log(chalk.blue(`installApp: local path — source '${sourceDisk.name}' (${sourceDisk.id})`))
+            await installAppFromDisk(storeHandle, opts.appId, sourceDisk as Disk, targetDisk as Disk, instanceName)
+            return
+        }
+        log(chalk.yellow(
+            `installApp: --source '${sourceDisk.name}' (${sourceDisk.id}) has no apps/${opts.appId} — ` +
+            `stale catalog pointer; falling back to GitHub / other docked disks`
+        ))
     }
 
-    // ── Route 2/3: no --source → probe internet ───────────────────────────
+    // ── Route 2/3: no usable --source → probe internet ────────────────────
     const online = await hasInternet()
 
     if (online) {
@@ -169,17 +202,24 @@ export const installApp = async (
         return
     }
 
-    // Route 3: offline — look for a local source in appDB
-    log(chalk.yellow(`installApp: no internet — searching appDB for local source of '${opts.appId}'`))
+    // Route 3: offline — appDB pointer only if bundle still on that disk; else scan docked disks
+    log(chalk.yellow(`installApp: no internet — searching for local source of '${opts.appId}'`))
     const appEntry = store.appDB[opts.appId]
     if (appEntry && (appEntry as any).sourceDiskId) {
         const sourceDiskId: DiskID = (appEntry as any).sourceDiskId
         const sourceDisk = getDisk(store, sourceDiskId)
-        if (sourceDisk?.device) {
+        if (sourceDisk?.device && await diskHasAppBundle(sourceDisk as Disk, opts.appId)) {
             log(chalk.blue(`installApp: auto-selected source disk '${sourceDisk.name}'`))
-            await installAppFromDisk(storeHandle, opts.appId, sourceDisk, targetDisk as Disk, instanceName)
+            await installAppFromDisk(storeHandle, opts.appId, sourceDisk as Disk, targetDisk as Disk, instanceName)
             return
         }
+    }
+
+    const alt = await findDockedDiskWithApp(store, opts.appId, String(targetDisk.id))
+    if (alt) {
+        log(chalk.blue(`installApp: found apps/${opts.appId} on docked disk '${alt.name}' (${alt.id})`))
+        await installAppFromDisk(storeHandle, opts.appId, alt, targetDisk as Disk, instanceName)
+        return
     }
 
     // No local source found
@@ -210,12 +250,18 @@ export const indexBackupDiskApps = async (
     const appsDir = `${await diskMountRoot(backupDisk)}/apps`
     if (!await fs.pathExists(appsDir)) {
         log(`indexBackupDiskApps: no apps/ directory on disk ${backupDisk.name}`)
+        clearStaleSourcePointers(storeHandle, backupDisk)
         return
     }
 
-    const appIds = (await fs.readdir(appsDir)) as AppID[]
+    const appIds = ((await fs.readdir(appsDir)) as AppID[]).filter(Boolean)
+    if (appIds.length === 0) {
+        log(`indexBackupDiskApps: empty apps/ on disk ${backupDisk.name} — clearing stale source pointers`)
+        clearStaleSourcePointers(storeHandle, backupDisk)
+        return
+    }
+
     for (const appId of appIds) {
-        if (!appId) continue
         try {
             // Register in appDB using existing createOrUpdateApp (reads compose.yaml for metadata)
             await createOrUpdateApp(storeHandle, appId, backupDisk)
@@ -234,4 +280,26 @@ export const indexBackupDiskApps = async (
             log(chalk.yellow(`indexBackupDiskApps: skipping '${appId}' — ${e.message}`))
         }
     }
+}
+
+/**
+ * Prefer A r31: when a Backup/Catalog disk no longer has apps/, drop appDB
+ * sourceDiskId pointers at this disk so Console omits stale --source and
+ * installApp can GitHub-route (or pick a docked disk that still has the bundle).
+ */
+export const clearStaleSourcePointers = (
+    storeHandle: DocHandle<Store>,
+    backupDisk: Disk
+): void => {
+    storeHandle.change(doc => {
+        for (const appId of Object.keys(doc.appDB)) {
+            const entry = doc.appDB[appId as AppID] as any
+            if (!entry) continue
+            if (String(entry.sourceDiskId) !== String(backupDisk.id)) continue
+            delete entry.source
+            delete entry.sourceDiskId
+            delete entry.sourceDiskName
+            log(`clearStaleSourcePointers: cleared source for '${appId}' (was disk '${backupDisk.name}')`)
+        }
+    })
 }

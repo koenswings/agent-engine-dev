@@ -257,7 +257,8 @@ test/
 
 | Scenario | Description | States | Duration |
 |----------|-------------|--------|----------|
-| `school-day` | Typical day, Kolibri + Nextcloud, 3 engines | 8 | 8h simulated |
+| `school-day` | Typical day, Kolibri + Nextcloud, 3 engines (idea04 + shared + deferred Intents) | 8 | 8h simulated |
+| `school-day-2engine` | 2-engine UI walk for idea01+idea03; unique; hub/console/operator only (no App-open) | ~10 | 2h simulated |
 | `stress` | High reboot rate, fast disk swaps | 6 | 2h simulated |
 | `minimal` | 2 engines, 3 states, for CI gate | 3 | 10 min |
 
@@ -279,3 +280,35 @@ test/
 2. **Multi-disk scenarios**: should the Markov model support multiple disks in flight simultaneously? Increases realism but complicates state tracking. Phase 2.
 
 3. **Engine-aware state**: should the model track which engine a disk is on, or treat "kolibri docked somewhere" as a single state? Single-state is simpler; engine-aware is more realistic. Start with single-state.
+
+---
+
+## Proposal revisions
+
+*(idea#168 / Axle executor — logical consistency only; Steve may accept or rewrite.)*
+
+1. **Implementation phase renumber (Steve/Koen greenlight vs original §):**
+   - Original: Phase 3 = stability monitoring + multiple scenario files; Phase 4 = stress + CI `minimal`.
+   - **Active interpretation (idea#168):** Phase 3 = Playwright UI Intent dispatch from the ONE YAML walker (`test/duration/ui/` → Pixel `e2e/intents`); Phase 4 = dwell stability probes + `stress.yaml` + CI `minimal` on FakeFleetOps.
+   - Multiple scenario files and `stress.yaml` already shipped in Phase 1–2; Phase 4 therefore focuses on **probes + CI green**, not inventing a second scenario tree.
+
+2. **YAML transition shape:** early examples in this doc omit `action:` keys. Design Review locked `{ to, weight, action }` for **all** layers — treat example YAML without `action` as superseded.
+
+3. **Open question #2** ("Multi-disk … Phase 2"): Phase 2 is complete; multi-disk simultaneous flight remains optional/future — strike the "Phase 2" schedule tag.
+
+4. **Stability probe §7:** keep as Phase 4 dwell behaviour (30s interval, fail after 3 consecutive). `--fast` compresses dwell so CI still exercises ≥1 probe per gap without wall-clock 30s.
+
+5. **File layout:** add `test/duration/ui/` (Playwright/Stub drivers), `test/duration/stability.ts`, and Intent contract `ACTIONS.md`. No second runner.
+
+6. **Intent rename (Pixel#134 @9502201):** `add_files` → `add_files_role`. Engine YAML/ACTIONS must use `add_files_role`. Engine UI driver calls `runDurationIntent` / `hasDurationIntent` from `idea-console/duration-intents` (sibling path fallback) — do not re-implement Console selectors.
+7. **Live Console URL for duration `--ui` / Playwright:** use the Engine-served Console on port **8080** (for example, `http://idea01:8080`), not port 80. Fleet Pis serve Console on :8080; docs/CLI examples using `:80` or bare `http://idea01` without a port are superseded.
+8. **2-engine UI scenario (`school-day-2engine`):** full `school-day` lists `pool_engines: [idea01, idea03, idea04]`, `store_mode: shared`, and deferred lesson Intents (`keep_watching` / `exit_lesson` / …). That combination is **not** suitable for current 2-host live `--ui` claims (no idea04; live stores unique; Pixel deferred chrome). Prefer `test/duration/scenarios/school-day-2engine.yaml` (idea01+idea03, unique store). Does not remove `school-day`; supersedes the assumption that school-day needs idea04 for 2-host claims.
+9. **`school-day-2engine` App-open trim (idea#168 live FAIL @5e253d3):** live `--ui` timed out on `open_nextcloud_as_learner` waiting `[data-testid="instance-nextcloud-grade5a-001"]` because the pool had no Running Kid fixture instances. `infra_dock_fixture` / RealFleetOps dock defaults to **dock-only** (strips `instances/`; no auto-start). Console App-open Intents (`open_kolibri_*` / `open_nextcloud_*` / `open_video` / `open_exercise`) require a visible Running instance card + Open button. Therefore overnight `school-day-2engine` is trimmed to **hub/console/operator Intents only** (`open_console_as_*`, `stay_on_*`, `return_to_start`, `open_disk_inventory` + light infra). App-open edges move to a later scenario once fixtures are Running (`startInstances` + images, or provisioned). FakeFleetOps stub path unchanged.
+
+10. **ONE canonical graph (`unified.yaml`) — alternate scenario YAMLs demoted (2026-10-01 / idea#145):**
+    Koen via Steve: scenario YAML files are **not** alternate graphs. Shipped Markov file is only
+    `test/duration/scenarios/unified.yaml` (full proposal state tables: 28 states). Former
+    `school-day*.yaml` / `minimal*.yaml` / `stress.yaml` deleted as graphs; deprecated CLI names
+    alias → `unified`. Stress / CI / 2-engine / dock / reboot = **CLI knobs** (`--iterations`,
+    `--live`, `--ui`, `--hosts`, `--fast`), not separate state tables. Steve aligns #144 in parallel.
+

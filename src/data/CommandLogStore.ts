@@ -223,18 +223,34 @@ export const flushLogs = (
   })
 }
 
+/** Stash for attachTraceResult → closeTrace atomic publish (Prefer A r42). */
+const pendingTraceResults = new Map<string, string>()
+
+export const stashTraceResult = (traceId: string, resultJson: string): void => {
+  pendingTraceResults.set(traceId, resultJson)
+}
+
+export const takePendingTraceResult = (traceId: string): string | undefined => {
+  const v = pendingTraceResults.get(traceId)
+  pendingTraceResults.delete(traceId)
+  return v
+}
+
 /**
  * Mark a trace as completed. Call after the command resolves or rejects.
  * A trace already closed as 'error' stays 'error': a later 'ok' close (e.g. the
  * wrapper of a command whose inner work recorded a failure, idea#109) does not
- * hide the failure.
+ * hide the failure. Pending attachTraceResult is applied in the same change.
  */
 export const closeTrace = (
   handle: DocHandle<CommandLogStore>,
   traceId: string,
   status: 'ok' | 'error',
-  errorMessage?: string
+  errorMessage?: string,
+  /** When set, written in the same Automerge change as status (Console sees both together). */
+  resultJson?: string | null,
 ): void => {
+  const fromStash = resultJson !== undefined ? resultJson : takePendingTraceResult(traceId)
   handle.change(doc => {
     const trace = doc.traces[traceId]
     if (!trace) return
@@ -242,5 +258,6 @@ export const closeTrace = (
     trace.status = status
     trace.completedAt = Date.now()
     if (errorMessage) trace.errorMessage = errorMessage
+    if (fromStash !== undefined && fromStash !== null) trace.result = fromStash
   })
 }
