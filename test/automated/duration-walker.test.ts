@@ -45,6 +45,7 @@ import {
     FAST_DWELL_MS,
     detectStatusAnomalies,
     isDockerMissingProbeFailure,
+    runningInstanceExpectsLocalDocker,
     runStabilityDuringDwell,
     snapshotRunning,
 } from '../duration/stability.js'
@@ -1129,6 +1130,54 @@ describe('Phase 4 stability probes (FakeFleetOps)', () => {
         expect(result.ok).toBe(true)
         expect(probes).toBeGreaterThanOrEqual(3)
         expect(result.samples.some(sample => isDockerMissingProbeFailure(sample))).toBe(true)
+    })
+
+    it('settles a transient docker-missing probe after confirm_eject', async () => {
+        // Prefer A r46: confirm_eject stops the container before diskDB.dockedTo /
+        // status leave Running, so the first probes can say docker missing.
+        const ops = fakeOps({
+            poolEngines: ['idea01'],
+            excludeEngines: ['idea02'],
+        })
+        await ops.dockFixture('idea01', 'duration-nextcloud-grade5a-001')
+        let probes = 0
+        ops.probeStability = async () => {
+            probes++
+            const missing = probes <= 2
+            return {
+                ok: !missing,
+                detail: missing ? 'idea01: docker missing for nextcloud-grade5a-001' : 'fake probe ok',
+                engines: [{
+                    id: 'idea01',
+                    wsUp: true,
+                    dockerOk: !missing,
+                    statusAnomaly: missing ? 'docker missing for nextcloud-grade5a-001' : undefined,
+                }],
+            }
+        }
+        const result = await runStabilityDuringDwell({
+            ops,
+            engines: ['idea01'],
+            intervalMs: 1,
+            failAfter: DEFAULT_FAIL_AFTER,
+            dwellMs: 10,
+            justCompletedAction: 'confirm_eject',
+            dockerMissingSettleMs: 20,
+        })
+        expect(result.ok).toBe(true)
+        expect(probes).toBeGreaterThanOrEqual(3)
+        expect(result.samples.some(sample => isDockerMissingProbeFailure(sample))).toBe(true)
+    })
+
+    it('runningInstanceExpectsLocalDocker skips undocked and foreign disks', () => {
+        const instance = { diskId: 'duration-nextcloud-grade5a-001' }
+        const dockedHere = { 'duration-nextcloud-grade5a-001': { dockedTo: 'idea01' } }
+        const undocked = { 'duration-nextcloud-grade5a-001': { dockedTo: null } }
+        const otherEngine = { 'duration-nextcloud-grade5a-001': { dockedTo: 'idea03' } }
+        expect(runningInstanceExpectsLocalDocker(instance, dockedHere, 'idea01')).toBe(true)
+        expect(runningInstanceExpectsLocalDocker(instance, undocked, 'idea01')).toBe(false)
+        expect(runningInstanceExpectsLocalDocker(instance, otherEngine, 'idea01')).toBe(false)
+        expect(runningInstanceExpectsLocalDocker(instance, {}, 'idea01')).toBe(true)
     })
 
     it('unified walk with dwell probes stays green on FakeFleetOps', async () => {

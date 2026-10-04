@@ -19,6 +19,7 @@ import {
     DEFAULT_DWELL_MS,
     DEFAULT_FAIL_AFTER,
     DEFAULT_PROBE_INTERVAL_MS,
+    CONFIRM_EJECT_MIN_DOCKER_MISSING_SETTLE_MS,
     DEFAULT_DOCKER_MISSING_SETTLE_MS,
     FAST_DWELL_MS,
     FAST_PROBE_INTERVAL_MS,
@@ -226,6 +227,15 @@ const runWalkWithSteps = async (
             const intervalMs = fullOpts.probeIntervalMs
                 ?? (fullOpts.fast ? FAST_PROBE_INTERVAL_MS : DEFAULT_PROBE_INTERVAL_MS)
             const failAfter = fullOpts.probeFailAfter ?? DEFAULT_FAIL_AFTER
+            // Caller-supplied dockerMissingSettleMs always wins (unit tests pass 20ms).
+            // confirm_eject needs at least 15s even under --fast (1s is too short);
+            // the non-fast 90s default already covers it.
+            const defaultSettleMs = fullOpts.fast
+                ? FAST_DOCKER_MISSING_SETTLE_MS
+                : DEFAULT_DOCKER_MISSING_SETTLE_MS
+            const settleMs = action === 'confirm_eject'
+                ? Math.max(defaultSettleMs, CONFIRM_EJECT_MIN_DOCKER_MISSING_SETTLE_MS)
+                : defaultSettleMs
             const stab = await runStabilityDuringDwell({
                 ops: fullOpts.ops,
                 engines: pool,
@@ -233,8 +243,7 @@ const runWalkWithSteps = async (
                 failAfter,
                 dwellMs,
                 justCompletedAction: action,
-                dockerMissingSettleMs: fullOpts.dockerMissingSettleMs
-                    ?? (fullOpts.fast ? FAST_DOCKER_MISSING_SETTLE_MS : DEFAULT_DOCKER_MISSING_SETTLE_MS),
+                dockerMissingSettleMs: fullOpts.dockerMissingSettleMs ?? settleMs,
             })
             probeResults = stab.samples.map(s => ({ ok: s.ok, detail: s.detail }))
             if (!stab.ok) {

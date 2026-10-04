@@ -133,7 +133,7 @@ Content pins (stable): `open_video` contentId `e60662de-b15c-52f9-b003-359f7d91f
 
 ## Phase 4 stability
 
-During dwell between transitions (~30s; `--fast` → ~80ms): WS ping + docker ps / status anomaly; fail after 3 consecutive probe failures, with `docker missing` aborting on its first sample except immediately after `move_app`/`copy_app`, which gets up to 90s (1s under `--fast`) to reappear or leave Running/Starting before aborting if still ghost. `--no-stability` to skip.
+During dwell between transitions (~30s; `--fast` → ~80ms): WS ping + docker ps / status anomaly; fail after 3 consecutive probe failures, with `docker missing` aborting on its first sample except immediately after `move_app`/`copy_app`/`infra_move_disk`/`confirm_eject`, which gets up to 90s (1s under `--fast`; `confirm_eject` at least 15s) to reappear or leave Running/Starting before aborting if still ghost. An undocked disk (or one docked to another engine) is not a docker-missing ghost. `--no-stability` to skip.
 
 ## Live fleet (`--live` / RealFleetOps)
 

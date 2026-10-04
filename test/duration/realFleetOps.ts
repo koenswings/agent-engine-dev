@@ -16,6 +16,7 @@ import { Repo, type DocHandle, type DocumentId, type PeerId } from '@automerge/a
 import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websocket'
 import { $ } from 'zx'
 import type { Store } from '../../src/data/Store.js'
+import { runningInstanceExpectsLocalDocker } from './stability.js'
 import type {
     FleetOps,
     SemanticStoreView,
@@ -566,7 +567,11 @@ export class RealFleetOps implements FleetOps {
             if (wsUp) {
                 try {
                     const view = await this.readStore(id)
-                    const running = Object.values(view.instanceDB).filter(i => i.status === 'Running')
+                    // Undocked or foreign-docked disks do not need a local container.
+                    // Null diskId or a missing disk row still expects docker.
+                    const running = Object.values(view.instanceDB).filter(i =>
+                        i.status === 'Running'
+                        && runningInstanceExpectsLocalDocker(i, view.diskDB, id))
                     if (running.length === 0) {
                         dockerOk = true // nothing expected running
                     } else {
