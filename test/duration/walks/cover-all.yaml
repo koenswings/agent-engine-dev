@@ -229,9 +229,16 @@ steps:
   - from: nc_share
     to: console_teacher
     action: back_to_console_from_share
+  # Prefer A cover-all-aeef795-r12 FAIL@28 / Steve: later block learner before file-drop.
   - from: console_teacher
+    to: start
+    action: return_to_start
+  - from: start
+    to: console_learner
+    action: open_console_as_learner
+  - from: console_learner
     to: nc_browse
-    action: open_nextcloud_as_teacher
+    action: open_nextcloud_as_learner
   - from: nc_browse
     to: nc_drop
     action: open_file_drop
