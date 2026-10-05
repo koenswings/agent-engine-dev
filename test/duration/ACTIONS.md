@@ -23,7 +23,7 @@ YAML transition shape (all layers): `{ to, weight, action }`.
 | Key | Entry / effect |
 |---|---|
 | `infra_undock_fixtures` | `infra_idle` — Engine eject/undock fixture disks |
-| `infra_dock_fixture` | `infra_docked` — Engine dock fixture on a pool engine. Prefer A r16 FAIL@65: after dock+settle, when Nextcloud is among fixtures, live path polls `:18280/login` until login-form HTML ready (and sets `DURATION_NEXTCLOUD_URL` follow-host); Fake skips the wait |
+| `infra_dock_fixture` | `infra_docked` — Engine dock fixture on a pool engine. Prefer A r16 FAIL@65 / r17 FAIL@58: after dock+settle, when Nextcloud is among fixtures, live path polls `http://<engineId>:18280/login` (logical hostname, not Tailscale IP — NC trusted_domains) until login-form HTML ready (and sets `DURATION_NEXTCLOUD_URL`); Fake skips the wait |
 | `infra_move_disk` | `infra_disk_moved` — undock then dock on another pool engine (wait undock settle; dockFixture no-op only if already on *target*; docker settle grace like move_app). Prefer A r15: sets `DURATION_KOLIBRI_URL` to the target host so Console Path B follows the disk (not Console idea01) |
 | `infra_reboot_engine` | `infra_reboot` — SSH reboot; `--fast` → `pm2 restart engine` (Path A: stop duration docker zombies before/after pm2 so `no_zombie_instances` holds) |
 
@@ -118,6 +118,8 @@ Path A re-dock after eject: RealFleetOps does `rm -f` sentinel, `sleep 5`, then 
 Path A `infra_dock_fixture` re-dock (findDockedEngine miss / no walker dock): prefer non-excluded `poolEngines[0]` (Console host / idea01) — not RNG; also dock sibling `fixtureDisks` (nextcloud + empty-001 + empty-002) on the same engine. Empty packs prefer `idea-test-3` / `idea-test-4`.
 
 **Prefer A r16 FAIL@65 → NC readiness:** `open_nextcloud_as_teacher` aborted ~31s after NC re-dock (`login form incomplete` on `idea01:18280`). Unlike Kolibri Path B `waitForSidecarHttpReady`, Engine did not wait for NC. Tip: `waitNextcloudSidecarReadyForEngine` after `infra_dock_fixture` settle (Path A no-op + re-dock) when any `fixtureDisks` id includes `nextcloud`; poll GET `/login` for user+password+submit HTML; `DURATION_NEXTCLOUD_READY_MS` default 180000; skip on FakeFleetOps.
+
+**Prefer A r17 FAIL@58 → NC probe hostname:** readiness timed out probing Tailscale IP (`http://100.99.231.94:18280/login` → HTTP 400 untrusted domain). Post-run: IP → 400; `http://idea01:18280/login` → 200. Tip: NC readiness uses Engine logical id / hostname (trusted_domains), not `hostMap` Tailscale IP. Kolibri follow-host may still use IP. Do not treat 400 as up; do not change Pi trusted_domains.
 
 Path A / `infra_reboot_engine --fast`: `rebootEngine` stops `kolibri-grade5a` / `nextcloud-grade5a` / `duration-*` containers (never `idea166-*`) before `pm2 restart`, then `reconcileDurationZombies` after `waitReady` so Automerge Running+Undocked fixtures do not trip `no_zombie_instances`.
 

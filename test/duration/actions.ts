@@ -439,17 +439,26 @@ export const syncKolibriSidecarUrlForEngine = (
 }
 
 /**
- * Prefer A cover-all-230b70f-r16 FAIL@65: after infra_dock_fixture re-docks NC on
- * idea01 with startInstances, Console open_nextcloud_as_teacher hit login form
- * incomplete (~31s) — NC still booting. Mirror Kolibri follow-host: point
- * DURATION_NEXTCLOUD_URL at the dock host (Tailscale IP when live).
+ * Prefer A cover-all-230b70f-r16 FAIL@65 / r17 FAIL@58: after infra_dock_fixture
+ * re-docks NC, poll readiness then set DURATION_NEXTCLOUD_URL. Unlike Kolibri
+ * (Path B may need Tailscale IP from hostMap), Nextcloud trusted_domains includes
+ * the Engine logical id (idea01) but not the Tailscale IP — probe by hostname.
+ * `hosts` is accepted for call-site parity with Kolibri but ignored for the URL.
+ * Honors DURATION_NEXTCLOUD_URL / DURATION_NEXTCLOUD_PORT when already set.
  */
 export const syncNextcloudSidecarUrlForEngine = (
     engineId: string,
-    hosts: Record<string, string> | undefined,
+    _hosts: Record<string, string> | undefined,
     env: NodeJS.ProcessEnv = process.env,
 ): string => {
-    const authority = (hosts?.[engineId]?.trim() || engineId).replace(/\/$/, '')
+    const existing = env.DURATION_NEXTCLOUD_URL?.trim()
+    if (existing) {
+        const url = existing.replace(/\/$/, '')
+        env.DURATION_NEXTCLOUD_URL = url
+        return url
+    }
+    // Logical engine id / hostname — not hosts[engineId] Tailscale IP (r17 FAIL@58).
+    const authority = engineId.replace(/\/$/, '')
     const portRaw = env.DURATION_NEXTCLOUD_PORT?.trim()
     const port = portRaw && /^\d+$/.test(portRaw) ? portRaw : '18280'
     const url = `http://${authority}:${port}`
@@ -489,9 +498,9 @@ export type WaitNextcloudSidecarOpts = {
 }
 
 /**
- * Poll GET http://host:18280/login until body looks like NC login form.
- * Sets DURATION_NEXTCLOUD_URL (follow-host). Loud-fail citing r16 FAIL@65.
- * No Playwright — Node fetch only.
+ * Poll GET http://<engineId>:18280/login until body looks like NC login form.
+ * Sets DURATION_NEXTCLOUD_URL to logical hostname (not Tailscale IP — r17 FAIL@58
+ * trusted_domains). Loud-fail citing r16 FAIL@65. No Playwright — Node fetch only.
  */
 export const waitNextcloudSidecarReadyForEngine = async (
     engineId: string,

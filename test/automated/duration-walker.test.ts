@@ -1618,21 +1618,38 @@ describe('syncKolibriSidecarUrlForEngine (r15 FAIL@70)', () => {
     })
 })
 
-describe('syncNextcloudSidecarUrlForEngine / waitNextcloud (r16 FAIL@65)', () => {
-    it('sets DURATION_NEXTCLOUD_URL to host map IP:18280', () => {
+describe('syncNextcloudSidecarUrlForEngine / waitNextcloud (r16 FAIL@65 / r17 FAIL@58)', () => {
+    it('sets DURATION_NEXTCLOUD_URL to logical engine id:18280 (not hostMap IP)', () => {
         const env: NodeJS.ProcessEnv = {}
         const url = syncNextcloudSidecarUrlForEngine(
             'idea01',
             { idea01: '100.99.231.94', idea03: '100.126.117.80' },
             env,
         )
-        expect(url).toBe('http://100.99.231.94:18280')
+        expect(url).toBe('http://idea01:18280')
         expect(env.DURATION_NEXTCLOUD_URL).toBe(url)
     })
 
-    it('honors DURATION_NEXTCLOUD_PORT override and logical id fallback', () => {
+    it('honors DURATION_NEXTCLOUD_URL override when already set', () => {
+        const env: NodeJS.ProcessEnv = {
+            DURATION_NEXTCLOUD_URL: 'http://custom-nc:19999/',
+        }
+        const url = syncNextcloudSidecarUrlForEngine(
+            'idea01',
+            { idea01: '100.99.231.94' },
+            env,
+        )
+        expect(url).toBe('http://custom-nc:19999')
+        expect(env.DURATION_NEXTCLOUD_URL).toBe(url)
+    })
+
+    it('honors DURATION_NEXTCLOUD_PORT override with logical id', () => {
         const env: NodeJS.ProcessEnv = { DURATION_NEXTCLOUD_PORT: '18281' }
-        const url = syncNextcloudSidecarUrlForEngine('idea01', undefined, env)
+        const url = syncNextcloudSidecarUrlForEngine(
+            'idea01',
+            { idea01: '100.99.231.94' },
+            env,
+        )
         expect(url).toBe('http://idea01:18281')
     })
 
@@ -1670,7 +1687,7 @@ describe('syncNextcloudSidecarUrlForEngine / waitNextcloud (r16 FAIL@65)', () =>
             env,
             skip: true,
         })
-        expect(env.DURATION_NEXTCLOUD_URL).toBe('http://100.99.231.94:18280')
+        expect(env.DURATION_NEXTCLOUD_URL).toBe('http://idea01:18280')
         expect(msg).toContain('wait skipped')
     })
 
@@ -1689,7 +1706,7 @@ describe('syncNextcloudSidecarUrlForEngine / waitNextcloud (r16 FAIL@65)', () =>
             sleepImpl: async () => {},
         })
         expect(msg).toContain('login form ready')
-        expect(env.DURATION_NEXTCLOUD_URL).toBe('http://10.0.0.1:18280')
+        expect(env.DURATION_NEXTCLOUD_URL).toBe('http://idea01:18280')
     })
 
     it('waitNextcloudSidecarReadyForEngine loud-fails with r16 FAIL@65 message', async () => {
