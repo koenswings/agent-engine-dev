@@ -967,7 +967,9 @@ export class RealFleetOps implements FleetOps {
         const host = this.hostOf(engineId)
         const candidates = preferred
             ? [preferred]
-            : ['idea-test-1', 'idea-test-2', 'idea-test-3', 'idea-test-4']
+            : // Prefer A r26 FAIL@93: Path A pre-docks duration-add-files-001 on idea-test-5;
+              // scan every live fixture slot, not just 1..4.
+              Array.from({ length: 8 }, (_, i) => `idea-test-${i + 1}`)
         for (const device of candidates) {
             if (!/^idea-test-[0-9]+$/.test(device)) continue
             const meta = `${this.disksRoot}/${device}/META.yaml`
