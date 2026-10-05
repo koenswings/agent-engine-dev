@@ -1138,10 +1138,12 @@ export class RealFleetOps implements FleetOps {
 
     /**
      * Wait until diskId is not docked on any pool engine (post-eject Automerge settle).
-     * Unique-store: ejectDisk is async via engine commands — dockFixture must not
-     * treat a stale dockedTo as "already docked" and no-op a move.
+     * Unique-store: ejectDisk is async via engine commands — dockFixture / redockEmptyFresh
+     * must not treat a stale dockedTo as "already docked" and no-op a same-engine redock
+     * (Prefer A cover-all-6b96ee2-r23 FAIL@91: empty-001 eject→dockFixture no-op on idea01).
+     * Public so redockEmptyFresh can wait after undock before dockFixture.
      */
-    private async waitDiskUndocked(diskId: string, timeoutMs = 60_000): Promise<void> {
+    async waitDiskUndocked(diskId: string, timeoutMs = 60_000): Promise<void> {
         const start = Date.now()
         while (Date.now() - start < timeoutMs) {
             try {

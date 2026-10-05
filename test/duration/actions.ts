@@ -265,11 +265,45 @@ export const waitEmpty002PostInstallRunning = async (
 }
 
 /**
+ * Prefer A r23 FAIL@91: after ejectDisk, unique-store may still show dockedTo until
+ * Automerge settles. Poll / waitDiskUndocked until findDockedEngine is null so
+ * dockFixture cannot no-op a same-engine fresh redock on stale state.
+ * Fail loud if undock does not clear within budget.
+ */
+const waitUndockedBeforeRedock = async (
+    ops: {
+        waitDiskUndocked?: (id: string, timeoutMs?: number) => Promise<void>
+        findDockedEngine?: (id: string) => Promise<string | null>
+    },
+    diskId: string,
+    label: string,
+    timeoutMs = 60_000,
+): Promise<void> => {
+    if (typeof ops.waitDiskUndocked === 'function') {
+        await ops.waitDiskUndocked(diskId, timeoutMs)
+        return
+    }
+    if (typeof ops.findDockedEngine !== 'function') return
+    const start = Date.now()
+    while (Date.now() - start < timeoutMs) {
+        const still = await ops.findDockedEngine(diskId)
+        if (!still) return
+        await new Promise<void>(r => setTimeout(r, 50))
+    }
+    throw new Error(
+        `${label}: ${diskId} still docked after eject within ${timeoutMs}ms ` +
+            `(unique-store Automerge lag). Prefer A — fail loud before dockFixture no-op.`,
+    )
+}
+
+/**
  * Shared Prefer A empty-pack fresh re-dock (Kid pack always rm+cp via dockFixture;
  * empty/empty-002 also strip non-META so createFilesDisk is not refused by README.md).
  * Force undock-then-dock so RealFleetOps empty always-fresh-copy runs (dockFixture
- * no-ops when already on the same engine). Does NOT change DURATION_EMPTY_DISK_ID
- * (=001); Pixel ensureEmptyDiskPanel discovers any empty-badge row. Never idea02.
+ * no-ops when already on the same engine). After undock, wait until store clears
+ * dockedTo (Prefer A r23) before dockFixture — unique-store eject is async.
+ * Does NOT change DURATION_EMPTY_DISK_ID (=001); Pixel ensureEmptyDiskPanel discovers
+ * any empty-badge row. Never idea02.
  * FakeFleetOps: undock pool-wide + synthetic dockFixture (CRI stays green).
  * purgeStoreInstances (BeforeSecondInstall + BeforeErase + BeforeMakeFiles /
  * Prefer A r36/r37/r20): FS wipe is not enough — Automerge instanceDB rows with
@@ -301,11 +335,15 @@ const redockEmptyFresh = async (
 
     const opsAny = ctx.opts.ops as FleetOps & {
         findDockedEngine?: (id: string) => Promise<string | null>
+        waitDiskUndocked?: (id: string, timeoutMs?: number) => Promise<void>
     }
     if (typeof opsAny.findDockedEngine === 'function') {
         const already = await opsAny.findDockedEngine(diskId)
         if (already) {
             await ctx.opts.ops.undockFixtures([already], diskId)
+            // Prefer A r23: wait until undock clears BEFORE dockFixture (same-engine
+            // redock otherwise no-ops on stale dockedTo=idea01).
+            await waitUndockedBeforeRedock(opsAny, diskId, label)
         }
     } else {
         // Fake / no findDockedEngine: undock pool-wide (idempotent if absent).

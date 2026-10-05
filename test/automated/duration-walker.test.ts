@@ -1326,9 +1326,79 @@ describe('Prefer A r21: empty-001 Files Disk on Console engine (cover-all-033497
     it('redockEmpty001BeforeMakeFiles fails loud if dock lands off the Console engine (live findDockedEngine)', async () => {
         await withEnv({ DURATION_SWITCH_ENGINE_HOST: 'idea01' }, async () => {
             const ops = fakeOps({ poolEngines: POOL, excludeEngines: ['idea02'], storeMode: 'shared' })
-            const live = Object.assign(ops, { findDockedEngine: async () => 'idea03' })
+            // waitDiskUndocked no-op so the constant findDockedEngine mock does not
+            // trip the r23 undock-settle wait; landing check still sees idea03.
+            const live = Object.assign(ops, {
+                findDockedEngine: async () => 'idea03',
+                waitDiskUndocked: async () => {},
+            })
             await expect(redockEmpty001BeforeMakeFiles(ctxFor(live, 'idea03') as any))
                 .rejects.toThrow(/landed on idea03 not idea01/)
+        })
+    })
+
+    it('redockEmpty001BeforeMakeFiles waits for undock settle before dockFixture (stale unique-store dockedTo)', async () => {
+        // Prefer A cover-all-6b96ee2-r23 FAIL@91: eject then dockFixture no-op'd on
+        // stale dockedTo=idea01 while unique-store eject was still in flight.
+        await withEnv({
+            DURATION_SWITCH_ENGINE_HOST: 'idea01',
+            DURATION_CONSOLE_URL: 'http://idea01:8080',
+            DURATION_EMPTY_DISK_ID: undefined,
+        }, async () => {
+            const ops = fakeOps({ poolEngines: POOL, excludeEngines: ['idea02'], storeMode: 'shared' })
+            await ops.dockFixture('idea01', 'duration-empty-001')
+            let stale: string | null = 'idea01'
+            let waitPolls = 0
+            let dockedWhileStale = false
+            const undockBase = ops.undockFixtures.bind(ops)
+            const dockBase = ops.dockFixture.bind(ops)
+            const live = Object.assign(ops, {
+                findDockedEngine: async () => stale,
+                waitDiskUndocked: async (_diskId: string, timeoutMs = 60_000) => {
+                    const start = Date.now()
+                    while (Date.now() - start < timeoutMs) {
+                        waitPolls++
+                        if (!stale) return
+                        await new Promise<void>(r => setTimeout(r, 5))
+                    }
+                    throw new Error(`RealFleetOps: disk duration-empty-001 still docked after eject within ${timeoutMs}ms`)
+                },
+                undockFixtures: async (engines: string[], diskId: string) => {
+                    await undockBase(engines, diskId)
+                    // Automerge lag: stay stale briefly, then clear.
+                    stale = 'idea01'
+                    setTimeout(() => { stale = null }, 20)
+                },
+                dockFixture: async (engineId: string, diskId: string) => {
+                    if (stale) dockedWhileStale = true
+                    expect(stale).toBeNull()
+                    await dockBase(engineId, diskId)
+                    stale = engineId
+                },
+            })
+            const note = await redockEmpty001BeforeMakeFiles(ctxFor(live, 'idea01') as any)
+            expect(note).toMatch(/re-docked duration-empty-001 on idea01/)
+            expect(dockedWhileStale).toBe(false)
+            expect(waitPolls).toBeGreaterThan(0)
+            const view = await ops.readStore('idea01')
+            expect(view.diskDB['duration-empty-001']?.dockedTo).toBe('idea01')
+        })
+    })
+
+    it('redockEmpty001BeforeMakeFiles fails loud if undock never clears', async () => {
+        await withEnv({ DURATION_SWITCH_ENGINE_HOST: 'idea01' }, async () => {
+            const ops = fakeOps({ poolEngines: POOL, excludeEngines: ['idea02'], storeMode: 'shared' })
+            await ops.dockFixture('idea01', 'duration-empty-001')
+            const live = Object.assign(ops, {
+                findDockedEngine: async () => 'idea01',
+                waitDiskUndocked: async () => {
+                    throw new Error(
+                        'RealFleetOps: disk duration-empty-001 still docked after eject within 60ms',
+                    )
+                },
+            })
+            await expect(redockEmpty001BeforeMakeFiles(ctxFor(live, 'idea01') as any))
+                .rejects.toThrow(/still docked after eject/)
         })
     })
 
