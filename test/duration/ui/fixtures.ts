@@ -44,9 +44,15 @@ export const DURATION_UI_FIXTURES = {
         packPath: 'tests/duration-tests/fixtures/empty-002',
         preferredDevice: 'idea-test-4',
     },
+    /** Console#135 @ 198eb69 / Kid App#11 Prefer A Kiwix stub (not infra_disk until Atlas docks). */
+    kiwix: {
+        diskId: 'duration-kiwix-ideaa-001',
+        instanceId: 'kiwix-ideaa-001',
+        packPath: 'tests/duration-tests/fixtures/kiwix',
+    },
 } as const
 
-/** Pixel Console Intent names registered in agent-console-dev e2e/intents (76 @ 2da863c; was 71 @ f150b9e). */
+/** Pixel Console Intent names registered in agent-console-dev e2e/intents (85 @ 198eb69; was 76 @ 2da863c). */
 export const PIXEL_REGISTERED_INTENTS = [
     'open_console_as_teacher',
     'open_console_as_learner',
@@ -81,6 +87,18 @@ export const PIXEL_REGISTERED_INTENTS = [
     // Collab doc Viewer (Console#135 @ 2da863c)
     'open_collab_doc',
     'close_doc',
+    // keep_editing on NC Text (Console#135 @ 1bbb729 / tip 198eb69)
+    'keep_editing',
+    // File Drop trio (Console#135 @ 198eb69) — names match cover-all.yaml
+    'open_file_drop',
+    'after_upload',
+    'leave_file_drop',
+    // Wikipedia / Kiwix stub (Console#135 @ 1bbb729 / tip 198eb69) — names match cover-all.yaml
+    'open_wikipedia_as_teacher',
+    'open_wikipedia_as_learner',
+    'search_browse_wikipedia',
+    'leave_wikipedia_as_teacher',
+    'leave_wikipedia_as_learner',
     // Pixel coaching set (Console#134 @ ba0cfa1)
     'create_class',
     'enroll_learners',
@@ -140,16 +158,12 @@ export const PIXEL_REGISTERED_INTENTS = [
 
 export type PixelIntentName = (typeof PIXEL_REGISTERED_INTENTS)[number]
 
-/** Known YAML Intents not in Pixel registry — clear deferred message, never silent. */
-export const DEFERRED_UI_INTENTS = [
-    'open_wikipedia_as_teacher',
-    'open_wikipedia_as_learner',
-] as const
+/** Known YAML Intents not in Pixel registry — clear deferred message, never silent. Empty @ 198eb69 (wiki + File Drop undeferred). */
+export const DEFERRED_UI_INTENTS = [] as const
 
 /**
- * Proposal Intents on unified.yaml still not in Pixel's 76-key registry (@ 2da863c).
+ * Proposal Intents on unified.yaml still not in Pixel's 85-key registry (@ 198eb69).
  * StubUiDriver Fake no-ops; live --ui clear-miss until Pixel adapters — do not drop YAML edges.
- * open_wikipedia_* stay deferred.
  * keep_watching is registered (Console#134 @ 329dc38).
  * next_resource is registered (Console#135 @ f16ee18).
  * finish_exercise is registered (Console#135 @ d087081).
@@ -159,18 +173,11 @@ export const DEFERRED_UI_INTENTS = [
  * share_to_class is registered (Console#135 @ 953af05).
  * done_sharing / back_to_console_from_share are registered (Console#135 @ 1709165).
  * open_collab_doc / close_doc are registered (Console#135 @ 2da863c).
+ * keep_editing + Wikipedia open/search/leave are registered (Console#135 @ 1bbb729).
+ * File Drop trio is registered (Console#135 @ 198eb69).
+ * PIXEL_MISSING empty @ 198eb69.
  */
-export const PIXEL_MISSING_INTENTS = [
-    // Nextcloud deep (share/collab undeferred @ 2da863c)
-    'open_file_drop',
-    'after_upload',
-    'leave_file_drop',
-    'keep_editing',
-    // Wikipedia leave/search (open_* deferred)
-    'search_browse_wikipedia',
-    'leave_wikipedia_as_learner',
-    'leave_wikipedia_as_teacher',
-] as const
+export const PIXEL_MISSING_INTENTS = [] as const
 
 export const isPixelIntent = (name: string): name is PixelIntentName =>
     (PIXEL_REGISTERED_INTENTS as readonly string[]).includes(name)
@@ -183,10 +190,28 @@ export const isPixelMissingUiIntent = (name: string): boolean =>
 
 /** Resolve default disk/instance for an Intent from Kid pins. */
 export const defaultIdsForIntent = (action: string): { diskId?: string; instanceId?: string } => {
-    if (action.includes('nextcloud')) {
+    if (
+        action.includes('nextcloud') ||
+        action === 'keep_editing' ||
+        action === 'open_collab_doc' ||
+        action === 'close_doc' ||
+        action === 'browse_folders' ||
+        action === 'share_to_class' ||
+        action === 'done_sharing' ||
+        action === 'back_to_console_from_share' ||
+        action === 'open_file_drop' ||
+        action === 'after_upload' ||
+        action === 'leave_file_drop'
+    ) {
         return {
             diskId: DURATION_UI_FIXTURES.nextcloud.diskId,
             instanceId: DURATION_UI_FIXTURES.nextcloud.instanceId,
+        }
+    }
+    if (action.includes('wikipedia') || action.includes('kiwix')) {
+        return {
+            diskId: DURATION_UI_FIXTURES.kiwix.diskId,
+            instanceId: DURATION_UI_FIXTURES.kiwix.instanceId,
         }
     }
     // Prefer A r27: late install / start_after_install target empty-disk install uuid —

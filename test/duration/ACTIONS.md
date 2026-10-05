@@ -4,7 +4,7 @@
 **Locked** by Steve Design Review for idea#166 — do not rename without reporting a clash.  
 **Phase 3+4 (idea#168):** walker dispatches usage/operator Intents via `test/duration/ui/` → Pixel `e2e/intents` (`getIntent`).  
 **ONE graph:** `scenarios/unified.yaml` is the only Markov state table. Run modes = CLI knobs.  
-**Pixel registry:** Console tip `2da863c` (PR #135) — **76** Intent keys (+ `captureAfterIntent` / `screenshotPath` for `--record-walk`; production web ignores sticky `demoMode`). Engine ACTIONS.md on #145 is source for walker contract.
+**Pixel registry:** Console tip `198eb69` (PR #135) — **85** Intent keys (+ `captureAfterIntent` / `screenshotPath` for `--record-walk`; production web ignores sticky `demoMode`). Engine ACTIONS.md on #145 is source for walker contract.
 
 YAML transition shape (all layers): `{ to, weight, action }`.
 
@@ -35,10 +35,10 @@ Recording + **cover-registered-intents** (Pixel-registered demo + infra; live `-
 
 Fake/CI default: `StubUiDriver` (no browser). Live UI: `pnpm test:duration -- --live --ui` → `PlaywrightUiDriver` loads Pixel `runDurationIntent` / optional `captureAfterIntent` from `idea-console/duration-intents` or `agent-console-dev/e2e/intents` (or `DURATION_CONSOLE_INTENTS`).
 
-### Pixel-registered (76 — + share_to_class + done_sharing + back_to_console_from_share + open_collab_doc + close_doc; Console@2da863c)
+### Pixel-registered (85 — + keep_editing + Wikipedia open/search/leave + File Drop trio; Console@198eb69; was 76 @ 2da863c)
 
 Hub/dwell: `open_console_as_*`, `return_to_start`, `stay_on_*`  
-App-open: `open_kolibri_as_teacher` → `/en/coach/#/classes`, `open_kolibri_as_learner`, `open_nextcloud_as_*` (Console#135 @ f150b9e: loud-fail if Nextcloud sign-in fails — live smoke may need Kid passwords; do not change NC Intent code here), `open_video`, `open_exercise`, `keep_watching` (Console#134 @ 329dc38, stay on pinned video URL), `next_resource` (Console#135 @ f16ee18, video→exercise via resource panel), `finish_exercise` (Console#135 @ d087081, exercise→Learn home via Perseus Check), `next_video` (Console#135 @ a8b4b6c, exercise→video via resource panel), `exit_lesson` (Console#135 @ 549f72b, video/exercise→Learn home via Kolibri chrome), `browse_folders` (Console#135 @ f150b9e, Nextcloud Class Materials / Drop Zone / Collab dwell), `share_to_class` (Console#135 @ 953af05 — will fail until Kid sets `enable_sharing true` on Grade 5A Files mount; do not change Kid/app code here), `done_sharing` / `back_to_console_from_share` (Console#135 @ 1709165), `open_collab_doc` / `close_doc` (Console#135 @ 2da863c)
+App-open: `open_kolibri_as_teacher` → `/en/coach/#/classes`, `open_kolibri_as_learner`, `open_nextcloud_as_*` (Console#135 @ f150b9e / settle @ b1d3d60: loud-fail if Nextcloud sign-in fails — live smoke may need Kid passwords; do not change NC Intent code here), `open_video`, `open_exercise`, `keep_watching` (Console#134 @ 329dc38, stay on pinned video URL), `next_resource` (Console#135 @ f16ee18, video→exercise via resource panel), `finish_exercise` (Console#135 @ d087081, exercise→Learn home via Perseus Check), `next_video` (Console#135 @ a8b4b6c, exercise→video via resource panel), `exit_lesson` (Console#135 @ 549f72b, video/exercise→Learn home via Kolibri chrome), `browse_folders` (Console#135 @ f150b9e, Nextcloud Class Materials / Drop Zone / Collab dwell), `share_to_class` (Console#135 @ 953af05 — will fail until Kid sets `enable_sharing true` on Grade 5A Files mount; do not change Kid/app code here), `done_sharing` / `back_to_console_from_share` (Console#135 @ 1709165), `open_collab_doc` / `close_doc` (Console#135 @ 2da863c), `keep_editing` (Console#135 @ 1bbb729, NC Text write dwell), `open_file_drop` / `after_upload` / `leave_file_drop` (Console#135 @ 198eb69 — names match cover-all.yaml), `open_wikipedia_as_teacher` / `open_wikipedia_as_learner` / `search_browse_wikipedia` / `leave_wikipedia_as_teacher` / `leave_wikipedia_as_learner` (Console#135 @ 1bbb729 — names match cover-all.yaml)
 Operator: `open_disk_inventory`, `open_instance_controls`, `eject_disk`, `confirm_eject`, `cancel_eject`, `erase_disk`, `confirm_erase`, `cancel_erase`, `start_instance`, `stop_instance`, `open_account`, `close_account`, `open_settings`, `close_settings`, `sign_in`, `make_files_disk`, `add_files_role`  
 Operator deep: `install_app`, `start_after_install`, `stay_on_disk`, `make_backup_disk`, `restore_from_backup`, `open_app`, `backup_instance`, `back_to_disk`, `back_to_overview`, `log_out`, `notice_usb_dock`, `retry_login_first_time_setup`, `change_password`, `add_operator`, `remove_operator`, `copy_app`, `move_app`  
 **Coaching (Console#134 @ ba0cfa1):** `create_class`, `enroll_learners`, `build_lesson`, `create_quiz`, `read_reports`, `preview_as_learner`, `browse_classes`
@@ -49,15 +49,13 @@ Operator deep: `install_app`, `start_after_install`, `stay_on_disk`, `make_backu
 
 ### Deferred (clear message, not silent)
 
-`open_wikipedia_as_teacher`, `open_wikipedia_as_learner`
+*(none — Wikipedia + File Drop undeferred @ Console `198eb69`)*
 
 ### Pixel-missing (still on unified.yaml — Fake Stub no-op / live clear-miss)
 
 Do **not** silently drop these edges from `unified.yaml`.
 
-**Nextcloud deep:** `open_file_drop`, `after_upload`, `leave_file_drop`, `keep_editing`
-
-**Wikipedia leave/search:** `search_browse_wikipedia`, `leave_wikipedia_as_learner`, `leave_wikipedia_as_teacher`
+*(none — File Drop trio undeferred @ Console `198eb69`)*
 
 ### Engine-owned (not Pixel)
 
@@ -80,6 +78,9 @@ pnpm test:duration -- --scenario kolibri-learn-smoke --fast
 pnpm test:duration -- --scenario kolibri-teacher-preview-smoke --fast
 pnpm test:duration -- --scenario kolibri-next-video-exit-smoke --fast
 pnpm test:duration -- --scenario nextcloud-share-smoke --fast   # Fake only — HOLD live (see below)
+pnpm test:duration -- --scenario nextcloud-collab-smoke --fast     # Fake only — HOLD live until Atlas 198eb69 + GO
+pnpm test:duration -- --scenario wikipedia-smoke --fast            # Fake only — HOLD live until Atlas 198eb69 + GO
+pnpm test:duration -- --scenario nextcloud-file-drop-smoke --fast # Fake only — HOLD live until Atlas 198eb69 + GO
 # Mid-cover-all without re-walking 1..11:
 pnpm test:duration -- --scenario cover-all --start-from 12 --fast
 pnpm test:duration -- --scenario cover-all --start-from finish_exercise --iterations 1 --fast
@@ -88,9 +89,13 @@ pnpm test:duration -- --scenario kolibri-learn-smoke --start-from finish_exercis
 
 `kolibri-next-video-exit-smoke` extends the teacher-preview path with `open_exercise` → `next_video` → `exit_lesson`. Mid-start on `finish_exercise` alone does **not** auto-navigate the page — live UI must already be on the pinned exercise, or run the full smoke.
 
-**`nextcloud-share-smoke`** (8 steps, teacher): `open_console_as_teacher` → `open_nextcloud_as_teacher` → `browse_folders` → `share_to_class` → `done_sharing` → `share_to_class` → `back_to_console_from_share` → `return_to_start`. Seeded Grade5A pins only (`duration-nextcloud-grade5a-001` / `nextcloud-grade5a-001`), store_mode shared via unified.yaml. **HOLD live** until Atlas confirms Path A with Kid App#11 @`a443398` Prefer A fixtures + Kid `enable_sharing true` on the Grade 5A Files mount + Steve clear; needs Console@`2da863c`+.
+**`nextcloud-share-smoke`** (8 steps, teacher): `open_console_as_teacher` → `open_nextcloud_as_teacher` → `browse_folders` → `share_to_class` → `done_sharing` → `share_to_class` → `back_to_console_from_share` → `return_to_start`. Seeded Grade5A pins only (`duration-nextcloud-grade5a-001` / `nextcloud-grade5a-001`), store_mode shared via unified.yaml. **HOLD live** until Atlas confirms Path A with Kid App#11 @`a443398` Prefer A fixtures + Kid `enable_sharing true` on the Grade 5A Files mount + Steve clear; needs Console@`198eb69`+ (Files settle @ b1d3d60). Share re-run waits Atlas 198eb69.
 
-**Not yet written (wait on Pixel/Atlas):** NC collab smoke (`open_collab_doc` / `close_doc` registered, but `keep_editing` (NC Text) still Pixel-missing and Atlas hold on NC collab live), File Drop smoke (`open_file_drop` / `after_upload` / `leave_file_drop` Pixel-missing), wiki smoke (`open_wikipedia_*` deferred; `search_browse_wikipedia` / `leave_wikipedia_*` Pixel-missing; Kiwix fixture not in infra yet).
+**`nextcloud-collab-smoke`** (7 steps, teacher): `open_console_as_teacher` → `open_nextcloud_as_teacher` → `browse_folders` → `open_collab_doc` → `keep_editing` → `close_doc` → `return_to_start`. Seeded Grade5A pins only. **HOLD live** until Atlas redeploys Console@`198eb69` + Steve/Atlas GO.
+
+**`wikipedia-smoke`** (9 steps): learner `open_wikipedia_as_learner` → `search_browse_wikipedia` → `leave_wikipedia_as_learner` then teacher `open_wikipedia_as_teacher` → `leave_wikipedia_as_teacher` (names match cover-all.yaml). Kiwix pins `duration-kiwix-ideaa-001` / `kiwix-ideaa-001` (not infra_disk yet). **HOLD live** until Atlas redeploys Console@`198eb69` + Steve/Atlas GO.
+
+**`nextcloud-file-drop-smoke`** (8 steps, learner): `open_console_as_learner` → `open_nextcloud_as_learner` → `browse_folders` → `open_file_drop` → `after_upload` → `open_file_drop` → `leave_file_drop` → `return_to_start` (names match cover-all.yaml). Seeded Grade5A pins only. **HOLD live** until Atlas redeploys Console@`198eb69` + Steve/Atlas GO.
 
 **`--record-walk` caveat:** frames often show the Console Apps page, not the Kolibri tab — the recorder does not follow app tabs. Do not trust screenshots alone for Kolibri steps; prefer Intent `ok` / structured logs.
 

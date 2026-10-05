@@ -1,0 +1,23 @@
+# HOLD LIVE: do not run --live --ui until (1) Atlas redeploys Console tip 198eb69
+# (PR #135 Prefer A: Wikipedia / Kiwix stub open + search_browse + leave), and (2) Steve/Atlas GO.
+# Fake Stub OK now. Kiwix fixture not infra_disk yet (unified.yaml still comments kiwix deferred
+# for fleet dock); live needs Kid sidecar / DURATION_KIWIX_URL as Pixel Intent docs say.
+#
+# Covers cover-all wiki edges in one walk (learner search path + teacher leave path).
+# Action names match cover-all.yaml / cover-registered contract exactly:
+#   open_wikipedia_as_* / search_browse_wikipedia / leave_wikipedia_as_*
+# store_mode: shared via unified.yaml. Seeded pins: duration-kiwix-ideaa-001 / kiwix-ideaa-001
+# (Console Prefer A; not Grade5A). Do NOT flip unified.yaml store_mode.
+kind: walk
+name: wikipedia-smoke
+graph: unified
+steps:
+  - { from: start, to: console_learner, action: open_console_as_learner }
+  - { from: console_learner, to: wiki_browse, action: open_wikipedia_as_learner }
+  - { from: wiki_browse, to: wiki_browse, action: search_browse_wikipedia }
+  - { from: wiki_browse, to: console_learner, action: leave_wikipedia_as_learner }
+  - { from: console_learner, to: start, action: return_to_start }
+  - { from: start, to: console_teacher, action: open_console_as_teacher }
+  - { from: console_teacher, to: wiki_browse, action: open_wikipedia_as_teacher }
+  - { from: wiki_browse, to: console_teacher, action: leave_wikipedia_as_teacher }
+  - { from: console_teacher, to: start, action: return_to_start }

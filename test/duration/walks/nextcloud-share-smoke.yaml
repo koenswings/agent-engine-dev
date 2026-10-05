@@ -1,15 +1,16 @@
 # HOLD LIVE: do not run --live --ui until (1) Atlas confirms Path A applied with Kid App#11
 # @ a443398 Prefer A fixtures, (2) Kid `enable_sharing true` on the Grade 5A Files mount is
-# confirmed, and (3) Steve clears it. Needs Console@2da863c+ (share_to_class @ 953af05,
-# done_sharing / back_to_console_from_share @ 1709165). Fake Stub OK now.
+# confirmed, and (3) Steve clears it. Needs Console@198eb69+ (share_to_class @ 953af05,
+# done_sharing / back_to_console_from_share @ 1709165; Files settle @ b1d3d60). Fake Stub OK now.
+# Share live re-run waits Atlas 198eb69 + Steve/Atlas GO.
 #
 # Mirrors cover-all teacher NC block (open_nextcloud_as_teacher → share_to_class →
 # back_to_console_from_share) plus nc_share → done_sharing. Prefer A: seeded Grade5A pins
 # only (duration-nextcloud-grade5a-001 / nextcloud-grade5a-001 from scenarios/unified.yaml).
 # store_mode: shared, inherited from graph unified.yaml (walk loader does not override it).
 # Live open_nextcloud_as_* loud-fails if the NC sign-in fails (Kid passwords).
-# Collab / File Drop / wiki smokes wait on Pixel/Atlas (keep_editing, open_file_drop,
-# after_upload, leave_file_drop, wiki Intents not registered yet).
+# Collab / wiki / File Drop smokes prepared separately (@ 198eb69):
+# nextcloud-collab-smoke, wikipedia-smoke, nextcloud-file-drop-smoke. HOLD live until Atlas 198eb69 + GO.
 kind: walk
 name: nextcloud-share-smoke
 graph: unified

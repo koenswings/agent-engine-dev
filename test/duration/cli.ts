@@ -35,7 +35,7 @@ const usage = () => {
   --scenario <name>     Markov: random|unified (default) → scenarios/unified.yaml
                         Walk:   cover-all → walks/cover-all.yaml (strict full graph)
                         Walk:   cover-registered-intents → walks/cover-registered-intents.yaml (registered-intents walk; alias cover-hardpass)
-                        Walk:   kolibri-learn-smoke / kolibri-teacher-preview-smoke → short finish_exercise smokes
+                        Walk:   kolibri-*-smoke / nextcloud-*-smoke / wikipedia-smoke → short Prefer A smokes
                         Deprecated aliases → unified: ${Object.keys(SCENARIO_ALIASES).join(', ')}
   --iterations <n>      Markov steps (default: 40). Walks default to steps.length.
   --start-from <N|action>  Walks only: start at 1-based step N (duration_step numbering)

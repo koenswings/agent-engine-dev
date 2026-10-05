@@ -38,6 +38,9 @@ import {
     DURATION_UI_FIXTURES,
     isPixelIntent,
     resolveConsoleIntentsDir,
+    DEFERRED_UI_INTENTS,
+    PIXEL_REGISTERED_INTENTS,
+    PIXEL_MISSING_INTENTS,
 } from '../duration/ui/index.js'
 import {
     DEFAULT_FAIL_AFTER,
@@ -301,6 +304,103 @@ describe('duration scenario YAML loader', () => {
             'done_sharing',
             'share_to_class',
             'back_to_console_from_share',
+            'return_to_start',
+        ])
+        expect(walk.scenario.store_mode).toBe('shared')
+        const ops = fakeOps({
+            poolEngines: [...DEFAULT_POOL],
+            excludeEngines: ['idea02'],
+            storeMode: 'shared',
+            settleDelayMs: 0,
+        })
+        const result = await runDeterministicWalk(walk, {
+            fast: true,
+            ops,
+            stubUi: true,
+            skipStability: true,
+        })
+        expect(result.failures).toBe(0)
+        expect(result.aborted).toBe(false)
+        expect(result.steps).toBe(8)
+        expect(result.finalState).toBe('start')
+    })
+
+    it('runs nextcloud-collab-smoke Fake walk end-to-end (open_collab_doc → keep_editing → close_doc)', async () => {
+        expect(isWalkScenario('nextcloud-collab-smoke')).toBe(true)
+        const walk = loadWalk('nextcloud-collab-smoke')
+        expect(walk.steps.map(s => s.action)).toEqual([
+            'open_console_as_teacher',
+            'open_nextcloud_as_teacher',
+            'browse_folders',
+            'open_collab_doc',
+            'keep_editing',
+            'close_doc',
+            'return_to_start',
+        ])
+        expect(walk.scenario.store_mode).toBe('shared')
+        const ops = fakeOps({
+            poolEngines: [...DEFAULT_POOL],
+            excludeEngines: ['idea02'],
+            storeMode: 'shared',
+            settleDelayMs: 0,
+        })
+        const result = await runDeterministicWalk(walk, {
+            fast: true,
+            ops,
+            stubUi: true,
+            skipStability: true,
+        })
+        expect(result.failures).toBe(0)
+        expect(result.aborted).toBe(false)
+        expect(result.steps).toBe(7)
+        expect(result.finalState).toBe('start')
+    })
+
+    it('runs wikipedia-smoke Fake walk end-to-end (learner search + teacher leave)', async () => {
+        expect(isWalkScenario('wikipedia-smoke')).toBe(true)
+        const walk = loadWalk('wikipedia-smoke')
+        expect(walk.steps.map(s => s.action)).toEqual([
+            'open_console_as_learner',
+            'open_wikipedia_as_learner',
+            'search_browse_wikipedia',
+            'leave_wikipedia_as_learner',
+            'return_to_start',
+            'open_console_as_teacher',
+            'open_wikipedia_as_teacher',
+            'leave_wikipedia_as_teacher',
+            'return_to_start',
+        ])
+        expect(walk.scenario.store_mode).toBe('shared')
+        const ops = fakeOps({
+            poolEngines: [...DEFAULT_POOL],
+            excludeEngines: ['idea02'],
+            storeMode: 'shared',
+            settleDelayMs: 0,
+        })
+        const result = await runDeterministicWalk(walk, {
+            fast: true,
+            ops,
+            stubUi: true,
+            skipStability: true,
+        })
+        expect(result.failures).toBe(0)
+        expect(result.aborted).toBe(false)
+        expect(result.steps).toBe(9)
+        expect(result.finalState).toBe('start')
+    })
+
+
+    it('runs nextcloud-file-drop-smoke Fake walk end-to-end (open_file_drop → after_upload → leave_file_drop)', async () => {
+        expect(isWalkScenario('nextcloud-file-drop-smoke')).toBe(true)
+        const walk = loadWalk('nextcloud-file-drop-smoke')
+        expect(walk.steps.map(s => s.action)).toEqual([
+            'open_console_as_learner',
+            'open_nextcloud_as_learner',
+            'browse_folders',
+            'open_file_drop',
+            'after_upload',
+            'open_file_drop',
+            'leave_file_drop',
             'return_to_start',
         ])
         expect(walk.scenario.store_mode).toBe('shared')
@@ -894,19 +994,36 @@ describe('Phase 3 UI Intent dispatch (StubUiDriver)', () => {
         expect(isPixelIntent('infra_dock_fixture')).toBe(false)
     })
 
-    it('deferred Intents return mode deferred without aborting stub walks', async () => {
+    it('Wikipedia + keep_editing + File Drop are Pixel-registered @ 198eb69 (deferred/missing empty)', async () => {
         const driver = new StubUiDriver()
-        const r = await driver.runIntent({ action: 'open_wikipedia_as_teacher' })
-        expect(r.ok).toBe(true)
-        expect(r.mode).toBe('deferred')
+        for (const action of [
+            'open_wikipedia_as_teacher',
+            'open_wikipedia_as_learner',
+            'search_browse_wikipedia',
+            'leave_wikipedia_as_teacher',
+            'leave_wikipedia_as_learner',
+            'keep_editing',
+            'open_file_drop',
+            'after_upload',
+            'leave_file_drop',
+        ] as const) {
+            expect(isPixelIntent(action)).toBe(true)
+            const r = await driver.runIntent({ action })
+            expect(r.ok).toBe(true)
+            expect(r.mode).toBe('stub')
+            expect(r.message).not.toMatch(/deferred|Pixel-missing/)
+        }
+        expect(DEFERRED_UI_INTENTS).toHaveLength(0)
+        expect(PIXEL_REGISTERED_INTENTS).toHaveLength(85)
+        expect(PIXEL_MISSING_INTENTS).toHaveLength(0)
     })
 
-    it('Pixel-missing Intents Fake no-op without aborting', async () => {
+    it('unknown Intent still Fake no-ops without aborting (PIXEL_MISSING empty @ 198eb69)', async () => {
         const driver = new StubUiDriver()
-        const r = await driver.runIntent({ action: 'open_file_drop' })
+        const r = await driver.runIntent({ action: 'not_a_real_intent_xyz' })
         expect(r.ok).toBe(true)
         expect(r.mode).toBe('stub')
-        expect(r.message).toMatch(/Pixel-missing/)
+        expect(r.message).toMatch(/unknown Intent/)
     })
 
     it('bakes Kid content pins (App#10)', () => {
