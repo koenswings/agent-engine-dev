@@ -65,6 +65,8 @@ export const PIXEL_REGISTERED_INTENTS = [
     'keep_watching',
     // video → exercise via resource panel (Console#135 @ f16ee18)
     'next_resource',
+    // exercise → Learn home via Perseus Check (Console#135 @ d087081)
+    'finish_exercise',
     // Pixel coaching set (Console#134 @ ba0cfa1)
     'create_class',
     'enroll_learners',
@@ -137,10 +139,10 @@ export const DEFERRED_UI_INTENTS = [
  * Lesson chrome exit_lesson + open_wikipedia_* stay deferred.
  * keep_watching is registered (Console#134 @ 329dc38).
  * next_resource is registered (Console#135 @ f16ee18).
+ * finish_exercise is registered (Console#135 @ d087081).
  */
 export const PIXEL_MISSING_INTENTS = [
-    // Kolibri navigation (finish_exercise/next_video not deferred — clear Fake no-op)
-    'finish_exercise',
+    // Kolibri navigation (next_video not deferred — clear Fake no-op)
     'next_video',
     // Nextcloud deep
     'share_to_class',

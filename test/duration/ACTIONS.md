@@ -38,7 +38,7 @@ Fake/CI default: `StubUiDriver` (no browser). Live UI: `pnpm test:duration -- --
 ### Pixel-registered (65 — Console#134 @ ba0cfa1)
 
 Hub/dwell: `open_console_as_*`, `return_to_start`, `stay_on_*`  
-App-open: `open_kolibri_as_teacher` → `/en/coach/#/classes`, `open_kolibri_as_learner`, `open_nextcloud_as_*`, `open_video`, `open_exercise`, `keep_watching` (Console#134 @ 329dc38, stay on pinned video URL), `next_resource` (Console#135 @ f16ee18, video→exercise via resource panel)
+App-open: `open_kolibri_as_teacher` → `/en/coach/#/classes`, `open_kolibri_as_learner`, `open_nextcloud_as_*`, `open_video`, `open_exercise`, `keep_watching` (Console#134 @ 329dc38, stay on pinned video URL), `next_resource` (Console#135 @ f16ee18, video→exercise via resource panel), `finish_exercise` (Console#135 @ d087081, exercise→Learn home via Perseus Check)
 Operator: `open_disk_inventory`, `open_instance_controls`, `eject_disk`, `confirm_eject`, `cancel_eject`, `erase_disk`, `confirm_erase`, `cancel_erase`, `start_instance`, `stop_instance`, `open_account`, `close_account`, `open_settings`, `close_settings`, `sign_in`, `make_files_disk`, `add_files_role`  
 Operator deep: `install_app`, `start_after_install`, `stay_on_disk`, `make_backup_disk`, `restore_from_backup`, `open_app`, `backup_instance`, `back_to_disk`, `back_to_overview`, `log_out`, `notice_usb_dock`, `retry_login_first_time_setup`, `change_password`, `add_operator`, `remove_operator`, `copy_app`, `move_app`  
 **Coaching (Console#134 @ ba0cfa1):** `create_class`, `enroll_learners`, `build_lesson`, `create_quiz`, `read_reports`, `preview_as_learner`, `browse_classes`
@@ -55,7 +55,7 @@ Operator deep: `install_app`, `start_after_install`, `stay_on_disk`, `make_backu
 
 Do **not** silently drop these edges from `unified.yaml`.
 
-**Kolibri navigation:** `finish_exercise`, `next_video`
+**Kolibri navigation:** `next_video`
 
 **Nextcloud deep:** `share_to_class`, `done_sharing`, `back_to_console_from_share`, `open_file_drop`, `after_upload`, `leave_file_drop`, `open_collab_doc`, `close_doc`, `keep_editing`, `browse_folders`
 
