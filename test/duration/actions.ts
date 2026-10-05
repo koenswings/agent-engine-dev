@@ -265,23 +265,24 @@ export const waitEmpty002PostInstallRunning = async (
 }
 
 /**
- * Shared Prefer A empty-002 fresh re-dock (Kid pack always rm+cp via dockFixture).
+ * Shared Prefer A empty-pack fresh re-dock (Kid pack always rm+cp via dockFixture;
+ * empty/empty-002 also strip non-META so createFilesDisk is not refused by README.md).
  * Force undock-then-dock so RealFleetOps empty always-fresh-copy runs (dockFixture
  * no-ops when already on the same engine). Does NOT change DURATION_EMPTY_DISK_ID
  * (=001); Pixel ensureEmptyDiskPanel discovers any empty-badge row. Never idea02.
  * FakeFleetOps: undock pool-wide + synthetic dockFixture (CRI stays green).
- * purgeStoreInstances (BeforeSecondInstall + BeforeErase / Prefer A r36/r37): FS
- * wipe is not enough — Automerge instanceDB rows with storedOn=empty-002 survive;
- * Console hasInstancesOn keys off store → still shows app / no EmptyDiskPanel.
- * AfterErase must NOT purge (erase already cleared instances).
+ * purgeStoreInstances (BeforeSecondInstall + BeforeErase + BeforeMakeFiles /
+ * Prefer A r36/r37/r20): FS wipe is not enough — Automerge instanceDB rows with
+ * storedOn=diskId survive; Console hasInstancesOn keys off store → still shows
+ * app / no EmptyDiskPanel. AfterErase must NOT purge (erase already cleared instances).
  */
-const redockEmpty002Fresh = async (
+const redockEmptyFresh = async (
     ctx: ActionContext,
+    diskId: string,
     label: string,
     noteSuffix: string,
     opts?: { purgeStoreInstances?: boolean },
 ): Promise<string> => {
-    const diskId = DURATION_UI_FIXTURES.empty2.diskId
     const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
     if (pool.length === 0) {
         throw new Error(`${label}: no pool engines available`)
@@ -312,6 +313,14 @@ const redockEmpty002Fresh = async (
     await settleParticipants(ctx, pool)
     return `re-docked ${diskId} on ${engine} ${noteSuffix}`
 }
+
+const redockEmpty002Fresh = (
+    ctx: ActionContext,
+    label: string,
+    noteSuffix: string,
+    opts?: { purgeStoreInstances?: boolean },
+): Promise<string> =>
+    redockEmptyFresh(ctx, DURATION_UI_FIXTURES.empty2.diskId, label, noteSuffix, opts)
 
 /**
  * Prefer A r26/r27 live safety net: Path A confirm_erase of empty-002 undocks
@@ -355,6 +364,56 @@ export const redockEmpty002BeforeErase = async (ctx: ActionContext): Promise<str
         'before late erase_disk (Empty fresh pack + store purge)',
         { purgeStoreInstances: true },
     )
+
+/**
+ * Prefer A r20 FAIL@92: cover-all install_app@88 dirties empty-001 (apps/instances/
+ * services + Kid README.md). Pixel make_files_disk then createFilesDisk-refuses
+ * ("has other files") but soft-passes on Nextcloud's tree files badge. Re-dock
+ * empty-001 fresh (strip non-META) + purge store before make_files_disk Intent.
+ * Does NOT move Kolibri back — files_role_added targets this Files Disk, not Grade5A.
+ */
+export const redockEmpty001BeforeMakeFiles = async (ctx: ActionContext): Promise<string> =>
+    redockEmptyFresh(
+        ctx,
+        DURATION_UI_FIXTURES.empty.diskId,
+        'redockEmpty001BeforeMakeFiles',
+        'before make_files_disk (Empty fresh pack + store purge; createFilesDisk-clean)',
+        { purgeStoreInstances: true },
+    )
+
+/**
+ * Prefer A r20: after Pixel make_files_disk ok, confirm store diskTypes includes
+ * 'files' on the Empty→Files target. Pixel settle can soft-pass on a foreign
+ * [data-role=files] badge (Nextcloud) while createFilesDisk refused dirty root.
+ * StubUiDriver skips (Fake has no Engine createFilesDisk). Never idea02.
+ */
+const assertFilesRoleOnDisk = async (ctx: ActionContext, diskId: string): Promise<string> => {
+    const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
+    const engine =
+        (ctx.walker.dockedEngine && !ctx.excludeEngines.includes(ctx.walker.dockedEngine)
+            ? ctx.walker.dockedEngine
+            : null) ?? pool[0]
+    if (!engine) {
+        throw new Error(`assertFilesRoleOnDisk: no pool engine for ${diskId}`)
+    }
+    const budget = 30_000
+    const deadline = Date.now() + budget
+    let lastTypes: string[] = []
+    while (Date.now() < deadline) {
+        const view = await ctx.opts.ops.readStore(engine)
+        const disk = view.diskDB[diskId]
+        lastTypes = disk?.diskTypes ?? []
+        if (lastTypes.includes('files')) {
+            return `store files role on ${diskId} (${lastTypes.join(',')})`
+        }
+        await sleep(400)
+    }
+    throw new Error(
+        `make_files_disk soft-pass: disk ${diskId} on ${engine} diskTypes=[${lastTypes.join(', ')}] ` +
+            `lack 'files' within ${budget}ms (createFilesDisk refused dirty root, or Pixel matched a foreign files badge). ` +
+            `Prefer A — fail loud; do not assert Kolibri Grade5A.`,
+    )
+}
 
 const infraUndockFixtures = async (ctx: ActionContext): Promise<ActionResult> => {
     const engines = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
@@ -890,6 +949,33 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             diskId = k[0]
             instanceId = k[1]
         }
+    } else if (
+        ctx.action === 'make_files_disk' ||
+        ctx.action === 'add_files_role' ||
+        ctx.action === 'files_role_added' ||
+        ctx.action === 'make_backup_disk' ||
+        ctx.action === 'restore_from_backup' ||
+        ctx.action === 'backup_configured_restored' ||
+        ctx.action === 'erase_disk' ||
+        ctx.action === 'install_app' ||
+        ctx.action === 'start_after_install'
+    ) {
+        // Prefer A r20: EmptyDiskPanel / Files-role Intents — never hard-code moved Kolibri.
+        const filesId = process.env.DURATION_FILES_DISK_ID?.trim()
+        const emptyId =
+            process.env.DURATION_EMPTY_DISK_ID?.trim() || DURATION_UI_FIXTURES.empty.diskId
+        if (
+            filesId &&
+            (ctx.action === 'files_role_added' ||
+                ctx.action === 'add_files_role' ||
+                ctx.action === 'backup_configured_restored' ||
+                ctx.action === 'restore_from_backup')
+        ) {
+            diskId = filesId
+        } else {
+            diskId = emptyId
+        }
+        instanceId = undefined
     }
     let preStartSettleNote: string | null = null
     // Prefer A r32: settle empty-002 auto-start before start_after_install Intent.
@@ -901,6 +987,20 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             return {
                 ok: false,
                 message: `start_after_install aborted before Intent: ${err}`,
+                layer,
+            }
+        }
+    }
+    // Prefer A r20: fresh-clean empty-001 before make_files_disk (install_app may have dirtied it).
+    if (ctx.action === 'make_files_disk') {
+        try {
+            const note = await redockEmpty001BeforeMakeFiles(ctx)
+            preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${note}` : note
+        } catch (e) {
+            const err = e instanceof Error ? e.message : String(e)
+            return {
+                ok: false,
+                message: `make_files_disk aborted before Intent: ${err}`,
                 layer,
             }
         }
@@ -934,6 +1034,26 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     let message = result.message ?? `${result.mode}: ${ctx.action}`
     if (preStartSettleNote) {
         message = `${message}; ${preStartSettleNote}`
+    }
+    // Prefer A r20: pin Files Disk under test + fail loud if Pixel soft-passed on dirty empty.
+    if (result.ok && ctx.action === 'make_files_disk') {
+        const filesDiskId = diskId ?? DURATION_UI_FIXTURES.empty.diskId
+        process.env.DURATION_FILES_DISK_ID = filesDiskId
+        if (driver.kind === 'playwright') {
+            try {
+                const note = await assertFilesRoleOnDisk(ctx, filesDiskId)
+                message = `${message}; ${note}`
+            } catch (e) {
+                const err = e instanceof Error ? e.message : String(e)
+                return {
+                    ok: false,
+                    message: `make_files_disk reported ok but files role missing: ${err}`,
+                    layer,
+                }
+            }
+        } else {
+            message = `${message}; DURATION_FILES_DISK_ID=${filesDiskId} (stub; skip store assert)`
+        }
     }
     // Prefer A r26: after successful confirm_erase, re-dock empty-002 Empty for late install_app.
     if (result.ok && ctx.action === 'confirm_erase') {
@@ -1171,6 +1291,7 @@ export class FakeFleetOps implements FleetOps {
                 name: diskId,
                 dockedTo: engineId,
                 device: 'idea-test-duration',
+                diskTypes: /empty/i.test(diskId) ? ['empty'] : undefined,
             }
             // Fixture instance becomes Running when docked (semantic smoke).
             const instId = this.fixtureInstanceMap[diskId] ?? `${diskId}-main`
@@ -1266,6 +1387,10 @@ export class FakeFleetOps implements FleetOps {
                 if (inst && inst.diskId === diskId) {
                     delete doc.instanceDB[id]
                 }
+            }
+            const disk = doc.diskDB[diskId]
+            if (disk && /empty/i.test(diskId)) {
+                disk.diskTypes = ['empty']
             }
         })
         if (this.settleDelayMs) await sleep(this.settleDelayMs)

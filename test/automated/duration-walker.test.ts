@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { FakeFleetOps, dispatchAction, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, nextcloudLoginFormLooksReady, nextcloudInitialState, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
+import { FakeFleetOps, dispatchAction, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, redockEmpty001BeforeMakeFiles, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, nextcloudLoginFormLooksReady, nextcloudInitialState, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
 import { semanticStoresEqual, waitForConvergence } from '../duration/convergence.js'
 import { evaluateInvariants, DEFAULT_INFRA_INVARIANTS, listInvariantTypes } from '../duration/invariants.js'
 import {
@@ -898,6 +898,9 @@ describe('RealFleetOps guard clauses (no network)', () => {
         // Still refuse when META belongs to a different diskId
         expect(emptyRemote).toMatch(/! grep -Fq 'diskId: duration-empty-001'/)
         expect(emptyRemote).toMatch(/exit 4/)
+        // Prefer A r20: strip Kid README.md / stray apps so createFilesDisk is not refused
+        expect(emptyRemote).toMatch(/stripped non-META entries from empty pack/)
+        expect(emptyRemote).toMatch(/! -name 'META\.yaml' ! -name 'lost\+found'/)
 
         const empty2Remote = buildSshDockCopyRemote({
             ...base,
@@ -912,6 +915,7 @@ describe('RealFleetOps guard clauses (no network)', () => {
         expect(empty2Remote).toMatch(/cp -a '\/fixtures\/empty-002\/\.'/)
         expect(empty2Remote).not.toMatch(/reuse existing Path A tree/)
         expect(empty2Remote).toMatch(/! grep -Fq 'diskId: duration-empty-002'/)
+        expect(empty2Remote).toMatch(/stripped non-META entries from empty pack/)
 
         const kolibriRemote = buildSshDockCopyRemote({
             ...base,
@@ -1066,6 +1070,38 @@ describe('Phase 3 UI Intent dispatch (StubUiDriver)', () => {
         expect(defaultIdsForIntent('open_kolibri_as_learner').instanceId).toBe('kolibri-grade5a-001')
     })
 
+    it('defaultIdsForIntent remaps files/backup EmptyDiskPanel Intents to empty-001 (not Kolibri)', () => {
+        const prevFiles = process.env.DURATION_FILES_DISK_ID
+        const prevEmpty = process.env.DURATION_EMPTY_DISK_ID
+        delete process.env.DURATION_FILES_DISK_ID
+        delete process.env.DURATION_EMPTY_DISK_ID
+        try {
+            for (const action of [
+                'make_files_disk',
+                'add_files_role',
+                'files_role_added',
+                'make_backup_disk',
+                'restore_from_backup',
+                'backup_configured_restored',
+                'erase_disk',
+            ]) {
+                const ids = defaultIdsForIntent(action)
+                expect(ids.diskId, action).toBe('duration-empty-001')
+                expect(ids.instanceId, action).toBeUndefined()
+            }
+            process.env.DURATION_FILES_DISK_ID = 'duration-files-disk'
+            expect(defaultIdsForIntent('files_role_added').diskId).toBe('duration-files-disk')
+            expect(defaultIdsForIntent('add_files_role').diskId).toBe('duration-files-disk')
+            // make_files_disk stays on EMPTY (convert target), not FILES pin
+            expect(defaultIdsForIntent('make_files_disk').diskId).toBe('duration-empty-001')
+        } finally {
+            if (prevFiles === undefined) delete process.env.DURATION_FILES_DISK_ID
+            else process.env.DURATION_FILES_DISK_ID = prevFiles
+            if (prevEmpty === undefined) delete process.env.DURATION_EMPTY_DISK_ID
+            else process.env.DURATION_EMPTY_DISK_ID = prevEmpty
+        }
+    })
+
     it('walker dispatches usage Intents through uiDriver on unified', async () => {
         const scenario = loadScenario('unified')
         const ops = fakeOps({
@@ -1196,6 +1232,45 @@ describe('Prefer A empty-002 re-dock after confirm_erase (Fake)', () => {
 })
 
 describe('Prefer A empty-002 re-dock before second late install (Fake)', () => {
+    it('redockEmpty001BeforeMakeFiles docks empty-001 on pool[0] with purge', async () => {
+        const ops = new FakeFleetOps({
+            poolEngines: ['idea01', 'idea03', 'idea04'],
+            excludeEngines: ['idea02'],
+            storeMode: 'shared',
+            fixtureInstanceMap: {
+                'duration-empty-001': 'empty-001-main',
+            },
+        })
+        await ops.dockFixture('idea01', 'duration-empty-001')
+        // Simulate install_app residue on empty-001
+        await ops.purgeInstancesStoredOn('idea01', 'duration-empty-001')
+        const ctx = {
+            action: 'make_files_disk',
+            poolEngines: ['idea01', 'idea03', 'idea04'],
+            excludeEngines: ['idea02'],
+            fixtureDisk: 'duration-kolibri-grade5a-001',
+            fixtureDisks: [
+                'duration-kolibri-grade5a-001',
+                'duration-nextcloud-grade5a-001',
+                'duration-empty-001',
+                'duration-empty-002',
+            ],
+            fixtureInstances: {},
+            walker: { dockedEngine: 'idea01', step: 90, layer: 'operator' as const },
+            opts: { ops, settleTimeoutMs: 500 },
+        }
+        const note = await redockEmpty001BeforeMakeFiles(ctx as any)
+        expect(note).toMatch(/duration-empty-001/)
+        expect(note).toMatch(/idea01/)
+        expect(note).toMatch(/make_files_disk/)
+        const view = await ops.readStore('idea01')
+        expect(view.diskDB['duration-empty-001']?.dockedTo).toBe('idea01')
+        expect(view.diskDB['duration-empty-001']?.diskTypes).toEqual(['empty'])
+        // Primary EMPTY pin unchanged
+        expect(DURATION_UI_FIXTURES.empty.diskId).toBe('duration-empty-001')
+        expect(DURATION_UI_FIXTURES.empty2.diskId).toBe('duration-empty-002')
+    })
+
     it('redockEmpty002BeforeSecondInstall docks empty-002 on pool[0]', async () => {
         const ops = fakeOps({
             poolEngines: ['idea01', 'idea03'],

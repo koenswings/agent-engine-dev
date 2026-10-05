@@ -258,6 +258,17 @@ export const buildSshDockCopyRemote = (args: SshDockCopyRemoteArgs): string => {
         `mkdir -p '${dest}'`,
         `cp -a '${src}/.' '${dest}/'`,
         stripInstances,
+    )
+    if (pack === 'empty' || pack === 'empty-002') {
+        // createFilesDisk allows only META.yaml + lost+found on empty roots.
+        // Kid pack ships README.md (humans); prior install leaves apps/instances/services.
+        // Strip so Empty → Files does not false-refuse / Pixel soft-pass on dirty error.
+        parts.push(
+            `find '${dest}' -mindepth 1 -maxdepth 1 ! -name 'META.yaml' ! -name 'lost+found' -exec rm -rf {} +`,
+            `echo "RealFleetOps: stripped non-META entries from empty pack at ${dest} (createFilesDisk-clean)"`,
+        )
+    }
+    parts.push(
         `test -f '${dest}/META.yaml' || { echo "META.yaml missing after copy into ${dest}" >&2; exit 3; }`,
         // Atlas: chokidar needs unlink+create after eject, not mtime-only touch.
         `rm -f '${sentinel}'; sleep 5; touch '${sentinel}'`,
@@ -523,6 +534,9 @@ export class RealFleetOps implements FleetOps {
                 name: disk.name != null ? String(disk.name) : undefined,
                 dockedTo: resolveLogical(disk.dockedTo != null ? String(disk.dockedTo) : null),
                 device: disk.device != null ? String(disk.device) : null,
+                diskTypes: Array.isArray(disk.diskTypes)
+                    ? disk.diskTypes.map(String)
+                    : undefined,
             }
         }
 

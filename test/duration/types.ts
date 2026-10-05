@@ -78,6 +78,8 @@ export interface SemanticDisk {
     name?: string
     dockedTo: string | null
     device?: string | null
+    /** Prefer A r20: make_files_disk post-check (files role landed). */
+    diskTypes?: string[]
 }
 
 export interface SemanticEngine {

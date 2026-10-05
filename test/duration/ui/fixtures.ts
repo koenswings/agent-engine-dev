@@ -222,6 +222,33 @@ export const defaultIdsForIntent = (action: string): { diskId?: string; instance
             // omit instanceId → Pixel discovers newly installed non-grade5a start-*
         }
     }
+    // Prefer A r20 FAIL@92: files / backup EmptyDiskPanel Intents must target the
+    // empty (or Files) disk under test — never hard-code moved Kolibri Grade5A.
+    // files_role_added asserts disk-view / files badge on this id (DURATION_FILES_DISK_ID
+    // after make_files_disk when set by the harness).
+    if (
+        action === 'make_files_disk' ||
+        action === 'add_files_role' ||
+        action === 'files_role_added' ||
+        action === 'make_backup_disk' ||
+        action === 'restore_from_backup' ||
+        action === 'backup_configured_restored' ||
+        action === 'erase_disk'
+    ) {
+        const filesId = process.env.DURATION_FILES_DISK_ID?.trim()
+        if (
+            filesId &&
+            (action === 'files_role_added' ||
+                action === 'add_files_role' ||
+                action === 'backup_configured_restored' ||
+                action === 'restore_from_backup')
+        ) {
+            return { diskId: filesId }
+        }
+        const emptyId =
+            process.env.DURATION_EMPTY_DISK_ID?.trim() || DURATION_UI_FIXTURES.empty.diskId
+        return { diskId: emptyId }
+    }
     if (
         action.includes('kolibri') ||
         action === 'open_video' ||
