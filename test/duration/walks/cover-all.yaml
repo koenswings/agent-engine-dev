@@ -63,18 +63,31 @@ steps:
   - from: kolibri_home
     to: start
     action: return_to_start
+  # Prefer A cover-all-fd3b210-r11 FAIL@22 — share needs teacher; file-drop needs learner.
   - from: start
-    to: console_learner
-    action: open_console_as_learner
-  - from: console_learner
+    to: console_teacher
+    action: open_console_as_teacher
+  - from: console_teacher
     to: nc_browse
-    action: open_nextcloud_as_learner
+    action: open_nextcloud_as_teacher
   - from: nc_browse
     to: nc_share
     action: share_to_class
   - from: nc_share
     to: nc_browse
     action: done_sharing
+  - from: nc_browse
+    to: console_teacher
+    action: leave_nextcloud_as_teacher
+  - from: console_teacher
+    to: start
+    action: return_to_start
+  - from: start
+    to: console_learner
+    action: open_console_as_learner
+  - from: console_learner
+    to: nc_browse
+    action: open_nextcloud_as_learner
   - from: nc_browse
     to: nc_drop
     action: open_file_drop
