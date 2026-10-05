@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { FakeFleetOps, dispatchAction, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, nextcloudLoginFormLooksReady, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
+import { FakeFleetOps, dispatchAction, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, nextcloudLoginFormLooksReady, nextcloudInitialState, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
 import { semanticStoresEqual, waitForConvergence } from '../duration/convergence.js'
 import { evaluateInvariants, DEFAULT_INFRA_INVARIANTS, listInvariantTypes } from '../duration/invariants.js'
 import {
@@ -58,7 +58,8 @@ import {
     listFramePngs,
     sanitizeActionForFilename,
 } from '../duration/recordWalk.js'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -1678,6 +1679,76 @@ describe('syncNextcloudSidecarUrlForEngine / waitNextcloud (r16 FAIL@65 / r17 FA
             ]),
         ).toBe(true)
         expect(fixtureSetHasNextcloud('duration-kolibri-grade5a-001', ['duration-empty-001'])).toBe(false)
+    })
+
+    // cover-all-230b70f-r19 FAIL@58: NC 31 renders the login form client-side (Vue).
+    // Real HTML shape from Atlas Path A evidence path-a-ready-r19/nc-login-page.html.
+    // cwd-first (dist-test/ has no .html assets), module-relative fallback — mirrors scenariosDir().
+    const ncLoginVueFixture = (): string => {
+        const fromCwd = join(process.cwd(), 'test/duration/fixtures/nextcloud-login-vue.html')
+        if (existsSync(fromCwd)) return fromCwd
+        return fileURLToPath(new URL('../duration/fixtures/nextcloud-login-vue.html', import.meta.url))
+    }
+    const NC_LOGIN_VUE_HTML = readFileSync(ncLoginVueFixture(), 'utf8')
+
+    it('nextcloudLoginFormLooksReady: real NC Vue login (body-login + hideLoginForm=false) is ready (r19 FAIL@58)', () => {
+        // Guard: fixture has no classic form signals, so path A alone must carry it.
+        expect(NC_LOGIN_VUE_HTML).toContain('id="body-login"')
+        expect(NC_LOGIN_VUE_HTML).toContain('id="initial-state-core-hideLoginForm" value="ZmFsc2U="')
+        expect(/name=["']user["']|name=["']password["']|type=["']submit["']|data-login-form/i.test(NC_LOGIN_VUE_HTML)).toBe(false)
+        expect(nextcloudInitialState(NC_LOGIN_VUE_HTML, 'core', 'hideLoginForm')).toBe('false')
+        expect(nextcloudLoginFormLooksReady(NC_LOGIN_VUE_HTML)).toBe(true)
+    })
+
+    it('nextcloudLoginFormLooksReady: Vue path requires body-login AND hideLoginForm=false', () => {
+        // hideLoginForm=true (dHJ1ZQ==) → login form hidden → not ready
+        const hidden = NC_LOGIN_VUE_HTML.replace(
+            'id="initial-state-core-hideLoginForm" value="ZmFsc2U="',
+            'id="initial-state-core-hideLoginForm" value="dHJ1ZQ=="',
+        )
+        expect(nextcloudLoginFormLooksReady(hidden)).toBe(false)
+        // no hideLoginForm marker → not ready
+        const noMarker = NC_LOGIN_VUE_HTML.replace(/<input[^>]*initial-state-core-hideLoginForm[^>]*>/, '')
+        expect(nextcloudLoginFormLooksReady(noMarker)).toBe(false)
+        // other initial-state-core-login* markers alone are not enough
+        expect(noMarker).toContain('initial-state-core-loginUsername')
+        // no body-login → not ready
+        const noBody = NC_LOGIN_VUE_HTML.replace('<body id="body-login">', '<body id="body-user">')
+        expect(nextcloudLoginFormLooksReady(noBody)).toBe(false)
+        // attribute order agnostic
+        expect(
+            nextcloudLoginFormLooksReady(
+                '<body class="x" id="body-login"><input value="ZmFsc2U=" type="hidden" id="initial-state-core-hideLoginForm"></body>',
+            ),
+        ).toBe(true)
+    })
+
+    it('nextcloudLoginFormLooksReady: classic form still ready alongside Vue path (OR)', () => {
+        const classic = `
+          <body id="body-login"><form data-login-form>
+            <input name="user" id="user" /><input name="password" id="password" type="password" />
+            <button type="submit">Log in</button>
+          </form></body>`
+        expect(nextcloudLoginFormLooksReady(classic)).toBe(true)
+    })
+
+    it('waitNextcloudSidecarReadyForEngine resolves on real NC Vue login HTML via logical hostname (r19 FAIL@58, keeps f99ebb9)', async () => {
+        const env: NodeJS.ProcessEnv = { DURATION_NEXTCLOUD_READY_MS: '5000' }
+        const urls: string[] = []
+        const fetchImpl = (async (input: string | URL | Request) => {
+            urls.push(String(input))
+            return { status: 200, text: async () => NC_LOGIN_VUE_HTML } as Response
+        }) as typeof fetch
+        const msg = await waitNextcloudSidecarReadyForEngine('idea01', {
+            hosts: { idea01: '100.99.231.94' },
+            env,
+            fetchImpl,
+            sleepImpl: async () => {},
+        })
+        expect(msg).toContain('login form ready')
+        expect(urls).toEqual(['http://idea01:18280/login'])
+        expect(urls.join(' ')).not.toContain('100.99.231.94')
+        expect(env.DURATION_NEXTCLOUD_URL).toBe('http://idea01:18280')
     })
 
     it('waitNextcloudSidecarReadyForEngine skip sets URL without polling', async () => {

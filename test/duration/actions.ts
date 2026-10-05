@@ -474,10 +474,48 @@ export const nextcloudReadyTimeoutMs = (env: NodeJS.ProcessEnv = process.env): n
 }
 
 /**
- * True when HTML looks like a Nextcloud login form (Console NC_SELECTORS signals).
+ * Decode a Nextcloud `initial-state-<app>-<key>` hidden input value (base64 JSON).
+ * Returns null when the input is absent or undecodable. Attribute order agnostic.
+ */
+export const nextcloudInitialState = (html: string, app: string, key: string): string | null => {
+    const id = `initial-state-${app}-${key}`
+    const tagRe = /<input\b[^>]*>/gi
+    for (const m of html.matchAll(tagRe)) {
+        const tag = m[0]
+        const idMatch = /\bid=["']([^"']+)["']/i.exec(tag)
+        if (!idMatch || idMatch[1] !== id) continue
+        const valMatch = /\bvalue=["']([^"']*)["']/i.exec(tag)
+        if (!valMatch) return null
+        try {
+            return Buffer.from(valMatch[1], 'base64').toString('utf8').trim()
+        } catch {
+            return null
+        }
+    }
+    return null
+}
+
+/**
+ * True when HTML looks like a ready Nextcloud login page. Two paths (OR):
+ *
+ * A) Vue client-rendered login (NC 31 on idea01:18280): server HTML has
+ *    `<body id="body-login">` + `initial-state-core-hideLoginForm` whose base64
+ *    value decodes to `false` (ZmFsc2U=). The form inputs are built by core-login.js,
+ *    so they never appear in the HTTP body. cover-all-230b70f-r19 FAIL@58
+ *    infra_dock_fixture burned the full 180s budget on a healthy NC because only (B)
+ *    existed. Fixture: test/duration/fixtures/nextcloud-login-vue.html
+ *    (Atlas Path A evidence path-a-ready-r19).
+ *
+ * B) Classic server-rendered form (Console NC_SELECTORS signals):
+ *    user + password + submit.
+ *
  * Used by Engine harness HTTP poll — no Playwright.
  */
 export const nextcloudLoginFormLooksReady = (html: string): boolean => {
+    const bodyLogin = /<body\b[^>]*\bid=["']body-login["']/i.test(html)
+    if (bodyLogin && nextcloudInitialState(html, 'core', 'hideLoginForm') === 'false') {
+        return true
+    }
     const hasUser =
         /name=["']user["']|id=["']user["']|data-login-form-input-user/i.test(html)
     const hasPassword =
@@ -529,7 +567,7 @@ export const waitNextcloudSidecarReadyForEngine = async (
                 if (nextcloudLoginFormLooksReady(html)) {
                     return `DURATION_NEXTCLOUD_URL=${base} (login form ready)`
                 }
-                last = `HTTP ${status} login-form incomplete (user/password/submit)`
+                last = `HTTP ${status} login-form incomplete (body-login+hideLoginForm=false | user/password/submit)`
             } else {
                 last = `HTTP ${status}`
             }
