@@ -1,6 +1,6 @@
 #!/usr/bin/env npx tsx
 /**
- * pnpm test:duration [--scenario random|unified|cover-all|cover-registered-intents|cover-hardpass] [--iterations N] [--fast] [--live] [--ui]
+ * pnpm test:duration [--scenario random|unified|cover-all|cover-registered-intents|kolibri-*-smoke|…] [--iterations N] [--start-from N|action] [--fast] [--live] [--ui]
  *
  * Preferred verification (once Pixel+Atlas ready): `--live --ui` for real Console walks.
  * Default Fake: FakeFleetOps + StubUiDriver (CI / missing-Intent only) + Markov on unified.yaml.
@@ -16,7 +16,7 @@
 import { FakeFleetOps } from './actions.js'
 import { RealFleetOps, parseHostsFlag } from './realFleetOps.js'
 import { ensureRecordWalkDir } from './recordWalk.js'
-import { runDeterministicWalk, runWalk } from './runner.js'
+import { resolveWalkStartIndex, runDeterministicWalk, runWalk } from './runner.js'
 import {
     DEFAULT_POOL,
     isWalkScenario,
@@ -35,8 +35,13 @@ const usage = () => {
   --scenario <name>     Markov: random|unified (default) → scenarios/unified.yaml
                         Walk:   cover-all → walks/cover-all.yaml (strict full graph)
                         Walk:   cover-registered-intents → walks/cover-registered-intents.yaml (registered-intents walk; alias cover-hardpass)
+                        Walk:   kolibri-learn-smoke / kolibri-teacher-preview-smoke → short finish_exercise smokes
                         Deprecated aliases → unified: ${Object.keys(SCENARIO_ALIASES).join(', ')}
   --iterations <n>      Markov steps (default: 40). Walks default to steps.length.
+  --start-from <N|action>  Walks only: start at 1-based step N (duration_step numbering)
+                        or first step whose action matches. Seeds walker.current to
+                        that step's 'from'. With --iterations, start-from applies first
+                        then remaining steps are truncated to N.
   --fast                pm2 restart instead of reboot; shorter settle / dwell
   --seed <n>            RNG seed (Markov only; overrides YAML seed)
   --live                Use RealFleetOps against fleet Pis (default: FakeFleetOps)
@@ -71,6 +76,10 @@ Fake deterministic walks (regression before long random soak):
   pnpm test:duration -- --scenario cover-all --fast          # strict full graph (90 actions)
   pnpm test:duration -- --scenario cover-registered-intents --fast     # registered-intents walk (alias cover-hardpass)
   pnpm test:duration -- --scenario cover-registered-intents --fast --record-walk /tmp/dur-rec   # dry-run flag (0 frames)
+  pnpm test:duration -- --scenario kolibri-learn-smoke --fast
+  pnpm test:duration -- --scenario kolibri-teacher-preview-smoke --fast
+  pnpm test:duration -- --scenario cover-all --start-from 12 --fast          # finish_exercise onward
+  pnpm test:duration -- --scenario cover-all --start-from finish_exercise --iterations 1 --fast
 
 Live (same unified graph; hosts/store are CLI knobs — not alternate YAMLs):
   pnpm test:duration -- --live --scenario unified --fast --iterations 30 \\
@@ -89,6 +98,8 @@ interface ParsedArgs {
     help: boolean
     scenario: string
     iterations?: number
+    /** Walks only: 1-based step number or action name (raw CLI string). */
+    startFrom?: string
     fast: boolean
     seed?: number
     live: boolean
@@ -106,6 +117,7 @@ interface ParsedArgs {
 const parseArgs = (argv: string[]): ParsedArgs => {
     let scenario = 'random'
     let iterations: number | undefined
+    let startFrom: string | undefined
     let fast = false
     let seed: number | undefined
     let live = false
@@ -126,6 +138,13 @@ const parseArgs = (argv: string[]): ParsedArgs => {
         }
         if (a === '--scenario') scenario = argv[++i] ?? scenario
         else if (a === '--iterations') iterations = Number(argv[++i])
+        else if (a === '--start-from') {
+            startFrom = argv[++i]
+            if (!startFrom) {
+                console.error('--start-from requires <N|action>')
+                return { help: true, scenario, fast, live, ui: false, noStability: false, startInstances: false }
+            }
+        }
         else if (a === '--fast') fast = true
         else if (a === '--seed') seed = Number(argv[++i])
         else if (a === '--live') live = true
@@ -148,7 +167,7 @@ const parseArgs = (argv: string[]): ParsedArgs => {
         }
     }
     return {
-        help: false, scenario, iterations, fast, seed, live,
+        help: false, scenario, iterations, startFrom, fast, seed, live,
         hostsRaw, healthWrapBefore, healthWrapAfter,
         ui, consoleUrl, noStability, dwellMs, recordWalkDir, startInstances,
     }
@@ -191,8 +210,30 @@ const main = async () => {
         }))
     }
 
+    if (args.startFrom !== undefined && !walk) {
+        console.error('--start-from applies to deterministic walks only (e.g. --scenario cover-all)')
+        process.exit(2)
+    }
+    let startFromResolved: string | number | undefined
+    if (walk && args.startFrom !== undefined) {
+        try {
+            // Prefer numeric when the CLI token is all digits; else action name.
+            startFromResolved = /^\d+$/.test(args.startFrom)
+                ? Number(args.startFrom)
+                : args.startFrom
+            // Validate early for clear CLI errors (runner also validates).
+            resolveWalkStartIndex(walk.steps, startFromResolved)
+        } catch (err) {
+            console.error(err instanceof Error ? err.message : String(err))
+            process.exit(2)
+        }
+    }
+    const startIndex = walk && startFromResolved !== undefined
+        ? resolveWalkStartIndex(walk.steps, startFromResolved)
+        : 0
+    const walkRemaining = walk ? walk.steps.length - startIndex : 0
     const iterations = walk
-        ? Math.min(args.iterations ?? walk.steps.length, walk.steps.length)
+        ? Math.min(args.iterations ?? walkRemaining, walkRemaining)
         : (args.iterations ?? 40)
     const seed = args.seed ?? scenario.seed
     const pool = scenario.pool_engines ?? [...DEFAULT_POOL]
@@ -264,6 +305,7 @@ const main = async () => {
         mode: walk ? 'walk' as const : 'markov' as const,
         walk_file: walk ? args.scenario : null,
         iterations,
+        start_from: args.startFrom ?? null,
         fast: args.fast,
         seed: seed ?? null,
         store_mode: scenario.store_mode,
@@ -304,6 +346,7 @@ const main = async () => {
         ? await runDeterministicWalk(walk, {
             ...sharedOpts,
             iterations,
+            startFrom: startFromResolved,
         })
         : await runWalk({
             scenario,

@@ -1,6 +1,6 @@
 # Deterministic cover-registered-intents walk ("registered-intents walk") — NOT a Markov graph.
 # Loads states/invariants/fixtures/pool from scenarios/unified.yaml.
-# Covers the current Pixel-registered demo subset (58 actions; registry 65 @ Console#134 cdcfdb1)
+# Covers the current Pixel-registered demo subset (58 actions; registry 68 @ Console 4f7cfba)
 # plus Engine infra FleetOps (dock/undock/move/reboot via RealFleetOps).
 # Excludes every action in DEFERRED_UI_INTENTS + PIXEL_MISSING_INTENTS
 # (coaching Intents are registered but not yet expanded here; keep_watching, wikipedia, etc.).

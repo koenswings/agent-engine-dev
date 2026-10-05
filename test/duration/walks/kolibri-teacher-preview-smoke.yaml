@@ -1,0 +1,29 @@
+# Mirrors cover-all 1–2 + 8–12 (teacher Preview-as-learner) minus coaching 3–7.
+# Prefer A smoke — 7 steps to finish_exercise. open_exercise is also registered for
+# alternate seeding; this walk uses open_video → keep_watching → next_resource.
+# Fake Stub OK; live --ui needs Console@4f7cfba+ (click-mask wait) + Kolibri Running.
+kind: walk
+name: kolibri-teacher-preview-smoke
+graph: unified
+steps:
+  - from: start
+    to: console_teacher
+    action: open_console_as_teacher
+  - from: console_teacher
+    to: kolibri_manage
+    action: open_kolibri_as_teacher
+  - from: kolibri_manage
+    to: kolibri_home
+    action: preview_as_learner
+  - from: kolibri_home
+    to: kolibri_watching
+    action: open_video
+  - from: kolibri_watching
+    to: kolibri_watching
+    action: keep_watching
+  - from: kolibri_watching
+    to: kolibri_exercise
+    action: next_resource
+  - from: kolibri_exercise
+    to: kolibri_home
+    action: finish_exercise

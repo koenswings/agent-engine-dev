@@ -30,7 +30,7 @@ Never eject/erase the idea03 Intenso Files Disk.
 
 **Live App-open (later):** Kid sidecar `post-dock-restore-running.sh` → `idea166-kolibri-live` :18080. Fake walks do not require live.
 
-Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/pull/167); Pixel Console [agent-console-dev#134](https://github.com/koenswings/agent-console-dev/pull/134) tip **`cdcfdb1`** (65 Intents + prod-web ignores sticky demoMode + `captureAfterIntent` / `screenshotPath`).
+Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/pull/167); Pixel Console [agent-console-dev#134](https://github.com/koenswings/agent-console-dev/pull/134) tip **`4f7cfba`** (68 Intents + click-mask wait; prod-web ignores sticky demoMode + `captureAfterIntent` / `screenshotPath`).
 
 Pixel coaching set now registered at Console@`ba0cfa1`: `create_class`, `enroll_learners`, `build_lesson`, `create_quiz`, `read_reports`, `preview_as_learner`, `browse_classes`; `open_kolibri_as_teacher` opens `/en/coach/#/classes`. `back_to_console` is hardened.
 
@@ -55,6 +55,8 @@ Pixel coaching set now registered at Console@`ba0cfa1`: `create_class`, `enroll_
 - `random` / `unified` / default → **Markov** simulation on `scenarios/unified.yaml`
 - `cover-all` → **deterministic walk** (`walks/cover-all.yaml`) covering every graph action once — strict full-graph regression (under `--ui`, Pixel-missing still **failLoud** abort; live retry requires Console@`ba0cfa1`)
 - `cover-registered-intents` (chat: **registered-intents walk**; alias `cover-hardpass`) → **deterministic walk** (`walks/cover-registered-intents.yaml`) covering the current Pixel-registered demo subset + Engine infra FleetOps — **live `--ui` demo now** (coaching Intents are registered but walk expansion is deferred; excludes DEFERRED + PIXEL_MISSING)
+- `kolibri-learn-smoke` / `kolibri-teacher-preview-smoke` → short Prefer A walks to `finish_exercise` (6 / 7 steps; skips coaching 3–7)
+- `--start-from <N|action>` (walks only): slice from 1-based step or first matching action; seeds `walker.current` to that step's `from`. With `--iterations`, start-from applies first then remaining are truncated.
 - Do **not** invent alternate Markov graphs
 
 Deprecated aliases that still resolve to `unified.yaml`: `minimal`, `minimal-live`, `minimal-dock`, `stress`, `school-day`.
@@ -66,6 +68,8 @@ Canonical Fake pool: **idea01 + idea03 + idea04** (never idea02). Live `--hosts`
 | Fake Markov smoke | `--scenario random --iterations 40 --fast` |
 | Fake cover-all walk (strict) | `--scenario cover-all --fast` |
 | Fake cover-registered-intents / registered-intents walk | `--scenario cover-registered-intents --fast` (alias `cover-hardpass`) |
+| Fake Kolibri finish_exercise smokes | `--scenario kolibri-learn-smoke --fast` / `kolibri-teacher-preview-smoke` |
+| Walk mid-start | `--scenario cover-all --start-from 12` or `--start-from finish_exercise` (+ optional `--iterations N`) |
 | Fake multi-hour proof | `--scenario random --iterations 2000 --seed 42 --fast` |
 | Live reboot / dock | `--live --fast --hosts idea01=…,idea03=…,idea04=…` (same YAML) |
 | **Live UI (preferred; Console@`cdcfdb1`)** | `--live --ui --start-instances --hosts idea01=…,idea03=…,idea04=… --console-url http://idea01:8080` |
@@ -78,6 +82,9 @@ Canonical Fake pool: **idea01 + idea03 + idea04** (never idea02). Live `--hosts`
 pnpm test:duration                          # Markov random/unified, 40 steps (Fake + Stub UI + probes)
 pnpm test:duration -- --scenario cover-all --fast
 pnpm test:duration -- --scenario cover-registered-intents --fast
+pnpm test:duration -- --scenario kolibri-learn-smoke --fast
+pnpm test:duration -- --scenario kolibri-teacher-preview-smoke --fast
+pnpm test:duration -- --scenario cover-all --start-from finish_exercise --iterations 1 --fast
 pnpm test:duration -- --scenario random --iterations 2000 --seed 42 --fast
 # Dry-run --record-walk wiring (stub steps → record_walk_skip, 0 frames, no video):
 pnpm test:duration -- --scenario cover-registered-intents --fast --record-walk /tmp/dur-rec
@@ -138,6 +145,8 @@ pnpm test:duration -- --live --scenario unified --fast \
 5. Without `--ui`: Fake Stub logs `record_walk_skip` per UI step (flag dry-run); no PNGs → skip video.
 
 ffmpeg on this box: `/usr/bin/ffmpeg`.
+
+**Caveat:** `--record-walk` frames often show the Console Apps page, not the Kolibri tab — the recorder does not follow app tabs. Do not trust screenshots alone for Kolibri steps; prefer Intent `ok` / structured logs. Live Kolibri smokes need Console@`4f7cfba`+ (click-mask wait).
 
 ### Live caveats
 

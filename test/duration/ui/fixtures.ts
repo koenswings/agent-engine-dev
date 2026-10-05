@@ -46,7 +46,7 @@ export const DURATION_UI_FIXTURES = {
     },
 } as const
 
-/** Pixel Console Intent names registered in agent-console-dev#134 e2e/intents (65 @ ba0cfa1). */
+/** Pixel Console Intent names registered in agent-console-dev e2e/intents (68 @ 4f7cfba; was 65 @ ba0cfa1). */
 export const PIXEL_REGISTERED_INTENTS = [
     'open_console_as_teacher',
     'open_console_as_learner',
@@ -134,7 +134,7 @@ export const DEFERRED_UI_INTENTS = [
 ] as const
 
 /**
- * Proposal Intents on unified.yaml still not in Pixel's 65-key registry (@ ba0cfa1).
+ * Proposal Intents on unified.yaml still not in Pixel's 68-key registry (@ 4f7cfba).
  * StubUiDriver Fake no-ops; live --ui clear-miss until Pixel adapters — do not drop YAML edges.
  * Lesson chrome exit_lesson + open_wikipedia_* stay deferred.
  * keep_watching is registered (Console#134 @ 329dc38).

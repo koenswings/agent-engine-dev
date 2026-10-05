@@ -4,7 +4,7 @@
 **Locked** by Steve Design Review for idea#166 — do not rename without reporting a clash.  
 **Phase 3+4 (idea#168):** walker dispatches usage/operator Intents via `test/duration/ui/` → Pixel `e2e/intents` (`getIntent`).  
 **ONE graph:** `scenarios/unified.yaml` is the only Markov state table. Run modes = CLI knobs.  
-**Pixel registry:** Console#134 tip `cdcfdb1` — **65** Intent keys (+ `captureAfterIntent` / `screenshotPath` for `--record-walk`; production web ignores sticky `demoMode`). Engine ACTIONS.md on #145 is source for walker contract.
+**Pixel registry:** Console tip `4f7cfba` — **68** Intent keys (+ `captureAfterIntent` / `screenshotPath` for `--record-walk`; production web ignores sticky `demoMode`). Engine ACTIONS.md on #145 is source for walker contract.
 
 YAML transition shape (all layers): `{ to, weight, action }`.
 
@@ -35,7 +35,7 @@ Recording + **cover-registered-intents** (Pixel-registered demo + infra; live `-
 
 Fake/CI default: `StubUiDriver` (no browser). Live UI: `pnpm test:duration -- --live --ui` → `PlaywrightUiDriver` loads Pixel `runDurationIntent` / optional `captureAfterIntent` from `idea-console/duration-intents` or `agent-console-dev/e2e/intents` (or `DURATION_CONSOLE_INTENTS`).
 
-### Pixel-registered (65 — Console#134 @ ba0cfa1)
+### Pixel-registered (68 — keep_watching + next_resource + finish_exercise; Console@4f7cfba)
 
 Hub/dwell: `open_console_as_*`, `return_to_start`, `stay_on_*`  
 App-open: `open_kolibri_as_teacher` → `/en/coach/#/classes`, `open_kolibri_as_learner`, `open_nextcloud_as_*`, `open_video`, `open_exercise`, `keep_watching` (Console#134 @ 329dc38, stay on pinned video URL), `next_resource` (Console#135 @ f16ee18, video→exercise via resource panel), `finish_exercise` (Console#135 @ d087081, exercise→Learn home via Perseus Check)
@@ -65,6 +65,30 @@ Do **not** silently drop these edges from `unified.yaml`.
 
 `enter_infra_fleet_walk`, all `infra_*`
 
+
+## `--start-from` + Kolibri finish_exercise smokes (Prefer A)
+
+Walks only (`--scenario cover-all|kolibri-*-smoke|…`). Markov rejects `--start-from`.
+
+- `--start-from <N>` — 1-based step number matching `duration_step` numbering on the full walk; seeds `walker.current` to that step's `from`.
+- `--start-from <action>` — first step whose `action` matches (e.g. `finish_exercise`).
+- With `--iterations N`: apply start-from first, then truncate the remaining slice to N steps.
+- Past end / unknown action → clear CLI error (exit 2).
+
+**Smoke walks** (Fake Stub OK; live `--ui` needs Console@`4f7cfba`+ click-mask wait — do not run live until that tip is served):
+
+```bash
+pnpm test:duration -- --scenario kolibri-learn-smoke --fast
+pnpm test:duration -- --scenario kolibri-teacher-preview-smoke --fast
+# Mid-cover-all without re-walking 1..11:
+pnpm test:duration -- --scenario cover-all --start-from 12 --fast
+pnpm test:duration -- --scenario cover-all --start-from finish_exercise --iterations 1 --fast
+pnpm test:duration -- --scenario kolibri-learn-smoke --start-from finish_exercise --fast
+```
+
+`open_exercise` is registered (Pixel) for alternate seeding; these smokes use `open_video` → `keep_watching` → `next_resource` → `finish_exercise`. Mid-start on `finish_exercise` alone does **not** auto-navigate the page — live UI must already be on the pinned exercise, or run the full smoke.
+
+**`--record-walk` caveat:** frames often show the Console Apps page, not the Kolibri tab — the recorder does not follow app tabs. Do not trust screenshots alone for Kolibri steps; prefer Intent `ok` / structured logs.
 
 ## Live demoMode OFF (PlaywrightUiDriver)
 

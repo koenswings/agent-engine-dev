@@ -7,7 +7,6 @@ import { describe, it, expect } from 'vitest'
 import { FakeFleetOps, dispatchAction, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall } from '../duration/actions.js'
 import { semanticStoresEqual, waitForConvergence } from '../duration/convergence.js'
 import { evaluateInvariants, DEFAULT_INFRA_INVARIANTS, listInvariantTypes } from '../duration/invariants.js'
-import { runWalk } from '../duration/runner.js'
 import {
     assertPrivateDurationRoots,
     buildSshDockCopyRemote,
@@ -31,7 +30,7 @@ import {
     resolveWalkName,
     WALK_ALIASES,
 } from '../duration/scenario.js'
-import { runDeterministicWalk } from '../duration/runner.js'
+import { resolveWalkStartIndex, runDeterministicWalk, runWalk } from '../duration/runner.js'
 import type { Scenario, SemanticStoreView } from '../duration/types.js'
 import {
     StubUiDriver,
@@ -181,6 +180,114 @@ describe('duration scenario YAML loader', () => {
         expect(result.failures).toBe(0)
         expect(result.aborted).toBe(false)
         expect(result.steps).toBe(walk.steps.length)
+    })
+
+    it('loads kolibri-learn-smoke and kolibri-teacher-preview-smoke walks', () => {
+        expect(isWalkScenario('kolibri-learn-smoke')).toBe(true)
+        expect(isWalkScenario('kolibri-teacher-preview-smoke')).toBe(true)
+        const learn = loadWalk('kolibri-learn-smoke')
+        expect(learn.name).toBe('kolibri-learn-smoke')
+        expect(learn.steps.map(s => s.action)).toEqual([
+            'open_console_as_learner',
+            'open_kolibri_as_learner',
+            'open_video',
+            'keep_watching',
+            'next_resource',
+            'finish_exercise',
+        ])
+        const teacher = loadWalk('kolibri-teacher-preview-smoke')
+        expect(teacher.steps).toHaveLength(7)
+        expect(teacher.steps.at(-1)?.action).toBe('finish_exercise')
+    })
+
+    it('resolveWalkStartIndex: by number, by action, past-end / unknown fail', () => {
+        const walk = loadWalk('cover-all')
+        expect(resolveWalkStartIndex(walk.steps, 12)).toBe(11)
+        expect(walk.steps[11]!.action).toBe('finish_exercise')
+        expect(resolveWalkStartIndex(walk.steps, 'finish_exercise')).toBe(11)
+        expect(resolveWalkStartIndex(walk.steps, '1')).toBe(0)
+        expect(() => resolveWalkStartIndex(walk.steps, 0)).toThrow(/1-based/)
+        expect(() => resolveWalkStartIndex(walk.steps, walk.steps.length + 1)).toThrow(/past end/)
+        expect(() => resolveWalkStartIndex(walk.steps, 'no_such_action')).toThrow(/unknown action/)
+    })
+
+    it('runDeterministicWalk --start-from by number seeds current and keeps step numbers', async () => {
+        const walk = loadWalk('cover-all')
+        const ops = fakeOps({
+            poolEngines: [...DEFAULT_POOL],
+            excludeEngines: ['idea02'],
+            storeMode: 'shared',
+            settleDelayMs: 0,
+        })
+        const logs: { step: number; action: string; from: string }[] = []
+        const result = await runDeterministicWalk(walk, {
+            fast: true,
+            ops,
+            stubUi: true,
+            skipStability: true,
+            startFrom: 12,
+            iterations: 1,
+            onLog: e => logs.push({ step: e.step, action: e.action, from: e.from }),
+        })
+        expect(result.failures).toBe(0)
+        expect(result.aborted).toBe(false)
+        expect(logs).toHaveLength(1)
+        expect(logs[0]).toMatchObject({ step: 12, action: 'finish_exercise', from: 'kolibri_exercise' })
+        expect(result.finalState).toBe('kolibri_home')
+        expect(result.steps).toBe(1) // executed count; log step number stays 12
+    })
+
+    it('runDeterministicWalk --start-from by action + iterations after start-from', async () => {
+        const walk = loadWalk('kolibri-learn-smoke')
+        const ops = fakeOps({
+            poolEngines: [...DEFAULT_POOL],
+            excludeEngines: ['idea02'],
+            storeMode: 'shared',
+            settleDelayMs: 0,
+        })
+        const logs: string[] = []
+        const result = await runDeterministicWalk(walk, {
+            fast: true,
+            ops,
+            stubUi: true,
+            skipStability: true,
+            startFrom: 'finish_exercise',
+            iterations: 1,
+            onLog: e => logs.push(e.action),
+        })
+        expect(result.failures).toBe(0)
+        expect(logs).toEqual(['finish_exercise'])
+        // Without start-from, iterations 2 would be first two actions
+        const logs2: string[] = []
+        await runDeterministicWalk(walk, {
+            fast: true,
+            ops,
+            stubUi: true,
+            skipStability: true,
+            iterations: 2,
+            onLog: e => logs2.push(e.action),
+        })
+        expect(logs2).toEqual(['open_console_as_learner', 'open_kolibri_as_learner'])
+    })
+
+    it('runs kolibri-learn-smoke Fake walk end-to-end', async () => {
+        const walk = loadWalk('kolibri-learn-smoke')
+        const ops = fakeOps({
+            poolEngines: [...DEFAULT_POOL],
+            excludeEngines: ['idea02'],
+            storeMode: 'shared',
+            settleDelayMs: 0,
+        })
+        const result = await runDeterministicWalk(walk, {
+            fast: true,
+            ops,
+            stubUi: true,
+            skipStability: true,
+        })
+        expect(result.failures).toBe(0)
+        expect(result.aborted).toBe(false)
+        expect(result.steps).toBe(6)
+        expect(result.finalState).toBe('kolibri_home')
     })
 
     it('refuses hw-roundtrip stick fixture markers', () => {
