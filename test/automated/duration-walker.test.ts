@@ -757,7 +757,7 @@ describe('Phase 3 UI Intent dispatch (StubUiDriver)', () => {
 
     it('deferred Intents return mode deferred without aborting stub walks', async () => {
         const driver = new StubUiDriver()
-        const r = await driver.runIntent({ action: 'next_resource' })
+        const r = await driver.runIntent({ action: 'exit_lesson' })
         expect(r.ok).toBe(true)
         expect(r.mode).toBe('deferred')
     })
