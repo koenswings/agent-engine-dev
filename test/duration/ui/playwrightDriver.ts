@@ -84,6 +84,8 @@ type PwLocator = {
     isVisible: () => Promise<boolean>
     click: () => Promise<void>
     waitFor: (o: { state: 'visible'; timeout: number }) => Promise<void>
+    isDisabled: () => Promise<boolean>
+    getAttribute: (name: string) => Promise<string | null>
 }
 type PwPage = {
     locator: (sel: string) => PwLocator
@@ -386,12 +388,15 @@ export class PlaywrightUiDriver implements UiDriver {
      */
     async selectDisk(
         diskId: string,
-        opts: { timeoutMs?: number; requireEmptyPanel?: boolean } = {},
+        opts: { timeoutMs?: number; requireEmptyPanel?: boolean; requireAddFiles?: boolean } = {},
     ): Promise<string> {
         await this.ensureReady()
         const page = this.page as PwPage
         const rowSel = diskRowSelector(diskId)
         const panelSel = '[data-testid="empty-disk-panel"]'
+        // Prefer A r22 FAIL@93: add_files_role needs Add Files on the app-only DiskView.
+        const addFilesSel = '[data-testid="add-files"]'
+        let addFilesState = 'not visible'
         const budget = opts.timeoutMs ?? 60_000
         const deadline = Date.now() + budget
         let lastReload = Date.now()
@@ -401,6 +406,24 @@ export class PlaywrightUiDriver implements UiDriver {
             if (await row.isVisible().catch(() => false)) {
                 await row.click()
                 clicked = true
+                if (opts.requireAddFiles) {
+                    const btn = page.locator(addFilesSel).first()
+                    try {
+                        await btn.waitFor({ state: 'visible', timeout: 5_000 })
+                        if (!(await btn.isDisabled().catch(() => false))) {
+                            return `selected ${rowSel} (Add Files visible)`
+                        }
+                        addFilesState = `disabled (title="${((await btn.getAttribute('title').catch(() => null)) ?? '').trim()}")`
+                    } catch {
+                        /* store may still be converging (app role / dock) — retry */
+                    }
+                    if (Date.now() - lastReload > 10_000) {
+                        lastReload = Date.now()
+                        await page.reload().catch(() => undefined)
+                    }
+                    await page.waitForTimeout(500)
+                    continue
+                }
                 if (!opts.requireEmptyPanel) return `selected ${rowSel}`
                 try {
                     await page.locator(panelSel).first().waitFor({ state: 'visible', timeout: 5_000 })
@@ -414,6 +437,13 @@ export class PlaywrightUiDriver implements UiDriver {
                 await page.reload().catch(() => undefined)
             }
             await page.waitForTimeout(500)
+        }
+        if (opts.requireAddFiles) {
+            throw new Error(
+                `selectDisk: ${rowSel} ${clicked ? `clicked but ${addFilesSel} ${addFilesState}` : 'never visible in NetworkTree'} ` +
+                    `within ${budget}ms. Prefer A r22 — add_files_role needs Add Files on an app-only disk; ` +
+                    `no soft-pass / no remap onto the make_files_disk Files Disk.`,
+            )
         }
         throw new Error(
             `selectDisk: ${rowSel} ${clicked ? 'clicked but EmptyDiskPanel never visible' : 'never visible in NetworkTree'} ` +

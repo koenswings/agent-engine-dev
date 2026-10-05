@@ -1080,6 +1080,25 @@ export class RealFleetOps implements FleetOps {
         return { device, dest, fsType: String(out ?? '').trim() }
     }
 
+    /**
+     * Prefer A r22 FAIL@93: read-only listing of a docked fixture slot root (ls -1A).
+     * add_files_role preflight — Eng 8d98718 createFilesDisk refuses an Apps disk
+     * whose root holds anything beyond META.yaml/lost+found/apps/services/instances.
+     */
+    async probeFixtureRootEntries(
+        engineId: string,
+        diskId: string,
+    ): Promise<{ dest: string; entries: string[] } | null> {
+        this.assertNotExcluded(engineId, 'probeFixtureRootEntries')
+        const device = this.deviceMap(engineId).get(diskId)
+            ?? (await this.hasHealthyFixtureTree(engineId, diskId))
+        if (!device || !/^idea-test-[0-9]+$/.test(device)) return null
+        const dest = `${this.disksRoot}/${device}`
+        const out = await this.ssh(this.hostOf(engineId), `ls -1A '${dest}' 2>/dev/null || true`)
+        const entries = String(out ?? '').split('\n').map(l => l.trim()).filter(Boolean)
+        return { dest, entries }
+    }
+
     private async sshRemoveSentinel(engineId: string, device: string): Promise<void> {
         if (!/^idea-test-[0-9]+$/.test(device)) return
         assertPrivateDurationRoots(this.disksRoot, this.watchDir)

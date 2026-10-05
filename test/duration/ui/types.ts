@@ -44,7 +44,12 @@ export interface UiDriver {
      * (polling/reloading until it appears) and, when requireEmptyPanel, wait for
      * EmptyDiskPanel — so EmptyDiskPanel Intents act on that exact disk, never the
      * "first Empty Disk". Throws (fail loud) when the row/panel never shows.
+     * Prefer A r22: requireAddFiles waits for a visible, enabled
+     * `[data-testid="add-files"]` on that DiskView (app-only disk for add_files_role).
      */
-    selectDisk?(diskId: string, opts?: { timeoutMs?: number; requireEmptyPanel?: boolean }): Promise<string>
+    selectDisk?(
+        diskId: string,
+        opts?: { timeoutMs?: number; requireEmptyPanel?: boolean; requireAddFiles?: boolean },
+    ): Promise<string>
     close?(): Promise<void>
 }

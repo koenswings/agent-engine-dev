@@ -525,7 +525,11 @@ export const preflightFilesDiskTarget = async (
  * [data-role=files] badge (Nextcloud) while createFilesDisk refused dirty root.
  * StubUiDriver skips (Fake has no Engine createFilesDisk). Never idea02.
  */
-const assertFilesRoleOnDisk = async (ctx: ActionContext, diskId: string): Promise<string> => {
+const assertFilesRoleOnDisk = async (
+    ctx: ActionContext,
+    diskId: string,
+    label: 'make_files_disk' | 'add_files_role' = 'make_files_disk',
+): Promise<string> => {
     // Prefer A r21: the Console's engine (where empty-001 was re-docked), not
     // walker.dockedEngine (follows Kolibri after infra_move_disk).
     const engine = resolveConsoleEngineHost(ctx)
@@ -541,11 +545,226 @@ const assertFilesRoleOnDisk = async (ctx: ActionContext, diskId: string): Promis
         }
         await sleep(400)
     }
+    const why = label === 'add_files_role'
+        ? `(createFilesDisk refused the Apps disk root, or Pixel matched a foreign files badge). ` +
+          `Prefer A — fail loud; no soft-pass.`
+        : `(createFilesDisk refused dirty root, or Pixel matched a foreign files badge). ` +
+          `Prefer A — fail loud; do not assert Kolibri Grade5A.`
     throw new Error(
-        `make_files_disk soft-pass: disk ${diskId} on ${engine} diskTypes=[${lastTypes.join(', ')}] ` +
-            `lack 'files' within ${budget}ms (createFilesDisk refused dirty root, or Pixel matched a foreign files badge). ` +
-            `Prefer A — fail loud; do not assert Kolibri Grade5A.`,
+        `${label} soft-pass: disk ${diskId} on ${engine} diskTypes=[${lastTypes.join(', ')}] ` +
+            `lack 'files' within ${budget}ms ${why}`,
     )
+}
+
+/**
+ * Prefer A r22 FAIL@93 (cover-all-6e4ce29-r22): add_files_role is a DIFFERENT Intent
+ * from make_files_disk (Add Files on an Apps disk vs Files-from-Empty) — it is never
+ * "already satisfied" by the make_files_disk Files Disk (empty-001), and the harness
+ * never soft-passes it. Its target is an app-only disk (diskTypes app[/backup], no
+ * files): DURATION_ADD_FILES_DISK_ID (dedicated app-only fixture) else the primary
+ * Kid fixture (Kolibri Grade5A, explicitly restored onto the Console engine — this is
+ * an explicit restore, not a silent Grade5A remap). Refuses Empty packs and the
+ * make_files_disk Files Disk (they never offer Add Files).
+ */
+export const addFilesAppDiskId = (
+    ctx: Pick<ActionContext, 'fixtureDisk'>,
+    env: NodeJS.ProcessEnv = process.env,
+): string => {
+    const id = env.DURATION_ADD_FILES_DISK_ID?.trim() || ctx.fixtureDisk
+    const filesId = env.DURATION_FILES_DISK_ID?.trim()
+    if (!id) {
+        throw new Error('add_files_role: no app-only disk id (DURATION_ADD_FILES_DISK_ID / fixtureDisk unset). Prefer A — fail loud.')
+    }
+    if (/empty/i.test(id) || (filesId && id === filesId)) {
+        throw new Error(
+            `add_files_role: '${id}' is not an app-only disk (Empty pack / make_files_disk Files Disk ` +
+                `never offers Add Files). Set DURATION_ADD_FILES_DISK_ID to an Apps disk. Prefer A — fail loud.`,
+        )
+    }
+    return id
+}
+
+/**
+ * Prefer A r22 FAIL@93: where diskId is docked right now. Live → findDockedEngine;
+ * Fake → scan pool stores for dockedTo.
+ */
+const locateDockedEngine = async (ctx: ActionContext, diskId: string): Promise<string | null> => {
+    const opsAny = ctx.opts.ops as FleetOps & { findDockedEngine?: (id: string) => Promise<string | null> }
+    if (typeof opsAny.findDockedEngine === 'function') return opsAny.findDockedEngine(diskId)
+    for (const eng of ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))) {
+        try {
+            const view = await ctx.opts.ops.readStore(eng)
+            const docked = view.diskDB[diskId]?.dockedTo
+            if (docked) return docked
+        } catch {
+            /* try next */
+        }
+    }
+    return null
+}
+
+/**
+ * Prefer A r22 FAIL@93: before add_files_role, make sure an app-only disk is docked
+ * on the Console's engine (Path A idea01). cover-all infra_move_disk@62 moved Kolibri
+ * Grade5A idea01→idea03, leaving idea01 with Empty Disk (files, from make_files_disk
+ * @91), Empty Disk 002, Nextcloud (app+files) and System — no DiskView offers
+ * [data-testid="add-files"]. Explicit restore: moveDisk(<holder>→Console engine)
+ * (or dockFixture when undocked), live findDockedEngine must confirm landing, then
+ * the Console engine store must show diskTypes app[/backup] with no files/empty/
+ * system/upgrade (Eng 8d98718 createFilesDisk allowed set), and (live) the slot
+ * must be an ext4 mount whose root holds only META.yaml/lost+found/apps/services/
+ * instances(/BACKUP.yaml/backups) — createFilesDisk refuses anything else. Fail loud
+ * on every miss: no soft-pass, no remap onto the make_files_disk Files Disk, never
+ * idea02. DURATION_FILES_DISK_SKIP_EXT4_PREFLIGHT=1 skips only the ext4/root probe
+ * (post-Intent store check still fails loud).
+ */
+export const ensureAppOnlyDiskOnConsoleEngine = async (
+    ctx: ActionContext,
+    env: NodeJS.ProcessEnv = process.env,
+): Promise<{ diskId: string; engine: string; note: string; movedFixture: boolean }> => {
+    const diskId = addFilesAppDiskId(ctx, env)
+    const engine = resolveConsoleEngineHost(ctx, env)
+    assertNotGolden(ctx, engine, 'add_files_role(restore app-only disk)')
+    if (isNeverEngine(engine)) {
+        throw new Error(`add_files_role: refused Console engine '${engine}' (never idea02)`)
+    }
+    const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
+    const opsAny = ctx.opts.ops as FleetOps & {
+        findDockedEngine?: (id: string) => Promise<string | null>
+        probeFixtureFsType?: (
+            engineId: string,
+            diskId: string,
+        ) => Promise<{ device: string; dest: string; fsType: string } | null>
+        probeFixtureRootEntries?: (
+            engineId: string,
+            diskId: string,
+        ) => Promise<{ dest: string; entries: string[] } | null>
+    }
+    const isLive = typeof opsAny.findDockedEngine === 'function'
+
+    const holder = await locateDockedEngine(ctx, diskId)
+    let moveNote: string
+    let moved = false
+    if (holder === engine) {
+        moveNote = `${diskId} already docked on Console engine ${engine}`
+    } else {
+        if (holder && (ctx.excludeEngines.includes(holder) || isNeverEngine(holder))) {
+            throw new Error(
+                `add_files_role: ${diskId} docked on excluded/never engine '${holder}'; refuse to move. Prefer A — never idea02.`,
+            )
+        }
+        if (holder) {
+            await ctx.opts.ops.moveDisk(holder, engine, diskId)
+            moveNote = `restored ${diskId} ${holder}→${engine} (Console engine) before add_files_role`
+        } else {
+            await ctx.opts.ops.dockFixture(engine, diskId)
+            moveNote = `docked ${diskId} on ${engine} (Console engine) before add_files_role`
+        }
+        moved = true
+        await settleParticipants(ctx, pool)
+        if (isLive) {
+            const landed = await opsAny.findDockedEngine!(diskId)
+            if (landed !== engine) {
+                throw new Error(
+                    `add_files_role: restore of ${diskId} landed on ${landed ?? 'nowhere'} not ${engine} ` +
+                        `(Console engine; RealFleetOps healthy-tree redirect?). Prefer A — fail loud; never idea02.`,
+                )
+            }
+        }
+    }
+
+    // Store: app-only on the Console engine (Add Files offered only without files role).
+    const budget = isLive ? (ctx.opts.fast ? 60_000 : 120_000) : 2_000
+    const deadline = Date.now() + budget
+    let last = 'unread'
+    for (;;) {
+        try {
+            const view = await ctx.opts.ops.readStore(engine)
+            const disk = view.diskDB[diskId]
+            const types = disk?.diskTypes ?? []
+            last = `dockedTo=${disk?.dockedTo ?? 'none'} diskTypes=[${types.join(', ')}]`
+            if (types.includes('files')) {
+                throw new Error(
+                    `add_files_role: ${diskId} on ${engine} already has a files role (${last}) — ` +
+                        `DiskView will not offer Add Files. Re-dock a fresh app-only pack (Atlas Path A). Prefer A — fail loud, no soft-pass.`,
+                )
+            }
+            const forbidden = types.filter(t => t === 'empty' || t === 'system' || t === 'upgrade')
+            if (forbidden.length) {
+                throw new Error(
+                    `add_files_role: ${diskId} on ${engine} is not an app-only disk (${last}). Prefer A — fail loud.`,
+                )
+            }
+            // Fake dock leaves diskTypes unset for app packs; live must show 'app'.
+            const appOk = isLive ? types.includes('app') : true
+            if (disk?.dockedTo && appOk) break
+        } catch (e) {
+            if (e instanceof Error && e.message.startsWith('add_files_role:')) throw e
+            last = `readStore failed: ${e instanceof Error ? e.message : String(e)}`
+        }
+        if (Date.now() >= deadline) {
+            throw new Error(
+                `add_files_role: no app-only disk on Console engine ${engine} within ${budget}ms ` +
+                    `(${diskId}: ${last}). Prefer A — fail loud; no soft-pass / no remap onto the make_files_disk Files Disk.`,
+            )
+        }
+        await sleep(400)
+    }
+
+    // Live: Eng 8d98718 createFilesDisk needs only role entries in the root (META.yaml,
+    // lost+found, apps/services/instances, BACKUP.yaml/backups) AND an ext4 root. Kid
+    // app packs (kolibri, kolibri-form3, kiwix) ship `content/` at the root, so stock
+    // Kolibri Grade5A is refused ("has other files on it (content)") — report every
+    // problem in one loud error so Atlas/Kid can fix the fixture in one pass.
+    let fsNote = ''
+    const skip = /^(1|true|yes)$/i.test(env.DURATION_FILES_DISK_SKIP_EXT4_PREFLIGHT?.trim() ?? '')
+    if (skip) {
+        fsNote = '; ext4/root preflight skipped'
+    } else {
+        const problems: string[] = []
+        if (typeof opsAny.probeFixtureRootEntries === 'function') {
+            const root = await opsAny.probeFixtureRootEntries(engine, diskId)
+            if (root) {
+                const allowed = new Set(['META.yaml', 'lost+found', 'apps', 'services', 'instances', 'BACKUP.yaml', 'backups'])
+                const others = root.entries.filter(e => !allowed.has(e)).sort()
+                if (others.length) {
+                    problems.push(
+                        `root ${root.dest} has non-IDEA entries (${others.join(', ')}) — createFilesDisk refuses ` +
+                            `("has other files on it")`,
+                    )
+                } else {
+                    fsNote += '; root clean'
+                }
+            }
+        }
+        if (typeof opsAny.probeFixtureFsType === 'function') {
+            const probe = await opsAny.probeFixtureFsType(engine, diskId)
+            const fs = probe ? `${probe.dest} fs=${probe.fsType || 'unknown'}` : 'slot not found'
+            if (probe?.fsType !== 'ext4') {
+                problems.push(`slot ${fs} — createFilesDisk requires an ext4 mount at the disk root ("not an ext4 disk")`)
+            } else {
+                fsNote = `; ${fs}${fsNote}`
+            }
+        }
+        if (problems.length) {
+            throw new Error(
+                `add_files_role preflight: app-only ${diskId} on ${engine} cannot take a files role on Eng 8d98718: ` +
+                    `${problems.join('; ')}. Atlas/Kid Path A: provide an app-only disk whose root is only ` +
+                    `META.yaml/apps/services/instances on a pi-owned ext4 mount (DURATION_ADD_FILES_DISK_ID), ` +
+                    `or fix the Kolibri slot. Prefer A — fail loud; no soft-pass / no Grade5A remap.`,
+            )
+        }
+    }
+
+    if (diskId === ctx.fixtureDisk && moved && /kolibri/i.test(diskId)) {
+        syncKolibriSidecarUrlForEngine(engine, hostMapFromOps(ctx.opts.ops), env)
+    }
+    return {
+        diskId,
+        engine,
+        note: `${moveNote}; app-only ${diskId} on ${engine} (${last}${fsNote})`,
+        movedFixture: moved && diskId === ctx.fixtureDisk,
+    }
 }
 
 const infraUndockFixtures = async (ctx: ActionContext): Promise<ActionResult> => {
@@ -1095,17 +1314,21 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     ) {
         // Prefer A r20: EmptyDiskPanel / Files-role Intents — never hard-code moved Kolibri.
         const filesId = process.env.DURATION_FILES_DISK_ID?.trim()
+        const lastFilesRoleId = process.env.DURATION_LAST_FILES_ROLE_DISK_ID?.trim()
         const emptyId =
             process.env.DURATION_EMPTY_DISK_ID?.trim() || DURATION_UI_FIXTURES.empty.diskId
-        if (
+        if (ctx.action === 'files_role_added' && (lastFilesRoleId || filesId)) {
+            // Prefer A r22: assert on the disk that most recently gained a files role
+            // (make_files_disk → empty-001; add_files_role → app-only disk).
+            diskId = lastFilesRoleId || filesId || emptyId
+        } else if (
             filesId &&
-            (ctx.action === 'files_role_added' ||
-                ctx.action === 'add_files_role' ||
-                ctx.action === 'backup_configured_restored' ||
+            (ctx.action === 'backup_configured_restored' ||
                 ctx.action === 'restore_from_backup')
         ) {
             diskId = filesId
         } else {
+            // add_files_role target is resolved below (app-only disk restore, r22).
             diskId = emptyId
         }
         instanceId = undefined
@@ -1154,15 +1377,58 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             }
         }
     }
-    const result = await driver.runIntent({
-        action: ctx.action,
-        diskId,
-        instanceId,
-        engineId: ctx.action === 'make_files_disk'
-            ? resolveConsoleEngineHost(ctx)
-            : (ctx.walker.dockedEngine ?? ctx.poolEngines[0]),
-        screenshotPath: shotPath,
-    })
+    // Prefer A r22 FAIL@93: add_files_role ≠ make_files_disk. Never "already satisfied"
+    // by the make_files_disk Files Disk; never soft-pass. Restore an app-only disk onto
+    // the Console engine (Kolibri back from infra_move_disk@62, or
+    // DURATION_ADD_FILES_DISK_ID), open its DiskView, require a visible Add Files.
+    let addFilesDockedEngine: string | undefined
+    if (ctx.action === 'add_files_role') {
+        try {
+            const app = await ensureAppOnlyDiskOnConsoleEngine(ctx)
+            diskId = app.diskId
+            if (app.movedFixture) addFilesDockedEngine = app.engine
+            let selNote = ''
+            if (typeof driver.selectDisk === 'function') {
+                selNote = await driver.selectDisk(app.diskId, {
+                    timeoutMs: ctx.opts.fast ? 60_000 : 120_000,
+                    requireAddFiles: true,
+                })
+            }
+            const notes = [app.note, selNote].filter(Boolean).join('; ')
+            preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${notes}` : notes
+        } catch (e) {
+            const err = e instanceof Error ? e.message : String(e)
+            return {
+                ok: false,
+                message: `add_files_role aborted before Intent: ${err}`,
+                layer,
+                // Walker follows Kolibri if the restore moved it before failing later.
+                ...(addFilesDockedEngine ? { dockedEngine: addFilesDockedEngine } : {}),
+            }
+        }
+    }
+    // Console 230b70f add_files_role clicks DURATION_FILES_DISK_ID before diskId — point
+    // it at the app-only disk for this Intent only; restore the make_files_disk pin after
+    // (backup/restore Intents still key off it).
+    const prevFilesPin = process.env.DURATION_FILES_DISK_ID
+    if (ctx.action === 'add_files_role' && diskId) process.env.DURATION_FILES_DISK_ID = diskId
+    let result: Awaited<ReturnType<typeof driver.runIntent>>
+    try {
+        result = await driver.runIntent({
+            action: ctx.action,
+            diskId,
+            instanceId,
+            engineId: ctx.action === 'make_files_disk' || ctx.action === 'add_files_role'
+                ? resolveConsoleEngineHost(ctx)
+                : (ctx.walker.dockedEngine ?? ctx.poolEngines[0]),
+            screenshotPath: shotPath,
+        })
+    } finally {
+        if (ctx.action === 'add_files_role') {
+            if (prevFilesPin === undefined) delete process.env.DURATION_FILES_DISK_ID
+            else process.env.DURATION_FILES_DISK_ID = prevFilesPin
+        }
+    }
     if (recDir && shotPath) {
         if (driver.kind === 'stub') {
             finalizeRecordedFrame({
@@ -1190,6 +1456,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     if (result.ok && ctx.action === 'make_files_disk') {
         const filesDiskId = diskId ?? filesDiskTargetId()
         process.env.DURATION_FILES_DISK_ID = filesDiskId
+        process.env.DURATION_LAST_FILES_ROLE_DISK_ID = filesDiskId
         if (driver.kind === 'playwright') {
             try {
                 const note = await assertFilesRoleOnDisk(ctx, filesDiskId)
@@ -1204,6 +1471,26 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             }
         } else {
             message = `${message}; DURATION_FILES_DISK_ID=${filesDiskId} (stub; skip store assert)`
+        }
+    }
+    // Prefer A r22: add_files_role must really land a files role on the app-only disk.
+    if (result.ok && ctx.action === 'add_files_role' && diskId) {
+        process.env.DURATION_LAST_FILES_ROLE_DISK_ID = diskId
+        if (driver.kind === 'playwright') {
+            try {
+                const note = await assertFilesRoleOnDisk(ctx, diskId, 'add_files_role')
+                message = `${message}; ${note}`
+            } catch (e) {
+                const err = e instanceof Error ? e.message : String(e)
+                return {
+                    ok: false,
+                    message: `add_files_role reported ok but files role missing: ${err}`,
+                    layer,
+                    ...(addFilesDockedEngine ? { dockedEngine: addFilesDockedEngine } : {}),
+                }
+            }
+        } else {
+            message = `${message}; add_files_role on app-only ${diskId} (stub; skip store assert)`
         }
     }
     // Prefer A r26: after successful confirm_erase, re-dock empty-002 Empty for late install_app.
@@ -1254,6 +1541,8 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
         ok: result.ok,
         message,
         layer,
+        // Prefer A r22: Kolibri restored onto the Console engine → walker follows it.
+        ...(addFilesDockedEngine ? { dockedEngine: addFilesDockedEngine } : {}),
     }
 }
 

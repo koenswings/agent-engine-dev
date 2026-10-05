@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { FakeFleetOps, dispatchAction, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, redockEmpty001BeforeMakeFiles, resolveConsoleEngineHost, filesDiskTargetId, preflightFilesDiskTarget, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, nextcloudLoginFormLooksReady, nextcloudInitialState, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
+import { FakeFleetOps, dispatchAction, addFilesAppDiskId, ensureAppOnlyDiskOnConsoleEngine, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, redockEmpty001BeforeMakeFiles, resolveConsoleEngineHost, filesDiskTargetId, preflightFilesDiskTarget, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, nextcloudLoginFormLooksReady, nextcloudInitialState, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
 import { semanticStoresEqual, waitForConvergence } from '../duration/convergence.js'
 import { evaluateInvariants, DEFAULT_INFRA_INVARIANTS, listInvariantTypes } from '../duration/invariants.js'
 import {
@@ -1074,12 +1074,15 @@ describe('Phase 3 UI Intent dispatch (StubUiDriver)', () => {
     it('defaultIdsForIntent remaps files/backup EmptyDiskPanel Intents to empty-001 (not Kolibri)', () => {
         const prevFiles = process.env.DURATION_FILES_DISK_ID
         const prevEmpty = process.env.DURATION_EMPTY_DISK_ID
+        const prevLast = process.env.DURATION_LAST_FILES_ROLE_DISK_ID
+        const prevAdd = process.env.DURATION_ADD_FILES_DISK_ID
         delete process.env.DURATION_FILES_DISK_ID
         delete process.env.DURATION_EMPTY_DISK_ID
+        delete process.env.DURATION_LAST_FILES_ROLE_DISK_ID
+        delete process.env.DURATION_ADD_FILES_DISK_ID
         try {
             for (const action of [
                 'make_files_disk',
-                'add_files_role',
                 'files_role_added',
                 'make_backup_disk',
                 'restore_from_backup',
@@ -1092,10 +1095,19 @@ describe('Phase 3 UI Intent dispatch (StubUiDriver)', () => {
             }
             process.env.DURATION_FILES_DISK_ID = 'duration-files-disk'
             expect(defaultIdsForIntent('files_role_added').diskId).toBe('duration-files-disk')
-            expect(defaultIdsForIntent('add_files_role').diskId).toBe('duration-files-disk')
+            // Prefer A r22: add_files_role = Add Files on an app-only disk, never the Files pin.
+            expect(defaultIdsForIntent('add_files_role').diskId).toBe('duration-kolibri-grade5a-001')
+            process.env.DURATION_ADD_FILES_DISK_ID = 'duration-app-only-001'
+            expect(defaultIdsForIntent('add_files_role').diskId).toBe('duration-app-only-001')
+            process.env.DURATION_LAST_FILES_ROLE_DISK_ID = 'duration-kolibri-grade5a-001'
+            expect(defaultIdsForIntent('files_role_added').diskId).toBe('duration-kolibri-grade5a-001')
             // make_files_disk stays on EMPTY (convert target), not FILES pin
             expect(defaultIdsForIntent('make_files_disk').diskId).toBe('duration-empty-001')
         } finally {
+            if (prevLast === undefined) delete process.env.DURATION_LAST_FILES_ROLE_DISK_ID
+            else process.env.DURATION_LAST_FILES_ROLE_DISK_ID = prevLast
+            if (prevAdd === undefined) delete process.env.DURATION_ADD_FILES_DISK_ID
+            else process.env.DURATION_ADD_FILES_DISK_ID = prevAdd
             if (prevFiles === undefined) delete process.env.DURATION_FILES_DISK_ID
             else process.env.DURATION_FILES_DISK_ID = prevFiles
             if (prevEmpty === undefined) delete process.env.DURATION_EMPTY_DISK_ID
@@ -1420,6 +1432,217 @@ describe('Prefer A r21: empty-001 Files Disk on Console engine (cover-all-033497
         expect(isEmptyFixtureDisk('duration-empty-002')).toBe(true)
         expect(isEmptyFixtureDisk('duration-kolibri-grade5a-001')).toBe(false)
         expect(isEmptyFixtureDisk('duration-nextcloud-grade5a-001')).toBe(false)
+    })
+})
+
+describe('Prefer A r22: add_files_role restores an app-only disk on the Console engine (cover-all-6e4ce29-r22 FAIL@93)', () => {
+    const POOL = ['idea01', 'idea03', 'idea04']
+    const KOLIBRI = 'duration-kolibri-grade5a-001'
+    const BASE_ENV = {
+        DURATION_SWITCH_ENGINE_HOST: 'idea01',
+        DURATION_CONSOLE_URL: 'http://idea01:8080',
+        DURATION_EMPTY_DISK_ID: undefined,
+        DURATION_ADD_FILES_DISK_ID: undefined,
+        DURATION_FILES_DISK_ID: 'duration-empty-001',
+        DURATION_LAST_FILES_ROLE_DISK_ID: 'duration-empty-001',
+        DURATION_KOLIBRI_URL: undefined,
+        DURATION_FILES_DISK_SKIP_EXT4_PREFLIGHT: undefined,
+    }
+    const withEnv = async (vars: Record<string, string | undefined>, fn: () => Promise<void> | void) => {
+        const prev: Record<string, string | undefined> = {}
+        for (const k of Object.keys(vars)) {
+            prev[k] = process.env[k]
+            if (vars[k] === undefined) delete process.env[k]
+            else process.env[k] = vars[k]
+        }
+        try {
+            await fn()
+        } finally {
+            for (const k of Object.keys(prev)) {
+                if (prev[k] === undefined) delete process.env[k]
+                else process.env[k] = prev[k]
+            }
+        }
+    }
+    const ctxFor = (ops: unknown, dockedEngine: string | null, extra: Record<string, unknown> = {}, action = 'add_files_role') => ({
+        opts: { ops, rng: () => 0, settleTimeoutMs: 500, fast: true, ...extra },
+        walker: { current: 'op_disk', layer: 'operator' as const, dockedEngine, step: 92 },
+        from: 'op_disk',
+        to: 'op_files',
+        action,
+        excludeEngines: ['idea02'],
+        poolEngines: POOL,
+        fixtureDisk: KOLIBRI,
+        fixtureInstance: 'kolibri-grade5a-001',
+        fixtureDisks: [KOLIBRI, 'duration-nextcloud-grade5a-001', 'duration-empty-001', 'duration-empty-002'],
+        fixtureInstances: { ...KID_FIXTURES },
+    })
+    /** r22 fleet: Kolibri moved to idea03 @62; empty-001 is the make_files_disk Files Disk on idea01. */
+    const r22Fleet = async () => {
+        const ops = fakeOps({ poolEngines: POOL, excludeEngines: ['idea02'], storeMode: 'shared' })
+        await ops.dockFixture('idea01', 'duration-empty-001')
+        await ops.dockFixture('idea01', 'duration-empty-002')
+        await ops.dockFixture('idea01', 'duration-nextcloud-grade5a-001')
+        await ops.dockFixture('idea03', KOLIBRI)
+        return ops
+    }
+    const addFilesDriver = (onSelect?: (id: string, o?: { requireAddFiles?: boolean }) => Promise<string>) => {
+        const driver = new StubUiDriver()
+        const selected: string[] = []
+        const pinDuringIntent: (string | undefined)[] = []
+        const orig = driver.runIntent.bind(driver)
+        Object.assign(driver, {
+            selectDisk: async (id: string, o?: { requireAddFiles?: boolean; requireEmptyPanel?: boolean }) => {
+                selected.push(id)
+                if (onSelect) return onSelect(id, o)
+                expect(o?.requireAddFiles).toBe(true)
+                expect(o?.requireEmptyPanel).toBeFalsy()
+                return `selected [data-testid="disk-${id}"] (Add Files visible)`
+            },
+            runIntent: async (req: any) => {
+                if (req.action === 'add_files_role') pinDuringIntent.push(process.env.DURATION_FILES_DISK_ID)
+                return orig(req)
+            },
+        })
+        return { driver, selected, pinDuringIntent }
+    }
+
+    it('restores Kolibri idea03→idea01, selects it with requireAddFiles, runs the Intent (no already-satisfied short-circuit)', async () => {
+        await withEnv(BASE_ENV, async () => {
+            const ops = await r22Fleet()
+            const { driver, selected, pinDuringIntent } = addFilesDriver()
+            const result = await dispatchAction(ctxFor(ops, 'idea03', { stubUi: true, uiDriver: driver }) as any)
+            expect(result.ok, result.message).toBe(true)
+            expect(result.message).toMatch(/restored duration-kolibri-grade5a-001 idea03→idea01/)
+            expect(result.dockedEngine).toBe('idea01')
+            expect(selected).toEqual([KOLIBRI])
+            // The Pixel Intent still runs even though empty-001 already has files (make_files_disk).
+            const call = driver.callContexts.find(c => c.action === 'add_files_role')
+            expect(call?.diskId).toBe(KOLIBRI)
+            expect(call?.engineId).toBe('idea01')
+            // Console 230b70f reads DURATION_FILES_DISK_ID first → app-only disk during the Intent only.
+            expect(pinDuringIntent).toEqual([KOLIBRI])
+            expect(process.env.DURATION_FILES_DISK_ID).toBe('duration-empty-001')
+            expect(process.env.DURATION_LAST_FILES_ROLE_DISK_ID).toBe(KOLIBRI)
+            expect(process.env.DURATION_KOLIBRI_URL).toBe('http://idea01:18080')
+            const view = await ops.readStore('idea01')
+            expect(view.diskDB[KOLIBRI]?.dockedTo).toBe('idea01')
+        })
+    })
+
+    it('files_role_added after add_files_role asserts the app-only disk, not empty-001', async () => {
+        await withEnv({ ...BASE_ENV, DURATION_LAST_FILES_ROLE_DISK_ID: KOLIBRI }, async () => {
+            const ops = await r22Fleet()
+            const driver = new StubUiDriver()
+            const r = await dispatchAction(ctxFor(ops, 'idea01', { stubUi: true, uiDriver: driver }, 'files_role_added') as any)
+            expect(r.ok).toBe(true)
+            expect(driver.callContexts.find(c => c.action === 'files_role_added')?.diskId).toBe(KOLIBRI)
+        })
+    })
+
+    it('Kolibri already on the Console engine: no move, walker dockedEngine untouched', async () => {
+        await withEnv(BASE_ENV, async () => {
+            const ops = await r22Fleet()
+            await ops.moveDisk('idea03', 'idea01', KOLIBRI)
+            const { driver } = addFilesDriver()
+            const r = await dispatchAction(ctxFor(ops, 'idea01', { stubUi: true, uiDriver: driver }) as any)
+            expect(r.ok).toBe(true)
+            expect(r.message).toMatch(/already docked on Console engine idea01/)
+            expect(r.dockedEngine).toBeUndefined()
+        })
+    })
+
+    it('fails loud before the Intent when Add Files is not visible on the app-only disk', async () => {
+        await withEnv(BASE_ENV, async () => {
+            const ops = await r22Fleet()
+            const { driver } = addFilesDriver(async () => {
+                throw new Error('selectDisk: [data-testid="disk-duration-kolibri-grade5a-001"] clicked but [data-testid="add-files"] not visible')
+            })
+            const r = await dispatchAction(ctxFor(ops, 'idea03', { stubUi: true, uiDriver: driver }) as any)
+            expect(r.ok).toBe(false)
+            expect(r.message).toMatch(/add_files_role aborted before Intent: .*add-files/)
+            expect(driver.callContexts.find(c => c.action === 'add_files_role')).toBeUndefined()
+            expect(process.env.DURATION_LAST_FILES_ROLE_DISK_ID).toBe('duration-empty-001')
+        })
+    })
+
+    it('fails loud when the app-only target is an Empty pack / the make_files_disk Files Disk', async () => {
+        await withEnv({ ...BASE_ENV, DURATION_ADD_FILES_DISK_ID: 'duration-empty-001' }, async () => {
+            const ops = await r22Fleet()
+            const { driver } = addFilesDriver()
+            const r = await dispatchAction(ctxFor(ops, 'idea03', { stubUi: true, uiDriver: driver }) as any)
+            expect(r.ok).toBe(false)
+            expect(r.message).toMatch(/not an app-only disk/)
+            expect(driver.callContexts.find(c => c.action === 'add_files_role')).toBeUndefined()
+        })
+        expect(() => addFilesAppDiskId({ fixtureDisk: KOLIBRI }, { DURATION_FILES_DISK_ID: KOLIBRI })).toThrow(/not an app-only disk/)
+        expect(addFilesAppDiskId({ fixtureDisk: KOLIBRI }, {})).toBe(KOLIBRI)
+    })
+
+    it('live: fails loud when the restore lands off the Console engine or the disk already has files', async () => {
+        await withEnv(BASE_ENV, async () => {
+            const ops = await r22Fleet()
+            const offConsole = Object.assign(ops, { findDockedEngine: async () => 'idea03' })
+            await expect(ensureAppOnlyDiskOnConsoleEngine(ctxFor(offConsole, 'idea03') as any))
+                .rejects.toThrow(/landed on idea03 not idea01/)
+        })
+        await withEnv(BASE_ENV, async () => {
+            const ops = await r22Fleet()
+            await ops.moveDisk('idea03', 'idea01', KOLIBRI)
+            const realRead = ops.readStore.bind(ops)
+            const hasFiles = Object.assign(ops, {
+                findDockedEngine: async () => 'idea01',
+                readStore: async (e: string) => {
+                    const v = await realRead(e)
+                    if (v.diskDB[KOLIBRI]) v.diskDB[KOLIBRI]!.diskTypes = ['app', 'files']
+                    return v
+                },
+            })
+            await expect(ensureAppOnlyDiskOnConsoleEngine(ctxFor(hasFiles, 'idea01') as any))
+                .rejects.toThrow(/already has a files role/)
+        })
+    })
+
+    it('live preflight: ext4 slot + clean root required (README.md refused); skip env escapes', async () => {
+        await withEnv(BASE_ENV, async () => {
+            const ops = await r22Fleet()
+            await ops.moveDisk('idea03', 'idea01', KOLIBRI)
+            const realRead = ops.readStore.bind(ops)
+            let entries = ['META.yaml', 'apps', 'services', 'instances', 'README.md']
+            let fsType = 'ext4'
+            const live = Object.assign(ops, {
+                findDockedEngine: async () => 'idea01',
+                readStore: async (e: string) => {
+                    const v = await realRead(e)
+                    if (v.diskDB[KOLIBRI]) v.diskDB[KOLIBRI]!.diskTypes = ['app']
+                    return v
+                },
+                probeFixtureFsType: async () => ({ device: 'idea-test-1', dest: '/x/idea-test-1', fsType }),
+                probeFixtureRootEntries: async () => ({ dest: '/x/idea-test-1', entries }),
+            })
+            const ctx = ctxFor(live, 'idea01') as any
+            await expect(ensureAppOnlyDiskOnConsoleEngine(ctx)).rejects.toThrow(/non-IDEA entries \(README\.md\)/)
+            // Stock Kid Kolibri pack ships content/ at root → refused; both problems in one error.
+            entries = ['META.yaml', 'apps', 'content', 'instances']
+            fsType = ''
+            await expect(ensureAppOnlyDiskOnConsoleEngine(ctx)).rejects.toThrow(/non-IDEA entries \(content\).*fs=unknown.*ext4/)
+            entries = ['META.yaml', 'apps', 'services', 'instances', 'lost+found']
+            await expect(ensureAppOnlyDiskOnConsoleEngine(ctx)).rejects.toThrow(/fs=unknown.*ext4/)
+            fsType = 'ext4'
+            const ok = await ensureAppOnlyDiskOnConsoleEngine(ctx)
+            expect(ok.note).toMatch(/fs=ext4; root clean/)
+            fsType = ''
+            const skipped = await ensureAppOnlyDiskOnConsoleEngine(ctx, { ...process.env, DURATION_FILES_DISK_SKIP_EXT4_PREFLIGHT: '1' })
+            expect(skipped.note).toMatch(/preflight skipped/)
+        })
+    })
+
+    it('never restores onto idea02 (Console host named idea02 falls back to pool[0])', async () => {
+        await withEnv({ ...BASE_ENV, DURATION_SWITCH_ENGINE_HOST: 'idea02', DURATION_CONSOLE_URL: undefined }, async () => {
+            const ops = await r22Fleet()
+            const r = await ensureAppOnlyDiskOnConsoleEngine(ctxFor(ops, 'idea03') as any)
+            expect(r.engine).toBe('idea01')
+        })
     })
 })
 

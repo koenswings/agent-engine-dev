@@ -226,9 +226,14 @@ export const defaultIdsForIntent = (action: string): { diskId?: string; instance
     // empty (or Files) disk under test — never hard-code moved Kolibri Grade5A.
     // files_role_added asserts disk-view / files badge on this id (DURATION_FILES_DISK_ID
     // after make_files_disk when set by the harness).
+    // Prefer A r22 FAIL@93: add_files_role targets an app-only disk (Add Files on an
+    // Apps DiskView) — DURATION_ADD_FILES_DISK_ID else Kolibri Grade5A (the harness
+    // restores it onto the Console engine first). Never the make_files_disk Files Disk.
+    if (action === 'add_files_role') {
+        return { diskId: process.env.DURATION_ADD_FILES_DISK_ID?.trim() || DURATION_UI_FIXTURES.kolibri.diskId }
+    }
     if (
         action === 'make_files_disk' ||
-        action === 'add_files_role' ||
         action === 'files_role_added' ||
         action === 'make_backup_disk' ||
         action === 'restore_from_backup' ||
@@ -236,10 +241,14 @@ export const defaultIdsForIntent = (action: string): { diskId?: string; instance
         action === 'erase_disk'
     ) {
         const filesId = process.env.DURATION_FILES_DISK_ID?.trim()
+        // Prefer A r22: files_role_added asserts the disk that most recently gained files.
+        const lastFilesRole = process.env.DURATION_LAST_FILES_ROLE_DISK_ID?.trim()
+        if (action === 'files_role_added' && lastFilesRole) {
+            return { diskId: lastFilesRole }
+        }
         if (
             filesId &&
             (action === 'files_role_added' ||
-                action === 'add_files_role' ||
                 action === 'backup_configured_restored' ||
                 action === 'restore_from_backup')
         ) {
