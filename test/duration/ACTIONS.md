@@ -155,6 +155,7 @@ Deprecated CLI aliases (`minimal-*`, `stress`, `school-day`) load **`unified.yam
 |---|---|---|
 | `infra_dock_fixture` (primary) | `duration-kolibri-grade5a-001` | `kolibri-grade5a-001` |
 | nextcloud pack | `duration-nextcloud-grade5a-001` | `nextcloud-grade5a-001` |
+| wikipedia / kiwix (Prefer A / App#11) | `duration-kiwix-ideaa-001` | `kiwix-ideaa-001` |
 | empty pack (EmptyDiskPanel / make_backup) | `duration-empty-001` | — (no instance; slot idea-test-3; early `DURATION_EMPTY_DISK_ID`) |
 | empty pack #2 (Prefer A r17 erase + late install) | `duration-empty-002` | — (Kid pack `empty-002/`; slot idea-test-4; erase discover **and** must stay Empty after erase for late `install_app`) |
 | Backup Disk (post `make_backup_disk`) | `duration-empty-001` via `DURATION_BACKUP_DISK_ID` | — (role=backup; required before `restore_from_backup`; **not** erase target) |
@@ -162,7 +163,9 @@ Deprecated CLI aliases (`minimal-*`, `stress`, `school-day`) load **`unified.yam
 
 Content pins (stable): `open_video` contentId `e60662de-b15c-52f9-b003-359f7d91f8fd` / nodeId `4a1a1b92-3f6d-59eb-a94c-3f91f0011dd5`; `open_exercise` contentId `7eb9de46-96eb-53d0-bcc1-2fb270b96f03` / nodeId `94a47ec7-f30d-5cd1-93f8-ad08c42b6c2a`. Auth Morango IDs are re-provision mutable.
 
-`infra_undock_fixtures` undocks **all** infra-eligible fixture disks. Kiwix omitted until wiki edges go live.
+`infra_undock_fixtures` undocks **all** infra-eligible fixture disks. Kiwix omitted from infra dock until wiki edges go live (not infra_disk in unified.yaml).
+
+**UI Intent fixture remap** (`actions.ts` `runUiIntent`): defaults are primary kolibri Grade5A; Intents whose name includes `nextcloud` remap to nextcloud Grade5A from `fixtureInstances`; names including `wikipedia` / `kiwix` remap to Prefer A Kiwix pins (`duration-kiwix-ideaa-001` / `kiwix-ideaa-001`, falling back to `DURATION_UI_FIXTURES.kiwix` when not in `fixtureInstances`); `kolibri` / `open_video` / `open_exercise` stay on kolibri. Playwright must not receive kolibri `instanceId` for wikipedia Intents (r1 FAIL@2: Open landed on Kolibri :18080 signin).
 
 ## Phase 4 stability
 

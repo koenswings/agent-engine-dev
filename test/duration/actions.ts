@@ -656,6 +656,21 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             diskId = nc[0]
             instanceId = nc[1]
         }
+    } else if (ctx.action.includes('wikipedia') || ctx.action.includes('kiwix')) {
+        // Prefer A / Kid App#11: open_wikipedia_* / search_browse_wikipedia / leave_wikipedia_*
+        // must target Kiwix (kiwix-ideaa-001), never primary kolibri-grade5a-001.
+        // Kiwix is not infra_disk yet (unified.yaml deferred) so fixtureInstances often
+        // lacks a kiwix entry — fall back to seeded Prefer A pin.
+        const kx = Object.entries(ctx.fixtureInstances).find(
+            ([d]) => d.includes('kiwix') || d.includes('wikipedia'),
+        )
+        if (kx) {
+            diskId = kx[0]
+            instanceId = kx[1]
+        } else {
+            diskId = DURATION_UI_FIXTURES.kiwix.diskId
+            instanceId = DURATION_UI_FIXTURES.kiwix.instanceId
+        }
     } else if (ctx.action.includes('kolibri') || ctx.action === 'open_video' || ctx.action === 'open_exercise') {
         const k = Object.entries(ctx.fixtureInstances).find(([d]) => d.includes('kolibri'))
         if (k) {

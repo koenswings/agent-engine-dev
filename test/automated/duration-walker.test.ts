@@ -36,6 +36,7 @@ import {
     StubUiDriver,
     createUiDriver,
     DURATION_UI_FIXTURES,
+    defaultIdsForIntent,
     isPixelIntent,
     resolveConsoleIntentsDir,
     DEFERRED_UI_INTENTS,
@@ -377,16 +378,28 @@ describe('duration scenario YAML loader', () => {
             storeMode: 'shared',
             settleDelayMs: 0,
         })
+        const driver = new StubUiDriver()
         const result = await runDeterministicWalk(walk, {
             fast: true,
             ops,
             stubUi: true,
+            uiDriver: driver,
             skipStability: true,
         })
         expect(result.failures).toBe(0)
         expect(result.aborted).toBe(false)
         expect(result.steps).toBe(9)
         expect(result.finalState).toBe('start')
+        // Prefer A: wikipedia Intents must remap to Kiwix pins (not primary kolibri-grade5a-001)
+        const wikiCalls = driver.callContexts.filter(c =>
+            c.action.includes('wikipedia') || c.action.includes('kiwix'),
+        )
+        expect(wikiCalls.length).toBe(5)
+        for (const c of wikiCalls) {
+            expect(c.diskId, c.action).toBe(DURATION_UI_FIXTURES.kiwix.diskId)
+            expect(c.instanceId, c.action).toBe(DURATION_UI_FIXTURES.kiwix.instanceId)
+            expect(c.instanceId, c.action).not.toBe('kolibri-grade5a-001')
+        }
     })
 
 
@@ -1032,6 +1045,24 @@ describe('Phase 3 UI Intent dispatch (StubUiDriver)', () => {
         expect(DURATION_UI_FIXTURES.kolibri.exercise.contentId).toBe('7eb9de46-96eb-53d0-bcc1-2fb270b96f03')
         expect(DURATION_UI_FIXTURES.kolibri.channelId).toBe('30b6c263-4b96-5a62-93bd-dcf9a5cad7ca')
         expect(DURATION_UI_FIXTURES.nextcloud.instanceId).toBe('nextcloud-grade5a-001')
+        expect(DURATION_UI_FIXTURES.kiwix.diskId).toBe('duration-kiwix-ideaa-001')
+        expect(DURATION_UI_FIXTURES.kiwix.instanceId).toBe('kiwix-ideaa-001')
+    })
+
+    it('defaultIdsForIntent remaps wikipedia/kiwix to Prefer A Kiwix pins', () => {
+        for (const action of [
+            'open_wikipedia_as_learner',
+            'open_wikipedia_as_teacher',
+            'search_browse_wikipedia',
+            'leave_wikipedia_as_learner',
+            'leave_wikipedia_as_teacher',
+        ]) {
+            const ids = defaultIdsForIntent(action)
+            expect(ids.diskId, action).toBe('duration-kiwix-ideaa-001')
+            expect(ids.instanceId, action).toBe('kiwix-ideaa-001')
+        }
+        expect(defaultIdsForIntent('open_nextcloud_as_learner').instanceId).toBe('nextcloud-grade5a-001')
+        expect(defaultIdsForIntent('open_kolibri_as_learner').instanceId).toBe('kolibri-grade5a-001')
     })
 
     it('walker dispatches usage Intents through uiDriver on unified', async () => {
