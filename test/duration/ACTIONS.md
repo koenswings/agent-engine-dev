@@ -79,6 +79,7 @@ Walks only (`--scenario cover-all|kolibri-*-smoke|…`). Markov rejects `--start
 pnpm test:duration -- --scenario kolibri-learn-smoke --fast
 pnpm test:duration -- --scenario kolibri-teacher-preview-smoke --fast
 pnpm test:duration -- --scenario kolibri-next-video-exit-smoke --fast
+pnpm test:duration -- --scenario nextcloud-share-smoke --fast   # Fake only — HOLD live (see below)
 # Mid-cover-all without re-walking 1..11:
 pnpm test:duration -- --scenario cover-all --start-from 12 --fast
 pnpm test:duration -- --scenario cover-all --start-from finish_exercise --iterations 1 --fast
@@ -86,6 +87,10 @@ pnpm test:duration -- --scenario kolibri-learn-smoke --start-from finish_exercis
 ```
 
 `kolibri-next-video-exit-smoke` extends the teacher-preview path with `open_exercise` → `next_video` → `exit_lesson`. Mid-start on `finish_exercise` alone does **not** auto-navigate the page — live UI must already be on the pinned exercise, or run the full smoke.
+
+**`nextcloud-share-smoke`** (8 steps, teacher): `open_console_as_teacher` → `open_nextcloud_as_teacher` → `browse_folders` → `share_to_class` → `done_sharing` → `share_to_class` → `back_to_console_from_share` → `return_to_start`. Seeded Grade5A pins only (`duration-nextcloud-grade5a-001` / `nextcloud-grade5a-001`), store_mode shared via unified.yaml. **HOLD live** until Atlas confirms Path A with Kid App#11 @`a443398` Prefer A fixtures + Kid `enable_sharing true` on the Grade 5A Files mount + Steve clear; needs Console@`2da863c`+.
+
+**Not yet written (wait on Pixel/Atlas):** NC collab smoke (`open_collab_doc` / `close_doc` registered, but `keep_editing` (NC Text) still Pixel-missing and Atlas hold on NC collab live), File Drop smoke (`open_file_drop` / `after_upload` / `leave_file_drop` Pixel-missing), wiki smoke (`open_wikipedia_*` deferred; `search_browse_wikipedia` / `leave_wikipedia_*` Pixel-missing; Kiwix fixture not in infra yet).
 
 **`--record-walk` caveat:** frames often show the Console Apps page, not the Kolibri tab — the recorder does not follow app tabs. Do not trust screenshots alone for Kolibri steps; prefer Intent `ok` / structured logs.
 

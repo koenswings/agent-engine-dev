@@ -290,6 +290,38 @@ describe('duration scenario YAML loader', () => {
         expect(result.finalState).toBe('kolibri_home')
     })
 
+    it('runs nextcloud-share-smoke Fake walk end-to-end (share_to_class → done_sharing → back_to_console_from_share)', async () => {
+        expect(isWalkScenario('nextcloud-share-smoke')).toBe(true)
+        const walk = loadWalk('nextcloud-share-smoke')
+        expect(walk.steps.map(s => s.action)).toEqual([
+            'open_console_as_teacher',
+            'open_nextcloud_as_teacher',
+            'browse_folders',
+            'share_to_class',
+            'done_sharing',
+            'share_to_class',
+            'back_to_console_from_share',
+            'return_to_start',
+        ])
+        expect(walk.scenario.store_mode).toBe('shared')
+        const ops = fakeOps({
+            poolEngines: [...DEFAULT_POOL],
+            excludeEngines: ['idea02'],
+            storeMode: 'shared',
+            settleDelayMs: 0,
+        })
+        const result = await runDeterministicWalk(walk, {
+            fast: true,
+            ops,
+            stubUi: true,
+            skipStability: true,
+        })
+        expect(result.failures).toBe(0)
+        expect(result.aborted).toBe(false)
+        expect(result.steps).toBe(8)
+        expect(result.finalState).toBe('start')
+    })
+
     it('refuses hw-roundtrip stick fixture markers', () => {
         expect(() => assertSafeFixtureDisk('stick-26A1EE83197F')).toThrow(/hw-roundtrip/)
         expect(() => assertSafeFixtureDisk('3E50-902A')).toThrow(/hw-roundtrip/)
