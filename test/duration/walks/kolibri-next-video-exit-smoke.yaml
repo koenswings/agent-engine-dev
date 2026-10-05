@@ -1,0 +1,15 @@
+# Teacher preview path through finish_exercise, then next_video → exit_lesson (Prefer A short smoke).
+kind: walk
+name: kolibri-next-video-exit-smoke
+graph: unified
+steps:
+  - { from: start, to: console_teacher, action: open_console_as_teacher }
+  - { from: console_teacher, to: kolibri_manage, action: open_kolibri_as_teacher }
+  - { from: kolibri_manage, to: kolibri_home, action: preview_as_learner }
+  - { from: kolibri_home, to: kolibri_watching, action: open_video }
+  - { from: kolibri_watching, to: kolibri_watching, action: keep_watching }
+  - { from: kolibri_watching, to: kolibri_exercise, action: next_resource }
+  - { from: kolibri_exercise, to: kolibri_home, action: finish_exercise }
+  - { from: kolibri_home, to: kolibri_exercise, action: open_exercise }
+  - { from: kolibri_exercise, to: kolibri_watching, action: next_video }
+  - { from: kolibri_watching, to: kolibri_home, action: exit_lesson }

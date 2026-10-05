@@ -73,18 +73,19 @@ Walks only (`--scenario cover-all|kolibri-*-smoke|…`). Markov rejects `--start
 - With `--iterations N`: apply start-from first, then truncate the remaining slice to N steps.
 - Past end / unknown action → clear CLI error (exit 2).
 
-**Smoke walks** (Fake Stub OK; live `--ui` needs Console@`4f7cfba`+ click-mask wait — do not run live until that tip is served):
+**Smoke walks** (Fake Stub OK; live `--ui` needs Console@`f150b9e`+ for next_video/exit_lesson/browse_folders; finish_exercise needs `4f7cfba`+):
 
 ```bash
 pnpm test:duration -- --scenario kolibri-learn-smoke --fast
 pnpm test:duration -- --scenario kolibri-teacher-preview-smoke --fast
+pnpm test:duration -- --scenario kolibri-next-video-exit-smoke --fast
 # Mid-cover-all without re-walking 1..11:
 pnpm test:duration -- --scenario cover-all --start-from 12 --fast
 pnpm test:duration -- --scenario cover-all --start-from finish_exercise --iterations 1 --fast
 pnpm test:duration -- --scenario kolibri-learn-smoke --start-from finish_exercise --fast
 ```
 
-`open_exercise` is registered (Pixel) for alternate seeding; these smokes use `open_video` → `keep_watching` → `next_resource` → `finish_exercise`. Mid-start on `finish_exercise` alone does **not** auto-navigate the page — live UI must already be on the pinned exercise, or run the full smoke.
+`kolibri-next-video-exit-smoke` extends the teacher-preview path with `open_exercise` → `next_video` → `exit_lesson`. Mid-start on `finish_exercise` alone does **not** auto-navigate the page — live UI must already be on the pinned exercise, or run the full smoke.
 
 **`--record-walk` caveat:** frames often show the Console Apps page, not the Kolibri tab — the recorder does not follow app tabs. Do not trust screenshots alone for Kolibri steps; prefer Intent `ok` / structured logs.
 
