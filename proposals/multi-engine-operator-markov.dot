@@ -1,0 +1,127 @@
+digraph MultiEngineOperatorMarkov {
+  rankdir=TB;
+  size="16,9!";
+  ratio=fill;
+  bgcolor="white";
+  pad="0.35";
+  nodesep="0.32";
+  ranksep="0.50";
+  fontname="Helvetica";
+  splines=true;
+  overlap=false;
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10, width=1.40, height=0.48, margin="0.08,0.06"];
+  edge [fontname="Helvetica", fontsize=7, color="#555555"];
+
+  start [label="start", shape=circle, width=0.40, height=0.40, fixedsize=true, fillcolor="#eeeeee", style=filled, fontsize=9];
+
+  subgraph cluster_entry {
+    label="Auth";
+    fontsize=11;
+    style=rounded;
+    color="#5DADE2";
+    op_entry [label="op_entry\n(open / login)", fillcolor="#D6EAF8"];
+  }
+
+  subgraph cluster_hub {
+    label="School hub";
+    fontsize=11;
+    style=rounded;
+    color="#3498DB";
+    op_overview [label="op_overview\n(NetworkTree)", fillcolor="#85C1E9"];
+  }
+
+  subgraph cluster_disk {
+    label="Disk actions";
+    fontsize=11;
+    style=rounded;
+    color="#F4D03F";
+    op_disk    [label="op_disk\n(disk inventory)", fillcolor="#FCF3CF"];
+    op_install [label="op_install", fillcolor="#ABEBC6"];
+    op_files   [label="op_files", fillcolor="#D7BDE2"];
+    op_backup  [label="op_backup", fillcolor="#D5F5E3"];
+    op_erase   [label="op_erase", fillcolor="#F5B7B1"];
+    op_eject   [label="op_eject", fillcolor="#F5B7B1"];
+  }
+
+  subgraph cluster_instance {
+    label="Instance / redistribute";
+    fontsize=11;
+    style=rounded;
+    color="#5DADE2";
+    op_instance  [label="op_instance", fillcolor="#AED6F1"];
+    op_copy_move [label="op_copy_move", fillcolor="#F9E79F"];
+  }
+
+  subgraph cluster_admin {
+    label="Account / settings";
+    fontsize=11;
+    style=rounded;
+    color="#95A5A6";
+    op_account  [label="op_account", fillcolor="#D5DBDB"];
+    op_settings [label="op_settings", fillcolor="#D5DBDB"];
+  }
+
+  start -> op_entry [label="Open Console\nas operator"];
+
+  op_entry -> op_overview [label="Sign in 0.85"];
+  op_entry -> op_entry    [label="Retry login /\nfirst-time setup 0.15"];
+
+  op_overview -> op_disk     [label="Open disk inventory 0.28"];
+  op_overview -> op_instance [label="Open instance controls 0.18"];
+  op_overview -> op_eject    [label="Eject disk 0.10"];
+  op_overview -> op_account  [label="Open Account 0.06"];
+  op_overview -> op_settings [label="Open Settings 0.06"];
+  op_overview -> op_overview [label="Stay on overview 0.20"];
+  op_overview -> op_overview [label="Notice USB dock 0.12"];
+
+  op_disk -> op_install   [label="Install App 0.18"];
+  op_disk -> op_files     [label="Make Files Disk 0.08"];
+  op_disk -> op_files     [label="Add Files role 0.06"];
+  op_disk -> op_backup    [label="Make Backup Disk 0.08"];
+  op_disk -> op_backup    [label="Restore from Backup 0.06"];
+  op_disk -> op_instance  [label="Open instance controls 0.18"];
+  op_disk -> op_copy_move [label="Copy app 0.05"];
+  op_disk -> op_copy_move [label="Move app 0.05"];
+  op_disk -> op_erase     [label="Erase disk 0.08"];
+  op_disk -> op_eject     [label="Eject disk 0.08"];
+  op_disk -> op_overview  [label="Back to overview 0.10"];
+
+  op_eject -> op_overview [label="Confirm eject 0.70"];
+  op_eject -> op_overview [label="Cancel eject 0.30"];
+
+  op_erase -> op_disk     [label="Confirm erase 0.70"];
+  op_erase -> op_overview [label="Cancel erase 0.30"];
+
+  op_files -> op_disk     [label="Files role added 0.80"];
+  op_files -> op_overview [label="Back to overview 0.20"];
+
+  op_backup -> op_disk     [label="Backup configured /\nrestored 0.75"];
+  op_backup -> op_overview [label="Back to overview 0.25"];
+
+  op_install -> op_instance [label="Start after install 0.55"];
+  op_install -> op_disk     [label="Stay on disk 0.30"];
+  op_install -> op_overview [label="Back to overview 0.15"];
+
+  op_instance -> op_instance  [label="Start instance 0.15"];
+  op_instance -> op_instance  [label="Stop instance 0.12"];
+  op_instance -> op_instance  [label="Open app 0.10"];
+  op_instance -> op_instance  [label="Backup instance 0.08"];
+  op_instance -> op_copy_move [label="Copy app 0.10"];
+  op_instance -> op_copy_move [label="Move app 0.10"];
+  op_instance -> op_disk      [label="Back to disk 0.20"];
+  op_instance -> op_overview  [label="Back to overview 0.15"];
+
+  op_copy_move -> op_overview [label="Done redistribute 0.55"];
+  op_copy_move -> op_disk     [label="Stay on source disk 0.30"];
+  op_copy_move -> op_instance [label="Open copied instance 0.15"];
+
+  op_account -> op_account  [label="Add operator 0.20"];
+  op_account -> op_account  [label="Remove operator 0.15"];
+  op_account -> op_account  [label="Change password 0.20"];
+  op_account -> op_overview [label="Close Account 0.35"];
+  op_account -> op_entry    [label="Log out 0.10"];
+
+  op_settings -> op_overview [label="Close Settings 0.50"];
+  op_settings -> op_settings [label="Switch Engine 0.25"];
+  op_settings -> op_settings [label="Reboot Engine 0.25"];
+}
