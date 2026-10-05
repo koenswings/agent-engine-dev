@@ -373,9 +373,11 @@ const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
         if (existing && !ctx.excludeEngines.includes(existing)) {
             await settleParticipants(ctx, ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e)))
             const kolibriUrl = syncKolibriSidecarUrlForEngine(existing, hostMapFromOps(ctx.opts.ops))
+            const ncReady = await maybeWaitNextcloudAfterDock(ctx, existing)
+            const ncMsg = ncReady ? `; ${ncReady}` : ''
             return {
                 ok: true,
-                message: `fixture ${ctx.fixtureDisk} already docked on ${existing} (no-op); DURATION_KOLIBRI_URL=${kolibriUrl}`,
+                message: `fixture ${ctx.fixtureDisk} already docked on ${existing} (no-op); DURATION_KOLIBRI_URL=${kolibriUrl}${ncMsg}`,
                 dockedEngine: existing,
                 layer: 'infra',
             }
@@ -405,9 +407,11 @@ const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
     await settleParticipants(ctx, ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e)))
     const sibMsg = siblings.length ? ` (+ ${siblings.join(', ')})` : ''
     const kolibriUrl = syncKolibriSidecarUrlForEngine(engine, hostMapFromOps(ctx.opts.ops))
+    const ncReady = await maybeWaitNextcloudAfterDock(ctx, engine)
+    const ncMsg = ncReady ? `; ${ncReady}` : ''
     return {
         ok: true,
-        message: `docked ${ctx.fixtureDisk}${sibMsg} on ${engine}; DURATION_KOLIBRI_URL=${kolibriUrl}`,
+        message: `docked ${ctx.fixtureDisk}${sibMsg} on ${engine}; DURATION_KOLIBRI_URL=${kolibriUrl}${ncMsg}`,
         dockedEngine: engine,
         layer: 'infra',
     }
@@ -432,6 +436,131 @@ export const syncKolibriSidecarUrlForEngine = (
     const url = `http://${authority}:${port}`
     env.DURATION_KOLIBRI_URL = url
     return url
+}
+
+/**
+ * Prefer A cover-all-230b70f-r16 FAIL@65: after infra_dock_fixture re-docks NC on
+ * idea01 with startInstances, Console open_nextcloud_as_teacher hit login form
+ * incomplete (~31s) — NC still booting. Mirror Kolibri follow-host: point
+ * DURATION_NEXTCLOUD_URL at the dock host (Tailscale IP when live).
+ */
+export const syncNextcloudSidecarUrlForEngine = (
+    engineId: string,
+    hosts: Record<string, string> | undefined,
+    env: NodeJS.ProcessEnv = process.env,
+): string => {
+    const authority = (hosts?.[engineId]?.trim() || engineId).replace(/\/$/, '')
+    const portRaw = env.DURATION_NEXTCLOUD_PORT?.trim()
+    const port = portRaw && /^\d+$/.test(portRaw) ? portRaw : '18280'
+    const url = `http://${authority}:${port}`
+    env.DURATION_NEXTCLOUD_URL = url
+    return url
+}
+
+/** Poll budget for NC login-form readiness after dock. Default 180s (re-dock >30s). */
+export const nextcloudReadyTimeoutMs = (env: NodeJS.ProcessEnv = process.env): number => {
+    const raw = env.DURATION_NEXTCLOUD_READY_MS?.trim()
+    if (raw && /^\d+$/.test(raw)) return Math.max(1_000, Number(raw))
+    return 180_000
+}
+
+/**
+ * True when HTML looks like a Nextcloud login form (Console NC_SELECTORS signals).
+ * Used by Engine harness HTTP poll — no Playwright.
+ */
+export const nextcloudLoginFormLooksReady = (html: string): boolean => {
+    const hasUser =
+        /name=["']user["']|id=["']user["']|data-login-form-input-user/i.test(html)
+    const hasPassword =
+        /name=["']password["']|id=["']password["']|data-login-form-input-password/i.test(html)
+    const hasSubmit = /type=["']submit["']|data-login-form-submit/i.test(html)
+    return hasUser && hasPassword && hasSubmit
+}
+
+export type WaitNextcloudSidecarOpts = {
+    hosts?: Record<string, string>
+    env?: NodeJS.ProcessEnv
+    /** Skip network poll (FakeFleetOps / non-live). */
+    skip?: boolean
+    /** Inject fetch for unit tests. */
+    fetchImpl?: typeof fetch
+    /** Inject sleep for unit tests. */
+    sleepImpl?: (ms: number) => Promise<void>
+}
+
+/**
+ * Poll GET http://host:18280/login until body looks like NC login form.
+ * Sets DURATION_NEXTCLOUD_URL (follow-host). Loud-fail citing r16 FAIL@65.
+ * No Playwright — Node fetch only.
+ */
+export const waitNextcloudSidecarReadyForEngine = async (
+    engineId: string,
+    opts: WaitNextcloudSidecarOpts = {},
+): Promise<string> => {
+    const env = opts.env ?? process.env
+    const base = syncNextcloudSidecarUrlForEngine(engineId, opts.hosts, env)
+    if (opts.skip) {
+        return `DURATION_NEXTCLOUD_URL=${base} (wait skipped)`
+    }
+    const budget = nextcloudReadyTimeoutMs(env)
+    const deadline = Date.now() + budget
+    const fetchImpl = opts.fetchImpl ?? globalThis.fetch
+    const sleepImpl = opts.sleepImpl ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)))
+    const loginUrl = `${base.replace(/\/$/, '')}/login`
+    let last = 'no-attempt'
+    while (Date.now() < deadline) {
+        try {
+            const resp = await fetchImpl(loginUrl, {
+                redirect: 'follow',
+                signal: AbortSignal.timeout(5_000),
+            })
+            const status = resp.status
+            if (status >= 200 && status < 400) {
+                const html = await resp.text()
+                if (nextcloudLoginFormLooksReady(html)) {
+                    return `DURATION_NEXTCLOUD_URL=${base} (login form ready)`
+                }
+                last = `HTTP ${status} login-form incomplete (user/password/submit)`
+            } else {
+                last = `HTTP ${status}`
+            }
+        } catch (err) {
+            last = err instanceof Error ? err.message : String(err)
+        }
+        await sleepImpl(1_000)
+    }
+    throw new Error(
+        `Nextcloud sidecar not ready: ${loginUrl} within ${budget}ms (last=${last}). ` +
+            `cover-all-230b70f-r16 FAIL@65 open_nextcloud_as_teacher — NC still booting after ` +
+            `infra_dock_fixture; Engine must poll :18280 login form (mirror Kolibri ` +
+            `waitForSidecarHttpReady). Set DURATION_NEXTCLOUD_READY_MS / DURATION_NEXTCLOUD_URL|PORT.`,
+    )
+}
+
+/** True when Nextcloud Grade5A (or any nextcloud disk) is among fixtures. */
+export const fixtureSetHasNextcloud = (
+    fixtureDisk: string,
+    fixtureDisks: string[],
+): boolean => {
+    const all = [fixtureDisk, ...fixtureDisks]
+    return all.some(d => /nextcloud/i.test(d))
+}
+
+/**
+ * After dock+settle: when NC is in the fixture set and ops are live (RealFleetOps),
+ * wait until :18280 login form is ready. Fake / non-live → sync URL only, no poll.
+ */
+const maybeWaitNextcloudAfterDock = async (
+    ctx: ActionContext,
+    engineId: string,
+): Promise<string | null> => {
+    if (!fixtureSetHasNextcloud(ctx.fixtureDisk, ctx.fixtureDisks)) return null
+    const opsAny = ctx.opts.ops as FleetOps & { findDockedEngine?: unknown }
+    const isLive = typeof opsAny.findDockedEngine === 'function'
+    return waitNextcloudSidecarReadyForEngine(engineId, {
+        hosts: hostMapFromOps(ctx.opts.ops),
+        skip: !isLive,
+    })
 }
 
 const hostMapFromOps = (ops: FleetOps): Record<string, string> | undefined => {

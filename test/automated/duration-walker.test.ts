@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { FakeFleetOps, dispatchAction, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, syncKolibriSidecarUrlForEngine } from '../duration/actions.js'
+import { FakeFleetOps, dispatchAction, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, nextcloudLoginFormLooksReady, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
 import { semanticStoresEqual, waitForConvergence } from '../duration/convergence.js'
 import { evaluateInvariants, DEFAULT_INFRA_INVARIANTS, listInvariantTypes } from '../duration/invariants.js'
 import {
@@ -1615,5 +1615,103 @@ describe('syncKolibriSidecarUrlForEngine (r15 FAIL@70)', () => {
         const env: NodeJS.ProcessEnv = { DURATION_KOLIBRI_PORT: '18081' }
         const url = syncKolibriSidecarUrlForEngine('idea03', undefined, env)
         expect(url).toBe('http://idea03:18081')
+    })
+})
+
+describe('syncNextcloudSidecarUrlForEngine / waitNextcloud (r16 FAIL@65)', () => {
+    it('sets DURATION_NEXTCLOUD_URL to host map IP:18280', () => {
+        const env: NodeJS.ProcessEnv = {}
+        const url = syncNextcloudSidecarUrlForEngine(
+            'idea01',
+            { idea01: '100.99.231.94', idea03: '100.126.117.80' },
+            env,
+        )
+        expect(url).toBe('http://100.99.231.94:18280')
+        expect(env.DURATION_NEXTCLOUD_URL).toBe(url)
+    })
+
+    it('honors DURATION_NEXTCLOUD_PORT override and logical id fallback', () => {
+        const env: NodeJS.ProcessEnv = { DURATION_NEXTCLOUD_PORT: '18281' }
+        const url = syncNextcloudSidecarUrlForEngine('idea01', undefined, env)
+        expect(url).toBe('http://idea01:18281')
+    })
+
+    it('nextcloudReadyTimeoutMs defaults to 180000 and honors env', () => {
+        expect(nextcloudReadyTimeoutMs({})).toBe(180_000)
+        expect(nextcloudReadyTimeoutMs({ DURATION_NEXTCLOUD_READY_MS: '120000' })).toBe(120_000)
+    })
+
+    it('nextcloudLoginFormLooksReady detects user+password+submit signals', () => {
+        const ready = `
+          <form data-login-form>
+            <div data-login-form-input-user><input name="user" id="user" /></div>
+            <div data-login-form-input-password><input name="password" id="password" type="password" /></div>
+            <button data-login-form-submit type="submit">Log in</button>
+          </form>`
+        expect(nextcloudLoginFormLooksReady(ready)).toBe(true)
+        expect(nextcloudLoginFormLooksReady('<html>booting</html>')).toBe(false)
+        expect(nextcloudLoginFormLooksReady('<input name="user" /><input name="password" />')).toBe(false)
+    })
+
+    it('fixtureSetHasNextcloud matches grade5a disk ids', () => {
+        expect(
+            fixtureSetHasNextcloud('duration-kolibri-grade5a-001', [
+                'duration-nextcloud-grade5a-001',
+                'duration-empty-001',
+            ]),
+        ).toBe(true)
+        expect(fixtureSetHasNextcloud('duration-kolibri-grade5a-001', ['duration-empty-001'])).toBe(false)
+    })
+
+    it('waitNextcloudSidecarReadyForEngine skip sets URL without polling', async () => {
+        const env: NodeJS.ProcessEnv = {}
+        const msg = await waitNextcloudSidecarReadyForEngine('idea01', {
+            hosts: { idea01: '100.99.231.94' },
+            env,
+            skip: true,
+        })
+        expect(env.DURATION_NEXTCLOUD_URL).toBe('http://100.99.231.94:18280')
+        expect(msg).toContain('wait skipped')
+    })
+
+    it('waitNextcloudSidecarReadyForEngine resolves when login HTML ready', async () => {
+        const env: NodeJS.ProcessEnv = { DURATION_NEXTCLOUD_READY_MS: '5000' }
+        const html = '<input name="user"/><input id="password"/><button type="submit">'
+        const fetchImpl = (async () =>
+            ({
+                status: 200,
+                text: async () => html,
+            }) as Response) as typeof fetch
+        const msg = await waitNextcloudSidecarReadyForEngine('idea01', {
+            hosts: { idea01: '10.0.0.1' },
+            env,
+            fetchImpl,
+            sleepImpl: async () => {},
+        })
+        expect(msg).toContain('login form ready')
+        expect(env.DURATION_NEXTCLOUD_URL).toBe('http://10.0.0.1:18280')
+    })
+
+    it('waitNextcloudSidecarReadyForEngine loud-fails with r16 FAIL@65 message', async () => {
+        const env: NodeJS.ProcessEnv = { DURATION_NEXTCLOUD_READY_MS: '1000' }
+        const fetchImpl = (async () => {
+            throw new Error('ECONNREFUSED')
+        }) as typeof fetch
+        await expect(
+            waitNextcloudSidecarReadyForEngine('idea01', {
+                hosts: { idea01: '10.0.0.1' },
+                env,
+                fetchImpl,
+                sleepImpl: async () => {},
+            }),
+        ).rejects.toThrow(/r16 FAIL@65/)
+        await expect(
+            waitNextcloudSidecarReadyForEngine('idea01', {
+                hosts: { idea01: '10.0.0.1' },
+                env,
+                fetchImpl,
+                sleepImpl: async () => {},
+            }),
+        ).rejects.toThrow(/18280/)
     })
 })
