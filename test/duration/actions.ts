@@ -372,9 +372,10 @@ const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
         const existing = await opsAny.findDockedEngine(ctx.fixtureDisk)
         if (existing && !ctx.excludeEngines.includes(existing)) {
             await settleParticipants(ctx, ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e)))
+            const kolibriUrl = syncKolibriSidecarUrlForEngine(existing, hostMapFromOps(ctx.opts.ops))
             return {
                 ok: true,
-                message: `fixture ${ctx.fixtureDisk} already docked on ${existing} (no-op)`,
+                message: `fixture ${ctx.fixtureDisk} already docked on ${existing} (no-op); DURATION_KOLIBRI_URL=${kolibriUrl}`,
                 dockedEngine: existing,
                 layer: 'infra',
             }
@@ -403,7 +404,40 @@ const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
     }
     await settleParticipants(ctx, ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e)))
     const sibMsg = siblings.length ? ` (+ ${siblings.join(', ')})` : ''
-    return { ok: true, message: `docked ${ctx.fixtureDisk}${sibMsg} on ${engine}`, dockedEngine: engine, layer: 'infra' }
+    const kolibriUrl = syncKolibriSidecarUrlForEngine(engine, hostMapFromOps(ctx.opts.ops))
+    return {
+        ok: true,
+        message: `docked ${ctx.fixtureDisk}${sibMsg} on ${engine}; DURATION_KOLIBRI_URL=${kolibriUrl}`,
+        dockedEngine: engine,
+        layer: 'infra',
+    }
+}
+
+
+/**
+ * Prefer A cover-all-230b70f-r15 FAIL@70: Console Path B `resolveSidecarUrl` uses the
+ * Console page hostname (idea01) unless `DURATION_KOLIBRI_URL` is set. After
+ * `infra_move_disk` moves the kolibri fixture to idea03, Path B still probed
+ * idea01:18080 → ECONNREFUSED. Engine owns follow-host: point env at the dock host.
+ * Host from RealFleetOps.getHostMap() (Tailscale IP) when live; else logical id.
+ */
+export const syncKolibriSidecarUrlForEngine = (
+    engineId: string,
+    hosts: Record<string, string> | undefined,
+    env: NodeJS.ProcessEnv = process.env,
+): string => {
+    const authority = (hosts?.[engineId]?.trim() || engineId).replace(/\/$/, '')
+    const portRaw = env.DURATION_KOLIBRI_PORT?.trim()
+    const port = portRaw && /^\d+$/.test(portRaw) ? portRaw : '18080'
+    const url = `http://${authority}:${port}`
+    env.DURATION_KOLIBRI_URL = url
+    return url
+}
+
+const hostMapFromOps = (ops: FleetOps): Record<string, string> | undefined => {
+    const anyOps = ops as FleetOps & { getHostMap?: () => Record<string, string> }
+    if (typeof anyOps.getHostMap === 'function') return anyOps.getHostMap()
+    return undefined
 }
 
 const infraMoveDisk = async (ctx: ActionContext): Promise<ActionResult> => {
@@ -418,9 +452,12 @@ const infraMoveDisk = async (ctx: ActionContext): Promise<ActionResult> => {
         await ctx.opts.ops.moveDisk(from, to, ctx.fixtureDisk)
     }
     await settleParticipants(ctx, ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e)))
+    const kolibriUrl = syncKolibriSidecarUrlForEngine(to, hostMapFromOps(ctx.opts.ops))
+    const moveMsg =
+        from === to ? `re-docked on sole pool engine ${to}` : `moved ${ctx.fixtureDisk} ${from}→${to}`
     return {
         ok: true,
-        message: from === to ? `re-docked on sole pool engine ${to}` : `moved ${ctx.fixtureDisk} ${from}→${to}`,
+        message: `${moveMsg}; DURATION_KOLIBRI_URL=${kolibriUrl}`,
         dockedEngine: to,
         layer: 'infra',
     }

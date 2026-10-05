@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { FakeFleetOps, dispatchAction, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall } from '../duration/actions.js'
+import { FakeFleetOps, dispatchAction, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, syncKolibriSidecarUrlForEngine } from '../duration/actions.js'
 import { semanticStoresEqual, waitForConvergence } from '../duration/convergence.js'
 import { evaluateInvariants, DEFAULT_INFRA_INVARIANTS, listInvariantTypes } from '../duration/invariants.js'
 import {
@@ -1596,5 +1596,24 @@ describe('duration --record-walk helpers', () => {
         } finally {
             rmSync(dir, { recursive: true, force: true })
         }
+    })
+})
+
+describe('syncKolibriSidecarUrlForEngine (r15 FAIL@70)', () => {
+    it('sets DURATION_KOLIBRI_URL to host map IP:18080', () => {
+        const env: NodeJS.ProcessEnv = {}
+        const url = syncKolibriSidecarUrlForEngine(
+            'idea03',
+            { idea01: '100.99.231.94', idea03: '100.126.117.80' },
+            env,
+        )
+        expect(url).toBe('http://100.126.117.80:18080')
+        expect(env.DURATION_KOLIBRI_URL).toBe(url)
+    })
+
+    it('falls back to logical engine id when hosts missing', () => {
+        const env: NodeJS.ProcessEnv = { DURATION_KOLIBRI_PORT: '18081' }
+        const url = syncKolibriSidecarUrlForEngine('idea03', undefined, env)
+        expect(url).toBe('http://idea03:18081')
     })
 })
