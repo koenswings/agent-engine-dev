@@ -864,14 +864,14 @@ describe('Phase 3 UI Intent dispatch (StubUiDriver)', () => {
 
     it('deferred Intents return mode deferred without aborting stub walks', async () => {
         const driver = new StubUiDriver()
-        const r = await driver.runIntent({ action: 'exit_lesson' })
+        const r = await driver.runIntent({ action: 'open_wikipedia_as_teacher' })
         expect(r.ok).toBe(true)
         expect(r.mode).toBe('deferred')
     })
 
     it('Pixel-missing Intents Fake no-op without aborting', async () => {
         const driver = new StubUiDriver()
-        const r = await driver.runIntent({ action: 'next_video' })
+        const r = await driver.runIntent({ action: 'share_to_class' })
         expect(r.ok).toBe(true)
         expect(r.mode).toBe('stub')
         expect(r.message).toMatch(/Pixel-missing/)

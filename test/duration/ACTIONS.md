@@ -4,7 +4,7 @@
 **Locked** by Steve Design Review for idea#166 — do not rename without reporting a clash.  
 **Phase 3+4 (idea#168):** walker dispatches usage/operator Intents via `test/duration/ui/` → Pixel `e2e/intents` (`getIntent`).  
 **ONE graph:** `scenarios/unified.yaml` is the only Markov state table. Run modes = CLI knobs.  
-**Pixel registry:** Console tip `4f7cfba` — **68** Intent keys (+ `captureAfterIntent` / `screenshotPath` for `--record-walk`; production web ignores sticky `demoMode`). Engine ACTIONS.md on #145 is source for walker contract.
+**Pixel registry:** Console tip `f150b9e` (PR #135) — **71** Intent keys (+ `captureAfterIntent` / `screenshotPath` for `--record-walk`; production web ignores sticky `demoMode`). Engine ACTIONS.md on #145 is source for walker contract.
 
 YAML transition shape (all layers): `{ to, weight, action }`.
 
@@ -35,10 +35,10 @@ Recording + **cover-registered-intents** (Pixel-registered demo + infra; live `-
 
 Fake/CI default: `StubUiDriver` (no browser). Live UI: `pnpm test:duration -- --live --ui` → `PlaywrightUiDriver` loads Pixel `runDurationIntent` / optional `captureAfterIntent` from `idea-console/duration-intents` or `agent-console-dev/e2e/intents` (or `DURATION_CONSOLE_INTENTS`).
 
-### Pixel-registered (68 — keep_watching + next_resource + finish_exercise; Console@4f7cfba)
+### Pixel-registered (71 — + next_video + exit_lesson + browse_folders; Console@f150b9e)
 
 Hub/dwell: `open_console_as_*`, `return_to_start`, `stay_on_*`  
-App-open: `open_kolibri_as_teacher` → `/en/coach/#/classes`, `open_kolibri_as_learner`, `open_nextcloud_as_*`, `open_video`, `open_exercise`, `keep_watching` (Console#134 @ 329dc38, stay on pinned video URL), `next_resource` (Console#135 @ f16ee18, video→exercise via resource panel), `finish_exercise` (Console#135 @ d087081, exercise→Learn home via Perseus Check)
+App-open: `open_kolibri_as_teacher` → `/en/coach/#/classes`, `open_kolibri_as_learner`, `open_nextcloud_as_*` (Console#135 @ f150b9e: loud-fail if Nextcloud sign-in fails — live smoke may need Kid passwords; do not change NC Intent code here), `open_video`, `open_exercise`, `keep_watching` (Console#134 @ 329dc38, stay on pinned video URL), `next_resource` (Console#135 @ f16ee18, video→exercise via resource panel), `finish_exercise` (Console#135 @ d087081, exercise→Learn home via Perseus Check), `next_video` (Console#135 @ a8b4b6c, exercise→video via resource panel), `exit_lesson` (Console#135 @ 549f72b, video/exercise→Learn home via Kolibri chrome), `browse_folders` (Console#135 @ f150b9e, Nextcloud Class Materials / Drop Zone / Collab dwell)
 Operator: `open_disk_inventory`, `open_instance_controls`, `eject_disk`, `confirm_eject`, `cancel_eject`, `erase_disk`, `confirm_erase`, `cancel_erase`, `start_instance`, `stop_instance`, `open_account`, `close_account`, `open_settings`, `close_settings`, `sign_in`, `make_files_disk`, `add_files_role`  
 Operator deep: `install_app`, `start_after_install`, `stay_on_disk`, `make_backup_disk`, `restore_from_backup`, `open_app`, `backup_instance`, `back_to_disk`, `back_to_overview`, `log_out`, `notice_usb_dock`, `retry_login_first_time_setup`, `change_password`, `add_operator`, `remove_operator`, `copy_app`, `move_app`  
 **Coaching (Console#134 @ ba0cfa1):** `create_class`, `enroll_learners`, `build_lesson`, `create_quiz`, `read_reports`, `preview_as_learner`, `browse_classes`
@@ -49,15 +49,13 @@ Operator deep: `install_app`, `start_after_install`, `stay_on_disk`, `make_backu
 
 ### Deferred (clear message, not silent)
 
-`exit_lesson`, `open_wikipedia_as_teacher`, `open_wikipedia_as_learner`
+`open_wikipedia_as_teacher`, `open_wikipedia_as_learner`
 
 ### Pixel-missing (still on unified.yaml — Fake Stub no-op / live clear-miss)
 
 Do **not** silently drop these edges from `unified.yaml`.
 
-**Kolibri navigation:** `next_video`
-
-**Nextcloud deep:** `share_to_class`, `done_sharing`, `back_to_console_from_share`, `open_file_drop`, `after_upload`, `leave_file_drop`, `open_collab_doc`, `close_doc`, `keep_editing`, `browse_folders`
+**Nextcloud deep:** `share_to_class`, `done_sharing`, `back_to_console_from_share`, `open_file_drop`, `after_upload`, `leave_file_drop`, `open_collab_doc`, `close_doc`, `keep_editing`
 
 **Wikipedia leave/search:** `search_browse_wikipedia`, `leave_wikipedia_as_learner`, `leave_wikipedia_as_teacher`
 

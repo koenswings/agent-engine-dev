@@ -46,7 +46,7 @@ export const DURATION_UI_FIXTURES = {
     },
 } as const
 
-/** Pixel Console Intent names registered in agent-console-dev e2e/intents (68 @ 4f7cfba; was 65 @ ba0cfa1). */
+/** Pixel Console Intent names registered in agent-console-dev e2e/intents (71 @ f150b9e; was 68 @ 4f7cfba). */
 export const PIXEL_REGISTERED_INTENTS = [
     'open_console_as_teacher',
     'open_console_as_learner',
@@ -67,6 +67,12 @@ export const PIXEL_REGISTERED_INTENTS = [
     'next_resource',
     // exercise → Learn home via Perseus Check (Console#135 @ d087081)
     'finish_exercise',
+    // exercise → video via resource panel (Console#135 @ a8b4b6c)
+    'next_video',
+    // video/exercise → Learn home via Kolibri chrome (Console#135 @ 549f72b)
+    'exit_lesson',
+    // Nextcloud Class Materials / Drop Zone / Collab (Console#135 @ f150b9e)
+    'browse_folders',
     // Pixel coaching set (Console#134 @ ba0cfa1)
     'create_class',
     'enroll_learners',
@@ -128,22 +134,22 @@ export type PixelIntentName = (typeof PIXEL_REGISTERED_INTENTS)[number]
 
 /** Known YAML Intents not in Pixel registry — clear deferred message, never silent. */
 export const DEFERRED_UI_INTENTS = [
-    'exit_lesson',
     'open_wikipedia_as_teacher',
     'open_wikipedia_as_learner',
 ] as const
 
 /**
- * Proposal Intents on unified.yaml still not in Pixel's 68-key registry (@ 4f7cfba).
+ * Proposal Intents on unified.yaml still not in Pixel's 71-key registry (@ f150b9e).
  * StubUiDriver Fake no-ops; live --ui clear-miss until Pixel adapters — do not drop YAML edges.
- * Lesson chrome exit_lesson + open_wikipedia_* stay deferred.
+ * open_wikipedia_* stay deferred.
  * keep_watching is registered (Console#134 @ 329dc38).
  * next_resource is registered (Console#135 @ f16ee18).
  * finish_exercise is registered (Console#135 @ d087081).
+ * next_video is registered (Console#135 @ a8b4b6c).
+ * exit_lesson is registered (Console#135 @ 549f72b).
+ * browse_folders is registered (Console#135 @ f150b9e).
  */
 export const PIXEL_MISSING_INTENTS = [
-    // Kolibri navigation (next_video not deferred — clear Fake no-op)
-    'next_video',
     // Nextcloud deep
     'share_to_class',
     'done_sharing',
@@ -154,7 +160,6 @@ export const PIXEL_MISSING_INTENTS = [
     'open_collab_doc',
     'close_doc',
     'keep_editing',
-    'browse_folders',
     // Wikipedia leave/search (open_* deferred)
     'search_browse_wikipedia',
     'leave_wikipedia_as_learner',
