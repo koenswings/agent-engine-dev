@@ -46,7 +46,7 @@ export const DURATION_UI_FIXTURES = {
     },
 } as const
 
-/** Pixel Console Intent names registered in agent-console-dev e2e/intents (71 @ f150b9e; was 68 @ 4f7cfba). */
+/** Pixel Console Intent names registered in agent-console-dev e2e/intents (76 @ 2da863c; was 71 @ f150b9e). */
 export const PIXEL_REGISTERED_INTENTS = [
     'open_console_as_teacher',
     'open_console_as_learner',
@@ -73,6 +73,14 @@ export const PIXEL_REGISTERED_INTENTS = [
     'exit_lesson',
     // Nextcloud Class Materials / Drop Zone / Collab (Console#135 @ f150b9e)
     'browse_folders',
+    // Nextcloud share (Console#135 @ 953af05)
+    'share_to_class',
+    // leave nc_share (Console#135 @ 1709165)
+    'done_sharing',
+    'back_to_console_from_share',
+    // Collab doc Viewer (Console#135 @ 2da863c)
+    'open_collab_doc',
+    'close_doc',
     // Pixel coaching set (Console#134 @ ba0cfa1)
     'create_class',
     'enroll_learners',
@@ -139,7 +147,7 @@ export const DEFERRED_UI_INTENTS = [
 ] as const
 
 /**
- * Proposal Intents on unified.yaml still not in Pixel's 71-key registry (@ f150b9e).
+ * Proposal Intents on unified.yaml still not in Pixel's 76-key registry (@ 2da863c).
  * StubUiDriver Fake no-ops; live --ui clear-miss until Pixel adapters — do not drop YAML edges.
  * open_wikipedia_* stay deferred.
  * keep_watching is registered (Console#134 @ 329dc38).
@@ -148,17 +156,15 @@ export const DEFERRED_UI_INTENTS = [
  * next_video is registered (Console#135 @ a8b4b6c).
  * exit_lesson is registered (Console#135 @ 549f72b).
  * browse_folders is registered (Console#135 @ f150b9e).
+ * share_to_class is registered (Console#135 @ 953af05).
+ * done_sharing / back_to_console_from_share are registered (Console#135 @ 1709165).
+ * open_collab_doc / close_doc are registered (Console#135 @ 2da863c).
  */
 export const PIXEL_MISSING_INTENTS = [
-    // Nextcloud deep
-    'share_to_class',
-    'done_sharing',
-    'back_to_console_from_share',
+    // Nextcloud deep (share/collab undeferred @ 2da863c)
     'open_file_drop',
     'after_upload',
     'leave_file_drop',
-    'open_collab_doc',
-    'close_doc',
     'keep_editing',
     // Wikipedia leave/search (open_* deferred)
     'search_browse_wikipedia',

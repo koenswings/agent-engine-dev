@@ -871,7 +871,7 @@ describe('Phase 3 UI Intent dispatch (StubUiDriver)', () => {
 
     it('Pixel-missing Intents Fake no-op without aborting', async () => {
         const driver = new StubUiDriver()
-        const r = await driver.runIntent({ action: 'share_to_class' })
+        const r = await driver.runIntent({ action: 'open_file_drop' })
         expect(r.ok).toBe(true)
         expect(r.mode).toBe('stub')
         expect(r.message).toMatch(/Pixel-missing/)
