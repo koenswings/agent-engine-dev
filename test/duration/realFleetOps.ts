@@ -205,6 +205,12 @@ export const resolveDurationFixturePack = (diskId: string): string => {
     return pack
 }
 
+/** Prefer A r21: empty / empty-002 packs (always fresh-copy, never redirected). */
+export const isEmptyFixtureDisk = (diskId: string): boolean => {
+    const pack = DISK_ID_TO_PACK[diskId]
+    return pack === 'empty' || pack === 'empty-002'
+}
+
 export type SshDockCopyRemoteArgs = {
     diskId: string
     pack: string
@@ -252,14 +258,30 @@ export const buildSshDockCopyRemote = (args: SshDockCopyRemoteArgs): string => {
             `echo "RealFleetOps: refuse overwrite occupied ${dest} (no matching META for ${diskId})" >&2; exit 4; fi`,
         )
     }
+    const isEmptyPack = pack === 'empty' || pack === 'empty-002'
     parts.push(
         `test -d '${src}' || { echo "missing fixture source ${src}" >&2; exit 2; }`,
-        `rm -rf '${dest}'`,
-        `mkdir -p '${dest}'`,
+    )
+    if (isEmptyPack) {
+        // Prefer A r21: Atlas Path A may back the empty slot with a real ext4 mount
+        // (createFilesDisk on Eng 8d98718 requires `findmnt -no FSTYPE <root>` = ext4;
+        // a plain dir under duration-disks reads as 'unknown'). Never rm -rf a
+        // mount point (EBUSY under set -e + would drop the ext4 backing) — clear
+        // its contents instead (keep lost+found).
+        parts.push(
+            `if mountpoint -q '${dest}' 2>/dev/null; then ` +
+            `find '${dest}' -mindepth 1 -maxdepth 1 ! -name 'lost+found' -exec rm -rf {} +; ` +
+            `echo "RealFleetOps: ${dest} is a mount point ($(findmnt -no FSTYPE '${dest}' || true)); cleared contents, kept mount"; ` +
+            `else rm -rf '${dest}'; mkdir -p '${dest}'; fi`,
+        )
+    } else {
+        parts.push(`rm -rf '${dest}'`, `mkdir -p '${dest}'`)
+    }
+    parts.push(
         `cp -a '${src}/.' '${dest}/'`,
         stripInstances,
     )
-    if (pack === 'empty' || pack === 'empty-002') {
+    if (isEmptyPack) {
         // createFilesDisk allows only META.yaml + lost+found on empty roots.
         // Kid pack ships README.md (humans); prior install leaves apps/instances/services.
         // Strip so Empty → Files does not false-refuse / Pixel soft-pass on dirty error.
@@ -1039,6 +1061,25 @@ export class RealFleetOps implements FleetOps {
         await this.ssh(host, remote)
     }
 
+    /**
+     * Prefer A r21: report how the docked fixture slot is backed on engineId —
+     * `findmnt -no FSTYPE <dest>` exactly as Engine createFilesDisk checks it
+     * ('' for a plain dir under duration-disks → createFilesDisk "filesystem: unknown").
+     * Read-only (ssh findmnt). Returns null when no slot for diskId is found.
+     */
+    async probeFixtureFsType(
+        engineId: string,
+        diskId: string,
+    ): Promise<{ device: string; dest: string; fsType: string } | null> {
+        this.assertNotExcluded(engineId, 'probeFixtureFsType')
+        const device = this.deviceMap(engineId).get(diskId)
+            ?? (await this.hasHealthyFixtureTree(engineId, diskId))
+        if (!device || !/^idea-test-[0-9]+$/.test(device)) return null
+        const dest = `${this.disksRoot}/${device}`
+        const out = await this.ssh(this.hostOf(engineId), `findmnt -no FSTYPE '${dest}' || true`)
+        return { device, dest, fsType: String(out ?? '').trim() }
+    }
+
     private async sshRemoveSentinel(engineId: string, device: string): Promise<void> {
         if (!/^idea-test-[0-9]+$/.test(device)) return
         assertPrivateDurationRoots(this.disksRoot, this.watchDir)
@@ -1169,10 +1210,13 @@ export class RealFleetOps implements FleetOps {
             // store not ready yet — proceed with copy
         }
 
-        // Prefer an engine that already has a healthy Path A META.yaml tree
+        // Prefer an engine that already has a healthy Path A META.yaml tree.
+        // Prefer A r21: never for empty packs — they always fresh-copy, so a
+        // "healthy" tree elsewhere is meaningless and redirecting would land
+        // empty-001 off the Console's engine (r21 FAIL@91: idea03 not idea01).
         let target = engineId
         let device = await this.hasHealthyFixtureTree(engineId, diskId)
-        if (!device) {
+        if (!device && !isEmptyFixtureDisk(diskId)) {
             for (const id of this.pool) {
                 if (this.exclude.includes(id) || id === engineId) continue
                 device = await this.hasHealthyFixtureTree(id, diskId)

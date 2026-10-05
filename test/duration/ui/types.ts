@@ -39,5 +39,12 @@ export interface UiDriver {
      * Stub omits this; Playwright implements when page is already open.
      */
     screenshot?(path: string): Promise<void>
+    /**
+     * Optional (Prefer A r21): select the NetworkTree row `[data-testid="disk-<diskId>"]`
+     * (polling/reloading until it appears) and, when requireEmptyPanel, wait for
+     * EmptyDiskPanel — so EmptyDiskPanel Intents act on that exact disk, never the
+     * "first Empty Disk". Throws (fail loud) when the row/panel never shows.
+     */
+    selectDisk?(diskId: string, opts?: { timeoutMs?: number; requireEmptyPanel?: boolean }): Promise<string>
     close?(): Promise<void>
 }

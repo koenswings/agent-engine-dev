@@ -281,18 +281,23 @@ const redockEmptyFresh = async (
     diskId: string,
     label: string,
     noteSuffix: string,
-    opts?: { purgeStoreInstances?: boolean },
+    opts?: { purgeStoreInstances?: boolean; targetEngine?: string },
 ): Promise<string> => {
     const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
     if (pool.length === 0) {
         throw new Error(`${label}: no pool engines available`)
     }
-    // Prefer existing dock holder, else Console host pool[0] (Path A empty dock pattern).
+    // Explicit target (Prefer A r21: Console's engine for empty-001) wins; else prefer
+    // existing dock holder, else Console host pool[0] (Path A empty dock pattern).
     const engine =
+        opts?.targetEngine ??
         (ctx.walker.dockedEngine && !ctx.excludeEngines.includes(ctx.walker.dockedEngine)
             ? ctx.walker.dockedEngine
             : null) ?? pool[0]!
     assertNotGolden(ctx, engine, label)
+    if (isNeverEngine(engine)) {
+        throw new Error(`${label}: refused engine '${engine}' (never idea02)`)
+    }
 
     const opsAny = ctx.opts.ops as FleetOps & {
         findDockedEngine?: (id: string) => Promise<string | null>
@@ -311,7 +316,63 @@ const redockEmptyFresh = async (
     }
     await ctx.opts.ops.dockFixture(engine, diskId)
     await settleParticipants(ctx, pool)
+    if (opts?.targetEngine && typeof opsAny.findDockedEngine === 'function') {
+        // Prefer A r21: dockFixture must not have redirected the empty pack elsewhere.
+        const landed = await opsAny.findDockedEngine(diskId)
+        if (landed !== engine) {
+            throw new Error(
+                `${label}: ${diskId} landed on ${landed ?? 'nowhere'} not ${engine} ` +
+                    `(Console's engine). Prefer A — fail loud; never idea02.`,
+            )
+        }
+    }
     return `re-docked ${diskId} on ${engine} ${noteSuffix}`
+}
+
+/** Prefer A: hosts the harness must never touch, regardless of exclude_engines. */
+const NEVER_ENGINES = new Set(['idea02'])
+const isNeverEngine = (engine: string): boolean => NEVER_ENGINES.has(engine)
+
+const hostnameOfUrl = (raw: string | undefined): string | null => {
+    const v = raw?.trim()
+    if (!v) return null
+    try {
+        return new URL(v.includes('://') ? v : `http://${v}`).hostname.toLowerCase()
+    } catch {
+        return null
+    }
+}
+
+/**
+ * Prefer A r21: the pool engine that serves the Console under test (Path A: idea01).
+ * Order: DURATION_SWITCH_ENGINE_HOST → DURATION_CONSOLE_URL hostname (logical name or
+ * --hosts IP/hostname reverse-mapped) → pool[0]. Candidates must be in the pool, not
+ * excluded, never idea02. NEVER walker.dockedEngine — that follows Kolibri after
+ * infra_move_disk (idea03 in cover-all r21), which is not where the Console's
+ * EmptyDiskPanel lives.
+ */
+export const resolveConsoleEngineHost = (
+    ctx: Pick<ActionContext, 'poolEngines' | 'excludeEngines'> & { opts: { ops: FleetOps } },
+    env: NodeJS.ProcessEnv = process.env,
+): string => {
+    const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e))
+    if (pool.length === 0) {
+        throw new Error('resolveConsoleEngineHost: no pool engines (excluded / never idea02)')
+    }
+    const hostMap = hostMapFromOps(ctx.opts.ops) ?? {}
+    const toLogical = (cand: string | null | undefined): string | null => {
+        const c = cand?.trim().toLowerCase()
+        if (!c) return null
+        const direct = pool.find(e => e.toLowerCase() === c)
+        if (direct) return direct
+        const viaHost = pool.find(e => (hostMap[e] ?? '').trim().toLowerCase() === c)
+        return viaHost ?? null
+    }
+    return (
+        toLogical(env.DURATION_SWITCH_ENGINE_HOST) ??
+        toLogical(hostnameOfUrl(env.DURATION_CONSOLE_URL)) ??
+        pool[0]!
+    )
 }
 
 const redockEmpty002Fresh = (
@@ -372,14 +433,91 @@ export const redockEmpty002BeforeErase = async (ctx: ActionContext): Promise<str
  * empty-001 fresh (strip non-META) + purge store before make_files_disk Intent.
  * Does NOT move Kolibri back — files_role_added targets this Files Disk, not Grade5A.
  */
-export const redockEmpty001BeforeMakeFiles = async (ctx: ActionContext): Promise<string> =>
-    redockEmptyFresh(
+export const redockEmpty001BeforeMakeFiles = async (ctx: ActionContext): Promise<string> => {
+    // Prefer A r21 FAIL@91: walker.dockedEngine was idea03 (Kolibri after infra_move_disk)
+    // so empty-001 was dock-copied onto idea03 while the Console under test is idea01.
+    // Always land empty-001 on the Console's engine.
+    const target = resolveConsoleEngineHost(ctx)
+    return redockEmptyFresh(
         ctx,
-        DURATION_UI_FIXTURES.empty.diskId,
+        filesDiskTargetId(),
         'redockEmpty001BeforeMakeFiles',
-        'before make_files_disk (Empty fresh pack + store purge; createFilesDisk-clean)',
-        { purgeStoreInstances: true },
+        `before make_files_disk (Console engine ${target}; Empty fresh pack + store purge; createFilesDisk-clean)`,
+        { purgeStoreInstances: true, targetEngine: target },
     )
+}
+
+/**
+ * Prefer A r21: the disk make_files_disk converts — DURATION_EMPTY_DISK_ID or
+ * duration-empty-001. Never empty-002 / Grade5A (r21 UI fell through to "Empty Disk 002").
+ */
+export const filesDiskTargetId = (env: NodeJS.ProcessEnv = process.env): string =>
+    env.DURATION_EMPTY_DISK_ID?.trim() || DURATION_UI_FIXTURES.empty.diskId
+
+/**
+ * Prefer A r21: before the make_files_disk Intent, wait until the Console engine's
+ * store shows the target docked there as a pure Empty disk, and (live) that its slot
+ * is a real ext4 mount — Eng 8d98718 createFilesDisk runs `findmnt -no FSTYPE <root>`
+ * and refuses anything else ("filesystem: unknown" for a plain dir). Fail loud here
+ * instead of letting the Intent fall through to another Empty Disk.
+ * DURATION_FILES_DISK_SKIP_EXT4_PREFLIGHT=1 skips only the ext4 probe (post-check
+ * still fails loud if the files role does not land).
+ */
+export const preflightFilesDiskTarget = async (
+    ctx: ActionContext,
+    diskId: string,
+    engine: string,
+    env: NodeJS.ProcessEnv = process.env,
+): Promise<string> => {
+    const opsLive = ctx.opts.ops as FleetOps & { findDockedEngine?: unknown }
+    // Live only: Console EmptyDiskPanel needs zero instances on the disk. FakeFleetOps
+    // dockFixture always seeds a synthetic <disk>-main instance, so skip there.
+    const requireNoInstances = typeof opsLive.findDockedEngine === 'function'
+    const budget = ctx.opts.fast ? 30_000 : 60_000
+    const deadline = Date.now() + budget
+    let last = 'unread'
+    for (;;) {
+        try {
+            const view = await ctx.opts.ops.readStore(engine)
+            const disk = view.diskDB[diskId]
+            const types = disk?.diskTypes ?? []
+            const insts = Object.values(view.instanceDB).filter(i => i.diskId === diskId)
+            last = `dockedTo=${disk?.dockedTo ?? 'none'} diskTypes=[${types.join(', ')}] instances=${insts.length}`
+            const typesOk = types.length === 1 && types[0] === 'empty'
+            if (disk?.dockedTo && typesOk && (!requireNoInstances || insts.length === 0)) break
+        } catch (e) {
+            last = `readStore failed: ${e instanceof Error ? e.message : String(e)}`
+        }
+        if (Date.now() >= deadline) {
+            throw new Error(
+                `preflight: ${diskId} not a clean Empty disk on Console engine ${engine} within ${budget}ms ` +
+                    `(${last}). Prefer A — fail loud; do not let make_files_disk pick another Empty Disk.`,
+            )
+        }
+        await sleep(400)
+    }
+    const opsAny = ctx.opts.ops as FleetOps & {
+        probeFixtureFsType?: (
+            engineId: string,
+            diskId: string,
+        ) => Promise<{ device: string; dest: string; fsType: string } | null>
+    }
+    if (typeof opsAny.probeFixtureFsType !== 'function') {
+        return `preflight ${diskId} Empty on ${engine} (${last})`
+    }
+    const skipExt4 = /^(1|true|yes)$/i.test(env.DURATION_FILES_DISK_SKIP_EXT4_PREFLIGHT?.trim() ?? '')
+    const probe = await opsAny.probeFixtureFsType(engine, diskId)
+    const fsNote = probe ? `${probe.dest} fs=${probe.fsType || 'unknown'}` : 'slot not found'
+    if (!skipExt4 && probe?.fsType !== 'ext4') {
+        throw new Error(
+            `preflight: ${diskId} on ${engine} slot ${fsNote} — Engine createFilesDisk requires an ext4 ` +
+                `mount at the disk root (findmnt -no FSTYPE); a plain dir reads 'unknown' and is refused ` +
+                `("not an ext4 disk"). Atlas Path A: back ${probe?.dest ?? `${engine}:<duration-disks>/idea-test-3`} ` +
+                `with a pi-owned ext4 mount (loop image), then re-run. Prefer A — fail loud.`,
+        )
+    }
+    return `preflight ${diskId} Empty on ${engine} (${last}; ${fsNote}${skipExt4 ? '; ext4 preflight skipped' : ''})`
+}
 
 /**
  * Prefer A r20: after Pixel make_files_disk ok, confirm store diskTypes includes
@@ -388,14 +526,9 @@ export const redockEmpty001BeforeMakeFiles = async (ctx: ActionContext): Promise
  * StubUiDriver skips (Fake has no Engine createFilesDisk). Never idea02.
  */
 const assertFilesRoleOnDisk = async (ctx: ActionContext, diskId: string): Promise<string> => {
-    const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
-    const engine =
-        (ctx.walker.dockedEngine && !ctx.excludeEngines.includes(ctx.walker.dockedEngine)
-            ? ctx.walker.dockedEngine
-            : null) ?? pool[0]
-    if (!engine) {
-        throw new Error(`assertFilesRoleOnDisk: no pool engine for ${diskId}`)
-    }
+    // Prefer A r21: the Console's engine (where empty-001 was re-docked), not
+    // walker.dockedEngine (follows Kolibri after infra_move_disk).
+    const engine = resolveConsoleEngineHost(ctx)
     const budget = 30_000
     const deadline = Date.now() + budget
     let lastTypes: string[] = []
@@ -994,8 +1127,24 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     // Prefer A r20: fresh-clean empty-001 before make_files_disk (install_app may have dirtied it).
     if (ctx.action === 'make_files_disk') {
         try {
+            // Prefer A r21: always convert the pinned empty (empty-001), by testid.
+            diskId = filesDiskTargetId()
+            const consoleEngine = resolveConsoleEngineHost(ctx)
             const note = await redockEmpty001BeforeMakeFiles(ctx)
-            preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${note}` : note
+            const pre = await preflightFilesDiskTarget(ctx, diskId, consoleEngine)
+            // Pin the Files Disk id before the Intent so Pixel + later steps share it.
+            process.env.DURATION_FILES_DISK_ID = diskId
+            let selNote = ''
+            if (typeof driver.selectDisk === 'function') {
+                // Select disk-<id> row + EmptyDiskPanel so Pixel ensureEmptyDiskPanel
+                // never falls through to "first Empty Disk" (r21: Empty Disk 002).
+                selNote = await driver.selectDisk(diskId, {
+                    timeoutMs: ctx.opts.fast ? 60_000 : 120_000,
+                    requireEmptyPanel: true,
+                })
+            }
+            const notes = [note, pre, selNote].filter(Boolean).join('; ')
+            preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${notes}` : notes
         } catch (e) {
             const err = e instanceof Error ? e.message : String(e)
             return {
@@ -1009,7 +1158,9 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
         action: ctx.action,
         diskId,
         instanceId,
-        engineId: ctx.walker.dockedEngine ?? ctx.poolEngines[0],
+        engineId: ctx.action === 'make_files_disk'
+            ? resolveConsoleEngineHost(ctx)
+            : (ctx.walker.dockedEngine ?? ctx.poolEngines[0]),
         screenshotPath: shotPath,
     })
     if (recDir && shotPath) {
@@ -1037,7 +1188,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     }
     // Prefer A r20: pin Files Disk under test + fail loud if Pixel soft-passed on dirty empty.
     if (result.ok && ctx.action === 'make_files_disk') {
-        const filesDiskId = diskId ?? DURATION_UI_FIXTURES.empty.diskId
+        const filesDiskId = diskId ?? filesDiskTargetId()
         process.env.DURATION_FILES_DISK_ID = filesDiskId
         if (driver.kind === 'playwright') {
             try {

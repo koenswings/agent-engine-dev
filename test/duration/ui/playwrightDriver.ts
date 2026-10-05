@@ -79,6 +79,26 @@ type PlaywrightModule = {
     }
 }
 
+type PwLocator = {
+    first: () => PwLocator
+    isVisible: () => Promise<boolean>
+    click: () => Promise<void>
+    waitFor: (o: { state: 'visible'; timeout: number }) => Promise<void>
+}
+type PwPage = {
+    locator: (sel: string) => PwLocator
+    reload: () => Promise<unknown>
+    waitForTimeout: (ms: number) => Promise<void>
+}
+
+/** Prefer A r21: Console NetworkTree disk row testid (Pixel sel.disk). */
+export const diskRowSelector = (diskId: string): string => {
+    if (!/^[A-Za-z0-9._-]+$/.test(diskId)) {
+        throw new Error(`diskRowSelector: refuse unsafe diskId '${diskId}'`)
+    }
+    return `[data-testid="disk-${diskId}"]`
+}
+
 const here = dirname(fileURLToPath(import.meta.url))
 
 const candidateIntentDirs = (explicit?: string): string[] => {
@@ -356,6 +376,49 @@ export class PlaywrightUiDriver implements UiDriver {
                 message: `Playwright Intent '${ctx.action}' failed: ${raw}`,
             }
         }
+    }
+
+    /**
+     * Prefer A r21: pin an EmptyDiskPanel Intent to `disk-<diskId>` by testid.
+     * Polls the NetworkTree (reloading every ~10s so a fresh re-dock appears), clicks
+     * the row, and optionally waits for `empty-disk-panel`. Throws if never visible —
+     * do not let Pixel discovery fall through to another Empty Disk (r21: Empty Disk 002).
+     */
+    async selectDisk(
+        diskId: string,
+        opts: { timeoutMs?: number; requireEmptyPanel?: boolean } = {},
+    ): Promise<string> {
+        await this.ensureReady()
+        const page = this.page as PwPage
+        const rowSel = diskRowSelector(diskId)
+        const panelSel = '[data-testid="empty-disk-panel"]'
+        const budget = opts.timeoutMs ?? 60_000
+        const deadline = Date.now() + budget
+        let lastReload = Date.now()
+        let clicked = false
+        while (Date.now() < deadline) {
+            const row = page.locator(rowSel).first()
+            if (await row.isVisible().catch(() => false)) {
+                await row.click()
+                clicked = true
+                if (!opts.requireEmptyPanel) return `selected ${rowSel}`
+                try {
+                    await page.locator(panelSel).first().waitFor({ state: 'visible', timeout: 5_000 })
+                    return `selected ${rowSel} (EmptyDiskPanel visible)`
+                } catch {
+                    /* store may still be converging — retry */
+                }
+            }
+            if (Date.now() - lastReload > 10_000) {
+                lastReload = Date.now()
+                await page.reload().catch(() => undefined)
+            }
+            await page.waitForTimeout(500)
+        }
+        throw new Error(
+            `selectDisk: ${rowSel} ${clicked ? 'clicked but EmptyDiskPanel never visible' : 'never visible in NetworkTree'} ` +
+                `within ${budget}ms. Prefer A — refuse to act on another Empty Disk.`,
+        )
     }
 
     /**

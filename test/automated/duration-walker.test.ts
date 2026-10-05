@@ -4,12 +4,13 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { FakeFleetOps, dispatchAction, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, redockEmpty001BeforeMakeFiles, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, nextcloudLoginFormLooksReady, nextcloudInitialState, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
+import { FakeFleetOps, dispatchAction, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, redockEmpty001BeforeMakeFiles, resolveConsoleEngineHost, filesDiskTargetId, preflightFilesDiskTarget, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, nextcloudLoginFormLooksReady, nextcloudInitialState, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
 import { semanticStoresEqual, waitForConvergence } from '../duration/convergence.js'
 import { evaluateInvariants, DEFAULT_INFRA_INVARIANTS, listInvariantTypes } from '../duration/invariants.js'
 import {
     assertPrivateDurationRoots,
     buildSshDockCopyRemote,
+    isEmptyFixtureDisk,
     DEFAULT_DURATION_DISKS_ROOT,
     DEFAULT_DURATION_WATCH_DIR,
     looksLikeProtectedHwDisk,
@@ -1228,6 +1229,197 @@ describe('Prefer A empty-002 re-dock after confirm_erase (Fake)', () => {
         // Primary EMPTY id unchanged contract — we only re-dock 002
         expect(DURATION_UI_FIXTURES.empty.diskId).toBe('duration-empty-001')
         expect(DURATION_UI_FIXTURES.empty2.diskId).toBe('duration-empty-002')
+    })
+})
+
+describe('Prefer A r21: empty-001 Files Disk on Console engine (cover-all-0334976-r21 FAIL@91)', () => {
+    const POOL = ['idea01', 'idea03', 'idea04']
+    const withEnv = async (vars: Record<string, string | undefined>, fn: () => Promise<void> | void) => {
+        const prev: Record<string, string | undefined> = {}
+        for (const k of Object.keys(vars)) {
+            prev[k] = process.env[k]
+            if (vars[k] === undefined) delete process.env[k]
+            else process.env[k] = vars[k]
+        }
+        try {
+            await fn()
+        } finally {
+            for (const k of Object.keys(prev)) {
+                if (prev[k] === undefined) delete process.env[k]
+                else process.env[k] = prev[k]
+            }
+        }
+    }
+    const ctxFor = (ops: FakeFleetOps, dockedEngine: string | null, extra: Record<string, unknown> = {}) => ({
+        opts: { ops, rng: () => 0, settleTimeoutMs: 500, fast: true, ...extra },
+        walker: { current: 'op_disk', layer: 'operator' as const, dockedEngine, step: 91 },
+        from: 'op_disk',
+        to: 'op_files',
+        action: 'make_files_disk',
+        excludeEngines: ['idea02'],
+        poolEngines: POOL,
+        fixtureDisk: 'duration-kolibri-grade5a-001',
+        fixtureInstance: 'kolibri-grade5a-001',
+        fixtureDisks: [
+            'duration-kolibri-grade5a-001',
+            'duration-nextcloud-grade5a-001',
+            'duration-empty-001',
+            'duration-empty-002',
+        ],
+        fixtureInstances: { ...KID_FIXTURES },
+    })
+
+    it('resolveConsoleEngineHost: SWITCH host → Console URL host → IP reverse-map → pool[0]; never idea02', () => {
+        const ops = fakeOps({ poolEngines: POOL, excludeEngines: ['idea02'], storeMode: 'shared' })
+        const ctx = { poolEngines: POOL, excludeEngines: ['idea02'], opts: { ops } }
+        expect(resolveConsoleEngineHost(ctx, { DURATION_SWITCH_ENGINE_HOST: 'idea01' })).toBe('idea01')
+        expect(resolveConsoleEngineHost(ctx, { DURATION_CONSOLE_URL: 'http://idea03:8080' })).toBe('idea03')
+        // SWITCH wins over console URL
+        expect(resolveConsoleEngineHost(ctx, {
+            DURATION_SWITCH_ENGINE_HOST: 'idea01',
+            DURATION_CONSOLE_URL: 'http://idea03:8080',
+        })).toBe('idea01')
+        // Tailscale IP reverse-mapped via ops.getHostMap()
+        const opsWithHosts = Object.assign(fakeOps({ poolEngines: POOL, excludeEngines: ['idea02'], storeMode: 'shared' }), {
+            getHostMap: () => ({ idea01: '100.99.231.94', idea03: '100.126.117.80', idea04: '100.108.39.45' }),
+        })
+        expect(resolveConsoleEngineHost(
+            { poolEngines: POOL, excludeEngines: ['idea02'], opts: { ops: opsWithHosts } },
+            { DURATION_CONSOLE_URL: 'http://100.99.231.94:8080' },
+        )).toBe('idea01')
+        // idea02 never selected even if named (falls back to pool[0])
+        expect(resolveConsoleEngineHost(ctx, { DURATION_SWITCH_ENGINE_HOST: 'idea02' })).toBe('idea01')
+        expect(resolveConsoleEngineHost(
+            { poolEngines: ['idea02', 'idea03'], excludeEngines: [], opts: { ops } },
+            {},
+        )).toBe('idea03')
+        // Unknown host → pool[0]
+        expect(resolveConsoleEngineHost(ctx, { DURATION_CONSOLE_URL: 'http://elsewhere:8080' })).toBe('idea01')
+    })
+
+    it('redockEmpty001BeforeMakeFiles lands on Console engine idea01 even when walker.dockedEngine=idea03 (Kolibri moved)', async () => {
+        await withEnv({ DURATION_SWITCH_ENGINE_HOST: 'idea01', DURATION_CONSOLE_URL: 'http://idea01:8080', DURATION_EMPTY_DISK_ID: undefined }, async () => {
+            const ops = fakeOps({ poolEngines: POOL, excludeEngines: ['idea02'], storeMode: 'shared' })
+            await ops.dockFixture('idea01', 'duration-empty-001')
+            await ops.dockFixture('idea03', 'duration-kolibri-grade5a-001')
+            const note = await redockEmpty001BeforeMakeFiles(ctxFor(ops, 'idea03') as any)
+            expect(note).toMatch(/re-docked duration-empty-001 on idea01/)
+            expect(note).not.toMatch(/on idea03/)
+            const view = await ops.readStore('idea01')
+            expect(view.diskDB['duration-empty-001']?.dockedTo).toBe('idea01')
+            expect(view.diskDB['duration-empty-001']?.diskTypes).toEqual(['empty'])
+        })
+    })
+
+    it('redockEmpty001BeforeMakeFiles fails loud if dock lands off the Console engine (live findDockedEngine)', async () => {
+        await withEnv({ DURATION_SWITCH_ENGINE_HOST: 'idea01' }, async () => {
+            const ops = fakeOps({ poolEngines: POOL, excludeEngines: ['idea02'], storeMode: 'shared' })
+            const live = Object.assign(ops, { findDockedEngine: async () => 'idea03' })
+            await expect(redockEmpty001BeforeMakeFiles(ctxFor(live, 'idea03') as any))
+                .rejects.toThrow(/landed on idea03 not idea01/)
+        })
+    })
+
+    it('filesDiskTargetId pins empty-001 (DURATION_EMPTY_DISK_ID override), never empty-002', () => {
+        expect(filesDiskTargetId({})).toBe('duration-empty-001')
+        expect(filesDiskTargetId({ DURATION_EMPTY_DISK_ID: 'duration-empty-001' })).toBe('duration-empty-001')
+        expect(filesDiskTargetId({})).not.toBe(DURATION_UI_FIXTURES.empty2.diskId)
+    })
+
+    it('preflightFilesDiskTarget fails loud when live slot is a plain dir (findmnt FSTYPE empty)', async () => {
+        const ops = fakeOps({ poolEngines: POOL, excludeEngines: ['idea02'], storeMode: 'shared' })
+        await ops.dockFixture('idea01', 'duration-empty-001')
+        await ops.purgeInstancesStoredOn('idea01', 'duration-empty-001')
+        const dirBacked = Object.assign(ops, {
+            findDockedEngine: async () => 'idea01',
+            probeFixtureFsType: async () => ({
+                device: 'idea-test-3',
+                dest: '/home/pi/idea/duration-disks/idea-test-3',
+                fsType: '',
+            }),
+        })
+        await expect(preflightFilesDiskTarget(ctxFor(dirBacked, 'idea03') as any, 'duration-empty-001', 'idea01', {}))
+            .rejects.toThrow(/fs=unknown.*ext4/)
+        // Escape hatch skips only the ext4 probe
+        const note = await preflightFilesDiskTarget(
+            ctxFor(dirBacked, 'idea03') as any, 'duration-empty-001', 'idea01',
+            { DURATION_FILES_DISK_SKIP_EXT4_PREFLIGHT: '1' },
+        )
+        expect(note).toMatch(/ext4 preflight skipped/)
+        // ext4-backed slot passes
+        const ext4 = Object.assign(ops, {
+            probeFixtureFsType: async () => ({ device: 'idea-test-3', dest: '/x/idea-test-3', fsType: 'ext4' }),
+        })
+        const ok = await preflightFilesDiskTarget(ctxFor(ext4, 'idea03') as any, 'duration-empty-001', 'idea01', {})
+        expect(ok).toMatch(/fs=ext4/)
+    })
+
+    it('dispatchAction make_files_disk: Intent + selectDisk target empty-001 on idea01; FILES pin set', async () => {
+        await withEnv({
+            DURATION_SWITCH_ENGINE_HOST: 'idea01',
+            DURATION_CONSOLE_URL: 'http://idea01:8080',
+            DURATION_EMPTY_DISK_ID: undefined,
+            DURATION_FILES_DISK_ID: undefined,
+        }, async () => {
+            const ops = fakeOps({ poolEngines: POOL, excludeEngines: ['idea02'], storeMode: 'shared' })
+            await ops.dockFixture('idea01', 'duration-empty-001')
+            await ops.dockFixture('idea01', 'duration-empty-002')
+            await ops.dockFixture('idea03', 'duration-kolibri-grade5a-001')
+            const driver = new StubUiDriver()
+            const selected: string[] = []
+            const selDriver = Object.assign(driver, {
+                selectDisk: async (id: string, o?: { requireEmptyPanel?: boolean }) => {
+                    expect(o?.requireEmptyPanel).toBe(true)
+                    selected.push(id)
+                    return `selected [data-testid="disk-${id}"]`
+                },
+            })
+            const result = await dispatchAction(ctxFor(ops, 'idea03', { stubUi: true, uiDriver: selDriver }) as any)
+            expect(result.ok).toBe(true)
+            expect(selected).toEqual(['duration-empty-001'])
+            const call = driver.callContexts.find(c => c.action === 'make_files_disk')
+            expect(call?.diskId).toBe('duration-empty-001')
+            expect(call?.engineId).toBe('idea01')
+            expect(process.env.DURATION_FILES_DISK_ID).toBe('duration-empty-001')
+            expect(result.message).toMatch(/re-docked duration-empty-001 on idea01/)
+            const view = await ops.readStore('idea01')
+            expect(view.diskDB['duration-empty-001']?.dockedTo).toBe('idea01')
+        })
+    })
+
+    it('buildSshDockCopyRemote: empty pack keeps an ext4 mount point (clear contents, no rm -rf of mount)', () => {
+        const remote = buildSshDockCopyRemote({
+            diskId: 'duration-empty-001',
+            pack: 'empty',
+            src: '/fixtures/empty',
+            dest: '/home/pi/idea/duration-disks/idea-test-3',
+            sentinel: '/home/pi/idea/duration-watch/idea-test-3',
+            disksRoot: DEFAULT_DURATION_DISKS_ROOT,
+            watchDir: DEFAULT_DURATION_WATCH_DIR,
+            startInstances: true,
+        })
+        expect(remote).toMatch(/if mountpoint -q '\/home\/pi\/idea\/duration-disks\/idea-test-3'/)
+        expect(remote).toMatch(/cleared contents, kept mount/)
+        expect(remote).toMatch(/else rm -rf '\/home\/pi\/idea\/duration-disks\/idea-test-3'; mkdir -p/)
+        expect(remote).toMatch(/stripped non-META entries from empty pack/)
+        const kolibri = buildSshDockCopyRemote({
+            diskId: 'duration-kolibri-grade5a-001',
+            pack: 'kolibri',
+            src: '/fixtures/kolibri',
+            dest: '/home/pi/idea/duration-disks/idea-test-1',
+            sentinel: '/home/pi/idea/duration-watch/idea-test-1',
+            disksRoot: DEFAULT_DURATION_DISKS_ROOT,
+            watchDir: DEFAULT_DURATION_WATCH_DIR,
+            startInstances: true,
+        })
+        expect(kolibri).not.toMatch(/mountpoint -q/)
+    })
+
+    it('isEmptyFixtureDisk: empty packs only (never redirected by dockFixture healthy-tree scan)', () => {
+        expect(isEmptyFixtureDisk('duration-empty-001')).toBe(true)
+        expect(isEmptyFixtureDisk('duration-empty-002')).toBe(true)
+        expect(isEmptyFixtureDisk('duration-kolibri-grade5a-001')).toBe(false)
+        expect(isEmptyFixtureDisk('duration-nextcloud-grade5a-001')).toBe(false)
     })
 })
 
