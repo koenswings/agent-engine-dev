@@ -184,10 +184,11 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
             traceId, command: 'summariseDisk', args: JSON.stringify({ targetId }),
             startedAt: Date.now(), completedAt: Date.now(), status: 'ok', errorMessage: null,
             result: JSON.stringify({
-                targetId, label, serial, model: null, sizeBytes: 32e9, filesystem: 'exfat',
-                usedBytes: null, readable: false, partial: false,
+                targetId, label, serial, model: null, sizeBytes: 32e9, fsType: 'exfat',
+                usedBytes: null, readable: false,
                 apps: [], instances: [], backups: [],
-                files: { count: 0, bytes: 0 }, other: { count: 0, bytes: 0 },
+                files: null, other: null, otherPartitions: [],
+                computedAt: Date.now(),
             }),
         } as any)
         return traceId
@@ -204,6 +205,11 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
         expect(summary.readable).toBe(false)
         expect(summary.label).toBe('SanDisk 32 GB')
         expect(summary.apps).toEqual([])
+        expect(summary.fsType).toBe('exfat')
+        expect(summary.files).toBeNull()
+        expect(summary.otherPartitions).toEqual([])
+        expect(typeof summary.computedAt).toBe('number')
+        expect(summary.computedAt).toBeGreaterThan(0)
     })
 
     it('eraseDisk refuses: unknown target, label mismatch, missing/old summary, system disk', async () => {

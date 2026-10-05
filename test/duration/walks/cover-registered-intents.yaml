@@ -1,0 +1,365 @@
+# Deterministic cover-registered-intents walk ("registered-intents walk") — NOT a Markov graph.
+# Loads states/invariants/fixtures/pool from scenarios/unified.yaml.
+# Covers the current Pixel-registered demo subset (58 actions; registry 65 @ Console#134 cdcfdb1)
+# plus Engine infra FleetOps (dock/undock/move/reboot via RealFleetOps).
+# Excludes every action in DEFERRED_UI_INTENTS + PIXEL_MISSING_INTENTS
+# (coaching Intents are registered but not yet expanded here; keep_watching, wikipedia, etc.).
+# Prefer short layer cycles; re-enter via return_to_start / hubs.
+# Live --ui: early infra enter + infra_dock_fixture BEFORE first open_disk_inventory;
+# reboot/move cycle runs later from infra_idle (avoids startInstances zombie on pm2 restart).
+# Path A `--start-instances` preserves dock across return_to_start.
+# cover-all = strict full graph (failLoud on Pixel-missing under --ui).
+#
+# Pixel Prefer A (Console#134 @48a4a05+): copy_app/move_app multi-disk +
+# EmptyDiskPanel + erase empty-only. Live preload: demoMode=false; four Path A
+# disks docked (kolibri + nextcloud + duration-empty-001 + duration-empty-002 on
+# idea-test-1/2/3/4). Env: DURATION_EMPTY_DISK_ID=duration-empty-001 (make_backup),
+# DURATION_BACKUP_DISK_ID=duration-empty-001, empty-002 docked for erase discover,
+# DURATION_EJECT_DISK_ID=duration-nextcloud-grade5a-001. Prefer A r17: after
+# make_backup empty-001 is backup — Pixel ensureEmptyDiskPanel discovers empty-002
+# (loud-fail if none). Walk: back_to_overview → open_disk_inventory before erase.
+# Never erase Grade5A. Engine infra_dock_fixture siblings include empty-002.
+# Late install_app after erase: empty-002 must stay docked Empty (Pixel empty-badge
+# discover; no DURATION_EMPTY_DISK_ID_2). r24/r26 FAIL@85: erase undocked empty-002.
+# Engine tip: after confirm_erase, redockEmpty002AfterErase fresh-docks empty-002
+# (EMPTY stays 001). Path A should still prefer erase republish Empty.
+# Prefer A r35/r36 FAIL@90: start_after_install fills empty-002 with kolibri → second
+# late install_app needs EmptyDiskPanel again. Engine tip: after open_copied_instance,
+# redockEmpty002BeforeSecondInstall fresh-docks empty-002 and purges Automerge
+# instanceDB storedOn=empty-002 (r36; hasInstancesOn is store-keyed).
+# Prefer A r37 FAIL@92: second late install_app fills empty-002 again → erase needs
+# EmptyDiskPanel. Engine tip: after stay_on_disk, redockEmpty002BeforeErase mirrors
+# BeforeSecondInstall (fresh dock + store purge).
+# Optional DURATION_COPY_SOURCE_DISK / DURATION_COPY_TARGET_DISK /
+# DURATION_COPY_INSTANCE_ID (default kolibri→nextcloud).
+# Wait for Atlas :8080 GO + Path A re-dock layout (kolibri/:18080, empties) before
+# live --ui --record-walk.
+kind: walk
+name: cover-registered-intents
+graph: unified
+steps:
+  - from: start
+    to: console_teacher
+    action: open_console_as_teacher
+  - from: console_teacher
+    to: kolibri_manage
+    action: open_kolibri_as_teacher
+  - from: kolibri_manage
+    to: console_teacher
+    action: back_to_console
+  - from: console_teacher
+    to: nc_browse
+    action: open_nextcloud_as_teacher
+  - from: nc_browse
+    to: console_teacher
+    action: leave_nextcloud_as_teacher
+  - from: console_teacher
+    to: console_teacher
+    action: stay_on_teacher_overview
+  - from: console_teacher
+    to: start
+    action: return_to_start
+  - from: start
+    to: console_learner
+    action: open_console_as_learner
+  - from: console_learner
+    to: kolibri_home
+    action: open_kolibri_as_learner
+  - from: kolibri_home
+    to: kolibri_watching
+    action: open_video
+  - from: kolibri_watching
+    to: start
+    action: return_to_start
+  - from: start
+    to: console_learner
+    action: open_console_as_learner
+  - from: console_learner
+    to: kolibri_home
+    action: open_kolibri_as_learner
+  - from: kolibri_home
+    to: kolibri_exercise
+    action: open_exercise
+  - from: kolibri_exercise
+    to: start
+    action: return_to_start
+  - from: start
+    to: console_learner
+    action: open_console_as_learner
+  - from: console_learner
+    to: kolibri_home
+    action: open_kolibri_as_learner
+  - from: kolibri_home
+    to: console_learner
+    action: leave_kolibri
+  - from: console_learner
+    to: nc_browse
+    action: open_nextcloud_as_learner
+  - from: nc_browse
+    to: console_learner
+    action: leave_nextcloud_as_learner
+  - from: console_learner
+    to: console_learner
+    action: stay_on_learner_overview
+  - from: console_learner
+    to: start
+    action: return_to_start
+  - from: start
+    to: infra_idle
+    action: enter_infra_fleet_walk
+  - from: infra_idle
+    to: infra_docked
+    action: infra_dock_fixture
+  - from: infra_docked
+    to: start
+    action: return_to_start
+  - from: start
+    to: op_entry
+    action: open_console_as_operator
+  - from: op_entry
+    to: op_overview
+    action: sign_in
+  - from: op_overview
+    to: op_disk
+    action: open_disk_inventory
+  - from: op_disk
+    to: op_instance
+    action: open_instance_controls
+  - from: op_instance
+    to: op_copy_move
+    action: copy_app
+  - from: op_copy_move
+    to: op_overview
+    action: done_redistribute
+  - from: op_overview
+    to: op_eject
+    action: eject_disk
+  - from: op_eject
+    to: op_overview
+    action: confirm_eject
+  - from: op_overview
+    to: op_account
+    action: open_account
+  - from: op_account
+    to: op_account
+    action: add_operator
+  - from: op_account
+    to: op_account
+    action: remove_operator
+  - from: op_account
+    to: op_account
+    action: change_password
+  - from: op_account
+    to: op_overview
+    action: close_account
+  - from: op_overview
+    to: op_settings
+    action: open_settings
+  - from: op_settings
+    to: op_overview
+    action: close_settings
+  - from: op_overview
+    to: op_overview
+    action: stay_on_overview
+  - from: op_overview
+    to: op_overview
+    action: notice_usb_dock
+  - from: op_overview
+    to: start
+    action: return_to_start
+  - from: start
+    to: infra_idle
+    action: enter_infra_fleet_walk
+  - from: infra_idle
+    to: infra_reboot
+    action: infra_reboot_engine
+  - from: infra_reboot
+    to: infra_docked
+    action: infra_dock_fixture
+  - from: infra_docked
+    to: infra_disk_moved
+    action: infra_move_disk
+  - from: infra_disk_moved
+    to: infra_idle
+    action: infra_undock_fixtures
+  - from: infra_idle
+    to: infra_docked
+    action: infra_dock_fixture
+  - from: infra_docked
+    to: start
+    action: return_to_start
+  - from: start
+    to: op_entry
+    action: open_console_as_operator
+  - from: op_entry
+    to: op_entry
+    action: retry_login_first_time_setup
+  - from: op_entry
+    to: op_overview
+    action: sign_in
+  - from: op_overview
+    to: op_disk
+    action: open_disk_inventory
+  - from: op_disk
+    to: op_install
+    action: install_app
+  - from: op_install
+    to: op_overview
+    action: back_to_overview
+  - from: op_overview
+    to: op_disk
+    action: open_disk_inventory
+  - from: op_disk
+    to: op_files
+    action: make_files_disk
+  - from: op_files
+    to: op_disk
+    action: files_role_added
+  - from: op_disk
+    to: op_files
+    action: add_files_role
+  - from: op_files
+    to: op_disk
+    action: files_role_added
+  - from: op_disk
+    to: op_backup
+    action: make_backup_disk
+  - from: op_backup
+    to: op_disk
+    action: backup_configured_restored
+  # Select Backup Disk before restore (not Grade5A). Graph: open_disk_inventory
+  # only from op_overview — back_to_overview then re-open with
+  # DURATION_BACKUP_DISK_ID=duration-empty-001 (post make_backup_disk role).
+  - from: op_disk
+    to: op_overview
+    action: back_to_overview
+  - from: op_overview
+    to: op_disk
+    action: open_disk_inventory
+  - from: op_disk
+    to: op_backup
+    action: restore_from_backup
+  - from: op_backup
+    to: op_disk
+    action: backup_configured_restored
+  # Prefer A — restore Confirm may SIGTERM source instance; start before move_app
+  # so the docker-missing stability probe does not abort.
+  - from: op_disk
+    to: op_instance
+    action: open_instance_controls
+  - from: op_instance
+    to: op_instance
+    action: start_instance
+  - from: op_instance
+    to: op_disk
+    action: back_to_disk
+  - from: op_disk
+    to: op_copy_move
+    action: move_app
+  - from: op_copy_move
+    to: op_disk
+    action: stay_on_source_disk
+  # Prefer A r17: select still-empty pack before erase (not Grade5A / not Backup).
+  # After make_backup, empty-001 is backup — Pixel @48a4a05 ensureEmptyDiskPanel
+  # discovers docked duration-empty-002 (empty-badge). Env keeps EMPTY=001 /
+  # BACKUP=001. Mirror Backup Disk select: back_to_overview → open_disk_inventory.
+  # Never erase Grade5A app disks.
+  # After confirm_erase: Engine redockEmpty002AfterErase fresh-docks empty-002
+  # (Pixel discover; EMPTY stays 001). Path A erase should still republish Empty.
+  # r24/r26: erase left empty-002 absent → FAIL@85 late install_app.
+  - from: op_disk
+    to: op_overview
+    action: back_to_overview
+  - from: op_overview
+    to: op_disk
+    action: open_disk_inventory
+  - from: op_disk
+    to: op_erase
+    action: erase_disk
+  - from: op_erase
+    to: op_disk
+    action: confirm_erase
+  # Post-erase eject: DURATION_EJECT_DISK_ID=duration-nextcloud-grade5a-001
+  # (Pixel also discovers a surviving ejectable disk).
+  - from: op_disk
+    to: op_eject
+    action: eject_disk
+  - from: op_eject
+    to: op_overview
+    action: cancel_eject
+  - from: op_overview
+    to: op_instance
+    action: open_instance_controls
+  # Prefer A — Back up while Running; stop first leaves backup disabled/locked.
+  - from: op_instance
+    to: op_instance
+    action: start_instance
+  - from: op_instance
+    to: op_instance
+    action: open_app
+  - from: op_instance
+    to: op_instance
+    action: backup_instance
+  - from: op_instance
+    to: op_instance
+    action: stop_instance
+  - from: op_instance
+    to: op_disk
+    action: back_to_disk
+  # Prefer A r27 FAIL@86: start_after_install must target NEW empty-002 install uuid
+  # (Pixel discover non-grade5a @2c55756), not kolibri-grade5a-001. install_app waits settle.
+  # Prefer A r31: late install must not use stale --source empty-001 (backup, no apps/);
+  # Prefer A r32: Engine waitEmpty002PostInstallRunning before start_after_install (auto-start race).
+  # Engine installApp falls back to GitHub / docked bundle when --source apps missing.
+  - from: op_disk
+    to: op_install
+    action: install_app
+  - from: op_install
+    to: op_instance
+    action: start_after_install
+  # Prefer A r34: after move_app, grade5a is on nextcloud; Pixel copy_app must target a different disk (data-source-disk-id != target).
+  # Same-disk nextcloud is rejected by NetworkTree, so the modal never opens (FAIL@87).
+  - from: op_instance
+    to: op_copy_move
+    action: copy_app
+  - from: op_copy_move
+    to: op_instance
+    action: open_copied_instance
+  - from: op_instance
+    to: op_disk
+    action: back_to_disk
+  # Prefer A r35/r36 FAIL@90: after open_copied, Engine redockEmpty002BeforeSecondInstall
+  # fresh-docks empty-002 Empty + purges instanceDB storedOn=empty-002 (r36 store vs FS;
+  # start_after_install left it as kolibri app disk; empty-001 is backup).
+  - from: op_disk
+    to: op_install
+    action: install_app
+  - from: op_install
+    to: op_disk
+    action: stay_on_disk
+  # Prefer A r37 FAIL@92: after stay_on_disk, Engine redockEmpty002BeforeErase fresh-docks
+  # empty-002 Empty + store purge (second late install_app left it as app disk again).
+  - from: op_disk
+    to: op_erase
+    action: erase_disk
+  - from: op_erase
+    to: op_overview
+    action: cancel_erase
+  - from: op_overview
+    to: op_account
+    action: open_account
+  - from: op_account
+    to: op_entry
+    action: log_out
+  - from: op_entry
+    to: op_overview
+    action: sign_in
+  - from: op_overview
+    to: op_settings
+    action: open_settings
+  - from: op_settings
+    to: op_settings
+    action: switch_engine
+  - from: op_settings
+    to: op_settings
+    action: reboot_engine

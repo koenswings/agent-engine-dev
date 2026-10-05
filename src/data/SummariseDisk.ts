@@ -14,7 +14,7 @@ import { Store } from './Store.js'
 import { Disk, diskMountRoot } from './Disk.js'
 import { localEngineId } from './Engine.js'
 import { DiskID, Timestamp } from './CommonTypes.js'
-import { getCommandLogHandle } from './CommandLogStore.js'
+import { getCommandLogHandle, stashTraceResult } from './CommandLogStore.js'
 import { getActiveTrace } from '../utils/CommandLogger.js'
 import { log } from '../utils/utils.js'
 
@@ -23,20 +23,22 @@ export const SUMMARY_MAX_MS = 10_000
 export const SUMMARY_MAX_AGE_MS = 10 * 60 * 1000
 
 export interface ContentSummary {
+    /** files-disk.md §7.4 / Console store.ts — must match Console parse + EraseDialog. */
     targetId: string
     label: string
-    serial: string | null
     model: string | null
-    sizeBytes: number | null
-    filesystem: string | null
+    sizeBytes: number
     usedBytes: number | null
+    fsType: string | null
+    apps: { name: string; version: string }[]
+    instances: { id: string; name: string; running: boolean; dataBytes: number | null }[]
+    backups: { instanceId: string; instanceName: string; lastBackup: number | null; snapshots: number | null }[]
+    files: { fileCount: number; totalBytes: number; partial: boolean } | null
+    other: { entryCount: number; totalBytes: number; partial: boolean } | null
+    otherPartitions: { device: string; fsType: string | null }[]
     readable: boolean
-    partial: boolean
-    apps: { id: string; name: string; version: string }[]
-    instances: { id: string; name: string; status: string; dataBytes: number }[]
-    backups: { instanceName: string; lastBackup: number | null }[]
-    files: { count: number; bytes: number }
-    other: { count: number; bytes: number }
+    serial: string | null
+    computedAt: number
 }
 
 export interface SummariseOps {
@@ -113,16 +115,19 @@ export const summariseDisk = async (
         const summary: ContentSummary = {
             targetId,
             label: c.label,
-            serial: (c as any).serial ?? c.candidateId,
             model: c.model,
             sizeBytes: c.sizeBytes,
-            filesystem: c.fsType,
             usedBytes: null,
+            fsType: c.fsType,
+            apps: [],
+            instances: [],
+            backups: [],
+            files: null,
+            other: null,
+            otherPartitions: [],
             readable: false,
-            partial: false,
-            apps: [], instances: [], backups: [],
-            files: { count: 0, bytes: 0 },
-            other: { count: 0, bytes: 0 },
+            serial: (c as any).serial ?? c.candidateId,
+            computedAt: ops.now(),
         }
         return summary
     }
@@ -153,86 +158,114 @@ export const summariseDisk = async (
     }, deadline)
     truncated = walkResult.truncated || entries > SUMMARY_MAX_ENTRIES
 
-    const apps = Object.values(store.appDB)
+    const apps: ContentSummary['apps'] = Object.values(store.appDB)
         .filter(a => {
             // Apps that came from this disk: instances stored here reference them,
             // or apps/ folder listing — use instances on disk + apps folder if present
             return Object.values(store.instanceDB).some(i => i.storedOn === disk.id && i.instanceOf === a.id)
         })
-        .map(a => ({ id: a.id, name: a.name as string, version: a.version as string }))
+        .map(a => ({ name: a.name as string, version: a.version as string }))
 
     // Also list apps present on the disk filesystem
+    const seenAppKeys = new Set(apps.map(a => `${a.name}@${a.version}`))
     try {
         const appDirs = await fs.readdir(path.join(root, 'apps'))
         for (const id of appDirs) {
-            if (!apps.some(a => a.id === id)) {
-                const dash = id.lastIndexOf('-')
-                apps.push({ id, name: dash > 0 ? id.slice(0, dash) : id, version: dash > 0 ? id.slice(dash + 1) : '' })
+            const dash = id.lastIndexOf('-')
+            const name = dash > 0 ? id.slice(0, dash) : id
+            const version = dash > 0 ? id.slice(dash + 1) : ''
+            const key = `${name}@${version}`
+            if (!seenAppKeys.has(key)) {
+                seenAppKeys.add(key)
+                apps.push({ name, version })
             }
         }
     } catch { /* no apps/ */ }
 
-    const instances = Object.values(store.instanceDB)
+    const instances: ContentSummary['instances'] = Object.values(store.instanceDB)
         .filter(i => i.storedOn === disk.id)
-        .map(i => {
-            let dataBytes = 0
-            // Approximate from walk of instances/<id> if we can stat quickly
-            return { id: i.id, name: i.name as string, status: i.status, dataBytes }
-        })
+        .map(i => ({
+            id: i.id,
+            name: i.name as string,
+            running: i.status === 'Running' || i.status === 'Starting',
+            dataBytes: 0 as number | null,
+        }))
 
     // Fill instance data sizes from a focused walk
     for (const inst of instances) {
         const instRoot = path.join(root, 'instances', inst.id)
         try {
-            const r = await ops.walk(instRoot, (_rel, size) => { inst.dataBytes += size }, deadline)
+            const r = await ops.walk(instRoot, (_rel, size) => { inst.dataBytes = (inst.dataBytes ?? 0) + size }, deadline)
             if (r.truncated) truncated = true
         } catch { /* missing */ }
     }
 
-    const backups: { instanceName: string; lastBackup: number | null }[] = []
+    const backups: ContentSummary['backups'] = []
     try {
-        const text = await fs.readFile(path.join(root, 'BACKUP.yaml'), 'utf8')
-        const parsed = YAML.parse(text)
+        const yamlText = await fs.readFile(path.join(root, 'BACKUP.yaml'), 'utf8')
+        const parsed = YAML.parse(yamlText)
         const links = parsed?.links ?? disk.backupConfig?.links ?? []
         for (const link of links) {
             const name = typeof link === 'string' ? link : link?.instanceName ?? link?.name
             if (!name) continue
             const inst = Object.values(store.instanceDB).find(i => i.name === name || i.id === name)
-            backups.push({ instanceName: name, lastBackup: inst?.lastBackup ?? null })
+            backups.push({
+                instanceId: inst?.id ?? String(name),
+                instanceName: name,
+                lastBackup: inst?.lastBackup ?? null,
+                snapshots: null,
+            })
         }
     } catch {
         if (disk.backupConfig?.links) {
             for (const link of disk.backupConfig.links as any[]) {
                 const name = typeof link === 'string' ? link : link?.instanceName
-                if (name) backups.push({ instanceName: name, lastBackup: null })
+                if (!name) continue
+                const inst = Object.values(store.instanceDB).find(i => i.name === name || i.id === name)
+                backups.push({
+                    instanceId: inst?.id ?? String(name),
+                    instanceName: name,
+                    lastBackup: null,
+                    snapshots: null,
+                })
             }
         }
     }
 
+    const filesPartial = truncated
+    const otherPartial = truncated
     return {
         targetId,
         label: disk.name,
-        serial: null,
         model: null,
-        sizeBytes: disk.sizeBytes ?? null,
-        filesystem: 'ext4',
+        sizeBytes: disk.sizeBytes ?? 0,
         usedBytes: disk.sizeBytes != null && disk.freeBytes != null ? disk.sizeBytes - disk.freeBytes : null,
-        readable: true,
-        partial: truncated,
+        fsType: 'ext4',
         apps,
         instances,
         backups,
-        files: { count: filesCount, bytes: filesBytes },
-        other: { count: otherCount, bytes: otherBytes },
+        files: { fileCount: filesCount, totalBytes: filesBytes, partial: filesPartial },
+        other: { entryCount: otherCount, totalBytes: otherBytes, partial: otherPartial },
+        otherPartitions: [],
+        readable: true,
+        serial: null,
+        computedAt: ops.now(),
     }
 }
 
-/** Attach a JSON result to a command trace (defaults to the active one). */
+/**
+ * Stash a JSON result for the active (or given) trace. closeTrace applies it in
+ * the same Automerge change as status=ok so Console sees both together
+ * (Prefer A r42: summariseDisk printed OK but EraseDialog timed out — no result).
+ */
 export const attachTraceResult = (result: unknown, traceId?: string): void => {
-    const h = getCommandLogHandle()
     const id = traceId ?? getActiveTrace()?.traceId
-    if (!h || !id) return
+    if (!id) return
     const json = JSON.stringify(result)
+    stashTraceResult(id, json)
+    // Eager write when a handle exists (unit tests / mid-flight readers).
+    const h = getCommandLogHandle()
+    if (!h) return
     h.change(doc => {
         const t = doc.traces[id]
         if (t) t.result = json

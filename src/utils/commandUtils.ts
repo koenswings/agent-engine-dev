@@ -2,7 +2,7 @@ import { DocHandle } from "@automerge/automerge-repo";
 import { Store } from "../data/Store.js";
 import { Command, EngineID } from "../data/CommonTypes.js";
 import { ArgumentDescriptor, CommandDefinition } from "../data/CommandDefinition.js";
-import { CommandLogStore, addTrace, closeTrace, getCommandLogHandle } from "../data/CommandLogStore.js";
+import { CommandLogStore, addTrace, closeTrace, getCommandLogHandle, takePendingTraceResult } from "../data/CommandLogStore.js";
 import { runWithTrace, flushTrace } from "./CommandLogger.js";
 import { print } from './utils.js';
 
@@ -140,6 +140,7 @@ export const handleCommand = async (
         console.error(`Error: ${error.message}`);
         if (commandLogHandle) {
             await flushTrace(traceId);
+            takePendingTraceResult(traceId); // discard — do not publish result on error
             closeTrace(commandLogHandle, traceId, 'error', error.message);
         }
     }
