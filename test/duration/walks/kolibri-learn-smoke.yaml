@@ -1,0 +1,27 @@
+# Mini walk: reach finish_exercise in 6 steps (learner path) without coaching 3–7.
+# Prefer A smoke — iterate finish_exercise without re-walking cover-all 1..11.
+# Fake Stub OK; live --ui needs Console@4f7cfba+ (click-mask wait) + Kolibri Running.
+# Mid-start: --start-from finish_exercise seeds walker.current=kolibri_exercise
+# (live UI: page must already be on pinned exercise, or run full smoke without start-from).
+kind: walk
+name: kolibri-learn-smoke
+graph: unified
+steps:
+  - from: start
+    to: console_learner
+    action: open_console_as_learner
+  - from: console_learner
+    to: kolibri_home
+    action: open_kolibri_as_learner
+  - from: kolibri_home
+    to: kolibri_watching
+    action: open_video
+  - from: kolibri_watching
+    to: kolibri_watching
+    action: keep_watching
+  - from: kolibri_watching
+    to: kolibri_exercise
+    action: next_resource
+  - from: kolibri_exercise
+    to: kolibri_home
+    action: finish_exercise

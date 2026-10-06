@@ -1,0 +1,53 @@
+digraph MultiEngineOperatorHub {
+  rankdir=TB;
+  bgcolor="white";
+  pad="0.4";
+  nodesep="0.45";
+  ranksep="0.60";
+  fontname="Helvetica";
+  splines=true;
+  overlap=false;
+  size="11,8!";
+  ratio=fill;
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=12, width=1.55, height=0.55, margin="0.10,0.08"];
+  edge [fontname="Helvetica", fontsize=9, color="#555555"];
+
+  start [label="start", shape=circle, width=0.45, height=0.45, fixedsize=true, fillcolor="#eeeeee", style=filled, fontsize=10];
+
+  op_entry    [label="op_entry\n(open / login)", fillcolor="#D6EAF8"];
+  op_overview [label="op_overview\n(NetworkTree)", fillcolor="#85C1E9"];
+  op_disk     [label="op_disk\n(disk inventory)", fillcolor="#FCF3CF"];
+  op_instance [label="op_instance", fillcolor="#AED6F1"];
+  op_eject    [label="op_eject", fillcolor="#F5B7B1"];
+  op_account  [label="op_account", fillcolor="#D5DBDB"];
+  op_settings [label="op_settings", fillcolor="#D5DBDB"];
+
+  start -> op_entry [label="Open Console as operator"];
+  op_entry -> op_overview [label="Sign in 0.85"];
+  op_entry -> op_entry    [label="Retry login /\nfirst-time setup 0.15"];
+
+  op_overview -> op_disk     [label="Open disk inventory 0.28"];
+  op_overview -> op_instance [label="Open instance controls 0.18"];
+  op_overview -> op_eject    [label="Eject disk 0.10"];
+  op_overview -> op_account  [label="Open Account 0.06"];
+  op_overview -> op_settings [label="Open Settings 0.06"];
+  op_overview -> op_overview [label="Stay on overview 0.20"];
+  op_overview -> op_overview [label="Notice USB dock 0.12"];
+
+  op_eject -> op_overview [label="Confirm eject 0.70"];
+  op_eject -> op_overview [label="Cancel eject 0.30"];
+
+  op_account -> op_account  [label="Add operator 0.20"];
+  op_account -> op_account  [label="Remove operator 0.15"];
+  op_account -> op_account  [label="Change password 0.20"];
+  op_account -> op_overview [label="Close Account 0.35"];
+  op_account -> op_entry    [label="Log out 0.10"];
+
+  op_settings -> op_overview [label="Close Settings 0.50"];
+  op_settings -> op_settings [label="Switch Engine 0.25"];
+  op_settings -> op_settings [label="Reboot Engine 0.25"];
+
+  op_disk -> op_overview [label="Back to overview 0.10", style=dashed];
+  op_instance -> op_overview [label="Back to overview 0.15", style=dashed];
+  op_instance -> op_disk [label="Back to disk 0.20", style=dashed];
+}

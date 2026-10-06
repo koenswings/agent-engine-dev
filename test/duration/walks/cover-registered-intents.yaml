@@ -1,6 +1,6 @@
 # Deterministic cover-registered-intents walk ("registered-intents walk") — NOT a Markov graph.
 # Loads states/invariants/fixtures/pool from scenarios/unified.yaml.
-# Covers the current Pixel-registered demo subset (58 actions; registry 65 @ Console#134 cdcfdb1)
+# Covers the current Pixel-registered demo subset (58 actions; registry 68 @ Console 4f7cfba)
 # plus Engine infra FleetOps (dock/undock/move/reboot via RealFleetOps).
 # Excludes every action in DEFERRED_UI_INTENTS + PIXEL_MISSING_INTENTS
 # (coaching Intents are registered but not yet expanded here; keep_watching, wikipedia, etc.).
@@ -227,6 +227,21 @@ steps:
   - from: op_backup
     to: op_disk
     action: backup_configured_restored
+  # r30 (Steve): take a real backup before restore — restore_from_backup needs an archive
+  # on the Backup Disk. Same path as cover-all @97-99: backup_instance (registered Console
+  # Intent, op_instance self-loop) via open_instance_controls / back_to_disk. Harness
+  # co-locates Kolibri's disk with the Backup Disk (store-verified move; never re-docks
+  # the Backup Disk) and asserts backupApp op Done + BACKUP.yaml lastBackup bumped +
+  # backups/<id>/config.
+  - from: op_disk
+    to: op_instance
+    action: open_instance_controls
+  - from: op_instance
+    to: op_instance
+    action: backup_instance
+  - from: op_instance
+    to: op_disk
+    action: back_to_disk
   # Select Backup Disk before restore (not Grade5A). Graph: open_disk_inventory
   # only from op_overview — back_to_overview then re-open with
   # DURATION_BACKUP_DISK_ID=duration-empty-001 (post make_backup_disk role).

@@ -1,0 +1,22 @@
+# HOLD LIVE: do not run --live --ui until (1) Atlas redeploys Console tip 198eb69
+# (PR #135 Prefer A: File Drop trio on Kid file request /s/grade5adropzone + b1d3d60
+# Files settle + 1bbb729 keep_editing/wiki), and (2) Steve/Atlas GO.
+# Fake Stub OK now. Share re-run also waits Atlas 198eb69.
+#
+# Mirrors cover-all learner File Drop path: open_file_drop → after_upload, then a second
+# open_file_drop → leave_file_drop (unified.yaml leave exits nc_drop). Prefer A: seeded
+# Grade5A pins only (duration-nextcloud-grade5a-001 / nextcloud-grade5a-001).
+# store_mode: shared via unified.yaml (walk loader does not override it).
+# Action names match cover-all.yaml exactly.
+kind: walk
+name: nextcloud-file-drop-smoke
+graph: unified
+steps:
+  - { from: start, to: console_learner, action: open_console_as_learner }
+  - { from: console_learner, to: nc_browse, action: open_nextcloud_as_learner }
+  - { from: nc_browse, to: nc_browse, action: browse_folders }
+  - { from: nc_browse, to: nc_drop, action: open_file_drop }
+  - { from: nc_drop, to: nc_browse, action: after_upload }
+  - { from: nc_browse, to: nc_drop, action: open_file_drop }
+  - { from: nc_drop, to: console_learner, action: leave_file_drop }
+  - { from: console_learner, to: start, action: return_to_start }
