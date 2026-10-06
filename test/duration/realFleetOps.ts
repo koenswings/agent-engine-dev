@@ -5,6 +5,8 @@
  * physical USB yank. Kid fixture dock (testMode) =
  *   copy pack → private IDEA_DISKS_ROOT/idea-test-N/ + sentinel under IDEA_WATCH_DIR
  * Defaults (Atlas-approved): /home/pi/idea/duration-disks + duration-watch.
+ * idea#168 r34@70: app-pack trees must carry their instance data before a dock with instances
+ * started (LOUD otherwise), and moveDisk carries the source disk's real tree to the target.
  * NEVER /disks, NEVER /dev/engine, NEVER idea03 sdb1, NEVER golden idea02.
  *
  * Connection helpers are inlined (adapted from test/cross-engine/remoteClient.ts)
@@ -207,6 +209,13 @@ export interface RealFleetOptions {
     docWaitMsByHost?: Record<string, number>
     /** Called on a real own-store stall (WS up, doc never ready). Default: reportOwnStoreStall → exit 2. */
     onOwnStoreStall?: (engine: string, docId: string, detail: string) => void
+    /**
+     * idea#168 r34@70: privilege for fixture-tree reads/moves on the Pi. 'auto' (default) uses
+     * `sudo -n` when the host grants it (docker-owned instance data) and runs as the ssh user
+     * otherwise (idea01 had no passwordless sudo at r30); 'never' always runs as the ssh user
+     * (unit tests on a box that has sudo).
+     */
+    sudoMode?: SudoMode
 }
 
 /** Thrown when a pool Engine's WS never completes the automerge-repo handshake. */
@@ -426,7 +435,8 @@ export type SshDockCopyRemoteArgs = {
  * Empty packs (duration-empty-001 → pack empty/; duration-empty-002 → pack empty-002/):
  * never reuse Path A tree — always rm -rf + cp -a so prior install_app/make_backup
  * apps/ cannot leave isAppDisk / hide EmptyDiskPanel. Kolibri/Nextcloud Grade5A: reuse
- * matching META tree (docker-owned instances → no wipe).
+ * matching META tree (docker-owned instances → no wipe) — dockFixture has already checked its
+ * instance data (hasHealthyFixtureTree, idea#168 r34@70) before this script runs.
  */
 export const buildSshDockCopyRemote = (args: SshDockCopyRemoteArgs): string => {
     const { diskId, pack, src, dest, sentinel, disksRoot, watchDir, startInstances } = args
@@ -496,6 +506,270 @@ export const buildSshDockCopyRemote = (args: SshDockCopyRemoteArgs): string => {
     return parts.join('; ')
 }
 
+// ── idea#168 r34@70: instance-data precondition + real-tree disk move ──────────
+
+export type SudoMode = 'auto' | 'never'
+
+/** Fixture slots scanned on a host: idea-test-1..8 (Prefer A r26: Path A uses idea-test-5). */
+export const FIXTURE_SLOT_COUNT = 8
+export const fixtureSlotNames = (): string[] =>
+    Array.from({ length: FIXTURE_SLOT_COUNT }, (_, i) => `idea-test-${i + 1}`)
+
+/**
+ * The Kolibri class the walk coaches — Kid CONTENT.live.json `class.name`, a classroom under
+ * facility "Duration Tests Facility" (`open_kolibri_as_teacher` lands on /en/coach/#/classes and
+ * the Console guard looks for "Grade 5A"). Morango ids are re-provision mutable; the name is not.
+ */
+export const KOLIBRI_GRADE5A_CLASS_NAME = 'Grade 5A'
+
+/** Instance data an app pack needs before its tree may be docked with instances started. */
+export type AppPackInstanceData = {
+    pack: 'kolibri' | 'nextcloud'
+    instanceId: string
+    /** Primary instance-data file, relative to the slot root (hashed on move as evidence). */
+    keyFile: string
+    /** Human description of what lives there (error messages). */
+    describe: string
+}
+
+export const APP_PACK_INSTANCE_DATA: Readonly<Record<string, AppPackInstanceData>> = {
+    'duration-kolibri-grade5a-001': {
+        pack: 'kolibri',
+        instanceId: 'kolibri-grade5a-001',
+        // compose: ./data/kolibri:/root/.kolibri (KOLIBRI_HOME) → db.sqlite3 is the Kolibri DB.
+        keyFile: 'instances/kolibri-grade5a-001/data/kolibri/db.sqlite3',
+        describe: `Kolibri home db.sqlite3 with facility + classroom '${KOLIBRI_GRADE5A_CLASS_NAME}'`,
+    },
+    'duration-nextcloud-grade5a-001': {
+        pack: 'nextcloud',
+        instanceId: 'nextcloud-grade5a-001',
+        // compose: ./data/nextcloud:/var/www/html, ./data/db:/var/lib/mysql
+        keyFile: 'instances/nextcloud-grade5a-001/data/nextcloud/config/config.php',
+        describe: "Nextcloud data/nextcloud (config.php 'installed' => true) + MariaDB datadir data/db",
+    },
+}
+
+export const appPackInstanceData = (diskId: string): AppPackInstanceData | null =>
+    APP_PACK_INSTANCE_DATA[diskId] ?? null
+
+const shq = (v: string): string => `'${v.replace(/'/g, `'\\''`)}'`
+
+/** Remote preamble: S='sudo -n' when allowed and granted, else '' (run as the ssh user). */
+export const sudoPreamble = (mode: SudoMode): string =>
+    mode === 'never'
+        ? `S=''`
+        : `if sudo -n true 2>/dev/null; then S='sudo -n'; else S=''; fi`
+
+/** Read-only Kolibri DB probe (python3 sqlite3; no sqlite3 CLI on the Pis). No single quotes inside. */
+const KOLIBRI_DB_PROBE_PY = [
+    'import os, sqlite3, sys, urllib.parse',
+    'p, cls = sys.argv[1], sys.argv[2]',
+    'q = "SELECT f.name FROM kolibriauth_collection c JOIN kolibriauth_collection f ON c.parent_id = f.id WHERE c.kind = ? AND c.name = ? AND f.kind = ?"',
+    'rows = None',
+    'err = ""',
+    'for opt in ("mode=ro", "immutable=1"):',
+    '    try:',
+    '        con = sqlite3.connect("file:" + urllib.parse.quote(p) + "?" + opt, uri=True)',
+    '        rows = con.execute(q, ("classroom", cls, "facility")).fetchall()',
+    '        con.close()',
+    '        break',
+    '    except Exception as e:',
+    '        err = str(e)',
+    'if rows is None:',
+    '    print("INSTANCE_DATA_MISSING db.sqlite3 unreadable or not a Kolibri DB (" + err + ")")',
+    'elif not rows:',
+    '    print("INSTANCE_DATA_MISSING db.sqlite3 has no classroom " + repr(cls) + " under a facility (unprovisioned Kolibri: /en/setup)")',
+    'else:',
+    '    print("INSTANCE_DATA_OK facility=" + str(rows[0][0]) + " class=" + cls + " bytes=" + str(os.path.getsize(p)))',
+].join('\n')
+
+/**
+ * Remote bash that checks an app pack's instance data under `root` (a slot or a seed pack).
+ * Always exits 0 and prints exactly one line: `INSTANCE_DATA_OK <detail>` or
+ * `INSTANCE_DATA_MISSING <what>`. Follows symlinks (Path A links data/kolibri to
+ * /home/pi/idea166-kolibri-live/data/kolibri on idea01).
+ */
+export const buildInstanceDataCheckRemote = (args: {
+    root: string
+    spec: AppPackInstanceData
+    sudoMode: SudoMode
+    classroomName?: string
+}): string => {
+    const { root, spec, sudoMode } = args
+    const key = `${root}/${spec.keyFile}`
+    const parts = [sudoPreamble(sudoMode)]
+    if (spec.pack === 'kolibri') {
+        const cls = args.classroomName ?? KOLIBRI_GRADE5A_CLASS_NAME
+        parts.push(
+            `if ! $S test -f ${shq(key)}; then echo ${shq(`INSTANCE_DATA_MISSING ${spec.keyFile} not found (Kolibri home of ${spec.instanceId}: compose ./data/kolibri → /root/.kolibri)`)}; ` +
+            `elif ! command -v python3 >/dev/null 2>&1; then echo ${shq(`INSTANCE_DATA_MISSING python3 not available on host to read ${spec.keyFile}`)}; ` +
+            `else $S python3 -c ${shq(KOLIBRI_DB_PROBE_PY)} ${shq(key)} ${shq(cls)} 2>&1 | tail -n 1; fi`,
+        )
+    } else {
+        // Nextcloud data is www-data / mysql owned (config.php 0640). Without sudo -n (idea01 at
+        // r30) the installed flag may be unreadable: then the data dirs must still exist and the
+        // OK verdict says the flag was not verified. A seed copy or META-only tree has no data/.
+        const d = `${root}/instances/${spec.instanceId}/data`
+        const rel = `instances/${spec.instanceId}/data`
+        const nonEmpty = (dir: string) => `{ ! $S test -r ${shq(dir)} || [ -n "$($S ls -A ${shq(dir)} 2>/dev/null)" ]; }`
+        parts.push(
+            `if ! $S test -d ${shq(`${d}/nextcloud`)} || ! ${nonEmpty(`${d}/nextcloud`)}; then echo ${shq(`INSTANCE_DATA_MISSING ${rel}/nextcloud (Nextcloud /var/www/html of ${spec.instanceId}) not found or empty`)}; ` +
+            `elif ! $S test -d ${shq(`${d}/db`)} || ! ${nonEmpty(`${d}/db`)}; then echo ${shq(`INSTANCE_DATA_MISSING ${rel}/db (MariaDB datadir) not found or empty`)}; ` +
+            `elif $S test -r ${shq(key)}; then ` +
+            `if $S grep -Eq "'installed'[[:space:]]*=>[[:space:]]*true" ${shq(key)}; then echo ${shq('INSTANCE_DATA_OK nextcloud installed (config.php installed=true, data/db present)')}; ` +
+            `else echo ${shq(`INSTANCE_DATA_MISSING ${spec.keyFile} has no 'installed' => true (Nextcloud never installed)`)}; fi; ` +
+            `elif $S test -x ${shq(`${d}/nextcloud/config`)} && ! $S test -e ${shq(key)}; then echo ${shq(`INSTANCE_DATA_MISSING ${spec.keyFile} not found`)}; ` +
+            `else echo ${shq('INSTANCE_DATA_OK nextcloud data dirs present; installed flag NOT verified (config.php not readable as the ssh user, no sudo -n)')}; fi`,
+        )
+    }
+    return parts.join('; ')
+}
+
+export const parseInstanceDataCheck = (out: string): { ok: boolean; detail: string } => {
+    const line = String(out ?? '').split('\n').map(l => l.trim()).filter(Boolean)
+        .find(l => /^INSTANCE_DATA_(OK|MISSING)\b/.test(l))
+    if (!line) return { ok: false, detail: `instance-data check printed no verdict (${String(out ?? '').trim().slice(0, 200) || 'empty output'})` }
+    const ok = line.startsWith('INSTANCE_DATA_OK')
+    return { ok, detail: line.replace(/^INSTANCE_DATA_(OK|MISSING)\s*/, '') }
+}
+
+export type FixtureSlotState = 'MATCH' | 'OTHER' | 'NOMETA' | 'FREE'
+
+/** One read-only pass over idea-test-1..8: META diskId match / other pack / no META / free. */
+export const buildFixtureSlotScanRemote = (disksRoot: string, diskId: string): string =>
+    `for d in ${fixtureSlotNames().join(' ')}; do p=${shq(disksRoot)}/$d; ` +
+    `if test -f "$p/META.yaml"; then if grep -Fq ${shq(`diskId: ${diskId}`)} "$p/META.yaml"; then s=MATCH; else s=OTHER; fi; ` +
+    `elif test -e "$p" || test -L "$p"; then s=NOMETA; else s=FREE; fi; ` +
+    `m=; if mountpoint -q "$p" 2>/dev/null; then m=' mount'; fi; echo "SLOT $d $s$m"; done`
+
+export const parseFixtureSlotScan = (out: string): { device: string; state: FixtureSlotState; mount: boolean }[] =>
+    String(out ?? '').split('\n').map(l => l.trim())
+        .map(l => /^SLOT (idea-test-[0-9]+) (MATCH|OTHER|NOMETA|FREE)( mount)?$/.exec(l))
+        .filter((m): m is RegExpExecArray => !!m)
+        .map(m => ({ device: m[1]!, state: m[2] as FixtureSlotState, mount: !!m[3] }))
+
+/**
+ * Source-side move plan (read-only): mount point?, instance ids, and every symlink in the
+ * tree that resolves OUTSIDE the slot (Path A: data/kolibri → idea166-kolibri-live). Those
+ * are materialized on the target — a real disk carries its data, not a host-local link.
+ */
+export const buildMovePlanRemote = (slot: string, sudoMode: SudoMode): string => [
+    sudoPreamble(sudoMode),
+    `s=${shq(slot)}`,
+    `if ! test -d "$s"; then echo "PLAN_ERR source slot $s missing"; exit 0; fi`,
+    `if mountpoint -q "$s" 2>/dev/null; then echo "PLAN_MOUNT $(findmnt -no FSTYPE "$s" 2>/dev/null || true)"; fi`,
+    `sc=$(readlink -f -- "$s")`,
+    `cd "$s" || { echo "PLAN_ERR cannot cd $s"; exit 0; }`,
+    `$S find . -type l -print0 | while IFS= read -r -d '' l; do rel=\${l#./}; r=$($S readlink -f -- "$l" 2>/dev/null || true); ` +
+    `if [ -z "$r" ] || ! $S test -e "$r"; then echo "PLAN_DANGLING $rel"; continue; fi; ` +
+    `case "$r" in "$sc"|"$sc"/*) ;; *) printf 'PLAN_EXTLINK %s\\t%s\\n' "$rel" "$r";; esac; done`,
+    `for i in instances/*/; do if [ -d "$i" ]; then echo "PLAN_INST $(basename "$i")"; fi; done`,
+    `echo PLAN_END`,
+].join('; ')
+
+export type MovePlan = {
+    error: string | null
+    mountFsType: string | null
+    dangling: string[]
+    extLinks: { rel: string; target: string }[]
+    instances: string[]
+}
+
+export const parseMovePlan = (out: string): MovePlan => {
+    const plan: MovePlan = { error: null, mountFsType: null, dangling: [], extLinks: [], instances: [] }
+    let ended = false
+    for (const raw of String(out ?? '').split('\n')) {
+        const l = raw.replace(/\r$/, '')
+        if (l.startsWith('PLAN_ERR ')) plan.error = l.slice(9).trim()
+        else if (l.startsWith('PLAN_MOUNT')) plan.mountFsType = l.slice(10).trim() || 'unknown'
+        else if (l.startsWith('PLAN_DANGLING ')) plan.dangling.push(l.slice(14))
+        else if (l.startsWith('PLAN_EXTLINK ')) {
+            const [rel, target] = l.slice(13).split('\t')
+            if (rel && target) plan.extLinks.push({ rel, target })
+        } else if (l.startsWith('PLAN_INST ')) plan.instances.push(l.slice(10).trim())
+        else if (l === 'PLAN_END') ended = true
+    }
+    if (!plan.error && !ended) plan.error = `move plan incomplete (${String(out ?? '').trim().slice(-200) || 'no output'})`
+    return plan
+}
+
+/** Paths we splice into tar/mv commands: plain relative/absolute paths only (no globs, no ..). */
+const SAFE_REL = /^[A-Za-z0-9._@+-]+(\/[A-Za-z0-9._@+-]+)*$/
+export const isSafeRelPath = (rel: string): boolean =>
+    SAFE_REL.test(rel) && !rel.split('/').some(seg => seg === '..' || seg === '.')
+export const isSafeAbsPath = (p: string): boolean => p.startsWith('/') && isSafeRelPath(p.slice(1))
+
+/** Source: stream the slot tree (tar, owners/modes kept) minus the external links. */
+export const buildTreeSendRemote = (slot: string, excludeRels: string[], sudoMode: SudoMode): string =>
+    `${sudoPreamble(sudoMode)}; cd ${shq(slot)} && $S tar --numeric-owner -cpf - ` +
+    excludeRels.map(r => `--exclude=${shq(`./${r}`)} `).join('') + '.'
+
+/** Target: unpack the stream into a fresh staging dir (never a live slot). */
+export const buildTreeReceiveRemote = (staging: string, sudoMode: SudoMode): string =>
+    `set -euo pipefail; ${sudoPreamble(sudoMode)}; $S rm -rf ${shq(staging)}; mkdir -p ${shq(staging)}; ` +
+    `$S tar --numeric-owner -xpf - -C ${shq(staging)}`
+
+/** Source: stream the data an external symlink points at (dir or file), by its own name. */
+export const buildExtLinkSendRemote = (target: string, sudoMode: SudoMode): string => {
+    const cut = target.lastIndexOf('/')
+    const dir = cut <= 0 ? '/' : target.slice(0, cut)
+    const base = target.slice(cut + 1)
+    return `${sudoPreamble(sudoMode)}; $S tar --numeric-owner -cpf - -C ${shq(dir)} ${shq(base)}`
+}
+
+/** Target: unpack an external link's data and place it at <staging>/<rel> as real data. */
+export const buildExtLinkReceiveRemote = (staging: string, rel: string, target: string, sudoMode: SudoMode): string => {
+    const base = target.slice(target.lastIndexOf('/') + 1)
+    const parent = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : ''
+    return `set -euo pipefail; ${sudoPreamble(sudoMode)}; t=$(mktemp -d ${shq(`${staging}/.extlink.XXXXXX`)}); ` +
+        `$S tar --numeric-owner -xpf - -C "$t"; ` +
+        (parent ? `$S mkdir -p ${shq(`${staging}/${parent}`)}; ` : '') +
+        `$S rm -rf ${shq(`${staging}/${rel}`)}; $S mv "$t"/${shq(base)} ${shq(`${staging}/${rel}`)}; $S rmdir "$t"`
+}
+
+/**
+ * Content digest of a tree, following symlinks (so a source whose data sits behind an external
+ * link digests the same as the target where it was materialized): file count, sha256 over the
+ * sorted per-file sha256 list, and the sha256 of the pack's key instance file (db.sqlite3).
+ */
+export const buildTreeDigestRemote = (root: string, keyFile: string | null, sudoMode: SudoMode): string =>
+    `set -uo pipefail; ${sudoPreamble(sudoMode)}; cd ${shq(root)} || { echo ${shq(`DIGEST_ERR cannot cd ${root}`)}; exit 0; }; ` +
+    `n=$($S find -L . -type f -print0 | tr -cd '\\0' | wc -c); ` +
+    `h=$($S find -L . -type f -print0 | LC_ALL=C sort -z | $S xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1) || { echo DIGEST_ERR hashing failed; exit 0; }; ` +
+    (keyFile
+        ? `k=$($S sha256sum -- ${shq(keyFile)} 2>/dev/null | cut -d' ' -f1); `
+        : `k=; `) +
+    `echo "DIGEST files=$n tree=$h key=\${k:-none}"`
+
+export const parseTreeDigest = (out: string): { files: number; tree: string; key: string } | { error: string } => {
+    const text = String(out ?? '')
+    const m = /DIGEST files=(\d+) tree=([0-9a-f]{64}) key=([0-9a-f]{64}|none)/.exec(text)
+    if (!m) return { error: (/DIGEST_ERR.*/.exec(text)?.[0] ?? text.trim().slice(-200)) || 'no digest output' }
+    return { files: Number(m[1]), tree: m[2]!, key: m[3]! }
+}
+
+/** Target: atomically turn the verified staging dir into the slot (refuse if the slot appeared). */
+export const buildCommitMovedTreeRemote = (staging: string, dest: string, sudoMode: SudoMode): string =>
+    `set -euo pipefail; ${sudoPreamble(sudoMode)}; ` +
+    `if test -e ${shq(dest)} || test -L ${shq(dest)}; then echo ${shq(`RealFleetOps: refuse commit — ${dest} appeared during the move`)} >&2; exit 4; fi; ` +
+    `$S mv ${shq(staging)} ${shq(dest)}`
+
+/**
+ * Source: the disk has left this host. Rename the slot out of the idea-test-N namespace into
+ * <disksRoot>/.moved-away/ (a rename: works as the ssh user even over docker-owned files; the
+ * Engine and the slot scan never look there). Data behind external links is left untouched.
+ */
+export const buildQuarantineSourceRemote = (slot: string, quarantine: string): string => {
+    const qroot = quarantine.slice(0, quarantine.lastIndexOf('/'))
+    return `set -euo pipefail; mkdir -p ${shq(qroot)}; ` +
+        `if mountpoint -q ${shq(slot)} 2>/dev/null; then echo ${shq(`RealFleetOps: refuse quarantine of mount point ${slot}`)} >&2; exit 4; fi; ` +
+        `mv ${shq(slot)} ${shq(quarantine)}; echo ${shq(`QUARANTINED ${quarantine}`)}`
+}
+
+/** Target: fire the testMode sentinel (chokidar needs unlink + create, not an mtime touch). */
+export const buildFireSentinelRemote = (watchDir: string, sentinel: string): string =>
+    `mkdir -p ${shq(watchDir)}; rm -f ${shq(sentinel)}; sleep 5; touch ${shq(sentinel)}`
+
 export const parseHostsFlag = (raw: string): Record<string, string> => {
     const out: Record<string, string> = {}
     for (const part of raw.split(',').map(s => s.trim()).filter(Boolean)) {
@@ -541,6 +815,7 @@ export class RealFleetOps implements FleetOps {
     private readonly watchDir: string
     private readonly fixtureSourceRoot: string
     private readonly startInstances: boolean
+    private readonly sudoMode: SudoMode
     private readonly pm2ReconnectTimeoutMs: number
     private readonly conns = new Map<string, Conn>()
     /** In-flight connects per logical engine, so concurrent callers share one Repo. */
@@ -583,6 +858,7 @@ export class RealFleetOps implements FleetOps {
             ?? process.env.DURATION_FIXTURE_SOURCE_ROOT
             ?? DEFAULT_DURATION_FIXTURE_SOURCE_ROOT).replace(/\/+$/, '')
         this.startInstances = opts.startInstances === true
+        this.sudoMode = opts.sudoMode ?? 'auto'
         this.pm2ReconnectTimeoutMs = opts.pm2ReconnectTimeoutMs ?? PM2_RECONNECT_TIMEOUT_MS
         this.wsHandshakeTimeoutMs = opts.wsHandshakeTimeoutMs
             ?? Math.min(15_000, Number(process.env.DURATION_WS_HANDSHAKE_MS ?? DEFAULT_WS_HANDSHAKE_TIMEOUT_MS) || DEFAULT_WS_HANDSHAKE_TIMEOUT_MS)
@@ -640,8 +916,19 @@ export class RealFleetOps implements FleetOps {
         }
     }
 
-    private async ssh(host: string, remoteCmd: string): Promise<string> {
+    protected async ssh(host: string, remoteCmd: string): Promise<string> {
         const result = await $`ssh ${sshOpts} ${`${this.sshUser}@${host}`} ${remoteCmd}`
+        return result.stdout
+    }
+
+    /**
+     * idea#168 r34@70: stream bytes host→host through the walker (`ssh src cmd | ssh dst cmd`,
+     * pipefail). Uses only the walker's existing SSH access to each Pi — no Pi→Pi keys needed.
+     */
+    protected async relayPipe(srcHost: string, srcCmd: string, dstHost: string, dstCmd: string): Promise<string> {
+        const relayOpts = [...sshOpts, '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=8']
+        const script = 'ssh -n "${@:5}" "$1" "$2" | ssh "${@:5}" "$3" "$4"'
+        const result = await $`bash -o pipefail -c ${script} relay ${`${this.sshUser}@${srcHost}`} ${srcCmd} ${`${this.sshUser}@${dstHost}`} ${dstCmd} ${relayOpts}`
         return result.stdout
     }
 
@@ -1490,33 +1777,70 @@ export class RealFleetOps implements FleetOps {
     }
 
 
-    /** SSH: idea-test-N whose META.yaml diskId matches (not merely META present). */
-    private async hasHealthyFixtureTree(engineId: string, diskId: string): Promise<string | null> {
-        const map = this.deviceMap(engineId)
-        const preferred = map.get(diskId)
-        const host = this.hostOf(engineId)
-        const candidates = preferred
-            ? [preferred]
-            : // Prefer A r26 FAIL@93: Path A pre-docks duration-add-files-001 on idea-test-5;
-              // scan every live fixture slot, not just 1..4.
-              Array.from({ length: 8 }, (_, i) => `idea-test-${i + 1}`)
-        for (const device of candidates) {
-            if (!/^idea-test-[0-9]+$/.test(device)) continue
-            const meta = `${this.disksRoot}/${device}/META.yaml`
-            // Quote diskId for grep -F; refuse mismatched packs (e.g. nextcloud slot for kolibri).
-            try {
-                await this.ssh(
-                    host,
-                    `test -f '${meta}' && grep -Fq 'diskId: ${diskId}' '${meta}'`,
-                )
-                map.set(diskId, device)
-                this.usedSet(engineId).add(device)
-                return device
-            } catch {
-                /* try next */
-            }
+    /** Read-only scan of idea-test-1..8 on engineId (one SSH round-trip). */
+    private async scanFixtureSlots(engineId: string, diskId: string) {
+        return parseFixtureSlotScan(await this.ssh(this.hostOf(engineId), buildFixtureSlotScanRemote(this.disksRoot, diskId)))
+    }
+
+    /** Run the app-pack instance-data check for `root` on engineId. */
+    private async checkInstanceData(engineId: string, root: string, spec: AppPackInstanceData): Promise<{ ok: boolean; detail: string }> {
+        try {
+            return parseInstanceDataCheck(await this.ssh(
+                this.hostOf(engineId),
+                buildInstanceDataCheckRemote({ root, spec, sudoMode: this.sudoMode }),
+            ))
+        } catch (e) {
+            return { ok: false, detail: `instance-data check failed over SSH: ${e instanceof Error ? e.message : String(e)}` }
         }
-        return null
+    }
+
+    /**
+     * SSH: the idea-test-N (1..8) on engineId whose META.yaml diskId matches, or null.
+     *
+     * idea#168 r34@70 — LOUD precondition, not a heuristic: a META.yaml with the right diskId is
+     * not a disk. For app packs (Kolibri / Nextcloud Grade5A) docked with instances started, the
+     * tree must also carry the instance's data (Kolibri: db.sqlite3 with facility + classroom
+     * 'Grade 5A'; Nextcloud: installed config.php + MariaDB schema). A matching tree without it
+     * throws, naming host, path, diskId and what is missing — never silently reused, never
+     * silently refreshed from the seed pack. Two slots with the same diskId also throw.
+     * `requireInstanceData: false` (read-only probes, dock-only smoke) checks META only.
+     */
+    private async hasHealthyFixtureTree(
+        engineId: string,
+        diskId: string,
+        opts: { requireInstanceData?: boolean } = {},
+    ): Promise<string | null> {
+        const host = this.hostOf(engineId)
+        const slots = await this.scanFixtureSlots(engineId, diskId)
+        const matches = slots.filter(sl => sl.state === 'MATCH').map(sl => sl.device)
+        if (matches.length === 0) return null
+        if (matches.length > 1) {
+            throw new Error(
+                `RealFleetOps: ${engineId} (${host}) holds ${matches.length} trees for ${diskId}: ` +
+                    matches.map(d => `${this.disksRoot}/${d}`).join(', ') +
+                    ` — one disk cannot be in two slots. Refusing to pick one; purge the stale tree(s) (Path A).`,
+            )
+        }
+        const device = matches[0]!
+        const spec = appPackInstanceData(diskId)
+        const require = opts.requireInstanceData ?? (this.startInstances && spec !== null)
+        if (require && spec) {
+            const dest = `${this.disksRoot}/${device}`
+            const verdict = await this.checkInstanceData(engineId, dest, spec)
+            if (!verdict.ok) {
+                throw new Error(
+                    `RealFleetOps: refuse stale fixture tree ${engineId}:${dest} (host ${host}) for ${diskId}: ` +
+                        `META.yaml diskId matches but the instance data is missing — ${verdict.detail}. ` +
+                        `Needed: ${spec.keyFile} (${spec.describe}). No silent reuse and no silent ` +
+                        `refresh-from-seed (either would start ${spec.instanceId} without its data). ` +
+                        `Purge/quarantine this tree or put the disk's real tree back (Path A), then re-run.`,
+                )
+            }
+            console.log(`[RealFleetOps] fixture tree ${engineId}:${dest} for ${diskId}: instance data OK (${verdict.detail})`)
+        }
+        this.deviceMap(engineId).set(diskId, device)
+        this.usedSet(engineId).add(device)
+        return device
     }
 
     /** Allocate idea-test-N on this engine for diskId (stable if already assigned). */
@@ -1605,7 +1929,7 @@ export class RealFleetOps implements FleetOps {
     ): Promise<{ device: string; dest: string; fsType: string } | null> {
         this.assertNotExcluded(engineId, 'probeFixtureFsType')
         const device = this.deviceMap(engineId).get(diskId)
-            ?? (await this.hasHealthyFixtureTree(engineId, diskId))
+            ?? (await this.hasHealthyFixtureTree(engineId, diskId, { requireInstanceData: false }))
         if (!device || !/^idea-test-[0-9]+$/.test(device)) return null
         const dest = `${this.disksRoot}/${device}`
         const out = await this.ssh(this.hostOf(engineId), `findmnt -no FSTYPE '${dest}' || true`)
@@ -1623,7 +1947,7 @@ export class RealFleetOps implements FleetOps {
     ): Promise<{ dest: string; entries: string[] } | null> {
         this.assertNotExcluded(engineId, 'probeFixtureRootEntries')
         const device = this.deviceMap(engineId).get(diskId)
-            ?? (await this.hasHealthyFixtureTree(engineId, diskId))
+            ?? (await this.hasHealthyFixtureTree(engineId, diskId, { requireInstanceData: false }))
         if (!device || !/^idea-test-[0-9]+$/.test(device)) return null
         const dest = `${this.disksRoot}/${device}`
         const out = await this.ssh(this.hostOf(engineId), `ls -1A '${dest}' 2>/dev/null || true`)
@@ -1739,6 +2063,14 @@ export class RealFleetOps implements FleetOps {
             return
         }
         if (already && already !== engineId) {
+            if (appPackInstanceData(diskId)) {
+                // idea#168 r34@70: an app disk docked elsewhere is carried, not re-seeded.
+                console.log(
+                    `[RealFleetOps] dockFixture: ${diskId} docked on ${already}; carrying its real tree to ${engineId} (moveDisk)`,
+                )
+                await this.moveDisk(already, engineId, diskId)
+                return
+            }
             console.log(
                 `[RealFleetOps] dockFixture: ${diskId} on ${already}; ejecting before dock on ${engineId}`,
             )
@@ -1769,7 +2101,24 @@ export class RealFleetOps implements FleetOps {
         // caller recorded idea03. Reuse a healthy tree on the requested engine, else
         // fresh-copy into a free idea-test-1..8 slot there; never another engine.
         const target = engineId
+        // idea#168 r34@70: throws LOUD on a META-only (stale) app tree — no silent reuse.
         let device = await this.hasHealthyFixtureTree(engineId, diskId)
+        const spec = appPackInstanceData(diskId)
+        if (!device && spec && this.startInstances) {
+            // No tree here. The Kid seed pack ships compose/.env but no instance data, so a
+            // fresh copy would start the app unprovisioned (Kolibri → /en/setup). Refuse unless
+            // the seed itself carries the data.
+            const src = this.fixtureSourcePath(diskId)
+            const seed = await this.checkInstanceData(target, src, spec)
+            if (!seed.ok) {
+                throw new Error(
+                    `RealFleetOps: no ${diskId} tree on ${target} (${this.hostOf(target)}:${this.disksRoot}/idea-test-1..${FIXTURE_SLOT_COUNT}) ` +
+                        `and the seed pack ${src} has no instance data — ${seed.detail}. Refusing a silent ` +
+                        `refresh-from-seed (it would start ${spec.instanceId} without ${spec.keyFile}). ` +
+                        `Move the disk's real tree here (infra_move_disk / moveDisk from the host that holds it) or restore it (Path A).`,
+                )
+            }
+        }
         if (!device) {
             // Try idea-test-N slots until copy accepts (skip occupied/mismatched trees).
             // Prefer Atlas slot for empty (idea-test-3) when free.
@@ -1818,6 +2167,15 @@ export class RealFleetOps implements FleetOps {
         }
     }
 
+    /**
+     * Move a fixture disk fromEngine → toEngine like a real USB disk move.
+     *
+     * idea#168 r34@70: app packs (Kolibri / Nextcloud Grade5A) carry the SOURCE disk's real
+     * tree — the walk's earlier instance state (Kolibri db.sqlite3 with Grade 5A, lessons,
+     * progress) — to the target (moveDiskTree). Never a seed copy, never a reuse of whatever
+     * tree the target happens to hold. Empty packs keep their documented always-fresh-copy dock.
+     * Either way the landing is store-verified (r29).
+     */
     async moveDisk(fromEngine: string, toEngine: string, diskId: string): Promise<void> {
         this.assertNotExcluded(fromEngine, 'moveDisk(from)')
         this.assertNotExcluded(toEngine, 'moveDisk(to)')
@@ -1828,17 +2186,28 @@ export class RealFleetOps implements FleetOps {
         if (looksLikeProtectedHwDisk(diskId)) {
             throw new Error(`RealFleetOps: refuse to move protected disk '${diskId}'`)
         }
-        await this.undockFixtures([fromEngine], diskId)
-        // Eject is async (engine command + Automerge); wait before dock or
-        // dockFixture may see stale dockedTo and skip the target host (r25).
-        await this.waitDiskUndocked(diskId, 60_000)
-        try {
-            await this.dockFixture(toEngine, diskId)
-        } catch (e) {
-            const err = e instanceof Error ? e.message : String(e)
-            throw new Error(
-                `RealFleetOps.moveDisk: target ${toEngine} could not take ${diskId}: ${err}`,
-            )
+        if (appPackInstanceData(diskId)) {
+            try {
+                await this.moveDiskTree(fromEngine, toEngine, diskId)
+            } catch (e) {
+                const err = e instanceof Error ? e.message : String(e)
+                throw new Error(
+                    `RealFleetOps.moveDisk ${fromEngine}→${toEngine}: target ${toEngine} could not take ${diskId}: ${err}`,
+                )
+            }
+        } else {
+            await this.undockFixtures([fromEngine], diskId)
+            // Eject is async (engine command + Automerge); wait before dock or
+            // dockFixture may see stale dockedTo and skip the target host (r25).
+            await this.waitDiskUndocked(diskId, 60_000)
+            try {
+                await this.dockFixture(toEngine, diskId)
+            } catch (e) {
+                const err = e instanceof Error ? e.message : String(e)
+                throw new Error(
+                    `RealFleetOps.moveDisk: target ${toEngine} could not take ${diskId}: ${err}`,
+                )
+            }
         }
         // r29: verify the landing in the store — never trust the request.
         const landed = await this.findDockedEngine(diskId)
@@ -1847,6 +2216,191 @@ export class RealFleetOps implements FleetOps {
                 `RealFleetOps.moveDisk: ${diskId} requested on ${toEngine} but store shows ` +
                     `${landed ?? 'not docked anywhere'} (r29 FAIL@97 class). No soft-pass.`,
             )
+        }
+    }
+
+    /** Poll `docker ps` on engineId until no container of these instances runs (compose name `<id>-…`). */
+    private async waitInstanceContainersGone(engineId: string, instanceIds: string[], timeoutMs: number): Promise<string[]> {
+        const ids = instanceIds.filter(id => /^[A-Za-z0-9_.-]+$/.test(id))
+        if (!ids.length) return []
+        const host = this.hostOf(engineId)
+        const deadline = Date.now() + timeoutMs
+        let running: string[] = []
+        for (;;) {
+            const out = await this.ssh(
+                host,
+                ids.map(id => `docker ps --filter name='^${id}-' --format '{{.Names}}' 2>/dev/null || true`).join('; '),
+            ).catch(() => '')
+            running = String(out ?? '').split('\n').map(l => l.trim()).filter(Boolean)
+            if (!running.length || Date.now() >= deadline) return running
+            await sleep(2_000)
+        }
+    }
+
+    /**
+     * idea#168 r34@70: the real-disk move for app packs. Order (every check that can refuse
+     * runs before anything changes):
+     *  1. source tree: the one idea-test-N on fromEngine with this diskId AND its instance data
+     *     (hasHealthyFixtureTree — loud if stale); not a mount point; no dangling links.
+     *  2. target: no tree with this diskId already (a stale duplicate is refused, never reused);
+     *     a free idea-test-1..8 slot.
+     *  3. eject on fromEngine (ejectDisk + sentinel removed), wait until undocked AND the
+     *     instance containers are gone (the Engine stops them after clearing dockedTo; never copy
+     *     a live DB).
+     *  4. stream the tree source → target staging through the walker (tar, owners/modes kept);
+     *     data behind symlinks that leave the slot (Path A data/kolibri → idea166-kolibri-live)
+     *     is materialized as real data on the target.
+     *  5. verify: per-file content digest of source == staging, incl. sha256 of the key file
+     *     (Kolibri db.sqlite3). Mismatch → staging removed, source left intact, loud.
+     *  6. commit staging → slot on the target; re-check instance data there.
+     *  7. quarantine the source slot to <disksRoot>/.moved-away/ (the disk left that host).
+     *  8. fire the target sentinel; wait until the store shows it docked on toEngine.
+     */
+    private async moveDiskTree(fromEngine: string, toEngine: string, diskId: string): Promise<void> {
+        const spec = appPackInstanceData(diskId)!
+        resolveDurationFixturePack(diskId)
+        assertPrivateDurationRoots(this.disksRoot, this.watchDir)
+        const srcHost = this.hostOf(fromEngine)
+        const dstHost = this.hostOf(toEngine)
+
+        // Instance data is required whenever instances run (Path A --start-instances); dock-only
+        // smoke strips instances/, so there the tree is carried without a data precondition.
+        const requireData = this.startInstances
+
+        // 1. Source tree (loud if META-only / duplicated).
+        const srcDevice = await this.hasHealthyFixtureTree(fromEngine, diskId, { requireInstanceData: requireData })
+        if (!srcDevice) {
+            throw new Error(
+                `source ${fromEngine} (${srcHost}) has no tree for ${diskId} under ${this.disksRoot}/idea-test-1..${FIXTURE_SLOT_COUNT} ` +
+                    `— nothing real to move. No refresh-from-seed.`,
+            )
+        }
+        const srcSlot = `${this.disksRoot}/${srcDevice}`
+        const plan = parseMovePlan(await this.ssh(srcHost, buildMovePlanRemote(srcSlot, this.sudoMode)))
+        if (plan.error) throw new Error(`source ${fromEngine}:${srcSlot}: ${plan.error}`)
+        if (plan.mountFsType) {
+            throw new Error(
+                `source ${fromEngine}:${srcSlot} is a mount point (${plan.mountFsType}; loop image?). Moving a ` +
+                    `loop-backed slot needs losetup/mount (root) on ${toEngine}; app slots are plain dirs in Path A. Refusing.`,
+            )
+        }
+        if (plan.dangling.length) {
+            throw new Error(
+                `source ${fromEngine}:${srcSlot} has dangling symlink(s) ${plan.dangling.join(', ')} — data missing on the source; refusing to move.`,
+            )
+        }
+        for (const l of plan.extLinks) {
+            if (!isSafeRelPath(l.rel) || !isSafeAbsPath(l.target)) {
+                throw new Error(`source ${fromEngine}:${srcSlot}: refuse odd symlink path '${l.rel}' → '${l.target}'`)
+            }
+        }
+
+        // 2. Target: no duplicate, a free slot.
+        const dstSlots = await this.scanFixtureSlots(toEngine, diskId)
+        const dup = dstSlots.filter(sl => sl.state === 'MATCH')
+        if (dup.length) {
+            throw new Error(
+                `target ${toEngine} (${dstHost}) already holds a tree for ${diskId} at ` +
+                    dup.map(d => `${this.disksRoot}/${d.device}`).join(', ') +
+                    ` (stale duplicate). A disk cannot be on two hosts; refusing to reuse or overwrite it — purge it (Path A).`,
+            )
+        }
+        const used = this.usedSet(toEngine)
+        const free = dstSlots.find(sl => sl.state === 'FREE' && !used.has(sl.device))
+        if (!free) {
+            throw new Error(
+                `target ${toEngine} (${dstHost}): no free idea-test-1..${FIXTURE_SLOT_COUNT} slot for ${diskId} ` +
+                    `(${dstSlots.map(sl => `${sl.device}=${sl.state}`).join(' ')})`,
+            )
+        }
+        const dstDevice = free.device
+        const dstSlot = `${this.disksRoot}/${dstDevice}`
+        const staging = `${this.disksRoot}/.incoming-${dstDevice}-${diskId}`
+
+        // 3. Eject on the source; wait for undock + containers gone.
+        console.log(
+            `[RealFleetOps] moveDisk ${diskId}: ejecting on ${fromEngine} (${srcSlot}) before carrying it to ${toEngine}:${dstSlot}`,
+        )
+        await this.undockFixtures([fromEngine], diskId)
+        await this.waitDiskUndocked(diskId, 60_000)
+        this.releaseTestDevice(fromEngine, diskId)
+        const stillRunning = await this.waitInstanceContainersGone(fromEngine, plan.instances, 90_000)
+        if (stillRunning.length) {
+            throw new Error(
+                `source ${fromEngine}: container(s) ${stillRunning.join(', ')} still running 90s after ejecting ${diskId}; ` +
+                    `refusing to copy live instance data. Source tree left intact (undocked) at ${srcSlot}.`,
+            )
+        }
+
+        // 4. Stream source → target staging.
+        const srcDigestRoot = srcSlot
+        try {
+            console.log(
+                `[RealFleetOps] moveDisk ${diskId}: streaming ${fromEngine}:${srcSlot} → ${toEngine}:${staging}` +
+                    (plan.extLinks.length ? ` (materializing ${plan.extLinks.map(l => `${l.rel} → ${l.target}`).join(', ')})` : ''),
+            )
+            await this.relayPipe(
+                srcHost, buildTreeSendRemote(srcSlot, plan.extLinks.map(l => l.rel), this.sudoMode),
+                dstHost, buildTreeReceiveRemote(staging, this.sudoMode),
+            )
+            for (const l of plan.extLinks) {
+                await this.relayPipe(
+                    srcHost, buildExtLinkSendRemote(l.target, this.sudoMode),
+                    dstHost, buildExtLinkReceiveRemote(staging, l.rel, l.target, this.sudoMode),
+                )
+            }
+            // 5. Verify content.
+            const [a, b] = await Promise.all([
+                this.ssh(srcHost, buildTreeDigestRemote(srcDigestRoot, spec.keyFile, this.sudoMode)),
+                this.ssh(dstHost, buildTreeDigestRemote(staging, spec.keyFile, this.sudoMode)),
+            ])
+            const da = parseTreeDigest(a)
+            const db = parseTreeDigest(b)
+            if ('error' in da) throw new Error(`source digest failed on ${fromEngine}:${srcSlot}: ${da.error}`)
+            if ('error' in db) throw new Error(`target digest failed on ${toEngine}:${staging}: ${db.error}`)
+            if (da.files !== db.files || da.tree !== db.tree || da.key !== db.key) {
+                throw new Error(
+                    `content mismatch after transfer: source ${da.files} files tree ${da.tree.slice(0, 12)} key ${da.key.slice(0, 12)} ` +
+                        `vs target ${db.files} files tree ${db.tree.slice(0, 12)} key ${db.key.slice(0, 12)}`,
+                )
+            }
+            if (requireData && da.key === 'none') throw new Error(`key instance file ${spec.keyFile} missing in the source tree`)
+            // 6. Commit on the target and re-check its instance data there.
+            await this.ssh(dstHost, buildCommitMovedTreeRemote(staging, dstSlot, this.sudoMode))
+            used.add(dstDevice)
+            this.deviceMap(toEngine).set(diskId, dstDevice)
+            console.log(
+                `[RealFleetOps] moveDisk ${diskId}: carried ${da.files} files ${fromEngine}:${srcSlot} → ${toEngine}:${dstSlot} ` +
+                    `(tree sha256 ${da.tree}, ${spec.keyFile} sha256 ${da.key})`,
+            )
+        } catch (e) {
+            await this.ssh(dstHost, `${sudoPreamble(this.sudoMode)}; $S rm -rf '${staging}'`).catch(() => '')
+            const err = e instanceof Error ? e.message : String(e)
+            throw new Error(`${err}. Staging ${toEngine}:${staging} removed; source tree left intact (undocked) at ${fromEngine}:${srcSlot}.`)
+        }
+        const landedData = requireData ? await this.checkInstanceData(toEngine, dstSlot, spec) : { ok: true, detail: 'dock-only' }
+        if (!landedData.ok) {
+            throw new Error(
+                `moved tree ${toEngine}:${dstSlot} fails the instance-data check after commit — ${landedData.detail}. ` +
+                    `Source tree left intact (undocked) at ${fromEngine}:${srcSlot}.`,
+            )
+        }
+
+        // 7. The disk has left the source host.
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+        const quarantine = `${this.disksRoot}/.moved-away/${srcDevice}-${diskId}-${stamp}`
+        await this.ssh(srcHost, buildQuarantineSourceRemote(srcSlot, quarantine))
+        console.log(`[RealFleetOps] moveDisk ${diskId}: source slot ${fromEngine}:${srcSlot} → ${quarantine} (disk left ${fromEngine})`)
+
+        // 8. Dock on the target (sentinel), wait for the store; one re-fire like dockFixture.
+        const sentinel = `${this.watchDir}/${dstDevice}`
+        await this.ssh(dstHost, buildFireSentinelRemote(this.watchDir, sentinel))
+        try {
+            await this.waitDiskDocked(toEngine, diskId, 120_000)
+        } catch (e) {
+            console.warn(`[RealFleetOps] moveDisk: waitDiskDocked failed once on ${toEngine}/${diskId}; re-firing sentinel: ${e}`)
+            await this.ssh(dstHost, buildFireSentinelRemote(this.watchDir, sentinel))
+            await this.waitDiskDocked(toEngine, diskId, 120_000)
         }
     }
 

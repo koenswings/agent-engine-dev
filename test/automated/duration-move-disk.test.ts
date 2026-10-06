@@ -1,0 +1,451 @@
+/**
+ * idea#168 r34@70 — infra_move_disk carries the SOURCE disk's real tree; app-pack fixture
+ * trees need their instance data (LOUD precondition, no silent reuse / refresh-from-seed).
+ *
+ * cover-all-cf231e8-r34 FAIL@70: after infra_move_disk@62 (Kolibri Grade5A idea01→idea03)
+ * dockFixture(idea03) reused a stale idea03:~/idea/duration-disks/idea-test-1 whose META.yaml
+ * had the right diskId but no Kolibri data → Kolibri on an empty data dir → /en/setup.
+ *
+ * These tests drive the REAL RealFleetOps code paths (dockFixture / moveDisk and the remote
+ * bash they generate) against per-host sandboxes on the box: every "ssh host cmd" runs the
+ * generated bash locally with the host's roots substituted, and the walker relay
+ * (ssh src | ssh dst) is a local pipe. Only the Automerge store calls are stubbed.
+ */
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { execFile, execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { promisify } from 'node:util'
+import {
+    APP_PACK_INSTANCE_DATA,
+    FIXTURE_SLOT_COUNT,
+    KOLIBRI_GRADE5A_CLASS_NAME,
+    RealFleetOps,
+    buildFixtureSlotScanRemote,
+    buildInstanceDataCheckRemote,
+    buildQuarantineSourceRemote,
+    buildTreeSendRemote,
+    fixtureSlotNames,
+    parseFixtureSlotScan,
+    parseInstanceDataCheck,
+    parseMovePlan,
+    sudoPreamble,
+} from '../duration/realFleetOps.js'
+import type { SemanticStoreView } from '../duration/types.js'
+
+const run = promisify(execFile)
+
+const KOLIBRI = 'duration-kolibri-grade5a-001'
+const KINST = 'kolibri-grade5a-001'
+const EMPTY = 'duration-empty-001'
+const HOSTS = { idea01: 'idea01', idea03: 'idea03', idea04: 'idea04' }
+const DB_REL = APP_PACK_INSTANCE_DATA[KOLIBRI]!.keyFile
+
+const sha256 = (file: string) => createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+
+/** A Kolibri-shaped db.sqlite3 (kolibriauth_collection) plus a walk-state row. */
+const makeKolibriDb = (file: string, opts: { grade5a: boolean; walkState?: string }) => {
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    const py = [
+        'import sqlite3, sys',
+        'con = sqlite3.connect(sys.argv[1])',
+        'con.execute("CREATE TABLE kolibriauth_collection (id TEXT PRIMARY KEY, name TEXT, kind TEXT, parent_id TEXT)")',
+        'con.execute("CREATE TABLE walk_state (k TEXT, v TEXT)")',
+        'con.execute("INSERT INTO kolibriauth_collection VALUES (?,?,?,?)", ("386af378", "Duration Tests Facility", "facility", None))',
+        'if sys.argv[2] == "1":',
+        '    con.execute("INSERT INTO kolibriauth_collection VALUES (?,?,?,?)", ("8264b7d5", "Grade 5A", "classroom", "386af378"))',
+        'if sys.argv[3]:',
+        '    con.execute("INSERT INTO walk_state VALUES (?,?)", ("progress", sys.argv[3]))',
+        'con.commit()',
+        'con.close()',
+    ].join('\n')
+    execFileSync('python3', ['-c', py, file, opts.grade5a ? '1' : '0', opts.walkState ?? ''])
+}
+
+const readWalkState = (file: string): string | null => {
+    const out = execFileSync('python3', ['-c',
+        'import sqlite3,sys\nr=sqlite3.connect(sys.argv[1]).execute("SELECT v FROM walk_state WHERE k=?",("progress",)).fetchone()\nprint(r[0] if r else "")',
+        file]).toString().trim()
+    return out || null
+}
+
+type Sandbox = {
+    dir: string
+    ROOT: string
+    WATCH: string
+    SEED: string
+    host: (h: string) => { disks: string; watch: string; seed: string }
+}
+
+const makeSandbox = (): Sandbox => {
+    let dir = ''
+    do { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rfo-move-')) } while (/sdb/i.test(dir))
+    const host = (h: string) => ({ disks: `${dir}/${h}/disks`, watch: `${dir}/${h}/watch`, seed: `${dir}/${h}/seed` })
+    for (const h of Object.keys(HOSTS)) {
+        const p = host(h)
+        fs.mkdirSync(p.disks, { recursive: true })
+        fs.mkdirSync(p.watch, { recursive: true })
+        // Kid seed packs as on the Pi: kolibri ships compose/.env but NO instance data.
+        fs.mkdirSync(`${p.seed}/kolibri/instances/${KINST}`, { recursive: true })
+        fs.writeFileSync(`${p.seed}/kolibri/META.yaml`, `diskId: ${KOLIBRI}\n`)
+        fs.writeFileSync(`${p.seed}/kolibri/instances/${KINST}/compose.yaml`, 'services: {}\n')
+        fs.mkdirSync(`${p.seed}/empty`, { recursive: true })
+        fs.writeFileSync(`${p.seed}/empty/META.yaml`, `diskId: ${EMPTY}\n`)
+        fs.writeFileSync(`${p.seed}/empty/README.md`, 'humans\n')
+    }
+    return { dir, ROOT: `${dir}/__DISKS__`, WATCH: `${dir}/__WATCH__`, SEED: `${dir}/__SEED__`, host }
+}
+
+/** Kolibri slot on a host. data: 'real' | 'symlink' (Path A idea01) | 'none' (stale META-only). */
+const plantKolibriTree = (sb: Sandbox, h: string, slot: string, data: 'real' | 'symlink' | 'none', opts: { grade5a?: boolean; walkState?: string } = {}) => {
+    const root = `${sb.host(h).disks}/${slot}`
+    fs.mkdirSync(`${root}/apps/kolibri-1.0`, { recursive: true })
+    fs.mkdirSync(`${root}/instances/${KINST}`, { recursive: true })
+    fs.writeFileSync(`${root}/META.yaml`, `diskId: ${KOLIBRI}\ndiskName: "Duration Tests — Kolibri Grade 5A"\n`)
+    fs.writeFileSync(`${root}/apps/kolibri-1.0/compose.yaml`, 'services: {}\n')
+    fs.writeFileSync(`${root}/instances/${KINST}/compose.yaml`, 'services: {}\n')
+    fs.writeFileSync(`${root}/instances/${KINST}/.env`, 'port=18080\n')
+    const dataDir = `${root}/instances/${KINST}/data/kolibri`
+    if (data === 'real') {
+        makeKolibriDb(`${dataDir}/db.sqlite3`, { grade5a: opts.grade5a ?? true, walkState: opts.walkState })
+        fs.mkdirSync(`${dataDir}/content/storage`, { recursive: true })
+        fs.writeFileSync(`${dataDir}/content/storage/video.mp4`, Buffer.from('fake-mp4-bytes'))
+    } else if (data === 'symlink') {
+        const live = `${sb.dir}/${h}/idea166-kolibri-live/data/kolibri`
+        makeKolibriDb(`${live}/db.sqlite3`, { grade5a: opts.grade5a ?? true, walkState: opts.walkState })
+        fs.mkdirSync(`${live}/content/storage`, { recursive: true })
+        fs.writeFileSync(`${live}/content/storage/video.mp4`, Buffer.from('fake-mp4-bytes'))
+        fs.mkdirSync(path.dirname(dataDir), { recursive: true })
+        fs.symlinkSync(live, dataDir)
+    }
+    return root
+}
+
+/** RealFleetOps whose SSH runs the generated bash locally against per-host sandboxes. */
+class LocalFleetOps extends RealFleetOps {
+    readonly cmds: { host: string; cmd: string }[] = []
+    readonly relays: { src: string; dst: string; srcCmd: string; dstCmd: string }[] = []
+    tamperAfterRelay: ((dstHost: string) => void) | null = null
+    constructor(private readonly sb: Sandbox, startInstances = true) {
+        super({
+            poolEngines: ['idea01', 'idea03', 'idea04'],
+            excludeEngines: ['idea02'],
+            hosts: HOSTS,
+            disksRoot: sb.ROOT,
+            watchDir: sb.WATCH,
+            fixtureSourceRoot: sb.SEED,
+            startInstances,
+            sudoMode: 'never',
+        })
+    }
+    private localize(host: string, cmd: string): string {
+        const p = this.sb.host(host)
+        return cmd
+            .replaceAll(this.sb.ROOT, p.disks)
+            .replaceAll(this.sb.WATCH, p.watch)
+            .replaceAll(this.sb.SEED, p.seed)
+            .replaceAll('sleep 5', 'sleep 0')
+    }
+    protected override async ssh(host: string, cmd: string): Promise<string> {
+        this.cmds.push({ host, cmd })
+        try {
+            const { stdout } = await run('bash', ['-c', this.localize(host, cmd)], { maxBuffer: 64 << 20 })
+            return stdout
+        } catch (e) {
+            const err = e as { stderr?: string; code?: number; message?: string }
+            throw new Error(`ssh ${host} failed (exit code: ${err.code}): ${err.stderr || err.message}`)
+        }
+    }
+    protected override async relayPipe(src: string, srcCmd: string, dst: string, dstCmd: string): Promise<string> {
+        this.relays.push({ src, dst, srcCmd, dstCmd })
+        const { stdout } = await run('bash', ['-o', 'pipefail', '-c', 'bash -c "$1" | bash -c "$2"', 'relay',
+            this.localize(src, srcCmd), this.localize(dst, dstCmd)], { maxBuffer: 64 << 20 })
+        this.tamperAfterRelay?.(dst)
+        return stdout
+    }
+}
+
+/** In-memory dock state standing in for the Automerge stores (unique mode). */
+const stubStore = (ops: LocalFleetOps, sb: Sandbox, initial: Record<string, string | null> = {}) => {
+    const docked = new Map<string, string | null>(Object.entries(initial))
+    const calls = { undock: [] as string[] }
+    const slotOf = (h: string, diskId: string): string | null => {
+        for (const s of fixtureSlotNames()) {
+            const meta = `${sb.host(h).disks}/${s}/META.yaml`
+            if (fs.existsSync(meta) && fs.readFileSync(meta, 'utf8').includes(`diskId: ${diskId}`)) return s
+        }
+        return null
+    }
+    Object.assign(ops as object, {
+        findDockedEngine: async (d: string) => docked.get(d) ?? null,
+        undockFixtures: async (engines: string[], d: string) => {
+            calls.undock.push(`${engines.join(',')}:${d}`)
+            const on = docked.get(d)
+            if (on && engines.includes(on)) {
+                const s = slotOf(on, d)
+                if (s) fs.rmSync(`${sb.host(on).watch}/${s}`, { force: true })
+                docked.set(d, null)
+            }
+        },
+        waitDiskUndocked: async (d: string) => {
+            if (docked.get(d)) throw new Error(`still docked ${d}`)
+        },
+        waitDiskDocked: async (engine: string, d: string) => {
+            const s = slotOf(engine, d)
+            if (!s || !fs.existsSync(`${sb.host(engine).watch}/${s}`)) {
+                throw new Error(`RealFleetOps: disk ${d} not docked on ${engine} (no sentinel for a ${d} slot)`)
+            }
+            docked.set(d, engine)
+        },
+        readStore: async (engine: string): Promise<SemanticStoreView> => ({
+            engineId: engine,
+            instanceDB: {},
+            diskDB: Object.fromEntries([...docked.entries()].map(([id, on]) => [id, { id, dockedTo: on, device: null }])),
+            engineDB: {},
+        }),
+    })
+    return { docked, calls, slotOf }
+}
+
+let sb: Sandbox
+beforeEach(() => { sb = makeSandbox() })
+afterEach(() => { fs.rmSync(sb.dir, { recursive: true, force: true }) })
+
+describe('idea#168 r34@70: hasHealthyFixtureTree is a LOUD instance-data precondition', () => {
+    it('(a) stale tree with matching META but no Kolibri data → dockFixture refuses loudly naming host, path, diskId, what is missing; nothing docked', async () => {
+        plantKolibriTree(sb, 'idea03', 'idea-test-1', 'none') // the r34 idea03 tree from 10-01
+        const ops = new LocalFleetOps(sb)
+        const store = stubStore(ops, sb)
+        const err = await ops.dockFixture('idea03', KOLIBRI).then(() => null, e => e as Error)
+        expect(err).toBeInstanceOf(Error)
+        expect(err!.message).toContain(`refuse stale fixture tree idea03:${sb.ROOT}/idea-test-1 (host idea03) for ${KOLIBRI}`)
+        expect(err!.message).toContain(`${DB_REL} not found`)
+        expect(err!.message).toMatch(/No silent reuse and no silent refresh-from-seed/)
+        // No sentinel fired, no copy from the seed pack, nothing docked.
+        expect(fs.readdirSync(sb.host('idea03').watch)).toEqual([])
+        expect(ops.cmds.some(c => c.cmd.includes('touch '))).toBe(false)
+        expect(ops.cmds.some(c => c.cmd.includes('cp -a'))).toBe(false)
+        expect(store.docked.get(KOLIBRI) ?? null).toBeNull()
+    })
+
+    it('(a) tree whose db.sqlite3 has no Grade 5A classroom (Kolibri booted on an empty dir) → refuses loudly', async () => {
+        plantKolibriTree(sb, 'idea03', 'idea-test-1', 'real', { grade5a: false })
+        const ops = new LocalFleetOps(sb)
+        stubStore(ops, sb)
+        await expect(ops.dockFixture('idea03', KOLIBRI)).rejects.toThrow(
+            new RegExp(`refuse stale fixture tree idea03:.*idea-test-1.*${KOLIBRI}.*db\\.sqlite3 has no classroom 'Grade 5A' under a facility`),
+        )
+        expect(fs.readdirSync(sb.host('idea03').watch)).toEqual([])
+    })
+
+    it('healthy tree (db.sqlite3 with Grade 5A, Path A symlinked data dir) is reused on the requested engine (regression)', async () => {
+        const root = plantKolibriTree(sb, 'idea01', 'idea-test-1', 'symlink', { walkState: 'kept' })
+        const ops = new LocalFleetOps(sb)
+        const store = stubStore(ops, sb)
+        await ops.dockFixture('idea01', KOLIBRI)
+        expect(store.docked.get(KOLIBRI)).toBe('idea01')
+        expect(fs.existsSync(`${sb.host('idea01').watch}/idea-test-1`)).toBe(true)
+        // Reused as-is: Path A link and walk state intact, nothing re-seeded.
+        expect(fs.lstatSync(`${root}/instances/${KINST}/data/kolibri`).isSymbolicLink()).toBe(true)
+        expect(readWalkState(`${root}/${DB_REL}`)).toBe('kept')
+    })
+
+    it('two slots with the same diskId on one host → LOUD (never picks one silently)', async () => {
+        plantKolibriTree(sb, 'idea03', 'idea-test-1', 'real')
+        plantKolibriTree(sb, 'idea03', 'idea-test-6', 'real')
+        const ops = new LocalFleetOps(sb)
+        stubStore(ops, sb)
+        await expect(ops.dockFixture('idea03', KOLIBRI)).rejects.toThrow(/idea03 \(idea03\) holds 2 trees for duration-kolibri-grade5a-001: .*idea-test-1, .*idea-test-6/)
+    })
+
+    it('slot scan stays idea-test-1..8: a healthy tree on idea-test-8 is found, one on idea-test-9 is not (→ seed refusal)', async () => {
+        expect(FIXTURE_SLOT_COUNT).toBe(8)
+        expect(fixtureSlotNames()).toEqual(['idea-test-1', 'idea-test-2', 'idea-test-3', 'idea-test-4', 'idea-test-5', 'idea-test-6', 'idea-test-7', 'idea-test-8'])
+        plantKolibriTree(sb, 'idea01', 'idea-test-8', 'real')
+        const ops = new LocalFleetOps(sb)
+        const store = stubStore(ops, sb)
+        await ops.dockFixture('idea01', KOLIBRI)
+        expect(store.docked.get(KOLIBRI)).toBe('idea01')
+        expect(fs.existsSync(`${sb.host('idea01').watch}/idea-test-8`)).toBe(true)
+
+        plantKolibriTree(sb, 'idea04', 'idea-test-9', 'real')
+        const ops4 = new LocalFleetOps(sb)
+        stubStore(ops4, sb)
+        await expect(ops4.dockFixture('idea04', KOLIBRI)).rejects.toThrow(/no duration-kolibri-grade5a-001 tree on idea04 .*idea-test-1\.\.8.*seed pack .* has no instance data/)
+    })
+
+    it('no tree on the target + seed pack without instance data → refuses a silent refresh-from-seed (no slot created)', async () => {
+        const ops = new LocalFleetOps(sb)
+        stubStore(ops, sb)
+        const err = await ops.dockFixture('idea03', KOLIBRI).then(() => null, e => e as Error)
+        expect(err?.message).toMatch(/Refusing a silent refresh-from-seed \(it would start kolibri-grade5a-001 without instances\/kolibri-grade5a-001\/data\/kolibri\/db\.sqlite3\)/)
+        expect(fs.readdirSync(sb.host('idea03').disks)).toEqual([])
+    })
+
+    it('dock-only smoke (no --start-instances): META-only Kolibri tree is still reused — instance data not required (regression)', async () => {
+        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'none')
+        const ops = new LocalFleetOps(sb, false)
+        const store = stubStore(ops, sb)
+        await ops.dockFixture('idea01', KOLIBRI)
+        expect(store.docked.get(KOLIBRI)).toBe('idea01')
+    })
+
+    it('empty pack keeps its always-fresh-copy dock (regression): seed copied, README stripped, sentinel fired', async () => {
+        const ops = new LocalFleetOps(sb)
+        const store = stubStore(ops, sb)
+        await ops.dockFixture('idea01', EMPTY)
+        expect(store.docked.get(EMPTY)).toBe('idea01')
+        expect(fs.readdirSync(`${sb.host('idea01').disks}/idea-test-3`).sort()).toEqual(['META.yaml'])
+        expect(fs.existsSync(`${sb.host('idea01').watch}/idea-test-3`)).toBe(true)
+    })
+
+    it('Nextcloud instance data: installed config.php + data/db required; unreadable config (no sudo) says NOT verified', () => {
+        const NC = 'duration-nextcloud-grade5a-001'
+        const spec = APP_PACK_INSTANCE_DATA[NC]!
+        const root = `${sb.host('idea01').disks}/idea-test-2`
+        const d = `${root}/instances/nextcloud-grade5a-001/data`
+        const check = () => parseInstanceDataCheck(execFileSync('bash', ['-c', buildInstanceDataCheckRemote({ root, spec, sudoMode: 'never' })]).toString())
+        fs.mkdirSync(`${root}/instances/nextcloud-grade5a-001`, { recursive: true })
+        expect(check()).toEqual({ ok: false, detail: expect.stringMatching(/data\/nextcloud .* not found or empty/) })
+        fs.mkdirSync(`${d}/nextcloud/config`, { recursive: true })
+        fs.writeFileSync(`${d}/nextcloud/config/config.php`, "<?php $CONFIG = array ('installed' => false);\n")
+        expect(check()).toEqual({ ok: false, detail: expect.stringMatching(/data\/db \(MariaDB datadir\) not found or empty/) })
+        fs.mkdirSync(`${d}/db/nextcloud`, { recursive: true })
+        expect(check()).toEqual({ ok: false, detail: expect.stringMatching(/has no 'installed' => true/) })
+        fs.writeFileSync(`${d}/nextcloud/config/config.php`, "<?php $CONFIG = array (\n  'installed' => true,\n);\n")
+        expect(check()).toEqual({ ok: true, detail: expect.stringMatching(/installed=true/) })
+        fs.chmodSync(`${d}/nextcloud/config/config.php`, 0o000)
+        try {
+            expect(check()).toEqual({ ok: true, detail: expect.stringMatching(/installed flag NOT verified/) })
+        } finally {
+            fs.chmodSync(`${d}/nextcloud/config/config.php`, 0o644)
+        }
+        fs.rmSync(`${d}/nextcloud/config/config.php`)
+        expect(check()).toEqual({ ok: false, detail: expect.stringMatching(/config\.php not found/) })
+    })
+
+    it('instance-data check: OK verdict names facility + Grade 5A; parse helpers', async () => {
+        const root = plantKolibriTree(sb, 'idea01', 'idea-test-1', 'symlink')
+        const out = execFileSync('bash', ['-c', buildInstanceDataCheckRemote({ root, spec: APP_PACK_INSTANCE_DATA[KOLIBRI]!, sudoMode: 'never' })]).toString()
+        expect(parseInstanceDataCheck(out)).toEqual({ ok: true, detail: expect.stringMatching(/^facility=Duration Tests Facility class=Grade 5A bytes=\d+$/) })
+        expect(KOLIBRI_GRADE5A_CLASS_NAME).toBe('Grade 5A')
+        expect(parseInstanceDataCheck('')).toMatchObject({ ok: false })
+        expect(sudoPreamble('auto')).toMatch(/sudo -n true/)
+        expect(sudoPreamble('never')).toBe(`S=''`)
+        const scan = parseFixtureSlotScan(execFileSync('bash', ['-c', buildFixtureSlotScanRemote(sb.host('idea01').disks, KOLIBRI)]).toString())
+        expect(scan).toHaveLength(8)
+        expect(scan[0]).toEqual({ device: 'idea-test-1', state: 'MATCH', mount: false })
+        expect(scan[1]).toEqual({ device: 'idea-test-2', state: 'FREE', mount: false })
+    })
+})
+
+describe('idea#168 r34@70: moveDisk carries the source disk\'s real tree (no fixture copy, no seed refresh)', () => {
+    it('(b) idea01→idea03: target gets the source DB byte-for-byte (same sha256, walk state kept), symlinked data materialized, source quarantined, docked on idea03', async () => {
+        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'symlink', { walkState: 'r34-steps-1-61:lesson+quiz+progress' })
+        const liveDb = `${sb.dir}/idea01/idea166-kolibri-live/data/kolibri/db.sqlite3`
+        const srcHash = sha256(liveDb)
+        // Busy idea03 slots: idea-test-1 another pack, idea-test-2 an unrelated dir.
+        fs.mkdirSync(`${sb.host('idea03').disks}/idea-test-1`, { recursive: true })
+        fs.writeFileSync(`${sb.host('idea03').disks}/idea-test-1/META.yaml`, 'diskId: duration-nextcloud-grade5a-001\n')
+        fs.mkdirSync(`${sb.host('idea03').disks}/idea-test-2`, { recursive: true })
+
+        const ops = new LocalFleetOps(sb)
+        const store = stubStore(ops, sb, { [KOLIBRI]: 'idea01' })
+        fs.writeFileSync(`${sb.host('idea01').watch}/idea-test-1`, '')
+        await ops.moveDisk('idea01', 'idea03', KOLIBRI)
+
+        const dst = `${sb.host('idea03').disks}/idea-test-3`
+        const dstDb = `${dst}/${DB_REL}`
+        expect(fs.lstatSync(`${dst}/instances/${KINST}/data/kolibri`).isDirectory()).toBe(true) // real dir, not a link
+        expect(fs.lstatSync(dstDb).isFile()).toBe(true)
+        expect(sha256(dstDb)).toBe(srcHash)
+        expect(readWalkState(dstDb)).toBe('r34-steps-1-61:lesson+quiz+progress')
+        expect(fs.readFileSync(`${dst}/instances/${KINST}/data/kolibri/content/storage/video.mp4`, 'utf8')).toBe('fake-mp4-bytes')
+        expect(fs.readFileSync(`${dst}/META.yaml`, 'utf8')).toContain(`diskId: ${KOLIBRI}`)
+        expect(fs.readFileSync(`${dst}/instances/${KINST}/.env`, 'utf8')).toBe('port=18080\n')
+        // Moved tree passes the Grade 5A precondition on the target.
+        const verdict = parseInstanceDataCheck(execFileSync('bash', ['-c', buildInstanceDataCheckRemote({ root: dst, spec: APP_PACK_INSTANCE_DATA[KOLIBRI]!, sudoMode: 'never' })]).toString())
+        expect(verdict.ok).toBe(true)
+        // Store: docked on the target; sentinel on idea03 only.
+        expect(store.docked.get(KOLIBRI)).toBe('idea03')
+        expect(fs.existsSync(`${sb.host('idea03').watch}/idea-test-3`)).toBe(true)
+        expect(fs.existsSync(`${sb.host('idea01').watch}/idea-test-1`)).toBe(false)
+        expect(store.calls.undock).toEqual([`idea01:${KOLIBRI}`])
+        // Source: the disk left idea01 — slot gone (quarantined), external live data untouched.
+        expect(fs.existsSync(`${sb.host('idea01').disks}/idea-test-1`)).toBe(false)
+        const moved = fs.readdirSync(`${sb.host('idea01').disks}/.moved-away`)
+        expect(moved).toHaveLength(1)
+        expect(moved[0]).toMatch(/^idea-test-1-duration-kolibri-grade5a-001-/)
+        expect(sha256(liveDb)).toBe(srcHash)
+        // No staging left; nothing came from the seed pack; no cp -a fixture copy.
+        expect(fs.readdirSync(sb.host('idea03').disks).filter(n => n.startsWith('.incoming'))).toEqual([])
+        expect([...ops.cmds.map(c => c.cmd), ...ops.relays.flatMap(r => [r.srcCmd, r.dstCmd])].some(c => c.includes(sb.SEED) || c.includes('cp -a'))).toBe(false)
+        expect(ops.relays.map(r => `${r.src}→${r.dst}`)).toEqual(['idea01→idea03', 'idea01→idea03'])
+    })
+
+    it('(b) target already holds a stale tree for the disk (the r34 idea03 idea-test-1) → LOUD before eject; source untouched', async () => {
+        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real')
+        plantKolibriTree(sb, 'idea03', 'idea-test-1', 'none')
+        const ops = new LocalFleetOps(sb)
+        const store = stubStore(ops, sb, { [KOLIBRI]: 'idea01' })
+        await expect(ops.moveDisk('idea01', 'idea03', KOLIBRI)).rejects.toThrow(
+            new RegExp(`target idea03 could not take ${KOLIBRI}: target idea03 \\(idea03\\) already holds a tree for ${KOLIBRI} at .*idea-test-1 \\(stale duplicate\\).*refusing to reuse or overwrite`),
+        )
+        expect(store.calls.undock).toEqual([])
+        expect(store.docked.get(KOLIBRI)).toBe('idea01')
+        expect(fs.existsSync(`${sb.host('idea01').disks}/idea-test-1/${DB_REL}`)).toBe(true)
+        expect(ops.relays).toEqual([])
+    })
+
+    it('(b) source tree is itself stale (META only) → LOUD before eject, no transfer', async () => {
+        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'none')
+        const ops = new LocalFleetOps(sb)
+        const store = stubStore(ops, sb, { [KOLIBRI]: 'idea01' })
+        await expect(ops.moveDisk('idea01', 'idea03', KOLIBRI)).rejects.toThrow(/refuse stale fixture tree idea01:.*idea-test-1.*db\.sqlite3 not found/)
+        expect(store.calls.undock).toEqual([])
+        expect(ops.relays).toEqual([])
+    })
+
+    it('(b) content mismatch after transfer → staging removed, source tree intact, LOUD; target never docked', async () => {
+        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real')
+        const ops = new LocalFleetOps(sb)
+        const store = stubStore(ops, sb, { [KOLIBRI]: 'idea01' })
+        ops.tamperAfterRelay = dst => {
+            const f = `${sb.host(dst).disks}/.incoming-idea-test-1-${KOLIBRI}/${DB_REL}`
+            if (fs.existsSync(f)) fs.appendFileSync(f, 'x')
+        }
+        await expect(ops.moveDisk('idea01', 'idea03', KOLIBRI)).rejects.toThrow(/content mismatch after transfer.*Staging idea03:.*removed; source tree left intact \(undocked\) at idea01:.*idea-test-1/)
+        expect(fs.readdirSync(sb.host('idea03').disks)).toEqual([])
+        expect(fs.existsSync(`${sb.host('idea01').disks}/idea-test-1/${DB_REL}`)).toBe(true)
+        expect(store.docked.get(KOLIBRI) ?? null).toBeNull()
+    })
+
+    it('dockFixture on another engine while the app disk is docked elsewhere carries the real tree (moveDisk), not a seed copy', async () => {
+        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real', { walkState: 'before-redock' })
+        const srcHash = sha256(`${sb.host('idea01').disks}/idea-test-1/${DB_REL}`)
+        const ops = new LocalFleetOps(sb)
+        const store = stubStore(ops, sb, { [KOLIBRI]: 'idea01' })
+        await ops.dockFixture('idea04', KOLIBRI)
+        expect(store.docked.get(KOLIBRI)).toBe('idea04')
+        const dstDb = `${sb.host('idea04').disks}/idea-test-1/${DB_REL}`
+        expect(sha256(dstDb)).toBe(srcHash)
+        expect(readWalkState(dstDb)).toBe('before-redock')
+    })
+
+    it('move plan / tar / quarantine builders: external links excluded from the main stream and materialized; mount points refused', async () => {
+        const root = plantKolibriTree(sb, 'idea01', 'idea-test-1', 'symlink')
+        const { buildMovePlanRemote } = await import('../duration/realFleetOps.js')
+        const plan = parseMovePlan(execFileSync('bash', ['-c', buildMovePlanRemote(root, 'never')]).toString())
+        expect(plan.error).toBeNull()
+        expect(plan.mountFsType).toBeNull()
+        expect(plan.instances).toEqual([KINST])
+        expect(plan.extLinks).toEqual([{ rel: `instances/${KINST}/data/kolibri`, target: `${sb.dir}/idea01/idea166-kolibri-live/data/kolibri` }])
+        expect(buildTreeSendRemote('/x/idea-test-1', [`instances/${KINST}/data/kolibri`], 'auto'))
+            .toMatch(/cd '\/x\/idea-test-1' && \$S tar --numeric-owner -cpf - --exclude='\.\/instances\/kolibri-grade5a-001\/data\/kolibri' \.$/)
+        expect(buildQuarantineSourceRemote('/x/idea-test-1', '/x/.moved-away/q')).toMatch(/refuse quarantine of mount point/)
+        expect(parseMovePlan('PLAN_END')).toMatchObject({ error: null })
+        expect(parseMovePlan('')).toMatchObject({ error: expect.stringMatching(/incomplete/) })
+    })
+})
