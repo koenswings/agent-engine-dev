@@ -16,7 +16,7 @@ import { log } from '../utils/utils.js'
 import { rsyncDirectory, rsyncInstanceData, rsyncToPeer, PeerEngine } from '../utils/rsync.js'
 import {
     instanceDataBytes, deleteInstanceData, deleteRemoteInstanceData, ensureRemoteDirs,
-    receiveAppArgs, receiveFilesArgs, receiveServiceArgs,
+    receiveAppArgs, receiveFilesArgs, receiveServiceArgs, putInstanceFiles,
 } from '../utils/appDataHelper.js'
 import { peerCopyRefusal, peerAccessProblem } from './PeerAccess.js'
 import {
@@ -347,16 +347,12 @@ export const copyApp = async (
             ? await instanceDirLooksLikeKolibri(instanceSrc)
             : await instanceDirLooksLikeKolibri(instanceDest)
         if (kolibriCopy) {
-            // Nested path under the instance folder; receive-files places named files
-            // at the instance root, so for peer we write a flat marker and rename is
-            // not available — write the full relative tree via a tiny staging dir of
-            // files listed with their paths... receive-files only stores basename.
-            // Local: write nested. Peer: write flat marker at instance root that
-            // runInstance also recognizes.
-            if (peer) {
-                const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-kolibri-rebind-'))
-                try {
-                    await fs.writeFile(`${tmp}/.idea-rebind-morango`, 'r40\n')
+            // Flat marker at instance root (receive-files / put-files place basenames).
+            // Peer: receive-files through the gate. Local: put-files as root (app-data policy).
+            const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-kolibri-rebind-'))
+            try {
+                await fs.writeFile(`${tmp}/.idea-rebind-morango`, 'r40\n')
+                if (peer) {
                     await rsyncToPeer(
                         [`${tmp}/.idea-rebind-morango`],
                         peer,
@@ -364,12 +360,11 @@ export const copyApp = async (
                         undefined,
                         opId,
                     )
-                } finally {
-                    await fs.remove(tmp).catch(() => undefined)
+                } else {
+                    await putInstanceFiles(targetRoot, newInstanceId, tmp)
                 }
-            } else {
-                await fs.ensureDir(`${instanceDest}/data/kolibri`)
-                await fs.writeFile(`${instanceDest}/data/kolibri/.idea-rebind-morango`, 'r40\n')
+            } finally {
+                await fs.remove(tmp).catch(() => undefined)
             }
             log(`copyApp: wrote Kolibri morango-rebind marker so start mints a fresh id (r40)`)
         }

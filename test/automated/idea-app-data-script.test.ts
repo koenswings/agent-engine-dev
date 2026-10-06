@@ -67,6 +67,7 @@ describe('idea-app-data: the source script (idea#168)', () => {
         expect(text).toMatch(/LOGGER -t idea-app-data -p auth\.notice/)
         expect(text).toMatch(/TEST-ONLY root bridge/)
         expect(text).toMatch(/erase-slot/)
+        expect(text).toMatch(/put-files/)
         expect(text).toMatch(/mkfs\.ext4/)
         expect(text).toMatch(/test-only root bridge: \$tok -> \$b/)
         expect(text).toMatch(/^ROOTS_FILE=\/etc\/idea\/app-data-roots$/m)
@@ -107,7 +108,7 @@ describe('idea-app-data: argument checks', () => {
         const cases: [string, number][] = [
             ['version', 0], ['size', 2], ['copy', 4], ['send', 6], ['delete', 2],
             ['borg-init', 2], ['borg-info', 2], ['borg-create', 4], ['borg-extract', 5],
-            ['ensure-dirs', 1], ['erase-slot', 2], ['peer-delete', 3], ['sync-peers', 0],
+            ['ensure-dirs', 1], ['erase-slot', 2], ['put-files', 3], ['peer-delete', 3], ['sync-peers', 0],
         ]
         for (const [sub, n] of cases) {
             for (const count of [n - 1, n + 1]) {
@@ -607,6 +608,44 @@ describe('idea-app-data: erase-slot (loop-backed duration fixtures)', () => {
         refused(await sb.run(['erase-slot', 'idea-test-4', staging], {
             FAKE_LOSETUP_BACKING: path.join(sb.tmp, 'x.img'),
         }), /holds the root filesystem/)
+    })
+})
+
+
+describe('idea-app-data: put-files (local Engine overlay into an instance)', () => {
+    it('copies basenames from a /tmp staging dir into the instance as root', async () => {
+        const root = await sb.addDisk('sdb1')
+        const inst = await sb.addInstance(root, 'inst1')
+        await fs.writeFile(path.join(inst, 'keep.txt'), 'keep')
+        const staging = await fs.mkdtemp('/tmp/idea-put-')
+        await fs.writeFile(path.join(staging, '.idea-rebind-morango'), 'r40\n')
+        await fs.writeFile(path.join(staging, 'extra.yaml'), 'x: 1\n')
+        const r = await sb.run(['put-files', 'sdb1', 'inst1', staging])
+        expect(r.exitCode, r.stderr + r.stdout).toBe(0)
+        expect(await fs.readFile(path.join(inst, '.idea-rebind-morango'), 'utf8')).toBe('r40\n')
+        expect(await fs.readFile(path.join(inst, 'extra.yaml'), 'utf8')).toBe('x: 1\n')
+        expect(await fs.readFile(path.join(inst, 'keep.txt'), 'utf8')).toBe('keep')
+        await fs.remove(staging)
+    })
+
+    it('refuses staging outside /tmp, empty staging, and a missing instance', async () => {
+        const root = await sb.addDisk('sdb1')
+        await sb.addInstance(root, 'inst1')
+        const outsideAbs = '/var/tmp/idea-put-outside-' + Date.now()
+        await fs.ensureDir(outsideAbs)
+        await fs.writeFile(path.join(outsideAbs, 'a'), 'x')
+        try {
+            refused(await sb.run(['put-files', 'sdb1', 'inst1', outsideAbs]), /under \/tmp/)
+        } finally {
+            await fs.remove(outsideAbs)
+        }
+        const empty = await fs.mkdtemp('/tmp/idea-put-empty-')
+        refused(await sb.run(['put-files', 'sdb1', 'inst1', empty]), /empty/)
+        await fs.remove(empty)
+        const staging = await fs.mkdtemp('/tmp/idea-put-')
+        await fs.writeFile(path.join(staging, 'a'), 'x')
+        refused(await sb.run(['put-files', 'sdb1', 'missing', staging]), /instance folder/)
+        await fs.remove(staging)
     })
 })
 

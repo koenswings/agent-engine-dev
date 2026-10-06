@@ -22,7 +22,7 @@ import {
     borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, appDataSudoArgv, remoteDeleteSshArgs,
     runAppData, appDataErrorMessage, appDataHelperProblem, assertAppDataHelper,
     instanceDataBytes, deleteInstanceData, deleteRemoteInstanceData,
-    remoteEnsureDirsSshArgs, ensureDirsArgs, receiveAppArgs, receiveServiceArgs, receiveFilesArgs,
+    remoteEnsureDirsSshArgs, ensureDirsArgs, receiveAppArgs, receiveServiceArgs, receiveFilesArgs, putFilesArgs,
     remoteHelperCommand, remoteHelperRsyncPath, runAppDataWithInput,
 } from '../../src/utils/appDataHelper.js'
 import { peerSshOptions } from '../../src/utils/peerSsh.js'
@@ -90,6 +90,8 @@ describe('helper argv builders', () => {
         expect(receiveAppArgs('sdb1', 'kolibri-1.0')).toEqual(['receive-app', 'sdb1', 'kolibri-1.0'])
         expect(receiveServiceArgs('idea-test-2')).toEqual(['receive-service', 'idea-test-2'])
         expect(receiveFilesArgs('sdb1', 'new1')).toEqual(['receive-files', 'sdb1', 'new1'])
+        expect(putFilesArgs('sdb1', 'new1', '/tmp/idea-put-xyz')).toEqual(['put-files', 'sdb1', 'new1', '/tmp/idea-put-xyz'])
+        expect(() => putFilesArgs('sdb1', 'new1', '/var/tmp/x')).toThrow(/under \/tmp/)
         expect(remoteHelperCommand(['version'])).toEqual(['sudo', '-n', '/usr/local/sbin/idea-app-data', 'version'])
         expect(remoteHelperRsyncPath(receiveAppArgs('sdb1', 'kolibri-1.0'))).toBe('sudo -n /usr/local/sbin/idea-app-data receive-app sdb1 kolibri-1.0')
         expect(deleteArgs('sdb2', 'x')).toEqual(['delete', 'sdb2', 'x'])

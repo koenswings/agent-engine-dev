@@ -50,6 +50,7 @@ vi.mock('../../src/utils/appDataHelper.js', async (importOriginal) => {
         instanceDataBytes: vi.fn(async () => 100 * 1024 * 1024),
         deleteInstanceData: vi.fn(async () => undefined),
         deleteRemoteInstanceData: vi.fn(async () => undefined),
+        putInstanceFiles: vi.fn(async () => undefined),
     }
 })
 
