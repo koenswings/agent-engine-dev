@@ -174,16 +174,16 @@ pnpm test:duration -- --live --scenario unified --fast \
 
 1. Creates `<dir>` if needed.
 2. After each **UI** Intent (and any step with a live Playwright page), writes `step-NNNN-<action>.png`.
-3. Soft-detect Pixel capture (aligned Console#134 @ `ba0cfa1`):
-   1. Pass `screenshotPath` into `runDurationIntent` (Pixel may settle + write PNG once)
-   2. Soft-detect `bridge.captureAfterIntent(page, { path, intent })` — **skip if PNG already exists** (no second capture)
-   3. Else fallback `page.screenshot({ path, fullPage: true })`
+3. Each frame comes from the **active tab** (`ui/activeTab.ts`): the newest App tab or popup the Intent opened (Kolibri, Nextcloud, Wikipedia), or the page last brought to front; closing an App tab falls back to the tab before it (normally the Console). `screenshotPath` is no longer passed to `runDurationIntent`, because Pixel would capture the Console page it was handed.
+   1. **Skip if the PNG already exists** (one frame per step)
+   2. Soft-detect `bridge.captureAfterIntent(activeTab, { path, intent })` (Pixel settle + viewport PNG)
+   3. Else fallback `activeTab.screenshot({ path, fullPage: true })`
 4. At walk end (success or abort): `ffmpeg` → `walk.mp4` in `<dir>`. Logs `record_walk_frame` / `record_walk_video` / `record_walk_skip`.
 5. Without `--ui`: Fake Stub logs `record_walk_skip` per UI step (flag dry-run); no PNGs → skip video.
 
 ffmpeg on this box: `/usr/bin/ffmpeg`.
 
-**Caveat:** `--record-walk` frames often show the Console Apps page, not the Kolibri tab — the recorder does not follow app tabs. Do not trust screenshots alone for Kolibri steps; prefer Intent `ok` / structured logs. Live Kolibri smokes need Console@`4f7cfba`+ (click-mask wait).
+**Caveat:** frames show what the active tab looks like; pass/fail still comes from Intent `ok` and the structured logs, not from screenshots. Live Kolibri smokes need Console@`4f7cfba`+ (click-mask wait).
 
 ### Live caveats
 
