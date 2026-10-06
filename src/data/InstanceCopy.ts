@@ -13,10 +13,14 @@
  *    so startInstance allocates a fresh, store-checked port for the copy.
  *  - setComposeInstanceName: write the copy's name into compose.yaml
  *    `x-app.instanceName`, which createOrUpdateInstance stores.
+ *  - rebindKolibriMorangoInstanceId: give a Kolibri copy its own morango
+ *    instance id so host-network zeroconf does not NonUniqueNameException
+ *    when the original and the copy both advertise (r40 FAIL@102).
  */
 
 import path from 'path'
-import { fs, chalk } from 'zx'
+import crypto from 'crypto'
+import { fs, chalk, $ } from 'zx'
 import { parseDocument } from 'yaml'
 import { log } from '../utils/utils.js'
 import type { Store } from './Store.js'
@@ -174,4 +178,69 @@ export const preparedCopyFiles = async (
     const env = await read('.env')
     if (typeof env === 'string') out['.env'] = clearEnginePort(env)
     return out
+}
+
+// ── Kolibri morango identity on copy (r40) ────────────────────────────────────
+
+/**
+ * Kolibri 0.15 zeroconf registers with the current morango InstanceIDModel id.
+ * copyApp clones the SQLite home, so the copy keeps the original's id. Two
+ * host-network Kolibris on the same LAN then hit NonUniqueNameException, the
+ * bus exits, and `start && tail -f` leaves Docker "Up" with nothing on the port
+ * (r40 FAIL@102 move_app). Mint a fresh 32-hex id for the copy's current row
+ * before the copy starts. mDNS itself stays on (Koen rule) — only the service
+ * instance id changes.
+ *
+ * No-op when the folder is not a Kolibri home or has no current row. Throws when
+ * the DB exists but cannot be updated.
+ */
+export const rebindKolibriMorangoInstanceId = async (instanceDir: string): Promise<string | null> => {
+    const dbPath = path.join(instanceDir, 'data', 'kolibri', 'db.sqlite3')
+    if (!(await fs.pathExists(dbPath))) return null
+
+    const newId = crypto.randomBytes(16).toString('hex')
+    // Stale pid/cache from the source must not convince Kolibri it is already up.
+    for (const rel of ['data/kolibri/server.pid', 'data/kolibri/process_cache']) {
+        try { await fs.remove(path.join(instanceDir, rel)) } catch { /* ignore */ }
+    }
+
+    // python3 + stdlib sqlite3 (no better-sqlite3 dependency on the Engine host).
+    const script =
+        'import sqlite3,sys\n' +
+        'db,new_id=sys.argv[1],sys.argv[2]\n' +
+        'c=sqlite3.connect(db)\n' +
+        "row=c.execute('select id from morango_instanceidmodel where current=1').fetchone()\n" +
+        'if not row:\n' +
+        " print('none'); c.close(); raise SystemExit(0)\n" +
+        "c.execute('update morango_instanceidmodel set id=? where current=1',(new_id,))\n" +
+        'c.commit(); c.close(); print(new_id)\n'
+
+    let result
+    try {
+        result = await $`python3 -c ${script} ${dbPath} ${newId}`.quiet()
+    } catch (e: any) {
+        const msg = (e?.stderr?.toString?.() || e?.message || String(e)).trim()
+        throw new Error(
+            `rebindKolibriMorangoInstanceId: cannot update ${dbPath}: ${msg}. ` +
+            `Without a fresh morango id, a host-network Kolibri copy will clash with the original on zeroconf.`,
+        )
+    }
+    const out = (result.stdout || '').trim()
+    if (out === 'none' || !out) {
+        log(`rebindKolibriMorangoInstanceId: no current morango row in ${dbPath}; leaving as-is`)
+        return null
+    }
+    log(`rebindKolibriMorangoInstanceId: ${dbPath} current id → ${out}`)
+    return out
+}
+
+/** True when this instance folder looks like Kolibri (data home or compose). */
+export const instanceDirLooksLikeKolibri = async (instanceDir: string): Promise<boolean> => {
+    if (await fs.pathExists(path.join(instanceDir, 'data', 'kolibri', 'db.sqlite3'))) return true
+    try {
+        const raw = await fs.readFile(path.join(instanceDir, 'compose.yaml'), 'utf8')
+        return /kolibri/i.test(raw)
+    } catch {
+        return false
+    }
 }

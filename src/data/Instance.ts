@@ -1,7 +1,7 @@
 import { $, YAML, chalk, fs, os, sleep } from "zx";
 
 $.verbose = false;
-import { addOrUpdateEnvVariable, deepPrint, log, randomPort, readEnvVariable, uuid, print } from "../utils/utils.js";
+import { addOrUpdateEnvVariable, deepPrint, log, randomPort, readEnvVariable, uuid, print, isEngineOnline } from "../utils/utils.js";
 import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber, ServiceImage, Timestamp, Version, DeviceName, InstanceName, AppName, Hostname, DiskID, OperationCause } from "./CommonTypes.js";
 import { createOperation, updateOperation } from './Operations.js'
 import { composeFileEnv } from './FilesMount.js'
@@ -17,6 +17,7 @@ import { DocHandle } from "@automerge/automerge-repo";
 import { CommandLogStore, LogEntry, getCommandLogHandle, addTrace, closeTrace, flushLogs } from './CommandLogStore.js'
 import { getActiveTrace, flushTrace } from '../utils/CommandLogger.js'
 import { dockerAvailable } from '../utils/dockerAvailable.js'
+import { rebindKolibriMorangoInstanceId } from './InstanceCopy.js'
 
 // ── Step-progress helpers ─────────────────────────────────────────────────────
 
@@ -650,6 +651,93 @@ export const assertComposeContainersHealthy = async (instanceDir: string, instan
   )
 }
 
+
+/**
+ * Prefer A r40: after compose up, require the instance host port to accept TCP
+ * for a short stable window before Automerge Running. Covers the Kolibri
+ * `start && tail -f` pattern where ZeroConfPlugin dies (~8s) but Docker stays
+ * Up (r40 FAIL@102). When the port stays dead, force-recreate once and
+ * re-probe; still dead → throw (startInstance marks Error).
+ */
+export const assertInstancePortReady = async (
+  instanceId: InstanceID,
+  port: number,
+  instanceDir: string,
+  opts: { readyTimeoutMs?: number; stableMs?: number; forceRecreate?: boolean } = {},
+): Promise<void> => {
+  if (!port || !Number.isFinite(port) || port <= 0) {
+    log(`assertInstancePortReady: no port for ${instanceId}; skipping sidecar probe`)
+    return
+  }
+  const readyTimeoutMs = opts.readyTimeoutMs ?? 60_000
+  const stableMs = opts.stableMs ?? 10_000
+  const forceRecreate = opts.forceRecreate !== false
+
+  const probeStable = async (budgetMs: number): Promise<boolean> => {
+    const deadline = Date.now() + budgetMs
+    let firstReadyAt: number | null = null
+    while (Date.now() < deadline) {
+      const up = await isEngineOnline('127.0.0.1', port)
+      if (up) {
+        if (firstReadyAt === null) firstReadyAt = Date.now()
+        else if (Date.now() - firstReadyAt >= stableMs) return true
+      } else {
+        firstReadyAt = null
+      }
+      await sleep(1000)
+    }
+    return false
+  }
+
+  if (await probeStable(readyTimeoutMs)) {
+    log(`assertInstancePortReady: ${instanceId} :${port} stable for ${stableMs}ms`)
+    return
+  }
+
+  if (forceRecreate) {
+    log(`assertInstancePortReady: ${instanceId} :${port} not ready — force-recreate once (r40/r22)`)
+    try {
+      await $({ cwd: instanceDir } as any)`docker compose up -d --force-recreate`
+    } catch (e: any) {
+      log(`assertInstancePortReady: force-recreate failed: ${e?.message ?? e}`)
+    }
+    await assertComposeContainersHealthy(instanceDir, instanceId)
+    if (await probeStable(readyTimeoutMs)) {
+      log(`assertInstancePortReady: ${instanceId} :${port} stable after force-recreate`)
+      return
+    }
+  }
+
+  // Pull a short log tail to surface ZeroConf / NonUniqueNameException in the Error.
+  let hint = ''
+  try {
+    const format = '{{.Names}}'
+    const r = await $`docker ps -a --filter name=${instanceId} --format ${format}`.quiet()
+    const name = (r.stdout || '').trim().split('\n').filter(Boolean)[0]
+    if (name) {
+      const lr = await $`docker logs --tail 40 ${name}`.quiet()
+      const logs = `${lr.stdout || ''}${lr.stderr || ''}`
+      const m = logs.match(/NonUniqueNameException|ZeroConfPlugin|AttributeError.*name|START_ERROR|Bus state: EXITED/i)
+      if (m) hint = ` Last logs mention: ${m[0]}.`
+      // Also try kolibri.txt inside the container when present.
+      try {
+        const kt = await $`docker exec ${name} tail -n 30 /root/.kolibri/logs/kolibri.txt`.quiet()
+        const klogs = `${kt.stdout || ''}`
+        const km = klogs.match(/NonUniqueNameException|ZeroConfPlugin|AttributeError.*name|START_ERROR/i)
+        if (km) hint = ` Kolibri logs: ${km[0]}.`
+      } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
+
+  throw new Error(
+    `Instance ${instanceId} container is up but host port ${port} never stayed ready ` +
+    `for ${stableMs}ms within ${readyTimeoutMs}ms (and after one force-recreate). ` +
+    `Automerge must not stay Running with a dead sidecar.${hint} ` +
+    `If this is Kolibri after copyApp, the copy likely still shares the original morango ` +
+    `instance id (zeroconf NonUniqueNameException); see rebindKolibriMorangoInstanceId.`,
+  )
+}
+
 export const createPortNumber = async (store: Store): Promise<PortNumber> => {
   let port = randomPort()
   let portInUse = true
@@ -1237,6 +1325,26 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
   }
   if (!stillStartable('before compose up')) return
 
+  // r40: Kolibri copyApp leaves .idea-rebind-morango so we mint a fresh morango
+  // instance id before the first advertise (zeroconf NonUniqueNameException).
+  {
+    const home = `${mountRoot}/instances/${instance.id}`
+    const markers = [
+      `${home}/data/kolibri/.idea-rebind-morango`,
+      `${home}/.idea-rebind-morango`,
+    ]
+    const hit: string[] = []
+    for (const m of markers) { if (await fs.pathExists(m)) hit.push(m) }
+    if (hit.length) {
+      try {
+        await rebindKolibriMorangoInstanceId(home)
+        for (const m of hit) await fs.remove(m).catch(() => undefined)
+      } catch (e: any) {
+        throw new Error(`Kolibri morango rebind before start failed: ${e?.message ?? e}`)
+      }
+    }
+  }
+
   // Compose up the app. A failure throws and the instance never becomes Running.
   // Opted-in Apps get COMPOSE_FILE=compose.yaml:<override> (idea#133).
   let mountedDiskIds: DiskID[] | null = null
@@ -1248,6 +1356,14 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
     await $(upOpts)`docker compose up -d`
     // Prefer A r30: fail loud if host-net process Exits immediately (port occupied, etc.)
     await assertComposeContainersHealthy(`${mountRoot}/instances/${instance.id}`, instance.id)
+    // Prefer A r40: container Up is not enough (Kolibri start&&tail; ZeroConf death).
+    const readyPort = storeHandle.doc()?.instanceDB?.[instance.id]?.port
+      ?? (port && !isNaN(parseInt(port)) ? parseInt(port) : 0)
+    await assertInstancePortReady(
+      instance.id,
+      Number(readyPort) || 0,
+      `${mountRoot}/instances/${instance.id}`,
+    )
     if (composeEnv) {
       // filesMounts only after success — read back from the override we just wrote
       const { mountableFilesDisks } = await import('./FilesMount.js')
