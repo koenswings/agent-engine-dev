@@ -417,13 +417,17 @@ export const resolveConsoleEngineHost = (
     )
 }
 
-const redockEmpty002Fresh = (
+const redockEmpty002Fresh = async (
     ctx: ActionContext,
     label: string,
     noteSuffix: string,
     opts?: { purgeStoreInstances?: boolean },
-): Promise<string> =>
-    redockEmptyFresh(ctx, DURATION_UI_FIXTURES.empty2.diskId, label, noteSuffix, opts)
+): Promise<string> => {
+    const note = await redockEmptyFresh(ctx, DURATION_UI_FIXTURES.empty2.diskId, label, noteSuffix, opts)
+    // idea#168: empty-002 is a fresh Empty pack again.
+    ctx.walker.empty002HoldsApp = false
+    return note
+}
 
 /**
  * Prefer A r26/r27 live safety net: Path A confirm_erase of empty-002 undocks
@@ -442,7 +446,9 @@ export const redockEmpty002AfterErase = async (ctx: ActionContext): Promise<stri
  * is backup). Mirror AfterErase undock+dockFixture, PLUS purgeStoreInstances (r36):
  * Automerge instanceDB rows with storedOn=empty-002 survive FS wipe; Console
  * hasInstancesOn keys off store (AfterErase does not need this — erase cleared
- * instances). Hooked after open_copied_instance.
+ * instances). idea#168: hooked BEFORE install_app whenever walker.empty002HoldsApp
+ * (set by a successful start_after_install, cleared by any empty-002 re-dock) — no
+ * longer tied to open_copied_instance, so cover-all-skip-copy gets it too.
  */
 export const redockEmpty002BeforeSecondInstall = async (ctx: ActionContext): Promise<string> =>
     redockEmpty002Fresh(
@@ -2520,6 +2526,23 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
         instanceId = undefined
     }
     let preStartSettleNote: string | null = null
+    // Prefer A r35 → idea#168: before an install_app while empty-002 still holds the app a
+    // previous start_after_install left there, re-dock empty-002 Empty (+ store purge) so the
+    // Console offers EmptyDiskPanel again (empty-001 is the backup disk by then). Used to hang
+    // off open_copied_instance (cover-all @117); now keyed on the real precondition so
+    // cover-all (@119) and cover-all-skip-copy (@116) both get it before the second install.
+    if (ctx.action === 'install_app' && ctx.walker.empty002HoldsApp) {
+        try {
+            preStartSettleNote = await redockEmpty002BeforeSecondInstall(ctx)
+        } catch (e) {
+            const err = e instanceof Error ? e.message : String(e)
+            return {
+                ok: false,
+                message: `install_app aborted before Intent: empty-002 re-dock failed: ${err}`,
+                layer,
+            }
+        }
+    }
     // Prefer A r32: settle empty-002 auto-start before start_after_install Intent.
     if (ctx.action === 'start_after_install') {
         try {
@@ -2825,20 +2848,12 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             }
         }
     }
-    // Prefer A r35: after open_copied_instance, re-dock empty-002 Empty before second
-    // late install_app (start_after_install left empty-002 as app disk; empty-001 is backup).
-    if (result.ok && ctx.action === 'open_copied_instance') {
-        try {
-            const note = await redockEmpty002BeforeSecondInstall(ctx)
-            message = `${message}; ${note}`
-        } catch (e) {
-            const err = e instanceof Error ? e.message : String(e)
-            return {
-                ok: false,
-                message: `open_copied_instance ok but empty-002 re-dock failed: ${err}`,
-                layer,
-            }
-        }
+    // idea#168: start_after_install left a running app on empty-002 (late install).
+    // The next install_app re-docks empty-002 Empty first (redockEmpty002BeforeSecondInstall,
+    // pre-Intent hook above) — works with or without copy_app/open_copied_instance.
+    if (result.ok && ctx.action === 'start_after_install') {
+        ctx.walker.empty002HoldsApp = true
+        message = `${message}; empty-002 now holds the late-installed app (next install_app re-docks it Empty)`
     }
     // Prefer A r37: after stay_on_disk (precedes late erase), re-dock empty-002 Empty
     // before erase_disk (second late install_app left empty-002 as app disk again).

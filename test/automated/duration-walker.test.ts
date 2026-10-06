@@ -30,7 +30,18 @@ import {
     resolveScenarioName,
     resolveWalkName,
     WALK_ALIASES,
+    parentStepFor,
+    validateWalkEdges,
 } from '../duration/scenario.js'
+import {
+    buildRunSummary,
+    formatRunSummaryLine,
+    KeepEditingRecoveryCounter,
+    parseKeepEditingRecovery,
+    shakeOutSummary,
+    stepNumbers,
+    tapStdoutLines,
+} from '../duration/runSummary.js'
 import { resolveWalkStartIndex, runDeterministicWalk, runWalk } from '../duration/runner.js'
 import type { Scenario, SemanticStoreView } from '../duration/types.js'
 import {
@@ -60,10 +71,10 @@ import {
     sanitizeActionForFilename,
 } from '../duration/recordWalk.js'
 import { consoleEngineOnline } from '../duration/ui/playwrightDriver.js'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 const unifiedScenario = (): Scenario => loadScenario('unified')
 
@@ -1794,49 +1805,129 @@ describe('Prefer A empty-002 re-dock before second late install (Fake)', () => {
         expect(view.diskDB['duration-empty-002']?.dockedTo).toBe('idea01')
     })
 
-    it('dispatchAction open_copied_instance re-docks empty-002 via StubUiDriver', async () => {
-        const ops = fakeOps({
-            poolEngines: ['idea01', 'idea03'],
-            excludeEngines: ['idea02'],
-            storeMode: 'shared',
-        })
-        // Simulate r35 post-start_after_install: empty-002 present but as app disk —
-        // force undock+fresh dock still runs via helper.
+    // idea#168: the hook moved off open_copied_instance onto install_app, keyed on
+    // walker.empty002HoldsApp (set by start_after_install, cleared by any empty-002 re-dock).
+    const hookCtx = (ops: FakeFleetOps, driver: StubUiDriver, action: string, walker: Record<string, unknown>) => ({
+        opts: { ops, rng: () => 0, settleTimeoutMs: 500, fast: true, stubUi: true, uiDriver: driver },
+        walker: { current: 'op_disk', layer: 'operator', dockedEngine: 'idea01', step: 118, ...walker } as {
+            current: string; layer: string; dockedEngine: string; step: number; empty002HoldsApp?: boolean
+        },
+        from: 'op_disk',
+        to: 'op_install',
+        action,
+        excludeEngines: ['idea02'],
+        poolEngines: ['idea01', 'idea03'],
+        fixtureDisk: 'duration-kolibri-grade5a-001',
+        fixtureInstance: 'kolibri-grade5a-001',
+        fixtureDisks: [
+            'duration-kolibri-grade5a-001',
+            'duration-nextcloud-grade5a-001',
+            'duration-empty-001',
+            'duration-empty-002',
+        ],
+        fixtureInstances: { ...KID_FIXTURES },
+    })
+
+    it('open_copied_instance no longer re-docks empty-002 (idea#168)', async () => {
+        const ops = fakeOps({ poolEngines: ['idea01', 'idea03'], excludeEngines: ['idea02'], storeMode: 'shared' })
+        const driver = new StubUiDriver()
+        const ctx = hookCtx(ops, driver, 'open_copied_instance', { current: 'op_copy_move', empty002HoldsApp: true })
+        const result = await dispatchAction({ ...ctx, from: 'op_copy_move', to: 'op_instance' } as any)
+        expect(result.ok).toBe(true)
+        expect(driver.calls).toContain('open_copied_instance')
+        expect(result.message).not.toMatch(/re-docked duration-empty-002/)
+        expect(ctx.walker.empty002HoldsApp).toBe(true)
+    })
+
+    it('start_after_install marks empty-002 as holding the app; next install_app re-docks it BEFORE the Intent and clears the mark', async () => {
+        const ops = fakeOps({ poolEngines: ['idea01', 'idea03'], excludeEngines: ['idea02'], storeMode: 'shared' })
         await ops.dockFixture('idea01', 'duration-empty-002')
         const driver = new StubUiDriver()
-        const result = await dispatchAction({
-            opts: {
-                ops,
-                rng: () => 0,
-                settleTimeoutMs: 500,
-                fast: true,
-                stubUi: true,
-                uiDriver: driver,
-            },
-            walker: { current: 'op_copy_move', layer: 'operator', dockedEngine: 'idea01', step: 88 },
-            from: 'op_copy_move',
-            to: 'op_instance',
-            action: 'open_copied_instance',
-            excludeEngines: ['idea02'],
-            poolEngines: ['idea01', 'idea03'],
-            fixtureDisk: 'duration-kolibri-grade5a-001',
-            fixtureInstance: 'kolibri-grade5a-001',
-            fixtureDisks: [
-                'duration-kolibri-grade5a-001',
-                'duration-nextcloud-grade5a-001',
-                'duration-empty-001',
-                'duration-empty-002',
-            ],
-            fixtureInstances: { ...KID_FIXTURES },
-        } as any)
-        expect(result.ok).toBe(true)
-        expect(result.message).toMatch(/re-docked duration-empty-002/)
-        expect(result.message).toMatch(/before second late install_app/)
-        expect(driver.calls).toContain('open_copied_instance')
+        const sai = hookCtx(ops, driver, 'start_after_install', { current: 'op_install' })
+        const r1 = await dispatchAction({ ...sai, from: 'op_install', to: 'op_instance' } as any)
+        expect(r1.ok, r1.message).toBe(true)
+        expect(sai.walker.empty002HoldsApp).toBe(true)
+        expect(r1.message).toMatch(/empty-002 now holds the late-installed app/)
+
+        const order: string[] = []
+        const origUndock = ops.undockFixtures.bind(ops)
+        ;(ops as any).undockFixtures = async (e: string[], d: string) => { order.push(`undock:${d}`); return origUndock(e, d) }
+        const origPurge = ops.purgeInstancesStoredOn.bind(ops)
+        ;(ops as any).purgeInstancesStoredOn = async (e: string, d: string) => { order.push(`purge:${d}`); return origPurge(e, d) }
+        const origRun = driver.runIntent.bind(driver)
+        ;(driver as any).runIntent = async (...a: any[]) => { order.push(`intent:${a[0]?.action ?? a[0]}`); return (origRun as any)(...a) }
+        const ia = hookCtx(ops, driver, 'install_app', { empty002HoldsApp: true })
+        const r2 = await dispatchAction(ia as any)
+        expect(r2.ok, r2.message).toBe(true)
+        expect(r2.message).toMatch(/re-docked duration-empty-002 on idea01 before second late install_app \(Empty fresh pack \+ store purge\)/)
+        expect(ia.walker.empty002HoldsApp).toBe(false)
+        // re-dock (undock + purge) happens before the install_app Intent
+        const intentAt = order.findIndex(o => o.startsWith('intent:'))
+        expect(order.indexOf('undock:duration-empty-002')).toBeGreaterThanOrEqual(0)
+        expect(order.indexOf('purge:duration-empty-002')).toBeGreaterThanOrEqual(0)
+        expect(intentAt).toBeGreaterThan(-1)
+        expect(order.indexOf('purge:duration-empty-002')).toBeLessThan(intentAt)
+        expect(order.indexOf('undock:duration-empty-002')).toBeLessThan(intentAt)
+        expect(driver.calls).toContain('install_app')
         const view = await ops.readStore('idea01')
         expect(view.diskDB['duration-empty-002']?.dockedTo).toBe('idea01')
         expect(DURATION_UI_FIXTURES.empty.diskId).toBe('duration-empty-001')
         expect(DURATION_UI_FIXTURES.empty2.diskId).toBe('duration-empty-002')
+    })
+
+    it('install_app without the mark (first / post-erase install) does not re-dock empty-002', async () => {
+        const ops = fakeOps({ poolEngines: ['idea01', 'idea03'], excludeEngines: ['idea02'], storeMode: 'shared' })
+        const driver = new StubUiDriver()
+        for (const walker of [{}, { empty002HoldsApp: false }]) {
+            const ctx = hookCtx(ops, driver, 'install_app', walker)
+            const r = await dispatchAction(ctx as any)
+            expect(r.ok, r.message).toBe(true)
+            expect(r.message).not.toMatch(/re-docked duration-empty-002/)
+        }
+    })
+
+    it('install_app fails loud before the Intent when the empty-002 re-dock fails', async () => {
+        const ops = fakeOps({ poolEngines: ['idea01', 'idea03'], excludeEngines: ['idea02'], storeMode: 'shared' })
+        ;(ops as any).purgeInstancesStoredOn = async () => { throw new Error('purge boom') }
+        const driver = new StubUiDriver()
+        const ctx = hookCtx(ops, driver, 'install_app', { empty002HoldsApp: true })
+        const r = await dispatchAction(ctx as any)
+        expect(r.ok).toBe(false)
+        expect(r.message).toBe('install_app aborted before Intent: empty-002 re-dock failed: purge boom')
+        expect(driver.calls).not.toContain('install_app')
+        expect(ctx.walker.empty002HoldsApp).toBe(true)
+    })
+
+    it('fires once per walk, right before the second late install_app, in cover-all, cover-all-skip-copy and cover-registered-intents', async () => {
+        const expected: Record<string, { step: number; parent?: number }> = {
+            'cover-all': { step: 119 },
+            'cover-all-skip-copy': { step: 116, parent: 119 },
+            'cover-registered-intents': { step: 93 },
+        }
+        for (const [name, want] of Object.entries(expected)) {
+            const walk = loadWalk(name)
+            const ops = fakeOps({ poolEngines: [...DEFAULT_POOL], excludeEngines: ['idea02'], storeMode: 'shared', settleDelayMs: 0 })
+            const logs: { step: number; action: string; message?: string }[] = []
+            const result = await runDeterministicWalk(walk, {
+                fast: true,
+                ops,
+                stubUi: true,
+                uiDriver: new StubUiDriver(),
+                skipStability: true,
+                settleTimeoutMs: 500,
+                onLog: e => logs.push({ step: e.step, action: e.action, message: e.message }),
+            })
+            expect(result.failures, name).toBe(0)
+            expect(result.aborted, `${name}: ${result.abortReason}`).toBe(false)
+            const fired = logs.filter(l => /before second late install_app/.test(l.message ?? ''))
+            expect(fired.map(l => [l.step, l.action]), name).toEqual([[want.step, 'install_app']])
+            const prev = logs.filter(l => l.step < want.step && /install_app|start_after_install/.test(l.action)).map(l => l.action)
+            expect(prev.at(-1), name).toBe('start_after_install')
+            if (want.parent) expect(parentStepFor(walk, want.step), name).toBe(want.parent)
+            // stay_on_disk BeforeErase + confirm_erase AfterErase hooks are unchanged
+            expect(logs.filter(l => /before late erase_disk/.test(l.message ?? '')).map(l => l.action), name).toEqual(['stay_on_disk'])
+            expect(logs.filter(l => /after confirm_erase \(Empty fresh pack\)/.test(l.message ?? '')).map(l => l.action), name).toEqual(['confirm_erase'])
+        }
     })
 })
 
@@ -3407,5 +3498,236 @@ describe('r30: reboot_engine must really reboot (lastBooted advances, queue drai
         expect(consoleEngineOnline(rows, true, 'idea03').detail).toMatch(/engine row engine-ENGINE_b \(idea03\.local\) offline/)
         expect(consoleEngineOnline(rows, true, 'idea04').detail).toMatch(/no engine row labelled idea04/)
         expect(consoleEngineOnline(rows, false, 'idea01').detail).toMatch(/status bar not connected/)
+    })
+})
+
+
+describe('idea#168 cover-all-skip-copy SHAKE-OUT walk', () => {
+    const HEADER =
+        '# SHAKE-OUT variant (idea#168): skips copy_app @43/@116 and open_copied_instance @117 until the root-owned app-data copy bug (design-root-helper.md) is decided. NOT a cover-all attempt.'
+    const walkFile = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'test', 'duration', 'walks', 'cover-all-skip-copy.yaml')
+
+    it('file starts with the verbatim SHAKE-OUT header and is a walk on unified', () => {
+        const text = readFileSync(walkFile, 'utf8')
+        expect(text.split('\n')[0]).toBe(HEADER)
+        expect(isWalkScenario('cover-all-skip-copy')).toBe(true)
+        const w = loadWalk('cover-all-skip-copy')
+        expect(w.name).toBe('cover-all-skip-copy')
+        expect(w.graph).toBe('unified')
+        expect(w.steps).toHaveLength(125)
+    })
+
+    it('every step is an EXISTING unified.yaml edge, continuous from start (independent check)', () => {
+        const w = loadWalk('cover-all-skip-copy')
+        const unified = loadScenario('unified')
+        let cur = unified.initial_state
+        w.steps.forEach((st, i) => {
+            expect(st.from, `@${i + 1}`).toBe(cur)
+            const edge = unified.states[cur]!.transitions.some(t => t.to === st.to && t.action === st.action)
+            expect(edge, `@${i + 1} ${cur} --${st.action}--> ${st.to}`).toBe(true)
+            cur = st.to
+        })
+    })
+
+    it('is cover-all with @43+@44 → back_to_overview and @116/@117 dropped; mapping per step', () => {
+        const ca = loadWalk('cover-all').steps
+        const v = loadWalk('cover-all-skip-copy')
+        const key = (s: { from?: string; to: string; action: string }) => `${s.from}|${s.action}|${s.to}`
+        expect(v.steps.slice(0, 42).map(key)).toEqual(ca.slice(0, 42).map(key))
+        expect(v.steps[42]).toEqual({ from: 'op_instance', to: 'op_overview', action: 'back_to_overview' })
+        expect(v.steps.slice(43, 114).map(key)).toEqual(ca.slice(44, 115).map(key))
+        expect(v.steps.slice(114).map(key)).toEqual(ca.slice(117).map(key))
+        expect(v.steps[114]!.action).toBe('back_to_disk')
+        expect(v.steps[113]!.action).toBe('start_after_install')
+        // key steps: keep_editing / backup / restore / move
+        const at = (a: string) => v.steps.flatMap((s, i) => (s.action === a ? [i + 1] : []))
+        expect(at('keep_editing')).toEqual([81])
+        expect(at('backup_instance')).toEqual([97, 111])
+        expect(at('restore_from_backup')).toEqual([99])
+        expect(at('move_app')).toEqual([101])
+        expect(at('install_app')).toEqual([87, 113, 116])
+        expect(at('copy_app')).toEqual([])
+        expect(at('open_copied_instance')).toEqual([])
+        expect(at('done_redistribute')).toEqual([])
+        expect([81, 97, 99, 101, 111, 116, 125].map(n => parentStepFor(v, n))).toEqual([82, 98, 100, 102, 112, 119, 128])
+        expect(parentStepFor(v, 42)).toBe(42)
+        expect(parentStepFor(v, 43)).toBeNull()
+        expect(parentStepFor(v, 44)).toBe(45)
+        expect(parentStepFor(v, 114)).toBe(115)
+        expect(parentStepFor(v, 115)).toBe(118)
+        for (let n = 1; n <= 125; n++) {
+            const p = parentStepFor(v, n)
+            if (p !== null) expect(v.steps[n - 1]!.action, `@${n}↔${p}`).toBe(ca[p - 1]!.action)
+        }
+        expect(parentStepFor(loadWalk('cover-all'), 5)).toBeNull()
+    })
+
+    it('shakeOut: notCovered uses cover-all numbers; cover-all itself is not a shake-out', () => {
+        const v = loadWalk('cover-all-skip-copy')
+        expect(v.shakeOut?.variantOf).toBe('cover-all')
+        expect(v.shakeOut?.parentSteps).toBe(128)
+        expect(v.shakeOut?.notCovered).toEqual([
+            { step: 43, action: 'copy_app' },
+            { step: 44, action: 'done_redistribute' },
+            { step: 116, action: 'copy_app' },
+            { step: 117, action: 'open_copied_instance' },
+        ])
+        expect(v.shakeOut?.substitutes).toEqual([{ variant: 43, action: 'back_to_overview', replacesParent: [43, 44] }])
+        for (const name of ['cover-all', 'cover-registered-intents', 'kolibri-learn-smoke']) {
+            expect(loadWalk(name).shakeOut, name).toBeUndefined()
+        }
+    })
+
+    describe('loadWalk edge / shake_out validation', () => {
+        const dir = mkdtempSync(join(tmpdir(), 'dur-walk-val-'))
+        const write = (name: string, body: string) => {
+            const p = join(dir, `${name}.yaml`)
+            writeFileSync(p, body)
+            return p
+        }
+        const caText = readFileSync(join(dirname(walkFile), 'cover-all.yaml'), 'utf8')
+        const skipText = readFileSync(walkFile, 'utf8')
+
+        it('every existing walk file passes', () => {
+            for (const f of readdirSync(dirname(walkFile)).filter(x => x.endsWith('.yaml'))) {
+                expect(() => loadWalk(f.replace(/\.yaml$/, '')), f).not.toThrow()
+            }
+        })
+
+        it('rejects a step whose edge is not in unified.yaml (no new edges)', () => {
+            // op_instance --copy_app--> op_overview does not exist (copy_app goes to op_copy_move)
+            const bad = skipText.replace(
+                '  - from: op_instance\n    to: op_overview\n    action: back_to_overview\n',
+                '  - from: op_instance\n    to: op_overview\n    action: copy_app\n',
+            )
+            expect(bad).not.toBe(skipText)
+            expect(() => loadWalk(write('bad-edge', bad))).toThrow(
+                /step 43: no edge op_instance --copy_app--> op_overview in graph 'unified' \(walks may only use existing graph edges\)/,
+            )
+        })
+
+        it('rejects a discontinuous walk (from ≠ previous to)', () => {
+            const bad = caText.replace(
+                '  - from: op_copy_move\n    to: op_overview\n    action: done_redistribute\n',
+                '',
+            )
+            expect(() => loadWalk(write('gap', bad))).toThrow(/step 44 \(eject_disk\) from 'op_overview' but step 43 ended at 'op_copy_move'/)
+        })
+
+        it('validateWalkEdges: step 1 defaults to initial_state', () => {
+            const unified = loadScenario('unified')
+            expect(() => validateWalkEdges([{ to: 'console_teacher', action: 'open_console_as_teacher' }], unified, 'x', 'unified')).not.toThrow()
+            expect(() => validateWalkEdges([{ to: 'op_overview', action: 'sign_in' }], unified, 'x', 'unified')).toThrow(/step 1: no edge start --sign_in--> op_overview/)
+        })
+
+        it('rejects shake_out not_covered that hides a skipped step, or names the wrong action', () => {
+            const hidden = skipText.replace('    - { step: 44, action: done_redistribute }\n', '')
+            expect(() => loadWalk(write('hidden', hidden))).toThrow(
+                /not_covered \[43,116,117\] must equal the cover-all steps the variant skips \[43,44,116,117\] \(no silent gaps\)/,
+            )
+            const wrong = skipText.replace('{ step: 117, action: open_copied_instance }', '{ step: 117, action: copy_app }')
+            expect(() => loadWalk(write('wrong', wrong))).toThrow(/cover-all @117 is 'open_copied_instance', not 'copy_app'/)
+        })
+
+        it('rejects a step_map that pairs different edges', () => {
+            const off = skipText.replace('{ variant: [44, 114], parent: [45, 115] }', '{ variant: [44, 114], parent: [44, 114] }')
+            expect(() => loadWalk(write('off', off))).toThrow(/shake_out variant @44 .* is not cover-all @44/)
+        })
+    })
+})
+
+describe('idea#168 run summary: shake-out labelling + keep_editing recovery count', () => {
+    const okLogs = (n: number, actions: string[]) =>
+        Array.from({ length: n }, (_, i) => ({
+            ts: '', step: i + 1, from: 'a', to: 'b', action: actions[i] ?? 'x', layer: null, ok: true, durationMs: 1,
+        }))
+
+    it('skip-copy summary: shakeOut true, notCovered (cover-all numbers), both numberings, last/failed steps mapped', () => {
+        const walk = loadWalk('cover-all-skip-copy')
+        const logs = okLogs(81, walk.steps.map(s => s.action))
+        logs[80] = { ...logs[80]!, ok: false }
+        const recoveries = { total: 2, failed: 1, byKind: { reopen_files: 1, reconnect: 1 } }
+        const s = buildRunSummary({ walk, result: { steps: 81, failures: 1, aborted: true, abortReason: 'step 81 failed', logs }, recoveries })
+        expect(s.shakeOut).toBe(true)
+        expect(s.variantOf).toBe('cover-all')
+        expect(s.walk).toBe('cover-all-skip-copy')
+        expect(s.notCovered).toEqual([
+            { step: 43, action: 'copy_app' },
+            { step: 44, action: 'done_redistribute' },
+            { step: 116, action: 'copy_app' },
+            { step: 117, action: 'open_copied_instance' },
+        ])
+        expect(s.stepNumbering).toEqual({
+            variantSteps: 125,
+            parentSteps: 128,
+            map: [
+                { variant: '1-42', parent: '1-42' },
+                { variant: '44-114', parent: '45-115' },
+                { variant: '115-125', parent: '118-128' },
+            ],
+            substitutes: [{ variant: 43, action: 'back_to_overview', replacesParent: [43, 44] }],
+        })
+        expect(s.lastStep).toEqual({ step: 81, parentStep: 82, action: 'keep_editing' })
+        expect(s.failedSteps).toEqual([{ step: 81, parentStep: 82, action: 'keep_editing' }])
+        expect(s.keepEditingRecoveries).toEqual(recoveries)
+        expect(stepNumbers(walk, 43)).toEqual({ step: 43, parentStep: null })
+        const line = formatRunSummaryLine(s)
+        expect(line).toContain('SHAKE-OUT variant of cover-all (NOT a cover-all attempt)')
+        expect(line).toContain('not covered cover-all@43 copy_app, cover-all@44 done_redistribute, cover-all@116 copy_app, cover-all@117 open_copied_instance')
+        expect(line).toContain('44-114↔cover-all@45-115')
+        expect(line).toContain('@43 back_to_overview replaces cover-all@43+44')
+        expect(line).toContain('last step @81 (cover-all@82) keep_editing')
+        expect(line).toContain('keep_editing recoveries: 2 (reopen_files=1, reconnect=1; failed=1)')
+    })
+
+    it('cover-all summary: shakeOut false, no notCovered / parentStep', () => {
+        const walk = loadWalk('cover-all')
+        const s = buildRunSummary({
+            walk,
+            result: { steps: 128, failures: 0, aborted: false, logs: okLogs(128, walk.steps.map(x => x.action)) },
+            recoveries: { total: 0, failed: 0, byKind: {} },
+        })
+        expect(s.shakeOut).toBe(false)
+        expect(s.notCovered).toBeUndefined()
+        expect(s.stepNumbering).toBeUndefined()
+        expect(s.lastStep).toEqual({ step: 128, action: 'reboot_engine' })
+        expect(shakeOutSummary(walk)).toBeNull()
+        expect(shakeOutSummary(null)).toBeNull()
+        expect(formatRunSummaryLine(s)).toBe('[duration] summary: cover-all steps=128 failures=0 | last step @128 reboot_engine | keep_editing recoveries: 0')
+    })
+
+    // Exact lines the Console keep_editing Intent prints (agent-console d637b83 nextcloudDeep.ts).
+    const ev = (kind: string, attempt: number, n: number, ok = true) =>
+        JSON.stringify({ event: 'keep_editing_recovery', file: 'Collab/Notes.md', kind, attempt, n, reason: 'r', ok, elapsedMs: 5, url: 'http://x' })
+
+    it('parseKeepEditingRecovery: only the keep_editing_recovery event counts', () => {
+        expect(parseKeepEditingRecovery(ev('reconnect', 1, 1))).toEqual({ kind: 'reconnect', ok: true })
+        expect(parseKeepEditingRecovery(ev('reopen_files', 1, 2, false))).toEqual({ kind: 'reopen_files', ok: false })
+        expect(parseKeepEditingRecovery(JSON.stringify({ event: 'duration_step', message: 'keep_editing_recovery x' }))).toBeNull()
+        expect(parseKeepEditingRecovery('keep_editing_recovery {not json')).toBeNull()
+        expect(parseKeepEditingRecovery('')).toBeNull()
+    })
+
+    it('KeepEditingRecoveryCounter: total + failed + byKind', () => {
+        const c = new KeepEditingRecoveryCounter()
+        c.addLines([ev('reconnect', 1, 1), ev('reconnect', 2, 2), ev('reopen_files', 1, 3, false), ev('reopen_page_reload', 1, 4), ev('reload', 1, 5), '{"event":"duration_step","step":82}'].join('\n'))
+        expect(c.snapshot()).toEqual({ total: 5, failed: 1, byKind: { reconnect: 2, reopen_files: 1, reopen_page_reload: 1, reload: 1 } })
+    })
+
+    it('tapStdoutLines counts console.log events (split chunks too) and passes output through', () => {
+        const written: string[] = []
+        const fakeStream = { write(chunk: unknown) { written.push(String(chunk)); return true } } as unknown as NodeJS.WriteStream
+        const c = new KeepEditingRecoveryCounter()
+        const untap = tapStdoutLines(line => c.addLines(line), fakeStream)
+        const line = ev('reopen_files', 1, 1) + '\n'
+        fakeStream.write(line.slice(0, 20))
+        fakeStream.write(line.slice(20))
+        fakeStream.write(ev('reconnect', 1, 2) + '\n' + '{"event":"duration_step"}\n')
+        fakeStream.write(Buffer.from(ev('reload', 1, 3) + '\n'))
+        untap()
+        fakeStream.write(ev('reload', 2, 4) + '\n') // after untap: not counted
+        expect(c.snapshot()).toEqual({ total: 3, failed: 0, byKind: { reopen_files: 1, reconnect: 1, reload: 1 } })
+        expect(written.join('')).toContain('"kind":"reopen_files"')
+        expect(written).toHaveLength(5)
     })
 })

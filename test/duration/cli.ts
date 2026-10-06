@@ -7,6 +7,8 @@
  * --scenario random|unified|default → Markov simulation on scenarios/unified.yaml
  * --scenario cover-all → deterministic full-graph walk (walks/cover-all.yaml)
  * --scenario cover-registered-intents → Pixel-registered + infra walk (walks/cover-registered-intents.yaml); live --ui demo
+ * --scenario cover-all-skip-copy → SHAKE-OUT variant of cover-all (no copy_app / open_copied_instance);
+ *   reported shakeOut:true + notCovered (cover-all numbering). NOT a cover-all attempt.
  * Deprecated aliases (minimal, stress, school-day, …) resolve to unified — not separate graphs.
  * --live: RealFleetOps over Tailscale/SSH (requires --hosts or DURATION_FLEET_HOSTS).
  * --ui: PlaywrightUiDriver → Pixel e2e/intents (DURATION_CONSOLE_URL / idea01 :8080).
@@ -32,6 +34,14 @@ import { $ } from 'zx'
 import type { StructuredLogEntry } from './types.js'
 import { EXIT_ENGINE_UNREACHABLE, installProcessGuards, timeoutSummary, walkExitCode } from './automergeTimeoutGuard.js'
 import { DEFAULT_PREFLIGHT_TIMEOUT_MS } from './realFleetOps.js'
+import {
+    buildRunSummary,
+    formatRunSummaryLine,
+    KeepEditingRecoveryCounter,
+    shakeOutSummary,
+    stepNumbers,
+    tapStdoutLines,
+} from './runSummary.js'
 
 const usage = () => {
     console.log(`Usage: pnpm test:duration [options]
@@ -39,6 +49,8 @@ const usage = () => {
   --scenario <name>     Markov: random|unified (default) → scenarios/unified.yaml
                         Walk:   cover-all → walks/cover-all.yaml (strict full graph)
                         Walk:   cover-registered-intents → walks/cover-registered-intents.yaml (registered-intents walk; alias cover-hardpass)
+                        Walk:   cover-all-skip-copy → SHAKE-OUT variant of cover-all (skips copy_app @43/@116,
+                                open_copied_instance @117); duration_done says shakeOut:true + notCovered
                         Walk:   kolibri-*-smoke / nextcloud-*-smoke / wikipedia-smoke → short Prefer A smokes
                         Deprecated aliases → unified: ${Object.keys(SCENARIO_ALIASES).join(', ')}
   --iterations <n>      Markov steps (default: 40). Walks default to steps.length.
@@ -210,6 +222,8 @@ const main = async () => {
 
     const walkMode = isWalkScenario(args.scenario)
     const walk = walkMode ? loadWalk(args.scenario) : null
+    // idea#168: shake-out variants (walk file has shake_out:) are labelled everywhere.
+    const shakeOut = shakeOutSummary(walk)
     const scenario = walk ? walk.scenario : loadScenario(args.scenario)
     const resolvedName = walk
         ? args.scenario
@@ -318,6 +332,10 @@ const main = async () => {
         scenario_file: resolvedName,
         mode: walk ? 'walk' as const : 'markov' as const,
         walk_file: walk ? args.scenario : null,
+        shakeOut: !!shakeOut,
+        ...(shakeOut
+            ? { variantOf: shakeOut.variantOf, notCovered: shakeOut.notCovered, stepNumbering: shakeOut.stepNumbering }
+            : {}),
         iterations,
         start_from: args.startFrom ?? null,
         fast: args.fast,
@@ -394,7 +412,8 @@ const main = async () => {
     }
 
     const onLog = (e: StructuredLogEntry) => {
-        console.log(JSON.stringify({ event: 'duration_step', ...e }))
+        // Shake-out: every step line also carries its parent (cover-all) step number.
+        console.log(JSON.stringify({ event: 'duration_step', ...e, ...stepNumbers(walk, e.step) }))
     }
     const settleTimeoutMs = args.live
         ? (args.fast ? 150_000 : 180_000)
@@ -413,6 +432,10 @@ const main = async () => {
         onLog,
     }
 
+    // idea#168: count the Console keep_editing Intent's {"event":"keep_editing_recovery"}
+    // lines as they go to stdout (= run.log); reported in duration_summary / duration_done.
+    const recoveryCounter = new KeepEditingRecoveryCounter()
+    const untapStdout = tapStdoutLines(line => recoveryCounter.addLines(line))
     const result = walk
         ? await runDeterministicWalk(walk, {
             ...sharedOpts,
@@ -426,15 +449,26 @@ const main = async () => {
             rng: seed !== undefined ? makeRng(seed) : undefined,
         })
 
+    untapStdout()
     await uiDriver.close?.().catch(() => {})
     if (ops instanceof RealFleetOps) {
         await ops.close().catch(() => {})
     }
 
     console.log(JSON.stringify(timeoutSummary()))
+    const summary = buildRunSummary({ walk, result, recoveries: recoveryCounter.snapshot() })
+    console.log(JSON.stringify(summary))
+    console.log(formatRunSummaryLine(summary))
     console.log(JSON.stringify({
         event: 'duration_done',
         mode: walk ? 'walk' : 'markov',
+        walk: walk?.name ?? null,
+        shakeOut: summary.shakeOut,
+        ...(shakeOut
+            ? { variantOf: shakeOut.variantOf, notCovered: shakeOut.notCovered, stepNumbering: shakeOut.stepNumbering }
+            : {}),
+        lastStep: summary.lastStep,
+        keepEditingRecoveries: summary.keepEditingRecoveries,
         steps: result.steps,
         failures: result.failures,
         finalState: result.finalState,
