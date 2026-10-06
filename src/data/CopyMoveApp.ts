@@ -27,7 +27,10 @@ import { sendCommand } from '../utils/commandUtils.js'
 import { getEngineAddress } from './Network.js'
 import { Instance, Status } from './Instance.js'
 import { IPAddress } from './CommonTypes.js'
+import { lookupInstanceArg, describeInstanceCandidates } from './InstanceArg.js'
+import { findExternalLinks, externalLinksMessage, uniqueCopyName, preparedCopyFiles } from './InstanceCopy.js'
 import os from 'os'
+import path from 'path'
 
 // ── Disk free-space check ─────────────────────────────────────────────────────
 
@@ -71,9 +74,19 @@ const validate = async (
     sourceDiskId: DiskID,
     targetDiskId: DiskID
 ): Promise<ValidatedCopyMove | string> => {
-    // Look up instance — search all (not just Running) so we can copy stopped instances too
-    const instance = Object.values(store.instanceDB).find(i => i.name === instanceName)
-    if (!instance) return `Instance '${instanceName}' not found`
+    // Look up the instance id-first (idea#168): an instance id, else a unique
+    // name, else the one instance with that name on the source disk (the
+    // Console sends `<name> <sourceDiskId> <targetDiskId>`). Any status, so
+    // stopped instances can be copied too. Crash recovery passes the id.
+    const found = lookupInstanceArg(store, String(instanceName), String(sourceDiskId))
+    if (!found.ok && found.reason === 'ambiguous') {
+        return `Instance name '${instanceName}' is ambiguous: ${describeInstanceCandidates(found.candidates)}. Use the instance id.`
+    }
+    if (!found.ok) return `Instance '${instanceName}' not found`
+    const instance = found.instance
+    if (found.via === 'name-on-disk') {
+        console.warn(`Instance name '${instanceName}' is shared by several instances; using ${instance.id}, the one on disk ${sourceDiskId}. Send the instance id.`)
+    }
 
     const sourceDisk = getDisk(store, sourceDiskId) as Disk | undefined
     if (!sourceDisk) return `Source disk '${sourceDiskId}' not found`
@@ -126,6 +139,12 @@ const validate = async (
     if (!await fs.pathExists(appMasterSrc)) return `App master directory not found: ${appMasterSrc}`
     if (!await fs.pathExists(instanceSrc)) return `Instance directory not found: ${instanceSrc}`
 
+    // Refuse instance data that links off the disk (idea#168 r35), before the
+    // source is stopped: rsync -a copies a link verbatim, so the result would
+    // share the original's data.
+    const externalLinks = await findExternalLinks(instanceSrc)
+    if (externalLinks.length > 0) return externalLinksMessage(instanceSrc, sourceDisk, externalLinks)
+
     return { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc }
 }
 
@@ -159,8 +178,10 @@ export const remoteEnsureDirsSshArgs = (remoteAddress: string, targetMountRoot: 
 
 /**
  * Copy an app instance from sourceDisk to targetDisk.
- * The copy receives a fresh InstanceID — it is a brand new instance.
- * The original keeps running (it is stopped during the file copy, then restarted).
+ * The copy receives a fresh InstanceID — it is a brand new instance — and its
+ * own name (`<name>-2`, `<name>-3`, …) and port (idea#168 r35).
+ * The original keeps running: it is stopped during the file copy and restarted
+ * before the copy starts, so it keeps its port.
  */
 export const copyApp = async (
     storeHandle: DocHandle<Store>,
@@ -172,17 +193,15 @@ export const copyApp = async (
     const store = storeHandle.doc()
 
     const v = await validate(store, instanceName, sourceDiskId, targetDiskId)
-    if (typeof v === 'string') {
-        console.error(chalk.red(`copyApp: ${v}`))
-        return
-    }
+    // Validation refusals throw (idea#168 r29@97), so the command trace or
+    // crash-recovery retry ends as error instead of silently succeeding.
+    if (typeof v === 'string') throw new Error(`copyApp: ${v}`)
     const { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc } = v
 
     // Acquire per-resource locks: source instance + target disk
     const lockKeys = [instanceKey(instance.id), diskKey(targetDisk.id)]
     if (!resourceLock.acquireAll(lockKeys, 'copyApp')) {
-        console.error(chalk.red(`copyApp: resource locked — another operation is already running on instance '${instanceName}' or target disk '${targetDisk.name}'. Retry when it completes.`))
-        return
+        throw new Error(`copyApp: resource locked — another operation is already running on instance '${instanceName}' or target disk '${targetDisk.name}'. Retry when it completes.`)
     }
 
     const opId = createOperation(storeHandle, 'copyApp', {
@@ -193,6 +212,27 @@ export const copyApp = async (
 
     const newInstanceId = uuid() as InstanceID
     let wasRunning = false
+    let sourceRestarted = false
+    // idea#168 r36: the folder this copy creates on the target disk. A failed copy
+    // removes it, else the next dock of that disk registers the partial folder as a
+    // new instance (r36: the @43 copy failed in rsync and its folder vuf3im3mbayl9z6uou3,
+    // named like the original, registered on Nextcloud Grade 5A).
+    let createdInstanceDest: string | null = null
+
+    // Restart the source if we stopped it. Called once: before the copy starts
+    // on success (idea#168 r35), else from finally.
+    const restartSource = async (when: string): Promise<void> => {
+        sourceRestarted = true
+        try {
+            const freshInstance = getInstance(storeHandle.doc(), instance.id)
+            if (freshInstance) {
+                log(`copyApp: restarting source instance '${instance.name}' (${instance.id}) ${when}`)
+                await startInstance(storeHandle, freshInstance, sourceDisk, 'post-copy')
+            }
+        } catch (restartErr: any) {
+            console.error(chalk.red(`copyApp: failed to restart source instance: ${restartErr.message}`))
+        }
+    }
 
     // Detect cross-engine: target disk is on a different engine
     const { localEngineId } = await import('./Engine.js')
@@ -260,12 +300,36 @@ export const copyApp = async (
         // 5. rsync instance data into a NEW instance directory (new ID)
         setCopyStep(3)
         const instanceDest = `${targetMountRoot}/instances/${newInstanceId}`
+        createdInstanceDest = instanceDest
         if (!isCrossEngine) await fs.ensureDir(instanceDest)
         else await $`ssh -o StrictHostKeyChecking=no pi@${remoteAddress} mkdir -p ${instanceDest}`
         log(`copyApp: syncing instance data ${instanceSrc} → ${isCrossEngine ? remoteAddress + ':' : ''}${instanceDest}`)
         await rsyncDirectory(instanceSrc, instanceDest, ({ progressPercent }) => {
             updateOperation(storeHandle, opId, { progressPercent: 25 + Math.round(progressPercent * 0.30) })
         }, opId, remoteAddress)
+
+        // 5a. Give the copy its own name and port (idea#168 r35). The rsync
+        //     copied the original's compose.yaml (x-app.instanceName) and .env
+        //     (port=). The copy gets a unique name (<name>-2, -3, …; see
+        //     uniqueCopyName) and no port, so startInstance allocates one that is
+        //     neither listening nor owned by another instance in the store.
+        const copyName = uniqueCopyName(storeHandle.doc(), String(instance.name))
+        const prepared = await preparedCopyFiles(instanceSrc, copyName)
+        const preparedNames = Object.keys(prepared) as (keyof typeof prepared)[]
+        if (preparedNames.length > 0) {
+            if (isCrossEngine) {
+                const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-copy-'))
+                try {
+                    for (const f of preparedNames) await fs.writeFile(`${tmp}/${f}`, prepared[f]!)
+                    await rsyncDirectory(tmp, instanceDest, undefined, opId, remoteAddress)
+                } finally {
+                    await fs.remove(tmp).catch(() => undefined)
+                }
+            } else {
+                for (const f of preparedNames) await fs.writeFile(`${instanceDest}/${f}`, prepared[f]!)
+            }
+        }
+        log(`copyApp: the copy is named '${copyName}'; its .env has no port, so it gets its own port at start`)
 
         // 5b. rsync service image tars needed by this instance
         //     services/ holds the Docker image tars that startInstance loads via
@@ -298,6 +362,12 @@ export const copyApp = async (
 
         // 6. Register/start the new instance
         setCopyStep(5)
+
+        // Restart the source BEFORE the copy starts (idea#168 r35): the
+        // original takes its own port back first, and the copy can never grab
+        // it while the original is down for the snapshot.
+        if (wasRunning) await restartSource('before the copy starts')
+
         if (isCrossEngine) {
             // Cross-engine: create instance record in shared store (as Docked),
             // then tell the remote engine to start it via sendCommand.
@@ -311,7 +381,7 @@ export const copyApp = async (
                 const newInst: Instance = {
                     id: newInstanceId,
                     instanceOf: instance.instanceOf,
-                    name: instance.name,
+                    name: copyName,
                     storedOn: targetDisk.id,
                     status: 'Docked' as Status,
                     statusCondition: null,
@@ -327,9 +397,9 @@ export const copyApp = async (
                 }
                 doc.instanceDB[newInstanceId] = newInst
             })
-            // Tell the remote engine to start this instance
+            // Tell the remote engine to start this instance, by id (idea#168)
             log(`copyApp: sending startInstance command to remote engine '${targetDisk.dockedTo}'`)
-            sendCommand(storeHandle, targetDisk.dockedTo as any, `startInstance ${instance.name} ${targetDisk.id} --cause cross-engine-cmd` as any)
+            sendCommand(storeHandle, targetDisk.dockedTo as any, `startInstance ${newInstanceId} ${targetDisk.id} --cause cross-engine-cmd` as any)
         } else {
             // Local: use existing processInstance flow
             log(`copyApp: registering new instance ${newInstanceId} on disk '${targetDisk.name}' (${targetDisk.id})`)
@@ -354,21 +424,21 @@ export const copyApp = async (
             })
         }
         console.error(chalk.red(`copyApp: failed — ${e.message ?? e}`))
-    } finally {
-        resourceLock.releaseAll(lockKeys)
-        // Always restart source instance if we stopped it
-        if (wasRunning) {
+        // Remove the partial copy unless it was already registered (fresh id, so the
+        // folder holds only what this op wrote).
+        if (createdInstanceDest && !storeHandle.doc()?.instanceDB?.[newInstanceId]) {
             try {
-                const freshStore = storeHandle.doc()
-                const freshInstance = getInstance(freshStore, instance.id)
-                if (freshInstance) {
-                    log(`copyApp: restarting source instance '${instanceName}'`)
-                    await startInstance(storeHandle, freshInstance, sourceDisk, 'post-copy')
-                }
-            } catch (restartErr: any) {
-                console.error(chalk.red(`copyApp: failed to restart source instance: ${restartErr.message}`))
+                if (isCrossEngine) await $`ssh -o StrictHostKeyChecking=no pi@${remoteAddress} rm -rf -- ${createdInstanceDest}`
+                else await fs.remove(createdInstanceDest)
+                log(`copyApp: removed the partial copy ${isCrossEngine ? remoteAddress + ':' : ''}${createdInstanceDest}`)
+            } catch (cleanupErr: any) {
+                console.error(chalk.red(`copyApp: could not remove the partial copy ${createdInstanceDest}: ${cleanupErr?.message ?? cleanupErr}`))
             }
         }
+    } finally {
+        resourceLock.releaseAll(lockKeys)
+        // Always restart the source if we stopped it and the success path did not
+        if (wasRunning && !sourceRestarted) await restartSource('after a failed copy')
     }
 }
 
@@ -390,25 +460,22 @@ export const moveApp = async (
     const store = storeHandle.doc()
 
     const v = await validate(store, instanceName, sourceDiskId, targetDiskId)
-    if (typeof v === 'string') {
-        console.error(chalk.red(`moveApp: ${v}`))
-        return
-    }
+    // Validation refusals throw (idea#168 r29@97), so the command trace or
+    // crash-recovery retry ends as error instead of silently succeeding.
+    if (typeof v === 'string') throw new Error(`moveApp: ${v}`)
     const { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc } = v
 
     // moveApp does not support cross-engine targets (data integrity risk if move fails midway).
     // Use copyApp + manual delete instead.
     const { localEngineId: localId } = await import('./Engine.js')
     if (String(targetDisk.dockedTo) !== String(localId)) {
-        log(`moveApp: Target disk '${targetDisk.name}' is on a remote engine. Cross-engine move is not supported — use copyApp instead, then delete the source.`)
-        return
+        throw new Error(`moveApp: Target disk '${targetDisk.name}' is on a remote engine. Cross-engine move is not supported — use copyApp instead, then delete the source.`)
     }
 
     // Acquire per-resource locks: instance + both disks
     const moveLockKeys = [instanceKey(instance.id), diskKey(sourceDisk.id), diskKey(targetDisk.id)]
     if (!resourceLock.acquireAll(moveLockKeys, 'moveApp')) {
-        console.error(chalk.red(`moveApp: resource locked — another operation is already running on instance '${instanceName}' or one of its disks. Retry when it completes.`))
-        return
+        throw new Error(`moveApp: resource locked — another operation is already running on instance '${instanceName}' or one of its disks. Retry when it completes.`)
     }
 
     const opId = createOperation(storeHandle, 'moveApp', {

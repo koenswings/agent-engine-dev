@@ -13,6 +13,7 @@ import { log } from '../utils/utils.js'
 import { fs } from 'zx'
 import path from 'path'
 import { config } from './Config.js'
+import { stopPeriodicFlush } from '../repo.js'
 
 // ── Types (also exported for use in CommonTypes consumers) ───────────────────
 
@@ -159,6 +160,9 @@ export const createCommandLogStore = async (
  * so the store and the new command log are still saved.
  */
 export const shutdownRepo = async (repo: Repo): Promise<void> => {
+  // r34 DURABILITY: stop the backstop flush (src/repo.ts) first, so no periodic
+  // tick runs during or after the final flush.
+  await stopPeriodicFlush(repo)
   try {
     await repo.shutdown()
   } catch (e) {

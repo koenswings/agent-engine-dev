@@ -274,6 +274,11 @@ export const getInstancesOfDisk = (store: Store, disk: Disk): Instance[] => {
     })
 }
 
+/**
+ * @deprecated Takes the FIRST instance with that name; names are not unique
+ * (idea#168). Commands resolve instance arguments with resolveInstanceArg /
+ * lookupInstanceArg (InstanceArg.ts), which refuse an ambiguous name.
+ */
 export const findInstanceByName = (store: Store, instanceName: string): Instance | undefined => {
     return getInstances(store).find(instance => instance.name === instanceName)
 }

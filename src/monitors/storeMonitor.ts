@@ -23,10 +23,48 @@ const engineSetMonitor = (patch, storeHandle): boolean => {
     }
 }
 
-// Track which commands are currently in-flight, keyed by engineId + command string.
-// Commands for different instances can execute concurrently; commands for the same
-// engine still execute serially (queue[0] is always processed next).
-const _currentlyExecuting = new Set<string>()
+// One command at a time per engine queue (per store handle): the head is run,
+// then removed, then the next head is run. idea#168: a queue head is never left
+// in place, so it can never block the queue.
+const _busy = new WeakMap<object, Set<string>>()
+
+/**
+ * Run the head of an engine's command queue, remove it, and go on with the next
+ * head. Used by the live path (queue patches) and by the startup replay, so both
+ * behave the same and a command is never run twice.
+ *
+ * Every head goes through handleCommand, also a bare word without a space
+ * (idea#168): a registered command without arguments (reboot, ls, disks, ...)
+ * runs; anything else (unknown, or a command that needs arguments) is refused by
+ * handleCommand with an error trace and nothing runs. Either way the head is
+ * removed afterwards. Before, a bare word was skipped and stayed at the head,
+ * blocking every later command until a restart.
+ */
+export const processCommandQueue = (storeHandle: DocHandle<Store>, engineId: EngineID, cmdLogHandle?: DocHandle<CommandLogStore> | null): void => {
+    let busy = _busy.get(storeHandle)
+    if (!busy) { busy = new Set(); _busy.set(storeHandle, busy) }
+    if (busy.has(String(engineId))) return
+    const queue = storeHandle.doc()?.engineDB[engineId as any]?.commands as unknown[] | undefined
+    if (!queue?.length) return
+
+    const head = queue[0]
+    const command = typeof head === 'string' ? head : String(head ?? '')
+    busy.add(String(engineId))
+    log(`Processing command for engine ${engineId}: ${command}`)
+    handleCommand(commands, storeHandle, 'engine', command, cmdLogHandle ?? null)
+        .catch(e => log(`Command '${command}' failed outside its trace: ${e?.message ?? e}`))
+        .finally(() => {
+            busy!.delete(String(engineId))
+            storeHandle.change(doc => {
+                const list = doc.engineDB[engineId as any]?.commands as any[] | undefined
+                if (!list) return
+                // Remove the command that ran: normally still the head
+                const i = list.findIndex(c => (typeof c === 'string' ? c : String(c ?? '')) === command)
+                if (i !== -1) list.splice(i, 1)
+            })
+            processCommandQueue(storeHandle, engineId, cmdLogHandle)
+        })
+}
 
 const engineCommandsMonitor = (patch, storeHandle): boolean => {
     const isCommandPath =
@@ -40,28 +78,7 @@ const engineCommandsMonitor = (patch, storeHandle): boolean => {
     const engineId = patch.path[1] as EngineID
     if (engineId !== localEngineId) return true
 
-    const doc = storeHandle.doc()
-    const queue = doc?.engineDB[engineId as any]?.commands as string[] | undefined
-    if (!queue?.length) return true
-
-    const command = queue[0]
-    if (!command || !command.includes(' ')) return true
-
-    // Use engineId+command as the dedup key so a new command with the same text
-    // (but on a different instance) can still run concurrently.
-    const key = `${engineId}:${command}`
-    if (_currentlyExecuting.has(key)) return true
-
-    _currentlyExecuting.add(key)
-    log(`Processing command for engine ${engineId}: ${command}`)
-    const cmdLogHandle = (storeHandle as any).__commandLogHandle ?? null
-    handleCommand(commands, storeHandle, 'engine', command, cmdLogHandle).then(() => {
-        _currentlyExecuting.delete(key)
-        storeHandle.change(doc => {
-            const eng = doc.engineDB[engineId as any]
-            if (eng) (eng.commands as any[]).splice(0, 1)
-        })
-    })
+    processCommandQueue(storeHandle, engineId, (storeHandle as any).__commandLogHandle ?? null)
     return true
 }
 
@@ -119,22 +136,10 @@ export const enableStoreMonitor = (storeHandle: DocHandle<Store>, commandLogHand
     // On startup, process any commands already queued for this engine.
     // The storeMonitor only fires on new patches, so commands written before
     // this engine started (or while it was offline) would otherwise be silently ignored.
-    // Replay any commands already in the queue at startup.
-    const startupStore = storeHandle.doc()
-    const startupCmds = [...((startupStore?.engineDB[localEngineId]?.commands as string[]) ?? [])]
-    if (startupCmds.length) {
-        log(`Replaying ${startupCmds.length} pending command(s) from queue on startup`)
-        ;(async () => {
-            for (const cmd of startupCmds) {
-                const startupKey = `${localEngineId}:${cmd}`
-                _currentlyExecuting.add(startupKey)
-                await handleCommand(commands, storeHandle, 'engine', cmd, commandLogHandle)
-                _currentlyExecuting.delete(startupKey)
-                storeHandle.change(doc => {
-                    const eng = doc.engineDB[localEngineId as any]
-                    if (eng) (eng.commands as any[]).splice(0, 1)
-                })
-            }
-        })()
+    // Same path as live commands (idea#168): serial, each command runs once.
+    const pending = storeHandle.doc()?.engineDB[localEngineId]?.commands?.length ?? 0
+    if (pending) {
+        log(`Replaying ${pending} pending command(s) from queue on startup`)
+        processCommandQueue(storeHandle, localEngineId, commandLogHandle)
     }
 }

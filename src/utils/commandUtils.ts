@@ -33,6 +33,42 @@ const recordErrorTrace = (
 }
 
 
+/**
+ * Split the argument part of a command line into tokens (idea#168 r29@97).
+ *
+ * Without a double quote this is exactly the old split on single spaces
+ * (empty tokens dropped). With quotes, a token that starts with `"` runs to
+ * the next `"` that ends a token (followed by a space or the end), so a disk
+ * name with spaces can be one argument: `restoreApp kolibri "My Disk"`. The
+ * quotes are removed. A `"` inside a token, or an opening quote with no
+ * closing one, stays literal.
+ */
+export const splitArgs = (argString: string): string[] => {
+    if (!argString.includes('"')) return argString.split(' ').filter(arg => arg.length > 0);
+    const tokens: string[] = [];
+    let i = 0;
+    while (i < argString.length) {
+        if (argString[i] === ' ') { i++; continue; }
+        if (argString[i] === '"') {
+            let close = argString.indexOf('"', i + 1);
+            while (close !== -1 && close + 1 < argString.length && argString[close + 1] !== ' ') {
+                close = argString.indexOf('"', close + 1);
+            }
+            if (close !== -1) {
+                tokens.push(argString.substring(i + 1, close));
+                i = close + 1;
+                continue;
+            }
+        }
+        let end = argString.indexOf(' ', i);
+        if (end === -1) end = argString.length;
+        tokens.push(argString.substring(i, end));
+        i = end;
+    }
+    return tokens;
+}
+
+
 export const handleCommand = async (
     commands: CommandDefinition[],
     storeHandle: DocHandle<Store> | null,
@@ -68,7 +104,7 @@ export const handleCommand = async (
             stringArgs.push(trimmedInput.substring(firstSpaceIndex + 1));
         }
     } else {
-        stringArgs = trimmedInput.split(' ').slice(1).filter(arg => arg.length > 0);
+        stringArgs = splitArgs(trimmedInput.split(' ').slice(1).join(' '));
     }
 
     // Scope checking

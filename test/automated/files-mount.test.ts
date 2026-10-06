@@ -133,7 +133,7 @@ describe('Files mount helpers (idea#133)', () => {
     })
 
     it('ENGINE_CAPABILITIES includes filesMount', () => {
-        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk'])
+        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs'])
     })
 })
 

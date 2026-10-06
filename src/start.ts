@@ -11,6 +11,7 @@ import { enableHttpMonitor } from './monitors/httpMonitor.js'
 import { DocumentId, Repo, DocHandle } from '@automerge/automerge-repo'
 import { startAutomergeServer } from './repo.js'
 import { enableMulticastDNSEngineMonitor } from './monitors/mdnsMonitor.js'
+import { startStaticPeers, staticPeersSetting } from './data/StaticPeers.js'
 import { createServerStore } from './data/Store.js'
 import { prepareStoreIdentity, storeIdentityPaths } from './data/StoreIdentity.js'
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
@@ -184,6 +185,13 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         await sleep(1000)
         log(chalk.bgMagenta('STARTING MULTICAST DNS MONITOR'))
         mdnsHandle = enableMulticastDNSEngineMonitor(storeHandle, repo)
+    }
+
+    // Opt-in static peer list (IDEA_STATIC_PEERS / settings.staticPeers): dials
+    // the listed Engines via connectEngine, independent of mDNS. Unset: no-op.
+    if (staticPeersSetting()?.trim()) {
+        log(chalk.bgMagenta('STARTING STATIC PEERS'))
+        startStaticPeers(repo, storeHandle)
     }
 
 

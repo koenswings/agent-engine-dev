@@ -7,12 +7,13 @@
  *  - BorgBackup for deduplicating, atomic, resumable archives
  *  - activeBackups Set prevents double-backup on reboot race
  *  - Lock file (.backup-in-progress) enables boot-resume after interrupted backup
- *  - testMode: skips borg commands but exercises all other logic (store updates, YAML, lock files)
+ *  - skipBorg() (settings.skipBorg / IDEA_SKIP_BORG, default testMode): skips borg commands but
+ *    exercises all other logic (store updates, YAML, lock files)
  */
 
 import { $, YAML, chalk, fs } from 'zx'
 import { log, print } from '../utils/utils.js'
-import { config, disksRoot } from '../data/Config.js'
+import { disksRoot, skipBorg } from '../data/Config.js'
 import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot } from '../data/Disk.js'
 import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { createOperation, updateOperation } from '../data/Operations.js'
@@ -91,6 +92,9 @@ export const backupInstance = async (
     }
 
     if (activeBackups.has(instanceId)) {
+        // A console backupApp refusal must fail its trace (idea#168 r29@97); a duplicate
+        // automatic trigger stays a quiet skip.
+        if (cause === 'console-command') throw new Error(`Backup for ${instanceId} already in progress — not started again`)
         log(`Backup for ${instanceId} already in progress — skipping duplicate trigger`)
         return
     }
@@ -159,10 +163,10 @@ export const backupInstance = async (
         if (!repoExists) {
             log(`Initialising Borg repo at ${repoPath}`)
             await fs.ensureDir(repoPath)
-            if (!config.settings.testMode) {
+            if (!skipBorg()) {
                 await $`borg init --encryption=none ${repoPath}`
             } else {
-                log(`testMode: skipping borg init`)
+                log(`skipBorg: skipping borg init`)
             }
         }
 
@@ -180,11 +184,11 @@ export const backupInstance = async (
         // 4. Run borg create
         setBackupStep(2, BACKUP_STEPS[2])
         const archiveName = new Date().toISOString().replace(/[:.]/g, '-')
-        if (!config.settings.testMode) {
+        if (!skipBorg()) {
             log(`Running borg create for instance ${instanceId}`)
             await $`borg create ${repoPath}::${archiveName} ${await diskMountRoot(appDisk)}/instances/${instanceId}`
         } else {
-            log(`testMode: skipping borg create for instance ${instanceId}`)
+            log(`skipBorg: skipping borg create for instance ${instanceId}`)
         }
 
         // 5. Restart instance if it was running
@@ -408,6 +412,46 @@ export const checkPendingBackups = async (
     }
 }
 
+// ── borg archive selection (idea#168) ─────────────────────────────────────────
+
+/** Runs `borg <args>` (in cwd when given) and returns stdout. Injectable for tests. */
+export type BorgRunner = (args: string[], cwd?: string) => Promise<string>
+
+const runBorg: BorgRunner = async (args, cwd) =>
+    (await (cwd ? $({ cwd }) : $)`borg ${args}`).stdout
+
+/**
+ * The newest archive of a repo and how to extract it into <mount root>/instances/.
+ *
+ * Archives are named by ISO timestamp (backupInstance), and borg 1.x has no
+ * `latest` alias: `borg extract <repo>::latest` fails with "Archive latest does
+ * not exist". So the newest archive is picked explicitly (`borg info --last 1`,
+ * sorted by archive time).
+ *
+ * borg stores the backed-up path without its leading '/', e.g.
+ * `disks/sda1/instances/<id>/...`, so the archive's own command line gives the
+ * prefix to strip: everything before `<id>`, so the files land in
+ * instances/<id>/ whatever the source disk's mount root was.
+ */
+export const latestArchiveFromInfo = (infoJson: string, instanceId: string): { name: string, stripComponents: number } => {
+    const archive = JSON.parse(infoJson)?.archives?.[0]
+    if (!archive?.name) throw new Error('No backup archives found in the repository')
+    const suffix = `instances/${instanceId}`
+    const source = (archive.command_line as string[] | undefined ?? [])
+        .map(a => a.replace(/^\/+/, '').replace(/\/+$/, ''))
+        .find(a => a === suffix || a.endsWith(`/${suffix}`))
+    if (!source) throw new Error(`Archive ${archive.name} does not contain instances/${instanceId}`)
+    return { name: archive.name, stripComponents: source.split('/').length - 1 }
+}
+
+/** Extract the newest archive of repoPath so the instance lands in instancesDir/<instanceId>. */
+export const extractLatestArchive = async (repoPath: string, instancesDir: string, instanceId: string, run: BorgRunner = runBorg): Promise<string> => {
+    const { name, stripComponents } = latestArchiveFromInfo(await run(['info', '--json', '--last', '1', repoPath]), instanceId)
+    log(`Extracting archive ${name} (--strip-components ${stripComponents}) into ${instancesDir}`)
+    await run(['extract', '--strip-components', String(stripComponents), `${repoPath}::${name}`], instancesDir)
+    return name
+}
+
 // ── restoreApp ────────────────────────────────────────────────────────────────
 
 /**
@@ -423,9 +467,9 @@ export const restoreApp = async (
 ): Promise<void> => {
     // Acquire lock: instance + target disk
     const restoreLockKeys = [instanceKey(instanceId), diskKey(targetDisk.id)]
+    // Refusals and failures throw (idea#168 r29@97), so the restoreApp command trace ends as error.
     if (!resourceLock.acquireAll(restoreLockKeys, 'restoreApp')) {
-        console.error(chalk.red(`restoreApp: resource locked — another operation is already running on instance or target disk. Retry when it completes.`))
-        return
+        throw new Error(`restoreApp: resource locked — another operation is already running on instance or target disk. Retry when it completes.`)
     }
 
     const opId = existingOpId ?? createOperation(storeHandle, 'restoreApp', {
@@ -471,11 +515,11 @@ export const restoreApp = async (
 
         await fs.ensureDir(instancesDir)
 
-        if (!config.settings.testMode) {
+        if (!skipBorg()) {
             log(`Restoring instance ${instanceId} from ${backupDevice} to ${targetDevice}`)
-            await $`bash -c ${'cd ' + instancesDir + ' && borg extract ' + repoPath + '::latest'}`
+            await extractLatestArchive(repoPath, instancesDir, instanceId)
         } else {
-            log(`testMode: skipping borg extract for instance ${instanceId}`)
+            log(`skipBorg: skipping borg extract for instance ${instanceId}`)
         }
 
         const { processInstance } = await import('../data/Disk.js')
@@ -495,6 +539,7 @@ export const restoreApp = async (
             completedAt: Date.now() as Timestamp,
         })
         log(chalk.red(`Restore of instance ${instanceId} failed: ${e.message ?? e}`))
+        throw e
     } finally {
         resourceLock.releaseAll(restoreLockKeys)
     }
@@ -512,10 +557,7 @@ export const createBackupDiskConfig = async (
     mode: BackupMode,
     instanceIds: InstanceID[]
 ): Promise<void> => {
-    if (!disk.device) {
-        log(chalk.red(`createBackupDiskConfig: disk ${disk.id} is not docked`))
-        return
-    }
+    if (!disk.device) throw new Error(`createBackupDiskConfig: disk ${disk.id} is not docked`)
 
     const yaml: BackupYaml = {
         mode,
