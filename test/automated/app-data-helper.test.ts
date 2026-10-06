@@ -18,7 +18,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from
 import { fs, os, path } from 'zx'
 import { Repo, DocHandle } from '@automerge/automerge-repo'
 import {
-    APP_DATA_HELPER, APP_DATA_HELPER_VERSION, sizeArgs, copyArgs, sendArgs, deleteArgs,
+    APP_DATA_HELPER, APP_DATA_HELPER_VERSION, sizeArgs, copyArgs, sendArgs, deleteArgs, eraseSlotArgs,
     borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, appDataSudoArgv, remoteDeleteSshArgs,
     runAppData, appDataErrorMessage, appDataHelperProblem, assertAppDataHelper,
     instanceDataBytes, deleteInstanceData, deleteRemoteInstanceData,
@@ -93,6 +93,8 @@ describe('helper argv builders', () => {
         expect(remoteHelperCommand(['version'])).toEqual(['sudo', '-n', '/usr/local/sbin/idea-app-data', 'version'])
         expect(remoteHelperRsyncPath(receiveAppArgs('sdb1', 'kolibri-1.0'))).toBe('sudo -n /usr/local/sbin/idea-app-data receive-app sdb1 kolibri-1.0')
         expect(deleteArgs('sdb2', 'x')).toEqual(['delete', 'sdb2', 'x'])
+        expect(eraseSlotArgs('idea-test-4', '/home/pi/.local/state/idea-engine/erase-staging/id1')).toEqual(['erase-slot', 'idea-test-4', '/home/pi/.local/state/idea-engine/erase-staging/id1'])
+        expect(() => eraseSlotArgs('sdb1', '/tmp/x')).toThrow(/not a test slot/)
         expect(borgInitArgs('sdc1', 'inst-1')).toEqual(['borg-init', 'sdc1', 'inst-1'])
         expect(borgInfoArgs('sdc1', 'inst-1')).toEqual(['borg-info', 'sdc1', 'inst-1'])
         expect(borgCreateArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', 'system')).toEqual(['borg-create', 'sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', 'system'])
@@ -198,7 +200,9 @@ describe('startup version check', () => {
 
     it('refuses to start on a version mismatch, saying ask Ops to update', async () => {
         process.env.FAKE_SUDO_OUT = 'idea-app-data 0'
-        await expect(assertAppDataHelper()).rejects.toThrow(/needs the app-data root helper \/usr\/local\/sbin\/idea-app-data version 2, but the installed one reports 'idea-app-data 0'; ask Ops to update/)
+        await expect(assertAppDataHelper()).rejects.toThrow(new RegExp(
+            `needs the app-data root helper /usr/local/sbin/idea-app-data version ${APP_DATA_HELPER_VERSION}, but the installed one reports 'idea-app-data 0'; ask Ops to update`,
+        ))
     })
 
     it('refuses to start when the helper is missing or sudo will not run it', async () => {

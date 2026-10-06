@@ -146,6 +146,25 @@ case "$1" in
 esac
 exit \${FAKE_BORG_EXIT:-0}`)
 
+    // erase-slot: record umount/mount/mkfs/losetup
+    await fake('umount', `${RECORD('umount', callsDir)}
+exit \${FAKE_UMOUNT_EXIT:-0}`)
+    await fake('mount', `${RECORD('mount', callsDir)}
+target="\${@: -1}"
+metafile="${callsDir}/erase-meta.path"
+if [[ -f "$metafile" && -d "$target" ]]; then cp -f "$(cat "$metafile")" "$target/META.yaml"; fi
+exit \${FAKE_MOUNT_EXIT:-0}`)
+    await fake('mkfs.ext4', `${RECORD('mkfs.ext4', callsDir)}
+staging=""
+while [[ $# -gt 0 ]]; do case "$1" in -d) staging="$2"; shift 2;; *) shift;; esac; done
+if [[ -n "$staging" && -f "$staging/META.yaml" ]]; then
+  echo "$staging/META.yaml" > ${callsDir}/erase-meta.path
+fi
+exit \${FAKE_MKFS_EXIT:-0}`)
+    await fake('losetup', `${RECORD('losetup', callsDir)}
+if [[ -n "\${FAKE_LOSETUP_BACKING:-}" ]]; then echo "\${FAKE_LOSETUP_BACKING}"; exit 0; fi
+exit 1`)
+
     const uid = opts.rootUid ?? process.getuid!()
     const gid = opts.rootGid ?? process.getgid!()
     let text = await fs.readFile(HELPER_SOURCE, 'utf8')
@@ -154,7 +173,8 @@ exit \${FAKE_BORG_EXIT:-0}`)
         if (!re.test(text)) throw new Error(`idea-app-data has no ${name}= line`)
         text = text.replace(re, `${name}=${value}`)
     }
-    for (const tool of ['rsync', 'rrsync', 'findmnt', 'logger', 'getent', 'df', 'runuser']) setConst(tool.toUpperCase(), path.join(bin, tool))
+    for (const tool of ['rsync', 'rrsync', 'findmnt', 'logger', 'getent', 'df', 'runuser', 'umount', 'mount', 'losetup']) setConst(tool.toUpperCase(), path.join(bin, tool))
+    setConst('MKFS', path.join(bin, 'mkfs.ext4'))
     if (!opts.realBorg) setConst('BORG', path.join(bin, 'borg'))
     setConst('DISKS_DIR', disks)
     setConst('SYSTEM_ROOT', sys)
@@ -171,6 +191,12 @@ exit \${FAKE_BORG_EXIT:-0}`)
     setConst('PEER_KNOWN_HOSTS', peerKnownHosts)
     setConst('LEDGER_DIR', ledgerDir)
     setConst('ENGINE_USER', os.userInfo().username)
+    // erase-slot: allow staging under <tmp>/erase-staging/<id> instead of /home/pi/...
+    const stagingRootEscaped = path.join(tmp, 'erase-staging').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    text = text.replace(
+        '[[ "$STAGING" =~ ^/home/pi/\\.local/state/idea-engine/erase-staging/[A-Za-z0-9_-]+$ ]]',
+        `[[ "$STAGING" =~ ^${stagingRootEscaped}/[A-Za-z0-9_-]+$ ]]`,
+    )
     const script = path.join(tmp, 'idea-app-data')
     await fs.writeFile(script, text, { mode: 0o755 })
 

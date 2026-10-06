@@ -35,6 +35,7 @@
 #   idea-app-data receive-app        <root> <appId> <rsync server args...>   (as pi)
 #   idea-app-data receive-service    <root> <rsync server args...>           (as pi)
 #   idea-app-data ensure-dirs        <root>   (apps/ instances/ services/, owned by pi)
+#   idea-app-data erase-slot       <slot> <stagingDir>   (TEST-ONLY: umount+mkfs+remount a loop-backed slot)
 #   Peer keys (the Engine, from its store):
 #   idea-app-data sync-peers   < "<engineId> ssh-ed25519 <key> ssh-ed25519 <hostkey>" lines
 #   idea-app-data borg-init    <bdev> <id>
@@ -105,7 +106,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=2
+readonly IDEA_APP_DATA_VERSION=3
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -141,6 +142,10 @@ DF=/usr/bin/df
 CMP=/usr/bin/cmp
 CHMOD=/usr/bin/chmod
 CHOWN=/usr/bin/chown
+UMOUNT=/usr/bin/umount
+MOUNT=/usr/bin/mount
+MKFS=/usr/sbin/mkfs.ext4
+LOSETUP=/usr/sbin/losetup
 
 # ── Fixed locations ──────────────────────────────────────────────────────────
 DISKS_DIR=/disks
@@ -902,8 +907,98 @@ case "$SUB" in
         exit 0
         ;;
 
+    erase-slot)
+        # TEST-ONLY: erase a loop-backed duration slot to an empty IDEA disk (Path A /
+        # idea#168 confirm_erase). Production USB erase stays on idea-erase-disk.
+        # umount + mkfs.ext4 + remount; never wipefs/sfdisk (the slot is a filesystem
+        # image, not a partitioned whole disk).
+        need 2 $(($# - 1)) "<slot> <stagingDir>"
+        SLOT_TOKEN="$2"
+        STAGING="$3"
+        check_root_shape "$SLOT_TOKEN"
+        [[ "$SLOT_TOKEN" =~ $RE_DEV || "$SLOT_TOKEN" == system ]] \
+            && refuse "erase-slot is only for test slot names (got '$SLOT_TOKEN')"
+        b=$(bridge_lookup "$SLOT_TOKEN")
+        [[ "$b" != AMBIGUOUS ]] || refuse "the test-only root bridge file $ROOTS_FILE lists '$SLOT_TOKEN' more than once"
+        [[ -n "$b" && "$b" != AMBIGUOUS ]] || refuse "unknown root '$SLOT_TOKEN' (not in the test-only root bridge)"
+        SLOT_DIR="$b"
+        BRIDGE_USED="$SLOT_TOKEN=$SLOT_DIR"
+        echo "idea-app-data: test-only root bridge: $SLOT_TOKEN -> $SLOT_DIR" >&2
+        journal "test-only root bridge: $SLOT_TOKEN -> $SLOT_DIR"
+
+        # Staging: same rules as idea-erase-disk (META.yaml only, under erase-staging)
+        [[ "$STAGING" =~ ^/home/pi/\.local/state/idea-engine/erase-staging/[A-Za-z0-9_-]+$ ]] \
+            || refuse "stagingDir must be under /home/pi/.local/state/idea-engine/erase-staging/<id>"
+        check="$STAGING"
+        while [[ "$check" != "/" && "$check" != "" ]]; do
+            if [[ -L "$check" ]]; then
+                refuse "staging path contains a symlink ($check)"
+            fi
+            check=$(dirname "$check")
+        done
+        [[ -d "$STAGING" ]] || refuse "stagingDir is not a directory"
+        owner=$($STAT -c '%U' "$STAGING" 2>/dev/null || true)
+        [[ "$owner" == "pi" || "$owner" == "$ENGINE_USER" ]] \
+            || refuse "stagingDir must be owned by pi (got ${owner:-unknown})"
+        shopt -s nullglob dotglob
+        entries=("$STAGING"/*)
+        shopt -u nullglob dotglob
+        for e in "${entries[@]:-}"; do
+            base=$(basename "$e")
+            [[ "$base" == "META.yaml" ]] || refuse "stagingDir may contain only META.yaml (found $base)"
+        done
+        [[ -f "$STAGING/META.yaml" ]] || refuse "stagingDir is missing META.yaml"
+
+        echo "STEP:checking"
+        src=""; fst=""
+        read -r src fst _ < <($FINDMNT -n -r -o SOURCE,FSTYPE --mountpoint "$SLOT_DIR" 2>/dev/null) || true
+        [[ -n "$src" ]] || refuse "$SLOT_DIR is not a mount point (need a loop-backed fixture)"
+        [[ "$fst" == ext4 ]] || refuse "$SLOT_DIR is not ext4 (got ${fst:-unknown})"
+        [[ "$src" =~ ^/dev/loop[0-9]+$ ]] \
+            || refuse "$SLOT_DIR is mounted from $src, not a loop device (erase-slot is loop-only)"
+
+        # Never touch the system root's device
+        rootsrc=""
+        read -r rootsrc _ < <($FINDMNT -n -r -o SOURCE --mountpoint / 2>/dev/null) || true
+        rootdev=${rootsrc#/dev/}
+        rootdev=${rootdev%%\[*}
+        [[ -n "$rootdev" ]] || refuse "cannot tell which device holds the root filesystem"
+        [[ "$src" != "/dev/$rootdev" && "$src" != "$rootsrc" ]] \
+            || refuse "$src holds the root filesystem"
+
+        backing=""
+        backing=$($LOSETUP -n -O BACK-FILE -- "$src" 2>/dev/null | head -1 | tr -d '[:space:]' || true)
+
+        echo "STEP:unmounting"
+        if ! $UMOUNT -- "$SLOT_DIR"; then
+            refuse "could not unmount $SLOT_DIR"
+        fi
+
+        wipe_target="$src"
+        if [[ ! -b "$wipe_target" ]]; then
+            [[ -n "$backing" && -e "$backing" && ! -L "$backing" ]] \
+                || refuse "loop device $src is gone after umount and no backing file was found"
+            wipe_target="$backing"
+        fi
+
+        echo "STEP:creating filesystem"
+        $MKFS -F -L "IDEA Disk" -E root_owner=1000:1000 -d "$STAGING" "$wipe_target" >/dev/null \
+            || refuse "mkfs.ext4 failed on $wipe_target"
+
+        echo "STEP:mounting"
+        if [[ -b "$src" ]]; then
+            $MOUNT -t ext4 -- "$src" "$SLOT_DIR" || refuse "could not remount $src on $SLOT_DIR"
+        elif [[ -n "$backing" && -e "$backing" ]]; then
+            $MOUNT -t ext4 -o loop -- "$backing" "$SLOT_DIR" || refuse "could not remount loop $backing on $SLOT_DIR"
+        else
+            $MOUNT -- "$SLOT_DIR" || refuse "could not remount $SLOT_DIR from fstab"
+        fi
+        [[ -f "$SLOT_DIR/META.yaml" ]] || refuse "META.yaml missing after erase-slot remount"
+        echo "ok: erased slot $SLOT_TOKEN as empty IDEA disk"
+        ;;
+
     "")
-        refuse "no subcommand (version, size, copy, send, receive, delete, borg-init, borg-info, borg-create, borg-extract, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, sync-peers)"
+        refuse "no subcommand (version, size, copy, send, receive, delete, borg-init, borg-info, borg-create, borg-extract, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, sync-peers)"
         ;;
     *)
         refuse "unknown subcommand '$(printf '%q' "$SUB")'"

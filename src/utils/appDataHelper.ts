@@ -36,7 +36,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '2'
+export const APP_DATA_HELPER_VERSION = '3'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: build-engine installs /usr/local/sbin/idea-app-data ' +
@@ -76,6 +76,18 @@ export const sendArgs = (srcRoot: string, srcId: string, host: string, peerEngin
 }
 /** On a peer (through its gate): create apps/, instances/, services/ on <root>, owned by pi. */
 export const ensureDirsArgs = (root: string): string[] => ['ensure-dirs', checkRoot(root)]
+/**
+ * TEST-ONLY: erase a loop-backed duration slot (idea-test-N) to an empty IDEA disk.
+ * umount + mkfs.ext4 + remount via the helper; production USB erase stays on idea-erase-disk.
+ */
+export const eraseSlotArgs = (slot: string, stagingDir: string): string[] => {
+    checkRoot(slot)
+    if (slot === 'system' || /^sd[a-z][12]$/.test(slot)) {
+        throw new Error(`'${slot}' is not a test slot name erase-slot accepts`)
+    }
+    if (!stagingDir || stagingDir.includes('\0')) throw new Error('stagingDir is required for erase-slot')
+    return ['erase-slot', slot, stagingDir]
+}
 /** On a peer: the rsync server for an app master, <root>/apps/<appId> (written as pi). */
 export const receiveAppArgs = (root: string, appId: string): string[] => ['receive-app', checkRoot(root), checkApp(appId)]
 /** On a peer: the rsync server for service image tars, <root>/services (written as pi). */

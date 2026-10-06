@@ -66,6 +66,8 @@ describe('idea-app-data: the source script (idea#168)', () => {
         expect(text).toMatch(/\$RRSYNC -wo /)
         expect(text).toMatch(/LOGGER -t idea-app-data -p auth\.notice/)
         expect(text).toMatch(/TEST-ONLY root bridge/)
+        expect(text).toMatch(/erase-slot/)
+        expect(text).toMatch(/mkfs\.ext4/)
         expect(text).toMatch(/test-only root bridge: \$tok -> \$b/)
         expect(text).toMatch(/^ROOTS_FILE=\/etc\/idea\/app-data-roots$/m)
         expect(text).toMatch(/^HELPER_PATH=\/usr\/local\/sbin\/idea-app-data$/m)
@@ -75,7 +77,7 @@ describe('idea-app-data: the source script (idea#168)', () => {
         for (const m of text.matchAll(/^([A-Z_]+)=(\/\S+)$/gm)) {
             if (['PATH', 'DISKS_DIR', 'ROOTS_FILE', 'LOCK_DIR', 'ROOT_HOME', 'HELPER_PATH',
                 'PEER_KEY', 'PEER_KNOWN_HOSTS', 'PEER_AUTH_DIR', 'PEER_GATE', 'LEDGER_DIR'].includes(m[1])) continue
-            expect(m[2], m[1]).toMatch(/^\/usr\/(s?bin)\/[a-z.]+$/)
+            expect(m[2], m[1]).toMatch(/^\/usr\/(s?bin)\/[a-z0-9.]+$/)
         }
     })
 
@@ -105,7 +107,7 @@ describe('idea-app-data: argument checks', () => {
         const cases: [string, number][] = [
             ['version', 0], ['size', 2], ['copy', 4], ['send', 6], ['delete', 2],
             ['borg-init', 2], ['borg-info', 2], ['borg-create', 4], ['borg-extract', 5],
-            ['ensure-dirs', 1], ['peer-delete', 3], ['sync-peers', 0],
+            ['ensure-dirs', 1], ['erase-slot', 2], ['peer-delete', 3], ['sync-peers', 0],
         ]
         for (const [sub, n] of cases) {
             for (const count of [n - 1, n + 1]) {
@@ -532,6 +534,79 @@ describe('idea-app-data: the TEST-ONLY root bridge (/etc/idea/app-data-roots)', 
         const roots = await addBridge(sb, ['idea-test-1'])
         await fs.appendFile(sb.rootsFile, `${roots['idea-test-1']}\n`)
         refused(await sb.run(['size', 'idea-test-1', 'inst1']), /lists 'idea-test-1' more than once/)
+    })
+})
+
+
+describe('idea-app-data: erase-slot (loop-backed duration fixtures)', () => {
+    const prepSlot = async (s: AppDataSandbox, slot = 'idea-test-4') => {
+        const roots = await addBridge(s, [slot])
+        const slotDir = roots[slot]
+        await fs.writeFile(path.join(slotDir, 'META.yaml'), 'diskId: old\n')
+        await fs.appendFile(s.mounts, `${slotDir} /dev/loop3 ext4\n`)
+        const backing = path.join(s.tmp, 'images', `${slot}.ext4.img`)
+        await fs.ensureDir(path.dirname(backing))
+        await fs.writeFile(backing, 'fake-image')
+        const staging = path.join(s.tmp, 'erase-staging', 'id1')
+        await fs.ensureDir(staging)
+        await fs.writeFile(path.join(staging, 'META.yaml'), 'diskId: duration-empty-002\ndiskName: IDEA Disk\n')
+        return { slotDir, backing, staging }
+    }
+
+    it('umount + mkfs.ext4 + remount on a loop-backed slot; copies META from staging', async () => {
+        const { slotDir, backing, staging } = await prepSlot(sb)
+        const r = await sb.run(['erase-slot', 'idea-test-4', staging], { FAKE_LOSETUP_BACKING: backing })
+        expect(r.exitCode, r.stderr + r.stdout).toBe(0)
+        expect(r.stdout).toMatch(/STEP:unmounting/)
+        expect(r.stdout).toMatch(/STEP:creating filesystem/)
+        expect(r.stdout).toMatch(/STEP:mounting/)
+        expect(r.stdout).toMatch(/ok: erased slot idea-test-4/)
+        const umount = await sb.calls('umount')
+        expect(umount).toHaveLength(1)
+        expect(umount[0].argv).toContain(slotDir)
+        const mkfs = await sb.calls('mkfs.ext4')
+        expect(mkfs).toHaveLength(1)
+        expect(mkfs[0].argv.slice(0, 6)).toEqual(['-F', '-L', 'IDEA Disk', '-E', 'root_owner=1000:1000', '-d'])
+        expect(mkfs[0].argv).toContain(staging)
+        // Prefer the still-attached loop device; fall back to the backing file
+        expect(['/dev/loop3', backing]).toContain(mkfs[0].argv[mkfs[0].argv.length - 1])
+        expect(mkfs[0].argv).not.toContain('wipefs')
+        expect(mkfs[0].argv).not.toContain('sfdisk')
+        const mount = await sb.calls('mount')
+        expect(mount.length).toBeGreaterThanOrEqual(1)
+        expect(await fs.readFile(path.join(slotDir, 'META.yaml'), 'utf8')).toMatch(/duration-empty-002/)
+    })
+
+    it('refuses when umount fails (still mounted)', async () => {
+        const { staging, backing } = await prepSlot(sb)
+        refused(await sb.run(['erase-slot', 'idea-test-4', staging], {
+            FAKE_UMOUNT_EXIT: '1',
+            FAKE_LOSETUP_BACKING: backing,
+        }), /could not unmount/)
+        expect(await sb.calls('mkfs.ext4')).toEqual([])
+    })
+
+    it('refuses a non-loop mount, sdX token, and a missing bridge entry', async () => {
+        const roots = await addBridge(sb, ['idea-test-4'])
+        await fs.appendFile(sb.mounts, `${roots['idea-test-4']} /dev/sdb1 ext4\n`)
+        const staging = path.join(sb.tmp, 'erase-staging', 'id2')
+        await fs.ensureDir(staging)
+        await fs.writeFile(path.join(staging, 'META.yaml'), 'diskId: x\n')
+        refused(await sb.run(['erase-slot', 'idea-test-4', staging]), /not a loop device/)
+        refused(await sb.run(['erase-slot', 'sdb1', staging]), /only for test slot names/)
+        refused(await sb.run(['erase-slot', 'idea-test-9', staging]), /unknown root/)
+    })
+
+    it('refuses the system disk if a loop somehow held root', async () => {
+        const roots = await addBridge(sb, ['idea-test-4'])
+        // Remap / to the same loop (pathological)
+        await fs.writeFile(sb.mounts, `${roots['idea-test-4']} /dev/loop3 ext4\n/ /dev/loop3 ext4\n`)
+        const staging = path.join(sb.tmp, 'erase-staging', 'id3')
+        await fs.ensureDir(staging)
+        await fs.writeFile(path.join(staging, 'META.yaml'), 'diskId: x\n')
+        refused(await sb.run(['erase-slot', 'idea-test-4', staging], {
+            FAKE_LOSETUP_BACKING: path.join(sb.tmp, 'x.img'),
+        }), /holds the root filesystem/)
     })
 })
 
