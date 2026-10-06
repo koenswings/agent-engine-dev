@@ -37,6 +37,14 @@ import { DEFAULT_PREFLIGHT_TIMEOUT_MS } from './realFleetOps.js'
 import { EXIT_STORE_PREFLIGHT, formatStoreMismatch, runStorePreflight } from './storePreflight.js'
 import { EXIT_SLOT_PREFLIGHT } from './slotLayout.js'
 import { EXIT_FIXTURE_PREFLIGHT, fixtureDiskPreflight } from './fixtureDisks.js'
+import {
+    EXIT_PEER_PREFLIGHT,
+    deriveCopyPairs,
+    peerPreflightVerdict,
+    requiredHelperVersion,
+    type PeerHostProbe,
+    type PeerPreflightResult,
+} from './peerPreflight.js'
 import { resolveConsoleEngineHost } from './actions.js'
 import {
     buildRunSummary,
@@ -107,9 +115,20 @@ const usage = () => {
                         From step 1 each must be docked on the Console engine and Empty
                         (diskTypes=[empty], no instances); with --start-from only docked +
                         distinct. A failure exits 8 (fixture_disk_preflight).
+                        Peer-key preflight (EVERY --live walk; NOT skipped by --no-preflight):
+                        the walk's cross-Engine copy steps (copy_app, at/after --start-from)
+                        need every pool pair (never idea02) to have exchanged per-Pi Engine
+                        keys: both entries publish peerAccess, each lists the other in
+                        peerAccess.authorized with the other's CURRENT key + host key
+                        fingerprints, no pool Engine authorizes idea02 or a non-pool Engine;
+                        read-only ssh per Pi: idea-app-data version >= 2 and (if readable)
+                        /etc/ssh/idea_authorized_keys/pi + /etc/idea/peer_known_hosts hold
+                        the peer's published keys. The slot-layout check then also needs
+                        helper >= 2 on helper Pis. No copy step → skipped (logged). A failure
+                        exits 9 (peer_preflight, names the pair and the reason).
   Exit codes: 0 ok · 1 walk failures · 2 fatal/refused · 4 engine unreachable ·
               5 Console pin mismatch · 6 store preflight mismatch · 7 slot-layout preflight ·
-              8 fixture-disk preflight
+              8 fixture-disk preflight · 9 peer-key preflight
   --dwell-ms <n>        Dwell between transitions (default: 30000 / --fast 80)
   --help                this message
 
@@ -296,6 +315,17 @@ const main = async () => {
         : (args.iterations ?? 40)
     const seed = args.seed ?? scenario.seed
     const pool = scenario.pool_engines ?? [...DEFAULT_POOL]
+    // idea#168: the cross-Engine copy steps this run executes (--start-from / --iterations
+    // applied) and the pool pairs whose per-Pi keys they need (peer preflight, exit 9).
+    const peerPlan = walk
+        ? deriveCopyPairs({
+            steps: walk.steps,
+            startIndex,
+            endIndex: startIndex + iterations,
+            poolEngines: pool,
+            excludeEngines: scenario.exclude_engines,
+        })
+        : null
     const fixtureInstances: Record<string, string> = {}
     for (const f of scenario.fixtures ?? []) {
         if (f.instanceId) fixtureInstances[f.diskId] = f.instanceId
@@ -429,11 +459,14 @@ const main = async () => {
         // idea#168 (Steve GO, option a): EVERY live run — which slot layout is in force on each
         // pool Pi (helper vs legacy), and a helper Pi's layout must be what the helper needs.
         // Read-only ssh. Legacy Pis (no helper: the current f65183a pool) pass unchanged.
-        const sl = await ops.preflightSlotLayout(pool)
+        // Helper floor: v1 in general, v2 when the walk copies across Pis (peer keys = v2 sync-peers).
+        const helperMin = peerPlan ? requiredHelperVersion(peerPlan) : 1
+        const sl = await ops.preflightSlotLayout(pool, helperMin)
         for (const v of sl) console.log(`[duration] ${v.message}`)
         console.log(JSON.stringify({
             event: 'slot_layout_preflight',
             ok: sl.every(v => v.ok),
+            helper_min_version: helperMin,
             pis: sl.map(v => ({ engine: v.engine, host: v.host, mode: v.ok || v.mode === 'helper' ? v.mode : 'unknown', helper_version: v.helperVersion, ok: v.ok, problems: v.problems })),
         }))
         if (!sl.every(v => v.ok)) {
@@ -483,6 +516,53 @@ const main = async () => {
                 await uiDriver.close?.().catch(() => {})
                 await ops.close().catch(() => {})
                 process.exit(EXIT_FIXTURE_PREFLIGHT)
+            }
+
+            // idea#168 per-Pi Engine keys: every cross-Engine copy step the run executes needs its
+            // pool pairs' keys published and mutually accepted (the Engine's copy validate()
+            // refuses otherwise) — exit 9 before step 1, not at copy_app 40/116 steps in. Read-only.
+            const plan = peerPlan!
+            let pv: PeerPreflightResult
+            if (!plan.pairs.length) {
+                pv = peerPreflightVerdict({ plan, store: { via: consoleEngine, engines: {}, liveIdOf: {} } })
+            } else {
+                const engines = [...new Set(plan.pairs.flatMap(p => [p.a, p.b]))]
+                const probes: Record<string, PeerHostProbe | Error> = {}
+                for (const e of engines) {
+                    try {
+                        probes[e] = await ops.probePeerHost(e)
+                    } catch (err) {
+                        probes[e] = err instanceof Error ? err : new Error(String(err))
+                    }
+                }
+                try {
+                    pv = peerPreflightVerdict({ plan, store: await ops.readPeerStore(consoleEngine), hosts: ops.getHostMap(), probes })
+                } catch (err) {
+                    const why = `peer preflight: store read on ${consoleEngine} failed: ${err instanceof Error ? err.message : String(err)}`
+                    pv = { ok: false, skipped: false, pairs: [], problems: [{ kind: 'probe-failed', subject: consoleEngine, message: why }], notes: [], message: why }
+                }
+            }
+            console.log(`[duration] ${pv.message}`)
+            for (const n of pv.notes) console.log(`[duration] peer preflight note: ${n}`)
+            console.log(JSON.stringify({
+                event: 'peer_preflight',
+                ok: pv.ok,
+                skipped: pv.skipped,
+                copy_steps: plan.copySteps,
+                from_step: plan.fromStep,
+                helper_min_version: helperMin,
+                pairs: pv.pairs.length
+                    ? pv.pairs.map(r => ({ a: r.a, b: r.b, host_a: r.hostA, host_b: r.hostB, steps: r.steps, a_accepts_b: r.aAcceptsB, b_accepts_a: r.bAcceptsA, ok: r.ok }))
+                    : plan.pairs.map(p => ({ a: p.a, b: p.b, steps: p.steps })),
+                problems: pv.problems,
+                notes: pv.notes,
+            }))
+            if (!pv.ok) {
+                for (const p of pv.problems) console.error(`[duration] FATAL (peer preflight, ${p.kind}): ${p.message}`)
+                console.log(JSON.stringify(timeoutSummary()))
+                await uiDriver.close?.().catch(() => {})
+                await ops.close().catch(() => {})
+                process.exit(EXIT_PEER_PREFLIGHT)
             }
         }
     }

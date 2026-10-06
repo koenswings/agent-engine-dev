@@ -39,6 +39,7 @@ import {
     type SlotLayoutMode,
     type SlotLayoutVerdict,
 } from './slotLayout.js'
+import { buildPeerProbeRemote, parsePeerProbe, type PeerHostProbe, type PeerStoreView } from './peerPreflight.js'
 import type { DurationCommandTrace } from './actions.js'
 import {
     abandonRepo,
@@ -1295,13 +1296,13 @@ export class RealFleetOps implements FleetOps {
      * (`/usr/local/sbin/idea-app-data` exists and `sudo -n … version` answers), the disks root's
      * owner/mode, the required slots, the helper's root bridge. Tests override this.
      */
-    protected async probeSlotLayout(engineId: string): Promise<SlotLayoutVerdict> {
+    protected async probeSlotLayout(engineId: string, minHelperVersion = 1): Promise<SlotLayoutVerdict> {
         this.assertNotExcluded(engineId, 'probeSlotLayout')
         assertPrivateDurationRoots(this.disksRoot, this.watchDir)
         const host = this.hostOf(engineId)
         const slots = requiredSlotNames()
         const out = await this.ssh(host, buildSlotLayoutProbeRemote(this.disksRoot, slots))
-        return slotLayoutVerdict(engineId, host, this.disksRoot, parseSlotLayoutProbe(out), slots)
+        return slotLayoutVerdict(engineId, host, this.disksRoot, parseSlotLayoutProbe(out), slots, minHelperVersion)
     }
 
     /**
@@ -1309,12 +1310,12 @@ export class RealFleetOps implements FleetOps {
      * `slot_layout_preflight`). Caches each verdict for the walk. A probe that fails over SSH is
      * a FAIL (never a silent legacy).
      */
-    async preflightSlotLayout(engines: readonly string[]): Promise<SlotLayoutVerdict[]> {
+    async preflightSlotLayout(engines: readonly string[], minHelperVersion = 1): Promise<SlotLayoutVerdict[]> {
         const out: SlotLayoutVerdict[] = []
         for (const id of engines) {
             let v: SlotLayoutVerdict
             try {
-                v = await this.probeSlotLayout(id)
+                v = await this.probeSlotLayout(id, minHelperVersion)
             } catch (e) {
                 const host = this.hostOf(id)
                 const why = e instanceof Error ? e.message : String(e)
@@ -1339,6 +1340,49 @@ export class RealFleetOps implements FleetOps {
             this.slotLayouts.set(engineId, v)
         }
         return v.mode
+    }
+
+    /**
+     * idea#168 peer preflight: READ-ONLY copy of every Engine entry (live id, hostname,
+     * peerAccess, lastRun) in the store doc synced from `viaEngine`, plus each pool engine's
+     * live engineDB key. Never calls storeHandle.change().
+     */
+    async readPeerStore(viaEngine: string): Promise<PeerStoreView> {
+        this.assertNotExcluded(viaEngine, 'readPeerStore(via)')
+        const conn = await this.connect(viaEngine)
+        const doc = conn.storeHandle.doc()
+        if (!doc) throw new Error(`RealFleetOps: store doc not ready for ${viaEngine}`)
+        const engines: PeerStoreView['engines'] = {}
+        for (const [id, raw] of Object.entries(doc.engineDB ?? {})) {
+            const e = (raw ?? {}) as unknown as Record<string, unknown>
+            const pa = e.peerAccess as Record<string, unknown> | null | undefined
+            engines[id] = {
+                liveId: id,
+                hostname: e.hostname == null ? null : String(e.hostname),
+                lastRun: typeof e.lastRun === 'number' ? e.lastRun : null,
+                peerAccess: pa == null
+                    ? (pa as null | undefined)
+                    : {
+                        sshKey: pa.sshKey == null ? pa.sshKey : String(pa.sshKey),
+                        hostKey: pa.hostKey == null ? pa.hostKey : String(pa.hostKey),
+                        publishedAt: typeof pa.publishedAt === 'number' ? pa.publishedAt : null,
+                        authorized: Array.isArray(pa.authorized) ? Array.from(pa.authorized as unknown[]).map(String) : pa.authorized,
+                    },
+            }
+        }
+        const liveIdOf: Record<string, string | null> = {}
+        for (const id of this.listPoolEngines()) {
+            const live = this.liveIds.get(id) ?? this.discoverLiveEngineId(doc, id)
+            liveIdOf[id] = live && engines[live] ? live : null
+        }
+        return { via: viaEngine, engines, liveIdOf }
+    }
+
+    /** idea#168 peer preflight: READ-ONLY ssh probe (helper version, peer files, own key files). Never idea02. */
+    async probePeerHost(engineId: string): Promise<PeerHostProbe> {
+        this.assertNotExcluded(engineId, 'probePeerHost')
+        if (isNeverStoreProbe(engineId)) throw new Error(`RealFleetOps: probePeerHost refused for '${engineId}' (never idea02)`)
+        return parsePeerProbe(await this.ssh(this.hostOf(engineId), buildPeerProbeRemote()))
     }
 
     async probeStoreConfig(engineId: string): Promise<string> {

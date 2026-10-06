@@ -195,7 +195,7 @@ ffmpeg on this box: `/usr/bin/ffmpeg`.
   (default `3zoqd`), `settings.mdns: true` and `IDEA_MDNS_DISABLE` not `true`, no `IDEA_STATIC_PEERS` /
   `settings.staticPeers`. Any mismatch → exit **6** before step 1 (Pi, field, expected vs actual). Exit codes:
   1 walk failures · 2 fatal/refused · 4 engine unreachable · 5 Console pin · 6 store preflight · 7 slot-layout preflight ·
-  8 fixture-disk preflight.
+  8 fixture-disk preflight · 9 peer-key preflight.
 - Slot layout (idea#168, app-data root helper; `slotLayout.ts`). Every `--live` run logs `slot_layout_preflight`
   per Pi (read-only ssh). **mode=legacy** — no `/usr/local/sbin/idea-app-data` on the Pi (the current f65183a
   pool): slot handling unchanged (the harness creates/removes `idea-test-N` dirs, stages moves in
@@ -218,6 +218,18 @@ ffmpeg on this box: `/usr/bin/ffmpeg`.
   `fixture_disk_preflight`: from step 1 each consumed role's disk must be docked on the Console engine and Empty
   (diskTypes=[empty], no instances), with `--start-from` docked + distinct only; role ids must be pairwise distinct
   (r38 ran with `DURATION_BACKUP_DISK_ID=DURATION_EMPTY_DISK_ID=duration-empty-001`). Else exit **8** before step 1.
+- Per-Pi peer keys (idea#168; `peerPreflight.ts`; Engine feat/app-data-root-helper). Every `--live` walk logs
+  `peer_preflight`. The cross-Engine copy steps are the walk's `copy_app` steps at/after `--start-from` (cover-all
+  @43/@116; cover-all-skip-copy has none → `peer preflight skipped: no cross-engine copy steps`). Which Pis a copy joins
+  is read from the store at run time and the walk can dock the app disks on any pool Pi, so every pool pair (never
+  idea02) is checked, both ways: both Engine entries publish `peerAccess` (sshKey + ed25519 hostKey); each lists the
+  other in `peerAccess.authorized` as `<engineId> <SHA256 key fp> <SHA256 hostkey fp>` with the other's CURRENT keys;
+  no pool Engine authorizes idea02 or a non-pool Engine. Read-only ssh per Pi: `sudo -n idea-app-data version` >= 2;
+  `/etc/ssh/idea_authorized_keys/pi` (gate line per peer) and `/etc/idea/peer_known_hosts` (pinned host key per peer)
+  hold the peer's published keys — when not readable the store check stands alone (logged as a note); the Pi's own
+  `~/.ssh/idea_engine_ed25519.pub` / `ssh_host_ed25519_key.pub` match what it publishes. Else exit **9** before step 1,
+  naming the pair and the reason (unpublished, one-sided, not-exchanged, fingerprint-mismatch, foreign-id,
+  helper-too-old, probe-failed). With a cross-Engine copy in the run the slot-layout check needs helper >= 2 (else >= 1).
 - META.yaml is never compared by bytes or sha (skipMetaUpdate:false rewrites it on every dock): checks use the
   parsed `diskId` (+ `created` where two META files are compared, e.g. moveDisk); see `metaYaml.ts`.
 - `dockFixture` = rsync Kid pack → `duration-disks/idea-test-N/` + touch sentinel under `duration-watch` (excludes `instances/` so Engine does not auto-start apps). `undock` = `ejectDisk` + remove sentinel. `moveDisk` = undock then dock.
