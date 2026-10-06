@@ -179,7 +179,8 @@ on_signal() {
     REFUSAL=""
     SUB="${SUB} (cancelled by SIG$sig)"
     trap - EXIT
-    (exit 128) ; log_exit
+    # log the status the caller will see: 128 + signal number (143 for TERM)
+    (exit $((128 + $(kill -l "$sig")))) ; log_exit
     trap - "$sig"
     kill -"$sig" $$
     exit 1

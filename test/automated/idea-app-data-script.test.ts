@@ -553,6 +553,6 @@ describe('idea-app-data: logging and cancellation', () => {
         const result = await new Promise<{ code: number | null, signal: string | null }>(res => proc.on('close', (code, signal) => res({ code, signal })))
         expect(result.signal).toBe('SIGTERM')
         expect(Date.now() - t0).toBeLessThan(10_000)
-        expect(await sb.journalText()).toMatch(/sub=copy \(cancelled by SIGTERM\)/)
+        expect(await sb.journalText()).toMatch(/sub=copy \(cancelled by SIGTERM\) .* exit=143 /)
     }, 20_000)
 })
