@@ -222,20 +222,39 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
 /** /META.yaml may be created when missing unless skipMetaUpdate() (idea#145, idea#168). */
 export const allowSystemMetaCreate = (): boolean => !skipMetaUpdate()
 
-export const readHardwareId = async (device: DeviceName): Promise<DiskID | undefined> => {
+/**
+ * Which serial reader a block device needs, from its sysfs model and vendor.
+ * The vendor compare is case-insensitive (idea#168): an Intenso stick reports
+ * 'INTENSO' on some kernels/firmware and 'Intenso' on others (idea01).
+ */
+export const hardwareIdReaderFor = (model: string, vendor: string): 'samsungFit' | 'intenso' | null => {
+  if (model.trim() === 'Flash Drive FIT') return 'samsungFit'
+  if (vendor.trim().toUpperCase() === 'INTENSO') return 'intenso'
+  return null
+}
+
+export interface HardwareIdDeps {
+  readSysfs: (path: string) => Promise<string>
+  samsungFit: (device: DeviceName) => Promise<DiskID | undefined>
+  intenso: (device: DeviceName) => Promise<DiskID | undefined>
+}
+
+export const readHardwareId = async (device: DeviceName, deps: Partial<HardwareIdDeps> = {}): Promise<DiskID | undefined> => {
   log(`Reading disk id for device ${device}`)
+  const readSysfs = deps.readSysfs ?? (async (p: string) => (await $`cat ${p}`).stdout)
   try {
     const rootDevice = stripPartition(device)
     log(`Root device is ${rootDevice}`)
     //const model = (await $`lsblk -o MODEL /dev/${rootDevice} --noheadings`).stdout.trim()
-    const model = (await $`cat /sys/block/${rootDevice}/device/model`).stdout.trim()
+    const model = (await readSysfs(`/sys/block/${rootDevice}/device/model`)).trim()
     log(`Model is ${model}`)
-    const vendor = (await $`cat /sys/block/${rootDevice}/device/vendor`).stdout.trim()
+    const vendor = (await readSysfs(`/sys/block/${rootDevice}/device/vendor`)).trim()
     log(`Vendor is ${vendor}`)
-    if (model === 'Flash Drive FIT') {
-      return await readHardwareIdSamsungFIT(device)
-    } else if (vendor === 'INTENSO') {
-      return await readHardwareIdIntenso(device)
+    const reader = hardwareIdReaderFor(model, vendor)
+    if (reader === 'samsungFit') {
+      return await (deps.samsungFit ?? readHardwareIdSamsungFIT)(device)
+    } else if (reader === 'intenso') {
+      return await (deps.intenso ?? readHardwareIdIntenso)(device)
     } else {
       log(`Model ${model} of vendor ${vendor} not recognized`)
       return undefined
