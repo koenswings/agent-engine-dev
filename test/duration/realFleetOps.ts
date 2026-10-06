@@ -130,12 +130,18 @@ const DISK_ID_TO_PACK: Record<string, string> = {
     'duration-empty-001': 'empty',
     /** Prefer A r17 second empty (Kid App#10 pack empty-002/). */
     'duration-empty-002': 'empty-002',
+    /** idea#168 r38@103: the Backup Disk under test (third Empty fixture; Path A idea-test-6). */
+    'duration-empty-003': 'empty-003',
 }
+
+/** Kid empty packs (META.yaml only after the createFilesDisk-clean strip). */
+const EMPTY_PACKS = new Set(['empty', 'empty-002', 'empty-003'])
 
 /** Prefer Atlas dock slot when allocating (empty → idea-test-3; empty2 → idea-test-4). */
 const DISK_ID_PREFERRED_DEVICE: Record<string, string> = {
     'duration-empty-001': 'idea-test-3',
     'duration-empty-002': 'idea-test-4',
+    'duration-empty-003': 'idea-test-6',
 }
 
 /** Known Path A instance ids (no duration- prefix on the container/instance). */
@@ -444,7 +450,7 @@ export const resolveDurationFixturePack = (diskId: string): string => {
 /** Prefer A r21: empty / empty-002 packs (always fresh-copy, never redirected). */
 export const isEmptyFixtureDisk = (diskId: string): boolean => {
     const pack = DISK_ID_TO_PACK[diskId]
-    return pack === 'empty' || pack === 'empty-002'
+    return !!pack && EMPTY_PACKS.has(pack)
 }
 
 export type SshDockCopyRemoteArgs = {
@@ -550,7 +556,7 @@ export const buildSshDockCopyRemote = (args: SshDockCopyRemoteArgs): string => {
     if (args.slotMode === 'helper') return buildSshDockCopyRemoteHelper(args)
     const { diskId, pack, src, dest, sentinel, disksRoot, watchDir, startInstances } = args
     const stripInstances = startInstances ? ':' : `rm -rf '${dest}/instances'`
-    const isEmpty = pack === 'empty' || pack === 'empty-002'
+    const isEmpty = EMPTY_PACKS.has(pack)
     // idea#168: app packs carry their staged services/*.tar (before the dock fires).
     const ensureTars = !isEmpty && args.serviceTars && args.serviceTars.tars.length
         ? `${buildEnsureServiceTarsRemote(dest, args.serviceTars.root, args.serviceTars.tars).replace(/^set -euo pipefail; /, '')}; `
@@ -559,7 +565,7 @@ export const buildSshDockCopyRemote = (args: SshDockCopyRemoteArgs): string => {
         'set -euo pipefail',
         `mkdir -p '${disksRoot}' '${watchDir}'`,
     ]
-    if (pack === 'empty' || pack === 'empty-002') {
+    if (EMPTY_PACKS.has(pack)) {
         // Empty has no docker-owned instance files — wipe is safe. Refuse only when
         // dest META belongs to a different diskId (never steal kolibri/nextcloud slot).
         parts.push(
@@ -583,7 +589,7 @@ export const buildSshDockCopyRemote = (args: SshDockCopyRemoteArgs): string => {
             `echo "RealFleetOps: refuse overwrite occupied ${dest} (no matching META for ${diskId})" >&2; exit 4; fi`,
         )
     }
-    const isEmptyPack = pack === 'empty' || pack === 'empty-002'
+    const isEmptyPack = EMPTY_PACKS.has(pack)
     parts.push(
         `test -d '${src}' || { echo "missing fixture source ${src}" >&2; exit 2; }`,
     )
@@ -642,7 +648,7 @@ export const buildSshDockCopyRemoteHelper = (args: SshDockCopyRemoteArgs): strin
         throw new Error(`RealFleetOps: refuse dock copy into ${dest} (not a direct child of ${disksRoot})`)
     }
     assertSlotPath(disksRoot, slot)
-    const isEmptyPack = pack === 'empty' || pack === 'empty-002'
+    const isEmptyPack = EMPTY_PACKS.has(pack)
     const ensureTars = !isEmptyPack && args.serviceTars && args.serviceTars.tars.length
         ? `${buildEnsureServiceTarsRemote(dest, args.serviceTars.root, args.serviceTars.tars).replace(/^set -euo pipefail; /, '')}; `
         : ''

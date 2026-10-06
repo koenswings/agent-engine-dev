@@ -36,6 +36,8 @@ import { EXIT_ENGINE_UNREACHABLE, installProcessGuards, timeoutSummary, walkExit
 import { DEFAULT_PREFLIGHT_TIMEOUT_MS } from './realFleetOps.js'
 import { EXIT_STORE_PREFLIGHT, formatStoreMismatch, runStorePreflight } from './storePreflight.js'
 import { EXIT_SLOT_PREFLIGHT } from './slotLayout.js'
+import { EXIT_FIXTURE_PREFLIGHT, fixtureDiskPreflight } from './fixtureDisks.js'
+import { resolveConsoleEngineHost } from './actions.js'
 import {
     buildRunSummary,
     formatRunSummaryLine,
@@ -92,13 +94,22 @@ const usage = () => {
                         read-only, per pool Pi. No /usr/local/sbin/idea-app-data → mode=legacy
                         (pre-helper slot handling, unchanged). Helper present → mode=helper,
                         enforced: \`sudo -n idea-app-data version\` answers, the disks root is
-                        root-owned and not group/other-writable, idea-test-1..5 exist, are real
+                        root-owned and not group/other-writable, idea-test-1..6 exist, are real
                         dirs (no symlink) and pi-writable, and /etc/idea/app-data-roots (root:root
                         0644) lists each; the harness then never creates or removes a slot dir
                         (it empties slots; instances/<id> via sudo -n idea-app-data delete).
                         A failure exits 7 (slot_layout_preflight).
+                        Fixture-disk preflight (EVERY --live walk; NOT skipped by --no-preflight):
+                        each Empty-disk role the executed steps consume needs its own disk —
+                        Files (install_app / make_files_disk: DURATION_EMPTY_DISK_ID, default
+                        duration-empty-001), Backup (make_backup_disk: DURATION_BACKUP_DISK_ID,
+                        default duration-empty-003), Erase (erase_disk: duration-empty-002).
+                        From step 1 each must be docked on the Console engine and Empty
+                        (diskTypes=[empty], no instances); with --start-from only docked +
+                        distinct. A failure exits 8 (fixture_disk_preflight).
   Exit codes: 0 ok · 1 walk failures · 2 fatal/refused · 4 engine unreachable ·
-              5 Console pin mismatch · 6 store preflight mismatch · 7 slot-layout preflight
+              5 Console pin mismatch · 6 store preflight mismatch · 7 slot-layout preflight ·
+              8 fixture-disk preflight
   --dwell-ms <n>        Dwell between transitions (default: 30000 / --fast 80)
   --help                this message
 
@@ -431,6 +442,48 @@ const main = async () => {
             await uiDriver.close?.().catch(() => {})
             await ops.close().catch(() => {})
             process.exit(EXIT_SLOT_PREFLIGHT)
+        }
+
+        // idea#168 r38@103: EVERY live walk — the Files, Backup and Erase Empty disks the walk
+        // consumes must be distinct, docked and (from step 1) Empty on the Console engine, else
+        // exit 8 before step 1 instead of failing at erase_disk 100 steps in. Read-only.
+        if (walk) {
+            const consoleEngine = resolveConsoleEngineHost(
+                { poolEngines: pool, excludeEngines: scenario.exclude_engines, opts: { ops } },
+                { ...process.env, ...(args.consoleUrl ? { DURATION_CONSOLE_URL: args.consoleUrl } : {}) },
+            )
+            let fp: ReturnType<typeof fixtureDiskPreflight> | null = null
+            let readErr: string | null = null
+            try {
+                fp = fixtureDiskPreflight({
+                    steps: walk.steps.slice(0, startIndex + iterations),
+                    startIndex,
+                    consoleEngine,
+                    poolEngines: pool.filter(e => !scenario.exclude_engines.includes(e)),
+                    view: await ops.readStore(consoleEngine),
+                })
+            } catch (e) {
+                readErr = `fixture disk preflight: store read on ${consoleEngine} failed: ${e instanceof Error ? e.message : String(e)}`
+            }
+            console.log(`[duration] ${fp?.message ?? readErr}`)
+            console.log(JSON.stringify({
+                event: 'fixture_disk_preflight',
+                ok: !!fp?.ok,
+                from_start: fp?.fromStart ?? startIndex <= 0,
+                console_engine: consoleEngine,
+                roles: (fp?.roles ?? []).map(r => ({
+                    role: r.role, disk_id: r.diskId, steps: r.steps, docked_to: r.state.dockedTo,
+                    disk_types: r.state.diskTypes, instances: r.state.instances, empty: r.state.empty, ok: r.ok,
+                })),
+                problems: fp?.problems ?? [readErr],
+            }))
+            if (!fp?.ok) {
+                for (const p of fp?.problems ?? [readErr]) console.error(`[duration] FATAL (fixture disk preflight): ${p}`)
+                console.log(JSON.stringify(timeoutSummary()))
+                await uiDriver.close?.().catch(() => {})
+                await ops.close().catch(() => {})
+                process.exit(EXIT_FIXTURE_PREFLIGHT)
+            }
         }
     }
 

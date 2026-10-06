@@ -194,17 +194,30 @@ ffmpeg on this box: `/usr/bin/ffmpeg`.
   (read-only ssh + the Engine's `/api/store-url` + the harness WS doc): per Pi, store id = `DURATION_EXPECTED_STORE_ID`
   (default `3zoqd`), `settings.mdns: true` and `IDEA_MDNS_DISABLE` not `true`, no `IDEA_STATIC_PEERS` /
   `settings.staticPeers`. Any mismatch → exit **6** before step 1 (Pi, field, expected vs actual). Exit codes:
-  1 walk failures · 2 fatal/refused · 4 engine unreachable · 5 Console pin · 6 store preflight · 7 slot-layout preflight.
+  1 walk failures · 2 fatal/refused · 4 engine unreachable · 5 Console pin · 6 store preflight · 7 slot-layout preflight ·
+  8 fixture-disk preflight.
 - Slot layout (idea#168, app-data root helper; `slotLayout.ts`). Every `--live` run logs `slot_layout_preflight`
   per Pi (read-only ssh). **mode=legacy** — no `/usr/local/sbin/idea-app-data` on the Pi (the current f65183a
   pool): slot handling unchanged (the harness creates/removes `idea-test-N` dirs, stages moves in
   `.incoming-*`, quarantines to `.moved-away/`). **mode=helper** — the helper exists and `sudo -n … version`
   answers `idea-app-data <N>`; enforced (else exit **7**): `duration-disks` root-owned and not g/o-writable,
-  `idea-test-1..5` exist, real dirs (no symlink), pi-writable, listed in `/etc/idea/app-data-roots`
+  `idea-test-1..6` exist, real dirs (no symlink), pi-writable, listed in `/etc/idea/app-data-roots`
   (root:root 0644). In helper mode the harness never creates or removes a slot dir: it empties a slot's
   contents (dotfiles included; refuses a symlink / missing / non-child slot), removes `instances/<id>` only via
   `sudo -n /usr/local/sbin/idea-app-data delete <slot> <id>`, receives a move straight into a pre-created EMPTY
   slot, and moves a moved-away slot's contents to `~/idea/duration-moved-away/` (the slot dir stays).
+- Empty fixture disks (idea#168 r38@103; `fixtureDisks.ts`). cover-all / cover-all-skip-copy consume THREE Empty
+  disks, one per role, which must be different disks: **Files** — install_app@88 + make_files_disk@91
+  (`DURATION_EMPTY_DISK_ID`, default `duration-empty-001`, Path A `idea-test-3`); **Backup** — make_backup_disk@95,
+  then backup_instance@98/@112 + restore_from_backup@100 (`DURATION_BACKUP_DISK_ID`, default `duration-empty-003`,
+  Path A `idea-test-6`, never re-docked by the harness); **Erase** — erase_disk@104/@121 + the late installs
+  (`duration-empty-002`, Path A `idea-test-4`, re-docked Empty by the harness after confirm_erase / before the second
+  install / before the late erase). Live, make_backup_disk and erase_disk are pinned to their role's disk (store
+  Empty wait + row select with EmptyDiskPanel; the Console Intent's `DURATION_EMPTY_DISK_ID` points at it for that
+  Intent only) and make_backup_disk must land `backup` on that disk in the store. Every `--live` walk logs
+  `fixture_disk_preflight`: from step 1 each consumed role's disk must be docked on the Console engine and Empty
+  (diskTypes=[empty], no instances), with `--start-from` docked + distinct only; role ids must be pairwise distinct
+  (r38 ran with `DURATION_BACKUP_DISK_ID=DURATION_EMPTY_DISK_ID=duration-empty-001`). Else exit **8** before step 1.
 - META.yaml is never compared by bytes or sha (skipMetaUpdate:false rewrites it on every dock): checks use the
   parsed `diskId` (+ `created` where two META files are compared, e.g. moveDisk); see `metaYaml.ts`.
 - `dockFixture` = rsync Kid pack → `duration-disks/idea-test-N/` + touch sentinel under `duration-watch` (excludes `instances/` so Engine does not auto-start apps). `undock` = `ejectDisk` + remove sentinel. `moveDisk` = undock then dock.

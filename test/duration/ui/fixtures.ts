@@ -44,6 +44,17 @@ export const DURATION_UI_FIXTURES = {
         packPath: 'tests/duration-tests/fixtures/empty-002',
         preferredDevice: 'idea-test-4',
     },
+    /**
+     * idea#168 r38@103: the Backup Disk under test (make_backup_disk → backup_instance ×2 →
+     * restore_from_backup). A THIRD Empty fixture: cover-all needs a separate Empty disk for
+     * Files (empty-001), Backup (this) and erase + late installs (empty-002). Path A docks it
+     * on idea01 (ext4 loop at idea-test-6); never re-docked by the harness; not an infra disk.
+     */
+    empty3: {
+        diskId: 'duration-empty-003',
+        packPath: 'tests/duration-tests/fixtures/empty-003',
+        preferredDevice: 'idea-test-6',
+    },
     /** Console#135 @ 198eb69 / Kid App#11 Prefer A Kiwix stub (not infra_disk until Atlas docks). */
     kiwix: {
         diskId: 'duration-kiwix-ideaa-001',

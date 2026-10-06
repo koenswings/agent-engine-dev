@@ -263,9 +263,9 @@ const goodHelperProbe = (over: Partial<Record<'version' | 'root' | 'bridge', str
 ].join('\n')
 
 describe('slot-layout preflight: helper present vs absent', () => {
-    it('required slots derived from the harness: idea-test-1..5', () => {
-        expect(REQUIRED_SLOT_COUNT).toBe(5)
-        expect(requiredSlotNames()).toEqual(['idea-test-1', 'idea-test-2', 'idea-test-3', 'idea-test-4', 'idea-test-5'])
+    it('required slots derived from the harness: idea-test-1..6 (r38@103 adds the Backup Disk duration-empty-003 at idea-test-6)', () => {
+        expect(REQUIRED_SLOT_COUNT).toBe(6)
+        expect(requiredSlotNames()).toEqual(['idea-test-1', 'idea-test-2', 'idea-test-3', 'idea-test-4', 'idea-test-5', 'idea-test-6'])
         expect(EXIT_SLOT_PREFLIGHT).toBe(7)
     })
 
@@ -284,7 +284,7 @@ describe('slot-layout preflight: helper present vs absent', () => {
         expect(v).toMatchObject({ mode: 'helper', ok: true, problems: [], helperVersion: 'idea-app-data 1' })
         expect(v.message).toBe(
             `slot_layout_preflight: idea03 (100.126.117.80): mode=helper (idea-app-data 1) — ${R} root-owned 0755; ` +
-            `slots idea-test-1..5 exist, pi-writable, no symlinks, listed in ${APP_DATA_ROOTS_FILE}; the harness never creates ` +
+            `slots idea-test-1..6 exist, pi-writable, no symlinks, listed in ${APP_DATA_ROOTS_FILE}; the harness never creates ` +
             `or removes a slot dir, it only empties slots (instances/<id> via sudo -n ${APP_DATA_HELPER} delete <slot> <id>)`,
         )
     })
@@ -336,7 +336,7 @@ describe('slot-layout preflight: helper present vs absent', () => {
         expect(p.helper).toBe('absent')
         expect(p.versionRc).toBeNull()
         expect(p.root).toMatchObject({ state: 'dir', uid: process.getuid!() })
-        expect(p.slots.map(x => `${x.name}=${x.state}`)).toEqual(['idea-test-1=dir', 'idea-test-2=symlink', 'idea-test-3=missing', 'idea-test-4=missing', 'idea-test-5=missing'])
+        expect(p.slots.map(x => `${x.name}=${x.state}`)).toEqual(['idea-test-1=dir', 'idea-test-2=symlink', 'idea-test-3=missing', 'idea-test-4=missing', 'idea-test-5=missing', 'idea-test-6=missing'])
         expect(p.slots[0]).toMatchObject({ writable: true })
         expect(() => parseSlotLayoutProbe('garbage')).toThrow(/unparseable/)
     })

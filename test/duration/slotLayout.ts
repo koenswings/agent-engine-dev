@@ -34,14 +34,16 @@ const RE_SLOT_NAME = /^idea-test-[0-9]+$/
 /**
  * Slots a walk can need on ONE Pi, derived from the harness:
  *  - dockFixture / moveDisk only ever use idea-test-1..FIXTURE_SLOT_COUNT (8) (the slot scan);
- *  - the walks dock at most these five disks — duration-kolibri-grade5a-001,
- *    duration-nextcloud-grade5a-001, duration-empty-001 (prefers idea-test-3),
- *    duration-empty-002 (prefers idea-test-4), duration-add-files-001 — and any of them can end
- *    up on any one Pi (infra_move_disk / move_app / restore), so a Pi needs five slots;
- *  - the empties' preferred slots (3, 4) are inside 1..5, and a slot freed by a move is emptied
- *    in place and reused, so 1..5 is enough.
+ *  - the walks use at most these six disks — duration-kolibri-grade5a-001,
+ *    duration-nextcloud-grade5a-001, duration-empty-001 (Files; prefers idea-test-3),
+ *    duration-empty-002 (erase + late installs; prefers idea-test-4), duration-add-files-001
+ *    (Path A idea-test-5) and duration-empty-003 (the Backup Disk, idea#168 r38@103; Path A
+ *    idea-test-6) — and any of them can end up on any one Pi (infra_move_disk / move_app /
+ *    backup co-location), so a Pi needs six slots;
+ *  - the preferred slots (3, 4, 6) are inside 1..6, and a slot freed by a move is emptied in
+ *    place and reused, so 1..6 is enough.
  */
-export const REQUIRED_SLOT_COUNT = 5
+export const REQUIRED_SLOT_COUNT = 6
 export const requiredSlotNames = (count = REQUIRED_SLOT_COUNT): string[] =>
     Array.from({ length: count }, (_, i) => `idea-test-${i + 1}`)
 

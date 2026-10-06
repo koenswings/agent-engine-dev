@@ -19,6 +19,7 @@ import { waitForConvergence } from './convergence.js'
 import { parse as parseYaml } from 'yaml'
 import { finalizeRecordedFrame, framePath } from './recordWalk.js'
 import { DURATION_UI_FIXTURES } from './ui/fixtures.js'
+import { backupDiskTargetId, describeDisk, diskEmptiness, eraseDiskTargetId, filesDiskTargetId, waitDiskEmpty } from './fixtureDisks.js'
 import { copyDoneBudgetMs, DEFAULT_NEXTCLOUD_READY_MS, envMs, instanceStartBudgetMs, logStartMeasured } from './startBudgets.js'
 
 export const HUB_ACTIONS = [
@@ -443,7 +444,7 @@ export const redockEmpty002AfterErase = async (ctx: ActionContext): Promise<stri
  * Prefer A r35/r36 live safety net: late install_app@85 + start_after_install@86 fills
  * duration-empty-002 with kolibri (app disk). copy_app@87 / open_copied@88 /
  * back_to_disk@89 then second install_app@90 needs EmptyDiskPanel again (empty-001
- * is backup). Mirror AfterErase undock+dockFixture, PLUS purgeStoreInstances (r36):
+ * is Files, empty-003 Backup — r38). Mirror AfterErase undock+dockFixture, PLUS purgeStoreInstances (r36):
  * Automerge instanceDB rows with storedOn=empty-002 survive FS wipe; Console
  * hasInstancesOn keys off store (AfterErase does not need this — erase cleared
  * instances). idea#168: hooked BEFORE install_app whenever walker.empty002HoldsApp
@@ -461,7 +462,7 @@ export const redockEmpty002BeforeSecondInstall = async (ctx: ActionContext): Pro
 /**
  * Prefer A r37 live safety net: second late install_app@90 fills empty-002 with
  * kolibri again (app disk). stay_on_disk@91 then erase_disk@92 needs EmptyDiskPanel
- * (empty-001 remains backup; empty-badge rows=0 otherwise). Mirror
+ * (empty-001 is Files, empty-003 Backup — r38; empty-badge rows=0 otherwise). Mirror
  * BeforeSecondInstall: undock+dockFixture + purgeStoreInstances. Hooked after
  * stay_on_disk (only CRI occurrence; precedes late erase). Do not regress
  * AfterErase (no purge) or BeforeSecondInstall.
@@ -498,9 +499,81 @@ export const redockEmpty001BeforeMakeFiles = async (ctx: ActionContext): Promise
 /**
  * Prefer A r21: the disk make_files_disk converts — DURATION_EMPTY_DISK_ID or
  * duration-empty-001. Never empty-002 / Grade5A (r21 UI fell through to "Empty Disk 002").
+ * idea#168 r38: the role → disk map (Files / Backup / Erase) lives in fixtureDisks.ts.
  */
-export const filesDiskTargetId = (env: NodeJS.ProcessEnv = process.env): string =>
-    env.DURATION_EMPTY_DISK_ID?.trim() || DURATION_UI_FIXTURES.empty.diskId
+export { backupDiskTargetId, eraseDiskTargetId, filesDiskTargetId }
+
+/**
+ * idea#168 r38@103: pin an EmptyDiskPanel Intent (make_backup_disk → the Backup Disk
+ * duration-empty-003, erase_disk → duration-empty-002) to its role's disk. Before r38 the
+ * Console Intent's discovery took "the first empty-badge row", so make_backup_disk@95
+ * consumed empty-002 and erase_disk@104 found no Empty disk. Live only (RealFleetOps):
+ * wait until the store shows the disk docked on a pool engine and Empty, then select its
+ * row with EmptyDiskPanel visible (playwright) so the Intent acts on THIS disk. Throws
+ * (fail loud, no fallback to another disk).
+ */
+export const pinEmptyDiskForIntent = async (
+    ctx: ActionContext,
+    driver: { selectDisk?: (diskId: string, opts?: { timeoutMs?: number; requireEmptyPanel?: boolean }) => Promise<string> },
+    diskId: string,
+    label: 'make_backup_disk' | 'erase_disk',
+    budgetMs?: number,
+): Promise<string | null> => {
+    const opsLive = ctx.opts.ops as FleetOps & { findDockedEngine?: unknown }
+    if (typeof opsLive.findDockedEngine !== 'function') return null
+    const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e))
+    const consoleEngine = resolveConsoleEngineHost(ctx)
+    const engines = [consoleEngine, ...pool.filter(e => e !== consoleEngine)]
+    // DURATION_FIXTURE_PIN_MS: the store-Empty wait (default fast 30 s / 60 s).
+    const budget = budgetMs ?? envMs(process.env, 'DURATION_FIXTURE_PIN_MS', ctx.opts.fast ? 30_000 : 60_000, 50)
+    let st: Awaited<ReturnType<typeof waitDiskEmpty>>
+    try {
+        st = await waitDiskEmpty(e => ctx.opts.ops.readStore(e), engines, diskId, budget)
+    } catch (e) {
+        const err = e instanceof Error ? e.message : String(e)
+        throw new Error(
+            `${label} target ${diskId}: ${err}. Each Empty role needs its own disk (Files ` +
+                `${filesDiskTargetId()}, Backup ${backupDiskTargetId()}, Erase ${eraseDiskTargetId()}); ` +
+                `never fall through to another Empty Disk. No soft-pass.`,
+        )
+    }
+    let selNote = ''
+    if (typeof driver.selectDisk === 'function') {
+        selNote = await driver.selectDisk(diskId, {
+            timeoutMs: ctx.opts.fast ? 60_000 : 120_000,
+            requireEmptyPanel: true,
+        })
+    }
+    return [`${label} pinned to ${describeDisk(st)} (Empty)`, selNote].filter(Boolean).join('; ')
+}
+
+/**
+ * idea#168 r38: make_backup_disk's Console success check accepts ANY backup badge — prove
+ * the pinned disk itself gained the backup role in the store (live only).
+ */
+export const assertBackupRoleOnDisk = async (ctx: ActionContext, diskId: string, budget = 30_000): Promise<string> => {
+    const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e))
+    const consoleEngine = resolveConsoleEngineHost(ctx)
+    const deadline = Date.now() + budget
+    let last = 'unread'
+    for (;;) {
+        try {
+            const st = diskEmptiness(await ctx.opts.ops.readStore(consoleEngine), diskId)
+            last = describeDisk(st)
+            if (st.diskTypes.includes('backup') && st.dockedTo && pool.includes(st.dockedTo)) {
+                return `store backup role on ${diskId} (${st.diskTypes.join(',')}) @${st.dockedTo}`
+            }
+        } catch (e) {
+            last = `readStore failed: ${e instanceof Error ? e.message : String(e)}`
+        }
+        if (Date.now() >= deadline) break
+        await sleep(400)
+    }
+    throw new Error(
+        `make_backup_disk soft-pass: ${last} lacks 'backup' within ${budget}ms (the Console Intent ` +
+            `accepts any backup badge). No soft-pass.`,
+    )
+}
 
 /**
  * Prefer A r21: before the make_files_disk Intent, wait until the Console engine's
@@ -1515,7 +1588,8 @@ export const ensureBackupDiskForInstance = async (
                 `for a linked Backup Disk on the instance's engine. No soft-pass.`,
         )
     }
-    const pinned = env.DURATION_BACKUP_DISK_ID?.trim()
+    // idea#168 r38: the Backup Disk under test (default duration-empty-003).
+    const pinned = backupDiskTargetId(env)
     const chosen =
         candidates.find(c => c.engine === inst.engine) ??
         candidates.find(c => c.id === pinned) ??
@@ -2528,7 +2602,8 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     let preStartSettleNote: string | null = null
     // Prefer A r35 → idea#168: before an install_app while empty-002 still holds the app a
     // previous start_after_install left there, re-dock empty-002 Empty (+ store purge) so the
-    // Console offers EmptyDiskPanel again (empty-001 is the backup disk by then). Used to hang
+    // Console offers EmptyDiskPanel again (empty-001 is the Files disk and empty-003 the
+    // Backup Disk by then — r38). Used to hang
     // off open_copied_instance (cover-all @117); now keyed on the real precondition so
     // cover-all (@119) and cover-all-skip-copy (@116) both get it before the second install.
     if (ctx.action === 'install_app' && ctx.walker.empty002HoldsApp) {
@@ -2584,6 +2659,24 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
                 message: `make_files_disk aborted before Intent: ${err}`,
                 layer,
             }
+        }
+    }
+    // idea#168 r38@103: make_backup_disk → the Backup Disk (duration-empty-003), erase_disk →
+    // duration-empty-002. Never "the first Empty Disk": that let make_backup_disk consume
+    // empty-002 and left erase_disk with no EmptyDiskPanel. Live only; fail loud.
+    let pinnedEmptyId: string | undefined
+    if (ctx.action === 'make_backup_disk' || ctx.action === 'erase_disk') {
+        const target = ctx.action === 'make_backup_disk' ? backupDiskTargetId() : eraseDiskTargetId()
+        try {
+            const note = await pinEmptyDiskForIntent(ctx, driver, target, ctx.action)
+            if (note !== null) {
+                pinnedEmptyId = target
+                diskId = target
+                preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${note}` : note
+            }
+        } catch (e) {
+            const err = e instanceof Error ? e.message : String(e)
+            return { ok: false, message: `${ctx.action} aborted before Intent: ${err}`, layer }
         }
     }
     // Prefer A r22 FAIL@93: add_files_role ≠ make_files_disk. Never "already satisfied"
@@ -2692,6 +2785,10 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     // (backup/restore Intents still key off it).
     const prevFilesPin = process.env.DURATION_FILES_DISK_ID
     if (ctx.action === 'add_files_role' && diskId) process.env.DURATION_FILES_DISK_ID = diskId
+    // idea#168 r38: Console ensureEmptyDiskPanel prefers DURATION_EMPTY_DISK_ID (the Files
+    // disk) over ctx.diskId — point it at the pinned role disk for this Intent only.
+    const prevEmptyPin = process.env.DURATION_EMPTY_DISK_ID
+    if (pinnedEmptyId) process.env.DURATION_EMPTY_DISK_ID = pinnedEmptyId
     let result: Awaited<ReturnType<typeof driver.runIntent>>
     try {
         result = await driver.runIntent({
@@ -2707,6 +2804,10 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
         if (ctx.action === 'add_files_role') {
             if (prevFilesPin === undefined) delete process.env.DURATION_FILES_DISK_ID
             else process.env.DURATION_FILES_DISK_ID = prevFilesPin
+        }
+        if (pinnedEmptyId) {
+            if (prevEmptyPin === undefined) delete process.env.DURATION_EMPTY_DISK_ID
+            else process.env.DURATION_EMPTY_DISK_ID = prevEmptyPin
         }
     }
     if (recDir && shotPath) {
@@ -2813,6 +2914,21 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
         } else {
             message = `${message}; DURATION_FILES_DISK_ID=${filesDiskId} (stub; skip store assert)`
         }
+    }
+    // idea#168 r38: make_backup_disk must land the backup role on the pinned Backup Disk;
+    // then pin DURATION_BACKUP_DISK_ID so the Console RestorePanel Intents (restore_from_backup,
+    // backup_configured_restored) select THIS disk rather than discovering a backup badge.
+    if (result.ok && ctx.action === 'make_backup_disk' && pinnedEmptyId) {
+        if (driver.kind === 'playwright') {
+            try {
+                message = `${message}; ${await assertBackupRoleOnDisk(ctx, pinnedEmptyId)}`
+            } catch (e) {
+                const err = e instanceof Error ? e.message : String(e)
+                return { ok: false, message: `make_backup_disk reported ok but ${err}`, layer }
+            }
+        }
+        process.env.DURATION_BACKUP_DISK_ID = pinnedEmptyId
+        message = `${message}; DURATION_BACKUP_DISK_ID=${pinnedEmptyId}`
     }
     // Prefer A r22: add_files_role must really land a files role on the app-only disk.
     if (result.ok && ctx.action === 'add_files_role' && diskId) {
