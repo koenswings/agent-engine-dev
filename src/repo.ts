@@ -1,10 +1,12 @@
 import { Repo } from "@automerge/automerge-repo";
 import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
-import { WebSocketServer } from "ws";
-import { WebSocketServerAdapter } from "@automerge/automerge-repo-network-websocket";
+import { ThreadedWebSocketServerAdapter } from "./wsServerThread.js";
 import { PortNumber } from "./data/CommonTypes.js";
 import { deepPrint, log, error } from './utils/utils.js'
 
+
+/** Keepalive ping interval of the Engine's WS server (adapter default: 5000 ms). */
+export const WS_KEEPALIVE_INTERVAL_MS = 30_000
 
 export const startAutomergeServer = async (dataDir:string, port:PortNumber):Promise<Repo> => {
     log(`Using data directory: ${dataDir}`);
@@ -12,12 +14,14 @@ export const startAutomergeServer = async (dataDir:string, port:PortNumber):Prom
     // 1. Create a storage adapter for the server to persist data.
     const storage = new NodeFSStorageAdapter(dataDir);
 
-    // 2. Create a WebSocket server.
-    const ws = new WebSocketServer({ port: port });
-    ws.on('error', (err) => {
-        error(`WebSocket server error on port ${port}: ${err.message}`)
-    })
-    const network = new WebSocketServerAdapter(ws);
+    // 2. Create the WebSocket server.
+    // IDEA04-WS: the server runs in a worker thread (wsServerThread.ts) so that
+    // accepting sockets, answering joins and the keepalive keep working while
+    // the main thread is busy syncing the large store doc to many fresh peers.
+    // Keepalive 30 s instead of the adapter's 5 s default: a peer is only
+    // dropped after a full interval without a pong. Listen errors (e.g. port
+    // in use) are logged as 'WebSocket server error on port ...' as before.
+    const network = new ThreadedWebSocketServerAdapter(port, WS_KEEPALIVE_INTERVAL_MS);
 
     // 3. Create the Automerge repo.
     const repo = new Repo({
