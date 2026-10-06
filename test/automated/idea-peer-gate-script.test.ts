@@ -131,10 +131,10 @@ describe('idea-peer-gate: everything outside the allow-list is refused, sudo nev
 })
 
 describe('idea-peer-gate end to end (gate → sudo → helper)', () => {
-    it('version answers the helper protocol version (2)', async () => {
+    it('version answers the helper protocol version (3)', async () => {
         const r = await sb.runGate([PEER], `sudo -n ${H} version`)
         expect(r.exitCode, r.stderr).toBe(0)
-        expect(r.stdout.trim()).toBe('idea-app-data 2')
+        expect(r.stdout.trim()).toBe('idea-app-data 3')
     })
 
     it('a receive is recorded for the peer named by the key; only that peer may delete it', async () => {
