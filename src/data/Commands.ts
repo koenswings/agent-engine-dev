@@ -78,7 +78,7 @@ const buildEngineWrapper = async (storeHandle: DocHandle<Store> | null, argsStri
     // Basic parser for a string of command-line args
     const parseArgs = (str: string): any => {
         const output: { [key: string]: any } = {};
-        const parts = str.match(/--(\w+)(?:[= ]([^\s"'\[\]]+|"[^"]*"|'[^']*'))?/g) || [];
+        const parts: string[] = str.match(/--(\w+)(?:[= ]([^\s"'\[\]]+|"[^"]*"|'[^']*'))?/g) || [];
         parts.forEach(part => {
             const match = part.match(/--(\w+)(?:[= ](.+))?/);
             if (match) {
