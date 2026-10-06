@@ -28,7 +28,8 @@ import {
 } from './scenario.js'
 import { createUiDriver } from './ui/index.js'
 import type { StructuredLogEntry } from './types.js'
-import { installProcessGuards, timeoutSummary } from './automergeTimeoutGuard.js'
+import { EXIT_ENGINE_UNREACHABLE, installProcessGuards, timeoutSummary, walkExitCode } from './automergeTimeoutGuard.js'
+import { DEFAULT_PREFLIGHT_TIMEOUT_MS } from './realFleetOps.js'
 
 const usage = () => {
     console.log(`Usage: pnpm test:duration [options]
@@ -57,6 +58,9 @@ const usage = () => {
   --start-instances     Path A: RealFleetOps startInstances:true (keep instances/ on dock) +
                         preserveDockedOnReturn so cover-registered-intents dock-before-inventory stays visible
   --no-stability        Skip Phase 4 dwell probes
+  --no-preflight        --live: skip the pre-walk check that every pool Engine serves the
+                        store over WS (default on; budget DURATION_PREFLIGHT_MS, 60000).
+                        A failed preflight exits 4 ("engine <id> unreachable for Ns …").
   --dwell-ms <n>        Dwell between transitions (default: 30000 / --fast 80)
   --help                this message
 
@@ -113,6 +117,7 @@ interface ParsedArgs {
     dwellMs?: number
     recordWalkDir?: string
     startInstances: boolean
+    noPreflight?: boolean
 }
 
 const parseArgs = (argv: string[]): ParsedArgs => {
@@ -131,6 +136,7 @@ const parseArgs = (argv: string[]): ParsedArgs => {
     let dwellMs: number | undefined
     let recordWalkDir: string | undefined
     let startInstances = false
+    let noPreflight = false
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]!
         if (a === '--') continue
@@ -157,6 +163,7 @@ const parseArgs = (argv: string[]): ParsedArgs => {
         else if (a === '--record-walk') recordWalkDir = argv[++i]
         else if (a === '--start-instances') startInstances = true
         else if (a === '--no-stability') noStability = true
+        else if (a === '--no-preflight') noPreflight = true
         else if (a === '--dwell-ms') dwellMs = Number(argv[++i])
         else if (a === '--engine-urls') {
             console.error('Unknown flag: --engine-urls (use --hosts name=ip,…)')
@@ -170,7 +177,7 @@ const parseArgs = (argv: string[]): ParsedArgs => {
     return {
         help: false, scenario, iterations, startFrom, fast, seed, live,
         hostsRaw, healthWrapBefore, healthWrapAfter,
-        ui, consoleUrl, noStability, dwellMs, recordWalkDir, startInstances,
+        ui, consoleUrl, noStability, dwellMs, recordWalkDir, startInstances, noPreflight,
     }
 }
 
@@ -323,6 +330,23 @@ const main = async () => {
     }
     console.log(JSON.stringify(commonStart))
 
+    // r32: fail fast before step 1 when a pool Engine does not serve the store over WS,
+    // instead of discovering it as an "own store" withTimeout 60 s into the walk.
+    if (ops instanceof RealFleetOps && !args.noPreflight) {
+        const budget = Number(process.env.DURATION_PREFLIGHT_MS ?? DEFAULT_PREFLIGHT_TIMEOUT_MS)
+        const pf = await ops.preflightEngines(budget)
+        console.log(JSON.stringify({ event: 'engine_preflight', ok: pf.ok, budgetMs: budget, engines: pf.engines }))
+        if (!pf.ok) {
+            for (const e of pf.engines.filter(x => !x.ok)) {
+                console.error(`[duration] FATAL (preflight): ${e.message ?? `engine ${e.id} not ready`}`)
+            }
+            console.log(JSON.stringify(timeoutSummary()))
+            await uiDriver.close?.().catch(() => {})
+            await ops.close().catch(() => {})
+            process.exit(EXIT_ENGINE_UNREACHABLE)
+        }
+    }
+
     const onLog = (e: StructuredLogEntry) => {
         console.log(JSON.stringify({ event: 'duration_step', ...e }))
     }
@@ -375,7 +399,7 @@ const main = async () => {
         record_walk: args.recordWalkDir ?? null,
     }))
 
-    process.exit(result.failures > 0 || result.aborted ? 1 : 0)
+    process.exit(walkExitCode(result))
 }
 
 /**

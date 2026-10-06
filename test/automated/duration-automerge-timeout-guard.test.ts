@@ -13,7 +13,17 @@ import { DocHandle, generateAutomergeUrl, parseAutomergeUrl, type DocumentId } f
 import { TimeoutError } from '@automerge/automerge-repo/helpers/withTimeout.js'
 import {
     ANNOTATION_KEY,
+    EXIT_ENGINE_UNREACHABLE,
     PRODUCTION_FLEET_STORE_DOC_ID,
+    abandonRepo,
+    reportEngineUnreachable,
+    reportOwnStoreStall,
+    walkExitCode,
+    describeEngineLink,
+    enginesServingStore,
+    getEngineLink,
+    noteEngineStoreReady,
+    noteEngineWs,
     getTimeoutAnnotation,
     handleUncaughtException,
     handleUnhandledRejection,
@@ -201,6 +211,139 @@ describe('automergeTimeoutGuard — policy', () => {
         const f = fakeIo()
         handleUnhandledRejection(await realTimeoutFor(doc), f.io)
         expect(f.events()[0]).toMatchObject({ class: 'foreign', docId: doc, peerId: 'engine-peer-1', via: 'idea04', lastMessageType: 'sync' })
+    })
+})
+
+describe('automergeTimeoutGuard — per-engine own-store verdict (r32)', () => {
+    const OWN = '3zoqdSVsEtj4ygNJPNcDyKWvdxo6'
+    const fakeRepo = () => {
+        const ns = new EventEmitter()
+        const repo = { networkSubsystem: ns as never, handles: {} as Record<string, unknown> }
+        return { ns, repo }
+    }
+    /** A real library timeout on a handle that lives in `repo`'s handle cache. */
+    const timeoutOwnedBy = async (repo: { handles: Record<string, unknown> }, id: string): Promise<unknown> => {
+        installWhenReadyAnnotation()
+        const h = new DocHandle(id as DocumentId, { timeoutDelay: 20 })
+        repo.handles[id] = h
+        try { await h.whenReady() } catch (e) { return e }
+        throw new Error('expected whenReady to time out')
+    }
+    /** idea01 connected + store ready (serves 3zoqd). */
+    const servingIdea01 = () => {
+        const a = fakeRepo()
+        registerOwnDoc(`automerge:${OWN}`, 'store', 'idea01')
+        trackRepo(a.repo, 'idea01', 'ws://100.99.231.94:4321')
+        a.ns.emit('peer', { peerId: 'peer-idea01' })
+        a.repo.handles[OWN] = { ready: true }
+        noteEngineStoreReady(a.repo, 'idea01')
+        return a
+    }
+
+    it('trackRepo counts attempts, handshakes and closes per engine', () => {
+        const a = fakeRepo(); const b = fakeRepo()
+        trackRepo(a.repo, 'idea04', 'ws://100.108.39.45:4321')
+        trackRepo(b.repo, 'idea04', 'ws://100.108.39.45:4321')
+        a.ns.emit('peer', { peerId: 'peer-ime17izo' })
+        a.ns.emit('peer-disconnected', { peerId: 'peer-ime17izo' })
+        a.ns.emit('peer-disconnected', { peerId: 'peer-ime17izo' }) // duplicate close not double-counted
+        noteEngineWs('idea04', 'socket-error', 'socket ECONNREFUSED')
+        expect(getEngineLink('idea04')).toMatchObject({ attempts: 2, opens: 1, closes: 1, socketErrors: 1, lastError: 'socket ECONNREFUSED', url: 'ws://100.108.39.45:4321' })
+        expect(describeEngineLink('idea04')).toMatch(/open now 0, attempts 2, handshakes 1, closes 1/)
+    })
+
+    it('late timeout from an ABANDONED unreachable attempt (walker already closed + judged it) → tolerated, not a sync timeout', async () => {
+        servingIdea01()
+        const d = fakeRepo()
+        registerOwnDoc(`automerge:${OWN}`, 'store', 'idea04')
+        trackRepo(d.repo, 'idea04', 'ws://100.108.39.45:4321')
+        noteEngineWs('idea04', 'socket-error', 'socket ECONNREFUSED')
+        abandonRepo(d.repo, 'engine idea04 unreachable (WS ws://100.108.39.45:4321): no WS handshake within 10000ms')
+        expect(enginesServingStore('idea04')).toEqual(['idea01'])
+        const f = fakeIo()
+        expect(handleUnhandledRejection(await timeoutOwnedBy(d.repo, OWN), f.io)).toBe('tolerated')
+        expect(f.exits).toEqual([])
+        expect(f.events()[0]).toMatchObject({ event: 'automerge_find_timeout_tolerated', verdict: 'abandoned_attempt', engine: 'idea04', abandoned: true })
+        expect(timeoutSummary()).toMatchObject({ total: 0, abandonedAttempts: 1, byClass: { own: 0 } })
+    })
+
+    it('timeout on a LIVE engine repo with no WS handshake while idea01 serves the store → engine_unreachable, exit 4, not a sync timeout', async () => {
+        servingIdea01()
+        const d = fakeRepo()
+        registerOwnDoc(`automerge:${OWN}`, 'store', 'idea04')
+        trackRepo(d.repo, 'idea04', 'ws://100.108.39.45:4321')
+        noteEngineWs('idea04', 'socket-error', 'socket ECONNREFUSED')
+        const f = fakeIo()
+        expect(handleUnhandledRejection(await timeoutOwnedBy(d.repo, OWN), f.io)).toBe('fatal')
+        expect(f.exits).toEqual([EXIT_ENGINE_UNREACHABLE])
+        expect(f.events()[0]).toMatchObject({ event: 'engine_unreachable_fatal', engine: 'idea04', ownerWsOpen: false, storeServedBy: ['idea01'], docId: OWN })
+        expect(String(f.errors[0]?.[0])).toMatch(/engine idea04 unreachable for \d+s \(WS ws:\/\/100\.108\.39\.45:4321, last error socket ECONNREFUSED/)
+        expect(String(f.errors[0]?.[0])).toMatch(/not a store sync timeout/)
+        expect(f.events().at(-1)).toMatchObject({ event: 'automerge_find_timeout_summary', total: 0, engineUnreachable: 1, byClass: { own: 0 } })
+    })
+
+    it('WS dropped mid-sync on the live repo (handshake then close) → engine_unreachable with handshakes/closes in the message', async () => {
+        servingIdea01()
+        const d = fakeRepo()
+        trackRepo(d.repo, 'idea04', 'ws://100.108.39.45:4321')
+        d.ns.emit('peer', { peerId: 'peer-ime17izo' })
+        d.ns.emit('peer-disconnected', { peerId: 'peer-ime17izo' })
+        const f = fakeIo()
+        handleUnhandledRejection(await timeoutOwnedBy(d.repo, OWN), f.io)
+        expect(f.exits).toEqual([4])
+        expect(String(f.errors[0]?.[0])).toMatch(/handshakes 1, closes 1/)
+    })
+
+    it('stall on an engine whose WS is OPEN → own_store_fatal, exit 2, even though idea01 serves the store', async () => {
+        servingIdea01()
+        const d = fakeRepo()
+        trackRepo(d.repo, 'idea04', 'ws://100.108.39.45:4321')
+        d.ns.emit('peer', { peerId: 'peer-ime17izo' })
+        const f = fakeIo()
+        handleUnhandledRejection(await timeoutOwnedBy(d.repo, OWN), f.io)
+        expect(f.exits).toEqual([2])
+        expect(f.events()[0]).toMatchObject({ event: 'automerge_find_timeout_own_store_fatal', engine: 'idea04', ownerWsOpen: true })
+    })
+
+    it('live owner without WS and NO other engine serves the store → own_store_fatal, exit 2', async () => {
+        const d = fakeRepo()
+        registerOwnDoc(`automerge:${OWN}`, 'store', 'idea04')
+        trackRepo(d.repo, 'idea04', 'ws://100.108.39.45:4321')
+        const f = fakeIo()
+        handleUnhandledRejection(await timeoutOwnedBy(d.repo, OWN), f.io)
+        expect(f.exits).toEqual([2])
+        expect(f.events()[0]).toMatchObject({ event: 'automerge_find_timeout_own_store_fatal', storeServedBy: [] })
+    })
+
+    it('reportOwnStoreStall: WS up + doc never ready → own-store FATAL event (reason sync_stall), exit 2', () => {
+        const d = fakeRepo()
+        trackRepo(d.repo, 'idea04', 'ws://100.108.39.45:4321')
+        d.ns.emit('peer', { peerId: 'peer-ime17izo' })
+        const f = fakeIo()
+        reportOwnStoreStall('idea04', OWN, 'store not ready 40s after connect', f.io)
+        expect(f.exits).toEqual([2])
+        expect(f.events()[0]).toMatchObject({ event: 'automerge_find_timeout_own_store_fatal', reason: 'sync_stall', engine: 'idea04', docId: OWN })
+        expect(String(f.errors[0]?.[0])).toMatch(/own store .* stalled on engine idea04.*WS is up/)
+    })
+
+    it('reportEngineUnreachable: distinct engine_unreachable event + "engine X unreachable for Ns" message, no exit', () => {
+        trackRepo(fakeRepo().repo, 'idea04', 'ws://100.108.39.45:4321')
+        noteEngineWs('idea04', 'socket-error', 'socket EHOSTUNREACH')
+        const f = fakeIo()
+        const msg = reportEngineUnreachable('idea04', f.io)
+        expect(msg).toMatch(/^engine idea04 unreachable for \d+s \(WS ws:\/\/100\.108\.39\.45:4321, last error socket EHOSTUNREACH/)
+        expect(f.exits).toEqual([])
+        expect(f.events()[0]).toMatchObject({ event: 'engine_unreachable', class: 'engine_unreachable', engine: 'idea04' })
+        expect(timeoutSummary()).toMatchObject({ total: 0, engineUnreachable: 1 })
+    })
+
+    it('walkExitCode: 0 ok, 1 ordinary failures, 4 when the last failure is an unreachable engine', () => {
+        const unreachable = 'idea04: WS down — engine idea04 unreachable for 42s (WS ws://100.108.39.45:4321, last error socket ECONNREFUSED; attempts 2)'
+        expect(walkExitCode({ failures: 0, aborted: false, logs: [] })).toBe(0)
+        expect(walkExitCode({ failures: 1, aborted: false, logs: [{ ok: false, message: 'invariant x failed' }] })).toBe(1)
+        expect(walkExitCode({ failures: 1, aborted: true, abortReason: `stability: ${unreachable}`, logs: [] })).toBe(4)
+        expect(walkExitCode({ failures: 1, aborted: false, logs: [{ ok: false, probes: [{ ok: false, detail: unreachable }] }] })).toBe(4)
+        expect(walkExitCode({ failures: 1, aborted: false, logs: [{ ok: false, message: 'engine idea04: store sync stall (WS ws://x up)' }] })).toBe(1)
     })
 })
 

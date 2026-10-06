@@ -17,7 +17,17 @@ import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websoc
 import { $ } from 'zx'
 import type { Store } from '../../src/data/Store.js'
 import { runningInstanceExpectsLocalDocker } from './stability.js'
-import { registerOwnDoc, trackRepo } from './automergeTimeoutGuard.js'
+import {
+    abandonRepo,
+    describeEngineLink,
+    getEngineLink,
+    noteEngineStoreReady,
+    noteEngineWs,
+    registerOwnDoc,
+    reportEngineUnreachable,
+    reportOwnStoreStall,
+    trackRepo,
+} from './automergeTimeoutGuard.js'
 import type {
     FleetOps,
     SemanticStoreView,
@@ -44,6 +54,40 @@ export const DEFAULT_DURATION_FIXTURE_SOURCE_ROOT =
  * rapid pm2 restarts. Duration-test-only bump (RealFleetOps), not production Engine.
  */
 export const PM2_RECONNECT_TIMEOUT_MS = 150_000
+/**
+ * r32: wait for the automerge-repo WS handshake before repo.find(). Without it,
+ * WebSocketClientAdapter force-marks itself ready after 1 s (dist/WebSocketClientAdapter.js
+ * connect → setTimeout(#forceReady, 1000)); a find() with zero peers then turns the store
+ * handle 'unavailable' at once ("Document … is unavailable"), which the probe reported as
+ * "WS down" even when the Engine answered a moment later (idea04 handshake ≈0.6–0.7 s idle).
+ */
+export const DEFAULT_WS_HANDSHAKE_TIMEOUT_MS = 10_000
+/** r32: pre-walk check that every pool Engine serves the store over WS (fail fast, exit 4). */
+export const DEFAULT_PREFLIGHT_TIMEOUT_MS = 60_000
+/**
+ * r32: how long a fresh connection may take to deliver the full store doc after the WS
+ * handshake. A fresh peer's full 3zoqd sync takes ~3.5–7 s on the Pi 5s and ~7–11 s on
+ * idea04 (Pi 4) (path-a-ready-r33 IDEA04-WS.md), so never less than 15 s.
+ * Override: DURATION_DOC_WAIT_MS (all hosts), DURATION_DOC_WAIT_MS_BY_HOST="idea04=30000,…",
+ * DURATION_DOC_WAIT_MS_<HOST> (e.g. DURATION_DOC_WAIT_MS_IDEA04). Env values below 15 s are raised to 15 s.
+ */
+export const MIN_DOC_WAIT_MS = 15_000
+export const DEFAULT_DOC_WAIT_MS = 15_000
+export const DEFAULT_DOC_WAIT_MS_BY_HOST: Readonly<Record<string, number>> = { idea04: 30_000 } // Pi 4
+/**
+ * Upper bound for env doc waits: automerge-repo's DocSynchronizer arms a bare 60 s
+ * whenReady() on the connecting Repo's handle; a connect attempt (handshake + doc wait)
+ * must conclude (ready, or closed and judged) before that timer fires.
+ */
+export const MAX_DOC_WAIT_MS = 45_000
+
+/** Thrown when the WS is up but the store doc never became ready within the per-host wait. */
+export class StoreSyncStallError extends Error {
+    constructor(readonly engine: string, readonly url: string, readonly detail: string) {
+        super(`engine ${engine}: store sync stall (WS ${url} up): ${detail}`)
+        this.name = 'StoreSyncStallError'
+    }
+}
 export const FULL_REBOOT_RECONNECT_TIMEOUT_MS = 180_000
 
 const FORBIDDEN_DISKS_ROOTS = ['/disks', '/disks/']
@@ -156,7 +200,91 @@ export interface RealFleetOptions {
     startInstances?: boolean
     /** waitReady timeout after pm2 restart (default PM2_RECONNECT_TIMEOUT_MS). */
     pm2ReconnectTimeoutMs?: number
+    /** Max wait for the WS handshake before find() (default DURATION_WS_HANDSHAKE_MS or 10 s). */
+    wsHandshakeTimeoutMs?: number
+    /** Per-host doc wait after the handshake (tests may go below MIN_DOC_WAIT_MS; env may not). */
+    docWaitMs?: number
+    docWaitMsByHost?: Record<string, number>
+    /** Called on a real own-store stall (WS up, doc never ready). Default: reportOwnStoreStall → exit 2. */
+    onOwnStoreStall?: (engine: string, docId: string, detail: string) => void
 }
+
+/** Thrown when a pool Engine's WS never completes the automerge-repo handshake. */
+export class EngineUnreachableError extends Error {
+    constructor(readonly engine: string, readonly url: string, readonly detail: string) {
+        super(`engine ${engine} unreachable (WS ${url}): ${detail}`)
+        this.name = 'EngineUnreachableError'
+    }
+}
+
+/**
+ * WebSocketClientAdapter that reports raw socket errors (ECONNREFUSED, …) to the timeout
+ * guard and can be closed for good: the library's onClose schedules a reconnect with a
+ * bare setTimeout that disconnect() does not cancel, so a "closed" adapter could open a
+ * new socket 2 s later (leak). After disconnect() this adapter never connects again.
+ */
+export class TrackedWebSocketClientAdapter extends WebSocketClientAdapter {
+    #closedForGood = false
+    #closed: Promise<void> = Promise.resolve()
+    connect(peerId: PeerId, peerMetadata?: Parameters<WebSocketClientAdapter['connect']>[1]): void {
+        if (this.#closedForGood) return
+        super.connect(peerId, peerMetadata)
+    }
+    disconnect(): void {
+        this.#closedForGood = true
+        const socket = this.socket as unknown as {
+            readyState: number
+            on?(e: string, fn: (...a: unknown[]) => void): unknown
+            once?(e: string, fn: () => void): unknown
+        } | undefined
+        if (!socket || !this.peerId) return // never connected: nothing to close
+        // ws emits 'error' when a CONNECTING socket is aborted; the library removed its
+        // listener first, which would make that an uncaught exception (exit 2).
+        socket.on?.('error', () => {})
+        if (socket.readyState !== 3 /* CLOSED */) {
+            this.#closed = new Promise<void>(resolve => {
+                const t = setTimeout(resolve, 1_500)
+                socket.once?.('close', () => { clearTimeout(t); resolve() })
+            })
+        }
+        super.disconnect()
+    }
+    /** Resolves once the socket closed by disconnect() is fully closed (max 1.5 s). */
+    whenClosed(): Promise<void> {
+        return this.#closed
+    }
+    constructor(url: string, retryInterval: number, via: string) {
+        super(url, retryInterval)
+        this.onError = event => {
+            const err = (event as { error?: { code?: string; message?: string } }).error
+            noteEngineWs(via, 'socket-error', `socket ${err?.code ?? err?.message ?? 'error'}`, url)
+            // The library ignores only ECONNREFUSED and rethrows every other socket error
+            // (EHOSTUNREACH, ETIMEDOUT, ECONNRESET…) from an event listener — an uncaught
+            // exception that would kill the walker (exit 2) for a merely unreachable host.
+            // Record it instead; the adapter keeps retrying and RealFleetOps judges reachability.
+        }
+    }
+}
+
+/** The adapter behind each walker Repo (closeRepo waits for its socket to close). */
+const adapterOf = new WeakMap<Repo, TrackedWebSocketClientAdapter>()
+
+/** Resolve once the Repo has a connected peer (handshake done), else reject after `ms`. */
+const waitForHandshake = (repo: Repo, engine: string, url: string, ms: number): Promise<void> =>
+    new Promise((resolve, reject) => {
+        if (repo.peers.length > 0) return resolve()
+        const ns = repo.networkSubsystem as unknown as {
+            on(e: 'peer', fn: () => void): unknown
+            off(e: 'peer', fn: () => void): unknown
+        }
+        const onPeer = () => { clearTimeout(timer); ns.off('peer', onPeer); resolve() }
+        const timer = setTimeout(() => {
+            ns.off('peer', onPeer)
+            const last = getEngineLink(engine)?.lastError
+            reject(new EngineUnreachableError(engine, url, `no WS handshake within ${ms}ms${last ? ` (last ${last})` : ''}`))
+        }, ms)
+        ns.on('peer', onPeer)
+    })
 
 interface Conn {
     repo: Repo
@@ -175,6 +303,75 @@ const sshOpts = [
 ]
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
+
+/**
+ * Close a connection for good: mark it abandoned for the timeout guard (its late
+ * whenReady rejections are then tolerated), then shut the Repo down, which disconnects
+ * the adapter and closes the socket (TrackedWebSocketClientAdapter never reconnects).
+ */
+const closeRepo = async (repo: Repo, reason: string, _stall = false): Promise<void> => {
+    abandonRepo(repo as unknown as Parameters<typeof abandonRepo>[0], reason)
+    try {
+        await repo.shutdown()
+    } catch {
+        // ignore shutdown races (socket already gone)
+    }
+    // Close-before-retry: the old socket is fully closed before any new one is opened.
+    await adapterOf.get(repo)?.whenClosed()
+}
+
+type StoreDocOutcome =
+    | { kind: 'ready'; handle: DocHandle<Store> }
+    | { kind: 'doc-unavailable' | 'ws-closed' | 'stall'; detail: string }
+
+/**
+ * Wait (polling, no extra withTimeout timers) until the store doc is ready on this Repo
+ * or `deadline` passes. Peer drops are left to the adapter's own reconnect.
+ */
+const awaitStoreDoc = async (repo: Repo, docId: DocumentId, deadline: number): Promise<StoreDocOutcome> => {
+    type Msg = { type?: string; documentId?: string }
+    const ns = repo.networkSubsystem as unknown as {
+        on(e: string, fn: (m: Msg) => void): unknown
+        off(e: string, fn: (m: Msg) => void): unknown
+    }
+    let syncMsgs = 0
+    let drops = 0
+    let docUnavailable = false
+    const onMsg = (m: Msg) => {
+        if (m?.documentId !== docId) return
+        if (m.type === 'doc-unavailable') docUnavailable = true
+        else if (m.type === 'sync' || m.type === 'request') { syncMsgs++; docUnavailable = false }
+    }
+    const onPeer = () => { docUnavailable = false }
+    const onDrop = () => { drops++ }
+    ns.on('message', onMsg)
+    ns.on('peer', onPeer)
+    ns.on('peer-disconnected', onDrop)
+    try {
+        const handle = repo.findWithProgress<Store>(docId).handle
+        const summary = () => `${syncMsgs} sync msg(s) for the doc, ${drops} WS drop(s), handle ${handle.state}`
+        let unavailableSince: number | null = null
+        while (Date.now() < deadline) {
+            if (handle.isReady()) return { kind: 'ready', handle }
+            if (repo.peers.length > 0 && docUnavailable && handle.state === 'unavailable') {
+                unavailableSince ??= Date.now()
+                if (Date.now() - unavailableSince >= 1_500) {
+                    return { kind: 'doc-unavailable', detail: `engine answered doc-unavailable; ${summary()}` }
+                }
+            } else {
+                unavailableSince = null
+            }
+            await sleep(100)
+        }
+        if (handle.isReady()) return { kind: 'ready', handle }
+        if (repo.peers.length === 0) return { kind: 'ws-closed', detail: summary() }
+        return { kind: 'stall', detail: docUnavailable ? `engine answered doc-unavailable; ${summary()}` : summary() }
+    } finally {
+        ns.off('message', onMsg)
+        ns.off('peer', onPeer)
+        ns.off('peer-disconnected', onDrop)
+    }
+}
 
 export const assertPrivateDurationRoots = (disksRoot: string, watchDir: string): void => {
     const d = disksRoot.replace(/\/+$/, '') || disksRoot
@@ -346,6 +543,16 @@ export class RealFleetOps implements FleetOps {
     private readonly startInstances: boolean
     private readonly pm2ReconnectTimeoutMs: number
     private readonly conns = new Map<string, Conn>()
+    /** In-flight connects per logical engine, so concurrent callers share one Repo. */
+    private readonly connecting = new Map<string, Promise<Conn>>()
+    private readonly wsHandshakeTimeoutMs: number
+    private readonly docWaitOpt?: number
+    private readonly docWaitByHostOpt: Record<string, number>
+    private readonly onOwnStoreStall: (engine: string, docId: string, detail: string) => void
+    /** Engines inside rebootEngine / reconnectEngine: a stall there is retried, not fatal. */
+    private readonly rebootWindow = new Set<string>()
+    /** Repos opened per engine (one per connection; tests assert reuse). */
+    private readonly reposOpened = new Map<string, number>()
     /** logical pool id → live engineDB key */
     private readonly liveIds = new Map<string, string>()
     /** live engineDB key → logical pool id */
@@ -377,6 +584,12 @@ export class RealFleetOps implements FleetOps {
             ?? DEFAULT_DURATION_FIXTURE_SOURCE_ROOT).replace(/\/+$/, '')
         this.startInstances = opts.startInstances === true
         this.pm2ReconnectTimeoutMs = opts.pm2ReconnectTimeoutMs ?? PM2_RECONNECT_TIMEOUT_MS
+        this.wsHandshakeTimeoutMs = opts.wsHandshakeTimeoutMs
+            ?? Math.min(15_000, Number(process.env.DURATION_WS_HANDSHAKE_MS ?? DEFAULT_WS_HANDSHAKE_TIMEOUT_MS) || DEFAULT_WS_HANDSHAKE_TIMEOUT_MS)
+        this.docWaitOpt = opts.docWaitMs
+        this.docWaitByHostOpt = { ...(opts.docWaitMsByHost ?? {}) }
+        this.onOwnStoreStall = opts.onOwnStoreStall
+            ?? ((engine, docId, detail) => reportOwnStoreStall(engine, docId, detail))
         assertPrivateDurationRoots(this.disksRoot, this.watchDir)
 
         for (const id of this.pool) {
@@ -451,15 +664,52 @@ export class RealFleetOps implements FleetOps {
         )
     }
 
-    private async disconnect(logicalId: string): Promise<void> {
+    /** Close this engine's connection (adapter + socket) for good; the next connect opens a fresh one. */
+    private async disconnect(logicalId: string, reason = 'closed by walker'): Promise<void> {
         const c = this.conns.get(logicalId)
         if (!c) return
         this.conns.delete(logicalId)
-        try {
-            await c.repo.shutdown()
-        } catch {
-            // ignore shutdown races after reboot
+        await closeRepo(c.repo, reason)
+    }
+
+    /**
+     * Per-host doc wait after the WS handshake (see MIN_DOC_WAIT_MS). Precedence:
+     * DURATION_DOC_WAIT_MS_<HOST> > DURATION_DOC_WAIT_MS_BY_HOST > opts.docWaitMsByHost >
+     * DEFAULT_DOC_WAIT_MS_BY_HOST > DURATION_DOC_WAIT_MS > opts.docWaitMs > DEFAULT_DOC_WAIT_MS.
+     */
+    docWaitMsFor(logicalId: string): number {
+        const env = (v: string | undefined): number | null => {
+            const n = v === undefined || v === '' ? NaN : Number(v)
+            return Number.isFinite(n) && n > 0 ? Math.min(MAX_DOC_WAIT_MS, Math.max(MIN_DOC_WAIT_MS, n)) : null
         }
+        const perHostEnv = env(process.env[`DURATION_DOC_WAIT_MS_${logicalId.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`])
+        if (perHostEnv !== null) return perHostEnv
+        const map = process.env.DURATION_DOC_WAIT_MS_BY_HOST
+        if (map) {
+            for (const part of map.split(',')) {
+                const [k, v] = part.split('=').map(x => x?.trim())
+                if (k === logicalId) {
+                    const n = env(v)
+                    if (n !== null) return n
+                }
+            }
+        }
+        if (this.docWaitByHostOpt[logicalId] !== undefined) return this.docWaitByHostOpt[logicalId]!
+        if (this.docWaitOpt === undefined && DEFAULT_DOC_WAIT_MS_BY_HOST[logicalId] !== undefined) {
+            return DEFAULT_DOC_WAIT_MS_BY_HOST[logicalId]!
+        }
+        return env(process.env.DURATION_DOC_WAIT_MS) ?? this.docWaitOpt ?? DEFAULT_DOC_WAIT_MS
+    }
+
+    /** Test / report hook: how many Repos (WS connections) were opened to this engine. */
+    getConnectionCount(logicalId: string): number {
+        return this.reposOpened.get(logicalId) ?? 0
+    }
+
+    /** True when this engine's reused connection currently has an open WS handshake. */
+    isWsOpen(logicalId: string): boolean {
+        const c = this.conns.get(logicalId)
+        return !!c && c.repo.peers.length > 0
     }
 
     private discoverLiveEngineId(store: Store, logicalId: string): string | null {
@@ -484,39 +734,101 @@ export class RealFleetOps implements FleetOps {
         this.logicalIds.set(liveId, logicalId)
     }
 
+    /**
+     * r32 connection model: ONE Repo / WS per engine for the whole walk, like a Console tab.
+     * Reused by every probe, step and read; the adapter reconnects its own socket after a
+     * drop. A new connection is opened only when none exists (first use, after
+     * reconnectEngine / rebootEngine, or after a failed attempt — which closes its Repo
+     * first). Concurrent callers share one in-flight attempt.
+     */
     private async connect(logicalId: string, forceNew = false): Promise<Conn> {
-        if (!forceNew) {
-            const existing = this.conns.get(logicalId)
-            if (existing) {
-                try {
-                    const doc = existing.storeHandle.doc()
-                    if (doc) return existing
-                } catch {
-                    await this.disconnect(logicalId)
-                }
-            }
-        } else {
-            await this.disconnect(logicalId)
+        if (forceNew) await this.disconnect(logicalId, 'forced reconnect')
+        const existing = this.conns.get(logicalId)
+        if (existing) {
+            try {
+                if (existing.storeHandle.doc()) return existing
+            } catch { /* fall through: replace it */ }
+            await this.disconnect(logicalId, 'store handle no longer ready')
         }
+        const inFlight = this.connecting.get(logicalId)
+        if (inFlight) return inFlight
+        const p = this.openConn(logicalId).finally(() => this.connecting.delete(logicalId))
+        this.connecting.set(logicalId, p)
+        return p
+    }
 
+    /**
+     * Open a connection and wait for the store doc: handshake (wsHandshakeTimeoutMs), then
+     * up to docWaitMsFor(engine) for the full sync. If the peer drops mid-sync the same Repo's
+     * adapter reconnects itself and the sync resumes (no new Repo). If the Engine explicitly
+     * answers doc-unavailable, the Repo is CLOSED and a fresh one opened (sequentially).
+     * Outcomes: ready → cached Conn; no usable WS → EngineUnreachableError; WS up but doc
+     * never ready → StoreSyncStallError (fatal via onOwnStoreStall outside a reboot window).
+     */
+    private async openConn(logicalId: string): Promise<Conn> {
         const host = this.hostOf(logicalId)
         const docId = await this.fetchStoreDocId(logicalId)
         const url = `ws://${host}:${this.enginePort}`
-        console.log(`[RealFleetOps] Connecting ${logicalId} at ${url} (doc ${docId})`)
+        const docWaitMs = this.docWaitMsFor(logicalId)
+        const started = Date.now()
+        const deadline = started + this.wsHandshakeTimeoutMs + docWaitMs
+        for (;;) {
+            this.reposOpened.set(logicalId, (this.reposOpened.get(logicalId) ?? 0) + 1)
+            console.log(`[RealFleetOps] Connecting ${logicalId} at ${url} (doc ${docId}, doc wait ${docWaitMs}ms)`)
+            const adapter = new TrackedWebSocketClientAdapter(url, 2000, logicalId)
+            const repo = new Repo({
+                network: [adapter],
+                peerId: `duration-${logicalId}-${Date.now()}` as PeerId,
+            })
+            adapterOf.set(repo, adapter)
+            const tracked = repo as unknown as Parameters<typeof trackRepo>[0]
+            // r30 automergeTimeoutGuard: the store doc is OWN; track peers/docs per engine.
+            registerOwnDoc(docId, 'store', logicalId)
+            trackRepo(tracked, logicalId, url)
+            void this.registerOwnCommandLog(logicalId, host)
+            let outcome: Awaited<ReturnType<typeof awaitStoreDoc>>
+            try {
+                const hsMs = Math.max(1, Math.min(this.wsHandshakeTimeoutMs, deadline - Date.now()))
+                await waitForHandshake(repo, logicalId, url, hsMs)
+                outcome = await awaitStoreDoc(repo, docId, deadline)
+            } catch (e) {
+                const reason = e instanceof EngineUnreachableError ? e.detail : (e instanceof Error ? e.message : String(e))
+                await closeRepo(repo, reason)
+                if (!this.rebootWindow.has(logicalId)) reportEngineUnreachable(logicalId) // expected while rebooting
+                console.log(`[RealFleetOps] Connect ${logicalId} failed: ${reason} [${describeEngineLink(logicalId)}]`)
+                throw e
+            }
+            if (outcome.kind === 'ready') {
+                noteEngineStoreReady(tracked, logicalId)
+                return this.registerConn(logicalId, repo, outcome.handle, host, docId, Date.now() - started)
+            }
+            if (outcome.kind === 'doc-unavailable' && Date.now() + 1_000 < deadline) {
+                // Close before retry: never two connections to one engine at once.
+                await closeRepo(repo, `engine answered doc-unavailable for ${docId}; reopening`)
+                await sleep(1_000)
+                continue
+            }
+            const secs = Math.round((Date.now() - started) / 1000)
+            if (outcome.kind === 'ws-closed') {
+                const detail = `WS dropped during store sync and did not come back within ${secs}s ` +
+                    `(${outcome.detail}; last ${getEngineLink(logicalId)?.lastError ?? 'error none'})`
+                await closeRepo(repo, detail)
+                const msg = this.rebootWindow.has(logicalId) ? detail : reportEngineUnreachable(logicalId)
+                console.log(`[RealFleetOps] Connect ${logicalId} failed: ${msg}`)
+                throw new EngineUnreachableError(logicalId, url, detail)
+            }
+            // WS up, doc not ready: a real own-store stall.
+            const detail = `store ${docId} not ready ${secs}s after connect (doc wait ${docWaitMs}ms, WS open; ${outcome.detail})`
+            await closeRepo(repo, `sync stall: ${detail}`, true)
+            console.log(`[RealFleetOps] Connect ${logicalId} failed: sync stall: ${detail} [${describeEngineLink(logicalId)}]`)
+            if (!this.rebootWindow.has(logicalId)) this.onOwnStoreStall(logicalId, docId, detail)
+            throw new StoreSyncStallError(logicalId, url, detail)
+        }
+    }
 
-        const adapter = new WebSocketClientAdapter(url, 2000)
-        const repo = new Repo({
-            network: [adapter],
-            peerId: `duration-${logicalId}-${Date.now()}` as PeerId,
-        })
-        // r30 automergeTimeoutGuard: the store doc is OWN (a withTimeout on it is fatal);
-        // track peers/docs so relayed foreign-doc timeouts carry docId + peerId.
-        registerOwnDoc(docId, 'store', logicalId)
-        trackRepo(repo as unknown as Parameters<typeof trackRepo>[0], logicalId)
-        void this.registerOwnCommandLog(logicalId, host)
-        const storeHandle = await repo.find<Store>(docId)
-        await storeHandle.whenReady()
-
+    private registerConn(
+        logicalId: string, repo: Repo, storeHandle: DocHandle<Store>, host: string, docId: DocumentId, tookMs: number,
+    ): Conn {
         const store = storeHandle.doc()
         const liveEngineId = store ? this.discoverLiveEngineId(store, logicalId) : null
         this.rememberMapping(logicalId, liveEngineId)
@@ -524,9 +836,8 @@ export class RealFleetOps implements FleetOps {
             `[RealFleetOps] Connected ${logicalId} → liveEngineId=${liveEngineId ?? 'unknown'} ` +
             `hostname=${liveEngineId && store?.engineDB[liveEngineId as keyof typeof store.engineDB]
                 ? (store.engineDB[liveEngineId as keyof typeof store.engineDB] as { hostname?: string }).hostname
-                : '?'}`,
+                : '?'} (store ready in ${tookMs}ms)`,
         )
-
         const conn: Conn = { repo, storeHandle, host, logicalId, liveEngineId, storeDocId: docId }
         this.conns.set(logicalId, conn)
         return conn
@@ -621,7 +932,9 @@ export class RealFleetOps implements FleetOps {
             if (this.exclude.includes(id)) continue
             let wsUp = false
             try {
-                const ready = await this.waitReady(id, 3_000)
+                // waitReady never declares WS down during a normal initial sync: with no
+                // connection it makes one full attempt (handshake + per-host doc wait).
+                const ready = await this.waitReady(id, this.wsHandshakeTimeoutMs)
                 wsUp = ready.wsUp
             } catch {
                 wsUp = false
@@ -666,7 +979,7 @@ export class RealFleetOps implements FleetOps {
                 }
             } else {
                 ok = false
-                details.push(`${id}: WS down`)
+                details.push(`${id}: WS down — ${reportEngineUnreachable(id)}`)
             }
             engines.push({ id, wsUp, dockerOk, statusAnomaly })
         }
@@ -677,38 +990,90 @@ export class RealFleetOps implements FleetOps {
         }
     }
 
+    /**
+     * r32 preflight: before step 1, every pool Engine must complete the WS handshake and
+     * serve the store doc. Retries until `timeoutMs`; never writes anything.
+     */
+    async preflightEngines(timeoutMs = DEFAULT_PREFLIGHT_TIMEOUT_MS): Promise<{
+        ok: boolean
+        engines: Array<{ id: string; ok: boolean; url: string; detail: string; message?: string }>
+    }> {
+        const ids = this.listPoolEngines()
+        const engines = await Promise.all(ids.map(async id => {
+            const url = `ws://${this.hostOf(id)}:${this.enginePort}`
+            const deadline = Date.now() + timeoutMs
+            let lastErr: Error | null = null
+            do {
+                try {
+                    await this.connect(id) // sequential: each failed attempt closed its Repo
+                    return { id, ok: true, url, detail: describeEngineLink(id) }
+                } catch (e) {
+                    lastErr = e instanceof Error ? e : new Error(String(e))
+                    if (lastErr instanceof StoreSyncStallError) break // WS up, doc never ready: not a reach problem
+                    if (Date.now() + 1_000 < deadline) await sleep(1_000)
+                }
+            } while (Date.now() < deadline)
+            const stalled = lastErr instanceof StoreSyncStallError
+            return {
+                id, ok: false, url, detail: describeEngineLink(id),
+                message: stalled ? lastErr!.message : reportEngineUnreachable(id),
+            }
+        }))
+        return { ok: engines.every(e => e.ok), engines }
+    }
+
+    /**
+     * Reuse model: with a cached connection, wait (≥ handshake timeout) for its WS to be
+     * open — the adapter reconnects itself after a drop; only if it stays down is the old
+     * connection CLOSED and a fresh one opened. With no connection, make at least one full
+     * attempt (handshake + per-host doc wait), retrying sequentially until `timeoutMs`.
+     */
     async waitReady(engineId: string, timeoutMs: number): Promise<SettleReady> {
         const start = Date.now()
-        let wsUp = false
-        let storeSynced = false
-        let attempt = 0
-        while (Date.now() - start < timeoutMs) {
-            attempt++
-            try {
-                // First try reuse; on later attempts force reconnect (post-reboot).
-                const force = attempt > 1 && !this.conns.has(engineId)
-                await this.connect(engineId, force)
-                let doc = this.conns.get(engineId)?.storeHandle.doc()
-                if (!doc) {
-                    await this.connect(engineId, true)
-                    doc = this.conns.get(engineId)?.storeHandle.doc()
+        let first = true
+        let freshAfterDrop = false
+        while (first || Date.now() - start < timeoutMs) {
+            first = false
+            const cached = this.conns.get(engineId)
+            if (cached) {
+                const wsWait = Math.max(this.wsHandshakeTimeoutMs, timeoutMs - (Date.now() - start))
+                if (await this.waitWsOpen(cached, wsWait)) {
+                    const doc = cached.storeHandle.doc()
+                    if (doc) {
+                        const live = this.discoverLiveEngineId(doc, engineId)
+                        this.rememberMapping(engineId, live)
+                        const storeSynced = live != null && !!doc.engineDB[live as keyof typeof doc.engineDB]
+                        // Unique-mode settle: WS up is the hard gate; storeSynced is best-effort.
+                        return { wsUp: true, storeSynced }
+                    }
                 }
-                wsUp = !!doc
-                if (doc) {
-                    const live = this.discoverLiveEngineId(doc, engineId)
-                    this.rememberMapping(engineId, live)
-                    storeSynced = live != null && !!doc.engineDB[live as keyof typeof doc.engineDB]
-                    // Unique-mode settle: WS up is the hard gate; storeSynced is best-effort.
-                    return { wsUp: true, storeSynced }
-                }
-            } catch {
-                wsUp = false
-                storeSynced = false
-                await this.disconnect(engineId)
+                // Real disconnect (WS stayed down): close the old connection before any retry.
+                noteEngineWs(engineId, 'error', `WS down on the reused connection for ${wsWait}ms`)
+                await this.disconnect(engineId, `WS down for ${wsWait}ms; reconnecting`)
+                if (!freshAfterDrop) { freshAfterDrop = true; first = true } // one fresh connection after a real disconnect
+                continue
             }
-            await sleep(500)
+            try {
+                await this.connect(engineId)
+                first = true // always validate the fresh connection, even past timeoutMs
+                continue
+            } catch (e) {
+                if (e instanceof StoreSyncStallError && !this.rebootWindow.has(engineId)) break
+                if (Date.now() - start + 1_000 < timeoutMs) await sleep(1_000)
+            }
         }
-        return { wsUp, storeSynced }
+        return { wsUp: false, storeSynced: false }
+    }
+
+    /** Resolve true once this connection's Repo has an open WS peer, false after `ms`. */
+    private async waitWsOpen(conn: Conn, ms: number): Promise<boolean> {
+        if (conn.repo.peers.length > 0) return true
+        try {
+            await waitForHandshake(conn.repo, conn.logicalId, `ws://${conn.host}:${this.enginePort}`, ms)
+            return true
+        } catch {
+            return false
+        }
     }
 
     async readStore(engineId: string): Promise<SemanticStoreView> {
@@ -837,12 +1202,15 @@ export class RealFleetOps implements FleetOps {
      */
     async reconnectEngine(engineId: string, timeoutMs: number): Promise<SettleReady> {
         this.assertNotExcluded(engineId, 'reconnectEngine')
-        await this.disconnect(engineId)
-        // connect() awaits whenReady(), which can hang on a dead host — bound it.
-        const timedOut = new Promise<SettleReady>(r =>
-            setTimeout(() => r({ wsUp: false, storeSynced: false }), timeoutMs + 5_000).unref?.(),
-        )
-        return Promise.race([this.waitReady(engineId, timeoutMs), timedOut])
+        // Reuse model exception: a reboot needs a FRESH socket. Close the old one first.
+        await this.disconnect(engineId, 'reconnectEngine: fresh WS required')
+        this.rebootWindow.add(engineId)
+        try {
+            // Every attempt is bounded (handshake + doc wait), so no outer race timer.
+            return await this.waitReady(engineId, timeoutMs)
+        } finally {
+            this.rebootWindow.delete(engineId)
+        }
     }
 
     /** Exposed for tests / smoke reporting. */
@@ -964,8 +1332,24 @@ export class RealFleetOps implements FleetOps {
         this.assertNotExcluded(engineId, 'rebootEngine')
         const host = this.hostOf(engineId)
         await this.runHealthWrap(this.healthWrapBefore)
-        await this.disconnect(engineId)
+        // Close (not just forget) the connection before the reboot; reopen fresh after.
+        await this.disconnect(engineId, 'rebootEngine: closing before reboot')
+        this.rebootWindow.add(engineId)
+        try {
+            await this.rebootAndReconnect(engineId, host, fast)
+        } finally {
+            this.rebootWindow.delete(engineId)
+        }
 
+        // Docker containers can survive pm2 restart; Automerge may reconnect with
+        // Running instances whose disks are Undocked → no_zombie_instances. Clear
+        // Path A duration fixtures only (never idea166-* / Intenso).
+        await this.reconcileDurationZombies(engineId)
+
+        await this.runHealthWrap(this.healthWrapAfter)
+    }
+
+    private async rebootAndReconnect(engineId: string, host: string, fast: boolean): Promise<void> {
         if (fast) {
             // Clear Path A duration containers before pm2 so they do not survive as orphans.
             await this.stopDurationFixtureContainers(host)
@@ -1009,13 +1393,6 @@ export class RealFleetOps implements FleetOps {
                 throw new Error(`RealFleetOps: ${engineId} WS not up after reboot`)
             }
         }
-
-        // Docker containers can survive pm2 restart; Automerge may reconnect with
-        // Running instances whose disks are Undocked → no_zombie_instances. Clear
-        // Path A duration fixtures only (never idea166-* / Intenso).
-        await this.reconcileDurationZombies(engineId)
-
-        await this.runHealthWrap(this.healthWrapAfter)
     }
 
     async undockFixtures(engineIds: string[], diskId: string): Promise<void> {
@@ -1559,8 +1936,9 @@ export class RealFleetOps implements FleetOps {
 
     /** Drop all open WS connections (tests / process exit). */
     async close(): Promise<void> {
+        await Promise.allSettled([...this.connecting.values()])
         const ids = [...this.conns.keys()]
-        for (const id of ids) await this.disconnect(id)
+        for (const id of ids) await this.disconnect(id, 'walker closing')
     }
 
     getDisksRoot(): string { return this.disksRoot }
