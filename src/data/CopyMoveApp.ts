@@ -10,14 +10,15 @@
 
 import { chalk, fs, $ } from 'zx'
 import { log } from '../utils/utils.js'
-import { rsyncDirectory } from '../utils/rsync.js'
+import { rsyncDirectory, rsyncInstanceData } from '../utils/rsync.js'
+import { instanceDataBytes, deleteInstanceData, deleteRemoteInstanceData } from '../utils/appDataHelper.js'
 import { shellQuote } from '../utils/ssh.js'
 import {
     InstanceID, DiskID, DiskName, InstanceName, Timestamp,
     OperationKind, OperationCause, ServiceImage
 } from './CommonTypes.js'
 import { Store, getDisk, getInstance, getInstancesOfDisk } from './Store.js'
-import { Disk, processInstance, diskMountRoot, diskFsRoot } from './Disk.js'
+import { Disk, processInstance, diskMountRoot, diskFsRoot, appDataRoot } from './Disk.js'
 import { stopInstance, startInstance } from './Instance.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { uuid } from '../utils/utils.js'
@@ -46,7 +47,9 @@ export const availableBytes = async (path: string): Promise<number> => {
 }
 
 /**
- * Returns total size in bytes of `path` (recursive).
+ * Returns total size in bytes of `path` (recursive), as the Engine user.
+ * Used for the pi-owned app master; instance data is sized as root by the
+ * app-data helper (instanceDataBytes), because pi cannot read all of it (idea#168).
  * Exported so tests can mock it.
  */
 export const directoryBytes = async (path: string): Promise<number> => {
@@ -66,6 +69,9 @@ interface ValidatedCopyMove {
     targetDevice: string
     appMasterSrc: string
     instanceSrc: string
+    /** app-data helper root tokens (idea#168): 'system', 'sdX1' or a test slot name */
+    sourceRoot: string
+    targetRoot: string
 }
 
 const validate = async (
@@ -145,7 +151,10 @@ const validate = async (
     const externalLinks = await findExternalLinks(instanceSrc)
     if (externalLinks.length > 0) return externalLinksMessage(instanceSrc, sourceDisk, externalLinks)
 
-    return { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc }
+    const sourceRoot = await appDataRoot(sourceDisk)
+    const targetRoot = await appDataRoot(targetDisk)
+
+    return { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc, sourceRoot, targetRoot }
 }
 
 // ── copyApp ───────────────────────────────────────────────────────────────────
@@ -196,7 +205,7 @@ export const copyApp = async (
     // Validation refusals throw (idea#168 r29@97), so the command trace or
     // crash-recovery retry ends as error instead of silently succeeding.
     if (typeof v === 'string') throw new Error(`copyApp: ${v}`)
-    const { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc } = v
+    const { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc, sourceRoot, targetRoot } = v
 
     // Acquire per-resource locks: source instance + target disk
     const lockKeys = [instanceKey(instance.id), diskKey(targetDisk.id)]
@@ -267,7 +276,9 @@ export const copyApp = async (
         // 2. Check free space (local only — skip for cross-engine)
         setCopyStep(1)
         if (!isCrossEngine) {
-            const needed = await directoryBytes(appMasterSrc) + await directoryBytes(instanceSrc)
+            // Instance data is sized as root by the app-data helper (idea#168): pi cannot
+            // read all of it (root 0600 sessions, MariaDB 0700 folders).
+            const needed = await directoryBytes(appMasterSrc) + await instanceDataBytes(sourceRoot, instance.id)
             const available = await availableBytes(await diskFsRoot(targetDisk))
             if (available < needed) {
                 throw new Error(
@@ -297,16 +308,21 @@ export const copyApp = async (
             updateOperation(storeHandle, opId, { progressPercent: Math.round(progressPercent * 0.25) })
         }, opId, remoteAddress)
 
-        // 5. rsync instance data into a NEW instance directory (new ID)
+        // 5. Copy instance data into a NEW instance directory (new ID), as root through
+        //    the app-data helper (idea#168): owners and modes are kept, and data pi
+        //    cannot read is copied too. The helper creates the folder; cross-engine it
+        //    sends to pi@<remote>, where that Engine's helper receives it (rrsync -wo).
         setCopyStep(3)
         const instanceDest = `${targetMountRoot}/instances/${newInstanceId}`
         createdInstanceDest = instanceDest
-        if (!isCrossEngine) await fs.ensureDir(instanceDest)
-        else await $`ssh -o StrictHostKeyChecking=no pi@${remoteAddress} mkdir -p ${instanceDest}`
-        log(`copyApp: syncing instance data ${instanceSrc} → ${isCrossEngine ? remoteAddress + ':' : ''}${instanceDest}`)
-        await rsyncDirectory(instanceSrc, instanceDest, ({ progressPercent }) => {
-            updateOperation(storeHandle, opId, { progressPercent: 25 + Math.round(progressPercent * 0.30) })
-        }, opId, remoteAddress)
+        log(`copyApp: syncing instance data ${instanceSrc} → ${isCrossEngine ? remoteAddress + ':' : ''}${instanceDest} (idea-app-data ${isCrossEngine ? 'send' : 'copy'})`)
+        await rsyncInstanceData(
+            isCrossEngine
+                ? { kind: 'send', srcRoot: sourceRoot, srcId: instance.id, host: remoteAddress!, dstRoot: targetRoot, dstId: newInstanceId }
+                : { kind: 'copy', srcRoot: sourceRoot, srcId: instance.id, dstRoot: targetRoot, dstId: newInstanceId },
+            ({ progressPercent }) => {
+                updateOperation(storeHandle, opId, { progressPercent: 25 + Math.round(progressPercent * 0.30) })
+            }, opId)
 
         // 5a. Give the copy its own name and port (idea#168 r35). The rsync
         //     copied the original's compose.yaml (x-app.instanceName) and .env
@@ -425,11 +441,12 @@ export const copyApp = async (
         }
         console.error(chalk.red(`copyApp: failed — ${e.message ?? e}`))
         // Remove the partial copy unless it was already registered (fresh id, so the
-        // folder holds only what this op wrote).
+        // folder holds only what this op wrote). As root through the app-data helper
+        // (idea#168): the copy holds files owned by root, 999 and www-data.
         if (createdInstanceDest && !storeHandle.doc()?.instanceDB?.[newInstanceId]) {
             try {
-                if (isCrossEngine) await $`ssh -o StrictHostKeyChecking=no pi@${remoteAddress} rm -rf -- ${createdInstanceDest}`
-                else await fs.remove(createdInstanceDest)
+                if (isCrossEngine) await deleteRemoteInstanceData(remoteAddress!, targetRoot, newInstanceId)
+                else await deleteInstanceData(targetRoot, newInstanceId)
                 log(`copyApp: removed the partial copy ${isCrossEngine ? remoteAddress + ':' : ''}${createdInstanceDest}`)
             } catch (cleanupErr: any) {
                 console.error(chalk.red(`copyApp: could not remove the partial copy ${createdInstanceDest}: ${cleanupErr?.message ?? cleanupErr}`))
@@ -463,7 +480,7 @@ export const moveApp = async (
     // Validation refusals throw (idea#168 r29@97), so the command trace or
     // crash-recovery retry ends as error instead of silently succeeding.
     if (typeof v === 'string') throw new Error(`moveApp: ${v}`)
-    const { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc } = v
+    const { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc, sourceRoot, targetRoot } = v
 
     // moveApp does not support cross-engine targets (data integrity risk if move fails midway).
     // Use copyApp + manual delete instead.
@@ -485,6 +502,11 @@ export const moveApp = async (
     }, cause, { type: 'instance', id: instance.id })
 
     let wasRunning = false
+    // idea#168: set once the helper copy into the target started, cleared when the
+    // instance is registered there. A failed move removes this partial copy, else a
+    // retry is refused (the helper needs an absent or empty destination) and the next
+    // dock of the target disk would register the partial folder.
+    let partialTarget = false
 
     // ── step definitions ──────────────────────────────────────────────────────
     const MOVE_STEPS = [
@@ -512,7 +534,7 @@ export const moveApp = async (
 
         // 2. Check free space
         setMoveStep(1)
-        const needed = await directoryBytes(appMasterSrc) + await directoryBytes(instanceSrc)
+        const needed = await directoryBytes(appMasterSrc) + await instanceDataBytes(sourceRoot, instance.id)
         const available = await availableBytes(await diskFsRoot(targetDisk))
         if (available < needed) {
             throw new Error(
@@ -535,14 +557,16 @@ export const moveApp = async (
             updateOperation(storeHandle, opId, { progressPercent: Math.round(progressPercent * 0.25) })
         }, opId)
 
-        // 5. rsync instance data — same instance ID, new location
+        // 5. Copy instance data as root through the app-data helper (idea#168) —
+        //    same instance ID, new location; owners and modes are kept.
         setMoveStep(3)
         const instanceDest = `${targetMountRoot}/instances/${instance.id}`
-        await fs.ensureDir(instanceDest)
-        log(`moveApp: syncing instance data ${instanceSrc} → ${instanceDest}`)
-        await rsyncDirectory(instanceSrc, instanceDest, ({ progressPercent }) => {
-            updateOperation(storeHandle, opId, { progressPercent: 25 + Math.round(progressPercent * 0.30) })
-        }, opId)
+        log(`moveApp: syncing instance data ${instanceSrc} → ${instanceDest} (idea-app-data copy)`)
+        partialTarget = true
+        await rsyncInstanceData({ kind: 'copy', srcRoot: sourceRoot, srcId: instance.id, dstRoot: targetRoot, dstId: instance.id },
+            ({ progressPercent }) => {
+                updateOperation(storeHandle, opId, { progressPercent: 25 + Math.round(progressPercent * 0.30) })
+            }, opId)
 
         // 5b. rsync service image tars needed by this instance
         //     services/ holds the Docker image tars that startInstance loads via
@@ -575,18 +599,19 @@ export const moveApp = async (
         setMoveStep(5)
         log(`moveApp: registering instance ${instance.id} on disk '${targetDisk.name}' (${targetDisk.id})`)
         await processInstance(storeHandle, targetDisk, instance.id)
+        partialTarget = false
 
         // 8. Remove source instance directory
         setMoveStep(6)
-        // Removed as pi, without sudo (idea#80): instance folders on disks must be
-        // removable by pi, and the Engine's sudoers file does not allow rm on them.
+        // Removed as root through the app-data helper (idea#168): the folder holds
+        // files containers wrote as root, 999 or www-data, which pi cannot remove.
         // The instance already runs from the target disk at this point, so a failure
-        // (e.g. files a container created as root) is logged and does not fail the move.
-        log(`moveApp: removing source instance directory ${instanceSrc}`)
+        // is logged and does not fail the move.
+        log(`moveApp: removing source instance directory ${instanceSrc} (idea-app-data delete)`)
         try {
-            await fs.remove(instanceSrc)
+            await deleteInstanceData(sourceRoot, instance.id)
         } catch (e: any) {
-            log(chalk.yellow(`moveApp: could not fully remove ${instanceSrc} as pi: ${e.message}. Remove the leftover folder by hand.`))
+            log(chalk.yellow(`moveApp: could not remove ${instanceSrc}: ${e.message}. Remove the leftover folder by hand.`))
         }
 
         // 9. Remove source app master only if no other instance on the source disk uses it
@@ -618,6 +643,22 @@ export const moveApp = async (
             })
         }
         console.error(chalk.red(`moveApp: failed — ${e.message ?? e}`))
+
+        // Remove the partial copy on the target (idea#168) while the instance is still
+        // registered on the source disk. Never the source: the helper refuses a copy
+        // onto the same root, so target root ≠ source root. Not after a helper
+        // refusal: it wrote nothing, and a folder that was already there (e.g. an
+        // earlier restore of this instance onto the target) is not ours to remove.
+        const stillOnSource = String(storeHandle.doc()?.instanceDB?.[instance.id]?.storedOn) === String(sourceDisk.id)
+        const helperRefused = /idea-app-data [\w-]+ refused: /.test(String(e?.message ?? ''))
+        if (partialTarget && stillOnSource && !helperRefused && targetRoot !== sourceRoot) {
+            try {
+                await deleteInstanceData(targetRoot, instance.id)
+                log(`moveApp: removed the partial copy of ${instance.id} on '${targetDisk.name}'`)
+            } catch (cleanupErr: any) {
+                console.error(chalk.red(`moveApp: could not remove the partial copy of ${instance.id} on '${targetDisk.name}': ${cleanupErr?.message ?? cleanupErr}`))
+            }
+        }
 
         // On failure, try to restart the source instance if we stopped it
         if (wasRunning) {

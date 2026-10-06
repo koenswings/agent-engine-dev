@@ -4,7 +4,10 @@
  * Design: design/copy-move-app.md — Test Strategy section
  *
  * Uses a real Automerge Repo (same pattern as eject-disk.test.ts) and mocks:
- *   - rsyncDirectory (no real file transfers)
+ *   - rsyncDirectory (app masters, service tars) and rsyncInstanceData (instance
+ *     data through the app-data root helper, idea#168) — no real file transfers
+ *   - the app-data helper calls instanceDataBytes / deleteInstanceData /
+ *     deleteRemoteInstanceData (no sudo)
  *   - processInstance (no Docker)
  *   - stopInstance / startInstance (no Docker)
  *   - fs operations in CopyMoveApp (no real disk access)
@@ -29,8 +32,26 @@ vi.mock('../../src/utils/rsync.js', () => ({
     ) => {
         onProgress?.({ progressPercent: 50 })
         onProgress?.({ progressPercent: 100 })
-    })
+    }),
+    rsyncInstanceData: vi.fn(async (
+        _t: unknown,
+        onProgress?: (p: { progressPercent: number }) => void
+    ) => {
+        onProgress?.({ progressPercent: 50 })
+        onProgress?.({ progressPercent: 100 })
+    }),
 }))
+
+// The app-data root helper (idea#168): instance data is sized and deleted as root.
+vi.mock('../../src/utils/appDataHelper.js', async (importOriginal) => {
+    const actual = await importOriginal<any>()
+    return {
+        ...actual,
+        instanceDataBytes: vi.fn(async () => 100 * 1024 * 1024),
+        deleteInstanceData: vi.fn(async () => undefined),
+        deleteRemoteInstanceData: vi.fn(async () => undefined),
+    }
+})
 
 // Mock the Disk.processInstance — no Docker during unit tests
 vi.mock('../../src/data/Disk.js', async (importOriginal) => {
@@ -107,7 +128,7 @@ vi.mock('zx', async (importOriginal) => {
 
 const SOURCE_DISK_ID = 'DISK_source' as DiskID
 const TARGET_DISK_ID = 'DISK_target' as DiskID
-const INSTANCE_ID = 'INST_abc' as InstanceID
+const INSTANCE_ID = 'kolibri-abc123' as InstanceID
 const APP_ID = 'kolibri-1.0' as AppID
 
 const makeRepo = () => new Repo({ network: [], storage: undefined })
@@ -214,6 +235,35 @@ describe('copyApp', () => {
         expect(vi.mocked(startInstance)).not.toHaveBeenCalled()
     })
 
+    it('copies instance data with the helper into the new id (disk root tokens) and sizes it as root (idea#168)', async () => {
+        const { handle } = await makeHandle()
+        const { rsyncInstanceData } = await import('../../src/utils/rsync.js')
+        const helper = await import('../../src/utils/appDataHelper.js')
+        const { processInstance } = await import('../../src/data/Disk.js')
+        await copyApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
+        const newId = vi.mocked(processInstance).mock.calls[0][2]
+        expect(vi.mocked(helper.instanceDataBytes).mock.calls).toEqual([['idea-test-1', INSTANCE_ID]])
+        expect(vi.mocked(rsyncInstanceData).mock.calls.map(c => c[0])).toEqual([
+            { kind: 'copy', srcRoot: 'idea-test-1', srcId: INSTANCE_ID, dstRoot: 'idea-test-2', dstId: newId },
+        ])
+        expect(newId).toMatch(/^[a-z0-9]{19}$/)
+        expect(typeof vi.mocked(rsyncInstanceData).mock.calls[0][2]).toBe('string')   // opId: cancellable
+        const mfs = await getMockedFs()
+        expect(vi.mocked(mfs.ensureDir).mock.calls.map(c => String(c[0])).some(p => p.includes('/instances/'))).toBe(false)
+    })
+
+    it('a failed instance copy removes the partial copy (new id) through the helper', async () => {
+        const { handle } = await makeHandle()
+        const { rsyncInstanceData } = await import('../../src/utils/rsync.js')
+        const helper = await import('../../src/utils/appDataHelper.js')
+        vi.mocked(rsyncInstanceData).mockRejectedValueOnce(new Error('rsync cancelled (SIGTERM)'))
+        await copyApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
+        const spec = vi.mocked(rsyncInstanceData).mock.calls[0][0] as any
+        expect(vi.mocked(helper.deleteInstanceData).mock.calls).toEqual([['idea-test-2', spec.dstId]])
+        expect(spec.dstId).not.toBe(INSTANCE_ID)
+        expect(vi.mocked(helper.deleteRemoteInstanceData)).not.toHaveBeenCalled()
+    })
+
     it('sets operation status to Failed when rsync throws', async () => {
         const { handle } = await makeHandle()
         const { rsyncDirectory } = await import('../../src/utils/rsync.js')
@@ -298,14 +348,16 @@ describe('moveApp', () => {
         )
     })
 
-    it('removes source instance directory after successful move', async () => {
+    it('removes the source instance directory as root through the helper after a successful move (idea#168)', async () => {
         const { handle } = await makeHandle()
         const { $ } = await import('zx')
+        const helper = await import('../../src/utils/appDataHelper.js')
         await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
-        // Instance dir is removed as pi with fs.remove, without sudo (idea#80).
+        expect(vi.mocked(helper.deleteInstanceData).mock.calls).toEqual([['idea-test-1', INSTANCE_ID]])
+        // never as pi (fs.remove) and never a sudo rm
         const mfs = await getMockedFs()
         const removeCalls = vi.mocked(mfs.remove).mock.calls.map(c => c[0] as string)
-        expect(removeCalls.some(p => p.includes(`/instances/${INSTANCE_ID}`))).toBe(true)
+        expect(removeCalls.some(p => p.includes(`/instances/${INSTANCE_ID}`))).toBe(false)
         const didSudoRm = vi.mocked($).mock.calls.some((args: any) => {
             const [strings, ...vals] = args
             const allParts = [
@@ -315,6 +367,59 @@ describe('moveApp', () => {
             return allParts.includes('sudo') && allParts.includes('rm') && allParts.includes(INSTANCE_ID)
         })
         expect(didSudoRm).toBe(false)
+    })
+
+    it('copies instance data with the helper (same id, disk root tokens) and sizes it as root', async () => {
+        const { handle } = await makeHandle()
+        const { rsyncInstanceData } = await import('../../src/utils/rsync.js')
+        const helper = await import('../../src/utils/appDataHelper.js')
+        await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
+        expect(vi.mocked(helper.instanceDataBytes).mock.calls).toEqual([['idea-test-1', INSTANCE_ID]])
+        expect(vi.mocked(rsyncInstanceData).mock.calls.map(c => c[0])).toEqual([
+            { kind: 'copy', srcRoot: 'idea-test-1', srcId: INSTANCE_ID, dstRoot: 'idea-test-2', dstId: INSTANCE_ID },
+        ])
+        expect(typeof vi.mocked(rsyncInstanceData).mock.calls[0][2]).toBe('string')   // opId: cancellable
+        // the instance folder is not pre-created as pi (the helper creates it as root)
+        const mfs = await getMockedFs()
+        expect(vi.mocked(mfs.ensureDir).mock.calls.map(c => String(c[0])).some(p => p.includes('/instances/'))).toBe(false)
+    })
+
+    it('a failed instance copy removes the partial target copy through the helper, never the source', async () => {
+        const { handle } = await makeHandle()
+        const { rsyncInstanceData } = await import('../../src/utils/rsync.js')
+        const helper = await import('../../src/utils/appDataHelper.js')
+        vi.mocked(rsyncInstanceData).mockRejectedValueOnce(new Error('rsync (idea-app-data copy exited with code 23: some files vanished)'))
+        await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
+        expect(Object.values(handle.doc().operationDB)[0].status).toBe('Failed')
+        expect(vi.mocked(helper.deleteInstanceData).mock.calls).toEqual([['idea-test-2', INSTANCE_ID]])
+    })
+
+    it('a helper refusal (e.g. the target folder already exists) removes nothing', async () => {
+        const { handle } = await makeHandle()
+        const { rsyncInstanceData } = await import('../../src/utils/rsync.js')
+        const helper = await import('../../src/utils/appDataHelper.js')
+        vi.mocked(rsyncInstanceData).mockRejectedValueOnce(new Error('rsync (idea-app-data copy refused: destination /disks/sdc1/instances/x already exists and is not empty)'))
+        await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
+        expect(Object.values(handle.doc().operationDB)[0].error).toContain('already exists and is not empty')
+        expect(vi.mocked(helper.deleteInstanceData)).not.toHaveBeenCalled()
+    })
+
+    it('a failure after the instance is registered on the target does not remove the target copy', async () => {
+        const { handle } = await makeHandle()
+        const helper = await import('../../src/utils/appDataHelper.js')
+        const mfs = await getMockedFs()
+        // app master removal (after registration) fails
+        vi.mocked(mfs.remove).mockRejectedValueOnce(new Error('EBUSY'))
+        await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
+        expect(vi.mocked(helper.deleteInstanceData).mock.calls.filter(c => c[0] === 'idea-test-2')).toEqual([])
+    })
+
+    it('a failing source delete is logged and the move still ends Done', async () => {
+        const { handle } = await makeHandle()
+        const helper = await import('../../src/utils/appDataHelper.js')
+        vi.mocked(helper.deleteInstanceData).mockRejectedValueOnce(new Error('idea-app-data delete refused: x'))
+        await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
+        expect(Object.values(handle.doc().operationDB)[0].status).toBe('Done')
     })
 
     it('removes app master when no other instance on source disk uses it', async () => {

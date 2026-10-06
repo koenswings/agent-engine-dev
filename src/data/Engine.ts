@@ -2,6 +2,7 @@ import { $, chalk, os, YAML, fs, path, sleep } from 'zx';
 
 $.verbose = false;
 import { deepPrint, log, uuid, print } from '../utils/utils.js';
+import { APP_DATA_HELPER } from '../utils/appDataHelper.js';
 import { readMetaUpdateId, DiskMeta, addMeta, readRemoteDiskId } from './Meta.js';
 import { Version, Command, Hostname, Timestamp, DiskID, EngineID } from './CommonTypes.js';
 import { Store, getAppsOfEngine, getDisksOfEngine, getInstancesOfEngine } from './Store.js';
@@ -522,6 +523,13 @@ export const installUdev = async (exec: any, enginePath: string) => {
     print(chalk.blue('  - Installing idea-erase-disk...'))
     await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-erase-disk /usr/local/sbin/idea-erase-disk`
     print(chalk.green('  - /usr/local/sbin/idea-erase-disk installed'))
+    // idea-app-data: the app-data root helper (idea#168), same rules: root-owned COPY,
+    // 0755, in /usr/local/sbin; its sudoers line is in 11-engine-files (visudo -cf above).
+    // It runs rsync/rrsync, borg, runuser and ssh by absolute path.
+    print(chalk.blue('  - Installing idea-app-data...'))
+    await exec`sudo apt install rsync borgbackup -y`
+    await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-app-data ${APP_DATA_HELPER}`
+    print(chalk.green(`  - ${APP_DATA_HELPER} installed`))
     await createDir(exec, '/disks', "0755", "0:0")
 
     // Configure /dev/engine ownership so the pi user can write sentinel files.

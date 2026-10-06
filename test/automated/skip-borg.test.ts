@@ -10,8 +10,8 @@
  *   - skipBorg() resolution (unset → testMode; explicit true/false wins)
  *   - the IDEA_SKIP_BORG env override (fresh Config module)
  *   - unset + testMode: backupInstance / restoreApp never call borg
- *   - skipBorg false + testMode: borg init, create and extract all run
- *     (a fake `borg` on PATH records its arguments)
+ *   - skipBorg false + testMode: borg init, create and extract all run, as root
+ *     through the app-data helper (a fake `sudo` on PATH records its arguments)
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
@@ -58,13 +58,17 @@ const addInstance = (h: DocHandle<Store>, diskId: DiskID) =>
         } as any
     })
 
-// A fake borg: logs each call; `init` creates <repo>/config; `info` returns one
-// archive whose command line names instances/<INST>.
-const FAKE_BORG = `#!/usr/bin/env bash
+// A fake sudo standing in for `sudo -n /usr/local/sbin/idea-app-data …` (idea#168):
+// logs the helper arguments; borg-init creates <repo>/config; borg-info returns
+// one archive whose command line names instances/<INST>.
+const FAKE_SUDO = `#!/usr/bin/env bash
+# anything else (e.g. createOrUpdateEngine's sudo cat /META.yaml) goes to the real sudo
+[[ "$1" == -n && "$2" == /usr/local/sbin/idea-app-data ]] || exec /usr/bin/sudo "$@"
+shift 2
 echo "$*" >> "$FAKE_BORG_LOG"
 case "$1" in
-  init) mkdir -p "\${@: -1}" && echo '[repository]' > "\${@: -1}/config" ;;
-  info) echo '{"archives":[{"name":"2026-10-06T08-00-00-000Z","command_line":["borg","create","r::a","/disks/x/instances/${INST}"]}]}' ;;
+  borg-init) mkdir -p "$IDEA_DISKS_ROOT/$2/backups/$3" && echo '[repository]' > "$IDEA_DISKS_ROOT/$2/backups/$3/config" ;;
+  borg-info) echo '{"archives":[{"name":"2026-10-06T08-00-00-000Z","command_line":["borg","create","--numeric-ids","--","r::a","/disks/x/instances/${INST}"]}]}' ;;
 esac
 exit 0
 `
@@ -81,9 +85,9 @@ beforeEach(async () => {
     await fs.ensureDir(`${DISKS_ROOT}/${appDevice}/instances/${INST}`)
     await fs.ensureDir(`${DISKS_ROOT}/${backupDevice}`)
     await fs.writeFile(`${DISKS_ROOT}/${backupDevice}/BACKUP.yaml`, `mode: on-demand\nlinks:\n  - instanceId: ${INST}\n    lastBackup: 0\n`)
-    binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fake-borg-'))
+    binDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fake-sudo-'))
     borgLog = path.join(binDir, 'calls.log')
-    await fs.writeFile(path.join(binDir, 'borg'), FAKE_BORG, { mode: 0o755 })
+    await fs.writeFile(path.join(binDir, 'sudo'), FAKE_SUDO, { mode: 0o755 })
     process.env.PATH = `${binDir}:${saved.path}`
     process.env.FAKE_BORG_LOG = borgLog
     config.settings.testMode = true
@@ -168,16 +172,15 @@ describe('backupInstance / restoreApp with testMode on', () => {
         expect(restoreError).toMatch(/No docked Backup Disk with archives/)
     })
 
-    it('skipBorg false: borg init, create and extract all run (real archive path), still in testMode', async () => {
+    it('skipBorg false: borg init, create and extract all run through the helper (root tokens, real archive name), still in testMode', async () => {
         config.settings.skipBorg = false
         const { backupOp } = await backupThenRestore()
         const log = await calls()
-        const repo = `${DISKS_ROOT}/${backupDevice}/backups/${INST}`
         expect(backupOp?.status, JSON.stringify(backupOp)).toBe('Done')
-        expect(log[0]).toBe(`init --encryption=none ${repo}`)
-        expect(log[1]).toMatch(new RegExp(`^create ${repo}::\\S+ ${DISKS_ROOT}/${appDevice}/instances/${INST}$`))
-        expect(log[2]).toBe(`info --json --last 1 ${repo}`)
-        expect(log[3]).toBe(`extract --strip-components 3 ${repo}::2026-10-06T08-00-00-000Z`)
+        expect(log[0]).toBe(`borg-init ${backupDevice} ${INST}`)
+        expect(log[1]).toMatch(new RegExp(`^borg-create ${backupDevice} ${INST} \\d{4}-\\d{2}-\\d{2}T[0-9-]+Z ${appDevice}$`))
+        expect(log[2]).toBe(`borg-info ${backupDevice} ${INST}`)
+        expect(log[3]).toBe(`borg-extract ${backupDevice} ${INST} 2026-10-06T08-00-00-000Z 3 ${appDevice}`)
         expect(log).toHaveLength(4)
     })
 })

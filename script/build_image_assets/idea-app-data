@@ -1,0 +1,630 @@
+#!/bin/bash
+# idea-app-data — root helper for app INSTANCE data: size, copy, send, receive,
+# delete and Borg backup/restore (idea#168)
+#
+# Installed as a root-owned COPY at /usr/local/sbin/idea-app-data (0755, never a
+# symlink) by build-engine, next to idea-erase-disk. Allowed by ONE sudoers line
+# with no argument list (11-engine-files):
+#   pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-app-data
+# so this script validates every argument itself. The Engine (pi, under pm2)
+# calls it with `sudo -n` for app instance data only; app masters and service
+# tars are pi-owned and stay plain pi operations.
+#
+# Why root: app containers write instance data as root (Kolibri sessions 0600),
+# 999 (MariaDB, 0700 folders) and www-data (Nextcloud 0640/0770). pi cannot read
+# those, so copy/move/backup/restore as pi fail or lose the owners.
+#
+# Usage (exact argument counts; no options are accepted from the caller):
+#   idea-app-data version
+#   idea-app-data size         <root> <id>
+#   idea-app-data copy         <srcRoot> <srcId> <dstRoot> <dstId>
+#   idea-app-data send         <srcRoot> <srcId> <host> <dstRoot> <dstId>
+#   idea-app-data receive      <dstRoot> <dstId> <rsync server args...>   (remote side of send only)
+#   idea-app-data delete       <root> <id>
+#   idea-app-data borg-init    <bdev> <id>
+#   idea-app-data borg-info    <bdev> <id>
+#   idea-app-data borg-create  <bdev> <id> <archive> <srcRoot>
+#   idea-app-data borg-extract <bdev> <id> <archive> <strip> <dstRoot>
+#
+# Tokens (none can start with '-' or hold '/' or '..'):
+#   root     sd[a-z][12]  → /disks/<dev>: findmnt must show source /dev/<dev>, type
+#                           ext4, not the root filesystem's drive, META.yaml at its root
+#            system       → /instances/<id> on the system disk
+#            <slot name>  → TEST-ONLY root bridge (see below), e.g. idea-test-1
+#   bdev     like root but never 'system'; the disk must hold BACKUP.yaml
+#   id       ^[a-z0-9][a-z0-9-]{0,63}$
+#   archive  ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9-]{8,16}Z$   (backupInstance's format)
+#   strip    ^[1-9]$
+#   host     an IPv4 address or ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$, resolved HERE;
+#            every resolved IPv4 address must be in 10/8, 172.16/12, 192.168/16 or
+#            100.64/10 (LAN and Tailscale). Public, loopback or unresolvable: refused.
+#
+# Paths are built here from checked tokens only, and `realpath -e` must give back
+# exactly the built path (no symlink anywhere in it). A copy/receive destination
+# must not exist yet or be empty. copy and send refuse source data holding a
+# symlink whose target (lexical or real) leaves the instance folder (idea#168 r35).
+# No shell: every command is a bash array with absolute binaries and `--` before
+# paths; PATH, umask and LC_ALL are fixed (sudo's env_reset strips the caller's
+# environment). Every call is logged with logger to auth.notice (caller, subcommand,
+# arguments, exit code, duration), refusals included. A per-instance / per-repo
+# flock in a root-only folder under /run/lock keeps two runs off the same folder.
+#
+# TEST-ONLY root bridge (idea#168; REMOVE when the pool gets real USB disks, Stage 2):
+#   The duration pool's fixture disks are folders (or loop mounts) under
+#   /home/pi/idea/duration-disks/<slot>, which the Engine names by slot
+#   (IDEA_DISKS_ROOT + device 'idea-test-N'). They are not /dev/sdX mounts, so the
+#   checks above refuse them. Only on pool Pis, Ops may list such roots in
+#   /etc/idea/app-data-roots, one absolute path per line ('#' comments allowed).
+#   The file is ignored (and the reason logged) unless it is a regular file, not a
+#   symlink, owned root:root, mode 0644 (so no group/other write). An entry is
+#   ignored (reason logged) unless it is an absolute path without '.'/'..'
+#   components or symlinks, an existing folder whose name is a slot name (not
+#   sdX1/sdX2/system), and whose parent folder is owned by root and not
+#   group/other writable. A root token that is not sdX1/sdX2/system resolves ONLY
+#   through this file, by the entry's last path component; every use is logged as
+#   "test-only root bridge". Production Pis never have this file.
+#
+# Exit codes: 0 ok; 2 refused (stderr "refused: <reason>"); otherwise the exit code
+# of rsync/borg/du/rm. A run cancelled with TERM/INT/HUP stops its child and then
+# dies of the same signal, so sudo (and the Engine) see the signal.
+
+set -u
+set -o pipefail
+
+readonly IDEA_APP_DATA_VERSION=1
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+umask 022
+export LC_ALL=C
+IFS=$' \t\n'
+unset -v CDPATH GLOBIGNORE BASH_ENV ENV BORG_RSH BORG_REPO BORG_PASSPHRASE BORG_PASSCOMMAND RSYNC_RSH RSYNC_CONNECT_PROG
+
+# ── Absolute binaries ────────────────────────────────────────────────────────
+RSYNC=/usr/bin/rsync
+RRSYNC=/usr/bin/rrsync
+BORG=/usr/bin/borg
+FINDMNT=/usr/bin/findmnt
+REALPATH=/usr/bin/realpath
+READLINK=/usr/bin/readlink
+STAT=/usr/bin/stat
+DU=/usr/bin/du
+RM=/usr/bin/rm
+RMDIR=/usr/bin/rmdir
+MKDIR=/usr/bin/mkdir
+MKTEMP=/usr/bin/mktemp
+MV=/usr/bin/mv
+FIND=/usr/bin/find
+FLOCK=/usr/bin/flock
+LOGGER=/usr/bin/logger
+GETENT=/usr/bin/getent
+RUNUSER=/usr/sbin/runuser
+SSH=/usr/bin/ssh
+SUDO=/usr/bin/sudo
+DATE=/usr/bin/date
+SORT=/usr/bin/sort
+
+# ── Fixed locations ──────────────────────────────────────────────────────────
+DISKS_DIR=/disks
+SYSTEM_ROOT=
+ROOTS_FILE=/etc/idea/app-data-roots
+LOCK_DIR=/run/lock/idea-app-data
+ROOT_HOME=/root
+ROOT_UID=0
+ROOT_GID=0
+REMOTE_USER=pi
+HELPER_PATH=/usr/local/sbin/idea-app-data
+LOCK_WAIT_SECONDS=600
+
+export HOME="$ROOT_HOME"
+
+RE_DEV='^sd[a-z][12]$'
+RE_ID='^[a-z0-9][a-z0-9-]{0,63}$'
+RE_SLOT='^[a-z0-9][a-z0-9-]{0,63}$'
+RE_ARCHIVE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9-]{8,16}Z$'
+RE_STRIP='^[1-9]$'
+RE_IPV4='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$'
+RE_HOST='^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$'
+RE_SERVER_ARG='^[A-Za-z0-9._=,:+@/-]*$'
+
+RSYNC_OPTS=(-aHAX --numeric-ids -x --info=progress2 --no-inc-recursive)
+
+SUB="${1:-}"
+START_MS=$($DATE +%s%3N 2>/dev/null || echo 0)
+LOG_ARGS=$(printf '%q ' "$@")
+LOG_ARGS=${LOG_ARGS:0:1500}
+REFUSAL=""
+CHILD=""
+STAGING_TMP=""
+BRIDGE_USED=""
+
+# ── Logging, refusal, exit ───────────────────────────────────────────────────
+journal() { $LOGGER -t idea-app-data -p auth.notice -- "$*" >/dev/null 2>&1 || true; }
+
+log_exit() {
+    local ec=$?
+    local end_ms
+    end_ms=$($DATE +%s%3N 2>/dev/null || echo 0)
+    local msg="user=${SUDO_USER:-unknown} sub=${SUB:-none} args=${LOG_ARGS% } exit=$ec ms=$((end_ms - START_MS))"
+    [[ -n "$BRIDGE_USED" ]] && msg+=" test-only-root-bridge=[$BRIDGE_USED]"
+    [[ -n "$REFUSAL" ]] && msg+=" refused=$(printf '%q' "$REFUSAL")"
+    journal "$msg"
+}
+trap log_exit EXIT
+
+refuse() {
+    REFUSAL="$*"
+    echo "refused: $*" >&2
+    exit 2
+}
+
+cleanup_staging() {
+    if [[ -n "$STAGING_TMP" && -d "$STAGING_TMP" && ! -L "$STAGING_TMP" ]]; then
+        $RM -rf --one-file-system -- "$STAGING_TMP" 2>/dev/null || true
+        $RMDIR -- "${STAGING_TMP%/*}" 2>/dev/null || true   # the staging folder, once empty
+    fi
+    STAGING_TMP=""
+}
+
+# Cancellation: stop the child, clean up, log, then die of the same signal so
+# sudo re-raises it and the Engine sees a signal (not just an exit code).
+on_signal() {
+    local sig="$1"
+    if [[ -n "$CHILD" ]]; then
+        kill -"$sig" "$CHILD" 2>/dev/null || true
+        wait "$CHILD" 2>/dev/null || true
+        CHILD=""
+    fi
+    cleanup_staging
+    REFUSAL=""
+    SUB="${SUB} (cancelled by SIG$sig)"
+    trap - EXIT
+    (exit 128) ; log_exit
+    trap - "$sig"
+    kill -"$sig" $$
+    exit 1
+}
+trap 'on_signal TERM' TERM
+trap 'on_signal INT' INT
+trap 'on_signal HUP' HUP
+
+# Run a command in the background and wait, so a signal to this script is handled
+# at once (bash defers traps while a foreground child runs). stdin is passed on
+# explicitly (background jobs would otherwise read /dev/null; receive needs it).
+exec {STDIN_FD}<&0 || STDIN_FD=0
+run_child() {
+    "$@" <&"${STDIN_FD:-0}" &
+    CHILD=$!
+    local ec=0
+    wait "$CHILD" || ec=$?
+    CHILD=""
+    return "$ec"
+}
+
+# ── Checks ───────────────────────────────────────────────────────────────────
+need() {   # need <count> <given> <usage>
+    [[ "$2" -eq "$1" ]] || refuse "$SUB takes exactly $1 argument(s) ($3), got $2"
+}
+
+check_id() { [[ "$1" =~ $RE_ID ]] || refuse "instance id '$1' does not match $RE_ID"; }
+
+check_root_shape() {
+    [[ "$1" == system || "$1" =~ $RE_DEV || "$1" =~ $RE_SLOT ]] \
+        || refuse "root '$1' is not sd[a-z][12], system or a test-only slot name"
+}
+
+# realpath -e must give back exactly the path we built: it exists and no
+# component is a symlink.
+exact_path() {
+    local r
+    r=$($REALPATH -e -- "$1" 2>/dev/null) || return 1
+    [[ "$r" == "$1" ]]
+}
+
+drive_of() {
+    local d="$1"
+    if [[ "$d" =~ ^(mmcblk[0-9]+|nvme[0-9]+n[0-9]+)p[0-9]+$ ]]; then echo "${BASH_REMATCH[1]}"
+    elif [[ "$d" =~ ^(sd[a-z]+)[0-9]+$ ]]; then echo "${BASH_REMATCH[1]}"
+    else echo "$d"
+    fi
+}
+
+stat_fields() { $STAT -c '%u %g %a' -- "$1" 2>/dev/null; }
+
+no_group_other_write() { (( (8#$1 & 8#022) == 0 )); }
+
+# A real, mounted Engine disk: /disks/<dev> from /dev/<dev>, ext4, not on the
+# root filesystem's drive, META.yaml at its root.
+check_engine_disk() {
+    local dev="$1" mp="$DISKS_DIR/$1" out src fst rootsrc rootdev
+    exact_path "$mp" && [[ -d "$mp" ]] || refuse "$mp is not a folder (missing, or a symlink in its path)"
+    src=""; fst=""
+    read -r src fst _ < <($FINDMNT -n -r -o SOURCE,FSTYPE --mountpoint "$mp" 2>/dev/null)
+    [[ -n "$src" ]] || refuse "$mp is not a mount point (the disk is not mounted)"
+    [[ "$src" == "/dev/$dev" ]] || refuse "$mp is mounted from $src, not /dev/$dev"
+    [[ "$fst" == ext4 ]] || refuse "/dev/$dev at $mp is not ext4 (got ${fst:-unknown})"
+    rootsrc=""
+    read -r rootsrc _ < <($FINDMNT -n -r -o SOURCE --mountpoint / 2>/dev/null)
+    rootdev=${rootsrc#/dev/}
+    rootdev=${rootdev%%\[*}
+    [[ -n "$rootdev" ]] || refuse "cannot tell which device holds the root filesystem"
+    [[ "$rootdev" != "$dev" ]] || refuse "/dev/$dev holds the root filesystem"
+    [[ "$(drive_of "$rootdev")" != "$(drive_of "$dev")" ]] || refuse "/dev/$dev is on the system drive ($(drive_of "$rootdev"))"
+}
+
+# TEST-ONLY root bridge (idea#168, Stage 2 removes it). Prints the bridge root for
+# a slot name, or nothing. Every reason a file or entry is ignored is logged.
+bridge_ignored() {
+    echo "idea-app-data: ignoring the test-only root bridge file $ROOTS_FILE: $*" >&2
+    journal "test-only root bridge: ignoring $ROOTS_FILE: $*"
+}
+bridge_entry_ignored() {
+    echo "idea-app-data: test-only root bridge: ignoring entry '$1' in $ROOTS_FILE: $2" >&2
+    journal "test-only root bridge: ignoring entry $(printf '%q' "$1"): $2"
+}
+bridge_lookup() {
+    local slot="$1" st uid gid mode line entry base parent pst puid pgid pmode found=""
+    [[ -e "$ROOTS_FILE" || -L "$ROOTS_FILE" ]] || return 0
+    if [[ -L "$ROOTS_FILE" ]]; then bridge_ignored "it is a symlink"; return 0; fi
+    if [[ ! -f "$ROOTS_FILE" ]]; then bridge_ignored "not a regular file"; return 0; fi
+    st=$(stat_fields "$ROOTS_FILE") || { bridge_ignored "cannot stat it"; return 0; }
+    read -r uid gid mode <<<"$st"
+    if [[ "$uid" != "$ROOT_UID" || "$gid" != "$ROOT_GID" ]]; then bridge_ignored "owner is $uid:$gid, not root:root"; return 0; fi
+    if ! no_group_other_write "$mode"; then bridge_ignored "mode 0$mode lets group or others write it"; return 0; fi
+    if [[ "$mode" != 644 ]]; then bridge_ignored "mode is 0$mode, not 0644"; return 0; fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        entry=${line%%#*}
+        entry=${entry#"${entry%%[![:space:]]*}"}
+        entry=${entry%"${entry##*[![:space:]]}"}
+        [[ -n "$entry" ]] || continue
+        if [[ ! "$entry" =~ ^/[A-Za-z0-9._/-]+$ ]]; then bridge_entry_ignored "$entry" "not an absolute path of [A-Za-z0-9._/-]"; continue; fi
+        if [[ "$entry" == *//* || "$entry" == */ ]]; then bridge_entry_ignored "$entry" "has '//' or a trailing '/'"; continue; fi
+        if [[ "$entry" =~ (^|/)\.\.?(/|$) ]]; then bridge_entry_ignored "$entry" "has a '.' or '..' component"; continue; fi
+        base=${entry##*/}
+        parent=${entry%/*}
+        [[ -n "$parent" ]] || parent=/
+        if [[ ! "$base" =~ $RE_SLOT || "$base" =~ $RE_DEV || "$base" == system ]]; then
+            bridge_entry_ignored "$entry" "its name '$base' is not a slot name (or is sdX1/sdX2/system)"; continue
+        fi
+        if ! exact_path "$entry" || [[ ! -d "$entry" ]]; then bridge_entry_ignored "$entry" "not an existing folder without symlinks in its path"; continue; fi
+        pst=$(stat_fields "$parent") || { bridge_entry_ignored "$entry" "cannot stat its parent"; continue; }
+        read -r puid pgid pmode <<<"$pst"
+        if [[ "$puid" != "$ROOT_UID" ]]; then bridge_entry_ignored "$entry" "its parent $parent is owned by uid $puid, not root"; continue; fi
+        if ! no_group_other_write "$pmode"; then bridge_entry_ignored "$entry" "its parent $parent (mode 0$pmode) is group or other writable"; continue; fi
+        if [[ "$base" == "$slot" ]]; then
+            if [[ -n "$found" ]]; then bridge_entry_ignored "$entry" "a second entry named '$slot'"; found="AMBIGUOUS"; continue; fi
+            found="$entry"
+        fi
+    done < "$ROOTS_FILE"
+    echo "$found"
+}
+
+# resolve_root <token> <instances|backup> → sets R_DIR (no trailing slash; '' is /)
+resolve_root() {
+    local tok="$1" purpose="$2" b
+    R_DIR=""
+    check_root_shape "$tok"
+    if [[ "$tok" == system ]]; then
+        [[ "$purpose" != backup ]] || refuse "a Backup Disk is never the system disk"
+        R_DIR="$SYSTEM_ROOT"
+        return 0
+    fi
+    if [[ "$tok" =~ $RE_DEV ]]; then
+        check_engine_disk "$tok"
+        R_DIR="$DISKS_DIR/$tok"
+    else
+        b=$(bridge_lookup "$tok")
+        [[ "$b" != AMBIGUOUS ]] || refuse "the test-only root bridge file $ROOTS_FILE lists '$tok' more than once"
+        [[ -n "$b" ]] || refuse "unknown root '$tok': not sd[a-z][12] or system, and not listed in a valid test-only root bridge file ($ROOTS_FILE)"
+        R_DIR="$b"
+        BRIDGE_USED+="${BRIDGE_USED:+ }$tok=$b"
+        echo "idea-app-data: test-only root bridge: $tok -> $b" >&2
+        journal "test-only root bridge: $tok -> $b (pool fixture; remove at Stage 2)"
+    fi
+    [[ -f "$R_DIR/META.yaml" && ! -L "$R_DIR/META.yaml" ]] || refuse "no META.yaml at the root of $R_DIR (not an Engine disk)"
+    if [[ "$purpose" == backup ]]; then
+        [[ -f "$R_DIR/BACKUP.yaml" && ! -L "$R_DIR/BACKUP.yaml" ]] || refuse "no BACKUP.yaml at the root of $R_DIR (not a Backup Disk)"
+    fi
+}
+
+existing_dir() {   # existing_dir <path> <what>
+    exact_path "$1" && [[ -d "$1" ]] || refuse "$2 $1 is not a folder (missing, or a symlink in its path)"
+}
+
+# A destination must not exist yet or be an empty real folder; created (0700, the
+# copy then gives it the source's owner and mode).
+prepare_dst() {
+    local d="$1"
+    if [[ -L "$d" ]]; then refuse "destination $d is a symlink"; fi
+    if [[ -e "$d" ]]; then
+        exact_path "$d" && [[ -d "$d" ]] || refuse "destination $d is not a real folder"
+        local entries
+        shopt -s nullglob dotglob
+        entries=("$d"/*)
+        shopt -u nullglob dotglob
+        (( ${#entries[@]} == 0 )) || refuse "destination $d already exists and is not empty"
+    else
+        $MKDIR -m 0700 -- "$d" || refuse "cannot create destination $d"
+    fi
+    exact_path "$d" || refuse "destination $d changed while it was prepared"
+}
+
+# copy/send: no symlink in the data may resolve outside the instance folder
+# (lexically or really); the copy would share the original's data (r35).
+refuse_external_links() {
+    local inst="$1" l raw lex real bad=() n=0
+    inside() { [[ "$1" == "$inst" || "$1" == "$inst"/* ]]; }
+    while IFS= read -r -d '' l; do
+        raw=$($READLINK -- "$l" 2>/dev/null) || continue
+        if [[ "$raw" == /* ]]; then
+            lex=$($REALPATH -m -s -- "$raw" 2>/dev/null) || lex="$raw"
+        else
+            lex=$($REALPATH -m -s -- "${l%/*}/$raw" 2>/dev/null) || lex="${l%/*}/$raw"
+        fi
+        real=$($REALPATH -e -- "$l" 2>/dev/null) || real=""
+        if ! inside "$lex" || { [[ -n "$real" ]] && ! inside "$real"; }; then
+            n=$((n + 1))
+            (( n <= 10 )) && bad+=("'${l#"$inst"/}' -> '${real:-$lex}'")
+        fi
+    done < <($FIND -P "$inst" -type l -print0 2>/dev/null)
+    if (( n > 0 )); then
+        local more=""
+        (( n > 10 )) && more=" (and $((n - 10)) more)"
+        refuse "instance data links off the slot: ${bad[*]}$more"
+    fi
+}
+
+check_host() {   # sets ADDR: the first resolved address; every one is checked
+    local host="$1" a o1 o2 o3 o4 addrs=()
+    [[ "$host" =~ $RE_HOST && "$host" != *..* ]] || refuse "host '$host' is not an IPv4 address or host name"
+    while read -r a _; do
+        [[ -n "$a" ]] || continue
+        local dup=0 x
+        for x in "${addrs[@]:-}"; do [[ "$x" == "$a" ]] && dup=1; done
+        (( dup )) || addrs+=("$a")
+    done < <($GETENT ahostsv4 "$host" 2>/dev/null)
+    (( ${#addrs[@]} > 0 )) || refuse "host '$host' does not resolve to an IPv4 address"
+    for a in "${addrs[@]}"; do
+        [[ "$a" =~ $RE_IPV4 ]] || refuse "host '$host' resolves to '$a', not an IPv4 address"
+        o1=$((10#${BASH_REMATCH[1]})); o2=$((10#${BASH_REMATCH[2]})); o3=$((10#${BASH_REMATCH[3]})); o4=$((10#${BASH_REMATCH[4]}))
+        (( o1 <= 255 && o2 <= 255 && o3 <= 255 && o4 <= 255 )) || refuse "host '$host' resolves to '$a', not an IPv4 address"
+        (( o1 != 127 )) || refuse "host '$host' resolves to loopback $a"
+        if (( o1 == 10 )) || (( o1 == 172 && o2 >= 16 && o2 <= 31 )) || (( o1 == 192 && o2 == 168 )) || (( o1 == 100 && o2 >= 64 && o2 <= 127 )); then
+            continue
+        fi
+        refuse "host '$host' resolves to $a, which is not a private LAN (10/8, 172.16/12, 192.168/16) or Tailscale (100.64/10) address"
+    done
+    ADDR="${addrs[0]}"
+}
+
+lock_ready() {
+    if [[ ! -e "$LOCK_DIR" && ! -L "$LOCK_DIR" ]]; then $MKDIR -m 0700 -- "$LOCK_DIR" 2>/dev/null || true; fi
+    [[ -d "$LOCK_DIR" && ! -L "$LOCK_DIR" ]] || refuse "lock folder $LOCK_DIR is missing or a symlink"
+    local st uid gid mode
+    st=$(stat_fields "$LOCK_DIR") || refuse "cannot stat $LOCK_DIR"
+    read -r uid gid mode <<<"$st"
+    [[ "$uid" == "$ROOT_UID" && "$mode" == 700 ]] || refuse "lock folder $LOCK_DIR must be owned by root with mode 0700 (got uid $uid, mode 0$mode)"
+}
+take_locks() {   # take_locks <name>... (taken in sorted order)
+    lock_ready
+    local name fd sorted
+    sorted=$(printf '%s\n' "$@" | $SORT -u)
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        exec {fd}>>"$LOCK_DIR/$name.lock" || refuse "cannot open lock $name"
+        $FLOCK -w "$LOCK_WAIT_SECONDS" "$fd" || refuse "busy: another idea-app-data run still holds $name after ${LOCK_WAIT_SECONDS}s"
+    done <<<"$sorted"
+}
+
+pin_cwd() {   # cd into a checked folder and make sure we really are there
+    cd -P -- "$1" 2>/dev/null || refuse "cannot enter $1"
+    [[ "$(pwd -P)" == "$1" ]] || refuse "$1 changed while it was checked"
+}
+
+borg_env() {
+    export BORG_RELOCATED_REPO_ACCESS_IS_OK=yes
+    export BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK=yes
+}
+
+inst_dir() { echo "$1/instances/$2"; }   # inst_dir <R_DIR> <id>
+
+# ── Root only ────────────────────────────────────────────────────────────────
+[[ "$EUID" -eq "$ROOT_UID" ]] || refuse "must run as root (through sudo)"
+
+case "$SUB" in
+    version)
+        need 0 $(($# - 1)) "none"
+        echo "idea-app-data $IDEA_APP_DATA_VERSION"
+        ;;
+
+    size)
+        need 2 $(($# - 1)) "<root> <id>"
+        check_id "$3"
+        resolve_root "$2" instances
+        INST=$(inst_dir "$R_DIR" "$3")
+        existing_dir "$INST" "instance folder"
+        pin_cwd "$INST"
+        OUT=$($DU -sk -x -- .) || exit $?
+        KB=${OUT%%[[:space:]]*}
+        [[ "$KB" =~ ^[0-9]+$ ]] || { echo "du gave no size: $OUT" >&2; exit 1; }
+        echo "$KB"
+        ;;
+
+    copy)
+        need 4 $(($# - 1)) "<srcRoot> <srcId> <dstRoot> <dstId>"
+        check_id "$3"; check_id "$5"
+        resolve_root "$2" instances; S_DIR="$R_DIR"
+        resolve_root "$4" instances; D_DIR="$R_DIR"
+        [[ "$S_DIR" != "$D_DIR" || "$3" != "$5" ]] || refuse "source and destination are the same folder"
+        SRC=$(inst_dir "$S_DIR" "$3")
+        existing_dir "$SRC" "source instance folder"
+        existing_dir "$D_DIR/instances" "destination instances folder"
+        DST=$(inst_dir "$D_DIR" "$5")
+        refuse_external_links "$SRC"
+        take_locks "inst.$2.$3" "inst.$4.$5"
+        prepare_dst "$DST"
+        pin_cwd "$SRC"
+        exec {DST_FD}<"$DST" || refuse "cannot open destination $DST"
+        [[ "$($READLINK -- "/proc/$$/fd/$DST_FD")" == "$DST" ]] || refuse "destination $DST changed while it was opened"
+        run_child $RSYNC "${RSYNC_OPTS[@]}" -- ./ "/proc/self/fd/$DST_FD/"
+        exit $?
+        ;;
+
+    send)
+        need 5 $(($# - 1)) "<srcRoot> <srcId> <host> <dstRoot> <dstId>"
+        check_id "$3"; check_id "$6"
+        check_root_shape "$5"
+        resolve_root "$2" instances; S_DIR="$R_DIR"
+        SRC=$(inst_dir "$S_DIR" "$3")
+        existing_dir "$SRC" "source instance folder"
+        check_host "$4"
+        refuse_external_links "$SRC"
+        take_locks "inst.$2.$3"
+        pin_cwd "$SRC"
+        run_child $RSYNC "${RSYNC_OPTS[@]}" \
+            -e "$RUNUSER -u $REMOTE_USER -- $SSH -o StrictHostKeyChecking=no -o BatchMode=yes" \
+            --rsync-path="$SUDO -n $HELPER_PATH receive $5 $6" \
+            -- ./ "$REMOTE_USER@$ADDR:."
+        exit $?
+        ;;
+
+    receive)
+        (( $# >= 5 )) || refuse "receive takes <dstRoot> <dstId> and the rsync server arguments, got $(($# - 1)) argument(s)"
+        check_id "$3"
+        resolve_root "$2" instances; D_DIR="$R_DIR"
+        existing_dir "$D_DIR/instances" "destination instances folder"
+        DST=$(inst_dir "$D_DIR" "$3")
+        DST_ROOT_TOKEN="$2"; DST_ID="$3"
+        shift 3
+        [[ "$1" == --server ]] || refuse "receive only runs an rsync server (first server argument must be --server)"
+        for a in "$@"; do
+            [[ "$a" != --sender ]] || refuse "receive is write-only: --sender is not allowed"
+            [[ "$a" =~ $RE_SERVER_ARG ]] || refuse "unsafe rsync server argument $(printf '%q' "$a")"
+        done
+        take_locks "inst.$DST_ROOT_TOKEN.$DST_ID"
+        prepare_dst "$DST"
+        export SSH_ORIGINAL_COMMAND="rsync $*"
+        run_child $RRSYNC -wo "$DST"
+        exit $?
+        ;;
+
+    delete)
+        need 2 $(($# - 1)) "<root> <id>"
+        check_id "$3"
+        resolve_root "$2" instances
+        PARENT="$R_DIR/instances"
+        existing_dir "$PARENT" "instances folder"
+        INST="$PARENT/$3"
+        if [[ ! -e "$INST" && ! -L "$INST" ]]; then
+            echo "ok: $INST does not exist; nothing to delete" >&2
+            exit 0
+        fi
+        [[ ! -L "$INST" ]] || refuse "$INST is a symlink"
+        existing_dir "$INST" "instance folder"
+        take_locks "inst.$2.$3"
+        pin_cwd "$PARENT"
+        run_child $RM -rf --one-file-system -- "./$3"
+        exit $?
+        ;;
+
+    borg-init)
+        need 2 $(($# - 1)) "<bdev> <id>"
+        check_id "$3"
+        resolve_root "$2" backup
+        existing_dir "$R_DIR/backups" "backups folder"
+        REPO="$R_DIR/backups/$3"
+        if [[ -e "$REPO" || -L "$REPO" ]]; then
+            existing_dir "$REPO" "repository folder"
+            [[ ! -e "$REPO/config" ]] || refuse "$REPO is already a Borg repository"
+        fi
+        take_locks "repo.$2.$3"
+        borg_env
+        run_child $BORG init --encryption=none -- "$REPO"
+        exit $?
+        ;;
+
+    borg-info)
+        need 2 $(($# - 1)) "<bdev> <id>"
+        check_id "$3"
+        resolve_root "$2" backup
+        REPO="$R_DIR/backups/$3"
+        existing_dir "$REPO" "repository folder"
+        [[ -f "$REPO/config" ]] || refuse "$REPO is not a Borg repository"
+        borg_env
+        run_child $BORG info --json --last 1 -- "$REPO"
+        exit $?
+        ;;
+
+    borg-create)
+        need 4 $(($# - 1)) "<bdev> <id> <archive> <srcRoot>"
+        check_id "$3"
+        [[ "$4" =~ $RE_ARCHIVE ]] || refuse "archive name '$4' does not match $RE_ARCHIVE"
+        resolve_root "$2" backup; B_DIR="$R_DIR"
+        resolve_root "$5" instances; S_DIR="$R_DIR"
+        REPO="$B_DIR/backups/$3"
+        existing_dir "$REPO" "repository folder"
+        [[ -f "$REPO/config" ]] || refuse "$REPO is not a Borg repository"
+        SRC=$(inst_dir "$S_DIR" "$3")
+        existing_dir "$SRC" "source instance folder"
+        take_locks "repo.$2.$3" "inst.$5.$3"
+        borg_env
+        run_child $BORG create --numeric-ids -- "$REPO::$4" "$SRC"
+        exit $?
+        ;;
+
+    borg-extract)
+        need 5 $(($# - 1)) "<bdev> <id> <archive> <strip> <dstRoot>"
+        check_id "$3"
+        [[ "$4" =~ $RE_ARCHIVE ]] || refuse "archive name '$4' does not match $RE_ARCHIVE"
+        [[ "$5" =~ $RE_STRIP ]] || refuse "strip '$5' does not match $RE_STRIP"
+        resolve_root "$2" backup; B_DIR="$R_DIR"
+        resolve_root "$6" instances; D_DIR="$R_DIR"
+        REPO="$B_DIR/backups/$3"
+        existing_dir "$REPO" "repository folder"
+        [[ -f "$REPO/config" ]] || refuse "$REPO is not a Borg repository"
+        existing_dir "$D_DIR/instances" "destination instances folder"
+        DST=$(inst_dir "$D_DIR" "$3")
+        if [[ -L "$DST" ]]; then refuse "destination $DST is a symlink"; fi
+        if [[ -e "$DST" ]]; then existing_dir "$DST" "destination"; fi
+        take_locks "repo.$2.$3" "inst.$6.$3"
+        # Fresh staging folder on the target disk (same filesystem, so the final
+        # mv is a rename), root-only.
+        STG="$D_DIR/.idea-app-data-staging"
+        if [[ ! -e "$STG" && ! -L "$STG" ]]; then $MKDIR -m 0700 -- "$STG" || refuse "cannot create $STG"; fi
+        existing_dir "$STG" "staging folder"
+        read -r STG_UID _ STG_MODE <<<"$(stat_fields "$STG")"
+        [[ "$STG_UID" == "$ROOT_UID" && "$STG_MODE" == 700 ]] || refuse "staging folder $STG must be owned by root with mode 0700"
+        STAGING_TMP=$($MKTEMP -d -- "$STG/restore-$3.XXXXXX") || refuse "cannot create a staging folder in $STG"
+        pin_cwd "$STAGING_TMP"
+        borg_env
+        EC=0
+        run_child $BORG extract --numeric-ids --strip-components "$5" -- "$REPO::$4" || EC=$?
+        if (( EC != 0 )); then cd / ; cleanup_staging; exit "$EC"; fi
+        cd /
+        shopt -s nullglob dotglob
+        GOT=("$STAGING_TMP"/*)
+        shopt -u nullglob dotglob
+        if (( ${#GOT[@]} != 1 )) || [[ "${GOT[0]}" != "$STAGING_TMP/$3" || -L "${GOT[0]}" || ! -d "${GOT[0]}" ]]; then
+            NAMES=""; for g in ${GOT[@]+"${GOT[@]}"}; do NAMES+="${g##*/} "; done
+            cleanup_staging
+            refuse "archive $4 did not hold exactly instances/$3 at strip $5 (got: ${NAMES:-nothing})"
+        fi
+        # Restore replaces the instance folder: the previous one (if any) is moved
+        # aside into the staging folder and removed once the restored one is in place.
+        if [[ -e "$DST" ]]; then
+            existing_dir "$DST" "destination"
+            $MV -T -- "$DST" "$STAGING_TMP/.previous" || { cleanup_staging; refuse "cannot move the previous $DST aside"; }
+        fi
+        $MV -T -- "$STAGING_TMP/$3" "$DST" || { EC=$?; [[ -e "$STAGING_TMP/.previous" ]] && $MV -T -- "$STAGING_TMP/.previous" "$DST"; cleanup_staging; exit "$EC"; }
+        cleanup_staging
+        exit 0
+        ;;
+
+    "")
+        refuse "no subcommand (version, size, copy, send, receive, delete, borg-init, borg-info, borg-create, borg-extract)"
+        ;;
+    *)
+        refuse "unknown subcommand '$(printf '%q' "$SUB")'"
+        ;;
+esac
+exit 0

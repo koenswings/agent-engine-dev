@@ -14,8 +14,10 @@
  *      folder registered as a second "kolibri" on the next dock).
  *
  * Real files in pretend disks under IDEA_DISKS_ROOT (idea-test-6x). rsync is
- * replaced by fs.copy (links copied as links, like rsync -a); start/stop and
- * processInstance are recorded, never run (no Docker).
+ * replaced by fs.copy (links copied as links, like rsync -a), and so is the
+ * app-data root helper (idea#168: instance data is copied, sized and deleted as
+ * root by `sudo -n idea-app-data`; here its root tokens map to the pretend disks);
+ * start/stop and processInstance are recorded, never run (no Docker).
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
@@ -28,6 +30,9 @@ const remoteOverlays = vi.hoisted(() => [] as { src: string, dest: string, files
 // r36: make the instance rsync fail after writing part of the copy
 const failure = vi.hoisted(() => ({ rsync: null as string | null, process: null as string | null }))
 const sshCalls = vi.hoisted(() => [] as string[])
+// idea#168: instance data goes through the app-data helper (copy / send / delete)
+const instanceTransfers = vi.hoisted(() => [] as any[])
+const helperDeletes = vi.hoisted(() => [] as string[][])
 
 vi.mock('../../src/utils/rsync.js', () => ({
     rsyncDirectory: vi.fn(async (src: string, dest: string, onProgress?: (p: { progressPercent: number }) => void, _opId?: string, remoteHost?: string) => {
@@ -52,7 +57,44 @@ vi.mock('../../src/utils/rsync.js', () => ({
         }
         onProgress?.({ progressPercent: 100 })
     }),
+    // The app-data helper's copy/send: root tokens are the pretend disks' devices
+    rsyncInstanceData: vi.fn(async (t: any, onProgress?: (p: { progressPercent: number }) => void) => {
+        const { fs } = await import('zx')
+        const { disksRoot } = await import('../../src/data/Config.js')
+        const dir = (root: string, id: string) => `${root === 'system' ? '' : `${disksRoot()}/${root}`}/instances/${id}`
+        instanceTransfers.push(t)
+        if (failure.rsync) {
+            if (t.kind === 'copy') {
+                await fs.ensureDir(`${dir(t.dstRoot, t.dstId)}/data/kolibri`)
+                await fs.writeFile(`${dir(t.dstRoot, t.dstId)}/data/kolibri/db.sqlite3`, 'partial')
+            }
+            throw new Error(failure.rsync)
+        }
+        if (t.kind === 'copy') {
+            if (await fs.pathExists(dir(t.dstRoot, t.dstId))) throw new Error(`rsync (idea-app-data copy refused: destination exists)`)
+            await fs.copy(dir(t.srcRoot, t.srcId), dir(t.dstRoot, t.dstId), { dereference: false })
+        }
+        onProgress?.({ progressPercent: 100 })
+    }),
 }))
+
+vi.mock('../../src/utils/appDataHelper.js', async (importOriginal) => {
+    const actual = await importOriginal<any>()
+    const dir = async (root: string, id: string) => {
+        const { disksRoot } = await import('../../src/data/Config.js')
+        return `${root === 'system' ? '' : `${disksRoot()}/${root}`}/instances/${id}`
+    }
+    return {
+        ...actual,
+        instanceDataBytes: vi.fn(async () => 4096),
+        deleteInstanceData: vi.fn(async (root: string, id: string) => {
+            helperDeletes.push([root, id])
+            const { fs } = await import('zx')
+            await fs.remove(await dir(root, id))
+        }),
+        // deleteRemoteInstanceData stays real: its ssh goes to the mocked zx $ below
+    }
+})
 
 // Port candidates are made deterministic per test (zx also uses Math.random)
 vi.mock('../../src/utils/utils.js', async (importOriginal) => {
@@ -114,7 +156,6 @@ import { installAppFromDisk } from '../../src/data/InstallApp.js'
 import { findExternalLinks, uniqueCopyName, clearEnginePort, setComposeInstanceName } from '../../src/data/InstanceCopy.js'
 import { choosePortForStart } from '../../src/data/Instance.js'
 import { randomPort } from '../../src/utils/utils.js'
-import { rsyncDirectory } from '../../src/utils/rsync.js'
 import { AppID, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/data/CommonTypes.js'
 
 const SRC = 'DISK_src-r35' as DiskID
@@ -198,6 +239,8 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
         order.length = 0
         remoteOverlays.length = 0
         sshCalls.length = 0
+        instanceTransfers.length = 0
+        helperDeletes.length = 0
         failure.rsync = null
         failure.process = null
         setRootDeviceForTests('mmcblk-not-a-test-disk')
@@ -348,10 +391,11 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
             await copyApp(h, ORIG as any, SRC, TGT)
             const newRow = Object.values(h.doc().instanceDB).find(i => String(i.id) !== ORIG)!
             expect(newRow.name).toBe('kolibri-2')
-            // The instance rsync sends the original files; the overlay (from a local temp dir) then replaces them
+            // The helper sends the original files as root (idea#168); the overlay (from a local temp dir) then replaces them
+            expect(instanceTransfers).toEqual([{ kind: 'send', srcRoot: SRC_DEV, srcId: ORIG, host: '10.0.0.35', dstRoot: TGT_DEV, dstId: newRow.id }])
             const toCopy = remoteOverlays.filter(o => o.dest.endsWith(`/instances/${newRow.id}`))
-            expect(toCopy.map(o => o.src.includes('idea-copy-'))).toEqual([false, true])
-            const overlay = toCopy[1]
+            expect(toCopy.map(o => o.src.includes('idea-copy-'))).toEqual([true])
+            const overlay = toCopy[0]
             expect(YAML.parse(overlay.files['compose.yaml'])['x-app'].instanceName).toBe('kolibri-2')
             expect(overlay.files['.env']).not.toMatch(/^port=/m)
             expect(h.doc().engineDB[REMOTE].commands).toEqual([`startInstance ${newRow.id} ${TGT} --cause cross-engine-cmd`])
@@ -362,7 +406,6 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
     })
     // ── 6. failed copy: partial folder removed (idea#168 r36) ────────────────
 
-    const rsyncDirectoryMock = vi.mocked(rsyncDirectory)
     const R36_RSYNC = 'rsync exited with code 23: rsync: [sender] send_files failed to open "/disks/idea-test-61/instances/kolibri-grade5a-001/data/kolibri/sessions/kolibrie9es3": Permission denied (13)'
 
     it('a failed local copy removes its partial folder, registers no instance, ends Failed and restarts the source', async () => {
@@ -375,13 +418,15 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
         expect(op.status).toBe('Failed')
         expect(op.error).toBe(R36_RSYNC)
         expect(order).toEqual([`stop:${ORIG}`, `start:${ORIG}`])           // source back up, copy never processed
-        expect(rsyncDirectoryMock.mock.calls.some(c => String(c[1]).includes('/instances/'))).toBe(true) // it failed IN the instance rsync
+        // it failed IN the instance copy, and the partial copy was removed through the helper
+        expect(instanceTransfers.map(t => t.kind)).toEqual(['copy'])
+        expect(helperDeletes).toEqual([[TGT_DEV, instanceTransfers[0].dstId]])
         // a later dock of the target disk finds nothing to register
         expect(await fs.pathExists(`${tgtRoot()}/instances`)).toBe(true)
         expect((await fs.readdir(`${tgtRoot()}/instances`)).length).toBe(0)
     })
 
-    it('a failed cross-engine copy removes the partial folder on the remote with ssh rm -rf of exactly that folder', async () => {
+    it('a failed cross-engine copy removes the partial folder on the remote with that Engine\'s helper (ssh … sudo -n idea-app-data delete <root> <id>)', async () => {
         h = await makeHandle('Stopped')
         const REMOTE = 'ENGINE_remote-r36' as EngineID
         h.change(doc => {
@@ -392,10 +437,16 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
         try {
             failure.rsync = R36_RSYNC
             await copyApp(h, ORIG as any, SRC, TGT)
-            const mkdir = sshCalls.find(c => /pi@10\.0\.0\.36 mkdir -p \S+\/instances\/[\w-]+$/.test(c))!
-            expect(mkdir, JSON.stringify(sshCalls)).toBeTruthy()
-            const dest = mkdir.split(' mkdir -p ')[1]
-            expect(sshCalls.filter(c => / rm -rf /.test(c))).toEqual([`ssh -o StrictHostKeyChecking=no pi@10.0.0.36 rm -rf -- ${dest}`])
+            expect(instanceTransfers.map(t => t.kind)).toEqual(['send'])
+            const newId = instanceTransfers[0].dstId
+            expect(newId).not.toBe(ORIG)
+            expect(sshCalls.filter(c => / rm -rf /.test(c)), JSON.stringify(sshCalls)).toEqual([])
+            expect(sshCalls.filter(c => /idea-app-data/.test(c))).toEqual([
+                `ssh -o StrictHostKeyChecking=no -o BatchMode=yes pi@10.0.0.36 -- sudo -n /usr/local/sbin/idea-app-data delete ${TGT_DEV} ${newId}`,
+            ])
+            // the instance folder itself is no longer pre-created over ssh (the receiving helper creates it as root)
+            expect(sshCalls.some(c => new RegExp(`mkdir -p \\S+/instances/${newId}`).test(c))).toBe(false)
+            expect(helperDeletes).toEqual([])                               // nothing deleted locally
             expect(Object.keys(h.doc().instanceDB)).toEqual([ORIG])
             expect(h.doc().engineDB[REMOTE].commands).toEqual([])          // no remote startInstance
             expect((Object.values(h.doc().operationDB)[0] as any).status).toBe('Failed')

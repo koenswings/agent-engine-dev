@@ -9,12 +9,18 @@
  *  - Lock file (.backup-in-progress) enables boot-resume after interrupted backup
  *  - skipBorg() (settings.skipBorg / IDEA_SKIP_BORG, default testMode): skips borg commands but
  *    exercises all other logic (store updates, YAML, lock files)
+ *  - Borg runs as root through the app-data helper (idea#168):
+ *    `sudo -n /usr/local/sbin/idea-app-data borg-init|borg-info|borg-create|borg-extract`,
+ *    so it can read instance data written by root/999/www-data and restores owners
+ *    (--numeric-ids). Repositories become root-owned; the repo folder and the
+ *    .backup-in-progress lock file stay the Engine's (pi).
  */
 
 import { $, YAML, chalk, fs } from 'zx'
 import { log, print } from '../utils/utils.js'
 import { disksRoot, skipBorg } from '../data/Config.js'
-import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot } from '../data/Disk.js'
+import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot, appDataRoot } from '../data/Disk.js'
+import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs } from '../utils/appDataHelper.js'
 import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { createOperation, updateOperation } from '../data/Operations.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
@@ -164,7 +170,7 @@ export const backupInstance = async (
             log(`Initialising Borg repo at ${repoPath}`)
             await fs.ensureDir(repoPath)
             if (!skipBorg()) {
-                await $`borg init --encryption=none ${repoPath}`
+                await runAppData(borgInitArgs(backupDevice, instanceId))
             } else {
                 log(`skipBorg: skipping borg init`)
             }
@@ -186,7 +192,7 @@ export const backupInstance = async (
         const archiveName = new Date().toISOString().replace(/[:.]/g, '-')
         if (!skipBorg()) {
             log(`Running borg create for instance ${instanceId}`)
-            await $`borg create ${repoPath}::${archiveName} ${await diskMountRoot(appDisk)}/instances/${instanceId}`
+            await runAppData(borgCreateArgs(backupDevice, instanceId, archiveName, await appDataRoot(appDisk as Disk)))
         } else {
             log(`skipBorg: skipping borg create for instance ${instanceId}`)
         }
@@ -414,12 +420,6 @@ export const checkPendingBackups = async (
 
 // ── borg archive selection (idea#168) ─────────────────────────────────────────
 
-/** Runs `borg <args>` (in cwd when given) and returns stdout. Injectable for tests. */
-export type BorgRunner = (args: string[], cwd?: string) => Promise<string>
-
-const runBorg: BorgRunner = async (args, cwd) =>
-    (await (cwd ? $({ cwd }) : $)`borg ${args}`).stdout
-
 /**
  * The newest archive of a repo and how to extract it into <mount root>/instances/.
  *
@@ -444,11 +444,18 @@ export const latestArchiveFromInfo = (infoJson: string, instanceId: string): { n
     return { name: archive.name, stripComponents: source.split('/').length - 1 }
 }
 
-/** Extract the newest archive of repoPath so the instance lands in instancesDir/<instanceId>. */
-export const extractLatestArchive = async (repoPath: string, instancesDir: string, instanceId: string, run: BorgRunner = runBorg): Promise<string> => {
-    const { name, stripComponents } = latestArchiveFromInfo(await run(['info', '--json', '--last', '1', repoPath]), instanceId)
-    log(`Extracting archive ${name} (--strip-components ${stripComponents}) into ${instancesDir}`)
-    await run(['extract', '--strip-components', String(stripComponents), `${repoPath}::${name}`], instancesDir)
+/**
+ * Extract the newest archive of the instance's repo on the Backup Disk so the
+ * instance lands in <target mount root>/instances/<instanceId>, as root through the
+ * app-data helper: `borg-info` (JSON), then `borg-extract`, which extracts into a
+ * fresh staging folder on the target disk, checks that only <instanceId> came out
+ * and moves it into place (replacing a previous folder of that instance).
+ * Roots are app-data helper root tokens. The runner is injectable for tests.
+ */
+export const extractLatestArchive = async (backupRoot: string, instanceId: string, targetRoot: string, run: AppDataRunner = runAppData): Promise<string> => {
+    const { name, stripComponents } = latestArchiveFromInfo(await run(borgInfoArgs(backupRoot, instanceId)), instanceId)
+    log(`Extracting archive ${name} (--strip-components ${stripComponents}) onto ${targetRoot} instances/${instanceId}`)
+    await run(borgExtractArgs(backupRoot, instanceId, name, stripComponents, targetRoot))
     return name
 }
 
@@ -516,8 +523,8 @@ export const restoreApp = async (
         await fs.ensureDir(instancesDir)
 
         if (!skipBorg()) {
-            log(`Restoring instance ${instanceId} from ${backupDevice} to ${targetDevice}`)
-            await extractLatestArchive(repoPath, instancesDir, instanceId)
+            log(`Restoring instance ${instanceId} from ${backupDevice} to ${targetDevice} (repo ${repoPath})`)
+            await extractLatestArchive(backupDevice, instanceId, await appDataRoot(targetDisk))
         } else {
             log(`skipBorg: skipping borg extract for instance ${instanceId}`)
         }

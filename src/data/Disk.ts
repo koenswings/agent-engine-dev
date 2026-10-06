@@ -360,6 +360,17 @@ export const diskMountRoot = async (disk: Disk): Promise<string> => {
 }
 
 /**
+ * The disk's root token for the app-data root helper (/usr/local/sbin/idea-app-data,
+ * idea#168): 'system' for the system disk (the helper uses /instances/<id>), else
+ * the device ('sdX1'; on the duration pool a slot name such as 'idea-test-1', which
+ * the helper accepts only through its TEST-ONLY root bridge file). Same rule as
+ * diskMountRoot, so both name the same folder.
+ */
+export const appDataRoot = async (disk: Disk): Promise<string> => {
+    return (await isSystemDisk(disk)) ? 'system' : String(disk.device)
+}
+
+/**
  * Returns the filesystem root for free-space checks and similar operations
  * that need the actual mount point.
  * System disk: '/'   Regular disk: '<disksRoot>/<device>' (disksRoot defaults to /disks)

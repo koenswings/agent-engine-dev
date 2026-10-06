@@ -30,6 +30,7 @@ import { Status } from './data/Instance.js'
 import { Store } from './data/Store.js'
 import { createCommandLogStore, shutdownRepo } from './data/CommandLogStore.js'
 import { initCommandLogger } from './utils/CommandLogger.js'
+import { assertAppDataHelper } from './utils/appDataHelper.js'
 
 
 
@@ -54,6 +55,11 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     log(`  Temp Directory: ${os.tmpdir()}`)
     log(`  Endianness: ${os.endianness()}`)
     log(`  Network Hostname: ${os.hostname()}`)
+
+    // The app-data root helper (idea#168) must be installed, allowed by sudoers and
+    // the version this Engine speaks; otherwise refuse to start with an "ask Ops to
+    // update" message (copy, move, backup and restore of app data depend on it).
+    await assertAppDataHelper()
 
     // Process the config
     const settings = config.settings

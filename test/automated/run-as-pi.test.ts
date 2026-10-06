@@ -147,17 +147,38 @@ describe('Engine sudoers asset (idea#80)', () => {
             // createFilesDisk: the disk root folder only, never recursive (idea#131)
             'pi ALL=(root) NOPASSWD: /usr/bin/chown -h pi\\:pi /disks/sd[a-z][12]',
             'pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-erase-disk',
+            // app data as root (idea#168): one helper, no argument list (the helper validates)
+            'pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-app-data',
             'pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]',
         ])
         expect(rulesText).not.toMatch(/tee \/disks/)
         expect(rulesText).not.toMatch(/rmdir/)   // the rmdir entry lives in 11-engine-files (idea#126)
         expect(rulesText).not.toMatch(/chown -h/) // the chown -h entry lives in 11-engine-files (idea#131)
         expect(rulesText).not.toMatch(/idea-erase-disk/) // erase script lives in 11-engine-files (idea#134)
+        expect(rulesText).not.toMatch(/idea-app-data/)   // app-data helper lives in 11-engine-files (idea#168)
         expect(src('src/data/CreateFilesDisk.ts')).toContain("export const SUDO_CHOWN = '/usr/bin/chown'")
         const visudo = ['/usr/sbin/visudo', '/sbin/visudo'].find(p => fs.existsSync(p))
         if (!visudo) ctx.skip()
         const out = await $`${visudo} -cf ${path.join(ROOT, 'script/build_image_assets/11-engine-files.sudoers')}`.nothrow()
         expect(out.exitCode, out.stderr).toBe(0)
+    })
+
+    it('app data runs as root only through the helper: every sudo spawn is `sudo -n /usr/local/sbin/idea-app-data …` (idea#168)', () => {
+        const helper = src('src/utils/appDataHelper.ts')
+        expect(helper).toContain("export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'")
+        expect(helper).toContain("export const appDataSudoArgv = (args: string[]): string[] => ['-n', APP_DATA_HELPER, ...args]")
+        expect(helper).toContain('`sudo -n ${APP_DATA_HELPER} delete ${r} ${i}`')
+        for (const f of ['src/utils/appDataHelper.ts', 'src/utils/rsync.ts', 'src/monitors/backupMonitor.ts', 'src/data/CopyMoveApp.ts']) {
+            const text = src(f)
+            for (const m of text.matchAll(/spawn\('sudo', ([^,]+),/g)) expect(m[1], f).toBe('appDataSudoArgv(args)')
+            for (const m of text.matchAll(/runRsyncProcess\('sudo', ([^,]+),/g)) expect(m[1], f).toBe('appDataSudoArgv(args)')
+            expect(text, f).not.toMatch(/\$`sudo /)
+            expect(text, f).not.toMatch(/\$`borg |spawn\('borg'/)
+            expect(text, f).not.toMatch(/rm -rf --? \$\{/)
+        }
+        const engine = src('src/data/Engine.ts')
+        expect(engine).toContain('sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-app-data ${APP_DATA_HELPER}')
+        expect(fs.statSync(path.join(ROOT, 'script/build_image_assets/idea-app-data')).mode & 0o111).not.toBe(0)
     })
 
     it('mount points are removed with rmdir, never rm -fr (idea#126)', () => {

@@ -8,14 +8,17 @@
  * instances/disks/sdX/instances/<id>/. extractLatestArchive picks the newest
  * archive explicitly and strips the stored prefix.
  *
- *   - latestArchiveFromInfo / extractLatestArchive with a fake borg runner
- *   - a real borg round trip (skipped when borg is not installed)
+ *   - latestArchiveFromInfo / extractLatestArchive with a fake app-data runner
+ *   - a real borg round trip through the app-data root helper (idea-app-data, run
+ *     unprivileged in a sandbox; skipped when borg is not installed)
  */
 
 import { describe, it, expect, afterEach } from 'vitest'
 import { execFileSync } from 'child_process'
-import { fs, os, path } from 'zx'
-import { latestArchiveFromInfo, extractLatestArchive, BorgRunner } from '../../src/monitors/backupMonitor.js'
+import { fs, path } from 'zx'
+import { latestArchiveFromInfo, extractLatestArchive } from '../../src/monitors/backupMonitor.js'
+import type { AppDataRunner } from '../../src/utils/appDataHelper.js'
+import { makeAppDataSandbox, AppDataSandbox } from '../harness/appDataSandbox.js'
 
 const info = (name: string, source: string) => JSON.stringify({
     archives: [{ name, command_line: ['/usr/bin/borg', 'create', `/disks/sdb1/backups/inst-1::${name}`, source] }],
@@ -40,54 +43,81 @@ describe('latestArchiveFromInfo', () => {
     })
 })
 
-describe('extractLatestArchive (fake borg)', () => {
-    it('asks borg for the newest archive, then extracts that one (never ::latest) in instancesDir', async () => {
-        const calls: { args: string[], cwd?: string }[] = []
-        const run: BorgRunner = async (args, cwd) => {
-            calls.push({ args, cwd })
-            return args[0] === 'info' ? info('2026-10-06T02-00-00-000Z', '/disks/sda1/instances/inst-1') : ''
+describe('extractLatestArchive (fake app-data runner)', () => {
+    it('asks the helper for the newest archive (borg-info), then borg-extract of that one (never ::latest) onto the target root', async () => {
+        const calls: string[][] = []
+        const run: AppDataRunner = async (args) => {
+            calls.push(args)
+            return args[0] === 'borg-info' ? info('2026-10-06T02-00-00-000Z', '/disks/sda1/instances/inst-1') : ''
         }
-        const name = await extractLatestArchive('/disks/sdb1/backups/inst-1', '/disks/sdc1/instances', 'inst-1', run)
+        const name = await extractLatestArchive('sdb1', 'inst-1', 'sdc1', run)
         expect(name).toBe('2026-10-06T02-00-00-000Z')
         expect(calls).toEqual([
-            { args: ['info', '--json', '--last', '1', '/disks/sdb1/backups/inst-1'], cwd: undefined },
-            { args: ['extract', '--strip-components', '3', '/disks/sdb1/backups/inst-1::2026-10-06T02-00-00-000Z'], cwd: '/disks/sdc1/instances' },
+            ['borg-info', 'sdb1', 'inst-1'],
+            ['borg-extract', 'sdb1', 'inst-1', '2026-10-06T02-00-00-000Z', '3', 'sdc1'],
         ])
-        expect(calls.flatMap(c => c.args).some(a => a.endsWith('::latest'))).toBe(false)
+        expect(calls.flat().some(a => a.includes('latest'))).toBe(false)
     })
-    it('a borg failure propagates (restore fails loud)', async () => {
-        const run: BorgRunner = async () => { throw new Error('Repository does not exist') }
-        await expect(extractLatestArchive('/x', '/y', 'inst-1', run)).rejects.toThrow('Repository does not exist')
+    it('restoring onto the system disk passes the system root token', async () => {
+        const calls: string[][] = []
+        const run: AppDataRunner = async (args) => { calls.push(args); return args[0] === 'borg-info' ? info('2026-10-06T02-00-00-000Z', '/instances/inst-1') : '' }
+        await extractLatestArchive('sdb1', 'inst-1', 'system', run)
+        expect(calls[1]).toEqual(['borg-extract', 'sdb1', 'inst-1', '2026-10-06T02-00-00-000Z', '1', 'system'])
+    })
+    it('a helper failure propagates (restore fails loud)', async () => {
+        const run: AppDataRunner = async () => { throw new Error('idea-app-data borg-info refused: repository folder is not a folder') }
+        await expect(extractLatestArchive('sdb1', 'inst-1', 'sdc1', run)).rejects.toThrow('refused: repository folder')
+    })
+    it('an archive name the helper would refuse never reaches it', async () => {
+        const calls: string[][] = []
+        const run: AppDataRunner = async (args) => { calls.push(args); return info('latest', '/disks/sda1/instances/inst-1') }
+        await expect(extractLatestArchive('sdb1', 'inst-1', 'sdc1', run)).rejects.toThrow(/archive/)
+        expect(calls.length).toBe(1)
     })
 })
 
-const hasBorg = (() => { try { execFileSync('borg', ['--version'], { stdio: 'ignore' }); return true } catch { return false } })()
+const hasBorg = (() => { try { execFileSync('/usr/bin/borg', ['--version'], { stdio: 'ignore' }); return true } catch { return false } })()
 
-describe.skipIf(!hasBorg)('extractLatestArchive (real borg round trip)', () => {
-    let tmp = ''
-    afterEach(async () => { if (tmp) await fs.remove(tmp) })
+describe.skipIf(!hasBorg)('extractLatestArchive (real borg round trip through idea-app-data)', () => {
+    let sb: AppDataSandbox | undefined
+    afterEach(async () => { if (sb) await fs.remove(sb.tmp); sb = undefined })
 
-    it('restores the newest of two timestamped archives into instances/<id>', async () => {
-        tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'borg-latest-'))
-        const env = { ...process.env, BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK: 'yes' }
-        const src = path.join(tmp, 'disks', 'sda1', 'instances', 'inst-1')
-        const repo = path.join(tmp, 'repo')
-        const target = path.join(tmp, 'target', 'instances')
-        await fs.ensureDir(src); await fs.ensureDir(target)
-        const borg = (args: string[], cwd?: string) => execFileSync('borg', args, { env, cwd, encoding: 'utf8' })
-        borg(['init', '--encryption=none', repo])
-        await fs.writeFile(path.join(src, 'data.txt'), 'old')
-        borg(['create', `${repo}::2026-10-06T01-00-00-000Z`, src])
+    it('backs up twice and restores the newest archive into <target>/instances/<id>, numeric owners and modes kept', async () => {
+        sb = await makeAppDataSandbox({ realBorg: true })
+        const box = sb
+        const run: AppDataRunner = async (args) => {
+            const r = await box.run(args)
+            if (r.exitCode !== 0) throw new Error(`idea-app-data ${args[0]} failed (${r.exitCode}): ${r.stderr}`)
+            return r.stdout
+        }
+        const app = await box.addDisk('sdb1')
+        const bk = await box.addDisk('sdc1', { backup: true })
+        const target = await box.addDisk('sdd1')
+        const src = path.join(app, 'instances', 'inst-1')
+        await fs.ensureDir(path.join(src, 'db'))
+        await fs.writeFile(path.join(src, 'db', 'secret'), 'old', { mode: 0o600 })
+        await fs.ensureDir(path.join(bk, 'backups', 'inst-1'))   // the Engine creates the repo folder as pi
+        await run(['borg-init', 'sdc1', 'inst-1'])
+        await run(['borg-create', 'sdc1', 'inst-1', '2026-10-06T01-00-00-000Z', 'sdb1'])
         await new Promise(r => setTimeout(r, 1100))   // archive times are second-granular
-        await fs.writeFile(path.join(src, 'data.txt'), 'new')
-        borg(['create', `${repo}::2026-10-06T02-00-00-000Z`, src])
+        await fs.writeFile(path.join(src, 'db', 'secret'), 'new')
+        await run(['borg-create', 'sdc1', 'inst-1', '2026-10-06T02-00-00-000Z', 'sdb1'])
 
-        // The old command fails: borg 1.x has no 'latest' alias
-        expect(() => execFileSync('borg', ['extract', `${repo}::latest`], { env, cwd: target, stdio: 'pipe' })).toThrow()
+        // a stale copy on the target is replaced, not merged
+        await fs.ensureDir(path.join(target, 'instances', 'inst-1'))
+        await fs.writeFile(path.join(target, 'instances', 'inst-1', 'stale'), 'x')
 
-        const name = await extractLatestArchive(repo, target, 'inst-1', async (args, cwd) => borg(args, cwd))
+        const name = await extractLatestArchive('sdc1', 'inst-1', 'sdd1', run)
         expect(name).toBe('2026-10-06T02-00-00-000Z')
-        expect(await fs.readFile(path.join(target, 'inst-1', 'data.txt'), 'utf8')).toBe('new')
-        expect(await fs.pathExists(path.join(target, 'tmp'))).toBe(false)
+        const restored = path.join(target, 'instances', 'inst-1')
+        expect(await fs.readFile(path.join(restored, 'db', 'secret'), 'utf8')).toBe('new')
+        expect((await fs.stat(path.join(restored, 'db', 'secret'))).mode & 0o777).toBe(0o600)
+        expect((await fs.stat(path.join(restored, 'db', 'secret'))).uid).toBe((await fs.stat(path.join(src, 'db', 'secret'))).uid)
+        expect(await fs.pathExists(path.join(restored, 'stale'))).toBe(false)
+        expect(await fs.readdir(path.join(target, 'instances'))).toEqual(['inst-1'])
+        expect(await fs.pathExists(path.join(target, '.idea-app-data-staging'))).toBe(false)
+
+        const borgCalls = (await box.journalText()).split('\n').filter(l => l.includes('sub=borg-')).map(l => l.match(/sub=(\S+)/)![1])
+        expect(borgCalls).toEqual(['borg-init', 'borg-create', 'borg-create', 'borg-info', 'borg-extract'])
     }, 60_000)
 })
