@@ -88,12 +88,12 @@ These commands perform actions on the system. Some are restricted to an `engine`
 
 ### `backupApp`
 - **Description:** Backs up an app instance to a Backup Disk. Stops the instance briefly for filesystem consistency, runs a BorgBackup archive, then restarts it. If no Backup Disk name is given, the first docked Backup Disk linked to the instance is used. The backup holds the instance lock and the Backup Disk lock together (idea#126); if another operation holds either, the backup is not started and the command fails with the reason. A failure during the backup fails the command with its message.
-- **Usage:** `backupApp <instanceName> [backupDiskName]`
+- **Usage:** `backupApp <instanceId|instanceName> <backupDiskId>` (idea#168). The instance is an instance id or a unique instance name (see [Instance arguments](#instance-arguments)); the disk goes through the shared disk resolver (see [Disk arguments](#disk-arguments)). Every refusal ends the command trace as `error` with the reason. The trace arg keys stay `instanceName` and `backupDiskId`.
 - **Scope:** `engine`
 
 ### `restoreApp`
 - **Description:** Restores the latest backup archive for an instance from any docked Backup Disk onto a target disk. Extracts the archive and calls processInstance to register and start the restored instance.
-- **Usage:** `restoreApp <instanceName> <targetDiskName>`
+- **Usage:** `restoreApp <instanceId|instanceName> <targetDiskId>` (idea#168). The instance is an instance id or a unique instance name (see [Instance arguments](#instance-arguments)); the target disk goes through the shared disk resolver (see [Disk arguments](#disk-arguments)). Every refusal ends the command trace as `error` with the reason. The trace arg keys stay `instanceName` and `backupDiskId` (the latter holds the target disk).
 - **Scope:** `engine`
 
 ### `createBackupDisk`
@@ -152,7 +152,7 @@ These commands perform actions on the system. Some are restricted to an `engine`
 
 ### Disk arguments
 
-`installApp` (target and `--source`), `createBackupDisk` and `ejectDisk` take a disk id and resolve it with one shared resolver, `resolveDiskArg` in `src/data/DiskArg.ts` (idea#128):
+`installApp` (target and `--source`), `createBackupDisk`, `ejectDisk`, `backupApp` and `restoreApp` (idea#168) take a disk id and resolve it with one shared resolver, `resolveDiskArg` in `src/data/DiskArg.ts` (idea#128):
 
 1. **Id first.** A record with that id must be docked to this engine and have a device. Otherwise the command is refused (`not currently docked`, `not docked to this engine`).
 2. **Name fallback (deprecated).** When no record has that id, the argument is matched as a disk name, but only against records docked to this engine with a device. Stale or remote records with the same name are ignored. If two such records share the name, the command is refused as ambiguous and the ids are listed. A name that resolves logs a deprecation warning into the trace: `<command>: disk '<name>' was given by name; use the disk id <id> (names are deprecated, idea#128).`
@@ -162,7 +162,13 @@ Every refusal throws, so the command trace ends as `error`. The resolver does no
 
 A Console can tell whether the Engine takes disk ids from the Engine record: `capabilities.includes('diskIdArgs') && capabilitiesBootedAt === lastBooted` (see ARCHITECTURE.md, Engine capabilities).
 
+A disk name with spaces can be passed as one argument in double quotes, e.g. `restoreApp kolibri "Duration Tests — Add Files App"` (idea#168). A token that starts with `"` runs to the next `"` that ends a token; the quotes are removed. Lines without a `"` are split on spaces exactly as before. Commands that take the whole rest of the line as one argument (`send`, `installApp`, `connect`, `buildEngine`) are not affected.
+
 `createFilesDisk` (idea#131) is new and takes the disk ID only: it uses `lookupDiskById` (the id rule above, without the name fallback). A Console knows the Engine has it when `capabilities.includes('filesDisk') && capabilitiesBootedAt === lastBooted`. Files binds into Apps (`Instance.filesMounts`) need `capabilities.includes('filesMount')` as well (idea#133). Erase needs `capabilities.includes('eraseDisk')` (idea#134).
+
+### Instance arguments
+
+`backupApp` and `restoreApp` resolve their instance argument with `resolveInstanceArg` in `src/data/Commands.ts` (idea#168): an instance id first, then a unique instance name. If two or more instances share the name, the command is refused as ambiguous and their ids are listed; an unknown argument is refused as not found. Both refusals end the trace as `error`.
 
 ---
 

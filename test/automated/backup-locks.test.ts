@@ -19,7 +19,8 @@ import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import { DiskID, DiskName, EngineID, InstanceID, Timestamp, OperationCause } from '../../src/data/CommonTypes.js'
 import { Disk } from '../../src/data/Disk.js'
-import { backupInstance, backupLockKeysFor, runningBackupOnDisk } from '../../src/monitors/backupMonitor.js'
+import { backupInstance, backupLockKeysFor, runningBackupOnDisk, createBackupDiskConfig } from '../../src/monitors/backupMonitor.js'
+import { runWithTrace } from '../../src/utils/CommandLogger.js'
 import { resourceLock, instanceKey, diskKey } from '../../src/utils/ResourceLock.js'
 import { createOperation, updateOperation } from '../../src/data/Operations.js'
 import { CommandLogStore, CommandTrace, setCommandLogHandle } from '../../src/data/CommandLogStore.js'
@@ -163,6 +164,70 @@ describe('backup locks via acquireAll (idea#126)', () => {
         } finally {
             resourceLock.release(diskKey(backupDisk.id))
         }
+    })
+})
+
+describe('backup / restore refusals fail loud (idea#168 r29@97)', () => {
+    let logHandle: DocHandle<CommandLogStore>
+    let err: ReturnType<typeof vi.spyOn>
+    beforeEach(async () => {
+        appDevice = uniqueTestDevice()
+        do { backupDevice = uniqueTestDevice() } while (backupDevice === appDevice)
+        await fs.ensureDir(`${DISKS_ROOT}/${appDevice}/instances/${INST}`)
+        await fs.ensureDir(`${DISKS_ROOT}/${backupDevice}/backups/${INST}`)
+        await fs.writeFile(`${DISKS_ROOT}/${backupDevice}/backups/${INST}/config`, '[repository]\n')
+        logHandle = newCommandLog()
+        setCommandLogHandle(logHandle)
+        err = vi.spyOn(console, 'error').mockImplementation(() => {})
+    })
+    afterEach(async () => {
+        vi.restoreAllMocks()
+        setCommandLogHandle(null)
+        await fs.remove(`${DISKS_ROOT}/${appDevice}`)
+        await fs.remove(`${DISKS_ROOT}/${backupDevice}`)
+    })
+
+    it('restoreApp while the target disk is locked: trace error, no operation', async () => {
+        const { storeHandle, appDisk } = await setup()
+        resourceLock.acquire(diskKey(appDisk.id), 'copyApp')
+        try {
+            await handleCommand(commands, storeHandle, 'engine', `restoreApp ${INST} ${appDisk.id}`, logHandle)
+            const t = traces(logHandle).find(x => x.command === 'restoreApp')
+            expect(t?.status).toBe('error')
+            expect(t?.errorMessage).toContain('restoreApp: resource locked')
+            expect(Object.values(storeHandle.doc()!.operationDB).find(o => o.kind === 'restoreApp')).toBeUndefined()
+        } finally {
+            resourceLock.release(diskKey(appDisk.id))
+        }
+    })
+
+    it('restoreApp that fails (no Backup Disk with archives): trace error, operation Failed, locks released', async () => {
+        const { storeHandle, appDisk } = await setup()
+        await fs.remove(`${DISKS_ROOT}/${backupDevice}/backups/${INST}/config`)
+        await handleCommand(commands, storeHandle, 'engine', `restoreApp ${INST} ${appDisk.id}`, logHandle)
+        const t = traces(logHandle).find(x => x.command === 'restoreApp')
+        expect(t?.status).toBe('error')
+        expect(t?.errorMessage).toContain(`No docked Backup Disk with archives for instance ${INST}`)
+        const op = Object.values(storeHandle.doc()!.operationDB).find(o => o.kind === 'restoreApp')
+        expect(op?.status).toBe('Failed')
+        expect(resourceLock.isLocked(diskKey(appDisk.id))).toBe(false)
+        expect(resourceLock.isLocked(instanceKey(INST))).toBe(false)
+    })
+
+    it('a second console backupApp while one runs is refused (throws); a duplicate automatic trigger is a quiet skip', async () => {
+        const { storeHandle, backupDisk } = await setup()
+        await runWithTrace({ traceId: 't-dup', command: 'backupApp', args: '{}' }, async () => {
+            const first = backupInstance(storeHandle, INST, backupDisk, undefined, 'console-command')
+            await expect(backupInstance(storeHandle, INST, backupDisk, undefined, 'console-command')).rejects.toThrow('already in progress')
+            await expect(backupInstance(storeHandle, INST, backupDisk, undefined, 'backup-app-docked')).resolves.toBeUndefined()
+            await first
+        })
+    })
+
+    it('createBackupDiskConfig on an undocked disk throws', async () => {
+        const { storeHandle } = await setup()
+        await expect(createBackupDiskConfig(storeHandle, makeDisk('bd-x', 'X', null, true), 'on-demand', [INST]))
+            .rejects.toThrow('createBackupDiskConfig: disk bd-x is not docked')
     })
 })
 

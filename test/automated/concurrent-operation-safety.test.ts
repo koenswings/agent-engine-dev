@@ -240,18 +240,14 @@ describe('concurrent operation safety — ejectDisk blocked when disk locked', (
         // Acquire the instance lock manually (simulates first copyApp running)
         resourceLock.acquire(instanceKey('INST_001'), 'copyApp')
 
-        const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
         const { copyApp } = await import('../../src/data/CopyMoveApp.js')
         const { handle } = await makeHandle()
 
-        await copyApp(handle, 'my-kolibri' as any, 'DISK_source' as DiskID, 'DISK_target' as DiskID)
-
-        expect(consoleSpy).toHaveBeenCalledWith(
-            expect.stringContaining('resource locked')
-        )
+        // The refusal throws (idea#168 r29@97), so a command trace ends as error
+        await expect(copyApp(handle, 'my-kolibri' as any, 'DISK_source' as DiskID, 'DISK_target' as DiskID))
+            .rejects.toThrow('resource locked')
         // No operation record created — rejected before createOperation
         expect(Object.keys(handle.doc().operationDB)).toHaveLength(0)
-        consoleSpy.mockRestore()
         resourceLock.release(instanceKey('INST_001'))
     })
 })

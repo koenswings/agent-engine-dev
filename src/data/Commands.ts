@@ -2,9 +2,9 @@ import { CommandDefinition } from "./CommandDefinition.js";
 import { Store, getApps, getDisks, getDisk, getRunningEngines, getInstances, getEngine, findDiskByName, findInstanceByName, getLocalEngine, createClientStore } from "./Store.js";
 import { Disk, clearDuplicateDiskRecords, isSystemDiskRecord } from "./Disk.js";
 import { deepPrint, log, print } from "../utils/utils.js";
-import { buildInstance, startInstance, runInstance, stopInstance, markInstanceError } from "./Instance.js";
+import { Instance, buildInstance, startInstance, runInstance, stopInstance, markInstanceError } from "./Instance.js";
 import { buildEngine, syncEngine, clearKnownHost, rebootEngine } from "./Engine.js";
-import { AppName, Command, DeviceName, DiskID, DiskName, EngineID, Hostname, InstanceName, Version } from "./CommonTypes.js";
+import { AppName, Command, DeviceName, DiskID, DiskName, EngineID, Hostname, InstanceID, InstanceName, Version } from "./CommonTypes.js";
 import { localEngineId } from "./Engine.js";
 import { chalk, fs, $ } from "zx";
 import { ssh } from '../utils/ssh.js'
@@ -94,10 +94,7 @@ const buildEngineWrapper = async (storeHandle: DocHandle<Store> | null, argsStri
     const defaults = config.defaults;
 
     const machine = parsedArgs.machine;
-    if (!machine) {
-        console.error(chalk.red('buildEngine command requires a --machine argument.'));
-        return;
-    }
+    if (!machine) throw new Error('buildEngine command requires a --machine argument.')
 
     // Clear the known_hosts entry for the target machine before attempting to connect
     await clearKnownHost(machine);
@@ -128,18 +125,18 @@ const buildEngineWrapper = async (storeHandle: DocHandle<Store> | null, argsStri
         await buildEngine(buildArgs);
         print(chalk.green('buildEngine command finished successfully.'));
     } catch (e: any) {
-        console.error(chalk.red(`buildEngine command failed: ${e.message}`));
+        throw new Error(`buildEngine command failed: ${e.message}`)
     }
 }
 
 const ls = (storeHandle: DocHandle<Store> | null): void => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     print('NetworkData on this engine:');
     print(deepPrint(storeHandle.doc()), 3);
 }
 
 const lsEngines = (storeHandle: DocHandle<Store> | null): void => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     print('Engines:');
     const engines = getRunningEngines(storeHandle.doc());
     print(`Total engines: ${engines.length}`);
@@ -147,7 +144,7 @@ const lsEngines = (storeHandle: DocHandle<Store> | null): void => {
 }
 
 const lsDisks = (storeHandle: DocHandle<Store> | null): void => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     print('Disks:');
     const disks = getDisks(storeHandle.doc());
     print(`Total disks: ${disks.length}`);
@@ -155,7 +152,7 @@ const lsDisks = (storeHandle: DocHandle<Store> | null): void => {
 }
 
 const lsApps = (storeHandle: DocHandle<Store> | null): void => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     print('Apps:');
     const apps = getApps(storeHandle.doc());
     print(`Total apps: ${apps.length}`);
@@ -163,7 +160,7 @@ const lsApps = (storeHandle: DocHandle<Store> | null): void => {
 }
 
 const lsInstances = (storeHandle: DocHandle<Store> | null): void => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     print('Instances:');
     const instances = getInstances(storeHandle.doc());
     print(`Total instances: ${instances.length}`);
@@ -208,17 +205,14 @@ const installAppWrapper = async (storeHandle: DocHandle<Store> | null, argsStrin
 const createInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, appName: AppName, gitAccount: string, gitTag: string, diskName: DiskName) => {
     console.warn(chalk.yellow('createInstance is deprecated — use installApp instead'))
     const store = storeHandle?.doc()
-    if (!store) { console.error(chalk.red("Store is not available to create instance.")); return; }
+    if (!store) throw new Error("Store is not available to create instance.")
     const disk = findDiskByName(store, diskName)
-    if (!disk || !disk.device) {
-        print(chalk.red(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`))
-        return
-    }
+    if (!disk || !disk.device) throw new Error(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`)
     await buildInstance(instanceName, appName, gitAccount, gitTag as Version, disk.device)
 }
 
 const startInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName, ...rest: string[]) => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available.")); return; }
+    if (!storeHandle) throw new Error("Store is not available.")
     // Parse optional --cause flag forwarded by cross-engine copyApp dispatch
     const causeFlag = rest.find(a => a.startsWith('--cause'))
     const cause: import('./CommonTypes.js').OperationCause =
@@ -226,34 +220,22 @@ const startInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instan
         : 'console-command'
     const store = storeHandle.doc()
     const instance = findInstanceByName(store, instanceName)
-    if (!instance) {
-        print(chalk.red(`Instance ${instanceName} not found`))
-        return
-    }
+    if (!instance) throw new Error(`Instance ${instanceName} not found`)
     // Look up disk by ID from instance.storedOn — same fix as stopInstanceWrapper.
     // findDiskByName uses getDisks() which filters dockedTo != null and misses
     // disks that appear undocked in the CRDT but are physically still attached.
     const disk = (instance.storedOn ? getDisk(store, instance.storedOn) : undefined) ?? findDiskByName(store, diskName)
-    if (!disk) {
-        print(chalk.red(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`))
-        return
-    }
+    if (!disk) throw new Error(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`)
     startInstance(storeHandle, instance, disk, cause)
 }
 
 const runInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName) => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available.")); return; }
+    if (!storeHandle) throw new Error("Store is not available.")
     const store = storeHandle.doc()
     const instance = findInstanceByName(store, instanceName)
     const disk = findDiskByName(store, diskName)
-    if (!instance) {
-        print(chalk.red(`Instance ${instanceName} not found`))
-        return
-    }
-    if (!disk) {
-        print(chalk.red(`Disk ${diskName} not found`))
-        return
-    }
+    if (!instance) throw new Error(`Instance ${instanceName} not found`)
+    if (!disk) throw new Error(`Disk ${diskName} not found`)
     // runInstance propagates compose up failures (idea#109): mark the instance
     // Error and rethrow, so handleCommand closes this command's trace as failed.
     try {
@@ -265,51 +247,64 @@ const runInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instance
 }
 
 const stopInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName) => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available.")); return; }
+    if (!storeHandle) throw new Error("Store is not available.")
     const store = storeHandle.doc()
     const instance = findInstanceByName(store, instanceName)
-    if (!instance) {
-        print(chalk.red(`Instance ${instanceName} not found`))
-        return
-    }
+    if (!instance) throw new Error(`Instance ${instanceName} not found`)
     // Look up disk by ID from instance.storedOn — not via getDisks() which filters
     // to dockedTo != null and would miss disks that appear undocked in the CRDT.
     const disk = (instance.storedOn ? getDisk(store, instance.storedOn) : undefined) ?? findDiskByName(store, diskName)
-    if (!disk) {
-        print(chalk.red(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`))
-        return
-    }
+    if (!disk) throw new Error(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`)
     stopInstance(storeHandle, instance, disk, 'console-command')
 }
 
 const sendWrapper = (storeHandle: DocHandle<Store> | null, args: string) => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     const firstSpaceIndex = args.indexOf(' ');
-    if (firstSpaceIndex === -1) {
-        console.error(chalk.red("Send command requires at least two arguments: <engineId> <command>"));
-        return;
-    }
+    if (firstSpaceIndex === -1) throw new Error("Send command requires at least two arguments: <engineId> <command>")
     const engineId = args.substring(0, firstSpaceIndex);
     const command = args.substring(firstSpaceIndex + 1);
+    if (!storeHandle.doc()?.engineDB[engineId as EngineID]) throw new Error(`Cannot send command: Engine ${engineId} not found in store.`)
     sendCommand(storeHandle, engineId as EngineID, command as Command);
 }
 
 const rebootWrapper = async (storeHandle: DocHandle<Store> | null) => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     const localEngine = getLocalEngine(storeHandle.doc());
     await rebootEngine(storeHandle, localEngine);
 }
 
-const backupAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, backupDiskName?: DiskName) => {
+/**
+ * Resolve an instance argument (idea#168 r29@97): an instance id first, then a
+ * unique instance name. Two or more instances with that name are refused as
+ * ambiguous (listing their ids); none is refused as not found.
+ */
+export const resolveInstanceArg = (store: Store, arg: string, command: string): Instance => {
+    const byId = store.instanceDB[arg as InstanceID]
+    if (byId) return byId
+    const named = Object.values(store.instanceDB).filter(i => i.name === arg)
+    if (named.length === 1) return named[0]
+    if (named.length > 1) {
+        throw new Error(`${command}: instance name '${arg}' is ambiguous: ${named.map(i => `${i.id} (on disk ${i.storedOn ?? 'none'})`).join(', ')}. Use the instance id.`)
+    }
+    throw new Error(`${command}: instance '${arg}' not found.`)
+}
+
+/**
+ * backupApp <instanceIdOrName> <backupDiskIdOrName> (idea#168 r29@97). The
+ * instance goes through resolveInstanceArg, the disk through resolveDiskArg:
+ * an id, or a unique name (a disk name with a warning).
+ */
+const backupAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: string, backupDiskId?: string) => {
     // Refusals throw so the command-log trace closes as error (idea#122).
     if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     const store = storeHandle.doc()
-    const instance = Object.values(store.instanceDB).find(i => i.name === instanceName)
-    if (!instance) throw new Error(`Instance '${instanceName}' not found.`)
+    const instance = resolveInstanceArg(store, instanceArg, 'backupApp')
+    const instanceName = instance.name
 
-    // Find backup disk: named or first linked docked Backup Disk
-    let backupDisk = backupDiskName
-        ? Object.values(store.diskDB).find(d => d.name === backupDiskName && d.device != null)
+    // Find backup disk: by id or unique name, or first linked docked Backup Disk
+    let backupDisk = backupDiskId
+        ? resolveDiskArg(store, getLocalEngine(store)?.id, backupDiskId, 'backupApp')
         : Object.values(store.diskDB).find(d =>
             d.device != null &&
             d.diskTypes?.includes('backup') &&
@@ -317,23 +312,27 @@ const backupAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceNa
           )
 
     if (!backupDisk) {
-        throw new Error(`No docked Backup Disk found${backupDiskName ? ` named '${backupDiskName}'` : ` linked to instance '${instanceName}'`}.`)
+        throw new Error(`No docked Backup Disk found linked to instance '${instanceName}'.`)
     }
-    print(chalk.blue(`Backing up instance '${instanceName}' to disk '${backupDisk.name}'...`))
+    print(chalk.blue(`Backing up instance '${instanceName}' to disk '${backupDisk.name}' (${backupDisk.id})...`))
     await backupInstance(storeHandle, instance.id, backupDisk as any, undefined, 'console-command')
 }
 
-const restoreAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, targetDiskName: DiskName) => {
+/**
+ * restoreApp <instanceIdOrName> <targetDiskIdOrName> (idea#168 r29@97). The
+ * instance goes through resolveInstanceArg, the disk through resolveDiskArg:
+ * an id, or a unique name (a disk name with a warning).
+ */
+const restoreAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: string, targetDiskId: string) => {
     // Refusals throw so the command-log trace closes as error (idea#122).
     if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     const store = storeHandle.doc()
-    const instance = Object.values(store.instanceDB).find(i => i.name === instanceName)
-    if (!instance) throw new Error(`Instance '${instanceName}' not found in store.`)
+    const instance = resolveInstanceArg(store, instanceArg, 'restoreApp')
+    const instanceName = instance.name
 
-    const targetDisk = Object.values(store.diskDB).find(d => d.name === targetDiskName && d.device != null)
-    if (!targetDisk) throw new Error(`Target disk '${targetDiskName}' not found or not docked.`)
+    const targetDisk = resolveDiskArg(store, getLocalEngine(store)?.id, targetDiskId, 'restoreApp')
 
-    print(chalk.blue(`Restoring instance '${instanceName}' to disk '${targetDiskName}'...`))
+    print(chalk.blue(`Restoring instance '${instanceName}' to disk '${targetDisk.name}' (${targetDisk.id})...`))
     await restoreApp(storeHandle, instance.id, targetDisk as any, undefined, 'console-command')
 }
 
@@ -391,12 +390,12 @@ const createFilesDiskWrapper = async (storeHandle: DocHandle<Store> | null, disk
 }
 
 const copyAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, sourceDiskId: DiskID, targetDiskId: DiskID) => {
-    if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
+    if (!storeHandle) throw new Error('Store is not available.')
     await copyApp(storeHandle, instanceName, sourceDiskId, targetDiskId, 'console-command')
 }
 
 const moveAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, sourceDiskId: DiskID, targetDiskId: DiskID) => {
-    if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
+    if (!storeHandle) throw new Error('Store is not available.')
     await moveApp(storeHandle, instanceName, sourceDiskId, targetDiskId, 'console-command')
 }
 
@@ -475,6 +474,9 @@ export const commands: CommandDefinition[] = [
     { name: "copyApp", execute: copyAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
     { name: "moveApp", execute: moveAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
     { name: "ejectDisk", execute: ejectDiskWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
+    // backupApp / restoreApp (idea#168): the instance is an id or unique name, the disk
+    // an id or unique docked name (resolveInstanceArg / resolveDiskArg). The trace arg
+    // keys stay 'instanceName' / 'backupDiskId' (Console trace filters read them).
     { name: "backupApp", execute: backupAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "mode" }, { type: "string", name: "instanceNames", variadic: true }], scope: 'engine' },
@@ -482,9 +484,9 @@ export const commands: CommandDefinition[] = [
     { name: "summariseDisk", execute: summariseDiskWrapper, args: [{ type: "string", name: "targetId" }], scope: 'engine' },
     { name: "eraseDisk", execute: eraseDiskWrapper, args: [{ type: "string", name: "targetId" }, { type: "string", name: "summaryTraceId" }, { type: "string", name: "confirmName", variadic: true }], scope: 'engine' },
     { name: "cancelOperation", execute: async (storeHandle: DocHandle<Store> | null, opId: string) => {
-        if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
+        if (!storeHandle) throw new Error('Store is not available.')
         const err = cancelOperation(storeHandle, opId)
-        if (err) console.error(chalk.red(`cancelOperation: ${err}`))
-        else print(chalk.green(`Operation ${opId} cancelled`))
+        if (err) throw new Error(`cancelOperation: ${err}`)
+        print(chalk.green(`Operation ${opId} cancelled`))
     }, args: [{ type: "string" }], scope: 'engine' },
 ];

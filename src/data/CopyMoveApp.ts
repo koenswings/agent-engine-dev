@@ -172,17 +172,15 @@ export const copyApp = async (
     const store = storeHandle.doc()
 
     const v = await validate(store, instanceName, sourceDiskId, targetDiskId)
-    if (typeof v === 'string') {
-        console.error(chalk.red(`copyApp: ${v}`))
-        return
-    }
+    // Validation refusals throw (idea#168 r29@97), so the command trace or
+    // crash-recovery retry ends as error instead of silently succeeding.
+    if (typeof v === 'string') throw new Error(`copyApp: ${v}`)
     const { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc } = v
 
     // Acquire per-resource locks: source instance + target disk
     const lockKeys = [instanceKey(instance.id), diskKey(targetDisk.id)]
     if (!resourceLock.acquireAll(lockKeys, 'copyApp')) {
-        console.error(chalk.red(`copyApp: resource locked — another operation is already running on instance '${instanceName}' or target disk '${targetDisk.name}'. Retry when it completes.`))
-        return
+        throw new Error(`copyApp: resource locked — another operation is already running on instance '${instanceName}' or target disk '${targetDisk.name}'. Retry when it completes.`)
     }
 
     const opId = createOperation(storeHandle, 'copyApp', {
@@ -390,25 +388,22 @@ export const moveApp = async (
     const store = storeHandle.doc()
 
     const v = await validate(store, instanceName, sourceDiskId, targetDiskId)
-    if (typeof v === 'string') {
-        console.error(chalk.red(`moveApp: ${v}`))
-        return
-    }
+    // Validation refusals throw (idea#168 r29@97), so the command trace or
+    // crash-recovery retry ends as error instead of silently succeeding.
+    if (typeof v === 'string') throw new Error(`moveApp: ${v}`)
     const { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc } = v
 
     // moveApp does not support cross-engine targets (data integrity risk if move fails midway).
     // Use copyApp + manual delete instead.
     const { localEngineId: localId } = await import('./Engine.js')
     if (String(targetDisk.dockedTo) !== String(localId)) {
-        log(`moveApp: Target disk '${targetDisk.name}' is on a remote engine. Cross-engine move is not supported — use copyApp instead, then delete the source.`)
-        return
+        throw new Error(`moveApp: Target disk '${targetDisk.name}' is on a remote engine. Cross-engine move is not supported — use copyApp instead, then delete the source.`)
     }
 
     // Acquire per-resource locks: instance + both disks
     const moveLockKeys = [instanceKey(instance.id), diskKey(sourceDisk.id), diskKey(targetDisk.id)]
     if (!resourceLock.acquireAll(moveLockKeys, 'moveApp')) {
-        console.error(chalk.red(`moveApp: resource locked — another operation is already running on instance '${instanceName}' or one of its disks. Retry when it completes.`))
-        return
+        throw new Error(`moveApp: resource locked — another operation is already running on instance '${instanceName}' or one of its disks. Retry when it completes.`)
     }
 
     const opId = createOperation(storeHandle, 'moveApp', {

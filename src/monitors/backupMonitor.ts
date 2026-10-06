@@ -91,6 +91,9 @@ export const backupInstance = async (
     }
 
     if (activeBackups.has(instanceId)) {
+        // A console backupApp refusal must fail its trace (idea#168 r29@97); a duplicate
+        // automatic trigger stays a quiet skip.
+        if (cause === 'console-command') throw new Error(`Backup for ${instanceId} already in progress — not started again`)
         log(`Backup for ${instanceId} already in progress — skipping duplicate trigger`)
         return
     }
@@ -423,9 +426,9 @@ export const restoreApp = async (
 ): Promise<void> => {
     // Acquire lock: instance + target disk
     const restoreLockKeys = [instanceKey(instanceId), diskKey(targetDisk.id)]
+    // Refusals and failures throw (idea#168 r29@97), so the restoreApp command trace ends as error.
     if (!resourceLock.acquireAll(restoreLockKeys, 'restoreApp')) {
-        console.error(chalk.red(`restoreApp: resource locked — another operation is already running on instance or target disk. Retry when it completes.`))
-        return
+        throw new Error(`restoreApp: resource locked — another operation is already running on instance or target disk. Retry when it completes.`)
     }
 
     const opId = existingOpId ?? createOperation(storeHandle, 'restoreApp', {
@@ -495,6 +498,7 @@ export const restoreApp = async (
             completedAt: Date.now() as Timestamp,
         })
         log(chalk.red(`Restore of instance ${instanceId} failed: ${e.message ?? e}`))
+        throw e
     } finally {
         resourceLock.releaseAll(restoreLockKeys)
     }
@@ -512,10 +516,7 @@ export const createBackupDiskConfig = async (
     mode: BackupMode,
     instanceIds: InstanceID[]
 ): Promise<void> => {
-    if (!disk.device) {
-        log(chalk.red(`createBackupDiskConfig: disk ${disk.id} is not docked`))
-        return
-    }
+    if (!disk.device) throw new Error(`createBackupDiskConfig: disk ${disk.id} is not docked`)
 
     const yaml: BackupYaml = {
         mode,

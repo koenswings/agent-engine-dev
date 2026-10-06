@@ -224,22 +224,41 @@ describe('copyApp', () => {
         expect(ops[0].error).toContain('disk full')
     })
 
-    it('errors cleanly when instance is not found', async () => {
+    // Validation refusals throw (idea#168 r29@97), so the trace fails loud.
+    it('throws when instance is not found, no operation created', async () => {
         const { handle } = await makeHandle()
-        const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-        await copyApp(handle, 'nonexistent' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
-        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('not found'))
+        await expect(copyApp(handle, 'nonexistent' as any, SOURCE_DISK_ID, TARGET_DISK_ID))
+            .rejects.toThrow("copyApp: Instance 'nonexistent' not found")
         expect(Object.keys(handle.doc().operationDB)).toHaveLength(0)
-        consoleSpy.mockRestore()
     })
 
-    it('errors cleanly when target disk is not docked', async () => {
+    it('throws when target disk is not docked', async () => {
         const { handle } = await makeHandle()
         handle.change(doc => { doc.diskDB[TARGET_DISK_ID].device = null })
+        await expect(copyApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID))
+            .rejects.toThrow(`copyApp: Target disk '${TARGET_DISK_ID}' is not docked`)
+        expect(Object.keys(handle.doc().operationDB)).toHaveLength(0)
+    })
+
+    it('throws when source and target are the same disk', async () => {
+        const { handle } = await makeHandle()
+        await expect(copyApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, SOURCE_DISK_ID))
+            .rejects.toThrow('copyApp: Source and target disk are the same')
+    })
+
+    it('via handleCommand: the refusal ends the copyApp trace as error (no unhandled rejection)', async () => {
+        const { handle } = await makeHandle()
+        const { commands } = await import('../../src/data/Commands.js')
+        const { handleCommand } = await import('../../src/utils/commandUtils.js')
+        const log = makeRepo().create<any>({ traces: {}, recentTraceIds: [] })
         const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
-        await copyApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
-        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('not docked'))
-        consoleSpy.mockRestore()
+        await expect(handleCommand(commands, handle, 'engine', `copyApp nonexistent ${SOURCE_DISK_ID} ${TARGET_DISK_ID}`, log)).resolves.toBeUndefined()
+        const ids = log.doc().recentTraceIds
+        const t = log.doc().traces[ids[ids.length - 1]]
+        expect(t.command).toBe('copyApp')
+        expect(t.status).toBe('error')
+        expect(t.errorMessage).toContain("copyApp: Instance 'nonexistent' not found")
+        expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("copyApp: Instance 'nonexistent' not found"))
     })
 })
 
@@ -334,6 +353,68 @@ describe('moveApp', () => {
         const mfs = await getMockedFs()
         const removeCalls = vi.mocked(mfs.remove).mock.calls.map(c => c[0] as string)
         expect(removeCalls.some(p => p.includes(`/apps/${APP_ID}`))).toBe(false)
+    })
+
+    it('throws on a validation refusal (instance not stored on source disk), no operation created', async () => {
+        const { handle } = await makeHandle()
+        await expect(moveApp(handle, 'my-kolibri' as any, TARGET_DISK_ID, SOURCE_DISK_ID))
+            .rejects.toThrow(`moveApp: Instance 'my-kolibri' is not stored on disk '${TARGET_DISK_ID}'`)
+        expect(Object.keys(handle.doc().operationDB)).toHaveLength(0)
+    })
+
+    it('refuses a cross-engine target: throws, and via handleCommand the trace ends as error', async () => {
+        const { handle } = await makeHandle()
+        const { network } = await import('../../src/data/Network.js')
+        const REMOTE = 'ENGINE_remote-1' as EngineID
+        handle.change(doc => { doc.diskDB[TARGET_DISK_ID].dockedTo = REMOTE })
+        network.connections['10.0.0.9:4321' as any] = { adapter: {} as any, missedDiscoveryCount: 0, hostname: 'idea09' as any, engineId: REMOTE }
+        try {
+            await expect(moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID))
+                .rejects.toThrow('Cross-engine move is not supported')
+            const { commands } = await import('../../src/data/Commands.js')
+            const { handleCommand } = await import('../../src/utils/commandUtils.js')
+            const log = makeRepo().create<any>({ traces: {}, recentTraceIds: [] })
+            const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+            await handleCommand(commands, handle, 'engine', `moveApp my-kolibri ${SOURCE_DISK_ID} ${TARGET_DISK_ID}`, log)
+            const ids = log.doc().recentTraceIds
+            const t = log.doc().traces[ids[ids.length - 1]]
+            expect(t.status).toBe('error')
+            expect(t.errorMessage).toContain('Cross-engine move is not supported')
+            expect(Object.keys(handle.doc().operationDB)).toHaveLength(0)
+            consoleSpy.mockRestore()
+        } finally {
+            delete network.connections['10.0.0.9:4321' as any]
+        }
+    })
+
+    it('refuses while the instance or a disk is locked: throws, no operation created', async () => {
+        const { handle } = await makeHandle()
+        const { resourceLock, diskKey } = await import('../../src/utils/ResourceLock.js')
+        resourceLock.acquire(diskKey(TARGET_DISK_ID), 'restoreApp')
+        try {
+            await expect(moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID))
+                .rejects.toThrow('moveApp: resource locked')
+            expect(Object.keys(handle.doc().operationDB)).toHaveLength(0)
+        } finally {
+            resourceLock.release(diskKey(TARGET_DISK_ID))
+        }
+    })
+
+    it('crash-recovery retry: a validation refusal marks the operation Failed', async () => {
+        const { handle } = await makeHandle()
+        handle.change(doc => {
+            doc.operationDB['op-r'] = {
+                id: 'op-r', kind: 'moveApp', args: { instanceId: 'nonexistent', sourceDiskId: SOURCE_DISK_ID, targetDiskId: TARGET_DISK_ID },
+                cause: 'console-command', subject: null, engineId: localEngineId,
+                status: 'Running', progressPercent: 10, currentStep: null, totalSteps: null, stepLabel: null,
+                startedAt: 0 as Timestamp, completedAt: null, error: null,
+            }
+        })
+        await recoverInterruptedOperations(handle, {
+            moveApp: async (args, h) => { await moveApp(h, args.instanceId as any, args.sourceDiskId as any, args.targetDiskId as any, 'crash-recovery') },
+        })
+        await vi.waitFor(() => expect(handle.doc().operationDB['op-r'].status).toBe('Failed'))
+        expect(handle.doc().operationDB['op-r'].error).toContain("Retry failed: moveApp: Instance 'nonexistent' not found")
     })
 
     it('sets Failed and restarts source instance when rsync throws', async () => {
