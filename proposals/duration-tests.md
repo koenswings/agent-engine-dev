@@ -1467,6 +1467,7 @@ Authenticated operator Console UI click sequences. Intent-style names only. Prel
 
 1. **Move** demanding Kolibri from idea-A disk to idea-B disk (same InstanceID).
 2. Wait `moveApp`; assert backup links intact; source cleaned; catalog still unified.
+3. Precondition: source and target disk are docked on the **same** Engine. `moveApp` refuses cross-engine targets; use **Copy app** for that. The harness re-reads both hosts from the store and fails loud before the Intent.
 
 #### Done redistribute
 

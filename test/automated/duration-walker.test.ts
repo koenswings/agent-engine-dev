@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { FakeFleetOps, dispatchAction, addFilesAppDiskId, ensureAppOnlyDiskOnConsoleEngine, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, redockEmpty001BeforeMakeFiles, resolveConsoleEngineHost, filesDiskTargetId, preflightFilesDiskTarget, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, resyncFixtureSidecarUrlsFromStore, locateInstanceEngine, verifyRestoreOperation, SIDECAR_SETTLE_ACTIONS, verifyBackupOperation, ensureBackupDiskForInstance, backupYamlLastBackup, nextcloudLoginFormLooksReady, nextcloudInitialState, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
+import { FakeFleetOps, dispatchAction, addFilesAppDiskId, ensureAppOnlyDiskOnConsoleEngine, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, redockEmpty001BeforeMakeFiles, resolveConsoleEngineHost, filesDiskTargetId, preflightFilesDiskTarget, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, resyncFixtureSidecarUrlsFromStore, locateInstanceEngine, verifyRestoreOperation, SIDECAR_SETTLE_ACTIONS, verifyBackupOperation, ensureBackupDiskForInstance, backupYamlLastBackup, predictCopyMovePair, preflightCopyMoveSamePi, nextcloudLoginFormLooksReady, nextcloudInitialState, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
 import { semanticStoresEqual, waitForConvergence } from '../duration/convergence.js'
 import { evaluateInvariants, DEFAULT_INFRA_INVARIANTS, listInvariantTypes } from '../duration/invariants.js'
 import {
@@ -2901,6 +2901,185 @@ describe('r30: real backup_instance before restore_from_backup (op Done + archiv
             await expect(ensureBackupDiskForInstance(ctxFor(b.ops, null, 'idea03') as any, INST, KOLIBRI)).rejects.toThrow(
                 /backup_instance: co-locate duration-kolibri-grade5a-001 idea03→idea01 did not land \(store: kolibri-grade5a-001 on idea04\)/,
             )
+        })
+    })
+})
+
+describe('r30: cover-registered-intents takes a real backup before restore_from_backup', () => {
+    it('open_instance_controls → backup_instance → back_to_disk follow make_backup_disk/backup_configured_restored (@64-66); restore @69, move_app @74, copy_app @30/@90; 102 steps', () => {
+        const walk = loadWalk('cover-registered-intents')
+        const acts = walk.steps.map(st => st.action)
+        expect(walk.steps.length).toBe(102)
+        const r = acts.indexOf('restore_from_backup')
+        expect(r + 1).toBe(69)
+        expect(acts.slice(r - 7, r + 1)).toEqual([
+            'make_backup_disk',
+            'backup_configured_restored',
+            'open_instance_controls',
+            'backup_instance',
+            'back_to_disk',
+            'back_to_overview',
+            'open_disk_inventory',
+            'restore_from_backup',
+        ])
+        const at = (a: string) => acts.flatMap((x, i) => (x === a ? [i + 1] : []))
+        expect(at('backup_instance')).toEqual([65, 85])
+        expect(at('move_app')).toEqual([74])
+        expect(at('copy_app')).toEqual([30, 90])
+        // backup precedes the first restore in both walks
+        for (const name of ['cover-all', 'cover-registered-intents']) {
+            const a = loadWalk(name).steps.map(st => st.action)
+            expect(a.indexOf('backup_instance'), name).toBeLessThan(a.indexOf('restore_from_backup'))
+            expect(a.indexOf('backup_instance'), name).toBeGreaterThan(a.indexOf('make_backup_disk'))
+        }
+        const ca = loadWalk('cover-all').steps.map(st => st.action)
+        const caAt = (x: string) => ca.flatMap((y, i) => (y === x ? [i + 1] : []))
+        expect(caAt('backup_instance')).toEqual([98, 112])
+        expect(caAt('restore_from_backup')).toEqual([100])
+        expect(caAt('move_app')).toEqual([102])
+        expect(caAt('copy_app')).toEqual([43, 116])
+    })
+
+    it('Fake cover-registered-intents walk still completes (backup/move preflights are live-only)', async () => {
+        const walk = loadWalk('cover-registered-intents')
+        const ops = fakeOps({ poolEngines: [...DEFAULT_POOL], excludeEngines: ['idea02'], storeMode: 'shared', settleDelayMs: 0 })
+        const result = await runDeterministicWalk(walk, { fast: true, ops, stubUi: true, skipStability: true })
+        expect(result.failures).toBe(0)
+        expect(result.aborted).toBe(false)
+        expect(result.steps).toBe(102)
+    })
+})
+
+describe('r30: move_app same-Pi preflight (Eng 8d98718 refuses cross-engine moveApp); copy_app reports only', () => {
+    const POOL = ['idea01', 'idea03', 'idea04']
+    const KOLIBRI = 'duration-kolibri-grade5a-001'
+    const NC = 'duration-nextcloud-grade5a-001'
+    const INST = 'kolibri-grade5a-001'
+    const ENV_KEYS = ['DURATION_COPY_TARGET_DISK', 'DURATION_COPY_SOURCE_DISK', 'DURATION_COPY_INSTANCE_ID', 'DURATION_KOLIBRI_URL', 'DURATION_NEXTCLOUD_URL'] as const
+    const withEnv = async (vars: Partial<Record<(typeof ENV_KEYS)[number], string>>, fn: () => Promise<void>) => {
+        const prev: Record<string, string | undefined> = {}
+        for (const k of ENV_KEYS) {
+            prev[k] = process.env[k]
+            if (vars[k] === undefined) delete process.env[k]
+            else process.env[k] = vars[k]
+        }
+        try {
+            await fn()
+        } finally {
+            for (const k of ENV_KEYS) {
+                if (prev[k] === undefined) delete process.env[k]
+                else process.env[k] = prev[k]
+            }
+        }
+    }
+    /** Fake "live" fleet: findDockedEngine from the store (enables the preflight). */
+    const fleet = async (kolibriOn: string, ncOn = 'idea01') => {
+        const ops = fakeOps({ poolEngines: POOL, excludeEngines: ['idea02'], storeMode: 'shared' })
+        await ops.dockFixture(ncOn, NC)
+        await ops.dockFixture(kolibriOn, KOLIBRI)
+        return Object.assign(ops, {
+            getHostMap: () => ({ idea01: '100.99.231.94', idea03: '100.126.117.80', idea04: '100.108.39.45' }),
+            findDockedEngine: async (d: string) => (await ops.readStore('idea01')).diskDB[d]?.dockedTo ?? null,
+        })
+    }
+    const ctxFor = (ops: unknown, action: string, driver?: unknown, dockedEngine: string | null = 'idea01') => ({
+        opts: { ops, rng: () => 0, settleTimeoutMs: 500, fast: true, stubUi: true, ...(driver ? { uiDriver: driver } : {}) },
+        walker: { current: 'op_disk', layer: 'operator' as const, dockedEngine, step: 101 },
+        from: 'op_disk',
+        to: 'op_copy_move',
+        action,
+        excludeEngines: ['idea02'],
+        poolEngines: POOL,
+        fixtureDisk: KOLIBRI,
+        fixtureInstance: INST,
+        fixtureDisks: [KOLIBRI, NC],
+        fixtureInstances: { ...KID_FIXTURES },
+    })
+    const clickDriver = () => {
+        const seen: string[] = []
+        const driver = new StubUiDriver()
+        Object.assign(driver, {
+            runIntent: async (req: any) => {
+                seen.push(req.action)
+                return { ok: true, mode: 'live', message: `runDurationIntent ok: ${req.action}` }
+            },
+        })
+        return { driver, seen }
+    }
+
+    it('move_app: Kolibri and Nextcloud both on idea01 → passes, Intent runs, message names the same-Pi pair', async () => {
+        await withEnv({}, async () => {
+            const ops = await fleet('idea01')
+            const { driver, seen } = clickDriver()
+            const r = await dispatchAction(ctxFor(ops, 'move_app', driver) as any)
+            expect(r.ok, r.message).toBe(true)
+            expect(seen).toEqual(['move_app'])
+            expect(r.message).toMatch(/move_app preflight: same Pi kolibri-grade5a-001 on idea01 \(disk duration-kolibri-grade5a-001\) -> duration-nextcloud-grade5a-001 on idea01/)
+        })
+    })
+
+    it('move_app: Kolibri on idea03, Nextcloud on idea01 → LOUD cross-engine fail naming both Pis and both disks; Intent never runs', async () => {
+        await withEnv({}, async () => {
+            const ops = await fleet('idea03')
+            const { driver, seen } = clickDriver()
+            // walker still believes idea01 — the preflight must re-read the store
+            const r = await dispatchAction(ctxFor(ops, 'move_app', driver, 'idea01') as any)
+            expect(r.ok).toBe(false)
+            expect(r.message).toMatch(
+                /^move_app aborted before Intent: move_app preflight: cross-engine move kolibri-grade5a-001 on idea03 \(disk duration-kolibri-grade5a-001\) -> duration-nextcloud-grade5a-001 on idea01; Engine refuses cross-engine moveApp/,
+            )
+            expect(seen).toEqual([])
+        })
+    })
+
+    it('move_app: source follows the instance storedOn (after an earlier move) and DURATION_COPY_TARGET_DISK is honoured', async () => {
+        await withEnv({ DURATION_COPY_TARGET_DISK: 'duration-empty-001' }, async () => {
+            const ops = await fleet('idea01')
+            await ops.dockFixture('idea04', 'duration-empty-001')
+            ;(ops as any).mutate((doc: SemanticStoreView) => {
+                doc.instanceDB[INST]!.diskId = NC
+            })
+            const pair = await predictCopyMovePair(ctxFor(ops, 'move_app') as any, { instanceId: INST, diskId: KOLIBRI })
+            expect(pair).toMatchObject({ sourceDiskId: NC, sourceEngine: 'idea01', targetDiskId: 'duration-empty-001', targetEngine: 'idea04' })
+            await expect(preflightCopyMoveSamePi(ctxFor(ops, 'move_app') as any, 'move_app', { instanceId: INST, diskId: KOLIBRI })).rejects.toThrow(
+                /cross-engine move kolibri-grade5a-001 on idea01 \(disk duration-nextcloud-grade5a-001\) -> duration-empty-001 on idea04/,
+            )
+        })
+    })
+
+    it('copy_app: cross-engine pair is reported, not refused (Eng 8d98718 copyApp Phase 2 supports remote targets)', async () => {
+        await withEnv({}, async () => {
+            const ops = await fleet('idea03')
+            const { driver, seen } = clickDriver()
+            const r = await dispatchAction({ ...ctxFor(ops, 'copy_app', driver, 'idea03'), from: 'op_instance' } as any)
+            expect(r.ok, r.message).toBe(true)
+            expect(seen).toEqual(['copy_app'])
+            expect(r.message).toMatch(/copy_app preflight: cross-engine copy kolibri-grade5a-001 on idea03 \(disk duration-kolibri-grade5a-001\) -> duration-nextcloud-grade5a-001 on idea01 \(Eng 8d98718 copyApp Phase 2 supports it\)/)
+        })
+    })
+
+    it('move_app: no other docked disk, or a pair on idea02 → LOUD; Fake ops without findDockedEngine skip the preflight', async () => {
+        await withEnv({}, async () => {
+            const solo = await fleet('idea01')
+            await solo.undockFixtures(['idea01'], NC)
+            await expect(preflightCopyMoveSamePi(ctxFor(solo, 'move_app') as any, 'move_app', { instanceId: INST, diskId: KOLIBRI })).rejects.toThrow(
+                /move_app preflight: no docked target disk ≠ duration-kolibri-grade5a-001/,
+            )
+            const golden = await fleet('idea01')
+            ;(golden as any).mutate((doc: SemanticStoreView) => {
+                doc.diskDB[NC]!.dockedTo = 'idea02'
+            })
+            await expect(preflightCopyMoveSamePi(ctxFor(golden, 'move_app') as any, 'move_app', { instanceId: INST, diskId: KOLIBRI })).rejects.toThrow(
+                /touches excluded engine idea02/,
+            )
+            const plain = fakeOps({ poolEngines: POOL, excludeEngines: ['idea02'], storeMode: 'shared' })
+            await plain.dockFixture('idea03', KOLIBRI)
+            await plain.dockFixture('idea01', NC)
+            const { driver, seen } = clickDriver()
+            const r = await dispatchAction(ctxFor(plain, 'move_app', driver) as any)
+            expect(r.ok, r.message).toBe(true)
+            expect(seen).toEqual(['move_app'])
+            expect(r.message).not.toMatch(/preflight/)
         })
     })
 })

@@ -1496,6 +1496,117 @@ export const ensureBackupDiskForInstance = async (
     }
 }
 
+// ── r30: move_app must stay on one Pi (Eng 8d98718 refuses cross-engine moveApp) ──
+
+/** Console 0760c01 e2e/intents/copyMoveApp.ts pickTargetDiskId preference order. */
+export const COPY_MOVE_TARGET_PREFERENCE = [
+    DURATION_UI_FIXTURES.nextcloud.diskId,
+    DURATION_UI_FIXTURES.kolibri.diskId,
+    'duration-empty-001',
+] as const
+
+/**
+ * r30: predict what the Console copy_app / move_app Intent will drag, mirroring Console
+ * 0760c01 copyMoveApp.ts: instance = DURATION_COPY_INSTANCE_ID || ctx instance || Kolibri;
+ * source = the instance's storedOn (the Intent reads data-source-disk-id; DOM wins over
+ * the env/ctx guess); target = DURATION_COPY_TARGET_DISK || (guessed source is Nextcloud
+ * ? Kolibri : Nextcloud) when docked and ≠ source, else pickTargetDiskId preference
+ * (Nextcloud, Kolibri, empty-001, then any other non-system docked disk). Hosts come
+ * from a fresh store read, never from walker.dockedEngine.
+ */
+export const predictCopyMovePair = async (
+    ctx: ActionContext,
+    ids: { instanceId?: string; diskId?: string },
+    env: NodeJS.ProcessEnv = process.env,
+): Promise<{
+    instanceId: string
+    sourceDiskId: string
+    sourceEngine: string | null
+    targetDiskId: string | null
+    targetEngine: string | null
+}> => {
+    const kolibri = DURATION_UI_FIXTURES.kolibri
+    const nc = DURATION_UI_FIXTURES.nextcloud.diskId
+    const instanceId = env.DURATION_COPY_INSTANCE_ID?.trim() || ids.instanceId || kolibri.instanceId
+    const guessSource = env.DURATION_COPY_SOURCE_DISK?.trim() || ids.diskId || kolibri.diskId
+    const defaultTarget = env.DURATION_COPY_TARGET_DISK?.trim() || (guessSource === nc ? kolibri.diskId : nc)
+    const docked = new Map<string, string>() // diskId → engine, insertion = store order
+    let storedOn: string | null = null
+    for (const eng of ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))) {
+        let view: SemanticStoreView
+        try {
+            view = await ctx.opts.ops.readStore(eng)
+        } catch {
+            continue
+        }
+        for (const d of Object.values(view.diskDB)) {
+            if (d.dockedTo && !docked.has(d.id)) docked.set(d.id, d.dockedTo)
+        }
+        const inst = view.instanceDB[instanceId]
+        if (!storedOn && inst?.diskId && inst.status !== 'Undocked') storedOn = inst.diskId
+    }
+    const sourceDiskId = storedOn ?? guessSource
+    const others = [...docked.keys()].filter(id => id !== sourceDiskId && !/system/i.test(id))
+    let targetDiskId: string | null =
+        defaultTarget !== sourceDiskId && docked.has(defaultTarget) ? defaultTarget : null
+    if (!targetDiskId) {
+        targetDiskId = COPY_MOVE_TARGET_PREFERENCE.find(id => others.includes(id)) ?? others[0] ?? null
+    }
+    return {
+        instanceId,
+        sourceDiskId,
+        sourceEngine: docked.get(sourceDiskId) ?? null,
+        targetDiskId,
+        targetEngine: targetDiskId ? (docked.get(targetDiskId) ?? null) : null,
+    }
+}
+
+/**
+ * r30 preflight before move_app / copy_app (live only). Eng 8d98718 moveApp refuses a
+ * target disk on another engine (CopyMoveApp.ts:399-405 — logs "Cross-engine move is not
+ * supported" and returns, no Operation). copyApp supports cross-engine targets (Phase 2:
+ * rsync over SSH + remote startInstance; CopyMoveApp.ts:94-103/197-201), so copy_app only
+ * reports the pair. Throws (move_app) naming both Pis and both disks.
+ */
+export const preflightCopyMoveSamePi = async (
+    ctx: ActionContext,
+    op: 'move_app' | 'copy_app',
+    ids: { instanceId?: string; diskId?: string },
+    env: NodeJS.ProcessEnv = process.env,
+): Promise<string> => {
+    const pair = await predictCopyMovePair(ctx, ids, env)
+    const { instanceId, sourceDiskId, sourceEngine, targetDiskId, targetEngine } = pair
+    if (!sourceEngine) {
+        throw new Error(
+            `${op} preflight: ${instanceId} source disk ${sourceDiskId} is not docked on any pool engine ` +
+                `(store re-read). No soft-pass.`,
+        )
+    }
+    if (!targetDiskId || !targetEngine) {
+        throw new Error(
+            `${op} preflight: no docked target disk ≠ ${sourceDiskId} for ${instanceId} ` +
+                `(store re-read; Console needs ≥2 docked disks). No soft-pass.`,
+        )
+    }
+    for (const e of [sourceEngine, targetEngine]) {
+        if (ctx.excludeEngines.includes(e) || isNeverEngine(e)) {
+            throw new Error(`${op} preflight: ${instanceId} pair touches excluded engine ${e} — never idea02. No soft-pass.`)
+        }
+    }
+    const desc = `${instanceId} on ${sourceEngine} (disk ${sourceDiskId}) -> ${targetDiskId} on ${targetEngine}`
+    if (sourceEngine !== targetEngine) {
+        if (op === 'move_app') {
+            throw new Error(
+                `move_app preflight: cross-engine move ${desc}; Engine refuses cross-engine moveApp ` +
+                    `(Eng 8d98718 CopyMoveApp.ts:399-405 "Cross-engine move is not supported"). ` +
+                    `Co-locate both disks on one Pi first. No soft-pass.`,
+            )
+        }
+        return `${op} preflight: cross-engine copy ${desc} (Eng 8d98718 copyApp Phase 2 supports it)`
+    }
+    return `${op} preflight: same Pi ${desc} (store re-read)`
+}
+
 export type BackupCheckReason =
     | 'ok'
     | 'never_started'
@@ -2056,6 +2167,24 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             return {
                 ok: false,
                 message: `backup_instance aborted before Intent: ${err}`,
+                layer,
+            }
+        }
+    }
+    // r30: move_app must stay on one Pi (Eng refuses cross-engine moveApp); copy_app
+    // reports its pair. Live only (findDockedEngine) — Fake walks skip.
+    if (
+        (ctx.action === 'move_app' || ctx.action === 'copy_app') &&
+        typeof (ctx.opts.ops as FleetOps & { findDockedEngine?: unknown }).findDockedEngine === 'function'
+    ) {
+        try {
+            const note = await preflightCopyMoveSamePi(ctx, ctx.action, { instanceId, diskId })
+            preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${note}` : note
+        } catch (e) {
+            const err = e instanceof Error ? e.message : String(e)
+            return {
+                ok: false,
+                message: `${ctx.action} aborted before Intent: ${err}`,
                 layer,
             }
         }
