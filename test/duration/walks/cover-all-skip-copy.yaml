@@ -1,399 +1,531 @@
-# Deterministic cover-all walk — NOT a Markov graph.
-# Loads states/invariants/fixtures/pool from scenarios/unified.yaml.
-# Covers 90/90 distinct action names (re-enters via return_to_start / layer hubs).
-# Prefer short cycles per layer (usage → operator → infra). Gaps: none — full action coverage.
+# SHAKE-OUT variant (idea#168): skips copy_app @43/@116 and open_copied_instance @117 until the root-owned app-data copy bug (design-root-helper.md) is decided. NOT a cover-all attempt.
+#
+# Derived from walks/cover-all.yaml (same unified graph, EXISTING edges only — loadWalk
+# rejects any step whose from --action--> to edge is not in scenarios/unified.yaml):
+#   variant @1-42    = cover-all @1-42
+#   variant @43      = op_instance --back_to_overview--> op_overview (replaces cover-all
+#                      @43 copy_app + @44 done_redistribute)
+#   variant @44-114  = cover-all @45-115
+#   variant @115-125 = cover-all @118-128 (cover-all @116 copy_app + @117
+#                      open_copied_instance dropped; @115 start_after_install → back_to_disk)
+# Each step carries a "# @N = cover-all @M" comment. The machine-readable mapping is the
+# shake_out block below; loadWalk checks it step-by-step against cover-all.yaml.
+# done_redistribute only exists at cover-all @44, so it is NOT covered either.
 kind: walk
-name: cover-all
+name: cover-all-skip-copy
 graph: unified
+shake_out:
+  variant_of: cover-all
+  reason: root-owned app-data copy bug (design-root-helper.md) undecided — copy_app skipped
+  step_map:
+    - { variant: [1, 42], parent: [1, 42] }
+    - { variant: [44, 114], parent: [45, 115] }
+    - { variant: [115, 125], parent: [118, 128] }
+  substitutes:
+    - { variant: 43, action: back_to_overview, replaces_parent: [43, 44] }
+  not_covered:
+    - { step: 43, action: copy_app }
+    - { step: 44, action: done_redistribute }
+    - { step: 116, action: copy_app }
+    - { step: 117, action: open_copied_instance }
 steps:
+  # @1 = cover-all @1
   - from: start
     to: console_teacher
     action: open_console_as_teacher
+  # @2 = cover-all @2
   - from: console_teacher
     to: kolibri_manage
     action: open_kolibri_as_teacher
+  # @3 = cover-all @3
   - from: kolibri_manage
     to: kolibri_manage
     action: create_class
+  # @4 = cover-all @4
   - from: kolibri_manage
     to: kolibri_manage
     action: enroll_learners
+  # @5 = cover-all @5
   - from: kolibri_manage
     to: kolibri_manage
     action: build_lesson
+  # @6 = cover-all @6
   - from: kolibri_manage
     to: kolibri_manage
     action: create_quiz
+  # @7 = cover-all @7
   - from: kolibri_manage
     to: kolibri_manage
     action: read_reports
+  # @8 = cover-all @8
   - from: kolibri_manage
     to: kolibri_home
     action: preview_as_learner
+  # @9 = cover-all @9
   - from: kolibri_home
     to: kolibri_watching
     action: open_video
+  # @10 = cover-all @10
   - from: kolibri_watching
     to: kolibri_watching
     action: keep_watching
+  # @11 = cover-all @11
   - from: kolibri_watching
     to: kolibri_exercise
     action: next_resource
+  # @12 = cover-all @12
   - from: kolibri_exercise
     to: kolibri_home
     action: finish_exercise
+  # @13 = cover-all @13
   - from: kolibri_home
     to: kolibri_exercise
     action: open_exercise
+  # @14 = cover-all @14
   - from: kolibri_exercise
     to: kolibri_watching
     action: next_video
+  # @15 = cover-all @15
   - from: kolibri_watching
     to: kolibri_home
     action: exit_lesson
+  # @16 = cover-all @16
   - from: kolibri_home
     to: kolibri_home
     action: browse_classes
+  # @17 = cover-all @17
   - from: kolibri_home
     to: console_learner
     action: leave_kolibri
+  # @18 = cover-all @18
   - from: console_learner
     to: kolibri_home
     action: open_kolibri_as_learner
+  # @19 = cover-all @19
   - from: kolibri_home
     to: start
     action: return_to_start
-  # Prefer A cover-all-fd3b210-r11 FAIL@22 — share needs teacher; file-drop needs learner.
+  # @20 = cover-all @20
   - from: start
     to: console_teacher
     action: open_console_as_teacher
+  # @21 = cover-all @21
   - from: console_teacher
     to: nc_browse
     action: open_nextcloud_as_teacher
+  # @22 = cover-all @22
   - from: nc_browse
     to: nc_share
     action: share_to_class
+  # @23 = cover-all @23
   - from: nc_share
     to: nc_browse
     action: done_sharing
+  # @24 = cover-all @24
   - from: nc_browse
     to: console_teacher
     action: leave_nextcloud_as_teacher
+  # @25 = cover-all @25
   - from: console_teacher
     to: start
     action: return_to_start
+  # @26 = cover-all @26
   - from: start
     to: console_learner
     action: open_console_as_learner
+  # @27 = cover-all @27
   - from: console_learner
     to: nc_browse
     action: open_nextcloud_as_learner
+  # @28 = cover-all @28
   - from: nc_browse
     to: nc_drop
     action: open_file_drop
+  # @29 = cover-all @29
   - from: nc_drop
     to: nc_browse
     action: after_upload
+  # @30 = cover-all @30
   - from: nc_browse
     to: nc_collab
     action: open_collab_doc
+  # @31 = cover-all @31
   - from: nc_collab
     to: nc_browse
     action: close_doc
+  # @32 = cover-all @32
   - from: nc_browse
     to: nc_browse
     action: browse_folders
+  # @33 = cover-all @33
   - from: nc_browse
     to: console_learner
     action: leave_nextcloud_as_learner
+  # @34 = cover-all @34
   - from: console_learner
     to: wiki_browse
     action: open_wikipedia_as_learner
+  # @35 = cover-all @35
   - from: wiki_browse
     to: wiki_browse
     action: search_browse_wikipedia
+  # @36 = cover-all @36
   - from: wiki_browse
     to: console_learner
     action: leave_wikipedia_as_learner
+  # @37 = cover-all @37
   - from: console_learner
     to: console_learner
     action: stay_on_learner_overview
+  # @38 = cover-all @38
   - from: console_learner
     to: start
     action: return_to_start
+  # @39 = cover-all @39
   - from: start
     to: op_entry
     action: open_console_as_operator
+  # @40 = cover-all @40
   - from: op_entry
     to: op_overview
     action: sign_in
+  # @41 = cover-all @41
   - from: op_overview
     to: op_disk
     action: open_disk_inventory
+  # @42 = cover-all @42
   - from: op_disk
     to: op_instance
     action: open_instance_controls
+  # @43 = substitute for cover-all @43 copy_app + @44 done_redistribute
   - from: op_instance
-    to: op_copy_move
-    action: copy_app
-  - from: op_copy_move
     to: op_overview
-    action: done_redistribute
+    action: back_to_overview
+  # @44 = cover-all @45
   - from: op_overview
     to: op_eject
     action: eject_disk
+  # @45 = cover-all @46
   - from: op_eject
     to: op_overview
     action: confirm_eject
+  # @46 = cover-all @47
   - from: op_overview
     to: op_account
     action: open_account
+  # @47 = cover-all @48
   - from: op_account
     to: op_account
     action: add_operator
+  # @48 = cover-all @49
   - from: op_account
     to: op_account
     action: remove_operator
+  # @49 = cover-all @50
   - from: op_account
     to: op_account
     action: change_password
+  # @50 = cover-all @51
   - from: op_account
     to: op_overview
     action: close_account
+  # @51 = cover-all @52
   - from: op_overview
     to: op_settings
     action: open_settings
+  # @52 = cover-all @53
   - from: op_settings
     to: op_overview
     action: close_settings
+  # @53 = cover-all @54
   - from: op_overview
     to: op_overview
     action: stay_on_overview
+  # @54 = cover-all @55
   - from: op_overview
     to: op_overview
     action: notice_usb_dock
+  # @55 = cover-all @56
   - from: op_overview
     to: start
     action: return_to_start
+  # @56 = cover-all @57
   - from: start
     to: infra_idle
     action: enter_infra_fleet_walk
+  # @57 = cover-all @58
   - from: infra_idle
     to: infra_docked
     action: infra_dock_fixture
+  # @58 = cover-all @59
   - from: infra_docked
     to: infra_reboot
     action: infra_reboot_engine
+  # @59 = cover-all @60
   - from: infra_reboot
     to: infra_idle
     action: infra_undock_fixtures
+  # @60 = cover-all @61
   - from: infra_idle
     to: infra_docked
     action: infra_dock_fixture
+  # @61 = cover-all @62
   - from: infra_docked
     to: infra_disk_moved
     action: infra_move_disk
+  # @62 = cover-all @63
   - from: infra_disk_moved
     to: start
     action: return_to_start
+  # @63 = cover-all @64
   - from: start
     to: console_teacher
     action: open_console_as_teacher
+  # @64 = cover-all @65
   - from: console_teacher
     to: nc_browse
     action: open_nextcloud_as_teacher
+  # @65 = cover-all @66
   - from: nc_browse
     to: console_teacher
     action: leave_nextcloud_as_teacher
+  # @66 = cover-all @67
   - from: console_teacher
     to: wiki_browse
     action: open_wikipedia_as_teacher
+  # @67 = cover-all @68
   - from: wiki_browse
     to: console_teacher
     action: leave_wikipedia_as_teacher
+  # @68 = cover-all @69
   - from: console_teacher
     to: console_teacher
     action: stay_on_teacher_overview
+  # @69 = cover-all @70
   - from: console_teacher
     to: kolibri_manage
     action: open_kolibri_as_teacher
+  # @70 = cover-all @71
   - from: kolibri_manage
     to: console_teacher
     action: back_to_console
+  # @71 = cover-all @72
   - from: console_teacher
     to: nc_browse
     action: open_nextcloud_as_teacher
+  # @72 = cover-all @73
   - from: nc_browse
     to: nc_share
     action: share_to_class
+  # @73 = cover-all @74
   - from: nc_share
     to: console_teacher
     action: back_to_console_from_share
-  # Prefer A cover-all-aeef795-r12 FAIL@28 / Steve: later block learner before file-drop.
+  # @74 = cover-all @75
   - from: console_teacher
     to: start
     action: return_to_start
+  # @75 = cover-all @76
   - from: start
     to: console_learner
     action: open_console_as_learner
+  # @76 = cover-all @77
   - from: console_learner
     to: nc_browse
     action: open_nextcloud_as_learner
+  # @77 = cover-all @78
   - from: nc_browse
     to: nc_drop
     action: open_file_drop
+  # @78 = cover-all @79
   - from: nc_drop
     to: console_learner
     action: leave_file_drop
+  # @79 = cover-all @80
   - from: console_learner
     to: nc_browse
     action: open_nextcloud_as_learner
+  # @80 = cover-all @81
   - from: nc_browse
     to: nc_collab
     action: open_collab_doc
+  # @81 = cover-all @82
   - from: nc_collab
     to: nc_collab
     action: keep_editing
+  # @82 = cover-all @83
   - from: nc_collab
     to: start
     action: return_to_start
+  # @83 = cover-all @84
   - from: start
     to: op_entry
     action: open_console_as_operator
+  # @84 = cover-all @85
   - from: op_entry
     to: op_entry
     action: retry_login_first_time_setup
+  # @85 = cover-all @86
   - from: op_entry
     to: op_overview
     action: sign_in
+  # @86 = cover-all @87
   - from: op_overview
     to: op_disk
     action: open_disk_inventory
+  # @87 = cover-all @88
   - from: op_disk
     to: op_install
     action: install_app
+  # @88 = cover-all @89
   - from: op_install
     to: op_overview
     action: back_to_overview
+  # @89 = cover-all @90
   - from: op_overview
     to: op_disk
     action: open_disk_inventory
+  # @90 = cover-all @91
   - from: op_disk
     to: op_files
     action: make_files_disk
+  # @91 = cover-all @92
   - from: op_files
     to: op_disk
     action: files_role_added
+  # @92 = cover-all @93
   - from: op_disk
     to: op_files
     action: add_files_role
+  # @93 = cover-all @94
   - from: op_files
     to: op_disk
     action: files_role_added
+  # @94 = cover-all @95
   - from: op_disk
     to: op_backup
     action: make_backup_disk
+  # @95 = cover-all @96
   - from: op_backup
     to: op_disk
     action: backup_configured_restored
-  # r30 (Steve, after cover-all-980e735-r29 FAIL@97): take a real backup before restore —
-  # restore_from_backup needs an archive on the Backup Disk. backup_instance is the
-  # registered Console Intent (InstanceRow Back up); it departs op_instance, so enter
-  # instance controls and come back to the disk (proposal "Backup drill" chain). Harness
-  # asserts backupApp op Done + BACKUP.yaml lastBackup bumped + backups/<id>/config.
+  # @96 = cover-all @97
   - from: op_disk
     to: op_instance
     action: open_instance_controls
+  # @97 = cover-all @98
   - from: op_instance
     to: op_instance
     action: backup_instance
+  # @98 = cover-all @99
   - from: op_instance
     to: op_disk
     action: back_to_disk
+  # @99 = cover-all @100
   - from: op_disk
     to: op_backup
     action: restore_from_backup
+  # @100 = cover-all @101
   - from: op_backup
     to: op_disk
     action: backup_configured_restored
+  # @101 = cover-all @102
   - from: op_disk
     to: op_copy_move
     action: move_app
+  # @102 = cover-all @103
   - from: op_copy_move
     to: op_disk
     action: stay_on_source_disk
+  # @103 = cover-all @104
   - from: op_disk
     to: op_erase
     action: erase_disk
+  # @104 = cover-all @105
   - from: op_erase
     to: op_disk
     action: confirm_erase
+  # @105 = cover-all @106
   - from: op_disk
     to: op_eject
     action: eject_disk
+  # @106 = cover-all @107
   - from: op_eject
     to: op_overview
     action: cancel_eject
+  # @107 = cover-all @108
   - from: op_overview
     to: op_instance
     action: open_instance_controls
+  # @108 = cover-all @109
   - from: op_instance
     to: op_instance
     action: start_instance
+  # @109 = cover-all @110
   - from: op_instance
     to: op_instance
     action: stop_instance
+  # @110 = cover-all @111
   - from: op_instance
     to: op_instance
     action: open_app
+  # @111 = cover-all @112
   - from: op_instance
     to: op_instance
     action: backup_instance
+  # @112 = cover-all @113
   - from: op_instance
     to: op_disk
     action: back_to_disk
+  # @113 = cover-all @114
   - from: op_disk
     to: op_install
     action: install_app
+  # @114 = cover-all @115
   - from: op_install
     to: op_instance
     action: start_after_install
-  - from: op_instance
-    to: op_copy_move
-    action: copy_app
-  - from: op_copy_move
-    to: op_instance
-    action: open_copied_instance
+  # @115 = cover-all @118
   - from: op_instance
     to: op_disk
     action: back_to_disk
+  # @116 = cover-all @119
   - from: op_disk
     to: op_install
     action: install_app
+  # @117 = cover-all @120
   - from: op_install
     to: op_disk
     action: stay_on_disk
+  # @118 = cover-all @121
   - from: op_disk
     to: op_erase
     action: erase_disk
+  # @119 = cover-all @122
   - from: op_erase
     to: op_overview
     action: cancel_erase
+  # @120 = cover-all @123
   - from: op_overview
     to: op_account
     action: open_account
+  # @121 = cover-all @124
   - from: op_account
     to: op_entry
     action: log_out
+  # @122 = cover-all @125
   - from: op_entry
     to: op_overview
     action: sign_in
+  # @123 = cover-all @126
   - from: op_overview
     to: op_settings
     action: open_settings
+  # @124 = cover-all @127
   - from: op_settings
     to: op_settings
     action: switch_engine
+  # @125 = cover-all @128
   - from: op_settings
     to: op_settings
     action: reboot_engine

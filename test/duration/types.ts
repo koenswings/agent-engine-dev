@@ -78,6 +78,10 @@ export interface SemanticDisk {
     name?: string
     dockedTo: string | null
     device?: string | null
+    /** Prefer A r20: make_files_disk post-check (files role landed). */
+    diskTypes?: string[]
+    /** r30: Backup Disk backupConfig.links (instance ids). Not part of convergence equality. */
+    backupLinks?: string[]
 }
 
 export interface SemanticEngine {
@@ -197,6 +201,12 @@ export interface WalkerState {
     /** Engine currently holding the fixture disk, if any. */
     dockedEngine: string | null
     step: number
+    /**
+     * idea#168: true after a successful start_after_install put a running app on
+     * duration-empty-002 (late install); cleared by every fresh empty-002 re-dock.
+     * The next install_app re-docks empty-002 first (redockEmpty002BeforeSecondInstall).
+     */
+    empty002HoldsApp?: boolean
 }
 
 /** One step in a deterministic walk file (kind: walk). */
@@ -219,4 +229,30 @@ export interface WalkDefinition {
     steps: WalkStep[]
     /** Resolved Markov scenario (states, pool, fixtures, …). */
     scenario: Scenario
+    /**
+     * idea#168: set when the walk file has a `shake_out:` block — a labelled variant
+     * of another walk (e.g. cover-all-skip-copy of cover-all). Runs report
+     * shakeOut:true + notCovered; NEVER counts as the parent walk.
+     */
+    shakeOut?: WalkShakeOut
+}
+
+/** Variant step range ↔ parent walk step range (1-based, inclusive, same length). */
+export interface WalkStepRange {
+    variant: [number, number]
+    parent: [number, number]
+}
+
+/** idea#168 shake-out labelling, validated step-by-step against the parent walk. */
+export interface WalkShakeOut {
+    /** Parent walk name (e.g. cover-all). */
+    variantOf: string
+    reason?: string
+    /** Parent walk step count (cover-all: 128). */
+    parentSteps: number
+    stepMap: WalkStepRange[]
+    /** Variant steps that do not exist in the parent (honest substitutes). */
+    substitutes: { variant: number; action: string; replacesParent: number[] }[]
+    /** Parent steps the variant does NOT execute (parent numbering). */
+    notCovered: { step: number; action: string }[]
 }

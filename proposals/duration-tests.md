@@ -1448,6 +1448,7 @@ Authenticated operator Console UI click sequences. Intent-style names only. Prel
 **Enters `op_backup`.**
 
 1. Select Backup Disk → Restore panel → pick instance archive → target App Disk → confirm Restore.
+2. Assert: a `restoreApp` operation ended Done, and the restored instance is Running on the target disk with a container on that Engine. Needs an archive from **Backup instance** first.
 
 #### Backup configured / restored
 
@@ -1466,6 +1467,7 @@ Authenticated operator Console UI click sequences. Intent-style names only. Prel
 
 1. **Move** demanding Kolibri from idea-A disk to idea-B disk (same InstanceID).
 2. Wait `moveApp`; assert backup links intact; source cleaned; catalog still unified.
+3. Precondition: source and target disk are docked on the **same** Engine. `moveApp` refuses cross-engine targets; use **Copy app** for that. The harness re-reads both hosts from the store and fails loud before the Intent.
 
 #### Done redistribute
 
@@ -1511,6 +1513,7 @@ Authenticated operator Console UI click sequences. Intent-style names only. Prel
 
 1. Running (or eligible) instance → **Backup** → pick Backup Disk → `backupApp`.
 2. Watch OperationProgress; cancel only if testing cancel path.
+3. Assert: the `backupApp` operation for that instance ended Done. The Backup Disk now holds an archive for it: BACKUP.yaml `lastBackup` is bumped above its previous value (> 0), and `backups/<InstanceID>/` holds a Borg repo. **Restore from Backup** depends on this.
 
 #### Back to disk
 
@@ -1551,6 +1554,8 @@ Authenticated operator Console UI click sequences. Intent-style names only. Prel
 #### Reboot Engine
 
 1. NetworkTree **Reboot** on a selected Engine (modelled from settings/hub) → wait reconnect → stay in `op_settings` until **Close Settings**.
+2. Before the click, record the Engine's `lastBooted` and its `commands` queue. If a bare command already sits at the queue head, it would never drain and would mask the result, so fail.
+3. Assert: `lastBooted` strictly advances within 10 min (the Console's reboot confirm budget). Afterwards the command queue head is empty (no leftover `reboot`). The Engine reconnects (fresh WS + store settle), and the Console NetworkTree shows its row online with the status bar connected. A dialog that was merely accepted is not a pass.
 
 ---
 

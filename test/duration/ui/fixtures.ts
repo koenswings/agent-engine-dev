@@ -1,6 +1,5 @@
 /**
- * Kid stable fixture / content pins for duration UI Intents (idea#168 / App#10,
- * merged → agent-app-dev main @da291d5a).
+ * Kid stable fixture / content pins for duration UI Intents (idea#168 / App#10).
  * Auth Morango IDs are re-provision mutable — do not hard-fail walks on them.
  * Content IDs (video/exercise/channel) are stable across re-provision.
  */
@@ -10,11 +9,7 @@ export const DURATION_UI_FIXTURES = {
         instanceId: 'kolibri-grade5a-001',
         packPath: 'tests/duration-tests/fixtures/kolibri',
         channelId: '30b6c263-4b96-5a62-93bd-dcf9a5cad7ca',
-        /**
-         * open_video — CONTENT.seeded.json intentResolution (CONTENT.live.json on main
-         * points at the Khan remap; these pins are its syntheticSmokeFallback).
-         * Pass = Learn route /topics/c/<nodeId>; contentId is never in the URL.
-         */
+        /** open_video — CONTENT.seeded / CONTENT.live intentResolution */
         video: {
             contentId: 'e60662de-b15c-52f9-b003-359f7d91f8fd',
             nodeId: '4a1a1b92-3f6d-59eb-a94c-3f91f0011dd5',
@@ -49,9 +44,26 @@ export const DURATION_UI_FIXTURES = {
         packPath: 'tests/duration-tests/fixtures/empty-002',
         preferredDevice: 'idea-test-4',
     },
+    /**
+     * idea#168 r38@103: the Backup Disk under test (make_backup_disk → backup_instance ×2 →
+     * restore_from_backup). A THIRD Empty fixture: cover-all needs a separate Empty disk for
+     * Files (empty-001), Backup (this) and erase + late installs (empty-002). Path A docks it
+     * on idea01 (ext4 loop at idea-test-6); never re-docked by the harness; not an infra disk.
+     */
+    empty3: {
+        diskId: 'duration-empty-003',
+        packPath: 'tests/duration-tests/fixtures/empty-003',
+        preferredDevice: 'idea-test-6',
+    },
+    /** Console#135 @ 198eb69 / Kid App#11 Prefer A Kiwix stub (not infra_disk until Atlas docks). */
+    kiwix: {
+        diskId: 'duration-kiwix-ideaa-001',
+        instanceId: 'kiwix-ideaa-001',
+        packPath: 'tests/duration-tests/fixtures/kiwix',
+    },
 } as const
 
-/** Pixel Console Intent names registered in agent-console-dev#134 e2e/intents (65 @ ba0cfa1). */
+/** Pixel Console Intent names registered in agent-console-dev e2e/intents (85 @ 198eb69; was 76 @ 2da863c). */
 export const PIXEL_REGISTERED_INTENTS = [
     'open_console_as_teacher',
     'open_console_as_learner',
@@ -66,7 +78,38 @@ export const PIXEL_REGISTERED_INTENTS = [
     'open_nextcloud_as_learner',
     'open_video',
     'open_exercise',
-    'next_resource', // Console#135 @ 1a46f20 (e2e/intents/registry.ts:147)
+    // stay on pinned video URL (Console#134 @ 329dc38). No click.
+    'keep_watching',
+    // video → exercise via resource panel (Console#135 @ f16ee18)
+    'next_resource',
+    // exercise → Learn home via Perseus Check (Console#135 @ d087081)
+    'finish_exercise',
+    // exercise → video via resource panel (Console#135 @ a8b4b6c)
+    'next_video',
+    // video/exercise → Learn home via Kolibri chrome (Console#135 @ 549f72b)
+    'exit_lesson',
+    // Nextcloud Class Materials / Drop Zone / Collab (Console#135 @ f150b9e)
+    'browse_folders',
+    // Nextcloud share (Console#135 @ 953af05)
+    'share_to_class',
+    // leave nc_share (Console#135 @ 1709165)
+    'done_sharing',
+    'back_to_console_from_share',
+    // Collab doc Viewer (Console#135 @ 2da863c)
+    'open_collab_doc',
+    'close_doc',
+    // keep_editing on NC Text (Console#135 @ 1bbb729 / tip 198eb69)
+    'keep_editing',
+    // File Drop trio (Console#135 @ 198eb69) — names match cover-all.yaml
+    'open_file_drop',
+    'after_upload',
+    'leave_file_drop',
+    // Wikipedia / Kiwix stub (Console#135 @ 1bbb729 / tip 198eb69) — names match cover-all.yaml
+    'open_wikipedia_as_teacher',
+    'open_wikipedia_as_learner',
+    'search_browse_wikipedia',
+    'leave_wikipedia_as_teacher',
+    'leave_wikipedia_as_learner',
     // Pixel coaching set (Console#134 @ ba0cfa1)
     'create_class',
     'enroll_learners',
@@ -126,39 +169,26 @@ export const PIXEL_REGISTERED_INTENTS = [
 
 export type PixelIntentName = (typeof PIXEL_REGISTERED_INTENTS)[number]
 
-/** Known YAML Intents not in Pixel registry — clear deferred message, never silent. */
-export const DEFERRED_UI_INTENTS = [
-    'keep_watching',
-    'exit_lesson',
-    'open_wikipedia_as_teacher',
-    'open_wikipedia_as_learner',
-] as const
+/** Known YAML Intents not in Pixel registry — clear deferred message, never silent. Empty @ 198eb69 (wiki + File Drop undeferred). */
+export const DEFERRED_UI_INTENTS = [] as const
 
 /**
- * Proposal Intents on unified.yaml still not in Pixel's 65-key registry (@ ba0cfa1).
+ * Proposal Intents on unified.yaml still not in Pixel's 85-key registry (@ 198eb69).
  * StubUiDriver Fake no-ops; live --ui clear-miss until Pixel adapters — do not drop YAML edges.
- * Lesson chrome keep_watching/exit_lesson + open_wikipedia_* live under DEFERRED_UI_INTENTS.
+ * keep_watching is registered (Console#134 @ 329dc38).
+ * next_resource is registered (Console#135 @ f16ee18).
+ * finish_exercise is registered (Console#135 @ d087081).
+ * next_video is registered (Console#135 @ a8b4b6c).
+ * exit_lesson is registered (Console#135 @ 549f72b).
+ * browse_folders is registered (Console#135 @ f150b9e).
+ * share_to_class is registered (Console#135 @ 953af05).
+ * done_sharing / back_to_console_from_share are registered (Console#135 @ 1709165).
+ * open_collab_doc / close_doc are registered (Console#135 @ 2da863c).
+ * keep_editing + Wikipedia open/search/leave are registered (Console#135 @ 1bbb729).
+ * File Drop trio is registered (Console#135 @ 198eb69).
+ * PIXEL_MISSING empty @ 198eb69.
  */
-export const PIXEL_MISSING_INTENTS = [
-    // Kolibri navigation (finish_exercise/next_video not deferred — clear Fake no-op)
-    'finish_exercise',
-    'next_video',
-    // Nextcloud deep
-    'share_to_class',
-    'done_sharing',
-    'back_to_console_from_share',
-    'open_file_drop',
-    'after_upload',
-    'leave_file_drop',
-    'open_collab_doc',
-    'close_doc',
-    'keep_editing',
-    'browse_folders',
-    // Wikipedia leave/search (open_* deferred)
-    'search_browse_wikipedia',
-    'leave_wikipedia_as_learner',
-    'leave_wikipedia_as_teacher',
-] as const
+export const PIXEL_MISSING_INTENTS = [] as const
 
 export const isPixelIntent = (name: string): name is PixelIntentName =>
     (PIXEL_REGISTERED_INTENTS as readonly string[]).includes(name)
@@ -171,10 +201,28 @@ export const isPixelMissingUiIntent = (name: string): boolean =>
 
 /** Resolve default disk/instance for an Intent from Kid pins. */
 export const defaultIdsForIntent = (action: string): { diskId?: string; instanceId?: string } => {
-    if (action.includes('nextcloud')) {
+    if (
+        action.includes('nextcloud') ||
+        action === 'keep_editing' ||
+        action === 'open_collab_doc' ||
+        action === 'close_doc' ||
+        action === 'browse_folders' ||
+        action === 'share_to_class' ||
+        action === 'done_sharing' ||
+        action === 'back_to_console_from_share' ||
+        action === 'open_file_drop' ||
+        action === 'after_upload' ||
+        action === 'leave_file_drop'
+    ) {
         return {
             diskId: DURATION_UI_FIXTURES.nextcloud.diskId,
             instanceId: DURATION_UI_FIXTURES.nextcloud.instanceId,
+        }
+    }
+    if (action.includes('wikipedia') || action.includes('kiwix')) {
+        return {
+            diskId: DURATION_UI_FIXTURES.kiwix.diskId,
+            instanceId: DURATION_UI_FIXTURES.kiwix.instanceId,
         }
     }
     // Prefer A r27: late install / start_after_install target empty-disk install uuid —
@@ -184,6 +232,42 @@ export const defaultIdsForIntent = (action: string): { diskId?: string; instance
             diskId: DURATION_UI_FIXTURES.empty.diskId,
             // omit instanceId → Pixel discovers newly installed non-grade5a start-*
         }
+    }
+    // Prefer A r20 FAIL@92: files / backup EmptyDiskPanel Intents must target the
+    // empty (or Files) disk under test — never hard-code moved Kolibri Grade5A.
+    // files_role_added asserts disk-view / files badge on this id (DURATION_FILES_DISK_ID
+    // after make_files_disk when set by the harness).
+    // Prefer A r22 FAIL@93: add_files_role targets an app-only disk (Add Files on an
+    // Apps DiskView) — DURATION_ADD_FILES_DISK_ID else Kolibri Grade5A (the harness
+    // restores it onto the Console engine first). Never the make_files_disk Files Disk.
+    if (action === 'add_files_role') {
+        return { diskId: process.env.DURATION_ADD_FILES_DISK_ID?.trim() || DURATION_UI_FIXTURES.kolibri.diskId }
+    }
+    if (
+        action === 'make_files_disk' ||
+        action === 'files_role_added' ||
+        action === 'make_backup_disk' ||
+        action === 'restore_from_backup' ||
+        action === 'backup_configured_restored' ||
+        action === 'erase_disk'
+    ) {
+        const filesId = process.env.DURATION_FILES_DISK_ID?.trim()
+        // Prefer A r22: files_role_added asserts the disk that most recently gained files.
+        const lastFilesRole = process.env.DURATION_LAST_FILES_ROLE_DISK_ID?.trim()
+        if (action === 'files_role_added' && lastFilesRole) {
+            return { diskId: lastFilesRole }
+        }
+        if (
+            filesId &&
+            (action === 'files_role_added' ||
+                action === 'backup_configured_restored' ||
+                action === 'restore_from_backup')
+        ) {
+            return { diskId: filesId }
+        }
+        const emptyId =
+            process.env.DURATION_EMPTY_DISK_ID?.trim() || DURATION_UI_FIXTURES.empty.diskId
+        return { diskId: emptyId }
     }
     if (
         action.includes('kolibri') ||

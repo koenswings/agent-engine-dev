@@ -5,7 +5,7 @@
  * Fail the walk after `failAfter` consecutive probe failures (default 3),
  * except for a docker-missing anomaly, which aborts on its first failure.
  */
-import type { FleetOps, SemanticStoreView } from './types.js'
+import type { FleetOps, SemanticDisk, SemanticInstance, SemanticStoreView } from './types.js'
 
 export interface StabilityProbeSample {
     ts: string
@@ -23,9 +23,9 @@ export interface StabilityProbeOptions {
     failAfter: number
     /** Total dwell window for this inter-transition gap. */
     dwellMs: number
-    /** Action that just completed; move/copy get a docker settle grace period. */
+    /** Action that just completed; move/copy and confirm_eject get a docker settle grace period. */
     justCompletedAction?: string
-    /** Maximum time to wait for docker/status convergence after move/copy. */
+    /** Maximum time to wait for docker/status convergence after move/copy or confirm_eject. */
     dockerMissingSettleMs?: number
     onProbe?: (sample: StabilityProbeSample) => void
 }
@@ -49,17 +49,42 @@ export const isDockerMissingProbeFailure = (sample: StabilityProbeSample): boole
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
 
-const MOVE_COPY_ACTIONS = new Set(['move_app', 'copy_app', 'infra_move_disk'])
+/**
+ * Actions whose container can be gone while Automerge still says Running.
+ * The docker-missing settle window covers move_app, copy_app, infra_move_disk,
+ * and confirm_eject (container gone, store still Running). Not eject_disk
+ * (dialog only; container still up).
+ */
+// Prefer A r22: add_files_role may restore Kolibri onto the Console engine (moveDisk).
+const MOVE_COPY_ACTIONS = new Set(['move_app', 'copy_app', 'infra_move_disk', 'confirm_eject', 'add_files_role'])
 export const DEFAULT_DOCKER_MISSING_SETTLE_MS = 90_000
 export const FAST_DOCKER_MISSING_SETTLE_MS = 1_000
+/** confirm_eject stops the container before status leaves Running; --fast's 1s window is too short. */
+export const CONFIRM_EJECT_MIN_DOCKER_MISSING_SETTLE_MS = 15_000
 
 const isMoveOrCopy = (action: string | undefined): boolean =>
     action !== undefined && MOVE_COPY_ACTIONS.has(action)
 
 /**
+ * Whether a Running instance should still have a local container on this engine.
+ * Undocked disks (dockedTo null) and disks docked to another engine do not.
+ * A null diskId or a missing disk row stays conservative: still expect docker.
+ */
+export const runningInstanceExpectsLocalDocker = (
+    instance: Pick<SemanticInstance, 'diskId'>,
+    diskDB: Record<string, Pick<SemanticDisk, 'dockedTo'> | undefined>,
+    engineId: string,
+): boolean => {
+    if (!instance.diskId) return true
+    const disk = diskDB[instance.diskId]
+    if (!disk) return true
+    return disk.dockedTo === engineId
+}
+
+/**
  * Return true while an instance named by a docker-missing sample still claims
  * Running/Starting. Missing or otherwise transitioned instances are no longer
- * ghost Running states, so the post-move grace period may end.
+ * ghost Running states, so the post-move / confirm_eject grace period may end.
  */
 const missingInstancesStillActive = async (
     opts: StabilityProbeOptions,
@@ -190,10 +215,10 @@ export const runStabilityDuringDwell = async (
         return { ok: true, samples, consecutiveFailures: 0 }
     }
 
-    // A move/copy can briefly stop/recreate its source container while the
-    // Automerge instance status still says Running. Give that one transition
-    // an independent settle window; all later docker-missing samples remain
-    // hard failures.
+    // A move/copy or confirm_eject can briefly remove its container while the
+    // Automerge instance status still says Running (confirm_eject: container
+    // gone, store still Running). Give that one transition an independent
+    // settle window; all later docker-missing samples remain hard failures.
     const allowMoveCopySettle = isMoveOrCopy(opts.justCompletedAction)
     const settleMs = opts.dockerMissingSettleMs ?? DEFAULT_DOCKER_MISSING_SETTLE_MS
     let moveCopySettled = false

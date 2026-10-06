@@ -33,6 +33,114 @@ export const semanticStoresEqual = (a: SemanticStoreView, b: SemanticStoreView):
     return true
 }
 
+const fmtVal = (v: unknown): string => {
+    if (v === undefined) return '<absent>'
+    if (v === null) return 'null'
+    if (v === '') return '""'
+    return String(v)
+}
+
+/**
+ * Field-level dump of semantic divergences across Engine views.
+ * Format: `db id=<id> field=<field> <engineId>=<val> …`
+ */
+export const formatSemanticDivergence = (views: SemanticStoreView[]): string => {
+    if (views.length < 2) {
+        return 'semantic fields diverge (need ≥2 views)'
+    }
+
+    const lines: string[] = []
+    const engineLabel = (v: SemanticStoreView): string => v.engineId
+
+    const allIds = (pick: (v: SemanticStoreView) => Record<string, unknown>): string[] => {
+        const ids = new Set<string>()
+        for (const v of views) {
+            for (const id of Object.keys(pick(v))) ids.add(id)
+        }
+        return [...ids].sort()
+    }
+
+    const pushFieldDiff = (
+        db: string,
+        id: string,
+        field: string,
+        values: { engine: string; value: unknown }[],
+    ): void => {
+        const rendered = values.map(x => `${x.engine}=${fmtVal(x.value)}`).join(' ')
+        const distinct = new Set(values.map(x => fmtVal(x.value)))
+        if (distinct.size <= 1) return
+        lines.push(`${db} id=${id} field=${field} ${rendered}`)
+    }
+
+    for (const id of allIds(v => v.instanceDB)) {
+        const presence = views.map(v => ({
+            engine: engineLabel(v),
+            value: v.instanceDB[id] ? 'present' : 'absent',
+        }))
+        pushFieldDiff('instanceDB', id, '<presence>', presence)
+        if (presence.every(p => p.value === 'absent')) continue
+        if (presence.some(p => p.value === 'absent')) continue // presence line covers it
+        for (const field of ['status', 'diskId', 'name'] as const) {
+            pushFieldDiff(
+                'instanceDB',
+                id,
+                field,
+                views.map(v => ({
+                    engine: engineLabel(v),
+                    value: v.instanceDB[id]?.[field],
+                })),
+            )
+        }
+    }
+
+    for (const id of allIds(v => v.diskDB)) {
+        const presence = views.map(v => ({
+            engine: engineLabel(v),
+            value: v.diskDB[id] ? 'present' : 'absent',
+        }))
+        pushFieldDiff('diskDB', id, '<presence>', presence)
+        if (presence.every(p => p.value === 'absent')) continue
+        if (presence.some(p => p.value === 'absent')) continue
+        for (const field of ['dockedTo', 'name', 'device'] as const) {
+            pushFieldDiff(
+                'diskDB',
+                id,
+                field,
+                views.map(v => ({
+                    engine: engineLabel(v),
+                    value: v.diskDB[id]?.[field],
+                })),
+            )
+        }
+    }
+
+    for (const id of allIds(v => v.engineDB)) {
+        const presence = views.map(v => ({
+            engine: engineLabel(v),
+            value: v.engineDB[id] ? 'present' : 'absent',
+        }))
+        pushFieldDiff('engineDB', id, '<presence>', presence)
+        if (presence.every(p => p.value === 'absent')) continue
+        if (presence.some(p => p.value === 'absent')) continue
+        for (const field of ['hostname'] as const) {
+            pushFieldDiff(
+                'engineDB',
+                id,
+                field,
+                views.map(v => ({
+                    engine: engineLabel(v),
+                    value: v.engineDB[id]?.[field],
+                })),
+            )
+        }
+    }
+
+    if (lines.length === 0) {
+        return 'semantic fields diverge (no field-level diff found)'
+    }
+    return `semantic fields diverge: ${lines.join('; ')}`
+}
+
 export interface ConvergenceResult {
     ok: boolean
     elapsedMs: number
@@ -87,10 +195,11 @@ export const waitForConvergence = async (
     }
 
     const views = await Promise.all(engineIds.map(id => ops.readStore(id)))
+    const dump = formatSemanticDivergence(views)
     return {
         ok: false,
         elapsedMs: Date.now() - start,
-        reason: `stores did not converge within ${timeoutMs}ms across [${engineIds.join(', ')}]`,
+        reason: `stores did not converge within ${timeoutMs}ms across [${engineIds.join(', ')}]: ${dump}`,
         views,
     }
 }
