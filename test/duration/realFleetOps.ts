@@ -7,6 +7,9 @@
  * Defaults (Atlas-approved): /home/pi/idea/duration-disks + duration-watch.
  * idea#168 r34@70: app-pack trees must carry their instance data before a dock with instances
  * started (LOUD otherwise), and moveDisk carries the source disk's real tree to the target.
+ * idea#168 r35@62: a fixture slot whose paths resolve OUTSIDE the slot (symlinks) is refused
+ * LOUDLY (dock + move), and moveDisk refuses while any foreign running container mounts data
+ * inside the source slot (never stops it).
  * NEVER /disks, NEVER /dev/engine, NEVER idea03 sdb1, NEVER golden idea02.
  *
  * Connection helpers are inlined (adapted from test/cross-engine/remoteClient.ts)
@@ -532,7 +535,7 @@ export type AppPackInstanceData = {
     describe: string
     /**
      * idea#168 r35@62: slot-relative dirs whose CONTENTS are throwaway and are NOT carried by
-     * moveDisk (left out of the slot tar, the external-link tar and the digest on both sides);
+     * moveDisk (left out of the slot tar and the digest on both sides);
      * each is recreated EMPTY on the target (source mode/owner when the source dir can be
      * stat'ed and chown'ed, else 1777). Kolibri: Django file sessions, root 0600 per login —
      * unreadable as pi without sudo -n; the walk logs in again after the move.
@@ -597,8 +600,8 @@ const KOLIBRI_DB_PROBE_PY = [
 /**
  * Remote bash that checks an app pack's instance data under `root` (a slot or a seed pack).
  * Always exits 0 and prints exactly one line: `INSTANCE_DATA_OK <detail>` or
- * `INSTANCE_DATA_MISSING <what>`. Follows symlinks (Path A links data/kolibri to
- * /home/pi/idea166-kolibri-live/data/kolibri on idea01).
+ * `INSTANCE_DATA_MISSING <what>`. Follows symlinks, but since idea#168 r35@62 a slot with a
+ * symlink that resolves outside it is refused before this check runs (buildSlotLinkScanRemote).
  */
 export const buildInstanceDataCheckRemote = (args: {
     root: string
@@ -664,9 +667,107 @@ const findPruneExpr = (paths: readonly string[]): string =>
     paths.length ? `\\( ${paths.map(p => `-path ${shq(p)}`).join(' -o ')} \\) -prune -o ` : ''
 
 /**
- * Source-side move plan (read-only): mount point?, instance ids, and every symlink in the
- * tree that resolves OUTSIDE the slot (Path A: data/kolibri → idea166-kolibri-live). Those
- * are materialized on the target — a real disk carries its data, not a host-local link.
+ * idea#168 r35@62 — read-only scan of a fixture slot for symlinks that resolve OUTSIDE the slot
+ * (r35: Path A idea01 idea-test-1/instances/kolibri-grade5a-001/data/kolibri →
+ * /home/pi/idea166-kolibri-live/data/kolibri). A real IDEA disk carries its data inside the disk:
+ * no Engine product path (install, copy_app, move_app, app pack layout) creates a link out of
+ * the disk, and the Engine's copy_app (rsync -a) copies such a link verbatim, so a copy would
+ * share the original's live data (r35@62: the @43 copy wrote the shared Kolibri DB while @62
+ * tarred it). Prints `LINK_OUT <rel>\t<raw link text>\t<resolved>` per offending link, then
+ * `LINKS_END`; `LINKS_ERR <why>` when the slot cannot be scanned. Unreadable subdirs (root 0700)
+ * are skipped by find (stderr dropped); skip dirs are pruned. readlink -m: a dangling link is
+ * judged by where it points (inside → left to the move plan's dangling check; outside → refused).
+ */
+export const buildSlotLinkScanRemote = (slot: string, sudoMode: SudoMode, skipDirs: readonly string[] = []): string => [
+    sudoPreamble(sudoMode),
+    `s=${shq(slot)}`,
+    `if ! test -d "$s"; then echo "LINKS_ERR slot $s missing"; exit 0; fi`,
+    `sc=$(readlink -f -- "$s")`,
+    `cd "$s" || { echo "LINKS_ERR cannot cd $s"; exit 0; }`,
+    `$S find . ${findPruneExpr(skipDirs.map(r => `./${r}`))}-type l -print0 2>/dev/null | while IFS= read -r -d '' l; do rel=\${l#./}; ` +
+    `raw=$($S readlink -- "$l" 2>/dev/null || true); r=$($S readlink -m -- "$l" 2>/dev/null || true); ` +
+    `case "$r" in "$sc"|"$sc"/*) ;; *) printf 'LINK_OUT %s\\t%s\\t%s\\n' "$rel" "$raw" "\${r:-unresolvable}";; esac; done`,
+    `echo LINKS_END`,
+].join('; ')
+
+export type SlotLinkScan = { error: string | null; outside: { rel: string; raw: string; target: string }[] }
+
+export const parseSlotLinkScan = (out: string): SlotLinkScan => {
+    const scan: SlotLinkScan = { error: null, outside: [] }
+    let ended = false
+    for (const raw of String(out ?? '').split('\n')) {
+        const l = raw.replace(/\r$/, '')
+        if (l.startsWith('LINKS_ERR ')) scan.error = l.slice(10).trim()
+        else if (l.startsWith('LINK_OUT ')) {
+            const [rel, link, target] = l.slice(9).split('\t')
+            if (rel) scan.outside.push({ rel, raw: link ?? '', target: target ?? 'unresolvable' })
+        } else if (l === 'LINKS_END') ended = true
+    }
+    if (!scan.error && !ended) scan.error = `link scan incomplete (${String(out ?? '').trim().slice(-200) || 'no output'})`
+    return scan
+}
+
+/**
+ * idea#168 r35@62 — read-only: every running container on the host whose bind/volume mount
+ * source lies inside one of `roots` (taken literally AND after readlink -f, on both sides, so a
+ * mount through a symlink that lands in the slot is caught, e.g. a zombie copy whose
+ * data/kolibri links into the source's data). Prints
+ * `MOUNT_HIT <container>\t<mount source>\t<resolved>` per hit, then `MOUNT_SCAN_END`;
+ * `MOUNT_SCAN_ERR <why>` when docker cannot be asked (then nobody can vouch the data is quiet).
+ * Only `docker ps -q` and `docker inspect` — never stops, kills or removes anything.
+ */
+export const buildMountScanRemote = (roots: readonly string[]): string => [
+    `roots=()`,
+    ...roots.map(r => `roots+=(${shq(r)}); x=$(readlink -f -- ${shq(r)} 2>/dev/null || true); if [ -n "$x" ]; then roots+=("$x"); fi`),
+    `if ! ids=$(docker ps -q 2>&1); then echo "MOUNT_SCAN_ERR docker ps failed: $(printf %s "$ids" | tr '\\n' ' ' | cut -c1-200)"; exit 0; fi`,
+    `if [ -n "$ids" ]; then printf '%s\\n' $ids | xargs -r docker inspect --format '{{$n := .Name}}{{range .Mounts}}{{$n}}{{"\\t"}}{{.Source}}{{println}}{{end}}' 2>/dev/null | ` +
+    `while IFS=$'\\t' read -r n src; do if [ -z "$src" ]; then continue; fi; r=$(readlink -f -- "$src" 2>/dev/null || true); if [ -z "$r" ]; then r="$src"; fi; ` +
+    `for root in "\${roots[@]}"; do hit=; case "$src" in "$root"|"$root"/*) hit=1;; esac; case "$r" in "$root"|"$root"/*) hit=1;; esac; ` +
+    `if [ -n "$hit" ]; then printf 'MOUNT_HIT %s\\t%s\\t%s\\n' "\${n#/}" "$src" "$r"; break; fi; done; done; fi`,
+    `echo MOUNT_SCAN_END`,
+].join('; ')
+
+export type MountHit = { container: string; source: string; resolved: string }
+
+export const parseMountScan = (out: string): { error: string | null; hits: MountHit[] } => {
+    const res: { error: string | null; hits: MountHit[] } = { error: null, hits: [] }
+    let ended = false
+    for (const raw of String(out ?? '').split('\n')) {
+        const l = raw.replace(/\r$/, '')
+        if (l.startsWith('MOUNT_SCAN_ERR')) res.error = l.slice(14).trim() || 'docker unavailable'
+        else if (l.startsWith('MOUNT_HIT ')) {
+            const [container, source, resolved] = l.slice(10).split('\t')
+            if (container && source) {
+                if (!res.hits.some(h => h.container === container && h.source === source)) {
+                    res.hits.push({ container, source, resolved: resolved || source })
+                }
+            }
+        } else if (l === 'MOUNT_SCAN_END') ended = true
+    }
+    if (!res.error && !ended) res.error = `mount scan incomplete (${String(out ?? '').trim().slice(-200) || 'no output'})`
+    return res
+}
+
+/** A container belongs to one of the disk's own instances when its compose name is `<instanceId>-…`. */
+export const isOwnInstanceContainer = (container: string, instanceIds: readonly string[]): boolean =>
+    instanceIds.some(id => container.startsWith(`${id}-`))
+
+export const describeMountHits = (hits: readonly MountHit[]): string =>
+    hits.map(h => `${h.container} mounts ${h.source}${h.resolved !== h.source ? ` (→ ${h.resolved})` : ''}`).join('; ')
+
+/**
+ * idea#168 r35@62 — target: remove the staging dir of a failed move and SAY whether it is gone
+ * (`STAGING_GONE` / `STAGING_LEFT <ls>`), instead of assuming the rm worked.
+ */
+export const buildStagingCleanupRemote = (staging: string, sudoMode: SudoMode): string =>
+    `${sudoPreamble(sudoMode)}; $S rm -rf ${shq(staging)} 2>/dev/null; ` +
+    `if test -e ${shq(staging)} || test -L ${shq(staging)}; then echo "STAGING_LEFT $($S ls -ld ${shq(staging)} 2>&1 | head -c 200)"; else echo STAGING_GONE; fi`
+
+/**
+ * Source-side move plan (read-only): mount point?, instance ids, dangling links, and every
+ * symlink in the tree that resolves OUTSIDE the slot. idea#168 r35@62: such links are REFUSED
+ * (never materialized — b40b8a0's materialization is gone); hasHealthyFixtureTree refuses them
+ * first, the plan re-checks right before the eject.
  */
 export const buildMovePlanRemote = (slot: string, sudoMode: SudoMode, skipDirs: readonly string[] = []): string => [
     sudoPreamble(sudoMode),
@@ -728,14 +829,13 @@ export const isSafeAbsPath = (p: string): boolean => p.startsWith('/') && isSafe
 /**
  * idea#168 r35@62: unanchored tar pattern for a skip dir — its last two path segments
  * ('instances/…/data/kolibri/sessions' → 'kolibri/sessions'). GNU tar --exclude is unanchored
- * by default (matches after any '/'), so one pattern hits both the slot stream
- * (./instances/…/data/kolibri/sessions) and the external-link stream, whose members are named
- * after the link target's basename (kolibri/sessions). Excluding the dir entry means tar never
- * opens it (works for a root 0700 dir with root 0600 files as pi).
+ * by default (matches after any '/'), so it hits ./instances/…/data/kolibri/sessions in the
+ * slot stream. Excluding the dir entry means tar never opens it (works for a root 0700 dir with
+ * root 0600 files as pi).
  */
 export const skipDirTarPattern = (rel: string): string => rel.split('/').slice(-2).join('/')
 
-/** Source: stream the slot tree (tar, owners/modes kept) minus the external links and skip dirs. */
+/** Source: stream the slot tree (tar, owners/modes kept) minus `excludeRels` and the skip dirs. */
 export const buildTreeSendRemote = (slot: string, excludeRels: string[], sudoMode: SudoMode, skipPatterns: readonly string[] = []): string =>
     `${sudoPreamble(sudoMode)}; cd ${shq(slot)} && $S tar --numeric-owner -cpf - ` +
     excludeRels.map(r => `--exclude=${shq(`./${r}`)} `).join('') +
@@ -746,46 +846,10 @@ export const buildTreeReceiveRemote = (staging: string, sudoMode: SudoMode): str
     `set -euo pipefail; ${sudoPreamble(sudoMode)}; $S rm -rf ${shq(staging)}; mkdir -p ${shq(staging)}; ` +
     `$S tar --numeric-owner -xpf - -C ${shq(staging)}`
 
-/** Source: stream the data an external symlink points at (dir or file), by its own name, minus skip dirs. */
-export const buildExtLinkSendRemote = (target: string, sudoMode: SudoMode, skipPatterns: readonly string[] = []): string => {
-    const cut = target.lastIndexOf('/')
-    const dir = cut <= 0 ? '/' : target.slice(0, cut)
-    const base = target.slice(cut + 1)
-    return `${sudoPreamble(sudoMode)}; $S tar --numeric-owner -cpf - ` +
-        skipPatterns.map(p => `--exclude=${shq(p)} `).join('') + `-C ${shq(dir)} ${shq(base)}`
-}
-
 /**
- * Tar patterns for the external-link stream of link `rel` → `target`: the unanchored tails plus,
- * when the target's basename differs from the link's own name, the skip dir re-rooted at the
- * target basename (so a link named data/kolibri → …/kolibri-live still excludes its sessions).
- */
-export const extLinkSkipPatterns = (rel: string, target: string, skipDirs: readonly string[]): string[] => {
-    const base = target.slice(target.lastIndexOf('/') + 1)
-    const out = skipDirs.map(skipDirTarPattern)
-    for (const d of skipDirs) {
-        if (d.startsWith(`${rel}/`)) {
-            const p = `${base}${d.slice(rel.length)}`
-            if (!out.includes(p)) out.push(p)
-        }
-    }
-    return out
-}
-
-/** Target: unpack an external link's data and place it at <staging>/<rel> as real data. */
-export const buildExtLinkReceiveRemote = (staging: string, rel: string, target: string, sudoMode: SudoMode): string => {
-    const base = target.slice(target.lastIndexOf('/') + 1)
-    const parent = rel.includes('/') ? rel.slice(0, rel.lastIndexOf('/')) : ''
-    return `set -euo pipefail; ${sudoPreamble(sudoMode)}; t=$(mktemp -d ${shq(`${staging}/.extlink.XXXXXX`)}); ` +
-        `$S tar --numeric-owner -xpf - -C "$t"; ` +
-        (parent ? `$S mkdir -p ${shq(`${staging}/${parent}`)}; ` : '') +
-        `$S rm -rf ${shq(`${staging}/${rel}`)}; $S mv "$t"/${shq(base)} ${shq(`${staging}/${rel}`)}; $S rmdir "$t"`
-}
-
-/**
- * Content digest of a tree, following symlinks (so a source whose data sits behind an external
- * link digests the same as the target where it was materialized): file count, sha256 over the
- * sorted per-file sha256 list, and the sha256 of the pack's key instance file (db.sqlite3).
+ * Content digest of a tree (find -L: in-slot links are followed the same way on both sides;
+ * links out of the slot are refused before a move): file count, sha256 over the sorted per-file
+ * sha256 list, and the sha256 of the pack's key instance file (db.sqlite3).
  */
 export const buildTreeDigestRemote = (root: string, keyFile: string | null, sudoMode: SudoMode, skipPatterns: readonly string[] = []): string => {
     // idea#168 r35@62: skip dirs (Kolibri sessions) pruned on BOTH sides — never descended.
@@ -843,7 +907,7 @@ export const buildCommitMovedTreeRemote = (staging: string, dest: string, sudoMo
 /**
  * Source: the disk has left this host. Rename the slot out of the idea-test-N namespace into
  * <disksRoot>/.moved-away/ (a rename: works as the ssh user even over docker-owned files; the
- * Engine and the slot scan never look there). Data behind external links is left untouched.
+ * Engine and the slot scan never look there).
  */
 export const buildQuarantineSourceRemote = (slot: string, quarantine: string): string => {
     const qroot = quarantine.slice(0, quarantine.lastIndexOf('/'))
@@ -1890,11 +1954,19 @@ export class RealFleetOps implements FleetOps {
      * throws, naming host, path, diskId and what is missing — never silently reused, never
      * silently refreshed from the seed pack. Two slots with the same diskId also throw.
      * `requireInstanceData: false` (read-only probes, dock-only smoke) checks META only.
+     *
+     * idea#168 r35@62 — LOUD: a slot with any path (app data or anything else) that is a symlink
+     * resolving OUTSIDE the slot is refused, naming host, link, target and diskId. A real IDEA
+     * disk carries its data inside the disk; Engine copy_app copies such a link verbatim and the
+     * copy then shares the original's live data (r35: copy y3zvlf9ug1t8wgod3uu wrote the Grade5A
+     * DB during @62's tar). This REPLACES b40b8a0's "materialize external links on move".
+     * `refuseExternalLinks: false` only for the read-only probes (they change nothing, and a slot
+     * they look at was link-checked when it was docked).
      */
     private async hasHealthyFixtureTree(
         engineId: string,
         diskId: string,
-        opts: { requireInstanceData?: boolean } = {},
+        opts: { requireInstanceData?: boolean; refuseExternalLinks?: boolean } = {},
     ): Promise<string | null> {
         const host = this.hostOf(engineId)
         const slots = await this.scanFixtureSlots(engineId, diskId)
@@ -1909,6 +1981,9 @@ export class RealFleetOps implements FleetOps {
         }
         const device = matches[0]!
         const spec = appPackInstanceData(diskId)
+        if (opts.refuseExternalLinks ?? true) {
+            await this.assertNoExternalLinks(engineId, `${this.disksRoot}/${device}`, diskId, spec?.moveSkipDirs ?? [])
+        }
         const require = opts.requireInstanceData ?? (this.startInstances && spec !== null)
         if (require && spec) {
             const dest = `${this.disksRoot}/${device}`
@@ -1927,6 +2002,62 @@ export class RealFleetOps implements FleetOps {
         this.deviceMap(engineId).set(diskId, device)
         this.usedSet(engineId).add(device)
         return device
+    }
+
+    /**
+     * idea#168 r35@62: LOUD refusal of a slot holding symlinks that resolve outside it (see
+     * hasHealthyFixtureTree). Also refuses when the slot cannot be scanned (no silent pass).
+     */
+    private async assertNoExternalLinks(engineId: string, slot: string, diskId: string, skipDirs: readonly string[]): Promise<void> {
+        const host = this.hostOf(engineId)
+        let scan: SlotLinkScan
+        try {
+            scan = parseSlotLinkScan(await this.ssh(host, buildSlotLinkScanRemote(slot, this.sudoMode, skipDirs)))
+        } catch (e) {
+            scan = { error: `link scan failed over SSH: ${e instanceof Error ? e.message : String(e)}`, outside: [] }
+        }
+        if (scan.error) {
+            throw new Error(
+                `RealFleetOps: refuse fixture tree ${engineId}:${slot} (host ${host}) for ${diskId}: cannot verify that ` +
+                    `no symlink in the slot resolves outside it — ${scan.error}. No silent pass.`,
+            )
+        }
+        if (scan.outside.length) {
+            throw new Error(
+                `RealFleetOps: refuse fixture tree ${engineId}:${slot} (host ${host}) for ${diskId}: ` +
+                    `${scan.outside.length} symlink(s) resolve OUTSIDE the slot — ` +
+                    scan.outside.map(l => `${slot}/${l.rel} → ${l.target}${l.raw && l.raw !== l.target ? ` (link text '${l.raw}')` : ''}`).join('; ') +
+                    `. A real IDEA disk carries its data inside the disk (no Engine install/copy_app/move_app path ` +
+                    `creates such a link); Engine copy_app would copy the link and the copy would share this live data ` +
+                    `(idea#168 r35@62). Replace each link with the real data inside the slot (Path A), then re-run. ` +
+                    `Not materialized, not followed.`,
+            )
+        }
+    }
+
+    /**
+     * idea#168 r35@62: running containers on engineId with a mount inside `roots` that are NOT
+     * one of `ownInstances` (compose `<instanceId>-…`). Read-only; throws when docker cannot be
+     * asked (nobody can vouch the data is quiet).
+     */
+    private async foreignMountHits(engineId: string, roots: readonly string[], ownInstances: readonly string[]): Promise<{ foreign: MountHit[]; own: MountHit[] }> {
+        const host = this.hostOf(engineId)
+        let res: { error: string | null; hits: MountHit[] }
+        try {
+            res = parseMountScan(await this.ssh(host, buildMountScanRemote(roots)))
+        } catch (e) {
+            res = { error: `mount scan failed over SSH: ${e instanceof Error ? e.message : String(e)}`, hits: [] }
+        }
+        if (res.error) {
+            throw new Error(
+                `cannot list the running containers' mounts on ${engineId} (${host}) — ${res.error}. Cannot verify that ` +
+                    `no other container uses ${roots.join(', ')}; refusing (no silent pass).`,
+            )
+        }
+        return {
+            foreign: res.hits.filter(h => !isOwnInstanceContainer(h.container, ownInstances)),
+            own: res.hits.filter(h => isOwnInstanceContainer(h.container, ownInstances)),
+        }
     }
 
     /** Allocate idea-test-N on this engine for diskId (stable if already assigned). */
@@ -2015,7 +2146,7 @@ export class RealFleetOps implements FleetOps {
     ): Promise<{ device: string; dest: string; fsType: string } | null> {
         this.assertNotExcluded(engineId, 'probeFixtureFsType')
         const device = this.deviceMap(engineId).get(diskId)
-            ?? (await this.hasHealthyFixtureTree(engineId, diskId, { requireInstanceData: false }))
+            ?? (await this.hasHealthyFixtureTree(engineId, diskId, { requireInstanceData: false, refuseExternalLinks: false }))
         if (!device || !/^idea-test-[0-9]+$/.test(device)) return null
         const dest = `${this.disksRoot}/${device}`
         const out = await this.ssh(this.hostOf(engineId), `findmnt -no FSTYPE '${dest}' || true`)
@@ -2033,7 +2164,7 @@ export class RealFleetOps implements FleetOps {
     ): Promise<{ dest: string; entries: string[] } | null> {
         this.assertNotExcluded(engineId, 'probeFixtureRootEntries')
         const device = this.deviceMap(engineId).get(diskId)
-            ?? (await this.hasHealthyFixtureTree(engineId, diskId, { requireInstanceData: false }))
+            ?? (await this.hasHealthyFixtureTree(engineId, diskId, { requireInstanceData: false, refuseExternalLinks: false }))
         if (!device || !/^idea-test-[0-9]+$/.test(device)) return null
         const dest = `${this.disksRoot}/${device}`
         const out = await this.ssh(this.hostOf(engineId), `ls -1A '${dest}' 2>/dev/null || true`)
@@ -2327,25 +2458,56 @@ export class RealFleetOps implements FleetOps {
      * idea#168 r34@70: the real-disk move for app packs. Order (every check that can refuse
      * runs before anything changes):
      *  1. source tree: the one idea-test-N on fromEngine with this diskId AND its instance data
-     *     (hasHealthyFixtureTree — loud if stale); not a mount point; no dangling links.
+     *     (hasHealthyFixtureTree — loud if stale); no symlink resolving outside the slot
+     *     (idea#168 r35@62: refused, never materialized); not a mount point; no dangling links.
      *  2. target: no tree with this diskId already (a stale duplicate is refused, never reused);
      *     a free idea-test-1..8 slot.
+     *  2b. idea#168 r35@62 preflight: no running container on fromEngine OTHER than the disk's own
+     *     instances (which the eject stops) has a mount that resolves inside the source slot
+     *     (docker inspect). Else refuse BEFORE the eject, naming container(s) and path(s). Never
+     *     stops a foreign container.
      *  3. eject on fromEngine (ejectDisk + sentinel removed), wait until undocked AND the
      *     instance containers are gone (the Engine stops them after clearing dockedTo; never copy
      *     a live DB).
-     *  4. stream the tree source → target staging through the walker (tar, owners/modes kept);
-     *     data behind symlinks that leave the slot (Path A data/kolibri → idea166-kolibri-live)
-     *     is materialized as real data on the target.
+     *  3b. idea#168 r35@62 quiescence: re-scan after the eject — NO running container may mount
+     *     anything inside the slot any more; else refuse before the tar (source left ejected).
+     *  4. stream the slot source → target staging through the walker (tar, owners/modes kept).
+     *     tar "file changed as we read it" (exit 1) stays a failure.
      *  5. verify: per-file content digest of source == staging, incl. sha256 of the key file
      *     (Kolibri db.sqlite3). Mismatch → staging removed, source left intact, loud.
      *     idea#168 r35@62: the pack's moveSkipDirs (Kolibri data/kolibri/sessions: root 0600
-     *     Django session files, unreadable as pi) are left out of both tars and both digests,
+     *     Django session files, unreadable as pi) are left out of the tar and both digests,
      *     then recreated EMPTY in staging (source mode/owner, else 1777).
      *  6. commit staging → slot on the target; re-check instance data there.
      *  7. quarantine the source slot to <disksRoot>/.moved-away/ (the disk left that host).
      *  8. fire the target sentinel; wait until the store shows it docked on toEngine.
+     * Failure after the eject (3b–6): the target staging is removed AND verified gone (or the
+     * message says it is still there); the source is left EJECTED (undocked, sentinel removed)
+     * with its tree intact and is NOT re-docked by the harness (a re-dock would restart its
+     * instances and hide the state the failure must be diagnosed from); the message says so.
+     * The move duration (total + phases) is logged on success and carried in the error.
      */
     private async moveDiskTree(fromEngine: string, toEngine: string, diskId: string): Promise<void> {
+        const t0 = Date.now()
+        const phases: string[] = []
+        let tPhase = t0
+        const phase = (name: string) => {
+            const now = Date.now()
+            phases.push(`${name} ${now - tPhase}ms`)
+            tPhase = now
+        }
+        const timing = () => `${Date.now() - t0}ms${phases.length ? ` (${phases.join(', ')})` : ''}`
+        try {
+            await this.moveDiskTreeSteps(fromEngine, toEngine, diskId, phase)
+        } catch (e) {
+            const err = e instanceof Error ? e.message : String(e)
+            console.log(`[RealFleetOps] moveDisk ${diskId} ${fromEngine}→${toEngine}: FAILED after ${timing()}`)
+            throw new Error(`${err} [move_duration_ms=${Date.now() - t0}; failed after ${timing()}]`)
+        }
+        console.log(`[RealFleetOps] moveDisk ${diskId} ${fromEngine}→${toEngine}: done in ${timing()}`)
+    }
+
+    private async moveDiskTreeSteps(fromEngine: string, toEngine: string, diskId: string, phase: (name: string) => void): Promise<void> {
         const spec = appPackInstanceData(diskId)!
         resolveDurationFixturePack(diskId)
         assertPrivateDurationRoots(this.disksRoot, this.watchDir)
@@ -2356,7 +2518,7 @@ export class RealFleetOps implements FleetOps {
         // smoke strips instances/, so there the tree is carried without a data precondition.
         const requireData = this.startInstances
 
-        // 1. Source tree (loud if META-only / duplicated).
+        // 1. Source tree (loud if META-only / duplicated / links out of the slot).
         const srcDevice = await this.hasHealthyFixtureTree(fromEngine, diskId, { requireInstanceData: requireData })
         if (!srcDevice) {
             throw new Error(
@@ -2380,10 +2542,14 @@ export class RealFleetOps implements FleetOps {
                 `source ${fromEngine}:${srcSlot} has dangling symlink(s) ${plan.dangling.join(', ')} — data missing on the source; refusing to move.`,
             )
         }
-        for (const l of plan.extLinks) {
-            if (!isSafeRelPath(l.rel) || !isSafeAbsPath(l.target)) {
-                throw new Error(`source ${fromEngine}:${srcSlot}: refuse odd symlink path '${l.rel}' → '${l.target}'`)
-            }
+        if (plan.extLinks.length) {
+            // hasHealthyFixtureTree refused these already; a link that appeared since is refused too.
+            throw new Error(
+                `refuse to move ${diskId}: source ${fromEngine} (${srcHost}) slot ${srcSlot} has symlink(s) resolving OUTSIDE the slot — ` +
+                    plan.extLinks.map(l => `${srcSlot}/${l.rel} → ${l.target}`).join('; ') +
+                    `. A real disk carries its data inside the disk; not materialized (idea#168 r35@62). Replace the link(s) ` +
+                    `with the real data in the slot (Path A). Nothing changed: ${diskId} still docked on ${fromEngine}.`,
+            )
         }
 
         // 2. Target: no duplicate, a free slot.
@@ -2408,6 +2574,21 @@ export class RealFleetOps implements FleetOps {
         const dstSlot = `${this.disksRoot}/${dstDevice}`
         const staging = `${this.disksRoot}/.incoming-${dstDevice}-${diskId}`
 
+        // 2b. idea#168 r35@62: no foreign container may use the source slot's data. Own instances
+        // are stopped by the eject; anything else would keep writing while we tar.
+        const mountRoots = [srcSlot]
+        const pre = await this.foreignMountHits(fromEngine, mountRoots, plan.instances)
+        if (pre.foreign.length) {
+            throw new Error(
+                `refuse to eject/move ${diskId}: on ${fromEngine} (${srcHost}) running container(s) that are not instances of ` +
+                    `${diskId} (${plan.instances.join(', ') || 'none'}) use data inside its slot ${srcSlot} — ${describeMountHits(pre.foreign)}. ` +
+                    `Ejecting ${diskId} does not stop them, so the move would tar data they are writing (r35@62 "file changed as we read it"). ` +
+                    `NOT stopping them (the harness never stops foreign containers): stop/remove them through their owner (Engine/Console) ` +
+                    `or Path A, then re-run. Nothing changed: ${diskId} still docked on ${fromEngine}, tree intact.`,
+            )
+        }
+        phase('preflight')
+
         // 3. Eject on the source; wait for undock + containers gone.
         console.log(
             `[RealFleetOps] moveDisk ${diskId}: ejecting on ${fromEngine} (${srcSlot}) before carrying it to ${toEngine}:${dstSlot}`,
@@ -2415,31 +2596,39 @@ export class RealFleetOps implements FleetOps {
         await this.undockFixtures([fromEngine], diskId)
         await this.waitDiskUndocked(diskId, 60_000)
         this.releaseTestDevice(fromEngine, diskId)
+        const ejectedState =
+            `${diskId} left EJECTED on ${fromEngine} (undocked, sentinel ${this.watchDir}/${srcDevice} removed), tree intact at ` +
+            `${fromEngine}:${srcSlot}; NOT re-docked by the harness (a re-dock would restart its instances and hide this state) — ` +
+            `re-dock or repair it (Path A) before the next run`
         const stillRunning = await this.waitInstanceContainersGone(fromEngine, plan.instances, 90_000)
         if (stillRunning.length) {
             throw new Error(
                 `source ${fromEngine}: container(s) ${stillRunning.join(', ')} still running 90s after ejecting ${diskId}; ` +
-                    `refusing to copy live instance data. Source tree left intact (undocked) at ${srcSlot}.`,
+                    `refusing to copy live instance data. Source tree left intact (undocked) at ${srcSlot}. Source: ${ejectedState}.`,
             )
         }
+        // 3b. idea#168 r35@62 quiescence: after the eject NOTHING running may mount the slot.
+        const post = await this.foreignMountHits(fromEngine, mountRoots, []).catch(e => {
+            throw new Error(`${e instanceof Error ? e.message : String(e)} (after the eject). Source: ${ejectedState}. No staging created on ${toEngine}.`)
+        })
+        if (post.foreign.length) {
+            throw new Error(
+                `refuse to stream ${diskId}: after the eject on ${fromEngine} (${srcHost}) running container(s) still use data inside ` +
+                    `${srcSlot} — ${describeMountHits(post.foreign)}. The source is not quiescent; NOT stopping them. ` +
+                    `Source: ${ejectedState}. No staging created on ${toEngine}.`,
+            )
+        }
+        phase('eject')
 
         // 4. Stream source → target staging.
         const srcDigestRoot = srcSlot
         try {
-            console.log(
-                `[RealFleetOps] moveDisk ${diskId}: streaming ${fromEngine}:${srcSlot} → ${toEngine}:${staging}` +
-                    (plan.extLinks.length ? ` (materializing ${plan.extLinks.map(l => `${l.rel} → ${l.target}`).join(', ')})` : ''),
-            )
+            console.log(`[RealFleetOps] moveDisk ${diskId}: streaming ${fromEngine}:${srcSlot} → ${toEngine}:${staging}`)
             await this.relayPipe(
-                srcHost, buildTreeSendRemote(srcSlot, plan.extLinks.map(l => l.rel), this.sudoMode, skipPatterns),
+                srcHost, buildTreeSendRemote(srcSlot, [], this.sudoMode, skipPatterns),
                 dstHost, buildTreeReceiveRemote(staging, this.sudoMode),
             )
-            for (const l of plan.extLinks) {
-                await this.relayPipe(
-                    srcHost, buildExtLinkSendRemote(l.target, this.sudoMode, extLinkSkipPatterns(l.rel, l.target, skipDirs)),
-                    dstHost, buildExtLinkReceiveRemote(staging, l.rel, l.target, this.sudoMode),
-                )
-            }
+            phase('stream')
             // 5. Verify content.
             const [a, b] = await Promise.all([
                 this.ssh(srcHost, buildTreeDigestRemote(srcDigestRoot, spec.keyFile, this.sudoMode, skipPatterns)),
@@ -2479,10 +2668,20 @@ export class RealFleetOps implements FleetOps {
                 `[RealFleetOps] moveDisk ${diskId}: carried ${da.files} files ${fromEngine}:${srcSlot} → ${toEngine}:${dstSlot} ` +
                     `(tree sha256 ${da.tree}, ${spec.keyFile} sha256 ${da.key})`,
             )
+            phase('verify+commit')
         } catch (e) {
-            await this.ssh(dstHost, `${sudoPreamble(this.sudoMode)}; $S rm -rf '${staging}'`).catch(() => '')
+            // idea#168 r35@62: verify the staging is really gone instead of assuming the rm worked.
+            const cleanup = await this.ssh(dstHost, buildStagingCleanupRemote(staging, this.sudoMode))
+                .catch(err => `STAGING_UNKNOWN ${err instanceof Error ? err.message : String(err)}`)
+            const left = /STAGING_LEFT\s*(.*)/.exec(cleanup)
+            const stagingState = /STAGING_GONE/.test(cleanup)
+                ? `Staging ${toEngine}:${staging} removed (verified absent)`
+                : left
+                    ? `Staging ${toEngine}:${staging} NOT removed (still there: ${left[1]!.trim()}) — remove it before the next run`
+                    : `Staging ${toEngine}:${staging} state UNKNOWN (cleanup did not report: ${cleanup.trim().slice(0, 200)}) — check and remove it before the next run`
             const err = e instanceof Error ? e.message : String(e)
-            throw new Error(`${err}. Staging ${toEngine}:${staging} removed; source tree left intact (undocked) at ${fromEngine}:${srcSlot}.`)
+            console.log(`[RealFleetOps] moveDisk ${diskId}: stream/verify failed — ${stagingState}; source ${ejectedState}`)
+            throw new Error(`${err}. ${stagingState}; source tree left intact (undocked) at ${fromEngine}:${srcSlot}. Source: ${ejectedState}.`)
         }
         const landedData = requireData ? await this.checkInstanceData(toEngine, dstSlot, spec) : { ok: true, detail: 'dock-only' }
         if (!landedData.ok) {
@@ -2508,6 +2707,7 @@ export class RealFleetOps implements FleetOps {
             await this.ssh(dstHost, buildFireSentinelRemote(this.watchDir, sentinel))
             await this.waitDiskDocked(toEngine, diskId, 120_000)
         }
+        phase('dock')
     }
 
     /**

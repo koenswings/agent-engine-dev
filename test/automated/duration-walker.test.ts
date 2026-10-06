@@ -2423,7 +2423,7 @@ describe('r29 FAIL@97: follow the store host for Kolibri/NC sidecars; restore mu
             const r = await dispatchAction(moveCtx(ops) as any)
             expect(r.ok, r.message).toBe(true)
             expect(r.dockedEngine).toBe('idea03')
-            expect(r.message).toMatch(/moved duration-kolibri-grade5a-001 idea01→idea03 \(store-verified: disk \+ kolibri-grade5a-001 on idea03\)/)
+            expect(r.message).toMatch(/moved duration-kolibri-grade5a-001 idea01→idea03 in \d+ms \(move_ms=\d+; store-verified: disk \+ kolibri-grade5a-001 on idea03\)/)
             expect(r.message).toMatch(/DURATION_KOLIBRI_URL=http:\/\/100\.126\.117\.80:18080 \(store: kolibri-grade5a-001 on idea03; was http:\/\/100\.99\.231\.94:18080\)/)
             expect(process.env.DURATION_KOLIBRI_URL).toBe(IDEA03_URL)
             expect((await ops.readStore('idea03')).diskDB[KOLIBRI]?.dockedTo).toBe('idea03')
@@ -2456,7 +2456,7 @@ describe('r29 FAIL@97: follow the store host for Kolibri/NC sidecars; restore mu
                 },
             })
             await expect(dispatchAction(moveCtx(ops) as any)).rejects.toThrow(
-                /infra_move_disk: target idea03 could not take duration-kolibri-grade5a-001 \(idea01→idea03\): .*no free idea-test-N.*No soft-pass; no fallback host/,
+                /infra_move_disk: target idea03 could not take duration-kolibri-grade5a-001 \(idea01→idea03\): .*no free idea-test-N.*No soft-pass; no fallback host\. infra_move_disk move_ms=\d+\./,
             )
         })
     })

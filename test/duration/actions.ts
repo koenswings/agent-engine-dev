@@ -1071,6 +1071,8 @@ const infraMoveDisk = async (ctx: ActionContext): Promise<ActionResult> => {
     assertNotGolden(ctx, from, 'infra_move_disk(from)')
     const to = pickPoolEngine(ctx, from)
     assertNotGolden(ctx, to, 'infra_move_disk(to)')
+    // idea#168 r35@62: the move duration is logged explicitly (success and failure).
+    const moveStartedAt = Date.now()
     try {
         if (from === to) {
             // Single-engine pool: treat as re-dock settle (document limitation).
@@ -1080,11 +1082,15 @@ const infraMoveDisk = async (ctx: ActionContext): Promise<ActionResult> => {
         }
     } catch (e) {
         const err = e instanceof Error ? e.message : String(e)
+        const ms = Date.now() - moveStartedAt
+        console.log(`[infra_move_disk] ${ctx.fixtureDisk} ${from}→${to}: FAILED after ${ms}ms`)
         throw new Error(
             `infra_move_disk: target ${to} could not take ${ctx.fixtureDisk} (${from}→${to}): ${err}. ` +
-                `No soft-pass; no fallback host.`,
+                `No soft-pass; no fallback host. infra_move_disk move_ms=${ms}.`,
         )
     }
+    const moveMs = Date.now() - moveStartedAt
+    console.log(`[infra_move_disk] ${ctx.fixtureDisk} ${from}→${to}: moved in ${moveMs}ms`)
     await settleParticipants(ctx, ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e)))
     // cover-all-980e735-r29 FAIL@97: @62 "moved idea01→idea03" while the disk was
     // re-docked on idea01. Verify disk AND fixture instance host == target in the
@@ -1107,7 +1113,7 @@ const infraMoveDisk = async (ctx: ActionContext): Promise<ActionResult> => {
     const moveMsg =
         from === to
             ? `re-docked on sole pool engine ${to}`
-            : `moved ${ctx.fixtureDisk} ${from}→${to} (store-verified: disk + ${ctx.fixtureInstance} on ${to})`
+            : `moved ${ctx.fixtureDisk} ${from}→${to} in ${moveMs}ms (move_ms=${moveMs}; store-verified: disk + ${ctx.fixtureInstance} on ${to})`
     return {
         ok: true,
         message: `${moveMsg}; ${urls}`,

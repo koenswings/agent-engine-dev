@@ -11,7 +11,7 @@
  * generated bash locally with the host's roots substituted, and the walker relay
  * (ssh src | ssh dst) is a local pipe. Only the Automerge store calls are stubbed.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { execFile, execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import fs from 'node:fs'
@@ -25,13 +25,17 @@ import {
     RealFleetOps,
     buildFixtureSlotScanRemote,
     buildInstanceDataCheckRemote,
-    buildExtLinkSendRemote,
+    buildMountScanRemote,
     buildMovePlanRemote,
     buildQuarantineSourceRemote,
     buildRecreateSkipDirsRemote,
+    buildSlotLinkScanRemote,
+    buildStagingCleanupRemote,
     buildTreeDigestRemote,
     buildTreeSendRemote,
-    extLinkSkipPatterns,
+    isOwnInstanceContainer,
+    parseMountScan,
+    parseSlotLinkScan,
     parseTreeDigest,
     skipDirTarPattern,
     fixtureSlotNames,
@@ -78,6 +82,50 @@ const readWalkState = (file: string): string | null => {
     return out || null
 }
 
+/**
+ * idea#168 r35@62 — fake `docker` on PATH for the generated bash: `ps -q`, `ps --filter name=RE
+ * --format …` and `inspect --format … <ids>` read <dir>/<host>/docker.tsv (one container per
+ * line: id TAB name TAB mount-source…); every call is logged; stop/kill/rm/restart are refused
+ * (exit 99) so a test can prove the harness never stops a container. FAKE_DOCKER_BROKEN=1 → ps fails.
+ */
+const FAKE_DOCKER = `#!/usr/bin/env bash
+echo "$FAKE_DOCKER_HOST $*" >> "$FAKE_DOCKER_LOG"
+state="$FAKE_DOCKER_STATE"
+case "$1" in
+  ps)
+    if [ -f "$FAKE_DOCKER_BROKEN" ]; then echo "Cannot connect to the Docker daemon" >&2; exit 1; fi
+    shift; q=0; filter=""
+    while [ $# -gt 0 ]; do case "$1" in -q) q=1;; --filter) shift; filter="$1";; --format) shift;; esac; shift; done
+    [ -f "$state" ] || exit 0
+    while IFS=$'\t' read -r id name rest; do
+      [ -n "$id" ] || continue
+      if [ -n "$filter" ]; then printf '%s\n' "$name" | grep -Eq -- "\${filter#name=}" || continue; fi
+      if [ $q = 1 ]; then echo "$id"; else echo "$name"; fi
+    done < "$state";;
+  inspect)
+    shift; ids=()
+    while [ $# -gt 0 ]; do case "$1" in --format|-f) shift;; *) ids+=("$1");; esac; shift; done
+    for want in "\${ids[@]}"; do
+      while IFS=$'\t' read -r id name rest; do
+        [ "$id" = "$want" ] || continue
+        IFS=$'\t' read -ra ms <<< "$rest"
+        for m in "\${ms[@]}"; do printf '/%s\t%s\n' "$name" "$m"; done
+      done < "$state"
+    done;;
+  stop|kill|rm|restart|start|compose) echo "fake docker: '$1' refused in tests" >&2; exit 99;;
+esac
+`
+
+type Container = { id: string; name: string; mounts: string[] }
+const dockerState = (sb: Sandbox, h: string) => `${sb.dir}/${h}/docker.tsv`
+const setContainers = (sb: Sandbox, h: string, cs: Container[]) =>
+    fs.writeFileSync(dockerState(sb, h), cs.map(c => [c.id, c.name, ...c.mounts].join('\t')).join('\n') + (cs.length ? '\n' : ''))
+const getContainers = (sb: Sandbox, h: string): Container[] =>
+    !fs.existsSync(dockerState(sb, h)) ? [] : fs.readFileSync(dockerState(sb, h), 'utf8').split('\n').filter(Boolean)
+        .map(l => { const [id, name, ...mounts] = l.split('\t'); return { id: id!, name: name!, mounts } })
+const dockerLog = (sb: Sandbox): string[] =>
+    fs.existsSync(`${sb.dir}/docker.log`) ? fs.readFileSync(`${sb.dir}/docker.log`, 'utf8').split('\n').filter(Boolean) : []
+
 type Sandbox = {
     dir: string
     ROOT: string
@@ -102,6 +150,8 @@ const makeSandbox = (): Sandbox => {
         fs.writeFileSync(`${p.seed}/empty/META.yaml`, `diskId: ${EMPTY}\n`)
         fs.writeFileSync(`${p.seed}/empty/README.md`, 'humans\n')
     }
+    fs.mkdirSync(`${dir}/fakebin`, { recursive: true })
+    fs.writeFileSync(`${dir}/fakebin/docker`, FAKE_DOCKER, { mode: 0o755 })
     return { dir, ROOT: `${dir}/__DISKS__`, WATCH: `${dir}/__WATCH__`, SEED: `${dir}/__SEED__`, host }
 }
 
@@ -165,9 +215,15 @@ class LocalFleetOps extends RealFleetOps {
             sudoMode: 'never',
         })
     }
+    /** idea#168 r35@62: simulate a failing stream (the real relay runs first, so staging exists). */
+    failRelayWith: string | null = null
+    /** idea#168 r35@62: simulate a staging dir that cannot be removed on the target. */
+    keepStaging = false
     private localize(host: string, cmd: string): string {
         const p = this.sb.host(host)
-        return cmd
+        const env = `export PATH=${this.sb.dir}/fakebin:$PATH FAKE_DOCKER_HOST=${host} FAKE_DOCKER_STATE=${this.sb.dir}/${host}/docker.tsv ` +
+            `FAKE_DOCKER_LOG=${this.sb.dir}/docker.log FAKE_DOCKER_BROKEN=${this.sb.dir}/${host}/docker.broken; `
+        return env + cmd
             .replaceAll(this.sb.ROOT, p.disks)
             .replaceAll(this.sb.WATCH, p.watch)
             .replaceAll(this.sb.SEED, p.seed)
@@ -175,6 +231,7 @@ class LocalFleetOps extends RealFleetOps {
     }
     protected override async ssh(host: string, cmd: string): Promise<string> {
         this.cmds.push({ host, cmd })
+        if (this.keepStaging && cmd.includes('STAGING_LEFT')) cmd = cmd.replace(/\$S rm -rf '[^']*' 2>\/dev\/null; /, '')
         try {
             const { stdout } = await run('bash', ['-c', this.localize(host, cmd)], { maxBuffer: 64 << 20 })
             return stdout
@@ -188,12 +245,13 @@ class LocalFleetOps extends RealFleetOps {
         const { stdout } = await run('bash', ['-o', 'pipefail', '-c', 'bash -c "$1" | bash -c "$2"', 'relay',
             this.localize(src, srcCmd), this.localize(dst, dstCmd)], { maxBuffer: 64 << 20 })
         this.tamperAfterRelay?.(dst)
+        if (this.failRelayWith) throw new Error(this.failRelayWith)
         return stdout
     }
 }
 
 /** In-memory dock state standing in for the Automerge stores (unique mode). */
-const stubStore = (ops: LocalFleetOps, sb: Sandbox, initial: Record<string, string | null> = {}) => {
+const stubStore = (ops: LocalFleetOps, sb: Sandbox, initial: Record<string, string | null> = {}, hooks: { afterUndock?: (host: string) => void } = {}) => {
     const docked = new Map<string, string | null>(Object.entries(initial))
     const calls = { undock: [] as string[] }
     const slotOf = (h: string, diskId: string): string | null => {
@@ -212,6 +270,9 @@ const stubStore = (ops: LocalFleetOps, sb: Sandbox, initial: Record<string, stri
                 const s = slotOf(on, d)
                 if (s) fs.rmSync(`${sb.host(on).watch}/${s}`, { force: true })
                 docked.set(d, null)
+                // The Engine stops the disk's own instance containers on eject (compose `<id>-…`).
+                setContainers(sb, on, getContainers(sb, on).filter(c => !c.name.startsWith(`${KINST}-`)))
+                hooks.afterUndock?.(on)
             }
         },
         waitDiskUndocked: async (d: string) => {
@@ -265,15 +326,14 @@ describe('idea#168 r34@70: hasHealthyFixtureTree is a LOUD instance-data precond
         expect(fs.readdirSync(sb.host('idea03').watch)).toEqual([])
     })
 
-    it('healthy tree (db.sqlite3 with Grade 5A, Path A symlinked data dir) is reused on the requested engine (regression)', async () => {
-        const root = plantKolibriTree(sb, 'idea01', 'idea-test-1', 'symlink', { walkState: 'kept' })
+    it('healthy tree (db.sqlite3 with Grade 5A, real data inside the slot) is reused on the requested engine (regression)', async () => {
+        const root = plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real', { walkState: 'kept' })
         const ops = new LocalFleetOps(sb)
         const store = stubStore(ops, sb)
         await ops.dockFixture('idea01', KOLIBRI)
         expect(store.docked.get(KOLIBRI)).toBe('idea01')
         expect(fs.existsSync(`${sb.host('idea01').watch}/idea-test-1`)).toBe(true)
-        // Reused as-is: Path A link and walk state intact, nothing re-seeded.
-        expect(fs.lstatSync(`${root}/instances/${KINST}/data/kolibri`).isSymbolicLink()).toBe(true)
+        // Reused as-is: walk state intact, nothing re-seeded.
         expect(readWalkState(`${root}/${DB_REL}`)).toBe('kept')
     })
 
@@ -367,10 +427,10 @@ describe('idea#168 r34@70: hasHealthyFixtureTree is a LOUD instance-data precond
 })
 
 describe('idea#168 r34@70: moveDisk carries the source disk\'s real tree (no fixture copy, no seed refresh)', () => {
-    it('(b) idea01→idea03: target gets the source DB byte-for-byte (same sha256, walk state kept), symlinked data materialized, source quarantined, docked on idea03', async () => {
-        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'symlink', { walkState: 'r34-steps-1-61:lesson+quiz+progress' })
-        const liveDb = `${sb.dir}/idea01/idea166-kolibri-live/data/kolibri/db.sqlite3`
-        const srcHash = sha256(liveDb)
+    it('(b) idea01→idea03: target gets the source DB byte-for-byte (same sha256, walk state kept), source quarantined, docked on idea03', async () => {
+        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real', { walkState: 'r34-steps-1-61:lesson+quiz+progress' })
+        const srcDb = `${sb.host('idea01').disks}/idea-test-1/${DB_REL}`
+        const srcHash = sha256(srcDb)
         // Busy idea03 slots: idea-test-1 another pack, idea-test-2 an unrelated dir.
         fs.mkdirSync(`${sb.host('idea03').disks}/idea-test-1`, { recursive: true })
         fs.writeFileSync(`${sb.host('idea03').disks}/idea-test-1/META.yaml`, 'diskId: duration-nextcloud-grade5a-001\n')
@@ -383,7 +443,7 @@ describe('idea#168 r34@70: moveDisk carries the source disk\'s real tree (no fix
 
         const dst = `${sb.host('idea03').disks}/idea-test-3`
         const dstDb = `${dst}/${DB_REL}`
-        expect(fs.lstatSync(`${dst}/instances/${KINST}/data/kolibri`).isDirectory()).toBe(true) // real dir, not a link
+        expect(fs.lstatSync(`${dst}/instances/${KINST}/data/kolibri`).isDirectory()).toBe(true)
         expect(fs.lstatSync(dstDb).isFile()).toBe(true)
         expect(sha256(dstDb)).toBe(srcHash)
         expect(readWalkState(dstDb)).toBe('r34-steps-1-61:lesson+quiz+progress')
@@ -398,16 +458,20 @@ describe('idea#168 r34@70: moveDisk carries the source disk\'s real tree (no fix
         expect(fs.existsSync(`${sb.host('idea03').watch}/idea-test-3`)).toBe(true)
         expect(fs.existsSync(`${sb.host('idea01').watch}/idea-test-1`)).toBe(false)
         expect(store.calls.undock).toEqual([`idea01:${KOLIBRI}`])
-        // Source: the disk left idea01 — slot gone (quarantined), external live data untouched.
+        // Source: the disk left idea01 — slot gone (quarantined with its data).
         expect(fs.existsSync(`${sb.host('idea01').disks}/idea-test-1`)).toBe(false)
         const moved = fs.readdirSync(`${sb.host('idea01').disks}/.moved-away`)
         expect(moved).toHaveLength(1)
         expect(moved[0]).toMatch(/^idea-test-1-duration-kolibri-grade5a-001-/)
-        expect(sha256(liveDb)).toBe(srcHash)
+        expect(sha256(`${sb.host('idea01').disks}/.moved-away/${moved[0]}/${DB_REL}`)).toBe(srcHash)
         // No staging left; nothing came from the seed pack; no cp -a fixture copy.
         expect(fs.readdirSync(sb.host('idea03').disks).filter(n => n.startsWith('.incoming'))).toEqual([])
         expect([...ops.cmds.map(c => c.cmd), ...ops.relays.flatMap(r => [r.srcCmd, r.dstCmd])].some(c => c.includes(sb.SEED) || c.includes('cp -a'))).toBe(false)
-        expect(ops.relays.map(r => `${r.src}→${r.dst}`)).toEqual(['idea01→idea03', 'idea01→idea03'])
+        // One stream (the slot); no external-link stream any more (idea#168 r35@62).
+        expect(ops.relays.map(r => `${r.src}→${r.dst}`)).toEqual(['idea01→idea03'])
+        // Mount scans before and after the eject on the source; read-only docker only.
+        expect(ops.cmds.filter(c => c.cmd.includes('MOUNT_SCAN_END')).map(c => c.host)).toEqual(['idea01', 'idea01'])
+        expect(dockerLog(sb).every(l => / (ps|inspect)\b/.test(l))).toBe(true)
     })
 
     it('(b) target already holds a stale tree for the disk (the r34 idea03 idea-test-1) → LOUD before eject; source untouched', async () => {
@@ -441,7 +505,7 @@ describe('idea#168 r34@70: moveDisk carries the source disk\'s real tree (no fix
             const f = `${sb.host(dst).disks}/.incoming-idea-test-1-${KOLIBRI}/${DB_REL}`
             if (fs.existsSync(f)) fs.appendFileSync(f, 'x')
         }
-        await expect(ops.moveDisk('idea01', 'idea03', KOLIBRI)).rejects.toThrow(/content mismatch after transfer.*Staging idea03:.*removed; source tree left intact \(undocked\) at idea01:.*idea-test-1/)
+        await expect(ops.moveDisk('idea01', 'idea03', KOLIBRI)).rejects.toThrow(/content mismatch after transfer.*Staging idea03:.*removed \(verified absent\); source tree left intact \(undocked\) at idea01:.*idea-test-1/)
         expect(fs.readdirSync(sb.host('idea03').disks)).toEqual([])
         expect(fs.existsSync(`${sb.host('idea01').disks}/idea-test-1/${DB_REL}`)).toBe(true)
         expect(store.docked.get(KOLIBRI) ?? null).toBeNull()
@@ -459,9 +523,8 @@ describe('idea#168 r34@70: moveDisk carries the source disk\'s real tree (no fix
         expect(readWalkState(dstDb)).toBe('before-redock')
     })
 
-    it('move plan / tar / quarantine builders: external links excluded from the main stream and materialized; mount points refused', async () => {
+    it('move plan / tar / quarantine builders: the plan still REPORTS links out of the slot (moveDisk refuses them); mount points refused', async () => {
         const root = plantKolibriTree(sb, 'idea01', 'idea-test-1', 'symlink')
-        const { buildMovePlanRemote } = await import('../duration/realFleetOps.js')
         const plan = parseMovePlan(execFileSync('bash', ['-c', buildMovePlanRemote(root, 'never')]).toString())
         expect(plan.error).toBeNull()
         expect(plan.mountFsType).toBeNull()
@@ -482,18 +545,11 @@ describe('idea#168 r35@62: Kolibri root-0600 session files are left out of the m
         expect(spec.moveSkipDirs).toEqual([SESSIONS_REL])
         expect(APP_PACK_INSTANCE_DATA['duration-nextcloud-grade5a-001']!.moveSkipDirs).toBeUndefined()
         expect(skipDirTarPattern(SESSIONS_REL)).toBe('kolibri/sessions')
-        expect(extLinkSkipPatterns(`instances/${KINST}/data/kolibri`, '/home/pi/idea166-kolibri-live/data/kolibri', [SESSIONS_REL]))
-            .toEqual(['kolibri/sessions'])
-        // A link whose target basename differs still gets its sessions excluded.
-        expect(extLinkSkipPatterns(`instances/${KINST}/data/kolibri`, '/home/pi/kolibri-home', [SESSIONS_REL]))
-            .toEqual(['kolibri/sessions', 'kolibri-home/sessions'])
     })
 
-    it('generated tar commands carry the exclude for both layouts, and GNU tar really drops sessions in both (slot ./instances/…/kolibri/sessions and ext-link kolibri/sessions)', () => {
-        const send = buildTreeSendRemote('/x/idea-test-1', [`instances/${KINST}/data/kolibri`], 'never', ['kolibri/sessions'])
-        expect(send).toContain(`--exclude='./instances/${KINST}/data/kolibri' --exclude='kolibri/sessions' .`)
-        const ext = buildExtLinkSendRemote('/home/pi/idea166-kolibri-live/data/kolibri', 'never', ['kolibri/sessions'])
-        expect(ext).toMatch(/tar --numeric-owner -cpf - --exclude='kolibri\/sessions' -C '\/home\/pi\/idea166-kolibri-live\/data' 'kolibri'$/)
+    it('generated tar command carries the exclude, and GNU tar really drops ./instances/…/kolibri/sessions', () => {
+        const send = buildTreeSendRemote('/x/idea-test-1', [], 'never', ['kolibri/sessions'])
+        expect(send).toMatch(/cd '\/x\/idea-test-1' && \$S tar --numeric-owner -cpf - --exclude='kolibri\/sessions' \.$/)
 
         // Real layout (data/kolibri a real dir in the slot): member ./instances/…/data/kolibri/sessions.
         const realRoot = plantKolibriTree(sb, 'idea03', 'idea-test-1', 'real', { sessions: true })
@@ -501,23 +557,17 @@ describe('idea#168 r35@62: Kolibri root-0600 session files are left out of the m
         expect(realList).toContain(`./${DB_REL}\n`)
         expect(realList).toContain(`./instances/${KINST}/data/kolibri/content/storage/video.mp4`)
         expect(realList).not.toMatch(/sessions/)
-        // Ext-link layout (Path A idea01): members named kolibri/…
-        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'symlink', { sessions: true })
-        const live = `${sb.dir}/idea01/idea166-kolibri-live/data/kolibri`
-        const extList = execFileSync('bash', ['-o', 'pipefail', '-c', `${buildExtLinkSendRemote(live, 'never', ['kolibri/sessions'])} | tar -tf -`]).toString()
-        expect(extList).toContain('kolibri/db.sqlite3\n')
-        expect(extList).not.toMatch(/sessions/)
-        // Sanity: without the exclude, tar as a non-root user fails on the 0600/000 session files (the r35@62 failure).
-        expect(() => execFileSync('bash', ['-o', 'pipefail', '-c', `${buildExtLinkSendRemote(live, 'never')} | tar -tf - >/dev/null`], { stdio: 'pipe' })).toThrow()
+        // Sanity: without the exclude, tar as a non-root user fails on the 0600/000 session files.
+        expect(() => execFileSync('bash', ['-o', 'pipefail', '-c', `${buildTreeSendRemote(realRoot, [], 'never')} | tar -tf - >/dev/null`], { stdio: 'pipe' })).toThrow()
     })
 
     it('digest prunes sessions (find -L … -path \'*/kolibri/sessions\' -prune) on an unreadable tree; same digest as the tree without sessions', () => {
         const cmd = buildTreeDigestRemote('/x', DB_REL, 'never', ['kolibri/sessions'])
         expect(cmd).toContain(`find -L . \\( -path '*/kolibri/sessions' \\) -prune -o -type f -print0`)
         expect(cmd.match(/-prune/g)).toHaveLength(2) // count + hash
-        const withS = plantKolibriTree(sb, 'idea01', 'idea-test-1', 'symlink', { sessions: true })
+        const withS = plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real', { sessions: true })
         const noS = plantKolibriTree(sb, 'idea03', 'idea-test-1', 'real')
-        fs.copyFileSync(`${sb.dir}/idea01/idea166-kolibri-live/data/kolibri/db.sqlite3`, `${noS}/${DB_REL}`)
+        fs.copyFileSync(`${withS}/${DB_REL}`, `${noS}/${DB_REL}`)
         const dig = (root: string, pats: string[]) => parseTreeDigest(execFileSync('bash', ['-c', buildTreeDigestRemote(root, DB_REL, 'never', pats)], { stdio: 'pipe' }).toString())
         const a = dig(withS, ['kolibri/sessions'])
         const b = dig(noS, ['kolibri/sessions'])
@@ -563,10 +613,9 @@ describe('idea#168 r35@62: Kolibri root-0600 session files are left out of the m
         expect(out).toMatch(/SKIPDIR d\/kolibri\/sessions not recreated/)
     })
 
-    it('(r35@62) idea01→idea03 with UNREADABLE session files behind the data/kolibri link: move succeeds, db.sqlite3 sha256 matches, target has an EMPTY sessions dir (source mode)', async () => {
-        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'symlink', { sessions: true, walkState: 'r35-steps-1-61' })
-        const liveDb = `${sb.dir}/idea01/idea166-kolibri-live/data/kolibri/db.sqlite3`
-        const srcHash = sha256(liveDb)
+    it('(r35@62) idea01→idea03 with UNREADABLE session files in data/kolibri: move succeeds, db.sqlite3 sha256 matches, target has an EMPTY sessions dir (source mode)', async () => {
+        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real', { sessions: true, walkState: 'r35-steps-1-61' })
+        const srcHash = sha256(`${sb.host('idea01').disks}/idea-test-1/${DB_REL}`)
         const ops = new LocalFleetOps(sb)
         const store = stubStore(ops, sb, { [KOLIBRI]: 'idea01' })
         fs.writeFileSync(`${sb.host('idea01').watch}/idea-test-1`, '')
@@ -584,8 +633,9 @@ describe('idea#168 r35@62: Kolibri root-0600 session files are left out of the m
         expect(ops.relays.map(r => r.srcCmd).every(c => c.includes(`--exclude='kolibri/sessions'`))).toBe(true)
         expect(ops.cmds.filter(c => c.cmd.includes('DIGEST files=')).map(c => c.host).sort()).toEqual(['idea01', 'idea03'])
         expect(ops.cmds.filter(c => c.cmd.includes('DIGEST files=')).every(c => c.cmd.includes(`-path '*/kolibri/sessions' \\) -prune`))).toBe(true)
-        // Source session files untouched (live data stays on idea01).
-        expect(fs.readdirSync(`${sb.dir}/idea01/idea166-kolibri-live/data/kolibri/sessions`).sort()).toEqual(['sessionid-learner-r35', 'sessionid-teacher-r35'])
+        // Source session files untouched (quarantined with the source slot on idea01).
+        const q = fs.readdirSync(`${sb.host('idea01').disks}/.moved-away`)[0]!
+        expect(fs.readdirSync(`${sb.host('idea01').disks}/.moved-away/${q}/${SESSIONS_REL}`).sort()).toEqual(['sessionid-learner-r35', 'sessionid-teacher-r35'])
     })
 
     it('(r35) real-dir layout idea03→idea04 with unreadable sessions: move succeeds, sessions recreated empty, db hash matches', async () => {
@@ -604,12 +654,231 @@ describe('idea#168 r35@62: Kolibri root-0600 session files are left out of the m
     })
 
     it('(r35) source without a sessions dir: target still gets one (1777) so Django file sessions work', async () => {
-        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'symlink')
+        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real')
         const ops = new LocalFleetOps(sb)
         stubStore(ops, sb, { [KOLIBRI]: 'idea01' })
         await ops.moveDisk('idea01', 'idea03', KOLIBRI)
         const sess = `${sb.host('idea03').disks}/idea-test-1/${SESSIONS_REL}`
         expect(fs.readdirSync(sess)).toEqual([])
         expect(fs.statSync(sess).mode & 0o7777).toBe(0o1777)
+    })
+})
+
+describe('idea#168 r35@62: symlinks out of the slot are refused LOUDLY (dock + move); foreign mounts block the move; failure state is explicit', () => {
+    const LIVE = () => `${sb.dir}/idea01/idea166-kolibri-live/data/kolibri`
+    const ZOMBIE = 'y3zvlf9ug1t8wgod3uu'
+    const OWN = { id: 'c0ffee000001', name: `${KINST}-kolibri-1` }
+    /** The @43 copy_app copy on the Nextcloud disk (idea-test-2): data/kolibri is a link to `linkTo`. */
+    const plantZombieCopy = (h: string, linkTo: string) => {
+        const nc = `${sb.host(h).disks}/idea-test-2`
+        fs.mkdirSync(`${nc}/instances/${ZOMBIE}/data/docker`, { recursive: true })
+        fs.writeFileSync(`${nc}/META.yaml`, 'diskId: duration-nextcloud-grade5a-001\n')
+        fs.writeFileSync(`${nc}/instances/${ZOMBIE}/.env`, 'port=51308\nKOLIBRI_HTTP_PORT=18080\n')
+        fs.symlinkSync(linkTo, `${nc}/instances/${ZOMBIE}/data/kolibri`)
+        return { id: 'ddc7c065ff91', name: `${ZOMBIE}-kolibri-1`, mounts: [`${nc}/instances/${ZOMBIE}/data/docker`, `${nc}/instances/${ZOMBIE}/data/kolibri`] }
+    }
+    const noStopCalls = () => expect(dockerLog(sb).filter(l => !/^\S+ (ps|inspect)\b/.test(l))).toEqual([])
+
+    it('dockFixture refuses the Path A layout (data/kolibri → idea166-kolibri-live) naming host, link, target, diskId; nothing docked, not followed', async () => {
+        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'symlink')
+        const ops = new LocalFleetOps(sb)
+        const store = stubStore(ops, sb)
+        const err = await ops.dockFixture('idea01', KOLIBRI).then(() => null, e => e as Error)
+        expect(err?.message).toContain(`refuse fixture tree idea01:${sb.ROOT}/idea-test-1 (host idea01) for ${KOLIBRI}: 1 symlink(s) resolve OUTSIDE the slot`)
+        expect(err?.message).toContain(`${sb.ROOT}/idea-test-1/instances/${KINST}/data/kolibri → ${LIVE()}`)
+        expect(err?.message).toMatch(/copy_app would copy the link and the copy would share this live data \(idea#168 r35@62\).*Not materialized, not followed/)
+        expect(store.docked.get(KOLIBRI) ?? null).toBeNull()
+        expect(fs.readdirSync(sb.host('idea01').watch)).toEqual([])
+        // Refused before the instance-data check (which would follow the link).
+        expect(ops.cmds.some(c => c.cmd.includes('INSTANCE_DATA_OK'))).toBe(false)
+    })
+
+    it('ANY path in the slot linking out (not only app data) is refused; a relative link that stays inside the slot is fine', async () => {
+        const root = plantKolibriTree(sb, 'idea03', 'idea-test-1', 'real')
+        fs.symlinkSync('kolibri/content', `${root}/instances/${KINST}/data/content-link`) // inside: OK
+        const ops = new LocalFleetOps(sb)
+        const store = stubStore(ops, sb)
+        await ops.dockFixture('idea03', KOLIBRI)
+        expect(store.docked.get(KOLIBRI)).toBe('idea03')
+
+        const outside = path.join(sb.dir, 'host-icon.png')
+        fs.writeFileSync(outside, 'png')
+        fs.symlinkSync(outside, `${root}/apps/kolibri-1.0/icon.png`)
+        const ops2 = new LocalFleetOps(sb)
+        stubStore(ops2, sb)
+        await expect(ops2.dockFixture('idea03', KOLIBRI)).rejects.toThrow(
+            new RegExp(`refuse fixture tree idea03:.*idea-test-1 \\(host idea03\\) for ${KOLIBRI}: 1 symlink\\(s\\) resolve OUTSIDE the slot — .*apps/kolibri-1\\.0/icon\\.png → ${outside.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`),
+        )
+    })
+
+    it('link scan builder: LINK_OUT names rel, link text, target; inside/relative links pass; dangling-outside reported; parse needs LINKS_END', () => {
+        const root = plantKolibriTree(sb, 'idea01', 'idea-test-1', 'symlink')
+        fs.symlinkSync('../../META.yaml', `${root}/instances/${KINST}/meta-link`)
+        fs.symlinkSync('/nonexistent-dir/x', `${root}/apps/gone`)
+        const scan = parseSlotLinkScan(execFileSync('bash', ['-c', buildSlotLinkScanRemote(root, 'never', [SESSIONS_REL])]).toString())
+        expect(scan.error).toBeNull()
+        expect(scan.outside.sort((a, b) => a.rel.localeCompare(b.rel))).toEqual([
+            { rel: 'apps/gone', raw: '/nonexistent-dir/x', target: '/nonexistent-dir/x' },
+            { rel: `instances/${KINST}/data/kolibri`, raw: LIVE(), target: LIVE() },
+        ])
+        expect(parseSlotLinkScan('')).toMatchObject({ error: expect.stringMatching(/incomplete/) })
+        expect(parseSlotLinkScan('LINKS_ERR slot /x missing\nLINKS_END').error).toBe('slot /x missing')
+    })
+
+    it('(r35 shape) moveDisk: symlinked source + zombie copy on the NC disk writing the same live dir → refused BEFORE the eject; zombie NOT stopped; nothing streamed', async () => {
+        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'symlink', { walkState: 'r35' })
+        const zombie = plantZombieCopy('idea01', LIVE())
+        setContainers(sb, 'idea01', [zombie])
+        const ops = new LocalFleetOps(sb)
+        const store = stubStore(ops, sb, { [KOLIBRI]: 'idea01' })
+        fs.writeFileSync(`${sb.host('idea01').watch}/idea-test-1`, '')
+        const err = await ops.moveDisk('idea01', 'idea03', KOLIBRI).then(() => null, e => e as Error)
+        expect(err?.message).toMatch(new RegExp(`target idea03 could not take ${KOLIBRI}: RealFleetOps: refuse fixture tree idea01:.*idea-test-1 \\(host idea01\\) for ${KOLIBRI}: 1 symlink\\(s\\) resolve OUTSIDE the slot`))
+        expect(err?.message).toContain(`instances/${KINST}/data/kolibri → ${LIVE()}`)
+        expect(err?.message).toMatch(/move_duration_ms=\d+/)
+        expect(store.calls.undock).toEqual([])
+        expect(store.docked.get(KOLIBRI)).toBe('idea01')
+        expect(fs.existsSync(`${sb.host('idea01').watch}/idea-test-1`)).toBe(true)
+        expect(ops.relays).toEqual([])
+        expect(getContainers(sb, 'idea01').map(c => c.name)).toEqual([`${ZOMBIE}-kolibri-1`])
+        noStopCalls()
+        expect(fs.readdirSync(sb.host('idea03').disks)).toEqual([])
+    })
+
+    it('foreign container whose mount resolves INSIDE the source slot (zombie copy linking into the source data) → refused BEFORE the eject, naming container + paths; own instance is not foreign; never stopped', async () => {
+        const root = plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real', { walkState: 'r36' })
+        const srcData = `${root}/instances/${KINST}/data/kolibri`
+        const zombie = plantZombieCopy('idea01', srcData)
+        setContainers(sb, 'idea01', [{ ...OWN, mounts: [srcData, `${root}/instances/${KINST}/data/docker`] }, zombie])
+        const ops = new LocalFleetOps(sb)
+        const store = stubStore(ops, sb, { [KOLIBRI]: 'idea01' })
+        const err = await ops.moveDisk('idea01', 'idea03', KOLIBRI).then(() => null, e => e as Error)
+        const msg = err?.message ?? ''
+        expect(msg).toContain(`refuse to eject/move ${KOLIBRI}: on idea01 (idea01) running container(s) that are not instances of ${KOLIBRI} (${KINST}) use data inside its slot ${sb.ROOT}/idea-test-1`)
+        expect(msg).toContain(`${ZOMBIE}-kolibri-1 mounts ${sb.host('idea01').disks}/idea-test-2/instances/${ZOMBIE}/data/kolibri (→ ${srcData})`)
+        expect(msg).not.toContain(`${KINST}-kolibri-1 mounts`)
+        expect(msg).toMatch(/NOT stopping them \(the harness never stops foreign containers\).*Nothing changed: duration-kolibri-grade5a-001 still docked on idea01/)
+        expect(store.calls.undock).toEqual([])
+        expect(store.docked.get(KOLIBRI)).toBe('idea01')
+        expect(ops.relays).toEqual([])
+        expect(getContainers(sb, 'idea01').map(c => c.name)).toEqual([OWN.name, `${ZOMBIE}-kolibri-1`])
+        noStopCalls()
+    })
+
+    it('own instance containers only → allowed (the eject stops them); the post-eject re-scan finds nothing; move succeeds', async () => {
+        const root = plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real')
+        setContainers(sb, 'idea01', [{ ...OWN, mounts: [`${root}/instances/${KINST}/data/kolibri`] }])
+        const ops = new LocalFleetOps(sb)
+        const store = stubStore(ops, sb, { [KOLIBRI]: 'idea01' })
+        await ops.moveDisk('idea01', 'idea03', KOLIBRI)
+        expect(store.docked.get(KOLIBRI)).toBe('idea03')
+        expect(isOwnInstanceContainer(OWN.name, [KINST])).toBe(true)
+        expect(isOwnInstanceContainer(`${ZOMBIE}-kolibri-1`, [KINST])).toBe(false)
+        noStopCalls()
+    })
+
+    it('a container that starts using the slot AFTER the eject → refused before the tar; source left EJECTED (said so), no staging on the target', async () => {
+        const root = plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real')
+        const ops = new LocalFleetOps(sb)
+        const store = stubStore(ops, sb, { [KOLIBRI]: 'idea01' }, {
+            afterUndock: h => setContainers(sb, h, [{ id: 'late00000001', name: 'late-writer-1', mounts: [`${root}/instances/${KINST}/data/kolibri`] }]),
+        })
+        fs.writeFileSync(`${sb.host('idea01').watch}/idea-test-1`, '')
+        const err = await ops.moveDisk('idea01', 'idea03', KOLIBRI).then(() => null, e => e as Error)
+        expect(err?.message).toMatch(/refuse to stream duration-kolibri-grade5a-001: after the eject on idea01 \(idea01\) running container\(s\) still use data inside .*idea-test-1 — late-writer-1 mounts /)
+        expect(err?.message).toMatch(/Source: duration-kolibri-grade5a-001 left EJECTED on idea01 \(undocked, sentinel .*idea-test-1 removed\), tree intact at idea01:.*idea-test-1; NOT re-docked by the harness.*No staging created on idea03/)
+        expect(store.docked.get(KOLIBRI) ?? null).toBeNull()
+        expect(ops.relays).toEqual([])
+        expect(fs.readdirSync(sb.host('idea03').disks)).toEqual([])
+        expect(fs.existsSync(`${root}/${DB_REL}`)).toBe(true)
+        noStopCalls()
+    })
+
+    it('docker cannot be asked on the source → refused before the eject (no silent pass)', async () => {
+        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real')
+        fs.writeFileSync(`${sb.dir}/idea01/docker.broken`, '')
+        const ops = new LocalFleetOps(sb)
+        const store = stubStore(ops, sb, { [KOLIBRI]: 'idea01' })
+        await expect(ops.moveDisk('idea01', 'idea03', KOLIBRI)).rejects.toThrow(
+            /cannot list the running containers' mounts on idea01 \(idea01\) — docker ps failed: Cannot connect to the Docker daemon.*refusing \(no silent pass\)/,
+        )
+        expect(store.calls.undock).toEqual([])
+        expect(store.docked.get(KOLIBRI)).toBe('idea01')
+    })
+
+    it('failed stream (tar "file changed as we read it", exit 1) stays a failure: staging verified gone on the target, source left EJECTED + intact (said so), duration in the error', async () => {
+        const root = plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real', { walkState: 'r35-62' })
+        const srcHash = sha256(`${root}/${DB_REL}`)
+        const ops = new LocalFleetOps(sb)
+        ops.failRelayWith = 'ssh relay idea01→idea03 failed (exit code: 1): tar: kolibri: file changed as we read it'
+        const store = stubStore(ops, sb, { [KOLIBRI]: 'idea01' })
+        fs.writeFileSync(`${sb.host('idea01').watch}/idea-test-1`, '')
+        const logs: string[] = []
+        const spy = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => { logs.push(a.map(String).join(' ')) })
+        let err: Error | null = null
+        try {
+            err = await ops.moveDisk('idea01', 'idea03', KOLIBRI).then(() => null, e => e as Error)
+        } finally {
+            spy.mockRestore()
+        }
+        const msg = err?.message ?? ''
+        expect(msg).toMatch(/tar: kolibri: file changed as we read it/)
+        expect(msg).toMatch(new RegExp(`Staging idea03:.*\\.incoming-idea-test-1-${KOLIBRI} removed \\(verified absent\\); source tree left intact \\(undocked\\) at idea01:.*idea-test-1`))
+        expect(msg).toMatch(/Source: duration-kolibri-grade5a-001 left EJECTED on idea01 .*NOT re-docked by the harness/)
+        expect(msg).toMatch(/\[move_duration_ms=\d+; failed after \d+ms \(preflight \d+ms, eject \d+ms\)\]/)
+        expect(fs.readdirSync(sb.host('idea03').disks)).toEqual([])
+        expect(sha256(`${root}/${DB_REL}`)).toBe(srcHash)
+        expect(store.docked.get(KOLIBRI) ?? null).toBeNull()
+        expect(fs.existsSync(`${sb.host('idea01').watch}/idea-test-1`)).toBe(false)
+        expect(logs.some(l => /moveDisk duration-kolibri-grade5a-001 idea01→idea03: FAILED after \d+ms/.test(l))).toBe(true)
+    })
+
+    it('failed stream whose staging cannot be removed → the error says it is NOT removed (no false "removed")', async () => {
+        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real')
+        const ops = new LocalFleetOps(sb)
+        ops.failRelayWith = 'tar: kolibri: file changed as we read it'
+        ops.keepStaging = true
+        stubStore(ops, sb, { [KOLIBRI]: 'idea01' })
+        await expect(ops.moveDisk('idea01', 'idea03', KOLIBRI)).rejects.toThrow(
+            /Staging idea03:.*\.incoming-idea-test-1-duration-kolibri-grade5a-001 NOT removed \(still there: .*\) — remove it before the next run/,
+        )
+        expect(fs.readdirSync(sb.host('idea03').disks)).toEqual([`.incoming-idea-test-1-${KOLIBRI}`])
+        const st = path.join(sb.dir, 'st')
+        expect(execFileSync('bash', ['-c', buildStagingCleanupRemote(st, 'never')]).toString().trim()).toBe('STAGING_GONE')
+    })
+
+    it('successful move logs its duration with phases', async () => {
+        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real')
+        const ops = new LocalFleetOps(sb)
+        stubStore(ops, sb, { [KOLIBRI]: 'idea01' })
+        const logs: string[] = []
+        const spy = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => { logs.push(a.map(String).join(' ')) })
+        try {
+            await ops.moveDisk('idea01', 'idea03', KOLIBRI)
+        } finally {
+            spy.mockRestore()
+        }
+        expect(logs.some(l => /\[RealFleetOps\] moveDisk duration-kolibri-grade5a-001 idea01→idea03: done in \d+ms \(preflight \d+ms, eject \d+ms, stream \d+ms, verify\+commit \d+ms, dock \d+ms\)/.test(l))).toBe(true)
+    })
+
+    it('mount scan builder: literal and resolved mount sources inside the roots are hits; outside ones are not; parse needs MOUNT_SCAN_END', () => {
+        const root = plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real')
+        const zombie = plantZombieCopy('idea01', `${root}/instances/${KINST}/data/kolibri`)
+        setContainers(sb, 'idea01', [
+            { ...OWN, mounts: [`${root}/instances/${KINST}/data/kolibri`] },
+            zombie,
+            { id: 'kiwix0000001', name: 'idea166-kiwix-live', mounts: [`${sb.dir}/idea01/idea166-kiwix-live/data`] },
+        ])
+        const env = `export PATH=${sb.dir}/fakebin:$PATH FAKE_DOCKER_HOST=idea01 FAKE_DOCKER_STATE=${dockerState(sb, 'idea01')} FAKE_DOCKER_LOG=${sb.dir}/docker.log FAKE_DOCKER_BROKEN=${sb.dir}/none; `
+        const res = parseMountScan(execFileSync('bash', ['-c', env + buildMountScanRemote([root])]).toString())
+        expect(res.error).toBeNull()
+        expect(res.hits).toEqual([
+            { container: OWN.name, source: `${root}/instances/${KINST}/data/kolibri`, resolved: `${root}/instances/${KINST}/data/kolibri` },
+            { container: zombie.name, source: zombie.mounts[1], resolved: `${root}/instances/${KINST}/data/kolibri` },
+        ])
+        expect(buildMountScanRemote(['/x'])).toContain(`docker inspect --format '{{$n := .Name}}{{range .Mounts}}{{$n}}{{"\\t"}}{{.Source}}{{println}}{{end}}'`)
+        expect(buildMountScanRemote(['/x'])).not.toMatch(/docker (stop|kill|rm|restart)/)
+        expect(parseMountScan('')).toMatchObject({ error: expect.stringMatching(/incomplete/) })
+        expect(parseMountScan('MOUNT_SCAN_ERR docker ps failed: x\nMOUNT_SCAN_END').error).toBe('docker ps failed: x')
     })
 })
