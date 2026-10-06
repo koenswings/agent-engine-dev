@@ -1,5 +1,5 @@
 import { CommandDefinition } from "./CommandDefinition.js";
-import { Store, getApps, getDisks, getDisk, getRunningEngines, getInstances, getEngine, findDiskByName, findInstanceByName, getLocalEngine, createClientStore } from "./Store.js";
+import { Store, getApps, getDisks, getDisk, getRunningEngines, getInstances, getEngine, findDiskByName, getLocalEngine, createClientStore } from "./Store.js";
 import { Disk, clearDuplicateDiskRecords, isSystemDiskRecord } from "./Disk.js";
 import { deepPrint, log, print } from "../utils/utils.js";
 import { Instance, buildInstance, startInstance, runInstance, stopInstance, markInstanceError } from "./Instance.js";
@@ -219,8 +219,7 @@ const startInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instan
         causeFlag ? (causeFlag.split('=')[1] ?? rest[rest.indexOf(causeFlag) + 1] ?? 'cross-engine-cmd') as any
         : 'console-command'
     const store = storeHandle.doc()
-    const instance = findInstanceByName(store, instanceName)
-    if (!instance) throw new Error(`Instance ${instanceName} not found`)
+    const instance = resolveInstanceArg(store, instanceName, 'startInstance')
     // Look up disk by ID from instance.storedOn — same fix as stopInstanceWrapper.
     // findDiskByName uses getDisks() which filters dockedTo != null and misses
     // disks that appear undocked in the CRDT but are physically still attached.
@@ -232,9 +231,8 @@ const startInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instan
 const runInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName) => {
     if (!storeHandle) throw new Error("Store is not available.")
     const store = storeHandle.doc()
-    const instance = findInstanceByName(store, instanceName)
+    const instance = resolveInstanceArg(store, instanceName, 'runInstance')
     const disk = findDiskByName(store, diskName)
-    if (!instance) throw new Error(`Instance ${instanceName} not found`)
     if (!disk) throw new Error(`Disk ${diskName} not found`)
     // runInstance propagates compose up failures (idea#109): mark the instance
     // Error and rethrow, so handleCommand closes this command's trace as failed.
@@ -249,8 +247,7 @@ const runInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instance
 const stopInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName) => {
     if (!storeHandle) throw new Error("Store is not available.")
     const store = storeHandle.doc()
-    const instance = findInstanceByName(store, instanceName)
-    if (!instance) throw new Error(`Instance ${instanceName} not found`)
+    const instance = resolveInstanceArg(store, instanceName, 'stopInstance')
     // Look up disk by ID from instance.storedOn — not via getDisks() which filters
     // to dockedTo != null and would miss disks that appear undocked in the CRDT.
     const disk = (instance.storedOn ? getDisk(store, instance.storedOn) : undefined) ?? findDiskByName(store, diskName)
