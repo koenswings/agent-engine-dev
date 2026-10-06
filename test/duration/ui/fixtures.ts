@@ -66,6 +66,7 @@ export const PIXEL_REGISTERED_INTENTS = [
     'open_nextcloud_as_learner',
     'open_video',
     'open_exercise',
+    'next_resource', // Console#135 @ 1a46f20 (e2e/intents/registry.ts:147)
     // Pixel coaching set (Console#134 @ ba0cfa1)
     'create_class',
     'enroll_learners',
@@ -128,7 +129,6 @@ export type PixelIntentName = (typeof PIXEL_REGISTERED_INTENTS)[number]
 /** Known YAML Intents not in Pixel registry — clear deferred message, never silent. */
 export const DEFERRED_UI_INTENTS = [
     'keep_watching',
-    'next_resource',
     'exit_lesson',
     'open_wikipedia_as_teacher',
     'open_wikipedia_as_learner',
@@ -137,7 +137,7 @@ export const DEFERRED_UI_INTENTS = [
 /**
  * Proposal Intents on unified.yaml still not in Pixel's 65-key registry (@ ba0cfa1).
  * StubUiDriver Fake no-ops; live --ui clear-miss until Pixel adapters — do not drop YAML edges.
- * Lesson chrome keep_watching/next_resource/exit_lesson + open_wikipedia_* live under DEFERRED_UI_INTENTS.
+ * Lesson chrome keep_watching/exit_lesson + open_wikipedia_* live under DEFERRED_UI_INTENTS.
  */
 export const PIXEL_MISSING_INTENTS = [
     // Kolibri navigation (finish_exercise/next_video not deferred — clear Fake no-op)

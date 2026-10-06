@@ -49,7 +49,7 @@ Operator deep: `install_app`, `start_after_install`, `stay_on_disk`, `make_backu
 
 ### Deferred (clear message, not silent)
 
-`keep_watching`, `next_resource`, `exit_lesson`, `open_wikipedia_as_teacher`, `open_wikipedia_as_learner`
+`keep_watching`, `exit_lesson`, `open_wikipedia_as_teacher`, `open_wikipedia_as_learner`
 
 ### Pixel-missing (still on unified.yaml — Fake Stub no-op / live clear-miss)
 
