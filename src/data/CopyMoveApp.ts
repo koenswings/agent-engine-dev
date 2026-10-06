@@ -18,6 +18,7 @@ import {
     instanceDataBytes, deleteInstanceData, deleteRemoteInstanceData, ensureRemoteDirs,
     receiveAppArgs, receiveFilesArgs, receiveServiceArgs,
 } from '../utils/appDataHelper.js'
+import { peerCopyRefusal, peerAccessProblem } from './PeerAccess.js'
 import {
     InstanceID, DiskID, DiskName, InstanceName, Timestamp,
     OperationKind, OperationCause, ServiceImage
@@ -83,7 +84,8 @@ const validate = async (
     store: Store,
     instanceName: InstanceName,
     sourceDiskId: DiskID,
-    targetDiskId: DiskID
+    targetDiskId: DiskID,
+    kind: 'copy' | 'move' = 'copy'
 ): Promise<ValidatedCopyMove | string> => {
     // Look up the instance id-first (idea#168): an instance id, else a unique
     // name, else the one instance with that name on the source disk (the
@@ -122,6 +124,12 @@ const validate = async (
         const remoteAddress = getEngineAddress(targetEngineId as any)
         if (!remoteAddress) {
             return `Target engine '${targetEngineId}' is not currently reachable (not in network connections). Ensure it is online and connected.`
+        }
+        // Per-Pi Engine keys: both Engines must have accepted each other's key
+        // (a move refuses a remote target itself, with its own message)
+        if (kind === 'copy') {
+            const refusal = peerCopyRefusal(store, String(localEngineId), String(targetEngineId), peerAccessProblem())
+            if (refusal) return refusal
         }
     }
 
@@ -461,7 +469,7 @@ export const moveApp = async (
 ): Promise<void> => {
     const store = storeHandle.doc()
 
-    const v = await validate(store, instanceName, sourceDiskId, targetDiskId)
+    const v = await validate(store, instanceName, sourceDiskId, targetDiskId, 'move')
     // Validation refusals throw (idea#168 r29@97), so the command trace or
     // crash-recovery retry ends as error instead of silently succeeding.
     if (typeof v === 'string') throw new Error(`moveApp: ${v}`)

@@ -4,7 +4,7 @@ import { runDiskDetectionSelfCheck, recordDiskDetectionFailure, errorMessage } f
 import { enableTimeMonitor, generateHeartBeat } from './monitors/timeMonitor.js'
 import { $, chalk, fs, sleep } from 'zx'
 import { deepPrint, log, print } from './utils/utils.js'
-import { config } from './data/Config.js'
+import { config, peerAccessEnabled, peerStaleMs } from './data/Config.js'
 import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
 import { enableHttpMonitor } from './monitors/httpMonitor.js'
@@ -28,6 +28,7 @@ import { clearStaleUnmountErrors } from './monitors/mounts.js'
 import { createCommandLogStore, shutdownRepo } from './data/CommandLogStore.js'
 import { initCommandLogger } from './utils/CommandLogger.js'
 import { assertAppDataHelper } from './utils/appDataHelper.js'
+import { startPeerAccess } from './data/PeerAccess.js'
 import { checkAndSetUndockedApps } from './data/UndockedApps.js'
 export { checkAndSetUndockedApps }
 
@@ -84,8 +85,9 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // Store identity (idea#120): a missing store-url.txt is written back with the
     // shared fleet store URL; an existing one is used as it is. store-template.json
     // is never written; if it is missing, startup stops with a clear error.
-    const { storeDocId, restored } = await prepareStoreIdentity(storeIdentity)
+    const { storeDocId, restored, fallback } = await prepareStoreIdentity(storeIdentity)
     if (restored) print(chalk.yellow(`store-url.txt was missing: restored the fleet store URL`))
+    if (fallback) print(chalk.bgRed.white(`store-url.txt was restored by the Engine (store-identity/store-url.restored): peer access fails closed until Ops confirms the store`))
     log(`Using document ID: ${storeDocId}`)
 
     // HACK: Force save on remote changes
@@ -115,6 +117,14 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // monitors start so there is no racing writer; tombstones propagate to
     // all peers on the next Automerge sync.
     cleanupPhantomEngines(storeHandle)
+
+    // Per-Pi Engine key (design-per-pi-engine-key.md): make it if missing, publish
+    // it with the host key in this Engine's entry, and sync peers' keys into the
+    // root-owned authorized_keys/known_hosts through idea-app-data sync-peers.
+    // Fails closed (no key published, nobody authorized) on a restored store URL.
+    const peerAccess = await startPeerAccess(storeHandle, String(localEngineId), {
+        enabled: peerAccessEnabled(), fallbackStore: fallback, storeUrlPath: storeIdentity.urlPath, staleMs: peerStaleMs(),
+    })
 
     // Clear unmount errors (idea#126) this Engine recorded for disks whose mount
     // point is no longer mounted, or now holds another filesystem (fsUuid).
@@ -229,7 +239,11 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     log(chalk.bgMagenta('STARTING HEARTBEAT GENERATION'))
     const heartbeatIntervalMs = config.settings.heartbeatIntervalMs ?? 50000
     generateHeartBeat(storeHandle)
-    enableTimeMonitor(heartbeatIntervalMs, () => generateHeartBeat(storeHandle))
+    // The heartbeat also repairs this Engine's peerAccess and expires stale peers
+    enableTimeMonitor(heartbeatIntervalMs, () => {
+        generateHeartBeat(storeHandle)
+        peerAccess.onHeartbeat().catch(e => print(chalk.red(`peer access heartbeat: ${e}`)))
+    })
 
 
 }

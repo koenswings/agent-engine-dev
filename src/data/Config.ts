@@ -26,6 +26,8 @@ export interface Settings {
     skipMetaUpdate?: boolean;     // If true, readMetaUpdateId never rewrites an existing META.yaml and /META.yaml is never created (default: isDev || testMode). See skipMetaUpdate().
     dockerAvailable?: boolean;    // Force the Docker-available answer (default: unset → cached `docker info` probe). See utils/dockerAvailable.ts.
     staticPeers?: string;         // Opt-in static peer list 'host[:port],...' (IDEA_STATIC_PEERS wins). See StaticPeers.ts.
+    peerAccess?: boolean;         // Per-Pi Engine keys for cross-Engine copy (default: on unless isDev || testMode). See peerAccessEnabled().
+    peerStaleHours?: number;      // A peer Engine without a heartbeat for this long loses its key here (default 168 = 7 days). See peerStaleMs().
 }
 
 export interface Defaults {
@@ -126,6 +128,8 @@ function validateSettings(obj: any, path: string): string[] {
     if (obj.dockerAvailable !== undefined && typeof obj.dockerAvailable !== 'boolean') errors.push(`'${path}dockerAvailable' must be a boolean.`);
     if (obj.skipMetaWrite !== undefined && typeof obj.skipMetaWrite !== 'boolean') errors.push(`'${path}skipMetaWrite' must be a boolean.`);
     if (obj.staticPeers !== undefined && obj.staticPeers !== null && typeof obj.staticPeers !== 'string') errors.push(`'${path}staticPeers' must be a string.`);
+    if (obj.peerAccess !== undefined && typeof obj.peerAccess !== 'boolean') errors.push(`'${path}peerAccess' must be a boolean.`);
+    if (obj.peerStaleHours !== undefined && (typeof obj.peerStaleHours !== 'number' || !(obj.peerStaleHours > 0))) errors.push(`'${path}peerStaleHours' must be a positive number.`);
     return errors;
 }
 
@@ -323,6 +327,17 @@ if (process.env.IDEA_SKIP_BORG === 'true' || process.env.IDEA_SKIP_BORG === 'fal
  * testMode (ordinary tests keep skipping borg). Read at call time.
  */
 export const skipBorg = (): boolean => config.settings.skipBorg ?? config.settings.testMode;
+
+/**
+ * Whether this Engine makes and publishes its own Engine key and syncs its peers'
+ * keys into the root-owned authorized_keys/known_hosts (data/PeerAccess.ts).
+ * Unset: on, except on dev containers and in test mode (no root helper there).
+ */
+export const peerAccessEnabled = (): boolean => config.settings.peerAccess ?? !(config.settings.isDev || config.settings.testMode);
+
+/** After how long without a heartbeat a peer's key is removed (settings.peerStaleHours; default 7 days). */
+export const PEER_STALE_HOURS_DEFAULT = 168;
+export const peerStaleMs = (): number => (config.settings.peerStaleHours ?? PEER_STALE_HOURS_DEFAULT) * 60 * 60 * 1000;
 
 export const DEFAULT_DISKS_ROOT = '/disks';
 

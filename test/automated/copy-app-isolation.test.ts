@@ -162,7 +162,17 @@ import { findExternalLinks, uniqueCopyName, clearEnginePort, setComposeInstanceN
 import { choosePortForStart } from '../../src/data/Instance.js'
 import { randomPort } from '../../src/utils/utils.js'
 import { AppID, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/data/CommonTypes.js'
+import { authorizedEntry } from '../../src/data/PeerAccess.js'
 import { peerSshOptions } from '../../src/utils/peerSsh.js'
+import { testKey } from '../harness/peerKeys.js'
+
+/** Per-Pi Engine keys: the local Engine and REMOTE have published and accepted each other's keys. */
+const peersExchanged = (doc: Store, remote: EngineID, opts: { remoteAccepts?: boolean } = {}) => {
+    const keys = (seed: string) => ({ sshKey: testKey(`${seed}-ssh`), hostKey: testKey(`${seed}-host`), publishedAt: 0 as Timestamp })
+    const local = keys('local'); const rem = keys(String(remote))
+    ;(doc.engineDB as any)[localEngineId].peerAccess = { ...local, authorized: [authorizedEntry(String(remote), rem)] }
+    ;(doc.engineDB as any)[remote].peerAccess = { ...rem, authorized: opts.remoteAccepts === false ? [] : [authorizedEntry(String(localEngineId), local)] }
+}
 
 const SRC = 'DISK_src-r35' as DiskID
 const TGT = 'DISK_tgt-r35' as DiskID
@@ -391,6 +401,7 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
         h.change(doc => {
             doc.diskDB[TGT].dockedTo = REMOTE
             ;(doc.engineDB as any)[REMOTE] = { id: REMOTE, commands: [], lastRun: Date.now() }
+            peersExchanged(doc, REMOTE)
         })
         network.connections['10.0.0.35:4321' as any] = { adapter: {} as any, missedDiscoveryCount: 0, hostname: 'idea35' as any, engineId: REMOTE }
         try {
@@ -444,6 +455,7 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
         h.change(doc => {
             doc.diskDB[TGT].dockedTo = REMOTE
             ;(doc.engineDB as any)[REMOTE] = { id: REMOTE, commands: [], lastRun: Date.now() }
+            peersExchanged(doc, REMOTE)
         })
         network.connections['10.0.0.36:4321' as any] = { adapter: {} as any, missedDiscoveryCount: 0, hostname: 'idea36' as any, engineId: REMOTE }
         try {
@@ -466,6 +478,30 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
             expect((Object.values(h.doc().operationDB)[0] as any).status).toBe('Failed')
         } finally {
             delete network.connections['10.0.0.36:4321' as any]
+        }
+    })
+
+    it('a cross-engine copy to a peer that has not accepted this Engine\'s key yet is refused in validate(): nothing sent, nothing stopped', async () => {
+        h = await makeHandle('Running')
+        const REMOTE = 'ENGINE_remote-r37' as EngineID
+        h.change(doc => {
+            doc.diskDB[TGT].dockedTo = REMOTE
+            ;(doc.engineDB as any)[REMOTE] = { id: REMOTE, hostname: 'idea37', commands: [], lastRun: Date.now() }
+            peersExchanged(doc, REMOTE, { remoteAccepts: false })
+        })
+        network.connections['10.0.0.37:4321' as any] = { adapter: {} as any, missedDiscoveryCount: 0, hostname: 'idea37' as any, engineId: REMOTE }
+        try {
+            await expect(copyApp(h, ORIG as any, SRC, TGT)).rejects.toThrow(
+                /^copyApp: Engine 'idea37' \(ENGINE_remote-r37\) has not accepted this Engine's key yet .* Try again in a minute\.$/)
+            h.change(doc => { delete (doc.engineDB as any)[REMOTE].peerAccess })
+            await expect(copyApp(h, ORIG as any, SRC, TGT)).rejects.toThrow(/has not published an Engine key \(it runs an older Engine/)
+            expect(sshCalls).toEqual([])
+            expect(remoteOverlays).toEqual([])
+            expect(instanceTransfers).toEqual([])
+            expect(order).toEqual([])
+            expect(Object.keys(h.doc().instanceDB)).toEqual([ORIG])
+        } finally {
+            delete network.connections['10.0.0.37:4321' as any]
         }
     })
 
