@@ -25,8 +25,15 @@ import {
     RealFleetOps,
     buildFixtureSlotScanRemote,
     buildInstanceDataCheckRemote,
+    buildExtLinkSendRemote,
+    buildMovePlanRemote,
     buildQuarantineSourceRemote,
+    buildRecreateSkipDirsRemote,
+    buildTreeDigestRemote,
     buildTreeSendRemote,
+    extLinkSkipPatterns,
+    parseTreeDigest,
+    skipDirTarPattern,
     fixtureSlotNames,
     parseFixtureSlotScan,
     parseInstanceDataCheck,
@@ -99,7 +106,7 @@ const makeSandbox = (): Sandbox => {
 }
 
 /** Kolibri slot on a host. data: 'real' | 'symlink' (Path A idea01) | 'none' (stale META-only). */
-const plantKolibriTree = (sb: Sandbox, h: string, slot: string, data: 'real' | 'symlink' | 'none', opts: { grade5a?: boolean; walkState?: string } = {}) => {
+const plantKolibriTree = (sb: Sandbox, h: string, slot: string, data: 'real' | 'symlink' | 'none', opts: { grade5a?: boolean; walkState?: string; sessions?: boolean } = {}) => {
     const root = `${sb.host(h).disks}/${slot}`
     fs.mkdirSync(`${root}/apps/kolibri-1.0`, { recursive: true })
     fs.mkdirSync(`${root}/instances/${KINST}`, { recursive: true })
@@ -120,8 +127,26 @@ const plantKolibriTree = (sb: Sandbox, h: string, slot: string, data: 'real' | '
         fs.mkdirSync(path.dirname(dataDir), { recursive: true })
         fs.symlinkSync(live, dataDir)
     }
+    if (opts.sessions && data !== 'none') plantUnreadableSessions(`${dataDir}/sessions`)
     return root
 }
+
+/**
+ * idea#168 r35@62: Kolibri's Django file sessions — one file per login, root 0600 on the Pi, so
+ * unreadable as pi (no sudo -n on idea01). Here: mode 000 files (the box runs as a non-root
+ * user, so they really are unreadable) in a distinctive 0750 dir.
+ */
+const SESSIONS_MODE = 0o750
+const plantUnreadableSessions = (dir: string) => {
+    fs.mkdirSync(dir, { recursive: true })
+    for (const n of ['sessionid-teacher-r35', 'sessionid-learner-r35']) {
+        fs.writeFileSync(`${dir}/${n}`, 'django-session-pickle')
+        fs.chmodSync(`${dir}/${n}`, 0o000)
+    }
+    fs.chmodSync(dir, SESSIONS_MODE)
+    expect(() => fs.readFileSync(`${dir}/sessionid-teacher-r35`)).toThrow(/EACCES/)
+}
+const SESSIONS_REL = `instances/${KINST}/data/kolibri/sessions`
 
 /** RealFleetOps whose SSH runs the generated bash locally against per-host sandboxes. */
 class LocalFleetOps extends RealFleetOps {
@@ -447,5 +472,144 @@ describe('idea#168 r34@70: moveDisk carries the source disk\'s real tree (no fix
         expect(buildQuarantineSourceRemote('/x/idea-test-1', '/x/.moved-away/q')).toMatch(/refuse quarantine of mount point/)
         expect(parseMovePlan('PLAN_END')).toMatchObject({ error: null })
         expect(parseMovePlan('')).toMatchObject({ error: expect.stringMatching(/incomplete/) })
+    })
+})
+
+describe('idea#168 r35@62: Kolibri root-0600 session files are left out of the move and recreated empty', () => {
+    const spec = APP_PACK_INSTANCE_DATA[KOLIBRI]!
+
+    it('pack spec: Kolibri skips data/kolibri/sessions; Nextcloud skips nothing; tar pattern is the unanchored tail', () => {
+        expect(spec.moveSkipDirs).toEqual([SESSIONS_REL])
+        expect(APP_PACK_INSTANCE_DATA['duration-nextcloud-grade5a-001']!.moveSkipDirs).toBeUndefined()
+        expect(skipDirTarPattern(SESSIONS_REL)).toBe('kolibri/sessions')
+        expect(extLinkSkipPatterns(`instances/${KINST}/data/kolibri`, '/home/pi/idea166-kolibri-live/data/kolibri', [SESSIONS_REL]))
+            .toEqual(['kolibri/sessions'])
+        // A link whose target basename differs still gets its sessions excluded.
+        expect(extLinkSkipPatterns(`instances/${KINST}/data/kolibri`, '/home/pi/kolibri-home', [SESSIONS_REL]))
+            .toEqual(['kolibri/sessions', 'kolibri-home/sessions'])
+    })
+
+    it('generated tar commands carry the exclude for both layouts, and GNU tar really drops sessions in both (slot ./instances/…/kolibri/sessions and ext-link kolibri/sessions)', () => {
+        const send = buildTreeSendRemote('/x/idea-test-1', [`instances/${KINST}/data/kolibri`], 'never', ['kolibri/sessions'])
+        expect(send).toContain(`--exclude='./instances/${KINST}/data/kolibri' --exclude='kolibri/sessions' .`)
+        const ext = buildExtLinkSendRemote('/home/pi/idea166-kolibri-live/data/kolibri', 'never', ['kolibri/sessions'])
+        expect(ext).toMatch(/tar --numeric-owner -cpf - --exclude='kolibri\/sessions' -C '\/home\/pi\/idea166-kolibri-live\/data' 'kolibri'$/)
+
+        // Real layout (data/kolibri a real dir in the slot): member ./instances/…/data/kolibri/sessions.
+        const realRoot = plantKolibriTree(sb, 'idea03', 'idea-test-1', 'real', { sessions: true })
+        const realList = execFileSync('bash', ['-o', 'pipefail', '-c', `${buildTreeSendRemote(realRoot, [], 'never', ['kolibri/sessions'])} | tar -tf -`]).toString()
+        expect(realList).toContain(`./${DB_REL}\n`)
+        expect(realList).toContain(`./instances/${KINST}/data/kolibri/content/storage/video.mp4`)
+        expect(realList).not.toMatch(/sessions/)
+        // Ext-link layout (Path A idea01): members named kolibri/…
+        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'symlink', { sessions: true })
+        const live = `${sb.dir}/idea01/idea166-kolibri-live/data/kolibri`
+        const extList = execFileSync('bash', ['-o', 'pipefail', '-c', `${buildExtLinkSendRemote(live, 'never', ['kolibri/sessions'])} | tar -tf -`]).toString()
+        expect(extList).toContain('kolibri/db.sqlite3\n')
+        expect(extList).not.toMatch(/sessions/)
+        // Sanity: without the exclude, tar as a non-root user fails on the 0600/000 session files (the r35@62 failure).
+        expect(() => execFileSync('bash', ['-o', 'pipefail', '-c', `${buildExtLinkSendRemote(live, 'never')} | tar -tf - >/dev/null`], { stdio: 'pipe' })).toThrow()
+    })
+
+    it('digest prunes sessions (find -L … -path \'*/kolibri/sessions\' -prune) on an unreadable tree; same digest as the tree without sessions', () => {
+        const cmd = buildTreeDigestRemote('/x', DB_REL, 'never', ['kolibri/sessions'])
+        expect(cmd).toContain(`find -L . \\( -path '*/kolibri/sessions' \\) -prune -o -type f -print0`)
+        expect(cmd.match(/-prune/g)).toHaveLength(2) // count + hash
+        const withS = plantKolibriTree(sb, 'idea01', 'idea-test-1', 'symlink', { sessions: true })
+        const noS = plantKolibriTree(sb, 'idea03', 'idea-test-1', 'real')
+        fs.copyFileSync(`${sb.dir}/idea01/idea166-kolibri-live/data/kolibri/db.sqlite3`, `${noS}/${DB_REL}`)
+        const dig = (root: string, pats: string[]) => parseTreeDigest(execFileSync('bash', ['-c', buildTreeDigestRemote(root, DB_REL, 'never', pats)], { stdio: 'pipe' }).toString())
+        const a = dig(withS, ['kolibri/sessions'])
+        const b = dig(noS, ['kolibri/sessions'])
+        expect(a).toMatchObject({ files: 6, key: sha256(`${noS}/${DB_REL}`) })
+        expect(b).toEqual(a)
+        // Sanity: the unpruned digest (b40b8a0) fails on the unreadable session files.
+        expect(dig(withS, [])).toMatchObject({ error: expect.stringMatching(/DIGEST_ERR hashing failed/) })
+    })
+
+    it('move plan prunes sessions from its link walk and reports the source sessions dir mode/owner', () => {
+        const root = plantKolibriTree(sb, 'idea03', 'idea-test-1', 'real', { sessions: true })
+        const cmd = buildMovePlanRemote(root, 'never', [SESSIONS_REL])
+        expect(cmd).toContain(`find . \\( -path './${SESSIONS_REL}' \\) -prune -o -type l -print0`)
+        const plan = parseMovePlan(execFileSync('bash', ['-c', cmd]).toString())
+        expect(plan.error).toBeNull()
+        const st = fs.statSync(`${root}/${SESSIONS_REL}`)
+        expect(plan.skipDirs).toEqual([{ rel: SESSIONS_REL, mode: '750', uid: st.uid, gid: st.gid }])
+        // Absent sessions dir: not listed (target falls back to 1777).
+        fs.rmSync(`${root}/${SESSIONS_REL}`, { recursive: true, force: true })
+        expect(parseMovePlan(execFileSync('bash', ['-c', cmd]).toString()).skipDirs).toEqual([])
+    })
+
+    it('recreate: source mode/owner when chown works; 1777 when the source is unknown or chown to it fails; skipped without a parent', () => {
+        const st = path.join(sb.dir, 'staging')
+        fs.mkdirSync(`${st}/a/kolibri`, { recursive: true })
+        fs.mkdirSync(`${st}/b/kolibri`, { recursive: true })
+        fs.mkdirSync(`${st}/c/kolibri`, { recursive: true })
+        const me = os.userInfo()
+        const out = execFileSync('bash', ['-c', buildRecreateSkipDirsRemote(st, [
+            { rel: 'a/kolibri/sessions', src: { mode: '750', uid: me.uid, gid: me.gid } },
+            { rel: 'b/kolibri/sessions', src: null },
+            { rel: 'c/kolibri/sessions', src: { mode: '700', uid: 0, gid: 0 } }, // root-owned source, no sudo on the target
+            { rel: 'd/kolibri/sessions', src: null },
+        ], 'never')]).toString()
+        const mode = (p: string) => (fs.statSync(p).mode & 0o7777).toString(8)
+        expect(mode(`${st}/a/kolibri/sessions`)).toBe('750')
+        expect(mode(`${st}/b/kolibri/sessions`)).toBe('1777')
+        expect(mode(`${st}/c/kolibri/sessions`)).toBe('1777')
+        expect(fs.existsSync(`${st}/d`)).toBe(false)
+        for (const x of ['a', 'b', 'c']) expect(fs.readdirSync(`${st}/${x}/kolibri/sessions`)).toEqual([])
+        expect(out).toMatch(/SKIPDIR a\/kolibri\/sessions recreated empty mode=750 owner=\d+:\d+ \(as source\)/)
+        expect(out).toMatch(/SKIPDIR c\/kolibri\/sessions recreated empty mode=1777 \(could not chown to source owner 0:0\)/)
+        expect(out).toMatch(/SKIPDIR d\/kolibri\/sessions not recreated/)
+    })
+
+    it('(r35@62) idea01→idea03 with UNREADABLE session files behind the data/kolibri link: move succeeds, db.sqlite3 sha256 matches, target has an EMPTY sessions dir (source mode)', async () => {
+        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'symlink', { sessions: true, walkState: 'r35-steps-1-61' })
+        const liveDb = `${sb.dir}/idea01/idea166-kolibri-live/data/kolibri/db.sqlite3`
+        const srcHash = sha256(liveDb)
+        const ops = new LocalFleetOps(sb)
+        const store = stubStore(ops, sb, { [KOLIBRI]: 'idea01' })
+        fs.writeFileSync(`${sb.host('idea01').watch}/idea-test-1`, '')
+        await ops.moveDisk('idea01', 'idea03', KOLIBRI)
+
+        const dst = `${sb.host('idea03').disks}/idea-test-1`
+        expect(sha256(`${dst}/${DB_REL}`)).toBe(srcHash)
+        expect(readWalkState(`${dst}/${DB_REL}`)).toBe('r35-steps-1-61')
+        const sess = `${dst}/${SESSIONS_REL}`
+        expect(fs.lstatSync(sess).isDirectory()).toBe(true)
+        expect(fs.readdirSync(sess)).toEqual([])
+        expect(fs.statSync(sess).mode & 0o7777).toBe(SESSIONS_MODE)
+        expect(store.docked.get(KOLIBRI)).toBe('idea03')
+        // Every stream and digest carried the exclude / prune.
+        expect(ops.relays.map(r => r.srcCmd).every(c => c.includes(`--exclude='kolibri/sessions'`))).toBe(true)
+        expect(ops.cmds.filter(c => c.cmd.includes('DIGEST files=')).map(c => c.host).sort()).toEqual(['idea01', 'idea03'])
+        expect(ops.cmds.filter(c => c.cmd.includes('DIGEST files=')).every(c => c.cmd.includes(`-path '*/kolibri/sessions' \\) -prune`))).toBe(true)
+        // Source session files untouched (live data stays on idea01).
+        expect(fs.readdirSync(`${sb.dir}/idea01/idea166-kolibri-live/data/kolibri/sessions`).sort()).toEqual(['sessionid-learner-r35', 'sessionid-teacher-r35'])
+    })
+
+    it('(r35) real-dir layout idea03→idea04 with unreadable sessions: move succeeds, sessions recreated empty, db hash matches', async () => {
+        plantKolibriTree(sb, 'idea03', 'idea-test-2', 'real', { sessions: true, walkState: 'after-r35-move' })
+        const srcHash = sha256(`${sb.host('idea03').disks}/idea-test-2/${DB_REL}`)
+        const ops = new LocalFleetOps(sb)
+        const store = stubStore(ops, sb, { [KOLIBRI]: 'idea03' })
+        fs.writeFileSync(`${sb.host('idea03').watch}/idea-test-2`, '')
+        await ops.moveDisk('idea03', 'idea04', KOLIBRI)
+        const dst = `${sb.host('idea04').disks}/idea-test-1`
+        expect(sha256(`${dst}/${DB_REL}`)).toBe(srcHash)
+        expect(fs.readdirSync(`${dst}/${SESSIONS_REL}`)).toEqual([])
+        expect(fs.statSync(`${dst}/${SESSIONS_REL}`).mode & 0o7777).toBe(SESSIONS_MODE)
+        expect(store.docked.get(KOLIBRI)).toBe('idea04')
+        expect(ops.relays).toHaveLength(1)
+    })
+
+    it('(r35) source without a sessions dir: target still gets one (1777) so Django file sessions work', async () => {
+        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'symlink')
+        const ops = new LocalFleetOps(sb)
+        stubStore(ops, sb, { [KOLIBRI]: 'idea01' })
+        await ops.moveDisk('idea01', 'idea03', KOLIBRI)
+        const sess = `${sb.host('idea03').disks}/idea-test-1/${SESSIONS_REL}`
+        expect(fs.readdirSync(sess)).toEqual([])
+        expect(fs.statSync(sess).mode & 0o7777).toBe(0o1777)
     })
 })

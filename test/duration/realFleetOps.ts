@@ -530,6 +530,14 @@ export type AppPackInstanceData = {
     keyFile: string
     /** Human description of what lives there (error messages). */
     describe: string
+    /**
+     * idea#168 r35@62: slot-relative dirs whose CONTENTS are throwaway and are NOT carried by
+     * moveDisk (left out of the slot tar, the external-link tar and the digest on both sides);
+     * each is recreated EMPTY on the target (source mode/owner when the source dir can be
+     * stat'ed and chown'ed, else 1777). Kolibri: Django file sessions, root 0600 per login —
+     * unreadable as pi without sudo -n; the walk logs in again after the move.
+     */
+    moveSkipDirs?: readonly string[]
 }
 
 export const APP_PACK_INSTANCE_DATA: Readonly<Record<string, AppPackInstanceData>> = {
@@ -539,6 +547,9 @@ export const APP_PACK_INSTANCE_DATA: Readonly<Record<string, AppPackInstanceData
         // compose: ./data/kolibri:/root/.kolibri (KOLIBRI_HOME) → db.sqlite3 is the Kolibri DB.
         keyFile: 'instances/kolibri-grade5a-001/data/kolibri/db.sqlite3',
         describe: `Kolibri home db.sqlite3 with facility + classroom '${KOLIBRI_GRADE5A_CLASS_NAME}'`,
+        // KOLIBRI_HOME/sessions: Django SESSION_ENGINE=file, one root 0600 file per login. Must
+        // exist (else ImproperlyConfigured) but its contents are disposable.
+        moveSkipDirs: ['instances/kolibri-grade5a-001/data/kolibri/sessions'],
     },
     'duration-nextcloud-grade5a-001': {
         pack: 'nextcloud',
@@ -648,22 +659,31 @@ export const parseFixtureSlotScan = (out: string): { device: string; state: Fixt
         .filter((m): m is RegExpExecArray => !!m)
         .map(m => ({ device: m[1]!, state: m[2] as FixtureSlotState, mount: !!m[3] }))
 
+/** `\( -path A -o -path B \) -prune -o ` (or '') for find. */
+const findPruneExpr = (paths: readonly string[]): string =>
+    paths.length ? `\\( ${paths.map(p => `-path ${shq(p)}`).join(' -o ')} \\) -prune -o ` : ''
+
 /**
  * Source-side move plan (read-only): mount point?, instance ids, and every symlink in the
  * tree that resolves OUTSIDE the slot (Path A: data/kolibri → idea166-kolibri-live). Those
  * are materialized on the target — a real disk carries its data, not a host-local link.
  */
-export const buildMovePlanRemote = (slot: string, sudoMode: SudoMode): string => [
+export const buildMovePlanRemote = (slot: string, sudoMode: SudoMode, skipDirs: readonly string[] = []): string => [
     sudoPreamble(sudoMode),
     `s=${shq(slot)}`,
     `if ! test -d "$s"; then echo "PLAN_ERR source slot $s missing"; exit 0; fi`,
     `if mountpoint -q "$s" 2>/dev/null; then echo "PLAN_MOUNT $(findmnt -no FSTYPE "$s" 2>/dev/null || true)"; fi`,
     `sc=$(readlink -f -- "$s")`,
     `cd "$s" || { echo "PLAN_ERR cannot cd $s"; exit 0; }`,
-    `$S find . -type l -print0 | while IFS= read -r -d '' l; do rel=\${l#./}; r=$($S readlink -f -- "$l" 2>/dev/null || true); ` +
+    `$S find . ${findPruneExpr(skipDirs.map(r => `./${r}`))}-type l -print0 | while IFS= read -r -d '' l; do rel=\${l#./}; r=$($S readlink -f -- "$l" 2>/dev/null || true); ` +
     `if [ -z "$r" ] || ! $S test -e "$r"; then echo "PLAN_DANGLING $rel"; continue; fi; ` +
     `case "$r" in "$sc"|"$sc"/*) ;; *) printf 'PLAN_EXTLINK %s\\t%s\\n' "$rel" "$r";; esac; done`,
     `for i in instances/*/; do if [ -d "$i" ]; then echo "PLAN_INST $(basename "$i")"; fi; done`,
+    // Skipped dirs: mode/owner of the source dir (stat -L follows data/kolibri → live; needs
+    // only search on the parent, so works for a root 0700 dir) or '-' when absent/unreadable.
+    ...skipDirs.map(r =>
+        `if st=$($S stat -L -c '%a %u %g' -- ${shq(r)} 2>/dev/null); then printf 'PLAN_SKIPDIR %s\\t%s\\n' ${shq(r)} "$st"; ` +
+        `else printf 'PLAN_SKIPDIR %s\\t-\\n' ${shq(r)}; fi`),
     `echo PLAN_END`,
 ].join('; ')
 
@@ -673,10 +693,12 @@ export type MovePlan = {
     dangling: string[]
     extLinks: { rel: string; target: string }[]
     instances: string[]
+    /** idea#168 r35@62: source mode/owner of each pack skip dir that could be stat'ed (absent ones omitted). */
+    skipDirs: { rel: string; mode: string; uid: number; gid: number }[]
 }
 
 export const parseMovePlan = (out: string): MovePlan => {
-    const plan: MovePlan = { error: null, mountFsType: null, dangling: [], extLinks: [], instances: [] }
+    const plan: MovePlan = { error: null, mountFsType: null, dangling: [], extLinks: [], instances: [], skipDirs: [] }
     let ended = false
     for (const raw of String(out ?? '').split('\n')) {
         const l = raw.replace(/\r$/, '')
@@ -686,6 +708,10 @@ export const parseMovePlan = (out: string): MovePlan => {
         else if (l.startsWith('PLAN_EXTLINK ')) {
             const [rel, target] = l.slice(13).split('\t')
             if (rel && target) plan.extLinks.push({ rel, target })
+        } else if (l.startsWith('PLAN_SKIPDIR ')) {
+            const [rel, st] = l.slice(13).split('\t')
+            const m = /^([0-7]{3,4}) (\d+) (\d+)$/.exec(String(st ?? '').trim())
+            if (rel && m) plan.skipDirs.push({ rel, mode: m[1]!, uid: Number(m[2]), gid: Number(m[3]) })
         } else if (l.startsWith('PLAN_INST ')) plan.instances.push(l.slice(10).trim())
         else if (l === 'PLAN_END') ended = true
     }
@@ -699,22 +725,51 @@ export const isSafeRelPath = (rel: string): boolean =>
     SAFE_REL.test(rel) && !rel.split('/').some(seg => seg === '..' || seg === '.')
 export const isSafeAbsPath = (p: string): boolean => p.startsWith('/') && isSafeRelPath(p.slice(1))
 
-/** Source: stream the slot tree (tar, owners/modes kept) minus the external links. */
-export const buildTreeSendRemote = (slot: string, excludeRels: string[], sudoMode: SudoMode): string =>
+/**
+ * idea#168 r35@62: unanchored tar pattern for a skip dir — its last two path segments
+ * ('instances/…/data/kolibri/sessions' → 'kolibri/sessions'). GNU tar --exclude is unanchored
+ * by default (matches after any '/'), so one pattern hits both the slot stream
+ * (./instances/…/data/kolibri/sessions) and the external-link stream, whose members are named
+ * after the link target's basename (kolibri/sessions). Excluding the dir entry means tar never
+ * opens it (works for a root 0700 dir with root 0600 files as pi).
+ */
+export const skipDirTarPattern = (rel: string): string => rel.split('/').slice(-2).join('/')
+
+/** Source: stream the slot tree (tar, owners/modes kept) minus the external links and skip dirs. */
+export const buildTreeSendRemote = (slot: string, excludeRels: string[], sudoMode: SudoMode, skipPatterns: readonly string[] = []): string =>
     `${sudoPreamble(sudoMode)}; cd ${shq(slot)} && $S tar --numeric-owner -cpf - ` +
-    excludeRels.map(r => `--exclude=${shq(`./${r}`)} `).join('') + '.'
+    excludeRels.map(r => `--exclude=${shq(`./${r}`)} `).join('') +
+    skipPatterns.map(p => `--exclude=${shq(p)} `).join('') + '.'
 
 /** Target: unpack the stream into a fresh staging dir (never a live slot). */
 export const buildTreeReceiveRemote = (staging: string, sudoMode: SudoMode): string =>
     `set -euo pipefail; ${sudoPreamble(sudoMode)}; $S rm -rf ${shq(staging)}; mkdir -p ${shq(staging)}; ` +
     `$S tar --numeric-owner -xpf - -C ${shq(staging)}`
 
-/** Source: stream the data an external symlink points at (dir or file), by its own name. */
-export const buildExtLinkSendRemote = (target: string, sudoMode: SudoMode): string => {
+/** Source: stream the data an external symlink points at (dir or file), by its own name, minus skip dirs. */
+export const buildExtLinkSendRemote = (target: string, sudoMode: SudoMode, skipPatterns: readonly string[] = []): string => {
     const cut = target.lastIndexOf('/')
     const dir = cut <= 0 ? '/' : target.slice(0, cut)
     const base = target.slice(cut + 1)
-    return `${sudoPreamble(sudoMode)}; $S tar --numeric-owner -cpf - -C ${shq(dir)} ${shq(base)}`
+    return `${sudoPreamble(sudoMode)}; $S tar --numeric-owner -cpf - ` +
+        skipPatterns.map(p => `--exclude=${shq(p)} `).join('') + `-C ${shq(dir)} ${shq(base)}`
+}
+
+/**
+ * Tar patterns for the external-link stream of link `rel` → `target`: the unanchored tails plus,
+ * when the target's basename differs from the link's own name, the skip dir re-rooted at the
+ * target basename (so a link named data/kolibri → …/kolibri-live still excludes its sessions).
+ */
+export const extLinkSkipPatterns = (rel: string, target: string, skipDirs: readonly string[]): string[] => {
+    const base = target.slice(target.lastIndexOf('/') + 1)
+    const out = skipDirs.map(skipDirTarPattern)
+    for (const d of skipDirs) {
+        if (d.startsWith(`${rel}/`)) {
+            const p = `${base}${d.slice(rel.length)}`
+            if (!out.includes(p)) out.push(p)
+        }
+    }
+    return out
 }
 
 /** Target: unpack an external link's data and place it at <staging>/<rel> as real data. */
@@ -732,14 +787,45 @@ export const buildExtLinkReceiveRemote = (staging: string, rel: string, target: 
  * link digests the same as the target where it was materialized): file count, sha256 over the
  * sorted per-file sha256 list, and the sha256 of the pack's key instance file (db.sqlite3).
  */
-export const buildTreeDigestRemote = (root: string, keyFile: string | null, sudoMode: SudoMode): string =>
-    `set -uo pipefail; ${sudoPreamble(sudoMode)}; cd ${shq(root)} || { echo ${shq(`DIGEST_ERR cannot cd ${root}`)}; exit 0; }; ` +
-    `n=$($S find -L . -type f -print0 | tr -cd '\\0' | wc -c); ` +
-    `h=$($S find -L . -type f -print0 | LC_ALL=C sort -z | $S xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1) || { echo DIGEST_ERR hashing failed; exit 0; }; ` +
+export const buildTreeDigestRemote = (root: string, keyFile: string | null, sudoMode: SudoMode, skipPatterns: readonly string[] = []): string => {
+    // idea#168 r35@62: skip dirs (Kolibri sessions) pruned on BOTH sides — never descended.
+    const prune = findPruneExpr(skipPatterns.map(p => `*/${p}`))
+    return `set -uo pipefail; ${sudoPreamble(sudoMode)}; cd ${shq(root)} || { echo ${shq(`DIGEST_ERR cannot cd ${root}`)}; exit 0; }; ` +
+    `n=$($S find -L . ${prune}-type f -print0 | tr -cd '\\0' | wc -c); ` +
+    `h=$($S find -L . ${prune}-type f -print0 | LC_ALL=C sort -z | $S xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1) || { echo DIGEST_ERR hashing failed; exit 0; }; ` +
     (keyFile
         ? `k=$($S sha256sum -- ${shq(keyFile)} 2>/dev/null | cut -d' ' -f1); `
         : `k=; `) +
     `echo "DIGEST files=$n tree=$h key=\${k:-none}"`
+}
+
+/**
+ * idea#168 r35@62 — target staging: recreate each skip dir EMPTY where its parent landed
+ * (Django's file session backend raises ImproperlyConfigured if KOLIBRI_HOME/sessions is
+ * missing). Source mode + owner when known and chown succeeds; otherwise 1777 so the Kolibri
+ * container (root, or any uid) can create its session files. Parent missing (dock-only, no
+ * instance data) → skipped. Prints one `SKIPDIR <rel> <detail>` line per dir.
+ */
+export const buildRecreateSkipDirsRemote = (
+    staging: string,
+    dirs: readonly { rel: string; src: { mode: string; uid: number; gid: number } | null }[],
+    sudoMode: SudoMode,
+): string => [
+    `set -euo pipefail`,
+    sudoPreamble(sudoMode),
+    ...dirs.map(({ rel, src }) => {
+        const d = `${staging}/${rel}`
+        const parent = d.slice(0, d.lastIndexOf('/'))
+        const ok = src !== null && /^[0-7]{3,4}$/.test(src.mode) && Number.isInteger(src.uid) && Number.isInteger(src.gid)
+        const set = ok
+            ? `$S chmod ${src!.mode} ${shq(d)}; if $S chown ${src!.uid}:${src!.gid} ${shq(d)} 2>/dev/null; then ` +
+              `echo ${shq(`SKIPDIR ${rel} recreated empty mode=${src!.mode} owner=${src!.uid}:${src!.gid} (as source)`)}; ` +
+              `else $S chmod 1777 ${shq(d)}; echo ${shq(`SKIPDIR ${rel} recreated empty mode=1777 (could not chown to source owner ${src!.uid}:${src!.gid})`)}; fi`
+            : `$S chmod 1777 ${shq(d)}; echo ${shq(`SKIPDIR ${rel} recreated empty mode=1777 (source dir absent or not stat-able)`)}`
+        return `if $S test -d ${shq(parent)}; then $S rm -rf ${shq(d)}; $S mkdir ${shq(d)}; ${set}; ` +
+            `else echo ${shq(`SKIPDIR ${rel} not recreated (parent not in the moved tree)`)}; fi`
+    }),
+].join('; ')
 
 export const parseTreeDigest = (out: string): { files: number; tree: string; key: string } | { error: string } => {
     const text = String(out ?? '')
@@ -2252,6 +2338,9 @@ export class RealFleetOps implements FleetOps {
      *     is materialized as real data on the target.
      *  5. verify: per-file content digest of source == staging, incl. sha256 of the key file
      *     (Kolibri db.sqlite3). Mismatch → staging removed, source left intact, loud.
+     *     idea#168 r35@62: the pack's moveSkipDirs (Kolibri data/kolibri/sessions: root 0600
+     *     Django session files, unreadable as pi) are left out of both tars and both digests,
+     *     then recreated EMPTY in staging (source mode/owner, else 1777).
      *  6. commit staging → slot on the target; re-check instance data there.
      *  7. quarantine the source slot to <disksRoot>/.moved-away/ (the disk left that host).
      *  8. fire the target sentinel; wait until the store shows it docked on toEngine.
@@ -2276,7 +2365,9 @@ export class RealFleetOps implements FleetOps {
             )
         }
         const srcSlot = `${this.disksRoot}/${srcDevice}`
-        const plan = parseMovePlan(await this.ssh(srcHost, buildMovePlanRemote(srcSlot, this.sudoMode)))
+        const skipDirs = spec.moveSkipDirs ?? []
+        const skipPatterns = skipDirs.map(skipDirTarPattern)
+        const plan = parseMovePlan(await this.ssh(srcHost, buildMovePlanRemote(srcSlot, this.sudoMode, skipDirs)))
         if (plan.error) throw new Error(`source ${fromEngine}:${srcSlot}: ${plan.error}`)
         if (plan.mountFsType) {
             throw new Error(
@@ -2340,19 +2431,19 @@ export class RealFleetOps implements FleetOps {
                     (plan.extLinks.length ? ` (materializing ${plan.extLinks.map(l => `${l.rel} → ${l.target}`).join(', ')})` : ''),
             )
             await this.relayPipe(
-                srcHost, buildTreeSendRemote(srcSlot, plan.extLinks.map(l => l.rel), this.sudoMode),
+                srcHost, buildTreeSendRemote(srcSlot, plan.extLinks.map(l => l.rel), this.sudoMode, skipPatterns),
                 dstHost, buildTreeReceiveRemote(staging, this.sudoMode),
             )
             for (const l of plan.extLinks) {
                 await this.relayPipe(
-                    srcHost, buildExtLinkSendRemote(l.target, this.sudoMode),
+                    srcHost, buildExtLinkSendRemote(l.target, this.sudoMode, extLinkSkipPatterns(l.rel, l.target, skipDirs)),
                     dstHost, buildExtLinkReceiveRemote(staging, l.rel, l.target, this.sudoMode),
                 )
             }
             // 5. Verify content.
             const [a, b] = await Promise.all([
-                this.ssh(srcHost, buildTreeDigestRemote(srcDigestRoot, spec.keyFile, this.sudoMode)),
-                this.ssh(dstHost, buildTreeDigestRemote(staging, spec.keyFile, this.sudoMode)),
+                this.ssh(srcHost, buildTreeDigestRemote(srcDigestRoot, spec.keyFile, this.sudoMode, skipPatterns)),
+                this.ssh(dstHost, buildTreeDigestRemote(staging, spec.keyFile, this.sudoMode, skipPatterns)),
             ])
             const da = parseTreeDigest(a)
             const db = parseTreeDigest(b)
@@ -2365,6 +2456,21 @@ export class RealFleetOps implements FleetOps {
                 )
             }
             if (requireData && da.key === 'none') throw new Error(`key instance file ${spec.keyFile} missing in the source tree`)
+            // 5b. idea#168 r35@62: skip dirs (Kolibri sessions) were not carried — recreate them
+            // EMPTY in staging so the committed slot has them (Django file sessions need the dir).
+            if (skipDirs.length) {
+                const out = await this.ssh(dstHost, buildRecreateSkipDirsRemote(
+                    staging,
+                    skipDirs.map(rel => {
+                        const st = plan.skipDirs.find(d => d.rel === rel)
+                        return { rel, src: st ? { mode: st.mode, uid: st.uid, gid: st.gid } : null }
+                    }),
+                    this.sudoMode,
+                ))
+                for (const line of String(out ?? '').split('\n').map(x => x.trim()).filter(x => x.startsWith('SKIPDIR '))) {
+                    console.log(`[RealFleetOps] moveDisk ${diskId}: ${toEngine}: ${line.slice(8)} (contents not carried: throwaway)`)
+                }
+            }
             // 6. Commit on the target and re-check its instance data there.
             await this.ssh(dstHost, buildCommitMovedTreeRemote(staging, dstSlot, this.sudoMode))
             used.add(dstDevice)
