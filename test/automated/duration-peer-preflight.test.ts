@@ -247,6 +247,16 @@ describe('peer preflight verdict', () => {
         }])
         const absent = verdict(exchangedStore(), { ...goodProbes(), idea04: goodProbe('idea04', { helper: 'absent', versionRc: null, versionOut: '' }) })
         expect(absent.problems[0]!.message).toBe('idea04 (100.108.39.45): helper too old — no /usr/local/sbin/idea-app-data (need idea-app-data >= 2 with sync-peers) for idea04↔idea01, idea04↔idea03')
+        // no helper → no peer files either: one helper-too-old problem, the missing files are notes (live idea01 today)
+        const bare = verdict(exchangedStore(), {
+            ...goodProbes(),
+            idea04: goodProbe('idea04', { helper: 'absent', versionRc: null, versionOut: '', authorizedKeys: { state: 'missing' }, knownHosts: { state: 'missing' } }),
+        })
+        expect(bare.problems.map(p => p.kind)).toEqual(['helper-too-old'])
+        expect(bare.notes).toEqual([
+            `idea04 (100.108.39.45): ${PEER_AUTHORIZED_KEYS} does not exist (expected: no idea-app-data v2 sync-peers on this Pi yet — reported as helper-too-old)`,
+            `idea04 (100.108.39.45): ${PEER_KNOWN_HOSTS} does not exist (expected: no idea-app-data v2 sync-peers on this Pi yet — reported as helper-too-old)`,
+        ])
         const sudo = verdict(exchangedStore(), { ...goodProbes(), idea01: goodProbe('idea01', { versionRc: 1, versionOut: 'sudo: a password is required' }) })
         expect(sudo.problems[0]).toMatchObject({ kind: 'helper-too-old', message: expect.stringMatching(/gave exit 1: sudo: a password is required \(need idea-app-data >= 2\)/) })
 

@@ -433,6 +433,7 @@ export const peerPreflightVerdict = (input: {
             continue
         }
         const v = helperVersionNumber(pr.versionRc, pr.versionOut)
+        const helperOk = pr.helper === 'present' && v !== null && v >= minV
         if (pr.helper === 'absent') {
             problems.push({ kind: 'helper-too-old', subject: e, message: `${name(e)}: helper too old — no ${PEER_HELPER} (need idea-app-data >= ${minV} with sync-peers) for ${pairText}` })
         } else if (v === null) {
@@ -466,6 +467,10 @@ export const peerPreflightVerdict = (input: {
             [PEER_KNOWN_HOSTS, pr.knownHosts, parseKnownHostsLine, 'hostKey', 'pinned host key'],
         ] as const) {
             if (f.state === 'unreadable') { notes.push(`${name(e)}: ${file} not readable as pi — relying on the store check (peerAccess.authorized) for ${pairText}`); continue }
+            if (f.state !== 'file' && !helperOk) {
+                notes.push(`${name(e)}: ${file} does not exist (expected: no idea-app-data v${minV} sync-peers on this Pi yet — reported as helper-too-old)`)
+                continue
+            }
             if (f.state !== 'file') {
                 problems.push({ kind: 'one-sided', subject: e, message: `${name(e)}: ${file} does not exist — sync-peers has not written it, so ${pairText} cannot ${field === 'sshKey' ? `log in to ${e}` : `verify the peer host key on ${e}`}` })
                 continue
