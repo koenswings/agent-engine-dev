@@ -411,6 +411,46 @@ export const checkPendingBackups = async (
     }
 }
 
+// ── borg archive selection (idea#168) ─────────────────────────────────────────
+
+/** Runs `borg <args>` (in cwd when given) and returns stdout. Injectable for tests. */
+export type BorgRunner = (args: string[], cwd?: string) => Promise<string>
+
+const runBorg: BorgRunner = async (args, cwd) =>
+    (await (cwd ? $({ cwd }) : $)`borg ${args}`).stdout
+
+/**
+ * The newest archive of a repo and how to extract it into <mount root>/instances/.
+ *
+ * Archives are named by ISO timestamp (backupInstance), and borg 1.x has no
+ * `latest` alias: `borg extract <repo>::latest` fails with "Archive latest does
+ * not exist". So the newest archive is picked explicitly (`borg info --last 1`,
+ * sorted by archive time).
+ *
+ * borg stores the backed-up path without its leading '/', e.g.
+ * `disks/sda1/instances/<id>/...`, so the archive's own command line gives the
+ * prefix to strip: everything before `<id>`, so the files land in
+ * instances/<id>/ whatever the source disk's mount root was.
+ */
+export const latestArchiveFromInfo = (infoJson: string, instanceId: string): { name: string, stripComponents: number } => {
+    const archive = JSON.parse(infoJson)?.archives?.[0]
+    if (!archive?.name) throw new Error('No backup archives found in the repository')
+    const suffix = `instances/${instanceId}`
+    const source = (archive.command_line as string[] | undefined ?? [])
+        .map(a => a.replace(/^\/+/, '').replace(/\/+$/, ''))
+        .find(a => a === suffix || a.endsWith(`/${suffix}`))
+    if (!source) throw new Error(`Archive ${archive.name} does not contain instances/${instanceId}`)
+    return { name: archive.name, stripComponents: source.split('/').length - 1 }
+}
+
+/** Extract the newest archive of repoPath so the instance lands in instancesDir/<instanceId>. */
+export const extractLatestArchive = async (repoPath: string, instancesDir: string, instanceId: string, run: BorgRunner = runBorg): Promise<string> => {
+    const { name, stripComponents } = latestArchiveFromInfo(await run(['info', '--json', '--last', '1', repoPath]), instanceId)
+    log(`Extracting archive ${name} (--strip-components ${stripComponents}) into ${instancesDir}`)
+    await run(['extract', '--strip-components', String(stripComponents), `${repoPath}::${name}`], instancesDir)
+    return name
+}
+
 // ── restoreApp ────────────────────────────────────────────────────────────────
 
 /**
@@ -476,7 +516,7 @@ export const restoreApp = async (
 
         if (!config.settings.testMode) {
             log(`Restoring instance ${instanceId} from ${backupDevice} to ${targetDevice}`)
-            await $`bash -c ${'cd ' + instancesDir + ' && borg extract ' + repoPath + '::latest'}`
+            await extractLatestArchive(repoPath, instancesDir, instanceId)
         } else {
             log(`testMode: skipping borg extract for instance ${instanceId}`)
         }
