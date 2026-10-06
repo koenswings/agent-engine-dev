@@ -21,6 +21,7 @@ export interface Settings {
     disksRoot?: string;           // Mount root for App Disks (default: /disks). Tests point this at a private temp folder.
     skipImageLoad?: boolean;      // If true, don't load service images from services/*.tar at app start (default: same as testMode). See skipImageLoad().
     skipMetaWrite?: boolean;      // If true, don't write META.yaml on the first dock of a disk without one (default: same as testMode). See skipMetaWrite().
+    staticPeers?: string;         // Opt-in static peer list 'host[:port],...' (IDEA_STATIC_PEERS wins). See StaticPeers.ts.
 }
 
 export interface Defaults {
@@ -116,6 +117,7 @@ function validateSettings(obj: any, path: string): string[] {
     if (obj.disksRoot !== undefined && typeof obj.disksRoot !== 'string') errors.push(`'${path}disksRoot' must be a string.`);
     if (obj.skipImageLoad !== undefined && typeof obj.skipImageLoad !== 'boolean') errors.push(`'${path}skipImageLoad' must be a boolean.`);
     if (obj.skipMetaWrite !== undefined && typeof obj.skipMetaWrite !== 'boolean') errors.push(`'${path}skipMetaWrite' must be a boolean.`);
+    if (obj.staticPeers !== undefined && obj.staticPeers !== null && typeof obj.staticPeers !== 'string') errors.push(`'${path}staticPeers' must be a string.`);
     return errors;
 }
 
