@@ -131,17 +131,23 @@ type Sandbox = {
     ROOT: string
     WATCH: string
     SEED: string
-    host: (h: string) => { disks: string; watch: string; seed: string }
+    /** idea#168 Stage 1: DURATION_SERVICE_TARS_ROOT placeholder (per host: <dir>/<h>/tars). */
+    TARS: string
+    host: (h: string) => { disks: string; watch: string; seed: string; tars: string }
 }
+const KTAR = 'koenswings_kolibri:1.0-0.15.5-dev.tar'
 
 const makeSandbox = (): Sandbox => {
     let dir = ''
     do { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rfo-move-')) } while (/sdb/i.test(dir))
-    const host = (h: string) => ({ disks: `${dir}/${h}/disks`, watch: `${dir}/${h}/watch`, seed: `${dir}/${h}/seed` })
+    const host = (h: string) => ({ disks: `${dir}/${h}/disks`, watch: `${dir}/${h}/watch`, seed: `${dir}/${h}/seed`, tars: `${dir}/${h}/tars` })
     for (const h of Object.keys(HOSTS)) {
         const p = host(h)
         fs.mkdirSync(p.disks, { recursive: true })
         fs.mkdirSync(p.watch, { recursive: true })
+        // idea#168 Stage 1: Atlas-staged service tars on every pool Pi (same image, own copy).
+        fs.mkdirSync(p.tars, { recursive: true })
+        fs.writeFileSync(`${p.tars}/${KTAR}`, `kolibri image staged on ${h}`)
         // Kid seed packs as on the Pi: kolibri ships compose/.env but NO instance data.
         fs.mkdirSync(`${p.seed}/kolibri/instances/${KINST}`, { recursive: true })
         fs.writeFileSync(`${p.seed}/kolibri/META.yaml`, `diskId: ${KOLIBRI}\n`)
@@ -152,11 +158,11 @@ const makeSandbox = (): Sandbox => {
     }
     fs.mkdirSync(`${dir}/fakebin`, { recursive: true })
     fs.writeFileSync(`${dir}/fakebin/docker`, FAKE_DOCKER, { mode: 0o755 })
-    return { dir, ROOT: `${dir}/__DISKS__`, WATCH: `${dir}/__WATCH__`, SEED: `${dir}/__SEED__`, host }
+    return { dir, ROOT: `${dir}/__DISKS__`, WATCH: `${dir}/__WATCH__`, SEED: `${dir}/__SEED__`, TARS: `${dir}/__TARS__`, host }
 }
 
 /** Kolibri slot on a host. data: 'real' | 'symlink' (Path A idea01) | 'none' (stale META-only). */
-const plantKolibriTree = (sb: Sandbox, h: string, slot: string, data: 'real' | 'symlink' | 'none', opts: { grade5a?: boolean; walkState?: string; sessions?: boolean } = {}) => {
+const plantKolibriTree = (sb: Sandbox, h: string, slot: string, data: 'real' | 'symlink' | 'none', opts: { grade5a?: boolean; walkState?: string; sessions?: boolean; services?: boolean } = {}) => {
     const root = `${sb.host(h).disks}/${slot}`
     fs.mkdirSync(`${root}/apps/kolibri-1.0`, { recursive: true })
     fs.mkdirSync(`${root}/instances/${KINST}`, { recursive: true })
@@ -164,6 +170,11 @@ const plantKolibriTree = (sb: Sandbox, h: string, slot: string, data: 'real' | '
     fs.writeFileSync(`${root}/apps/kolibri-1.0/compose.yaml`, 'services: {}\n')
     fs.writeFileSync(`${root}/instances/${KINST}/compose.yaml`, 'services: {}\n')
     fs.writeFileSync(`${root}/instances/${KINST}/.env`, 'port=18080\n')
+    // idea#168 Stage 1: a docked app slot carries its services tar (hard link to the host's staged copy).
+    if (opts.services) {
+        fs.mkdirSync(`${root}/services`, { recursive: true })
+        fs.linkSync(`${sb.host(h).tars}/${KTAR}`, `${root}/services/${KTAR}`)
+    }
     const dataDir = `${root}/instances/${KINST}/data/kolibri`
     if (data === 'real') {
         makeKolibriDb(`${dataDir}/db.sqlite3`, { grade5a: opts.grade5a ?? true, walkState: opts.walkState })
@@ -227,6 +238,7 @@ class LocalFleetOps extends RealFleetOps {
             .replaceAll(this.sb.ROOT, p.disks)
             .replaceAll(this.sb.WATCH, p.watch)
             .replaceAll(this.sb.SEED, p.seed)
+            .replaceAll(this.sb.TARS, p.tars)
             .replaceAll('sleep 5', 'sleep 0')
     }
     protected override async ssh(host: string, cmd: string): Promise<string> {
@@ -296,8 +308,19 @@ const stubStore = (ops: LocalFleetOps, sb: Sandbox, initial: Record<string, stri
 }
 
 let sb: Sandbox
-beforeEach(() => { sb = makeSandbox() })
-afterEach(() => { fs.rmSync(sb.dir, { recursive: true, force: true }) })
+const savedTarsEnv = { root: process.env.DURATION_SERVICE_TARS_ROOT, mode: process.env.DURATION_SERVICE_TARS }
+beforeEach(() => {
+    sb = makeSandbox()
+    process.env.DURATION_SERVICE_TARS_ROOT = sb.TARS
+    delete process.env.DURATION_SERVICE_TARS
+})
+afterEach(() => {
+    fs.rmSync(sb.dir, { recursive: true, force: true })
+    for (const [k, v] of [['DURATION_SERVICE_TARS_ROOT', savedTarsEnv.root], ['DURATION_SERVICE_TARS', savedTarsEnv.mode]] as const) {
+        if (v === undefined) delete process.env[k]
+        else process.env[k] = v
+    }
+})
 
 describe('idea#168 r34@70: hasHealthyFixtureTree is a LOUD instance-data precondition', () => {
     it('(a) stale tree with matching META but no Kolibri data → dockFixture refuses loudly naming host, path, diskId, what is missing; nothing docked', async () => {
@@ -428,7 +451,7 @@ describe('idea#168 r34@70: hasHealthyFixtureTree is a LOUD instance-data precond
 
 describe('idea#168 r34@70: moveDisk carries the source disk\'s real tree (no fixture copy, no seed refresh)', () => {
     it('(b) idea01→idea03: target gets the source DB byte-for-byte (same sha256, walk state kept), source quarantined, docked on idea03', async () => {
-        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real', { walkState: 'r34-steps-1-61:lesson+quiz+progress' })
+        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real', { walkState: 'r34-steps-1-61:lesson+quiz+progress', services: true })
         const srcDb = `${sb.host('idea01').disks}/idea-test-1/${DB_REL}`
         const srcHash = sha256(srcDb)
         // Busy idea03 slots: idea-test-1 another pack, idea-test-2 an unrelated dir.
@@ -450,6 +473,10 @@ describe('idea#168 r34@70: moveDisk carries the source disk\'s real tree (no fix
         expect(fs.readFileSync(`${dst}/instances/${KINST}/data/kolibri/content/storage/video.mp4`, 'utf8')).toBe('fake-mp4-bytes')
         expect(fs.readFileSync(`${dst}/META.yaml`, 'utf8')).toContain(`diskId: ${KOLIBRI}`)
         expect(fs.readFileSync(`${dst}/instances/${KINST}/.env`, 'utf8')).toBe('port=18080\n')
+        // idea#168 Stage 1: services/*.tar not streamed; the target links ITS staged copy.
+        expect(fs.statSync(`${dst}/services/${KTAR}`).ino).toBe(fs.statSync(`${sb.host('idea03').tars}/${KTAR}`).ino)
+        expect(fs.readFileSync(`${dst}/services/${KTAR}`, 'utf8')).toBe('kolibri image staged on idea03')
+        expect(ops.relays.every(r => r.srcCmd.includes("--exclude='./services'"))).toBe(true)
         // Moved tree passes the Grade 5A precondition on the target.
         const verdict = parseInstanceDataCheck(execFileSync('bash', ['-c', buildInstanceDataCheckRemote({ root: dst, spec: APP_PACK_INSTANCE_DATA[KOLIBRI]!, sudoMode: 'never' })]).toString())
         expect(verdict.ok).toBe(true)
@@ -632,7 +659,8 @@ describe('idea#168 r35@62: Kolibri root-0600 session files are left out of the m
         // Every stream and digest carried the exclude / prune.
         expect(ops.relays.map(r => r.srcCmd).every(c => c.includes(`--exclude='kolibri/sessions'`))).toBe(true)
         expect(ops.cmds.filter(c => c.cmd.includes('DIGEST files=')).map(c => c.host).sort()).toEqual(['idea01', 'idea03'])
-        expect(ops.cmds.filter(c => c.cmd.includes('DIGEST files=')).every(c => c.cmd.includes(`-path '*/kolibri/sessions' \\) -prune`))).toBe(true)
+        // (idea#168 Stage 1: ./services, re-linked on the target, is pruned in the same group.)
+        expect(ops.cmds.filter(c => c.cmd.includes('DIGEST files=')).every(c => /-path '\*\/kolibri\/sessions'( -o -path '\.\/services')? \\\) -prune/.test(c.cmd))).toBe(true)
         // Source session files untouched (quarantined with the source slot on idea01).
         const q = fs.readdirSync(`${sb.host('idea01').disks}/.moved-away`)[0]!
         expect(fs.readdirSync(`${sb.host('idea01').disks}/.moved-away/${q}/${SESSIONS_REL}`).sort()).toEqual(['sessionid-learner-r35', 'sessionid-teacher-r35'])

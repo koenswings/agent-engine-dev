@@ -34,6 +34,43 @@ Aligned (do not block): Atlas Ops [idea#167](https://github.com/koenswings/idea/
 
 Pixel coaching set now registered at Console@`ba0cfa1`: `create_class`, `enroll_learners`, `build_lesson`, `create_quiz`, `read_reports`, `preview_as_learner`, `browse_classes`; `open_kolibri_as_teacher` opens `/en/coach/#/classes`. `back_to_console` is hardened.
 
+### Service-image tars (idea#168 Stage 1 — `skipImageLoad: false`)
+
+A real App Disk carries `services/<image with / → _>.tar`, and the Engine loads each tar
+(`docker image load`) before `docker compose up` unless `skipImageLoad` is true. The Kid
+packs do not ship the tars (GBs), so **Atlas stages them once per pool Pi** and the harness
+hard-links them into the slot on every dock (`buildEnsureServiceTarsRemote`, `cp` fallback
+across filesystems). The harness never downloads, builds or deletes a staged tar.
+
+| Pack (diskId) | Image (compose `services.*.image`) | Staged file (`DURATION_SERVICE_TARS_ROOT`, default `/home/pi/idea/duration-service-tars/`) | ≈ size |
+|---|---|---|---|
+| `duration-kolibri-grade5a-001` | `koenswings/kolibri:1.0-0.15.5-dev` | `koenswings_kolibri:1.0-0.15.5-dev.tar` | 1.62 GB |
+| `duration-nextcloud-grade5a-001` | `koenswings/nextcloud:1.0-31.0.1` | `koenswings_nextcloud:1.0-31.0.1.tar` | 2.02 GB |
+| `duration-nextcloud-grade5a-001` | `koenswings/nextcloud-mariadb:1.0-11.7.2-MariaDB-ubu2404` | `koenswings_nextcloud-mariadb:1.0-11.7.2-MariaDB-ubu2404.tar` | 0.49 GB |
+
+- **Where:** on **idea01, idea03 and idea04** (every pool Pi a pack can dock on or move to; never idea02),
+  same directory, pi-readable, on the same filesystem as `/home/pi/idea/duration-disks` so the
+  slot links are hard links (no extra space). ≈ **4.13 GB per Pi**.
+- **How (Atlas, once):** `docker save <image> -o /home/pi/idea/duration-service-tars/<file>` on a Pi
+  that has the image, or copy `services/<file>` from a real App Disk; then `sha256sum` the three
+  files on every Pi and compare. The file name must be exactly the Engine's
+  `serviceImageTarPath` name (table above).
+- **Free space:** the Engine's `copyApp`/`installApp` copy the tars onto the target disk
+  (`services/`), so each `copy_app` / late `install_app` adds 1.6–2.5 GB to a slot. Keep
+  ≥ 15 GB free under `/home/pi/idea` on each Pi; reset (fresh dock of empty packs, rm of app
+  slots) removes those copies.
+- **Dock:** with `--start-instances` and `DURATION_SERVICE_TARS=require` (default), an app pack's
+  dock links its tars into `<slot>/services/` before the sentinel fires, in the fresh-copy and
+  the reuse path; a missing staged tar refuses the dock (exit 5, `SERVICE_TAR_MISSING <path>`).
+  `DURATION_SERVICE_TARS=off` restores the old behaviour (Engine warns, Docker uses a cached image).
+- **moveDisk:** `services/` is not streamed between Pis (excluded from the tar stream and the
+  digest); the target re-links its own staged copies after the commit.
+- **Budgets** (`startBudgets.ts`; upper bounds, a healthy start returns at once; measured
+  durations are logged as `instance_start_measured` JSON lines):
+  `DURATION_INSTANCE_START_MS` (post-install start; fast 300 s / 600 s, was 120 s / 300 s),
+  `DURATION_NEXTCLOUD_READY_MS` (420 s, was 180 s), `DURATION_COPY_DONE_MS` (fast 300 s / 900 s,
+  was 120 s / 600 s), `DURATION_DOCK_WAIT_MS` (300 s, was 120 s).
+
 ## Phase 1–4 (this tree)
 
 - YAML loader + Markov walker + action dispatcher (**ONE** walker / schema / graph)

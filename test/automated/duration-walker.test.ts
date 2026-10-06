@@ -2215,8 +2215,8 @@ describe('syncNextcloudSidecarUrlForEngine / waitNextcloud (r16 FAIL@65 / r17 FA
         expect(url).toBe('http://idea01:18281')
     })
 
-    it('nextcloudReadyTimeoutMs defaults to 180000 and honors env', () => {
-        expect(nextcloudReadyTimeoutMs({})).toBe(180_000)
+    it('nextcloudReadyTimeoutMs defaults to 420000 (services/*.tar load; was 180000) and honors env', () => {
+        expect(nextcloudReadyTimeoutMs({})).toBe(420_000)
         expect(nextcloudReadyTimeoutMs({ DURATION_NEXTCLOUD_READY_MS: '120000' })).toBe(120_000)
     })
 

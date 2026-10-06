@@ -23,6 +23,7 @@ import { $ } from 'zx'
 import type { Store } from '../../src/data/Store.js'
 import { runningInstanceExpectsLocalDocker } from './stability.js'
 import { consoleDistProbeScript, parseConsoleDistProbe, type ConsoleDistProbe } from './consoleDeploy.js'
+import { dockWaitMs, logStartMeasured } from './startBudgets.js'
 import type { DurationCommandTrace } from './actions.js'
 import {
     abandonRepo,
@@ -51,6 +52,14 @@ const GOLDEN_DEFAULT = 'idea02'
 /** Atlas-approved private roots on pool Pis — never /disks or /dev/engine. */
 export const DEFAULT_DURATION_DISKS_ROOT = '/home/pi/idea/duration-disks'
 export const DEFAULT_DURATION_WATCH_DIR = '/home/pi/idea/duration-watch'
+/**
+ * idea#168 Stage 1: staged service-image tars on each pool Pi (Atlas stages them once; the
+ * harness never downloads or writes them). Dock and moveDisk hard-link them into the slot's
+ * services/ (cp fallback across filesystems), so the Engine's start finds
+ * services/<image with / → _>.tar like on a real App Disk (skipImageLoad: false).
+ * Override: DURATION_SERVICE_TARS_ROOT.
+ */
+export const DEFAULT_DURATION_SERVICE_TARS_ROOT = '/home/pi/idea/duration-service-tars'
 /** Kid packs on the Pi workspace (agent-app-dev#10). */
 export const DEFAULT_DURATION_FIXTURE_SOURCE_ROOT =
     '/home/pi/idea/agents/agent-app-dev/tests/duration-tests/fixtures'
@@ -433,7 +442,79 @@ export type SshDockCopyRemoteArgs = {
     watchDir: string
     /** When true, keep instances/ (Path A --start-instances). */
     startInstances: boolean
+    /** idea#168: hard-link the pack's staged services/*.tar into the slot (app packs only). */
+    serviceTars?: { root: string; tars: readonly ServiceTarSpec[] } | null
 }
+
+// ── idea#168 Stage 1: app packs carry services/*.tar ─────────────────────────────
+
+/** One service image an app pack's instance starts, and its saved tar on the App Disk. */
+export type ServiceTarSpec = {
+    image: string
+    /** File name under services/ — Engine serviceImageTarPath: image with '/' → '_', + '.tar'. */
+    tar: string
+    /** Approximate size (bytes) — staging docs and disk-space checks. */
+    approxBytes: number
+}
+
+/** Mirrors Engine src/data/Instance.ts serviceImageTarPath (file name part). */
+export const serviceImageTarName = (image: string): string => `${image.replace(/\//g, '_')}.tar`
+
+const tarSpec = (image: string, approxBytes: number): ServiceTarSpec => ({ image, tar: serviceImageTarName(image), approxBytes })
+
+/** Images per app pack (Kid compose.yaml `services.*.image`, agent-app-dev tests/duration-tests/fixtures). */
+export const APP_PACK_SERVICE_TARS: Readonly<Record<string, readonly ServiceTarSpec[]>> = {
+    'duration-kolibri-grade5a-001': [tarSpec('koenswings/kolibri:1.0-0.15.5-dev', 1_620_000_000)],
+    'duration-nextcloud-grade5a-001': [
+        tarSpec('koenswings/nextcloud:1.0-31.0.1', 2_020_000_000),
+        tarSpec('koenswings/nextcloud-mariadb:1.0-11.7.2-MariaDB-ubu2404', 490_000_000),
+    ],
+}
+
+export const appPackServiceTars = (diskId: string): readonly ServiceTarSpec[] => APP_PACK_SERVICE_TARS[diskId] ?? []
+
+/**
+ * DURATION_SERVICE_TARS: 'require' (default) — a docked app pack whose instances start must
+ * carry its tars (missing staged tar → dock refused, exit 5); 'off' — old behaviour (no tars;
+ * Engine warns and Docker uses a cached image).
+ */
+export const serviceTarsMode = (env: NodeJS.ProcessEnv = process.env): 'require' | 'off' =>
+    /^(off|0|false|no)$/i.test(env.DURATION_SERVICE_TARS?.trim() ?? '') ? 'off' : 'require'
+
+export const serviceTarsRoot = (env: NodeJS.ProcessEnv = process.env): string => {
+    const root = env.DURATION_SERVICE_TARS_ROOT?.trim() || DEFAULT_DURATION_SERVICE_TARS_ROOT
+    if (!isSafeAbsPath(root) || root === '/disks' || root.startsWith('/disks/')) {
+        throw new Error(`DURATION_SERVICE_TARS_ROOT '${root}' must be a plain absolute path outside /disks`)
+    }
+    return root
+}
+
+/**
+ * Remote bash: make `slot/services/<tar>` the staged `root/<tar>` for each spec. Already the
+ * same file (inode) or same size → kept; else hard link (`ln -f`), cp across filesystems.
+ * A missing staged tar exits 5 naming it. Prints one `SERVICE_TAR <state> <tar> <bytes>` per tar.
+ * Writes only inside the slot; reads the staging root.
+ */
+export const buildEnsureServiceTarsRemote = (slot: string, root: string, tars: readonly ServiceTarSpec[]): string => {
+    const parts = ['set -euo pipefail', `mkdir -p ${shq(`${slot}/services`)}`]
+    for (const t of tars) {
+        const src = shq(`${root}/${t.tar}`)
+        const dst = shq(`${slot}/services/${t.tar}`)
+        parts.push(
+            `if ! test -s ${src}; then echo ${shq(`SERVICE_TAR_MISSING ${root}/${t.tar} (${t.image}, ~${(t.approxBytes / 1e9).toFixed(2)} GB) — Atlas must stage it on this Pi`)} >&2; exit 5; fi`,
+            `if test -e ${dst} && { [ "$(stat -c %i ${dst})" = "$(stat -c %i ${src})" ] || [ "$(stat -c %s ${dst})" = "$(stat -c %s ${src})" ]; }; then st=present; ` +
+                `elif ln -f ${src} ${dst} 2>/dev/null; then st=linked; else cp -f ${src} ${dst}; st=copied; fi; ` +
+                `echo "SERVICE_TAR $st ${t.tar.replace(/"/g, '')} $(stat -c %s ${dst})"`,
+        )
+    }
+    return parts.join('; ')
+}
+
+export const parseEnsureServiceTars = (out: string): { state: string; tar: string; bytes: number }[] =>
+    String(out ?? '').split('\n').map(l => l.trim())
+        .map(l => /^SERVICE_TAR (present|linked|copied) (\S+) (\d+)$/.exec(l))
+        .filter((m): m is RegExpExecArray => !!m)
+        .map(m => ({ state: m[1]!, tar: m[2]!, bytes: Number(m[3]) }))
 
 /**
  * Build the remote bash for Kid dockFixture copy.
@@ -446,6 +527,11 @@ export type SshDockCopyRemoteArgs = {
 export const buildSshDockCopyRemote = (args: SshDockCopyRemoteArgs): string => {
     const { diskId, pack, src, dest, sentinel, disksRoot, watchDir, startInstances } = args
     const stripInstances = startInstances ? ':' : `rm -rf '${dest}/instances'`
+    const isEmpty = pack === 'empty' || pack === 'empty-002'
+    // idea#168: app packs carry their staged services/*.tar (before the dock fires).
+    const ensureTars = !isEmpty && args.serviceTars && args.serviceTars.tars.length
+        ? `${buildEnsureServiceTarsRemote(dest, args.serviceTars.root, args.serviceTars.tars).replace(/^set -euo pipefail; /, '')}; `
+        : ''
     const parts: string[] = [
         'set -euo pipefail',
         `mkdir -p '${disksRoot}' '${watchDir}'`,
@@ -466,6 +552,7 @@ export const buildSshDockCopyRemote = (args: SshDockCopyRemoteArgs): string => {
         parts.push(
             `if test -f '${dest}/META.yaml' && grep -Fq 'diskId: ${diskId}' '${dest}/META.yaml'; then ` +
             `echo "RealFleetOps: reuse existing Path A tree at ${dest}"; ` +
+            ensureTars +
             `rm -f '${sentinel}'; sleep 5; touch '${sentinel}'; exit 0; fi`,
             `if test -d '${dest}'; then ` +
             `echo "RealFleetOps: refuse overwrite occupied ${dest} (no matching META for ${diskId})" >&2; exit 4; fi`,
@@ -505,6 +592,9 @@ export const buildSshDockCopyRemote = (args: SshDockCopyRemoteArgs): string => {
     }
     parts.push(
         `test -f '${dest}/META.yaml' || { echo "META.yaml missing after copy into ${dest}" >&2; exit 3; }`,
+    )
+    if (ensureTars) parts.push(ensureTars.replace(/; $/, ''))
+    parts.push(
         // Atlas: chokidar needs unlink+create after eject, not mtime-only touch.
         `rm -f '${sentinel}'; sleep 5; touch '${sentinel}'`,
     )
@@ -853,9 +943,10 @@ export const buildTreeReceiveRemote = (staging: string, sudoMode: SudoMode): str
  * links out of the slot are refused before a move): file count, sha256 over the sorted per-file
  * sha256 list, and the sha256 of the pack's key instance file (db.sqlite3).
  */
-export const buildTreeDigestRemote = (root: string, keyFile: string | null, sudoMode: SudoMode, skipPatterns: readonly string[] = []): string => {
+export const buildTreeDigestRemote = (root: string, keyFile: string | null, sudoMode: SudoMode, skipPatterns: readonly string[] = [], excludeRels: readonly string[] = []): string => {
     // idea#168 r35@62: skip dirs (Kolibri sessions) pruned on BOTH sides — never descended.
-    const prune = findPruneExpr(skipPatterns.map(p => `*/${p}`))
+    // idea#168 Stage 1: anchored excludeRels (./services: tars re-linked on the target) too.
+    const prune = findPruneExpr([...skipPatterns.map(p => `*/${p}`), ...excludeRels.map(r => `./${r}`)])
     return `set -uo pipefail; ${sudoPreamble(sudoMode)}; cd ${shq(root)} || { echo ${shq(`DIGEST_ERR cannot cd ${root}`)}; exit 0; }; ` +
     `n=$($S find -L . ${prune}-type f -print0 | tr -cd '\\0' | wc -c); ` +
     `h=$($S find -L . ${prune}-type f -print0 | LC_ALL=C sort -z | $S xargs -0 -r sha256sum | sha256sum | cut -d' ' -f1) || { echo DIGEST_ERR hashing failed; exit 0; }; ` +
@@ -2150,6 +2241,16 @@ export class RealFleetOps implements FleetOps {
     }
 
     /**
+     * idea#168 Stage 1: the staged services/*.tar this pack's slot must carry, or null
+     * (empty packs, instances not started, DURATION_SERVICE_TARS=off).
+     */
+    serviceTarsFor(diskId: string): { root: string; tars: readonly ServiceTarSpec[] } | null {
+        const tars = appPackServiceTars(diskId)
+        if (!tars.length || !this.startInstances || serviceTarsMode() === 'off') return null
+        return { root: serviceTarsRoot(), tars }
+    }
+
+    /**
      * Kid dock (testMode): copy pack tree → IDEA_DISKS_ROOT/idea-test-N/ + touch
      * sentinel under IDEA_WATCH_DIR. Excludes instances/ unless startInstances.
      * Does not start Kolibri/Nextcloud — image not required for dock-only smoke.
@@ -2179,12 +2280,17 @@ export class RealFleetOps implements FleetOps {
             disksRoot: this.disksRoot,
             watchDir: this.watchDir,
             startInstances: this.startInstances,
+            serviceTars: this.serviceTarsFor(diskId),
         })
         console.log(
             `[RealFleetOps] dock copy ${diskId} → ${engineId}:${dest} ` +
-            `(sentinel ${sentinel}, startInstances=${this.startInstances})`,
+            `(sentinel ${sentinel}, startInstances=${this.startInstances}` +
+            `${this.serviceTarsFor(diskId) ? `, services/*.tar from ${this.serviceTarsFor(diskId)!.root}` : ''})`,
         )
-        await this.ssh(host, remote)
+        const out = await this.ssh(host, remote)
+        for (const t of parseEnsureServiceTars(out)) {
+            console.log(`[RealFleetOps] dock ${diskId} on ${engineId}: services/${t.tar} ${t.state} (${t.bytes} bytes)`)
+        }
     }
 
     /**
@@ -2426,14 +2532,14 @@ export class RealFleetOps implements FleetOps {
         }
         // Path A after UI eject: chokidar can lag; allow 120s and one sentinel re-fire.
         try {
-            await this.waitDiskDocked(target, diskId, 120_000)
+            await this.waitDiskDocked(target, diskId, dockWaitMs())
         } catch (e) {
             console.warn(
                 `[RealFleetOps] dockFixture: waitDiskDocked failed once on ${target}/${diskId}; ` +
                 `re-firing sentinel (unlink+sleep+touch) and retrying: ${e}`,
             )
             await this.sshDockCopy(target, diskId, device)
-            await this.waitDiskDocked(target, diskId, 120_000)
+            await this.waitDiskDocked(target, diskId, dockWaitMs())
         }
     }
 
@@ -2582,6 +2688,10 @@ export class RealFleetOps implements FleetOps {
         const srcSlot = `${this.disksRoot}/${srcDevice}`
         const skipDirs = spec.moveSkipDirs ?? []
         const skipPatterns = skipDirs.map(skipDirTarPattern)
+        // idea#168 Stage 1: services/*.tar (GBs) are not streamed between Pis — the target
+        // re-links its own staged copies after the commit (same image, same file name).
+        const moveTars = this.serviceTarsFor(diskId)
+        const moveExclude = moveTars ? ['services'] : []
         const plan = parseMovePlan(await this.ssh(srcHost, buildMovePlanRemote(srcSlot, this.sudoMode, skipDirs)))
         if (plan.error) throw new Error(`source ${fromEngine}:${srcSlot}: ${plan.error}`)
         if (plan.mountFsType) {
@@ -2678,14 +2788,14 @@ export class RealFleetOps implements FleetOps {
         try {
             console.log(`[RealFleetOps] moveDisk ${diskId}: streaming ${fromEngine}:${srcSlot} → ${toEngine}:${staging}`)
             await this.relayPipe(
-                srcHost, buildTreeSendRemote(srcSlot, [], this.sudoMode, skipPatterns),
+                srcHost, buildTreeSendRemote(srcSlot, moveExclude, this.sudoMode, skipPatterns),
                 dstHost, buildTreeReceiveRemote(staging, this.sudoMode),
             )
             phase('stream')
             // 5. Verify content.
             const [a, b] = await Promise.all([
-                this.ssh(srcHost, buildTreeDigestRemote(srcDigestRoot, spec.keyFile, this.sudoMode, skipPatterns)),
-                this.ssh(dstHost, buildTreeDigestRemote(staging, spec.keyFile, this.sudoMode, skipPatterns)),
+                this.ssh(srcHost, buildTreeDigestRemote(srcDigestRoot, spec.keyFile, this.sudoMode, skipPatterns, moveExclude)),
+                this.ssh(dstHost, buildTreeDigestRemote(staging, spec.keyFile, this.sudoMode, skipPatterns, moveExclude)),
             ])
             const da = parseTreeDigest(a)
             const db = parseTreeDigest(b)
@@ -2715,6 +2825,11 @@ export class RealFleetOps implements FleetOps {
             }
             // 6. Commit on the target and re-check its instance data there.
             await this.ssh(dstHost, buildCommitMovedTreeRemote(staging, dstSlot, this.sudoMode))
+            if (moveTars) {
+                const out = await this.ssh(dstHost, buildEnsureServiceTarsRemote(dstSlot, moveTars.root, moveTars.tars))
+                const linked = parseEnsureServiceTars(out)
+                console.log(`[RealFleetOps] moveDisk ${diskId}: ${toEngine}:${dstSlot}/services ← ${moveTars.root} (${linked.map(t => `${t.tar} ${t.state}`).join(', ')}; not streamed)`)
+            }
             used.add(dstDevice)
             this.deviceMap(toEngine).set(diskId, dstDevice)
             console.log(
@@ -2753,13 +2868,15 @@ export class RealFleetOps implements FleetOps {
         // 8. Dock on the target (sentinel), wait for the store; one re-fire like dockFixture.
         const sentinel = `${this.watchDir}/${dstDevice}`
         await this.ssh(dstHost, buildFireSentinelRemote(this.watchDir, sentinel))
+        const dockT0 = Date.now()
         try {
-            await this.waitDiskDocked(toEngine, diskId, 120_000)
+            await this.waitDiskDocked(toEngine, diskId, dockWaitMs())
         } catch (e) {
             console.warn(`[RealFleetOps] moveDisk: waitDiskDocked failed once on ${toEngine}/${diskId}; re-firing sentinel: ${e}`)
             await this.ssh(dstHost, buildFireSentinelRemote(this.watchDir, sentinel))
-            await this.waitDiskDocked(toEngine, diskId, 120_000)
+            await this.waitDiskDocked(toEngine, diskId, dockWaitMs())
         }
+        logStartMeasured({ what: 'dock', engine: toEngine, diskId, ms: Date.now() - dockT0, budgetMs: dockWaitMs() })
         phase('dock')
     }
 

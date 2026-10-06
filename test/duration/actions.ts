@@ -19,6 +19,7 @@ import { waitForConvergence } from './convergence.js'
 import { parse as parseYaml } from 'yaml'
 import { finalizeRecordedFrame, framePath } from './recordWalk.js'
 import { DURATION_UI_FIXTURES } from './ui/fixtures.js'
+import { copyDoneBudgetMs, DEFAULT_NEXTCLOUD_READY_MS, envMs, instanceStartBudgetMs, logStartMeasured } from './startBudgets.js'
 
 export const HUB_ACTIONS = [
     'return_to_start',
@@ -217,11 +218,11 @@ export const waitEmpty002PostInstallRunning = async (
     const opsAny = ctx.opts.ops as FleetOps & { findDockedEngine?: unknown }
     const isLive = typeof opsAny.findDockedEngine === 'function'
     // Fake: synthetic empty-002-main already Running after redock — short budget.
-    // Live: installApp + compose start can take minutes even under --fast dwell.
-    const budget = isLive
-        ? (ctx.opts.fast ? 120_000 : 5 * 60_000)
-        : (ctx.opts.fast ? 800 : 3_000)
-    const deadline = Date.now() + budget
+    // Live: installApp + compose start (+ services/*.tar image load with skipImageLoad:false)
+    // can take minutes even under --fast dwell. DURATION_INSTANCE_START_MS (startBudgets.ts).
+    const budget = instanceStartBudgetMs({ fast: !!ctx.opts.fast, live: isLive })
+    const t0 = Date.now()
+    const deadline = t0 + budget
     let lastIds: string[] = []
     let sawStarting: { id: string; status: string } | null = null
 
@@ -240,7 +241,9 @@ export const waitEmpty002PostInstallRunning = async (
                 lastIds.push(`${inst.id}:${inst.status}`)
                 const st = (inst.status ?? '').trim()
                 if (st === 'Running') {
-                    return `post-install settle: ${inst.id} Running on ${diskId} (${eng})`
+                    const ms = Date.now() - t0
+                    if (isLive) logStartMeasured({ what: 'post_install_start', engine: eng, instanceId: inst.id, diskId, ms, budgetMs: budget })
+                    return `post-install settle: ${inst.id} Running on ${diskId} (${eng}) after ${ms}ms (budget ${budget}ms)`
                 }
                 if (/^Starting/i.test(st) || st === 'Starting') {
                     sawStarting = { id: inst.id, status: st }
@@ -916,12 +919,9 @@ export const syncNextcloudSidecarUrlForEngine = (
     return url
 }
 
-/** Poll budget for NC login-form readiness after dock. Default 180s (re-dock >30s). */
-export const nextcloudReadyTimeoutMs = (env: NodeJS.ProcessEnv = process.env): number => {
-    const raw = env.DURATION_NEXTCLOUD_READY_MS?.trim()
-    if (raw && /^\d+$/.test(raw)) return Math.max(1_000, Number(raw))
-    return 180_000
-}
+/** Poll budget for NC login-form readiness after dock. Default 420 s (was 180 s; services/*.tar load, startBudgets.ts). */
+export const nextcloudReadyTimeoutMs = (env: NodeJS.ProcessEnv = process.env): number =>
+    envMs(env, 'DURATION_NEXTCLOUD_READY_MS', DEFAULT_NEXTCLOUD_READY_MS)
 
 /**
  * Decode a Nextcloud `initial-state-<app>-<key>` hidden input value (base64 JSON).
@@ -1000,7 +1000,8 @@ export const waitNextcloudSidecarReadyForEngine = async (
         return `DURATION_NEXTCLOUD_URL=${base} (wait skipped)`
     }
     const budget = nextcloudReadyTimeoutMs(env)
-    const deadline = Date.now() + budget
+    const t0 = Date.now()
+    const deadline = t0 + budget
     const fetchImpl = opts.fetchImpl ?? globalThis.fetch
     const sleepImpl = opts.sleepImpl ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)))
     const loginUrl = `${base.replace(/\/$/, '')}/login`
@@ -1015,7 +1016,9 @@ export const waitNextcloudSidecarReadyForEngine = async (
             if (status >= 200 && status < 400) {
                 const html = await resp.text()
                 if (nextcloudLoginFormLooksReady(html)) {
-                    return `DURATION_NEXTCLOUD_URL=${base} (login form ready)`
+                    const ms = Date.now() - t0
+                    logStartMeasured({ what: 'nextcloud_ready', engine: engineId, ms, budgetMs: budget })
+                    return `DURATION_NEXTCLOUD_URL=${base} (login form ready after ${ms}ms, budget ${budget}ms)`
                 }
                 last = `HTTP ${status} login-form incomplete (body-login+hideLoginForm=false | user/password/submit)`
             } else {
@@ -1344,10 +1347,12 @@ export const verifyRestoreOperation = async (
         }
         ctrNote = `container ${names.join(',')} on ${host}`
     }
+    const opMs = typeof done.completedAt === 'number' && typeof done.startedAt === 'number' ? done.completedAt - done.startedAt : null
+    if (opMs != null) logStartMeasured({ what: 'restore_op', engine: done.engine, instanceId: instId, diskId: targetDiskId, ms: opMs, opMs })
     return {
         ok: true,
         reason: 'ok',
-        note: `restore op ${done.id} Done on ${done.engine}; ${instId} Running on ${targetDiskId}@${host}; ${ctrNote}`,
+        note: `restore op ${done.id} Done on ${done.engine}${opMs != null ? ` in ${opMs}ms` : ''}; ${instId} Running on ${targetDiskId}@${host}; ${ctrNote}`,
     }
 }
 
@@ -1569,7 +1574,7 @@ export type CopyCheckReason = 'ok' | 'refused' | 'never_started' | 'not_done'
  * After the copy_app Intent reports ok (Console Confirm + settle), the Engine must have run
  * a copyApp Operation since the Intent started and it must end Done. Bounded waits:
  * DURATION_COPY_START_MS (fast 5 s / 30 s) for it to appear, DURATION_COPY_DONE_MS (fast
- * 120 s / 600 s) for it to end. Failed/Cancelled, a timeout, or no Operation (a refused
+ * 300 s / 900 s, startBudgets.ts: the target start loads services/*.tar) for it to end. Failed/Cancelled, a timeout, or no Operation (a refused
  * copyApp CommandLog trace is quoted) → not ok, Engine error verbatim. r36@43: copyApp
  * Failed "rsync exited with code 23 … Permission denied (13)" while the step passed.
  * Prefers rows for the expected instance; otherwise judges every copyApp row since the
@@ -1590,7 +1595,7 @@ export const verifyCopyOperation = async (
         return raw && /^\d+$/.test(raw) ? Number(raw) : undefined
     }
     const startBudget = opts.startBudgetMs ?? envMs('DURATION_COPY_START_MS') ?? (ctx.opts.fast ? 5_000 : 30_000)
-    const doneBudget = opts.doneBudgetMs ?? envMs('DURATION_COPY_DONE_MS') ?? (ctx.opts.fast ? 120_000 : 600_000)
+    const doneBudget = opts.doneBudgetMs ?? copyDoneBudgetMs(!!ctx.opts.fast, env)
     const pollMs = opts.pollMs ?? 1_000
     const slackMs = opts.slackMs ?? 5_000
     const traceSlackMs = opts.traceSlackMs ?? 5_000
@@ -1676,10 +1681,13 @@ export const verifyCopyOperation = async (
                 `${errNote}. No soft-pass.`,
         }
     }
+    const opMs = typeof done.completedAt === 'number' && typeof done.startedAt === 'number' ? done.completedAt - done.startedAt : null
+    logStartMeasured({ what: 'copy_op', engine: done.engine, instanceId: done.args?.instanceId ?? null, diskId: done.args?.targetDiskId ?? null, ms: Date.now() - t0, budgetMs: startBudget + doneBudget, opMs })
     return {
         ok: true,
         reason: 'ok',
-        note: `copy op ${done.id} Done on ${done.engine}${done.args?.instanceId ? ` (${done.args.instanceId} → ${done.args.targetDiskId ?? '?'})` : ''}`,
+        note: `copy op ${done.id} Done on ${done.engine}${done.args?.instanceId ? ` (${done.args.instanceId} → ${done.args.targetDiskId ?? '?'})` : ''}` +
+            `${opMs != null ? ` in ${opMs}ms` : ''}`,
     }
 }
 
