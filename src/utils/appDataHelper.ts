@@ -94,6 +94,15 @@ export const receiveAppArgs = (root: string, appId: string): string[] => ['recei
 export const receiveServiceArgs = (root: string): string[] => ['receive-service', checkRoot(root)]
 /** On a peer: the rsync server for compose.yaml/.env into an instance folder this Engine's receive created. */
 export const receiveFilesArgs = (root: string, id: string): string[] => ['receive-files', checkRoot(root), checkId(id)]
+/**
+ * Local Engine: copy basenames from a /tmp staging dir into an existing instance
+ * folder as root (idea-app-data put-files). Peers use receive-files through the gate.
+ */
+export const putFilesArgs = (root: string, id: string, stagingDir: string): string[] => {
+    if (!stagingDir || stagingDir.includes('\0')) throw new Error('stagingDir is required for put-files')
+    if (!stagingDir.startsWith('/tmp/')) throw new Error('stagingDir for put-files must be under /tmp')
+    return ['put-files', checkRoot(root), checkId(id), stagingDir]
+}
 export const deleteArgs = (root: string, id: string): string[] => ['delete', checkRoot(root), checkId(id)]
 export const borgInitArgs = (bdev: string, id: string): string[] => ['borg-init', checkRoot(bdev), checkId(id)]
 export const borgInfoArgs = (bdev: string, id: string): string[] => ['borg-info', checkRoot(bdev), checkId(id)]
@@ -168,6 +177,16 @@ export const instanceDataBytes = async (root: string, id: string, run: AppDataRu
 /** Removes an instance folder as root (rm -rf --one-file-system). A missing folder is fine. */
 export const deleteInstanceData = async (root: string, id: string, run: AppDataRunner = runAppData): Promise<void> => {
     await run(deleteArgs(root, id))
+}
+
+/** Place basename files from staging into an instance folder as root (local Engine). */
+export const putInstanceFiles = async (
+    root: string,
+    id: string,
+    stagingDir: string,
+    run: AppDataRunner = runAppData,
+): Promise<void> => {
+    await run(putFilesArgs(root, id, stagingDir))
 }
 
 /** Removes an instance folder on a peer Engine: ssh pi@host sudo -n idea-app-data delete <root> <id> (through its gate). */

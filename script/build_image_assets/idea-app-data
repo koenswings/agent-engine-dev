@@ -36,6 +36,7 @@
 #   idea-app-data receive-service    <root> <rsync server args...>           (as pi)
 #   idea-app-data ensure-dirs        <root>   (apps/ instances/ services/, owned by pi)
 #   idea-app-data erase-slot       <slot> <stagingDir>   (TEST-ONLY: umount+mkfs+remount a loop-backed slot)
+#   idea-app-data put-files        <root> <id> <stagingDir>  (local Engine: copy basenames from staging into instance as root)
 #   Peer keys (the Engine, from its store):
 #   idea-app-data sync-peers   < "<engineId> ssh-ed25519 <key> ssh-ed25519 <hostkey>" lines
 #   idea-app-data borg-init    <bdev> <id>
@@ -125,6 +126,7 @@ READLINK=/usr/bin/readlink
 STAT=/usr/bin/stat
 DU=/usr/bin/du
 RM=/usr/bin/rm
+CP=/usr/bin/cp
 RMDIR=/usr/bin/rmdir
 MKDIR=/usr/bin/mkdir
 MKTEMP=/usr/bin/mktemp
@@ -742,6 +744,37 @@ case "$SUB" in
         done
         ;;
 
+    put-files)
+        # Local Engine only: place overlay files (compose, .env, Kolibri rebind marker, …)
+        # into an existing instance folder as root. Staging holds basenames only; peers
+        # use receive-files through the gate (peer-receive-files) instead.
+        need 3 $(($# - 1)) "<root> <id> <stagingDir>"
+        check_id "$3"
+        resolve_root "$2" instances
+        DST=$(inst_dir "$R_DIR" "$3")
+        STAGING="$4"
+        existing_dir "$DST" "instance folder"
+        [[ -n "$STAGING" && "$STAGING" != -* ]] || refuse "stagingDir is required for put-files"
+        [[ "$STAGING" == /* ]] || refuse "stagingDir must be an absolute path"
+        [[ "$STAGING" == /tmp/* ]] || refuse "stagingDir must be under /tmp"
+        [[ -d "$STAGING" && ! -L "$STAGING" ]] || refuse "staging '$STAGING' is not a real folder"
+        exact_path "$STAGING" || refuse "staging '$STAGING' is not a real folder"
+        free_floor "$R_DIR/instances"
+        take_locks "inst.$2.$3"
+        shopt -s nullglob dotglob
+        entries=("$STAGING"/*)
+        shopt -u nullglob dotglob
+        (( ${#entries[@]} > 0 )) || refuse "staging '$STAGING' is empty"
+        for f in "${entries[@]}"; do
+            base="${f##*/}"
+            [[ "$base" != "." && "$base" != ".." ]] || continue
+            [[ -f "$f" && ! -L "$f" ]] || refuse "staging holds a non-regular file: $base"
+            [[ "$base" =~ ^[A-Za-z0-9._][A-Za-z0-9._+-]{0,200}$ ]] || refuse "staging file name '$base' is not allowed"
+            $CP -f -- "$f" "$DST/$base" || refuse "cannot write $DST/$base"
+        done
+        echo "ok: put ${#entries[@]} file(s) into $DST"
+        ;;
+
     peer-delete)
         need 3 $(($# - 1)) "<peerEngineId> <root> <id>"
         check_engine_id "$2"; check_id "$4"
@@ -998,7 +1031,7 @@ case "$SUB" in
         ;;
 
     "")
-        refuse "no subcommand (version, size, copy, send, receive, delete, borg-init, borg-info, borg-create, borg-extract, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, sync-peers)"
+        refuse "no subcommand (version, size, copy, send, receive, delete, borg-init, borg-info, borg-create, borg-extract, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, sync-peers)"
         ;;
     *)
         refuse "unknown subcommand '$(printf '%q' "$SUB")'"

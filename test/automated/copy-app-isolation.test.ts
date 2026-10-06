@@ -57,7 +57,7 @@ vi.mock('../../src/utils/rsync.js', () => ({
         }
         for (const p of paths) {
             const f = p.split('/').at(-1)!
-            if ((await fs.lstat(p)).isFile() && (f === '.env' || f === 'compose.yaml')) files[f] = await fs.readFile(p, 'utf8')
+            if ((await fs.lstat(p)).isFile() && (f === '.env' || f === 'compose.yaml' || f === '.idea-rebind-morango')) files[f] = await fs.readFile(p, 'utf8')
         }
         remoteOverlays.push({ src, peer, helperArgs, files })
         onProgress?.({ progressPercent: 100 })
@@ -96,6 +96,14 @@ vi.mock('../../src/utils/appDataHelper.js', async (importOriginal) => {
             helperDeletes.push([root, id])
             const { fs } = await import('zx')
             await fs.remove(await dir(root, id))
+        }),
+        // Local Kolibri marker (and any other basename overlay) via idea-app-data put-files
+        putInstanceFiles: vi.fn(async (root: string, id: string, stagingDir: string) => {
+            const { fs } = await import('zx')
+            const dest = await dir(root, id)
+            for (const name of await fs.readdir(stagingDir)) {
+                await fs.copy(`${stagingDir}/${name}`, `${dest}/${name}`)
+            }
         }),
         // deleteRemoteInstanceData stays real: its ssh goes to the mocked zx $ below
     }
@@ -327,6 +335,7 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
         // own data: a real directory, not a link
         expect((await fs.lstat(`${copyDir}/data/kolibri`)).isDirectory()).toBe(true)
         expect(await fs.readFile(`${copyDir}/data/kolibri/db.sqlite3`, 'utf8')).toBe('original-db')
+        expect(await fs.readFile(`${copyDir}/.idea-rebind-morango`, 'utf8')).toBe('r40\n')
 
         // unique name in compose.yaml (comments kept) and in the store
         const compose = await fs.readFile(`${copyDir}/compose.yaml`, 'utf8')
@@ -415,12 +424,16 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
             expect(remoteOverlays.map(o => [o.peer, o.helperArgs])).toEqual([
                 [{ host: '10.0.0.35', engineId: REMOTE }, ['receive-app', TGT_DEV, APP]],
                 [{ host: '10.0.0.35', engineId: REMOTE }, ['receive-files', TGT_DEV, newRow.id]],
+                [{ host: '10.0.0.35', engineId: REMOTE }, ['receive-files', TGT_DEV, newRow.id]], // Kolibri rebind marker
             ])
             const toCopy = remoteOverlays.filter(o => o.helperArgs[0] === 'receive-files')
-            expect(toCopy.map(o => [o.src].flat().every(p => /idea-copy-[^/]+\/(compose\.yaml|\.env)$/.test(p)))).toEqual([true])   // the files only, never the folder
+            expect(toCopy).toHaveLength(2)
+            expect([toCopy[0].src].flat().every(p => /idea-copy-[^/]+\/(compose\.yaml|\.env)$/.test(p))).toBe(true)   // overlay files only
+            expect([toCopy[1].src].flat().every(p => /idea-kolibri-rebind-[^/]+\/\.idea-rebind-morango$/.test(p))).toBe(true)
             const overlay = toCopy[0]
             expect(YAML.parse(overlay.files['compose.yaml'])['x-app'].instanceName).toBe('kolibri-2')
             expect(overlay.files['.env']).not.toMatch(/^port=/m)
+            expect(toCopy[1].files['.idea-rebind-morango']).toBe('r40\n')
             expect(h.doc().engineDB[REMOTE].commands).toEqual([`startInstance ${newRow.id} ${TGT} --cause cross-engine-cmd`])
             expect(order).toEqual([`stop:${ORIG}`, `start:${ORIG}`])
         } finally {

@@ -16,7 +16,7 @@ import { log } from '../utils/utils.js'
 import { rsyncDirectory, rsyncInstanceData, rsyncToPeer, PeerEngine } from '../utils/rsync.js'
 import {
     instanceDataBytes, deleteInstanceData, deleteRemoteInstanceData, ensureRemoteDirs,
-    receiveAppArgs, receiveFilesArgs, receiveServiceArgs,
+    receiveAppArgs, receiveFilesArgs, receiveServiceArgs, putInstanceFiles,
 } from '../utils/appDataHelper.js'
 import { peerCopyRefusal, peerAccessProblem } from './PeerAccess.js'
 import {
@@ -35,7 +35,7 @@ import { getEngineAddress } from './Network.js'
 import { Instance, Status } from './Instance.js'
 import { IPAddress } from './CommonTypes.js'
 import { lookupInstanceArg, describeInstanceCandidates } from './InstanceArg.js'
-import { findExternalLinks, externalLinksMessage, uniqueCopyName, preparedCopyFiles } from './InstanceCopy.js'
+import { findExternalLinks, externalLinksMessage, uniqueCopyName, preparedCopyFiles, instanceDirLooksLikeKolibri } from './InstanceCopy.js'
 import os from 'os'
 import path from 'path'
 
@@ -339,6 +339,35 @@ export const copyApp = async (
             }
         }
         log(`copyApp: the copy is named '${copyName}'; its .env has no port, so it gets its own port at start`)
+
+        // 5a2. r40: mark Kolibri copies so startInstance rebinds morango id before
+        //     zeroconf advertise (NonUniqueNameException → fake Docker Running).
+        //     Marker works for local and cross-engine (file is in the instance folder).
+        const kolibriCopy = peer
+            ? await instanceDirLooksLikeKolibri(instanceSrc)
+            : await instanceDirLooksLikeKolibri(instanceDest)
+        if (kolibriCopy) {
+            // Flat marker at instance root (receive-files / put-files place basenames).
+            // Peer: receive-files through the gate. Local: put-files as root (app-data policy).
+            const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-kolibri-rebind-'))
+            try {
+                await fs.writeFile(`${tmp}/.idea-rebind-morango`, 'r40\n')
+                if (peer) {
+                    await rsyncToPeer(
+                        [`${tmp}/.idea-rebind-morango`],
+                        peer,
+                        receiveFilesArgs(targetRoot, newInstanceId),
+                        undefined,
+                        opId,
+                    )
+                } else {
+                    await putInstanceFiles(targetRoot, newInstanceId, tmp)
+                }
+            } finally {
+                await fs.remove(tmp).catch(() => undefined)
+            }
+            log(`copyApp: wrote Kolibri morango-rebind marker so start mints a fresh id (r40)`)
+        }
 
         // 5b. rsync service image tars needed by this instance
         //     services/ holds the Docker image tars that startInstance loads via
