@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { FakeFleetOps, dispatchAction, addFilesAppDiskId, ensureAppOnlyDiskOnConsoleEngine, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, redockEmpty001BeforeMakeFiles, resolveConsoleEngineHost, filesDiskTargetId, preflightFilesDiskTarget, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, resyncFixtureSidecarUrlsFromStore, locateInstanceEngine, verifyRestoreOperation, SIDECAR_SETTLE_ACTIONS, nextcloudLoginFormLooksReady, nextcloudInitialState, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
+import { FakeFleetOps, dispatchAction, addFilesAppDiskId, ensureAppOnlyDiskOnConsoleEngine, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, redockEmpty001BeforeMakeFiles, resolveConsoleEngineHost, filesDiskTargetId, preflightFilesDiskTarget, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, resyncFixtureSidecarUrlsFromStore, locateInstanceEngine, verifyRestoreOperation, SIDECAR_SETTLE_ACTIONS, verifyBackupOperation, ensureBackupDiskForInstance, backupYamlLastBackup, nextcloudLoginFormLooksReady, nextcloudInitialState, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
 import { semanticStoresEqual, waitForConvergence } from '../duration/convergence.js'
 import { evaluateInvariants, DEFAULT_INFRA_INVARIANTS, listInvariantTypes } from '../duration/invariants.js'
 import {
@@ -2606,6 +2606,301 @@ describe('r29 FAIL@97: follow the store host for Kolibri/NC sidecars; restore mu
             const noCtr = await verifyRestoreOperation(ctx(mk([op('Done')], [])), since)
             expect(noCtr?.reason).toBe('no_container')
             expect(noCtr?.note).toMatch(/no running container kolibri-grade5a-001-\* on idea01/)
+        })
+    })
+})
+
+describe('r30: real backup_instance before restore_from_backup (op Done + archive on the Backup Disk)', () => {
+    const POOL = ['idea01', 'idea03', 'idea04']
+    const KOLIBRI = 'duration-kolibri-grade5a-001'
+    const NC = 'duration-nextcloud-grade5a-001'
+    const EMPTY2 = 'duration-empty-002'
+    const INST = 'kolibri-grade5a-001'
+    const HOSTS = { idea01: '100.99.231.94', idea03: '100.126.117.80', idea04: '100.108.39.45' }
+    const ENV_KEYS = ['DURATION_KOLIBRI_URL', 'DURATION_NEXTCLOUD_URL', 'DURATION_BACKUP_DISK_ID', 'DURATION_BACKUP_START_MS', 'DURATION_BACKUP_DONE_MS', 'DURATION_FILES_DISK_ID'] as const
+    const withEnv = async (vars: Partial<Record<(typeof ENV_KEYS)[number], string>>, fn: () => Promise<void>) => {
+        const prev: Record<string, string | undefined> = {}
+        for (const k of ENV_KEYS) {
+            prev[k] = process.env[k]
+            if (vars[k] === undefined) delete process.env[k]
+            else process.env[k] = vars[k]
+        }
+        try {
+            await fn()
+        } finally {
+            for (const k of ENV_KEYS) {
+                if (prev[k] === undefined) delete process.env[k]
+                else process.env[k] = prev[k]
+            }
+        }
+    }
+    const yaml = (lastBackup: number, inst = INST) =>
+        `mode: on-demand\nlinks:\n  - instanceId: ${inst}\n    lastBackup: ${lastBackup}\n`
+    type Probe = { dest: string; backupYaml: string | null; repoEntries: string[] | null }
+    /**
+     * Fake live fleet: Kolibri on kolibriOn, empty-002 = Backup Disk (named with spaces,
+     * like r29) on idea01 linking kolibri-grade5a-001. `after` describes what the Engine
+     * leaves once the Console Intent has clicked Back up.
+     */
+    const fleet = async (opts: {
+        kolibriOn?: string
+        links?: string[]
+        ops?: (since: number) => any[]
+        before?: Probe
+        after?: Probe
+    } = {}) => {
+        const ops = fakeOps({ poolEngines: POOL, excludeEngines: ['idea02'], storeMode: 'shared' })
+        await ops.dockFixture('idea01', NC)
+        await ops.dockFixture(opts.kolibriOn ?? 'idea01', KOLIBRI)
+        await ops.dockFixture('idea01', EMPTY2)
+        ;(ops as any).mutate((doc: SemanticStoreView) => {
+            const d = doc.diskDB[EMPTY2]!
+            d.name = 'Duration Tests — Empty Disk 002'
+            d.diskTypes = ['backup']
+            d.backupLinks = opts.links ?? [INST]
+        })
+        const state = { clicked: false, clickedAt: 0, intentEngine: undefined as string | undefined, listed: [] as string[], probed: [] as string[] }
+        const before: Probe = opts.before ?? { dest: '/home/pi/idea/duration-disks/idea-test-4', backupYaml: yaml(0), repoEntries: null }
+        const after: Probe = opts.after ?? {
+            dest: '/home/pi/idea/duration-disks/idea-test-4',
+            backupYaml: yaml(1_759_710_000_000),
+            repoEntries: ['README', 'config', 'data', 'hints.5', 'index.5', 'integrity.5'],
+        }
+        const live = Object.assign(ops, {
+            getHostMap: () => ({ ...HOSTS }),
+            listOperations: async (e: string) => {
+                state.listed.push(e)
+                if (!state.clicked || e !== 'idea01') return []
+                return opts.ops ? opts.ops(state.clickedAt) : [
+                    { id: 'b1', kind: 'backupApp', status: 'Done', startedAt: state.clickedAt + 200, args: { instanceId: INST, backupDiskId: EMPTY2 } },
+                ]
+            },
+            probeBackupDisk: async (e: string, diskId: string, inst: string) => {
+                state.probed.push(`${e}:${diskId}:${inst}`)
+                return state.clicked ? after : before
+            },
+        })
+        const driver = new StubUiDriver()
+        Object.assign(driver, {
+            runIntent: async (req: any) => {
+                state.clicked = true
+                state.clickedAt = Date.now()
+                state.intentEngine = req.engineId
+                return { ok: true, mode: 'live', message: `runDurationIntent ok: ${req.action}` }
+            },
+        })
+        return { ops: live, driver, state }
+    }
+    const ctxFor = (ops: unknown, driver: unknown, dockedEngine: string | null) => ({
+        opts: { ops, rng: () => 0, settleTimeoutMs: 500, fast: true, stubUi: true, uiDriver: driver },
+        walker: { current: 'op_instance', layer: 'operator' as const, dockedEngine, step: 97 },
+        from: 'op_instance',
+        to: 'op_instance',
+        action: 'backup_instance',
+        excludeEngines: ['idea02'],
+        poolEngines: POOL,
+        fixtureDisk: KOLIBRI,
+        fixtureInstance: INST,
+        fixtureDisks: [KOLIBRI, NC],
+        fixtureInstances: { ...KID_FIXTURES },
+    })
+    const FAST = { DURATION_BACKUP_START_MS: '60', DURATION_BACKUP_DONE_MS: '60' }
+
+    it('cover-all: open_instance_controls → backup_instance → back_to_disk sit between @96 backup_configured_restored and restore_from_backup (@100); graph unchanged', () => {
+        const walk = loadWalk('cover-all')
+        const acts = walk.steps.map(st => st.action)
+        const firstRestore = acts.indexOf('restore_from_backup')
+        expect(firstRestore + 1).toBe(100)
+        expect(acts.slice(firstRestore - 5, firstRestore + 1)).toEqual([
+            'make_backup_disk',
+            'backup_configured_restored',
+            'open_instance_controls',
+            'backup_instance',
+            'back_to_disk',
+            'restore_from_backup',
+        ])
+        expect(walk.steps[firstRestore - 2]).toMatchObject({ from: 'op_instance', to: 'op_instance', action: 'backup_instance' })
+        expect(walk.steps.length).toBe(128)
+        // backup_instance is the existing op_instance self-loop — no new state/edge.
+        const g = unifiedScenario()
+        const opInst = (g.states as any).op_instance.transitions as { to: string; action: string }[]
+        expect(opInst).toContainEqual(expect.objectContaining({ to: 'op_instance', action: 'backup_instance' }))
+        const opDisk = (g.states as any).op_disk.transitions as { to: string; action: string }[]
+        expect(opDisk.map(t => t.action)).not.toContain('backup_instance')
+    })
+
+    it('backupYamlLastBackup: link value, 0 when never backed up, undefined without file/link', () => {
+        expect(backupYamlLastBackup(yaml(42), INST)).toBe(42)
+        expect(backupYamlLastBackup(yaml(0), INST)).toBe(0)
+        expect(backupYamlLastBackup(yaml(5, 'other'), INST)).toBeUndefined()
+        expect(backupYamlLastBackup(null, INST)).toBeUndefined()
+        expect(backupYamlLastBackup('::: not yaml', INST)).toBeUndefined()
+    })
+
+    it('backup_instance (live): Kolibri on idea03 is co-located with the Backup Disk on idea01, Intent runs there, op Done + archive → ok', async () => {
+        await withEnv({}, async () => {
+            const { ops, driver, state } = await fleet({ kolibriOn: 'idea03' })
+            const r = await dispatchAction(ctxFor(ops, driver, 'idea03') as any)
+            expect(r.ok, r.message).toBe(true)
+            expect(r.dockedEngine).toBe('idea01')
+            expect(state.intentEngine).toBe('idea01')
+            expect((await ops.readStore('idea01')).diskDB[KOLIBRI]?.dockedTo).toBe('idea01')
+            expect(r.message).toMatch(/co-located duration-kolibri-grade5a-001 idea03→idea01 \(store-verified\) with Backup Disk duration-empty-002; BACKUP\.yaml lastBackup before=0/)
+            expect(r.message).toMatch(/backup op b1 Done on idea01; kolibri-grade5a-001 archived on duration-empty-002@idea01 \(BACKUP\.yaml lastBackup=1759710000000 > 0; backups\/kolibri-grade5a-001\/config present\)/)
+            expect(process.env.DURATION_KOLIBRI_URL).toBe('http://100.99.231.94:18080')
+            expect(state.listed).not.toContain('idea02')
+            expect(state.probed.every(p => p.startsWith('idea01:duration-empty-002:kolibri-grade5a-001'))).toBe(true)
+        })
+    })
+
+    it('backup_instance (live): no backupApp op (Eng 8d98718 "Too many arguments") → LOUD "backup op never started", even when the Intent reported ok', async () => {
+        await withEnv(FAST, async () => {
+            const { ops, driver } = await fleet({ ops: () => [] })
+            const r = await dispatchAction(ctxFor(ops, driver, 'idea01') as any)
+            expect(r.ok).toBe(false)
+            expect(r.message).toMatch(/^backup_instance: backup op never started: no backupApp Operation since the Back up click/)
+            expect(r.message).toMatch(/Too many arguments/)
+            expect(r.message).toMatch(/\(Console Intent reported ok\)$/)
+        })
+    })
+
+    it('backup_instance (live): op Failed → LOUD "backup op did not end Done" with the Engine error', async () => {
+        await withEnv(FAST, async () => {
+            const { ops, driver } = await fleet({
+                ops: t => [{ id: 'b2', kind: 'backupApp', status: 'Failed', startedAt: t + 100, error: 'borg: Repository does not exist', args: { instanceId: INST, backupDiskId: EMPTY2 } }],
+            })
+            const r = await dispatchAction(ctxFor(ops, driver, 'idea01') as any)
+            expect(r.ok).toBe(false)
+            expect(r.message).toMatch(/^backup_instance: backup op did not end Done: b2@idea01=Failed inst=kolibri-grade5a-001 \(borg: Repository does not exist\)/)
+        })
+    })
+
+    it('backup_instance (live): op still Running at the budget → "did not end Done"', async () => {
+        await withEnv(FAST, async () => {
+            const { ops, driver } = await fleet({
+                ops: t => [{ id: 'b3', kind: 'backupApp', status: 'Running', startedAt: t + 100, args: { instanceId: INST, backupDiskId: EMPTY2 } }],
+            })
+            const r = await dispatchAction(ctxFor(ops, driver, 'idea01') as any)
+            expect(r.ok).toBe(false)
+            expect(r.message).toMatch(/backup op did not end Done: b3@idea01=Running/)
+        })
+    })
+
+    it('backup_instance (live): op Done but BACKUP.yaml lastBackup still 0 → LOUD', async () => {
+        await withEnv(FAST, async () => {
+            const { ops, driver } = await fleet({
+                after: { dest: '/d/idea-test-4', backupYaml: yaml(0), repoEntries: ['config', 'data'] },
+            })
+            const r = await dispatchAction(ctxFor(ops, driver, 'idea01') as any)
+            expect(r.ok).toBe(false)
+            expect(r.message).toMatch(/^backup_instance: backup op b1 Done but Backup Disk duration-empty-002@idea01 \/d\/idea-test-4: BACKUP\.yaml lastBackup for kolibri-grade5a-001 still 0/)
+        })
+    })
+
+    it('backup_instance (live): op Done, lastBackup bumped, but no Borg repo for the instance → LOUD "no archive"', async () => {
+        await withEnv(FAST, async () => {
+            for (const [repoEntries, why] of [
+                [null, /backups\/kolibri-grade5a-001\/ missing/],
+                [['data'], /backups\/kolibri-grade5a-001\/config missing \(entries: data\)/],
+                [['config', '.backup-in-progress'], /\.backup-in-progress still present/],
+            ] as const) {
+                const { ops, driver } = await fleet({
+                    after: { dest: '/d/idea-test-4', backupYaml: yaml(99), repoEntries: repoEntries as string[] | null },
+                })
+                const r = await dispatchAction(ctxFor(ops, driver, 'idea01') as any)
+                expect(r.ok).toBe(false)
+                expect(r.message).toMatch(/^backup_instance: no archive for kolibri-grade5a-001 on Backup Disk duration-empty-002@idea01/)
+                expect(r.message).toMatch(why)
+                expect(r.message).toMatch(/No docked Backup Disk with archives/)
+            }
+        })
+    })
+
+    it('backup_instance (live): only the name-twin was backed up (copy_app clone also named "kolibri") → LOUD wrong instance', async () => {
+        await withEnv(FAST, async () => {
+            const { ops, driver } = await fleet({
+                ops: t => [{ id: 'b4', kind: 'backupApp', status: 'Done', startedAt: t + 100, args: { instanceId: '99vunsducqvzniusygc', backupDiskId: EMPTY2 } }],
+            })
+            const r = await dispatchAction(ctxFor(ops, driver, 'idea01') as any)
+            expect(r.ok).toBe(false)
+            expect(r.message).toMatch(/^backup_instance: backup op backed up the wrong instance: b4@idea01=Done inst=99vunsducqvzniusygc; expected kolibri-grade5a-001/)
+        })
+    })
+
+    it('verifyBackupOperation: a second backup must bump lastBackup beyond the pre-click value; stale ops ignored; arg form irrelevant', async () => {
+        await withEnv({}, async () => {
+            const since = Date.now()
+            const { ops, state } = await fleet({
+                ops: t => [
+                    { id: 'old', kind: 'backupApp', status: 'Done', startedAt: t - 3_600_000, args: { instanceId: INST, backupDiskId: EMPTY2 } },
+                    // ids in args regardless of what the Console typed (Eng resolves before createOperation)
+                    { id: 'b5', kind: 'backupApp', status: 'Done', startedAt: t + 10, args: { instanceId: INST, backupDiskId: EMPTY2 } },
+                ],
+                after: { dest: '/d/idea-test-4', backupYaml: yaml(1000), repoEntries: ['config'] },
+            })
+            state.clicked = true
+            state.clickedAt = since
+            const ctx = ctxFor(ops, null, 'idea01') as any
+            const budgets = { startBudgetMs: 30, doneBudgetMs: 30, pollMs: 5 }
+            const stale = await verifyBackupOperation(ctx, since, { instanceId: INST, priorLastBackup: 1000 }, budgets)
+            expect(stale?.reason).toBe('last_backup_not_bumped')
+            expect(stale?.note).toMatch(/not bumped \(1000 ≤ before 1000\)/)
+            const ok = await verifyBackupOperation(ctx, since, { instanceId: INST, priorLastBackup: 500 }, budgets)
+            expect(ok?.ok, ok?.note).toBe(true)
+            expect(ok?.note).toMatch(/^backup op b5 Done on idea01/)
+            // Fake ops without an operationDB reader → no live check (Fake walks unaffected).
+            expect(await verifyBackupOperation(ctxFor(fakeOps({ poolEngines: POOL }), null, 'idea01') as any, since, { instanceId: INST })).toBeNull()
+        })
+    })
+
+    it('backup_instance preflight: no Backup Disk linked to the instance → aborted before Intent (Console would not show Back up)', async () => {
+        await withEnv({}, async () => {
+            const { ops, driver, state } = await fleet({ links: ['nextcloud-grade5a-001'] })
+            const r = await dispatchAction(ctxFor(ops, driver, 'idea01') as any)
+            expect(r.ok).toBe(false)
+            expect(r.message).toMatch(/^backup_instance aborted before Intent: backup_instance: no docked Backup Disk linked to kolibri-grade5a-001 on any pool engine/)
+            expect(state.clicked).toBe(false)
+        })
+    })
+
+    it('RealFleetOps.probeBackupDisk: read-only cat/ls on the store slot; parses BACKUP.yaml + repo entries; refuses odd ids', async () => {
+        const cmds: string[] = []
+        const self = (out: string) => ({
+            assertNotExcluded: (e: string) => { if (e === 'idea02') throw new Error('excluded') },
+            readStore: async () => ({ engineId: 'idea01', instanceDB: {}, diskDB: { [EMPTY2]: { id: EMPTY2, dockedTo: 'idea01', device: 'idea-test-4' } }, engineDB: {} }),
+            deviceMap: () => new Map<string, string>(),
+            disksRoot: '/home/pi/idea/duration-disks',
+            hostOf: (e: string) => e,
+            ssh: async (_h: string, cmd: string) => { cmds.push(cmd); return out },
+        })
+        const probe = (RealFleetOps.prototype as any).probeBackupDisk
+        const ok = await probe.call(self(`${yaml(7)}@@REPO@@\nREADME\nconfig\ndata\n`), 'idea01', EMPTY2, INST)
+        expect(ok).toEqual({ dest: '/home/pi/idea/duration-disks/idea-test-4', backupYaml: yaml(7).trim(), repoEntries: ['README', 'config', 'data'] })
+        expect(cmds[0]).toMatch(/cat '\/home\/pi\/idea\/duration-disks\/idea-test-4\/BACKUP\.yaml'/)
+        expect(cmds[0]).toMatch(/ls -1A '\/home\/pi\/idea\/duration-disks\/idea-test-4\/backups\/kolibri-grade5a-001'/)
+        expect(cmds[0]).not.toMatch(/\brm\b|\bborg\b|>|tee|mv /)
+        const none = await probe.call(self('@@NO_BACKUP_YAML@@\n@@REPO@@\n@@NO_REPO@@\n'), 'idea01', EMPTY2, INST)
+        expect(none).toMatchObject({ backupYaml: null, repoEntries: null })
+        await expect(probe.call(self(''), 'idea01', EMPTY2, "x'; rm -rf /")).rejects.toThrow(/refuse backup probe/)
+        await expect(probe.call(self(''), 'idea02', EMPTY2, INST)).rejects.toThrow(/excluded/)
+    })
+
+    it('ensureBackupDiskForInstance: BACKUP.yaml without a link for the instance, or co-locate landing elsewhere → LOUD', async () => {
+        await withEnv({}, async () => {
+            const a = await fleet({ before: { dest: '/d/idea-test-4', backupYaml: yaml(0, 'other'), repoEntries: null } })
+            await expect(ensureBackupDiskForInstance(ctxFor(a.ops, null, 'idea01') as any, INST, KOLIBRI)).rejects.toThrow(
+                /BACKUP\.yaml has no link for kolibri-grade5a-001/,
+            )
+            const b = await fleet({ kolibriOn: 'idea03' })
+            Object.assign(b.ops, {
+                moveDisk: async (from: string, _to: string, d: string) => {
+                    await b.ops.undockFixtures([from], d)
+                    await b.ops.dockFixture('idea04', d)
+                },
+            })
+            await expect(ensureBackupDiskForInstance(ctxFor(b.ops, null, 'idea03') as any, INST, KOLIBRI)).rejects.toThrow(
+                /backup_instance: co-locate duration-kolibri-grade5a-001 idea03→idea01 did not land \(store: kolibri-grade5a-001 on idea04\)/,
+            )
         })
     })
 })

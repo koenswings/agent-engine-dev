@@ -80,6 +80,8 @@ export interface SemanticDisk {
     device?: string | null
     /** Prefer A r20: make_files_disk post-check (files role landed). */
     diskTypes?: string[]
+    /** r30: Backup Disk backupConfig.links (instance ids). Not part of convergence equality. */
+    backupLinks?: string[]
 }
 
 export interface SemanticEngine {

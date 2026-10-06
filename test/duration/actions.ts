@@ -16,6 +16,7 @@ import type {
     WalkerState,
 } from './types.js'
 import { waitForConvergence } from './convergence.js'
+import { parse as parseYaml } from 'yaml'
 import { finalizeRecordedFrame, framePath } from './recordWalk.js'
 import { DURATION_UI_FIXTURES } from './ui/fixtures.js'
 
@@ -1344,6 +1345,338 @@ export const verifyRestoreOperation = async (
     }
 }
 
+// ── r30: backup_instance must leave a real archive before restore_from_backup ──────
+
+export type BackupDiskProbe = { dest: string; backupYaml: string | null; repoEntries: string[] | null }
+
+type BackupOps = FleetOps & {
+    listOperations?: (engineId: string) => Promise<DurationOperationRow[]>
+    probeBackupDisk?: (engineId: string, diskId: string, instanceId: string) => Promise<BackupDiskProbe | null>
+}
+
+/** Eng backupMonitor LOCK_FILE: present while (or after a failed) borg create. */
+export const BACKUP_IN_PROGRESS_MARKER = '.backup-in-progress'
+
+/**
+ * BACKUP.yaml `links[].lastBackup` for instanceId. `undefined` = no BACKUP.yaml / no link
+ * for the instance; a number otherwise (0 = configured, never backed up).
+ */
+export const backupYamlLastBackup = (raw: string | null, instanceId: string): number | undefined => {
+    if (raw == null) return undefined
+    let doc: unknown
+    try {
+        doc = parseYaml(raw)
+    } catch {
+        return undefined
+    }
+    const links = (doc as { links?: unknown } | null)?.links
+    if (!Array.isArray(links)) return undefined
+    const link = links.find(l => (l as { instanceId?: unknown })?.instanceId === instanceId) as
+        | { lastBackup?: unknown }
+        | undefined
+    if (!link) return undefined
+    const n = Number(link.lastBackup ?? 0)
+    return Number.isFinite(n) ? n : 0
+}
+
+/** Live harness capability: read-only Backup Disk probe (RealFleetOps). Fake walks skip. */
+export const hasBackupProbe = (ctx: ActionContext): boolean =>
+    typeof (ctx.opts.ops as BackupOps).probeBackupDisk === 'function'
+
+/**
+ * r30 preflight before the backup_instance Intent (live only). Console 0760c01
+ * InstanceRow shows `backup-instance-<id>` only for a Backup Disk that is docked on the
+ * SAME engine as the instance's disk and links the instance (InstanceList
+ * resolveBackupDisks), and Eng backupInstance writes borg on the local device. After a
+ * real infra_move_disk@62 Kolibri sits on idea03 while make_backup_disk@95 configured
+ * empty-00x on the Console engine — co-locate by moving the APP disk to the Backup Disk's
+ * engine (verified moveDisk; never the Backup Disk: an empty-pack re-dock wipes
+ * BACKUP.yaml). Returns the Backup Disk + its BACKUP.yaml lastBackup before the Intent.
+ */
+export const ensureBackupDiskForInstance = async (
+    ctx: ActionContext,
+    instanceId: string,
+    appDiskId: string,
+    env: NodeJS.ProcessEnv = process.env,
+): Promise<{
+    backupDiskId: string
+    engine: string
+    priorLastBackup: number
+    movedTo: string | null
+    note: string
+}> => {
+    const ops = ctx.opts.ops as BackupOps
+    const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e))
+    const inst = await locateInstanceEngine(ctx, instanceId, appDiskId)
+    if (!inst.engine || !inst.live) {
+        throw new Error(
+            `backup_instance: ${instanceId} is not live on any pool engine (disk ${inst.diskId}: ` +
+                `${inst.engine ? `docked on ${inst.engine}, instance Undocked` : 'not docked'}). No soft-pass.`,
+        )
+    }
+    // Backup Disks linked to the instance, docked on a pool engine (shared store: any view).
+    const candidates: { id: string; engine: string }[] = []
+    const seen = new Set<string>()
+    for (const eng of pool) {
+        let view: SemanticStoreView
+        try {
+            view = await ctx.opts.ops.readStore(eng)
+        } catch {
+            continue
+        }
+        for (const d of Object.values(view.diskDB)) {
+            if (seen.has(d.id) || !d.dockedTo || !d.diskTypes?.includes('backup')) continue
+            if (!pool.includes(d.dockedTo)) continue
+            if (d.backupLinks && !d.backupLinks.includes(instanceId)) continue
+            seen.add(d.id)
+            candidates.push({ id: d.id, engine: d.dockedTo })
+        }
+    }
+    if (!candidates.length) {
+        throw new Error(
+            `backup_instance: no docked Backup Disk linked to ${instanceId} on any pool engine ` +
+                `(${pool.join(', ')}) — make_backup_disk must link it first; Console shows Back up only ` +
+                `for a linked Backup Disk on the instance's engine. No soft-pass.`,
+        )
+    }
+    const pinned = env.DURATION_BACKUP_DISK_ID?.trim()
+    const chosen =
+        candidates.find(c => c.engine === inst.engine) ??
+        candidates.find(c => c.id === pinned) ??
+        candidates[0]!
+    let movedTo: string | null = null
+    let moveNote = `${instanceId} on ${inst.engine} with Backup Disk ${chosen.id}`
+    if (chosen.engine !== inst.engine) {
+        assertNotGolden(ctx, chosen.engine, 'backup_instance(co-locate app disk)')
+        try {
+            await ctx.opts.ops.moveDisk(inst.engine, chosen.engine, inst.diskId)
+        } catch (e) {
+            const err = e instanceof Error ? e.message : String(e)
+            throw new Error(
+                `backup_instance: could not co-locate ${inst.diskId} ${inst.engine}→${chosen.engine} ` +
+                    `(Backup Disk ${chosen.id} lives there): ${err}. No soft-pass.`,
+            )
+        }
+        await settleParticipants(ctx, [inst.engine, chosen.engine])
+        const after = await locateInstanceEngine(ctx, instanceId, inst.diskId)
+        if (after.engine !== chosen.engine || !after.live) {
+            throw new Error(
+                `backup_instance: co-locate ${inst.diskId} ${inst.engine}→${chosen.engine} did not land ` +
+                    `(store: ${instanceId} on ${after.engine ?? 'none'}${after.live ? '' : ', not live'}). No soft-pass.`,
+            )
+        }
+        movedTo = chosen.engine
+        moveNote = `co-located ${inst.diskId} ${inst.engine}→${chosen.engine} (store-verified) with Backup Disk ${chosen.id}`
+    }
+    let priorLastBackup = 0
+    if (typeof ops.probeBackupDisk === 'function') {
+        const probe = await ops.probeBackupDisk(chosen.engine, chosen.id, instanceId)
+        if (!probe) {
+            throw new Error(
+                `backup_instance: Backup Disk ${chosen.id} on ${chosen.engine} has no known idea-test-N slot ` +
+                    `(cannot verify the archive afterwards). No soft-pass.`,
+            )
+        }
+        const lb = backupYamlLastBackup(probe.backupYaml, instanceId)
+        if (lb === undefined) {
+            throw new Error(
+                `backup_instance: Backup Disk ${chosen.id}@${chosen.engine} ${probe.dest}/BACKUP.yaml ` +
+                    `${probe.backupYaml == null ? 'missing' : `has no link for ${instanceId}`} — ` +
+                    `Eng backupInstance only bumps lastBackup for linked instances. No soft-pass.`,
+            )
+        }
+        priorLastBackup = lb
+    }
+    return {
+        backupDiskId: chosen.id,
+        engine: chosen.engine,
+        priorLastBackup,
+        movedTo,
+        note: `${moveNote}; BACKUP.yaml lastBackup before=${priorLastBackup}`,
+    }
+}
+
+export type BackupCheckReason =
+    | 'ok'
+    | 'never_started'
+    | 'wrong_instance'
+    | 'not_done'
+    | 'last_backup_not_bumped'
+    | 'no_archive'
+
+/**
+ * r30: after the backup_instance Intent (Console clicks Back up and returns), poll the
+ * pool engines' operationDB for a backupApp Operation started after the click and wait
+ * for it to end. Reads only the resolved Operation args (Eng backupMonitor.ts:110-113:
+ * instanceId + backupDiskId) — independent of whether the Console sent names (Eng
+ * 8d98718) or ids (fix/restore-backup-disk-id). Then the Backup Disk must really hold
+ * the archive restore_from_backup will look for: BACKUP.yaml lastBackup for the
+ * instance > 0 and > its pre-Intent value, `backups/<instanceId>/config` (the Borg repo
+ * Eng restoreApp requires) and no `.backup-in-progress` marker. Returns null without a
+ * live operationDB reader (Fake ops / stub).
+ */
+export const verifyBackupOperation = async (
+    ctx: ActionContext,
+    sinceMs: number,
+    expect: { instanceId: string; priorLastBackup?: number },
+    opts: { startBudgetMs?: number; doneBudgetMs?: number; pollMs?: number; slackMs?: number } = {},
+    env: NodeJS.ProcessEnv = process.env,
+): Promise<{ ok: boolean; reason: BackupCheckReason; note: string } | null> => {
+    const ops = ctx.opts.ops as BackupOps
+    if (typeof ops.listOperations !== 'function') return null
+    const envMs = (k: string): number | undefined => {
+        const raw = env[k]?.trim()
+        return raw && /^\d+$/.test(raw) ? Number(raw) : undefined
+    }
+    const startBudget = opts.startBudgetMs ?? envMs('DURATION_BACKUP_START_MS') ?? (ctx.opts.fast ? 5_000 : 30_000)
+    const doneBudget = opts.doneBudgetMs ?? envMs('DURATION_BACKUP_DONE_MS') ?? (ctx.opts.fast ? 30_000 : 600_000)
+    const pollMs = opts.pollMs ?? 1_000
+    const slackMs = opts.slackMs ?? 60_000
+    const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e))
+    const want = expect.instanceId
+    const t0 = Date.now()
+    let rows: (DurationOperationRow & { engine: string })[] = []
+    let readErrors: string[] = []
+    const scan = async () => {
+        rows = []
+        readErrors = []
+        for (const eng of pool) {
+            try {
+                for (const r of await ops.listOperations!(eng)) {
+                    if (r.kind !== 'backupApp') continue
+                    if (typeof r.startedAt !== 'number' || r.startedAt < sinceMs - slackMs) continue
+                    if (!rows.some(x => x.id === r.id)) rows.push({ ...r, engine: eng })
+                }
+            } catch (e) {
+                readErrors.push(`${eng}: ${e instanceof Error ? e.message : String(e)}`)
+            }
+        }
+    }
+    const desc = (rs: typeof rows) =>
+        rs.map(r => `${r.id}@${r.engine}=${r.status}${r.args?.instanceId ? ` inst=${r.args.instanceId}` : ''}${r.error ? ` (${r.error})` : ''}`).join(', ')
+    const terminal = (st: string) => st === 'Done' || st === 'Failed' || st === 'Cancelled'
+    for (;;) {
+        await scan()
+        const mine = rows.filter(r => r.args?.instanceId === want)
+        const elapsed = Date.now() - t0
+        if (mine.some(r => r.status === 'Done')) break
+        if (mine.length && mine.every(r => terminal(r.status))) break
+        if (!rows.length && elapsed >= startBudget) break
+        if (rows.length && !mine.length && rows.every(r => terminal(r.status)) && elapsed >= startBudget) break
+        if (elapsed >= startBudget + doneBudget) break
+        await sleep(pollMs)
+    }
+    const errNote = readErrors.length ? ` (store read errors: ${readErrors.join('; ')})` : ''
+    if (!rows.length) {
+        return {
+            ok: false,
+            reason: 'never_started',
+            note:
+                `backup op never started: no backupApp Operation since the Back up click on any pool engine ` +
+                `within ${startBudget}ms${errNote}. Engine rejected the command before execution? (Eng 8d98718 ` +
+                `splits "backupApp <instance> <backupDiskName>" on spaces → "Too many arguments"; ` +
+                `"Duration Tests — Empty Disk 002" has spaces). Engine/Console backup bug — no soft-pass.`,
+        }
+    }
+    const mine = rows.filter(r => r.args?.instanceId === want)
+    if (!mine.length) {
+        return {
+            ok: false,
+            reason: 'wrong_instance',
+            note:
+                `backup op backed up the wrong instance: ${desc(rows)}; expected ${want}. Eng 8d98718 ` +
+                `resolves the instance by NAME and two instances share it (e.g. copy_app clone). No soft-pass.`,
+        }
+    }
+    const done = mine.find(r => r.status === 'Done')
+    if (!done) {
+        return {
+            ok: false,
+            reason: 'not_done',
+            note: `backup op did not end Done: ${desc(mine)} after ${Date.now() - t0}ms. No soft-pass.`,
+        }
+    }
+    const backupDiskId = done.args?.backupDiskId
+    if (!backupDiskId) {
+        return {
+            ok: false,
+            reason: 'no_archive',
+            note: `backup op ${done.id} Done on ${done.engine} but carries no backupDiskId arg. No soft-pass.`,
+        }
+    }
+    const host = await locateDockedEngine(ctx, backupDiskId)
+    if (!host || ctx.excludeEngines.includes(host) || isNeverEngine(host)) {
+        return {
+            ok: false,
+            reason: 'no_archive',
+            note: `backup op ${done.id} Done but Backup Disk ${backupDiskId} is not docked on a pool engine (${host ?? 'nowhere'}). No soft-pass.`,
+        }
+    }
+    if (typeof ops.probeBackupDisk !== 'function') {
+        return {
+            ok: false,
+            reason: 'no_archive',
+            note: `backup op ${done.id} Done but no Backup Disk probe available to verify the archive on ${backupDiskId}@${host}. No soft-pass.`,
+        }
+    }
+    let probe: BackupDiskProbe | null = null
+    try {
+        probe = await ops.probeBackupDisk(host, backupDiskId, want)
+    } catch (e) {
+        return {
+            ok: false,
+            reason: 'no_archive',
+            note: `backup op ${done.id} Done but probing ${backupDiskId}@${host} failed: ${e instanceof Error ? e.message : String(e)}. No soft-pass.`,
+        }
+    }
+    if (!probe) {
+        return {
+            ok: false,
+            reason: 'no_archive',
+            note: `backup op ${done.id} Done but Backup Disk ${backupDiskId}@${host} has no known idea-test-N slot. No soft-pass.`,
+        }
+    }
+    const lb = backupYamlLastBackup(probe.backupYaml, want)
+    const prior = expect.priorLastBackup ?? 0
+    if (lb === undefined || lb <= 0 || lb <= prior) {
+        const now =
+            lb === undefined
+                ? probe.backupYaml == null
+                    ? 'BACKUP.yaml missing'
+                    : `BACKUP.yaml has no link for ${want}`
+                : lb <= 0
+                  ? `BACKUP.yaml lastBackup for ${want} still 0`
+                  : `BACKUP.yaml lastBackup for ${want} not bumped (${lb} ≤ before ${prior})`
+        return {
+            ok: false,
+            reason: 'last_backup_not_bumped',
+            note: `backup op ${done.id} Done but Backup Disk ${backupDiskId}@${host} ${probe.dest}: ${now}. No soft-pass.`,
+        }
+    }
+    const repo = probe.repoEntries
+    if (!repo || !repo.includes('config') || repo.includes(BACKUP_IN_PROGRESS_MARKER)) {
+        const why = !repo
+            ? `backups/${want}/ missing`
+            : !repo.includes('config')
+              ? `backups/${want}/config missing (entries: ${repo.join(', ') || 'none'})`
+              : `backups/${want}/${BACKUP_IN_PROGRESS_MARKER} still present (borg create unfinished/failed)`
+        return {
+            ok: false,
+            reason: 'no_archive',
+            note:
+                `no archive for ${want} on Backup Disk ${backupDiskId}@${host} ${probe.dest}: ${why} — ` +
+                `restore_from_backup would fail "No docked Backup Disk with archives". No soft-pass.`,
+        }
+    }
+    return {
+        ok: true,
+        reason: 'ok',
+        note:
+            `backup op ${done.id} Done on ${done.engine}; ${want} archived on ${backupDiskId}@${host} ` +
+            `(BACKUP.yaml lastBackup=${lb} > ${prior}; backups/${want}/config present)`,
+    }
+}
+
 const infraRebootEngine = async (ctx: ActionContext): Promise<ActionResult> => {
     // Prefer rebooting a non-dock-holder when possible; never golden.
     const engine = pickPoolEngine(ctx)
@@ -1701,6 +2034,32 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             }
         }
     }
+    // r30: backup_instance must have a linked Backup Disk on the instance's engine (Console
+    // shows Back up only then); co-locate the app disk if needed and remember BACKUP.yaml
+    // lastBackup so the post-check can prove a NEW archive. Live only (Fake walks skip).
+    let backupPre: Awaited<ReturnType<typeof ensureBackupDiskForInstance>> | null = null
+    let backupDockedEngine: string | undefined
+    if (ctx.action === 'backup_instance' && hasBackupProbe(ctx)) {
+        try {
+            backupPre = await ensureBackupDiskForInstance(ctx, instanceId ?? ctx.fixtureInstance, ctx.fixtureDisk)
+            const notes = [backupPre.note]
+            if (backupPre.movedTo) {
+                backupDockedEngine = backupPre.movedTo
+                const urls = await resyncFixtureSidecarUrlsFromStore(ctx).catch(
+                    e => `sidecar URL resync failed: ${e instanceof Error ? e.message : String(e)}`,
+                )
+                if (urls) notes.push(urls)
+            }
+            preStartSettleNote = [preStartSettleNote, ...notes].filter(Boolean).join('; ')
+        } catch (e) {
+            const err = e instanceof Error ? e.message : String(e)
+            return {
+                ok: false,
+                message: `backup_instance aborted before Intent: ${err}`,
+                layer,
+            }
+        }
+    }
     // r29 FAIL@97: re-read the Kolibri/NC host from the store before any Intent that
     // polls a sidecar after Confirm (relocation steps may have moved — or not moved — it).
     if (SIDECAR_SETTLE_ACTIONS.has(ctx.action)) {
@@ -1726,7 +2085,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             instanceId,
             engineId: ctx.action === 'make_files_disk' || ctx.action === 'add_files_role'
                 ? resolveConsoleEngineHost(ctx)
-                : (ctx.walker.dockedEngine ?? ctx.poolEngines[0]),
+                : (backupDockedEngine ?? ctx.walker.dockedEngine ?? ctx.poolEngines[0]),
             screenshotPath: shotPath,
         })
     } finally {
@@ -1770,6 +2129,25 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
                     `restore_from_backup: ${check.note}` +
                     (result.ok ? ' (Console Intent reported ok)' : ` (Console Intent: ${message})`),
                 layer,
+            }
+        }
+        if (check) message = `${message}; ${check.note}`
+    }
+    // r30: backup_instance must leave a real archive for restore_from_backup (op Done +
+    // BACKUP.yaml lastBackup bumped + backups/<id>/config). Live only.
+    if (ctx.action === 'backup_instance') {
+        const check = await verifyBackupOperation(ctx, intentStartedAt, {
+            instanceId: instanceId ?? ctx.fixtureInstance,
+            priorLastBackup: backupPre?.priorLastBackup,
+        })
+        if (check && !check.ok) {
+            return {
+                ok: false,
+                message:
+                    `backup_instance: ${check.note}` +
+                    (result.ok ? ' (Console Intent reported ok)' : ` (Console Intent: ${message})`),
+                layer,
+                ...(backupDockedEngine ? { dockedEngine: backupDockedEngine } : {}),
             }
         }
         if (check) message = `${message}; ${check.note}`
@@ -1864,7 +2242,10 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
         message,
         layer,
         // Prefer A r22: Kolibri restored onto the Console engine → walker follows it.
-        ...(addFilesDockedEngine ? { dockedEngine: addFilesDockedEngine } : {}),
+        // r30: likewise when backup_instance co-located Kolibri with the Backup Disk.
+        ...(addFilesDockedEngine ?? backupDockedEngine
+            ? { dockedEngine: addFilesDockedEngine ?? backupDockedEngine }
+            : {}),
     }
 }
 

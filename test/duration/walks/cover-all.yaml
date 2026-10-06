@@ -296,6 +296,20 @@ steps:
   - from: op_backup
     to: op_disk
     action: backup_configured_restored
+  # r30 (Steve, after cover-all-980e735-r29 FAIL@97): take a real backup before restore —
+  # restore_from_backup needs an archive on the Backup Disk. backup_instance is the
+  # registered Console Intent (InstanceRow Back up); it departs op_instance, so enter
+  # instance controls and come back to the disk (proposal "Backup drill" chain). Harness
+  # asserts backupApp op Done + BACKUP.yaml lastBackup bumped + backups/<id>/config.
+  - from: op_disk
+    to: op_instance
+    action: open_instance_controls
+  - from: op_instance
+    to: op_instance
+    action: backup_instance
+  - from: op_instance
+    to: op_disk
+    action: back_to_disk
   - from: op_disk
     to: op_backup
     action: restore_from_backup

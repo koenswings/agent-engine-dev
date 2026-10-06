@@ -559,6 +559,9 @@ export class RealFleetOps implements FleetOps {
                 diskTypes: Array.isArray(disk.diskTypes)
                     ? disk.diskTypes.map(String)
                     : undefined,
+                backupLinks: Array.isArray(disk.backupConfig?.links)
+                    ? disk.backupConfig!.links.map(String)
+                    : undefined,
             }
         }
 
@@ -735,6 +738,48 @@ export class RealFleetOps implements FleetOps {
             `docker ps --filter name='^${instanceId}-' --format '{{.Names}}' 2>/dev/null || true`,
         )
         return out.split('\n').map(l => l.trim()).filter(Boolean)
+    }
+
+    /**
+     * r30 backup_instance: read-only look at a docked Backup Disk slot on engineId —
+     * `cat BACKUP.yaml` and `ls -1A backups/<instanceId>` (Eng backupMonitor writes the
+     * Borg repo there and bumps BACKUP.yaml links[].lastBackup only after borg create).
+     * Device comes from the store row (fallback: harness device map). Never writes.
+     * Returns null when no idea-test-N slot is known for the disk on that engine.
+     */
+    async probeBackupDisk(
+        engineId: string,
+        diskId: string,
+        instanceId: string,
+    ): Promise<{ dest: string; backupYaml: string | null; repoEntries: string[] | null } | null> {
+        this.assertNotExcluded(engineId, 'probeBackupDisk')
+        if (!/^[A-Za-z0-9_.-]+$/.test(instanceId)) {
+            throw new Error(`RealFleetOps: refuse backup probe for odd instance id '${instanceId}'`)
+        }
+        let device: string | null = null
+        try {
+            const view = await this.readStore(engineId)
+            const d = view.diskDB[diskId]
+            if (d?.device && /^idea-test-[0-9]+$/.test(d.device)) device = d.device
+        } catch {
+            /* fall back to the harness device map */
+        }
+        device ??= this.deviceMap(engineId).get(diskId) ?? null
+        if (!device || !/^idea-test-[0-9]+$/.test(device)) return null
+        const dest = `${this.disksRoot}/${device}`
+        const repo = `${dest}/backups/${instanceId}`
+        const out = await this.ssh(
+            this.hostOf(engineId),
+            `if [ -f '${dest}/BACKUP.yaml' ]; then cat '${dest}/BACKUP.yaml'; else echo '@@NO_BACKUP_YAML@@'; fi; ` +
+                `echo '@@REPO@@'; if [ -d '${repo}' ]; then ls -1A '${repo}'; else echo '@@NO_REPO@@'; fi`,
+        )
+        const text = String(out ?? '')
+        const [yamlPart, repoPart = ''] = text.split('@@REPO@@')
+        const backupYaml = /@@NO_BACKUP_YAML@@/.test(yamlPart ?? '') ? null : (yamlPart ?? '').trim()
+        const repoEntries = /@@NO_REPO@@/.test(repoPart)
+            ? null
+            : repoPart.split('\n').map(l => l.trim()).filter(Boolean)
+        return { dest, backupYaml, repoEntries }
     }
 
     /** Exposed for tests / smoke reporting. */

@@ -1448,6 +1448,7 @@ Authenticated operator Console UI click sequences. Intent-style names only. Prel
 **Enters `op_backup`.**
 
 1. Select Backup Disk → Restore panel → pick instance archive → target App Disk → confirm Restore.
+2. Assert: a `restoreApp` operation ended Done, and the restored instance is Running on the target disk with a container on that Engine. Needs an archive from **Backup instance** first.
 
 #### Backup configured / restored
 
@@ -1511,6 +1512,7 @@ Authenticated operator Console UI click sequences. Intent-style names only. Prel
 
 1. Running (or eligible) instance → **Backup** → pick Backup Disk → `backupApp`.
 2. Watch OperationProgress; cancel only if testing cancel path.
+3. Assert: the `backupApp` operation for that instance ended Done. The Backup Disk now holds an archive for it: BACKUP.yaml `lastBackup` is bumped above its previous value (> 0), and `backups/<InstanceID>/` holds a Borg repo. **Restore from Backup** depends on this.
 
 #### Back to disk
 
