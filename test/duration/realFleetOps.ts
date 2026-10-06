@@ -17,6 +17,7 @@ import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websoc
 import { $ } from 'zx'
 import type { Store } from '../../src/data/Store.js'
 import { runningInstanceExpectsLocalDocker } from './stability.js'
+import { registerOwnDoc, trackRepo } from './automergeTimeoutGuard.js'
 import type {
     FleetOps,
     SemanticStoreView,
@@ -508,6 +509,11 @@ export class RealFleetOps implements FleetOps {
             network: [adapter],
             peerId: `duration-${logicalId}-${Date.now()}` as PeerId,
         })
+        // r30 automergeTimeoutGuard: the store doc is OWN (a withTimeout on it is fatal);
+        // track peers/docs so relayed foreign-doc timeouts carry docId + peerId.
+        registerOwnDoc(docId, 'store', logicalId)
+        trackRepo(repo as unknown as Parameters<typeof trackRepo>[0], logicalId)
+        void this.registerOwnCommandLog(logicalId, host)
         const storeHandle = await repo.find<Store>(docId)
         await storeHandle.whenReady()
 
@@ -524,6 +530,25 @@ export class RealFleetOps implements FleetOps {
         const conn: Conn = { repo, storeHandle, host, logicalId, liveEngineId, storeDocId: docId }
         this.conns.set(logicalId, conn)
         return conn
+    }
+
+    /**
+     * Best-effort: learn this pool Engine's own CommandLog doc id from its read-only
+     * GET /api/command-log-url (Engine httpMonitor), so the timeout guard can class a
+     * relayed CommandLog as 'own' instead of 'foreign'. Never throws, never blocks connect.
+     */
+    private async registerOwnCommandLog(logicalId: string, host: string): Promise<void> {
+        const port = Number(process.env.DURATION_ENGINE_HTTP_PORT ?? 8080)
+        try {
+            const res = await fetch(`http://${host}:${port}/api/command-log-url`, { signal: AbortSignal.timeout(5_000) })
+            if (!res.ok) return
+            const body = await res.json() as { url?: unknown }
+            if (typeof body.url === 'string' && body.url.startsWith('automerge:')) {
+                registerOwnDoc(body.url, 'commandLog', logicalId)
+            }
+        } catch {
+            // unknown CommandLog id → its timeouts are classed 'foreign' (still tolerated)
+        }
     }
 
     private toSemanticView(logicalId: string, store: Store): SemanticStoreView {

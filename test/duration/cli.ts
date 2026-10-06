@@ -28,6 +28,7 @@ import {
 } from './scenario.js'
 import { createUiDriver } from './ui/index.js'
 import type { StructuredLogEntry } from './types.js'
+import { installProcessGuards, timeoutSummary } from './automergeTimeoutGuard.js'
 
 const usage = () => {
     console.log(`Usage: pnpm test:duration [options]
@@ -360,6 +361,7 @@ const main = async () => {
         await ops.close().catch(() => {})
     }
 
+    console.log(JSON.stringify(timeoutSummary()))
     console.log(JSON.stringify({
         event: 'duration_done',
         mode: walk ? 'walk' : 'markov',
@@ -377,30 +379,21 @@ const main = async () => {
 }
 
 /**
- * r30 (2026-10-06): with mDNS ON (Koen's production-replica rule) the harness's
- * automerge-repo client can hit an internal `withTimeout: timed out after 60000ms`
- * find rejection that nobody awaits. Node then killed the walker mid-step
- * (cover-all r30 died at step 9 open_video, not an Intent failure). The production
- * Engine logs and survives these (src/start.ts unhandledRejection); mirror that here
- * for this one error class only, logged as a structured event. Any other unhandled
- * rejection still aborts the walk (exit 2).
+ * r30 (2026-10-06): with mDNS ON the harness's automerge-repo clients receive docs
+ * relayed by the pool Engines (incl. production idea02's foreign docs) and can hit
+ * an internal `withTimeout: timed out after 60000ms` rejection that nobody awaits.
+ * Node then killed the walker mid-step (cover-all r30 died at step 9 open_video,
+ * not an Intent failure). See automergeTimeoutGuard.ts for the policy:
+ *   - only automerge-repo's withTimeout TimeoutError is considered for tolerance;
+ *   - on the walker's OWN store doc it is FATAL (exit 2): a real sync bug;
+ *   - foreign / own CommandLog / undeterminable doc → tolerated, logged as
+ *     `automerge_find_timeout_tolerated` with docId, peerId, class;
+ *   - any other unhandledRejection or uncaughtException → exit 2.
  */
-process.on('unhandledRejection', (reason: unknown) => {
-    const msg = reason instanceof Error ? reason.message : String(reason)
-    const name = reason instanceof Error ? reason.name : ''
-    if (name === 'TimeoutError' && msg.startsWith('withTimeout: timed out after')) {
-        console.log(JSON.stringify({
-            event: 'automerge_find_timeout_tolerated',
-            ts: new Date().toISOString(),
-            message: msg,
-        }))
-        return
-    }
-    console.error('[duration] unhandledRejection', reason)
-    process.exit(2)
-})
+installProcessGuards()
 
 main().catch(err => {
     console.error(err)
+    console.log(JSON.stringify(timeoutSummary()))
     process.exit(2)
 })
