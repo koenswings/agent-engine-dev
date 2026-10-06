@@ -71,6 +71,7 @@ type PlaywrightModule = {
         launch: (opts?: { headless?: boolean }) => Promise<{
             newContext: (opts?: { baseURL?: string }) => Promise<{
                 newPage: () => Promise<unknown>
+                addInitScript: (script: () => void) => Promise<void>
                 close: () => Promise<void>
             }>
             close: () => Promise<void>
