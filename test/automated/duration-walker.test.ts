@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { FakeFleetOps, dispatchAction, addFilesAppDiskId, ensureAppOnlyDiskOnConsoleEngine, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, redockEmpty001BeforeMakeFiles, resolveConsoleEngineHost, filesDiskTargetId, preflightFilesDiskTarget, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, resyncFixtureSidecarUrlsFromStore, locateInstanceEngine, verifyRestoreOperation, SIDECAR_SETTLE_ACTIONS, verifyBackupOperation, diagnoseBackupTrace, traceArgTokens, ensureBackupDiskForInstance, backupYamlLastBackup, predictCopyMovePair, preflightCopyMoveSamePi, resolveRebootTarget, verifyRebootEngine, REBOOT_CONFIRM_DEFAULT_MS, nextcloudLoginFormLooksReady, nextcloudInitialState, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
+import { FakeFleetOps, dispatchAction, addFilesAppDiskId, ensureAppOnlyDiskOnConsoleEngine, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, redockEmpty001BeforeMakeFiles, resolveConsoleEngineHost, filesDiskTargetId, preflightFilesDiskTarget, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, resyncFixtureSidecarUrlsFromStore, locateInstanceEngine, verifyRestoreOperation, SIDECAR_SETTLE_ACTIONS, verifyBackupOperation, verifyCopyOperation, diagnoseBackupTrace, traceArgTokens, ensureBackupDiskForInstance, backupYamlLastBackup, predictCopyMovePair, preflightCopyMoveSamePi, resolveRebootTarget, verifyRebootEngine, REBOOT_CONFIRM_DEFAULT_MS, nextcloudLoginFormLooksReady, nextcloudInitialState, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
 import { semanticStoresEqual, waitForConvergence } from '../duration/convergence.js'
 import { evaluateInvariants, DEFAULT_INFRA_INVARIANTS, listInvariantTypes } from '../duration/invariants.js'
 import {
@@ -3035,7 +3035,7 @@ describe('r30: move_app same-Pi preflight (Eng 8d98718 refuses cross-engine move
     const KOLIBRI = 'duration-kolibri-grade5a-001'
     const NC = 'duration-nextcloud-grade5a-001'
     const INST = 'kolibri-grade5a-001'
-    const ENV_KEYS = ['DURATION_COPY_TARGET_DISK', 'DURATION_COPY_SOURCE_DISK', 'DURATION_COPY_INSTANCE_ID', 'DURATION_KOLIBRI_URL', 'DURATION_NEXTCLOUD_URL'] as const
+    const ENV_KEYS = ['DURATION_COPY_TARGET_DISK', 'DURATION_COPY_SOURCE_DISK', 'DURATION_COPY_INSTANCE_ID', 'DURATION_KOLIBRI_URL', 'DURATION_NEXTCLOUD_URL', 'DURATION_COPY_START_MS', 'DURATION_COPY_DONE_MS'] as const
     const withEnv = async (vars: Partial<Record<(typeof ENV_KEYS)[number], string>>, fn: () => Promise<void>) => {
         const prev: Record<string, string | undefined> = {}
         for (const k of ENV_KEYS) {
@@ -3135,6 +3135,83 @@ describe('r30: move_app same-Pi preflight (Eng 8d98718 refuses cross-engine move
             expect(r.ok, r.message).toBe(true)
             expect(seen).toEqual(['copy_app'])
             expect(r.message).toMatch(/copy_app preflight: cross-engine copy kolibri-grade5a-001 on idea03 \(disk duration-kolibri-grade5a-001\) -> duration-nextcloud-grade5a-001 on idea01 \(Eng 8d98718 copyApp Phase 2 supports it\)/)
+        })
+    })
+
+    // copy_app soft-pass closed: the copyApp Operation must end Done after "Intent ok".
+    const R36_COPY_ERR =
+        'rsync exited with code 23: rsync: [sender] send_files failed to open "/home/pi/idea/duration-disks/idea-test-1/instances/kolibri-grade5a-001/data/kolibri/sessions/kolibrie9es3vhc6wc7smklwgjx6n09byrgt61m": Permission denied (13)'
+    const copyFleet = async (opts: { ops?: (t: number) => any[]; traces?: (t: number) => any[] } = {}) => {
+        const ops = await fleet('idea01')
+        const state = { clickedAt: 0, listed: [] as string[] }
+        Object.assign(ops, {
+            listOperations: async (e: string) => {
+                state.listed.push(e)
+                if (!state.clickedAt || e !== 'idea01' || !opts.ops) return []
+                return opts.ops(state.clickedAt)
+            },
+            listCommandTraces: async (e: string) => (state.clickedAt && e === 'idea01' && opts.traces ? opts.traces(state.clickedAt) : []),
+        })
+        const driver = new StubUiDriver()
+        Object.assign(driver, {
+            runIntent: async (req: any) => {
+                state.clickedAt = Date.now()
+                return { ok: true, mode: 'live', message: `runDurationIntent ok: ${req.action}` }
+            },
+        })
+        return { ops, driver, state }
+    }
+    const copyOp = (t: number, status: string, extra: Record<string, unknown> = {}) => ({
+        id: 'c1', kind: 'copyApp', status, startedAt: t + 50,
+        args: { instanceId: INST, sourceDiskId: KOLIBRI, targetDiskId: NC }, ...extra,
+    })
+    const FASTCOPY = { DURATION_COPY_START_MS: '60', DURATION_COPY_DONE_MS: '60' }
+
+    it('copy_app (live, r36@43): copyApp Failed after "Intent ok" → LOUD FAIL quoting the Engine error verbatim', async () => {
+        await withEnv(FASTCOPY, async () => {
+            const { ops, driver, state } = await copyFleet({ ops: t => [copyOp(t, 'Failed', { error: R36_COPY_ERR })] })
+            const r = await dispatchAction({ ...ctxFor(ops, 'copy_app', driver), from: 'op_instance' } as any)
+            expect(r.ok).toBe(false)
+            expect(r.message).toBe(
+                `copy_app: copy op did not end Done: c1@idea01=Failed inst=kolibri-grade5a-001 → duration-nextcloud-grade5a-001 (error: ${R36_COPY_ERR}). No soft-pass. (Console Intent reported ok)`,
+            )
+            expect(state.listed).not.toContain('idea02')
+        })
+    })
+
+    it('copy_app (live): copyApp Done → ok, message names the Operation', async () => {
+        await withEnv(FASTCOPY, async () => {
+            const { ops, driver } = await copyFleet({ ops: t => [copyOp(t, 'Done')] })
+            const r = await dispatchAction({ ...ctxFor(ops, 'copy_app', driver), from: 'op_instance' } as any)
+            expect(r.ok, r.message).toBe(true)
+            expect(r.message).toMatch(/copy op c1 Done on idea01 \(kolibri-grade5a-001 → duration-nextcloud-grade5a-001\)$/)
+        })
+    })
+
+    it('copy_app (live): no copyApp Operation (an older one ignored) → "never started"; a refused copyApp trace is quoted', async () => {
+        await withEnv(FASTCOPY, async () => {
+            const { ops, driver } = await copyFleet({ ops: t => [{ ...copyOp(t, 'Done'), id: 'old', startedAt: t - 600_000 }] })
+            const r = await dispatchAction({ ...ctxFor(ops, 'copy_app', driver), from: 'op_instance' } as any)
+            expect(r.ok).toBe(false)
+            expect(r.message).toMatch(/^copy_app: copy op never started: no copyApp Operation on any pool engine \(idea01, idea03, idea04\) within \d+ms \(budget 60ms\) after the copy Confirm\. No soft-pass\. \(Console Intent reported ok\)$/)
+
+            const refused = await copyFleet({
+                ops: () => [],
+                traces: t => [{ traceId: 'tr9', command: 'copyApp', args: '{"instanceName":"kolibri"}', status: 'error', startedAt: t + 20, completedAt: t + 25, errorMessage: "copyApp: instance name 'kolibri' is ambiguous" }],
+            })
+            const r2 = await dispatchAction({ ...ctxFor(refused.ops, 'copy_app', refused.driver), from: 'op_instance' } as any)
+            expect(r2.ok).toBe(false)
+            expect(r2.message).toMatch(/^copy_app: copy op never started: Engine idea01 refused "copyApp" \(trace tr9 status=error: copyApp: instance name 'kolibri' is ambiguous; args \{"instanceName":"kolibri"\}\)/)
+        })
+    })
+
+    it('copy_app (live): copyApp still Running at the bounded budget → "did not end Done"; Fake ops without operationDB skip the check', async () => {
+        await withEnv(FASTCOPY, async () => {
+            const { ops, driver } = await copyFleet({ ops: t => [copyOp(t, 'Running')] })
+            const r = await dispatchAction({ ...ctxFor(ops, 'copy_app', driver), from: 'op_instance' } as any)
+            expect(r.ok).toBe(false)
+            expect(r.message).toMatch(/copy op did not end Done: c1@idea01=Running inst=kolibri-grade5a-001 → duration-nextcloud-grade5a-001 after \d+ms \(budget 120ms\)/)
+            expect(await verifyCopyOperation(ctxFor(fakeOps({ poolEngines: POOL }), 'copy_app') as any, Date.now(), { instanceId: INST })).toBeNull()
         })
     })
 

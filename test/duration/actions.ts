@@ -1561,6 +1561,128 @@ export const ensureBackupDiskForInstance = async (
     }
 }
 
+// ── copy_app must really copy (no soft-pass on "Intent ok") ─────────────────────────
+
+export type CopyCheckReason = 'ok' | 'refused' | 'never_started' | 'not_done'
+
+/**
+ * After the copy_app Intent reports ok (Console Confirm + settle), the Engine must have run
+ * a copyApp Operation since the Intent started and it must end Done. Bounded waits:
+ * DURATION_COPY_START_MS (fast 5 s / 30 s) for it to appear, DURATION_COPY_DONE_MS (fast
+ * 120 s / 600 s) for it to end. Failed/Cancelled, a timeout, or no Operation (a refused
+ * copyApp CommandLog trace is quoted) → not ok, Engine error verbatim. r36@43: copyApp
+ * Failed "rsync exited with code 23 … Permission denied (13)" while the step passed.
+ * Prefers rows for the expected instance; otherwise judges every copyApp row since the
+ * click (the Console Intent may drag another instance than the walker's guess).
+ * Returns null without a live operationDB reader (Fake ops).
+ */
+export const verifyCopyOperation = async (
+    ctx: ActionContext,
+    sinceMs: number,
+    expect: { instanceId?: string },
+    opts: { startBudgetMs?: number; doneBudgetMs?: number; pollMs?: number; slackMs?: number; traceSlackMs?: number } = {},
+    env: NodeJS.ProcessEnv = process.env,
+): Promise<{ ok: boolean; reason: CopyCheckReason; note: string } | null> => {
+    const ops = ctx.opts.ops as BackupOps
+    if (typeof ops.listOperations !== 'function') return null
+    const envMs = (k: string): number | undefined => {
+        const raw = env[k]?.trim()
+        return raw && /^\d+$/.test(raw) ? Number(raw) : undefined
+    }
+    const startBudget = opts.startBudgetMs ?? envMs('DURATION_COPY_START_MS') ?? (ctx.opts.fast ? 5_000 : 30_000)
+    const doneBudget = opts.doneBudgetMs ?? envMs('DURATION_COPY_DONE_MS') ?? (ctx.opts.fast ? 120_000 : 600_000)
+    const pollMs = opts.pollMs ?? 1_000
+    const slackMs = opts.slackMs ?? 5_000
+    const traceSlackMs = opts.traceSlackMs ?? 5_000
+    const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e))
+    const terminal = (st: string) => st === 'Done' || st === 'Failed' || st === 'Cancelled'
+    const t0 = Date.now()
+    let rows: (DurationOperationRow & { engine: string })[] = []
+    let readErrors: string[] = []
+    let refusal: (DurationCommandTrace & { engine: string }) | undefined
+    const scan = async () => {
+        rows = []
+        readErrors = []
+        for (const eng of pool) {
+            try {
+                for (const r of await ops.listOperations!(eng)) {
+                    if (r.kind !== 'copyApp') continue
+                    if (typeof r.startedAt !== 'number' || r.startedAt < sinceMs - slackMs) continue
+                    if (!rows.some(x => x.id === r.id)) rows.push({ ...r, engine: eng })
+                }
+            } catch (e) {
+                readErrors.push(`${eng}: ${e instanceof Error ? e.message : String(e)}`)
+            }
+        }
+        if (!rows.length && typeof ops.listCommandTraces === 'function') {
+            for (const eng of pool) {
+                try {
+                    const t = (await ops.listCommandTraces(eng)).find(
+                        x => x.command === 'copyApp' && x.status === 'error' && typeof x.startedAt === 'number' && x.startedAt >= sinceMs - traceSlackMs,
+                    )
+                    if (t) refusal = { ...t, engine: eng }
+                } catch {
+                    // CommandLog unreadable: the Operation check still decides
+                }
+            }
+        }
+    }
+    const judged = () => {
+        const mine = expect.instanceId ? rows.filter(r => r.args?.instanceId === expect.instanceId) : []
+        return mine.length ? mine : rows
+    }
+    for (;;) {
+        await scan()
+        const elapsed = Date.now() - t0
+        const rs = judged()
+        if (rs.some(r => r.status === 'Done')) break
+        if (rs.length && rs.every(r => terminal(r.status))) break
+        if (!rs.length && refusal) break
+        if (!rs.length && elapsed >= startBudget) break
+        if (elapsed >= startBudget + doneBudget) break
+        await sleep(pollMs)
+    }
+    const desc = (rs: typeof rows) =>
+        rs.map(r => `${r.id}@${r.engine}=${r.status}${r.args?.instanceId ? ` inst=${r.args.instanceId}` : ''}` +
+            `${r.args?.targetDiskId ? ` → ${r.args.targetDiskId}` : ''}${r.error ? ` (error: ${r.error})` : ''}`).join(', ')
+    const errNote = readErrors.length ? ` (store read errors: ${readErrors.join('; ')})` : ''
+    const rs = judged()
+    if (!rs.length) {
+        if (refusal) {
+            return {
+                ok: false,
+                reason: 'refused',
+                note:
+                    `copy op never started: Engine ${refusal.engine} refused "copyApp" (trace ${refusal.traceId} ` +
+                    `status=error: ${refusal.errorMessage ?? 'no message'}; args ${refusal.args}), no copyApp Operation${errNote}. No soft-pass.`,
+            }
+        }
+        return {
+            ok: false,
+            reason: 'never_started',
+            note:
+                `copy op never started: no copyApp Operation on any pool engine (${pool.join(', ')}) within ` +
+                `${Date.now() - t0}ms (budget ${startBudget}ms) after the copy Confirm${errNote}. No soft-pass.`,
+        }
+    }
+    const done = rs.find(r => r.status === 'Done')
+    if (!done) {
+        const still = rs.some(r => !terminal(r.status))
+        return {
+            ok: false,
+            reason: 'not_done',
+            note:
+                `copy op did not end Done: ${desc(rs)}${still ? ` after ${Date.now() - t0}ms (budget ${startBudget + doneBudget}ms)` : ''}` +
+                `${errNote}. No soft-pass.`,
+        }
+    }
+    return {
+        ok: true,
+        reason: 'ok',
+        note: `copy op ${done.id} Done on ${done.engine}${done.args?.instanceId ? ` (${done.args.instanceId} → ${done.args.targetDiskId ?? '?'})` : ''}`,
+    }
+}
+
 // ── r30: move_app must stay on one Pi (Eng 8d98718 refuses cross-engine moveApp) ──
 
 /** Console 0760c01 e2e/intents/copyMoveApp.ts pickTargetDiskId preference order. */
@@ -2611,6 +2733,16 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
                 layer,
                 ...(backupDockedEngine ? { dockedEngine: backupDockedEngine } : {}),
             }
+        }
+        if (check) message = `${message}; ${check.note}`
+    }
+    // copy_app: "Intent ok" is not enough — the copyApp Operation must end Done (live only).
+    if (ctx.action === 'copy_app' && result.ok) {
+        const check = await verifyCopyOperation(ctx, intentStartedAt, {
+            instanceId: process.env.DURATION_COPY_INSTANCE_ID?.trim() || instanceId || ctx.fixtureInstance,
+        })
+        if (check && !check.ok) {
+            return { ok: false, message: `copy_app: ${check.note} (Console Intent reported ok)`, layer }
         }
         if (check) message = `${message}; ${check.note}`
     }
