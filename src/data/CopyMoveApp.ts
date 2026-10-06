@@ -213,6 +213,11 @@ export const copyApp = async (
     const newInstanceId = uuid() as InstanceID
     let wasRunning = false
     let sourceRestarted = false
+    // idea#168 r36: the folder this copy creates on the target disk. A failed copy
+    // removes it, else the next dock of that disk registers the partial folder as a
+    // new instance (r36: the @43 copy failed in rsync and its folder vuf3im3mbayl9z6uou3,
+    // named like the original, registered on Nextcloud Grade 5A).
+    let createdInstanceDest: string | null = null
 
     // Restart the source if we stopped it. Called once: before the copy starts
     // on success (idea#168 r35), else from finally.
@@ -295,6 +300,7 @@ export const copyApp = async (
         // 5. rsync instance data into a NEW instance directory (new ID)
         setCopyStep(3)
         const instanceDest = `${targetMountRoot}/instances/${newInstanceId}`
+        createdInstanceDest = instanceDest
         if (!isCrossEngine) await fs.ensureDir(instanceDest)
         else await $`ssh -o StrictHostKeyChecking=no pi@${remoteAddress} mkdir -p ${instanceDest}`
         log(`copyApp: syncing instance data ${instanceSrc} → ${isCrossEngine ? remoteAddress + ':' : ''}${instanceDest}`)
@@ -418,6 +424,17 @@ export const copyApp = async (
             })
         }
         console.error(chalk.red(`copyApp: failed — ${e.message ?? e}`))
+        // Remove the partial copy unless it was already registered (fresh id, so the
+        // folder holds only what this op wrote).
+        if (createdInstanceDest && !storeHandle.doc()?.instanceDB?.[newInstanceId]) {
+            try {
+                if (isCrossEngine) await $`ssh -o StrictHostKeyChecking=no pi@${remoteAddress} rm -rf -- ${createdInstanceDest}`
+                else await fs.remove(createdInstanceDest)
+                log(`copyApp: removed the partial copy ${isCrossEngine ? remoteAddress + ':' : ''}${createdInstanceDest}`)
+            } catch (cleanupErr: any) {
+                console.error(chalk.red(`copyApp: could not remove the partial copy ${createdInstanceDest}: ${cleanupErr?.message ?? cleanupErr}`))
+            }
+        }
     } finally {
         resourceLock.releaseAll(lockKeys)
         // Always restart the source if we stopped it and the success path did not

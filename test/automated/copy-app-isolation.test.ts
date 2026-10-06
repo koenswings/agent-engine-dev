@@ -9,6 +9,9 @@
  *   3. copyApp restarts the original BEFORE the copy starts (call order).
  *   4. The copy gets a unique name (<name>-2, -3, …) in compose.yaml and the store.
  *   5. copyApp resolves the instance id-first; an ambiguous name is refused.
+ *   6. A failed copy removes its partial folder on the target disk (local and
+ *      over ssh) and leaves no registered instance (idea#168 r36: a partial
+ *      folder registered as a second "kolibri" on the next dock).
  *
  * Real files in pretend disks under IDEA_DISKS_ROOT (idea-test-6x). rsync is
  * replaced by fs.copy (links copied as links, like rsync -a); start/stop and
@@ -22,10 +25,20 @@ import path from 'path'
 
 const order = vi.hoisted(() => [] as string[])
 const remoteOverlays = vi.hoisted(() => [] as { src: string, dest: string, files: Record<string, string> }[])
+// r36: make the instance rsync fail after writing part of the copy
+const failure = vi.hoisted(() => ({ rsync: null as string | null, process: null as string | null }))
+const sshCalls = vi.hoisted(() => [] as string[])
 
 vi.mock('../../src/utils/rsync.js', () => ({
     rsyncDirectory: vi.fn(async (src: string, dest: string, onProgress?: (p: { progressPercent: number }) => void, _opId?: string, remoteHost?: string) => {
         const { fs } = await import('zx')
+        if (failure.rsync && src.includes('/instances/')) {
+            if (!remoteHost) {
+                await fs.ensureDir(`${dest}/data/kolibri`)
+                await fs.writeFile(`${dest}/data/kolibri/db.sqlite3`, 'partial')
+            }
+            throw new Error(failure.rsync)
+        }
         if (remoteHost) {
             // Cross-engine: record what would be sent (the overlay of rewritten files)
             const files: Record<string, string> = {}
@@ -66,6 +79,7 @@ vi.mock('../../src/data/Disk.js', async (importOriginal) => {
             const { createOrUpdateInstance } = await import('../../src/data/Instance.js')
             const inst = await createOrUpdateInstance(handle, instanceId, disk)
             order.push(`process:${instanceId}`)
+            if (failure.process) throw new Error(failure.process)
             return inst
         }),
     }
@@ -76,7 +90,13 @@ vi.mock('zx', async (importOriginal) => {
     const actual = await importOriginal<any>()
     const mocked = vi.fn((strings: any, ...vals: any[]) => {
         const flat = [...(Array.isArray(strings) ? strings : [String(strings ?? '')]), ...vals.flat().map(String)].join(' ')
-        if (/(^|\s)ssh\s/.test(flat.trim() + ' ')) return Promise.resolve({ stdout: '', stderr: '' })
+        if (/(^|\s)ssh\s/.test(flat.trim() + ' ')) {
+            const cmd = Array.isArray(strings)
+                ? strings.reduce((acc: string, str: string, i: number) => acc + str + (i < vals.length ? [vals[i]].flat().map(String).join(' ') : ''), '')
+                : flat
+            sshCalls.push(cmd.replace(/\s+/g, ' ').trim())
+            return Promise.resolve({ stdout: '', stderr: '' })
+        }
         return actual.$(strings, ...vals)
     }) as any
     mocked.sync = actual.$.sync
@@ -94,6 +114,7 @@ import { installAppFromDisk } from '../../src/data/InstallApp.js'
 import { findExternalLinks, uniqueCopyName, clearEnginePort, setComposeInstanceName } from '../../src/data/InstanceCopy.js'
 import { choosePortForStart } from '../../src/data/Instance.js'
 import { randomPort } from '../../src/utils/utils.js'
+import { rsyncDirectory } from '../../src/utils/rsync.js'
 import { AppID, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/data/CommonTypes.js'
 
 const SRC = 'DISK_src-r35' as DiskID
@@ -176,6 +197,9 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
     beforeEach(async () => {
         order.length = 0
         remoteOverlays.length = 0
+        sshCalls.length = 0
+        failure.rsync = null
+        failure.process = null
         setRootDeviceForTests('mmcblk-not-a-test-disk')
         outside = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-outside-'))
         await fs.remove(srcRoot()); await fs.remove(tgtRoot())
@@ -335,5 +359,64 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
         } finally {
             delete network.connections['10.0.0.35:4321' as any]
         }
+    })
+    // ── 6. failed copy: partial folder removed (idea#168 r36) ────────────────
+
+    const rsyncDirectoryMock = vi.mocked(rsyncDirectory)
+    const R36_RSYNC = 'rsync exited with code 23: rsync: [sender] send_files failed to open "/disks/idea-test-61/instances/kolibri-grade5a-001/data/kolibri/sessions/kolibrie9es3": Permission denied (13)'
+
+    it('a failed local copy removes its partial folder, registers no instance, ends Failed and restarts the source', async () => {
+        h = await makeHandle('Running')
+        failure.rsync = R36_RSYNC
+        await copyApp(h, ORIG as any, SRC, TGT)
+        expect(await copyDirs()).toEqual([])                               // no partial folder left
+        expect(Object.keys(h.doc().instanceDB)).toEqual([ORIG])            // nothing registered
+        const op = Object.values(h.doc().operationDB)[0] as any
+        expect(op.status).toBe('Failed')
+        expect(op.error).toBe(R36_RSYNC)
+        expect(order).toEqual([`stop:${ORIG}`, `start:${ORIG}`])           // source back up, copy never processed
+        expect(rsyncDirectoryMock.mock.calls.some(c => String(c[1]).includes('/instances/'))).toBe(true) // it failed IN the instance rsync
+        // a later dock of the target disk finds nothing to register
+        expect(await fs.pathExists(`${tgtRoot()}/instances`)).toBe(true)
+        expect((await fs.readdir(`${tgtRoot()}/instances`)).length).toBe(0)
+    })
+
+    it('a failed cross-engine copy removes the partial folder on the remote with ssh rm -rf of exactly that folder', async () => {
+        h = await makeHandle('Stopped')
+        const REMOTE = 'ENGINE_remote-r36' as EngineID
+        h.change(doc => {
+            doc.diskDB[TGT].dockedTo = REMOTE
+            ;(doc.engineDB as any)[REMOTE] = { id: REMOTE, commands: [] }
+        })
+        network.connections['10.0.0.36:4321' as any] = { adapter: {} as any, missedDiscoveryCount: 0, hostname: 'idea36' as any, engineId: REMOTE }
+        try {
+            failure.rsync = R36_RSYNC
+            await copyApp(h, ORIG as any, SRC, TGT)
+            const mkdir = sshCalls.find(c => /pi@10\.0\.0\.36 mkdir -p \S+\/instances\/[\w-]+$/.test(c))!
+            expect(mkdir, JSON.stringify(sshCalls)).toBeTruthy()
+            const dest = mkdir.split(' mkdir -p ')[1]
+            expect(sshCalls.filter(c => / rm -rf /.test(c))).toEqual([`ssh -o StrictHostKeyChecking=no pi@10.0.0.36 rm -rf -- ${dest}`])
+            expect(Object.keys(h.doc().instanceDB)).toEqual([ORIG])
+            expect(h.doc().engineDB[REMOTE].commands).toEqual([])          // no remote startInstance
+            expect((Object.values(h.doc().operationDB)[0] as any).status).toBe('Failed')
+        } finally {
+            delete network.connections['10.0.0.36:4321' as any]
+        }
+    })
+
+    it('a copy that fails AFTER registering keeps its folder (registered instance, not a partial copy); a refusal before the rsync touches nothing', async () => {
+        h = await makeHandle('Stopped')
+        failure.process = 'docker compose up failed'
+        await copyApp(h, ORIG as any, SRC, TGT)
+        const [newId] = await copyDirs()
+        expect(newId).toBeTruthy()
+        expect(h.doc().instanceDB[newId as InstanceID]).toBeTruthy()
+        expect((Object.values(h.doc().operationDB)[0] as any).error).toBe('docker compose up failed')
+
+        // a refusal (unknown target) fails before the folder exists: nothing created, nothing removed
+        failure.process = null
+        await fs.remove(`${tgtRoot()}/instances`)
+        await expect(copyApp(h, ORIG as any, SRC, 'DISK_nope' as DiskID)).rejects.toThrow()
+        expect(await copyDirs()).toEqual([])
     })
 })
