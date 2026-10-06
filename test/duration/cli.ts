@@ -26,7 +26,9 @@ import {
     resolveScenarioName,
     SCENARIO_ALIASES,
 } from './scenario.js'
-import { createUiDriver } from './ui/index.js'
+import { createUiDriver, resolveConsoleIntentsDir } from './ui/index.js'
+import { EXIT_CONSOLE_PIN_MISMATCH, runConsoleDeployPreflight } from './consoleDeploy.js'
+import { $ } from 'zx'
 import type { StructuredLogEntry } from './types.js'
 import { EXIT_ENGINE_UNREACHABLE, installProcessGuards, timeoutSummary, walkExitCode } from './automergeTimeoutGuard.js'
 import { DEFAULT_PREFLIGHT_TIMEOUT_MS } from './realFleetOps.js'
@@ -61,6 +63,10 @@ const usage = () => {
   --no-preflight        --live: skip the pre-walk check that every pool Engine serves the
                         store over WS (default on; budget DURATION_PREFLIGHT_MS, 60000).
                         A failed preflight exits 4 ("engine <id> unreachable for Ns …").
+                        With --ui it also gates the Console: the build the pool serves at
+                        --console-url must be DURATION_EXPECTED_CONSOLE_SHA (default: the
+                        box Intents checkout HEAD) and the Intents checkout that same commit;
+                        a mismatch exits 5 (console_deploy_preflight).
   --dwell-ms <n>        Dwell between transitions (default: 30000 / --fast 80)
   --help                this message
 
@@ -344,6 +350,46 @@ const main = async () => {
             await uiDriver.close?.().catch(() => {})
             await ops.close().catch(() => {})
             process.exit(EXIT_ENGINE_UNREACHABLE)
+        }
+    }
+
+    // r36@98: the browser drives the Console the POOL serves (--console-url), not the box
+    // checkout that supplies the Intents. Its commit must equal the pin
+    // (DURATION_EXPECTED_CONSOLE_SHA, else the box Intents checkout HEAD) and the box Intents
+    // checkout must be that same commit — else fail loud before step 1. Read-only.
+    if (ops instanceof RealFleetOps && args.ui && !args.noPreflight) {
+        const consoleUrl = args.consoleUrl ?? process.env.DURATION_CONSOLE_URL ?? 'http://idea01:8080'
+        const fleet = ops
+        const intentsDir = resolveConsoleIntentsDir()
+        const cd = await runConsoleDeployPreflight(consoleUrl, fleet.getHostMap(), {
+            fetchText: async url => {
+                const res = await fetch(url, { signal: AbortSignal.timeout(10_000) })
+                return { status: res.status, contentType: res.headers.get('content-type') ?? '', body: await res.text() }
+            },
+            probeDist: host => fleet.probeConsoleDist(host),
+            boxHead: async () => {
+                if (!intentsDir) return null
+                const r = await $`git -C ${intentsDir} rev-parse HEAD`.quiet()
+                return r.stdout.trim() || null
+            },
+        })
+        console.log(JSON.stringify({
+            event: 'console_deploy_preflight',
+            ok: cd.ok,
+            method: cd.method,
+            console_url: consoleUrl,
+            served_sha: cd.servedSha,
+            pin: cd.pin,
+            box_intents_head: cd.boxHead,
+            intents_dir: intentsDir,
+            note: cd.note,
+        }))
+        if (!cd.ok) {
+            console.error(`[duration] FATAL (console preflight): ${cd.note}`)
+            console.log(JSON.stringify(timeoutSummary()))
+            await uiDriver.close?.().catch(() => {})
+            await ops.close().catch(() => {})
+            process.exit(EXIT_CONSOLE_PIN_MISMATCH)
         }
     }
 

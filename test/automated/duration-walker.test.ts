@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { FakeFleetOps, dispatchAction, addFilesAppDiskId, ensureAppOnlyDiskOnConsoleEngine, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, redockEmpty001BeforeMakeFiles, resolveConsoleEngineHost, filesDiskTargetId, preflightFilesDiskTarget, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, resyncFixtureSidecarUrlsFromStore, locateInstanceEngine, verifyRestoreOperation, SIDECAR_SETTLE_ACTIONS, verifyBackupOperation, ensureBackupDiskForInstance, backupYamlLastBackup, predictCopyMovePair, preflightCopyMoveSamePi, resolveRebootTarget, verifyRebootEngine, REBOOT_CONFIRM_DEFAULT_MS, nextcloudLoginFormLooksReady, nextcloudInitialState, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
+import { FakeFleetOps, dispatchAction, addFilesAppDiskId, ensureAppOnlyDiskOnConsoleEngine, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, redockEmpty001BeforeMakeFiles, resolveConsoleEngineHost, filesDiskTargetId, preflightFilesDiskTarget, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, resyncFixtureSidecarUrlsFromStore, locateInstanceEngine, verifyRestoreOperation, SIDECAR_SETTLE_ACTIONS, verifyBackupOperation, diagnoseBackupTrace, traceArgTokens, ensureBackupDiskForInstance, backupYamlLastBackup, predictCopyMovePair, preflightCopyMoveSamePi, resolveRebootTarget, verifyRebootEngine, REBOOT_CONFIRM_DEFAULT_MS, nextcloudLoginFormLooksReady, nextcloudInitialState, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
 import { semanticStoresEqual, waitForConvergence } from '../duration/convergence.js'
 import { evaluateInvariants, DEFAULT_INFRA_INVARIANTS, listInvariantTypes } from '../duration/invariants.js'
 import {
@@ -2647,6 +2647,8 @@ describe('r30: real backup_instance before restore_from_backup (op Done + archiv
         kolibriOn?: string
         links?: string[]
         ops?: (since: number) => any[]
+        /** r36@98: Engine CommandLog traces on idea01 after the click; null = no reader. */
+        traces?: ((since: number) => any[]) | null
         before?: Probe
         after?: Probe
     } = {}) => {
@@ -2660,7 +2662,7 @@ describe('r30: real backup_instance before restore_from_backup (op Done + archiv
             d.diskTypes = ['backup']
             d.backupLinks = opts.links ?? [INST]
         })
-        const state = { clicked: false, clickedAt: 0, intentEngine: undefined as string | undefined, listed: [] as string[], probed: [] as string[] }
+        const state = { clicked: false, clickedAt: 0, intentEngine: undefined as string | undefined, listed: [] as string[], probed: [] as string[], traced: [] as string[] }
         const before: Probe = opts.before ?? { dest: '/home/pi/idea/duration-disks/idea-test-4', backupYaml: yaml(0), repoEntries: null }
         const after: Probe = opts.after ?? {
             dest: '/home/pi/idea/duration-disks/idea-test-4',
@@ -2680,6 +2682,15 @@ describe('r30: real backup_instance before restore_from_backup (op Done + archiv
                 state.probed.push(`${e}:${diskId}:${inst}`)
                 return state.clicked ? after : before
             },
+            ...(opts.traces === null
+                ? {}
+                : {
+                      listCommandTraces: async (e: string) => {
+                          state.traced.push(e)
+                          if (!state.clicked || e !== 'idea01' || !opts.traces) return []
+                          return opts.traces(state.clickedAt)
+                      },
+                  }),
         })
         const driver = new StubUiDriver()
         Object.assign(driver, {
@@ -2754,15 +2765,82 @@ describe('r30: real backup_instance before restore_from_backup (op Done + archiv
         })
     })
 
-    it('backup_instance (live): no backupApp op (Eng 8d98718 "Too many arguments") → LOUD "backup op never started", even when the Intent reported ok', async () => {
+    // r36@98 exact trace: Console 230b70f (served by the pool) sent display names.
+    const R36_TRACE = (t: number) => ({
+        traceId: '7b80d0c9-3072-4a85-912c-e7e294719dd7',
+        command: 'backupApp',
+        args: JSON.stringify(['kolibri', 'Duration', 'Tests', '—', 'Empty', 'Disk', '002']),
+        status: 'error',
+        startedAt: t + 940,
+        completedAt: t + 953,
+        errorMessage: 'Error: Too many arguments',
+    })
+
+    it('backup_instance (live, r36@98): Engine refused backupApp (error trace, names with spaces) → LOUD "refused" naming the served Console, at once, no stale 8d98718 hint', async () => {
+        await withEnv({ DURATION_BACKUP_START_MS: '20000', DURATION_BACKUP_DONE_MS: '60' }, async () => {
+            const { ops, driver, state } = await fleet({ ops: () => [], traces: t => [R36_TRACE(t)] })
+            const t0 = Date.now()
+            const r = await dispatchAction(ctxFor(ops, driver, 'idea01') as any)
+            expect(Date.now() - t0).toBeLessThan(10_000) // did not wait out the 20 s start budget
+            expect(r.ok).toBe(false)
+            expect(r.message).toMatch(/^backup_instance: backup op never started: Engine idea01 refused "backupApp" before execution \+\d+ms after the Intent started/)
+            expect(r.message).toMatch(/trace 7b80d0c9-3072-4a85-912c-e7e294719dd7 status=error: Error: Too many arguments/)
+            expect(r.message).toMatch(/the Console sent 7 space-separated tokens/)
+            expect(r.message).toMatch(/display names with spaces were sent instead of ids/)
+            expect(r.message).toMatch(/predates the r30 id contract \(Console c981361\+ sends "backupApp kolibri-grade5a-001 <backupDiskId>"\)/)
+            expect(r.message).toMatch(/console_deploy_preflight/)
+            expect(r.message).not.toMatch(/8d98718/)
+            expect(r.message).toMatch(/\(Console Intent reported ok\)$/)
+            expect(state.traced).not.toContain('idea02')
+        })
+    })
+
+    it('backup_instance (live): no Operation and no backupApp trace anywhere → "never started", Console never delivered the command', async () => {
         await withEnv(FAST, async () => {
-            const { ops, driver } = await fleet({ ops: () => [] })
+            const { ops, driver } = await fleet({ ops: () => [], traces: () => [] })
             const r = await dispatchAction(ctxFor(ops, driver, 'idea01') as any)
             expect(r.ok).toBe(false)
-            expect(r.message).toMatch(/^backup_instance: backup op never started: no backupApp Operation since the Back up click/)
-            expect(r.message).toMatch(/Too many arguments/)
+            expect(r.message).toMatch(/^backup_instance: backup op never started: no backupApp Operation since the Back up click on any pool engine within \d+ms \(budget 60ms\)/)
+            expect(r.message).toMatch(/no backupApp command trace on any pool engine \(idea01, idea03, idea04\): the Console never delivered the command/)
+            expect(r.message).not.toMatch(/8d98718|Too many arguments/)
             expect(r.message).toMatch(/\(Console Intent reported ok\)$/)
         })
+    })
+
+    it('backup_instance (live): no Operation, CommandLog not readable → says it cannot tell refusal from non-delivery', async () => {
+        await withEnv(FAST, async () => {
+            const { ops, driver } = await fleet({ ops: () => [], traces: null })
+            const r = await dispatchAction(ctxFor(ops, driver, 'idea01') as any)
+            expect(r.ok).toBe(false)
+            expect(r.message).toMatch(/backup op never started: .*Engine CommandLog not readable by this harness — cannot tell a refusal from a command that never arrived/)
+        })
+    })
+
+    it('verifyBackupOperation: a refusal trace from before the Intent (earlier walk) is ignored; an accepted trace without Operation is reported as such', async () => {
+        await withEnv({}, async () => {
+            const since = Date.now()
+            const old = { ...R36_TRACE(since), traceId: 'old', startedAt: since - 600_000 }
+            const accepted = { ...R36_TRACE(since), traceId: 'acc', status: 'ok', args: '{"instanceName":"kolibri-grade5a-001","backupDiskId":"duration-empty-002"}', errorMessage: null }
+            const { ops, state } = await fleet({ ops: () => [], traces: () => [old, accepted] })
+            state.clicked = true
+            state.clickedAt = since
+            const r = await verifyBackupOperation(ctxFor(ops, null, 'idea01') as any, since, { instanceId: INST }, { startBudgetMs: 30, doneBudgetMs: 30, pollMs: 5 })
+            expect(r?.reason).toBe('never_started')
+            expect(r?.note).toMatch(/backupApp trace\(s\) acc@idea01=ok without an Operation/)
+            expect(r?.note).not.toMatch(/old@/)
+        })
+    })
+
+    it('diagnoseBackupTrace / traceArgTokens: ambiguous name, not docked, generic; non-error → empty', () => {
+        const base = { traceId: 't', command: 'backupApp', startedAt: 1, completedAt: 2 }
+        expect(traceArgTokens('{"instanceName":"kolibri","backupDiskId":"duration-empty-002"}')).toEqual(['kolibri', 'duration-empty-002'])
+        expect(traceArgTokens('["a","b c"]')).toEqual(['a', 'b c'])
+        expect(diagnoseBackupTrace({ ...base, args: '["kolibri","duration-empty-002"]', status: 'error', errorMessage: "backupApp: instance name 'kolibri' is ambiguous: a, b. Use the instance id." }, { instanceId: INST }))
+            .toMatch(/non-unique name/)
+        expect(diagnoseBackupTrace({ ...base, args: '["kolibri-grade5a-001","duration-empty-002"]', status: 'error', errorMessage: "Disk 'x' (duration-empty-002) is not docked to this engine." }, { instanceId: INST }))
+            .toMatch(/could not resolve/)
+        expect(diagnoseBackupTrace({ ...base, args: '["a","b"]', status: 'error', errorMessage: 'locked' }, { instanceId: INST })).toMatch(/^Engine refused/)
+        expect(diagnoseBackupTrace({ ...base, args: '["a","b"]', status: 'ok', errorMessage: null }, { instanceId: INST })).toBe('')
     })
 
     it('backup_instance (live): op Failed → LOUD "backup op did not end Done" with the Engine error', async () => {
@@ -2825,6 +2903,7 @@ describe('r30: real backup_instance before restore_from_backup (op Done + archiv
             const r = await dispatchAction(ctxFor(ops, driver, 'idea01') as any)
             expect(r.ok).toBe(false)
             expect(r.message).toMatch(/^backup_instance: backup op backed up the wrong instance: b4@idea01=Done inst=99vunsducqvzniusygc; expected kolibri-grade5a-001/)
+            expect(r.message).not.toMatch(/8d98718/)
         })
     })
 

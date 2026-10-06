@@ -22,6 +22,8 @@ import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websoc
 import { $ } from 'zx'
 import type { Store } from '../../src/data/Store.js'
 import { runningInstanceExpectsLocalDocker } from './stability.js'
+import { consoleDistProbeScript, parseConsoleDistProbe, type ConsoleDistProbe } from './consoleDeploy.js'
+import type { DurationCommandTrace } from './actions.js'
 import {
     abandonRepo,
     describeEngineLink,
@@ -958,6 +960,7 @@ export class RealFleetOps implements FleetOps {
     private readonly hosts: Record<string, string>
     private readonly sshUser: string
     private readonly enginePort: number
+    private readonly commandLogUrls = new Map<string, string>()
     private readonly healthWrapBefore?: string
     private readonly healthWrapAfter?: string
     private readonly storeUrls: Record<string, string>
@@ -1549,6 +1552,56 @@ export class RealFleetOps implements FleetOps {
                 ),
             }
         })
+    }
+
+    /**
+     * r36@98: read-only list of this pool Engine's own CommandLog traces (doc url from the
+     * Engine's GET /api/command-log-url, synced over the existing WS Repo). Never changes
+     * the doc. Eng handleCommand traces every queued command, refusals included.
+     */
+    async listCommandTraces(engineId: string): Promise<DurationCommandTrace[]> {
+        this.assertNotExcluded(engineId, 'listCommandTraces')
+        const conn = await this.connect(engineId)
+        let url = this.commandLogUrls.get(engineId)
+        if (!url) {
+            const port = Number(process.env.DURATION_ENGINE_HTTP_PORT ?? 8080)
+            const res = await fetch(`http://${conn.host}:${port}/api/command-log-url`, { signal: AbortSignal.timeout(5_000) })
+            const body = res.ok ? ((await res.json()) as { url?: unknown }) : {}
+            if (typeof body.url !== 'string' || !body.url.startsWith('automerge:')) {
+                throw new Error(`no CommandLog url from ${engineId} /api/command-log-url (HTTP ${res.status})`)
+            }
+            url = body.url
+            this.commandLogUrls.set(engineId, url)
+            registerOwnDoc(url, 'commandLog', engineId)
+        }
+        const handle = conn.repo.findWithProgress<{ traces?: Record<string, unknown> }>(toDocId(url)).handle
+        const deadline = Date.now() + 5_000
+        while (!handle.isReady() && Date.now() < deadline) await sleep(100)
+        if (!handle.isReady()) throw new Error(`CommandLog ${url} of ${engineId} not ready within 5000ms`)
+        const doc = handle.doc()
+        return Object.entries(doc?.traces ?? {}).map(([id, raw]) => {
+            const t = (raw ?? {}) as Record<string, unknown>
+            return {
+                traceId: String(t.traceId ?? id),
+                command: String(t.command ?? ''),
+                args: typeof t.args === 'string' ? t.args : JSON.stringify(t.args ?? null),
+                status: String(t.status ?? ''),
+                startedAt: typeof t.startedAt === 'number' ? t.startedAt : null,
+                completedAt: typeof t.completedAt === 'number' ? t.completedAt : null,
+                errorMessage: t.errorMessage == null ? null : String(t.errorMessage),
+            }
+        })
+    }
+
+    /**
+     * r36@98: READ-ONLY probe of the Console dist a pool Engine serves (consolePath from its
+     * config.yaml, the git HEAD of that checkout, tracked changes, commit time, dist mtime and
+     * main asset). Only cat/sed/grep/stat/git rev-parse|log|status — nothing is written.
+     */
+    async probeConsoleDist(engineId: string): Promise<ConsoleDistProbe> {
+        this.assertNotExcluded(engineId, 'probeConsoleDist')
+        const out = await this.ssh(this.hostOf(engineId), consoleDistProbeScript())
+        return parseConsoleDistProbe(out)
     }
 
     /**

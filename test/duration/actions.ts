@@ -1355,9 +1355,68 @@ export const verifyRestoreOperation = async (
 
 export type BackupDiskProbe = { dest: string; backupYaml: string | null; repoEntries: string[] | null }
 
+/**
+ * r36@98: one Engine CommandLog trace (read-only). Eng handleCommand writes a trace for
+ * every queued command, also for a refusal before execution ("Too many arguments",
+ * "Instance … ambiguous"), so a refused command is visible even without an Operation.
+ * `args` is the trace's JSON string (named object, or the token array on a parse refusal).
+ */
+export type DurationCommandTrace = {
+    traceId: string
+    command: string
+    args: string
+    status: string
+    startedAt: number | null
+    completedAt: number | null
+    errorMessage: string | null
+}
+
 type BackupOps = FleetOps & {
     listOperations?: (engineId: string) => Promise<DurationOperationRow[]>
     probeBackupDisk?: (engineId: string, diskId: string, instanceId: string) => Promise<BackupDiskProbe | null>
+    listCommandTraces?: (engineId: string) => Promise<DurationCommandTrace[]>
+}
+
+/** Tokens of a trace's args: a JSON array as is, a named object's values (arrays flattened). */
+export const traceArgTokens = (args: string): string[] => {
+    let v: unknown
+    try {
+        v = JSON.parse(args)
+    } catch {
+        return args ? [args] : []
+    }
+    const flat = (x: unknown): string[] => (Array.isArray(x) ? x.flatMap(flat) : x == null ? [] : [String(x)])
+    if (Array.isArray(v)) return flat(v)
+    if (v && typeof v === 'object') return Object.values(v as Record<string, unknown>).flatMap(flat)
+    return v == null ? [] : [String(v)]
+}
+
+/**
+ * r36@98: why a backupApp the Console sent never became an Operation, from the Engine's
+ * own CommandLog trace. Eng backupApp takes exactly `<instanceIdOrName> <backupDiskIdOrName>`
+ * (space-split): more tokens means the Console sent display names with spaces, i.e. a
+ * Console build without the r30 id contract (Console c981361: `backupApp <instanceId>
+ * <backupDiskId>`). Returns '' when the trace is not a refusal.
+ */
+export const diagnoseBackupTrace = (t: DurationCommandTrace, expect: { instanceId: string }): string => {
+    if (t.status !== 'error') return ''
+    const tokens = traceArgTokens(t.args)
+    const err = (t.errorMessage ?? '').trim()
+    if (/too many arguments/i.test(err) || tokens.length > 2) {
+        return (
+            `the Console sent ${tokens.length} space-separated tokens (${JSON.stringify(tokens)}), but Engine backupApp ` +
+            `takes exactly <instanceId> <backupDiskId>: display names with spaces were sent instead of ids. ` +
+            `The Console the Engine serves predates the r30 id contract (Console c981361+ sends ` +
+            `"backupApp ${expect.instanceId} <backupDiskId>") — check the deployed Console build (console_deploy_preflight)`
+        )
+    }
+    if (/ambiguous/i.test(err)) {
+        return `the instance/disk argument was a non-unique name (${JSON.stringify(tokens)}); a Console with the r30 id contract sends ids`
+    }
+    if (/not found|not (currently )?docked|not docked to this engine/i.test(err)) {
+        return `the Engine could not resolve ${JSON.stringify(tokens)} on the engine the Console addressed (stale engine/disk?)`
+    }
+    return `Engine refused ${JSON.stringify(tokens)}`
 }
 
 /** Eng backupMonitor LOCK_FILE: present while (or after a failed) borg create. */
@@ -1818,6 +1877,7 @@ export const verifyRebootEngine = async (
 export type BackupCheckReason =
     | 'ok'
     | 'never_started'
+    | 'refused'
     | 'wrong_instance'
     | 'not_done'
     | 'last_backup_not_bumped'
@@ -1828,7 +1888,9 @@ export type BackupCheckReason =
  * pool engines' operationDB for a backupApp Operation started after the click and wait
  * for it to end. Reads only the resolved Operation args (Eng backupMonitor.ts:110-113:
  * instanceId + backupDiskId) — independent of whether the Console sent names (Eng
- * 8d98718) or ids (fix/restore-backup-disk-id). Then the Backup Disk must really hold
+ * 8d98718) or ids (fix/restore-backup-disk-id). r36@98: without an Operation, the
+ * Engine CommandLog trace tells a refusal ("Too many arguments" → the served Console sent
+ * names) from a command that never arrived; a refusal ends the wait at once. Then the Backup Disk must really hold
  * the archive restore_from_backup will look for: BACKUP.yaml lastBackup for the
  * instance > 0 and > its pre-Intent value, `backups/<instanceId>/config` (the Borg repo
  * Eng restoreApp requires) and no `.backup-in-progress` marker. Returns null without a
@@ -1838,7 +1900,7 @@ export const verifyBackupOperation = async (
     ctx: ActionContext,
     sinceMs: number,
     expect: { instanceId: string; priorLastBackup?: number },
-    opts: { startBudgetMs?: number; doneBudgetMs?: number; pollMs?: number; slackMs?: number } = {},
+    opts: { startBudgetMs?: number; doneBudgetMs?: number; pollMs?: number; slackMs?: number; traceSlackMs?: number } = {},
     env: NodeJS.ProcessEnv = process.env,
 ): Promise<{ ok: boolean; reason: BackupCheckReason; note: string } | null> => {
     const ops = ctx.opts.ops as BackupOps
@@ -1853,9 +1915,15 @@ export const verifyBackupOperation = async (
     const slackMs = opts.slackMs ?? 60_000
     const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e))
     const want = expect.instanceId
+    // CommandLog traces: Engine clocks vs the walker's — a few seconds of slack only, so an
+    // older backupApp trace (an earlier walk) is not taken for this click.
+    const traceSlackMs = opts.traceSlackMs ?? 5_000
     const t0 = Date.now()
     let rows: (DurationOperationRow & { engine: string })[] = []
     let readErrors: string[] = []
+    let traces: (DurationCommandTrace & { engine: string })[] = []
+    let traceErrors: string[] = []
+    const canReadTraces = typeof ops.listCommandTraces === 'function'
     const scan = async () => {
         rows = []
         readErrors = []
@@ -1871,15 +1939,37 @@ export const verifyBackupOperation = async (
             }
         }
     }
+    const scanTraces = async () => {
+        if (!canReadTraces) return
+        traces = []
+        traceErrors = []
+        for (const eng of pool) {
+            try {
+                for (const t of await ops.listCommandTraces!(eng)) {
+                    if (t.command !== 'backupApp') continue
+                    if (typeof t.startedAt !== 'number' || t.startedAt < sinceMs - traceSlackMs) continue
+                    if (!traces.some(x => x.traceId === t.traceId)) traces.push({ ...t, engine: eng })
+                }
+            } catch (e) {
+                traceErrors.push(`${eng}: ${e instanceof Error ? e.message : String(e)}`)
+            }
+        }
+        traces.sort((a, b) => (a.startedAt ?? 0) - (b.startedAt ?? 0))
+    }
+    const refusal = () => traces.find(t => t.status === 'error')
     const desc = (rs: typeof rows) =>
         rs.map(r => `${r.id}@${r.engine}=${r.status}${r.args?.instanceId ? ` inst=${r.args.instanceId}` : ''}${r.error ? ` (${r.error})` : ''}`).join(', ')
     const terminal = (st: string) => st === 'Done' || st === 'Failed' || st === 'Cancelled'
     for (;;) {
         await scan()
+        if (!rows.length) await scanTraces()
         const mine = rows.filter(r => r.args?.instanceId === want)
         const elapsed = Date.now() - t0
         if (mine.some(r => r.status === 'Done')) break
         if (mine.length && mine.every(r => terminal(r.status))) break
+        // r36@98: the Engine already refused the command (error trace, no Operation) —
+        // no Operation can follow, so do not wait out the start budget.
+        if (!rows.length && refusal()) break
         if (!rows.length && elapsed >= startBudget) break
         if (rows.length && !mine.length && rows.every(r => terminal(r.status)) && elapsed >= startBudget) break
         if (elapsed >= startBudget + doneBudget) break
@@ -1887,14 +1977,33 @@ export const verifyBackupOperation = async (
     }
     const errNote = readErrors.length ? ` (store read errors: ${readErrors.join('; ')})` : ''
     if (!rows.length) {
+        const waited = Date.now() - t0
+        const refused = refusal()
+        if (refused) {
+            const at = refused.startedAt != null ? ` ${refused.startedAt - sinceMs >= 0 ? '+' : ''}${refused.startedAt - sinceMs}ms after the Intent started` : ''
+            return {
+                ok: false,
+                reason: 'refused',
+                note:
+                    `backup op never started: Engine ${refused.engine} refused "backupApp" before execution${at} ` +
+                    `(trace ${refused.traceId} status=error: ${refused.errorMessage ?? 'no message'}; ` +
+                    `args ${refused.args}), no backupApp Operation${errNote}: ` +
+                    `${diagnoseBackupTrace(refused, { instanceId: want })}. No soft-pass.`,
+            }
+        }
+        const traceNote = !canReadTraces
+            ? 'Engine CommandLog not readable by this harness — cannot tell a refusal from a command that never arrived'
+            : traces.length
+              ? `backupApp trace(s) ${traces.map(t => `${t.traceId}@${t.engine}=${t.status}`).join(', ')} without an Operation`
+              : `and no backupApp command trace on any pool engine (${pool.join(', ')}): the Console never delivered ` +
+                `the command (Back up opened the Backup Disk picker? addressed to a non-pool engine? Console offline?)`
+        const traceErrNote = traceErrors.length ? ` (CommandLog read errors: ${traceErrors.join('; ')})` : ''
         return {
             ok: false,
             reason: 'never_started',
             note:
                 `backup op never started: no backupApp Operation since the Back up click on any pool engine ` +
-                `within ${startBudget}ms${errNote}. Engine rejected the command before execution? (Eng 8d98718 ` +
-                `splits "backupApp <instance> <backupDiskName>" on spaces → "Too many arguments"; ` +
-                `"Duration Tests — Empty Disk 002" has spaces). Engine/Console backup bug — no soft-pass.`,
+                `within ${waited}ms (budget ${startBudget}ms)${errNote}; ${traceNote}${traceErrNote}. No soft-pass.`,
         }
     }
     const mine = rows.filter(r => r.args?.instanceId === want)
@@ -1903,8 +2012,9 @@ export const verifyBackupOperation = async (
             ok: false,
             reason: 'wrong_instance',
             note:
-                `backup op backed up the wrong instance: ${desc(rows)}; expected ${want}. Eng 8d98718 ` +
-                `resolves the instance by NAME and two instances share it (e.g. copy_app clone). No soft-pass.`,
+                `backup op backed up the wrong instance: ${desc(rows)}; expected ${want}. The Engine resolved ` +
+                `the instance argument to another instance (a name shared with a copy_app clone, sent by a ` +
+                `Console without the r30 id contract?). No soft-pass.`,
         }
     }
     const done = mine.find(r => r.status === 'Done')
