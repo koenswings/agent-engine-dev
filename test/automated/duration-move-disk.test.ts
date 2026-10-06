@@ -660,7 +660,9 @@ describe('idea#168 r35@62: Kolibri root-0600 session files are left out of the m
         expect(ops.relays.map(r => r.srcCmd).every(c => c.includes(`--exclude='kolibri/sessions'`))).toBe(true)
         expect(ops.cmds.filter(c => c.cmd.includes('DIGEST files=')).map(c => c.host).sort()).toEqual(['idea01', 'idea03'])
         // (idea#168 Stage 1: ./services, re-linked on the target, is pruned in the same group.)
-        expect(ops.cmds.filter(c => c.cmd.includes('DIGEST files=')).every(c => /-path '\*\/kolibri\/sessions'( -o -path '\.\/services')? \\\) -prune/.test(c.cmd))).toBe(true)
+        expect(ops.cmds.filter(c => c.cmd.includes('DIGEST files=')).every(c => /-path '\*\/kolibri\/sessions'( -o -path '\.\/services')? -o -path '\.\/META\.yaml' \\\) -prune/.test(c.cmd))).toBe(true)
+        // idea#168 r38: META.yaml is compared parsed (diskId + created) on both sides, never in the byte digest.
+        expect(ops.cmds.filter(c => c.cmd.includes('@@META_BEGIN@@')).map(c => c.host).sort()).toEqual(['idea01', 'idea03'])
         // Source session files untouched (quarantined with the source slot on idea01).
         const q = fs.readdirSync(`${sb.host('idea01').disks}/.moved-away`)[0]!
         expect(fs.readdirSync(`${sb.host('idea01').disks}/.moved-away/${q}/${SESSIONS_REL}`).sort()).toEqual(['sessionid-learner-r35', 'sessionid-teacher-r35'])

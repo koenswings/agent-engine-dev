@@ -848,18 +848,26 @@ describe('RealFleetOps guard clauses (no network)', () => {
         expect(() => parseHostsFlag('idea01')).toThrow(/Invalid/)
     })
 
-    it('refuses golden reboot and shared store mode without contacting Pis', async () => {
+    it('idea#168 r38: live shared store mode is accepted; unique refused; golden reboot refused (no Pis contacted)', async () => {
         const ops = new RealFleetOps({
             poolEngines: ['idea01', 'idea03'],
             excludeEngines: ['idea02'],
             hosts: fakeHosts,
-            storeMode: 'unique',
+            storeMode: 'shared',
         })
         await expect(ops.rebootEngine('idea02', true)).rejects.toThrow(/excluded|golden/)
-        await expect(ops.applyStoreMode('shared')).rejects.toThrow(/Ops must provision|shared/)
-        expect(ops.getStoreMode()).toBe('unique')
-        await ops.applyStoreMode('unique') // no-op
-        expect(ops.getStoreMode()).toBe('unique')
+        await expect(ops.applyStoreMode('shared')).resolves.toBeUndefined()
+        expect(ops.getStoreMode()).toBe('shared')
+        await expect(ops.applyStoreMode('unique')).rejects.toThrow(/store_mode 'unique' refused on the live pool.*3zoqd/)
+        expect(ops.getStoreMode()).toBe('shared')
+        // default (no storeMode) is shared; unique at construction is refused
+        expect(new RealFleetOps({ poolEngines: ['idea01'], excludeEngines: ['idea02'], hosts: fakeHosts }).getStoreMode()).toBe('shared')
+        expect(() => new RealFleetOps({ poolEngines: ['idea01'], excludeEngines: ['idea02'], hosts: fakeHosts, storeMode: 'unique' }))
+            .toThrow(/storeMode 'unique' refused on the live pool/)
+        // the shared unified graph runs through applyStoreMode without throwing
+        expect(loadScenario('unified').store_mode).toBe('shared')
+        await expect(ops.applyStoreMode(loadScenario('unified').store_mode!)).resolves.toBeUndefined()
+        await expect(ops.probeStoreConfig('idea02')).rejects.toThrow(/excluded|golden|idea02/)
     })
 
     it('defaults to Atlas-approved private duration roots (never /disks)', () => {
@@ -909,7 +917,10 @@ describe('RealFleetOps guard clauses (no network)', () => {
         expect(emptyRemote).toMatch(/cp -a '\/fixtures\/empty\/\.'/)
         expect(emptyRemote).not.toMatch(/reuse existing Path A tree/)
         // Still refuse when META belongs to a different diskId
-        expect(emptyRemote).toMatch(/! grep -Fq 'diskId: duration-empty-001'/)
+        // idea#168 r38: parsed diskId compared exactly (no grep -F substring / byte match)
+        expect(emptyRemote).not.toMatch(/grep -Fq/)
+        expect(emptyRemote).toMatch(/! \[ -f '\/home\/pi\/idea\/duration-disks\/idea-test-3\/META\.yaml' \] && \[ "\$\(sed -n 's\/\^diskId:/)
+        expect(emptyRemote).toMatch(/\)" = 'duration-empty-001' \]/)
         expect(emptyRemote).toMatch(/exit 4/)
         // Prefer A r20: strip Kid README.md / stray apps so createFilesDisk is not refused
         expect(emptyRemote).toMatch(/stripped non-META entries from empty pack/)
@@ -927,7 +938,7 @@ describe('RealFleetOps guard clauses (no network)', () => {
         expect(empty2Remote).toMatch(/rm -rf '\/home\/pi\/idea\/duration-disks\/idea-test-4'/)
         expect(empty2Remote).toMatch(/cp -a '\/fixtures\/empty-002\/\.'/)
         expect(empty2Remote).not.toMatch(/reuse existing Path A tree/)
-        expect(empty2Remote).toMatch(/! grep -Fq 'diskId: duration-empty-002'/)
+        expect(empty2Remote).toMatch(/\)" = 'duration-empty-002' \]/)
         expect(empty2Remote).toMatch(/stripped non-META entries from empty pack/)
 
         const kolibriRemote = buildSshDockCopyRemote({
@@ -939,7 +950,7 @@ describe('RealFleetOps guard clauses (no network)', () => {
             sentinel: '/home/pi/idea/duration-watch/idea-test-1',
         })
         expect(kolibriRemote).toMatch(/reuse existing Path A tree/)
-        expect(kolibriRemote).toMatch(/grep -Fq 'diskId: duration-kolibri-grade5a-001'/)
+        expect(kolibriRemote).toMatch(/if \[ -f '\/home\/pi\/idea\/duration-disks\/idea-test-1\/META\.yaml' \] && \[ "\$\(sed .*\)" = 'duration-kolibri-grade5a-001' \]; then/)
         // Reuse early-exit must appear before wipe for Grade5A
         expect(kolibriRemote.indexOf('reuse existing Path A tree'))
             .toBeLessThan(kolibriRemote.indexOf("rm -rf '/home/pi/idea/duration-disks/idea-test-1'"))

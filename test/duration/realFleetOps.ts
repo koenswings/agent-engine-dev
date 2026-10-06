@@ -24,6 +24,8 @@ import type { Store } from '../../src/data/Store.js'
 import { runningInstanceExpectsLocalDocker } from './stability.js'
 import { consoleDistProbeScript, parseConsoleDistProbe, type ConsoleDistProbe } from './consoleDeploy.js'
 import { dockWaitMs, logStartMeasured } from './startBudgets.js'
+import { storeProbeScript } from './storePreflight.js'
+import { assertSameMetaIdentity, metaDiskIdIsShell } from './metaYaml.js'
 import type { DurationCommandTrace } from './actions.js'
 import {
     abandonRepo,
@@ -540,7 +542,8 @@ export const buildSshDockCopyRemote = (args: SshDockCopyRemoteArgs): string => {
         // Empty has no docker-owned instance files — wipe is safe. Refuse only when
         // dest META belongs to a different diskId (never steal kolibri/nextcloud slot).
         parts.push(
-            `if test -f '${dest}/META.yaml' && ! grep -Fq 'diskId: ${diskId}' '${dest}/META.yaml'; then ` +
+            // idea#168 r38: parsed diskId (exact), never a byte/grep-substring match on META.yaml.
+            `if test -f '${dest}/META.yaml' && ! ${metaDiskIdIsShell(`'${dest}/META.yaml'`, diskId)}; then ` +
             `echo "RealFleetOps: refuse overwrite occupied ${dest} (no matching META for ${diskId})" >&2; exit 4; fi`,
             `echo "RealFleetOps: empty pack always fresh-copy into ${dest} (no Path A reuse)"`,
         )
@@ -550,7 +553,8 @@ export const buildSshDockCopyRemote = (args: SshDockCopyRemoteArgs): string => {
         // Reuse only when META.yaml diskId matches (never steal nextcloud slot for kolibri).
         // Atlas: chokidar needs unlink+create after eject, not mtime-only touch.
         parts.push(
-            `if test -f '${dest}/META.yaml' && grep -Fq 'diskId: ${diskId}' '${dest}/META.yaml'; then ` +
+            // idea#168 r38: parsed diskId (exact) — the Engine rewrites META.yaml on every dock.
+            `if ${metaDiskIdIsShell(`'${dest}/META.yaml'`, diskId)}; then ` +
             `echo "RealFleetOps: reuse existing Path A tree at ${dest}"; ` +
             ensureTars +
             `rm -f '${sentinel}'; sleep 5; touch '${sentinel}'; exit 0; fi`,
@@ -744,7 +748,7 @@ export type FixtureSlotState = 'MATCH' | 'OTHER' | 'NOMETA' | 'FREE'
 /** One read-only pass over idea-test-1..8: META diskId match / other pack / no META / free. */
 export const buildFixtureSlotScanRemote = (disksRoot: string, diskId: string): string =>
     `for d in ${fixtureSlotNames().join(' ')}; do p=${shq(disksRoot)}/$d; ` +
-    `if test -f "$p/META.yaml"; then if grep -Fq ${shq(`diskId: ${diskId}`)} "$p/META.yaml"; then s=MATCH; else s=OTHER; fi; ` +
+    `if test -f "$p/META.yaml"; then if ${metaDiskIdIsShell('"$p/META.yaml"', diskId)}; then s=MATCH; else s=OTHER; fi; ` +
     `elif test -e "$p" || test -L "$p"; then s=NOMETA; else s=FREE; fi; ` +
     `m=; if mountpoint -q "$p" 2>/dev/null; then m=' mount'; fi; echo "SLOT $d $s$m"; done`
 
@@ -938,6 +942,20 @@ export const buildTreeReceiveRemote = (staging: string, sudoMode: SudoMode): str
     `set -euo pipefail; ${sudoPreamble(sudoMode)}; $S rm -rf ${shq(staging)}; mkdir -p ${shq(staging)}; ` +
     `$S tar --numeric-owner -xpf - -C ${shq(staging)}`
 
+/** idea#168 r38: META.yaml is compared parsed (diskId + created), never in a byte digest. */
+export const META_DIGEST_EXCLUDE: readonly string[] = ['META.yaml']
+
+/** Read-only: cat <root>/META.yaml between markers ($S when sudo -n is granted). */
+export const buildMetaCatRemote = (root: string, sudoMode: SudoMode): string =>
+    `${sudoPreamble(sudoMode)}; echo @@META_BEGIN@@; $S cat -- ${shq(`${root}/META.yaml`)} 2>/dev/null || echo @@META_MISSING@@; echo; echo @@META_END@@`
+
+/** META.yaml text from buildMetaCatRemote output, null when missing. */
+export const parseMetaCat = (out: string): string | null => {
+    const m = /@@META_BEGIN@@\n([\s\S]*?)\n?@@META_END@@/.exec(String(out ?? ''))
+    if (!m || m[1]!.includes('@@META_MISSING@@')) return null
+    return m[1]!
+}
+
 /**
  * Content digest of a tree (find -L: in-slot links are followed the same way on both sides;
  * links out of the slot are refused before a move): file count, sha256 over the sorted per-file
@@ -1041,6 +1059,8 @@ const hostnameMatches = (hostname: string | undefined, logicalId: string): boole
     return h === want || h.startsWith(`${want}.`) || hostname.toLowerCase() === logicalId.toLowerCase()
 }
 
+const isNeverStoreProbe = (engineId: string): boolean => engineId === 'idea02'
+
 const toDocId = (urlOrId: string): DocumentId =>
     urlOrId.trim().replace(/^automerge:/, '') as DocumentId
 
@@ -1086,7 +1106,14 @@ export class RealFleetOps implements FleetOps {
         this.exclude = [...(opts.excludeEngines ?? [GOLDEN_DEFAULT])]
         if (!this.exclude.includes(GOLDEN_DEFAULT)) this.exclude.push(GOLDEN_DEFAULT)
         this.hosts = { ...opts.hosts }
-        this.mode = opts.storeMode ?? 'unique'
+        // idea#168 r38: live pool = one shared store; 'unique' refused (see applyStoreMode).
+        if (opts.storeMode && opts.storeMode !== 'shared') {
+            throw new Error(
+                `RealFleetOps: storeMode '${opts.storeMode}' refused on the live pool — idea01/03/04 share ONE store ` +
+                    `(3zoqd, mDNS ON, no static peers). Use shared; unique is Fake-only.`,
+            )
+        }
+        this.mode = 'shared'
         this.sshUser = opts.sshUser ?? DEFAULT_SSH_USER
         this.enginePort = opts.enginePort ?? DEFAULT_ENGINE_PORT
         this.healthWrapBefore = opts.healthWrapBefore
@@ -1136,16 +1163,38 @@ export class RealFleetOps implements FleetOps {
         return this.mode
     }
 
+    /**
+     * idea#168 r38 (Koen's standing rule): the live pool IS one shared store — the dev store
+     * (3zoqd…), mDNS ON, no static peers — an exact production replica. 'shared' is accepted
+     * (nothing to provision: the Engines already share it; runStorePreflight proves it before
+     * step 1 of every live run). 'unique' is REFUSED on the live pool (stricter option: a
+     * unique-store run would not be a production replica). FakeFleetOps keeps both modes.
+     */
     async applyStoreMode(mode: StoreMode): Promise<void> {
-        if (mode === 'shared') {
+        if (mode !== 'shared') {
             throw new Error(
-                'RealFleetOps: applyStoreMode(shared) requires Ops to provision a shared Automerge ' +
-                'store + mDNS across pool engines. Pis currently run unique stores with mdns:false ' +
-                '(idea01/idea03). Do not silently fake shared across unique stores — ask Atlas/Ops.',
+                `RealFleetOps: store_mode '${mode}' refused on the live pool — idea01/03/04 share ONE store ` +
+                    `(DURATION_EXPECTED_STORE_ID, default 3zoqd) with mDNS ON and no static peers (production replica). ` +
+                    `Use store_mode: shared (scenarios/unified.yaml); unique is Fake-only.`,
             )
         }
-        // unique: no-op when Pis already unique+mdns off
-        this.mode = 'unique'
+        this.mode = 'shared'
+    }
+
+    /** idea#168 r38 store preflight: READ-ONLY probe (config.yaml, store-url.txt, pm2.config.cjs, Engine env keys). */
+    async probeStoreConfig(engineId: string): Promise<string> {
+        this.assertNotExcluded(engineId, 'probeStoreConfig')
+        if (isNeverStoreProbe(engineId)) throw new Error(`RealFleetOps: probeStoreConfig refused for '${engineId}' (never idea02)`)
+        return this.ssh(this.hostOf(engineId), storeProbeScript())
+    }
+
+    /** idea#168 r38: the store doc the harness syncs from this Engine + whether that Engine's own engineDB row is in it. */
+    wsStoreInfo(engineId: string): { docId: string; engineRow: boolean } | null {
+        const c = this.conns.get(engineId)
+        if (!c) return null
+        const doc = c.storeHandle.doc() as Store | undefined
+        const live = doc ? this.discoverLiveEngineId(doc, engineId) : null
+        return { docId: String(c.storeDocId), engineRow: !!(doc && live && doc.engineDB[live as keyof typeof doc.engineDB]) }
     }
 
     private hostOf(engineId: string): string {
@@ -2793,10 +2842,23 @@ export class RealFleetOps implements FleetOps {
             )
             phase('stream')
             // 5. Verify content.
-            const [a, b] = await Promise.all([
-                this.ssh(srcHost, buildTreeDigestRemote(srcDigestRoot, spec.keyFile, this.sudoMode, skipPatterns, moveExclude)),
-                this.ssh(dstHost, buildTreeDigestRemote(staging, spec.keyFile, this.sudoMode, skipPatterns, moveExclude)),
+            // idea#168 r38: META.yaml is NOT in the byte digest (the Engine rewrites it on dock:
+            // lastDocked, diskName quoting) — its identity (diskId + created) is compared parsed.
+            const digestExclude = [...moveExclude, ...META_DIGEST_EXCLUDE]
+            const [a, b, metaA, metaB] = await Promise.all([
+                this.ssh(srcHost, buildTreeDigestRemote(srcDigestRoot, spec.keyFile, this.sudoMode, skipPatterns, digestExclude)),
+                this.ssh(dstHost, buildTreeDigestRemote(staging, spec.keyFile, this.sudoMode, skipPatterns, digestExclude)),
+                this.ssh(srcHost, buildMetaCatRemote(srcDigestRoot, this.sudoMode)),
+                this.ssh(dstHost, buildMetaCatRemote(staging, this.sudoMode)),
             ])
+            const metaSrc = parseMetaCat(metaA)
+            const metaDst = parseMetaCat(metaB)
+            if (metaSrc === null) throw new Error(`source META.yaml missing/unreadable on ${fromEngine}:${srcSlot}/META.yaml`)
+            if (metaDst === null) throw new Error(`target META.yaml missing after transfer on ${toEngine}:${staging}/META.yaml`)
+            const metaId = assertSameMetaIdentity(metaSrc, metaDst, `moveDisk ${diskId} ${fromEngine}:${srcSlot} → ${toEngine}:${staging}`)
+            if (metaId.diskId !== diskId) {
+                throw new Error(`moveDisk ${diskId}: carried META.yaml diskId is ${metaId.diskId ?? 'missing'}, expected ${diskId}`)
+            }
             const da = parseTreeDigest(a)
             const db = parseTreeDigest(b)
             if ('error' in da) throw new Error(`source digest failed on ${fromEngine}:${srcSlot}: ${da.error}`)

@@ -188,7 +188,15 @@ ffmpeg on this box: `/usr/bin/ffmpeg`.
 ### Live caveats
 
 - Claim **pool** Pis only (`idea01` / `idea03` / `idea04`). **Never golden idea02.**
-- Tonight’s Pis use **unique** stores + `mdns:false`. `applyStoreMode('shared')` throws until Ops provisions shared store+mDNS.
+- idea#168 r38 (Koen's standing rule): the live pool idea01/03/04 shares ONE dev store (`3zoqd…`) with
+  mDNS ON and NO static peers — a production replica. `RealFleetOps` accepts `store_mode: shared` (unified.yaml;
+  no wrapper flip) and REFUSES `unique` (Fake keeps both). Every `--live` run starts with `store_preflight`
+  (read-only ssh + the Engine's `/api/store-url` + the harness WS doc): per Pi, store id = `DURATION_EXPECTED_STORE_ID`
+  (default `3zoqd`), `settings.mdns: true` and `IDEA_MDNS_DISABLE` not `true`, no `IDEA_STATIC_PEERS` /
+  `settings.staticPeers`. Any mismatch → exit **6** before step 1 (Pi, field, expected vs actual). Exit codes:
+  1 walk failures · 2 fatal/refused · 4 engine unreachable · 5 Console pin · 6 store preflight.
+- META.yaml is never compared by bytes or sha (skipMetaUpdate:false rewrites it on every dock): checks use the
+  parsed `diskId` (+ `created` where two META files are compared, e.g. moveDisk); see `metaYaml.ts`.
 - `dockFixture` = rsync Kid pack → `duration-disks/idea-test-N/` + touch sentinel under `duration-watch` (excludes `instances/` so Engine does not auto-start apps). `undock` = `ejectDisk` + remove sentinel. `moveDisk` = undock then dock.
 - Engine on Pis must run with `testMode:true` and `IDEA_SYSTEM_DISK_SKIP=true` plus the private roots above (Atlas).
 - Fixture disks must **never** be the idea03 hw-roundtrip Intenso

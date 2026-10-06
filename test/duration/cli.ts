@@ -34,6 +34,7 @@ import { $ } from 'zx'
 import type { StructuredLogEntry } from './types.js'
 import { EXIT_ENGINE_UNREACHABLE, installProcessGuards, timeoutSummary, walkExitCode } from './automergeTimeoutGuard.js'
 import { DEFAULT_PREFLIGHT_TIMEOUT_MS } from './realFleetOps.js'
+import { EXIT_STORE_PREFLIGHT, formatStoreMismatch, runStorePreflight } from './storePreflight.js'
 import {
     buildRunSummary,
     formatRunSummaryLine,
@@ -79,6 +80,15 @@ const usage = () => {
                         --console-url must be DURATION_EXPECTED_CONSOLE_SHA (default: the
                         box Intents checkout HEAD) and the Intents checkout that same commit;
                         a mismatch exits 5 (console_deploy_preflight).
+                        Store preflight (EVERY --live run; NOT skipped by --no-preflight):
+                        each pool Pi must use the one shared store DURATION_EXPECTED_STORE_ID
+                        (default 3zoqd: store-url.txt, the running Engine's /api/store-url,
+                        the harness WS doc) with mDNS ON (settings.mdns, IDEA_MDNS_DISABLE) and
+                        no static peers (IDEA_STATIC_PEERS ?? settings.staticPeers); a mismatch
+                        exits 6 (store_preflight, names Pi / field / expected vs actual).
+                        Live store_mode must be shared (unique is refused; Fake keeps both).
+  Exit codes: 0 ok · 1 walk failures · 2 fatal/refused · 4 engine unreachable ·
+              5 Console pin mismatch · 6 store preflight mismatch
   --dwell-ms <n>        Dwell between transitions (default: 30000 / --fast 80)
   --help                this message
 
@@ -301,7 +311,8 @@ const main = async () => {
             poolEngines: pool,
             excludeEngines: scenario.exclude_engines,
             hosts,
-            storeMode: scenario.store_mode ?? 'unique',
+            // idea#168 r38: live pool = one shared store (unique refused by RealFleetOps).
+            storeMode: scenario.store_mode ?? 'shared',
             fixtureInstances,
             healthWrapBefore: args.healthWrapBefore,
             healthWrapAfter: args.healthWrapAfter,
@@ -368,6 +379,30 @@ const main = async () => {
             await uiDriver.close?.().catch(() => {})
             await ops.close().catch(() => {})
             process.exit(EXIT_ENGINE_UNREACHABLE)
+        }
+    }
+
+    // idea#168 r38: EVERY live run (any scenario / walk, not skippable by --no-preflight):
+    // each pool Pi must be on the one shared dev store (DURATION_EXPECTED_STORE_ID, default
+    // 3zoqd) with mDNS ON and no static peers — the production replica. Read-only ssh + the
+    // Engine's own /api/store-url + the harness WS doc. Mismatch → exit 6 before step 1.
+    if (ops instanceof RealFleetOps) {
+        const sp = await runStorePreflight(pool, ops.getHostMap(), {
+            probe: id => ops.probeStoreConfig(id),
+            fetchStoreUrl: async (host, port) => {
+                const res = await fetch(`http://${host}:${port}/api/store-url`, { signal: AbortSignal.timeout(10_000) })
+                if (!res.ok) throw new Error(`HTTP ${res.status}`)
+                return res.text()
+            },
+            ws: id => ops.wsStoreInfo(id),
+        })
+        console.log(JSON.stringify({ event: 'store_preflight', ok: sp.ok, expected_store_id: sp.expected, pis: sp.pis, mismatches: sp.mismatches }))
+        if (!sp.ok) {
+            for (const m of sp.mismatches) console.error(`[duration] FATAL (${formatStoreMismatch(m)})`)
+            console.log(JSON.stringify(timeoutSummary()))
+            await uiDriver.close?.().catch(() => {})
+            await ops.close().catch(() => {})
+            process.exit(EXIT_STORE_PREFLIGHT)
         }
     }
 
