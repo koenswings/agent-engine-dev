@@ -2100,7 +2100,13 @@ export type BackupCheckReason =
  * instanceId + backupDiskId) — independent of whether the Console sent names (Eng
  * 8d98718) or ids (fix/restore-backup-disk-id). r36@98: without an Operation, the
  * Engine CommandLog trace tells a refusal ("Too many arguments" → the served Console sent
- * names) from a command that never arrived; a refusal ends the wait at once. Then the Backup Disk must really hold
+ * names) from a command that never arrived; a refusal ends the wait once traces are known.
+ * r42@112: operationDB is polled on a steady cadence for the start budget; CommandLog /
+ * listCommandTraces is best-effort (background during the wait, final pass after the
+ * budget) so a 5s "not ready" never consumes the only ops re-poll window. Fail text
+ * distinguishes ops-empty+CL-unread vs ops-empty+CL-readable-no-trace vs refusal — never
+ * claims "Console never delivered" from unread CommandLog alone. Still hard-fails with
+ * never_started when no backupApp Operation appears. Then the Backup Disk must really hold
  * the archive restore_from_backup will look for: BACKUP.yaml lastBackup for the
  * instance > 0 and > its pre-Intent value, `backups/<instanceId>/config` (the Borg repo
  * Eng restoreApp requires) and no `.backup-in-progress` marker. Returns null without a
@@ -2109,7 +2115,7 @@ export type BackupCheckReason =
 export const verifyBackupOperation = async (
     ctx: ActionContext,
     sinceMs: number,
-    expect: { instanceId: string; priorLastBackup?: number },
+    expect: { instanceId: string; priorLastBackup?: number; expectedEngine?: string },
     opts: { startBudgetMs?: number; doneBudgetMs?: number; pollMs?: number; slackMs?: number; traceSlackMs?: number } = {},
     env: NodeJS.ProcessEnv = process.env,
 ): Promise<{ ok: boolean; reason: BackupCheckReason; note: string } | null> => {
@@ -2119,7 +2125,8 @@ export const verifyBackupOperation = async (
         const raw = env[k]?.trim()
         return raw && /^\d+$/.test(raw) ? Number(raw) : undefined
     }
-    const startBudget = opts.startBudgetMs ?? envMs('DURATION_BACKUP_START_MS') ?? (ctx.opts.fast ? 5_000 : 30_000)
+    // r42@112: fast cover-all default was 5s and raced Automerge op visibility after open_app churn.
+    const startBudget = opts.startBudgetMs ?? envMs('DURATION_BACKUP_START_MS') ?? (ctx.opts.fast ? 25_000 : 30_000)
     const doneBudget = opts.doneBudgetMs ?? envMs('DURATION_BACKUP_DONE_MS') ?? (ctx.opts.fast ? 30_000 : 600_000)
     const pollMs = opts.pollMs ?? 1_000
     const slackMs = opts.slackMs ?? 60_000
@@ -2170,16 +2177,26 @@ export const verifyBackupOperation = async (
     const desc = (rs: typeof rows) =>
         rs.map(r => `${r.id}@${r.engine}=${r.status}${r.args?.instanceId ? ` inst=${r.args.instanceId}` : ''}${r.error ? ` (${r.error})` : ''}`).join(', ')
     const terminal = (st: string) => st === 'Done' || st === 'Failed' || st === 'Cancelled'
+    // r42@112: never await CommandLog on the start-budget critical path. Kick one best-effort
+    // background scan for early refusal; keep polling operationDB every pollMs.
+    let tracesInFlight: Promise<void> | null = null
+    let earlyTracesSettled = false
+    const kickTracesBestEffort = () => {
+        if (!canReadTraces || tracesInFlight || earlyTracesSettled) return
+        tracesInFlight = scanTraces().finally(() => {
+            tracesInFlight = null
+            earlyTracesSettled = true
+        })
+    }
     for (;;) {
         await scan()
-        if (!rows.length) await scanTraces()
+        if (!rows.length) kickTracesBestEffort()
         const mine = rows.filter(r => r.args?.instanceId === want)
         const elapsed = Date.now() - t0
         if (mine.some(r => r.status === 'Done')) break
         if (mine.length && mine.every(r => terminal(r.status))) break
-        // r36@98: the Engine already refused the command (error trace, no Operation) —
-        // no Operation can follow, so do not wait out the start budget.
-        if (!rows.length && refusal()) break
+        // r36@98: refusal ends the wait once background CommandLog has settled — never blocks ops polls.
+        if (!rows.length && earlyTracesSettled && refusal()) break
         if (!rows.length && elapsed >= startBudget) break
         if (rows.length && !mine.length && rows.every(r => terminal(r.status)) && elapsed >= startBudget) break
         if (elapsed >= startBudget + doneBudget) break
@@ -2187,6 +2204,9 @@ export const verifyBackupOperation = async (
     }
     const errNote = readErrors.length ? ` (store read errors: ${readErrors.join('; ')})` : ''
     if (!rows.length) {
+        // Final CommandLog pass AFTER the ops start budget — accurate refused / unread / empty diagnosis.
+        if (tracesInFlight) await tracesInFlight
+        await scanTraces()
         const waited = Date.now() - t0
         const refused = refusal()
         if (refused) {
@@ -2201,12 +2221,38 @@ export const verifyBackupOperation = async (
                     `${diagnoseBackupTrace(refused, { instanceId: want })}. No soft-pass.`,
             }
         }
-        const traceNote = !canReadTraces
-            ? 'Engine CommandLog not readable by this harness — cannot tell a refusal from a command that never arrived'
-            : traces.length
-              ? `backupApp trace(s) ${traces.map(t => `${t.traceId}@${t.engine}=${t.status}`).join(', ')} without an Operation`
-              : `and no backupApp command trace on any pool engine (${pool.join(', ')}): the Console never delivered ` +
+        const unreadEngines = [
+            ...new Set(
+                traceErrors
+                    .map(e => e.split(':')[0]?.trim() ?? '')
+                    .filter(e => pool.includes(e)),
+            ),
+        ]
+        const readableEngines = pool.filter(e => !unreadEngines.includes(e))
+        const expected = expect.expectedEngine
+        let traceNote: string
+        if (!canReadTraces) {
+            traceNote =
+                'Engine CommandLog not readable by this harness — cannot tell a refusal from a command that never arrived'
+        } else if (traces.length) {
+            traceNote = `backupApp trace(s) ${traces.map(t => `${t.traceId}@${t.engine}=${t.status}`).join(', ')} without an Operation`
+        } else if (unreadEngines.length) {
+            const expBit = expected
+                ? unreadEngines.includes(expected)
+                    ? ` expected engine ${expected} CommandLog unread`
+                    : ` expected engine ${expected} CommandLog readable with no backupApp trace`
+                : ''
+            traceNote =
+                `ops empty and CommandLog unread on ${unreadEngines.join(', ')}` +
+                (readableEngines.length
+                    ? `; readable engines (${readableEngines.join(', ')}) had no backupApp trace`
+                    : '; no pool CommandLog was readable') +
+                `${expBit} — cannot conclude Console non-delivery from unread/empty traces alone`
+        } else {
+            traceNote =
+                `and no backupApp command trace on any pool engine (${pool.join(', ')}): the Console never delivered ` +
                 `the command (Back up opened the Backup Disk picker? addressed to a non-pool engine? Console offline?)`
+        }
         const traceErrNote = traceErrors.length ? ` (CommandLog read errors: ${traceErrors.join('; ')})` : ''
         return {
             ok: false,
@@ -2855,6 +2901,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
         const check = await verifyBackupOperation(ctx, intentStartedAt, {
             instanceId: instanceId ?? ctx.fixtureInstance,
             priorLastBackup: backupPre?.priorLastBackup,
+            expectedEngine: backupPre?.engine,
         })
         if (check && !check.ok) {
             return {

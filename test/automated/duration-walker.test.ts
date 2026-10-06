@@ -2918,6 +2918,71 @@ describe('r30: real backup_instance before restore_from_backup (op Done + archiv
         })
     })
 
+    // r42@112: idea01 CommandLog "not ready" must not be reported as Console non-delivery.
+    it('backup_instance (live): ops empty + CommandLog unread on expected engine → never claims Console never delivered', async () => {
+        await withEnv(FAST, async () => {
+            const { ops, driver } = await fleet({ ops: () => [], traces: () => [] })
+            Object.assign(ops, {
+                listCommandTraces: async (e: string) => {
+                    if (e === 'idea01') throw new Error('CommandLog automerge:34HHkR3T5VjdV8rAUrcZ476Ldid2 not ready within 5000ms')
+                    return []
+                },
+            })
+            const r = await dispatchAction(ctxFor(ops, driver, 'idea01') as any)
+            expect(r.ok).toBe(false)
+            expect(r.message).toMatch(/CommandLog unread on idea01/)
+            expect(r.message).toMatch(/expected engine idea01 CommandLog unread/)
+            expect(r.message).toMatch(/cannot conclude Console non-delivery/)
+            expect(r.message).not.toMatch(/Console never delivered/)
+            expect(r.message).toMatch(/No soft-pass/)
+            expect(r.message).toMatch(/\(Console Intent reported ok\)$/)
+        })
+    })
+
+    // r42@112: a slow CommandLog must not consume the only ops re-poll window.
+    it('verifyBackupOperation: slow CommandLog does not starve operationDB re-polls within the start budget', async () => {
+        await withEnv({}, async () => {
+            const since = Date.now()
+            const { ops, state } = await fleet({
+                ops: () => [],
+                traces: () => [],
+            })
+            state.clicked = true
+            state.clickedAt = since
+            let opsPolls = 0
+            Object.assign(ops, {
+                listOperations: async (e: string) => {
+                    if (e !== 'idea01') return []
+                    opsPolls++
+                    // Appear on the 4th idea01 poll — old code never got here (blocked on CL).
+                    if (opsPolls < 4) return []
+                    return [
+                        {
+                            id: 'late',
+                            kind: 'backupApp',
+                            status: 'Done',
+                            startedAt: since + 50,
+                            args: { instanceId: INST, backupDiskId: EMPTY2 },
+                        },
+                    ]
+                },
+                listCommandTraces: async () => {
+                    await new Promise<void>(r => setTimeout(r, 800))
+                    return []
+                },
+            })
+            const r = await verifyBackupOperation(
+                ctxFor(ops, null, 'idea01') as any,
+                since,
+                { instanceId: INST, expectedEngine: 'idea01' },
+                { startBudgetMs: 2_000, doneBudgetMs: 30, pollMs: 40 },
+            )
+            expect(r?.ok, r?.note).toBe(true)
+            expect(r?.note).toMatch(/backup op late Done on idea01/)
+            expect(opsPolls).toBeGreaterThanOrEqual(4)
+        })
+    })
+
     it('verifyBackupOperation: a refusal trace from before the Intent (earlier walk) is ignored; an accepted trace without Operation is reported as such', async () => {
         await withEnv({}, async () => {
             const since = Date.now()
