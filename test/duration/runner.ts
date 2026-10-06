@@ -263,6 +263,8 @@ const runWalkWithSteps = async (
                     poolEngines: pool,
                     fixtureDisk,
                     engines: pool,
+                    settleTimeoutMs: fullOpts.settleTimeoutMs,
+                    fast: fullOpts.fast,
                 })
                 invResults = evaluated
                 for (const inv of evaluated) {
