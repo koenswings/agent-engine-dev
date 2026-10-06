@@ -292,6 +292,11 @@ export const slotLayoutVerdict = (
     disksRoot: string,
     probe: SlotLayoutProbe,
     slots: readonly string[] = requiredSlotNames(),
+    /**
+     * Lowest `idea-app-data <N>` accepted on a helper Pi: 1 in general, 2 when the walk runs a
+     * cross-Engine copy (peer keys need v2 sync-peers; peerPreflight.requiredHelperVersion).
+     */
+    minHelperVersion = 1,
 ): SlotLayoutVerdict => {
     const where = `${engine} (${host})`
     if (probe.helper === 'absent') {
@@ -338,6 +343,13 @@ export const slotLayoutVerdict = (
         if (missing.length) {
             problems.push(`root bridge ${APP_DATA_ROOTS_FILE} does not list ${missing.map(n => `${disksRoot}/${n}`).join(', ')}`)
         }
+    }
+    const vNum = vOk ? Number(probe.versionOut.replace('idea-app-data ', '')) : null
+    if (vNum !== null && vNum < minHelperVersion) {
+        problems.push(
+            `${APP_DATA_HELPER} is version ${vNum} but this walk needs >= ${minHelperVersion}` +
+                (minHelperVersion >= 2 ? ' (it runs a cross-Engine copy: per-Pi peer keys need idea-app-data v2 sync-peers)' : ''),
+        )
     }
     const version = vOk ? probe.versionOut : null
     const slotRange = slots.length ? `${slots[0]}..${slots[slots.length - 1]!.replace('idea-test-', '')}` : '(none)'
