@@ -546,7 +546,7 @@ describe('two-engine store simulation (per-Pi keys exchanged through the store)'
 
         // what A's key may do on B: the gate named in B's file, with A's id
         const v = await sbB.runGate(['ENGINE_a'], 'sudo -n /usr/local/sbin/idea-app-data version')
-        expect(v.stdout.trim()).toBe('idea-app-data 2')
+        expect(v.stdout.trim()).toBe('idea-app-data 3')
 
         // B is reimaged: new Engine key. A re-authorizes it from the store and logs it loudly
         await fs.remove(path.join(sbB.tmp, 'pi-ssh'))
