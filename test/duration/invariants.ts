@@ -3,7 +3,7 @@
  * Primary focus: infra layer. Semantic field checks only.
  */
 
-import { semanticStoresEqual } from './convergence.js'
+import { formatSemanticDivergence, waitForConvergence } from './convergence.js'
 import type { FleetOps, InvariantSpec, SemanticStoreView, WalkerState } from './types.js'
 
 export interface InvariantContext {
@@ -13,6 +13,13 @@ export interface InvariantContext {
     poolEngines: string[]
     fixtureDisk: string
     engines: string[]
+    /**
+     * Settle budget for store_convergence wait/retry (same as action settle gate).
+     * Live+fast harness uses ~150s; Fake defaults follow settleParticipants.
+     */
+    settleTimeoutMs?: number
+    /** When settleTimeoutMs omitted: fast→2s, else→15s (mirrors settleParticipants). */
+    fast?: boolean
 }
 
 export interface InvariantResult {
@@ -27,16 +34,36 @@ type Evaluator = (
     views: SemanticStoreView[],
 ) => Promise<InvariantResult> | InvariantResult
 
-const evalStoreConvergence: Evaluator = (_spec, ctx, views) => {
-    if (ctx.ops.getStoreMode() !== 'shared' || views.length < 2) {
+const storeConvergenceBudgetMs = (ctx: InvariantContext): number =>
+    ctx.settleTimeoutMs ?? (ctx.fast ? 2000 : 15_000)
+
+/**
+ * Wait/retry until semantic equality (reuse waitForConvergence / settle budget).
+ * Persistent diverge → hard-fail with field-level dump. No soft-pass.
+ */
+const evalStoreConvergence: Evaluator = async (_spec, ctx, _views) => {
+    if (ctx.ops.getStoreMode() !== 'shared' || ctx.engines.length < 2) {
         return { type: 'store_convergence', ok: true, detail: 'skipped (unique or single engine)' }
     }
-    const [first, ...rest] = views
-    const ok = !!first && rest.every(v => semanticStoresEqual(first, v))
+    const timeoutMs = storeConvergenceBudgetMs(ctx)
+    const pollMs = ctx.fast ? 20 : 50
+    const result = await waitForConvergence(ctx.ops, ctx.engines, timeoutMs, { pollMs })
+    if (result.ok) {
+        return {
+            type: 'store_convergence',
+            ok: true,
+            detail: 'semantic instanceDB/diskDB/engineDB match',
+        }
+    }
+    const dump = result.views && result.views.length >= 2
+        ? formatSemanticDivergence(result.views)
+        : (result.reason ?? 'semantic fields diverge')
     return {
         type: 'store_convergence',
-        ok,
-        detail: ok ? 'semantic instanceDB/diskDB/engineDB match' : 'semantic fields diverge',
+        ok: false,
+        detail: dump.startsWith('semantic fields diverge')
+            ? dump
+            : `semantic fields diverge: ${dump}`,
     }
 }
 
@@ -197,3 +224,4 @@ export const evaluateInvariants = async (
 }
 
 export const listInvariantTypes = (): string[] => Object.keys(REGISTRY)
+

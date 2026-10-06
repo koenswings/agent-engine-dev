@@ -54,23 +54,71 @@ export const runWalk = async (opts: DurationOptions): Promise<WalkerResult> => {
 }
 
 /**
+ * Resolve `--start-from <N|action>` against a walk's steps.
+ * N is 1-based (matches duration_step numbering on a full walk).
+ * Action name → first matching step. Throws on past-end / unknown action.
+ */
+export const resolveWalkStartIndex = (
+    steps: { action: string }[],
+    startFrom: number | string,
+): number => {
+    const raw = typeof startFrom === 'number' ? startFrom : String(startFrom).trim()
+    if (typeof raw === 'number' || /^\d+$/.test(raw)) {
+        const n = typeof raw === 'number' ? raw : Number(raw)
+        if (!Number.isInteger(n) || n < 1) {
+            throw new Error(
+                `--start-from: expected 1-based step number >= 1, got ${JSON.stringify(startFrom)}`,
+            )
+        }
+        if (n > steps.length) {
+            throw new Error(`--start-from ${n}: past end (walk has ${steps.length} steps)`)
+        }
+        return n - 1
+    }
+    const action = String(raw)
+    if (!action) {
+        throw new Error('--start-from: empty value')
+    }
+    const idx = steps.findIndex(s => s.action === action)
+    if (idx < 0) {
+        throw new Error(`--start-from: unknown action '${action}' in walk`)
+    }
+    return idx
+}
+
+/**
  * Deterministic walk runner — executes WalkDefinition.steps in order.
  * Same action dispatch, invariants, dwell/stability as Markov runWalk.
  * `--iterations` defaults to steps.length and is capped at steps.length.
+ * `--start-from` (optional): slice from 1-based step N or first matching action,
+ * seed walker.current to that step's `from`. When both set, start-from applies
+ * first, then iterations truncates the remaining slice.
  */
 export const runDeterministicWalk = async (
     walk: WalkDefinition,
     opts: Omit<DurationOptions, 'scenario' | 'iterations'> & {
         iterations?: number
+        /** 1-based step number or action name — see resolveWalkStartIndex. */
+        startFrom?: number | string
     },
 ): Promise<WalkerResult> => {
-    const maxSteps = walk.steps.length
+    const startIndex = opts.startFrom !== undefined
+        ? resolveWalkStartIndex(walk.steps, opts.startFrom)
+        : 0
+    const fromStart = walk.steps.slice(startIndex)
+    const maxSteps = fromStart.length
     const iterations = Math.min(opts.iterations ?? maxSteps, maxSteps)
+    const steps = fromStart.slice(0, iterations)
+    const seedCurrent = steps[0]?.from ?? walk.scenario.initial_state
+    const seedLayer = walk.scenario.states[seedCurrent]?.layer ?? null
     return runWalkWithSteps({
         ...opts,
         scenario: walk.scenario,
         iterations,
-        steps: walk.steps.slice(0, iterations),
+        steps,
+        initialCurrent: seedCurrent,
+        initialLayer: seedLayer,
+        stepNumberBase: startIndex,
     })
 }
 
@@ -78,7 +126,14 @@ type StepSpec = { from?: string; to: string; action: string }
 
 /** Shared executor: Markov-picked transitions OR explicit walk steps. */
 const runWalkWithSteps = async (
-    opts: DurationOptions & { steps?: StepSpec[] },
+    opts: DurationOptions & {
+        steps?: StepSpec[]
+        /** Prefer A --start-from: seed walker.current before first step. */
+        initialCurrent?: string
+        initialLayer?: Layer | null
+        /** Prefer A --start-from: duration_step numbers stay aligned with original walk. */
+        stepNumberBase?: number
+    },
 ): Promise<WalkerResult> => {
     const scenario = opts.scenario
     const rng = opts.rng ?? (scenario.seed !== undefined ? makeRng(scenario.seed) : Math.random)
@@ -105,11 +160,12 @@ const runWalkWithSteps = async (
 
     await fullOpts.ops.applyStoreMode(scenario.store_mode ?? fullOpts.ops.getStoreMode())
 
+    const stepNumberBase = opts.stepNumberBase ?? 0
     const walker: WalkerState = {
-        current: scenario.initial_state,
-        layer: null,
+        current: opts.initialCurrent ?? scenario.initial_state,
+        layer: opts.initialLayer ?? null,
         dockedEngine: null,
-        step: 0,
+        step: stepNumberBase,
     }
 
     const logs: StructuredLogEntry[] = []
@@ -132,17 +188,18 @@ const runWalkWithSteps = async (
         let action: string
         if (useExplicit) {
             const step = opts.steps![i]!
+            const walkStepNo = stepNumberBase + i + 1
             if (step.from !== undefined && step.from !== walker.current) {
                 aborted = true
                 abortReason =
-                    `walk step ${i + 1}: expected from '${step.from}' but current is '${walker.current}'`
+                    `walk step ${walkStepNo}: expected from '${step.from}' but current is '${walker.current}'`
                 break
             }
             const edgeOk = stateDef.transitions.some(t => t.to === step.to && t.action === step.action)
             if (!edgeOk) {
                 aborted = true
                 abortReason =
-                    `walk step ${i + 1}: no edge ${walker.current} --${step.action}--> ${step.to}`
+                    `walk step ${walkStepNo}: no edge ${walker.current} --${step.action}--> ${step.to}`
                 break
             }
             to = step.to
@@ -206,6 +263,8 @@ const runWalkWithSteps = async (
                     poolEngines: pool,
                     fixtureDisk,
                     engines: pool,
+                    settleTimeoutMs: fullOpts.settleTimeoutMs,
+                    fast: fullOpts.fast,
                 })
                 invResults = evaluated
                 for (const inv of evaluated) {
@@ -252,7 +311,7 @@ const runWalkWithSteps = async (
             }
         }
 
-        walker.step = i + 1
+        walker.step = stepNumberBase + i + 1
         const entry: StructuredLogEntry = {
             ts: nowIso(),
             step: walker.step,
@@ -305,7 +364,8 @@ const runWalkWithSteps = async (
     }
 
     return {
-        steps: walker.step,
+        // Executed step count (duration_step log entries keep original walk numbering via stepNumberBase).
+        steps: logs.length,
         failures,
         finalState: walker.current,
         logs,

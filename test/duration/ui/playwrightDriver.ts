@@ -79,6 +79,52 @@ type PlaywrightModule = {
     }
 }
 
+type PwLocator = {
+    first: () => PwLocator
+    isVisible: () => Promise<boolean>
+    click: () => Promise<void>
+    waitFor: (o: { state: 'visible'; timeout: number }) => Promise<void>
+    isDisabled: () => Promise<boolean>
+    getAttribute: (name: string) => Promise<string | null>
+}
+type PwPage = {
+    locator: (sel: string) => PwLocator
+    reload: () => Promise<unknown>
+    waitForTimeout: (ms: number) => Promise<void>
+    evaluate?: <T>(fn: () => T) => Promise<T>
+}
+
+/** r30 reboot_engine: one Console NetworkTree engine row as seen in the DOM. */
+export type ConsoleEngineRow = { testId: string; label: string; online: boolean }
+
+/**
+ * r30: is `hostname` shown online? Console 0760c01/c981361 NetworkTree renders
+ * `[data-testid="engine-<storeId>"]` with `.tree-item__label` = hostname and
+ * `.tree-item__status-dot--online` (lastRun within 90s); the status bar shows
+ * `.status-bar__dot--connected` while the Console's own WS is up.
+ */
+export const consoleEngineOnline = (
+    rows: ConsoleEngineRow[],
+    statusConnected: boolean,
+    hostname: string,
+): { ok: boolean; detail: string } => {
+    const want = hostname.trim().replace(/\.local$/i, '').toLowerCase()
+    const row = rows.find(r => r.label.trim().replace(/\.local$/i, '').toLowerCase() === want)
+    const seen = rows.map(r => `${r.label || '?'}=${r.online ? 'online' : 'offline'}`).join(', ') || 'none'
+    if (!statusConnected) return { ok: false, detail: `status bar not connected; rows=[${seen}]` }
+    if (!row) return { ok: false, detail: `no engine row labelled ${hostname}; rows=[${seen}]` }
+    if (!row.online) return { ok: false, detail: `engine row ${row.testId} (${row.label}) offline; rows=[${seen}]` }
+    return { ok: true, detail: `engine row ${row.testId} (${row.label}) online; status bar connected` }
+}
+
+/** Prefer A r21: Console NetworkTree disk row testid (Pixel sel.disk). */
+export const diskRowSelector = (diskId: string): string => {
+    if (!/^[A-Za-z0-9._-]+$/.test(diskId)) {
+        throw new Error(`diskRowSelector: refuse unsafe diskId '${diskId}'`)
+    }
+    return `[data-testid="disk-${diskId}"]`
+}
+
 const here = dirname(fileURLToPath(import.meta.url))
 
 const candidateIntentDirs = (explicit?: string): string[] => {
@@ -356,6 +402,120 @@ export class PlaywrightUiDriver implements UiDriver {
                 message: `Playwright Intent '${ctx.action}' failed: ${raw}`,
             }
         }
+    }
+
+    /**
+     * Prefer A r21: pin an EmptyDiskPanel Intent to `disk-<diskId>` by testid.
+     * Polls the NetworkTree (reloading every ~10s so a fresh re-dock appears), clicks
+     * the row, and optionally waits for `empty-disk-panel`. Throws if never visible —
+     * do not let Pixel discovery fall through to another Empty Disk (r21: Empty Disk 002).
+     */
+    async selectDisk(
+        diskId: string,
+        opts: { timeoutMs?: number; requireEmptyPanel?: boolean; requireAddFiles?: boolean } = {},
+    ): Promise<string> {
+        await this.ensureReady()
+        const page = this.page as PwPage
+        const rowSel = diskRowSelector(diskId)
+        const panelSel = '[data-testid="empty-disk-panel"]'
+        // Prefer A r22 FAIL@93: add_files_role needs Add Files on the app-only DiskView.
+        const addFilesSel = '[data-testid="add-files"]'
+        let addFilesState = 'not visible'
+        const budget = opts.timeoutMs ?? 60_000
+        const deadline = Date.now() + budget
+        let lastReload = Date.now()
+        let clicked = false
+        while (Date.now() < deadline) {
+            const row = page.locator(rowSel).first()
+            if (await row.isVisible().catch(() => false)) {
+                await row.click()
+                clicked = true
+                if (opts.requireAddFiles) {
+                    const btn = page.locator(addFilesSel).first()
+                    try {
+                        await btn.waitFor({ state: 'visible', timeout: 5_000 })
+                        if (!(await btn.isDisabled().catch(() => false))) {
+                            return `selected ${rowSel} (Add Files visible)`
+                        }
+                        addFilesState = `disabled (title="${((await btn.getAttribute('title').catch(() => null)) ?? '').trim()}")`
+                    } catch {
+                        /* store may still be converging (app role / dock) — retry */
+                    }
+                    if (Date.now() - lastReload > 10_000) {
+                        lastReload = Date.now()
+                        await page.reload().catch(() => undefined)
+                    }
+                    await page.waitForTimeout(500)
+                    continue
+                }
+                if (!opts.requireEmptyPanel) return `selected ${rowSel}`
+                try {
+                    await page.locator(panelSel).first().waitFor({ state: 'visible', timeout: 5_000 })
+                    return `selected ${rowSel} (EmptyDiskPanel visible)`
+                } catch {
+                    /* store may still be converging — retry */
+                }
+            }
+            if (Date.now() - lastReload > 10_000) {
+                lastReload = Date.now()
+                await page.reload().catch(() => undefined)
+            }
+            await page.waitForTimeout(500)
+        }
+        if (opts.requireAddFiles) {
+            throw new Error(
+                `selectDisk: ${rowSel} ${clicked ? `clicked but ${addFilesSel} ${addFilesState}` : 'never visible in NetworkTree'} ` +
+                    `within ${budget}ms. Prefer A r22 — add_files_role needs Add Files on an app-only disk; ` +
+                    `no soft-pass / no remap onto the make_files_disk Files Disk.`,
+            )
+        }
+        throw new Error(
+            `selectDisk: ${rowSel} ${clicked ? 'clicked but EmptyDiskPanel never visible' : 'never visible in NetworkTree'} ` +
+                `within ${budget}ms. Prefer A — refuse to act on another Empty Disk.`,
+        )
+    }
+
+    /** r30 reboot_engine: see UiDriver.waitEngineOnline. */
+    async waitEngineOnline(
+        hostname: string,
+        opts: { timeoutMs?: number; allowReload?: boolean } = {},
+    ): Promise<string> {
+        await this.ensureReady()
+        const page = this.page as PwPage
+        if (typeof page.evaluate !== 'function') {
+            throw new Error('waitEngineOnline: Playwright page has no evaluate()')
+        }
+        const budget = opts.timeoutMs ?? 180_000
+        const start = Date.now()
+        let reloaded = false
+        let last = 'not sampled'
+        while (Date.now() - start < budget) {
+            const snap = await page
+                .evaluate(() => {
+                    const rows = Array.from(document.querySelectorAll('.tree-item--engine')).map(el => ({
+                        testId: el.getAttribute('data-testid') ?? '',
+                        label: (el.querySelector('.tree-item__label')?.textContent ?? '').trim(),
+                        online: !!el.querySelector('.tree-item__status-dot--online'),
+                    }))
+                    const statusConnected = !!document.querySelector('.status-bar__dot--connected')
+                    return { rows, statusConnected }
+                })
+                .catch((e: unknown) => ({ rows: [] as ConsoleEngineRow[], statusConnected: false, err: String(e) }))
+            const verdict = consoleEngineOnline(snap.rows, snap.statusConnected, hostname)
+            if (verdict.ok) {
+                return `${verdict.detail} after ${Date.now() - start}ms${reloaded ? ' (after one allowed reload)' : ''}`
+            }
+            last = verdict.detail
+            if (opts.allowReload && !reloaded && Date.now() - start > budget / 2) {
+                reloaded = true
+                await page.reload().catch(() => undefined)
+            }
+            await page.waitForTimeout(1_000)
+        }
+        throw new Error(
+            `Console did not show ${hostname} online within ${budget}ms (${last})` +
+                `${opts.allowReload ? '' : '; no reload attempted (DURATION_REBOOT_ALLOW_RELOAD=1 allows one)'}`,
+        )
     }
 
     /**

@@ -49,5 +49,21 @@ copyApp + moveApp commands and rsync infrastructure. Covers Operation store type
 Per-command log capture via AsyncLocalStorage + Automerge CommandLogStore.
 
 ## duration-tests.md
-**Status:** Proposed · **Author:** Axle
-Markov-model duration tests: simulate a school day (reboots, disk swaps, engine changes) from YAML scenarios and verify invariants, including Automerge convergence across all engines.
+**Status:** Proposed — unified source of truth · **Authors:** Axle; Steve (Lead Bot); unified 2026-09-30
+Canonical Markov **duration tests** for continuous long-running school operation: one graph / one runner with **Usage** (classroom), **Operator** (Console manage/alter), and **Infra/fleet** layers; per-state Return-to-start black-circle shortcuts; YAML for all layers; Implementation chapter; shared-store policy; Automerge invariants. Graphs: `duration-tests-{hub,usage-*,operator-*,infra}.{dot,png,svg}` (+ pdf).
+
+## multi-engine-classroom.md
+**Status:** SUPERSEDED by [`duration-tests.md`](./duration-tests.md) — backup retained · **Author:** Steve (Lead Bot)
+Pre-unification classroom / usage Markov draft. Do not extend; content preserved for reference. See [`duration-tests.md`](./duration-tests.md).
+
+## multi-engine-operator.md
+**Status:** SUPERSEDED by [`duration-tests.md`](./duration-tests.md) — backup retained · **Author:** Steve (Lead Bot)
+Pre-unification operator Console Markov draft. Do not extend; content preserved for reference. See [`duration-tests.md`](./duration-tests.md).
+
+## duration-tests-infra-backup.md
+**Status:** SUPERSEDED by [`duration-tests.md`](./duration-tests.md) — backup retained · **Author:** Axle
+Pre-unification infra / YAML / runner duration-tests draft (2026-04-11). Absorbed into the Infra/fleet chapter of [`duration-tests.md`](./duration-tests.md).
+
+## multi-engine-classroom-scenarios.md
+**Status:** Superseded by multi-engine-classroom.md · **Author:** Steve (Lead Bot)
+Prior implementation-heavy draft of multi-Engine classroom scenarios. Kept for historical research only; do not treat as current proposal. (+ `.pdf`)

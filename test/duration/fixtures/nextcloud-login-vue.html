@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<!--
+  Stripped real Nextcloud 31 /login HTML (Vue client-rendered form).
+  Source: Atlas Path A evidence path-a-ready-r19/nc-login-page.html
+  (GET http://idea01:18280/login, HTTP 200, 2026-10-05 ~22:15 CEST).
+  Removed: requesttoken, CSP nonces, <script> blocks, large base64 initial-state
+  (config/capabilities/theming). Kept verbatim: body id, initial-state-core-* login
+  markers incl. hideLoginForm=ZmFsc2U= ("false"), and the empty <div id="login">
+  mount point. NOTE: server HTML has no user/password inputs and no submit button.
+  Context: cover-all-230b70f-r19 FAIL@58 infra_dock_fixture.
+-->
+<html class="ng-csp" data-placeholder-focus="false" lang="en" data-locale="en" translate="no" >
+	<head>
+		<meta charset="utf-8">
+		<title>
+			Login – Nextcloud		</title>
+		<link rel="stylesheet" href="/core/css/guest.css?v=dc94ad66-0">
+	</head>
+	<body id="body-login">
+		<noscript>
+	<div id="nojavascript">
+		<div>
+			This application requires JavaScript for correct operation.
+		</div>
+	</div>
+</noscript>
+		<div id="initial-state-container" style="display: none;">
+			<input type="hidden" id="initial-state-core-loginUsername" value="IiI=">
+			<input type="hidden" id="initial-state-core-loginAutocomplete" value="dHJ1ZQ==">
+			<input type="hidden" id="initial-state-core-loginThrottleDelay" value="MjUwMDA=">
+			<input type="hidden" id="initial-state-core-loginResetPasswordLink" value="IiI=">
+			<input type="hidden" id="initial-state-core-loginCanResetPassword" value="dHJ1ZQ==">
+			<input type="hidden" id="initial-state-core-emailStates" value="W10=">
+			<input type="hidden" id="initial-state-core-webauthn-available" value="dHJ1ZQ==">
+			<input type="hidden" id="initial-state-core-hideLoginForm" value="ZmFsc2U=">
+			<input type="hidden" id="initial-state-core-countAlternativeLogins" value="MA==">
+			<input type="hidden" id="initial-state-core-alternativeLogins" value="W10=">
+			<input type="hidden" id="initial-state-core-loginTimeout" value="MzAw">
+			<input type="hidden" id="initial-state-core-projects_enabled" value="ZmFsc2U=">
+			<input type="hidden" id="initial-state-core-versionHash" value="ImRjOTRhZDY2Ig==">
+	</div>
+		<div class="wrapper">
+			<div class="v-align">
+								<div>
+					<h1 class="hidden-visually">
+						Nextcloud					</h1>
+					<div>
+	<div id="login"></div>
+</div>
+				</div>
+			</div>
+		</div>
+	</body>
+</html>
