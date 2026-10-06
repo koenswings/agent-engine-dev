@@ -26,6 +26,19 @@ import { consoleDistProbeScript, parseConsoleDistProbe, type ConsoleDistProbe } 
 import { dockWaitMs, logStartMeasured } from './startBudgets.js'
 import { storeProbeScript } from './storePreflight.js'
 import { assertSameMetaIdentity, metaDiskIdIsShell } from './metaYaml.js'
+import {
+    assertSlotPath,
+    buildAssertEmptySlotRemote,
+    buildEmptySlotRemote,
+    buildQuarantineSlotContentsRemote,
+    buildSlotLayoutProbeRemote,
+    movedAwayRoot,
+    parseSlotLayoutProbe,
+    requiredSlotNames,
+    slotLayoutVerdict,
+    type SlotLayoutMode,
+    type SlotLayoutVerdict,
+} from './slotLayout.js'
 import type { DurationCommandTrace } from './actions.js'
 import {
     abandonRepo,
@@ -442,6 +455,13 @@ export type SshDockCopyRemoteArgs = {
     sentinel: string
     disksRoot: string
     watchDir: string
+    /**
+     * idea#168: slot layout of the target Pi. 'legacy' (default; no idea-app-data helper) keeps
+     * the pre-helper script byte-for-byte. 'helper': never create or remove the slot dir — empty
+     * its contents (instances/<id> via `sudo -n /usr/local/sbin/idea-app-data delete`), refuse a
+     * missing / symlinked / non-child slot.
+     */
+    slotMode?: SlotLayoutMode
     /** When true, keep instances/ (Path A --start-instances). */
     startInstances: boolean
     /** idea#168: hard-link the pack's staged services/*.tar into the slot (app packs only). */
@@ -527,6 +547,7 @@ export const parseEnsureServiceTars = (out: string): { state: string; tar: strin
  * instance data (hasHealthyFixtureTree, idea#168 r34@70) before this script runs.
  */
 export const buildSshDockCopyRemote = (args: SshDockCopyRemoteArgs): string => {
+    if (args.slotMode === 'helper') return buildSshDockCopyRemoteHelper(args)
     const { diskId, pack, src, dest, sentinel, disksRoot, watchDir, startInstances } = args
     const stripInstances = startInstances ? ':' : `rm -rf '${dest}/instances'`
     const isEmpty = pack === 'empty' || pack === 'empty-002'
@@ -602,6 +623,68 @@ export const buildSshDockCopyRemote = (args: SshDockCopyRemoteArgs): string => {
         // Atlas: chokidar needs unlink+create after eject, not mtime-only touch.
         `rm -f '${sentinel}'; sleep 5; touch '${sentinel}'`,
     )
+    return parts.join('; ')
+}
+
+/**
+ * idea#168 helper layout (the Pi has /usr/local/sbin/idea-app-data): same dock copy, but the
+ * harness never creates or removes the slot dir. The disks root is root-owned (no mkdir of it),
+ * the slot must already exist (Atlas pre-creates it). Empty packs: the slot's contents are
+ * emptied (root-owned instances/<id> through `sudo -n /usr/local/sbin/idea-app-data delete
+ * <slot> <id>`, never rm) before the fresh copy. App packs: reuse a matching tree as before;
+ * otherwise the slot must be EMPTY (else "refuse overwrite occupied", exit 4) and is filled in
+ * place. Slot refusals (symlink / missing / not a direct child) exit 7 (loud, not "occupied").
+ */
+export const buildSshDockCopyRemoteHelper = (args: SshDockCopyRemoteArgs): string => {
+    const { diskId, pack, src, dest, sentinel, disksRoot, watchDir, startInstances } = args
+    const slot = dest.slice(dest.lastIndexOf('/') + 1)
+    if (`${disksRoot}/${slot}` !== dest) {
+        throw new Error(`RealFleetOps: refuse dock copy into ${dest} (not a direct child of ${disksRoot})`)
+    }
+    assertSlotPath(disksRoot, slot)
+    const isEmptyPack = pack === 'empty' || pack === 'empty-002'
+    const ensureTars = !isEmptyPack && args.serviceTars && args.serviceTars.tars.length
+        ? `${buildEnsureServiceTarsRemote(dest, args.serviceTars.root, args.serviceTars.tars).replace(/^set -euo pipefail; /, '')}; `
+        : ''
+    const parts: string[] = [
+        'set -euo pipefail',
+        // The disks root is root-owned in the helper layout: only the (pi-owned) watch dir is made.
+        `mkdir -p '${watchDir}'`,
+        `echo "RealFleetOps: slot layout helper on this Pi — ${dest} is emptied/filled in place, never created or removed"`,
+    ]
+    if (isEmptyPack) {
+        parts.push(
+            `if test -f '${dest}/META.yaml' && ! ${metaDiskIdIsShell(`'${dest}/META.yaml'`, diskId)}; then ` +
+            `echo "RealFleetOps: refuse overwrite occupied ${dest} (no matching META for ${diskId})" >&2; exit 4; fi`,
+            `test -d '${src}' || { echo "missing fixture source ${src}" >&2; exit 2; }`,
+            `echo "RealFleetOps: empty pack always fresh-copy into ${dest} (contents emptied, slot dir kept)"`,
+            buildEmptySlotRemote({ disksRoot, slot, mode: 'helper' }),
+        )
+    } else {
+        parts.push(
+            `if ${metaDiskIdIsShell(`'${dest}/META.yaml'`, diskId)}; then ` +
+            `echo "RealFleetOps: reuse existing Path A tree at ${dest}"; ` +
+            ensureTars +
+            `rm -f '${sentinel}'; sleep 5; touch '${sentinel}'; exit 0; fi`,
+            `if test -d '${dest}' && ! test -L '${dest}' && [ -n "$(find '${dest}' -mindepth 1 -maxdepth 1 ! -name lost+found -print -quit)" ]; then ` +
+            `echo "RealFleetOps: refuse overwrite occupied ${dest} (no matching META for ${diskId})" >&2; exit 4; fi`,
+            `test -d '${src}' || { echo "missing fixture source ${src}" >&2; exit 2; }`,
+            buildAssertEmptySlotRemote({ disksRoot, slot, mode: 'helper' }),
+        )
+    }
+    parts.push(`cp -a '${src}/.' '${dest}/'`)
+    // Fresh copy of a Kid seed pack (pi-owned, no running instance): plain rm inside the slot.
+    if (!startInstances) parts.push(`rm -rf '${dest}/instances'`)
+    if (isEmptyPack) {
+        // createFilesDisk allows only META.yaml + lost+found on empty roots (strip README.md etc.).
+        parts.push(
+            buildEmptySlotRemote({ disksRoot, slot, mode: 'helper', keep: ['META.yaml'] }),
+            `echo "RealFleetOps: stripped non-META entries from empty pack at ${dest} (createFilesDisk-clean)"`,
+        )
+    }
+    parts.push(`test -f '${dest}/META.yaml' || { echo "META.yaml missing after copy into ${dest}" >&2; exit 3; }`)
+    if (ensureTars) parts.push(ensureTars.replace(/; $/, ''))
+    parts.push(`rm -f '${sentinel}'; sleep 5; touch '${sentinel}'`)
     return parts.join('; ')
 }
 
@@ -743,18 +826,25 @@ export const parseInstanceDataCheck = (out: string): { ok: boolean; detail: stri
     return { ok, detail: line.replace(/^INSTANCE_DATA_(OK|MISSING)\s*/, '') }
 }
 
-export type FixtureSlotState = 'MATCH' | 'OTHER' | 'NOMETA' | 'FREE'
+/**
+ * EMPTY (idea#168 helper layout): an existing real dir with nothing in it (lost+found aside) —
+ * an Atlas pre-created slot. Only helper-mode Pis use EMPTY as the free slot; legacy Pis keep
+ * using FREE (path absent) exactly as before.
+ */
+export type FixtureSlotState = 'MATCH' | 'OTHER' | 'NOMETA' | 'EMPTY' | 'FREE'
 
-/** One read-only pass over idea-test-1..8: META diskId match / other pack / no META / free. */
+/** One read-only pass over idea-test-1..8: META diskId match / other pack / no META / empty dir / free. */
 export const buildFixtureSlotScanRemote = (disksRoot: string, diskId: string): string =>
     `for d in ${fixtureSlotNames().join(' ')}; do p=${shq(disksRoot)}/$d; ` +
     `if test -f "$p/META.yaml"; then if ${metaDiskIdIsShell('"$p/META.yaml"', diskId)}; then s=MATCH; else s=OTHER; fi; ` +
-    `elif test -e "$p" || test -L "$p"; then s=NOMETA; else s=FREE; fi; ` +
+    `elif test -L "$p"; then s=NOMETA; ` +
+    `elif test -d "$p" && [ -z "$(find "$p" -mindepth 1 -maxdepth 1 ! -name lost+found -print -quit 2>/dev/null)" ]; then s=EMPTY; ` +
+    `elif test -e "$p"; then s=NOMETA; else s=FREE; fi; ` +
     `m=; if mountpoint -q "$p" 2>/dev/null; then m=' mount'; fi; echo "SLOT $d $s$m"; done`
 
 export const parseFixtureSlotScan = (out: string): { device: string; state: FixtureSlotState; mount: boolean }[] =>
     String(out ?? '').split('\n').map(l => l.trim())
-        .map(l => /^SLOT (idea-test-[0-9]+) (MATCH|OTHER|NOMETA|FREE)( mount)?$/.exec(l))
+        .map(l => /^SLOT (idea-test-[0-9]+) (MATCH|OTHER|NOMETA|EMPTY|FREE)( mount)?$/.exec(l))
         .filter((m): m is RegExpExecArray => !!m)
         .map(m => ({ device: m[1]!, state: m[2] as FixtureSlotState, mount: !!m[3] }))
 
@@ -942,6 +1032,16 @@ export const buildTreeReceiveRemote = (staging: string, sudoMode: SudoMode): str
     `set -euo pipefail; ${sudoPreamble(sudoMode)}; $S rm -rf ${shq(staging)}; mkdir -p ${shq(staging)}; ` +
     `$S tar --numeric-owner -xpf - -C ${shq(staging)}`
 
+/**
+ * idea#168 helper layout — target: unpack the stream straight into the pre-created EMPTY slot
+ * (the harness never creates a staging dir in the root-owned disks root, nor renames one into
+ * place). Refuses unless the slot exists, is a real dir, a direct child of the disks root and
+ * empty. The sentinel is fired only after the verify, so the Engine does not dock it earlier.
+ */
+export const buildTreeReceiveIntoSlotRemote = (disksRoot: string, slot: string, sudoMode: SudoMode): string =>
+    `set -euo pipefail; ${sudoPreamble(sudoMode)}; ${buildAssertEmptySlotRemote({ disksRoot, slot, mode: 'helper' })}; ` +
+    `$S tar --numeric-owner -xpf - -C ${shq(`${disksRoot}/${slot}`)}`
+
 /** idea#168 r38: META.yaml is compared parsed (diskId + created), never in a byte digest. */
 export const META_DIGEST_EXCLUDE: readonly string[] = ['META.yaml']
 
@@ -1096,6 +1196,8 @@ export class RealFleetOps implements FleetOps {
     private readonly liveIds = new Map<string, string>()
     /** live engineDB key → logical pool id */
     private readonly logicalIds = new Map<string, string>()
+    /** idea#168: per-engine slot layout verdict (helper vs legacy), probed once over read-only ssh. */
+    private readonly slotLayouts = new Map<string, SlotLayoutVerdict>()
     /** logicalEngine → diskId → idea-test-N device slot */
     private readonly deviceByEngineDisk = new Map<string, Map<string, string>>()
     /** logicalEngine → set of idea-test-N in use */
@@ -1182,6 +1284,57 @@ export class RealFleetOps implements FleetOps {
     }
 
     /** idea#168 r38 store preflight: READ-ONLY probe (config.yaml, store-url.txt, pm2.config.cjs, Engine env keys). */
+    /**
+     * idea#168: read-only probe of one Pi's slot layout — does it have the app-data root helper
+     * (`/usr/local/sbin/idea-app-data` exists and `sudo -n … version` answers), the disks root's
+     * owner/mode, the required slots, the helper's root bridge. Tests override this.
+     */
+    protected async probeSlotLayout(engineId: string): Promise<SlotLayoutVerdict> {
+        this.assertNotExcluded(engineId, 'probeSlotLayout')
+        assertPrivateDurationRoots(this.disksRoot, this.watchDir)
+        const host = this.hostOf(engineId)
+        const slots = requiredSlotNames()
+        const out = await this.ssh(host, buildSlotLayoutProbeRemote(this.disksRoot, slots))
+        return slotLayoutVerdict(engineId, host, this.disksRoot, parseSlotLayoutProbe(out), slots)
+    }
+
+    /**
+     * idea#168: the slot-layout preflight for each engine (logs nothing itself; the CLI logs
+     * `slot_layout_preflight`). Caches each verdict for the walk. A probe that fails over SSH is
+     * a FAIL (never a silent legacy).
+     */
+    async preflightSlotLayout(engines: readonly string[]): Promise<SlotLayoutVerdict[]> {
+        const out: SlotLayoutVerdict[] = []
+        for (const id of engines) {
+            let v: SlotLayoutVerdict
+            try {
+                v = await this.probeSlotLayout(id)
+            } catch (e) {
+                const host = this.hostOf(id)
+                const why = e instanceof Error ? e.message : String(e)
+                v = {
+                    engine: id, host, mode: 'legacy', ok: false, helperVersion: null, problems: [`slot layout probe failed: ${why}`],
+                    message: `slot_layout_preflight: ${id} (${host}): mode=UNKNOWN — FAIL: slot layout probe failed over SSH: ${why}`,
+                }
+            }
+            if (v.ok) this.slotLayouts.set(id, v)
+            out.push(v)
+        }
+        return out
+    }
+
+    /** idea#168: slot layout in force on engineId (probes once if the preflight did not run; loud on a bad helper layout). */
+    async slotModeOf(engineId: string): Promise<SlotLayoutMode> {
+        let v = this.slotLayouts.get(engineId)
+        if (!v) {
+            v = await this.probeSlotLayout(engineId)
+            console.log(`[RealFleetOps] ${v.message}`)
+            if (!v.ok) throw new Error(`RealFleetOps: ${v.message}`)
+            this.slotLayouts.set(engineId, v)
+        }
+        return v.mode
+    }
+
     async probeStoreConfig(engineId: string): Promise<string> {
         this.assertNotExcluded(engineId, 'probeStoreConfig')
         if (isNeverStoreProbe(engineId)) throw new Error(`RealFleetOps: probeStoreConfig refused for '${engineId}' (never idea02)`)
@@ -2320,6 +2473,7 @@ export class RealFleetOps implements FleetOps {
         // Prefer cp -a (always on Pi). Drop instances/ unless startInstances so
         // Engine docks without auto-starting Kolibri/Nextcloud (image not required).
         const pack = resolveDurationFixturePack(diskId)
+        const slotMode = await this.slotModeOf(engineId)
         const remote = buildSshDockCopyRemote({
             diskId,
             pack,
@@ -2328,11 +2482,12 @@ export class RealFleetOps implements FleetOps {
             sentinel,
             disksRoot: this.disksRoot,
             watchDir: this.watchDir,
+            slotMode,
             startInstances: this.startInstances,
             serviceTars: this.serviceTarsFor(diskId),
         })
         console.log(
-            `[RealFleetOps] dock copy ${diskId} → ${engineId}:${dest} ` +
+            `[RealFleetOps] dock copy ${diskId} → ${engineId}:${dest} [slot layout ${slotMode}] ` +
             `(sentinel ${sentinel}, startInstances=${this.startInstances}` +
             `${this.serviceTarsFor(diskId) ? `, services/*.tar from ${this.serviceTarsFor(diskId)!.root}` : ''})`,
         )
@@ -2775,16 +2930,22 @@ export class RealFleetOps implements FleetOps {
             )
         }
         const used = this.usedSet(toEngine)
-        const free = dstSlots.find(sl => sl.state === 'FREE' && !used.has(sl.device))
+        // idea#168: a legacy Pi's free slot is an absent path (FREE, created by the commit); a
+        // helper Pi's is an Atlas pre-created EMPTY slot, filled in place (never created/removed).
+        const dstMode = await this.slotModeOf(toEngine)
+        const srcMode = await this.slotModeOf(fromEngine)
+        const freeState = dstMode === 'helper' ? 'EMPTY' : 'FREE'
+        const free = dstSlots.find(sl => sl.state === freeState && !used.has(sl.device))
         if (!free) {
             throw new Error(
                 `target ${toEngine} (${dstHost}): no free idea-test-1..${FIXTURE_SLOT_COUNT} slot for ${diskId} ` +
-                    `(${dstSlots.map(sl => `${sl.device}=${sl.state}`).join(' ')})`,
+                    `(slot layout ${dstMode}: needs a ${freeState} slot; ` +
+                    `${dstSlots.map(sl => `${sl.device}=${sl.state}`).join(' ')})`,
             )
         }
         const dstDevice = free.device
         const dstSlot = `${this.disksRoot}/${dstDevice}`
-        const staging = `${this.disksRoot}/.incoming-${dstDevice}-${diskId}`
+        const staging = dstMode === 'helper' ? dstSlot : `${this.disksRoot}/.incoming-${dstDevice}-${diskId}`
 
         // 2b. idea#168 r35@62: no foreign container may use the source slot's data. Own instances
         // are stopped by the eject; anything else would keep writing while we tar.
@@ -2838,7 +2999,9 @@ export class RealFleetOps implements FleetOps {
             console.log(`[RealFleetOps] moveDisk ${diskId}: streaming ${fromEngine}:${srcSlot} → ${toEngine}:${staging}`)
             await this.relayPipe(
                 srcHost, buildTreeSendRemote(srcSlot, moveExclude, this.sudoMode, skipPatterns),
-                dstHost, buildTreeReceiveRemote(staging, this.sudoMode),
+                dstHost, dstMode === 'helper'
+                    ? buildTreeReceiveIntoSlotRemote(this.disksRoot, dstDevice, this.sudoMode)
+                    : buildTreeReceiveRemote(staging, this.sudoMode),
             )
             phase('stream')
             // 5. Verify content.
@@ -2886,7 +3049,11 @@ export class RealFleetOps implements FleetOps {
                 }
             }
             // 6. Commit on the target and re-check its instance data there.
-            await this.ssh(dstHost, buildCommitMovedTreeRemote(staging, dstSlot, this.sudoMode))
+            if (dstMode === 'helper') {
+                console.log(`[RealFleetOps] moveDisk ${diskId}: ${toEngine}:${dstSlot} received in place (slot layout helper: no staging dir, no rename)`)
+            } else {
+                await this.ssh(dstHost, buildCommitMovedTreeRemote(staging, dstSlot, this.sudoMode))
+            }
             if (moveTars) {
                 const out = await this.ssh(dstHost, buildEnsureServiceTarsRemote(dstSlot, moveTars.root, moveTars.tars))
                 const linked = parseEnsureServiceTars(out)
@@ -2901,10 +3068,17 @@ export class RealFleetOps implements FleetOps {
             phase('verify+commit')
         } catch (e) {
             // idea#168 r35@62: verify the staging is really gone instead of assuming the rm worked.
-            const cleanup = await this.ssh(dstHost, buildStagingCleanupRemote(staging, this.sudoMode))
-                .catch(err => `STAGING_UNKNOWN ${err instanceof Error ? err.message : String(err)}`)
+            // Helper layout: the "staging" is the target slot itself — empty its contents, keep the dir.
+            const cleanup = dstMode === 'helper'
+                ? await this.ssh(dstHost, buildEmptySlotRemote({ disksRoot: this.disksRoot, slot: dstDevice, mode: 'helper' }))
+                    .then(out => /SLOT_EMPTIED/.test(out) ? 'STAGING_GONE' : `STAGING_UNKNOWN ${out}`)
+                    .catch(err => `STAGING_LEFT ${err instanceof Error ? err.message : String(err)}`.slice(0, 400))
+                : await this.ssh(dstHost, buildStagingCleanupRemote(staging, this.sudoMode))
+                    .catch(err => `STAGING_UNKNOWN ${err instanceof Error ? err.message : String(err)}`)
             const left = /STAGING_LEFT\s*(.*)/.exec(cleanup)
-            const stagingState = /STAGING_GONE/.test(cleanup)
+            const stagingState = dstMode === 'helper' && /STAGING_GONE/.test(cleanup)
+                ? `Target slot ${toEngine}:${staging} emptied (verified empty; slot dir kept)`
+                : /STAGING_GONE/.test(cleanup)
                 ? `Staging ${toEngine}:${staging} removed (verified absent)`
                 : left
                     ? `Staging ${toEngine}:${staging} NOT removed (still there: ${left[1]!.trim()}) — remove it before the next run`
@@ -2923,9 +3097,19 @@ export class RealFleetOps implements FleetOps {
 
         // 7. The disk has left the source host.
         const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-        const quarantine = `${this.disksRoot}/.moved-away/${srcDevice}-${diskId}-${stamp}`
-        await this.ssh(srcHost, buildQuarantineSourceRemote(srcSlot, quarantine))
-        console.log(`[RealFleetOps] moveDisk ${diskId}: source slot ${fromEngine}:${srcSlot} → ${quarantine} (disk left ${fromEngine})`)
+        if (srcMode === 'helper') {
+            // Helper layout: the slot dir stays (Atlas's); its contents move out of the disks root.
+            const quarantine = `${movedAwayRoot(this.disksRoot)}/${srcDevice}-${diskId}-${stamp}`
+            await this.ssh(srcHost, buildQuarantineSlotContentsRemote({ disksRoot: this.disksRoot, slot: srcDevice, quarantine }))
+            console.log(
+                `[RealFleetOps] moveDisk ${diskId}: source slot ${fromEngine}:${srcSlot} contents → ${quarantine} ` +
+                    `(slot dir kept, now empty; disk left ${fromEngine})`,
+            )
+        } else {
+            const quarantine = `${this.disksRoot}/.moved-away/${srcDevice}-${diskId}-${stamp}`
+            await this.ssh(srcHost, buildQuarantineSourceRemote(srcSlot, quarantine))
+            console.log(`[RealFleetOps] moveDisk ${diskId}: source slot ${fromEngine}:${srcSlot} → ${quarantine} (disk left ${fromEngine})`)
+        }
 
         // 8. Dock on the target (sentinel), wait for the store; one re-fire like dockFixture.
         const sentinel = `${this.watchDir}/${dstDevice}`

@@ -35,6 +35,7 @@ import type { StructuredLogEntry } from './types.js'
 import { EXIT_ENGINE_UNREACHABLE, installProcessGuards, timeoutSummary, walkExitCode } from './automergeTimeoutGuard.js'
 import { DEFAULT_PREFLIGHT_TIMEOUT_MS } from './realFleetOps.js'
 import { EXIT_STORE_PREFLIGHT, formatStoreMismatch, runStorePreflight } from './storePreflight.js'
+import { EXIT_SLOT_PREFLIGHT } from './slotLayout.js'
 import {
     buildRunSummary,
     formatRunSummaryLine,
@@ -87,8 +88,17 @@ const usage = () => {
                         no static peers (IDEA_STATIC_PEERS ?? settings.staticPeers); a mismatch
                         exits 6 (store_preflight, names Pi / field / expected vs actual).
                         Live store_mode must be shared (unique is refused; Fake keeps both).
+                        Slot-layout preflight (EVERY --live run; NOT skipped by --no-preflight):
+                        read-only, per pool Pi. No /usr/local/sbin/idea-app-data → mode=legacy
+                        (pre-helper slot handling, unchanged). Helper present → mode=helper,
+                        enforced: \`sudo -n idea-app-data version\` answers, the disks root is
+                        root-owned and not group/other-writable, idea-test-1..5 exist, are real
+                        dirs (no symlink) and pi-writable, and /etc/idea/app-data-roots (root:root
+                        0644) lists each; the harness then never creates or removes a slot dir
+                        (it empties slots; instances/<id> via sudo -n idea-app-data delete).
+                        A failure exits 7 (slot_layout_preflight).
   Exit codes: 0 ok · 1 walk failures · 2 fatal/refused · 4 engine unreachable ·
-              5 Console pin mismatch · 6 store preflight mismatch
+              5 Console pin mismatch · 6 store preflight mismatch · 7 slot-layout preflight
   --dwell-ms <n>        Dwell between transitions (default: 30000 / --fast 80)
   --help                this message
 
@@ -403,6 +413,24 @@ const main = async () => {
             await uiDriver.close?.().catch(() => {})
             await ops.close().catch(() => {})
             process.exit(EXIT_STORE_PREFLIGHT)
+        }
+
+        // idea#168 (Steve GO, option a): EVERY live run — which slot layout is in force on each
+        // pool Pi (helper vs legacy), and a helper Pi's layout must be what the helper needs.
+        // Read-only ssh. Legacy Pis (no helper: the current f65183a pool) pass unchanged.
+        const sl = await ops.preflightSlotLayout(pool)
+        for (const v of sl) console.log(`[duration] ${v.message}`)
+        console.log(JSON.stringify({
+            event: 'slot_layout_preflight',
+            ok: sl.every(v => v.ok),
+            pis: sl.map(v => ({ engine: v.engine, host: v.host, mode: v.ok || v.mode === 'helper' ? v.mode : 'unknown', helper_version: v.helperVersion, ok: v.ok, problems: v.problems })),
+        }))
+        if (!sl.every(v => v.ok)) {
+            for (const v of sl.filter(x => !x.ok)) console.error(`[duration] FATAL (${v.message})`)
+            console.log(JSON.stringify(timeoutSummary()))
+            await uiDriver.close?.().catch(() => {})
+            await ops.close().catch(() => {})
+            process.exit(EXIT_SLOT_PREFLIGHT)
         }
     }
 

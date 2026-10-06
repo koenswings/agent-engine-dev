@@ -194,7 +194,17 @@ ffmpeg on this box: `/usr/bin/ffmpeg`.
   (read-only ssh + the Engine's `/api/store-url` + the harness WS doc): per Pi, store id = `DURATION_EXPECTED_STORE_ID`
   (default `3zoqd`), `settings.mdns: true` and `IDEA_MDNS_DISABLE` not `true`, no `IDEA_STATIC_PEERS` /
   `settings.staticPeers`. Any mismatch → exit **6** before step 1 (Pi, field, expected vs actual). Exit codes:
-  1 walk failures · 2 fatal/refused · 4 engine unreachable · 5 Console pin · 6 store preflight.
+  1 walk failures · 2 fatal/refused · 4 engine unreachable · 5 Console pin · 6 store preflight · 7 slot-layout preflight.
+- Slot layout (idea#168, app-data root helper; `slotLayout.ts`). Every `--live` run logs `slot_layout_preflight`
+  per Pi (read-only ssh). **mode=legacy** — no `/usr/local/sbin/idea-app-data` on the Pi (the current f65183a
+  pool): slot handling unchanged (the harness creates/removes `idea-test-N` dirs, stages moves in
+  `.incoming-*`, quarantines to `.moved-away/`). **mode=helper** — the helper exists and `sudo -n … version`
+  answers `idea-app-data <N>`; enforced (else exit **7**): `duration-disks` root-owned and not g/o-writable,
+  `idea-test-1..5` exist, real dirs (no symlink), pi-writable, listed in `/etc/idea/app-data-roots`
+  (root:root 0644). In helper mode the harness never creates or removes a slot dir: it empties a slot's
+  contents (dotfiles included; refuses a symlink / missing / non-child slot), removes `instances/<id>` only via
+  `sudo -n /usr/local/sbin/idea-app-data delete <slot> <id>`, receives a move straight into a pre-created EMPTY
+  slot, and moves a moved-away slot's contents to `~/idea/duration-moved-away/` (the slot dir stays).
 - META.yaml is never compared by bytes or sha (skipMetaUpdate:false rewrites it on every dock): checks use the
   parsed `diskId` (+ `created` where two META files are compared, e.g. moveDisk); see `metaYaml.ts`.
 - `dockFixture` = rsync Kid pack → `duration-disks/idea-test-N/` + touch sentinel under `duration-watch` (excludes `instances/` so Engine does not auto-start apps). `undock` = `ejectDisk` + remove sentinel. `moveDisk` = undock then dock.

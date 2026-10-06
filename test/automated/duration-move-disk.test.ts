@@ -45,6 +45,7 @@ import {
     sudoPreamble,
 } from '../duration/realFleetOps.js'
 import type { SemanticStoreView } from '../duration/types.js'
+import { APP_DATA_HELPER, movedAwayRoot, type SlotLayoutVerdict } from '../duration/slotLayout.js'
 
 const run = promisify(execFile)
 
@@ -233,7 +234,8 @@ class LocalFleetOps extends RealFleetOps {
     private localize(host: string, cmd: string): string {
         const p = this.sb.host(host)
         const env = `export PATH=${this.sb.dir}/fakebin:$PATH FAKE_DOCKER_HOST=${host} FAKE_DOCKER_STATE=${this.sb.dir}/${host}/docker.tsv ` +
-            `FAKE_DOCKER_LOG=${this.sb.dir}/docker.log FAKE_DOCKER_BROKEN=${this.sb.dir}/${host}/docker.broken; `
+            `FAKE_DOCKER_LOG=${this.sb.dir}/docker.log FAKE_DOCKER_BROKEN=${this.sb.dir}/${host}/docker.broken ` +
+            `FAKE_HELPER_DISKS=${p.disks} FAKE_SUDO_LOG=${this.sb.dir}/sudo.log; `
         return env + cmd
             .replaceAll(this.sb.ROOT, p.disks)
             .replaceAll(this.sb.WATCH, p.watch)
@@ -910,5 +912,194 @@ describe('idea#168 r35@62: symlinks out of the slot are refused LOUDLY (dock + m
         expect(buildMountScanRemote(['/x'])).not.toMatch(/docker (stop|kill|rm|restart)/)
         expect(parseMountScan('')).toMatchObject({ error: expect.stringMatching(/incomplete/) })
         expect(parseMountScan('MOUNT_SCAN_ERR docker ps failed: x\nMOUNT_SCAN_END').error).toBe('docker ps failed: x')
+    })
+})
+
+
+// ── idea#168 (Steve GO, option a): helper slot layout — never create or remove a slot dir ─────
+
+/**
+ * Fake `sudo` (first on PATH in the sandbox): logs its argv; `sudo -n /usr/local/sbin/idea-app-data
+ * delete <slot> <id>` acts as the root helper (removes <disks>/<slot>/instances/<id> even where
+ * pi could not: u+w first); anything else is refused like a sudoers without that line.
+ */
+const FAKE_SUDO = `#!/usr/bin/env bash
+echo "sudo $*" >> "$FAKE_SUDO_LOG"
+if [ "$1" = -n ] && [ "$2" = ${APP_DATA_HELPER} ] && [ "$3" = delete ] && [ $# -eq 5 ]; then
+  d="$FAKE_HELPER_DISKS/$4/instances/$5"
+  [ -f "$FAKE_HELPER_DISKS/$4/META.yaml" ] || { echo "refused: no META.yaml" >&2; exit 2; }
+  if [ ! -e "$d" ]; then echo "ok: $d does not exist; nothing to delete" >&2; exit 0; fi
+  [ ! -L "$d" ] || { echo "refused: $d is a symlink" >&2; exit 2; }
+  chmod -R u+w "$d" && rm -rf --one-file-system -- "$d"; exit $?
+fi
+echo "sudo: a password is required" >&2; exit 1
+`
+const sudoLog = (sb: Sandbox): string[] =>
+    fs.existsSync(`${sb.dir}/sudo.log`) ? fs.readFileSync(`${sb.dir}/sudo.log`, 'utf8').split('\n').filter(Boolean) : []
+
+/** LocalFleetOps whose Pis (helperHosts) have the idea-app-data helper (the layout verdict is stubbed). */
+class HelperLocalFleetOps extends LocalFleetOps {
+    constructor(sb: Sandbox, private readonly helperHosts: readonly string[], startInstances = true) {
+        super(sb, startInstances)
+        fs.writeFileSync(`${sb.dir}/fakebin/sudo`, FAKE_SUDO, { mode: 0o755 })
+    }
+    protected override async probeSlotLayout(engineId: string): Promise<SlotLayoutVerdict> {
+        const helper = this.helperHosts.includes(engineId)
+        return {
+            engine: engineId, host: engineId, mode: helper ? 'helper' : 'legacy', ok: true,
+            helperVersion: helper ? 'idea-app-data 1' : null, problems: [], message: `stub ${engineId} ${helper ? 'helper' : 'legacy'}`,
+        }
+    }
+}
+
+/** Atlas's one-time layout on a helper Pi: idea-test-1..5 pre-created (empty). */
+const precreateSlots = (sb: Sandbox, h: string, n = 5): Record<string, number> => {
+    const inodes: Record<string, number> = {}
+    for (let i = 1; i <= n; i++) {
+        const p = `${sb.host(h).disks}/idea-test-${i}`
+        fs.mkdirSync(p, { recursive: true })
+        inodes[`idea-test-${i}`] = fs.statSync(p).ino
+    }
+    return inodes
+}
+
+/** A slot left by install_app on an empty disk: apps/, root-owned-like instances/<id> (pi cannot rm), dotfiles. */
+const plantInstalledEmpty = (sb: Sandbox, h: string, slot: string, diskId = EMPTY) => {
+    const root = `${sb.host(h).disks}/${slot}`
+    fs.mkdirSync(`${root}/apps/kolibri-1.0`, { recursive: true })
+    fs.writeFileSync(`${root}/META.yaml`, `diskId: ${diskId}\n`)
+    fs.writeFileSync(`${root}/.hidden`, 'dot\n')
+    fs.mkdirSync(`${root}/.cache/x`, { recursive: true })
+    const locked = `${root}/instances/app-1/data/locked`
+    fs.mkdirSync(locked, { recursive: true })
+    fs.writeFileSync(`${locked}/db`, 'root-owned on the Pi')
+    fs.chmodSync(locked, 0o555) // pi cannot remove db → only the "root" helper can
+    return root
+}
+
+describe('idea#168 helper slot layout: the harness never creates or removes a slot dir', () => {
+    afterEach(() => {
+        // the sandbox rm (afterEach above) needs write on any 0555 dir left behind
+        execFileSync('bash', ['-c', `chmod -R u+w ${JSON.stringify(sb.dir)} 2>/dev/null || true`])
+    })
+
+    it('empty pack on a helper Pi: slot dir kept (same inode), contents incl. dotfiles emptied, instances/<id> via sudo -n idea-app-data delete <slot> <id>', async () => {
+        const inodes = precreateSlots(sb, 'idea01')
+        const root = plantInstalledEmpty(sb, 'idea01', 'idea-test-3')
+        const ops = new HelperLocalFleetOps(sb, ['idea01'])
+        const store = stubStore(ops, sb)
+        await ops.dockFixture('idea01', EMPTY)
+        expect(store.docked.get(EMPTY)).toBe('idea01')
+        expect(fs.statSync(root).ino).toBe(inodes['idea-test-3'])
+        expect(fs.readdirSync(root).sort()).toEqual(['META.yaml'])
+        expect(fs.readFileSync(`${root}/META.yaml`, 'utf8')).toBe(`diskId: ${EMPTY}\n`)
+        expect(sudoLog(sb)).toEqual([`sudo -n ${APP_DATA_HELPER} delete idea-test-3 app-1`])
+        const dock = ops.cmds.find(c => c.cmd.includes('cp -a'))!.cmd
+        expect(dock).toContain(`sudo -n ${APP_DATA_HELPER} delete "$_sn" "$_sid"`)
+        expect(dock).not.toMatch(/rm -rf '[^']*idea-test-3'(;| )/)
+        expect(dock).not.toMatch(/mkdir -p '[^']*__DISKS__'/)
+        expect(dock).not.toMatch(/mkdir -p '[^']*idea-test-3'/)
+        // Other slots untouched, nothing else in the disks root.
+        expect(fs.readdirSync(sb.host('idea01').disks).sort()).toEqual(['idea-test-1', 'idea-test-2', 'idea-test-3', 'idea-test-4', 'idea-test-5'])
+    })
+
+    it('same installed empty slot on a LEGACY Pi keeps the old rm -rf + mkdir (unchanged) — and fails on root-owned data, as before', async () => {
+        plantInstalledEmpty(sb, 'idea01', 'idea-test-3')
+        const ops = new HelperLocalFleetOps(sb, [])
+        stubStore(ops, sb)
+        const err = await ops.dockFixture('idea01', EMPTY).then(() => null, e => e as Error)
+        expect(err?.message).toMatch(/Permission denied/)
+        const dock = ops.cmds.find(c => c.cmd.includes('cp -a'))!.cmd
+        expect(dock).toContain(`rm -rf '${sb.ROOT}/idea-test-3'; mkdir -p '${sb.ROOT}/idea-test-3'`)
+        expect(sudoLog(sb)).toEqual([])
+    })
+
+    it('helper Pi without the pre-created slot: refused LOUD (exit 7, names the slot), slot NOT created, nothing docked', async () => {
+        const ops = new HelperLocalFleetOps(sb, ['idea01'])
+        const store = stubStore(ops, sb)
+        const err = await ops.dockFixture('idea01', EMPTY).then(() => null, e => e as Error)
+        expect(err?.message).toMatch(/exit code: 7/)
+        expect(err?.message).toContain(`SLOT_REFUSED: ${sb.host('idea01').disks}/idea-test-3 does not exist — the harness never creates a slot dir (helper layout: Atlas pre-creates every slot)`)
+        expect(fs.readdirSync(sb.host('idea01').disks)).toEqual([])
+        expect(store.docked.get(EMPTY) ?? null).toBeNull()
+    })
+
+    it('helper Pi with a symlinked slot: refused LOUD, the link target is not touched', async () => {
+        precreateSlots(sb, 'idea01')
+        const elsewhere = `${sb.dir}/elsewhere`
+        fs.mkdirSync(elsewhere)
+        fs.writeFileSync(`${elsewhere}/keep.txt`, 'keep')
+        fs.rmdirSync(`${sb.host('idea01').disks}/idea-test-3`)
+        fs.symlinkSync(elsewhere, `${sb.host('idea01').disks}/idea-test-3`)
+        const ops = new HelperLocalFleetOps(sb, ['idea01'])
+        stubStore(ops, sb)
+        const err = await ops.dockFixture('idea01', EMPTY).then(() => null, e => e as Error)
+        expect(err?.message).toContain(`SLOT_REFUSED: ${sb.host('idea01').disks}/idea-test-3 is a symlink`)
+        expect(fs.readdirSync(elsewhere)).toEqual(['keep.txt'])
+        expect(fs.lstatSync(`${sb.host('idea01').disks}/idea-test-3`).isSymbolicLink()).toBe(true)
+    })
+
+    it('moveDisk idea01→idea03 on helper Pis: received IN the pre-created EMPTY slot (no .incoming, no rename); source slot kept, emptied, contents moved outside the disks root', async () => {
+        const srcInodes = precreateSlots(sb, 'idea01')
+        const dstInodes = precreateSlots(sb, 'idea03')
+        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real', { walkState: 'helper-move', services: true })
+        const srcDb = `${sb.host('idea01').disks}/idea-test-1/${DB_REL}`
+        const srcHash = sha256(srcDb)
+        fs.writeFileSync(`${sb.host('idea03').disks}/idea-test-1/META.yaml`, 'diskId: duration-nextcloud-grade5a-001\n')
+        const ops = new HelperLocalFleetOps(sb, ['idea01', 'idea03'])
+        const store = stubStore(ops, sb, { [KOLIBRI]: 'idea01' })
+        fs.writeFileSync(`${sb.host('idea01').watch}/idea-test-1`, '')
+        await ops.moveDisk('idea01', 'idea03', KOLIBRI)
+
+        const dst = `${sb.host('idea03').disks}/idea-test-2` // first EMPTY slot (idea-test-1 holds Nextcloud)
+        expect(fs.statSync(dst).ino).toBe(dstInodes['idea-test-2'])
+        expect(sha256(`${dst}/${DB_REL}`)).toBe(srcHash)
+        expect(readWalkState(`${dst}/${DB_REL}`)).toBe('helper-move')
+        expect(store.docked.get(KOLIBRI)).toBe('idea03')
+        expect(fs.readdirSync(sb.host('idea03').disks).sort()).toEqual(['idea-test-1', 'idea-test-2', 'idea-test-3', 'idea-test-4', 'idea-test-5'])
+        // Source slot: same dir, now empty; its contents are outside the disks root.
+        const src = `${sb.host('idea01').disks}/idea-test-1`
+        expect(fs.statSync(src).ino).toBe(srcInodes['idea-test-1'])
+        expect(fs.readdirSync(src)).toEqual([])
+        expect(fs.readdirSync(sb.host('idea01').disks).sort()).toEqual(['idea-test-1', 'idea-test-2', 'idea-test-3', 'idea-test-4', 'idea-test-5'])
+        const qroot = movedAwayRoot(sb.ROOT)
+        const moved = fs.readdirSync(qroot)
+        expect(moved).toHaveLength(1)
+        expect(moved[0]).toMatch(/^idea-test-1-duration-kolibri-grade5a-001-/)
+        expect(sha256(`${qroot}/${moved[0]}/${DB_REL}`)).toBe(srcHash)
+        const all = [...ops.cmds.map(c => c.cmd), ...ops.relays.flatMap(r => [r.srcCmd, r.dstCmd])]
+        expect(all.some(c => c.includes('.incoming-') || c.includes('.moved-away') || /\bmv '[^']*idea-test-\d'/.test(c))).toBe(false)
+    })
+
+    it('moveDisk on helper Pis, failed stream: the target slot is emptied and KEPT (said so); source intact', async () => {
+        precreateSlots(sb, 'idea01')
+        const dstInodes = precreateSlots(sb, 'idea03')
+        const root = plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real')
+        const srcHash = sha256(`${root}/${DB_REL}`)
+        const ops = new HelperLocalFleetOps(sb, ['idea01', 'idea03'])
+        ops.failRelayWith = 'ssh relay idea01→idea03 failed (exit code: 1): tar: kolibri: file changed as we read it'
+        stubStore(ops, sb, { [KOLIBRI]: 'idea01' })
+        fs.writeFileSync(`${sb.host('idea01').watch}/idea-test-1`, '')
+        const logs: string[] = []
+        const spy = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => { logs.push(a.map(String).join(' ')) })
+        let err: Error | null = null
+        try {
+            err = await ops.moveDisk('idea01', 'idea03', KOLIBRI).then(() => null, e => e as Error)
+        } finally {
+            spy.mockRestore()
+        }
+        expect(err?.message).toMatch(new RegExp(`Target slot idea03:.*idea-test-1 emptied \\(verified empty; slot dir kept\\)`))
+        expect(fs.statSync(`${sb.host('idea03').disks}/idea-test-1`).ino).toBe(dstInodes['idea-test-1'])
+        expect(fs.readdirSync(`${sb.host('idea03').disks}/idea-test-1`)).toEqual([])
+        expect(sha256(`${root}/${DB_REL}`)).toBe(srcHash)
+    })
+
+    it('helper target with no EMPTY slot (all occupied / absent): LOUD, names the layout and the slot states', async () => {
+        plantKolibriTree(sb, 'idea01', 'idea-test-1', 'real')
+        const ops = new HelperLocalFleetOps(sb, ['idea01', 'idea03'])
+        stubStore(ops, sb, { [KOLIBRI]: 'idea01' })
+        const err = await ops.moveDisk('idea01', 'idea03', KOLIBRI).then(() => null, e => e as Error)
+        expect(err?.message).toMatch(/no free idea-test-1\.\.8 slot .*slot layout helper: needs a EMPTY slot; idea-test-1=FREE/)
+        expect(fs.readdirSync(sb.host('idea03').disks)).toEqual([])
     })
 })
