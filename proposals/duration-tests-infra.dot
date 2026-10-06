@@ -1,0 +1,52 @@
+digraph DurationTestsInfra {
+  rankdir=LR;
+  size="14,6!";
+  bgcolor="white";
+  pad="0.40";
+  nodesep="0.45";
+  ranksep="0.65";
+  fontname="Helvetica";
+  splines=true;
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, width=1.50, height=0.55, margin="0.10,0.08"];
+  edge [fontname="Helvetica", fontsize=8, color="#555555"];
+
+  start [label="start", shape=circle, width=0.45, height=0.45, fixedsize=true, fillcolor="#eeeeee", style=filled, fontsize=10];
+subgraph cluster_infra {
+    label="Infra / fleet (pool Engines only — never golden idea02)";
+    fontsize=11;
+    style=rounded;
+    color="#E74C3C";
+    infra_idle [label="infra_idle", fillcolor="#FADBD8"];
+    infra_docked [label="infra_docked", fillcolor="#F5B7B1"];
+    infra_disk_moved [label="infra_disk_moved", fillcolor="#F1948A"];
+    infra_reboot [label="infra_reboot\n(non-golden)", fillcolor="#EC7063"];
+  }
+
+  start -> infra_idle [label="Enter infra fleet walk"];
+
+  infra_idle -> infra_docked [label="0.40"];
+  infra_idle -> infra_reboot [label="0.05"];
+  infra_idle -> infra_idle [label="0.50"];
+
+  infra_docked -> infra_idle [label="0.20"];
+  infra_docked -> infra_disk_moved [label="0.10"];
+  infra_docked -> infra_docked [label="0.60"];
+  infra_docked -> infra_reboot [label="0.05"];
+
+  infra_disk_moved -> infra_docked [label="0.50"];
+  infra_disk_moved -> infra_idle [label="0.25"];
+  infra_disk_moved -> infra_reboot [label="0.20"];
+
+  infra_reboot -> infra_idle [label="0.55"];
+  infra_reboot -> infra_docked [label="0.40"];
+
+  // Per-state Return-to-start shortcuts (dedicated black circles)
+  infra_disk_moved_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  infra_disk_moved -> infra_disk_moved_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  infra_docked_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  infra_docked -> infra_docked_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  infra_idle_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  infra_idle -> infra_idle_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  infra_reboot_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  infra_reboot -> infra_reboot_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+}

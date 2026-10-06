@@ -1,0 +1,49 @@
+digraph DurationTestsOperatorHub {
+  rankdir=TB;
+  size="14,8!";
+  bgcolor="white";
+  pad="0.35";
+  nodesep="0.35";
+  ranksep="0.50";
+  fontname="Helvetica";
+  splines=true;
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=10, width=1.40, height=0.48, margin="0.08,0.06"];
+  edge [fontname="Helvetica", fontsize=7, color="#555555"];
+
+  start [label="start", shape=circle, width=0.40, height=0.40, fixedsize=true, fillcolor="#eeeeee", style=filled, fontsize=9];
+op_entry [label="op_entry\n(open / login)", fillcolor="#D6EAF8"];
+  op_overview [label="op_overview\n(NetworkTree)", fillcolor="#85C1E9"];
+  op_account  [label="op_account", fillcolor="#D5DBDB"];
+  op_settings [label="op_settings", fillcolor="#D5DBDB"];
+  op_disk_hint [label="op_disk…\n(see disk panel)", fillcolor="#FCF3CF", style="rounded,dashed,filled"];
+
+  start -> op_entry [label="Open Console\nas operator"];
+  op_entry -> op_overview [label="Sign in 0.85"];
+  op_entry -> op_entry    [label="Retry login /\nfirst-time setup 0.15"];
+
+  op_overview -> op_disk_hint [label="Open disk inventory 0.28"];
+  op_overview -> op_account  [label="Open Account 0.06"];
+  op_overview -> op_settings [label="Open Settings 0.06"];
+  op_overview -> op_overview [label="Stay on overview 0.20"];
+  op_overview -> op_overview [label="Notice USB dock 0.12"];
+
+  op_account -> op_account  [label="Add operator 0.20"];
+  op_account -> op_account  [label="Remove operator 0.15"];
+  op_account -> op_account  [label="Change password 0.20"];
+  op_account -> op_overview [label="Close Account 0.35"];
+  op_account -> op_entry    [label="Log out 0.10"];
+
+  op_settings -> op_overview [label="Close Settings 0.50"];
+  op_settings -> op_settings [label="Switch Engine 0.25"];
+  op_settings -> op_settings [label="Reboot Engine 0.25"];
+
+  // Per-state Return-to-start shortcuts (dedicated black circles)
+  op_account_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  op_account -> op_account_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  op_entry_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  op_entry -> op_entry_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  op_overview_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  op_overview -> op_overview_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+  op_settings_ret [label="", shape=circle, width=0.18, height=0.18, fixedsize=true, fillcolor="black", style=filled, color="black"];
+  op_settings -> op_settings_ret [label="0.05", style=dashed, color="#333333", arrowsize=0.6, minlen=1];
+}

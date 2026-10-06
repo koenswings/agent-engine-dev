@@ -63,18 +63,31 @@ steps:
   - from: kolibri_home
     to: start
     action: return_to_start
+  # Prefer A cover-all-fd3b210-r11 FAIL@22 — share needs teacher; file-drop needs learner.
   - from: start
-    to: console_learner
-    action: open_console_as_learner
-  - from: console_learner
+    to: console_teacher
+    action: open_console_as_teacher
+  - from: console_teacher
     to: nc_browse
-    action: open_nextcloud_as_learner
+    action: open_nextcloud_as_teacher
   - from: nc_browse
     to: nc_share
     action: share_to_class
   - from: nc_share
     to: nc_browse
     action: done_sharing
+  - from: nc_browse
+    to: console_teacher
+    action: leave_nextcloud_as_teacher
+  - from: console_teacher
+    to: start
+    action: return_to_start
+  - from: start
+    to: console_learner
+    action: open_console_as_learner
+  - from: console_learner
+    to: nc_browse
+    action: open_nextcloud_as_learner
   - from: nc_browse
     to: nc_drop
     action: open_file_drop
@@ -216,9 +229,16 @@ steps:
   - from: nc_share
     to: console_teacher
     action: back_to_console_from_share
+  # Prefer A cover-all-aeef795-r12 FAIL@28 / Steve: later block learner before file-drop.
   - from: console_teacher
+    to: start
+    action: return_to_start
+  - from: start
+    to: console_learner
+    action: open_console_as_learner
+  - from: console_learner
     to: nc_browse
-    action: open_nextcloud_as_teacher
+    action: open_nextcloud_as_learner
   - from: nc_browse
     to: nc_drop
     action: open_file_drop
@@ -276,6 +296,20 @@ steps:
   - from: op_backup
     to: op_disk
     action: backup_configured_restored
+  # r30 (Steve, after cover-all-980e735-r29 FAIL@97): take a real backup before restore —
+  # restore_from_backup needs an archive on the Backup Disk. backup_instance is the
+  # registered Console Intent (InstanceRow Back up); it departs op_instance, so enter
+  # instance controls and come back to the disk (proposal "Backup drill" chain). Harness
+  # asserts backupApp op Done + BACKUP.yaml lastBackup bumped + backups/<id>/config.
+  - from: op_disk
+    to: op_instance
+    action: open_instance_controls
+  - from: op_instance
+    to: op_instance
+    action: backup_instance
+  - from: op_instance
+    to: op_disk
+    action: back_to_disk
   - from: op_disk
     to: op_backup
     action: restore_from_backup

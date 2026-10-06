@@ -12,9 +12,12 @@ import type { UiDriver, UiIntentContext, UiIntentResult } from './types.js'
 export class StubUiDriver implements UiDriver {
     readonly kind = 'stub' as const
     readonly calls: string[] = []
+    /** Full Intent contexts (diskId/instanceId) for fixture-remap unit asserts. */
+    readonly callContexts: UiIntentContext[] = []
 
     async runIntent(ctx: UiIntentContext): Promise<UiIntentResult> {
         this.calls.push(ctx.action)
+        this.callContexts.push(ctx)
         if (isDeferredUiIntent(ctx.action)) {
             return {
                 ok: true,

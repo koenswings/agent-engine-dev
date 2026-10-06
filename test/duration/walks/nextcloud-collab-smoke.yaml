@@ -1,0 +1,20 @@
+# HOLD LIVE: do not run --live --ui until (1) Atlas redeploys Console tip 198eb69
+# (PR #135 Prefer A: keep_editing on Nextcloud Text), and (2) Steve/Atlas GO.
+# Fake Stub OK now. open_collab_doc already needed Text @ 2da863c; keep_editing proves writes.
+#
+# Mirrors cover-all NC collab path: open_collab_doc → keep_editing → close_doc, with
+# teacher NC open/browse prelude. Prefer A: seeded Grade5A pins only
+# (duration-nextcloud-grade5a-001 / nextcloud-grade5a-001 from scenarios/unified.yaml).
+# store_mode: shared, inherited from graph unified.yaml (walk loader does not override it).
+# File Drop: see nextcloud-file-drop-smoke (also HOLD until Atlas 198eb69 + GO).
+kind: walk
+name: nextcloud-collab-smoke
+graph: unified
+steps:
+  - { from: start, to: console_teacher, action: open_console_as_teacher }
+  - { from: console_teacher, to: nc_browse, action: open_nextcloud_as_teacher }
+  - { from: nc_browse, to: nc_browse, action: browse_folders }
+  - { from: nc_browse, to: nc_collab, action: open_collab_doc }
+  - { from: nc_collab, to: nc_collab, action: keep_editing }
+  - { from: nc_collab, to: nc_browse, action: close_doc }
+  - { from: nc_browse, to: start, action: return_to_start }

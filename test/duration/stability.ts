@@ -55,7 +55,8 @@ const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
  * and confirm_eject (container gone, store still Running). Not eject_disk
  * (dialog only; container still up).
  */
-const MOVE_COPY_ACTIONS = new Set(['move_app', 'copy_app', 'infra_move_disk', 'confirm_eject'])
+// Prefer A r22: add_files_role may restore Kolibri onto the Console engine (moveDisk).
+const MOVE_COPY_ACTIONS = new Set(['move_app', 'copy_app', 'infra_move_disk', 'confirm_eject', 'add_files_role'])
 export const DEFAULT_DOCKER_MISSING_SETTLE_MS = 90_000
 export const FAST_DOCKER_MISSING_SETTLE_MS = 1_000
 /** confirm_eject stops the container before status leaves Running; --fast's 1s window is too short. */
