@@ -11,6 +11,13 @@
  *
  * Fakes record their calls in <tmp>/calls/<name>.log as JSON lines
  * {argv, cwd, env} so tests can check the exact argv.
+ *
+ * Per-Pi Engine keys: df (free space, FAKE_DF_AVAIL_KB) and runuser (drops
+ * `-u <user> --`) are fakes too; the peer files (/etc/ssh/idea_authorized_keys,
+ * /etc/idea/peer_known_hosts), the ledger folder and the Engine user point into the
+ * temp folder. script/build_image_assets/idea-peer-gate is copied the same way
+ * (runGate): its sudo is a fake that runs the sandboxed helper, so gate → helper
+ * runs end to end.
  */
 
 import { fs, path } from 'zx'
@@ -18,6 +25,7 @@ import os from 'os'
 import { spawn } from 'child_process'
 
 export const HELPER_SOURCE = path.resolve('script/build_image_assets/idea-app-data')
+export const GATE_SOURCE = path.resolve('script/build_image_assets/idea-peer-gate')
 
 export interface RunResult { exitCode: number | null, signal: string | null, stdout: string, stderr: string }
 
@@ -34,7 +42,17 @@ export interface AppDataSandbox {
     /** getent ahostsv4 table: lines "<host> <address>" */
     hosts: string
     journal: string
+    /** /etc/ssh/idea_authorized_keys (the folder) and its pi file */
+    peerAuthDir: string
+    peerAuthFile: string
+    /** /etc/idea/peer_known_hosts */
+    peerKnownHosts: string
+    /** /var/lib/idea-app-data (the receive ledger folder) */
+    ledgerDir: string
+    gateScript: string
     run: (args: string[], env?: Record<string, string>) => Promise<RunResult>
+    /** the gate as sshd runs it: argv [peerEngineId], SSH_ORIGINAL_COMMAND = cmd */
+    runGate: (gateArgs: string[], cmd: string | undefined, env?: Record<string, string>) => Promise<RunResult>
     calls: (name: string) => Promise<{ argv: string[], cwd: string, env: Record<string, string> }[]>
     fake: (name: string, body: string) => Promise<void>
     /** an Engine disk /disks/<dev> mounted from /dev/<dev> (ext4) with META.yaml and instances/ */
@@ -107,6 +125,15 @@ echo "      1,024 100%   1.00MB/s    0:00:00 (xfr#1, to-chk=0/1)"
 last="\${@: -1}"
 if [[ "$last" == /proc/self/fd/* ]]; then cp -a ./. "$last" || exit 23; fi
 exit \${FAKE_RSYNC_EXIT:-0}`)
+    // df -Pk -- <dir>: header + one line, Available = FAKE_DF_AVAIL_KB (default: plenty)
+    await fake('df', `${RECORD('df', callsDir)}
+echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+echo "/dev/fake 99999999 1 \${FAKE_DF_AVAIL_KB:-99999998} 1% /"`)
+    // runuser -u <user> -- <cmd…>: record, then run <cmd…> as the test user
+    await fake('runuser', `${RECORD('runuser', callsDir)}
+while [[ $# -gt 0 && "$1" != -- ]]; do shift; done
+shift
+exec "$@"`)
     await fake('rrsync', `${RECORD('rrsync', callsDir)}
 cat > ${path.join(callsDir, 'rrsync.stdin')}
 exit \${FAKE_RRSYNC_EXIT:-0}`)
@@ -127,7 +154,7 @@ exit \${FAKE_BORG_EXIT:-0}`)
         if (!re.test(text)) throw new Error(`idea-app-data has no ${name}= line`)
         text = text.replace(re, `${name}=${value}`)
     }
-    for (const tool of ['rsync', 'rrsync', 'findmnt', 'logger', 'getent']) setConst(tool.toUpperCase(), path.join(bin, tool))
+    for (const tool of ['rsync', 'rrsync', 'findmnt', 'logger', 'getent', 'df', 'runuser']) setConst(tool.toUpperCase(), path.join(bin, tool))
     if (!opts.realBorg) setConst('BORG', path.join(bin, 'borg'))
     setConst('DISKS_DIR', disks)
     setConst('SYSTEM_ROOT', sys)
@@ -137,8 +164,30 @@ exit \${FAKE_BORG_EXIT:-0}`)
     setConst('ROOT_UID', String(uid))
     setConst('ROOT_GID', String(gid))
     setConst('LOCK_WAIT_SECONDS', '2')
+    const peerAuthDir = path.join(etc, 'ssh-idea_authorized_keys')
+    const peerKnownHosts = path.join(etc, 'idea', 'peer_known_hosts')
+    const ledgerDir = path.join(tmp, 'var-lib-idea-app-data')
+    setConst('PEER_AUTH_DIR', peerAuthDir)
+    setConst('PEER_KNOWN_HOSTS', peerKnownHosts)
+    setConst('LEDGER_DIR', ledgerDir)
+    setConst('ENGINE_USER', os.userInfo().username)
     const script = path.join(tmp, 'idea-app-data')
     await fs.writeFile(script, text, { mode: 0o755 })
+
+    // The gate: its sudo runs the sandboxed helper (sudo -n <HELPER_PATH> <args…>)
+    await fake('sudo', `${RECORD('sudo', callsDir)}
+[[ "$1" == -n && "$2" == /usr/local/sbin/idea-app-data ]] || { echo "fake sudo: unexpected argv $*" >&2; exit 99; }
+shift 2
+[[ -n "\${FAKE_SUDO_EXIT:-}" ]] && exit "$FAKE_SUDO_EXIT"
+SUDO_USER=pi exec ${script} "$@"`)
+    let gateText = await fs.readFile(GATE_SOURCE, 'utf8')
+    for (const [name, value] of [['SUDO', path.join(bin, 'sudo')], ['LOGGER', path.join(bin, 'logger')]]) {
+        const re = new RegExp(`^${name}=.*$`, 'm')
+        if (!re.test(gateText)) throw new Error(`idea-peer-gate has no ${name}= line`)
+        gateText = gateText.replace(re, `${name}=${value}`)
+    }
+    const gateScript = path.join(tmp, 'idea-peer-gate')
+    await fs.writeFile(gateScript, gateText, { mode: 0o755 })
 
     const run = async (args: string[], env: Record<string, string> = {}): Promise<RunResult> => {
         // stdin is /dev/null (as for a Engine call); rrsync's stdin passthrough is checked with a pipe separately
@@ -148,6 +197,22 @@ exit \${FAKE_BORG_EXIT:-0}`)
                 env: { ...process.env, SUDO_USER: 'pi', ...env },
                 stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
             })
+            let stdout = ''
+            let stderr = ''
+            proc.stdout!.on('data', d => { stdout += d })
+            proc.stderr!.on('data', d => { stderr += d })
+            proc.on('error', reject)
+            proc.on('close', (exitCode, signal) => resolve({ exitCode, signal, stdout, stderr }))
+            if (input !== undefined) proc.stdin!.end(input)
+        })
+    }
+    const runGate = async (gateArgs: string[], cmd: string | undefined, env: Record<string, string> = {}): Promise<RunResult> => {
+        const input = env.FAKE_STDIN
+        const e: Record<string, string> = { ...process.env as Record<string, string>, SSH_CLIENT: '10.0.0.9 50000 22', ...env }
+        if (cmd === undefined) delete e.SSH_ORIGINAL_COMMAND
+        else e.SSH_ORIGINAL_COMMAND = cmd
+        return new Promise<RunResult>((resolve, reject) => {
+            const proc = spawn(gateScript, gateArgs, { env: e, stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'] })
             let stdout = ''
             let stderr = ''
             proc.stdout!.on('data', d => { stdout += d })
@@ -183,5 +248,9 @@ exit \${FAKE_BORG_EXIT:-0}`)
         return inst
     }
     const journalText = async () => (await fs.pathExists(journal)) ? fs.readFile(journal, 'utf8') : ''
-    return { tmp, bin, script, disks, sys, rootsFile, lockDir: path.join(lockParent, 'idea-app-data'), mounts, hosts, journal, run, calls, fake, addDisk, addInstance, journalText }
+    return {
+        tmp, bin, script, disks, sys, rootsFile, lockDir: path.join(lockParent, 'idea-app-data'), mounts, hosts, journal,
+        peerAuthDir, peerAuthFile: path.join(peerAuthDir, 'pi'), peerKnownHosts, ledgerDir, gateScript,
+        run, runGate, calls, fake, addDisk, addInstance, journalText,
+    }
 }

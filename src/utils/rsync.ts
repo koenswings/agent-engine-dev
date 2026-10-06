@@ -4,7 +4,9 @@
  * Design: design/copy-move-app.md
  *
  * Phase 1: same-engine, local paths only.
- * Phase 2: cross-engine — pass remoteHost to rsync over SSH to pi@host.
+ * Phase 2: cross-engine — rsyncToPeer: rsync over ssh with this Engine's own key
+ *   (utils/peerSsh.ts); on the peer, the gate runs that Engine's helper as the
+ *   rsync server (receive-app / receive-service / receive-files), never a shell.
  *
  * Helper mode (idea#168): instance DATA is copied by the root helper
  * /usr/local/sbin/idea-app-data (`sudo -n … copy|send`), which runs
@@ -17,7 +19,8 @@
 import { spawn } from 'child_process'
 import { log } from './utils.js'
 import { registerProcess, deregisterProcess } from '../data/Operations.js'
-import { appDataSudoArgv, appDataErrorMessage, copyArgs, sendArgs } from './appDataHelper.js'
+import { appDataSudoArgv, appDataErrorMessage, copyArgs, sendArgs, remoteHelperRsyncPath } from './appDataHelper.js'
+import { peerRsyncShell, peerTarget } from './peerSsh.js'
 
 export interface RsyncProgress {
     progressPercent: number
@@ -85,16 +88,14 @@ const runRsyncProcess = (
 }
 
 /**
- * Copy src/ to dest/ using rsync.
+ * Copy src/ to dest/ using rsync (both local).
  *
  * - Preserves permissions, symlinks, timestamps (-a / archive mode)
  * - Reports per-transfer progress via onProgress callback (0-100)
  * - Idempotent: re-running after interruption transfers only the delta
  * - Throws on non-zero exit
  *
- * src must be a local absolute path.
- * dest must be an absolute path. If remoteHost is provided, rsync runs over
- * SSH to `pi@<remoteHost>:<dest>` (cross-engine Phase 2).
+ * src and dest must be local absolute paths (a peer Engine: rsyncToPeer).
  * Trailing slash is appended to src so rsync copies the *contents*.
  *
  * Runs as the Engine user (pi): use it for pi-owned trees (app masters, the
@@ -105,41 +106,63 @@ export const rsyncDirectory = (
     dest: string,
     onProgress?: RsyncProgressCallback,
     opId?: string,
-    remoteHost?: string,
 ): Promise<void> => {
     // Ensure src has trailing slash so rsync copies contents, not the directory itself
     const srcArg = src.endsWith('/') ? src : src + '/'
-    const destArg = remoteHost ? `pi@${remoteHost}:${dest}` : dest
-
     const args = [
         '-a',
         '--info=progress2',
         '--no-inc-recursive',  // required for accurate total-progress reporting
+        srcArg, dest,
     ]
-
-    if (remoteHost) {
-        args.push('-e', 'ssh -o StrictHostKeyChecking=no')
-    }
-
-    args.push(srcArg, destArg)
-
     return runRsyncProcess('rsync', args, (code, _signal, stderr) => `rsync exited with code ${code}: ${stderr.trim()}`, onProgress, opId)
 }
+
+/** A peer Engine: its current address and its Engine id (the host key is pinned by id). */
+export interface PeerEngine { host: string, engineId: string }
+
+/**
+ * The rsync argv (as pi) that sends `src` to a peer, where the peer's helper runs
+ * the rsync server for `helperArgs` (receive-app <root> <appId>, receive-service
+ * <root> or receive-files <root> <id>) into a folder it builds from those tokens.
+ * A src ending in '/' sends a folder's contents (and that folder's own owner and
+ * mode, for the target folder); a file or a list of files sends just those files.
+ */
+export const rsyncToPeerArgs = (src: string | string[], peer: PeerEngine, helperArgs: string[]): string[] => [
+    '-a',
+    '--info=progress2',
+    '--no-inc-recursive',
+    '-e', peerRsyncShell(peer.engineId),
+    `--rsync-path=${remoteHelperRsyncPath(helperArgs)}`,
+    '--', ...[src].flat(), `${peerTarget(peer.host)}:.`,
+]
+
+/** Send a pi-owned folder (src ending in '/') or files to a peer Engine's helper (see rsyncToPeerArgs). */
+export const rsyncToPeer = (
+    src: string | string[],
+    peer: PeerEngine,
+    helperArgs: string[],
+    onProgress?: RsyncProgressCallback,
+    opId?: string,
+): Promise<void> =>
+    runRsyncProcess('rsync', rsyncToPeerArgs(src, peer, helperArgs),
+        (code, _signal, stderr) => `rsync to Engine ${peer.engineId} (${peer.host}, ${helperArgs[0]}) exited with code ${code}: ${stderr.trim()}`,
+        onProgress, opId)
 
 /** One instance-data transfer through the root helper. Roots are helper root tokens. */
 export type InstanceDataTransfer =
     | { kind: 'copy', srcRoot: string, srcId: string, dstRoot: string, dstId: string }
-    | { kind: 'send', srcRoot: string, srcId: string, host: string, dstRoot: string, dstId: string }
+    | { kind: 'send', srcRoot: string, srcId: string, host: string, peerEngineId: string, dstRoot: string, dstId: string }
 
 /** The helper arguments for a transfer (subcommand first). */
 export const instanceDataTransferArgs = (t: InstanceDataTransfer): string[] =>
     t.kind === 'copy'
         ? copyArgs(t.srcRoot, t.srcId, t.dstRoot, t.dstId)
-        : sendArgs(t.srcRoot, t.srcId, t.host, t.dstRoot, t.dstId)
+        : sendArgs(t.srcRoot, t.srcId, t.host, t.peerEngineId, t.dstRoot, t.dstId)
 
 /**
- * Copy (same Engine) or send (to `pi@host`, received there by that Engine's helper
- * through rrsync) an instance folder as root, keeping owners, modes, hard links,
+ * Copy (same Engine) or send (to `pi@host` with this Engine's key, received there
+ * by that Engine's helper through its gate and rrsync) an instance folder as root, keeping owners, modes, hard links,
  * ACLs and xattrs: `sudo -n /usr/local/sbin/idea-app-data copy|send …`. The helper
  * creates the destination (it must not exist yet, or be empty) and refuses data
  * that links off the instance folder.

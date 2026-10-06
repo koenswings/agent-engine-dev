@@ -1,0 +1,111 @@
+#!/bin/bash
+# idea-peer-gate — the forced command of every peer Engine key (per-Pi Engine keys,
+# design-per-pi-engine-key.md)
+#
+# Installed as a root-owned COPY at /usr/local/sbin/idea-peer-gate (0755) by
+# build-engine. sshd runs it (as pi) for every login with a peer Engine key, from
+# the key's line in /etc/ssh/idea_authorized_keys/pi, which only
+# `idea-app-data sync-peers` writes:
+#   restrict,command="/usr/local/sbin/idea-peer-gate <peerEngineId>" ssh-ed25519 <key> idea-peer:<peerEngineId>
+# so the peer's Engine id comes from that root-owned file, never from the peer.
+#
+# The peer asks for ONE command in $SSH_ORIGINAL_COMMAND, always a call of this
+# Pi's app-data helper:  [/usr/bin/]sudo -n /usr/local/sbin/idea-app-data <sub> <args…>
+# Allowed, and run as argv (never through a shell):
+#   version                                → idea-app-data version
+#   ensure-dirs <root>                     → idea-app-data ensure-dirs <root>
+#   receive <root> <id> --server …         → idea-app-data peer-receive <peer> <root> <id> --server …
+#                                            (a NEW instance folder, recorded in the ledger)
+#   receive-files <root> <id> --server …   → idea-app-data peer-receive-files <peer> <root> <id> --server …
+#   receive-app <root> <appId> --server …  → idea-app-data receive-app <root> <appId> --server …
+#   receive-service <root> --server …      → idea-app-data receive-service <root> --server …
+#   delete <root> <id>                     → idea-app-data peer-delete <peer> <root> <id>
+#                                            (only a folder that peer's receive created)
+# Everything else — a shell, scp/sftp, any other program or subcommand, --sender,
+# a character outside [A-Za-z0-9._=,:+@/-] and space — is refused (exit 2,
+# "refused: …"). The helper checks every token again. Every call is logged with
+# logger to auth.notice (peer, client address, command, allowed or refused).
+
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+export LC_ALL=C
+umask 022
+IFS=$' \t\n'
+
+SUDO=/usr/bin/sudo
+SUDO_WORD=/usr/bin/sudo   # the spelled form a peer may send (besides plain sudo)
+LOGGER=/usr/bin/logger
+HELPER_PATH=/usr/local/sbin/idea-app-data
+
+RE_ENGINE='^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
+RE_COMMAND='^[A-Za-z0-9._=,:+@/ -]{1,4096}$'
+
+PEER="${1:-}"
+CMD="${SSH_ORIGINAL_COMMAND:-}"
+FROM="${SSH_CLIENT:-unknown}"
+FROM="${FROM%% *}"
+
+journal() { $LOGGER -t idea-peer-gate -p auth.notice -- "$*" >/dev/null 2>&1 || true; }
+
+refuse() {
+    journal "refused peer=$(printf '%q' "$PEER") from=$FROM cmd=$(printf '%q' "${CMD:0:300}") reason=$(printf '%q' "$*")"
+    echo "refused: $*" >&2
+    exit 2
+}
+
+allow() {   # allow <helper args…>
+    journal "allowed peer=$PEER from=$FROM helper=$*"
+    exec $SUDO -n $HELPER_PATH "$@"
+    echo "refused: cannot run $SUDO" >&2
+    exit 2
+}
+
+(( $# == 1 )) || refuse "the gate takes exactly one argument (the peer's Engine id), got $#"
+[[ "$PEER" =~ $RE_ENGINE ]] || refuse "peer Engine id does not match $RE_ENGINE"
+[[ -n "$CMD" ]] || refuse "no command: a peer key gets no shell"
+[[ "$CMD" =~ $RE_COMMAND ]] || refuse "the command holds a character outside [A-Za-z0-9._=,:+@/ -] (or is longer than 4096)"
+
+read -r -a W <<<"$CMD"
+(( ${#W[@]} >= 4 )) || refuse "not a call of $HELPER_PATH"
+[[ "${W[0]}" == sudo || "${W[0]}" == "$SUDO_WORD" ]] || refuse "only $HELPER_PATH may run (through sudo -n), not '${W[0]}'"
+[[ "${W[1]}" == -n && "${W[2]}" == "$HELPER_PATH" ]] || refuse "only '$SUDO_WORD -n $HELPER_PATH …' may run"
+SUBCMD="${W[3]}"
+ARGS=("${W[@]:4}")
+N=${#ARGS[@]}
+
+server_args() {   # server_args <index of --server>: --server there, no --sender anywhere
+    [[ "${ARGS[$1]:-}" == --server ]] || refuse "$SUBCMD needs the rsync server arguments (--server …)"
+    local a
+    for a in "${ARGS[@]}"; do [[ "$a" != --sender ]] || refuse "$SUBCMD is write-only: --sender is not allowed"; done
+}
+
+case "$SUBCMD" in
+    version)
+        (( N == 0 )) || refuse "version takes no arguments"
+        allow version ;;
+    ensure-dirs)
+        (( N == 1 )) || refuse "ensure-dirs takes exactly <root>"
+        allow ensure-dirs "${ARGS[0]}" ;;
+    receive)
+        (( N >= 3 )) || refuse "receive takes <root> <id> and the rsync server arguments"
+        server_args 2
+        allow peer-receive "$PEER" "${ARGS[@]}" ;;
+    receive-files)
+        (( N >= 3 )) || refuse "receive-files takes <root> <id> and the rsync server arguments"
+        server_args 2
+        allow peer-receive-files "$PEER" "${ARGS[@]}" ;;
+    receive-app)
+        (( N >= 3 )) || refuse "receive-app takes <root> <appId> and the rsync server arguments"
+        server_args 2
+        allow receive-app "${ARGS[@]}" ;;
+    receive-service)
+        (( N >= 2 )) || refuse "receive-service takes <root> and the rsync server arguments"
+        server_args 1
+        allow receive-service "${ARGS[@]}" ;;
+    delete)
+        (( N == 2 )) || refuse "delete takes exactly <root> <id>"
+        allow peer-delete "$PEER" "${ARGS[@]}" ;;
+    *)
+        refuse "subcommand '$SUBCMD' is not allowed for a peer Engine key" ;;
+esac

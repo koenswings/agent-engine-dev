@@ -26,7 +26,7 @@ import os from 'os'
 import path from 'path'
 
 const order = vi.hoisted(() => [] as string[])
-const remoteOverlays = vi.hoisted(() => [] as { src: string, dest: string, files: Record<string, string> }[])
+const remoteOverlays = vi.hoisted(() => [] as { src: string | string[], peer: { host: string, engineId: string }, helperArgs: string[], files: Record<string, string> }[])
 // r36: make the instance rsync fail after writing part of the copy
 const failure = vi.hoisted(() => ({ rsync: null as string | null, process: null as string | null }))
 const sshCalls = vi.hoisted(() => [] as string[])
@@ -35,26 +35,31 @@ const instanceTransfers = vi.hoisted(() => [] as any[])
 const helperDeletes = vi.hoisted(() => [] as string[][])
 
 vi.mock('../../src/utils/rsync.js', () => ({
-    rsyncDirectory: vi.fn(async (src: string, dest: string, onProgress?: (p: { progressPercent: number }) => void, _opId?: string, remoteHost?: string) => {
+    rsyncDirectory: vi.fn(async (src: string, dest: string, onProgress?: (p: { progressPercent: number }) => void) => {
         const { fs } = await import('zx')
         if (failure.rsync && src.includes('/instances/')) {
-            if (!remoteHost) {
-                await fs.ensureDir(`${dest}/data/kolibri`)
-                await fs.writeFile(`${dest}/data/kolibri/db.sqlite3`, 'partial')
-            }
+            await fs.ensureDir(`${dest}/data/kolibri`)
+            await fs.writeFile(`${dest}/data/kolibri/db.sqlite3`, 'partial')
             throw new Error(failure.rsync)
         }
-        if (remoteHost) {
-            // Cross-engine: record what would be sent (the overlay of rewritten files)
-            const files: Record<string, string> = {}
-            for (const f of await fs.readdir(src)) {
-                const p = `${src}/${f}`
-                if ((await fs.lstat(p)).isFile() && (f === '.env' || f === 'compose.yaml')) files[f] = await fs.readFile(p, 'utf8')
-            }
-            remoteOverlays.push({ src, dest, files })
-        } else {
-            await fs.copy(src, dest, { overwrite: true, dereference: false })
+        await fs.copy(src, dest, { overwrite: true, dereference: false })
+        onProgress?.({ progressPercent: 100 })
+    }),
+    // Cross-engine (per-Pi Engine keys): rsync to the peer's helper through its gate.
+    // Record what would be sent (the overlay of rewritten files) and to which helper call.
+    rsyncToPeer: vi.fn(async (src: string | string[], peer: { host: string, engineId: string }, helperArgs: string[], onProgress?: (p: { progressPercent: number }) => void) => {
+        const { fs } = await import('zx')
+        const files: Record<string, string> = {}
+        const paths: string[] = []
+        for (const s of [src].flat()) {
+            if ((await fs.stat(s)).isDirectory()) for (const f of await fs.readdir(s)) paths.push(`${s.replace(/\/$/, '')}/${f}`)
+            else paths.push(s)
         }
+        for (const p of paths) {
+            const f = p.split('/').at(-1)!
+            if ((await fs.lstat(p)).isFile() && (f === '.env' || f === 'compose.yaml')) files[f] = await fs.readFile(p, 'utf8')
+        }
+        remoteOverlays.push({ src, peer, helperArgs, files })
         onProgress?.({ progressPercent: 100 })
     }),
     // The app-data helper's copy/send: root tokens are the pretend disks' devices
@@ -157,6 +162,7 @@ import { findExternalLinks, uniqueCopyName, clearEnginePort, setComposeInstanceN
 import { choosePortForStart } from '../../src/data/Instance.js'
 import { randomPort } from '../../src/utils/utils.js'
 import { AppID, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/data/CommonTypes.js'
+import { peerSshOptions } from '../../src/utils/peerSsh.js'
 
 const SRC = 'DISK_src-r35' as DiskID
 const TGT = 'DISK_tgt-r35' as DiskID
@@ -384,7 +390,7 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
         const REMOTE = 'ENGINE_remote-r35' as EngineID
         h.change(doc => {
             doc.diskDB[TGT].dockedTo = REMOTE
-            ;(doc.engineDB as any)[REMOTE] = { id: REMOTE, commands: [] }
+            ;(doc.engineDB as any)[REMOTE] = { id: REMOTE, commands: [], lastRun: Date.now() }
         })
         network.connections['10.0.0.35:4321' as any] = { adapter: {} as any, missedDiscoveryCount: 0, hostname: 'idea35' as any, engineId: REMOTE }
         try {
@@ -392,9 +398,15 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
             const newRow = Object.values(h.doc().instanceDB).find(i => String(i.id) !== ORIG)!
             expect(newRow.name).toBe('kolibri-2')
             // The helper sends the original files as root (idea#168); the overlay (from a local temp dir) then replaces them
-            expect(instanceTransfers).toEqual([{ kind: 'send', srcRoot: SRC_DEV, srcId: ORIG, host: '10.0.0.35', dstRoot: TGT_DEV, dstId: newRow.id }])
-            const toCopy = remoteOverlays.filter(o => o.dest.endsWith(`/instances/${newRow.id}`))
-            expect(toCopy.map(o => o.src.includes('idea-copy-'))).toEqual([true])
+            expect(instanceTransfers).toEqual([{ kind: 'send', srcRoot: SRC_DEV, srcId: ORIG, host: '10.0.0.35', peerEngineId: REMOTE, dstRoot: TGT_DEV, dstId: newRow.id }])
+            // every remote step goes to the peer's helper with this Engine's key, pinned by the peer's Engine id
+            expect(sshCalls).toEqual([`ssh ${peerSshOptions(REMOTE).join(' ')} pi@10.0.0.35 -- sudo -n /usr/local/sbin/idea-app-data ensure-dirs ${TGT_DEV}`])
+            expect(remoteOverlays.map(o => [o.peer, o.helperArgs])).toEqual([
+                [{ host: '10.0.0.35', engineId: REMOTE }, ['receive-app', TGT_DEV, APP]],
+                [{ host: '10.0.0.35', engineId: REMOTE }, ['receive-files', TGT_DEV, newRow.id]],
+            ])
+            const toCopy = remoteOverlays.filter(o => o.helperArgs[0] === 'receive-files')
+            expect(toCopy.map(o => [o.src].flat().every(p => /idea-copy-[^/]+\/(compose\.yaml|\.env)$/.test(p)))).toEqual([true])   // the files only, never the folder
             const overlay = toCopy[0]
             expect(YAML.parse(overlay.files['compose.yaml'])['x-app'].instanceName).toBe('kolibri-2')
             expect(overlay.files['.env']).not.toMatch(/^port=/m)
@@ -431,7 +443,7 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
         const REMOTE = 'ENGINE_remote-r36' as EngineID
         h.change(doc => {
             doc.diskDB[TGT].dockedTo = REMOTE
-            ;(doc.engineDB as any)[REMOTE] = { id: REMOTE, commands: [] }
+            ;(doc.engineDB as any)[REMOTE] = { id: REMOTE, commands: [], lastRun: Date.now() }
         })
         network.connections['10.0.0.36:4321' as any] = { adapter: {} as any, missedDiscoveryCount: 0, hostname: 'idea36' as any, engineId: REMOTE }
         try {
@@ -442,8 +454,10 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
             expect(newId).not.toBe(ORIG)
             expect(sshCalls.filter(c => / rm -rf /.test(c)), JSON.stringify(sshCalls)).toEqual([])
             expect(sshCalls.filter(c => /idea-app-data/.test(c))).toEqual([
-                `ssh -o StrictHostKeyChecking=no -o BatchMode=yes pi@10.0.0.36 -- sudo -n /usr/local/sbin/idea-app-data delete ${TGT_DEV} ${newId}`,
+                `ssh ${peerSshOptions(REMOTE).join(' ')} pi@10.0.0.36 -- sudo -n /usr/local/sbin/idea-app-data ensure-dirs ${TGT_DEV}`,
+                `ssh ${peerSshOptions(REMOTE).join(' ')} pi@10.0.0.36 -- sudo -n /usr/local/sbin/idea-app-data delete ${TGT_DEV} ${newId}`,
             ])
+            expect(sshCalls.some(c => /StrictHostKeyChecking=no/.test(c))).toBe(false)
             // the instance folder itself is no longer pre-created over ssh (the receiving helper creates it as root)
             expect(sshCalls.some(c => new RegExp(`mkdir -p \\S+/instances/${newId}`).test(c))).toBe(false)
             expect(helperDeletes).toEqual([])                               // nothing deleted locally

@@ -14,15 +14,19 @@
  *         root bridge file /etc/idea/app-data-roots, which production never has)
  *   id    an instance id (^[a-z0-9][a-z0-9-]{0,63}$)
  *
- * App masters and service tars are Engine-written and pi-owned, so they stay plain
- * pi operations. Every call is an argv array (never a shell string). The only shell
- * string is the remote delete, whose tokens are checked here first.
+ * App masters and service tars are Engine-written and pi-owned, so locally they stay
+ * plain pi operations. Every call is an argv array (never a shell string). Commands
+ * for a PEER Engine (ensure-dirs, receive-app/-service/-files, delete) go over ssh
+ * with this Engine's own key (utils/peerSsh.ts) as one remote command built from
+ * checked tokens; on the peer the forced command idea-peer-gate parses it and runs
+ * that Engine's helper (helper version 2, per-Pi Engine keys).
  */
 
 import { spawn } from 'child_process'
 import { $ } from 'zx'
 import { log } from './utils.js'
 import { config } from '../data/Config.js'
+import { peerSshArgv, checkEngineId } from './peerSsh.js'
 
 /** Installed path of the helper (a root-owned copy, 0755; build-engine installUdev). */
 export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
@@ -32,7 +36,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '1'
+export const APP_DATA_HELPER_VERSION = '2'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: build-engine installs /usr/local/sbin/idea-app-data ' +
@@ -41,6 +45,7 @@ export const APP_DATA_HELPER_UPDATE =
 const ROOT_TOKEN = /^(system|sd[a-z][12]|[a-z0-9][a-z0-9-]{0,63})$/
 const ID_TOKEN = /^[a-z0-9][a-z0-9-]{0,63}$/
 const ARCHIVE_TOKEN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9-]{8,16}Z$/
+const APP_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 
 const checkRoot = (root: string): string => {
     if (!ROOT_TOKEN.test(root)) throw new Error(`'${root}' is not a disk root the app-data helper accepts (system, sdX1/sdX2 or a test slot name)`)
@@ -49,6 +54,10 @@ const checkRoot = (root: string): string => {
 const checkId = (id: string): string => {
     if (!ID_TOKEN.test(id)) throw new Error(`'${id}' is not an instance id the app-data helper accepts`)
     return id
+}
+const checkApp = (appId: string): string => {
+    if (!APP_TOKEN.test(appId) || appId.includes('..')) throw new Error(`'${appId}' is not an app id the app-data helper accepts`)
+    return appId
 }
 const checkArchive = (archive: string): string => {
     if (!ARCHIVE_TOKEN.test(archive)) throw new Error(`'${archive}' is not a backup archive name the app-data helper accepts`)
@@ -60,10 +69,19 @@ const checkArchive = (archive: string): string => {
 export const sizeArgs = (root: string, id: string): string[] => ['size', checkRoot(root), checkId(id)]
 export const copyArgs = (srcRoot: string, srcId: string, dstRoot: string, dstId: string): string[] =>
     ['copy', checkRoot(srcRoot), checkId(srcId), checkRoot(dstRoot), checkId(dstId)]
-export const sendArgs = (srcRoot: string, srcId: string, host: string, dstRoot: string, dstId: string): string[] => {
+/** send: the peer's address AND its Engine id (the helper pins the peer's host key by Engine id). */
+export const sendArgs = (srcRoot: string, srcId: string, host: string, peerEngineId: string, dstRoot: string, dstId: string): string[] => {
     if (!/^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/.test(host)) throw new Error(`'${host}' is not a host the app-data helper accepts`)
-    return ['send', checkRoot(srcRoot), checkId(srcId), host, checkRoot(dstRoot), checkId(dstId)]
+    return ['send', checkRoot(srcRoot), checkId(srcId), host, checkEngineId(peerEngineId), checkRoot(dstRoot), checkId(dstId)]
 }
+/** On a peer (through its gate): create apps/, instances/, services/ on <root>, owned by pi. */
+export const ensureDirsArgs = (root: string): string[] => ['ensure-dirs', checkRoot(root)]
+/** On a peer: the rsync server for an app master, <root>/apps/<appId> (written as pi). */
+export const receiveAppArgs = (root: string, appId: string): string[] => ['receive-app', checkRoot(root), checkApp(appId)]
+/** On a peer: the rsync server for service image tars, <root>/services (written as pi). */
+export const receiveServiceArgs = (root: string): string[] => ['receive-service', checkRoot(root)]
+/** On a peer: the rsync server for compose.yaml/.env into an instance folder this Engine's receive created. */
+export const receiveFilesArgs = (root: string, id: string): string[] => ['receive-files', checkRoot(root), checkId(id)]
 export const deleteArgs = (root: string, id: string): string[] => ['delete', checkRoot(root), checkId(id)]
 export const borgInitArgs = (bdev: string, id: string): string[] => ['borg-init', checkRoot(bdev), checkId(id)]
 export const borgInfoArgs = (bdev: string, id: string): string[] => ['borg-info', checkRoot(bdev), checkId(id)]
@@ -77,14 +95,23 @@ export const borgExtractArgs = (bdev: string, id: string, archive: string, strip
 /** The argv for `sudo`: sudo -n /usr/local/sbin/idea-app-data <args…> */
 export const appDataSudoArgv = (args: string[]): string[] => ['-n', APP_DATA_HELPER, ...args]
 
+/** A helper call as the words of a remote command: sudo -n /usr/local/sbin/idea-app-data <args…> */
+export const remoteHelperCommand = (args: string[]): string[] => ['sudo', '-n', APP_DATA_HELPER, ...args]
+
+/** The same as one string, for `rsync --rsync-path=` (tokens are checked, no quoting needed). */
+export const remoteHelperRsyncPath = (args: string[]): string => remoteHelperCommand(args).join(' ')
+
 /**
- * The ssh argv that deletes a partial copy on a remote Engine with that Engine's
- * helper. The remote command is ONE argument built from checked tokens only.
+ * The ssh argv that deletes a partial copy on a peer Engine with that Engine's
+ * helper (its gate allows it only for a folder this Engine's receive created). The
+ * remote command is ONE argument built from checked tokens only.
  */
-export const remoteDeleteSshArgs = (host: string, root: string, id: string): string[] => {
-    const [, r, i] = deleteArgs(root, id)
-    return ['ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'BatchMode=yes', `pi@${host}`, '--', `sudo -n ${APP_DATA_HELPER} delete ${r} ${i}`]
-}
+export const remoteDeleteSshArgs = (host: string, peerEngineId: string, root: string, id: string): string[] =>
+    peerSshArgv(host, peerEngineId, remoteHelperCommand(deleteArgs(root, id)))
+
+/** The ssh argv that creates apps/, instances/ and services/ on the peer's target disk (idea#80). */
+export const remoteEnsureDirsSshArgs = (host: string, peerEngineId: string, root: string): string[] =>
+    peerSshArgv(host, peerEngineId, remoteHelperCommand(ensureDirsArgs(root)))
 
 // ── Running the helper ───────────────────────────────────────────────────────
 
@@ -131,10 +158,37 @@ export const deleteInstanceData = async (root: string, id: string, run: AppDataR
     await run(deleteArgs(root, id))
 }
 
-/** Removes an instance folder on a remote Engine: ssh pi@host sudo -n idea-app-data delete <root> <id>. */
-export const deleteRemoteInstanceData = async (host: string, root: string, id: string): Promise<void> => {
-    await $`${remoteDeleteSshArgs(host, root, id)}`
+/** Removes an instance folder on a peer Engine: ssh pi@host sudo -n idea-app-data delete <root> <id> (through its gate). */
+export const deleteRemoteInstanceData = async (host: string, peerEngineId: string, root: string, id: string): Promise<void> => {
+    await $`${remoteDeleteSshArgs(host, peerEngineId, root, id)}`
 }
+
+/** Creates apps/, instances/ and services/ on a peer's disk (through its gate). */
+export const ensureRemoteDirs = async (host: string, peerEngineId: string, root: string): Promise<void> => {
+    await $`${remoteEnsureDirsSshArgs(host, peerEngineId, root)}`
+}
+
+/**
+ * `sudo -n idea-app-data sync-peers` with the FULL peer set on stdin (one line per
+ * peer: `<engineId> ssh-ed25519 <key> ssh-ed25519 <hostkey>`). Returns stdout.
+ */
+export type AppDataInputRunner = (args: string[], input: string) => Promise<string>
+
+export const runAppDataWithInput: AppDataInputRunner = (args, input) => new Promise((resolve, reject) => {
+    log(`sudo -n ${APP_DATA_HELPER} ${args.join(' ')} (${input.split('\n').filter(Boolean).length} line(s) on stdin)`)
+    const proc = spawn('sudo', appDataSudoArgv(args), { stdio: ['pipe', 'pipe', 'pipe'] })
+    let stdout = ''
+    let stderr = ''
+    proc.stdout.on('data', (c: Buffer) => { stdout += c.toString() })
+    proc.stderr.on('data', (c: Buffer) => { stderr += c.toString() })
+    proc.on('error', (err) => reject(new Error(`idea-app-data ${args[0]}: could not start sudo: ${err.message}`)))
+    proc.on('close', (code, signal) => {
+        if (code === 0) resolve(stdout)
+        else reject(new Error(appDataErrorMessage(args[0], code, signal, stderr)))
+    })
+    proc.stdin.on('error', () => undefined)
+    proc.stdin.end(input)
+})
 
 // ── Version check at startup ─────────────────────────────────────────────────
 

@@ -7,7 +7,9 @@
  *   - the startup version check (match / mismatch / missing; isDev skips)
  *   - rsyncInstanceData: argv, progress, errors, and cancel through cancelOperation
  *     (fake sudo execs the sandboxed helper, whose rsync sleeps)
- *   - the remote delete ssh argv
+ *   - the peer ssh argv (remote delete, remote ensure-dirs) with this Engine's own key
+ *     and the peer's pinned host key (per-Pi Engine keys)
+ *   - runAppDataWithInput (sync-peers): the peer set goes over stdin
  *
  * A fake `sudo` and `ssh` are first on PATH for this file.
  */
@@ -20,7 +22,10 @@ import {
     borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, appDataSudoArgv, remoteDeleteSshArgs,
     runAppData, appDataErrorMessage, appDataHelperProblem, assertAppDataHelper,
     instanceDataBytes, deleteInstanceData, deleteRemoteInstanceData,
+    remoteEnsureDirsSshArgs, ensureDirsArgs, receiveAppArgs, receiveServiceArgs, receiveFilesArgs,
+    remoteHelperCommand, remoteHelperRsyncPath, runAppDataWithInput,
 } from '../../src/utils/appDataHelper.js'
+import { peerSshOptions } from '../../src/utils/peerSsh.js'
 import { rsyncInstanceData, instanceDataTransferArgs } from '../../src/utils/rsync.js'
 import { config } from '../../src/data/Config.js'
 import { Store } from '../../src/data/Store.js'
@@ -80,7 +85,13 @@ describe('helper argv builders', () => {
     it('build the subcommand argv from tokens', () => {
         expect(sizeArgs('sdb1', 'inst-1')).toEqual(['size', 'sdb1', 'inst-1'])
         expect(copyArgs('system', 'inst-1', 'idea-test-2', 'abc123')).toEqual(['copy', 'system', 'inst-1', 'idea-test-2', 'abc123'])
-        expect(sendArgs('sdb1', 'inst-1', 'idea04.local', 'sdc1', 'new1')).toEqual(['send', 'sdb1', 'inst-1', 'idea04.local', 'sdc1', 'new1'])
+        expect(sendArgs('sdb1', 'inst-1', 'idea04.local', 'ENGINE_idea04', 'sdc1', 'new1')).toEqual(['send', 'sdb1', 'inst-1', 'idea04.local', 'ENGINE_idea04', 'sdc1', 'new1'])
+        expect(ensureDirsArgs('system')).toEqual(['ensure-dirs', 'system'])
+        expect(receiveAppArgs('sdb1', 'kolibri-1.0')).toEqual(['receive-app', 'sdb1', 'kolibri-1.0'])
+        expect(receiveServiceArgs('idea-test-2')).toEqual(['receive-service', 'idea-test-2'])
+        expect(receiveFilesArgs('sdb1', 'new1')).toEqual(['receive-files', 'sdb1', 'new1'])
+        expect(remoteHelperCommand(['version'])).toEqual(['sudo', '-n', '/usr/local/sbin/idea-app-data', 'version'])
+        expect(remoteHelperRsyncPath(receiveAppArgs('sdb1', 'kolibri-1.0'))).toBe('sudo -n /usr/local/sbin/idea-app-data receive-app sdb1 kolibri-1.0')
         expect(deleteArgs('sdb2', 'x')).toEqual(['delete', 'sdb2', 'x'])
         expect(borgInitArgs('sdc1', 'inst-1')).toEqual(['borg-init', 'sdc1', 'inst-1'])
         expect(borgInfoArgs('sdc1', 'inst-1')).toEqual(['borg-info', 'sdc1', 'inst-1'])
@@ -99,8 +110,14 @@ describe('helper argv builders', () => {
         expect(() => sizeArgs('..', 'x')).toThrow(/not a disk root/)
         expect(() => sizeArgs('sdb1', '../etc')).toThrow(/not an instance id/)
         expect(() => sizeArgs('sdb1', '-rf')).toThrow(/not an instance id/)
-        expect(() => sendArgs('sdb1', 'x', '-oProxyCommand=x', 'sdc1', 'y')).toThrow(/not a host/)
-        expect(() => sendArgs('sdb1', 'x', 'a b', 'sdc1', 'y')).toThrow(/not a host/)
+        expect(() => sendArgs('sdb1', 'x', '-oProxyCommand=x', 'ENGINE_a', 'sdc1', 'y')).toThrow(/not a host/)
+        expect(() => sendArgs('sdb1', 'x', 'a b', 'ENGINE_a', 'sdc1', 'y')).toThrow(/not a host/)
+        expect(() => sendArgs('sdb1', 'x', '10.0.0.4', '-oProxyCommand=x', 'sdc1', 'y')).toThrow(/not an Engine id/)
+        expect(() => sendArgs('sdb1', 'x', '10.0.0.4', 'ENGINE a', 'sdc1', 'y')).toThrow(/not an Engine id/)
+        expect(() => receiveAppArgs('sdb1', '../etc')).toThrow(/not an app id/)
+        expect(() => receiveAppArgs('sdb1', 'kolibri..1')).toThrow(/not an app id/)
+        expect(() => receiveAppArgs('sdb1', '-rf')).toThrow(/not an app id/)
+        expect(() => receiveFilesArgs('sdb1', 'a/b')).toThrow(/not an instance id/)
         expect(() => borgCreateArgs('sdc1', 'x', 'latest', 'sdb1')).toThrow(/not a backup archive name/)
         expect(() => borgExtractArgs('sdc1', 'x', '2026-10-06T10-18-00-123Z', 0, 'sdb1')).toThrow(/out of range/)
         expect(() => borgExtractArgs('sdc1', 'x', '2026-10-06T10-18-00-123Z', 10, 'sdb1')).toThrow(/out of range/)
@@ -109,16 +126,28 @@ describe('helper argv builders', () => {
 
     it('instanceDataTransferArgs maps copy and send', () => {
         expect(instanceDataTransferArgs({ kind: 'copy', srcRoot: 'sdb1', srcId: 'a', dstRoot: 'sdc1', dstId: 'b' })).toEqual(['copy', 'sdb1', 'a', 'sdc1', 'b'])
-        expect(instanceDataTransferArgs({ kind: 'send', srcRoot: 'sdb1', srcId: 'a', host: '192.168.1.4', dstRoot: 'sdc1', dstId: 'b' })).toEqual(['send', 'sdb1', 'a', '192.168.1.4', 'sdc1', 'b'])
+        expect(instanceDataTransferArgs({ kind: 'send', srcRoot: 'sdb1', srcId: 'a', host: '192.168.1.4', peerEngineId: 'ENGINE_p', dstRoot: 'sdc1', dstId: 'b' })).toEqual(['send', 'sdb1', 'a', '192.168.1.4', 'ENGINE_p', 'sdc1', 'b'])
     })
 
-    it('remoteDeleteSshArgs: ssh pi@host -- one remote command built from checked tokens', () => {
-        expect(remoteDeleteSshArgs('idea04.local', 'idea-test-3', 'abc')).toEqual([
-            'ssh', '-o', 'StrictHostKeyChecking=no', '-o', 'BatchMode=yes', 'pi@idea04.local', '--',
+    it('remoteDeleteSshArgs: ssh <Engine key, pinned host key> pi@host -- one remote command built from checked tokens', () => {
+        expect(remoteDeleteSshArgs('idea04.local', 'ENGINE_idea04', 'idea-test-3', 'abc')).toEqual([
+            'ssh', '-i', '/home/pi/.ssh/idea_engine_ed25519', '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes',
+            '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=/etc/idea/peer_known_hosts',
+            '-o', 'HostKeyAlias=ENGINE_idea04', '-o', 'ConnectTimeout=10', 'pi@idea04.local', '--',
             'sudo -n /usr/local/sbin/idea-app-data delete idea-test-3 abc',
         ])
-        expect(() => remoteDeleteSshArgs('idea04', 'sdb1', 'x;reboot')).toThrow(/not an instance id/)
-        expect(() => remoteDeleteSshArgs('idea04', '$(id)', 'x')).toThrow(/not a disk root/)
+        expect(() => remoteDeleteSshArgs('idea04', 'ENGINE_idea04', 'sdb1', 'x;reboot')).toThrow(/not an instance id/)
+        expect(() => remoteDeleteSshArgs('idea04', 'ENGINE_idea04', '$(id)', 'x')).toThrow(/not a disk root/)
+        expect(() => remoteDeleteSshArgs('idea04', 'ENGINE;id', 'sdb1', 'x')).toThrow(/not an Engine id/)
+        expect(() => remoteDeleteSshArgs('-oProxyCommand=x', 'ENGINE_idea04', 'sdb1', 'x')).toThrow(/not a peer address/)
+    })
+
+    it('remoteEnsureDirsSshArgs: the peer helper\'s ensure-dirs <root>, never a plain mkdir/chown', () => {
+        for (const root of ['system', 'sdb1', 'idea-test-2']) {
+            const args = remoteEnsureDirsSshArgs('10.0.0.2', 'ENGINE_b', root)
+            expect(args).toEqual(['ssh', ...peerSshOptions('ENGINE_b'), 'pi@10.0.0.2', '--', `sudo -n /usr/local/sbin/idea-app-data ensure-dirs ${root}`])
+            expect(args.join(' ')).not.toMatch(/mkdir|chown|StrictHostKeyChecking=no/)
+        }
     })
 })
 
@@ -169,7 +198,7 @@ describe('startup version check', () => {
 
     it('refuses to start on a version mismatch, saying ask Ops to update', async () => {
         process.env.FAKE_SUDO_OUT = 'idea-app-data 0'
-        await expect(assertAppDataHelper()).rejects.toThrow(/needs the app-data root helper \/usr\/local\/sbin\/idea-app-data version 1, but the installed one reports 'idea-app-data 0'; ask Ops to update/)
+        await expect(assertAppDataHelper()).rejects.toThrow(/needs the app-data root helper \/usr\/local\/sbin\/idea-app-data version 2, but the installed one reports 'idea-app-data 0'; ask Ops to update/)
     })
 
     it('refuses to start when the helper is missing or sudo will not run it', async () => {
@@ -195,14 +224,28 @@ describe('startup version check', () => {
 })
 
 describe('remote delete', () => {
-    it('ssh pi@<host> -- "sudo -n /usr/local/sbin/idea-app-data delete <root> <id>"', async () => {
-        await deleteRemoteInstanceData('192.168.1.44', 'sdb1', 'new1')
+    it('ssh <peer options> pi@<host> -- "sudo -n /usr/local/sbin/idea-app-data delete <root> <id>"', async () => {
+        await deleteRemoteInstanceData('192.168.1.44', 'ENGINE_idea04', 'sdb1', 'new1')
         const calls = (await fs.readFile(path.join(tmp, 'ssh.log'), 'utf8')).split('\n').filter(Boolean).map(l => JSON.parse(l))
-        expect(calls).toEqual([['-o', 'StrictHostKeyChecking=no', '-o', 'BatchMode=yes', 'pi@192.168.1.44', '--', 'sudo -n /usr/local/sbin/idea-app-data delete sdb1 new1']])
+        expect(calls).toEqual([[...peerSshOptions('ENGINE_idea04'), 'pi@192.168.1.44', '--', 'sudo -n /usr/local/sbin/idea-app-data delete sdb1 new1']])
     })
     it('a failing ssh rejects', async () => {
         process.env.FAKE_SSH_EXIT = '255'
-        await expect(deleteRemoteInstanceData('192.168.1.44', 'sdb1', 'new1')).rejects.toThrow()
+        await expect(deleteRemoteInstanceData('192.168.1.44', 'ENGINE_idea04', 'sdb1', 'new1')).rejects.toThrow()
+    })
+})
+
+describe('runAppDataWithInput (sync-peers)', () => {
+    it('sudo -n idea-app-data sync-peers with the peer set on stdin; a refusal rejects with the refused: line', async () => {
+        const sb = await makeAppDataSandbox()
+        try {
+            process.env.FAKE_HELPER = sb.script
+            process.env.SUDO_USER = 'pi'
+            const out = await runAppDataWithInput(['sync-peers'], '')
+            expect(out.trim()).toBe('sync-peers: 0 peer(s); authorized_keys updated; known_hosts updated')
+            expect(await sudoCalls()).toEqual([['-n', '/usr/local/sbin/idea-app-data', 'sync-peers']])
+            await expect(runAppDataWithInput(['sync-peers'], 'garbage\n')).rejects.toThrow(/^idea-app-data sync-peers refused: peer line 1 is not/)
+        } finally { await fs.remove(sb.tmp) }
     })
 })
 
@@ -226,13 +269,13 @@ describe('rsyncInstanceData', () => {
     })
 
     it('send: sudo -n idea-app-data send … <host> …', async () => {
-        await rsyncInstanceData({ kind: 'send', srcRoot: 'sdb1', srcId: 'inst-1', host: '10.0.0.4', dstRoot: 'sdc1', dstId: 'new1' })
-        expect(await sudoCalls()).toEqual([['-n', '/usr/local/sbin/idea-app-data', 'send', 'sdb1', 'inst-1', '10.0.0.4', 'sdc1', 'new1']])
+        await rsyncInstanceData({ kind: 'send', srcRoot: 'sdb1', srcId: 'inst-1', host: '10.0.0.4', peerEngineId: 'ENGINE_p4', dstRoot: 'sdc1', dstId: 'new1' })
+        expect(await sudoCalls()).toEqual([['-n', '/usr/local/sbin/idea-app-data', 'send', 'sdb1', 'inst-1', '10.0.0.4', 'ENGINE_p4', 'sdc1', 'new1']])
         expect((await sb.calls('rsync'))[0].argv.at(-1)).toBe('pi@10.0.0.4:.')
     })
 
     it('a helper refusal rejects with the refused: line', async () => {
-        await expect(rsyncInstanceData({ kind: 'send', srcRoot: 'sdb1', srcId: 'inst-1', host: '8.8.8.8', dstRoot: 'sdc1', dstId: 'new1' }))
+        await expect(rsyncInstanceData({ kind: 'send', srcRoot: 'sdb1', srcId: 'inst-1', host: '8.8.8.8', peerEngineId: 'ENGINE_p4', dstRoot: 'sdc1', dstId: 'new1' }))
             .rejects.toThrow(/^rsync \(idea-app-data send refused: host '8\.8\.8\.8' resolves to 8\.8\.8\.8, which is not a private LAN/)
     })
 

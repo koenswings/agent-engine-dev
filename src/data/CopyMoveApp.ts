@@ -5,14 +5,19 @@
  *
  * Phase 1: same-engine — source and target on local engine.
  * Phase 2: cross-engine — source on local engine, target on remote engine;
- *   rsync over SSH, remote start via sendCommand.
+ *   rsync over ssh with this Engine's own key (per-Pi Engine keys,
+ *   data/PeerAccess.ts, utils/peerSsh.ts), remote start via sendCommand. Every
+ *   remote step runs the peer's helper through its gate (ensure-dirs, receive-app,
+ *   receive / receive-files, receive-service, delete); none is a plain ssh command.
  */
 
 import { chalk, fs, $ } from 'zx'
 import { log } from '../utils/utils.js'
-import { rsyncDirectory, rsyncInstanceData } from '../utils/rsync.js'
-import { instanceDataBytes, deleteInstanceData, deleteRemoteInstanceData } from '../utils/appDataHelper.js'
-import { shellQuote } from '../utils/ssh.js'
+import { rsyncDirectory, rsyncInstanceData, rsyncToPeer, PeerEngine } from '../utils/rsync.js'
+import {
+    instanceDataBytes, deleteInstanceData, deleteRemoteInstanceData, ensureRemoteDirs,
+    receiveAppArgs, receiveFilesArgs, receiveServiceArgs,
+} from '../utils/appDataHelper.js'
 import {
     InstanceID, DiskID, DiskName, InstanceName, Timestamp,
     OperationKind, OperationCause, ServiceImage
@@ -160,32 +165,6 @@ const validate = async (
 // ── copyApp ───────────────────────────────────────────────────────────────────
 
 /**
- * The remote command that creates apps/, instances/ and services/ on the target disk of a
- * cross-engine copy (idea#80). It runs entirely on the remote Engine, as pi.
- *
- * - System disk (mount root '' or '/'): the folders live in '/', which only root can write.
- *   Uses the exact commands allowed by 10-engine.sudoers (full binary paths, non-recursive
- *   chown to pi). The paths are fixed, so no quoting is needed.
- * - App Disk (<disksRoot>/<device>): the disk root is writable by pi, so no sudo. The
- *   paths are single-quoted, so spaces or quotes in them stay one shell word.
- */
-export const SYSTEM_DISK_ENSURE_DIRS =
-    'sudo /usr/bin/mkdir -p /apps /instances /services && sudo /usr/bin/chown pi:pi /apps /instances /services'
-
-export const remoteEnsureDirsCommand = (targetMountRoot: string): string => {
-    if (targetMountRoot === '' || targetMountRoot === '/') return SYSTEM_DISK_ENSURE_DIRS
-    const dirs = ['apps', 'instances', 'services'].map(d => shellQuote(`${targetMountRoot}/${d}`))
-    return `mkdir -p ${dirs.join(' ')}`
-}
-
-/**
- * The argv for the ssh call: the whole remote command is ONE argument, so nothing
- * in it (such as '&&') is run by the local shell.
- */
-export const remoteEnsureDirsSshArgs = (remoteAddress: string, targetMountRoot: string): string[] =>
-    ['ssh', '-o', 'StrictHostKeyChecking=no', `pi@${remoteAddress}`, '--', remoteEnsureDirsCommand(targetMountRoot)]
-
-/**
  * Copy an app instance from sourceDisk to targetDisk.
  * The copy receives a fresh InstanceID — it is a brand new instance — and its
  * own name (`<name>-2`, `<name>-3`, …) and port (idea#168 r35).
@@ -249,6 +228,8 @@ export const copyApp = async (
     const remoteAddress = isCrossEngine
         ? getEngineAddress(targetDisk.dockedTo as any) as string
         : undefined
+    // The peer: its address now, and its Engine id (key and host key pinned by id)
+    const peer: PeerEngine | undefined = isCrossEngine ? { host: remoteAddress!, engineId: String(targetDisk.dockedTo) } : undefined
 
     // ── step definitions ──────────────────────────────────────────────────────
     const COPY_STEPS = [
@@ -289,11 +270,11 @@ export const copyApp = async (
         }
 
         // 3. Ensure target directory structure
-        // For cross-engine: SSH mkdir on remote Pi
+        // For cross-engine: the peer's helper (ensure-dirs <root>, through its gate)
         const targetMountRoot = await diskMountRoot(targetDisk) // '' for system disk (both local and remote)
-        if (isCrossEngine) {
-            log(`copyApp: ensuring remote directories on ${remoteAddress}`)
-            await $`${remoteEnsureDirsSshArgs(remoteAddress!, targetMountRoot)}`
+        if (peer) {
+            log(`copyApp: ensuring remote directories on ${peer.host} (Engine ${peer.engineId}, idea-app-data ensure-dirs ${targetRoot})`)
+            await ensureRemoteDirs(peer.host, peer.engineId, targetRoot)
         } else {
             await fs.ensureDir(`${targetMountRoot}/apps`)
             await fs.ensureDir(`${targetMountRoot}/instances`)
@@ -304,9 +285,11 @@ export const copyApp = async (
         setCopyStep(2)
         const appMasterDest = `${targetMountRoot}/apps/${appId}`
         log(`copyApp: syncing app master ${appMasterSrc} → ${isCrossEngine ? remoteAddress + ':' : ''}${appMasterDest}`)
-        await rsyncDirectory(appMasterSrc, appMasterDest, ({ progressPercent }) => {
+        const appMasterProgress = ({ progressPercent }: { progressPercent: number }) => {
             updateOperation(storeHandle, opId, { progressPercent: Math.round(progressPercent * 0.25) })
-        }, opId, remoteAddress)
+        }
+        if (peer) await rsyncToPeer(appMasterSrc.replace(/\/*$/, '/'), peer, receiveAppArgs(targetRoot, appId), appMasterProgress, opId)
+        else await rsyncDirectory(appMasterSrc, appMasterDest, appMasterProgress, opId)
 
         // 5. Copy instance data into a NEW instance directory (new ID), as root through
         //    the app-data helper (idea#168): owners and modes are kept, and data pi
@@ -317,8 +300,8 @@ export const copyApp = async (
         createdInstanceDest = instanceDest
         log(`copyApp: syncing instance data ${instanceSrc} → ${isCrossEngine ? remoteAddress + ':' : ''}${instanceDest} (idea-app-data ${isCrossEngine ? 'send' : 'copy'})`)
         await rsyncInstanceData(
-            isCrossEngine
-                ? { kind: 'send', srcRoot: sourceRoot, srcId: instance.id, host: remoteAddress!, dstRoot: targetRoot, dstId: newInstanceId }
+            peer
+                ? { kind: 'send', srcRoot: sourceRoot, srcId: instance.id, host: peer.host, peerEngineId: peer.engineId, dstRoot: targetRoot, dstId: newInstanceId }
                 : { kind: 'copy', srcRoot: sourceRoot, srcId: instance.id, dstRoot: targetRoot, dstId: newInstanceId },
             ({ progressPercent }) => {
                 updateOperation(storeHandle, opId, { progressPercent: 25 + Math.round(progressPercent * 0.30) })
@@ -333,11 +316,13 @@ export const copyApp = async (
         const prepared = await preparedCopyFiles(instanceSrc, copyName)
         const preparedNames = Object.keys(prepared) as (keyof typeof prepared)[]
         if (preparedNames.length > 0) {
-            if (isCrossEngine) {
+            if (peer) {
                 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-copy-'))
                 try {
                     for (const f of preparedNames) await fs.writeFile(`${tmp}/${f}`, prepared[f]!)
-                    await rsyncDirectory(tmp, instanceDest, undefined, opId, remoteAddress)
+                    // only into the folder this Engine's receive just created (the peer's gate checks
+                    // its ledger); the files only, so the instance folder keeps its own owner and mode
+                    await rsyncToPeer(preparedNames.map(f => `${tmp}/${f}`), peer, receiveFilesArgs(targetRoot, newInstanceId), undefined, opId)
                 } finally {
                     await fs.remove(tmp).catch(() => undefined)
                 }
@@ -361,8 +346,8 @@ export const copyApp = async (
                 const tarSrc = `${copyServicesSrcDir}/${tarName}`
                 if (await fs.pathExists(tarSrc)) {
                     log(`copyApp: syncing service image ${tarName}`)
-                    if (isCrossEngine) {
-                        await $`rsync -a -e ${'ssh -o StrictHostKeyChecking=no'} ${tarSrc} pi@${remoteAddress}:${copyServicesDestDir}/`
+                    if (peer) {
+                        await rsyncToPeer(tarSrc, peer, receiveServiceArgs(targetRoot), undefined, opId)
                     } else {
                         await $`rsync -a ${tarSrc} ${copyServicesDestDir}/`
                     }
@@ -445,7 +430,7 @@ export const copyApp = async (
         // (idea#168): the copy holds files owned by root, 999 and www-data.
         if (createdInstanceDest && !storeHandle.doc()?.instanceDB?.[newInstanceId]) {
             try {
-                if (isCrossEngine) await deleteRemoteInstanceData(remoteAddress!, targetRoot, newInstanceId)
+                if (peer) await deleteRemoteInstanceData(peer.host, peer.engineId, targetRoot, newInstanceId)
                 else await deleteInstanceData(targetRoot, newInstanceId)
                 log(`copyApp: removed the partial copy ${isCrossEngine ? remoteAddress + ':' : ''}${createdInstanceDest}`)
             } catch (cleanupErr: any) {

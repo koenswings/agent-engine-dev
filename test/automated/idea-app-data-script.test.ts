@@ -12,6 +12,7 @@ import { spawn } from 'child_process'
 import { fs, path } from 'zx'
 import { makeAppDataSandbox, AppDataSandbox, HELPER_SOURCE } from '../harness/appDataSandbox.js'
 import { APP_DATA_HELPER, APP_DATA_HELPER_VERSION } from '../../src/utils/appDataHelper.js'
+import { peerSshOptions, PEER_KNOWN_HOSTS } from '../../src/utils/peerSsh.js'
 
 let sb: AppDataSandbox
 const created: AppDataSandbox[] = []
@@ -72,7 +73,8 @@ describe('idea-app-data: the source script (idea#168)', () => {
         expect(text).not.toMatch(/bash -c|sh -c/)
         // Every external command is a $VAR set to an absolute path
         for (const m of text.matchAll(/^([A-Z_]+)=(\/\S+)$/gm)) {
-            if (['PATH', 'DISKS_DIR', 'ROOTS_FILE', 'LOCK_DIR', 'ROOT_HOME', 'HELPER_PATH'].includes(m[1])) continue
+            if (['PATH', 'DISKS_DIR', 'ROOTS_FILE', 'LOCK_DIR', 'ROOT_HOME', 'HELPER_PATH',
+                'PEER_KEY', 'PEER_KNOWN_HOSTS', 'PEER_AUTH_DIR', 'PEER_GATE', 'LEDGER_DIR'].includes(m[1])) continue
             expect(m[2], m[1]).toMatch(/^\/usr\/(s?bin)\/[a-z.]+$/)
         }
     })
@@ -101,8 +103,9 @@ describe('idea-app-data: argument checks', () => {
 
     it('refuses the wrong argument count for every subcommand', async () => {
         const cases: [string, number][] = [
-            ['version', 0], ['size', 2], ['copy', 4], ['send', 5], ['delete', 2],
+            ['version', 0], ['size', 2], ['copy', 4], ['send', 6], ['delete', 2],
             ['borg-init', 2], ['borg-info', 2], ['borg-create', 4], ['borg-extract', 5],
+            ['ensure-dirs', 1], ['peer-delete', 3], ['sync-peers', 0],
         ]
         for (const [sub, n] of cases) {
             for (const count of [n - 1, n + 1]) {
@@ -131,7 +134,7 @@ describe('idea-app-data: argument checks', () => {
         }
         await sb.addInstance(path.join(sb.disks, 'sdb1'), 'inst1')
         for (const host of ['-oProxyCommand=touch /tmp/pwned', '-oProxyCommand=x', 'a/b', 'idea04..local', 'host name', '']) {
-            refused(await sb.run(['send', 'sdb1', 'inst1', host, 'sdc1', 'new1']), /host '.*' is not an IPv4 address or host name/)
+            refused(await sb.run(['send', 'sdb1', 'inst1', host, 'ENGINE_peer4', 'sdc1', 'new1']), /host '.*' is not an IPv4 address or host name/)
         }
         expect(await sb.calls('rsync')).toEqual([])
     })
@@ -245,7 +248,7 @@ describe('idea-app-data: copy', () => {
         // chain: a link inside the slot that points at a link leaving it
         await fs.symlink('/tmp', path.join(inst, 'data', 'hop2'))
         await fs.symlink('hop2', path.join(inst, 'data', 'hop1'))
-        refused(await sb.run(['send', 'sdb1', 'inst1', '10.0.0.4', 'sdc1', 'new1']), /'data\/hop1' -> '\/tmp'.*'data\/hop2'|'data\/hop2'.*'data\/hop1'/)
+        refused(await sb.run(['send', 'sdb1', 'inst1', '10.0.0.4', 'ENGINE_peer4', 'sdc1', 'new1']), /'data\/hop1' -> '\/tmp'.*'data\/hop2'|'data\/hop2'.*'data\/hop1'/)
         expect(await fs.pathExists(path.join(dst, 'instances', 'new1'))).toBe(false)
         expect(await sb.calls('rsync')).toEqual([])
     })
@@ -256,13 +259,13 @@ describe('idea-app-data: send and receive', () => {
         await sb.addInstance(await sb.addDisk('sdb1'), 'inst1')
     })
 
-    it('sends to a private address: runuser -u pi ssh, the remote helper receive as --rsync-path, pi@<ip>:.', async () => {
-        const r = await sb.run(['send', 'sdb1', 'inst1', '10.0.0.4', 'sdc1', 'new1'])
+    it('sends to a private address: runuser -u pi ssh with the Engine key and the pinned host key (HostKeyAlias=<peer>), the remote helper receive as --rsync-path, pi@<ip>:.', async () => {
+        const r = await sb.run(['send', 'sdb1', 'inst1', '10.0.0.4', 'ENGINE_peer4', 'sdc1', 'new1'])
         expect(r.exitCode, r.stderr).toBe(0)
         const [call] = await sb.calls('rsync')
         expect(call.argv).toEqual([
             '-aHAX', '--numeric-ids', '-x', '--info=progress2', '--no-inc-recursive',
-            '-e', '/usr/sbin/runuser -u pi -- /usr/bin/ssh -o StrictHostKeyChecking=no -o BatchMode=yes',
+            '-e', `${sb.bin}/runuser -u pi -- /usr/bin/ssh ${peerSshOptions('ENGINE_peer4').join(' ').replace(PEER_KNOWN_HOSTS, sb.peerKnownHosts)}`,
             '--rsync-path=/usr/bin/sudo -n /usr/local/sbin/idea-app-data receive sdc1 new1',
             '--', './', 'pi@10.0.0.4:.',
         ])
@@ -271,31 +274,31 @@ describe('idea-app-data: send and receive', () => {
 
     it('accepts 10/8, 172.16/12, 192.168/16, 100.64/10 and a host name that resolves only to those (connects to the resolved address)', async () => {
         for (const ip of ['10.255.0.1', '172.16.0.1', '172.31.255.254', '192.168.1.20', '100.64.0.1', '100.127.255.254']) {
-            const r = await sb.run(['send', 'sdb1', 'inst1', ip, 'sdc1', 'new1'])
+            const r = await sb.run(['send', 'sdb1', 'inst1', ip, 'ENGINE_peer4', 'sdc1', 'new1'])
             expect(r.exitCode, `${ip}: ${r.stderr}`).toBe(0)
         }
         await fs.writeFile(sb.hosts, 'idea04.local 192.168.1.44\nidea04.tail.ts.net 100.101.102.103\n')
-        expect((await sb.run(['send', 'sdb1', 'inst1', 'idea04.local', 'sdc1', 'new1'])).exitCode).toBe(0)
+        expect((await sb.run(['send', 'sdb1', 'inst1', 'idea04.local', 'ENGINE_peer4', 'sdc1', 'new1'])).exitCode).toBe(0)
         expect((await sb.calls('rsync')).at(-1)!.argv.at(-1)).toBe('pi@192.168.1.44:.')
-        expect((await sb.run(['send', 'sdb1', 'inst1', 'idea04.tail.ts.net', 'sdc1', 'new1'])).exitCode).toBe(0)
+        expect((await sb.run(['send', 'sdb1', 'inst1', 'idea04.tail.ts.net', 'ENGINE_peer4', 'sdc1', 'new1'])).exitCode).toBe(0)
         expect((await sb.calls('rsync')).at(-1)!.argv.at(-1)).toBe('pi@100.101.102.103:.')
     })
 
     it('refuses a public IP, loopback, near-miss ranges and an unresolvable host', async () => {
-        refused(await sb.run(['send', 'sdb1', 'inst1', '8.8.8.8', 'sdc1', 'new1']), /resolves to 8\.8\.8\.8, which is not a private LAN .* or Tailscale/)
-        refused(await sb.run(['send', 'sdb1', 'inst1', '127.0.0.1', 'sdc1', 'new1']), /resolves to loopback 127\.0\.0\.1/)
+        refused(await sb.run(['send', 'sdb1', 'inst1', '8.8.8.8', 'ENGINE_peer4', 'sdc1', 'new1']), /resolves to 8\.8\.8\.8, which is not a private LAN .* or Tailscale/)
+        refused(await sb.run(['send', 'sdb1', 'inst1', '127.0.0.1', 'ENGINE_peer4', 'sdc1', 'new1']), /resolves to loopback 127\.0\.0\.1/)
         for (const ip of ['172.32.0.1', '172.15.255.255', '192.169.0.1', '100.128.0.1', '100.63.255.255', '11.0.0.1', '0.0.0.0']) {
-            refused(await sb.run(['send', 'sdb1', 'inst1', ip, 'sdc1', 'new1']), /not a private LAN/)
+            refused(await sb.run(['send', 'sdb1', 'inst1', ip, 'ENGINE_peer4', 'sdc1', 'new1']), /not a private LAN/)
         }
-        refused(await sb.run(['send', 'sdb1', 'inst1', 'nowhere.invalid', 'sdc1', 'new1']), /does not resolve/)
+        refused(await sb.run(['send', 'sdb1', 'inst1', 'nowhere.invalid', 'ENGINE_peer4', 'sdc1', 'new1']), /does not resolve/)
         expect(await sb.calls('rsync')).toEqual([])
     })
 
     it('refuses a host name that resolves to a public address, even when another address is private', async () => {
         await fs.writeFile(sb.hosts, 'evil.example 93.184.216.34\nmixed.example 192.168.1.5\nmixed.example 1.1.1.1\nlo.example 127.0.1.1\n')
-        refused(await sb.run(['send', 'sdb1', 'inst1', 'evil.example', 'sdc1', 'new1']), /'evil\.example' resolves to 93\.184\.216\.34, which is not a private/)
-        refused(await sb.run(['send', 'sdb1', 'inst1', 'mixed.example', 'sdc1', 'new1']), /resolves to 1\.1\.1\.1/)
-        refused(await sb.run(['send', 'sdb1', 'inst1', 'lo.example', 'sdc1', 'new1']), /loopback/)
+        refused(await sb.run(['send', 'sdb1', 'inst1', 'evil.example', 'ENGINE_peer4', 'sdc1', 'new1']), /'evil\.example' resolves to 93\.184\.216\.34, which is not a private/)
+        refused(await sb.run(['send', 'sdb1', 'inst1', 'mixed.example', 'ENGINE_peer4', 'sdc1', 'new1']), /resolves to 1\.1\.1\.1/)
+        refused(await sb.run(['send', 'sdb1', 'inst1', 'lo.example', 'ENGINE_peer4', 'sdc1', 'new1']), /loopback/)
         expect(await sb.calls('rsync')).toEqual([])
     })
 
