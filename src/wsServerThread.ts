@@ -29,13 +29,14 @@
  */
 
 import { Worker } from 'worker_threads'
+import { next as A } from '@automerge/automerge'
 import { NetworkAdapter, Message, PeerId, PeerMetadata } from '@automerge/automerge-repo'
 import { log, error } from './utils/utils.js'
 import type { WsServerThreadData } from './wsServerThreadWorker.js'
 
 const RESTART_DELAY_MS = 1000
 
-type QueuedEvent = { event: 'peer-candidate' | 'peer-disconnected' | 'message', payload: any }
+export type QueuedEvent = { event: 'peer-candidate' | 'peer-disconnected' | 'message', payload: any }
 
 /**
  * Start the worker module next to this one: .js when compiled (the Engine runs
@@ -49,6 +50,16 @@ const startWorker = (workerData: WsServerThreadData): Worker => {
     const boot = `import('tsx/esm/api').then(m => m.register()).then(() => import(${JSON.stringify(tsUrl)}))`
     return new Worker(boot, { eval: true, workerData })
 }
+
+/** A sync/request message that carries changes must be applied even if its sender has left. */
+export const carriesChanges = (msg: any): boolean => {
+    if ((msg?.type !== 'sync' && msg?.type !== 'request') || !msg.data) return false
+    try { return A.decodeSyncMessage(msg.data).changes.length > 0 } catch { return true }
+}
+
+/** The queue without `peerId`'s messages that carry no changes (see #dropQueuedFrom). */
+export const pruneDepartedMessages = (queue: QueuedEvent[], peerId: PeerId): QueuedEvent[] =>
+    queue.filter(e => !(e.event === 'message' && e.payload?.senderId === peerId && !carriesChanges(e.payload)))
 
 export class ThreadedWebSocketServerAdapter extends NetworkAdapter {
     readonly port: number
@@ -128,6 +139,7 @@ export class ThreadedWebSocketServerAdapter extends NetworkAdapter {
     #onWorkerMessage(m: any): void {
         switch (m?.type) {
             case 'event':
+                if (m.event === 'peer-disconnected') this.#dropQueuedFrom(m.payload?.peerId)
                 this.#enqueue({ event: m.event, payload: m.payload })
                 break
             case 'ready':
@@ -145,6 +157,26 @@ export class ThreadedWebSocketServerAdapter extends NetworkAdapter {
                 break
         }
     }
+
+    /**
+     * r34 POST-BURST-CPU: the peer's socket is gone. Its messages still waiting in
+     * the queue would each cost a receiveSyncMessage + generateSyncMessage on the
+     * main thread (seconds for a full sync on a Pi 4) for a reply nobody can
+     * receive; after a burst of short-lived clients that kept idea04's main thread
+     * at 100% for ~2 min while new clients got nothing. Drop them, EXCEPT sync
+     * messages that carry changes: those may hold the peer's last edits and must
+     * still be applied to the doc.
+     */
+    #dropQueuedFrom(peerId: PeerId | undefined): void {
+        if (!peerId) return
+        const before = this.#queue.length
+        this.#queue = pruneDepartedMessages(this.#queue, peerId)
+        const dropped = before - this.#queue.length
+        if (dropped > 0) this.droppedFromDeparted += dropped
+    }
+
+    /** Messages dropped because their sender had disconnected (diagnostics/tests). */
+    droppedFromDeparted = 0
 
     #enqueue(e: QueuedEvent): void {
         this.#queue.push(e)

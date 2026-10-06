@@ -1,4 +1,4 @@
-import { Repo } from "@automerge/automerge-repo";
+import { Repo, PeerMetadata } from "@automerge/automerge-repo";
 import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
 import { ThreadedWebSocketServerAdapter } from "./wsServerThread.js";
 import { PortNumber } from "./data/CommonTypes.js";
@@ -63,6 +63,23 @@ export const stopPeriodicFlush = async (repo: Repo): Promise<void> => {
 /** Keepalive ping interval of the Engine's WS server (adapter default: 5000 ms). */
 export const WS_KEEPALIVE_INTERVAL_MS = 30_000
 
+/**
+ * Share policy (r34 POST-BURST-CPU). With `async () => true` the Engine announced
+ * EVERY document it holds (store, command logs, golden doc, relayed foreign docs:
+ * 6-9 docs, ~3 MB on idea04) to EVERY peer that connected, so each fresh Console tab
+ * or probe got a full sync of all of them, unasked, on top of the store it asked for
+ * (r34 raw/ws/conc6-idea04e-*.json: 6 unrequested docs per client).
+ *
+ * Announce only to peers that persist documents (other Engines: they have storage,
+ * so isEphemeral is false) - Engine-to-Engine replication and relaying stay as they
+ * are. Storage-less clients (Console, walker/probe, CLI) get exactly what they
+ * find(): a request is always answered (also for a doc this Engine has to fetch
+ * from its Engine peers first), and after it the peer receives live updates for
+ * that doc. Unknown metadata (should not happen: the WS join carries it) is
+ * treated as an Engine, i.e. the old behaviour.
+ */
+export const shouldAnnounceTo = (meta: PeerMetadata | undefined): boolean => meta?.isEphemeral !== true
+
 export const startAutomergeServer = async (dataDir:string, port:PortNumber):Promise<Repo> => {
     log(`Using data directory: ${dataDir}`);
 
@@ -79,10 +96,10 @@ export const startAutomergeServer = async (dataDir:string, port:PortNumber):Prom
     const network = new ThreadedWebSocketServerAdapter(port, WS_KEEPALIVE_INTERVAL_MS);
 
     // 3. Create the Automerge repo.
-    const repo = new Repo({
+    const repo: Repo = new Repo({
         storage: storage,
         network: [network],
-        sharePolicy: async (peerId) => true // Allow all peers to sync
+        sharePolicy: async (peerId) => shouldAnnounceTo(repo.peerMetadataByPeerId[peerId])
     });
 
     startPeriodicFlush(repo);
