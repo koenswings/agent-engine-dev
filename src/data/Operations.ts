@@ -237,14 +237,22 @@ export const cancelOperation = (
  */
 export const recoverInterruptedOperations = async (
     storeHandle: DocHandle<Store>,
-    retryHandlers: Partial<Record<OperationKind, (args: Record<string, string>, storeHandle: DocHandle<Store>) => Promise<void>>>
+    retryHandlers: Partial<Record<OperationKind, (args: Record<string, string>, storeHandle: DocHandle<Store>) => Promise<void>>>,
+    engineId: EngineID = localEngineId,
 ): Promise<void> => {
     const store = storeHandle.doc()
     if (!store.operationDB) return
 
-    const interrupted = Object.values(store.operationDB).filter(
-        op => op.status === 'Running' || op.status === 'Pending'
+    // operationDB is shared by all Engines. Only this Engine's own operations
+    // (Operation.engineId, set by createOperation) were interrupted by this
+    // restart; another Engine's Running/Pending op is still running there, and an
+    // op without an engineId has an unknown owner. Both are left alone.
+    const unfinished = Object.values(store.operationDB).filter(
+        op => op && (op.status === 'Running' || op.status === 'Pending')
     )
+    const interrupted = unfinished.filter(op => op.engineId && String(op.engineId) === String(engineId))
+    const others = unfinished.length - interrupted.length
+    if (others > 0) log(`recoverInterruptedOperations: leaving ${others} unfinished operation(s) of other (or unknown) Engines alone`)
     if (interrupted.length === 0) return
 
     log(`recoverInterruptedOperations: ${interrupted.length} interrupted operation(s) found`)

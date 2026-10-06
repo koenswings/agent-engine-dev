@@ -8,7 +8,7 @@ import { config } from './data/Config.js'
 import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
 import { enableHttpMonitor } from './monitors/httpMonitor.js'
-import { DocumentId, Repo, DocHandle } from '@automerge/automerge-repo'
+import { DocumentId, Repo } from '@automerge/automerge-repo'
 import { startAutomergeServer } from './repo.js'
 import { enableMulticastDNSEngineMonitor } from './monitors/mdnsMonitor.js'
 import { startStaticPeers, staticPeersSetting } from './data/StaticPeers.js'
@@ -25,12 +25,11 @@ import { diskFsRoot } from './data/Disk.js'
 import { copyApp, moveApp } from './data/CopyMoveApp.js'
 import { backupInstance } from './monitors/backupMonitor.js'
 import { clearStaleUnmountErrors } from './monitors/mounts.js'
-import { InstanceID } from './data/CommonTypes.js'
-import { Status } from './data/Instance.js'
-import { Store } from './data/Store.js'
 import { createCommandLogStore, shutdownRepo } from './data/CommandLogStore.js'
 import { initCommandLogger } from './utils/CommandLogger.js'
 import { assertAppDataHelper } from './utils/appDataHelper.js'
+import { checkAndSetUndockedApps } from './data/UndockedApps.js'
+export { checkAndSetUndockedApps }
 
 
 
@@ -121,7 +120,8 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // point is no longer mounted, or now holds another filesystem (fsUuid).
     await clearStaleUnmountErrors(storeHandle, localEngineId).catch(e => log(`Could not clear stale unmount errors: ${e}`))
 
-    // Check for undocked apps after restart
+    // Check for undocked apps after restart: only instances on disks docked on
+    // this Engine (Disk.dockedTo); other Engines' instances are left alone
     await checkAndSetUndockedApps(storeHandle)
 
     // Crash recovery: retry idempotent interrupted ops; mark others Failed
@@ -234,29 +234,6 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
 
 }
 
-
-export const checkAndSetUndockedApps = async (storeHandle: DocHandle<Store>): Promise<void> => {
-    const { instanceDB } = storeHandle.doc();
-    const promises = Object.keys(instanceDB).map(async (instanceId) => {
-        const instance = instanceDB[instanceId];
-        if (instance.status !== "Undocked") {
-            try {
-                const result = await $`docker ps -q -f name=${instance.id}`;
-                if (result.stdout.trim() === "") {
-                    // No container running, set to undocked
-                    log(`Setting status of instance ${instanceId} to Undocked`)
-                    storeHandle.change(doc => {
-                          const inst = doc.instanceDB[instanceId]
-                          inst.status = 'Undocked' as Status 
-                        })
-                }
-            } catch (error) {
-                console.error(`Error checking docker status for ${instance.name}: ${error}`);
-            }
-        }
-    });
-    await Promise.all(promises);
-};
 
 async function shutdownProcedure(repo: Repo, httpServer?: import('http').Server, mdnsHandle?: { end: () => Promise<void> }): Promise<void> {
     print('*** Engine is now closing ***');
