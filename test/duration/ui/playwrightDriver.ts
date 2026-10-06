@@ -91,6 +91,30 @@ type PwPage = {
     locator: (sel: string) => PwLocator
     reload: () => Promise<unknown>
     waitForTimeout: (ms: number) => Promise<void>
+    evaluate?: <T>(fn: () => T) => Promise<T>
+}
+
+/** r30 reboot_engine: one Console NetworkTree engine row as seen in the DOM. */
+export type ConsoleEngineRow = { testId: string; label: string; online: boolean }
+
+/**
+ * r30: is `hostname` shown online? Console 0760c01/c981361 NetworkTree renders
+ * `[data-testid="engine-<storeId>"]` with `.tree-item__label` = hostname and
+ * `.tree-item__status-dot--online` (lastRun within 90s); the status bar shows
+ * `.status-bar__dot--connected` while the Console's own WS is up.
+ */
+export const consoleEngineOnline = (
+    rows: ConsoleEngineRow[],
+    statusConnected: boolean,
+    hostname: string,
+): { ok: boolean; detail: string } => {
+    const want = hostname.trim().replace(/\.local$/i, '').toLowerCase()
+    const row = rows.find(r => r.label.trim().replace(/\.local$/i, '').toLowerCase() === want)
+    const seen = rows.map(r => `${r.label || '?'}=${r.online ? 'online' : 'offline'}`).join(', ') || 'none'
+    if (!statusConnected) return { ok: false, detail: `status bar not connected; rows=[${seen}]` }
+    if (!row) return { ok: false, detail: `no engine row labelled ${hostname}; rows=[${seen}]` }
+    if (!row.online) return { ok: false, detail: `engine row ${row.testId} (${row.label}) offline; rows=[${seen}]` }
+    return { ok: true, detail: `engine row ${row.testId} (${row.label}) online; status bar connected` }
 }
 
 /** Prefer A r21: Console NetworkTree disk row testid (Pixel sel.disk). */
@@ -448,6 +472,49 @@ export class PlaywrightUiDriver implements UiDriver {
         throw new Error(
             `selectDisk: ${rowSel} ${clicked ? 'clicked but EmptyDiskPanel never visible' : 'never visible in NetworkTree'} ` +
                 `within ${budget}ms. Prefer A — refuse to act on another Empty Disk.`,
+        )
+    }
+
+    /** r30 reboot_engine: see UiDriver.waitEngineOnline. */
+    async waitEngineOnline(
+        hostname: string,
+        opts: { timeoutMs?: number; allowReload?: boolean } = {},
+    ): Promise<string> {
+        await this.ensureReady()
+        const page = this.page as PwPage
+        if (typeof page.evaluate !== 'function') {
+            throw new Error('waitEngineOnline: Playwright page has no evaluate()')
+        }
+        const budget = opts.timeoutMs ?? 180_000
+        const start = Date.now()
+        let reloaded = false
+        let last = 'not sampled'
+        while (Date.now() - start < budget) {
+            const snap = await page
+                .evaluate(() => {
+                    const rows = Array.from(document.querySelectorAll('.tree-item--engine')).map(el => ({
+                        testId: el.getAttribute('data-testid') ?? '',
+                        label: (el.querySelector('.tree-item__label')?.textContent ?? '').trim(),
+                        online: !!el.querySelector('.tree-item__status-dot--online'),
+                    }))
+                    const statusConnected = !!document.querySelector('.status-bar__dot--connected')
+                    return { rows, statusConnected }
+                })
+                .catch((e: unknown) => ({ rows: [] as ConsoleEngineRow[], statusConnected: false, err: String(e) }))
+            const verdict = consoleEngineOnline(snap.rows, snap.statusConnected, hostname)
+            if (verdict.ok) {
+                return `${verdict.detail} after ${Date.now() - start}ms${reloaded ? ' (after one allowed reload)' : ''}`
+            }
+            last = verdict.detail
+            if (opts.allowReload && !reloaded && Date.now() - start > budget / 2) {
+                reloaded = true
+                await page.reload().catch(() => undefined)
+            }
+            await page.waitForTimeout(1_000)
+        }
+        throw new Error(
+            `Console did not show ${hostname} online within ${budget}ms (${last})` +
+                `${opts.allowReload ? '' : '; no reload attempted (DURATION_REBOOT_ALLOW_RELOAD=1 allows one)'}`,
         )
     }
 

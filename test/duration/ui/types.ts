@@ -51,5 +51,15 @@ export interface UiDriver {
         diskId: string,
         opts?: { timeoutMs?: number; requireEmptyPanel?: boolean; requireAddFiles?: boolean },
     ): Promise<string>
+    /**
+     * Optional (r30 reboot_engine): wait until the Console NetworkTree shows the engine row
+     * for `hostname` with an online status dot AND the status bar is connected. Throws
+     * (fail loud) on timeout. No page reload unless opts.allowReload (one reload at half
+     * budget) — a reload would mask a Console that never reconnects by itself.
+     */
+    waitEngineOnline?(
+        hostname: string,
+        opts?: { timeoutMs?: number; allowReload?: boolean },
+    ): Promise<string>
     close?(): Promise<void>
 }

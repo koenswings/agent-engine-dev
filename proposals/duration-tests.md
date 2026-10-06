@@ -1554,6 +1554,8 @@ Authenticated operator Console UI click sequences. Intent-style names only. Prel
 #### Reboot Engine
 
 1. NetworkTree **Reboot** on a selected Engine (modelled from settings/hub) → wait reconnect → stay in `op_settings` until **Close Settings**.
+2. Before the click, record the Engine's `lastBooted` and its `commands` queue. If a bare command already sits at the queue head, it would never drain and would mask the result, so fail.
+3. Assert: `lastBooted` strictly advances within 10 min (the Console's reboot confirm budget). Afterwards the command queue head is empty (no leftover `reboot`). The Engine reconnects (fresh WS + store settle), and the Console NetworkTree shows its row online with the status bar connected. A dialog that was merely accepted is not a pass.
 
 ---
 

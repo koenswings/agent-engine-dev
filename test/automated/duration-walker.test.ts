@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { FakeFleetOps, dispatchAction, addFilesAppDiskId, ensureAppOnlyDiskOnConsoleEngine, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, redockEmpty001BeforeMakeFiles, resolveConsoleEngineHost, filesDiskTargetId, preflightFilesDiskTarget, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, resyncFixtureSidecarUrlsFromStore, locateInstanceEngine, verifyRestoreOperation, SIDECAR_SETTLE_ACTIONS, verifyBackupOperation, ensureBackupDiskForInstance, backupYamlLastBackup, predictCopyMovePair, preflightCopyMoveSamePi, nextcloudLoginFormLooksReady, nextcloudInitialState, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
+import { FakeFleetOps, dispatchAction, addFilesAppDiskId, ensureAppOnlyDiskOnConsoleEngine, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, redockEmpty001BeforeMakeFiles, resolveConsoleEngineHost, filesDiskTargetId, preflightFilesDiskTarget, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, resyncFixtureSidecarUrlsFromStore, locateInstanceEngine, verifyRestoreOperation, SIDECAR_SETTLE_ACTIONS, verifyBackupOperation, ensureBackupDiskForInstance, backupYamlLastBackup, predictCopyMovePair, preflightCopyMoveSamePi, resolveRebootTarget, verifyRebootEngine, REBOOT_CONFIRM_DEFAULT_MS, nextcloudLoginFormLooksReady, nextcloudInitialState, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
 import { semanticStoresEqual, waitForConvergence } from '../duration/convergence.js'
 import { evaluateInvariants, DEFAULT_INFRA_INVARIANTS, listInvariantTypes } from '../duration/invariants.js'
 import {
@@ -59,6 +59,7 @@ import {
     listFramePngs,
     sanitizeActionForFilename,
 } from '../duration/recordWalk.js'
+import { consoleEngineOnline } from '../duration/ui/playwrightDriver.js'
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
@@ -3081,5 +3082,174 @@ describe('r30: move_app same-Pi preflight (Eng 8d98718 refuses cross-engine move
             expect(seen).toEqual(['move_app'])
             expect(r.message).not.toMatch(/preflight/)
         })
+    })
+})
+
+describe('r30: reboot_engine must really reboot (lastBooted advances, queue drains, reconnect)', () => {
+    const POOL = ['idea01', 'idea03', 'idea04']
+    const ENV_KEYS = ['DURATION_REBOOT_CONFIRM_MS', 'DURATION_REBOOT_QUEUE_DRAIN_MS', 'DURATION_REBOOT_RECONNECT_MS', 'DURATION_REBOOT_POLL_MS', 'DURATION_REBOOT_ALLOW_RELOAD'] as const
+    const FAST = { DURATION_REBOOT_CONFIRM_MS: '60', DURATION_REBOOT_QUEUE_DRAIN_MS: '60', DURATION_REBOOT_RECONNECT_MS: '60', DURATION_REBOOT_POLL_MS: '5' }
+    const withEnv = async (vars: Partial<Record<(typeof ENV_KEYS)[number], string>>, fn: () => Promise<void>) => {
+        const prev: Record<string, string | undefined> = {}
+        for (const k of ENV_KEYS) {
+            prev[k] = process.env[k]
+            if (vars[k] === undefined) delete process.env[k]
+            else process.env[k] = vars[k]
+        }
+        try {
+            await fn()
+        } finally {
+            for (const k of ENV_KEYS) {
+                if (prev[k] === undefined) delete process.env[k]
+                else process.env[k] = prev[k]
+            }
+        }
+    }
+    type St = { lastBooted: number; commands: string[] }
+    /**
+     * Fake live fleet. `before` = engine record before the click; `after` = what the
+     * Engine shows once the Console Intent has clicked reboot (Console pushes bare
+     * "reboot" onto engineDB[...].commands — c981361 src/store/engine.ts:266).
+     */
+    const fleet = (opts: { before?: St; after?: St; wsUp?: boolean; uiError?: string } = {}) => {
+        const ops = fakeOps({ poolEngines: POOL, excludeEngines: ['idea02'], storeMode: 'shared' })
+        const state = { clicked: false, intentEngine: undefined as string | undefined, via: [] as string[], reconnected: [] as string[], ui: [] as string[] }
+        const before: St = opts.before ?? { lastBooted: 1_000, commands: [] }
+        const after: St = opts.after ?? { lastBooted: 2_000, commands: [] }
+        const live = Object.assign(ops, {
+            readEngineState: async (via: string, target: string) => {
+                state.via.push(`${via}>${target}`)
+                const st = state.clicked ? after : before
+                return { liveId: `ENGINE_${target}`, lastBooted: st.lastBooted, lastRun: Date.now(), commands: [...st.commands] }
+            },
+            reconnectEngine: async (e: string) => {
+                state.reconnected.push(e)
+                return { wsUp: opts.wsUp ?? true, storeSynced: true }
+            },
+        })
+        const driver = new StubUiDriver()
+        Object.assign(driver, {
+            runIntent: async (req: any) => {
+                state.clicked = true
+                state.intentEngine = req.engineId
+                return { ok: true, mode: 'live', message: `runDurationIntent ok: ${req.action}` }
+            },
+            waitEngineOnline: async (host: string) => {
+                state.ui.push(host)
+                if (opts.uiError) throw new Error(opts.uiError)
+                return `engine row engine-ENGINE_${host} (${host}) online; status bar connected`
+            },
+        })
+        return { ops: live, driver, state }
+    }
+    const ctxFor = (ops: unknown, driver: unknown, dockedEngine: string | null = 'idea01') => ({
+        opts: { ops, rng: () => 0, settleTimeoutMs: 500, fast: true, stubUi: true, uiDriver: driver },
+        walker: { current: 'op_settings', layer: 'operator' as const, dockedEngine, step: 127 },
+        from: 'op_settings',
+        to: 'op_settings',
+        action: 'reboot_engine',
+        excludeEngines: ['idea02'],
+        poolEngines: POOL,
+        fixtureDisk: 'duration-kolibri-grade5a-001',
+        fixtureInstance: 'kolibri-grade5a-001',
+        fixtureDisks: ['duration-kolibri-grade5a-001'],
+        fixtureInstances: { ...KID_FIXTURES },
+    })
+
+    it('walks: reboot_engine stays the last step (cover-all @128, cover-registered-intents @102)', () => {
+        for (const [name, n] of [['cover-all', 128], ['cover-registered-intents', 102]] as const) {
+            const acts = loadWalk(name).steps.map(st => st.action)
+            expect(acts.length, name).toBe(n)
+            expect(acts.flatMap((a, i) => (a === 'reboot_engine' ? [i + 1] : [])), name).toEqual([n])
+        }
+        expect(REBOOT_CONFIRM_DEFAULT_MS).toBe(600_000)
+    })
+
+    it('happy path: lastBooted advances, queue empty, fresh WS + settle + Console row online → ok; Intent targets the same engine', async () => {
+        await withEnv(FAST, async () => {
+            const { ops, driver, state } = fleet()
+            const r = await dispatchAction(ctxFor(ops, driver, 'idea01') as any)
+            expect(r.ok, r.message).toBe(true)
+            expect(state.intentEngine).toBe('idea01')
+            expect(r.message).toMatch(/reboot_engine target idea01 \(ENGINE_idea01\) lastBooted before=1000; queue head=empty/)
+            expect(r.message).toMatch(/reboot_engine: idea01 lastBooted 1000→2000 after \d+ms; queue empty; fresh WS up \+ store synced; pool settled; engine row engine-ENGINE_idea01 \(idea01\) online; status bar connected/)
+            expect(state.reconnected).toEqual(['idea01'])
+            expect(state.ui).toEqual(['idea01'])
+            expect(state.via.some(v => v.startsWith('idea02'))).toBe(false)
+        })
+    })
+
+    it('lastBooted does not advance (bare "reboot" stuck at the queue head) → LOUD, names before/last and queue head', async () => {
+        await withEnv(FAST, async () => {
+            const { ops, driver } = fleet({ after: { lastBooted: 1_000, commands: ['reboot'] } })
+            const r = await dispatchAction(ctxFor(ops, driver) as any)
+            expect(r.ok).toBe(false)
+            expect(r.message).toMatch(/^reboot_engine: idea01 lastBooted did not advance within 60ms \(before=1000, last=1000\); queue head="reboot"/)
+            expect(r.message).toMatch(/\(Console Intent reported ok\)$/)
+        })
+    })
+
+    it('rebooted but a leftover "reboot" is still at the queue head → LOUD', async () => {
+        await withEnv(FAST, async () => {
+            const { ops, driver } = fleet({ after: { lastBooted: 2_000, commands: ['reboot'] } })
+            const r = await dispatchAction(ctxFor(ops, driver) as any)
+            expect(r.ok).toBe(false)
+            expect(r.message).toMatch(/^reboot_engine: idea01 rebooted \(lastBooted 1000→2000\) but its command queue head is still "reboot" after 60ms \(queue length 1\)/)
+        })
+    })
+
+    it('stale bare command at the queue head BEFORE the click → aborted before Intent (would mask the result)', async () => {
+        await withEnv(FAST, async () => {
+            const { ops, driver, state } = fleet({ before: { lastBooted: 1_000, commands: ['reboot', 'startInstance kolibri x'] } })
+            const r = await dispatchAction(ctxFor(ops, driver) as any)
+            expect(r.ok).toBe(false)
+            expect(r.message).toMatch(/^reboot_engine aborted before Intent: reboot_engine preflight: idea01 \(ENGINE_idea01\) command queue head is a stale bare command "reboot" \(queue length 2\)/)
+            expect(state.clicked).toBe(false)
+        })
+    })
+
+    it('no reconnect: harness WS never comes back, or the Console row stays offline → LOUD', async () => {
+        await withEnv(FAST, async () => {
+            const a = fleet({ wsUp: false })
+            const r1 = await dispatchAction(ctxFor(a.ops, a.driver) as any)
+            expect(r1.ok).toBe(false)
+            expect(r1.message).toMatch(/^reboot_engine: idea01 rebooted \(lastBooted 1000→2000\) but the harness could not open a fresh WS to it within 60ms/)
+            const b = fleet({ uiError: 'Console did not show idea01 online within 60ms (engine row engine-ENGINE_idea01 (idea01) offline; rows=[idea01=offline])' })
+            const r2 = await dispatchAction(ctxFor(b.ops, b.driver) as any)
+            expect(r2.ok).toBe(false)
+            expect(r2.message).toMatch(/^reboot_engine: idea01 rebooted \(lastBooted 1000→2000\) but Console did not show idea01 online within 60ms/)
+        })
+    })
+
+    it('target guards: never idea02, must be a pool engine; Fake ops (no readEngineState) skip every check', async () => {
+        await withEnv(FAST, async () => {
+            const { ops } = fleet()
+            const ctx = ctxFor(ops, null) as any
+            expect(() => resolveRebootTarget(ctx, 'idea02')).toThrow(/refused engine 'idea02'/)
+            expect(() => resolveRebootTarget(ctx, 'idea09')).toThrow(/not a pool engine/)
+            expect(resolveRebootTarget(ctx, undefined)).toBe('idea01')
+            const a = fleet()
+            const r = await dispatchAction(ctxFor(a.ops, a.driver, 'idea02') as any)
+            expect(r.ok).toBe(false)
+            expect(r.message).toMatch(/^reboot_engine aborted before Intent: reboot_engine: refused engine 'idea02'/)
+            expect(a.state.clicked).toBe(false)
+            const plain = fakeOps({ poolEngines: POOL, excludeEngines: ['idea02'], storeMode: 'shared' })
+            const driver = new StubUiDriver()
+            const r3 = await dispatchAction(ctxFor(plain, driver) as any)
+            expect(r3.ok, r3.message).toBe(true)
+            expect(r3.message).not.toMatch(/lastBooted/)
+            expect(await verifyRebootEngine(ctxFor(plain, null) as any, 'idea01', { liveId: 'x', lastBooted: 1, lastRun: 1, commands: [] })).toBeNull()
+        })
+    })
+
+    it('consoleEngineOnline: row online + status bar connected; offline / missing / disconnected fail with detail', () => {
+        const rows = [
+            { testId: 'engine-ENGINE_a', label: 'idea01', online: true },
+            { testId: 'engine-ENGINE_b', label: 'idea03.local', online: false },
+        ]
+        expect(consoleEngineOnline(rows, true, 'idea01')).toMatchObject({ ok: true })
+        expect(consoleEngineOnline(rows, true, 'idea03').detail).toMatch(/engine row engine-ENGINE_b \(idea03\.local\) offline/)
+        expect(consoleEngineOnline(rows, true, 'idea04').detail).toMatch(/no engine row labelled idea04/)
+        expect(consoleEngineOnline(rows, false, 'idea01').detail).toMatch(/status bar not connected/)
     })
 })

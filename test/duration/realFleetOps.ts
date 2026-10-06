@@ -782,6 +782,44 @@ export class RealFleetOps implements FleetOps {
         return { dest, backupYaml, repoEntries }
     }
 
+    /**
+     * r30 reboot_engine: read-only engine record of `targetEngine` as seen through the
+     * store of `viaEngine` (shared store: any pool engine; unique: the target itself).
+     * Returns lastBooted / lastRun / commands queue, or null when the record is absent.
+     */
+    async readEngineState(
+        viaEngine: string,
+        targetEngine: string,
+    ): Promise<{ liveId: string; lastBooted: number | null; lastRun: number | null; commands: string[] } | null> {
+        this.assertNotExcluded(viaEngine, 'readEngineState(via)')
+        const conn = await this.connect(viaEngine)
+        const doc = conn.storeHandle.doc()
+        if (!doc) throw new Error(`RealFleetOps: store doc not ready for ${viaEngine}`)
+        const liveId = this.liveIds.get(targetEngine) ?? this.discoverLiveEngineId(doc, targetEngine)
+        const eng = liveId
+            ? (doc.engineDB[liveId as keyof typeof doc.engineDB] as unknown as Record<string, unknown> | undefined)
+            : undefined
+        if (!liveId || !eng) return null
+        const num = (v: unknown) => (typeof v === 'number' ? v : null)
+        const cmds = Array.isArray(eng.commands) ? Array.from(eng.commands as unknown[]).map(String) : []
+        return { liveId, lastBooted: num(eng.lastBooted), lastRun: num(eng.lastRun), commands: cmds }
+    }
+
+    /**
+     * r30 reboot_engine: drop any cached connection and prove a FRESH WS + store sync to
+     * engineId (a cached Automerge doc survives a dead socket, so waitReady alone could
+     * report wsUp from cache right after a reboot).
+     */
+    async reconnectEngine(engineId: string, timeoutMs: number): Promise<SettleReady> {
+        this.assertNotExcluded(engineId, 'reconnectEngine')
+        await this.disconnect(engineId)
+        // connect() awaits whenReady(), which can hang on a dead host — bound it.
+        const timedOut = new Promise<SettleReady>(r =>
+            setTimeout(() => r({ wsUp: false, storeSynced: false }), timeoutMs + 5_000).unref?.(),
+        )
+        return Promise.race([this.waitReady(engineId, timeoutMs), timedOut])
+    }
+
     /** Exposed for tests / smoke reporting. */
     getLiveEngineId(logicalId: string): string | null {
         return this.liveIds.get(logicalId) ?? null

@@ -1607,6 +1607,208 @@ export const preflightCopyMoveSamePi = async (
     return `${op} preflight: same Pi ${desc} (store re-read)`
 }
 
+// ── r30: reboot_engine must really reboot (lastBooted advances, queue drains, reconnect) ──
+
+export type EngineStateRow = { liveId: string; lastBooted: number | null; lastRun: number | null; commands: string[] }
+
+type RebootOps = FleetOps & {
+    readEngineState?: (viaEngine: string, targetEngine: string) => Promise<EngineStateRow | null>
+    reconnectEngine?: (engineId: string, timeoutMs: number) => Promise<SettleReady>
+}
+
+/** Live harness capability for the reboot_engine checks (RealFleetOps). Fake walks skip. */
+export const hasRebootProbe = (ctx: ActionContext): boolean =>
+    typeof (ctx.opts.ops as RebootOps).readEngineState === 'function'
+
+const envBudget = (env: NodeJS.ProcessEnv, key: string, dflt: number): number => {
+    const raw = env[key]?.trim()
+    return raw && /^\d+$/.test(raw) ? Number(raw) : dflt
+}
+
+/** Console src/store/remoteConfirm.ts: reboot confirm budget 10 * MIN. */
+export const REBOOT_CONFIRM_DEFAULT_MS = 10 * 60_000
+
+const queueHead = (st: EngineStateRow | null): string =>
+    !st ? 'unread' : st.commands.length ? JSON.stringify(st.commands[0]) : 'empty'
+
+/**
+ * Read targetEngine's record through the pool (target first, then the others — shared
+ * store replicates it; a rebooting target's own socket is dead). Highest lastBooted wins.
+ */
+const readEngineStateAnyVia = async (ctx: ActionContext, target: string): Promise<EngineStateRow | null> => {
+    const ops = ctx.opts.ops as RebootOps
+    const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e))
+    const order = [target, ...pool.filter(e => e !== target)]
+    let best: EngineStateRow | null = null
+    for (const via of order) {
+        try {
+            const st = await ops.readEngineState!(via, target)
+            if (st && (best == null || (st.lastBooted ?? 0) > (best.lastBooted ?? 0))) best = st
+        } catch {
+            /* via engine down (e.g. the target itself mid-reboot) — try next */
+        }
+    }
+    return best
+}
+
+/** Reboot target: same engine id the Console Intent gets; never golden, must be a pool engine. */
+export const resolveRebootTarget = (ctx: ActionContext, engineHint: string | undefined): string => {
+    const engine = engineHint ?? ctx.poolEngines[0]
+    if (!engine) throw new Error('reboot_engine: no target engine (empty pool)')
+    assertNotGolden(ctx, engine, 'reboot_engine')
+    if (isNeverEngine(engine)) throw new Error(`reboot_engine: refused engine '${engine}' (never idea02)`)
+    if (!ctx.poolEngines.includes(engine)) {
+        throw new Error(`reboot_engine: target '${engine}' is not a pool engine (${ctx.poolEngines.join(', ')}). No soft-pass.`)
+    }
+    return engine
+}
+
+/**
+ * r30 pre-click (live): record lastBooted + commands queue. Eng 8902b67 storeMonitor
+ * processes queue[0] only and skips bare (no-argument) commands without splicing them,
+ * so a bare head never drains and would mask this reboot — fail loud before clicking.
+ */
+export const preflightRebootEngine = async (
+    ctx: ActionContext,
+    engine: string,
+): Promise<{ before: EngineStateRow; note: string }> => {
+    const before = await readEngineStateAnyVia(ctx, engine)
+    if (!before) {
+        throw new Error(`reboot_engine preflight: no engineDB record for ${engine} in any pool store. No soft-pass.`)
+    }
+    if (before.lastBooted == null) {
+        throw new Error(`reboot_engine preflight: ${engine} (${before.liveId}) has no lastBooted in the store. No soft-pass.`)
+    }
+    const head = before.commands[0]
+    if (head != null && !String(head).includes(' ')) {
+        throw new Error(
+            `reboot_engine preflight: ${engine} (${before.liveId}) command queue head is a stale bare command ` +
+                `${JSON.stringify(head)} (queue length ${before.commands.length}) — Eng 8902b67 storeMonitor skips ` +
+                `bare commands without draining them, so a new reboot would be masked. Clear it first. No soft-pass.`,
+        )
+    }
+    return {
+        before,
+        note: `reboot_engine target ${engine} (${before.liveId}) lastBooted before=${before.lastBooted}; queue head=${queueHead(before)}`,
+    }
+}
+
+export type RebootCheckReason = 'ok' | 'not_rebooted' | 'queue_not_drained' | 'no_reconnect' | 'console_not_reconnected'
+
+/**
+ * r30 post-Intent (live): Console c981361 reboot_engine only proves the confirm dialog
+ * was accepted. Require (1) engine.lastBooted strictly advances within
+ * DURATION_REBOOT_CONFIRM_MS (default 10 min, Console remoteConfirm.ts reboot), (2) the
+ * engine's command queue head is empty afterwards (no leftover bare `reboot`) within
+ * DURATION_REBOOT_QUEUE_DRAIN_MS, (3) a FRESH harness WS + store sync to the engine and
+ * the pool settle gate, (4) when the UI driver can, the Console NetworkTree row for the
+ * engine is back online with the status bar connected (DURATION_REBOOT_RECONNECT_MS;
+ * DURATION_REBOOT_ALLOW_RELOAD=1 permits one reload). Returns null without a live probe.
+ */
+export const verifyRebootEngine = async (
+    ctx: ActionContext,
+    engine: string,
+    before: EngineStateRow,
+    opts: { confirmMs?: number; drainMs?: number; reconnectMs?: number; pollMs?: number } = {},
+    env: NodeJS.ProcessEnv = process.env,
+): Promise<{ ok: boolean; reason: RebootCheckReason; note: string } | null> => {
+    const ops = ctx.opts.ops as RebootOps
+    if (typeof ops.readEngineState !== 'function') return null
+    const confirmMs = opts.confirmMs ?? envBudget(env, 'DURATION_REBOOT_CONFIRM_MS', REBOOT_CONFIRM_DEFAULT_MS)
+    const drainMs = opts.drainMs ?? envBudget(env, 'DURATION_REBOOT_QUEUE_DRAIN_MS', 60_000)
+    const reconnectMs = opts.reconnectMs ?? envBudget(env, 'DURATION_REBOOT_RECONNECT_MS', 180_000)
+    const pollMs = opts.pollMs ?? envBudget(env, 'DURATION_REBOOT_POLL_MS', 2_000)
+    const b = before.lastBooted ?? 0
+
+    // 1. lastBooted advances
+    const t0 = Date.now()
+    let last: EngineStateRow | null = null
+    for (;;) {
+        last = await readEngineStateAnyVia(ctx, engine)
+        if (last && (last.lastBooted ?? 0) > b) break
+        if (Date.now() - t0 >= confirmMs) {
+            return {
+                ok: false,
+                reason: 'not_rebooted',
+                note:
+                    `reboot_engine: ${engine} lastBooted did not advance within ${confirmMs}ms ` +
+                    `(before=${b}, last=${last?.lastBooted ?? 'unread'}); queue head=${queueHead(last)}. ` +
+                    `Console confirm accepted but the Engine never rebooted (bare "reboot" skipped by storeMonitor?). No soft-pass.`,
+            }
+        }
+        await sleep(pollMs)
+    }
+    const advancedAfter = Date.now() - t0
+    const after = last.lastBooted
+
+    // 2. queue head empty
+    const t1 = Date.now()
+    for (;;) {
+        if (last && last.commands.length === 0) break
+        if (Date.now() - t1 >= drainMs) {
+            return {
+                ok: false,
+                reason: 'queue_not_drained',
+                note:
+                    `reboot_engine: ${engine} rebooted (lastBooted ${b}→${after}) but its command queue head is ` +
+                    `still ${queueHead(last)} after ${drainMs}ms (queue length ${last?.commands.length ?? '?'}) — ` +
+                    `leftover command would block the queue. No soft-pass.`,
+            }
+        }
+        await sleep(pollMs)
+        last = await readEngineStateAnyVia(ctx, engine)
+    }
+
+    // 3. fresh WS + settle
+    const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e))
+    let wsNote = 'reconnect probe unavailable'
+    if (typeof ops.reconnectEngine === 'function') {
+        const ready = await ops.reconnectEngine(engine, reconnectMs)
+        if (!ready.wsUp) {
+            return {
+                ok: false,
+                reason: 'no_reconnect',
+                note: `reboot_engine: ${engine} rebooted (lastBooted ${b}→${after}) but the harness could not open a fresh WS to it within ${reconnectMs}ms. No soft-pass.`,
+            }
+        }
+        wsNote = `fresh WS up${ready.storeSynced ? ' + store synced' : ''}`
+    }
+    try {
+        await settleParticipants(ctx, pool)
+    } catch (e) {
+        return {
+            ok: false,
+            reason: 'no_reconnect',
+            note: `reboot_engine: ${engine} rebooted (lastBooted ${b}→${after}) but the pool did not settle afterwards: ${e instanceof Error ? e.message : String(e)}. No soft-pass.`,
+        }
+    }
+
+    // 4. Console UI reconnect
+    let uiNote = 'Console UI check unavailable (driver)'
+    const driver = ctx.opts.uiDriver
+    if (driver && typeof driver.waitEngineOnline === 'function') {
+        try {
+            uiNote = await driver.waitEngineOnline(engine, {
+                timeoutMs: reconnectMs,
+                allowReload: /^(1|true|yes)$/i.test(env.DURATION_REBOOT_ALLOW_RELOAD?.trim() ?? ''),
+            })
+        } catch (e) {
+            return {
+                ok: false,
+                reason: 'console_not_reconnected',
+                note: `reboot_engine: ${engine} rebooted (lastBooted ${b}→${after}) but ${e instanceof Error ? e.message : String(e)}. No soft-pass.`,
+            }
+        }
+    }
+    return {
+        ok: true,
+        reason: 'ok',
+        note:
+            `reboot_engine: ${engine} lastBooted ${b}→${after} after ${advancedAfter}ms; queue empty; ` +
+            `${wsNote}; pool settled; ${uiNote}`,
+    }
+}
+
 export type BackupCheckReason =
     | 'ok'
     | 'never_started'
@@ -2189,6 +2391,21 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             }
         }
     }
+    // r30: reboot_engine — target must be a pool engine (never idea02); live: record
+    // lastBooted + queue, refuse a stale bare queue head before clicking.
+    let rebootTarget: string | undefined
+    let rebootBefore: EngineStateRow | null = null
+    if (ctx.action === 'reboot_engine' && hasRebootProbe(ctx)) {
+        try {
+            rebootTarget = resolveRebootTarget(ctx, backupDockedEngine ?? ctx.walker.dockedEngine ?? undefined)
+            const pre = await preflightRebootEngine(ctx, rebootTarget)
+            rebootBefore = pre.before
+            preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${pre.note}` : pre.note
+        } catch (e) {
+            const err = e instanceof Error ? e.message : String(e)
+            return { ok: false, message: `reboot_engine aborted before Intent: ${err}`, layer }
+        }
+    }
     // r29 FAIL@97: re-read the Kolibri/NC host from the store before any Intent that
     // polls a sidecar after Confirm (relocation steps may have moved — or not moved — it).
     if (SIDECAR_SETTLE_ACTIONS.has(ctx.action)) {
@@ -2214,7 +2431,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             instanceId,
             engineId: ctx.action === 'make_files_disk' || ctx.action === 'add_files_role'
                 ? resolveConsoleEngineHost(ctx)
-                : (backupDockedEngine ?? ctx.walker.dockedEngine ?? ctx.poolEngines[0]),
+                : (rebootTarget ?? backupDockedEngine ?? ctx.walker.dockedEngine ?? ctx.poolEngines[0]),
             screenshotPath: shotPath,
         })
     } finally {
@@ -2278,6 +2495,22 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
                 layer,
                 ...(backupDockedEngine ? { dockedEngine: backupDockedEngine } : {}),
             }
+        }
+        if (check) message = `${message}; ${check.note}`
+    }
+    // r30: reboot_engine must really reboot the target and come back (live only).
+    if (ctx.action === 'reboot_engine' && rebootTarget && rebootBefore) {
+        if (!result.ok) {
+            const st = await readEngineStateAnyVia(ctx, rebootTarget).catch(() => null)
+            return {
+                ok: false,
+                message: `${message}; reboot_engine: ${rebootTarget} queue head=${queueHead(st)} lastBooted=${st?.lastBooted ?? 'unread'} (before=${rebootBefore.lastBooted})`,
+                layer,
+            }
+        }
+        const check = await verifyRebootEngine(ctx, rebootTarget, rebootBefore)
+        if (check && !check.ok) {
+            return { ok: false, message: `${check.note} (Console Intent reported ok)`, layer }
         }
         if (check) message = `${message}; ${check.note}`
     }
