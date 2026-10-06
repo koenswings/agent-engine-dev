@@ -376,6 +376,30 @@ const main = async () => {
     process.exit(result.failures > 0 || result.aborted ? 1 : 0)
 }
 
+/**
+ * r30 (2026-10-06): with mDNS ON (Koen's production-replica rule) the harness's
+ * automerge-repo client can hit an internal `withTimeout: timed out after 60000ms`
+ * find rejection that nobody awaits. Node then killed the walker mid-step
+ * (cover-all r30 died at step 9 open_video, not an Intent failure). The production
+ * Engine logs and survives these (src/start.ts unhandledRejection); mirror that here
+ * for this one error class only, logged as a structured event. Any other unhandled
+ * rejection still aborts the walk (exit 2).
+ */
+process.on('unhandledRejection', (reason: unknown) => {
+    const msg = reason instanceof Error ? reason.message : String(reason)
+    const name = reason instanceof Error ? reason.name : ''
+    if (name === 'TimeoutError' && msg.startsWith('withTimeout: timed out after')) {
+        console.log(JSON.stringify({
+            event: 'automerge_find_timeout_tolerated',
+            ts: new Date().toISOString(),
+            message: msg,
+        }))
+        return
+    }
+    console.error('[duration] unhandledRejection', reason)
+    process.exit(2)
+})
+
 main().catch(err => {
     console.error(err)
     process.exit(2)
