@@ -15,10 +15,13 @@
  * localStorage.demoMode='false' before first goto — sticky demo must not mask Kid fixtures.
  * Do not remap Intents to demo disk IDs; no DURATION_ALLOW_DEMO.
  *
- * --record-walk soft-detect (Pixel Console#134 @ ba0cfa1):
- *   1) pass screenshotPath into runDurationIntent (Pixel may write PNG once)
- *   2) soft-detect bridge.captureAfterIntent — skip if PNG already exists
- *   3) else page.screenshot({ path, fullPage: true })
+ * --record-walk: each frame is taken from the ACTIVE tab (activeTab.ts), so an
+ * in-app step shows Kolibri / Nextcloud / Wikipedia, not the Console behind it.
+ * runDurationIntent no longer gets screenshotPath (Pixel would capture the
+ * Console page it was handed). After the Intent:
+ *   1) skip if the PNG already exists
+ *   2) soft-detect bridge.captureAfterIntent(activeTab, …) (Pixel settle + viewport)
+ *   3) else activeTab.screenshot({ path, fullPage: true })
  */
 import { createRequire } from 'node:module'
 import { existsSync, mkdirSync } from 'node:fs'
@@ -30,6 +33,7 @@ import {
     isDeferredUiIntent,
 } from './fixtures.js'
 import type { UiDriver, UiIntentContext, UiIntentResult } from './types.js'
+import { ActiveTabTracker, captureFrameFrom, followContextTabs, type TrackablePage } from './activeTab.js'
 
 export interface PlaywrightUiOptions {
     baseUrl?: string
@@ -71,6 +75,7 @@ type PlaywrightModule = {
         launch: (opts?: { headless?: boolean }) => Promise<{
             newContext: (opts?: { baseURL?: string }) => Promise<{
                 newPage: () => Promise<unknown>
+                on: (event: 'page', listener: (page: TrackablePage) => void) => unknown
                 addInitScript: (script: () => void) => Promise<void>
                 close: () => Promise<void>
             }>
@@ -272,6 +277,8 @@ export class PlaywrightUiDriver implements UiDriver {
     private page: unknown = null
     private bridge: PixelBridge | null = null
     private initPromise: Promise<void> | null = null
+    /** --record-walk: which tab (Console or an App tab) is active right now. */
+    private tabs = new ActiveTabTracker()
 
     constructor(opts: PlaywrightUiOptions = {}) {
         this.opts = {
@@ -303,35 +310,29 @@ export class PlaywrightUiDriver implements UiDriver {
                         localStorage.setItem('demoMode', 'false')
                     })
                 }
+                followContextTabs(this.context, this.tabs)
                 this.page = await this.context.newPage()
+                this.tabs.track(this.page as TrackablePage)
             })()
         }
         await this.initPromise
     }
 
+    /** The tab the walker is on now: the newest / brought-to-front App tab, else the Console page. */
+    activePage(): unknown {
+        if (!this.page) return null
+        return this.tabs.active(this.page as TrackablePage)
+    }
+
     /**
-     * Soft-detect capture after Intent (or for bare page screenshot).
-     * Prefer captureAfterIntent; skip second capture if screenshotPath already wrote PNG.
+     * Capture the active tab after an Intent (or for a bare step screenshot).
+     * Prefer Pixel captureAfterIntent on that tab; skip when the PNG already exists.
      */
     private async captureFrame(path: string, intent?: string): Promise<void> {
         mkdirSync(dirname(path), { recursive: true })
-        // Skip second capture when runDurationIntent already wrote via screenshotPath.
+        // One frame per step: the runner's bare-step capture skips a step the Intent already captured.
         if (existsSync(path)) return
-
-        const bridge = this.bridge
-        // Soft-detect Pixel locked export first: captureAfterIntent(page, { path, intent?, settleMs? })
-        if (bridge && typeof bridge.captureAfterIntent === 'function') {
-            await bridge.captureAfterIntent(this.page, { path, intent })
-            return
-        }
-
-        // Fallback: Playwright page.screenshot (fullPage ok)
-        const page = this.page as {
-            screenshot?: (o: { path: string; fullPage?: boolean }) => Promise<Buffer | void>
-        } | null
-        if (page && typeof page.screenshot === 'function') {
-            await page.screenshot({ path, fullPage: true })
-        }
+        await captureFrameFrom(this.activePage(), path, intent, this.bridge?.captureAfterIntent)
     }
 
     async runIntent(ctx: UiIntentContext): Promise<UiIntentResult> {
@@ -363,13 +364,11 @@ export class PlaywrightUiDriver implements UiDriver {
                 instanceId: ctx.instanceId ?? defaults.instanceId,
                 engineId: ctx.engineId,
             }
-            // 1) Prefer Pixel screenshotPath on runDurationIntent when recording.
-            if (ctx.screenshotPath) {
-                runOpts.screenshotPath = ctx.screenshotPath
-            }
+            // --record-walk: do NOT hand screenshotPath to Pixel — it would capture the
+            // Console page it was given, not the App tab an in-app Intent switched to.
             const result = await bridge.runDurationIntent(runOpts)
 
-            // Soft-detect post-Intent capture (success or fail — useful for debugging).
+            // Post-Intent capture of the active tab (success or fail — useful for debugging).
             if (ctx.screenshotPath) {
                 try {
                     await this.captureFrame(ctx.screenshotPath, ctx.action)
@@ -535,5 +534,6 @@ export class PlaywrightUiDriver implements UiDriver {
         this.browser = null
         this.bridge = null
         this.initPromise = null
+        this.tabs = new ActiveTabTracker()
     }
 }
