@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { FakeFleetOps, dispatchAction, addFilesAppDiskId, ensureAppOnlyDiskOnConsoleEngine, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, redockEmpty001BeforeMakeFiles, resolveConsoleEngineHost, filesDiskTargetId, preflightFilesDiskTarget, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, nextcloudLoginFormLooksReady, nextcloudInitialState, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
+import { FakeFleetOps, dispatchAction, addFilesAppDiskId, ensureAppOnlyDiskOnConsoleEngine, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, redockEmpty001BeforeMakeFiles, resolveConsoleEngineHost, filesDiskTargetId, preflightFilesDiskTarget, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, resyncFixtureSidecarUrlsFromStore, locateInstanceEngine, verifyRestoreOperation, SIDECAR_SETTLE_ACTIONS, nextcloudLoginFormLooksReady, nextcloudInitialState, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
 import { semanticStoresEqual, waitForConvergence } from '../duration/convergence.js'
 import { evaluateInvariants, DEFAULT_INFRA_INVARIANTS, listInvariantTypes } from '../duration/invariants.js'
 import {
@@ -1722,7 +1722,7 @@ describe('Prefer A empty-002 re-dock before second late install (Fake)', () => {
             poolEngines: ['idea01', 'idea03', 'idea04'],
             excludeEngines: ['idea02'],
             storeMode: 'shared',
-            fixtureInstanceMap: {
+            fixtureInstances: {
                 'duration-empty-001': 'empty-001-main',
             },
         })
@@ -2361,5 +2361,251 @@ describe('syncNextcloudSidecarUrlForEngine / waitNextcloud (r16 FAIL@65 / r17 FA
                 sleepImpl: async () => {},
             }),
         ).rejects.toThrow(/18280/)
+    })
+})
+
+describe('r29 FAIL@97: follow the store host for Kolibri/NC sidecars; restore must really run (cover-all-980e735-r29)', () => {
+    const POOL = ['idea01', 'idea03', 'idea04']
+    const KOLIBRI = 'duration-kolibri-grade5a-001'
+    const NC = 'duration-nextcloud-grade5a-001'
+    const HOSTS = { idea01: '100.99.231.94', idea03: '100.126.117.80', idea04: '100.108.39.45' }
+    const IDEA01_URL = 'http://100.99.231.94:18080'
+    const IDEA03_URL = 'http://100.126.117.80:18080'
+    const ENV_KEYS = ['DURATION_KOLIBRI_URL', 'DURATION_KOLIBRI_PORT', 'DURATION_NEXTCLOUD_URL', 'DURATION_NEXTCLOUD_PORT', 'DURATION_FILES_DISK_ID'] as const
+    const withEnv = async (vars: Partial<Record<(typeof ENV_KEYS)[number], string>>, fn: () => Promise<void>) => {
+        const prev: Record<string, string | undefined> = {}
+        for (const k of ENV_KEYS) {
+            prev[k] = process.env[k]
+            if (vars[k] === undefined) delete process.env[k]
+            else process.env[k] = vars[k]
+        }
+        try {
+            await fn()
+        } finally {
+            for (const k of ENV_KEYS) {
+                if (prev[k] === undefined) delete process.env[k]
+                else process.env[k] = prev[k]
+            }
+        }
+    }
+    /** Fake fleet with a host map (Kolibri + NC on idea01, like r29 after @62). */
+    const r29Fleet = async (kolibriOn = 'idea01') => {
+        const ops = fakeOps({ poolEngines: POOL, excludeEngines: ['idea02'], storeMode: 'shared' })
+        await ops.dockFixture('idea01', NC)
+        await ops.dockFixture(kolibriOn, KOLIBRI)
+        return Object.assign(ops, { getHostMap: () => ({ ...HOSTS }) })
+    }
+    const ctxFor = (ops: unknown, dockedEngine: string | null, action: string, extra: Record<string, unknown> = {}) => ({
+        opts: { ops, rng: () => 0, settleTimeoutMs: 500, fast: true, ...extra },
+        walker: { current: 'op_disk', layer: 'operator' as const, dockedEngine, step: 96 },
+        from: 'op_disk',
+        to: 'op_backup',
+        action,
+        excludeEngines: ['idea02'],
+        poolEngines: POOL,
+        fixtureDisk: KOLIBRI,
+        fixtureInstance: 'kolibri-grade5a-001',
+        fixtureDisks: [KOLIBRI, NC],
+        fixtureInstances: { ...KID_FIXTURES },
+    })
+
+    const moveCtx = (ops: unknown, from = 'idea01') => ({
+        ...ctxFor(ops, from, 'infra_move_disk'),
+        from: 'infra_docked',
+        to: 'infra_disk_moved',
+        walker: { current: 'infra_docked', layer: 'infra' as const, dockedEngine: from, step: 61 },
+    })
+
+    it('infra_move_disk: target-honoured move idea01→idea03 is store-verified and URLs follow idea03', async () => {
+        await withEnv({ DURATION_KOLIBRI_URL: IDEA01_URL }, async () => {
+            const ops = await r29Fleet('idea01')
+            const r = await dispatchAction(moveCtx(ops) as any)
+            expect(r.ok, r.message).toBe(true)
+            expect(r.dockedEngine).toBe('idea03')
+            expect(r.message).toMatch(/moved duration-kolibri-grade5a-001 idea01→idea03 \(store-verified: disk \+ kolibri-grade5a-001 on idea03\)/)
+            expect(r.message).toMatch(/DURATION_KOLIBRI_URL=http:\/\/100\.126\.117\.80:18080 \(store: kolibri-grade5a-001 on idea03; was http:\/\/100\.99\.231\.94:18080\)/)
+            expect(process.env.DURATION_KOLIBRI_URL).toBe(IDEA03_URL)
+            expect((await ops.readStore('idea03')).diskDB[KOLIBRI]?.dockedTo).toBe('idea03')
+        })
+    })
+
+    it('infra_move_disk: disk lands on a different engine (old healthy-tree redirect) → LOUD fail naming target, URL untouched', async () => {
+        await withEnv({ DURATION_KOLIBRI_URL: IDEA01_URL }, async () => {
+            const ops = await r29Fleet('idea01')
+            // r29 run.log L241: requested idea03, re-docked on idea01.
+            Object.assign(ops, {
+                moveDisk: async (from: string, _to: string, diskId: string) => {
+                    await ops.undockFixtures([from], diskId)
+                    await ops.dockFixture('idea01', diskId)
+                },
+            })
+            await expect(dispatchAction(moveCtx(ops) as any)).rejects.toThrow(
+                /infra_move_disk: duration-kolibri-grade5a-001 requested on target idea03 \(idea01→idea03\) but the store shows it docked on idea01\. No soft-pass/,
+            )
+            expect(process.env.DURATION_KOLIBRI_URL).toBe(IDEA01_URL)
+        })
+    })
+
+    it('infra_move_disk: target cannot take the disk (dock error) → LOUD fail naming target and reason', async () => {
+        await withEnv({}, async () => {
+            const ops = await r29Fleet('idea01')
+            Object.assign(ops, {
+                moveDisk: async () => {
+                    throw new Error('RealFleetOps: no free idea-test-N for duration-kolibri-grade5a-001 on idea03')
+                },
+            })
+            await expect(dispatchAction(moveCtx(ops) as any)).rejects.toThrow(
+                /infra_move_disk: target idea03 could not take duration-kolibri-grade5a-001 \(idea01→idea03\): .*no free idea-test-N.*No soft-pass; no fallback host/,
+            )
+        })
+    })
+
+    it('infra_move_disk: disk on target but instance not live there → LOUD fail', async () => {
+        await withEnv({}, async () => {
+            const ops = await r29Fleet('idea01')
+            const realMove = ops.moveDisk.bind(ops)
+            Object.assign(ops, {
+                moveDisk: async (f: string, t: string, d: string) => {
+                    await realMove(f, t, d)
+                    ;(ops as any).mutate((doc: SemanticStoreView) => {
+                        doc.instanceDB['kolibri-grade5a-001']!.status = 'Undocked'
+                    })
+                },
+            })
+            await expect(dispatchAction(moveCtx(ops) as any)).rejects.toThrow(
+                /infra_move_disk: kolibri-grade5a-001 host in store is none .* not target idea03/,
+            )
+        })
+    })
+
+    it('RealFleetOps.dockFixture has no cross-engine healthy-tree preference; moveDisk verifies landing (r29 @62)', async () => {
+        const fs = await import('node:fs')
+        const path = await import('node:path')
+        const src = fs.readFileSync(path.resolve(process.cwd(), 'test/duration/realFleetOps.ts'), 'utf8')
+        const body = src.slice(src.indexOf('async dockFixture('), src.indexOf('async moveDisk('))
+        expect(body).not.toMatch(/prefer \$\{target\}/)
+        expect(body).not.toMatch(/for \(const id of this\.pool\)/)
+        expect(body).toMatch(/const target = engineId/)
+        const move = src.slice(src.indexOf('async moveDisk('), src.indexOf('async purgeInstancesStoredOn('))
+        expect(move).toMatch(/target \$\{toEngine\} could not take/)
+        expect(move).toMatch(/findDockedEngine\(diskId\)/)
+    })
+
+    it('locateInstanceEngine ignores Undocked rows and never returns idea02', async () => {
+        await withEnv({}, async () => {
+            const ops = await r29Fleet('idea01')
+            const ctx = ctxFor(ops, 'idea03', 'restore_from_backup') as any
+            expect(await locateInstanceEngine(ctx, 'kolibri-grade5a-001', KOLIBRI)).toEqual({ engine: 'idea01', diskId: KOLIBRI, live: true })
+            await ops.undockFixtures(['idea01'], KOLIBRI)
+            expect((await locateInstanceEngine(ctx, 'kolibri-grade5a-001', KOLIBRI)).engine).toBeNull()
+            const golden = Object.assign(Object.create(ops), {
+                readStore: async (e: string) => ({
+                    engineId: e,
+                    instanceDB: { 'kolibri-grade5a-001': { id: 'kolibri-grade5a-001', status: 'Running', diskId: KOLIBRI } },
+                    diskDB: { [KOLIBRI]: { id: KOLIBRI, dockedTo: 'idea02' } },
+                    engineDB: {},
+                }),
+            })
+            expect((await locateInstanceEngine(ctxFor(golden, null, 'restore_from_backup') as any, 'kolibri-grade5a-001', KOLIBRI)).engine).toBeNull()
+        })
+    })
+
+    it('restore_from_backup: stale idea03 URL is re-read from the store (idea01) before the Intent runs', async () => {
+        await withEnv({ DURATION_KOLIBRI_URL: IDEA03_URL, DURATION_FILES_DISK_ID: 'duration-empty-001' }, async () => {
+            const ops = await r29Fleet('idea01')
+            const driver = new StubUiDriver()
+            const seen: (string | undefined)[] = []
+            const orig = driver.runIntent.bind(driver)
+            Object.assign(driver, {
+                runIntent: async (req: any) => {
+                    seen.push(process.env.DURATION_KOLIBRI_URL)
+                    return orig(req)
+                },
+            })
+            // walker still believes idea03 (r29 after @62)
+            const r = await dispatchAction(ctxFor(ops, 'idea03', 'restore_from_backup', { stubUi: true, uiDriver: driver }) as any)
+            expect(r.ok, r.message).toBe(true)
+            expect(seen).toEqual([IDEA01_URL])
+            expect(r.message).toMatch(/DURATION_KOLIBRI_URL=http:\/\/100\.99\.231\.94:18080 \(store: kolibri-grade5a-001 on idea01; was http:\/\/100\.126\.117\.80:18080\)/)
+            expect(SIDECAR_SETTLE_ACTIONS.has('move_app') && SIDECAR_SETTLE_ACTIONS.has('copy_app')).toBe(true)
+        })
+    })
+
+    it('resync: harness-managed NC URL follows the store host; manual override kept', async () => {
+        await withEnv({ DURATION_NEXTCLOUD_URL: 'http://idea03:18280' }, async () => {
+            const ops = await r29Fleet('idea01')
+            const env: NodeJS.ProcessEnv = { DURATION_NEXTCLOUD_URL: 'http://idea03:18280', DURATION_KOLIBRI_URL: IDEA03_URL }
+            const note = await resyncFixtureSidecarUrlsFromStore(ctxFor(ops, 'idea03', 'move_app') as any, env)
+            expect(env.DURATION_NEXTCLOUD_URL).toBe('http://idea01:18280')
+            expect(env.DURATION_KOLIBRI_URL).toBe(IDEA01_URL)
+            expect(note).toMatch(/DURATION_NEXTCLOUD_URL=http:\/\/idea01:18280/)
+            const manual: NodeJS.ProcessEnv = { DURATION_NEXTCLOUD_URL: 'http://nc.example.test:8443' }
+            const note2 = await resyncFixtureSidecarUrlsFromStore(ctxFor(ops, 'idea03', 'move_app') as any, manual)
+            expect(manual.DURATION_NEXTCLOUD_URL).toBe('http://nc.example.test:8443')
+            expect(note2).toMatch(/manual override/)
+        })
+    })
+
+    it('restore_from_backup (live ops): no restoreApp op → fails loud "restore op never started" (Intent ok → no false PASS)', async () => {
+        await withEnv({ DURATION_KOLIBRI_URL: IDEA03_URL, DURATION_FILES_DISK_ID: 'duration-empty-001' }, async () => {
+            const ops = await r29Fleet('idea01')
+            const live = Object.assign(ops, { listOperations: async () => [
+                // stale op from an earlier run must not count
+                { id: 'old', kind: 'restoreApp', status: 'Done', startedAt: Date.now() - 3_600_000, args: { instanceId: 'kolibri-grade5a-001', targetDiskId: KOLIBRI } },
+                { id: 'cp', kind: 'copyApp', status: 'Done', startedAt: Date.now() },
+            ] })
+            const r = await dispatchAction(ctxFor(live, 'idea03', 'restore_from_backup', { stubUi: true, uiDriver: new StubUiDriver() }) as any)
+            expect(r.ok).toBe(false)
+            expect(r.message).toMatch(/^restore_from_backup: restore op never started: no restoreApp Operation since Confirm/)
+            expect(r.message).toMatch(/Too many arguments/)
+            expect(r.message).toMatch(/\(Console Intent reported ok\)$/)
+        })
+    })
+
+    it('restore_from_backup (live ops): Console sidecar timeout + no op → message leads with "restore op never started", not the sidecar timeout', async () => {
+        await withEnv({ DURATION_FILES_DISK_ID: 'duration-empty-001' }, async () => {
+            const ops = await r29Fleet('idea01')
+            const live = Object.assign(ops, { listOperations: async () => [] })
+            const driver = new StubUiDriver()
+            Object.assign(driver, {
+                runIntent: async () => ({ ok: false, mode: 'live', message: 'idea#168 sidecar not stable: http://100.126.117.80:18080 ... ECONNREFUSED' }),
+            })
+            const r = await dispatchAction(ctxFor(live, 'idea03', 'restore_from_backup', { stubUi: true, uiDriver: driver }) as any)
+            expect(r.ok).toBe(false)
+            expect(r.message).toMatch(/^restore_from_backup: restore op never started/)
+            expect(r.message).toMatch(/\(Console Intent: idea#168 sidecar not stable/)
+        })
+    })
+
+    it('verifyRestoreOperation: op Done + instance Running on target + container → ok; each missing piece fails with its own reason', async () => {
+        await withEnv({}, async () => {
+            const since = Date.now()
+            const ops = await r29Fleet('idea01')
+            expect(await verifyRestoreOperation(ctxFor(ops, 'idea01', 'restore_from_backup') as any, since)).toBeNull()
+            const seenEngines: string[] = []
+            const op = (status: string, extra: Record<string, unknown> = {}) => ({
+                id: 'r1', kind: 'restoreApp', status, startedAt: since + 500,
+                args: { instanceId: 'kolibri-grade5a-001', targetDiskId: KOLIBRI }, ...extra,
+            })
+            const mk = (rows: any[], containers: string[] | null = ['kolibri-grade5a-001-kolibri-1']) =>
+                Object.assign(Object.create(ops), {
+                    listOperations: async (e: string) => { seenEngines.push(e); return e === 'idea01' ? rows : [] },
+                    ...(containers ? { listInstanceContainers: async (e: string, id: string) => (e === 'idea01' && id === 'kolibri-grade5a-001' ? containers : []) } : {}),
+                })
+            const ctx = (o: unknown) => ctxFor(o, 'idea01', 'restore_from_backup') as any
+            const ok = await verifyRestoreOperation(ctx(mk([op('Done')])), since)
+            expect(ok?.ok, ok?.note).toBe(true)
+            expect(ok?.note).toMatch(/restore op r1 Done on idea01; kolibri-grade5a-001 Running on duration-kolibri-grade5a-001@idea01; container kolibri-grade5a-001-kolibri-1 on idea01/)
+            expect(seenEngines).not.toContain('idea02')
+            const failed = await verifyRestoreOperation(ctx(mk([op('Failed', { error: 'No docked Backup Disk with archives for instance kolibri-grade5a-001' })])), since)
+            expect(failed?.reason).toBe('not_done')
+            expect(failed?.note).toMatch(/r1@idea01=Failed \(No docked Backup Disk with archives/)
+            const wrongDisk = await verifyRestoreOperation(ctx(mk([op('Done', { args: { instanceId: 'kolibri-grade5a-001', targetDiskId: NC } })])), since)
+            expect(wrongDisk?.reason).toBe('no_instance')
+            expect(wrongDisk?.note).toMatch(/storedOn=duration-kolibri-grade5a-001/)
+            const noCtr = await verifyRestoreOperation(ctx(mk([op('Done')], [])), since)
+            expect(noCtr?.reason).toBe('no_container')
+            expect(noCtr?.note).toMatch(/no running container kolibri-grade5a-001-\* on idea01/)
+        })
     })
 })

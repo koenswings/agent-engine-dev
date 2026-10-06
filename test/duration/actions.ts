@@ -1070,21 +1070,277 @@ const infraMoveDisk = async (ctx: ActionContext): Promise<ActionResult> => {
     assertNotGolden(ctx, from, 'infra_move_disk(from)')
     const to = pickPoolEngine(ctx, from)
     assertNotGolden(ctx, to, 'infra_move_disk(to)')
-    if (from === to) {
-        // Single-engine pool: treat as re-dock settle (document limitation).
-        await ctx.opts.ops.dockFixture(to, ctx.fixtureDisk)
-    } else {
-        await ctx.opts.ops.moveDisk(from, to, ctx.fixtureDisk)
+    try {
+        if (from === to) {
+            // Single-engine pool: treat as re-dock settle (document limitation).
+            await ctx.opts.ops.dockFixture(to, ctx.fixtureDisk)
+        } else {
+            await ctx.opts.ops.moveDisk(from, to, ctx.fixtureDisk)
+        }
+    } catch (e) {
+        const err = e instanceof Error ? e.message : String(e)
+        throw new Error(
+            `infra_move_disk: target ${to} could not take ${ctx.fixtureDisk} (${from}→${to}): ${err}. ` +
+                `No soft-pass; no fallback host.`,
+        )
     }
     await settleParticipants(ctx, ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e)))
-    const kolibriUrl = syncKolibriSidecarUrlForEngine(to, hostMapFromOps(ctx.opts.ops))
+    // cover-all-980e735-r29 FAIL@97: @62 "moved idea01→idea03" while the disk was
+    // re-docked on idea01. Verify disk AND fixture instance host == target in the
+    // store before passing; then derive the sidecar URLs from that verified host.
+    const landed = await locateDockedEngine(ctx, ctx.fixtureDisk)
+    if (landed !== to) {
+        throw new Error(
+            `infra_move_disk: ${ctx.fixtureDisk} requested on target ${to} (${from}→${to}) but the store ` +
+                `shows it docked on ${landed ?? 'no pool engine'}. No soft-pass; refusing to record a different host.`,
+        )
+    }
+    const inst = await locateInstanceEngine(ctx, ctx.fixtureInstance, ctx.fixtureDisk)
+    if (!inst.live || inst.engine !== to) {
+        throw new Error(
+            `infra_move_disk: ${ctx.fixtureInstance} host in store is ${inst.live ? inst.engine : 'none (not docked/Undocked)'} ` +
+                `(disk ${inst.diskId}), not target ${to}. No soft-pass.`,
+        )
+    }
+    const urls = await resyncFixtureSidecarUrlsFromStore(ctx)
     const moveMsg =
-        from === to ? `re-docked on sole pool engine ${to}` : `moved ${ctx.fixtureDisk} ${from}→${to}`
+        from === to
+            ? `re-docked on sole pool engine ${to}`
+            : `moved ${ctx.fixtureDisk} ${from}→${to} (store-verified: disk + ${ctx.fixtureInstance} on ${to})`
     return {
         ok: true,
-        message: `${moveMsg}; DURATION_KOLIBRI_URL=${kolibriUrl}`,
+        message: `${moveMsg}; ${urls}`,
         dockedEngine: to,
         layer: 'infra',
+    }
+}
+
+/**
+ * cover-all-980e735-r29 FAIL@97: return the pool engine whose store shows instanceId
+ * on a docked disk (unique store: other engines keep an Undocked copy of the row).
+ * Falls back to fallbackDiskId when no store has a live row. Never returns an
+ * excluded (golden idea02) engine.
+ */
+export const locateInstanceEngine = async (
+    ctx: ActionContext,
+    instanceId: string,
+    fallbackDiskId: string,
+): Promise<{ engine: string | null; diskId: string; live: boolean }> => {
+    const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
+    let diskId = fallbackDiskId
+    let live = false
+    for (const eng of pool) {
+        try {
+            const view = await ctx.opts.ops.readStore(eng)
+            const inst = view.instanceDB[instanceId]
+            if (inst?.diskId && inst.status !== 'Undocked') {
+                diskId = inst.diskId
+                live = true
+                break
+            }
+        } catch {
+            /* try next */
+        }
+    }
+    const engine = await locateDockedEngine(ctx, diskId)
+    if (!engine || ctx.excludeEngines.includes(engine)) return { engine: null, diskId, live: false }
+    return { engine, diskId, live }
+}
+
+/** Intents whose Console implementation polls a sidecar URL after Confirm. */
+export const SIDECAR_SETTLE_ACTIONS = new Set(['restore_from_backup', 'move_app', 'copy_app'])
+
+/** True when url's hostname is a pool engine id or its host-map address (harness-managed). */
+const isHarnessManagedUrl = (
+    url: string | undefined,
+    pool: string[],
+    hosts: Record<string, string> | undefined,
+): boolean => {
+    if (!url?.trim()) return true
+    try {
+        const h = new URL(url.trim()).hostname
+        return pool.includes(h) || Object.values(hosts ?? {}).includes(h)
+    } catch {
+        return false
+    }
+}
+
+/**
+ * cover-all-980e735-r29 FAIL@97: DURATION_KOLIBRI_URL stayed on idea03 from @62 while
+ * the store had kolibri-grade5a-001 Running on idea01, so the restore settle polled a
+ * host with nothing on :18080. Before every sidecar-settle Intent, re-read the live
+ * host of the Kolibri (and Nextcloud) fixture instance from the store and point the
+ * env at it. Nextcloud is only rewritten when its URL is harness-managed (unset or a
+ * pool hostname/IP), so manual overrides survive. Never points at an excluded engine.
+ */
+export const resyncFixtureSidecarUrlsFromStore = async (
+    ctx: ActionContext,
+    env: NodeJS.ProcessEnv = process.env,
+): Promise<string> => {
+    const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
+    const hosts = hostMapFromOps(ctx.opts.ops)
+    const notes: string[] = []
+    const entries = Object.entries(ctx.fixtureInstances)
+    const kolibri =
+        entries.find(([d]) => /kolibri/i.test(d)) ??
+        (/kolibri/i.test(ctx.fixtureDisk) ? ([ctx.fixtureDisk, ctx.fixtureInstance] as const) : undefined)
+    if (kolibri) {
+        const [diskId, instId] = kolibri
+        const { engine } = await locateInstanceEngine(ctx, instId, diskId)
+        const prev = env.DURATION_KOLIBRI_URL
+        if (engine) {
+            const url = syncKolibriSidecarUrlForEngine(engine, hosts, env)
+            notes.push(
+                `DURATION_KOLIBRI_URL=${url} (store: ${instId} on ${engine}` +
+                    `${prev && prev.replace(/\/$/, '') !== url ? `; was ${prev}` : ''})`,
+            )
+        } else {
+            notes.push(`${instId} not docked on any pool engine; DURATION_KOLIBRI_URL unchanged (${prev ?? 'unset'})`)
+        }
+    }
+    const nc = entries.find(([d]) => /nextcloud/i.test(d))
+    if (nc) {
+        const [diskId, instId] = nc
+        const { engine } = await locateInstanceEngine(ctx, instId, diskId)
+        const prev = env.DURATION_NEXTCLOUD_URL
+        if (engine && isHarnessManagedUrl(prev, pool, hosts)) {
+            const portRaw = env.DURATION_NEXTCLOUD_PORT?.trim()
+            const port = portRaw && /^\d+$/.test(portRaw) ? portRaw : '18280'
+            // Logical hostname, not Tailscale IP (NC trusted_domains, r17 FAIL@58).
+            const url = `http://${engine}:${port}`
+            env.DURATION_NEXTCLOUD_URL = url
+            notes.push(
+                `DURATION_NEXTCLOUD_URL=${url} (store: ${instId} on ${engine}` +
+                    `${prev && prev.replace(/\/$/, '') !== url ? `; was ${prev}` : ''})`,
+            )
+        } else if (engine) {
+            notes.push(`DURATION_NEXTCLOUD_URL=${prev} kept (manual override)`)
+        }
+    }
+    return notes.join('; ')
+}
+
+export type DurationOperationRow = {
+    id: string
+    kind: string
+    status: string
+    startedAt: number | null
+    completedAt?: number | null
+    error?: string | null
+    args?: Record<string, string>
+}
+
+/**
+ * cover-all-980e735-r29 FAIL@97: Eng 8d98718 rejected `restoreApp kolibri Duration Tests —
+ * Add Files App` ("Too many arguments", space-split disk name): no Operation, no instance,
+ * no container. With a correct sidecar URL the Console settle would have seen the
+ * untouched original instance and passed. Require, on live ops:
+ *   1. a restoreApp Operation started after Confirm that ended Done (pool engines only);
+ *   2. its instance in the store, storedOn the op's targetDiskId, Running, on a docked disk;
+ *   3. a running container for that instance on the host the store reports (when
+ *      ops.listInstanceContainers exists).
+ * Returns null when unavailable (Fake ops / stub). `reason` is machine-checkable.
+ */
+export const verifyRestoreOperation = async (
+    ctx: ActionContext,
+    sinceMs: number,
+    slackMs = 60_000,
+): Promise<{ ok: boolean; reason: 'ok' | 'never_started' | 'not_done' | 'no_instance' | 'no_container'; note: string } | null> => {
+    const opsAny = ctx.opts.ops as FleetOps & {
+        listOperations?: (engineId: string) => Promise<DurationOperationRow[]>
+        listInstanceContainers?: (engineId: string, instanceId: string) => Promise<string[]>
+    }
+    if (typeof opsAny.listOperations !== 'function') return null
+    const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
+    const found: (DurationOperationRow & { engine: string })[] = []
+    const readErrors: string[] = []
+    for (const eng of pool) {
+        try {
+            const rows = await opsAny.listOperations(eng)
+            for (const r of rows) {
+                if (r.kind !== 'restoreApp') continue
+                if (typeof r.startedAt !== 'number' || r.startedAt < sinceMs - slackMs) continue
+                found.push({ ...r, engine: eng })
+            }
+        } catch (e) {
+            readErrors.push(`${eng}: ${e instanceof Error ? e.message : String(e)}`)
+        }
+    }
+    const errNote = readErrors.length ? ` (store read errors: ${readErrors.join('; ')})` : ''
+    if (!found.length) {
+        return {
+            ok: false,
+            reason: 'never_started',
+            note:
+                `restore op never started: no restoreApp Operation since Confirm on any pool engine${errNote}. ` +
+                `Engine rejected the command before execution? (r29: Eng 8d98718 split ` +
+                `"restoreApp <instance> <targetDiskName>" on spaces → "Too many arguments"). ` +
+                `Engine/Console restore bug — no soft-pass.`,
+        }
+    }
+    const done = found.find(r => r.status === 'Done')
+    if (!done) {
+        const desc = found
+            .map(r => `${r.id}@${r.engine}=${r.status}${r.error ? ` (${r.error})` : ''}`)
+            .join(', ')
+        return { ok: false, reason: 'not_done', note: `restore op did not end Done: ${desc}. No soft-pass.` }
+    }
+    const instId = done.args?.instanceId
+    const targetDiskId = done.args?.targetDiskId
+    if (!instId || !targetDiskId) {
+        return {
+            ok: false,
+            reason: 'no_instance',
+            note: `restore op ${done.id} Done on ${done.engine} but carries no instanceId/targetDiskId args. No soft-pass.`,
+        }
+    }
+    const host = await locateDockedEngine(ctx, targetDiskId)
+    let instNote = 'unread'
+    let instOk = false
+    if (host && !ctx.excludeEngines.includes(host)) {
+        try {
+            const view = await ctx.opts.ops.readStore(host)
+            const row = view.instanceDB[instId]
+            instNote = row ? `${instId} status=${row.status} storedOn=${row.diskId}` : `${instId} absent`
+            instOk = !!row && row.diskId === targetDiskId && row.status === 'Running'
+        } catch (e) {
+            instNote = `readStore(${host}) failed: ${e instanceof Error ? e.message : String(e)}`
+        }
+    } else {
+        instNote = `target disk ${targetDiskId} not docked on any pool engine`
+    }
+    if (!instOk) {
+        return {
+            ok: false,
+            reason: 'no_instance',
+            note:
+                `restore op ${done.id} Done on ${done.engine} but no restored instance Running on ` +
+                `${targetDiskId}@${host ?? 'nowhere'} (${instNote}). No soft-pass.`,
+        }
+    }
+    let ctrNote = 'container check unavailable'
+    if (typeof opsAny.listInstanceContainers === 'function') {
+        let names: string[] = []
+        try {
+            names = await opsAny.listInstanceContainers(host!, instId)
+        } catch (e) {
+            ctrNote = `docker ps failed: ${e instanceof Error ? e.message : String(e)}`
+        }
+        if (!names.length) {
+            return {
+                ok: false,
+                reason: 'no_container',
+                note:
+                    `restore op ${done.id} Done and ${instId} Running on ${targetDiskId}@${host} in the store, ` +
+                    `but no running container ${instId}-* on ${host} (${ctrNote}). No soft-pass.`,
+            }
+        }
+        ctrNote = `container ${names.join(',')} on ${host}`
+    }
+    return {
+        ok: true,
+        reason: 'ok',
+        note: `restore op ${done.id} Done on ${done.engine}; ${instId} Running on ${targetDiskId}@${host}; ${ctrNote}`,
     }
 }
 
@@ -1311,7 +1567,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     }
     // Prefer pack-specific ids when Intent names the app.
     let diskId = defaults.diskId
-    let instanceId = defaults.instanceId
+    let instanceId: string | undefined = defaults.instanceId
     if (ctx.action.includes('nextcloud')) {
         const nc = Object.entries(ctx.fixtureInstances).find(([d]) => d.includes('nextcloud'))
         if (nc) {
@@ -1445,6 +1701,18 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             }
         }
     }
+    // r29 FAIL@97: re-read the Kolibri/NC host from the store before any Intent that
+    // polls a sidecar after Confirm (relocation steps may have moved — or not moved — it).
+    if (SIDECAR_SETTLE_ACTIONS.has(ctx.action)) {
+        try {
+            const note = await resyncFixtureSidecarUrlsFromStore(ctx)
+            if (note) preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${note}` : note
+        } catch (e) {
+            const err = e instanceof Error ? e.message : String(e)
+            preStartSettleNote = `${preStartSettleNote ? `${preStartSettleNote}; ` : ''}sidecar URL resync failed: ${err}`
+        }
+    }
+    const intentStartedAt = Date.now()
     // Console 230b70f add_files_role clicks DURATION_FILES_DISK_ID before diskId — point
     // it at the app-only disk for this Intent only; restore the make_files_disk pin after
     // (backup/restore Intents still key off it).
@@ -1489,6 +1757,22 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     let message = result.message ?? `${result.mode}: ${ctx.action}`
     if (preStartSettleNote) {
         message = `${message}; ${preStartSettleNote}`
+    }
+    // r29 FAIL@97: a restore that the Engine never executed must not pass on a healthy
+    // pre-existing sidecar. Live only; on Intent failure append the diagnosis.
+    if (ctx.action === 'restore_from_backup') {
+        const check = await verifyRestoreOperation(ctx, intentStartedAt)
+        if (check && !check.ok) {
+            // Lead with the restore verdict, not the Console's generic sidecar timeout.
+            return {
+                ok: false,
+                message:
+                    `restore_from_backup: ${check.note}` +
+                    (result.ok ? ' (Console Intent reported ok)' : ` (Console Intent: ${message})`),
+                layer,
+            }
+        }
+        if (check) message = `${message}; ${check.note}`
     }
     // Prefer A r20: pin Files Disk under test + fail loud if Pixel soft-passed on dirty empty.
     if (result.ok && ctx.action === 'make_files_disk') {

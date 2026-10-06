@@ -692,6 +692,51 @@ export class RealFleetOps implements FleetOps {
         return structuredClone(this.toSemanticView(engineId, doc))
     }
 
+    /**
+     * r29 FAIL@97: read-only list of operationDB rows (restore/copy/move evidence).
+     * Never calls storeHandle.change().
+     */
+    async listOperations(engineId: string): Promise<
+        { id: string; kind: string; status: string; startedAt: number | null; completedAt: number | null; error: string | null; args: Record<string, string> }[]
+    > {
+        this.assertNotExcluded(engineId, 'listOperations')
+        const conn = await this.connect(engineId)
+        const doc = conn.storeHandle.doc() as (Store & { operationDB?: Record<string, unknown> }) | undefined
+        if (!doc) {
+            throw new Error(`RealFleetOps: store doc not ready for ${engineId}`)
+        }
+        return Object.entries(doc.operationDB ?? {}).map(([id, raw]) => {
+            const o = (raw ?? {}) as unknown as Record<string, unknown>
+            return {
+                id: String(o.id ?? id),
+                kind: String(o.kind ?? ''),
+                status: String(o.status ?? ''),
+                startedAt: typeof o.startedAt === 'number' ? o.startedAt : null,
+                completedAt: typeof o.completedAt === 'number' ? o.completedAt : null,
+                error: o.error == null ? null : String(o.error),
+                args: Object.fromEntries(
+                    Object.entries((o.args ?? {}) as Record<string, unknown>).map(([k, v]) => [k, String(v)]),
+                ),
+            }
+        })
+    }
+
+    /**
+     * r29: read-only `docker ps` names for an instance id on a pool engine
+     * (restore_from_backup must leave a running container on the store host).
+     */
+    async listInstanceContainers(engineId: string, instanceId: string): Promise<string[]> {
+        this.assertNotExcluded(engineId, 'listInstanceContainers')
+        if (!/^[A-Za-z0-9_.-]+$/.test(instanceId)) {
+            throw new Error(`RealFleetOps: refuse docker filter for odd instance id '${instanceId}'`)
+        }
+        const out = await this.ssh(
+            this.hostOf(engineId),
+            `docker ps --filter name='^${instanceId}-' --format '{{.Names}}' 2>/dev/null || true`,
+        )
+        return out.split('\n').map(l => l.trim()).filter(Boolean)
+    }
+
     /** Exposed for tests / smoke reporting. */
     getLiveEngineId(logicalId: string): string | null {
         return this.liveIds.get(logicalId) ?? null
@@ -1233,23 +1278,13 @@ export class RealFleetOps implements FleetOps {
             // store not ready yet — proceed with copy
         }
 
-        // Prefer an engine that already has a healthy Path A META.yaml tree.
-        // Prefer A r21: never for empty packs — they always fresh-copy, so a
-        // "healthy" tree elsewhere is meaningless and redirecting would land
-        // empty-001 off the Console's engine (r21 FAIL@91: idea03 not idea01).
-        let target = engineId
+        // cover-all-980e735-r29 FAIL@97: dock ONLY on the requested engine. The old
+        // "prefer another pool engine with a healthy META tree" fallback silently
+        // redirected infra_move_disk@62 (idea01→idea03) back onto idea01 while the
+        // caller recorded idea03. Reuse a healthy tree on the requested engine, else
+        // fresh-copy into a free idea-test-1..8 slot there; never another engine.
+        const target = engineId
         let device = await this.hasHealthyFixtureTree(engineId, diskId)
-        if (!device && !isEmptyFixtureDisk(diskId)) {
-            for (const id of this.pool) {
-                if (this.exclude.includes(id) || id === engineId) continue
-                device = await this.hasHealthyFixtureTree(id, diskId)
-                if (device) {
-                    target = id
-                    console.log(`[RealFleetOps] dockFixture: prefer ${target} (healthy tree ${device})`)
-                    break
-                }
-            }
-        }
         if (!device) {
             // Try idea-test-N slots until copy accepts (skip occupied/mismatched trees).
             // Prefer Atlas slot for empty (idea-test-3) when free.
@@ -1312,7 +1347,22 @@ export class RealFleetOps implements FleetOps {
         // Eject is async (engine command + Automerge); wait before dock or
         // dockFixture may see stale dockedTo and skip the target host (r25).
         await this.waitDiskUndocked(diskId, 60_000)
-        await this.dockFixture(toEngine, diskId)
+        try {
+            await this.dockFixture(toEngine, diskId)
+        } catch (e) {
+            const err = e instanceof Error ? e.message : String(e)
+            throw new Error(
+                `RealFleetOps.moveDisk: target ${toEngine} could not take ${diskId}: ${err}`,
+            )
+        }
+        // r29: verify the landing in the store — never trust the request.
+        const landed = await this.findDockedEngine(diskId)
+        if (landed !== toEngine) {
+            throw new Error(
+                `RealFleetOps.moveDisk: ${diskId} requested on ${toEngine} but store shows ` +
+                    `${landed ?? 'not docked anywhere'} (r29 FAIL@97 class). No soft-pass.`,
+            )
+        }
     }
 
     /**
