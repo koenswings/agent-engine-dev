@@ -22,6 +22,8 @@ export interface Settings {
     skipImageLoad?: boolean;      // If true, don't load service images from services/*.tar at app start (default: same as testMode). See skipImageLoad().
     skipMetaWrite?: boolean;      // If true, don't write META.yaml on the first dock of a disk without one (default: same as testMode). See skipMetaWrite().
     skipBorg?: boolean;           // If true, backup/restore skip borg init/create/extract (default: same as testMode). See skipBorg().
+    skipHardwareId?: boolean;     // If true, readMetaUpdateId keeps the META diskId (no block-device serial lookup) (default: isDev || testMode). See skipHardwareId().
+    skipMetaUpdate?: boolean;     // If true, readMetaUpdateId never rewrites an existing META.yaml and /META.yaml is never created (default: isDev || testMode). See skipMetaUpdate().
     dockerAvailable?: boolean;    // Force the Docker-available answer (default: unset → cached `docker info` probe). See utils/dockerAvailable.ts.
     staticPeers?: string;         // Opt-in static peer list 'host[:port],...' (IDEA_STATIC_PEERS wins). See StaticPeers.ts.
 }
@@ -119,6 +121,8 @@ function validateSettings(obj: any, path: string): string[] {
     if (obj.disksRoot !== undefined && typeof obj.disksRoot !== 'string') errors.push(`'${path}disksRoot' must be a string.`);
     if (obj.skipImageLoad !== undefined && typeof obj.skipImageLoad !== 'boolean') errors.push(`'${path}skipImageLoad' must be a boolean.`);
     if (obj.skipBorg !== undefined && typeof obj.skipBorg !== 'boolean') errors.push(`'${path}skipBorg' must be a boolean.`);
+    if (obj.skipHardwareId !== undefined && typeof obj.skipHardwareId !== 'boolean') errors.push(`'${path}skipHardwareId' must be a boolean.`);
+    if (obj.skipMetaUpdate !== undefined && typeof obj.skipMetaUpdate !== 'boolean') errors.push(`'${path}skipMetaUpdate' must be a boolean.`);
     if (obj.dockerAvailable !== undefined && typeof obj.dockerAvailable !== 'boolean') errors.push(`'${path}dockerAvailable' must be a boolean.`);
     if (obj.skipMetaWrite !== undefined && typeof obj.skipMetaWrite !== 'boolean') errors.push(`'${path}skipMetaWrite' must be a boolean.`);
     if (obj.staticPeers !== undefined && obj.staticPeers !== null && typeof obj.staticPeers !== 'string') errors.push(`'${path}staticPeers' must be a string.`);
@@ -336,3 +340,34 @@ if (process.env.IDEA_DOCKER_AVAILABLE === 'true' || process.env.IDEA_DOCKER_AVAI
     config.settings.dockerAvailable = process.env.IDEA_DOCKER_AVAILABLE === 'true';
 }
 
+// Allow IDEA_SKIP_HARDWARE_ID=true|false and IDEA_SKIP_META_UPDATE=true|false to
+// override the META.yaml identity gates (idea#168). Unset: follow isDev || testMode.
+if (process.env.IDEA_SKIP_HARDWARE_ID === 'true' || process.env.IDEA_SKIP_HARDWARE_ID === 'false') {
+    config.settings.skipHardwareId = process.env.IDEA_SKIP_HARDWARE_ID === 'true';
+}
+if (process.env.IDEA_SKIP_META_UPDATE === 'true' || process.env.IDEA_SKIP_META_UPDATE === 'false') {
+    config.settings.skipMetaUpdate = process.env.IDEA_SKIP_META_UPDATE === 'true';
+}
+
+/**
+ * Whether readMetaUpdateId keeps the diskId from META.yaml instead of reading the
+ * block device's hardware serial (readHardwareId: /sys/block/<dev>/device/model +
+ * vendor, scsi_id / sudo hdparm) (idea#168).
+ *
+ * testMode/isDev used to decide this together with sudo mount/umount. Like
+ * skipBorg: settings.skipHardwareId, when set, decides on its own; unset it follows
+ * isDev || testMode (the old gate). Under fixture mounts (pi-owned IDEA_DISKS_ROOT,
+ * device names like idea-test-1) there is no /sys/block entry: the lookup finds
+ * nothing and a META with isHardwareId: false keeps its id. Read at call time.
+ */
+export const skipHardwareId = (): boolean => config.settings.skipHardwareId ?? (config.settings.isDev || config.settings.testMode);
+
+/**
+ * Whether readMetaUpdateId leaves an existing META.yaml as it is (no lastDocked /
+ * diskId / format rewrite) and whether a missing system /META.yaml may NOT be
+ * created (idea#168). Unset: follows isDev || testMode (the old gate). Disk META
+ * files under a pi-owned IDEA_DISKS_ROOT are written as pi; /META.yaml and
+ * /disks/sd[a-z][12]/META.yaml go through the sudoers-allowed tee (writeMetaFile).
+ * Separate from skipMetaWrite (the FIRST write on a disk without META.yaml).
+ */
+export const skipMetaUpdate = (): boolean => config.settings.skipMetaUpdate ?? (config.settings.isDev || config.settings.testMode);

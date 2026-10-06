@@ -3,7 +3,7 @@ import { posix } from 'path'
 import pack from '../../package.json' with { type: "json" }
 import { deepPrint, fileExists, log, stripPartition, uuid, print } from '../utils/utils.js'
 import { DeviceName, DiskID, DiskName, Timestamp, Version } from './CommonTypes.js'
-import { config, disksRoot } from './Config.js'
+import { disksRoot, skipHardwareId, skipMetaUpdate } from './Config.js'
 
 export interface DiskMeta {
   diskId: DiskID         
@@ -106,7 +106,8 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
   let path
   let device: DeviceName
   // Every Engine runs on a Pi with a real /META.yaml. We always read it.
-  // testMode only affects hardware ID lookup (skipped) and writeMeta (skipped) — not identity.
+  // skipHardwareId() gates the hardware ID lookup and skipMetaUpdate() the rewrite
+  // (both default to isDev || testMode; idea#168) — not identity.
   try {
     if (deviceSpec) {
       path = `${disksRoot()}/${deviceSpec}/META.yaml`
@@ -121,7 +122,7 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
         device = sourceParts[1] as DeviceName  // e.g. sda2 from /dev/sda2
       } else {
         // Non-block root (overlay, etc.) — device is only used for hardware-id
-        // lookup, which is skipped in testMode/isDev. Use a stable placeholder.
+        // lookup, which skipHardwareId() usually skips there. Use a stable placeholder.
         device = 'system' as DeviceName
         log(`Root SOURCE is '${rootSource}' (non-/dev); using device placeholder '${device}'`)
       }
@@ -130,7 +131,7 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
 
     // The system disk's /META.yaml: create it when it is missing (idea#145)
     if (!deviceSpec) {
-      await ensureSystemMeta(device, { allowCreate: !config.settings.isDev && !config.settings.testMode })
+      await ensureSystemMeta(device, { allowCreate: allowSystemMetaCreate() })
     }
 
     //log(`Our current dir is ${await $`pwd`} with content ${await $`ls`} and path ${path}`)
@@ -151,11 +152,12 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
       let update = false
 
       // Find the hardware id.
-      // In testMode/isDev: skip block device access and use the id from the META file as-is.
-      // Fixture disks have isHardwareId: false and a stable generated id — no hardware lookup needed.
+      // skipHardwareId() (default isDev || testMode): skip block device access and use the id
+      // from the META file as-is. Fixture disks have isHardwareId: false and a stable generated
+      // id — with the lookup on, they find no serial and keep it.
       let diskId: DiskID
-      if (config.settings.isDev || config.settings.testMode) {
-        log(`testMode/isDev: using diskId from META file (${meta.diskId}), skipping hardware id lookup`)
+      if (skipHardwareId()) {
+        log(`skipHardwareId: using diskId from META file (${meta.diskId}), skipping hardware id lookup`)
         diskId = meta.diskId
       } else {
         diskId = await readHardwareId(device) as DiskID
@@ -202,8 +204,8 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
       }
 
       // Update the META file if necessary.
-      // Skip in testMode/isDev — we don't want to mutate fixtures (or /META.yaml, which needs sudo).
-      if (update && !config.settings.isDev && !config.settings.testMode) {
+      // skipMetaUpdate() (default isDev || testMode) leaves fixtures and /META.yaml untouched.
+      if (update && !skipMetaUpdate()) {
         await writeMeta(meta, path)
       }
       return meta
@@ -216,6 +218,9 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
     throw e
   }
 }
+
+/** /META.yaml may be created when missing unless skipMetaUpdate() (idea#145, idea#168). */
+export const allowSystemMetaCreate = (): boolean => !skipMetaUpdate()
 
 export const readHardwareId = async (device: DeviceName): Promise<DiskID | undefined> => {
   log(`Reading disk id for device ${device}`)
