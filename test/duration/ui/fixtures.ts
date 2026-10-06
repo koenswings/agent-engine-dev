@@ -1,5 +1,6 @@
 /**
- * Kid stable fixture / content pins for duration UI Intents (idea#168 / App#10).
+ * Kid stable fixture / content pins for duration UI Intents (idea#168 / App#10,
+ * merged → agent-app-dev main @da291d5a).
  * Auth Morango IDs are re-provision mutable — do not hard-fail walks on them.
  * Content IDs (video/exercise/channel) are stable across re-provision.
  */
@@ -9,7 +10,11 @@ export const DURATION_UI_FIXTURES = {
         instanceId: 'kolibri-grade5a-001',
         packPath: 'tests/duration-tests/fixtures/kolibri',
         channelId: '30b6c263-4b96-5a62-93bd-dcf9a5cad7ca',
-        /** open_video — CONTENT.seeded / CONTENT.live intentResolution */
+        /**
+         * open_video — CONTENT.seeded.json intentResolution (CONTENT.live.json on main
+         * points at the Khan remap; these pins are its syntheticSmokeFallback).
+         * Pass = Learn route /topics/c/<nodeId>; contentId is never in the URL.
+         */
         video: {
             contentId: 'e60662de-b15c-52f9-b003-359f7d91f8fd',
             nodeId: '4a1a1b92-3f6d-59eb-a94c-3f91f0011dd5',
