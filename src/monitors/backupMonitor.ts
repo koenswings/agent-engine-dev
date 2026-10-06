@@ -7,12 +7,13 @@
  *  - BorgBackup for deduplicating, atomic, resumable archives
  *  - activeBackups Set prevents double-backup on reboot race
  *  - Lock file (.backup-in-progress) enables boot-resume after interrupted backup
- *  - testMode: skips borg commands but exercises all other logic (store updates, YAML, lock files)
+ *  - skipBorg() (settings.skipBorg / IDEA_SKIP_BORG, default testMode): skips borg commands but
+ *    exercises all other logic (store updates, YAML, lock files)
  */
 
 import { $, YAML, chalk, fs } from 'zx'
 import { log, print } from '../utils/utils.js'
-import { config, disksRoot } from '../data/Config.js'
+import { disksRoot, skipBorg } from '../data/Config.js'
 import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot } from '../data/Disk.js'
 import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { createOperation, updateOperation } from '../data/Operations.js'
@@ -162,10 +163,10 @@ export const backupInstance = async (
         if (!repoExists) {
             log(`Initialising Borg repo at ${repoPath}`)
             await fs.ensureDir(repoPath)
-            if (!config.settings.testMode) {
+            if (!skipBorg()) {
                 await $`borg init --encryption=none ${repoPath}`
             } else {
-                log(`testMode: skipping borg init`)
+                log(`skipBorg: skipping borg init`)
             }
         }
 
@@ -183,11 +184,11 @@ export const backupInstance = async (
         // 4. Run borg create
         setBackupStep(2, BACKUP_STEPS[2])
         const archiveName = new Date().toISOString().replace(/[:.]/g, '-')
-        if (!config.settings.testMode) {
+        if (!skipBorg()) {
             log(`Running borg create for instance ${instanceId}`)
             await $`borg create ${repoPath}::${archiveName} ${await diskMountRoot(appDisk)}/instances/${instanceId}`
         } else {
-            log(`testMode: skipping borg create for instance ${instanceId}`)
+            log(`skipBorg: skipping borg create for instance ${instanceId}`)
         }
 
         // 5. Restart instance if it was running
@@ -514,11 +515,11 @@ export const restoreApp = async (
 
         await fs.ensureDir(instancesDir)
 
-        if (!config.settings.testMode) {
+        if (!skipBorg()) {
             log(`Restoring instance ${instanceId} from ${backupDevice} to ${targetDevice}`)
             await extractLatestArchive(repoPath, instancesDir, instanceId)
         } else {
-            log(`testMode: skipping borg extract for instance ${instanceId}`)
+            log(`skipBorg: skipping borg extract for instance ${instanceId}`)
         }
 
         const { processInstance } = await import('../data/Disk.js')

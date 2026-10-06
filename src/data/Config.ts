@@ -21,6 +21,7 @@ export interface Settings {
     disksRoot?: string;           // Mount root for App Disks (default: /disks). Tests point this at a private temp folder.
     skipImageLoad?: boolean;      // If true, don't load service images from services/*.tar at app start (default: same as testMode). See skipImageLoad().
     skipMetaWrite?: boolean;      // If true, don't write META.yaml on the first dock of a disk without one (default: same as testMode). See skipMetaWrite().
+    skipBorg?: boolean;           // If true, backup/restore skip borg init/create/extract (default: same as testMode). See skipBorg().
     staticPeers?: string;         // Opt-in static peer list 'host[:port],...' (IDEA_STATIC_PEERS wins). See StaticPeers.ts.
 }
 
@@ -116,6 +117,7 @@ function validateSettings(obj: any, path: string): string[] {
     if (obj.heartbeatIntervalMs !== undefined && typeof obj.heartbeatIntervalMs !== 'number') errors.push(`'${path}heartbeatIntervalMs' must be a number.`);
     if (obj.disksRoot !== undefined && typeof obj.disksRoot !== 'string') errors.push(`'${path}disksRoot' must be a string.`);
     if (obj.skipImageLoad !== undefined && typeof obj.skipImageLoad !== 'boolean') errors.push(`'${path}skipImageLoad' must be a boolean.`);
+    if (obj.skipBorg !== undefined && typeof obj.skipBorg !== 'boolean') errors.push(`'${path}skipBorg' must be a boolean.`);
     if (obj.skipMetaWrite !== undefined && typeof obj.skipMetaWrite !== 'boolean') errors.push(`'${path}skipMetaWrite' must be a boolean.`);
     if (obj.staticPeers !== undefined && obj.staticPeers !== null && typeof obj.staticPeers !== 'string') errors.push(`'${path}staticPeers' must be a string.`);
     return errors;
@@ -298,6 +300,23 @@ if (process.env.IDEA_SKIP_META_WRITE === 'true' || process.env.IDEA_SKIP_META_WR
  * write. Read at call time so overrides always apply.
  */
 export const skipMetaWrite = (): boolean => config.settings.skipMetaWrite ?? config.settings.testMode;
+
+// Allow IDEA_SKIP_BORG=true|false to override whether backup/restore run borg
+// (idea#168 r36@98). Unset: follows testMode.
+if (process.env.IDEA_SKIP_BORG === 'true' || process.env.IDEA_SKIP_BORG === 'false') {
+    config.settings.skipBorg = process.env.IDEA_SKIP_BORG === 'true';
+}
+
+/**
+ * Whether backupApp / restoreApp skip the borg commands (idea#168 r36@98).
+ *
+ * Like skipImageLoad: testMode means "fixture disks, no sudo mount/umount", which
+ * the duration pool needs, but it also skipped borg, so a backup on the pool ended
+ * Done with no Borg repository and restoreApp then refused "No docked Backup Disk
+ * with archives". settings.skipBorg, when set, decides on its own; unset, it follows
+ * testMode (ordinary tests keep skipping borg). Read at call time.
+ */
+export const skipBorg = (): boolean => config.settings.skipBorg ?? config.settings.testMode;
 
 export const DEFAULT_DISKS_ROOT = '/disks';
 
