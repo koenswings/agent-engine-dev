@@ -63,27 +63,32 @@ These commands perform actions on the system. Some are restricted to an `engine`
 
 ### `startInstance`
 - **Description:** Starts a previously created application instance. This involves preloading services and creating and running the Docker containers. The instance becomes `Running` only after `docker compose up` succeeded; any failure sets it to `Error` and closes the command's trace as failed (idea#109). A missing or unloadable `services/<image>.tar` is only a warning (a `warn` log line in the trace): Docker pulls the image at create time if it can.
-- **Usage:** `startInstance <instanceName> <diskName>`
+- **Usage:** `startInstance <instanceId|instanceName> <diskId|diskName> [--cause <cause>]` (idea#168). The instance resolves id-first (see [Instance arguments](#instance-arguments)); an ambiguous name is refused. `--cause` is sent by the cross-engine `copyApp` dispatch (`startInstance <newInstanceId> <targetDiskId> --cause cross-engine-cmd`). The trace arg keys stay `instanceName` and `diskId` (plus `options`).
+- **Port:** the instance keeps the `port=` in its `.env` unless that port is listening (netstat), reserved (80, 8080) or owned by another instance in the store on this engine (idea#168 r35, `storePortOwner`); then, and when `.env` has no port, a fresh port is allocated that is none of those. When two records claim one port (data from before the fix), a Running/Starting claimant owns it, else the older record.
 - **Scope:** `engine`
 
 ### `runInstance`
 - **Description:** A shortcut for running an already-created instance's containers. Assumes `startInstance` has been run at least once. Sets `Running` only after `docker compose up` succeeded; on failure the instance is set to `Error` and the command fails.
-- **Usage:** `runInstance <instanceName> <diskName>`
+- **Usage:** `runInstance <instanceId|instanceName> <diskName>` (idea#168). The instance resolves id-first (see [Instance arguments](#instance-arguments)).
 - **Scope:** `engine`
 
 ### `stopInstance`
 - **Description:** Stops a running application instance and its associated Docker containers.
-- **Usage:** `stopInstance <instanceName> <diskName>`
+- **Usage:** `stopInstance <instanceId|instanceName> <diskId|diskName>` (idea#168). The instance resolves id-first (see [Instance arguments](#instance-arguments)); an ambiguous name is refused.
 - **Scope:** `engine`
 
 ### `copyApp`
-- **Description:** Copies an app instance from one disk to another. The copy receives a brand new InstanceID — it is treated as a fresh instance. The original instance is stopped during the file copy (for a consistent snapshot) and restarted afterwards. Progress is tracked in `operationDB` in the store and visible to all Consoles.
-- **Usage:** `copyApp <instanceName> <sourceDiskName> <targetDiskName>`
+- **Description:** Copies an app instance from one disk to another. The copy receives a brand new InstanceID — it is treated as a fresh instance. The original instance is stopped during the file copy (for a consistent snapshot) and restarted **before the copy starts**, so it keeps its port (idea#168 r35). Progress is tracked in `operationDB` in the store and visible to all Consoles.
+- **The copy is its own instance (idea#168 r35):**
+  - **Name:** `<name>-2`, or the next free `<name>-<n>` (n ≥ 2) that no instance in the store uses. Copying a copy continues its series (`kolibri-2` → `kolibri-3`, when `kolibri` exists); other names are kept whole (`kolibri-grade5a-001` → `kolibri-grade5a-001-2`). Written to the copy's `compose.yaml` `x-app.instanceName` (comments kept) and stored on the instance.
+  - **Port:** the Engine-written `port=` line is removed from the copy's `.env` (other lines are kept), so its start allocates a fresh port (see `startInstance`). App keys such as `KOLIBRI_HTTP_PORT` in `.env` are not Engine-written and are left alone; the Engine rewrites the Kolibri listen env in `compose.yaml` to the allocated port at every start.
+  - **Data:** refused when the instance folder holds a symlink that resolves outside it (see [Instance data links](#instance-data-links)).
+- **Usage:** `copyApp <instanceId|instanceName> <sourceDiskId> <targetDiskId>`. The instance resolves id-first (see [Instance arguments](#instance-arguments)); a name shared by several instances resolves only to the one on the source disk. Crash recovery retries with the instance id. A cross-engine copy dispatches `startInstance <newInstanceId> <targetDiskId> --cause cross-engine-cmd` to the target Engine.
 - **Scope:** `engine`
 
 ### `moveApp`
 - **Description:** Moves an app instance from one disk to another. The instance keeps its original InstanceID so backup disk links remain intact. The source instance directory (and app master, if no other instance on the source disk uses it) is removed after a successful transfer.
-- **Usage:** `moveApp <instanceName> <sourceDiskName> <targetDiskName>`
+- **Usage:** `moveApp <instanceId|instanceName> <sourceDiskId> <targetDiskId>`. The instance resolves id-first (see [Instance arguments](#instance-arguments)). Refused when the instance folder holds a symlink that resolves outside it (see [Instance data links](#instance-data-links)).
 - **Scope:** `engine`
 
 ### `backupApp`
@@ -168,7 +173,18 @@ A disk name with spaces can be passed as one argument in double quotes, e.g. `re
 
 ### Instance arguments
 
-`backupApp` and `restoreApp` resolve their instance argument with `resolveInstanceArg` in `src/data/Commands.ts` (idea#168): an instance id first, then a unique instance name. If two or more instances share the name, the command is refused as ambiguous and their ids are listed; an unknown argument is refused as not found. Both refusals end the trace as `error`.
+`startInstance`, `runInstance`, `stopInstance`, `copyApp`, `moveApp`, `backupApp` and `restoreApp` resolve their instance argument id-first with `lookupInstanceArg` / `resolveInstanceArg` in `src/data/InstanceArg.ts` (idea#168):
+
+1. **Id.** An instance with that id.
+2. **Unique name.** Exactly one instance with that name.
+3. **Name on the command's disk.** When several instances share the name, the one stored on the disk the command names: the disk argument of `startInstance` / `runInstance` / `stopInstance` (a disk id or disk name), the source disk of `copyApp` / `moveApp`. A warning in the trace names the id to send instead. This keeps the Console's wire format (`startInstance <name> <storedOn>`, `copyApp <name> <sourceDiskId> <targetDiskId>`) working and unambiguous. `backupApp` / `restoreApp` have no such disk and skip this step.
+4. **Refused.** Otherwise the command is refused as ambiguous (the candidate ids and their disks are listed) or as not found. Both refusals end the trace as `error`.
+
+Trace arg keys are unchanged (`instanceName`), so a Console that filters traces by the value it sent keeps working. An Engine with this resolver advertises the `instanceIdArgs` capability (see ARCHITECTURE.md, Engine capabilities); a Console can send instance ids to such Engines.
+
+### Instance data links
+
+`copyApp`, `moveApp` and `installApp` (when it copies an existing source instance) refuse instance data that links off the disk (idea#168 r35). Before anything is stopped or written, the instance folder is scanned; any symlink that resolves outside the instance folder (lexically, or after following the link chain; dangling links included) refuses the command with every such link and its target, e.g. `copyApp: instance data links off the disk: 'data/kolibri' -> '/home/pi/idea166-kolibri-live/data/kolibri'. …`. rsync `-a` and `fs.copy` reproduce a link verbatim, so the copy would share the original's data; the Engine refuses rather than dereferencing, which would silently copy an arbitrarily large external tree. Links that stay inside the instance folder are copied as links. Folders the Engine cannot read are skipped (rsync cannot read them either). No IDEA product path creates such a link; replace it with the real data and retry.
 
 ---
 

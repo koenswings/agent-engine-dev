@@ -62,7 +62,7 @@ describe('system disk helper + mount command (idea#134)', () => {
     })
 
     it('ENGINE_CAPABILITIES includes eraseDisk', () => {
-        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk'])
+        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs'])
     })
 })
 

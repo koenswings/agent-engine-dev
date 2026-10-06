@@ -1,5 +1,6 @@
 import { CommandDefinition } from "./CommandDefinition.js";
-import { Store, getApps, getDisks, getDisk, getRunningEngines, getInstances, getEngine, findDiskByName, findInstanceByName, getLocalEngine, createClientStore } from "./Store.js";
+import { Store, getApps, getDisks, getDisk, getRunningEngines, getInstances, getEngine, findDiskByName, getLocalEngine, createClientStore } from "./Store.js";
+import { resolveInstanceArg } from './InstanceArg.js';
 import { Disk, clearDuplicateDiskRecords, isSystemDiskRecord } from "./Disk.js";
 import { deepPrint, log, print } from "../utils/utils.js";
 import { Instance, buildInstance, startInstance, runInstance, stopInstance, markInstanceError } from "./Instance.js";
@@ -211,6 +212,13 @@ const createInstanceWrapper = async (storeHandle: DocHandle<Store> | null, insta
     await buildInstance(instanceName, appName, gitAccount, gitTag as Version, disk.device)
 }
 
+/**
+ * startInstance <instanceId|instanceName> <diskId|diskName> [--cause <cause>]
+ * The instance resolves id-first (idea#168, resolveInstanceArg): an id, a
+ * unique name, or the one instance with that name on the given disk (the
+ * Console sends `<name> <storedOn>`); an ambiguous name is refused.
+ * `--cause` comes from the cross-engine copyApp dispatch.
+ */
 const startInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName, ...rest: string[]) => {
     if (!storeHandle) throw new Error("Store is not available.")
     // Parse optional --cause flag forwarded by cross-engine copyApp dispatch
@@ -219,8 +227,7 @@ const startInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instan
         causeFlag ? (causeFlag.split('=')[1] ?? rest[rest.indexOf(causeFlag) + 1] ?? 'cross-engine-cmd') as any
         : 'console-command'
     const store = storeHandle.doc()
-    const instance = findInstanceByName(store, instanceName)
-    if (!instance) throw new Error(`Instance ${instanceName} not found`)
+    const instance = resolveInstanceArg(store, instanceName, 'startInstance', diskName)
     // Look up disk by ID from instance.storedOn — same fix as stopInstanceWrapper.
     // findDiskByName uses getDisks() which filters dockedTo != null and misses
     // disks that appear undocked in the CRDT but are physically still attached.
@@ -232,9 +239,8 @@ const startInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instan
 const runInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName) => {
     if (!storeHandle) throw new Error("Store is not available.")
     const store = storeHandle.doc()
-    const instance = findInstanceByName(store, instanceName)
+    const instance = resolveInstanceArg(store, instanceName, 'runInstance', diskName)
     const disk = findDiskByName(store, diskName)
-    if (!instance) throw new Error(`Instance ${instanceName} not found`)
     if (!disk) throw new Error(`Disk ${diskName} not found`)
     // runInstance propagates compose up failures (idea#109): mark the instance
     // Error and rethrow, so handleCommand closes this command's trace as failed.
@@ -249,8 +255,7 @@ const runInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instance
 const stopInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName) => {
     if (!storeHandle) throw new Error("Store is not available.")
     const store = storeHandle.doc()
-    const instance = findInstanceByName(store, instanceName)
-    if (!instance) throw new Error(`Instance ${instanceName} not found`)
+    const instance = resolveInstanceArg(store, instanceName, 'stopInstance', diskName)
     // Look up disk by ID from instance.storedOn — not via getDisks() which filters
     // to dockedTo != null and would miss disks that appear undocked in the CRDT.
     const disk = (instance.storedOn ? getDisk(store, instance.storedOn) : undefined) ?? findDiskByName(store, diskName)
@@ -275,20 +280,10 @@ const rebootWrapper = async (storeHandle: DocHandle<Store> | null) => {
 }
 
 /**
- * Resolve an instance argument (idea#168 r29@97): an instance id first, then a
- * unique instance name. Two or more instances with that name are refused as
- * ambiguous (listing their ids); none is refused as not found.
+ * Resolve an instance argument id-first (idea#168). Moved to InstanceArg.ts so
+ * copyApp / moveApp share it; re-exported here for existing importers.
  */
-export const resolveInstanceArg = (store: Store, arg: string, command: string): Instance => {
-    const byId = store.instanceDB[arg as InstanceID]
-    if (byId) return byId
-    const named = Object.values(store.instanceDB).filter(i => i.name === arg)
-    if (named.length === 1) return named[0]
-    if (named.length > 1) {
-        throw new Error(`${command}: instance name '${arg}' is ambiguous: ${named.map(i => `${i.id} (on disk ${i.storedOn ?? 'none'})`).join(', ')}. Use the instance id.`)
-    }
-    throw new Error(`${command}: instance '${arg}' not found.`)
-}
+export { resolveInstanceArg } from './InstanceArg.js'
 
 /**
  * backupApp <instanceIdOrName> <backupDiskIdOrName> (idea#168 r29@97). The
@@ -454,7 +449,10 @@ export const commands: CommandDefinition[] = [
     },
     { name: "installApp", execute: installAppWrapper, args: [{ type: "string" }], scope: 'engine' },
     { name: "createInstance", execute: createInstanceWrapper, args: [{ type: "string" }, { type: "string" }, { type: "string" }, { type: "string" }, { type: "string" }], scope: 'engine' },
-    { name: "startInstance", execute: startInstanceWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "diskId" }], scope: 'engine' },
+    // Instance args resolve id-first (idea#168, InstanceArg.ts). The trace arg key stays
+    // 'instanceName' (Console trace filters read it). startInstance takes optional flags
+    // (`--cause <cause>`, sent by the cross-engine copyApp dispatch).
+    { name: "startInstance", execute: startInstanceWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "diskId" }, { type: "string", name: "options", variadic: true, optional: true }], scope: 'engine' },
     { name: "runInstance", execute: runInstanceWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "diskId" }], scope: 'engine' },
     { name: "stopInstance", execute: stopInstanceWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "diskId" }], scope: 'engine' },
     {

@@ -699,6 +699,76 @@ export const checkPortNumber = async (port: PortNumber): Promise<boolean> => {
 // KSW - UNTESTED <<<
 
 /**
+ * The other instance in the store that owns `port` on this engine (idea#168
+ * r35), or undefined. Candidates are the instances on disks docked to this
+ * engine, other than `self`, whose stored port equals `port`; a stored port
+ * stays with an instance while it is stopped, so a copy can no longer take
+ * the port of an original that is down for a moment. When two records claim
+ * the same port (data from before this fix), exactly one of them owns it: a
+ * Running/Starting claimant, else the older record (created, then id), so the
+ * original keeps its port and the newer copy moves.
+ */
+export const storePortOwner = (store: Store, self: Instance, port: number): Instance | undefined => {
+  if (!port) return undefined
+  let engine: ReturnType<typeof getLocalEngine>
+  try { engine = getLocalEngine(store) } catch { return undefined }
+  const me = store.instanceDB?.[self.id] ?? self
+  const myCreated = Number(me.created ?? 0)
+  return getInstancesOfEngine(store, engine).find(other => {
+    if (!other || String(other.id) === String(self.id)) return false
+    if (Number(other.port) !== Number(port)) return false
+    if (other.status === 'Running' || other.status === 'Starting') return true
+    const otherCreated = Number(other.created ?? 0)
+    return otherCreated < myCreated || (otherCreated === myCreated && String(other.id) < String(self.id))
+  })
+}
+
+/**
+ * Decide the host port for a start (step 1 of startInstance) and write it to
+ * the instance's .env. Keeps the .env port unless it is listening right now
+ * (netstat), reserved for Engine/Console, or owned by another instance in the
+ * store on this engine (storePortOwner, idea#168 r35); otherwise, and when the
+ * .env has no port (a fresh install or a copy), allocates one with
+ * createPortNumber, which skips listening, reserved and store-owned ports.
+ */
+export const choosePortForStart = async (storeHandle: DocHandle<Store>, instance: Instance, envPath: string): Promise<PortNumber> => {
+  let port: PortNumber = 0 as PortNumber
+  try {
+    log(`Trying to find a port number for instance ${instance.id} in the .env file`)
+    port = parseInt(await readEnvVariable(envPath, 'port') as string) as PortNumber
+  } catch (e) {
+    log(`No .env file found for instance ${instance.id}`)
+  }
+  if (!(port == 0) && !isNaN(port)) {
+    log(`Found a port number for instance ${instance.id} in the .env file: ${port}`)
+    // Prefer A r30: if .env port is in use OR reserved (Console :8080), reallocate for
+    // every app — including kolibri. idea#168 r35: also when another instance in the
+    // store owns it (e.g. the original of a copy, stopped for the snapshot).
+    const portInUse = await checkPortNumber(port)
+    const portReserved = isReservedHostPort(port)
+    const owner = portInUse || portReserved ? undefined : storePortOwner(storeHandle.doc(), instance, port)
+    if (portInUse || portReserved || owner) {
+      const why = portReserved ? 'reserved for Engine/Console'
+        : portInUse ? 'already in use'
+        : `owned by instance '${owner!.name}' (${owner!.id}) in the store`
+      log(`Port ${port} is ${why}. Generating a new port number.`)
+      port = await createPortNumber(storeHandle.doc())
+      await addOrUpdateEnvVariable(envPath, 'port', port.toString())
+    } else {
+      log(`Port ${port} is not in use`)
+    }
+  } else {
+    log(`No port number has previously been generated.`)
+    // Prefer A r30: never hardcode kolibri → 8080 (collides with host-net Console).
+    log(`Generating a new port number for instance ${instance.id}.`)
+    port = await createPortNumber(storeHandle.doc())
+    // Write a .env file in which you define the port variable
+    await addOrUpdateEnvVariable(envPath, 'port', port.toString())
+  }
+  return port
+}
+
+/**
  * Build a human-readable diagnosis string when an instance fails.
  * Collects: the caught error message + recent docker logs for each service container.
  * Safe to call in a catch block — never throws.
@@ -821,42 +891,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     //   }
     // }
 
-    let port: PortNumber = 0 as PortNumber
-
-    // Check if the port is defined in the .env file
-    try {
-      log(`Trying to find a port number for instance ${instance.id} in the .env file`)
-      // const envContent = (await $`cat /disks/${disk.device}/instances/${instance.id}/.env`).stdout
-      // port = parseInt(envContent.split('=')[1].slice(0, -1)) as PortNumber
-      port = parseInt(await readEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'port') as string) as PortNumber
-    } catch (e) {
-      log(`No .env file found for instance ${instance.id}`)
-    }
-    // Check if port is undefined or NaN
-    if (!(port == 0) && !isNaN(port)) {
-      log(`Found a port number for instance ${instance.id} in the .env file: ${port}`)
-
-      // Prefer A r30: if .env port is in use OR reserved (Console :8080), reallocate for
-      // every app — including kolibri. Old kolibri path waited 10s then threw
-      // "Port N is still in use" (copy ghost on :18080) or hardcoded fresh installs to 8080.
-      const portInUse = await checkPortNumber(port)
-      const portReserved = isReservedHostPort(port)
-      if (portInUse || portReserved) {
-        log(`Port ${port} is ${portReserved ? 'reserved for Engine/Console' : 'already in use'}. Generating a new port number.`)
-        port = await createPortNumber(store)
-        await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'port', port.toString())
-      } else {
-        log(`Port ${port} is not in use`)
-      }
-
-    } else {
-      log(`No port number has previously been generated.`)
-      // Prefer A r30: never hardcode kolibri → 8080 (collides with host-net Console).
-      log(`Generating a new port number for instance ${instance.id}.`)
-      port = await createPortNumber(store)
-      // Write a .env file in which you define the port variable
-      await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'port', port.toString())
-    }
+    const port = await choosePortForStart(storeHandle, instance, `${mountRoot}/instances/${instance.id}/.env`)
 
     // Host-network Kolibri must listen on the Engine-allocated port (tag 1.0 omit; fixtures hardcode 18080).
     await syncKolibriHostListenPort(`${mountRoot}/instances/${instance.id}/compose.yaml`, port)

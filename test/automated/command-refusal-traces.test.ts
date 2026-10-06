@@ -93,7 +93,7 @@ describe('command refusals end the trace as error (idea#168 r29@97)', () => {
     for (const cmd of ['startInstance', 'runInstance', 'stopInstance']) {
         it(`${cmd}: no store, instance not found, disk not found`, async () => {
             await refused(null, `${cmd} orphan NoSuchDisk`, 'Store is not available.')
-            await refused(h, `${cmd} ghost d-1`, 'Instance ghost not found')
+            await refused(h, `${cmd} ghost d-1`, `${cmd}: instance 'ghost' not found.`)
             await refused(h, `${cmd} orphan NoSuchDisk`, /Disk '?NoSuchDisk'? not found/)
         })
     }
