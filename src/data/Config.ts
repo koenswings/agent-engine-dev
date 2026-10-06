@@ -22,6 +22,7 @@ export interface Settings {
     skipImageLoad?: boolean;      // If true, don't load service images from services/*.tar at app start (default: same as testMode). See skipImageLoad().
     skipMetaWrite?: boolean;      // If true, don't write META.yaml on the first dock of a disk without one (default: same as testMode). See skipMetaWrite().
     skipBorg?: boolean;           // If true, backup/restore skip borg init/create/extract (default: same as testMode). See skipBorg().
+    dockerAvailable?: boolean;    // Force the Docker-available answer (default: unset → cached `docker info` probe). See utils/dockerAvailable.ts.
     staticPeers?: string;         // Opt-in static peer list 'host[:port],...' (IDEA_STATIC_PEERS wins). See StaticPeers.ts.
 }
 
@@ -118,6 +119,7 @@ function validateSettings(obj: any, path: string): string[] {
     if (obj.disksRoot !== undefined && typeof obj.disksRoot !== 'string') errors.push(`'${path}disksRoot' must be a string.`);
     if (obj.skipImageLoad !== undefined && typeof obj.skipImageLoad !== 'boolean') errors.push(`'${path}skipImageLoad' must be a boolean.`);
     if (obj.skipBorg !== undefined && typeof obj.skipBorg !== 'boolean') errors.push(`'${path}skipBorg' must be a boolean.`);
+    if (obj.dockerAvailable !== undefined && typeof obj.dockerAvailable !== 'boolean') errors.push(`'${path}dockerAvailable' must be a boolean.`);
     if (obj.skipMetaWrite !== undefined && typeof obj.skipMetaWrite !== 'boolean') errors.push(`'${path}skipMetaWrite' must be a boolean.`);
     if (obj.staticPeers !== undefined && obj.staticPeers !== null && typeof obj.staticPeers !== 'string') errors.push(`'${path}staticPeers' must be a string.`);
     return errors;
@@ -326,3 +328,11 @@ export const DEFAULT_DISKS_ROOT = '/disks';
  * Read at call time (not import time) so the env override always applies.
  */
 export const disksRoot = (): string => config.settings.disksRoot || DEFAULT_DISKS_ROOT;
+
+// Allow IDEA_DOCKER_AVAILABLE=true|false to force whether the Docker-only paths
+// (metrics poll, already-running shortcut, container logs) run (idea#168).
+// Unset: a cached `docker info` probe decides (utils/dockerAvailable.ts).
+if (process.env.IDEA_DOCKER_AVAILABLE === 'true' || process.env.IDEA_DOCKER_AVAILABLE === 'false') {
+    config.settings.dockerAvailable = process.env.IDEA_DOCKER_AVAILABLE === 'true';
+}
+

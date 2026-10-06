@@ -16,6 +16,7 @@ import { config, disksRoot, skipImageLoad } from '../data/Config.js'
 import { DocHandle } from "@automerge/automerge-repo";
 import { CommandLogStore, LogEntry, getCommandLogHandle, addTrace, closeTrace, flushLogs } from './CommandLogStore.js'
 import { getActiveTrace, flushTrace } from '../utils/CommandLogger.js'
+import { dockerAvailable } from '../utils/dockerAvailable.js'
 
 // ── Step-progress helpers ─────────────────────────────────────────────────────
 
@@ -782,8 +783,8 @@ export const diagnoseInstance = async (instance: Instance, disk: Disk, caughtErr
     parts.push(`Engine error: ${msg}`)
   }
 
-  // 2. Docker container logs (last 20 lines per service)
-  if (!config.settings.testMode) {
+  // 2. Docker container logs (last 20 lines per service) — whenever Docker answers (idea#168; was !testMode)
+  if (await dockerAvailable()) {
     for (const image of (instance.serviceImages ?? [])) {
       // Container name convention: <instanceId>-<serviceName>-1
       // Derive service name from image: last path segment before tag
@@ -808,7 +809,8 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 
   // Short-circuit: if containers are already running (e.g. engine restarted while app was up),
   // just update the status to Running and return — no need to recreate containers.
-  if (!config.settings.testMode) {
+  // Gated on a Docker daemon, not testMode (idea#168: the duration pool runs testMode with real Docker).
+  if (await dockerAvailable()) {
     try {
       const ps = await $`docker ps --filter name=${instance.id} --format {{.Names}}`
       if (ps.stdout.trim().length > 0) {
