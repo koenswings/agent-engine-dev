@@ -40,6 +40,12 @@ export interface Stage2Fixture {
     /** Home Pi (the only Pi whose SSD carries this partition). */
     host: (typeof STAGE2_POOL)[number]
     partNumber: 1 | 2
+    /** Which fixture SSD on that Pi (1 = first, 2 = idea04's second SSD). ≤2 partitions per SSD. */
+    ssd: 1 | 2
+    /** false = kept out of the Engine (partition removed); only the spare. */
+    expectDocked?: boolean
+    /** Free-text role, for the evidence table. */
+    role: string
     partLabel: string
     fsLabel: string
     /** Exact diskTypes the reset fixture must carry; null = per Stage 1 META, not pinned yet (PLAN §1 [unverified]). */
@@ -50,12 +56,16 @@ export interface Stage2Fixture {
 
 /** PLAN §1 partition layout — 2 fixtures per Pi, one Prefer A app per Pi. */
 export const STAGE2_FIXTURES: readonly Stage2Fixture[] = [
-    { diskId: 'duration-kolibri-grade5a-001', host: 'idea01', partNumber: 1, partLabel: 'IDEA-KOLIBRI', fsLabel: 'DUR-KOLIBRI', diskTypes: ['app'], stage1Slot: 'idea-test-1' },
-    { diskId: 'duration-add-files-001', host: 'idea01', partNumber: 2, partLabel: 'IDEA-ADDFILES', fsLabel: 'ADDFILES01', diskTypes: ['app'], stage1Slot: 'idea-test-5' },
-    { diskId: 'duration-nextcloud-grade5a-001', host: 'idea03', partNumber: 1, partLabel: 'IDEA-NEXTCLOUD', fsLabel: 'DUR-NEXTCLOUD', diskTypes: ['app'], stage1Slot: 'idea-test-2' },
-    { diskId: 'duration-empty-001', host: 'idea03', partNumber: 2, partLabel: 'IDEA-EMPTY001', fsLabel: 'DUR-EMPTY001', diskTypes: ['empty'], stage1Slot: 'idea-test-3' },
-    { diskId: 'duration-empty-002', host: 'idea04', partNumber: 1, partLabel: 'IDEA-EMPTY002', fsLabel: 'DUR-EMPTY002', diskTypes: ['empty'], stage1Slot: 'idea-test-4' },
-    { diskId: 'duration-empty-003', host: 'idea04', partNumber: 2, partLabel: 'IDEA-EMPTY003', fsLabel: 'DUR-EMPTY003', diskTypes: ['empty'], stage1Slot: 'idea-test-6' },
+    { diskId: 'duration-kolibri-grade5a-001', host: 'idea01', ssd: 1, partNumber: 1, partLabel: 'IDEA-KOLIBRI', fsLabel: 'DUR-KOLIBRI', diskTypes: ['app'], stage1Slot: 'idea-test-1', role: 'Prefer A app, move source' },
+    { diskId: 'duration-add-files-001', host: 'idea01', ssd: 1, partNumber: 2, partLabel: 'IDEA-ADDFILES', fsLabel: 'ADDFILES01', diskTypes: ['app'], stage1Slot: 'idea-test-5', role: 'add_files_role (app only)' },
+    // Nextcloud seed carries FILES.yaml + files/ → the Engine derives [app, files] (Atlas AXLE-ANSWERS §3; seed kept).
+    { diskId: 'duration-nextcloud-grade5a-001', host: 'idea03', ssd: 1, partNumber: 1, partLabel: 'IDEA-NEXTCLOUD', fsLabel: 'DUR-NEXTCLOUD', diskTypes: ['app', 'files'], stage1Slot: 'idea-test-2', role: 'Prefer A app' },
+    { diskId: 'duration-empty-001', host: 'idea03', ssd: 1, partNumber: 2, partLabel: 'IDEA-EMPTY001', fsLabel: 'DUR-EMPTY001', diskTypes: ['empty'], stage1Slot: 'idea-test-3', role: 'Files' },
+    { diskId: 'duration-empty-002', host: 'idea04', ssd: 1, partNumber: 1, partLabel: 'IDEA-EMPTY002', fsLabel: 'DUR-EMPTY002', diskTypes: ['empty'], stage1Slot: 'idea-test-4', role: 'Erase + late installs' },
+    { diskId: 'duration-empty-003', host: 'idea04', ssd: 1, partNumber: 2, partLabel: 'IDEA-EMPTY003', fsLabel: 'DUR-EMPTY003', diskTypes: ['empty'], stage1Slot: 'idea-test-6', role: 'Backup' },
+    // idea04 SSD2 (Steve option a): dedicated move target + spare. Ids stay duration-empty-* (stage2-dock.sh reset accepts only those).
+    { diskId: 'duration-empty-004', host: 'idea04', ssd: 2, partNumber: 1, partLabel: 'IDEA-MOVE001', fsLabel: 'DUR-MOVE001', diskTypes: ['empty'], stage1Slot: '(new)', role: 'move target (infra_move_disk)' },
+    { diskId: 'duration-empty-005', host: 'idea04', ssd: 2, partNumber: 2, partLabel: 'IDEA-SPARE001', fsLabel: 'DUR-SPARE001', diskTypes: ['empty'], stage1Slot: '(new)', role: 'spare (kept out of the Engine)', expectDocked: false },
 ]
 
 export const stage2Fixture = (diskId: string): Stage2Fixture => {
@@ -66,24 +76,25 @@ export const stage2Fixture = (diskId: string): Stage2Fixture => {
 export const stage2HomeOf = (diskId: string): string => stage2Fixture(diskId).host
 export const stage2FixturesOn = (host: string): Stage2Fixture[] => STAGE2_FIXTURES.filter(f => f.host === host)
 
-/** Static layout sanity (also a unit test): ≤2 partitions per Pi, numbers 1/2 only, unique labels, never idea02. */
+/** Static layout sanity: ≤2 partitions (1/2) per SSD, several SSDs per Pi allowed, unique labels, never idea02. */
 export const validateStage2Layout = (fixtures: readonly Stage2Fixture[] = STAGE2_FIXTURES): string[] => {
     const problems: string[] = []
     const seen = new Set<string>()
     for (const f of fixtures) {
         if ((STAGE2_NEVER_HOSTS as readonly string[]).includes(f.host)) problems.push(`${f.diskId} homed on ${f.host} (never)`)
         if (f.partNumber !== 1 && f.partNumber !== 2) problems.push(`${f.diskId} on partition ${f.partNumber} (Engine sees only 1-2)`)
-        for (const k of [f.diskId, f.partLabel, f.fsLabel, `${f.host}#${f.partNumber}`]) {
+        for (const k of [f.diskId, f.partLabel, f.fsLabel, `${f.host}#ssd${f.ssd}#p${f.partNumber}`]) {
             if (seen.has(k)) problems.push(`duplicate ${k}`)
             seen.add(k)
         }
     }
-    for (const h of new Set(fixtures.map(f => f.host))) {
-        const n = fixtures.filter(f => f.host === h).length
-        if (n > 2) problems.push(`${h} carries ${n} fixtures (max 2 partitions visible to the Engine)`)
+    for (const key of new Set(fixtures.map(f => `${f.host} SSD${f.ssd}`))) {
+        const n = fixtures.filter(f => `${f.host} SSD${f.ssd}` === key).length
+        if (n > 2) problems.push(`${key} carries ${n} fixtures (max 2 partitions per SSD visible to the Engine)`)
     }
     return problems
 }
+export const stage2SsdsOn = (host: string): (1 | 2)[] => [...new Set(stage2FixturesOn(host).map(f => f.ssd))].sort()
 
 // ── stage2-dock.sh contract ─────────────────────────────────────────────────
 
@@ -95,11 +106,11 @@ export const validateStage2Layout = (fixtures: readonly Stage2Fixture[] = STAGE2
 export const STAGE2_DOCK_CONTRACT = {
     script: 'path from DURATION_STAGE2_DOCK (default /usr/local/sbin/stage2-dock.sh), run as `sudo -n`',
     verbs: {
-        status: '`status --json` → {ok,host,bootId,rootDisk,fixtures:[{partLabel,diskId|null,kname|null,parent|null,fsType,fsLabel,mounted:"/disks/sdXN"|null,present}],ugreenDetached:bool,extraSdDisks:[kname]}. Read-only.',
-        dock: '`dock <diskId> --json` (partition-level: `partx -a --nr N` of the PARTLABEL\'s partition) → {ok,diskId,kname}. Idempotent when present.',
+        status: '`status --json` → {ok,host,bootId,rootDisk,ssds:[{kname,serial,model}] (every fixture SSD),fixtures:[{partLabel,diskId|null,kname|null,parent|null,fsType,fsLabel,mounted:"/disks/sdXN"|null,present}],ugreenDetached:bool,extraSdDisks:[kname]}. Read-only.',
+        dock: '`dock <diskId> --json` partition-level. Mounted (Engine-docked) → {ok,already:true}; present+unmounted → partx -d then -a (real add uevent, cycled:true); absent → partx -a → {ok,diskId,kname,already:false}.',
         undock: '`undock <diskId> --json` (partition-level: refuses while mounted — Engine eject first; `partx -d --nr N`) → {ok,diskId}.',
-        'eject-ssd': '`eject-ssd --json` USB unbind of THIS Pi\'s fixture SSD by serial (refuses root disk) → {ok,serial,fixtures:[diskId]}. Both partitions leave.',
-        'dock-ssd': '`dock-ssd --json` USB bind by serial → {ok,serial,fixtures:[{diskId,kname}]}.',
+        'eject-ssd': '`eject-ssd --ssd <diskId> --json` USB unbind of the fixture SSD that carries <diskId> (by its serial; refuses root disk / Ugreen) → {ok,serial,port,fixtures:[diskId of THAT SSD]}. Both its partitions leave; the Pi\'s other SSD stays.',
+        'dock-ssd': '`dock-ssd --ssd <diskId> --json` USB bind of that SSD\'s recorded port (state per serial) → {ok,serial,fixtures:[{diskId,kname}] of THAT SSD}.',
         reset: '`reset <diskId> --json` Empty fixtures only: refuses while mounted; re-mkfs.ext4 -L <fsLabel> (same PARTLABEL) + META.yaml {diskId, diskTypes:[empty]}, root pi:pi 0755 → {ok,diskId}. Stage 2 equivalent of the Stage 1 "fresh Empty pack".',
         yank: '`yank <diskId> --json` removal WITHOUT umount (dirty-unplug path, idea#126) — only when a walk step asks for it.',
         export: '`export <diskId>` → tar stream (numeric-owner, xattrs) on stdout of the partition AFTER Engine eject: script mounts it read-only at a private path (never /disks), tars, unmounts. Refuses while the Engine has it mounted.',
@@ -134,7 +145,8 @@ export const buildStage2DockCmd = (
     }
     const base = `sudo -n ${script}`
     switch (verb) {
-        case 'status': case 'eject-ssd': case 'dock-ssd': return `${base} ${verb} --json`
+        case 'status': return `${base} status --json`
+        case 'eject-ssd': case 'dock-ssd': return `${base} ${verb} --ssd ${id(args.diskId, 'fixture diskId (selects the SSD)')} --json`
         case 'dock': case 'undock': case 'reset': case 'yank': return `${base} ${verb} ${id(args.diskId, 'diskId')} --json`
         case 'export': return `${base} export ${id(args.diskId, 'diskId')}`
         case 'import': return `${base} import ${id(args.diskId, 'target diskId')} --as ${id(args.as, 'source diskId')} --json`
@@ -171,6 +183,8 @@ export interface Stage2Status {
     /** /proc/sys/kernel/random/boot_id — changes on every reboot (planned or 05:00). */
     bootId: string | null
     rootDisk: string | null
+    /** Fixture SSDs (model drives the D4 hardware-id check); [] when the script does not report them. */
+    ssds: { kname: string; serial: string | null; model: string | null }[]
     fixtures: Stage2StatusFixture[]
     ugreenDetached: boolean
     extraSdDisks: string[]
@@ -185,6 +199,7 @@ export const parseStage2Status = (out: string): Stage2Status => {
             partLabel: String(f.partLabel), diskId: f.diskId ?? null, kname: f.kname ?? null, parent: f.parent ?? null,
             fsType: f.fsType ?? null, fsLabel: f.fsLabel ?? null, mounted: f.mounted ?? null, present: !!f.present,
         })),
+        ssds: Array.isArray(j.ssds) ? j.ssds.map(x => ({ kname: String(x.kname), serial: x.serial ?? null, model: x.model ?? null })) : [],
         ugreenDetached: j.ugreenDetached === true,
         extraSdDisks: Array.isArray(j.extraSdDisks) ? j.extraSdDisks.map(String) : [],
     }
@@ -293,26 +308,32 @@ export const stage2EngineSettingsProblems = (probe: EngineConfigProbe | string |
     return problems
 }
 
+/** readHardwareId special-cases these models (src: Intenso + Samsung FIT). */
+export const HWID_MODELS = /intenso|samsung.*fit|\bfit\b/i
+const effectiveFromProbe = (p: EngineConfigProbe | string): EffectiveEngineSettings | null => {
+    const text = typeof p === 'string' ? p : p.configYaml
+    if (!text) return null
+    try {
+        const settings = ((parseYaml(text) ?? {}) as { settings?: Record<string, unknown> }).settings ?? {}
+        return effectiveEngineSettings(settings, typeof p === 'string' ? {} : p.env)
+    } catch { return null }
+}
+
 // ── Role map + move target (Steve 2026-10-07) ───────────────────────────────
 
 /**
- * Files = empty-001 (idea03, kept for Files). Erase = empty-002, Backup = empty-003 (idea04).
- * move_disk target = idea04 (Steve). idea04 has only 002/003, both of which are role disks,
- * so the move target SHARES a partition with a role. Default: empty-002 (Erase). The
- * timeline check below proves whether that fits for a given walk (cover-all: it does NOT).
+ * Files = empty-001 (idea03). Erase = empty-002, Backup = empty-003 (idea04 SSD1).
+ * move_disk target = empty-004 on idea04 SSD2 (Steve option a), never a role disk; empty-005 = spare.
  */
 export const STAGE2_MOVE_TARGET_HOST = 'idea04'
+export const STAGE2_MOVE_TARGET_ID = 'duration-empty-004'
+export const STAGE2_SPARE_ID = 'duration-empty-005'
 export const STAGE2_ROLE_MAP = {
     files: 'duration-empty-001',
     backup: 'duration-empty-003',
     erase: 'duration-empty-002',
 } as const
-export const stage2MoveTargetId = (env: NodeJS.ProcessEnv = process.env): string => {
-    const id = env.DURATION_STAGE2_MOVE_TARGET?.trim() || 'duration-empty-002'
-    const f = stage2Fixture(id)
-    if (f.host !== STAGE2_MOVE_TARGET_HOST || f.diskTypes?.[0] !== 'empty') throw new Error(`Stage 2: move target ${id} must be an Empty partition on ${STAGE2_MOVE_TARGET_HOST}`)
-    return id
-}
+export const stage2MoveTargetId = (): string => STAGE2_MOVE_TARGET_ID
 
 /** Steps that need each role disk Empty / its role (fixtureDisks ROLE_CONSUMERS + later users). */
 const ROLE_USERS: Record<keyof typeof STAGE2_ROLE_MAP, readonly string[]> = {
@@ -330,8 +351,7 @@ export interface Stage2Conflict { role: string; diskId: string; moveStep: number
  * that still needs that app. Any role step on the same partition inside [N, lastNeed] is a
  * conflict. Install_app steps on the erase disk (the late installs) count as erase-role use.
  */
-export const stage2RoleTimeline = (steps: readonly { action: string }[], env: NodeJS.ProcessEnv = process.env): Stage2Conflict[] => {
-    const target = stage2MoveTargetId(env)
+export const stage2RoleTimeline = (steps: readonly { action: string }[], target: string = STAGE2_MOVE_TARGET_ID): Stage2Conflict[] => {
     const role = (Object.entries(STAGE2_ROLE_MAP).find(([, id]) => id === target)?.[0] ?? null) as keyof typeof STAGE2_ROLE_MAP | null
     const out: Stage2Conflict[] = []
     steps.forEach((s, i) => {
@@ -355,7 +375,7 @@ export const describeStage2Conflicts = (c: Stage2Conflict[]): string =>
     c.length
         ? `move target ${c[0]!.diskId} (${c[0]!.role} role) holds the moved app from infra_move_disk@${c[0]!.moveStep} ` +
           `until @${c[0]!.heldUntil}, but the ${c[0]!.role} role needs it at ${c.map(x => `@${x.roleStep} ${x.action}`).join(', ')} — ` +
-          `roles + move target do not fit in 6 partitions (needs a 7th: 2nd SSD on idea04 or Engine D1)`
+          `the move target must not be a role disk`
         : 'move target fits'
 
 // ── Stage 2 preflight verdict (pure) ────────────────────────────────────────
@@ -393,11 +413,18 @@ export const stage2Preflight = (i: Stage2PreflightInput): Stage2PreflightResult 
         if (h === 'idea03' && !st.ugreenDetached) problems.push(`idea03: Ugreen hw-roundtrip stick not detached in software (would mount as an App Disk)`)
         if (st.extraSdDisks.length) problems.push(`${h}: unexpected sd disks besides root + fixture SSD: ${st.extraSdDisks.join(', ')}`)
         const mine = stage2FixturesOn(h)
-        const parents = new Set<string>()
+        const parentOfSsd = new Map<number, Set<string>>()
         for (const f of mine) {
             const s = st.fixtures.find(x => x.partLabel === f.partLabel)
+            if (f.expectDocked === false) {
+                if (i.store[f.diskId]?.dockedTo) problems.push(`${f.diskId} (spare) is docked on ${i.store[f.diskId]!.dockedTo} — keep it out of the Engine`)
+                if (s?.present && s.mounted) problems.push(`${h}: spare ${f.partLabel} mounted at ${s.mounted}`)
+                if (s?.parent) parentOfSsd.set(f.ssd, new Set([...(parentOfSsd.get(f.ssd) ?? []), s.parent]))
+                table.push(`${h} ssd${f.ssd} p${f.partNumber} ${f.partLabel} ${f.diskId} (spare, not docked)`)
+                continue
+            }
             if (!s || !s.present) { problems.push(`${h}: partition ${f.partLabel} (${f.diskId}) not present`); continue }
-            if (s.parent) parents.add(s.parent)
+            if (s.parent) parentOfSsd.set(f.ssd, new Set([...(parentOfSsd.get(f.ssd) ?? []), s.parent]))
             if (st.rootDisk && s.parent === st.rootDisk) problems.push(`${h}: ${f.partLabel} sits on the ROOT disk ${st.rootDisk} — refusing`)
             if (s.kname && !new RegExp(`^sd[a-z]${f.partNumber}$`).test(s.kname)) problems.push(`${h}: ${f.partLabel} is ${s.kname}, expected partition ${f.partNumber} (Engine sees sdX1/sdX2 only)`)
             if (s.fsType !== 'ext4') problems.push(`${h}: ${f.partLabel} fs ${s.fsType ?? '?'} (Engine mounts ext4 only)`)
@@ -413,10 +440,31 @@ export const stage2Preflight = (i: Stage2PreflightInput): Stage2PreflightResult 
                 }
                 if (f.diskTypes?.[0] === 'empty' && sv.instances.length) problems.push(`${f.diskId}: Empty fixture holds instances ${sv.instances.join(', ')}`)
             }
-            table.push(`${h} p${f.partNumber} ${f.partLabel} ${s.kname ?? '?'} ${f.diskId} ${sv?.dockedTo ?? 'undocked'} [${sv?.diskTypes.join(',') ?? ''}]`)
+            table.push(`${h} ssd${f.ssd} p${f.partNumber} ${f.partLabel} ${s.kname ?? '?'} ${f.diskId} ${sv?.dockedTo ?? 'undocked'} [${sv?.diskTypes.join(',') ?? ''}]`)
         }
-        if (parents.size > 1) problems.push(`${h}: fixture partitions on more than one disk (${[...parents].join(', ')}) — expected ONE SSD`)
+        const ssdParents: string[] = []
+        for (const [n, ps] of parentOfSsd) {
+            if (ps.size > 1) problems.push(`${h}: SSD${n} fixtures sit on more than one disk (${[...ps].join(', ')}) — ≤2 partitions of ONE SSD`)
+            ssdParents.push(...ps)
+        }
+        if (new Set(ssdParents).size !== ssdParents.length) problems.push(`${h}: two fixture SSDs resolve to the same disk (${ssdParents.join(', ')})`)
+        // D4: hardware-id collision. With skipHardwareId off, readHardwareId gives Intenso / Samsung FIT
+        // disks the SCSI serial as diskId — the SAME id for both partitions of one SSD.
+        const eff = cfg instanceof Error || !cfg ? null : effectiveFromProbe(cfg)
+        for (const d of st.ssds) {
+            if (d.model && HWID_MODELS.test(d.model) && eff && !eff.skipHardwareId) {
+                problems.push(`${h}: D4 hw-id collision risk — SSD ${d.kname} model '${d.model}' is Intenso/Samsung FIT and effective skipHardwareId=false: both partitions would get diskId = serial ${d.serial ?? '?'}`)
+            }
+        }
     }
+    // D4: no two fixture partitions may resolve to one diskId (META / hardware id), on any Pi.
+    const byId = new Map<string, string[]>()
+    for (const h of i.pool) {
+        const st = i.status[h]
+        if (!st || st instanceof Error) continue
+        for (const x of st.fixtures) if (x.present && x.diskId) byId.set(x.diskId, [...(byId.get(x.diskId) ?? []), `${h}:${x.partLabel}`])
+    }
+    for (const [id, where] of byId) if (where.length > 1) problems.push(`D4: diskId ${id} resolves for ${where.length} partitions (${where.join(', ')}) — hardware-id/META collision`)
     if (i.steps) {
         const c = stage2RoleTimeline(i.steps)
         if (c.length) problems.push(describeStage2Conflicts(c))
@@ -432,7 +480,7 @@ export interface Stage2Gap { action: string; semantics: string; reason: string }
 export const STAGE2_GAPS: readonly Stage2Gap[] = [
     {
         action: 'infra_move_disk',
-        semantics: 'network copy: source partition exported (stage2-dock.sh export) and imported into an Empty partition on the target Pi; the SSD itself never changes hosts',
+        semantics: 'network copy: source partition exported (stage2-dock.sh export) and imported into the dedicated move target duration-empty-004 (idea04 SSD2 p1); the SSD itself never changes hosts',
         reason: 'no hands to move a real SSD between Pis (PLAN §3 / D7); physical move = Stage 3 (USB switch)',
     },
 ]
@@ -451,9 +499,9 @@ export const stage2SummaryFields = (steps: readonly { action: string }[] | null)
 })
 
 /** Network-copy target for a move: always the configured Empty on idea04 (Steve), never the source. */
-export const stage2MoveTargetPartition = (toHost: string, sourceDiskId: string, env: NodeJS.ProcessEnv = process.env): Stage2Fixture => {
+export const stage2MoveTargetPartition = (toHost: string, sourceDiskId: string): Stage2Fixture => {
     if (toHost !== STAGE2_MOVE_TARGET_HOST) throw new Error(`Stage 2 move_disk: target must be ${STAGE2_MOVE_TARGET_HOST} (got ${toHost}); ${sourceDiskId} cannot be network-copied elsewhere`)
-    const f = stage2Fixture(stage2MoveTargetId(env))
+    const f = stage2Fixture(STAGE2_MOVE_TARGET_ID)
     if (f.diskId === sourceDiskId) throw new Error(`Stage 2 move_disk: ${sourceDiskId} is the move target itself`)
     return f
 }
@@ -467,14 +515,14 @@ export const STAGE2_DOCK_SPLIT: Record<string, { level: 'partition' | 'ssd' | 'n
     infra_undock_fixtures: { level: 'partition', verbs: 'Engine eject → undock' },
     enter_infra_fleet_walk: { level: 'partition', verbs: 'Engine eject → undock (unless preserveDockedOnReturn)' },
     return_to_start: { level: 'partition', verbs: 'Engine eject → undock (unless preserveDockedOnReturn)' },
-    infra_move_disk: { level: 'partition', verbs: 'Engine eject → export | import into move target → dock' },
-    install_app: { level: 'partition', verbs: 'empty-002 fresh: Engine eject → undock → reset → dock' },
-    make_files_disk: { level: 'partition', verbs: 'empty-001 fresh: Engine eject → undock → reset → dock' },
-    erase_disk: { level: 'partition', verbs: 'empty-002 fresh after/before erase: undock → reset → dock' },
+    infra_move_disk: { level: 'partition', verbs: 'Engine eject source + move target → reset target → export | import → undock source → dock target' },
+    install_app: { level: 'partition', verbs: 'empty-002 fresh: Engine eject → reset → dock (re-add cycle)' },
+    make_files_disk: { level: 'partition', verbs: 'empty-001 fresh: Engine eject → reset → dock (re-add cycle)' },
+    erase_disk: { level: 'partition', verbs: 'empty-002 fresh after/before erase: Engine eject → reset → dock (re-add cycle)' },
     add_files_role: { level: 'partition', verbs: 'add-files home dock if absent' },
     eject_disk: { level: 'none', verbs: 'Console/Engine eject only (Intent); no device change' },
-    infra_reboot_engine: { level: 'ssd', verbs: 'after boot: status (bootId) → dock-ssd if the SSD is missing → re-apply partition state' },
+    infra_reboot_engine: { level: 'ssd', verbs: 'after boot: status (bootId) → dock-ssd --ssd <fixture> for each SSD whose partitions are all missing → re-apply partition state' },
     reboot_engine: { level: 'ssd', verbs: 'same as infra_reboot_engine' },
     '05:00 daily reboot': { level: 'ssd', verbs: 'detected by bootId change before the next fixture op → same redock' },
-    yank: { level: 'ssd', verbs: 'eject-ssd without Engine eject (dirty path) → dock-ssd; no cover-all step uses it yet' },
+    yank: { level: 'ssd', verbs: 'yank <diskId> (unbinds that SSD without Engine eject) → dock-ssd --ssd <diskId>; no cover-all step uses it yet' },
 }
