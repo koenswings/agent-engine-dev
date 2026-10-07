@@ -10,7 +10,10 @@ echo "--- Starting Engine Bootstrap Installation ---"
 # 1. Install base system dependencies and Node.js tools
 echo "--> Installing git, curl, and Node.js environment..."
 apt-get update -y
-apt-get install -y npm git curl borgbackup
+# rsync (with rrsync) and borgbackup are run as root by the app-data helper
+# /usr/local/sbin/idea-app-data (idea#168); step 5 (build-engine, installUdev)
+# installs the helper and its sudoers line.
+apt-get install -y npm git curl rsync borgbackup
 npm install -g n pnpm
 echo "--> Setting Node.js version for script execution..."
 n 20
@@ -38,6 +41,9 @@ EOF
 systemd-tmpfiles --create /etc/tmpfiles.d/idea-engine.conf
 
 # 5. Run the main provisioning script in Local Mode
+# (installs the sudoers files 10-engine/11-engine-files after visudo -cf, and the
+# root helpers /usr/local/sbin/idea-erase-disk and /usr/local/sbin/idea-app-data
+# as root-owned 0755 copies; the Engine refuses to start without idea-app-data)
 echo "--> Executing main build script in Local Mode..."
 # Execute the main build script using its new wrapper
 ./build-engine

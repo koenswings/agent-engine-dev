@@ -28,6 +28,7 @@ import { AppID, AppName, DiskID, DiskName, InstanceName, Version } from './Commo
 import { DocHandle } from '@automerge/automerge-repo'
 import { Disk, diskMountRoot } from './Disk.js'
 import { App, createOrUpdateApp } from './App.js'
+import { assertNoExternalLinks } from './InstanceCopy.js'
 
 // ── Internet probe ────────────────────────────────────────────────────────────
 
@@ -73,8 +74,33 @@ export const installAppFromDisk = async (
         throw new Error(`App '${appId}' not found on disk '${sourceDisk.name}' at ${sourcePath}`)
     }
 
+    // Generate a fresh instance ID
+    const { uuid } = await import('../utils/utils.js')
+    const instanceId = uuid()
+
+    const sourceInstanceBase = `${sourceMountRoot}/instances`
+
+    // If source has an instance of this app, copy its data as the starting point
+    let sourceInstanceId: string | null = null
+    if (await fs.pathExists(sourceInstanceBase)) {
+        const store = storeHandle.doc()
+        const sourceInstance = Object.values(store.instanceDB).find(
+            i => String(i.instanceOf) === String(appId) && String(i.storedOn) === String(sourceDisk.id)
+        )
+        if (sourceInstance) sourceInstanceId = sourceInstance.id
+    }
+
+    // Refuse source instance data that links off the disk (idea#168 r35) before
+    // anything is written to the target: fs.copy reproduces a link verbatim, so the new
+    // instance would share the source instance's data.
+    const copyFromSourceInstance = !!sourceInstanceId && await fs.pathExists(`${sourceInstanceBase}/${sourceInstanceId}`)
+    if (copyFromSourceInstance) {
+        await assertNoExternalLinks('installApp', `${sourceInstanceBase}/${sourceInstanceId}`, sourceDisk)
+    }
+
     // Ensure target has the required directory structure
     const targetMountRoot = await diskMountRoot(targetDisk)
+    const targetInstanceBase = `${targetMountRoot}/instances`
     await fs.ensureDir(`${targetMountRoot}/apps`)
     await fs.ensureDir(`${targetMountRoot}/instances`)
     await fs.ensureDir(`${targetMountRoot}/services`)
@@ -87,27 +113,10 @@ export const installAppFromDisk = async (
     // Register app in store
     await createOrUpdateApp(storeHandle, appId, targetDisk)
 
-    // Generate a fresh instance ID and create the instance directory
-    const { uuid } = await import('../utils/utils.js')
-    const instanceId = uuid()
-
-    const sourceInstanceBase = `${sourceMountRoot}/instances`
-    const targetInstanceBase = `${targetMountRoot}/instances`
-
-    // If source has an instance of this app, copy its data as the starting point
-    let sourceInstanceId: string | null = null
-    if (await fs.pathExists(sourceInstanceBase)) {
-        const store = storeHandle.doc()
-        const sourceInstance = Object.values(store.instanceDB).find(
-            i => String(i.instanceOf) === String(appId) && String(i.storedOn) === String(sourceDisk.id)
-        )
-        if (sourceInstance) sourceInstanceId = sourceInstance.id
-    }
-
     const instanceDir = `${targetInstanceBase}/${instanceId}`
     await fs.ensureDir(instanceDir)
 
-    if (sourceInstanceId && await fs.pathExists(`${sourceInstanceBase}/${sourceInstanceId}`)) {
+    if (copyFromSourceInstance) {
         log(`Copying instance data from ${sourceInstanceId} to new instance ${instanceId}`)
         await fs.copy(`${sourceInstanceBase}/${sourceInstanceId}`, instanceDir, { overwrite: true })
     } else {

@@ -123,9 +123,10 @@ export const disconnectEngine = (repo: Repo, address: IPAddress, port: PortNumbe
 
 
 
-export const connectEngine = async (repo:Repo, address: IPAddress, hostname: Hostname, engineId: EngineID, storeDocId: DocumentId): Promise<WebSocketClientAdapter | undefined> => {
+export const connectEngine = async (repo:Repo, address: IPAddress, hostname: Hostname, engineId: EngineID, storeDocId: DocumentId, peerPort?: PortNumber): Promise<WebSocketClientAdapter | undefined> => {
 
-  const port = settings.port as PortNumber || 1234 as PortNumber
+  // peerPort: static peers (StaticPeers.ts) only; mDNS peers use the own port as before
+  const port = peerPort ?? (settings.port as PortNumber || 1234 as PortNumber)
 
   log(`Connecting to engine at ${address}:${port}`)
 

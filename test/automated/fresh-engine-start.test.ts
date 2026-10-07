@@ -188,7 +188,7 @@ describe('/META.yaml is created when missing (idea#145)', () => {
     it('readMetaUpdateId creates the system META before reading it; Engine.ts exits with a readable reason', () => {
         expect(SYSTEM_META_PATH).toBe('/META.yaml')
         const meta = fs.readFileSync(path.join(ROOT, 'src/data/Meta.ts'), 'utf-8')
-        expect(meta).toMatch(/if \(!deviceSpec\) \{\s*await ensureSystemMeta\(device, \{ allowCreate: !config\.settings\.isDev && !config\.settings\.testMode \}\)/)
+        expect(meta).toMatch(/if \(!deviceSpec\) \{\s*await ensureSystemMeta\(device, \{ allowCreate: allowSystemMetaCreate\(\) \}\)/)
         const engine = fs.readFileSync(path.join(ROOT, 'src/data/Engine.ts'), 'utf-8')
         expect(engine).toContain('Cannot start the Engine: could not determine the local Engine id')
     })

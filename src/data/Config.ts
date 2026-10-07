@@ -21,6 +21,13 @@ export interface Settings {
     disksRoot?: string;           // Mount root for App Disks (default: /disks). Tests point this at a private temp folder.
     skipImageLoad?: boolean;      // If true, don't load service images from services/*.tar at app start (default: same as testMode). See skipImageLoad().
     skipMetaWrite?: boolean;      // If true, don't write META.yaml on the first dock of a disk without one (default: same as testMode). See skipMetaWrite().
+    skipBorg?: boolean;           // If true, backup/restore skip borg init/create/extract (default: same as testMode). See skipBorg().
+    skipHardwareId?: boolean;     // If true, readMetaUpdateId keeps the META diskId (no block-device serial lookup) (default: isDev || testMode). See skipHardwareId().
+    skipMetaUpdate?: boolean;     // If true, readMetaUpdateId never rewrites an existing META.yaml and /META.yaml is never created (default: isDev || testMode). See skipMetaUpdate().
+    dockerAvailable?: boolean;    // Force the Docker-available answer (default: unset → cached `docker info` probe). See utils/dockerAvailable.ts.
+    staticPeers?: string;         // Opt-in static peer list 'host[:port],...' (IDEA_STATIC_PEERS wins). See StaticPeers.ts.
+    peerAccess?: boolean;         // Per-Pi Engine keys for cross-Engine copy (default: on unless isDev || testMode). See peerAccessEnabled().
+    peerStaleHours?: number;      // A peer Engine without a heartbeat for this long loses its key here (default 168 = 7 days). See peerStaleMs().
 }
 
 export interface Defaults {
@@ -115,7 +122,14 @@ function validateSettings(obj: any, path: string): string[] {
     if (obj.heartbeatIntervalMs !== undefined && typeof obj.heartbeatIntervalMs !== 'number') errors.push(`'${path}heartbeatIntervalMs' must be a number.`);
     if (obj.disksRoot !== undefined && typeof obj.disksRoot !== 'string') errors.push(`'${path}disksRoot' must be a string.`);
     if (obj.skipImageLoad !== undefined && typeof obj.skipImageLoad !== 'boolean') errors.push(`'${path}skipImageLoad' must be a boolean.`);
+    if (obj.skipBorg !== undefined && typeof obj.skipBorg !== 'boolean') errors.push(`'${path}skipBorg' must be a boolean.`);
+    if (obj.skipHardwareId !== undefined && typeof obj.skipHardwareId !== 'boolean') errors.push(`'${path}skipHardwareId' must be a boolean.`);
+    if (obj.skipMetaUpdate !== undefined && typeof obj.skipMetaUpdate !== 'boolean') errors.push(`'${path}skipMetaUpdate' must be a boolean.`);
+    if (obj.dockerAvailable !== undefined && typeof obj.dockerAvailable !== 'boolean') errors.push(`'${path}dockerAvailable' must be a boolean.`);
     if (obj.skipMetaWrite !== undefined && typeof obj.skipMetaWrite !== 'boolean') errors.push(`'${path}skipMetaWrite' must be a boolean.`);
+    if (obj.staticPeers !== undefined && obj.staticPeers !== null && typeof obj.staticPeers !== 'string') errors.push(`'${path}staticPeers' must be a string.`);
+    if (obj.peerAccess !== undefined && typeof obj.peerAccess !== 'boolean') errors.push(`'${path}peerAccess' must be a boolean.`);
+    if (obj.peerStaleHours !== undefined && (typeof obj.peerStaleHours !== 'number' || !(obj.peerStaleHours > 0))) errors.push(`'${path}peerStaleHours' must be a positive number.`);
     return errors;
 }
 
@@ -297,6 +311,34 @@ if (process.env.IDEA_SKIP_META_WRITE === 'true' || process.env.IDEA_SKIP_META_WR
  */
 export const skipMetaWrite = (): boolean => config.settings.skipMetaWrite ?? config.settings.testMode;
 
+// Allow IDEA_SKIP_BORG=true|false to override whether backup/restore run borg
+// (idea#168 r36@98). Unset: follows testMode.
+if (process.env.IDEA_SKIP_BORG === 'true' || process.env.IDEA_SKIP_BORG === 'false') {
+    config.settings.skipBorg = process.env.IDEA_SKIP_BORG === 'true';
+}
+
+/**
+ * Whether backupApp / restoreApp skip the borg commands (idea#168 r36@98).
+ *
+ * Like skipImageLoad: testMode means "fixture disks, no sudo mount/umount", which
+ * the duration pool needs, but it also skipped borg, so a backup on the pool ended
+ * Done with no Borg repository and restoreApp then refused "No docked Backup Disk
+ * with archives". settings.skipBorg, when set, decides on its own; unset, it follows
+ * testMode (ordinary tests keep skipping borg). Read at call time.
+ */
+export const skipBorg = (): boolean => config.settings.skipBorg ?? config.settings.testMode;
+
+/**
+ * Whether this Engine makes and publishes its own Engine key and syncs its peers'
+ * keys into the root-owned authorized_keys/known_hosts (data/PeerAccess.ts).
+ * Unset: on, except on dev containers and in test mode (no root helper there).
+ */
+export const peerAccessEnabled = (): boolean => config.settings.peerAccess ?? !(config.settings.isDev || config.settings.testMode);
+
+/** After how long without a heartbeat a peer's key is removed (settings.peerStaleHours; default 7 days). */
+export const PEER_STALE_HOURS_DEFAULT = 168;
+export const peerStaleMs = (): number => (config.settings.peerStaleHours ?? PEER_STALE_HOURS_DEFAULT) * 60 * 60 * 1000;
+
 export const DEFAULT_DISKS_ROOT = '/disks';
 
 /**
@@ -305,3 +347,42 @@ export const DEFAULT_DISKS_ROOT = '/disks';
  * Read at call time (not import time) so the env override always applies.
  */
 export const disksRoot = (): string => config.settings.disksRoot || DEFAULT_DISKS_ROOT;
+
+// Allow IDEA_DOCKER_AVAILABLE=true|false to force whether the Docker-only paths
+// (metrics poll, already-running shortcut, container logs) run (idea#168).
+// Unset: a cached `docker info` probe decides (utils/dockerAvailable.ts).
+if (process.env.IDEA_DOCKER_AVAILABLE === 'true' || process.env.IDEA_DOCKER_AVAILABLE === 'false') {
+    config.settings.dockerAvailable = process.env.IDEA_DOCKER_AVAILABLE === 'true';
+}
+
+// Allow IDEA_SKIP_HARDWARE_ID=true|false and IDEA_SKIP_META_UPDATE=true|false to
+// override the META.yaml identity gates (idea#168). Unset: follow isDev || testMode.
+if (process.env.IDEA_SKIP_HARDWARE_ID === 'true' || process.env.IDEA_SKIP_HARDWARE_ID === 'false') {
+    config.settings.skipHardwareId = process.env.IDEA_SKIP_HARDWARE_ID === 'true';
+}
+if (process.env.IDEA_SKIP_META_UPDATE === 'true' || process.env.IDEA_SKIP_META_UPDATE === 'false') {
+    config.settings.skipMetaUpdate = process.env.IDEA_SKIP_META_UPDATE === 'true';
+}
+
+/**
+ * Whether readMetaUpdateId keeps the diskId from META.yaml instead of reading the
+ * block device's hardware serial (readHardwareId: /sys/block/<dev>/device/model +
+ * vendor, scsi_id / sudo hdparm) (idea#168).
+ *
+ * testMode/isDev used to decide this together with sudo mount/umount. Like
+ * skipBorg: settings.skipHardwareId, when set, decides on its own; unset it follows
+ * isDev || testMode (the old gate). Under fixture mounts (pi-owned IDEA_DISKS_ROOT,
+ * device names like idea-test-1) there is no /sys/block entry: the lookup finds
+ * nothing and a META with isHardwareId: false keeps its id. Read at call time.
+ */
+export const skipHardwareId = (): boolean => config.settings.skipHardwareId ?? (config.settings.isDev || config.settings.testMode);
+
+/**
+ * Whether readMetaUpdateId leaves an existing META.yaml as it is (no lastDocked /
+ * diskId / format rewrite) and whether a missing system /META.yaml may NOT be
+ * created (idea#168). Unset: follows isDev || testMode (the old gate). Disk META
+ * files under a pi-owned IDEA_DISKS_ROOT are written as pi; /META.yaml and
+ * /disks/sd[a-z][12]/META.yaml go through the sudoers-allowed tee (writeMetaFile).
+ * Separate from skipMetaWrite (the FIRST write on a disk without META.yaml).
+ */
+export const skipMetaUpdate = (): boolean => config.settings.skipMetaUpdate ?? (config.settings.isDev || config.settings.testMode);

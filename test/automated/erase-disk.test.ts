@@ -13,7 +13,7 @@ import { createOrUpdateEngine, localEngineId, ENGINE_CAPABILITIES } from '../../
 import { createOrUpdateDisk, processDisk } from '../../src/data/Disk.js'
 import {
     eraseDisk, setEraseOpsForTests, clearStaleEraseStaging, ERASE_STAGING_ROOT,
-    eraseBlocker, IDEA_DISK_LABEL, isEraseDeviceLocked,
+    eraseBlocker, IDEA_DISK_LABEL, isEraseDeviceLocked, isSlotEraseDevice,
 } from '../../src/data/EraseDisk.js'
 import { summariseDisk, attachTraceResult, SUMMARY_MAX_AGE_MS, setSummariseOpsForTests } from '../../src/data/SummariseDisk.js'
 import { scanUnformattedDisks, setUnformattedOpsForTests, uniquifyLabels, clearGeneratedUnformattedIdsForTests, labelForUnformatted } from '../../src/data/UnformattedDisks.js'
@@ -62,7 +62,7 @@ describe('system disk helper + mount command (idea#134)', () => {
     })
 
     it('ENGINE_CAPABILITIES includes eraseDisk', () => {
-        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk'])
+        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs'])
     })
 })
 
@@ -134,6 +134,7 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
     let logHandle: DocHandle<CommandLogStore>
     const roots: string[] = []
     let scriptCalls: any[]
+    let slotCalls: any[]
 
     beforeEach(async () => {
         h = await newStore()
@@ -141,6 +142,7 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
         await logHandle.whenReady()
         setCommandLogHandle(logHandle)
         scriptCalls = []
+        slotCalls = []
         setEraseOpsForTests({
             runScript: async (a) => {
                 scriptCalls.push(a)
@@ -152,9 +154,18 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
                 roots.push(root)
                 return { stdout: 'STEP:partitioning\nSTEP:creating filesystem\nSTEP:mounting\nok: erased\n' }
             },
+            runSlotErase: async (a) => {
+                slotCalls.push(a)
+                const root = `${DISKS_ROOT}/${a.slot}`
+                await fs.ensureDir(root)
+                await fs.copy(path.join(a.stagingDir, 'META.yaml'), path.join(root, 'META.yaml'))
+                roots.push(root)
+                return { stdout: 'STEP:unmounting\nSTEP:creating filesystem\nSTEP:mounting\nok: erased slot\n' }
+            },
             udevadmSettle: async () => {},
             composeDownV: async () => {},
             lsblkSizeSerial: async () => ({ sizeBytes: 32_000_000_000, serial: 'FAKE1' }),
+            isMountPoint: async () => false,
             addDevice: async (p) => {
                 const device = p.split('/').pop()!
                 const root = `${DISKS_ROOT}/${device}`
@@ -170,6 +181,7 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
         })
     })
     afterEach(async () => {
+        vi.restoreAllMocks()
         setEraseOpsForTests(null)
         setSystemDiskOpsForTests(null)
         setCommandLogHandle(null)
@@ -244,8 +256,13 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
         const result = await eraseDisk(h, 'CAND1', tid, 'SanDisk 32 GB')
         expect(result.diskId).toBe('CAND1')
         expect(scriptCalls).toHaveLength(1)
+        expect(slotCalls).toHaveLength(0)
         expect(scriptCalls[0].device).toBe('/dev/sdb')
         expect(scriptCalls[0].label).toBe(IDEA_DISK_LABEL)
+        // Production USB path still invokes idea-erase-disk args (partition whole disk)
+        expect(scriptCalls[0]).toMatchObject({
+            device: '/dev/sdb', serial: 'FAKE1', sizeBytes: 32_000_000_000, label: IDEA_DISK_LABEL,
+        })
         // Staging was META-only (deleted after; check what script received existed)
         expect(scriptCalls[0].stagingDir).toMatch(/erase-staging/)
         const disk = h.doc()!.diskDB['CAND1' as DiskID]
@@ -273,5 +290,118 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
         await fs.writeFile(path.join(dir, 'META.yaml'), 'diskId: x\n')
         await clearStaleEraseStaging()
         expect(await fs.pathExists(dir)).toBe(false)
+    })
+
+    it('isSlotEraseDevice detects idea-test-N only', () => {
+        expect(isSlotEraseDevice('idea-test-4')).toBe(true)
+        expect(isSlotEraseDevice('sdb1')).toBe(false)
+        expect(isSlotEraseDevice('sda')).toBe(false)
+        expect(isSlotEraseDevice(null)).toBe(false)
+    })
+
+    it('eraseDisk loop slot success: runSlotErase, not runScript; remounts as empty', async () => {
+        const device = 'idea-test-4'
+        const diskId = 'duration-empty-002'
+        const root = `${DISKS_ROOT}/${device}`
+        await fs.ensureDir(root)
+        await fs.writeFile(path.join(root, 'META.yaml'), YAML.stringify({
+            diskId, diskName: 'Duration Tests — Empty Disk 002', isHardwareId: false, created: 1, version: '1.0',
+        }))
+        roots.push(root)
+        const disk = createOrUpdateDisk(h, LOCAL, device as DeviceName, diskId as DiskID, 'Duration Tests — Empty Disk 002' as DiskName, 1 as Timestamp)
+        await processDisk(h, disk)
+
+        const tid = putSummary(diskId, 'Duration Tests — Empty Disk 002', null)
+        // undockDisk is heavy; stub it so erase only exercises the slot path
+        const usb = await import('../../src/monitors/usbDeviceMonitor.js')
+        const undockSpy = vi.spyOn(usb, 'undockDisk').mockImplementation(async (storeHandle, d) => {
+            storeHandle.change(doc => {
+                const x = doc.diskDB[d.id]
+                if (x) { x.dockedTo = null; x.device = null as any }
+            })
+        })
+
+        const result = await eraseDisk(h, diskId, tid, 'Duration Tests — Empty Disk 002')
+        expect(result.diskId).toBe(diskId)
+        expect(slotCalls).toHaveLength(1)
+        expect(slotCalls[0].slot).toBe(device)
+        expect(slotCalls[0].stagingDir).toMatch(/erase-staging/)
+        expect(scriptCalls).toHaveLength(0)
+        const published = h.doc()!.diskDB[diskId as DiskID]
+        expect(published).toBeTruthy()
+        expect([...published.diskTypes]).toEqual(['empty'])
+        undockSpy.mockRestore()
+    })
+
+    it('eraseDisk loop slot: still-mounted refusal when umount really fails', async () => {
+        const device = 'idea-test-4'
+        const diskId = 'duration-empty-002'
+        const root = `${DISKS_ROOT}/${device}`
+        await fs.ensureDir(root)
+        await fs.writeFile(path.join(root, 'META.yaml'), YAML.stringify({
+            diskId, diskName: 'Duration Tests — Empty Disk 002', isHardwareId: false, created: 1, version: '1.0',
+        }))
+        roots.push(root)
+        const disk = createOrUpdateDisk(h, LOCAL, device as DeviceName, diskId as DiskID, 'Duration Tests — Empty Disk 002' as DiskName, 1 as Timestamp)
+        await processDisk(h, disk)
+        const tid = putSummary(diskId, 'Duration Tests — Empty Disk 002', null)
+
+        const usb = await import('../../src/monitors/usbDeviceMonitor.js')
+        vi.spyOn(usb, 'undockDisk').mockImplementation(async (storeHandle, d) => {
+            storeHandle.change(doc => {
+                const x = doc.diskDB[d.id]
+                if (x) { x.dockedTo = null; x.device = null as any }
+            })
+        })
+
+        setEraseOpsForTests({
+            runSlotErase: async () => { throw new Error('helper: could not unmount') },
+            isMountPoint: async () => true,
+            runScript: async () => { throw new Error('USB script must not run for slots') },
+            addDevice: async () => {},
+            udevadmSettle: async () => {},
+            composeDownV: async () => {},
+            lsblkSizeSerial: async () => ({ sizeBytes: 0, serial: null }),
+        })
+
+        await expect(eraseDisk(h, diskId, tid, 'Duration Tests — Empty Disk 002'))
+            .rejects.toThrow(/couldn't be unmounted, so nothing was erased/)
+        expect(scriptCalls).toHaveLength(0)
+    })
+
+    it('eraseDisk USB path refuses when still mounted (unchanged)', async () => {
+        const device = 'sdb1'
+        const diskId = 'usb-disk-1'
+        const root = `${DISKS_ROOT}/${device}`
+        await fs.ensureDir(root)
+        await fs.writeFile(path.join(root, 'META.yaml'), YAML.stringify({
+            diskId, diskName: 'USB Stick', isHardwareId: false, created: 1, version: '1.0',
+        }))
+        roots.push(root)
+        const disk = createOrUpdateDisk(h, LOCAL, device as DeviceName, diskId as DiskID, 'USB Stick' as DiskName, 1 as Timestamp)
+        await processDisk(h, disk)
+        const tid = putSummary(diskId, 'USB Stick', 'FAKE1')
+
+        const usb = await import('../../src/monitors/usbDeviceMonitor.js')
+        vi.spyOn(usb, 'undockDisk').mockImplementation(async (storeHandle, d) => {
+            storeHandle.change(doc => {
+                const x = doc.diskDB[d.id]
+                if (x) { x.dockedTo = null; x.device = null as any }
+            })
+        })
+        setEraseOpsForTests({
+            isMountPoint: async () => true,
+            runScript: async () => { throw new Error('should not partition') },
+            runSlotErase: async () => { throw new Error('should not slot-erase') },
+            addDevice: async () => {},
+            udevadmSettle: async () => {},
+            composeDownV: async () => {},
+            lsblkSizeSerial: async () => ({ sizeBytes: 32e9, serial: 'FAKE1' }),
+        })
+
+        await expect(eraseDisk(h, diskId, tid, 'USB Stick'))
+            .rejects.toThrow(/couldn't be unmounted, so nothing was erased/)
+        expect(scriptCalls).toHaveLength(0)
+        expect(slotCalls).toHaveLength(0)
     })
 })

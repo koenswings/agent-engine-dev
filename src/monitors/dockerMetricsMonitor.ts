@@ -16,7 +16,7 @@ import { DocHandle } from '@automerge/automerge-repo'
 import { Store, getLocalEngine, getInstancesOfEngine } from '../data/Store.js'
 import { DockerMetrics } from '../data/CommonTypes.js'
 import { localEngineId } from '../data/Engine.js'
-import { config } from '../data/Config.js'
+import { dockerAvailable } from '../utils/dockerAvailable.js'
 
 $.verbose = false
 
@@ -155,8 +155,8 @@ const collectMetrics = async (
 
 // ── Main monitor loop ─────────────────────────────────────────────────────────
 
-const poll = async (storeHandle: DocHandle<Store>): Promise<void> => {
-    if (config.settings.testMode) return  // no Docker in test mode
+export const pollDockerMetricsOnce = async (storeHandle: DocHandle<Store>): Promise<void> => {
+    if (!(await dockerAvailable())) return  // no Docker daemon (was: testMode; idea#168)
 
     const store = storeHandle.doc()
     const localEngine = getLocalEngine(store)
@@ -196,7 +196,7 @@ export const enableDockerMetricsMonitor = (storeHandle: DocHandle<Store>): void 
 
     const run = async () => {
         try {
-            await poll(storeHandle)
+            await pollDockerMetricsOnce(storeHandle)
         } catch (e: any) {
             log(`[dockerMetrics] Unhandled error in poll: ${e.message ?? e}`)
         }

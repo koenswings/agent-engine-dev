@@ -2,6 +2,8 @@ import { $, chalk, os, YAML, fs, path, sleep } from 'zx';
 
 $.verbose = false;
 import { deepPrint, log, uuid, print } from '../utils/utils.js';
+import { APP_DATA_HELPER } from '../utils/appDataHelper.js';
+import { PEER_GATE, PEER_AUTHORIZED_KEYS, PEER_KNOWN_HOSTS } from '../utils/peerSsh.js';
 import { readMetaUpdateId, DiskMeta, addMeta, readRemoteDiskId } from './Meta.js';
 import { Version, Command, Hostname, Timestamp, DiskID, EngineID } from './CommonTypes.js';
 import { Store, getAppsOfEngine, getDisksOfEngine, getInstancesOfEngine } from './Store.js';
@@ -25,6 +27,28 @@ export interface Engine {
   eraseInProgress?: EraseInProgress | null;
   /** Whole non-system disks without ext4 (idea#134); rebuilt on dock/undock and at startup */
   unformattedDisks?: UnformattedDiskPublic[];
+  /**
+   * This Engine's own ssh key and host key for Engine-to-Engine copies (per-Pi
+   * Engine keys, data/PeerAccess.ts). Written by this Engine only, at every start
+   * and repaired on the heartbeat; null (or absent) when peer access is off here.
+   */
+  peerAccess?: PeerAccess | null;
+}
+
+/** Engine.peerAccess (design-per-pi-engine-key.md) */
+export interface PeerAccess {
+  /** 'ssh-ed25519 <base64>' of /home/pi/.ssh/idea_engine_ed25519.pub (no comment) */
+  sshKey: string;
+  /** 'ssh-ed25519 <base64>' of /etc/ssh/ssh_host_ed25519_key.pub, pinned by peers under this Engine's id */
+  hostKey: string;
+  /** When sshKey/hostKey were last (re)published */
+  publishedAt: Timestamp;
+  /**
+   * The peers this Engine has written into its authorized_keys and known_hosts
+   * (idea-app-data sync-peers), as '<engineId> <sshKey fingerprint> <hostKey fingerprint>'.
+   * A peer may copy to this Engine once its entry (with its CURRENT keys) is listed here.
+   */
+  authorized: string[];
 }
 
 export interface UnformattedDiskPublic {
@@ -51,13 +75,16 @@ export interface EraseInProgress {
  *   filesDisk:  the Files Disk role and createFilesDisk <diskId> [<shareName…>] (idea#131).
  *   filesMount: Files Disk binds into opted-in Apps (x-app.filesMount, idea#133).
  *   eraseDisk:  summariseDisk + eraseDisk (idea#134).
+ *   instanceIdArgs: startInstance, runInstance, stopInstance, copyApp, moveApp,
+ *               backupApp and restoreApp take an instance id (idea#168); a name
+ *               still works when it is unambiguous.
  * Written at every startup as a whole new list, with capabilitiesBootedAt set
  * to that startup's lastBooted. A Console counts a capability only when
  * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs']
 
 import { config } from './Config.js';
 
@@ -519,6 +546,15 @@ export const installUdev = async (exec: any, enginePath: string) => {
     print(chalk.blue('  - Installing idea-erase-disk...'))
     await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-erase-disk /usr/local/sbin/idea-erase-disk`
     print(chalk.green('  - /usr/local/sbin/idea-erase-disk installed'))
+    // idea-app-data: the app-data root helper (idea#168), same rules: root-owned COPY,
+    // 0755, in /usr/local/sbin; its sudoers line is in 11-engine-files (visudo -cf above).
+    // It runs rsync/rrsync, borg, runuser and ssh by absolute path.
+    print(chalk.blue('  - Installing idea-app-data...'))
+    await exec`sudo apt install rsync borgbackup -y`
+    await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-app-data ${APP_DATA_HELPER}`
+    print(chalk.green(`  - ${APP_DATA_HELPER} installed`))
+    // Per-Pi Engine keys: the forced command for peer keys and the sshd drop-in
+    await installPeerAccess(exec, enginePath)
     await createDir(exec, '/disks', "0755", "0:0")
 
     // Configure /dev/engine ownership so the pi user can write sentinel files.
@@ -547,6 +583,49 @@ EOF`
     process.exit(1);
   }
   print(chalk.green('Udev and udev rules installed'));
+}
+
+/** The sshd drop-in that adds the root-owned peer key file (per-Pi Engine keys). */
+export const PEER_SSHD_DROPIN = '/etc/ssh/sshd_config.d/10-idea-peer.conf'
+/** The helper's ledger of folders a peer's receive created (LEDGER_DIR in idea-app-data). */
+export const PEER_LEDGER_DIR = '/var/lib/idea-app-data'
+
+/**
+ * Per-Pi Engine keys (design-per-pi-engine-key.md), the root-owned parts. No key
+ * is installed here: each Engine makes its own at first start and the helper's
+ * sync-peers writes the peer files.
+ *   - /usr/local/sbin/idea-peer-gate: root-owned COPY, 0755 (the forced command of
+ *     every peer key line)
+ *   - /etc/ssh/idea_authorized_keys and /etc/idea: root 0755 (sync-peers writes
+ *     idea_authorized_keys/pi and /etc/idea/peer_known_hosts there)
+ *   - /var/lib/idea-app-data: root 0700 (the helper's receive ledger)
+ *   - /etc/ssh/sshd_config.d/10-idea-peer.conf: adds idea_authorized_keys/%u to
+ *     AuthorizedKeysFile. Checked with `sshd -t` (on failure it is removed again
+ *     and the build stops), then `sshd -T` must show it in effect, then sshd is
+ *     reloaded (open sessions stay).
+ */
+export const installPeerAccess = async (exec: any, enginePath: string) => {
+  print(chalk.blue('  - Installing idea-peer-gate and the sshd drop-in for peer Engine keys...'))
+  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-peer-gate ${PEER_GATE}`
+  await exec`sudo install -d -o root -g root -m 0755 ${path.dirname(PEER_AUTHORIZED_KEYS)} ${path.dirname(PEER_KNOWN_HOSTS)}`
+  await exec`sudo install -d -o root -g root -m 0700 ${PEER_LEDGER_DIR}`
+  await exec`sudo install -o root -g root -m 0644 ${enginePath}/script/build_image_assets/10-idea-peer.conf ${PEER_SSHD_DROPIN}`
+  try {
+    await exec`sudo /usr/sbin/sshd -t`
+  } catch (e) {
+    await exec`sudo rm -f ${PEER_SSHD_DROPIN}`
+    throw new Error(`sshd -t rejected the configuration with ${PEER_SSHD_DROPIN}; removed it again (peer Engine keys will not work): ${e}`)
+  }
+  const effective = await exec`sudo /usr/sbin/sshd -T -C user=pi,host=localhost,addr=127.0.0.1`
+  if (!/^authorizedkeysfile .*\/etc\/ssh\/idea_authorized_keys\/%u/m.test(String(effective?.stdout ?? ''))) {
+    print(chalk.red(`  - WARNING: sshd does not use /etc/ssh/idea_authorized_keys/%u: an earlier drop-in or sshd_config sets AuthorizedKeysFile first. Peer Engine keys will not work until it is fixed.`))
+  }
+  try {
+    await exec`sudo systemctl reload ssh`
+  } catch {
+    await exec`sudo systemctl reload sshd`
+  }
+  print(chalk.green(`  - ${PEER_GATE} and ${PEER_SSHD_DROPIN} installed; sshd reloaded`))
 }
 
 /**

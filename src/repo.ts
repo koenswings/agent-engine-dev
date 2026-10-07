@@ -1,10 +1,84 @@
-import { Repo } from "@automerge/automerge-repo";
+import { Repo, PeerMetadata } from "@automerge/automerge-repo";
 import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
-import { WebSocketServer } from "ws";
-import { WebSocketServerAdapter } from "@automerge/automerge-repo-network-websocket";
+import { ThreadedWebSocketServerAdapter } from "./wsServerThread.js";
 import { PortNumber } from "./data/CommonTypes.js";
 import { deepPrint, log, error } from './utils/utils.js'
 
+
+/**
+ * r34 DURABILITY. automerge-repo 2.3.0-alpha.0 (and 2.3.0) never wrote a document
+ * to disk after the first change: Repo's throttled save closure ignored its
+ * arguments and kept saving the doc version captured at the first
+ * 'heads-changed' (automerge-repo src/Repo.ts:166-168), so
+ * StorageSubsystem.saveDoc saw unchanged heads and returned. Only repo.flush()
+ * (SIGINT/SIGTERM -> shutdownRepo) wrote, so a crash or power cut lost
+ * everything since the last clean stop. Fixed upstream in 2.3.1 (package.json).
+ *
+ * Backstop, independent of the library version: flush the ready docs every
+ * STORE_FLUSH_INTERVAL_MS. saveDoc is a no-op when a doc's heads have not moved
+ * since it was last stored, writes one incremental chunk when they have, and
+ * compacts on its own when the incrementals outgrow the snapshot. This bounds a
+ * crash/power-cut loss to this interval even if a future library version
+ * regresses. shutdownRepo stops it (stopPeriodicFlush) before the final flush.
+ */
+export const STORE_FLUSH_INTERVAL_MS = 5_000
+
+const periodicFlushes = new WeakMap<Repo, () => Promise<void>>()
+
+/** Start the backstop flush for `repo`; returns its stop function (also reachable via stopPeriodicFlush). */
+export const startPeriodicFlush = (repo: Repo, intervalMs: number = STORE_FLUSH_INTERVAL_MS): (() => Promise<void>) => {
+    void periodicFlushes.get(repo)?.()
+    let stopped = false
+    let inFlight: Promise<void> | undefined
+    const tick = async (): Promise<void> => {
+        try {
+            // Only ready handles: flush() of a handle that never loaded (e.g. a command
+            // log that timed out) throws (see shutdownRepo in CommandLogStore.ts).
+            const ready = Object.values(repo.handles).filter(h => h.isReady()).map(h => h.documentId)
+            if (ready.length > 0) await repo.flush(ready)
+        } catch (e) {
+            error(`[repo] periodic flush failed: ${e instanceof Error ? e.message : e}`)
+        }
+    }
+    const timer = setInterval(() => {
+        if (stopped || inFlight) return
+        inFlight = tick().finally(() => { inFlight = undefined })
+    }, intervalMs)
+    timer.unref()
+    const stop = async (): Promise<void> => {
+        stopped = true
+        clearInterval(timer)
+        if (periodicFlushes.get(repo) === stop) periodicFlushes.delete(repo)
+        await inFlight
+    }
+    periodicFlushes.set(repo, stop)
+    return stop
+}
+
+/** Stop `repo`'s backstop flush and wait for a running tick to finish. No-op if none is running. */
+export const stopPeriodicFlush = async (repo: Repo): Promise<void> => {
+    await periodicFlushes.get(repo)?.()
+}
+
+/** Keepalive ping interval of the Engine's WS server (adapter default: 5000 ms). */
+export const WS_KEEPALIVE_INTERVAL_MS = 30_000
+
+/**
+ * Share policy (r34 POST-BURST-CPU). With `async () => true` the Engine announced
+ * EVERY document it holds (store, command logs, golden doc, relayed foreign docs:
+ * 6-9 docs, ~3 MB on idea04) to EVERY peer that connected, so each fresh Console tab
+ * or probe got a full sync of all of them, unasked, on top of the store it asked for
+ * (r34 raw/ws/conc6-idea04e-*.json: 6 unrequested docs per client).
+ *
+ * Announce only to peers that persist documents (other Engines: they have storage,
+ * so isEphemeral is false) - Engine-to-Engine replication and relaying stay as they
+ * are. Storage-less clients (Console, walker/probe, CLI) get exactly what they
+ * find(): a request is always answered (also for a doc this Engine has to fetch
+ * from its Engine peers first), and after it the peer receives live updates for
+ * that doc. Unknown metadata (should not happen: the WS join carries it) is
+ * treated as an Engine, i.e. the old behaviour.
+ */
+export const shouldAnnounceTo = (meta: PeerMetadata | undefined): boolean => meta?.isEphemeral !== true
 
 export const startAutomergeServer = async (dataDir:string, port:PortNumber):Promise<Repo> => {
     log(`Using data directory: ${dataDir}`);
@@ -12,19 +86,23 @@ export const startAutomergeServer = async (dataDir:string, port:PortNumber):Prom
     // 1. Create a storage adapter for the server to persist data.
     const storage = new NodeFSStorageAdapter(dataDir);
 
-    // 2. Create a WebSocket server.
-    const ws = new WebSocketServer({ port: port });
-    ws.on('error', (err) => {
-        error(`WebSocket server error on port ${port}: ${err.message}`)
-    })
-    const network = new WebSocketServerAdapter(ws);
+    // 2. Create the WebSocket server.
+    // IDEA04-WS: the server runs in a worker thread (wsServerThread.ts) so that
+    // accepting sockets, answering joins and the keepalive keep working while
+    // the main thread is busy syncing the large store doc to many fresh peers.
+    // Keepalive 30 s instead of the adapter's 5 s default: a peer is only
+    // dropped after a full interval without a pong. Listen errors (e.g. port
+    // in use) are logged as 'WebSocket server error on port ...' as before.
+    const network = new ThreadedWebSocketServerAdapter(port, WS_KEEPALIVE_INTERVAL_MS);
 
     // 3. Create the Automerge repo.
-    const repo = new Repo({
+    const repo: Repo = new Repo({
         storage: storage,
         network: [network],
-        sharePolicy: async (peerId) => true // Allow all peers to sync
+        sharePolicy: async (peerId) => shouldAnnounceTo(repo.peerMetadataByPeerId[peerId])
     });
+
+    startPeriodicFlush(repo);
 
     log(`Automerge server is running on port ${port}`);
 

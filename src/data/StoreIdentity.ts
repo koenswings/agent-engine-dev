@@ -61,14 +61,27 @@ export const readStoreDocId = (urlPath: string = storeIdentityPaths().urlPath): 
 }
 
 /**
+ * store-url.restored, next to store-url.txt: written when the Engine restored a
+ * missing store-url.txt with the fleet store URL. While it exists and still names
+ * the URL in store-url.txt, peer access fails closed (data/PeerAccess.ts): the
+ * Engine cannot tell it is in its own store, so it publishes no Engine key and
+ * authorizes no peer. Ops confirms the store by deleting the file; changing
+ * store-url.txt makes it stale, and it is removed at the next start.
+ */
+export const restoredMarkerPath = (paths: StoreIdentityPaths): string =>
+    path.join(path.dirname(paths.urlPath), 'store-url.restored')
+
+/**
  * Startup check of the store identity folder (idea#120):
  *   - store-template.json must exist; it is never created or written here. If it
  *     is missing the Engine stops with a clear error (restore it from git).
  *   - store-url.txt missing → written atomically with FLEET_STORE_URL.
  *   - store-url.txt present → used as it is, whatever it contains (an isolated
  *     Engine may deliberately use its own store, e.g. idea03); never rewritten.
+ *   - fallback: true while store-url.restored (see restoredMarkerPath) names the
+ *     URL in use, i.e. the Engine runs on a store URL it restored itself.
  */
-export const prepareStoreIdentity = async (paths: StoreIdentityPaths = storeIdentityPaths()): Promise<{ storeDocId: DocumentId, restored: boolean }> => {
+export const prepareStoreIdentity = async (paths: StoreIdentityPaths = storeIdentityPaths()): Promise<{ storeDocId: DocumentId, restored: boolean, fallback: boolean }> => {
     if (!fs.existsSync(paths.templatePath)) {
         throw new Error(
             `Store template ${paths.templatePath} is missing. Every Engine must start from the shared ` +
@@ -79,8 +92,20 @@ export const prepareStoreIdentity = async (paths: StoreIdentityPaths = storeIden
     if (!fs.existsSync(paths.urlPath)) {
         log(`Store URL file ${paths.urlPath} not found. Writing the fleet store URL ${FLEET_STORE_URL}.`)
         await writeFileAtomic(paths.urlPath, FLEET_STORE_URL)
+        await fs.remove(restoredMarkerPath(paths))
+        await writeFileAtomic(restoredMarkerPath(paths), FLEET_STORE_URL + '\n')
         restored = true
     }
     const storeDocId = readStoreDocId(paths.urlPath)
-    return { storeDocId, restored }
+    let fallback = false
+    const marker = restoredMarkerPath(paths)
+    if (fs.existsSync(marker)) {
+        if (storeDocIdFromUrl(fs.readFileSync(marker, 'utf-8')) === storeDocId) {
+            fallback = true
+        } else {
+            log(`store-url.txt no longer holds the URL the Engine restored; removing ${marker}`)
+            await fs.remove(marker)
+        }
+    }
+    return { storeDocId, restored, fallback }
 }

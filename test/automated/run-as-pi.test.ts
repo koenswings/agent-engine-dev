@@ -19,7 +19,6 @@ import path from 'path'
 import { $, fs, YAML } from 'zx'
 import { diskPath, uniqueTestDevice } from '../harness/diskSim.js'
 import { createMeta } from '../../src/data/Meta.js'
-import { SYSTEM_DISK_ENSURE_DIRS, remoteEnsureDirsCommand } from '../../src/data/CopyMoveApp.js'
 import { DeviceName } from '../../src/data/CommonTypes.js'
 
 const ROOT = process.cwd()
@@ -101,6 +100,8 @@ describe('Engine sudoers asset (idea#80)', () => {
             '-n ${SUDO_CHOWN} -h pi:pi ${mountPoint}',
             // 11-engine-files (idea#134): eraseDisk script (no arg list in sudoers)
             '-n ${ERASE_SCRIPT} ${a.device} ${a.serial} ${String(a.sizeBytes)} ${a.label} ${a.stagingDir}',
+            // 11-engine-files (idea#168): erase-slot via idea-app-data (loop-backed test slots)
+            '-n ${APP_DATA_HELPER} ${argv[0]} ${argv[1]} ${argv[2]}',
         ]
         const calls = RUNTIME_FILES.flatMap(f => sudoCalls(src(f)))
         expect(calls.length).toBeGreaterThan(0)
@@ -116,11 +117,11 @@ describe('Engine sudoers asset (idea#80)', () => {
         expect(meta).not.toMatch(/sudo mv/)
         expect(src('src/data/Engine.ts')).toContain('$`sudo /usr/bin/systemctl reboot`')
         expect(src('src/data/Engine.ts')).not.toMatch(/\$`sudo reboot now`/)
-        // CopyMoveApp.ts: cross-engine copy onto a remote system disk (the only remote sudo)
-        const appDirs = SYSTEM_DISK_ENSURE_DIRS.split(' && ')
-        expect(appDirs.every(c => c.startsWith('sudo /usr/bin/'))).toBe(true)
-        for (const c of appDirs) expect(rulesText).toContain(c.replace(/^sudo /, '').replace(/:/g, '\\:'))
-        expect(remoteEnsureDirsCommand('/disks/sda1')).not.toMatch(/sudo/)
+        // CopyMoveApp.ts: cross-engine copies run NO remote shell command any more
+        // (per-Pi Engine keys): the peer's gate runs that Engine's helper (ensure-dirs …)
+        const copyMove = src('src/data/CopyMoveApp.ts')
+        expect(copyMove).not.toMatch(/mkdir -p|chown pi|StrictHostKeyChecking=no|rsync -a -e/)
+        expect(copyMove).toContain('ensureRemoteDirs(peer.host, peer.engineId, targetRoot)')
         // ...and each of those binaries/arguments is in the sudoers file
         for (const rule of [
             '/usr/bin/umount /disks/sd[a-z][12]',
@@ -147,17 +148,42 @@ describe('Engine sudoers asset (idea#80)', () => {
             // createFilesDisk: the disk root folder only, never recursive (idea#131)
             'pi ALL=(root) NOPASSWD: /usr/bin/chown -h pi\\:pi /disks/sd[a-z][12]',
             'pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-erase-disk',
+            // app data as root (idea#168): one helper, no argument list (the helper validates)
+            'pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-app-data',
             'pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]',
         ])
         expect(rulesText).not.toMatch(/tee \/disks/)
         expect(rulesText).not.toMatch(/rmdir/)   // the rmdir entry lives in 11-engine-files (idea#126)
         expect(rulesText).not.toMatch(/chown -h/) // the chown -h entry lives in 11-engine-files (idea#131)
         expect(rulesText).not.toMatch(/idea-erase-disk/) // erase script lives in 11-engine-files (idea#134)
+        expect(rulesText).not.toMatch(/idea-app-data/)   // app-data helper lives in 11-engine-files (idea#168)
         expect(src('src/data/CreateFilesDisk.ts')).toContain("export const SUDO_CHOWN = '/usr/bin/chown'")
         const visudo = ['/usr/sbin/visudo', '/sbin/visudo'].find(p => fs.existsSync(p))
         if (!visudo) ctx.skip()
         const out = await $`${visudo} -cf ${path.join(ROOT, 'script/build_image_assets/11-engine-files.sudoers')}`.nothrow()
         expect(out.exitCode, out.stderr).toBe(0)
+    })
+
+    it('app data runs as root only through the helper: every sudo spawn is `sudo -n /usr/local/sbin/idea-app-data …` (idea#168)', () => {
+        const helper = src('src/utils/appDataHelper.ts')
+        expect(helper).toContain("export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'")
+        expect(helper).toContain("export const appDataSudoArgv = (args: string[]): string[] => ['-n', APP_DATA_HELPER, ...args]")
+        // remote helper calls (through the peer's gate) are built from checked tokens only
+        expect(helper).toContain("export const remoteHelperCommand = (args: string[]): string[] => ['sudo', '-n', APP_DATA_HELPER, ...args]")
+        expect(helper).toContain('peerSshArgv(host, peerEngineId, remoteHelperCommand(deleteArgs(root, id)))')
+        for (const f of ['src/utils/appDataHelper.ts', 'src/utils/rsync.ts', 'src/monitors/backupMonitor.ts', 'src/data/CopyMoveApp.ts']) {
+            const text = src(f)
+            for (const m of text.matchAll(/spawn\('sudo', ([^,]+),/g)) expect(m[1], f).toBe('appDataSudoArgv(args)')
+            for (const m of text.matchAll(/runRsyncProcess\('sudo', ([^,]+),/g)) expect(m[1], f).toBe('appDataSudoArgv(args)')
+            expect(text, f).not.toMatch(/\$`sudo /)
+            expect(text, f).not.toMatch(/\$`borg |spawn\('borg'/)
+            expect(text, f).not.toMatch(/rm -rf --? \$\{/)
+        }
+        const engine = src('src/data/Engine.ts')
+        expect(engine).toContain('sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-app-data ${APP_DATA_HELPER}')
+        expect(engine).toContain('sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-peer-gate ${PEER_GATE}')
+        expect(fs.statSync(path.join(ROOT, 'script/build_image_assets/idea-app-data')).mode & 0o111).not.toBe(0)
+        expect(fs.statSync(path.join(ROOT, 'script/build_image_assets/idea-peer-gate')).mode & 0o111).not.toBe(0)
     })
 
     it('mount points are removed with rmdir, never rm -fr (idea#126)', () => {

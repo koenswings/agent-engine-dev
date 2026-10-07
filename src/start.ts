@@ -4,13 +4,14 @@ import { runDiskDetectionSelfCheck, recordDiskDetectionFailure, errorMessage } f
 import { enableTimeMonitor, generateHeartBeat } from './monitors/timeMonitor.js'
 import { $, chalk, fs, sleep } from 'zx'
 import { deepPrint, log, print } from './utils/utils.js'
-import { config } from './data/Config.js'
+import { config, peerAccessEnabled, peerStaleMs } from './data/Config.js'
 import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
 import { enableHttpMonitor } from './monitors/httpMonitor.js'
-import { DocumentId, Repo, DocHandle } from '@automerge/automerge-repo'
+import { DocumentId, Repo } from '@automerge/automerge-repo'
 import { startAutomergeServer } from './repo.js'
 import { enableMulticastDNSEngineMonitor } from './monitors/mdnsMonitor.js'
+import { startStaticPeers, staticPeersSetting } from './data/StaticPeers.js'
 import { createServerStore } from './data/Store.js'
 import { prepareStoreIdentity, storeIdentityPaths } from './data/StoreIdentity.js'
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
@@ -24,11 +25,12 @@ import { diskFsRoot } from './data/Disk.js'
 import { copyApp, moveApp } from './data/CopyMoveApp.js'
 import { backupInstance } from './monitors/backupMonitor.js'
 import { clearStaleUnmountErrors } from './monitors/mounts.js'
-import { InstanceID } from './data/CommonTypes.js'
-import { Status } from './data/Instance.js'
-import { Store } from './data/Store.js'
 import { createCommandLogStore, shutdownRepo } from './data/CommandLogStore.js'
 import { initCommandLogger } from './utils/CommandLogger.js'
+import { assertAppDataHelper } from './utils/appDataHelper.js'
+import { startPeerAccess } from './data/PeerAccess.js'
+import { checkAndSetUndockedApps } from './data/UndockedApps.js'
+export { checkAndSetUndockedApps }
 
 
 
@@ -54,6 +56,11 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     log(`  Endianness: ${os.endianness()}`)
     log(`  Network Hostname: ${os.hostname()}`)
 
+    // The app-data root helper (idea#168) must be installed, allowed by sudoers and
+    // the version this Engine speaks; otherwise refuse to start with an "ask Ops to
+    // update" message (copy, move, backup and restore of app data depend on it).
+    await assertAppDataHelper()
+
     // Process the config
     const settings = config.settings
     const STORE_DATA_PATH = "./"+config.settings.storeDataFolder
@@ -78,8 +85,9 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // Store identity (idea#120): a missing store-url.txt is written back with the
     // shared fleet store URL; an existing one is used as it is. store-template.json
     // is never written; if it is missing, startup stops with a clear error.
-    const { storeDocId, restored } = await prepareStoreIdentity(storeIdentity)
+    const { storeDocId, restored, fallback } = await prepareStoreIdentity(storeIdentity)
     if (restored) print(chalk.yellow(`store-url.txt was missing: restored the fleet store URL`))
+    if (fallback) print(chalk.bgRed.white(`store-url.txt was restored by the Engine (store-identity/store-url.restored): peer access fails closed until Ops confirms the store`))
     log(`Using document ID: ${storeDocId}`)
 
     // HACK: Force save on remote changes
@@ -110,11 +118,20 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // all peers on the next Automerge sync.
     cleanupPhantomEngines(storeHandle)
 
+    // Per-Pi Engine key (design-per-pi-engine-key.md): make it if missing, publish
+    // it with the host key in this Engine's entry, and sync peers' keys into the
+    // root-owned authorized_keys/known_hosts through idea-app-data sync-peers.
+    // Fails closed (no key published, nobody authorized) on a restored store URL.
+    const peerAccess = await startPeerAccess(storeHandle, String(localEngineId), {
+        enabled: peerAccessEnabled(), fallbackStore: fallback, storeUrlPath: storeIdentity.urlPath, staleMs: peerStaleMs(),
+    })
+
     // Clear unmount errors (idea#126) this Engine recorded for disks whose mount
     // point is no longer mounted, or now holds another filesystem (fsUuid).
     await clearStaleUnmountErrors(storeHandle, localEngineId).catch(e => log(`Could not clear stale unmount errors: ${e}`))
 
-    // Check for undocked apps after restart
+    // Check for undocked apps after restart: only instances on disks docked on
+    // this Engine (Disk.dockedTo); other Engines' instances are left alone
     await checkAndSetUndockedApps(storeHandle)
 
     // Crash recovery: retry idempotent interrupted ops; mark others Failed
@@ -186,6 +203,13 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         mdnsHandle = enableMulticastDNSEngineMonitor(storeHandle, repo)
     }
 
+    // Opt-in static peer list (IDEA_STATIC_PEERS / settings.staticPeers): dials
+    // the listed Engines via connectEngine, independent of mDNS. Unset: no-op.
+    if (staticPeersSetting()?.trim()) {
+        log(chalk.bgMagenta('STARTING STATIC PEERS'))
+        startStaticPeers(repo, storeHandle)
+    }
+
 
     await sleep(1000)
     log(chalk.bgMagenta('STARTING MONITORING OF USB DEVICES'))
@@ -215,34 +239,15 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     log(chalk.bgMagenta('STARTING HEARTBEAT GENERATION'))
     const heartbeatIntervalMs = config.settings.heartbeatIntervalMs ?? 50000
     generateHeartBeat(storeHandle)
-    enableTimeMonitor(heartbeatIntervalMs, () => generateHeartBeat(storeHandle))
+    // The heartbeat also repairs this Engine's peerAccess and expires stale peers
+    enableTimeMonitor(heartbeatIntervalMs, () => {
+        generateHeartBeat(storeHandle)
+        peerAccess.onHeartbeat().catch(e => print(chalk.red(`peer access heartbeat: ${e}`)))
+    })
 
 
 }
 
-
-export const checkAndSetUndockedApps = async (storeHandle: DocHandle<Store>): Promise<void> => {
-    const { instanceDB } = storeHandle.doc();
-    const promises = Object.keys(instanceDB).map(async (instanceId) => {
-        const instance = instanceDB[instanceId];
-        if (instance.status !== "Undocked") {
-            try {
-                const result = await $`docker ps -q -f name=${instance.id}`;
-                if (result.stdout.trim() === "") {
-                    // No container running, set to undocked
-                    log(`Setting status of instance ${instanceId} to Undocked`)
-                    storeHandle.change(doc => {
-                          const inst = doc.instanceDB[instanceId]
-                          inst.status = 'Undocked' as Status 
-                        })
-                }
-            } catch (error) {
-                console.error(`Error checking docker status for ${instance.name}: ${error}`);
-            }
-        }
-    });
-    await Promise.all(promises);
-};
 
 async function shutdownProcedure(repo: Repo, httpServer?: import('http').Server, mdnsHandle?: { end: () => Promise<void> }): Promise<void> {
     print('*** Engine is now closing ***');

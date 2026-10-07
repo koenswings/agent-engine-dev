@@ -17,6 +17,10 @@
 #                script validates device/serial/size/label/staging itself
 #   typed mount  src/monitors/mounts.ts (safeMount): exactly
 #                /usr/bin/mount -t ext4 /dev/<dev> /disks/<dev> (idea#134)
+#   app data     /usr/local/sbin/idea-app-data (idea#168): no argument list; the helper
+#                validates subcommand, device, instance id, archive, host and paths itself
+#                (src/utils/appDataHelper.ts, src/utils/rsync.ts rsyncInstanceData:
+#                size/copy/send/receive/delete/borg-* of app INSTANCE data as root)
 #
 # The code runs `sudo /usr/bin/tee /disks/<device>/META.yaml > /dev/null` with the
 # YAML on stdin, so sudo sees exactly "/usr/bin/tee /disks/<device>/META.yaml", and
@@ -32,4 +36,5 @@ pi ALL=(root) NOPASSWD: /usr/bin/tee /disks/sd[a-z][12]/META.yaml
 pi ALL=(root) NOPASSWD: /usr/bin/rmdir /disks/sd[a-z][12]
 pi ALL=(root) NOPASSWD: /usr/bin/chown -h pi\:pi /disks/sd[a-z][12]
 pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-erase-disk
+pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-app-data
 pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]

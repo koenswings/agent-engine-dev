@@ -12,10 +12,10 @@ export interface UiIntentContext {
     instanceId?: string
     engineId?: string
     /**
-     * When set (--record-walk), PlaywrightUiDriver soft-detects Pixel capture:
-     * 1) pass screenshotPath into runDurationIntent
-     * 2) else bridge.captureAfterIntent(page, { path, intent })
-     * 3) else page.screenshot({ path, fullPage: true })
+     * When set (--record-walk), PlaywrightUiDriver writes the step PNG from the
+     * ACTIVE tab after the Intent (an App tab the Intent opened or brought to front,
+     * else the Console page): bridge.captureAfterIntent(activeTab, { path, intent }),
+     * else activeTab.screenshot({ path, fullPage: true }).
      */
     screenshotPath?: string
 }
@@ -35,7 +35,7 @@ export interface UiDriver {
     readonly kind: 'stub' | 'playwright'
     runIntent(ctx: UiIntentContext): Promise<UiIntentResult>
     /**
-     * Optional: capture current page to path (infra / non-Intent steps with a live page).
+     * Optional: capture the active tab to path (infra / non-Intent steps with a live page).
      * Stub omits this; Playwright implements when page is already open.
      */
     screenshot?(path: string): Promise<void>

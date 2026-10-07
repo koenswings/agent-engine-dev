@@ -4,6 +4,10 @@
  * eraseDisk <targetId> <summaryTraceId> <confirmName…>
  * Uses a fakeable script runner for tests. Never formats the fleet test stick
  * in automated tests — success paths inject runEraseScript.
+ *
+ * Loop-backed duration slots (device idea-test-N under IDEA_DISKS_ROOT): erase
+ * goes through idea-app-data erase-slot (umount + mkfs.ext4 on the loop/image +
+ * remount). Production USB (/dev/sdX) still uses idea-erase-disk unchanged.
  */
 
 import os from 'os'
@@ -22,6 +26,13 @@ import { refreshUnformattedDisks } from './UnformattedDisks.js'
 import { isSystemDevice, driveNameOf } from './SystemDisk.js'
 import { log, print, uuid } from '../utils/utils.js'
 import { disksRoot } from './Config.js'
+import { APP_DATA_HELPER, eraseSlotArgs } from '../utils/appDataHelper.js'
+
+/** Same pattern as TEST_DEVICE_PATTERN in usbDeviceMonitor (avoid a circular import). */
+export const SLOT_ERASE_DEVICE_PATTERN = /^idea-test-[0-9]+$/
+/** True when erase should use the loop-slot helper path, not idea-erase-disk. */
+export const isSlotEraseDevice = (device: string | null | undefined): boolean =>
+    !!device && SLOT_ERASE_DEVICE_PATTERN.test(device)
 
 export const ERASE_SCRIPT = '/usr/local/sbin/idea-erase-disk'
 export const ERASE_STAGING_ROOT = path.join(ENGINE_STATE_DIR, 'erase-staging')
@@ -40,17 +51,31 @@ export interface EraseScriptArgs {
     stagingDir: string
 }
 
+export interface EraseSlotArgs {
+    slot: string         // idea-test-N
+    stagingDir: string
+}
+
 export interface EraseOps {
     runScript: (args: EraseScriptArgs) => Promise<{ stdout: string }>
+    /** TEST-ONLY loop slot: sudo -n idea-app-data erase-slot <slot> <stagingDir> */
+    runSlotErase: (args: EraseSlotArgs) => Promise<{ stdout: string }>
     udevadmSettle: () => Promise<void>
     composeDownV: (instanceDir: string) => Promise<void>
     lsblkSizeSerial: (wholeDevice: string) => Promise<{ sizeBytes: number; serial: string | null }>
     addDevice: (devicePath: string) => Promise<void>
+    /** mountpoint -q; injectable so tests can simulate a still-mounted refusal */
+    isMountPoint: (mp: string) => Promise<boolean>
 }
 
 const defaultOps: EraseOps = {
     runScript: async (a) => {
         const out = await $`sudo -n ${ERASE_SCRIPT} ${a.device} ${a.serial} ${String(a.sizeBytes)} ${a.label} ${a.stagingDir}`
+        return { stdout: out.stdout }
+    },
+    runSlotErase: async (a) => {
+        const argv = eraseSlotArgs(a.slot, a.stagingDir)
+        const out = await $`sudo -n ${APP_DATA_HELPER} ${argv[0]} ${argv[1]} ${argv[2]}`
         return { stdout: out.stdout }
     },
     udevadmSettle: async () => { await $`udevadm settle` },
@@ -63,6 +88,7 @@ const defaultOps: EraseOps = {
         return { sizeBytes: parseInt(size, 10) || 0, serial: serial || null }
     },
     addDevice: async () => { /* wired from usb monitor at runtime */ },
+    isMountPoint: async (mp) => (await $`mountpoint -q ${mp}`.nothrow()).exitCode === 0,
 }
 
 let ops = defaultOps
@@ -168,12 +194,18 @@ export const eraseDisk = async (
         if (await isSystemDevice(disk.device)) throw new Error(`${disk.name} is this Pi's system disk and cannot be erased.`)
         devicePartition = disk.device
         whole = wholeDeviceOf(disk.device)
-        const info = await ops.lsblkSizeSerial(whole)
-        sizeBytes = info.sizeBytes
-        serial = info.serial ?? summary.serial ?? '-'
-        // Summary serial check when both known
-        if (summary.serial && info.serial && summary.serial !== info.serial) {
-            throw new Error(`The summary is for a different disk (serial mismatch). Check the disk again.`)
+        if (isSlotEraseDevice(disk.device)) {
+            // Loop slots have no /dev/<name> for lsblk; size/serial come from the summary.
+            sizeBytes = summary.sizeBytes
+            serial = summary.serial ?? '-'
+        } else {
+            const info = await ops.lsblkSizeSerial(whole)
+            sizeBytes = info.sizeBytes
+            serial = info.serial ?? summary.serial ?? '-'
+            // Summary serial check when both known
+            if (summary.serial && info.serial && summary.serial !== info.serial) {
+                throw new Error(`The summary is for a different disk (serial mismatch). Check the disk again.`)
+            }
         }
         keptId = disk.id
     } else {
@@ -232,11 +264,11 @@ export const eraseDisk = async (
             const { undockDisk } = await import('../monitors/usbDeviceMonitor.js')
             await undockDisk(storeHandle, disk)
 
-            // If still mounted, refuse
+            // USB: undock must have unmounted. Loop slots skip umount in testMode;
+            // erase-slot does the real umount — do not refuse here for slots.
             const mp = `${disksRoot()}/${devicePartition}`
-            const still = await $`mountpoint -q ${mp}`.nothrow()
-            if (still.exitCode === 0) {
-                // Restore
+            const slotErase = isSlotEraseDevice(devicePartition)
+            if (!slotErase && await ops.isMountPoint(mp)) {
                 await processDisk(storeHandle, disk).catch(() => {})
                 throw new Error(`${summary.label} couldn't be unmounted, so nothing was erased.`)
             }
@@ -278,14 +310,31 @@ export const eraseDisk = async (
         }
         await fs.writeFile(path.join(stagingDir, 'META.yaml'), YAML.stringify(meta))
 
-        setEraseStep(storeHandle, 'partitioning', targetId, summary.label)
-        const scriptOut = await ops.runScript({
-            device: `/dev/${whole}`,
-            serial: serial || '-',
-            sizeBytes,
-            label: IDEA_DISK_LABEL,
-            stagingDir,
-        })
+        const slotErase = isSlotEraseDevice(devicePartition ?? whole)
+        setEraseStep(storeHandle, slotErase ? 'creating filesystem' : 'partitioning', targetId, summary.label)
+        let scriptOut: { stdout: string }
+        if (slotErase) {
+            try {
+                scriptOut = await ops.runSlotErase({
+                    slot: devicePartition ?? whole,
+                    stagingDir,
+                })
+            } catch (e) {
+                const mp = `${disksRoot()}/${devicePartition ?? whole}`
+                if (await ops.isMountPoint(mp)) {
+                    throw new Error(`${summary.label} couldn't be unmounted, so nothing was erased.`)
+                }
+                throw e
+            }
+        } else {
+            scriptOut = await ops.runScript({
+                device: `/dev/${whole}`,
+                serial: serial || '-',
+                sizeBytes,
+                label: IDEA_DISK_LABEL,
+                stagingDir,
+            })
+        }
         // Parse STEP markers into eraseInProgress
         for (const line of scriptOut.stdout.split('\n')) {
             if (line.startsWith('STEP:')) {
@@ -293,13 +342,15 @@ export const eraseDisk = async (
                 if (step === 'creating filesystem') setEraseStep(storeHandle, 'creating filesystem', targetId, summary.label)
                 else if (step === 'mounting') setEraseStep(storeHandle, 'mounting', targetId, summary.label)
                 else if (step === 'partitioning') setEraseStep(storeHandle, 'partitioning', targetId, summary.label)
+                else if (step === 'unmounting') setEraseStep(storeHandle, 'stopping and unmounting', targetId, summary.label)
             }
         }
 
         setEraseStep(storeHandle, 'mounting', targetId, summary.label)
-        await ops.udevadmSettle()
-        const partition = `${whole}1`
-        // Engine mounts via addDevice
+        if (!slotErase) await ops.udevadmSettle()
+        // USB: partition is whole+1 (sdb → sdb1). Loop slots keep the slot name.
+        const partition = slotErase ? (devicePartition ?? whole) : `${whole}1`
+        // Engine mounts via addDevice (testMode slots: fixture already remounted by erase-slot)
         const add = addDeviceImpl ?? ops.addDevice
         await add(`/dev/engine/${partition}`)
 
