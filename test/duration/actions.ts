@@ -6,6 +6,7 @@
  * Usage/operator Intents: StubUiDriver (Fake CI) or PlaywrightUiDriver → Pixel getIntent.
  */
 
+import { STAGE2_MOVE_TARGET_HOST, stage2HomeOf } from './stage2.js'
 import type {
     DurationOptions,
     FleetOps,
@@ -330,6 +331,7 @@ const redockEmptyFresh = async (
     // existing dock holder, else Console host pool[0] (Path A empty dock pattern).
     const engine =
         opts?.targetEngine ??
+        (isStage2(ctx) ? stage2HomeOf(diskId) : null) ??
         (ctx.walker.dockedEngine && !ctx.excludeEngines.includes(ctx.walker.dockedEngine)
             ? ctx.walker.dockedEngine
             : null) ?? pool[0]!
@@ -375,6 +377,11 @@ const redockEmptyFresh = async (
 /** Prefer A: hosts the harness must never touch, regardless of exclude_engines. */
 const NEVER_ENGINES = new Set(['idea02'])
 const isNeverEngine = (engine: string): boolean => NEVER_ENGINES.has(engine)
+
+/** Stage 2 (Stage2FleetOps): a fixture lives on its home Pi's SSD, not on the Console engine. */
+const isStage2 = (ctx: { opts: { ops: FleetOps } }): boolean => (ctx.opts.ops as FleetOps & { stage?: number }).stage === 2
+const stage2HomeOr = (ctx: { opts: { ops: FleetOps } }, diskId: string, fallback: string): string =>
+    isStage2(ctx) ? stage2HomeOf(diskId) : fallback
 
 const hostnameOfUrl = (raw: string | undefined): string | null => {
     const v = raw?.trim()
@@ -486,7 +493,7 @@ export const redockEmpty001BeforeMakeFiles = async (ctx: ActionContext): Promise
     // Prefer A r21 FAIL@91: walker.dockedEngine was idea03 (Kolibri after infra_move_disk)
     // so empty-001 was dock-copied onto idea03 while the Console under test is idea01.
     // Always land empty-001 on the Console's engine.
-    const target = resolveConsoleEngineHost(ctx)
+    const target = stage2HomeOr(ctx, filesDiskTargetId(), resolveConsoleEngineHost(ctx))
     return redockEmptyFresh(
         ctx,
         filesDiskTargetId(),
@@ -744,7 +751,8 @@ export const ensureAppOnlyDiskOnConsoleEngine = async (
     env: NodeJS.ProcessEnv = process.env,
 ): Promise<{ diskId: string; engine: string; note: string; movedFixture: boolean }> => {
     const diskId = addFilesAppDiskId(ctx, env)
-    const engine = resolveConsoleEngineHost(ctx, env)
+    // Stage 2: the app-only disk's home Pi (idea01) — it cannot leave its SSD except by network copy.
+    const engine = stage2HomeOr(ctx, diskId, resolveConsoleEngineHost(ctx, env))
     assertNotGolden(ctx, engine, 'add_files_role(restore app-only disk)')
     if (isNeverEngine(engine)) {
         throw new Error(`add_files_role: refused Console engine '${engine}' (never idea02)`)
@@ -918,7 +926,10 @@ const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
     // Path A re-dock after undock: prefer Console host pool[0] (idea01), never RNG —
     // unique-store inventory is empty if fixtures land on idea03/idea04.
     let engine: string
-    if (ctx.walker.dockedEngine && !ctx.excludeEngines.includes(ctx.walker.dockedEngine)) {
+    if (isStage2(ctx)) {
+        // Stage 2: each fixture docks on its own home Pi (Kolibri idea01, Nextcloud idea03).
+        engine = stage2HomeOf(ctx.fixtureDisk)
+    } else if (ctx.walker.dockedEngine && !ctx.excludeEngines.includes(ctx.walker.dockedEngine)) {
         engine = ctx.walker.dockedEngine
     } else if (ctx.opts.preserveDockedOnReturn) {
         const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
@@ -934,7 +945,7 @@ const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
     // Sibling fixtures (nextcloud) on the same engine so inventory sees both packs.
     const siblings = ctx.fixtureDisks.filter(d => d !== ctx.fixtureDisk)
     for (const diskId of siblings) {
-        await ctx.opts.ops.dockFixture(engine, diskId)
+        await ctx.opts.ops.dockFixture(stage2HomeOr(ctx, diskId, engine), diskId)
     }
     await settleParticipants(ctx, ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e)))
     const sibMsg = siblings.length ? ` (+ ${siblings.join(', ')})` : ''
@@ -1151,7 +1162,8 @@ const hostMapFromOps = (ops: FleetOps): Record<string, string> | undefined => {
 const infraMoveDisk = async (ctx: ActionContext): Promise<ActionResult> => {
     const from = ctx.walker.dockedEngine ?? pickPoolEngine(ctx)
     assertNotGolden(ctx, from, 'infra_move_disk(from)')
-    const to = pickPoolEngine(ctx, from)
+    // Stage 2 (Steve): the move target is always idea04 (network copy into its move-target partition).
+    const to = isStage2(ctx) ? STAGE2_MOVE_TARGET_HOST : pickPoolEngine(ctx, from)
     assertNotGolden(ctx, to, 'infra_move_disk(to)')
     // idea#168 r35@62: the move duration is logged explicitly (success and failure).
     const moveStartedAt = Date.now()
@@ -2682,7 +2694,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
         try {
             // Prefer A r21: always convert the pinned empty (empty-001), by testid.
             diskId = filesDiskTargetId()
-            const consoleEngine = resolveConsoleEngineHost(ctx)
+            const consoleEngine = stage2HomeOr(ctx, diskId, resolveConsoleEngineHost(ctx))
             const note = await redockEmpty001BeforeMakeFiles(ctx)
             const pre = await preflightFilesDiskTarget(ctx, diskId, consoleEngine)
             // Pin the Files Disk id before the Intent so Pixel + later steps share it.
@@ -2842,7 +2854,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             diskId,
             instanceId,
             engineId: ctx.action === 'make_files_disk' || ctx.action === 'add_files_role'
-                ? resolveConsoleEngineHost(ctx)
+                ? (isStage2(ctx) ? stage2HomeOf(diskId) : resolveConsoleEngineHost(ctx))
                 : (rebootTarget ?? backupDockedEngine ?? ctx.walker.dockedEngine ?? ctx.poolEngines[0]),
             screenshotPath: shotPath,
         })

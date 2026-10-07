@@ -34,7 +34,7 @@ import { $ } from 'zx'
 import type { StructuredLogEntry } from './types.js'
 import { EXIT_ENGINE_UNREACHABLE, installProcessGuards, timeoutSummary, walkExitCode } from './automergeTimeoutGuard.js'
 import { DEFAULT_PREFLIGHT_TIMEOUT_MS } from './realFleetOps.js'
-import { EXIT_STORE_PREFLIGHT, formatStoreMismatch, parseStoreProbe, runStorePreflight } from './storePreflight.js'
+import { EXIT_STORE_PREFLIGHT, formatStoreMismatch, runStorePreflight } from './storePreflight.js'
 import { EXIT_SLOT_PREFLIGHT } from './slotLayout.js'
 import { EXIT_STAGE2_PREFLIGHT, resolveDurationStage, stage2Preflight, stage2HomeOf, stage2SummaryFields, STAGE2_FIXTURES } from './stage2.js'
 import { Stage2FleetOps } from './stage2FleetOps.js'
@@ -476,7 +476,7 @@ const main = async () => {
             const configYaml: Parameters<typeof stage2Preflight>[0]['configYaml'] = {}
             for (const e of pool) {
                 try { status[e] = await s2ops.stage2Status(e) } catch (err) { status[e] = err instanceof Error ? err : new Error(String(err)) }
-                try { configYaml[e] = parseStoreProbe(await s2ops.probeStoreConfig(e)).config } catch (err) { configYaml[e] = err instanceof Error ? err : new Error(String(err)) }
+                try { configYaml[e] = await s2ops.probeEngineConfig(e) } catch (err) { configYaml[e] = err instanceof Error ? err : new Error(String(err)) }
             }
             const store: Parameters<typeof stage2Preflight>[0]['store'] = {}
             try {
@@ -491,7 +491,7 @@ const main = async () => {
                     }
                 }
             } catch (err) { console.error(`[duration] stage2 preflight: store read failed: ${err instanceof Error ? err.message : String(err)}`) }
-            const s2 = stage2Preflight({ pool, hosts: ops.getHostMap(), status, configYaml, store })
+            const s2 = stage2Preflight({ pool, hosts: ops.getHostMap(), status, configYaml, store, ...(walk ? { steps: walk.steps.slice(0, startIndex + iterations) } : {}) })
             console.log(`[duration] ${s2.message}`)
             console.log(JSON.stringify({ event: 'stage2_preflight', ok: s2.ok, table: s2.table, problems: s2.problems }))
             if (!s2.ok) {

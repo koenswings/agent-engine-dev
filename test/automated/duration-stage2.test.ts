@@ -2,26 +2,27 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { RealFleetOps } from '../duration/realFleetOps.js'
 import { fixtureDiskPreflight } from '../duration/fixtureDisks.js'
+import fs from 'node:fs'
+import { parse as parseYaml } from 'yaml'
 import {
-    EXIT_STAGE2_PREFLIGHT, STAGE2_FIXTURES, STAGE2_GAPS, buildStage2DockCmd, parseStage2DockJson, parseStage2Status,
+    EXIT_STAGE2_PREFLIGHT, PRODUCTION_EFFECTIVE, NOT_ENFORCED_PENDING, STAGE2_DOCK_SPLIT, STAGE2_ROLE_MAP,
+    buildEngineConfigProbe, describeStage2Conflicts, parseEngineConfigProbe, stage2MoveTargetId, stage2RoleTimeline, STAGE2_FIXTURES, STAGE2_GAPS, buildStage2DockCmd, parseStage2DockJson, parseStage2Status,
     resolveDurationStage, stage2EngineSettingsProblems, stage2FixturesOn, stage2HomeOf, stage2MoveTargetPartition,
     stage2NotCovered, stage2Preflight, stage2SummaryFields, validateStage2Layout, type Stage2Status,
 } from '../duration/stage2.js'
 import { Stage2FleetOps } from '../duration/stage2FleetOps.js'
 
+// Golden idea02's config.yaml settings (read-only 2026-10-07), trimmed.
 const GOOD_CFG = `settings:
-  testMode: false
-  disksRoot: /disks
-  skipImageLoad: false
-  skipMetaWrite: true
-  skipMetaUpdate: true
-  skipHardwareId: true
-  skipBorg: false
-  peerAccess: true
   mdns: true
+  isDev: false
+  testMode: false   # comment
+  port: 4321
+  storeIdentityFolder: store-identity
 `
+const probe = (cfg = GOOD_CFG, env: Record<string, string> = {}) => ({ configYaml: cfg, pid: '1234', env })
 const statusFor = (host: string, over: Partial<Stage2Status> = {}): Stage2Status => ({
-    ok: true, host, rootDisk: 'sda', ugreenDetached: host === 'idea03', extraSdDisks: [],
+    ok: true, host, bootId: 'boot-1', rootDisk: 'sda', ugreenDetached: host === 'idea03', extraSdDisks: [],
     fixtures: stage2FixturesOn(host).map(f => ({
         partLabel: f.partLabel, diskId: f.diskId, kname: `sdb${f.partNumber}`, parent: 'sdb', fsType: 'ext4',
         fsLabel: f.fsLabel, mounted: `/disks/sdb${f.partNumber}`, present: true,
@@ -32,9 +33,16 @@ const goodInput = () => ({
     pool: ['idea01', 'idea03', 'idea04'],
     hosts: { idea01: '10.0.0.1', idea03: '10.0.0.3', idea04: '10.0.0.4' } as Record<string, string>,
     status: { idea01: statusFor('idea01'), idea03: statusFor('idea03'), idea04: statusFor('idea04') } as Record<string, Stage2Status | Error>,
-    configYaml: { idea01: GOOD_CFG, idea03: GOOD_CFG, idea04: GOOD_CFG } as Record<string, string | null | Error>,
+    configYaml: { idea01: probe(), idea03: probe(), idea04: probe() } as Record<string, ReturnType<typeof probe> | Error>,
     store: Object.fromEntries(STAGE2_FIXTURES.map(f => [f.diskId, { dockedTo: f.host, diskTypes: [...f.diskTypes!], instances: [] as string[] }])),
 })
+
+const loadWalk = (name: string): { action: string }[] => {
+    const url = new URL(`../duration/walks/${name}.yaml`, import.meta.url)
+    const p = fs.existsSync(url) ? url : new URL(`../../../test/duration/walks/${name}.yaml`, import.meta.url)
+    const doc = parseYaml(fs.readFileSync(p, 'utf8')) as { steps: { action: string }[] }
+    return doc.steps
+}
 
 describe('stage switch', () => {
     it('defaults to Stage 1, accepts 2, rejects others', () => {
@@ -87,17 +95,50 @@ describe('stage2-dock.sh contract', () => {
     })
 })
 
-describe('engine settings pins', () => {
-    it('accepts the Stage 2 pins', () => expect(stage2EngineSettingsProblems(GOOD_CFG, 'idea01')).toEqual([]))
-    it('flags testMode on, unpinned skip*, private disksRoot, static peers, mDNS off', () => {
-        const cfg = GOOD_CFG.replace('testMode: false', 'testMode: true').replace('  skipBorg: false\n', '')
-            .replace('disksRoot: /disks', 'disksRoot: /home/pi/idea/duration-disks').replace('mdns: true', 'mdns: false') + '  staticPeers: idea03\n'
-        const p = stage2EngineSettingsProblems(cfg, 'idea01').join(' | ')
-        expect(p).toMatch(/testMode = true/)
-        expect(p).toMatch(/skipBorg not set/)
-        expect(p).toMatch(/disksRoot/)
-        expect(p).toMatch(/mdns = false/)
-        expect(p).toMatch(/staticPeers/)
+describe('engine settings = production', () => {
+    it('production effective values (all Config.ts defaults)', () => {
+        expect(PRODUCTION_EFFECTIVE).toEqual({
+            testMode: false, isDev: false, mdns: true, disksRoot: '/disks', staticPeers: null, skipImageLoad: false,
+            skipMetaWrite: false, skipBorg: false, skipHardwareId: false, skipMetaUpdate: false, peerAccess: true,
+        })
+    })
+    it('accepts a Pi configured like idea02', () => expect(stage2EngineSettingsProblems(probe(), 'idea01')).toEqual([]))
+    it('flags Stage 1 env overrides, test-only keys, testMode, mDNS off, static peers, no Engine', () => {
+        const p = stage2EngineSettingsProblems(probe(GOOD_CFG.replace('mdns: true', 'mdns: false') + '  skipBorg: true\n  staticPeers: idea03\n',
+            { IDEA_TEST_MODE: 'true', IDEA_DISKS_ROOT: '/home/pi/idea/duration-disks', IDEA_WATCH_DIR: '/home/pi/idea/duration-watch' }), 'idea01').join(' | ')
+        for (const re of [/IDEA_TEST_MODE=true/, /IDEA_DISKS_ROOT/, /IDEA_WATCH_DIR/, /settings.skipBorg/, /settings.staticPeers/,
+            /effective testMode = true/, /effective mdns = false/, /effective disksRoot/, /effective skipBorg = true/]) expect(p).toMatch(re)
+        expect(stage2EngineSettingsProblems({ configYaml: GOOD_CFG, pid: null, env: {} }, 'x').join()).toMatch(/no running Engine/)
+    })
+    it('skipHardwareId is not enforced until D4', () => {
+        expect(NOT_ENFORCED_PENDING.skipHardwareId).toMatch(/D4/)
+        expect(stage2EngineSettingsProblems(probe(GOOD_CFG, { IDEA_SKIP_HARDWARE_ID: 'true' }), 'h').join()).not.toMatch(/effective skipHardwareId/)
+    })
+    it('parses the config probe output', () => {
+        const pr = parseEngineConfigProbe(`@@S2 config\n${GOOD_CFG}@@S2 env\npid=42\nenv:IDEA_DISKS_ROOT=/x\n@@S2 end\n`)
+        expect(pr.pid).toBe('42'); expect(pr.env).toEqual({ IDEA_DISKS_ROOT: '/x' }); expect(pr.configYaml).toMatch(/testMode: false/)
+        expect(buildEngineConfigProbe()).toMatch(/\/home\/pi\/idea\/agents\/agent-engine-dev/)
+        expect(buildEngineConfigProbe()).not.toMatch(/(pm2 (restart|start|stop|delete|set)|tee|(?<!2)>\s*\/)/)
+    })
+})
+
+describe('role map + move target timeline', () => {
+    it('roles: Files 001 idea03, Erase 002 / Backup 003 idea04; move target idea04 002 by default', () => {
+        expect(STAGE2_ROLE_MAP).toEqual({ files: 'duration-empty-001', backup: 'duration-empty-003', erase: 'duration-empty-002' })
+        expect(stage2MoveTargetId({})).toBe('duration-empty-002')
+        expect(() => stage2MoveTargetId({ DURATION_STAGE2_MOVE_TARGET: 'duration-empty-001' })).toThrow(/idea04/)
+    })
+    it('cover-all: move target conflicts with its role whichever of 002/003 is chosen', () => {
+        const steps = loadWalk('cover-all')
+        const c2 = stage2RoleTimeline(steps, {})
+        expect(c2.map(c => `${c.roleStep} ${c.action}`)).toEqual(['104 erase_disk'])
+        expect(c2[0]!.moveStep).toBe(62)
+        expect(describeStage2Conflicts(c2)).toMatch(/do not fit/)
+        const c3 = stage2RoleTimeline(steps, { DURATION_STAGE2_MOVE_TARGET: 'duration-empty-003' })
+        expect(c3.map(c => c.action)).toEqual(expect.arrayContaining(['make_backup_disk']))
+    })
+    it('no move step → no conflict', () => {
+        expect(stage2RoleTimeline([{ action: 'erase_disk' }, { action: 'make_backup_disk' }], {})).toEqual([])
     })
 })
 
@@ -108,6 +149,11 @@ describe('stage2Preflight', () => {
         expect(r.ok).toBe(true)
         expect(r.table).toHaveLength(6)
         expect(EXIT_STAGE2_PREFLIGHT).toBe(10)
+    })
+    it('fails on the cover-all role/move conflict when given the walk', () => {
+        const r = stage2Preflight({ ...goodInput(), steps: loadWalk('cover-all') })
+        expect(r.ok).toBe(false)
+        expect(r.problems.join()).toMatch(/do not fit/)
     })
     it('fails closed on idea02, root-disk partition, sdb3, vfat, wrong META, dirty store, Ugreen attached', () => {
         const i = goodInput()
@@ -160,33 +206,47 @@ describe('declared gaps', () => {
         ])
         expect(stage2SummaryFields(null)).toMatchObject({ stage: 2, stage2NotCovered: [] })
     })
-    it('move target = an Empty partition on the target Pi, never the source', () => {
-        expect(stage2MoveTargetPartition('idea03', 'duration-kolibri-grade5a-001').diskId).toBe('duration-empty-001')
-        expect(stage2MoveTargetPartition('idea04', 'duration-kolibri-grade5a-001').diskId).toBe('duration-empty-003')
-        expect(() => stage2MoveTargetPartition('idea01', 'duration-nextcloud-grade5a-001')).toThrow(/no Empty partition/)
+    it('move target = idea04 empty-002 only; never idea03 empty-001 (Files)', () => {
+        expect(stage2MoveTargetPartition('idea04', 'duration-kolibri-grade5a-001', {}).diskId).toBe('duration-empty-002')
+        expect(() => stage2MoveTargetPartition('idea03', 'duration-kolibri-grade5a-001', {})).toThrow(/must be idea04/)
+        expect(() => stage2MoveTargetPartition('idea04', 'duration-empty-002', {})).toThrow(/move target itself/)
+    })
+    it('dock split: partition for per-disk steps, whole SSD only for reboot/yank', () => {
+        const ssd = Object.entries(STAGE2_DOCK_SPLIT).filter(([, v]) => v.level === 'ssd').map(([k]) => k).sort()
+        expect(ssd).toEqual(['05:00 daily reboot', 'infra_reboot_engine', 'reboot_engine', 'yank'])
+        expect(STAGE2_DOCK_SPLIT.infra_move_disk!.level).toBe('partition')
     })
 })
 
+const IP: Record<string, string> = { '10.0.0.1': 'idea01', '10.0.0.3': 'idea03', '10.0.0.4': 'idea04' }
 class CannedStage2 extends Stage2FleetOps {
     calls: string[] = []
     docked: Record<string, string | null> = {}
+    boot: Record<string, string> = { idea01: 'b1', idea03: 'b1', idea04: 'b1' }
+    ssdMissing = new Set<string>()
     protected override async ssh(host: string, cmd: string): Promise<string> {
-        this.calls.push(`${host} ${cmd}`)
+        const h = IP[host]!
+        if (cmd.endsWith(' status --json')) {
+            const st = statusFor(h, { bootId: this.boot[h]! })
+            if (this.ssdMissing.has(h)) st.fixtures.forEach(f => { f.present = false })
+            return JSON.stringify(st)
+        }
+        this.calls.push(`${h} ${cmd.replace('sudo -n /usr/local/sbin/stage2-dock.sh ', '').replace(' --json', '')}`)
+        if (cmd.endsWith(' dock-ssd --json')) this.ssdMissing.delete(h)
         const m = / (dock|undock) (\S+) --json$/.exec(cmd)
         if (m) {
-            const host2 = Object.entries({ '10.0.0.1': 'idea01', '10.0.0.3': 'idea03', '10.0.0.4': 'idea04' }).find(([h]) => h === host)![1]
-            this.docked[m[2]!] = m[1] === 'dock' ? host2 : null
-            return `{"ok":true}`
+            const occupant = m[2] === 'duration-empty-002' && this.kolibriOn002 ? 'duration-kolibri-grade5a-001' : m[2]!
+            this.docked[occupant] = m[1] === 'dock' ? h : null
         }
         return `{"ok":true}`
     }
+    kolibriOn002 = false
     protected override async relayPipe(s: string, sc: string, d: string, dc: string): Promise<string> {
-        this.calls.push(`RELAY ${s} ${sc} | ${d} ${dc}`)
-        this.docked['duration-kolibri-grade5a-001'] = null
+        this.calls.push(`RELAY ${IP[s]} ${sc.replace('sudo -n /usr/local/sbin/stage2-dock.sh ', '')} | ${IP[d]} ${dc.replace('sudo -n /usr/local/sbin/stage2-dock.sh ', '').replace(' --json', '')}`)
+        this.kolibriOn002 = true
         return '{"ok":true}'
     }
     override async findDockedEngine(diskId: string): Promise<string | null> {
-        if (diskId === 'duration-kolibri-grade5a-001' && this.docked['duration-empty-001'] === 'idea03') return 'idea03'
         return this.docked[diskId] ?? null
     }
 }
@@ -197,33 +257,90 @@ const mk = () => new CannedStage2({
 
 describe('Stage2FleetOps', () => {
     afterEach(() => vi.restoreAllMocks())
+    const quiet = () => {
+        vi.spyOn(RealFleetOps.prototype, 'undockFixtures').mockResolvedValue()
+        vi.spyOn(console, 'log').mockImplementation(() => {})
+    }
     it('refuses idea02 in the pool', () => {
         expect(() => new Stage2FleetOps({ poolEngines: ['idea01', 'idea02'], hosts: { idea01: 'a', idea02: 'b' } })).toThrow(/idea02/)
     })
-    it('dock = partition add on the home Pi only', async () => {
+    it('dock app fixture = partition add on its home Pi; wrong Pi refused', async () => {
+        quiet()
         const o = mk()
-        await o.dockFixture('idea04', 'duration-empty-002')
-        expect(o.calls).toEqual(['10.0.0.4 sudo -n /usr/local/sbin/stage2-dock.sh dock duration-empty-002 --json'])
-        o.docked['duration-empty-002'] = null
-        await expect(o.dockFixture('idea01', 'duration-empty-002')).rejects.toThrow(/lives on idea04/)
+        await o.dockFixture('idea03', 'duration-nextcloud-grade5a-001')
+        expect(o.calls).toEqual(['idea03 dock duration-nextcloud-grade5a-001'])
+        o.docked['duration-nextcloud-grade5a-001'] = null
+        await expect(o.dockFixture('idea01', 'duration-nextcloud-grade5a-001')).rejects.toThrow(/lives on idea03/)
     })
-    it('undock = Engine eject first, then partition remove', async () => {
+    it('Empty fixture always docks fresh (undock → reset → dock)', async () => {
+        quiet()
+        const o = mk()
+        o.docked['duration-empty-001'] = 'idea03'
+        await o.dockFixture('idea03', 'duration-empty-001')
+        expect(o.calls).toEqual(['idea03 undock duration-empty-001', 'idea03 reset duration-empty-001', 'idea03 dock duration-empty-001'])
+    })
+    it('undock = Engine eject first, then partition remove; held across reboots', async () => {
         const o = mk()
         const order: string[] = []
         vi.spyOn(RealFleetOps.prototype, 'undockFixtures').mockImplementation(async () => { order.push('engine-eject') })
         o.docked['duration-empty-002'] = 'idea04'
         await o.undockFixtures(['idea04'], 'duration-empty-002')
         order.push(...o.calls)
-        expect(order).toEqual(['engine-eject', '10.0.0.4 sudo -n /usr/local/sbin/stage2-dock.sh undock duration-empty-002 --json'])
+        expect(order).toEqual(['engine-eject', 'idea04 undock duration-empty-002'])
+        expect(o.heldUndocked.has('duration-empty-002')).toBe(true)
     })
-    it('move_disk = eject + export|import relay + dock target partition (network copy)', async () => {
+    it('move_disk = eject, reset target, export|import relay into idea04 empty-002, undock source, dock target', async () => {
+        quiet()
         const o = mk()
-        vi.spyOn(RealFleetOps.prototype, 'undockFixtures').mockResolvedValue()
-        vi.spyOn(console, 'log').mockImplementation(() => {})
-        await o.moveDisk('idea01', 'idea03', 'duration-kolibri-grade5a-001')
+        o.docked['duration-kolibri-grade5a-001'] = 'idea01'
+        await o.moveDisk('idea01', 'idea04', 'duration-kolibri-grade5a-001')
         expect(o.calls).toEqual([
-            'RELAY 10.0.0.1 sudo -n /usr/local/sbin/stage2-dock.sh export duration-kolibri-grade5a-001 | 10.0.0.3 sudo -n /usr/local/sbin/stage2-dock.sh import duration-empty-001 --as duration-kolibri-grade5a-001 --json',
-            '10.0.0.3 sudo -n /usr/local/sbin/stage2-dock.sh dock duration-empty-001 --json',
+            'idea04 reset duration-empty-002',
+            'RELAY idea01 export duration-kolibri-grade5a-001 | idea04 import duration-empty-002 --as duration-kolibri-grade5a-001',
+            'idea01 undock duration-kolibri-grade5a-001',
+            'idea04 dock duration-empty-002',
         ])
+        expect(o.moveCopies.get('duration-empty-002')).toBe('duration-kolibri-grade5a-001')
+        await expect(o.moveDisk('idea01', 'idea03', 'duration-nextcloud-grade5a-001')).rejects.toThrow(/must be idea04/)
+    })
+    it('Erase redock while 002 holds moved Kolibri: copy out, Kolibri back home, 002 reset fresh', async () => {
+        quiet()
+        const o = mk()
+        o.docked['duration-kolibri-grade5a-001'] = 'idea01'
+        await o.moveDisk('idea01', 'idea04', 'duration-kolibri-grade5a-001')
+        o.calls = []
+        o.kolibriOn002 = false
+        await o.dockFixture('idea04', 'duration-empty-002')
+        expect(o.calls).toEqual([
+            'idea04 undock duration-empty-002',
+            'idea01 dock duration-kolibri-grade5a-001',
+            'idea04 reset duration-empty-002',
+            'idea04 dock duration-empty-002',
+        ])
+        expect(o.moveCopies.size).toBe(0)
+    })
+    it('05:00 reboot (boot_id change) → redock: held-undocked fixture undocked again, others awaited', async () => {
+        quiet()
+        const o = mk()
+        o.docked['duration-empty-002'] = 'idea04'
+        await o.undockFixtures(['idea04'], 'duration-empty-002')
+        o.docked['duration-empty-002'] = 'idea04' // partitions came back at boot
+        o.docked['duration-empty-003'] = 'idea04'
+        o.boot.idea04 = 'b2'
+        o.calls = []
+        await o.dockFixture('idea04', 'duration-empty-003')
+        expect(o.redockLog).toEqual(['idea04: re-undock duration-empty-002', 'idea04: wait docked duration-empty-003'])
+        expect(o.calls[0]).toBe('idea04 undock duration-empty-002')
+    })
+    it('reboot with SSD missing → dock-ssd (whole SSD) then partition state', async () => {
+        quiet()
+        const o = mk()
+        vi.spyOn(RealFleetOps.prototype, 'rebootEngine').mockResolvedValue()
+        o.ssdMissing.add('idea03')
+        o.docked['duration-nextcloud-grade5a-001'] = 'idea03'
+        o.docked['duration-empty-001'] = 'idea03'
+        await o.rebootEngine('idea03', true)
+        expect(o.calls).toEqual(['idea03 dock-ssd'])
+        expect(o.redockLog[0]).toBe('idea03: SSD missing after boot → dock-ssd')
     })
 })
