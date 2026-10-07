@@ -142,6 +142,8 @@ export const fixtureDiskPreflight = (input: {
     poolEngines: readonly string[]
     view: SemanticStoreView
     env?: NodeJS.ProcessEnv
+    /** Stage 2: each Empty fixture's home Pi (it lives on that Pi's SSD); default = Console engine for all. */
+    expectedHostOf?: (diskId: string) => string
 }): FixtureDiskPreflight => {
     const env = input.env ?? process.env
     const fromStart = input.startIndex <= 0
@@ -160,10 +162,11 @@ export const fixtureDiskPreflight = (input: {
             problem = `${role} disk ${diskId} (${first}) is not in the store — dock it Empty: ${pathAHint(role, diskId)}`
         } else if (!state.dockedTo) {
             problem = `${role} disk ${diskId} (${first}) is not docked — dock it Empty: ${pathAHint(role, diskId)}`
-        } else if (fromStart && state.dockedTo !== input.consoleEngine) {
+        } else if (fromStart && state.dockedTo !== (input.expectedHostOf?.(diskId) ?? input.consoleEngine)) {
+            const want = input.expectedHostOf?.(diskId) ?? input.consoleEngine
             problem =
-                `${role} disk ${diskId} (${first}) is docked on ${state.dockedTo}, not on the Console engine ` +
-                `${input.consoleEngine} — ${pathAHint(role, diskId)} on ${input.consoleEngine}`
+                `${role} disk ${diskId} (${first}) is docked on ${state.dockedTo}, not on ` +
+                `${input.expectedHostOf ? 'its Stage 2 home' : 'the Console engine'} ${want} — ${pathAHint(role, diskId)} on ${want}`
         } else if (!fromStart && !input.poolEngines.includes(state.dockedTo)) {
             problem = `${role} disk ${diskId} (${first}) is docked on ${state.dockedTo}, outside the pool`
         } else if (fromStart && !state.empty) {

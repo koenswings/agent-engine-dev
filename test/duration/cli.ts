@@ -34,8 +34,10 @@ import { $ } from 'zx'
 import type { StructuredLogEntry } from './types.js'
 import { EXIT_ENGINE_UNREACHABLE, installProcessGuards, timeoutSummary, walkExitCode } from './automergeTimeoutGuard.js'
 import { DEFAULT_PREFLIGHT_TIMEOUT_MS } from './realFleetOps.js'
-import { EXIT_STORE_PREFLIGHT, formatStoreMismatch, runStorePreflight } from './storePreflight.js'
+import { EXIT_STORE_PREFLIGHT, formatStoreMismatch, parseStoreProbe, runStorePreflight } from './storePreflight.js'
 import { EXIT_SLOT_PREFLIGHT } from './slotLayout.js'
+import { EXIT_STAGE2_PREFLIGHT, resolveDurationStage, stage2Preflight, stage2HomeOf, stage2SummaryFields, STAGE2_FIXTURES } from './stage2.js'
+import { Stage2FleetOps } from './stage2FleetOps.js'
 import { EXIT_FIXTURE_PREFLIGHT, fixtureDiskPreflight } from './fixtureDisks.js'
 import {
     EXIT_PEER_PREFLIGHT,
@@ -337,6 +339,8 @@ const main = async () => {
     }
 
     let ops: FakeFleetOps | RealFleetOps
+    const durationStage = resolveDurationStage()
+    const stage2Fields = durationStage === 2 ? stage2SummaryFields(walk?.steps ?? null) : null
     let hosts: Record<string, string> | undefined
 
     if (args.live) {
@@ -358,7 +362,7 @@ const main = async () => {
             console.error('Refusing --live with idea02 in pool')
             process.exit(2)
         }
-        ops = new RealFleetOps({
+        const opsOpts = {
             poolEngines: pool,
             excludeEngines: scenario.exclude_engines,
             hosts,
@@ -368,7 +372,9 @@ const main = async () => {
             healthWrapBefore: args.healthWrapBefore,
             healthWrapAfter: args.healthWrapAfter,
             startInstances: args.startInstances,
-        })
+        }
+        // Stage 2 (DURATION_STAGE=2): real SSD partitions via stage2-dock.sh; Stage 1 unchanged otherwise.
+        ops = durationStage === 2 ? new Stage2FleetOps(opsOpts) : new RealFleetOps(opsOpts)
     } else {
         ops = new FakeFleetOps({
             poolEngines: pool,
@@ -413,6 +419,8 @@ const main = async () => {
         start_instances: args.startInstances,
         hosts: hosts ?? null,
         stability: !args.noStability,
+        stage: durationStage,
+        ...(stage2Fields ?? {}),
     }
     console.log(JSON.stringify(commonStart))
 
@@ -461,7 +469,40 @@ const main = async () => {
         // Read-only ssh. Legacy Pis (no helper: the current f65183a pool) pass unchanged.
         // Helper floor: v1 in general, v2 when the walk copies across Pis (peer keys = v2 sync-peers).
         const helperMin = peerPlan ? requiredHelperVersion(peerPlan) : 1
-        const sl = await ops.preflightSlotLayout(pool, helperMin)
+        if (ops instanceof Stage2FleetOps) {
+            // Stage 2: no idea-test-N slots; partitions by PARTLABEL, Engine settings pinned, store home state.
+            const s2ops = ops
+            const status: Parameters<typeof stage2Preflight>[0]['status'] = {}
+            const configYaml: Parameters<typeof stage2Preflight>[0]['configYaml'] = {}
+            for (const e of pool) {
+                try { status[e] = await s2ops.stage2Status(e) } catch (err) { status[e] = err instanceof Error ? err : new Error(String(err)) }
+                try { configYaml[e] = parseStoreProbe(await s2ops.probeStoreConfig(e)).config } catch (err) { configYaml[e] = err instanceof Error ? err : new Error(String(err)) }
+            }
+            const store: Parameters<typeof stage2Preflight>[0]['store'] = {}
+            try {
+                const view = await s2ops.readStore(pool[0]!)
+                for (const f of STAGE2_FIXTURES) {
+                    const d = view.diskDB[f.diskId]
+                    if (!d) continue
+                    store[f.diskId] = {
+                        dockedTo: await s2ops.findDockedEngine(f.diskId),
+                        diskTypes: [...(d.diskTypes ?? [])],
+                        instances: Object.values(view.instanceDB).filter(x => x.diskId === f.diskId).map(x => x.id),
+                    }
+                }
+            } catch (err) { console.error(`[duration] stage2 preflight: store read failed: ${err instanceof Error ? err.message : String(err)}`) }
+            const s2 = stage2Preflight({ pool, hosts: ops.getHostMap(), status, configYaml, store })
+            console.log(`[duration] ${s2.message}`)
+            console.log(JSON.stringify({ event: 'stage2_preflight', ok: s2.ok, table: s2.table, problems: s2.problems }))
+            if (!s2.ok) {
+                for (const p of s2.problems) console.error(`[duration] FATAL (stage2 preflight): ${p}`)
+                console.log(JSON.stringify(timeoutSummary()))
+                await uiDriver.close?.().catch(() => {})
+                await ops.close().catch(() => {})
+                process.exit(EXIT_STAGE2_PREFLIGHT)
+            }
+        }
+        const sl = ops instanceof Stage2FleetOps ? [] : await ops.preflightSlotLayout(pool, helperMin)
         for (const v of sl) console.log(`[duration] ${v.message}`)
         console.log(JSON.stringify({
             event: 'slot_layout_preflight',
@@ -494,6 +535,7 @@ const main = async () => {
                     consoleEngine,
                     poolEngines: pool.filter(e => !scenario.exclude_engines.includes(e)),
                     view: await ops.readStore(consoleEngine),
+                    ...(ops instanceof Stage2FleetOps ? { expectedHostOf: stage2HomeOf } : {}),
                 })
             } catch (e) {
                 readErr = `fixture disk preflight: store read on ${consoleEngine} failed: ${e instanceof Error ? e.message : String(e)}`
@@ -652,14 +694,17 @@ const main = async () => {
     }
 
     console.log(JSON.stringify(timeoutSummary()))
-    const summary = buildRunSummary({ walk, result, recoveries: recoveryCounter.snapshot() })
+    const summary = { ...buildRunSummary({ walk, result, recoveries: recoveryCounter.snapshot() }), ...(stage2Fields ?? {}) }
     console.log(JSON.stringify(summary))
-    console.log(formatRunSummaryLine(summary))
+    console.log(formatRunSummaryLine(summary) + (stage2Fields
+        ? ` | STAGE 2: ${stage2Fields.stage2NotCovered.map(n => `@${n.step} ${n.action} = network copy`).join(', ') || 'no gap steps'} (physical move not covered)`
+        : ''))
     console.log(JSON.stringify({
         event: 'duration_done',
         mode: walk ? 'walk' : 'markov',
         walk: walk?.name ?? null,
         shakeOut: summary.shakeOut,
+        ...(stage2Fields ?? {}),
         ...(shakeOut
             ? { variantOf: shakeOut.variantOf, notCovered: shakeOut.notCovered, stepNumbering: shakeOut.stepNumbering }
             : {}),
