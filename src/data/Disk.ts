@@ -13,6 +13,7 @@ import { FilesConfig, hasFilesYaml, processFilesDisk } from './FilesDisk.js';
 import { parseFilesMount } from './FilesMount.js';
 import { updateDiskSize } from './DiskSize.js';
 import { recordDiskDetectionFailure } from '../monitors/diskDetection.js';
+import { shouldAutoStart } from './AutoStart.js';
 
 
 
@@ -662,11 +663,25 @@ export const processInstance = async (storeHandle: DocHandle<Store>, disk: Disk,
  * issued explicitly via the 'startInstance' command.
  */
 const tracedStartInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk): Promise<void> => {
-    // Never auto-start an instance that was explicitly stopped by the operator.
-    // processInstance is called on every disk-dock event; without this guard a
-    // re-dock (or a spurious udev re-add) would restart a stopped instance.
-    if (instance.status === 'Stopped') {
-        log(`tracedStartInstance: skipping auto-start of '${instance.name}' (${instance.id}) — status is Stopped`)
+    // Never auto-start an instance the operator stopped (idea#176). processInstance
+    // runs on every dock: boot, a real USB plug, the testMode/dev startup undock +
+    // re-add of every disk, a spurious udev re-add, and move/restore/install
+    // registration. An undock overwrites Stopped with Undocked and the dock pass
+    // resets that to Docked, so the gate also reads the operator's last stop
+    // (AutoStart.ts). The instance is put back to Stopped so the Console shows it.
+    const current = storeHandle.doc()?.instanceDB?.[instance.id] ?? instance
+    const gate = shouldAutoStart(storeHandle.doc(), current)
+    if (!gate.start) {
+        log(`tracedStartInstance: skipping auto-start of '${current.name}' (${current.id}) on disk ${disk.id}: ${gate.reason}`)
+        if (gate.userStop && current.status !== 'Stopped') {
+            storeHandle.change(doc => {
+                const inst = doc.instanceDB[instance.id]
+                if (inst && inst.status !== 'Stopped' && inst.status !== 'Missing') {
+                    log(`Setting status of instance ${instance.id} to Stopped (was ${inst.status}; the operator's stop is still in force)`)
+                    inst.status = 'Stopped' as Status
+                }
+            })
+        }
         return
     }
     const cmdLogHandle = getCommandLogHandle()

@@ -44,7 +44,7 @@ vi.mock('../../src/data/Instance.js', async (importOriginal) => {
         startInstance: vi.fn(async (handle: any, inst: any) => {
             h.started.push(String(inst.id))
             h.running.add(String(inst.id))
-            handle.change((doc: any) => { doc.instanceDB[inst.id].status = 'Running' })
+            handle.change((doc: any) => { doc.instanceDB[inst.id].status = 'Running'; doc.instanceDB[inst.id].lastStarted = Date.now() })
         }),
     }
 })
@@ -233,6 +233,7 @@ describe('a user Stop persists across an Engine restart', () => {
         expect(status(handle, MILKWISE)).toBe('Stopped')
 
         const { startInstance } = await import('../../src/data/Instance.js')
+        await new Promise(r => setTimeout(r, 2))
         await startInstance(handle, handle.doc().instanceDB[MILKWISE as InstanceID] as any, disk(handle, SYS), 'console-command')
         expect(status(handle, MILKWISE)).toBe('Running')
 
@@ -294,7 +295,9 @@ describe('regression: normal autostart and interrupted operations', () => {
         const handle = await makeStore()
         await stop(handle, KOLIBRI, APPD, 'console-command')
         await new Promise(r => setTimeout(r, 2))
-        handle.change(d => { (d.instanceDB as any)[KOLIBRI].status = 'Running' }); h.running.add(KOLIBRI)
+        // the operator starts it again (a successful start sets lastStarted)
+        handle.change(d => { (d.instanceDB as any)[KOLIBRI].status = 'Running'; (d.instanceDB as any)[KOLIBRI].lastStarted = Date.now() }); h.running.add(KOLIBRI)
+        await new Promise(r => setTimeout(r, 2))
         await stop(handle, KOLIBRI, APPD, 'backup-pre-stop')
         await restartEngine(handle)
         expect(h.started).toContain(KOLIBRI)
@@ -322,7 +325,7 @@ describe('regression: normal autostart and interrupted operations', () => {
         expect(status(handle, KOLIBRI)).toBe('Running')
     })
 
-    it('another Engine\'s unfinished user stop is not treated as interrupted by this restart', async () => {
+    it('an unfinished operator stop recorded by another Engine still counts: no container, so Stopped', async () => {
         const handle = await makeStore()
         handle.change(d => {
             (d.operationDB as any)['op-other'] = {
@@ -333,7 +336,7 @@ describe('regression: normal autostart and interrupted operations', () => {
         })
         h.running.delete(KOLIBRI)
         await checkAndSetUndockedApps(handle, localEngineId, async (id) => h.running.has(String(id)))
-        expect(status(handle, KOLIBRI)).toBe('Undocked')
+        expect(status(handle, KOLIBRI)).toBe('Stopped')
     })
 
     it('a user-stopped instance on a disk docked on another Engine is left alone', async () => {
