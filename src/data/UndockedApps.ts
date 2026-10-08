@@ -19,14 +19,17 @@
  *   - a stop the Engine did itself as one step of a longer operation (backup,
  *     copy, move, disk undock): an interrupted operation, so the instance is
  *     marked Undocked as before and the dock pass starts it again;
- *   - an operator stop that was interrupted by the restart (its operation is
- *     still Running/Pending on this Engine) and whose containers are already
- *     gone: the instance is marked Stopped, which is what the operator asked.
+ *   - any other status with an operator stop still in force (AutoStart.ts, e.g.
+ *     an operator stop interrupted by the restart) and no container: Stopped.
+ * The dock pass applies the same rule (shouldAutoStart in tracedStartInstance),
+ * so the testMode/dev startup undock + re-add of every disk, a boot where a disk
+ * is gone or renamed, and a real unplug + replug keep the Stop too.
  */
 import { $ } from 'zx'
 import { DocHandle } from '@automerge/automerge-repo'
 import { log } from '../utils/utils.js'
-import { EngineID, InstanceID, Operation, OperationCause } from './CommonTypes.js'
+import { EngineID, InstanceID } from './CommonTypes.js'
+import { isUserStopped, lastStopOperation, userStopInForce } from './AutoStart.js'
 import { Instance, Status } from './Instance.js'
 import { Store } from './Store.js'
 import { localEngineId } from './Engine.js'
@@ -39,41 +42,8 @@ export const isInstanceDockedOn = (store: Store, instance: Instance | undefined 
     return String(disk.dockedTo) === String(engineId)
 }
 
-/** Causes of a stopApp operation that come from the operator (idea#176). */
-export const USER_STOP_CAUSES: ReadonlySet<OperationCause> = new Set<OperationCause>([
-    'console-command', 'cli-command', 'cross-engine-cmd',
-])
-
-/** The most recent stopApp operation of the instance (any Engine), or undefined. */
-export const lastStopOperation = (store: Store, instanceId: InstanceID): Operation | undefined => {
-    let last: Operation | undefined
-    for (const op of Object.values(store.operationDB ?? {})) {
-        if (!op || op.kind !== 'stopApp') continue
-        const target = op.subject?.type === 'instance' ? op.subject.id : op.args?.instanceId
-        if (String(target) !== String(instanceId)) continue
-        if (!last || (op.startedAt ?? 0) >= (last.startedAt ?? 0)) last = op
-    }
-    return last
-}
-
-/**
- * True when the instance is Stopped because the operator stopped it (or the store
- * has no stop record for it): startup must leave it Stopped (idea#176).
- */
-export const isUserStopped = (store: Store, instance: Instance): boolean => {
-    if (instance.status !== 'Stopped') return false
-    const op = lastStopOperation(store, instance.id)
-    return !op || USER_STOP_CAUSES.has(op.cause)
-}
-
-/** An operator stop of the instance that this Engine's restart interrupted (still Running/Pending). */
-export const interruptedUserStop = (store: Store, instance: Instance, engineId: EngineID): Operation | undefined => {
-    const op = lastStopOperation(store, instance.id)
-    if (!op || !USER_STOP_CAUSES.has(op.cause)) return undefined
-    if (op.status !== 'Running' && op.status !== 'Pending') return undefined
-    if (!op.engineId || String(op.engineId) !== String(engineId)) return undefined
-    return op
-}
+// The decision rules live in AutoStart.ts, shared with the dock path (idea#176).
+export { USER_CAUSES, USER_STOP_CAUSES, lastStopOperation, lastUserStop, userStopInForce, isUserStopped, shouldAutoStart } from './AutoStart.js'
 
 /** Does this Pi run a container of the instance? (`docker ps -q -f name=<id>`) */
 export type ContainerRunningCheck = (instanceId: InstanceID) => Promise<boolean>
@@ -109,9 +79,11 @@ export const checkAndSetUndockedApps = async (
                 // to another Engine (a sync) while docker ps ran.
                 if (!inst || inst.status === 'Undocked' || !isInstanceDockedOn(doc, inst, engineId)) return
                 if (isUserStopped(doc, inst)) return
-                const stopOp = interruptedUserStop(doc, inst, engineId)
+                // An operator stop is still in force (e.g. it was interrupted by the
+                // restart after its containers stopped): the instance is Stopped.
+                const stopOp = userStopInForce(doc, inst)
                 if (stopOp) {
-                    log(`Setting status of instance ${instanceId} to Stopped (operator stop ${stopOp.id.slice(0, 8)} was interrupted by the restart; no container on this Engine)`)
+                    log(`Setting status of instance ${instanceId} to Stopped (operator stop ${String(stopOp.id).slice(0, 8)} by ${stopOp.cause} is in force; no container on this Engine)`)
                     inst.status = 'Stopped' as Status
                     return
                 }
