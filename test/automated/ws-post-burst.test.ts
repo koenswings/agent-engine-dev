@@ -27,6 +27,7 @@ import { NodeFSStorageAdapter } from '@automerge/automerge-repo-storage-nodefs'
 import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websocket'
 import { next as A } from '@automerge/automerge'
 import { startAutomergeServer } from '../../src/repo.js'
+import { enginePeerId } from '../../src/data/StoreScope.js'
 import { pruneDepartedMessages, QueuedEvent } from '../../src/wsServerThread.js'
 import { PortNumber } from '../../src/data/CommonTypes.js'
 import { largeStoreDoc } from '../harness/largeStoreDoc.js'
@@ -53,11 +54,11 @@ const runClient = (input: WsSyncClientInput): Promise<WsSyncClientResult> => new
 })
 
 /** In-process client; records the documentIds of every message the server sends it. */
-const inProcessClient = async (url: string, docId: DocumentId, storageDir?: string) => {
+const inProcessClient = async (url: string, docId: DocumentId, storageDir?: string, peerId?: string) => {
     const adapter = new WebSocketClientAdapter(url, 2_000)
     const seen = new Set<string>()
     adapter.on('message', (m: any) => { if (m?.documentId) seen.add(m.documentId) })
-    const repo = new Repo({ network: [adapter], storage: storageDir ? new NodeFSStorageAdapter(storageDir) : undefined, peerId: `postburst-${Math.random().toString(36).slice(2)}` as PeerId })
+    const repo = new Repo({ network: [adapter], storage: storageDir ? new NodeFSStorageAdapter(storageDir) : undefined, peerId: (peerId ?? `postburst-${Math.random().toString(36).slice(2)}`) as PeerId })
     const handle = await repo.find(docId)
     await handle.whenReady()
     return { seen, close: async () => { try { await repo.shutdown() } catch { /* already disconnected */ } } }
@@ -77,7 +78,7 @@ describe('Automerge WS server after a burst of short-lived clients (r34 POST-BUR
         extraIds.push(seed.import(extraDoc(6_000)).documentId, seed.import(extraDoc(1_000)).documentId)
         await seed.flush()
         const port = await freePort()
-        repo = await startAutomergeServer(dataDir, port as PortNumber)
+        repo = await startAutomergeServer(dataDir, port as PortNumber, { storeDocId: mainId, engineId: 'ENGINE_postburst' })
         for (const id of [mainId, ...extraIds]) await (await repo.find(id)).whenReady()
         url = `ws://127.0.0.1:${port}`
     }, 180_000)
@@ -95,9 +96,10 @@ describe('Automerge WS server after a burst of short-lived clients (r34 POST-BUR
         expect([...c.seen]).toEqual([mainId])
     }, 60_000)
 
-    it('a peer with storage (another Engine) still gets every doc announced', async () => {
+    it('a peer with storage (another Engine of the same store) still gets every doc announced', async () => {
         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'idea-postburst-peer-'))
-        const c = await inProcessClient(url, mainId, dir)
+        // Store-scoped peering (StoreScope.ts): an Engine peer carries its store tag in its peerId
+        const c = await inProcessClient(url, mainId, dir, enginePeerId(mainId, 'ENGINE_postburst-peer'))
         const until = Date.now() + 10_000
         while (!extraIds.every(id => c.seen.has(id)) && Date.now() < until) await new Promise(r => setTimeout(r, 100))
         await c.close()
@@ -135,9 +137,11 @@ describe('storage-less clients still get docs their Engine relays (Console remot
         onlyOnB = seedB.import(extraDoc(200)).documentId
         await seedB.flush()
         const [portA, portB] = [await freePort(), await freePort()]
-        b = await startAutomergeServer(dirB, portB as PortNumber)
+        // Both Engines in one store (store-scoped peering: A and B must share a store to sync)
+        const storeId = seedB.create({ engineDB: {} }).documentId
+        b = await startAutomergeServer(dirB, portB as PortNumber, { storeDocId: storeId, engineId: 'ENGINE_b' })
         await (await b.find(onlyOnB)).whenReady()
-        a = await startAutomergeServer(dirA, portA as PortNumber)
+        a = await startAutomergeServer(dirA, portA as PortNumber, { storeDocId: storeId, engineId: 'ENGINE_a' })
         a.networkSubsystem.addNetworkAdapter(new WebSocketClientAdapter(`ws://127.0.0.1:${portB}`, 2_000))
         urlA = `ws://127.0.0.1:${portA}`
         // Wait until A is peered with B (the client's request must find an Engine to ask).
