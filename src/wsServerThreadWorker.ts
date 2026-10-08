@@ -17,11 +17,23 @@
  *   { type: 'listening' } | { type: 'ready' } | { type: 'server-error', message }
  *   { type: 'event', event: 'peer-candidate' | 'peer-disconnected' | 'message', payload }
  *   { type: 'log', level: 'log' | 'error', message }
+ *   { type: 'refused', peerId, remote, verdict, ownTag }   a join refused by the store check
+ *
+ * Store-scoped peering (StoreScope.ts): when our own peerId is an Engine peerId
+ * (`idea-engine/<storeTag>/...`, always the case for the Engine, src/repo.ts),
+ * every join is checked BEFORE the stock adapter sees it. A peer of another store,
+ * or a non-ephemeral peer without a store tag (an old Engine), gets an
+ * `idea-store-refused ours=<tag> kind=<kind>` error and its socket is closed: no
+ * peer-candidate, no 'peer' reply, none of its messages reach the Repo. Messages on
+ * a socket that has not completed an admitted join are dropped too (the stock
+ * adapter would forward them with whatever senderId they claim).
  */
 
 import { parentPort, workerData } from 'worker_threads'
 import { WebSocketServer } from 'ws'
 import { WebSocketServerAdapter } from '@automerge/automerge-repo-network-websocket'
+import { cbor } from '@automerge/automerge-repo'
+import { parseEnginePeerId, peerVerdict, refusalMessage, PeerVerdict } from './data/StoreScope.js'
 
 export interface WsServerThreadData { port: number, keepAliveIntervalMs: number }
 
@@ -78,6 +90,53 @@ const startKeepalive = (wss: WebSocketServer, intervalMs: number): NodeJS.Timeou
     return timer
 }
 
+export interface StoreRefusal { peerId?: string, remote: string, verdict: PeerVerdict, ownTag: string }
+
+/**
+ * The stock server adapter with the store check on each socket's join (see header).
+ * ownTag undefined (our own peerId is not an Engine peerId: tests/tools that run a
+ * plain server) = no check, the stock behaviour.
+ */
+export class StoreScopedWebSocketServerAdapter extends WebSocketServerAdapter {
+    ownTag?: string
+    #admitted = new WeakSet<object>()
+    readonly #onRefused: (r: StoreRefusal) => void
+    readonly #wss: WebSocketServer
+
+    constructor(server: WebSocketServer, keepAliveInterval: number, onRefused: (r: StoreRefusal) => void) {
+        super(server, keepAliveInterval)
+        this.#wss = server
+        this.#onRefused = onRefused
+    }
+
+    override connect(peerId: any, peerMetadata?: any): void {
+        this.ownTag = parseEnginePeerId(peerId)?.storeTag
+        super.connect(peerId, peerMetadata)
+        this.#wss.on('connection', (socket: any, req: any) => {
+            socket.ideaRemote = `${req?.socket?.remoteAddress ?? '?'}:${req?.socket?.remotePort ?? '?'}`
+        })
+    }
+
+    override receiveMessage(messageBytes: Uint8Array, socket: any): void {
+        if (!this.ownTag || this.#admitted.has(socket)) return super.receiveMessage(messageBytes, socket)
+        let message: any
+        try { message = cbor.decode(new Uint8Array(messageBytes as any)) } catch { socket.close(); return }
+        if (message?.type !== 'join') return   // nothing before the join is processed
+        const verdict = peerVerdict(this.ownTag, message.senderId, message.peerMetadata)
+        if (!verdict.admit) {
+            try {
+                socket.send(cbor.encode({ type: 'error', senderId: this.peerId, targetId: message.senderId,
+                    message: refusalMessage(this.ownTag, verdict.kind) }))
+            } catch { /* socket already closing */ }
+            try { socket.close(4403, 'store mismatch') } catch { /* ignore */ }
+            this.#onRefused({ peerId: message.senderId, remote: socket.ideaRemote ?? '?', verdict, ownTag: this.ownTag })
+            return
+        }
+        this.#admitted.add(socket)
+        super.receiveMessage(messageBytes, socket)
+    }
+}
+
 if (parentPort) {
     const port = parentPort
     const { port: listenPort, keepAliveIntervalMs } = workerData as WsServerThreadData
@@ -88,7 +147,7 @@ if (parentPort) {
     process.on('uncaughtException', (err: Error) => logError(`[ws-server-thread uncaughtException] ${err.stack ?? err.message}`))
     process.on('unhandledRejection', (reason: any) => logError(`[ws-server-thread unhandledRejection] ${reason instanceof Error ? reason.stack : String(reason)}`))
 
-    let adapter: WebSocketServerAdapter | undefined
+    let adapter: StoreScopedWebSocketServerAdapter | undefined
 
     port.on('message', (m: any) => {
         try {
@@ -102,7 +161,7 @@ if (parentPort) {
                     wss.on('listening', () => post({ type: 'listening' }))
                     // Our keepalive (startKeepalive) replaces the stock one, which
                     // would terminate a peer whose pong is stuck behind its own sync.
-                    adapter = new WebSocketServerAdapter(wss, STOCK_KEEPALIVE_OFF)
+                    adapter = new StoreScopedWebSocketServerAdapter(wss, STOCK_KEEPALIVE_OFF, (r) => post({ type: 'refused', ...r }))
                     startKeepalive(wss, keepAliveIntervalMs)
                     for (const event of FORWARDED_EVENTS) {
                         adapter.on(event, (payload: unknown) => post({ type: 'event', event, payload }))

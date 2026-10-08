@@ -31,8 +31,10 @@
 import { Worker } from 'worker_threads'
 import { next as A } from '@automerge/automerge'
 import { NetworkAdapter, Message, PeerId, PeerMetadata } from '@automerge/automerge-repo'
-import { log, error } from './utils/utils.js'
-import type { WsServerThreadData } from './wsServerThreadWorker.js'
+import { log, error, print } from './utils/utils.js'
+import type { WsServerThreadData, StoreRefusal } from './wsServerThreadWorker.js'
+import { describeRefusal, RefusalLog } from './data/StoreScope.js'
+import { guardOutgoing } from './data/StoreScopedClientAdapter.js'
 
 const RESTART_DELAY_MS = 1000
 
@@ -61,6 +63,20 @@ export const carriesChanges = (msg: any): boolean => {
 export const pruneDepartedMessages = (queue: QueuedEvent[], peerId: PeerId): QueuedEvent[] =>
     queue.filter(e => !(e.event === 'message' && e.payload?.senderId === peerId && !carriesChanges(e.payload)))
 
+export interface ThreadedServerStoreScope {
+    /** Called for every join the worker refused (store check, StoreScope.ts). Default: a rate-limited log line. */
+    onRefused?: (r: StoreRefusal) => void
+    /** true = documentId is another fleet's store doc: never served, never accepted. */
+    docGuard?: (documentId: string) => boolean
+}
+
+const serverRefusalLog = new RefusalLog(print)
+const logServerRefusal = (r: StoreRefusal): void => {
+    const host = r.remote.replace(/:\d+$/, '')
+    serverRefusalLog.report(`in|${host}|${r.verdict.kind}|${r.verdict.theirTag ?? ''}`,
+        describeRefusal(r.verdict, r.ownTag, r.peerId, `inbound from ${r.remote}`))
+}
+
 export class ThreadedWebSocketServerAdapter extends NetworkAdapter {
     readonly port: number
     readonly keepAliveIntervalMs: number
@@ -80,10 +96,15 @@ export class ThreadedWebSocketServerAdapter extends NetworkAdapter {
     #listeningResolve!: () => void
     #listeningReject!: (e: Error) => void
 
-    constructor(port: number, keepAliveIntervalMs: number) {
+    #scope: ThreadedServerStoreScope
+    /** Joins refused by the store check (diagnostics/tests). */
+    readonly refusals: StoreRefusal[] = []
+
+    constructor(port: number, keepAliveIntervalMs: number, scope: ThreadedServerStoreScope = {}) {
         super()
         this.port = port
         this.keepAliveIntervalMs = keepAliveIntervalMs
+        this.#scope = scope
         this.listening = new Promise<void>((resolve, reject) => { this.#listeningResolve = resolve; this.#listeningReject = reject })
         this.listening.catch(() => { /* reported via error(); callers may await it */ })
         this.#spawn()
@@ -103,9 +124,13 @@ export class ThreadedWebSocketServerAdapter extends NetworkAdapter {
         this.#worker.postMessage({ type: 'connect', peerId, peerMetadata })
     }
 
+    /** Set the foreign-doc guard once the Repo exists (src/repo.ts). */
+    setDocGuard(docGuard: (documentId: string) => boolean): void { this.#scope.docGuard = docGuard }
+
     send(message: Message): void {
         if ('data' in message && message.data?.byteLength === 0) throw new Error('Tried to send a zero-length message')
-        this.#worker.postMessage({ type: 'send', message })
+        const out = guardOutgoing(message, this.#scope.docGuard)
+        if (out) this.#worker.postMessage({ type: 'send', message: out })
     }
 
     disconnect(): void {
@@ -140,8 +165,22 @@ export class ThreadedWebSocketServerAdapter extends NetworkAdapter {
         switch (m?.type) {
             case 'event':
                 if (m.event === 'peer-disconnected') this.#dropQueuedFrom(m.payload?.peerId)
+                // A sync/request for another fleet's store doc that is loaded here is not
+                // processed (that would serve or change the foreign copy): answer unavailable.
+                if (m.event === 'message' && m.payload?.documentId && (m.payload.type === 'sync' || m.payload.type === 'request')
+                    && this.#scope.docGuard?.(String(m.payload.documentId))) {
+                    this.send({ type: 'doc-unavailable', senderId: this.peerId!, targetId: m.payload.senderId, documentId: m.payload.documentId } as Message)
+                    break
+                }
                 this.#enqueue({ event: m.event, payload: m.payload })
                 break
+            case 'refused': {
+                const r: StoreRefusal = { peerId: m.peerId, remote: m.remote, verdict: m.verdict, ownTag: m.ownTag }
+                this.refusals.push(r)
+                if (this.refusals.length > 100) this.refusals.shift()
+                ;(this.#scope.onRefused ?? logServerRefusal)(r)
+                break
+            }
             case 'ready':
                 if (!this.#ready) { this.#ready = true; this.#readyResolve() }
                 break

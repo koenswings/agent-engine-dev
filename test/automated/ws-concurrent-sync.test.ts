@@ -120,7 +120,7 @@ describe('Automerge WS server: slow and crowded store sync (IDEA04-WS)', () => {
         seed.import(bin, { docId })
         await seed.flush()
         port = await freePort()
-        repo = await startAutomergeServer(dataDir, port as PortNumber)
+        repo = await startAutomergeServer(dataDir, port as PortNumber, { storeDocId: docId, engineId: 'ENGINE_wsconc' })
         const handle = await repo.find(docId)
         await handle.whenReady()
         await waitListening(port)
