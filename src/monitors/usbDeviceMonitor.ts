@@ -1,6 +1,6 @@
 import chokidar from 'chokidar'
 import { getKeys, log, uuid } from '../utils/utils.js'
-import { DiskMeta, readHardwareId, readMetaUpdateId, writeMetaFile } from '../data/Meta.js';
+import { DiskMeta, newHardwareDiskId, readMetaUpdateId, writeMetaFile } from '../data/Meta.js';
 import { $, fs, YAML, chalk } from 'zx'
 
 $.verbose = false;
@@ -196,7 +196,8 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                         return
                     }
                     log('Could not find a META file. Creating one now.')
-                    const diskId = await readHardwareId(device) as DiskID
+                    // Serial for a single-partition drive, <serial>-<PARTUUID> when it has several (idea#168 D4)
+                    const diskId = await newHardwareDiskId(device) as DiskID
                     // The disk name should be the name of the volume if available, otherwise 'Unnamed Disk'
                     let diskName: DiskName = 'Unnamed Disk' as DiskName
                     try {

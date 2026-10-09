@@ -374,6 +374,9 @@ if (process.env.IDEA_SKIP_META_UPDATE === 'true' || process.env.IDEA_SKIP_META_U
  * isDev || testMode (the old gate). Under fixture mounts (pi-owned IDEA_DISKS_ROOT,
  * device names like idea-test-1) there is no /sys/block entry: the lookup finds
  * nothing and a META with isHardwareId: false keeps its id. Read at call time.
+ *
+ * Not needed for multi-partition SSDs (idea#168 D4): with the lookup on, each
+ * partition gets serial + PARTUUID and assigned ids are kept (DiskIdentity.ts).
  */
 export const skipHardwareId = (): boolean => config.settings.skipHardwareId ?? (config.settings.isDev || config.settings.testMode);
 
