@@ -24,6 +24,14 @@
  */
 import type { SemanticStoreView } from './types.js'
 import { DURATION_UI_FIXTURES } from './ui/fixtures.js'
+import { STAGE2_ROLE_MAP, STAGE2_SEQUENTIAL_SHARES, stage2RoleWindows } from './stage2.js'
+
+/**
+ * Stage 2 (DURATION_STAGE=2, READY 2026-10-09 §4.4): only three Empties exist and empty-003 is the
+ * move-only target, so the role ids come from STAGE2_ROLE_MAP (files empty-001, backup empty-002,
+ * erase empty-001 — Files and Erase share empty-001 SEQUENTIALLY, re-docked fresh before erase).
+ */
+const isStage2 = (env: NodeJS.ProcessEnv): boolean => env.DURATION_STAGE?.trim() === '2'
 
 /** Exit code: a fixture disk a walk role needs is missing / not Empty / shared (before step 1). */
 export const EXIT_FIXTURE_PREFLIGHT = 8
@@ -32,14 +40,18 @@ export type FixtureDiskRole = 'files' | 'backup' | 'erase'
 
 /** The disk make_files_disk converts (and the first install_app lands on). */
 export const filesDiskTargetId = (env: NodeJS.ProcessEnv = process.env): string =>
-    env.DURATION_EMPTY_DISK_ID?.trim() || DURATION_UI_FIXTURES.empty.diskId
+    env.DURATION_EMPTY_DISK_ID?.trim() || (isStage2(env) ? STAGE2_ROLE_MAP.files : DURATION_UI_FIXTURES.empty.diskId)
 
 /** The disk make_backup_disk turns into the Backup Disk under test. */
 export const backupDiskTargetId = (env: NodeJS.ProcessEnv = process.env): string =>
-    env.DURATION_BACKUP_DISK_ID?.trim() || DURATION_UI_FIXTURES.empty3.diskId
+    env.DURATION_BACKUP_DISK_ID?.trim() || (isStage2(env) ? STAGE2_ROLE_MAP.backup : DURATION_UI_FIXTURES.empty3.diskId)
 
-/** The disk erase_disk erases (the harness re-docks it Empty for the late installs/erase). */
-export const eraseDiskTargetId = (): string => DURATION_UI_FIXTURES.empty2.diskId
+/**
+ * The disk erase_disk erases (the harness re-docks it Empty for the late installs/erase).
+ * Stage 1: always duration-empty-002. Stage 2: STAGE2_ROLE_MAP.erase (empty-001). DURATION_ERASE_DISK_ID overrides.
+ */
+export const eraseDiskTargetId = (env: NodeJS.ProcessEnv = process.env): string =>
+    env.DURATION_ERASE_DISK_ID?.trim() || (isStage2(env) ? STAGE2_ROLE_MAP.erase : DURATION_UI_FIXTURES.empty2.diskId)
 
 /** Walk actions that consume each role's Empty disk. */
 export const ROLE_CONSUMERS: Record<FixtureDiskRole, readonly string[]> = {
@@ -49,7 +61,25 @@ export const ROLE_CONSUMERS: Record<FixtureDiskRole, readonly string[]> = {
 }
 
 export const roleDiskId = (role: FixtureDiskRole, env: NodeJS.ProcessEnv = process.env): string =>
-    role === 'files' ? filesDiskTargetId(env) : role === 'backup' ? backupDiskTargetId(env) : eraseDiskTargetId()
+    role === 'files' ? filesDiskTargetId(env) : role === 'backup' ? backupDiskTargetId(env) : eraseDiskTargetId(env)
+
+/**
+ * Stage 2 only: two roles may resolve to one disk when the pair is an allowed sequential share
+ * (STAGE2_SEQUENTIAL_SHARES) AND their step windows in this walk do not overlap.
+ */
+export const allowedSequentialShare = (
+    roles: readonly FixtureDiskRole[],
+    steps: readonly { action: string }[],
+    env: NodeJS.ProcessEnv = process.env,
+): boolean => {
+    if (!isStage2(env) || roles.length !== 2) return false
+    const w = stage2RoleWindows(steps)
+    const [a, b] = roles.map(r => w.find(x => x.role === r))
+    if (!a || !b) return false
+    const [first, second] = a.from <= b.from ? [a, b] : [b, a]
+    if (second.from <= first.to) return false
+    return STAGE2_SEQUENTIAL_SHARES.some(([x, y]) => x === first.role && y === second.role)
+}
 
 export interface DiskEmptiness {
     diskId: string
@@ -125,7 +155,7 @@ const pathAHint = (role: FixtureDiskRole, diskId: string): string =>
 const ROLE_ENV: Record<FixtureDiskRole, string> = {
     files: 'DURATION_EMPTY_DISK_ID',
     backup: 'DURATION_BACKUP_DISK_ID',
-    erase: '(fixed: duration-empty-002)',
+    erase: 'DURATION_ERASE_DISK_ID',
 }
 
 /**
@@ -181,10 +211,11 @@ export const fixtureDiskPreflight = (input: {
     for (const r of roles) byId.set(r.diskId, [...(byId.get(r.diskId) ?? []), r])
     for (const [id, rs] of byId) {
         if (rs.length < 2) continue
+        if (allowedSequentialShare(rs.map(r => r.role), input.steps, env)) continue
         problems.push(
             `${rs.map(r => `${r.role} (${ROLE_ENV[r.role]})`).join(' and ')} resolve to the same disk ${id} — ` +
                 `each role consumes its own Empty disk (files ${filesDiskTargetId(env)}, backup ` +
-                `${backupDiskTargetId(env)}, erase ${eraseDiskTargetId()}); set DURATION_BACKUP_DISK_ID=` +
+                `${backupDiskTargetId(env)}, erase ${eraseDiskTargetId(env)}); set DURATION_BACKUP_DISK_ID=` +
                 `${DURATION_UI_FIXTURES.empty3.diskId} and DURATION_EMPTY_DISK_ID=${DURATION_UI_FIXTURES.empty.diskId}`,
         )
         for (const r of rs) r.ok = false

@@ -36,7 +36,8 @@ import { EXIT_ENGINE_UNREACHABLE, installProcessGuards, timeoutSummary, walkExit
 import { DEFAULT_PREFLIGHT_TIMEOUT_MS } from './realFleetOps.js'
 import { EXIT_STORE_PREFLIGHT, formatStoreMismatch, runStorePreflight } from './storePreflight.js'
 import { EXIT_SLOT_PREFLIGHT } from './slotLayout.js'
-import { EXIT_STAGE2_PREFLIGHT, resolveDurationStage, stage2Preflight, stage2HomeOf, stage2SummaryFields, STAGE2_FIXTURES } from './stage2.js'
+import { describeStage2Windows, EXIT_STAGE2_PREFLIGHT, resolveDurationStage, stage2Preflight, stage2HomeOf, stage2SummaryFields, STAGE2_FIXTURES } from './stage2.js'
+import { resolveStage2StoreFixMode, runStage2StoreFix } from './stage2StoreFix.js'
 import { Stage2FleetOps } from './stage2FleetOps.js'
 import { EXIT_FIXTURE_PREFLIGHT, fixtureDiskPreflight } from './fixtureDisks.js'
 import {
@@ -472,6 +473,21 @@ const main = async () => {
         if (ops instanceof Stage2FleetOps) {
             // Stage 2: no idea-test-N slots; partitions by PARTLABEL, Engine settings pinned, store home state.
             const s2ops = ops
+            // READY §4.7: store step = stage2-store-fix.sh behind the D10 v2 gate (opt-in; default off).
+            const storeFixMode = resolveStage2StoreFixMode()
+            if (storeFixMode !== 'off') {
+                const sf = runStage2StoreFix(storeFixMode)
+                console.log(JSON.stringify({ event: 'stage2_store_fix', mode: storeFixMode, ok: sf.ok, gate: sf.gate, plan: sf.plan, problem: sf.problem ?? null }))
+                if (!sf.ok) {
+                    console.error(`[duration] FATAL (stage2 store step): ${sf.problem}`)
+                    console.log(JSON.stringify(timeoutSummary()))
+                    await uiDriver.close?.().catch(() => {})
+                    await ops.close().catch(() => {})
+                    process.exit(EXIT_STAGE2_PREFLIGHT)
+                }
+            } else {
+                console.log('[duration] stage2 store step: off (DURATION_STAGE2_STORE_FIX=plan|apply runs stage2-store-fix.sh behind D10 v2)')
+            }
             const status: Parameters<typeof stage2Preflight>[0]['status'] = {}
             const configYaml: Parameters<typeof stage2Preflight>[0]['configYaml'] = {}
             for (const e of pool) {
@@ -501,6 +517,11 @@ const main = async () => {
                 await ops.close().catch(() => {})
                 process.exit(EXIT_STAGE2_PREFLIGHT)
             }
+            // D5 safety net: remember every pool Pi's boot_id so a 05:00 / unplanned reboot is seen
+            // at the next fixture op and reconciled (dock-ssd → re-undock held → wait docked).
+            const bootIds = await s2ops.recordBootIds(pool)
+            const roleWindows = walk ? describeStage2Windows(walk.steps.slice(0, startIndex + iterations)) : ''
+            console.log(JSON.stringify({ event: 'stage2_walk_start', bootIds, roleWindows }))
         }
         const sl = ops instanceof Stage2FleetOps ? [] : await ops.preflightSlotLayout(pool, helperMin)
         for (const v of sl) console.log(`[duration] ${v.message}`)

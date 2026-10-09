@@ -1664,6 +1664,9 @@ export class RealFleetOps implements FleetOps {
                 status: String(inst.status ?? ''),
                 diskId: inst.storedOn != null ? String(inst.storedOn) : null,
                 name: inst.name != null ? String(inst.name) : undefined,
+                ...(Number.isInteger(Number((inst as { port?: unknown }).port)) && Number((inst as { port?: unknown }).port) > 0
+                    ? { port: Number((inst as { port?: unknown }).port) }
+                    : {}),
             }
         }
 
@@ -2507,7 +2510,7 @@ export class RealFleetOps implements FleetOps {
      * sentinel under IDEA_WATCH_DIR. Excludes instances/ unless startInstances.
      * Does not start Kolibri/Nextcloud — image not required for dock-only smoke.
      */
-    private async sshDockCopy(engineId: string, diskId: string, device: string): Promise<void> {
+    protected async sshDockCopy(engineId: string, diskId: string, device: string): Promise<void> {
         if (!/^idea-test-[0-9]+$/.test(device)) {
             throw new Error(`RealFleetOps: refuse non-test device '${device}' (must be idea-test-N)`)
         }
@@ -2585,7 +2588,7 @@ export class RealFleetOps implements FleetOps {
         return { dest, entries }
     }
 
-    private async sshRemoveSentinel(engineId: string, device: string): Promise<void> {
+    protected async sshRemoveSentinel(engineId: string, device: string): Promise<void> {
         if (!/^idea-test-[0-9]+$/.test(device)) return
         assertPrivateDurationRoots(this.disksRoot, this.watchDir)
         const host = this.hostOf(engineId)

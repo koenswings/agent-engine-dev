@@ -71,6 +71,8 @@ export interface SemanticInstance {
     status: string
     diskId: string | null
     name?: string
+    /** Stage 2: published sidecar port from the store (kolibri 18080, nextcloud 61820). Not part of convergence equality. */
+    port?: number
 }
 
 export interface SemanticDisk {

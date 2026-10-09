@@ -54,19 +54,24 @@ export interface Stage2Fixture {
     stage1Slot: string
 }
 
-/** PLAN §1 partition layout — 2 fixtures per Pi, one Prefer A app per Pi. */
+/**
+ * Atlas Path A READY 2026-10-09 14:16 (path-a-stage2-20261009/READY.md §2): 6 walk fixtures on 3 real
+ * Intenso SSDs, one SSD per Pi, two partitions each. idea04's second SSD (empty-004/005 of 82aeaa5)
+ * does not exist (bad media, SUMMARY.md DO-NOT-USE). Devices are NEVER addressed by kname:
+ * idea01's fixture SSD is sda (root = sdb2), idea03/idea04's is sdb.
+ */
 export const STAGE2_FIXTURES: readonly Stage2Fixture[] = [
     { diskId: 'duration-kolibri-grade5a-001', host: 'idea01', ssd: 1, partNumber: 1, partLabel: 'IDEA-KOLIBRI', fsLabel: 'DUR-KOLIBRI', diskTypes: ['app'], stage1Slot: 'idea-test-1', role: 'Prefer A app, move source' },
     { diskId: 'duration-add-files-001', host: 'idea01', ssd: 1, partNumber: 2, partLabel: 'IDEA-ADDFILES', fsLabel: 'ADDFILES01', diskTypes: ['app'], stage1Slot: 'idea-test-5', role: 'add_files_role (app only)' },
-    // Nextcloud seed carries FILES.yaml + files/ → the Engine derives [app, files] (Atlas AXLE-ANSWERS §3; seed kept).
+    // Nextcloud seed carries FILES.yaml + files/ → the Engine derives [app, files] (READY §4.3).
     { diskId: 'duration-nextcloud-grade5a-001', host: 'idea03', ssd: 1, partNumber: 1, partLabel: 'IDEA-NEXTCLOUD', fsLabel: 'DUR-NEXTCLOUD', diskTypes: ['app', 'files'], stage1Slot: 'idea-test-2', role: 'Prefer A app' },
-    { diskId: 'duration-empty-001', host: 'idea03', ssd: 1, partNumber: 2, partLabel: 'IDEA-EMPTY001', fsLabel: 'DUR-EMPTY001', diskTypes: ['empty'], stage1Slot: 'idea-test-3', role: 'Files' },
-    { diskId: 'duration-empty-002', host: 'idea04', ssd: 1, partNumber: 1, partLabel: 'IDEA-EMPTY002', fsLabel: 'DUR-EMPTY002', diskTypes: ['empty'], stage1Slot: 'idea-test-4', role: 'Erase + late installs' },
-    { diskId: 'duration-empty-003', host: 'idea04', ssd: 1, partNumber: 2, partLabel: 'IDEA-EMPTY003', fsLabel: 'DUR-EMPTY003', diskTypes: ['empty'], stage1Slot: 'idea-test-6', role: 'Backup' },
-    // idea04 SSD2 (Steve option a): dedicated move target + spare. Ids stay duration-empty-* (stage2-dock.sh reset accepts only those).
-    { diskId: 'duration-empty-004', host: 'idea04', ssd: 2, partNumber: 1, partLabel: 'IDEA-MOVE001', fsLabel: 'DUR-MOVE001', diskTypes: ['empty'], stage1Slot: '(new)', role: 'move target (infra_move_disk)' },
-    { diskId: 'duration-empty-005', host: 'idea04', ssd: 2, partNumber: 2, partLabel: 'IDEA-SPARE001', fsLabel: 'DUR-SPARE001', diskTypes: ['empty'], stage1Slot: '(new)', role: 'spare (kept out of the Engine)', expectDocked: false },
+    { diskId: 'duration-empty-001', host: 'idea03', ssd: 1, partNumber: 2, partLabel: 'IDEA-EMPTY001', fsLabel: 'DUR-EMPTY001', diskTypes: ['empty'], stage1Slot: 'idea-test-3', role: 'Files, then Erase + late installs (sequential, fresh reset between)' },
+    { diskId: 'duration-empty-002', host: 'idea04', ssd: 1, partNumber: 1, partLabel: 'IDEA-EMPTY002', fsLabel: 'DUR-EMPTY002', diskTypes: ['empty'], stage1Slot: 'idea-test-4', role: 'Backup (same Pi as the moved Kolibri)' },
+    { diskId: 'duration-empty-003', host: 'idea04', ssd: 1, partNumber: 2, partLabel: 'IDEA-EMPTY003', fsLabel: 'DUR-EMPTY003', diskTypes: ['empty'], stage1Slot: 'idea-test-6', role: 'move-only target (infra_move_disk); no other role' },
 ]
+
+/** Pis that must never receive a network-copied disk (READY §4.4: never move onto idea01). */
+export const STAGE2_NEVER_MOVE_TO = ['idea01'] as const
 
 export const stage2Fixture = (diskId: string): Stage2Fixture => {
     const f = STAGE2_FIXTURES.find(x => x.diskId === diskId)
@@ -137,7 +142,7 @@ export const buildStage2DockCmd = (
     args: { diskId?: string; as?: string } = {},
     script = STAGE2_DOCK_SCRIPT_DEFAULT,
 ): string => {
-    if (!RE_SCRIPT.test(script)) throw new Error(`Stage 2: refuse dock script path '${script}'`)
+    if (!RE_SCRIPT.test(script) || script.includes('..')) throw new Error(`Stage 2: refuse dock script path '${script}'`)
     const id = (x: string | undefined, what: string): string => {
         if (!x || !RE_DISK_ID.test(x)) throw new Error(`Stage 2: ${verb} needs a valid ${what} (got '${x ?? ''}')`)
         stage2Fixture(x)
@@ -254,13 +259,30 @@ export const effectiveEngineSettings = (settings: Record<string, unknown>, env: 
     }
 }
 
-/** Golden idea02's effective settings (all defaults). skipHardwareId: not enforced until D4 (SSD model). */
+/** Golden idea02's effective settings (all Config.ts defaults). */
 export const PRODUCTION_EFFECTIVE: EffectiveEngineSettings = effectiveEngineSettings({ mdns: true, isDev: false, testMode: false })
-export const NOT_ENFORCED_PENDING: Partial<Record<keyof EffectiveEngineSettings, string>> = {
-    skipHardwareId: 'D4 (SSD model/size): Intenso/Samsung FIT serial may replace the META diskId and collide across 2 partitions',
-}
-/** config.yaml settings keys production does NOT set (must stay unset so defaults apply). */
-export const PRODUCTION_UNSET_KEYS = ['disksRoot', 'skipImageLoad', 'skipMetaWrite', 'skipBorg', 'skipMetaUpdate', 'peerAccess', 'staticPeers', 'watchDir'] as const
+
+/**
+ * Stage 2 pins that deliberately DIFFER from production (READY §1, switchover v2 14:10).
+ * required: preflight fails unless the effective value is exactly this; allowed: reported only.
+ */
+export const STAGE2_PINS = {
+    skipHardwareId: {
+        value: true, required: true,
+        why: 'D4: all Stage 2 SSDs are Intenso; with hw-id on, both partitions of one SSD get the SAME serial-based diskId. Test-only pin until the Engine keys the id per partition (then remove).',
+    },
+    systemDiskSkip: {
+        value: true, required: false,
+        why: 'PLAN §5 pin (was IDEA_SYSTEM_DISK_SKIP env); test-only, reported',
+    },
+} as const
+/** Back-compat name (82aeaa5): nothing is "pending" any more — skipHardwareId is now a REQUIRED pin. */
+export const NOT_ENFORCED_PENDING: Partial<Record<keyof EffectiveEngineSettings, string>> = {}
+/**
+ * config.yaml keys production does NOT set. READY pins the skip flags and peerAccess explicitly to their
+ * production values (allowed when the effective value equals production); these must stay UNSET.
+ */
+export const PRODUCTION_UNSET_KEYS = ['disksRoot', 'staticPeers', 'watchDir'] as const
 
 /** Read-only remote probe: config.yaml + pm2.config.cjs + IDEA_* of the running Engine (same sources production uses). */
 export const buildEngineConfigProbe = (engineDir = PRODUCTION_ENGINE_DIR): string => [
@@ -288,7 +310,11 @@ export const parseEngineConfigProbe = (out: string): EngineConfigProbe => {
     return { configYaml: missing ? null : cfg.join('\n'), pid, env }
 }
 
-/** Stage 2 Pi vs production: same effective settings, production-unset keys unset, no IDEA_* overrides, Engine running. */
+/**
+ * Stage 2 Pi vs production (READY §4.5): the running Engine has NO IDEA_* env at all (no test-only
+ * env, no duration-watch), effective testMode false, skipHardwareId pinned true (D4), every other
+ * effective value = production, disksRoot/staticPeers/watchDir unset, Engine running.
+ */
 export const stage2EngineSettingsProblems = (probe: EngineConfigProbe | string | null, host: string): string[] => {
     const pr: EngineConfigProbe = typeof probe === 'string' || probe === null ? { configYaml: probe, pid: 'n/a', env: {} } : probe
     if (!pr.configYaml) return [`${host}: ${PRODUCTION_ENGINE_DIR}/config.yaml unreadable`]
@@ -298,14 +324,37 @@ export const stage2EngineSettingsProblems = (probe: EngineConfigProbe | string |
     }
     const problems: string[] = []
     if (pr.pid === null) problems.push(`${host}: no running Engine (${PRODUCTION_ENGINE_DIR}/dist/src/index.js)`)
-    for (const k of SETTING_OVERRIDE_ENV) if (pr.env[k] !== undefined) problems.push(`${host}: Engine env ${k}=${pr.env[k]} (production sets no IDEA_* override; no test-only env)`)
+    for (const [k, v] of Object.entries(pr.env).sort()) {
+        if (k.startsWith('IDEA_')) problems.push(`${host}: Engine env ${k}=${v} (Stage 2: no IDEA_* env on the running Engine)`)
+    }
     for (const k of PRODUCTION_UNSET_KEYS) if (settings[k] !== undefined) problems.push(`${host}: settings.${k} = ${JSON.stringify(settings[k])} (production leaves it unset → default)`)
     const eff = effectiveEngineSettings(settings, pr.env)
+    if (eff.testMode !== false) problems.push(`${host}: effective testMode = ${eff.testMode} (Stage 2 needs testMode false: real udev + /disks mounts)`)
     for (const k of Object.keys(PRODUCTION_EFFECTIVE) as (keyof EffectiveEngineSettings)[]) {
-        if (NOT_ENFORCED_PENDING[k]) continue
+        if (k === 'testMode') continue
+        const pin = (STAGE2_PINS as Record<string, { value: unknown; required: boolean }>)[k]
+        if (pin?.required) {
+            if (eff[k] !== pin.value) problems.push(`${host}: effective ${k} = ${JSON.stringify(eff[k])}, Stage 2 pin = ${JSON.stringify(pin.value)} (${k === 'skipHardwareId' ? 'D4' : 'pin'})`)
+            continue
+        }
         if (eff[k] !== PRODUCTION_EFFECTIVE[k]) problems.push(`${host}: effective ${k} = ${JSON.stringify(eff[k])}, production = ${JSON.stringify(PRODUCTION_EFFECTIVE[k])}`)
     }
     return problems
+}
+
+/** Pins in force on a Pi (for the preflight table / D4 report). */
+export const stage2PinReport = (probe: EngineConfigProbe | string | null): string[] => {
+    const text = typeof probe === 'string' ? probe : probe?.configYaml
+    if (!text) return []
+    let settings: Record<string, unknown> = {}
+    try { settings = ((parseYaml(text) ?? {}) as { settings?: Record<string, unknown> }).settings ?? {} } catch { return [] }
+    const eff = effectiveEngineSettings(settings, typeof probe === 'string' || !probe ? {} : probe.env) as unknown as Record<string, unknown>
+    const out: string[] = []
+    for (const [k, pin] of Object.entries(STAGE2_PINS)) {
+        const v = k in eff ? eff[k] : settings[k]
+        if (v === pin.value) out.push(`${k}=${JSON.stringify(v)}${k === 'skipHardwareId' ? ' (D4 pin, test-only)' : ' (pin)'}`)
+    }
+    return out
 }
 
 /** readHardwareId special-cases these models (src: Intenso + Samsung FIT). */
@@ -319,64 +368,129 @@ const effectiveFromProbe = (p: EngineConfigProbe | string): EffectiveEngineSetti
     } catch { return null }
 }
 
-// ── Role map + move target (Steve 2026-10-07) ───────────────────────────────
+// ── Role map + move target (READY §4.4, 2026-10-09) ─────────────────────────
 
 /**
- * Files = empty-001 (idea03). Erase = empty-002, Backup = empty-003 (idea04 SSD1).
- * move_disk target = empty-004 on idea04 SSD2 (Steve option a), never a role disk; empty-005 = spare.
+ * Only THREE Empties exist (001 idea03, 002/003 idea04) but cover-all has FOUR Empty uses: Files
+ * (@88–@92), Backup (@95–@112), Erase + late installs (@104–@121) and the move target (@62 → end).
+ * READY §4.4: empty-003 is move-only (never moved onto idea01). The backup_instance Intent needs
+ * the Backup Disk on the SAME Pi as the instance (ensureBackupDiskForInstance), and the moved
+ * Kolibri lives on idea04 → Backup = empty-002 (idea04). Files ends (@92) before Erase starts
+ * (@104), so both use empty-001 SEQUENTIALLY; the harness re-docks it fresh (Engine eject →
+ * reset → dock) before the first erase_disk. stage2RoleTimeline proves no overlap.
  */
 export const STAGE2_MOVE_TARGET_HOST = 'idea04'
-export const STAGE2_MOVE_TARGET_ID = 'duration-empty-004'
-export const STAGE2_SPARE_ID = 'duration-empty-005'
-export const STAGE2_ROLE_MAP = {
+export const STAGE2_MOVE_TARGET_ID = 'duration-empty-003'
+export type Stage2Role = 'files' | 'backup' | 'erase'
+export const STAGE2_ROLE_MAP: Readonly<Record<Stage2Role, string>> = {
     files: 'duration-empty-001',
-    backup: 'duration-empty-003',
-    erase: 'duration-empty-002',
-} as const
+    backup: 'duration-empty-002',
+    erase: 'duration-empty-001',
+}
+/** Role pairs allowed on ONE partition, only in this order and only without overlap (fresh reset between). */
+export const STAGE2_SEQUENTIAL_SHARES: readonly (readonly [Stage2Role, Stage2Role])[] = [['files', 'erase']]
 export const stage2MoveTargetId = (): string => STAGE2_MOVE_TARGET_ID
 
-/** Steps that need each role disk Empty / its role (fixtureDisks ROLE_CONSUMERS + later users). */
-const ROLE_USERS: Record<keyof typeof STAGE2_ROLE_MAP, readonly string[]> = {
-    files: ['install_app', 'make_files_disk'],
-    backup: ['make_backup_disk', 'backup_instance', 'restore_from_backup'],
-    erase: ['erase_disk'],
-}
-/** Steps that need the MOVED app disk (Kolibri) live after infra_move_disk. */
-const MOVED_APP_USERS = ['open_kolibri_as_teacher', 'open_kolibri_as_learner', 'backup_instance', 'restore_from_backup']
+/** 1-based inclusive step window in which a role's partition is in use. */
+export interface Stage2Window { role: Stage2Role | 'move'; from: number; to: number; steps: number[] }
 
-export interface Stage2Conflict { role: string; diskId: string; moveStep: number; roleStep: number; action: string; heldUntil: number }
+const idxs = (steps: readonly { action: string }[], pred: (a: string, i: number) => boolean): number[] =>
+    steps.flatMap((s, i) => (pred(s.action, i) ? [i + 1] : []))
 
 /**
- * After infra_move_disk@N the move target partition holds the moved app until the last step
- * that still needs that app. Any role step on the same partition inside [N, lastNeed] is a
- * conflict. Install_app steps on the erase disk (the late installs) count as erase-role use.
+ * Usage windows per role on cover-all-like walks (1-based):
+ *  files:  first install_app/make_files_disk .. last make_files_disk (+ its files_role_added)
+ *  erase:  first erase_disk .. last erase_disk/confirm_erase/cancel_erase/later install_app/start_after_install/stay_on_disk
+ *  backup: first make_backup_disk .. last backup_instance/restore_from_backup/backup_configured_restored
+ *  move:   first infra_move_disk .. end of walk (the copy stays until the end-of-run preflight)
  */
-export const stage2RoleTimeline = (steps: readonly { action: string }[], target: string = STAGE2_MOVE_TARGET_ID): Stage2Conflict[] => {
-    const role = (Object.entries(STAGE2_ROLE_MAP).find(([, id]) => id === target)?.[0] ?? null) as keyof typeof STAGE2_ROLE_MAP | null
+export const stage2RoleWindows = (steps: readonly { action: string }[]): Stage2Window[] => {
+    const out: Stage2Window[] = []
+    const firstErase = steps.findIndex(s => s.action === 'erase_disk') + 1 // 0 = none
+    const mk = idxs(steps, a => a === 'make_files_disk')
+    const filesSteps = idxs(steps, (a, i) => (a === 'install_app' || a === 'make_files_disk') && (!firstErase || i + 1 < firstErase) && (!mk.length || i + 1 <= mk.at(-1)!))
+    if (filesSteps.length) {
+        let to = filesSteps.at(-1)!
+        if (steps[to]?.action === 'files_role_added') to += 1
+        out.push({ role: 'files', from: filesSteps[0]!, to, steps: filesSteps })
+    }
+    if (firstErase) {
+        const late = new Set(['erase_disk', 'confirm_erase', 'cancel_erase', 'install_app', 'start_after_install', 'stay_on_disk'])
+        const es = idxs(steps, (a, i) => i + 1 >= firstErase && late.has(a))
+        out.push({ role: 'erase', from: firstErase, to: es.at(-1)!, steps: es })
+    }
+    const bk = idxs(steps, a => a === 'make_backup_disk')
+    if (bk.length) {
+        const users = idxs(steps, (a, i) => i + 1 >= bk[0]! && ['make_backup_disk', 'backup_instance', 'restore_from_backup', 'backup_configured_restored'].includes(a))
+        out.push({ role: 'backup', from: bk[0]!, to: users.at(-1)!, steps: users })
+    }
+    const mv = idxs(steps, a => a === 'infra_move_disk')
+    if (mv.length) out.push({ role: 'move', from: mv[0]!, to: steps.length, steps: mv })
+    return out
+}
+
+export interface Stage2Conflict { kind: 'move-target' | 'overlap' | 'share' | 'never-move-to'; diskId: string; detail: string }
+
+/**
+ * Partition timeline verdict for a walk: [] = fits. Conflicts: a role on the move target (move-only),
+ * two roles on one partition whose windows overlap, a sequential share not in STAGE2_SEQUENTIAL_SHARES,
+ * a move target homed on a never-move-to Pi.
+ */
+export const stage2RoleTimeline = (
+    steps: readonly { action: string }[],
+    target: string = STAGE2_MOVE_TARGET_ID,
+    roleMap: Readonly<Record<Stage2Role, string>> = STAGE2_ROLE_MAP,
+): Stage2Conflict[] => {
+    const w = stage2RoleWindows(steps)
     const out: Stage2Conflict[] = []
-    steps.forEach((s, i) => {
-        if (s.action !== 'infra_move_disk') return
-        const moveStep = i + 1
-        let heldUntil = moveStep
-        steps.forEach((t, j) => { if (j > i && MOVED_APP_USERS.includes(t.action)) heldUntil = j + 1 })
-        if (!role) return
-        const firstFiles = steps.findIndex(x => x.action === 'make_files_disk')
-        steps.forEach((t, j) => {
-            const n = j + 1
-            if (n <= moveStep || n > heldUntil) return
-            const lateInstall = role === 'erase' && t.action === 'install_app' && firstFiles >= 0 && j > firstFiles
-            if (ROLE_USERS[role].includes(t.action) || lateInstall) out.push({ role, diskId: target, moveStep, roleStep: n, action: t.action, heldUntil })
-        })
-    })
+    const mv = w.find(x => x.role === 'move')
+    const host = STAGE2_FIXTURES.find(f => f.diskId === target)?.host
+    if (mv && host && (STAGE2_NEVER_MOVE_TO as readonly string[]).includes(host)) {
+        out.push({ kind: 'never-move-to', diskId: target, detail: `move target ${target} is on ${host} — never move onto ${host}` })
+    }
+    const roles = w.filter(x => x.role !== 'move') as (Stage2Window & { role: Stage2Role })[]
+    for (const r of roles) {
+        if (mv && roleMap[r.role] === target) {
+            out.push({ kind: 'move-target', diskId: target, detail: `${r.role} role uses the move-only target ${target} at @${r.steps.join(',@')} (move @${mv.from} holds it until @${mv.to})` })
+        }
+    }
+    for (let i = 0; i < roles.length; i++) for (let j = i + 1; j < roles.length; j++) {
+        const [a, b] = [roles[i]!, roles[j]!]
+        if (roleMap[a.role] !== roleMap[b.role]) continue
+        const [first, second] = a.from <= b.from ? [a, b] : [b, a]
+        if (second.from <= first.to) {
+            out.push({ kind: 'overlap', diskId: roleMap[a.role], detail: `${first.role} @${first.from}–@${first.to} and ${second.role} @${second.from}–@${second.to} overlap on ${roleMap[a.role]}` })
+        } else if (!STAGE2_SEQUENTIAL_SHARES.some(([x, y]) => x === first.role && y === second.role)) {
+            out.push({ kind: 'share', diskId: roleMap[a.role], detail: `${first.role} then ${second.role} share ${roleMap[a.role]} (not an allowed sequential share)` })
+        }
+    }
     return out
 }
 
 export const describeStage2Conflicts = (c: Stage2Conflict[]): string =>
-    c.length
-        ? `move target ${c[0]!.diskId} (${c[0]!.role} role) holds the moved app from infra_move_disk@${c[0]!.moveStep} ` +
-          `until @${c[0]!.heldUntil}, but the ${c[0]!.role} role needs it at ${c.map(x => `@${x.roleStep} ${x.action}`).join(', ')} — ` +
-          `the move target must not be a role disk`
-        : 'move target fits'
+    c.length ? `role/move-target timeline: ${c.map(x => x.detail).join('; ')}` : 'role/move-target timeline fits'
+
+/** Human summary of the windows (evidence / duration_start). */
+export const describeStage2Windows = (steps: readonly { action: string }[]): string =>
+    stage2RoleWindows(steps).map(x => `${x.role}=${x.role === 'move' ? STAGE2_MOVE_TARGET_ID : STAGE2_ROLE_MAP[x.role]}@${x.from}–@${x.to}`).join(' ')
+
+// ── Whole-SSD eject vs sibling partitions ───────────────────────────────────
+
+/** Steps whose fixture work is whole-SSD AND re-docks inside the same step (the walk never sees a half-ejected SSD). */
+export const STAGE2_SSD_LEVEL_REDOCK_IN_STEP = ['infra_reboot_engine', 'reboot_engine'] as const
+
+/**
+ * A whole-SSD eject takes BOTH partitions of that SSD offline. Walk steps may only use whole-SSD
+ * verbs when they re-dock before the step ends (reboot types: redockAfterBoot inside the step), so
+ * no later step can depend on a sibling partition of an ejected SSD. Returns problems ([] = fits).
+ */
+export const stage2WholeSsdProblems = (steps: readonly { action: string }[]): string[] =>
+    steps.flatMap((s, i) => {
+        const lvl = STAGE2_DOCK_SPLIT[s.action]?.level
+        if (lvl !== 'ssd') return []
+        if ((STAGE2_SSD_LEVEL_REDOCK_IN_STEP as readonly string[]).includes(s.action)) return []
+        return [`@${i + 1} ${s.action} is whole-SSD without an in-step redock — both partitions of that SSD would stay offline`]
+    })
 
 // ── Stage 2 preflight verdict (pure) ────────────────────────────────────────
 
@@ -412,6 +526,12 @@ export const stage2Preflight = (i: Stage2PreflightInput): Stage2PreflightResult 
         if (st.host !== h) problems.push(`${h}: stage2-dock reports host '${st.host}'`)
         if (h === 'idea03' && !st.ugreenDetached) problems.push(`idea03: Ugreen hw-roundtrip stick not detached in software (would mount as an App Disk)`)
         if (st.extraSdDisks.length) problems.push(`${h}: unexpected sd disks besides root + fixture SSD: ${st.extraSdDisks.join(', ')}`)
+        const pins = cfg instanceof Error || !cfg ? [] : stage2PinReport(cfg)
+        if (pins.length) table.push(`${h} pins: ${pins.join(', ')}`)
+        // stage2-dock.sh rows that are not READY fixtures (e.g. 82aeaa5's IDEA-MOVE001/IDEA-SPARE001) must be absent.
+        for (const x of st.fixtures) {
+            if (!STAGE2_FIXTURES.some(f => f.partLabel === x.partLabel) && x.present) problems.push(`${h}: ${x.partLabel} is present but is not a READY fixture`)
+        }
         const mine = stage2FixturesOn(h)
         const parentOfSsd = new Map<number, Set<string>>()
         for (const f of mine) {
@@ -468,6 +588,7 @@ export const stage2Preflight = (i: Stage2PreflightInput): Stage2PreflightResult 
     if (i.steps) {
         const c = stage2RoleTimeline(i.steps)
         if (c.length) problems.push(describeStage2Conflicts(c))
+        problems.push(...stage2WholeSsdProblems(i.steps))
     }
     const ok = problems.length === 0
     return { ok, problems, table, message: ok ? `stage2 preflight OK: ${table.join(' | ')}` : `stage2 preflight FAILED: ${problems.join(' | ')}` }
@@ -480,7 +601,7 @@ export interface Stage2Gap { action: string; semantics: string; reason: string }
 export const STAGE2_GAPS: readonly Stage2Gap[] = [
     {
         action: 'infra_move_disk',
-        semantics: 'network copy: source partition exported (stage2-dock.sh export) and imported into the dedicated move target duration-empty-004 (idea04 SSD2 p1); the SSD itself never changes hosts',
+        semantics: 'network copy: source partition exported (stage2-dock.sh export) and imported into the move-only target duration-empty-003 (idea04 p2, IDEA-EMPTY003); the SSD itself never changes hosts',
         reason: 'no hands to move a real SSD between Pis (PLAN §3 / D7); physical move = Stage 3 (USB switch)',
     },
 ]
@@ -498,8 +619,9 @@ export const stage2SummaryFields = (steps: readonly { action: string }[] | null)
     stage2NotCovered: steps ? stage2NotCovered(steps) : [],
 })
 
-/** Network-copy target for a move: always the configured Empty on idea04 (Steve), never the source. */
+/** Network-copy target for a move: always the move-only Empty on idea04 (READY §4.4), never the source, never idea01. */
 export const stage2MoveTargetPartition = (toHost: string, sourceDiskId: string): Stage2Fixture => {
+    if ((STAGE2_NEVER_MOVE_TO as readonly string[]).includes(toHost)) throw new Error(`Stage 2 move_disk: never move onto ${toHost} (READY §4.4)`)
     if (toHost !== STAGE2_MOVE_TARGET_HOST) throw new Error(`Stage 2 move_disk: target must be ${STAGE2_MOVE_TARGET_HOST} (got ${toHost}); ${sourceDiskId} cannot be network-copied elsewhere`)
     const f = stage2Fixture(STAGE2_MOVE_TARGET_ID)
     if (f.diskId === sourceDiskId) throw new Error(`Stage 2 move_disk: ${sourceDiskId} is the move target itself`)
@@ -515,10 +637,10 @@ export const STAGE2_DOCK_SPLIT: Record<string, { level: 'partition' | 'ssd' | 'n
     infra_undock_fixtures: { level: 'partition', verbs: 'Engine eject → undock' },
     enter_infra_fleet_walk: { level: 'partition', verbs: 'Engine eject → undock (unless preserveDockedOnReturn)' },
     return_to_start: { level: 'partition', verbs: 'Engine eject → undock (unless preserveDockedOnReturn)' },
-    infra_move_disk: { level: 'partition', verbs: 'Engine eject source + move target → reset target → export | import → undock source → dock target' },
-    install_app: { level: 'partition', verbs: 'empty-002 fresh: Engine eject → reset → dock (re-add cycle)' },
+    infra_move_disk: { level: 'partition', verbs: 'Engine eject source + move target empty-003 → reset empty-003 → export | import → undock source → dock empty-003 (sibling empty-002 stays mounted)' },
+    install_app: { level: 'partition', verbs: 'erase disk (empty-001) fresh before a 2nd late install: Engine eject → reset → dock (re-add cycle)' },
     make_files_disk: { level: 'partition', verbs: 'empty-001 fresh: Engine eject → reset → dock (re-add cycle)' },
-    erase_disk: { level: 'partition', verbs: 'empty-002 fresh after/before erase: Engine eject → reset → dock (re-add cycle)' },
+    erase_disk: { level: 'partition', verbs: 'erase disk (empty-001) fresh before the first erase (Files role done) and after/before erase: Engine eject → reset → dock (re-add cycle)' },
     add_files_role: { level: 'partition', verbs: 'add-files home dock if absent' },
     eject_disk: { level: 'none', verbs: 'Console/Engine eject only (Intent); no device change' },
     infra_reboot_engine: { level: 'ssd', verbs: 'after boot: status (bootId) → dock-ssd --ssd <fixture> for each SSD whose partitions are all missing → re-apply partition state' },

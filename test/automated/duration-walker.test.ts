@@ -2598,7 +2598,7 @@ describe('r29 FAIL@97: follow the store host for Kolibri/NC sidecars; restore mu
         await withEnv({}, async () => {
             const ops = await r29Fleet('idea01')
             const ctx = ctxFor(ops, 'idea03', 'restore_from_backup') as any
-            expect(await locateInstanceEngine(ctx, 'kolibri-grade5a-001', KOLIBRI)).toEqual({ engine: 'idea01', diskId: KOLIBRI, live: true })
+            expect(await locateInstanceEngine(ctx, 'kolibri-grade5a-001', KOLIBRI)).toEqual({ engine: 'idea01', diskId: KOLIBRI, live: true, status: 'Running' }) // + store status (Stage 2 owner check)
             await ops.undockFixtures(['idea01'], KOLIBRI)
             expect((await locateInstanceEngine(ctx, 'kolibri-grade5a-001', KOLIBRI)).engine).toBeNull()
             const golden = Object.assign(Object.create(ops), {

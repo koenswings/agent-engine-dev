@@ -211,7 +211,8 @@ const settleParticipants = async (ctx: ActionContext, engines: string[]): Promis
 export const waitEmpty002PostInstallRunning = async (
     ctx: ActionContext,
 ): Promise<string> => {
-    const diskId = DURATION_UI_FIXTURES.empty2.diskId
+    // Stage 1: duration-empty-002; Stage 2: the erase role's partition (READY: empty-001).
+    const diskId = eraseDiskTargetId()
     const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
     if (pool.length === 0) {
         return 'post-install settle skipped (no pool engines)'
@@ -431,7 +432,8 @@ const redockEmpty002Fresh = async (
     noteSuffix: string,
     opts?: { purgeStoreInstances?: boolean },
 ): Promise<string> => {
-    const note = await redockEmptyFresh(ctx, DURATION_UI_FIXTURES.empty2.diskId, label, noteSuffix, opts)
+    // Stage 1: duration-empty-002; Stage 2: the erase role's partition (eraseDiskTargetId, READY: empty-001).
+    const note = await redockEmptyFresh(ctx, eraseDiskTargetId(), label, noteSuffix, opts)
     // idea#168: empty-002 is a fresh Empty pack again.
     ctx.walker.empty002HoldsApp = false
     return note
@@ -501,6 +503,27 @@ export const redockEmpty001BeforeMakeFiles = async (ctx: ActionContext): Promise
         `before make_files_disk (Console engine ${target}; Empty fresh pack + store purge; createFilesDisk-clean)`,
         { purgeStoreInstances: true, targetEngine: target },
     )
+}
+
+/**
+ * Stage 2 (READY §4.4): Files and Erase share duration-empty-001 SEQUENTIALLY (only three Empties,
+ * empty-003 is move-only). Before erase_disk, if the erase partition is not Empty (it is still the
+ * Files Disk from make_files_disk@91), re-dock it FRESH: Engine eject → stage2-dock.sh reset → dock,
+ * plus a store purge. Returns null when not Stage 2, or the disk is already Empty (no-op).
+ */
+export const stage2RedockSharedEraseDisk = async (ctx: ActionContext): Promise<string | null> => {
+    if (!isStage2(ctx)) return null
+    const diskId = eraseDiskTargetId()
+    const home = stage2HomeOf(diskId)
+    const st = diskEmptiness(await ctx.opts.ops.readStore(home), diskId)
+    if (st.empty && st.dockedTo === home) return null
+    const note = await redockEmpty002Fresh(
+        ctx,
+        'stage2RedockSharedEraseDisk',
+        `before erase_disk (Stage 2 Files→Erase share; was ${describeDisk(st)}; fresh reset + store purge)`,
+        { purgeStoreInstances: true },
+    )
+    return note
 }
 
 /**
@@ -949,6 +972,18 @@ const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
     }
     await settleParticipants(ctx, ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e)))
     const sibMsg = siblings.length ? ` (+ ${siblings.join(', ')})` : ''
+    if (isStage2(ctx)) {
+        // Stage 2: per-Pi URLs + ports from the store (Kolibri idea01:18080, Nextcloud idea03:61820),
+        // each pointing at its own fixture's Pi — never the Console engine, never "any Pi".
+        const urls = await resyncFixtureSidecarUrlsFromStore(ctx, process.env, { ownerCheck: false })
+        const ncReady = await maybeWaitNextcloudAfterDock(ctx, stage2HomeOf(DURATION_UI_FIXTURES.nextcloud.diskId))
+        return {
+            ok: true,
+            message: `docked ${ctx.fixtureDisk}${sibMsg} on ${engine} (Stage 2 homes); ${urls}${ncReady ? `; ${ncReady}` : ''}`,
+            dockedEngine: engine,
+            layer: 'infra',
+        }
+    }
     const kolibriUrl = syncKolibriSidecarUrlForEngine(engine, hostMapFromOps(ctx.opts.ops))
     const ncReady = await maybeWaitNextcloudAfterDock(ctx, engine)
     const ncMsg = ncReady ? `; ${ncReady}` : ''
@@ -972,10 +1007,12 @@ export const syncKolibriSidecarUrlForEngine = (
     engineId: string,
     hosts: Record<string, string> | undefined,
     env: NodeJS.ProcessEnv = process.env,
+    /** Stage 2: the instance's published port from the store (env DURATION_KOLIBRI_PORT still wins). */
+    storePort?: number,
 ): string => {
     const authority = (hosts?.[engineId]?.trim() || engineId).replace(/\/$/, '')
     const portRaw = env.DURATION_KOLIBRI_PORT?.trim()
-    const port = portRaw && /^\d+$/.test(portRaw) ? portRaw : '18080'
+    const port = portRaw && /^\d+$/.test(portRaw) ? portRaw : storePort ? String(storePort) : '18080'
     const url = `http://${authority}:${port}`
     env.DURATION_KOLIBRI_URL = url
     return url
@@ -993,6 +1030,8 @@ export const syncNextcloudSidecarUrlForEngine = (
     engineId: string,
     _hosts: Record<string, string> | undefined,
     env: NodeJS.ProcessEnv = process.env,
+    /** Stage 2: the instance's published port from the store (READY: nextcloud 61820). */
+    storePort?: number,
 ): string => {
     const existing = env.DURATION_NEXTCLOUD_URL?.trim()
     if (existing) {
@@ -1003,7 +1042,7 @@ export const syncNextcloudSidecarUrlForEngine = (
     // Logical engine id / hostname — not hosts[engineId] Tailscale IP (r17 FAIL@58).
     const authority = engineId.replace(/\/$/, '')
     const portRaw = env.DURATION_NEXTCLOUD_PORT?.trim()
-    const port = portRaw && /^\d+$/.test(portRaw) ? portRaw : '18280'
+    const port = portRaw && /^\d+$/.test(portRaw) ? portRaw : storePort ? String(storePort) : '18280'
     const url = `http://${authority}:${port}`
     env.DURATION_NEXTCLOUD_URL = url
     return url
@@ -1203,7 +1242,8 @@ const infraMoveDisk = async (ctx: ActionContext): Promise<ActionResult> => {
                 `(disk ${inst.diskId}), not target ${to}. No soft-pass.`,
         )
     }
-    const urls = await resyncFixtureSidecarUrlsFromStore(ctx)
+    // Owner check deferred to the next sidecar-settle Intent (the moved instance may still be starting).
+    const urls = await resyncFixtureSidecarUrlsFromStore(ctx, process.env, { ownerCheck: false })
     const moveMsg =
         from === to
             ? `re-docked on sole pool engine ${to}`
@@ -1226,10 +1266,12 @@ export const locateInstanceEngine = async (
     ctx: ActionContext,
     instanceId: string,
     fallbackDiskId: string,
-): Promise<{ engine: string | null; diskId: string; live: boolean }> => {
+): Promise<{ engine: string | null; diskId: string; live: boolean; port?: number; status?: string }> => {
     const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
     let diskId = fallbackDiskId
     let live = false
+    let port: number | undefined
+    let status: string | undefined
     for (const eng of pool) {
         try {
             const view = await ctx.opts.ops.readStore(eng)
@@ -1237,6 +1279,8 @@ export const locateInstanceEngine = async (
             if (inst?.diskId && inst.status !== 'Undocked') {
                 diskId = inst.diskId
                 live = true
+                port = inst.port
+                status = inst.status
                 break
             }
         } catch {
@@ -1245,7 +1289,7 @@ export const locateInstanceEngine = async (
     }
     const engine = await locateDockedEngine(ctx, diskId)
     if (!engine || ctx.excludeEngines.includes(engine)) return { engine: null, diskId, live: false }
-    return { engine, diskId, live }
+    return { engine, diskId, live, ...(port ? { port } : {}), ...(status ? { status } : {}) }
 }
 
 /** Intents whose Console implementation polls a sidecar URL after Confirm. */
@@ -1277,7 +1321,10 @@ const isHarnessManagedUrl = (
 export const resyncFixtureSidecarUrlsFromStore = async (
     ctx: ActionContext,
     env: NodeJS.ProcessEnv = process.env,
+    /** Stage 2 sidecar-owner check (docker publishes the port). Off right after a dock (containers still starting). */
+    opts: { ownerCheck?: boolean } = {},
 ): Promise<string> => {
+    const ownerCheck = opts.ownerCheck ?? true
     const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
     const hosts = hostMapFromOps(ctx.opts.ops)
     const notes: string[] = []
@@ -1287,10 +1334,13 @@ export const resyncFixtureSidecarUrlsFromStore = async (
         (/kolibri/i.test(ctx.fixtureDisk) ? ([ctx.fixtureDisk, ctx.fixtureInstance] as const) : undefined)
     if (kolibri) {
         const [diskId, instId] = kolibri
-        const { engine } = await locateInstanceEngine(ctx, instId, diskId)
+        const { engine, port, status } = await locateInstanceEngine(ctx, instId, diskId)
         const prev = env.DURATION_KOLIBRI_URL
         if (engine) {
-            const url = syncKolibriSidecarUrlForEngine(engine, hosts, env)
+            // Stage 2: the store's port (a Kolibri moved to idea04 cannot use :18080 — idea04's own
+            // native Kolibri holds it) + the sidecar-owner check (never an "any Pi answers" probe).
+            const url = syncKolibriSidecarUrlForEngine(engine, hosts, env, isStage2(ctx) ? port : undefined)
+            if (isStage2(ctx) && ownerCheck) notes.push(await stage2SidecarOwnerNote(ctx, engine, instId, port, status))
             notes.push(
                 `DURATION_KOLIBRI_URL=${url} (store: ${instId} on ${engine}` +
                     `${prev && prev.replace(/\/$/, '') !== url ? `; was ${prev}` : ''})`,
@@ -1302,11 +1352,13 @@ export const resyncFixtureSidecarUrlsFromStore = async (
     const nc = entries.find(([d]) => /nextcloud/i.test(d))
     if (nc) {
         const [diskId, instId] = nc
-        const { engine } = await locateInstanceEngine(ctx, instId, diskId)
+        const { engine, port: storePort, status: ncStatus } = await locateInstanceEngine(ctx, instId, diskId)
         const prev = env.DURATION_NEXTCLOUD_URL
         if (engine && isHarnessManagedUrl(prev, pool, hosts)) {
             const portRaw = env.DURATION_NEXTCLOUD_PORT?.trim()
-            const port = portRaw && /^\d+$/.test(portRaw) ? portRaw : '18280'
+            // Stage 2: the store's port (READY: 61820 on idea03; 18280 is idea166's NC, not the fixture).
+            const port = portRaw && /^\d+$/.test(portRaw) ? portRaw : isStage2(ctx) && storePort ? String(storePort) : '18280'
+            if (isStage2(ctx) && ownerCheck) notes.push(await stage2SidecarOwnerNote(ctx, engine, instId, storePort, ncStatus))
             // Logical hostname, not Tailscale IP (NC trusted_domains, r17 FAIL@58).
             const url = `http://${engine}:${port}`
             env.DURATION_NEXTCLOUD_URL = url
@@ -1319,6 +1371,28 @@ export const resyncFixtureSidecarUrlsFromStore = async (
         }
     }
     return notes.join('; ')
+}
+
+/**
+ * Stage 2: prove the sidecar URL hits THIS instance's container on THIS Pi (docker publishes
+ * `:<port>->` on an inst-* container), never "some Pi answers": idea04's native Kolibri also
+ * answers :18080. Throws (loud fail) on a mismatch; non-Stage2FleetOps ops → note only.
+ */
+export const stage2SidecarOwnerNote = async (
+    ctx: ActionContext,
+    engine: string,
+    instanceId: string,
+    port: number | undefined,
+    /** Store status; the check runs only for Running instances (a stopped one publishes nothing). */
+    status?: string,
+): Promise<string> => {
+    if (status !== undefined && status !== 'Running') return `sidecar owner check skipped (${instanceId} ${status} on ${engine})`
+    const ops = ctx.opts.ops as FleetOps & { verifySidecarOwner?: (e: string, i: string, p: number) => Promise<string[]> }
+    if (!port) throw new Error(`Stage 2: ${instanceId} on ${engine} has no port in the store — cannot pin its sidecar URL`)
+    if (typeof ops.verifySidecarOwner !== 'function') return `sidecar owner check skipped (${engine}:${port}, no Stage2FleetOps)`
+    // verifySidecarOwner throws when no container of this instance publishes :port on this Pi.
+    const owners = await ops.verifySidecarOwner(engine, instanceId, port)
+    return `sidecar owner OK ${instanceId} → ${engine}:${port} (${owners.join(', ')})`
 }
 
 export type DurationOperationRow = {
@@ -2726,6 +2800,10 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     if (ctx.action === 'make_backup_disk' || ctx.action === 'erase_disk') {
         const target = ctx.action === 'make_backup_disk' ? backupDiskTargetId() : eraseDiskTargetId()
         try {
+            if (ctx.action === 'erase_disk') {
+                const fresh = await stage2RedockSharedEraseDisk(ctx)
+                if (fresh) preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${fresh}` : fresh
+            }
             const note = await pinEmptyDiskForIntent(ctx, driver, target, ctx.action)
             if (note !== null) {
                 pinnedEmptyId = target
@@ -2778,9 +2856,11 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             const notes = [backupPre.note]
             if (backupPre.movedTo) {
                 backupDockedEngine = backupPre.movedTo
-                const urls = await resyncFixtureSidecarUrlsFromStore(ctx).catch(
-                    e => `sidecar URL resync failed: ${e instanceof Error ? e.message : String(e)}`,
-                )
+                const urls = await resyncFixtureSidecarUrlsFromStore(ctx).catch(e => {
+                    // Stage 2: a wrong-owner sidecar is a loud failure (no soft-pass).
+                    if (isStage2(ctx)) throw e
+                    return `sidecar URL resync failed: ${e instanceof Error ? e.message : String(e)}`
+                })
                 if (urls) notes.push(urls)
             }
             preStartSettleNote = [preStartSettleNote, ...notes].filter(Boolean).join('; ')
@@ -2834,6 +2914,8 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             if (note) preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${note}` : note
         } catch (e) {
             const err = e instanceof Error ? e.message : String(e)
+            // Stage 2: the sidecar must be proven on its own Pi (no soft-pass).
+            if (isStage2(ctx)) return { ok: false, message: `${ctx.action} aborted before Intent: ${err}`, layer }
             preStartSettleNote = `${preStartSettleNote ? `${preStartSettleNote}; ` : ''}sidecar URL resync failed: ${err}`
         }
     }
