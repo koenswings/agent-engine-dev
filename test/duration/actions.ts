@@ -931,10 +931,33 @@ const infraUndockFixtures = async (ctx: ActionContext): Promise<ActionResult> =>
 const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
     // Prefer Atlas/Kid pre-docked engine (Path A) — RealFleetOps.findDockedEngine when live.
     const opsAny = ctx.opts.ops as FleetOps & { findDockedEngine?: (diskId: string) => Promise<string | null> }
+    let notDocked: string[] = []
     if (typeof opsAny.findDockedEngine === 'function') {
+        const usable = (e: string | null): e is string => !!e && !ctx.excludeEngines.includes(e)
         const existing = await opsAny.findDockedEngine(ctx.fixtureDisk)
-        if (existing && !ctx.excludeEngines.includes(existing)) {
+        // r53 FAIL@58 (Stage 2): Kolibri was still docked on idea01, but eject_disk@45 had ejected
+        // Nextcloud on idea03; the shortcut returned "already docked (no-op)" and then waited 420 s for a
+        // Nextcloud nobody re-docked. Stage 2: the shortcut holds only when EVERY fixture is docked;
+        // otherwise fall through to the per-Pi Stage 2 dock path below (each fixture on its home Pi).
+        if (usable(existing) && isStage2(ctx)) {
+            for (const d of ctx.fixtureDisks) {
+                if (d === ctx.fixtureDisk) continue
+                if (!usable(await opsAny.findDockedEngine(d))) notDocked.push(d)
+            }
+        }
+        if (usable(existing) && notDocked.length === 0) {
             await settleParticipants(ctx, ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e)))
+            if (isStage2(ctx)) {
+                // Stage 2: URLs from the store; Nextcloud is waited on ITS home Pi (not Kolibri's engine).
+                const urls = await resyncFixtureSidecarUrlsFromStore(ctx, process.env, { ownerCheck: false })
+                const ncReady = await maybeWaitNextcloudAfterDock(ctx, stage2HomeOf(DURATION_UI_FIXTURES.nextcloud.diskId))
+                return {
+                    ok: true,
+                    message: `all fixtures already docked (${ctx.fixtureDisks.join(', ')}; ${ctx.fixtureDisk} on ${existing}) — no-op (Stage 2); ${urls}${ncReady ? `; ${ncReady}` : ''}`,
+                    dockedEngine: existing,
+                    layer: 'infra',
+                }
+            }
             const kolibriUrl = syncKolibriSidecarUrlForEngine(existing, hostMapFromOps(ctx.opts.ops))
             const ncReady = await maybeWaitNextcloudAfterDock(ctx, existing)
             const ncMsg = ncReady ? `; ${ncReady}` : ''
@@ -944,6 +967,9 @@ const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
                 dockedEngine: existing,
                 layer: 'infra',
             }
+        }
+        if (notDocked.length) {
+            console.log(`[duration] stage2 infra_dock_fixture: ${notDocked.join(', ')} not docked → per-Pi Stage 2 dock path (no already-docked shortcut)`)
         }
     }
     // Path A re-dock after undock: prefer Console host pool[0] (idea01), never RNG —
@@ -964,11 +990,24 @@ const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
         engine = pickPoolEngine(ctx)
     }
     assertNotGolden(ctx, engine, 'infra_dock_fixture')
-    await ctx.opts.ops.dockFixture(engine, ctx.fixtureDisk)
+    // Stage 2: a fixture network-copied to the move target (store holder ≠ its home) stays there —
+    // docking its home partition too would give two partitions one diskId (Stage2FleetOps refuses).
+    const movedCopyOn = async (diskId: string): Promise<string | null> => {
+        if (!isStage2(ctx) || typeof opsAny.findDockedEngine !== 'function') return null
+        const on = await opsAny.findDockedEngine(diskId)
+        return on && on !== stage2HomeOf(diskId) && !ctx.excludeEngines.includes(on) ? on : null
+    }
+    const kept: string[] = []
+    const dockOne = async (target: string, diskId: string) => {
+        const on = await movedCopyOn(diskId)
+        if (on) kept.push(`${diskId} stays on ${on} (moved copy)`)
+        else await ctx.opts.ops.dockFixture(target, diskId)
+    }
+    await dockOne(engine, ctx.fixtureDisk)
     // Sibling fixtures (nextcloud) on the same engine so inventory sees both packs.
     const siblings = ctx.fixtureDisks.filter(d => d !== ctx.fixtureDisk)
     for (const diskId of siblings) {
-        await ctx.opts.ops.dockFixture(stage2HomeOr(ctx, diskId, engine), diskId)
+        await dockOne(stage2HomeOr(ctx, diskId, engine), diskId)
     }
     await settleParticipants(ctx, ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e)))
     const sibMsg = siblings.length ? ` (+ ${siblings.join(', ')})` : ''
@@ -979,7 +1018,10 @@ const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
         const ncReady = await maybeWaitNextcloudAfterDock(ctx, stage2HomeOf(DURATION_UI_FIXTURES.nextcloud.diskId))
         return {
             ok: true,
-            message: `docked ${ctx.fixtureDisk}${sibMsg} on ${engine} (Stage 2 homes); ${urls}${ncReady ? `; ${ncReady}` : ''}`,
+            message:
+                `docked ${ctx.fixtureDisk}${sibMsg} on ${engine} (Stage 2 homes)` +
+                `${notDocked.length ? ` [was not docked: ${notDocked.join(', ')}]` : ''}` +
+                `${kept.length ? ` [${kept.join('; ')}]` : ''}; ${urls}${ncReady ? `; ${ncReady}` : ''}`,
             dockedEngine: engine,
             layer: 'infra',
         }
@@ -1199,7 +1241,8 @@ const hostMapFromOps = (ops: FleetOps): Record<string, string> | undefined => {
 }
 
 const infraMoveDisk = async (ctx: ActionContext): Promise<ActionResult> => {
-    const from = ctx.walker.dockedEngine ?? pickPoolEngine(ctx)
+    // Stage 2: the source is where the STORE has the fixture docked, never walker state / RNG.
+    const from = isStage2(ctx) ? await stage2MoveSource(ctx) : ctx.walker.dockedEngine ?? pickPoolEngine(ctx)
     assertNotGolden(ctx, from, 'infra_move_disk(from)')
     // Stage 2 (Steve): the move target is always idea04 (network copy into its move-target partition).
     const to = isStage2(ctx) ? STAGE2_MOVE_TARGET_HOST : pickPoolEngine(ctx, from)
@@ -1207,6 +1250,10 @@ const infraMoveDisk = async (ctx: ActionContext): Promise<ActionResult> => {
     // idea#168 r35@62: the move duration is logged explicitly (success and failure).
     const moveStartedAt = Date.now()
     try {
+        if (from === to && isStage2(ctx)) {
+            // Stage 2: "already on the move target" is not a move — the walk needs the real network copy.
+            throw new Error(`Stage 2: ${ctx.fixtureDisk} is already docked on the move target ${to} — refusing a no-op move`)
+        }
         if (from === to) {
             // Single-engine pool: treat as re-dock settle (document limitation).
             await ctx.opts.ops.dockFixture(to, ctx.fixtureDisk)
@@ -1254,6 +1301,18 @@ const infraMoveDisk = async (ctx: ActionContext): Promise<ActionResult> => {
         dockedEngine: to,
         layer: 'infra',
     }
+}
+
+/** Stage 2 infra_move_disk source: the store holder of the fixture disk (fail loud when undocked / excluded). */
+const stage2MoveSource = async (ctx: ActionContext): Promise<string> => {
+    const holder = await locateDockedEngine(ctx, ctx.fixtureDisk)
+    if (!holder || ctx.excludeEngines.includes(holder) || isNeverEngine(holder)) {
+        throw new Error(
+            `infra_move_disk (Stage 2): ${ctx.fixtureDisk} is not docked on a pool engine (store: ${holder ?? 'none'}; ` +
+                `walker said ${ctx.walker.dockedEngine ?? 'none'}) — nothing to copy from. No soft-pass.`,
+        )
+    }
+    return holder
 }
 
 /**

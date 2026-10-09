@@ -217,7 +217,13 @@ export class Stage2FleetOps extends RealFleetOps {
             throw new Error(`Stage 2: ${diskId} was network-copied to ${copyOn} (${stage2Fixture(copyOn).host}); docking the home partition too would give two partitions one diskId — refused`)
         }
         const already = await this.findDockedEngine(diskId)
-        if (already === engineId && f.diskTypes?.[0] !== 'empty') return
+        if (already === engineId && f.diskTypes?.[0] !== 'empty') {
+            // "Already docked" only when the Pi agrees: the store row AND the partition mounted there.
+            // A stale store row (or a Console eject the store has not caught up with) gets a real dock.
+            const p = this.partitionWith(await this.stage2Status(engineId), diskId)
+            if (p?.mounted) return
+            console.log(`[duration] stage2: store has ${diskId} docked on ${engineId} but ${p?.partLabel ?? 'its partition'} is not mounted → dock`)
+        }
         if (engineId !== f.host) {
             if (already && already !== engineId) return this.moveDisk(already, engineId, diskId)
             throw new Error(`Stage 2: ${diskId} lives on ${f.host}'s SSD; cannot dock it on ${engineId} (use infra_move_disk = network copy)`)
@@ -286,7 +292,8 @@ export class Stage2FleetOps extends RealFleetOps {
      * verbs only: the target's sibling (empty-002, Backup) stays mounted throughout.
      */
     override async moveDisk(fromEngine: string, toEngine: string, diskId: string): Promise<void> {
-        if (fromEngine === toEngine) return
+        // A same-Pi "move" is not a network copy — refuse instead of a silent no-op.
+        if (fromEngine === toEngine) throw new Error(`Stage 2 move_disk: ${diskId} ${fromEngine}→${toEngine} is not a move (same Pi) — refused`)
         stage2Fixture(diskId)
         const target = stage2MoveTargetPartition(toEngine, diskId)
         if (this.moveCopies.has(target.diskId)) throw new Error(`Stage 2 move_disk: move target ${target.diskId} already holds ${this.moveCopies.get(target.diskId)}`)

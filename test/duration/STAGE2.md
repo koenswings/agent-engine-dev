@@ -112,6 +112,17 @@ Why not rely on (c):
 
 It would catch an unplanned reboot and either recover or fail loud. It has not been exercised against a real reboot. The planned `reboot_engine` @128 (idea01) uses the same path and is the first real test of it.
 
+## No "already docked" shortcuts around the per-Pi paths (r53 FAIL@58)
+
+r53: `eject_disk@45` ejected Nextcloud on idea03; `infra_dock_fixture@58` saw Kolibri docked on idea01,
+returned "already docked (no-op)" and waited 420 s for a Nextcloud nobody re-docked. Now:
+
+- `infra_dock_fixture`: in Stage 2 the no-op holds only when EVERY fixture is docked; otherwise each
+  fixture is docked on its home Pi (a network-copied fixture stays on the move target).
+- `Stage2FleetOps.dockFixture`: "already docked" needs the store row AND the partition mounted on that Pi.
+- `infra_move_disk`: the Stage 2 source is the store holder (not walker state); undocked or already on
+  the move target fails loud. `Stage2FleetOps.moveDisk(x, x)` is refused instead of a silent no-op.
+
 ## Smoke (D9)
 
 `test/duration/stage2Smoke.ts` (idea04 only, empty-002/003). Phases:

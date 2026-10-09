@@ -8,7 +8,7 @@ import fs from 'node:fs'
 import { parse as parseYaml } from 'yaml'
 import { RealFleetOps } from '../duration/realFleetOps.js'
 import { allowedSequentialShare, backupDiskTargetId, eraseDiskTargetId, filesDiskTargetId, fixtureDiskPreflight } from '../duration/fixtureDisks.js'
-import { stage2RedockSharedEraseDisk, stage2SidecarOwnerNote, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine } from '../duration/actions.js'
+import { dispatchAction, stage2RedockSharedEraseDisk, stage2SidecarOwnerNote, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine } from '../duration/actions.js'
 import {
     EXIT_STAGE2_PREFLIGHT, PRODUCTION_EFFECTIVE, STAGE2_DOCK_SPLIT, STAGE2_FIXTURES, STAGE2_GAPS, STAGE2_MOVE_TARGET_ID, STAGE2_PINS,
     STAGE2_ROLE_MAP, buildEngineConfigProbe, buildStage2DockCmd, describeStage2Conflicts, describeStage2Windows, parseEngineConfigProbe,
@@ -467,7 +467,8 @@ describe('Stage2FleetOps', () => {
         expect(o.heldUndocked.has(K)).toBe(true)
         await expect(o.dockFixture('idea01', K)).rejects.toThrow(/two partitions one diskId/)
         await expect(o.dockFixture('idea04', E3)).rejects.toThrow(/holds the moved/)
-        await expect(o.moveDisk('idea04', 'idea04', AF)).resolves.toBeUndefined()
+        // r53 shortcut sweep: a same-Pi "move" is refused, never a silent no-op.
+        await expect(o.moveDisk('idea04', 'idea04', AF)).rejects.toThrow(/is not a move \(same Pi\) — refused/)
         await expect(o.moveDisk('idea03', 'idea01', NC)).rejects.toThrow(/never move onto idea01/)
     })
     it('eject-ssd takes both partitions offline: Engine-ejects both, then partition verbs on either are refused until dock-ssd', async () => {
@@ -566,5 +567,114 @@ describe('Stage 2 erase share + sidecar owner (actions)', () => {
         expect(await stage2SidecarOwnerNote(ctx, 'idea01', 'kolibri-grade5a-001', 18080, 'Stopped')).toMatch(/skipped/)
         owner.mockRejectedValueOnce(new Error('not served by'))
         await expect(stage2SidecarOwnerNote(ctx, 'idea04', 'kolibri-grade5a-001', 18080, 'Running')).rejects.toThrow(/not served by/)
+    })
+})
+
+// ── r53 FAIL@58: "already docked" shortcuts must not bypass the Stage 2 per-Pi paths ─────────
+const KI = 'kolibri-grade5a-001'
+const NI = 'nextcloud-grade5a-001'
+const NC_LOGIN = '<form><input name="user"><input name="password"><button type="submit">Log in</button></form>'
+/** Live-looking Stage2FleetOps (canned stage2-dock.sh) whose store view follows the canned dock map. */
+const liveCanned = () => {
+    quiet()
+    const o = mk()
+    const view = (): SemanticStoreView => ({
+        diskDB: Object.fromEntries(Object.entries(o.docked).map(([id, on]) => [id, { id, dockedTo: on, diskTypes: [...(STAGE2_FIXTURES.find(f => f.diskId === id)?.diskTypes ?? [])] }])),
+        instanceDB: {
+            [KI]: { id: KI, diskId: K, status: o.docked[K] ? 'Running' : 'Undocked', port: 18080 },
+            [NI]: { id: NI, diskId: NC, status: o.docked[NC] ? 'Running' : 'Undocked', port: 61820 },
+        },
+        engineDB: {},
+    } as unknown as SemanticStoreView)
+    vi.spyOn(o, 'readStore').mockImplementation(async () => view())
+    vi.spyOn(o, 'waitReady').mockResolvedValue({ wsUp: true } as never)
+    vi.spyOn(o, 'getStoreMode').mockReturnValue('unique' as never)
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(NC_LOGIN, { status: 200 })))
+    return o
+}
+const infraCtx = (o: CannedStage2, action: string, walkerEngine: string | null = 'idea01') => ({
+    action, from: 'infra_idle', to: 'infra_idle',
+    opts: { ops: o, fast: true, settleTimeoutMs: 50, rng: () => 0 },
+    walker: { dockedEngine: walkerEngine, step: 57 },
+    poolEngines: ['idea01', 'idea03', 'idea04'], excludeEngines: ['idea02'],
+    fixtureDisk: K, fixtureInstance: KI, fixtureDisks: [K, NC], fixtureInstances: { [K]: KI, [NC]: NI },
+}) as never
+
+describe('r53: Stage 2 already-docked shortcuts', () => {
+    const saved = { ...process.env }
+    afterEach(() => {
+        vi.restoreAllMocks(); vi.unstubAllGlobals()
+        for (const k of ['DURATION_NEXTCLOUD_URL', 'DURATION_KOLIBRI_URL', 'DURATION_NEXTCLOUD_PORT', 'DURATION_KOLIBRI_PORT', 'DURATION_NEXTCLOUD_READY_MS']) {
+            if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]
+        }
+    })
+    it('r53 replay: eject_disk@45 ejects Nextcloud on idea03, then infra_dock_fixture@58 re-docks it through the per-Pi path', async () => {
+        const o = liveCanned()
+        o.docked[NC] = null // Console eject: store undocked, partition present but unmounted on idea03
+        const r = await dispatchAction(infraCtx(o, 'infra_dock_fixture'))
+        expect(r.ok).toBe(true)
+        // d26f4e2: calls = [] ("fixture … already docked on idea01 (no-op)") and a 420 s wait for Nextcloud.
+        expect(o.calls).toEqual([`idea03 dock ${NC}`])
+        expect(o.docked[NC]).toBe('idea03')
+        expect(o.docked[K]).toBe('idea01')
+        expect(r.message).toMatch(/docked duration-kolibri-grade5a-001 \(\+ duration-nextcloud-grade5a-001\) on idea01 \(Stage 2 homes\) \[was not docked: duration-nextcloud-grade5a-001\]/)
+        expect(r.message).toMatch(/DURATION_NEXTCLOUD_URL=http:\/\/idea03:61820/)
+        expect(r.dockedEngine).toBe('idea01')
+    })
+    it('all fixtures docked → still a no-op, Nextcloud waited on ITS home Pi (idea03)', async () => {
+        const o = liveCanned()
+        const r = await dispatchAction(infraCtx(o, 'infra_dock_fixture'))
+        expect(r.ok).toBe(true)
+        expect(o.calls).toEqual([])
+        expect(r.message).toMatch(/all fixtures already docked .* no-op \(Stage 2\)/)
+        expect(r.message).toMatch(/DURATION_NEXTCLOUD_URL=http:\/\/idea03:61820/)
+        expect(vi.mocked(fetch).mock.calls[0]![0]).toBe('http://idea03:61820/login')
+    })
+    it('Kolibri undocked too (r52-style undock) → both re-docked on their homes', async () => {
+        const o = liveCanned()
+        await o.undockFixtures(['idea01', 'idea03', 'idea04'], K)
+        o.docked[NC] = null
+        o.calls = []
+        const r = await dispatchAction(infraCtx(o, 'infra_dock_fixture', null))
+        expect(r.ok).toBe(true)
+        expect(o.calls).toEqual([`idea01 dock ${K}`, `idea03 dock ${NC}`])
+    })
+    it('a moved copy stays on the move target; only the missing home fixture is docked', async () => {
+        const o = liveCanned()
+        await o.moveDisk('idea01', 'idea04', K)
+        o.docked[NC] = null
+        o.calls = []
+        const r = await dispatchAction(infraCtx(o, 'infra_dock_fixture', 'idea04'))
+        expect(r.ok).toBe(true)
+        expect(o.calls).toEqual([`idea03 dock ${NC}`])
+        expect(r.message).toMatch(/duration-kolibri-grade5a-001 stays on idea04 \(moved copy\)/)
+    })
+    it('Stage2FleetOps.dockFixture: store says docked but the partition is not mounted → real dock, not a no-op', async () => {
+        const o = liveCanned()
+        o.docked[NC] = null
+        const orig = o.findDockedEngine.bind(o)
+        vi.spyOn(o, 'findDockedEngine').mockImplementation(async d => (d === NC ? 'idea03' : orig(d))) // stale store row
+        await o.dockFixture('idea03', NC)
+        expect(o.calls).toEqual([`idea03 dock ${NC}`])
+        o.calls = []
+        await o.dockFixture('idea03', NC) // now mounted for real → no-op
+        expect(o.calls).toEqual([])
+    })
+    it('infra_move_disk (Stage 2): source = store holder, not stale walker state; network copy to idea04', async () => {
+        const o = liveCanned()
+        const r = await dispatchAction(infraCtx(o, 'infra_move_disk', 'idea03')) // walker stale (idea03)
+        expect(r.ok).toBe(true)
+        expect(o.calls).toContain(`RELAY idea01 export ${K} | idea04 import ${E3} --as ${K}`)
+        expect(r.dockedEngine).toBe('idea04')
+    })
+    it('infra_move_disk (Stage 2): fixture undocked or already on the move target → loud failure, no no-op', async () => {
+        const a = liveCanned()
+        a.docked[K] = null
+        await expect(dispatchAction(infraCtx(a, 'infra_move_disk'))).rejects.toThrow(/not docked on a pool engine .* No soft-pass/)
+        const b = liveCanned()
+        await b.moveDisk('idea01', 'idea04', K)
+        b.calls = []
+        await expect(dispatchAction(infraCtx(b, 'infra_move_disk', 'idea04'))).rejects.toThrow(/already docked on the move target idea04 — refusing a no-op move/)
+        expect(b.calls).toEqual([])
     })
 })
