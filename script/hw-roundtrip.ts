@@ -18,6 +18,16 @@
  *          re-plug → every ext4 partition docked exactly once again, with the same
  *          disk id, META.yaml id kept, one mount by source and target.
  *      Non-ext4 partitions on the stick are checked once: not mounted, no dock.
+ *   3. Disk ids per partition (idea#168 D4): the ext4 partitions of the test disk
+ *      have pairwise distinct disk ids (start and after every re-plug), and each
+ *      id is a fixed point of the Engine's rule (DiskIdentity.resolveHardwareDiskId
+ *      with the drive serial from readHardwareId and lsblk PARTUUIDs): re-resolving
+ *      the id in META.yaml gives the same id, so it cannot change on a later
+ *      dock. On a multi-partition drive with a hardware serial, every hardware id
+ *      except a legacy bare serial on the primary partition is <serial>-<PARTUUID>.
+ *      --require-multi-partition fails the run when the test disk has fewer than
+ *      two ext4 partitions or no hardware serial (Intenso / Samsung FIT), so a
+ *      PASS proves the multi-partition case.
  *
  * Usage (on the Pi, from any Engine checkout with node_modules):
  *   npx tsx script/hw-roundtrip.ts [options]
@@ -31,6 +41,7 @@
  *     --cycles <n>          eject + re-plug cycles (default 2)
  *     --method <m>          unplug simulation: unbind (default) | authorized
  *     --timeout <s>         per-step timeout in seconds (default 60)
+ *     --require-multi-partition  fail unless the disk has ≥2 ext4 partitions and a hardware serial (idea#168 D4)
  *
  * Root: only the unplug simulation (a write to /sys/bus/usb/...) needs root.
  * It runs as `sudo -n tee <sysfs file>` with the tester's own sudo; it is NOT
@@ -51,6 +62,8 @@ import path from 'path'
 import { spawn, ChildProcess } from 'child_process'
 import { fileURLToPath } from 'url'
 import { collectBlockFacts, loadExpectation, resolveStick } from './hw-roundtrip-guard.js'
+import { readHardwareId } from '../src/data/Meta.js'
+import { readPartitionFacts, resolveHardwareDiskId } from '../src/data/DiskIdentity.js'
 
 $.verbose = false
 
@@ -68,6 +81,7 @@ const ENGINE_LOG = opt('engine-log', path.join(os.homedir(), '.pm2/logs/engine-o
 const CYCLES = parseInt(opt('cycles', '2'), 10)
 const METHOD = opt('method', 'unbind')
 const TIMEOUT_MS = parseInt(opt('timeout', '60'), 10) * 1000
+const REQUIRE_MULTI = argv.includes('--require-multi-partition')
 const STICK_CONFIG = path.resolve(opt('stick-config', path.join(ROOT, 'script', 'hw-roundtrip-disks.json')))
 let DEVICE = ''
 
@@ -310,6 +324,33 @@ const systemChecks = async (when: string) => {
 
 interface Part { dev: string, uuid: string, diskId: string, name: string, metaId: string, fstype: string }
 
+const metaHwFlagOf = async (dev: string): Promise<boolean | undefined> => {
+    const v = (await sh(`grep -E '^isHardwareId:' /disks/${dev}/META.yaml | head -1 | sed 's/^isHardwareId:[[:space:]]*//'`)).trim()
+    return v === 'true' ? true : v === 'false' ? false : undefined
+}
+
+/** idea#168 D4: distinct ids per partition, each a fixed point of the Engine's id rule */
+const checkPartitionIds = async (parts: Part[], when: string) => {
+    const ids = parts.map(p => p.diskId)
+    check(new Set(ids).size === ids.length, `${when}: the ${parts.length} ext4 partition(s) of ${DEVICE} have distinct disk ids`, ids.join(', '))
+    const serial = await readHardwareId(parts[0].dev as any)
+    if (!serial) {
+        info(`${when}: no hardware serial for ${DEVICE} (not Intenso / Samsung FIT): ids are META-assigned, rule check skipped`)
+        if (REQUIRE_MULTI) check(false, `${when}: --require-multi-partition: ${DEVICE} has a hardware serial`)
+        return
+    }
+    if (REQUIRE_MULTI) check(parts.length >= 2, `${when}: --require-multi-partition: ${DEVICE} has ≥2 ext4 partitions`, `found ${parts.length}`)
+    for (const p of parts) {
+        const facts = await readPartitionFacts(p.dev as any)
+        const identity = { serial: String(serial), self: facts.self ?? { name: p.dev, partn: null, partuuid: null, fstype: 'ext4' }, siblings: facts.siblings }
+        const r = resolveHardwareDiskId({ diskId: p.metaId as any, isHardwareId: await metaHwFlagOf(p.dev) }, identity)
+        check(r.diskId === p.diskId, `${when}: ${p.dev} id ${p.diskId} is stable under the Engine's id rule (${r.decision})`, `rule gives ${r.diskId}`)
+        if (parts.length >= 2 && r.isHardwareId && r.decision !== 'keep-legacy') {
+            check(p.diskId === `${serial}-${(identity.self.partuuid ?? '').toLowerCase()}`, `${when}: ${p.dev} hardware id is <serial>-<PARTUUID>`, `id=${p.diskId} partuuid=${identity.self.partuuid}`)
+        }
+    }
+}
+
 const metaIdOf = async (dev: string) => (await sh(`grep -E '^diskId:' /disks/${dev}/META.yaml | head -1 | sed 's/^diskId:[[:space:]]*//'`)).replace(/['"]/g, '')
 
 const checkDocked = async (parts: Part[], when: string) => {
@@ -366,6 +407,7 @@ const roundTrip = async () => {
     info(`ext4 partitions (round-trip): ${parts.map(p => `${p.dev} '${p.name}' ${p.diskId} uuid=${p.uuid} meta=${p.metaId}`).join('; ')}`)
     if (nonExt4.length) info(`non-ext4 partitions (must stay unmounted, idea#134): ${nonExt4.map(p => `${p.dev} ${p.fstype || '?'}`).join('; ')}`)
     await checkDocked(parts, 'start')
+    await checkPartitionIds(parts, 'start')
     await checkNonExt4Unmounted(nonExt4, 'start')
 
     for (let c = 1; c <= CYCLES; c++) {
@@ -423,6 +465,7 @@ const roundTrip = async () => {
             if (off >= 0) check(addedLog.includes(`A disk on device /dev/engine/${d} has been added`), `cycle ${c}: Engine logged the add of ${d}`)
         }
         await checkDocked(parts, `cycle ${c} after re-plug`)
+        await checkPartitionIds(parts, `cycle ${c} after re-plug`)
         await checkNonExt4Unmounted(nonExt4, `cycle ${c} after re-plug`)
         const u = udevLines.length ? '' : ' (no udev lines captured)'
         info(`udev events captured this cycle${u}`)
