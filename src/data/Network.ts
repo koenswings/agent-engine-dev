@@ -1,11 +1,13 @@
 import { BrowserWebSocketClientAdapter, WebSocketClientAdapter } from "@automerge/automerge-repo-network-websocket";
 import { Engine } from './Engine.js'
-import { findIp, log } from '../utils/utils.js';
+import { findIp, log, print } from '../utils/utils.js';
 import { EngineID, Hostname, IPAddress, InterfaceName, PortNumber, Timestamp } from './CommonTypes.js';
 import { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
 import { config } from './Config.js';
 import { Store, findRunningEngineByHostname } from "./Store.js";
 import { readStoreDocId } from "./StoreIdentity.js";
+import { describeRefusal, isForeignStoreDoc, PeerVerdict, RefusalLog, storeTag } from "./StoreScope.js";
+import { ClientRefusal, StoreScopedWebSocketClientAdapter } from "./StoreScopedClientAdapter.js";
 
 const settings = config.settings
 
@@ -50,6 +52,17 @@ export const network: Network = {
 }
 
 const MAX_MISSED_DISCOVERIES = 3;
+
+/**
+ * Store-scoped peering (StoreScope.ts): a peer (ip:port) that was refused because it
+ * belongs to another store, or is an old Engine without a store tag, is not dialled
+ * again for REFUSED_PEER_BACKOFF_MS (mDNS discovery and the static-peer supervisor
+ * would otherwise redial it every 10 s). After that one new attempt is made, so a
+ * peer that was moved into our store (or upgraded) is picked up on its own.
+ */
+export const REFUSED_PEER_BACKOFF_MS = 5 * 60_000
+export const refusedPeers = new Map<string, { until: number, verdict: PeerVerdict, by: 'local' | 'remote' }>()
+const outboundRefusalLog = new RefusalLog(print)
 
 // **********
 // Functions
@@ -127,15 +140,30 @@ export const connectEngine = async (repo:Repo, address: IPAddress, hostname: Hos
 
   // peerPort: static peers (StaticPeers.ts) only; mDNS peers use the own port as before
   const port = peerPort ?? (settings.port as PortNumber || 1234 as PortNumber)
+  const key = `${address}:${port}`
+  const ownTag = storeTag(storeDocId)
 
-  log(`Connecting to engine at ${address}:${port}`)
+  const refused = refusedPeers.get(key)
+  if (refused && refused.until > Date.now()) {
+    log(`[store-scope] Not dialling ${key} (${hostname}): refused at ${new Date(refused.until - REFUSED_PEER_BACKOFF_MS).toISOString()} (${refused.verdict.kind}); next attempt after ${new Date(refused.until).toISOString()}`)
+    return undefined
+  }
+
+  log(`Connecting to engine at ${key}`)
 
 
   log(`Checking connection with ${address}`)
-  if (!network.connections.hasOwnProperty(`${address}:${port}`) && address !== 'localhost' && address !== '127.0.0.1') {
-    log(`Creating a new connection to ${address}:${port}`)
+  if (!network.connections.hasOwnProperty(key) && address !== 'localhost' && address !== '127.0.0.1') {
+    log(`Creating a new connection to ${key}`)
 
-    const clientConnection = new WebSocketClientAdapter(`ws://${address}:${port}`)
+    // Store-scoped client: the server's peerId must carry our store tag, or the
+    // link is dropped before any document is exchanged (StoreScopedClientAdapter.ts).
+    const clientConnection: StoreScopedWebSocketClientAdapter = new StoreScopedWebSocketClientAdapter(`ws://${key}`, {
+      ownTag,
+      docGuard: (documentId) => isForeignStoreDoc(repo as any, storeDocId, documentId),
+      onRefused: (r) => refuseEngine(repo, key, hostname, ownTag, clientConnection, r),
+    })
+    refusedPeers.delete(key)
     repo.networkSubsystem.addNetworkAdapter(clientConnection)
     
     log(`Finding document with ID: ${storeDocId}`);
@@ -145,22 +173,42 @@ export const connectEngine = async (repo:Repo, address: IPAddress, hostname: Hos
     await handle.whenReady(); // Ensure it's loaded before returning
     log(`Handle is ready. State: ${handle.state}`);
 
+    if (clientConnection.refusal) {
+      log(`Connection to ${key} was refused by the store check; not registered`)
+      return undefined
+    }
+
     handle.on('change', () => {
       // no-op: CRDT sync events are handled by storeMonitor
     });
 
-    network.connections[`${address}:${port}`] = { adapter: clientConnection, missedDiscoveryCount: 0, hostname, engineId };
+    network.connections[key] = { adapter: clientConnection, missedDiscoveryCount: 0, hostname, engineId };
     
-    log(`Created an websocket client connection on adddress ws://${address}:${port}`)
+    log(`Created an websocket client connection on adddress ws://${key}`)
     return clientConnection
   } else {
     // Return a resolved promise of ConnectionResult
-    log(`Connection to ${address}:${port} already exists or address is localhost or 127.0.0.1`)
-    if (network.connections[`${address}:${port}`]) {
-        network.connections[`${address}:${port}`].missedDiscoveryCount = 0;
+    log(`Connection to ${key} already exists or address is localhost or 127.0.0.1`)
+    if (network.connections[key]) {
+        network.connections[key].missedDiscoveryCount = 0;
     }
     return undefined
   }
+}
+
+/**
+ * The store check refused the link to `key` (we refused the server, or it refused
+ * us): log it (peer address, its store, ours), drop the adapter and the connection
+ * entry, and back off before dialling it again.
+ */
+const refuseEngine = (repo: Repo, key: string, hostname: Hostname, ownTag: string, adapter: StoreScopedWebSocketClientAdapter, r: ClientRefusal): void => {
+  refusedPeers.set(key, { until: Date.now() + REFUSED_PEER_BACKOFF_MS, verdict: r.verdict, by: r.by })
+  const where = r.by === 'local' ? `outbound to ${key} (${hostname})` : `outbound to ${key} (${hostname}), which refused us`
+  outboundRefusalLog.report(`out|${key}|${r.verdict.kind}|${r.verdict.theirTag ?? ''}`,
+    describeRefusal(r.verdict, ownTag, r.remotePeerId, where) + ` Not dialling it again for ${REFUSED_PEER_BACKOFF_MS / 60_000} min.`)
+  try { repo.networkSubsystem.removeNetworkAdapter(adapter) } catch (e: any) { log(`removeNetworkAdapter after refusal: ${e?.message ?? e}`) }
+  const conn = network.connections[key as IPAddress]
+  if (conn && conn.adapter === adapter) delete network.connections[key as IPAddress]
 }
 
 /**

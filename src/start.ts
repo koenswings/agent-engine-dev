@@ -79,16 +79,19 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         await $`mkdir -p ${STORE_IDENTITY_PATH}`
     }
 
-    log(`Starting Automerge server...`)
-    const repo = await startAutomergeServer(STORE_DATA_PATH, settings.port as PortNumber || 1234 as PortNumber)
-
     // Store identity (idea#120): a missing store-url.txt is written back with the
     // shared fleet store URL; an existing one is used as it is. store-template.json
     // is never written; if it is missing, startup stops with a clear error.
+    // Read BEFORE the Automerge server starts: the Repo's peerId carries the store
+    // tag, so the Engine only ever peers with Engines of this store (StoreScope.ts).
     const { storeDocId, restored, fallback } = await prepareStoreIdentity(storeIdentity)
     if (restored) print(chalk.yellow(`store-url.txt was missing: restored the fleet store URL`))
     if (fallback) print(chalk.bgRed.white(`store-url.txt was restored by the Engine (store-identity/store-url.restored): peer access fails closed until Ops confirms the store`))
     log(`Using document ID: ${storeDocId}`)
+
+    log(`Starting Automerge server...`)
+    const repo = await startAutomergeServer(STORE_DATA_PATH, settings.port as PortNumber || 1234 as PortNumber,
+        { storeDocId, engineId: String(localEngineId) })
 
     // HACK: Force save on remote changes
     // The repo doesn't persist changes that come in from a remote peer automatically.
@@ -131,7 +134,9 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     await clearStaleUnmountErrors(storeHandle, localEngineId).catch(e => log(`Could not clear stale unmount errors: ${e}`))
 
     // Check for undocked apps after restart: only instances on disks docked on
-    // this Engine (Disk.dockedTo); other Engines' instances are left alone
+    // this Engine (Disk.dockedTo); other Engines' instances are left alone.
+    // An instance the operator stopped stays Stopped, so the dock pass does not
+    // auto-start it (idea#176)
     await checkAndSetUndockedApps(storeHandle)
 
     // Crash recovery: retry idempotent interrupted ops; mark others Failed
