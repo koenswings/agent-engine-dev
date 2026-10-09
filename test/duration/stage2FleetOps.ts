@@ -19,6 +19,17 @@ import {
 } from './stage2.js'
 
 const DOCK_WAIT_MS = Number(process.env.DURATION_STAGE2_DOCK_WAIT_MS ?? 120_000)
+/**
+ * Gap between `undock` and `dock` when re-docking a partition that is present but not mounted
+ * (Engine-ejected, or after reset/import). Atlas reset-r53: the script's own partx -d/-a cycle is
+ * milliseconds apart, chokidar merges unlink+add of /dev/engine/<kname> into a 'change', and the Engine
+ * only acts on add/unlink → the dock silently did nothing. undock → ~5 s → dock worked.
+ */
+export const STAGE2_REDOCK_GAP_MS_DEFAULT = 5_000
+export const stage2RedockGapMs = (env: NodeJS.ProcessEnv = process.env): number => {
+    const v = Number(env.DURATION_STAGE2_REDOCK_GAP_MS)
+    return Number.isFinite(v) && v >= 0 && env.DURATION_STAGE2_REDOCK_GAP_MS?.trim() ? v : STAGE2_REDOCK_GAP_MS_DEFAULT
+}
 const RE_INSTANCE = /^[A-Za-z0-9_.-]+$/
 
 export class Stage2FleetOps extends RealFleetOps {
@@ -27,6 +38,7 @@ export class Stage2FleetOps extends RealFleetOps {
     private readonly s2hosts: Record<string, string>
     private readonly sleepMs: (ms: number) => Promise<void>
     private readonly dockWaitMs: number
+    private readonly redockGapMs: number
     /** Partition diskId → diskId of the app network-copied onto it (move target occupancy). */
     readonly moveCopies = new Map<string, string>()
     /** Fixtures the harness deliberately left undocked (a reboot re-adds partitions → undock again). */
@@ -37,8 +49,10 @@ export class Stage2FleetOps extends RealFleetOps {
     readonly ssdOffline = new Set<string>()
     /** Log of redock reconciliations (for evidence / tests). */
     readonly redockLog: string[] = []
+    /** Log of partition docks (undock → gap → dock decisions), for evidence / tests. */
+    readonly dockLog: string[] = []
 
-    constructor(opts: RealFleetOptions & { dockScript?: string; sleep?: (ms: number) => Promise<void>; dockWaitMs?: number }) {
+    constructor(opts: RealFleetOptions & { dockScript?: string; sleep?: (ms: number) => Promise<void>; dockWaitMs?: number; redockGapMs?: number }) {
         for (const n of STAGE2_NEVER_HOSTS) {
             if (opts.poolEngines.includes(n)) throw new Error(`Stage2FleetOps: refuse ${n} in pool`)
         }
@@ -47,6 +61,7 @@ export class Stage2FleetOps extends RealFleetOps {
         this.s2hosts = { ...opts.hosts }
         this.sleepMs = opts.sleep ?? (ms => new Promise(r => setTimeout(r, ms)))
         this.dockWaitMs = opts.dockWaitMs ?? DOCK_WAIT_MS
+        this.redockGapMs = opts.redockGapMs ?? stage2RedockGapMs()
     }
 
     private s2host(engineId: string): string {
@@ -196,11 +211,60 @@ export class Stage2FleetOps extends RealFleetOps {
         }
     }
 
-    /** `dock`; `already:true` (partition mounted = Engine already has it) is success, not an error. */
-    private async dockPartition(engineId: string, diskId: string, as = diskId): Promise<void> {
-        const r = await this.dockCall(engineId, 'dock', { diskId })
-        if (r.already === true) console.log(`[duration] stage2: dock ${diskId} on ${engineId}: already mounted by the Engine (no uevent)`)
-        await this.waitDocked(as, engineId)
+    /**
+     * Every partition dock goes through here (dockFixture, move_disk source/target). Engine-visible dock
+     * of partition `part` (META diskId `as`, ≠ part for a network-copied fixture) on engineId:
+     *   - mounted already → nothing to add (still verified below);
+     *   - present but NOT mounted (Engine-ejected, or fresh from reset/import) → `undock`, wait
+     *     redockGapMs (DURATION_STAGE2_REDOCK_GAP_MS, default 5 s), then `dock` — never the script's
+     *     millisecond re-add cycle, which chokidar sees as a 'change' the Engine ignores (reset-r53);
+     *   - absent → `dock` (a real add).
+     * Then verify (bounded by dockWaitMs): the store has `as` docked on engineId AND the partition is
+     * mounted there. A dock with no effect fails loud — never a silent no-op.
+     */
+    private async dockPartition(engineId: string, part: string, as = part): Promise<void> {
+        const label = stage2Fixture(part).partLabel
+        await this.checkBoot(engineId) // a 05:00 reboot is reconciled before any partition verb
+        const st = await this.stage2Status(engineId)
+        const p = st.fixtures.find(x => x.partLabel === label)
+        if (p?.present && p.mounted) {
+            console.log(`[duration] stage2: dock ${part} on ${engineId}: ${label} already mounted at ${p.mounted}`)
+        } else {
+            if (p?.present) {
+                this.dockLog.push(`${engineId}: ${label} present, not mounted → undock, wait ${this.redockGapMs}ms, dock`)
+                await this.rawCall(engineId, 'undock', { diskId: part })
+                await this.sleepMs(this.redockGapMs)
+            }
+            const r = await this.rawCall(engineId, 'dock', { diskId: part })
+            if (r.cycled === true) {
+                // The script re-added a partition it found present (fast cycle) — exactly the case the Engine may miss.
+                console.log(`[duration] stage2: dock ${part} on ${engineId} used the fast re-add cycle (cycled:true) — verifying the Engine took it`)
+            }
+            this.dockLog.push(`${engineId}: dock ${part}${as !== part ? ` (as ${as})` : ''}`)
+        }
+        await this.verifyEngineDocked(engineId, part, as)
+    }
+
+    /** Store shows `as` docked on engineId AND `part`'s partition is mounted there, within dockWaitMs; else throw. */
+    private async verifyEngineDocked(engineId: string, part: string, as = part): Promise<void> {
+        const label = stage2Fixture(part).partLabel
+        const deadline = Date.now() + this.dockWaitMs
+        let last = 'unread'
+        for (;;) {
+            try {
+                const on = await this.findDockedEngine(as)
+                const p = (await this.stage2Status(engineId)).fixtures.find(x => x.partLabel === label)
+                last = `store dockedTo=${on ?? 'none'}, ${label} ${p?.present ? `present, mounted=${p.mounted ?? 'no'}` : 'absent'}`
+                if (on === engineId && p?.present && p.mounted) return
+            } catch (e) { last = e instanceof Error ? e.message : String(e) }
+            if (Date.now() >= deadline) {
+                throw new Error(
+                    `Stage 2: dock of ${part}${as !== part ? ` (as ${as})` : ''} on ${engineId} had no effect within ${this.dockWaitMs}ms ` +
+                        `(${last}) — the Engine did not take the partition. No soft-pass.`,
+                )
+            }
+            await this.sleepMs(1000)
+        }
     }
 
     /**
@@ -301,7 +365,7 @@ export class Stage2FleetOps extends RealFleetOps {
         await this.checkBoot(fromEngine)
         await this.checkBoot(toEngine)
         await this.engineEject(fromEngine, diskId)
-        if (this.heldUndocked.has(target.diskId)) { await this.rawCall(toEngine, 'dock', { diskId: target.diskId }); await this.waitDocked(target.diskId, toEngine) }
+        if (this.heldUndocked.has(target.diskId)) await this.dockPartition(toEngine, target.diskId)
         if (await this.findDockedEngine(target.diskId)) await this.engineEject(toEngine, target.diskId)
         await this.rawCall(toEngine, 'reset', { diskId: target.diskId })
         this.assertSsdOnline(fromEngine, diskId)
@@ -314,9 +378,8 @@ export class Stage2FleetOps extends RealFleetOps {
         if (stage2Fixture(diskId).host === fromEngine) { await this.rawCall(fromEngine, 'undock', { diskId }); this.heldUndocked.add(diskId) }
         this.moveCopies.set(target.diskId, diskId)
         this.heldUndocked.delete(target.diskId)
-        const r = await this.rawCall(toEngine, 'dock', { diskId: target.diskId })
-        if (r.already === true) console.log(`[duration] stage2: move target ${target.diskId} already mounted (no uevent)`)
-        await this.waitDocked(diskId, toEngine)
+        // Fresh from reset + import the target is present but unmounted → undock, gap, dock (reset-r53), verified.
+        await this.dockPartition(toEngine, target.diskId, diskId)
     }
 
     // ── Read-only probes on the real partition (Stage 1 used idea-test-N slots) ──

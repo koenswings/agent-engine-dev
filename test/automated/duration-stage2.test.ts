@@ -337,6 +337,11 @@ class CannedStage2 extends Stage2FleetOps {
     unmountLag = 0
     lagLeft: Record<string, number> = {}
     statusCalls = 0
+    /** dock calls on a present partition (fast re-add cycle the Engine ignores). */
+    fastCycles = 0
+    /** The Engine ignores even a real add (the "dock had no effect" case). */
+    engineDeaf = false
+    sleeps: number[] = []
     protected override async ssh(host: string, cmd: string): Promise<string> {
         const h = IP[host]!
         if (cmd.endsWith(' status --json')) {
@@ -362,9 +367,17 @@ class CannedStage2 extends Stage2FleetOps {
         } else if ((m = /^(dock|undock) (\S+)$/.exec(c))) {
             const onIt = this.meta[m[2]!] ?? m[2]!
             if (m[1] === 'dock') {
-                const already = this.docked[onIt] === h && !this.removed.has(m[2]!)
-                this.removed.delete(m[2]!); this.docked[onIt] = h
-                return `{"ok":true,"already":${already}}`
+                const present = !this.removed.has(m[2]!)
+                if (present && this.docked[onIt] === h) return '{"ok":true,"already":true}'
+                if (present) {
+                    // reset-r53: present but unmounted → the script's ms partx -d/-a cycle; chokidar sees a 'change',
+                    // the Engine (add/unlink only) does nothing.
+                    this.fastCycles++
+                    return '{"ok":true,"already":false,"cycled":true}'
+                }
+                this.removed.delete(m[2]!)
+                if (!this.engineDeaf) this.docked[onIt] = h // a real add uevent: the Engine docks it
+                return '{"ok":true,"already":false,"cycled":false}'
             }
             if (this.docked[onIt] === h) return '{"ok":false,"exit":5}'
             this.removed.add(m[2]!)
@@ -384,7 +397,7 @@ class CannedStage2 extends Stage2FleetOps {
 const mk = () => {
     const o = new CannedStage2({
         poolEngines: ['idea01', 'idea03', 'idea04'], hosts: { idea01: '10.0.0.1', idea03: '10.0.0.3', idea04: '10.0.0.4' },
-        storeMode: 'shared', sleep: async () => {}, dockWaitMs: 200,
+        storeMode: 'shared', sleep: async (ms: number) => { o.sleeps.push(ms) }, dockWaitMs: 200,
     })
     for (const f of STAGE2_FIXTURES) o.docked[f.diskId] = f.host
     return o
@@ -444,11 +457,13 @@ describe('Stage2FleetOps', () => {
         quiet()
         const o = mk()
         await o.dockFixture('idea03', E1)
-        expect(o.calls).toEqual([`idea03 reset ${E1}`, `idea03 dock ${E1}`])
+        // reset leaves it present + unmounted → undock, gap, dock (reset-r53), never the fast re-add cycle.
+        expect(o.calls).toEqual([`idea03 reset ${E1}`, `idea03 undock ${E1}`, `idea03 dock ${E1}`])
+        expect(o.fastCycles).toBe(0)
         await o.undockFixtures(['idea03'], E1)
         o.calls = []
         await o.dockFixture('idea03', E1)
-        expect(o.calls).toEqual([`idea03 dock ${E1}`, `idea03 reset ${E1}`, `idea03 dock ${E1}`])
+        expect(o.calls).toEqual([`idea03 dock ${E1}`, `idea03 reset ${E1}`, `idea03 undock ${E1}`, `idea03 dock ${E1}`])
     })
     it('move_disk = network copy into empty-003: partition verbs only, sibling empty-002 untouched, no SSD verbs', async () => {
         quiet()
@@ -458,8 +473,10 @@ describe('Stage2FleetOps', () => {
             `idea04 reset ${E3}`,
             `RELAY idea01 export ${K} | idea04 import ${E3} --as ${K}`,
             `idea01 undock ${K}`,
+            `idea04 undock ${E3}`, // imported target is present + unmounted → undock, gap, dock
             `idea04 dock ${E3}`,
         ])
+        expect(o.fastCycles).toBe(0)
         expect(o.calls.some(c => c.includes(E2) || /-ssd/.test(c))).toBe(false)
         expect(o.docked[E2]).toBe('idea04')
         expect(o.docked[K]).toBe('idea04')
@@ -614,7 +631,8 @@ describe('r53: Stage 2 already-docked shortcuts', () => {
         const r = await dispatchAction(infraCtx(o, 'infra_dock_fixture'))
         expect(r.ok).toBe(true)
         // d26f4e2: calls = [] ("fixture … already docked on idea01 (no-op)") and a 420 s wait for Nextcloud.
-        expect(o.calls).toEqual([`idea03 dock ${NC}`])
+        // Engine-ejected partition is present → undock, gap, dock (reset-r53).
+        expect(o.calls).toEqual([`idea03 undock ${NC}`, `idea03 dock ${NC}`])
         expect(o.docked[NC]).toBe('idea03')
         expect(o.docked[K]).toBe('idea01')
         expect(r.message).toMatch(/docked duration-kolibri-grade5a-001 \(\+ duration-nextcloud-grade5a-001\) on idea01 \(Stage 2 homes\) \[was not docked: duration-nextcloud-grade5a-001\]/)
@@ -637,7 +655,7 @@ describe('r53: Stage 2 already-docked shortcuts', () => {
         o.calls = []
         const r = await dispatchAction(infraCtx(o, 'infra_dock_fixture', null))
         expect(r.ok).toBe(true)
-        expect(o.calls).toEqual([`idea01 dock ${K}`, `idea03 dock ${NC}`])
+        expect(o.calls).toEqual([`idea01 dock ${K}`, `idea03 undock ${NC}`, `idea03 dock ${NC}`])
     })
     it('a moved copy stays on the move target; only the missing home fixture is docked', async () => {
         const o = liveCanned()
@@ -646,7 +664,7 @@ describe('r53: Stage 2 already-docked shortcuts', () => {
         o.calls = []
         const r = await dispatchAction(infraCtx(o, 'infra_dock_fixture', 'idea04'))
         expect(r.ok).toBe(true)
-        expect(o.calls).toEqual([`idea03 dock ${NC}`])
+        expect(o.calls).toEqual([`idea03 undock ${NC}`, `idea03 dock ${NC}`])
         expect(r.message).toMatch(/duration-kolibri-grade5a-001 stays on idea04 \(moved copy\)/)
     })
     it('Stage2FleetOps.dockFixture: store says docked but the partition is not mounted → real dock, not a no-op', async () => {
@@ -655,7 +673,7 @@ describe('r53: Stage 2 already-docked shortcuts', () => {
         const orig = o.findDockedEngine.bind(o)
         vi.spyOn(o, 'findDockedEngine').mockImplementation(async d => (d === NC ? 'idea03' : orig(d))) // stale store row
         await o.dockFixture('idea03', NC)
-        expect(o.calls).toEqual([`idea03 dock ${NC}`])
+        expect(o.calls).toEqual([`idea03 undock ${NC}`, `idea03 dock ${NC}`])
         o.calls = []
         await o.dockFixture('idea03', NC) // now mounted for real → no-op
         expect(o.calls).toEqual([])
@@ -676,5 +694,77 @@ describe('r53: Stage 2 already-docked shortcuts', () => {
         b.calls = []
         await expect(dispatchAction(infraCtx(b, 'infra_move_disk', 'idea04'))).rejects.toThrow(/already docked on the move target idea04 — refusing a no-op move/)
         expect(b.calls).toEqual([])
+    })
+})
+
+// ── reset-r53 (Atlas): a dock of a present-but-Engine-ejected partition is a chokidar 'change' ─────────
+describe('reset-r53: undock → gap → dock, then verify the Engine took it', () => {
+    afterEach(() => { vi.restoreAllMocks(); delete process.env.DURATION_STAGE2_REDOCK_GAP_MS })
+    it("change-not-add: the script's fast re-add cycle alone leaves the Engine undocked (the r53 reset finding)", async () => {
+        quiet()
+        const o = mk()
+        o.docked[NC] = null // Engine-ejected: present, unmounted
+        // What a bare `dock` does (Atlas 15:52): cycled:true, Engine never sees an add.
+        const out = await (o as unknown as { ssh(h: string, c: string): Promise<string> }).ssh('10.0.0.3', `sudo -n /usr/local/sbin/stage2-dock.sh dock ${NC} --json`)
+        expect(JSON.parse(out)).toMatchObject({ ok: true, cycled: true })
+        expect(o.docked[NC]).toBeNull()
+        expect(o.fastCycles).toBe(1)
+    })
+    it('present + unmounted → undock, wait the gap (default 5 s), dock; Engine docks it; verified', async () => {
+        quiet()
+        const o = mk()
+        o.docked[NC] = null
+        await o.dockFixture('idea03', NC)
+        expect(o.calls).toEqual([`idea03 undock ${NC}`, `idea03 dock ${NC}`])
+        expect(o.sleeps[0]).toBe(5_000) // the gap sits between undock and dock
+        expect(o.fastCycles).toBe(0)
+        expect(o.docked[NC]).toBe('idea03')
+        expect(o.dockLog).toEqual([`idea03: IDEA-NEXTCLOUD present, not mounted → undock, wait 5000ms, dock`, `idea03: dock ${NC}`])
+    })
+    it('gap is configurable (constructor, DURATION_STAGE2_REDOCK_GAP_MS); absent partition docks without a gap; mounted is a no-op', async () => {
+        quiet()
+        process.env.DURATION_STAGE2_REDOCK_GAP_MS = '1500'
+        const { stage2RedockGapMs, STAGE2_REDOCK_GAP_MS_DEFAULT } = await import('../duration/stage2FleetOps.js')
+        expect(stage2RedockGapMs()).toBe(1500)
+        expect(stage2RedockGapMs({ DURATION_STAGE2_REDOCK_GAP_MS: 'x' })).toBe(STAGE2_REDOCK_GAP_MS_DEFAULT)
+        const o = mk()
+        o.docked[NC] = null
+        await o.dockFixture('idea03', NC)
+        expect(o.sleeps[0]).toBe(1500)
+        const a = mk()
+        await a.undockFixtures(['idea03'], NC) // harness undock: partition removed
+        a.calls = []; a.sleeps.length = 0
+        await a.dockFixture('idea03', NC)
+        expect(a.calls).toEqual([`idea03 dock ${NC}`])
+        expect(a.sleeps).toEqual([])
+        a.calls = []
+        await a.dockFixture('idea03', NC)
+        expect(a.calls).toEqual([])
+    })
+    it('a dock with no effect (Engine never takes the partition) fails loud with what it saw', async () => {
+        quiet()
+        const o = mk()
+        o.docked[NC] = null
+        o.engineDeaf = true
+        await expect(o.dockFixture('idea03', NC)).rejects.toThrow(
+            /dock of duration-nextcloud-grade5a-001 on idea03 had no effect within 200ms \(store dockedTo=none, IDEA-NEXTCLOUD present, mounted=no\) — the Engine did not take the partition\. No soft-pass\./,
+        )
+        expect(o.calls).toEqual([`idea03 undock ${NC}`, `idea03 dock ${NC}`])
+    })
+    it('move_disk target that the Engine never docks fails loud (no silent move)', async () => {
+        quiet()
+        const o = mk()
+        o.engineDeaf = true
+        await expect(o.moveDisk('idea01', 'idea04', K)).rejects.toThrow(/dock of duration-empty-003 \(as duration-kolibri-grade5a-001\) on idea04 had no effect/)
+    })
+    it('r53 path end-to-end: Console eject@45 then infra_dock_fixture@58 → undock, gap, dock, verified', async () => {
+        const o = liveCanned()
+        o.docked[NC] = null
+        const r = await dispatchAction(infraCtx(o, 'infra_dock_fixture'))
+        expect(r.ok).toBe(true)
+        expect(o.calls).toEqual([`idea03 undock ${NC}`, `idea03 dock ${NC}`])
+        expect(o.sleeps).toContain(5_000)
+        expect(o.fastCycles).toBe(0)
+        expect(o.docked[NC]).toBe('idea03')
     })
 })

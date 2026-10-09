@@ -123,6 +123,17 @@ returned "already docked (no-op)" and waited 420 s for a Nextcloud nobody re-doc
 - `infra_move_disk`: the Stage 2 source is the store holder (not walker state); undocked or already on
   the move target fails loud. `Stage2FleetOps.moveDisk(x, x)` is refused instead of a silent no-op.
 
+## Partition dock = undock → gap → dock, verified (Atlas reset-r53)
+
+`stage2-dock.sh dock` on a partition that is present but not mounted (Engine-ejected, or fresh from
+reset/import) re-adds it with `partx -d`/`-a` milliseconds apart; chokidar merges that into a `change`
+and the Engine (add/unlink only) silently does nothing. Every harness partition dock
+(`Stage2FleetOps.dockPartition`: dockFixture, Empty fresh docks, move_disk target) therefore:
+present + unmounted → `undock`, wait `DURATION_STAGE2_REDOCK_GAP_MS` (default 5000), `dock`; absent →
+`dock`; mounted → nothing to add. Then it verifies, within `DURATION_STAGE2_DOCK_WAIT_MS`, that the store
+has the disk docked on that Pi AND the partition is mounted — otherwise it fails loud ("had no effect").
+Whole-SSD `dock-ssd` is unchanged. The Pi script is Atlas's and is not changed here.
+
 ## Smoke (D9)
 
 `test/duration/stage2Smoke.ts` (idea04 only, empty-002/003). Phases:
