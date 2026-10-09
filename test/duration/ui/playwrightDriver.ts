@@ -33,6 +33,7 @@ import {
     isDeferredUiIntent,
 } from './fixtures.js'
 import type { UiDriver, UiIntentContext, UiIntentResult } from './types.js'
+import { playwrightCandidates } from '../boxTooling.js'
 import { ActiveTabTracker, captureFrameFrom, followContextTabs, type TrackablePage } from './activeTab.js'
 
 export interface PlaywrightUiOptions {
@@ -157,12 +158,8 @@ export const resolveConsoleIntentsDir = (explicit?: string): string | null => {
 
 const loadPlaywright = async (): Promise<PlaywrightModule> => {
     const require = createRequire(import.meta.url)
-    const tries = [
-        'playwright',
-        '@playwright/test',
-        '/workspace/agent-console-dev/node_modules/playwright',
-        resolve(here, '../../../../agent-console-dev/node_modules/playwright'),
-    ]
+    // Same list the box-tooling preflight checks (boxTooling.ts), so the two cannot drift.
+    const tries = playwrightCandidates(here)
     for (const spec of tries) {
         try {
             if (spec.startsWith('/')) {

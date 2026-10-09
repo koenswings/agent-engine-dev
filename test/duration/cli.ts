@@ -15,6 +15,8 @@
  * --record-walk <dir>: screenshots after UI/live-page steps + ffmpeg walk.mp4 (best with --ui).
  */
 
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { FakeFleetOps } from './actions.js'
 import { RealFleetOps, parseHostsFlag } from './realFleetOps.js'
 import { ensureRecordWalkDir } from './recordWalk.js'
@@ -30,6 +32,7 @@ import {
 } from './scenario.js'
 import { createUiDriver, resolveConsoleIntentsDir } from './ui/index.js'
 import { EXIT_CONSOLE_PIN_MISMATCH, runConsoleDeployPreflight } from './consoleDeploy.js'
+import { checkBoxTooling, EXIT_BOX_TOOLING, realBoxToolingDeps } from './boxTooling.js'
 import { $ } from 'zx'
 import type { StructuredLogEntry } from './types.js'
 import { EXIT_ENGINE_UNREACHABLE, installProcessGuards, timeoutSummary, walkExitCode } from './automergeTimeoutGuard.js'
@@ -424,6 +427,25 @@ const main = async () => {
         ...(stage2Fields ?? {}),
     }
     console.log(JSON.stringify(commonStart))
+
+    // r51 FAIL@1: a live --ui walk needs box tooling (node_modules, Playwright on the driver's paths,
+    // the Intents checkout's node_modules, Chromium). Check before any pool contact → exit 11.
+    if (args.ui && args.live && !args.noPreflight) {
+        const harnessRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
+        const bt = checkBoxTooling({
+            harnessRoot,
+            driverDir: join(harnessRoot, 'test/duration/ui'),
+            intentsDir: resolveConsoleIntentsDir(),
+        }, realBoxToolingDeps())
+        console.log(`[duration] ${bt.message}`)
+        console.log(JSON.stringify({ event: 'box_tooling_preflight', ok: bt.ok, playwright: bt.playwright, chromium: bt.chromium, intents_playwright: bt.intentsPlaywright, problems: bt.problems }))
+        if (!bt.ok) {
+            for (const p of bt.problems) console.error(`[duration] FATAL (box tooling): ${p}`)
+            await uiDriver.close?.().catch(() => {})
+            if (ops instanceof RealFleetOps) await ops.close().catch(() => {})
+            process.exit(EXIT_BOX_TOOLING)
+        }
+    }
 
     // r32: fail fast before step 1 when a pool Engine does not serve the store over WS,
     // instead of discovering it as an "own store" withTimeout 60 s into the walk.
