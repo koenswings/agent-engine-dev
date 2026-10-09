@@ -1,8 +1,10 @@
-import { Repo, PeerMetadata } from "@automerge/automerge-repo";
+import { Repo, PeerMetadata, PeerId } from "@automerge/automerge-repo";
 import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
 import { ThreadedWebSocketServerAdapter } from "./wsServerThread.js";
 import { PortNumber } from "./data/CommonTypes.js";
 import { deepPrint, log, error } from './utils/utils.js'
+import { enginePeerId, isForeignStoreDoc, peerVerdict, storeTag } from './data/StoreScope.js'
+export { isForeignStoreDoc }
 
 
 /**
@@ -80,7 +82,33 @@ export const WS_KEEPALIVE_INTERVAL_MS = 30_000
  */
 export const shouldAnnounceTo = (meta: PeerMetadata | undefined): boolean => meta?.isEphemeral !== true
 
-export const startAutomergeServer = async (dataDir:string, port:PortNumber):Promise<Repo> => {
+/**
+ * Store-scoped peering (StoreScope.ts). The adapters refuse other stores' Engines
+ * at the handshake; this is the Repo-level backstop on top of shouldAnnounceTo:
+ *   - announce only to Engines of OUR store (an unverified non-ephemeral peer, which
+ *     the adapters never let through, would get nothing either);
+ *   - never announce another fleet's store doc, even to our own Engines: copies
+ *     relayed here before this fix stay on disk untouched (quarantine is separate)
+ *     but are not passed on.
+ * Storage-less clients (Console, CLI) still get nothing unasked, as before.
+ */
+export const storeScopedSharePolicy = (repo: Repo, ownStoreDocId: string) => {
+    const ownTag = storeTag(ownStoreDocId)
+    return async (peerId: PeerId, documentId?: string): Promise<boolean> => {
+        const meta = repo.peerMetadataByPeerId[peerId]
+        if (!shouldAnnounceTo(meta)) return false
+        if (peerVerdict(ownTag, peerId, meta).kind !== 'same-store') return false
+        return !(documentId && isForeignStoreDoc(repo, ownStoreDocId, documentId))
+    }
+}
+
+export interface EngineIdentity {
+    /** This Engine's store doc id (store-url.txt). */
+    storeDocId: string
+    engineId: string
+}
+
+export const startAutomergeServer = async (dataDir:string, port:PortNumber, identity: EngineIdentity):Promise<Repo> => {
     log(`Using data directory: ${dataDir}`);
 
     // 1. Create a storage adapter for the server to persist data.
@@ -95,12 +123,20 @@ export const startAutomergeServer = async (dataDir:string, port:PortNumber):Prom
     // in use) are logged as 'WebSocket server error on port ...' as before.
     const network = new ThreadedWebSocketServerAdapter(port, WS_KEEPALIVE_INTERVAL_MS);
 
-    // 3. Create the Automerge repo.
+    // 3. Create the Automerge repo. Its peerId carries our store tag
+    // (idea-engine/<storeTag>/<engineId>/<session>): both WS adapters check the
+    // other side's against it before any document is exchanged (StoreScope.ts).
+    const peerId = enginePeerId(identity.storeDocId, identity.engineId) as PeerId
+    let sharePolicy: (peerId: PeerId, documentId?: string) => Promise<boolean> = async () => false
     const repo: Repo = new Repo({
         storage: storage,
         network: [network],
-        sharePolicy: async (peerId) => shouldAnnounceTo(repo.peerMetadataByPeerId[peerId])
+        peerId,
+        sharePolicy: (p, d) => sharePolicy(p, d)
     });
+    sharePolicy = storeScopedSharePolicy(repo, identity.storeDocId)
+    network.setDocGuard((documentId) => isForeignStoreDoc(repo, identity.storeDocId, documentId))
+    log(`[store-scope] Engine peerId ${peerId}: syncing only with Engines of store ${storeTag(identity.storeDocId)}`)
 
     startPeriodicFlush(repo);
 

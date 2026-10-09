@@ -15,6 +15,12 @@
  *     warning; valid entries still run. Duplicate entries are dialled once.
  * Unset or empty: nothing runs (no timers, no logs); behaviour is unchanged.
  *
+ * Store-scoped peering (StoreScope.ts): a static peer is dialled through connectEngine
+ * like an mDNS peer, so the same handshake store check applies. A host that resolves
+ * to a Tailscale (or any) address of an Engine in ANOTHER store, or to an old Engine
+ * without a store tag, is refused before any document moves and logged with its
+ * store and ours; connectEngine then waits REFUSED_PEER_BACKOFF_MS before redialling.
+ *
  * Per peer:
  *   - The host is resolved to IPv4; the connection key is `${ip}:${port}`, the
  *     same key the mDNS path uses, so a peer also found by mDNS is not dialled twice.
@@ -36,7 +42,7 @@ import { DocHandle, Repo } from '@automerge/automerge-repo'
 import { EngineID, Hostname, IPAddress, PortNumber } from './CommonTypes.js'
 import { Store } from './Store.js'
 import { config } from './Config.js'
-import { connectEngine, network } from './Network.js'
+import { connectEngine, network, refusedPeers } from './Network.js'
 import { readStoreDocId } from './StoreIdentity.js'
 import { log } from '../utils/utils.js'
 
@@ -155,7 +161,9 @@ export const startStaticPeers = (repo: Repo, storeHandle: DocHandle<Store>, opts
                     existing.missedDiscoveryCount = 0
                     if (String(existing.engineId).startsWith('static:')) existing.engineId = engineIdFor(peer.host)
                 } else {
-                    deps.log(`Static peer ${peer.host}:${peer.port}: connecting to ${key}`)
+                    // Store-scoped peering: a static peer goes through the same handshake store
+                    // check as an mDNS peer (connectEngine); a refused one is backed off there.
+                    if (!((refusedPeers.get(key)?.until ?? 0) > Date.now())) deps.log(`Static peer ${peer.host}:${peer.port}: connecting to ${key}`)
                     await deps.connect(address as IPAddress, shortName(peer.host) as Hostname, engineIdFor(peer.host), peer.port)
                 }
                 failures = 0

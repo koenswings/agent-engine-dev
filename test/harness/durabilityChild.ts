@@ -9,7 +9,7 @@ import { startAutomergeServer } from '../../src/repo.js'
 import { DocumentId } from '@automerge/automerge-repo'
 
 const [dataDir, port, docId, changes] = process.argv.slice(2)
-const repo = await startAutomergeServer(dataDir, Number(port) as any)
+const repo = await startAutomergeServer(dataDir, Number(port) as any, { storeDocId: docId, engineId: 'ENGINE_durability' })
 const handle = await repo.find<{ n: number }>(docId as DocumentId)
 let k = 0
 const t = setInterval(() => {
