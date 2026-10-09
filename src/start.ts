@@ -134,7 +134,9 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     await clearStaleUnmountErrors(storeHandle, localEngineId).catch(e => log(`Could not clear stale unmount errors: ${e}`))
 
     // Check for undocked apps after restart: only instances on disks docked on
-    // this Engine (Disk.dockedTo); other Engines' instances are left alone
+    // this Engine (Disk.dockedTo); other Engines' instances are left alone.
+    // An instance the operator stopped stays Stopped, so the dock pass does not
+    // auto-start it (idea#176)
     await checkAndSetUndockedApps(storeHandle)
 
     // Crash recovery: retry idempotent interrupted ops; mark others Failed

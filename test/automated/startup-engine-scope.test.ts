@@ -47,7 +47,10 @@ const makeTwoEngineStore = async (): Promise<DocHandle<Store>> => {
             'nextcloud-path-a': instance('nextcloud-path-a', 'disk-a-nc'),
             // idea03's own instances
             'b-running': instance('b-running', 'disk-b-1'),
-            'b-gone': instance('b-gone', 'disk-b-1', 'Stopped'),
+            // Docked, container gone: an interrupted start, marked Undocked so the dock pass restarts it
+            'b-gone': instance('b-gone', 'disk-b-1', 'Docked'),
+            // Stopped by the operator: stays Stopped across the restart (idea#176)
+            'b-stopped': instance('b-stopped', 'disk-b-1', 'Stopped'),
             'b-undocked': instance('b-undocked', 'disk-b-1', 'Undocked'),
             // owner unknown or not docked
             'on-undocked-disk': instance('on-undocked-disk', 'disk-not-docked'),
@@ -87,6 +90,7 @@ describe('checkAndSetUndockedApps: only this Engine\'s instances', () => {
         expect(s['b-running']).toBe('Running')
         expect(s['b-gone']).toBe('Undocked')
         expect(s['b-undocked']).toBe('Undocked')
+        expect(s['b-stopped']).toBe('Stopped')
     })
 
     it('A restarting marks its own idle instances and leaves B\'s alone (symmetry)', async () => {
@@ -96,7 +100,7 @@ describe('checkAndSetUndockedApps: only this Engine\'s instances', () => {
         expect(s['kolibri-path-a']).toBe('Running')
         expect(s['nextcloud-path-a']).toBe('Undocked')
         expect(s['b-running']).toBe('Running')
-        expect(s['b-gone']).toBe('Stopped')
+        expect(s['b-gone']).toBe('Docked')
     })
 
     it('leaves instances alone when the disk\'s engine is unknown, missing, not docked or the disk is unknown', async () => {
@@ -116,7 +120,7 @@ describe('checkAndSetUndockedApps: only this Engine\'s instances', () => {
             if (String(id) === 'b-gone') handle.change(d => { (d.diskDB as any)['disk-b-1'].dockedTo = A })
             return false
         })
-        expect(statuses(handle)['b-gone']).toBe('Stopped')
+        expect(statuses(handle)['b-gone']).toBe('Docked')
     })
 
     it('a docker error leaves the instance as it is', async () => {
@@ -124,7 +128,7 @@ describe('checkAndSetUndockedApps: only this Engine\'s instances', () => {
         await checkAndSetUndockedApps(handle, B, async () => { throw new Error('docker: command not found') })
         const s = statuses(handle)
         expect(s['b-running']).toBe('Running')
-        expect(s['b-gone']).toBe('Stopped')
+        expect(s['b-gone']).toBe('Docked')
     })
 
     it('defaults to the local Engine id (Disk.dockedTo === localEngineId)', async () => {
@@ -137,7 +141,7 @@ describe('checkAndSetUndockedApps: only this Engine\'s instances', () => {
         const s = statuses(handle)
         expect(s['local-idle']).toBe('Undocked')
         expect(s['kolibri-path-a']).toBe('Running')
-        expect(s['b-gone']).toBe('Stopped')
+        expect(s['b-gone']).toBe('Docked')
     })
 
     it('isInstanceDockedOn follows diskDB[storedOn].dockedTo only', async () => {
