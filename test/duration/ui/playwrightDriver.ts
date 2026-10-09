@@ -33,7 +33,7 @@ import {
     isDeferredUiIntent,
 } from './fixtures.js'
 import type { UiDriver, UiIntentContext, UiIntentResult } from './types.js'
-import { playwrightCandidates } from '../boxTooling.js'
+import { loadPlaywright, type PlaywrightModule } from './playwrightLoader.js'
 import { ActiveTabTracker, captureFrameFrom, followContextTabs, type TrackablePage } from './activeTab.js'
 
 export interface PlaywrightUiOptions {
@@ -70,20 +70,6 @@ type CaptureAfterIntent = (
     page: unknown,
     opts: { path: string; intent?: string; settleMs?: number },
 ) => Promise<void>
-
-type PlaywrightModule = {
-    chromium: {
-        launch: (opts?: { headless?: boolean }) => Promise<{
-            newContext: (opts?: { baseURL?: string }) => Promise<{
-                newPage: () => Promise<unknown>
-                on: (event: 'page', listener: (page: TrackablePage) => void) => unknown
-                addInitScript: (script: () => void) => Promise<void>
-                close: () => Promise<void>
-            }>
-            close: () => Promise<void>
-        }>
-    }
-}
 
 type PwLocator = {
     first: () => PwLocator
@@ -154,27 +140,6 @@ export const resolveConsoleIntentsDir = (explicit?: string): string | null => {
         }
     }
     return null
-}
-
-const loadPlaywright = async (): Promise<PlaywrightModule> => {
-    const require = createRequire(import.meta.url)
-    // Same list the box-tooling preflight checks (boxTooling.ts), so the two cannot drift.
-    const tries = playwrightCandidates(here)
-    for (const spec of tries) {
-        try {
-            if (spec.startsWith('/')) {
-                const mod = await import(pathToFileURL(join(spec, 'index.js')).href).catch(() => null)
-                if (mod) return mod as PlaywrightModule
-            }
-            return require(spec) as PlaywrightModule
-        } catch {
-            /* try next */
-        }
-    }
-    throw new Error(
-        'PlaywrightUiDriver: playwright not installed. ' +
-        'Install in Engine (pnpm add -D playwright) or use agent-console-dev node_modules.',
-    )
 }
 
 type PixelBridge = {
@@ -295,7 +260,7 @@ export class PlaywrightUiDriver implements UiDriver {
         if (!this.initPromise) {
             this.initPromise = (async () => {
                 this.bridge = await loadPixelBridge(this.opts.intentsDir)
-                const pw = await loadPlaywright()
+                const { mod: pw } = await loadPlaywright()
                 this.browser = await pw.chromium.launch({ headless: this.opts.headless })
                 this.context = await this.browser.newContext({ baseURL: this.opts.baseUrl })
                 // Force demoMode OFF before first Console goto (idea01:8080 / not localhost).

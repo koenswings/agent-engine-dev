@@ -5,22 +5,25 @@
  *   1. node_modules in the harness checkout (tsx/yaml/automerge),
  *   2. Playwright resolvable from the SAME candidate paths PlaywrightUiDriver uses,
  *   3. the Console Intents checkout's own node_modules (the Intents import @playwright/test from there),
- *   4. the Chromium binary that Playwright will launch.
- * Fails with EXIT_BOX_TOOLING (11). Read-only (fs checks + module resolution; no browser launch).
+ *   4. the Chromium binary that Playwright will launch,
+ *   5. (r52 FAIL@1) an actual headless Chromium launch + close through the harness's OWN loader
+ *      (playwrightLoader.loadPlaywright, the function PlaywrightUiDriver uses). Resolving Playwright is not
+ *      enough: r52 resolved it fine and still died on `pw.chromium.launch` (CJS module imported as ESM).
+ * Fails with EXIT_BOX_TOOLING (11). Box-local only (fs, module resolution, one local headless browser); no pool contact.
  */
 import { createRequire } from 'node:module'
 import { existsSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
+import { loadPlaywright, playwrightCandidates } from './ui/playwrightLoader.js'
+
+export { playwrightCandidates }
 
 export const EXIT_BOX_TOOLING = 11
 
-/** Candidate specs, in PlaywrightUiDriver.loadPlaywright order (shared so the two can never drift). */
-export const playwrightCandidates = (driverDir: string): string[] => [
-    'playwright',
-    '@playwright/test',
-    '/workspace/agent-console-dev/node_modules/playwright',
-    resolve(driverDir, '../../../../agent-console-dev/node_modules/playwright'),
-]
+/** Max time for the headless launch + close probe. */
+export const BOX_TOOLING_LAUNCH_TIMEOUT_MS = 60_000
+
+export interface LaunchProbeResult { spec: string; browserVersion: string | null; ms: number }
 
 /** Packages the harness itself needs at runtime from its own node_modules. */
 export const HARNESS_PACKAGES = ['tsx', 'yaml', '@automerge/automerge-repo'] as const
@@ -33,6 +36,8 @@ export interface BoxToolingDeps {
     chromiumPath: (pwFile: string) => string
     /** package.json version next to a resolved module file, or null. */
     versionOf: (pwFile: string) => string | null
+    /** Load Playwright through the harness's own loader, launch headless Chromium, close it. Throws on any failure. */
+    launchProbe: () => Promise<LaunchProbeResult>
 }
 
 export interface BoxToolingInput { harnessRoot: string; driverDir: string; intentsDir: string | null }
@@ -43,6 +48,8 @@ export interface BoxToolingResult {
     playwright: { spec: string; file: string; version: string | null } | null
     chromium: string | null
     intentsPlaywright: string | null
+    /** Result of the real launch probe; null when it did not run or failed. */
+    launch: LaunchProbeResult | null
     message: string
 }
 
@@ -56,7 +63,7 @@ const tryResolve = (deps: BoxToolingDeps, fromDir: string, spec: string): string
     } catch { return null }
 }
 
-export const checkBoxTooling = (input: BoxToolingInput, deps: BoxToolingDeps): BoxToolingResult => {
+export const checkBoxTooling = async (input: BoxToolingInput, deps: BoxToolingDeps): Promise<BoxToolingResult> => {
     const problems: string[] = []
     const nm = join(input.harnessRoot, 'node_modules')
     if (!deps.exists(nm)) problems.push(`harness node_modules missing at ${nm} — run pnpm install --frozen-lockfile in ${input.harnessRoot}`)
@@ -95,11 +102,49 @@ export const checkBoxTooling = (input: BoxToolingInput, deps: BoxToolingDeps): B
             chromium = null
         }
     }
+    // The real thing: the driver's own loader + chromium.launch({ headless: true }) + close.
+    // Runs whenever Playwright resolved (even with other problems) so its error is reported too.
+    let launch: LaunchProbeResult | null = null
+    if (playwright) {
+        try {
+            launch = await deps.launchProbe()
+        } catch (e) {
+            problems.push(`headless Chromium launch through the harness loader failed: ${e instanceof Error ? e.message : String(e)}`)
+        }
+    }
     const ok = problems.length === 0
     const message = ok
-        ? `box tooling OK: playwright ${playwright!.version ?? '?'} (${playwright!.spec}), chromium ${chromium}, intents @playwright/test ${intentsPlaywright}`
+        ? `box tooling OK: playwright ${playwright!.version ?? '?'} (${playwright!.spec}), chromium ${chromium}, ` +
+          `launch probe OK via loader '${launch!.spec}' (browser ${launch!.browserVersion ?? '?'}, ${launch!.ms} ms), ` +
+          `intents @playwright/test ${intentsPlaywright}`
         : `box tooling FAILED: ${problems.join(' | ')}`
-    return { ok, problems, playwright, chromium, intentsPlaywright, message }
+    return { ok, problems, playwright, chromium, intentsPlaywright, launch, message }
+}
+
+/** Process exit code for a box-tooling verdict: 0 or EXIT_BOX_TOOLING (11). */
+export const boxToolingExitCode = (r: Pick<BoxToolingResult, 'ok'>): number => (r.ok ? 0 : EXIT_BOX_TOOLING)
+
+const withTimeout = <T>(p: Promise<T>, ms: number, what: string): Promise<T> =>
+    new Promise<T>((res, rej) => {
+        const t = setTimeout(() => rej(new Error(`${what} timed out after ${ms} ms`)), ms)
+        p.then(v => { clearTimeout(t); res(v) }, e => { clearTimeout(t); rej(e) })
+    })
+
+/** Real launch probe: exactly the driver's loader, then launch/close headless Chromium. */
+export const realLaunchProbe = async (
+    load: typeof loadPlaywright = loadPlaywright,
+    timeoutMs = BOX_TOOLING_LAUNCH_TIMEOUT_MS,
+): Promise<LaunchProbeResult> => {
+    const t0 = Date.now()
+    const { mod, spec } = await load()
+    const browser = await withTimeout(mod.chromium.launch({ headless: true }), timeoutMs, 'chromium.launch')
+    let browserVersion: string | null = null
+    try {
+        browserVersion = typeof browser.version === 'function' ? browser.version() : null
+    } finally {
+        await withTimeout(browser.close(), timeoutMs, 'browser.close')
+    }
+    return { spec, browserVersion, ms: Date.now() - t0 }
 }
 
 /** Real fs / module-resolution deps. */
@@ -125,4 +170,5 @@ export const realBoxToolingDeps = (): BoxToolingDeps => ({
         }
         return null
     },
+    launchProbe: () => realLaunchProbe(),
 })

@@ -32,7 +32,7 @@ import {
 } from './scenario.js'
 import { createUiDriver, resolveConsoleIntentsDir } from './ui/index.js'
 import { EXIT_CONSOLE_PIN_MISMATCH, runConsoleDeployPreflight } from './consoleDeploy.js'
-import { checkBoxTooling, EXIT_BOX_TOOLING, realBoxToolingDeps } from './boxTooling.js'
+import { boxToolingExitCode, checkBoxTooling, realBoxToolingDeps } from './boxTooling.js'
 import { $ } from 'zx'
 import type { StructuredLogEntry } from './types.js'
 import { EXIT_ENGINE_UNREACHABLE, installProcessGuards, timeoutSummary, walkExitCode } from './automergeTimeoutGuard.js'
@@ -432,18 +432,18 @@ const main = async () => {
     // the Intents checkout's node_modules, Chromium). Check before any pool contact → exit 11.
     if (args.ui && args.live && !args.noPreflight) {
         const harnessRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
-        const bt = checkBoxTooling({
+        const bt = await checkBoxTooling({
             harnessRoot,
             driverDir: join(harnessRoot, 'test/duration/ui'),
             intentsDir: resolveConsoleIntentsDir(),
         }, realBoxToolingDeps())
         console.log(`[duration] ${bt.message}`)
-        console.log(JSON.stringify({ event: 'box_tooling_preflight', ok: bt.ok, playwright: bt.playwright, chromium: bt.chromium, intents_playwright: bt.intentsPlaywright, problems: bt.problems }))
+        console.log(JSON.stringify({ event: 'box_tooling_preflight', ok: bt.ok, playwright: bt.playwright, chromium: bt.chromium, launch: bt.launch, intents_playwright: bt.intentsPlaywright, problems: bt.problems }))
         if (!bt.ok) {
             for (const p of bt.problems) console.error(`[duration] FATAL (box tooling): ${p}`)
             await uiDriver.close?.().catch(() => {})
             if (ops instanceof RealFleetOps) await ops.close().catch(() => {})
-            process.exit(EXIT_BOX_TOOLING)
+            process.exit(boxToolingExitCode(bt))
         }
     }
 
