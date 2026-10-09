@@ -635,7 +635,7 @@ describe('r53: Stage 2 already-docked shortcuts', () => {
         expect(o.calls).toEqual([`idea03 undock ${NC}`, `idea03 dock ${NC}`])
         expect(o.docked[NC]).toBe('idea03')
         expect(o.docked[K]).toBe('idea01')
-        expect(r.message).toMatch(/docked duration-kolibri-grade5a-001 \(\+ duration-nextcloud-grade5a-001\) on idea01 \(Stage 2 homes\) \[was not docked: duration-nextcloud-grade5a-001\]/)
+        expect(r.message).toMatch(/Stage 2 homes: docked duration-nextcloud-grade5a-001 \[already Docked\+mounted, not re-docked: duration-kolibri-grade5a-001\] \[was not docked: duration-nextcloud-grade5a-001\]/)
         expect(r.message).toMatch(/DURATION_NEXTCLOUD_URL=http:\/\/idea03:61820/)
         expect(r.dockedEngine).toBe('idea01')
     })
@@ -766,5 +766,55 @@ describe('reset-r53: undock → gap → dock, then verify the Engine took it', (
         expect(o.sleeps).toContain(5_000)
         expect(o.fastCycles).toBe(0)
         expect(o.docked[NC]).toBe('idea03')
+    })
+})
+
+// ── r55 (r54 step 58): the per-Pi dock path docks only the disks that need it ─────────
+describe('r55: infra_dock_fixture docks only what is not Docked+mounted', () => {
+    const saved = { ...process.env }
+    afterEach(() => {
+        vi.restoreAllMocks(); vi.unstubAllGlobals()
+        for (const k of ['DURATION_NEXTCLOUD_URL', 'DURATION_KOLIBRI_URL']) {
+            if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]
+        }
+    })
+    /** cover-all's real fixture set (scenarios/unified.yaml: all four infra_disk). */
+    const fullCtx = (o: CannedStage2, walkerEngine: string | null = 'idea01') => ({
+        ...(infraCtx(o, 'infra_dock_fixture', walkerEngine) as object),
+        fixtureDisks: [K, NC, E1, E2],
+    }) as never
+    it('r54 replay: eject_disk@45 ejected Nextcloud only → step 58 docks ONLY Nextcloud; Kolibri, empty-001, empty-002 untouched', async () => {
+        const o = liveCanned()
+        o.docked[NC] = null // Console eject@45: store undocked, partition present + unmounted on idea03
+        const r = await dispatchAction(fullCtx(o))
+        expect(r.ok, r.message).toBe(true)
+        // 1c5f167: + Engine eject, reset, undock, dock of empty-001 (idea03) and empty-002 (idea04).
+        expect(o.calls).toEqual([`idea03 undock ${NC}`, `idea03 dock ${NC}`])
+        expect(engineEjects).toEqual([])
+        expect(o.calls.some(c => c.includes(E1) || c.includes(E2) || c.includes(K))).toBe(false)
+        expect(r.message).toMatch(/Stage 2 homes: docked duration-nextcloud-grade5a-001 \[already Docked\+mounted, not re-docked: duration-kolibri-grade5a-001, duration-empty-001, duration-empty-002\]/)
+    })
+    it('step 61 after infra_undock_fixtures@60: every fixture is undocked → all docked again (Empties fresh)', async () => {
+        const o = liveCanned()
+        for (const d of [K, NC, E1, E2]) await o.undockFixtures(['idea01', 'idea03', 'idea04'], d)
+        o.calls = []
+        const r = await dispatchAction(fullCtx(o, null))
+        expect(r.ok, r.message).toBe(true)
+        expect(o.calls).toEqual([
+            `idea01 dock ${K}`, `idea03 dock ${NC}`,
+            `idea03 dock ${E1}`, `idea03 reset ${E1}`, `idea03 undock ${E1}`, `idea03 dock ${E1}`,
+            `idea04 dock ${E2}`, `idea04 reset ${E2}`, `idea04 undock ${E2}`, `idea04 dock ${E2}`,
+        ])
+        expect(r.message).not.toMatch(/already Docked\+mounted/)
+    })
+    it('an Empty docked in the store but NOT mounted is docked (no shortcut on a stale row)', async () => {
+        const o = liveCanned()
+        o.docked[NC] = null
+        const orig = o.findDockedEngine.bind(o)
+        o.docked[E1] = null
+        vi.spyOn(o, 'findDockedEngine').mockImplementation(async d => (d === E1 ? 'idea03' : orig(d))) // stale store row
+        expect(await o.stage2DockedAndMounted('idea03', E1)).toBe(false)
+        expect(await o.stage2DockedAndMounted('idea04', E2)).toBe(true)
+        expect(await o.stage2DockedAndMounted('idea01', E2)).toBe(false)
     })
 })

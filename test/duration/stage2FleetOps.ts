@@ -301,6 +301,17 @@ export class Stage2FleetOps extends RealFleetOps {
         await this.dockPartition(engineId, diskId)
     }
 
+    /**
+     * r55 (r54 step 58): true when the store has diskId Docked on engineId AND its partition is mounted
+     * there — such a disk needs no dock (an Empty would otherwise be ejected + reset + re-docked fresh).
+     * A moved copy is looked up by its META diskId on the move target.
+     */
+    async stage2DockedAndMounted(engineId: string, diskId: string): Promise<boolean> {
+        if ((await this.findDockedEngine(diskId)) !== engineId) return false
+        const p = this.partitionWith(await this.stage2Status(engineId), diskId)
+        return !!(p?.present && p.mounted)
+    }
+
     /** Engine eject (inherited, WS) first, then remove the partition so a later dock is a real add uevent. */
     override async undockFixtures(engineIds: string[], diskId: string): Promise<void> {
         const f = stage2Fixture(diskId)

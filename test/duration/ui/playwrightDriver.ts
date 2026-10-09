@@ -241,6 +241,9 @@ export class PlaywrightUiDriver implements UiDriver {
     private initPromise: Promise<void> | null = null
     /** --record-walk: which tab (Console or an App tab) is active right now. */
     private tabs = new ActiveTabTracker()
+    /** r55: every tab the context opened, with an open sequence number (post-use App tab check). */
+    private tabLog: { page: unknown; seq: number }[] = []
+    private tabSeqN = 0
 
     constructor(opts: PlaywrightUiOptions = {}) {
         this.opts = {
@@ -273,11 +276,43 @@ export class PlaywrightUiDriver implements UiDriver {
                     })
                 }
                 followContextTabs(this.context, this.tabs)
+                this.context.on?.('page', (p: unknown) => {
+                    this.tabLog.push({ page: p, seq: ++this.tabSeqN })
+                })
                 this.page = await this.context.newPage()
                 this.tabs.track(this.page as TrackablePage)
             })()
         }
         await this.initPromise
+    }
+
+    /** r55: sequence number of the newest tab opened so far (0 before any). */
+    tabSeq(): number {
+        return this.tabSeqN
+    }
+
+    /**
+     * r55: URLs of the Console page and every still-open tab, marking the active one and the ones
+     * opened after `sinceSeq` (fresh). The harness checks these against the store App URLs.
+     */
+    appTabs(sinceSeq = Number.POSITIVE_INFINITY): { url: string; active: boolean; fresh: boolean; console?: boolean }[] {
+        type P = { url?: () => string; isClosed?: () => boolean }
+        const urlOf = (p: unknown): string => {
+            try { return (p as P).url?.() ?? '' } catch { return '' }
+        }
+        const open = (p: unknown): boolean => {
+            try { return (p as P).isClosed?.() !== true } catch { return false }
+        }
+        if (!this.page) return []
+        const active = this.activePage()
+        const out: { url: string; active: boolean; fresh: boolean; console?: boolean }[] = [
+            { url: urlOf(this.page), active: active === this.page, fresh: false, console: true },
+        ]
+        for (const t of this.tabLog) {
+            if (t.page === this.page || !open(t.page)) continue
+            out.push({ url: urlOf(t.page), active: active === t.page, fresh: t.seq > sinceSeq })
+        }
+        return out
     }
 
     /** The tab the walker is on now: the newest / brought-to-front App tab, else the Console page. */
@@ -497,5 +532,7 @@ export class PlaywrightUiDriver implements UiDriver {
         this.bridge = null
         this.initPromise = null
         this.tabs = new ActiveTabTracker()
+        this.tabLog = []
+        this.tabSeqN = 0
     }
 }

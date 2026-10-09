@@ -20,6 +20,10 @@ import { waitForConvergence } from './convergence.js'
 import { parse as parseYaml } from 'yaml'
 import { finalizeRecordedFrame, framePath } from './recordWalk.js'
 import { DURATION_UI_FIXTURES } from './ui/fixtures.js'
+import {
+    APP_URL_ENV, CONSOLE_DEFAULT_SIDECAR_PORTS, INSTANCE_SIDECAR_ACTIONS, appKindForInstanceId, appTabProblems, appsUsedByStep,
+    assertNoManualAppOverride, idea166Target, isHarnessOwned, nextcloudUntrustedDomain, offPinRedirect, setHarnessEnv, type AppPin, type SidecarApp,
+} from './appUrls.js'
 import { backupDiskTargetId, describeDisk, diskEmptiness, eraseDiskTargetId, filesDiskTargetId, waitDiskEmpty } from './fixtureDisks.js'
 import { copyDoneBudgetMs, DEFAULT_NEXTCLOUD_READY_MS, envMs, instanceStartBudgetMs, logStartMeasured } from './startBudgets.js'
 
@@ -909,7 +913,9 @@ export const ensureAppOnlyDiskOnConsoleEngine = async (
     }
 
     if (diskId === ctx.fixtureDisk && moved && /kolibri/i.test(diskId)) {
-        syncKolibriSidecarUrlForEngine(engine, hostMapFromOps(ctx.opts.ops), env)
+        // Stage 2: from the store (instance's Pi + published port) — never the :18080 default.
+        if (isStage2(ctx)) await resyncFixtureSidecarUrlsFromStore(ctx, env, { ownerCheck: false })
+        else syncKolibriSidecarUrlForEngine(engine, hostMapFromOps(ctx.opts.ops), env)
     }
     return {
         diskId,
@@ -998,10 +1004,24 @@ const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
         return on && on !== stage2HomeOf(diskId) && !ctx.excludeEngines.includes(on) ? on : null
     }
     const kept: string[] = []
+    const alreadyUp: string[] = []
+    const docked: string[] = []
+    const opsS2 = ctx.opts.ops as FleetOps & { stage2DockedAndMounted?: (e: string, d: string) => Promise<boolean> }
     const dockOne = async (target: string, diskId: string) => {
         const on = await movedCopyOn(diskId)
-        if (on) kept.push(`${diskId} stays on ${on} (moved copy)`)
-        else await ctx.opts.ops.dockFixture(target, diskId)
+        if (on) {
+            kept.push(`${diskId} stays on ${on} (moved copy)`)
+            return
+        }
+        // r54 step 58: only the ejected Nextcloud needed docking, but the per-Pi path re-docked the
+        // Empties fresh too (Engine eject → reset → dock). Stage 2: a disk the store has Docked on its
+        // target AND whose partition is mounted there is left alone.
+        if (isStage2(ctx) && typeof opsS2.stage2DockedAndMounted === 'function' && (await opsS2.stage2DockedAndMounted(target, diskId))) {
+            alreadyUp.push(diskId)
+            return
+        }
+        await ctx.opts.ops.dockFixture(target, diskId)
+        docked.push(diskId)
     }
     await dockOne(engine, ctx.fixtureDisk)
     // Sibling fixtures (nextcloud) on the same engine so inventory sees both packs.
@@ -1016,10 +1036,12 @@ const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
         // each pointing at its own fixture's Pi — never the Console engine, never "any Pi".
         const urls = await resyncFixtureSidecarUrlsFromStore(ctx, process.env, { ownerCheck: false })
         const ncReady = await maybeWaitNextcloudAfterDock(ctx, stage2HomeOf(DURATION_UI_FIXTURES.nextcloud.diskId))
+        console.log(`[duration] stage2 infra_dock_fixture: docked [${docked.join(', ')}]; already Docked+mounted (left alone) [${alreadyUp.join(', ')}]`)
         return {
             ok: true,
             message:
-                `docked ${ctx.fixtureDisk}${sibMsg} on ${engine} (Stage 2 homes)` +
+                `Stage 2 homes: docked ${docked.length ? docked.join(', ') : 'none'}` +
+                `${alreadyUp.length ? ` [already Docked+mounted, not re-docked: ${alreadyUp.join(', ')}]` : ''}` +
                 `${notDocked.length ? ` [was not docked: ${notDocked.join(', ')}]` : ''}` +
                 `${kept.length ? ` [${kept.join('; ')}]` : ''}; ${urls}${ncReady ? `; ${ncReady}` : ''}`,
             dockedEngine: engine,
@@ -1049,14 +1071,22 @@ export const syncKolibriSidecarUrlForEngine = (
     engineId: string,
     hosts: Record<string, string> | undefined,
     env: NodeJS.ProcessEnv = process.env,
-    /** Stage 2: the instance's published port from the store (env DURATION_KOLIBRI_PORT still wins). */
+    /** Stage 2: the instance's published port from the store (Stage 1: env DURATION_KOLIBRI_PORT still wins). */
     storePort?: number,
+    /** Stage 2 (r55): the store port is mandatory and a manual DURATION_KOLIBRI_PORT never wins. */
+    opts: { stage2?: boolean } = {},
 ): string => {
     const authority = (hosts?.[engineId]?.trim() || engineId).replace(/\/$/, '')
-    const portRaw = env.DURATION_KOLIBRI_PORT?.trim()
-    const port = portRaw && /^\d+$/.test(portRaw) ? portRaw : storePort ? String(storePort) : '18080'
+    let port: string
+    if (opts.stage2) {
+        if (!storePort) throw new Error(`Stage 2: no store port for Kolibri on ${engineId} — refusing the Console default :${CONSOLE_DEFAULT_SIDECAR_PORTS.kolibri}`)
+        port = String(storePort)
+    } else {
+        const portRaw = env.DURATION_KOLIBRI_PORT?.trim()
+        port = portRaw && /^\d+$/.test(portRaw) ? portRaw : storePort ? String(storePort) : '18080'
+    }
     const url = `http://${authority}:${port}`
-    env.DURATION_KOLIBRI_URL = url
+    setHarnessEnv(env, 'DURATION_KOLIBRI_URL', url)
     return url
 }
 
@@ -1074,19 +1104,33 @@ export const syncNextcloudSidecarUrlForEngine = (
     env: NodeJS.ProcessEnv = process.env,
     /** Stage 2: the instance's published port from the store (READY: nextcloud 61820). */
     storePort?: number,
+    /**
+     * Stage 2 (r55): only a URL the harness itself set from the store is honoured; with none, the store
+     * port is mandatory (never the Console default :18280 = idea166's Nextcloud on idea01).
+     */
+    opts: { stage2?: boolean } = {},
 ): string => {
     const existing = env.DURATION_NEXTCLOUD_URL?.trim()
-    if (existing) {
+    if (existing && (!opts.stage2 || isHarnessOwned(env, 'DURATION_NEXTCLOUD_URL'))) {
         const url = existing.replace(/\/$/, '')
-        env.DURATION_NEXTCLOUD_URL = url
+        setHarnessEnv(env, 'DURATION_NEXTCLOUD_URL', url)
         return url
+    }
+    if (existing && opts.stage2) {
+        throw new Error(`Stage 2: DURATION_NEXTCLOUD_URL=${existing} was set outside the harness — refused (the URL comes from the store)`)
     }
     // Logical engine id / hostname — not hosts[engineId] Tailscale IP (r17 FAIL@58).
     const authority = engineId.replace(/\/$/, '')
-    const portRaw = env.DURATION_NEXTCLOUD_PORT?.trim()
-    const port = portRaw && /^\d+$/.test(portRaw) ? portRaw : storePort ? String(storePort) : '18280'
+    let port: string
+    if (opts.stage2) {
+        if (!storePort) throw new Error(`Stage 2: no store port for Nextcloud on ${engineId} — refusing the Console default :${CONSOLE_DEFAULT_SIDECAR_PORTS.nextcloud}`)
+        port = String(storePort)
+    } else {
+        const portRaw = env.DURATION_NEXTCLOUD_PORT?.trim()
+        port = portRaw && /^\d+$/.test(portRaw) ? portRaw : storePort ? String(storePort) : '18280'
+    }
     const url = `http://${authority}:${port}`
-    env.DURATION_NEXTCLOUD_URL = url
+    setHarnessEnv(env, 'DURATION_NEXTCLOUD_URL', url)
     return url
 }
 
@@ -1154,6 +1198,13 @@ export type WaitNextcloudSidecarOpts = {
     fetchImpl?: typeof fetch
     /** Inject sleep for unit tests. */
     sleepImpl?: (ms: number) => Promise<void>
+    /** Stage 2: URL only from the store (see syncNextcloudSidecarUrlForEngine opts.stage2). */
+    stage2?: boolean
+    /**
+     * r54 FAIL@58: Nextcloud answered HTTP 400 "Access through untrusted domain" for the whole 420 s.
+     * After this many consecutive untrusted-domain answers, fail at once (fixture trusted_domains). Default 30.
+     */
+    untrustedFailAfter?: number
 }
 
 /**
@@ -1166,7 +1217,7 @@ export const waitNextcloudSidecarReadyForEngine = async (
     opts: WaitNextcloudSidecarOpts = {},
 ): Promise<string> => {
     const env = opts.env ?? process.env
-    const base = syncNextcloudSidecarUrlForEngine(engineId, opts.hosts, env)
+    const base = syncNextcloudSidecarUrlForEngine(engineId, opts.hosts, env, undefined, { stage2: opts.stage2 })
     if (opts.skip) {
         return `DURATION_NEXTCLOUD_URL=${base} (wait skipped)`
     }
@@ -1176,14 +1227,45 @@ export const waitNextcloudSidecarReadyForEngine = async (
     const fetchImpl = opts.fetchImpl ?? globalThis.fetch
     const sleepImpl = opts.sleepImpl ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)))
     const loginUrl = `${base.replace(/\/$/, '')}/login`
+    const untrustedFailAfter = opts.untrustedFailAfter ?? 30
+    let untrusted = 0
     let last = 'no-attempt'
     while (Date.now() < deadline) {
         try {
-            const resp = await fetchImpl(loginUrl, {
-                redirect: 'follow',
-                signal: AbortSignal.timeout(5_000),
-            })
+            // Atlas reset-r54: never follow Nextcloud's overwrite.cli.url redirect to idea01:18280 —
+            // Stage 2 follows redirects by hand, only while they stay on the store host:port.
+            let resp = await fetchImpl(loginUrl, { redirect: opts.stage2 ? 'manual' : 'follow', signal: AbortSignal.timeout(5_000) })
+            if (opts.stage2) {
+                const u = new URL(base)
+                const pinLike = { hosts: [u.hostname], port: Number(u.port || 80) }
+                let at = loginUrl
+                for (let hop = 0; hop < 5 && resp.status >= 300 && resp.status < 400; hop++) {
+                    const loc = resp.headers.get('location')
+                    const off = offPinRedirect(resp.status, loc, at, pinLike)
+                    if (off) throw new NextcloudUntrustedError(`Nextcloud at ${base}: ${off}`)
+                    if (!loc) break
+                    at = new URL(loc, at).href
+                    resp = await fetchImpl(at, { redirect: 'manual', signal: AbortSignal.timeout(5_000) })
+                }
+            }
             const status = resp.status
+            if (status === 400) {
+                const body = await resp.text().catch(() => '')
+                if (nextcloudUntrustedDomain(status, body)) {
+                    untrusted++
+                    last = `HTTP 400 "Access through untrusted domain" ×${untrusted}`
+                    if (untrusted >= untrustedFailAfter) {
+                        throw new NextcloudUntrustedError(
+                            `Nextcloud at ${base} refuses host '${new URL(base).host}': HTTP 400 "Access through untrusted domain" ` +
+                                `${untrusted}× in a row — its config.php trusted_domains does not list this host:port. ` +
+                                `Nextcloud fixture config (not Engine, not the walk); no soft-pass, no other host.`,
+                        )
+                    }
+                    await sleepImpl(1_000)
+                    continue
+                }
+            }
+            untrusted = 0
             if (status >= 200 && status < 400) {
                 const html = await resp.text()
                 if (nextcloudLoginFormLooksReady(html)) {
@@ -1196,6 +1278,7 @@ export const waitNextcloudSidecarReadyForEngine = async (
                 last = `HTTP ${status}`
             }
         } catch (err) {
+            if (err instanceof NextcloudUntrustedError) throw err
             last = err instanceof Error ? err.message : String(err)
         }
         await sleepImpl(1_000)
@@ -1203,10 +1286,12 @@ export const waitNextcloudSidecarReadyForEngine = async (
     throw new Error(
         `Nextcloud sidecar not ready: ${loginUrl} within ${budget}ms (last=${last}). ` +
             `cover-all-230b70f-r16 FAIL@65 open_nextcloud_as_teacher — NC still booting after ` +
-            `infra_dock_fixture; Engine must poll :18280 login form (mirror Kolibri ` +
+            `infra_dock_fixture; Engine must poll the store port's login form (mirror Kolibri ` +
             `waitForSidecarHttpReady). Set DURATION_NEXTCLOUD_READY_MS / DURATION_NEXTCLOUD_URL|PORT.`,
     )
 }
+
+class NextcloudUntrustedError extends Error {}
 
 /** True when Nextcloud Grade5A (or any nextcloud disk) is among fixtures. */
 export const fixtureSetHasNextcloud = (
@@ -1231,6 +1316,7 @@ const maybeWaitNextcloudAfterDock = async (
     return waitNextcloudSidecarReadyForEngine(engineId, {
         hosts: hostMapFromOps(ctx.opts.ops),
         skip: !isLive,
+        stage2: isStage2(ctx),
     })
 }
 
@@ -1398,7 +1484,12 @@ export const resyncFixtureSidecarUrlsFromStore = async (
         if (engine) {
             // Stage 2: the store's port (a Kolibri moved to idea04 cannot use :18080 — idea04's own
             // native Kolibri holds it) + the sidecar-owner check (never an "any Pi answers" probe).
-            const url = syncKolibriSidecarUrlForEngine(engine, hosts, env, isStage2(ctx) ? port : undefined)
+            if (isStage2(ctx)) {
+                // r55: no manual / default URL or port survives in Stage 2 (store only).
+                if (!port) throw new Error(`Stage 2: ${instId} on ${engine} has no port in the store — refusing the Console default :${CONSOLE_DEFAULT_SIDECAR_PORTS.kolibri}`)
+                assertNoManualAppOverride(env, stage2PinFor('kolibri', instId, engine, port, hosts, status))
+            }
+            const url = syncKolibriSidecarUrlForEngine(engine, hosts, env, isStage2(ctx) ? port : undefined, { stage2: isStage2(ctx) })
             if (isStage2(ctx) && ownerCheck) notes.push(await stage2SidecarOwnerNote(ctx, engine, instId, port, status))
             notes.push(
                 `DURATION_KOLIBRI_URL=${url} (store: ${instId} on ${engine}` +
@@ -1413,14 +1504,25 @@ export const resyncFixtureSidecarUrlsFromStore = async (
         const [diskId, instId] = nc
         const { engine, port: storePort, status: ncStatus } = await locateInstanceEngine(ctx, instId, diskId)
         const prev = env.DURATION_NEXTCLOUD_URL
-        if (engine && isHarnessManagedUrl(prev, pool, hosts)) {
+        if (engine && isStage2(ctx)) {
+            // r55: Stage 2 Nextcloud URL = the store's Pi + port, always (a manual URL/port is refused, never kept).
+            if (!storePort) throw new Error(`Stage 2: ${instId} on ${engine} has no port in the store — refusing the Console default :${CONSOLE_DEFAULT_SIDECAR_PORTS.nextcloud}`)
+            const pin = stage2PinFor('nextcloud', instId, engine, storePort, hosts, ncStatus)
+            assertNoManualAppOverride(env, pin)
+            if (ownerCheck) notes.push(await stage2SidecarOwnerNote(ctx, engine, instId, storePort, ncStatus))
+            setHarnessEnv(env, 'DURATION_NEXTCLOUD_URL', pin.url)
+            notes.push(
+                `DURATION_NEXTCLOUD_URL=${pin.url} (store: ${instId} on ${engine}` +
+                    `${prev && prev.replace(/\/$/, '') !== pin.url ? `; was ${prev}` : ''})`,
+            )
+        } else if (engine && isHarnessManagedUrl(prev, pool, hosts)) {
             const portRaw = env.DURATION_NEXTCLOUD_PORT?.trim()
             // Stage 2: the store's port (READY: 61820 on idea03; 18280 is idea166's NC, not the fixture).
             const port = portRaw && /^\d+$/.test(portRaw) ? portRaw : isStage2(ctx) && storePort ? String(storePort) : '18280'
             if (isStage2(ctx) && ownerCheck) notes.push(await stage2SidecarOwnerNote(ctx, engine, instId, storePort, ncStatus))
             // Logical hostname, not Tailscale IP (NC trusted_domains, r17 FAIL@58).
             const url = `http://${engine}:${port}`
-            env.DURATION_NEXTCLOUD_URL = url
+            setHarnessEnv(env, 'DURATION_NEXTCLOUD_URL', url)
             notes.push(
                 `DURATION_NEXTCLOUD_URL=${url} (store: ${instId} on ${engine}` +
                     `${prev && prev.replace(/\/$/, '') !== url ? `; was ${prev}` : ''})`,
@@ -1452,6 +1554,184 @@ export const stage2SidecarOwnerNote = async (
     // verifySidecarOwner throws when no container of this instance publishes :port on this Pi.
     const owners = await ops.verifySidecarOwner(engine, instanceId, port)
     return `sidecar owner OK ${instanceId} → ${engine}:${port} (${owners.join(', ')})`
+}
+
+/** Every hostname that addresses `engine`: logical id, its --hosts IP, <id>.local. */
+const engineHostAliases = (engine: string, hosts: Record<string, string> | undefined): string[] =>
+    [...new Set([engine, `${engine}.local`, ...(hosts?.[engine]?.trim() ? [hosts[engine]!.trim()] : [])])]
+
+/**
+ * Store-derived App URL (Stage 2). Kolibri keeps the --hosts authority (Path B by IP, r15); Nextcloud and
+ * Kiwix use the logical hostname (Nextcloud trusted_domains, r17).
+ */
+export const stage2PinFor = (
+    app: SidecarApp,
+    instanceId: string,
+    engine: string,
+    port: number,
+    hosts: Record<string, string> | undefined,
+    status?: string,
+): AppPin => {
+    const authority = app === 'kolibri' ? (hosts?.[engine]?.trim() || engine) : engine
+    return {
+        app, instanceId, engine, port,
+        url: `http://${authority}:${port}`,
+        hosts: engineHostAliases(engine, hosts),
+        ...(status ? { status } : {}),
+    }
+}
+
+/** One App a step uses: which instance (and its disk, for the store lookup). */
+export interface AppUse { app: SidecarApp; instanceId: string; diskId: string }
+
+const diskOfInstance = (ctx: ActionContext, instanceId: string): string =>
+    Object.entries(ctx.fixtureInstances).find(([, i]) => i === instanceId)?.[0] ?? ''
+
+const fixtureInstanceFor = (ctx: ActionContext, app: SidecarApp): AppUse => {
+    const re = app === 'kolibri' ? /kolibri/i : app === 'nextcloud' ? /nextcloud/i : /kiwix|wikipedia/i
+    const hit = Object.entries(ctx.fixtureInstances).find(([d]) => re.test(d))
+    if (hit) return { app, diskId: hit[0], instanceId: hit[1] }
+    const f = DURATION_UI_FIXTURES[app]
+    return { app, diskId: f.diskId, instanceId: f.instanceId }
+}
+
+/**
+ * r55: which Apps (and instances) this step reaches through a sidecar URL. App states / App-named
+ * Intents → the fixture instance of that App; open_app / copy / move / restore settle → the
+ * instance the Console resolves (DURATION_START_INSTANCE_ID / ctx instance / backup source).
+ */
+export const stage2AppUsesForStep = (ctx: ActionContext, instanceId: string | undefined): AppUse[] => {
+    const uses: AppUse[] = appsUsedByStep({ action: ctx.action, to: ctx.to }).map(a => fixtureInstanceFor(ctx, a))
+    if (INSTANCE_SIDECAR_ACTIONS.has(ctx.action)) {
+        const id =
+            (ctx.action === 'open_app' ? process.env.DURATION_START_INSTANCE_ID?.trim() : undefined) ||
+            (ctx.action === 'restore_from_backup' ? process.env.DURATION_BACKUP_SOURCE_INSTANCE?.trim() : undefined) ||
+            instanceId ||
+            ctx.fixtureInstance
+        const app = appKindForInstanceId(id)
+        if (!uses.some(u => u.instanceId === id)) uses.push({ app, instanceId: id, diskId: diskOfInstance(ctx, id) })
+    }
+    return uses
+}
+
+/**
+ * Nextcloud must accept the host it is reached by: a 400 "Access through untrusted domain" (r54: the
+ * fixture's trusted_domains held only idea01:18280) fails here, not after a 90–420 s Console poll.
+ */
+const stage2NextcloudHostCheck = async (pin: AppPin): Promise<string> => {
+    let status = 0
+    let body = ''
+    try {
+        const r = await fetch(`${pin.url}/status.php`, { redirect: 'manual', signal: AbortSignal.timeout(5_000) })
+        status = r.status
+        body = status === 400 ? await r.text().catch(() => '') : ''
+        const off = offPinRedirect(status, r.headers.get('location'), `${pin.url}/status.php`, pin)
+        if (off) throw new Error(`Stage 2: Nextcloud ${pin.instanceId} at ${pin.url}: ${off}`)
+    } catch (e) {
+        if (e instanceof Error && e.message.startsWith('Stage 2:')) throw e
+        return `nextcloud host check: ${pin.url}/status.php unreachable (${e instanceof Error ? e.message : String(e)}) — Console readiness poll decides`
+    }
+    if (nextcloudUntrustedDomain(status, body)) {
+        throw new Error(
+            `Stage 2: Nextcloud ${pin.instanceId} at ${pin.url} answers HTTP 400 "Access through untrusted domain" — its ` +
+                `trusted_domains does not list ${new URL(pin.url).host}. Nextcloud fixture config; no soft-pass, no other host`,
+        )
+    }
+    return `nextcloud host check ${pin.url}/status.php HTTP ${status}`
+}
+
+/**
+ * r55 pre-use (Stage 2): pin each App's URL from the store (instance's own Pi + port) BEFORE the Intent,
+ * refuse manual overrides, prove the port is that instance's container on that Pi (Running instances;
+ * a not-yet-Running one is proven right after the Intent). Throws on any miss — no default port.
+ */
+export const pinAppsForStep = async (
+    ctx: ActionContext,
+    uses: AppUse[],
+    env: NodeJS.ProcessEnv = process.env,
+): Promise<{ pins: AppPin[]; note: string }> => {
+    const hosts = hostMapFromOps(ctx.opts.ops)
+    const pins: AppPin[] = []
+    const notes: string[] = []
+    const live = typeof (ctx.opts.ops as FleetOps & { verifySidecarOwner?: unknown }).verifySidecarOwner === 'function'
+    for (const use of uses) {
+        const dflt = CONSOLE_DEFAULT_SIDECAR_PORTS[use.app]
+        const loc = await locateInstanceEngine(ctx, use.instanceId, use.diskId)
+        if (!loc.engine || !loc.live) {
+            throw new Error(
+                `Stage 2: ${use.app} ${use.instanceId} has no live instance on a pool Pi in the store — its URL would fall back ` +
+                    `to the Console default :${dflt} on the Console host (idea166 sidecars answer there). No any-Pi fallback`,
+            )
+        }
+        if (!loc.port) {
+            throw new Error(`Stage 2: ${use.app} ${use.instanceId} on ${loc.engine} has no port in the store — refusing the Console default :${dflt}`)
+        }
+        const pin = stage2PinFor(use.app, use.instanceId, loc.engine, loc.port, hosts, loc.status)
+        const i166 = idea166Target(pin.url, loc.engine === 'idea01' ? pin.hosts : [])
+        if (i166) throw new Error(`Stage 2: ${use.app} ${use.instanceId} store URL ${pin.url} is ${i166} — never a Stage 2 fixture. No any-Pi fallback`)
+        assertNoManualAppOverride(env, pin)
+        setHarnessEnv(env, APP_URL_ENV[use.app], pin.url)
+        pins.push(pin)
+        if (loc.status === 'Running') {
+            notes.push(await stage2SidecarOwnerNote(ctx, loc.engine, use.instanceId, loc.port, loc.status))
+            if (use.app === 'nextcloud' && live) notes.push(await stage2NextcloudHostCheck(pin))
+        } else {
+            notes.push(`${use.instanceId} ${loc.status ?? 'status?'} on ${loc.engine} — owner check after the Intent`)
+        }
+        notes.push(`${APP_URL_ENV[use.app]}=${pin.url} (store: ${use.instanceId} on ${loc.engine}:${loc.port})`)
+    }
+    return { pins, note: notes.join('; ') }
+}
+
+/** Driver slice the post-use check needs (PlaywrightUiDriver implements it; Stub does not). */
+type TabAwareDriver = { appTabs?: (sinceSeq?: number) => { url: string; active: boolean; fresh: boolean; console?: boolean }[] }
+
+/**
+ * r55 post-use (Stage 2): every App tab the step used must address one of its store pins, and each used
+ * instance must still be Running and served by its own container on its own Pi. A relocation shows up
+ * as a re-pin note (the next use re-verifies); a wrong host/port tab or a missing owner fails the step.
+ */
+export const verifyAppUseAfterIntent = async (
+    ctx: ActionContext,
+    driver: TabAwareDriver,
+    uses: AppUse[],
+    pins: AppPin[],
+    tabSeq0: number | undefined,
+    env: NodeJS.ProcessEnv = process.env,
+): Promise<{ ok: true; note: string } | { ok: false; problem: string }> => {
+    const notes: string[] = []
+    if (typeof driver.appTabs === 'function') {
+        const hosts = hostMapFromOps(ctx.opts.ops)
+        const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
+        const consoleHosts = pool.flatMap(e => engineHostAliases(e, hosts))
+        const tabs = driver.appTabs(tabSeq0)
+        const problems = appTabProblems(tabs, pins, consoleHosts)
+        if (problems.length) return { ok: false, problem: problems.join('; ') }
+        notes.push(`app tabs on store URLs (${pins.map(p => p.url).join(', ')})`)
+    } else {
+        notes.push('app tab check n/a (driver has no tab list)')
+    }
+    for (const use of uses) {
+        try {
+            const loc = await locateInstanceEngine(ctx, use.instanceId, use.diskId)
+            if (!loc.engine || !loc.live || !loc.port) {
+                return { ok: false, problem: `${use.instanceId} has no live instance with a port in the store after the step — the App it used was not this instance. No soft-pass` }
+            }
+            if (loc.status !== 'Running') {
+                return { ok: false, problem: `${use.instanceId} is ${loc.status ?? 'unknown'} on ${loc.engine} after the step — the App it used was not this instance. No soft-pass` }
+            }
+            const pinned = pins.find(p => p.instanceId === use.instanceId)
+            if (pinned && (pinned.engine !== loc.engine || pinned.port !== loc.port)) {
+                const re = stage2PinFor(use.app, use.instanceId, loc.engine, loc.port, hostMapFromOps(ctx.opts.ops), loc.status)
+                setHarnessEnv(env, APP_URL_ENV[use.app], re.url)
+                notes.push(`${use.instanceId} now ${loc.engine}:${loc.port} (was ${pinned.engine}:${pinned.port}) → ${APP_URL_ENV[use.app]}=${re.url}`)
+            }
+            notes.push(await stage2SidecarOwnerNote(ctx, loc.engine, use.instanceId, loc.port, loc.status))
+        } catch (e) {
+            return { ok: false, problem: e instanceof Error ? e.message : String(e) }
+        }
+    }
+    return { ok: true, note: notes.join('; ') }
 }
 
 export type DurationOperationRow = {
@@ -2978,6 +3258,27 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             preStartSettleNote = `${preStartSettleNote ? `${preStartSettleNote}; ` : ''}sidecar URL resync failed: ${err}`
         }
     }
+    // r55: no any-Pi fallback for ANY App port (Stage 2). Every App this step reaches through a sidecar
+    // URL is pinned from the store (its own Pi + port) BEFORE the Intent, with the owner check; the
+    // Console default ports (Kolibri 18080, Nextcloud 18280, Kiwix 18380) can never apply silently.
+    let appUses: AppUse[] = []
+    let appPins: AppPin[] = []
+    let tabSeq0: number | undefined
+    if (isStage2(ctx)) {
+        appUses = stage2AppUsesForStep(ctx, instanceId)
+        if (appUses.length) {
+            try {
+                const r = await pinAppsForStep(ctx, appUses)
+                appPins = r.pins
+                if (r.note) preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${r.note}` : r.note
+            } catch (e) {
+                const err = e instanceof Error ? e.message : String(e)
+                return { ok: false, message: `${ctx.action} aborted before Intent: ${err}`, layer }
+            }
+            const d = driver as typeof driver & { tabSeq?: () => number }
+            tabSeq0 = typeof d.tabSeq === 'function' ? d.tabSeq() : undefined
+        }
+    }
     const intentStartedAt = Date.now()
     // Console 230b70f add_files_role clicks DURATION_FILES_DISK_ID before diskId — point
     // it at the app-only disk for this Intent only; restore the make_files_disk pin after
@@ -3031,6 +3332,15 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     let message = result.message ?? `${result.mode}: ${ctx.action}`
     if (preStartSettleNote) {
         message = `${message}; ${preStartSettleNote}`
+    }
+    // r55 post-use: the App tabs this step used must be on the store URLs, and each used instance must
+    // still be Running and owned by its own container on its own Pi (Stage 2; Intent ok only).
+    if (result.ok && appUses.length && isStage2(ctx)) {
+        const post = await verifyAppUseAfterIntent(ctx, driver as TabAwareDriver, appUses, appPins, tabSeq0)
+        if (!post.ok) {
+            return { ok: false, message: `${ctx.action}: ${post.problem} (Console Intent reported ok; ${preStartSettleNote ?? ''})`, layer }
+        }
+        if (post.note) message = `${message}; ${post.note}`
     }
     // r29 FAIL@97: a restore that the Engine never executed must not pass on a healthy
     // pre-existing sidecar. Live only; on Intent failure append the diagnosis.

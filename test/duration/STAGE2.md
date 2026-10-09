@@ -134,6 +134,39 @@ present + unmounted → `undock`, wait `DURATION_STAGE2_REDOCK_GAP_MS` (default 
 has the disk docked on that Pi AND the partition is mounted — otherwise it fails loud ("had no effect").
 Whole-SSD `dock-ssd` is unchanged. The Pi script is Atlas's and is not changed here.
 
+## No any-Pi fallback for any App port (r54 → r55)
+
+r54 steps 21–33 "passed" against `idea166-nextcloud-live-app` on idea01:18280 — the Console's default
+Nextcloud port on the Console host — not the fixture `nextcloud-grade5a-001` on idea03:61820 (whose
+`trusted_domains` only lists `idea01:18280`, so step 58 then failed on HTTP 400 "untrusted domain").
+Step 34 used `idea166-kiwix-live` on idea01:18380 the same way. The Console Intents (cda87d2
+`e2e/intents/sidecarUrls.ts`) resolve every App as `DURATION_<APP>_URL`, else Console host +
+`DURATION_<APP>_PORT`, else 18080 / 18280 / 18380. In Stage 2 (`test/duration/appUrls.ts`, `actions.ts`
+`pinAppsForStep` / `verifyAppUseAfterIntent`):
+
+- every step that lands in an App state (`kolibri_*`, `nc_*`, `wiki_*`), names an App
+  (`open_*_as_*`, `search_browse_wikipedia`), or opens/settles an instance (`open_app`, `copy_app`,
+  `move_app`, `restore_from_backup`) gets `DURATION_<APP>_URL` from the STORE (instance's Pi + published
+  port) before its Intent; no store instance / no port / a manual URL or port → the step fails;
+- the port must be that instance's container on that Pi (`verifySidecarOwner`), and Nextcloud must not
+  answer 400 "untrusted domain";
+- after the Intent, the active tab, any tab the step opened, and the Console page must be on a Console
+  host:8080 or on one of the step's store URLs (any alias of that Pi), and each used instance must still
+  be Running and owned — otherwise the step fails ("Console Intent reported ok");
+- `DURATION_NC_FILE_REQUEST_URL`, if set, must be on the Nextcloud store host:port;
+- the `infra_dock_fixture` Nextcloud wait uses the store URL only and fails fast on repeated
+  "untrusted domain" answers (`untrustedFailAfter`, default 30).
+
+Kiwix has no instance in the Stage 2 store, so `open_wikipedia_*` / `search_browse_wikipedia` fail
+loud until a Kiwix fixture exists.
+
+## infra_dock_fixture docks only what needs docking (r54 step 58)
+
+The per-Pi path used to dock every fixture disk, and an Empty dock is always fresh (Engine eject → reset
+→ dock), so step 58 re-made empty-001/002 although only Nextcloud had been ejected. Now a disk the store
+has Docked on its target AND whose partition is mounted there (`Stage2FleetOps.stage2DockedAndMounted`)
+is left alone; the step message lists `[already Docked+mounted, not re-docked: …]`.
+
 ## Smoke (D9)
 
 `test/duration/stage2Smoke.ts` (idea04 only, empty-002/003). Phases:

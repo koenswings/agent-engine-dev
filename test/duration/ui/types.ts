@@ -61,5 +61,12 @@ export interface UiDriver {
         hostname: string,
         opts?: { timeoutMs?: number; allowReload?: boolean },
     ): Promise<string>
+    /** r55 (optional): sequence number of the newest tab the browser context opened. */
+    tabSeq?(): number
+    /**
+     * r55 (optional): the Console page and every open tab — URL, whether it is the active tab, and
+     * whether it was opened after `sinceSeq`. Used to prove a step's App tabs are on store URLs.
+     */
+    appTabs?(sinceSeq?: number): { url: string; active: boolean; fresh: boolean; console?: boolean }[]
     close?(): Promise<void>
 }
