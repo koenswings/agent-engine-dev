@@ -17,6 +17,7 @@
  * remoteClient cache.
  */
 
+import { sshRetryPolicy, withSshRetry } from './sshRetry.js'
 import { Repo, type DocHandle, type DocumentId, type PeerId } from '@automerge/automerge-repo'
 import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websocket'
 import { $ } from 'zx'
@@ -376,6 +377,9 @@ const sshOpts = [
     '-o', 'StrictHostKeyChecking=no',
     '-o', 'UserKnownHostsFile=/dev/null',
     '-o', 'ConnectTimeout=10',
+    // r63: a link that dies mid-command fails (exit 255 'Timeout, server … not responding') instead of hanging.
+    '-o', 'ServerAliveInterval=10',
+    '-o', 'ServerAliveCountMax=3',
 ]
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
@@ -1335,7 +1339,7 @@ export class RealFleetOps implements FleetOps {
         assertPrivateDurationRoots(this.disksRoot, this.watchDir)
         const host = this.hostOf(engineId)
         const slots = requiredSlotNames()
-        const out = await this.ssh(host, buildSlotLayoutProbeRemote(this.disksRoot, slots))
+        const out = await this.sshRead(host, buildSlotLayoutProbeRemote(this.disksRoot, slots))
         return slotLayoutVerdict(engineId, host, this.disksRoot, parseSlotLayoutProbe(out), slots, minHelperVersion)
     }
 
@@ -1416,13 +1420,13 @@ export class RealFleetOps implements FleetOps {
     async probePeerHost(engineId: string): Promise<PeerHostProbe> {
         this.assertNotExcluded(engineId, 'probePeerHost')
         if (isNeverStoreProbe(engineId)) throw new Error(`RealFleetOps: probePeerHost refused for '${engineId}' (never idea02)`)
-        return parsePeerProbe(await this.ssh(this.hostOf(engineId), buildPeerProbeRemote()))
+        return parsePeerProbe(await this.sshRead(this.hostOf(engineId), buildPeerProbeRemote()))
     }
 
     async probeStoreConfig(engineId: string): Promise<string> {
         this.assertNotExcluded(engineId, 'probeStoreConfig')
         if (isNeverStoreProbe(engineId)) throw new Error(`RealFleetOps: probeStoreConfig refused for '${engineId}' (never idea02)`)
-        return this.ssh(this.hostOf(engineId), storeProbeScript())
+        return this.sshRead(this.hostOf(engineId), storeProbeScript())
     }
 
     /** idea#168 r38: the store doc the harness syncs from this Engine + whether that Engine's own engineDB row is in it. */
@@ -1446,9 +1450,27 @@ export class RealFleetOps implements FleetOps {
         }
     }
 
-    protected async ssh(host: string, remoteCmd: string): Promise<string> {
+    /** One ssh round-trip, no retry. */
+    protected async sshOnce(host: string, remoteCmd: string): Promise<string> {
         const result = await $`ssh ${sshOpts} ${`${this.sshUser}@${host}`} ${remoteCmd}`
         return result.stdout
+    }
+
+    /**
+     * ssh with NO retry by default (mutating calls: a reset after the remote ran would run them twice).
+     * `{ retry: true }` (use sshRead) retries transport failures only — see sshRetry.ts.
+     */
+    protected async ssh(host: string, remoteCmd: string, opts: { retry?: boolean } = {}): Promise<string> {
+        if (!opts.retry) return this.sshOnce(host, remoteCmd)
+        return withSshRetry(host, remoteCmd.replace(/\s+/g, ' ').slice(0, 80), () => this.sshOnce(host, remoteCmd), sshRetryPolicy(), {
+            sleep: ms => sleep(ms),
+            log: line => console.log(line),
+        })
+    }
+
+    /** Read-only probe (cat/ls/stat/findmnt/docker ps/lsblk/status): transport failures retried with backoff. */
+    protected sshRead(host: string, remoteCmd: string): Promise<string> {
+        return this.ssh(host, remoteCmd, { retry: true })
     }
 
     /**
@@ -1466,7 +1488,7 @@ export class RealFleetOps implements FleetOps {
         if (this.storeUrls[logicalId]) return toDocId(this.storeUrls[logicalId]!)
         const host = this.hostOf(logicalId)
         try {
-            const out = await this.ssh(
+            const out = await this.sshRead(
                 host,
                 'cat /home/pi/idea/agents/agent-engine-dev/store-identity/store-url.txt',
             )
@@ -1783,7 +1805,7 @@ export class RealFleetOps implements FleetOps {
                             dockerOk = undefined
                         } else {
                             // docker ps — names often contain instance id
-                            const result = await this.ssh(host, 'docker ps --format "{{.Names}}" 2>/dev/null || true')
+                            const result = await this.sshRead(host, 'docker ps --format "{{.Names}}" 2>/dev/null || true')
                             const names = (result ?? '').toLowerCase()
                             const missing = running.filter(i => !names.includes(i.id.toLowerCase())
                                 && !names.includes((i.name ?? '').toLowerCase()))
@@ -1986,7 +2008,7 @@ export class RealFleetOps implements FleetOps {
      */
     async probeConsoleDist(engineId: string): Promise<ConsoleDistProbe> {
         this.assertNotExcluded(engineId, 'probeConsoleDist')
-        const out = await this.ssh(this.hostOf(engineId), consoleDistProbeScript())
+        const out = await this.sshRead(this.hostOf(engineId), consoleDistProbeScript())
         return parseConsoleDistProbe(out)
     }
 
@@ -1999,7 +2021,7 @@ export class RealFleetOps implements FleetOps {
         if (!/^[A-Za-z0-9_.-]+$/.test(instanceId)) {
             throw new Error(`RealFleetOps: refuse docker filter for odd instance id '${instanceId}'`)
         }
-        const out = await this.ssh(
+        const out = await this.sshRead(
             this.hostOf(engineId),
             `docker ps --filter name='^${instanceId}-' --format '{{.Names}}' 2>/dev/null || true`,
         )
@@ -2034,7 +2056,7 @@ export class RealFleetOps implements FleetOps {
         if (!device || !/^idea-test-[0-9]+$/.test(device)) return null
         const dest = `${this.disksRoot}/${device}`
         const repo = `${dest}/backups/${instanceId}`
-        const out = await this.ssh(
+        const out = await this.sshRead(
             this.hostOf(engineId),
             `if [ -f '${dest}/BACKUP.yaml' ]; then cat '${dest}/BACKUP.yaml'; else echo '@@NO_BACKUP_YAML@@'; fi; ` +
                 `echo '@@REPO@@'; if [ -d '${repo}' ]; then ls -1A '${repo}'; else echo '@@NO_REPO@@'; fi`,
@@ -2117,7 +2139,7 @@ export class RealFleetOps implements FleetOps {
             'docker ps -a --format "{{.Names}}" 2>/dev/null || true',
         ].join('; ')
         try {
-            const listed = (await this.ssh(host, listRemote)).trim()
+            const listed = (await this.sshRead(host, listRemote)).trim()
             const names = listed.split(/\s+/).map(n => n.replace(/^\//, '')).filter(Boolean)
             const targets = names.filter(n =>
                 !n.includes('idea166-') &&
@@ -2355,13 +2377,13 @@ export class RealFleetOps implements FleetOps {
 
     /** Read-only scan of idea-test-1..8 on engineId (one SSH round-trip). */
     private async scanFixtureSlots(engineId: string, diskId: string) {
-        return parseFixtureSlotScan(await this.ssh(this.hostOf(engineId), buildFixtureSlotScanRemote(this.disksRoot, diskId)))
+        return parseFixtureSlotScan(await this.sshRead(this.hostOf(engineId), buildFixtureSlotScanRemote(this.disksRoot, diskId)))
     }
 
     /** Run the app-pack instance-data check for `root` on engineId. */
     private async checkInstanceData(engineId: string, root: string, spec: AppPackInstanceData): Promise<{ ok: boolean; detail: string }> {
         try {
-            return parseInstanceDataCheck(await this.ssh(
+            return parseInstanceDataCheck(await this.sshRead(
                 this.hostOf(engineId),
                 buildInstanceDataCheckRemote({ root, spec, sudoMode: this.sudoMode }),
             ))
@@ -2438,7 +2460,7 @@ export class RealFleetOps implements FleetOps {
         const host = this.hostOf(engineId)
         let scan: SlotLinkScan
         try {
-            scan = parseSlotLinkScan(await this.ssh(host, buildSlotLinkScanRemote(slot, this.sudoMode, skipDirs)))
+            scan = parseSlotLinkScan(await this.sshRead(host, buildSlotLinkScanRemote(slot, this.sudoMode, skipDirs)))
         } catch (e) {
             scan = { error: `link scan failed over SSH: ${e instanceof Error ? e.message : String(e)}`, outside: [] }
         }
@@ -2470,7 +2492,7 @@ export class RealFleetOps implements FleetOps {
         const host = this.hostOf(engineId)
         let res: { error: string | null; hits: MountHit[] }
         try {
-            res = parseMountScan(await this.ssh(host, buildMountScanRemote(roots)))
+            res = parseMountScan(await this.sshRead(host, buildMountScanRemote(roots)))
         } catch (e) {
             res = { error: `mount scan failed over SSH: ${e instanceof Error ? e.message : String(e)}`, hits: [] }
         }
@@ -2592,7 +2614,7 @@ export class RealFleetOps implements FleetOps {
             ?? (await this.hasHealthyFixtureTree(engineId, diskId, { requireInstanceData: false, refuseExternalLinks: false }))
         if (!device || !/^idea-test-[0-9]+$/.test(device)) return null
         const dest = `${this.disksRoot}/${device}`
-        const out = await this.ssh(this.hostOf(engineId), `findmnt -no FSTYPE '${dest}' || true`)
+        const out = await this.sshRead(this.hostOf(engineId), `findmnt -no FSTYPE '${dest}' || true`)
         return { device, dest, fsType: String(out ?? '').trim() }
     }
 
@@ -2610,7 +2632,7 @@ export class RealFleetOps implements FleetOps {
             ?? (await this.hasHealthyFixtureTree(engineId, diskId, { requireInstanceData: false, refuseExternalLinks: false }))
         if (!device || !/^idea-test-[0-9]+$/.test(device)) return null
         const dest = `${this.disksRoot}/${device}`
-        const out = await this.ssh(this.hostOf(engineId), `ls -1A '${dest}' 2>/dev/null || true`)
+        const out = await this.sshRead(this.hostOf(engineId), `ls -1A '${dest}' 2>/dev/null || true`)
         const entries = String(out ?? '').split('\n').map(l => l.trim()).filter(Boolean)
         return { dest, entries }
     }
@@ -2885,7 +2907,7 @@ export class RealFleetOps implements FleetOps {
         const deadline = Date.now() + timeoutMs
         let running: string[] = []
         for (;;) {
-            const out = await this.ssh(
+            const out = await this.sshRead(
                 host,
                 ids.map(id => `docker ps --filter name='^${id}-' --format '{{.Names}}' 2>/dev/null || true`).join('; '),
             ).catch(() => '')
@@ -2974,7 +2996,7 @@ export class RealFleetOps implements FleetOps {
         // re-links its own staged copies after the commit (same image, same file name).
         const moveTars = this.serviceTarsFor(diskId)
         const moveExclude = moveTars ? ['services'] : []
-        const plan = parseMovePlan(await this.ssh(srcHost, buildMovePlanRemote(srcSlot, this.sudoMode, skipDirs)))
+        const plan = parseMovePlan(await this.sshRead(srcHost, buildMovePlanRemote(srcSlot, this.sudoMode, skipDirs)))
         if (plan.error) throw new Error(`source ${fromEngine}:${srcSlot}: ${plan.error}`)
         if (plan.mountFsType) {
             throw new Error(
@@ -3087,10 +3109,10 @@ export class RealFleetOps implements FleetOps {
             // lastDocked, diskName quoting) — its identity (diskId + created) is compared parsed.
             const digestExclude = [...moveExclude, ...META_DIGEST_EXCLUDE]
             const [a, b, metaA, metaB] = await Promise.all([
-                this.ssh(srcHost, buildTreeDigestRemote(srcDigestRoot, spec.keyFile, this.sudoMode, skipPatterns, digestExclude)),
-                this.ssh(dstHost, buildTreeDigestRemote(staging, spec.keyFile, this.sudoMode, skipPatterns, digestExclude)),
-                this.ssh(srcHost, buildMetaCatRemote(srcDigestRoot, this.sudoMode)),
-                this.ssh(dstHost, buildMetaCatRemote(staging, this.sudoMode)),
+                this.sshRead(srcHost, buildTreeDigestRemote(srcDigestRoot, spec.keyFile, this.sudoMode, skipPatterns, digestExclude)),
+                this.sshRead(dstHost, buildTreeDigestRemote(staging, spec.keyFile, this.sudoMode, skipPatterns, digestExclude)),
+                this.sshRead(srcHost, buildMetaCatRemote(srcDigestRoot, this.sudoMode)),
+                this.sshRead(dstHost, buildMetaCatRemote(staging, this.sudoMode)),
             ])
             const metaSrc = parseMetaCat(metaA)
             const metaDst = parseMetaCat(metaB)

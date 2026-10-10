@@ -89,7 +89,11 @@ export class Stage2FleetOps extends RealFleetOps {
 
     private async rawCall(engineId: string, verb: Stage2DockVerb, args: { diskId?: string; as?: string } = {}) {
         if (args.diskId && verb !== 'dock-ssd' && verb !== 'eject-ssd' && verb !== 'status') this.assertSsdOnline(engineId, args.diskId)
-        const out = await this.ssh(this.s2host(engineId), buildStage2DockCmd(verb, args, this.dockScript))
+        // Only the read-only `status` verb is retried on a transport failure; dock/undock/eject/export/import/reset
+        // are never auto-retried (a reset after the script ran would run it twice).
+        const out = verb === 'status'
+            ? await this.sshRead(this.s2host(engineId), buildStage2DockCmd(verb, args, this.dockScript))
+            : await this.ssh(this.s2host(engineId), buildStage2DockCmd(verb, args, this.dockScript))
         const r = parseStage2DockJson(out, `${verb}@${engineId}`)
         if (!r.ok) throw new Error(`stage2-dock ${verb} ${args.diskId ?? ''} on ${engineId} returned ok=false: ${JSON.stringify(r).slice(0, 300)}`)
         return r
@@ -102,12 +106,12 @@ export class Stage2FleetOps extends RealFleetOps {
     }
 
     async stage2Status(engineId: string): Promise<Stage2Status> {
-        return parseStage2Status(await this.ssh(this.s2host(engineId), buildStage2DockCmd('status', {}, this.dockScript)))
+        return parseStage2Status(await this.sshRead(this.s2host(engineId), buildStage2DockCmd('status', {}, this.dockScript)))
     }
 
     /** Read-only: config.yaml + running Engine IDEA_* env (production's own sources). */
     async probeEngineConfig(engineId: string): Promise<EngineConfigProbe> {
-        return parseEngineConfigProbe(await this.ssh(this.s2host(engineId), buildEngineConfigProbe()))
+        return parseEngineConfigProbe(await this.sshRead(this.s2host(engineId), buildEngineConfigProbe()))
     }
 
     private async checkBoot(engineId: string): Promise<void> {
@@ -172,7 +176,7 @@ export class Stage2FleetOps extends RealFleetOps {
 
     /** Pi clock, ms since epoch (lastDocked is written by the Engine on that clock). */
     async piNowMs(engineId: string): Promise<number> {
-        const v = Number(String(await this.ssh(this.s2host(engineId), 'date +%s%3N')).trim())
+        const v = Number(String(await this.sshRead(this.s2host(engineId), 'date +%s%3N')).trim())
         if (!Number.isFinite(v) || v <= 0) throw new Error(`Stage 2: cannot read the clock on ${engineId}`)
         return v
     }
@@ -183,7 +187,7 @@ export class Stage2FleetOps extends RealFleetOps {
         await this.redockAfterBoot(engineId)
         const note = await waitRestartReconciled(engineId, restartAt, {
             readStore: () => this.readStore(engineId),
-            dockerPs: async () => String(await this.ssh(this.s2host(engineId), DOCKER_PS_CMD)),
+            dockerPs: async () => String(await this.sshRead(this.s2host(engineId), DOCKER_PS_CMD)),
             sleep: ms => this.sleepMs(ms),
             now: () => Date.now(),
         })
@@ -451,7 +455,7 @@ export class Stage2FleetOps extends RealFleetOps {
         const m = await this.stage2MountOf(engineId, diskId)
         if (!m) return null
         const repo = `${m.dest}/backups/${instanceId}`
-        const out = await this.ssh(this.s2host(engineId),
+        const out = await this.sshRead(this.s2host(engineId),
             `if [ -f '${m.dest}/BACKUP.yaml' ]; then cat '${m.dest}/BACKUP.yaml'; else echo '@@NO_BACKUP_YAML@@'; fi; ` +
             `echo '@@REPO@@'; if [ -d '${repo}' ]; then ls -1A '${repo}'; else echo '@@NO_REPO@@'; fi`)
         const [yamlPart, repoPart = ''] = String(out ?? '').split('@@REPO@@')
@@ -465,14 +469,14 @@ export class Stage2FleetOps extends RealFleetOps {
     override async probeFixtureFsType(engineId: string, diskId: string) {
         const m = await this.stage2MountOf(engineId, diskId)
         if (!m) return null
-        const out = await this.ssh(this.s2host(engineId), `findmnt -no FSTYPE '${m.dest}' || true`)
+        const out = await this.sshRead(this.s2host(engineId), `findmnt -no FSTYPE '${m.dest}' || true`)
         return { device: m.kname, dest: m.dest, fsType: String(out ?? '').trim() }
     }
 
     override async probeFixtureRootEntries(engineId: string, diskId: string) {
         const m = await this.stage2MountOf(engineId, diskId)
         if (!m) return null
-        const out = await this.ssh(this.s2host(engineId), `ls -1A '${m.dest}' 2>/dev/null || true`)
+        const out = await this.sshRead(this.s2host(engineId), `ls -1A '${m.dest}' 2>/dev/null || true`)
         return { dest: m.dest, entries: String(out ?? '').split('\n').map(l => l.trim()).filter(Boolean) }
     }
 
@@ -486,7 +490,7 @@ export class Stage2FleetOps extends RealFleetOps {
     async verifySidecarOwner(engineId: string, instanceId: string, port: number): Promise<string[]> {
         if (!RE_INSTANCE.test(instanceId)) throw new Error(`Stage2FleetOps: odd instance id '${instanceId}'`)
         if (!Number.isInteger(port) || port <= 0 || port > 65535) throw new Error(`Stage2FleetOps: bad port ${port}`)
-        const out = await this.ssh(this.s2host(engineId), buildSidecarOwnerProbe(instanceId, port))
+        const out = await this.sshRead(this.s2host(engineId), buildSidecarOwnerProbe(instanceId, port))
         const v = parseSidecarOwnerProbe(String(out ?? ''), port)
         if (!v.owners.length) {
             throw new Error(

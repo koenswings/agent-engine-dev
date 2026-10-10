@@ -3119,6 +3119,8 @@ describe('r30: real backup_instance before restore_from_backup (op Done + archiv
             disksRoot: '/home/pi/idea/duration-disks',
             hostOf: (e: string) => e,
             ssh: async (_h: string, cmd: string) => { cmds.push(cmd); return out },
+            // r63: read-only probes go through sshRead (transport retry); same fake.
+            sshRead: async (_h: string, cmd: string) => { cmds.push(cmd); return out },
         })
         const probe = (RealFleetOps.prototype as any).probeBackupDisk
         const ok = await probe.call(self(`${yaml(7)}@@REPO@@\nREADME\nconfig\ndata\n`), 'idea01', EMPTY2, INST)
