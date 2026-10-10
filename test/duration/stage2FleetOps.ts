@@ -11,6 +11,7 @@
  * copies trees into duration-disks: sshDockCopy / sshRemoveSentinel refuse. Disks are addressed
  * by diskId → PARTLABEL only (stage2-dock.sh); paths come from `status` (mounted /disks/<kname>).
  */
+import { waitRestartReconciled, DOCKER_PS_CMD } from './restartReconcile.js'
 import { RealFleetOps, protectedDiskReason, protectedDiskRefusal, type RealFleetOptions } from './realFleetOps.js'
 import {
     buildEngineConfigProbe, buildStage2DockCmd, parseEngineConfigProbe, parseStage2DockJson, parseStage2Status,
@@ -164,9 +165,30 @@ export class Stage2FleetOps extends RealFleetOps {
         }
     }
 
+    /** r60 FAIL@59: a real Engine restart never removes containers; neither does the Stage 2 --fast restart. */
+    protected override fastRestartClearsContainers(): boolean {
+        return false
+    }
+
+    /** Pi clock, ms since epoch (lastDocked is written by the Engine on that clock). */
+    async piNowMs(engineId: string): Promise<number> {
+        const v = Number(String(await this.ssh(this.s2host(engineId), 'date +%s%3N')).trim())
+        if (!Number.isFinite(v) || v <= 0) throw new Error(`Stage 2: cannot read the clock on ${engineId}`)
+        return v
+    }
+
     override async rebootEngine(engineId: string, fast: boolean): Promise<void> {
+        const restartAt = await this.piNowMs(engineId)
         await super.rebootEngine(engineId, fast)
         await this.redockAfterBoot(engineId)
+        const note = await waitRestartReconciled(engineId, restartAt, {
+            readStore: () => this.readStore(engineId),
+            dockerPs: async () => String(await this.ssh(this.s2host(engineId), DOCKER_PS_CMD)),
+            sleep: ms => this.sleepMs(ms),
+            now: () => Date.now(),
+        })
+        this.redockLog.push(`${engineId}: ${note}`)
+        console.log(`[Stage2FleetOps] ${note}`)
     }
 
     private async waitDocked(diskId: string, engineId: string): Promise<void> {

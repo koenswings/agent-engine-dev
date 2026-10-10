@@ -1718,6 +1718,9 @@ export class RealFleetOps implements FleetOps {
                 backupLinks: Array.isArray(disk.backupConfig?.links)
                     ? disk.backupConfig!.links.map(String)
                     : undefined,
+                ...(Number.isFinite(Number((disk as { lastDocked?: unknown }).lastDocked))
+                    ? { lastDocked: Number((disk as { lastDocked?: unknown }).lastDocked) }
+                    : {}),
             }
         }
 
@@ -2222,10 +2225,16 @@ export class RealFleetOps implements FleetOps {
         await this.runHealthWrap(this.healthWrapAfter)
     }
 
+    /** Stage 1 loop-fixture hygiene; Stage2FleetOps returns false (no container removal on a --fast restart). */
+    protected fastRestartClearsContainers(): boolean {
+        return true
+    }
+
     private async rebootAndReconnect(engineId: string, host: string, fast: boolean): Promise<void> {
         if (fast) {
-            // Clear Path A duration containers before pm2 so they do not survive as orphans.
-            await this.stopDurationFixtureContainers(host)
+            // Stage 1: clear Path A duration containers before pm2 so they do not survive as orphans.
+            // Stage 2 (r60 FAIL@59): a real Engine restart never removes containers — see fastRestartClearsContainers.
+            if (this.fastRestartClearsContainers()) await this.stopDurationFixtureContainers(host)
             console.log(`[RealFleetOps] pm2 restart engine on ${engineId} (${host})`)
             await this.ssh(host, 'pm2 restart engine')
             // Brief pause then wait for WS.

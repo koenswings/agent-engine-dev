@@ -84,6 +84,8 @@ export interface SemanticDisk {
     diskTypes?: string[]
     /** r30: Backup Disk backupConfig.links (instance ids). Not part of convergence equality. */
     backupLinks?: string[]
+    /** r61: Engine's last (re)processing of this disk, ms since epoch (Pi clock). Not part of convergence equality. */
+    lastDocked?: number
 }
 
 export interface SemanticEngine {
