@@ -194,3 +194,11 @@ remote engine and the page hostname for its own engine. The box resolver answers
 - Every `open_{kolibri,nextcloud,wikipedia}_as_*` step must show a tab from the Console Open
   (`<engine>.local:<port>`, or `<engine>:<port>` for the Console's own engine). A Path B tab (bare remote
   name or IP) or no tab fails the step (`consoleOpenProblem`). A real learner would have got nothing there.
+
+## r58: tab matching by port + engine host forms (r57 FAIL@35)
+
+For each App a step uses, the harness sets `DURATION_<APP>_HOSTS` next to `DURATION_<APP>_URL`. It lists the
+bare name, `.local`, the --hosts IP and the LAN IP. The LAN IP comes from store `engineDB[].lanAddress`
+(Engine PR #166), else from `DURATION_LAN_HOSTS`. The Console intents (Console PR #140) match tabs by port plus
+any of these host forms, not by exact origin. The Open check also accepts the engine's LAN IP, because
+Console #139 Open uses `engine.lanAddress`. Fallback tabs (bare remote name or Tailscale IP) still fail.

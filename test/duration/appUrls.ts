@@ -21,6 +21,45 @@ export type SidecarApp = 'kolibri' | 'nextcloud' | 'kiwix'
 export const SIDECAR_APPS: readonly SidecarApp[] = ['kolibri', 'nextcloud', 'kiwix']
 
 /** Console cda87d2 e2e/intents/sidecarUrls.ts SIDECAR_DEFAULT_PORTS — never allowed to apply in Stage 2. */
+/** r58: every host form of the App's engine for the Console intents' tab matching (Console PR #140). */
+export const APP_HOSTS_ENV: Readonly<Record<SidecarApp, string>> = {
+    kolibri: 'DURATION_KOLIBRI_HOSTS', nextcloud: 'DURATION_NEXTCLOUD_HOSTS', kiwix: 'DURATION_KIWIX_HOSTS',
+}
+
+/**
+ * r58: engine → school-LAN IP from DURATION_LAN_HOSTS ("idea01=10.99.0.11,idea03=10.99.0.13,…").
+ * Console #139 makes Open use engine.lanAddress, so a tab on the engine's LAN IP is a Console-Open tab.
+ * The fallback (Path B) never uses the LAN IP: it uses the bare name or the --hosts (Tailscale) address.
+ */
+export const lanHostsFromEnv = (env: NodeJS.ProcessEnv = process.env): Record<string, string> => {
+    const out: Record<string, string> = {}
+    for (const part of (env.DURATION_LAN_HOSTS ?? '').split(',')) {
+        const m = /^\s*([a-z0-9-]+)\s*=\s*([0-9a-f.:]+)\s*$/i.exec(part)
+        if (m) out[m[1]!] = m[2]!
+    }
+    return out
+}
+
+/**
+ * Engine PR #166: engineDB[id].lanAddress (bare IPv4) from a store view, merged over DURATION_LAN_HOSTS
+ * (the store wins). Only bare IPv4 literals are taken.
+ */
+export const lanHostsFromStore = (
+    engineDB: Record<string, { lanAddress?: string | null } | undefined> | undefined,
+    base: Record<string, string> = {},
+): Record<string, string> => {
+    const out = { ...base }
+    for (const [id, e] of Object.entries(engineDB ?? {})) {
+        const a = String(e?.lanAddress ?? '').trim()
+        if (/^\d{1,3}(\.\d{1,3}){3}$/.test(a)) out[id] = a
+    }
+    return out
+}
+
+/** r58: value for DURATION_<APP>_HOSTS — the pin's host forms plus the engine's LAN IP. */
+export const appHostForms = (pin: AppPin, lan: Record<string, string> = {}): string =>
+    [...new Set([...pin.hosts, ...(lan[pin.engine] ? [lan[pin.engine]!] : [])])].join(',')
+
 export const CONSOLE_DEFAULT_SIDECAR_PORTS: Readonly<Record<SidecarApp, number>> = { kolibri: 18080, nextcloud: 18280, kiwix: 18380 }
 export const APP_URL_ENV: Readonly<Record<SidecarApp, string>> = {
     kolibri: 'DURATION_KOLIBRI_URL', nextcloud: 'DURATION_NEXTCLOUD_URL', kiwix: 'DURATION_KIWIX_URL',
@@ -221,7 +260,12 @@ export const CONSOLE_OPEN_ACTION_RE = /^open_(kolibri|nextcloud|wikipedia)_as_(t
  * Open could have got nothing — fail loudly instead of letting the fallback pass the step.
  * A step that reused an already-open Console-Open tab of the same App passes too.
  */
-export const consoleOpenProblem = (action: string, tabs: AppTab[], pins: AppPin[]): string | null => {
+export const consoleOpenProblem = (
+    action: string,
+    tabs: AppTab[],
+    pins: AppPin[],
+    lan: Record<string, string> = {},
+): string | null => {
     const m = CONSOLE_OPEN_ACTION_RE.exec(action)
     if (!m) return null
     const app: SidecarApp = m[1] === 'wikipedia' ? 'kiwix' : (m[1] as SidecarApp)
@@ -235,7 +279,12 @@ export const consoleOpenProblem = (action: string, tabs: AppTab[], pins: AppPin[
     } catch {
         /* no Console tab listed */
     }
-    const openHosts = [`${pin.engine}.local`, ...(consoleHost === pin.engine ? [pin.engine] : [])]
+    // Console #139: Open uses engine.lanAddress (LAN IP) for a remote engine — also a Console-Open tab.
+    const openHosts = [
+        `${pin.engine}.local`,
+        ...(consoleHost === pin.engine ? [pin.engine] : []),
+        ...(lan[pin.engine] ? [lan[pin.engine]!] : []),
+    ]
     const fromOpen = (t: AppTab): boolean => {
         try {
             const u = new URL(t.url)

@@ -89,6 +89,8 @@ export interface SemanticDisk {
 export interface SemanticEngine {
     id: string
     hostname?: string
+    /** Engine PR #166: school-LAN IPv4 (absent on older Engines). Console #139 Open uses it. */
+    lanAddress?: string | null
 }
 
 export interface SettleReady {

@@ -21,7 +21,7 @@ import { parse as parseYaml } from 'yaml'
 import { finalizeRecordedFrame, framePath } from './recordWalk.js'
 import { DURATION_UI_FIXTURES } from './ui/fixtures.js'
 import {
-    APP_URL_ENV, CONSOLE_DEFAULT_SIDECAR_PORTS, INSTANCE_SIDECAR_ACTIONS, appKindForInstanceId, appTabProblems, appsUsedByStep, consoleOpenProblem, CONSOLE_OPEN_ACTION_RE,
+    APP_URL_ENV, CONSOLE_DEFAULT_SIDECAR_PORTS, INSTANCE_SIDECAR_ACTIONS, appKindForInstanceId, appTabProblems, appsUsedByStep, consoleOpenProblem, CONSOLE_OPEN_ACTION_RE, APP_HOSTS_ENV, appHostForms, lanHostsFromEnv, lanHostsFromStore,
     assertNoManualAppOverride, idea166Target, isHarnessOwned, nextcloudUntrustedDomain, offPinRedirect, setHarnessEnv, type AppPin, type SidecarApp,
 } from './appUrls.js'
 import { backupDiskTargetId, describeDisk, diskEmptiness, eraseDiskTargetId, filesDiskTargetId, waitDiskEmpty } from './fixtureDisks.js'
@@ -1640,6 +1640,23 @@ const stage2NextcloudHostCheck = async (pin: AppPin): Promise<string> => {
     return `nextcloud host check ${pin.url}/status.php HTTP ${status}`
 }
 
+/** r58: engine → LAN IP: store engineDB[].lanAddress (Engine PR #166) over DURATION_LAN_HOSTS. */
+export const stage2LanHosts = async (ctx: ActionContext, env: NodeJS.ProcessEnv = process.env): Promise<Record<string, string>> => {
+    const base = lanHostsFromEnv(env)
+    for (const e of ctx.poolEngines.filter(x => !ctx.excludeEngines.includes(x))) {
+        try {
+            const view = await ctx.opts.ops.readStore(e)
+            return lanHostsFromStore(view.engineDB as Record<string, { lanAddress?: string | null }>, base)
+        } catch {
+            /* try next */
+        }
+    }
+    return base
+}
+
+const withLan = (pin: AppPin, lan: Record<string, string>): AppPin =>
+    lan[pin.engine] && !pin.hosts.includes(lan[pin.engine]!) ? { ...pin, hosts: [...pin.hosts, lan[pin.engine]!] } : pin
+
 /**
  * r55 pre-use (Stage 2): pin each App's URL from the store (instance's own Pi + port) BEFORE the Intent,
  * refuse manual overrides, prove the port is that instance's container on that Pi (Running instances;
@@ -1654,6 +1671,7 @@ export const pinAppsForStep = async (
     const pins: AppPin[] = []
     const notes: string[] = []
     const live = typeof (ctx.opts.ops as FleetOps & { verifySidecarOwner?: unknown }).verifySidecarOwner === 'function'
+    const lan = uses.length ? await stage2LanHosts(ctx, env) : {}
     for (const use of uses) {
         const dflt = CONSOLE_DEFAULT_SIDECAR_PORTS[use.app]
         const loc = await locateInstanceEngine(ctx, use.instanceId, use.diskId)
@@ -1666,11 +1684,12 @@ export const pinAppsForStep = async (
         if (!loc.port) {
             throw new Error(`Stage 2: ${use.app} ${use.instanceId} on ${loc.engine} has no port in the store — refusing the Console default :${dflt}`)
         }
-        const pin = stage2PinFor(use.app, use.instanceId, loc.engine, loc.port, hosts, loc.status)
+        const pin = withLan(stage2PinFor(use.app, use.instanceId, loc.engine, loc.port, hosts, loc.status), lan)
         const i166 = idea166Target(pin.url, loc.engine === 'idea01' ? pin.hosts : [])
         if (i166) throw new Error(`Stage 2: ${use.app} ${use.instanceId} store URL ${pin.url} is ${i166} — never a Stage 2 fixture. No any-Pi fallback`)
         assertNoManualAppOverride(env, pin)
         setHarnessEnv(env, APP_URL_ENV[use.app], pin.url)
+        setHarnessEnv(env, APP_HOSTS_ENV[use.app], appHostForms(pin, lan))
         pins.push(pin)
         if (loc.status === 'Running') {
             notes.push(await stage2SidecarOwnerNote(ctx, loc.engine, use.instanceId, loc.port, loc.status))
@@ -1708,7 +1727,7 @@ export const verifyAppUseAfterIntent = async (
         const problems = appTabProblems(tabs, pins, consoleHosts)
         if (problems.length) return { ok: false, problem: problems.join('; ') }
         notes.push(`app tabs on store URLs (${pins.map(p => p.url).join(', ')})`)
-        const openProblem = consoleOpenProblem(ctx.action, tabs, pins)
+        const openProblem = consoleOpenProblem(ctx.action, tabs, pins, await stage2LanHosts(ctx, env))
         if (openProblem) return { ok: false, problem: openProblem }
         if (CONSOLE_OPEN_ACTION_RE.test(ctx.action)) notes.push('tab came from the Console Open (<engine>.local)')
     } else {
@@ -1727,6 +1746,7 @@ export const verifyAppUseAfterIntent = async (
             if (pinned && (pinned.engine !== loc.engine || pinned.port !== loc.port)) {
                 const re = stage2PinFor(use.app, use.instanceId, loc.engine, loc.port, hostMapFromOps(ctx.opts.ops), loc.status)
                 setHarnessEnv(env, APP_URL_ENV[use.app], re.url)
+                setHarnessEnv(env, APP_HOSTS_ENV[use.app], appHostForms(re, await stage2LanHosts(ctx, env)))
                 notes.push(`${use.instanceId} now ${loc.engine}:${loc.port} (was ${pinned.engine}:${pinned.port}) → ${APP_URL_ENV[use.app]}=${re.url}`)
             }
             notes.push(await stage2SidecarOwnerNote(ctx, loc.engine, use.instanceId, loc.port, loc.status))

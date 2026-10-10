@@ -1694,6 +1694,9 @@ export class RealFleetOps implements FleetOps {
             engineDB[logical] = {
                 id: logical,
                 hostname: eng.hostname != null ? String(eng.hostname) : undefined,
+                ...(typeof (eng as { lanAddress?: unknown }).lanAddress === 'string'
+                    ? { lanAddress: String((eng as { lanAddress?: unknown }).lanAddress) }
+                    : {}),
             }
         }
         // Ensure the queried logical engine appears even if live key differed
