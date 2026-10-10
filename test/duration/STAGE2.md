@@ -202,3 +202,21 @@ bare name, `.local`, the --hosts IP and the LAN IP. The LAN IP comes from store 
 (Engine PR #166), else from `DURATION_LAN_HOSTS`. The Console intents (Console PR #140) match tabs by port plus
 any of these host forms, not by exact origin. The Open check also accepts the engine's LAN IP, because
 Console #139 Open uses `engine.lanAddress`. Fallback tabs (bare remote name or Tailscale IP) still fail.
+
+## r59: instances settle after instance-changing steps (r58 FAIL@58)
+
+`instanceSettle.ts`. Each Engine is authoritative for the disks docked on it. Every instance on a docked disk
+must settle before the harness pins App URLs or uses Apps:
+- Running or Pauzed with a port, or Stopped or Docked, counts as settled. Missing is ignored.
+- Undocked, Starting, or Running without a port means keep waiting.
+- Error fails at once.
+
+The wait is bounded by `DURATION_INSTANCE_SETTLE_MS` (default 300 s) and dumps every instance's status, port and
+disk on timeout. It runs at three points:
+- at the start of every Stage 2 URL resync (dock, move, backup co-locate, sidecar-settle Intents);
+- before every App pin (`pinAppsForStep`);
+- after every step in `SETTLE_AFTER_ACTIONS` (`settleAfterStep`): dock 58/61, reboot 59/128, move 62, copy 43/116,
+  move_app 102, restore 100, start 109/115, backup 98/112, make_backup 95, make_files 91, add_files 93,
+  cancel_eject 107, notice_usb_dock 55, confirm_erase 105.
+
+It only reads the store. No user action is retried.

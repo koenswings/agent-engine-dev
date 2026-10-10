@@ -20,6 +20,7 @@ import { waitForConvergence } from './convergence.js'
 import { parse as parseYaml } from 'yaml'
 import { finalizeRecordedFrame, framePath } from './recordWalk.js'
 import { DURATION_UI_FIXTURES } from './ui/fixtures.js'
+import { SETTLE_AFTER_ACTIONS, waitInstancesSettled } from './instanceSettle.js'
 import {
     APP_URL_ENV, CONSOLE_DEFAULT_SIDECAR_PORTS, INSTANCE_SIDECAR_ACTIONS, appKindForInstanceId, appTabProblems, appsUsedByStep, consoleOpenProblem, CONSOLE_OPEN_ACTION_RE, APP_HOSTS_ENV, appHostForms, lanHostsFromEnv, lanHostsFromStore,
     assertNoManualAppOverride, idea166Target, isHarnessOwned, nextcloudUntrustedDomain, offPinRedirect, setHarnessEnv, type AppPin, type SidecarApp,
@@ -1463,6 +1464,14 @@ const isHarnessManagedUrl = (
  * env at it. Nextcloud is only rewritten when its URL is harness-managed (unset or a
  * pool hostname/IP), so manual overrides survive. Never points at an excluded engine.
  */
+/** r59: Stage 2 — wait until every instance on a docked disk has settled (see instanceSettle.ts). */
+export const stage2WaitInstancesSettled = async (ctx: ActionContext, label: string): Promise<string> => {
+    if (!isStage2(ctx)) return ''
+    const engines = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
+    const pollMs = ctx.opts.fast ? Number(process.env.DURATION_INSTANCE_SETTLE_POLL_MS ?? 3_000) : 3_000
+    return waitInstancesSettled(label, { engines, readStore: e => ctx.opts.ops.readStore(e), pollMs })
+}
+
 export const resyncFixtureSidecarUrlsFromStore = async (
     ctx: ActionContext,
     env: NodeJS.ProcessEnv = process.env,
@@ -1473,6 +1482,8 @@ export const resyncFixtureSidecarUrlsFromStore = async (
     const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
     const hosts = hostMapFromOps(ctx.opts.ops)
     const notes: string[] = []
+    // r59 (r58 FAIL@58): never read a port while an instance on a docked disk is still starting.
+    if (isStage2(ctx)) notes.push(await stage2WaitInstancesSettled(ctx, `${ctx.action}: instance settle before URL resync`))
     const entries = Object.entries(ctx.fixtureInstances)
     const kolibri =
         entries.find(([d]) => /kolibri/i.test(d)) ??
@@ -1672,6 +1683,7 @@ export const pinAppsForStep = async (
     const notes: string[] = []
     const live = typeof (ctx.opts.ops as FleetOps & { verifySidecarOwner?: unknown }).verifySidecarOwner === 'function'
     const lan = uses.length ? await stage2LanHosts(ctx, env) : {}
+    if (uses.length) notes.push(await stage2WaitInstancesSettled(ctx, `${ctx.action}: instance settle before App pin`))
     for (const use of uses) {
         const dflt = CONSOLE_DEFAULT_SIDECAR_PORTS[use.app]
         const loc = await locateInstanceEngine(ctx, use.instanceId, use.diskId)
@@ -3532,6 +3544,25 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
 }
 
 export const dispatchAction = async (ctx: ActionContext): Promise<ActionResult> => {
+    return settleAfterStep(ctx, await dispatchActionInner(ctx))
+}
+
+/**
+ * r59: after a dock/redock/move/copy/reboot/restore step, every instance on a docked disk must settle
+ * (left Undocked/Starting, port when running) before the next step pins URLs or uses Apps. A failed step
+ * is returned as is; a settle failure turns an ok step into a loud failure with the field dump.
+ */
+export const settleAfterStep = async (ctx: ActionContext, r: ActionResult): Promise<ActionResult> => {
+    if (!r.ok || !isStage2(ctx) || !SETTLE_AFTER_ACTIONS.has(ctx.action)) return r
+    try {
+        const note = await stage2WaitInstancesSettled(ctx, `${ctx.action}: instance settle after step`)
+        return { ...r, message: `${r.message}; ${note}` }
+    } catch (e) {
+        return { ...r, ok: false, message: `${r.message}; ${e instanceof Error ? e.message : String(e)}` }
+    }
+}
+
+const dispatchActionInner = async (ctx: ActionContext): Promise<ActionResult> => {
     switch (ctx.action) {
         case 'return_to_start':
             return returnToStart(ctx)
