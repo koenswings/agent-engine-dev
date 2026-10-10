@@ -13,6 +13,7 @@ export type { UiDriver, UiIntentContext, UiIntentResult } from './types.js'
 export { StubUiDriver } from './stubDriver.js'
 export {
     PlaywrightUiDriver,
+    hostResolverRulesFor,
     resolveConsoleIntentsDir,
     type PlaywrightUiOptions,
 } from './playwrightDriver.js'
@@ -28,6 +29,8 @@ export interface CreateUiDriverOpts {
     intentsDir?: string
     headless?: boolean
     failLoud?: boolean
+    /** r57: --hosts map → browser resolves `<engine>.local` (Console Open URLs) to it. */
+    hosts?: Record<string, string>
 }
 
 /** Factory: Stub for Fake/CI; Playwright when --ui (never silent Stub fallback for registered Intents). */
@@ -40,5 +43,6 @@ export const createUiDriver = (opts: CreateUiDriverOpts): UiDriver => {
         intentsDir: dir ?? opts.intentsDir,
         headless: opts.headless,
         failLoud: opts.failLoud,
+        ...(opts.hosts ? { hosts: opts.hosts } : {}),
     })
 }

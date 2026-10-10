@@ -21,7 +21,7 @@ import { parse as parseYaml } from 'yaml'
 import { finalizeRecordedFrame, framePath } from './recordWalk.js'
 import { DURATION_UI_FIXTURES } from './ui/fixtures.js'
 import {
-    APP_URL_ENV, CONSOLE_DEFAULT_SIDECAR_PORTS, INSTANCE_SIDECAR_ACTIONS, appKindForInstanceId, appTabProblems, appsUsedByStep,
+    APP_URL_ENV, CONSOLE_DEFAULT_SIDECAR_PORTS, INSTANCE_SIDECAR_ACTIONS, appKindForInstanceId, appTabProblems, appsUsedByStep, consoleOpenProblem, CONSOLE_OPEN_ACTION_RE,
     assertNoManualAppOverride, idea166Target, isHarnessOwned, nextcloudUntrustedDomain, offPinRedirect, setHarnessEnv, type AppPin, type SidecarApp,
 } from './appUrls.js'
 import { backupDiskTargetId, describeDisk, diskEmptiness, eraseDiskTargetId, filesDiskTargetId, waitDiskEmpty } from './fixtureDisks.js'
@@ -1708,6 +1708,9 @@ export const verifyAppUseAfterIntent = async (
         const problems = appTabProblems(tabs, pins, consoleHosts)
         if (problems.length) return { ok: false, problem: problems.join('; ') }
         notes.push(`app tabs on store URLs (${pins.map(p => p.url).join(', ')})`)
+        const openProblem = consoleOpenProblem(ctx.action, tabs, pins)
+        if (openProblem) return { ok: false, problem: openProblem }
+        if (CONSOLE_OPEN_ACTION_RE.test(ctx.action)) notes.push('tab came from the Console Open (<engine>.local)')
     } else {
         notes.push('app tab check n/a (driver has no tab list)')
     }

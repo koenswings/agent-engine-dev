@@ -46,6 +46,25 @@ export interface PlaywrightUiOptions {
      * ok:false (open_video/open_exercise fail-loud).
      */
     failLoud?: boolean
+    /**
+     * r57 (r56 step 34): engine id → reachable address (the --hosts map). The Console's own Open
+     * button opens `http://<engine>.local:<port>` (AppCard.tsx appUrl). The box cannot resolve mDNS
+     * `.local` names (its resolver answers 198.18.0.1, a sink), so Chromium opened NO tab at all and
+     * only the intents' Path B fallback hid it. Mapping `<engine>.local` → the --hosts address in the
+     * browser's resolver lets the real Console Open produce the real tab (no fallback, no URL rewrite).
+     */
+    hosts?: Record<string, string>
+}
+
+/** r57: Chromium --host-resolver-rules mapping `<engine>.local` (and bare `<engine>`) to its --hosts IP. */
+export const hostResolverRulesFor = (hosts: Record<string, string> | undefined): string | null => {
+    const rules: string[] = []
+    for (const [engine, addr] of Object.entries(hosts ?? {})) {
+        const a = addr?.trim()
+        if (!/^[a-z0-9-]+$/i.test(engine) || !a || !/^[0-9a-f.:]+$/i.test(a)) continue
+        rules.push(`MAP ${engine}.local ${a}`)
+    }
+    return rules.length ? rules.join(', ') : null
 }
 
 type DurationIntentResult = {
@@ -233,6 +252,7 @@ export class PlaywrightUiDriver implements UiDriver {
         headless: boolean
         failLoud: boolean
         intentsDir: string | null
+        hosts?: Record<string, string>
     }
     private browser: Awaited<ReturnType<PlaywrightModule['chromium']['launch']>> | null = null
     private context: Awaited<ReturnType<Awaited<ReturnType<PlaywrightModule['chromium']['launch']>>['newContext']>> | null = null
@@ -253,6 +273,7 @@ export class PlaywrightUiDriver implements UiDriver {
             headless: opts.headless !== false,
             failLoud: opts.failLoud !== false,
             intentsDir: resolveConsoleIntentsDir(opts.intentsDir),
+            ...(opts.hosts ? { hosts: opts.hosts } : {}),
         }
         // Allow construct without sibling if package resolves at runIntent time;
         // createUiDriver still prefers resolveConsoleIntentsDir for fail-fast.
@@ -264,7 +285,11 @@ export class PlaywrightUiDriver implements UiDriver {
             this.initPromise = (async () => {
                 this.bridge = await loadPixelBridge(this.opts.intentsDir)
                 const { mod: pw } = await loadPlaywright()
-                this.browser = await pw.chromium.launch({ headless: this.opts.headless })
+                const rules = hostResolverRulesFor(this.opts.hosts)
+                this.browser = await pw.chromium.launch({
+                    headless: this.opts.headless,
+                    ...(rules ? { args: [`--host-resolver-rules=${rules}`] } : {}),
+                })
                 this.context = await this.browser.newContext({ baseURL: this.opts.baseUrl })
                 // Force demoMode OFF before first Console goto (idea01:8080 / not localhost).
                 // Sticky localStorage.demoMode==='true' (Pixel bootDemo) must not override

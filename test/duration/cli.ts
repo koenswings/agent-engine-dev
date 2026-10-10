@@ -396,6 +396,7 @@ const main = async () => {
         baseUrl: args.consoleUrl,
         headless: true,
         failLoud: true,
+        ...(hosts ? { hosts } : {}),
     })
 
     const commonStart = {

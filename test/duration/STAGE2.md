@@ -181,3 +181,16 @@ is left alone; the step message lists `[already Docked+mounted, not re-docked: �
 ```
 DURATION_FLEET_HOSTS=idea01=…,idea03=…,idea04=… npx tsx test/duration/stage2Smoke.ts --out <dir> --cycles 10
 ```
+
+## r57: the Console Open must open the App tab (r56 FAIL@34)
+
+The Console's Open (`AppCard.tsx` `window.open(http://<engineHostname>:<port>)`) uses `<engine>.local` for a
+remote engine and the page hostname for its own engine. The box resolver answers `.local` with a sink
+(198.18.0.1), so Chromium opened **no tab**. Kiwix (single-shot open in `wikipedia.ts`) failed. NC and Kolibri
+"passed" only through the intents' Path B (goto the pinned URL), which hid the same dead Open.
+
+- The Playwright driver launches Chromium with `--host-resolver-rules=MAP <engine>.local <--hosts addr>`. The
+  real Console Open now produces the real tab. Nothing is rewritten, and there is no fallback.
+- Every `open_{kolibri,nextcloud,wikipedia}_as_*` step must show a tab from the Console Open
+  (`<engine>.local:<port>`, or `<engine>:<port>` for the Console's own engine). A Path B tab (bare remote
+  name or IP) or no tab fails the step (`consoleOpenProblem`). A real learner would have got nothing there.

@@ -207,3 +207,49 @@ export const offPinRedirect = (status: number, location: string | null, base: st
     const i = idea166Target(target)
     return `HTTP ${status} redirect to ${target}${i ? ` = ${i}, not a fixture` : ''} — off the store URL; not followed (Nextcloud overwrite.cli.url?). No any-Pi fallback`
 }
+
+// ── r57 (r56 step 34): the Console's own Open must have produced the App tab ──
+
+/** App-open Intents whose tab must come from the Console's Open button (AppCard window.open). */
+export const CONSOLE_OPEN_ACTION_RE = /^open_(kolibri|nextcloud|wikipedia)_as_(teacher|learner)$/
+
+/**
+ * The Console Open opens `http://<engine>.local:<port>` (agent-console AppCard.tsx appUrl; the Console's own
+ * engine keeps the page hostname, e.g. idea01). The intents'
+ * Path B fallback instead opens the pinned store URL (`<engine>` or the --hosts IP), so a tab on
+ * `<engine>.local:<port>` proves the real Open worked. Path B (or no tab) means a real learner clicking
+ * Open could have got nothing — fail loudly instead of letting the fallback pass the step.
+ * A step that reused an already-open Console-Open tab of the same App passes too.
+ */
+export const consoleOpenProblem = (action: string, tabs: AppTab[], pins: AppPin[]): string | null => {
+    const m = CONSOLE_OPEN_ACTION_RE.exec(action)
+    if (!m) return null
+    const app: SidecarApp = m[1] === 'wikipedia' ? 'kiwix' : (m[1] as SidecarApp)
+    const pin = pins.find(p => p.app === app)
+    if (!pin) return null
+    // The Console builds the URL from its engine hostname: `<engine>.local` for a remote engine, and the
+    // page's own hostname for the engine serving the Console (r57 probe: Kolibri on idea01 → idea01:18080).
+    let consoleHost = ''
+    try {
+        consoleHost = new URL(tabs.find(t => t.console)?.url ?? '').hostname
+    } catch {
+        /* no Console tab listed */
+    }
+    const openHosts = [`${pin.engine}.local`, ...(consoleHost === pin.engine ? [pin.engine] : [])]
+    const fromOpen = (t: AppTab): boolean => {
+        try {
+            const u = new URL(t.url)
+            return openHosts.includes(u.hostname) && portOf(u) === pin.port
+        } catch {
+            return false
+        }
+    }
+    const fresh = tabs.filter(t => t.fresh && !t.console)
+    if (fresh.some(fromOpen)) return null
+    if (!fresh.length && tabs.some(t => !t.console && fromOpen(t))) return null
+    const seen = fresh.map(t => t.url).join(', ') || 'no new tab'
+    return (
+        `${action}: the Console's Open for ${pin.instanceId} did not produce a tab on ${openHosts.map(h => `http://${h}:${pin.port}`).join(' / ')} ` +
+        `(saw: ${seen}). A Path B tab on the store URL does not count — a real user clicking Open would have got nothing. No soft-pass`
+    )
+}

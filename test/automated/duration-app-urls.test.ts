@@ -127,7 +127,9 @@ describe('r55: steps 21–33 cannot pass on idea01:18280', () => {
 
     it('READY store: the Nextcloud URL is pinned to idea03:61820 BEFORE step 21 and every NC step, never the Console default', async () => {
         const { ops, owner } = mkOps()
-        const { driver, seen } = mkDriver((a, env) => (appOf(a, '') === 'nextcloud' ? consoleResolve('nextcloud', env) : null))
+        // r57: an open_nextcloud_* tab is what the Console Open opens (<engine>.local:<store port>).
+        const { driver, seen } = mkDriver((a, env) =>
+            appOf(a, '') !== 'nextcloud' ? null : /^open_nextcloud_as_/.test(a) ? 'http://idea03.local:61820/login' : consoleResolve('nextcloud', env))
         for (const s of STEPS_21_33.filter(x => x.action !== 'return_to_start')) {
             const r = await dispatchAction(ctxFor(ops, driver, s, s.n))
             expect(r.ok, `${s.n} ${s.action}: ${r.message}`).toBe(true)
@@ -277,10 +279,18 @@ describe('r55: no fallback for any App (Kolibri, Nextcloud, Kiwix, copies)', () 
 
     it('a Kolibri tab via the logical hostname (Path A) is the same Pi + port → accepted', async () => {
         const { ops } = mkOps()
-        const { driver } = mkDriver(() => 'http://idea01:18080/en/coach/')
+        const { driver } = mkDriver(() => 'http://idea01:18080/en/coach/') // real Console Open on its own engine (r57 probe)
         const r = await dispatchAction(ctxFor(ops, driver, { from: 'console_teacher', to: 'kolibri_manage', action: 'open_kolibri_as_teacher' }, 2))
         expect(r.ok, r.message).toBe(true)
         expect(r.message).toMatch(/app tabs on store URLs \(http:\/\/10.0.0.1:18080\)/)
+    })
+
+    it('r57 (r56 replay): open_* whose only tab is the Path B store URL fails — a dead Console Open is not masked', async () => {
+        const { ops } = mkOps()
+        const { driver } = mkDriver(() => 'http://10.0.0.1:18080/en/coach/')
+        const r = await dispatchAction(ctxFor(ops, driver, { from: 'console_teacher', to: 'kolibri_manage', action: 'open_kolibri_as_teacher' }, 2))
+        expect(r.ok).toBe(false)
+        expect(r.message).toMatch(/Console's Open for kolibri-grade5a-001 did not produce a tab on http:\/\/idea01\.local:18080/)
     })
 
     it('an instance that is not Running after the step fails (the App used was not this instance)', async () => {
