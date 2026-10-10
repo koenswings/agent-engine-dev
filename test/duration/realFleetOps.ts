@@ -20,6 +20,7 @@
 import { sshRetryPolicy, withSshRetry } from './sshRetry.js'
 import { Repo, type DocHandle, type DocumentId, type PeerId } from '@automerge/automerge-repo'
 import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websocket'
+import { headsKey, recordReconnect, staleViewMs } from './staleView.js'
 import { $ } from 'zx'
 import type { Store } from '../../src/data/Store.js'
 import { runningInstanceExpectsLocalDocker } from './stability.js'
@@ -1933,6 +1934,53 @@ export class RealFleetOps implements FleetOps {
         return structuredClone(this.toSemanticView(engineId, doc))
     }
 
+    private readonly viewSeen = new Map<string, { heads: string; changedAt: number }>()
+
+    private headsOf(c: Conn): string[] | null {
+        try {
+            return (c.storeHandle as unknown as { heads?: () => string[] }).heads?.() ?? null
+        } catch {
+            return null
+        }
+    }
+
+    /** Is the Engine's HTTP port answering (the Pi is up)? 3 s, read-only GET. */
+    protected async engineHttpUp(host: string): Promise<boolean> {
+        const port = Number(process.env.DURATION_ENGINE_HTTP_PORT ?? 8080)
+        try {
+            const r = await fetch(`http://${host}:${port}/`, { signal: AbortSignal.timeout(3_000) })
+            return r.status > 0
+        } catch {
+            return false
+        }
+    }
+
+    /**
+     * r66 stale-view guard: drop the cached store connection to `engineId`, open a fresh one and report
+     * whether it sees data the cached view lacked (heads differ). EVERY call is recorded (staleView.ts):
+     * run.log line, RECONNECTS.md, duration_summary. Returns foundNew (null when the reconnect failed).
+     */
+    async refreshView(engineId: string, reason: string): Promise<boolean | null> {
+        this.assertNotExcluded(engineId, 'refreshView')
+        const t0 = Date.now()
+        const old = this.conns.get(engineId)
+        const beforeHeads = old ? headsKey(this.headsOf(old)) : 'no-conn'
+        try {
+            const fresh = await this.connect(engineId, true)
+            const afterHeads = headsKey(this.headsOf(fresh))
+            const foundNew = afterHeads !== beforeHeads
+            this.viewSeen.set(engineId, { heads: afterHeads, changedAt: Date.now() })
+            recordReconnect({ engine: engineId, at: t0, reason, foundNew, beforeHeads, afterHeads, tookMs: Date.now() - t0 })
+            return foundNew
+        } catch (e) {
+            recordReconnect({
+                engine: engineId, at: t0, reason, foundNew: null, beforeHeads, afterHeads: 'n/a', tookMs: Date.now() - t0,
+                error: e instanceof Error ? e.message : String(e),
+            })
+            return null
+        }
+    }
+
     /**
      * r29 FAIL@97: read-only list of operationDB rows (restore/copy/move evidence).
      * Never calls storeHandle.change().
@@ -1941,7 +1989,16 @@ export class RealFleetOps implements FleetOps {
         { id: string; kind: string; status: string; startedAt: number | null; completedAt: number | null; error: string | null; args: Record<string, string> }[]
     > {
         this.assertNotExcluded(engineId, 'listOperations')
-        const conn = await this.connect(engineId)
+        let conn = await this.connect(engineId)
+        // r66 stale-view guard (b): a doc unchanged for DURATION_STALE_VIEW_MS while the Pi answers → reconnect.
+        const key = headsKey(this.headsOf(conn))
+        const seen = this.viewSeen.get(engineId)
+        const now = Date.now()
+        if (!seen || seen.heads !== key) this.viewSeen.set(engineId, { heads: key, changedAt: now })
+        else if (now - seen.changedAt >= staleViewMs() && await this.engineHttpUp(conn.host)) {
+            await this.refreshView(engineId, `doc unchanged ${Math.round((now - seen.changedAt) / 1000)}s while ${engineId} is up`)
+            conn = await this.connect(engineId)
+        }
         const doc = conn.storeHandle.doc() as (Store & { operationDB?: Record<string, unknown> }) | undefined
         if (!doc) {
             throw new Error(`RealFleetOps: store doc not ready for ${engineId}`)

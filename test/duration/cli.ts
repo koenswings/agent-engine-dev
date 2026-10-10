@@ -34,6 +34,7 @@ import { createUiDriver, resolveConsoleIntentsDir } from './ui/index.js'
 import { EXIT_CONSOLE_PIN_MISMATCH, runConsoleDeployPreflight } from './consoleDeploy.js'
 import { boxToolingExitCode, checkBoxTooling, realBoxToolingDeps } from './boxTooling.js'
 import { $ } from 'zx'
+import { reconnectLine, reconnectSummary, writeReconnectsMd } from './staleView.js'
 import { createHash } from 'node:crypto'
 import type { StructuredLogEntry } from './types.js'
 import { EXIT_ENGINE_UNREACHABLE, installProcessGuards, timeoutSummary, walkExitCode } from './automergeTimeoutGuard.js'
@@ -756,6 +757,17 @@ const main = async () => {
     console.log(JSON.stringify(timeoutSummary()))
     const summary = { ...buildRunSummary({ walk, result, recoveries: recoveryCounter.snapshot() }), ...(stage2Fields ?? {}) }
     console.log(JSON.stringify(summary))
+    // r66: RECONNECTS.md (every forced stale-view reconnect) next to run.log; a FAIL-NOTE quotes reconnectLine().
+    const evidenceDir = args.recordWalkDir ?? process.env.DURATION_EVIDENCE_DIR?.trim()
+    if (evidenceDir) {
+        try {
+            const p = writeReconnectsMd(evidenceDir)
+            console.log(JSON.stringify({ event: 'stale_view_reconnects', path: p, line: reconnectLine(), ...reconnectSummary() }))
+        } catch (e) {
+            console.error(`[duration] could not write RECONNECTS.md: ${e instanceof Error ? e.message : String(e)}`)
+        }
+    }
+    console.log(`[duration] ${reconnectLine()}`)
     console.log(formatRunSummaryLine(summary) + (stage2Fields
         ? ` | STAGE 2: ${stage2Fields.stage2NotCovered.map(n => `@${n.step} ${n.action} = network copy`).join(', ') || 'no gap steps'} (physical move not covered)`
         : ''))

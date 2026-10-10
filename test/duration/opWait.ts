@@ -29,6 +29,8 @@ export interface OpWaitIo {
     sleep: (ms: number) => Promise<void>
     now: () => number
     log?: (line: string) => void
+    /** r66 stale-view guard: force a reconnect + re-read of this engine's store view (counted by the caller). */
+    refresh?: (engine: string, reason: string) => Promise<boolean | null>
 }
 
 /** Budget per kind: copy/move DURATION_COPY_DONE_MS (fast 300 s / 900 s), restore DURATION_RESTORE_DONE_MS (default = copy). */
@@ -38,8 +40,17 @@ export const opDoneBudgetMs = (kind: WaitOpKind, fast: boolean, env: NodeJS.Proc
     if (kind === 'backupApp') return envMs(env, 'DURATION_BACKUP_DONE_MS', copy, 0)
     return copy
 }
-/** How long an Operation may take to appear after Confirm (DURATION_OP_APPEAR_MS, default 30 s). */
-export const opAppearBudgetMs = (env: NodeJS.ProcessEnv = process.env): number => envMs(env, 'DURATION_OP_APPEAR_MS', 30_000, 0)
+/** r66: how long an Operation may take to appear after Confirm (DURATION_OP_APPEAR_MS; default and floor 60 s). */
+export const MIN_OP_APPEAR_MS = 60_000
+/** Explicit env values below 60 s are honoured (unit tests) but logged loudly. */
+export const opAppearBudgetMs = (env: NodeJS.ProcessEnv = process.env): number => opStartBudget(env, 'DURATION_OP_APPEAR_MS')
+export const opStartBudget = (env: NodeJS.ProcessEnv, key: string): number => {
+    const raw = env[key]?.trim()
+    if (!raw || !/^\d+$/.test(raw)) return MIN_OP_APPEAR_MS
+    const v = Number(raw)
+    if (v < MIN_OP_APPEAR_MS) console.warn(`[duration] ${key}=${v}ms is below the ${MIN_OP_APPEAR_MS}ms op-start minimum (r65 FAIL@43)`)
+    return v
+}
 
 const fmt = (r: OpRow & { engine: string }, now: number) =>
     `${r.engine}:${r.kind}#${r.id} status=${r.status} instance=${r.args?.instanceId ?? '?'} ` +
@@ -52,6 +63,7 @@ export const waitOperationTerminal = async (
     let rows: (OpRow & { engine: string })[] = []
     let errs: string[] = []
     let lastStatus = ''
+    let refreshed = false
     for (;;) {
         rows = []; errs = []
         for (const e of io.engines) {
@@ -84,6 +96,11 @@ export const waitOperationTerminal = async (
             if (op.status === 'Failed' || op.status === 'Cancelled') {
                 return { status: 'Error', detail: `${q.kind} ${op.status}: ${op.error ?? 'no error text'} | ${dump()}`, opId: op.id, elapsedMs }
             }
+        } else if (elapsedMs >= appearMs && io.refresh && !refreshed) {
+            // r66: before declaring NotSeen, distrust the cached view once: reconnect every engine and re-read.
+            refreshed = true
+            for (const e of io.engines) await io.refresh(e, `${q.kind} wait saw no Operation for ${q.instanceId ?? 'any'} after ${elapsedMs}ms`)
+            continue
         } else if (elapsedMs >= appearMs) {
             return { status: 'NotSeen', detail: `no ${q.kind} Operation for ${q.instanceId ?? 'any instance'} since ${q.sinceMs} within ${appearMs}ms | ${dump()}`, elapsedMs }
         }

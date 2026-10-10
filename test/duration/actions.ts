@@ -6,7 +6,7 @@
  * Usage/operator Intents: StubUiDriver (Fake CI) or PlaywrightUiDriver → Pixel getIntent.
  */
 
-import { WAIT_OP_ACTIONS, opAppearBudgetMs, opDoneBudgetMs, waitOperationTerminal, type WaitOperationFn } from './opWait.js'
+import { opStartBudget, WAIT_OP_ACTIONS, opAppearBudgetMs, opDoneBudgetMs, waitOperationTerminal, type WaitOperationFn } from './opWait.js'
 import { STAGE2_MOVE_TARGET_HOST, stage2HomeOf } from './stage2.js'
 import type {
     DurationOptions,
@@ -1781,6 +1781,18 @@ export type DurationOperationRow = {
 }
 
 /**
+ * r66 stale-view guard (r65 FAIL@43): force a reconnect + re-read of every pool engine's store view before a
+ * post-check gives up on "no Operation". Each reconnect is counted (staleView.ts). Returns false when the
+ * ops have no refreshView (Fake ops) so the caller fails as before.
+ */
+export const refreshViews = async (ctx: ActionContext, pool: string[], reason: string): Promise<boolean> => {
+    const ops = ctx.opts.ops as { refreshView?: (e: string, why: string) => Promise<boolean | null> }
+    if (typeof ops.refreshView !== 'function') return false
+    for (const e of pool.filter(x => !isNeverEngine(x))) await ops.refreshView(e, reason)
+    return true
+}
+
+/**
  * cover-all-980e735-r29 FAIL@97: Eng 8d98718 rejected `restoreApp kolibri Duration Tests —
  * Add Files App` ("Too many arguments", space-split disk name): no Operation, no instance,
  * no container. With a correct sidecar URL the Console settle would have seen the
@@ -1804,9 +1816,12 @@ export const verifyRestoreOperation = async (
     const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
     const found: (DurationOperationRow & { engine: string })[] = []
     const readErrors: string[] = []
+    const scanRestore = async () => {
+    found.length = 0
+    readErrors.length = 0
     for (const eng of pool) {
         try {
-            const rows = await opsAny.listOperations(eng)
+            const rows = await opsAny.listOperations!(eng)
             for (const r of rows) {
                 if (r.kind !== 'restoreApp') continue
                 if (typeof r.startedAt !== 'number' || r.startedAt < sinceMs - slackMs) continue
@@ -1816,6 +1831,10 @@ export const verifyRestoreOperation = async (
             readErrors.push(`${eng}: ${e instanceof Error ? e.message : String(e)}`)
         }
     }
+    }
+    await scanRestore()
+    // r66 stale-view guard: distrust the cached view once before declaring never_started.
+    if (!found.length && await refreshViews(ctx, pool, 'restoreApp post-check saw no Operation')) await scanRestore()
     const errNote = readErrors.length ? ` (store read errors: ${readErrors.join('; ')})` : ''
     if (!found.length) {
         return {
@@ -2126,7 +2145,7 @@ export const verifyCopyOperation = async (
     ctx: ActionContext,
     sinceMs: number,
     expect: { instanceId?: string },
-    opts: { startBudgetMs?: number; doneBudgetMs?: number; pollMs?: number; slackMs?: number; traceSlackMs?: number } = {},
+    opts: { startBudgetMs?: number; doneBudgetMs?: number; pollMs?: number; slackMs?: number; traceSlackMs?: number; startClockMs?: number } = {},
     env: NodeJS.ProcessEnv = process.env,
 ): Promise<{ ok: boolean; reason: CopyCheckReason; note: string } | null> => {
     const ops = ctx.opts.ops as BackupOps
@@ -2135,15 +2154,17 @@ export const verifyCopyOperation = async (
         const raw = env[k]?.trim()
         return raw && /^\d+$/.test(raw) ? Number(raw) : undefined
     }
-    const startBudget = opts.startBudgetMs ?? envMs('DURATION_COPY_START_MS') ?? (ctx.opts.fast ? 5_000 : 30_000)
+    // r65 FAIL@43: was fast 5 s counted from the Intent's return. r66: ≥ 60 s (env floor), clock from Confirm.
+    const startBudget = opts.startBudgetMs ?? opStartBudget(env, 'DURATION_COPY_START_MS')
     const doneBudget = opts.doneBudgetMs ?? copyDoneBudgetMs(!!ctx.opts.fast, env)
     const pollMs = opts.pollMs ?? 1_000
     const slackMs = opts.slackMs ?? 5_000
     const traceSlackMs = opts.traceSlackMs ?? 5_000
     const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e))
     const terminal = (st: string) => st === 'Done' || st === 'Failed' || st === 'Cancelled'
-    const t0 = Date.now()
+    const t0 = opts.startClockMs ?? Date.now()
     let rows: (DurationOperationRow & { engine: string })[] = []
+    let viewRefreshed = false
     let readErrors: string[] = []
     let refusal: (DurationCommandTrace & { engine: string }) | undefined
     const scan = async () => {
@@ -2184,6 +2205,10 @@ export const verifyCopyOperation = async (
         if (rs.some(r => r.status === 'Done')) break
         if (rs.length && rs.every(r => terminal(r.status))) break
         if (!rs.length && refusal) break
+        if (!rs.length && elapsed >= startBudget && !viewRefreshed && await refreshViews(ctx, pool, `copyApp post-check saw no Operation after ${elapsed}ms`)) {
+            viewRefreshed = true
+            continue
+        }
         if (!rs.length && elapsed >= startBudget) break
         if (elapsed >= startBudget + doneBudget) break
         await sleep(pollMs)
@@ -2597,6 +2622,7 @@ export const verifyBackupOperation = async (
     // older backupApp trace (an earlier walk) is not taken for this click.
     const traceSlackMs = opts.traceSlackMs ?? 5_000
     const t0 = Date.now()
+    let viewRefreshed = false
     let rows: (DurationOperationRow & { engine: string })[] = []
     let readErrors: string[] = []
     let traces: (DurationCommandTrace & { engine: string })[] = []
@@ -2658,6 +2684,10 @@ export const verifyBackupOperation = async (
         if (mine.length && mine.every(r => terminal(r.status))) break
         // r36@98: refusal ends the wait once background CommandLog has settled — never blocks ops polls.
         if (!rows.length && earlyTracesSettled && refusal()) break
+        if (!rows.length && elapsed >= startBudget && !viewRefreshed && await refreshViews(ctx, pool, `backupApp post-check saw no Operation after ${elapsed}ms`)) {
+            viewRefreshed = true
+            continue
+        }
         if (!rows.length && elapsed >= startBudget) break
         if (rows.length && !mine.length && rows.every(r => terminal(r.status)) && elapsed >= startBudget) break
         if (elapsed >= startBudget + doneBudget) break
@@ -3017,13 +3047,15 @@ const layerForUiAction = (action: string, fallback: Layer | null): Layer => {
  * r64 (r63 FAIL@43): the store-backed Operation wait handed to copy/move/restore Intents (live ops only).
  * Read-only: listOperations on every pool engine; bounded by opDoneBudgetMs; logged per status change.
  */
-export const waitOperationFor = (ctx: ActionContext): WaitOperationFn | undefined => {
+export const waitOperationFor = (ctx: ActionContext, onConfirm?: (sinceMs: number) => void): WaitOperationFn | undefined => {
     const kind = WAIT_OP_ACTIONS[ctx.action]
-    const ops = ctx.opts.ops as BackupOps
+    const ops = ctx.opts.ops as BackupOps & { refreshView?: (e: string, reason: string) => Promise<boolean | null> }
     if (!kind || typeof ops.listOperations !== 'function') return undefined
     const engines = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e))
     return async q => {
+        onConfirm?.(q.sinceMs)
         const r = await waitOperationTerminal(q, {
+            ...(typeof ops.refreshView === 'function' ? { refresh: (e: string, why: string) => ops.refreshView!(e, why) } : {}),
             listOperations: e => ops.listOperations!(e),
             engines,
             sleep: ms => new Promise(res => setTimeout(res, ms)),
@@ -3348,6 +3380,9 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     const prevEmptyPin = process.env.DURATION_EMPTY_DISK_ID
     if (pinnedEmptyId) process.env.DURATION_EMPTY_DISK_ID = pinnedEmptyId
     let result: Awaited<ReturnType<typeof driver.runIntent>>
+    // r66: the Intent reports its Confirm time through the op-wait hook; the post-check clock starts there.
+    let confirmAtMs: number | undefined
+    const waitOp = waitOperationFor(ctx, ms => { confirmAtMs = ms })
     try {
         result = await driver.runIntent({
             action: ctx.action,
@@ -3357,7 +3392,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
                 ? (isStage2(ctx) ? stage2HomeOf(diskId) : resolveConsoleEngineHost(ctx))
                 : (rebootTarget ?? backupDockedEngine ?? ctx.walker.dockedEngine ?? ctx.poolEngines[0]),
             screenshotPath: shotPath,
-            ...(waitOperationFor(ctx) ? { waitOperation: waitOperationFor(ctx)! } : {}),
+            ...(waitOp ? { waitOperation: waitOp } : {}),
         })
     } finally {
         if (ctx.action === 'add_files_role') {
@@ -3439,9 +3474,9 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     }
     // copy_app: "Intent ok" is not enough — the copyApp Operation must end Done (live only).
     if (ctx.action === 'copy_app' && result.ok) {
-        const check = await verifyCopyOperation(ctx, intentStartedAt, {
+        const check = await verifyCopyOperation(ctx, confirmAtMs ?? intentStartedAt, {
             instanceId: process.env.DURATION_COPY_INSTANCE_ID?.trim() || instanceId || ctx.fixtureInstance,
-        })
+        }, { startClockMs: confirmAtMs })
         if (check && !check.ok) {
             return { ok: false, message: `copy_app: ${check.note} (Console Intent reported ok)`, layer }
         }

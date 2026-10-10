@@ -3771,7 +3771,7 @@ describe('idea#168 run summary: shake-out labelling + keep_editing recovery coun
         expect(s.lastStep).toEqual({ step: 128, action: 'reboot_engine' })
         expect(shakeOutSummary(walk)).toBeNull()
         expect(shakeOutSummary(null)).toBeNull()
-        expect(formatRunSummaryLine(s)).toBe('[duration] summary: cover-all steps=128 failures=0 | last step @128 reboot_engine | keep_editing recoveries: 0')
+        expect(formatRunSummaryLine(s)).toBe('[duration] summary: cover-all steps=128 failures=0 | last step @128 reboot_engine | keep_editing recoveries: 0 | stale-view reconnects: 0')
     })
 
     // Exact lines the Console keep_editing Intent prints (agent-console d637b83 nextcloudDeep.ts).
