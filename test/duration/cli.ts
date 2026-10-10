@@ -34,6 +34,7 @@ import { createUiDriver, resolveConsoleIntentsDir } from './ui/index.js'
 import { EXIT_CONSOLE_PIN_MISMATCH, runConsoleDeployPreflight } from './consoleDeploy.js'
 import { boxToolingExitCode, checkBoxTooling, realBoxToolingDeps } from './boxTooling.js'
 import { $ } from 'zx'
+import { createHash } from 'node:crypto'
 import type { StructuredLogEntry } from './types.js'
 import { EXIT_ENGINE_UNREACHABLE, installProcessGuards, timeoutSummary, walkExitCode } from './automergeTimeoutGuard.js'
 import { DEFAULT_PREFLIGHT_TIMEOUT_MS } from './realFleetOps.js'
@@ -672,6 +673,17 @@ const main = async () => {
                 const r = await $`git -C ${intentsDir} rev-parse HEAD`.quiet()
                 return r.stdout.trim() || null
             },
+            fetchMd5: async url => {
+                const res = await fetch(url, { signal: AbortSignal.timeout(30_000) })
+                if (res.status !== 200) throw new Error(`${url}: HTTP ${res.status}`)
+                return createHash('md5').update(Buffer.from(await res.arrayBuffer())).digest('hex')
+            },
+            rangeFiles: async (from, to) => {
+                if (!intentsDir) throw new Error('no DURATION_CONSOLE_INTENTS checkout')
+                const d = await $`git -C ${intentsDir} diff --name-only ${from} ${to}`.quiet()
+                const anc = await $`git -C ${intentsDir} merge-base --is-ancestor ${from} ${to}`.quiet().nothrow()
+                return { files: d.stdout.split('\n').map(l => l.trim()).filter(Boolean), ancestor: anc.exitCode === 0 }
+            },
         })
         console.log(JSON.stringify({
             event: 'console_deploy_preflight',
@@ -680,6 +692,10 @@ const main = async () => {
             console_url: consoleUrl,
             served_sha: cd.servedSha,
             pin: cd.pin,
+            intents_pin: cd.pin,
+            product_pin: cd.product ? { sha: cd.product.sha, asset: cd.product.asset, md5: cd.product.md5 } : null,
+            served_asset: cd.servedAsset ?? null,
+            served_asset_md5: cd.servedAssetMd5 ?? null,
             box_intents_head: cd.boxHead,
             intents_dir: intentsDir,
             note: cd.note,
