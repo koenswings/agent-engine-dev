@@ -175,33 +175,64 @@ export const PROTECTED_DISK_MARKERS = [
 
 const PROTECTED_LABELS = ['IDEA Disk'] as const
 
-const SYSTEMISH_DISK_MARKERS = ['root', 'system', 'mmcblk0', 'nvme0n1', 'sda1'] as const
+/**
+ * System-disk facts (r59 FAIL@60): decided from what a disk IS — its mount, FS label or store name —
+ * never from its kernel name. Stage 2 fixtures are real partitions (idea01 Kolibri = sda1, idea04
+ * empty-002 = sda1) and the root disk is sdb2 on idea01 but sda2 on idea03, so 'sda1' says nothing.
+ */
+const SYSTEM_MOUNTPOINTS = ['/', '/boot', '/boot/firmware'] as const
+const SYSTEM_FS_LABELS = ['rootfs', 'bootfs'] as const
+const SYSTEM_DISK_NAMES = ['System Disk'] as const
 
-export const looksLikeProtectedHwDisk = (diskIdOrName: string, extra?: {
+export interface ProtectedDiskFacts {
     name?: string | null
     label?: string | null
     device?: string | null
-}): boolean => {
-    const hay = [
-        diskIdOrName,
-        extra?.name ?? '',
-        extra?.label ?? '',
-        extra?.device ?? '',
-    ].join(' ').toUpperCase()
-    for (const m of PROTECTED_DISK_MARKERS) {
-        if (hay.includes(m.toUpperCase())) return true
-    }
-    for (const lab of PROTECTED_LABELS) {
-        // Exact-ish label match (avoid matching "duration-…-IDEA…" synthetic ids)
-        const name = (extra?.name ?? diskIdOrName).trim()
-        if (name === lab || (extra?.label ?? '').trim() === lab) return true
-    }
-    const device = (extra?.device ?? '').toLowerCase()
-    for (const sys of SYSTEMISH_DISK_MARKERS) {
-        if (device === sys || device.startsWith(`${sys}p`) || device === `/dev/${sys}`) return true
-    }
-    return false
+    /** Where the partition is mounted on its Pi (from that Pi's lsblk/findmnt), when known. */
+    mountpoint?: string | null
+    /** True when the partition's parent is the Pi's root disk (stage2-dock.sh status rootDisk). */
+    onRootDisk?: boolean | null
 }
+
+/**
+ * Why a disk must never be ejected/erased/moved by the harness, or null. Order:
+ *   1. hw-roundtrip stick markers (serial / FS UUID / store ids) — always veto, fixtures included;
+ *   2. a known duration fixture id is otherwise never protected by name/label/device (it is ours);
+ *   3. 'IDEA Disk' label/name, system FS labels, the store's "System Disk", a system mount, the root disk.
+ * The device name is only ever reported, never matched.
+ */
+export const protectedDiskReason = (diskIdOrName: string, extra?: ProtectedDiskFacts): string | null => {
+    const hay = [diskIdOrName, extra?.name ?? '', extra?.label ?? '', extra?.device ?? ''].join(' ').toUpperCase()
+    for (const m of PROTECTED_DISK_MARKERS) {
+        if (hay.includes(m.toUpperCase())) return `hw-roundtrip marker ${m}`
+    }
+    if (looksLikeDurationFixtureId(diskIdOrName)) return null
+    const name = (extra?.name ?? diskIdOrName).trim()
+    const label = (extra?.label ?? '').trim()
+    for (const lab of PROTECTED_LABELS) {
+        if (name === lab || label === lab) return `protected label '${lab}'`
+    }
+    for (const lab of SYSTEM_FS_LABELS) {
+        if (label === lab) return `system FS label '${lab}'`
+    }
+    for (const n of SYSTEM_DISK_NAMES) {
+        if (name === n) return `store name '${n}'`
+    }
+    const mp = (extra?.mountpoint ?? '').trim()
+    if (mp && (SYSTEM_MOUNTPOINTS as readonly string[]).includes(mp)) return `system mount ${mp}`
+    if (extra?.onRootDisk) return 'partition of the root disk'
+    return null
+}
+
+export const looksLikeProtectedHwDisk = (diskIdOrName: string, extra?: ProtectedDiskFacts): boolean =>
+    protectedDiskReason(diskIdOrName, extra) !== null
+
+/** One refusal text for every guard: the Pi, the disk, what matched. No hardcoded host or vendor. */
+export const protectedDiskRefusal = (
+    verb: string, engineId: string | null, diskId: string, reason: string, name?: string | null, device?: string | null,
+): string =>
+    `RealFleetOps: refuse to ${verb} protected disk '${diskId}'` +
+    `${engineId ? ` on ${engineId}` : ''}${name ? ` (name=${name})` : ''}${device ? ` [device ${device}]` : ''}: ${reason}`
 
 export interface RealFleetOptions {
     poolEngines: string[]
@@ -431,8 +462,11 @@ export const assertPrivateDurationRoots = (disksRoot: string, watchDir: string):
             `RealFleetOps: refuse IDEA_WATCH_DIR='${watchDir}' (never /dev/engine; use ${DEFAULT_DURATION_WATCH_DIR})`,
         )
     }
-    if (d.includes('sdb') || w.includes('sdb')) {
-        throw new Error(`RealFleetOps: refuse roots that mention sdb (never idea03 hw stick)`)
+    // Stage 1 harness roots are plain dirs; never a kernel block-device name (any sdX / mmcblkN / nvmeN, any Pi).
+    const devRe = /(^|\/)(sd[a-z]+[0-9]*|mmcblk[0-9]+(p[0-9]+)?|nvme[0-9]+n[0-9]+(p[0-9]+)?)(\/|$)/
+    const hit = devRe.exec(d) ?? devRe.exec(w)
+    if (hit) {
+        throw new Error(`RealFleetOps: refuse harness roots that name a block device ('${hit[2]}' in ${devRe.test(d) ? `IDEA_DISKS_ROOT='${disksRoot}'` : `IDEA_WATCH_DIR='${watchDir}'`})`)
     }
 }
 
@@ -2235,11 +2269,8 @@ export class RealFleetOps implements FleetOps {
     }
 
     async undockFixtures(engineIds: string[], diskId: string): Promise<void> {
-        if (looksLikeProtectedHwDisk(diskId)) {
-            throw new Error(
-                `RealFleetOps: refuse to eject protected hw-roundtrip / system disk '${diskId}'`,
-            )
-        }
+        const idReason = protectedDiskReason(diskId)
+        if (idReason) throw new Error(protectedDiskRefusal('eject', null, diskId, idReason))
         for (const logicalId of engineIds) {
             if (this.exclude.includes(logicalId)) continue
             try {
@@ -2247,36 +2278,20 @@ export class RealFleetOps implements FleetOps {
                 const doc = conn.storeHandle.doc()
                 if (!doc) continue
 
-                const disk = doc.diskDB[diskId as keyof typeof doc.diskDB] as
+                // Only the disk asked for: by id, else by store name (a caller passing a name).
+                const disk = (doc.diskDB[diskId as keyof typeof doc.diskDB]
+                    ?? Object.values(doc.diskDB ?? {}).find(d => d && String(d.name) === diskId)) as
                     | { id?: string; name?: string; dockedTo?: string | null; device?: string | null }
                     | undefined
-
-                // Also scan by name/label for protected sticks if caller used a fixture id that
-                // happens to collide — and refuse ejecting anything that looks like the Intenso.
-                for (const d of Object.values(doc.diskDB ?? {})) {
-                    if (!d) continue
-                    if (looksLikeProtectedHwDisk(String(d.id), {
-                        name: d.name != null ? String(d.name) : null,
-                        device: d.device != null ? String(d.device) : null,
-                    }) && (String(d.id) === diskId || String(d.name) === diskId)) {
-                        throw new Error(
-                            `RealFleetOps: refuse to eject idea03 Intenso / protected disk ` +
-                            `'${d.id}' (name=${d.name})`,
-                        )
-                    }
-                }
-
                 if (!disk) {
                     // Fixture not present — already undocked
                     continue
                 }
-                if (looksLikeProtectedHwDisk(String(disk.id ?? diskId), {
-                    name: disk.name != null ? String(disk.name) : null,
-                    device: disk.device != null ? String(disk.device) : null,
-                })) {
-                    throw new Error(
-                        `RealFleetOps: refuse to eject protected disk '${disk.id ?? diskId}'`,
-                    )
+                const name = disk.name != null ? String(disk.name) : null
+                const storeDevice = disk.device != null ? String(disk.device) : null
+                const reason = protectedDiskReason(String(disk.id ?? diskId), { name, device: storeDevice })
+                if (reason) {
+                    throw new Error(protectedDiskRefusal('eject', logicalId, String(disk.id ?? diskId), reason, name, storeDevice))
                 }
                 if (!disk.dockedTo) continue // already undocked
 
@@ -2684,9 +2699,8 @@ export class RealFleetOps implements FleetOps {
 
     async dockFixture(engineId: string, diskId: string): Promise<void> {
         this.assertNotExcluded(engineId, 'dockFixture')
-        if (looksLikeProtectedHwDisk(diskId)) {
-            throw new Error(`RealFleetOps: refuse to dock protected disk '${diskId}'`)
-        }
+        const dockReason = protectedDiskReason(diskId)
+        if (dockReason) throw new Error(protectedDiskRefusal('dock', engineId, diskId, dockReason))
         resolveDurationFixturePack(diskId) // validate known Kid id
         assertPrivateDurationRoots(this.disksRoot, this.watchDir)
 
@@ -2819,9 +2833,8 @@ export class RealFleetOps implements FleetOps {
             await this.dockFixture(toEngine, diskId)
             return
         }
-        if (looksLikeProtectedHwDisk(diskId)) {
-            throw new Error(`RealFleetOps: refuse to move protected disk '${diskId}'`)
-        }
+        const moveReason = protectedDiskReason(diskId)
+        if (moveReason) throw new Error(protectedDiskRefusal('move', fromEngine, diskId, moveReason))
         if (appPackInstanceData(diskId)) {
             try {
                 await this.moveDiskTree(fromEngine, toEngine, diskId)
@@ -3192,9 +3205,8 @@ export class RealFleetOps implements FleetOps {
      */
     async purgeInstancesStoredOn(engineId: string, diskId: string): Promise<void> {
         this.assertNotExcluded(engineId, 'purgeInstancesStoredOn')
-        if (looksLikeProtectedHwDisk(diskId)) {
-            throw new Error(`RealFleetOps: refuse to purge instances on protected disk '${diskId}'`)
-        }
+        const purgeReason = protectedDiskReason(diskId)
+        if (purgeReason) throw new Error(protectedDiskRefusal('purge instances on', engineId, diskId, purgeReason))
         if (!looksLikeDurationFixtureId(diskId)) {
             throw new Error(
                 `RealFleetOps: refuse to purge instances on non-duration disk '${diskId}'`,

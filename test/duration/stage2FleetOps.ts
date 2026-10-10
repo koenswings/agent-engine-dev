@@ -11,7 +11,7 @@
  * copies trees into duration-disks: sshDockCopy / sshRemoveSentinel refuse. Disks are addressed
  * by diskId → PARTLABEL only (stage2-dock.sh); paths come from `status` (mounted /disks/<kname>).
  */
-import { RealFleetOps, type RealFleetOptions } from './realFleetOps.js'
+import { RealFleetOps, protectedDiskReason, protectedDiskRefusal, type RealFleetOptions } from './realFleetOps.js'
 import {
     buildEngineConfigProbe, buildStage2DockCmd, parseEngineConfigProbe, parseStage2DockJson, parseStage2Status,
     stage2DockScript, stage2Fixture, stage2FixturesOn, stage2MoveTargetPartition, stage2SsdsOn, STAGE2_DISKS_ROOT, STAGE2_NEVER_HOSTS,
@@ -312,11 +312,30 @@ export class Stage2FleetOps extends RealFleetOps {
         return !!(p?.present && p.mounted)
     }
 
+    /**
+     * r59 FAIL@60 (fix 4): the device-level check is made where the device is — on the holder Pi,
+     * from its own stage2-dock.sh status (lsblk): FS label, mount, and whether the partition sits on
+     * that Pi's root disk. The kernel name (sda1, sdb1…) is reported, never matched.
+     */
+    async assertNotSystemPartition(holder: string, part: string, diskId: string): Promise<void> {
+        const st = await this.stage2Status(holder)
+        const p = this.partitionWith(st, part)
+        if (!p) return
+        const reason = protectedDiskReason(diskId, {
+            label: p.fsLabel, mountpoint: p.mounted, onRootDisk: !!(st.rootDisk && p.parent === st.rootDisk),
+        })
+            // A fixture id skips the label/mount checks in protectedDiskReason; the root disk never may.
+            ?? (st.rootDisk && p.parent === st.rootDisk ? 'partition of the root disk' : null)
+            ?? (p.mounted && ['/', '/boot', '/boot/firmware'].includes(p.mounted) ? `system mount ${p.mounted}` : null)
+        if (reason) throw new Error(protectedDiskRefusal('eject', holder, diskId, reason, null, p.kname))
+    }
+
     /** Engine eject (inherited, WS) first, then remove the partition so a later dock is a real add uevent. */
     override async undockFixtures(engineIds: string[], diskId: string): Promise<void> {
         const f = stage2Fixture(diskId)
         const target = [...this.moveCopies.entries()].find(([, a]) => a === diskId)?.[0]
         const holder = target ? stage2Fixture(target).host : f.host
+        if (engineIds.includes(holder)) await this.assertNotSystemPartition(holder, target ?? diskId, diskId)
         for (const e of engineIds) {
             if (e === holder) continue
             await super.undockFixtures([e], diskId) // not on its partition's Pi: store eject only (no device here)

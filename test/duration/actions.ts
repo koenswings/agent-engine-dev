@@ -668,8 +668,8 @@ export const preflightFilesDiskTarget = async (
         throw new Error(
             `preflight: ${diskId} on ${engine} slot ${fsNote} — Engine createFilesDisk requires an ext4 ` +
                 `mount at the disk root (findmnt -no FSTYPE); a plain dir reads 'unknown' and is refused ` +
-                `("not an ext4 disk"). Atlas Path A: back ${probe?.dest ?? `${engine}:<duration-disks>/idea-test-3`} ` +
-                `with a pi-owned ext4 mount (loop image), then re-run. Prefer A — fail loud.`,
+                `("not an ext4 disk"). Atlas Path A: back ${probe?.dest ?? `${diskId} on ${engine}`} ` +
+                `with a pi-owned ext4 mount, then re-run. Prefer A — fail loud.`,
         )
     }
     return `preflight ${diskId} Empty on ${engine} (${last}; ${fsNote}${skipExt4 ? '; ext4 preflight skipped' : ''})`
@@ -2083,7 +2083,7 @@ export const ensureBackupDiskForInstance = async (
         const probe = await ops.probeBackupDisk(chosen.engine, chosen.id, instanceId)
         if (!probe) {
             throw new Error(
-                `backup_instance: Backup Disk ${chosen.id} on ${chosen.engine} has no known idea-test-N slot ` +
+                `backup_instance: Backup Disk ${chosen.id} on ${chosen.engine} has no known mount (Stage 2 partition / Stage 1 slot) ` +
                     `(cannot verify the archive afterwards). No soft-pass.`,
             )
         }
@@ -2778,7 +2778,7 @@ export const verifyBackupOperation = async (
         return {
             ok: false,
             reason: 'no_archive',
-            note: `backup op ${done.id} Done but Backup Disk ${backupDiskId}@${host} has no known idea-test-N slot. No soft-pass.`,
+            note: `backup op ${done.id} Done but Backup Disk ${backupDiskId}@${host} has no known mount (Stage 2 partition / Stage 1 slot). No soft-pass.`,
         }
     }
     const lb = backupYamlLastBackup(probe.backupYaml, want)
