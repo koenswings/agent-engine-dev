@@ -3,6 +3,7 @@ import { doc } from 'lib0/dom.js'
 import { Timestamp } from '../data/CommonTypes.js'
 import { inspectEngine } from '../data/Engine.js'
 import { Store, getLocalEngine } from '../data/Store.js'
+import { currentLanAddress } from '../data/LanAddress.js'
 import { log, contains, deepPrint } from '../utils/utils.js'
 
 export const enableTimeMonitor = (interval, callback) => {
@@ -80,6 +81,12 @@ export const generateHeartBeat = (storeHandle) => {
         //log(`This is the doc to change: ${deepPrint(doc, 2)}`)
         const localEngine = getLocalEngine(doc)
         localEngine.lastRun = lastRun
+        // LAN IPv4 for the Console (agent-console-dev#138): written only when it changed (DHCP)
+        const lan = currentLanAddress()
+        if ((localEngine.lanAddress ?? null) !== lan) {
+            log(`Engine lanAddress ${localEngine.lanAddress ?? 'unset'} → ${lan ?? 'null'}`)
+            localEngine.lanAddress = lan
+        }
         //inspectEngine(store, localEngine)
     })
 } 

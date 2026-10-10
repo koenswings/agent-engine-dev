@@ -8,6 +8,7 @@ import { readMetaUpdateId, DiskMeta, addMeta, readRemoteDiskId } from './Meta.js
 import { Version, Command, Hostname, Timestamp, DiskID, EngineID } from './CommonTypes.js';
 import { Store, getAppsOfEngine, getDisksOfEngine, getInstancesOfEngine } from './Store.js';
 import { DocHandle } from '@automerge/automerge-repo';
+import { currentLanAddress } from './LanAddress.js';
 
 export interface Engine {
   id: EngineID,
@@ -33,6 +34,14 @@ export interface Engine {
    * and repaired on the heartbeat; null (or absent) when peer access is off here.
    */
   peerAccess?: PeerAccess | null;
+  /**
+   * LAN IPv4 of this Engine (agent-console-dev#138), e.g. '192.168.0.139': the
+   * address of the default-route interface, else the first eligible wired/Wi-Fi
+   * address; never Docker bridges, Tailscale 100.64/10 or link-local 169.254/16.
+   * null when there is none; absent on Engines older than this field.
+   * Written at start and when it changes (checked on every heartbeat).
+   */
+  lanAddress?: string | null;
 }
 
 /** Engine.peerAccess (design-per-pi-engine-key.md) */
@@ -124,6 +133,7 @@ export const initialiseLocalEngine = async (): Promise<Engine> => {
       capabilitiesBootedAt: booted,
       eraseInProgress: null,
       unformattedDisks: [],
+      lanAddress: currentLanAddress(),
     }
     return localEngine
   } catch (e) {
@@ -156,6 +166,7 @@ export const createOrUpdateEngine = async (storeHandle: DocHandle<Store>, engine
         engine.capabilitiesBootedAt = booted
         if (engine.unformattedDisks === undefined) engine.unformattedDisks = []
         if (engine.eraseInProgress === undefined) engine.eraseInProgress = null
+        if (engine.lanAddress !== newEngine.lanAddress) engine.lanAddress = newEngine.lanAddress ?? null
       }
     })
   return engine!
