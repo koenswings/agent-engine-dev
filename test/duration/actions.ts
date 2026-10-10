@@ -6,6 +6,7 @@
  * Usage/operator Intents: StubUiDriver (Fake CI) or PlaywrightUiDriver → Pixel getIntent.
  */
 
+import { WAIT_OP_ACTIONS, opAppearBudgetMs, opDoneBudgetMs, waitOperationTerminal, type WaitOperationFn } from './opWait.js'
 import { STAGE2_MOVE_TARGET_HOST, stage2HomeOf } from './stage2.js'
 import type {
     DurationOptions,
@@ -3013,6 +3014,28 @@ const layerForUiAction = (action: string, fallback: Layer | null): Layer => {
 }
 
 /**
+ * r64 (r63 FAIL@43): the store-backed Operation wait handed to copy/move/restore Intents (live ops only).
+ * Read-only: listOperations on every pool engine; bounded by opDoneBudgetMs; logged per status change.
+ */
+export const waitOperationFor = (ctx: ActionContext): WaitOperationFn | undefined => {
+    const kind = WAIT_OP_ACTIONS[ctx.action]
+    const ops = ctx.opts.ops as BackupOps
+    if (!kind || typeof ops.listOperations !== 'function') return undefined
+    const engines = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e))
+    return async q => {
+        const r = await waitOperationTerminal(q, {
+            listOperations: e => ops.listOperations!(e),
+            engines,
+            sleep: ms => new Promise(res => setTimeout(res, ms)),
+            now: () => Date.now(),
+            log: line => console.log(line),
+        }, opDoneBudgetMs(q.kind, !!ctx.opts.fast), opAppearBudgetMs())
+        console.log(JSON.stringify({ event: 'op_wait_result', action: ctx.action, ...r }))
+        return r
+    }
+}
+
+/**
  * Dispatch a usage/operator Intent via UiDriver (Phase 3).
  * StubUiDriver when stubUi≠false / no driver; PlaywrightUiDriver when --ui.
  */
@@ -3334,6 +3357,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
                 ? (isStage2(ctx) ? stage2HomeOf(diskId) : resolveConsoleEngineHost(ctx))
                 : (rebootTarget ?? backupDockedEngine ?? ctx.walker.dockedEngine ?? ctx.poolEngines[0]),
             screenshotPath: shotPath,
+            ...(waitOperationFor(ctx) ? { waitOperation: waitOperationFor(ctx)! } : {}),
         })
     } finally {
         if (ctx.action === 'add_files_role') {

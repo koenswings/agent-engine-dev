@@ -81,6 +81,8 @@ type RunDurationIntent = (opts: {
     instanceId?: string
     /** Pixel opt-in: write PNG after Intent when supported. */
     screenshotPath?: string
+    /** r64: store Operation wait for copy/move/restore Intents (Console ≥ #140 r64 commit reads it). */
+    waitOperation?: import('../opWait.js').WaitOperationFn
 }) => Promise<DurationIntentResult>
 
 type HasDurationIntent = (action: string) => boolean
@@ -385,6 +387,7 @@ export class PlaywrightUiDriver implements UiDriver {
                 diskId: ctx.diskId ?? defaults.diskId,
                 instanceId: ctx.instanceId ?? defaults.instanceId,
                 engineId: ctx.engineId,
+                ...(ctx.waitOperation ? { waitOperation: ctx.waitOperation } : {}),
             }
             // --record-walk: do NOT hand screenshotPath to Pixel — it would capture the
             // Console page it was given, not the App tab an in-app Intent switched to.

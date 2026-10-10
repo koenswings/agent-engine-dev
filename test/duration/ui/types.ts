@@ -18,6 +18,11 @@ export interface UiIntentContext {
      * else activeTab.screenshot({ path, fullPage: true }).
      */
     screenshotPath?: string
+    /**
+     * r64 (r63 FAIL@43): read-only store wait for the Operation an Intent just confirmed (copyApp/moveApp/
+     * restoreApp). Handed to the Console Intent; it waits for Done before its single post-op Start.
+     */
+    waitOperation?: import('../opWait.js').WaitOperationFn
 }
 
 export interface UiIntentResult {
