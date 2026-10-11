@@ -17,6 +17,8 @@ vi.mock('zx', async (orig) => {
     const real: any = await orig()
     const fake: any = (strings: TemplateStringsArray, ...vals: unknown[]) => {
         const cmd = strings.reduce((a, s, i) => a + s + (i < vals.length ? String(vals[i]) : ''), '')
+        // Engine start-up reads (Engine id from /META.yaml, findmnt, lsblk) use the real shell
+        if (/META\.yaml|^findmnt|^lsblk/.test(cmd) && !cmd.startsWith('mkdir')) return real.$(strings, ...vals)
         cmds.push(cmd)
         let stdout = ''
         if (cmd.startsWith('cat ') && cmd.endsWith('compose.yaml')) {
