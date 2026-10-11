@@ -1576,10 +1576,21 @@ export class RealFleetOps implements FleetOps {
      * pipefail). Uses only the walker's existing SSH access to each Pi — no Pi→Pi keys needed.
      */
     protected async relayPipe(srcHost: string, srcCmd: string, dstHost: string, dstCmd: string): Promise<string> {
-        const relayOpts = [...sshOpts, '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=8']
-        const script = 'ssh -n "${@:5}" "$1" "$2" | ssh "${@:5}" "$3" "$4"'
-        const result = await $`bash -o pipefail -c ${script} relay ${`${this.sshUser}@${srcHost}`} ${srcCmd} ${`${this.sshUser}@${dstHost}`} ${dstCmd} ${relayOpts}`
-        return result.stdout
+        // r69 (r68 FAIL@62): a box VM pause of ~919 s mid-stream let ServerAlive 15×8 (2 min) kill both legs.
+        // ServerAlive budget is now 30 s × 60 = 30 min (DURATION_RELAY_ALIVE_*), so a frozen box that wakes
+        // within that keeps the TCP sessions (the Pis' sshd has no ClientAlive). The pipe runs in its own process
+        // group with a hard monotonic limit (DURATION_RELAY_ATTEMPT_MS, default 60 min) that kills both legs.
+        const iv = process.env.DURATION_RELAY_ALIVE_INTERVAL_S ?? '30'
+        const cnt = process.env.DURATION_RELAY_ALIVE_COUNT ?? '60'
+        const relay = (h: string) => { const a = this.sshArgs(h); return [...a.slice(0, -1).filter((x, k, arr) => !/^ServerAlive/.test(x) && !(x === '-o' && /^ServerAlive/.test(arr[k + 1] ?? ''))), '-o', `ServerAliveInterval=${iv}`, '-o', `ServerAliveCountMax=${cnt}`, a[a.length - 1]!] }
+        const q = (x: string) => `'${x.replace(/'/g, `'\\''`)}'`
+        const bin = q(this.sshBinary())
+        const script = `${bin} -n ${relay(srcHost).map(q).join(' ')} ${q(srcCmd)} | ${bin} ${relay(dstHost).map(q).join(' ')} ${q(dstCmd)}`
+        const limit = Number(process.env.DURATION_RELAY_ATTEMPT_MS ?? 3_600_000)
+        const r = await runProcess('bash', ['-o', 'pipefail', '-c', script], { timeoutMs: limit })
+        if (r.code === 0) return r.stdout
+        throw Object.assign(new Error(`relay ${srcHost}→${dstHost} ${r.timedOut ? `killed after ${limit}ms` : `exit ${r.code}`}: ${r.stderr.trim().slice(-600)}`),
+            { exitCode: r.timedOut ? 255 : r.code, stderr: r.stderr, stdout: r.stdout, timedOut: r.timedOut })
     }
 
     private async fetchStoreDocId(logicalId: string): Promise<DocumentId> {

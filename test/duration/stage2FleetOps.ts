@@ -88,7 +88,7 @@ export class Stage2FleetOps extends RealFleetOps {
         }
     }
 
-    private async rawCall(engineId: string, verb: Stage2DockVerb, args: { diskId?: string; as?: string } = {}) {
+    protected async rawCall(engineId: string, verb: Stage2DockVerb, args: { diskId?: string; as?: string } = {}) {
         if (args.diskId && verb !== 'dock-ssd' && verb !== 'eject-ssd' && verb !== 'status') this.assertSsdOnline(engineId, args.diskId)
         // Only the read-only `status` verb is retried on a transport failure; dock/undock/eject/export/import/reset
         // are never auto-retried (a reset after the script ran would run it twice).
@@ -457,17 +457,74 @@ export class Stage2FleetOps extends RealFleetOps {
         if (await this.findDockedEngine(target.diskId)) await this.engineEject(toEngine, target.diskId)
         await this.rawCall(toEngine, 'reset', { diskId: target.diskId })
         this.assertSsdOnline(fromEngine, diskId)
-        const out = await this.relayPipe(
-            this.s2host(fromEngine), buildStage2DockCmd('export', { diskId }, this.dockScript),
-            this.s2host(toEngine), buildStage2DockCmd('import', { diskId: target.diskId, as: diskId }, this.dockScript),
-        )
-        if (!parseStage2DockJson(out, `import@${toEngine}`).ok) throw new Error(`stage2-dock import ${target.diskId} --as ${diskId} on ${toEngine} ok=false`)
+        const out = await this.relayMoveWithRecovery(fromEngine, toEngine, diskId, target)
+        if (!out.recovered && !parseStage2DockJson(out.stdout, `import@${toEngine}`).ok) throw new Error(`stage2-dock import ${target.diskId} --as ${diskId} on ${toEngine} ok=false`)
         // Source partition leaves the Engine only after the export read it (export mounts it ro itself).
         if (stage2Fixture(diskId).host === fromEngine) { await this.rawCall(fromEngine, 'undock', { diskId }); this.heldUndocked.add(diskId) }
         this.moveCopies.set(target.diskId, diskId)
         this.heldUndocked.delete(target.diskId)
         // Fresh from reset + import the target is present but unmounted → undock, gap, dock (reset-r53), verified.
         await this.dockPartition(toEngine, target.diskId, diskId)
+    }
+
+    /**
+     * r69 (r68 FAIL@62): export|import with recovery. On a relay failure: wait (read-only) until neither Pi holds
+     * a private stage2-dock mount (a leg may still be finishing), then classify from `status`:
+     *  - target carries the source META (import is staged; META lands last) and is unmounted → DONE, no retry;
+     *  - target still the reset Empty (or META mid-move = null) → NOT DONE: confirm the source partition is
+     *    present, unmounted, same META (intact, still docked at partition level), `reset` the target
+     *    (single-shot gate), then retry the whole export|import ONCE;
+     *  - anything else → UNKNOWN: fail loud. A half-applied import is never re-issued without a reset.
+     */
+    protected async relayMoveWithRecovery(fromEngine: string, toEngine: string, diskId: string, target: { diskId: string; partLabel: string }): Promise<{ stdout: string; recovered: boolean; attempts: number }> {
+        const exp = buildStage2DockCmd('export', { diskId }, this.dockScript)
+        const imp = buildStage2DockCmd('import', { diskId: target.diskId, as: diskId }, this.dockScript)
+        const errs: string[] = []
+        const log = (o: Record<string, unknown>) => console.log(JSON.stringify({ ...o, diskId, from: fromEngine, to: toEngine, target: target.diskId }))
+        for (let attempt = 1; attempt <= 2; attempt++) {
+            const t0 = performance.now()
+            try {
+                const stdout = await this.relayPipe(this.s2host(fromEngine), exp, this.s2host(toEngine), imp)
+                if (attempt > 1) log({ event: 'move_relay_retry_ok', attempt, ms: Math.round(performance.now() - t0) })
+                return { stdout, recovered: false, attempts: attempt }
+            } catch (e) {
+                const msg = e instanceof Error ? e.message : String(e)
+                errs.push(`#${attempt}: ${msg}`)
+                log({ event: 'move_relay_failed', attempt, ms: Math.round(performance.now() - t0), error: msg.slice(0, 400) })
+                const v = await this.relayOutcome(fromEngine, toEngine, diskId, target)
+                log({ event: 'move_relay_verify', attempt, ...v })
+                if (v.state === 'done') { log({ event: 'move_relay_recovered_by_verify', attempt }); return { stdout: '', recovered: true, attempts: attempt } }
+                if (v.state === 'unknown' || !v.sourceIntact || attempt === 2) {
+                    throw new Error(`Stage 2 move_disk ${diskId} ${fromEngine}→${toEngine}: relay failed (${errs.join(' | ')}); verify: ${v.state}` +
+                        `${v.sourceIntact ? '' : ' — SOURCE NOT INTACT'} (${v.detail}). ${attempt === 2 ? 'Second failure — no further retry.' : 'Not retried.'}`)
+                }
+                log({ event: 'move_relay_reset_target', attempt })
+                await this.rawCall(toEngine, 'reset', { diskId: target.diskId })
+                log({ event: 'move_relay_retry', attempt: attempt + 1 })
+            }
+        }
+        throw new Error('unreachable')
+    }
+
+    /** Read-only (status via sshRead): outcome of an interrupted export|import. */
+    protected async relayOutcome(fromEngine: string, toEngine: string, diskId: string, target: { diskId: string; partLabel: string }): Promise<{ state: 'done' | 'not_done' | 'unknown'; sourceIntact: boolean; detail: string }> {
+        const src = stage2Fixture(diskId)
+        const settle = Number(process.env.DURATION_RELAY_SETTLE_MS ?? 300_000)
+        const t0 = performance.now()
+        const priv = (m: string | null) => !!m && !m.startsWith(`${STAGE2_DISKS_ROOT}/`)
+        for (;;) {
+            const [ds, ss] = [await this.stage2Status(toEngine), await this.stage2Status(fromEngine)]
+            const t = ds.fixtures.find(x => x.partLabel === target.partLabel)
+            const s = ss.fixtures.find(x => x.partLabel === src.partLabel)
+            const busy = priv(t?.mounted ?? null) || priv(s?.mounted ?? null)
+            if (busy && performance.now() - t0 < settle) { await this.sleepMs(5_000); continue }
+            const sourceIntact = !!s && s.present && s.diskId === diskId && !s.mounted
+            const detail = `target ${target.partLabel}: present=${t?.present} meta=${t?.diskId ?? null} mounted=${t?.mounted ?? null}; source ${src.partLabel}: present=${s?.present} meta=${s?.diskId ?? null} mounted=${s?.mounted ?? null}${busy ? ' — private mount still held after settle' : ''}`
+            if (!t || !t.present || t.mounted) return { state: 'unknown', sourceIntact, detail }
+            if (t.diskId === diskId) return { state: 'done', sourceIntact, detail }
+            if (t.diskId === target.diskId || t.diskId == null) return { state: 'not_done', sourceIntact, detail }
+            return { state: 'unknown', sourceIntact, detail }
+        }
     }
 
     // ── Read-only probes on the real partition (Stage 1 used idea-test-N slots) ──
