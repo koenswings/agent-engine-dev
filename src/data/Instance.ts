@@ -258,7 +258,7 @@ export type Status = 'Undocked'      // Disk is not currently docked; instance d
   | 'Error';
 
 
-export const buildInstance = async (instanceName: InstanceName, appName: AppName, gitAccount: string, version: Version, device: DeviceName): Promise<void> => {
+export const buildInstance = async (instanceName: InstanceName, appName: AppName, gitAccount: string, version: Version, device: DeviceName): Promise<InstanceID | undefined> => {
   print(`Building new instance '${instanceName}' from version ${version} of app '${appName}' on device '${device}' of the local engine.`)
 
   // CODING STYLE: only use absolute pathnames !
@@ -446,9 +446,11 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
 
 
     print(chalk.green(`Instance ${instanceId} built`))
+    return instanceId
   } catch (e) {
     print(chalk.red('Error building app instance'))
     console.error(e)
+    return undefined
   }
 }
 
