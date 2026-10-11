@@ -289,7 +289,15 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     // Create the app infrastructure if it does not exist
     // TODO: This should be done when creating the disk — https://github.com/koenswings/idea/issues/46
     // TODO: Here we should only be checking if it is an apps disk! — https://github.com/koenswings/idea/issues/46
-    await $`mkdir -p ${root}/apps ${root}/services ${root}/instances`
+    if (onSystemDisk) {
+      // /apps, /instances, /services may be root-owned on the system disk (idea04).
+      // Use exactly the sudoers ENGINE_APPDIRS commands (10-engine) to create them
+      // and hand them to pi; the Engine runs as pi and writes into them.
+      await $`sudo -n /usr/bin/mkdir -p /apps /instances /services`
+      await $`sudo -n /usr/bin/chown pi:pi /apps /instances /services`
+    } else {
+      await $`mkdir -p ${root}/apps ${root}/services ${root}/instances`
+    }
 
     // **************************
     // STEP 1 - App Type creation
