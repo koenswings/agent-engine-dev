@@ -6,7 +6,7 @@ import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber,
 import { createOperation, updateOperation } from './Operations.js'
 import { composeFileEnv } from './FilesMount.js'
 import { Store, getDisk, getEngine, getLocalEngine, getInstancesOfEngine, } from "./Store.js";
-import { Disk, diskMountRoot, diskFsRoot } from "./Disk.js";
+import { Disk, diskMountRoot, diskFsRoot, deviceMountRoot } from "./Disk.js";
 import { localEngineId } from "./Engine.js";
 import { network } from "./Network.js";
 import { createAppId } from "./App.js";
@@ -279,13 +279,17 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     //   log(`Instance ID: ${instanceId}`)
     // } 
     const instanceId = createInstanceId(appName).toString() as InstanceID
+    // System disk -> '' (/apps, /instances); other disks -> <disksRoot>/<device>
+    const root = await deviceMountRoot(String(device))
+    const onSystemDisk = root === ''
+    log(`buildInstance: target root '${root || '/'}' for device ${device}`)
     log(`Instance ID: ${instanceId}`)
 
 
     // Create the app infrastructure if it does not exist
     // TODO: This should be done when creating the disk — https://github.com/koenswings/idea/issues/46
     // TODO: Here we should only be checking if it is an apps disk! — https://github.com/koenswings/idea/issues/46
-    await $`mkdir -p ${disksRoot()}/${device}/apps ${disksRoot()}/${device}/services ${disksRoot()}/${device}/instances`
+    await $`mkdir -p ${root}/apps ${root}/services ${root}/instances`
 
     // **************************
     // STEP 1 - App Type creation
@@ -315,7 +319,7 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     // Overwrite if it exists
     // We want to copy the content of a directory and rename the directory at the same time: 
     //   See https://unix.stackexchange.com/questions/412259/how-can-i-copy-a-directory-and-rename-it-in-the-same-command
-    await $`cp -fr /tmp/apps/${appName}/. ${disksRoot()}/${device}/apps/${appName}-${appVersion}/`
+    await $`cp -fr /tmp/apps/${appName}/. ${root}/apps/${appName}-${appVersion}/`
 
 
     // **************************
@@ -337,19 +341,19 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     //   }
     // }
     // Again use /. to specify the content of the dir, not the dir itself 
-    await $`cp -fr /tmp/apps/${appName}/. ${disksRoot()}/${device}/instances/${instanceId}/`
+    await $`cp -fr /tmp/apps/${appName}/. ${root}/instances/${instanceId}/`
 
 
 
 
     // If the app has an init_data.tar.gz file, unpack it in the app folder
-    if (fs.existsSync(`${disksRoot()}/${device}/instances/${instanceId}/init_data.tar.gz`)) {
+    if (fs.existsSync(`${root}/instances/${instanceId}/init_data.tar.gz`)) {
       print(`Unpacking the init_data.tar.gz file in the app folder`)
-      await $`tar -xzf ${disksRoot()}/${device}/instances/${instanceId}/init_data.tar.gz -C ${disksRoot()}/${device}/instances/${instanceId}`
+      await $`tar -xzf ${root}/instances/${instanceId}/init_data.tar.gz -C ${root}/instances/${instanceId}`
       // Rename the folder init_data to data
-      await $`mv ${disksRoot()}/${device}/instances/${instanceId}/init_data ${disksRoot()}/${device}/instances/${instanceId}/data`
+      await $`mv ${root}/instances/${instanceId}/init_data ${root}/instances/${instanceId}/data`
       // Remove the init_data.tar.gz file
-      await $`rm ${disksRoot()}/${device}/instances/${instanceId}/init_data.tar.gz`
+      await $`rm ${root}/instances/${instanceId}/init_data.tar.gz`
     }
     // Not needed as Docker will auto-create any data folder we specify in the compose
     // } else {
@@ -359,12 +363,12 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
 
     // Open the compose.yaml file of the app instance and add the version info to the compose file and the instance name
     print(`Opening the compose.yaml file of the app instance and adding the version info to the compose file (${appVersion}) and the instance name (${instanceName})`)
-    const composeFile = await $`cat ${disksRoot()}/${device}/instances/${instanceId}/compose.yaml`
+    const composeFile = await $`cat ${root}/instances/${instanceId}/compose.yaml`
     const compose = YAML.parse(composeFile.stdout)
     compose['x-app'].version = appVersion
     compose['x-app'].instanceName = instanceName
     const composeYAML = YAML.stringify(compose)
-    await $`echo ${composeYAML} > ${disksRoot()}/${device}/instances/${instanceId}/compose.yaml`
+    await $`echo ${composeYAML} > ${root}/instances/${instanceId}/compose.yaml`
 
     // Remove the temporary app folder
     await $`rm -rf /tmp/apps/${appName}`
@@ -378,7 +382,7 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     for (const serviceName in services) {
       const serviceImage = services[serviceName].image
       // Pull the sercice image
-      const serviceImageTar = serviceImageTarPath(`${disksRoot()}/${device}`, serviceImage)
+      const serviceImageTar = serviceImageTarPath(`${root}`, serviceImage)
       if (fs.existsSync(serviceImageTar)) {
         print(`Service image ${serviceImage} already exists`)
       } else {
@@ -393,7 +397,10 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     // STEP 4 - Create the META.yaml file if it is not already there
     // **************************
 
-    if (!fs.existsSync(`${disksRoot()}/${device}/META.yaml`)) {
+    if (onSystemDisk) {
+      // The system disk's META is /META.yaml, written at image build; never create a second one
+      print(`System disk ${device}: using existing /META.yaml`)
+    } else if (!fs.existsSync(`${root}/META.yaml`)) {
       log(`Creating META.yaml file on disk ${device}`)
       createMeta(device)
     } else {

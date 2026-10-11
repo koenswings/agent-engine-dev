@@ -361,6 +361,16 @@ export const diskMountRoot = async (disk: Disk): Promise<string> => {
 }
 
 /**
+ * Mount-root prefix for a bare device name, same rule as diskMountRoot. System disk
+ * (root partition, e.g. sda2 on a Pi 4 USB root, nvme0n1p2 / mmcblk0p2 on a Pi 5
+ * internal root): '' so paths become /apps/..., /instances/.... Any other device:
+ * '<disksRoot>/<device>'. Never /disks/<dev> for the system disk: that folder is an
+ * empty root-owned mount point there.
+ */
+export const deviceMountRoot = async (device: string): Promise<string> =>
+    diskMountRoot({ device } as unknown as Disk)
+
+/**
  * The disk's root token for the app-data root helper (/usr/local/sbin/idea-app-data,
  * idea#168): 'system' for the system disk (the helper uses /instances/<id>), else
  * the device ('sdX1'; on the duration pool a slot name such as 'idea-test-1', which
