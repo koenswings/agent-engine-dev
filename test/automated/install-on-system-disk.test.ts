@@ -26,7 +26,9 @@ vi.mock('zx', async (orig) => {
         p.nothrow = () => p; p.quiet = () => p
         return p
     }
-    const fs = { ...real.fs, existsSync: () => false }
+    // Only the instance/service paths under test are reported missing; everything
+    // else (e.g. /META.yaml for the Engine id) keeps the real answer.
+    const fs = { ...real.fs, existsSync: (p: any) => /\/(instances|services|apps)\/|\/sdb1\/META\.yaml$/.test(String(p)) ? false : real.fs.existsSync(p) }
     return { ...real, $: fake, fs }
 })
 vi.mock('../../src/data/Meta.js', async (orig) => {
