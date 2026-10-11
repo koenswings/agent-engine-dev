@@ -18,6 +18,7 @@ import {
     stage2DockScript, stage2Fixture, stage2FixturesOn, stage2MoveTargetPartition, stage2SsdsOn, STAGE2_DISKS_ROOT, STAGE2_NEVER_HOSTS,
     type EngineConfigProbe, type Stage2DockVerb, type Stage2Status,
 } from './stage2.js'
+import type { MutateSpec } from './sshMutate.js'
 
 const DOCK_WAIT_MS = Number(process.env.DURATION_STAGE2_DOCK_WAIT_MS ?? 120_000)
 /**
@@ -91,12 +92,43 @@ export class Stage2FleetOps extends RealFleetOps {
         if (args.diskId && verb !== 'dock-ssd' && verb !== 'eject-ssd' && verb !== 'status') this.assertSsdOnline(engineId, args.diskId)
         // Only the read-only `status` verb is retried on a transport failure; dock/undock/eject/export/import/reset
         // are never auto-retried (a reset after the script ran would run it twice).
-        const out = verb === 'status'
-            ? await this.sshRead(this.s2host(engineId), buildStage2DockCmd(verb, args, this.dockScript))
-            : await this.ssh(this.s2host(engineId), buildStage2DockCmd(verb, args, this.dockScript))
+        if (verb === 'status') {
+            const r0 = parseStage2DockJson(await this.sshRead(this.s2host(engineId), buildStage2DockCmd(verb, args, this.dockScript)), `${verb}@${engineId}`)
+            if (!r0.ok) throw new Error(`stage2-dock status on ${engineId} returned ok=false: ${JSON.stringify(r0).slice(0, 300)}`)
+            return r0
+        }
+        // r67 (r66 FAIL@60): mutating verbs run ONCE behind a warm ControlMaster + start gate; a drop after the
+        // start is decided by a read-only status verify (stage2MutateSpec), never by re-running blind.
+        const m = await this.sshMutate(this.s2host(engineId), buildStage2DockCmd(verb, args, this.dockScript), this.stage2MutateSpec(engineId, verb, args))
+        if (m.recoveredByVerify) {
+            this.dockLog.push(`${engineId}: ${verb} ${args.diskId ?? ''} recovered-by-verify after a transport drop`)
+            return { ok: true, recoveredByVerify: true } as ReturnType<typeof parseStage2DockJson>
+        }
+        const out = m.stdout
         const r = parseStage2DockJson(out, `${verb}@${engineId}`)
         if (!r.ok) throw new Error(`stage2-dock ${verb} ${args.diskId ?? ''} on ${engineId} returned ok=false: ${JSON.stringify(r).slice(0, 300)}`)
         return r
+    }
+
+    /**
+     * r67: how each mutating stage2-dock verb is verified read-only after an ambiguous transport drop.
+     * undock/dock/eject-ssd/dock-ssd converge on a state `status` can see: done → continue; not done → fail
+     * loud (single-shot, never re-issued). reset/yank/export/import cannot be proven done → unknown → fail loud.
+     */
+    stage2MutateSpec(engineId: string, verb: Stage2DockVerb, args: { diskId?: string; as?: string }): MutateSpec {
+        const name = `stage2-dock ${verb}${args.diskId ? ` ${args.diskId}` : ''}${args.as ? ` --as ${args.as}` : ''} @${engineId}`
+        const present = async (ids: string[]) => {
+            const st = await this.stage2Status(engineId)
+            return ids.map(id => !!this.partitionWith(st, id)?.present)
+        }
+        const ssdIds = () => { const f = stage2Fixture(args.diskId!); return stage2FixturesOn(engineId).filter(x => x.ssd === f.ssd).map(x => x.diskId) }
+        switch (verb) {
+            case 'undock': return { verb: name, idempotent: true, verify: async () => ((await present([args.diskId!]))[0] ? 'not_done' : 'done') }
+            case 'dock': return { verb: name, idempotent: true, verify: async () => ((await present([args.diskId!]))[0] ? 'done' : 'not_done') }
+            case 'eject-ssd': return { verb: name, idempotent: true, verify: async () => ((await present(ssdIds())).some(Boolean) ? 'not_done' : 'done') }
+            case 'dock-ssd': return { verb: name, idempotent: true, verify: async () => ((await present(ssdIds())).every(Boolean) ? 'done' : 'not_done') }
+            default: return { verb: name, idempotent: false }
+        }
     }
 
     /** Every fixture op first checks boot_id: a changed id (05:00 reboot) triggers redock reconciliation. */

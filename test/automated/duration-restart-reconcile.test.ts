@@ -118,6 +118,7 @@ describe('--fast restart: no container removal in Stage 2; Stage 1 unchanged', (
     const fakeRestart = (o: RealFleetOps, cmds: string[]) => {
         const anyO = o as unknown as Record<string, unknown>
         anyO.ssh = async (_h: string, c: string) => { cmds.push(c); return c.startsWith('docker ps -a --format "{{.Names}}"') ? `${NI}-nextcloud-app-1\n${KI}-kolibri-1` : '' }
+        anyO.sshMutate = async (h: string, c: string) => ({ stdout: await (anyO.ssh as (h: string, c: string) => Promise<string>)(h, c), recoveredByVerify: false, reissued: false, preStartRetries: 0 })
         anyO.waitReady = async () => ({ wsUp: true })
         anyO.disconnect = async () => {}
         anyO.reconcileDurationZombies = async () => {}

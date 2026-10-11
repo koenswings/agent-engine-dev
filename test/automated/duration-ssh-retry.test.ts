@@ -126,14 +126,20 @@ describe('Stage2FleetOps.verifySidecarOwner (read-only, sshRead)', () => {
 })
 
 describe('mutating calls are never auto-retried', () => {
-    it('stage2-dock undock (rawCall) on a Connection reset: one attempt, error surfaces', async () => {
+    it('r67: stage2-dock undock (rawCall) is single-shot via the gated sshMutate; a reset after start → status re-check, not done → fails, run once', async () => {
         const o = new Stage2FleetOps({ poolEngines: ['idea01', 'idea03', 'idea04'], hosts: HOSTS, storeMode: 'shared' })
-        const calls = withOnce(o, [R62])
+        const calls = withOnce(o, [])
         vi.spyOn(o as unknown as { assertSsdOnline: () => void }, 'assertSsdOnline').mockImplementation(() => {})
+        const anyO = o as unknown as Record<string, unknown>
+        const runs: string[] = []
+        anyO.ensureMaster = async () => {}
+        anyO.runGated = async (_h: string, g: string) => { runs.push(g); return { code: 255, stdout: '__IDEA_MUTATE_GATE__\n', stderr: 'Connection reset by 100.126.117.80 port 22', sentGo: true } }
+        anyO.stage2Status = async () => ({ fixtures: [] })
+        anyO.partitionWith = () => ({ present: true }) // still there → not done
         const raw = (o as unknown as { rawCall: (e: string, v: string, a: object) => Promise<unknown> }).rawCall.bind(o)
-        await expect(raw('idea03', 'undock', { diskId: 'duration-nextcloud-grade5a-001' })).rejects.toThrow(/exit code: 255/)
-        expect(calls).toHaveLength(1)
-        expect(logs.some(l => l.includes('ssh_retry'))).toBe(false)
+        await expect(raw('idea03', 'undock', { diskId: 'duration-nextcloud-grade5a-001' })).rejects.toThrow(/status re-check says not_done\. Single-shot: not re-run/)
+        expect(runs).toHaveLength(1)
+        expect(calls).toHaveLength(0) // never the plain (un-gated) ssh
     })
     it('stage2-dock status (read-only verb) IS retried', async () => {
         const o = new Stage2FleetOps({ poolEngines: ['idea01', 'idea03', 'idea04'], hosts: HOSTS, storeMode: 'shared' })
@@ -142,13 +148,16 @@ describe('mutating calls are never auto-retried', () => {
         await raw('idea03', 'status', {})
         expect(calls).toHaveLength(2)
     })
-    it('pm2 restart (rebootEngine --fast) on a reset: one attempt, no retry', async () => {
+    it('r67: pm2 restart (rebootEngine --fast) is single-shot; reset after start + Engine not restarted → fails, run once', async () => {
         const o = new RealFleetOps({ poolEngines: ['idea01', 'idea03', 'idea04'], hosts: HOSTS, storeMode: 'shared' })
-        const calls = withOnce(o, [R62])
         const anyO = o as unknown as Record<string, unknown>
         anyO.disconnect = async () => {}
         anyO.stopDurationFixtureContainers = async () => []
-        await expect(o.rebootEngine('idea03', true)).rejects.toThrow(/exit code: 255/)
-        expect(calls.filter(c => c.cmd === 'pm2 restart engine')).toHaveLength(1)
+        anyO.sshRead = async (_h: string, c: string) => (c === 'date +%s' ? '1000' : '900')
+        const runs: string[] = []
+        anyO.ensureMaster = async () => {}
+        anyO.runGated = async (_h: string, g: string) => { runs.push(g); return { code: 255, stdout: '__IDEA_MUTATE_GATE__\n', stderr: 'Connection reset by 100.126.117.80 port 22', sentGo: true } }
+        await expect(o.rebootEngine('idea03', true)).rejects.toThrow(/pm2 restart engine .*status re-check says not_done/)
+        expect(runs.filter(g => g.includes('pm2 restart engine'))).toHaveLength(1)
     })
 })

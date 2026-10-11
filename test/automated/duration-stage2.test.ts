@@ -342,6 +342,10 @@ class CannedStage2 extends Stage2FleetOps {
     /** The Engine ignores even a real add (the "dock had no effect" case). */
     engineDeaf = false
     sleeps: number[] = []
+    // r67: verbs go through sshMutate (gate + ControlMaster); this fake has no real transport → straight to ssh.
+    protected override async sshMutate(host: string, cmd: string): Promise<{ stdout: string; recoveredByVerify: boolean; reissued: boolean; preStartRetries: number }> {
+        return { stdout: await this.ssh(host, cmd), recoveredByVerify: false, reissued: false, preStartRetries: 0 }
+    }
     protected override async ssh(host: string, cmd: string): Promise<string> {
         const h = IP[host]!
         if (cmd.endsWith(' status --json')) {

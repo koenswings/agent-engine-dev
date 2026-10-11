@@ -20,6 +20,8 @@
 import { sshRetryPolicy, withSshRetry } from './sshRetry.js'
 import { Repo, type DocHandle, type DocumentId, type PeerId } from '@automerge/automerge-repo'
 import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websocket'
+import { spawn, type ChildProcess } from 'node:child_process'
+import { GATE_TOKEN, gateSecs, sshMutate, type GatedResult, type MutateResult, type MutateSpec } from './sshMutate.js'
 import { headsKey, recordReconnect, staleViewMs } from './staleView.js'
 import { $ } from 'zx'
 import type { Store } from '../../src/data/Store.js'
@@ -384,6 +386,9 @@ const sshOpts = [
 ]
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
+
+/** Engine process start (epoch s, Pi clock) for pm2 app "engine"; empty when not running. */
+export const PM2_ENGINE_START_CMD = 'p=$(pm2 pid engine 2>/dev/null | tail -1); [ -n "$p" ] && [ "$p" != 0 ] && stat -c %Y /proc/$p 2>/dev/null || echo 0'
 
 /**
  * Close a connection for good: mark it abandoned for the timeout guard (its late
@@ -1452,9 +1457,25 @@ export class RealFleetOps implements FleetOps {
     }
 
     /** One ssh round-trip, no retry. */
-    protected async sshOnce(host: string, remoteCmd: string): Promise<string> {
-        const result = await $`ssh ${sshOpts} ${`${this.sshUser}@${host}`} ${remoteCmd}`
-        return result.stdout
+    protected async sshOnce(host: string, remoteCmd: string, attemptTimeoutMs?: number): Promise<string> {
+        const p = $`ssh ${sshOpts} ${`${this.sshUser}@${host}`} ${remoteCmd}`
+        if (!attemptTimeoutMs) return (await p).stdout
+        // r67 (r66 @39: one docker-ps attempt hung 903 s): read attempts get a hard wall limit; a kill is a
+        // transport failure (exit 255 "Timeout, server … not responding") so the read retry takes over.
+        const timer = setTimeout(() => { void p.kill('SIGKILL').catch(() => {}) }, attemptTimeoutMs)
+        try {
+            return (await p).stdout
+        } catch (e) {
+            const f = e as { exitCode?: number | null; stderr?: string }
+            if (f.exitCode == null || f.exitCode === 137) {
+                throw Object.assign(new Error(`Timeout, server ${host} not responding (walker read attempt killed after ${attemptTimeoutMs}ms)`), {
+                    exitCode: 255, stderr: `Timeout, server ${host} not responding (walker read attempt killed after ${attemptTimeoutMs}ms)`,
+                })
+            }
+            throw e
+        } finally {
+            clearTimeout(timer)
+        }
     }
 
     /**
@@ -1463,8 +1484,72 @@ export class RealFleetOps implements FleetOps {
      */
     protected async ssh(host: string, remoteCmd: string, opts: { retry?: boolean } = {}): Promise<string> {
         if (!opts.retry) return this.sshOnce(host, remoteCmd)
-        return withSshRetry(host, remoteCmd.replace(/\s+/g, ' ').slice(0, 80), () => this.sshOnce(host, remoteCmd), sshRetryPolicy(), {
+        return withSshRetry(host, remoteCmd.replace(/\s+/g, ' ').slice(0, 80), () => this.sshOnce(host, remoteCmd, Number(process.env.DURATION_SSH_READ_ATTEMPT_MS ?? 120_000)), sshRetryPolicy(), {
             sleep: ms => sleep(ms),
+            log: line => console.log(line),
+        })
+    }
+
+    // ── r67: mutating ssh behind a warm ControlMaster + start gate (sshMutate.ts) ──
+    /** Masters this walker started / reused, per host (tests + run.log). */
+    readonly masterStats = { started: 0, reused: 0 }
+    protected controlPath(): string {
+        return process.env.DURATION_SSH_CONTROL_PATH?.trim() || '/tmp/idea-dur-cm-%C'
+    }
+
+    /** Local process with a hard wall timeout (kill → code null, timedOut). */
+    protected runLocal(cmd: string, args: string[], opts: { timeoutMs: number; onStdout?: (chunk: string, child: ChildProcess) => void; earlyKill?: { ms: number; unless: () => boolean } }): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }> {
+        return new Promise(resolve => {
+            const child = spawn(cmd, args, { stdio: ['pipe', 'pipe', 'pipe'] })
+            let stdout = '', stderr = '', timedOut = false
+            const t = setTimeout(() => { timedOut = true; child.kill('SIGKILL') }, opts.timeoutMs)
+            const ek = opts.earlyKill ? setTimeout(() => { if (!opts.earlyKill!.unless()) { timedOut = true; child.kill('SIGKILL') } }, opts.earlyKill.ms) : undefined
+            child.on('close', () => { if (ek) clearTimeout(ek) })
+            child.stdout.on('data', d => { stdout += String(d); opts.onStdout?.(stdout, child) })
+            child.stderr.on('data', d => { stderr += String(d) })
+            child.on('error', e => { stderr += String(e) })
+            child.on('close', code => { clearTimeout(t); resolve({ code, stdout, stderr, timedOut }) })
+        })
+    }
+
+    /** Warm transport: reuse a live ControlMaster, else establish one (no remote command; transport retries only). */
+    protected async ensureMaster(host: string): Promise<void> {
+        const target = `${this.sshUser}@${host}`
+        const cp = ['-o', `ControlPath=${this.controlPath()}`]
+        const chk = await this.runLocal('ssh', [...sshOpts, ...cp, '-O', 'check', target], { timeoutMs: 10_000 })
+        if (chk.code === 0) { this.masterStats.reused++; return }
+        await withSshRetry(host, 'ControlMaster establish', async () => {
+            const r = await this.runLocal('ssh', [...sshOpts, ...cp, '-o', 'ControlMaster=yes', '-o', `ControlPersist=${process.env.DURATION_SSH_CONTROL_PERSIST ?? '600'}`, '-fN', target], { timeoutMs: 45_000 })
+            if (r.code !== 0) throw Object.assign(new Error(r.stderr || 'master failed'), { exitCode: 255, stderr: r.timedOut ? `Connection timed out establishing ControlMaster (${r.stderr.trim()})` : (r.stderr || 'Connection closed') })
+        }, sshRetryPolicy(), { sleep: ms => sleep(ms), log: line => console.log(line) })
+        this.masterStats.started++
+        console.log(JSON.stringify({ event: 'ssh_master_up', host }))
+    }
+
+    /** One gated attempt over the master: send GO only after the gate token arrived. */
+    protected async runGated(host: string, gated: string): Promise<GatedResult> {
+        let sentGo = false
+        const r = await this.runLocal('ssh', [...sshOpts, '-o', `ControlPath=${this.controlPath()}`, '-o', 'ControlMaster=no', `${this.sshUser}@${host}`, gated], {
+            timeoutMs: Number(process.env.DURATION_SSH_MUTATE_MAX_MS ?? 3_600_000),
+            // No gate token within gate+15 s → kill: the command provably never started.
+            earlyKill: { ms: (gateSecs() + 15) * 1000, unless: () => sentGo },
+            onStdout: (all, child) => {
+                if (!sentGo && all.includes(GATE_TOKEN)) {
+                    sentGo = true
+                    child.stdin?.write('GO\n'); child.stdin?.end()
+                }
+            },
+        })
+        return { code: r.code, stdout: r.stdout, stderr: r.stderr, sentGo, timedOut: r.timedOut }
+    }
+
+    /** Mutating remote command: run once behind the start gate; see sshMutate.ts. */
+    protected async sshMutate(host: string, remoteCmd: string, spec: MutateSpec): Promise<MutateResult> {
+        return sshMutate(host, remoteCmd, spec, {
+            ensureMaster: h => this.ensureMaster(h),
+            runGated: (h, g) => this.runGated(h, g),
+            sleep: ms => sleep(ms),
+            now: () => Date.now(),
             log: line => console.log(line),
         })
     }
@@ -2315,7 +2400,18 @@ export class RealFleetOps implements FleetOps {
             // Stage 2 (r60 FAIL@59): a real Engine restart never removes containers — see fastRestartClearsContainers.
             if (this.fastRestartClearsContainers()) await this.stopDurationFixtureContainers(host)
             console.log(`[RealFleetOps] pm2 restart engine on ${engineId} (${host})`)
-            await this.ssh(host, 'pm2 restart engine')
+            // r67: gated + verified (a reset after GO is decided by the Engine process start time, never re-run blind).
+            const before = Number(String(await this.sshRead(host, 'date +%s')).trim())
+            await this.sshMutate(host, 'pm2 restart engine', {
+                verb: 'pm2 restart engine',
+                idempotent: true,
+                verify: async () => {
+                    const out = String(await this.sshRead(host, PM2_ENGINE_START_CMD)).trim()
+                    const started = Number(out)
+                    if (!Number.isFinite(started) || started <= 0) return 'unknown'
+                    return started >= before ? 'done' : 'not_done'
+                },
+            })
             // Brief pause then wait for WS.
             // Overnight smoke (idea#166): 60s withTimeout was too short after rapid
             // pm2 restarts on idea03 — Automerge reconnect lagged. Use 150s
@@ -2330,11 +2426,17 @@ export class RealFleetOps implements FleetOps {
             }
         } else {
             console.log(`[RealFleetOps] sudo reboot on ${engineId} (${host})`)
-            try {
-                await this.ssh(host, 'sudo reboot')
-            } catch {
-                // reboot often kills SSH mid-flight
-            }
+            // r67: gated — a failure before the command started is retried; a drop after GO (normal for a
+            // reboot) is decided read-only by the boot id changing (sshRead rides out the reboot itself).
+            const bootBefore = String(await this.sshRead(host, 'cat /proc/sys/kernel/random/boot_id')).trim()
+            await this.sshMutate(host, 'sudo reboot', {
+                verb: 'sudo reboot',
+                idempotent: false,
+                verify: async () => {
+                    const now = String(await this.sshRead(host, 'cat /proc/sys/kernel/random/boot_id')).trim()
+                    return now && now !== bootBefore ? 'done' : 'unknown'
+                },
+            })
             // Wait until SSH comes back, then WS
             const deadline = Date.now() + 300_000
             let sshUp = false
