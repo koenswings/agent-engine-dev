@@ -207,8 +207,9 @@ const createInstanceWrapper = async (storeHandle: DocHandle<Store> | null, insta
     console.warn(chalk.yellow('createInstance is deprecated — use installApp instead'))
     const store = storeHandle?.doc()
     if (!store) throw new Error("Store is not available to create instance.")
-    const disk = findDiskByName(store, diskName)
-    if (!disk || !disk.device) throw new Error(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`)
+    // Disk by id (preferred) or unique name; a name with spaces must be quoted ("System Disk")
+    const disk = resolveDiskArg(store, localEngineId as any, String(diskName), 'createInstance')
+    if (!disk.device) throw new Error(`Disk '${diskName}' has no device on engine ${localEngineId}`)
     await buildInstance(instanceName, appName, gitAccount, gitTag as Version, disk.device)
 }
 
