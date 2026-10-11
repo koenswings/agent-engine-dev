@@ -157,6 +157,8 @@ export interface FleetOps {
     /** Engine-owned settle: WS up + store sync ready. */
     waitReady(engineId: string, timeoutMs: number): Promise<SettleReady>
     readStore(engineId: string): Promise<SemanticStoreView>
+    /** Optional (real fleet): drop + reopen the cached store view of one engine; recorded in RECONNECTS.md. */
+    refreshView?(engineId: string, reason: string): Promise<boolean | null>
     listPoolEngines(): string[]
     /** Apply shared-store / unique-doc + mDNS policy. */
     applyStoreMode(mode: StoreMode): Promise<void>
