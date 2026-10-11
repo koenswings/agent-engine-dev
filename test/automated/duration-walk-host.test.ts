@@ -47,8 +47,16 @@ describe('idea02 launcher contract (script/idea02-walker/launch.sh)', () => {
         expect(sh).toMatch(/kill -0 "\$PID"/)
         expect(sh).toMatch(/step-0001/)
     })
+    it('looks for step 1 in walk/ (record-walk dir), not anywhere in the run dir', () => {
+        expect(sh).toContain('"$EVID/walk/step-0001-*"')
+        expect(sh).not.toMatch(/find "\$EVID" -name '\*step-0001\*'/)
+    })
+    it('pins the console intents checkout and passes the idea04 doc wait', () => {
+        expect(sh).toMatch(/REFUSE: console intents checkout is not/)
+        expect(sh).toContain('DURATION_DOC_WAIT_MS_IDEA04')
+    })
     it('runs the store-check gate before launching and keeps the declared pins + deviation', () => {
         expect(sh).toMatch(/store-check\.ts/)
-        for (const v of ['DURATION_STAGE=2', 'cda87d20606a270eab896a4f9b0350ecebcbfb5b', 'index-CyVOVvJQ.js', 'd65c2daaf595627a8e106d87e8e31a1a', '4fb5299', 'DURATION_DOC_WAIT_MS', '--start-instances', '--console-url http://idea01:8080']) expect(sh).toContain(v)
+        for (const v of ['DURATION_STAGE=2', 'cda87d20606a270eab896a4f9b0350ecebcbfb5b', 'index-CyVOVvJQ.js', 'd65c2daaf595627a8e106d87e8e31a1a', '49cf9085e063887cb162c8cbc6ed1dd1f79b1e93', 'DURATION_DOC_WAIT_MS', '--start-instances', '--console-url http://idea01:8080']) expect(sh).toContain(v)
     })
 })
