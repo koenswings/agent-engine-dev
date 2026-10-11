@@ -429,7 +429,73 @@ export const stage2RoleWindows = (steps: readonly { action: string }[]): Stage2W
     return out
 }
 
-export interface Stage2Conflict { kind: 'move-target' | 'overlap' | 'share' | 'never-move-to'; diskId: string; detail: string }
+export interface Stage2Conflict { kind: 'move-target' | 'overlap' | 'share' | 'never-move-to' | 'dirty-needs-empty' | 'consumer-on-move-target'; diskId: string; detail: string }
+
+/**
+ * r75 fix 3: every step that needs a role partition in a given state, and what it leaves behind.
+ * install_app writes an app onto the files partition (before the first erase_disk) or the erase
+ * partition (after); needsEmpty steps require the Console's EmptyDiskPanel (no instances).
+ */
+export const STAGE2_DISK_CONSUMERS: Readonly<Record<string, { role: (i: { eraseStarted: boolean }) => Stage2Role; needsEmpty: boolean; dirties: boolean; cleans?: boolean }>> = {
+    install_app: { role: i => (i.eraseStarted ? 'erase' : 'files'), needsEmpty: true, dirties: true },
+    make_files_disk: { role: () => 'files', needsEmpty: true, dirties: false },
+    make_backup_disk: { role: () => 'backup', needsEmpty: true, dirties: false },
+    erase_disk: { role: () => 'erase', needsEmpty: false, dirties: false },
+    confirm_erase: { role: () => 'erase', needsEmpty: false, dirties: false, cleans: true },
+    restore_from_backup: { role: () => 'backup', needsEmpty: false, dirties: false },
+    backup_instance: { role: () => 'backup', needsEmpty: false, dirties: false },
+}
+
+/**
+ * Steps that the harness precedes with a SETTLED fresh re-dock (wait for in-flight ops, remove
+ * instances, reset, re-check; actions.ts settleDiskOpsBeforeReset): they may consume a dirtied
+ * partition. install_app only after a start_after_install (redockEmpty002BeforeSecondInstall hook).
+ */
+export const STAGE2_RESET_BEFORE = new Set(['make_files_disk', 'erase_disk'])
+
+/**
+ * r75 fix 3: per-partition state machine over the whole walk. A step that needs an Empty partition
+ * after an install dirtied it, with no settled reset in between, is a 'dirty-needs-empty' conflict;
+ * any consumer on the move-only target is 'consumer-on-move-target'. Pre-walk, fail loud.
+ */
+export const stage2DiskStateConflicts = (
+    steps: readonly { action: string }[],
+    target: string = STAGE2_MOVE_TARGET_ID,
+    roleMap: Readonly<Record<Stage2Role, string>> = STAGE2_ROLE_MAP,
+): Stage2Conflict[] => {
+    const out: Stage2Conflict[] = []
+    const dirtyBy = new Map<string, number>() // disk → step that dirtied it
+    const holdsStartedApp = new Set<string>()
+    let eraseStarted = false
+    steps.forEach((s, i) => {
+        const n = i + 1
+        if (s.action === 'start_after_install') {
+            for (const d of dirtyBy.keys()) holdsStartedApp.add(d)
+            return
+        }
+        if (s.action === 'stay_on_disk') {
+            // redockEmpty002BeforeErase: settled fresh re-dock of the erase partition after stay_on_disk.
+            const d = roleMap.erase
+            dirtyBy.delete(d); holdsStartedApp.delete(d)
+            return
+        }
+        const c = STAGE2_DISK_CONSUMERS[s.action]
+        if (!c) return
+        if (s.action === 'erase_disk') eraseStarted = true
+        const disk = roleMap[c.role({ eraseStarted })]
+        if (disk === target) {
+            out.push({ kind: 'consumer-on-move-target', diskId: disk, detail: `${s.action}@${n} uses the move-only target ${disk}` })
+        }
+        const reset = STAGE2_RESET_BEFORE.has(s.action) || (s.action === 'install_app' && holdsStartedApp.has(disk))
+        if (reset) { dirtyBy.delete(disk); holdsStartedApp.delete(disk) }
+        if (c.needsEmpty && dirtyBy.has(disk)) {
+            out.push({ kind: 'dirty-needs-empty', diskId: disk, detail: `${s.action}@${n} needs ${disk} Empty but install_app@${dirtyBy.get(disk)} dirtied it with no settled reset in between` })
+        }
+        if (c.cleans) { dirtyBy.delete(disk); holdsStartedApp.delete(disk) }
+        if (c.dirties) dirtyBy.set(disk, n)
+    })
+    return out
+}
 
 /**
  * Partition timeline verdict for a walk: [] = fits. Conflicts: a role on the move target (move-only),
@@ -464,6 +530,8 @@ export const stage2RoleTimeline = (
             out.push({ kind: 'share', diskId: roleMap[a.role], detail: `${first.role} then ${second.role} share ${roleMap[a.role]} (not an allowed sequential share)` })
         }
     }
+    // r75 fix 3: all role pairs above + every disk consumer / install transition across the walk.
+    out.push(...stage2DiskStateConflicts(steps, target, roleMap))
     return out
 }
 

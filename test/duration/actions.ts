@@ -6,6 +6,7 @@
  * Usage/operator Intents: StubUiDriver (Fake CI) or PlaywrightUiDriver → Pixel getIntent.
  */
 
+import { isIdea02Target } from './walkHost.js'
 import { settleAfterLongOp, poolInstanceIds, type PostOpSettleIo } from './postOpSettle.js'
 import { opStartBudget, WAIT_OP_ACTIONS, opAppearBudgetMs, opDoneBudgetMs, waitOperationTerminal, type WaitOperationFn } from './opWait.js'
 import { STAGE2_MOVE_TARGET_HOST, stage2HomeOf } from './stage2.js'
@@ -27,7 +28,7 @@ import {
     APP_URL_ENV, CONSOLE_DEFAULT_SIDECAR_PORTS, INSTANCE_SIDECAR_ACTIONS, appKindForInstanceId, appTabProblems, appsUsedByStep, consoleOpenProblem, CONSOLE_OPEN_ACTION_RE, APP_HOSTS_ENV, appHostForms, lanHostsFromEnv, lanHostsFromStore,
     assertNoManualAppOverride, idea166Target, isHarnessOwned, nextcloudUntrustedDomain, offPinRedirect, setHarnessEnv, type AppPin, type SidecarApp,
 } from './appUrls.js'
-import { backupDiskTargetId, describeDisk, diskEmptiness, eraseDiskTargetId, filesDiskTargetId, waitDiskEmpty } from './fixtureDisks.js'
+import { backupDiskTargetId, describeDisk, diskEmptiness, eraseDiskTargetId, filesDiskTargetId, waitDiskEmpty, diskResetVerdict, instanceStoredOn, rowInFlight } from './fixtureDisks.js'
 import { copyDoneBudgetMs, DEFAULT_NEXTCLOUD_READY_MS, envMs, instanceStartBudgetMs, logStartMeasured } from './startBudgets.js'
 
 export const HUB_ACTIONS = [
@@ -324,6 +325,60 @@ const waitUndockedBeforeRedock = async (
  * storedOn=diskId survive; Console hasInstancesOn keys off store → still shows
  * app / no EmptyDiskPanel. AfterErase must NOT purge (erase already cleared instances).
  */
+/** r75 fix 1: budget for an in-flight install/op on a disk to land and settle before its reset. */
+export const diskOpSettleMs = (env: NodeJS.ProcessEnv = process.env): number => {
+    const n = Number(env.DURATION_DISK_OP_SETTLE_MS)
+    return Number.isFinite(n) && n > 0 ? n : 180_000
+}
+
+/**
+ * r75 FAIL@91 fix 1: never reset a disk under a live operation. install_app@88 soft-returned, the
+ * Engine wrote the new instance 14 s later (after the purge), then stage2-dock reset reformatted the
+ * partition under it: stale Pauzed record (currentStep 5) + orphan Created container. Before a fresh
+ * re-dock: wait until an install the walker started on this disk has landed in the store and every
+ * row on the disk has settled (diskResetVerdict). Timeout → fail loud, no reset. No-op without
+ * diskInstancesRaw (Fake). Clears walker.pendingInstallDisk for this disk.
+ */
+export const settleDiskOpsBeforeReset = async (
+    ctx: ActionContext,
+    engine: string,
+    diskId: string,
+    label: string,
+    opts: { budgetMs?: number; pollMs?: number } = {},
+): Promise<string> => {
+    const ops = ctx.opts.ops as FleetOps & { diskInstancesRaw?: FleetOps['diskInstancesRaw'] }
+    const pending = ctx.walker.pendingInstallDisk === diskId
+    if (typeof ops.diskInstancesRaw !== 'function') {
+        if (pending) ctx.walker.pendingInstallDisk = null
+        return ''
+    }
+    const budget = opts.budgetMs ?? diskOpSettleMs()
+    const poll = opts.pollMs ?? 1_000
+    const t0 = Date.now()
+    let last = 'unread'
+    for (;;) {
+        try {
+            const rows = await ops.diskInstancesRaw(engine, diskId)
+            last = rows.length ? rows.map(r => `${r.id}=${r.status}${r.currentStep != null ? `@step${r.currentStep}` : ''}`).join(', ') : 'no instances'
+            if (diskResetVerdict(rows, pending) === 'ready') {
+                if (pending) ctx.walker.pendingInstallDisk = null
+                const waited = Date.now() - t0
+                return rows.length || pending ? `ops on ${diskId} settled after ${waited}ms (${last})` : ''
+            }
+        } catch (e) {
+            last = `read failed: ${e instanceof Error ? e.message : String(e)}`
+        }
+        if (Date.now() - t0 >= budget) {
+            throw new Error(
+                `${label}: ${diskId} on ${engine} still has an operation in flight after ${budget}ms ` +
+                    `(${pending ? 'install_app pending; ' : ''}${last}) — refusing to reset a disk under a live op ` +
+                    `(DURATION_DISK_OP_SETTLE_MS). Fail loud.`,
+            )
+        }
+        await new Promise(r => setTimeout(r, poll))
+    }
+}
+
 const redockEmptyFresh = async (
     ctx: ActionContext,
     diskId: string,
@@ -352,6 +407,13 @@ const redockEmptyFresh = async (
         findDockedEngine?: (id: string) => Promise<string | null>
         waitDiskUndocked?: (id: string, timeoutMs?: number) => Promise<void>
     }
+    let settleNote = ''
+    if (opts?.purgeStoreInstances) {
+        // r75 fix 1: wait for in-flight ops, then remove the instances (containers + records) while
+        // the disk is still docked, BEFORE the reset.
+        settleNote = await settleDiskOpsBeforeReset(ctx, engine, diskId, label)
+        await ctx.opts.ops.purgeInstancesStoredOn(engine, diskId)
+    }
     if (typeof opsAny.findDockedEngine === 'function') {
         const already = await opsAny.findDockedEngine(diskId)
         if (already) {
@@ -379,12 +441,22 @@ const redockEmptyFresh = async (
             )
         }
     }
-    return `re-docked ${diskId} on ${engine} ${noteSuffix}`
+    if (opts?.purgeStoreInstances && typeof ctx.opts.ops.diskInstancesRaw === 'function') {
+        // r75 fix 1: re-check after the reset — a record still on the disk means something survived.
+        const left = await ctx.opts.ops.diskInstancesRaw(engine, diskId)
+        if (left.length) {
+            throw new Error(
+                `${label}: ${diskId} on ${engine} still holds ${left.map(r => `${r.id}=${r.status}`).join(', ')} ` +
+                    `after the fresh re-dock — fail loud (r75).`,
+            )
+        }
+    }
+    return `re-docked ${diskId} on ${engine} ${noteSuffix}${settleNote ? `; ${settleNote}` : ''}`
 }
 
 /** Prefer A: hosts the harness must never touch, regardless of exclude_engines. */
 const NEVER_ENGINES = new Set(['idea02'])
-const isNeverEngine = (engine: string): boolean => NEVER_ENGINES.has(engine)
+const isNeverEngine = (engine: string): boolean => NEVER_ENGINES.has(engine) || isIdea02Target(engine)
 
 /** Stage 2 (Stage2FleetOps): a fixture lives on its home Pi's SSD, not on the Console engine. */
 const isStage2 = (ctx: { opts: { ops: FleetOps } }): boolean => (ctx.opts.ops as FleetOps & { stage?: number }).stage === 2
@@ -639,7 +711,7 @@ export const preflightFilesDiskTarget = async (
             const view = await ctx.opts.ops.readStore(engine)
             const disk = view.diskDB[diskId]
             const types = disk?.diskTypes ?? []
-            const insts = Object.values(view.instanceDB).filter(i => i.diskId === diskId)
+            const insts = Object.values(view.instanceDB).filter(i => instanceStoredOn(i, diskId))
             last = `dockedTo=${disk?.dockedTo ?? 'none'} diskTypes=[${types.join(', ')}] instances=${insts.length}`
             const typesOk = types.length === 1 && types[0] === 'empty'
             if (disk?.dockedTo && typesOk && (!requireNoInstances || insts.length === 0)) break
@@ -3578,6 +3650,11 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
         } else {
             message = `${message}; add_files_role on app-only ${diskId} (stub; skip store assert)`
         }
+    }
+    // r75 fix 1: remember the disk an install_app is still landing on (soft return).
+    if (result.ok && ctx.action === 'erase_disk') ctx.walker.eraseStarted = true
+    if (result.ok && ctx.action === 'install_app') {
+        ctx.walker.pendingInstallDisk = ctx.walker.eraseStarted ? eraseDiskTargetId() : filesDiskTargetId()
     }
     // Prefer A r26: after successful confirm_erase, re-dock empty-002 Empty for late install_app.
     if (result.ok && ctx.action === 'confirm_erase') {

@@ -569,7 +569,7 @@ describe('Stage 2 erase share + sidecar owner (actions)', () => {
         process.env.DURATION_STAGE = '2'
         const { ctx, calls } = ctxWith(['files'])
         expect(await stage2RedockSharedEraseDisk(ctx)).toMatch(/re-docked duration-empty-001 on idea03/)
-        expect(calls).toEqual([`undock idea01,idea03,idea04 ${E1}`, `purge idea03 ${E1}`, `dock idea03 ${E1}`])
+        expect(calls).toEqual([`purge idea03 ${E1}`, `undock idea01,idea03,idea04 ${E1}`, `purge idea03 ${E1}`, `dock idea03 ${E1}`])
     })
     it('no-op when empty-001 is already Empty on idea03, or in Stage 1', async () => {
         process.env.DURATION_STAGE = '2'

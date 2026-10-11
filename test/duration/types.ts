@@ -145,6 +145,11 @@ export interface FleetOps {
      * set disk.diskTypes=['empty']. Duration fixtures only (RealFleetOps).
      */
     purgeInstancesStoredOn(engineId: string, diskId: string): Promise<void>
+    /**
+     * r75: raw instance rows stored on diskId (id, status, Engine currentStep) for the in-flight-op
+     * gate before a fresh re-dock. Optional: Fake has no async installs.
+     */
+    diskInstancesRaw?(engineId: string, diskId: string): Promise<DiskInstanceRow[]>
     /** Move: undock then dock on another pool engine. */
     moveDisk(fromEngine: string, toEngine: string, diskId: string): Promise<void>
     /** Reboot pool engine; fast=true → pm2 restart instead of sudo reboot. */
@@ -201,6 +206,9 @@ export interface DurationOptions {
     onLog?: (entry: StructuredLogEntry) => void
 }
 
+/** r75: one instanceDB row stored on a disk (raw Engine fields for the in-flight gate). */
+export interface DiskInstanceRow { id: string; status: string; currentStep: number | null }
+
 export interface WalkerState {
     current: string
     layer: Layer | null
@@ -213,6 +221,14 @@ export interface WalkerState {
      * The next install_app re-docks empty-002 first (redockEmpty002BeforeSecondInstall).
      */
     empty002HoldsApp?: boolean
+    /**
+     * r75 FAIL@91: install_app soft-returns while the Engine's installApp keeps running (the record
+     * appeared 14 s later, after the store purge). Set after a successful install_app to the disk it
+     * targets; a fresh re-dock of that disk first waits for the install to land and settle.
+     */
+    pendingInstallDisk?: string | null
+    /** true once erase_disk ran: later install_app targets the erase partition, not the files one. */
+    eraseStarted?: boolean
 }
 
 /** One step in a deterministic walk file (kind: walk). */

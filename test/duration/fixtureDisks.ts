@@ -92,11 +92,35 @@ export interface DiskEmptiness {
 }
 
 /** Same criterion as preflightFilesDiskTarget: the Console's empty badge needs all three. */
+/**
+ * r75 fix 2: the ONE predicate for "instance stored on this disk", shared by the store purge
+ * (raw Engine rows: storedOn) and the emptiness checks (semantic view: diskId, mapped from storedOn).
+ */
+export const instanceStoredOn = (inst: { storedOn?: unknown; diskId?: unknown } | null | undefined, diskId: string): boolean =>
+    !!inst && String(inst.storedOn ?? inst.diskId ?? '') === String(diskId)
+
+/**
+ * r75 fix 1: Engine statuses that mean an operation is still running on the instance. A row with a
+ * non-null currentStep (installApp / startInstance progress) is in flight whatever its status says
+ * (r75: Pauzed + currentStep 5 "Starting containers").
+ */
+export const IN_FLIGHT_STATUSES = new Set(['Installing', 'Creating', 'Starting', 'Stopping', 'Pauzing', 'Copying', 'Moving', 'Restoring', 'BackingUp', 'Deleting'])
+export const rowInFlight = (r: { status: string; currentStep: number | null }): boolean =>
+    r.currentStep != null || IN_FLIGHT_STATUSES.has(r.status)
+
+/**
+ * r75 fix 1 verdict before a fresh re-dock (reset) of a disk: 'wait' while an install the walker
+ * started has not landed in the store yet, or any row on the disk is still mid-operation;
+ * 'ready' once every row has settled (they are then purged). Never reset under a live op.
+ */
+export const diskResetVerdict = (rows: readonly { status: string; currentStep: number | null }[], pendingInstall: boolean): 'wait' | 'ready' =>
+    (pendingInstall && rows.length === 0) || rows.some(rowInFlight) ? 'wait' : 'ready'
+
 export const diskEmptiness = (view: SemanticStoreView, diskId: string): DiskEmptiness => {
     const disk = view.diskDB[diskId]
     const diskTypes = [...(disk?.diskTypes ?? [])]
     const instances = Object.values(view.instanceDB)
-        .filter(i => i.diskId === diskId)
+        .filter(i => instanceStoredOn(i, diskId))
         .map(i => i.id)
         .sort()
     const dockedTo = disk?.dockedTo ?? null

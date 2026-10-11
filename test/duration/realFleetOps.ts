@@ -23,6 +23,7 @@ import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websoc
 import { type ChildProcess } from 'node:child_process'
 import { existsSync, unlinkSync } from 'node:fs'
 import { runProcess } from './procRun.js'
+import { instanceStoredOn } from './fixtureDisks.js'
 import { GATE_TOKEN, gateSecs, sshMutate, type GatedResult, type MutateResult, type MutateSpec } from './sshMutate.js'
 import { headsKey, recordReconnect, staleViewMs } from './staleView.js'
 import { $ } from 'zx'
@@ -59,6 +60,7 @@ import {
     trackRepo,
 } from './automergeTimeoutGuard.js'
 import type {
+    DiskInstanceRow,
     FleetOps,
     SemanticStoreView,
     SettleReady,
@@ -2347,7 +2349,7 @@ export class RealFleetOps implements FleetOps {
         }
         const stopped: string[] = []
         for (const inst of Object.values(view.instanceDB)) {
-            if (inst.status !== 'Running' && inst.status !== 'Starting') continue
+            // r75: also remove Created/Pauzed containers of an interrupted install (orphan kolibri-6rgar…).
             const disk = inst.diskId ? view.diskDB[inst.diskId] : undefined
             if (disk && disk.dockedTo !== null) continue
             const idHits =
@@ -3434,7 +3436,8 @@ export class RealFleetOps implements FleetOps {
         const toPurge: { id: string; status: string }[] = []
         for (const [id, inst] of Object.entries(doc.instanceDB ?? {})) {
             if (!inst) continue
-            if (String((inst as { storedOn?: unknown }).storedOn) !== String(diskId)) continue
+            // r75 fix 2: same predicate as diskEmptiness / preflightFilesDiskTarget.
+            if (!instanceStoredOn(inst as { storedOn?: unknown }, diskId)) continue
             toPurge.push({
                 id: String((inst as { id?: unknown }).id ?? id),
                 status: String((inst as { status?: unknown }).status ?? ''),
@@ -3489,6 +3492,21 @@ export class RealFleetOps implements FleetOps {
             `storedOn=${diskId} on ${engineId}` +
             (purgeIds.length ? ` (${purgeIds.join(', ')})` : ''),
         )
+    }
+
+    /** r75 fix 1: raw instance rows stored on diskId (READ-ONLY), for the in-flight gate before a reset. */
+    async diskInstancesRaw(engineId: string, diskId: string): Promise<DiskInstanceRow[]> {
+        this.assertNotExcluded(engineId, 'diskInstancesRaw')
+        const conn = await this.connect(engineId)
+        const doc = conn.storeHandle.doc()
+        if (!doc) throw new Error(`RealFleetOps: store doc not ready for ${engineId}`)
+        const rows: DiskInstanceRow[] = []
+        for (const [id, inst] of Object.entries(doc.instanceDB ?? {})) {
+            const i = inst as { id?: unknown; status?: unknown; currentStep?: unknown; storedOn?: unknown } | undefined
+            if (!i || !instanceStoredOn(i, diskId)) continue
+            rows.push({ id: String(i.id ?? id), status: String(i.status ?? ''), currentStep: typeof i.currentStep === 'number' ? i.currentStep : null })
+        }
+        return rows
     }
 
     /** Drop all open WS connections (tests / process exit). */
