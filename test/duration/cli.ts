@@ -34,6 +34,7 @@ import { createUiDriver, resolveConsoleIntentsDir } from './ui/index.js'
 import { EXIT_CONSOLE_PIN_MISMATCH, runConsoleDeployPreflight } from './consoleDeploy.js'
 import { boxToolingExitCode, checkBoxTooling, realBoxToolingDeps } from './boxTooling.js'
 import { $ } from 'zx'
+import { startPauseMonitor } from './procRun.js'
 import { reconnectLine, reconnectSummary, writeReconnectsMd } from './staleView.js'
 import { createHash } from 'node:crypto'
 import type { StructuredLogEntry } from './types.js'
@@ -710,6 +711,7 @@ const main = async () => {
         }
     }
 
+    startPauseMonitor() // r68: box VM freezes show up in run.log as box_pause
     const onLog = (e: StructuredLogEntry) => {
         // Shake-out: every step line also carries its parent (cover-all) step number.
         console.log(JSON.stringify({ event: 'duration_step', ...e, ...stepNumbers(walk, e.step) }))

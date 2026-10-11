@@ -159,6 +159,6 @@ describe('r62-style read retries unchanged', () => {
         const f = Object.create(RealFleetOps.prototype) as any
         Object.assign(f, { sshUser: 'pi' })
         // 10.255.255.1 never answers; ConnectTimeout=10 > the 300 ms attempt limit → killed → exit 255 "Timeout … not responding".
-        await expect(f.sshOnce('10.255.255.1', 'true', 300)).rejects.toMatchObject({ exitCode: 255, stderr: expect.stringMatching(/Timeout, server 10\.255\.255\.1 not responding \(walker read attempt killed after 300ms\)/) })
+        await expect(f.sshOnce('10.255.255.1', 'true', 300)).rejects.toMatchObject({ exitCode: 255, stderr: expect.stringMatching(/Timeout, server 10\.255\.255\.1 not responding \(walker killed the ssh process group after 300ms\)/) })
     })
 })

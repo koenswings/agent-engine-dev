@@ -56,13 +56,18 @@ export interface SshRetryIo {
     sleep: (ms: number) => Promise<void>
     log: (line: string) => void
     now?: () => number
+    /** Wall clock, only to report a box pause (wall advanced much more than monotonic). */
+    wall?: () => number
 }
 
 export const withSshRetry = async <T>(
     host: string, what: string, run: () => Promise<T>, policy: SshRetryPolicy, io: SshRetryIo,
 ): Promise<T> => {
-    const now = io.now ?? (() => Date.now())
+    // r68 (r67 FAIL@23): the budget is MONOTONIC time — a frozen box (VM pause) must not use up the deadline.
+    const now = io.now ?? (() => performance.now())
+    const wall = io.wall ?? (() => Date.now())
     const t0 = now()
+    const w0 = wall()
     const tries: string[] = []
     for (let attempt = 1; ; attempt++) {
         try {
@@ -72,10 +77,13 @@ export const withSshRetry = async <T>(
         } catch (e) {
             if (!isSshTransportFailure(e)) throw e // remote ran and failed, or not a transport error: never retried
             const line = sshStderrLine(e)
-            const elapsed = now() - t0
-            tries.push(`#${attempt} @${elapsed}ms: exit 255 ${line}`)
+            const elapsed = Math.round(now() - t0)
+            const pausedMs = Math.max(0, Math.round(wall() - w0 - elapsed))
+            if (pausedMs > 20_000) io.log(JSON.stringify({ event: 'box_pause_detected', host, what, attempt, wall_elapsed_ms: elapsed + pausedMs, mono_elapsed_ms: elapsed, paused_ms: pausedMs }))
+            tries.push(`#${attempt} @${elapsed}ms${pausedMs > 20_000 ? ` (+${pausedMs}ms box pause)` : ''}: exit 255 ${line}`)
             const wait = backoffFor(policy, attempt - 1)
-            if (elapsed + wait > policy.deadlineMs) {
+            // At least one retry after any transport failure; then the monotonic deadline decides.
+            if (attempt >= 2 && elapsed + wait > policy.deadlineMs) {
                 io.log(JSON.stringify({ event: 'ssh_retry_exhausted', host, what, attempts: attempt, elapsed_ms: elapsed, deadline_ms: policy.deadlineMs, stderr: line }))
                 throw new Error(
                     `ssh ${host} (${what}): transport failure on all ${attempt} attempt(s) within ${policy.deadlineMs}ms ` +

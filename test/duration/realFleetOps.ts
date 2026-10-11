@@ -20,7 +20,9 @@
 import { sshRetryPolicy, withSshRetry } from './sshRetry.js'
 import { Repo, type DocHandle, type DocumentId, type PeerId } from '@automerge/automerge-repo'
 import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websocket'
-import { spawn, type ChildProcess } from 'node:child_process'
+import { type ChildProcess } from 'node:child_process'
+import { existsSync, unlinkSync } from 'node:fs'
+import { runProcess } from './procRun.js'
 import { GATE_TOKEN, gateSecs, sshMutate, type GatedResult, type MutateResult, type MutateSpec } from './sshMutate.js'
 import { headsKey, recordReconnect, staleViewMs } from './staleView.js'
 import { $ } from 'zx'
@@ -1457,25 +1459,32 @@ export class RealFleetOps implements FleetOps {
     }
 
     /** One ssh round-trip, no retry. */
+    /** ssh binary (DURATION_SSH_BIN for real-process tests). */
+    protected sshBinary(): string {
+        return process.env.DURATION_SSH_BIN?.trim() || 'ssh'
+    }
+
+    /** ssh argv up to and including the target (tests add e.g. a port). */
+    protected sshArgs(host: string): string[] {
+        return [...sshOpts, `${this.sshUser}@${host}`]
+    }
+
+    /**
+     * One ssh round-trip, no retry. With attemptTimeoutMs (every read): own process group, SIGKILL to the whole
+     * group at the limit, resolves at once, and a kill is a transport failure (exit 255) so the read retry runs.
+     */
     protected async sshOnce(host: string, remoteCmd: string, attemptTimeoutMs?: number): Promise<string> {
-        const p = $`ssh ${sshOpts} ${`${this.sshUser}@${host}`} ${remoteCmd}`
-        if (!attemptTimeoutMs) return (await p).stdout
-        // r67 (r66 @39: one docker-ps attempt hung 903 s): read attempts get a hard wall limit; a kill is a
-        // transport failure (exit 255 "Timeout, server … not responding") so the read retry takes over.
-        const timer = setTimeout(() => { void p.kill('SIGKILL').catch(() => {}) }, attemptTimeoutMs)
-        try {
-            return (await p).stdout
-        } catch (e) {
-            const f = e as { exitCode?: number | null; stderr?: string }
-            if (f.exitCode == null || f.exitCode === 137) {
-                throw Object.assign(new Error(`Timeout, server ${host} not responding (walker read attempt killed after ${attemptTimeoutMs}ms)`), {
-                    exitCode: 255, stderr: `Timeout, server ${host} not responding (walker read attempt killed after ${attemptTimeoutMs}ms)`,
-                })
-            }
-            throw e
-        } finally {
-            clearTimeout(timer)
+        if (!attemptTimeoutMs) {
+            const result = await $`ssh ${sshOpts} ${`${this.sshUser}@${host}`} ${remoteCmd}`
+            return result.stdout
         }
+        const r = await runProcess(this.sshBinary(), [...this.sshArgs(host), remoteCmd], { timeoutMs: attemptTimeoutMs })
+        if (r.code === 0) return r.stdout
+        if (r.timedOut) {
+            const msg = `Timeout, server ${host} not responding (walker killed the ssh process group after ${attemptTimeoutMs}ms)`
+            throw Object.assign(new Error(msg), { exitCode: 255, stderr: `${r.stderr}\n${msg}`.trim(), stdout: r.stdout })
+        }
+        throw Object.assign(new Error(`ssh ${host}: exit ${r.code}: ${r.stderr.trim().slice(0, 400)}`), { exitCode: r.code, stderr: r.stderr, stdout: r.stdout })
     }
 
     /**
@@ -1492,34 +1501,36 @@ export class RealFleetOps implements FleetOps {
 
     // ── r67: mutating ssh behind a warm ControlMaster + start gate (sshMutate.ts) ──
     /** Masters this walker started / reused, per host (tests + run.log). */
-    readonly masterStats = { started: 0, reused: 0 }
-    protected controlPath(): string {
-        return process.env.DURATION_SSH_CONTROL_PATH?.trim() || '/tmp/idea-dur-cm-%C'
-    }
+    readonly masterStats = { started: 0, reused: 0, recreated: 0 }
 
     /** Local process with a hard wall timeout (kill → code null, timedOut). */
     protected runLocal(cmd: string, args: string[], opts: { timeoutMs: number; onStdout?: (chunk: string, child: ChildProcess) => void; earlyKill?: { ms: number; unless: () => boolean } }): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }> {
-        return new Promise(resolve => {
-            const child = spawn(cmd, args, { stdio: ['pipe', 'pipe', 'pipe'] })
-            let stdout = '', stderr = '', timedOut = false
-            const t = setTimeout(() => { timedOut = true; child.kill('SIGKILL') }, opts.timeoutMs)
-            const ek = opts.earlyKill ? setTimeout(() => { if (!opts.earlyKill!.unless()) { timedOut = true; child.kill('SIGKILL') } }, opts.earlyKill.ms) : undefined
-            child.on('close', () => { if (ek) clearTimeout(ek) })
-            child.stdout.on('data', d => { stdout += String(d); opts.onStdout?.(stdout, child) })
-            child.stderr.on('data', d => { stderr += String(d) })
-            child.on('error', e => { stderr += String(e) })
-            child.on('close', code => { clearTimeout(t); resolve({ code, stdout, stderr, timedOut }) })
-        })
+        return runProcess(cmd, args, opts)
+    }
+
+    /** Explicit per-host mux socket (so a dead one can be removed). */
+    protected controlPathFor(host: string): string {
+        const dir = process.env.DURATION_SSH_CONTROL_DIR?.trim() || '/tmp'
+        return `${dir}/idea-dur-cm-${this.sshUser}-${host.replace(/[^A-Za-z0-9._-]/g, '_')}`
     }
 
     /** Warm transport: reuse a live ControlMaster, else establish one (no remote command; transport retries only). */
     protected async ensureMaster(host: string): Promise<void> {
-        const target = `${this.sshUser}@${host}`
-        const cp = ['-o', `ControlPath=${this.controlPath()}`]
-        const chk = await this.runLocal('ssh', [...sshOpts, ...cp, '-O', 'check', target], { timeoutMs: 10_000 })
+        const cp = ['-o', `ControlPath=${this.controlPathFor(host)}`]
+        const base = this.sshArgs(host)
+        const target = base[base.length - 1]!
+        const opts = base.slice(0, -1)
+        const chk = await this.runLocal(this.sshBinary(), [...opts, ...cp, '-O', 'check', target], { timeoutMs: 10_000 })
         if (chk.code === 0) { this.masterStats.reused++; return }
+        // r68: a dead/stale mux (frozen link, VM pause, killed master) is torn down and recreated — never reused.
+        if (existsSync(this.controlPathFor(host))) {
+            await this.runLocal(this.sshBinary(), [...opts, ...cp, '-O', 'exit', target], { timeoutMs: 5_000 })
+            try { unlinkSync(this.controlPathFor(host)) } catch { /* already gone */ }
+            this.masterStats.recreated++
+            console.log(JSON.stringify({ event: 'ssh_master_dead', host, check: (chk.stderr || (chk.timedOut ? 'check timed out' : `exit ${chk.code}`)).trim().slice(0, 200), action: 'exit+unlink, recreate' }))
+        }
         await withSshRetry(host, 'ControlMaster establish', async () => {
-            const r = await this.runLocal('ssh', [...sshOpts, ...cp, '-o', 'ControlMaster=yes', '-o', `ControlPersist=${process.env.DURATION_SSH_CONTROL_PERSIST ?? '600'}`, '-fN', target], { timeoutMs: 45_000 })
+            const r = await this.runLocal(this.sshBinary(), [...opts, ...cp, '-o', 'ControlMaster=yes', '-o', `ControlPersist=${process.env.DURATION_SSH_CONTROL_PERSIST ?? '600'}`, '-fN', target], { timeoutMs: 45_000 })
             if (r.code !== 0) throw Object.assign(new Error(r.stderr || 'master failed'), { exitCode: 255, stderr: r.timedOut ? `Connection timed out establishing ControlMaster (${r.stderr.trim()})` : (r.stderr || 'Connection closed') })
         }, sshRetryPolicy(), { sleep: ms => sleep(ms), log: line => console.log(line) })
         this.masterStats.started++
@@ -1529,7 +1540,8 @@ export class RealFleetOps implements FleetOps {
     /** One gated attempt over the master: send GO only after the gate token arrived. */
     protected async runGated(host: string, gated: string): Promise<GatedResult> {
         let sentGo = false
-        const r = await this.runLocal('ssh', [...sshOpts, '-o', `ControlPath=${this.controlPath()}`, '-o', 'ControlMaster=no', `${this.sshUser}@${host}`, gated], {
+        const base = this.sshArgs(host)
+        const r = await this.runLocal(this.sshBinary(), [...base.slice(0, -1), '-o', `ControlPath=${this.controlPathFor(host)}`, '-o', 'ControlMaster=no', base[base.length - 1]!, gated], {
             timeoutMs: Number(process.env.DURATION_SSH_MUTATE_MAX_MS ?? 3_600_000),
             // No gate token within gate+15 s → kill: the command provably never started.
             earlyKill: { ms: (gateSecs() + 15) * 1000, unless: () => sentGo },
