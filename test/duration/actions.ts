@@ -6,6 +6,7 @@
  * Usage/operator Intents: StubUiDriver (Fake CI) or PlaywrightUiDriver → Pixel getIntent.
  */
 
+import { settleAfterLongOp, poolInstanceIds, type PostOpSettleIo } from './postOpSettle.js'
 import { opStartBudget, WAIT_OP_ACTIONS, opAppearBudgetMs, opDoneBudgetMs, waitOperationTerminal, type WaitOperationFn } from './opWait.js'
 import { STAGE2_MOVE_TARGET_HOST, stage2HomeOf } from './stage2.js'
 import type {
@@ -3067,6 +3068,21 @@ export const waitOperationFor = (ctx: ActionContext, onConfirm?: (sinceMs: numbe
     }
 }
 
+/** r70: copy/move steps whose Done is followed by a post-op settle on ALL pool views. */
+export const POST_OP_SETTLE_ACTIONS = new Set(['copy_app', 'move_app'])
+
+export const postOpIo = (ctx: ActionContext): PostOpSettleIo => {
+    const ops = ctx.opts.ops as { refreshView?: (e: string, why: string) => Promise<boolean | null> }
+    return {
+        engines: ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e)),
+        readStore: e => ctx.opts.ops.readStore(e),
+        ...(typeof ops.refreshView === 'function' ? { refresh: (e: string, why: string) => ops.refreshView!(e, why) } : {}),
+        sleep: ms => new Promise(res => setTimeout(res, ms)),
+        now: () => performance.now(),
+        log: line => console.log(line),
+    }
+}
+
 /**
  * Dispatch a usage/operator Intent via UiDriver (Phase 3).
  * StubUiDriver when stubUi≠false / no driver; PlaywrightUiDriver when --ui.
@@ -3379,6 +3395,9 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     // disk) over ctx.diskId — point it at the pinned role disk for this Intent only.
     const prevEmptyPin = process.env.DURATION_EMPTY_DISK_ID
     if (pinnedEmptyId) process.env.DURATION_EMPTY_DISK_ID = pinnedEmptyId
+    // r70: baseline of pool instance ids before a copy/move, so the settle knows which instances the op created.
+    const postOpBaseline = POST_OP_SETTLE_ACTIONS.has(ctx.action) && isStage2(ctx) && waitOperationFor(ctx)
+        ? await poolInstanceIds(postOpIo(ctx)) : undefined
     let result: Awaited<ReturnType<typeof driver.runIntent>>
     // r66: the Intent reports its Confirm time through the op-wait hook; the post-check clock starts there.
     let confirmAtMs: number | undefined
@@ -3429,6 +3448,12 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     }
     // r55 post-use: the App tabs this step used must be on the store URLs, and each used instance must
     // still be Running and owned by its own container on its own Pi (Stage 2; Intent ok only).
+    // r70 (r69 FAIL@43): after copy/move Done, refresh ALL pool views and wait until sources + new instances Run.
+    if (result.ok && postOpBaseline !== undefined && isStage2(ctx)) {
+        const ps = await settleAfterLongOp(ctx.action, [...new Set([...appUses.map(u => u.instanceId), ...(typeof instanceId === 'string' && instanceId ? [instanceId] : [])])], postOpBaseline, postOpIo(ctx))
+        if (!ps.ok) return { ok: false, message: `${ctx.action}: ${ps.note} (Console Intent reported ok; ${preStartSettleNote ?? ''})`, layer }
+        message = `${message}; ${ps.note}`
+    }
     if (result.ok && appUses.length && isStage2(ctx)) {
         const post = await verifyAppUseAfterIntent(ctx, driver as TabAwareDriver, appUses, appPins, tabSeq0)
         if (!post.ok) {
