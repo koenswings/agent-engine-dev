@@ -18,6 +18,7 @@ import { CommandLogStore, LogEntry, getCommandLogHandle, addTrace, closeTrace, f
 import { getActiveTrace, flushTrace } from '../utils/CommandLogger.js'
 import { dockerAvailable } from '../utils/dockerAvailable.js'
 import { rebindKolibriMorangoInstanceId } from './InstanceCopy.js'
+import { trackInFlight } from './InstanceInFlight.js'
 
 // ── Step-progress helpers ─────────────────────────────────────────────────────
 
@@ -908,7 +909,11 @@ export const diagnoseInstance = async (instance: Instance, disk: Disk, caughtErr
   return parts.join('\n\n') || 'Unknown error'
 }
 
-export const startInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> => {
+/** #179: every start is tracked in flight on its disk so an eject waits for it to settle. */
+export const startInstance = (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> =>
+  trackInFlight(String(disk.id), `startInstance ${instance.id}`, startInstanceTracked(storeHandle, instance, disk, cause))
+
+const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> => {
   const store: Store = storeHandle.doc()
   print(`Starting instance '${instance.id}' on disk ${disk.id} of engine '${localEngineId}'.`)
 
@@ -923,6 +928,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
         const port = parseInt(await readEnvVariable(`${await diskMountRoot(disk)}/instances/${instance.id}/.env`, 'port') as string) || 0
         storeHandle.change(doc => {
           const inst = doc.instanceDB[instance.id]
+          if (!inst) return  // #179: never write to (or resurrect) a deleted row
           inst.status = 'Running' as Status
           inst.statusCondition = null
           if (port > 0) inst.port = port as PortNumber
@@ -951,6 +957,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
   log(`Setting instance '${instance.id}' status to Starting`)
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
+    if (!inst) return  // #179: never write to (or resurrect) a deleted row
     inst.status = 'Starting' as Status
   })
 
@@ -1007,6 +1014,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     // Assign the port number to the instance object
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
+      if (!inst) return  // #179: never write to (or resurrect) a deleted row
       inst.port = port as PortNumber
     })
 
@@ -1286,6 +1294,7 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
   }
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
+    if (!inst) return  // #179: never write to (or resurrect) a deleted row
     inst.status = 'Pauzed' as Status
   })
 }
@@ -1314,6 +1323,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
       log(`Port number extracted from .env file for instance ${instance.id}: ${parsedPort}`)
       storeHandle.change(doc => {
         const inst = doc.instanceDB[instance.id]
+        if (!inst) return  // #179: never write to (or resurrect) a deleted row
         inst.port = parsedPort as PortNumber
       })
     } else {
@@ -1395,6 +1405,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
   if (!stillStartable('after compose up')) return
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
+    if (!inst) return  // #179: never write to (or resurrect) a deleted row
     inst.lastStarted = new Date().getTime() as Timestamp
     inst.status = 'Running' as Status
     inst.statusCondition = null  // clear any previous error diagnosis
@@ -1493,6 +1504,7 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
     // Set the status of the instance to Stopped
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
+      if (!inst) return  // #179: never write to (or resurrect) a deleted row
       inst.status = 'Stopped' as Status // Set the status to Stopped when the instance is stopped
     })
     clearStep(storeHandle, instance.id)
@@ -1507,6 +1519,7 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
     const condition = await diagnoseInstance(instance, disk, e)
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
+      if (!inst) return  // #179: never write to (or resurrect) a deleted row
       inst.status = 'Error' as Status
       inst.statusCondition = condition
     })

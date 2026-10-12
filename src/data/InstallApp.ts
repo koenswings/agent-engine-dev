@@ -29,6 +29,7 @@ import { DocHandle } from '@automerge/automerge-repo'
 import { Disk, diskMountRoot } from './Disk.js'
 import { App, createOrUpdateApp } from './App.js'
 import { assertNoExternalLinks } from './InstanceCopy.js'
+import { trackInFlight } from './InstanceInFlight.js'
 
 // ── Internet probe ────────────────────────────────────────────────────────────
 
@@ -170,7 +171,16 @@ const findDockedDiskWithApp = async (store: Store, appId: AppID, excludeDiskId?:
     return undefined
 }
 
+/** #179: an install is in flight on its target disk until it settles, so an eject waits for it. */
 export const installApp = async (
+    storeHandle: DocHandle<Store>,
+    opts: InstallAppOptions
+): Promise<void> => {
+    const target = resolveDiskArg(storeHandle.doc(), getLocalEngine(storeHandle.doc())?.id, opts.targetDiskId, 'installApp')
+    return trackInFlight(String(target.id), `installApp ${opts.appId}`, installAppRouted(storeHandle, opts))
+}
+
+const installAppRouted = async (
     storeHandle: DocHandle<Store>,
     opts: InstallAppOptions
 ): Promise<void> => {
