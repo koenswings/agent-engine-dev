@@ -55,6 +55,7 @@ import {
     type PeerPreflightResult,
 } from './peerPreflight.js'
 import { resolveConsoleEngineHost } from './actions.js'
+import { installVerdictGuards, setCurrentStep, setVerdictDir, startLoopWatchdog, writeVerdict } from './verdict.js'
 import {
     buildRunSummary,
     formatRunSummaryLine,
@@ -263,6 +264,14 @@ const main = async () => {
     if (args.help) {
         usage()
         process.exit(0)
+    }
+    // r86j: every exit after this point writes RESULT.txt + a duration_verdict line in run.log;
+    // a blocked event loop is caught by an out-of-thread watchdog (see verdict.ts).
+    const verdictDir = process.env.DURATION_EVIDENCE_DIR?.trim() || null
+    if (args.live) {
+        setVerdictDir(verdictDir)
+        installVerdictGuards()
+        startLoopWatchdog({ dir: verdictDir })
     }
 
     if (args.recordWalkDir) {
@@ -713,6 +722,7 @@ const main = async () => {
 
     startPauseMonitor() // r68: box VM freezes show up in run.log as box_pause
     const onLog = (e: StructuredLogEntry) => {
+        setCurrentStep(stepNumbers(walk, e.step)?.parentStep ?? e.step)
         // Shake-out: every step line also carries its parent (cover-all) step number.
         console.log(JSON.stringify({ event: 'duration_step', ...e, ...stepNumbers(walk, e.step) }))
     }
@@ -794,7 +804,16 @@ const main = async () => {
         record_walk: args.recordWalkDir ?? null,
     }))
 
-    process.exit(walkExitCode(result))
+    const code = walkExitCode(result)
+    writeVerdict({
+        status: code === 0 && !result.aborted && !(result.failures) ? 'PASS' : 'FAIL',
+        reason: code === 0 && !result.aborted && !(result.failures)
+            ? `walk complete: ${result.steps} step(s)`
+            : `exit ${code}; aborted=${!!result.aborted}${result.abortReason ? ` (${result.abortReason})` : ''}; failures=${result.failures}`,
+        step: summary.lastStep?.parentStep ?? summary.lastStep?.step ?? null,
+        source: 'walk-end',
+    })
+    process.exit(code)
 }
 
 /**
@@ -814,5 +833,6 @@ installProcessGuards()
 main().catch(err => {
     console.error(err)
     console.log(JSON.stringify(timeoutSummary()))
+    writeVerdict({ status: 'FAIL', reason: `walker threw: ${err instanceof Error ? err.message : String(err)}`.slice(0, 2000), source: 'main-catch' })
     process.exit(2)
 })

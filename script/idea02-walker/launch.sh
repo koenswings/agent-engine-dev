@@ -35,8 +35,16 @@ export DURATION_EXPECTED_STORE_ID=3zoqd
 export DURATION_POST_OP_SETTLE_MS=\${DURATION_POST_OP_SETTLE_MS:-300000}
 export DURATION_DOC_WAIT_MS=\${DURATION_DOC_WAIT_MS:-45000}
 export DURATION_DOC_WAIT_MS_IDEA04=\${DURATION_DOC_WAIT_MS_IDEA04:-120000}
+export DURATION_LOOP_STALL_MS=\${DURATION_LOOP_STALL_MS:-150000}
 env | grep -E "^(DURATION|STAGE2)_" | sort > $EVID/ENV.txt
-exec /usr/local/bin/pnpm test:duration -- --live --ui --start-instances --scenario cover-all --fast --console-url http://idea01:8080 --record-walk $EVID/walk "\$@"
+# r86j: no exec. If the walker dies without a verdict (SIGKILL, OOM, crash), write FAIL with the exit status.
+/usr/local/bin/pnpm test:duration -- --live --ui --start-instances --scenario cover-all --fast --console-url http://idea01:8080 --record-walk $EVID/walk "\$@"
+rc=\$?
+if [ ! -s $EVID/RESULT.txt ]; then
+  printf 'FAIL step=? source=run.sh\nwalker exited rc=%s without a verdict (SIGKILL/OOM/crash; see dmesg)\n' "\$rc" > $EVID/RESULT.txt
+  echo "{\"event\":\"duration_verdict\",\"ts\":\"\$(date -u +%FT%TZ)\",\"status\":\"FAIL\",\"reason\":\"walker exited rc=\$rc without a verdict\",\"source\":\"run.sh\"}" >> $EVID/run.log
+fi
+exit \$rc
 R
 chmod +x "$EVID/run.sh"
 echo "harness=$SHA console=$(git -C /home/walker/agent-console-dev rev-parse HEAD) start=$(date -Is)" > "$EVID/LAUNCH.txt"

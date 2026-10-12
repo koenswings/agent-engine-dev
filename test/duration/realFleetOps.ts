@@ -394,6 +394,9 @@ export class TrackedWebSocketClientAdapter extends WebSocketClientAdapter {
 /** The adapter behind each walker Repo (closeRepo waits for its socket to close). */
 const adapterOf = new WeakMap<Repo, TrackedWebSocketClientAdapter>()
 
+/** r86j: a connect may finish this late past its deadline (one 100 ms poll + scheduling) before it is a stall. */
+export const CONNECT_OVERRUN_GRACE_MS = Number(process.env.DURATION_CONNECT_OVERRUN_GRACE_MS ?? 5_000)
+
 /** Resolve once the Repo has a connected peer (handshake done), else reject after `ms`. */
 const waitForHandshake = (repo: Repo, engine: string, url: string, ms: number): Promise<void> =>
     new Promise((resolve, reject) => {
@@ -1788,6 +1791,23 @@ export class RealFleetOps implements FleetOps {
                 if (!this.rebootWindow.has(logicalId)) reportEngineUnreachable(logicalId) // expected while rebooting
                 console.log(`[RealFleetOps] Connect ${logicalId} failed: ${reason} [${describeEngineLink(logicalId)}]`)
                 throw e
+            }
+            // r86j: evidence for the store-growth/sync class (Steve): sync time + walker memory per connect.
+            const now = Date.now()
+            const overrunMs = now - deadline
+            const mu = process.memoryUsage()
+            console.log(JSON.stringify({
+                event: 'store_sync_measured', engine: logicalId, docId, outcome: outcome.kind,
+                tookMs: now - started, docWaitMs, overrunMs: Math.max(0, overrunMs),
+                walkerRssMb: Math.round(mu.rss / 1048576), walkerHeapUsedMb: Math.round(mu.heapUsed / 1048576),
+                walkerExternalMb: Math.round(mu.external / 1048576), walkerArrayBuffersMb: Math.round(mu.arrayBuffers / 1048576),
+            }))
+            // r86j: idea03 came back 'ready' 632 s into a 45 s doc wait: the polling loop could not run
+            // because a synchronous Automerge apply blocked the event loop. A connect that overran its
+            // bound is a fail-loud stall even if the doc finally loaded; never a silent slow pass.
+            if (outcome.kind === 'ready' && overrunMs > CONNECT_OVERRUN_GRACE_MS) {
+                outcome = { kind: 'stall', detail: `doc ready only ${Math.round((now - started) / 1000)}s after connect, ` +
+                    `${Math.round(overrunMs / 1000)}s past the bound (event loop blocked by store sync; walker rss ${Math.round(mu.rss / 1048576)} MB)` }
             }
             if (outcome.kind === 'ready') {
                 noteEngineStoreReady(tracked, logicalId)
