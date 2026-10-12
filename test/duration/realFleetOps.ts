@@ -309,6 +309,9 @@ export interface RealFleetOptions {
 }
 
 /** Thrown when a pool Engine's WS never completes the automerge-repo handshake. */
+/** r86h FAIL@104: a store write (Engine command / purge) that could not be made, even after one reconnect. */
+export class StoreWriteError extends Error {}
+
 export class EngineUnreachableError extends Error {
     constructor(readonly engine: string, readonly url: string, readonly detail: string) {
         super(`engine ${engine} unreachable (WS ${url}): ${detail}`)
@@ -2529,6 +2532,35 @@ export class RealFleetOps implements FleetOps {
         }
     }
 
+    /**
+     * r86h FAIL@104: the walker's idea03 handle was wedged ("outdated document", after a
+     * "Websocket not ready (2)" during step 102), so storeHandle.change() for `ejectDisk` threw. The
+     * catch in undockFixtures only warned, so the eject was never sent (idea03's Engine log has no
+     * ejectDisk for step 104) and the harness waited the full 120 s for it.
+     * A store write now goes through here: on a throw, reconnect that engine once (fresh Repo and
+     * handle) and retry the write once. If it still fails → StoreWriteError (fail loud, never swallowed).
+     */
+    async changeStore(logicalId: string, conn: Conn, what: string, fn: (s: Store) => void): Promise<Conn> {
+        try {
+            conn.storeHandle.change(fn)
+            return conn
+        } catch (e) {
+            const first = e instanceof Error ? e.message : String(e)
+            console.log(`[RealFleetOps] ${what} on ${logicalId}: store write failed (${first}); reconnecting once and retrying`)
+            await this.refreshView(logicalId, `${what}: store write failed (${first})`)
+            const fresh = this.conns.get(logicalId)
+            if (!fresh || fresh === conn) {
+                throw new StoreWriteError(`${what} on ${logicalId}: store write failed (${first}) and the reconnect gave no fresh connection — command NOT sent. Fail loud.`)
+            }
+            try {
+                fresh.storeHandle.change(fn)
+                return fresh
+            } catch (e2) {
+                throw new StoreWriteError(`${what} on ${logicalId}: store write failed twice (${first}; after reconnect: ${e2 instanceof Error ? e2.message : String(e2)}) — command NOT sent. Fail loud.`)
+            }
+        }
+    }
+
     async undockFixtures(engineIds: string[], diskId: string): Promise<void> {
         const idReason = protectedDiskReason(diskId)
         if (idReason) throw new Error(protectedDiskRefusal('eject', null, diskId, idReason))
@@ -2564,7 +2596,7 @@ export class RealFleetOps implements FleetOps {
                 }
                 // Prefer eject by id
                 console.log(`[RealFleetOps] ejectDisk ${diskId} on ${logicalId} (live=${liveTarget})`)
-                conn.storeHandle.change(s => {
+                await this.changeStore(logicalId, conn, `ejectDisk ${diskId}`, s => {
                     const eng = s.engineDB[liveTarget as keyof typeof s.engineDB] as
                         | { commands: string[] }
                         | undefined
@@ -2581,6 +2613,7 @@ export class RealFleetOps implements FleetOps {
                 }
             } catch (e) {
                 if (e instanceof Error && /refuse to eject/.test(e.message)) throw e
+                if (e instanceof StoreWriteError) throw e
                 console.warn(`[RealFleetOps] undockFixtures ${logicalId}/${diskId}: ${e}`)
             }
         }
@@ -3520,7 +3553,7 @@ export class RealFleetOps implements FleetOps {
             await sleep(1500)
         }
         const purgeIds = toPurge.map(i => i.id)
-        conn.storeHandle.change(s => {
+        await this.changeStore(engineId, conn, `purgeInstancesStoredOn ${diskId}`, s => {
             for (const id of purgeIds) {
                 if (s.instanceDB[id as keyof typeof s.instanceDB]) {
                     delete s.instanceDB[id as keyof typeof s.instanceDB]
