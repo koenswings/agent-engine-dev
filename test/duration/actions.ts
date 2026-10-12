@@ -2385,7 +2385,7 @@ export const verifyCopyOperation = async (
     }
 }
 
-// ── r30: move_app must stay on one Pi (Eng 8d98718 refuses cross-engine moveApp) ──
+// ── r30: move_app must stay on one Pi (the Engine refuses cross-engine moveApp) ──
 
 /** Console 0760c01 e2e/intents/copyMoveApp.ts pickTargetDiskId preference order. */
 export const COPY_MOVE_TARGET_PREFERENCE = [
@@ -2413,6 +2413,8 @@ export const predictCopyMovePair = async (
     sourceEngine: string | null
     targetDiskId: string | null
     targetEngine: string | null
+    /** r86f: other docked non-system disks on the source's Pi (the only legal moveApp targets). */
+    sameEngineOthers: string[]
 }> => {
     const kolibri = DURATION_UI_FIXTURES.kolibri
     const nc = DURATION_UI_FIXTURES.nextcloud.diskId
@@ -2447,13 +2449,15 @@ export const predictCopyMovePair = async (
         sourceEngine: docked.get(sourceDiskId) ?? null,
         targetDiskId,
         targetEngine: targetDiskId ? (docked.get(targetDiskId) ?? null) : null,
+        sameEngineOthers: others.filter(id => docked.get(id) === docked.get(sourceDiskId)),
     }
 }
 
 /**
- * r30 preflight before move_app / copy_app (live only). Eng 8d98718 moveApp refuses a
- * target disk on another engine (CopyMoveApp.ts:399-405 — logs "Cross-engine move is not
- * supported" and returns, no Operation). copyApp supports cross-engine targets (Phase 2:
+ * r30 preflight before move_app / copy_app (live only). The Engine's moveApp refuses a
+ * target disk on another engine: src/data/CopyMoveApp.ts moveApp throws "moveApp: Target disk '…' is
+ * on a remote engine. Cross-engine move is not supported" (pinned Engine f194fb5; the old 8d98718
+ * line citation 399-405 was stale). The command trace ends as error and no Operation is created. copyApp supports cross-engine targets (Phase 2:
  * rsync over SSH + remote startInstance; CopyMoveApp.ts:94-103/197-201), so copy_app only
  * reports the pair. Throws (move_app) naming both Pis and both disks.
  */
@@ -2485,13 +2489,16 @@ export const preflightCopyMoveSamePi = async (
     const desc = `${instanceId} on ${sourceEngine} (disk ${sourceDiskId}) -> ${targetDiskId} on ${targetEngine}`
     if (sourceEngine !== targetEngine) {
         if (op === 'move_app') {
+            const sameHost = pair.sameEngineOthers.length
+                ? `other disks docked on ${sourceEngine}: ${pair.sameEngineOthers.join(', ')}`
+                : `no other disk is docked on ${sourceEngine}`
             throw new Error(
-                `move_app preflight: cross-engine move ${desc}; Engine refuses cross-engine moveApp ` +
-                    `(Eng 8d98718 CopyMoveApp.ts:399-405 "Cross-engine move is not supported"). ` +
-                    `Co-locate both disks on one Pi first. No soft-pass.`,
+                `move_app preflight: cross-engine move ${desc}; the Engine refuses cross-engine moveApp ` +
+                    `(CopyMoveApp.ts moveApp: "Target disk … is on a remote engine. Cross-engine move is not supported"). ` +
+                    `Same-Pi candidates: ${sameHost}. Co-locate both disks on one Pi first. No soft-pass.`,
             )
         }
-        return `${op} preflight: cross-engine copy ${desc} (Eng 8d98718 copyApp Phase 2 supports it)`
+        return `${op} preflight: cross-engine copy ${desc} (Engine copyApp supports cross-engine targets)`
     }
     return `${op} preflight: same Pi ${desc} (store re-read)`
 }

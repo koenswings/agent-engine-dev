@@ -3275,9 +3275,24 @@ describe('r30: move_app same-Pi preflight (Eng 8d98718 refuses cross-engine move
             const r = await dispatchAction(ctxFor(ops, 'move_app', driver, 'idea01') as any)
             expect(r.ok).toBe(false)
             expect(r.message).toMatch(
-                /^move_app aborted before Intent: move_app preflight: cross-engine move kolibri-grade5a-001 on idea03 \(disk duration-kolibri-grade5a-001\) -> duration-nextcloud-grade5a-001 on idea01; Engine refuses cross-engine moveApp/,
+                /^move_app aborted before Intent: move_app preflight: cross-engine move kolibri-grade5a-001 on idea03 \(disk duration-kolibri-grade5a-001\) -> duration-nextcloud-grade5a-001 on idea01; the Engine refuses cross-engine moveApp/,
             )
             expect(seen).toEqual([])
+        })
+    })
+
+    it('r86f FAIL@102: Kolibri on idea04 (after @62), Nextcloud on idea03 → loud refusal names the only same-Pi disk and cites the pinned Engine text, not 8d98718:399-405', async () => {
+        await withEnv({}, async () => {
+            const ops = await fleet('idea04', 'idea03')
+            await ops.dockFixture('idea04', 'duration-empty-002')
+            const pair = await predictCopyMovePair(ctxFor(ops, 'move_app') as any, { instanceId: INST, diskId: KOLIBRI })
+            expect(pair).toMatchObject({ sourceEngine: 'idea04', targetDiskId: NC, targetEngine: 'idea03', sameEngineOthers: ['duration-empty-002'] })
+            const err = await preflightCopyMoveSamePi(ctxFor(ops, 'move_app') as any, 'move_app', { instanceId: INST, diskId: KOLIBRI }).catch(e => e as Error)
+            expect(err).toBeInstanceOf(Error)
+            expect((err as Error).message).toMatch(/cross-engine move kolibri-grade5a-001 on idea04 \(disk duration-kolibri-grade5a-001\) -> duration-nextcloud-grade5a-001 on idea03/)
+            expect((err as Error).message).toContain('Same-Pi candidates: other disks docked on idea04: duration-empty-002')
+            expect((err as Error).message).toContain('Cross-engine move is not supported')
+            expect((err as Error).message).not.toMatch(/8d98718|399-405/)
         })
     })
 
@@ -3296,14 +3311,14 @@ describe('r30: move_app same-Pi preflight (Eng 8d98718 refuses cross-engine move
         })
     })
 
-    it('copy_app: cross-engine pair is reported, not refused (Eng 8d98718 copyApp Phase 2 supports remote targets)', async () => {
+    it('copy_app: cross-engine pair is reported, not refused (Engine copyApp supports remote targets)', async () => {
         await withEnv({}, async () => {
             const ops = await fleet('idea03')
             const { driver, seen } = clickDriver()
             const r = await dispatchAction({ ...ctxFor(ops, 'copy_app', driver, 'idea03'), from: 'op_instance' } as any)
             expect(r.ok, r.message).toBe(true)
             expect(seen).toEqual(['copy_app'])
-            expect(r.message).toMatch(/copy_app preflight: cross-engine copy kolibri-grade5a-001 on idea03 \(disk duration-kolibri-grade5a-001\) -> duration-nextcloud-grade5a-001 on idea01 \(Eng 8d98718 copyApp Phase 2 supports it\)/)
+            expect(r.message).toMatch(/copy_app preflight: cross-engine copy kolibri-grade5a-001 on idea03 \(disk duration-kolibri-grade5a-001\) -> duration-nextcloud-grade5a-001 on idea01 \(Engine copyApp supports cross-engine targets\)/)
         })
     })
 
