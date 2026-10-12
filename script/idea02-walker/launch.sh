@@ -11,7 +11,7 @@ EVID=/home/walker/duration-evidence/$RUN
 git -C "$REPO" diff --quiet || { echo "REFUSE: dirty harness tree"; exit 3; }
 SHA=$(git -C "$REPO" rev-parse HEAD)
 git -C "$REPO" branch -r --contains "$SHA" | grep -q origin/ || { echo "REFUSE: $SHA not pushed"; exit 3; }
-CONSOLE_PIN=49cf9085e063887cb162c8cbc6ed1dd1f79b1e93  # intents (e2e-only on 4fb5299): Text collision named loud (r77 FAIL@82)
+CONSOLE_PIN=b540743daf6b90de162391cc937e942691141dd4  # intents = 49cf908 (r77 Text collision loud) merged with product 1f97528 (PR #142): range e2e/test-only
 [ "$(git -C /home/walker/agent-console-dev rev-parse HEAD)" = "$CONSOLE_PIN" ] || { echo "REFUSE: console intents checkout is not $CONSOLE_PIN"; exit 3; }
 git -C /home/walker/agent-console-dev diff --quiet || { echo "REFUSE: dirty console intents tree"; exit 3; }
 mkdir -p "$EVID"; [ -f "$EVID/run.pid" ] && kill -0 "$(cat "$EVID/run.pid")" 2>/dev/null && { echo "REFUSE: already running"; exit 4; }
@@ -26,7 +26,7 @@ export DURATION_LAN_HOSTS=\${DURATION_LAN_HOSTS:-idea01=10.99.0.11,idea03=10.99.
 export DURATION_CONSOLE_INTENTS=/home/walker/agent-console-dev/e2e/intents
 export DURATION_STAGE=2
 export DURATION_EXPECTED_CONSOLE_SHA=$CONSOLE_PIN
-# Product pin: unmerged Console PR #142 tip 1f97528 (incl. #138), Steve option (b) 10:33 CEST; intents stay 49cf908.
+# Product pin: unmerged Console PR #142 tip 1f97528 (incl. #138), Steve option (b) 10:33 CEST; intents b540743 = 49cf908 + merge of 1f97528.
 export DURATION_CONSOLE_PRODUCT_SHA=1f97528849e49a4cd75d2e26478618dc90a67be0
 export DURATION_CONSOLE_PRODUCT_ASSET=index-Bnq0hP4N.js
 export DURATION_CONSOLE_PRODUCT_ASSET_MD5=e4d525ad92d28b95555b0e4ac542287d
