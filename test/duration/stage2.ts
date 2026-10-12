@@ -388,14 +388,23 @@ const effectiveFromProbe = (p: EngineConfigProbe | string): EffectiveEngineSetti
  */
 export const STAGE2_MOVE_TARGET_HOST = 'idea04'
 export const STAGE2_MOVE_TARGET_ID = 'duration-empty-003'
-export type Stage2Role = 'files' | 'backup' | 'erase'
+/**
+ * r86f FAIL@102, Steve option (A): move_app needs a same-Pi target (moveApp refuses a remote target).
+ * After @62 the Kolibri fixture is on idea04, whose only other disk is the Backup Disk (@95–@112), so
+ * Stage 2 move_app moves the step-43 copy (on the Nextcloud disk, idea03) onto empty-001 (idea03) in the
+ * gap between Files (@88–@92) and Erase (@104–@122). On-Pi check 2026-10-12 (movapp-filesdisk-check):
+ * Engine f194fb5 accepted moveApp onto the Files Disk (op moul3p35tlq5rdfwtk2 Done; FILES.yaml intact).
+ * Erase's fresh re-dock (Engine eject → rows settle → purge → reset → dock) clears the moved instance.
+ */
+export type Stage2Role = 'files' | 'backup' | 'erase' | 'moveApp'
 export const STAGE2_ROLE_MAP: Readonly<Record<Stage2Role, string>> = {
     files: 'duration-empty-001',
     backup: 'duration-empty-002',
     erase: 'duration-empty-001',
+    moveApp: 'duration-empty-001',
 }
 /** Role pairs allowed on ONE partition, only in this order and only without overlap (fresh reset between). */
-export const STAGE2_SEQUENTIAL_SHARES: readonly (readonly [Stage2Role, Stage2Role])[] = [['files', 'erase']]
+export const STAGE2_SEQUENTIAL_SHARES: readonly (readonly [Stage2Role, Stage2Role])[] = [['files', 'erase'], ['files', 'moveApp'], ['moveApp', 'erase']]
 export const stage2MoveTargetId = (): string => STAGE2_MOVE_TARGET_ID
 
 /** 1-based inclusive step window in which a role's partition is in use. */
@@ -431,6 +440,8 @@ export const stage2RoleWindows = (steps: readonly { action: string }[]): Stage2W
         const users = idxs(steps, (a, i) => i + 1 >= bk[0]! && ['make_backup_disk', 'backup_instance', 'restore_from_backup', 'backup_configured_restored'].includes(a))
         out.push({ role: 'backup', from: bk[0]!, to: users.at(-1)!, steps: users })
     }
+    const ma = idxs(steps, a => a === 'move_app')
+    if (ma.length) out.push({ role: 'moveApp', from: ma[0]!, to: ma.at(-1)!, steps: ma })
     const mv = idxs(steps, a => a === 'infra_move_disk')
     if (mv.length) out.push({ role: 'move', from: mv[0]!, to: steps.length, steps: mv })
     return out
@@ -451,6 +462,8 @@ export const STAGE2_DISK_CONSUMERS: Readonly<Record<string, { role: (i: { eraseS
     confirm_erase: { role: () => 'erase', needsEmpty: false, dirties: false, cleans: true },
     restore_from_backup: { role: () => 'backup', needsEmpty: false, dirties: false },
     backup_instance: { role: () => 'backup', needsEmpty: false, dirties: false },
+    // r86f (A): Stage 2 move_app lands the step-43 copy on empty-001 (dirties it; erase_disk@104 resets).
+    move_app: { role: () => 'moveApp', needsEmpty: false, dirties: true },
 }
 
 /**

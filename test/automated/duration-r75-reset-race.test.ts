@@ -82,7 +82,7 @@ describe('fix 3: all-pairs role windows + dirtied-then-needs-Empty', () => {
     })
     it('install then a needs-Empty step without a settled reset is a pre-walk conflict', () => {
         const steps = [{ action: 'install_app' }, { action: 'back_to_overview' }, { action: 'make_backup_disk' }]
-        expect(stage2DiskStateConflicts(steps, E3, { files: E1, backup: E1, erase: E2 }).map(c => c.kind)).toEqual(['dirty-needs-empty'])
+        expect(stage2DiskStateConflicts(steps, E3, { files: E1, backup: E1, erase: E2, moveApp: 'x-move-unused' }).map(c => c.kind)).toEqual(['dirty-needs-empty'])
         expect(stage2DiskStateConflicts([{ action: 'install_app' }, { action: 'install_app' }]).map(c => c.kind)).toEqual(['dirty-needs-empty'])
         expect(stage2DiskStateConflicts([{ action: 'install_app' }, { action: 'make_files_disk' }])).toEqual([])
     })

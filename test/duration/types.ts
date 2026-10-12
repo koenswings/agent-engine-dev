@@ -229,6 +229,11 @@ export interface WalkerState {
      * targets; a fresh re-dock of that disk first waits for the install to land and settle.
      */
     pendingInstallDisk?: string | null
+    /**
+     * r86f (A): the instance the first Stage 2 copy_app created (cover-all @43), recorded from the
+     * post-op settle (pool ids after minus the pre-Confirm baseline). Stage 2 move_app moves it.
+     */
+    stage2CopyInstanceId?: string | null
     /** true once erase_disk ran: later install_app targets the erase partition, not the files one. */
     eraseStarted?: boolean
 }

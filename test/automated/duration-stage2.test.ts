@@ -157,7 +157,7 @@ describe('Engine settings preflight (READY §4.5)', () => {
 
 describe('roles + move-only target (READY §4.4)', () => {
     it('role map: Files + Erase share empty-001 (idea03), Backup empty-002 (idea04); empty-003 move-only', () => {
-        expect(STAGE2_ROLE_MAP).toEqual({ files: E1, backup: E2, erase: E1 })
+        expect(STAGE2_ROLE_MAP).toEqual({ files: E1, backup: E2, erase: E1, moveApp: E1 })
         expect(Object.values(STAGE2_ROLE_MAP)).not.toContain(E3)
         expect(STAGE2_MOVE_TARGET_ID).toBe(E3)
         expect(stage2HomeOf(STAGE2_ROLE_MAP.backup)).toBe('idea04') // same Pi as the moved Kolibri (ensureBackupDiskForInstance)
@@ -178,10 +178,10 @@ describe('roles + move-only target (READY §4.4)', () => {
     })
     it('detects a role on the move target, an overlapping share, an unlisted share', () => {
         expect(stage2RoleTimeline(COVER_ALL, E3, { ...STAGE2_ROLE_MAP, backup: E3 }).map(c => c.kind)).toContain('move-target')
-        expect(stage2RoleTimeline(COVER_ALL, E3, { files: E1, backup: E2, erase: E2 }).map(c => c.kind)).toContain('overlap')
-        expect(stage2RoleTimeline(COVER_ALL, E3, { files: E1, backup: E1, erase: E2 }).map(c => c.kind)).toEqual(['share'])
+        expect(stage2RoleTimeline(COVER_ALL, E3, { files: E1, backup: E2, erase: E2, moveApp: 'x-move-unused' }).map(c => c.kind)).toContain('overlap')
+        expect(stage2RoleTimeline(COVER_ALL, E3, { files: E1, backup: E1, erase: E2, moveApp: 'x-move-unused' }).map(c => c.kind)).toEqual(['share'])
         const steps = [{ action: 'make_backup_disk' }, { action: 'backup_instance' }, { action: 'erase_disk' }]
-        expect(stage2RoleTimeline(steps, E3, { files: E1, backup: E2, erase: E2 }).map(c => c.kind)).toEqual(['share'])
+        expect(stage2RoleTimeline(steps, E3, { files: E1, backup: E2, erase: E2, moveApp: 'x-move-unused' }).map(c => c.kind)).toEqual(['share'])
     })
     it('move target is always idea04 empty-003; never idea01, never the source', () => {
         expect(stage2MoveTargetPartition('idea04', K).diskId).toBe(E3)

@@ -9,7 +9,7 @@
 import { isIdea02Target } from './walkHost.js'
 import { settleAfterLongOp, poolInstanceIds, type PostOpSettleIo } from './postOpSettle.js'
 import { opStartBudget, WAIT_OP_ACTIONS, opAppearBudgetMs, opDoneBudgetMs, waitOperationTerminal, type WaitOperationFn } from './opWait.js'
-import { STAGE2_ADD_FILES_DISK_ID, STAGE2_MOVE_TARGET_HOST, stage2HomeOf } from './stage2.js'
+import { STAGE2_ADD_FILES_DISK_ID, STAGE2_MOVE_TARGET_HOST, STAGE2_ROLE_MAP, stage2HomeOf } from './stage2.js'
 import type {
     DurationOptions,
     FleetOps,
@@ -2403,6 +2403,46 @@ export const COPY_MOVE_TARGET_PREFERENCE = [
  * (Nextcloud, Kolibri, empty-001, then any other non-system docked disk). Hosts come
  * from a fresh store read, never from walker.dockedEngine.
  */
+/**
+ * r86f FAIL@102, Steve option (A): Stage 2 move_app moves the step-43 copy (ctx.walker.stage2CopyInstanceId,
+ * recorded by copy_app) onto STAGE2_ROLE_MAP.moveApp (duration-empty-001, same Pi as the Nextcloud disk).
+ * DURATION_COPY_INSTANCE_ID / DURATION_COPY_TARGET_DISK set by the operator still win. Stage 1: null (unchanged).
+ * No recorded copy and no override → throws (fail loud; never fall back to the cross-Pi Kolibri fixture).
+ */
+export const stage2MoveAppPins = (
+    ctx: Pick<ActionContext, 'action' | 'walker'> & { opts?: unknown },
+    env: NodeJS.ProcessEnv = process.env,
+): { instanceId: string; targetDiskId: string; set: Record<string, string> } | null => {
+    if (ctx.action !== 'move_app' || !isStage2(ctx as ActionContext)) return null
+    const envInst = env.DURATION_COPY_INSTANCE_ID?.trim()
+    const envTarget = env.DURATION_COPY_TARGET_DISK?.trim()
+    const instanceId = envInst || ctx.walker.stage2CopyInstanceId?.trim() || ''
+    if (!instanceId) {
+        throw new Error(
+            'Stage 2 move_app (option A): no step-43 copy recorded (copy_app did not run or created no single new instance) ' +
+                'and DURATION_COPY_INSTANCE_ID is unset. Fail loud; never fall back to the Kolibri fixture (cross-Pi).',
+        )
+    }
+    const targetDiskId = envTarget || STAGE2_ROLE_MAP.moveApp
+    const set: Record<string, string> = {}
+    if (!envInst) set.DURATION_COPY_INSTANCE_ID = instanceId
+    if (!envTarget) set.DURATION_COPY_TARGET_DISK = targetDiskId
+    return { instanceId, targetDiskId, set }
+}
+
+/** Sets harness-owned env vars; returns the restore function. */
+export const pinEnv = (vars: Record<string, string>, env: NodeJS.ProcessEnv = process.env): (() => void) => {
+    const prev: Record<string, string | undefined> = {}
+    for (const [k, v] of Object.entries(vars)) { prev[k] = env[k]; env[k] = v }
+    return () => { for (const [k, v] of Object.entries(prev)) { if (v === undefined) delete env[k]; else env[k] = v } }
+}
+
+/** r86f (A): the single instance a copy created = ids after minus baseline; null when not exactly one. */
+export const newCopyInstanceId = (baseline: ReadonlySet<string>, after: ReadonlySet<string>): string | null => {
+    const fresh = [...after].filter(id => !baseline.has(id))
+    return fresh.length === 1 ? fresh[0]! : null
+}
+
 export const predictCopyMovePair = async (
     ctx: ActionContext,
     ids: { instanceId?: string; diskId?: string },
@@ -3457,6 +3497,21 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             }
         }
     }
+    // r86f (A): Stage 2 move_app → the step-43 copy onto empty-001 (env overrides win). Pinned for
+    // the preflight and the Intent; restored after the Intent (or on an early abort).
+    let restoreMovePins: (() => void) | null = null
+    let movePinnedInstance: string | null = null
+    try {
+        const pins = stage2MoveAppPins(ctx)
+        if (pins) {
+            restoreMovePins = pinEnv(pins.set)
+            movePinnedInstance = pins.instanceId
+            const note = `Stage 2 move_app (A): instance ${pins.instanceId} (step-43 copy${pins.set.DURATION_COPY_INSTANCE_ID ? '' : ', env override'}) → ${pins.targetDiskId}${pins.set.DURATION_COPY_TARGET_DISK ? '' : ' (env override)'}`
+            preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${note}` : note
+        }
+    } catch (e) {
+        return { ok: false, message: `move_app aborted before Intent: ${e instanceof Error ? e.message : String(e)}`, layer }
+    }
     // r30: move_app must stay on one Pi (Eng refuses cross-engine moveApp); copy_app
     // reports its pair. Live only (findDockedEngine) — Fake walks skip.
     if (
@@ -3468,6 +3523,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${note}` : note
         } catch (e) {
             const err = e instanceof Error ? e.message : String(e)
+            restoreMovePins?.()
             return {
                 ok: false,
                 message: `${ctx.action} aborted before Intent: ${err}`,
@@ -3557,6 +3613,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             ...(waitOp ? { waitOperation: waitOp } : {}),
         })
     } finally {
+        restoreMovePins?.()
         if (ctx.action === 'add_files_role') {
             if (prevFilesPin === undefined) delete process.env.DURATION_FILES_DISK_ID
             else process.env.DURATION_FILES_DISK_ID = prevFilesPin
@@ -3593,9 +3650,15 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     // still be Running and owned by its own container on its own Pi (Stage 2; Intent ok only).
     // r70 (r69 FAIL@43): after copy/move Done, refresh ALL pool views and wait until sources + new instances Run.
     if (result.ok && postOpBaseline !== undefined && isStage2(ctx)) {
-        const ps = await settleAfterLongOp(ctx.action, [...new Set([...appUses.map(u => u.instanceId), ...(typeof instanceId === 'string' && instanceId ? [instanceId] : [])])], postOpBaseline, postOpIo(ctx))
+        const ps = await settleAfterLongOp(ctx.action, [...new Set([...appUses.map(u => u.instanceId), ...(typeof instanceId === 'string' && instanceId ? [instanceId] : []), ...(movePinnedInstance ? [movePinnedInstance] : [])])], postOpBaseline, postOpIo(ctx))
         if (!ps.ok) return { ok: false, message: `${ctx.action}: ${ps.note} (Console Intent reported ok; ${preStartSettleNote ?? ''})`, layer }
         message = `${message}; ${ps.note}`
+        // r86f (A): remember the first copy (cover-all @43) for Stage 2 move_app.
+        if (ctx.action === 'copy_app' && !ctx.walker.stage2CopyInstanceId && postOpBaseline) {
+            const id = newCopyInstanceId(postOpBaseline, await poolInstanceIds(postOpIo(ctx)))
+            if (id) { ctx.walker.stage2CopyInstanceId = id; message = `${message}; recorded step-${ctx.walker.step} copy ${id} for Stage 2 move_app` }
+            else message = `${message}; could not single out the new copy (move_app will fail loud unless DURATION_COPY_INSTANCE_ID is set)`
+        }
     }
     if (result.ok && appUses.length && isStage2(ctx)) {
         const post = await verifyAppUseAfterIntent(ctx, driver as TabAwareDriver, appUses, appPins, tabSeq0, process.env, tabsBefore)
