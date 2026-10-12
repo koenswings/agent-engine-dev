@@ -57,6 +57,6 @@ describe('idea02 launcher contract (script/idea02-walker/launch.sh)', () => {
     })
     it('runs the store-check gate before launching and keeps the declared pins + deviation', () => {
         expect(sh).toMatch(/store-check\.ts/)
-        for (const v of ['DURATION_STAGE=2', '1f97528849e49a4cd75d2e26478618dc90a67be0', 'index-Bnq0hP4N.js', 'e4d525ad92d28b95555b0e4ac542287d', 'b540743daf6b90de162391cc937e942691141dd4', 'DURATION_DOC_WAIT_MS', '--start-instances', '--console-url http://idea01:8080']) expect(sh).toContain(v)
+        for (const v of ['DURATION_STAGE=2', 'a3909932e626aa123a5f231ce836e35504ceb7b1', 'index-TiDA4OzM.js', '18296be6ff32fc3050d24cec21767f2b', 'd194a2b4cc008d91e881a7e8f728291fad177fe5', 'DURATION_DOC_WAIT_MS', '--start-instances', '--console-url http://idea01:8080']) expect(sh).toContain(v)
     })
 })

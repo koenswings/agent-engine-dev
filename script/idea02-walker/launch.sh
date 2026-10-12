@@ -12,7 +12,7 @@ EVID=/home/walker/duration-evidence/$RUN
 git -C "$REPO" diff --quiet || { echo "REFUSE: dirty harness tree"; exit 3; }
 SHA=$(git -C "$REPO" rev-parse HEAD)
 git -C "$REPO" branch -r --contains "$SHA" | grep -q origin/ || { echo "REFUSE: $SHA not pushed"; exit 3; }
-CONSOLE_PIN=b540743daf6b90de162391cc937e942691141dd4  # intents = 49cf908 (r77 Text collision loud) merged with product 1f97528 (PR #142): range e2e/test-only
+CONSOLE_PIN=d194a2b4cc008d91e881a7e8f728291fad177fe5  # intents = b540743 merged with product a390993 (PR #144 on #142): range e2e/test-only
 [ "$(git -C /home/walker/agent-console-dev rev-parse HEAD)" = "$CONSOLE_PIN" ] || { echo "REFUSE: console intents checkout is not $CONSOLE_PIN"; exit 3; }
 git -C /home/walker/agent-console-dev diff --quiet || { echo "REFUSE: dirty console intents tree"; exit 3; }
 mkdir -p "$EVID"; [ -f "$EVID/run.pid" ] && kill -0 "$(cat "$EVID/run.pid")" 2>/dev/null && { echo "REFUSE: already running"; exit 4; }
@@ -27,10 +27,10 @@ export DURATION_LAN_HOSTS=\${DURATION_LAN_HOSTS:-idea01=10.99.0.11,idea03=10.99.
 export DURATION_CONSOLE_INTENTS=/home/walker/agent-console-dev/e2e/intents
 export DURATION_STAGE=2
 export DURATION_EXPECTED_CONSOLE_SHA=$CONSOLE_PIN
-# Product pin: unmerged Console PR #142 tip 1f97528 (incl. #138), Steve option (b) 10:33 CEST; intents b540743 = 49cf908 + merge of 1f97528.
-export DURATION_CONSOLE_PRODUCT_SHA=1f97528849e49a4cd75d2e26478618dc90a67be0
-export DURATION_CONSOLE_PRODUCT_ASSET=index-Bnq0hP4N.js
-export DURATION_CONSOLE_PRODUCT_ASSET_MD5=e4d525ad92d28b95555b0e4ac542287d
+# Product pin: unmerged Console PR #144 tip a390993 (on #142 1f97528; EraseDialog follows target Engine log, r86i FAIL@105), Steve option (b); intents d194a2b = b540743 + merge of a390993.
+export DURATION_CONSOLE_PRODUCT_SHA=a3909932e626aa123a5f231ce836e35504ceb7b1
+export DURATION_CONSOLE_PRODUCT_ASSET=index-TiDA4OzM.js
+export DURATION_CONSOLE_PRODUCT_ASSET_MD5=18296be6ff32fc3050d24cec21767f2b
 export DURATION_EXPECTED_STORE_ID=3zoqd
 export DURATION_POST_OP_SETTLE_MS=\${DURATION_POST_OP_SETTLE_MS:-300000}
 export DURATION_DOC_WAIT_MS=\${DURATION_DOC_WAIT_MS:-45000}
