@@ -24,6 +24,7 @@ import { log } from '../utils/utils.js'
 import { Store, getDisk, getLocalEngine } from './Store.js'
 import { resolveDiskArg } from './DiskArg.js'
 import { buildInstance } from './Instance.js'
+import { parseAppId } from './App.js'
 import { AppID, AppName, DiskID, DiskName, InstanceName, Version } from './CommonTypes.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Disk, diskMountRoot } from './Disk.js'
@@ -39,6 +40,7 @@ import { assertNoExternalLinks } from './InstanceCopy.js'
 export const hasInternet = (): Promise<boolean> => {
     // Test hook: Prefer A r31 unit coverage for offline alt-disk fallback
     if (process.env.IDEA_INSTALL_FORCE_OFFLINE === 'true') return Promise.resolve(false)
+    if (process.env.IDEA_INSTALL_FORCE_ONLINE === 'true') return Promise.resolve(true)
     return new Promise(resolve => {
         const socket = net.createConnection({ host: '1.1.1.1', port: 53 })
         const timer = setTimeout(() => { socket.destroy(); resolve(false) }, 2000)
@@ -204,8 +206,7 @@ export const installApp = async (
     if (online) {
         // Route 2: GitHub path (existing buildInstance logic)
         log(chalk.blue(`installApp: GitHub path (internet available)`))
-        const appName = opts.appId.slice(0, opts.appId.lastIndexOf('-')) as AppName
-        const version = opts.appId.slice(opts.appId.lastIndexOf('-') + 1) as Version
+        const { name: appName, version } = parseAppId(opts.appId)
         const targetDevice = targetDisk.device!
         await buildInstance(instanceName, appName, gitAccount, version, targetDevice as any)
         return
@@ -232,7 +233,7 @@ export const installApp = async (
     }
 
     // No local source found
-    const appName = opts.appId.slice(0, opts.appId.lastIndexOf('-')) as AppName
+    const appName = parseAppId(opts.appId).name
     throw new Error(
         `installApp: App '${appName}' not found locally. ` +
         `Insert a disk containing '${appName}' or connect to the internet.`
