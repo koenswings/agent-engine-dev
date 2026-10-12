@@ -179,7 +179,14 @@ export interface AppTab { url: string; active: boolean; fresh: boolean; console?
  * the sidecar check is consolePage.request.get, no tab). Only these get the leftover-tab exemption; every
  * other step keeps judging the active tab, so a reused stale tab is still caught.
  */
-export const CONSOLE_ONLY_APP_ACTIONS: ReadonlySet<string> = new Set(['restore_from_backup'])
+export const CONSOLE_ONLY_APP_ACTIONS: ReadonlySet<string> = new Set([
+    // r86h audit (Console intents b540743): none of these opens or navigates an App tab; the copy/move/
+    // restore post-Confirm settle polls the sidecar by HTTP (waitForSidecarStable → request.get).
+    'copy_app', 'move_app', 'restore_from_backup', 'backup_instance',
+    'open_instance_controls', 'open_copied_instance', 'start_instance', 'stop_instance',
+    'install_app', 'start_after_install', 'eject_disk', 'confirm_eject', 'cancel_eject',
+    'erase_disk', 'confirm_erase', 'cancel_erase', 'make_files_disk', 'add_files_role', 'make_backup_disk',
+])
 
 export const untouchedLeftoverTab = (t: AppTab, before: readonly AppTab[] | undefined): boolean =>
     !!before && !t.fresh && !t.console && t.seq !== undefined && before.some(b => b.seq === t.seq && b.url === t.url)

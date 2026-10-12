@@ -1739,14 +1739,31 @@ const fixtureInstanceFor = (ctx: ActionContext, app: SidecarApp): AppUse => {
  * Intents → the fixture instance of that App; open_app / copy / move / restore settle → the
  * instance the Console resolves (DURATION_START_INSTANCE_ID / ctx instance / backup source).
  */
-export const stage2AppUsesForStep = (ctx: ActionContext, instanceId: string | undefined): AppUse[] => {
+/**
+ * r86h (r86g FAIL@102): the instance a Console-only step really acts on, resolved exactly as the Console
+ * intent (b540743) resolves it, so the expected App/URL follows that instance and not the fixture:
+ * copy/move/open_copied_instance: DURATION_COPY_INSTANCE_ID (operator override or the Stage 2 move pin)
+ * || ctx instance; open_app: DURATION_START_INSTANCE_ID || ctx instance; restore_from_backup: ctx instance
+ * (the Console ignores DURATION_BACKUP_SOURCE_INSTANCE — a differing value is refused, fail loud).
+ */
+export const actedInstanceId = (action: string, instanceId: string | undefined, fixtureInstance: string, env: NodeJS.ProcessEnv = process.env): string => {
+    const ctxId = instanceId || fixtureInstance
+    if (action === 'copy_app' || action === 'move_app' || action === 'open_copied_instance') return env.DURATION_COPY_INSTANCE_ID?.trim() || ctxId
+    if (action === 'open_app') return env.DURATION_START_INSTANCE_ID?.trim() || ctxId
+    if (action === 'restore_from_backup') {
+        const b = env.DURATION_BACKUP_SOURCE_INSTANCE?.trim()
+        if (b && b !== ctxId) {
+            throw new Error(`restore_from_backup: DURATION_BACKUP_SOURCE_INSTANCE=${b} but the Console intent restores ${ctxId} (it ignores that env) — refused, the guard would check the wrong instance. Fail loud.`)
+        }
+        return ctxId
+    }
+    return ctxId
+}
+
+export const stage2AppUsesForStep = (ctx: ActionContext, instanceId: string | undefined, env: NodeJS.ProcessEnv = process.env): AppUse[] => {
     const uses: AppUse[] = appsUsedByStep({ action: ctx.action, to: ctx.to }).map(a => fixtureInstanceFor(ctx, a))
     if (INSTANCE_SIDECAR_ACTIONS.has(ctx.action)) {
-        const id =
-            (ctx.action === 'open_app' ? process.env.DURATION_START_INSTANCE_ID?.trim() : undefined) ||
-            (ctx.action === 'restore_from_backup' ? process.env.DURATION_BACKUP_SOURCE_INSTANCE?.trim() : undefined) ||
-            instanceId ||
-            ctx.fixtureInstance
+        const id = actedInstanceId(ctx.action, instanceId, ctx.fixtureInstance, env)
         const app = appKindForInstanceId(id)
         if (!uses.some(u => u.instanceId === id)) uses.push({ app, instanceId: id, diskId: diskOfInstance(ctx, id) })
     }
@@ -3555,7 +3572,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
         } catch (e) {
             const err = e instanceof Error ? e.message : String(e)
             // Stage 2: the sidecar must be proven on its own Pi (no soft-pass).
-            if (isStage2(ctx)) return { ok: false, message: `${ctx.action} aborted before Intent: ${err}`, layer }
+            if (isStage2(ctx)) { restoreMovePins?.(); return { ok: false, message: `${ctx.action} aborted before Intent: ${err}`, layer } }
             preStartSettleNote = `${preStartSettleNote ? `${preStartSettleNote}; ` : ''}sidecar URL resync failed: ${err}`
         }
     }
@@ -3567,7 +3584,12 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     let tabSeq0: number | undefined
     let tabsBefore: AppTab[] | undefined
     if (isStage2(ctx)) {
-        appUses = stage2AppUsesForStep(ctx, instanceId)
+        try {
+            appUses = stage2AppUsesForStep(ctx, instanceId)
+        } catch (e) {
+            restoreMovePins?.()
+            return { ok: false, message: `${ctx.action} aborted before Intent: ${e instanceof Error ? e.message : String(e)}`, layer }
+        }
         if (appUses.length) {
             try {
                 const r = await pinAppsForStep(ctx, appUses)
@@ -3575,6 +3597,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
                 if (r.note) preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${r.note}` : r.note
             } catch (e) {
                 const err = e instanceof Error ? e.message : String(e)
+                restoreMovePins?.()
                 return { ok: false, message: `${ctx.action} aborted before Intent: ${err}`, layer }
             }
             const d = driver as typeof driver & { tabSeq?: () => number }
