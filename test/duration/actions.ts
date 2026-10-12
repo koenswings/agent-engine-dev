@@ -3176,7 +3176,10 @@ const layerForUiAction = (action: string, fallback: Layer | null): Layer => {
  */
 export const waitOperationFor = (ctx: ActionContext, onConfirm?: (sinceMs: number) => void): WaitOperationFn | undefined => {
     const kind = WAIT_OP_ACTIONS[ctx.action]
-    const ops = ctx.opts.ops as BackupOps & { refreshView?: (e: string, reason: string) => Promise<boolean | null> }
+    const ops = ctx.opts.ops as BackupOps & {
+        refreshView?: (e: string, reason: string) => Promise<boolean | null>
+        listCommandTraces?: (engineId: string) => Promise<DurationCommandTrace[]>
+    }
     if (!kind || typeof ops.listOperations !== 'function') return undefined
     const engines = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e))
     return async q => {
@@ -3184,6 +3187,8 @@ export const waitOperationFor = (ctx: ActionContext, onConfirm?: (sinceMs: numbe
         const r = await waitOperationTerminal(q, {
             ...(typeof ops.refreshView === 'function' ? { refresh: (e: string, why: string) => ops.refreshView!(e, why) } : {}),
             listOperations: e => ops.listOperations!(e),
+            // r85 FAIL@100: an Engine refusal (no Operation) fails the step with the Engine's message.
+            ...(typeof ops.listCommandTraces === 'function' ? { listCommandTraces: (e: string) => ops.listCommandTraces!(e) } : {}),
             engines,
             sleep: ms => new Promise(res => setTimeout(res, ms)),
             now: () => Date.now(),

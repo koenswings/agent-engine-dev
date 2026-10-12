@@ -31,6 +31,28 @@ export interface OpWaitIo {
     log?: (line: string) => void
     /** r66 stale-view guard: force a reconnect + re-read of this engine's store view (counted by the caller). */
     refresh?: (engine: string, reason: string) => Promise<boolean | null>
+    /**
+     * r85 FAIL@100: the Engine's own CommandLog traces (read-only). A command the Engine refused
+     * (status 'error') never creates an Operation, so without this the wait could only end NotSeen,
+     * which the Console Intent treats as "legacy settle" and reports ok. Surfaces the refusal.
+     */
+    listCommandTraces?: (engine: string) => Promise<{ command: string; args: string; status: string; startedAt: number | null; errorMessage: string | null }[]>
+}
+
+/** r85: a refused (status 'error') trace of q.kind for q.instanceId since q.sinceMs on any engine, else undefined. */
+export const findRefusedCommand = async (q: WaitOpQuery, io: OpWaitIo, slackMs = 5_000): Promise<string | undefined> => {
+    if (!io.listCommandTraces) return undefined
+    for (const e of io.engines) {
+        let traces: Awaited<ReturnType<NonNullable<OpWaitIo['listCommandTraces']>>>
+        try { traces = await io.listCommandTraces(e) } catch { continue }
+        const hit = traces
+            .filter(t => t.status === 'error' && (t.startedAt ?? 0) >= q.sinceMs - slackMs)
+            .filter(t => t.command === q.kind || t.command.startsWith(`${q.kind} `))
+            .filter(t => !q.instanceId || `${t.command} ${t.args}`.includes(q.instanceId))
+            .sort((a, b) => (b.startedAt ?? 0) - (a.startedAt ?? 0))[0]
+        if (hit) return `${e} refused ${hit.command} ${hit.args}: ${hit.errorMessage ?? 'no error text'}`
+    }
+    return undefined
 }
 
 /** Budget per kind: copy/move DURATION_COPY_DONE_MS (fast 300 s / 900 s), restore DURATION_RESTORE_DONE_MS (default = copy). */
@@ -96,6 +118,14 @@ export const waitOperationTerminal = async (
             if (op.status === 'Failed' || op.status === 'Cancelled') {
                 return { status: 'Error', detail: `${q.kind} ${op.status}: ${op.error ?? 'no error text'} | ${dump()}`, opId: op.id, elapsedMs }
             }
+        } else if (io.listCommandTraces) {
+            const refused = await findRefusedCommand(q, io, slackMs)
+            if (refused) {
+                return { status: 'Error', detail: `${q.kind} refused by the Engine (no Operation created): ${refused} | ${dump()}`, elapsedMs }
+            }
+        }
+        if (op) {
+            /* handled above */
         } else if (elapsedMs >= appearMs && io.refresh && !refreshed) {
             // r66: before declaring NotSeen, distrust the cached view once: reconnect every engine and re-read.
             refreshed = true
