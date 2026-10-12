@@ -3,6 +3,7 @@
 # Runs from idea02 only, on the pushed harness checkout; absolute paths throughout.
 # Gate: store-check (store=3, queues=0, idea02 absent) must PASS before launch (READY gate, Atlas).
 # Deviation: DURATION_DOC_WAIT_MS=45000 (idea02 Pi 4 doc load ~24-27 s; see DEVIATIONS.md).
+# Deviation r86c: idea04 (Pi 4) store-ready wait 120 s (DURATION_DOC_WAIT_MS_IDEA04) and staggered walk-start connects (DURATION_CONNECT_STAGGER_MS, default 3 s); still fail-loud.
 set -euo pipefail
 RUN="${1:?run id}"; shift || true
 REPO=/home/walker/agent-engine-stage2
@@ -33,7 +34,7 @@ export DURATION_CONSOLE_PRODUCT_ASSET_MD5=e4d525ad92d28b95555b0e4ac542287d
 export DURATION_EXPECTED_STORE_ID=3zoqd
 export DURATION_POST_OP_SETTLE_MS=\${DURATION_POST_OP_SETTLE_MS:-300000}
 export DURATION_DOC_WAIT_MS=\${DURATION_DOC_WAIT_MS:-45000}
-export DURATION_DOC_WAIT_MS_IDEA04=\${DURATION_DOC_WAIT_MS_IDEA04:-45000}
+export DURATION_DOC_WAIT_MS_IDEA04=\${DURATION_DOC_WAIT_MS_IDEA04:-120000}
 env | grep -E "^(DURATION|STAGE2)_" | sort > $EVID/ENV.txt
 exec /usr/local/bin/pnpm test:duration -- --live --ui --start-instances --scenario cover-all --fast --console-url http://idea01:8080 --record-walk $EVID/walk "\$@"
 R

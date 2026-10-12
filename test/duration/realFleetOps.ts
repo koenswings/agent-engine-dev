@@ -113,13 +113,28 @@ export const DEFAULT_PREFLIGHT_TIMEOUT_MS = 60_000
  */
 export const MIN_DOC_WAIT_MS = 15_000
 export const DEFAULT_DOC_WAIT_MS = 15_000
-export const DEFAULT_DOC_WAIT_MS_BY_HOST: Readonly<Record<string, number>> = { idea04: 30_000 } // Pi 4
+/**
+ * r86b FAIL (pre-step-1 idea04 sync stall): idea04 is the only Pi 4, and each new client's first full
+ * 3zoqd sync runs on its main thread (~4.7 s extra per concurrent client, 14.9 s blocked with 3; 11.2 MB
+ * in 2,032 unmerged update files, Atlas r86b-idea04-stall). Its store-ready wait is 120 s. Still fail-loud
+ * (StoreSyncStallError) after that.
+ */
+export const IDEA04_DOC_WAIT_MS = 120_000
+export const DEFAULT_DOC_WAIT_MS_BY_HOST: Readonly<Record<string, number>> = { idea04: IDEA04_DOC_WAIT_MS } // Pi 4
 /**
  * Upper bound for env doc waits: automerge-repo's DocSynchronizer arms a bare 60 s
  * whenReady() on the connecting Repo's handle; a connect attempt (handshake + doc wait)
  * must conclude (ready, or closed and judged) before that timer fires.
  */
 export const MAX_DOC_WAIT_MS = 45_000
+/** Per-host caps above MAX_DOC_WAIT_MS (r86b: idea04 Pi 4 first sync). A timed-out handle answers doc-unavailable and openConn reopens until the deadline. */
+export const MAX_DOC_WAIT_MS_BY_HOST: Readonly<Record<string, number>> = { idea04: IDEA04_DOC_WAIT_MS }
+/** r86b: gap between the walk-start store connects (one Pi at a time). DURATION_CONNECT_STAGGER_MS overrides. */
+export const DEFAULT_CONNECT_STAGGER_MS = 3_000
+export const connectStaggerMs = (env: NodeJS.ProcessEnv = process.env): number => {
+    const raw = env.DURATION_CONNECT_STAGGER_MS?.trim()
+    return raw && /^\d+$/.test(raw) ? Number(raw) : DEFAULT_CONNECT_STAGGER_MS
+}
 
 /** Thrown when the WS is up but the store doc never became ready within the per-host wait. */
 export class StoreSyncStallError extends Error {
@@ -1630,7 +1645,7 @@ export class RealFleetOps implements FleetOps {
     docWaitMsFor(logicalId: string): number {
         const env = (v: string | undefined): number | null => {
             const n = v === undefined || v === '' ? NaN : Number(v)
-            return Number.isFinite(n) && n > 0 ? Math.min(MAX_DOC_WAIT_MS, Math.max(MIN_DOC_WAIT_MS, n)) : null
+            return Number.isFinite(n) && n > 0 ? Math.min(MAX_DOC_WAIT_MS_BY_HOST[logicalId] ?? MAX_DOC_WAIT_MS, Math.max(MIN_DOC_WAIT_MS, n)) : null
         }
         const perHostEnv = env(process.env[`DURATION_DOC_WAIT_MS_${logicalId.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`])
         if (perHostEnv !== null) return perHostEnv
@@ -1958,7 +1973,7 @@ export class RealFleetOps implements FleetOps {
         engines: Array<{ id: string; ok: boolean; url: string; detail: string; message?: string }>
     }> {
         const ids = this.listPoolEngines()
-        const engines = await Promise.all(ids.map(async id => {
+        const probe = async (id: string) => {
             const url = `ws://${this.hostOf(id)}:${this.enginePort}`
             const deadline = Date.now() + timeoutMs
             let lastErr: Error | null = null
@@ -1977,7 +1992,15 @@ export class RealFleetOps implements FleetOps {
                 id, ok: false, url, detail: describeEngineLink(id),
                 message: stalled ? lastErr!.message : reportEngineUnreachable(id),
             }
-        }))
+        }
+        // r86b: stagger the walk-start store connects (one Pi at a time, a few seconds apart) so idea04
+        // (Pi 4) never serves several first full syncs at once. Each connect stays fail-loud.
+        const stagger = connectStaggerMs()
+        const engines: Awaited<ReturnType<typeof probe>>[] = []
+        for (const [i, id] of ids.entries()) {
+            if (i > 0 && stagger > 0) await sleep(stagger)
+            engines.push(await probe(id))
+        }
         return { ok: engines.every(e => e.ok), engines }
     }
 
