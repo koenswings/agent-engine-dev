@@ -379,6 +379,53 @@ export const settleDiskOpsBeforeReset = async (
     }
 }
 
+/**
+ * r82b FAIL@91: after the Engine eject, wait until no row on the disk is mid-operation (a start
+ * racing the eject must finish first) before the records are purged. Timeout → fail loud with the
+ * rows. An Error row after the eject is a real Engine state: fail loud, never purge it away.
+ * No-op without diskInstancesRaw (Fake).
+ */
+export const settleRowsAfterUndock = async (
+    ctx: ActionContext,
+    engine: string,
+    diskId: string,
+    label: string,
+    opts: { budgetMs?: number; pollMs?: number } = {},
+): Promise<string> => {
+    const ops = ctx.opts.ops as FleetOps & { diskInstancesRaw?: FleetOps['diskInstancesRaw'] }
+    if (typeof ops.diskInstancesRaw !== 'function') return ''
+    const budget = opts.budgetMs ?? diskOpSettleMs()
+    const poll = opts.pollMs ?? 1_000
+    const t0 = Date.now()
+    let last = 'unread'
+    for (;;) {
+        try {
+            const rows = await ops.diskInstancesRaw(engine, diskId)
+            last = rows.length ? rows.map(r => `${r.id}=${r.status}${r.currentStep != null ? `@step${r.currentStep}` : ''}`).join(', ') : 'no instances'
+            if (!rows.some(rowInFlight)) {
+                const bad = rows.filter(r => r.status === 'Error')
+                if (bad.length) {
+                    throw new Error(
+                        `${label}: Engine left ${bad.map(r => r.id).join(', ')} in Error on ${diskId} (${engine}) after the eject ` +
+                            `(${last}) — real Engine state, not purged. Fail loud.`,
+                    )
+                }
+                return rows.length ? `after eject ${diskId} rows settled in ${Date.now() - t0}ms (${last}); purging stale records` : ''
+            }
+        } catch (e) {
+            if (e instanceof Error && e.message.includes('in Error on')) throw e
+            last = `read failed: ${e instanceof Error ? e.message : String(e)}`
+        }
+        if (Date.now() - t0 >= budget) {
+            throw new Error(
+                `${label}: ${diskId} on ${engine} still has an instance mid-operation ${budget}ms after the eject ` +
+                    `(${last}) — refusing to purge under a live op. Fail loud.`,
+            )
+        }
+        await new Promise(r => setTimeout(r, poll))
+    }
+}
+
 const redockEmptyFresh = async (
     ctx: ActionContext,
     diskId: string,
@@ -412,7 +459,11 @@ const redockEmptyFresh = async (
         // r75 fix 1: wait for in-flight ops, then remove the instances (containers + records) while
         // the disk is still docked, BEFORE the reset.
         settleNote = await settleDiskOpsBeforeReset(ctx, engine, diskId, label)
-        await ctx.opts.ops.purgeInstancesStoredOn(engine, diskId)
+        // r82b FAIL@91: NO record purge while the disk is still docked. The instance files are
+        // still on the disk, so the Engine re-adopts the deleted row on its next disk scan and
+        // starts it again; the eject then races that start and the row ends in Error. Like an
+        // Atlas reset: eject through the Engine first (it stops the containers and marks the
+        // rows Undocked), let the rows settle, then purge the stale records, then re-dock.
     }
     if (typeof opsAny.findDockedEngine === 'function') {
         const already = await opsAny.findDockedEngine(diskId)
@@ -427,6 +478,8 @@ const redockEmptyFresh = async (
         await ctx.opts.ops.undockFixtures(pool, diskId)
     }
     if (opts?.purgeStoreInstances) {
+        const undockNote = await settleRowsAfterUndock(ctx, engine, diskId, label)
+        if (undockNote) settleNote = settleNote ? `${settleNote}; ${undockNote}` : undockNote
         await ctx.opts.ops.purgeInstancesStoredOn(engine, diskId)
     }
     await ctx.opts.ops.dockFixture(engine, diskId)
