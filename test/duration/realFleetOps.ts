@@ -348,12 +348,35 @@ export class TrackedWebSocketClientAdapter extends WebSocketClientAdapter {
         }
         super.disconnect()
     }
+    /**
+     * r86g "Attempting to change an outdated document" (121× on the idea01/idea03 repos from step 100):
+     * automerge-repo 2.3.1 DocSynchronizer answers a sync message INSIDE handle.update(), after
+     * A.receiveSyncMessage has already advanced the doc. The library adapter's send() THROWS
+     * "Websocket not ready (2)" when the socket is CLOSING; the throw escapes the update callback, so
+     * the handle keeps the pre-receive doc, which Automerge has marked outdated. Every later sync
+     * message then fails, and the view freezes until a reconnect (r86g: 6 stale-view reconnects,
+     * all found new data). A send on a socket that is not OPEN is dropped here instead (counted
+     * via noteEngineWs). The sync protocol re-sends after the reconnect, so nothing is lost.
+     */
+    send(message: Parameters<WebSocketClientAdapter['send']>[0]): void {
+        const socket = this.socket as unknown as { readyState?: number } | undefined
+        if (socket && socket.readyState !== 1 /* OPEN */) {
+            this.droppedSends++
+            if (this.droppedSends === 1) console.log(`[RealFleetOps] ${this.via}: dropping sync sends while the socket is not OPEN (library would throw inside handle.update and wedge the doc)`)
+            noteEngineWs(this.via, 'error', `send dropped: socket readyState ${socket.readyState} (not OPEN)`, this.url)
+            return
+        }
+        super.send(message)
+    }
+    droppedSends = 0
     /** Resolves once the socket closed by disconnect() is fully closed (max 1.5 s). */
     whenClosed(): Promise<void> {
         return this.#closed
     }
+    readonly via: string
     constructor(url: string, retryInterval: number, via: string) {
         super(url, retryInterval)
+        this.via = via
         this.onError = event => {
             const err = (event as { error?: { code?: string; message?: string } }).error
             noteEngineWs(via, 'socket-error', `socket ${err?.code ?? err?.message ?? 'error'}`, url)
