@@ -165,7 +165,24 @@ export const assertNoManualAppOverride = (env: NodeJS.ProcessEnv, pin: AppPin): 
     }
 }
 
-export interface AppTab { url: string; active: boolean; fresh: boolean; console?: boolean }
+export interface AppTab { url: string; active: boolean; fresh: boolean; console?: boolean; seq?: number }
+
+/**
+ * r86d FAIL@100: a tab that existed before the step (same seq) at the same URL, was not opened during the
+ * step and is not the Console page was not used by this step: e.g. the Nextcloud Text tab left by
+ * keep_editing@~82 while restore_from_backup drives only the Console page (its sidecar check is an HTTP
+ * request, never a tab). It stays the tracker's "active" tab but is not this step's App use.
+ * A tab that navigated during the step (URL changed) or was opened during it is still checked.
+ */
+/**
+ * Actions whose Console Intent never drives an App tab (b540743 restore_from_backup: Console clicks, then
+ * the sidecar check is consolePage.request.get, no tab). Only these get the leftover-tab exemption; every
+ * other step keeps judging the active tab, so a reused stale tab is still caught.
+ */
+export const CONSOLE_ONLY_APP_ACTIONS: ReadonlySet<string> = new Set(['restore_from_backup'])
+
+export const untouchedLeftoverTab = (t: AppTab, before: readonly AppTab[] | undefined): boolean =>
+    !!before && !t.fresh && !t.console && t.seq !== undefined && before.some(b => b.seq === t.seq && b.url === t.url)
 
 /**
  * After an Intent: every App tab the step used (the active tab, tabs opened during the step, the
@@ -177,10 +194,12 @@ export const appTabProblems = (
     pins: AppPin[],
     consoleHosts: string[],
     consolePorts: number[] = [8080, 80],
+    before?: readonly AppTab[],
 ): string[] => {
     const problems: string[] = []
     for (const t of tabs) {
         if (!(t.active || t.fresh || t.console)) continue
+        if (untouchedLeftoverTab(t, before)) continue
         let u: URL
         try {
             u = new URL(t.url)

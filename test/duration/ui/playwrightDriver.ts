@@ -322,7 +322,7 @@ export class PlaywrightUiDriver implements UiDriver {
      * r55: URLs of the Console page and every still-open tab, marking the active one and the ones
      * opened after `sinceSeq` (fresh). The harness checks these against the store App URLs.
      */
-    appTabs(sinceSeq = Number.POSITIVE_INFINITY): { url: string; active: boolean; fresh: boolean; console?: boolean }[] {
+    appTabs(sinceSeq = Number.POSITIVE_INFINITY): { url: string; active: boolean; fresh: boolean; console?: boolean; seq?: number }[] {
         type P = { url?: () => string; isClosed?: () => boolean }
         const urlOf = (p: unknown): string => {
             try { return (p as P).url?.() ?? '' } catch { return '' }
@@ -332,12 +332,12 @@ export class PlaywrightUiDriver implements UiDriver {
         }
         if (!this.page) return []
         const active = this.activePage()
-        const out: { url: string; active: boolean; fresh: boolean; console?: boolean }[] = [
+        const out: { url: string; active: boolean; fresh: boolean; console?: boolean; seq?: number }[] = [
             { url: urlOf(this.page), active: active === this.page, fresh: false, console: true },
         ]
         for (const t of this.tabLog) {
             if (t.page === this.page || !open(t.page)) continue
-            out.push({ url: urlOf(t.page), active: active === t.page, fresh: t.seq > sinceSeq })
+            out.push({ url: urlOf(t.page), active: active === t.page, fresh: t.seq > sinceSeq, seq: t.seq })
         }
         return out
     }

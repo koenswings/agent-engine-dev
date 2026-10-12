@@ -25,7 +25,7 @@ import { finalizeRecordedFrame, framePath } from './recordWalk.js'
 import { DURATION_UI_FIXTURES } from './ui/fixtures.js'
 import { SETTLE_AFTER_ACTIONS, waitInstancesSettled } from './instanceSettle.js'
 import {
-    APP_URL_ENV, CONSOLE_DEFAULT_SIDECAR_PORTS, INSTANCE_SIDECAR_ACTIONS, appKindForInstanceId, appTabProblems, appsUsedByStep, consoleOpenProblem, CONSOLE_OPEN_ACTION_RE, APP_HOSTS_ENV, appHostForms, lanHostsFromEnv, lanHostsFromStore,
+    type AppTab, CONSOLE_ONLY_APP_ACTIONS, APP_URL_ENV, CONSOLE_DEFAULT_SIDECAR_PORTS, INSTANCE_SIDECAR_ACTIONS, appKindForInstanceId, appTabProblems, appsUsedByStep, consoleOpenProblem, CONSOLE_OPEN_ACTION_RE, APP_HOSTS_ENV, appHostForms, lanHostsFromEnv, lanHostsFromStore,
     assertNoManualAppOverride, idea166Target, isHarnessOwned, nextcloudUntrustedDomain, offPinRedirect, setHarnessEnv, type AppPin, type SidecarApp,
 } from './appUrls.js'
 import { backupDiskTargetId, describeDisk, diskEmptiness, eraseDiskTargetId, filesDiskTargetId, waitDiskEmpty, diskResetVerdict, instanceStoredOn, rowInFlight } from './fixtureDisks.js'
@@ -1843,7 +1843,7 @@ export const pinAppsForStep = async (
 }
 
 /** Driver slice the post-use check needs (PlaywrightUiDriver implements it; Stub does not). */
-type TabAwareDriver = { appTabs?: (sinceSeq?: number) => { url: string; active: boolean; fresh: boolean; console?: boolean }[] }
+type TabAwareDriver = { appTabs?: (sinceSeq?: number) => { url: string; active: boolean; fresh: boolean; console?: boolean; seq?: number }[] }
 
 /**
  * r55 post-use (Stage 2): every App tab the step used must address one of its store pins, and each used
@@ -1857,6 +1857,7 @@ export const verifyAppUseAfterIntent = async (
     pins: AppPin[],
     tabSeq0: number | undefined,
     env: NodeJS.ProcessEnv = process.env,
+    tabsBefore?: AppTab[],
 ): Promise<{ ok: true; note: string } | { ok: false; problem: string }> => {
     const notes: string[] = []
     if (typeof driver.appTabs === 'function') {
@@ -1864,7 +1865,7 @@ export const verifyAppUseAfterIntent = async (
         const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
         const consoleHosts = pool.flatMap(e => engineHostAliases(e, hosts))
         const tabs = driver.appTabs(tabSeq0)
-        const problems = appTabProblems(tabs, pins, consoleHosts)
+        const problems = appTabProblems(tabs, pins, consoleHosts, undefined, tabsBefore)
         if (problems.length) return { ok: false, problem: problems.join('; ') }
         notes.push(`app tabs on store URLs (${pins.map(p => p.url).join(', ')})`)
         const openProblem = consoleOpenProblem(ctx.action, tabs, pins, await stage2LanHosts(ctx, env))
@@ -3501,6 +3502,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     let appUses: AppUse[] = []
     let appPins: AppPin[] = []
     let tabSeq0: number | undefined
+    let tabsBefore: AppTab[] | undefined
     if (isStage2(ctx)) {
         appUses = stage2AppUsesForStep(ctx, instanceId)
         if (appUses.length) {
@@ -3514,6 +3516,9 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             }
             const d = driver as typeof driver & { tabSeq?: () => number }
             tabSeq0 = typeof d.tabSeq === 'function' ? d.tabSeq() : undefined
+            // r86d: snapshot the open tabs so a leftover tab the step never touched is not judged as its App use.
+            tabsBefore = CONSOLE_ONLY_APP_ACTIONS.has(ctx.action) && typeof (driver as TabAwareDriver).appTabs === 'function'
+                ? (driver as TabAwareDriver).appTabs!(tabSeq0) : undefined
         }
     }
     const intentStartedAt = Date.now()
@@ -3586,7 +3591,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
         message = `${message}; ${ps.note}`
     }
     if (result.ok && appUses.length && isStage2(ctx)) {
-        const post = await verifyAppUseAfterIntent(ctx, driver as TabAwareDriver, appUses, appPins, tabSeq0)
+        const post = await verifyAppUseAfterIntent(ctx, driver as TabAwareDriver, appUses, appPins, tabSeq0, process.env, tabsBefore)
         if (!post.ok) {
             return { ok: false, message: `${ctx.action}: ${post.problem} (Console Intent reported ok; ${preStartSettleNote ?? ''})`, layer }
         }
