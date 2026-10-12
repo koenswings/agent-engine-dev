@@ -70,6 +70,13 @@ export const STAGE2_FIXTURES: readonly Stage2Fixture[] = [
     { diskId: 'duration-empty-003', host: 'idea04', ssd: 1, partNumber: 2, partLabel: 'IDEA-EMPTY003', fsLabel: 'DUR-EMPTY003', diskTypes: ['empty'], stage1Slot: 'idea-test-6', role: 'move-only target (infra_move_disk); no other role' },
 ]
 
+/**
+ * r84c FAIL@93: the dedicated app-only fixture for add_files_role (READY: idea01 p2 IDEA-ADDFILES).
+ * Never the move source Kolibri: infra_move_disk@62 network-copies it to idea04 (empty-003), and
+ * restoring it to its idea01 home would be a move onto idea01 (READY §4.4).
+ */
+export const STAGE2_ADD_FILES_DISK_ID = 'duration-add-files-001'
+
 /** Pis that must never receive a network-copied disk (READY §4.4: never move onto idea01). */
 export const STAGE2_NEVER_MOVE_TO = ['idea01'] as const
 

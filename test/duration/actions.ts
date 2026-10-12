@@ -9,7 +9,7 @@
 import { isIdea02Target } from './walkHost.js'
 import { settleAfterLongOp, poolInstanceIds, type PostOpSettleIo } from './postOpSettle.js'
 import { opStartBudget, WAIT_OP_ACTIONS, opAppearBudgetMs, opDoneBudgetMs, waitOperationTerminal, type WaitOperationFn } from './opWait.js'
-import { STAGE2_MOVE_TARGET_HOST, stage2HomeOf } from './stage2.js'
+import { STAGE2_ADD_FILES_DISK_ID, STAGE2_MOVE_TARGET_HOST, stage2HomeOf } from './stage2.js'
 import type {
     DurationOptions,
     FleetOps,
@@ -853,7 +853,8 @@ export const addFilesAppDiskId = (
     ctx: Pick<ActionContext, 'fixtureDisk'>,
     env: NodeJS.ProcessEnv = process.env,
 ): string => {
-    const id = env.DURATION_ADD_FILES_DISK_ID?.trim() || ctx.fixtureDisk
+    // r84c FAIL@93: Stage 2 defaults to its dedicated app-only fixture on idea01, never the moved Kolibri.
+    const id = env.DURATION_ADD_FILES_DISK_ID?.trim() || (env.DURATION_STAGE?.trim() === '2' ? STAGE2_ADD_FILES_DISK_ID : ctx.fixtureDisk)
     const filesId = env.DURATION_FILES_DISK_ID?.trim()
     if (!id) {
         throw new Error('add_files_role: no app-only disk id (DURATION_ADD_FILES_DISK_ID / fixtureDisk unset). Prefer A — fail loud.')
