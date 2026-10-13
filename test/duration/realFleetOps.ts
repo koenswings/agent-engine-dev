@@ -1330,7 +1330,7 @@ export class RealFleetOps implements FleetOps {
         if (opts.storeMode && opts.storeMode !== 'shared') {
             throw new Error(
                 `RealFleetOps: storeMode '${opts.storeMode}' refused on the live pool — idea01/03/04 share ONE store ` +
-                    `(3zoqd, mDNS ON, no static peers). Use shared; unique is Fake-only.`,
+                    `(2VroE; was 3zoqd, compacted 2026-10-13; mDNS ON, no static peers). Use shared; unique is Fake-only.`,
             )
         }
         this.mode = 'shared'
@@ -1385,7 +1385,7 @@ export class RealFleetOps implements FleetOps {
 
     /**
      * idea#168 r38 (Koen's standing rule): the live pool IS one shared store — the dev store
-     * (3zoqd…), mDNS ON, no static peers — an exact production replica. 'shared' is accepted
+     * (2VroE…, was 3zoqd, compacted to 2VroE 2026-10-13), mDNS ON, no static peers — an exact production replica. 'shared' is accepted
      * (nothing to provision: the Engines already share it; runStorePreflight proves it before
      * step 1 of every live run). 'unique' is REFUSED on the live pool (stricter option: a
      * unique-store run would not be a production replica). FakeFleetOps keeps both modes.
@@ -1394,7 +1394,7 @@ export class RealFleetOps implements FleetOps {
         if (mode !== 'shared') {
             throw new Error(
                 `RealFleetOps: store_mode '${mode}' refused on the live pool — idea01/03/04 share ONE store ` +
-                    `(DURATION_EXPECTED_STORE_ID, default 3zoqd) with mDNS ON and no static peers (production replica). ` +
+                    `(DURATION_EXPECTED_STORE_ID, default 2VroE) with mDNS ON and no static peers (production replica). ` +
                     `Use store_mode: shared (scenarios/unified.yaml); unique is Fake-only.`,
             )
         }

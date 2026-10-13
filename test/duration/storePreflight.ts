@@ -1,6 +1,6 @@
 /**
  * idea#168 r38 store preflight (Koen's standing rule): the live pool idea01/03/04 is an exact
- * production replica — ONE shared dev store (doc 3zoqd…), mDNS discovery ON, NO static peers.
+ * production replica — ONE shared dev store (doc 2VroE…; was 3zoqd, compacted to 2VroE 2026-10-13), mDNS discovery ON, NO static peers.
  * Before step 1 of EVERY live run (any scenario / walk), each pool Pi must show exactly that, or
  * the run exits EXIT_STORE_PREFLIGHT naming the Pi, the field and expected vs actual.
  * idea02 is never probed (refused before any ssh).
@@ -29,7 +29,7 @@ export const DEFAULT_EXPECTED_STORE_ID = '2VroE'
 export const DEFAULT_ENGINE_DIR = '/home/pi/idea/agents/agent-engine-dev'
 const NEVER = 'idea02'
 
-/** DURATION_EXPECTED_STORE_ID (id or automerge: URL, full or ≥5-char prefix), default 3zoqd. */
+/** DURATION_EXPECTED_STORE_ID (id or automerge: URL, full or ≥5-char prefix), default 2VroE. */
 export const expectedStoreId = (env: NodeJS.ProcessEnv = process.env): string => {
     const v = (env.DURATION_EXPECTED_STORE_ID ?? '').trim().replace(/^automerge:/, '')
     if (!v) return DEFAULT_EXPECTED_STORE_ID

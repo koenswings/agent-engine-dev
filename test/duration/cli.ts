@@ -103,7 +103,7 @@ const usage = () => {
                         a mismatch exits 5 (console_deploy_preflight).
                         Store preflight (EVERY --live run; NOT skipped by --no-preflight):
                         each pool Pi must use the one shared store DURATION_EXPECTED_STORE_ID
-                        (default 3zoqd: store-url.txt, the running Engine's /api/store-url,
+                        (default 2VroE: store-url.txt, the running Engine's /api/store-url,
                         the harness WS doc) with mDNS ON (settings.mdns, IDEA_MDNS_DISABLE) and
                         no static peers (IDEA_STATIC_PEERS ?? settings.staticPeers); a mismatch
                         exits 6 (store_preflight, names Pi / field / expected vs actual).

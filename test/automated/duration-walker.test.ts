@@ -858,7 +858,7 @@ describe('RealFleetOps guard clauses (no network)', () => {
         await expect(ops.rebootEngine('idea02', true)).rejects.toThrow(/excluded|golden/)
         await expect(ops.applyStoreMode('shared')).resolves.toBeUndefined()
         expect(ops.getStoreMode()).toBe('shared')
-        await expect(ops.applyStoreMode('unique')).rejects.toThrow(/store_mode 'unique' refused on the live pool.*3zoqd/)
+        await expect(ops.applyStoreMode('unique')).rejects.toThrow(/store_mode 'unique' refused on the live pool.*2VroE/)
         expect(ops.getStoreMode()).toBe('shared')
         // default (no storeMode) is shared; unique at construction is refused
         expect(new RealFleetOps({ poolEngines: ['idea01'], excludeEngines: ['idea02'], hosts: fakeHosts }).getStoreMode()).toBe('shared')
