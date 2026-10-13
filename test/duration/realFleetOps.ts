@@ -26,6 +26,7 @@ import { runProcess } from './procRun.js'
 import { instanceStoredOn } from './fixtureDisks.js'
 import { GATE_TOKEN, gateSecs, sshMutate, type GatedResult, type MutateResult, type MutateSpec } from './sshMutate.js'
 import { headsKey, recordReconnect, staleViewMs } from './staleView.js'
+import { CommandLogReader } from './commandLogReader.js'
 import { $ } from 'zx'
 import type { Store } from '../../src/data/Store.js'
 import { runningInstanceExpectsLocalDocker } from './stability.js'
@@ -2114,6 +2115,7 @@ export class RealFleetOps implements FleetOps {
     }
 
     private readonly viewSeen = new Map<string, { heads: string; changedAt: number }>()
+    private readonly commandLogReaders = new Map<string, CommandLogReader>()
 
     private headsOf(c: Conn): string[] | null {
         try {
@@ -2218,23 +2220,15 @@ export class RealFleetOps implements FleetOps {
             this.commandLogUrls.set(engineId, url)
             registerOwnDoc(url, 'commandLog', engineId)
         }
-        const handle = conn.repo.findWithProgress<{ traces?: Record<string, unknown> }>(toDocId(url)).handle
-        const deadline = Date.now() + 5_000
-        while (!handle.isReady() && Date.now() < deadline) await sleep(100)
-        if (!handle.isReady()) throw new Error(`CommandLog ${url} of ${engineId} not ready within 5000ms`)
-        const doc = handle.doc()
-        return Object.entries(doc?.traces ?? {}).map(([id, raw]) => {
-            const t = (raw ?? {}) as Record<string, unknown>
-            return {
-                traceId: String(t.traceId ?? id),
-                command: String(t.command ?? ''),
-                args: typeof t.args === 'string' ? t.args : JSON.stringify(t.args ?? null),
-                status: String(t.status ?? ''),
-                startedAt: typeof t.startedAt === 'number' ? t.startedAt : null,
-                completedAt: typeof t.completedAt === 'number' ? t.completedAt : null,
-                errorMessage: t.errorMessage == null ? null : String(t.errorMessage),
-            }
-        })
+        // r86k: never sync the CommandLog on the main thread (150 s WASM block @43); read it off-thread.
+        let reader = this.commandLogReaders.get(engineId)
+        const wsUrl = `ws://${conn.host}:${this.enginePort}`
+        if (!reader || !reader.alive || reader.wsUrl !== wsUrl || reader.docUrl !== url) {
+            if (reader) void reader.close()
+            reader = new CommandLogReader(engineId, wsUrl, url)
+            this.commandLogReaders.set(engineId, reader)
+        }
+        return reader.list(5_000)
     }
 
     /**
@@ -3610,6 +3604,8 @@ export class RealFleetOps implements FleetOps {
 
     /** Drop all open WS connections (tests / process exit). */
     async close(): Promise<void> {
+        await Promise.allSettled([...this.commandLogReaders.values()].map(r => r.close()))
+        this.commandLogReaders.clear()
         await Promise.allSettled([...this.connecting.values()])
         const ids = [...this.conns.keys()]
         for (const id of ids) await this.disconnect(id, 'walker closing')
