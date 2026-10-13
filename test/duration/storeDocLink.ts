@@ -7,6 +7,7 @@
  */
 import { Worker } from 'node:worker_threads'
 import type { Store } from '../../src/data/Store.js'
+import { sharedDocHost, perLinkWorkers, type WorkerLike } from './docHost.js'
 
 export const STORE_DOC_WORKER_URL = new URL('./storeDocWorker.mjs', import.meta.url)
 
@@ -60,7 +61,7 @@ export interface StoreDocLinkOpts {
 export const liveStoreLinks = new Set<StoreDocLink>()
 
 export class StoreDocLink {
-    private worker: Worker
+    private worker: WorkerLike
     private snap: Store | undefined
     private snapHeads: string[] | null = null
     private nextId = 1
@@ -77,15 +78,14 @@ export class StoreDocLink {
     constructor(readonly o: StoreDocLinkOpts) {
         this.logicalId = o.logicalId
         const log = o.log ?? console.log
-        this.worker = new Worker(STORE_DOC_WORKER_URL, {
-            workerData: {
+        const data = {
                 url: o.url, docId: o.docId, logicalId: o.logicalId, deadline: o.deadline, handshakeMs: o.handshakeMs,
                 peerId: `duration-${o.logicalId}-${Date.now()}`,
                 snapshotMs: Number(process.env.DURATION_STORE_SNAPSHOT_MS ?? 500),
                 memEveryMs: Number(process.env.DURATION_WORKER_MEM_MS ?? 15_000),
-            },
-            execArgv: [],
-        })
+        }
+        // r86p: all links share one doc-host thread (one Automerge WASM) unless DURATION_DOC_HOST=per-link.
+        this.worker = perLinkWorkers() ? new Worker(STORE_DOC_WORKER_URL, { workerData: data, execArgv: [] }) : sharedDocHost.open('store', data)
         this.worker.unref()
         liveStoreLinks.add(this)
         let settle!: (o: StoreOutcome) => void

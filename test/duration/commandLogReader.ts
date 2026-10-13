@@ -5,11 +5,12 @@
  */
 import { Worker } from 'node:worker_threads'
 import type { DurationCommandTrace } from './actions.js'
+import { sharedDocHost, perLinkWorkers, type WorkerLike } from './docHost.js'
 
 export const COMMAND_LOG_WORKER_URL = new URL('./commandLogWorker.mjs', import.meta.url)
 
 export class CommandLogReader {
-    private worker: Worker
+    private worker: WorkerLike
     private nextId = 1
     private pending = new Map<number, { resolve: (t: DurationCommandTrace[]) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>()
     private dead: Error | null = null
@@ -17,10 +18,11 @@ export class CommandLogReader {
     mem: { heapUsed: number; external: number; arrayBuffers: number; at: number } | null = null
 
     constructor(readonly engine: string, readonly wsUrl: string, readonly docUrl: string, log: (s: string) => void = console.log) {
-        this.worker = new Worker(COMMAND_LOG_WORKER_URL, {
-            workerData: { wsUrl, docUrl, peerId: `duration-cl-${engine}-${Date.now()}`, memEveryMs: Number(process.env.DURATION_WORKER_MEM_MS ?? 15_000) },
-            execArgv: [], // plain .mjs: no tsx loader needed in the worker
-        })
+        const data = { wsUrl, docUrl, peerId: `duration-cl-${engine}-${Date.now()}`, memEveryMs: Number(process.env.DURATION_WORKER_MEM_MS ?? 15_000) }
+        // r86p: shared doc-host thread (one Automerge WASM for all links) unless DURATION_DOC_HOST=per-link.
+        this.worker = perLinkWorkers()
+            ? new Worker(COMMAND_LOG_WORKER_URL, { workerData: data, execArgv: [] }) // plain .mjs: no tsx loader needed
+            : sharedDocHost.open('commandLog', data)
         this.worker.unref()
         this.worker.on('message', (m: { id?: number; event?: string; ms?: number; traces?: DurationCommandTrace[]; error?: string; heapUsed?: number; external?: number; arrayBuffers?: number }) => {
             if (m.event === 'mem') {
