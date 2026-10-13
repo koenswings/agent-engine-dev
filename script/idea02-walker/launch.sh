@@ -12,7 +12,7 @@ EVID=/home/walker/duration-evidence/$RUN
 git -C "$REPO" diff --quiet || { echo "REFUSE: dirty harness tree"; exit 3; }
 SHA=$(git -C "$REPO" rev-parse HEAD)
 git -C "$REPO" branch -r --contains "$SHA" | grep -q origin/ || { echo "REFUSE: $SHA not pushed"; exit 3; }
-CONSOLE_PIN=234d8332afb372fbc28d6c552de94d32ac6a0495  # intents = d194a2b merged with product d6930d8 (#146 fix on #144 a390993) + drop appdocker01: range e2e/test-only
+CONSOLE_PIN=19a8b82bb50f4fdb2c27e68bf39464267381188e  # intents = 234d833 merged with product ca8c111 (#146 dedupe c3a8783 on pool d6930d8): range e2e/test-only
 [ "$(git -C /home/walker/agent-console-dev rev-parse HEAD)" = "$CONSOLE_PIN" ] || { echo "REFUSE: console intents checkout is not $CONSOLE_PIN"; exit 3; }
 git -C /home/walker/agent-console-dev diff --quiet || { echo "REFUSE: dirty console intents tree"; exit 3; }
 mkdir -p "$EVID"; [ -f "$EVID/run.pid" ] && kill -0 "$(cat "$EVID/run.pid")" 2>/dev/null && { echo "REFUSE: already running"; exit 4; }
@@ -27,10 +27,10 @@ export DURATION_LAN_HOSTS=\${DURATION_LAN_HOSTS:-idea01=10.99.0.11,idea03=10.99.
 export DURATION_CONSOLE_INTENTS=/home/walker/agent-console-dev/e2e/intents
 export DURATION_STAGE=2
 export DURATION_EXPECTED_CONSOLE_SHA=$CONSOLE_PIN
-# Product pin: d6930d8 = Console PR #146 fix (discovery/manual connect probe the page's port, r86m FAIL@127) cherry-picked on #144 tip a390993 (branch fix/discovery-page-port-pool); intents 234d833 = d194a2b + merge of d6930d8 + appdocker01 drop.
-export DURATION_CONSOLE_PRODUCT_SHA=d6930d8e1158b29f101fc0f97bffe790ae6d7bf7
-export DURATION_CONSOLE_PRODUCT_ASSET=index-Bl6PrZc0.js
-export DURATION_CONSOLE_PRODUCT_ASSET_MD5=3d6a9825ece69de9b8aae9eca2844b67
+# Product pin: ca8c111 = Console PR #146 page-port fix + engine dedupe (r86n FAIL@127 duplicate idea01) on #144 tip a390993 (branch fix/discovery-page-port-pool); intents 19a8b82 = 234d833 + merge of ca8c111.
+export DURATION_CONSOLE_PRODUCT_SHA=ca8c111e4bc30fb2731749597650c226dc89e236
+export DURATION_CONSOLE_PRODUCT_ASSET=index-qUni5WGC.js
+export DURATION_CONSOLE_PRODUCT_ASSET_MD5=3428b6f5e0667f790d803beb0ad5ce0b
 export DURATION_EXPECTED_STORE_ID=3zoqd
 export DURATION_POST_OP_SETTLE_MS=\${DURATION_POST_OP_SETTLE_MS:-300000}
 export DURATION_DOC_WAIT_MS=\${DURATION_DOC_WAIT_MS:-45000}
