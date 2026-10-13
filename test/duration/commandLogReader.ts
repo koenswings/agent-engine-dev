@@ -5,7 +5,7 @@
  */
 import { Worker } from 'node:worker_threads'
 import type { DurationCommandTrace } from './actions.js'
-import { sharedDocHost, perLinkWorkers, type WorkerLike } from './docHost.js'
+import { sharedCommandLogHost, perLinkWorkers, type WorkerLike } from './docHost.js'
 
 export const COMMAND_LOG_WORKER_URL = new URL('./commandLogWorker.mjs', import.meta.url)
 
@@ -22,7 +22,7 @@ export class CommandLogReader {
         // r86p: shared doc-host thread (one Automerge WASM for all links) unless DURATION_DOC_HOST=per-link.
         this.worker = perLinkWorkers()
             ? new Worker(COMMAND_LOG_WORKER_URL, { workerData: data, execArgv: [] }) // plain .mjs: no tsx loader needed
-            : sharedDocHost.open('commandLog', data)
+            : sharedCommandLogHost.open('commandLog', data)
         this.worker.unref()
         this.worker.on('message', (m: { id?: number; event?: string; ms?: number; traces?: DurationCommandTrace[]; error?: string; heapUsed?: number; external?: number; arrayBuffers?: number }) => {
             if (m.event === 'mem') {

@@ -129,6 +129,24 @@ export async function startStoreDocSession(workerData, io) {
             Promise.resolve().then(() => repo.shutdown()).catch(() => {}).finally(() => setTimeout(() => io.exit(0), 200))
             return
         }
+        // r86q (Steve): after a WS close the adapter reconnects its own socket and this Repo re-syncs the
+        // EXISTING handle with the new peer (incremental, no fresh doc wait / first sync). The walker asks
+        // here instead of opening a new Repo; the answer always comes back (ok or a reason) within m.ms.
+        if (m?.type === 'reattach') {
+            const id = m.id, until = Date.now() + Math.max(0, Number(m.ms) || 0), t0 = Date.now()
+            const tick = () => {
+                if (closing) return post({ id, ok: false, error: 'session closing' })
+                const ready = !!handle?.isReady(), peer = repo.peers.length > 0
+                if (ready && peer) {
+                    try { return post({ id, ok: true, reattached: true, tookMs: Date.now() - t0, ...snapshot() }) }
+                    catch (e) { return post({ id, ok: false, error: `snapshot: ${e?.message ?? e}` }) }
+                }
+                if (Date.now() >= until) return post({ id, ok: false, error: `reattach: ${peer ? 'WS open' : 'no WS peer'}, handle ${handle?.state ?? 'none'} after ${Date.now() - t0}ms` })
+                setTimeout(tick, 100)
+            }
+            tick()
+            return
+        }
         if (m?.type === 'change') {
             try {
                 if (!handle?.isReady()) throw new Error(`store doc not ready (handle ${handle?.state ?? 'none'})`)
@@ -148,6 +166,8 @@ export async function startStoreDocSession(workerData, io) {
         const out = await awaitDoc()
         if (out.kind === 'ready' && !closing) {
             handle.on('change', scheduleSnapshot)
+            // r86q: a re-established peer re-syncs this handle; push a fresh snapshot once it has.
+            ns.on('peer', () => { if (!closing) scheduleSnapshot() })
             post({ event: 'outcome', kind: 'ready', tookMs: Date.now() - started, ...snapshot() })
         } else post({ event: 'outcome', ...out, tookMs: Date.now() - started })
     }

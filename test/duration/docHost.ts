@@ -44,7 +44,17 @@ export class DocHost {
     private idleTimer: NodeJS.Timeout | null = null
     /** Host threads started so far (tests: the host is shared, and recycled only when idle). */
     starts = 0
-    constructor(private readonly url: URL = DOC_HOST_WORKER_URL, private readonly idleMs = Number(process.env.DURATION_DOC_HOST_IDLE_MS ?? 30_000)) {}
+    private lastPong = 0
+    private heartbeat: NodeJS.Timeout | null = null
+    constructor(private readonly url: URL = DOC_HOST_WORKER_URL, private readonly idleMs = Number(process.env.DURATION_DOC_HOST_IDLE_MS ?? 30_000),
+        private readonly heartbeatMs = 1_000, readonly name = 'doc-host') {}
+
+    /**
+     * r86q: ms since the host thread last answered a heartbeat (0 when not running). r86p FAIL@42: the
+     * one shared host ran idea01's CommandLog first sync (WASM, ~150 s in r86k) and every store session
+     * on that thread went silent with it; the walker saw only "store worker gave no outcome".
+     */
+    unresponsiveMs(now = Date.now()): number { return this.worker && this.lastPong ? Math.max(0, now - this.lastPong) : 0 }
 
     get openChannels(): number { return this.chans.size }
     get running(): boolean { return this.worker !== null }
@@ -75,6 +85,7 @@ export class DocHost {
     async stop(): Promise<void> {
         const w = this.worker
         this.worker = null
+        if (this.heartbeat) { clearInterval(this.heartbeat); this.heartbeat = null }
         if (w) await w.terminate()
     }
 
@@ -83,7 +94,12 @@ export class DocHost {
         const w = new Worker(this.url, { execArgv: [] })
         this.starts++
         w.unref()
-        w.on('message', (m: { ch: number; msg?: unknown; exit?: number }) => {
+        this.lastPong = Date.now()
+        if (this.heartbeat) clearInterval(this.heartbeat)
+        this.heartbeat = setInterval(() => { if (this.worker === w) w.postMessage({ type: 'ping', t: Date.now() }) }, this.heartbeatMs)
+        this.heartbeat.unref()
+        w.on('message', (m: { ch: number; msg?: unknown; exit?: number; pong?: number }) => {
+            if (m.pong !== undefined) { this.lastPong = Date.now(); return }
             const c = this.chans.get(m.ch)
             if (!c) return
             if (m.exit !== undefined) this.closed(c, m.exit)
@@ -103,7 +119,13 @@ export class DocHost {
     }
 }
 
-/** The walker's one shared host. */
-export const sharedDocHost = new DocHost()
+/** The walker's shared host for every store-doc link (one Automerge WASM for all Engines). */
+export const sharedDocHost = new DocHost(undefined, undefined, undefined, 'store-host')
+/**
+ * r86q: CommandLog readers get their OWN shared host. r86p FAIL@42: idea01's CommandLog (4 MB of history,
+ * appended to during copyApp) synced on the same thread as the store sessions and froze them all for
+ * > 3 min (LOOPLAG: no store mem sample after 09:27:37 UTC). Two hosts = two WASM instances at most, never one per link.
+ */
+export const sharedCommandLogHost = new DocHost(undefined, undefined, undefined, 'commandlog-host')
 
 export const perLinkWorkers = (): boolean => process.env.DURATION_DOC_HOST === 'per-link'

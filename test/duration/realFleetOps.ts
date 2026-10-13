@@ -2155,7 +2155,19 @@ export class RealFleetOps implements FleetOps {
             const cached = this.conns.get(engineId)
             if (cached) {
                 const wsWait = Math.max(this.wsHandshakeTimeoutMs, timeoutMs - (Date.now() - start))
-                if (await this.waitWsOpen(cached, wsWait)) {
+                // r86q (r86p FAIL@42): a dropped WS on an off-thread link is re-attached in its worker (the
+                // adapter reconnects, the existing handle re-syncs) — never closed for a fresh full doc wait.
+                if (cached.link && cached.link.alive) {
+                    if (await cached.link.reattach(wsWait)) {
+                        const doc = cached.storeHandle.doc()
+                        if (doc) {
+                            const live = this.discoverLiveEngineId(doc, engineId)
+                            this.rememberMapping(engineId, live)
+                            return { wsUp: true, storeSynced: live != null && !!doc.engineDB[live as keyof typeof doc.engineDB] }
+                        }
+                    }
+                    console.log(JSON.stringify({ event: 'store_reattach_failed', engine: engineId, detail: cached.link.lastReattachError }))
+                } else if (await this.waitWsOpen(cached, wsWait)) {
                     const doc = cached.storeHandle.doc()
                     if (doc) {
                         const live = this.discoverLiveEngineId(doc, engineId)

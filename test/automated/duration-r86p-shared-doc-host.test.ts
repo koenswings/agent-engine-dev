@@ -16,7 +16,7 @@ import { Repo, type PeerId } from '@automerge/automerge-repo'
 import { WebSocketServerAdapter } from '@automerge/automerge-repo-network-websocket'
 import { StoreDocLink } from '../duration/storeDocLink.js'
 import { CommandLogReader } from '../duration/commandLogReader.js'
-import { DocHost, sharedDocHost } from '../duration/docHost.js'
+import { DocHost, sharedDocHost, sharedCommandLogHost } from '../duration/docHost.js'
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
 const MB = 1048576
@@ -44,6 +44,8 @@ const startEngine = async (name: string, ops: number, clTraces: number) => {
     const port = (server.address() as net.AddressInfo).port
     return {
         name, url: `ws://127.0.0.1:${port}`, store, cl,
+        /** Engine-side WS close of every open socket (the client adapter reconnects itself). */
+        dropSockets: () => { for (const s of sockets.splice(0)) { try { s.terminate() } catch { /* */ } } },
         close: async () => { for (const s of sockets) { try { s.terminate() } catch { /* */ } } await repo.shutdown().catch(() => {}); wss.close(); await new Promise<void>(r => server.close(() => r())) },
     }
 }
@@ -60,7 +62,7 @@ const listSoon = async (r: CommandLogReader, min: number) => {
     throw new Error(`CommandLog of ${r.engine} not readable`)
 }
 
-afterAll(async () => { await sharedDocHost.stop() })
+afterAll(async () => { await sharedDocHost.stop(); await sharedCommandLogHost.stop() })
 
 describe('r86p: one shared doc-host worker for all walker Automerge links', () => {
     it('store links + CommandLog readers share ONE host thread; read, write and replace a link', async () => {
@@ -73,7 +75,10 @@ describe('r86p: one shared doc-host worker for all walker Automerge links', () =
             for (const l of links) expect((await l.outcome()).kind).toBe('ready')
             for (const r of readers) expect((await listSoon(r, 60)).length).toBe(60)
             expect(sharedDocHost.starts - startsBefore).toBeLessThanOrEqual(1)
-            expect(sharedDocHost.openChannels).toBe(6)
+            // r86q: store links on one host, CommandLog readers on their own (separate threads)
+            expect(sharedDocHost.openChannels).toBe(3)
+            expect(sharedCommandLogHost.openChannels).toBe(3)
+            expect(sharedCommandLogHost.threadId).not.toBe(sharedDocHost.threadId)
             expect((links[0].doc() as any)?.engineDB?.idea01?.hostname).toBe('idea01')
             // a write still reaches the Engine
             await links[1].change(s => { (s as any).engineDB.idea03.commands.push('ejectDisk d1') })
@@ -93,6 +98,7 @@ describe('r86p: one shared doc-host worker for all walker Automerge links', () =
             for (const e of engines) await e.close()
         }
         expect(sharedDocHost.openChannels).toBe(0)
+        expect(sharedCommandLogHost.openChannels).toBe(0)
     }, 120_000)
 
     it('the host is recycled once idle and restarts on the next open', async () => {
@@ -130,7 +136,7 @@ describe('r86p: one shared doc-host worker for all walker Automerge links', () =
                 engines[i].cl.change(d => { d.traces[`c${k}`] = { traceId: `c${k}`, command: 'moveApp', status: 'ok', startedAt: k } })
                 sample()
             }
-            expect(sharedDocHost.openChannels).toBe(6)
+            expect(sharedDocHost.openChannels + sharedCommandLogHost.openChannels).toBe(6)
         } finally {
             clearInterval(timer)
             for (const l of links) await l.close()
@@ -140,4 +146,69 @@ describe('r86p: one shared doc-host worker for all walker Automerge links', () =
         console.log(JSON.stringify({ event: 'r86p_soak', peakRssMb: Math.round(peak / MB) }))
         expect(peak).toBeLessThan(1200 * MB)
     }, 240_000)
+
+    it('r86q: WS close + reconnect on the shared host — the existing handle re-attaches, doc ready again, worker answers', async () => {
+        delete process.env.DURATION_DOC_HOST
+        const e = await startEngine('idea01', 300, 5)
+        const other = await startEngine('idea03', 50, 1)
+        const link = openStore(e)
+        const bystander = openStore(other)
+        const peers: number[] = []
+        try {
+            expect((await link.outcome()).kind).toBe('ready')
+            expect((await bystander.outcome()).kind).toBe('ready')
+            expect(await link.reattach(5_000)).toBe(true) // healthy link: answers at once
+            e.dropSockets() // Engine-side close (r86p: idea01 WS closed during copyApp)
+            for (let i = 0; i < 50 && link.peerCount > 0; i++) await sleep(50)
+            expect(link.peerCount).toBe(0)
+            peers.push(link.peerCount)
+            // the Engine changes the store while the walker is disconnected
+            e.store.change(d => { d.engineDB.idea01.commands.push('copyApp kolibri') })
+            // re-attach the SAME session (no new Repo, no fresh doc wait): adapter reconnects (2 s), handle re-syncs
+            const t0 = Date.now()
+            expect(await link.reattach(20_000)).toBe(true)
+            expect(link.lastReattachError).toBeNull()
+            expect(Date.now() - t0).toBeLessThan(15_000)
+            expect(link.alive).toBe(true)
+            expect(link.peerCount).toBeGreaterThan(0)
+            for (let i = 0; i < 50 && (link.doc() as any)?.engineDB?.idea01?.commands?.length !== 1; i++) await sleep(100)
+            expect((link.doc() as any).engineDB.idea01.commands).toEqual(['copyApp kolibri'])
+            // writes go through the re-attached handle
+            await link.change(s => { (s as any).engineDB.idea01.commands.push('ejectDisk d2') })
+            for (let i = 0; i < 50 && e.store.doc()?.engineDB?.idea01?.commands?.length !== 2; i++) await sleep(100)
+            expect(e.store.doc()?.engineDB?.idea01?.commands).toEqual(['copyApp kolibri', 'ejectDisk d2'])
+            expect(bystander.alive).toBe(true)
+            expect(sharedDocHost.unresponsiveMs()).toBeLessThan(5_000)
+        } finally {
+            await link.close(); await bystander.close(); await e.close(); await other.close()
+        }
+    }, 60_000)
+
+    it('r86q: reattach always answers — false with a reason when the Engine stays down', async () => {
+        const e = await startEngine('idea04', 20, 1)
+        const link = openStore(e)
+        try {
+            expect((await link.outcome()).kind).toBe('ready')
+            await e.close()
+            const t0 = Date.now()
+            expect(await link.reattach(1_500)).toBe(false)
+            expect(Date.now() - t0).toBeLessThan(4_000)
+            expect(link.lastReattachError).toMatch(/reattach: no WS peer/)
+        } finally { await link.close() }
+    }, 30_000)
+
+    it('r86q: a blocked host thread is named (heartbeat), not reported as a plain sync stall', async () => {
+        const host = new DocHost(new URL('data:text/javascript,' + encodeURIComponent(
+            "import { parentPort } from 'node:worker_threads'; parentPort.on('message', m => { if (m?.type === 'ping') parentPort.postMessage({ pong: m.t }); if (m?.type === 'block') { const u = Date.now() + 2500; while (Date.now() < u); } })")), 50, 100, 'test-host')
+        try {
+            host.open('store', {})
+            await sleep(300)
+            expect(host.unresponsiveMs()).toBeLessThan(1_000)
+            host.send({ type: 'block' })
+            await sleep(1_500)
+            expect(host.unresponsiveMs()).toBeGreaterThan(1_000)
+            await sleep(1_500)
+            expect(host.unresponsiveMs()).toBeLessThan(1_000)
+        } finally { await host.stop() }
+    }, 20_000)
 })

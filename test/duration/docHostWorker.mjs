@@ -19,6 +19,9 @@ process.on('unhandledRejection', (r) => {
 })
 
 parentPort.on('message', (m) => {
+    // r86q: liveness heartbeat. A pong only goes out when this thread's event loop runs, so a long
+    // synchronous Automerge apply in ANY session shows up on the main thread as a silent host.
+    if (m?.type === 'ping') { send({ pong: m.t }); return }
     if (m?.type === 'open') {
         const ch = m.ch
         const c = { kind: m.kind, handlers: [], closed: false }

@@ -7,7 +7,7 @@
  */
 import { Worker } from 'node:worker_threads'
 import type { Store } from '../../src/data/Store.js'
-import { sharedDocHost, perLinkWorkers, type WorkerLike } from './docHost.js'
+import { sharedDocHost, perLinkWorkers, DocChannel, type WorkerLike } from './docHost.js'
 
 export const STORE_DOC_WORKER_URL = new URL('./storeDocWorker.mjs', import.meta.url)
 
@@ -91,7 +91,7 @@ export class StoreDocLink {
         let settle!: (o: StoreOutcome) => void
         this.outcomeP = new Promise(r => { settle = r })
         const backstop = setTimeout(() => {
-            settle({ kind: 'stall', detail: `store worker gave no outcome ${Math.round(((o.backstopMs ?? 15_000) + Math.max(0, o.deadline - Date.now())) / 1000)}s (wall clock, main thread free)`, tookMs: -1 })
+            settle({ kind: 'stall', detail: `store worker gave no outcome ${Math.round(((o.backstopMs ?? 15_000) + Math.max(0, o.deadline - Date.now())) / 1000)}s (wall clock, main thread free)${this.hostState()}`, tookMs: -1 })
         }, Math.max(0, o.deadline - Date.now()) + (o.backstopMs ?? 15_000))
         backstop.unref()
         this.worker.on('message', (m: Record<string, unknown>) => {
@@ -145,6 +145,38 @@ export class StoreDocLink {
         this.lastSnapshotParseMs = performance.now() - t0
         this.snapHeads = Array.isArray(m.heads) ? (m.heads as string[]) : null
         this.snapshots++
+    }
+
+    /** r86q: names a frozen shared host thread in failure details (r86p: it was silent > 3 min). */
+    hostState(): string {
+        if (!(this.worker instanceof DocChannel)) return ''
+        const ms = this.worker.host.unresponsiveMs()
+        return ms > 5_000 ? `; ${this.worker.host.name} thread unresponsive for ${Math.round(ms / 1000)}s (event loop blocked)` : ''
+    }
+
+    /**
+     * r86q (Steve, r86p FAIL@42): after a WS close + adapter reconnect, re-sync the EXISTING handle in the
+     * worker instead of a fresh Repo + full doc wait. Resolves true once the worker reports an open peer and
+     * a ready handle (fresh snapshot taken), false with `lastReattachError` otherwise. Always settles within
+     * `ms` + 2 s, also when the worker never answers.
+     */
+    lastReattachError: string | null = null
+    reattach(ms: number): Promise<boolean> {
+        if (this.dead) { this.lastReattachError = this.dead.message; return Promise.resolve(false) }
+        const id = this.nextId++
+        return new Promise(resolve => {
+            const timer = setTimeout(() => {
+                this.pending.delete(id)
+                this.lastReattachError = `store worker for ${this.logicalId} did not answer reattach within ${ms + 2_000}ms${this.hostState()}`
+                resolve(false)
+            }, ms + 2_000)
+            this.pending.set(id, {
+                resolve: () => { this.lastReattachError = null; resolve(true) },
+                reject: e => { this.lastReattachError = e.message; resolve(false) },
+                timer,
+            })
+            this.worker.postMessage({ type: 'reattach', id, ms })
+        })
     }
 
     outcome(): Promise<StoreOutcome> { return this.outcomeP }
