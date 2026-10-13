@@ -236,6 +236,23 @@ export const runStabilityDuringDwell = async (
                 return true
             }
         }
+        // r86e FAIL@46: the Engine had already set the instance Undocked and the disk dockedTo=null (fresh
+        // read of the store afterwards), and the container had exited normally on eject. The walker's
+        // CACHED idea01 view never received that change (stale view; each re-read in r86d/r86e found new
+        // data). Before failing, distrust the cached view once: reconnect the engines that reported docker
+        // missing and judge a fresh sample. If the fresh store still says Running/Starting with no
+        // container, it fails loud as before.
+        const refresh = (opts.ops as { refreshView?: (e: string, why: string) => Promise<boolean | null> }).refreshView
+        if (typeof refresh === 'function') {
+            const stale = first.engines.filter(e => /docker missing/i.test(e.statusAnomaly ?? '')).map(e => e.id)
+            for (const e of stale.length ? stale : opts.engines) {
+                try { await refresh.call(opts.ops, e, `docker missing after ${settleMs}ms settle (${opts.justCompletedAction ?? 'op'}): re-read before failing`) } catch { /* fresh read below decides */ }
+            }
+            const fresh = await doProbe()
+            samples.push(fresh)
+            opts.onProbe?.(fresh)
+            if (fresh.ok || (isDockerMissingProbeFailure(fresh) && !await missingInstancesStillActive(opts, fresh))) return true
+        }
         // The samples are already in the returned log; fail conservatively when
         // the instance remained Running/Starting while its container stayed absent.
         return false
