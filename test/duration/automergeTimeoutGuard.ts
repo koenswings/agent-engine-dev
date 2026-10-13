@@ -290,6 +290,45 @@ export const trackRepo = (repo: TrackableRepo, via: string, url?: string): void 
     }
 }
 
+/**
+ * r86l: the store-doc Repo of a walker connection now lives in a worker thread (storeDocLink.ts), so its
+ * networkSubsystem cannot be observed here. RealFleetOps feeds the same facts (attempt, handshake
+ * open/close, store ready, abandoned) through this handle, so per-Engine WS facts and
+ * engineOpenNow / enginesServingStore stay correct.
+ */
+export interface LinkTracker {
+    peers(n: number): void
+    storeReady(): void
+    abandon(reason: string): void
+}
+export const trackWorkerLink = (via: string, url?: string): LinkTracker => {
+    const link = linkFor(via, url)
+    link.attempts++
+    link.firstAttemptAt ??= Date.now()
+    const entry: TrackedRepoEntry = {
+        repo: { handles: {} } as unknown as TrackableRepo, via, openPeers: new Set(),
+        abandoned: false, openWhenAbandoned: false, abandonReason: null, storeReady: false,
+    }
+    state.repos.push(entry)
+    return {
+        peers: (n: number) => {
+            const was = entry.openPeers.size
+            entry.openPeers.clear()
+            for (let i = 0; i < n; i++) entry.openPeers.add(`${via}-worker-peer-${i}`)
+            if (n > was) { link.opens += n - was; link.lastOpenAt = Date.now() }
+            if (n < was) { link.closes += was - n; link.lastCloseAt = Date.now() }
+        },
+        storeReady: () => { entry.storeReady = true; link.lastStoreReadyAt = Date.now() },
+        abandon: (reason: string) => {
+            if (entry.abandoned) return
+            entry.openWhenAbandoned = entry.openPeers.size > 0
+            entry.abandoned = true
+            entry.abandonReason = reason
+            entry.storeReady = false
+        },
+    }
+}
+
 /** The tracked Repo whose handle cache holds exactly this handle (null for stand-alone handles). */
 const ownerEntryOf = (handle: unknown, documentId: string): TrackedRepoEntry | null => {
     for (const e of state.repos) {

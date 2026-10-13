@@ -25,6 +25,12 @@ const kick = setInterval(() => {
     } catch { handle = null }
 }, 250)
 
+// r86l: per-worker memory for LOOPLAG.jsonl (RealFleetOps.threadMem).
+setInterval(() => {
+    const m = process.memoryUsage()
+    parentPort.postMessage({ event: 'mem', heapUsed: m.heapUsed, external: m.external, arrayBuffers: m.arrayBuffers })
+}, Number(workerData.memEveryMs ?? 15_000)).unref()
+
 const compact = (doc) => Object.entries(doc?.traces ?? {}).map(([id, raw]) => {
     const t = raw ?? {}
     return {

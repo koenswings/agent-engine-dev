@@ -27,6 +27,8 @@ import { instanceStoredOn } from './fixtureDisks.js'
 import { GATE_TOKEN, gateSecs, sshMutate, type GatedResult, type MutateResult, type MutateSpec } from './sshMutate.js'
 import { headsKey, recordReconnect, staleViewMs } from './staleView.js'
 import { CommandLogReader } from './commandLogReader.js'
+import { StoreDocLink } from './storeDocLink.js'
+import type { ThreadMem } from './verdict.js'
 import { $ } from 'zx'
 import type { Store } from '../../src/data/Store.js'
 import { runningInstanceExpectsLocalDocker } from './stability.js'
@@ -59,6 +61,7 @@ import {
     reportEngineUnreachable,
     reportOwnStoreStall,
     trackRepo,
+    trackWorkerLink,
 } from './automergeTimeoutGuard.js'
 import type {
     DiskInstanceRow,
@@ -307,6 +310,8 @@ export interface RealFleetOptions {
      * (unit tests on a box that has sudo).
      */
     sudoMode?: SudoMode
+    /** r86l: run the store-doc Repo in a worker thread (default true; env DURATION_STORE_IN_PROCESS=1 → false). */
+    storeInWorker?: boolean
 }
 
 /** Thrown when a pool Engine's WS never completes the automerge-repo handshake. */
@@ -415,9 +420,19 @@ const waitForHandshake = (repo: Repo, engine: string, url: string, ms: number): 
         ns.on('peer', onPeer)
     })
 
+/** DocHandle surface RealFleetOps uses: a real handle (in-process mode) or a StoreDocLink snapshot (worker mode). */
+interface StoreHandleLike {
+    doc(): Store | undefined
+    heads?(): string[] | null
+    change(fn: (s: Store) => void): void | Promise<void>
+}
+
 interface Conn {
-    repo: Repo
-    storeHandle: DocHandle<Store>
+    /** In-process mode only (DURATION_STORE_IN_PROCESS=1); null when the doc lives in a worker. */
+    repo: Repo | null
+    /** r86l worker mode (default): the store-doc Repo runs in storeDocWorker.mjs. */
+    link?: StoreDocLink
+    storeHandle: StoreHandleLike
     host: string
     logicalId: string
     liveEngineId: string | null
@@ -1290,6 +1305,8 @@ export class RealFleetOps implements FleetOps {
     private readonly onOwnStoreStall: (engine: string, docId: string, detail: string) => void
     /** Engines inside rebootEngine / reconnectEngine: a stall there is retried, not fatal. */
     private readonly rebootWindow = new Set<string>()
+    /** r86l: store-doc Repo in a worker thread (default). DURATION_STORE_IN_PROCESS=1 / storeInWorker:false = old in-process Repo. */
+    readonly storeInWorker: boolean
     /** Repos opened per engine (one per connection; tests assert reuse). */
     private readonly reposOpened = new Map<string, number>()
     /** logical pool id → live engineDB key */
@@ -1304,6 +1321,7 @@ export class RealFleetOps implements FleetOps {
     private readonly usedDevices = new Map<string, Set<string>>()
 
     constructor(opts: RealFleetOptions) {
+        this.storeInWorker = opts.storeInWorker ?? process.env.DURATION_STORE_IN_PROCESS !== '1'
         this.pool = [...opts.poolEngines]
         this.exclude = [...(opts.excludeEngines ?? [GOLDEN_DEFAULT])]
         if (!this.exclude.includes(GOLDEN_DEFAULT)) this.exclude.push(GOLDEN_DEFAULT)
@@ -1664,7 +1682,8 @@ export class RealFleetOps implements FleetOps {
         const c = this.conns.get(logicalId)
         if (!c) return
         this.conns.delete(logicalId)
-        await closeRepo(c.repo, reason)
+        if (c.link) await c.link.close(reason)
+        else if (c.repo) await closeRepo(c.repo, reason)
     }
 
     /**
@@ -1704,7 +1723,7 @@ export class RealFleetOps implements FleetOps {
     /** True when this engine's reused connection currently has an open WS handshake. */
     isWsOpen(logicalId: string): boolean {
         const c = this.conns.get(logicalId)
-        return !!c && c.repo.peers.length > 0
+        return !!c && (c.link ? c.link.peerCount > 0 : (c.repo?.peers.length ?? 0) > 0)
     }
 
     private discoverLiveEngineId(store: Store, logicalId: string): string | null {
@@ -1767,6 +1786,7 @@ export class RealFleetOps implements FleetOps {
         const docWaitMs = this.docWaitMsFor(logicalId)
         const started = Date.now()
         const deadline = started + this.wsHandshakeTimeoutMs + docWaitMs
+        if (this.storeInWorker) return this.openConnWorker(logicalId, host, docId, url, docWaitMs, started, deadline)
         for (;;) {
             this.reposOpened.set(logicalId, (this.reposOpened.get(logicalId) ?? 0) + 1)
             console.log(`[RealFleetOps] Connecting ${logicalId} at ${url} (doc ${docId}, doc wait ${docWaitMs}ms)`)
@@ -1832,6 +1852,75 @@ export class RealFleetOps implements FleetOps {
             // WS up, doc not ready: a real own-store stall.
             const detail = `store ${docId} not ready ${secs}s after connect (doc wait ${docWaitMs}ms, WS open; ${outcome.detail})`
             await closeRepo(repo, `sync stall: ${detail}`, true)
+            console.log(`[RealFleetOps] Connect ${logicalId} failed: sync stall: ${detail} [${describeEngineLink(logicalId)}]`)
+            if (!this.rebootWindow.has(logicalId)) this.onOwnStoreStall(logicalId, docId, detail)
+            throw new StoreSyncStallError(logicalId, url, detail)
+        }
+    }
+
+    /**
+     * r86l: openConn with the Repo in a worker thread. Same outcomes and fail-loud rules as the
+     * in-process path (ready / doc-unavailable → reopen / ws-closed or unreachable → EngineUnreachableError /
+     * stall → StoreSyncStallError + onOwnStoreStall); the bound is now a real wall-clock timer, because
+     * the main thread never applies the sync.
+     */
+    private async openConnWorker(
+        logicalId: string, host: string, docId: DocumentId, url: string, docWaitMs: number, started: number, deadline: number,
+    ): Promise<Conn> {
+        for (;;) {
+            this.reposOpened.set(logicalId, (this.reposOpened.get(logicalId) ?? 0) + 1)
+            console.log(`[RealFleetOps] Connecting ${logicalId} at ${url} (doc ${docId}, doc wait ${docWaitMs}ms, off-thread)`)
+            registerOwnDoc(docId, 'store', logicalId)
+            void this.registerOwnCommandLog(logicalId, host)
+            const hsMs = Math.max(1, Math.min(this.wsHandshakeTimeoutMs, deadline - Date.now()))
+            const tracker = trackWorkerLink(logicalId, url)
+            const link = new StoreDocLink({
+                logicalId, url, docId: String(docId), deadline, handshakeMs: hsMs,
+                backstopMs: CONNECT_OVERRUN_GRACE_MS,
+                onWs: (kind, detail) => noteEngineWs(logicalId, kind, detail, url),
+                onPeers: n => tracker.peers(n),
+            })
+            link.onClose = reason => tracker.abandon(reason)
+            let outcome = await link.outcome()
+            const now = Date.now()
+            const overrunMs = now - deadline
+            const mu = process.memoryUsage()
+            console.log(JSON.stringify({
+                event: 'store_sync_measured', engine: logicalId, docId, outcome: outcome.kind, offThread: true,
+                tookMs: now - started, docWaitMs, overrunMs: Math.max(0, overrunMs),
+                walkerRssMb: Math.round(mu.rss / 1048576), walkerHeapUsedMb: Math.round(mu.heapUsed / 1048576),
+                workerHeapMb: link.mem ? Math.round(link.mem.heapUsed / 1048576) : null,
+                snapshotParseMs: Math.round(link.lastSnapshotParseMs),
+            }))
+            if (outcome.kind === 'ready' && overrunMs > CONNECT_OVERRUN_GRACE_MS) {
+                outcome = { kind: 'stall', tookMs: outcome.tookMs, detail: `doc ready only ${Math.round((now - started) / 1000)}s after connect, ` +
+                    `${Math.round(overrunMs / 1000)}s past the bound (off-thread; walker rss ${Math.round(mu.rss / 1048576)} MB)` }
+            }
+            if (outcome.kind === 'ready' && link.doc()) {
+                const store = link.doc()!
+                const liveEngineId = this.discoverLiveEngineId(store, logicalId)
+                this.rememberMapping(logicalId, liveEngineId)
+                console.log(`[RealFleetOps] Connected ${logicalId} → liveEngineId=${liveEngineId ?? 'unknown'} (store ready in ${Date.now() - started}ms, off-thread)`)
+                tracker.storeReady()
+                const conn: Conn = { repo: null, link, storeHandle: link, host, logicalId, liveEngineId, storeDocId: docId }
+                this.conns.set(logicalId, conn)
+                return conn
+            }
+            await link.close(`connect ${outcome.kind}`)
+            if (outcome.kind === 'doc-unavailable' && Date.now() + 1_000 < deadline) {
+                await sleep(1_000)
+                continue
+            }
+            const secs = Math.round((Date.now() - started) / 1000)
+            if (outcome.kind === 'unreachable' || outcome.kind === 'ws-closed') {
+                const detail = outcome.kind === 'unreachable'
+                    ? `${outcome.detail}${getEngineLink(logicalId)?.lastError ? ` (last ${getEngineLink(logicalId)!.lastError})` : ''}`
+                    : `WS dropped during store sync and did not come back within ${secs}s (${outcome.detail}; last ${getEngineLink(logicalId)?.lastError ?? 'error none'})`
+                const msg = this.rebootWindow.has(logicalId) ? detail : reportEngineUnreachable(logicalId)
+                console.log(`[RealFleetOps] Connect ${logicalId} failed: ${msg}`)
+                throw new EngineUnreachableError(logicalId, url, detail)
+            }
+            const detail = `store ${docId} not ready ${secs}s after connect (doc wait ${docWaitMs}ms, WS open, off-thread; ${outcome.kind === 'ready' ? 'no snapshot' : outcome.detail})`
             console.log(`[RealFleetOps] Connect ${logicalId} failed: sync stall: ${detail} [${describeEngineLink(logicalId)}]`)
             if (!this.rebootWindow.has(logicalId)) this.onOwnStoreStall(logicalId, docId, detail)
             throw new StoreSyncStallError(logicalId, url, detail)
@@ -2096,6 +2185,8 @@ export class RealFleetOps implements FleetOps {
 
     /** Resolve true once this connection's Repo has an open WS peer, false after `ms`. */
     private async waitWsOpen(conn: Conn, ms: number): Promise<boolean> {
+        if (conn.link) return conn.link.waitPeer(ms)
+        if (!conn.repo) return false
         if (conn.repo.peers.length > 0) return true
         try {
             await waitForHandshake(conn.repo, conn.logicalId, `ws://${conn.host}:${this.enginePort}`, ms)
@@ -2116,6 +2207,21 @@ export class RealFleetOps implements FleetOps {
 
     private readonly viewSeen = new Map<string, { heads: string; changedAt: number }>()
     private readonly commandLogReaders = new Map<string, CommandLogReader>()
+
+    /** r86l: memory of every Automerge worker thread (store doc + CommandLog) for LOOPLAG.jsonl. */
+    threadMem(): ThreadMem[] {
+        const mb = (b: number) => Math.round(b / 1048576)
+        const out: ThreadMem[] = []
+        for (const [id, c] of this.conns) {
+            const m = c.link?.mem
+            if (m) out.push({ thread: `store:${id}`, heapUsedMb: mb(m.heapUsed), externalMb: mb(m.external), arrayBuffersMb: mb(m.arrayBuffers), ageMs: Date.now() - m.at })
+        }
+        for (const [id, r] of this.commandLogReaders) {
+            const m = r.mem
+            if (m && r.alive) out.push({ thread: `commandLog:${id}`, heapUsedMb: mb(m.heapUsed), externalMb: mb(m.external), arrayBuffersMb: mb(m.arrayBuffers), ageMs: Date.now() - m.at })
+        }
+        return out
+    }
 
     private headsOf(c: Conn): string[] | null {
         try {
@@ -2556,7 +2662,7 @@ export class RealFleetOps implements FleetOps {
      */
     async changeStore(logicalId: string, conn: Conn, what: string, fn: (s: Store) => void): Promise<Conn> {
         try {
-            conn.storeHandle.change(fn)
+            await conn.storeHandle.change(fn)
             return conn
         } catch (e) {
             const first = e instanceof Error ? e.message : String(e)
@@ -2567,7 +2673,7 @@ export class RealFleetOps implements FleetOps {
                 throw new StoreWriteError(`${what} on ${logicalId}: store write failed (${first}) and the reconnect gave no fresh connection — command NOT sent. Fail loud.`)
             }
             try {
-                fresh.storeHandle.change(fn)
+                await fresh.storeHandle.change(fn)
                 return fresh
             } catch (e2) {
                 throw new StoreWriteError(`${what} on ${logicalId}: store write failed twice (${first}; after reconnect: ${e2 instanceof Error ? e2.message : String(e2)}) — command NOT sent. Fail loud.`)

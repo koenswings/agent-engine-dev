@@ -76,34 +76,66 @@ export interface WatchdogOpts {
     beatMs?: number
     /** Test hook: do not SIGKILL, post 'stalled' to the parent instead. */
     noKill?: boolean
+    /** r86l soft RSS guard: FAIL loud when the walker's VmRSS reaches this (default DURATION_RSS_LIMIT_MB or 3000 MB; idea02 has 3.8 GB). 0 = off. */
+    rssLimitMb?: number
+    /** r86l soft RSS guard: FAIL loud when the host's MemAvailable drops below this (default DURATION_MEM_AVAIL_MIN_MB or 300 MB). 0 = off. */
+    memAvailMinMb?: number
+    /** r86l: write a process RSS sample to LOOPLAG.jsonl this often, lag or not (default DURATION_RSS_SAMPLE_MS or 30 s). */
+    rssSampleMs?: number
+}
+
+/** r86l: thresholds from env (idea02 ~3.8 GB RAM; r86l reached 2.0 GB RSS with 674 MB available). */
+export const rssGuardDefaults = (env: NodeJS.ProcessEnv = process.env): { rssLimitMb: number; memAvailMinMb: number; rssSampleMs: number } => {
+    const n = (v: string | undefined, d: number) => { const x = Number(v); return v !== undefined && v !== '' && Number.isFinite(x) && x >= 0 ? x : d }
+    return {
+        rssLimitMb: n(env.DURATION_RSS_LIMIT_MB, 3000),
+        memAvailMinMb: n(env.DURATION_MEM_AVAIL_MIN_MB, 300),
+        rssSampleMs: n(env.DURATION_RSS_SAMPLE_MS, 30_000),
+    }
 }
 
 const WORKER_SRC = `
 const { workerData, parentPort } = require('node:worker_threads')
 const fs = require('node:fs'); const path = require('node:path')
 const f64 = new Float64Array(workerData.sab)
-const { dir, stallMs, lagLogMs, noKill } = workerData
-let worst = 0, lastLogged = 0
+const { dir, stallMs, lagLogMs, noKill, rssLimitKb, memAvailMinKb, rssSampleMs } = workerData
+let worst = 0, lastLogged = 0, lastSample = 0
 const mem = () => { try { const s = fs.readFileSync('/proc/' + process.pid + '/status', 'utf8'); const g = k => (s.match(new RegExp(k + ':\\\\s+(\\\\d+)')) || [])[1]; return { rssKb: +g('VmRSS') || null, hwmKb: +g('VmHWM') || null, swapKb: +g('VmSwap') || null } } catch { return {} } }
 const sysMem = () => { try { const s = fs.readFileSync('/proc/meminfo', 'utf8'); const g = k => +((s.match(new RegExp(k + ':\\\\s+(\\\\d+)')) || [])[1]); return { memAvailKb: g('MemAvailable'), swapFreeKb: g('SwapFree') } } catch { return {} } }
+const fail = (source, reason, step) => {
+  f64[2] = 1
+  const line = JSON.stringify({ event: 'duration_verdict', ts: new Date().toISOString(), status: 'FAIL', reason, step, source }) + '\\n'
+  if (dir) {
+    try { const t = path.join(dir, 'RESULT.txt.tmp'); const fd = fs.openSync(t, 'w'); fs.writeSync(fd, 'FAIL step=' + (step ?? '?') + ' source=' + source + '\\n' + reason + '\\n'); fs.fsyncSync(fd); fs.closeSync(fd); fs.renameSync(t, path.join(dir, 'RESULT.txt')) } catch {}
+    try { fs.appendFileSync(path.join(dir, 'run.log'), line) } catch {}
+  }
+  if (noKill) parentPort.postMessage({ stalled: true, source, reason })
+  else process.kill(process.pid, 'SIGKILL')
+}
 const tick = () => {
   const hb = f64[0]; if (!hb) return
   const lag = Date.now() - hb
+  const m = mem(), sm = sysMem()
+  // r86l: periodic RSS sample + soft RSS guard (here, so both work while the main loop is blocked).
+  if (rssSampleMs > 0 && Date.now() - lastSample >= rssSampleMs) {
+    lastSample = Date.now()
+    if (dir) try { fs.appendFileSync(path.join(dir, 'LOOPLAG.jsonl'), JSON.stringify({ ts: new Date().toISOString(), kind: 'rss', lagMs: lag, step: f64[1] || null, ...m, ...sm }) + '\\n') } catch {}
+  }
+  if (f64[2] !== 1 && ((rssLimitKb > 0 && m.rssKb >= rssLimitKb) || (memAvailMinKb > 0 && sm.memAvailKb > 0 && sm.memAvailKb < memAvailMinKb))) {
+    const step = f64[1] || null
+    const what = rssLimitKb > 0 && m.rssKb >= rssLimitKb
+      ? 'walker RSS ' + Math.round(m.rssKb / 1024) + ' MB reached the soft limit ' + Math.round(rssLimitKb / 1024) + ' MB'
+      : 'host MemAvailable ' + Math.round(sm.memAvailKb / 1024) + ' MB below the floor ' + Math.round(memAvailMinKb / 1024) + ' MB'
+    fail('rss-guard', what + ' at step ' + (step ?? '?') + ': failing loud before the OOM killer ' + JSON.stringify({ lagMs: lag, ...m, ...sm }), step)
+    return
+  }
   if (lag >= lagLogMs && lag - lastLogged >= lagLogMs) {
     lastLogged = lag; worst = Math.max(worst, lag)
-    if (dir) try { fs.appendFileSync(path.join(dir, 'LOOPLAG.jsonl'), JSON.stringify({ ts: new Date().toISOString(), lagMs: lag, step: f64[1] || null, ...mem(), ...sysMem() }) + '\\n') } catch {}
+    if (dir) try { fs.appendFileSync(path.join(dir, 'LOOPLAG.jsonl'), JSON.stringify({ ts: new Date().toISOString(), lagMs: lag, step: f64[1] || null, ...m, ...sm }) + '\\n') } catch {}
   } else if (lag < lagLogMs) lastLogged = 0
   if (lag >= stallMs && f64[2] !== 1) {
-    f64[2] = 1
     const step = f64[1] || null
-    const reason = 'walker event loop blocked ' + Math.round(lag / 1000) + 's (limit ' + Math.round(stallMs / 1000) + 's) at step ' + (step ?? '?') + ': no in-process timer can fire; killed by loop watchdog ' + JSON.stringify({ ...mem(), ...sysMem() })
-    const line = JSON.stringify({ event: 'duration_verdict', ts: new Date().toISOString(), status: 'FAIL', reason, step, source: 'loop-watchdog' }) + '\\n'
-    if (dir) {
-      try { const t = path.join(dir, 'RESULT.txt.tmp'); const fd = fs.openSync(t, 'w'); fs.writeSync(fd, 'FAIL step=' + (step ?? '?') + ' source=loop-watchdog\\n' + reason + '\\n'); fs.fsyncSync(fd); fs.closeSync(fd); fs.renameSync(t, path.join(dir, 'RESULT.txt')) } catch {}
-      try { fs.appendFileSync(path.join(dir, 'run.log'), line) } catch {}
-    }
-    if (noKill) parentPort.postMessage({ stalled: true, reason })
-    else process.kill(process.pid, 'SIGKILL')
+    fail('loop-watchdog', 'walker event loop blocked ' + Math.round(lag / 1000) + 's (limit ' + Math.round(stallMs / 1000) + 's) at step ' + (step ?? '?') + ': no in-process timer can fire; killed by loop watchdog ' + JSON.stringify({ ...m, ...sm }), step)
   }
 }
 setInterval(tick, Math.min(1000, Math.max(50, Math.floor(lagLogMs / 2))))
@@ -114,13 +146,17 @@ export const startLoopWatchdog = (o: WatchdogOpts): { stop: () => Promise<void>;
     const stallMs = o.stallMs ?? Number(process.env.DURATION_LOOP_STALL_MS ?? 150_000)
     const lagLogMs = o.lagLogMs ?? 5_000
     const beatMs = o.beatMs ?? 1_000
+    const g = rssGuardDefaults()
+    const rssLimitKb = Math.round((o.rssLimitMb ?? g.rssLimitMb) * 1024)
+    const memAvailMinKb = Math.round((o.memAvailMinMb ?? g.memAvailMinMb) * 1024)
+    const rssSampleMs = o.rssSampleMs ?? g.rssSampleMs
     f64[0] = Date.now()
     const beat = setInterval(() => { f64[0] = Date.now() }, beatMs)
     beat.unref()
     // A .cjs file, not eval: eval workers inherit the parent's module mode (ESM / tsx) and lose require.
     const file = join(mkdtempSync(join(tmpdir(), 'duration-loop-watchdog-')), 'watchdog.cjs')
     writeFileSync(file, WORKER_SRC)
-    const worker = new Worker(file, { workerData: { sab, dir: o.dir, stallMs, lagLogMs, noKill: !!o.noKill }, execArgv: [] })
+    const worker = new Worker(file, { workerData: { sab, dir: o.dir, stallMs, lagLogMs, noKill: !!o.noKill, rssLimitKb, memAvailMinKb, rssSampleMs }, execArgv: [] })
     worker.on('error', e => { try { process.stderr.write(`[duration] loop watchdog error: ${e instanceof Error ? e.message : String(e)}\n`) } catch { /* ignore */ } })
     worker.unref()
     return {
@@ -149,4 +185,25 @@ export const installVerdictGuards = (): void => {
     process.on('exit', code => {
         writeVerdict({ status: 'FAIL', reason: `walker exited with code ${code} without a verdict`, source: 'exit' })
     })
+}
+
+/**
+ * r86l: per-thread memory into LOOPLAG.jsonl from the main thread (now free: no Automerge apply here).
+ * RSS is per process; each Automerge worker reports its own isolate heap / external / arrayBuffers.
+ */
+export interface ThreadMem { thread: string; heapUsedMb: number; externalMb: number; arrayBuffersMb: number; ageMs?: number }
+export const startMemSampler = (dir: string | null, threads: () => ThreadMem[], everyMs = rssGuardDefaults().rssSampleMs): (() => void) => {
+    if (!dir || everyMs <= 0) return () => {}
+    const mb = (b: number) => Math.round(b / 1048576)
+    const t = setInterval(() => {
+        const m = process.memoryUsage()
+        const row = {
+            ts: new Date().toISOString(), kind: 'threads', step: currentStep(),
+            main: { rssMb: mb(m.rss), heapUsedMb: mb(m.heapUsed), externalMb: mb(m.external), arrayBuffersMb: mb(m.arrayBuffers) },
+            workers: (() => { try { return threads() } catch { return [] } })(),
+        }
+        try { appendFileSync(join(dir, 'LOOPLAG.jsonl'), JSON.stringify(row) + '\n') } catch { /* ignore */ }
+    }, everyMs)
+    t.unref()
+    return () => clearInterval(t)
 }

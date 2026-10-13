@@ -14,14 +14,19 @@ export class CommandLogReader {
     private pending = new Map<number, { resolve: (t: DurationCommandTrace[]) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>()
     private dead: Error | null = null
     readyMs: number | null = null
+    mem: { heapUsed: number; external: number; arrayBuffers: number; at: number } | null = null
 
     constructor(readonly engine: string, readonly wsUrl: string, readonly docUrl: string, log: (s: string) => void = console.log) {
         this.worker = new Worker(COMMAND_LOG_WORKER_URL, {
-            workerData: { wsUrl, docUrl, peerId: `duration-cl-${engine}-${Date.now()}` },
+            workerData: { wsUrl, docUrl, peerId: `duration-cl-${engine}-${Date.now()}`, memEveryMs: Number(process.env.DURATION_WORKER_MEM_MS ?? 15_000) },
             execArgv: [], // plain .mjs: no tsx loader needed in the worker
         })
         this.worker.unref()
-        this.worker.on('message', (m: { id?: number; event?: string; ms?: number; traces?: DurationCommandTrace[]; error?: string }) => {
+        this.worker.on('message', (m: { id?: number; event?: string; ms?: number; traces?: DurationCommandTrace[]; error?: string; heapUsed?: number; external?: number; arrayBuffers?: number }) => {
+            if (m.event === 'mem') {
+                this.mem = { heapUsed: m.heapUsed ?? 0, external: m.external ?? 0, arrayBuffers: m.arrayBuffers ?? 0, at: Date.now() }
+                return
+            }
             if (m.event === 'ready') {
                 this.readyMs = m.ms ?? null
                 log(JSON.stringify({ event: 'command_log_synced_off_thread', engine, docUrl, ms: m.ms }))

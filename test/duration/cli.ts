@@ -55,7 +55,7 @@ import {
     type PeerPreflightResult,
 } from './peerPreflight.js'
 import { resolveConsoleEngineHost } from './actions.js'
-import { installVerdictGuards, setCurrentStep, setVerdictDir, startLoopWatchdog, writeVerdict } from './verdict.js'
+import { installVerdictGuards, setCurrentStep, setVerdictDir, startLoopWatchdog, startMemSampler, writeVerdict } from './verdict.js'
 import {
     buildRunSummary,
     formatRunSummaryLine,
@@ -390,7 +390,10 @@ const main = async () => {
             startInstances: args.startInstances,
         }
         // Stage 2 (DURATION_STAGE=2): real SSD partitions via stage2-dock.sh; Stage 1 unchanged otherwise.
-        ops = durationStage === 2 ? new Stage2FleetOps(opsOpts) : new RealFleetOps(opsOpts)
+        const real = durationStage === 2 ? new Stage2FleetOps(opsOpts) : new RealFleetOps(opsOpts)
+        ops = real
+        // r86l: per-thread memory (main + every Automerge worker) into LOOPLAG.jsonl.
+        startMemSampler(process.env.DURATION_EVIDENCE_DIR?.trim() || null, () => real.threadMem())
     } else {
         ops = new FakeFleetOps({
             poolEngines: pool,
