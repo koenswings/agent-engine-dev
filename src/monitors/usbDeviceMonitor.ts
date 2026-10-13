@@ -406,15 +406,20 @@ export const undockAllOnDevice = async (storeHandle: DocHandle<Store>, engineId:
         storeHandle.change(doc => { cleared = clearDuplicateDiskRecords(doc, engineId, device, primary.id) })
         log(`Undocked stale disk record(s) ${cleared.join(', ')} on ${device}`)
     }
-    await undockDisk(storeHandle, primary)
+    // Device-removal path: the disk is already gone, so no in-flight wait (#179 applies to eject).
+    await undockDisk(storeHandle, primary, { waitInFlight: false })
     return [primary.id, ...cleared]
 }
 
-export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
+export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk, opts: { waitInFlight?: boolean } = {}) => {
     const device0 = disk.device
     // #179: an instance start/install still running on this disk must settle first (bounded),
     // then it is stopped below. Otherwise it carries on against the unmounted disk (r82b/r83).
-    if (device0 && !(await isSystemDiskRecord(disk))) {
+    // Only for an Engine-initiated undock (ejectDisk, erase), where the disk is still there and
+    // the Engine itself unmounts it. After a physical removal (device gone, undockAllOnDevice
+    // from the monitor) the disk is already gone: waiting cannot help the start and would only
+    // keep the pulled disk listed as docked for up to the bound (disk-dock-undock).
+    if (opts.waitInFlight !== false && device0 && !(await isSystemDiskRecord(disk))) {
         const w = await waitInFlightOnDisk(String(disk.id), ejectInFlightWaitMs())
         if (w.timedOut.length) log(`Undock ${disk.id}: still in flight after ${w.waitedMs}ms (${w.timedOut.join(', ')}) — stopping anyway`)
         else if (w.waitedMs > 0) log(`Undock ${disk.id}: in-flight start(s) settled after ${w.waitedMs}ms`)

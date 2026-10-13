@@ -139,10 +139,19 @@ describe('installApp <appId> <targetDiskId> [--source <sourceDiskId>] (idea#128)
     const run = async (cmd: string) => { const log = newLog(); await handleCommand(commands, h, 'engine', cmd, log); return lastTrace(log) }
 
     it('by id: stale --source missing bundle does not hard-fail on source path (Prefer A r31)', async () => {
-        const t = await run('installApp kolibri-1.0 tgt-id --source src-id --name my-kolibri')
-        // Must not be the old Route-1 hard-fail; falls through to GitHub / alt disk
-        expect(t.errorMessage ?? '').not.toMatch(/not found on disk 'Catalog' at .*\/apps\/kolibri-1\.0/)
-        expect(warn).not.toHaveBeenCalled()
+        // Offline: this test is about --source resolution only. Online, the GitHub route now
+        // builds AND starts a real Kolibri (#178), which is not what this unit covers.
+        const prev = process.env.IDEA_INSTALL_FORCE_OFFLINE
+        process.env.IDEA_INSTALL_FORCE_OFFLINE = 'true'
+        try {
+            const t = await run('installApp kolibri-1.0 tgt-id --source src-id --name my-kolibri')
+            // Must not be the old Route-1 hard-fail; falls through to GitHub / alt disk
+            expect(t.errorMessage ?? '').not.toMatch(/not found on disk 'Catalog' at .*\/apps\/kolibri-1\.0/)
+            expect(warn).not.toHaveBeenCalled()
+        } finally {
+            if (prev === undefined) delete process.env.IDEA_INSTALL_FORCE_OFFLINE
+            else process.env.IDEA_INSTALL_FORCE_OFFLINE = prev
+        }
     })
     it('by id: installs from the source onto the chosen one of two same-named disks', async () => {
         await fs.ensureDir(`${DISKS_ROOT}/${src}/apps/demo-1.0`)
@@ -166,9 +175,18 @@ describe('installApp <appId> <targetDiskId> [--source <sourceDiskId>] (idea#128)
         }
     })
     it('by name: a unique source name resolves with a deprecation warning', async () => {
-        const t = await run('installApp kolibri-1.0 tgt-id --source Catalog')
-        expect(t.errorMessage ?? '').not.toMatch(/not found on disk 'Catalog' at .*\/apps\/kolibri-1\.0/)
-        expect(warn).toHaveBeenCalledWith(expect.stringContaining("installApp --source: disk 'Catalog' was given by name"))
+        // Offline: this test is about --source resolution only. Online, the GitHub route now
+        // builds AND starts a real Kolibri (#178), which is not what this unit covers.
+        const prev = process.env.IDEA_INSTALL_FORCE_OFFLINE
+        process.env.IDEA_INSTALL_FORCE_OFFLINE = 'true'
+        try {
+            const t = await run('installApp kolibri-1.0 tgt-id --source Catalog')
+            expect(t.errorMessage ?? '').not.toMatch(/not found on disk 'Catalog' at .*\/apps\/kolibri-1\.0/)
+            expect(warn).toHaveBeenCalledWith(expect.stringContaining("installApp --source: disk 'Catalog' was given by name"))
+        } finally {
+            if (prev === undefined) delete process.env.IDEA_INSTALL_FORCE_OFFLINE
+            else process.env.IDEA_INSTALL_FORCE_OFFLINE = prev
+        }
     })
     it('ambiguous target name: refused, trace error, nothing written', async () => {
         const t = await run('installApp kolibri-1.0 IDEA_Disk --source src-id')
