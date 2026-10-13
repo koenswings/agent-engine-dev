@@ -45,6 +45,7 @@
  *     --inflight-disk <d>   case 3 target partition: disk id or name (e.g. duration-empty-003);
  *                           refuses when the instance is stored elsewhere (default: the
  *                           instance's own storedOn, which must be on the test disk)
+ *     --eject-wait <s>      max wait for an ejectDisk trace (default 150; > the 120 s in-flight bound)
  *     --cycles 0            skip the eject cycles (case 3 only, plus the system checks)
  *
  * Example (idea04, Kolibri installed on empty-003 = sda2 first; IDs via the flags since
@@ -91,6 +92,10 @@ const CYCLES = parseInt(opt('cycles', '2'), 10)
 const METHOD = opt('method', 'unbind')
 const TIMEOUT_MS = parseInt(opt('timeout', '60'), 10) * 1000
 const INFLIGHT_START = opt('inflight-start', '')
+// #179: ejectDisk waits (bounded, IDEA_EJECT_INFLIGHT_WAIT_MS default 120 s) for an instance start
+// still in flight on the disk, e.g. the app restart after the previous cycle's re-dock. The eject
+// trace wait must outlast that bound, or the test unplugs in the middle of an eject (hw180 run 1).
+const EJECT_TRACE_WAIT_MS = parseInt(opt('eject-wait', '150'), 10) * 1000
 const INFLIGHT_DISK = opt('inflight-disk', '')
 const STICK_CONFIG = path.resolve(opt('stick-config', path.join(ROOT, 'script', 'hw-roundtrip-disks.json')))
 let DEVICE = ''
@@ -230,7 +235,7 @@ const waitTrace = async (arg: string, t0: number): Promise<any | null> => {
             && (() => { try { return JSON.parse(t.args).diskId === arg } catch { return false } })()
             && t.status !== 'running' && t.completedAt) ?? null
         return !!found
-    }, 30000)
+    }, EJECT_TRACE_WAIT_MS)
     return found
 }
 
