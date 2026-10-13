@@ -858,7 +858,7 @@ describe('RealFleetOps guard clauses (no network)', () => {
         await expect(ops.rebootEngine('idea02', true)).rejects.toThrow(/excluded|golden/)
         await expect(ops.applyStoreMode('shared')).resolves.toBeUndefined()
         expect(ops.getStoreMode()).toBe('shared')
-        await expect(ops.applyStoreMode('unique')).rejects.toThrow(/store_mode 'unique' refused on the live pool.*3zoqd/)
+        await expect(ops.applyStoreMode('unique')).rejects.toThrow(/store_mode 'unique' refused on the live pool.*2VroE/)
         expect(ops.getStoreMode()).toBe('shared')
         // default (no storeMode) is shared; unique at construction is refused
         expect(new RealFleetOps({ poolEngines: ['idea01'], excludeEngines: ['idea02'], hosts: fakeHosts }).getStoreMode()).toBe('shared')
@@ -2598,7 +2598,7 @@ describe('r29 FAIL@97: follow the store host for Kolibri/NC sidecars; restore mu
         await withEnv({}, async () => {
             const ops = await r29Fleet('idea01')
             const ctx = ctxFor(ops, 'idea03', 'restore_from_backup') as any
-            expect(await locateInstanceEngine(ctx, 'kolibri-grade5a-001', KOLIBRI)).toEqual({ engine: 'idea01', diskId: KOLIBRI, live: true })
+            expect(await locateInstanceEngine(ctx, 'kolibri-grade5a-001', KOLIBRI)).toEqual({ engine: 'idea01', diskId: KOLIBRI, live: true, status: 'Running' }) // + store status (Stage 2 owner check)
             await ops.undockFixtures(['idea01'], KOLIBRI)
             expect((await locateInstanceEngine(ctx, 'kolibri-grade5a-001', KOLIBRI)).engine).toBeNull()
             const golden = Object.assign(Object.create(ops), {
@@ -3119,6 +3119,8 @@ describe('r30: real backup_instance before restore_from_backup (op Done + archiv
             disksRoot: '/home/pi/idea/duration-disks',
             hostOf: (e: string) => e,
             ssh: async (_h: string, cmd: string) => { cmds.push(cmd); return out },
+            // r63: read-only probes go through sshRead (transport retry); same fake.
+            sshRead: async (_h: string, cmd: string) => { cmds.push(cmd); return out },
         })
         const probe = (RealFleetOps.prototype as any).probeBackupDisk
         const ok = await probe.call(self(`${yaml(7)}@@REPO@@\nREADME\nconfig\ndata\n`), 'idea01', EMPTY2, INST)
@@ -3273,9 +3275,24 @@ describe('r30: move_app same-Pi preflight (Eng 8d98718 refuses cross-engine move
             const r = await dispatchAction(ctxFor(ops, 'move_app', driver, 'idea01') as any)
             expect(r.ok).toBe(false)
             expect(r.message).toMatch(
-                /^move_app aborted before Intent: move_app preflight: cross-engine move kolibri-grade5a-001 on idea03 \(disk duration-kolibri-grade5a-001\) -> duration-nextcloud-grade5a-001 on idea01; Engine refuses cross-engine moveApp/,
+                /^move_app aborted before Intent: move_app preflight: cross-engine move kolibri-grade5a-001 on idea03 \(disk duration-kolibri-grade5a-001\) -> duration-nextcloud-grade5a-001 on idea01; the Engine refuses cross-engine moveApp/,
             )
             expect(seen).toEqual([])
+        })
+    })
+
+    it('r86f FAIL@102: Kolibri on idea04 (after @62), Nextcloud on idea03 → loud refusal names the only same-Pi disk and cites the pinned Engine text, not 8d98718:399-405', async () => {
+        await withEnv({}, async () => {
+            const ops = await fleet('idea04', 'idea03')
+            await ops.dockFixture('idea04', 'duration-empty-002')
+            const pair = await predictCopyMovePair(ctxFor(ops, 'move_app') as any, { instanceId: INST, diskId: KOLIBRI })
+            expect(pair).toMatchObject({ sourceEngine: 'idea04', targetDiskId: NC, targetEngine: 'idea03', sameEngineOthers: ['duration-empty-002'] })
+            const err = await preflightCopyMoveSamePi(ctxFor(ops, 'move_app') as any, 'move_app', { instanceId: INST, diskId: KOLIBRI }).catch(e => e as Error)
+            expect(err).toBeInstanceOf(Error)
+            expect((err as Error).message).toMatch(/cross-engine move kolibri-grade5a-001 on idea04 \(disk duration-kolibri-grade5a-001\) -> duration-nextcloud-grade5a-001 on idea03/)
+            expect((err as Error).message).toContain('Same-Pi candidates: other disks docked on idea04: duration-empty-002')
+            expect((err as Error).message).toContain('Cross-engine move is not supported')
+            expect((err as Error).message).not.toMatch(/8d98718|399-405/)
         })
     })
 
@@ -3294,14 +3311,14 @@ describe('r30: move_app same-Pi preflight (Eng 8d98718 refuses cross-engine move
         })
     })
 
-    it('copy_app: cross-engine pair is reported, not refused (Eng 8d98718 copyApp Phase 2 supports remote targets)', async () => {
+    it('copy_app: cross-engine pair is reported, not refused (Engine copyApp supports remote targets)', async () => {
         await withEnv({}, async () => {
             const ops = await fleet('idea03')
             const { driver, seen } = clickDriver()
             const r = await dispatchAction({ ...ctxFor(ops, 'copy_app', driver, 'idea03'), from: 'op_instance' } as any)
             expect(r.ok, r.message).toBe(true)
             expect(seen).toEqual(['copy_app'])
-            expect(r.message).toMatch(/copy_app preflight: cross-engine copy kolibri-grade5a-001 on idea03 \(disk duration-kolibri-grade5a-001\) -> duration-nextcloud-grade5a-001 on idea01 \(Eng 8d98718 copyApp Phase 2 supports it\)/)
+            expect(r.message).toMatch(/copy_app preflight: cross-engine copy kolibri-grade5a-001 on idea03 \(disk duration-kolibri-grade5a-001\) -> duration-nextcloud-grade5a-001 on idea01 \(Engine copyApp supports cross-engine targets\)/)
         })
     })
 
@@ -3769,7 +3786,7 @@ describe('idea#168 run summary: shake-out labelling + keep_editing recovery coun
         expect(s.lastStep).toEqual({ step: 128, action: 'reboot_engine' })
         expect(shakeOutSummary(walk)).toBeNull()
         expect(shakeOutSummary(null)).toBeNull()
-        expect(formatRunSummaryLine(s)).toBe('[duration] summary: cover-all steps=128 failures=0 | last step @128 reboot_engine | keep_editing recoveries: 0')
+        expect(formatRunSummaryLine(s)).toBe('[duration] summary: cover-all steps=128 failures=0 | last step @128 reboot_engine | keep_editing recoveries: 0 | stale-view reconnects: 0')
     })
 
     // Exact lines the Console keep_editing Intent prints (agent-console d637b83 nextcloudDeep.ts).

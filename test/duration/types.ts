@@ -71,6 +71,8 @@ export interface SemanticInstance {
     status: string
     diskId: string | null
     name?: string
+    /** Stage 2: published sidecar port from the store (kolibri 18080, nextcloud 61820). Not part of convergence equality. */
+    port?: number
 }
 
 export interface SemanticDisk {
@@ -82,11 +84,15 @@ export interface SemanticDisk {
     diskTypes?: string[]
     /** r30: Backup Disk backupConfig.links (instance ids). Not part of convergence equality. */
     backupLinks?: string[]
+    /** r61: Engine's last (re)processing of this disk, ms since epoch (Pi clock). Not part of convergence equality. */
+    lastDocked?: number
 }
 
 export interface SemanticEngine {
     id: string
     hostname?: string
+    /** Engine PR #166: school-LAN IPv4 (absent on older Engines). Console #139 Open uses it. */
+    lanAddress?: string | null
 }
 
 export interface SettleReady {
@@ -139,6 +145,11 @@ export interface FleetOps {
      * set disk.diskTypes=['empty']. Duration fixtures only (RealFleetOps).
      */
     purgeInstancesStoredOn(engineId: string, diskId: string): Promise<void>
+    /**
+     * r75: raw instance rows stored on diskId (id, status, Engine currentStep) for the in-flight-op
+     * gate before a fresh re-dock. Optional: Fake has no async installs.
+     */
+    diskInstancesRaw?(engineId: string, diskId: string): Promise<DiskInstanceRow[]>
     /** Move: undock then dock on another pool engine. */
     moveDisk(fromEngine: string, toEngine: string, diskId: string): Promise<void>
     /** Reboot pool engine; fast=true → pm2 restart instead of sudo reboot. */
@@ -146,6 +157,8 @@ export interface FleetOps {
     /** Engine-owned settle: WS up + store sync ready. */
     waitReady(engineId: string, timeoutMs: number): Promise<SettleReady>
     readStore(engineId: string): Promise<SemanticStoreView>
+    /** Optional (real fleet): drop + reopen the cached store view of one engine; recorded in RECONNECTS.md. */
+    refreshView?(engineId: string, reason: string): Promise<boolean | null>
     listPoolEngines(): string[]
     /** Apply shared-store / unique-doc + mDNS policy. */
     applyStoreMode(mode: StoreMode): Promise<void>
@@ -195,6 +208,9 @@ export interface DurationOptions {
     onLog?: (entry: StructuredLogEntry) => void
 }
 
+/** r75: one instanceDB row stored on a disk (raw Engine fields for the in-flight gate). */
+export interface DiskInstanceRow { id: string; status: string; currentStep: number | null }
+
 export interface WalkerState {
     current: string
     layer: Layer | null
@@ -207,6 +223,19 @@ export interface WalkerState {
      * The next install_app re-docks empty-002 first (redockEmpty002BeforeSecondInstall).
      */
     empty002HoldsApp?: boolean
+    /**
+     * r75 FAIL@91: install_app soft-returns while the Engine's installApp keeps running (the record
+     * appeared 14 s later, after the store purge). Set after a successful install_app to the disk it
+     * targets; a fresh re-dock of that disk first waits for the install to land and settle.
+     */
+    pendingInstallDisk?: string | null
+    /**
+     * r86f (A): the instance the first Stage 2 copy_app created (cover-all @43), recorded from the
+     * post-op settle (pool ids after minus the pre-Confirm baseline). Stage 2 move_app moves it.
+     */
+    stage2CopyInstanceId?: string | null
+    /** true once erase_disk ran: later install_app targets the erase partition, not the files one. */
+    eraseStarted?: boolean
 }
 
 /** One step in a deterministic walk file (kind: walk). */
