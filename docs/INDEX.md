@@ -36,6 +36,11 @@ IDEA Pi test fleet: node inventory (idea01–idea04), hardware specs, provisioni
 procedure, SSH access, and fleet management commands.
 → [docs/PI_FLEET.md](PI_FLEET.md)
 
+## STORE_HISTORY_R86Q.md
+**Status:** Record (2026-10-13)  ·  **Maintained by:** Axle
+r86q diagnosis: why the shared store's history (heartbeats, metrics) made syncs slow, and the fixes (#192/#194, compaction).
+→ [docs/STORE_HISTORY_R86Q.md](STORE_HISTORY_R86Q.md)
+
 ## interfaces.json
 **Status:** Supporting asset  ·  **Maintained by:** Axle
 Generated/supporting JSON describing Engine interfaces (not narrative docs).

@@ -13,6 +13,8 @@
  *   3. An existing store-url.txt with a different ID (an isolated Engine such as
  *      idea03) is used as it is and never rewritten
  *   4. A missing template stops startup with a clear error and writes nothing
+ *   6. engine#193: no store-url.txt and no IDEA_ALLOW_STORE_URL_FALLBACK → startup
+ *      refuses with a clear error and writes nothing
  *   5. No module-load reads of store-url.txt; startup never writes the template
  *
  * Everything runs in a private temp folder (copy of the template, own store data):
@@ -29,6 +31,8 @@ import { Store, createServerStore } from '../../src/data/Store.js'
 import {
     FLEET_STORE_URL,
     prepareStoreIdentity,
+    STORE_URL_FALLBACK_ENV,
+    storeUrlFallbackAllowed,
     readStoreDocId,
     storeDocIdFromUrl,
     storeIdentityPaths,
@@ -59,7 +63,7 @@ afterEach(async () => { await fs.remove(tmp) })
 
 /** The store part of startEngine: prepare the identity, then open the store. */
 const startStore = async () => {
-    const { storeDocId, restored } = await prepareStoreIdentity(paths)
+    const { storeDocId, restored } = await prepareStoreIdentity(paths, { allowFallback: true })
     const repo = new Repo({ storage: new NodeFSStorageAdapter(dataDir), network: [] })
     const handle = await createServerStore(repo, storeDocId, dataDir, paths.templatePath)
     await repo.flush()
@@ -74,7 +78,7 @@ describe('store identity at startup (idea#120)', () => {
         expect(fs.readFileSync(TRACKED_URL, 'utf8').trim()).to.equal(FLEET_STORE_URL)
     })
 
-    it('no store-url.txt: writes the fleet URL, keeps the template, and a second start reuses it', async () => {
+    it('no store-url.txt, fallback allowed: writes the fleet URL, keeps the template, and a second start reuses it', async () => {
         const templateBefore = await fs.readFile(paths.templatePath)
         expect(fs.existsSync(paths.urlPath)).to.be.false
 
@@ -143,5 +147,29 @@ describe('store identity at startup (idea#120)', () => {
         for (const f of ['src/start.ts', 'src/data/Store.ts', 'src/data/StoreIdentity.ts']) {
             expect(src(f), `${f} must not create a store with repo.create or write the template`).to.not.match(/repo\.create|writeFile\([^)]*[Tt]emplate/)
         }
+    })
+})
+
+describe('refuse to start without store-url.txt (engine#193)', () => {
+    it('no store-url.txt and fallback not allowed: throws a clear error and writes nothing', async () => {
+        await expect(prepareStoreIdentity(paths, { allowFallback: false }))
+            .rejects.toThrow(/store-url\.txt is missing: refusing to start.*IDEA_ALLOW_STORE_URL_FALLBACK=true/s)
+        expect(fs.existsSync(paths.urlPath), 'no store-url.txt written').to.be.false
+        expect(fs.existsSync(path.join(path.dirname(paths.urlPath), 'store-url.restored')), 'no marker written').to.be.false
+    })
+
+    it('the default follows the env flag (off unless true/1)', () => {
+        expect(STORE_URL_FALLBACK_ENV).to.equal('IDEA_ALLOW_STORE_URL_FALLBACK')
+        expect(storeUrlFallbackAllowed({})).to.be.false
+        expect(storeUrlFallbackAllowed({ IDEA_ALLOW_STORE_URL_FALLBACK: 'false' })).to.be.false
+        expect(storeUrlFallbackAllowed({ IDEA_ALLOW_STORE_URL_FALLBACK: 'true' })).to.be.true
+        expect(storeUrlFallbackAllowed({ IDEA_ALLOW_STORE_URL_FALLBACK: '1' })).to.be.true
+    })
+
+    it('an existing store-url.txt still starts with fallback off', async () => {
+        await fs.writeFile(paths.urlPath, FLEET_STORE_URL)
+        const r = await prepareStoreIdentity(paths, { allowFallback: false })
+        expect(r.restored).to.be.false
+        expect(r.storeDocId).to.equal(storeDocIdFromUrl(FLEET_STORE_URL))
     })
 })
