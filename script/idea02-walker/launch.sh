@@ -12,7 +12,7 @@ EVID=/home/walker/duration-evidence/$RUN
 git -C "$REPO" diff --quiet || { echo "REFUSE: dirty harness tree"; exit 3; }
 SHA=$(git -C "$REPO" rev-parse HEAD)
 git -C "$REPO" branch -r --contains "$SHA" | grep -q origin/ || { echo "REFUSE: $SHA not pushed"; exit 3; }
-CONSOLE_PIN=19a8b82bb50f4fdb2c27e68bf39464267381188e  # intents = 234d833 merged with product ca8c111 (#146 dedupe c3a8783 on pool d6930d8): range e2e/test-only
+CONSOLE_PIN=4788cc41d7eb88517e73f836e3bb59027c3caee2  # intents = 19a8b82 + r86s FAIL@128 store-reload wait (e2e/test-only); 19a8b82 = 234d833 merged with product ca8c111 (#146 dedupe c3a8783 on pool d6930d8): range e2e/test-only
 [ "$(git -C /home/walker/agent-console-dev rev-parse HEAD)" = "$CONSOLE_PIN" ] || { echo "REFUSE: console intents checkout is not $CONSOLE_PIN"; exit 3; }
 git -C /home/walker/agent-console-dev diff --quiet || { echo "REFUSE: dirty console intents tree"; exit 3; }
 mkdir -p "$EVID"; [ -f "$EVID/run.pid" ] && kill -0 "$(cat "$EVID/run.pid")" 2>/dev/null && { echo "REFUSE: already running"; exit 4; }
@@ -27,7 +27,7 @@ export DURATION_LAN_HOSTS=\${DURATION_LAN_HOSTS:-idea01=10.99.0.11,idea03=10.99.
 export DURATION_CONSOLE_INTENTS=/home/walker/agent-console-dev/e2e/intents
 export DURATION_STAGE=2
 export DURATION_EXPECTED_CONSOLE_SHA=$CONSOLE_PIN
-# Product pin: ca8c111 = Console PR #146 page-port fix + engine dedupe (r86n FAIL@127 duplicate idea01) on #144 tip a390993 (branch fix/discovery-page-port-pool); intents 19a8b82 = 234d833 + merge of ca8c111.
+# Product pin: ca8c111 = Console PR #146 page-port fix + engine dedupe (r86n FAIL@127 duplicate idea01) on #144 tip a390993 (branch fix/discovery-page-port-pool); intents 4788cc41d7eb88517e73f836e3bb59027c3caee2 = 19a8b82 (234d833 + merge of ca8c111) + switch_engine/reboot_engine store-reload wait.
 export DURATION_CONSOLE_PRODUCT_SHA=ca8c111e4bc30fb2731749597650c226dc89e236
 export DURATION_CONSOLE_PRODUCT_ASSET=index-qUni5WGC.js
 export DURATION_CONSOLE_PRODUCT_ASSET_MD5=3428b6f5e0667f790d803beb0ad5ce0b
