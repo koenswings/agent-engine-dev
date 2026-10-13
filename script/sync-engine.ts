@@ -98,6 +98,11 @@ const syncEngine = async () => {
       await $$`chmod +x ${enginePath}/client`;
       await $$`chmod +x ${enginePath}/reset-engine`;
       await $$`chmod +x ${enginePath}/sync-engine`;
+      await $$`chmod +x ${enginePath}/install-root-helpers`;
+      // Root-owned parts (borgbackup, sudoers, idea-app-data, ...) on every update,
+      // not only at first install (wizardly-hugle had no borg, 2026-10-13). Idempotent.
+      console.log(chalk.blue(`Installing/upgrading the root helpers on ${machine}...`));
+      await $$`cd ${enginePath} && ./install-root-helpers`;
 
 
       // Now pnpm build and pm2 start engine 
