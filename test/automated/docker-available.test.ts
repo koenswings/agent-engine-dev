@@ -161,13 +161,17 @@ describe('dockerAvailable() (real module)', () => {
 })
 
 describe('Docker-only paths follow dockerAvailable(), not testMode', () => {
-    it('metrics poll: testMode + Docker → metrics written; no Docker → no docker command at all', async () => {
+    it('metrics poll: testMode + Docker → metrics broadcast (ephemeral, not stored); no Docker → no docker command at all', async () => {
         const h = await makeHandle('Running')
         docker.running = `${INST}-kolibri-1\n`
+        const sent: any[] = []
+        ;(h as any).broadcast = (msg: any) => { sent.push(msg) }
         await pollDockerMetricsOnce(h)
-        const m = h.doc().instanceDB[INST].metrics as any
+        const m = sent[0]?.instances?.[INST]
+        expect(sent[0]?.type).toBe('idea/metrics')
         expect(m?.cpuPercent).toBe(12.5)
         expect(m?.memUsageBytes).toBe(256 * 1024 ** 2)
+        expect(h.doc().instanceDB[INST].metrics ?? null).toBeNull()   // store design 2026-10-13
 
         docker.available = false
         docker.calls.length = 0
