@@ -135,6 +135,63 @@ const wholeDeviceOf = (device: string): string => {
 }
 
 /**
+ * Instances that live on ANOTHER disk but hold this disk open: a Files Disk
+ * bind-mounted through filesMounts (e.g. Nextcloud /files), or an app volume
+ * whose host path is under this disk's mount root. A running container keeps
+ * the block device busy, so wipefs fails with "Device or resource busy" and the
+ * fallback fails too. Erase refuses up front and names them instead.
+ * (Could be extended to stop them first if preferred.)
+ */
+/** Host paths of bind volumes in an instance's compose.yaml (absolute paths only). */
+export const composeVolumeHostPaths = async (store: Store, inst: { id: string; storedOn?: any }): Promise<string[]> => {
+    try {
+        const home = inst.storedOn ? store.diskDB[inst.storedOn as DiskID] : null
+        if (!home?.device) return []
+        const file = path.join(await diskMountRoot(home), 'instances', inst.id, 'compose.yaml')
+        const doc = YAML.parse(await fs.readFile(file, 'utf8')) ?? {}
+        const out: string[] = []
+        for (const svc of Object.values<any>(doc.services ?? {})) {
+            for (const v of svc?.volumes ?? []) {
+                const src = typeof v === 'string' ? v.split(':')[0] : v?.source
+                if (typeof src === 'string' && src.startsWith('/')) out.push(path.normalize(src))
+            }
+        }
+        return out
+    } catch {
+        return []
+    }
+}
+
+export const instancesUsingDisk = async (
+    store: Store,
+    disk: Disk,
+    volumeHostPaths: (store: Store, inst: any) => Promise<string[]> = composeVolumeHostPaths,
+): Promise<{ id: string; name: string; via: 'filesMounts' | 'volume' }[]> => {
+    const out: { id: string; name: string; via: 'filesMounts' | 'volume' }[] = []
+    const mp = disk.device ? `${disksRoot()}/${disk.device}` : null
+    for (const inst of Object.values(store.instanceDB)) {
+        if (inst.storedOn === disk.id) continue // removed by the erase itself
+        const status = String(inst.status ?? '')
+        if (['Stopped', 'Undocked', 'Docked', 'Missing'].includes(status)) continue
+        if ((inst.filesMounts ?? []).includes(disk.id)) {
+            out.push({ id: inst.id, name: String(inst.name ?? inst.id), via: 'filesMounts' })
+            continue
+        }
+        if (mp) {
+            const paths = await volumeHostPaths(store, inst)
+            if (paths.some(p => p === mp || p.startsWith(mp + '/'))) {
+                out.push({ id: inst.id, name: String(inst.name ?? inst.id), via: 'volume' })
+            }
+        }
+    }
+    return out
+}
+
+export const instancesUsingDiskMessage = (label: string, users: { name: string; via: string }[]): string =>
+    `${label} is in use by ${users.map(u => `${u.name} (${u.via === 'filesMounts' ? 'Files mount' : 'app volume'})`).join(', ')}. ` +
+    `Stop ${users.length === 1 ? 'that instance' : 'those instances'} or remove the Files mount first; nothing was erased.`
+
+/**
  * Blockers: running backup, held instance lock, Nextcloud first-start/upgrade,
  * another erase in progress. Returns an error message or null.
  */
@@ -222,6 +279,11 @@ export const eraseDisk = async (
 
     const blocker = await eraseBlocker(store, disk)
     if (blocker) throw new Error(blocker)
+
+    if (disk) {
+        const users = await instancesUsingDisk(storeHandle.doc()!, disk)
+        if (users.length > 0) throw new Error(instancesUsingDiskMessage(summary.label, users))
+    }
 
     setEraseStep(storeHandle, 'checking', targetId, summary.label)
     lockedDevices.add(whole)
