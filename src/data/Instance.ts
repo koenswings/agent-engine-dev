@@ -18,7 +18,7 @@ import { CommandLogStore, LogEntry, getCommandLogHandle, addTrace, closeTrace, f
 import { getActiveTrace, flushTrace } from '../utils/CommandLogger.js'
 import { dockerAvailable } from '../utils/dockerAvailable.js'
 import { rebindKolibriMorangoInstanceId } from './InstanceCopy.js'
-import { trackInFlight } from './InstanceInFlight.js'
+import { trackInFlight, startDiskGoneReason, dockIdentityOf } from './InstanceInFlight.js'
 
 // ── Step-progress helpers ─────────────────────────────────────────────────────
 
@@ -190,7 +190,27 @@ export const recordInstanceStartWarnings = async (
 /**
  * Set an instance to Error with a diagnosis in statusCondition.
  */
+/** Device-node check for a pulled disk; null in testMode (simulated devices). Tests may override. */
+let deviceExistsCheck: ((dev: string) => boolean) | null | undefined = undefined
+export const setDeviceExistsCheckForTests = (fn: ((dev: string) => boolean) | null | undefined): void => { deviceExistsCheck = fn }
+const deviceExists = (): ((dev: string) => boolean) | null =>
+  deviceExistsCheck !== undefined ? deviceExistsCheck : (config.settings.testMode ? null : (dev: string) => fs.existsSync(`/dev/${dev}`))
+
 export const markInstanceError = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, e: unknown): Promise<void> => {
+  // hw180: a start that fails because its disk was pulled (undock pending, record undocked or
+  // moved, device node gone) is not an app failure: the instance goes to Undocked, never Error.
+  const gone = startDiskGoneReason(String(disk.id), disk.device ?? null, dockIdentityOf(storeHandle.doc()?.diskDB?.[disk.id]), deviceExists())
+  if (gone) {
+    log(`Instance ${instance.id}: start failed because ${gone} — marking Undocked, not Error (${e instanceof Error ? e.message : String(e)})`)
+    storeHandle.change(doc => {
+      const inst = doc.instanceDB[instance.id]
+      if (!inst) return
+      inst.status = 'Undocked' as Status
+      inst.statusCondition = null
+      inst.metrics = null
+    })
+    return
+  }
   const condition = await diagnoseInstance(instance, disk, e)
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]

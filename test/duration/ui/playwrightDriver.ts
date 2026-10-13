@@ -33,6 +33,7 @@ import {
     isDeferredUiIntent,
 } from './fixtures.js'
 import type { UiDriver, UiIntentContext, UiIntentResult } from './types.js'
+import { loadPlaywright, type PlaywrightModule } from './playwrightLoader.js'
 import { ActiveTabTracker, captureFrameFrom, followContextTabs, type TrackablePage } from './activeTab.js'
 
 export interface PlaywrightUiOptions {
@@ -45,6 +46,25 @@ export interface PlaywrightUiOptions {
      * ok:false (open_video/open_exercise fail-loud).
      */
     failLoud?: boolean
+    /**
+     * r57 (r56 step 34): engine id → reachable address (the --hosts map). The Console's own Open
+     * button opens `http://<engine>.local:<port>` (AppCard.tsx appUrl). The box cannot resolve mDNS
+     * `.local` names (its resolver answers 198.18.0.1, a sink), so Chromium opened NO tab at all and
+     * only the intents' Path B fallback hid it. Mapping `<engine>.local` → the --hosts address in the
+     * browser's resolver lets the real Console Open produce the real tab (no fallback, no URL rewrite).
+     */
+    hosts?: Record<string, string>
+}
+
+/** r57: Chromium --host-resolver-rules mapping `<engine>.local` (and bare `<engine>`) to its --hosts IP. */
+export const hostResolverRulesFor = (hosts: Record<string, string> | undefined): string | null => {
+    const rules: string[] = []
+    for (const [engine, addr] of Object.entries(hosts ?? {})) {
+        const a = addr?.trim()
+        if (!/^[a-z0-9-]+$/i.test(engine) || !a || !/^[0-9a-f.:]+$/i.test(a)) continue
+        rules.push(`MAP ${engine}.local ${a}`)
+    }
+    return rules.length ? rules.join(', ') : null
 }
 
 type DurationIntentResult = {
@@ -61,6 +81,8 @@ type RunDurationIntent = (opts: {
     instanceId?: string
     /** Pixel opt-in: write PNG after Intent when supported. */
     screenshotPath?: string
+    /** r64: store Operation wait for copy/move/restore Intents (Console ≥ #140 r64 commit reads it). */
+    waitOperation?: import('../opWait.js').WaitOperationFn
 }) => Promise<DurationIntentResult>
 
 type HasDurationIntent = (action: string) => boolean
@@ -69,20 +91,6 @@ type CaptureAfterIntent = (
     page: unknown,
     opts: { path: string; intent?: string; settleMs?: number },
 ) => Promise<void>
-
-type PlaywrightModule = {
-    chromium: {
-        launch: (opts?: { headless?: boolean }) => Promise<{
-            newContext: (opts?: { baseURL?: string }) => Promise<{
-                newPage: () => Promise<unknown>
-                on: (event: 'page', listener: (page: TrackablePage) => void) => unknown
-                addInitScript: (script: () => void) => Promise<void>
-                close: () => Promise<void>
-            }>
-            close: () => Promise<void>
-        }>
-    }
-}
 
 type PwLocator = {
     first: () => PwLocator
@@ -153,31 +161,6 @@ export const resolveConsoleIntentsDir = (explicit?: string): string | null => {
         }
     }
     return null
-}
-
-const loadPlaywright = async (): Promise<PlaywrightModule> => {
-    const require = createRequire(import.meta.url)
-    const tries = [
-        'playwright',
-        '@playwright/test',
-        '/workspace/agent-console-dev/node_modules/playwright',
-        resolve(here, '../../../../agent-console-dev/node_modules/playwright'),
-    ]
-    for (const spec of tries) {
-        try {
-            if (spec.startsWith('/')) {
-                const mod = await import(pathToFileURL(join(spec, 'index.js')).href).catch(() => null)
-                if (mod) return mod as PlaywrightModule
-            }
-            return require(spec) as PlaywrightModule
-        } catch {
-            /* try next */
-        }
-    }
-    throw new Error(
-        'PlaywrightUiDriver: playwright not installed. ' +
-        'Install in Engine (pnpm add -D playwright) or use agent-console-dev node_modules.',
-    )
 }
 
 type PixelBridge = {
@@ -271,6 +254,7 @@ export class PlaywrightUiDriver implements UiDriver {
         headless: boolean
         failLoud: boolean
         intentsDir: string | null
+        hosts?: Record<string, string>
     }
     private browser: Awaited<ReturnType<PlaywrightModule['chromium']['launch']>> | null = null
     private context: Awaited<ReturnType<Awaited<ReturnType<PlaywrightModule['chromium']['launch']>>['newContext']>> | null = null
@@ -279,6 +263,9 @@ export class PlaywrightUiDriver implements UiDriver {
     private initPromise: Promise<void> | null = null
     /** --record-walk: which tab (Console or an App tab) is active right now. */
     private tabs = new ActiveTabTracker()
+    /** r55: every tab the context opened, with an open sequence number (post-use App tab check). */
+    private tabLog: { page: unknown; seq: number }[] = []
+    private tabSeqN = 0
 
     constructor(opts: PlaywrightUiOptions = {}) {
         this.opts = {
@@ -288,6 +275,7 @@ export class PlaywrightUiDriver implements UiDriver {
             headless: opts.headless !== false,
             failLoud: opts.failLoud !== false,
             intentsDir: resolveConsoleIntentsDir(opts.intentsDir),
+            ...(opts.hosts ? { hosts: opts.hosts } : {}),
         }
         // Allow construct without sibling if package resolves at runIntent time;
         // createUiDriver still prefers resolveConsoleIntentsDir for fail-fast.
@@ -298,8 +286,12 @@ export class PlaywrightUiDriver implements UiDriver {
         if (!this.initPromise) {
             this.initPromise = (async () => {
                 this.bridge = await loadPixelBridge(this.opts.intentsDir)
-                const pw = await loadPlaywright()
-                this.browser = await pw.chromium.launch({ headless: this.opts.headless })
+                const { mod: pw } = await loadPlaywright()
+                const rules = hostResolverRulesFor(this.opts.hosts)
+                this.browser = await pw.chromium.launch({
+                    headless: this.opts.headless,
+                    ...(rules ? { args: [`--host-resolver-rules=${rules}`] } : {}),
+                })
                 this.context = await this.browser.newContext({ baseURL: this.opts.baseUrl })
                 // Force demoMode OFF before first Console goto (idea01:8080 / not localhost).
                 // Sticky localStorage.demoMode==='true' (Pixel bootDemo) must not override
@@ -311,11 +303,43 @@ export class PlaywrightUiDriver implements UiDriver {
                     })
                 }
                 followContextTabs(this.context, this.tabs)
+                this.context.on?.('page', (p: unknown) => {
+                    this.tabLog.push({ page: p, seq: ++this.tabSeqN })
+                })
                 this.page = await this.context.newPage()
                 this.tabs.track(this.page as TrackablePage)
             })()
         }
         await this.initPromise
+    }
+
+    /** r55: sequence number of the newest tab opened so far (0 before any). */
+    tabSeq(): number {
+        return this.tabSeqN
+    }
+
+    /**
+     * r55: URLs of the Console page and every still-open tab, marking the active one and the ones
+     * opened after `sinceSeq` (fresh). The harness checks these against the store App URLs.
+     */
+    appTabs(sinceSeq = Number.POSITIVE_INFINITY): { url: string; active: boolean; fresh: boolean; console?: boolean; seq?: number }[] {
+        type P = { url?: () => string; isClosed?: () => boolean }
+        const urlOf = (p: unknown): string => {
+            try { return (p as P).url?.() ?? '' } catch { return '' }
+        }
+        const open = (p: unknown): boolean => {
+            try { return (p as P).isClosed?.() !== true } catch { return false }
+        }
+        if (!this.page) return []
+        const active = this.activePage()
+        const out: { url: string; active: boolean; fresh: boolean; console?: boolean; seq?: number }[] = [
+            { url: urlOf(this.page), active: active === this.page, fresh: false, console: true },
+        ]
+        for (const t of this.tabLog) {
+            if (t.page === this.page || !open(t.page)) continue
+            out.push({ url: urlOf(t.page), active: active === t.page, fresh: t.seq > sinceSeq, seq: t.seq })
+        }
+        return out
     }
 
     /** The tab the walker is on now: the newest / brought-to-front App tab, else the Console page. */
@@ -363,6 +387,7 @@ export class PlaywrightUiDriver implements UiDriver {
                 diskId: ctx.diskId ?? defaults.diskId,
                 instanceId: ctx.instanceId ?? defaults.instanceId,
                 engineId: ctx.engineId,
+                ...(ctx.waitOperation ? { waitOperation: ctx.waitOperation } : {}),
             }
             // --record-walk: do NOT hand screenshotPath to Pixel — it would capture the
             // Console page it was given, not the App tab an in-app Intent switched to.
@@ -535,5 +560,7 @@ export class PlaywrightUiDriver implements UiDriver {
         this.bridge = null
         this.initPromise = null
         this.tabs = new ActiveTabTracker()
+        this.tabLog = []
+        this.tabSeqN = 0
     }
 }
