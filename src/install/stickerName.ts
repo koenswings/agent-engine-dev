@@ -1,0 +1,142 @@
+import { chalk } from 'zx'
+import { Hostname } from '../data/CommonTypes.js'
+import { isStickerName, normaliseName, pickUniqueName, Rand } from '../utils/nameGenerator.js'
+
+/**
+ * Install-time sticker name resolution (idea#184).
+ *
+ * Order:
+ *  1. An explicit --hostname is used as given (existing idea01-04 keep their
+ *     names; operators may re-use a sticker name on a re-install).
+ *  2. A name persisted by an earlier run (/etc/idea/sticker-name) is kept, so
+ *     re-running the installer or --personalize never renames a stickered Pi.
+ *  3. Otherwise a new two-word name is generated that is not taken on the LAN
+ *     (mDNS) nor in the network database (engineDB hostnames of the store).
+ */
+export const STICKER_NAME_FILE = '/etc/idea/sticker-name'
+
+export interface StickerNameDeps {
+    readPersisted: () => Promise<string | null>
+    persist: (name: string) => Promise<void>
+    /** Hostnames of every Engine in the network database (may be empty if unreachable). */
+    storeNames: () => Promise<{ names: string[], checked: boolean }>
+    /** True when `<name>.local` already answers on the LAN. */
+    lanTaken: (name: string) => Promise<boolean>
+    rand?: Rand
+    log?: (msg: string) => void
+}
+
+export interface StickerNameResult {
+    name: Hostname
+    source: 'explicit' | 'persisted' | 'generated'
+    storeChecked: boolean
+}
+
+export const resolveStickerName = async (explicit: string | undefined, deps: StickerNameDeps, maxLanTries = 20): Promise<StickerNameResult> => {
+    const log = deps.log ?? (() => {})
+    if (explicit) {
+        const n = normaliseName(explicit)
+        if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(n)) throw new Error(`bad hostname '${explicit}'`)
+        await deps.persist(n)
+        return { name: n as Hostname, source: 'explicit', storeChecked: false }
+    }
+    const persisted = await deps.readPersisted()
+    if (persisted && isStickerName(normaliseName(persisted))) {
+        return { name: normaliseName(persisted) as Hostname, source: 'persisted', storeChecked: false }
+    }
+    const { names, checked } = await deps.storeNames()
+    if (!checked) log('WARNING: network database not reachable; name checked against the LAN only')
+    const taken = new Set(names.map(normaliseName))
+    for (let i = 0; i < maxLanTries; i++) {
+        const candidate = pickUniqueName(taken, deps.rand)
+        if (await deps.lanTaken(candidate)) {
+            log(`${candidate}.local is already on the LAN; picking another name`)
+            taken.add(candidate)
+            continue
+        }
+        await deps.persist(candidate)
+        return { name: candidate, source: 'generated', storeChecked: checked }
+    }
+    throw new Error(`no free sticker name after ${maxLanTries} LAN checks`)
+}
+
+/** Unique hostnames in a store document's engineDB. */
+export const engineHostnames = (doc: { engineDB?: Record<string, { hostname?: string }> } | undefined): string[] =>
+    [...new Set(Object.values(doc?.engineDB ?? {}).map((e) => e?.hostname).filter((h): h is string => !!h))]
+
+/** Text for the sticker, printed at the end of the install and saved next to it. */
+export const stickerText = (name: string, consolePort: number): string => {
+    const url = `http://${name}.local${consolePort === 80 ? '' : `:${consolePort}`}`
+    return [
+        '+------------------------------------------+',
+        `  STICKER NAME:  ${name}`,
+        `  Console:       ${url}`,
+        '+------------------------------------------+',
+    ].join('\n')
+}
+
+// ---------------------------------------------------------------------------
+// Real dependencies (Pi). `exec` is zx `$` locally or the ssh wrapper remotely.
+// ---------------------------------------------------------------------------
+
+export const realStickerNameDeps = (exec: any, opts: { peers?: string[], log?: (m: string) => void } = {}): StickerNameDeps => ({
+    log: opts.log ?? ((m) => console.log(chalk.yellow(m))),
+    readPersisted: async () => {
+        try { return (await exec`cat ${STICKER_NAME_FILE} 2>/dev/null || true`).stdout.trim() || null } catch { return null }
+    },
+    persist: async (name) => {
+        await exec`sudo mkdir -p /etc/idea && echo ${name} | sudo tee ${STICKER_NAME_FILE} > /dev/null`
+    },
+    lanTaken: async (name) => {
+        try {
+            const r = await exec`timeout 5 avahi-resolve-host-name -4 ${name + '.local'} 2>/dev/null || true`
+            return r.stdout.trim().length > 0
+        } catch { return false }
+    },
+    storeNames: async () => storeNamesFromPeers(opts.peers ?? await lanEnginePeers(exec)),
+})
+
+/** Hostnames of Engines advertising on the LAN (ciao service, TXT name=...). */
+export const lanEnginePeers = async (exec: any): Promise<string[]> => {
+    try {
+        const r = await exec`timeout 6 avahi-browse -atrp 2>/dev/null || true`
+        return parseAvahiEngineNames(r.stdout)
+    } catch { return [] }
+}
+
+/** Engine names from `avahi-browse -atrp` output: resolved (=) lines with a TXT "name=" and "id=". */
+export const parseAvahiEngineNames = (out: string): string[] => {
+    const names = new Set<string>()
+    for (const line of out.split('\n')) {
+        if (!line.startsWith('=')) continue
+        if (!line.includes('"id=')) continue
+        const m = line.match(/"name=([^"]+)"/)
+        if (m) names.add(normaliseName(m[1]))
+    }
+    return [...names]
+}
+
+/** Read engineDB hostnames from the first peer that serves its store. */
+export const storeNamesFromPeers = async (peers: string[], port = 80): Promise<{ names: string[], checked: boolean }> => {
+    const { createClientStore } = await import('../data/Store.js')
+    for (const peer of peers) {
+        const host = peer.endsWith('.local') ? peer : `${peer}.local`
+        try {
+            const res = await fetch(`http://${host}${port === 80 ? '' : `:${port}`}/api/store-url`, { signal: AbortSignal.timeout(5000) })
+            if (!res.ok) continue
+            const url = (await res.json())?.url as string | undefined
+            if (!url?.startsWith('automerge:')) continue
+            const conn = createClientStore([host], `installer-${process.pid}` as any, url.replace('automerge:', '') as any, 15)
+            const { handle, repo } = await Promise.race([conn, new Promise<never>((_, rej) => setTimeout(() => rej(new Error('timeout')), 20_000))])
+            const doc = await Promise.resolve(handle.doc()) as any
+            const names = engineHostnames(doc)
+            try { await repo.shutdown() } catch { /* ignore */ }
+            return { names: [...names, ...peers], checked: true }
+        } catch { /* try next peer */ }
+    }
+    return { names: peers, checked: false }
+}
+
+export const writeStickerFile = async (exec: any, text: string) => {
+    try { await exec`echo ${text} > /home/pi/STICKER.txt` } catch { /* best effort */ }
+}

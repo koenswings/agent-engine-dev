@@ -5,7 +5,7 @@ $.verbose = false;
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import pack from '../package.json' with { type: "json" };
-import { generateHostName } from '../src/utils/nameGenerator.js';
+import { realStickerNameDeps, resolveStickerName, stickerText, writeStickerFile } from '../src/install/stickerName.js';
 import { config } from '../src/data/Config.js';
 import { buildEngine, setHostname, syncEngine } from '../src/data/Engine.js';
 import { addMeta } from '../src/data/Meta.js';
@@ -20,7 +20,6 @@ const main = async () => {
     // Command line argument parsing
     const user = argv.u || argv.user || defaults.user;
     const machine = argv.m || argv.machine || defaults.machine;
-    const hostname = argv.hostname || generateHostName();
     const { version } = pack;
 
     // Help and version flags
@@ -36,7 +35,9 @@ const main = async () => {
         console.log(`  -v, --version           output the version number`)
         console.log(`  -u, --user <string>     the SSH user to connect as (default: ${defaults.user})`)
         console.log(`  -m, --machine <string>  the machine hostname or IP address (default: local bootstrap mode)`) // Corrected to reference the local bootstrap mode as default
-        console.log(`  --hostname <string>     the hostname to set for the new engine (default: randomly generated)`)
+        console.log(`  --hostname <string>     the hostname to set (default: a generated two-word sticker name, e.g. brave-otter,`)
+        console.log(`                          unique on the LAN and in the network database; kept on re-runs, idea#184)`)
+        console.log(`  --peer <host[,host]>    Engine(s) whose network database to check the generated name against (default: Engines found via mDNS)`)
         console.log(`  -l, --language <string> the locale language to set (default: ${defaults.language})`)
         console.log(`  -k, --keyboard <string> the keyboard layout to set (default: ${defaults.keyboard})`)
         console.log(`  -t, --timezone <string> the timezone to set (default: ${defaults.timezone})`)
@@ -74,6 +75,19 @@ const main = async () => {
 
     const model = parseModel(argv.model);
 
+    // Sticker name (idea#184): explicit --hostname, else the name persisted by an
+    // earlier run, else a new two-word name not taken on the LAN or in the store.
+    // --dry-run never generates or persists anything.
+    let hostname: string = argv.hostname || '<generated at install>';
+    let nameSource = argv.hostname ? 'explicit' : 'generated';
+    if (!argv['dry-run']) {
+        const peers = argv.peer ? String(argv.peer).split(',').map((s: string) => s.trim()).filter(Boolean) : undefined;
+        const r = await resolveStickerName(argv.hostname, realStickerNameDeps(exec, { peers }));
+        hostname = r.name;
+        nameSource = r.source;
+        console.log(chalk.green(`Hostname: ${hostname} (${r.source}${r.source === 'generated' ? (r.storeChecked ? ', checked against LAN and network database' : ', checked against LAN only') : ''})`));
+    }
+
     // Assemble arguments for the core buildEngine function
     const buildArgs = {
         exec,
@@ -97,7 +111,7 @@ const main = async () => {
     };
 
     const { exec: _exec, ...shown } = buildArgs;
-    console.log(chalk.green(`Build options: ${JSON.stringify({ model: model ?? null, ...shown })}`));
+    console.log(chalk.green(`Build options: ${JSON.stringify({ model: model ?? null, nameSource, ...shown })}`));
     if (argv['dry-run']) {
         // Print the resolved options only (used to check flag handling, idea#146)
         process.exit(0);
@@ -114,6 +128,9 @@ const main = async () => {
         await buildEngine(buildArgs);
     }
     
+    const sticker = stickerText(hostname, config.settings.httpPort ?? 80);
+    await writeStickerFile(exec, sticker);
+    console.log(chalk.bold.green(`\nWrite this name on the sticker on the case (also saved in /home/pi/STICKER.txt):\n${sticker}\n`));
     console.log(chalk.green(`Script completed successfully.`));
     process.exit(0);
 }

@@ -26,7 +26,7 @@ This document provides a reference for the main provisioning and utility scripts
     -   `-v, --version`: Show the version.
     -   `-u, --user <user>`: The SSH user for Remote Mode.
     -   `-m, --machine <address>`: The Pi's hostname or IP address. Leave it out for Local Mode.
-    -   `--hostname <name>`: The hostname to set (default: randomly generated).
+    -   `--hostname <name>`: The hostname to set. Default (idea#184): a generated two-word **sticker name** such as `brave-otter` (no digits), checked against the LAN (`avahi-resolve-host-name <name>.local`) and against the `engineDB` hostnames of the network database (read from an Engine found via mDNS or given with `--peer <host[,host]>`; when no store is reachable it says so and checks the LAN only). The name is persisted in `/etc/idea/sticker-name`, so re-running the build or `--personalize` keeps it (`boot.sh` deletes it on a master-image clone's first boot so each clone gets its own). At the end the name and Console URL are printed for the sticker and saved in `/home/pi/STICKER.txt`. An explicit `--hostname` is used as given (existing idea01-04 keep their names). `provision-fleet.sh` takes `auto=<ip>` to use a generated name.
     -   `-l, --language <locale>`, `-k, --keyboard <layout>`, `-t, --timezone <tz>`: Localisation settings.
     -   `--upgrade`, `--argon`, `--zerotier`, `--raspap`, `--gadget`, `--temperature`: Optional parts of the build. Every one of these can be turned off with `--no-<option>` or `--<option>=false` (idea#146), which is required for argon/gadget on spare and Pi 5 profiles.
     -   `--model pi4|pi5`: Selects the Pi model. On pi5, gadget mode is forced off and an explicit `--gadget` is refused.

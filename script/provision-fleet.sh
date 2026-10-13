@@ -3,6 +3,10 @@
 #
 # Usage:
 #   ./script/provision-fleet.sh [options] <name>=<ip>[,model=pi4|pi5] ...
+#   <name> "auto" lets build-engine generate a unique two-word sticker name
+#   (idea#184, e.g. brave-otter); any other name is kept as given (idea01-04).
+#   The generated name is printed in the log line "Hostname: ..." and in the
+#   final summary: write it on the sticker on the case.
 #
 # Examples:
 #   # Pi 5 reached through idea03 as a jump host, fleet Tailscale key from a local file
@@ -195,7 +199,8 @@ REMOTE
   set +e
   # The key goes from the root-only file into the environment of build-engine on the
   # Pi ($(...) runs remotely); it is never in an argument on either machine.
-  rssh "cd /home/pi/idea/agents/agent-engine-dev && TAILSCALE_AUTHKEY=\"\$(sudo cat /etc/tailscale/debug-authkey)\" ./build-engine --hostname '$NAME' --timezone '$TIMEZONE' --keyboard '$KEYBOARD' $FLAGS --prod" >>"$LOG" 2>&1
+  HOSTFLAG="--hostname '$NAME'"; [[ "$NAME" == auto ]] && HOSTFLAG=""
+  rssh "cd /home/pi/idea/agents/agent-engine-dev && TAILSCALE_AUTHKEY=\"\$(sudo cat /etc/tailscale/debug-authkey)\" ./build-engine $HOSTFLAG --timezone '$TIMEZONE' --keyboard '$KEYBOARD' $FLAGS --prod" >>"$LOG" 2>&1
   BUILD_EXIT=$?
   set -e
   # build-engine ends with a reboot: the SSH connection drops (255) or returns 0.
@@ -205,6 +210,10 @@ REMOTE
     RESULTS+=("$NAME: FAILED (build-engine exit $BUILD_EXIT)"); FAILED=1; continue
   fi
   grep -F 'Build options:' "$LOG" | tail -1 | sed 's/^/  /' || true
+  if [[ "$NAME" == auto ]]; then
+    GEN=$(grep -oE 'Hostname: [a-z]+-[a-z]+' "$LOG" | tail -1 | awk '{print $2}')
+    [[ -n "$GEN" ]] && { echo "  Sticker name: $GEN"; NAME="$GEN"; }
+  fi
 
   if [[ $WAIT -eq 0 ]]; then
     RESULTS+=("$NAME: built, rebooting (not checked, --no-wait)"); continue
