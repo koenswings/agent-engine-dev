@@ -24,6 +24,7 @@ import { log } from '../utils/utils.js'
 import { Store, getDisk, getLocalEngine } from './Store.js'
 import { resolveDiskArg } from './DiskArg.js'
 import { buildInstance } from './Instance.js'
+import { parseAppId } from './App.js'
 import { AppID, AppName, DiskID, DiskName, InstanceName, Version } from './CommonTypes.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Disk, diskMountRoot } from './Disk.js'
@@ -216,8 +217,7 @@ const installAppRouted = async (
     if (online) {
         // Route 2: GitHub path (existing buildInstance logic)
         log(chalk.blue(`installApp: GitHub path (internet available)`))
-        const appName = opts.appId.slice(0, opts.appId.lastIndexOf('-')) as AppName
-        const version = opts.appId.slice(opts.appId.lastIndexOf('-') + 1) as Version
+        const { name: appName, version } = parseAppId(opts.appId)
         const targetDevice = targetDisk.device!
         const instanceId = await buildInstance(instanceName, appName, gitAccount, version, targetDevice as any)
         if (!instanceId) {
@@ -255,7 +255,7 @@ const installAppRouted = async (
     }
 
     // No local source found
-    const appName = opts.appId.slice(0, opts.appId.lastIndexOf('-')) as AppName
+    const appName = parseAppId(opts.appId).name
     throw new Error(
         `installApp: App '${appName}' not found locally. ` +
         `Insert a disk containing '${appName}' or connect to the internet.`
