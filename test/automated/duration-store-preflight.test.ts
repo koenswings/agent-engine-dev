@@ -1,5 +1,5 @@
 /**
- * idea#168 r38: live store preflight (one shared dev store 3zoqd, mDNS ON, no static peers),
+ * idea#168 r38: live store preflight (one shared dev store 2VroE (was 3zoqd, compacted 2026-10-13), mDNS ON, no static peers),
  * META.yaml identity by parsed diskId + created (never bytes / sha), and the Console pin
  * telling d637b83 from 1a46f20 by git HEAD even when the bundle name is identical.
  */
@@ -33,7 +33,7 @@ import { buildFixtureSlotScanRemote, buildMetaCatRemote, buildTreeDigestRemote, 
 
 const HOSTS = { idea01: '100.99.231.94', idea03: '100.126.117.80', idea04: '100.108.39.45' }
 const POOL = ['idea01', 'idea03', 'idea04']
-const URL3Z = 'automerge:3zoqdSVsEtj4ygNJPNcDyKWvdxo6'
+const URL2V = 'automerge:2VroEUvDkmYsDAwE5oG9YeFNadWH'
 
 // Values as read on the pool 2026-10-06 (Engine f65183a).
 const CONFIG = (o: { mdns?: string; staticPeers?: string } = {}) => `settings:
@@ -52,7 +52,7 @@ const PM2 = `module.exports = { apps: [{ name: "engine", script: "./dist/src/ind
 
 const probeOut = (o: { config?: string; storeUrl?: string; pm2?: string; environ?: 'readable' | 'unreadable'; env?: string[]; pid?: string } = {}) => [
     '@@DSP@@ config', o.config ?? CONFIG(),
-    '@@DSP@@ storeurl', o.storeUrl ?? URL3Z, '',
+    '@@DSP@@ storeurl', o.storeUrl ?? URL2V, '',
     '@@DSP@@ pm2config', o.pm2 ?? PM2,
     '@@DSP@@ proc', `pid=${o.pid ?? '54874'}`, `environ=${o.environ ?? 'unreadable'}`, ...(o.env ?? []).map(e => `env:${e}`),
     '@@DSP@@ end',
@@ -74,24 +74,24 @@ const deps = (over: Partial<Record<string, string | Error>> = {}, api: Record<st
                 const v = api[pi]
                 if (v instanceof Error) throw v
                 expect(port).toBe(8080)
-                return v ?? JSON.stringify({ url: URL3Z, wsPort: 4321 })
+                return v ?? JSON.stringify({ url: URL2V, wsPort: 4321 })
             },
             ws: ws ? (pi: string) => ws[pi] ?? null : undefined,
         },
     }
 }
 
-describe('idea#168 r38 store preflight (live pool = shared 3zoqd, mDNS ON, no static peers)', () => {
-    it('exit code 6 is distinct from 4 (engine unreachable) and 5 (Console pin); expected id from env, default 3zoqd', () => {
+describe('idea#168 r38 store preflight (live pool = shared 2VroE, mDNS ON, no static peers)', () => {
+    it('exit code 6 is distinct from 4 (engine unreachable) and 5 (Console pin); expected id from env, default 2VroE', () => {
         expect(EXIT_STORE_PREFLIGHT).toBe(6)
         expect(new Set([1, 2, EXIT_ENGINE_UNREACHABLE, EXIT_CONSOLE_PIN_MISMATCH, EXIT_STORE_PREFLIGHT]).size).toBe(5)
-        expect(DEFAULT_EXPECTED_STORE_ID).toBe('3zoqd')
-        expect(expectedStoreId({})).toBe('3zoqd')
+        expect(DEFAULT_EXPECTED_STORE_ID).toBe('2VroE')
+        expect(expectedStoreId({})).toBe('2VroE')
         expect(expectedStoreId({ DURATION_EXPECTED_STORE_ID: 'automerge:4GQmEZehPD' })).toBe('4GQmEZehPD')
         expect(() => expectedStoreId({ DURATION_EXPECTED_STORE_ID: 'ab' })).toThrow(/≥5/)
-        expect(storeIdMatches(URL3Z, '3zoqd')).toBe(true)
-        expect(storeIdMatches('automerge:4GQmEZehPDfryGDxkFo9XixbvmAC', '3zoqd')).toBe(false)
-        expect(storeIdMatches(null, '3zoqd')).toBe(false)
+        expect(storeIdMatches(URL2V, '2VroE')).toBe(true)
+        expect(storeIdMatches('automerge:4GQmEZehPDfryGDxkFo9XixbvmAC', '2VroE')).toBe(false)
+        expect(storeIdMatches(null, '2VroE')).toBe(false)
     })
 
     it('probe script is read-only (cat / sed / pgrep / grep; no writes) and parses', () => {
@@ -101,7 +101,7 @@ describe('idea#168 r38 store preflight (live pool = shared 3zoqd, mDNS ON, no st
         expect(s).toContain('pm2.config.cjs')
         expect(s).not.toMatch(/\b(rm|mv|cp|tee|touch|pm2 (restart|start|stop|delete)|systemctl|reboot)\b|>\s*[^&/]/)
         const p = parseStoreProbe(probeOut({ environ: 'readable', env: ['IDEA_STATIC_PEERS='] }))
-        expect(p.storeUrl).toBe(URL3Z)
+        expect(p.storeUrl).toBe(URL2V)
         expect(p.pid).toBe('54874')
         expect(p.environReadable).toBe(true)
         expect(p.procEnv).toEqual({ IDEA_STATIC_PEERS: '' })
@@ -111,17 +111,17 @@ describe('idea#168 r38 store preflight (live pool = shared 3zoqd, mDNS ON, no st
         expect(pm2DeclaredEnv('env: { IDEA_STATIC_PEERS: process.env.X }', 'IDEA_STATIC_PEERS')).toBe('UNPARSABLE')
     })
 
-    it('PASS: all three Pis on 3zoqd (file + running Engine /api/store-url + harness WS row), mDNS on, no static peers', async () => {
-        const { d, probed } = deps({}, {}, { idea01: { docId: '3zoqdSVsEtj4ygNJPNcDyKWvdxo6', engineRow: true } })
+    it('PASS: all three Pis on 2VroE (file + running Engine /api/store-url + harness WS row), mDNS on, no static peers', async () => {
+        const { d, probed } = deps({}, {}, { idea01: { docId: '2VroEUvDkmYsDAwE5oG9YeFNadWH', engineRow: true } })
         const r = await runStorePreflight(POOL, HOSTS, d, {})
         expect(r.ok).toBe(true)
         expect(r.mismatches).toEqual([])
-        expect(r.expected).toBe('3zoqd')
+        expect(r.expected).toBe('2VroE')
         expect(probed.sort()).toEqual(POOL)
         expect(r.pis.map(p => [p.pi, p.ok, p.mdns, p.staticPeers, p.storeUrlFile, p.apiStoreUrl, p.envSource])).toEqual(
-            POOL.map(pi => [pi, true, true, null, URL3Z, URL3Z, 'pm2.config.cjs']),
+            POOL.map(pi => [pi, true, true, null, URL2V, URL2V, 'pm2.config.cjs']),
         )
-        expect(r.pis[0]!.wsStoreDocId).toBe('3zoqdSVsEtj4ygNJPNcDyKWvdxo6')
+        expect(r.pis[0]!.wsStoreDocId).toBe('2VroEUvDkmYsDAwE5oG9YeFNadWH')
         expect(r.pis[0]!.wsEngineRow).toBe(true)
     })
 
@@ -130,14 +130,14 @@ describe('idea#168 r38 store preflight (live pool = shared 3zoqd, mDNS ON, no st
         const a = await runStorePreflight(POOL, HOSTS, deps({ idea03: probeOut({ storeUrl: other }) }, { idea03: JSON.stringify({ url: other }) }).d, {})
         expect(a.ok).toBe(false)
         expect(a.mismatches.map(formatStoreMismatch)).toEqual([
-            `store_preflight: idea03: store-url.txt: expected automerge:3zoqd…, actual ${other}`,
-            `store_preflight: idea03: running Engine /api/store-url: expected automerge:3zoqd…, actual ${other}`,
+            `store_preflight: idea03: store-url.txt: expected automerge:2VroE…, actual ${other}`,
+            `store_preflight: idea03: running Engine /api/store-url: expected automerge:2VroE…, actual ${other}`,
         ])
-        // file says 3zoqd but the running Engine still serves another store (restart pending)
+        // file says 2VroE but the running Engine still serves another store (restart pending)
         const b = await runStorePreflight(POOL, HOSTS, deps({}, { idea04: JSON.stringify({ url: other }) }).d, {})
-        expect(b.mismatches).toEqual([{ pi: 'idea04', field: 'running Engine /api/store-url', expected: 'automerge:3zoqd…', actual: other }])
-        const c = await runStorePreflight(POOL, HOSTS, deps({}, {}, { idea01: { docId: URL3Z.slice(10), engineRow: false } }).d, {})
-        expect(c.mismatches).toEqual([{ pi: 'idea01', field: 'harness WS store doc', expected: "idea01's own engineDB row in 3zoqd", actual: 'no row for this Engine' }])
+        expect(b.mismatches).toEqual([{ pi: 'idea04', field: 'running Engine /api/store-url', expected: 'automerge:2VroE…', actual: other }])
+        const c = await runStorePreflight(POOL, HOSTS, deps({}, {}, { idea01: { docId: URL2V.slice(10), engineRow: false } }).d, {})
+        expect(c.mismatches).toEqual([{ pi: 'idea01', field: 'harness WS store doc', expected: "idea01's own engineDB row in 2VroE", actual: 'no row for this Engine' }])
         // DURATION_EXPECTED_STORE_ID override
         const e = await runStorePreflight(POOL, HOSTS, deps().d, { DURATION_EXPECTED_STORE_ID: '4GQmE' })
         expect(e.ok).toBe(false)
@@ -188,7 +188,7 @@ describe('idea#168 r38 store preflight (live pool = shared 3zoqd, mDNS ON, no st
         ).d, {})
         expect(r.ok).toBe(false)
         expect(r.mismatches).toEqual([
-            { pi: 'idea03', field: 'running Engine /api/store-url', expected: 'automerge:3zoqd…', actual: 'no answer (fetch failed)' },
+            { pi: 'idea03', field: 'running Engine /api/store-url', expected: 'automerge:2VroE…', actual: 'no answer (fetch failed)' },
             { pi: 'idea04', field: 'ssh', expected: 'read-only ssh pi@100.108.39.45 answers', actual: 'unreachable: ssh: connect to host 100.108.39.45 port 22: Connection timed out' },
         ])
         const np = await runStorePreflight(['idea01'], HOSTS, deps({ idea01: probeOut({ pid: 'none' }) }).d, {})

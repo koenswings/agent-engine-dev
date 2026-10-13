@@ -164,3 +164,62 @@ describe('store_convergence wait/retry + field dump', () => {
         expect(inv[0]?.ok).toBe(true)
     })
 })
+
+describe('r80 FAIL@57: stale-view guard in waitForConvergence (lagging Pi view refreshed once, real divergence still fails)', () => {
+    const fresh = (id: string) => baseView(id, { status: 'Undocked', dockedTo: null })
+    const stale = (id: string) => baseView(id, { status: 'Running', dockedTo: 'idea01' })
+    const mk = (views: Record<string, () => SemanticStoreView>, onRefresh?: (id: string) => void) => {
+        const calls: { id: string; reason: string }[] = []
+        const ops = {
+            getStoreMode: () => 'shared',
+            waitReady: async () => ({ wsUp: true }),
+            readStore: async (id: string) => views[id]!(),
+            refreshView: async (id: string, reason: string) => {
+                calls.push({ id, reason })
+                onRefresh?.(id)
+                return true
+            },
+        }
+        return { ops: ops as never, calls }
+    }
+    const ids = ['idea01', 'idea03', 'idea04']
+    const opts = { pollMs: 1, staleAfterMs: 5, refreshExtraMs: 200 }
+
+    it('refreshes the lone lagging view once and converges (recorded reason names the engine)', async () => {
+        let idea04 = stale
+        const { ops, calls } = mk({ idea01: () => fresh('idea01'), idea03: () => fresh('idea03'), idea04: () => idea04('idea04') }, () => { idea04 = fresh })
+        const r = await waitForConvergence(ops, ids, 100, opts)
+        expect(r.ok).toBe(true)
+        expect(calls).toHaveLength(1)
+        expect(calls[0]!.id).toBe('idea04')
+        expect(calls[0]!.reason).toMatch(/only idea04 off the majority/)
+    })
+
+    it('still FAILS with the field dump when the refreshed view really diverges (one refresh only)', async () => {
+        const { ops, calls } = mk({ idea01: () => fresh('idea01'), idea03: () => fresh('idea03'), idea04: () => stale('idea04') })
+        const r = await waitForConvergence(ops, ids, 60, opts)
+        expect(r.ok).toBe(false)
+        expect(r.reason).toMatch(/kolibri-grade5a-001 field=status .*idea04=Running/)
+        expect(calls).toHaveLength(1)
+    })
+
+    it('no majority (all differ) → no refresh, plain failure', async () => {
+        const { ops, calls } = mk({
+            idea01: () => fresh('idea01'),
+            idea03: () => baseView('idea03', { status: 'Paused' }),
+            idea04: () => stale('idea04'),
+        })
+        const r = await waitForConvergence(ops, ids, 40, opts)
+        expect(r.ok).toBe(false)
+        expect(calls).toHaveLength(0)
+    })
+
+    it('ops without refreshView keep the old behaviour (fail at the timeout, no extension)', async () => {
+        const { ops } = mk({ idea01: () => fresh('idea01'), idea03: () => fresh('idea03'), idea04: () => stale('idea04') })
+        delete (ops as { refreshView?: unknown }).refreshView
+        const t0 = Date.now()
+        const r = await waitForConvergence(ops, ids, 40, opts)
+        expect(r.ok).toBe(false)
+        expect(Date.now() - t0).toBeLessThan(150)
+    })
+})
