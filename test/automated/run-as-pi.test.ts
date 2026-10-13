@@ -102,6 +102,9 @@ describe('Engine sudoers asset (idea#80)', () => {
             '-n ${ERASE_SCRIPT} ${a.device} ${a.serial} ${String(a.sizeBytes)} ${a.label} ${a.stagingDir}',
             // 11-engine-files (idea#168): erase-slot via idea-app-data (loop-backed test slots)
             '-n ${APP_DATA_HELPER} ${argv[0]} ${argv[1]} ${argv[2]}',
+            // 10-engine ENGINE_APPDIRS (engine#187): Instance.ts creates the system-disk app folders
+            '-n /usr/bin/mkdir -p /apps /instances /services',
+            '-n /usr/bin/chown pi:pi /apps /instances /services',
         ]
         const calls = RUNTIME_FILES.flatMap(f => sudoCalls(src(f)))
         expect(calls.length).toBeGreaterThan(0)
