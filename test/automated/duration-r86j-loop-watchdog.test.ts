@@ -20,6 +20,8 @@ import {
 import { CONNECT_OVERRUN_GRACE_MS, RealFleetOps } from '../duration/realFleetOps.js'
 
 const here = fileURLToPath(new URL('.', import.meta.url))
+// Tests run from dist-test/test/automated; .ts sources live in the source tree (test/automated).
+const srcHere = here.replace(/([\\/])dist-test[\\/]/, '$1')
 const tmp = () => mkdtempSync(join(tmpdir(), 'r86j-'))
 
 afterEach(() => _resetVerdictState())
@@ -75,7 +77,7 @@ describe('r86j: loop watchdog bounds a blocked event loop', () => {
 
     it('real process: SIGKILLed by the watchdog still leaves FAIL; SIGTERM leaves FAIL', () => {
         const d = tmp()
-        const mod = pathToFileURL(join(here, '../duration/verdict.ts')).href
+        const mod = pathToFileURL(join(srcHere, '../duration/verdict.ts')).href
         const run = (code: string) => spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', `import * as v from ${JSON.stringify(mod)};\n${code}`], { timeout: 20_000 })
         const blocked = run(`v.setVerdictDir(${JSON.stringify(d)}); v.installVerdictGuards();
             v.setCurrentStep(116); v.startLoopWatchdog({ dir: ${JSON.stringify(d)}, stallMs: 800, lagLogMs: 300, beatMs: 50 });
@@ -101,7 +103,7 @@ describe('r86j: a connect that overran its bound is a stall, not a slow ready', 
         expect(CONNECT_OVERRUN_GRACE_MS).toBe(5_000)
         expect(typeof ops.openConn).toBe('function')
         // Source check: the overrun guard turns a late 'ready' into a stall before registerConn.
-        const src = readFileSync(join(here, '../duration/realFleetOps.ts'), 'utf8')
+        const src = readFileSync(join(srcHere, '../duration/realFleetOps.ts'), 'utf8')
         const i = src.indexOf('overrunMs > CONNECT_OVERRUN_GRACE_MS')
         expect(i).toBeGreaterThan(0)
         expect(src.indexOf("kind: 'stall'", i)).toBeGreaterThan(i)

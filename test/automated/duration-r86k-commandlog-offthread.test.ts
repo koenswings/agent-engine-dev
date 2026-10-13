@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url'
 import { describe, it, expect } from 'vitest'
 import { Repo } from '@automerge/automerge-repo'
 import { WebSocketServerAdapter } from '@automerge/automerge-repo-network-websocket'
@@ -48,7 +49,7 @@ describe('r86k CommandLog read off the main thread', () => {
     }, 20_000)
 
     it('RealFleetOps.listCommandTraces no longer opens the CommandLog on its main-thread Repo', () => {
-        const src = readFileSync(new URL('../duration/realFleetOps.ts', import.meta.url), 'utf8')
+        const src = readFileSync(fileURLToPath(new URL('../duration/realFleetOps.ts', import.meta.url)).replace(/([\\/])dist-test[\\/]/, '$1'), 'utf8')
         const body = src.slice(src.indexOf('async listCommandTraces('), src.indexOf('async listCommandTraces(') + 2500)
         expect(body).not.toMatch(/conn\.repo\.find/)
         expect(body).toMatch(/CommandLogReader/)
