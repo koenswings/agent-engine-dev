@@ -30,6 +30,7 @@
  * empty set) and says so loudly until Ops confirms the store.
  */
 
+import { peerLiveSeen } from './Liveness.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { spawn } from 'child_process'
 import { fs, chalk } from 'zx'
@@ -70,7 +71,11 @@ const ageText = (ms: number): string => {
  * well-formed peerAccess and a heartbeat within `staleMs`. Engines that share a
  * key (a cloned SD card) are all left out. Sorted by Engine id, at most 256.
  */
-export const computePeerSet = (store: Store, localEngineId: string, now: number, staleMs: number = PEER_STALE_MS): { peers: PeerLine[], skipped: SkippedPeer[] } => {
+export const computePeerSet = (
+    store: Store, localEngineId: string, now: number, staleMs: number = PEER_STALE_MS,
+    /** last live hb/metrics from that Engine (our clock), store-design 2026-10-13; see Liveness.ts */
+    liveSeen: (engineId: string) => number | undefined = () => undefined,
+): { peers: PeerLine[], skipped: SkippedPeer[] } => {
     const skipped: SkippedPeer[] = []
     let peers: PeerLine[] = []
     const ownKey = normaliseEd25519((store.engineDB as any)?.[localEngineId]?.peerAccess?.sshKey)
@@ -84,7 +89,10 @@ export const computePeerSet = (store: Store, localEngineId: string, now: number,
         const hostKey = normaliseEd25519(pa.hostKey)
         if (!sshKey) { skipped.push({ engineId, reason: 'its published sshKey is not one ed25519 public key' }); continue }
         if (!hostKey) { skipped.push({ engineId, reason: 'its published hostKey is not one ed25519 public key' }); continue }
-        const lastRun = Number(eng.lastRun)
+        // stored lastRun (boot + hourly) or a live hb ping, whichever is newer
+        const stored = Number(eng.lastRun)
+        const ping = liveSeen(engineId)
+        const lastRun = ping !== undefined && (!Number.isFinite(stored) || ping > stored) ? ping : stored
         if (!Number.isFinite(lastRun) || now - lastRun > staleMs) {
             skipped.push({ engineId, reason: Number.isFinite(lastRun) ? `stale: no heartbeat for ${ageText(now - lastRun)}` : 'stale: no heartbeat recorded' })
             continue
@@ -258,6 +266,8 @@ export interface PeerAccessOptions {
     run?: AppDataInputRunner
     now?: () => number
     staleMs?: number
+    /** last live ping per peer (default Liveness.peerLiveSeen) */
+    liveSeen?: (engineId: string) => number | undefined
     debounceMs?: number
     keyPath?: string
     hostKeyPath?: string
@@ -375,7 +385,7 @@ export class PeerAccessController {
         const store = this.handle.doc()
         if (!store) return
         const { peers, skipped } = this.opts.mode === 'on'
-            ? computePeerSet(store, this.localEngineId, this.now(), this.opts.staleMs ?? PEER_STALE_MS)
+            ? computePeerSet(store, this.localEngineId, this.now(), this.opts.staleMs ?? PEER_STALE_MS, this.opts.liveSeen ?? peerLiveSeen)
             : { peers: [] as PeerLine[], skipped: [] as SkippedPeer[] }
         const input = peerSetInput(peers)
         if (input !== this.lastInput) {
