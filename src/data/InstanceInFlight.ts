@@ -53,3 +53,49 @@ export const waitInFlightOnDisk = async (diskId: string, timeoutMs: number): Pro
 
 /** Test hook. */
 export const resetInFlightForTests = (): void => { inFlight.clear() }
+
+// ── Undock pending + dock identity (hw180 idea04, 2026-10-13) ───────────────────────────
+
+const undockPending = new Map<string, number>()
+
+/** An undock (eject, erase or physical removal) of `diskId` has begun and has not finished. */
+export const markUndockPending = (diskId: string): void => { undockPending.set(String(diskId), (undockPending.get(String(diskId)) ?? 0) + 1) }
+export const clearUndockPending = (diskId: string): void => {
+    const n = (undockPending.get(String(diskId)) ?? 0) - 1
+    if (n > 0) undockPending.set(String(diskId), n); else undockPending.delete(String(diskId))
+}
+export const isUndockPending = (diskId: string): boolean => (undockPending.get(String(diskId)) ?? 0) > 0
+
+/** What identifies one dock of a disk: device node, engine, dock time (generation). */
+export interface DockIdentity { device: string | null; dockedTo: string | null; lastDocked: number | null }
+export const dockIdentityOf = (d: { device?: unknown; dockedTo?: unknown; lastDocked?: unknown } | null | undefined): DockIdentity => ({
+    device: (d?.device as string) ?? null, dockedTo: (d?.dockedTo as string) ?? null, lastDocked: (d?.lastDocked as number) ?? null,
+})
+
+/**
+ * Why the dock `before` (captured when the eject began) is no longer the disk's current dock
+ * `now` (store record after the in-flight wait); null when it is still the same dock.
+ */
+export const dockChangedReason = (before: DockIdentity, now: DockIdentity | null): string | null => {
+    if (!now || !now.dockedTo || !now.device) return `disk is no longer docked (was ${before.device})`
+    if (now.dockedTo !== before.dockedTo) return `disk is now docked to ${now.dockedTo} (was ${before.dockedTo})`
+    if (now.device !== before.device) return `disk was re-docked on ${now.device} (was ${before.device})`
+    if (now.lastDocked !== before.lastDocked) return `disk was re-docked on ${now.device} (dock generation ${before.lastDocked} → ${now.lastDocked})`
+    return null
+}
+
+/**
+ * Why a failed start on `diskId` is a pulled disk rather than a real start failure; null = real failure.
+ * `deviceAtStart` is the device the start ran against; `deviceExists` checks the node (injected for tests).
+ */
+export const startDiskGoneReason = (diskId: string, deviceAtStart: string | null, now: DockIdentity | null,
+    deviceExists: ((dev: string) => boolean) | null): string | null => {
+    if (isUndockPending(diskId)) return 'an undock of the disk is pending'
+    if (!now || !now.dockedTo || !now.device) return 'the disk is no longer docked'
+    if (deviceAtStart && now.device !== deviceAtStart) return `the disk moved from ${deviceAtStart} to ${now.device}`
+    if (deviceExists && deviceAtStart && !deviceExists(deviceAtStart)) return `device ${deviceAtStart} is gone`
+    return null
+}
+
+/** Test hook. */
+export const resetUndockPendingForTests = (): void => { undockPending.clear() }
