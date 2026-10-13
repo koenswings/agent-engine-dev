@@ -25,7 +25,7 @@ import { parse as parseYaml } from 'yaml'
 /** Exit code of a failed store preflight (1 walk failures, 2 fatal, 4 engine unreachable, 5 Console pin). */
 export const EXIT_STORE_PREFLIGHT = 6
 
-export const DEFAULT_EXPECTED_STORE_ID = '3zoqd'
+export const DEFAULT_EXPECTED_STORE_ID = '2VroE'
 export const DEFAULT_ENGINE_DIR = '/home/pi/idea/agents/agent-engine-dev'
 const NEVER = 'idea02'
 

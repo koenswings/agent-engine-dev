@@ -16,7 +16,7 @@ CONSOLE_PIN=19a8b82bb50f4fdb2c27e68bf39464267381188e  # intents = 234d833 merged
 [ "$(git -C /home/walker/agent-console-dev rev-parse HEAD)" = "$CONSOLE_PIN" ] || { echo "REFUSE: console intents checkout is not $CONSOLE_PIN"; exit 3; }
 git -C /home/walker/agent-console-dev diff --quiet || { echo "REFUSE: dirty console intents tree"; exit 3; }
 mkdir -p "$EVID"; [ -f "$EVID/run.pid" ] && kill -0 "$(cat "$EVID/run.pid")" 2>/dev/null && { echo "REFUSE: already running"; exit 4; }
-( cd "$REPO" && STORE_DOC="${STORE_DOC:-3zoqdSVsEtj4ygNJPNcDyKWvdxo6}" DURATION_DOC_WAIT_MS=45000 /usr/bin/env npx tsx script/idea02-walker/store-check.ts ) > "$EVID/store-check.txt" 2>&1 || { echo "REFUSE: store-check gate FAIL"; tail -8 "$EVID/store-check.txt"; exit 8; }
+( cd "$REPO" && STORE_DOC="${STORE_DOC:-2VroEUvDkmYsDAwE5oG9YeFNadWH}" DURATION_DOC_WAIT_MS=45000 /usr/bin/env npx tsx script/idea02-walker/store-check.ts ) > "$EVID/store-check.txt" 2>&1 || { echo "REFUSE: store-check gate FAIL"; tail -8 "$EVID/store-check.txt"; exit 8; }
 rm -f "$EVID/run.pid"
 cat > "$EVID/run.sh" <<R
 #!/usr/bin/env bash
@@ -31,7 +31,7 @@ export DURATION_EXPECTED_CONSOLE_SHA=$CONSOLE_PIN
 export DURATION_CONSOLE_PRODUCT_SHA=ca8c111e4bc30fb2731749597650c226dc89e236
 export DURATION_CONSOLE_PRODUCT_ASSET=index-qUni5WGC.js
 export DURATION_CONSOLE_PRODUCT_ASSET_MD5=3428b6f5e0667f790d803beb0ad5ce0b
-export DURATION_EXPECTED_STORE_ID=3zoqd
+export DURATION_EXPECTED_STORE_ID=2VroE
 export DURATION_POST_OP_SETTLE_MS=\${DURATION_POST_OP_SETTLE_MS:-300000}
 export DURATION_DOC_WAIT_MS=\${DURATION_DOC_WAIT_MS:-45000}
 export DURATION_DOC_WAIT_MS_IDEA04=\${DURATION_DOC_WAIT_MS_IDEA04:-120000}
