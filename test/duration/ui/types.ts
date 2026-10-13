@@ -18,6 +18,11 @@ export interface UiIntentContext {
      * else activeTab.screenshot({ path, fullPage: true }).
      */
     screenshotPath?: string
+    /**
+     * r64 (r63 FAIL@43): read-only store wait for the Operation an Intent just confirmed (copyApp/moveApp/
+     * restoreApp). Handed to the Console Intent; it waits for Done before its single post-op Start.
+     */
+    waitOperation?: import('../opWait.js').WaitOperationFn
 }
 
 export interface UiIntentResult {
@@ -61,5 +66,12 @@ export interface UiDriver {
         hostname: string,
         opts?: { timeoutMs?: number; allowReload?: boolean },
     ): Promise<string>
+    /** r55 (optional): sequence number of the newest tab the browser context opened. */
+    tabSeq?(): number
+    /**
+     * r55 (optional): the Console page and every open tab — URL, whether it is the active tab, and
+     * whether it was opened after `sinceSeq`. Used to prove a step's App tabs are on store URLs.
+     */
+    appTabs?(sinceSeq?: number): { url: string; active: boolean; fresh: boolean; console?: boolean }[]
     close?(): Promise<void>
 }

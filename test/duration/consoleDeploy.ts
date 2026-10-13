@@ -47,6 +47,35 @@ export type ConsoleDeployInput = {
     stamp: ConsoleBuildStamp | null
     probe: ConsoleDistProbe | null
     probeError?: string | null
+    /** r65 split pins: the served PRODUCT pin (absent = Stage 1 single-pin behaviour). */
+    product?: ConsoleProductPin | null
+    /** md5 of the served main asset bytes (split mode). */
+    servedAssetMd5?: string | null
+    /** `git diff --name-only <product>..<intents>` in the box Intents checkout (split mode). */
+    rangeFiles?: string[] | null
+    /** product SHA is an ancestor of the intents SHA (split mode). */
+    rangeAncestor?: boolean | null
+    rangeError?: string | null
+}
+
+/**
+ * r65 (r64 exit 5): the Console the pool SERVES (product: built from `sha`, asset name + md5) is pinned
+ * apart from the box Intents checkout (DURATION_EXPECTED_CONSOLE_SHA). An intents tip passes only when
+ * every commit between the two touches e2e/ or test/ paths alone.
+ */
+export type ConsoleProductPin = { sha: string; asset: string; md5: string | null }
+
+/** Paths an intents-only tip may change without a dist rebuild. */
+export const INTENTS_ONLY_PATH = /^(e2e|test)\//
+export const productPathsIn = (files: string[]): string[] => files.filter(f => f.trim() && !INTENTS_ONLY_PATH.test(f.trim()))
+
+/** Product pin from env (DURATION_CONSOLE_PRODUCT_SHA / _ASSET / _ASSET_MD5); null when unset. */
+export const consoleProductPinFromEnv = (env: NodeJS.ProcessEnv = process.env): ConsoleProductPin | null => {
+    const sha = env.DURATION_CONSOLE_PRODUCT_SHA?.trim()
+    if (!sha) return null
+    const asset = env.DURATION_CONSOLE_PRODUCT_ASSET?.trim()
+    if (!asset) throw new Error('console_deploy_preflight: DURATION_CONSOLE_PRODUCT_SHA set without DURATION_CONSOLE_PRODUCT_ASSET (served asset name, e.g. index-<hash>.js)')
+    return { sha, asset: asset.replace(/^\/?(assets\/)?/, 'assets/'), md5: env.DURATION_CONSOLE_PRODUCT_ASSET_MD5?.trim().toLowerCase() || null }
 }
 
 export type ConsoleDeployVerdict = { ok: boolean; servedSha: string | null; method: 'build-info' | 'ssh-checkout' | 'none'; note: string }
@@ -135,6 +164,7 @@ export const consoleDeployVerdict = (i: ConsoleDeployInput): ConsoleDeployVerdic
     if (!i.boxHead || !shaMatches(i.boxHead, i.pin)) {
         return fail(null, 'none', `box Intents checkout is ${short(i.boxHead)}, not the pinned Console.`)
     }
+    if (i.product) return splitVerdict(i, i.product, where, fail)
     if (i.stamp) {
         if (i.stamp.dirty) return fail(i.stamp.sha, 'build-info', `${where} serves a dirty build of ${short(i.stamp.sha)} (build-info.json).`)
         if (!shaMatches(i.stamp.sha, i.pin)) {
@@ -177,6 +207,54 @@ export const consoleDeployVerdict = (i: ConsoleDeployInput): ConsoleDeployVerdic
     }
 }
 
+/** r65 split-pin verdict: served asset = product pin, product..intents touches only e2e/ + test/. */
+const splitVerdict = (
+    i: ConsoleDeployInput,
+    prod: ConsoleProductPin,
+    where: string,
+    fail: (servedSha: string | null, method: ConsoleDeployVerdict['method'], why: string) => ConsoleDeployVerdict,
+): ConsoleDeployVerdict => {
+    const pins = `product ${short(prod.sha)} (${prod.asset}${prod.md5 ? ` md5 ${prod.md5.slice(0, 8)}` : ''}) / intents ${short(i.pin)}`
+    // Range: intents = product + e2e/test-only commits.
+    if (i.rangeError || i.rangeFiles == null) return fail(null, 'none', `cannot list ${short(prod.sha)}..${short(i.pin)} in the box Intents checkout${i.rangeError ? `: ${i.rangeError}` : ''}.`)
+    if (!shaMatches(prod.sha, i.pin) && i.rangeAncestor === false) {
+        return fail(null, 'none', `product ${short(prod.sha)} is not an ancestor of intents ${short(i.pin)} — the intents tip is not built on the served product.`)
+    }
+    const prodFiles = productPathsIn(i.rangeFiles)
+    if (prodFiles.length) {
+        return fail(null, 'none', `${short(prod.sha)}..${short(i.pin)} changes product path(s) [${prodFiles.slice(0, 10).join(', ')}${prodFiles.length > 10 ? `, +${prodFiles.length - 10}` : ''}] — the served dist is stale, rebuild.`)
+    }
+    // Served = product pin.
+    if (!i.servedAsset) return fail(null, 'none', `could not read the main asset from ${i.consoleUrl}/ index.html.`)
+    if (i.servedAsset !== prod.asset) return fail(null, 'none', `${where} serves ${i.servedAsset}, not the product pin ${prod.asset}.`)
+    if (prod.md5) {
+        if (!i.servedAssetMd5) return fail(null, 'none', `could not hash the served ${i.servedAsset}.`)
+        if (i.servedAssetMd5.toLowerCase() !== prod.md5) return fail(null, 'none', `${where} serves ${i.servedAsset} with md5 ${i.servedAssetMd5}, not the product pin md5 ${prod.md5}.`)
+    }
+    if (i.stamp) {
+        if (i.stamp.dirty || !shaMatches(i.stamp.sha, prod.sha)) return fail(i.stamp.sha, 'build-info', `${where} build-info.json says ${short(i.stamp.sha)}${i.stamp.dirty ? ' (dirty)' : ''}, not the product pin.`)
+        return { ok: true, servedSha: i.stamp.sha, method: 'build-info', note: `console_deploy_preflight: split pins ${pins}: ${where} serves ${i.servedAsset} (build-info ${short(i.stamp.sha)}); range e2e/test-only (${i.rangeFiles.length} files)` }
+    }
+    if (i.consoleHost) {
+        const p = i.probe
+        if (!p) return fail(null, 'ssh-checkout', `read-only probe of ${i.consoleHost} failed${i.probeError ? `: ${i.probeError}` : ''}.`)
+        if (p.distAsset !== i.servedAsset) return fail(p.head, 'ssh-checkout', `${where} serves ${i.servedAsset} but ${i.consoleHost}:${p.consolePath ?? '?'}/index.html references ${p.distAsset ?? 'nothing'} — not the served dist.`)
+        if ((p.dirty ?? 0) > 0) return fail(p.head, 'ssh-checkout', `${i.consoleHost} Console checkout ${short(p.head)} has ${p.dirty} tracked change(s).`)
+        if (p.head && !shaMatches(p.head, prod.sha) && !shaMatches(p.head, i.pin)) {
+            return fail(p.head, 'ssh-checkout', `${i.consoleHost} Console checkout is ${short(p.head)}, neither the product nor the intents pin.`)
+        }
+    }
+    return {
+        ok: true,
+        servedSha: prod.sha,
+        method: i.consoleHost ? 'ssh-checkout' : 'none',
+        note:
+            `console_deploy_preflight: split pins ${pins}: ${where} serves ${i.servedAsset}` +
+            `${i.servedAssetMd5 ? ` md5 ${i.servedAssetMd5.slice(0, 8)}` : ''} = product pin; ` +
+            `${short(prod.sha)}..${short(i.pin)} touches only e2e/ + test/ (${i.rangeFiles.length} files); box Intents checkout = ${short(i.pin)}`,
+    }
+}
+
 /** Pool logical id behind the Console URL host (id itself, or its --hosts address), else null. */
 export const consoleHostFor = (consoleUrl: string, hosts: Record<string, string>): string | null => {
     let h: string
@@ -197,6 +275,10 @@ export type ConsoleDeployDeps = {
     probeDist: (consoleHost: string) => Promise<ConsoleDistProbe>
     /** `git rev-parse HEAD` of the box Intents checkout. */
     boxHead: () => Promise<string | null>
+    /** Split mode: md5 hex of a served URL's bytes. */
+    fetchMd5?: (url: string) => Promise<string>
+    /** Split mode: changed files and ancestry of product..intents in the box Intents checkout. */
+    rangeFiles?: (from: string, to: string) => Promise<{ files: string[]; ancestor: boolean }>
 }
 
 /**
@@ -209,7 +291,7 @@ export const runConsoleDeployPreflight = async (
     hosts: Record<string, string>,
     deps: ConsoleDeployDeps,
     env: NodeJS.ProcessEnv = process.env,
-): Promise<ConsoleDeployVerdict & { pin: string | null; boxHead: string | null }> => {
+): Promise<ConsoleDeployVerdict & { pin: string | null; boxHead: string | null; product: ConsoleProductPin | null; servedAsset?: string | null; servedAssetMd5?: string | null }> => {
     const base = consoleUrl.replace(/\/+$/, '')
     const boxHead = await deps.boxHead().catch(() => null)
     const envPin = env.DURATION_EXPECTED_CONSOLE_SHA?.trim()
@@ -222,6 +304,7 @@ export const runConsoleDeployPreflight = async (
             method: 'none',
             pin: null,
             boxHead,
+            product: null,
             note:
                 'console_deploy_preflight: no Console pin — set DURATION_EXPECTED_CONSOLE_SHA (and point ' +
                 'DURATION_CONSOLE_INTENTS at a git checkout of that commit). No soft-pass.',
@@ -251,6 +334,29 @@ export const runConsoleDeployPreflight = async (
             probeError = e instanceof Error ? e.message : String(e)
         }
     }
-    const v = consoleDeployVerdict({ consoleUrl: base, consoleHost, pin, pinSource, boxHead, servedAsset, stamp, probe, probeError })
-    return { ...v, pin, boxHead }
+    let product: ConsoleProductPin | null = null
+    try {
+        product = consoleProductPinFromEnv(env)
+    } catch (e) {
+        return { ok: false, servedSha: null, method: 'none', pin, boxHead, product: null, note: `${e instanceof Error ? e.message : String(e)}. No soft-pass.` }
+    }
+    let servedAssetMd5: string | null = null
+    let rangeFiles: string[] | null = null
+    let rangeAncestor: boolean | null = null
+    let rangeError: string | null = null
+    if (product) {
+        if (servedAsset && deps.fetchMd5) servedAssetMd5 = await deps.fetchMd5(`${base}/${servedAsset}`).catch(() => null)
+        if (!deps.rangeFiles) rangeError = 'no git range reader'
+        else {
+            try {
+                const r = await deps.rangeFiles(product.sha, pin)
+                rangeFiles = r.files
+                rangeAncestor = r.ancestor
+            } catch (e) {
+                rangeError = e instanceof Error ? e.message : String(e)
+            }
+        }
+    }
+    const v = consoleDeployVerdict({ consoleUrl: base, consoleHost, pin, pinSource, boxHead, servedAsset, stamp, probe, probeError, product, servedAssetMd5, rangeFiles, rangeAncestor, rangeError })
+    return { ...v, pin, boxHead, product, servedAsset, servedAssetMd5 }
 }
