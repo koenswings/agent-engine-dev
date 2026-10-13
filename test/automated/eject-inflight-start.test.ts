@@ -17,7 +17,7 @@ import { fs, path } from 'zx'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import { DeviceName, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/data/CommonTypes.js'
-import { undockDisk } from '../../src/monitors/usbDeviceMonitor.js'
+import { undockDisk, undockAllOnDevice } from '../../src/monitors/usbDeviceMonitor.js'
 import { processDisk } from '../../src/data/Disk.js'
 import { trackInFlight, inFlightOnDisk, resetInFlightForTests } from '../../src/data/InstanceInFlight.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
@@ -87,6 +87,17 @@ describe('#179 (1): eject waits for an in-flight start on the disk, then stops',
         const t0 = Date.now()
         await undockDisk(h, h.doc()!.diskDB['e003' as DiskID] as any)
         expect(Date.now() - t0).toBeLessThan(1000)
+    })
+
+    it('physical removal (undockAllOnDevice, device gone): no in-flight wait, disk undocked at once', async () => {
+        process.env.IDEA_EJECT_INFLIGHT_WAIT_MS = '5000'
+        const h = await newStore()
+        const dev = uniqueTestDevice(); addDisk(h, 'e004', dev)
+        trackInFlight('e004', 'startInstance pulled', new Promise<void>(() => {}))
+        const t0 = Date.now()
+        await undockAllOnDevice(h, LOCAL, dev as DeviceName)
+        expect(Date.now() - t0).toBeLessThan(1000)
+        expect(h.doc()!.diskDB['e004' as DiskID]!.dockedTo).toBeNull()
     })
 })
 
