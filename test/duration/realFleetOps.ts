@@ -2264,12 +2264,34 @@ export class RealFleetOps implements FleetOps {
         const t0 = Date.now()
         const old = this.conns.get(engineId)
         const beforeHeads = old ? headsKey(this.headsOf(old)) : 'no-conn'
+        // r86r (r86q FAIL@42, Steve): an alive off-thread link is RE-SYNCED in its worker (f702e6a reattach),
+        // never replaced by connect(forceNew) — a fresh Repo is a full first sync of 3zoqd (~58 s on a Pi) on
+        // an already busy store host. A slow host (heartbeat late but recovering) gets more time, bounded by
+        // DURATION_REFRESH_REATTACH_MS; past that the refresh fails loudly (counted, foundNew=null). Only a
+        // dead link, or a responsive host whose WS stays down, falls back to a fresh connection.
+        const link = old?.link
+        if (link && link.alive) {
+            const r = await this.reattachBounded(engineId, link)
+            if (r.ok) {
+                const afterHeads = headsKey(this.headsOf(old!))
+                const foundNew = afterHeads !== beforeHeads
+                this.viewSeen.set(engineId, { heads: afterHeads, changedAt: Date.now() })
+                recordReconnect({ engine: engineId, at: t0, reason, foundNew, beforeHeads, afterHeads, tookMs: Date.now() - t0, mode: 'reattach' })
+                return foundNew
+            }
+            if (r.hostBlocked) {
+                recordReconnect({ engine: engineId, at: t0, reason, foundNew: null, beforeHeads, afterHeads: 'n/a', tookMs: Date.now() - t0, mode: 'failed',
+                    error: `stale-view refresh: re-sync of the existing link did not complete within ${r.boundMs}ms and the store host is still blocked (${r.detail}); NOT replaced by a fresh full sync` })
+                return null
+            }
+            console.log(JSON.stringify({ event: 'stale_view_refresh_fallback', engine: engineId, reason: `re-sync failed with a responsive host: ${r.detail}; closing for a fresh connection` }))
+        }
         try {
             const fresh = await this.connect(engineId, true)
             const afterHeads = headsKey(this.headsOf(fresh))
             const foundNew = afterHeads !== beforeHeads
             this.viewSeen.set(engineId, { heads: afterHeads, changedAt: Date.now() })
-            recordReconnect({ engine: engineId, at: t0, reason, foundNew, beforeHeads, afterHeads, tookMs: Date.now() - t0 })
+            recordReconnect({ engine: engineId, at: t0, reason, foundNew, beforeHeads, afterHeads, tookMs: Date.now() - t0, mode: 'fresh' })
             return foundNew
         } catch (e) {
             recordReconnect({
@@ -2278,6 +2300,28 @@ export class RealFleetOps implements FleetOps {
             })
             return null
         }
+    }
+
+    /**
+     * r86r: re-sync an alive link, retrying in slices while its host thread is blocked but recovering
+     * (heartbeat answered again since the last slice). Bounded by DURATION_REFRESH_REATTACH_MS (default 120 s).
+     */
+    private async reattachBounded(engineId: string, link: StoreDocLink): Promise<{ ok: boolean; hostBlocked: boolean; detail: string; boundMs: number }> {
+        const boundMs = Number(process.env.DURATION_REFRESH_REATTACH_MS ?? 120_000)
+        const sliceMs = Number(process.env.DURATION_REFRESH_REATTACH_SLICE_MS ?? 15_000)
+        const until = Date.now() + boundMs
+        let detail = 'not tried'
+        let blocked = false
+        for (let i = 1; ; i++) {
+            const ms = Math.max(1, Math.min(sliceMs, until - Date.now()))
+            if (await link.reattach(ms)) return { ok: true, hostBlocked: false, detail: 'ok', boundMs }
+            detail = link.lastReattachError ?? 'unknown'
+            blocked = link.hostState() !== ''
+            console.log(JSON.stringify({ event: 'stale_view_reattach_slice', engine: engineId, slice: i, host_blocked: blocked, detail }))
+            if (!link.alive || Date.now() >= until) break
+            if (!blocked) break // responsive host and still no peer/ready handle: a real disconnect
+        }
+        return { ok: false, hostBlocked: blocked && link.alive, detail, boundMs }
     }
 
     /**
