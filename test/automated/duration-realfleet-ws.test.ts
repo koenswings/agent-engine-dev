@@ -280,21 +280,25 @@ describe('RealFleetOps WS model — fake Engine (r32)', () => {
 
 describe('RealFleetOps doc wait config (r32)', () => {
     const ops = () => new RealFleetOps({ poolEngines: ['idea01', 'idea03', 'idea04'], hosts: { idea01: 'a', idea03: 'b', idea04: 'c' } })
-    it('defaults: 15 s, idea04 (Pi 4) 30 s', () => {
+    it('defaults: 15 s, idea04 (Pi 4) 120 s (r86b)', () => {
         delete process.env.DURATION_DOC_WAIT_MS; delete process.env.DURATION_DOC_WAIT_MS_BY_HOST; delete process.env.DURATION_DOC_WAIT_MS_IDEA04
         expect(DEFAULT_DOC_WAIT_MS).toBeGreaterThanOrEqual(15_000)
         expect(ops().docWaitMsFor('idea01')).toBe(15_000)
-        expect(ops().docWaitMsFor('idea04')).toBe(30_000)
+        expect(ops().docWaitMsFor('idea04')).toBe(120_000)
     })
     it('env overrides: global, by-host map, per-host var; floored at 15 s and capped below automerge 60 s', () => {
         process.env.DURATION_DOC_WAIT_MS = '20000'
         expect(ops().docWaitMsFor('idea01')).toBe(20_000)
-        expect(ops().docWaitMsFor('idea04')).toBe(30_000) // host default beats the global value
+        expect(ops().docWaitMsFor('idea04')).toBe(120_000) // host default beats the global value
         process.env.DURATION_DOC_WAIT_MS_BY_HOST = 'idea04=25000, idea03=5000'
         expect(ops().docWaitMsFor('idea04')).toBe(25_000)
         expect(ops().docWaitMsFor('idea03')).toBe(MIN_DOC_WAIT_MS)
         process.env.DURATION_DOC_WAIT_MS_IDEA04 = '120000'
-        expect(ops().docWaitMsFor('idea04')).toBe(MAX_DOC_WAIT_MS)
+        expect(ops().docWaitMsFor('idea04')).toBe(120_000) // r86b: idea04 cap 120 s
+        process.env.DURATION_DOC_WAIT_MS_IDEA04 = '600000'
+        expect(ops().docWaitMsFor('idea04')).toBe(120_000)
+        process.env.DURATION_DOC_WAIT_MS_BY_HOST = 'idea03=120000'
+        expect(ops().docWaitMsFor('idea03')).toBe(MAX_DOC_WAIT_MS) // Pi 5s keep the 45 s cap
     })
     it('TrackedWebSocketClientAdapter never connects again after disconnect()', () => {
         const a = new TrackedWebSocketClientAdapter('ws://127.0.0.1:1', 2000, 'idea01')

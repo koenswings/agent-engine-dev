@@ -15,6 +15,8 @@
  * --record-walk <dir>: screenshots after UI/live-page steps + ffmpeg walk.mp4 (best with --ui).
  */
 
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { FakeFleetOps } from './actions.js'
 import { RealFleetOps, parseHostsFlag } from './realFleetOps.js'
 import { ensureRecordWalkDir } from './recordWalk.js'
@@ -30,12 +32,19 @@ import {
 } from './scenario.js'
 import { createUiDriver, resolveConsoleIntentsDir } from './ui/index.js'
 import { EXIT_CONSOLE_PIN_MISMATCH, runConsoleDeployPreflight } from './consoleDeploy.js'
+import { boxToolingExitCode, checkBoxTooling, realBoxToolingDeps } from './boxTooling.js'
 import { $ } from 'zx'
+import { startPauseMonitor } from './procRun.js'
+import { reconnectLine, reconnectSummary, writeReconnectsMd } from './staleView.js'
+import { createHash } from 'node:crypto'
 import type { StructuredLogEntry } from './types.js'
 import { EXIT_ENGINE_UNREACHABLE, installProcessGuards, timeoutSummary, walkExitCode } from './automergeTimeoutGuard.js'
 import { DEFAULT_PREFLIGHT_TIMEOUT_MS } from './realFleetOps.js'
 import { EXIT_STORE_PREFLIGHT, formatStoreMismatch, runStorePreflight } from './storePreflight.js'
 import { EXIT_SLOT_PREFLIGHT } from './slotLayout.js'
+import { describeStage2Windows, EXIT_STAGE2_PREFLIGHT, resolveDurationStage, stage2Preflight, stage2HomeOf, stage2SummaryFields, STAGE2_FIXTURES } from './stage2.js'
+import { resolveStage2StoreFixMode, runStage2StoreFix } from './stage2StoreFix.js'
+import { Stage2FleetOps } from './stage2FleetOps.js'
 import { EXIT_FIXTURE_PREFLIGHT, fixtureDiskPreflight } from './fixtureDisks.js'
 import {
     EXIT_PEER_PREFLIGHT,
@@ -46,6 +55,7 @@ import {
     type PeerPreflightResult,
 } from './peerPreflight.js'
 import { resolveConsoleEngineHost } from './actions.js'
+import { installVerdictGuards, setCurrentStep, setVerdictDir, startLoopWatchdog, startMemSampler, writeVerdict } from './verdict.js'
 import {
     buildRunSummary,
     formatRunSummaryLine,
@@ -93,7 +103,7 @@ const usage = () => {
                         a mismatch exits 5 (console_deploy_preflight).
                         Store preflight (EVERY --live run; NOT skipped by --no-preflight):
                         each pool Pi must use the one shared store DURATION_EXPECTED_STORE_ID
-                        (default 3zoqd: store-url.txt, the running Engine's /api/store-url,
+                        (default 2VroE: store-url.txt, the running Engine's /api/store-url,
                         the harness WS doc) with mDNS ON (settings.mdns, IDEA_MDNS_DISABLE) and
                         no static peers (IDEA_STATIC_PEERS ?? settings.staticPeers); a mismatch
                         exits 6 (store_preflight, names Pi / field / expected vs actual).
@@ -255,6 +265,14 @@ const main = async () => {
         usage()
         process.exit(0)
     }
+    // r86j: every exit after this point writes RESULT.txt + a duration_verdict line in run.log;
+    // a blocked event loop is caught by an out-of-thread watchdog (see verdict.ts).
+    const verdictDir = process.env.DURATION_EVIDENCE_DIR?.trim() || null
+    if (args.live) {
+        setVerdictDir(verdictDir)
+        installVerdictGuards()
+        startLoopWatchdog({ dir: verdictDir })
+    }
 
     if (args.recordWalkDir) {
         ensureRecordWalkDir(args.recordWalkDir)
@@ -337,6 +355,8 @@ const main = async () => {
     }
 
     let ops: FakeFleetOps | RealFleetOps
+    const durationStage = resolveDurationStage()
+    const stage2Fields = durationStage === 2 ? stage2SummaryFields(walk?.steps ?? null) : null
     let hosts: Record<string, string> | undefined
 
     if (args.live) {
@@ -358,7 +378,7 @@ const main = async () => {
             console.error('Refusing --live with idea02 in pool')
             process.exit(2)
         }
-        ops = new RealFleetOps({
+        const opsOpts = {
             poolEngines: pool,
             excludeEngines: scenario.exclude_engines,
             hosts,
@@ -368,7 +388,12 @@ const main = async () => {
             healthWrapBefore: args.healthWrapBefore,
             healthWrapAfter: args.healthWrapAfter,
             startInstances: args.startInstances,
-        })
+        }
+        // Stage 2 (DURATION_STAGE=2): real SSD partitions via stage2-dock.sh; Stage 1 unchanged otherwise.
+        const real = durationStage === 2 ? new Stage2FleetOps(opsOpts) : new RealFleetOps(opsOpts)
+        ops = real
+        // r86l: per-thread memory (main + every Automerge worker) into LOOPLAG.jsonl.
+        startMemSampler(process.env.DURATION_EVIDENCE_DIR?.trim() || null, () => real.threadMem())
     } else {
         ops = new FakeFleetOps({
             poolEngines: pool,
@@ -386,6 +411,7 @@ const main = async () => {
         baseUrl: args.consoleUrl,
         headless: true,
         failLoud: true,
+        ...(hosts ? { hosts } : {}),
     })
 
     const commonStart = {
@@ -413,8 +439,29 @@ const main = async () => {
         start_instances: args.startInstances,
         hosts: hosts ?? null,
         stability: !args.noStability,
+        stage: durationStage,
+        ...(stage2Fields ?? {}),
     }
     console.log(JSON.stringify(commonStart))
+
+    // r51 FAIL@1: a live --ui walk needs box tooling (node_modules, Playwright on the driver's paths,
+    // the Intents checkout's node_modules, Chromium). Check before any pool contact → exit 11.
+    if (args.ui && args.live && !args.noPreflight) {
+        const harnessRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
+        const bt = await checkBoxTooling({
+            harnessRoot,
+            driverDir: join(harnessRoot, 'test/duration/ui'),
+            intentsDir: resolveConsoleIntentsDir(),
+        }, realBoxToolingDeps())
+        console.log(`[duration] ${bt.message}`)
+        console.log(JSON.stringify({ event: 'box_tooling_preflight', ok: bt.ok, playwright: bt.playwright, chromium: bt.chromium, launch: bt.launch, intents_playwright: bt.intentsPlaywright, problems: bt.problems }))
+        if (!bt.ok) {
+            for (const p of bt.problems) console.error(`[duration] FATAL (box tooling): ${p}`)
+            await uiDriver.close?.().catch(() => {})
+            if (ops instanceof RealFleetOps) await ops.close().catch(() => {})
+            process.exit(boxToolingExitCode(bt))
+        }
+    }
 
     // r32: fail fast before step 1 when a pool Engine does not serve the store over WS,
     // instead of discovering it as an "own store" withTimeout 60 s into the walk.
@@ -461,7 +508,60 @@ const main = async () => {
         // Read-only ssh. Legacy Pis (no helper: the current f65183a pool) pass unchanged.
         // Helper floor: v1 in general, v2 when the walk copies across Pis (peer keys = v2 sync-peers).
         const helperMin = peerPlan ? requiredHelperVersion(peerPlan) : 1
-        const sl = await ops.preflightSlotLayout(pool, helperMin)
+        if (ops instanceof Stage2FleetOps) {
+            // Stage 2: no idea-test-N slots; partitions by PARTLABEL, Engine settings pinned, store home state.
+            const s2ops = ops
+            // READY §4.7: store step = stage2-store-fix.sh behind the D10 v2 gate (opt-in; default off).
+            const storeFixMode = resolveStage2StoreFixMode()
+            if (storeFixMode !== 'off') {
+                const sf = runStage2StoreFix(storeFixMode)
+                console.log(JSON.stringify({ event: 'stage2_store_fix', mode: storeFixMode, ok: sf.ok, gate: sf.gate, plan: sf.plan, problem: sf.problem ?? null }))
+                if (!sf.ok) {
+                    console.error(`[duration] FATAL (stage2 store step): ${sf.problem}`)
+                    console.log(JSON.stringify(timeoutSummary()))
+                    await uiDriver.close?.().catch(() => {})
+                    await ops.close().catch(() => {})
+                    process.exit(EXIT_STAGE2_PREFLIGHT)
+                }
+            } else {
+                console.log('[duration] stage2 store step: off (DURATION_STAGE2_STORE_FIX=plan|apply runs stage2-store-fix.sh behind D10 v2)')
+            }
+            const status: Parameters<typeof stage2Preflight>[0]['status'] = {}
+            const configYaml: Parameters<typeof stage2Preflight>[0]['configYaml'] = {}
+            for (const e of pool) {
+                try { status[e] = await s2ops.stage2Status(e) } catch (err) { status[e] = err instanceof Error ? err : new Error(String(err)) }
+                try { configYaml[e] = await s2ops.probeEngineConfig(e) } catch (err) { configYaml[e] = err instanceof Error ? err : new Error(String(err)) }
+            }
+            const store: Parameters<typeof stage2Preflight>[0]['store'] = {}
+            try {
+                const view = await s2ops.readStore(pool[0]!)
+                for (const f of STAGE2_FIXTURES) {
+                    const d = view.diskDB[f.diskId]
+                    if (!d) continue
+                    store[f.diskId] = {
+                        dockedTo: await s2ops.findDockedEngine(f.diskId),
+                        diskTypes: [...(d.diskTypes ?? [])],
+                        instances: Object.values(view.instanceDB).filter(x => x.diskId === f.diskId).map(x => x.id),
+                    }
+                }
+            } catch (err) { console.error(`[duration] stage2 preflight: store read failed: ${err instanceof Error ? err.message : String(err)}`) }
+            const s2 = stage2Preflight({ pool, hosts: ops.getHostMap(), status, configYaml, store, ...(walk ? { steps: walk.steps.slice(0, startIndex + iterations) } : {}) })
+            console.log(`[duration] ${s2.message}`)
+            console.log(JSON.stringify({ event: 'stage2_preflight', ok: s2.ok, table: s2.table, problems: s2.problems }))
+            if (!s2.ok) {
+                for (const p of s2.problems) console.error(`[duration] FATAL (stage2 preflight): ${p}`)
+                console.log(JSON.stringify(timeoutSummary()))
+                await uiDriver.close?.().catch(() => {})
+                await ops.close().catch(() => {})
+                process.exit(EXIT_STAGE2_PREFLIGHT)
+            }
+            // D5 safety net: remember every pool Pi's boot_id so a 05:00 / unplanned reboot is seen
+            // at the next fixture op and reconciled (dock-ssd → re-undock held → wait docked).
+            const bootIds = await s2ops.recordBootIds(pool)
+            const roleWindows = walk ? describeStage2Windows(walk.steps.slice(0, startIndex + iterations)) : ''
+            console.log(JSON.stringify({ event: 'stage2_walk_start', bootIds, roleWindows }))
+        }
+        const sl = ops instanceof Stage2FleetOps ? [] : await ops.preflightSlotLayout(pool, helperMin)
         for (const v of sl) console.log(`[duration] ${v.message}`)
         console.log(JSON.stringify({
             event: 'slot_layout_preflight',
@@ -494,6 +594,7 @@ const main = async () => {
                     consoleEngine,
                     poolEngines: pool.filter(e => !scenario.exclude_engines.includes(e)),
                     view: await ops.readStore(consoleEngine),
+                    ...(ops instanceof Stage2FleetOps ? { expectedHostOf: stage2HomeOf } : {}),
                 })
             } catch (e) {
                 readErr = `fixture disk preflight: store read on ${consoleEngine} failed: ${e instanceof Error ? e.message : String(e)}`
@@ -586,6 +687,17 @@ const main = async () => {
                 const r = await $`git -C ${intentsDir} rev-parse HEAD`.quiet()
                 return r.stdout.trim() || null
             },
+            fetchMd5: async url => {
+                const res = await fetch(url, { signal: AbortSignal.timeout(30_000) })
+                if (res.status !== 200) throw new Error(`${url}: HTTP ${res.status}`)
+                return createHash('md5').update(Buffer.from(await res.arrayBuffer())).digest('hex')
+            },
+            rangeFiles: async (from, to) => {
+                if (!intentsDir) throw new Error('no DURATION_CONSOLE_INTENTS checkout')
+                const d = await $`git -C ${intentsDir} diff --name-only ${from} ${to}`.quiet()
+                const anc = await $`git -C ${intentsDir} merge-base --is-ancestor ${from} ${to}`.quiet().nothrow()
+                return { files: d.stdout.split('\n').map(l => l.trim()).filter(Boolean), ancestor: anc.exitCode === 0 }
+            },
         })
         console.log(JSON.stringify({
             event: 'console_deploy_preflight',
@@ -594,6 +706,10 @@ const main = async () => {
             console_url: consoleUrl,
             served_sha: cd.servedSha,
             pin: cd.pin,
+            intents_pin: cd.pin,
+            product_pin: cd.product ? { sha: cd.product.sha, asset: cd.product.asset, md5: cd.product.md5 } : null,
+            served_asset: cd.servedAsset ?? null,
+            served_asset_md5: cd.servedAssetMd5 ?? null,
             box_intents_head: cd.boxHead,
             intents_dir: intentsDir,
             note: cd.note,
@@ -607,7 +723,9 @@ const main = async () => {
         }
     }
 
+    startPauseMonitor() // r68: box VM freezes show up in run.log as box_pause
     const onLog = (e: StructuredLogEntry) => {
+        setCurrentStep(stepNumbers(walk, e.step)?.parentStep ?? e.step)
         // Shake-out: every step line also carries its parent (cover-all) step number.
         console.log(JSON.stringify({ event: 'duration_step', ...e, ...stepNumbers(walk, e.step) }))
     }
@@ -652,14 +770,28 @@ const main = async () => {
     }
 
     console.log(JSON.stringify(timeoutSummary()))
-    const summary = buildRunSummary({ walk, result, recoveries: recoveryCounter.snapshot() })
+    const summary = { ...buildRunSummary({ walk, result, recoveries: recoveryCounter.snapshot() }), ...(stage2Fields ?? {}) }
     console.log(JSON.stringify(summary))
-    console.log(formatRunSummaryLine(summary))
+    // r66: RECONNECTS.md (every forced stale-view reconnect) next to run.log; a FAIL-NOTE quotes reconnectLine().
+    const evidenceDir = args.recordWalkDir ?? process.env.DURATION_EVIDENCE_DIR?.trim()
+    if (evidenceDir) {
+        try {
+            const p = writeReconnectsMd(evidenceDir)
+            console.log(JSON.stringify({ event: 'stale_view_reconnects', path: p, line: reconnectLine(), ...reconnectSummary() }))
+        } catch (e) {
+            console.error(`[duration] could not write RECONNECTS.md: ${e instanceof Error ? e.message : String(e)}`)
+        }
+    }
+    console.log(`[duration] ${reconnectLine()}`)
+    console.log(formatRunSummaryLine(summary) + (stage2Fields
+        ? ` | STAGE 2: ${stage2Fields.stage2NotCovered.map(n => `@${n.step} ${n.action} = network copy`).join(', ') || 'no gap steps'} (physical move not covered)`
+        : ''))
     console.log(JSON.stringify({
         event: 'duration_done',
         mode: walk ? 'walk' : 'markov',
         walk: walk?.name ?? null,
         shakeOut: summary.shakeOut,
+        ...(stage2Fields ?? {}),
         ...(shakeOut
             ? { variantOf: shakeOut.variantOf, notCovered: shakeOut.notCovered, stepNumbering: shakeOut.stepNumbering }
             : {}),
@@ -675,7 +807,16 @@ const main = async () => {
         record_walk: args.recordWalkDir ?? null,
     }))
 
-    process.exit(walkExitCode(result))
+    const code = walkExitCode(result)
+    writeVerdict({
+        status: code === 0 && !result.aborted && !(result.failures) ? 'PASS' : 'FAIL',
+        reason: code === 0 && !result.aborted && !(result.failures)
+            ? `walk complete: ${result.steps} step(s)`
+            : `exit ${code}; aborted=${!!result.aborted}${result.abortReason ? ` (${result.abortReason})` : ''}; failures=${result.failures}`,
+        step: summary.lastStep?.parentStep ?? summary.lastStep?.step ?? null,
+        source: 'walk-end',
+    })
+    process.exit(code)
 }
 
 /**
@@ -695,5 +836,6 @@ installProcessGuards()
 main().catch(err => {
     console.error(err)
     console.log(JSON.stringify(timeoutSummary()))
+    writeVerdict({ status: 'FAIL', reason: `walker threw: ${err instanceof Error ? err.message : String(err)}`.slice(0, 2000), source: 'main-catch' })
     process.exit(2)
 })
