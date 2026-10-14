@@ -4,7 +4,7 @@ import { log } from '../utils/utils.js';
 import { Store } from './Store.js';
 import { Disk, diskMountRoot } from './Disk.js';
 import { DocHandle } from '@automerge/automerge-repo';
-import { AppFilesMount, parseFilesMount } from './FilesMount.js';
+import { AppFilesMount, AppUsbMount, parseFilesMount, parseUsbMount } from './FilesMount.js';
 
 export interface App {
     id: AppID;
@@ -18,6 +18,8 @@ export interface App {
     author: string | null;
     /** Opt-in to Files Disk mounts (x-app.filesMount); null when the App does not opt in (idea#133). */
     filesMount?: AppFilesMount | null;
+    /** Opt-in to teacher USB sticks (x-app.usbMount, idea#193 §4); null when the App does not opt in. */
+    usbMount?: AppUsbMount | null;
 }
 
 type AppCategory = 'Productivity' | 'Utilities' | 'Games' | 'education' | 'office' | 'it' | string;
@@ -105,6 +107,7 @@ export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: Ap
                     icon: xapp.icon ?? null,
                     author: xapp.author ?? null,
                     filesMount: parseFilesMount(xapp),
+                    usbMount: parseUsbMount(xapp),
                 }
                 // Store the new app object in the store
                 doc.appDB[appId] = app
@@ -121,6 +124,7 @@ export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: Ap
                 app.icon = xapp.icon ?? null
                 app.author = xapp.author ?? null
                 app.filesMount = parseFilesMount(xapp)
+                app.usbMount = parseUsbMount(xapp)
             }
         })
     return app!

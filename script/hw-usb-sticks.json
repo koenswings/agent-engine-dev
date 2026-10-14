@@ -1,0 +1,10 @@
+{
+  "_comment": "Teacher test sticks per test Pi for script/hw-usb-sticks.ts (idea#193). Fill in on the claimed test Pi (Atlas, proposal step 2); never idea02, wizardly-hugle or Milkwise. files: relative path -> sha256 of a known file on the stick.",
+  "idea03": {
+    "refuseSerials": ["AA202000000000004820"],
+    "sticks": [
+      { "name": "FAT32 test stick", "fsType": "vfat", "usbSerial": "", "diskSerial": "", "uuids": [""], "kolibri": true, "files": {} },
+      { "name": "exFAT test stick", "fsType": "exfat", "usbSerial": "", "diskSerial": "", "uuids": [""], "kolibri": false, "files": {} }
+    ]
+  }
+}
