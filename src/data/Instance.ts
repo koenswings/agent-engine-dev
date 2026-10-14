@@ -318,8 +318,12 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
 
     } else {
       print(`Cloning version ${version} of app ${appName} from git account ${gitAccount}`)
-      await $`git clone -b ${version} https://github.com/koenswings/app-${appName} /tmp/apps/${appName}`
-      appVersion = version
+      // A branch name may contain '/' (feat/x): the ref goes to git intact as one
+      // argument, the folder name of the App master is derived from it (Atlas).
+      assertGitRef(version)
+      await $`git ${appCloneArgs('koenswings', appName, version, `/tmp/apps/${appName}`)}`
+      appVersion = versionDirName(version)
+      if (appVersion !== version) log(`App ref '${version}' is stored as version '${appVersion}' (folder ${appName}-${appVersion})`)
     }
 
 
@@ -905,6 +909,27 @@ export const diagnoseInstance = async (instance: Instance, disk: Disk, caughtErr
 
   return parts.join('\n\n') || 'Unknown error'
 }
+
+/**
+ * Refuse a git ref that git itself would refuse or that could be read as an
+ * option (git check-ref-format rules, simplified). '/' is allowed.
+ */
+export const assertGitRef = (ref: string): void => {
+  const bad = !ref || ref.startsWith('-') || ref.startsWith('/') || ref.endsWith('/') || ref.endsWith('.') ||
+    ref.endsWith('.lock') || ref.includes('..') || ref.includes('//') || ref.includes('@{') ||
+    /[\x00-\x20\x7f~^:?*\[\\]/.test(ref) || ref.split('/').some(c => c.startsWith('.'))
+  if (bad) throw new Error(`Invalid app version / git ref '${ref}'`)
+}
+
+/** Folder-safe form of a ref for <appName>-<version> (one path component): feat/x → feat-x. */
+export const versionDirName = (ref: string): string => {
+  const v = ref.replace(/[^A-Za-z0-9._+-]+/g, '-').replace(/-+/g, '-').replace(/^[-.]+/, '').replace(/-+$/, '')
+  return v || 'ref'
+}
+
+/** argv after `git` for cloning one branch/tag of an App repo; the ref is passed unchanged. */
+export const appCloneArgs = (gitAccount: string, appName: string, ref: string, dest: string): string[] =>
+  ['clone', '--branch', ref, '--', `https://github.com/${gitAccount}/app-${appName}`, dest]
 
 export const startInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> => {
   const store: Store = storeHandle.doc()
