@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { ADJECTIVES, NOUNS, generateHostName, isStickerName, pickUniqueName, NoFreeNameError } from '../../src/utils/nameGenerator.js'
+import { ADJECTIVES, NOUNS, BLOCKED_PAIRS, allStickerNames, isAllowedPair, isDerivedPair, generateHostName, isStickerName, pickUniqueName, NoFreeNameError } from '../../src/utils/nameGenerator.js'
 import { engineHostnames, parseAvahiEngineNames, parseTailscaleStatusNames, resolveStickerName, stickerText, StickerNameDeps } from '../../src/install/stickerName.js'
 
 /** Deterministic PRNG (mulberry32). */
@@ -29,13 +29,42 @@ describe('sticker name generator (idea#184)', () => {
             expect(new Set(list).size).toBe(list.length)
             for (const w of list) { expect(w).toMatch(/^[a-z]{3,8}$/) }
         }
-        expect(ADJECTIVES.length * NOUNS.length).toBeGreaterThanOrEqual(100_000)
+        expect(allStickerNames().length).toBeGreaterThanOrEqual(100_000)
     })
     it('word lists do not overlap and avoid words that read as slurs', () => {
         const nouns = new Set<string>(NOUNS)
         expect(ADJECTIVES.filter((a) => nouns.has(a))).toEqual([])
         const banned = ['ape', 'monkey', 'pig', 'donkey', 'black', 'white', 'dark', 'slave', 'dumb', 'fat', 'ugly', 'lazy', 'jackal', 'angel', 'god']
         for (const w of [...ADJECTIVES, ...NOUNS]) expect(banned).not.toContain(w)
+    })
+    it('never pairs an adjective with the noun it derives from', () => {
+        for (const [a, n] of [['sandy', 'sand'], ['stony', 'stone'], ['starry', 'star'], ['mossy', 'moss'], ['leafy', 'leaf'], ['peachy', 'peach'], ['oaken', 'oak'], ['coastal', 'coast']])
+            expect(isDerivedPair(a, n)).toBe(true)
+        for (const [a, n] of [['sunset', 'sun'], ['sandy', 'otter'], ['golden', 'gold' + 'fish'], ['brave', 'otter']])
+            expect(isDerivedPair(a, n)).toBe(false)
+        const all = new Set(allStickerNames())
+        for (const n of ['sandy-sand', 'stony-stone', 'starry-star', 'sunny-sun', 'rainy-rain']) expect(all.has(n)).toBe(false)
+        const r = seeded(9)
+        for (let i = 0; i < 20_000; i++) {
+            const [a, n] = generateHostName(r).split('-')
+            expect(isDerivedPair(a, n)).toBe(false)
+        }
+    })
+    it('never produces a blocklisted double-meaning pair', () => {
+        expect(BLOCKED_PAIRS).toContain('silver-fox')
+        const all = new Set(allStickerNames())
+        for (const p of BLOCKED_PAIRS) {
+            const [a, n] = p.split('-')
+            expect(isAllowedPair(a, n)).toBe(false)
+            expect(all.has(p)).toBe(false)
+        }
+        // the walk fallback skips them too: with every other name taken, none is returned
+        const others = [...all].filter((n) => n !== 'brave-otter')
+        expect(pickUniqueName(others, seeded(5))).toBe('brave-otter')
+    })
+    it('does not use words the review removed', () => {
+        for (const w of ['owl', 'ivory', 'cute', 'first', 'prime', 'springbok', 'ruler', 'whale', 'native'])
+            expect([...ADJECTIVES, ...NOUNS] as string[]).not.toContain(w)
     })
     it('generates two words, no digits, valid hostname', () => {
         const r = seeded(42)
@@ -55,8 +84,7 @@ describe('sticker name generator (idea#184)', () => {
         expect(n).not.toBe(first)
     })
     it('pickUniqueName finds the last free name and fails when none is left', () => {
-        const all: string[] = []
-        for (const a of ADJECTIVES) for (const b of NOUNS) all.push(`${a}-${b}`)
+        const all = allStickerNames()
         const free = all.pop()!
         expect(pickUniqueName(all, seeded(3))).toBe(free)
         expect(() => pickUniqueName([...all, free], seeded(3))).toThrow(NoFreeNameError)
