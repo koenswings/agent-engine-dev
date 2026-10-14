@@ -126,6 +126,8 @@ for i in "${!N_NAME[@]}"; do
   NAME="${N_NAME[$i]}"; IP="${N_IP[$i]}"; MODEL="${N_MODEL[$i]}"
   TARGET="${SSH_USER}@${IP}"
   LOG="/tmp/provision-${NAME}.log"
+  # Several "auto" nodes must not share one log (idea#184): name it by address.
+  [[ "$NAME" == auto ]] && LOG="/tmp/provision-auto-${IP//[^A-Za-z0-9.-]/_}.log"
   rssh() { ssh "${SSH_OPTS[@]}" "$TARGET" "$@"; }
 
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

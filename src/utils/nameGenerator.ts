@@ -9,29 +9,11 @@ import { Hostname } from '../data/CommonTypes.js';
  * Pis are no longer identified by numbers (no `idea<N>`).
  *
  * Words are short, common, friendly and easy to pronounce and spell when read
- * aloud over a phone line. 64 x 64 = 4096 combinations.
+ * aloud over a phone line. The lists live in ./stickerWords.ts (one reviewable
+ * file, >= 100,000 combinations).
  */
-export const ADJECTIVES = [
-    'amber', 'bold', 'brave', 'bright', 'brisk', 'calm', 'clever', 'cosy',
-    'crisp', 'dusty', 'eager', 'early', 'fair', 'fancy', 'fast', 'fond',
-    'free', 'fresh', 'gentle', 'glad', 'golden', 'grand', 'green', 'happy',
-    'hardy', 'humble', 'jolly', 'keen', 'kind', 'lively', 'lucky', 'mellow',
-    'merry', 'mighty', 'misty', 'modest', 'noble', 'proud', 'quick', 'quiet',
-    'rapid', 'ready', 'royal', 'rosy', 'shiny', 'silver', 'simple', 'smart',
-    'snowy', 'solid', 'steady', 'sunny', 'super', 'swift', 'tall', 'tidy',
-    'tiny', 'true', 'trusty', 'velvet', 'warm', 'wild', 'wise', 'witty',
-] as const
-
-export const NOUNS = [
-    'badger', 'beaver', 'bison', 'camel', 'cedar', 'cobra', 'comet', 'condor',
-    'coral', 'crane', 'cricket', 'dingo', 'dolphin', 'eagle', 'falcon', 'ferret',
-    'finch', 'gecko', 'gazelle', 'giraffe', 'heron', 'hippo', 'hornet', 'ibis',
-    'impala', 'jaguar', 'kestrel', 'koala', 'lemur', 'lion', 'lizard', 'llama',
-    'lynx', 'mango', 'marlin', 'meerkat', 'moose', 'otter', 'owl', 'panda',
-    'parrot', 'pelican', 'penguin', 'puffin', 'quail', 'rabbit', 'raven', 'robin',
-    'salmon', 'seal', 'shark', 'sparrow', 'squid', 'stork', 'swan', 'tapir',
-    'tiger', 'toucan', 'turtle', 'walrus', 'weasel', 'whale', 'wombat', 'zebra',
-] as const
+export { ADJECTIVES, NOUNS } from './stickerWords.js'
+import { ADJECTIVES, NOUNS } from './stickerWords.js'
 
 /** A sticker name: two lower-case words joined by one hyphen, no digits. */
 export const STICKER_NAME_RE = /^[a-z]+-[a-z]+$/
@@ -47,7 +29,8 @@ export type Rand = () => number
 
 const pick = <T>(a: readonly T[], rand: Rand): T => a[Math.floor(rand() * a.length) % a.length]
 
-/** One random two-word name (not checked for collisions). */
+/** One random two-word name, NOT checked for collisions. Installers must use
+ *  resolveStickerName (src/install/stickerName.ts) instead. */
 export const generateHostName = (rand: Rand = Math.random): Hostname =>
     `${pick(ADJECTIVES, rand)}-${pick(NOUNS, rand)}` as Hostname
 
@@ -56,7 +39,7 @@ export class NoFreeNameError extends Error {}
 /**
  * A random sticker name that is not in `taken` (compared case-insensitively,
  * `.local` ignored). Tries random names first, then walks every combination
- * from a random start so it only fails when all 4096 are taken.
+ * from a random start so it only fails when every combination is taken.
  */
 export const pickUniqueName = (taken: Iterable<string>, rand: Rand = Math.random, tries = 50): Hostname => {
     const t = new Set([...taken].map(normaliseName))

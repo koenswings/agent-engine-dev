@@ -11,7 +11,9 @@ import { isStickerName, normaliseName, pickUniqueName, Rand } from '../utils/nam
  *  2. A name persisted by an earlier run (/etc/idea/sticker-name) is kept, so
  *     re-running the installer or --personalize never renames a stickered Pi.
  *  3. Otherwise a new two-word name is generated that is not taken on the LAN
- *     (mDNS) nor in the network database (engineDB hostnames of the store).
+ *     (mDNS), nor in the network database (engineDB hostnames of the store),
+ *     nor on the tailnet when tailscale is installed and online (read-only
+ *     `tailscale status --json`; no central registry).
  */
 export const STICKER_NAME_FILE = '/etc/idea/sticker-name'
 
@@ -22,6 +24,8 @@ export interface StickerNameDeps {
     storeNames: () => Promise<{ names: string[], checked: boolean }>
     /** True when `<name>.local` already answers on the LAN. */
     lanTaken: (name: string) => Promise<boolean>
+    /** Hostnames on the tailnet; checked=false when tailscale is absent or not online. */
+    tailnetNames?: () => Promise<{ names: string[], checked: boolean }>
     rand?: Rand
     log?: (msg: string) => void
 }
@@ -30,6 +34,7 @@ export interface StickerNameResult {
     name: Hostname
     source: 'explicit' | 'persisted' | 'generated'
     storeChecked: boolean
+    tailnetChecked: boolean
 }
 
 export const resolveStickerName = async (explicit: string | undefined, deps: StickerNameDeps, maxLanTries = 20): Promise<StickerNameResult> => {
@@ -38,15 +43,17 @@ export const resolveStickerName = async (explicit: string | undefined, deps: Sti
         const n = normaliseName(explicit)
         if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(n)) throw new Error(`bad hostname '${explicit}'`)
         await deps.persist(n)
-        return { name: n as Hostname, source: 'explicit', storeChecked: false }
+        return { name: n as Hostname, source: 'explicit', storeChecked: false, tailnetChecked: false }
     }
     const persisted = await deps.readPersisted()
     if (persisted && isStickerName(normaliseName(persisted))) {
-        return { name: normaliseName(persisted) as Hostname, source: 'persisted', storeChecked: false }
+        return { name: normaliseName(persisted) as Hostname, source: 'persisted', storeChecked: false, tailnetChecked: false }
     }
     const { names, checked } = await deps.storeNames()
     if (!checked) log('WARNING: network database not reachable; name checked against the LAN only')
-    const taken = new Set(names.map(normaliseName))
+    const tailnet = deps.tailnetNames ? await deps.tailnetNames() : { names: [], checked: false }
+    if (tailnet.checked) log(`checking the name against ${tailnet.names.length} tailnet name(s)`)
+    const taken = new Set([...names, ...tailnet.names].map(normaliseName))
     for (let i = 0; i < maxLanTries; i++) {
         const candidate = pickUniqueName(taken, deps.rand)
         if (await deps.lanTaken(candidate)) {
@@ -55,7 +62,7 @@ export const resolveStickerName = async (explicit: string | undefined, deps: Sti
             continue
         }
         await deps.persist(candidate)
-        return { name: candidate, source: 'generated', storeChecked: checked }
+        return { name: candidate, source: 'generated', storeChecked: checked, tailnetChecked: tailnet.checked }
     }
     throw new Error(`no free sticker name after ${maxLanTries} LAN checks`)
 }
@@ -94,7 +101,36 @@ export const realStickerNameDeps = (exec: any, opts: { peers?: string[], log?: (
         } catch { return false }
     },
     storeNames: async () => storeNamesFromPeers(opts.peers ?? await lanEnginePeers(exec)),
+    tailnetNames: async () => {
+        try {
+            const r = await exec`command -v tailscale >/dev/null 2>&1 && timeout 10 tailscale status --json 2>/dev/null || true`
+            return parseTailscaleStatusNames(r.stdout)
+        } catch { return { names: [], checked: false } }
+    },
 })
+
+/**
+ * Hostnames from `tailscale status --json` (read-only). Only counts when the
+ * node is online (BackendState "Running"); otherwise checked=false. Takes both
+ * the OS HostName and the MagicDNS label (first part of DNSName) of self and peers.
+ */
+export const parseTailscaleStatusNames = (out: string): { names: string[], checked: boolean } => {
+    let j: any
+    try { j = JSON.parse(out) } catch { return { names: [], checked: false } }
+    if (!j || j.BackendState !== 'Running') return { names: [], checked: false }
+    const names = new Set<string>()
+    const add = (n: any) => {
+        if (!n) return
+        if (typeof n.HostName === 'string' && n.HostName) names.add(normaliseName(n.HostName))
+        if (typeof n.DNSName === 'string' && n.DNSName) {
+            const label = n.DNSName.split('.')[0]
+            if (label) names.add(normaliseName(label))
+        }
+    }
+    add(j.Self)
+    for (const p of Object.values(j.Peer ?? {})) add(p)
+    return { names: [...names], checked: true }
+}
 
 /** Hostnames of Engines advertising on the LAN (ciao service, TXT name=...). */
 export const lanEnginePeers = async (exec: any): Promise<string[]> => {

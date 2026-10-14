@@ -36,7 +36,7 @@ const main = async () => {
         console.log(`  -u, --user <string>     the SSH user to connect as (default: ${defaults.user})`)
         console.log(`  -m, --machine <string>  the machine hostname or IP address (default: local bootstrap mode)`) // Corrected to reference the local bootstrap mode as default
         console.log(`  --hostname <string>     the hostname to set (default: a generated two-word sticker name, e.g. brave-otter,`)
-        console.log(`                          unique on the LAN and in the network database; kept on re-runs, idea#184)`)
+        console.log(`                          unique on the LAN, in the network database and on the tailnet; kept on re-runs, idea#184)`)
         console.log(`  --peer <host[,host]>    Engine(s) whose network database to check the generated name against (default: Engines found via mDNS)`)
         console.log(`  -l, --language <string> the locale language to set (default: ${defaults.language})`)
         console.log(`  -k, --keyboard <string> the keyboard layout to set (default: ${defaults.keyboard})`)
@@ -85,7 +85,7 @@ const main = async () => {
         const r = await resolveStickerName(argv.hostname, realStickerNameDeps(exec, { peers }));
         hostname = r.name;
         nameSource = r.source;
-        console.log(chalk.green(`Hostname: ${hostname} (${r.source}${r.source === 'generated' ? (r.storeChecked ? ', checked against LAN and network database' : ', checked against LAN only') : ''})`));
+        console.log(chalk.green(`Hostname: ${hostname} (${r.source}${r.source === 'generated' ? `, checked against LAN${r.storeChecked ? ', network database' : ''}${r.tailnetChecked ? ', tailnet' : ''}` : ''})`));
     }
 
     // Assemble arguments for the core buildEngine function

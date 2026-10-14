@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { ADJECTIVES, NOUNS, generateHostName, isStickerName, pickUniqueName, NoFreeNameError } from '../../src/utils/nameGenerator.js'
-import { engineHostnames, parseAvahiEngineNames, resolveStickerName, stickerText, StickerNameDeps } from '../../src/install/stickerName.js'
+import { engineHostnames, parseAvahiEngineNames, parseTailscaleStatusNames, resolveStickerName, stickerText, StickerNameDeps } from '../../src/install/stickerName.js'
 
 /** Deterministic PRNG (mulberry32). */
 const seeded = (seed: number) => () => {
@@ -27,9 +27,15 @@ describe('sticker name generator (idea#184)', () => {
     it('word lists are unique, lower-case letters only, short', () => {
         for (const list of [ADJECTIVES, NOUNS]) {
             expect(new Set(list).size).toBe(list.length)
-            for (const w of list) { expect(w).toMatch(/^[a-z]{3,7}$/) }
+            for (const w of list) { expect(w).toMatch(/^[a-z]{3,8}$/) }
         }
-        expect(ADJECTIVES.length * NOUNS.length).toBeGreaterThanOrEqual(4096)
+        expect(ADJECTIVES.length * NOUNS.length).toBeGreaterThanOrEqual(100_000)
+    })
+    it('word lists do not overlap and avoid words that read as slurs', () => {
+        const nouns = new Set<string>(NOUNS)
+        expect(ADJECTIVES.filter((a) => nouns.has(a))).toEqual([])
+        const banned = ['ape', 'monkey', 'pig', 'donkey', 'black', 'white', 'dark', 'slave', 'dumb', 'fat', 'ugly', 'lazy', 'jackal', 'angel', 'god']
+        for (const w of [...ADJECTIVES, ...NOUNS]) expect(banned).not.toContain(w)
     })
     it('generates two words, no digits, valid hostname', () => {
         const r = seeded(42)
@@ -84,6 +90,19 @@ describe('resolveStickerName', () => {
         expect(isStickerName(r.name)).toBe(true)
         expect(saved).toEqual([r.name])
     })
+    it('avoids names taken on the tailnet when tailscale is online', async () => {
+        const probe = seeded(11)
+        const a = generateHostName(probe)
+        const { deps } = fakeDeps({ rand: seeded(11) })
+        deps.tailnetNames = async () => ({ names: [a.toUpperCase()], checked: true })
+        const r = await resolveStickerName(undefined, deps)
+        expect(r.tailnetChecked).toBe(true)
+        expect(r.name).not.toBe(a)
+    })
+    it('without tailscale the tailnet is reported unchecked', async () => {
+        const r = await resolveStickerName(undefined, fakeDeps().deps)
+        expect(r.tailnetChecked).toBe(false)
+    })
     it('reports when the network database could not be checked', async () => {
         const r = await resolveStickerName(undefined, fakeDeps({ storeOk: false }).deps)
         expect(r.storeChecked).toBe(false)
@@ -108,5 +127,23 @@ describe('install helpers', () => {
     it('sticker text names the Console URL', () => {
         expect(stickerText('brave-otter', 8080)).toContain('http://brave-otter.local:8080')
         expect(stickerText('brave-otter', 80)).toContain('http://brave-otter.local\n')
+    })
+})
+
+describe('tailscale status --json parsing (idea#184)', () => {
+    it('collects self and peer HostName and MagicDNS labels when Running', () => {
+        const out = JSON.stringify({
+            BackendState: 'Running',
+            Self: { HostName: 'idea02', DNSName: 'idea02.tail1234.ts.net.' },
+            Peer: { k1: { HostName: 'Brave-Otter', DNSName: 'brave-otter-1.tail1234.ts.net.' }, k2: { HostName: 'laptop' } },
+        })
+        const r = parseTailscaleStatusNames(out)
+        expect(r.checked).toBe(true)
+        expect(r.names.sort()).toEqual(['brave-otter', 'brave-otter-1', 'idea02', 'laptop'])
+    })
+    it('is unchecked when not online, empty or not JSON', () => {
+        expect(parseTailscaleStatusNames(JSON.stringify({ BackendState: 'NeedsLogin', Peer: {} })).checked).toBe(false)
+        expect(parseTailscaleStatusNames('').checked).toBe(false)
+        expect(parseTailscaleStatusNames('tailscale: not found').checked).toBe(false)
     })
 })
