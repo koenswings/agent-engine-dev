@@ -222,8 +222,43 @@ export const buildUsbJson = (engineId: string, updatedAt: number, records: Array
     })),
 })
 
+/**
+ * Make sure the USB root exists without needing a restart. tmpfiles.d
+ * (install-root-helpers) normally creates /run/idea-usb as pi:pi 0755; when the
+ * Engine runs before that, it creates the folder itself if the parent lets it
+ * (parent exists and is writable by this user, e.g. pi-owned 0755). Otherwise it
+ * returns false and is retried on the next plug and the next JSON write/sync.
+ * A non-default root (tests, dev) whose parent is missing is created recursively.
+ */
+let rootMissingLogged = false
+export const ensureUsbRoot = async (): Promise<boolean> => {
+    const root = usbRoot()
+    if (await fs.pathExists(root)) { rootMissingLogged = false; return true }
+    const parent = path.dirname(root)
+    try {
+        if (root !== DEFAULT_USB_ROOT && !(await fs.pathExists(parent))) {
+            await fs.ensureDir(root)
+        } else {
+            await fs.access(parent, fs.constants.W_OK | fs.constants.X_OK)
+            await fs.mkdir(root, { mode: 0o755 })
+            await fs.chmod(root, 0o755)   // umask-independent
+        }
+        log(`USB sticks: created ${root}`)
+        rootMissingLogged = false
+        return true
+    } catch (e: any) {
+        if (e?.code === 'EEXIST') return true
+        if (!rootMissingLogged) {
+            log(`USB sticks: ${root} is missing and ${parent} does not let the Engine create it (${e?.code ?? e?.message ?? e}); tmpfiles.d idea-usb.conf not installed? Will retry on the next plug/sync; Ops: run install-root-helpers`)
+            rootMissingLogged = true
+        }
+        return false
+    }
+}
+
 const writeUsbJson = async (): Promise<void> => {
     const root = usbRoot()
+    if (!(await ensureUsbRoot())) return
     const json = buildUsbJson(await engineIdOf(), ops.now(), [...sticks.values()])
     try {
         await ops.writeFileAtomic(path.join(root, IDEA_USB_JSON), JSON.stringify(json, null, 2) + '\n')
@@ -298,6 +333,7 @@ export const addStick = async (
     if (!isStickFsType(fsType)) return { ok: false, message: `Refusing to mount ${device} as a USB stick: filesystem ${probe.fsType}` }
     const mp = stickMountPoint(device)
     if (usbRoot() === DEFAULT_USB_ROOT && path.dirname(mp) !== DEFAULT_USB_ROOT) return { ok: false, message: `bad mount point ${mp}` }
+    if (!(await ensureUsbRoot())) return { ok: false, message: `Cannot mount USB stick /dev/${device}: ${usbRoot()} is missing and could not be created (run install-root-helpers)` }
     const mounts = await ops.listMounts()
     const atTarget = mounts.filter(m => m.target === mp)
     const ofSource = mounts.filter(m => m.source === `/dev/${device}`)
@@ -414,10 +450,7 @@ export const removeSticksOnDrive = async (storeHandle: DocHandle<Store>, drive: 
 export const usbStartupCleanup = async (storeHandle: DocHandle<Store>): Promise<void> => {
     sticks.clear()
     const root = usbRoot()
-    if (!(await fs.pathExists(root))) {
-        if (root === DEFAULT_USB_ROOT) log(`USB sticks: ${root} is missing (tmpfiles.d idea-usb.conf not installed?); sticks cannot be mounted until Ops runs install-root-helpers`)
-        else await fs.ensureDir(root)
-    }
+    await ensureUsbRoot()
     try {
         const mounts = (await ops.listMounts()).filter(m => path.dirname(m.target) === root)
         for (const m of mounts) {
@@ -435,6 +468,6 @@ export const usbStartupCleanup = async (storeHandle: DocHandle<Store>): Promise<
         log(`USB sticks startup cleanup: ${e?.message ?? e}`)
     }
     await publishToStore(storeHandle)
-    if (await fs.pathExists(root)) await writeUsbJson()
+    await writeUsbJson()   // retries creating the root
 }
 

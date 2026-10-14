@@ -281,6 +281,42 @@ describe('idea#193 teacher USB sticks', () => {
         })
     })
 
+    describe('USB root missing at start (before install-root-helpers)', () => {
+        const swapRoot = async (parentMode: number) => {
+            const parent = path.join(usbRootDir, 'run'); await fs.ensureDir(parent); await fs.chmod(parent, parentMode)
+            const root = path.join(parent, 'idea-usb'); process.env.IDEA_USB_ROOT = root
+            return { parent, root }
+        }
+        it('creates the root itself (0755) at startup when the parent is writable, and writes the JSON', async () => {
+            const { root } = await swapRoot(0o755)
+            await usbStartupCleanup(h)
+            expect((await fs.stat(root)).mode & 0o777).toBe(0o755)
+            expect(JSON.parse(await fs.readFile(path.join(root, IDEA_USB_JSON), 'utf-8'))).toMatchObject({ sticks: [] })
+        })
+        it('parent not writable: startup leaves it missing; the first plug creates it once allowed, no restart', async () => {
+            const { parent, root } = await swapRoot(0o555)
+            await usbStartupCleanup(h)
+            expect(await fs.pathExists(root)).toBe(false)
+            const r1 = await addStick(h, 'sdb1', probe(), { autoStart: false })
+            expect(r1.ok).toBe(false)
+            expect(st.calls.some(c => c.includes('/usr/bin/mount'))).toBe(false)
+            await fs.chmod(parent, 0o755)   // e.g. install-root-helpers / tmpfiles ran meanwhile
+            const r2 = await addStick(h, 'sdb1', probe(), { autoStart: false })
+            expect(r2.ok).toBe(true)
+            expect(await fs.pathExists(root)).toBe(true)
+            const json = JSON.parse(await fs.readFile(path.join(root, IDEA_USB_JSON), 'utf-8'))
+            expect(json.sticks.map((s: any) => s.device)).toEqual(['sdb1'])
+        })
+        it('root made by someone else later: the next JSON write (unplug/sync) uses it', async () => {
+            const { parent, root } = await swapRoot(0o555)
+            await usbStartupCleanup(h)
+            await fs.chmod(parent, 0o755); await fs.mkdir(root)
+            await addStick(h, 'sdb1', probe(), { autoStart: false })
+            await removeStick(h, 'sdb1')
+            expect(JSON.parse(await fs.readFile(path.join(root, IDEA_USB_JSON), 'utf-8')).sticks).toEqual([])
+        })
+    })
+
     describe('§4 x-app.usbMount (app-nextcloud#7)', () => {
         const kidXapp = { usbMount: { path: '/mnt/idea-usb', services: ['nextcloud-app'] }, filesMount: { path: '/mnt/idea-files', services: ['nextcloud-app'] } }
         it("Kid's compose (no sync key) gets the Nextcloud default sync", () => {
