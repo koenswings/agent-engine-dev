@@ -30,7 +30,8 @@ export interface Settings {
     commandLogArchiveMaxBytes?: number; // Size cap of store-identity/command-log-archive/ in bytes (default 1 GB = 1_000_000_000). Over the cap, the oldest archives are deleted one by one, each logged (#185, Koen 2026-10-15). See commandLogArchiveMaxBytes().
     peerStaleHours?: number;      // A peer Engine without a heartbeat for this long loses its key here (default 168 = 7 days). See peerStaleMs().
     autoStartChannelBuilder?: boolean; // Start the docked kolibri-channel-builder when a stick with a kolibri folder is mounted (idea#193 §8.2a; default true). See autoStartChannelBuilder().
-    usbRoot?: string;             // Mount root for teacher USB sticks (default /run/idea-usb; IDEA_USB_ROOT wins). Tests point this at a temp folder. See usbRoot().
+    usbRoot?: string;
+    ideaLocal?: boolean;          // Publish the shared name idea.local via avahi D-Bus when mdns is on (idea#203; default true). See monitors/ideaLocal.ts.             // Mount root for teacher USB sticks (default /run/idea-usb; IDEA_USB_ROOT wins). Tests point this at a temp folder. See usbRoot().
 }
 
 export interface Defaults {
@@ -135,6 +136,7 @@ function validateSettings(obj: any, path: string): string[] {
     if (obj.commandLogArchiveMaxBytes !== undefined && (typeof obj.commandLogArchiveMaxBytes !== 'number' || !(obj.commandLogArchiveMaxBytes > 0))) errors.push(`'${path}commandLogArchiveMaxBytes' must be a positive number.`);
     if (obj.peerStaleHours !== undefined && (typeof obj.peerStaleHours !== 'number' || !(obj.peerStaleHours > 0))) errors.push(`'${path}peerStaleHours' must be a positive number.`);
     if (obj.autoStartChannelBuilder !== undefined && typeof obj.autoStartChannelBuilder !== 'boolean') errors.push(`'${path}autoStartChannelBuilder' must be a boolean.`);
+    if (obj.ideaLocal !== undefined && typeof obj.ideaLocal !== 'boolean') errors.push(`'${path}ideaLocal' must be a boolean.`);
     if (obj.usbRoot !== undefined && typeof obj.usbRoot !== 'string') errors.push(`'${path}usbRoot' must be a string.`);
     return errors;
 }
