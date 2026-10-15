@@ -148,6 +148,24 @@ export interface ConvergenceResult {
     views?: SemanticStoreView[]
 }
 
+/** Order-independent key of a semantic view (same fields as semanticStoresEqual). */
+export const semanticViewKey = (v: SemanticStoreView): string =>
+    [
+        sortKeys(v.instanceDB).map(k => instanceKey(v.instanceDB[k]!)).join(','),
+        sortKeys(v.diskDB).map(k => diskKey(v.diskDB[k]!)).join(','),
+        sortKeys(v.engineDB).map(k => engineKey(v.engineDB[k]!)).join(','),
+    ].join('#')
+
+/** Index of the single view that differs from an agreeing majority (≥2 others), else null. */
+export const loneOutlier = (views: SemanticStoreView[]): number | null => {
+    if (views.length < 3) return null
+    const keys = views.map(semanticViewKey)
+    const off = keys.map((k, i) => keys.filter((o, j) => j !== i && o === k).length === 0 ? i : -1).filter(i => i >= 0)
+    if (off.length !== 1) return null
+    const others = keys.filter((_, i) => i !== off[0])
+    return others.every(k => k === others[0]) ? off[0]! : null
+}
+
 /**
  * Poll fleet stores until semantic equality (shared mode) or local ready (unique mode).
  * Engine-owned settle gate that UI Interactions will await later.
@@ -156,7 +174,7 @@ export const waitForConvergence = async (
     ops: FleetOps,
     engineIds: string[],
     timeoutMs: number,
-    opts?: { pollMs?: number; requireShared?: boolean },
+    opts?: { pollMs?: number; requireShared?: boolean; staleAfterMs?: number; refreshExtraMs?: number },
 ): Promise<ConvergenceResult> => {
     const pollMs = opts?.pollMs ?? 50
     const start = Date.now()
@@ -185,11 +203,43 @@ export const waitForConvergence = async (
         return { ok: true, elapsedMs: Date.now() - start }
     }
 
-    while (Date.now() - start < timeoutMs) {
+    // r80 FAIL@57: the walker's cached view of one Pi lagged (idea04 still showed the pre-undock
+    // state while idea01/idea03 and idea04's own Engine had the undock). Stale-view guard: a view
+    // that is the ONLY one off the majority and has not changed for staleAfterMs is force-refreshed
+    // (fresh connection, recorded in RECONNECTS.md), at most once per engine per wait, and the wait
+    // gets ONE bounded extra window for that refresh. Real divergence (fresh views still differ,
+    // no majority, or refresh failed) still fails with the field dump. Never a soft-pass.
+    const staleAfterMs = opts?.staleAfterMs ?? Math.min(30_000, Math.max(1, Math.floor(timeoutMs / 4)))
+    const extraMs = opts?.refreshExtraMs ?? 120_000
+    const refreshed = new Set<string>()
+    const lastKey = new Map<string, { key: string; since: number }>()
+    let deadline = start + timeoutMs
+    let extended = false
+    while (Date.now() < deadline) {
         const views = await Promise.all(engineIds.map(id => ops.readStore(id)))
         const [first, ...rest] = views
         if (first && rest.every(v => semanticStoresEqual(first, v))) {
             return { ok: true, elapsedMs: Date.now() - start, views }
+        }
+        const lagger = loneOutlier(views)
+        const now = Date.now()
+        engineIds.forEach((id, i) => {
+            const key = semanticViewKey(views[i]!)
+            const prev = lastKey.get(id)
+            if (!prev || prev.key !== key) lastKey.set(id, { key, since: now })
+        })
+        if (lagger !== null && ops.refreshView) {
+            const id = engineIds[lagger]!
+            const since = lastKey.get(id)!.since
+            if (!refreshed.has(id) && now - since >= staleAfterMs) {
+                refreshed.add(id)
+                await ops.refreshView(id, `convergence: only ${id} off the majority, view unchanged ${Math.round((now - since) / 1000)}s`)
+                if (!extended) {
+                    extended = true
+                    deadline = Math.max(deadline, Date.now() + Math.min(extraMs, timeoutMs))
+                }
+                continue
+            }
         }
         await new Promise(r => setTimeout(r, pollMs))
     }

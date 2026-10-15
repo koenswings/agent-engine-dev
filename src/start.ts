@@ -27,7 +27,7 @@ import { backupInstance } from './monitors/backupMonitor.js'
 import { clearStaleUnmountErrors } from './monitors/mounts.js'
 import { createCommandLogStore, shutdownRepo, startCommandLogRotation } from './data/CommandLogStore.js'
 import { initCommandLogger } from './utils/CommandLogger.js'
-import { assertAppDataHelper } from './utils/appDataHelper.js'
+import { assertAppDataHelper, reportBorgAtStartup } from './utils/appDataHelper.js'
 import { startPeerAccess } from './data/PeerAccess.js'
 import { checkAndSetUndockedApps } from './data/UndockedApps.js'
 export { checkAndSetUndockedApps }
@@ -60,6 +60,8 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // the version this Engine speaks; otherwise refuse to start with an "ask Ops to
     // update" message (copy, move, backup and restore of app data depend on it).
     await assertAppDataHelper()
+    // borg: loud but not fatal (only Backup Disks need it)
+    reportBorgAtStartup()
 
     // Process the config
     const settings = config.settings

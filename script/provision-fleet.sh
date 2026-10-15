@@ -141,7 +141,7 @@ for i in "${!N_NAME[@]}"; do
 set -euo pipefail
 NODE_VERSION="$1"; PNPM_VERSION="$2"; ENGINE_REF="$3"; CONSOLE_REF="$4"
 sudo apt-get update -y -qq
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq npm git curl rsync jq >/dev/null
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq npm git curl rsync borgbackup jq >/dev/null
 sudo npm install -g -s n "pnpm@${PNPM_VERSION}"
 sudo n "$NODE_VERSION" >/dev/null
 hash -r
