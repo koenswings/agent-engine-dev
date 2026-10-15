@@ -119,7 +119,7 @@ export const enableHttpMonitor = (
                 res.end(JSON.stringify(buildStoreUrlPayload(storeUrl)))
             } catch (e) {
                 log(`[http] /api/store-url: failed to read store URL — ${e}`)
-                res.writeHead(503, { 'Content-Type': 'application/json' })
+                res.writeHead(503, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })  // Console on another Pi must see the 503 too
                 res.end(JSON.stringify({ error: 'Store URL not available yet' }))
             }
             return
@@ -135,7 +135,7 @@ export const enableHttpMonitor = (
                 res.end(JSON.stringify({ url: logUrl }))
             } catch (e) {
                 log(`[http] /api/command-log-url: failed to read URL — ${e}`)
-                res.writeHead(503, { 'Content-Type': 'application/json' })
+                res.writeHead(503, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })  // Console on another Pi must see the 503 too
                 res.end(JSON.stringify({ error: 'Command log URL not available yet' }))
             }
             return
