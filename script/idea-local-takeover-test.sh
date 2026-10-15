@@ -22,7 +22,13 @@
 # Usage:
 #   script/idea-local-takeover-test.sh --claim <steve-claim-id> [--mode netcut|avahi-freeze]
 #       [--pool idea01,idea03,idea04] [--client idea02] [--lan-if eth0] [--ports 80,8080]
-#       [--cut 150] [--ttl 120] [--out DIR] [--dry-run]
+#       [--cut 150] [--ttl 120] [--converge 60] [--out DIR] [--dry-run]
+#
+# One holder is checked ON THE WIRE, not with getaddrinfo (which returns only the first answer
+# and hid a second holder on 2026-10-15): script/idea-local-mdns-responders.py sends a raw mDNS
+# query from the client and collects every responder. Before the cut exactly one pool Engine
+# must answer; after the restore exactly one must answer on 2 consecutive queries within
+# --converge seconds, or the run FAILs.
 # Hosts are ssh aliases (see ~/.ssh/config); SSH can be overridden (env SSH).
 # Exit: 0 PASS, 1 FAIL (no takeover within --ttl), 2 refused/precondition, 3 infra error.
 
@@ -30,7 +36,7 @@ set -uo pipefail
 
 SSH=${SSH:-"ssh -o BatchMode=yes -o ConnectTimeout=15"}
 CLAIM=""; MODE=netcut; POOL="idea01,idea03,idea04"; CLIENT=idea02; LAN_IF=eth0; PORTS=80,8080
-CUT=150; TTL=120; OUT=""; DRY=0
+CUT=150; TTL=120; CONVERGE=60; OUT=""; DRY=0
 ALLOWED_POOL="idea01 idea03 idea04"          # never wh (wizardly-hugle) or idea02
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -42,6 +48,7 @@ while [ $# -gt 0 ]; do
     --ports) PORTS="${2:-}"; shift 2 ;;
     --cut) CUT="${2:-}"; shift 2 ;;
     --ttl) TTL="${2:-}"; shift 2 ;;
+    --converge) CONVERGE="${2:-}"; shift 2 ;;
     --out) OUT="${2:-}"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
     *) echo "refused: unknown argument $1" >&2; exit 2 ;;
@@ -57,6 +64,7 @@ case "$MODE" in netcut|avahi-freeze) ;; *) refuse "--mode must be netcut or avah
 [[ "$CUT" =~ ^[0-9]+$ && "$TTL" =~ ^[0-9]+$ ]] || refuse "--cut/--ttl must be seconds"
 [ "$CUT" -gt "$TTL" ] || refuse "--cut ($CUT) must be longer than --ttl ($TTL)"
 [ "$CUT" -le 600 ] || refuse "--cut is at most 600 s"
+[[ "$CONVERGE" =~ ^[0-9]+$ ]] && [ "$CONVERGE" -ge 10 ] && [ "$CONVERGE" -le 300 ] || refuse "--converge must be 10-300 s"
 IFS=, read -r -a POOL_HOSTS <<< "$POOL"
 [ "${#POOL_HOSTS[@]}" -ge 2 ] || refuse "need at least 2 pool Engines"
 for h in "${POOL_HOSTS[@]}"; do
@@ -89,10 +97,22 @@ done
 resolve_once() { rsh "$CLIENT" "python3 -c \"import socket
 try: print('+'.join(sorted({a[4][0] for a in socket.getaddrinfo('idea.local',80,socket.AF_INET,socket.SOCK_STREAM)})))
 except Exception: print('FAIL')\""; }
-NOW=$(resolve_once) || { log "infra: client $CLIENT unreachable"; exit 3; }
+RESPONDERS_PY="$(dirname "$0")/idea-local-mdns-responders.py"
+POOL_IPS=$(for h in "${POOL_HOSTS[@]}"; do printf '%s,' "${LANIP[$h]}"; done)
+# Raw mDNS query from the client; prints the JSON line and appends it to mdns-responders.txt.
+responders() { rsh "$CLIENT" "python3 - --wait 2" < "$RESPONDERS_PY" | tee -a "$OUT/mdns-responders.txt"; }
+# "ONE <ip>" (exit 0) or "NOT-ONE ..." (exit 1)
+one_holder() { local j; j=$(responders) || return 3; python3 "$RESPONDERS_PY" --judge "$j" "$POOL_IPS"; }
+PRE=$(one_holder); PRE_RC=$?
+[ "$PRE_RC" -le 1 ] && [ -n "$PRE" ] || { log "infra: raw mDNS query on client $CLIENT failed"; exit 3; }
+log "before cut, raw mDNS: $PRE"
+[ "$PRE_RC" = 0 ] || refuse "idea.local is not answered by exactly one pool Engine on the wire ($PRE); fix before testing"
+NOW=${PRE#ONE }
 HOLDER=""
 for h in "${POOL_HOSTS[@]}"; do [ "$NOW" = "${LANIP[$h]}" ] && HOLDER=$h; done
-[ -n "$HOLDER" ] || refuse "idea.local resolves to '$NOW' on $CLIENT, which is not exactly one pool Engine; fix before testing"
+[ -n "$HOLDER" ] || refuse "idea.local is answered by $NOW, which is not a pool Engine"
+GAI=$(resolve_once) || { log "infra: client $CLIENT unreachable"; exit 3; }
+[ "$GAI" = "$NOW" ] || refuse "getaddrinfo on $CLIENT gives '$GAI' but the only responder is $NOW"
 FIRST_PORT=${PORTS%%,*}
 code=$(rsh "$CLIENT" "curl -s -o /dev/null -m 5 -w '%{http_code}' http://idea.local:$FIRST_PORT/") || code=000
 [ "$code" = 200 ] || refuse "http://idea.local:$FIRST_PORT/ answered $code before the cut (Console must answer first)"
@@ -145,7 +165,18 @@ rsh "$HOLDER" "$CUTCMD" > "$OUT/cut.txt" 2>&1 || { log "infra: cut failed on $HO
 log "CUT on $HOLDER at $(date +%T) (+5 s into the poll)"
 wait $POLLPID
 restore; trap - EXIT
-sleep 15
+T_RESTORE=$(date +%s)
+# ── After restore: exactly one responder on the wire, twice in a row, within --converge s ──
+CONV=FAIL; STREAK=0; LAST=""
+while [ $(( $(date +%s) - T_RESTORE )) -lt "$CONVERGE" ]; do
+  LAST=$(one_holder); rc=$?
+  [ "$rc" -le 1 ] || { log "infra: raw mDNS query failed after restore"; LAST="infra"; }
+  log "after restore +$(( $(date +%s) - T_RESTORE )) s, raw mDNS: $LAST"
+  if [ "$rc" = 0 ]; then STREAK=$((STREAK + 1)); else STREAK=0; fi
+  if [ "$STREAK" -ge 2 ]; then CONV=PASS; break; fi
+  sleep 3
+done
+CONV_S=$(( $(date +%s) - T_RESTORE ))
 AFTER=$(resolve_once)
 for h in "${OTHERS[@]}"; do rsh "$h" "grep -h '\\[idea.local\\]' ~/.pm2/logs/engine-out*.log 2>/dev/null | tail -3" | sed "s/^/$h publisher: /" | tee -a "$OUT/summary.txt"; done
 rsh "$HOLDER" "grep -h '\\[idea.local\\]' ~/.pm2/logs/engine-out*.log 2>/dev/null | tail -3" | sed "s/^/$HOLDER publisher: /" | tee -a "$OUT/summary.txt"
@@ -155,5 +186,11 @@ log "after restore: idea.local -> $AFTER (expect exactly one pool address)"
 python3 "$(dirname "$0")/idea-local-takeover-analyse.py" "$OUT/poll.csv" 5 "${LANIP[$HOLDER]}" "$TTL" \
   "$(for h in "${OTHERS[@]}"; do printf '%s,' "${LANIP[$h]}"; done)" | tee -a "$OUT/summary.txt"
 RES=${PIPESTATUS[0]}
+if [ "$CONV" = PASS ]; then
+  log "PASS: exactly one responder for idea.local on the wire ($LAST) within ${CONV_S} s of the restore (limit ${CONVERGE} s)"
+else
+  log "FAIL: not exactly one responder for idea.local within ${CONVERGE} s of the restore (last: $LAST)"
+  RES=1
+fi
 log "results in $OUT"
 exit "$RES"
