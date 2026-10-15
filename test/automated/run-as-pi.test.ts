@@ -100,6 +100,8 @@ describe('Engine sudoers asset (idea#80)', () => {
             '-n ${SUDO_CHOWN} -h pi:pi ${mountPoint}',
             // 11-engine-files (idea#134): eraseDisk script (no arg list in sudoers)
             '-n ${ERASE_SCRIPT} ${a.device} ${a.serial} ${String(a.sizeBytes)} ${a.label} ${a.stagingDir}',
+            // 11-engine-files (engine#188): read-only partition-table check, same script
+            '-n ${ERASE_SCRIPT} --check-table /dev/${whole}',
             // 11-engine-files (idea#168): erase-slot via idea-app-data (loop-backed test slots)
             '-n ${APP_DATA_HELPER} ${argv[0]} ${argv[1]} ${argv[2]}',
             // 10-engine ENGINE_APPDIRS (engine#187): Instance.ts creates the system-disk app folders
