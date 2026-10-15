@@ -331,6 +331,7 @@ export const buildEngine = async (args: any) => {
 
   await setHostname(exec, hostname);
   await installAvahi(exec);
+  await installDhcpVendorClass(exec, enginePath);
   await localiseSystem(exec, enginePath, language, keyboard, timezone);
   await installCrontabs(exec, enginePath);
 
@@ -524,6 +525,31 @@ export const setHostname = async (exec: any, hostname: string) => {
   }
   print(chalk.green('Hostname set'));
   print(hostname); // Print hostname for capture
+}
+
+/** Installed copy of script/build_image_assets/idea-dhcp-vendor-class (idea#209 D8). */
+export const DHCP_VENDOR_CLASS_HELPER = '/usr/local/sbin/idea-dhcp-vendor-class'
+export const DHCP_VENDOR_CLASS = 'idea-engine'
+
+/**
+ * idea#209 D8: the Engine sends DHCP option 60 "idea-engine", so the school router
+ * gives every Engine an address in .2–.9 without MAC reservations. The helper writes a
+ * NetworkManager conf.d connection default (and/or a dhcpcd.conf vendorclassid line),
+ * idempotently, with a .idea-bak-<UTC> backup. Only the NM *config* is reloaded: no
+ * connection is touched and no link drops; the value is used from the next DHCP
+ * activation (the nightly 05:00 reboot at the latest).
+ */
+export const installDhcpVendorClass = async (exec: any, enginePath: string) => {
+  print(chalk.blue(`Setting DHCP vendor class (option 60) to ${DHCP_VENDOR_CLASS}...`));
+  try {
+    await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-dhcp-vendor-class ${DHCP_VENDOR_CLASS_HELPER}`;
+    await exec`sudo ${DHCP_VENDOR_CLASS_HELPER}`;
+    // Reload NM's config files only (like SIGHUP); never restart NM or dhcpcd.
+    await exec`if systemctl is-active --quiet NetworkManager; then sudo nmcli general reload conf; fi`;
+  } catch (e) {
+    print(chalk.red('Error setting the DHCP vendor class'));
+    console.error(e);
+  }
 }
 
 export const installAvahi = async (exec: any) => {

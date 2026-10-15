@@ -1,0 +1,94 @@
+#!/bin/bash
+# idea-dhcp-vendor-class — make this Engine send DHCP option 60 (vendor class
+# identifier) "idea-engine", so the IDEA school router gives Engines .2–.9
+# without MAC reservations (idea#209 D8, router proposal section 5.1:
+#   dhcp-vendorclass=set:engine,idea-engine
+#   dhcp-range=tag:engine,10.42.0.2,10.42.0.9,12h).
+#
+# Handles both DHCP clients a Pi image can have; each part is skipped when absent:
+#  * NetworkManager (Bookworm/Trixie Pi OS; NM's internal DHCP client): a conf.d
+#    drop-in giving ipv4.dhcp-vendor-class-identifier as a *connection default*
+#    for eth0 and wlan0. No profile is modified, so it also covers the auto-made
+#    in-memory "Wired connection 1" and Wi-Fi profiles added later; a profile with
+#    its own explicit value keeps it.
+#  * dhcpcd (Bullseye-style images): a global "vendorclassid idea-engine" line in
+#    dhcpcd.conf, replacing any other active vendorclassid line.
+# Idempotent: when the setting is already in place nothing is written. Before a
+# changed file is replaced, the old one is copied to <file>.idea-bak-<UTC>.
+# Never restarts NetworkManager or dhcpcd and never touches a link: the caller only
+# runs "nmcli general reload conf", and the value is used from the next DHCP
+# activation (nightly reboot, cable re-plug, or "nmcli device reapply eth0").
+#
+# Usage: idea-dhcp-vendor-class [--nm-conf-dir DIR] [--dhcpcd-conf FILE]
+#   defaults /etc/NetworkManager/conf.d and /etc/dhcpcd.conf
+#   IDEA_DHCP_VENDOR_CLASS overrides the value (default idea-engine).
+# Prints one line per client: "nm|dhcpcd unchanged|absent|changed [backup=<path>]".
+set -euo pipefail
+NM_DIR=/etc/NetworkManager/conf.d
+DHCPCD_CONF=/etc/dhcpcd.conf
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --nm-conf-dir) NM_DIR="$2"; shift 2 ;;
+    --dhcpcd-conf) DHCPCD_CONF="$2"; shift 2 ;;
+    *) echo "unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
+VC="${IDEA_DHCP_VENDOR_CLASS:-idea-engine}"
+[[ "$VC" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid vendor class: $VC" >&2; exit 1; }
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+
+# Write $2 (content) to $1 atomically, keeping mode/owner of an existing file.
+replace() {
+  local f="$1" tmp
+  tmp=$(mktemp "$f.XXXXXX")
+  printf '%s' "$2" > "$tmp"
+  if [ -f "$f" ]; then
+    chmod --reference="$f" "$tmp"; chown --reference="$f" "$tmp" 2>/dev/null || true
+  else
+    chmod 0644 "$tmp"
+  fi
+  mv "$tmp" "$f"
+}
+
+# --- NetworkManager -----------------------------------------------------------
+if [ -d "$NM_DIR" ]; then
+  f="$NM_DIR/90-idea-dhcp-vendor-class.conf"
+  want="# idea#209 D8: Engines send DHCP option 60 \"$VC\" so the school router
+# gives them 10.42.0.2-.9 (dnsmasq dhcp-vendorclass). Managed by build-engine
+# (script/build_image_assets/idea-dhcp-vendor-class); edits are overwritten.
+[connection-idea-dhcp-vendor-class]
+match-device=interface-name:eth0,interface-name:wlan0
+ipv4.dhcp-vendor-class-identifier=$VC
+"
+  if [ -f "$f" ] && [ "$(cat "$f"; echo x)" = "${want}x" ]; then
+    echo "nm unchanged"
+  elif [ -f "$f" ]; then
+    b="$f.idea-bak-$STAMP"; cp -p "$f" "$b"; replace "$f" "$want"; echo "nm changed backup=$b"
+  else
+    replace "$f" "$want"; echo "nm changed"
+  fi
+else
+  echo "nm absent"
+fi
+
+# --- dhcpcd -------------------------------------------------------------------
+if [ -f "$DHCPCD_CONF" ]; then
+  # Active (uncommented) vendorclassid lines before the first interface/ssid block
+  # are global; those after belong to a block and are left alone.
+  current=$(awk '/^[[:space:]]*(interface|ssid)[[:space:]]/ { exit }
+    /^[[:space:]]*vendorclassid([[:space:]]|$)/ { v=$0; sub(/^[[:space:]]*vendorclassid[[:space:]]*/,"",v); sub(/[[:space:]]*$/,"",v); print v }' "$DHCPCD_CONF")
+  if [ "$current" = "$VC" ]; then
+    echo "dhcpcd unchanged"
+  else
+    b="$DHCPCD_CONF.idea-bak-$STAMP"; cp -p "$DHCPCD_CONF" "$b"
+    new=$(awk -v line="vendorclassid $VC" '
+      !blk && /^[[:space:]]*(interface|ssid)[[:space:]]/ { if (!done) { print "# idea#209 D8: DHCP option 60 for the school router"; print line; print ""; done=1 } blk=1 }
+      !blk && /^[[:space:]]*vendorclassid([[:space:]]|$)/ { next }
+      { print }
+      END { if (!done) { print "# idea#209 D8: DHCP option 60 for the school router"; print line } }' "$DHCPCD_CONF"; echo x)
+    replace "$DHCPCD_CONF" "${new%x}"
+    echo "dhcpcd changed backup=$b"
+  fi
+else
+  echo "dhcpcd absent"
+fi
