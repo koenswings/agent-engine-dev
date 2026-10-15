@@ -45,6 +45,9 @@ const startEngine = async (name: string, ops: number, clTraces: number) => {
     return {
         name, url: `ws://127.0.0.1:${port}`, store, cl,
         /** Engine-side WS close of every open socket (the client adapter reconnects itself). */
+        /** Stop reading every open socket without closing it: the walker's peer stays listed and its
+         *  socket stays OPEN, but nothing (no ping) is answered any more — a stale peer, as in the pool. */
+        freezeSockets: () => { for (const s of sockets) { try { (s as any)._socket.pause() } catch { /* */ } } },
         dropSockets: () => { for (const s of sockets.splice(0)) { try { s.terminate() } catch { /* */ } } },
         close: async () => { for (const s of sockets) { try { s.terminate() } catch { /* */ } } await repo.shutdown().catch(() => {}); wss.close(); await new Promise<void>(r => server.close(() => r())) },
     }
@@ -195,6 +198,19 @@ describe('r86p: one shared doc-host worker for all walker Automerge links', () =
             expect(Date.now() - t0).toBeLessThan(4_000)
             expect(link.lastReattachError).toMatch(/reattach: no WS peer/)
         } finally { await link.close() }
+    }, 30_000)
+
+    it('c2cbdb0: a listed peer whose socket does not answer a ping is not a reattach', async () => {
+        const e = await startEngine('idea03', 20, 1)
+        const link = openStore(e)
+        try {
+            expect((await link.outcome()).kind).toBe('ready')
+            expect(await link.reattach(5_000)).toBe(true) // live socket answers the ping
+            e.freezeSockets() // peer still in repo.peers, socket still OPEN, but no pong comes back
+            expect(link.peerCount).toBeGreaterThan(0)
+            expect(await link.reattach(1_500)).toBe(false) // before c2cbdb0: true on the stale peer entry
+            expect(link.lastReattachError).toMatch(/reattach: /)
+        } finally { await link.close(); await e.close() }
     }, 30_000)
 
     it('r86q: a blocked host thread is named (heartbeat), not reported as a plain sync stall', async () => {
