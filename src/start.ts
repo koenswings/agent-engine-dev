@@ -166,7 +166,8 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
 
     // Start the HTTP server (serves Console UI + /api/store-url)
     log(chalk.bgMagenta('STARTING HTTP SERVER'))
-    const httpServer = enableHttpMonitor(undefined, undefined, commandLogHandle)
+    // idea#203: http://idea.local (port 80) must reach this Engine's Console even when httpPort is not 80
+    const httpServer = enableHttpMonitor(undefined, undefined, commandLogHandle, config.settings.ideaLocalHttpPort ?? 80)
 
     // Start the instances monitor
     // log(chalk.bgMagenta('STARTING INSTANCES MONITOR'))

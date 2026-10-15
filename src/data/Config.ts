@@ -29,7 +29,8 @@ export interface Settings {
     peerAccess?: boolean;         // Per-Pi Engine keys for cross-Engine copy (default: on unless isDev || testMode). See peerAccessEnabled().
     peerStaleHours?: number;      // A peer Engine without a heartbeat for this long loses its key here (default 168 = 7 days). See peerStaleMs().
     autoStartChannelBuilder?: boolean; // Start the docked kolibri-channel-builder when a stick with a kolibri folder is mounted (idea#193 §8.2a; default true). See autoStartChannelBuilder().
-    usbRoot?: string;             // Mount root for teacher USB sticks (default /run/idea-usb; IDEA_USB_ROOT wins). Tests point this at a temp folder. See usbRoot().
+    usbRoot?: string;
+    ideaLocalHttpPort?: number;   // Port that http://idea.local is served on, in addition to httpPort (idea#203; default 80). See httpMonitor.ts.             // Mount root for teacher USB sticks (default /run/idea-usb; IDEA_USB_ROOT wins). Tests point this at a temp folder. See usbRoot().
 }
 
 export interface Defaults {
@@ -133,6 +134,7 @@ function validateSettings(obj: any, path: string): string[] {
     if (obj.peerAccess !== undefined && typeof obj.peerAccess !== 'boolean') errors.push(`'${path}peerAccess' must be a boolean.`);
     if (obj.peerStaleHours !== undefined && (typeof obj.peerStaleHours !== 'number' || !(obj.peerStaleHours > 0))) errors.push(`'${path}peerStaleHours' must be a positive number.`);
     if (obj.autoStartChannelBuilder !== undefined && typeof obj.autoStartChannelBuilder !== 'boolean') errors.push(`'${path}autoStartChannelBuilder' must be a boolean.`);
+    if (obj.ideaLocalHttpPort !== undefined && (typeof obj.ideaLocalHttpPort !== 'number' || !Number.isInteger(obj.ideaLocalHttpPort) || obj.ideaLocalHttpPort < 1 || obj.ideaLocalHttpPort > 65535)) errors.push(`'${path}ideaLocalHttpPort' must be a port number.`);
     if (obj.usbRoot !== undefined && typeof obj.usbRoot !== 'string') errors.push(`'${path}usbRoot' must be a string.`);
     return errors;
 }

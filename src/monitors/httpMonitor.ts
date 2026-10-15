@@ -8,6 +8,13 @@
  *
  * Port: configurable via `config.yaml` settings.httpPort (default 80).
  *
+ * idea#203: clients open `http://idea.local` (port 80) and must get the Console of
+ * whichever Engine holds that name. When httpPort is not 80 (e.g. an Engine that
+ * serves its Console on :8080), start.ts passes `alsoPort` = settings.ideaLocalHttpPort
+ * (default 80) and the same handler (Console + API) is also served there, so
+ * same-origin calls such as /api/store-url keep working. Closing the main server
+ * closes the extra listener.
+ *
  * If `consolePath` is empty or the directory does not exist, the static file
  * serving is skipped but /api/store-url is still available.
  *
@@ -84,7 +91,8 @@ const mimeType = (filePath: string): string => {
 export const enableHttpMonitor = (
     port: number = config.settings.httpPort,
     consolePath: string = config.settings.consolePath,
-    _commandLogHandle?: DocHandle<CommandLogStore> | null   // unused at runtime — URL comes from disk
+    _commandLogHandle?: DocHandle<CommandLogStore> | null,  // unused at runtime — URL comes from disk
+    alsoPort?: number,     // idea#203: also serve on this port (idea.local, :80) when it differs from `port`
 ): http.Server => {
 
     const hasConsole = consolePath && fs.existsSync(consolePath)
@@ -97,7 +105,7 @@ export const enableHttpMonitor = (
         log(`[http] No consolePath configured — Console UI will not be served`)
     }
 
-    const server = http.createServer(async (req, res) => {
+    const handler: http.RequestListener = async (req, res) => {
         const url = req.url ?? '/'
 
         // ── API routes ──────────────────────────────────────────────────────
@@ -161,21 +169,31 @@ export const enableHttpMonitor = (
             res.writeHead(500, { 'Content-Type': 'text/plain' })
             res.end('Internal error')
         }
-    })
+    }
 
-    server.on('error', (e: NodeJS.ErrnoException) => {
-        if (e.code === 'EACCES') {
-            log(`[http] Permission denied on port ${port}. Run with sudo or use a port > 1024.`)
-        } else if (e.code === 'EADDRINUSE') {
-            log(`[http] Port ${port} already in use.`)
-        } else {
-            log(`[http] Server error: ${e}`)
-        }
-    })
+    const listen = (p: number, what: string): http.Server => {
+        const srv = http.createServer(handler)
+        srv.on('error', (e: NodeJS.ErrnoException) => {
+            if (e.code === 'EACCES') {
+                log(`[http] Permission denied on port ${p} (${what}). Grant node cap_net_bind_service or use a port > 1024.`)
+            } else if (e.code === 'EADDRINUSE') {
+                log(`[http] Port ${p} already in use (${what}).`)
+            } else {
+                log(`[http] Server error on port ${p} (${what}): ${e}`)
+            }
+        })
+        srv.listen(p, () => {
+            log(`[http] Engine HTTP server listening on port ${(srv.address() as any)?.port ?? p} (${what})`)
+        })
+        return srv
+    }
 
-    server.listen(port, () => {
-        log(`[http] Engine HTTP server listening on port ${port}`)
-    })
+    const server = listen(port, 'Console')
+    if (alsoPort !== undefined && alsoPort !== port) {
+        const extra = listen(alsoPort, 'idea.local Console')
+        ;(server as any).ideaLocalServer = extra
+        server.on('close', () => { if (extra.listening) extra.close() })
+    }
 
     return server
 }
