@@ -26,7 +26,8 @@ export const seeded = (seed: number) => () => {
 }
 
 const main = async () => {
-    if (!argv['no-rename']) { console.error('this tool only runs with --no-rename (use build-engine.ts to install)'); process.exit(2) }
+    // minimist reads --no-rename as rename=false
+    if (!(argv.rename === false || argv['no-rename'])) { console.error('this tool only runs with --no-rename (use build-engine.ts to install)'); process.exit(2) }
     $.verbose = false
     const out = argv.out ? String(argv.out) : mkdtempSync(join(tmpdir(), 'sticker-'))
     const stickerFile = join(out, 'sticker-name'), stickerTxt = join(out, 'STICKER.txt')

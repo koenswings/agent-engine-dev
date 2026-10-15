@@ -38,6 +38,7 @@ describe('idea#184 --no-rename tool and real deps', () => {
     it('sticker-name.ts never renames the system', () => {
         const s = read('script/sticker-name.ts')
         expect(s).toMatch(/no-rename/)
+        expect(s).toMatch(/argv.rename === false/) // minimist negation
         expect(s).not.toMatch(/hostnamectl|setHostname|\/etc\/hosts|tailscale set/)
     })
     it('installAvahi installs avahi-utils (LAN check needs avahi-resolve-host-name)', () => {
