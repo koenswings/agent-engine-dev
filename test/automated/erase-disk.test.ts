@@ -14,6 +14,7 @@ import { createOrUpdateDisk, processDisk } from '../../src/data/Disk.js'
 import {
     eraseDisk, setEraseOpsForTests, clearStaleEraseStaging, ERASE_STAGING_ROOT,
     eraseBlocker, IDEA_DISK_LABEL, isEraseDeviceLocked, isSlotEraseDevice,
+    eraseLockRefusesAdd, eraseLockedDevicesForTests, setEraseAddDevice,
 } from '../../src/data/EraseDisk.js'
 import { summariseDisk, attachTraceResult, SUMMARY_MAX_AGE_MS, setSummariseOpsForTests } from '../../src/data/SummariseDisk.js'
 import { scanUnformattedDisks, setUnformattedOpsForTests, uniquifyLabels, clearGeneratedUnformattedIdsForTests, labelForUnformatted } from '../../src/data/UnformattedDisks.js'
@@ -129,6 +130,7 @@ describe('unformattedDisks scan (idea#134)', () => {
     })
 })
 
+let eraseOpsForTestsAdd: (p: string) => Promise<void>
 describe('summariseDisk + eraseDisk (idea#134)', () => {
     let h: DocHandle<Store>
     let logHandle: DocHandle<CommandLogStore>
@@ -166,7 +168,7 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
             composeDownV: async () => {},
             lsblkSizeSerial: async () => ({ sizeBytes: 32_000_000_000, serial: 'FAKE1' }),
             isMountPoint: async () => false,
-            addDevice: async (p) => {
+            addDevice: eraseOpsForTestsAdd = async (p) => {
                 const device = p.split('/').pop()!
                 const root = `${DISKS_ROOT}/${device}`
                 if (!(await fs.pathExists(root))) await fs.ensureDir(root)
@@ -270,6 +272,44 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
         expect([...disk.diskTypes]).toEqual(['empty'])
         expect(h.doc()!.engineDB[LOCAL].eraseInProgress).toBeNull()
         expect(isEraseDeviceLocked('sdb')).toBe(false)
+    })
+
+    it('post-erase add goes through the real erase-lock guard and is not refused (wh 2026-10-12)', async () => {
+        // Production wires usbDeviceMonitor.addDevice, which refuses locked devices via eraseLockRefusesAdd.
+        // Before the fix the lock on 'sdb' was held across the add → "did not come back as empty".
+        const refused: string[] = []
+        const realAdd = (eraseOpsForTestsAdd as any)
+        setEraseAddDevice(async (p) => {
+            const device = p.split('/').pop()!
+            if (eraseLockRefusesAdd(device)) { refused.push(device); return }
+            await realAdd(p)
+        })
+        try {
+            h.change(doc => {
+                doc.engineDB[LOCAL].unformattedDisks = [{
+                    candidateId: 'CAND1', device: 'sdb', sizeBytes: 32e9,
+                    model: 'SanDisk', fsType: 'exfat', label: 'SanDisk 32 GB', serial: 'FAKE1',
+                }]
+            })
+            const tid = putSummary('CAND1', 'SanDisk 32 GB')
+            const result = await eraseDisk(h, 'CAND1', tid, 'SanDisk 32 GB')
+            expect(refused).toEqual([])
+            expect(result.diskId).toBe('CAND1')
+            expect([...h.doc()!.diskDB['CAND1' as DiskID].diskTypes]).toEqual(['empty'])
+            expect(isEraseDeviceLocked('sdb')).toBe(false)
+        } finally {
+            setEraseAddDevice(null)
+        }
+    })
+
+    it('eraseLockRefusesAdd: partition and whole drive of a locked erase are refused, others not', () => {
+        eraseLockedDevicesForTests().add('sdc')
+        try {
+            expect(eraseLockRefusesAdd('sdc1')).toBe(true)
+            expect(eraseLockRefusesAdd('/dev/engine/sdc1')).toBe(true)
+            expect(eraseLockRefusesAdd('sdc')).toBe(true)
+            expect(eraseLockRefusesAdd('sdd1')).toBe(false)
+        } finally { eraseLockedDevicesForTests().delete('sdc') }
     })
 
     it('second concurrent erase is refused', async () => {
