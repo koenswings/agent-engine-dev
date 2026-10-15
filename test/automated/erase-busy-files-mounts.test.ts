@@ -56,6 +56,7 @@ describe('eraseDisk refuses a disk held by another instance (filesMounts / volum
         downCalls = 0
         setEraseOpsForTests({
             mountedPartitions: async () => [],
+            hiddenTablePartitions: async () => [],
             runScript: async () => { scriptCalls++; throw new Error('should not partition') },
             runSlotErase: async () => { scriptCalls++; throw new Error('should not slot-erase') },
             composeDownV: async () => { downCalls++ },

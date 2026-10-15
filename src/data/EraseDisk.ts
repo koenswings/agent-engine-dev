@@ -68,7 +68,33 @@ export interface EraseOps {
     isMountPoint: (mp: string) => Promise<boolean>
     /** Mounted partitions of a whole device as [partition, mountpoint] (findmnt); injectable for tests */
     mountedPartitions: (wholeDevice: string) => Promise<{ partition: string; mountpoint: string }[]>
+    /**
+     * Partitions in the on-disk partition table that the kernel does not show
+     * (root helper `idea-erase-disk --check-table`, read-only). Throws when the
+     * table can't be checked. Injectable for tests.
+     */
+    hiddenTablePartitions: (wholeDevice: string) => Promise<HiddenPartition[]>
 }
+
+export interface HiddenPartition { partition: string; name: string | null }
+
+/** Parse `idea-erase-disk --check-table` output: lines "hidden: sda1 start=..., name=\"X\"". */
+export const parseHiddenPartitions = (stdout: string): HiddenPartition[] => {
+    const res: HiddenPartition[] = []
+    for (const line of stdout.split('\n')) {
+        const m = line.trim().match(/^hidden:\s+(\S+)(.*)$/)
+        if (!m) continue
+        const name = m[2].match(/name="([^"]*)"/)?.[1] ?? null
+        res.push({ partition: m[1], name: name || null })
+    }
+    return res
+}
+
+export const hiddenPartitionsMessage = (label: string, whole: string, hidden: HiddenPartition[]): string =>
+    `${label} is on /dev/${whole}, whose partition table also has ` +
+    `${hidden.map(h => h.name ? `${h.partition} ("${h.name}")` : h.partition).join(', ')}, ` +
+    `which this Pi does not show (not in lsblk). Erasing wipes the whole disk, so nothing was erased. ` +
+    `Unplug the disk and plug it in again, then check it.`
 
 const defaultOps: EraseOps = {
     runScript: async (a) => {
@@ -101,6 +127,13 @@ const defaultOps: EraseOps = {
             if (part !== whole && driveNameOf(part) === whole) res.push({ partition: part, mountpoint: target.replace(/\\x20/g, ' ') })
         }
         return res
+    },
+    hiddenTablePartitions: async (whole) => {
+        const out = await $`sudo -n ${ERASE_SCRIPT} --check-table /dev/${whole}`.nothrow()
+        if (out.exitCode !== 0) {
+            throw new Error((out.stderr || out.stdout).trim() || `exit ${out.exitCode}`)
+        }
+        return parseHiddenPartitions(out.stdout)
     },
 }
 
@@ -309,6 +342,16 @@ export const eraseDisk = async (
                 `${summary.label} shares its physical disk (/dev/${whole}) with ${siblings.map(m => `${m.partition} mounted at ${m.mountpoint}`).join(', ')}. ` +
                 `Erasing wipes the whole disk, so nothing was erased.`)
         }
+        // lsblk/findmnt only see partitions the kernel knows. A partition that is in
+        // the on-disk table but missing from /proc/partitions (idea01 sda1,
+        // 2026-10-15) would be wiped unseen, so read the table itself. Fail closed.
+        let hidden: HiddenPartition[]
+        try {
+            hidden = await ops.hiddenTablePartitions(whole)
+        } catch (e: any) {
+            throw new Error(`Could not check the partition table of /dev/${whole} (${e.message ?? e}), so nothing was erased.`)
+        }
+        if (hidden.length > 0) throw new Error(hiddenPartitionsMessage(summary.label, whole, hidden))
     }
 
     setEraseStep(storeHandle, 'checking', targetId, summary.label)
