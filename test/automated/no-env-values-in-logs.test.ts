@@ -146,8 +146,9 @@ const buildFixtureDisk = async (c: EnvCase): Promise<void> => {
         image: IMAGE,
         pull_policy: 'never',
         labels: { [TEST_CONTAINER_LABEL_KEY]: TEST_CONTAINER_LABEL_VALUE },
-        // No published port: the test needs no traffic, and a host port could
-        // clash with another test's container on a busy runner.
+        // Published on the generated .env port: since #152 startInstance only reports
+        // Running once the host port answers (same fixture shape as instance-start-status).
+        ports: ['${port}:80'],
         environment: { APP_DB_PASSWORD: '${APP_DB_PASSWORD:-}', APP_API_TOKEN: '${APP_API_TOKEN:-}' },
         restart: 'no',
     }

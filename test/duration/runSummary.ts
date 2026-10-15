@@ -10,6 +10,7 @@
  *    both step numberings. Never presented as the parent walk.
  */
 
+import { reconnectEvents, reconnectSummary, type ReconnectEvent } from './staleView.js'
 import type { StructuredLogEntry, WalkDefinition, WalkerResult } from './types.js'
 import { parentStepFor } from './scenario.js'
 
@@ -157,12 +158,15 @@ export interface RunSummary {
     lastStep: { step: number; action: string; parentStep?: number | null } | null
     failedSteps: { step: number; action: string; parentStep?: number | null }[]
     keepEditingRecoveries: KeepEditingRecoveryCount
+    /** r66: every forced stale-view reconnect (staleView.ts) — a frozen sync view stays visible. */
+    reconnects?: ReturnType<typeof reconnectSummary>
 }
 
 export const buildRunSummary = (input: {
     walk: WalkDefinition | null
     result: Pick<WalkerResult, 'steps' | 'failures' | 'aborted' | 'abortReason' | 'logs'>
     recoveries: KeepEditingRecoveryCount
+    reconnects?: readonly ReconnectEvent[]
 }): RunSummary => {
     const { walk, result, recoveries } = input
     const so = shakeOutSummary(walk)
@@ -184,6 +188,7 @@ export const buildRunSummary = (input: {
             .filter(l => !l.ok)
             .map(l => ({ ...stepNumbers(walk, l.step), action: l.action })),
         keepEditingRecoveries: recoveries,
+        reconnects: reconnectSummary(input.reconnects ?? reconnectEvents()),
     }
 }
 
@@ -205,5 +210,8 @@ export const formatRunSummaryLine = (s: RunSummary): string => {
     const last = s.lastStep
         ? ` | last step @${s.lastStep.step}${s.lastStep.parentStep !== undefined ? ` (${s.variantOf}@${s.lastStep.parentStep ?? 'substitute'})` : ''} ${s.lastStep.action}`
         : ''
-    return `[duration] summary: ${s.walk ?? s.mode} steps=${s.steps} failures=${s.failures}${s.aborted ? ' ABORTED' : ''}${last} | ${rec}${so}`
+    const rc = s.reconnects
+        ? ` | stale-view reconnects: ${s.reconnects.count}${s.reconnects.count ? ` (found new ${s.reconnects.found_new}, failed ${s.reconnects.failed}; ${s.reconnects.times.join(', ')})` : ''}`
+        : ''
+    return `[duration] summary: ${s.walk ?? s.mode} steps=${s.steps} failures=${s.failures}${s.aborted ? ' ABORTED' : ''}${last} | ${rec}${rc}${so}`
 }
