@@ -8,7 +8,7 @@
  */
 import { describe, it, expect } from 'vitest'
 import {
-    IdeaLocalPublisher, AvahiClient, AvahiEntryGroup, EntryGroupState, lanAddresses,
+    isEntryGroupGone, IdeaLocalPublisher, AvahiClient, AvahiEntryGroup, EntryGroupState, lanAddresses,
     isLanInterfaceName, AVAHI_PUBLISH_NO_REVERSE, AVAHI_PROTO_INET, LanAddress,
 } from '../../src/monitors/ideaLocal.js'
 
@@ -21,6 +21,8 @@ class FakeGroup implements AvahiEntryGroup {
     name = ''
     records: { ifIndex: number, proto: number, flags: number, address: string }[] = []
     freed = false
+    /** avahi-daemon restarted: the object path is gone, libdbus answers UnknownMethod. */
+    gone = false
     constructor(public lan: FakeLan, public host: FakeHost) { lan.groups.add(this) }
     async addAddress(ifIndex: number, proto: number, flags: number, name: string, address: string) {
         if (this.host.down) throw new Error('org.freedesktop.DBus.Error.ServiceUnknown')
@@ -29,13 +31,14 @@ class FakeGroup implements AvahiEntryGroup {
     }
     async commit() { this.state = EntryGroupState.REGISTERING }
     async getState() {
+        if (this.gone) { const e: any = new Error('Method "GetState" with signature "" on interface "org.freedesktop.Avahi.EntryGroup" doesn\'t exist'); e.type = 'org.freedesktop.DBus.Error.UnknownMethod'; throw e }
         if (this.host.down) throw new Error('org.freedesktop.DBus.Error.ServiceUnknown')
         if (this.state === EntryGroupState.REGISTERING) {
             this.state = this.lan.holder(this.name) ? EntryGroupState.COLLISION : EntryGroupState.ESTABLISHED
         }
         return this.state
     }
-    async free() { this.freed = true; this.lan.groups.delete(this) }
+    async free() { if (this.gone) throw new Error('UnknownMethod'); this.freed = true; this.lan.groups.delete(this) }
 }
 class FakeHost {
     down = false
@@ -46,6 +49,8 @@ class FakeHost {
         this.connects++
         return { entryGroupNew: async () => { if (this.down) throw new Error('gone'); return new FakeGroup(this.lan, this) }, close: () => {} }
     }
+    /** avahi-daemon restart (e.g. after an avahi-daemon.conf change): all its groups vanish, the bus stays. */
+    avahiRestart() { for (const g of [...this.lan.groups]) if (g.host === this) { g.gone = true; this.lan.groups.delete(g) } }
     /** Power cut: the host vanishes without a goodbye; its records stop answering probes. */
     powerCut() { this.down = true; for (const g of [...this.lan.groups]) if (g.host === this) this.lan.groups.delete(g) }
 }
@@ -167,5 +172,48 @@ describe('idea.local LAN-only addresses (idea#203)', () => {
     it('isLanInterfaceName', () => {
         for (const n of ['eth0', 'wlan0', 'end0', 'enp1s0']) expect(isLanInterfaceName(n)).toBe(true)
         for (const n of ['lo', 'docker0', 'br-abc', 'veth123', 'tailscale0', 'virbr0']) expect(isLanInterfaceName(n)).toBe(false)
+    })
+
+    describe('avahi-daemon restart (pool 2026-10-15: GetState UnknownMethod)', () => {
+        it('classifies a vanished entry group, not other errors', () => {
+            const e: any = new Error('Method "GetState" with signature "" on interface "org.freedesktop.Avahi.EntryGroup" doesn\'t exist')
+            expect(isEntryGroupGone(e)).toBe(true)
+            expect(isEntryGroupGone({ type: 'org.freedesktop.DBus.Error.UnknownObject', text: 'x' })).toBe(true)
+            expect(isEntryGroupGone(new Error('org.freedesktop.DBus.Error.ServiceUnknown'))).toBe(false)
+            expect(isEntryGroupGone(new Error('Connection closed'))).toBe(false)
+        })
+
+        it('the holder re-publishes in the same tick: no error line, no reconnect, still holder', async () => {
+            const lan = new FakeLan(); const h = new FakeHost(lan); const lines: string[] = []
+            const p = mk(h, () => [addr('10.99.0.13')], lines)
+            await p.tick(); expect(await p.tick()).toBe('holder')
+            h.avahiRestart()
+            expect(await p.tick()).toBe('registering')
+            expect(await p.tick()).toBe('holder')
+            expect(h.connects).toBe(1)
+            expect(lines.some(l => /D-Bus error/.test(l))).toBe(false)
+            expect(lines.some(l => /daemon restarted/.test(l))).toBe(true)
+            expect(lan.groups.size).toBe(1)
+        })
+
+        it('a waiting Engine whose avahi restarts keeps waiting; one holder throughout', async () => {
+            const lan = new FakeLan(); const h1 = new FakeHost(lan); const h2 = new FakeHost(lan)
+            const p1 = mk(h1, () => [addr('10.99.0.13')]); const p2 = mk(h2, () => [addr('10.99.0.14')])
+            await p1.tick(); await p1.tick(); await p2.tick(); await p2.tick()
+            h2.avahiRestart()
+            for (let i = 0; i < 4; i++) { await p2.tick(); await p1.tick() }
+            expect(p1.status).toBe('holder'); expect(p2.status).toBe('waiting')
+            expect(lan.holder('idea.local')!.host).toBe(h1)
+        })
+
+        it('takeover after a holder power cut still works when the waiter just had an avahi restart', async () => {
+            const lan = new FakeLan(); const h1 = new FakeHost(lan); const h2 = new FakeHost(lan)
+            const p1 = mk(h1, () => [addr('10.99.0.13')]); const p2 = mk(h2, () => [addr('10.99.0.14')])
+            await p1.tick(); await p1.tick(); await p2.tick(); await p2.tick()
+            h2.avahiRestart(); h1.powerCut()
+            for (let i = 0; i < 3 && p2.status !== 'holder'; i++) await p2.tick()
+            expect(p2.status).toBe('holder')
+            expect(lan.holder('idea.local')!.host).toBe(h2)
+        })
     })
 })

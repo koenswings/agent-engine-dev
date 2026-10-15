@@ -77,6 +77,22 @@ const sysIfIndex = (name: string): number | undefined => {
     } catch { return undefined }
 }
 
+/**
+ * True when a D-Bus error means our entry group object no longer exists in avahi-daemon.
+ * avahi keeps groups only in memory: when avahi-daemon restarts (e.g. after an
+ * avahi-daemon.conf change, PR #215) the new daemon owns org.freedesktop.Avahi but has no
+ * /ClientN/EntryGroupM objects, and libdbus answers any call on the old path with
+ * UnknownMethod 'Method "GetState" with signature "" on interface ... doesn't exist'.
+ * That is not a bus failure: the right reaction is to publish a fresh group.
+ */
+export const isEntryGroupGone = (e: any): boolean => {
+    const name = String(e?.type ?? e?.name ?? '')
+    const msg = String(e?.text ?? e?.message ?? e ?? '')
+    return /org\.freedesktop\.DBus\.Error\.(UnknownMethod|UnknownObject|UnknownInterface)/.test(name)
+        || /org\.freedesktop\.DBus\.Error\.(UnknownMethod|UnknownObject|UnknownInterface)/.test(msg)
+        || /on interface "org\.freedesktop\.Avahi\.EntryGroup" doesn't exist/.test(msg)
+}
+
 const addrKey = (a: LanAddress[]) => a.map(x => `${x.ifIndex}/${x.address}`).join(',')
 
 // ── avahi abstraction ────────────────────────────────────────────────────────
@@ -148,6 +164,14 @@ export class IdeaLocalPublisher {
         if (c) { try { c.close() } catch { /* ignore */ } }
     }
 
+    /** The group's state, or undefined when avahi no longer has the group (daemon restarted). */
+    private async readGroupState(g: AvahiEntryGroup): Promise<number | undefined> {
+        try { return await g.getState() } catch (e: any) {
+            if (isEntryGroupGone(e)) return undefined
+            throw e
+        }
+    }
+
     /** One step of the retry/takeover loop. Never throws. */
     async tick(): Promise<PublisherStatus> {
         if (this.stopped) return this.status
@@ -156,23 +180,29 @@ export class IdeaLocalPublisher {
             const key = addrKey(addrs)
 
             if (this.group) {
-                const st = await this.group.getState()
-                if (key === this.publishedKey && st === EntryGroupState.ESTABLISHED) {
+                const st = await this.readGroupState(this.group)
+                if (st === undefined) {
+                    // avahi-daemon restarted and our group went with it. The bus connection is
+                    // fine; publish a fresh group in this same tick (no reconnect, no error line).
+                    this.group = undefined
+                    this.publishedKey = ''
+                    this.note('registering', `avahi-daemon lost our ${this.name} entry group (daemon restarted); re-publishing`)
+                } else if (key === this.publishedKey && st === EntryGroupState.ESTABLISHED) {
                     this.note('holder', `holding ${this.name} on ${addrs.map(a => `${a.ifName} ${a.address}`).join(', ')}`)
                     return this.status
-                }
-                if (key === this.publishedKey && (st === EntryGroupState.REGISTERING || st === EntryGroupState.UNCOMMITED)) {
+                } else if (key === this.publishedKey && (st === EntryGroupState.REGISTERING || st === EntryGroupState.UNCOMMITED)) {
                     this.status = 'registering'
                     return this.status
-                }
-                if (st === EntryGroupState.COLLISION) {
-                    this.note('waiting', `${this.name} is held by another Engine; retrying every 2-5 s`)
-                } else if (key !== this.publishedKey) {
-                    this.note('registering', `LAN addresses changed (${key || 'none'}); re-publishing ${this.name}`)
                 } else {
-                    this.note('waiting', `${this.name} registration ended in state ${EntryGroupState[st] ?? st}; retrying`)
+                    if (st === EntryGroupState.COLLISION) {
+                        this.note('waiting', `${this.name} is held by another Engine; retrying every 2-5 s`)
+                    } else if (key !== this.publishedKey) {
+                        this.note('registering', `LAN addresses changed (${key || 'none'}); re-publishing ${this.name}`)
+                    } else {
+                        this.note('waiting', `${this.name} registration ended in state ${EntryGroupState[st] ?? st}; retrying`)
+                    }
+                    await this.dropGroup()
                 }
-                await this.dropGroup()
             }
 
             if (addrs.length === 0) {
