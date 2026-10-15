@@ -9,6 +9,25 @@ import { EngineID, Hostname, IPAddress } from '../data/CommonTypes.js';
 import { config } from '../data/Config.js';
 import { readStoreDocId } from '../data/StoreIdentity.js';
 import { RefusalLog, storeTag } from '../data/StoreScope.js';
+import { lanAddresses } from './ideaLocal.js';
+
+/**
+ * node-dns-sd (peer discovery) binds 0.0.0.0:5353 and, by default, sends its query on every
+ * non-internal IPv4 address: tailscale0 (no MULTICAST flag → `send EPERM 224.0.0.251:5353`,
+ * pool idea03), docker0/br-* (a bridge that is down or just removed → `send ENODEV`, pool
+ * idea04) and veth*. The first failing interface rejects the whole discover(), so discovery
+ * also skipped the real LAN for that round. Restrict it to the LAN addresses idea.local
+ * publishes on (lanAddresses: never lo, docker*, br-*, veth*, tailscale*, …). Applied to the
+ * singleton; node-dns-sd re-reads the list through this method at every start.
+ */
+export const restrictDnsSdToLan = (sd: any = mDnsSd, lan: () => string[] = () => lanAddresses().map(a => a.address)): void => {
+    sd._getNetifAddressList = () => lan()
+    if (Array.isArray(sd._netif_address_list)) sd._netif_address_list = lan()
+}
+
+/** One log line per distinct discovery error, not one every 10 s round. */
+let lastDiscoveryError = ''
+
 
 /**
  * The TXT record this Engine advertises. `store` (StoreScope.ts storeTag: a short
@@ -133,13 +152,18 @@ export const discoverEngines = async (storeHandle: DocHandle<Store>, repo:Repo, 
         if (deviceList.length === 0) {
             log(chalk.bgBlackBright(`No remote engines found`))
         }
-    } catch (error) {
-        log(`***node-dns-sd*** Error discovering engines`)
-        console.error(error);
+        if (lastDiscoveryError) { log(`[mdns] engine discovery working again`); lastDiscoveryError = '' }
+    } catch (error: any) {
+        const line = `${error?.message ?? error}`
+        if (line !== lastDiscoveryError) {
+            log(`***node-dns-sd*** Error discovering engines: ${line} (logged once until it changes)`)
+            lastDiscoveryError = line
+        }
     }
 }
 
 export const enableMulticastDNSEngineMonitor = (storeHandle: DocHandle<Store>, repo: Repo): { end: () => Promise<void> } => {
+    restrictDnsSdToLan()
     const service = startAdvertising(storeHandle.doc())
     
     const runDiscovery = async () => {

@@ -10,7 +10,7 @@ import { describe, it, expect } from 'vitest'
 import {
     isEntryGroupGone, IdeaLocalPublisher, AvahiClient, AvahiEntryGroup, EntryGroupState, lanAddresses,
     isLanInterfaceName, AVAHI_PUBLISH_NO_REVERSE, AVAHI_PROTO_INET, LanAddress, MdnsResponder,
-    foreignHolders, conflictWinner, encodeMdnsQuery, parseMdnsAnswers,
+    foreignHolders, conflictWinner, encodeMdnsQuery, parseMdnsAnswers, queryIdeaLocalResponders,
 } from '../../src/monitors/ideaLocal.js'
 
 class FakeLan {
@@ -227,7 +227,8 @@ describe('idea.local LAN-only addresses (idea#203)', () => {
             const p1 = mk(h1, () => [addr('10.99.0.13')]); const p2 = mk(h2, () => [addr('10.99.0.14')])
             await p1.tick(); await p1.tick(); await p2.tick(); await p2.tick()
             h2.avahiRestart(); h1.powerCut()
-            for (let i = 0; i < 3 && p2.status !== 'holder'; i++) await p2.tick()
+            // the waiter first lets a previous holder re-claim (reclaim grace), then takes over
+            for (let i = 0; i < 6 && p2.status !== 'holder'; i++) { await p2.tick(); clock += 3000 }
             expect(p2.status).toBe('holder')
             expect(lan.holder('idea.local')!.host).toBe(h2)
         })
@@ -354,5 +355,114 @@ describe('raw mDNS query encoding (idea#203)', () => {
         expect(parseMdnsAnswers(msg, 'idea.local')).toEqual(['10.99.0.13'])
         expect(parseMdnsAnswers(Buffer.from([0, 0, 0, 0]), 'idea.local')).toEqual([])
         expect(parseMdnsAnswers(msg.subarray(0, 40), 'idea.local')).toEqual([])
+    })
+})
+
+describe('idea.local simultaneous avahi-daemon restart (pool cron `0 * * * * systemctl restart avahi-daemon`, 17:00:01)', () => {
+    const setup = (grace?: () => number) => {
+        clock = 0
+        const lan = new FakeLan(); const h3 = new FakeHost(lan); const h4 = new FakeHost(lan)
+        const l3: string[] = []; const l4: string[] = []
+        const opts = (h: FakeHost, ip: string, lines: string[]) => new IdeaLocalPublisher({
+            connect: h.connect, addresses: () => [addr(ip)], logger: l => lines.push(l), nextDelayMs: () => 1,
+            probe: async () => h.lan.probe(h), now: () => clock, ...(grace ? { reclaimGraceMs: grace } : {}),
+        })
+        return { lan, h3, h4, l3, l4, p3: opts(h3, '10.99.0.13', l3), p4: opts(h4, '10.99.0.14', l4) }
+    }
+    /** both daemons restart at the same second; the waiter's tick happens to come first (what happened on the pool) */
+    const restartBoth = async (s: ReturnType<typeof setup>, first: IdeaLocalPublisher, second: IdeaLocalPublisher) => {
+        s.h3.avahiRestart(); s.h4.avahiRestart()
+        await first.tick(); clock += 1000; await second.tick()
+        for (let i = 0; i < 20; i++) { await first.tick(); await second.tick(); clock += 3000 }
+    }
+
+    it('reproduces 17:00:01 without the reclaim grace: the waiter (idea04) ticks first and takes the name', async () => {
+        const s = setup(() => 0)
+        await s.p3.tick(); await s.p3.tick(); await s.p4.tick(); await s.p4.tick()
+        expect(s.p3.status).toBe('holder'); expect(s.p4.status).toBe('waiting')
+        await restartBoth(s, s.p4, s.p3)
+        expect(s.lan.holders('idea.local').map(g => g.host)).toEqual([s.h4])
+        expect(s.p3.status).toBe('waiting')
+    })
+
+    it('with the grace the previous holder keeps the name even when the waiter ticks first', async () => {
+        const s = setup()
+        await s.p3.tick(); await s.p3.tick(); await s.p4.tick(); await s.p4.tick()
+        await restartBoth(s, s.p4, s.p3)
+        expect(s.lan.holders('idea.local').map(g => g.host)).toEqual([s.h3])
+        expect(s.p3.status).toBe('holder'); expect(s.p4.status).toBe('waiting')
+        expect(s.l4.some(l => /letting the previous holder re-claim/.test(l))).toBe(true)
+    })
+
+    it('a single holder with the higher IP (idea04) keeps it: no step-down, no flap, over many hourly restarts', async () => {
+        const s = setup()
+        await s.p4.tick(); await s.p4.tick(); await s.p3.tick(); await s.p3.tick()
+        expect(s.p4.status).toBe('holder'); expect(s.p3.status).toBe('waiting')
+        const holderLog: string[] = []
+        for (let hour = 0; hour < 5; hour++) {
+            await restartBoth(s, hour % 2 ? s.p3 : s.p4, hour % 2 ? s.p4 : s.p3)
+            for (let i = 0; i < 10; i++) {
+                await s.p3.tick(); await s.p4.tick(); clock += 3000
+                const hs = s.lan.holders('idea.local')
+                expect(hs.length).toBeLessThanOrEqual(1)
+                holderLog.push(hs.map(g => g.records[0].address).join())
+            }
+        }
+        expect(new Set(holderLog)).toEqual(new Set(['10.99.0.14']))
+        expect(s.l4.some(l => /withdrawing/.test(l))).toBe(false)
+    })
+
+    it('when neither held the name, one of them gets it after the grace', async () => {
+        const s = setup()
+        await s.p3.tick(); await s.p4.tick() // both registering, nobody established yet
+        s.h3.avahiRestart(); s.h4.avahiRestart()
+        for (let i = 0; i < 10; i++) { await s.p3.tick(); await s.p4.tick(); clock += 3000 }
+        expect(s.lan.holders('idea.local').length).toBe(1)
+    })
+})
+
+describe('idea.local second-holder check send errors (pool idea03: send EPERM 224.0.0.251:5353)', () => {
+    const holder = (probe: () => Promise<any>, lines: string[]) => {
+        clock = 0
+        const lan = new FakeLan(); const h = new FakeHost(lan)
+        return new IdeaLocalPublisher({ connect: h.connect, addresses: () => [addr('10.99.0.13')], logger: l => lines.push(l), nextDelayMs: () => 1, probe, now: () => clock })
+    }
+
+    it('logs a send error once per change, names the interface, never withdraws', async () => {
+        const lines: string[] = []
+        let errors = ['send on eth0 10.99.0.13: EPERM']
+        const p = holder(async () => ({ responders: [], errors }), lines)
+        await p.tick()
+        for (let i = 0; i < 20; i++) expect(await p.tick()).toBe('holder')
+        expect(lines.filter(l => /EPERM/.test(l)).length).toBe(1)
+        expect(lines.find(l => /EPERM/.test(l))).toMatch(/eth0 10\.99\.0\.13/)
+        errors = []
+        for (let i = 0; i < 5; i++) await p.tick()
+        expect(lines.filter(l => /working again/.test(l)).length).toBe(1)
+        errors = ['send on eth0 10.99.0.13: ENETUNREACH']
+        await p.tick(); await p.tick()
+        expect(lines.filter(l => /ENETUNREACH/.test(l)).length).toBe(1)
+        expect(p.status).toBe('holder')
+    })
+
+    it('a check that throws on every tick is logged once and never drops the name', async () => {
+        const lines: string[] = []
+        const seq: any[] = [new Error('EPERM'), new Error('EPERM'), new Error('EPERM')]
+        const p = holder(async () => { const x = seq.shift(); if (x) throw x; return [] }, lines)
+        await p.tick()
+        for (let i = 0; i < 6; i++) expect(await p.tick()).toBe('holder')
+        expect(lines.filter(l => /probe failed: EPERM/.test(l)).length).toBe(1)
+    })
+
+    it('the real query skips non-LAN interfaces and returns (never throws) bind/send errors per interface', async () => {
+        const r = await queryIdeaLocalResponders('idea.local', [
+            { ifName: 'br-a12736f0adec', ifIndex: 9, address: '172.30.0.1' },
+            { ifName: 'docker0', ifIndex: 4, address: '172.17.0.1' },
+            { ifName: 'tailscale0', ifIndex: 5, address: '100.126.117.80' },
+            { ifName: 'eth0', ifIndex: 2, address: '192.0.2.123' }, // not ours: bind fails with EADDRNOTAVAIL
+        ], 200)
+        expect(r.responders).toEqual([])
+        expect(r.errors.length).toBe(1)
+        expect(r.errors[0]).toMatch(/eth0 192\.0\.2\.123: EADDRNOTAVAIL/)
     })
 })
