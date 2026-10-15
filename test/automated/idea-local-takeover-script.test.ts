@@ -37,6 +37,18 @@ describe('idea-local-takeover-test.sh refusals (idea#203)', () => {
         expect(run('--claim', 'c1', '--cut', '100', '--ttl', '120').err).toMatch(/must be longer/)
         expect(run('--claim', 'c1', '--cut', '900').err).toMatch(/at most 600/)
     })
+    it('--converge is bounded (10-300 s)', () => {
+        expect(run('--claim', 'c1', '--converge', '5').err).toMatch(/--converge must be 10-300/)
+        expect(run('--claim', 'c1', '--converge', '900').err).toMatch(/--converge must be 10-300/)
+        expect(run('--claim', 'c1', '--converge', 'x').code).toBe(2)
+    })
+    it('checks one holder on the wire (raw mDNS) before the cut and after the restore', () => {
+        const src = fs.readFileSync(SCRIPT, 'utf8')
+        expect(src).toMatch(/before cut, raw mDNS/)
+        expect(src).toMatch(/not answered by exactly one pool Engine on the wire/)
+        expect(src).toMatch(/STREAK" -ge 2/)
+        expect(src).toMatch(/not exactly one responder for idea.local within/)
+    })
     it('refuses unsafe claim, mode, interface and ports', () => {
         expect(run('--claim', 'a;rm').code).toBe(2)
         expect(run('--claim', 'c1', '--mode', 'reboot').code).toBe(2)
@@ -78,5 +90,38 @@ describe('idea-local-takeover-analyse.py (idea#203)', () => {
     it('FAIL when a lookup returns two addresses including the dead one', async () => {
         const r = await analyse([...seq(0, 160, '10.99.0.11+10.99.0.13')])
         expect(r.code).toBe(1)
+    })
+})
+
+describe('idea-local-mdns-responders.py (idea#203: every responder, not just the first)', () => {
+    const RESP = path.join(process.cwd(), 'script/idea-local-mdns-responders.py')
+    const judge = (responders: object, pool = '10.99.0.13,10.99.0.14') =>
+        spawnSync('python3', [RESP, '--judge', JSON.stringify({ responders }), pool], { encoding: 'utf8' })
+    it('ONE when exactly one pool Engine answers', () => {
+        const r = judge({ '10.99.0.14': ['10.99.0.14'] }); expect(r.status).toBe(0); expect(r.stdout.trim()).toBe('ONE 10.99.0.14')
+    })
+    it('NOT-ONE for the 2026-10-15 split brain (two responders)', () => {
+        const r = judge({ '10.99.0.13': ['10.99.0.13'], '10.99.0.14': ['10.99.0.14'] })
+        expect(r.status).toBe(1); expect(r.stdout).toMatch(/^NOT-ONE/)
+    })
+    it('NOT-ONE for no answer, a non-pool address, or one host giving two addresses', () => {
+        expect(judge({}).status).toBe(1)
+        expect(judge({ '10.99.0.11': ['10.99.0.11'] }).status).toBe(1)
+        expect(judge({ '10.99.0.13': ['10.99.0.13', '172.21.0.1'] }).status).toBe(1)
+    })
+    it('encodes a QU A query and parses compressed answers, skipping goodbyes', () => {
+        const py = `
+import importlib.util, struct, socket
+s = importlib.util.spec_from_file_location('r', ${JSON.stringify(RESP)}); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
+q = m.encode_query('idea.local', 0x1234)
+assert q == bytes([0x12,0x34,0,0,0,1,0,0,0,0,0,0,4]) + b'idea' + bytes([5]) + b'local' + bytes([0,0,1,0x80,1]), q
+hdr = struct.pack('>HHHHHH', 0x1234, 0x8400, 1, 2, 0, 0)
+rr = lambda ttl, ip: bytes([0xc0, 12]) + struct.pack('>HHIH', 1, 0x8001, ttl, 4) + socket.inet_aton(ip)
+msg = hdr + q[12:] + rr(120, '10.99.0.13') + rr(0, '10.99.0.14')
+assert m.parse_answers(msg, 'idea.local') == ['10.99.0.13'], m.parse_answers(msg, 'idea.local')
+assert m.parse_answers(msg[:30], 'idea.local') == []
+print('ok')`
+        const r = spawnSync('python3', ['-c', py], { encoding: 'utf8' })
+        expect(r.stderr).toBe(''); expect(r.stdout.trim()).toBe('ok')
     })
 })
