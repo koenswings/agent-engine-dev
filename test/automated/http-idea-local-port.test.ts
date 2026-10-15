@@ -88,3 +88,44 @@ describe('Console on the idea.local port (idea#203)', () => {
         expect(config.settings.ideaLocalHttpPort ?? 80).toBe(80)
     })
 })
+
+describe('idea.local port: API, command log, engineId and WebSocket (idea#203, Console #159)', () => {
+    it('/api/store-url carries engineId (backward compatible), on both ports; /api/command-log-url answers', async () => {
+        const [main, extra] = [await freePort(), await freePort()]
+        server = enableHttpMonitor(main, consoleDir, null, extra, { engineId: 'e-123' })
+        await listening(server); await listening((server as any).ideaLocalServer)
+        for (const p of [main, extra]) {
+            const r = await fetch(`http://127.0.0.1:${p}/api/store-url`)
+            if (r.status === 200) {
+                const j = await r.json()
+                expect(j.engineId).toBe('e-123'); expect(typeof j.url).toBe('string'); expect(typeof j.wsPort).toBe('number')
+            } else expect(r.status).toBe(503)
+            const c = await fetch(`http://127.0.0.1:${p}/api/command-log-url`)
+            expect([200, 503]).toContain(c.status)
+            expect(c.headers.get('access-control-allow-origin')).toBe('*')
+        }
+    })
+
+    it('without engineId the payload is unchanged ({url, wsPort})', async () => {
+        const { buildStoreUrlPayload } = await import('../../src/monitors/httpMonitor.js')
+        expect(buildStoreUrlPayload('automerge:x', 1)).toEqual({ url: 'automerge:x', wsPort: 1 })
+        expect(buildStoreUrlPayload('automerge:x', 1, 'e1')).toEqual({ url: 'automerge:x', wsPort: 1, engineId: 'e1' })
+    })
+
+    it('a WebSocket upgrade on the idea.local port reaches the Engine WebSocket server', async () => {
+        const { WebSocketServer, WebSocket } = await import('ws')
+        const wsPort = await freePort()
+        const wss = new WebSocketServer({ port: wsPort })
+        wss.on('connection', (s) => s.on('message', (m) => s.send('echo:' + m.toString())))
+        await new Promise((r) => wss.once('listening', r))
+        const [main, extra] = [await freePort(), await freePort()]
+        server = enableHttpMonitor(main, consoleDir, null, extra, { wsPort })
+        await listening((server as any).ideaLocalServer)
+        const ws = new WebSocket(`ws://127.0.0.1:${extra}/`)
+        const got = await new Promise<string>((res, rej) => {
+            ws.on('open', () => ws.send('hi')); ws.on('message', (m) => res(m.toString())); ws.on('error', rej)
+        })
+        expect(got).toBe('echo:hi')
+        ws.close(); await new Promise<void>((r) => wss.close(() => r()))
+    })
+})

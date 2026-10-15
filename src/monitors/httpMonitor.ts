@@ -28,6 +28,7 @@
  */
 
 import http from 'http'
+import net from 'net'
 import path from 'path'
 import { fs } from 'zx'
 import { log } from '../utils/utils.js'
@@ -63,6 +64,8 @@ const MIME_TYPES: Record<string, string> = {
 export interface StoreUrlPayload {
     url: string
     wsPort: number
+    /** idea#203 / Console #159: which Engine answered (behind idea.local the Console must know). Omitted when unknown. */
+    engineId?: string
 }
 
 /**
@@ -74,8 +77,9 @@ export interface StoreUrlPayload {
  */
 export const buildStoreUrlPayload = (
     storeUrl: string,
-    wsPort: number = config.settings.port
-): StoreUrlPayload => ({ url: storeUrl, wsPort })
+    wsPort: number = config.settings.port,
+    engineId?: string
+): StoreUrlPayload => (engineId ? { url: storeUrl, wsPort, engineId } : { url: storeUrl, wsPort })
 
 const mimeType = (filePath: string): string => {
     const ext = path.extname(filePath).toLowerCase()
@@ -93,6 +97,7 @@ export const enableHttpMonitor = (
     consolePath: string = config.settings.consolePath,
     _commandLogHandle?: DocHandle<CommandLogStore> | null,  // unused at runtime — URL comes from disk
     alsoPort?: number,     // idea#203: also serve on this port (idea.local, :80) when it differs from `port`
+    opts: { engineId?: string, wsPort?: number } = {},  // engineId for /api/store-url; wsPort = Engine WebSocket port for Upgrade pass-through
 ): http.Server => {
 
     const hasConsole = consolePath && fs.existsSync(consolePath)
@@ -116,7 +121,7 @@ export const enableHttpMonitor = (
                     'Content-Type': 'application/json',
                     'Access-Control-Allow-Origin': '*',  // Console may be on a different origin during dev
                 })
-                res.end(JSON.stringify(buildStoreUrlPayload(storeUrl)))
+                res.end(JSON.stringify(buildStoreUrlPayload(storeUrl, undefined, opts.engineId)))
             } catch (e) {
                 log(`[http] /api/store-url: failed to read store URL — ${e}`)
                 res.writeHead(503, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })  // Console on another Pi must see the 503 too
@@ -173,6 +178,20 @@ export const enableHttpMonitor = (
 
     const listen = (p: number, what: string): http.Server => {
         const srv = http.createServer(handler)
+        // idea#203: a WebSocket Upgrade on the HTTP port(s) is passed through to the Engine's
+        // WebSocket server (127.0.0.1:wsPort), so the store sync also works via http://idea.local.
+        srv.on('upgrade', (req, socket, head) => {
+            const wsPort = opts.wsPort ?? config.settings.port
+            const up = net.connect(wsPort, '127.0.0.1', () => {
+                const lines = [`${req.method} ${req.url} HTTP/${req.httpVersion}`]
+                for (let i = 0; i < req.rawHeaders.length; i += 2) lines.push(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}`)
+                up.write(lines.join('\r\n') + '\r\n\r\n')
+                if (head?.length) up.write(head)
+                up.pipe(socket); socket.pipe(up)
+            })
+            const end = () => { up.destroy(); socket.destroy() }
+            up.on('error', end); socket.on('error', end); up.on('close', end); socket.on('close', end)
+        })
         srv.on('error', (e: NodeJS.ErrnoException) => {
             if (e.code === 'EACCES') {
                 log(`[http] Permission denied on port ${p} (${what}). Grant node cap_net_bind_service or use a port > 1024.`)
