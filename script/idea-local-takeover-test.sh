@@ -22,7 +22,7 @@
 # Usage:
 #   script/idea-local-takeover-test.sh --claim <steve-claim-id> [--mode netcut|avahi-freeze]
 #       [--pool idea01,idea03,idea04] [--client idea02] [--lan-if eth0] [--ports 80,8080]
-#       [--cut 150] [--ttl 120] [--converge 60] [--out DIR] [--dry-run]
+#       [--cut 150] [--ttl 120] [--converge 60] [--out DIR] [--dry-run] [--print-netcut]
 #
 # One holder is checked ON THE WIRE, not with getaddrinfo (which returns only the first answer
 # and hid a second holder on 2026-10-15): script/idea-local-mdns-responders.py sends a raw mDNS
@@ -30,13 +30,17 @@
 # must answer; after the restore exactly one must answer on 2 consecutive queries within
 # --converge seconds, or the run FAILs.
 # Hosts are ssh aliases (see ~/.ssh/config); SSH can be overridden (env SSH).
-# Exit: 0 PASS, 1 FAIL (no takeover within --ttl), 2 refused/precondition, 3 infra error.
+# After the restore every rule tagged idea203-takeover must be gone (iptables, ip6tables, nft),
+# else the run FAILs.
+# Exit: 0 PASS, 1 FAIL (no takeover within --ttl, not one holder, or a rule left), 2 refused/precondition, 3 infra error.
 
 set -uo pipefail
 
 SSH=${SSH:-"ssh -o BatchMode=yes -o ConnectTimeout=15"}
+# Binaries on the holder (overridable only so the test can run the generated commands against a fake).
+IPT=${IPT:-/usr/sbin/iptables}; IP6T=${IP6T:-/usr/sbin/ip6tables}; NFT=${NFT:-nft}
 CLAIM=""; MODE=netcut; POOL="idea01,idea03,idea04"; CLIENT=idea02; LAN_IF=eth0; PORTS=80,8080
-CUT=150; TTL=120; CONVERGE=60; OUT=""; DRY=0
+CUT=150; TTL=120; CONVERGE=60; OUT=""; DRY=0; PRINT=0
 ALLOWED_POOL="idea01 idea03 idea04"          # never wh (wizardly-hugle) or idea02
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -51,6 +55,7 @@ while [ $# -gt 0 ]; do
     --converge) CONVERGE="${2:-}"; shift 2 ;;
     --out) OUT="${2:-}"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
+    --print-netcut) PRINT=1; shift ;;
     *) echo "refused: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -73,6 +78,37 @@ done
 [[ " $ALLOWED_POOL " != *" $CLIENT "* ]] || refuse "the client must not be one of the pool Engines"
 [[ "$CLIENT" != wh && "$CLIENT" != wizardly-hugle* ]] || refuse "wh is never used"
 
+# Cut commands on the holder (built once the arguments are checked).
+build_cut() {
+# Every rule carries this comment so the undo and the leftover check can find it in any table.
+TAG="idea203-takeover"
+M="-m comment --comment $TAG"
+RULES=("INPUT -i $LAN_IF -p udp --dport 5353 $M -j DROP" "OUTPUT -o $LAN_IF -p udp --sport 5353 $M -j DROP" "OUTPUT -o $LAN_IF -p udp --dport 5353 $M -j DROP")
+for p in ${PORTS//,/ }; do RULES+=("INPUT -i $LAN_IF -p tcp --dport $p $M -j DROP"); done
+UNIT="idea203-takeover-restore-$(date +%s)"
+if [ "$MODE" = netcut ]; then
+  # Undo deletes every copy of every rule (a rule inserted twice by a retried cut would survive
+  # a single -D). Only IPv4 iptables rules are added; on the Pis iptables is iptables-nft, so
+  # they live in nft table ip filter, which the leftover check also reads.
+  UNDO=""; for r in "${RULES[@]}"; do UNDO+="while $IPT -w -C $r 2>/dev/null; do $IPT -w -D $r || break; done; "; done
+  DO="";   for r in "${RULES[@]}"; do DO+="$IPT -w -I $r && "; done; DO+="true"
+else
+  UNDO="pkill -CONT -x avahi-daemon; "
+  DO="pkill -STOP -x avahi-daemon"
+fi
+# Prints every firewall rule of ours still present (iptables + ip6tables, all tables, and the
+# raw nft ruleset), nothing when clean.
+LEFTOVER="for t in filter nat mangle raw; do sudo $IPT -w -t \$t -S 2>/dev/null; sudo $IP6T -w -t \$t -S 2>/dev/null; done | grep -F -- '$TAG'; sudo $NFT list ruleset 2>/dev/null | grep -F -- '$TAG'; true"
+SCHEDULE="sudo systemd-run --unit=$UNIT --on-active=${CUT} /bin/sh -c '$UNDO true'"
+CUTCMD="$SCHEDULE && sudo sh -c '$DO'"
+RESTORE="sudo sh -c '$UNDO true'; sudo systemctl stop $UNIT.timer 2>/dev/null; true"
+
+}
+
+if [ "$PRINT" = 1 ]; then
+  # Contacts nothing: prints the cut, undo and leftover-check commands (one per line) for review/tests.
+  build_cut; printf 'DO=%s\nUNDO=%s\nLEFTOVER=%s\n' "$DO" "$UNDO" "$LEFTOVER"; exit 0
+fi
 OUT=${OUT:-/workspace/idea203-takeover/run-$(date +%Y%m%d-%H%M%S)}
 mkdir -p "$OUT"
 log() { echo "[$(date +%T)] $*" | tee -a "$OUT/summary.txt"; }
@@ -102,7 +138,7 @@ POOL_IPS=$(for h in "${POOL_HOSTS[@]}"; do printf '%s,' "${LANIP[$h]}"; done)
 # Raw mDNS query from the client; prints the JSON line and appends it to mdns-responders.txt.
 responders() { rsh "$CLIENT" "python3 - --wait 2" < "$RESPONDERS_PY" | tee -a "$OUT/mdns-responders.txt"; }
 # "ONE <ip>" (exit 0) or "NOT-ONE ..." (exit 1)
-one_holder() { local j; j=$(responders) || return 3; python3 "$RESPONDERS_PY" --judge "$j" "$POOL_IPS"; }
+one_holder() { local j; j=$(responders) || return 3; python3 "$RESPONDERS_PY" --judge-json "$j" --pool "$POOL_IPS"; }
 PRE=$(one_holder); PRE_RC=$?
 [ "$PRE_RC" -le 1 ] && [ -n "$PRE" ] || { log "infra: raw mDNS query on client $CLIENT failed"; exit 3; }
 log "before cut, raw mDNS: $PRE"
@@ -120,23 +156,12 @@ log "holder before cut: $HOLDER (${LANIP[$HOLDER]}), Console HTTP $code"
 OTHERS=(); for h in "${POOL_HOSTS[@]}"; do [ "$h" != "$HOLDER" ] && OTHERS+=("$h"); done
 
 # ── Cut commands on the holder ──────────────────────────────────────────────
-RULES=("INPUT -i $LAN_IF -p udp --dport 5353 -j DROP" "OUTPUT -o $LAN_IF -p udp --sport 5353 -j DROP" "OUTPUT -o $LAN_IF -p udp --dport 5353 -j DROP")
-for p in ${PORTS//,/ }; do RULES+=("INPUT -i $LAN_IF -p tcp --dport $p -j DROP"); done
-UNIT="idea203-takeover-restore-$(date +%s)"
-if [ "$MODE" = netcut ]; then
-  UNDO=""; for r in "${RULES[@]}"; do UNDO+="/usr/sbin/iptables -w -D $r 2>/dev/null; "; done
-  DO="";   for r in "${RULES[@]}"; do DO+="/usr/sbin/iptables -w -I $r && "; done; DO+="true"
-else
-  UNDO="pkill -CONT -x avahi-daemon; "
-  DO="pkill -STOP -x avahi-daemon"
-fi
-SCHEDULE="sudo systemd-run --unit=$UNIT --on-active=${CUT} /bin/sh -c '$UNDO true'"
-CUTCMD="$SCHEDULE && sudo sh -c '$DO'"
-RESTORE="sudo sh -c '$UNDO true'; sudo systemctl stop $UNIT.timer 2>/dev/null; true"
+build_cut
 
 if [ "$DRY" = 1 ]; then
   log "DRY RUN: would run on $HOLDER: $CUTCMD"
   log "DRY RUN: would restore with: $RESTORE"
+  log "DRY RUN: would check for leftovers with: $LEFTOVER"
   exit 0
 fi
 
@@ -166,6 +191,19 @@ log "CUT on $HOLDER at $(date +%T) (+5 s into the poll)"
 wait $POLLPID
 restore; trap - EXIT
 T_RESTORE=$(date +%s)
+# ── Every rule we added must be gone (iptables/ip6tables, INPUT/OUTPUT, nft) ──
+LEFT=$(rsh "$HOLDER" "$LEFTOVER" 2>&1) || { log "infra: leftover-rule check failed on $HOLDER"; LEFT="check-failed"; }
+if [ -n "$LEFT" ]; then
+  printf '%s\n' "$LEFT" > "$OUT/leftover-rules.txt"
+  log "FAIL: firewall rules tagged $TAG are still on $HOLDER after the restore (see leftover-rules.txt); retrying the undo once"
+  rsh "$HOLDER" "$RESTORE" >/dev/null 2>&1
+  LEFT2=$(rsh "$HOLDER" "$LEFTOVER" 2>&1)
+  log "after the second undo: ${LEFT2:-no rules left}"
+  LEFTOVER_FAIL=1
+else
+  log "netcut undo: no rule tagged $TAG left on $HOLDER (iptables, ip6tables, nft)"
+  LEFTOVER_FAIL=0
+fi
 # ── After restore: exactly one responder on the wire, twice in a row, within --converge s ──
 CONV=FAIL; STREAK=0; LAST=""
 while [ $(( $(date +%s) - T_RESTORE )) -lt "$CONVERGE" ]; do
@@ -192,5 +230,6 @@ else
   log "FAIL: not exactly one responder for idea.local within ${CONVERGE} s of the restore (last: $LAST)"
   RES=1
 fi
+[ "$LEFTOVER_FAIL" = 0 ] || RES=1
 log "results in $OUT"
 exit "$RES"
