@@ -78,6 +78,20 @@ let lastDiscoveryError = ''
 
 
 /**
+ * The host name ciao publishes A records for in the Engine's `_engine._tcp` SRV record.
+ *
+ * ciao defaults it to the service name, i.e. `<hostname>.local`, which avahi-daemon already
+ * owns on every Pi (it is how clients reach the Engine). ciao probes that name, sees avahi
+ * answer for it, and resolves the "conflict" by renaming BOTH the service and its host:
+ * every Engine was advertised as 'idea03 (2)' on idea03-(2).local (pool, 2026-10-15; also
+ * on main since the ciao advertiser was added, not a leftover of restarts). A distinct name
+ * leaves `<hostname>.local` to avahi and keeps the service name equal to the hostname.
+ * Discovery reads the hostname from the TXT record and the address from the answer, so the
+ * SRV target name is not used for dialling.
+ */
+export const engineServiceHostname = (engineName: string): string => `${engineName}-engine`
+
+/**
  * The TXT record this Engine advertises. `store` (StoreScope.ts storeTag: a short
  * prefix plus a hash, never the full store id) lets other Engines skip us without
  * dialling when we are not in their store (store-scoped peering).
@@ -152,13 +166,15 @@ export const startAdvertising = (store: Store): CiaoService => {
     log(`Advertising on ${interfaces ? `LAN interfaces ${interfaces.join(', ')}` : 'all interfaces (no LAN interface found)'}`)
     const service = responder.createService({
         name: engineName.toString(),
+        hostname: engineServiceHostname(engineName.toString()),
         type: 'engine',
         port: config.settings.port,
         txt: engineTxtRecord(engineName, engine.id, engineVersion, storeTag(readStoreDocId()))
     })
 
-    // Log name conflicts without updating the store — the (2) suffix is a service
-    // advertisement detail, not the machine hostname.
+    // A name conflict now means a second Engine with the same hostname on the LAN (the
+    // host name is no longer shared with avahi, see engineServiceHostname). Log it without
+    // updating the store: the (2) suffix is an advertisement detail, not the machine hostname.
     service.on('name-change', (newName: string) => {
         log(`mDNS service name changed to '${newName}' due to conflict — hostname in store unchanged`);
     });
