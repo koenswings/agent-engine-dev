@@ -135,3 +135,27 @@ describe('hw-roundtrip expected IDs: config file + CLI flags', () => {
         expect(cfg.idea03).toMatchObject(expected())
     })
 })
+
+describe('unformattedDisks expectation for the stick disk (idea#193, #205)', () => {
+    const idea04 = JSON.stringify({ blockdevices: [{ name: 'sda', fstype: null, children: [{ name: 'sda1', fstype: 'vfat' }, { name: 'sda2', fstype: 'ext4' }] }, { name: 'sdb', fstype: null, children: [{ name: 'sdb1', fstype: 'vfat' }, { name: 'sdb2', fstype: 'ext4' }] }] })
+    const plain = JSON.stringify({ blockdevices: [{ name: 'sdc', fstype: null, children: [{ name: 'sdc1', fstype: 'exfat' }] }] })
+    it('detects ext4 on a sibling partition', async () => {
+        const { diskHasExt4 } = await import('../../script/hw-roundtrip-guard.js')
+        expect(diskHasExt4(idea04, 'sda')).toBe(true)
+        expect(diskHasExt4(plain, 'sdc')).toBe(false)
+        expect(diskHasExt4(JSON.stringify({ blockdevices: [{ name: 'sdd', fstype: 'ext4' }] }), 'sdd')).toBe(true)
+    })
+    it('throws on unknown disk or bad JSON (no silent pass)', async () => {
+        const { diskHasExt4 } = await import('../../script/hw-roundtrip-guard.js')
+        expect(() => diskHasExt4(plain, 'sda')).toThrow()
+        expect(() => diskHasExt4('', 'sda')).toThrow()
+    })
+    it('reversed assertion with ext4, normal without', async () => {
+        const { unformattedExpectation } = await import('../../script/hw-roundtrip-guard.js')
+        expect(unformattedExpectation(true, false).ok).toBe(true)
+        expect(unformattedExpectation(true, true).ok).toBe(false)
+        expect(unformattedExpectation(false, true).ok).toBe(true)
+        expect(unformattedExpectation(false, false).ok).toBe(false)
+        expect(unformattedExpectation(true, false).label).toMatch(/NOT in unformattedDisks/)
+    })
+})

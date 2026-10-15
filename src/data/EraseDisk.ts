@@ -240,6 +240,14 @@ export const eraseDisk = async (
     try {
         setEraseStep(storeHandle, 'stopping and unmounting', targetId, summary.label)
 
+        // A teacher stick on this drive is mounted read-only under /run/idea-usb
+        // (idea#193 §3.5): unmount it first; nothing was written, so this is safe.
+        {
+            const { removeSticksOnDrive } = await import('./UsbSticks.js')
+            const gone = await removeSticksOnDrive(storeHandle, whole, 'erase requested')
+            if (gone.length) log(`eraseDisk: unmounted USB stick(s) ${gone.join(', ')} before erasing`)
+        }
+
         if (disk) {
             // Recreate other-disk Files mounts without this bind (R1 / §7.3)
             for (const inst of optedInInstances(storeHandle.doc()!)) {
