@@ -348,6 +348,8 @@ export const capCommandLogArchives = async (archiveDir: string, maxBytes: number
     // print, not log: always written (log is verbosity-gated), every deletion must be in the Engine log
     print(`[commandLog] Archive folder over its size cap (${maxBytes} bytes): deleted oldest archive ${f.name} (${f.size} bytes), ${total} bytes left`)
   }
+  // One line per cap check that deletes nothing (Koen 2026-10-15), so every rotation shows the check ran
+  if (removed.length === 0) print(`[commandLog] command-log archive ${total} bytes under cap ${maxBytes}, nothing deleted`)
   return removed
 }
 

@@ -188,6 +188,30 @@ describe('CommandLog daily rotation (idea#183)', () => {
         expect(del[1]).toContain('command-log-2026-10-02-b.automerge')
     })
 
+    it('size cap: a check that deletes nothing logs one line with the total and the cap', async () => {
+        await put('command-log-2026-10-01-a.automerge', 100)
+        await put('command-log-2026-10-02-b.automerge', 200)
+        const lines: string[] = []
+        const orig = console.info
+        console.info = (...a: any[]) => { lines.push(a.join(' ')) }
+        try { expect(await capCommandLogArchives(archiveDir(), 1000)).toEqual([]) } finally { console.info = orig }
+        expect(lines.filter(l => /command-log archive/.test(l))).toEqual(
+            ['[commandLog] command-log archive 300 bytes under cap 1000, nothing deleted'])
+        expect(lines.filter(l => /deleted oldest archive/.test(l))).toEqual([])
+    })
+
+    it('size cap: a real rotation under the cap logs the check line', async () => {
+        const lines: string[] = []
+        const orig = console.info
+        console.info = (...a: any[]) => { lines.push(a.join(' ')) }
+        try {
+            const repo = new Repo({ network: [] })
+            await createCommandLogStore(repo, { urlFile: urlFile(), now: at('2026-10-12T10:00:00') })
+            await rotateCommandLog(repo, { urlFile: urlFile(), now: at('2026-10-13T00:01:00'), archiveMaxBytes: 1_000_000_000 })
+        } finally { console.info = orig }
+        expect(lines.filter(l => /bytes under cap 1000000000, nothing deleted/.test(l)).length).toBe(1)
+    })
+
     it('size cap is enforced by a real rotation (small cap on a fixture), the new archive is kept', async () => {
         await put('command-log-2026-09-01-a.automerge', 5000)
         await put('command-log-2026-09-02-b.automerge', 5000)
