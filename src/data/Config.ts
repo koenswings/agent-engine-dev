@@ -30,8 +30,9 @@ export interface Settings {
     commandLogArchiveMaxBytes?: number; // Size cap of store-identity/command-log-archive/ in bytes (default 1 GB = 1_000_000_000). Over the cap, the oldest archives are deleted one by one, each logged (#185, Koen 2026-10-15). See commandLogArchiveMaxBytes().
     peerStaleHours?: number;      // A peer Engine without a heartbeat for this long loses its key here (default 168 = 7 days). See peerStaleMs().
     autoStartChannelBuilder?: boolean; // Start the docked kolibri-channel-builder when a stick with a kolibri folder is mounted (idea#193 §8.2a; default true). See autoStartChannelBuilder().
-    usbRoot?: string;
-    ideaLocal?: boolean;          // Publish the shared name idea.local via avahi D-Bus when mdns is on (idea#203; default true). See monitors/ideaLocal.ts.             // Mount root for teacher USB sticks (default /run/idea-usb; IDEA_USB_ROOT wins). Tests point this at a temp folder. See usbRoot().
+    usbRoot?: string;             // Mount root for teacher USB sticks (default /run/idea-usb; IDEA_USB_ROOT wins). Tests point this at a temp folder. See usbRoot().
+    ideaLocal?: boolean;          // Publish the shared name idea.local via avahi D-Bus when mdns is on (idea#203; default true). See monitors/ideaLocal.ts.
+    ideaLocalHttpPort?: number;   // Port that http://idea.local is served on, in addition to httpPort (idea#203; default 80). See httpMonitor.ts.
 }
 
 export interface Defaults {
@@ -137,6 +138,7 @@ function validateSettings(obj: any, path: string): string[] {
     if (obj.peerStaleHours !== undefined && (typeof obj.peerStaleHours !== 'number' || !(obj.peerStaleHours > 0))) errors.push(`'${path}peerStaleHours' must be a positive number.`);
     if (obj.autoStartChannelBuilder !== undefined && typeof obj.autoStartChannelBuilder !== 'boolean') errors.push(`'${path}autoStartChannelBuilder' must be a boolean.`);
     if (obj.ideaLocal !== undefined && typeof obj.ideaLocal !== 'boolean') errors.push(`'${path}ideaLocal' must be a boolean.`);
+    if (obj.ideaLocalHttpPort !== undefined && (typeof obj.ideaLocalHttpPort !== 'number' || !Number.isInteger(obj.ideaLocalHttpPort) || obj.ideaLocalHttpPort < 1 || obj.ideaLocalHttpPort > 65535)) errors.push(`'${path}ideaLocalHttpPort' must be a port number.`);
     if (obj.usbRoot !== undefined && typeof obj.usbRoot !== 'string') errors.push(`'${path}usbRoot' must be a string.`);
     return errors;
 }
