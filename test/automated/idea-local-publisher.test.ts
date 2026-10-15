@@ -19,12 +19,12 @@ class FakeLan {
     cut = new Set<FakeHost>()
     sees(a: FakeHost, b: FakeHost) { return a === b || (!this.cut.has(a) && !this.cut.has(b)) }
     holder(name: string, from?: FakeHost) {
-        return [...this.groups].find(g => g.name === name && g.state === EntryGroupState.ESTABLISHED && (!from || this.sees(from, g.host)))
+        return [...this.groups].find(g => g.name === name && g.state === EntryGroupState.ESTABLISHED && !g.host.frozen && (!from || this.sees(from, g.host)))
     }
     holders(name: string) { return [...this.groups].filter(g => g.name === name && g.state === EntryGroupState.ESTABLISHED) }
     /** A raw mDNS query from `from`: every visible host with an established record answers (avahi never re-probes). */
     probe(from: FakeHost): MdnsResponder[] {
-        return [...this.groups].filter(g => g.state === EntryGroupState.ESTABLISHED && this.sees(from, g.host))
+        return [...this.groups].filter(g => g.state === EntryGroupState.ESTABLISHED && !g.host.frozen && this.sees(from, g.host))
             .map(g => ({ from: g.records[0].address, addresses: g.records.map(r => r.address) }))
     }
 }
@@ -37,29 +37,50 @@ class FakeGroup implements AvahiEntryGroup {
     gone = false
     constructor(public lan: FakeLan, public host: FakeHost) { lan.groups.add(this) }
     async addAddress(ifIndex: number, proto: number, flags: number, name: string, address: string) {
+        if (this.host.frozen) return this.host.hang()
         if (this.host.down) throw new Error('org.freedesktop.DBus.Error.ServiceUnknown')
         if (!(flags & AVAHI_PUBLISH_NO_REVERSE)) throw new Error('org.freedesktop.Avahi.CollisionError: Local name collision')
         this.name = name; this.records.push({ ifIndex, proto, flags, address })
     }
-    async commit() { this.state = EntryGroupState.REGISTERING }
+    async commit() { if (this.host.frozen) return this.host.hang(); this.state = EntryGroupState.REGISTERING }
     async getState() {
         if (this.gone) { const e: any = new Error('Method "GetState" with signature "" on interface "org.freedesktop.Avahi.EntryGroup" doesn\'t exist'); e.type = 'org.freedesktop.DBus.Error.UnknownMethod'; throw e }
         if (this.host.down) throw new Error('org.freedesktop.DBus.Error.ServiceUnknown')
+        if (this.host.frozen) return this.host.hang()
         if (this.state === EntryGroupState.REGISTERING) {
             this.state = this.lan.holder(this.name, this.host) ? EntryGroupState.COLLISION : EntryGroupState.ESTABLISHED
         }
         return this.state
     }
-    async free() { if (this.gone) throw new Error('UnknownMethod'); this.freed = true; this.lan.groups.delete(this) }
+    async free() { if (this.host.frozen) { this.host.queuedFree.add(this); return this.host.hang() } if (this.gone) throw new Error('UnknownMethod'); this.freed = true; this.lan.groups.delete(this) }
 }
 class FakeHost {
     down = false
     connects = 0
     constructor(public lan: FakeLan) {}
+    /** avahi-daemon SIGSTOPped: D-Bus calls never answer, it neither answers nor defends on the wire. */
+    frozen = false
+    queuedFree = new Set<FakeGroup>()
+    queuedDisconnect = false
+    hang(): Promise<never> { return new Promise<never>(() => {}) }
     connect = async (): Promise<AvahiClient> => {
         if (this.down) throw new Error('avahi not running')
+        if (this.frozen) return this.hang()
         this.connects++
-        return { entryGroupNew: async () => { if (this.down) throw new Error('gone'); return new FakeGroup(this.lan, this) }, close: () => {} }
+        return {
+            entryGroupNew: async () => { if (this.down) throw new Error('gone'); if (this.frozen) return this.hang(); return new FakeGroup(this.lan, this) },
+            // avahi frees every group of a client whose D-Bus connection closed (queued while frozen)
+            close: () => { if (this.frozen) this.queuedDisconnect = true; else for (const g of [...this.lan.groups]) if (g.host === this) this.lan.groups.delete(g) },
+        }
+    }
+    freeze() { this.frozen = true }
+    /** SIGCONT: avahi handles the queued Free / client disconnect (goodbye); records not freed come back as they were. */
+    thaw() {
+        this.frozen = false
+        for (const g of this.queuedFree) { g.freed = true; this.lan.groups.delete(g) }
+        this.queuedFree.clear()
+        if (this.queuedDisconnect) for (const g of [...this.lan.groups]) if (g.host === this) this.lan.groups.delete(g)
+        this.queuedDisconnect = false
     }
     /** avahi-daemon restart (e.g. after an avahi-daemon.conf change): all its groups vanish, the bus stays. */
     avahiRestart() { for (const g of [...this.lan.groups]) if (g.host === this) { g.gone = true; this.lan.groups.delete(g) } }
@@ -464,5 +485,63 @@ describe('idea.local second-holder check send errors (pool idea03: send EPERM 22
         expect(r.responders).toEqual([])
         expect(r.errors.length).toBe(1)
         expect(r.errors[0]).toMatch(/eth0 192\.0\.2\.123: EADDRNOTAVAIL/)
+    })
+})
+
+describe('idea.local holder whose avahi-daemon freezes (pool takeover run3 avahi-freeze 18:17, SIGSTOP/SIGCONT)', () => {
+    const round = async (...ps: IdeaLocalPublisher[]) => { for (const p of ps) await p.tick(); clock += 3000 }
+    const setup = (dbusTimeoutMs: number) => {
+        clock = 0
+        const lan = new FakeLan(); const h3 = new FakeHost(lan); const h4 = new FakeHost(lan)
+        const l3: string[] = []
+        const opts = (h: FakeHost, ip: string, lines: string[] = []) => new IdeaLocalPublisher({
+            connect: h.connect, addresses: () => [addr(ip)], logger: (l) => lines.push(l), nextDelayMs: () => 1,
+            probe: async () => h.lan.probe(h), now: () => clock, dbusTimeoutMs,
+        })
+        return { lan, h3, h4, l3, p3: opts(h3, '10.99.0.13', l3), p4: opts(h4, '10.99.0.14') }
+    }
+    const tickWithin = async (p: IdeaLocalPublisher, ms: number) =>
+        Promise.race([p.tick().then(() => 'done'), new Promise(r => setTimeout(() => r('hung'), ms))])
+
+    it('reproduces run3 without a D-Bus timeout: the frozen holder\'s tick hangs, and after SIGCONT its old record is back next to the new holder', async () => {
+        const s = setup(0)
+        await round(s.p3, s.p4); await round(s.p3, s.p4)
+        expect(s.p3.status).toBe('holder')
+        s.h3.freeze()
+        expect(await tickWithin(s.p3, 50)).toBe('hung')
+        for (let i = 0; i < 3; i++) await round(s.p4)
+        expect(s.p4.status).toBe('holder')
+        s.h3.thaw()
+        expect(s.lan.holders('idea.local').map(g => g.records[0].address).sort()).toEqual(['10.99.0.13', '10.99.0.14'])
+    })
+
+    it('with the timeout the holder frees its group and closes D-Bus while avahi is frozen: after SIGCONT only the new holder has the name', async () => {
+        const s = setup(20)
+        await round(s.p3, s.p4); await round(s.p3, s.p4)
+        s.h3.freeze()
+        expect(await tickWithin(s.p3, 500)).toBe('done')
+        expect(s.p3.status).toBe('error')
+        expect(s.l3.some(l => /did not answer EntryGroup.GetState within 0.0 s; giving up idea.local: freed our entry group and closed the D-Bus connection/.test(l))).toBe(true)
+        expect(s.h3.queuedDisconnect).toBe(true)
+        for (let i = 0; i < 3; i++) { await round(s.p4); expect(await tickWithin(s.p3, 500)).toBe('done') }
+        expect(s.p4.status).toBe('holder')
+        s.h3.thaw()
+        expect(s.lan.holders('idea.local').map(g => g.records[0].address)).toEqual(['10.99.0.14'])
+        // idea03 reconnects and competes again: idea04 keeps the name, no flap
+        for (let i = 0; i < 20; i++) { await round(s.p3, s.p4); expect(s.lan.holders('idea.local').length).toBe(1) }
+        expect(s.lan.holder('idea.local')!.host).toBe(s.h4)
+        expect(s.p3.status).toBe('waiting')
+    })
+
+    it('a connect that only completes after the timeout is closed, not leaked', async () => {
+        let closed = 0; let release!: (c: AvahiClient) => void
+        const p = new IdeaLocalPublisher({
+            connect: () => new Promise<AvahiClient>(r => { release = r }), addresses: () => [addr('10.99.0.13')],
+            logger: () => {}, nextDelayMs: () => 1, probe: undefined, dbusTimeoutMs: 10,
+        })
+        expect(await p.tick()).toBe('error')
+        release({ entryGroupNew: async () => { throw new Error('x') }, close: () => { closed++ } })
+        await new Promise(r => setTimeout(r, 10))
+        expect(closed).toBe(1)
     })
 })
