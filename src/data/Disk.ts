@@ -494,6 +494,60 @@ export const processSystemApp = async (storeHandle: DocHandle<Store>, disk: Disk
 }
 
 /**
+ * Create or update the store record of a system-disk instance from its compose.yaml.
+ * Same rules as createOrUpdateInstance (docked disks): instanceOf, name and
+ * serviceImages follow the instance's compose x-app on every pass, so an instance
+ * whose compose now names a newer app version moves to that app record (and gets
+ * its usbMount / filesMount). Stopped is preserved; Missing/Undocked/Error → Docked.
+ */
+export const upsertSystemInstanceRecord = (storeHandle: DocHandle<Store>, disk: Disk, instanceId: InstanceID, compose: any): Instance | undefined => {
+    let instance: Instance | undefined
+    const services = Object.keys(compose.services)
+    const serviceImages = services.map((s: string) => compose.services[s].image)
+    const instanceName = compose['x-app'].instanceName
+    const appId = createAppId(compose['x-app'].name, compose['x-app'].version) as AppID
+    storeHandle.change(doc => {
+        const stored = doc.instanceDB[instanceId]
+        if (!stored) {
+            log(`Creating new system instance ${instanceId}`)
+            const newInst: Instance = {
+                id: instanceId,
+                instanceOf: appId,
+                name: instanceName,
+                storedOn: disk.id,
+                status: 'Docked' as Status,
+                statusCondition: null,
+                port: 0 as PortNumber,
+                serviceImages: serviceImages as ServiceImage[],
+                created: new Date().getTime() as Timestamp,
+                lastBackup: null,
+                lastStarted: 0 as Timestamp,
+                currentStep: null,
+                totalSteps: null,
+                stepLabel: null,
+                metrics: null,
+            }
+            doc.instanceDB[instanceId] = newInst
+            instance = newInst
+        } else {
+            log(`Updating existing system instance ${instanceId}`)
+            if (stored.instanceOf !== appId) log(`System instance ${instanceId} moves from app ${stored.instanceOf} to ${appId}`)
+            stored.instanceOf = appId
+            stored.name = instanceName
+            stored.storedOn = disk.id
+            stored.serviceImages = serviceImages as ServiceImage[]
+            // Preserve Stopped status — same rule as createOrUpdateInstance:
+            // only reset to Docked from transient/detached states.
+            if (stored.status === 'Missing' || stored.status === 'Undocked' || stored.status === 'Error') {
+                stored.status = 'Docked' as Status
+            }
+            instance = stored
+        }
+    })
+    return instance
+}
+
+/**
  * Process a single instance on the system disk.
  * Reads compose.yaml from /instances/<instanceId>/ (not /disks/<device>/instances/).
  */
@@ -503,43 +557,7 @@ export const processSystemInstance = async (storeHandle: DocHandle<Store>, disk:
     try {
         const composeFile = await $`cat /instances/${instanceId}/compose.yaml`
         const compose = YAML.parse(composeFile.stdout)
-        const services = Object.keys(compose.services)
-        const serviceImages = services.map((s: string) => compose.services[s].image)
-        const instanceName = compose['x-app'].instanceName
-        storeHandle.change(doc => {
-            const stored = doc.instanceDB[instanceId]
-            if (!stored) {
-                log(`Creating new system instance ${instanceId}`)
-                const newInst: Instance = {
-                    id: instanceId,
-                    instanceOf: createAppId(compose['x-app'].name, compose['x-app'].version) as AppID,
-                    name: instanceName,
-                    storedOn: disk.id,
-                    status: 'Docked' as Status,
-                    statusCondition: null,
-                    port: 0 as PortNumber,
-                    serviceImages: serviceImages as ServiceImage[],
-                    created: new Date().getTime() as Timestamp,
-                    lastBackup: null,
-                    lastStarted: 0 as Timestamp,
-                    currentStep: null,
-                    totalSteps: null,
-                    stepLabel: null,
-                    metrics: null,
-                }
-                doc.instanceDB[instanceId] = newInst
-                instance = newInst
-            } else {
-                log(`Updating existing system instance ${instanceId}`)
-                stored.storedOn = disk.id
-                // Preserve Stopped status — same rule as createOrUpdateInstance:
-                // only reset to Docked from transient/detached states.
-                if (stored.status === 'Missing' || stored.status === 'Undocked' || stored.status === 'Error') {
-                    stored.status = 'Docked' as Status
-                }
-                instance = stored
-            }
-        })
+        instance = upsertSystemInstanceRecord(storeHandle, disk, instanceId, compose)
     } catch (e) {
         log(`Error processing system instance ${instanceId}: ${e}`)
         return undefined
