@@ -94,6 +94,28 @@ export const isEntryGroupGone = (e: any): boolean => {
         || /on interface "org\.freedesktop\.Avahi\.EntryGroup" doesn't exist/.test(msg)
 }
 
+/**
+ * avahi-daemon did not answer a D-Bus call in time. Seen on the pool when avahi is frozen
+ * (SIGSTOP, takeover test mode avahi-freeze; also a hung or overloaded daemon): dbus-next
+ * has no call timeout, so without this the publisher's tick waited forever.
+ */
+export class AvahiTimeoutError extends Error {
+    readonly code = 'AVAHI_DBUS_TIMEOUT'
+    constructor(what: string, ms: number) { super(`avahi-daemon did not answer ${what} within ${(ms / 1000).toFixed(1)} s`) }
+}
+export const isAvahiTimeout = (e: any): boolean => e instanceof AvahiTimeoutError || e?.code === 'AVAHI_DBUS_TIMEOUT'
+
+/** `p`, or an AvahiTimeoutError after `ms`. The late result of `p` is ignored (never unhandled). */
+export const withAvahiTimeout = <T>(p: Promise<T>, ms: number, what: string): Promise<T> => {
+    if (!(ms > 0) || !Number.isFinite(ms)) return p
+    let t: NodeJS.Timeout | undefined
+    const late = p.catch(() => undefined as any)
+    return Promise.race([
+        p.finally(() => clearTimeout(t)),
+        new Promise<T>((_, reject) => { t = setTimeout(() => { void late; reject(new AvahiTimeoutError(what, ms)) }, ms) }),
+    ])
+}
+
 const addrKey = (a: LanAddress[]) => a.map(x => `${x.ifIndex}/${x.address}`).join(',')
 
 // ── avahi abstraction ────────────────────────────────────────────────────────
@@ -268,6 +290,14 @@ export interface IdeaLocalPublisherOptions {
     /** after withdrawing for a conflict, do not re-register for this long, ms (default 15000) */
     conflictHoldoffMs?: number
     now?: () => number
+    /**
+     * Every avahi D-Bus call (connect, EntryGroupNew, AddAddress, Commit, GetState, Free) must
+     * answer within this time (default 4000 ms). On a timeout the Engine frees its entry group
+     * and closes its D-Bus connection: the frees queue in avahi's socket, so a frozen avahi
+     * (SIGSTOP) drops our idea.local record and multicasts a goodbye (TTL 0) the moment it runs
+     * again, instead of carrying on as a second holder. Measured on a real avahi 2026-10-15.
+     */
+    dbusTimeoutMs?: number
 }
 
 export class IdeaLocalPublisher {
@@ -291,6 +321,7 @@ export class IdeaLocalPublisher {
     private readonly now: () => number
     private conflictSeen = 0
     private holdoffUntil = 0
+    private readonly dbusTimeoutMs: number
 
     constructor(o: IdeaLocalPublisherOptions) {
         this.name = o.name ?? IDEA_LOCAL_NAME
@@ -303,6 +334,7 @@ export class IdeaLocalPublisher {
         this.conflictHoldoffMs = o.conflictHoldoffMs ?? 15000
         this.now = o.now ?? Date.now
         this.reclaimGraceMs = o.reclaimGraceMs ?? (() => 6500 + Math.floor(Math.random() * 3001))
+        this.dbusTimeoutMs = o.dbusTimeoutMs ?? 4000
     }
 
     /** Log probe trouble once per change (not every tick), and once when it clears. */
@@ -358,11 +390,14 @@ export class IdeaLocalPublisher {
         if (line !== this.lastLogged) { this.logger(`[idea.local] ${line}`); this.lastLogged = line }
     }
 
+    /** D-Bus call to avahi with the call timeout. */
+    private av<T>(p: Promise<T>, what: string): Promise<T> { return withAvahiTimeout(p, this.dbusTimeoutMs, what) }
+
     private async dropGroup() {
         const g = this.group
         this.group = undefined
         this.publishedKey = ''
-        if (g) { try { await g.free() } catch { /* group already gone with the connection */ } }
+        if (g) { try { await this.av(g.free(), 'EntryGroup.Free') } catch { /* gone with the connection, or avahi not answering */ } }
     }
 
     private async dropClient() {
@@ -374,7 +409,7 @@ export class IdeaLocalPublisher {
 
     /** The group's state, or undefined when avahi no longer has the group (daemon restarted). */
     private async readGroupState(g: AvahiEntryGroup): Promise<number | undefined> {
-        try { return await g.getState() } catch (e: any) {
+        try { return await this.av(g.getState(), 'EntryGroup.GetState') } catch (e: any) {
             if (isEntryGroupGone(e)) return undefined
             throw e
         }
@@ -435,15 +470,23 @@ export class IdeaLocalPublisher {
                 return this.status
             }
 
-            if (!this.client) this.client = await this.connect()
-            const g = await this.client.entryGroupNew()
+            if (!this.client) {
+                const pending = this.connect()
+                this.client = await this.av(pending, 'the D-Bus connect').catch((e) => {
+                    // A connect that completes after we gave up must not leak a bus connection.
+                    if (isAvahiTimeout(e)) pending.then(c => c.close(), () => {})
+                    throw e
+                })
+            }
+            const g = await this.av(this.client.entryGroupNew(), 'Server.EntryGroupNew')
             this.group = g
             try {
                 for (const a of addrs) {
-                    await g.addAddress(a.ifIndex, AVAHI_PROTO_INET, AVAHI_PUBLISH_NO_REVERSE, this.name, a.address)
+                    await this.av(g.addAddress(a.ifIndex, AVAHI_PROTO_INET, AVAHI_PUBLISH_NO_REVERSE, this.name, a.address), 'EntryGroup.AddAddress')
                 }
-                await g.commit()
+                await this.av(g.commit(), 'EntryGroup.Commit')
             } catch (e: any) {
+                if (isAvahiTimeout(e)) throw e
                 // A local collision (e.g. this host already publishes the name) is not fatal: retry later.
                 await this.dropGroup()
                 this.note('waiting', `could not register ${this.name}: ${e?.message ?? e}; retrying`)
@@ -453,6 +496,23 @@ export class IdeaLocalPublisher {
             if (this.status !== 'waiting') this.status = 'registering'
             return this.status
         } catch (e: any) {
+            if (isAvahiTimeout(e)) {
+                // avahi-daemon is not running its main loop (frozen/hung). Our record is still in
+                // its memory and it will answer with it as soon as it runs again. Queue the Free
+                // and close the D-Bus connection now (avahi frees every group of a client that
+                // disconnected), without waiting for answers: when avahi resumes it handles both
+                // right after the queries that piled up while it was stopped, and multicasts a
+                // goodbye for idea.local. Then reconnect and compete again like any other Engine.
+                const wasHolder = this.status === 'holder'
+                const g = this.group; const c = this.client
+                this.group = undefined; this.client = undefined; this.publishedKey = ''
+                if (g) { try { void g.free().catch(() => {}) } catch { /* ignore */ } }
+                if (c) { try { c.close() } catch { /* ignore */ } }
+                this.note('error', g
+                    ? `${e.message}; ${wasHolder ? `giving up ${this.name}: ` : ''}freed our entry group and closed the D-Bus connection so a frozen avahi drops the record when it runs again; reconnecting`
+                    : `${e.message}; reconnecting`)
+                return this.status
+            }
             // avahi-daemon or D-Bus gone: reconnect on the next tick.
             await this.dropClient()
             this.note('error', `avahi D-Bus error: ${e?.message ?? e}; reconnecting`)

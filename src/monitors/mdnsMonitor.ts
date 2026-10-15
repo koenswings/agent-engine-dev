@@ -9,7 +9,8 @@ import { EngineID, Hostname, IPAddress } from '../data/CommonTypes.js';
 import { config } from '../data/Config.js';
 import { readStoreDocId } from '../data/StoreIdentity.js';
 import { RefusalLog, storeTag } from '../data/StoreScope.js';
-import { lanAddresses } from './ideaLocal.js';
+import { readdirSync } from 'fs';
+import { isLanInterfaceName, lanAddresses } from './ideaLocal.js';
 
 /**
  * node-dns-sd (peer discovery) binds 0.0.0.0:5353 and, by default, sends its query on every
@@ -23,6 +24,53 @@ import { lanAddresses } from './ideaLocal.js';
 export const restrictDnsSdToLan = (sd: any = mDnsSd, lan: () => string[] = () => lanAddresses().map(a => a.address)): void => {
     sd._getNetifAddressList = () => lan()
     if (Array.isArray(sd._netif_address_list)) sd._netif_address_list = lan()
+}
+
+/**
+ * node-dns-sd's discover() starts `this._sendQueryPacket(buf)` without awaiting or catching it,
+ * so a failing multicast send (`send EPERM 224.0.0.251:5353` when OUTPUT udp/5353 is dropped,
+ * pool idea03 takeover run 2026-10-15 18:08: 36 -> 110 lines) is an unhandledRejection on
+ * every 10 s round, and the remaining interfaces are skipped. Make every send resolve: an
+ * error is reported (once per distinct message, see discoverySendError) and the query goes on
+ * to the next interface; the round still collects answers until its wait ends.
+ */
+export const catchDnsSdSendErrors = (sd: any = mDnsSd, report: (e: any) => void = (e) => discoverySendError(e)): void => {
+    if (sd.__ideaSendErrorsCaught) return
+    const udpSend = sd._udpSend?.bind(sd)
+    if (typeof udpSend === 'function') {
+        sd._udpSend = (buf: Buffer, port: number, addr: string) =>
+            Promise.resolve().then(() => udpSend(buf, port, addr)).catch((e: any) => { report(e) })
+    }
+    const sendQuery = sd._sendQueryPacket?.bind(sd)
+    if (typeof sendQuery === 'function') {
+        // setMulticastInterface can throw (EADDRNOTAVAIL when an address just went away)
+        sd._sendQueryPacket = (buf: Buffer) =>
+            Promise.resolve().then(() => sendQuery(buf)).catch((e: any) => { report(e) })
+    }
+    sd.__ideaSendErrorsCaught = true
+}
+
+let lastSendError = ''
+/** Log a discovery send error once until a different one happens (not an EPERM flood). */
+export const discoverySendError = (e: any, logger: (line: string) => void = log): void => {
+    const line = `${e?.code ?? ''} ${e?.message ?? e}`.trim()
+    if (line === lastSendError) return
+    lastSendError = line
+    logger(`***node-dns-sd*** engine discovery query could not be sent: ${line} (logged once until it changes; discovery keeps running)`)
+}
+
+/**
+ * The interfaces the Engine's own mDNS service (ciao, `_engine._tcp`) is advertised on: the
+ * school LAN only (every /sys/class/net name that isLanInterfaceName accepts: eth0, wlan0,
+ * also while down), never docker0/br-* (pool idea03 advertised itself at 172.21.0.1 and
+ * 172.22.0.1), veth*, tailscale*, lo. undefined (ciao: all interfaces) only when no LAN
+ * interface exists at all, so discovery is never switched off.
+ */
+export const engineAdvertiseInterfaces = (names: () => string[] = () => readdirSync('/sys/class/net')): string[] | undefined => {
+    let all: string[] = []
+    try { all = names() } catch { return undefined }
+    const lan = all.filter(isLanInterfaceName).sort()
+    return lan.length > 0 ? lan : undefined
 }
 
 /** One log line per distinct discovery error, not one every 10 s round. */
@@ -94,13 +142,14 @@ export const startAdvertising = (store: Store): CiaoService => {
     }
     const engineName = engine.hostname
     const engineVersion = engine.version
-    const responder = ciao.getResponder()
+    const interfaces = engineAdvertiseInterfaces()
+    const responder = ciao.getResponder(interfaces ? { interface: interfaces } : undefined)
 
     if (!engineName) {
         throw new Error(`No engine hostname found in the store`)
     }
 
-    log(`Advertising on all interfaces`)
+    log(`Advertising on ${interfaces ? `LAN interfaces ${interfaces.join(', ')}` : 'all interfaces (no LAN interface found)'}`)
     const service = responder.createService({
         name: engineName.toString(),
         type: 'engine',
@@ -115,7 +164,7 @@ export const startAdvertising = (store: Store): CiaoService => {
     });
 
     service.advertise().then(() => {
-        log(`The following service is published on all interfaces: ${engineName}._engine._tcp.local`);
+        log(`The following service is published on ${interfaces ? interfaces.join(', ') : 'all interfaces'}: ${engineName}._engine._tcp.local`);
     }).catch((err) => {
         error(`Error advertising mDNS service: ${err}`)
     })
@@ -164,6 +213,7 @@ export const discoverEngines = async (storeHandle: DocHandle<Store>, repo:Repo, 
 
 export const enableMulticastDNSEngineMonitor = (storeHandle: DocHandle<Store>, repo: Repo): { end: () => Promise<void> } => {
     restrictDnsSdToLan()
+    catchDnsSdSendErrors()
     const service = startAdvertising(storeHandle.doc())
     
     const runDiscovery = async () => {
