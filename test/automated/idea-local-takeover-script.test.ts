@@ -111,6 +111,7 @@ describe('idea-local-mdns-responders.py (idea#203: every responder, not just the
     })
     it('encodes a QU A query and parses compressed answers, skipping goodbyes', () => {
         const py = `
+import sys; sys.dont_write_bytecode = True
 import importlib.util, struct, socket
 s = importlib.util.spec_from_file_location('r', ${JSON.stringify(RESP)}); m = importlib.util.module_from_spec(s); s.loader.exec_module(m)
 q = m.encode_query('idea.local', 0x1234)
