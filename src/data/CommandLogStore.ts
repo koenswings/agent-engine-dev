@@ -9,10 +9,10 @@
  */
 
 import { DocHandle, Repo, isValidAutomergeUrl } from '@automerge/automerge-repo'
-import { log } from '../utils/utils.js'
+import { log, print } from '../utils/utils.js'
 import { fs } from 'zx'
 import path from 'path'
-import { config } from './Config.js'
+import { config, commandLogArchiveMaxBytes } from './Config.js'
 import { stopPeriodicFlush } from '../repo.js'
 
 // ── Types (also exported for use in CommonTypes consumers) ───────────────────
@@ -56,12 +56,25 @@ let _handle: DocHandle<CommandLogStore> | null = null
 export const getCommandLogHandle = (): DocHandle<CommandLogStore> | null => _handle
 
 /**
+ * Doc ids of command logs retired by a daily rotation (idea#183). A caller that
+ * captured the handle at startup (storeMonitor, CommandLogger, a long command
+ * that started before midnight) still passes the old handle; every write helper
+ * redirects such a handle to the current doc, where open traces were carried.
+ */
+const _retired = new Set<string>()
+
+/** The doc a write for `handle` should go to: the current doc if `handle` was rotated out. */
+export const liveCommandLogHandle = (handle: DocHandle<CommandLogStore>): DocHandle<CommandLogStore> =>
+  (_handle && handle !== _handle && _retired.has(handle.documentId)) ? _handle : handle
+
+/**
  * Point the module-level handle at an existing doc. createCommandLogStore sets
  * it in production; tests use this to record into an in-memory doc without
  * touching store-identity/.
  */
 export const setCommandLogHandle = (handle: DocHandle<CommandLogStore> | null): void => {
   _handle = handle
+  if (handle === null) { _retired.clear(); _currentDay = null }
 }
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
@@ -81,6 +94,12 @@ export interface CommandLogStoreOptions {
   urlFile?: string
   /** Default: COMMAND_LOG_LOAD_TIMEOUT_MS */
   timeoutMs?: number
+  /** Clock, for tests. Default: () => new Date() */
+  now?: () => Date
+  /** Default: <dir of urlFile>/command-log-archive */
+  archiveDir?: string
+  /** Size cap of archiveDir in bytes; oldest archives are deleted until under it. Default: settings.commandLogArchiveMaxBytes (1 GB) */
+  archiveMaxBytes?: number
 }
 
 /**
@@ -128,7 +147,7 @@ export const createCommandLogStore = async (
   repo: Repo,
   options: CommandLogStoreOptions = {},
 ): Promise<DocHandle<CommandLogStore>> => {
-  const urlFile = options.urlFile ?? path.join('./' + config.settings.storeIdentityFolder, 'command-log-url.txt')
+  const urlFile = options.urlFile ?? defaultUrlFile()
   const timeoutMs = options.timeoutMs ?? COMMAND_LOG_LOAD_TIMEOUT_MS
 
   let handle: DocHandle<CommandLogStore>
@@ -149,7 +168,206 @@ export const createCommandLogStore = async (
   }
 
   _handle = handle
-  return handle
+  const today = localDay(options.now?.() ?? new Date())
+  if (!existingUrl || handle.url !== existingUrl) {
+    // A fresh doc was just created: it belongs to today.
+    await writeAtomic(dayFileFor(urlFile), today)
+    _currentDay = today
+    return handle
+  }
+  _currentDay = readDayFile(urlFile)
+
+  // idea#183: rotate at startup when the loaded doc is from another day (or
+  // predates rotation and has no day file), so an Engine that was off at
+  // midnight, or is upgraded, starts on a small doc.
+  if (_currentDay !== today) {
+    log(`[commandLog] CommandLog day is ${_currentDay ?? 'unknown'}, today is ${today}: rotating at startup`)
+    await rotateCommandLog(repo, options)
+  }
+  return _handle!
+}
+
+// ── Daily rotation (idea#183) ────────────────────────────────────────────────
+
+
+/**
+ * Traces closed less than this long before a rotation are carried into the new
+ * doc, so a reader that switches docs right after midnight still finds the
+ * result of a command it sent just before. Running traces are always carried.
+ */
+export const COMMAND_LOG_CARRY_GRACE_MS = 15 * 60_000
+
+/** How often the Engine checks for a local date change. */
+export const COMMAND_LOG_ROTATION_CHECK_MS = 60_000
+
+let _currentDay: string | null = null
+let _rotating: Promise<DocHandle<CommandLogStore>> | null = null
+
+/** YYYY-MM-DD of `d` in the Engine's local timezone. */
+export const localDay = (d: Date): string => {
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+const dayFileFor = (urlFile: string) => path.join(path.dirname(urlFile), 'command-log-day.txt')
+const defaultUrlFile = () => path.join('./' + config.settings.storeIdentityFolder, 'command-log-url.txt')
+
+const readDayFile = (urlFile: string): string | null => {
+  try {
+    const d = fs.readFileSync(dayFileFor(urlFile), 'utf-8').trim()
+    return /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null
+  } catch { return null }
+}
+
+/** Write via temp file + rename, so a reader of /api/command-log-url never sees a half-written URL. */
+const writeAtomic = async (file: string, content: string): Promise<void> => {
+  await fs.ensureDir(path.dirname(file))
+  const tmp = `${file}.tmp-${process.pid}`
+  await fs.writeFile(tmp, content)
+  await fs.rename(tmp, file)
+}
+
+/** Day of the current CommandLog doc (null before createCommandLogStore). */
+export const getCommandLogDay = (): string | null => _currentDay
+
+/**
+ * Start a fresh CommandLog doc and archive the current one (idea#183).
+ *
+ * 1. Create the new doc with every running trace, and every trace closed in the
+ *    last COMMAND_LOG_CARRY_GRACE_MS, copied in (same traceIds, same order).
+ * 2. Switch synchronously: module handle, retired set, so writes made through
+ *    the old handle from now on land in the new doc.
+ * 3. Point readers at it: command-log-url.txt (served by /api/command-log-url)
+ *    and command-log-day.txt are rewritten atomically.
+ * 4. Archive the old doc: Automerge binary saved to
+ *    <archiveDir>/command-log-<day>-<documentId>.automerge, then the doc is
+ *    deleted from the Repo (no more sync, removed from store-data).
+ * 5. Size cap: while archiveDir is over archiveMaxBytes, delete the oldest archive
+ *    (one at a time, each deletion logged). No age-based deletion (Koen 2026-10-15).
+ *
+ * Concurrent calls share one rotation.
+ */
+export const rotateCommandLog = (
+  repo: Repo,
+  options: CommandLogStoreOptions = {},
+): Promise<DocHandle<CommandLogStore>> => {
+  if (_rotating) return _rotating
+  _rotating = _rotate(repo, options).finally(() => { _rotating = null })
+  return _rotating
+}
+
+const _rotate = async (repo: Repo, options: CommandLogStoreOptions): Promise<DocHandle<CommandLogStore>> => {
+  const urlFile = options.urlFile ?? defaultUrlFile()
+  const archiveDir = options.archiveDir ?? path.join(path.dirname(urlFile), 'command-log-archive')
+  const archiveMaxBytes = options.archiveMaxBytes ?? commandLogArchiveMaxBytes()
+  const now = options.now?.() ?? new Date()
+  const today = localDay(now)
+  const old = _handle
+  const oldDay = _currentDay ?? 'unknown'
+
+  const fresh = repo.create<CommandLogStore>({ traces: {}, recentTraceIds: [] })
+  await fresh.whenReady()
+
+  // Snapshot + carry + switch with no await in between, so no write is lost.
+  let carried = 0
+  const oldDoc = old?.isReady() ? old.doc() : undefined
+  if (oldDoc) {
+    const cutoff = now.getTime() - COMMAND_LOG_CARRY_GRACE_MS
+    const keep = (oldDoc.recentTraceIds ?? []).filter(id => {
+      const t = oldDoc.traces[id]
+      return t && (t.status === 'running' || (t.completedAt ?? 0) >= cutoff)
+    })
+    if (keep.length) {
+      fresh.change(doc => {
+        for (const id of keep) {
+          doc.traces[id] = JSON.parse(JSON.stringify(oldDoc.traces[id]))
+          ;(doc.recentTraceIds as string[]).push(id)
+        }
+      })
+    }
+    carried = keep.length
+  }
+  if (old) _retired.add(old.documentId)
+  _handle = fresh
+  _currentDay = today
+
+  await writeAtomic(urlFile, fresh.url)
+  await writeAtomic(dayFileFor(urlFile), today)
+  log(`[commandLog] Rotated CommandLog ${old?.url ?? '(none)'} (${oldDay}) -> ${fresh.url} (${today}), carried ${carried} open/recent trace(s)`)
+
+  if (old) {
+    try {
+      const bin = old.isReady() ? await repo.export(old.documentId) : undefined
+      if (bin) {
+        await fs.ensureDir(archiveDir)
+        const file = path.join(archiveDir, `command-log-${oldDay}-${old.documentId}.automerge`)
+        await fs.writeFile(file, bin)
+        log(`[commandLog] Archived previous CommandLog to ${file} (${bin.byteLength} bytes)`)
+      }
+      repo.delete(old.documentId)
+    } catch (e) {
+      log(`[commandLog] Could not archive previous CommandLog ${old.url}: ${e instanceof Error ? e.message : e}`)
+    }
+  }
+  await capCommandLogArchives(archiveDir, archiveMaxBytes)
+  return fresh
+}
+
+const ARCHIVE_RE = /^command-log-(.+)-[^-]+\.automerge$/
+const ARCHIVE_DAY_RE = /^command-log-(\d{4}-\d{2}-\d{2})-.+\.automerge$/
+
+/** Archive files of archiveDir, oldest first: by the day in the name, then mtime, then name. Other files are ignored. */
+export const listCommandLogArchives = async (archiveDir: string): Promise<{ name: string, size: number, day: string, mtimeMs: number }[]> => {
+  if (!fs.existsSync(archiveDir)) return []
+  const out: { name: string, size: number, day: string, mtimeMs: number }[] = []
+  for (const name of await fs.readdir(archiveDir)) {
+    if (!ARCHIVE_RE.test(name)) continue
+    const st = await fs.stat(path.join(archiveDir, name))
+    if (!st.isFile()) continue
+    // A file without a day in its name (command-log-unknown-…) sorts by mtime among dated ones of the same mtime day.
+    const day = ARCHIVE_DAY_RE.exec(name)?.[1] ?? localDay(new Date(st.mtimeMs))
+    out.push({ name, size: st.size, day, mtimeMs: st.mtimeMs })
+  }
+  return out.sort((a, b) => a.day.localeCompare(b.day) || a.mtimeMs - b.mtimeMs || a.name.localeCompare(b.name))
+}
+
+/**
+ * Size cap (#185, Koen 2026-10-15): while the archive files of archiveDir total more
+ * than maxBytes, delete the oldest one, logging each deletion. Never deletes by age,
+ * never touches other files. Returns the deleted file names in deletion order.
+ */
+export const capCommandLogArchives = async (archiveDir: string, maxBytes: number): Promise<string[]> => {
+  const files = await listCommandLogArchives(archiveDir)
+  let total = files.reduce((n, f) => n + f.size, 0)
+  const removed: string[] = []
+  for (const f of files) {
+    if (total <= maxBytes) break
+    await fs.remove(path.join(archiveDir, f.name))
+    total -= f.size
+    removed.push(f.name)
+    // print, not log: always written (log is verbosity-gated), every deletion must be in the Engine log
+    print(`[commandLog] Archive folder over its size cap (${maxBytes} bytes): deleted oldest archive ${f.name} (${f.size} bytes), ${total} bytes left`)
+  }
+  return removed
+}
+
+/**
+ * Check the local date every COMMAND_LOG_ROTATION_CHECK_MS and rotate when it
+ * changed (idea#183). Returns a stop function.
+ */
+export const startCommandLogRotation = (
+  repo: Repo,
+  options: CommandLogStoreOptions & { intervalMs?: number } = {},
+): (() => void) => {
+  const timer = setInterval(() => {
+    const today = localDay(options.now?.() ?? new Date())
+    if (_currentDay && _currentDay !== today && !_rotating) {
+      rotateCommandLog(repo, options).catch(e =>
+        log(`[commandLog] Rotation failed: ${e instanceof Error ? e.message : e}`))
+    }
+  }, options.intervalMs ?? COMMAND_LOG_ROTATION_CHECK_MS)
+  timer.unref?.()
+  return () => clearInterval(timer)
 }
 
 /**
@@ -196,7 +414,7 @@ export const addTrace = (
   handle: DocHandle<CommandLogStore>,
   trace: Omit<CommandTrace, 'logs'>
 ): void => {
-  handle.change(doc => {
+  liveCommandLogHandle(handle).change(doc => {
     doc.traces[trace.traceId] = { ...trace, logs: [] }
     ;(doc.recentTraceIds as string[]).push(trace.traceId)
 
@@ -218,7 +436,7 @@ export const flushLogs = (
   entries: LogEntry[]
 ): void => {
   if (!entries.length) return
-  handle.change(doc => {
+  liveCommandLogHandle(handle).change(doc => {
     const trace = doc.traces[traceId]
     if (!trace) return
     for (const entry of entries) {
@@ -255,7 +473,7 @@ export const closeTrace = (
   resultJson?: string | null,
 ): void => {
   const fromStash = resultJson !== undefined ? resultJson : takePendingTraceResult(traceId)
-  handle.change(doc => {
+  liveCommandLogHandle(handle).change(doc => {
     const trace = doc.traces[traceId]
     if (!trace) return
     if (trace.status === 'error' && status === 'ok') return

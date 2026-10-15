@@ -14,7 +14,7 @@ import { Docker } from "node-docker-api";
 import { createMeta } from '../data/Meta.js'
 import { config, disksRoot, skipImageLoad } from '../data/Config.js'
 import { DocHandle } from "@automerge/automerge-repo";
-import { CommandLogStore, LogEntry, getCommandLogHandle, addTrace, closeTrace, flushLogs } from './CommandLogStore.js'
+import { CommandLogStore, LogEntry, getCommandLogHandle, liveCommandLogHandle, addTrace, closeTrace, flushLogs } from './CommandLogStore.js'
 import { getActiveTrace, flushTrace } from '../utils/CommandLogger.js'
 import { dockerAvailable } from '../utils/dockerAvailable.js'
 import { rebindKolibriMorangoInstanceId } from './InstanceCopy.js'
@@ -70,7 +70,7 @@ export const START_INSTANCE_COMMAND = 'startInstance'
  */
 const activeStartTraceId = (handle: DocHandle<CommandLogStore>): string | null => {
   const active = getActiveTrace()
-  if (active && active.command === START_INSTANCE_COMMAND && handle.doc()?.traces[active.traceId]) {
+  if (active && active.command === START_INSTANCE_COMMAND && liveCommandLogHandle(handle).doc()?.traces[active.traceId]) {
     return active.traceId
   }
   return null
