@@ -12,7 +12,7 @@ import { NodeFSStorageAdapter } from '@automerge/automerge-repo-storage-nodefs'
 import {
     CommandLogStore, createCommandLogStore, rotateCommandLog, startCommandLogRotation,
     getCommandLogHandle, setCommandLogHandle, getCommandLogDay, localDay, addTrace, closeTrace,
-    flushLogs, pruneCommandLogArchives, liveCommandLogHandle, shutdownRepo,
+    flushLogs, capCommandLogArchives, listCommandLogArchives, liveCommandLogHandle, shutdownRepo,
     COMMAND_LOG_CARRY_GRACE_MS,
 } from '../../src/data/CommandLogStore.js'
 
@@ -141,16 +141,68 @@ describe('CommandLog daily rotation (idea#183)', () => {
         } finally { stop() }
     })
 
-    it('prunes archives older than the retention window and ignores other files', async () => {
+    const put = async (name: string, bytes: number, mtime?: string) => {
         await fs.ensureDir(archiveDir())
-        for (const n of ['command-log-2026-09-01-a.automerge', 'command-log-2026-09-28-b.automerge',
-                         'command-log-2026-09-29-c.automerge', 'command-log-unknown-d.automerge', 'notes.txt']) {
-            await fs.writeFile(path.join(archiveDir(), n), 'x')
-        }
-        const removed = await pruneCommandLogArchives(archiveDir(), 14, new Date('2026-10-13T00:00:05'))
-        expect(removed.sort()).toEqual(['command-log-2026-09-01-a.automerge', 'command-log-2026-09-28-b.automerge'])
+        await fs.writeFile(path.join(archiveDir(), name), Buffer.alloc(bytes, 1))
+        if (mtime) { const t = new Date(mtime); await fs.utimes(path.join(archiveDir(), name), t, t) }
+    }
+
+    it('size cap: under or at the cap nothing is deleted, whatever the age', async () => {
+        await put('command-log-2020-01-01-old.automerge', 400)
+        await put('command-log-2026-10-12-b.automerge', 600)
+        expect(await capCommandLogArchives(archiveDir(), 1000)).toEqual([])
+        expect((await fs.readdir(archiveDir())).length).toBe(2)
+    })
+
+    it('size cap: deletes the oldest archives one at a time until the total is under the cap; other files untouched', async () => {
+        await put('command-log-2026-10-10-c.automerge', 300)
+        await put('command-log-2026-09-01-a.automerge', 300)
+        await put('command-log-2026-10-01-b.automerge', 300)
+        await put('command-log-2026-10-12-d.automerge', 300)
+        await put('notes.txt', 5000)
+        const removed = await capCommandLogArchives(archiveDir(), 700)
+        expect(removed).toEqual(['command-log-2026-09-01-a.automerge', 'command-log-2026-10-01-b.automerge'])
         expect((await fs.readdir(archiveDir())).sort()).toEqual(
-            ['command-log-2026-09-29-c.automerge', 'command-log-unknown-d.automerge', 'notes.txt'])
+            ['command-log-2026-10-10-c.automerge', 'command-log-2026-10-12-d.automerge', 'notes.txt'])
+    })
+
+    it('size cap: same day sorts by mtime; an undated archive sorts by its mtime day', async () => {
+        await put('command-log-2026-10-12-new.automerge', 100, '2026-10-12T20:00:00')
+        await put('command-log-2026-10-12-early.automerge', 100, '2026-10-12T01:00:00')
+        await put('command-log-unknown-x.automerge', 100, '2026-10-11T12:00:00')
+        expect((await listCommandLogArchives(archiveDir())).map(f => f.name)).toEqual([
+            'command-log-unknown-x.automerge', 'command-log-2026-10-12-early.automerge', 'command-log-2026-10-12-new.automerge'])
+        expect(await capCommandLogArchives(archiveDir(), 150)).toEqual(['command-log-unknown-x.automerge', 'command-log-2026-10-12-early.automerge'])
+    })
+
+    it('size cap: each deletion is logged', async () => {
+        await put('command-log-2026-10-01-a.automerge', 100)
+        await put('command-log-2026-10-02-b.automerge', 100)
+        const lines: string[] = []
+        const orig = console.info
+        console.info = (...a: any[]) => { lines.push(a.join(' ')) }
+        try { await capCommandLogArchives(archiveDir(), 50) } finally { console.info = orig }
+        const del = lines.filter(l => /deleted oldest archive/.test(l))
+        expect(del.length).toBe(2)
+        expect(del[0]).toContain('command-log-2026-10-01-a.automerge')
+        expect(del[1]).toContain('command-log-2026-10-02-b.automerge')
+    })
+
+    it('size cap is enforced by a real rotation (small cap on a fixture), the new archive is kept', async () => {
+        await put('command-log-2026-09-01-a.automerge', 5000)
+        await put('command-log-2026-09-02-b.automerge', 5000)
+        const repo = new Repo({ network: [] })
+        const old = await createCommandLogStore(repo, { urlFile: urlFile(), now: at('2026-10-12T10:00:00') })
+        const h = await rotateCommandLog(repo, { urlFile: urlFile(), now: at('2026-10-13T00:01:00'), archiveMaxBytes: 6000 })
+        expect(h.url).not.toBe(old.url)
+        expect((await fs.readdir(archiveDir())).sort()).toEqual(
+            ['command-log-2026-09-02-b.automerge', `command-log-2026-10-12-${old.documentId}.automerge`])
+    })
+
+    it('default cap is 1 GB from settings.commandLogArchiveMaxBytes', async () => {
+        const { commandLogArchiveMaxBytes, COMMAND_LOG_ARCHIVE_DEFAULT_MAX_BYTES } = await import('../../src/data/Config.js')
+        expect(COMMAND_LOG_ARCHIVE_DEFAULT_MAX_BYTES).toBe(1_000_000_000)
+        expect(commandLogArchiveMaxBytes()).toBe(1_000_000_000)
     })
 
     it('start.ts starts the rotation timer', () => {

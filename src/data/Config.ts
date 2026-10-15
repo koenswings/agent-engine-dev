@@ -27,6 +27,7 @@ export interface Settings {
     dockerAvailable?: boolean;    // Force the Docker-available answer (default: unset → cached `docker info` probe). See utils/dockerAvailable.ts.
     staticPeers?: string;         // Opt-in static peer list 'host[:port],...' (IDEA_STATIC_PEERS wins). See StaticPeers.ts.
     peerAccess?: boolean;         // Per-Pi Engine keys for cross-Engine copy (default: on unless isDev || testMode). See peerAccessEnabled().
+    commandLogArchiveMaxBytes?: number; // Size cap of store-identity/command-log-archive/ in bytes (default 1 GB = 1_000_000_000). Over the cap, the oldest archives are deleted one by one, each logged (#185, Koen 2026-10-15). See commandLogArchiveMaxBytes().
     peerStaleHours?: number;      // A peer Engine without a heartbeat for this long loses its key here (default 168 = 7 days). See peerStaleMs().
 }
 
@@ -129,6 +130,7 @@ function validateSettings(obj: any, path: string): string[] {
     if (obj.skipMetaWrite !== undefined && typeof obj.skipMetaWrite !== 'boolean') errors.push(`'${path}skipMetaWrite' must be a boolean.`);
     if (obj.staticPeers !== undefined && obj.staticPeers !== null && typeof obj.staticPeers !== 'string') errors.push(`'${path}staticPeers' must be a string.`);
     if (obj.peerAccess !== undefined && typeof obj.peerAccess !== 'boolean') errors.push(`'${path}peerAccess' must be a boolean.`);
+    if (obj.commandLogArchiveMaxBytes !== undefined && (typeof obj.commandLogArchiveMaxBytes !== 'number' || !(obj.commandLogArchiveMaxBytes > 0))) errors.push(`'${path}commandLogArchiveMaxBytes' must be a positive number.`);
     if (obj.peerStaleHours !== undefined && (typeof obj.peerStaleHours !== 'number' || !(obj.peerStaleHours > 0))) errors.push(`'${path}peerStaleHours' must be a positive number.`);
     return errors;
 }
@@ -386,3 +388,7 @@ export const skipHardwareId = (): boolean => config.settings.skipHardwareId ?? (
  * Separate from skipMetaWrite (the FIRST write on a disk without META.yaml).
  */
 export const skipMetaUpdate = (): boolean => config.settings.skipMetaUpdate ?? (config.settings.isDev || config.settings.testMode);
+
+/** #185: size cap of the CommandLog archive folder (bytes, default 1 GB). No age-based deletion. */
+export const COMMAND_LOG_ARCHIVE_DEFAULT_MAX_BYTES = 1_000_000_000
+export const commandLogArchiveMaxBytes = (): number => config.settings.commandLogArchiveMaxBytes ?? COMMAND_LOG_ARCHIVE_DEFAULT_MAX_BYTES

@@ -9,10 +9,10 @@
  */
 
 import { DocHandle, Repo, isValidAutomergeUrl } from '@automerge/automerge-repo'
-import { log } from '../utils/utils.js'
+import { log, print } from '../utils/utils.js'
 import { fs } from 'zx'
 import path from 'path'
-import { config } from './Config.js'
+import { config, commandLogArchiveMaxBytes } from './Config.js'
 import { stopPeriodicFlush } from '../repo.js'
 
 // ── Types (also exported for use in CommonTypes consumers) ───────────────────
@@ -98,8 +98,8 @@ export interface CommandLogStoreOptions {
   now?: () => Date
   /** Default: <dir of urlFile>/command-log-archive */
   archiveDir?: string
-  /** Archives older than this many days are pruned. Default: COMMAND_LOG_RETENTION_DAYS */
-  retentionDays?: number
+  /** Size cap of archiveDir in bytes; oldest archives are deleted until under it. Default: settings.commandLogArchiveMaxBytes (1 GB) */
+  archiveMaxBytes?: number
 }
 
 /**
@@ -189,9 +189,6 @@ export const createCommandLogStore = async (
 
 // ── Daily rotation (idea#183) ────────────────────────────────────────────────
 
-/** Archives older than this are deleted at each rotation (env IDEA_COMMAND_LOG_RETENTION_DAYS). */
-export const COMMAND_LOG_RETENTION_DAYS = Number(process.env.IDEA_COMMAND_LOG_RETENTION_DAYS) > 0
-  ? Number(process.env.IDEA_COMMAND_LOG_RETENTION_DAYS) : 14
 
 /**
  * Traces closed less than this long before a rotation are carried into the new
@@ -245,7 +242,8 @@ export const getCommandLogDay = (): string | null => _currentDay
  * 4. Archive the old doc: Automerge binary saved to
  *    <archiveDir>/command-log-<day>-<documentId>.automerge, then the doc is
  *    deleted from the Repo (no more sync, removed from store-data).
- * 5. Prune archives older than retentionDays.
+ * 5. Size cap: while archiveDir is over archiveMaxBytes, delete the oldest archive
+ *    (one at a time, each deletion logged). No age-based deletion (Koen 2026-10-15).
  *
  * Concurrent calls share one rotation.
  */
@@ -261,7 +259,7 @@ export const rotateCommandLog = (
 const _rotate = async (repo: Repo, options: CommandLogStoreOptions): Promise<DocHandle<CommandLogStore>> => {
   const urlFile = options.urlFile ?? defaultUrlFile()
   const archiveDir = options.archiveDir ?? path.join(path.dirname(urlFile), 'command-log-archive')
-  const retentionDays = options.retentionDays ?? COMMAND_LOG_RETENTION_DAYS
+  const archiveMaxBytes = options.archiveMaxBytes ?? commandLogArchiveMaxBytes()
   const now = options.now?.() ?? new Date()
   const today = localDay(now)
   const old = _handle
@@ -311,25 +309,45 @@ const _rotate = async (repo: Repo, options: CommandLogStoreOptions): Promise<Doc
       log(`[commandLog] Could not archive previous CommandLog ${old.url}: ${e instanceof Error ? e.message : e}`)
     }
   }
-  await pruneCommandLogArchives(archiveDir, retentionDays, now)
+  await capCommandLogArchives(archiveDir, archiveMaxBytes)
   return fresh
 }
 
-/** Delete archives whose day is more than `retentionDays` before `now`. Returns the deleted file names. */
-export const pruneCommandLogArchives = async (archiveDir: string, retentionDays: number, now: Date): Promise<string[]> => {
+const ARCHIVE_RE = /^command-log-(.+)-[^-]+\.automerge$/
+const ARCHIVE_DAY_RE = /^command-log-(\d{4}-\d{2}-\d{2})-.+\.automerge$/
+
+/** Archive files of archiveDir, oldest first: by the day in the name, then mtime, then name. Other files are ignored. */
+export const listCommandLogArchives = async (archiveDir: string): Promise<{ name: string, size: number, day: string, mtimeMs: number }[]> => {
   if (!fs.existsSync(archiveDir)) return []
-  const limit = new Date(now.getFullYear(), now.getMonth(), now.getDate() - retentionDays)
-  const removed: string[] = []
+  const out: { name: string, size: number, day: string, mtimeMs: number }[] = []
   for (const name of await fs.readdir(archiveDir)) {
-    const m = /^command-log-(\d{4})-(\d{2})-(\d{2})-.+\.automerge$/.exec(name)
-    if (!m) continue
-    const day = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
-    if (day < limit) {
-      await fs.remove(path.join(archiveDir, name))
-      removed.push(name)
-    }
+    if (!ARCHIVE_RE.test(name)) continue
+    const st = await fs.stat(path.join(archiveDir, name))
+    if (!st.isFile()) continue
+    // A file without a day in its name (command-log-unknown-…) sorts by mtime among dated ones of the same mtime day.
+    const day = ARCHIVE_DAY_RE.exec(name)?.[1] ?? localDay(new Date(st.mtimeMs))
+    out.push({ name, size: st.size, day, mtimeMs: st.mtimeMs })
   }
-  if (removed.length) log(`[commandLog] Pruned ${removed.length} CommandLog archive(s) older than ${retentionDays} days`)
+  return out.sort((a, b) => a.day.localeCompare(b.day) || a.mtimeMs - b.mtimeMs || a.name.localeCompare(b.name))
+}
+
+/**
+ * Size cap (#185, Koen 2026-10-15): while the archive files of archiveDir total more
+ * than maxBytes, delete the oldest one, logging each deletion. Never deletes by age,
+ * never touches other files. Returns the deleted file names in deletion order.
+ */
+export const capCommandLogArchives = async (archiveDir: string, maxBytes: number): Promise<string[]> => {
+  const files = await listCommandLogArchives(archiveDir)
+  let total = files.reduce((n, f) => n + f.size, 0)
+  const removed: string[] = []
+  for (const f of files) {
+    if (total <= maxBytes) break
+    await fs.remove(path.join(archiveDir, f.name))
+    total -= f.size
+    removed.push(f.name)
+    // print, not log: always written (log is verbosity-gated), every deletion must be in the Engine log
+    print(`[commandLog] Archive folder over its size cap (${maxBytes} bytes): deleted oldest archive ${f.name} (${f.size} bytes), ${total} bytes left`)
+  }
   return removed
 }
 
