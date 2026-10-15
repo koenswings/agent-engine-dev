@@ -1,10 +1,86 @@
 {
   "_comment": "Teacher test sticks per test Pi for script/hw-usb-sticks.ts (idea#193). Fill in on the claimed test Pi (Atlas, proposal step 2); never idea02, wizardly-hugle or Milkwise. files: relative path -> sha256 of a known file on the stick.",
   "idea03": {
-    "refuseSerials": ["AA202000000000004820"],
+    "refuseSerials": [
+      "AA202000000000004820"
+    ],
     "sticks": [
-      { "name": "FAT32 test stick", "fsType": "vfat", "usbSerial": "", "diskSerial": "", "uuids": [""], "kolibri": true, "files": {} },
-      { "name": "exFAT test stick", "fsType": "exfat", "usbSerial": "", "diskSerial": "", "uuids": [""], "kolibri": false, "files": {} }
+      {
+        "name": "FAT32 test stick",
+        "fsType": "vfat",
+        "usbSerial": "",
+        "diskSerial": "",
+        "uuids": [
+          ""
+        ],
+        "kolibri": true,
+        "files": {}
+      },
+      {
+        "name": "exFAT test stick",
+        "fsType": "exfat",
+        "usbSerial": "",
+        "diskSerial": "",
+        "uuids": [
+          ""
+        ],
+        "kolibri": false,
+        "files": {}
+      }
     ]
+  },
+  "idea04": {
+    "refuseSerials": [
+      "AA202000000000002167"
+    ],
+    "sticks": [
+      {
+        "name": "IDEA-DEMO FAT32 (Intenso SSD sda1)",
+        "fsType": "vfat",
+        "usbSerial": "26A1EE83210C",
+        "diskSerial": "1642504001002428",
+        "uuids": [
+          "0425-A7AB",
+          "2591364e-03e6-40cb-867d-d453594b8297"
+        ],
+        "kolibri": true,
+        "files": {
+          "CREDITS.txt": "b6a757ce32216b7f72879cde6eee25f19edb081d0488a514992dded78cd8a940",
+          "kolibri/Early Reading/channel.json": "602e7c6ff0de8d465faec80604bbc451139b86f77c03d01a655a1b4e7b543259",
+          "kolibri/Early Reading/Our Country/Herd of elephants Hwange.jpg": "b6af0fa801ec4952b94db0d95b49bd3e9c59a08af29245430716ae0d4824038f",
+          "kolibri/Early Reading/Our Country/Victoria Falls.jpg": "6236382f1634e1ff08174331a966fd8661e1591ddacb6405b32818ceff7da754",
+          "kolibri/Early Reading/Stories/Is there someone like me.pdf": "0ccaeaebabe0c0d48a5dd1d16b8037fa6e9815ea81b09ce5ccb7bf8082a7194a",
+          "kolibri/Early Reading/Stories/Lady Amelia and her butterfly.pdf": "07c7c079cb7b95a57a8799464d92e38c804c7fd09842e2387128578e7b5762d8",
+          "kolibri/Early Reading/Stories/Mom and Me Love Always Wins.pdf": "d42d617b0e8248d5e1da801381461df7d9e84865b3bfdfc27c324445e8f56e02",
+          "kolibri/Early Reading/Stories/Nena and love.pdf": "a151bd5eefe8ac0c6126f2bb22821b533abf35031810135011de510338802f51",
+          "kolibri/Grade 5 Science/Animals/Curious elephant Zimbabwe.jpg": "a3dfa79e200595d1af6622e0ffa543064ea01263d0b0c3c909ec9c4ab820cc70",
+          "kolibri/Grade 5 Science/Animals/Elephant and zebra in Hwange.jpg": "7dc65bad4d03d4f25fc45de74b7d6f8adc78a0c53b4207b833b704f3920246f5",
+          "kolibri/Grade 5 Science/Animals/Honey bee taking off.mp4": "4c064c61fa9aca29c63d4bf5a525a8ec6be013d6e2ddc49ef87e8dd646246ce1",
+          "kolibri/Grade 5 Science/channel.json": "2107688d2e512df4b5f3283b97cf1e1f96fa28072f8370666869e6a4af4003a1",
+          "kolibri/Grade 5 Science/Earth and Sky/Phases of the moon.jpg": "5c88c6253e2652fe922711e103ee25d600bc69ed69d38adc25cde0ad169374f2",
+          "kolibri/Grade 5 Science/Earth and Sky/The solar system.png": "dd13fad901ba33aa2a7b9153929b32669648472ed184ee5c9219f17b59b8b1eb",
+          "kolibri/Grade 5 Science/Earth and Sky/The water cycle.png": "15dca7fbc239cdce8fc9a05195dc15219a26b93f100772c61fcc717aec9ffeae",
+          "kolibri/Grade 5 Science/Plants/Bean seed time-lapse.mp4": "a83256c4f5606c1f279eca0c97a25e68b85a01843e0306435c8e06603fcc9e9d",
+          "kolibri/Grade 5 Science/Plants/Growing maize.mp4": "1116213c7d1e4631899a893bea1c081cba6ee2b8d2821c0755787aaea48cf37e",
+          "kolibri/Grade 5 Science/Plants/Parts of a flower.png": "614b78805a327195d2d51f666328fe1a94fe813ace1f47f1ecc9bc41df2bbf5f",
+          "kolibri/Grade 5 Science/Textbooks/Natural Sciences Grade 4.epub": "48f0d1027ea9e12abceb1aeca17372c9ddd7357c35e23f0d8c001a0a7901322a",
+          "kolibri/Grade 5 Science/Textbooks/Natural Sciences Grade 5A.pdf": "8c39db3dba79556f36762eac1e1611b591305a9fa32a62c42a290df1581c9b2c",
+          "kolibri/Grade 5 Science/Textbooks/Natural Sciences Grade 5.epub": "5019d3898a67e98519cec671ef9487d893ad878bb227da8993199140df2a89f9",
+          "kolibri/Maths/channel.json": "600f9cd965b590e3a694eca569ff82b65ebd7bf6b42ee9643e6633d3c1c254c7",
+          "kolibri/Maths/Counting/Counting fruit.mp4": "ce8f78c379891b6beccc8c5309fcc3f60e6bccabc3c0a5a22c5c2eaf88847968",
+          "kolibri/Maths/Fractions/Cake in quarters.jpg": "d6389fd3cc9644e38ff65c51c80fc050590a68cbc1e475919c8bed9de2ba7116",
+          "kolibri/Maths/Fractions/Fraction circles.png": "f8fd053a3a23b0fc6cc44e703f03db8f1d24e8b55212d94d186854ce67a02abc",
+          "kolibri/Maths/Fractions/Paper fraction pies.jpg": "50e5c9741f1745dcb121051cdcf0aa4474dbdd0be8f5708bfa91717faac8ac77",
+          "kolibri/Maths/Shapes/Rotating icosahedron.mp4": "fd2e6d909821eb0ee40dfd5c82755c35fcb862697865d1ebedf2d4ec6ed69eb1",
+          "kolibri/Maths/Times Tables/Easy multiplication tables.pdf": "742a80cd8ef69c0d3c6c0963cb238def0f763cff69932a5f5639204d7395fae5",
+          "kolibri/Maths/Times Tables/Multiplication table.pdf": "8272ce8d7c1d5f85775935a3f34a721a1e645726f81d20543156d71ad7308ecd",
+          "Teacher Notes/About this disk.txt": "02a113d7103301ad87113ce082bbced54c215e5731bc4943a6d7a05a50f7ad54",
+          "Teacher Notes/Natural Sciences Gr 5A Teacher Guide.pdf": "c47ca66db30150eea393f40885adcb195e5af82e95a2fef857249c4113e69b93",
+          "Worksheets/Blank fraction circles.png": "85a9f8b55bc05c54f253e9ceece9dc668b81671c7519e53141f684b5a583d1b5",
+          "Worksheets/How Tortoise got a crooked nose (colour-in).pdf": "fc61e68dbde6f278f588f42dad3f3cf42ed413d79fcae027dbb3438c6c09c571"
+        }
+      }
+    ],
+    "_note": "sda2 (2591364e-…, DUR-EMPTY003, Kolibri Running) shares the Intenso SSD with the stick partition sda1: run only with --method partition-uevent; uuids[0] is the stick."
   }
 }

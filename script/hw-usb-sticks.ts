@@ -27,7 +27,10 @@
  * Usage (on the test Pi, from an Engine checkout with node_modules):
  *   npx tsx script/hw-usb-sticks.ts [--engine-dir <path>] [--port 4321]
  *       [--engine-log ~/.pm2/logs/engine-out.log] [--config script/hw-usb-sticks.json]
- *       [--method unbind|authorized] [--timeout 60] [--builder]
+ *       [--method unbind|authorized|partition-uevent] [--timeout 60] [--builder]
+ * --method partition-uevent simulates unplug/plug of the stick PARTITION only
+ * (udevadm trigger --action=remove|add /sys/class/block/<part>): use it when the
+ * stick partition shares a USB device with another disk that must stay up.
  * Root: only the unplug simulation and the read-only sha256 of the block device use
  * the tester's own sudo (not the Engine sudoers). Exit 0 only when every check passes.
  * Log: test/testresults/hw-usb-sticks-<UTC yyyy-mm-dd-hhmmss>.log
@@ -81,7 +84,7 @@ const waitFor = async (what: string, fn: () => Promise<boolean> | boolean, timeo
 // ── Guards ──
 const host = os.hostname()
 if (['idea02', 'wizardly-hugle'].includes(host) || /milkwise/i.test(host)) abort(`refusing to run on ${host}`)
-if (!['unbind', 'authorized'].includes(METHOD)) abort(`unknown --method ${METHOD}`)
+if (!['unbind', 'authorized', 'partition-uevent'].includes(METHOD)) abort(`unknown --method ${METHOD}`)
 const cfg = (JSON.parse(fs.readFileSync(CONFIG, 'utf8')) as any)[host]
 if (!cfg?.sticks?.length) abort(`no test sticks recorded for ${host} in ${CONFIG}`)
 type StickCfg = { name: string, fsType: 'vfat' | 'exfat', usbSerial: string, diskSerial: string, uuids: string[], kolibri: boolean, files: Record<string, string> }
@@ -108,8 +111,14 @@ const sysWrite = async (file: string, v: string) => {
     const r = await $`echo ${v} | sudo -n tee ${file}`.nothrow()
     if (r.exitCode !== 0) throw new Error(`sudo tee ${file} failed: ${r.stderr.trim()}`)
 }
-const unplug = (usbId: string) => METHOD === 'unbind' ? sysWrite('/sys/bus/usb/drivers/usb/unbind', usbId) : sysWrite(`/sys/bus/usb/devices/${usbId}/authorized`, '0')
-const plug = (usbId: string) => METHOD === 'unbind' ? sysWrite('/sys/bus/usb/drivers/usb/bind', usbId) : sysWrite(`/sys/bus/usb/devices/${usbId}/authorized`, '1')
+const uevent = async (action: 'add' | 'remove', part: string) => {
+    if (!/^[a-z]+[0-9]+$/.test(part)) throw new Error(`partition-uevent needs a partition, got '${part}'`)
+    const r = await $`sudo -n udevadm trigger --action=${action} ${`/sys/class/block/${part}`}`.nothrow()
+    if (r.exitCode !== 0) throw new Error(`udevadm trigger ${action} ${part} failed: ${r.stderr.trim()}`)
+}
+// usbId: the USB device (unbind/authorized); part: the stick partition (partition-uevent)
+const unplug = (usbId: string, part: string) => METHOD === 'partition-uevent' ? uevent('remove', part) : METHOD === 'unbind' ? sysWrite('/sys/bus/usb/drivers/usb/unbind', usbId) : sysWrite(`/sys/bus/usb/devices/${usbId}/authorized`, '0')
+const plug = (usbId: string, part: string) => METHOD === 'partition-uevent' ? uevent('add', part) : METHOD === 'unbind' ? sysWrite('/sys/bus/usb/drivers/usb/bind', usbId) : sysWrite(`/sys/bus/usb/devices/${usbId}/authorized`, '1')
 const deviceOfUuid = async (uuid: string) => (await sh('lsblk -rno NAME,UUID')).split('\n').map(l => l.split(' ')).find(p => p[1] === uuid)?.[0] ?? ''
 const builder = () => Object.values(store().instanceDB ?? {}).find((i: any) =>
     String(i.instanceOf).startsWith('kolibri-channel-builder-') && store().diskDB[i.storedOn]?.dockedTo === ENGINE_ID) as any
@@ -117,7 +126,7 @@ const nextcloud = () => Object.values(store().instanceDB ?? {}).find((i: any) =>
     store().appDB[i.instanceOf]?.usbMount && String(i.instanceOf).startsWith('nextcloud-') && i.status === 'Running' && store().diskDB[i.storedOn]?.dockedTo === ENGINE_ID) as any
 
 write(`hw-usb-sticks on ${host}: engine ${ENGINE_ID} store ${storeUrl} method=${METHOD} builder=${BUILDER}`)
-check((await sh('cat /proc/filesystems')).split('\n').some(l => l.trim().endsWith('exfat')) || !!(await sh('modinfo exfat 2>/dev/null | head -1')), 'kernel exfat driver available (no exfat-fuse)')
+check((await sh('cat /proc/filesystems')).split('\n').some(l => l.trim().endsWith('exfat')) || !!(await sh('/usr/sbin/modinfo -n exfat 2>/dev/null || ls /lib/modules/$(uname -r)/kernel/fs/exfat 2>/dev/null')), 'kernel exfat driver available (no exfat-fuse)')
 check((await sh(`stat -c '%U:%G %a' ${USB_ROOT}`)) === 'pi:pi 755', `${USB_ROOT} is pi:pi 0755 (tmpfiles.d idea-usb.conf)`)
 
 for (const s of sticks) {
@@ -126,6 +135,9 @@ for (const s of sticks) {
     const r = resolveStick(exp, await collectBlockFacts())
     if (!r.ok) { check(false, `${s.name}: stick identified`, (r as any).reason); continue }
     write(`PASS  ${s.name}: stick ${r.disk} on USB ${r.usbId}`)
+    // uuids[1..] are other partitions on the same disk that must stay up (e.g. an Engine
+    // disk next to the stick partition): only a partition-level uevent may then be used
+    if (s.uuids.length > 1 && METHOD !== 'partition-uevent') { check(false, `${s.name}: shares its disk with ${s.uuids.slice(1).join(', ')}`, 'only --method partition-uevent may be used'); continue }
     const uuid = s.uuids[0]
     let dev = await deviceOfUuid(uuid)
     const stickId = `usb-${uuid}`
@@ -133,8 +145,8 @@ for (const s of sticks) {
     check(/^[0-9a-f]{64}$/.test(before), `${s.name}: image checksum before`, before)
 
     let off = logOffset()
-    await unplug(r.usbId); await waitFor('stick gone', () => !usbSticks().some(x => x.stickId === stickId)); await sleep(2000)
-    await plug(r.usbId)
+    await unplug(r.usbId, dev); await waitFor('stick gone', () => !usbSticks().some(x => x.stickId === stickId)); await sleep(2000)
+    await plug(r.usbId, dev)
     const seen = await waitFor('Engine.usbSticks entry', () => usbSticks().some(x => x.stickId === stickId))
     check(seen, `${s.name}: in Engine.usbSticks after plug`)
     dev = await deviceOfUuid(uuid)
@@ -173,7 +185,7 @@ for (const s of sticks) {
             } else info(`builder ${b.id} is ${b.status}, not Docked: auto-start-from-Docked check needs a fresh dock of the builder disk`)
             h.change((doc: any) => { doc.engineDB[ENGINE_ID].commands.push(`stopInstance ${builder().name} ${builder().storedOn}`) })
             await waitFor('builder Stopped', () => builder()?.status === 'Stopped', 120000)
-            await unplug(r.usbId); await waitFor('gone', () => !usbSticks().some(x => x.stickId === stickId)); await sleep(2000); await plug(r.usbId)
+            await unplug(r.usbId, dev); await waitFor('gone', () => !usbSticks().some(x => x.stickId === stickId)); await sleep(2000); await plug(r.usbId, dev)
             await waitFor('back', () => usbSticks().some(x => x.stickId === stickId)); await sleep(5000)
             check(builder()?.status === 'Stopped', `${s.name}: operator-stopped builder stays Stopped on plug`)
             check(usbSticks().find(x => x.stickId === stickId)?.builderAutoStart === 'operatorStopped', `${s.name}: builderAutoStart operatorStopped`)
@@ -183,14 +195,14 @@ for (const s of sticks) {
 
     off = logOffset()
     const mp2 = `${USB_ROOT}/${dev}`
-    await unplug(r.usbId)
+    await unplug(r.usbId, dev)
     check(await waitFor('removed from store', () => !usbSticks().some(x => x.stickId === stickId)), `${s.name}: removed from Engine.usbSticks on unplug`)
     await waitFor('mount gone', async () => !(await sh(`findmnt -rn -M ${mp2}`)))
     check(!(await sh(`findmnt -rn -M ${mp2}`)) && !(await sh(`findmnt -rn -S /dev/${dev}`)), `${s.name}: no mount by target or source`)
     check(!fs.existsSync(mp2), `${s.name}: ${mp2} removed`)
     const json2 = (() => { try { return JSON.parse(fs.readFileSync(`${USB_ROOT}/.idea-usb.json`, 'utf8')) } catch { return null } })()
     check(!!json2 && !json2.sticks.some((x: any) => x.device === dev), `${s.name}: gone from .idea-usb.json`)
-    await plug(r.usbId)
+    await plug(r.usbId, dev)
     await waitFor('re-plugged', async () => !!(await deviceOfUuid(uuid)))
     dev = await deviceOfUuid(uuid)
     await waitFor('mounted again', () => usbSticks().some(x => x.stickId === stickId))
