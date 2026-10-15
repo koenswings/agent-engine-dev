@@ -33,3 +33,31 @@ describe('idea#184 install wiring', () => {
         }
     })
 })
+
+describe('idea#184 --no-rename tool and real deps', () => {
+    it('sticker-name.ts never renames the system', () => {
+        const s = read('script/sticker-name.ts')
+        expect(s).toMatch(/no-rename/)
+        expect(s).not.toMatch(/hostnamectl|setHostname|\/etc\/hosts|tailscale set/)
+    })
+    it('installAvahi installs avahi-utils (LAN check needs avahi-resolve-host-name)', () => {
+        expect(read('src/data/Engine.ts')).toMatch(/apt install avahi-daemon avahi-utils libnss-mdns/)
+    })
+    it('real deps write a custom sticker file without sudo and warn when avahi-utils is missing', async () => {
+        const { realStickerNameDeps } = await import('../../src/install/stickerName.js')
+        const cmds: string[] = []
+        const logs: string[] = []
+        const exec = async (strings: TemplateStringsArray, ...vals: any[]) => {
+            const c = strings.reduce((a, s, i) => a + s + (i < vals.length ? vals[i] : ''), '')
+            cmds.push(c)
+            return { stdout: c.includes('avahi-resolve-host-name') ? 'NO-AVAHI-UTILS\n' : '' }
+        }
+        const d = realStickerNameDeps(exec, { stickerFile: '/tmp/x/sticker-name', log: (m) => logs.push(m), peers: [] })
+        await d.persist('brave-otter')
+        expect(cmds.at(-1)).not.toMatch(/sudo/)
+        expect(cmds.at(-1)).toMatch(/\/tmp\/x\/sticker-name/)
+        expect(await d.lanTaken('brave-otter')).toBe(false)
+        expect(await d.lanTaken('calm-otter')).toBe(false)
+        expect(logs.filter((l) => /avahi-utils/.test(l)).length).toBe(1)
+    })
+})

@@ -486,7 +486,7 @@ export const setHostname = async (exec: any, hostname: string) => {
 export const installAvahi = async (exec: any) => {
   print(chalk.blue('Installing Avahi for .local mDNS discovery...'));
   try {
-    await exec`sudo apt install avahi-daemon libnss-mdns -y`;
+    await exec`sudo apt install avahi-daemon avahi-utils libnss-mdns -y`;
     await exec`sudo systemctl enable avahi-daemon`;
     await exec`sudo systemctl start avahi-daemon`;
   } catch (e) {

@@ -86,28 +86,51 @@ export const stickerText = (name: string, consolePort: number): string => {
 // Real dependencies (Pi). `exec` is zx `$` locally or the ssh wrapper remotely.
 // ---------------------------------------------------------------------------
 
-export const realStickerNameDeps = (exec: any, opts: { peers?: string[], log?: (m: string) => void } = {}): StickerNameDeps => ({
-    log: opts.log ?? ((m) => console.log(chalk.yellow(m))),
+/** tailscale and avahi tools live in /usr/sbin and /usr/bin; a non-login ssh PATH may lack /usr/sbin. */
+const TOOL_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+export interface RealDepsOpts {
+    peers?: string[]
+    log?: (m: string) => void
+    /** Where the chosen name is kept (default /etc/idea/sticker-name). A non-default
+     *  path is written without sudo (used by script/sticker-name.ts --no-rename). */
+    stickerFile?: string
+}
+
+export const realStickerNameDeps = (exec: any, opts: RealDepsOpts = {}): StickerNameDeps => {
+    const file = opts.stickerFile ?? STICKER_NAME_FILE
+    const log = opts.log ?? ((m: string) => console.log(chalk.yellow(m)))
+    let avahiWarned = false
+    return {
+    log,
     readPersisted: async () => {
-        try { return (await exec`cat ${STICKER_NAME_FILE} 2>/dev/null || true`).stdout.trim() || null } catch { return null }
+        try { return (await exec`cat ${file} 2>/dev/null || true`).stdout.trim() || null } catch { return null }
     },
     persist: async (name) => {
-        await exec`sudo mkdir -p /etc/idea && echo ${name} | sudo tee ${STICKER_NAME_FILE} > /dev/null`
+        if (file === STICKER_NAME_FILE) await exec`sudo mkdir -p /etc/idea && echo ${name} | sudo tee ${file} > /dev/null`
+        else await exec`mkdir -p "$(dirname ${file})" && echo ${name} > ${file}`
     },
     lanTaken: async (name) => {
         try {
-            const r = await exec`timeout 5 avahi-resolve-host-name -4 ${name + '.local'} 2>/dev/null || true`
-            return r.stdout.trim().length > 0
+            const r = await exec`PATH=${TOOL_PATH}; if command -v avahi-resolve-host-name >/dev/null 2>&1; then timeout 5 avahi-resolve-host-name -4 ${name + '.local'} 2>/dev/null || true; else echo NO-AVAHI-UTILS; fi`
+            const out = r.stdout.trim()
+            if (out === 'NO-AVAHI-UTILS') {
+                if (!avahiWarned) log('WARNING: avahi-resolve-host-name missing (apt install avahi-utils); name NOT checked on the LAN')
+                avahiWarned = true
+                return false
+            }
+            return out.length > 0
         } catch { return false }
     },
     storeNames: async () => storeNamesFromPeers(opts.peers ?? await lanEnginePeers(exec)),
     tailnetNames: async () => {
         try {
-            const r = await exec`command -v tailscale >/dev/null 2>&1 && timeout 10 tailscale status --json 2>/dev/null || true`
+            const r = await exec`PATH=${TOOL_PATH}; command -v tailscale >/dev/null 2>&1 && timeout 10 tailscale status --json 2>/dev/null || true`
             return parseTailscaleStatusNames(r.stdout)
         } catch { return { names: [], checked: false } }
     },
-})
+    }
+}
 
 /**
  * Hostnames from `tailscale status --json` (read-only). Only counts when the
@@ -135,7 +158,7 @@ export const parseTailscaleStatusNames = (out: string): { names: string[], check
 /** Hostnames of Engines advertising on the LAN (ciao service, TXT name=...). */
 export const lanEnginePeers = async (exec: any): Promise<string[]> => {
     try {
-        const r = await exec`timeout 6 avahi-browse -atrp 2>/dev/null || true`
+        const r = await exec`PATH=${TOOL_PATH}; timeout 6 avahi-browse -atrp 2>/dev/null || true`
         return parseAvahiEngineNames(r.stdout)
     } catch { return [] }
 }
@@ -173,6 +196,6 @@ export const storeNamesFromPeers = async (peers: string[], port = 80): Promise<{
     return { names: peers, checked: false }
 }
 
-export const writeStickerFile = async (exec: any, text: string) => {
-    try { await exec`echo ${text} > /home/pi/STICKER.txt` } catch { /* best effort */ }
+export const writeStickerFile = async (exec: any, text: string, path = '/home/pi/STICKER.txt') => {
+    try { await exec`echo ${text} > ${path}` } catch { /* best effort */ }
 }
