@@ -21,6 +21,10 @@
 #                validates subcommand, device, instance id, archive, host and paths itself
 #                (src/utils/appDataHelper.ts, src/utils/rsync.ts rsyncInstanceData:
 #                size/copy/send/receive/delete/borg-* of app INSTANCE data as root)
+#   usb sticks   src/data/UsbSticks.ts (idea#193): teacher FAT/exFAT sticks, typed,
+#                read-only, exactly these options, only under /run/idea-usb (never
+#                /disks). /run/idea-usb is pi:pi 0755 from /etc/tmpfiles.d/idea-usb.conf,
+#                so the mount point folders need no sudo. umount -l only when busy.
 #
 # The code runs `sudo /usr/bin/tee /disks/<device>/META.yaml > /dev/null` with the
 # YAML on stdin, so sudo sees exactly "/usr/bin/tee /disks/<device>/META.yaml", and
@@ -31,6 +35,8 @@
 # points to. The ':' is escaped as '\:' because it is special in sudoers.
 # Patterns are narrow on purpose (sd[a-z][12], never /disks/*): in sudoers a '*' in
 # arguments also matches spaces, '/' and '..'. tee without -a truncates the file.
+# In the stick mount lines ',' and '=' inside -o are escaped as '\,' and '\=' (sudoers
+# special characters); sudo matches them as plain ',' and '='.
 # Paths are for Raspberry Pi OS (merged /usr).
 pi ALL=(root) NOPASSWD: /usr/bin/tee /disks/sd[a-z][12]/META.yaml
 pi ALL=(root) NOPASSWD: /usr/bin/rmdir /disks/sd[a-z][12]
@@ -38,3 +44,9 @@ pi ALL=(root) NOPASSWD: /usr/bin/chown -h pi\:pi /disks/sd[a-z][12]
 pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-erase-disk
 pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-app-data
 pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]
+pi ALL=(root) NOPASSWD: /usr/bin/mount -t vfat -o ro\,nosuid\,nodev\,noexec\,uid\=1000\,gid\=1000\,fmask\=0222\,dmask\=0222\,iocharset\=utf8\,shortname\=mixed /dev/sd[a-z][12] /run/idea-usb/sd[a-z][12]
+pi ALL=(root) NOPASSWD: /usr/bin/mount -t vfat -o ro\,nosuid\,nodev\,noexec\,uid\=1000\,gid\=1000\,fmask\=0222\,dmask\=0222\,iocharset\=utf8\,shortname\=mixed /dev/sd[a-z] /run/idea-usb/sd[a-z]
+pi ALL=(root) NOPASSWD: /usr/bin/mount -t exfat -o ro\,nosuid\,nodev\,noexec\,uid\=1000\,gid\=1000\,fmask\=0222\,dmask\=0222\,iocharset\=utf8 /dev/sd[a-z][12] /run/idea-usb/sd[a-z][12]
+pi ALL=(root) NOPASSWD: /usr/bin/mount -t exfat -o ro\,nosuid\,nodev\,noexec\,uid\=1000\,gid\=1000\,fmask\=0222\,dmask\=0222\,iocharset\=utf8 /dev/sd[a-z] /run/idea-usb/sd[a-z]
+pi ALL=(root) NOPASSWD: /usr/bin/umount /run/idea-usb/sd[a-z][12], /usr/bin/umount /run/idea-usb/sd[a-z]
+pi ALL=(root) NOPASSWD: /usr/bin/umount -l /run/idea-usb/sd[a-z][12], /usr/bin/umount -l /run/idea-usb/sd[a-z]

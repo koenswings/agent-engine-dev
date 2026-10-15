@@ -1411,7 +1411,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
       Number(readyPort) || 0,
       `${mountRoot}/instances/${instance.id}`,
     )
-    if (composeEnv) {
+    if (composeEnv && store.appDB[instance.instanceOf]?.filesMount) {
       // filesMounts only after success — read back from the override we just wrote
       const { mountableFilesDisks } = await import('./FilesMount.js')
       mountedDiskIds = mountableFilesDisks(store).map(d => d.id)
@@ -1434,6 +1434,11 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
 
   print(chalk.green(`App ${instance.id} running`))
   clearStep(storeHandle, instance.id)
+  // idea#193 §4: reconcile USB stick storages once the App runs (x-app.usbMount.sync)
+  if (storeHandle.doc()?.appDB?.[instance.instanceOf]?.usbMount?.sync) {
+    const { syncUsbApps } = await import('./UsbSticks.js')
+    void syncUsbApps(storeHandle, 'start', true, instance.id)
+  }
 
   // App-specific post-processing commands
   // If the app on which the instance is based is nextcloud, 
