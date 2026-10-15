@@ -29,8 +29,8 @@ export interface Settings {
     peerAccess?: boolean;         // Per-Pi Engine keys for cross-Engine copy (default: on unless isDev || testMode). See peerAccessEnabled().
     peerStaleHours?: number;      // A peer Engine without a heartbeat for this long loses its key here (default 168 = 7 days). See peerStaleMs().
     autoStartChannelBuilder?: boolean; // Start the docked kolibri-channel-builder when a stick with a kolibri folder is mounted (idea#193 §8.2a; default true). See autoStartChannelBuilder().
-    usbRoot?: string;
-    ideaLocal?: boolean;          // Publish the shared name idea.local via avahi D-Bus when mdns is on (idea#203; default true). See monitors/ideaLocal.ts.             // Mount root for teacher USB sticks (default /run/idea-usb; IDEA_USB_ROOT wins). Tests point this at a temp folder. See usbRoot().
+    usbRoot?: string;             // Mount root for teacher USB sticks (default /run/idea-usb; IDEA_USB_ROOT wins). Tests point this at a temp folder. See usbRoot().
+    ideaLocal?: boolean;          // Publish the shared name idea.local via avahi D-Bus when mdns is on (idea#203; default true). See monitors/ideaLocal.ts.
 }
 
 export interface Defaults {
