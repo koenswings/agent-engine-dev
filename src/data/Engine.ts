@@ -118,13 +118,15 @@ export interface EraseInProgress {
  *   instanceIdArgs: startInstance, runInstance, stopInstance, copyApp, moveApp,
  *               backupApp and restoreApp take an instance id (idea#168); a name
  *               still works when it is unambiguous.
+ *   unknownDiskReadOnly: a disk without IDEA META.yaml is never mounted read-write
+ *               and never gets a META.yaml (idea#201 §10 rule 1).
  * Written at every startup as a whole new list, with capabilitiesBootedAt set
  * to that startup's lastBooted. A Console counts a capability only when
  * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly']
 
 import { config } from './Config.js';
 
