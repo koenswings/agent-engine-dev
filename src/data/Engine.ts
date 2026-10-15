@@ -330,7 +330,7 @@ export const buildEngine = async (args: any) => {
   if (upgrade) await upgradeSystem(exec);
 
   await setHostname(exec, hostname);
-  await installAvahi(exec);
+  await installAvahi(exec, enginePath);
   await installDhcpVendorClass(exec, enginePath);
   await localiseSystem(exec, enginePath, language, keyboard, timezone);
   await installCrontabs(exec, enginePath);
@@ -552,12 +552,21 @@ export const installDhcpVendorClass = async (exec: any, enginePath: string) => {
   }
 }
 
-export const installAvahi = async (exec: any) => {
+/** Installed copy of script/build_image_assets/idea-avahi-lan-only (idea#203). */
+export const AVAHI_LAN_ONLY_HELPER = '/usr/local/sbin/idea-avahi-lan-only'
+export const AVAHI_CONF = '/etc/avahi/avahi-daemon.conf'
+
+export const installAvahi = async (exec: any, enginePath: string) => {
   print(chalk.blue('Installing Avahi for .local mDNS discovery...'));
   try {
     await exec`sudo apt install avahi-daemon libnss-mdns -y`;
+    // LAN only (idea#203): allow-interfaces=eth0,wlan0 under [server], so <host>.local
+    // never resolves to a docker bridge (idea03.local -> 172.21.0.1). Idempotent; the
+    // helper backs the conf up to avahi-daemon.conf.idea-bak-<UTC> before any change.
+    await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-avahi-lan-only ${AVAHI_LAN_ONLY_HELPER}`;
+    await exec`sudo ${AVAHI_LAN_ONLY_HELPER} ${AVAHI_CONF}`;
     await exec`sudo systemctl enable avahi-daemon`;
-    await exec`sudo systemctl start avahi-daemon`;
+    await exec`sudo systemctl restart avahi-daemon`;
   } catch (e) {
     print(chalk.red('Error installing Avahi'));
     console.error(e);

@@ -8,6 +8,7 @@ import { config, peerAccessEnabled, peerStaleMs } from './data/Config.js'
 import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
 import { enableHttpMonitor } from './monitors/httpMonitor.js'
+import { enableIdeaLocalPublisher, IdeaLocalPublisher } from './monitors/ideaLocal.js'
 import { DocumentId, Repo } from '@automerge/automerge-repo'
 import { startAutomergeServer } from './repo.js'
 import { enableMulticastDNSEngineMonitor } from './monitors/mdnsMonitor.js'
@@ -166,7 +167,8 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
 
     // Start the HTTP server (serves Console UI + /api/store-url)
     log(chalk.bgMagenta('STARTING HTTP SERVER'))
-    const httpServer = enableHttpMonitor(undefined, undefined, commandLogHandle)
+    // idea#203: http://idea.local (port 80) must reach this Engine's Console even when httpPort is not 80
+    const httpServer = enableHttpMonitor(undefined, undefined, commandLogHandle, config.settings.ideaLocalHttpPort ?? 80, { engineId: String(localEngineId) })
 
     // Start the instances monitor
     // log(chalk.bgMagenta('STARTING INSTANCES MONITOR'))
@@ -187,6 +189,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         // this will be fired when you kill the app with ctrl + c.
         log('Shutting down automerge')
         log('*** SIGINT received ****');
+        await ideaLocalPublisher?.stop().catch(() => {})
         await shutdownProcedure(repo, httpServer, mdnsHandle)
         process.exit(0)
     })
@@ -194,6 +197,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         // this will be fired by the Linux shutdown command
         log('Shutting down automerge')
         log('*** SIGTERM received ****');
+        await ideaLocalPublisher?.stop().catch(() => {})
         await shutdownProcedure(repo, httpServer, mdnsHandle)
         process.exit(0)
     })
@@ -204,10 +208,16 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
 
     const configMDNS = config.settings.mdns
     let mdnsHandle: { end: () => Promise<void> } | undefined
+    let ideaLocalPublisher: IdeaLocalPublisher | undefined
     if (!disableMDNS && configMDNS) {
         await sleep(1000)
         log(chalk.bgMagenta('STARTING MULTICAST DNS MONITOR'))
         mdnsHandle = enableMulticastDNSEngineMonitor(storeHandle, repo)
+        // idea#203: every Engine competes for the shared name idea.local (one holder, takeover)
+        if (config.settings.ideaLocal !== false) {
+            log(chalk.bgMagenta('STARTING idea.local PUBLISHER'))
+            ideaLocalPublisher = enableIdeaLocalPublisher()
+        }
     }
 
     // Opt-in static peer list (IDEA_STATIC_PEERS / settings.staticPeers): dials
