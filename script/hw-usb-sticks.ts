@@ -14,7 +14,8 @@
  *       (kernel exfat driver present: /proc/filesystems lists exfat)
  *    4. recorded files: sha256 matches through the mount; a write as pi fails
  *    5. /run/idea-usb/.idea-usb.json lists the stick ({"sticks":[{device,displayName,label,…}]})
- *    6. never a diskDB entry; the drive is still in Engine.unformattedDisks (erase offered)
+ *    6. never a diskDB entry; the drive is in Engine.unformattedDisks (erase offered),
+ *       or, when the drive also carries an ext4 partition (App Disk), NOT in it
  *    7. a Running Nextcloud with x-app.usbMount on this Engine sees /mnt/idea-usb/<dev>
  *       (docker exec ls) and the Engine log shows the usb-sync.sh call
  *    8. channel builder (§8.2a, only with --builder): a kolibri stick with the builder
@@ -41,7 +42,7 @@ import { $, fs, sleep } from 'zx'
 import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { collectBlockFacts, resolveStick, StickExpectation } from './hw-roundtrip-guard.js'
+import { collectBlockFacts, resolveStick, StickExpectation, diskHasExt4, unformattedExpectation } from './hw-roundtrip-guard.js'
 
 $.verbose = false
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -164,7 +165,12 @@ for (const s of sticks) {
     const json = (() => { try { return JSON.parse(fs.readFileSync(`${USB_ROOT}/.idea-usb.json`, 'utf8')) } catch { return null } })()
     check(!!json?.sticks?.some((x: any) => x.device === dev && x.displayName === e.displayName && x.label === e.label), `${s.name}: .idea-usb.json lists it`)
     check(!Object.values(store().diskDB ?? {}).some((d: any) => d.device === dev && d.dockedTo === ENGINE_ID), `${s.name}: no diskDB entry`)
-    check((store().engineDB[ENGINE_ID].unformattedDisks ?? []).some((u: any) => u.device === r.disk), `${s.name}: still in unformattedDisks (erase offered)`)
+    {
+        const listed = (store().engineDB[ENGINE_ID].unformattedDisks ?? []).some((u: any) => u.device === r.disk)
+        const hasExt4 = diskHasExt4(await sh(`lsblk -J -o NAME,FSTYPE /dev/${r.disk}`), r.disk)
+        const u = unformattedExpectation(hasExt4, listed)
+        check(u.ok, `${s.name}: ${u.label}`, `listed=${listed} ext4=${hasExt4}`)
+    }
     const nc = nextcloud()
     if (nc) {
         const ls = await sh(`docker exec ${nc.id}-nextcloud-app-1 ls /mnt/idea-usb/${dev}`)
