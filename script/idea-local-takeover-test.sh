@@ -19,10 +19,21 @@
 #       scheduled the same way. HTTP keeps answering on the old IP, so only the mDNS part is cut.
 # The client (idea02 by default) is used read-only: getaddrinfo() lookups and HTTP GETs.
 #
+# Which Engine is cut (--holder): with the lowest-IPv4 rule the lowest pool address (idea03)
+# always holds idea.local at the start, so a plain run only ever cuts idea03. --holder <host>
+# first PRODUCES that Engine as the holder, honestly, through the same mechanism a school would
+# hit: avahi-daemon on the current holder is frozen (SIGSTOP, SIGCONT scheduled with systemd-run
+# after --prep s as a safety net) until <host> answers alone on the wire, then continued; the old
+# holder's Engine (idea#203 #211 D-Bus timeout) has freed its record meanwhile and rejoins as a
+# waiter. <host> must then be the only responder on 2 consecutive raw queries within --converge s
+# and avahi must be running again on the old holder, or the run stops (exit 3) before any cut.
+# --prepare-only stops there (exit 0), e.g. to hand a higher-IP holder to another test.
+#
 # Usage:
 #   script/idea-local-takeover-test.sh --claim <steve-claim-id> [--mode netcut|avahi-freeze]
 #       [--pool idea01,idea03,idea04] [--client idea02] [--lan-if eth0] [--ports 80,8080]
-#       [--cut 150] [--ttl 120] [--converge 60] [--out DIR] [--dry-run] [--print-netcut]
+#       [--cut 150] [--ttl 120] [--converge 60] [--holder idea04] [--prep 30] [--prepare-only]
+#       [--out DIR] [--dry-run] [--print-netcut]
 #
 # One holder is checked ON THE WIRE, not with getaddrinfo (which returns only the first answer
 # and hid a second holder on 2026-10-15): script/idea-local-mdns-responders.py sends a raw mDNS
@@ -40,7 +51,7 @@ SSH=${SSH:-"ssh -o BatchMode=yes -o ConnectTimeout=15"}
 # Binaries on the holder (overridable only so the test can run the generated commands against a fake).
 IPT=${IPT:-/usr/sbin/iptables}; IP6T=${IP6T:-/usr/sbin/ip6tables}; NFT=${NFT:-nft}
 CLAIM=""; MODE=netcut; POOL="idea01,idea03,idea04"; CLIENT=idea02; LAN_IF=eth0; PORTS=80,8080
-CUT=150; TTL=120; CONVERGE=60; OUT=""; DRY=0; PRINT=0
+CUT=150; TTL=120; CONVERGE=60; OUT=""; DRY=0; PRINT=0; WANT_HOLDER=""; PREP=30; PREP_ONLY=0
 ALLOWED_POOL="idea01 idea03 idea04"          # never wh (wizardly-hugle) or idea02
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -54,6 +65,9 @@ while [ $# -gt 0 ]; do
     --ttl) TTL="${2:-}"; shift 2 ;;
     --converge) CONVERGE="${2:-}"; shift 2 ;;
     --out) OUT="${2:-}"; shift 2 ;;
+    --holder) WANT_HOLDER="${2:-}"; shift 2 ;;
+    --prep) PREP="${2:-}"; shift 2 ;;
+    --prepare-only) PREP_ONLY=1; shift ;;
     --dry-run) DRY=1; shift ;;
     --print-netcut) PRINT=1; shift ;;
     *) echo "refused: unknown argument $1" >&2; exit 2 ;;
@@ -77,6 +91,11 @@ for h in "${POOL_HOSTS[@]}"; do
 done
 [[ " $ALLOWED_POOL " != *" $CLIENT "* ]] || refuse "the client must not be one of the pool Engines"
 [[ "$CLIENT" != wh && "$CLIENT" != wizardly-hugle* ]] || refuse "wh is never used"
+[[ "$PREP" =~ ^[0-9]+$ ]] && [ "$PREP" -ge 5 ] && [ "$PREP" -le 120 ] || refuse "--prep must be 5-120 s"
+if [ -n "$WANT_HOLDER" ]; then
+  [[ " ${POOL_HOSTS[*]} " == *" $WANT_HOLDER "* ]] || refuse "--holder $WANT_HOLDER is not in --pool $POOL"
+fi
+[ "$PREP_ONLY" = 0 ] || [ -n "$WANT_HOLDER" ] || refuse "--prepare-only needs --holder <host>"
 
 # Cut commands on the holder (built once the arguments are checked).
 build_cut() {
@@ -96,6 +115,11 @@ else
   UNDO="pkill -CONT -x avahi-daemon; "
   DO="pkill -STOP -x avahi-daemon"
 fi
+# What was cut, for the log lines (avahi-freeze changes no firewall rule).
+if [ "$MODE" = netcut ]; then WHAT="mDNS and Console ports dropped on $LAN_IF"; UNDONE="firewall rules removed"
+else WHAT="avahi-daemon frozen (SIGSTOP)"; UNDONE="avahi-daemon continued (SIGCONT)"; fi
+# avahi-freeze: prints the stopped avahi-daemon if it is still stopped (state T), nothing when running.
+AVAHI_STOPPED="ps -o pid=,stat=,comm= -C avahi-daemon 2>/dev/null | awk '\$2 ~ /T/'; true"
 # Prints every firewall rule of ours still present (iptables + ip6tables, all tables, and the
 # raw nft ruleset), nothing when clean.
 LEFTOVER="for t in filter nat mangle raw; do sudo $IPT -w -t \$t -S 2>/dev/null; sudo $IP6T -w -t \$t -S 2>/dev/null; done | grep -F -- '$TAG'; sudo $NFT list ruleset 2>/dev/null | grep -F -- '$TAG'; true"
@@ -152,6 +176,48 @@ GAI=$(resolve_once) || { log "infra: client $CLIENT unreachable"; exit 3; }
 FIRST_PORT=${PORTS%%,*}
 code=$(rsh "$CLIENT" "curl -s -o /dev/null -m 5 -w '%{http_code}' http://idea.local:$FIRST_PORT/") || code=000
 [ "$code" = 200 ] || refuse "http://idea.local:$FIRST_PORT/ answered $code before the cut (Console must answer first)"
+
+build_cut   # defines AVAHI_STOPPED for the preparation (rebuilt before the cut)
+# ── --holder: produce the requested holder first (freeze avahi on the current one) ──
+if [ -n "$WANT_HOLDER" ] && [ "$WANT_HOLDER" != "$HOLDER" ]; then
+  PUNIT="idea203-takeover-prep-$(date +%s)"
+  PREP_CMD="sudo systemd-run --unit=$PUNIT --on-active=${PREP} /bin/sh -c 'pkill -CONT -x avahi-daemon; true' && sudo pkill -STOP -x avahi-daemon"
+  PREP_UNDO="sudo pkill -CONT -x avahi-daemon; sudo systemctl stop $PUNIT.timer 2>/dev/null; true"
+  if [ "$DRY" = 1 ]; then
+    log "DRY RUN: would first make $WANT_HOLDER the holder: on $HOLDER run: $PREP_CMD; wait for ONE ${LANIP[$WANT_HOLDER]}; then: $PREP_UNDO"
+  else
+    PREV=$HOLDER
+    trap 'rsh "$PREV" "$PREP_UNDO" >/dev/null 2>&1' EXIT
+    log "preparing: $WANT_HOLDER must hold idea.local; freezing avahi-daemon on the current holder $PREV (SIGCONT scheduled after ${PREP} s)"
+    rsh "$PREV" "$PREP_CMD" > "$OUT/prep.txt" 2>&1 || { log "infra: could not freeze avahi on $PREV: $(cat "$OUT/prep.txt")"; exit 3; }
+    T0=$(date +%s); GOT=""
+    while [ $(( $(date +%s) - T0 )) -lt "$PREP" ]; do
+      GOT=$(one_holder) && [ "$GOT" = "ONE ${LANIP[$WANT_HOLDER]}" ] && break
+      sleep 2
+    done
+    rsh "$PREV" "$PREP_UNDO" >/dev/null 2>&1; trap - EXIT
+    log "preparing: after $(( $(date +%s) - T0 )) s of the freeze, raw mDNS: $GOT; avahi-daemon continued on $PREV"
+    [ "$GOT" = "ONE ${LANIP[$WANT_HOLDER]}" ] || { log "infra: $WANT_HOLDER did not take idea.local while $PREV was frozen; not cutting anything"; exit 3; }
+    STOPPED=$(rsh "$PREV" "$AVAHI_STOPPED" 2>&1)
+    [ -z "$STOPPED" ] || { log "infra: avahi-daemon still stopped on $PREV after SIGCONT ($STOPPED)"; exit 3; }
+    T0=$(date +%s); STREAK=0
+    while [ $(( $(date +%s) - T0 )) -lt "$CONVERGE" ] && [ "$STREAK" -lt 2 ]; do
+      GOT=$(one_holder)
+      log "preparing: $PREV back, +$(( $(date +%s) - T0 )) s, raw mDNS: $GOT"
+      if [ "$GOT" = "ONE ${LANIP[$WANT_HOLDER]}" ]; then STREAK=$((STREAK + 1)); else STREAK=0; fi
+      [ "$STREAK" -ge 2 ] || sleep 3
+    done
+    [ "$STREAK" -ge 2 ] || { log "infra: $WANT_HOLDER is not the only holder within ${CONVERGE} s after $PREV came back (last: $GOT); not cutting anything"; exit 3; }
+    HOLDER=$WANT_HOLDER
+    sleep 2
+    GAI=$(resolve_once)
+    [ "$GAI" = "${LANIP[$HOLDER]}" ] || { log "infra: getaddrinfo on $CLIENT gives '$GAI', expected ${LANIP[$HOLDER]}"; exit 3; }
+    code=$(rsh "$CLIENT" "curl -s -o /dev/null -m 5 -w '%{http_code}' http://idea.local:$FIRST_PORT/") || code=000
+    [ "$code" = 200 ] || { log "infra: http://idea.local:$FIRST_PORT/ answered $code with $HOLDER as holder"; exit 3; }
+    log "prepared: $HOLDER (${LANIP[$HOLDER]}) is the only holder, Console HTTP $code"
+  fi
+fi
+if [ "$PREP_ONLY" = 1 ]; then log "prepare-only: done, nothing cut"; exit 0; fi
 log "holder before cut: $HOLDER (${LANIP[$HOLDER]}), Console HTTP $code"
 OTHERS=(); for h in "${POOL_HOSTS[@]}"; do [ "$h" != "$HOLDER" ] && OTHERS+=("$h"); done
 
@@ -165,7 +231,7 @@ if [ "$DRY" = 1 ]; then
   exit 0
 fi
 
-restore() { rsh "$HOLDER" "$RESTORE" >/dev/null 2>&1; log "restored $HOLDER (rules removed / avahi continued)"; }
+restore() { rsh "$HOLDER" "$RESTORE" >/dev/null 2>&1; log "restored $HOLDER ($UNDONE)"; }
 trap restore EXIT
 
 # ── Poll on the client (read-only), 2 Hz, for CUT+10 s ─────────────────────
@@ -187,7 +253,7 @@ POLLPID=$!
 sleep 5
 T_CUT=$(date +%s.%N)
 rsh "$HOLDER" "$CUTCMD" > "$OUT/cut.txt" 2>&1 || { log "infra: cut failed on $HOLDER: $(cat "$OUT/cut.txt")"; exit 3; }
-log "CUT on $HOLDER at $(date +%T) (+5 s into the poll)"
+log "CUT on $HOLDER at $(date +%T) (+5 s into the poll): $WHAT"
 wait $POLLPID
 restore; trap - EXIT
 T_RESTORE=$(date +%s)
@@ -201,8 +267,14 @@ if [ -n "$LEFT" ]; then
   log "after the second undo: ${LEFT2:-no rules left}"
   LEFTOVER_FAIL=1
 else
-  log "netcut undo: no rule tagged $TAG left on $HOLDER (iptables, ip6tables, nft)"
+  if [ "$MODE" = netcut ]; then log "netcut undo: no rule tagged $TAG left on $HOLDER (iptables, ip6tables, nft)"
+  else log "avahi-freeze: no firewall rule tagged $TAG on $HOLDER (none is added in this mode)"; fi
   LEFTOVER_FAIL=0
+fi
+if [ "$MODE" = avahi-freeze ]; then
+  STOPPED=$(rsh "$HOLDER" "$AVAHI_STOPPED" 2>&1)
+  if [ -n "$STOPPED" ]; then log "FAIL: avahi-daemon still stopped on $HOLDER after the restore ($STOPPED)"; LEFTOVER_FAIL=1
+  else log "avahi-freeze undo: avahi-daemon running on $HOLDER"; fi
 fi
 # ── After restore: exactly one responder on the wire, twice in a row, within --converge s ──
 CONV=FAIL; STREAK=0; LAST=""

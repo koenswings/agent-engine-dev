@@ -221,3 +221,69 @@ describe('idea-local-mdns-responders.py command line (idea#203)', () => {
         expect(py('--pool').status).toBe(2)
     })
 })
+
+describe('--holder: produce the higher-IP holder before the cut (idea#203 run2 only ever cut idea03)', () => {
+    const FAKE = path.join(process.cwd(), 'test/fixtures/idea-local-takeover-fake-ssh.sh')
+    const runFake = async (extraEnv: Record<string, string>, ...args: string[]) => {
+        const d = await fs.mkdtemp(path.join(os.tmpdir(), 'idea203-hold-'))
+        fs.writeFileSync(path.join(d, 'holder'), 'idea03\n')
+        const r = spawnSync('bash', [SCRIPT, '--claim', 'c1', '--pool', 'idea03,idea04', '--out', path.join(d, 'out'), ...args], {
+            encoding: 'utf8', env: { ...process.env, SSH: FAKE, FAKE_DIR: d, ...extraEnv },
+        })
+        const cmds = fs.existsSync(path.join(d, 'cmds')) ? fs.readFileSync(path.join(d, 'cmds'), 'utf8') : ''
+        const out = r.stdout; await fs.remove(d)
+        return { code: r.status, out, cmds, err: r.stderr }
+    }
+    it('refuses a --holder outside the pool, a bad --prep, and --prepare-only without --holder', () => {
+        expect(run('--claim', 'c1', '--pool', 'idea03,idea04', '--holder', 'idea01').err).toMatch(/not in --pool/)
+        expect(run('--claim', 'c1', '--holder', 'idea04', '--prep', '1').err).toMatch(/--prep must be 5-120/)
+        expect(run('--claim', 'c1', '--prepare-only').err).toMatch(/--prepare-only needs --holder/)
+    })
+    it('freezes avahi on the current holder (idea03) until idea04 alone answers, continues it, checks one holder twice, cuts nothing', async () => {
+        const r = await runFake({}, '--holder', 'idea04', '--prepare-only', '--prep', '5', '--converge', '10')
+        expect(r.code).toBe(0)
+        expect(r.out).toMatch(/freezing avahi-daemon on the current holder idea03/)
+        expect(r.out).toMatch(/prepared: idea04 \(10\.99\.0\.14\) is the only holder, Console HTTP 200/)
+        const lines = r.cmds.split('\n')
+        const stop = lines.findIndex(l => /^idea03: .*systemd-run --unit=idea203-takeover-prep-\d+ --on-active=5 .*pkill -CONT.*&& sudo pkill -STOP -x avahi-daemon/.test(l))
+        const cont = lines.findIndex(l => /^idea03: sudo pkill -CONT -x avahi-daemon; sudo systemctl stop idea203-takeover-prep-/.test(l))
+        expect(stop).toBeGreaterThanOrEqual(0); expect(cont).toBeGreaterThan(stop)
+        expect(r.cmds).not.toMatch(/iptables/)
+        expect(r.cmds).not.toMatch(/^idea04: .*pkill/m)
+    }, 30000)
+    it('stops with exit 3 and continues avahi when the requested holder never takes over (no cut)', async () => {
+        const r = await runFake({ FAKE_NO_TAKEOVER: '1' }, '--holder', 'idea04', '--prep', '5', '--converge', '10')
+        expect(r.code).toBe(3)
+        expect(r.out).toMatch(/idea04 did not take idea.local while idea03 was frozen; not cutting anything/)
+        expect(r.cmds).toMatch(/^idea03: sudo pkill -CONT -x avahi-daemon/m)
+        expect(r.cmds).not.toMatch(/iptables -w -I/)
+    }, 30000)
+    it('no preparation when the requested holder already holds the name; dry run prints the preparation', async () => {
+        const same = await runFake({}, '--holder', 'idea03', '--dry-run')
+        expect(same.code).toBe(0); expect(same.out).not.toMatch(/preparing/)
+        const dry = await runFake({}, '--holder', 'idea04', '--dry-run')
+        expect(dry.code).toBe(0)
+        expect(dry.out).toMatch(/DRY RUN: would first make idea04 the holder: on idea03 run: .*pkill -STOP/)
+        expect(dry.cmds).not.toMatch(/pkill/)
+    }, 30000)
+})
+
+describe('avahi-freeze wording and undo check (idea#203 run3 said "rules removed" and "netcut undo")', () => {
+    it('log lines name what was cut and undone per mode', () => {
+        const src = fs.readFileSync(SCRIPT, 'utf8')
+        expect(src).toMatch(/WHAT="avahi-daemon frozen \(SIGSTOP\)"; UNDONE="avahi-daemon continued \(SIGCONT\)"/)
+        expect(src).toMatch(/restored \$HOLDER \(\$UNDONE\)/)
+        expect(src).not.toMatch(/rules removed \/ avahi continued/)
+        expect(src).toMatch(/avahi-freeze: no firewall rule tagged/)
+        expect(src).toMatch(/FAIL: avahi-daemon still stopped on \$HOLDER after the restore/)
+    })
+    it('the stopped-avahi check prints a stopped daemon and nothing for a running one', () => {
+        const r = spawnSync('bash', [SCRIPT, '--claim', 'c1', '--mode', 'avahi-freeze', '--print-netcut'], { encoding: 'utf8', env: { ...process.env, SSH: 'false' } })
+        expect(r.status).toBe(0)
+        const src = fs.readFileSync(SCRIPT, 'utf8')
+        const cmd = src.match(/^AVAHI_STOPPED="(.*)"$/m)![1].replace(/\\\$/g, '$')
+        const awk = cmd.split('|')[1].replace(/; true$/, '').trim()
+        const t = spawnSync('bash', ['-c', `printf '  123 T avahi-daemon\\n  124 Ss avahi-daemon\\n' | ${awk}`], { encoding: 'utf8' })
+        expect(t.stdout.trim()).toBe('123 T avahi-daemon')
+    })
+})
