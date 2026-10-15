@@ -112,7 +112,10 @@ if [ "$MODE" = netcut ]; then
   UNDO=""; for r in "${RULES[@]}"; do UNDO+="while $IPT -w -C $r 2>/dev/null; do $IPT -w -D $r || break; done; "; done
   DO="";   for r in "${RULES[@]}"; do DO+="$IPT -w -I $r && "; done; DO+="true"
 else
-  UNDO="pkill -CONT -x avahi-daemon; "
+  # The first undo to run (the timer, or the script's restore) records when avahi got SIGCONT,
+  # so the analysis can place the resume on the client's poll (see RESUME_GRACE).
+  RESUMED="/run/$UNIT.resumed"
+  UNDO="pkill -CONT -x avahi-daemon; test -e $RESUMED || date +%s.%N > $RESUMED; "
   DO="pkill -STOP -x avahi-daemon"
 fi
 # What was cut, for the log lines (avahi-freeze changes no firewall rule).
@@ -123,7 +126,10 @@ AVAHI_STOPPED="ps -o pid=,stat=,comm= -C avahi-daemon 2>/dev/null | awk '\$2 ~ /
 # Prints every firewall rule of ours still present (iptables + ip6tables, all tables, and the
 # raw nft ruleset), nothing when clean.
 LEFTOVER="for t in filter nat mangle raw; do sudo $IPT -w -t \$t -S 2>/dev/null; sudo $IP6T -w -t \$t -S 2>/dev/null; done | grep -F -- '$TAG'; sudo $NFT list ruleset 2>/dev/null | grep -F -- '$TAG'; true"
-SCHEDULE="sudo systemd-run --unit=$UNIT --on-active=${CUT} /bin/sh -c '$UNDO true'"
+# systemd-run passes the command line as is (no %-specifier expansion; checked on idea03 20:08).
+# AccuracySec: a timer's default 1 min accuracy fired the undo up to a minute late (idea03 20:08),
+# i.e. after the client poll ended, so the avahi-freeze resume would not be observed.
+SCHEDULE="sudo systemd-run --unit=$UNIT --on-active=${CUT} --timer-property=AccuracySec=100ms /bin/sh -c '$UNDO true'"
 CUTCMD="$SCHEDULE && sudo sh -c '$DO'"
 RESTORE="sudo sh -c '$UNDO true'; sudo systemctl stop $UNIT.timer 2>/dev/null; true"
 
@@ -238,6 +244,7 @@ trap restore EXIT
 rsh "$CLIENT" "python3 - $((CUT + 10)) $FIRST_PORT" > "$OUT/poll.csv" <<'PY' &
 import socket, sys, time, urllib.request
 dur, port = float(sys.argv[1]), int(sys.argv[2]); t0 = time.time()
+print('# t0 %.3f' % t0, flush=True)
 while time.time() - t0 < dur:
     t = time.time()
     try: ip = '+'.join(sorted({a[4][0] for a in socket.getaddrinfo('idea.local', 80, socket.AF_INET, socket.SOCK_STREAM)}))
@@ -293,8 +300,27 @@ rsh "$HOLDER" "grep -h '\\[idea.local\\]' ~/.pm2/logs/engine-out*.log 2>/dev/nul
 log "after restore: idea.local -> $AFTER (expect exactly one pool address)"
 
 # ── Analyse ─────────────────────────────────────────────────────────────────
+# avahi-freeze ONLY (Steve, idea#203, 2026-10-15): the dead IP may appear for at most
+# RESUME_GRACE s right after the SIGCONT, never later. A SIGSTOPped avahi-daemon answers the
+# queries that piled up while it was frozen from memory as soon as it runs again, and sends the
+# goodbye for idea.local within ~10 ms; nothing the Engine does can stop that first burst, and a
+# real power cut cannot cause it. netcut (both directions) passes no resume and stays strict.
+RESUME_GRACE=2
+RESUME_ARGS=()
+if [ "$MODE" = avahi-freeze ]; then
+  T0=$(awk '$1 == "#" && $2 == "t0" { print $3; exit }' "$OUT/poll.csv")
+  TR=$(rsh "$HOLDER" "cat $RESUMED 2>/dev/null; sudo rm -f $RESUMED" 2>/dev/null | head -1)
+  if [ -n "$T0" ] && [ -n "$TR" ]; then
+    RS=$(python3 -c "print('%.2f' % ($TR - $T0))")
+    log "avahi-freeze: SIGCONT on $HOLDER at +$RS s into the poll (holder clock vs $CLIENT clock); dead IP allowed for ${RESUME_GRACE} s after it, never later"
+    RESUME_ARGS=("$RS" "$RESUME_GRACE")
+  else
+    log "FAIL: avahi-freeze resume time unknown (poll t0='${T0}', holder resume='${TR}'); cannot apply the ${RESUME_GRACE} s grace, judging strictly"
+    RESUME_FAIL=1
+  fi
+fi
 python3 "$(dirname "$0")/idea-local-takeover-analyse.py" "$OUT/poll.csv" 5 "${LANIP[$HOLDER]}" "$TTL" \
-  "$(for h in "${OTHERS[@]}"; do printf '%s,' "${LANIP[$h]}"; done)" | tee -a "$OUT/summary.txt"
+  "$(for h in "${OTHERS[@]}"; do printf '%s,' "${LANIP[$h]}"; done)" "${RESUME_ARGS[@]}" | tee -a "$OUT/summary.txt"
 RES=${PIPESTATUS[0]}
 if [ "$CONV" = PASS ]; then
   log "PASS: exactly one responder for idea.local on the wire ($LAST) within ${CONV_S} s of the restore (limit ${CONVERGE} s)"
@@ -303,5 +329,6 @@ else
   RES=1
 fi
 [ "$LEFTOVER_FAIL" = 0 ] || RES=1
+[ "${RESUME_FAIL:-0}" = 0 ] || RES=1
 log "results in $OUT"
 exit "$RES"
