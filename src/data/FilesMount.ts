@@ -25,6 +25,7 @@ import { DiskID, InstanceID } from './CommonTypes.js'
 import { localEngineId } from './Engine.js'
 import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
 import { log } from '../utils/utils.js'
+import { usbRoot } from './Config.js'
 
 /** Grouping window for runtime Files Disk docks (open Q2). Documented in ARCHITECTURE.md. */
 export const FILES_REMOUNT_GROUP_MS = 3_000
@@ -39,6 +40,51 @@ export interface AppFilesMount {
     path: string
     services: string[]
 }
+
+/**
+ * App.usbMount from x-app.usbMount (idea#193 §4): one static read-only bind of the
+ * Engine's USB root (/run/idea-usb) at `path` in each of `services`, with
+ * bind.propagation rslave so sticks mounted later appear without a recreate.
+ * `sync` (optional): the command the Engine runs with `docker exec` in
+ * <instanceId>-<service>-1 after each plug/unplug and at Engine start.
+ */
+export interface AppUsbMount {
+    path: string
+    services: string[]
+    sync: { service: string, user: string | null, command: string } | null
+}
+
+/** Default sync for an App binding into nextcloud-app (app-nextcloud#7 contract). */
+export const NEXTCLOUD_USB_SYNC = { service: 'nextcloud-app', user: 'www-data', command: '/idea/usb-sync.sh' } as const
+
+/** Parse x-app.usbMount; null when missing or invalid. */
+export const parseUsbMount = (xapp: any): AppUsbMount | null => {
+    const um = xapp?.usbMount
+    if (!um || typeof um !== 'object') return null
+    if (typeof um.path !== 'string' || !um.path.startsWith('/') || um.path.includes('..')) return null
+    if (!Array.isArray(um.services)) return null
+    const services = um.services.filter((s: unknown): s is string => typeof s === 'string' && s.length > 0)
+    if (services.length === 0) return null
+    let sync: AppUsbMount['sync'] = null
+    const sy = um.sync
+    if (sy && typeof sy === 'object' && typeof sy.command === 'string' && /^\/[A-Za-z0-9._\/-]+$/.test(sy.command)) {
+        const service = typeof sy.service === 'string' && sy.service ? sy.service : services[0]
+        const user = typeof sy.user === 'string' && /^[a-z_][a-z0-9_-]*$/.test(sy.user) ? sy.user : null
+        if (services.includes(service)) sync = { service, user, command: sy.command }
+    }
+    // app-nextcloud#7 declares no sync key: the Nextcloud contract is the default
+    if (!sync && !sy && services.includes(NEXTCLOUD_USB_SYNC.service)) sync = { ...NEXTCLOUD_USB_SYNC }
+    return { path: um.path, services: [...services], sync }
+}
+
+/** The usbMount bind entry for a compose override (long syntax). */
+export const usbBindEntry = (usbMount: AppUsbMount, hostRoot: string) => ({
+    type: 'bind',
+    source: hostRoot,
+    target: usbMount.path.replace(/\/$/, ''),
+    read_only: true,
+    bind: { create_host_path: false, propagation: 'rslave' },
+})
 
 export type RemountAction = 'up-d' | 'up-no-start' | 'skip' | 'hold'
 
@@ -197,10 +243,16 @@ export const shouldHoldFilesRemount = async (
 
 /** Build the compose override YAML (long bind syntax) and the display-name JSON. */
 export const buildOverride = (
-    filesMount: AppFilesMount,
+    filesMount: AppFilesMount | null,
     disks: { id: DiskID; shareName: string; hostFilesPath: string }[],
     displayJsonHost: string,
+    usb: { usbMount: AppUsbMount, hostRoot: string } | null = null,
 ): { yaml: string; display: Record<string, string> } => {
+    const services: Record<string, { volumes: any[] }> = {}
+    if (!filesMount) {
+        for (const s of usb!.usbMount.services) services[s] = { volumes: [usbBindEntry(usb!.usbMount, usb!.hostRoot)] }
+        return { yaml: YAML.stringify({ services }), display: {} }
+    }
     const display: Record<string, string> = {}
     const volumeEntries: any[] = []
     for (const d of disks) {
@@ -221,9 +273,13 @@ export const buildOverride = (
         read_only: true,
         bind: { create_host_path: false },
     })
-    const services: Record<string, { volumes: any[] }> = {}
     for (const s of filesMount.services) {
-        services[s] = { volumes: volumeEntries }
+        services[s] = { volumes: [...volumeEntries] }
+    }
+    if (usb) {
+        for (const s of usb.usbMount.services) {
+            services[s] = { volumes: [...(services[s]?.volumes ?? []), usbBindEntry(usb.usbMount, usb.hostRoot)] }
+        }
     }
     return { yaml: YAML.stringify({ services }), display }
 }
@@ -235,8 +291,15 @@ export const writeInstanceOverride = async (
     excludeDiskId?: DiskID,
 ): Promise<{ overridePath: string; diskIds: DiskID[] } | null> => {
     const app = store.appDB[instance.instanceOf]
-    if (!app?.filesMount) return null
+    if (!app?.filesMount && !app?.usbMount) return null
     await ensureEngineStateDir()
+    const usb = app.usbMount ? { usbMount: app.usbMount, hostRoot: usbRoot() } : null
+    if (!app.filesMount) {
+        const { yaml } = buildOverride(null, [], '', usb)
+        const overridePath = overridePathFor(instance.id)
+        await fs.writeFile(overridePath, yaml)
+        return { overridePath, diskIds: [] }
+    }
     const disks = mountableFilesDisks(store).filter(d => d.id !== excludeDiskId)
     const diskInfos: { id: DiskID; shareName: string; hostFilesPath: string }[] = []
     for (const d of disks) {
@@ -248,7 +311,7 @@ export const writeInstanceOverride = async (
         })
     }
     const displayHost = displayJsonHostPath(instance.id)
-    const { yaml, display } = buildOverride(app.filesMount, diskInfos, displayHost)
+    const { yaml, display } = buildOverride(app.filesMount, diskInfos, displayHost, usb)
     await fs.writeFile(displayHost, JSON.stringify(display, null, 2) + '\n')
     const overridePath = overridePathFor(instance.id)
     await fs.writeFile(overridePath, yaml)

@@ -29,6 +29,8 @@ export interface Settings {
     peerAccess?: boolean;         // Per-Pi Engine keys for cross-Engine copy (default: on unless isDev || testMode). See peerAccessEnabled().
     commandLogArchiveMaxBytes?: number; // Size cap of store-identity/command-log-archive/ in bytes (default 1 GB = 1_000_000_000). Over the cap, the oldest archives are deleted one by one, each logged (#185, Koen 2026-10-15). See commandLogArchiveMaxBytes().
     peerStaleHours?: number;      // A peer Engine without a heartbeat for this long loses its key here (default 168 = 7 days). See peerStaleMs().
+    autoStartChannelBuilder?: boolean; // Start the docked kolibri-channel-builder when a stick with a kolibri folder is mounted (idea#193 §8.2a; default true). See autoStartChannelBuilder().
+    usbRoot?: string;             // Mount root for teacher USB sticks (default /run/idea-usb; IDEA_USB_ROOT wins). Tests point this at a temp folder. See usbRoot().
 }
 
 export interface Defaults {
@@ -132,6 +134,8 @@ function validateSettings(obj: any, path: string): string[] {
     if (obj.peerAccess !== undefined && typeof obj.peerAccess !== 'boolean') errors.push(`'${path}peerAccess' must be a boolean.`);
     if (obj.commandLogArchiveMaxBytes !== undefined && (typeof obj.commandLogArchiveMaxBytes !== 'number' || !(obj.commandLogArchiveMaxBytes > 0))) errors.push(`'${path}commandLogArchiveMaxBytes' must be a positive number.`);
     if (obj.peerStaleHours !== undefined && (typeof obj.peerStaleHours !== 'number' || !(obj.peerStaleHours > 0))) errors.push(`'${path}peerStaleHours' must be a positive number.`);
+    if (obj.autoStartChannelBuilder !== undefined && typeof obj.autoStartChannelBuilder !== 'boolean') errors.push(`'${path}autoStartChannelBuilder' must be a boolean.`);
+    if (obj.usbRoot !== undefined && typeof obj.usbRoot !== 'string') errors.push(`'${path}usbRoot' must be a string.`);
     return errors;
 }
 
@@ -348,6 +352,13 @@ export const DEFAULT_DISKS_ROOT = '/disks';
  * Production: /disks. Tests: a private temp folder set via IDEA_DISKS_ROOT.
  * Read at call time (not import time) so the env override always applies.
  */
+/** Default mount root for teacher USB sticks (idea#193 §3.2); the only root the sudoers lines allow. */
+export const DEFAULT_USB_ROOT = '/run/idea-usb'
+/** Mount root for teacher USB sticks: IDEA_USB_ROOT, else settings.usbRoot, else /run/idea-usb. */
+export const usbRoot = (): string => process.env.IDEA_USB_ROOT || config.settings.usbRoot || DEFAULT_USB_ROOT
+/** idea#193 §8.2a kill switch: settings.autoStartChannelBuilder (default true). */
+export const autoStartChannelBuilder = (): boolean => config.settings.autoStartChannelBuilder ?? true
+
 export const disksRoot = (): string => config.settings.disksRoot || DEFAULT_DISKS_ROOT;
 
 // Allow IDEA_DOCKER_AVAILABLE=true|false to force whether the Docker-only paths

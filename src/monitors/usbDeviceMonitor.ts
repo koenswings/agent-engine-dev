@@ -19,6 +19,7 @@ import { DocHandle } from '@automerge/automerge-repo';
 import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js';
 import { runWithTrace } from '../utils/CommandLogger.js';
 import { recordDiskDetectionFailure, errorMessage } from './diskDetection.js';
+import { addStick, classifyFsType, removeStick, removeSticksOnDrive, usbStartupCleanup, usbStickOps, usbStickRoutingActive, syncUsbApps } from '../data/UsbSticks.js'
 import { safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointOf } from './mounts.js';
 
 /**
@@ -104,6 +105,26 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         return device && (device.match(/^sd[a-z][1-2]$/m) || device.match(/^sd[a-z]$/m)) ? true : false
     }
 
+    /**
+     * idea#193 §3.1: probe the filesystem type; vfat/exfat on a non-system disk is
+     * mounted read-only as a teacher stick. Returns true when the device was a
+     * stick (mounted, or refused with a recorded failure), false for ext4 and
+     * anything else (the IDEA disk path continues unchanged).
+     */
+    const tryAddStick = async (device: DeviceName): Promise<boolean> => {
+        if (isTestDeviceName(device) || !usbStickRoutingActive()) return false
+        let probe
+        try { probe = await usbStickOps().probe(device) } catch (e) { log(`USB stick probe of ${device}: ${errorMessage(e)}`); return false }
+        if (!probe || classifyFsType(probe.fsType) !== 'stick') return false
+        if (await isSystemDevice(device) || device === systemBootDevice || device === systemDevice) {
+            log(`Device ${device} (${probe.fsType}) is on the system drive — never mounted as a USB stick`)
+            return true
+        }
+        const result = await addStick(storeHandle, device, probe)
+        if (!result.ok) recordDiskDetectionFailure('mount', result.message, { device })
+        return true
+    }
+
     const addDevice = async function (path: string) {
         log(`A disk on device ${path} has been added`)
         const device = path.split('/').pop() as DeviceName
@@ -114,6 +135,12 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
             // Skip whole-disk entries for mounting (idea#134): accepted by validDevice
             // so lsblk can list them as unformatted candidates; never mounted.
             if (device.match(/^sd[a-z]$/)) {
+                // A stick formatted without a partition table carries FAT/exFAT on the
+                // whole disk (idea#193 §3.2): mount it read-only like a partition.
+                if (!isEraseDeviceLocked(device) && await tryAddStick(device)) {
+                    await refreshUnformattedDisks(storeHandle).catch(e => log(`unformatted refresh: ${e}`))
+                    return
+                }
                 log(`Device ${device} is a whole-disk entry — refreshing unformattedDisks, not mounting`)
                 await refreshUnformattedDisks(storeHandle).catch(e => log(`unformatted refresh: ${e}`))
                 return
@@ -156,6 +183,12 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                         log(`Error processing system disk: ${e}`)
                         recordDiskDetectionFailure('readMeta', `Could not read /META.yaml of the system disk on ${device}: ${errorMessage(e)}`, { device })
                     }
+                    return
+                }
+
+                // FAT/exFAT teacher stick (idea#193 §3.1): read-only under /run/idea-usb, never an IDEA disk
+                if (await tryAddStick(device)) {
+                    await refreshUnformattedDisks(storeHandle).catch(e => log(`unformatted refresh: ${e}`))
                     return
                 }
 
@@ -252,6 +285,14 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         const device = path.split('/').pop()
         if (validDevice(device!)) {
             log(`Processing the removal of USB device ${device}`)
+            // Teacher sticks first (idea#193 §3.4): partition, or every stick of a whole drive
+            const removedSticks = device!.match(/^sd[a-z]$/)
+                ? await removeSticksOnDrive(storeHandle, device!, 'unplugged')
+                : (await removeStick(storeHandle, device!, 'unplugged')) ? [device] : []
+            if (removedSticks.length) {
+                await refreshUnformattedDisks(storeHandle).catch(e => log(`unformatted refresh: ${e}`))
+                return
+            }
             // Every record on the device, not just the first (idea#152)
             const undocked = await undockAllOnDevice(storeHandle, localEngine.id, device as DeviceName)
             if (undocked.length === 0) {
@@ -335,6 +376,13 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         } catch (e) {
             log(`Error cleaning up the stale mount point of ${device}: ${errorMessage(e)}`)
         }
+    }
+
+    // Teacher sticks (idea#193 §3.4): unmount leftovers under /run/idea-usb before the
+    // watcher's initial adds mount the sticks that are still plugged in.
+    if (usbStickRoutingActive()) {
+        await usbStartupCleanup(storeHandle)
+        void syncUsbApps(storeHandle, 'start')
     }
 
     const watchDir = process.env.IDEA_WATCH_DIR || '/dev/engine'
