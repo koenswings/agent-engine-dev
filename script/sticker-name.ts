@@ -37,11 +37,15 @@ const main = async () => {
     const deps = realStickerNameDeps($, { peers, stickerFile, log: (m) => { logs.push(m); console.error(m) } })
     const lanTaken = deps.lanTaken
     deps.lanTaken = async (n) => taken.includes(n) ? (logs.push(`induced: ${n} treated as taken`), true) : lanTaken(n)
+    const seen: Record<string, { names: string[], checked: boolean }> = {}
+    const sn = deps.storeNames, tn = deps.tailnetNames
+    deps.storeNames = async () => (seen.store = await sn())
+    if (tn) deps.tailnetNames = async () => (seen.tailnet = await tn())
     if (argv.seed !== undefined) deps.rand = seeded(Number(argv.seed))
     const r = await resolveStickerName(argv.hostname, deps)
     const text = stickerText(r.name, Number(argv.port ?? 80))
     await writeStickerFile($, text, stickerTxt)
-    console.log(JSON.stringify({ ...r, stickerFile, stickerTxt, logs }))
+    console.log('RESULT ' + JSON.stringify({ ...r, stickerFile, stickerTxt, logs, seen }))
     process.exit(0)
 }
 if (process.argv[1]?.endsWith('sticker-name.ts')) main().catch((e) => { console.error(e); process.exit(1) })

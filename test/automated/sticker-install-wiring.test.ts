@@ -62,3 +62,10 @@ describe('idea#184 --no-rename tool and real deps', () => {
         expect(logs.filter((l) => /avahi-utils/.test(l)).length).toBe(1)
     })
 })
+
+describe('idea#184 store check ports', () => {
+    it('tries the default and the pool Console port', async () => {
+        const { STORE_PORTS } = await import('../../src/install/stickerName.js')
+        expect(STORE_PORTS).toEqual([80, 8080])
+    })
+})

@@ -176,9 +176,13 @@ export const parseAvahiEngineNames = (out: string): string[] => {
 }
 
 /** Read engineDB hostnames from the first peer that serves its store. */
-export const storeNamesFromPeers = async (peers: string[], port = 80): Promise<{ names: string[], checked: boolean }> => {
+/** Console ports to try on a peer: an Engine serves /api/store-url on its httpPort,
+ *  which is 80 on a default install but often 8080 on the pool. */
+export const STORE_PORTS = [80, 8080]
+
+export const storeNamesFromPeers = async (peers: string[], ports: number[] = STORE_PORTS): Promise<{ names: string[], checked: boolean }> => {
     const { createClientStore } = await import('../data/Store.js')
-    for (const peer of peers) {
+    for (const peer of peers) for (const port of ports) {
         const host = peer.endsWith('.local') ? peer : `${peer}.local`
         try {
             const res = await fetch(`http://${host}${port === 80 ? '' : `:${port}`}/api/store-url`, { signal: AbortSignal.timeout(5000) })
