@@ -5,7 +5,8 @@ usage: idea-local-takeover-analyse.py POLL.csv CUT_OFFSET_S DEAD_IP TTL_S LIVE_I
 POLL.csv rows: seconds_since_start,resolved_ips('+' joined or FAIL),http_status_of_first_ip
 Prints a summary; exit 0 PASS (a live Engine resolved AND served HTTP 200, steadily, within TTL), 1 FAIL.
 
-RESUME_S/GRACE_S are passed for --mode avahi-freeze ONLY (Steve, 2026-10-15). RESUME_S is when
+RESUME_S/GRACE_S are passed for --mode avahi-freeze ONLY (Steve, 2026-10-15; GRACE_S at most 3 s,
+raised from 2 s after the 856589f pool runs saw the resume burst last 2.5-2.7 s). RESUME_S is when
 avahi-daemon got SIGCONT on the frozen holder, in poll seconds. A SIGSTOPped avahi-daemon has
 queued every query the LAN sent it while frozen; on SIGCONT it first answers that backlog from
 memory (with the old idea.local record, before the Engine's freed entry group is processed) and
@@ -62,8 +63,8 @@ def main(argv):
     path, cut, dead, ttl, live = argv[1], float(argv[2]), argv[3], int(argv[4]), [x for x in argv[5].split(',') if x]
     resume = float(argv[6]) if len(argv) > 6 and argv[6] else None
     grace = float(argv[7]) if len(argv) > 7 else 0.0
-    if resume is not None and not 0 < grace <= 2.0:
-        print('FAIL: the resume grace must be > 0 and at most 2 s (Steve, idea#203)')
+    if resume is not None and not 0 < grace <= 3.0:
+        print('FAIL: the resume grace must be > 0 and at most 3 s (Steve, idea#203)')
         return 1
     rows = []
     for l in open(path):

@@ -301,11 +301,12 @@ log "after restore: idea.local -> $AFTER (expect exactly one pool address)"
 
 # ── Analyse ─────────────────────────────────────────────────────────────────
 # avahi-freeze ONLY (Steve, idea#203, 2026-10-15): the dead IP may appear for at most
-# RESUME_GRACE s right after the SIGCONT, never later. A SIGSTOPped avahi-daemon answers the
+# RESUME_GRACE (3) s right after the SIGCONT, never later. A SIGSTOPped avahi-daemon answers the
 # queries that piled up while it was frozen from memory as soon as it runs again, and sends the
 # goodbye for idea.local within ~10 ms; nothing the Engine does can stop that first burst, and a
 # real power cut cannot cause it. netcut (both directions) passes no resume and stays strict.
-RESUME_GRACE=2
+# 3 s, not 2 s (Steve, 2026-10-15): on pool 856589f the resume burst lasted 2.5 s and 2.7 s.
+RESUME_GRACE=3
 RESUME_ARGS=()
 if [ "$MODE" = avahi-freeze ]; then
   T0=$(awk '$1 == "#" && $2 == "t0" { print $3; exit }' "$OUT/poll.csv")
