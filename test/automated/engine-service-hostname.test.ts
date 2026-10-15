@@ -7,6 +7,7 @@
 import { describe, it, expect } from 'vitest'
 import ciao from '@homebridge/ciao'
 import { readFileSync } from 'fs'
+import path from 'path'
 import { engineServiceHostname } from '../../src/monitors/mdnsMonitor.js'
 
 describe('Engine mDNS service host name (idea#203 pool run ed2ab60)', () => {
@@ -24,7 +25,7 @@ describe('Engine mDNS service host name (idea#203 pool run ed2ab60)', () => {
         } finally { await responder.shutdown() }
     })
     it('startAdvertising passes it to ciao', () => {
-        const src = readFileSync(new URL('../../src/monitors/mdnsMonitor.ts', import.meta.url), 'utf8')
+        const src = readFileSync(path.join(process.cwd(), 'src/monitors/mdnsMonitor.ts'), 'utf8')
         expect(src).toMatch(/hostname: engineServiceHostname\(engineName\.toString\(\)\)/)
     })
 })
