@@ -184,21 +184,38 @@ export const parseMdnsAnswers = (buf: Buffer, name: string): string[] => {
     } catch { return [] }
 }
 
+/** A probe's outcome: every responder, plus one line per LAN interface whose query could not be sent. */
+export interface ProbeResult { responders: MdnsResponder[], errors: string[] }
+
 /**
- * Send a one-shot (legacy unicast, RFC 6762 §6.7) mDNS query for `name` from an ephemeral
- * port on each LAN address and collect every answer for `waitMs`. Every responder (our own
- * avahi included, via multicast loopback) answers straight to our socket, so a second holder
- * is seen even though avahi itself only reports one answer. Sent twice for loss.
+ * Send a one-shot (legacy unicast, RFC 6762 §6.7) mDNS query for `name` and collect every
+ * answer for `waitMs`. One socket per LAN address, bound to that address on an ephemeral
+ * port (never 5353, so it does not compete with avahi-daemon), with IP_MULTICAST_IF set to
+ * that same address: the query leaves only on the LAN interfaces we publish on, never on
+ * docker*, br-*, veth*, tailscale* (the caller passes lanAddresses()). Every responder (our
+ * own avahi included, via multicast loopback) answers straight to our socket, so a second
+ * holder is seen even though avahi itself only reports one answer. Sent twice for loss.
+ * Send/bind errors never throw: they are returned per interface in `errors`.
  */
-export const queryIdeaLocalResponders = async (name: string, addrs: LanAddress[], waitMs = 1200): Promise<MdnsResponder[]> => {
+export const queryIdeaLocalResponders = async (name: string, addrs: LanAddress[], waitMs = 1200): Promise<ProbeResult> => {
     const byFrom = new Map<string, Set<string>>()
-    await Promise.all(addrs.map(a => new Promise<void>((resolve) => {
-        const sock = dgram.createSocket({ type: 'udp4', reuseAddr: true })
+    const errors = new Set<string>()
+    await Promise.all(addrs.filter(a => isLanInterfaceName(a.ifName)).map(a => new Promise<void>((resolve) => {
+        const where = `${a.ifName} ${a.address}`
+        const fail = (what: string, e: any) => errors.add(`${what} on ${where}: ${e?.code ?? e?.message ?? e}`)
+        let sock: dgram.Socket
+        try { sock = dgram.createSocket({ type: 'udp4', reuseAddr: false }) } catch (e) { fail('socket', e); return resolve() }
         const id = Math.floor(Math.random() * 65535) + 1
         const q = encodeMdnsQuery(name, id)
-        let t2: NodeJS.Timeout | undefined
-        const done = () => { if (t2) clearTimeout(t2); try { sock.close() } catch { /* closed */ } resolve() }
-        sock.on('error', done)
+        const timers: NodeJS.Timeout[] = []
+        let finished = false
+        const done = () => {
+            if (finished) return
+            finished = true; timers.forEach(clearTimeout)
+            try { sock.close() } catch { /* closed */ }
+            resolve()
+        }
+        sock.on('error', (e) => { fail('socket', e); done() })
         sock.on('message', (msg, rinfo) => {
             if (msg.length < 2 || msg.readUInt16BE(0) !== id) return
             const found = parseMdnsAnswers(msg, name)
@@ -206,14 +223,20 @@ export const queryIdeaLocalResponders = async (name: string, addrs: LanAddress[]
             const s = byFrom.get(rinfo.address) ?? new Set<string>()
             found.forEach(x => s.add(x)); byFrom.set(rinfo.address, s)
         })
-        sock.bind(0, a.address, () => {
-            try { sock.setMulticastInterface(a.address); sock.setMulticastLoopback(true); sock.setMulticastTTL(255) } catch { /* best effort */ }
-            const send = () => sock.send(q, 5353, '224.0.0.251', () => {})
-            send(); t2 = setTimeout(send, 300)
-            setTimeout(done, waitMs)
-        })
+        try {
+            sock.bind(0, a.address, () => {
+                try {
+                    sock.setMulticastInterface(a.address)
+                    sock.setMulticastLoopback(true)
+                    sock.setMulticastTTL(255)
+                } catch (e) { fail('IP_MULTICAST_IF', e); return done() }
+                const send = () => { if (!finished) sock.send(q, 5353, '224.0.0.251', (e) => { if (e) fail('send', e) }) }
+                send(); timers.push(setTimeout(send, 300))
+                timers.push(setTimeout(done, waitMs))
+            })
+        } catch (e) { fail('bind', e); done() }
     })))
-    return [...byFrom].map(([from, s]) => ({ from, addresses: [...s].sort() }))
+    return { responders: [...byFrom].map(([from, s]) => ({ from, addresses: [...s].sort() })), errors: [...errors].sort() }
 }
 
 // ── publisher ────────────────────────────────────────────────────────────────
@@ -232,7 +255,14 @@ export interface IdeaLocalPublisherOptions {
      * A addresses it gave. Used by the holder on every tick to find a second holder (after a
      * partition heals avahi does not re-probe). Default: queryIdeaLocalResponders (raw socket).
      */
-    probe?: (name: string, addrs: LanAddress[]) => Promise<MdnsResponder[]>
+    probe?: (name: string, addrs: LanAddress[]) => Promise<MdnsResponder[] | ProbeResult>
+    /**
+     * A non-holder whose entry group vanished (avahi-daemon restarted; on the pool image a root
+     * cron restarts it at :00 on every Pi at the same second) waits this long before
+     * re-publishing, so the Engine that held the name re-claims it first. Must exceed the
+     * holder's worst-case detection time (one tick delay + one probe). Default 6.5-9.5 s.
+     */
+    reclaimGraceMs?: () => number
     /** consecutive probes that must see a lower-ranked holder before we withdraw (default 2) */
     conflictConfirmations?: number
     /** after withdrawing for a conflict, do not re-register for this long, ms (default 15000) */
@@ -253,7 +283,9 @@ export class IdeaLocalPublisher {
     private readonly addresses: () => LanAddress[]
     private readonly logger: (line: string) => void
     private readonly nextDelayMs: () => number
-    private readonly probe?: (name: string, addrs: LanAddress[]) => Promise<MdnsResponder[]>
+    private readonly probe?: (name: string, addrs: LanAddress[]) => Promise<MdnsResponder[] | ProbeResult>
+    private readonly reclaimGraceMs: () => number
+    private probeTrouble = ''
     private readonly conflictConfirmations: number
     private readonly conflictHoldoffMs: number
     private readonly now: () => number
@@ -270,6 +302,15 @@ export class IdeaLocalPublisher {
         this.conflictConfirmations = Math.max(1, o.conflictConfirmations ?? 2)
         this.conflictHoldoffMs = o.conflictHoldoffMs ?? 15000
         this.now = o.now ?? Date.now
+        this.reclaimGraceMs = o.reclaimGraceMs ?? (() => 6500 + Math.floor(Math.random() * 3001))
+    }
+
+    /** Log probe trouble once per change (not every tick), and once when it clears. */
+    private noteProbe(trouble: string) {
+        if (trouble === this.probeTrouble) return
+        if (trouble) this.logger(`[idea.local] second-holder check: ${trouble} (keeping the current state; logged once until it changes)`)
+        else this.logger(`[idea.local] second-holder check working again`)
+        this.probeTrouble = trouble
     }
 
     /**
@@ -279,8 +320,16 @@ export class IdeaLocalPublisher {
     private async checkSecondHolder(addrs: LanAddress[]): Promise<boolean> {
         if (!this.probe) return false
         let responders: MdnsResponder[]
-        try { responders = await this.probe(this.name, addrs) } catch (e: any) {
-            this.logger(`[idea.local] second-holder probe failed: ${e?.message ?? e}`)
+        try {
+            const r = await this.probe(this.name, addrs)
+            const res: ProbeResult = Array.isArray(r) ? { responders: r, errors: [] } : r
+            responders = res.responders
+            this.noteProbe(res.errors.join('; '))
+            // Nothing could be sent at all: this check says nothing. Keep the name and the
+            // confirmation count as they are (a failed check never withdraws).
+            if (res.errors.length > 0 && res.errors.length >= addrs.length && responders.length === 0) return false
+        } catch (e: any) {
+            this.noteProbe(`probe failed: ${e?.message ?? e}`)
             return false
         }
         const own = addrs.map(a => a.address)
@@ -342,10 +391,20 @@ export class IdeaLocalPublisher {
                 const st = await this.readGroupState(this.group)
                 if (st === undefined) {
                     // avahi-daemon restarted and our group went with it. The bus connection is
-                    // fine; publish a fresh group in this same tick (no reconnect, no error line).
+                    // fine. The holder publishes a fresh group in this same tick (no reconnect,
+                    // no error line); an Engine that was not holding waits the reclaim grace
+                    // first, so a simultaneous restart on every Pi (pool cron at :00) leaves
+                    // the name with the Engine that already had it.
+                    const wasHolder = this.status === 'holder'
                     this.group = undefined
                     this.publishedKey = ''
-                    this.note('registering', `avahi-daemon lost our ${this.name} entry group (daemon restarted); re-publishing`)
+                    if (wasHolder) {
+                        this.note('registering', `avahi-daemon lost our ${this.name} entry group (daemon restarted); re-publishing`)
+                    } else {
+                        const grace = this.reclaimGraceMs()
+                        this.holdoffUntil = Math.max(this.holdoffUntil, this.now() + grace)
+                        this.note('waiting', `avahi-daemon restarted; not holding ${this.name}, so letting the previous holder re-claim it first (${(grace / 1000).toFixed(1)} s)`)
+                    }
                 } else if (key === this.publishedKey && st === EntryGroupState.ESTABLISHED) {
                     if (this.status !== 'holder') {
                         this.conflictSeen = 0
