@@ -8,7 +8,7 @@ import { Disk, clearDuplicateDiskRecords, createOrUpdateDisk, isSystemDiskRecord
 import { flushFilesRemountNow, optedInInstances } from '../data/FilesMount.js'
 import { isSystemDevice, systemDriveNames, driveNameOf } from '../data/SystemDisk.js'
 import { refreshUnformattedDisks } from '../data/UnformattedDisks.js'
-import { eraseLockRefusesAdd, setEraseAddDevice } from '../data/EraseDisk.js'
+import { eraseLockRefusesAdd, isEraseDeviceLocked, setEraseAddDevice } from '../data/EraseDisk.js'
 import { findDiskByDevice, findDisksByDevice, Store, getDisksOfEngine, getLocalEngine } from '../data/Store.js'
 import { DeviceName, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../data/CommonTypes.js'
 
