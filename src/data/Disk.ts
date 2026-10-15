@@ -10,7 +10,7 @@ import { addTrace, closeTrace } from './CommandLogStore.js';
 import { runWithTrace } from '../utils/CommandLogger.js';
 import { disksRoot } from './Config.js';
 import { FilesConfig, hasFilesYaml, processFilesDisk } from './FilesDisk.js';
-import { parseFilesMount } from './FilesMount.js';
+import { parseFilesMount, parseUsbMount } from './FilesMount.js';
 import { updateDiskSize } from './DiskSize.js';
 import { recordDiskDetectionFailure } from '../monitors/diskDetection.js';
 import { shouldAutoStart } from './AutoStart.js';
@@ -445,9 +445,10 @@ export const processSystemDisk = async (storeHandle: DocHandle<Store>, disk: Dis
 /**
  * Process a single app on the system disk (reads from /apps/<appId>/compose.yaml).
  */
-export const processSystemApp = async (storeHandle: DocHandle<Store>, disk: Disk, appId: AppID): Promise<App | undefined> => {
+export const processSystemApp = async (storeHandle: DocHandle<Store>, disk: Disk, appId: AppID, appsRoot: string = '/apps'): Promise<App | undefined> => {
     try {
-        const appComposeFile = await $`cat /apps/${appId}/compose.yaml`
+        // appsRoot is a parameter only so tests can point it at a fixture folder
+        const appComposeFile = await $`cat ${appsRoot}/${appId}/compose.yaml`
         const appCompose = YAML.parse(appComposeFile.stdout)
         let app: App
         storeHandle.change(doc => {
@@ -466,12 +467,23 @@ export const processSystemApp = async (storeHandle: DocHandle<Store>, disk: Disk
                     icon: xapp.icon ?? null,
                     author: xapp.author ?? null,
                     filesMount: parseFilesMount(xapp),
+                    usbMount: parseUsbMount(xapp),
                 }
                 doc.appDB[appId] = app
             } else {
                 log(`Updating existing system app ${appId}`)
+                // Same granular update as createOrUpdateApp (App.ts): every x-app field is refreshed
                 app = storedApp
+                app.name = extractAppName(appId)
+                app.version = extractAppVersion(appId)
+                app.title = xapp.title
+                app.description = xapp.description ?? null
+                app.url = xapp.url ?? null
+                app.category = xapp.category
+                app.icon = xapp.icon ?? null
+                app.author = xapp.author ?? null
                 app.filesMount = parseFilesMount(xapp)
+                app.usbMount = parseUsbMount(xapp)
             }
         })
         return app!
