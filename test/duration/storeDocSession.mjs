@@ -134,9 +134,23 @@ export async function startStoreDocSession(workerData, io) {
         // here instead of opening a new Repo; the answer always comes back (ok or a reason) within m.ms.
         if (m?.type === 'reattach') {
             const id = m.id, until = Date.now() + Math.max(0, Number(m.ms) || 0), t0 = Date.now()
+            // A peer in repo.peers is not proof of a live connection: right after the Engine closes the
+            // socket, the peer stays listed until the close is processed (seen in the pool suite under load:
+            // socket readyState 2 CLOSING, peers 1). Only a pong on the CURRENT, OPEN socket proves it.
+            let pinged = null, ponged = null
+            const live = () => {
+                const s = adapter.socket
+                if (!s || s.readyState !== 1 || typeof s.ping !== 'function') return false
+                if (ponged === s) return true
+                if (pinged !== s) {
+                    pinged = s
+                    try { s.once('pong', () => { if (adapter.socket === s && s.readyState === 1) ponged = s }); s.ping() } catch { pinged = null }
+                }
+                return false
+            }
             const tick = () => {
                 if (closing) return post({ id, ok: false, error: 'session closing' })
-                const ready = !!handle?.isReady(), peer = repo.peers.length > 0
+                const ready = !!handle?.isReady(), peer = repo.peers.length > 0 && live()
                 if (ready && peer) {
                     try { return post({ id, ok: true, reattached: true, tookMs: Date.now() - t0, ...snapshot() }) }
                     catch (e) { return post({ id, ok: false, error: `snapshot: ${e?.message ?? e}` }) }
