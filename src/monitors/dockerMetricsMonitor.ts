@@ -17,6 +17,7 @@ import { Store, getLocalEngine, getInstancesOfEngine } from '../data/Store.js'
 import { DockerMetrics } from '../data/CommonTypes.js'
 import { localEngineId } from '../data/Engine.js'
 import { dockerAvailable } from '../utils/dockerAvailable.js'
+import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
 
 $.verbose = false
 
@@ -110,18 +111,21 @@ const parseStatsLine = (line: string): { name: string; metrics: DockerMetrics } 
 
 const collectMetrics = async (
     instanceIds: string[]
-): Promise<Map<string, DockerMetrics>> => {
+): Promise<{ metrics: Map<string, DockerMetrics>, runningContainers: string[] | null }> => {
     // docker stats container names follow the pattern: <instanceId>-<service>-1
     // We filter containers by name prefix matching any of the instance IDs.
     const result = new Map<string, DockerMetrics>()
-    if (instanceIds.length === 0) return result
+    // null = docker ps did not answer: never conclude anything about container state
+    let runningContainers: string[] | null = null
+    if (instanceIds.length === 0) return { metrics: result, runningContainers: [] }
 
     try {
         // docker stats does not support --filter; resolve container names via docker ps first
         const filterArgs = instanceIds.flatMap(id => ['--filter', `name=${id}`])
         const psProc = await $`docker ps --format {{.Names}} ${filterArgs}`
         const containerNames = psProc.stdout.split('\n').map(l => l.trim()).filter(Boolean)
-        if (containerNames.length === 0) return result
+        runningContainers = containerNames
+        if (containerNames.length === 0) return { metrics: result, runningContainers }
         const proc = await $`docker stats --no-stream --format json ${containerNames}`
         const lines = proc.stdout.split('\n').filter(l => l.trim())
 
@@ -150,7 +154,51 @@ const collectMetrics = async (
         log(`[dockerMetrics] docker stats error: ${e.message ?? e}`)
     }
 
-    return result
+    return { metrics: result, runningContainers }
+}
+
+// ── Containers stopped outside the Engine ─────────────────────────────────────
+// A `docker compose stop` (or a crash) done outside the Engine leaves the store at
+// Running. Each poll already lists the running containers of Running instances, so
+// a Running instance with no running container on EXTERNAL_STOP_MISSES consecutive
+// polls is set to Docked: present, not running, NOT an operator stop (Stopped stays
+// reserved for stops through the Engine), so auto-start rules that act on
+// Docked/Error apply again. Skipped while the Engine holds the instance's lock
+// (its own start/stop/remount) and within EXTERNAL_STOP_GRACE_MS of lastStarted.
+
+export const EXTERNAL_STOP_MISSES = 2
+export const EXTERNAL_STOP_GRACE_MS = 60_000
+const externalStopMisses = new Map<string, number>()
+/** Tests only. */
+export const resetExternalStopTrackingForTests = (): void => { externalStopMisses.clear() }
+
+/** Instance ids to mark Docked now; updates the miss counters. */
+export const detectExternalStops = (
+    instances: { id: string, status: string, lastStarted?: number | null }[],
+    runningContainers: string[] | null,
+    isLocked: (instanceId: string) => boolean,
+    now: number = Date.now(),
+): string[] => {
+    if (runningContainers === null) return []
+    const stopped: string[] = []
+    const seen = new Set<string>()
+    for (const inst of instances) {
+        if (inst.status !== 'Running') continue
+        seen.add(inst.id)
+        const hasContainer = runningContainers.some(n => n.startsWith(inst.id))
+        if (hasContainer || isLocked(inst.id) || now - (inst.lastStarted ?? 0) < EXTERNAL_STOP_GRACE_MS) {
+            externalStopMisses.delete(inst.id)
+            continue
+        }
+        const misses = (externalStopMisses.get(inst.id) ?? 0) + 1
+        externalStopMisses.set(inst.id, misses)
+        if (misses >= EXTERNAL_STOP_MISSES) {
+            externalStopMisses.delete(inst.id)
+            stopped.push(inst.id)
+        }
+    }
+    for (const id of [...externalStopMisses.keys()]) if (!seen.has(id)) externalStopMisses.delete(id)
+    return stopped
 }
 
 // ── Main monitor loop ─────────────────────────────────────────────────────────
@@ -167,7 +215,9 @@ export const pollDockerMetricsOnce = async (storeHandle: DocHandle<Store>): Prom
     const runningIds = runningInstances.map(i => i.id as string)
 
     // Collect live metrics for running containers
-    const metricsMap = await collectMetrics(runningIds)
+    const { metrics: metricsMap, runningContainers } = await collectMetrics(runningIds)
+    const externallyStopped = new Set(detectExternalStops(
+        runningInstances as any, runningContainers, id => resourceLock.isLocked(instanceKey(id))))
 
     // Write back to store — one change() call covers all instances
     storeHandle.change(doc => {
@@ -175,6 +225,12 @@ export const pollDockerMetricsOnce = async (storeHandle: DocHandle<Store>): Prom
             const instanceInDoc = doc.instanceDB[inst.id as any]
             if (!instanceInDoc) continue
 
+            if (externallyStopped.has(inst.id as string) && instanceInDoc.status === 'Running') {
+                log(`[dockerMetrics] Instance ${inst.id}: no running container on ${EXTERNAL_STOP_MISSES} polls (stopped outside the Engine) — status Running → Docked`)
+                instanceInDoc.status = 'Docked' as any
+                if (instanceInDoc.metrics !== null) instanceInDoc.metrics = null
+                continue
+            }
             if (inst.status === 'Running') {
                 const m = metricsMap.get(inst.id as string)
                 // If running but no container found yet (brief window during start), keep previous metrics
