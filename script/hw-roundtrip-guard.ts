@@ -142,3 +142,23 @@ export const loadExpectation = (argv: string[], configFile: string, hostname: st
         refuseSerials: [...(base.refuseSerials ?? []), ...all('refuse-serial')],
     }
 }
+
+/**
+ * idea#193: does the whole disk carry an ext4 partition? From `lsblk -J -o NAME,FSTYPE /dev/<disk>`.
+ * The Engine never lists such a disk in Engine.unformattedDisks (UnformattedDisks.ts hasExt4),
+ * so a stick partition that shares its disk with an App Disk must NOT be offered for erase.
+ */
+export const diskHasExt4 = (lsblkJson: string, disk: string): boolean => {
+    let parsed: any
+    try { parsed = JSON.parse(lsblkJson) } catch { throw new Error(`lsblk JSON for ${disk} unreadable`) }
+    const dev = (parsed?.blockdevices ?? []).find((d: any) => d?.name === disk)
+    if (!dev) throw new Error(`lsblk has no disk ${disk}`)
+    const walk = (d: any): boolean => d?.fstype === 'ext4' || (d?.children ?? []).some(walk)
+    return walk(dev)
+}
+
+/** The unformattedDisks expectation for the stick's disk: listed (erase offered) only when it has no ext4. */
+export const unformattedExpectation = (hasExt4: boolean, listed: boolean): { ok: boolean, label: string } =>
+    hasExt4
+        ? { ok: !listed, label: 'disk has an ext4 partition: NOT in unformattedDisks (no erase offered)' }
+        : { ok: listed, label: 'still in unformattedDisks (erase offered)' }
