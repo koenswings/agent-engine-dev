@@ -9,9 +9,14 @@ Read-only: it only sends queries.
 
 usage:
   idea-local-mdns-responders.py [--name idea.local] [--wait 2.0]
-  idea-local-mdns-responders.py --judge '<json line>' <pool ips comma list>
-      prints "ONE <ip>" (exit 0) when exactly one responder answers with exactly one pool
-      address, else "NOT-ONE <details>" (exit 1).
+      query only; prints the JSON line.
+  idea-local-mdns-responders.py --pool 10.99.0.13,10.99.0.14 --judge [--name ..] [--wait ..]
+      standalone: query now, print the JSON line, then the verdict.
+  idea-local-mdns-responders.py --judge-json '<json line>' --pool <ips>
+  idea-local-mdns-responders.py --judge '<json line>' <ips>          (old form, still accepted)
+      judge a JSON line from an earlier query.
+  Verdict: "ONE <ip>" (exit 0) when exactly one responder answers with exactly one pool
+  address, else "NOT-ONE <details>" (exit 1). Bad arguments: usage on stderr, exit 2.
 """
 import json, random, socket, struct, sys, time
 
@@ -75,15 +80,57 @@ def judge(responders, pool):
         return True, 'ONE %s' % addrs[0]
     return False, 'NOT-ONE responders=%s' % json.dumps(responders, sort_keys=True)
 
+USAGE = __doc__.split('usage:', 1)[1].rstrip()
+
+def usage(msg):
+    print('error: %s\nusage:%s' % (msg, USAGE), file=sys.stderr)
+    return 2
+
+def parse_pool(v):
+    ips = [x.strip() for x in (v or '').split(',') if x.strip()]
+    for ip in ips:
+        try: socket.inet_aton(ip)
+        except OSError: raise ValueError('not an IPv4 address in --pool: %r' % ip)
+        if ip.count('.') != 3: raise ValueError('not an IPv4 address in --pool: %r' % ip)
+    return ips
+
+def responders_of(line):
+    d = json.loads(line)
+    r = d.get('responders') if isinstance(d, dict) else None
+    if not isinstance(r, dict): raise ValueError('JSON has no "responders" object')
+    return r
+
 def main(argv):
-    if len(argv) >= 2 and argv[1] == '--judge':
-        ok, line = judge(json.loads(argv[2])['responders'], [x for x in argv[3].split(',') if x])
-        print(line); return 0 if ok else 1
-    name, wait, i = 'idea.local', 2.0, 1
-    while i < len(argv):
-        if argv[i] == '--name': name = argv[i + 1]; i += 2
-        elif argv[i] == '--wait': wait = float(argv[i + 1]); i += 2
-        else: print('unknown argument %s' % argv[i], file=sys.stderr); return 2
+    args = argv[1:]
+    name, wait, pool, judge_mode, judge_json = 'idea.local', 2.0, None, False, None
+    # old form: --judge '<json>' <ips>
+    if len(args) == 3 and args[0] == '--judge' and args[1].lstrip().startswith('{'):
+        judge_json, pool, args = args[1], args[2], []
+    i = 0
+    try:
+        while i < len(args):
+            a = args[i]
+            need = lambda: args[i + 1] if i + 1 < len(args) else (_ for _ in ()).throw(ValueError('%s needs a value' % a))
+            if a == '--name': name = need(); i += 2
+            elif a == '--wait': wait = float(need()); i += 2
+            elif a == '--pool': pool = need(); i += 2
+            elif a == '--judge-json': judge_json = need(); i += 2
+            elif a == '--judge': judge_mode = True; i += 1
+            elif a in ('-h', '--help'): print('usage:' + USAGE); return 0
+            else: return usage('unknown argument %s' % a)
+        ips = parse_pool(pool) if pool is not None else None
+        if judge_json is not None:
+            if not ips: return usage('--judge-json needs --pool <ip,ip,...>')
+            ok, line = judge(responders_of(judge_json), ips)
+            print(line); return 0 if ok else 1
+        if judge_mode:
+            if not ips: return usage('--judge needs --pool <ip,ip,...> (e.g. --pool 10.99.0.13,10.99.0.14 --judge)')
+            res = query(name, wait)
+            print(json.dumps({'t': time.strftime('%H:%M:%S'), 'responders': res}, sort_keys=True))
+            ok, line = judge(res, ips)
+            print(line); return 0 if ok else 1
+    except ValueError as e:
+        return usage(str(e))
     print(json.dumps({'t': time.strftime('%H:%M:%S'), 'responders': query(name, wait)}, sort_keys=True))
     return 0
 
