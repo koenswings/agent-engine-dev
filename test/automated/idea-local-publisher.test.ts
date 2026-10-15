@@ -9,12 +9,24 @@
 import { describe, it, expect } from 'vitest'
 import {
     isEntryGroupGone, IdeaLocalPublisher, AvahiClient, AvahiEntryGroup, EntryGroupState, lanAddresses,
-    isLanInterfaceName, AVAHI_PUBLISH_NO_REVERSE, AVAHI_PROTO_INET, LanAddress,
+    isLanInterfaceName, AVAHI_PUBLISH_NO_REVERSE, AVAHI_PROTO_INET, LanAddress, MdnsResponder,
+    foreignHolders, conflictWinner, encodeMdnsQuery, parseMdnsAnswers,
 } from '../../src/monitors/ideaLocal.js'
 
 class FakeLan {
     groups = new Set<FakeGroup>()
-    holder(name: string) { return [...this.groups].find(g => g.name === name && g.state === EntryGroupState.ESTABLISHED) }
+    /** hosts cut off the LAN (netcut): they and the rest cannot see each other's mDNS. */
+    cut = new Set<FakeHost>()
+    sees(a: FakeHost, b: FakeHost) { return a === b || (!this.cut.has(a) && !this.cut.has(b)) }
+    holder(name: string, from?: FakeHost) {
+        return [...this.groups].find(g => g.name === name && g.state === EntryGroupState.ESTABLISHED && (!from || this.sees(from, g.host)))
+    }
+    holders(name: string) { return [...this.groups].filter(g => g.name === name && g.state === EntryGroupState.ESTABLISHED) }
+    /** A raw mDNS query from `from`: every visible host with an established record answers (avahi never re-probes). */
+    probe(from: FakeHost): MdnsResponder[] {
+        return [...this.groups].filter(g => g.state === EntryGroupState.ESTABLISHED && this.sees(from, g.host))
+            .map(g => ({ from: g.records[0].address, addresses: g.records.map(r => r.address) }))
+    }
 }
 class FakeGroup implements AvahiEntryGroup {
     state = EntryGroupState.UNCOMMITED
@@ -34,7 +46,7 @@ class FakeGroup implements AvahiEntryGroup {
         if (this.gone) { const e: any = new Error('Method "GetState" with signature "" on interface "org.freedesktop.Avahi.EntryGroup" doesn\'t exist'); e.type = 'org.freedesktop.DBus.Error.UnknownMethod'; throw e }
         if (this.host.down) throw new Error('org.freedesktop.DBus.Error.ServiceUnknown')
         if (this.state === EntryGroupState.REGISTERING) {
-            this.state = this.lan.holder(this.name) ? EntryGroupState.COLLISION : EntryGroupState.ESTABLISHED
+            this.state = this.lan.holder(this.name, this.host) ? EntryGroupState.COLLISION : EntryGroupState.ESTABLISHED
         }
         return this.state
     }
@@ -56,8 +68,12 @@ class FakeHost {
 }
 
 const addr = (address: string, ifName = 'eth0', ifIndex = 2): LanAddress => ({ ifName, ifIndex, address })
+let clock = 0
 const mk = (host: FakeHost, a: () => LanAddress[], lines: string[] = []) =>
-    new IdeaLocalPublisher({ connect: host.connect, addresses: a, logger: (l) => lines.push(l), nextDelayMs: () => 1 })
+    new IdeaLocalPublisher({
+        connect: host.connect, addresses: a, logger: (l) => lines.push(l), nextDelayMs: () => 1,
+        probe: async () => host.down ? [] : host.lan.probe(host), now: () => clock,
+    })
 
 describe('idea.local publisher: one holder, retry, takeover (idea#203)', () => {
     it('publishes an IPv4 address record with NO_REVERSE (avahi-publish -a -R) per LAN interface', async () => {
@@ -215,5 +231,128 @@ describe('idea.local LAN-only addresses (idea#203)', () => {
             expect(p2.status).toBe('holder')
             expect(lan.holder('idea.local')!.host).toBe(h2)
         })
+    })
+})
+
+describe('idea.local second holder after a partition heals (idea#203 takeover run 2026-10-15)', () => {
+    /** One "round" = every publisher ticks once and 3 s pass (ticks are every 2-5 s). */
+    const round = async (...ps: IdeaLocalPublisher[]) => { for (const p of ps) await p.tick(); clock += 3000 }
+    const setup = () => {
+        clock = 0
+        const lan = new FakeLan(); const h3 = new FakeHost(lan); const h4 = new FakeHost(lan)
+        const l3: string[] = []; const l4: string[] = []
+        const p3 = mk(h3, () => [addr('10.99.0.13')], l3); const p4 = mk(h4, () => [addr('10.99.0.14')], l4)
+        return { lan, h3, h4, p3, p4, l3, l4 }
+    }
+    /** idea03 holds, gets cut off, idea04 takes over, the cut is lifted: two established holders. */
+    const splitBrain = async () => {
+        const s = setup()
+        await round(s.p3, s.p4); await round(s.p3, s.p4)
+        expect(s.p3.status).toBe('holder'); expect(s.p4.status).toBe('waiting')
+        s.lan.cut.add(s.h3)
+        for (let i = 0; i < 3; i++) await round(s.p3, s.p4)
+        expect(s.p4.status).toBe('holder'); expect(s.p3.status).toBe('holder')
+        s.lan.cut.delete(s.h3)
+        expect(s.lan.holders('idea.local').length).toBe(2)
+        return s
+    }
+
+    it('reproduces the pool failure without the check: both stay holders forever', async () => {
+        const s = setup()
+        const n3 = new IdeaLocalPublisher({ connect: s.h3.connect, addresses: () => [addr('10.99.0.13')], logger: () => {}, probe: undefined })
+        const n4 = new IdeaLocalPublisher({ connect: s.h4.connect, addresses: () => [addr('10.99.0.14')], logger: () => {}, probe: undefined })
+        await n3.tick(); await n3.tick(); await n4.tick(); await n4.tick()
+        s.lan.cut.add(s.h3); await n4.tick(); await n4.tick(); s.lan.cut.delete(s.h3)
+        for (let i = 0; i < 20; i++) { await n3.tick(); await n4.tick() }
+        expect(s.lan.holders('idea.local').length).toBe(2)
+    })
+
+    it('after the partition heals exactly one holder remains, the lowest IPv4 (idea03 .13)', async () => {
+        const s = await splitBrain()
+        let rounds = 0
+        while (s.lan.holders('idea.local').length > 1 && rounds < 10) { await round(s.p3, s.p4); rounds++ }
+        expect(s.lan.holders('idea.local').map(g => g.records[0].address)).toEqual(['10.99.0.13'])
+        expect(s.p3.status).toBe('holder'); expect(s.p4.status).toBe('waiting')
+        expect(rounds).toBe(2) // 2 confirmations = 2 probes, ~4-10 s with 2-5 s ticks
+        expect(s.l4.some(l => /second holder of idea.local: 10.99.0.13.*withdrawing/.test(l))).toBe(true)
+        expect(s.l3.some(l => /10.99.0.14 also answers: we keep it/.test(l))).toBe(true)
+    })
+
+    it('is symmetric: when the lower IP took over during the cut, it keeps it', async () => {
+        clock = 0
+        const lan = new FakeLan(); const hA = new FakeHost(lan); const hB = new FakeHost(lan)
+        const pA = mk(hA, () => [addr('10.99.0.14')]); const pB = mk(hB, () => [addr('10.99.0.13')])
+        await round(pA, pB); await round(pA, pB)
+        expect(pA.status).toBe('holder')
+        lan.cut.add(hA); for (let i = 0; i < 3; i++) await round(pA, pB); lan.cut.delete(hA)
+        for (let i = 0; i < 4; i++) await round(pA, pB)
+        expect(lan.holders('idea.local').map(g => g.records[0].address)).toEqual(['10.99.0.13'])
+        expect(pA.status).toBe('waiting'); expect(pB.status).toBe('holder')
+    })
+
+    it('does not flap: the loser stays withdrawn and only one holder exists for a long time after', async () => {
+        const s = await splitBrain()
+        const holderCounts: number[] = []
+        for (let i = 0; i < 60; i++) { await round(s.p3, s.p4); holderCounts.push(s.lan.holders('idea.local').length) }
+        expect(holderCounts.slice(2).every(n => n === 1)).toBe(true)
+        expect(s.lan.holder('idea.local')!.host).toBe(s.h3)
+        expect(s.l4.filter(l => /withdrawing/.test(l)).length).toBe(1)
+        expect(s.l3.filter(l => /we keep it/.test(l)).length).toBe(1)
+    })
+
+    it('a single conflicting probe (e.g. a stale answer) does not make the holder withdraw', async () => {
+        clock = 0
+        const lan = new FakeLan(); const h = new FakeHost(lan)
+        let answers: MdnsResponder[] = [{ from: '10.99.0.11', addresses: ['10.99.0.11'] }]
+        const p = new IdeaLocalPublisher({ connect: h.connect, addresses: () => [addr('10.99.0.14')], logger: () => {}, probe: async () => answers, now: () => clock })
+        await p.tick(); expect(await p.tick()).toBe('holder') // 1st conflict seen
+        answers = [{ from: '10.99.0.14', addresses: ['10.99.0.14'] }]
+        expect(await p.tick()).toBe('holder') // gone: counter reset
+        answers = [{ from: '10.99.0.11', addresses: ['10.99.0.11'] }]
+        expect(await p.tick()).toBe('holder')
+        expect(await p.tick()).toBe('waiting') // 2 in a row
+        expect(lan.groups.size).toBe(0)
+    })
+
+    it('after withdrawing it waits the hold-off, then takes over if the winner has gone', async () => {
+        const s = await splitBrain()
+        await round(s.p3, s.p4); await round(s.p3, s.p4)
+        expect(s.p4.status).toBe('waiting')
+        await s.p3.stop()
+        await s.p4.tick(); expect(s.lan.groups.size).toBe(0) // still in the 15 s hold-off
+        clock += 15000
+        await s.p4.tick(); expect(await s.p4.tick()).toBe('holder')
+    })
+
+    it('a probe that throws is logged and never drops the name', async () => {
+        clock = 0
+        const lan = new FakeLan(); const h = new FakeHost(lan); const lines: string[] = []
+        const p = new IdeaLocalPublisher({ connect: h.connect, addresses: () => [addr('10.99.0.14')], logger: l => lines.push(l), probe: async () => { throw new Error('EADDRNOTAVAIL') }, now: () => clock })
+        await p.tick(); for (let i = 0; i < 4; i++) expect(await p.tick()).toBe('holder')
+        expect(lines.some(l => /probe failed: EADDRNOTAVAIL/.test(l))).toBe(true)
+    })
+
+    it('rule helpers: own addresses are ignored, lowest IPv4 wins numerically', () => {
+        expect(foreignHolders([{ from: '10.99.0.14', addresses: ['10.99.0.14'] }, { from: '10.99.0.13', addresses: ['10.99.0.13'] }], ['10.99.0.14'])).toEqual(['10.99.0.13'])
+        expect(conflictWinner(['10.99.0.9'], ['10.99.0.13'])).toBe('us') // numeric, not string compare
+        expect(conflictWinner(['10.99.0.14'], ['10.99.0.13'])).toBe('them')
+        expect(conflictWinner(['10.99.0.14'], [])).toBe('us')
+    })
+})
+
+describe('raw mDNS query encoding (idea#203)', () => {
+    it('encodes an A/IN query with the QU bit', () => {
+        const q = encodeMdnsQuery('idea.local', 0x1234)
+        expect([...q]).toEqual([0x12, 0x34, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 4, ...Buffer.from('idea'), 5, ...Buffer.from('local'), 0, 0, 1, 0x80, 1])
+    })
+    it('parses A answers with name compression, ignores goodbyes (TTL 0) and other names', () => {
+        const hdr = Buffer.from([0x12, 0x34, 0x84, 0, 0, 1, 0, 3, 0, 0, 0, 0])
+        const qn = Buffer.from([4, ...Buffer.from('idea'), 5, ...Buffer.from('local'), 0, 0, 1, 0, 1])
+        const rr = (ttl: number, ip: number[], name = [0xc0, 12]) => Buffer.from([...name, 0, 1, 0x80, 1, ttl >> 24 & 255, ttl >> 16 & 255, ttl >> 8 & 255, ttl & 255, 0, 4, ...ip])
+        const other = [5, ...Buffer.from('other'), 0xc0, 17]
+        const msg = Buffer.concat([hdr, qn, rr(120, [10, 99, 0, 13]), rr(0, [10, 99, 0, 14]), rr(120, [10, 99, 0, 15], other)])
+        expect(parseMdnsAnswers(msg, 'idea.local')).toEqual(['10.99.0.13'])
+        expect(parseMdnsAnswers(Buffer.from([0, 0, 0, 0]), 'idea.local')).toEqual([])
+        expect(parseMdnsAnswers(msg.subarray(0, 40), 'idea.local')).toEqual([])
     })
 })
