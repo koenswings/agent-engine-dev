@@ -1240,6 +1240,29 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 // }
 
 /**
+ * Write the Engine hostname and eth0 IPv4 address into an instance .env as the
+ * `hostname` and `ip` variables. Applies to every app, not only Nextcloud.
+ * A missing hostname or IP is skipped (logged) rather than written empty.
+ */
+export const writeEngineHostEnv = async (
+  envPath: string,
+  hostname: string | undefined,
+  instanceId: string,
+  interfaces: NodeJS.Dict<os.NetworkInterfaceInfo[]> = os.networkInterfaces(),
+): Promise<void> => {
+  if (hostname) {
+    await addOrUpdateEnvVariable(envPath, 'hostname', hostname)
+  }
+  const ip = interfaces["eth0"]?.find((iface) => iface.family === "IPv4")?.address
+  if (ip) {
+    log(`Found IP address ${ip} for instance ${instanceId}`)
+    await addOrUpdateEnvVariable(envPath, 'ip', ip)
+  } else {
+    log(chalk.red(`No IP address found for instance ${instanceId}`))
+  }
+}
+
+/**
  * Create the containers of an instance (`docker compose create`) and set it to
  * Pauzed. Errors propagate to the caller (idea#109): startInstance turns them
  * into Error status and a failed command-log trace.
@@ -1249,27 +1272,9 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
   const mountRoot = await diskMountRoot(disk)
   log(`Creating the containers for the services of the app instance`)
 
-  // App-specific pre-processing commands
-  const app = store.appDB[instance.instanceOf]
-  if (app && app.name === 'nextcloud') {
-
-    // Pass the hostname to the compose file via .env
-    const localEngine = getLocalEngine(store)
-    const hostname = localEngine.hostname
-    if (hostname) {
-      await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'hostname', hostname)
-    }
-
-    // Pass the ip address to the compose file via .env
-    const interfaceData = os.networkInterfaces()
-    const ip = interfaceData["eth0"]?.find((iface) => iface.family === "IPv4")?.address
-    if (ip) {
-      log(`Found IP address ${ip} for instance ${instance.id}`)
-      await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'ip', ip)
-    } else {
-      log(chalk.red(`No IP address found for instance ${instance.id}`))
-    }
-  }
+  // Pass the Engine hostname and eth0 IP to every app's compose file via .env
+  // (previously Nextcloud only; apps such as the channel builder use ${hostname}).
+  await writeEngineHostEnv(`${mountRoot}/instances/${instance.id}/.env`, getLocalEngine(store).hostname, instance.id)
 
   log(`Creating containers of app instance '${instance.id}' on disk ${disk.id} of engine ${localEngineId}.`)
   try {
