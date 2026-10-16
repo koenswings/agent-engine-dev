@@ -274,6 +274,13 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
             log(`Disk ${disk.id} is an empty disk`)
             detectedTypes.push('empty')
         }
+        // #179: processAppDisk reconciles instance records only on an App Disk. On any other
+        // disk (e.g. a reset Empty) a record stored on it whose files are gone would survive
+        // the dock (idea#168 r82b kolibri-244pq…, r83 kolibri-kwffass…). Same handling as an App
+        // Disk: removeInstance (Missing, storedOn cleared).
+        if (!detectedTypes.includes('app')) {
+            await dropInstancesWithoutFiles(storeHandle, disk, mountRoot)
+        }
     }
 
     // Persist detected types to the store. Roles are listed in a fixed order
@@ -749,6 +756,18 @@ const tracedStartInstance = async (storeHandle: DocHandle<Store>, instance: Inst
         if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'error', e.message ?? String(e))
         throw e
     }
+}
+
+/** #179: on dock, the records stored on `disk` whose instances/<id> folder is missing are removed. */
+export const dropInstancesWithoutFiles = async (storeHandle: DocHandle<Store>, disk: Disk, mountRoot: string): Promise<InstanceID[]> => {
+    const dropped: InstanceID[] = []
+    for (const inst of getInstancesOfDisk(storeHandle.doc(), disk)) {
+        if (await fs.pathExists(`${mountRoot}/instances/${inst.id}`)) continue
+        removeInstance(storeHandle, disk, inst.id)
+        dropped.push(inst.id)
+    }
+    if (dropped.length) log(`Dock ${disk.id}: dropped ${dropped.length} instance record(s) without files: ${dropped.join(', ')}`)
+    return dropped
 }
 
 export const removeInstance = (storeHandle: DocHandle<Store>, disk: Disk, instanceId: InstanceID): void => {
