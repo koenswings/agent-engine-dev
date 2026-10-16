@@ -22,7 +22,7 @@ import { config } from '../../src/data/Config.js'
 import {
     addStick, removeStick, removeSticksOnDrive, usbStartupCleanup, syncUsbApps, classifyFsType,
     stickMountArgv, stickUmountArgv, setUsbStickOpsForTests, resetUsbSticksForTests, uniqueDisplayName,
-    findKolibriFolder, defaultUsbStickOps, UsbStickOps, StickProbe, IDEA_USB_JSON, STICK_MOUNT_OPTIONS,
+    findKolibriFolder, defaultUsbStickOps, stickBlockedBySiblings, UsbStickOps, StickProbe, IDEA_USB_JSON, STICK_MOUNT_OPTIONS,
 } from '../../src/data/UsbSticks.js'
 import { parseUsbMount, buildOverride, NEXTCLOUD_USB_SYNC } from '../../src/data/FilesMount.js'
 import { setBuilderAutoStartDepsForTests } from '../../src/data/ChannelBuilderAutoStart.js'
@@ -393,5 +393,53 @@ describe('idea#193 teacher USB sticks', () => {
                 config.settings.testMode = savedTest
             }
         })
+        it('FAT boot partition next to an ext4 root (RPi OS card) → never mounted, no stick, no Disk (idea#201 §10)', { timeout: 20_000 }, async () => {
+            const asked: string[] = []
+            setUsbStickOpsForTests({
+                ...fakeOps(st),
+                probe: async (d) => d === 'sdr1' ? probe({ uuid: 'BOOT', label: 'bootfs' }) : null,
+                drivePartitions: async (d) => { asked.push(d); return [
+                    { name: 'sdr1', fsType: 'vfat', partType: '0xc' },
+                    { name: 'sdr2', fsType: 'ext4', partType: '0x83' },
+                ] },
+            })
+            await fs.ensureDir(DEV_ROOT)
+            if (!watcher) watcher = await enableUsbDeviceMonitor(h)
+            await fs.writeFile(path.join(DEV_ROOT, 'sdr1'), '')
+            try {
+                expect(await waitFor(h, () => asked.includes('sdr1'))).toBe(true)
+                await new Promise(r => setTimeout(r, 300))
+                expect(st.calls.filter(c => c.includes('mount'))).toEqual([])
+                expect(st.mounts).toEqual([])
+                expect(h.doc().engineDB[localEngineId].usbSticks ?? []).toEqual([])
+                expect(Object.values(h.doc().diskDB).some(d => d.device === 'sdr1')).toBe(false)
+                expect(fs.existsSync(path.join(usbRootDir, 'sdr1'))).toBe(false)
+            } finally {
+                await fs.remove(path.join(DEV_ROOT, 'sdr1'))
+                config.settings.testMode = savedTest
+            }
+        })
+    })
+})
+
+describe('stickBlockedBySiblings (idea#201 §10 follow-up)', () => {
+    const P = (name: string, fsType: string | null, partType: string | null = null) => ({ name, fsType, partType })
+    it('FAT-only drive is a stick', () => {
+        expect(stickBlockedBySiblings('sdb1', [P('sdb1', 'vfat', '0xc')])).toBeNull()
+        expect(stickBlockedBySiblings('sdb1', [P('sdb1', 'exfat', '0x7'), P('sdb2', 'vfat', '0xc')])).toBeNull()
+        expect(stickBlockedBySiblings('sdb1', [])).toBeNull()
+    })
+    it('RPi OS / Ubuntu card (vfat boot + ext4 root) is blocked', () => {
+        expect(stickBlockedBySiblings('sdc1', [P('sdc1', 'vfat', '0xc'), P('sdc2', 'ext4', '0x83')])).toMatch(/sdc2.*ext4/)
+    })
+    it('IDEA disk (ext4 with META) next to a FAT partition is blocked', () => {
+        expect(stickBlockedBySiblings('sda1', [P('sda1', 'vfat'), P('sda2', 'ext4', '0fc63daf-8483-4772-8e79-3d69d8477de4')])).not.toBeNull()
+    })
+    it('Linux partition whose fstype udev has not probed yet is blocked by its type', () => {
+        expect(stickBlockedBySiblings('sdc1', [P('sdc1', 'vfat'), P('sdc2', null, '0x83')])).toMatch(/Linux partition/)
+        expect(stickBlockedBySiblings('sdc1', [P('sdc1', 'vfat'), P('sdc2', null, '0FC63DAF-8483-4772-8E79-3D69D8477DE4')])).not.toBeNull()
+    })
+    it('the device itself is ignored', () => {
+        expect(stickBlockedBySiblings('sdc2', [P('sdc2', 'ext4', '0x83')])).toBeNull()
     })
 })

@@ -77,7 +77,45 @@ export interface StickProbe {
     model: string | null
 }
 
+/** One partition of the drive a stick candidate sits on (lsblk only, nothing mounted). */
+export interface DrivePartition {
+    name: string
+    fsType: string | null
+    /** GPT type GUID or MBR type (0x83 = Linux), from lsblk PARTTYPE */
+    partType: string | null
+}
+
+/** Linux filesystem partition types: MBR 0x83 and the GPT Linux filesystem / root (arm64, x86-64) GUIDs. */
+const LINUX_PART_TYPES = new Set([
+    '0x83',
+    '0fc63daf-8483-4772-8e79-3d69d8477de4',
+    'b921b045-1df0-41c3-af44-4c6f280d3fae',
+    '4f68bce3-e8cd-4db1-96e7-fbcaf984b709',
+])
+
+/**
+ * idea#201 §10 follow-up: a FAT/exFAT partition on a drive that also carries an
+ * OS root or IDEA partition (ext4, with or without META.yaml) is the boot
+ * partition of an SD card / OS disk, never a teacher stick. Decided from lsblk
+ * alone, so the partition is not mounted at all. Returns the reason, or null for
+ * a real stick (FAT-only drive).
+ */
+export const stickBlockedBySiblings = (device: string, parts: DrivePartition[]): string | null => {
+    for (const p of parts) {
+        if (p.name === device) continue
+        const fs = (p.fsType ?? '').toLowerCase()
+        const pt = (p.partType ?? '').toLowerCase()
+        if (fs === 'ext4' || fs === 'ext3' || fs === 'ext2' || fs === 'btrfs' || fs === 'xfs' || fs === 'f2fs')
+            return `${p.name} on the same drive is ${fs} (OS root or IDEA partition)`
+        if (LINUX_PART_TYPES.has(pt))
+            return `${p.name} on the same drive is a Linux partition (type ${pt})`
+    }
+    return null
+}
+
 export interface UsbStickOps {
+    /** lsblk -J -o NAME,FSTYPE,PARTTYPE of the whole drive (partitions only); never mounts */
+    drivePartitions(device: string): Promise<DrivePartition[]>
     /** lsblk -J -b -o NAME,FSTYPE,LABEL,UUID,SIZE,MODEL /dev/<dev> (+ the drive's model) */
     probe(device: string): Promise<StickProbe | null>
     listMounts(): Promise<MountEntry[]>
@@ -96,6 +134,15 @@ export interface UsbStickOps {
 }
 
 export const defaultUsbStickOps: UsbStickOps = {
+    drivePartitions: async (device) => {
+        const drive = driveNameOf(device)
+        const out = await $`lsblk -J -o NAME,FSTYPE,PARTTYPE /dev/${drive}`.nothrow()
+        if (out.exitCode !== 0 || !out.stdout.trim()) return []
+        try {
+            const root = (JSON.parse(out.stdout)?.blockdevices ?? [])[0]
+            return ((root?.children ?? []) as any[]).map(c => ({ name: String(c.name), fsType: c.fstype ?? null, partType: c.parttype ?? null }))
+        } catch { return [] }
+    },
     probe: async (device) => {
         const out = await $`lsblk -J -b -o NAME,FSTYPE,LABEL,UUID,SIZE,MODEL /dev/${device}`.nothrow()
         if (out.exitCode !== 0 || !out.stdout.trim()) return null

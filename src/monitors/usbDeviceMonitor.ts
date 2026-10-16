@@ -18,7 +18,7 @@ import { DocHandle } from '@automerge/automerge-repo';
 import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js';
 import { runWithTrace } from '../utils/CommandLogger.js';
 import { recordDiskDetectionFailure, errorMessage } from './diskDetection.js';
-import { addStick, classifyFsType, removeStick, removeSticksOnDrive, usbStartupCleanup, usbStickOps, usbStickRoutingActive, syncUsbApps } from '../data/UsbSticks.js'
+import { addStick, classifyFsType, stickBlockedBySiblings, removeStick, removeSticksOnDrive, usbStartupCleanup, usbStickOps, usbStickRoutingActive, syncUsbApps } from '../data/UsbSticks.js'
 import { lookForIdeaMeta, safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointOf } from './mounts.js';
 
 /**
@@ -118,6 +118,17 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         if (await isSystemDevice(device) || device === systemBootDevice || device === systemDevice) {
             log(`Device ${device} (${probe.fsType}) is on the system drive — never mounted as a USB stick`)
             return true
+        }
+        // idea#201 §10 follow-up: the FAT boot partition of an OS / IDEA disk is
+        // not a stick. Decided from lsblk only; never mounted, never registered.
+        if (driveNameOf(device) !== device) {
+            let parts: Awaited<ReturnType<ReturnType<typeof usbStickOps>['drivePartitions']>> = []
+            try { parts = await usbStickOps().drivePartitions(device) } catch (e) { log(`USB stick sibling check of ${device}: ${errorMessage(e)}`) }
+            const why = stickBlockedBySiblings(device, parts)
+            if (why) {
+                log(`Device ${device} (${probe.fsType}) is not a teacher stick: ${why} — not mounted`)
+                return true
+            }
         }
         const result = await addStick(storeHandle, device, probe)
         if (!result.ok) recordDiskDetectionFailure('mount', result.message, { device })
