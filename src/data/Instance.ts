@@ -187,16 +187,49 @@ export const recordInstanceStartWarnings = async (
 }
 
 /**
- * Set an instance to Error with a diagnosis in statusCondition.
+ * Why an instance must not be set to Error: its disk is gone or no longer
+ * docked, or the instance is already Undocked (the eject's stop already moved
+ * it there). null when Error may be written. The same checks as runInstance's
+ * stillStartable guard on the success path.
  */
-export const markInstanceError = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, e: unknown): Promise<void> => {
+export const undockedReason = (doc: Store | undefined, instanceId: InstanceID, diskId: DiskID): string | null => {
+  const currentDisk = doc?.diskDB[diskId as any]
+  if (!currentDisk) return `disk ${diskId} is gone`
+  if (!currentDisk.dockedTo) return `disk ${diskId} is no longer docked`
+  if (doc?.instanceDB[instanceId as any]?.status === 'Undocked') return `instance ${instanceId} is already Undocked`
+  return null
+}
+
+/**
+ * Set an instance to Error with a diagnosis in statusCondition.
+ *
+ * Not when its disk was ejected or undocked while the failing step ran (r53: a
+ * start still in compose up / assertInstancePortReady when the disk was ejected
+ * failed afterwards with ENOENT, and Error overwrote Undocked). Then the status
+ * stays Undocked and this is logged. Returns whether Error was written.
+ */
+export const markInstanceError = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, e: unknown): Promise<boolean> => {
+  const before = undockedReason(storeHandle.doc(), instance.id, disk.id)
+  if (before) {
+    log(`Instance ${instance.id} failed after its disk was undocked (${before}) — leaving it Undocked, not Error: ${e instanceof Error ? e.message : String(e)}`)
+    return false
+  }
   const condition = await diagnoseInstance(instance, disk, e)
+  let skipped: string | null = null
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
     if (!inst) return
+    // Re-check inside the change: the eject may have run while diagnoseInstance did
+    skipped = undockedReason(doc as Store, instance.id, disk.id)
+    if (skipped) return
     inst.status = 'Error' as Status
     inst.statusCondition = condition
   })
+  if (skipped) {
+    log(`Instance ${instance.id} failed after its disk was undocked (${skipped}) — leaving it Undocked, not Error`)
+    return false
+  }
+  return true
 }
 
 // ── Start / stop step definitions ────────────────────────────────────────────
