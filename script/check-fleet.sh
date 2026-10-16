@@ -1,7 +1,10 @@
 #!/bin/bash
 # check-fleet.sh — Quick status check for all IDEA Pi fleet nodes
 #
-# Usage: ./script/check-fleet.sh
+# Usage: ./script/check-fleet.sh [node ...]
+#   Nodes are any Pi names (sticker names like brave-otter, or idea01-04),
+#   given as arguments, else in $IDEA_FLEET_NODES, else the /etc/hosts lines
+#   tagged "# idea-fleet" or named ideaNN.local (idea#184: no number scheme).
 #
 # Reads fleet config from docs/PI_FLEET.md (name.local entries in /etc/hosts)
 # and checks SSH reachability + Engine status on each.
@@ -13,7 +16,13 @@ SSH_USER="pi"
 ENGINE_PATH="/home/pi/idea/agents/agent-engine-dev"
 
 # Read fleet nodes from /etc/hosts (lines added by provision-fleet.sh)
-NODES=$(grep "idea0[0-9]\.local" /etc/hosts | awk '{print $2}' | sort -u)
+if (( $# > 0 )); then
+  NODES="$*"
+elif [[ -n "${IDEA_FLEET_NODES:-}" ]]; then
+  NODES="$IDEA_FLEET_NODES"
+else
+  NODES=$( { grep -E "#[[:space:]]*idea-fleet" /etc/hosts; grep -E "idea0[0-9]\.local" /etc/hosts; } | awk '{print $2}' | sort -u)
+fi
 
 if [[ -z "$NODES" ]]; then
   echo "No fleet nodes found in /etc/hosts. Run provision-fleet.sh first."

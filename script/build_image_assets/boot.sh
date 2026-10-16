@@ -25,6 +25,9 @@ if [[ -f $FLAG ]]; then
   #    the .js imports to .ts sources). /usr/local/bin holds the node from `n`.
   #    Runs as pi (sudo -u pi), not root, so it leaves no root-owned files in the
   #    Engine tree (idea#80). The root steps inside it use sudo themselves.
+  #    A clone of the master image carries the master's sticker name in
+  #    /etc/idea/sticker-name; drop it so this Pi gets its own unique name (idea#184).
+  rm -f /etc/idea/sticker-name /home/pi/STICKER.txt
   echo "--> Setting hostname and META.yaml via build-engine.ts --personalize" >> /home/pi/boot.out
   (cd /home/pi/idea/agents/agent-engine-dev && sudo -u pi -H env PATH=/usr/local/bin:$PATH ./node_modules/.bin/tsx script/build-engine.ts --personalize) >> /home/pi/boot.out 2>&1
 
