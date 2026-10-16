@@ -49,12 +49,16 @@ These commands perform actions on the system. Some are restricted to an `engine`
   - `--source` given: copies the app bundle from a docked disk (works offline).
   - No `--source`, internet available: clones from GitHub (same as the old `createInstance`).
   - No `--source`, no internet: searches `appDB` for a locally known source disk; fails with a clear message if none found.
-- **Usage:** `installApp <appId> <targetDiskId> [--source <sourceDiskId>] [--name <instanceName>]` (idea#128). The target and source are disk ids (the Console sends `disk.id`), resolved by the shared disk resolver (see [Disk arguments](#disk-arguments)). Both must be docked to this engine; a disk on another engine or an undocked record is refused (the old any-engine and undocked fallbacks are gone). Every refusal and usage error ends the command trace as `error` with the reason.
+- **Usage:** `installApp <appId> <targetDiskId> [--source <sourceDiskId>] [--name <instanceName>] [--fresh]` (idea#128). The target and source are disk ids (the Console sends `disk.id`), resolved by the shared disk resolver (see [Disk arguments](#disk-arguments)). Both must be docked to this engine; a disk on another engine or an undocked record is refused (the old any-engine and undocked fallbacks are gone). Every refusal and usage error ends the command trace as `error` with the reason.
 - **Scope:** `engine`
 - **Examples:**
   - `installApp kolibri-1.0 f3a9c2d1` — auto-route (online → GitHub, offline → appDB lookup)
   - `installApp kolibri-1.0 f3a9c2d1 --source 7be04c11` — copy from a docked catalog disk
   - `installApp kolibri-1.0 f3a9c2d1 --source 7be04c11 --name school-kolibri` — custom instance name
+  - `installApp kolibri-1.0 f3a9c2d1 --source 7be04c11 --name "Kolibri Demo" --fresh` — display name with a space, clean instance (idea#235)
+- **Arguments are quote-aware:** the line is split with the shared `splitArgs` (see [Quoted arguments](#disk-arguments)), so a value with spaces goes in double quotes (`--name "Kolibri Demo"`). Lines without a `"` split exactly as before. An unexpected extra argument (e.g. an unquoted `--name Kolibri Demo`) is refused with the usage line.
+- **`--name`:** the instance's display name. It is checked (not empty or blank, at most 64 characters, no control characters or newlines) and written to `x-app.instanceName` in the new instance's `compose.yaml` and to the store record, on both the GitHub route and the disk route. The instance id and folder, and so the Docker project, container and volume names, are still the generated id and never contain the name. Default: the appId.
+- **`--fresh`:** disk route only. The new instance starts from the app bundle's `compose.yaml` with an empty data directory; no data is copied from an existing instance on the source disk. Without `--fresh` the disk route still copies the source disk's instance of the app as the starting point (unchanged). Use `--fresh` for demo instances so they never inherit a school's data. The GitHub route always starts clean.
 
 ### `createInstance` *(deprecated)*
 - **Description:** Deprecated alias for `installApp`. Use `installApp` instead. Builds a new application instance from a git repository.
@@ -167,7 +171,7 @@ Every refusal throws, so the command trace ends as `error`. The resolver does no
 
 A Console can tell whether the Engine takes disk ids from the Engine record: `capabilities.includes('diskIdArgs') && capabilitiesBootedAt === lastBooted` (see ARCHITECTURE.md, Engine capabilities).
 
-A disk name with spaces can be passed as one argument in double quotes, e.g. `restoreApp kolibri "Duration Tests — Add Files App"` (idea#168). A token that starts with `"` runs to the next `"` that ends a token; the quotes are removed. Lines without a `"` are split on spaces exactly as before. Commands that take the whole rest of the line as one argument (`send`, `installApp`, `connect`, `buildEngine`) are not affected.
+A disk name with spaces can be passed as one argument in double quotes, e.g. `restoreApp kolibri "Duration Tests — Add Files App"` (idea#168). A token that starts with `"` runs to the next `"` that ends a token; the quotes are removed. Lines without a `"` are split on spaces exactly as before. Commands that take the whole rest of the line as one argument (`send`, `connect`, `buildEngine`) are not affected; `installApp` takes the rest of the line and splits it with the same quote-aware `splitArgs`.
 
 `createFilesDisk` (idea#131) is new and takes the disk ID only: it uses `lookupDiskById` (the id rule above, without the name fallback). A Console knows the Engine has it when `capabilities.includes('filesDisk') && capabilitiesBootedAt === lastBooted`. Files binds into Apps (`Instance.filesMounts`) need `capabilities.includes('filesMount')` as well (idea#133). Erase needs `capabilities.includes('eraseDisk')` (idea#134).
 
