@@ -275,6 +275,7 @@ describe('production mode (testMode off): real startup disk scan and USB add', (
             fsUuidAt: async (p: string) => mounts.some(m => m.target === p) ? 'AAAA-1111' : null,
             mkdir: async () => {},
             mount: async (d: string) => { mounts.push({ source: `/dev/${d}`, target: mountPointOf(d), fstype: 'ext4' }) },
+            mountReadOnly: async (d: string) => { mounts.push({ source: `/dev/${d}`, target: mountPointOf(d), fstype: 'ext4' }) },
             umount: async (d: string) => { mounts = mounts.filter(m => m.target !== mountPointOf(d)) },
             rmdir: async () => {},
         })

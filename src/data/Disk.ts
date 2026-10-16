@@ -10,7 +10,7 @@ import { addTrace, closeTrace } from './CommandLogStore.js';
 import { runWithTrace } from '../utils/CommandLogger.js';
 import { disksRoot } from './Config.js';
 import { FilesConfig, hasFilesYaml, processFilesDisk } from './FilesDisk.js';
-import { parseFilesMount } from './FilesMount.js';
+import { parseFilesMount, parseUsbMount } from './FilesMount.js';
 import { updateDiskSize } from './DiskSize.js';
 import { recordDiskDetectionFailure } from '../monitors/diskDetection.js';
 import { shouldAutoStart } from './AutoStart.js';
@@ -274,6 +274,13 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
             log(`Disk ${disk.id} is an empty disk`)
             detectedTypes.push('empty')
         }
+        // #179: processAppDisk reconciles instance records only on an App Disk. On any other
+        // disk (e.g. a reset Empty) a record stored on it whose files are gone would survive
+        // the dock (idea#168 r82b kolibri-244pq…, r83 kolibri-kwffass…). Same handling as an App
+        // Disk: removeInstance (Missing, storedOn cleared).
+        if (!detectedTypes.includes('app')) {
+            await dropInstancesWithoutFiles(storeHandle, disk, mountRoot)
+        }
     }
 
     // Persist detected types to the store. Roles are listed in a fixed order
@@ -445,9 +452,10 @@ export const processSystemDisk = async (storeHandle: DocHandle<Store>, disk: Dis
 /**
  * Process a single app on the system disk (reads from /apps/<appId>/compose.yaml).
  */
-export const processSystemApp = async (storeHandle: DocHandle<Store>, disk: Disk, appId: AppID): Promise<App | undefined> => {
+export const processSystemApp = async (storeHandle: DocHandle<Store>, disk: Disk, appId: AppID, appsRoot: string = '/apps'): Promise<App | undefined> => {
     try {
-        const appComposeFile = await $`cat /apps/${appId}/compose.yaml`
+        // appsRoot is a parameter only so tests can point it at a fixture folder
+        const appComposeFile = await $`cat ${appsRoot}/${appId}/compose.yaml`
         const appCompose = YAML.parse(appComposeFile.stdout)
         let app: App
         storeHandle.change(doc => {
@@ -466,12 +474,23 @@ export const processSystemApp = async (storeHandle: DocHandle<Store>, disk: Disk
                     icon: xapp.icon ?? null,
                     author: xapp.author ?? null,
                     filesMount: parseFilesMount(xapp),
+                    usbMount: parseUsbMount(xapp),
                 }
                 doc.appDB[appId] = app
             } else {
                 log(`Updating existing system app ${appId}`)
+                // Same granular update as createOrUpdateApp (App.ts): every x-app field is refreshed
                 app = storedApp
+                app.name = extractAppName(appId)
+                app.version = extractAppVersion(appId)
+                app.title = xapp.title
+                app.description = xapp.description ?? null
+                app.url = xapp.url ?? null
+                app.category = xapp.category
+                app.icon = xapp.icon ?? null
+                app.author = xapp.author ?? null
                 app.filesMount = parseFilesMount(xapp)
+                app.usbMount = parseUsbMount(xapp)
             }
         })
         return app!
@@ -479,6 +498,60 @@ export const processSystemApp = async (storeHandle: DocHandle<Store>, disk: Disk
         log(`Error processing system app ${appId}: ${e}`)
         return undefined
     }
+}
+
+/**
+ * Create or update the store record of a system-disk instance from its compose.yaml.
+ * Same rules as createOrUpdateInstance (docked disks): instanceOf, name and
+ * serviceImages follow the instance's compose x-app on every pass, so an instance
+ * whose compose now names a newer app version moves to that app record (and gets
+ * its usbMount / filesMount). Stopped is preserved; Missing/Undocked/Error → Docked.
+ */
+export const upsertSystemInstanceRecord = (storeHandle: DocHandle<Store>, disk: Disk, instanceId: InstanceID, compose: any): Instance | undefined => {
+    let instance: Instance | undefined
+    const services = Object.keys(compose.services)
+    const serviceImages = services.map((s: string) => compose.services[s].image)
+    const instanceName = compose['x-app'].instanceName
+    const appId = createAppId(compose['x-app'].name, compose['x-app'].version) as AppID
+    storeHandle.change(doc => {
+        const stored = doc.instanceDB[instanceId]
+        if (!stored) {
+            log(`Creating new system instance ${instanceId}`)
+            const newInst: Instance = {
+                id: instanceId,
+                instanceOf: appId,
+                name: instanceName,
+                storedOn: disk.id,
+                status: 'Docked' as Status,
+                statusCondition: null,
+                port: 0 as PortNumber,
+                serviceImages: serviceImages as ServiceImage[],
+                created: new Date().getTime() as Timestamp,
+                lastBackup: null,
+                lastStarted: 0 as Timestamp,
+                currentStep: null,
+                totalSteps: null,
+                stepLabel: null,
+                metrics: null,
+            }
+            doc.instanceDB[instanceId] = newInst
+            instance = newInst
+        } else {
+            log(`Updating existing system instance ${instanceId}`)
+            if (stored.instanceOf !== appId) log(`System instance ${instanceId} moves from app ${stored.instanceOf} to ${appId}`)
+            stored.instanceOf = appId
+            stored.name = instanceName
+            stored.storedOn = disk.id
+            stored.serviceImages = serviceImages as ServiceImage[]
+            // Preserve Stopped status — same rule as createOrUpdateInstance:
+            // only reset to Docked from transient/detached states.
+            if (stored.status === 'Missing' || stored.status === 'Undocked' || stored.status === 'Error') {
+                stored.status = 'Docked' as Status
+            }
+            instance = stored
+        }
+    })
+    return instance
 }
 
 /**
@@ -491,43 +564,7 @@ export const processSystemInstance = async (storeHandle: DocHandle<Store>, disk:
     try {
         const composeFile = await $`cat /instances/${instanceId}/compose.yaml`
         const compose = YAML.parse(composeFile.stdout)
-        const services = Object.keys(compose.services)
-        const serviceImages = services.map((s: string) => compose.services[s].image)
-        const instanceName = compose['x-app'].instanceName
-        storeHandle.change(doc => {
-            const stored = doc.instanceDB[instanceId]
-            if (!stored) {
-                log(`Creating new system instance ${instanceId}`)
-                const newInst: Instance = {
-                    id: instanceId,
-                    instanceOf: createAppId(compose['x-app'].name, compose['x-app'].version) as AppID,
-                    name: instanceName,
-                    storedOn: disk.id,
-                    status: 'Docked' as Status,
-                    statusCondition: null,
-                    port: 0 as PortNumber,
-                    serviceImages: serviceImages as ServiceImage[],
-                    created: new Date().getTime() as Timestamp,
-                    lastBackup: null,
-                    lastStarted: 0 as Timestamp,
-                    currentStep: null,
-                    totalSteps: null,
-                    stepLabel: null,
-                    metrics: null,
-                }
-                doc.instanceDB[instanceId] = newInst
-                instance = newInst
-            } else {
-                log(`Updating existing system instance ${instanceId}`)
-                stored.storedOn = disk.id
-                // Preserve Stopped status — same rule as createOrUpdateInstance:
-                // only reset to Docked from transient/detached states.
-                if (stored.status === 'Missing' || stored.status === 'Undocked' || stored.status === 'Error') {
-                    stored.status = 'Docked' as Status
-                }
-                instance = stored
-            }
-        })
+        instance = upsertSystemInstanceRecord(storeHandle, disk, instanceId, compose)
     } catch (e) {
         log(`Error processing system instance ${instanceId}: ${e}`)
         return undefined
@@ -719,6 +756,18 @@ const tracedStartInstance = async (storeHandle: DocHandle<Store>, instance: Inst
         if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'error', e.message ?? String(e))
         throw e
     }
+}
+
+/** #179: on dock, the records stored on `disk` whose instances/<id> folder is missing are removed. */
+export const dropInstancesWithoutFiles = async (storeHandle: DocHandle<Store>, disk: Disk, mountRoot: string): Promise<InstanceID[]> => {
+    const dropped: InstanceID[] = []
+    for (const inst of getInstancesOfDisk(storeHandle.doc(), disk)) {
+        if (await fs.pathExists(`${mountRoot}/instances/${inst.id}`)) continue
+        removeInstance(storeHandle, disk, inst.id)
+        dropped.push(inst.id)
+    }
+    if (dropped.length) log(`Dock ${disk.id}: dropped ${dropped.length} instance record(s) without files: ${dropped.join(', ')}`)
+    return dropped
 }
 
 export const removeInstance = (storeHandle: DocHandle<Store>, disk: Disk, instanceId: InstanceID): void => {

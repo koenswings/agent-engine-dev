@@ -48,6 +48,12 @@ export interface MountOps {
     mkdir(device: string): Promise<void>
     /** `sudo /usr/bin/mount -t ext4 /dev/<device> <disksRoot>/<device>` (idea#134) */
     mount(device: string): Promise<void>
+    /**
+     * Read-only look (idea#201 §10 rule 1):
+     * `sudo /usr/bin/mount -t ext4 -o ro,noload /dev/<device> <disksRoot>/<device>`.
+     * noload skips the journal replay, so nothing at all is written to the device.
+     */
+    mountReadOnly(device: string): Promise<void>
     /** `sudo umount <disksRoot>/<device>` (removes the top mount only) */
     umount(device: string): Promise<void>
     /** Remove the empty mount point folder (see removeMountPointFolder) */
@@ -65,6 +71,9 @@ export const SUDO_RMDIR = '/usr/bin/rmdir'
  */
 export const SUDO_MOUNT = '/usr/bin/mount'
 export const SUDO_MOUNT_PATTERN = '/usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]'
+export const SUDO_MOUNT_RO_PATTERN = '/usr/bin/mount -t ext4 -o ro,noload /dev/sd[a-z][12] /disks/sd[a-z][12]'
+export const mountExt4ReadOnlyCommand = (device: string, mountPoint: string): string[] =>
+    [SUDO_MOUNT, '-t', 'ext4', '-o', 'ro,noload', `/dev/${device}`, mountPoint]
 export const mountExt4Command = (device: string, mountPoint: string): string[] =>
     [SUDO_MOUNT, '-t', 'ext4', `/dev/${device}`, mountPoint]
 
@@ -114,6 +123,11 @@ export const defaultMountOps: MountOps = {
         const mp = `${disksRoot()}/${device}`
         // Exact argv order required by 11-engine-files (idea#134)
         await $`sudo /usr/bin/mount -t ext4 /dev/${device} ${mp}`
+    },
+    mountReadOnly: async (device) => {
+        const mp = `${disksRoot()}/${device}`
+        // Exact argv order required by 11-engine-files (idea#201 §10)
+        await $`sudo /usr/bin/mount -t ext4 -o ro,noload /dev/${device} ${mp}`
     },
     umount: async (device) => { await $`sudo umount ${disksRoot()}/${device}` },
     rmdir: removeMountPointFolder,
@@ -200,6 +214,57 @@ export const safeMount = async (device: string, ops: MountOps = mountOps()): Pro
     }
     const fsUuid = await ops.fsUuidOfDevice(device).catch(() => null)
     return { ok: true, alreadyMounted, fsUuid }
+}
+
+// ── Read-only look (idea#201 §10 rule 1) ────────────────────────────────────
+
+export type IdeaLookResult =
+    | { ok: true, hasMeta: boolean, alreadyMounted: boolean }
+    | { ok: false, message: string }
+
+/**
+ * Decide whether /dev/<device> is an IDEA disk WITHOUT writing to it
+ * (idea#201 §10 rule 1). A device that is not mounted yet is mounted
+ * read-only (ext4 ro,noload) on <disksRoot>/<device>, META.yaml is looked
+ * for, and the device is unmounted again and the mount point removed. Only
+ * a device with META.yaml may then be mounted read-write (safeMount).
+ * A device that is already mounted at its target (Engine restart) is looked
+ * at in place and left as it is. A busy target or a device mounted elsewhere
+ * is refused, as in safeMount.
+ */
+export const lookForIdeaMeta = async (
+    device: string,
+    ops: MountOps = mountOps(),
+    metaExists: (mountPoint: string) => boolean = (mp) => fs.existsSync(`${mp}/META.yaml`),
+): Promise<IdeaLookResult> => {
+    const target = mountPointOf(device)
+    const check = await checkMountState(device, ops)
+    if (check.state === 'targetBusy') {
+        return { ok: false, message: `Refusing to look at /dev/${device}: ${target} is already a mount point` }
+    }
+    if (check.state === 'deviceElsewhere') {
+        return { ok: false, message: `Refusing to look at /dev/${device}: it is already mounted (${check.mounts.map(m => m.target).join(', ')})` }
+    }
+    if (check.state === 'mounted') {
+        return { ok: true, hasMeta: metaExists(target), alreadyMounted: true }
+    }
+    try {
+        await ops.mkdir(device)
+        await ops.mountReadOnly(device)
+    } catch (e) {
+        await ops.rmdir(target).catch(() => undefined)
+        return { ok: false, message: `Could not mount /dev/${device} read-only on ${target}: ${e instanceof Error ? e.message : String(e)}` }
+    }
+    let hasMeta = false
+    try {
+        hasMeta = metaExists(target)
+    } finally {
+        const released = await unmountAndRemove(device, ops)
+        if (!released.ok) {
+            return { ok: false, message: `Read-only look at /dev/${device}: ${released.message}` }
+        }
+    }
+    return { ok: true, hasMeta, alreadyMounted: false }
 }
 
 // ── Unmounting ──────────────────────────────────────────────────────────────

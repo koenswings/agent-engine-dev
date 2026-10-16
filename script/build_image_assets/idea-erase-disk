@@ -5,6 +5,10 @@
 # Allowed by sudoers with no argument list; this script validates every argument.
 #
 # Usage: idea-erase-disk <device> <serial|-> <sizeBytes> <label> <stagingDir>
+#        idea-erase-disk --check-table <device>
+#          Read-only. Prints one line "hidden: <partition> <sfdisk fields>" for every
+#          partition in the on-disk partition table that the kernel does not show
+#          (no /sys/block/<disk>/<partition>), e.g. after a failed re-read. Exit 0.
 #   device     /^\/dev\/sd[a-z]$/  (whole disk only)
 #   serial     "-" or a short safe string matching the disk
 #   sizeBytes  digits; must match lsblk SIZE
@@ -26,9 +30,34 @@ MKFS=/usr/sbin/mkfs.ext4
 UDEVADM=/usr/bin/udevadm
 STAT=/usr/bin/stat
 REALPATH=/usr/bin/realpath
+SYS_BLOCK=/sys/block
 
 die() { echo "refused: $*" >&2; exit 1; }
 step() { echo "STEP:$*"; }
+
+# Partitions in the on-disk table (sfdisk -d) with no kernel block device.
+# lsblk/findmnt only see what the kernel shows, so a partition the kernel
+# missed would otherwise be wiped without any check (#188, idea01 sda1).
+hidden_partitions() {
+  local dev="$1" dump rc=0 line part rest
+  dump=$($SFDISK -d "$dev" 2>&1) || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    if grep -q "does not contain a recognized partition table" <<<"$dump"; then return 0; fi
+    die "cannot read the partition table of $dev"
+  fi
+  while IFS= read -r line; do
+    [[ "$line" =~ ^/dev/(sd[a-z][0-9]+)[[:space:]]*:[[:space:]]*(.*)$ ]] || continue
+    part="${BASH_REMATCH[1]}"; rest="${BASH_REMATCH[2]}"
+    [[ -e "$SYS_BLOCK/${dev#/dev/}/$part" ]] || echo "hidden: $part $rest"
+  done <<<"$dump"
+}
+
+if [[ "${1:-}" == "--check-table" ]]; then
+  DEVICE="${2:-}"
+  [[ "$DEVICE" =~ ^/dev/sd[a-z]$ ]] || die "device must be a whole disk /dev/sdX (got '${DEVICE:-}')"
+  hidden_partitions "$DEVICE"
+  exit 0
+fi
 
 DEVICE="${1:-}"
 SERIAL="${2:-}"
@@ -122,6 +151,13 @@ fi
 part_base=${DEVICE#/dev/}
 if $FINDMNT -n 2>/dev/null | grep -E "/dev/${part_base}[0-9]" >/dev/null 2>&1; then
   die "a partition of $DEVICE is still mounted"
+fi
+
+# Partitions in the table that the kernel does not show (never in lsblk/findmnt)
+hidden=$(hidden_partitions "$DEVICE")
+if [[ -n "$hidden" ]]; then
+  names=$(awk '{print $2}' <<<"$hidden" | paste -sd, -)
+  die "the partition table of $DEVICE has partitions the kernel does not show ($names)"
 fi
 
 # ── Destructive path (trap wipefs -a on error) ───────────────────────────────
