@@ -1,25 +1,26 @@
 import chokidar from 'chokidar'
-import { getKeys, log, uuid } from '../utils/utils.js'
-import { DiskMeta, readHardwareId, readMetaUpdateId, writeMetaFile } from '../data/Meta.js';
+import { getKeys, log } from '../utils/utils.js'
+import { DiskMeta, readMetaUpdateId } from '../data/Meta.js';
 import { $, fs, YAML, chalk } from 'zx'
 
 $.verbose = false;
 import { Disk, clearDuplicateDiskRecords, createOrUpdateDisk, isSystemDiskRecord, processDisk } from '../data/Disk.js'
 import { flushFilesRemountNow, optedInInstances } from '../data/FilesMount.js'
+import { clearUndockPending, dockChangedReason, dockIdentityOf, ejectInFlightWaitMs, markUndockPending, waitInFlightOnDisk } from '../data/InstanceInFlight.js'
 import { isSystemDevice, systemDriveNames, driveNameOf } from '../data/SystemDisk.js'
 import { refreshUnformattedDisks } from '../data/UnformattedDisks.js'
 import { isEraseDeviceLocked, setEraseAddDevice } from '../data/EraseDisk.js'
-import { findDiskByDevice, findDisksByDevice, Store, getDisksOfEngine, getLocalEngine } from '../data/Store.js'
+import { findDisksByDevice, Store, getDisksOfEngine, getLocalEngine } from '../data/Store.js'
 import { DeviceName, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../data/CommonTypes.js'
 
 import { Instance, Status, stopInstance } from '../data/Instance.js';
-import { config, disksRoot, skipMetaWrite } from '../data/Config.js'
+import { config, disksRoot } from '../data/Config.js'
 import { DocHandle } from '@automerge/automerge-repo';
 import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js';
 import { runWithTrace } from '../utils/CommandLogger.js';
 import { recordDiskDetectionFailure, errorMessage } from './diskDetection.js';
-import { addStick, classifyFsType, removeStick, removeSticksOnDrive, usbStartupCleanup, usbStickOps, usbStickRoutingActive, syncUsbApps } from '../data/UsbSticks.js'
-import { safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointOf } from './mounts.js';
+import { addStick, classifyFsType, stickBlockedBySiblings, removeStick, removeSticksOnDrive, usbStartupCleanup, usbStickOps, usbStickRoutingActive, syncUsbApps } from '../data/UsbSticks.js'
+import { lookForIdeaMeta, IdeaLookResult, safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointOf } from './mounts.js';
 
 /**
  * Filesystem UUID of each mounted device, recorded at mount time (or when an
@@ -105,6 +106,26 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     }
 
     /**
+     * idea#201 §10: one read-only META look per device, shared by the device's own
+     * addDevice and by the stick check of a FAT partition on the same drive, so
+     * they never race (two ro mounts of one device) and agree on the answer.
+     * Forgotten when the device is removed.
+     */
+    const metaLooks = new Map<string, Promise<IdeaLookResult>>()
+    const sharedMetaLook = (device: DeviceName): Promise<IdeaLookResult> => {
+        let p = metaLooks.get(device)
+        if (!p) {
+            p = !mountCommandsActive(config.settings.testMode)
+                ? Promise.resolve({ ok: true, hasMeta: fs.existsSync(`${disksRoot()}/${device}/META.yaml`), alreadyMounted: false } as IdeaLookResult)
+                : lookForIdeaMeta(device).catch(e => ({ ok: false, message: errorMessage(e) }) as IdeaLookResult)
+            metaLooks.set(device, p)
+            // A failed look may be retried on the next add event
+            p.then(r => { if (!r.ok && metaLooks.get(device) === p) metaLooks.delete(device) })
+        }
+        return p
+    }
+
+    /**
      * idea#193 §3.1: probe the filesystem type; vfat/exfat on a non-system disk is
      * mounted read-only as a teacher stick. Returns true when the device was a
      * stick (mounted, or refused with a recorded failure), false for ext4 and
@@ -119,9 +140,30 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
             log(`Device ${device} (${probe.fsType}) is on the system drive — never mounted as a USB stick`)
             return true
         }
+        // idea#201 §10 follow-up: the FAT boot partition of an OS card (Linux
+        // partition without META.yaml) is not a stick. The sibling is judged by
+        // the same shared read-only look its own addDevice uses, so the order of
+        // the add events does not matter. Never mounted, never registered.
+        if (driveNameOf(device) !== device) {
+            let parts: Awaited<ReturnType<ReturnType<typeof usbStickOps>['drivePartitions']>> = []
+            try { parts = await usbStickOps().drivePartitions(device) } catch (e) { log(`USB stick sibling check of ${device}: ${errorMessage(e)}`) }
+            const why = await stickBlockedBySiblings(device, parts, async (sib) => {
+                const look = await sharedMetaLook(sib as DeviceName)
+                return look.ok ? look.hasMeta : null
+            })
+            if (why) {
+                log(`Device ${device} (${probe.fsType}) is not a teacher stick: ${why} — not mounted`)
+                return true
+            }
+        }
         const result = await addStick(storeHandle, device, probe)
         if (!result.ok) recordDiskDetectionFailure('mount', result.message, { device })
         return true
+    }
+
+    /** idea#201 §10 rule 1: a device without IDEA META.yaml is left untouched. */
+    const logUnknownDisk = (device: DeviceName): void => {
+        log(`Device ${device} has no IDEA META.yaml — not an IDEA disk; left untouched (never mounted read-write, no META.yaml written)`)
     }
 
     const addDevice = async function (path: string) {
@@ -191,9 +233,30 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                     return
                 }
 
+                // idea#201 §10 rule 1: only a device with IDEA META.yaml is ever
+                // mounted read-write. Anything else (client SD cards, an Ubuntu or
+                // Raspberry Pi OS card, a foreign ext4 disk) is looked at read-only
+                // at most, released again, and never gets a META.yaml. Such a disk
+                // becomes an IDEA disk only through an explicit command
+                // (eraseDisk today, initialiseDisk later).
+                const metaPath = `${disksRoot()}/${device}/META.yaml`
                 if (!mountCommandsActive(config.settings.testMode)) {
                     log(`testMode: skipping mount for device ${device} — fixture expected at ${disksRoot()}/${device}`)
+                    if (!fs.existsSync(metaPath)) {
+                        logUnknownDisk(device)
+                        return
+                    }
                 } else {
+                    const look = await sharedMetaLook(device)
+                    if (!look.ok) {
+                        recordDiskDetectionFailure('mount', look.message, { device })
+                        return
+                    }
+                    if (!look.hasMeta) {
+                        if (look.alreadyMounted) log(`Device ${device} is already mounted without META.yaml — left as it is`)
+                        logUnknownDisk(device)
+                        return
+                    }
                     // findmnt-based check by target and source, for every filesystem
                     // type; never mounts twice or onto an existing mount point (idea#126)
                     const result = await safeMount(device)
@@ -205,68 +268,14 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                     log(result.alreadyMounted ? `Device ${device} already mounted` : `Device ${device} has been successfully mounted`)
                 }
 
-                let meta: DiskMeta
-                if (fs.existsSync(`${disksRoot()}/${device}/META.yaml`)) {
-                    log(`Found a META file on device ${device}. This disk has been processed by the system before.`)
-                    try {
-                        meta = await readMetaUpdateId(device)
-                        const disk: Disk = createOrUpdateDisk(storeHandle, localEngine.id, device, meta.diskId, meta.diskName, meta.created)
-                        await processDisk(storeHandle, disk)
-                    } catch (error) {
-                        log('Error processing the META file on the disk: ' + error)
-                        recordDiskDetectionFailure('readMeta', `Could not process META.yaml on ${device}: ${errorMessage(error)}`, { device })
-                    }
-                } else {
-                    // Before creating a new disk entry, check if a disk is already
-                    // registered for this device on THIS engine in the store. This prevents
-                    // spurious empty-disk entries when addDevice fires for a device that's
-                    // already docked (e.g. during docker compose up -d Recreate cycles).
-                    // Scoped to localEngine.id to avoid false matches on other engines' disks
-                    // in the shared CRDT store (e.g. all Pis having sda2 as the root device).
-                    const existingDisk = findDiskByDevice(storeHandle.doc(), device as DeviceName, localEngine.id)
-                    if (existingDisk) {
-                        log(`Device ${device} already has a registered disk (${existingDisk.id}) on this engine — skipping new disk creation`)
-                        return
-                    }
-                    log('Could not find a META file. Creating one now.')
-                    const diskId = await readHardwareId(device) as DiskID
-                    // The disk name should be the name of the volume if available, otherwise 'Unnamed Disk'
-                    let diskName: DiskName = 'Unnamed Disk' as DiskName
-                    try {
-                        const volumeNameOutput = await $`lsblk -no LABEL /dev/${device}`
-                        const volumeName = volumeNameOutput.stdout.trim()
-                        // Check if it is a valid volume name (not empty) - it should also not have any newlines
-                        if (volumeName && volumeName.length > 0 && !volumeName.includes('\n')) {
-                            diskName = volumeName as DiskName
-                        }
-                    } catch (e) {
-                        log(`Error reading volume name for device ${device}: ${e}`)
-                    }
-                    meta = {
-                        diskId: diskId ? diskId : uuid() as DiskID,
-                        isHardwareId: !!diskId,
-                        diskName: diskName,
-                        created: Date.now() as Timestamp,
-                        lastDocked: Date.now() as Timestamp
-                    }
-                    // Persist the identity on the disk (idea#121). Without this every
-                    // dock generated a new diskId (when there is no hardware serial)
-                    // and left an orphan diskDB entry behind. Under /disks the write goes through
-                    // sudo tee (11-engine-files). A failed write (read-only
-                    // mount, sudoers entry missing) is recorded and the disk is still registered.
-                    const metaPath = `${disksRoot()}/${device}/META.yaml`
-                    if (skipMetaWrite()) {
-                        log(`Not writing ${metaPath} (skipMetaWrite)`)
-                    } else {
-                        try {
-                            await writeMetaFile(meta, metaPath)
-                        } catch (e) {
-                            const idNote = meta.isHardwareId ? 'its id comes from the hardware serial' : 'it will get a new id on its next dock'
-                            recordDiskDetectionFailure('writeMeta', `Could not write META.yaml on ${device} (${idNote}); registering the disk anyway: ${errorMessage(e)}`, { device, diskId: meta.diskId })
-                        }
-                    }
+                log(`Found a META file on device ${device}. This disk has been processed by the system before.`)
+                try {
+                    const meta: DiskMeta = await readMetaUpdateId(device)
                     const disk: Disk = createOrUpdateDisk(storeHandle, localEngine.id, device, meta.diskId, meta.diskName, meta.created)
                     await processDisk(storeHandle, disk)
+                } catch (error) {
+                    log('Error processing the META file on the disk: ' + error)
+                    recordDiskDetectionFailure('readMeta', `Could not process META.yaml on ${device}: ${errorMessage(error)}`, { device })
                 }
             } catch (e) {
                 log(`Error processing device ${device}`)
@@ -284,6 +293,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         const device = path.split('/').pop()
         if (validDevice(device!)) {
             log(`Processing the removal of USB device ${device}`)
+            metaLooks.delete(device!)
             // Teacher sticks first (idea#193 §3.4): partition, or every stick of a whole drive
             const removedSticks = device!.match(/^sd[a-z]$/)
                 ? await removeSticksOnDrive(storeHandle, device!, 'unplugged')
@@ -453,20 +463,62 @@ export const undockAllOnDevice = async (storeHandle: DocHandle<Store>, engineId:
         storeHandle.change(doc => { cleared = clearDuplicateDiskRecords(doc, engineId, device, primary.id) })
         log(`Undocked stale disk record(s) ${cleared.join(', ')} on ${device}`)
     }
-    await undockDisk(storeHandle, primary)
+    // Device-removal path: the disk is already gone, so no in-flight wait (#179 applies to eject).
+    await undockDisk(storeHandle, primary, { waitInFlight: false })
     return [primary.id, ...cleared]
 }
 
-export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
+/** Result of undockDisk: `aborted` names why an eject stopped after its in-flight wait (disk pulled/re-docked meanwhile). */
+export type UndockResult = { aborted: string | null }
+
+/** Device node + mount still the one this dock made? Only with real mount commands (not testMode/sim). */
+const liveMountChangedReason = async (device: string): Promise<string | null> => {
+    if (!mountCommandsActive(config.settings.testMode)) return null
+    if (!fs.existsSync(`/dev/${device}`)) return `device /dev/${device} is gone`
+    const src = (await $`findmnt -n -o SOURCE ${mountPointOf(device)}`.nothrow()).stdout.trim()
+    if (src !== `/dev/${device}`) return `${mountPointOf(device)} is not mounted from /dev/${device} (source ${src || 'none'})`
+    return null
+}
+
+export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk, opts: { waitInFlight?: boolean } = {}): Promise<UndockResult | void> => {
+    markUndockPending(String(disk.id))
+    try { return await undockDiskInner(storeHandle, disk, opts) } finally { clearUndockPending(String(disk.id)) }
+}
+
+const undockDiskInner = async (storeHandle: DocHandle<Store>, disk: Disk, opts: { waitInFlight?: boolean }): Promise<UndockResult> => {
+    const device0 = disk.device
+    const before = dockIdentityOf(disk)
+    // #179: an instance start/install still running on this disk must settle first (bounded),
+    // then it is stopped below. Otherwise it carries on against the unmounted disk (r82b/r83).
+    // Only for an Engine-initiated undock (ejectDisk, erase), where the disk is still there and
+    // the Engine itself unmounts it. After a physical removal (device gone, undockAllOnDevice
+    // from the monitor) the disk is already gone: waiting cannot help the start and would only
+    // keep the pulled disk listed as docked for up to the bound (disk-dock-undock).
+    if (opts.waitInFlight !== false && device0 && !(await isSystemDiskRecord(disk))) {
+        const w = await waitInFlightOnDisk(String(disk.id), ejectInFlightWaitMs())
+        if (w.timedOut.length) log(`Undock ${disk.id}: still in flight after ${w.waitedMs}ms (${w.timedOut.join(', ')}) — stopping anyway`)
+        else if (w.waitedMs > 0) log(`Undock ${disk.id}: in-flight start(s) settled after ${w.waitedMs}ms`)
+        // hw180: the disk may have been pulled (and even re-plugged on a new device) during the wait.
+        // Only act on the very dock this eject was for: same device node, mount and dock generation.
+        if (w.waitedMs > 0 || w.timedOut.length) {
+            const reason = dockChangedReason(before, dockIdentityOf(storeHandle.doc()?.diskDB?.[disk.id]))
+                ?? await liveMountChangedReason(device0)
+            if (reason) {
+                log(`Eject of ${disk.id} aborted after the in-flight wait: ${reason}; nothing unmounted, store left as is`)
+                return { aborted: reason }
+            }
+        }
+    }
+    // Read the store AFTER the wait, so instances registered by a settling install are stopped too
     const store: Store = storeHandle.doc()
     const device = disk.device
     if (!device) {
         log(`Disk ${disk.id} is not mounted on any device. Nothing to undock.`)
-        return
+        return { aborted: null }
     }
     if (await isSystemDiskRecord(disk)) {
         log(`Disk ${disk.id} on ${device} is this Pi's system disk — never undocked`)
-        return
+        return { aborted: null }
     }
     try {
         // Combined Files Disk eject (§7.3): recreate opted-in instances on *other*
@@ -533,6 +585,7 @@ export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
         log(e)
         recordDiskDetectionFailure('undock', `Could not undock the disk on ${device}: ${errorMessage(e)}`, { device, diskId: disk.id })
     }
+    return { aborted: null }
 }
 
 /**

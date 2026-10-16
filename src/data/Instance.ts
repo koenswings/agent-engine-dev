@@ -14,10 +14,11 @@ import { Docker } from "node-docker-api";
 import { createMeta } from '../data/Meta.js'
 import { config, disksRoot, skipImageLoad } from '../data/Config.js'
 import { DocHandle } from "@automerge/automerge-repo";
-import { CommandLogStore, LogEntry, getCommandLogHandle, addTrace, closeTrace, flushLogs } from './CommandLogStore.js'
+import { CommandLogStore, LogEntry, getCommandLogHandle, liveCommandLogHandle, addTrace, closeTrace, flushLogs } from './CommandLogStore.js'
 import { getActiveTrace, flushTrace } from '../utils/CommandLogger.js'
 import { dockerAvailable } from '../utils/dockerAvailable.js'
 import { rebindKolibriMorangoInstanceId } from './InstanceCopy.js'
+import { trackInFlight, startDiskGoneReason, dockIdentityOf } from './InstanceInFlight.js'
 
 // ── Step-progress helpers ─────────────────────────────────────────────────────
 
@@ -69,7 +70,7 @@ export const START_INSTANCE_COMMAND = 'startInstance'
  */
 const activeStartTraceId = (handle: DocHandle<CommandLogStore>): string | null => {
   const active = getActiveTrace()
-  if (active && active.command === START_INSTANCE_COMMAND && handle.doc()?.traces[active.traceId]) {
+  if (active && active.command === START_INSTANCE_COMMAND && liveCommandLogHandle(handle).doc()?.traces[active.traceId]) {
     return active.traceId
   }
   return null
@@ -189,7 +190,27 @@ export const recordInstanceStartWarnings = async (
 /**
  * Set an instance to Error with a diagnosis in statusCondition.
  */
+/** Device-node check for a pulled disk; null in testMode (simulated devices). Tests may override. */
+let deviceExistsCheck: ((dev: string) => boolean) | null | undefined = undefined
+export const setDeviceExistsCheckForTests = (fn: ((dev: string) => boolean) | null | undefined): void => { deviceExistsCheck = fn }
+const deviceExists = (): ((dev: string) => boolean) | null =>
+  deviceExistsCheck !== undefined ? deviceExistsCheck : (config.settings.testMode ? null : (dev: string) => fs.existsSync(`/dev/${dev}`))
+
 export const markInstanceError = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, e: unknown): Promise<void> => {
+  // hw180: a start that fails because its disk was pulled (undock pending, record undocked or
+  // moved, device node gone) is not an app failure: the instance goes to Undocked, never Error.
+  const gone = startDiskGoneReason(String(disk.id), disk.device ?? null, dockIdentityOf(storeHandle.doc()?.diskDB?.[disk.id]), deviceExists())
+  if (gone) {
+    log(`Instance ${instance.id}: start failed because ${gone} — marking Undocked, not Error (${e instanceof Error ? e.message : String(e)})`)
+    storeHandle.change(doc => {
+      const inst = doc.instanceDB[instance.id]
+      if (!inst) return
+      inst.status = 'Undocked' as Status
+      inst.statusCondition = null
+      inst.metrics = null
+    })
+    return
+  }
   const condition = await diagnoseInstance(instance, disk, e)
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
@@ -258,7 +279,7 @@ export type Status = 'Undocked'      // Disk is not currently docked; instance d
   | 'Error';
 
 
-export const buildInstance = async (instanceName: InstanceName, appName: AppName, gitAccount: string, version: Version, device: DeviceName): Promise<void> => {
+export const buildInstance = async (instanceName: InstanceName, appName: AppName, gitAccount: string, version: Version, device: DeviceName): Promise<InstanceID | undefined> => {
   print(`Building new instance '${instanceName}' from version ${version} of app '${appName}' on device '${device}' of the local engine.`)
 
   // CODING STYLE: only use absolute pathnames !
@@ -446,9 +467,11 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
 
 
     print(chalk.green(`Instance ${instanceId} built`))
+    return instanceId
   } catch (e) {
     print(chalk.red('Error building app instance'))
     console.error(e)
+    return undefined
   }
 }
 
@@ -906,7 +929,11 @@ export const diagnoseInstance = async (instance: Instance, disk: Disk, caughtErr
   return parts.join('\n\n') || 'Unknown error'
 }
 
-export const startInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> => {
+/** #179: every start is tracked in flight on its disk so an eject waits for it to settle. */
+export const startInstance = (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> =>
+  trackInFlight(String(disk.id), `startInstance ${instance.id}`, startInstanceTracked(storeHandle, instance, disk, cause))
+
+const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> => {
   const store: Store = storeHandle.doc()
   print(`Starting instance '${instance.id}' on disk ${disk.id} of engine '${localEngineId}'.`)
 
@@ -921,6 +948,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
         const port = parseInt(await readEnvVariable(`${await diskMountRoot(disk)}/instances/${instance.id}/.env`, 'port') as string) || 0
         storeHandle.change(doc => {
           const inst = doc.instanceDB[instance.id]
+          if (!inst) return  // #179: never write to (or resurrect) a deleted row
           inst.status = 'Running' as Status
           inst.statusCondition = null
           if (port > 0) inst.port = port as PortNumber
@@ -949,6 +977,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
   log(`Setting instance '${instance.id}' status to Starting`)
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
+    if (!inst) return  // #179: never write to (or resurrect) a deleted row
     inst.status = 'Starting' as Status
   })
 
@@ -1005,6 +1034,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     // Assign the port number to the instance object
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
+      if (!inst) return  // #179: never write to (or resurrect) a deleted row
       inst.port = port as PortNumber
     })
 
@@ -1240,6 +1270,29 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 // }
 
 /**
+ * Write the Engine hostname and eth0 IPv4 address into an instance .env as the
+ * `hostname` and `ip` variables. Applies to every app, not only Nextcloud.
+ * A missing hostname or IP is skipped (logged) rather than written empty.
+ */
+export const writeEngineHostEnv = async (
+  envPath: string,
+  hostname: string | undefined,
+  instanceId: string,
+  interfaces: NodeJS.Dict<os.NetworkInterfaceInfo[]> = os.networkInterfaces(),
+): Promise<void> => {
+  if (hostname) {
+    await addOrUpdateEnvVariable(envPath, 'hostname', hostname)
+  }
+  const ip = interfaces["eth0"]?.find((iface) => iface.family === "IPv4")?.address
+  if (ip) {
+    log(`Found IP address ${ip} for instance ${instanceId}`)
+    await addOrUpdateEnvVariable(envPath, 'ip', ip)
+  } else {
+    log(chalk.red(`No IP address found for instance ${instanceId}`))
+  }
+}
+
+/**
  * Create the containers of an instance (`docker compose create`) and set it to
  * Pauzed. Errors propagate to the caller (idea#109): startInstance turns them
  * into Error status and a failed command-log trace.
@@ -1249,27 +1302,9 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
   const mountRoot = await diskMountRoot(disk)
   log(`Creating the containers for the services of the app instance`)
 
-  // App-specific pre-processing commands
-  const app = store.appDB[instance.instanceOf]
-  if (app && app.name === 'nextcloud') {
-
-    // Pass the hostname to the compose file via .env
-    const localEngine = getLocalEngine(store)
-    const hostname = localEngine.hostname
-    if (hostname) {
-      await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'hostname', hostname)
-    }
-
-    // Pass the ip address to the compose file via .env
-    const interfaceData = os.networkInterfaces()
-    const ip = interfaceData["eth0"]?.find((iface) => iface.family === "IPv4")?.address
-    if (ip) {
-      log(`Found IP address ${ip} for instance ${instance.id}`)
-      await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'ip', ip)
-    } else {
-      log(chalk.red(`No IP address found for instance ${instance.id}`))
-    }
-  }
+  // Pass the Engine hostname and eth0 IP to every app's compose file via .env
+  // (previously Nextcloud only; apps such as the channel builder use ${hostname}).
+  await writeEngineHostEnv(`${mountRoot}/instances/${instance.id}/.env`, getLocalEngine(store).hostname, instance.id)
 
   log(`Creating containers of app instance '${instance.id}' on disk ${disk.id} of engine ${localEngineId}.`)
   try {
@@ -1284,6 +1319,7 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
   }
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
+    if (!inst) return  // #179: never write to (or resurrect) a deleted row
     inst.status = 'Pauzed' as Status
   })
 }
@@ -1312,6 +1348,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
       log(`Port number extracted from .env file for instance ${instance.id}: ${parsedPort}`)
       storeHandle.change(doc => {
         const inst = doc.instanceDB[instance.id]
+        if (!inst) return  // #179: never write to (or resurrect) a deleted row
         inst.port = parsedPort as PortNumber
       })
     } else {
@@ -1393,6 +1430,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
   if (!stillStartable('after compose up')) return
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
+    if (!inst) return  // #179: never write to (or resurrect) a deleted row
     inst.lastStarted = new Date().getTime() as Timestamp
     inst.status = 'Running' as Status
     inst.statusCondition = null  // clear any previous error diagnosis
@@ -1496,6 +1534,7 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
     // Set the status of the instance to Stopped
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
+      if (!inst) return  // #179: never write to (or resurrect) a deleted row
       inst.status = 'Stopped' as Status // Set the status to Stopped when the instance is stopped
     })
     clearStep(storeHandle, instance.id)
@@ -1510,6 +1549,7 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
     const condition = await diagnoseInstance(instance, disk, e)
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
+      if (!inst) return  // #179: never write to (or resurrect) a deleted row
       inst.status = 'Error' as Status
       inst.statusCondition = condition
     })

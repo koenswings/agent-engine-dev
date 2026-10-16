@@ -113,7 +113,7 @@ export type ConsoleEngineRow = { testId: string; label: string; online: boolean 
 /**
  * r30: is `hostname` shown online? Console 0760c01/c981361 NetworkTree renders
  * `[data-testid="engine-<storeId>"]` with `.tree-item__label` = hostname and
- * `.tree-item__status-dot--online` (lastRun within 90s); the status bar shows
+ * `.tree-item__status-dot--online` (Console: live hb within 30 s, or stored lastRun within 90 s for old Engines); the status bar shows
  * `.status-bar__dot--connected` while the Console's own WS is up.
  */
 export const consoleEngineOnline = (

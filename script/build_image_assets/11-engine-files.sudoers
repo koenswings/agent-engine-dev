@@ -17,6 +17,8 @@
 #                script validates device/serial/size/label/staging itself
 #   typed mount  src/monitors/mounts.ts (safeMount): exactly
 #                /usr/bin/mount -t ext4 /dev/<dev> /disks/<dev> (idea#134)
+#                /usr/bin/mount -t ext4 -o ro,noload /dev/<dev> /disks/<dev>: read-only look
+#                for META.yaml before any rw mount (idea#201 §10 rule 1)
 #   app data     /usr/local/sbin/idea-app-data (idea#168): no argument list; the helper
 #                validates subcommand, device, instance id, archive, host and paths itself
 #                (src/utils/appDataHelper.ts, src/utils/rsync.ts rsyncInstanceData:
@@ -44,6 +46,7 @@ pi ALL=(root) NOPASSWD: /usr/bin/chown -h pi\:pi /disks/sd[a-z][12]
 pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-erase-disk
 pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-app-data
 pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]
+pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 -o ro\,noload /dev/sd[a-z][12] /disks/sd[a-z][12]
 pi ALL=(root) NOPASSWD: /usr/bin/mount -t vfat -o ro\,nosuid\,nodev\,noexec\,uid\=1000\,gid\=1000\,fmask\=0222\,dmask\=0222\,iocharset\=utf8\,shortname\=mixed /dev/sd[a-z][12] /run/idea-usb/sd[a-z][12]
 pi ALL=(root) NOPASSWD: /usr/bin/mount -t vfat -o ro\,nosuid\,nodev\,noexec\,uid\=1000\,gid\=1000\,fmask\=0222\,dmask\=0222\,iocharset\=utf8\,shortname\=mixed /dev/sd[a-z] /run/idea-usb/sd[a-z]
 pi ALL=(root) NOPASSWD: /usr/bin/mount -t exfat -o ro\,nosuid\,nodev\,noexec\,uid\=1000\,gid\=1000\,fmask\=0222\,dmask\=0222\,iocharset\=utf8 /dev/sd[a-z][12] /run/idea-usb/sd[a-z][12]
