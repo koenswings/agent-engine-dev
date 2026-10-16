@@ -67,4 +67,5 @@ const tick = setInterval(() => { const o = opOf(operationId); const s = `${o.sta
 const res = await done
 clearInterval(tick)
 out('result', res); out('operation', opOf(operationId))
+await sleep(1000)  // flash.log append
 process.exit(0)

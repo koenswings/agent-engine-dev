@@ -199,8 +199,10 @@ export const flashCard = async (
                     lastStep = step
                     updateOperation(storeHandle, opId, { currentStep: idx, totalSteps: FLASH_STEPS.length, stepLabel: step, progressPercent: pct })
                     setFlashInProgress(storeHandle, { operationId: opId, candidateId, version: image.version, step })
-                } else if (pct != null && pct !== lastPct) {
-                    updateOperation(storeHandle, opId, { progressPercent: pct })
+                } else if (pct != null && pct !== lastPct && Math.floor(pct / 5) !== Math.floor(Math.max(lastPct, 0) / 5)) {
+                    // Store design 2026-10-13 drops progress-only patches; a flash stores its
+                    // progress in 5 % steps (≤ 20 changes per step) by repeating currentStep.
+                    updateOperation(storeHandle, opId, { currentStep: idx, progressPercent: pct })
                 }
                 if (pct != null) lastPct = pct
             }

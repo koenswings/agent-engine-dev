@@ -262,6 +262,9 @@ describe('flashCard / cancelFlash (idea#201 §10)', () => {
         proc.line({ step: 'writing', bytes: 0, total: 100 })
         await new Promise(r => setTimeout(r, 5))
         expect(op(operationId)).toMatchObject({ stepLabel: 'writing', currentStep: 2, totalSteps: 6 })
+        proc.line({ step: 'writing', bytes: 2, total: 100 }); proc.line({ step: 'writing', bytes: 12, total: 100 })
+        await new Promise(r => setTimeout(r, 5))
+        expect(op(operationId).progressPercent).toBe(12)  // stored in 5 % steps (not a progress-only patch)
         proc.line({ result: 'ok', bytesWritten: 9 * GB, sha256: 'c'.repeat(64), readBackSha256: 'c'.repeat(64), safeToRemove: true })
         proc.end(0)
         const res = await done
