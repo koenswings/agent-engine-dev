@@ -1,7 +1,10 @@
 /**
  * meta-first-dock.test.ts
  *
- * idea#121: a disk docked without META.yaml gets one written on its first dock,
+ * idea#201 §10 rule 1 (supersedes the idea#121 first-dock write below): a disk
+ * docked without META.yaml is left untouched and is not registered.
+ *
+ * idea#121 (historical): a disk docked without META.yaml got one written on its first dock,
  * so its diskId stays the same on every later dock. Before this fix a disk
  * without a readable hardware serial got a new random id on every dock and left
  * an orphan diskDB entry behind.
@@ -55,7 +58,7 @@ const disksOnDevice = (store: Store, device: string) =>
 
 const isRoot = typeof process.getuid === 'function' && process.getuid() === 0
 
-describe('META.yaml is written on the first dock (idea#121)', () => {
+describe('first dock without META.yaml (idea#121, superseded by idea#201 §10 rule 1)', () => {
     let storeHandle: DocHandle<Store>
     let watcher: Awaited<ReturnType<typeof enableUsbDeviceMonitor>>
     const logHandle = newCommandLog()
@@ -100,71 +103,45 @@ describe('META.yaml is written on the first dock (idea#121)', () => {
         }
     })
 
-    it('docking a fixture without META.yaml writes one', { timeout: 20_000 }, async () => {
+    // idea#201 §10 rule 1 replaces the idea#121 first-dock write: a disk without
+    // META.yaml is not an IDEA disk and is left untouched, even when META writes
+    // are enabled (skipMetaWrite false). It becomes an IDEA disk only through an
+    // explicit command (eraseDisk; initialiseDisk later).
+    it('docking a fixture without META.yaml writes nothing and registers nothing (idea#201 §10)', { timeout: 20_000 }, async () => {
         const device = uniqueTestDevice()
         devices.push(device)
         const metaPath = path.join(diskPath(device), 'META.yaml')
+        const before = Object.keys(storeHandle.doc()!.diskDB).length
 
         await dockFixture(fixtureDir, device)
-        expect(await waitFor(storeHandle, s => disksOnDevice(s, device).length === 1)).toBe(true)
+        await new Promise(r => setTimeout(r, 3000))
 
-        const disk = disksOnDevice(storeHandle.doc()!, device)[0]
-        expect(fs.existsSync(metaPath)).toBe(true)
-        const meta = YAML.parse(await fs.readFile(metaPath, 'utf-8'))
-        expect(meta.diskId).toBe(disk.id)
-        expect(meta.diskName).toBe(disk.name)
-        expect(typeof meta.created).toBe('number')
+        expect(fs.existsSync(metaPath)).toBe(false)
+        expect(disksOnDevice(storeHandle.doc()!, device)).toHaveLength(0)
+        expect(Object.keys(storeHandle.doc()!.diskDB).length).toBe(before)
+        const writeTrace = traces(logHandle).find(t => t.command === DISK_DETECTION_COMMAND
+            && JSON.parse(t.args).step === 'writeMeta' && JSON.parse(t.args).device === device)
+        expect(writeTrace).toBeUndefined()
     })
 
-    it('a second dock of the same disk gives the same diskId', { timeout: 30_000 }, async () => {
+    it('a disk with META.yaml keeps the same diskId across docks', { timeout: 30_000 }, async () => {
         const device = uniqueTestDevice()
         devices.push(device)
+        const known = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-121-known-'))
+        const id = `idea121-known-${Date.now()}`
+        await fs.writeFile(path.join(known, 'META.yaml'), `diskId: ${id}\ndiskName: known\ncreated: 1\nlastDocked: 1\n`)
 
-        await dockFixture(fixtureDir, device)
+        await dockFixture(known, device)
         expect(await waitFor(storeHandle, s => disksOnDevice(s, device).length === 1)).toBe(true)
-        const firstId = disksOnDevice(storeHandle.doc()!, device)[0].id
+        expect(disksOnDevice(storeHandle.doc()!, device)[0].id).toBe(id)
 
         await triggerUndock(device)
         expect(await waitFor(storeHandle, s => disksOnDevice(s, device).length === 0)).toBe(true)
-
-        // Re-dock the same disk content (META.yaml written by the first dock stays)
         await fs.writeFile(sentinelPath(device), '')
         expect(await waitFor(storeHandle, s => disksOnDevice(s, device).length === 1)).toBe(true)
-        const secondId = disksOnDevice(storeHandle.doc()!, device)[0].id
-
-        expect(secondId).toBe(firstId)
-        // No second diskDB entry for the same disk
-        const store = storeHandle.doc()!
-        const entries = Object.values(store.diskDB).filter(d => d.id === firstId)
-        expect(entries).toHaveLength(1)
-        expect(Object.keys(store.diskDB).filter(id => id === firstId)).toHaveLength(1)
-    })
-
-    it.skipIf(isRoot)('an unwritable fixture records a detection failure and is still registered', { timeout: 20_000 }, async () => {
-        const device = uniqueTestDevice()
-        devices.push(device)
-        const target = diskPath(device)
-
-        // Read-only disk (like a root-owned or read-only mount): content, no META.yaml
-        await fs.ensureDir(target)
-        await fs.copy(fixtureDir, target)
-        await fs.chmod(target, 0o555)
-        await fs.ensureDir(path.dirname(sentinelPath(device)))
-        await fs.writeFile(sentinelPath(device), '')
-
-        expect(await waitFor(storeHandle, s => disksOnDevice(s, device).length === 1)).toBe(true)
-        expect(fs.existsSync(path.join(target, 'META.yaml'))).toBe(false)
-
-        const failure = traces(logHandle).find(t => {
-            if (t.command !== DISK_DETECTION_COMMAND) return false
-            const args = JSON.parse(t.args)
-            return args.step === 'writeMeta' && args.device === device
-        })
-        expect(failure, 'failed writeMeta trace').toBeDefined()
-        expect(failure!.status).toBe('error')
-        expect(failure!.errorMessage).toContain('Could not write META.yaml')
-        const disk = disksOnDevice(storeHandle.doc()!, device)[0]
-        expect(JSON.parse(failure!.args).diskId).toBe(disk.id)
+        expect(disksOnDevice(storeHandle.doc()!, device)[0].id).toBe(id)
+        expect(Object.keys(storeHandle.doc()!.diskDB).filter(k => k === id)).toHaveLength(1)
+        await fs.remove(known).catch(() => {})
     })
 })
 

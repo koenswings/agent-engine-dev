@@ -88,6 +88,8 @@ describe('Engine sudoers asset (idea#80)', () => {
         const allowed = [
             // 11-engine-files (idea#134): typed ext4 mount
             '/usr/bin/mount -t ext4 /dev/${device} ${mp}',
+            // 11-engine-files (idea#201 §10): read-only META look before any rw mount
+            '/usr/bin/mount -t ext4 -o ro,noload /dev/${device} ${mp}',
             'mkdir -p ${disksRoot()}/${device}',
             'umount ${disksRoot()}/${device}',
             'mkdir -p ${disksRoot()}/old',
@@ -154,6 +156,8 @@ describe('Engine sudoers asset (idea#80)', () => {
             // app data as root (idea#168): one helper, no argument list (the helper validates)
             'pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-app-data',
             'pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]',
+            // read-only look for META.yaml before any rw mount (idea#201 §10 rule 1)
+            'pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 -o ro\\,noload /dev/sd[a-z][12] /disks/sd[a-z][12]',
             // teacher USB sticks (idea#193): typed read-only mounts under /run/idea-usb only
             'pi ALL=(root) NOPASSWD: /usr/bin/mount -t vfat -o ro\\,nosuid\\,nodev\\,noexec\\,uid\\=1000\\,gid\\=1000\\,fmask\\=0222\\,dmask\\=0222\\,iocharset\\=utf8\\,shortname\\=mixed /dev/sd[a-z][12] /run/idea-usb/sd[a-z][12]',
             'pi ALL=(root) NOPASSWD: /usr/bin/mount -t vfat -o ro\\,nosuid\\,nodev\\,noexec\\,uid\\=1000\\,gid\\=1000\\,fmask\\=0222\\,dmask\\=0222\\,iocharset\\=utf8\\,shortname\\=mixed /dev/sd[a-z] /run/idea-usb/sd[a-z]',
