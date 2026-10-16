@@ -349,7 +349,11 @@ export const findDisksByApp = (store: Store, appId: AppID): Disk[] => {
 }
 
 export const extractAppName = (appId: AppID): string => {
-    return appId.split('-')[0]
+    // Same rule as App.ts parseAppId (no import: App.ts imports Store.ts)
+    const m = /^(.+?)-(\d+(?:\.\d+)*(?:[-.+][0-9A-Za-z.+-]*)?)$/.exec(String(appId))
+    if (m) return m[1]
+    const dash = String(appId).lastIndexOf('-')
+    return dash > 0 ? String(appId).slice(0, dash) : String(appId)
 }
 
 export const getDisk = (store: Store, diskId: DiskID): Disk | undefined => {

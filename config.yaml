@@ -7,7 +7,7 @@ settings:
   consolePath: /home/pi/idea/agents/agent-console-dev/dist  # Absolute path to Console dist/. Empty = Console UI not served.
   storeDataFolder: store-data
   storeIdentityFolder: store-identity
-  heartbeatIntervalMs: 30000  # How often the engine writes a heartbeat to the store (milliseconds)
+  heartbeatIntervalMs: 30000  # Peer-access repair + op archive tick (ms). The store is no longer written per tick: live hb is ephemeral every 10 s, lastRun stored at boot + hourly (Liveness.ts)
 defaults:
   user: pi
   machine: raspberrypi.local

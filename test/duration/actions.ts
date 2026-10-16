@@ -6,6 +6,10 @@
  * Usage/operator Intents: StubUiDriver (Fake CI) or PlaywrightUiDriver → Pixel getIntent.
  */
 
+import { isIdea02Target } from './walkHost.js'
+import { settleAfterLongOp, poolInstanceIds, type PostOpSettleIo } from './postOpSettle.js'
+import { opStartBudget, WAIT_OP_ACTIONS, opAppearBudgetMs, opDoneBudgetMs, waitOperationTerminal, type WaitOperationFn } from './opWait.js'
+import { STAGE2_ADD_FILES_DISK_ID, STAGE2_MOVE_TARGET_HOST, STAGE2_ROLE_MAP, stage2HomeOf } from './stage2.js'
 import type {
     DurationOptions,
     FleetOps,
@@ -19,7 +23,12 @@ import { waitForConvergence } from './convergence.js'
 import { parse as parseYaml } from 'yaml'
 import { finalizeRecordedFrame, framePath } from './recordWalk.js'
 import { DURATION_UI_FIXTURES } from './ui/fixtures.js'
-import { backupDiskTargetId, describeDisk, diskEmptiness, eraseDiskTargetId, filesDiskTargetId, waitDiskEmpty } from './fixtureDisks.js'
+import { SETTLE_AFTER_ACTIONS, waitInstancesSettled } from './instanceSettle.js'
+import {
+    type AppTab, CONSOLE_ONLY_APP_ACTIONS, APP_URL_ENV, CONSOLE_DEFAULT_SIDECAR_PORTS, INSTANCE_SIDECAR_ACTIONS, appKindForInstanceId, appTabProblems, appsUsedByStep, consoleOpenProblem, CONSOLE_OPEN_ACTION_RE, APP_HOSTS_ENV, appHostForms, lanHostsFromEnv, lanHostsFromStore,
+    assertNoManualAppOverride, idea166Target, isHarnessOwned, nextcloudUntrustedDomain, offPinRedirect, setHarnessEnv, type AppPin, type SidecarApp,
+} from './appUrls.js'
+import { backupDiskTargetId, describeDisk, diskEmptiness, eraseDiskTargetId, filesDiskTargetId, waitDiskEmpty, diskResetVerdict, instanceStoredOn, rowInFlight } from './fixtureDisks.js'
 import { copyDoneBudgetMs, DEFAULT_NEXTCLOUD_READY_MS, envMs, instanceStartBudgetMs, logStartMeasured } from './startBudgets.js'
 
 export const HUB_ACTIONS = [
@@ -210,7 +219,8 @@ const settleParticipants = async (ctx: ActionContext, engines: string[]): Promis
 export const waitEmpty002PostInstallRunning = async (
     ctx: ActionContext,
 ): Promise<string> => {
-    const diskId = DURATION_UI_FIXTURES.empty2.diskId
+    // Stage 1: duration-empty-002; Stage 2: the erase role's partition (READY: empty-001).
+    const diskId = eraseDiskTargetId()
     const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
     if (pool.length === 0) {
         return 'post-install settle skipped (no pool engines)'
@@ -315,6 +325,107 @@ const waitUndockedBeforeRedock = async (
  * storedOn=diskId survive; Console hasInstancesOn keys off store → still shows
  * app / no EmptyDiskPanel. AfterErase must NOT purge (erase already cleared instances).
  */
+/** r75 fix 1: budget for an in-flight install/op on a disk to land and settle before its reset. */
+export const diskOpSettleMs = (env: NodeJS.ProcessEnv = process.env): number => {
+    const n = Number(env.DURATION_DISK_OP_SETTLE_MS)
+    return Number.isFinite(n) && n > 0 ? n : 180_000
+}
+
+/**
+ * r75 FAIL@91 fix 1: never reset a disk under a live operation. install_app@88 soft-returned, the
+ * Engine wrote the new instance 14 s later (after the purge), then stage2-dock reset reformatted the
+ * partition under it: stale Pauzed record (currentStep 5) + orphan Created container. Before a fresh
+ * re-dock: wait until an install the walker started on this disk has landed in the store and every
+ * row on the disk has settled (diskResetVerdict). Timeout → fail loud, no reset. No-op without
+ * diskInstancesRaw (Fake). Clears walker.pendingInstallDisk for this disk.
+ */
+export const settleDiskOpsBeforeReset = async (
+    ctx: ActionContext,
+    engine: string,
+    diskId: string,
+    label: string,
+    opts: { budgetMs?: number; pollMs?: number } = {},
+): Promise<string> => {
+    const ops = ctx.opts.ops as FleetOps & { diskInstancesRaw?: FleetOps['diskInstancesRaw'] }
+    const pending = ctx.walker.pendingInstallDisk === diskId
+    if (typeof ops.diskInstancesRaw !== 'function') {
+        if (pending) ctx.walker.pendingInstallDisk = null
+        return ''
+    }
+    const budget = opts.budgetMs ?? diskOpSettleMs()
+    const poll = opts.pollMs ?? 1_000
+    const t0 = Date.now()
+    let last = 'unread'
+    for (;;) {
+        try {
+            const rows = await ops.diskInstancesRaw(engine, diskId)
+            last = rows.length ? rows.map(r => `${r.id}=${r.status}${r.currentStep != null ? `@step${r.currentStep}` : ''}`).join(', ') : 'no instances'
+            if (diskResetVerdict(rows, pending) === 'ready') {
+                if (pending) ctx.walker.pendingInstallDisk = null
+                const waited = Date.now() - t0
+                return rows.length || pending ? `ops on ${diskId} settled after ${waited}ms (${last})` : ''
+            }
+        } catch (e) {
+            last = `read failed: ${e instanceof Error ? e.message : String(e)}`
+        }
+        if (Date.now() - t0 >= budget) {
+            throw new Error(
+                `${label}: ${diskId} on ${engine} still has an operation in flight after ${budget}ms ` +
+                    `(${pending ? 'install_app pending; ' : ''}${last}) — refusing to reset a disk under a live op ` +
+                    `(DURATION_DISK_OP_SETTLE_MS). Fail loud.`,
+            )
+        }
+        await new Promise(r => setTimeout(r, poll))
+    }
+}
+
+/**
+ * r82b FAIL@91: after the Engine eject, wait until no row on the disk is mid-operation (a start
+ * racing the eject must finish first) before the records are purged. Timeout → fail loud with the
+ * rows. An Error row after the eject is a real Engine state: fail loud, never purge it away.
+ * No-op without diskInstancesRaw (Fake).
+ */
+export const settleRowsAfterUndock = async (
+    ctx: ActionContext,
+    engine: string,
+    diskId: string,
+    label: string,
+    opts: { budgetMs?: number; pollMs?: number } = {},
+): Promise<string> => {
+    const ops = ctx.opts.ops as FleetOps & { diskInstancesRaw?: FleetOps['diskInstancesRaw'] }
+    if (typeof ops.diskInstancesRaw !== 'function') return ''
+    const budget = opts.budgetMs ?? diskOpSettleMs()
+    const poll = opts.pollMs ?? 1_000
+    const t0 = Date.now()
+    let last = 'unread'
+    for (;;) {
+        try {
+            const rows = await ops.diskInstancesRaw(engine, diskId)
+            last = rows.length ? rows.map(r => `${r.id}=${r.status}${r.currentStep != null ? `@step${r.currentStep}` : ''}`).join(', ') : 'no instances'
+            if (!rows.some(rowInFlight)) {
+                const bad = rows.filter(r => r.status === 'Error')
+                if (bad.length) {
+                    throw new Error(
+                        `${label}: Engine left ${bad.map(r => r.id).join(', ')} in Error on ${diskId} (${engine}) after the eject ` +
+                            `(${last}) — real Engine state, not purged. Fail loud.`,
+                    )
+                }
+                return rows.length ? `after eject ${diskId} rows settled in ${Date.now() - t0}ms (${last}); purging stale records` : ''
+            }
+        } catch (e) {
+            if (e instanceof Error && e.message.includes('in Error on')) throw e
+            last = `read failed: ${e instanceof Error ? e.message : String(e)}`
+        }
+        if (Date.now() - t0 >= budget) {
+            throw new Error(
+                `${label}: ${diskId} on ${engine} still has an instance mid-operation ${budget}ms after the eject ` +
+                    `(${last}) — refusing to purge under a live op. Fail loud.`,
+            )
+        }
+        await new Promise(r => setTimeout(r, poll))
+    }
+}
+
 const redockEmptyFresh = async (
     ctx: ActionContext,
     diskId: string,
@@ -330,6 +441,7 @@ const redockEmptyFresh = async (
     // existing dock holder, else Console host pool[0] (Path A empty dock pattern).
     const engine =
         opts?.targetEngine ??
+        (isStage2(ctx) ? stage2HomeOf(diskId) : null) ??
         (ctx.walker.dockedEngine && !ctx.excludeEngines.includes(ctx.walker.dockedEngine)
             ? ctx.walker.dockedEngine
             : null) ?? pool[0]!
@@ -341,6 +453,17 @@ const redockEmptyFresh = async (
     const opsAny = ctx.opts.ops as FleetOps & {
         findDockedEngine?: (id: string) => Promise<string | null>
         waitDiskUndocked?: (id: string, timeoutMs?: number) => Promise<void>
+    }
+    let settleNote = ''
+    if (opts?.purgeStoreInstances) {
+        // r75 fix 1: wait for in-flight ops, then remove the instances (containers + records) while
+        // the disk is still docked, BEFORE the reset.
+        settleNote = await settleDiskOpsBeforeReset(ctx, engine, diskId, label)
+        // r82b FAIL@91: NO record purge while the disk is still docked. The instance files are
+        // still on the disk, so the Engine re-adopts the deleted row on its next disk scan and
+        // starts it again; the eject then races that start and the row ends in Error. Like an
+        // Atlas reset: eject through the Engine first (it stops the containers and marks the
+        // rows Undocked), let the rows settle, then purge the stale records, then re-dock.
     }
     if (typeof opsAny.findDockedEngine === 'function') {
         const already = await opsAny.findDockedEngine(diskId)
@@ -355,6 +478,8 @@ const redockEmptyFresh = async (
         await ctx.opts.ops.undockFixtures(pool, diskId)
     }
     if (opts?.purgeStoreInstances) {
+        const undockNote = await settleRowsAfterUndock(ctx, engine, diskId, label)
+        if (undockNote) settleNote = settleNote ? `${settleNote}; ${undockNote}` : undockNote
         await ctx.opts.ops.purgeInstancesStoredOn(engine, diskId)
     }
     await ctx.opts.ops.dockFixture(engine, diskId)
@@ -369,12 +494,27 @@ const redockEmptyFresh = async (
             )
         }
     }
-    return `re-docked ${diskId} on ${engine} ${noteSuffix}`
+    if (opts?.purgeStoreInstances && typeof ctx.opts.ops.diskInstancesRaw === 'function') {
+        // r75 fix 1: re-check after the reset — a record still on the disk means something survived.
+        const left = await ctx.opts.ops.diskInstancesRaw(engine, diskId)
+        if (left.length) {
+            throw new Error(
+                `${label}: ${diskId} on ${engine} still holds ${left.map(r => `${r.id}=${r.status}`).join(', ')} ` +
+                    `after the fresh re-dock — fail loud (r75).`,
+            )
+        }
+    }
+    return `re-docked ${diskId} on ${engine} ${noteSuffix}${settleNote ? `; ${settleNote}` : ''}`
 }
 
 /** Prefer A: hosts the harness must never touch, regardless of exclude_engines. */
 const NEVER_ENGINES = new Set(['idea02'])
-const isNeverEngine = (engine: string): boolean => NEVER_ENGINES.has(engine)
+const isNeverEngine = (engine: string): boolean => NEVER_ENGINES.has(engine) || isIdea02Target(engine)
+
+/** Stage 2 (Stage2FleetOps): a fixture lives on its home Pi's SSD, not on the Console engine. */
+const isStage2 = (ctx: { opts: { ops: FleetOps } }): boolean => (ctx.opts.ops as FleetOps & { stage?: number }).stage === 2
+const stage2HomeOr = (ctx: { opts: { ops: FleetOps } }, diskId: string, fallback: string): string =>
+    isStage2(ctx) ? stage2HomeOf(diskId) : fallback
 
 const hostnameOfUrl = (raw: string | undefined): string | null => {
     const v = raw?.trim()
@@ -424,7 +564,8 @@ const redockEmpty002Fresh = async (
     noteSuffix: string,
     opts?: { purgeStoreInstances?: boolean },
 ): Promise<string> => {
-    const note = await redockEmptyFresh(ctx, DURATION_UI_FIXTURES.empty2.diskId, label, noteSuffix, opts)
+    // Stage 1: duration-empty-002; Stage 2: the erase role's partition (eraseDiskTargetId, READY: empty-001).
+    const note = await redockEmptyFresh(ctx, eraseDiskTargetId(), label, noteSuffix, opts)
     // idea#168: empty-002 is a fresh Empty pack again.
     ctx.walker.empty002HoldsApp = false
     return note
@@ -486,7 +627,7 @@ export const redockEmpty001BeforeMakeFiles = async (ctx: ActionContext): Promise
     // Prefer A r21 FAIL@91: walker.dockedEngine was idea03 (Kolibri after infra_move_disk)
     // so empty-001 was dock-copied onto idea03 while the Console under test is idea01.
     // Always land empty-001 on the Console's engine.
-    const target = resolveConsoleEngineHost(ctx)
+    const target = stage2HomeOr(ctx, filesDiskTargetId(), resolveConsoleEngineHost(ctx))
     return redockEmptyFresh(
         ctx,
         filesDiskTargetId(),
@@ -494,6 +635,27 @@ export const redockEmpty001BeforeMakeFiles = async (ctx: ActionContext): Promise
         `before make_files_disk (Console engine ${target}; Empty fresh pack + store purge; createFilesDisk-clean)`,
         { purgeStoreInstances: true, targetEngine: target },
     )
+}
+
+/**
+ * Stage 2 (READY §4.4): Files and Erase share duration-empty-001 SEQUENTIALLY (only three Empties,
+ * empty-003 is move-only). Before erase_disk, if the erase partition is not Empty (it is still the
+ * Files Disk from make_files_disk@91), re-dock it FRESH: Engine eject → stage2-dock.sh reset → dock,
+ * plus a store purge. Returns null when not Stage 2, or the disk is already Empty (no-op).
+ */
+export const stage2RedockSharedEraseDisk = async (ctx: ActionContext): Promise<string | null> => {
+    if (!isStage2(ctx)) return null
+    const diskId = eraseDiskTargetId()
+    const home = stage2HomeOf(diskId)
+    const st = diskEmptiness(await ctx.opts.ops.readStore(home), diskId)
+    if (st.empty && st.dockedTo === home) return null
+    const note = await redockEmpty002Fresh(
+        ctx,
+        'stage2RedockSharedEraseDisk',
+        `before erase_disk (Stage 2 Files→Erase share; was ${describeDisk(st)}; fresh reset + store purge)`,
+        { purgeStoreInstances: true },
+    )
+    return note
 }
 
 /**
@@ -602,7 +764,7 @@ export const preflightFilesDiskTarget = async (
             const view = await ctx.opts.ops.readStore(engine)
             const disk = view.diskDB[diskId]
             const types = disk?.diskTypes ?? []
-            const insts = Object.values(view.instanceDB).filter(i => i.diskId === diskId)
+            const insts = Object.values(view.instanceDB).filter(i => instanceStoredOn(i, diskId))
             last = `dockedTo=${disk?.dockedTo ?? 'none'} diskTypes=[${types.join(', ')}] instances=${insts.length}`
             const typesOk = types.length === 1 && types[0] === 'empty'
             if (disk?.dockedTo && typesOk && (!requireNoInstances || insts.length === 0)) break
@@ -633,8 +795,8 @@ export const preflightFilesDiskTarget = async (
         throw new Error(
             `preflight: ${diskId} on ${engine} slot ${fsNote} — Engine createFilesDisk requires an ext4 ` +
                 `mount at the disk root (findmnt -no FSTYPE); a plain dir reads 'unknown' and is refused ` +
-                `("not an ext4 disk"). Atlas Path A: back ${probe?.dest ?? `${engine}:<duration-disks>/idea-test-3`} ` +
-                `with a pi-owned ext4 mount (loop image), then re-run. Prefer A — fail loud.`,
+                `("not an ext4 disk"). Atlas Path A: back ${probe?.dest ?? `${diskId} on ${engine}`} ` +
+                `with a pi-owned ext4 mount, then re-run. Prefer A — fail loud.`,
         )
     }
     return `preflight ${diskId} Empty on ${engine} (${last}; ${fsNote}${skipExt4 ? '; ext4 preflight skipped' : ''})`
@@ -691,7 +853,8 @@ export const addFilesAppDiskId = (
     ctx: Pick<ActionContext, 'fixtureDisk'>,
     env: NodeJS.ProcessEnv = process.env,
 ): string => {
-    const id = env.DURATION_ADD_FILES_DISK_ID?.trim() || ctx.fixtureDisk
+    // r84c FAIL@93: Stage 2 defaults to its dedicated app-only fixture on idea01, never the moved Kolibri.
+    const id = env.DURATION_ADD_FILES_DISK_ID?.trim() || (env.DURATION_STAGE?.trim() === '2' ? STAGE2_ADD_FILES_DISK_ID : ctx.fixtureDisk)
     const filesId = env.DURATION_FILES_DISK_ID?.trim()
     if (!id) {
         throw new Error('add_files_role: no app-only disk id (DURATION_ADD_FILES_DISK_ID / fixtureDisk unset). Prefer A — fail loud.')
@@ -744,7 +907,8 @@ export const ensureAppOnlyDiskOnConsoleEngine = async (
     env: NodeJS.ProcessEnv = process.env,
 ): Promise<{ diskId: string; engine: string; note: string; movedFixture: boolean }> => {
     const diskId = addFilesAppDiskId(ctx, env)
-    const engine = resolveConsoleEngineHost(ctx, env)
+    // Stage 2: the app-only disk's home Pi (idea01) — it cannot leave its SSD except by network copy.
+    const engine = stage2HomeOr(ctx, diskId, resolveConsoleEngineHost(ctx, env))
     assertNotGolden(ctx, engine, 'add_files_role(restore app-only disk)')
     if (isNeverEngine(engine)) {
         throw new Error(`add_files_role: refused Console engine '${engine}' (never idea02)`)
@@ -878,7 +1042,9 @@ export const ensureAppOnlyDiskOnConsoleEngine = async (
     }
 
     if (diskId === ctx.fixtureDisk && moved && /kolibri/i.test(diskId)) {
-        syncKolibriSidecarUrlForEngine(engine, hostMapFromOps(ctx.opts.ops), env)
+        // Stage 2: from the store (instance's Pi + published port) — never the :18080 default.
+        if (isStage2(ctx)) await resyncFixtureSidecarUrlsFromStore(ctx, env, { ownerCheck: false })
+        else syncKolibriSidecarUrlForEngine(engine, hostMapFromOps(ctx.opts.ops), env)
     }
     return {
         diskId,
@@ -900,10 +1066,33 @@ const infraUndockFixtures = async (ctx: ActionContext): Promise<ActionResult> =>
 const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
     // Prefer Atlas/Kid pre-docked engine (Path A) — RealFleetOps.findDockedEngine when live.
     const opsAny = ctx.opts.ops as FleetOps & { findDockedEngine?: (diskId: string) => Promise<string | null> }
+    let notDocked: string[] = []
     if (typeof opsAny.findDockedEngine === 'function') {
+        const usable = (e: string | null): e is string => !!e && !ctx.excludeEngines.includes(e)
         const existing = await opsAny.findDockedEngine(ctx.fixtureDisk)
-        if (existing && !ctx.excludeEngines.includes(existing)) {
+        // r53 FAIL@58 (Stage 2): Kolibri was still docked on idea01, but eject_disk@45 had ejected
+        // Nextcloud on idea03; the shortcut returned "already docked (no-op)" and then waited 420 s for a
+        // Nextcloud nobody re-docked. Stage 2: the shortcut holds only when EVERY fixture is docked;
+        // otherwise fall through to the per-Pi Stage 2 dock path below (each fixture on its home Pi).
+        if (usable(existing) && isStage2(ctx)) {
+            for (const d of ctx.fixtureDisks) {
+                if (d === ctx.fixtureDisk) continue
+                if (!usable(await opsAny.findDockedEngine(d))) notDocked.push(d)
+            }
+        }
+        if (usable(existing) && notDocked.length === 0) {
             await settleParticipants(ctx, ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e)))
+            if (isStage2(ctx)) {
+                // Stage 2: URLs from the store; Nextcloud is waited on ITS home Pi (not Kolibri's engine).
+                const urls = await resyncFixtureSidecarUrlsFromStore(ctx, process.env, { ownerCheck: false })
+                const ncReady = await maybeWaitNextcloudAfterDock(ctx, stage2HomeOf(DURATION_UI_FIXTURES.nextcloud.diskId))
+                return {
+                    ok: true,
+                    message: `all fixtures already docked (${ctx.fixtureDisks.join(', ')}; ${ctx.fixtureDisk} on ${existing}) — no-op (Stage 2); ${urls}${ncReady ? `; ${ncReady}` : ''}`,
+                    dockedEngine: existing,
+                    layer: 'infra',
+                }
+            }
             const kolibriUrl = syncKolibriSidecarUrlForEngine(existing, hostMapFromOps(ctx.opts.ops))
             const ncReady = await maybeWaitNextcloudAfterDock(ctx, existing)
             const ncMsg = ncReady ? `; ${ncReady}` : ''
@@ -914,11 +1103,17 @@ const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
                 layer: 'infra',
             }
         }
+        if (notDocked.length) {
+            console.log(`[duration] stage2 infra_dock_fixture: ${notDocked.join(', ')} not docked → per-Pi Stage 2 dock path (no already-docked shortcut)`)
+        }
     }
     // Path A re-dock after undock: prefer Console host pool[0] (idea01), never RNG —
     // unique-store inventory is empty if fixtures land on idea03/idea04.
     let engine: string
-    if (ctx.walker.dockedEngine && !ctx.excludeEngines.includes(ctx.walker.dockedEngine)) {
+    if (isStage2(ctx)) {
+        // Stage 2: each fixture docks on its own home Pi (Kolibri idea01, Nextcloud idea03).
+        engine = stage2HomeOf(ctx.fixtureDisk)
+    } else if (ctx.walker.dockedEngine && !ctx.excludeEngines.includes(ctx.walker.dockedEngine)) {
         engine = ctx.walker.dockedEngine
     } else if (ctx.opts.preserveDockedOnReturn) {
         const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
@@ -930,14 +1125,58 @@ const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
         engine = pickPoolEngine(ctx)
     }
     assertNotGolden(ctx, engine, 'infra_dock_fixture')
-    await ctx.opts.ops.dockFixture(engine, ctx.fixtureDisk)
+    // Stage 2: a fixture network-copied to the move target (store holder ≠ its home) stays there —
+    // docking its home partition too would give two partitions one diskId (Stage2FleetOps refuses).
+    const movedCopyOn = async (diskId: string): Promise<string | null> => {
+        if (!isStage2(ctx) || typeof opsAny.findDockedEngine !== 'function') return null
+        const on = await opsAny.findDockedEngine(diskId)
+        return on && on !== stage2HomeOf(diskId) && !ctx.excludeEngines.includes(on) ? on : null
+    }
+    const kept: string[] = []
+    const alreadyUp: string[] = []
+    const docked: string[] = []
+    const opsS2 = ctx.opts.ops as FleetOps & { stage2DockedAndMounted?: (e: string, d: string) => Promise<boolean> }
+    const dockOne = async (target: string, diskId: string) => {
+        const on = await movedCopyOn(diskId)
+        if (on) {
+            kept.push(`${diskId} stays on ${on} (moved copy)`)
+            return
+        }
+        // r54 step 58: only the ejected Nextcloud needed docking, but the per-Pi path re-docked the
+        // Empties fresh too (Engine eject → reset → dock). Stage 2: a disk the store has Docked on its
+        // target AND whose partition is mounted there is left alone.
+        if (isStage2(ctx) && typeof opsS2.stage2DockedAndMounted === 'function' && (await opsS2.stage2DockedAndMounted(target, diskId))) {
+            alreadyUp.push(diskId)
+            return
+        }
+        await ctx.opts.ops.dockFixture(target, diskId)
+        docked.push(diskId)
+    }
+    await dockOne(engine, ctx.fixtureDisk)
     // Sibling fixtures (nextcloud) on the same engine so inventory sees both packs.
     const siblings = ctx.fixtureDisks.filter(d => d !== ctx.fixtureDisk)
     for (const diskId of siblings) {
-        await ctx.opts.ops.dockFixture(engine, diskId)
+        await dockOne(stage2HomeOr(ctx, diskId, engine), diskId)
     }
     await settleParticipants(ctx, ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e)))
     const sibMsg = siblings.length ? ` (+ ${siblings.join(', ')})` : ''
+    if (isStage2(ctx)) {
+        // Stage 2: per-Pi URLs + ports from the store (Kolibri idea01:18080, Nextcloud idea03:61820),
+        // each pointing at its own fixture's Pi — never the Console engine, never "any Pi".
+        const urls = await resyncFixtureSidecarUrlsFromStore(ctx, process.env, { ownerCheck: false })
+        const ncReady = await maybeWaitNextcloudAfterDock(ctx, stage2HomeOf(DURATION_UI_FIXTURES.nextcloud.diskId))
+        console.log(`[duration] stage2 infra_dock_fixture: docked [${docked.join(', ')}]; already Docked+mounted (left alone) [${alreadyUp.join(', ')}]`)
+        return {
+            ok: true,
+            message:
+                `Stage 2 homes: docked ${docked.length ? docked.join(', ') : 'none'}` +
+                `${alreadyUp.length ? ` [already Docked+mounted, not re-docked: ${alreadyUp.join(', ')}]` : ''}` +
+                `${notDocked.length ? ` [was not docked: ${notDocked.join(', ')}]` : ''}` +
+                `${kept.length ? ` [${kept.join('; ')}]` : ''}; ${urls}${ncReady ? `; ${ncReady}` : ''}`,
+            dockedEngine: engine,
+            layer: 'infra',
+        }
+    }
     const kolibriUrl = syncKolibriSidecarUrlForEngine(engine, hostMapFromOps(ctx.opts.ops))
     const ncReady = await maybeWaitNextcloudAfterDock(ctx, engine)
     const ncMsg = ncReady ? `; ${ncReady}` : ''
@@ -961,12 +1200,22 @@ export const syncKolibriSidecarUrlForEngine = (
     engineId: string,
     hosts: Record<string, string> | undefined,
     env: NodeJS.ProcessEnv = process.env,
+    /** Stage 2: the instance's published port from the store (Stage 1: env DURATION_KOLIBRI_PORT still wins). */
+    storePort?: number,
+    /** Stage 2 (r55): the store port is mandatory and a manual DURATION_KOLIBRI_PORT never wins. */
+    opts: { stage2?: boolean } = {},
 ): string => {
     const authority = (hosts?.[engineId]?.trim() || engineId).replace(/\/$/, '')
-    const portRaw = env.DURATION_KOLIBRI_PORT?.trim()
-    const port = portRaw && /^\d+$/.test(portRaw) ? portRaw : '18080'
+    let port: string
+    if (opts.stage2) {
+        if (!storePort) throw new Error(`Stage 2: no store port for Kolibri on ${engineId} — refusing the Console default :${CONSOLE_DEFAULT_SIDECAR_PORTS.kolibri}`)
+        port = String(storePort)
+    } else {
+        const portRaw = env.DURATION_KOLIBRI_PORT?.trim()
+        port = portRaw && /^\d+$/.test(portRaw) ? portRaw : storePort ? String(storePort) : '18080'
+    }
     const url = `http://${authority}:${port}`
-    env.DURATION_KOLIBRI_URL = url
+    setHarnessEnv(env, 'DURATION_KOLIBRI_URL', url)
     return url
 }
 
@@ -982,19 +1231,35 @@ export const syncNextcloudSidecarUrlForEngine = (
     engineId: string,
     _hosts: Record<string, string> | undefined,
     env: NodeJS.ProcessEnv = process.env,
+    /** Stage 2: the instance's published port from the store (READY: nextcloud 61820). */
+    storePort?: number,
+    /**
+     * Stage 2 (r55): only a URL the harness itself set from the store is honoured; with none, the store
+     * port is mandatory (never the Console default :18280 = idea166's Nextcloud on idea01).
+     */
+    opts: { stage2?: boolean } = {},
 ): string => {
     const existing = env.DURATION_NEXTCLOUD_URL?.trim()
-    if (existing) {
+    if (existing && (!opts.stage2 || isHarnessOwned(env, 'DURATION_NEXTCLOUD_URL'))) {
         const url = existing.replace(/\/$/, '')
-        env.DURATION_NEXTCLOUD_URL = url
+        setHarnessEnv(env, 'DURATION_NEXTCLOUD_URL', url)
         return url
+    }
+    if (existing && opts.stage2) {
+        throw new Error(`Stage 2: DURATION_NEXTCLOUD_URL=${existing} was set outside the harness — refused (the URL comes from the store)`)
     }
     // Logical engine id / hostname — not hosts[engineId] Tailscale IP (r17 FAIL@58).
     const authority = engineId.replace(/\/$/, '')
-    const portRaw = env.DURATION_NEXTCLOUD_PORT?.trim()
-    const port = portRaw && /^\d+$/.test(portRaw) ? portRaw : '18280'
+    let port: string
+    if (opts.stage2) {
+        if (!storePort) throw new Error(`Stage 2: no store port for Nextcloud on ${engineId} — refusing the Console default :${CONSOLE_DEFAULT_SIDECAR_PORTS.nextcloud}`)
+        port = String(storePort)
+    } else {
+        const portRaw = env.DURATION_NEXTCLOUD_PORT?.trim()
+        port = portRaw && /^\d+$/.test(portRaw) ? portRaw : storePort ? String(storePort) : '18280'
+    }
     const url = `http://${authority}:${port}`
-    env.DURATION_NEXTCLOUD_URL = url
+    setHarnessEnv(env, 'DURATION_NEXTCLOUD_URL', url)
     return url
 }
 
@@ -1062,6 +1327,13 @@ export type WaitNextcloudSidecarOpts = {
     fetchImpl?: typeof fetch
     /** Inject sleep for unit tests. */
     sleepImpl?: (ms: number) => Promise<void>
+    /** Stage 2: URL only from the store (see syncNextcloudSidecarUrlForEngine opts.stage2). */
+    stage2?: boolean
+    /**
+     * r54 FAIL@58: Nextcloud answered HTTP 400 "Access through untrusted domain" for the whole 420 s.
+     * After this many consecutive untrusted-domain answers, fail at once (fixture trusted_domains). Default 30.
+     */
+    untrustedFailAfter?: number
 }
 
 /**
@@ -1074,7 +1346,7 @@ export const waitNextcloudSidecarReadyForEngine = async (
     opts: WaitNextcloudSidecarOpts = {},
 ): Promise<string> => {
     const env = opts.env ?? process.env
-    const base = syncNextcloudSidecarUrlForEngine(engineId, opts.hosts, env)
+    const base = syncNextcloudSidecarUrlForEngine(engineId, opts.hosts, env, undefined, { stage2: opts.stage2 })
     if (opts.skip) {
         return `DURATION_NEXTCLOUD_URL=${base} (wait skipped)`
     }
@@ -1084,14 +1356,45 @@ export const waitNextcloudSidecarReadyForEngine = async (
     const fetchImpl = opts.fetchImpl ?? globalThis.fetch
     const sleepImpl = opts.sleepImpl ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)))
     const loginUrl = `${base.replace(/\/$/, '')}/login`
+    const untrustedFailAfter = opts.untrustedFailAfter ?? 30
+    let untrusted = 0
     let last = 'no-attempt'
     while (Date.now() < deadline) {
         try {
-            const resp = await fetchImpl(loginUrl, {
-                redirect: 'follow',
-                signal: AbortSignal.timeout(5_000),
-            })
+            // Atlas reset-r54: never follow Nextcloud's overwrite.cli.url redirect to idea01:18280 —
+            // Stage 2 follows redirects by hand, only while they stay on the store host:port.
+            let resp = await fetchImpl(loginUrl, { redirect: opts.stage2 ? 'manual' : 'follow', signal: AbortSignal.timeout(5_000) })
+            if (opts.stage2) {
+                const u = new URL(base)
+                const pinLike = { hosts: [u.hostname], port: Number(u.port || 80) }
+                let at = loginUrl
+                for (let hop = 0; hop < 5 && resp.status >= 300 && resp.status < 400; hop++) {
+                    const loc = resp.headers.get('location')
+                    const off = offPinRedirect(resp.status, loc, at, pinLike)
+                    if (off) throw new NextcloudUntrustedError(`Nextcloud at ${base}: ${off}`)
+                    if (!loc) break
+                    at = new URL(loc, at).href
+                    resp = await fetchImpl(at, { redirect: 'manual', signal: AbortSignal.timeout(5_000) })
+                }
+            }
             const status = resp.status
+            if (status === 400) {
+                const body = await resp.text().catch(() => '')
+                if (nextcloudUntrustedDomain(status, body)) {
+                    untrusted++
+                    last = `HTTP 400 "Access through untrusted domain" ×${untrusted}`
+                    if (untrusted >= untrustedFailAfter) {
+                        throw new NextcloudUntrustedError(
+                            `Nextcloud at ${base} refuses host '${new URL(base).host}': HTTP 400 "Access through untrusted domain" ` +
+                                `${untrusted}× in a row — its config.php trusted_domains does not list this host:port. ` +
+                                `Nextcloud fixture config (not Engine, not the walk); no soft-pass, no other host.`,
+                        )
+                    }
+                    await sleepImpl(1_000)
+                    continue
+                }
+            }
+            untrusted = 0
             if (status >= 200 && status < 400) {
                 const html = await resp.text()
                 if (nextcloudLoginFormLooksReady(html)) {
@@ -1104,6 +1407,7 @@ export const waitNextcloudSidecarReadyForEngine = async (
                 last = `HTTP ${status}`
             }
         } catch (err) {
+            if (err instanceof NextcloudUntrustedError) throw err
             last = err instanceof Error ? err.message : String(err)
         }
         await sleepImpl(1_000)
@@ -1111,10 +1415,12 @@ export const waitNextcloudSidecarReadyForEngine = async (
     throw new Error(
         `Nextcloud sidecar not ready: ${loginUrl} within ${budget}ms (last=${last}). ` +
             `cover-all-230b70f-r16 FAIL@65 open_nextcloud_as_teacher — NC still booting after ` +
-            `infra_dock_fixture; Engine must poll :18280 login form (mirror Kolibri ` +
+            `infra_dock_fixture; Engine must poll the store port's login form (mirror Kolibri ` +
             `waitForSidecarHttpReady). Set DURATION_NEXTCLOUD_READY_MS / DURATION_NEXTCLOUD_URL|PORT.`,
     )
 }
+
+class NextcloudUntrustedError extends Error {}
 
 /** True when Nextcloud Grade5A (or any nextcloud disk) is among fixtures. */
 export const fixtureSetHasNextcloud = (
@@ -1139,6 +1445,7 @@ const maybeWaitNextcloudAfterDock = async (
     return waitNextcloudSidecarReadyForEngine(engineId, {
         hosts: hostMapFromOps(ctx.opts.ops),
         skip: !isLive,
+        stage2: isStage2(ctx),
     })
 }
 
@@ -1149,13 +1456,19 @@ const hostMapFromOps = (ops: FleetOps): Record<string, string> | undefined => {
 }
 
 const infraMoveDisk = async (ctx: ActionContext): Promise<ActionResult> => {
-    const from = ctx.walker.dockedEngine ?? pickPoolEngine(ctx)
+    // Stage 2: the source is where the STORE has the fixture docked, never walker state / RNG.
+    const from = isStage2(ctx) ? await stage2MoveSource(ctx) : ctx.walker.dockedEngine ?? pickPoolEngine(ctx)
     assertNotGolden(ctx, from, 'infra_move_disk(from)')
-    const to = pickPoolEngine(ctx, from)
+    // Stage 2 (Steve): the move target is always idea04 (network copy into its move-target partition).
+    const to = isStage2(ctx) ? STAGE2_MOVE_TARGET_HOST : pickPoolEngine(ctx, from)
     assertNotGolden(ctx, to, 'infra_move_disk(to)')
     // idea#168 r35@62: the move duration is logged explicitly (success and failure).
     const moveStartedAt = Date.now()
     try {
+        if (from === to && isStage2(ctx)) {
+            // Stage 2: "already on the move target" is not a move — the walk needs the real network copy.
+            throw new Error(`Stage 2: ${ctx.fixtureDisk} is already docked on the move target ${to} — refusing a no-op move`)
+        }
         if (from === to) {
             // Single-engine pool: treat as re-dock settle (document limitation).
             await ctx.opts.ops.dockFixture(to, ctx.fixtureDisk)
@@ -1191,7 +1504,8 @@ const infraMoveDisk = async (ctx: ActionContext): Promise<ActionResult> => {
                 `(disk ${inst.diskId}), not target ${to}. No soft-pass.`,
         )
     }
-    const urls = await resyncFixtureSidecarUrlsFromStore(ctx)
+    // Owner check deferred to the next sidecar-settle Intent (the moved instance may still be starting).
+    const urls = await resyncFixtureSidecarUrlsFromStore(ctx, process.env, { ownerCheck: false })
     const moveMsg =
         from === to
             ? `re-docked on sole pool engine ${to}`
@@ -1204,6 +1518,18 @@ const infraMoveDisk = async (ctx: ActionContext): Promise<ActionResult> => {
     }
 }
 
+/** Stage 2 infra_move_disk source: the store holder of the fixture disk (fail loud when undocked / excluded). */
+const stage2MoveSource = async (ctx: ActionContext): Promise<string> => {
+    const holder = await locateDockedEngine(ctx, ctx.fixtureDisk)
+    if (!holder || ctx.excludeEngines.includes(holder) || isNeverEngine(holder)) {
+        throw new Error(
+            `infra_move_disk (Stage 2): ${ctx.fixtureDisk} is not docked on a pool engine (store: ${holder ?? 'none'}; ` +
+                `walker said ${ctx.walker.dockedEngine ?? 'none'}) — nothing to copy from. No soft-pass.`,
+        )
+    }
+    return holder
+}
+
 /**
  * cover-all-980e735-r29 FAIL@97: return the pool engine whose store shows instanceId
  * on a docked disk (unique store: other engines keep an Undocked copy of the row).
@@ -1214,10 +1540,12 @@ export const locateInstanceEngine = async (
     ctx: ActionContext,
     instanceId: string,
     fallbackDiskId: string,
-): Promise<{ engine: string | null; diskId: string; live: boolean }> => {
+): Promise<{ engine: string | null; diskId: string; live: boolean; port?: number; status?: string }> => {
     const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
     let diskId = fallbackDiskId
     let live = false
+    let port: number | undefined
+    let status: string | undefined
     for (const eng of pool) {
         try {
             const view = await ctx.opts.ops.readStore(eng)
@@ -1225,6 +1553,8 @@ export const locateInstanceEngine = async (
             if (inst?.diskId && inst.status !== 'Undocked') {
                 diskId = inst.diskId
                 live = true
+                port = inst.port
+                status = inst.status
                 break
             }
         } catch {
@@ -1233,7 +1563,7 @@ export const locateInstanceEngine = async (
     }
     const engine = await locateDockedEngine(ctx, diskId)
     if (!engine || ctx.excludeEngines.includes(engine)) return { engine: null, diskId, live: false }
-    return { engine, diskId, live }
+    return { engine, diskId, live, ...(port ? { port } : {}), ...(status ? { status } : {}) }
 }
 
 /** Intents whose Console implementation polls a sidecar URL after Confirm. */
@@ -1262,23 +1592,44 @@ const isHarnessManagedUrl = (
  * env at it. Nextcloud is only rewritten when its URL is harness-managed (unset or a
  * pool hostname/IP), so manual overrides survive. Never points at an excluded engine.
  */
+/** r59: Stage 2 — wait until every instance on a docked disk has settled (see instanceSettle.ts). */
+export const stage2WaitInstancesSettled = async (ctx: ActionContext, label: string): Promise<string> => {
+    if (!isStage2(ctx)) return ''
+    const engines = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
+    const pollMs = ctx.opts.fast ? Number(process.env.DURATION_INSTANCE_SETTLE_POLL_MS ?? 3_000) : 3_000
+    return waitInstancesSettled(label, { engines, readStore: e => ctx.opts.ops.readStore(e), pollMs })
+}
+
 export const resyncFixtureSidecarUrlsFromStore = async (
     ctx: ActionContext,
     env: NodeJS.ProcessEnv = process.env,
+    /** Stage 2 sidecar-owner check (docker publishes the port). Off right after a dock (containers still starting). */
+    opts: { ownerCheck?: boolean } = {},
 ): Promise<string> => {
+    const ownerCheck = opts.ownerCheck ?? true
     const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
     const hosts = hostMapFromOps(ctx.opts.ops)
     const notes: string[] = []
+    // r59 (r58 FAIL@58): never read a port while an instance on a docked disk is still starting.
+    if (isStage2(ctx)) notes.push(await stage2WaitInstancesSettled(ctx, `${ctx.action}: instance settle before URL resync`))
     const entries = Object.entries(ctx.fixtureInstances)
     const kolibri =
         entries.find(([d]) => /kolibri/i.test(d)) ??
         (/kolibri/i.test(ctx.fixtureDisk) ? ([ctx.fixtureDisk, ctx.fixtureInstance] as const) : undefined)
     if (kolibri) {
         const [diskId, instId] = kolibri
-        const { engine } = await locateInstanceEngine(ctx, instId, diskId)
+        const { engine, port, status } = await locateInstanceEngine(ctx, instId, diskId)
         const prev = env.DURATION_KOLIBRI_URL
         if (engine) {
-            const url = syncKolibriSidecarUrlForEngine(engine, hosts, env)
+            // Stage 2: the store's port (a Kolibri moved to idea04 cannot use :18080 — idea04's own
+            // native Kolibri holds it) + the sidecar-owner check (never an "any Pi answers" probe).
+            if (isStage2(ctx)) {
+                // r55: no manual / default URL or port survives in Stage 2 (store only).
+                if (!port) throw new Error(`Stage 2: ${instId} on ${engine} has no port in the store — refusing the Console default :${CONSOLE_DEFAULT_SIDECAR_PORTS.kolibri}`)
+                assertNoManualAppOverride(env, stage2PinFor('kolibri', instId, engine, port, hosts, status))
+            }
+            const url = syncKolibriSidecarUrlForEngine(engine, hosts, env, isStage2(ctx) ? port : undefined, { stage2: isStage2(ctx) })
+            if (isStage2(ctx) && ownerCheck) notes.push(await stage2SidecarOwnerNote(ctx, engine, instId, port, status))
             notes.push(
                 `DURATION_KOLIBRI_URL=${url} (store: ${instId} on ${engine}` +
                     `${prev && prev.replace(/\/$/, '') !== url ? `; was ${prev}` : ''})`,
@@ -1290,14 +1641,27 @@ export const resyncFixtureSidecarUrlsFromStore = async (
     const nc = entries.find(([d]) => /nextcloud/i.test(d))
     if (nc) {
         const [diskId, instId] = nc
-        const { engine } = await locateInstanceEngine(ctx, instId, diskId)
+        const { engine, port: storePort, status: ncStatus } = await locateInstanceEngine(ctx, instId, diskId)
         const prev = env.DURATION_NEXTCLOUD_URL
-        if (engine && isHarnessManagedUrl(prev, pool, hosts)) {
+        if (engine && isStage2(ctx)) {
+            // r55: Stage 2 Nextcloud URL = the store's Pi + port, always (a manual URL/port is refused, never kept).
+            if (!storePort) throw new Error(`Stage 2: ${instId} on ${engine} has no port in the store — refusing the Console default :${CONSOLE_DEFAULT_SIDECAR_PORTS.nextcloud}`)
+            const pin = stage2PinFor('nextcloud', instId, engine, storePort, hosts, ncStatus)
+            assertNoManualAppOverride(env, pin)
+            if (ownerCheck) notes.push(await stage2SidecarOwnerNote(ctx, engine, instId, storePort, ncStatus))
+            setHarnessEnv(env, 'DURATION_NEXTCLOUD_URL', pin.url)
+            notes.push(
+                `DURATION_NEXTCLOUD_URL=${pin.url} (store: ${instId} on ${engine}` +
+                    `${prev && prev.replace(/\/$/, '') !== pin.url ? `; was ${prev}` : ''})`,
+            )
+        } else if (engine && isHarnessManagedUrl(prev, pool, hosts)) {
             const portRaw = env.DURATION_NEXTCLOUD_PORT?.trim()
-            const port = portRaw && /^\d+$/.test(portRaw) ? portRaw : '18280'
+            // Stage 2: the store's port (READY: 61820 on idea03; 18280 is idea166's NC, not the fixture).
+            const port = portRaw && /^\d+$/.test(portRaw) ? portRaw : isStage2(ctx) && storePort ? String(storePort) : '18280'
+            if (isStage2(ctx) && ownerCheck) notes.push(await stage2SidecarOwnerNote(ctx, engine, instId, storePort, ncStatus))
             // Logical hostname, not Tailscale IP (NC trusted_domains, r17 FAIL@58).
             const url = `http://${engine}:${port}`
-            env.DURATION_NEXTCLOUD_URL = url
+            setHarnessEnv(env, 'DURATION_NEXTCLOUD_URL', url)
             notes.push(
                 `DURATION_NEXTCLOUD_URL=${url} (store: ${instId} on ${engine}` +
                     `${prev && prev.replace(/\/$/, '') !== url ? `; was ${prev}` : ''})`,
@@ -1309,6 +1673,248 @@ export const resyncFixtureSidecarUrlsFromStore = async (
     return notes.join('; ')
 }
 
+/**
+ * Stage 2: prove the sidecar URL hits THIS instance's container on THIS Pi (docker publishes
+ * `:<port>->` on an inst-* container), never "some Pi answers": idea04's native Kolibri also
+ * answers :18080. Throws (loud fail) on a mismatch; non-Stage2FleetOps ops → note only.
+ */
+export const stage2SidecarOwnerNote = async (
+    ctx: ActionContext,
+    engine: string,
+    instanceId: string,
+    port: number | undefined,
+    /** Store status; the check runs only for Running instances (a stopped one publishes nothing). */
+    status?: string,
+): Promise<string> => {
+    if (status !== undefined && status !== 'Running') return `sidecar owner check skipped (${instanceId} ${status} on ${engine})`
+    const ops = ctx.opts.ops as FleetOps & { verifySidecarOwner?: (e: string, i: string, p: number) => Promise<string[]> }
+    if (!port) throw new Error(`Stage 2: ${instanceId} on ${engine} has no port in the store — cannot pin its sidecar URL`)
+    if (typeof ops.verifySidecarOwner !== 'function') return `sidecar owner check skipped (${engine}:${port}, no Stage2FleetOps)`
+    // verifySidecarOwner throws when no container of this instance publishes :port on this Pi.
+    const owners = await ops.verifySidecarOwner(engine, instanceId, port)
+    return `sidecar owner OK ${instanceId} → ${engine}:${port} (${owners.join(', ')})`
+}
+
+/** Every hostname that addresses `engine`: logical id, its --hosts IP, <id>.local. */
+const engineHostAliases = (engine: string, hosts: Record<string, string> | undefined): string[] =>
+    [...new Set([engine, `${engine}.local`, ...(hosts?.[engine]?.trim() ? [hosts[engine]!.trim()] : [])])]
+
+/**
+ * Store-derived App URL (Stage 2). Kolibri keeps the --hosts authority (Path B by IP, r15); Nextcloud and
+ * Kiwix use the logical hostname (Nextcloud trusted_domains, r17).
+ */
+export const stage2PinFor = (
+    app: SidecarApp,
+    instanceId: string,
+    engine: string,
+    port: number,
+    hosts: Record<string, string> | undefined,
+    status?: string,
+): AppPin => {
+    const authority = app === 'kolibri' ? (hosts?.[engine]?.trim() || engine) : engine
+    return {
+        app, instanceId, engine, port,
+        url: `http://${authority}:${port}`,
+        hosts: engineHostAliases(engine, hosts),
+        ...(status ? { status } : {}),
+    }
+}
+
+/** One App a step uses: which instance (and its disk, for the store lookup). */
+export interface AppUse { app: SidecarApp; instanceId: string; diskId: string }
+
+const diskOfInstance = (ctx: ActionContext, instanceId: string): string =>
+    Object.entries(ctx.fixtureInstances).find(([, i]) => i === instanceId)?.[0] ?? ''
+
+const fixtureInstanceFor = (ctx: ActionContext, app: SidecarApp): AppUse => {
+    const re = app === 'kolibri' ? /kolibri/i : app === 'nextcloud' ? /nextcloud/i : /kiwix|wikipedia/i
+    const hit = Object.entries(ctx.fixtureInstances).find(([d]) => re.test(d))
+    if (hit) return { app, diskId: hit[0], instanceId: hit[1] }
+    const f = DURATION_UI_FIXTURES[app]
+    return { app, diskId: f.diskId, instanceId: f.instanceId }
+}
+
+/**
+ * r55: which Apps (and instances) this step reaches through a sidecar URL. App states / App-named
+ * Intents → the fixture instance of that App; open_app / copy / move / restore settle → the
+ * instance the Console resolves (DURATION_START_INSTANCE_ID / ctx instance / backup source).
+ */
+/**
+ * r86h (r86g FAIL@102): the instance a Console-only step really acts on, resolved exactly as the Console
+ * intent (b540743) resolves it, so the expected App/URL follows that instance and not the fixture:
+ * copy/move/open_copied_instance: DURATION_COPY_INSTANCE_ID (operator override or the Stage 2 move pin)
+ * || ctx instance; open_app: DURATION_START_INSTANCE_ID || ctx instance; restore_from_backup: ctx instance
+ * (the Console ignores DURATION_BACKUP_SOURCE_INSTANCE — a differing value is refused, fail loud).
+ */
+export const actedInstanceId = (action: string, instanceId: string | undefined, fixtureInstance: string, env: NodeJS.ProcessEnv = process.env): string => {
+    const ctxId = instanceId || fixtureInstance
+    if (action === 'copy_app' || action === 'move_app' || action === 'open_copied_instance') return env.DURATION_COPY_INSTANCE_ID?.trim() || ctxId
+    if (action === 'open_app') return env.DURATION_START_INSTANCE_ID?.trim() || ctxId
+    if (action === 'restore_from_backup') {
+        const b = env.DURATION_BACKUP_SOURCE_INSTANCE?.trim()
+        if (b && b !== ctxId) {
+            throw new Error(`restore_from_backup: DURATION_BACKUP_SOURCE_INSTANCE=${b} but the Console intent restores ${ctxId} (it ignores that env) — refused, the guard would check the wrong instance. Fail loud.`)
+        }
+        return ctxId
+    }
+    return ctxId
+}
+
+export const stage2AppUsesForStep = (ctx: ActionContext, instanceId: string | undefined, env: NodeJS.ProcessEnv = process.env): AppUse[] => {
+    const uses: AppUse[] = appsUsedByStep({ action: ctx.action, to: ctx.to }).map(a => fixtureInstanceFor(ctx, a))
+    if (INSTANCE_SIDECAR_ACTIONS.has(ctx.action)) {
+        const id = actedInstanceId(ctx.action, instanceId, ctx.fixtureInstance, env)
+        const app = appKindForInstanceId(id)
+        if (!uses.some(u => u.instanceId === id)) uses.push({ app, instanceId: id, diskId: diskOfInstance(ctx, id) })
+    }
+    return uses
+}
+
+/**
+ * Nextcloud must accept the host it is reached by: a 400 "Access through untrusted domain" (r54: the
+ * fixture's trusted_domains held only idea01:18280) fails here, not after a 90–420 s Console poll.
+ */
+const stage2NextcloudHostCheck = async (pin: AppPin): Promise<string> => {
+    let status = 0
+    let body = ''
+    try {
+        const r = await fetch(`${pin.url}/status.php`, { redirect: 'manual', signal: AbortSignal.timeout(5_000) })
+        status = r.status
+        body = status === 400 ? await r.text().catch(() => '') : ''
+        const off = offPinRedirect(status, r.headers.get('location'), `${pin.url}/status.php`, pin)
+        if (off) throw new Error(`Stage 2: Nextcloud ${pin.instanceId} at ${pin.url}: ${off}`)
+    } catch (e) {
+        if (e instanceof Error && e.message.startsWith('Stage 2:')) throw e
+        return `nextcloud host check: ${pin.url}/status.php unreachable (${e instanceof Error ? e.message : String(e)}) — Console readiness poll decides`
+    }
+    if (nextcloudUntrustedDomain(status, body)) {
+        throw new Error(
+            `Stage 2: Nextcloud ${pin.instanceId} at ${pin.url} answers HTTP 400 "Access through untrusted domain" — its ` +
+                `trusted_domains does not list ${new URL(pin.url).host}. Nextcloud fixture config; no soft-pass, no other host`,
+        )
+    }
+    return `nextcloud host check ${pin.url}/status.php HTTP ${status}`
+}
+
+/** r58: engine → LAN IP: store engineDB[].lanAddress (Engine PR #166) over DURATION_LAN_HOSTS. */
+export const stage2LanHosts = async (ctx: ActionContext, env: NodeJS.ProcessEnv = process.env): Promise<Record<string, string>> => {
+    const base = lanHostsFromEnv(env)
+    for (const e of ctx.poolEngines.filter(x => !ctx.excludeEngines.includes(x))) {
+        try {
+            const view = await ctx.opts.ops.readStore(e)
+            return lanHostsFromStore(view.engineDB as Record<string, { lanAddress?: string | null }>, base)
+        } catch {
+            /* try next */
+        }
+    }
+    return base
+}
+
+const withLan = (pin: AppPin, lan: Record<string, string>): AppPin =>
+    lan[pin.engine] && !pin.hosts.includes(lan[pin.engine]!) ? { ...pin, hosts: [...pin.hosts, lan[pin.engine]!] } : pin
+
+/**
+ * r55 pre-use (Stage 2): pin each App's URL from the store (instance's own Pi + port) BEFORE the Intent,
+ * refuse manual overrides, prove the port is that instance's container on that Pi (Running instances;
+ * a not-yet-Running one is proven right after the Intent). Throws on any miss — no default port.
+ */
+export const pinAppsForStep = async (
+    ctx: ActionContext,
+    uses: AppUse[],
+    env: NodeJS.ProcessEnv = process.env,
+): Promise<{ pins: AppPin[]; note: string }> => {
+    const hosts = hostMapFromOps(ctx.opts.ops)
+    const pins: AppPin[] = []
+    const notes: string[] = []
+    const live = typeof (ctx.opts.ops as FleetOps & { verifySidecarOwner?: unknown }).verifySidecarOwner === 'function'
+    const lan = uses.length ? await stage2LanHosts(ctx, env) : {}
+    if (uses.length) notes.push(await stage2WaitInstancesSettled(ctx, `${ctx.action}: instance settle before App pin`))
+    for (const use of uses) {
+        const dflt = CONSOLE_DEFAULT_SIDECAR_PORTS[use.app]
+        const loc = await locateInstanceEngine(ctx, use.instanceId, use.diskId)
+        if (!loc.engine || !loc.live) {
+            throw new Error(
+                `Stage 2: ${use.app} ${use.instanceId} has no live instance on a pool Pi in the store — its URL would fall back ` +
+                    `to the Console default :${dflt} on the Console host (idea166 sidecars answer there). No any-Pi fallback`,
+            )
+        }
+        if (!loc.port) {
+            throw new Error(`Stage 2: ${use.app} ${use.instanceId} on ${loc.engine} has no port in the store — refusing the Console default :${dflt}`)
+        }
+        const pin = withLan(stage2PinFor(use.app, use.instanceId, loc.engine, loc.port, hosts, loc.status), lan)
+        const i166 = idea166Target(pin.url, loc.engine === 'idea01' ? pin.hosts : [])
+        if (i166) throw new Error(`Stage 2: ${use.app} ${use.instanceId} store URL ${pin.url} is ${i166} — never a Stage 2 fixture. No any-Pi fallback`)
+        assertNoManualAppOverride(env, pin)
+        setHarnessEnv(env, APP_URL_ENV[use.app], pin.url)
+        setHarnessEnv(env, APP_HOSTS_ENV[use.app], appHostForms(pin, lan))
+        pins.push(pin)
+        if (loc.status === 'Running') {
+            notes.push(await stage2SidecarOwnerNote(ctx, loc.engine, use.instanceId, loc.port, loc.status))
+            if (use.app === 'nextcloud' && live) notes.push(await stage2NextcloudHostCheck(pin))
+        } else {
+            notes.push(`${use.instanceId} ${loc.status ?? 'status?'} on ${loc.engine} — owner check after the Intent`)
+        }
+        notes.push(`${APP_URL_ENV[use.app]}=${pin.url} (store: ${use.instanceId} on ${loc.engine}:${loc.port})`)
+    }
+    return { pins, note: notes.join('; ') }
+}
+
+/** Driver slice the post-use check needs (PlaywrightUiDriver implements it; Stub does not). */
+type TabAwareDriver = { appTabs?: (sinceSeq?: number) => { url: string; active: boolean; fresh: boolean; console?: boolean; seq?: number }[] }
+
+/**
+ * r55 post-use (Stage 2): every App tab the step used must address one of its store pins, and each used
+ * instance must still be Running and served by its own container on its own Pi. A relocation shows up
+ * as a re-pin note (the next use re-verifies); a wrong host/port tab or a missing owner fails the step.
+ */
+export const verifyAppUseAfterIntent = async (
+    ctx: ActionContext,
+    driver: TabAwareDriver,
+    uses: AppUse[],
+    pins: AppPin[],
+    tabSeq0: number | undefined,
+    env: NodeJS.ProcessEnv = process.env,
+    tabsBefore?: AppTab[],
+): Promise<{ ok: true; note: string } | { ok: false; problem: string }> => {
+    const notes: string[] = []
+    if (typeof driver.appTabs === 'function') {
+        const hosts = hostMapFromOps(ctx.opts.ops)
+        const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
+        const consoleHosts = pool.flatMap(e => engineHostAliases(e, hosts))
+        const tabs = driver.appTabs(tabSeq0)
+        const problems = appTabProblems(tabs, pins, consoleHosts, undefined, tabsBefore)
+        if (problems.length) return { ok: false, problem: problems.join('; ') }
+        notes.push(`app tabs on store URLs (${pins.map(p => p.url).join(', ')})`)
+        const openProblem = consoleOpenProblem(ctx.action, tabs, pins, await stage2LanHosts(ctx, env))
+        if (openProblem) return { ok: false, problem: openProblem }
+        if (CONSOLE_OPEN_ACTION_RE.test(ctx.action)) notes.push('tab came from the Console Open (<engine>.local)')
+    } else {
+        notes.push('app tab check n/a (driver has no tab list)')
+    }
+    for (const use of uses) {
+        try {
+            const loc = await locateInstanceEngine(ctx, use.instanceId, use.diskId)
+            if (!loc.engine || !loc.live || !loc.port) {
+                return { ok: false, problem: `${use.instanceId} has no live instance with a port in the store after the step — the App it used was not this instance. No soft-pass` }
+            }
+            if (loc.status !== 'Running') {
+                return { ok: false, problem: `${use.instanceId} is ${loc.status ?? 'unknown'} on ${loc.engine} after the step — the App it used was not this instance. No soft-pass` }
+            }
+            const pinned = pins.find(p => p.instanceId === use.instanceId)
+            if (pinned && (pinned.engine !== loc.engine || pinned.port !== loc.port)) {
+                const re = stage2PinFor(use.app, use.instanceId, loc.engine, loc.port, hostMapFromOps(ctx.opts.ops), loc.status)
+                setHarnessEnv(env, APP_URL_ENV[use.app], re.url)
+                setHarnessEnv(env, APP_HOSTS_ENV[use.app], appHostForms(re, await stage2LanHosts(ctx, env)))
+                notes.push(`${use.instanceId} now ${loc.engine}:${loc.port} (was ${pinned.engine}:${pinned.port}) → ${APP_URL_ENV[use.app]}=${re.url}`)
+            }
+            notes.push(await stage2SidecarOwnerNote(ctx, loc.engine, use.instanceId, loc.port, loc.status))
+        } catch (e) {
+            return { ok: false, problem: e instanceof Error ? e.message : String(e) }
+        }
+    }
+    return { ok: true, note: notes.join('; ') }
+}
+
 export type DurationOperationRow = {
     id: string
     kind: string
@@ -1317,6 +1923,18 @@ export type DurationOperationRow = {
     completedAt?: number | null
     error?: string | null
     args?: Record<string, string>
+}
+
+/**
+ * r66 stale-view guard (r65 FAIL@43): force a reconnect + re-read of every pool engine's store view before a
+ * post-check gives up on "no Operation". Each reconnect is counted (staleView.ts). Returns false when the
+ * ops have no refreshView (Fake ops) so the caller fails as before.
+ */
+export const refreshViews = async (ctx: ActionContext, pool: string[], reason: string): Promise<boolean> => {
+    const ops = ctx.opts.ops as { refreshView?: (e: string, why: string) => Promise<boolean | null> }
+    if (typeof ops.refreshView !== 'function') return false
+    for (const e of pool.filter(x => !isNeverEngine(x))) await ops.refreshView(e, reason)
+    return true
 }
 
 /**
@@ -1343,9 +1961,12 @@ export const verifyRestoreOperation = async (
     const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))
     const found: (DurationOperationRow & { engine: string })[] = []
     const readErrors: string[] = []
+    const scanRestore = async () => {
+    found.length = 0
+    readErrors.length = 0
     for (const eng of pool) {
         try {
-            const rows = await opsAny.listOperations(eng)
+            const rows = await opsAny.listOperations!(eng)
             for (const r of rows) {
                 if (r.kind !== 'restoreApp') continue
                 if (typeof r.startedAt !== 'number' || r.startedAt < sinceMs - slackMs) continue
@@ -1355,6 +1976,10 @@ export const verifyRestoreOperation = async (
             readErrors.push(`${eng}: ${e instanceof Error ? e.message : String(e)}`)
         }
     }
+    }
+    await scanRestore()
+    // r66 stale-view guard: distrust the cached view once before declaring never_started.
+    if (!found.length && await refreshViews(ctx, pool, 'restoreApp post-check saw no Operation')) await scanRestore()
     const errNote = readErrors.length ? ` (store read errors: ${readErrors.join('; ')})` : ''
     if (!found.length) {
         return {
@@ -1623,7 +2248,7 @@ export const ensureBackupDiskForInstance = async (
         const probe = await ops.probeBackupDisk(chosen.engine, chosen.id, instanceId)
         if (!probe) {
             throw new Error(
-                `backup_instance: Backup Disk ${chosen.id} on ${chosen.engine} has no known idea-test-N slot ` +
+                `backup_instance: Backup Disk ${chosen.id} on ${chosen.engine} has no known mount (Stage 2 partition / Stage 1 slot) ` +
                     `(cannot verify the archive afterwards). No soft-pass.`,
             )
         }
@@ -1665,7 +2290,7 @@ export const verifyCopyOperation = async (
     ctx: ActionContext,
     sinceMs: number,
     expect: { instanceId?: string },
-    opts: { startBudgetMs?: number; doneBudgetMs?: number; pollMs?: number; slackMs?: number; traceSlackMs?: number } = {},
+    opts: { startBudgetMs?: number; doneBudgetMs?: number; pollMs?: number; slackMs?: number; traceSlackMs?: number; startClockMs?: number } = {},
     env: NodeJS.ProcessEnv = process.env,
 ): Promise<{ ok: boolean; reason: CopyCheckReason; note: string } | null> => {
     const ops = ctx.opts.ops as BackupOps
@@ -1674,15 +2299,17 @@ export const verifyCopyOperation = async (
         const raw = env[k]?.trim()
         return raw && /^\d+$/.test(raw) ? Number(raw) : undefined
     }
-    const startBudget = opts.startBudgetMs ?? envMs('DURATION_COPY_START_MS') ?? (ctx.opts.fast ? 5_000 : 30_000)
+    // r65 FAIL@43: was fast 5 s counted from the Intent's return. r66: ≥ 60 s (env floor), clock from Confirm.
+    const startBudget = opts.startBudgetMs ?? opStartBudget(env, 'DURATION_COPY_START_MS')
     const doneBudget = opts.doneBudgetMs ?? copyDoneBudgetMs(!!ctx.opts.fast, env)
     const pollMs = opts.pollMs ?? 1_000
     const slackMs = opts.slackMs ?? 5_000
     const traceSlackMs = opts.traceSlackMs ?? 5_000
     const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e))
     const terminal = (st: string) => st === 'Done' || st === 'Failed' || st === 'Cancelled'
-    const t0 = Date.now()
+    const t0 = opts.startClockMs ?? Date.now()
     let rows: (DurationOperationRow & { engine: string })[] = []
+    let viewRefreshed = false
     let readErrors: string[] = []
     let refusal: (DurationCommandTrace & { engine: string }) | undefined
     const scan = async () => {
@@ -1723,6 +2350,10 @@ export const verifyCopyOperation = async (
         if (rs.some(r => r.status === 'Done')) break
         if (rs.length && rs.every(r => terminal(r.status))) break
         if (!rs.length && refusal) break
+        if (!rs.length && elapsed >= startBudget && !viewRefreshed && await refreshViews(ctx, pool, `copyApp post-check saw no Operation after ${elapsed}ms`)) {
+            viewRefreshed = true
+            continue
+        }
         if (!rs.length && elapsed >= startBudget) break
         if (elapsed >= startBudget + doneBudget) break
         await sleep(pollMs)
@@ -1771,7 +2402,7 @@ export const verifyCopyOperation = async (
     }
 }
 
-// ── r30: move_app must stay on one Pi (Eng 8d98718 refuses cross-engine moveApp) ──
+// ── r30: move_app must stay on one Pi (the Engine refuses cross-engine moveApp) ──
 
 /** Console 0760c01 e2e/intents/copyMoveApp.ts pickTargetDiskId preference order. */
 export const COPY_MOVE_TARGET_PREFERENCE = [
@@ -1789,6 +2420,46 @@ export const COPY_MOVE_TARGET_PREFERENCE = [
  * (Nextcloud, Kolibri, empty-001, then any other non-system docked disk). Hosts come
  * from a fresh store read, never from walker.dockedEngine.
  */
+/**
+ * r86f FAIL@102, Steve option (A): Stage 2 move_app moves the step-43 copy (ctx.walker.stage2CopyInstanceId,
+ * recorded by copy_app) onto STAGE2_ROLE_MAP.moveApp (duration-empty-001, same Pi as the Nextcloud disk).
+ * DURATION_COPY_INSTANCE_ID / DURATION_COPY_TARGET_DISK set by the operator still win. Stage 1: null (unchanged).
+ * No recorded copy and no override → throws (fail loud; never fall back to the cross-Pi Kolibri fixture).
+ */
+export const stage2MoveAppPins = (
+    ctx: Pick<ActionContext, 'action' | 'walker'> & { opts?: unknown },
+    env: NodeJS.ProcessEnv = process.env,
+): { instanceId: string; targetDiskId: string; set: Record<string, string> } | null => {
+    if (ctx.action !== 'move_app' || !isStage2(ctx as ActionContext)) return null
+    const envInst = env.DURATION_COPY_INSTANCE_ID?.trim()
+    const envTarget = env.DURATION_COPY_TARGET_DISK?.trim()
+    const instanceId = envInst || ctx.walker.stage2CopyInstanceId?.trim() || ''
+    if (!instanceId) {
+        throw new Error(
+            'Stage 2 move_app (option A): no step-43 copy recorded (copy_app did not run or created no single new instance) ' +
+                'and DURATION_COPY_INSTANCE_ID is unset. Fail loud; never fall back to the Kolibri fixture (cross-Pi).',
+        )
+    }
+    const targetDiskId = envTarget || STAGE2_ROLE_MAP.moveApp
+    const set: Record<string, string> = {}
+    if (!envInst) set.DURATION_COPY_INSTANCE_ID = instanceId
+    if (!envTarget) set.DURATION_COPY_TARGET_DISK = targetDiskId
+    return { instanceId, targetDiskId, set }
+}
+
+/** Sets harness-owned env vars; returns the restore function. */
+export const pinEnv = (vars: Record<string, string>, env: NodeJS.ProcessEnv = process.env): (() => void) => {
+    const prev: Record<string, string | undefined> = {}
+    for (const [k, v] of Object.entries(vars)) { prev[k] = env[k]; env[k] = v }
+    return () => { for (const [k, v] of Object.entries(prev)) { if (v === undefined) delete env[k]; else env[k] = v } }
+}
+
+/** r86f (A): the single instance a copy created = ids after minus baseline; null when not exactly one. */
+export const newCopyInstanceId = (baseline: ReadonlySet<string>, after: ReadonlySet<string>): string | null => {
+    const fresh = [...after].filter(id => !baseline.has(id))
+    return fresh.length === 1 ? fresh[0]! : null
+}
+
 export const predictCopyMovePair = async (
     ctx: ActionContext,
     ids: { instanceId?: string; diskId?: string },
@@ -1799,6 +2470,8 @@ export const predictCopyMovePair = async (
     sourceEngine: string | null
     targetDiskId: string | null
     targetEngine: string | null
+    /** r86f: other docked non-system disks on the source's Pi (the only legal moveApp targets). */
+    sameEngineOthers: string[]
 }> => {
     const kolibri = DURATION_UI_FIXTURES.kolibri
     const nc = DURATION_UI_FIXTURES.nextcloud.diskId
@@ -1833,13 +2506,15 @@ export const predictCopyMovePair = async (
         sourceEngine: docked.get(sourceDiskId) ?? null,
         targetDiskId,
         targetEngine: targetDiskId ? (docked.get(targetDiskId) ?? null) : null,
+        sameEngineOthers: others.filter(id => docked.get(id) === docked.get(sourceDiskId)),
     }
 }
 
 /**
- * r30 preflight before move_app / copy_app (live only). Eng 8d98718 moveApp refuses a
- * target disk on another engine (CopyMoveApp.ts:399-405 — logs "Cross-engine move is not
- * supported" and returns, no Operation). copyApp supports cross-engine targets (Phase 2:
+ * r30 preflight before move_app / copy_app (live only). The Engine's moveApp refuses a
+ * target disk on another engine: src/data/CopyMoveApp.ts moveApp throws "moveApp: Target disk '…' is
+ * on a remote engine. Cross-engine move is not supported" (pinned Engine f194fb5; the old 8d98718
+ * line citation 399-405 was stale). The command trace ends as error and no Operation is created. copyApp supports cross-engine targets (Phase 2:
  * rsync over SSH + remote startInstance; CopyMoveApp.ts:94-103/197-201), so copy_app only
  * reports the pair. Throws (move_app) naming both Pis and both disks.
  */
@@ -1871,13 +2546,16 @@ export const preflightCopyMoveSamePi = async (
     const desc = `${instanceId} on ${sourceEngine} (disk ${sourceDiskId}) -> ${targetDiskId} on ${targetEngine}`
     if (sourceEngine !== targetEngine) {
         if (op === 'move_app') {
+            const sameHost = pair.sameEngineOthers.length
+                ? `other disks docked on ${sourceEngine}: ${pair.sameEngineOthers.join(', ')}`
+                : `no other disk is docked on ${sourceEngine}`
             throw new Error(
-                `move_app preflight: cross-engine move ${desc}; Engine refuses cross-engine moveApp ` +
-                    `(Eng 8d98718 CopyMoveApp.ts:399-405 "Cross-engine move is not supported"). ` +
-                    `Co-locate both disks on one Pi first. No soft-pass.`,
+                `move_app preflight: cross-engine move ${desc}; the Engine refuses cross-engine moveApp ` +
+                    `(CopyMoveApp.ts moveApp: "Target disk … is on a remote engine. Cross-engine move is not supported"). ` +
+                    `Same-Pi candidates: ${sameHost}. Co-locate both disks on one Pi first. No soft-pass.`,
             )
         }
-        return `${op} preflight: cross-engine copy ${desc} (Eng 8d98718 copyApp Phase 2 supports it)`
+        return `${op} preflight: cross-engine copy ${desc} (Engine copyApp supports cross-engine targets)`
     }
     return `${op} preflight: same Pi ${desc} (store re-read)`
 }
@@ -2136,6 +2814,7 @@ export const verifyBackupOperation = async (
     // older backupApp trace (an earlier walk) is not taken for this click.
     const traceSlackMs = opts.traceSlackMs ?? 5_000
     const t0 = Date.now()
+    let viewRefreshed = false
     let rows: (DurationOperationRow & { engine: string })[] = []
     let readErrors: string[] = []
     let traces: (DurationCommandTrace & { engine: string })[] = []
@@ -2197,6 +2876,10 @@ export const verifyBackupOperation = async (
         if (mine.length && mine.every(r => terminal(r.status))) break
         // r36@98: refusal ends the wait once background CommandLog has settled — never blocks ops polls.
         if (!rows.length && earlyTracesSettled && refusal()) break
+        if (!rows.length && elapsed >= startBudget && !viewRefreshed && await refreshViews(ctx, pool, `backupApp post-check saw no Operation after ${elapsed}ms`)) {
+            viewRefreshed = true
+            continue
+        }
         if (!rows.length && elapsed >= startBudget) break
         if (rows.length && !mine.length && rows.every(r => terminal(r.status)) && elapsed >= startBudget) break
         if (elapsed >= startBudget + doneBudget) break
@@ -2318,7 +3001,7 @@ export const verifyBackupOperation = async (
         return {
             ok: false,
             reason: 'no_archive',
-            note: `backup op ${done.id} Done but Backup Disk ${backupDiskId}@${host} has no known idea-test-N slot. No soft-pass.`,
+            note: `backup op ${done.id} Done but Backup Disk ${backupDiskId}@${host} has no known mount (Stage 2 partition / Stage 1 slot). No soft-pass.`,
         }
     }
     const lb = backupYamlLastBackup(probe.backupYaml, want)
@@ -2553,6 +3236,50 @@ const layerForUiAction = (action: string, fallback: Layer | null): Layer => {
 }
 
 /**
+ * r64 (r63 FAIL@43): the store-backed Operation wait handed to copy/move/restore Intents (live ops only).
+ * Read-only: listOperations on every pool engine; bounded by opDoneBudgetMs; logged per status change.
+ */
+export const waitOperationFor = (ctx: ActionContext, onConfirm?: (sinceMs: number) => void): WaitOperationFn | undefined => {
+    const kind = WAIT_OP_ACTIONS[ctx.action]
+    const ops = ctx.opts.ops as BackupOps & {
+        refreshView?: (e: string, reason: string) => Promise<boolean | null>
+        listCommandTraces?: (engineId: string) => Promise<DurationCommandTrace[]>
+    }
+    if (!kind || typeof ops.listOperations !== 'function') return undefined
+    const engines = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e))
+    return async q => {
+        onConfirm?.(q.sinceMs)
+        const r = await waitOperationTerminal(q, {
+            ...(typeof ops.refreshView === 'function' ? { refresh: (e: string, why: string) => ops.refreshView!(e, why) } : {}),
+            listOperations: e => ops.listOperations!(e),
+            // r85 FAIL@100: an Engine refusal (no Operation) fails the step with the Engine's message.
+            ...(typeof ops.listCommandTraces === 'function' ? { listCommandTraces: (e: string) => ops.listCommandTraces!(e) } : {}),
+            engines,
+            sleep: ms => new Promise(res => setTimeout(res, ms)),
+            now: () => Date.now(),
+            log: line => console.log(line),
+        }, opDoneBudgetMs(q.kind, !!ctx.opts.fast), opAppearBudgetMs())
+        console.log(JSON.stringify({ event: 'op_wait_result', action: ctx.action, ...r }))
+        return r
+    }
+}
+
+/** r70: copy/move steps whose Done is followed by a post-op settle on ALL pool views. */
+export const POST_OP_SETTLE_ACTIONS = new Set(['copy_app', 'move_app'])
+
+export const postOpIo = (ctx: ActionContext): PostOpSettleIo => {
+    const ops = ctx.opts.ops as { refreshView?: (e: string, why: string) => Promise<boolean | null> }
+    return {
+        engines: ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e)),
+        readStore: e => ctx.opts.ops.readStore(e),
+        ...(typeof ops.refreshView === 'function' ? { refresh: (e: string, why: string) => ops.refreshView!(e, why) } : {}),
+        sleep: ms => new Promise(res => setTimeout(res, ms)),
+        now: () => performance.now(),
+        log: line => console.log(line),
+    }
+}
+
+/**
  * Dispatch a usage/operator Intent via UiDriver (Phase 3).
  * StubUiDriver when stubUi≠false / no driver; PlaywrightUiDriver when --ui.
  */
@@ -2682,7 +3409,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
         try {
             // Prefer A r21: always convert the pinned empty (empty-001), by testid.
             diskId = filesDiskTargetId()
-            const consoleEngine = resolveConsoleEngineHost(ctx)
+            const consoleEngine = stage2HomeOr(ctx, diskId, resolveConsoleEngineHost(ctx))
             const note = await redockEmpty001BeforeMakeFiles(ctx)
             const pre = await preflightFilesDiskTarget(ctx, diskId, consoleEngine)
             // Pin the Files Disk id before the Intent so Pixel + later steps share it.
@@ -2714,6 +3441,10 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     if (ctx.action === 'make_backup_disk' || ctx.action === 'erase_disk') {
         const target = ctx.action === 'make_backup_disk' ? backupDiskTargetId() : eraseDiskTargetId()
         try {
+            if (ctx.action === 'erase_disk') {
+                const fresh = await stage2RedockSharedEraseDisk(ctx)
+                if (fresh) preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${fresh}` : fresh
+            }
             const note = await pinEmptyDiskForIntent(ctx, driver, target, ctx.action)
             if (note !== null) {
                 pinnedEmptyId = target
@@ -2766,9 +3497,11 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             const notes = [backupPre.note]
             if (backupPre.movedTo) {
                 backupDockedEngine = backupPre.movedTo
-                const urls = await resyncFixtureSidecarUrlsFromStore(ctx).catch(
-                    e => `sidecar URL resync failed: ${e instanceof Error ? e.message : String(e)}`,
-                )
+                const urls = await resyncFixtureSidecarUrlsFromStore(ctx).catch(e => {
+                    // Stage 2: a wrong-owner sidecar is a loud failure (no soft-pass).
+                    if (isStage2(ctx)) throw e
+                    return `sidecar URL resync failed: ${e instanceof Error ? e.message : String(e)}`
+                })
                 if (urls) notes.push(urls)
             }
             preStartSettleNote = [preStartSettleNote, ...notes].filter(Boolean).join('; ')
@@ -2781,6 +3514,21 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             }
         }
     }
+    // r86f (A): Stage 2 move_app → the step-43 copy onto empty-001 (env overrides win). Pinned for
+    // the preflight and the Intent; restored after the Intent (or on an early abort).
+    let restoreMovePins: (() => void) | null = null
+    let movePinnedInstance: string | null = null
+    try {
+        const pins = stage2MoveAppPins(ctx)
+        if (pins) {
+            restoreMovePins = pinEnv(pins.set)
+            movePinnedInstance = pins.instanceId
+            const note = `Stage 2 move_app (A): instance ${pins.instanceId} (step-43 copy${pins.set.DURATION_COPY_INSTANCE_ID ? '' : ', env override'}) → ${pins.targetDiskId}${pins.set.DURATION_COPY_TARGET_DISK ? '' : ' (env override)'}`
+            preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${note}` : note
+        }
+    } catch (e) {
+        return { ok: false, message: `move_app aborted before Intent: ${e instanceof Error ? e.message : String(e)}`, layer }
+    }
     // r30: move_app must stay on one Pi (Eng refuses cross-engine moveApp); copy_app
     // reports its pair. Live only (findDockedEngine) — Fake walks skip.
     if (
@@ -2792,6 +3540,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${note}` : note
         } catch (e) {
             const err = e instanceof Error ? e.message : String(e)
+            restoreMovePins?.()
             return {
                 ok: false,
                 message: `${ctx.action} aborted before Intent: ${err}`,
@@ -2822,7 +3571,40 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             if (note) preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${note}` : note
         } catch (e) {
             const err = e instanceof Error ? e.message : String(e)
+            // Stage 2: the sidecar must be proven on its own Pi (no soft-pass).
+            if (isStage2(ctx)) { restoreMovePins?.(); return { ok: false, message: `${ctx.action} aborted before Intent: ${err}`, layer } }
             preStartSettleNote = `${preStartSettleNote ? `${preStartSettleNote}; ` : ''}sidecar URL resync failed: ${err}`
+        }
+    }
+    // r55: no any-Pi fallback for ANY App port (Stage 2). Every App this step reaches through a sidecar
+    // URL is pinned from the store (its own Pi + port) BEFORE the Intent, with the owner check; the
+    // Console default ports (Kolibri 18080, Nextcloud 18280, Kiwix 18380) can never apply silently.
+    let appUses: AppUse[] = []
+    let appPins: AppPin[] = []
+    let tabSeq0: number | undefined
+    let tabsBefore: AppTab[] | undefined
+    if (isStage2(ctx)) {
+        try {
+            appUses = stage2AppUsesForStep(ctx, instanceId)
+        } catch (e) {
+            restoreMovePins?.()
+            return { ok: false, message: `${ctx.action} aborted before Intent: ${e instanceof Error ? e.message : String(e)}`, layer }
+        }
+        if (appUses.length) {
+            try {
+                const r = await pinAppsForStep(ctx, appUses)
+                appPins = r.pins
+                if (r.note) preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${r.note}` : r.note
+            } catch (e) {
+                const err = e instanceof Error ? e.message : String(e)
+                restoreMovePins?.()
+                return { ok: false, message: `${ctx.action} aborted before Intent: ${err}`, layer }
+            }
+            const d = driver as typeof driver & { tabSeq?: () => number }
+            tabSeq0 = typeof d.tabSeq === 'function' ? d.tabSeq() : undefined
+            // r86d: snapshot the open tabs so a leftover tab the step never touched is not judged as its App use.
+            tabsBefore = CONSOLE_ONLY_APP_ACTIONS.has(ctx.action) && typeof (driver as TabAwareDriver).appTabs === 'function'
+                ? (driver as TabAwareDriver).appTabs!(tabSeq0) : undefined
         }
     }
     const intentStartedAt = Date.now()
@@ -2835,18 +3617,26 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     // disk) over ctx.diskId — point it at the pinned role disk for this Intent only.
     const prevEmptyPin = process.env.DURATION_EMPTY_DISK_ID
     if (pinnedEmptyId) process.env.DURATION_EMPTY_DISK_ID = pinnedEmptyId
+    // r70: baseline of pool instance ids before a copy/move, so the settle knows which instances the op created.
+    const postOpBaseline = POST_OP_SETTLE_ACTIONS.has(ctx.action) && isStage2(ctx) && waitOperationFor(ctx)
+        ? await poolInstanceIds(postOpIo(ctx)) : undefined
     let result: Awaited<ReturnType<typeof driver.runIntent>>
+    // r66: the Intent reports its Confirm time through the op-wait hook; the post-check clock starts there.
+    let confirmAtMs: number | undefined
+    const waitOp = waitOperationFor(ctx, ms => { confirmAtMs = ms })
     try {
         result = await driver.runIntent({
             action: ctx.action,
             diskId,
             instanceId,
             engineId: ctx.action === 'make_files_disk' || ctx.action === 'add_files_role'
-                ? resolveConsoleEngineHost(ctx)
+                ? (isStage2(ctx) ? stage2HomeOf(diskId) : resolveConsoleEngineHost(ctx))
                 : (rebootTarget ?? backupDockedEngine ?? ctx.walker.dockedEngine ?? ctx.poolEngines[0]),
             screenshotPath: shotPath,
+            ...(waitOp ? { waitOperation: waitOp } : {}),
         })
     } finally {
+        restoreMovePins?.()
         if (ctx.action === 'add_files_role') {
             if (prevFilesPin === undefined) delete process.env.DURATION_FILES_DISK_ID
             else process.env.DURATION_FILES_DISK_ID = prevFilesPin
@@ -2878,6 +3668,27 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     let message = result.message ?? `${result.mode}: ${ctx.action}`
     if (preStartSettleNote) {
         message = `${message}; ${preStartSettleNote}`
+    }
+    // r55 post-use: the App tabs this step used must be on the store URLs, and each used instance must
+    // still be Running and owned by its own container on its own Pi (Stage 2; Intent ok only).
+    // r70 (r69 FAIL@43): after copy/move Done, refresh ALL pool views and wait until sources + new instances Run.
+    if (result.ok && postOpBaseline !== undefined && isStage2(ctx)) {
+        const ps = await settleAfterLongOp(ctx.action, [...new Set([...appUses.map(u => u.instanceId), ...(typeof instanceId === 'string' && instanceId ? [instanceId] : []), ...(movePinnedInstance ? [movePinnedInstance] : [])])], postOpBaseline, postOpIo(ctx))
+        if (!ps.ok) return { ok: false, message: `${ctx.action}: ${ps.note} (Console Intent reported ok; ${preStartSettleNote ?? ''})`, layer }
+        message = `${message}; ${ps.note}`
+        // r86f (A): remember the first copy (cover-all @43) for Stage 2 move_app.
+        if (ctx.action === 'copy_app' && !ctx.walker.stage2CopyInstanceId && postOpBaseline) {
+            const id = newCopyInstanceId(postOpBaseline, await poolInstanceIds(postOpIo(ctx)))
+            if (id) { ctx.walker.stage2CopyInstanceId = id; message = `${message}; recorded step-${ctx.walker.step} copy ${id} for Stage 2 move_app` }
+            else message = `${message}; could not single out the new copy (move_app will fail loud unless DURATION_COPY_INSTANCE_ID is set)`
+        }
+    }
+    if (result.ok && appUses.length && isStage2(ctx)) {
+        const post = await verifyAppUseAfterIntent(ctx, driver as TabAwareDriver, appUses, appPins, tabSeq0, process.env, tabsBefore)
+        if (!post.ok) {
+            return { ok: false, message: `${ctx.action}: ${post.problem} (Console Intent reported ok; ${preStartSettleNote ?? ''})`, layer }
+        }
+        if (post.note) message = `${message}; ${post.note}`
     }
     // r29 FAIL@97: a restore that the Engine never executed must not pass on a healthy
     // pre-existing sidecar. Live only; on Intent failure append the diagnosis.
@@ -2917,9 +3728,9 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     }
     // copy_app: "Intent ok" is not enough — the copyApp Operation must end Done (live only).
     if (ctx.action === 'copy_app' && result.ok) {
-        const check = await verifyCopyOperation(ctx, intentStartedAt, {
+        const check = await verifyCopyOperation(ctx, confirmAtMs ?? intentStartedAt, {
             instanceId: process.env.DURATION_COPY_INSTANCE_ID?.trim() || instanceId || ctx.fixtureInstance,
-        })
+        }, { startClockMs: confirmAtMs })
         if (check && !check.ok) {
             return { ok: false, message: `copy_app: ${check.note} (Console Intent reported ok)`, layer }
         }
@@ -2997,6 +3808,11 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             message = `${message}; add_files_role on app-only ${diskId} (stub; skip store assert)`
         }
     }
+    // r75 fix 1: remember the disk an install_app is still landing on (soft return).
+    if (result.ok && ctx.action === 'erase_disk') ctx.walker.eraseStarted = true
+    if (result.ok && ctx.action === 'install_app') {
+        ctx.walker.pendingInstallDisk = ctx.walker.eraseStarted ? eraseDiskTargetId() : filesDiskTargetId()
+    }
     // Prefer A r26: after successful confirm_erase, re-dock empty-002 Empty for late install_app.
     if (result.ok && ctx.action === 'confirm_erase') {
         try {
@@ -3046,6 +3862,25 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
 }
 
 export const dispatchAction = async (ctx: ActionContext): Promise<ActionResult> => {
+    return settleAfterStep(ctx, await dispatchActionInner(ctx))
+}
+
+/**
+ * r59: after a dock/redock/move/copy/reboot/restore step, every instance on a docked disk must settle
+ * (left Undocked/Starting, port when running) before the next step pins URLs or uses Apps. A failed step
+ * is returned as is; a settle failure turns an ok step into a loud failure with the field dump.
+ */
+export const settleAfterStep = async (ctx: ActionContext, r: ActionResult): Promise<ActionResult> => {
+    if (!r.ok || !isStage2(ctx) || !SETTLE_AFTER_ACTIONS.has(ctx.action)) return r
+    try {
+        const note = await stage2WaitInstancesSettled(ctx, `${ctx.action}: instance settle after step`)
+        return { ...r, message: `${r.message}; ${note}` }
+    } catch (e) {
+        return { ...r, ok: false, message: `${r.message}; ${e instanceof Error ? e.message : String(e)}` }
+    }
+}
+
+const dispatchActionInner = async (ctx: ActionContext): Promise<ActionResult> => {
     switch (ctx.action) {
         case 'return_to_start':
             return returnToStart(ctx)

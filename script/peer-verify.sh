@@ -347,7 +347,7 @@ for i in "${!NAMES[@]}"; do
     dump "$i" --ops-since 0 || { echo "cannot read the store of ${NAMES[$i]} (http://${IPS[$i]}:${HTTP_PORT[$i]}/api/store-url)" >&2; exit 3; }
     echo "$DUMP" > "$EVID/store-pre-${NAMES[$i]}.json"
     badids=$(jq -r --arg f "$FORBIDDEN_NAME" '.engineDB|to_entries[]|select((.value.hostname//"")|ascii_downcase|contains($f))|.key' <<<"$DUMP")
-    ids=$(jq -r --arg h "$host" '.engineDB|to_entries|map(select(.value.hostname==$h))|sort_by(.value.lastRun // 0)|reverse|.[].key' <<<"$DUMP")
+    ids=$(jq -r --arg h "$host" '.engineDB|to_entries|map(select(.value.hostname==$h))|sort_by(.value.lastBooted // .value.lastRun // 0)|reverse|.[].key' <<<"$DUMP")
     id=$(head -1 <<<"$ids")
     [[ -n "$id" ]] || refuse "no Engine entry with hostname $host in the store of ${NAMES[$i]}"
     [[ -z "$meta" || "ENGINE_$meta" == "$id" ]] || refuse "${NAMES[$i]}: /META.yaml says ENGINE_$meta but the store entry for $host is $id"

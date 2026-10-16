@@ -64,6 +64,10 @@ const fakeOps = (state: FakeState): MountOps => ({
         state.calls.push(`mount ${d}`)
         state.mounts.push({ source: `/dev/${d}`, target: mountPointOf(d), fstype: 'vfat' })
     },
+    mountReadOnly: async (d) => {
+        state.calls.push(`mount -o ro ${d}`)
+        state.mounts.push({ source: `/dev/${d}`, target: mountPointOf(d), fstype: 'ext4' })
+    },
     umount: async (d) => {
         state.calls.push(`umount ${d}`)
         if (state.umountFails) {
@@ -354,6 +358,11 @@ describe('busy unmount on undock sets Disk.unmountError; the next mount clears i
                 expect(await waitFor(storeHandle, s => !!s.diskDB[diskId]?.diskTypes?.includes('backup'))).toBe(true)
             }
 
+            // The read-only META look (idea#201 §10) came first and was released
+            expect(state.calls.indexOf(`mount -o ro ${device}`)).toBeLessThan(state.calls.indexOf(`mount ${device}`))
+            const umountsBefore = state.calls.filter(c => c === `umount ${device}`).length
+            const callsBefore = state.calls.length
+
             // Pull the disk while something keeps the mount busy
             state.umountFails = true
             await triggerUndock(device)
@@ -365,8 +374,8 @@ describe('busy unmount on undock sets Disk.unmountError; the next mount clears i
             expect(disk.unmountError!.mountPoint).toBe(mp)
             expect(disk.unmountError!.fsUuid).toBe('CAFE-0126')
             expect(disk.unmountError!.message).toContain('target is busy')
-            expect(state.calls.filter(c => c === `umount ${device}`)).toHaveLength(UMOUNT_MAX_ATTEMPTS)
-            expect(state.calls).not.toContain(`rmdir ${mp}`)
+            expect(state.calls.filter(c => c === `umount ${device}`).length - umountsBefore).toBe(UMOUNT_MAX_ATTEMPTS)
+            expect(state.calls.slice(callsBefore)).not.toContain(`rmdir ${mp}`)
             const failure = traces(logHandle).find(t => t.command === DISK_DETECTION_COMMAND &&
                 JSON.parse(t.args).step === 'undock' && JSON.parse(t.args).device === device)
             expect(failure?.status).toBe('error')
@@ -380,9 +389,10 @@ describe('busy unmount on undock sets Disk.unmountError; the next mount clears i
             expect(storeHandle.doc()!.diskDB[diskId].unmountError).toBeNull()
 
             // A clean undock: umount once, then rmdir
+            const callsBeforeCleanUndock = state.calls.length
             await triggerUndock(device)
             expect(await waitFor(storeHandle, s => s.diskDB[diskId]?.dockedTo === null)).toBe(true)
-            expect(await waitFor(storeHandle, () => state.calls.includes(`rmdir ${mp}`))).toBe(true)
+            expect(await waitFor(storeHandle, () => state.calls.slice(callsBeforeCleanUndock).includes(`rmdir ${mp}`))).toBe(true)
             expect(storeHandle.doc()!.diskDB[diskId].unmountError ?? null).toBeNull()
         })
     }

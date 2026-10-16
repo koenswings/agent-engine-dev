@@ -23,6 +23,7 @@
  */
 
 import { spawn } from 'child_process'
+import fs from 'fs'
 import { $ } from 'zx'
 import { log } from './utils.js'
 import { config } from '../data/Config.js'
@@ -39,8 +40,11 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
 export const APP_DATA_HELPER_VERSION = '3'
 
 export const APP_DATA_HELPER_UPDATE =
-    'ask Ops to update the Engine\'s root helper: build-engine installs /usr/local/sbin/idea-app-data ' +
-    'and its line in /etc/sudoers.d/11-engine-files (idea#168)'
+    'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
+    '/usr/local/sbin/idea-app-data and its line in /etc/sudoers.d/11-engine-files; build-engine does the same) (idea#168)'
+
+/** The borg binary idea-app-data runs by absolute path (BORG= in the helper; Debian package borgbackup). */
+export const BORG_PATH = '/usr/bin/borg'
 
 const ROOT_TOKEN = /^(system|sd[a-z][12]|[a-z0-9][a-z0-9-]{0,63})$/
 const ID_TOKEN = /^[a-z0-9][a-z0-9-]{0,63}$/
@@ -223,6 +227,17 @@ export const runAppDataWithInput: AppDataInputRunner = (args, input) => new Prom
 
 // ── Version check at startup ─────────────────────────────────────────────────
 
+/**
+ * What is wrong with borg for the helper, or null. The helper runs /usr/bin/borg
+ * by absolute path; without it backup and restore fail with exit 127 (wh, 2026-10-13).
+ */
+/** How borgProblem looks for the binary; tests that fake the helper replace `exists`. */
+export const borgPresence: { exists: (p: string) => boolean } = { exists: (p) => fs.existsSync(p) }
+
+export const borgProblem = (exists: (p: string) => boolean = borgPresence.exists): string | null =>
+    exists(BORG_PATH) ? null :
+        `${BORG_PATH} is not installed, so Backup Disk backups and restores cannot run (the app-data helper calls it by absolute path); ${APP_DATA_HELPER_UPDATE}.`
+
 /** What is wrong with the installed helper, or null when it is the version this Engine needs. */
 export const appDataHelperProblem = async (run: AppDataRunner = runAppData): Promise<string | null> => {
     const want = `idea-app-data ${APP_DATA_HELPER_VERSION}`
@@ -254,4 +269,17 @@ export const assertAppDataHelper = async (run: AppDataRunner = runAppData): Prom
     const problem = await appDataHelperProblem(run)
     if (problem) throw new Error(problem)
     log(`app-data root helper ${APP_DATA_HELPER} version ${APP_DATA_HELPER_VERSION} is installed`)
+}
+
+/**
+ * Startup preflight for borg. Not fatal (an Engine without a Backup Disk works),
+ * but loud at start, and backupMonitor refuses a backup with the same message
+ * instead of running into exit 127.
+ */
+export const reportBorgAtStartup = (exists: (p: string) => boolean = borgPresence.exists): string | null => {
+    if (config.settings.isDev) return null
+    const problem = borgProblem(exists)
+    if (problem) console.error(`ERROR (preflight): ${problem}`)
+    else log(`${BORG_PATH} is installed`)
+    return problem
 }

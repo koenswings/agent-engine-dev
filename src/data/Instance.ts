@@ -6,7 +6,7 @@ import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber,
 import { createOperation, updateOperation } from './Operations.js'
 import { composeFileEnv } from './FilesMount.js'
 import { Store, getDisk, getEngine, getLocalEngine, getInstancesOfEngine, } from "./Store.js";
-import { Disk, diskMountRoot, diskFsRoot } from "./Disk.js";
+import { Disk, diskMountRoot, diskFsRoot, deviceMountRoot } from "./Disk.js";
 import { localEngineId } from "./Engine.js";
 import { network } from "./Network.js";
 import { createAppId } from "./App.js";
@@ -14,11 +14,12 @@ import { Docker } from "node-docker-api";
 import { createMeta } from '../data/Meta.js'
 import { config, disksRoot, skipImageLoad } from '../data/Config.js'
 import { DocHandle } from "@automerge/automerge-repo";
-import { CommandLogStore, LogEntry, getCommandLogHandle, addTrace, closeTrace, flushLogs } from './CommandLogStore.js'
+import { CommandLogStore, LogEntry, getCommandLogHandle, liveCommandLogHandle, addTrace, closeTrace, flushLogs } from './CommandLogStore.js'
 import { getActiveTrace, flushTrace } from '../utils/CommandLogger.js'
 import { dockerAvailable } from '../utils/dockerAvailable.js'
 import { rebindKolibriMorangoInstanceId } from './InstanceCopy.js'
-import { hostIdentity, writeHostIdentityEnv, isNextcloudInstance, primaryIPv4, nextcloudTrustedDomainsBridge, setEnvLines } from './HostIdentity.js'
+import { hostIdentity, writeHostIdentityEnv, isNextcloudInstance, nextcloudTrustedDomainsBridge } from './HostIdentity.js'
+import { trackInFlight, startDiskGoneReason, dockIdentityOf } from './InstanceInFlight.js'
 
 // ── Step-progress helpers ─────────────────────────────────────────────────────
 
@@ -70,7 +71,7 @@ export const START_INSTANCE_COMMAND = 'startInstance'
  */
 const activeStartTraceId = (handle: DocHandle<CommandLogStore>): string | null => {
   const active = getActiveTrace()
-  if (active && active.command === START_INSTANCE_COMMAND && handle.doc()?.traces[active.traceId]) {
+  if (active && active.command === START_INSTANCE_COMMAND && liveCommandLogHandle(handle).doc()?.traces[active.traceId]) {
     return active.traceId
   }
   return null
@@ -190,7 +191,27 @@ export const recordInstanceStartWarnings = async (
 /**
  * Set an instance to Error with a diagnosis in statusCondition.
  */
+/** Device-node check for a pulled disk; null in testMode (simulated devices). Tests may override. */
+let deviceExistsCheck: ((dev: string) => boolean) | null | undefined = undefined
+export const setDeviceExistsCheckForTests = (fn: ((dev: string) => boolean) | null | undefined): void => { deviceExistsCheck = fn }
+const deviceExists = (): ((dev: string) => boolean) | null =>
+  deviceExistsCheck !== undefined ? deviceExistsCheck : (config.settings.testMode ? null : (dev: string) => fs.existsSync(`/dev/${dev}`))
+
 export const markInstanceError = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, e: unknown): Promise<void> => {
+  // hw180: a start that fails because its disk was pulled (undock pending, record undocked or
+  // moved, device node gone) is not an app failure: the instance goes to Undocked, never Error.
+  const gone = startDiskGoneReason(String(disk.id), disk.device ?? null, dockIdentityOf(storeHandle.doc()?.diskDB?.[disk.id]), deviceExists())
+  if (gone) {
+    log(`Instance ${instance.id}: start failed because ${gone} — marking Undocked, not Error (${e instanceof Error ? e.message : String(e)})`)
+    storeHandle.change(doc => {
+      const inst = doc.instanceDB[instance.id]
+      if (!inst) return
+      inst.status = 'Undocked' as Status
+      inst.statusCondition = null
+      inst.metrics = null
+    })
+    return
+  }
   const condition = await diagnoseInstance(instance, disk, e)
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
@@ -259,7 +280,7 @@ export type Status = 'Undocked'      // Disk is not currently docked; instance d
   | 'Error';
 
 
-export const buildInstance = async (instanceName: InstanceName, appName: AppName, gitAccount: string, version: Version, device: DeviceName): Promise<void> => {
+export const buildInstance = async (instanceName: InstanceName, appName: AppName, gitAccount: string, version: Version, device: DeviceName): Promise<InstanceID | undefined> => {
   print(`Building new instance '${instanceName}' from version ${version} of app '${appName}' on device '${device}' of the local engine.`)
 
   // CODING STYLE: only use absolute pathnames !
@@ -280,13 +301,25 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     //   log(`Instance ID: ${instanceId}`)
     // } 
     const instanceId = createInstanceId(appName).toString() as InstanceID
+    // System disk -> '' (/apps, /instances); other disks -> <disksRoot>/<device>
+    const root = await deviceMountRoot(String(device))
+    const onSystemDisk = root === ''
+    log(`buildInstance: target root '${root || '/'}' for device ${device}`)
     log(`Instance ID: ${instanceId}`)
 
 
     // Create the app infrastructure if it does not exist
     // TODO: This should be done when creating the disk — https://github.com/koenswings/idea/issues/46
     // TODO: Here we should only be checking if it is an apps disk! — https://github.com/koenswings/idea/issues/46
-    await $`mkdir -p ${disksRoot()}/${device}/apps ${disksRoot()}/${device}/services ${disksRoot()}/${device}/instances`
+    if (onSystemDisk) {
+      // /apps, /instances, /services may be root-owned on the system disk (idea04).
+      // Use exactly the sudoers ENGINE_APPDIRS commands (10-engine) to create them
+      // and hand them to pi; the Engine runs as pi and writes into them.
+      await $`sudo -n /usr/bin/mkdir -p /apps /instances /services`
+      await $`sudo -n /usr/bin/chown pi:pi /apps /instances /services`
+    } else {
+      await $`mkdir -p ${root}/apps ${root}/services ${root}/instances`
+    }
 
     // **************************
     // STEP 1 - App Type creation
@@ -307,8 +340,12 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
 
     } else {
       print(`Cloning version ${version} of app ${appName} from git account ${gitAccount}`)
-      await $`git clone -b ${version} https://github.com/koenswings/app-${appName} /tmp/apps/${appName}`
-      appVersion = version
+      // A branch name may contain '/' (feat/x): the ref goes to git intact as one
+      // argument, the folder name of the App master is derived from it (Atlas).
+      assertGitRef(version)
+      await $`git ${appCloneArgs('koenswings', appName, version, `/tmp/apps/${appName}`)}`
+      appVersion = versionDirName(version)
+      if (appVersion !== version) log(`App ref '${version}' is stored as version '${appVersion}' (folder ${appName}-${appVersion})`)
     }
 
 
@@ -316,7 +353,7 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     // Overwrite if it exists
     // We want to copy the content of a directory and rename the directory at the same time: 
     //   See https://unix.stackexchange.com/questions/412259/how-can-i-copy-a-directory-and-rename-it-in-the-same-command
-    await $`cp -fr /tmp/apps/${appName}/. ${disksRoot()}/${device}/apps/${appName}-${appVersion}/`
+    await $`cp -fr /tmp/apps/${appName}/. ${root}/apps/${appName}-${appVersion}/`
 
 
     // **************************
@@ -338,19 +375,19 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     //   }
     // }
     // Again use /. to specify the content of the dir, not the dir itself 
-    await $`cp -fr /tmp/apps/${appName}/. ${disksRoot()}/${device}/instances/${instanceId}/`
+    await $`cp -fr /tmp/apps/${appName}/. ${root}/instances/${instanceId}/`
 
 
 
 
     // If the app has an init_data.tar.gz file, unpack it in the app folder
-    if (fs.existsSync(`${disksRoot()}/${device}/instances/${instanceId}/init_data.tar.gz`)) {
+    if (fs.existsSync(`${root}/instances/${instanceId}/init_data.tar.gz`)) {
       print(`Unpacking the init_data.tar.gz file in the app folder`)
-      await $`tar -xzf ${disksRoot()}/${device}/instances/${instanceId}/init_data.tar.gz -C ${disksRoot()}/${device}/instances/${instanceId}`
+      await $`tar -xzf ${root}/instances/${instanceId}/init_data.tar.gz -C ${root}/instances/${instanceId}`
       // Rename the folder init_data to data
-      await $`mv ${disksRoot()}/${device}/instances/${instanceId}/init_data ${disksRoot()}/${device}/instances/${instanceId}/data`
+      await $`mv ${root}/instances/${instanceId}/init_data ${root}/instances/${instanceId}/data`
       // Remove the init_data.tar.gz file
-      await $`rm ${disksRoot()}/${device}/instances/${instanceId}/init_data.tar.gz`
+      await $`rm ${root}/instances/${instanceId}/init_data.tar.gz`
     }
     // Not needed as Docker will auto-create any data folder we specify in the compose
     // } else {
@@ -360,12 +397,12 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
 
     // Open the compose.yaml file of the app instance and add the version info to the compose file and the instance name
     print(`Opening the compose.yaml file of the app instance and adding the version info to the compose file (${appVersion}) and the instance name (${instanceName})`)
-    const composeFile = await $`cat ${disksRoot()}/${device}/instances/${instanceId}/compose.yaml`
+    const composeFile = await $`cat ${root}/instances/${instanceId}/compose.yaml`
     const compose = YAML.parse(composeFile.stdout)
     compose['x-app'].version = appVersion
     compose['x-app'].instanceName = instanceName
     const composeYAML = YAML.stringify(compose)
-    await $`echo ${composeYAML} > ${disksRoot()}/${device}/instances/${instanceId}/compose.yaml`
+    await $`echo ${composeYAML} > ${root}/instances/${instanceId}/compose.yaml`
 
     // Remove the temporary app folder
     await $`rm -rf /tmp/apps/${appName}`
@@ -379,7 +416,7 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     for (const serviceName in services) {
       const serviceImage = services[serviceName].image
       // Pull the sercice image
-      const serviceImageTar = serviceImageTarPath(`${disksRoot()}/${device}`, serviceImage)
+      const serviceImageTar = serviceImageTarPath(`${root}`, serviceImage)
       if (fs.existsSync(serviceImageTar)) {
         print(`Service image ${serviceImage} already exists`)
       } else {
@@ -394,7 +431,10 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     // STEP 4 - Create the META.yaml file if it is not already there
     // **************************
 
-    if (!fs.existsSync(`${disksRoot()}/${device}/META.yaml`)) {
+    if (onSystemDisk) {
+      // The system disk's META is /META.yaml, written at image build; never create a second one
+      print(`System disk ${device}: using existing /META.yaml`)
+    } else if (!fs.existsSync(`${root}/META.yaml`)) {
       log(`Creating META.yaml file on disk ${device}`)
       createMeta(device)
     } else {
@@ -432,9 +472,11 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
 
 
     print(chalk.green(`Instance ${instanceId} built`))
+    return instanceId
   } catch (e) {
     print(chalk.red('Error building app instance'))
     console.error(e)
+    return undefined
   }
 }
 
@@ -892,7 +934,32 @@ export const diagnoseInstance = async (instance: Instance, disk: Disk, caughtErr
   return parts.join('\n\n') || 'Unknown error'
 }
 
-export const startInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> => {
+/**
+ * Refuse a git ref that git itself would refuse or that could be read as an
+ * option (git check-ref-format rules, simplified). '/' is allowed.
+ */
+export const assertGitRef = (ref: string): void => {
+  const bad = !ref || ref.startsWith('-') || ref.startsWith('/') || ref.endsWith('/') || ref.endsWith('.') ||
+    ref.endsWith('.lock') || ref.includes('..') || ref.includes('//') || ref.includes('@{') ||
+    /[\x00-\x20\x7f~^:?*\[\\]/.test(ref) || ref.split('/').some(c => c.startsWith('.'))
+  if (bad) throw new Error(`Invalid app version / git ref '${ref}'`)
+}
+
+/** Folder-safe form of a ref for <appName>-<version> (one path component): feat/x → feat-x. */
+export const versionDirName = (ref: string): string => {
+  const v = ref.replace(/[^A-Za-z0-9._+-]+/g, '-').replace(/-+/g, '-').replace(/^[-.]+/, '').replace(/-+$/, '')
+  return v || 'ref'
+}
+
+/** argv after `git` for cloning one branch/tag of an App repo; the ref is passed unchanged. */
+export const appCloneArgs = (gitAccount: string, appName: string, ref: string, dest: string): string[] =>
+  ['clone', '--branch', ref, '--', `https://github.com/${gitAccount}/app-${appName}`, dest]
+
+/** #179: every start is tracked in flight on its disk so an eject waits for it to settle. */
+export const startInstance = (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> =>
+  trackInFlight(String(disk.id), `startInstance ${instance.id}`, startInstanceTracked(storeHandle, instance, disk, cause))
+
+const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> => {
   const store: Store = storeHandle.doc()
   print(`Starting instance '${instance.id}' on disk ${disk.id} of engine '${localEngineId}'.`)
 
@@ -907,6 +974,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
         const port = parseInt(await readEnvVariable(`${await diskMountRoot(disk)}/instances/${instance.id}/.env`, 'port') as string) || 0
         storeHandle.change(doc => {
           const inst = doc.instanceDB[instance.id]
+          if (!inst) return  // #179: never write to (or resurrect) a deleted row
           inst.status = 'Running' as Status
           inst.statusCondition = null
           if (port > 0) inst.port = port as PortNumber
@@ -935,6 +1003,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
   log(`Setting instance '${instance.id}' status to Starting`)
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
+    if (!inst) return  // #179: never write to (or resurrect) a deleted row
     inst.status = 'Starting' as Status
   })
 
@@ -991,6 +1060,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     // Assign the port number to the instance object
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
+      if (!inst) return  // #179: never write to (or resurrect) a deleted row
       inst.port = port as PortNumber
     })
 
@@ -1226,6 +1296,29 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 // }
 
 /**
+ * Write the Engine hostname and eth0 IPv4 address into an instance .env as the
+ * `hostname` and `ip` variables. Applies to every app, not only Nextcloud.
+ * A missing hostname or IP is skipped (logged) rather than written empty.
+ */
+export const writeEngineHostEnv = async (
+  envPath: string,
+  hostname: string | undefined,
+  instanceId: string,
+  interfaces: NodeJS.Dict<os.NetworkInterfaceInfo[]> = os.networkInterfaces(),
+): Promise<void> => {
+  if (hostname) {
+    await addOrUpdateEnvVariable(envPath, 'hostname', hostname)
+  }
+  const ip = interfaces["eth0"]?.find((iface) => iface.family === "IPv4")?.address
+  if (ip) {
+    log(`Found IP address ${ip} for instance ${instanceId}`)
+    await addOrUpdateEnvVariable(envPath, 'ip', ip)
+  } else {
+    log(chalk.red(`No IP address found for instance ${instanceId}`))
+  }
+}
+
+/**
  * Create the containers of an instance (`docker compose create`) and set it to
  * Pauzed. Errors propagate to the caller (idea#109): startInstance turns them
  * into Error status and a failed command-log trace.
@@ -1244,24 +1337,9 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
   await writeHostIdentityEnv(envPath, identity)
   log(`Host identity for instance ${instance.id}: IDEA_HOSTNAME=${identity.hostname} IDEA_HOST_IPS=${identity.ips.join(',')}`)
 
-  // Nextcloud: `${hostname}` / `${ip}` for Collabora's extra_hosts. Detected from the
-  // instance's own compose, not store.appDB[instance.instanceOf]: that lookup missed
-  // on idea03 in r54 (instance version '1.0-duration' vs apps/nextcloud-1.0), so
-  // these were never written (agent-engine-dev#163).
-  if (await isNextcloudInstance(instanceDir)) {
-    try {
-      if (identity.hostname) await setEnvLines(envPath, { hostname: identity.hostname })
-      const ip = primaryIPv4()
-      if (ip) {
-        log(`Found IP address ${ip} for instance ${instance.id}`)
-        await setEnvLines(envPath, { ip })
-      } else {
-        log(chalk.red(`No IP address found for instance ${instance.id}`))
-      }
-    } catch (e: any) {
-      log(chalk.red(`Could not write hostname / ip to ${envPath}: ${e?.message ?? e}`))
-    }
-  }
+  // hostname / ip for every app's compose (${hostname}, ${ip}): main's #217
+  // writeEngineHostEnv, which replaced this PR's Nextcloud-only block.
+  await writeEngineHostEnv(`${mountRoot}/instances/${instance.id}/.env`, getLocalEngine(store).hostname, instance.id)
 
   log(`Creating containers of app instance '${instance.id}' on disk ${disk.id} of engine ${localEngineId}.`)
   try {
@@ -1276,6 +1354,7 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
   }
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
+    if (!inst) return  // #179: never write to (or resurrect) a deleted row
     inst.status = 'Pauzed' as Status
   })
 }
@@ -1304,6 +1383,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
       log(`Port number extracted from .env file for instance ${instance.id}: ${parsedPort}`)
       storeHandle.change(doc => {
         const inst = doc.instanceDB[instance.id]
+        if (!inst) return  // #179: never write to (or resurrect) a deleted row
         inst.port = parsedPort as PortNumber
       })
     } else {
@@ -1371,7 +1451,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
       Number(readyPort) || 0,
       `${mountRoot}/instances/${instance.id}`,
     )
-    if (composeEnv) {
+    if (composeEnv && store.appDB[instance.instanceOf]?.filesMount) {
       // filesMounts only after success — read back from the override we just wrote
       const { mountableFilesDisks } = await import('./FilesMount.js')
       mountedDiskIds = mountableFilesDisks(store).map(d => d.id)
@@ -1385,6 +1465,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
   if (!stillStartable('after compose up')) return
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
+    if (!inst) return  // #179: never write to (or resurrect) a deleted row
     inst.lastStarted = new Date().getTime() as Timestamp
     inst.status = 'Running' as Status
     inst.statusCondition = null  // clear any previous error diagnosis
@@ -1393,6 +1474,11 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
 
   print(chalk.green(`App ${instance.id} running`))
   clearStep(storeHandle, instance.id)
+  // idea#193 §4: reconcile USB stick storages once the App runs (x-app.usbMount.sync)
+  if (storeHandle.doc()?.appDB?.[instance.instanceOf]?.usbMount?.sync) {
+    const { syncUsbApps } = await import('./UsbSticks.js')
+    void syncUsbApps(storeHandle, 'start', true, instance.id)
+  }
 
   // Nextcloud post-start bridge. TODO-remove (agent-engine-dev#163) once every
   // disk's app-nextcloud carries before-starting/20-idea-trusted-domains.sh.
@@ -1466,6 +1552,7 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
     // Set the status of the instance to Stopped
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
+      if (!inst) return  // #179: never write to (or resurrect) a deleted row
       inst.status = 'Stopped' as Status // Set the status to Stopped when the instance is stopped
     })
     clearStep(storeHandle, instance.id)
@@ -1480,6 +1567,7 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
     const condition = await diagnoseInstance(instance, disk, e)
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
+      if (!inst) return  // #179: never write to (or resurrect) a deleted row
       inst.status = 'Error' as Status
       inst.statusCondition = condition
     })

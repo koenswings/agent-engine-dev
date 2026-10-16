@@ -3,6 +3,10 @@
 #
 # Usage:
 #   ./script/provision-fleet.sh [options] <name>=<ip>[,model=pi4|pi5] ...
+#   <name> "auto" lets build-engine generate a unique two-word sticker name
+#   (idea#184, e.g. brave-otter); any other name is kept as given (idea01-04).
+#   The generated name is printed in the log line "Hostname: ..." and in the
+#   final summary: write it on the sticker on the case.
 #
 # Examples:
 #   # Pi 5 reached through idea03 as a jump host, fleet Tailscale key from a local file
@@ -122,6 +126,8 @@ for i in "${!N_NAME[@]}"; do
   NAME="${N_NAME[$i]}"; IP="${N_IP[$i]}"; MODEL="${N_MODEL[$i]}"
   TARGET="${SSH_USER}@${IP}"
   LOG="/tmp/provision-${NAME}.log"
+  # Several "auto" nodes must not share one log (idea#184): name it by address.
+  [[ "$NAME" == auto ]] && LOG="/tmp/provision-auto-${IP//[^A-Za-z0-9.-]/_}.log"
   rssh() { ssh "${SSH_OPTS[@]}" "$TARGET" "$@"; }
 
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -141,7 +147,7 @@ for i in "${!N_NAME[@]}"; do
 set -euo pipefail
 NODE_VERSION="$1"; PNPM_VERSION="$2"; ENGINE_REF="$3"; CONSOLE_REF="$4"
 sudo apt-get update -y -qq
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq npm git curl rsync jq >/dev/null
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq npm git curl rsync borgbackup jq >/dev/null
 sudo npm install -g -s n "pnpm@${PNPM_VERSION}"
 sudo n "$NODE_VERSION" >/dev/null
 hash -r
@@ -195,7 +201,8 @@ REMOTE
   set +e
   # The key goes from the root-only file into the environment of build-engine on the
   # Pi ($(...) runs remotely); it is never in an argument on either machine.
-  rssh "cd /home/pi/idea/agents/agent-engine-dev && TAILSCALE_AUTHKEY=\"\$(sudo cat /etc/tailscale/debug-authkey)\" ./build-engine --hostname '$NAME' --timezone '$TIMEZONE' --keyboard '$KEYBOARD' $FLAGS --prod" >>"$LOG" 2>&1
+  HOSTFLAG="--hostname '$NAME'"; [[ "$NAME" == auto ]] && HOSTFLAG=""
+  rssh "cd /home/pi/idea/agents/agent-engine-dev && TAILSCALE_AUTHKEY=\"\$(sudo cat /etc/tailscale/debug-authkey)\" ./build-engine $HOSTFLAG --timezone '$TIMEZONE' --keyboard '$KEYBOARD' $FLAGS --prod" >>"$LOG" 2>&1
   BUILD_EXIT=$?
   set -e
   # build-engine ends with a reboot: the SSH connection drops (255) or returns 0.
@@ -205,6 +212,10 @@ REMOTE
     RESULTS+=("$NAME: FAILED (build-engine exit $BUILD_EXIT)"); FAILED=1; continue
   fi
   grep -F 'Build options:' "$LOG" | tail -1 | sed 's/^/  /' || true
+  if [[ "$NAME" == auto ]]; then
+    GEN=$(grep -oE 'Hostname: [a-z]+-[a-z]+' "$LOG" | tail -1 | awk '{print $2}')
+    [[ -n "$GEN" ]] && { echo "  Sticker name: $GEN"; NAME="$GEN"; }
+  fi
 
   if [[ $WAIT -eq 0 ]]; then
     RESULTS+=("$NAME: built, rebooting (not checked, --no-wait)"); continue
