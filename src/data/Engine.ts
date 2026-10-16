@@ -8,6 +8,9 @@ import { readMetaUpdateId, DiskMeta, addMeta, readRemoteDiskId } from './Meta.js
 import { Version, Command, Hostname, Timestamp, DiskID, EngineID } from './CommonTypes.js';
 import { Store, getAppsOfEngine, getDisksOfEngine, getInstancesOfEngine } from './Store.js';
 import { DocHandle } from '@automerge/automerge-repo';
+import type { NewDisk, CardReader, ClientCard } from './ClientCards.js';
+import type { ClientImageStore } from './ClientImages.js';
+import type { FlashInProgress } from './FlashCard.js';
 
 export interface Engine {
   id: EngineID,
@@ -33,6 +36,16 @@ export interface Engine {
    * by this Engine, whole-list replace on plug/unplug; emptied at startup.
    */
   usbSticks?: UsbStickPublic[];
+  /** idea#201 §10: non-removable disks without IDEA META.yaml, never written (rule 1) */
+  newDisks?: NewDisk[];
+  /** idea#201 §10: card readers on this Engine (with or without a card) */
+  cardReaders?: CardReader[];
+  /** idea#201 §10: removable media present now (the only Flash targets) */
+  clientCards?: ClientCard[];
+  /** idea#201 §10: client images stored on this Engine */
+  clientImages?: ClientImageStore | null;
+  /** idea#201 §10: set for the whole run of a flash; one at a time per Engine */
+  flashInProgress?: FlashInProgress | null;
   /**
    * This Engine's own ssh key and host key for Engine-to-Engine copies (per-Pi
    * Engine keys, data/PeerAccess.ts). Written by this Engine only, at every start
@@ -120,13 +133,25 @@ export interface EraseInProgress {
  *               still works when it is unambiguous.
  *   unknownDiskReadOnly: a disk without IDEA META.yaml is never mounted read-write
  *               and never gets a META.yaml (idea#201 §10 rule 1).
+ *   clientCards: Engine.clientCards, cardReaders and newDisks are published, and
+ *               initialiseDisk <candidateId> [empty|files|backup] (idea#201 §10).
+ *   flashCard:  flashCard / cancelFlash; only when the root helper
+ *               /usr/local/sbin/idea-flash-card is installed (checked at startup).
+ *   clientImages: Engine.clientImages is published.
  * Written at every startup as a whole new list, with capabilitiesBootedAt set
  * to that startup's lastBooted. A Console counts a capability only when
  * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages']
+/** idea#201 §10: advertised only when the flash helper is installed (HELPER_MISSING otherwise) */
+export const FLASH_CARD_CAPABILITY = 'flashCard'
+export const FLASH_HELPER_PATH = '/usr/local/sbin/idea-flash-card'
+const flashHelperInstalled = (): boolean => { try { fs.accessSync(FLASH_HELPER_PATH, fs.constants.X_OK); return true } catch { return false } }
+/** The capability list written at this startup */
+export const engineCapabilities = (helperInstalled: boolean = flashHelperInstalled()): string[] =>
+  helperInstalled ? [...ENGINE_CAPABILITIES, FLASH_CARD_CAPABILITY] : [...ENGINE_CAPABILITIES]
 
 import { config } from './Config.js';
 
@@ -162,11 +187,12 @@ export const initialiseLocalEngine = async (): Promise<Engine> => {
       lastRun: booted,
       lastHalted: null,
       commands: [],
-      capabilities: [...ENGINE_CAPABILITIES],
+      capabilities: engineCapabilities(),
       capabilitiesBootedAt: booted,
       eraseInProgress: null,
       unformattedDisks: [],
       usbSticks: [],
+      flashInProgress: null,
     }
     return localEngine
   } catch (e) {
@@ -195,12 +221,14 @@ export const createOrUpdateEngine = async (storeHandle: DocHandle<Store>, engine
         engine.lastBooted = booted
         engine.lastRun = booted
         // Whole new list, never appended: a stale or extra entry disappears
-        engine.capabilities = [...ENGINE_CAPABILITIES]
+        engine.capabilities = engineCapabilities()
         engine.capabilitiesBootedAt = booted
         if (engine.unformattedDisks === undefined) engine.unformattedDisks = []
         // Sticks are re-mounted by the watcher's initial add events (idea#193 §3.4)
         if (engine.usbSticks === undefined || engine.usbSticks.length > 0) engine.usbSticks = []
         if (engine.eraseInProgress === undefined) engine.eraseInProgress = null
+        // idea#201: a flash never survives a restart (its Operation is failed INTERRUPTED)
+        if (engine.flashInProgress !== null) engine.flashInProgress = null
       }
     })
   return engine!
@@ -675,6 +703,12 @@ export const installRootHelpers = async (exec: any, enginePath: string) => {
   print(chalk.blue('  - Installing idea-erase-disk...'))
   await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-erase-disk /usr/local/sbin/idea-erase-disk`
   print(chalk.green('  - /usr/local/sbin/idea-erase-disk installed'))
+  // idea-flash-card: client-card flash helper (idea#201 §10), root-owned COPY, 0755
+  print(chalk.blue('  - Installing idea-flash-card...'))
+  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-flash-card ${FLASH_HELPER_PATH}`
+  // Client images (idea#202 layout): written by the Engine (pi), read by the helper (root)
+  await exec`sudo install -d -o pi -g pi -m 0755 /var/lib/idea /var/lib/idea/client-images`
+  print(chalk.green(`  - ${FLASH_HELPER_PATH} installed`))
   // idea-app-data: the app-data root helper (idea#168), same rules: root-owned COPY,
   // 0755, in /usr/local/sbin; its sudoers line is in 11-engine-files (visudo -cf above).
   // It runs rsync/rrsync, borg, runuser and ssh by absolute path.

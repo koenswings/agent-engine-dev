@@ -22,7 +22,10 @@ import { enableDockerMetricsMonitor } from './monitors/dockerMetricsMonitor.js'
 import { enableDiskSizeMonitor } from './data/DiskSize.js'
 import { ensureEngineStateDir, setFilesMountStore } from './data/FilesMount.js'
 import { clearStaleEraseStaging } from './data/EraseDisk.js'
-import { refreshUnformattedDisks } from './data/UnformattedDisks.js'
+import { refreshUnformattedDisks, setAfterUnformattedRefresh } from './data/UnformattedDisks.js'
+import { refreshClientCards, startClientCardPoll } from './data/ClientCards.js'
+import { refreshClientImages } from './data/ClientImages.js'
+import './data/FlashCard.js'
 import { diskFsRoot } from './data/Disk.js'
 import { copyApp, moveApp } from './data/CopyMoveApp.js'
 import { backupInstance } from './monitors/backupMonitor.js'
@@ -254,7 +257,15 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     await ensureEngineStateDir()
     setFilesMountStore(storeHandle)
     await clearStaleEraseStaging()
+    // idea#201 §10: client cards / new disks follow every unformattedDisks refresh, plus a
+    // lsblk poll (a card put into a reader sends no add event for the whole disk)
+    setAfterUnformattedRefresh((h) => refreshClientCards(h).then(() => undefined))
     await refreshUnformattedDisks(storeHandle).catch(e => log(`unformattedDisks at startup: ${e}`))
+    startClientCardPoll(storeHandle)
+    // Hashing a new image takes a while: in the background, then every 10 minutes
+    const imagesRefresh = () => refreshClientImages(storeHandle).catch(e => log(`client images: ${e}`))
+    imagesRefresh()
+    setInterval(imagesRefresh, 10 * 60_000)
 
     log(chalk.bgMagenta('STARTING HEARTBEAT GENERATION'))
     const heartbeatIntervalMs = config.settings.heartbeatIntervalMs ?? 50000

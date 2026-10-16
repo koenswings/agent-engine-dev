@@ -27,6 +27,7 @@ import { DiskArgResult, lookupDiskArg, resolveDiskArg } from './DiskArg.js';
 import { createFilesDisk } from './CreateFilesDisk.js';
 import { summariseDisk, attachTraceResult } from './SummariseDisk.js';
 import { eraseDisk } from './EraseDisk.js';
+import { flashCard, cancelFlash, initialiseDisk } from './FlashCard.js';
 import { testContext } from "../../test/testContext.js";
 
 
@@ -486,6 +487,21 @@ export const commands: CommandDefinition[] = [
     { name: "createFilesDisk", execute: createFilesDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "shareName", variadic: true, optional: true }], scope: 'engine' },
     { name: "summariseDisk", execute: summariseDiskWrapper, args: [{ type: "string", name: "targetId" }], scope: 'engine' },
     { name: "eraseDisk", execute: eraseDiskWrapper, args: [{ type: "string", name: "targetId" }, { type: "string", name: "summaryTraceId" }, { type: "string", name: "confirmName", variadic: true }], scope: 'engine' },
+    // idea#201 §10 (Engine API contract v2): ids only. Trace arg keys are the contract names.
+    { name: "flashCard", execute: async (storeHandle: DocHandle<Store> | null, candidateId: string, version: string, confirmSizeBytes: string) => {
+        if (!storeHandle) throw new Error('Store is not available.')
+        const { operationId } = await flashCard(storeHandle, candidateId, version, confirmSizeBytes)
+        attachTraceResult({ candidateId, version, operationId, started: true })
+        print(chalk.green(`Flash started: operation ${operationId}`))
+    }, args: [{ type: "string", name: "candidateId" }, { type: "string", name: "version" }, { type: "string", name: "confirmSizeBytes" }], scope: 'engine' },
+    { name: "cancelFlash", execute: async (storeHandle: DocHandle<Store> | null, operationId: string) => {
+        if (!storeHandle) throw new Error('Store is not available.')
+        cancelFlash(storeHandle, operationId)
+    }, args: [{ type: "string", name: "operationId" }], scope: 'engine' },
+    { name: "initialiseDisk", execute: async (storeHandle: DocHandle<Store> | null, candidateId: string, role?: string) => {
+        if (!storeHandle) throw new Error('Store is not available.')
+        await initialiseDisk(storeHandle, candidateId, role ?? 'empty')
+    }, args: [{ type: "string", name: "candidateId" }, { type: "string", name: "role", optional: true }], scope: 'engine' },
     { name: "cancelOperation", execute: async (storeHandle: DocHandle<Store> | null, opId: string) => {
         if (!storeHandle) throw new Error('Store is not available.')
         const err = cancelOperation(storeHandle, opId)

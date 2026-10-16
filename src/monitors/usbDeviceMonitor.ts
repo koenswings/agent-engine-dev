@@ -9,6 +9,7 @@ import { flushFilesRemountNow, optedInInstances } from '../data/FilesMount.js'
 import { clearUndockPending, dockChangedReason, dockIdentityOf, ejectInFlightWaitMs, markUndockPending, waitInFlightOnDisk } from '../data/InstanceInFlight.js'
 import { isSystemDevice, systemDriveNames, driveNameOf } from '../data/SystemDisk.js'
 import { refreshUnformattedDisks } from '../data/UnformattedDisks.js'
+import { setInitialiseAddDevice } from '../data/FlashCard.js'
 import { eraseLockRefusesAdd, isEraseDeviceLocked, setEraseAddDevice } from '../data/EraseDisk.js'
 import { findDiskByDevice, findDisksByDevice, Store, getDisksOfEngine, getLocalEngine } from '../data/Store.js'
 import { DeviceName, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../data/CommonTypes.js'
@@ -288,6 +289,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     }
 
         setEraseAddDevice(addDevice)
+        setInitialiseAddDevice(addDevice)
 
     const removeDevice = async (path: string) => {
         const device = path.split('/').pop()
@@ -307,6 +309,8 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
             if (undocked.length === 0) {
                 log(`No disk found on ${device}`)
             }
+            // idea#201 §10: a pulled card / new disk leaves clientCards / newDisks at once
+            await refreshUnformattedDisks(storeHandle).catch(e => log(`unformatted refresh: ${e}`))
         } else {
             log(`Non-USB device ${device} has been removed`)
         }
