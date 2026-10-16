@@ -125,6 +125,16 @@ This document provides a reference for the main provisioning and utility scripts
 
 ---
 
+### `hw-home-engine-card.sh` (`script/hw-home-engine-card.sh`)
+
+On-Pi hardware test for `idea-write-home-engine` (#213, idea#203 §2). Run on a pool Pi (never golden idea02), against a client card that was just flashed and verified, sitting in a card reader:
+
+    bash script/hw-home-engine-card.sh --card /dev/disk/by-id/<whole-card-link> [--name <engine-name>] [--dry-run]
+
+-   Refuses to start (exit 2) if the card holds `/` or `/boot(/firmware)`, any partition is mounted, partition 1 is not vfat, or the link is a `-partN` link.
+-   Checks the helper's refusals (BAD_ARGS, MEDIUM_SWAPPED, MOUNTED, the system disk), each leaving the card unchanged and unmounted. Then it checks the write: `idea-home.txt` = `<name>.local\n` in the root of partition 1, no temp file left, other files and partitions unchanged. Finally it checks the system disk: same lsblk facts and boot file checksums, and no `idea-home.txt` on it.
+-   `--dry-run` is read-only and runs no sudo. It is unit-tested in `test/automated/hw-home-engine-card.test.ts`. The evidence goes to `/tmp/hw-home-engine-<timestamp>/`, or to `--evidence <dir>`. Exit 0 means PASS.
+
 ### `hw-roundtrip.ts` (`script/hw-roundtrip.ts`)
 
 -   **Purpose:** On-Pi hardware round-trip test for disk changes (idea#152). Every PR that touches docking, undocking, eject, mounting or disk records must pass it on a claimed pool Pi before hand-off (see AGENTS.md).
