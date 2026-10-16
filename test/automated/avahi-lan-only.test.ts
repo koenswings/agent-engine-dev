@@ -97,7 +97,7 @@ describe('installAvahi (build-engine step)', () => {
         }
         await installAvahi(exec, '/home/pi/engine')
         expect(cmds).toEqual([
-            'sudo apt install avahi-daemon libnss-mdns -y',
+            'sudo apt install avahi-daemon avahi-utils libnss-mdns -y',
             `sudo install -o root -g root -m 0755 /home/pi/engine/script/build_image_assets/idea-avahi-lan-only ${AVAHI_LAN_ONLY_HELPER}`,
             `sudo ${AVAHI_LAN_ONLY_HELPER} ${AVAHI_CONF}`,
             'sudo systemctl enable avahi-daemon',
