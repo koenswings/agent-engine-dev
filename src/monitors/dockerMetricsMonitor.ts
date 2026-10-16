@@ -3,17 +3,19 @@
  *
  * Polls `docker stats --no-stream --format json` every POLL_INTERVAL_MS for
  * all containers belonging to Running instances on the local engine, then
- * writes parsed metrics to instance.metrics in the Automerge store.
+ * broadcasts them as an ephemeral 'idea/metrics' message on the store handle
+ * (never stored; store design 2026-10-13). Stored instance.metrics left by
+ * older Engines is cleared once.
  *
- * When an instance stops running (status !== 'Running'), metrics is set to null.
- *
- * The Console reads instance.metrics and formats the raw numbers itself.
+ * The Console (src/store/live.ts) keeps the latest message per Engine and
+ * formats the raw numbers itself.
  */
 
 import { $ } from 'zx'
 import { log } from '../utils/utils.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Store, getLocalEngine, getInstancesOfEngine } from '../data/Store.js'
+import { METRICS_TYPE } from '../data/Liveness.js'
 import { DockerMetrics } from '../data/CommonTypes.js'
 import { localEngineId } from '../data/Engine.js'
 import { dockerAvailable } from '../utils/dockerAvailable.js'
@@ -219,33 +221,39 @@ export const pollDockerMetricsOnce = async (storeHandle: DocHandle<Store>): Prom
     const externallyStopped = new Set(detectExternalStops(
         runningInstances as any, runningContainers, id => resourceLock.isLocked(instanceKey(id))))
 
-    // Write back to store — one change() call covers all instances
-    storeHandle.change(doc => {
-        for (const inst of allInstances) {
-            const instanceInDoc = doc.instanceDB[inst.id as any]
-            if (!instanceInDoc) continue
+    // Store design 2026-10-13: metrics are NOT written into the store doc any more
+    // (9.8k changes/day kept forever). They go out as an ephemeral message that the
+    // Engines relay to every peer of the store doc, so a Console on any Pi shows the
+    // latest metrics of every Pi (agent-console-dev src/store/live.ts).
+    const instances: Record<string, DockerMetrics> = {}
+    for (const [id, m] of metricsMap) instances[id] = m
+    storeHandle.broadcast(metricsMessage(String(localEngine.id), Date.now(), instances))
 
-            if (externallyStopped.has(inst.id as string) && instanceInDoc.status === 'Running') {
-                log(`[dockerMetrics] Instance ${inst.id}: no running container on ${EXTERNAL_STOP_MISSES} polls (stopped outside the Engine) — status Running → Docked`)
-                instanceInDoc.status = 'Docked' as any
-                if (instanceInDoc.metrics !== null) instanceInDoc.metrics = null
-                continue
-            }
-            if (inst.status === 'Running') {
-                const m = metricsMap.get(inst.id as string)
-                // If running but no container found yet (brief window during start), keep previous metrics
-                if (m) {
-                    instanceInDoc.metrics = m as any
-                }
-            } else {
-                // Not running — clear metrics
-                if (instanceInDoc.metrics !== null) {
-                    instanceInDoc.metrics = null
-                }
-            }
+    // One-time cleanup: stored metrics left by older Engines are cleared (only
+    // writes when something is still there). An instance stopped outside the
+    // Engine (#208: no container on EXTERNAL_STOP_MISSES polls) goes Running → Docked.
+    const doc0 = storeHandle.doc() as any
+    const leftovers = allInstances.filter(i => doc0?.instanceDB?.[i.id as any]?.metrics != null)
+    const stopped = allInstances.filter(i => externallyStopped.has(i.id as string) && doc0?.instanceDB?.[i.id as any]?.status === 'Running')
+    if (leftovers.length || stopped.length) storeHandle.change(doc => {
+        for (const inst of stopped) {
+            const instanceInDoc = doc.instanceDB[inst.id as any]
+            if (!instanceInDoc || instanceInDoc.status !== 'Running') continue
+            log(`[dockerMetrics] Instance ${inst.id}: no running container on ${EXTERNAL_STOP_MISSES} polls (stopped outside the Engine) — status Running → Docked`)
+            instanceInDoc.status = 'Docked' as any
+        }
+        for (const inst of leftovers) {
+            const instanceInDoc = doc.instanceDB[inst.id as any]
+            if (instanceInDoc && instanceInDoc.metrics != null) instanceInDoc.metrics = null
         }
     })
 }
+
+export interface MetricsMessage { type: typeof METRICS_TYPE, v: 1, engineId: string, sampledAt: number, instances: Record<string, DockerMetrics> }
+
+/** The ephemeral metrics message (Running instances only). */
+export const metricsMessage = (engineId: string, sampledAt: number, instances: Record<string, DockerMetrics>): MetricsMessage =>
+    ({ type: METRICS_TYPE, v: 1, engineId, sampledAt, instances })
 
 export const enableDockerMetricsMonitor = (storeHandle: DocHandle<Store>): void => {
     log('[dockerMetrics] Starting Docker metrics monitor')

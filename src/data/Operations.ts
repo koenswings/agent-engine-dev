@@ -95,6 +95,10 @@ export const updateOperation = (
             print(`└${bar}┘`)
         }
     }
+    // Store design 2026-10-13: progress is written only when the step (or status,
+    // or anything else) changes. A patch that only moves progressPercent inside the
+    // same step (rsync percentages, 1-2k changes/day kept forever) is not stored.
+    if (isProgressOnly(patch)) return
     storeHandle.change(doc => {
         const op = doc.operationDB?.[id]
         if (!op) return
@@ -112,6 +116,67 @@ export const updateOperation = (
             op.stepLabel = null
         }
     })
+}
+
+/** True when `patch` only carries progressPercent (no step, status or other field). */
+export const isProgressOnly = (patch: Record<string, unknown>): boolean => {
+    const keys = Object.keys(patch).filter(k => patch[k] !== undefined)
+    return keys.length > 0 && keys.every(k => k === 'progressPercent')
+}
+
+// ── Archiving finished operations (store design 2026-10-13) ──────────────────
+
+/** Finished operations older than this move out of the store into the CommandLog. */
+export const OPERATION_ARCHIVE_AGE_MS = 7 * 24 * 60 * 60 * 1000
+/** Operations per archive trace (one CommandLog trace each). */
+export const OPERATION_ARCHIVE_BATCH = 100
+const FINISHED: ReadonlySet<string> = new Set(['Done', 'Failed', 'Cancelled'])
+
+/**
+ * This Engine's finished operations (Done/Failed/Cancelled) whose completedAt
+ * (or startedAt when missing) is older than `ageMs` on this Engine's clock.
+ * Only our own: each Engine archives the ops it ran, so no two Engines archive
+ * the same record.
+ */
+export const operationsToArchive = (store: Store | undefined, engineId: string, now: number, ageMs = OPERATION_ARCHIVE_AGE_MS): Operation[] => {
+    const out: Operation[] = []
+    for (const op of Object.values(store?.operationDB ?? {}) as Operation[]) {
+        if (!op || String(op.engineId) !== engineId || !FINISHED.has(String(op.status))) continue
+        const at = Number(op.completedAt ?? op.startedAt)
+        if (Number.isFinite(at) && at > 0 && now - at > ageMs) out.push(op)
+    }
+    return out.sort((a, b) => Number(a.completedAt ?? a.startedAt) - Number(b.completedAt ?? b.startedAt))
+}
+
+/**
+ * Move old finished operations into the CommandLog (a closed 'archiveOperations'
+ * trace per batch; result = JSON array of the records), then delete them from
+ * operationDB. Nothing is deleted when there is no CommandLog. Returns how many
+ * were archived.
+ */
+export const archiveOldOperations = async (
+    storeHandle: DocHandle<Store>,
+    opts: { engineId?: string, now?: number, ageMs?: number, commandLog?: DocHandle<any> | null } = {},
+): Promise<number> => {
+    const cl = opts.commandLog === undefined ? getCommandLogHandle() : opts.commandLog
+    if (!cl) return 0
+    const engineId = opts.engineId ?? String(localEngineId)
+    const now = opts.now ?? Date.now()
+    const ops = operationsToArchive(storeHandle.doc(), engineId, now, opts.ageMs)
+    let archived = 0
+    for (let i = 0; i < ops.length; i += OPERATION_ARCHIVE_BATCH) {
+        const batch = ops.slice(i, i + OPERATION_ARCHIVE_BATCH)
+        const traceId = `archive-ops-${now}-${i / OPERATION_ARCHIVE_BATCH}`
+        addTrace(cl, {
+            traceId, command: 'archiveOperations', args: JSON.stringify([engineId, batch.length]),
+            startedAt: now, completedAt: now, status: 'ok', errorMessage: null,
+            result: JSON.stringify(batch.map(op => JSON.parse(JSON.stringify(op)))),
+        })
+        storeHandle.change(doc => { for (const op of batch) delete (doc.operationDB as any)[op.id] })
+        archived += batch.length
+    }
+    if (archived) print(`archived ${archived} finished operation(s) older than ${Math.round((opts.ageMs ?? OPERATION_ARCHIVE_AGE_MS) / 86_400_000)} days into the CommandLog`)
+    return archived
 }
 
 // ── Active process registry ──────────────────────────────────────────────

@@ -16,7 +16,7 @@ export interface Settings {
     consolePath: string;
     storeDataFolder: string;
     storeIdentityFolder: string;
-    heartbeatIntervalMs: number;  // How often the engine writes a heartbeat to the store (default: 50000ms)
+    heartbeatIntervalMs: number;  // Peer-access repair + op-archive tick (default 50000 ms); no store write per tick (Liveness.ts)
     systemDiskSkip?: boolean;     // If true, skip registering the Pi boot disk as a system disk (for test harnesses)
     disksRoot?: string;           // Mount root for App Disks (default: /disks). Tests point this at a private temp folder.
     skipImageLoad?: boolean;      // If true, don't load service images from services/*.tar at app start (default: same as testMode). See skipImageLoad().
