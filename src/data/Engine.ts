@@ -535,7 +535,7 @@ export const AVAHI_CONF = '/etc/avahi/avahi-daemon.conf'
 export const installAvahi = async (exec: any, enginePath: string) => {
   print(chalk.blue('Installing Avahi for .local mDNS discovery...'));
   try {
-    await exec`sudo apt install avahi-daemon libnss-mdns -y`;
+    await exec`sudo apt install avahi-daemon avahi-utils libnss-mdns -y`;
     // LAN only (idea#203): allow-interfaces=eth0,wlan0 under [server], so <host>.local
     // never resolves to a docker bridge (idea03.local -> 172.21.0.1). Idempotent; the
     // helper backs the conf up to avahi-daemon.conf.idea-bak-<UTC> before any change.
