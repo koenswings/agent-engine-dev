@@ -23,7 +23,7 @@ import * as net from 'net'
 import { log } from '../utils/utils.js'
 import { Store, getDisk, getLocalEngine } from './Store.js'
 import { resolveDiskArg } from './DiskArg.js'
-import { buildInstance } from './Instance.js'
+import { buildInstance, versionDirName } from './Instance.js'
 import { parseAppId } from './App.js'
 import { AppID, AppName, DiskID, DiskName, InstanceName, Version } from './CommonTypes.js'
 import { DocHandle } from '@automerge/automerge-repo'
@@ -113,6 +113,23 @@ export const parseInstallAppArgs = (argsString: string): ParsedInstallAppArgs =>
     }
 }
 
+/** True when both paths exist and resolve (realpath) to the same folder. */
+export const sameRealPath = async (a: string, b: string): Promise<boolean> => {
+    if (!await fs.pathExists(a) || !await fs.pathExists(b)) return false
+    return (await fs.realpath(a)) === (await fs.realpath(b))
+}
+
+/**
+ * The app id as it is stored on a disk: `<name>@<ref>` (installApp input, any git
+ * ref) becomes `<name>-<versionDirName(ref)>`, the apps/ folder buildInstance writes.
+ * Other ids are returned unchanged.
+ */
+export const diskAppId = (appId: string): AppID => {
+    if (!String(appId).includes('@')) return appId as AppID
+    const { name, version } = parseAppId(appId)
+    return `${name}-${versionDirName(version)}` as AppID
+}
+
 // ── Local install path ────────────────────────────────────────────────────────
 
 /**
@@ -173,10 +190,15 @@ export const installAppFromDisk = async (
     await fs.ensureDir(`${targetMountRoot}/instances`)
     await fs.ensureDir(`${targetMountRoot}/services`)
 
-    // Copy app bundle
+    // Copy app bundle, unless source and target are the same folder (--source is the
+    // target disk; Kid, #221): fs.copy refuses to copy a folder onto itself
     const targetAppPath = `${targetMountRoot}/apps/${appId}`
-    log(`Copying app bundle: ${sourcePath} → ${targetAppPath}`)
-    await fs.copy(sourcePath, targetAppPath, { overwrite: true })
+    if (await sameRealPath(sourcePath, targetAppPath)) {
+        log(`App bundle already in place at ${targetAppPath} (source is the target disk); not copying it`)
+    } else {
+        log(`Copying app bundle: ${sourcePath} → ${targetAppPath}`)
+        await fs.copy(sourcePath, targetAppPath, { overwrite: true })
+    }
 
     // Register app in store
     await createOrUpdateApp(storeHandle, appId, targetDisk)
@@ -263,6 +285,9 @@ const installAppRouted = async (
     storeHandle: DocHandle<Store>,
     opts: InstallAppOptions
 ): Promise<void> => {
+    // `<name>@<ref>` (Kid, #221): the ref goes to git as given; disks use the folder-safe id
+    const refAppId = opts.appId
+    opts = { ...opts, appId: diskAppId(opts.appId) }
     const store = storeHandle.doc()
     const instanceName = (opts.instanceName === undefined ? opts.appId : validateInstanceName(String(opts.instanceName))) as InstanceName
     const gitAccount = opts.gitAccount ?? 'koenswings'
@@ -295,7 +320,8 @@ const installAppRouted = async (
     if (online) {
         // Route 2: GitHub path (existing buildInstance logic)
         log(chalk.blue(`installApp: GitHub path (internet available)`))
-        const { name: appName, version } = parseAppId(opts.appId)
+        const { name: appName, version } = parseAppId(refAppId)
+        if (!appName || !version) throw new Error(`installApp: cannot read an app name and version from '${refAppId}'. Use <name>-<version> or <name>@<git ref>.`)
         const targetDevice = targetDisk.device!
         const instanceId = await buildInstance(instanceName, appName, gitAccount, version, targetDevice as any)
         if (!instanceId) {

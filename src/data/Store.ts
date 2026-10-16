@@ -1,3 +1,4 @@
+import { splitAppId } from './AppIdParse.js'
 import path from 'path'
 import { Engine, localEngineId } from './Engine.js'
 import { Disk } from './Disk.js'
@@ -348,13 +349,7 @@ export const findDisksByApp = (store: Store, appId: AppID): Disk[] => {
     })
 }
 
-export const extractAppName = (appId: AppID): string => {
-    // Same rule as App.ts parseAppId (no import: App.ts imports Store.ts)
-    const m = /^(.+?)-(\d+(?:\.\d+)*(?:[-.+][0-9A-Za-z.+-]*)?)$/.exec(String(appId))
-    if (m) return m[1]
-    const dash = String(appId).lastIndexOf('-')
-    return dash > 0 ? String(appId).slice(0, dash) : String(appId)
-}
+export const extractAppName = (appId: AppID): string => splitAppId(String(appId)).name
 
 export const getDisk = (store: Store, diskId: DiskID): Disk | undefined => {
     if (store.diskDB.hasOwnProperty(diskId)) {

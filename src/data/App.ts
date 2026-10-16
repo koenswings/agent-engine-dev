@@ -1,3 +1,4 @@
+import { splitAppId } from './AppIdParse.js'
 import { $, YAML, chalk } from 'zx';
 import { Version, URL, AppID, AppName, Hostname, DeviceName, DiskName, DiskID } from './CommonTypes.js';
 import { log } from '../utils/utils.js';
@@ -28,23 +29,10 @@ export const createAppId = (appName: AppName, version: Version): AppID => {
     return appName + "-" + version as AppID
 }
 
-/**
- * Split an app id '<name>-<version>' (app catalog: repo koenswings/app-<name>,
- * git tag = <version>). The version starts at the FIRST '-' that is followed by
- * a numeric version (digits, optionally .digits, then an optional '-', '.' or
- * '+' suffix), so a version may itself contain '-' and a name may contain '-':
- *   nextcloud-1.0-31.0.1        -> nextcloud / 1.0-31.0.1
- *   kolibri-channel-builder-1.0 -> kolibri-channel-builder / 1.0
- *   kolibri-1.0-duration        -> kolibri / 1.0-duration
- * Ids without a numeric version (e.g. 'kolibri-latest') fall back to the last '-'.
- */
-const APP_ID_RE = /^(.+?)-(\d+(?:\.\d+)*(?:[-.+][0-9A-Za-z.+-]*)?)$/
+/** Split an app id into name and version (rules in AppIdParse.ts). */
 export const parseAppId = (appId: string): { name: AppName, version: Version } => {
-    const m = APP_ID_RE.exec(appId)
-    if (m) return { name: m[1] as AppName, version: m[2] as Version }
-    const dash = appId.lastIndexOf('-')
-    if (dash <= 0) return { name: appId as AppName, version: '' as Version }
-    return { name: appId.slice(0, dash) as AppName, version: appId.slice(dash + 1) as Version }
+    const { name, version } = splitAppId(appId)
+    return { name: name as AppName, version: version as Version }
 }
 
 export const extractAppName = (appId: AppID): AppName => parseAppId(appId).name

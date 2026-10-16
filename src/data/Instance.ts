@@ -1,3 +1,4 @@
+import { isCommitSha } from './AppIdParse.js'
 import { $, YAML, chalk, fs, os, sleep } from "zx";
 
 $.verbose = false;
@@ -342,7 +343,13 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
       // A branch name may contain '/' (feat/x): the ref goes to git intact as one
       // argument, the folder name of the App master is derived from it (Atlas).
       assertGitRef(version)
-      await $`git ${appCloneArgs('koenswings', appName, version, `/tmp/apps/${appName}`)}`
+      if (isCommitSha(version)) {
+        // A commit SHA is not a branch or tag: clone, then check the commit out (Kid, #221)
+        await $`git ${['clone', '--', `https://github.com/koenswings/app-${appName}`, `/tmp/apps/${appName}`]}`
+        await $`git ${['-C', `/tmp/apps/${appName}`, 'checkout', '--detach', version]}`
+      } else {
+        await $`git ${appCloneArgs('koenswings', appName, version, `/tmp/apps/${appName}`)}`
+      }
       appVersion = versionDirName(version)
       if (appVersion !== version) log(`App ref '${version}' is stored as version '${appVersion}' (folder ${appName}-${appVersion})`)
     }

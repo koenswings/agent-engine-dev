@@ -32,7 +32,10 @@ import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import { disksRoot } from '../../src/data/Config.js'
 import { setRootDeviceForTests } from '../../src/data/Disk.js'
-import { installAppFromDisk, parseInstallAppArgs, validateInstanceName, MAX_INSTANCE_NAME_LENGTH } from '../../src/data/InstallApp.js'
+import { installAppFromDisk, parseInstallAppArgs, validateInstanceName, MAX_INSTANCE_NAME_LENGTH, sameRealPath, diskAppId } from '../../src/data/InstallApp.js'
+import { parseAppId } from '../../src/data/App.js'
+import { extractAppName as StoreExtractAppName } from '../../src/data/Store.js'
+import { isCommitSha } from '../../src/data/AppIdParse.js'
 import { AppID, DiskID, DiskName, EngineID, Timestamp } from '../../src/data/CommonTypes.js'
 
 const SRC = 'DISK_src-name' as DiskID
@@ -163,11 +166,68 @@ describe('installApp --name / --fresh (Kid, idea#235)', () => {
             expect(await fs.pathExists(`${tgtRoot()}/instances/${id}/.env`)).toBe(false)
         })
 
+        it('--source on the target disk: the bundle is not copied onto itself and the install succeeds', async () => {
+            await fs.ensureDir(`${tgtRoot()}/apps/${APP}`)
+            await fs.writeFile(`${tgtRoot()}/apps/${APP}/compose.yaml`, COMPOSE)
+            await fs.writeFile(`${tgtRoot()}/apps/${APP}/usb-sync.sh`, '#!/bin/sh\n')
+            const tgt = h.doc().diskDB[TGT] as any
+            await installAppFromDisk(h, APP, tgt, tgt, 'Nextcloud Demo' as any, { fresh: true })
+            const ids = (await newInstanceIds())
+            expect(ids).toHaveLength(1)
+            expect((await fs.readdir(`${tgtRoot()}/instances/${ids[0]}`)).sort()).toEqual(['compose.yaml', 'usb-sync.sh'])
+            expect((h.doc().instanceDB as any)[ids[0]].name).toBe('Nextcloud Demo')
+        })
+
         it('without --fresh the source instance data is still copied (unchanged behaviour), with the new name', async () => {
             await installAppFromDisk(h, APP, h.doc().diskDB[SRC] as any, h.doc().diskDB[TGT] as any, 'Kolibri Copy' as any)
             const [id] = await newInstanceIds()
             expect(await fs.readFile(`${tgtRoot()}/instances/${id}/data/kolibri/db.sqlite3`, 'utf8')).toBe('school-data')
             expect(YAML.parse(await fs.readFile(`${tgtRoot()}/instances/${id}/compose.yaml`, 'utf8'))['x-app'].instanceName).toBe('Kolibri Copy')
         })
+    })
+})
+
+describe('installApp: same-disk source, app id parsing, SHA refs (Kid, #221 live run)', () => {
+    it('sameRealPath: same folder (also through a symlink) is detected, different or missing is not', async () => {
+        const os = await import('os'); const path = await import('path')
+        const d = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-same-'))
+        await fs.ensureDir(`${d}/a/apps/x`); await fs.ensureDir(`${d}/b/apps/x`)
+        await fs.symlink(`${d}/a`, `${d}/link`)
+        expect(await sameRealPath(`${d}/a/apps/x`, `${d}/a/apps/x`)).toBe(true)
+        expect(await sameRealPath(`${d}/a/apps/x`, `${d}/link/apps/x`)).toBe(true)
+        expect(await sameRealPath(`${d}/a/apps/x`, `${d}/b/apps/x`)).toBe(false)
+        expect(await sameRealPath(`${d}/a/apps/x`, `${d}/nope/apps/x`)).toBe(false)
+        await fs.remove(d)
+    })
+
+    it('parseAppId: explicit <name>@<ref>, trailing SHA, and every existing id form', () => {
+        const cases: Array<[string, string, string]> = [
+            ['nextcloud@feat/nextcloud-demo', 'nextcloud', 'feat/nextcloud-demo'],
+            ['nextcloud@21d7f75efaaa6590efb93098120626e677732903', 'nextcloud', '21d7f75efaaa6590efb93098120626e677732903'],
+            ['kolibri-channel-builder@main', 'kolibri-channel-builder', 'main'],
+            ['nextcloud-21d7f75efaaa6590efb93098120626e677732903', 'nextcloud', '21d7f75efaaa6590efb93098120626e677732903'],
+            ['kolibri-channel-builder-2551b7d9830151ff0b9636a335f86cb7018b37d8', 'kolibri-channel-builder', '2551b7d9830151ff0b9636a335f86cb7018b37d8'],
+            ['Seafile-f3817b7669269abe2dfd3bcc347d0db8d2033ad6', 'Seafile', 'f3817b7669269abe2dfd3bcc347d0db8d2033ad6'],
+            ['nextcloud-1.0-31.0.1', 'nextcloud', '1.0-31.0.1'],
+            ['kolibri-1.0-duration', 'kolibri', '1.0-duration'],
+            ['kolibri-channel-builder-2.1-rc.1', 'kolibri-channel-builder', '2.1-rc.1'],
+            ['kolibri-latest', 'kolibri', 'latest'],
+        ]
+        for (const [id, name, version] of cases) {
+            expect(parseAppId(id)).toEqual({ name, version })
+            expect(StoreExtractAppName(id as any)).toBe(name)
+        }
+    })
+
+    it('diskAppId: <name>@<ref> becomes the folder-safe <name>-<ref>; other ids unchanged', () => {
+        expect(diskAppId('nextcloud@feat/nextcloud-demo')).toBe('nextcloud-feat-nextcloud-demo')
+        expect(diskAppId('nextcloud@21d7f75')).toBe('nextcloud-21d7f75')
+        expect(diskAppId('kolibri-1.0')).toBe('kolibri-1.0')
+    })
+
+    it('isCommitSha: SHAs (7-40 hex) yes; branches, tags, latest no', () => {
+        expect(isCommitSha('21d7f75')).toBe(true)
+        expect(isCommitSha('21d7f75efaaa6590efb93098120626e677732903')).toBe(true)
+        for (const r of ['main', 'feat/nextcloud-demo', '1.0', 'latest', 'abc', 'DEADBEEF1']) expect(isCommitSha(r)).toBe(false)
     })
 })
