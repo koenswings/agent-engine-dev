@@ -93,22 +93,34 @@ const LINUX_PART_TYPES = new Set([
     '4f68bce3-e8cd-4db1-96e7-fbcaf984b709',
 ])
 
+const LINUX_FS = new Set(['ext4', 'ext3', 'ext2', 'btrfs', 'xfs', 'f2fs'])
+
+/** Other partitions on the same drive that carry (or are typed as) a Linux filesystem. */
+export const linuxSiblings = (device: string, parts: DrivePartition[]): string[] =>
+    parts.filter(p => p.name !== device && (
+        LINUX_FS.has((p.fsType ?? '').toLowerCase()) || LINUX_PART_TYPES.has((p.partType ?? '').toLowerCase())
+    )).map(p => p.name)
+
 /**
- * idea#201 §10 follow-up: a FAT/exFAT partition on a drive that also carries an
- * OS root or IDEA partition (ext4, with or without META.yaml) is the boot
- * partition of an SD card / OS disk, never a teacher stick. Decided from lsblk
- * alone, so the partition is not mounted at all. Returns the reason, or null for
- * a real stick (FAT-only drive).
+ * idea#201 §10 follow-up: a FAT/exFAT partition is not a teacher stick when its
+ * drive also has a Linux partition WITHOUT IDEA META.yaml (an OS card: Raspberry
+ * Pi OS / Ubuntu boot partition). An IDEA drive (Linux partition WITH META.yaml,
+ * e.g. the dual-partition hw-roundtrip fixture) keeps its FAT partition as a
+ * stick, and so does a FAT-only drive. `hasMeta` answers from the shared
+ * read-only look (never writes); `null` = could not tell → skipped (safe side).
+ * Returns the reason to skip, or null to offer the stick.
  */
-export const stickBlockedBySiblings = (device: string, parts: DrivePartition[]): string | null => {
-    for (const p of parts) {
-        if (p.name === device) continue
-        const fs = (p.fsType ?? '').toLowerCase()
-        const pt = (p.partType ?? '').toLowerCase()
-        if (fs === 'ext4' || fs === 'ext3' || fs === 'ext2' || fs === 'btrfs' || fs === 'xfs' || fs === 'f2fs')
-            return `${p.name} on the same drive is ${fs} (OS root or IDEA partition)`
-        if (LINUX_PART_TYPES.has(pt))
-            return `${p.name} on the same drive is a Linux partition (type ${pt})`
+export const stickBlockedBySiblings = async (
+    device: string,
+    parts: DrivePartition[],
+    hasMeta: (sibling: string) => Promise<boolean | null>,
+): Promise<string | null> => {
+    for (const sib of linuxSiblings(device, parts)) {
+        const m = await hasMeta(sib)
+        if (m === true) continue
+        return m === null
+            ? `${sib} on the same drive is a Linux partition whose META.yaml could not be checked`
+            : `${sib} on the same drive is a Linux partition without IDEA META.yaml (OS card)`
     }
     return null
 }

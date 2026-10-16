@@ -18,7 +18,7 @@ import { $, fs, path, YAML } from 'zx'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Store } from '../../src/data/Store.js'
 import { localEngineId } from '../../src/data/Engine.js'
-import { config } from '../../src/data/Config.js'
+import { config, disksRoot } from '../../src/data/Config.js'
 import {
     addStick, removeStick, removeSticksOnDrive, usbStartupCleanup, syncUsbApps, classifyFsType,
     stickMountArgv, stickUmountArgv, setUsbStickOpsForTests, resetUsbSticksForTests, uniqueDisplayName,
@@ -404,7 +404,7 @@ describe('idea#193 teacher USB sticks', () => {
                 ] },
             })
             await fs.ensureDir(DEV_ROOT)
-            if (!watcher) watcher = await enableUsbDeviceMonitor(h)
+            await watcher?.close(); watcher = await enableUsbDeviceMonitor(h)
             await fs.writeFile(path.join(DEV_ROOT, 'sdr1'), '')
             try {
                 expect(await waitFor(h, () => asked.includes('sdr1'))).toBe(true)
@@ -419,27 +419,54 @@ describe('idea#193 teacher USB sticks', () => {
                 config.settings.testMode = savedTest
             }
         })
+        it('FAT partition of an IDEA drive (ext4 sibling WITH META) is still offered as a stick (idea#201 §10)', { timeout: 20_000 }, async () => {
+            const asked: string[] = []
+            setUsbStickOpsForTests({
+                ...fakeOps(st),
+                probe: async (d) => d === 'sds1' ? probe({ uuid: 'BOOT', label: 'bootfs' }) : null,
+                drivePartitions: async (d) => { asked.push(d); return [
+                    { name: 'sds1', fsType: 'vfat', partType: '0xc' },
+                    { name: 'sds2', fsType: 'ext4', partType: '0x83' },
+                ] },
+            })
+            await fs.ensureDir(DEV_ROOT)
+            await fs.ensureDir(path.join(disksRoot(), 'sds2'))
+            await fs.writeFile(path.join(disksRoot(), 'sds2', 'META.yaml'), 'diskId: x\n')
+            await watcher?.close(); watcher = await enableUsbDeviceMonitor(h)
+            await fs.writeFile(path.join(DEV_ROOT, 'sds1'), '')
+            try {
+                expect(await waitFor(h, s => (s.engineDB[localEngineId].usbSticks ?? []).some(x => x.device === 'sds1'))).toBe(true)
+                expect(Object.values(h.doc().diskDB).some(d => d.device === 'sds1')).toBe(false)
+            } finally {
+                await fs.remove(path.join(DEV_ROOT, 'sds1'))
+                await fs.remove(path.join(disksRoot(), 'sds2'))
+                config.settings.testMode = savedTest
+            }
+        })
     })
 })
 
-describe('stickBlockedBySiblings (idea#201 §10 follow-up)', () => {
+describe('stickBlockedBySiblings (idea#201 §10 follow-up, narrowed)', () => {
     const P = (name: string, fsType: string | null, partType: string | null = null) => ({ name, fsType, partType })
-    it('FAT-only drive is a stick', () => {
-        expect(stickBlockedBySiblings('sdb1', [P('sdb1', 'vfat', '0xc')])).toBeNull()
-        expect(stickBlockedBySiblings('sdb1', [P('sdb1', 'exfat', '0x7'), P('sdb2', 'vfat', '0xc')])).toBeNull()
-        expect(stickBlockedBySiblings('sdb1', [])).toBeNull()
+    const metaOf = (m: Record<string, boolean | null>) => { const asked: string[] = []; return { asked, fn: async (d: string) => { asked.push(d); return d in m ? m[d] : null } } }
+    it('FAT-only stick is offered without any META look', async () => {
+        const m = metaOf({})
+        expect(await stickBlockedBySiblings('sdb1', [P('sdb1', 'vfat', '0xc')], m.fn)).toBeNull()
+        expect(await stickBlockedBySiblings('sdb1', [P('sdb1', 'exfat', '0x7'), P('sdb2', 'vfat', '0xc')], m.fn)).toBeNull()
+        expect(await stickBlockedBySiblings('sdb1', [], m.fn)).toBeNull()
+        expect(m.asked).toEqual([])
     })
-    it('RPi OS / Ubuntu card (vfat boot + ext4 root) is blocked', () => {
-        expect(stickBlockedBySiblings('sdc1', [P('sdc1', 'vfat', '0xc'), P('sdc2', 'ext4', '0x83')])).toMatch(/sdc2.*ext4/)
+    it('OS card (vfat boot + ext4 root without META) is skipped', async () => {
+        const m = metaOf({ sdc2: false })
+        expect(await stickBlockedBySiblings('sdc1', [P('sdc1', 'vfat', '0xc'), P('sdc2', 'ext4', '0x83')], m.fn)).toMatch(/sdc2.*without IDEA META/)
+        expect(m.asked).toEqual(['sdc2'])
     })
-    it('IDEA disk (ext4 with META) next to a FAT partition is blocked', () => {
-        expect(stickBlockedBySiblings('sda1', [P('sda1', 'vfat'), P('sda2', 'ext4', '0fc63daf-8483-4772-8e79-3d69d8477de4')])).not.toBeNull()
+    it('IDEA drive (vfat + ext4 WITH META, hw-roundtrip fixture) offers its FAT partition', async () => {
+        const m = metaOf({ sda2: true })
+        expect(await stickBlockedBySiblings('sda1', [P('sda1', 'vfat'), P('sda2', 'ext4', '0fc63daf-8483-4772-8e79-3d69d8477de4')], m.fn)).toBeNull()
     })
-    it('Linux partition whose fstype udev has not probed yet is blocked by its type', () => {
-        expect(stickBlockedBySiblings('sdc1', [P('sdc1', 'vfat'), P('sdc2', null, '0x83')])).toMatch(/Linux partition/)
-        expect(stickBlockedBySiblings('sdc1', [P('sdc1', 'vfat'), P('sdc2', null, '0FC63DAF-8483-4772-8E79-3D69D8477DE4')])).not.toBeNull()
-    })
-    it('the device itself is ignored', () => {
-        expect(stickBlockedBySiblings('sdc2', [P('sdc2', 'ext4', '0x83')])).toBeNull()
+    it('Linux partition not yet probed by udev is judged by its type; unknown META → skipped (safe side)', async () => {
+        expect(await stickBlockedBySiblings('sdc1', [P('sdc1', 'vfat'), P('sdc2', null, '0x83')], metaOf({ sdc2: false }).fn)).not.toBeNull()
+        expect(await stickBlockedBySiblings('sdc1', [P('sdc1', 'vfat'), P('sdc2', null, '0FC63DAF-8483-4772-8E79-3D69D8477DE4')], metaOf({}).fn)).toMatch(/could not be checked/)
     })
 })

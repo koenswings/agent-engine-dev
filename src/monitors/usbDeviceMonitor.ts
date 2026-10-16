@@ -19,7 +19,7 @@ import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogSto
 import { runWithTrace } from '../utils/CommandLogger.js';
 import { recordDiskDetectionFailure, errorMessage } from './diskDetection.js';
 import { addStick, classifyFsType, stickBlockedBySiblings, removeStick, removeSticksOnDrive, usbStartupCleanup, usbStickOps, usbStickRoutingActive, syncUsbApps } from '../data/UsbSticks.js'
-import { lookForIdeaMeta, safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointOf } from './mounts.js';
+import { lookForIdeaMeta, IdeaLookResult, safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointOf } from './mounts.js';
 
 /**
  * Filesystem UUID of each mounted device, recorded at mount time (or when an
@@ -105,6 +105,26 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     }
 
     /**
+     * idea#201 §10: one read-only META look per device, shared by the device's own
+     * addDevice and by the stick check of a FAT partition on the same drive, so
+     * they never race (two ro mounts of one device) and agree on the answer.
+     * Forgotten when the device is removed.
+     */
+    const metaLooks = new Map<string, Promise<IdeaLookResult>>()
+    const sharedMetaLook = (device: DeviceName): Promise<IdeaLookResult> => {
+        let p = metaLooks.get(device)
+        if (!p) {
+            p = !mountCommandsActive(config.settings.testMode)
+                ? Promise.resolve({ ok: true, hasMeta: fs.existsSync(`${disksRoot()}/${device}/META.yaml`), alreadyMounted: false } as IdeaLookResult)
+                : lookForIdeaMeta(device).catch(e => ({ ok: false, message: errorMessage(e) }) as IdeaLookResult)
+            metaLooks.set(device, p)
+            // A failed look may be retried on the next add event
+            p.then(r => { if (!r.ok && metaLooks.get(device) === p) metaLooks.delete(device) })
+        }
+        return p
+    }
+
+    /**
      * idea#193 §3.1: probe the filesystem type; vfat/exfat on a non-system disk is
      * mounted read-only as a teacher stick. Returns true when the device was a
      * stick (mounted, or refused with a recorded failure), false for ext4 and
@@ -119,12 +139,17 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
             log(`Device ${device} (${probe.fsType}) is on the system drive — never mounted as a USB stick`)
             return true
         }
-        // idea#201 §10 follow-up: the FAT boot partition of an OS / IDEA disk is
-        // not a stick. Decided from lsblk only; never mounted, never registered.
+        // idea#201 §10 follow-up: the FAT boot partition of an OS card (Linux
+        // partition without META.yaml) is not a stick. The sibling is judged by
+        // the same shared read-only look its own addDevice uses, so the order of
+        // the add events does not matter. Never mounted, never registered.
         if (driveNameOf(device) !== device) {
             let parts: Awaited<ReturnType<ReturnType<typeof usbStickOps>['drivePartitions']>> = []
             try { parts = await usbStickOps().drivePartitions(device) } catch (e) { log(`USB stick sibling check of ${device}: ${errorMessage(e)}`) }
-            const why = stickBlockedBySiblings(device, parts)
+            const why = await stickBlockedBySiblings(device, parts, async (sib) => {
+                const look = await sharedMetaLook(sib as DeviceName)
+                return look.ok ? look.hasMeta : null
+            })
             if (why) {
                 log(`Device ${device} (${probe.fsType}) is not a teacher stick: ${why} — not mounted`)
                 return true
@@ -221,7 +246,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                         return
                     }
                 } else {
-                    const look = await lookForIdeaMeta(device)
+                    const look = await sharedMetaLook(device)
                     if (!look.ok) {
                         recordDiskDetectionFailure('mount', look.message, { device })
                         return
@@ -267,6 +292,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         const device = path.split('/').pop()
         if (validDevice(device!)) {
             log(`Processing the removal of USB device ${device}`)
+            metaLooks.delete(device!)
             // Teacher sticks first (idea#193 §3.4): partition, or every stick of a whole drive
             const removedSticks = device!.match(/^sd[a-z]$/)
                 ? await removeSticksOnDrive(storeHandle, device!, 'unplugged')
