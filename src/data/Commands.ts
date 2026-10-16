@@ -17,7 +17,7 @@ import { readStoreDocId } from "./StoreIdentity.js";
 import { realStickerNameDeps, resolveStickerName } from "../install/stickerName.js";
 import pack from '../../package.json' with { type: "json" };
 import { sendCommand } from "../utils/commandUtils.js";
-import { installApp } from './InstallApp.js';
+import { installApp, parseInstallAppArgs } from './InstallApp.js';
 import { copyApp, moveApp } from './CopyMoveApp.js';
 import { resourceLock, diskKey } from '../utils/ResourceLock.js';
 import { undockDisk } from "../monitors/usbDeviceMonitor.js";
@@ -174,32 +174,18 @@ const lsInstances = (storeHandle: DocHandle<Store> | null): void => {
 
 /**
  * installApp command wrapper (idea#128).
- * Usage: installApp <appId> <targetDiskId> [--source <sourceDiskId>] [--name <instanceName>]
+ * Usage: installApp <appId> <targetDiskId> [--source <sourceDiskId>] [--name <instanceName>] [--fresh]
+ * A value with spaces is quoted: --name "Kolibri Demo".
  *
  * All arguments are passed as a single string and parsed here. Disk arguments
  * go through resolveDiskArg (a unique disk name still works, with a warning).
  * Refusals throw, so the trace ends as `error`.
  */
-const INSTALL_APP_USAGE = 'Usage: installApp <appId> <targetDiskId> [--source <sourceDiskId>] [--name <instanceName>]'
 const installAppWrapper = async (storeHandle: DocHandle<Store> | null, argsString: string) => {
     if (!storeHandle) throw new Error("Store is not available.")
-
-    // Parse: installApp kolibri-1.0 <targetDiskId> --source <sourceDiskId> --name my-kolibri
-    const parts = (argsString ?? '').trim().split(/\s+/).filter(Boolean)
-    const appId = parts[0] as any
-    const targetDiskId = parts[1]
-    if (!appId || !targetDiskId || targetDiskId.startsWith('--')) throw new Error(INSTALL_APP_USAGE)
-    const flagValue = (flag: string): string | undefined => {
-        const i = parts.indexOf(flag)
-        if (i === -1) return undefined
-        const v = parts[i + 1]
-        if (!v || v.startsWith('--')) throw new Error(`installApp: ${flag} needs a value. ${INSTALL_APP_USAGE}`)
-        return v
-    }
-    const sourceDiskId = flagValue('--source')
-    const instanceName = flagValue('--name') as any
-
-    await installApp(storeHandle, { appId, targetDiskId, sourceDiskId, instanceName })
+    // Quote-aware: installApp kolibri-1.0 <targetDiskId> --name "Kolibri Demo" --fresh
+    const { appId, targetDiskId, sourceDiskId, instanceName, fresh } = parseInstallAppArgs(argsString)
+    await installApp(storeHandle, { appId, targetDiskId, sourceDiskId, instanceName, fresh })
 }
 
 /**
