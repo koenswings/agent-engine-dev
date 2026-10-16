@@ -49,6 +49,9 @@ export type OperationKind =
   | 'upgradeEngine'
   | 'startApp'
   | 'stopApp'
+  // idea#201 §10 (client cards)
+  | 'flashCard'
+  | 'initialiseDisk'
 
 /**
  * What triggered an operation.
@@ -125,6 +128,12 @@ export interface Operation {
   startedAt: Timestamp
   completedAt: Timestamp | null
   error: string | null
+  /**
+   * flashCard only (idea#201 contract v2): set together with Done/Failed. true = the
+   * card was flushed and powered off, safe to pull; false = eject first
+   * (POWER_OFF_FAILED). Absent on other kinds.
+   */
+  safeToRemove?: boolean
 }
 
 // References to top-level YMaps and YArrays in the Yjs document
