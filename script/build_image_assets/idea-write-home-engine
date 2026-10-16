@@ -1,0 +1,128 @@
+#!/bin/bash
+# idea-write-home-engine — write the home-Engine name onto a client card that was
+# JUST flashed and verified (idea#203 §2, Engine §10 / idea#201 rule 1).
+#
+# Called ONLY by the flash-card root helper (idea-flash-card), after the read-back
+# SHA matched and before flush + power-off. Never called by the Engine directly,
+# never for any other disk. It is a separate root-owned COPY in /usr/local/sbin so
+# it can be tested and reviewed on its own.
+#
+# Usage: idea-write-home-engine <byIdPath> <expectDevice> <expectSizeBytes> <name>
+#   byIdPath        /dev/disk/by-id/<link> that the helper just wrote and verified
+#                   (whole disk; a -partN link is refused)
+#   expectDevice    the kernel device the helper had open while writing, e.g. /dev/sdc
+#                   or /dev/mmcblk0 (the by-id link must STILL resolve to it)
+#   expectSizeBytes the size the helper wrote to (must still match)
+#   name            the Engine's mDNS hostname, e.g. brave-otter
+#                   ([a-z0-9-], 1-63 chars, no leading/trailing hyphen)
+#
+# Writes exactly one file: idea-home.txt = "<name>.local\n" on partition 1, which
+# must be FAT (vfat). Mounts that partition rw for the write only (private temp
+# mount point, nosuid,nodev,noexec), then syncs and unmounts.
+#
+# Refuses (exit 2, "refused: <CODE>: ...") with the §5 codes: MEDIUM_SWAPPED,
+# NOT_REMOVABLE, SYSTEM_DISK, BOOT_DEVICE, MOUNTED, plus NOT_FAT and BAD_ARGS.
+# The by-id link is re-resolved immediately before the mount.
+
+set -eu
+umask 022
+export LC_ALL=C
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+# Constants (tests rewrite these in a sandbox copy)
+DEV_DIR=/dev
+BYID_DIR=/dev/disk/by-id
+SYS_BLOCK=/sys/class/block
+MNT_BASE=/run
+LSBLK=/usr/bin/lsblk
+FINDMNT=/usr/bin/findmnt
+BLKID=/usr/sbin/blkid
+UDEVADM=/usr/bin/udevadm
+MOUNT=/usr/bin/mount
+UMOUNT=/usr/bin/umount
+REALPATH=/usr/bin/realpath
+SYNC=/usr/bin/sync
+MKTEMP=/usr/bin/mktemp
+HOME_FILE=idea-home.txt
+is_block() { [ -b "$1" ]; }
+
+refuse() { echo "refused: $1: $2" >&2; exit 2; }
+
+[ "$#" -eq 4 ] || refuse BAD_ARGS "usage: idea-write-home-engine <byIdPath> <expectDevice> <expectSizeBytes> <name>"
+BYID="$1"; EXPECT_DEV="$2"; EXPECT_SIZE="$3"; NAME="$4"
+
+# ── Argument checks ──────────────────────────────────────────────────────────
+[[ "$BYID" =~ ^${BYID_DIR}/[A-Za-z0-9_.:-]{1,200}$ ]] || refuse BAD_ARGS "byIdPath must be ${BYID_DIR}/<link>"
+[[ "$BYID" =~ -part[0-9]+$ ]] && refuse BAD_ARGS "byIdPath is a partition link; the whole card is required"
+[[ "$EXPECT_DEV" =~ ^${DEV_DIR}/(sd[a-z]{1,2}|mmcblk[0-9]{1,2})$ ]] || refuse BAD_ARGS "expectDevice must be a whole disk /dev/sdX or /dev/mmcblkN"
+[[ "$EXPECT_SIZE" =~ ^[1-9][0-9]{0,18}$ ]] || refuse BAD_ARGS "expectSizeBytes must be digits"
+[[ "$NAME" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || refuse BAD_ARGS "name must be 1-63 of a-z 0-9 -, no leading or trailing hyphen"
+
+DEVNAME=${EXPECT_DEV#"$DEV_DIR"/}
+
+# ── Identity: the by-id link still points at the device we wrote ────────────
+resolve_check() {
+    [ -L "$BYID" ] || refuse MEDIUM_SWAPPED "$BYID is gone"
+    local now
+    now=$($REALPATH -e -- "$BYID" 2>/dev/null) || refuse MEDIUM_SWAPPED "$BYID does not resolve"
+    [ "$now" = "$EXPECT_DEV" ] || refuse MEDIUM_SWAPPED "$BYID now resolves to $now, not $EXPECT_DEV"
+    [ -r "$SYS_BLOCK/$DEVNAME/size" ] || refuse MEDIUM_SWAPPED "$EXPECT_DEV has no size"
+    [ ! -e "$SYS_BLOCK/$DEVNAME/partition" ] || refuse MEDIUM_SWAPPED "$EXPECT_DEV is a partition"
+    local sectors
+    sectors=$(cat "$SYS_BLOCK/$DEVNAME/size")
+    [[ "$sectors" =~ ^[0-9]+$ ]] || refuse MEDIUM_SWAPPED "unreadable size"
+    [ "$((sectors * 512))" = "$EXPECT_SIZE" ] || refuse MEDIUM_SWAPPED "size is now $((sectors * 512)), wrote $EXPECT_SIZE"
+}
+resolve_check
+
+# ── Never the system disk, the boot device, a fixed disk or a mounted card ───
+removable=$(cat "$SYS_BLOCK/$DEVNAME/removable" 2>/dev/null || echo 0)
+tran=$($LSBLK -dno TRAN "$EXPECT_DEV" 2>/dev/null | tr -d ' ' || true)
+case "$DEVNAME" in mmcblk*) sd_slot=1 ;; *) sd_slot=0 ;; esac
+[ "$removable" = "1" ] || [ "$tran" = "usb" ] || [ "$sd_slot" = "1" ] || refuse NOT_REMOVABLE "$EXPECT_DEV is not removable media"
+
+parent_of() { # mount source -> whole-disk name
+    local src=$1 pk
+    src=$($REALPATH -e -- "$src" 2>/dev/null || echo "$src")
+    pk=$($LSBLK -no PKNAME "$src" 2>/dev/null | head -n1 | tr -d ' ' || true)
+    if [ -n "$pk" ]; then echo "$pk"; else echo "${src##*/}"; fi
+}
+for mp in / /boot /boot/firmware; do
+    src=$($FINDMNT -n -o SOURCE --mountpoint "$mp" 2>/dev/null || true)
+    [ -n "$src" ] || continue
+    if [ "$(parent_of "$src")" = "$DEVNAME" ]; then
+        [ "$mp" = "/" ] && refuse SYSTEM_DISK "$EXPECT_DEV holds /"
+        refuse BOOT_DEVICE "$EXPECT_DEV holds $mp"
+    fi
+done
+while read -r part; do
+    [ -n "$part" ] || continue
+    if $FINDMNT -n --source "$DEV_DIR/$part" >/dev/null 2>&1; then
+        refuse MOUNTED "$DEV_DIR/$part is mounted"
+    fi
+done < <($LSBLK -lno NAME "$EXPECT_DEV" 2>/dev/null)
+
+# ── Partition 1 must be FAT ──────────────────────────────────────────────────
+$UDEVADM settle --timeout=10 >/dev/null 2>&1 || true
+case "$DEVNAME" in mmcblk*) P1="${EXPECT_DEV}p1" ;; *) P1="${EXPECT_DEV}1" ;; esac
+is_block "$P1" || refuse NOT_FAT "$EXPECT_DEV has no partition 1"
+fstype=$($BLKID -o value -s TYPE "$P1" 2>/dev/null || true)
+[ "$fstype" = "vfat" ] || refuse NOT_FAT "partition 1 of $EXPECT_DEV is '${fstype:-none}', not vfat"
+
+# ── Write ────────────────────────────────────────────────────────────────────
+MP=$($MKTEMP -d "$MNT_BASE/idea-home-engine.XXXXXX")
+cleanup() {
+    if $FINDMNT -n --mountpoint "$MP" >/dev/null 2>&1; then $UMOUNT "$MP" || true; fi
+    rmdir "$MP" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+resolve_check   # immediately before the mount
+$MOUNT -t vfat -o rw,nosuid,nodev,noexec,umask=022 "$P1" "$MP"
+printf '%s.local\n' "$NAME" > "$MP/.$HOME_FILE.tmp"
+mv -f "$MP/.$HOME_FILE.tmp" "$MP/$HOME_FILE"
+$SYNC
+got=$(cat "$MP/$HOME_FILE")
+[ "$got" = "$NAME.local" ] || { echo "error: WRITE_FAILED: read back '$got'" >&2; exit 1; }
+$UMOUNT "$MP"
+echo "ok: $HOME_FILE = $NAME.local on $P1 ($BYID)"
