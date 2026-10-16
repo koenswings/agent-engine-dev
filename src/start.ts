@@ -1,7 +1,8 @@
 import os from 'os'
 import { enableUsbDeviceMonitor } from './monitors/usbDeviceMonitor.js'
 import { runDiskDetectionSelfCheck, recordDiskDetectionFailure, errorMessage } from './monitors/diskDetection.js'
-import { enableTimeMonitor, generateHeartBeat } from './monitors/timeMonitor.js'
+import { enableTimeMonitor } from './monitors/timeMonitor.js'
+import { startLiveness, writeLastSeen } from './data/Liveness.js'
 import { $, chalk, fs, sleep } from 'zx'
 import { deepPrint, log, print } from './utils/utils.js'
 import { config, peerAccessEnabled, peerStaleMs } from './data/Config.js'
@@ -16,7 +17,7 @@ import { startStaticPeers, staticPeersSetting } from './data/StaticPeers.js'
 import { createServerStore } from './data/Store.js'
 import { prepareStoreIdentity, storeIdentityPaths } from './data/StoreIdentity.js'
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
-import { recoverInterruptedOperations } from './data/Operations.js'
+import { recoverInterruptedOperations, archiveOldOperations } from './data/Operations.js'
 import { enableDockerMetricsMonitor } from './monitors/dockerMetricsMonitor.js'
 import { enableDiskSizeMonitor } from './data/DiskSize.js'
 import { ensureEngineStateDir, setFilesMountStore } from './data/FilesMount.js'
@@ -26,7 +27,7 @@ import { diskFsRoot } from './data/Disk.js'
 import { copyApp, moveApp } from './data/CopyMoveApp.js'
 import { backupInstance } from './monitors/backupMonitor.js'
 import { clearStaleUnmountErrors } from './monitors/mounts.js'
-import { createCommandLogStore, shutdownRepo } from './data/CommandLogStore.js'
+import { createCommandLogStore, shutdownRepo, startCommandLogRotation } from './data/CommandLogStore.js'
 import { initCommandLogger } from './utils/CommandLogger.js'
 import { assertAppDataHelper, reportBorgAtStartup } from './utils/appDataHelper.js'
 import { startPeerAccess } from './data/PeerAccess.js'
@@ -164,6 +165,8 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     log(chalk.bgMagenta('STARTING COMMAND LOG STORE'))
     const commandLogHandle = await createCommandLogStore(repo)
     initCommandLogger(commandLogHandle)
+    // idea#183: fresh CommandLog doc each local day, previous one archived
+    startCommandLogRotation(repo)
 
     // Start the HTTP server (serves Console UI + /api/store-url)
     log(chalk.bgMagenta('STARTING HTTP SERVER'))
@@ -255,10 +258,14 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
 
     log(chalk.bgMagenta('STARTING HEARTBEAT GENERATION'))
     const heartbeatIntervalMs = config.settings.heartbeatIntervalMs ?? 50000
-    generateHeartBeat(storeHandle)
-    // The heartbeat also repairs this Engine's peerAccess and expires stale peers
+    // Liveness without store history (store-design 2026-10-13): ephemeral hb every
+    // 10 s, stored lastRun at boot + hourly (Liveness.ts)
+    writeLastSeen(storeHandle, String(localEngineId), Date.now(), 0, true)
+    startLiveness(storeHandle, String(localEngineId))
+    // The heartbeat timer still repairs this Engine's peerAccess, expires stale
+    // peers and archives old operations; it no longer writes to the store itself
     enableTimeMonitor(heartbeatIntervalMs, () => {
-        generateHeartBeat(storeHandle)
+        archiveOldOperations(storeHandle).catch(e => print(chalk.red(`archive operations: ${e}`)))
         peerAccess.onHeartbeat().catch(e => print(chalk.red(`peer access heartbeat: ${e}`)))
     })
 

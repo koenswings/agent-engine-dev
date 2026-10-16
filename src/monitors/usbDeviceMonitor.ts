@@ -6,6 +6,7 @@ import { $, fs, YAML, chalk } from 'zx'
 $.verbose = false;
 import { Disk, clearDuplicateDiskRecords, createOrUpdateDisk, isSystemDiskRecord, processDisk } from '../data/Disk.js'
 import { flushFilesRemountNow, optedInInstances } from '../data/FilesMount.js'
+import { clearUndockPending, dockChangedReason, dockIdentityOf, ejectInFlightWaitMs, markUndockPending, waitInFlightOnDisk } from '../data/InstanceInFlight.js'
 import { isSystemDevice, systemDriveNames, driveNameOf } from '../data/SystemDisk.js'
 import { refreshUnformattedDisks } from '../data/UnformattedDisks.js'
 import { eraseLockRefusesAdd, isEraseDeviceLocked, setEraseAddDevice } from '../data/EraseDisk.js'
@@ -462,20 +463,62 @@ export const undockAllOnDevice = async (storeHandle: DocHandle<Store>, engineId:
         storeHandle.change(doc => { cleared = clearDuplicateDiskRecords(doc, engineId, device, primary.id) })
         log(`Undocked stale disk record(s) ${cleared.join(', ')} on ${device}`)
     }
-    await undockDisk(storeHandle, primary)
+    // Device-removal path: the disk is already gone, so no in-flight wait (#179 applies to eject).
+    await undockDisk(storeHandle, primary, { waitInFlight: false })
     return [primary.id, ...cleared]
 }
 
-export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
+/** Result of undockDisk: `aborted` names why an eject stopped after its in-flight wait (disk pulled/re-docked meanwhile). */
+export type UndockResult = { aborted: string | null }
+
+/** Device node + mount still the one this dock made? Only with real mount commands (not testMode/sim). */
+const liveMountChangedReason = async (device: string): Promise<string | null> => {
+    if (!mountCommandsActive(config.settings.testMode)) return null
+    if (!fs.existsSync(`/dev/${device}`)) return `device /dev/${device} is gone`
+    const src = (await $`findmnt -n -o SOURCE ${mountPointOf(device)}`.nothrow()).stdout.trim()
+    if (src !== `/dev/${device}`) return `${mountPointOf(device)} is not mounted from /dev/${device} (source ${src || 'none'})`
+    return null
+}
+
+export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk, opts: { waitInFlight?: boolean } = {}): Promise<UndockResult | void> => {
+    markUndockPending(String(disk.id))
+    try { return await undockDiskInner(storeHandle, disk, opts) } finally { clearUndockPending(String(disk.id)) }
+}
+
+const undockDiskInner = async (storeHandle: DocHandle<Store>, disk: Disk, opts: { waitInFlight?: boolean }): Promise<UndockResult> => {
+    const device0 = disk.device
+    const before = dockIdentityOf(disk)
+    // #179: an instance start/install still running on this disk must settle first (bounded),
+    // then it is stopped below. Otherwise it carries on against the unmounted disk (r82b/r83).
+    // Only for an Engine-initiated undock (ejectDisk, erase), where the disk is still there and
+    // the Engine itself unmounts it. After a physical removal (device gone, undockAllOnDevice
+    // from the monitor) the disk is already gone: waiting cannot help the start and would only
+    // keep the pulled disk listed as docked for up to the bound (disk-dock-undock).
+    if (opts.waitInFlight !== false && device0 && !(await isSystemDiskRecord(disk))) {
+        const w = await waitInFlightOnDisk(String(disk.id), ejectInFlightWaitMs())
+        if (w.timedOut.length) log(`Undock ${disk.id}: still in flight after ${w.waitedMs}ms (${w.timedOut.join(', ')}) — stopping anyway`)
+        else if (w.waitedMs > 0) log(`Undock ${disk.id}: in-flight start(s) settled after ${w.waitedMs}ms`)
+        // hw180: the disk may have been pulled (and even re-plugged on a new device) during the wait.
+        // Only act on the very dock this eject was for: same device node, mount and dock generation.
+        if (w.waitedMs > 0 || w.timedOut.length) {
+            const reason = dockChangedReason(before, dockIdentityOf(storeHandle.doc()?.diskDB?.[disk.id]))
+                ?? await liveMountChangedReason(device0)
+            if (reason) {
+                log(`Eject of ${disk.id} aborted after the in-flight wait: ${reason}; nothing unmounted, store left as is`)
+                return { aborted: reason }
+            }
+        }
+    }
+    // Read the store AFTER the wait, so instances registered by a settling install are stopped too
     const store: Store = storeHandle.doc()
     const device = disk.device
     if (!device) {
         log(`Disk ${disk.id} is not mounted on any device. Nothing to undock.`)
-        return
+        return { aborted: null }
     }
     if (await isSystemDiskRecord(disk)) {
         log(`Disk ${disk.id} on ${device} is this Pi's system disk — never undocked`)
-        return
+        return { aborted: null }
     }
     try {
         // Combined Files Disk eject (§7.3): recreate opted-in instances on *other*
@@ -542,6 +585,7 @@ export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
         log(e)
         recordDiskDetectionFailure('undock', `Could not undock the disk on ${device}: ${errorMessage(e)}`, { device, diskId: disk.id })
     }
+    return { aborted: null }
 }
 
 /**

@@ -146,6 +146,8 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
         scriptCalls = []
         slotCalls = []
         setEraseOpsForTests({
+            mountedPartitions: async () => [],
+            hiddenTablePartitions: async () => [],
             runScript: async (a) => {
                 scriptCalls.push(a)
                 // Fake: leave a META.yaml-only empty disk folder at DISKS_ROOT/<whole>1
@@ -395,6 +397,8 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
         })
 
         setEraseOpsForTests({
+            mountedPartitions: async () => [],
+            hiddenTablePartitions: async () => [],
             runSlotErase: async () => { throw new Error('helper: could not unmount') },
             isMountPoint: async () => true,
             runScript: async () => { throw new Error('USB script must not run for slots') },
@@ -430,6 +434,8 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
             })
         })
         setEraseOpsForTests({
+            mountedPartitions: async () => [],
+            hiddenTablePartitions: async () => [],
             isMountPoint: async () => true,
             runScript: async () => { throw new Error('should not partition') },
             runSlotErase: async () => { throw new Error('should not slot-erase') },
