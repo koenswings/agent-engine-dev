@@ -18,7 +18,7 @@ import { CommandLogStore, LogEntry, getCommandLogHandle, liveCommandLogHandle, a
 import { getActiveTrace, flushTrace } from '../utils/CommandLogger.js'
 import { dockerAvailable } from '../utils/dockerAvailable.js'
 import { rebindKolibriMorangoInstanceId } from './InstanceCopy.js'
-import { hostIdentity, writeHostIdentityEnv, isNextcloudInstance, nextcloudTrustedDomainsBridge } from './HostIdentity.js'
+import { hostIdentity, writeHostIdentityEnv, isNextcloudInstance, nextcloudTrustedDomainsBridge, hostNetworkInterfaces } from './HostIdentity.js'
 import { trackInFlight, startDiskGoneReason, dockIdentityOf } from './InstanceInFlight.js'
 
 // ── Step-progress helpers ─────────────────────────────────────────────────────
@@ -1339,7 +1339,7 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
 
   // hostname / ip for every app's compose (${hostname}, ${ip}): main's #217
   // writeEngineHostEnv, which replaced this PR's Nextcloud-only block.
-  await writeEngineHostEnv(`${mountRoot}/instances/${instance.id}/.env`, getLocalEngine(store).hostname, instance.id)
+  await writeEngineHostEnv(envPath, getLocalEngine(store).hostname, instance.id, hostNetworkInterfaces())
 
   log(`Creating containers of app instance '${instance.id}' on disk ${disk.id} of engine ${localEngineId}.`)
   try {

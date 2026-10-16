@@ -46,6 +46,9 @@ const ifaceRank = (name: string): number => {
 }
 
 /** All non-internal IPv4 addresses of this host, container bridges excluded, deduplicated. */
+/** The network interfaces as HostIdentity sees them (test hook aware). */
+export const hostNetworkInterfaces = (): Ifaces => ops.networkInterfaces()
+
 export const hostIPv4s = (ifaces: Ifaces = ops.networkInterfaces()): string[] => {
     const names = Object.keys(ifaces ?? {})
         .filter(n => !VIRTUAL_IFACE.test(n))
