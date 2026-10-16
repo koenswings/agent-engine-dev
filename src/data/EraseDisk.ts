@@ -23,7 +23,7 @@ import { remountInstance, optedInInstances, ENGINE_STATE_DIR } from './FilesMoun
 import { shouldHoldFilesRemount } from './FilesMount.js'
 import { ContentSummary, readSummaryFromTrace, resolveSummaryTarget } from './SummariseDisk.js'
 import { refreshUnformattedDisks } from './UnformattedDisks.js'
-import { isSystemDevice, driveNameOf } from './SystemDisk.js'
+import { isSystemDevice, driveNameOf, bareDevice } from './SystemDisk.js'
 import { log, print, uuid } from '../utils/utils.js'
 import { disksRoot } from './Config.js'
 import { APP_DATA_HELPER, eraseSlotArgs } from '../utils/appDataHelper.js'
@@ -66,7 +66,35 @@ export interface EraseOps {
     addDevice: (devicePath: string) => Promise<void>
     /** mountpoint -q; injectable so tests can simulate a still-mounted refusal */
     isMountPoint: (mp: string) => Promise<boolean>
+    /** Mounted partitions of a whole device as [partition, mountpoint] (findmnt); injectable for tests */
+    mountedPartitions: (wholeDevice: string) => Promise<{ partition: string; mountpoint: string }[]>
+    /**
+     * Partitions in the on-disk partition table that the kernel does not show
+     * (root helper `idea-erase-disk --check-table`, read-only). Throws when the
+     * table can't be checked. Injectable for tests.
+     */
+    hiddenTablePartitions: (wholeDevice: string) => Promise<HiddenPartition[]>
 }
+
+export interface HiddenPartition { partition: string; name: string | null }
+
+/** Parse `idea-erase-disk --check-table` output: lines "hidden: sda1 start=..., name=\"X\"". */
+export const parseHiddenPartitions = (stdout: string): HiddenPartition[] => {
+    const res: HiddenPartition[] = []
+    for (const line of stdout.split('\n')) {
+        const m = line.trim().match(/^hidden:\s+(\S+)(.*)$/)
+        if (!m) continue
+        const name = m[2].match(/name="([^"]*)"/)?.[1] ?? null
+        res.push({ partition: m[1], name: name || null })
+    }
+    return res
+}
+
+export const hiddenPartitionsMessage = (label: string, whole: string, hidden: HiddenPartition[]): string =>
+    `${label} is on /dev/${whole}, whose partition table also has ` +
+    `${hidden.map(h => h.name ? `${h.partition} ("${h.name}")` : h.partition).join(', ')}, ` +
+    `which this Pi does not show (not in lsblk). Erasing wipes the whole disk, so nothing was erased. ` +
+    `Unplug the disk and plug it in again, then check it.`
 
 const defaultOps: EraseOps = {
     runScript: async (a) => {
@@ -89,6 +117,24 @@ const defaultOps: EraseOps = {
     },
     addDevice: async () => { /* wired from usb monitor at runtime */ },
     isMountPoint: async (mp) => (await $`mountpoint -q ${mp}`.nothrow()).exitCode === 0,
+    mountedPartitions: async (whole) => {
+        const out = (await $`findmnt -rn -o SOURCE,TARGET`.nothrow()).stdout
+        const res: { partition: string; mountpoint: string }[] = []
+        for (const line of out.split('\n')) {
+            const [src, target] = line.trim().split(/\s+/)
+            if (!src?.startsWith('/dev/') || !target) continue
+            const part = bareDevice(src)
+            if (part !== whole && driveNameOf(part) === whole) res.push({ partition: part, mountpoint: target.replace(/\\x20/g, ' ') })
+        }
+        return res
+    },
+    hiddenTablePartitions: async (whole) => {
+        const out = await $`sudo -n ${ERASE_SCRIPT} --check-table /dev/${whole}`.nothrow()
+        if (out.exitCode !== 0) {
+            throw new Error((out.stderr || out.stdout).trim() || `exit ${out.exitCode}`)
+        }
+        return parseHiddenPartitions(out.stdout)
+    },
 }
 
 let ops = defaultOps
@@ -133,6 +179,63 @@ const wholeDeviceOf = (device: string): string => {
     const bare = device.replace(/^\/dev\//, '')
     return driveNameOf(bare)
 }
+
+/**
+ * Instances that live on ANOTHER disk but hold this disk open: a Files Disk
+ * bind-mounted through filesMounts (e.g. Nextcloud /files), or an app volume
+ * whose host path is under this disk's mount root. A running container keeps
+ * the block device busy, so wipefs fails with "Device or resource busy" and the
+ * fallback fails too. Erase refuses up front and names them instead.
+ * (Could be extended to stop them first if preferred.)
+ */
+/** Host paths of bind volumes in an instance's compose.yaml (absolute paths only). */
+export const composeVolumeHostPaths = async (store: Store, inst: { id: string; storedOn?: any }): Promise<string[]> => {
+    try {
+        const home = inst.storedOn ? store.diskDB[inst.storedOn as DiskID] : null
+        if (!home?.device) return []
+        const file = path.join(await diskMountRoot(home), 'instances', inst.id, 'compose.yaml')
+        const doc = YAML.parse(await fs.readFile(file, 'utf8')) ?? {}
+        const out: string[] = []
+        for (const svc of Object.values<any>(doc.services ?? {})) {
+            for (const v of svc?.volumes ?? []) {
+                const src = typeof v === 'string' ? v.split(':')[0] : v?.source
+                if (typeof src === 'string' && src.startsWith('/')) out.push(path.normalize(src))
+            }
+        }
+        return out
+    } catch {
+        return []
+    }
+}
+
+export const instancesUsingDisk = async (
+    store: Store,
+    disk: Disk,
+    volumeHostPaths: (store: Store, inst: any) => Promise<string[]> = composeVolumeHostPaths,
+): Promise<{ id: string; name: string; via: 'filesMounts' | 'volume' }[]> => {
+    const out: { id: string; name: string; via: 'filesMounts' | 'volume' }[] = []
+    const mp = disk.device ? `${disksRoot()}/${disk.device}` : null
+    for (const inst of Object.values(store.instanceDB)) {
+        if (inst.storedOn === disk.id) continue // removed by the erase itself
+        const status = String(inst.status ?? '')
+        if (['Stopped', 'Undocked', 'Docked', 'Missing'].includes(status)) continue
+        if ((inst.filesMounts ?? []).includes(disk.id)) {
+            out.push({ id: inst.id, name: String(inst.name ?? inst.id), via: 'filesMounts' })
+            continue
+        }
+        if (mp) {
+            const paths = await volumeHostPaths(store, inst)
+            if (paths.some(p => p === mp || p.startsWith(mp + '/'))) {
+                out.push({ id: inst.id, name: String(inst.name ?? inst.id), via: 'volume' })
+            }
+        }
+    }
+    return out
+}
+
+export const instancesUsingDiskMessage = (label: string, users: { name: string; via: string }[]): string =>
+    `${label} is in use by ${users.map(u => `${u.name} (${u.via === 'filesMounts' ? 'Files mount' : 'app volume'})`).join(', ')}. ` +
+    `Stop ${users.length === 1 ? 'that instance' : 'those instances'} or remove the Files mount first; nothing was erased.`
 
 /**
  * Blockers: running backup, held instance lock, Nextcloud first-start/upgrade,
@@ -223,11 +326,41 @@ export const eraseDisk = async (
     const blocker = await eraseBlocker(store, disk)
     if (blocker) throw new Error(blocker)
 
+    if (disk) {
+        const users = await instancesUsingDisk(storeHandle.doc()!, disk)
+        if (users.length > 0) throw new Error(instancesUsingDiskMessage(summary.label, users))
+    }
+
+    // Whole-device checks BEFORE any unmount or store change (#188): erase wipes the
+    // whole physical disk, so another mounted partition on it (e.g. sdb1 next to sdb2)
+    // or the system disk must refuse here, not after the target was undocked.
+    if (!isSlotEraseDevice(devicePartition ?? whole)) {
+        if (await isSystemDevice(whole)) throw new Error(`${summary.label} is on this Pi's system disk and cannot be erased.`)
+        const siblings = (await ops.mountedPartitions(whole)).filter(m => m.partition !== devicePartition)
+        if (siblings.length > 0) {
+            throw new Error(
+                `${summary.label} shares its physical disk (/dev/${whole}) with ${siblings.map(m => `${m.partition} mounted at ${m.mountpoint}`).join(', ')}. ` +
+                `Erasing wipes the whole disk, so nothing was erased.`)
+        }
+        // lsblk/findmnt only see partitions the kernel knows. A partition that is in
+        // the on-disk table but missing from /proc/partitions (idea01 sda1,
+        // 2026-10-15) would be wiped unseen, so read the table itself. Fail closed.
+        let hidden: HiddenPartition[]
+        try {
+            hidden = await ops.hiddenTablePartitions(whole)
+        } catch (e: any) {
+            throw new Error(`Could not check the partition table of /dev/${whole} (${e.message ?? e}), so nothing was erased.`)
+        }
+        if (hidden.length > 0) throw new Error(hiddenPartitionsMessage(summary.label, whole, hidden))
+    }
+
     setEraseStep(storeHandle, 'checking', targetId, summary.label)
     lockedDevices.add(whole)
     const stagingId = keptId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64) || uuid()
     const stagingDir = path.join(ERASE_STAGING_ROOT, stagingId)
     const removedInstances: { id: string; name: string; dataBytes: number }[] = []
+    let undocked = false
+    let erased = false
 
     try {
         setEraseStep(storeHandle, 'stopping and unmounting', targetId, summary.label)
@@ -280,6 +413,7 @@ export const eraseDisk = async (
                 await processDisk(storeHandle, disk).catch(() => {})
                 throw new Error(`${summary.label} couldn't be unmounted, so nothing was erased.`)
             }
+            undocked = true
 
             // Remove Disk entry and instances/apps from store
             storeHandle.change(doc => {
@@ -343,6 +477,7 @@ export const eraseDisk = async (
                 stagingDir,
             })
         }
+        erased = true
         // Parse STEP markers into eraseInProgress
         for (const line of scriptOut.stdout.split('\n')) {
             if (line.startsWith('STEP:')) {
@@ -385,6 +520,17 @@ export const eraseDisk = async (
         print(chalk.green(`Erased ${summary.label} → empty IDEA disk ${keptId}`))
         return { diskId: keptId as DiskID, removedInstances }
     } catch (e) {
+        // Failed after the target was unmounted but before the erase ran (#188):
+        // mount it again and re-register it, so it reappears in the store.
+        if (undocked && !erased && devicePartition) {
+            try {
+                const add = addDeviceImpl ?? ops.addDevice
+                await add(`/dev/engine/${devicePartition}`)
+                log(`Erase of ${summary.label} failed after unmounting; ${devicePartition} was mounted and registered again`)
+            } catch (re: any) {
+                log(`Erase of ${summary.label} failed after unmounting and ${devicePartition} could not be mounted again: ${re?.message ?? re}`)
+            }
+        }
         throw e
     } finally {
         lockedDevices.delete(whole)
