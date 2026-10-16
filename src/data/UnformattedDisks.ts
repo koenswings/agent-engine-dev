@@ -32,6 +32,8 @@ export interface LsblkDevice {
     size?: string | number
     model?: string | null
     serial?: string | null
+    /** lsblk RM: removable medium (card reader / SD). Such a device is a client card (idea#201 §10), never an Erase target. */
+    rm?: boolean | number | string | null
     children?: LsblkDevice[]
 }
 
@@ -42,7 +44,7 @@ export interface UnformattedOps {
 
 const defaultOps: UnformattedOps = {
     lsblkJson: async () => {
-        const out = await $`lsblk -J -b -o NAME,TYPE,FSTYPE,SIZE,MODEL,SERIAL`.nothrow()
+        const out = await $`lsblk -J -b -o NAME,TYPE,FSTYPE,SIZE,MODEL,SERIAL,RM`.nothrow()
         if (out.exitCode !== 0 || !out.stdout.trim()) return []
         const parsed = JSON.parse(out.stdout) as { blockdevices?: LsblkDevice[] }
         return parsed.blockdevices ?? []
@@ -119,6 +121,9 @@ export const candidateIdFor = async (name: string, serialRaw: string | null): Pr
     return { candidateId: generated(), serial: null }
 }
 
+/** lsblk RM column (bool in recent util-linux, "1"/1 in older). Same rule as ClientCards. */
+export const isRemovableMedium = (d: LsblkDevice): boolean => d.rm === true || d.rm === 1 || d.rm === '1' || d.rm === 'true'
+
 /** Forget the generated id of a device that is gone (called by every scanner). */
 export const forgetGeneratedIdsExcept = (present: Set<string>): void => {
     for (const k of [...generatedIds.keys()]) if (!present.has(k)) generatedIds.delete(k)
@@ -141,6 +146,8 @@ export const scanUnformattedDisks = async (): Promise<UnformattedDisk[]> => {
         if (!/^sd[a-z]$/.test(name)) continue  // whole sdX only; partitions 3+ out of scope for listing parents with ext4 on p3 still excluded via hasExt4
         seen.add(name)
         if (await isSystemDevice(name)) continue
+        // idea#201 §10: a removable medium is listed in Engine.clientCards (Flash), never here (no Erase on a client card)
+        if (isRemovableMedium(d)) continue
         if (hasExt4(d)) continue
         const sizeBytes = typeof d.size === 'number' ? d.size : parseInt(String(d.size ?? '0'), 10) || 0
         const model = d.model?.trim() || null
