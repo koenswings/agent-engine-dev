@@ -18,7 +18,7 @@ import { createOrUpdateEngine, localEngineId, engineCapabilities, ENGINE_CAPABIL
 import { EngineID, DiskID } from '../../src/data/CommonTypes.js'
 import {
     scanClientCards, setClientCardOpsForTests, clearClientCardStateForTests, refreshClientCards,
-    resetClientCardWriteCacheForTests, classifyContents, usbPathOf, CardLsblkDevice,
+    resetClientCardWriteCacheForTests, classifyContents, usbPathOf, CardLsblkDevice, setClientCardProbes,
 } from '../../src/data/ClientCards.js'
 import { scanClientImages, setClientImageOpsForTests, resolveImage, parseShaLine } from '../../src/data/ClientImages.js'
 import {
@@ -54,10 +54,12 @@ const IDEA_SSD: CardLsblkDevice = { name: 'sdf', type: 'disk', size: 240 * GB, r
     children: [{ name: 'sdf1', type: 'part', fstype: 'ext4', label: 'IDEA Disk', size: 240 * GB, mountpoint: '/disks/sdf1' }] }
 
 let lsblk: CardLsblkDevice[] = []
+let lsblkHook: (() => Promise<void>) | null = null
 const useDevices = (devs: CardLsblkDevice[], docked: string[] = ['sdf1'], sys: (d: string) => boolean = (d) => d.startsWith('sda')) => {
     lsblk = devs
+    lsblkHook = null
     setClientCardOpsForTests({
-        lsblkJson: async () => JSON.parse(JSON.stringify(lsblk)),
+        lsblkJson: async () => { if (lsblkHook) await lsblkHook(); return JSON.parse(JSON.stringify(lsblk)) },
         byIdLinks: async () => lsblk.filter(d => d.name !== 'sda').map(d => ({ link: `/dev/disk/by-id/usb-${(d.model ?? 'X').replace(/ /g, '_')}_${d.serial}-0:0`, device: d.name })),
         sysfsPath: async (d) => `/sys/devices/platform/scb/fd500000.pcie/pci0000:00/0000:01:00.0/usb1/1-1/1-1.${d.charCodeAt(2) - 96}/1-1.${d.charCodeAt(2) - 96}:1.0/host0/target0:0:0/0:0:0:0/block/${d}`,
         isSystemDevice: async (d) => sys(d),
@@ -138,6 +140,31 @@ describe('client cards scanner (idea#201 §10)', () => {
         expect(e.cardReaders).toHaveLength(2)
         expect(e.newDisks.map((d: any) => d.device)).toEqual(['sdd'])
         expect(Object.keys(e.newDisks[0]).sort()).toEqual(['byId', 'candidateId', 'contents', 'device', 'firstSeen', 'model', 'mountedReadOnly', 'partitions', 'readerId', 'removable', 'serial', 'sizeBytes'])
+    })
+
+    it('no stale BUSY: a slow scan started while busy cannot overwrite the refresh that follows the flash', async () => {
+        const h = await newStore()
+        useDevices([SYS, RPI_CARD])
+        let busy = true
+        setClientCardProbes({ busy: () => busy, helperInstalled: () => true })
+        try {
+            // first (poll) scan is slow and starts while the flash runs
+            let release!: () => void
+            const gate = new Promise<void>(r => { release = r })
+            let first = true
+            lsblkHook = async () => { if (first) { first = false; await gate } }
+            const poll = refreshClientCards(h, LOCAL)
+            await new Promise(r => setTimeout(r, 10))     // the poll has read busy=true and waits in lsblk
+            busy = false                                   // flash finished
+            const after = refreshClientCards(h, LOCAL)     // end-of-flash refresh
+            release()
+            await Promise.all([poll, after])
+            const card: any = (h.doc()!.engineDB[LOCAL] as any).clientCards[0]
+            expect(card.refusal).toBeNull()
+            expect(card.flashable).toBe(true)
+        } finally {
+            setClientCardProbes({ busy: () => false })
+        }
     })
 })
 

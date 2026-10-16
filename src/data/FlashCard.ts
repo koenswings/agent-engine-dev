@@ -171,6 +171,7 @@ export const flashCard = async (
     running.set(opId, entry)
     updateOperation(storeHandle, opId, { status: 'Running', currentStep: 0, totalSteps: FLASH_STEPS.length, stepLabel: 'checking' })
     setFlashInProgress(storeHandle, { operationId: opId, candidateId, version: image.version, step: 'checking' })
+    refreshClientCards(storeHandle).catch(() => {})   // show BUSY now, not at the next poll
     print(`Flashing ${image.fileName} to ${card.device} (${card.byId}, ${card.sizeBytes} bytes), operation ${opId}`)
 
     const done = new Promise<FlashResult | null>((resolve) => {

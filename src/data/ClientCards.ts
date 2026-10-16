@@ -296,10 +296,24 @@ const publicCard = (c: ScannedCard): ClientCard => ({
 const fingerprint = (r: ScanResult): string => JSON.stringify([r.newDisks, r.cardReaders, r.clientCards.map(publicCard)])
 let lastWritten = ''
 
-/** Rescan and write Engine.newDisks / cardReaders / clientCards (whole-list replace, only on change). */
-export const refreshClientCards = async (
+/**
+ * Rescan and write Engine.newDisks / cardReaders / clientCards (whole-list replace, only on change).
+ * Refreshes run one at a time and read the busy probe when they start: a poll scan that began
+ * during a flash used to finish after the flash's own end-of-flash refresh and write its BUSY
+ * last, leaving a stale BUSY hint on the card (idea#201).
+ */
+let refreshChain: Promise<unknown> = Promise.resolve()
+export const refreshClientCards = (
     storeHandle: DocHandle<Store>,
     engineId: EngineID = localEngineId as EngineID,
+): Promise<ScanResult> => {
+    const run = refreshChain.then(() => refreshClientCardsNow(storeHandle, engineId))
+    refreshChain = run.catch(() => {})
+    return run
+}
+const refreshClientCardsNow = async (
+    storeHandle: DocHandle<Store>,
+    engineId: EngineID,
 ): Promise<ScanResult> => {
     const scan = await scanClientCards(storeHandle.doc(), String(engineId), { busy: busyProbe(), helperInstalled: helperProbe() })
     lastScan = scan
@@ -319,7 +333,7 @@ export const refreshClientCards = async (
     return scan
 }
 
-export const resetClientCardWriteCacheForTests = (): void => { lastWritten = ''; lastScan = { newDisks: [], cardReaders: [], clientCards: [] } }
+export const resetClientCardWriteCacheForTests = (): void => { refreshChain = Promise.resolve(); lastWritten = ''; lastScan = { newDisks: [], cardReaders: [], clientCards: [] } }
 
 /** Media changes in a reader send no add event for the whole disk: poll lsblk (cheap, write only on change). */
 export const CLIENT_CARD_POLL_MS = 5_000
