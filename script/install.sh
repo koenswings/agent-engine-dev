@@ -12,7 +12,8 @@ echo "--> Installing git, curl, and Node.js environment..."
 apt-get update -y
 # rsync (with rrsync) and borgbackup are run as root by the app-data helper
 # /usr/local/sbin/idea-app-data (idea#168); step 5 (build-engine, installUdev)
-# installs the helper and its sudoers line.
+# installs the helper and its sudoers line. After every later Engine update run
+# ./install-root-helpers (idempotent) so the helper and borg stay current.
 apt-get install -y npm git curl rsync borgbackup
 npm install -g n pnpm
 echo "--> Setting Node.js version for script execution..."

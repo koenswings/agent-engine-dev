@@ -23,6 +23,7 @@ import { DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/dat
 import { Disk } from '../../src/data/Disk.js'
 import { config, skipBorg } from '../../src/data/Config.js'
 import { backupInstance, restoreApp } from '../../src/monitors/backupMonitor.js'
+import { borgPresence } from '../../src/utils/appDataHelper.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
 
 const INST = 'inst-borg-1' as InstanceID
@@ -80,6 +81,8 @@ let borgLog: string
 const saved = { testMode: config.settings.testMode, skipBorg: config.settings.skipBorg, path: process.env.PATH, log: process.env.FAKE_BORG_LOG }
 
 beforeEach(async () => {
+    // the fake sudo stands in for the helper; pretend /usr/bin/borg exists (borg preflight)
+    borgPresence.exists = () => true
     appDevice = uniqueTestDevice()
     do { backupDevice = uniqueTestDevice() } while (backupDevice === appDevice)
     await fs.ensureDir(`${DISKS_ROOT}/${appDevice}/instances/${INST}`)
@@ -95,6 +98,7 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+    borgPresence.exists = (p) => fs.existsSync(p)
     vi.restoreAllMocks()
     config.settings.testMode = saved.testMode
     config.settings.skipBorg = saved.skipBorg
@@ -170,6 +174,15 @@ describe('backupInstance / restoreApp with testMode on', () => {
         expect(backupOp?.status).toBe('Done')
         expect(await fs.pathExists(`${DISKS_ROOT}/${backupDevice}/backups/${INST}/config`)).toBe(false)
         expect(restoreError).toMatch(/No docked Backup Disk with archives/)
+    })
+
+    it('skipBorg false and no /usr/bin/borg: the backup fails with the preflight message, never calls the helper (no exit 127)', async () => {
+        config.settings.skipBorg = false
+        borgPresence.exists = () => false
+        const { backupOp } = await backupThenRestore()
+        expect(backupOp?.status).toBe('Failed')
+        expect(backupOp?.error).toMatch(/\/usr\/bin\/borg is not installed.*install-root-helpers/)
+        expect((await calls()).filter(c => c.startsWith('borg-'))).toEqual([])
     })
 
     it('skipBorg false: borg init, create and extract all run through the helper (root tokens, real archive name), still in testMode', async () => {

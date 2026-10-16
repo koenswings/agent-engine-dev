@@ -70,16 +70,5 @@ export const logTimeCallback = () => {
 //     }
 // }
 
-let runs = 0
-
-export const generateHeartBeat = (storeHandle) => {
-    runs++
-    storeHandle.change(doc => {
-        const lastRun = (new Date()).getTime() as Timestamp
-        log(`UPDATING ENGINE LASTRUN TO ${lastRun}`)
-        //log(`This is the doc to change: ${deepPrint(doc, 2)}`)
-        const localEngine = getLocalEngine(doc)
-        localEngine.lastRun = lastRun
-        //inspectEngine(store, localEngine)
-    })
-} 
+// The stored heartbeat (lastRun every 30 s) moved to data/Liveness.ts (store-design
+// 2026-10-13): an ephemeral hb every 10 s plus a stored lastRun at boot and hourly.

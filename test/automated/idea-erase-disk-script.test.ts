@@ -94,4 +94,68 @@ describe('idea-erase-disk script (idea#134)', () => {
         // mkfs must not have been invoked
         expect(await fs.pathExists(path.join(bin, 'mkfs.called'))).toBe(false)
     })
+    // #188 idea01 sda1: a partition in the on-disk table that the kernel does not show
+    const SFDISK_DUMP = [
+        'label: gpt', 'device: /dev/sdb', '',
+        '/dev/sdb1 : start=        2048, size=   105498624, type=0FC63DAF, uuid=E38E, name="IDEA-KOLIBRI"',
+        '/dev/sdb2 : start=   105500672, size=   128940943, type=0FC63DAF, uuid=3B75, name="IDEA-ADDFILES"',
+    ].join('\n')
+    const runTable = async (args: string[], kernelParts: string[]) => {
+        const sys = path.join(tmp, 'sys')
+        await fs.ensureDir(path.join(sys, 'sdb'))
+        for (const p of kernelParts) await fs.ensureDir(path.join(sys, 'sdb', p))
+        const stage = path.join(tmp, 'stage-table')
+        await fs.ensureDir(stage)
+        await fs.writeFile(path.join(stage, 'META.yaml'), 'diskId: x\n')
+        const localScript = path.join(tmp, 'idea-erase-disk')
+        let text = await fs.readFile(SCRIPT, 'utf8')
+        text = text.replace(
+            '[[ "$STAGING" =~ ^/home/pi/\\.local/state/idea-engine/erase-staging/[A-Za-z0-9_-]+$ ]]',
+            `[[ "$STAGING" == ${tmp}/* ]]`,
+        )
+        expect(text).toContain(`[[ "$STAGING" == ${tmp}/* ]]`)
+        text = text.replace('SYS_BLOCK=/sys/block', `SYS_BLOCK=${sys}`)
+        for (const tool of ['lsblk', 'findmnt', 'wipefs', 'sfdisk', 'mkfs.ext4', 'udevadm', 'stat']) {
+            text = text.replaceAll(`/usr/bin/${tool}`, path.join(bin, tool))
+            text = text.replaceAll(`/usr/sbin/${tool}`, path.join(bin, tool))
+        }
+        await fs.writeFile(localScript, text)
+        await fs.chmod(localScript, 0o755)
+        await fs.writeFile(path.join(tmp, 'dump.txt'), SFDISK_DUMP + '\n')
+        await writeFake('sfdisk', `if [ "$1" = "-d" ]; then cat ${path.join(tmp, 'dump.txt')}; exit 0; fi; touch ${path.join(bin, 'sfdisk.write')}`)
+        await writeFake('wipefs', `touch ${path.join(bin, 'wipefs.called')}`)
+        await writeFake('stat', 'echo pi')
+        await writeFake('findmnt', 'exit 1')
+        await writeFake('lsblk', 'for a in "$@"; do case "$a" in TYPE) echo disk; exit 0;; SIZE) echo 1000; exit 0;; SERIAL) echo -; exit 0;; esac; done; exit 0')
+        return $({ nothrow: true })`${localScript} ${args.map(a => a === '@STAGE' ? stage : a)}`
+    }
+
+    it('--check-table lists table partitions the kernel does not show, read-only', async () => {
+        const out = await runTable(['--check-table', '/dev/sdb'], ['sdb2'])
+        expect(out.exitCode).toBe(0)
+        expect(out.stdout.trim().split('\n')).toHaveLength(1)
+        expect(out.stdout).toMatch(/^hidden: sdb1 start=.*name="IDEA-KOLIBRI"/)
+        expect(await fs.pathExists(path.join(bin, 'wipefs.called'))).toBe(false)
+        expect(await fs.pathExists(path.join(bin, 'sfdisk.write'))).toBe(false)
+    })
+
+    it('--check-table prints nothing when the kernel shows every partition', async () => {
+        const out = await runTable(['--check-table', '/dev/sdb'], ['sdb1', 'sdb2'])
+        expect(out.exitCode).toBe(0)
+        expect(out.stdout.trim()).toBe('')
+    })
+
+    it('--check-table refuses a partition device', async () => {
+        const out = await runTable(['--check-table', '/dev/sdb1'], [])
+        expect(out.exitCode).not.toBe(0)
+        expect(out.stderr).toMatch(/whole disk/)
+    })
+
+    it('erase refuses before wipefs when the table has a hidden partition', async () => {
+        const out = await runTable(['/dev/sdb', '-', '1000', 'IDEA Disk', '@STAGE'], ['sdb2'])
+        expect(out.exitCode).not.toBe(0)
+        expect(out.stderr).toMatch(/partition table of \/dev\/sdb has partitions the kernel does not show \(sdb1\)/)
+        expect(await fs.pathExists(path.join(bin, 'wipefs.called'))).toBe(false)
+        expect(await fs.pathExists(path.join(bin, 'sfdisk.write'))).toBe(false)
+    })
 })

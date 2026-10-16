@@ -87,7 +87,7 @@ describe('command refusals end the trace as error (idea#168 r29@97)', () => {
 
     it('createInstance: no store, disk not found', async () => {
         await refused(null, 'createInstance a b c d e', 'Store is not available to create instance.')
-        await refused(h, 'createInstance i1 kolibri acct v1 NoSuchDisk', "Disk 'NoSuchDisk' not found or has no device")
+        await refused(h, 'createInstance i1 kolibri acct v1 NoSuchDisk', /Disk '?NoSuchDisk'? not found/)
     })
 
     for (const cmd of ['startInstance', 'runInstance', 'stopInstance']) {

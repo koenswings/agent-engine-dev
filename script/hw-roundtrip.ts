@@ -18,7 +18,16 @@
  *          re-plug → every ext4 partition docked exactly once again, with the same
  *          disk id, META.yaml id kept, one mount by source and target.
  *      Non-ext4 partitions on the stick are checked once: not mounted, no dock.
- *   3. Disk ids per partition (idea#168 D4): the ext4 partitions of the test disk
+ *   3. Optional (--inflight-start <instance>, #179/#180): physical pull-out while an app
+ *      start is in flight. The instance (stored on a test-disk partition) is stopped if
+ *      needed, `startInstance` is sent through the command queue and, while it is still
+ *      in flight, the USB device is unplugged (same sysfs simulation). The pulled
+ *      partition must be undocked at once (≤ 20 s, never the 120 s eject in-flight wait,
+ *      no wait lines in the Engine log), the instance must end and stay 'Undocked'
+ *      (never Running/Error against the gone disk), and after re-plug every ext4
+ *      partition re-docks exactly once and the instance is not Error / stuck Starting.
+ *      Verdict: hw-inflight-pull.ts.
+ *   4. Disk ids per partition (idea#168 D4): the ext4 partitions of the test disk
  *      have pairwise distinct disk ids (start and after every re-plug), and each
  *      id is a fixed point of the Engine's rule (DiskIdentity.resolveHardwareDiskId
  *      with the drive serial from readHardwareId and lsblk PARTUUIDs): re-resolving
@@ -42,6 +51,19 @@
  *     --method <m>          unplug simulation: unbind (default) | authorized
  *     --timeout <s>         per-step timeout in seconds (default 60)
  *     --require-multi-partition  fail unless the disk has ≥2 ext4 partitions and a hardware serial (idea#168 D4)
+ *     --inflight-start <i>  also run case 3 with this instance id or name (must be stored
+ *                           on a test-disk ext4 partition; default: case 3 not run)
+ *     --inflight-disk <d>   case 3 target partition: disk id or name (e.g. duration-empty-003);
+ *                           refuses when the instance is stored elsewhere (default: the
+ *                           instance's own storedOn, which must be on the test disk)
+ *     --eject-wait <s>      max wait for an ejectDisk trace (default 150; > the 120 s in-flight bound)
+ *     --cycles 0            skip the eject cycles (case 3 only, plus the system checks)
+ *
+ * Example (idea04, Kolibri installed on empty-003 = sda2 first; IDs via the flags since
+ * idea04 has no entry in hw-roundtrip-disks.json):
+ *   npx tsx script/hw-roundtrip.ts --cycles 0 --inflight-start kolibri --inflight-disk duration-empty-003 \
+ *     --stick-usb-serial 26A1EE83210C --disk-serial 1642504001002428 --uuid <sda1 uuid> --uuid <sda2 uuid> \
+ *     --refuse-serial AA202000000000002167
  *
  * Root: only the unplug simulation (a write to /sys/bus/usb/...) needs root.
  * It runs as `sudo -n tee <sysfs file>` with the tester's own sudo; it is NOT
@@ -64,6 +86,7 @@ import { fileURLToPath } from 'url'
 import { collectBlockFacts, loadExpectation, resolveStick } from './hw-roundtrip-guard.js'
 import { readHardwareId } from '../src/data/Meta.js'
 import { readPartitionFacts, resolveHardwareDiskId } from '../src/data/DiskIdentity.js'
+import { inflightPullChecks, inflightReplugChecks } from './hw-inflight-pull.js'
 
 $.verbose = false
 
@@ -82,6 +105,12 @@ const CYCLES = parseInt(opt('cycles', '2'), 10)
 const METHOD = opt('method', 'unbind')
 const TIMEOUT_MS = parseInt(opt('timeout', '60'), 10) * 1000
 const REQUIRE_MULTI = argv.includes('--require-multi-partition')
+const INFLIGHT_START = opt('inflight-start', '')
+// #179: ejectDisk waits (bounded, IDEA_EJECT_INFLIGHT_WAIT_MS default 120 s) for an instance start
+// still in flight on the disk, e.g. the app restart after the previous cycle's re-dock. The eject
+// trace wait must outlast that bound, or the test unplugs in the middle of an eject (hw180 run 1).
+const EJECT_TRACE_WAIT_MS = parseInt(opt('eject-wait', '150'), 10) * 1000
+const INFLIGHT_DISK = opt('inflight-disk', '')
 const STICK_CONFIG = path.resolve(opt('stick-config', path.join(ROOT, 'script', 'hw-roundtrip-disks.json')))
 let DEVICE = ''
 
@@ -167,7 +196,7 @@ for (const src of [rootSource, bootSource].filter(s => s.startsWith('/dev/'))) {
 const systemUsb = new Set<string>()
 for (const d of systemDisks) { const u = await usbDevicePath(d); if (u) systemUsb.add(u) }
 
-write(`hw-roundtrip on ${os.hostname()}: engine-dir=${ENGINE_DIR} port=${PORT} log=${ENGINE_LOG} cycles=${CYCLES} method=${METHOD}`)
+write(`hw-roundtrip on ${os.hostname()}: engine-dir=${ENGINE_DIR} port=${PORT} log=${ENGINE_LOG} cycles=${CYCLES} method=${METHOD} inflight-start=${INFLIGHT_START || '(off)'}`)
 info(`system drive: root=${rootSource} boot=${bootSource || '(none)'} disks=${[...systemDisks].join(',')} usb=${[...systemUsb].join(',') || '(not USB)'}`)
 
 const expected = loadExpectation(argv, STICK_CONFIG, os.hostname())
@@ -220,7 +249,7 @@ const waitTrace = async (arg: string, t0: number): Promise<any | null> => {
             && (() => { try { return JSON.parse(t.args).diskId === arg } catch { return false } })()
             && t.status !== 'running' && t.completedAt) ?? null
         return !!found
-    }, 30000)
+    }, EJECT_TRACE_WAIT_MS)
     return found
 }
 
@@ -470,12 +499,97 @@ const roundTrip = async () => {
         const u = udevLines.length ? '' : ' (no udev lines captured)'
         info(`udev events captured this cycle${u}`)
     }
+    return { parts, nonExt4 }
+}
+
+// ── 3. Pull-out while an app start is in flight (#179/#180) ─────────────────
+
+const sendCommand = (cmd: string): number => {
+    const t0 = Date.now()
+    storeHandle.change((doc: any) => { doc.engineDB[ENGINE_ID].commands.push(cmd) })
+    return t0
+}
+const instanceStatus = (id: string): string | null => store().instanceDB?.[id]?.status ?? null
+const runningStartTrace = (instanceId: string, name: string, t0: number): boolean =>
+    (Object.values((logHandle.doc() as any)?.traces ?? {}) as any[]).some(t => t.command === 'startInstance' && t.startedAt >= t0 - 2000
+        && t.status === 'running' && (() => { try { const a = JSON.parse(t.args); return [instanceId, name].includes(a.instanceName ?? a.instanceId) } catch { return false } })())
+
+const inflightPull = async (parts: Part[], nonExt4: { dev: string, fstype: string, uuid: string }[]) => {
+    write(`== in-flight start pull-out (${INFLIGHT_START})`)
+    const inst = (Object.values(store().instanceDB ?? {}) as any[]).find(i => i.id === INFLIGHT_START || i.name === INFLIGHT_START)
+    if (!inst) return abort(`--inflight-start ${INFLIGHT_START}: no such instance in the store`)
+    if (INFLIGHT_DISK) {
+        const want = (disks().find(d => d.id === INFLIGHT_DISK || d.name === INFLIGHT_DISK) as any)?.id
+        if (!want) return abort(`--inflight-disk ${INFLIGHT_DISK}: no such disk in the store`)
+        if (String(inst.storedOn) !== String(want)) return abort(`--inflight-start ${INFLIGHT_START} is stored on ${inst.storedOn}, not on --inflight-disk ${INFLIGHT_DISK} (${want}); put it there first`)
+    }
+    const part = parts.find(p => String(p.diskId) === String(inst.storedOn))
+    if (!part) return abort(`--inflight-start ${INFLIGHT_START}: stored on ${inst.storedOn}, not on a test-disk ext4 partition (${parts.map(p => p.diskId).join(',')})`)
+    info(`instance ${inst.id} '${inst.name}' on ${part.dev} (${part.diskId}), status ${instanceStatus(inst.id)}`)
+    if (instanceStatus(inst.id) !== 'Stopped') {
+        sendCommand(`stopInstance ${inst.id} ${part.diskId}`)
+        check(await waitFor(`${inst.id} Stopped`, async () => instanceStatus(inst.id) === 'Stopped', 120_000), `in-flight: ${inst.id} Stopped before the start`, `status=${instanceStatus(inst.id)}`)
+    }
+    await verifyStick('in-flight, before start')
+    const off = logOffset()
+    startUdev()
+    const t0 = sendCommand(`startInstance ${inst.id} ${part.diskId}`)
+    // Unplug as soon as the start is visibly in flight (status Starting or its trace running)
+    let inFlight = false
+    await waitFor(`startInstance ${inst.id} in flight`, async () => {
+        inFlight = instanceStatus(inst.id) === 'Starting' || runningStartTrace(inst.id, inst.name, t0)
+        return inFlight || instanceStatus(inst.id) === 'Running'
+    }, 30_000)
+    const statusAtUnplug = instanceStatus(inst.id)
+    const startTraceRunningAtUnplug = runningStartTrace(inst.id, inst.name, t0)
+    info(`unplug during start: status=${statusAtUnplug} startTraceRunning=${startTraceRunningAtUnplug} ${Date.now() - t0} ms after startInstance`)
+    const unpluggedAt = Date.now()
+    await unplug()
+    let undockedAt: number | null = null
+    await waitFor(`${part.diskId} undocked after pull-out`, async () => {
+        const r = store().diskDB?.[part.diskId]
+        if (r && r.dockedTo === null && r.device === null) { undockedAt = Date.now(); return true }
+        return false
+    }, 150_000)
+    // Watch the instance for 30 s: the late start must not flip it to Running/Error
+    const statuses: string[] = []
+    const watchEnd = Date.now() + 30_000
+    while (Date.now() < watchEnd) { statuses.push(instanceStatus(inst.id) ?? 'null'); await sleep(1000) }
+    const compact = statuses.filter((s, i) => i === 0 || s !== statuses[i - 1])
+    for (const c of inflightPullChecks({ diskId: String(part.diskId), instanceId: inst.id, statusAtUnplug, startTraceRunningAtUnplug,
+        unpluggedAt, undockedAt, logSinceUnplug: logSince(off), statusesAfterUndock: compact })) check(c.ok, c.what, c.detail)
+    check(udevSaw('remove', part.dev), `in-flight: udev 'remove' for ${part.dev}`)
+    udevLines = []
+    const off2 = logOffset()
+    info(`re-plug: ${METHOD === 'unbind' ? 'bind' : 'authorized=1'} ${usbId}`)
+    await plug()
+    const back = await waitFor('all ext4 partitions back and docked (in-flight case)', async () => {
+        for (const p of parts) {
+            const dev = await deviceByUuid(p.uuid)
+            if (!dev) return false
+            p.dev = dev
+            if (dockedOn(dev).length === 0 || (await mountsBySource(dev)).length === 0) return false
+        }
+        for (const p of nonExt4) { const dev = await deviceByUuid(p.uuid); if (dev) p.dev = dev }
+        return true
+    })
+    check(back, `in-flight: every ext4 partition re-docked after re-plug`)
+    // Let the dock-time reconcile of the instance finish before judging it
+    await waitFor(`${inst.id} settled after re-plug`, async () => !['Starting', 'Undocked'].includes(instanceStatus(inst.id) ?? ''), 120_000)
+    await sleep(3000)
+    stopUdev()
+    const addedLog = logSince(off2)
+    for (const p of parts) if (off2 >= 0) check(addedLog.includes(`A disk on device /dev/engine/${p.dev} has been added`), `in-flight: Engine logged the add of ${p.dev}`)
+    await checkDocked(parts, 'in-flight after re-plug')
+    await checkNonExt4Unmounted(nonExt4, 'in-flight after re-plug')
+    for (const c of inflightReplugChecks(inst.id, instanceStatus(inst.id))) check(c.ok, c.what, c.detail)
 }
 
 try {
     inRun = true
     await systemChecks('before')
-    await roundTrip()
+    const rt = await roundTrip()
+    if (INFLIGHT_START) await inflightPull(rt.parts, rt.nonExt4)
     await systemChecks('after')
 } catch (e) {
     if (!finished) { failures.push(`exception: ${e instanceof Error ? e.message : String(e)}`); write(`ERROR ${e}`) }

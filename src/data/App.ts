@@ -4,7 +4,7 @@ import { log } from '../utils/utils.js';
 import { Store } from './Store.js';
 import { Disk, diskMountRoot } from './Disk.js';
 import { DocHandle } from '@automerge/automerge-repo';
-import { AppFilesMount, parseFilesMount } from './FilesMount.js';
+import { AppFilesMount, AppUsbMount, parseFilesMount, parseUsbMount } from './FilesMount.js';
 
 export interface App {
     id: AppID;
@@ -18,6 +18,8 @@ export interface App {
     author: string | null;
     /** Opt-in to Files Disk mounts (x-app.filesMount); null when the App does not opt in (idea#133). */
     filesMount?: AppFilesMount | null;
+    /** Opt-in to teacher USB sticks (x-app.usbMount, idea#193 §4); null when the App does not opt in. */
+    usbMount?: AppUsbMount | null;
 }
 
 type AppCategory = 'Productivity' | 'Utilities' | 'Games' | 'education' | 'office' | 'it' | string;
@@ -26,16 +28,28 @@ export const createAppId = (appName: AppName, version: Version): AppID => {
     return appName + "-" + version as AppID
 }
 
-export const extractAppName = (appId: AppID): AppName => {
-    // Use lastIndexOf so hyphenated names like 'kolibri-with-plugins-1.0' work correctly.
-    // The convention is: last hyphen separates the name from the version.
-    return appId.slice(0, appId.lastIndexOf('-')) as AppName
+/**
+ * Split an app id '<name>-<version>' (app catalog: repo koenswings/app-<name>,
+ * git tag = <version>). The version starts at the FIRST '-' that is followed by
+ * a numeric version (digits, optionally .digits, then an optional '-', '.' or
+ * '+' suffix), so a version may itself contain '-' and a name may contain '-':
+ *   nextcloud-1.0-31.0.1        -> nextcloud / 1.0-31.0.1
+ *   kolibri-channel-builder-1.0 -> kolibri-channel-builder / 1.0
+ *   kolibri-1.0-duration        -> kolibri / 1.0-duration
+ * Ids without a numeric version (e.g. 'kolibri-latest') fall back to the last '-'.
+ */
+const APP_ID_RE = /^(.+?)-(\d+(?:\.\d+)*(?:[-.+][0-9A-Za-z.+-]*)?)$/
+export const parseAppId = (appId: string): { name: AppName, version: Version } => {
+    const m = APP_ID_RE.exec(appId)
+    if (m) return { name: m[1] as AppName, version: m[2] as Version }
+    const dash = appId.lastIndexOf('-')
+    if (dash <= 0) return { name: appId as AppName, version: '' as Version }
+    return { name: appId.slice(0, dash) as AppName, version: appId.slice(dash + 1) as Version }
 }
 
-export const extractAppVersion = (appId: AppID): Version => {
-    // Use lastIndexOf so hyphenated names like 'kolibri-with-plugins-1.0' work correctly.
-    return appId.slice(appId.lastIndexOf('-') + 1) as Version
-}
+export const extractAppName = (appId: AppID): AppName => parseAppId(appId).name
+
+export const extractAppVersion = (appId: AppID): Version => parseAppId(appId).version
 
 /**
  * Returns the major version number from an appId (e.g. 'sample-1.0' → 1).
@@ -93,6 +107,7 @@ export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: Ap
                     icon: xapp.icon ?? null,
                     author: xapp.author ?? null,
                     filesMount: parseFilesMount(xapp),
+                    usbMount: parseUsbMount(xapp),
                 }
                 // Store the new app object in the store
                 doc.appDB[appId] = app
@@ -109,6 +124,7 @@ export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: Ap
                 app.icon = xapp.icon ?? null
                 app.author = xapp.author ?? null
                 app.filesMount = parseFilesMount(xapp)
+                app.usbMount = parseUsbMount(xapp)
             }
         })
     return app!

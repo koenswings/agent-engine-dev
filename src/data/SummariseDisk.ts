@@ -7,6 +7,7 @@
  * Backups come from BACKUP.yaml + the store, never borg list.
  */
 
+import { parseAppId } from './App.js'
 import path from 'path'
 import { fs, YAML } from 'zx'
 import { DocHandle } from '@automerge/automerge-repo'
@@ -171,9 +172,7 @@ export const summariseDisk = async (
     try {
         const appDirs = await fs.readdir(path.join(root, 'apps'))
         for (const id of appDirs) {
-            const dash = id.lastIndexOf('-')
-            const name = dash > 0 ? id.slice(0, dash) : id
-            const version = dash > 0 ? id.slice(dash + 1) : ''
+            const { name, version } = parseAppId(id)
             const key = `${name}@${version}`
             if (!seenAppKeys.has(key)) {
                 seenAppKeys.add(key)

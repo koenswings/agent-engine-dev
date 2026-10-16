@@ -16,7 +16,7 @@ export interface Settings {
     consolePath: string;
     storeDataFolder: string;
     storeIdentityFolder: string;
-    heartbeatIntervalMs: number;  // How often the engine writes a heartbeat to the store (default: 50000ms)
+    heartbeatIntervalMs: number;  // Peer-access repair + op-archive tick (default 50000 ms); no store write per tick (Liveness.ts)
     systemDiskSkip?: boolean;     // If true, skip registering the Pi boot disk as a system disk (for test harnesses)
     disksRoot?: string;           // Mount root for App Disks (default: /disks). Tests point this at a private temp folder.
     skipImageLoad?: boolean;      // If true, don't load service images from services/*.tar at app start (default: same as testMode). See skipImageLoad().
@@ -27,7 +27,12 @@ export interface Settings {
     dockerAvailable?: boolean;    // Force the Docker-available answer (default: unset → cached `docker info` probe). See utils/dockerAvailable.ts.
     staticPeers?: string;         // Opt-in static peer list 'host[:port],...' (IDEA_STATIC_PEERS wins). See StaticPeers.ts.
     peerAccess?: boolean;         // Per-Pi Engine keys for cross-Engine copy (default: on unless isDev || testMode). See peerAccessEnabled().
+    commandLogArchiveMaxBytes?: number; // Size cap of store-identity/command-log-archive/ in bytes (default 1 GB = 1_000_000_000). Over the cap, the oldest archives are deleted one by one, each logged (#185, Koen 2026-10-15). See commandLogArchiveMaxBytes().
     peerStaleHours?: number;      // A peer Engine without a heartbeat for this long loses its key here (default 168 = 7 days). See peerStaleMs().
+    autoStartChannelBuilder?: boolean; // Start the docked kolibri-channel-builder when a stick with a kolibri folder is mounted (idea#193 §8.2a; default true). See autoStartChannelBuilder().
+    usbRoot?: string;             // Mount root for teacher USB sticks (default /run/idea-usb; IDEA_USB_ROOT wins). Tests point this at a temp folder. See usbRoot().
+    ideaLocalHttpPort?: number;   // Port that http://idea.local is served on, in addition to httpPort (idea#203; default 80). See httpMonitor.ts.
+    ideaLocal?: boolean;          // Publish the shared name idea.local via avahi D-Bus when mdns is on (idea#203; default true). See monitors/ideaLocal.ts.
 }
 
 export interface Defaults {
@@ -129,7 +134,12 @@ function validateSettings(obj: any, path: string): string[] {
     if (obj.skipMetaWrite !== undefined && typeof obj.skipMetaWrite !== 'boolean') errors.push(`'${path}skipMetaWrite' must be a boolean.`);
     if (obj.staticPeers !== undefined && obj.staticPeers !== null && typeof obj.staticPeers !== 'string') errors.push(`'${path}staticPeers' must be a string.`);
     if (obj.peerAccess !== undefined && typeof obj.peerAccess !== 'boolean') errors.push(`'${path}peerAccess' must be a boolean.`);
+    if (obj.commandLogArchiveMaxBytes !== undefined && (typeof obj.commandLogArchiveMaxBytes !== 'number' || !(obj.commandLogArchiveMaxBytes > 0))) errors.push(`'${path}commandLogArchiveMaxBytes' must be a positive number.`);
     if (obj.peerStaleHours !== undefined && (typeof obj.peerStaleHours !== 'number' || !(obj.peerStaleHours > 0))) errors.push(`'${path}peerStaleHours' must be a positive number.`);
+    if (obj.autoStartChannelBuilder !== undefined && typeof obj.autoStartChannelBuilder !== 'boolean') errors.push(`'${path}autoStartChannelBuilder' must be a boolean.`);
+    if (obj.ideaLocalHttpPort !== undefined && (typeof obj.ideaLocalHttpPort !== 'number' || !Number.isInteger(obj.ideaLocalHttpPort) || obj.ideaLocalHttpPort < 1 || obj.ideaLocalHttpPort > 65535)) errors.push(`'${path}ideaLocalHttpPort' must be a port number.`);
+    if (obj.ideaLocal !== undefined && typeof obj.ideaLocal !== 'boolean') errors.push(`'${path}ideaLocal' must be a boolean.`);
+    if (obj.usbRoot !== undefined && typeof obj.usbRoot !== 'string') errors.push(`'${path}usbRoot' must be a string.`);
     return errors;
 }
 
@@ -346,6 +356,13 @@ export const DEFAULT_DISKS_ROOT = '/disks';
  * Production: /disks. Tests: a private temp folder set via IDEA_DISKS_ROOT.
  * Read at call time (not import time) so the env override always applies.
  */
+/** Default mount root for teacher USB sticks (idea#193 §3.2); the only root the sudoers lines allow. */
+export const DEFAULT_USB_ROOT = '/run/idea-usb'
+/** Mount root for teacher USB sticks: IDEA_USB_ROOT, else settings.usbRoot, else /run/idea-usb. */
+export const usbRoot = (): string => process.env.IDEA_USB_ROOT || config.settings.usbRoot || DEFAULT_USB_ROOT
+/** idea#193 §8.2a kill switch: settings.autoStartChannelBuilder (default true). */
+export const autoStartChannelBuilder = (): boolean => config.settings.autoStartChannelBuilder ?? true
+
 export const disksRoot = (): string => config.settings.disksRoot || DEFAULT_DISKS_ROOT;
 
 // Allow IDEA_DOCKER_AVAILABLE=true|false to force whether the Docker-only paths
@@ -389,3 +406,7 @@ export const skipHardwareId = (): boolean => config.settings.skipHardwareId ?? (
  * Separate from skipMetaWrite (the FIRST write on a disk without META.yaml).
  */
 export const skipMetaUpdate = (): boolean => config.settings.skipMetaUpdate ?? (config.settings.isDev || config.settings.testMode);
+
+/** #185: size cap of the CommandLog archive folder (bytes, default 1 GB). No age-based deletion. */
+export const COMMAND_LOG_ARCHIVE_DEFAULT_MAX_BYTES = 1_000_000_000
+export const commandLogArchiveMaxBytes = (): number => config.settings.commandLogArchiveMaxBytes ?? COMMAND_LOG_ARCHIVE_DEFAULT_MAX_BYTES

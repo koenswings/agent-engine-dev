@@ -75,13 +75,28 @@ export const restoredMarkerPath = (paths: StoreIdentityPaths): string =>
  * Startup check of the store identity folder (idea#120):
  *   - store-template.json must exist; it is never created or written here. If it
  *     is missing the Engine stops with a clear error (restore it from git).
- *   - store-url.txt missing → written atomically with FLEET_STORE_URL.
+ *   - store-url.txt missing → startup stops with a clear error (engine#193), unless
+ *     IDEA_ALLOW_STORE_URL_FALLBACK=true: then written atomically with FLEET_STORE_URL.
  *   - store-url.txt present → used as it is, whatever it contains (an isolated
  *     Engine may deliberately use its own store, e.g. idea03); never rewritten.
  *   - fallback: true while store-url.restored (see restoredMarkerPath) names the
  *     URL in use, i.e. the Engine runs on a store URL it restored itself.
  */
-export const prepareStoreIdentity = async (paths: StoreIdentityPaths = storeIdentityPaths()): Promise<{ storeDocId: DocumentId, restored: boolean, fallback: boolean }> => {
+/**
+ * Env flag that lets the Engine write the fleet store URL into a missing
+ * store-url.txt (engine#193). Off by default: without the file the Engine refuses
+ * to start, so a dev/pool Pi that lost its file never silently joins production.
+ */
+export const STORE_URL_FALLBACK_ENV = 'IDEA_ALLOW_STORE_URL_FALLBACK'
+
+export const storeUrlFallbackAllowed = (env: NodeJS.ProcessEnv = process.env): boolean =>
+    env[STORE_URL_FALLBACK_ENV] === 'true' || env[STORE_URL_FALLBACK_ENV] === '1'
+
+export const prepareStoreIdentity = async (
+    paths: StoreIdentityPaths = storeIdentityPaths(),
+    opts: { allowFallback?: boolean } = {},
+): Promise<{ storeDocId: DocumentId, restored: boolean, fallback: boolean }> => {
+    const allowFallback = opts.allowFallback ?? storeUrlFallbackAllowed()
     if (!fs.existsSync(paths.templatePath)) {
         throw new Error(
             `Store template ${paths.templatePath} is missing. Every Engine must start from the shared ` +
@@ -90,6 +105,13 @@ export const prepareStoreIdentity = async (paths: StoreIdentityPaths = storeIden
     }
     let restored = false
     if (!fs.existsSync(paths.urlPath)) {
+        if (!allowFallback) {
+            throw new Error(
+                `Store URL file ${paths.urlPath} is missing: refusing to start (engine#193). ` +
+                `Without it the Engine would join the fleet store ${FLEET_STORE_URL}. Restore the file ` +
+                `(e.g. 'git checkout -- store-identity/store-url.txt', or the pool's store URL), or set ` +
+                `${STORE_URL_FALLBACK_ENV}=true to write the fleet store URL deliberately.`)
+        }
         log(`Store URL file ${paths.urlPath} not found. Writing the fleet store URL ${FLEET_STORE_URL}.`)
         await writeFileAtomic(paths.urlPath, FLEET_STORE_URL)
         await fs.remove(restoredMarkerPath(paths))
