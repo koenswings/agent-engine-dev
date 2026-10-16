@@ -122,6 +122,12 @@ describe('installApp --name / --fresh (Kid, idea#235)', () => {
             await fs.remove(srcRoot()); await fs.remove(tgtRoot())
             await fs.ensureDir(`${srcRoot()}/apps/${APP}`)
             await fs.writeFile(`${srcRoot()}/apps/${APP}/compose.yaml`, COMPOSE)
+            await fs.writeFile(`${srcRoot()}/apps/${APP}/idea-files-entrypoint.sh`, '#!/bin/sh\n')
+            await fs.writeFile(`${srcRoot()}/apps/${APP}/usb-sync.sh`, '#!/bin/sh\n')
+            await fs.ensureDir(`${srcRoot()}/apps/${APP}/docker-entrypoint-hooks.d/post-installation`)
+            await fs.writeFile(`${srcRoot()}/apps/${APP}/docker-entrypoint-hooks.d/post-installation/10-x.sh`, 'echo\n')
+            await fs.ensureDir(`${srcRoot()}/apps/${APP}/bundled-apps/files_usb`)
+            await fs.writeFile(`${srcRoot()}/apps/${APP}/bundled-apps/files_usb/info.xml`, '<info/>')
             await fs.ensureDir(`${srcRoot()}/instances/${ORIG}/data/kolibri`)
             await fs.writeFile(`${srcRoot()}/instances/${ORIG}/data/kolibri/db.sqlite3`, 'school-data')
             await fs.writeFile(`${srcRoot()}/instances/${ORIG}/compose.yaml`, COMPOSE)
@@ -148,11 +154,13 @@ describe('installApp --name / --fresh (Kid, idea#235)', () => {
             expect(rec.id).toBe(id)
         })
 
-        it('--fresh copies no source instance data', async () => {
+        it('--fresh copies the whole app bundle (entrypoints, hooks, bundled apps) and no source instance data', async () => {
             await installAppFromDisk(h, APP, h.doc().diskDB[SRC] as any, h.doc().diskDB[TGT] as any, 'Kolibri Demo' as any, { fresh: true })
             const [id] = await newInstanceIds()
-            expect((await fs.readdir(`${tgtRoot()}/instances/${id}`)).sort()).toEqual(['compose.yaml'])
+            expect((await fs.readdir(`${tgtRoot()}/instances/${id}`)).sort()).toEqual(
+                ['bundled-apps', 'compose.yaml', 'docker-entrypoint-hooks.d', 'idea-files-entrypoint.sh', 'usb-sync.sh'])
             expect(await fs.pathExists(`${tgtRoot()}/instances/${id}/data`)).toBe(false)
+            expect(await fs.pathExists(`${tgtRoot()}/instances/${id}/.env`)).toBe(false)
         })
 
         it('without --fresh the source instance data is still copied (unchanged behaviour), with the new name', async () => {
