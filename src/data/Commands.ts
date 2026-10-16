@@ -14,7 +14,7 @@ $.verbose = false;
 import { DocHandle, Repo } from "@automerge/automerge-repo";
 import { config } from "./Config.js";
 import { readStoreDocId } from "./StoreIdentity.js";
-import { generateHostName } from "../utils/nameGenerator.js";
+import { realStickerNameDeps, resolveStickerName } from "../install/stickerName.js";
 import pack from '../../package.json' with { type: "json" };
 import { sendCommand } from "../utils/commandUtils.js";
 import { installApp } from './InstallApp.js';
@@ -107,7 +107,7 @@ const buildEngineWrapper = async (storeHandle: DocHandle<Store> | null, argsStri
         isLocalMode: false,
         machine: machine,
         user: user,
-        hostname: parsedArgs.hostname || generateHostName(),
+        hostname: '' as string, // resolved after the sync, see below
         language: parsedArgs.language || defaults.language,
         keyboard: parsedArgs.keyboard || defaults.keyboard,
         timezone: parsedArgs.timezone || defaults.timezone,
@@ -123,6 +123,10 @@ const buildEngineWrapper = async (storeHandle: DocHandle<Store> | null, argsStri
     };
     try {
         await syncEngine(user, machine);
+        // idea#184: same checked resolution as script/build-engine.ts (explicit,
+        // else persisted, else a name free on LAN, store and tailnet), run on the
+        // target Pi once it is reachable.
+        buildArgs.hostname = (await resolveStickerName(parsedArgs.hostname, realStickerNameDeps(exec))).name;
         await buildEngine(buildArgs);
         print(chalk.green('buildEngine command finished successfully.'));
     } catch (e: any) {
@@ -207,8 +211,9 @@ const createInstanceWrapper = async (storeHandle: DocHandle<Store> | null, insta
     console.warn(chalk.yellow('createInstance is deprecated — use installApp instead'))
     const store = storeHandle?.doc()
     if (!store) throw new Error("Store is not available to create instance.")
-    const disk = findDiskByName(store, diskName)
-    if (!disk || !disk.device) throw new Error(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`)
+    // Disk by id (preferred) or unique name; a name with spaces must be quoted ("System Disk")
+    const disk = resolveDiskArg(store, localEngineId as any, String(diskName), 'createInstance')
+    if (!disk.device) throw new Error(`Disk '${diskName}' has no device on engine ${localEngineId}`)
     await buildInstance(instanceName, appName, gitAccount, gitTag as Version, disk.device)
 }
 

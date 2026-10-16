@@ -1,6 +1,7 @@
 /**
  * engine-lan-address.test.ts: Engine.lanAddress (agent-console-dev#138).
- * The Engine publishes its LAN IPv4 in the store at start and on every heartbeat,
+ * The Engine publishes its LAN IPv4 in the store at start and on every liveness beat
+ * (Liveness.ts, 10 s; written only when it changed),
  * so the Console can open apps without mDNS.
  *
  * LanAddress.ts is loaded with a dynamic import (path built at run time), so this
@@ -10,7 +11,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { Repo, DocHandle } from '@automerge/automerge-repo'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
-import { generateHeartBeat } from '../../src/monitors/timeMonitor.js'
+import { writeLanAddress } from '../../src/data/Liveness.js'
 
 const modPath = '../../src/data/' + 'LanAddress.js'
 let M: any
@@ -94,24 +95,23 @@ describe('Engine.lanAddress in the store', () => {
 
     it('heartbeat: updated when the IP changes (DHCP), not written when unchanged', async () => {
         setHost({ ...lo, eth0: [v4('192.168.0.139')] }, routes(['eth0', 100]))
-        generateHeartBeat(handle)
+        writeLanAddress(handle, localEngineId)
         expect(lan()).toBe('192.168.0.139')
 
         const touched: string[][] = []
         const onChange = ({ patches }: any) => { for (const p of patches) touched.push(p.path.map(String)) }
         handle.on('change', onChange)
         try {
-            generateHeartBeat(handle)       // same address
-            expect(touched.some(p => p.includes('lastRun')), 'heartbeat ran').toBe(true)
+            writeLanAddress(handle, localEngineId)       // same address
             expect(touched.filter(p => p.includes('lanAddress')), 'no lanAddress write when unchanged').toEqual([])
 
             setHost({ ...lo, eth0: [v4('192.168.0.177')] }, routes(['eth0', 100]))   // DHCP gave a new lease
-            generateHeartBeat(handle)
+            writeLanAddress(handle, localEngineId)
             expect(lan()).toBe('192.168.0.177')
             expect(touched.some(p => p.includes('lanAddress'))).toBe(true)
 
             setHost({ ...lo, ...noise }, '')   // cable out, Wi-Fi off
-            generateHeartBeat(handle)
+            writeLanAddress(handle, localEngineId)
             expect(lan()).toBeNull()
         } finally {
             handle.off('change', onChange)

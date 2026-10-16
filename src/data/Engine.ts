@@ -2,7 +2,7 @@ import { $, chalk, os, YAML, fs, path, sleep } from 'zx';
 
 $.verbose = false;
 import { deepPrint, log, uuid, print } from '../utils/utils.js';
-import { APP_DATA_HELPER } from '../utils/appDataHelper.js';
+import { APP_DATA_HELPER, APP_DATA_HELPER_VERSION, BORG_PATH } from '../utils/appDataHelper.js';
 import { PEER_GATE, PEER_AUTHORIZED_KEYS, PEER_KNOWN_HOSTS } from '../utils/peerSsh.js';
 import { readMetaUpdateId, DiskMeta, addMeta, readRemoteDiskId } from './Meta.js';
 import { Version, Command, Hostname, Timestamp, DiskID, EngineID } from './CommonTypes.js';
@@ -28,6 +28,12 @@ export interface Engine {
   eraseInProgress?: EraseInProgress | null;
   /** Whole non-system disks without ext4 (idea#134); rebuilt on dock/undock and at startup */
   unformattedDisks?: UnformattedDiskPublic[];
+  /**
+   * Teacher USB sticks (FAT/exFAT) mounted read-only under /run/idea-usb on this
+   * Engine (idea#193 §3.3). Not IDEA disks: no diskDB entry, no roles. Written only
+   * by this Engine, whole-list replace on plug/unplug; emptied at startup.
+   */
+  usbSticks?: UsbStickPublic[];
   /**
    * This Engine's own ssh key and host key for Engine-to-Engine copies (per-Pi
    * Engine keys, data/PeerAccess.ts). Written by this Engine only, at every start
@@ -60,6 +66,40 @@ export interface PeerAccess {
   authorized: string[];
 }
 
+/** Engine.usbSticks entry (idea#193 §3.3, §8.2a) */
+export interface UsbStickPublic {
+  /** 'usb-' + filesystem UUID (FAT/exFAT serial), stable per stick */
+  stickId: string
+  /** Partition or whole-disk device, e.g. sdb1 (or sdb for a stick without a partition table) */
+  device: string
+  /** Filesystem label, else the drive model, else 'USB stick' */
+  label: string
+  /** 'USB: <label>', unique on this Engine (' (2)' on a clash) */
+  displayName: string
+  fsType: 'vfat' | 'exfat'
+  sizeBytes: number
+  usedBytes: number
+  mountedAt: Timestamp
+  readOnly: true
+  /** The stick has a top-level folder named kolibri (any case): auto-build source (§8) */
+  hasKolibriFolder: boolean
+  /**
+   * What the Engine did about the channel builder for this stick (§8.2a), for the
+   * Console hint. null when the stick has no kolibri folder.
+   */
+  builderAutoStart: ChannelBuilderAutoStartResult | null
+}
+
+/**
+ * started: the Engine started the docked builder; alreadyRunning: it was Running or
+ * Starting; noBuilder: no kolibri-channel-builder instance docked on this Engine;
+ * operatorStopped: Stopped / Pauzed / an operator stop in force; disabled: setting
+ * autoStartChannelBuilder is false; busy: another operation holds the instance;
+ * failed: the start was tried and failed; notStartable: any other status.
+ */
+export type ChannelBuilderAutoStartResult =
+  'started' | 'alreadyRunning' | 'noBuilder' | 'operatorStopped' | 'disabled' | 'busy' | 'failed' | 'notStartable'
+
 export interface UnformattedDiskPublic {
   candidateId: string
   device: string
@@ -87,13 +127,15 @@ export interface EraseInProgress {
  *   instanceIdArgs: startInstance, runInstance, stopInstance, copyApp, moveApp,
  *               backupApp and restoreApp take an instance id (idea#168); a name
  *               still works when it is unambiguous.
+ *   unknownDiskReadOnly: a disk without IDEA META.yaml is never mounted read-write
+ *               and never gets a META.yaml (idea#201 §10 rule 1).
  * Written at every startup as a whole new list, with capabilitiesBootedAt set
  * to that startup's lastBooted. A Console counts a capability only when
  * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly']
 
 import { config } from './Config.js';
 
@@ -134,6 +176,7 @@ export const initialiseLocalEngine = async (): Promise<Engine> => {
       eraseInProgress: null,
       unformattedDisks: [],
       lanAddress: currentLanAddress(),
+      usbSticks: [],
     }
     return localEngine
   } catch (e) {
@@ -165,6 +208,8 @@ export const createOrUpdateEngine = async (storeHandle: DocHandle<Store>, engine
         engine.capabilities = [...ENGINE_CAPABILITIES]
         engine.capabilitiesBootedAt = booted
         if (engine.unformattedDisks === undefined) engine.unformattedDisks = []
+        // Sticks are re-mounted by the watcher's initial add events (idea#193 §3.4)
+        if (engine.usbSticks === undefined || engine.usbSticks.length > 0) engine.usbSticks = []
         if (engine.eraseInProgress === undefined) engine.eraseInProgress = null
         if (engine.lanAddress !== newEngine.lanAddress) engine.lanAddress = newEngine.lanAddress ?? null
       }
@@ -298,7 +343,7 @@ export const buildEngine = async (args: any) => {
   if (upgrade) await upgradeSystem(exec);
 
   await setHostname(exec, hostname);
-  await installAvahi(exec);
+  await installAvahi(exec, enginePath);
   await localiseSystem(exec, enginePath, language, keyboard, timezone);
   await installCrontabs(exec, enginePath);
 
@@ -494,12 +539,21 @@ export const setHostname = async (exec: any, hostname: string) => {
   print(hostname); // Print hostname for capture
 }
 
-export const installAvahi = async (exec: any) => {
+/** Installed copy of script/build_image_assets/idea-avahi-lan-only (idea#203). */
+export const AVAHI_LAN_ONLY_HELPER = '/usr/local/sbin/idea-avahi-lan-only'
+export const AVAHI_CONF = '/etc/avahi/avahi-daemon.conf'
+
+export const installAvahi = async (exec: any, enginePath: string) => {
   print(chalk.blue('Installing Avahi for .local mDNS discovery...'));
   try {
-    await exec`sudo apt install avahi-daemon libnss-mdns -y`;
+    await exec`sudo apt install avahi-daemon avahi-utils libnss-mdns -y`;
+    // LAN only (idea#203): allow-interfaces=eth0,wlan0 under [server], so <host>.local
+    // never resolves to a docker bridge (idea03.local -> 172.21.0.1). Idempotent; the
+    // helper backs the conf up to avahi-daemon.conf.idea-bak-<UTC> before any change.
+    await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-avahi-lan-only ${AVAHI_LAN_ONLY_HELPER}`;
+    await exec`sudo ${AVAHI_LAN_ONLY_HELPER} ${AVAHI_CONF}`;
     await exec`sudo systemctl enable avahi-daemon`;
-    await exec`sudo systemctl start avahi-daemon`;
+    await exec`sudo systemctl restart avahi-daemon`;
   } catch (e) {
     print(chalk.red('Error installing Avahi'));
     console.error(e);
@@ -552,20 +606,9 @@ export const installUdev = async (exec: any, enginePath: string) => {
   try {
     await exec`sudo apt install udev -y`;
     await copyAsset(exec, enginePath, '90-docking.rules', '/etc/udev/rules.d')
-    await installEngineSudoers(exec, enginePath)
-    // idea-erase-disk: root-owned COPY in /usr/local/sbin (never a symlink) (idea#134)
-    print(chalk.blue('  - Installing idea-erase-disk...'))
-    await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-erase-disk /usr/local/sbin/idea-erase-disk`
-    print(chalk.green('  - /usr/local/sbin/idea-erase-disk installed'))
-    // idea-app-data: the app-data root helper (idea#168), same rules: root-owned COPY,
-    // 0755, in /usr/local/sbin; its sudoers line is in 11-engine-files (visudo -cf above).
-    // It runs rsync/rrsync, borg, runuser and ssh by absolute path.
-    print(chalk.blue('  - Installing idea-app-data...'))
-    await exec`sudo apt install rsync borgbackup -y`
-    await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-app-data ${APP_DATA_HELPER}`
-    print(chalk.green(`  - ${APP_DATA_HELPER} installed`))
-    // Per-Pi Engine keys: the forced command for peer keys and the sshd drop-in
-    await installPeerAccess(exec, enginePath)
+    // Root helpers, their packages (rsync, borgbackup), sudoers and peer access.
+    // Same function as ./install-root-helpers, which every Engine update runs too.
+    await installRootHelpers(exec, enginePath)
     await createDir(exec, '/disks', "0755", "0:0")
 
     // Configure /dev/engine ownership so the pi user can write sentinel files.
@@ -594,6 +637,78 @@ EOF`
     process.exit(1);
   }
   print(chalk.green('Udev and udev rules installed'));
+}
+
+/**
+ * Debian packages the root helpers run by absolute path: idea-app-data uses
+ * /usr/bin/rsync (+ rrsync) and /usr/bin/borg (backup/restore). Before this list
+ * existed borgbackup was only in script/install.sh and the installUdev step, so a
+ * Pi that got the helper any other way (by hand, idea#168) had no borg (wh, idea02).
+ */
+export const ROOT_HELPER_PACKAGES = ['rsync', 'borgbackup']
+
+/** Installs the packages in `pkgs` that dpkg does not report as installed; idempotent. */
+export const ensureAptPackages = async (exec: any, pkgs: string[]): Promise<string[]> => {
+  const missing: string[] = []
+  for (const pkg of pkgs) {
+    let status = ''
+    try {
+      status = String((await exec`dpkg-query -W -f=${'${Status}'} ${pkg}`)?.stdout ?? '')
+    } catch { status = '' }
+    if (!/install ok installed/.test(status)) missing.push(pkg)
+  }
+  if (missing.length === 0) {
+    print(chalk.green(`  - packages already installed: ${pkgs.join(' ')}`))
+    return missing
+  }
+  print(chalk.blue(`  - installing missing packages: ${missing.join(' ')}`))
+  await exec`sudo apt-get update -y`
+  await exec`sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ${missing}`
+  return missing
+}
+
+/**
+ * Everything root-owned the Engine needs at run time, safe to run again on every
+ * install AND every update (build-engine installUdev, ./install-root-helpers,
+ * sync-engine): rsync + borgbackup, the sudoers files, /usr/local/sbin/idea-erase-disk,
+ * /usr/local/sbin/idea-app-data and the peer-access parts. `install` overwrites
+ * the helpers with the checkout's copies, so an outdated helper is upgraded.
+ * Ends by checking /usr/bin/borg and `idea-app-data version`; throws if either is wrong.
+ */
+/** tmpfiles.d entry that creates /run/idea-usb at boot (idea#193). */
+export const USB_TMPFILES_CONF = '/etc/tmpfiles.d/idea-usb.conf'
+
+export const installRootHelpers = async (exec: any, enginePath: string) => {
+  print(chalk.blue('  - Installing root helper packages...'))
+  await ensureAptPackages(exec, ROOT_HELPER_PACKAGES)
+  await installEngineSudoers(exec, enginePath)
+  // idea-erase-disk: root-owned COPY in /usr/local/sbin (never a symlink) (idea#134)
+  print(chalk.blue('  - Installing idea-erase-disk...'))
+  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-erase-disk /usr/local/sbin/idea-erase-disk`
+  print(chalk.green('  - /usr/local/sbin/idea-erase-disk installed'))
+  // idea-app-data: the app-data root helper (idea#168), same rules: root-owned COPY,
+  // 0755, in /usr/local/sbin; its sudoers line is in 11-engine-files (visudo -cf above).
+  // It runs rsync/rrsync, borg, runuser and ssh by absolute path.
+  print(chalk.blue('  - Installing idea-app-data...'))
+  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-app-data ${APP_DATA_HELPER}`
+  print(chalk.green(`  - ${APP_DATA_HELPER} installed`))
+  // Teacher USB sticks (idea#193): /run/idea-usb (pi:pi 0755) at every boot via tmpfiles.d
+  print(chalk.blue('  - Installing /etc/tmpfiles.d/idea-usb.conf...'))
+  await exec`sudo install -o root -g root -m 0644 ${enginePath}/script/build_image_assets/idea-usb.tmpfiles.conf ${USB_TMPFILES_CONF}`
+  await exec`sudo systemd-tmpfiles --create ${USB_TMPFILES_CONF}`
+  // Per-Pi Engine keys: the forced command for peer keys and the sshd drop-in
+  await installPeerAccess(exec, enginePath)
+  // Verify, so a broken install stops here and not at the first backup (exit 127)
+  try {
+    await exec`test -x ${BORG_PATH}`
+  } catch {
+    throw new Error(`${BORG_PATH} is still missing after installing borgbackup`)
+  }
+  const got = String((await exec`sudo -n ${APP_DATA_HELPER} version`)?.stdout ?? '').trim()
+  if (got !== `idea-app-data ${APP_DATA_HELPER_VERSION}`) {
+    throw new Error(`${APP_DATA_HELPER} reports '${got}' after install, expected 'idea-app-data ${APP_DATA_HELPER_VERSION}'`)
+  }
+  print(chalk.green(`  - root helpers OK: ${BORG_PATH}, ${got}`))
 }
 
 /** The sshd drop-in that adds the root-owned peer key file (per-Pi Engine keys). */

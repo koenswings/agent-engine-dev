@@ -79,6 +79,9 @@ export type OperationKind =
  * backup-app-docked — backup monitor triggers backup when App Disk docks while Backup
  *                     Disk is already present
  *                     (backupMonitor.ts: checkPendingBackups app-disk-docked branch)
+ * usb-stick         — a FAT/exFAT stick with a top-level kolibri folder was mounted;
+ *                     the Engine starts the docked channel builder (idea#193 §8.2a,
+ *                     ChannelBuilderAutoStart.ts). Not an operator cause.
  * crash-recovery    — engine restarted with a Pending/Running operation in the store;
  *                     recoverInterruptedOperations() re-queues idempotent ops
  *                     (Operations.ts + start.ts)
@@ -96,6 +99,7 @@ export type OperationCause =
   | 'backup-stale-lock'
   | 'backup-app-docked'
   | 'crash-recovery'
+  | 'usb-stick'
 
 export interface OperationSubject {
   type: 'instance' | 'disk' | 'engine'

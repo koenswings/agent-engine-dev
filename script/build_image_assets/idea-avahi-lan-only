@@ -1,0 +1,43 @@
+#!/bin/bash
+# idea-avahi-lan-only — make avahi-daemon announce and answer on the LAN only (idea#203).
+#
+# Without allow-interfaces, avahi also publishes on docker0 / br-* / veth*, so
+# <host>.local can resolve to a docker bridge address (idea03.local -> 172.21.0.1).
+# This sets, under [server] of the avahi config:
+#     allow-interfaces=eth0,wlan0
+# Idempotent: when the line is already exactly that, nothing is written.
+# Before any change the old file is copied to <conf>.idea-bak-<UTC timestamp>.
+# Does not restart avahi; the caller does (systemctl restart avahi-daemon).
+#
+# Usage: idea-avahi-lan-only [conf]   (default /etc/avahi/avahi-daemon.conf)
+#        IDEA_AVAHI_INTERFACES overrides the list (default eth0,wlan0).
+# Prints "unchanged" or "changed backup=<path>". Exit 1 on error.
+set -euo pipefail
+CONF="${1:-/etc/avahi/avahi-daemon.conf}"
+IFACES="${IDEA_AVAHI_INTERFACES:-eth0,wlan0}"
+[[ "$IFACES" =~ ^[A-Za-z0-9_.,-]+$ ]] || { echo "invalid interface list: $IFACES" >&2; exit 1; }
+[ -f "$CONF" ] || { echo "no such file: $CONF" >&2; exit 1; }
+
+current=$(awk '
+  /^[[:space:]]*\[/ { sec=$0; gsub(/[[:space:]]/,"",sec) }
+  sec=="[server]" && /^[[:space:]]*allow-interfaces[[:space:]]*=/ { v=$0; sub(/^[^=]*=[[:space:]]*/,"",v); sub(/[[:space:]]*$/,"",v); print v }
+' "$CONF")
+if [ "$current" = "$IFACES" ]; then echo "unchanged"; exit 0; fi
+
+BACKUP="$CONF.idea-bak-$(date -u +%Y%m%dT%H%M%SZ)"
+cp -p "$CONF" "$BACKUP"
+TMP=$(mktemp "$CONF.XXXXXX")
+trap 'rm -f "$TMP"' EXIT
+# In [server]: drop every allow-interfaces line (set or commented out) and write ours
+# right after the section header. No [server] section: append one.
+awk -v line="allow-interfaces=$IFACES" '
+  /^[[:space:]]*\[/ { sec=$0; gsub(/[[:space:]]/,"",sec); print; if (sec=="[server]") { print line; done=1 } ; next }
+  sec=="[server]" && /^[[:space:]]*#?[[:space:]]*allow-interfaces[[:space:]]*=/ { next }
+  { print }
+  END { if (!done) { print ""; print "[server]"; print line } }
+' "$CONF" > "$TMP"
+chmod --reference="$CONF" "$TMP"
+chown --reference="$CONF" "$TMP" 2>/dev/null || true
+mv "$TMP" "$CONF"
+trap - EXIT
+echo "changed backup=$BACKUP"

@@ -1,0 +1,5 @@
+#!/bin/sh
+# Installs or upgrades the Engine's root-owned parts (borgbackup, rsync, sudoers,
+# idea-erase-disk, idea-app-data, peer access). Idempotent: run it after EVERY
+# Engine update, not only at first install. Needs passwordless sudo.
+./node_modules/.bin/tsx script/install-root-helpers.ts "$@"

@@ -20,7 +20,7 @@ import { $, YAML, chalk, fs } from 'zx'
 import { log, print } from '../utils/utils.js'
 import { disksRoot, skipBorg } from '../data/Config.js'
 import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot, appDataRoot } from '../data/Disk.js'
-import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs } from '../utils/appDataHelper.js'
+import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgProblem } from '../utils/appDataHelper.js'
 import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { createOperation, updateOperation } from '../data/Operations.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
@@ -162,6 +162,12 @@ export const backupInstance = async (
         }
 
         log(`Starting backup of instance ${instanceId} from ${appDevice} to ${backupDevice}`)
+
+        // 0. Preflight: no borg means exit 127 from the helper; say so plainly instead
+        if (!skipBorg()) {
+            const borgMissing = borgProblem()
+            if (borgMissing) throw new Error(borgMissing)
+        }
 
         // 1. Init Borg repo if this is the first backup
         setBackupStep(0, BACKUP_STEPS[0])
@@ -453,6 +459,10 @@ export const latestArchiveFromInfo = (infoJson: string, instanceId: string): { n
  * Roots are app-data helper root tokens. The runner is injectable for tests.
  */
 export const extractLatestArchive = async (backupRoot: string, instanceId: string, targetRoot: string, run: AppDataRunner = runAppData): Promise<string> => {
+    if (run === runAppData) {
+        const borgMissing = borgProblem()
+        if (borgMissing) throw new Error(borgMissing)
+    }
     const { name, stripComponents } = latestArchiveFromInfo(await run(borgInfoArgs(backupRoot, instanceId)), instanceId)
     log(`Extracting archive ${name} (--strip-components ${stripComponents}) onto ${targetRoot} instances/${instanceId}`)
     await run(borgExtractArgs(backupRoot, instanceId, name, stripComponents, targetRoot))

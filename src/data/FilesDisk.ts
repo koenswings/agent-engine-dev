@@ -106,7 +106,16 @@ export const processFilesDisk = async (storeHandle: DocHandle<Store>, diskId: Di
     }
     storeHandle.change(doc => {
         const d = doc.diskDB[diskId]
-        if (d) d.filesConfig = filesConfig
+        if (!d) return
+        d.filesConfig = filesConfig
+        // Mark the Files role now, not only when processDisk finishes. processDisk
+        // writes diskTypes after the App role, which can take a long time (apps and
+        // instances). Until then the record had diskTypes [] (reset on dock), so
+        // mountableFilesDisks() skipped this disk: a Files remount set off by another
+        // disk docking at the same time, or an instance on this disk starting, built
+        // its override without this disk's files/ (startup remount race, 2026-10-15).
+        if (!d.diskTypes) d.diskTypes = ['files']
+        else if (!d.diskTypes.includes('files')) d.diskTypes.push('files')
     })
     if (filesConfig.passwordProtected) {
         log(`Files Disk ${diskId}: ${FILES_PASSWORD_ERROR}; not mounted`)

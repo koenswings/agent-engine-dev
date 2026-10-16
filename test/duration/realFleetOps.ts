@@ -17,8 +17,18 @@
  * remoteClient cache.
  */
 
+import { sshRetryPolicy, withSshRetry } from './sshRetry.js'
 import { Repo, type DocHandle, type DocumentId, type PeerId } from '@automerge/automerge-repo'
 import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websocket'
+import { type ChildProcess } from 'node:child_process'
+import { existsSync, unlinkSync } from 'node:fs'
+import { runProcess } from './procRun.js'
+import { instanceStoredOn } from './fixtureDisks.js'
+import { GATE_TOKEN, gateSecs, sshMutate, type GatedResult, type MutateResult, type MutateSpec } from './sshMutate.js'
+import { headsKey, recordReconnect, staleViewMs } from './staleView.js'
+import { CommandLogReader } from './commandLogReader.js'
+import { StoreDocLink } from './storeDocLink.js'
+import type { ThreadMem } from './verdict.js'
 import { $ } from 'zx'
 import type { Store } from '../../src/data/Store.js'
 import { runningInstanceExpectsLocalDocker } from './stability.js'
@@ -51,8 +61,10 @@ import {
     reportEngineUnreachable,
     reportOwnStoreStall,
     trackRepo,
+    trackWorkerLink,
 } from './automergeTimeoutGuard.js'
 import type {
+    DiskInstanceRow,
     FleetOps,
     SemanticStoreView,
     SettleReady,
@@ -105,13 +117,28 @@ export const DEFAULT_PREFLIGHT_TIMEOUT_MS = 60_000
  */
 export const MIN_DOC_WAIT_MS = 15_000
 export const DEFAULT_DOC_WAIT_MS = 15_000
-export const DEFAULT_DOC_WAIT_MS_BY_HOST: Readonly<Record<string, number>> = { idea04: 30_000 } // Pi 4
+/**
+ * r86b FAIL (pre-step-1 idea04 sync stall): idea04 is the only Pi 4, and each new client's first full
+ * 3zoqd sync runs on its main thread (~4.7 s extra per concurrent client, 14.9 s blocked with 3; 11.2 MB
+ * in 2,032 unmerged update files, Atlas r86b-idea04-stall). Its store-ready wait is 120 s. Still fail-loud
+ * (StoreSyncStallError) after that.
+ */
+export const IDEA04_DOC_WAIT_MS = 120_000
+export const DEFAULT_DOC_WAIT_MS_BY_HOST: Readonly<Record<string, number>> = { idea04: IDEA04_DOC_WAIT_MS } // Pi 4
 /**
  * Upper bound for env doc waits: automerge-repo's DocSynchronizer arms a bare 60 s
  * whenReady() on the connecting Repo's handle; a connect attempt (handshake + doc wait)
  * must conclude (ready, or closed and judged) before that timer fires.
  */
 export const MAX_DOC_WAIT_MS = 45_000
+/** Per-host caps above MAX_DOC_WAIT_MS (r86b: idea04 Pi 4 first sync). A timed-out handle answers doc-unavailable and openConn reopens until the deadline. */
+export const MAX_DOC_WAIT_MS_BY_HOST: Readonly<Record<string, number>> = { idea04: IDEA04_DOC_WAIT_MS }
+/** r86b: gap between the walk-start store connects (one Pi at a time). DURATION_CONNECT_STAGGER_MS overrides. */
+export const DEFAULT_CONNECT_STAGGER_MS = 3_000
+export const connectStaggerMs = (env: NodeJS.ProcessEnv = process.env): number => {
+    const raw = env.DURATION_CONNECT_STAGGER_MS?.trim()
+    return raw && /^\d+$/.test(raw) ? Number(raw) : DEFAULT_CONNECT_STAGGER_MS
+}
 
 /** Thrown when the WS is up but the store doc never became ready within the per-host wait. */
 export class StoreSyncStallError extends Error {
@@ -175,33 +202,64 @@ export const PROTECTED_DISK_MARKERS = [
 
 const PROTECTED_LABELS = ['IDEA Disk'] as const
 
-const SYSTEMISH_DISK_MARKERS = ['root', 'system', 'mmcblk0', 'nvme0n1', 'sda1'] as const
+/**
+ * System-disk facts (r59 FAIL@60): decided from what a disk IS — its mount, FS label or store name —
+ * never from its kernel name. Stage 2 fixtures are real partitions (idea01 Kolibri = sda1, idea04
+ * empty-002 = sda1) and the root disk is sdb2 on idea01 but sda2 on idea03, so 'sda1' says nothing.
+ */
+const SYSTEM_MOUNTPOINTS = ['/', '/boot', '/boot/firmware'] as const
+const SYSTEM_FS_LABELS = ['rootfs', 'bootfs'] as const
+const SYSTEM_DISK_NAMES = ['System Disk'] as const
 
-export const looksLikeProtectedHwDisk = (diskIdOrName: string, extra?: {
+export interface ProtectedDiskFacts {
     name?: string | null
     label?: string | null
     device?: string | null
-}): boolean => {
-    const hay = [
-        diskIdOrName,
-        extra?.name ?? '',
-        extra?.label ?? '',
-        extra?.device ?? '',
-    ].join(' ').toUpperCase()
-    for (const m of PROTECTED_DISK_MARKERS) {
-        if (hay.includes(m.toUpperCase())) return true
-    }
-    for (const lab of PROTECTED_LABELS) {
-        // Exact-ish label match (avoid matching "duration-…-IDEA…" synthetic ids)
-        const name = (extra?.name ?? diskIdOrName).trim()
-        if (name === lab || (extra?.label ?? '').trim() === lab) return true
-    }
-    const device = (extra?.device ?? '').toLowerCase()
-    for (const sys of SYSTEMISH_DISK_MARKERS) {
-        if (device === sys || device.startsWith(`${sys}p`) || device === `/dev/${sys}`) return true
-    }
-    return false
+    /** Where the partition is mounted on its Pi (from that Pi's lsblk/findmnt), when known. */
+    mountpoint?: string | null
+    /** True when the partition's parent is the Pi's root disk (stage2-dock.sh status rootDisk). */
+    onRootDisk?: boolean | null
 }
+
+/**
+ * Why a disk must never be ejected/erased/moved by the harness, or null. Order:
+ *   1. hw-roundtrip stick markers (serial / FS UUID / store ids) — always veto, fixtures included;
+ *   2. a known duration fixture id is otherwise never protected by name/label/device (it is ours);
+ *   3. 'IDEA Disk' label/name, system FS labels, the store's "System Disk", a system mount, the root disk.
+ * The device name is only ever reported, never matched.
+ */
+export const protectedDiskReason = (diskIdOrName: string, extra?: ProtectedDiskFacts): string | null => {
+    const hay = [diskIdOrName, extra?.name ?? '', extra?.label ?? '', extra?.device ?? ''].join(' ').toUpperCase()
+    for (const m of PROTECTED_DISK_MARKERS) {
+        if (hay.includes(m.toUpperCase())) return `hw-roundtrip marker ${m}`
+    }
+    if (looksLikeDurationFixtureId(diskIdOrName)) return null
+    const name = (extra?.name ?? diskIdOrName).trim()
+    const label = (extra?.label ?? '').trim()
+    for (const lab of PROTECTED_LABELS) {
+        if (name === lab || label === lab) return `protected label '${lab}'`
+    }
+    for (const lab of SYSTEM_FS_LABELS) {
+        if (label === lab) return `system FS label '${lab}'`
+    }
+    for (const n of SYSTEM_DISK_NAMES) {
+        if (name === n) return `store name '${n}'`
+    }
+    const mp = (extra?.mountpoint ?? '').trim()
+    if (mp && (SYSTEM_MOUNTPOINTS as readonly string[]).includes(mp)) return `system mount ${mp}`
+    if (extra?.onRootDisk) return 'partition of the root disk'
+    return null
+}
+
+export const looksLikeProtectedHwDisk = (diskIdOrName: string, extra?: ProtectedDiskFacts): boolean =>
+    protectedDiskReason(diskIdOrName, extra) !== null
+
+/** One refusal text for every guard: the Pi, the disk, what matched. No hardcoded host or vendor. */
+export const protectedDiskRefusal = (
+    verb: string, engineId: string | null, diskId: string, reason: string, name?: string | null, device?: string | null,
+): string =>
+    `RealFleetOps: refuse to ${verb} protected disk '${diskId}'` +
+    `${engineId ? ` on ${engineId}` : ''}${name ? ` (name=${name})` : ''}${device ? ` [device ${device}]` : ''}: ${reason}`
 
 export interface RealFleetOptions {
     poolEngines: string[]
@@ -252,9 +310,14 @@ export interface RealFleetOptions {
      * (unit tests on a box that has sudo).
      */
     sudoMode?: SudoMode
+    /** r86l: run the store-doc Repo in a worker thread (default true; env DURATION_STORE_IN_PROCESS=1 → false). */
+    storeInWorker?: boolean
 }
 
 /** Thrown when a pool Engine's WS never completes the automerge-repo handshake. */
+/** r86h FAIL@104: a store write (Engine command / purge) that could not be made, even after one reconnect. */
+export class StoreWriteError extends Error {}
+
 export class EngineUnreachableError extends Error {
     constructor(readonly engine: string, readonly url: string, readonly detail: string) {
         super(`engine ${engine} unreachable (WS ${url}): ${detail}`)
@@ -294,12 +357,35 @@ export class TrackedWebSocketClientAdapter extends WebSocketClientAdapter {
         }
         super.disconnect()
     }
+    /**
+     * r86g "Attempting to change an outdated document" (121× on the idea01/idea03 repos from step 100):
+     * automerge-repo 2.3.1 DocSynchronizer answers a sync message INSIDE handle.update(), after
+     * A.receiveSyncMessage has already advanced the doc. The library adapter's send() THROWS
+     * "Websocket not ready (2)" when the socket is CLOSING; the throw escapes the update callback, so
+     * the handle keeps the pre-receive doc, which Automerge has marked outdated. Every later sync
+     * message then fails, and the view freezes until a reconnect (r86g: 6 stale-view reconnects,
+     * all found new data). A send on a socket that is not OPEN is dropped here instead (counted
+     * via noteEngineWs). The sync protocol re-sends after the reconnect, so nothing is lost.
+     */
+    send(message: Parameters<WebSocketClientAdapter['send']>[0]): void {
+        const socket = this.socket as unknown as { readyState?: number } | undefined
+        if (socket && socket.readyState !== 1 /* OPEN */) {
+            this.droppedSends++
+            if (this.droppedSends === 1) console.log(`[RealFleetOps] ${this.via}: dropping sync sends while the socket is not OPEN (library would throw inside handle.update and wedge the doc)`)
+            noteEngineWs(this.via, 'error', `send dropped: socket readyState ${socket.readyState} (not OPEN)`, this.url)
+            return
+        }
+        super.send(message)
+    }
+    droppedSends = 0
     /** Resolves once the socket closed by disconnect() is fully closed (max 1.5 s). */
     whenClosed(): Promise<void> {
         return this.#closed
     }
+    readonly via: string
     constructor(url: string, retryInterval: number, via: string) {
         super(url, retryInterval)
+        this.via = via
         this.onError = event => {
             const err = (event as { error?: { code?: string; message?: string } }).error
             noteEngineWs(via, 'socket-error', `socket ${err?.code ?? err?.message ?? 'error'}`, url)
@@ -313,6 +399,9 @@ export class TrackedWebSocketClientAdapter extends WebSocketClientAdapter {
 
 /** The adapter behind each walker Repo (closeRepo waits for its socket to close). */
 const adapterOf = new WeakMap<Repo, TrackedWebSocketClientAdapter>()
+
+/** r86j: a connect may finish this late past its deadline (one 100 ms poll + scheduling) before it is a stall. */
+export const CONNECT_OVERRUN_GRACE_MS = Number(process.env.DURATION_CONNECT_OVERRUN_GRACE_MS ?? 5_000)
 
 /** Resolve once the Repo has a connected peer (handshake done), else reject after `ms`. */
 const waitForHandshake = (repo: Repo, engine: string, url: string, ms: number): Promise<void> =>
@@ -331,9 +420,19 @@ const waitForHandshake = (repo: Repo, engine: string, url: string, ms: number): 
         ns.on('peer', onPeer)
     })
 
+/** DocHandle surface RealFleetOps uses: a real handle (in-process mode) or a StoreDocLink snapshot (worker mode). */
+interface StoreHandleLike {
+    doc(): Store | undefined
+    heads?(): string[] | null
+    change(fn: (s: Store) => void): void | Promise<void>
+}
+
 interface Conn {
-    repo: Repo
-    storeHandle: DocHandle<Store>
+    /** In-process mode only (DURATION_STORE_IN_PROCESS=1); null when the doc lives in a worker. */
+    repo: Repo | null
+    /** r86l worker mode (default): the store-doc Repo runs in storeDocWorker.mjs. */
+    link?: StoreDocLink
+    storeHandle: StoreHandleLike
     host: string
     logicalId: string
     liveEngineId: string | null
@@ -345,9 +444,15 @@ const sshOpts = [
     '-o', 'StrictHostKeyChecking=no',
     '-o', 'UserKnownHostsFile=/dev/null',
     '-o', 'ConnectTimeout=10',
+    // r63: a link that dies mid-command fails (exit 255 'Timeout, server … not responding') instead of hanging.
+    '-o', 'ServerAliveInterval=10',
+    '-o', 'ServerAliveCountMax=3',
 ]
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
+
+/** Engine process start (epoch s, Pi clock) for pm2 app "engine"; empty when not running. */
+export const PM2_ENGINE_START_CMD = 'p=$(pm2 pid engine 2>/dev/null | tail -1); [ -n "$p" ] && [ "$p" != 0 ] && stat -c %Y /proc/$p 2>/dev/null || echo 0'
 
 /**
  * Close a connection for good: mark it abandoned for the timeout guard (its late
@@ -431,8 +536,11 @@ export const assertPrivateDurationRoots = (disksRoot: string, watchDir: string):
             `RealFleetOps: refuse IDEA_WATCH_DIR='${watchDir}' (never /dev/engine; use ${DEFAULT_DURATION_WATCH_DIR})`,
         )
     }
-    if (d.includes('sdb') || w.includes('sdb')) {
-        throw new Error(`RealFleetOps: refuse roots that mention sdb (never idea03 hw stick)`)
+    // Stage 1 harness roots are plain dirs; never a kernel block-device name (any sdX / mmcblkN / nvmeN, any Pi).
+    const devRe = /(^|\/)(sd[a-z]+[0-9]*|mmcblk[0-9]+(p[0-9]+)?|nvme[0-9]+n[0-9]+(p[0-9]+)?)(\/|$)/
+    const hit = devRe.exec(d) ?? devRe.exec(w)
+    if (hit) {
+        throw new Error(`RealFleetOps: refuse harness roots that name a block device ('${hit[2]}' in ${devRe.test(d) ? `IDEA_DISKS_ROOT='${disksRoot}'` : `IDEA_WATCH_DIR='${watchDir}'`})`)
     }
 }
 
@@ -1197,6 +1305,8 @@ export class RealFleetOps implements FleetOps {
     private readonly onOwnStoreStall: (engine: string, docId: string, detail: string) => void
     /** Engines inside rebootEngine / reconnectEngine: a stall there is retried, not fatal. */
     private readonly rebootWindow = new Set<string>()
+    /** r86l: store-doc Repo in a worker thread (default). DURATION_STORE_IN_PROCESS=1 / storeInWorker:false = old in-process Repo. */
+    readonly storeInWorker: boolean
     /** Repos opened per engine (one per connection; tests assert reuse). */
     private readonly reposOpened = new Map<string, number>()
     /** logical pool id → live engineDB key */
@@ -1211,6 +1321,7 @@ export class RealFleetOps implements FleetOps {
     private readonly usedDevices = new Map<string, Set<string>>()
 
     constructor(opts: RealFleetOptions) {
+        this.storeInWorker = opts.storeInWorker ?? process.env.DURATION_STORE_IN_PROCESS !== '1'
         this.pool = [...opts.poolEngines]
         this.exclude = [...(opts.excludeEngines ?? [GOLDEN_DEFAULT])]
         if (!this.exclude.includes(GOLDEN_DEFAULT)) this.exclude.push(GOLDEN_DEFAULT)
@@ -1219,7 +1330,7 @@ export class RealFleetOps implements FleetOps {
         if (opts.storeMode && opts.storeMode !== 'shared') {
             throw new Error(
                 `RealFleetOps: storeMode '${opts.storeMode}' refused on the live pool — idea01/03/04 share ONE store ` +
-                    `(3zoqd, mDNS ON, no static peers). Use shared; unique is Fake-only.`,
+                    `(2VroE; was 3zoqd, compacted 2026-10-13; mDNS ON, no static peers). Use shared; unique is Fake-only.`,
             )
         }
         this.mode = 'shared'
@@ -1274,7 +1385,7 @@ export class RealFleetOps implements FleetOps {
 
     /**
      * idea#168 r38 (Koen's standing rule): the live pool IS one shared store — the dev store
-     * (3zoqd…), mDNS ON, no static peers — an exact production replica. 'shared' is accepted
+     * (2VroE…, was 3zoqd, compacted to 2VroE 2026-10-13), mDNS ON, no static peers — an exact production replica. 'shared' is accepted
      * (nothing to provision: the Engines already share it; runStorePreflight proves it before
      * step 1 of every live run). 'unique' is REFUSED on the live pool (stricter option: a
      * unique-store run would not be a production replica). FakeFleetOps keeps both modes.
@@ -1283,7 +1394,7 @@ export class RealFleetOps implements FleetOps {
         if (mode !== 'shared') {
             throw new Error(
                 `RealFleetOps: store_mode '${mode}' refused on the live pool — idea01/03/04 share ONE store ` +
-                    `(DURATION_EXPECTED_STORE_ID, default 3zoqd) with mDNS ON and no static peers (production replica). ` +
+                    `(DURATION_EXPECTED_STORE_ID, default 2VroE) with mDNS ON and no static peers (production replica). ` +
                     `Use store_mode: shared (scenarios/unified.yaml); unique is Fake-only.`,
             )
         }
@@ -1301,7 +1412,7 @@ export class RealFleetOps implements FleetOps {
         assertPrivateDurationRoots(this.disksRoot, this.watchDir)
         const host = this.hostOf(engineId)
         const slots = requiredSlotNames()
-        const out = await this.ssh(host, buildSlotLayoutProbeRemote(this.disksRoot, slots))
+        const out = await this.sshRead(host, buildSlotLayoutProbeRemote(this.disksRoot, slots))
         return slotLayoutVerdict(engineId, host, this.disksRoot, parseSlotLayoutProbe(out), slots, minHelperVersion)
     }
 
@@ -1382,13 +1493,13 @@ export class RealFleetOps implements FleetOps {
     async probePeerHost(engineId: string): Promise<PeerHostProbe> {
         this.assertNotExcluded(engineId, 'probePeerHost')
         if (isNeverStoreProbe(engineId)) throw new Error(`RealFleetOps: probePeerHost refused for '${engineId}' (never idea02)`)
-        return parsePeerProbe(await this.ssh(this.hostOf(engineId), buildPeerProbeRemote()))
+        return parsePeerProbe(await this.sshRead(this.hostOf(engineId), buildPeerProbeRemote()))
     }
 
     async probeStoreConfig(engineId: string): Promise<string> {
         this.assertNotExcluded(engineId, 'probeStoreConfig')
         if (isNeverStoreProbe(engineId)) throw new Error(`RealFleetOps: probeStoreConfig refused for '${engineId}' (never idea02)`)
-        return this.ssh(this.hostOf(engineId), storeProbeScript())
+        return this.sshRead(this.hostOf(engineId), storeProbeScript())
     }
 
     /** idea#168 r38: the store doc the harness syncs from this Engine + whether that Engine's own engineDB row is in it. */
@@ -1412,9 +1523,117 @@ export class RealFleetOps implements FleetOps {
         }
     }
 
-    protected async ssh(host: string, remoteCmd: string): Promise<string> {
-        const result = await $`ssh ${sshOpts} ${`${this.sshUser}@${host}`} ${remoteCmd}`
-        return result.stdout
+    /** One ssh round-trip, no retry. */
+    /** ssh binary (DURATION_SSH_BIN for real-process tests). */
+    protected sshBinary(): string {
+        return process.env.DURATION_SSH_BIN?.trim() || 'ssh'
+    }
+
+    /** ssh argv up to and including the target (tests add e.g. a port). */
+    protected sshArgs(host: string): string[] {
+        return [...sshOpts, `${this.sshUser}@${host}`]
+    }
+
+    /**
+     * One ssh round-trip, no retry. With attemptTimeoutMs (every read): own process group, SIGKILL to the whole
+     * group at the limit, resolves at once, and a kill is a transport failure (exit 255) so the read retry runs.
+     */
+    protected async sshOnce(host: string, remoteCmd: string, attemptTimeoutMs?: number): Promise<string> {
+        if (!attemptTimeoutMs) {
+            const result = await $`ssh ${sshOpts} ${`${this.sshUser}@${host}`} ${remoteCmd}`
+            return result.stdout
+        }
+        const r = await runProcess(this.sshBinary(), [...this.sshArgs(host), remoteCmd], { timeoutMs: attemptTimeoutMs })
+        if (r.code === 0) return r.stdout
+        if (r.timedOut) {
+            const msg = `Timeout, server ${host} not responding (walker killed the ssh process group after ${attemptTimeoutMs}ms)`
+            throw Object.assign(new Error(msg), { exitCode: 255, stderr: `${r.stderr}\n${msg}`.trim(), stdout: r.stdout })
+        }
+        throw Object.assign(new Error(`ssh ${host}: exit ${r.code}: ${r.stderr.trim().slice(0, 400)}`), { exitCode: r.code, stderr: r.stderr, stdout: r.stdout })
+    }
+
+    /**
+     * ssh with NO retry by default (mutating calls: a reset after the remote ran would run them twice).
+     * `{ retry: true }` (use sshRead) retries transport failures only — see sshRetry.ts.
+     */
+    protected async ssh(host: string, remoteCmd: string, opts: { retry?: boolean } = {}): Promise<string> {
+        if (!opts.retry) return this.sshOnce(host, remoteCmd)
+        return withSshRetry(host, remoteCmd.replace(/\s+/g, ' ').slice(0, 80), () => this.sshOnce(host, remoteCmd, Number(process.env.DURATION_SSH_READ_ATTEMPT_MS ?? 120_000)), sshRetryPolicy(), {
+            sleep: ms => sleep(ms),
+            log: line => console.log(line),
+        })
+    }
+
+    // ── r67: mutating ssh behind a warm ControlMaster + start gate (sshMutate.ts) ──
+    /** Masters this walker started / reused, per host (tests + run.log). */
+    readonly masterStats = { started: 0, reused: 0, recreated: 0 }
+
+    /** Local process with a hard wall timeout (kill → code null, timedOut). */
+    protected runLocal(cmd: string, args: string[], opts: { timeoutMs: number; onStdout?: (chunk: string, child: ChildProcess) => void; earlyKill?: { ms: number; unless: () => boolean } }): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean }> {
+        return runProcess(cmd, args, opts)
+    }
+
+    /** Explicit per-host mux socket (so a dead one can be removed). */
+    protected controlPathFor(host: string): string {
+        const dir = process.env.DURATION_SSH_CONTROL_DIR?.trim() || '/tmp'
+        return `${dir}/idea-dur-cm-${this.sshUser}-${host.replace(/[^A-Za-z0-9._-]/g, '_')}`
+    }
+
+    /** Warm transport: reuse a live ControlMaster, else establish one (no remote command; transport retries only). */
+    protected async ensureMaster(host: string): Promise<void> {
+        const cp = ['-o', `ControlPath=${this.controlPathFor(host)}`]
+        const base = this.sshArgs(host)
+        const target = base[base.length - 1]!
+        const opts = base.slice(0, -1)
+        const chk = await this.runLocal(this.sshBinary(), [...opts, ...cp, '-O', 'check', target], { timeoutMs: 10_000 })
+        if (chk.code === 0) { this.masterStats.reused++; return }
+        // r68: a dead/stale mux (frozen link, VM pause, killed master) is torn down and recreated — never reused.
+        if (existsSync(this.controlPathFor(host))) {
+            await this.runLocal(this.sshBinary(), [...opts, ...cp, '-O', 'exit', target], { timeoutMs: 5_000 })
+            try { unlinkSync(this.controlPathFor(host)) } catch { /* already gone */ }
+            this.masterStats.recreated++
+            console.log(JSON.stringify({ event: 'ssh_master_dead', host, check: (chk.stderr || (chk.timedOut ? 'check timed out' : `exit ${chk.code}`)).trim().slice(0, 200), action: 'exit+unlink, recreate' }))
+        }
+        await withSshRetry(host, 'ControlMaster establish', async () => {
+            const r = await this.runLocal(this.sshBinary(), [...opts, ...cp, '-o', 'ControlMaster=yes', '-o', `ControlPersist=${process.env.DURATION_SSH_CONTROL_PERSIST ?? '600'}`, '-fN', target], { timeoutMs: 45_000 })
+            if (r.code !== 0) throw Object.assign(new Error(r.stderr || 'master failed'), { exitCode: 255, stderr: r.timedOut ? `Connection timed out establishing ControlMaster (${r.stderr.trim()})` : (r.stderr || 'Connection closed') })
+        }, sshRetryPolicy(), { sleep: ms => sleep(ms), log: line => console.log(line) })
+        this.masterStats.started++
+        console.log(JSON.stringify({ event: 'ssh_master_up', host }))
+    }
+
+    /** One gated attempt over the master: send GO only after the gate token arrived. */
+    protected async runGated(host: string, gated: string): Promise<GatedResult> {
+        let sentGo = false
+        const base = this.sshArgs(host)
+        const r = await this.runLocal(this.sshBinary(), [...base.slice(0, -1), '-o', `ControlPath=${this.controlPathFor(host)}`, '-o', 'ControlMaster=no', base[base.length - 1]!, gated], {
+            timeoutMs: Number(process.env.DURATION_SSH_MUTATE_MAX_MS ?? 3_600_000),
+            // No gate token within gate+15 s → kill: the command provably never started.
+            earlyKill: { ms: (gateSecs() + 15) * 1000, unless: () => sentGo },
+            onStdout: (all, child) => {
+                if (!sentGo && all.includes(GATE_TOKEN)) {
+                    sentGo = true
+                    child.stdin?.write('GO\n'); child.stdin?.end()
+                }
+            },
+        })
+        return { code: r.code, stdout: r.stdout, stderr: r.stderr, sentGo, timedOut: r.timedOut }
+    }
+
+    /** Mutating remote command: run once behind the start gate; see sshMutate.ts. */
+    protected async sshMutate(host: string, remoteCmd: string, spec: MutateSpec): Promise<MutateResult> {
+        return sshMutate(host, remoteCmd, spec, {
+            ensureMaster: h => this.ensureMaster(h),
+            runGated: (h, g) => this.runGated(h, g),
+            sleep: ms => sleep(ms),
+            now: () => Date.now(),
+            log: line => console.log(line),
+        })
+    }
+
+    /** Read-only probe (cat/ls/stat/findmnt/docker ps/lsblk/status): transport failures retried with backoff. */
+    protected sshRead(host: string, remoteCmd: string): Promise<string> {
+        return this.ssh(host, remoteCmd, { retry: true })
     }
 
     /**
@@ -1422,17 +1641,28 @@ export class RealFleetOps implements FleetOps {
      * pipefail). Uses only the walker's existing SSH access to each Pi — no Pi→Pi keys needed.
      */
     protected async relayPipe(srcHost: string, srcCmd: string, dstHost: string, dstCmd: string): Promise<string> {
-        const relayOpts = [...sshOpts, '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=8']
-        const script = 'ssh -n "${@:5}" "$1" "$2" | ssh "${@:5}" "$3" "$4"'
-        const result = await $`bash -o pipefail -c ${script} relay ${`${this.sshUser}@${srcHost}`} ${srcCmd} ${`${this.sshUser}@${dstHost}`} ${dstCmd} ${relayOpts}`
-        return result.stdout
+        // r69 (r68 FAIL@62): a box VM pause of ~919 s mid-stream let ServerAlive 15×8 (2 min) kill both legs.
+        // ServerAlive budget is now 30 s × 60 = 30 min (DURATION_RELAY_ALIVE_*), so a frozen box that wakes
+        // within that keeps the TCP sessions (the Pis' sshd has no ClientAlive). The pipe runs in its own process
+        // group with a hard monotonic limit (DURATION_RELAY_ATTEMPT_MS, default 60 min) that kills both legs.
+        const iv = process.env.DURATION_RELAY_ALIVE_INTERVAL_S ?? '30'
+        const cnt = process.env.DURATION_RELAY_ALIVE_COUNT ?? '60'
+        const relay = (h: string) => { const a = this.sshArgs(h); return [...a.slice(0, -1).filter((x, k, arr) => !/^ServerAlive/.test(x) && !(x === '-o' && /^ServerAlive/.test(arr[k + 1] ?? ''))), '-o', `ServerAliveInterval=${iv}`, '-o', `ServerAliveCountMax=${cnt}`, a[a.length - 1]!] }
+        const q = (x: string) => `'${x.replace(/'/g, `'\\''`)}'`
+        const bin = q(this.sshBinary())
+        const script = `${bin} -n ${relay(srcHost).map(q).join(' ')} ${q(srcCmd)} | ${bin} ${relay(dstHost).map(q).join(' ')} ${q(dstCmd)}`
+        const limit = Number(process.env.DURATION_RELAY_ATTEMPT_MS ?? 3_600_000)
+        const r = await runProcess('bash', ['-o', 'pipefail', '-c', script], { timeoutMs: limit })
+        if (r.code === 0) return r.stdout
+        throw Object.assign(new Error(`relay ${srcHost}→${dstHost} ${r.timedOut ? `killed after ${limit}ms` : `exit ${r.code}`}: ${r.stderr.trim().slice(-600)}`),
+            { exitCode: r.timedOut ? 255 : r.code, stderr: r.stderr, stdout: r.stdout, timedOut: r.timedOut })
     }
 
     private async fetchStoreDocId(logicalId: string): Promise<DocumentId> {
         if (this.storeUrls[logicalId]) return toDocId(this.storeUrls[logicalId]!)
         const host = this.hostOf(logicalId)
         try {
-            const out = await this.ssh(
+            const out = await this.sshRead(
                 host,
                 'cat /home/pi/idea/agents/agent-engine-dev/store-identity/store-url.txt',
             )
@@ -1452,7 +1682,8 @@ export class RealFleetOps implements FleetOps {
         const c = this.conns.get(logicalId)
         if (!c) return
         this.conns.delete(logicalId)
-        await closeRepo(c.repo, reason)
+        if (c.link) await c.link.close(reason)
+        else if (c.repo) await closeRepo(c.repo, reason)
     }
 
     /**
@@ -1463,7 +1694,7 @@ export class RealFleetOps implements FleetOps {
     docWaitMsFor(logicalId: string): number {
         const env = (v: string | undefined): number | null => {
             const n = v === undefined || v === '' ? NaN : Number(v)
-            return Number.isFinite(n) && n > 0 ? Math.min(MAX_DOC_WAIT_MS, Math.max(MIN_DOC_WAIT_MS, n)) : null
+            return Number.isFinite(n) && n > 0 ? Math.min(MAX_DOC_WAIT_MS_BY_HOST[logicalId] ?? MAX_DOC_WAIT_MS, Math.max(MIN_DOC_WAIT_MS, n)) : null
         }
         const perHostEnv = env(process.env[`DURATION_DOC_WAIT_MS_${logicalId.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`])
         if (perHostEnv !== null) return perHostEnv
@@ -1492,7 +1723,7 @@ export class RealFleetOps implements FleetOps {
     /** True when this engine's reused connection currently has an open WS handshake. */
     isWsOpen(logicalId: string): boolean {
         const c = this.conns.get(logicalId)
-        return !!c && c.repo.peers.length > 0
+        return !!c && (c.link ? c.link.peerCount > 0 : (c.repo?.peers.length ?? 0) > 0)
     }
 
     private discoverLiveEngineId(store: Store, logicalId: string): string | null {
@@ -1555,6 +1786,7 @@ export class RealFleetOps implements FleetOps {
         const docWaitMs = this.docWaitMsFor(logicalId)
         const started = Date.now()
         const deadline = started + this.wsHandshakeTimeoutMs + docWaitMs
+        if (this.storeInWorker) return this.openConnWorker(logicalId, host, docId, url, docWaitMs, started, deadline)
         for (;;) {
             this.reposOpened.set(logicalId, (this.reposOpened.get(logicalId) ?? 0) + 1)
             console.log(`[RealFleetOps] Connecting ${logicalId} at ${url} (doc ${docId}, doc wait ${docWaitMs}ms)`)
@@ -1581,6 +1813,23 @@ export class RealFleetOps implements FleetOps {
                 console.log(`[RealFleetOps] Connect ${logicalId} failed: ${reason} [${describeEngineLink(logicalId)}]`)
                 throw e
             }
+            // r86j: evidence for the store-growth/sync class (Steve): sync time + walker memory per connect.
+            const now = Date.now()
+            const overrunMs = now - deadline
+            const mu = process.memoryUsage()
+            console.log(JSON.stringify({
+                event: 'store_sync_measured', engine: logicalId, docId, outcome: outcome.kind,
+                tookMs: now - started, docWaitMs, overrunMs: Math.max(0, overrunMs),
+                walkerRssMb: Math.round(mu.rss / 1048576), walkerHeapUsedMb: Math.round(mu.heapUsed / 1048576),
+                walkerExternalMb: Math.round(mu.external / 1048576), walkerArrayBuffersMb: Math.round(mu.arrayBuffers / 1048576),
+            }))
+            // r86j: idea03 came back 'ready' 632 s into a 45 s doc wait: the polling loop could not run
+            // because a synchronous Automerge apply blocked the event loop. A connect that overran its
+            // bound is a fail-loud stall even if the doc finally loaded; never a silent slow pass.
+            if (outcome.kind === 'ready' && overrunMs > CONNECT_OVERRUN_GRACE_MS) {
+                outcome = { kind: 'stall', detail: `doc ready only ${Math.round((now - started) / 1000)}s after connect, ` +
+                    `${Math.round(overrunMs / 1000)}s past the bound (event loop blocked by store sync; walker rss ${Math.round(mu.rss / 1048576)} MB)` }
+            }
             if (outcome.kind === 'ready') {
                 noteEngineStoreReady(tracked, logicalId)
                 return this.registerConn(logicalId, repo, outcome.handle, host, docId, Date.now() - started)
@@ -1603,6 +1852,75 @@ export class RealFleetOps implements FleetOps {
             // WS up, doc not ready: a real own-store stall.
             const detail = `store ${docId} not ready ${secs}s after connect (doc wait ${docWaitMs}ms, WS open; ${outcome.detail})`
             await closeRepo(repo, `sync stall: ${detail}`, true)
+            console.log(`[RealFleetOps] Connect ${logicalId} failed: sync stall: ${detail} [${describeEngineLink(logicalId)}]`)
+            if (!this.rebootWindow.has(logicalId)) this.onOwnStoreStall(logicalId, docId, detail)
+            throw new StoreSyncStallError(logicalId, url, detail)
+        }
+    }
+
+    /**
+     * r86l: openConn with the Repo in a worker thread. Same outcomes and fail-loud rules as the
+     * in-process path (ready / doc-unavailable → reopen / ws-closed or unreachable → EngineUnreachableError /
+     * stall → StoreSyncStallError + onOwnStoreStall); the bound is now a real wall-clock timer, because
+     * the main thread never applies the sync.
+     */
+    private async openConnWorker(
+        logicalId: string, host: string, docId: DocumentId, url: string, docWaitMs: number, started: number, deadline: number,
+    ): Promise<Conn> {
+        for (;;) {
+            this.reposOpened.set(logicalId, (this.reposOpened.get(logicalId) ?? 0) + 1)
+            console.log(`[RealFleetOps] Connecting ${logicalId} at ${url} (doc ${docId}, doc wait ${docWaitMs}ms, off-thread)`)
+            registerOwnDoc(docId, 'store', logicalId)
+            void this.registerOwnCommandLog(logicalId, host)
+            const hsMs = Math.max(1, Math.min(this.wsHandshakeTimeoutMs, deadline - Date.now()))
+            const tracker = trackWorkerLink(logicalId, url)
+            const link = new StoreDocLink({
+                logicalId, url, docId: String(docId), deadline, handshakeMs: hsMs,
+                backstopMs: CONNECT_OVERRUN_GRACE_MS,
+                onWs: (kind, detail) => noteEngineWs(logicalId, kind, detail, url),
+                onPeers: n => tracker.peers(n),
+            })
+            link.onClose = reason => tracker.abandon(reason)
+            let outcome = await link.outcome()
+            const now = Date.now()
+            const overrunMs = now - deadline
+            const mu = process.memoryUsage()
+            console.log(JSON.stringify({
+                event: 'store_sync_measured', engine: logicalId, docId, outcome: outcome.kind, offThread: true,
+                tookMs: now - started, docWaitMs, overrunMs: Math.max(0, overrunMs),
+                walkerRssMb: Math.round(mu.rss / 1048576), walkerHeapUsedMb: Math.round(mu.heapUsed / 1048576),
+                workerHeapMb: link.mem ? Math.round(link.mem.heapUsed / 1048576) : null,
+                snapshotParseMs: Math.round(link.lastSnapshotParseMs),
+            }))
+            if (outcome.kind === 'ready' && overrunMs > CONNECT_OVERRUN_GRACE_MS) {
+                outcome = { kind: 'stall', tookMs: outcome.tookMs, detail: `doc ready only ${Math.round((now - started) / 1000)}s after connect, ` +
+                    `${Math.round(overrunMs / 1000)}s past the bound (off-thread; walker rss ${Math.round(mu.rss / 1048576)} MB)` }
+            }
+            if (outcome.kind === 'ready' && link.doc()) {
+                const store = link.doc()!
+                const liveEngineId = this.discoverLiveEngineId(store, logicalId)
+                this.rememberMapping(logicalId, liveEngineId)
+                console.log(`[RealFleetOps] Connected ${logicalId} → liveEngineId=${liveEngineId ?? 'unknown'} (store ready in ${Date.now() - started}ms, off-thread)`)
+                tracker.storeReady()
+                const conn: Conn = { repo: null, link, storeHandle: link, host, logicalId, liveEngineId, storeDocId: docId }
+                this.conns.set(logicalId, conn)
+                return conn
+            }
+            await link.close(`connect ${outcome.kind}`)
+            if (outcome.kind === 'doc-unavailable' && Date.now() + 1_000 < deadline) {
+                await sleep(1_000)
+                continue
+            }
+            const secs = Math.round((Date.now() - started) / 1000)
+            if (outcome.kind === 'unreachable' || outcome.kind === 'ws-closed') {
+                const detail = outcome.kind === 'unreachable'
+                    ? `${outcome.detail}${getEngineLink(logicalId)?.lastError ? ` (last ${getEngineLink(logicalId)!.lastError})` : ''}`
+                    : `WS dropped during store sync and did not come back within ${secs}s (${outcome.detail}; last ${getEngineLink(logicalId)?.lastError ?? 'error none'})`
+                const msg = this.rebootWindow.has(logicalId) ? detail : reportEngineUnreachable(logicalId)
+                console.log(`[RealFleetOps] Connect ${logicalId} failed: ${msg}`)
+                throw new EngineUnreachableError(logicalId, url, detail)
+            }
+            const detail = `store ${docId} not ready ${secs}s after connect (doc wait ${docWaitMs}ms, WS open, off-thread; ${outcome.kind === 'ready' ? 'no snapshot' : outcome.detail})`
             console.log(`[RealFleetOps] Connect ${logicalId} failed: sync stall: ${detail} [${describeEngineLink(logicalId)}]`)
             if (!this.rebootWindow.has(logicalId)) this.onOwnStoreStall(logicalId, docId, detail)
             throw new StoreSyncStallError(logicalId, url, detail)
@@ -1664,6 +1982,9 @@ export class RealFleetOps implements FleetOps {
                 status: String(inst.status ?? ''),
                 diskId: inst.storedOn != null ? String(inst.storedOn) : null,
                 name: inst.name != null ? String(inst.name) : undefined,
+                ...(Number.isInteger(Number((inst as { port?: unknown }).port)) && Number((inst as { port?: unknown }).port) > 0
+                    ? { port: Number((inst as { port?: unknown }).port) }
+                    : {}),
             }
         }
 
@@ -1681,6 +2002,9 @@ export class RealFleetOps implements FleetOps {
                 backupLinks: Array.isArray(disk.backupConfig?.links)
                     ? disk.backupConfig!.links.map(String)
                     : undefined,
+                ...(Number.isFinite(Number((disk as { lastDocked?: unknown }).lastDocked))
+                    ? { lastDocked: Number((disk as { lastDocked?: unknown }).lastDocked) }
+                    : {}),
             }
         }
 
@@ -1691,6 +2015,9 @@ export class RealFleetOps implements FleetOps {
             engineDB[logical] = {
                 id: logical,
                 hostname: eng.hostname != null ? String(eng.hostname) : undefined,
+                ...(typeof (eng as { lanAddress?: unknown }).lanAddress === 'string'
+                    ? { lanAddress: String((eng as { lanAddress?: unknown }).lanAddress) }
+                    : {}),
             }
         }
         // Ensure the queried logical engine appears even if live key differed
@@ -1740,7 +2067,7 @@ export class RealFleetOps implements FleetOps {
                             dockerOk = undefined
                         } else {
                             // docker ps — names often contain instance id
-                            const result = await this.ssh(host, 'docker ps --format "{{.Names}}" 2>/dev/null || true')
+                            const result = await this.sshRead(host, 'docker ps --format "{{.Names}}" 2>/dev/null || true')
                             const names = (result ?? '').toLowerCase()
                             const missing = running.filter(i => !names.includes(i.id.toLowerCase())
                                 && !names.includes((i.name ?? '').toLowerCase()))
@@ -1782,7 +2109,7 @@ export class RealFleetOps implements FleetOps {
         engines: Array<{ id: string; ok: boolean; url: string; detail: string; message?: string }>
     }> {
         const ids = this.listPoolEngines()
-        const engines = await Promise.all(ids.map(async id => {
+        const probe = async (id: string) => {
             const url = `ws://${this.hostOf(id)}:${this.enginePort}`
             const deadline = Date.now() + timeoutMs
             let lastErr: Error | null = null
@@ -1801,7 +2128,15 @@ export class RealFleetOps implements FleetOps {
                 id, ok: false, url, detail: describeEngineLink(id),
                 message: stalled ? lastErr!.message : reportEngineUnreachable(id),
             }
-        }))
+        }
+        // r86b: stagger the walk-start store connects (one Pi at a time, a few seconds apart) so idea04
+        // (Pi 4) never serves several first full syncs at once. Each connect stays fail-loud.
+        const stagger = connectStaggerMs()
+        const engines: Awaited<ReturnType<typeof probe>>[] = []
+        for (const [i, id] of ids.entries()) {
+            if (i > 0 && stagger > 0) await sleep(stagger)
+            engines.push(await probe(id))
+        }
         return { ok: engines.every(e => e.ok), engines }
     }
 
@@ -1820,7 +2155,19 @@ export class RealFleetOps implements FleetOps {
             const cached = this.conns.get(engineId)
             if (cached) {
                 const wsWait = Math.max(this.wsHandshakeTimeoutMs, timeoutMs - (Date.now() - start))
-                if (await this.waitWsOpen(cached, wsWait)) {
+                // r86q (r86p FAIL@42): a dropped WS on an off-thread link is re-attached in its worker (the
+                // adapter reconnects, the existing handle re-syncs) — never closed for a fresh full doc wait.
+                if (cached.link && cached.link.alive) {
+                    if (await cached.link.reattach(wsWait)) {
+                        const doc = cached.storeHandle.doc()
+                        if (doc) {
+                            const live = this.discoverLiveEngineId(doc, engineId)
+                            this.rememberMapping(engineId, live)
+                            return { wsUp: true, storeSynced: live != null && !!doc.engineDB[live as keyof typeof doc.engineDB] }
+                        }
+                    }
+                    console.log(JSON.stringify({ event: 'store_reattach_failed', engine: engineId, detail: cached.link.lastReattachError }))
+                } else if (await this.waitWsOpen(cached, wsWait)) {
                     const doc = cached.storeHandle.doc()
                     if (doc) {
                         const live = this.discoverLiveEngineId(doc, engineId)
@@ -1850,6 +2197,8 @@ export class RealFleetOps implements FleetOps {
 
     /** Resolve true once this connection's Repo has an open WS peer, false after `ms`. */
     private async waitWsOpen(conn: Conn, ms: number): Promise<boolean> {
+        if (conn.link) return conn.link.waitPeer(ms)
+        if (!conn.repo) return false
         if (conn.repo.peers.length > 0) return true
         try {
             await waitForHandshake(conn.repo, conn.logicalId, `ws://${conn.host}:${this.enginePort}`, ms)
@@ -1868,6 +2217,113 @@ export class RealFleetOps implements FleetOps {
         return structuredClone(this.toSemanticView(engineId, doc))
     }
 
+    private readonly viewSeen = new Map<string, { heads: string; changedAt: number }>()
+    private readonly commandLogReaders = new Map<string, CommandLogReader>()
+
+    /** r86l: memory of every Automerge worker thread (store doc + CommandLog) for LOOPLAG.jsonl. */
+    threadMem(): ThreadMem[] {
+        const mb = (b: number) => Math.round(b / 1048576)
+        const out: ThreadMem[] = []
+        for (const [id, c] of this.conns) {
+            const m = c.link?.mem
+            if (m) out.push({ thread: `store:${id}`, heapUsedMb: mb(m.heapUsed), externalMb: mb(m.external), arrayBuffersMb: mb(m.arrayBuffers), ageMs: Date.now() - m.at })
+        }
+        for (const [id, r] of this.commandLogReaders) {
+            const m = r.mem
+            if (m && r.alive) out.push({ thread: `commandLog:${id}`, heapUsedMb: mb(m.heapUsed), externalMb: mb(m.external), arrayBuffersMb: mb(m.arrayBuffers), ageMs: Date.now() - m.at })
+        }
+        return out
+    }
+
+    private headsOf(c: Conn): string[] | null {
+        try {
+            return (c.storeHandle as unknown as { heads?: () => string[] }).heads?.() ?? null
+        } catch {
+            return null
+        }
+    }
+
+    /** Is the Engine's HTTP port answering (the Pi is up)? 3 s, read-only GET. */
+    protected async engineHttpUp(host: string): Promise<boolean> {
+        const port = Number(process.env.DURATION_ENGINE_HTTP_PORT ?? 8080)
+        try {
+            const r = await fetch(`http://${host}:${port}/`, { signal: AbortSignal.timeout(3_000) })
+            return r.status > 0
+        } catch {
+            return false
+        }
+    }
+
+    /**
+     * r66 stale-view guard: drop the cached store connection to `engineId`, open a fresh one and report
+     * whether it sees data the cached view lacked (heads differ). EVERY call is recorded (staleView.ts):
+     * run.log line, RECONNECTS.md, duration_summary. Returns foundNew (null when the reconnect failed).
+     */
+    async refreshView(engineId: string, reason: string): Promise<boolean | null> {
+        this.assertNotExcluded(engineId, 'refreshView')
+        const t0 = Date.now()
+        const old = this.conns.get(engineId)
+        const beforeHeads = old ? headsKey(this.headsOf(old)) : 'no-conn'
+        // r86r (r86q FAIL@42, Steve): an alive off-thread link is RE-SYNCED in its worker (f702e6a reattach),
+        // never replaced by connect(forceNew) — a fresh Repo is a full first sync of 3zoqd (~58 s on a Pi) on
+        // an already busy store host. A slow host (heartbeat late but recovering) gets more time, bounded by
+        // DURATION_REFRESH_REATTACH_MS; past that the refresh fails loudly (counted, foundNew=null). Only a
+        // dead link, or a responsive host whose WS stays down, falls back to a fresh connection.
+        const link = old?.link
+        if (link && link.alive) {
+            const r = await this.reattachBounded(engineId, link)
+            if (r.ok) {
+                const afterHeads = headsKey(this.headsOf(old!))
+                const foundNew = afterHeads !== beforeHeads
+                this.viewSeen.set(engineId, { heads: afterHeads, changedAt: Date.now() })
+                recordReconnect({ engine: engineId, at: t0, reason, foundNew, beforeHeads, afterHeads, tookMs: Date.now() - t0, mode: 'reattach' })
+                return foundNew
+            }
+            if (r.hostBlocked) {
+                recordReconnect({ engine: engineId, at: t0, reason, foundNew: null, beforeHeads, afterHeads: 'n/a', tookMs: Date.now() - t0, mode: 'failed',
+                    error: `stale-view refresh: re-sync of the existing link did not complete within ${r.boundMs}ms and the store host is still blocked (${r.detail}); NOT replaced by a fresh full sync` })
+                return null
+            }
+            console.log(JSON.stringify({ event: 'stale_view_refresh_fallback', engine: engineId, reason: `re-sync failed with a responsive host: ${r.detail}; closing for a fresh connection` }))
+        }
+        try {
+            const fresh = await this.connect(engineId, true)
+            const afterHeads = headsKey(this.headsOf(fresh))
+            const foundNew = afterHeads !== beforeHeads
+            this.viewSeen.set(engineId, { heads: afterHeads, changedAt: Date.now() })
+            recordReconnect({ engine: engineId, at: t0, reason, foundNew, beforeHeads, afterHeads, tookMs: Date.now() - t0, mode: 'fresh' })
+            return foundNew
+        } catch (e) {
+            recordReconnect({
+                engine: engineId, at: t0, reason, foundNew: null, beforeHeads, afterHeads: 'n/a', tookMs: Date.now() - t0,
+                error: e instanceof Error ? e.message : String(e),
+            })
+            return null
+        }
+    }
+
+    /**
+     * r86r: re-sync an alive link, retrying in slices while its host thread is blocked but recovering
+     * (heartbeat answered again since the last slice). Bounded by DURATION_REFRESH_REATTACH_MS (default 120 s).
+     */
+    private async reattachBounded(engineId: string, link: StoreDocLink): Promise<{ ok: boolean; hostBlocked: boolean; detail: string; boundMs: number }> {
+        const boundMs = Number(process.env.DURATION_REFRESH_REATTACH_MS ?? 120_000)
+        const sliceMs = Number(process.env.DURATION_REFRESH_REATTACH_SLICE_MS ?? 15_000)
+        const until = Date.now() + boundMs
+        let detail = 'not tried'
+        let blocked = false
+        for (let i = 1; ; i++) {
+            const ms = Math.max(1, Math.min(sliceMs, until - Date.now()))
+            if (await link.reattach(ms)) return { ok: true, hostBlocked: false, detail: 'ok', boundMs }
+            detail = link.lastReattachError ?? 'unknown'
+            blocked = link.hostState() !== ''
+            console.log(JSON.stringify({ event: 'stale_view_reattach_slice', engine: engineId, slice: i, host_blocked: blocked, detail }))
+            if (!link.alive || Date.now() >= until) break
+            if (!blocked) break // responsive host and still no peer/ready handle: a real disconnect
+        }
+        return { ok: false, hostBlocked: blocked && link.alive, detail, boundMs }
+    }
+
     /**
      * r29 FAIL@97: read-only list of operationDB rows (restore/copy/move evidence).
      * Never calls storeHandle.change().
@@ -1876,7 +2332,16 @@ export class RealFleetOps implements FleetOps {
         { id: string; kind: string; status: string; startedAt: number | null; completedAt: number | null; error: string | null; args: Record<string, string> }[]
     > {
         this.assertNotExcluded(engineId, 'listOperations')
-        const conn = await this.connect(engineId)
+        let conn = await this.connect(engineId)
+        // r66 stale-view guard (b): a doc unchanged for DURATION_STALE_VIEW_MS while the Pi answers → reconnect.
+        const key = headsKey(this.headsOf(conn))
+        const seen = this.viewSeen.get(engineId)
+        const now = Date.now()
+        if (!seen || seen.heads !== key) this.viewSeen.set(engineId, { heads: key, changedAt: now })
+        else if (now - seen.changedAt >= staleViewMs() && await this.engineHttpUp(conn.host)) {
+            await this.refreshView(engineId, `doc unchanged ${Math.round((now - seen.changedAt) / 1000)}s while ${engineId} is up`)
+            conn = await this.connect(engineId)
+        }
         const doc = conn.storeHandle.doc() as (Store & { operationDB?: Record<string, unknown> }) | undefined
         if (!doc) {
             throw new Error(`RealFleetOps: store doc not ready for ${engineId}`)
@@ -1917,23 +2382,15 @@ export class RealFleetOps implements FleetOps {
             this.commandLogUrls.set(engineId, url)
             registerOwnDoc(url, 'commandLog', engineId)
         }
-        const handle = conn.repo.findWithProgress<{ traces?: Record<string, unknown> }>(toDocId(url)).handle
-        const deadline = Date.now() + 5_000
-        while (!handle.isReady() && Date.now() < deadline) await sleep(100)
-        if (!handle.isReady()) throw new Error(`CommandLog ${url} of ${engineId} not ready within 5000ms`)
-        const doc = handle.doc()
-        return Object.entries(doc?.traces ?? {}).map(([id, raw]) => {
-            const t = (raw ?? {}) as Record<string, unknown>
-            return {
-                traceId: String(t.traceId ?? id),
-                command: String(t.command ?? ''),
-                args: typeof t.args === 'string' ? t.args : JSON.stringify(t.args ?? null),
-                status: String(t.status ?? ''),
-                startedAt: typeof t.startedAt === 'number' ? t.startedAt : null,
-                completedAt: typeof t.completedAt === 'number' ? t.completedAt : null,
-                errorMessage: t.errorMessage == null ? null : String(t.errorMessage),
-            }
-        })
+        // r86k: never sync the CommandLog on the main thread (150 s WASM block @43); read it off-thread.
+        let reader = this.commandLogReaders.get(engineId)
+        const wsUrl = `ws://${conn.host}:${this.enginePort}`
+        if (!reader || !reader.alive || reader.wsUrl !== wsUrl || reader.docUrl !== url) {
+            if (reader) void reader.close()
+            reader = new CommandLogReader(engineId, wsUrl, url)
+            this.commandLogReaders.set(engineId, reader)
+        }
+        return reader.list(5_000)
     }
 
     /**
@@ -1943,7 +2400,7 @@ export class RealFleetOps implements FleetOps {
      */
     async probeConsoleDist(engineId: string): Promise<ConsoleDistProbe> {
         this.assertNotExcluded(engineId, 'probeConsoleDist')
-        const out = await this.ssh(this.hostOf(engineId), consoleDistProbeScript())
+        const out = await this.sshRead(this.hostOf(engineId), consoleDistProbeScript())
         return parseConsoleDistProbe(out)
     }
 
@@ -1956,7 +2413,7 @@ export class RealFleetOps implements FleetOps {
         if (!/^[A-Za-z0-9_.-]+$/.test(instanceId)) {
             throw new Error(`RealFleetOps: refuse docker filter for odd instance id '${instanceId}'`)
         }
-        const out = await this.ssh(
+        const out = await this.sshRead(
             this.hostOf(engineId),
             `docker ps --filter name='^${instanceId}-' --format '{{.Names}}' 2>/dev/null || true`,
         )
@@ -1991,7 +2448,7 @@ export class RealFleetOps implements FleetOps {
         if (!device || !/^idea-test-[0-9]+$/.test(device)) return null
         const dest = `${this.disksRoot}/${device}`
         const repo = `${dest}/backups/${instanceId}`
-        const out = await this.ssh(
+        const out = await this.sshRead(
             this.hostOf(engineId),
             `if [ -f '${dest}/BACKUP.yaml' ]; then cat '${dest}/BACKUP.yaml'; else echo '@@NO_BACKUP_YAML@@'; fi; ` +
                 `echo '@@REPO@@'; if [ -d '${repo}' ]; then ls -1A '${repo}'; else echo '@@NO_REPO@@'; fi`,
@@ -2074,7 +2531,7 @@ export class RealFleetOps implements FleetOps {
             'docker ps -a --format "{{.Names}}" 2>/dev/null || true',
         ].join('; ')
         try {
-            const listed = (await this.ssh(host, listRemote)).trim()
+            const listed = (await this.sshRead(host, listRemote)).trim()
             const names = listed.split(/\s+/).map(n => n.replace(/^\//, '')).filter(Boolean)
             const targets = names.filter(n =>
                 !n.includes('idea166-') &&
@@ -2117,7 +2574,7 @@ export class RealFleetOps implements FleetOps {
         }
         const stopped: string[] = []
         for (const inst of Object.values(view.instanceDB)) {
-            if (inst.status !== 'Running' && inst.status !== 'Starting') continue
+            // r75: also remove Created/Pauzed containers of an interrupted install (orphan kolibri-6rgar…).
             const disk = inst.diskId ? view.diskDB[inst.diskId] : undefined
             if (disk && disk.dockedTo !== null) continue
             const idHits =
@@ -2182,12 +2639,29 @@ export class RealFleetOps implements FleetOps {
         await this.runHealthWrap(this.healthWrapAfter)
     }
 
+    /** Stage 1 loop-fixture hygiene; Stage2FleetOps returns false (no container removal on a --fast restart). */
+    protected fastRestartClearsContainers(): boolean {
+        return true
+    }
+
     private async rebootAndReconnect(engineId: string, host: string, fast: boolean): Promise<void> {
         if (fast) {
-            // Clear Path A duration containers before pm2 so they do not survive as orphans.
-            await this.stopDurationFixtureContainers(host)
+            // Stage 1: clear Path A duration containers before pm2 so they do not survive as orphans.
+            // Stage 2 (r60 FAIL@59): a real Engine restart never removes containers — see fastRestartClearsContainers.
+            if (this.fastRestartClearsContainers()) await this.stopDurationFixtureContainers(host)
             console.log(`[RealFleetOps] pm2 restart engine on ${engineId} (${host})`)
-            await this.ssh(host, 'pm2 restart engine')
+            // r67: gated + verified (a reset after GO is decided by the Engine process start time, never re-run blind).
+            const before = Number(String(await this.sshRead(host, 'date +%s')).trim())
+            await this.sshMutate(host, 'pm2 restart engine', {
+                verb: 'pm2 restart engine',
+                idempotent: true,
+                verify: async () => {
+                    const out = String(await this.sshRead(host, PM2_ENGINE_START_CMD)).trim()
+                    const started = Number(out)
+                    if (!Number.isFinite(started) || started <= 0) return 'unknown'
+                    return started >= before ? 'done' : 'not_done'
+                },
+            })
             // Brief pause then wait for WS.
             // Overnight smoke (idea#166): 60s withTimeout was too short after rapid
             // pm2 restarts on idea03 — Automerge reconnect lagged. Use 150s
@@ -2202,11 +2676,17 @@ export class RealFleetOps implements FleetOps {
             }
         } else {
             console.log(`[RealFleetOps] sudo reboot on ${engineId} (${host})`)
-            try {
-                await this.ssh(host, 'sudo reboot')
-            } catch {
-                // reboot often kills SSH mid-flight
-            }
+            // r67: gated — a failure before the command started is retried; a drop after GO (normal for a
+            // reboot) is decided read-only by the boot id changing (sshRead rides out the reboot itself).
+            const bootBefore = String(await this.sshRead(host, 'cat /proc/sys/kernel/random/boot_id')).trim()
+            await this.sshMutate(host, 'sudo reboot', {
+                verb: 'sudo reboot',
+                idempotent: false,
+                verify: async () => {
+                    const now = String(await this.sshRead(host, 'cat /proc/sys/kernel/random/boot_id')).trim()
+                    return now && now !== bootBefore ? 'done' : 'unknown'
+                },
+            })
             // Wait until SSH comes back, then WS
             const deadline = Date.now() + 300_000
             let sshUp = false
@@ -2228,12 +2708,38 @@ export class RealFleetOps implements FleetOps {
         }
     }
 
-    async undockFixtures(engineIds: string[], diskId: string): Promise<void> {
-        if (looksLikeProtectedHwDisk(diskId)) {
-            throw new Error(
-                `RealFleetOps: refuse to eject protected hw-roundtrip / system disk '${diskId}'`,
-            )
+    /**
+     * r86h FAIL@104: the walker's idea03 handle was wedged ("outdated document", after a
+     * "Websocket not ready (2)" during step 102), so storeHandle.change() for `ejectDisk` threw. The
+     * catch in undockFixtures only warned, so the eject was never sent (idea03's Engine log has no
+     * ejectDisk for step 104) and the harness waited the full 120 s for it.
+     * A store write now goes through here: on a throw, reconnect that engine once (fresh Repo and
+     * handle) and retry the write once. If it still fails → StoreWriteError (fail loud, never swallowed).
+     */
+    async changeStore(logicalId: string, conn: Conn, what: string, fn: (s: Store) => void): Promise<Conn> {
+        try {
+            await conn.storeHandle.change(fn)
+            return conn
+        } catch (e) {
+            const first = e instanceof Error ? e.message : String(e)
+            console.log(`[RealFleetOps] ${what} on ${logicalId}: store write failed (${first}); reconnecting once and retrying`)
+            await this.refreshView(logicalId, `${what}: store write failed (${first})`)
+            const fresh = this.conns.get(logicalId)
+            if (!fresh || fresh === conn) {
+                throw new StoreWriteError(`${what} on ${logicalId}: store write failed (${first}) and the reconnect gave no fresh connection — command NOT sent. Fail loud.`)
+            }
+            try {
+                await fresh.storeHandle.change(fn)
+                return fresh
+            } catch (e2) {
+                throw new StoreWriteError(`${what} on ${logicalId}: store write failed twice (${first}; after reconnect: ${e2 instanceof Error ? e2.message : String(e2)}) — command NOT sent. Fail loud.`)
+            }
         }
+    }
+
+    async undockFixtures(engineIds: string[], diskId: string): Promise<void> {
+        const idReason = protectedDiskReason(diskId)
+        if (idReason) throw new Error(protectedDiskRefusal('eject', null, diskId, idReason))
         for (const logicalId of engineIds) {
             if (this.exclude.includes(logicalId)) continue
             try {
@@ -2241,36 +2747,20 @@ export class RealFleetOps implements FleetOps {
                 const doc = conn.storeHandle.doc()
                 if (!doc) continue
 
-                const disk = doc.diskDB[diskId as keyof typeof doc.diskDB] as
+                // Only the disk asked for: by id, else by store name (a caller passing a name).
+                const disk = (doc.diskDB[diskId as keyof typeof doc.diskDB]
+                    ?? Object.values(doc.diskDB ?? {}).find(d => d && String(d.name) === diskId)) as
                     | { id?: string; name?: string; dockedTo?: string | null; device?: string | null }
                     | undefined
-
-                // Also scan by name/label for protected sticks if caller used a fixture id that
-                // happens to collide — and refuse ejecting anything that looks like the Intenso.
-                for (const d of Object.values(doc.diskDB ?? {})) {
-                    if (!d) continue
-                    if (looksLikeProtectedHwDisk(String(d.id), {
-                        name: d.name != null ? String(d.name) : null,
-                        device: d.device != null ? String(d.device) : null,
-                    }) && (String(d.id) === diskId || String(d.name) === diskId)) {
-                        throw new Error(
-                            `RealFleetOps: refuse to eject idea03 Intenso / protected disk ` +
-                            `'${d.id}' (name=${d.name})`,
-                        )
-                    }
-                }
-
                 if (!disk) {
                     // Fixture not present — already undocked
                     continue
                 }
-                if (looksLikeProtectedHwDisk(String(disk.id ?? diskId), {
-                    name: disk.name != null ? String(disk.name) : null,
-                    device: disk.device != null ? String(disk.device) : null,
-                })) {
-                    throw new Error(
-                        `RealFleetOps: refuse to eject protected disk '${disk.id ?? diskId}'`,
-                    )
+                const name = disk.name != null ? String(disk.name) : null
+                const storeDevice = disk.device != null ? String(disk.device) : null
+                const reason = protectedDiskReason(String(disk.id ?? diskId), { name, device: storeDevice })
+                if (reason) {
+                    throw new Error(protectedDiskRefusal('eject', logicalId, String(disk.id ?? diskId), reason, name, storeDevice))
                 }
                 if (!disk.dockedTo) continue // already undocked
 
@@ -2282,7 +2772,7 @@ export class RealFleetOps implements FleetOps {
                 }
                 // Prefer eject by id
                 console.log(`[RealFleetOps] ejectDisk ${diskId} on ${logicalId} (live=${liveTarget})`)
-                conn.storeHandle.change(s => {
+                await this.changeStore(logicalId, conn, `ejectDisk ${diskId}`, s => {
                     const eng = s.engineDB[liveTarget as keyof typeof s.engineDB] as
                         | { commands: string[] }
                         | undefined
@@ -2299,6 +2789,7 @@ export class RealFleetOps implements FleetOps {
                 }
             } catch (e) {
                 if (e instanceof Error && /refuse to eject/.test(e.message)) throw e
+                if (e instanceof StoreWriteError) throw e
                 console.warn(`[RealFleetOps] undockFixtures ${logicalId}/${diskId}: ${e}`)
             }
         }
@@ -2325,13 +2816,13 @@ export class RealFleetOps implements FleetOps {
 
     /** Read-only scan of idea-test-1..8 on engineId (one SSH round-trip). */
     private async scanFixtureSlots(engineId: string, diskId: string) {
-        return parseFixtureSlotScan(await this.ssh(this.hostOf(engineId), buildFixtureSlotScanRemote(this.disksRoot, diskId)))
+        return parseFixtureSlotScan(await this.sshRead(this.hostOf(engineId), buildFixtureSlotScanRemote(this.disksRoot, diskId)))
     }
 
     /** Run the app-pack instance-data check for `root` on engineId. */
     private async checkInstanceData(engineId: string, root: string, spec: AppPackInstanceData): Promise<{ ok: boolean; detail: string }> {
         try {
-            return parseInstanceDataCheck(await this.ssh(
+            return parseInstanceDataCheck(await this.sshRead(
                 this.hostOf(engineId),
                 buildInstanceDataCheckRemote({ root, spec, sudoMode: this.sudoMode }),
             ))
@@ -2408,7 +2899,7 @@ export class RealFleetOps implements FleetOps {
         const host = this.hostOf(engineId)
         let scan: SlotLinkScan
         try {
-            scan = parseSlotLinkScan(await this.ssh(host, buildSlotLinkScanRemote(slot, this.sudoMode, skipDirs)))
+            scan = parseSlotLinkScan(await this.sshRead(host, buildSlotLinkScanRemote(slot, this.sudoMode, skipDirs)))
         } catch (e) {
             scan = { error: `link scan failed over SSH: ${e instanceof Error ? e.message : String(e)}`, outside: [] }
         }
@@ -2440,7 +2931,7 @@ export class RealFleetOps implements FleetOps {
         const host = this.hostOf(engineId)
         let res: { error: string | null; hits: MountHit[] }
         try {
-            res = parseMountScan(await this.ssh(host, buildMountScanRemote(roots)))
+            res = parseMountScan(await this.sshRead(host, buildMountScanRemote(roots)))
         } catch (e) {
             res = { error: `mount scan failed over SSH: ${e instanceof Error ? e.message : String(e)}`, hits: [] }
         }
@@ -2507,7 +2998,7 @@ export class RealFleetOps implements FleetOps {
      * sentinel under IDEA_WATCH_DIR. Excludes instances/ unless startInstances.
      * Does not start Kolibri/Nextcloud — image not required for dock-only smoke.
      */
-    private async sshDockCopy(engineId: string, diskId: string, device: string): Promise<void> {
+    protected async sshDockCopy(engineId: string, diskId: string, device: string): Promise<void> {
         if (!/^idea-test-[0-9]+$/.test(device)) {
             throw new Error(`RealFleetOps: refuse non-test device '${device}' (must be idea-test-N)`)
         }
@@ -2562,7 +3053,7 @@ export class RealFleetOps implements FleetOps {
             ?? (await this.hasHealthyFixtureTree(engineId, diskId, { requireInstanceData: false, refuseExternalLinks: false }))
         if (!device || !/^idea-test-[0-9]+$/.test(device)) return null
         const dest = `${this.disksRoot}/${device}`
-        const out = await this.ssh(this.hostOf(engineId), `findmnt -no FSTYPE '${dest}' || true`)
+        const out = await this.sshRead(this.hostOf(engineId), `findmnt -no FSTYPE '${dest}' || true`)
         return { device, dest, fsType: String(out ?? '').trim() }
     }
 
@@ -2580,12 +3071,12 @@ export class RealFleetOps implements FleetOps {
             ?? (await this.hasHealthyFixtureTree(engineId, diskId, { requireInstanceData: false, refuseExternalLinks: false }))
         if (!device || !/^idea-test-[0-9]+$/.test(device)) return null
         const dest = `${this.disksRoot}/${device}`
-        const out = await this.ssh(this.hostOf(engineId), `ls -1A '${dest}' 2>/dev/null || true`)
+        const out = await this.sshRead(this.hostOf(engineId), `ls -1A '${dest}' 2>/dev/null || true`)
         const entries = String(out ?? '').split('\n').map(l => l.trim()).filter(Boolean)
         return { dest, entries }
     }
 
-    private async sshRemoveSentinel(engineId: string, device: string): Promise<void> {
+    protected async sshRemoveSentinel(engineId: string, device: string): Promise<void> {
         if (!/^idea-test-[0-9]+$/.test(device)) return
         assertPrivateDurationRoots(this.disksRoot, this.watchDir)
         const host = this.hostOf(engineId)
@@ -2678,9 +3169,8 @@ export class RealFleetOps implements FleetOps {
 
     async dockFixture(engineId: string, diskId: string): Promise<void> {
         this.assertNotExcluded(engineId, 'dockFixture')
-        if (looksLikeProtectedHwDisk(diskId)) {
-            throw new Error(`RealFleetOps: refuse to dock protected disk '${diskId}'`)
-        }
+        const dockReason = protectedDiskReason(diskId)
+        if (dockReason) throw new Error(protectedDiskRefusal('dock', engineId, diskId, dockReason))
         resolveDurationFixturePack(diskId) // validate known Kid id
         assertPrivateDurationRoots(this.disksRoot, this.watchDir)
 
@@ -2813,9 +3303,8 @@ export class RealFleetOps implements FleetOps {
             await this.dockFixture(toEngine, diskId)
             return
         }
-        if (looksLikeProtectedHwDisk(diskId)) {
-            throw new Error(`RealFleetOps: refuse to move protected disk '${diskId}'`)
-        }
+        const moveReason = protectedDiskReason(diskId)
+        if (moveReason) throw new Error(protectedDiskRefusal('move', fromEngine, diskId, moveReason))
         if (appPackInstanceData(diskId)) {
             try {
                 await this.moveDiskTree(fromEngine, toEngine, diskId)
@@ -2857,7 +3346,7 @@ export class RealFleetOps implements FleetOps {
         const deadline = Date.now() + timeoutMs
         let running: string[] = []
         for (;;) {
-            const out = await this.ssh(
+            const out = await this.sshRead(
                 host,
                 ids.map(id => `docker ps --filter name='^${id}-' --format '{{.Names}}' 2>/dev/null || true`).join('; '),
             ).catch(() => '')
@@ -2946,7 +3435,7 @@ export class RealFleetOps implements FleetOps {
         // re-links its own staged copies after the commit (same image, same file name).
         const moveTars = this.serviceTarsFor(diskId)
         const moveExclude = moveTars ? ['services'] : []
-        const plan = parseMovePlan(await this.ssh(srcHost, buildMovePlanRemote(srcSlot, this.sudoMode, skipDirs)))
+        const plan = parseMovePlan(await this.sshRead(srcHost, buildMovePlanRemote(srcSlot, this.sudoMode, skipDirs)))
         if (plan.error) throw new Error(`source ${fromEngine}:${srcSlot}: ${plan.error}`)
         if (plan.mountFsType) {
             throw new Error(
@@ -3059,10 +3548,10 @@ export class RealFleetOps implements FleetOps {
             // lastDocked, diskName quoting) — its identity (diskId + created) is compared parsed.
             const digestExclude = [...moveExclude, ...META_DIGEST_EXCLUDE]
             const [a, b, metaA, metaB] = await Promise.all([
-                this.ssh(srcHost, buildTreeDigestRemote(srcDigestRoot, spec.keyFile, this.sudoMode, skipPatterns, digestExclude)),
-                this.ssh(dstHost, buildTreeDigestRemote(staging, spec.keyFile, this.sudoMode, skipPatterns, digestExclude)),
-                this.ssh(srcHost, buildMetaCatRemote(srcDigestRoot, this.sudoMode)),
-                this.ssh(dstHost, buildMetaCatRemote(staging, this.sudoMode)),
+                this.sshRead(srcHost, buildTreeDigestRemote(srcDigestRoot, spec.keyFile, this.sudoMode, skipPatterns, digestExclude)),
+                this.sshRead(dstHost, buildTreeDigestRemote(staging, spec.keyFile, this.sudoMode, skipPatterns, digestExclude)),
+                this.sshRead(srcHost, buildMetaCatRemote(srcDigestRoot, this.sudoMode)),
+                this.sshRead(dstHost, buildMetaCatRemote(staging, this.sudoMode)),
             ])
             const metaSrc = parseMetaCat(metaA)
             const metaDst = parseMetaCat(metaB)
@@ -3186,9 +3675,8 @@ export class RealFleetOps implements FleetOps {
      */
     async purgeInstancesStoredOn(engineId: string, diskId: string): Promise<void> {
         this.assertNotExcluded(engineId, 'purgeInstancesStoredOn')
-        if (looksLikeProtectedHwDisk(diskId)) {
-            throw new Error(`RealFleetOps: refuse to purge instances on protected disk '${diskId}'`)
-        }
+        const purgeReason = protectedDiskReason(diskId)
+        if (purgeReason) throw new Error(protectedDiskRefusal('purge instances on', engineId, diskId, purgeReason))
         if (!looksLikeDurationFixtureId(diskId)) {
             throw new Error(
                 `RealFleetOps: refuse to purge instances on non-duration disk '${diskId}'`,
@@ -3203,7 +3691,8 @@ export class RealFleetOps implements FleetOps {
         const toPurge: { id: string; status: string }[] = []
         for (const [id, inst] of Object.entries(doc.instanceDB ?? {})) {
             if (!inst) continue
-            if (String((inst as { storedOn?: unknown }).storedOn) !== String(diskId)) continue
+            // r75 fix 2: same predicate as diskEmptiness / preflightFilesDiskTarget.
+            if (!instanceStoredOn(inst as { storedOn?: unknown }, diskId)) continue
             toPurge.push({
                 id: String((inst as { id?: unknown }).id ?? id),
                 status: String((inst as { status?: unknown }).status ?? ''),
@@ -3240,7 +3729,7 @@ export class RealFleetOps implements FleetOps {
             await sleep(1500)
         }
         const purgeIds = toPurge.map(i => i.id)
-        conn.storeHandle.change(s => {
+        await this.changeStore(engineId, conn, `purgeInstancesStoredOn ${diskId}`, s => {
             for (const id of purgeIds) {
                 if (s.instanceDB[id as keyof typeof s.instanceDB]) {
                     delete s.instanceDB[id as keyof typeof s.instanceDB]
@@ -3260,8 +3749,25 @@ export class RealFleetOps implements FleetOps {
         )
     }
 
+    /** r75 fix 1: raw instance rows stored on diskId (READ-ONLY), for the in-flight gate before a reset. */
+    async diskInstancesRaw(engineId: string, diskId: string): Promise<DiskInstanceRow[]> {
+        this.assertNotExcluded(engineId, 'diskInstancesRaw')
+        const conn = await this.connect(engineId)
+        const doc = conn.storeHandle.doc()
+        if (!doc) throw new Error(`RealFleetOps: store doc not ready for ${engineId}`)
+        const rows: DiskInstanceRow[] = []
+        for (const [id, inst] of Object.entries(doc.instanceDB ?? {})) {
+            const i = inst as { id?: unknown; status?: unknown; currentStep?: unknown; storedOn?: unknown } | undefined
+            if (!i || !instanceStoredOn(i, diskId)) continue
+            rows.push({ id: String(i.id ?? id), status: String(i.status ?? ''), currentStep: typeof i.currentStep === 'number' ? i.currentStep : null })
+        }
+        return rows
+    }
+
     /** Drop all open WS connections (tests / process exit). */
     async close(): Promise<void> {
+        await Promise.allSettled([...this.commandLogReaders.values()].map(r => r.close()))
+        this.commandLogReaders.clear()
         await Promise.allSettled([...this.connecting.values()])
         const ids = [...this.conns.keys()]
         for (const id of ids) await this.disconnect(id, 'walker closing')

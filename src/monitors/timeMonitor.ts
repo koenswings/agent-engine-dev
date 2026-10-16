@@ -3,7 +3,6 @@ import { doc } from 'lib0/dom.js'
 import { Timestamp } from '../data/CommonTypes.js'
 import { inspectEngine } from '../data/Engine.js'
 import { Store, getLocalEngine } from '../data/Store.js'
-import { currentLanAddress } from '../data/LanAddress.js'
 import { log, contains, deepPrint } from '../utils/utils.js'
 
 export const enableTimeMonitor = (interval, callback) => {
@@ -71,22 +70,5 @@ export const logTimeCallback = () => {
 //     }
 // }
 
-let runs = 0
-
-export const generateHeartBeat = (storeHandle) => {
-    runs++
-    storeHandle.change(doc => {
-        const lastRun = (new Date()).getTime() as Timestamp
-        log(`UPDATING ENGINE LASTRUN TO ${lastRun}`)
-        //log(`This is the doc to change: ${deepPrint(doc, 2)}`)
-        const localEngine = getLocalEngine(doc)
-        localEngine.lastRun = lastRun
-        // LAN IPv4 for the Console (agent-console-dev#138): written only when it changed (DHCP)
-        const lan = currentLanAddress()
-        if ((localEngine.lanAddress ?? null) !== lan) {
-            log(`Engine lanAddress ${localEngine.lanAddress ?? 'unset'} → ${lan ?? 'null'}`)
-            localEngine.lanAddress = lan
-        }
-        //inspectEngine(store, localEngine)
-    })
-} 
+// The stored heartbeat (lastRun every 30 s) moved to data/Liveness.ts (store-design
+// 2026-10-13): an ephemeral hb every 10 s plus a stored lastRun at boot and hourly.

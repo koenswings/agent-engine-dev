@@ -24,11 +24,13 @@ import { log } from '../utils/utils.js'
 import { Store, getDisk, getLocalEngine } from './Store.js'
 import { resolveDiskArg } from './DiskArg.js'
 import { buildInstance } from './Instance.js'
+import { parseAppId } from './App.js'
 import { AppID, AppName, DiskID, DiskName, InstanceName, Version } from './CommonTypes.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Disk, diskMountRoot } from './Disk.js'
 import { App, createOrUpdateApp } from './App.js'
 import { assertNoExternalLinks } from './InstanceCopy.js'
+import { trackInFlight } from './InstanceInFlight.js'
 
 // ── Internet probe ────────────────────────────────────────────────────────────
 
@@ -39,6 +41,8 @@ import { assertNoExternalLinks } from './InstanceCopy.js'
 export const hasInternet = (): Promise<boolean> => {
     // Test hook: Prefer A r31 unit coverage for offline alt-disk fallback
     if (process.env.IDEA_INSTALL_FORCE_OFFLINE === 'true') return Promise.resolve(false)
+    // Test hook: idea#168 r81 unit coverage for the GitHub route without a network probe
+    if (process.env.IDEA_INSTALL_FORCE_ONLINE === 'true') return Promise.resolve(true)
     return new Promise(resolve => {
         const socket = net.createConnection({ host: '1.1.1.1', port: 53 })
         const timer = setTimeout(() => { socket.destroy(); resolve(false) }, 2000)
@@ -168,7 +172,16 @@ const findDockedDiskWithApp = async (store: Store, appId: AppID, excludeDiskId?:
     return undefined
 }
 
+/** #179: an install is in flight on its target disk until it settles, so an eject waits for it. */
 export const installApp = async (
+    storeHandle: DocHandle<Store>,
+    opts: InstallAppOptions
+): Promise<void> => {
+    const target = resolveDiskArg(storeHandle.doc(), getLocalEngine(storeHandle.doc())?.id, opts.targetDiskId, 'installApp')
+    return trackInFlight(String(target.id), `installApp ${opts.appId}`, installAppRouted(storeHandle, opts))
+}
+
+const installAppRouted = async (
     storeHandle: DocHandle<Store>,
     opts: InstallAppOptions
 ): Promise<void> => {
@@ -204,10 +217,20 @@ export const installApp = async (
     if (online) {
         // Route 2: GitHub path (existing buildInstance logic)
         log(chalk.blue(`installApp: GitHub path (internet available)`))
-        const appName = opts.appId.slice(0, opts.appId.lastIndexOf('-')) as AppName
-        const version = opts.appId.slice(opts.appId.lastIndexOf('-') + 1) as Version
+        const { name: appName, version } = parseAppId(opts.appId)
         const targetDevice = targetDisk.device!
-        await buildInstance(instanceName, appName, gitAccount, version, targetDevice as any)
+        const instanceId = await buildInstance(instanceName, appName, gitAccount, version, targetDevice as any)
+        if (!instanceId) {
+            throw new Error(`installApp: GitHub build of '${opts.appId}' on disk '${targetDisk.name}' failed (see Engine log)`)
+        }
+        // idea#168 r81: buildInstance only writes apps/ + instances/<id> on the disk. Register the
+        // app and the instance in the store and start it, exactly like the local route
+        // (installAppFromDisk). Without this the instance stayed invisible (no instanceDB row,
+        // no container) until the disk was next re-docked.
+        await createOrUpdateApp(storeHandle, opts.appId, targetDisk as Disk)
+        const { processInstance } = await import('./Disk.js')
+        await processInstance(storeHandle, targetDisk as Disk, instanceId)
+        log(chalk.green(`installApp: installed '${opts.appId}' as instance '${instanceName}' on disk '${targetDisk.name}' (GitHub)`))
         return
     }
 
@@ -232,7 +255,7 @@ export const installApp = async (
     }
 
     // No local source found
-    const appName = opts.appId.slice(0, opts.appId.lastIndexOf('-')) as AppName
+    const appName = parseAppId(opts.appId).name
     throw new Error(
         `installApp: App '${appName}' not found locally. ` +
         `Insert a disk containing '${appName}' or connect to the internet.`
