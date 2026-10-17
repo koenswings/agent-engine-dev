@@ -10,7 +10,8 @@ import { clearUndockPending, dockChangedReason, dockIdentityOf, ejectInFlightWai
 import { isSystemDevice, systemDriveNames, driveNameOf } from '../data/SystemDisk.js'
 import { refreshUnformattedDisks } from '../data/UnformattedDisks.js'
 import { setInitialiseAddDevice } from '../data/FlashCard.js'
-import { eraseLockRefusesAdd, isEraseDeviceLocked, setEraseAddDevice } from '../data/EraseDisk.js'
+import { singleFlight } from '../utils/singleFlight.js'
+import { eraseLockRefusesAdd, isEraseDeviceLocked, setEraseAddDevice, setEraseForgetDevice, noteEraseSkippedAdd } from '../data/EraseDisk.js'
 import { findDiskByDevice, findDisksByDevice, Store, getDisksOfEngine, getLocalEngine } from '../data/Store.js'
 import { DeviceName, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../data/CommonTypes.js'
 
@@ -189,7 +190,8 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
             }
             // Skip devices locked by eraseDisk for the whole erase (idea#134)
             if (eraseLockRefusesAdd(device)) {
-                log(`Device ${device} is locked for erase — addDevice skipped`)
+                log(`Device ${device} is locked for erase — addDevice skipped (re-added when the erase releases it)`)
+                noteEraseSkippedAdd(device)
                 return
             }
 
@@ -288,8 +290,19 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         }
     }
 
-        setEraseAddDevice(addDevice)
-        setInitialiseAddDevice(addDevice)
+    /**
+     * One add per device at a time: a udev add that arrives while eraseDisk's re-add of the same
+     * partition is running joins it instead of mounting and registering the disk a second time.
+     */
+    const addDeviceOnce = singleFlight(
+        (path: string) => path.split('/').pop() as string,
+        addDevice,
+        (device) => log(`An add of ${device} is already running — joining it`),
+    )
+
+        setEraseAddDevice(addDeviceOnce)
+        setEraseForgetDevice((device) => { metaLooks.delete(device) })
+        setInitialiseAddDevice(addDeviceOnce)
 
     const removeDevice = async (path: string) => {
         const device = path.split('/').pop()
@@ -402,7 +415,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     const watcher = watchDeviceFolder(watchDir)
 
     watcher
-        .on('add', addDevice)
+        .on('add', addDeviceOnce)
         .on('unlink', removeDevice)
         .on('error', error => recordDiskDetectionFailure('watcher', `Watcher error on ${watchDir}: ${errorMessage(error)}`, { watchDir }))
 
