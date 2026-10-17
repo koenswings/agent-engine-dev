@@ -1,4 +1,5 @@
 import { $, YAML, chalk, fs, os } from 'zx';
+import path from 'path';
 import { deepPrint, log } from '../utils/utils.js';
 import { App, createAppId, createOrUpdateApp, extractAppName, extractAppVersion } from './App.js'
 import { Instance, Status, createOrUpdateInstance, startInstance } from './Instance.js'
@@ -376,6 +377,20 @@ export const diskMountRoot = async (disk: Disk): Promise<string> => {
  */
 export const deviceMountRoot = async (device: string): Promise<string> =>
     diskMountRoot({ device } as unknown as Disk)
+
+/**
+ * Join path parts under a mount root from diskMountRoot / deviceMountRoot (idea#237).
+ * The system disk's root is '' (right for template strings: `${root}/instances` is
+ * /instances), but path.join('', 'instances', id) is the RELATIVE 'instances/<id>'.
+ * This always gives an absolute path: '/instances/<id>' for the system disk,
+ * '<disksRoot>/<device>/instances/<id>' for any other disk.
+ */
+export const joinMountRoot = (mountRoot: string, ...parts: string[]): string =>
+    path.join(mountRoot || '/', ...parts)
+
+/** Absolute path of parts on a disk (joinMountRoot of diskMountRoot), e.g. diskPath(disk, 'instances', id). */
+export const diskPath = async (disk: Disk, ...parts: string[]): Promise<string> =>
+    joinMountRoot(await diskMountRoot(disk), ...parts)
 
 /**
  * The disk's root token for the app-data root helper (/usr/local/sbin/idea-app-data,
