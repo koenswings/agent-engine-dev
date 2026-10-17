@@ -44,6 +44,8 @@ pi ALL=(root) NOPASSWD: /usr/bin/tee /disks/sd[a-z][12]/META.yaml
 pi ALL=(root) NOPASSWD: /usr/bin/rmdir /disks/sd[a-z][12]
 pi ALL=(root) NOPASSWD: /usr/bin/chown -h pi\:pi /disks/sd[a-z][12]
 pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-erase-disk
+# idea#201 §10: client-card flash helper (validates every argument itself)
+pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-flash-card
 pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-app-data
 pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]
 pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 -o ro\,noload /dev/sd[a-z][12] /disks/sd[a-z][12]

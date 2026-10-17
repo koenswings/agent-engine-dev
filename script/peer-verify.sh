@@ -237,6 +237,7 @@ revert_all() {
     done
 }
 
+# shellcheck disable=SC2329  # invoked indirectly (trap / poll / retry)
 on_exit() {
     local rc=$?
     trap - EXIT INT TERM
@@ -263,6 +264,7 @@ store_authorized() {  # store_authorized <viaIdx> <ofIdx> → sorted authorized 
 idx_of_engine() { local i; for i in "${!NAMES[@]}"; do [[ "${ENGINE_ID[$i]}" == "$1" ]] && { echo "$i"; return 0; }; done; return 1; }
 wait_engine_up() {  # wait_engine_up <idx> <previous lastBooted> <timeout>
     local i=$1 prev=$2
+    # shellcheck disable=SC2329  # invoked indirectly (trap / poll / retry)
     _up() { local lb; lb=$(engine_field "$i" lastBooted) && [[ -n "$lb" && "$lb" != "$prev" ]] \
         && [[ "$(rsh "$i" "pm2 jlist" | jq -r '.[]|select(.name=="engine")|.pm2_env.status')" == online ]]; }
     poll "$3" _up
@@ -276,6 +278,7 @@ peer_ssh() {
 }
 
 # ── post-state and summary ───────────────────────────────────────────────────
+# shellcheck disable=SC2329  # invoked indirectly (trap / poll / retry)
 post_state() {
     step "6 post-state"
     local i j bad out pre_auth now_auth failed
@@ -311,6 +314,7 @@ post_state() {
     done
 }
 
+# shellcheck disable=SC2329  # invoked indirectly (trap / poll / retry)
 summary() {
     local rc=$1
     {
@@ -552,6 +556,7 @@ copy_one() {  # copy_one <srcIdx> <tgtIdx>
     store "$a" push-command "${ENGINE_ID[$a]}" "copyApp ${SCRATCH_INST[$a]} ${SCRATCH_DISK[$a]} ${SCRATCH_DISK[$b]}" >/dev/null \
         || { result "$tag" FAIL "cannot push copyApp"; return; }
     log "$tag: pushed copyApp ${SCRATCH_INST[$a]} ${SCRATCH_DISK[$a]} ${SCRATCH_DISK[$b]}"
+    # shellcheck disable=SC2329  # invoked indirectly (trap / poll / retry)
     _op() {
         dump "$a" --ops-since $(( (t0 - 900) * 1000 )) --disks "${SCRATCH_DISK[$b]}" || return 1
         op=$(jq -c --arg i "${SCRATCH_INST[$a]}" --argjson pre "$(jq -R . <<<"$pre_ops" | jq -s .)" \
@@ -684,6 +689,7 @@ RS
     lr=$(dump "$h1" && jq -r --arg id "${ENGINE_ID[$h2]}" '.engineDB[$id].lastRun' <<<"$DUMP")
     rsh "$h2" "mkdir -p $STATE && touch $STATE/engine-stopped && pm2 stop engine >/dev/null" || { result "$tag" FAIL "cannot stop ${NAMES[$h2]}'s Engine"; return; }
     t_stop=$(now_s); log "${NAMES[$h2]}: pm2 stop engine; waiting up to ${STALE_TIMEOUT}s for ${NAMES[$h1]} to drop it (stale after 180 s)"
+    # shellcheck disable=SC2329  # invoked indirectly (trap / poll / retry)
     _dropped() { p=$(present "$h1" "$h2") && [[ "$p" == "0 0 0" ]] && log_since "$h1" | grep -q "peer key removed: Engine ${ENGINE_ID[$h2]} .*stale"; }
     if poll "$STALE_TIMEOUT" _dropped; then
         t_drop=$(now_s); log "${NAMES[$h1]} dropped ${NAMES[$h2]} $(( t_drop - t_stop )) s after the stop"
@@ -696,7 +702,9 @@ RS
     # start host 2 again; it must return within one heartbeat of being seen
     rsh "$h2" "pm2 start engine >/dev/null && rm -f $STATE/engine-stopped && rmdir $STATE 2>/dev/null; true"
     t_start=$(now_s); log "${NAMES[$h2]}: pm2 start engine"
+    # shellcheck disable=SC2329  # invoked indirectly (trap / poll / retry)
     _seen() { local l; l=$(dump "$h1" && jq -r --arg id "${ENGINE_ID[$h2]}" '.engineDB[$id].lastRun' <<<"$DUMP") && [[ -n "$l" && "$l" != "$lr" && "$l" != null ]]; }
+    # shellcheck disable=SC2329  # invoked indirectly (trap / poll / retry)
     _back() { p=$(present "$h1" "$h2") && [[ "$p" == "1 1 1" ]]; }
     PV_POLL_SAVE=$PV_POLL; PV_POLL=2
     if poll 240 _seen; then
@@ -714,6 +722,7 @@ RS
     revert_host "$h1"
     rsh "$h1" "grep -c peerStaleHours $cfg" >/dev/null 2>&1 && bad+=("peerStaleHours still in config.yaml after the revert")
     [[ "$(rsh "$h1" "sha256sum $cfg | cut -c1-64")" == "${CFG_SHA[$h1]}" ]] || bad+=("config.yaml not byte-identical after the revert")
+    # shellcheck disable=SC2329  # invoked indirectly (trap / poll / retry)
     _orig() { local o; o=$(rsh "$h1" "sha256sum $AUTH_FILE $KH_FILE | cut -c1-64 | tr '\n' ' '") && [[ "$o" == "${AUTH_SHA[$h1]} ${KH_SHA[$h1]} " ]] && _back; }
     poll 120 _orig || bad+=("${NAMES[$h1]}'s peer files did not return to their start content within 120 s after the revert")
     if (( ${#bad[@]} )); then result "$tag" FAIL "$(IFS=';'; echo "${bad[*]}")"

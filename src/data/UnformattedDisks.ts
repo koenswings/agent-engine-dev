@@ -32,20 +32,24 @@ export interface LsblkDevice {
     size?: string | number
     model?: string | null
     serial?: string | null
+    /** lsblk RM: removable medium (card reader / SD). Such a device is a client card (idea#201 §10), never an Erase target. */
+    rm?: boolean | number | string | null
     children?: LsblkDevice[]
 }
 
 export interface UnformattedOps {
     lsblkJson: () => Promise<LsblkDevice[]>
+    hardwareId: (device: string) => Promise<string | undefined>
 }
 
 const defaultOps: UnformattedOps = {
     lsblkJson: async () => {
-        const out = await $`lsblk -J -b -o NAME,TYPE,FSTYPE,SIZE,MODEL,SERIAL`.nothrow()
+        const out = await $`lsblk -J -b -o NAME,TYPE,FSTYPE,SIZE,MODEL,SERIAL,RM`.nothrow()
         if (out.exitCode !== 0 || !out.stdout.trim()) return []
         const parsed = JSON.parse(out.stdout) as { blockdevices?: LsblkDevice[] }
         return parsed.blockdevices ?? []
     },
+    hardwareId: async (device) => (await readHardwareId(device as any)) as string | undefined,
 }
 
 let ops = defaultOps
@@ -99,6 +103,33 @@ export const uniquifyLabels = (items: { label: string }[]): void => {
 }
 
 /**
+ * The candidateId of a whole disk without IDEA META (idea#134; idea#201 §10 contract v2:
+ * one id space, so Engine.newDisks / clientCards use the same id as unformattedDisks).
+ * Hardware id for known models (Meta.readHardwareId), else the lsblk serial, else a
+ * generated id that stays stable while the disk stays plugged.
+ */
+export const candidateIdFor = async (name: string, serialRaw: string | null): Promise<{ candidateId: string, serial: string | null }> => {
+    const generated = (): string => {
+        if (!generatedIds.has(name)) generatedIds.set(name, uuid())
+        return generatedIds.get(name)!
+    }
+    try {
+        const hw = await ops.hardwareId(name)
+        if (hw) return { candidateId: hw, serial: hw }
+    } catch { /* fall through */ }
+    if (serialRaw) return { candidateId: serialRaw, serial: serialRaw }
+    return { candidateId: generated(), serial: null }
+}
+
+/** lsblk RM column (bool in recent util-linux, "1"/1 in older). Same rule as ClientCards. */
+export const isRemovableMedium = (d: LsblkDevice): boolean => d.rm === true || d.rm === 1 || d.rm === '1' || d.rm === 'true'
+
+/** Forget the generated id of a device that is gone (called by every scanner). */
+export const forgetGeneratedIdsExcept = (present: Set<string>): void => {
+    for (const k of [...generatedIds.keys()]) if (!present.has(k)) generatedIds.delete(k)
+}
+
+/**
  * Scan lsblk and return whole non-system disks that have no ext4 anywhere
  * (including partition 3+). System and swap-only handling: a disk with swap but
  * no ext4 is still listed (erase script refuses swap at erase time); we exclude
@@ -115,28 +146,13 @@ export const scanUnformattedDisks = async (): Promise<UnformattedDisk[]> => {
         if (!/^sd[a-z]$/.test(name)) continue  // whole sdX only; partitions 3+ out of scope for listing parents with ext4 on p3 still excluded via hasExt4
         seen.add(name)
         if (await isSystemDevice(name)) continue
+        // idea#201 §10: a removable medium is listed in Engine.clientCards (Flash), never here (no Erase on a client card)
+        if (isRemovableMedium(d)) continue
         if (hasExt4(d)) continue
         const sizeBytes = typeof d.size === 'number' ? d.size : parseInt(String(d.size ?? '0'), 10) || 0
         const model = d.model?.trim() || null
         const serialRaw = d.serial?.trim() || null
-        // Prefer hardware id for known models (Meta.readHardwareId), else lsblk serial, else generated
-        let candidateId: string
-        let serial: string | null = serialRaw
-        try {
-            const hw = await readHardwareId(name as any)
-            if (hw) { candidateId = hw; serial = hw }
-            else if (serialRaw) candidateId = serialRaw
-            else {
-                if (!generatedIds.has(name)) generatedIds.set(name, uuid())
-                candidateId = generatedIds.get(name)!
-            }
-        } catch {
-            if (serialRaw) candidateId = serialRaw
-            else {
-                if (!generatedIds.has(name)) generatedIds.set(name, uuid())
-                candidateId = generatedIds.get(name)!
-            }
-        }
+        const { candidateId, serial } = await candidateIdFor(name, serialRaw)
         out.push({
             candidateId,
             device: name,
@@ -147,10 +163,14 @@ export const scanUnformattedDisks = async (): Promise<UnformattedDisk[]> => {
             serial,
         })
     }
-    for (const k of [...generatedIds.keys()]) if (!seen.has(k)) generatedIds.delete(k)
+    forgetGeneratedIdsExcept(seen)
     uniquifyLabels(out)
     return out
 }
+
+let afterRefresh: ((h: DocHandle<Store>) => Promise<void>) | null = null
+/** idea#201 §10: run after every refresh (client cards / new disks share the trigger). */
+export const setAfterUnformattedRefresh = (fn: ((h: DocHandle<Store>) => Promise<void>) | null): void => { afterRefresh = fn }
 
 /** Write Engine.unformattedDisks for this Engine (whole-list replace). */
 export const refreshUnformattedDisks = async (
@@ -166,5 +186,6 @@ export const refreshUnformattedDisks = async (
         }))
     })
     log(`Unformatted disks: ${list.map(d => `${d.device}(${d.label})`).join(', ') || '(none)'}`)
+    if (afterRefresh) await afterRefresh(storeHandle).catch(e => log(`after unformatted refresh: ${e}`))
     return list
 }

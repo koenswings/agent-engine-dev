@@ -63,7 +63,7 @@ describe('system disk helper + mount command (idea#134)', () => {
     })
 
     it('ENGINE_CAPABILITIES includes eraseDisk', () => {
-        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly'])
+        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages'])
     })
 })
 
@@ -102,6 +102,22 @@ describe('unformattedDisks scan (idea#134)', () => {
         expect(names).not.toContain('sdc')
         expect(list.find(d => d.device === 'sdb')!.candidateId).toBe('STICK1')
         expect(list.find(d => d.device === 'sdb')!.label).toMatch(/SanDisk/)
+    })
+
+    it('a removable medium (client card / card reader) is never listed (idea#201 §10)', async () => {
+        setSystemDiskOpsForTests({ findmntSource: async () => null, pkname: async () => null })
+        setUnformattedOpsForTests({
+            lsblkJson: async () => [
+                { name: 'sdc', type: 'disk', size: '15931539456', model: 'Mass Storage Device', serial: '121220160204', rm: true, children: [
+                    { name: 'sdc1', type: 'part', fstype: 'vfat', size: '268435456' },
+                    { name: 'sdc2', type: 'part', fstype: null, size: '268435456' },
+                ]},
+                { name: 'sdd', type: 'disk', size: '0', model: 'Card Reader', serial: 'R2', rm: '1', children: [] },
+                { name: 'sde', type: 'disk', size: '8000000000', model: 'HDD', serial: 'FIXED', rm: false, children: [] },
+            ],
+        })
+        const names = (await scanUnformattedDisks()).map(d => d.device)
+        expect(names).toEqual(['sde'])
     })
 
     it('labels get (2) on a clash (display only)', () => {

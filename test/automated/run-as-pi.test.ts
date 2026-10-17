@@ -155,6 +155,7 @@ describe('Engine sudoers asset (idea#80)', () => {
             // createFilesDisk: the disk root folder only, never recursive (idea#131)
             'pi ALL=(root) NOPASSWD: /usr/bin/chown -h pi\\:pi /disks/sd[a-z][12]',
             'pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-erase-disk',
+            'pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-flash-card',
             // app data as root (idea#168): one helper, no argument list (the helper validates)
             'pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-app-data',
             'pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]',
