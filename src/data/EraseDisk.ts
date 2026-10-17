@@ -51,6 +51,35 @@ export const eraseLockRefusesAdd = (device: string): boolean =>
     isEraseDeviceLocked(device) || isEraseDeviceLocked(driveNameOf(device.replace(/^\/dev\/(engine\/)?/, '')))
 export const eraseLockedDevicesForTests = (): Set<string> => lockedDevices
 
+/**
+ * Partition adds that the erase lock refused, per locked drive (idea01 2026-10-16, trace 93de80a4:
+ * "Device sda1 is locked for erase — addDevice skipped" twice, nothing re-added sda1, and the erase
+ * failed with "did not come back as empty"). When the lock is released, eraseDisk adds these again.
+ */
+const skippedAdds = new Map<string, Set<string>>()
+const bareName = (device: string): string => device.replace(/^\/dev\/(engine\/)?/, '')
+/** Called by the addDevice guard when it refuses an add: remember the partition for the re-add. */
+export const noteEraseSkippedAdd = (device: string): void => {
+    const name = bareName(device)
+    const whole = isEraseDeviceLocked(name) ? name : driveNameOf(name)
+    if (!isEraseDeviceLocked(whole) || name === whole) return
+    let set = skippedAdds.get(whole)
+    if (!set) { set = new Set(); skippedAdds.set(whole, set) }
+    set.add(name)
+}
+/** Release the erase lock on a drive; returns (and forgets) the partition adds it refused. */
+export const releaseEraseLock = (whole: string): string[] => {
+    lockedDevices.delete(whole)
+    const skipped = [...(skippedAdds.get(whole) ?? [])]
+    skippedAdds.delete(whole)
+    return skipped
+}
+export const eraseSkippedAddsForTests = (): Map<string, Set<string>> => skippedAdds
+
+/** A partition of this drive by name: sda → sda1, sda2 (not sdaa1); mmcblk0 / nvme0n1 → p1. */
+export const isPartitionOfDrive = (whole: string, device: string): boolean =>
+    device !== whole && device.startsWith(whole) && /^p?[0-9]+$/.test(device.slice(whole.length))
+
 export interface EraseScriptArgs {
     device: string       // /dev/sdX
     serial: string       // or "-"
@@ -82,6 +111,8 @@ export interface EraseOps {
      * table can't be checked. Injectable for tests.
      */
     hiddenTablePartitions: (wholeDevice: string) => Promise<HiddenPartition[]>
+    /** Partitions of a whole device the kernel shows now (/sys/block/<whole>); injectable for tests */
+    presentPartitions: (wholeDevice: string) => Promise<string[]>
 }
 
 export interface HiddenPartition { partition: string; name: string | null }
@@ -143,6 +174,10 @@ const defaultOps: EraseOps = {
         }
         return parseHiddenPartitions(out.stdout)
     },
+    presentPartitions: async (whole) => {
+        const entries = await fs.readdir(`/sys/block/${whole}`).catch(() => [] as string[])
+        return entries.filter(e => isPartitionOfDrive(whole, e)).sort()
+    },
 }
 
 let ops = defaultOps
@@ -154,6 +189,14 @@ export const setEraseOpsForTests = (o: Partial<EraseOps> | null): void => {
 /** Wire the live addDevice from enableUsbDeviceMonitor. */
 export const setEraseAddDevice = (fn: ((path: string) => Promise<void>) | null): void => {
     addDeviceImpl = fn
+}
+let forgetDeviceImpl: ((device: string) => void) | null = null
+/**
+ * Wire the usb monitor's "forget what you know about this device" (its cached META look). The
+ * erase rewrote the partition, so a look cached before the erase must not decide the re-add.
+ */
+export const setEraseForgetDevice = (fn: ((device: string) => void) | null): void => {
+    forgetDeviceImpl = fn
 }
 
 const setEraseStep = (storeHandle: DocHandle<Store>, step: EraseInProgress['step'], targetId: string, label: string) => {
@@ -508,16 +551,35 @@ export const eraseDisk = async (
         // ("Device sdb1 is locked for erase — addDevice skipped"). The disk then never came back, and
         // the erase failed with "did not come back as empty" (wizardly-hugle 2026-10-12 18:46).
         // The finally below still deletes the lock (idempotent) on every path.
-        lockedDevices.delete(whole)
-        await add(`/dev/engine/${partition}`)
+        // udev's own add for the new partition usually arrives while the lock is still held and is
+        // refused (idea01 2026-10-16, trace 93de80a4). So on release, add every partition of the
+        // drive that was refused, or that the kernel shows now, plus the expected one: each once.
+        const skipped = releaseEraseLock(whole)
+        const rescan = async (why: string) => {
+            const names = new Set<string>([partition])
+            if (!slotErase) {
+                for (const d of skipped) names.add(d)
+                const present = await ops.presentPartitions(whole).catch(() => [] as string[])
+                for (const d of present) if (isPartitionOfDrive(whole, d)) names.add(d)
+            }
+            if (skipped.length) log(`eraseDisk: ${why}: re-adding ${[...names].join(', ')} (refused while locked: ${skipped.join(', ')})`)
+            for (const d of names) {
+                forgetDeviceImpl?.(d)
+                try { await add(`/dev/engine/${d}`) } catch (e: any) { log(`eraseDisk: add of ${d} failed: ${e?.message ?? e}`) }
+            }
+        }
+        await rescan('erase lock released')
 
         // Wait briefly for the disk to appear as empty
         let published: Disk | undefined
         // A USB first mount can take longer than the old 4 s: wait up to ERASE_REPUBLISH_WAIT_MS.
-        for (let i = 0; i < Math.ceil(ERASE_REPUBLISH_WAIT_MS / 200); i++) {
+        const waitSteps = Math.ceil(ERASE_REPUBLISH_WAIT_MS / 200)
+        for (let i = 0; i < waitSteps; i++) {
             const s = storeHandle.doc()!
             published = Object.values(s.diskDB).find(d => d.id === keptId && d.dockedTo === localEngineId)
             if (published && published.diskTypes?.includes('empty')) break
+            // Halfway and still not docked: rescan the drive once (a late partition, a failed look)
+            if (i === Math.floor(waitSteps / 2) && !published) await rescan('disk not back yet, rescanning')
             await new Promise(r => setTimeout(r, 200))
             if (!published && Object.values(s.diskDB).some(d => d.device === partition)) {
                 published = Object.values(s.diskDB).find(d => d.device === partition)
@@ -548,7 +610,7 @@ export const eraseDisk = async (
         }
         throw e
     } finally {
-        lockedDevices.delete(whole)
+        releaseEraseLock(whole)
         clearEraseProgress(storeHandle)
         await fs.remove(stagingDir).catch(() => {})
     }

@@ -15,6 +15,7 @@ import {
     eraseDisk, setEraseOpsForTests, clearStaleEraseStaging, ERASE_STAGING_ROOT,
     eraseBlocker, IDEA_DISK_LABEL, isEraseDeviceLocked, isSlotEraseDevice,
     eraseLockRefusesAdd, eraseLockedDevicesForTests, setEraseAddDevice,
+    noteEraseSkippedAdd, releaseEraseLock, eraseSkippedAddsForTests, isPartitionOfDrive, setEraseForgetDevice,
 } from '../../src/data/EraseDisk.js'
 import { summariseDisk, attachTraceResult, SUMMARY_MAX_AGE_MS, setSummariseOpsForTests } from '../../src/data/SummariseDisk.js'
 import { scanUnformattedDisks, setUnformattedOpsForTests, uniquifyLabels, clearGeneratedUnformattedIdsForTests, labelForUnformatted } from '../../src/data/UnformattedDisks.js'
@@ -164,6 +165,7 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
         setEraseOpsForTests({
             mountedPartitions: async () => [],
             hiddenTablePartitions: async () => [],
+            presentPartitions: async () => [],
             runScript: async (a) => {
                 scriptCalls.push(a)
                 // Fake: leave a META.yaml-only empty disk folder at DISKS_ROOT/<whole>1
@@ -318,6 +320,113 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
         } finally {
             setEraseAddDevice(null)
         }
+    })
+
+    it('udev add refused while the erase lock is held is re-added on release, once (idea01 2026-10-16, trace 93de80a4)', async () => {
+        // Production: usbDeviceMonitor.addDevice refuses a locked device AND notes the refusal.
+        // The erase script's partition add arrives from udev while the lock is still held.
+        const refused: string[] = []
+        const added: string[] = []
+        const realAdd = (eraseOpsForTestsAdd as any)
+        const guardedAdd = async (p: string) => {
+            const device = p.split('/').pop()!
+            if (eraseLockRefusesAdd(device)) { refused.push(device); noteEraseSkippedAdd(device); return }
+            added.push(device)
+            await realAdd(p)
+        }
+        setEraseAddDevice(guardedAdd)
+        setEraseOpsForTests({
+            mountedPartitions: async () => [],
+            hiddenTablePartitions: async () => [],
+            udevadmSettle: async () => {},
+            composeDownV: async () => {},
+            isMountPoint: async () => false,
+            lsblkSizeSerial: async () => ({ sizeBytes: 32_000_000_000, serial: 'FAKE1' }),
+            presentPartitions: async () => ['sdb1'],
+            runScript: async (a) => {
+                scriptCalls.push(a)
+                const root = `${DISKS_ROOT}/sdb1`
+                await fs.ensureDir(root)
+                await fs.copy(path.join(a.stagingDir, 'META.yaml'), path.join(root, 'META.yaml'))
+                roots.push(root)
+                // udev's add for the new partition, twice, while the erase still holds the lock
+                await guardedAdd('/dev/engine/sdb1')
+                await guardedAdd('/dev/engine/sdb1')
+                expect(isEraseDeviceLocked('sdb')).toBe(true)
+                return { stdout: 'STEP:partitioning\nSTEP:creating filesystem\nok: erased\n' }
+            },
+        })
+        try {
+            h.change(doc => {
+                doc.engineDB[LOCAL].unformattedDisks = [{
+                    candidateId: 'CAND1', device: 'sdb', sizeBytes: 32e9,
+                    model: 'Intenso', fsType: null, label: 'Intenso 250 GB', serial: 'FAKE1',
+                }]
+            })
+            const tid = putSummary('CAND1', 'Intenso 250 GB')
+            const result = await eraseDisk(h, 'CAND1', tid, 'Intenso 250 GB')
+            expect(refused).toEqual(['sdb1', 'sdb1'])
+            // Re-added exactly once although it was skipped twice, is the expected partition, and is in /sys
+            expect(added).toEqual(['sdb1'])
+            expect(result.diskId).toBe('CAND1')
+            expect([...h.doc()!.diskDB['CAND1' as DiskID].diskTypes]).toEqual(['empty'])
+            expect(isEraseDeviceLocked('sdb')).toBe(false)
+            expect(eraseSkippedAddsForTests().size).toBe(0)
+        } finally {
+            setEraseAddDevice(null)
+        }
+    })
+
+    it('re-add on release forgets a META look cached before the erase (no stale "not an IDEA disk")', async () => {
+        // The monitor caches one META look per device. A look of the old sdb1 (no META.yaml) taken
+        // before the erase must not decide the re-add of the freshly formatted sdb1.
+        const looks = new Map<string, boolean>([['sdb1', false]])
+        const realAdd = (eraseOpsForTestsAdd as any)
+        const addCalls: string[] = []
+        setEraseAddDevice(async (p) => {
+            const device = p.split('/').pop()!
+            addCalls.push(device)
+            if (eraseLockRefusesAdd(device)) { noteEraseSkippedAdd(device); return }
+            if (!looks.has(device)) looks.set(device, await fs.pathExists(`${DISKS_ROOT}/${device}/META.yaml`))
+            if (!looks.get(device)) return   // "has no IDEA META.yaml — left untouched"
+            await realAdd(p)
+        })
+        setEraseForgetDevice((d) => { looks.delete(d) })
+        try {
+            h.change(doc => {
+                doc.engineDB[LOCAL].unformattedDisks = [{
+                    candidateId: 'CAND1', device: 'sdb', sizeBytes: 32e9,
+                    model: 'SanDisk', fsType: 'exfat', label: 'SanDisk 32 GB', serial: 'FAKE1',
+                }]
+            })
+            const tid = putSummary('CAND1', 'SanDisk 32 GB')
+            await eraseDisk(h, 'CAND1', tid, 'SanDisk 32 GB')
+            expect(addCalls).toEqual(['sdb1'])
+            expect([...h.doc()!.diskDB['CAND1' as DiskID].diskTypes]).toEqual(['empty'])
+        } finally {
+            setEraseAddDevice(null)
+            setEraseForgetDevice(null)
+        }
+    })
+
+    it('noteEraseSkippedAdd / releaseEraseLock: only partitions of a locked drive are remembered, once', () => {
+        eraseLockedDevicesForTests().add('sdc')
+        try {
+            noteEraseSkippedAdd('/dev/engine/sdc1')
+            noteEraseSkippedAdd('sdc1')
+            noteEraseSkippedAdd('sdc2')
+            noteEraseSkippedAdd('sdc')      // whole-disk entry: not a partition to re-add
+            noteEraseSkippedAdd('sdd1')     // not locked
+            expect(releaseEraseLock('sdc').sort()).toEqual(['sdc1', 'sdc2'])
+            expect(isEraseDeviceLocked('sdc')).toBe(false)
+            expect(releaseEraseLock('sdc')).toEqual([])   // idempotent
+            expect(eraseSkippedAddsForTests().size).toBe(0)
+        } finally { eraseLockedDevicesForTests().delete('sdc') }
+        expect(isPartitionOfDrive('sda', 'sda1')).toBe(true)
+        expect(isPartitionOfDrive('sda', 'sda')).toBe(false)
+        expect(isPartitionOfDrive('sda', 'sdaa1')).toBe(false)
+        expect(isPartitionOfDrive('mmcblk0', 'mmcblk0p1')).toBe(true)
+        expect(isPartitionOfDrive('nvme0n1', 'nvme0n1p2')).toBe(true)
     })
 
     it('eraseLockRefusesAdd: partition and whole drive of a locked erase are refused, others not', () => {
