@@ -1,6 +1,6 @@
 import { CommandDefinition } from "./CommandDefinition.js";
 import { Store, getApps, getDisks, getDisk, getRunningEngines, getInstances, getEngine, findDiskByName, getLocalEngine, createClientStore } from "./Store.js";
-import { resolveInstanceArg } from './InstanceArg.js';
+import { resolveInstanceArg, resolveLocalInstanceArg } from './InstanceArg.js';
 import { Disk, clearDuplicateDiskRecords, isSystemDiskRecord } from "./Disk.js";
 import { deepPrint, log, print } from "../utils/utils.js";
 import { Instance, buildInstance, startInstance, runInstance, stopInstance, markInstanceError } from "./Instance.js";
@@ -325,7 +325,8 @@ const restoreAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceA
 
 /**
  * createBackupDisk <diskId> <mode> <instanceName…> (idea#128). The disk goes
- * through resolveDiskArg; refusals throw, so the trace ends as `error`.
+ * through resolveDiskArg, each instance (name or id) through resolveLocalInstanceArg
+ * (only instances on this Engine); refusals throw, so the trace ends as `error`.
  */
 const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskId: string, mode: string, ...instanceNames: InstanceName[]) => {
     if (!storeHandle) throw new Error("Store is not available. Please connect first.")
@@ -334,11 +335,15 @@ const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, dis
     const store = storeHandle.doc()
     const disk = resolveDiskArg(store, getLocalEngine(store)?.id, diskId, 'createBackupDisk')
 
-    const instanceIds = instanceNames.map(name => {
-        const inst = Object.values(store.instanceDB).find(i => i.name === name)
-        if (!inst) console.warn(chalk.yellow(`Warning: instance '${name}' not found — it will be added to the links list anyway`))
-        return inst?.id
-    }).filter(Boolean) as any[]
+    // Names resolve only among instances on this Engine (kit Engines share one store and
+    // have identical instance names); an instance id is accepted too. An unknown or
+    // ambiguous argument refuses the whole command, so nothing is linked by mistake.
+    const engineId = getLocalEngine(store)?.id ?? localEngineId
+    const instanceIds: InstanceID[] = []
+    for (const arg of instanceNames) {
+        const inst = resolveLocalInstanceArg(store, String(arg), 'createBackupDisk', String(engineId))
+        if (!instanceIds.includes(inst.id)) instanceIds.push(inst.id)
+    }
 
     print(chalk.blue(`Creating Backup Disk config on '${disk.name}' (${disk.id}, mode: ${mode})...`))
     await createBackupDiskConfig(storeHandle, disk as any, mode as any, instanceIds)
