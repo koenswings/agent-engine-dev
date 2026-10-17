@@ -245,6 +245,73 @@ describe('createBackupDisk command', () => {
         expect(await fs.pathExists(`${DISKS_ROOT}/${device}/BACKUP.yaml`)).toBe(false)
     })
 
+    // Kit Engines share one store and have identical instance names (kind-panda / happy-zebra 2026-10-17)
+    const addRemoteEngineInstances = () => {
+        const remoteDisk = 'DISK_remote' as DiskID
+        storeHandle.change(doc => {
+            doc.diskDB[remoteDisk] = {
+                id: remoteDisk, name: 'remote-app-disk' as DiskName, device: 'sda2' as any,
+                dockedTo: 'other-kit-engine' as EngineID, created: 1 as Timestamp, lastDocked: 1 as Timestamp,
+                diskTypes: ['app'] as any, backupConfig: null,
+            }
+        })
+        // The other Engine's instances come FIRST in the store, so a store-wide "first match"
+        // (the old code) would pick them: re-add this Engine's instances after them.
+        storeHandle.change(doc => { for (const k of Object.keys(doc.instanceDB)) delete (doc.instanceDB as any)[k] })
+        addInstance(storeHandle, 'INST_0remote_kolibri' as InstanceID, 'kolibri', remoteDisk)
+        addInstance(storeHandle, 'INST_0remote_nextcloud' as InstanceID, 'nextcloud', remoteDisk)
+        addInstance(storeHandle, 'INST_kolibri' as InstanceID, 'kolibri', diskId)
+        addInstance(storeHandle, 'INST_nextcloud' as InstanceID, 'nextcloud', diskId)
+        addInstance(storeHandle, 'INST_wikipedia' as InstanceID, 'wikipedia', diskId)
+    }
+
+    it('identical names on another Engine: links only this Engine\'s instances', async () => {
+        addRemoteEngineInstances()
+        // the old store-wide lookup would have linked the other Engine's kolibri
+        expect(Object.values(storeHandle.doc()!.instanceDB).find(i => i.name === 'kolibri')!.id).toBe('INST_0remote_kolibri')
+        await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskId} on-demand kolibri nextcloud`)
+        expect(errorSpy).not.toHaveBeenCalled()
+        expect((await readBackupYaml()).links.map((l: any) => l.instanceId)).toEqual(['INST_kolibri', 'INST_nextcloud'])
+        expect(storeHandle.doc()!.diskDB[diskId].backupConfig?.links).toEqual(['INST_kolibri', 'INST_nextcloud'])
+    })
+
+    it('accepts instance ids (mixed with names); a repeated instance is linked once', async () => {
+        addRemoteEngineInstances()
+        await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskId} on-demand INST_wikipedia kolibri INST_kolibri`)
+        expect(errorSpy).not.toHaveBeenCalled()
+        expect((await readBackupYaml()).links.map((l: any) => l.instanceId)).toEqual(['INST_wikipedia', 'INST_kolibri'])
+    })
+
+    it('refuses the id of an instance on another Engine; nothing is written', async () => {
+        addRemoteEngineInstances()
+        await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskId} on-demand kolibri INST_0remote_nextcloud`)
+        expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('instance INST_0remote_nextcloud is not on this Engine'))
+        expect(await fs.pathExists(`${DISKS_ROOT}/${device}/BACKUP.yaml`)).toBe(false)
+        expect(storeHandle.doc()!.diskDB[diskId].diskTypes).not.toContain('backup')
+    })
+
+    it('refuses a name that is unknown on this Engine (even if another Engine has it); nothing is written', async () => {
+        addRemoteEngineInstances()
+        addInstance(storeHandle, 'INST_remote_only' as InstanceID, 'kiwix', 'DISK_remote' as DiskID)
+        await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskId} on-demand kolibri kiwix`)
+        expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("createBackupDisk: instance 'kiwix' not found on this Engine."))
+        expect(await fs.pathExists(`${DISKS_ROOT}/${device}/BACKUP.yaml`)).toBe(false)
+        await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskId} on-demand no-such-app`)
+        expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("createBackupDisk: instance 'no-such-app' not found on this Engine."))
+        expect(await fs.pathExists(`${DISKS_ROOT}/${device}/BACKUP.yaml`)).toBe(false)
+    })
+
+    it('refuses a name shared by two instances on this Engine, listing the ids; the id works', async () => {
+        addInstance(storeHandle, 'INST_kolibri_copy' as InstanceID, 'kolibri', diskId)
+        await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskId} on-demand kolibri`)
+        expect(errorSpy).toHaveBeenCalledWith(expect.stringMatching(/instance name 'kolibri' is ambiguous on this Engine: .*INST_kolibri .*INST_kolibri_copy .*Use the instance id/))
+        expect(await fs.pathExists(`${DISKS_ROOT}/${device}/BACKUP.yaml`)).toBe(false)
+        errorSpy.mockClear()
+        await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskId} on-demand INST_kolibri_copy`)
+        expect(errorSpy).not.toHaveBeenCalled()
+        expect((await readBackupYaml()).links.map((l: any) => l.instanceId)).toEqual(['INST_kolibri_copy'])
+    })
+
     it('rejects an unknown disk', async () => {
         await handleCommand(commands, storeHandle, 'engine', 'createBackupDisk no-such-disk on-demand kolibri nextcloud')
         expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Disk 'no-such-disk' not found."))
