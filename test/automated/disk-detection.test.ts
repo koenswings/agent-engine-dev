@@ -84,10 +84,16 @@ describe('checkDiskDetection (idea#82)', () => {
         expect(checkDiskDetection(paths)).toEqual([`udev rule ${paths.rulePath} differs from ${RULE_ASSET}`])
     })
 
-    it('reports a missing watch folder', async () => {
+    it('reports a missing watch folder when there are sd* devices to link', async () => {
         const paths = await makeFakeSystem(tmp, block, [])
         await fs.remove(paths.watchDir)
         expect(checkDiskDetection(paths)).toEqual([`${paths.watchDir} does not exist`])
+    })
+
+    it('a missing watch folder without any sd* device is normal (NVMe/SD root, no USB disk; agent-engine-dev#228)', async () => {
+        const paths = await makeFakeSystem(tmp, ['nvme0n1', 'nvme0n1p1', 'nvme0n1p2', 'mmcblk0', 'mmcblk0p1', 'loop0'], [])
+        await fs.remove(paths.watchDir)
+        expect(checkDiskDetection(paths)).toEqual([])
     })
 
     it('reports covered sd* devices without a watch-folder entry (the empty /dev/engine case)', async () => {
