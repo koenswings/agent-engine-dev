@@ -12,7 +12,7 @@ import path from 'path'
 import { fs, YAML } from 'zx'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Store } from './Store.js'
-import { Disk, diskMountRoot } from './Disk.js'
+import { Disk, diskMountRoot, joinMountRoot } from './Disk.js'
 import { localEngineId } from './Engine.js'
 import { DiskID, Timestamp } from './CommonTypes.js'
 import { getCommandLogHandle, stashTraceResult } from './CommandLogStore.js'
@@ -170,7 +170,7 @@ export const summariseDisk = async (
     // Also list apps present on the disk filesystem
     const seenAppKeys = new Set(apps.map(a => `${a.name}@${a.version}`))
     try {
-        const appDirs = await fs.readdir(path.join(root, 'apps'))
+        const appDirs = await fs.readdir(joinMountRoot(root, 'apps'))
         for (const id of appDirs) {
             const { name, version } = parseAppId(id)
             const key = `${name}@${version}`
@@ -192,7 +192,7 @@ export const summariseDisk = async (
 
     // Fill instance data sizes from a focused walk
     for (const inst of instances) {
-        const instRoot = path.join(root, 'instances', inst.id)
+        const instRoot = joinMountRoot(root, 'instances', inst.id)
         try {
             const r = await ops.walk(instRoot, (_rel, size) => { inst.dataBytes = (inst.dataBytes ?? 0) + size }, deadline)
             if (r.truncated) truncated = true
@@ -201,7 +201,7 @@ export const summariseDisk = async (
 
     const backups: ContentSummary['backups'] = []
     try {
-        const yamlText = await fs.readFile(path.join(root, 'BACKUP.yaml'), 'utf8')
+        const yamlText = await fs.readFile(joinMountRoot(root, 'BACKUP.yaml'), 'utf8')
         const parsed = YAML.parse(yamlText)
         const links = parsed?.links ?? disk.backupConfig?.links ?? []
         for (const link of links) {
