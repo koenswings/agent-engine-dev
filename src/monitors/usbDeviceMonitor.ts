@@ -22,6 +22,7 @@ import { runWithTrace } from '../utils/CommandLogger.js';
 import { recordDiskDetectionFailure, errorMessage } from './diskDetection.js';
 import { addStick, classifyFsType, stickBlockedBySiblings, removeStick, removeSticksOnDrive, usbStartupCleanup, usbStickOps, usbStickRoutingActive, syncUsbApps } from '../data/UsbSticks.js'
 import { lookForIdeaMeta, IdeaLookResult, safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointOf } from './mounts.js';
+import { isTestDeviceName, isValidDeviceName, isSdWholeDisk, partitionName, needsDirectSystemAdd } from './deviceNames.js'
 
 /**
  * Filesystem UUID of each mounted device, recorded at mount time (or when an
@@ -30,13 +31,9 @@ import { lookForIdeaMeta, IdeaLookResult, safeMount, unmountAndRemove, mountComm
  */
 const mountedFsUuids = new Map<string, string | null>()
 
-/**
- * Pretend disks created by the test harness use names that real hardware never
- * produces (e.g. `idea-test-1`). Only an Engine in testMode accepts them.
- */
-export const TEST_DEVICE_PATTERN = /^idea-test-[0-9]+$/
-export const isTestDeviceName = (device: string | undefined | null): boolean =>
-    !!device && TEST_DEVICE_PATTERN.test(device)
+// Test-only device names (idea#105) now live in deviceNames.ts; re-exported here
+// for existing importers.
+export { TEST_DEVICE_PATTERN, isTestDeviceName } from './deviceNames.js'
 
 /**
  * Options for the watcher on the udev watch folder (/dev/engine).
@@ -86,9 +83,9 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                 const bootSrc = (await $`findmnt -n -o SOURCE /boot/firmware`).stdout.trim()
                 const bootDev = bootSrc.replace(/^\/dev\//, '').replace(/\[.*\]$/, '')
                 if (bootDev) systemBootDevice = bootDev as DeviceName
-                else systemBootDevice = (parent + '1') as DeviceName
+                else systemBootDevice = partitionName(parent, 1) as DeviceName
             } catch {
-                systemBootDevice = (parent + '1') as DeviceName
+                systemBootDevice = partitionName(parent, 1) as DeviceName
             }
             log(`System disk detected: root=${systemDevice}, boot=${systemBootDevice}, drives=${systemDrives.join(',')}`)
         }
@@ -96,14 +93,10 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         log(`Could not detect system device: ${e}`)
     }
 
+    // sd* (sda, sda1, sda2), NVMe / mmcblk partitions and the detected root
+    // device itself (agent-engine-dev#228); idea-test-N only in testMode (idea#105).
     const validDevice = function (device: string): boolean {
-        // Test-only device names (idea-test-N) are accepted only in testMode.
-        // A live Engine (testMode off) ignores them, so a pretend disk can never
-        // be picked up and mounted by a live Engine (idea#105).
-        if (isTestDeviceName(device)) return config.settings.testMode
-        // Check if the device begins with "sd", is then followed by a letter and ends with the number 2
-        // We need the m flag - see https://regexr.com/7rvpq 
-        return device && (device.match(/^sd[a-z][1-2]$/m) || device.match(/^sd[a-z]$/m)) ? true : false
+        return isValidDeviceName(device, { systemDevice, testMode: config.settings.testMode })
     }
 
     /**
@@ -176,7 +169,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
 
             // Skip whole-disk entries for mounting (idea#134): accepted by validDevice
             // so lsblk can list them as unformatted candidates; never mounted.
-            if (device.match(/^sd[a-z]$/)) {
+            if (isSdWholeDisk(device)) {
                 // A stick formatted without a partition table carries FAT/exFAT on the
                 // whole disk (idea#193 §3.2): mount it read-only like a partition.
                 if (!isEraseDeviceLocked(device) && await tryAddStick(device)) {
@@ -297,7 +290,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
             log(`Processing the removal of USB device ${device}`)
             metaLooks.delete(device!)
             // Teacher sticks first (idea#193 §3.4): partition, or every stick of a whole drive
-            const removedSticks = device!.match(/^sd[a-z]$/)
+            const removedSticks = isSdWholeDisk(device)
                 ? await removeSticksOnDrive(storeHandle, device!, 'unplugged')
                 : (await removeStick(storeHandle, device!, 'unplugged')) ? [device] : []
             if (removedSticks.length) {
@@ -407,6 +400,18 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         .on('error', error => recordDiskDetectionFailure('watcher', `Watcher error on ${watchDir}: ${errorMessage(error)}`, { watchDir }))
 
     log(`Watching ${watchDir} for USB devices`)
+
+    // agent-engine-dev#228: a root device outside the udev rule (nvme0n1p2 on a
+    // Pi 5 booting from NVMe, mmcblk0p2 on an SD-booted Pi) gets no link in the
+    // watch folder, so the watcher never reports it. Register it directly.
+    if (needsDirectSystemAdd(systemDevice, {
+        systemDiskSkip: !!config.settings.systemDiskSkip,
+        linkExists: !!systemDevice && fs.existsSync(`${watchDir}/${systemDevice}`),
+    })) {
+        log(`System disk ${systemDevice} has no link in ${watchDir} — registering it directly`)
+        void addDevice(`${watchDir}/${systemDevice}`).catch(e =>
+            recordDiskDetectionFailure('dock', `Could not register the system disk on ${systemDevice}: ${errorMessage(e)}`, { device: systemDevice }))
+    }
     return watcher
 }
 
