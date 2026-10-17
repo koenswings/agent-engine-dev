@@ -112,7 +112,10 @@ describe('udev watch folder watcher (idea#110)', () => {
 
     it('enableUsbDeviceMonitor watches the folder with watchDeviceFolder', () => {
         const src = fs.readFileSync(path.join(ROOT, 'src/monitors/usbDeviceMonitor.ts'), 'utf8')
-        expect(src).toMatch(/const watcher = watchDeviceFolder\(watchDir\)/)
+        // agent-engine-dev#228: through watchDeviceFolderWhenPresent, which attaches
+        // watchDeviceFolder once the folder exists
+        expect(src).toMatch(/const watcher = watchDeviceFolderWhenPresent\(watchDir,/)
+        expect(src).toMatch(/const w = watchDeviceFolder\(root\)/)
         expect(src.match(/chokidar\.watch\(/g) ?? []).toHaveLength(1)
     })
 })

@@ -4,9 +4,11 @@
  * Makes USB disk detection failures visible (idea#82).
  *
  * Disk detection depends on the udev rule 90-docking.rules, which creates the
- * /dev/engine/<device> links the USB device monitor watches. tmpfiles.d always
- * creates /dev/engine, so a missing rule leaves an empty folder and docking
- * silently does nothing. boot.sh reinstalls the rule on every boot when it is
+ * /dev/engine/<device> links the USB device monitor watches. tmpfiles.d
+ * (idea-engine.conf, build-engine installUdev) should create /dev/engine at boot,
+ * so a missing rule leaves an empty folder and docking silently does nothing.
+ * Without that entry udev creates the folder only with the first sd* link; the
+ * monitor copes with a missing folder (agent-engine-dev#228). boot.sh reinstalls the rule on every boot when it is
  * missing or differs from the shipped asset (self-repair). This module:
  *
  *   - runs a startup self-check that reports what the self-repair could not fix
@@ -84,7 +86,7 @@ export const defaultDiskDetectionPaths = (): DiskDetectionPaths => ({
  * Check the udev setup disk detection relies on. Returns the problems found
  * (empty when everything is in place):
  *   - the udev rule file exists (and matches the shipped asset, when present)
- *   - the watch folder (/dev/engine) exists
+ *   - the watch folder (/dev/engine) exists when there is an sd* device to link
  *   - every sd* device covered by the rule has a matching /dev/engine/<name> entry
  */
 export const checkDiskDetection = (paths: DiskDetectionPaths): string[] => {
@@ -98,16 +100,19 @@ export const checkDiskDetection = (paths: DiskDetectionPaths): string[] => {
         if (installed !== shipped) problems.push(`udev rule ${paths.rulePath} differs from ${paths.ruleAsset}`)
     }
 
-    if (!fs.existsSync(paths.watchDir)) {
-        problems.push(`${paths.watchDir} does not exist`)
-        return problems
-    }
-
     let devices: string[] = []
     try {
         devices = fs.readdirSync(paths.sysBlockDir).filter(d => RULE_DEVICE_PATTERN.test(d))
     } catch (e) {
         problems.push(`cannot list ${paths.sysBlockDir}: ${errorMessage(e)}`)
+    }
+
+    // udev creates the watch folder with the first sd* link, so without any sd*
+    // device (NVMe/SD-root Pi, no USB disk) a missing folder is normal; the USB
+    // device monitor attaches once it appears (agent-engine-dev#228).
+    if (!fs.existsSync(paths.watchDir)) {
+        if (devices.length > 0) problems.push(`${paths.watchDir} does not exist`)
+        return problems
     }
     const present = new Set(fs.readdirSync(paths.watchDir))
     const missing = devices.filter(d => !present.has(d)).sort()
