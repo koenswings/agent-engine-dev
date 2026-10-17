@@ -24,6 +24,7 @@ import { recordDiskDetectionFailure, errorMessage } from './diskDetection.js';
 import { addStick, classifyFsType, stickBlockedBySiblings, removeStick, removeSticksOnDrive, usbStartupCleanup, usbStickOps, usbStickRoutingActive, syncUsbApps } from '../data/UsbSticks.js'
 import { lookForIdeaMeta, IdeaLookResult, safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointOf } from './mounts.js';
 import { isTestDeviceName, isValidDeviceName, isSdWholeDisk, partitionName, needsDirectSystemAdd } from './deviceNames.js'
+import { metaLookCache } from './metaLookCache.js';
 
 /**
  * Filesystem UUID of each mounted device, recorded at mount time (or when an
@@ -233,21 +234,14 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
      * idea#201 §10: one read-only META look per device, shared by the device's own
      * addDevice and by the stick check of a FAT partition on the same drive, so
      * they never race (two ro mounts of one device) and agree on the answer.
-     * Forgotten when the device is removed.
+     * Forgotten when the device is removed, and by every command that writes
+     * META.yaml before it calls addDevice (forgetMetaLook, metaLookCache.ts).
      */
-    const metaLooks = new Map<string, Promise<IdeaLookResult>>()
-    const sharedMetaLook = (device: DeviceName): Promise<IdeaLookResult> => {
-        let p = metaLooks.get(device)
-        if (!p) {
-            p = !mountCommandsActive(config.settings.testMode)
-                ? Promise.resolve({ ok: true, hasMeta: fs.existsSync(`${disksRoot()}/${device}/META.yaml`), alreadyMounted: false } as IdeaLookResult)
-                : lookForIdeaMeta(device).catch(e => ({ ok: false, message: errorMessage(e) }) as IdeaLookResult)
-            metaLooks.set(device, p)
-            // A failed look may be retried on the next add event
-            p.then(r => { if (!r.ok && metaLooks.get(device) === p) metaLooks.delete(device) })
-        }
-        return p
-    }
+    metaLookCache.clear()
+    const sharedMetaLook = (device: DeviceName): Promise<IdeaLookResult> =>
+        metaLookCache.get(device, () => !mountCommandsActive(config.settings.testMode)
+            ? Promise.resolve({ ok: true, hasMeta: fs.existsSync(`${disksRoot()}/${device}/META.yaml`), alreadyMounted: false } as IdeaLookResult)
+            : lookForIdeaMeta(device).catch(e => ({ ok: false, message: errorMessage(e) }) as IdeaLookResult))
 
     /**
      * idea#193 §3.1: probe the filesystem type; vfat/exfat on a non-system disk is
@@ -418,7 +412,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         const device = path.split('/').pop()
         if (validDevice(device!)) {
             log(`Processing the removal of USB device ${device}`)
-            metaLooks.delete(device!)
+            metaLookCache.forget(device!)
             // Teacher sticks first (idea#193 §3.4): partition, or every stick of a whole drive
             const removedSticks = isSdWholeDisk(device)
                 ? await removeSticksOnDrive(storeHandle, device!, 'unplugged')

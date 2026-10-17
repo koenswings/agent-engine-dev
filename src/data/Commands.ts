@@ -336,7 +336,7 @@ const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, dis
 
     const instanceIds = instanceNames.map(name => {
         const inst = Object.values(store.instanceDB).find(i => i.name === name)
-        if (!inst) console.warn(chalk.yellow(`Warning: instance '${name}' not found — it will be added to the links list anyway`))
+        if (!inst) console.warn(chalk.yellow(`Warning: instance '${name}' not found — skipped (not linked)`))
         return inst?.id
     }).filter(Boolean) as any[]
 

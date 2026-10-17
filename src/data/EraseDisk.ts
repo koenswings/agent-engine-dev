@@ -27,6 +27,7 @@ import { isSystemDevice, driveNameOf, bareDevice } from './SystemDisk.js'
 import { log, print, uuid } from '../utils/utils.js'
 import { disksRoot } from './Config.js'
 import { APP_DATA_HELPER, eraseSlotArgs } from '../utils/appDataHelper.js'
+import { forgetMetaLook } from '../monitors/metaLookCache.js'
 
 /** Same pattern as TEST_DEVICE_PATTERN in usbDeviceMonitor (avoid a circular import). */
 export const SLOT_ERASE_DEVICE_PATTERN = /^idea-test-[0-9]+$/
@@ -509,6 +510,8 @@ export const eraseDisk = async (
         // the erase failed with "did not come back as empty" (wizardly-hugle 2026-10-12 18:46).
         // The finally below still deletes the lock (idempotent) on every path.
         lockedDevices.delete(whole)
+        // The erase wrote a new META.yaml: a META look the usb monitor cached before the erase must not decide this add
+        forgetMetaLook(partition)
         await add(`/dev/engine/${partition}`)
 
         // Wait briefly for the disk to appear as empty
