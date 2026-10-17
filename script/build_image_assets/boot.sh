@@ -44,9 +44,29 @@ fi
 echo "******************************" >> /home/pi/boot.out
 echo "Growing and resizing partition" >> /home/pi/boot.out
 echo "******************************" >> /home/pi/boot.out
-# Try to expand the partition and filesystem. Errors are ignored if it's already expanded.
-sudo growpart /dev/sda 2 >> /home/pi/boot.out 2>&1 || true
-sudo resize2fs /dev/sda2 >> /home/pi/boot.out 2>&1 || true
+# Try to expand the root partition and filesystem. Errors are ignored if it's already expanded.
+# The root disk and partition number come from findmnt / and lsblk, never a fixed
+# /dev/sda (agent-engine-dev#228): on an NVMe- or SD-root Pi, sda is a USB disk
+# plugged in at boot and must not be touched. sda2 root: same commands as before.
+# --- grow_root_partition: begin (extracted and run by test/automated/valid-device-names.test.ts)
+SYS_BLOCK_DIR="${SYS_BLOCK_DIR:-/sys/class/block}"
+grow_root_partition() {
+  local src dev disk part
+  src="$(findmnt -n -o SOURCE /)"
+  dev="${src#/dev/}"
+  dev="${dev%%\[*}"
+  disk="$(lsblk -no PKNAME "/dev/$dev" 2>/dev/null | head -n 1)"
+  part="$(cat "$SYS_BLOCK_DIR/$dev/partition" 2>/dev/null)"
+  if [[ "$src" != /dev/* || -z "$disk" || -z "$part" ]]; then
+    echo "Root '$src' has no parent disk or partition number; not growing anything"
+    return 0
+  fi
+  echo "Growing /dev/$disk partition $part and /dev/$dev"
+  sudo growpart "/dev/$disk" "$part" || true
+  sudo resize2fs "/dev/$dev" || true
+}
+# --- grow_root_partition: end
+grow_root_partition >> /home/pi/boot.out 2>&1 || true
 
 # Self-repair of USB disk detection (idea#82). The Engine watches /dev/engine,
 # whose links are created by the udev rule 90-docking.rules. tmpfiles.d always

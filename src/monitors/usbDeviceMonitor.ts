@@ -1,4 +1,5 @@
-import chokidar from 'chokidar'
+import chokidar, { FSWatcher } from 'chokidar'
+import nodePath from 'path'
 import { getKeys, log } from '../utils/utils.js'
 import { DiskMeta, readMetaUpdateId } from '../data/Meta.js';
 import { $, fs, YAML, chalk } from 'zx'
@@ -50,6 +51,135 @@ export const DEVICE_WATCH_OPTIONS = { persistent: true, followSymlinks: false } 
 
 /** Watch the udev watch folder for device links (see DEVICE_WATCH_OPTIONS). */
 export const watchDeviceFolder = (watchDir: string) => chokidar.watch(watchDir, { ...DEVICE_WATCH_OPTIONS })
+
+/**
+ * Device names in the watch folder. A missing folder means "no USB devices", not
+ * an error (agent-engine-dev#228): udev only creates /dev/engine with the first
+ * sd* link, so a Pi with an NVMe or SD root and no USB disk has none. tmpfiles.d
+ * (idea-engine.conf) should create it at boot, but the Engine cannot rely on it
+ * and cannot create it itself (pi can't mkdir in /dev). Other errors are logged
+ * and also read as empty, so they never stop the monitor from starting.
+ */
+export const listDeviceFolder = async (dir: string): Promise<string[]> => {
+    try {
+        return (await fs.readdir(dir)).filter(Boolean)
+    } catch (e: any) {
+        if (e?.code === 'ENOENT') log(`${dir} does not exist — no USB devices attached yet`)
+        else log(`Could not list ${dir}: ${errorMessage(e)} — treating it as empty`)
+        return []
+    }
+}
+
+/** How often watchDeviceFolderWhenPresent checks whether the watch folder exists (one stat). */
+export const DEVICE_FOLDER_POLL_MS = 2000
+
+export interface DeviceFolderHandlers {
+    add: (path: string) => unknown
+    unlink: (path: string) => unknown
+    error: (error: unknown) => void
+}
+
+export interface DeviceFolderWatch {
+    /** True while a chokidar watcher is attached to the folder. */
+    isAttached: () => boolean
+    close: () => Promise<void>
+}
+
+/**
+ * Watch the udev watch folder, also when it does not exist yet or disappears
+ * again (agent-engine-dev#228). chokidar 3 on a missing folder reports the folder
+ * appearing but not the links created in it, and a watcher on a folder that was
+ * removed and recreated stays blind. So: one stat every `pollMs`; when the
+ * folder is there (and not yet watched, or replaced by a new inode) a watcher is
+ * attached with watchDeviceFolder, whose initial scan reports the links already
+ * in it; when it is gone the watcher is closed and every link it had reported is
+ * reported as unlinked (udev removes the folder only after its last link).
+ */
+export const watchDeviceFolderWhenPresent = (
+    watchDir: string,
+    handlers: DeviceFolderHandlers,
+    pollMs: number = DEVICE_FOLDER_POLL_MS,
+): DeviceFolderWatch => {
+    const root = nodePath.resolve(watchDir)
+    let watcher: FSWatcher | null = null
+    let ino: number | null = null
+    let closed = false
+    const present = new Set<string>()
+
+    const folderIno = (): number | null => {
+        try {
+            const st = fs.statSync(root)
+            return st.isDirectory() ? st.ino : null
+        } catch {
+            return null
+        }
+    }
+    const detach = (): void => {
+        const w = watcher
+        if (!w) return
+        watcher = null
+        ino = null
+        const gone = [...present]
+        present.clear()
+        void w.close().catch(e => log(`Closing the watcher on ${root}: ${errorMessage(e)}`))
+        log(`${root} is gone — device watcher detached${gone.length ? `; ${gone.length} device(s) unlinked` : ''}`)
+        for (const p of gone) handlers.unlink(p)
+    }
+    const attach = (i: number): void => {
+        ino = i
+        const w = watchDeviceFolder(root)
+        watcher = w
+        w.on('add', p => { if (watcher !== w) return; present.add(p); handlers.add(p) })
+            .on('unlink', p => { if (watcher !== w) return; present.delete(p); handlers.unlink(p) })
+            .on('unlinkDir', p => { if (watcher === w && nodePath.resolve(p) === root) detach() })
+            .on('error', e => { if (watcher === w) handlers.error(e) })
+        log(`Device watcher attached to ${root}`)
+    }
+    const check = (): void => {
+        if (closed) return
+        const i = folderIno()
+        if (watcher && i !== ino) detach()
+        if (!watcher && i !== null) attach(i)
+    }
+
+    check()
+    if (!watcher) log(`${root} does not exist yet — checking every ${pollMs} ms and watching it once it appears`)
+    const timer = setInterval(check, pollMs)
+    timer.unref?.()
+    return {
+        isAttached: () => watcher !== null,
+        close: async () => {
+            closed = true
+            clearInterval(timer)
+            const w = watcher
+            watcher = null
+            present.clear()
+            await w?.close()
+        },
+    }
+}
+
+/**
+ * agent-engine-dev#228: a root device outside the udev rule (nvme0n1p2 on a Pi 5
+ * booting from NVMe, mmcblk0p2 on an SD-booted Pi) gets no link in the watch
+ * folder, so the watcher never reports it: register it directly through
+ * addDevice. Independent of whether the watch folder exists. Returns true when
+ * it was started.
+ */
+export const registerUnlinkedSystemDisk = (opts: {
+    systemDevice: string | null | undefined
+    watchDir: string
+    systemDiskSkip: boolean
+    addDevice: (path: string) => Promise<unknown>
+}): boolean => {
+    const { systemDevice, watchDir, systemDiskSkip, addDevice } = opts
+    const linkExists = !!systemDevice && fs.existsSync(`${watchDir}/${systemDevice}`)
+    if (!needsDirectSystemAdd(systemDevice, { systemDiskSkip, linkExists })) return false
+    log(`System disk ${systemDevice} has no link in ${watchDir} — registering it directly`)
+    void addDevice(`${watchDir}/${systemDevice}`).catch(e =>
+        recordDiskDetectionFailure('dock', `Could not register the system disk on ${systemDevice}: ${errorMessage(e)}`, { device: systemDevice }))
+    return true
+}
 
 export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
 
@@ -322,96 +452,95 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         }
     }
 
-    const engineWatchDir = process.env.IDEA_WATCH_DIR || '/dev/engine'
-    const actualDevices = (config.settings.isDev || config.settings.testMode) ? [] : (await $`ls ${engineWatchDir}`).toString().split('\n').filter(device => validDevice(device))
-    log(`Actual devices: ${actualDevices}`)
+    const watchDir = process.env.IDEA_WATCH_DIR || '/dev/engine'
+    // Startup cleanup of records and mount points from before this start. A
+    // failure here is reported but never stops the system disk registration or
+    // the watcher below (agent-engine-dev#228).
+    try {
+        const actualDevices = (config.settings.isDev || config.settings.testMode) ? [] : (await listDeviceFolder(watchDir)).filter(device => validDevice(device))
+        log(`Actual devices: ${actualDevices}`)
 
-    log(`Removing from the network database disks that were attached before the current boot but are no longer attached now...`)
+        log(`Removing from the network database disks that were attached before the current boot but are no longer attached now...`)
 
-    const storedDisks = getDisksOfEngine(store, localEngine)
-    if (storedDisks.length !== 0) {
-        log(`The engine object shows previously mounted disks: ${storedDisks.map(d => d.id)}`)
-        const storedDevices = storedDisks.map(disk => disk.device).filter((device): device is DeviceName => device !== undefined && device !== null)
-        log(`Which were on devices: ${storedDevices}`)
+        const storedDisks = getDisksOfEngine(store, localEngine)
+        if (storedDisks.length !== 0) {
+            log(`The engine object shows previously mounted disks: ${storedDisks.map(d => d.id)}`)
+            const storedDevices = storedDisks.map(disk => disk.device).filter((device): device is DeviceName => device !== undefined && device !== null)
+            log(`Which were on devices: ${storedDevices}`)
 
-        for (let device of [...new Set(storedDevices)]) {
-            const disks = findDisksByDevice(storeHandle.doc(), device, localEngine.id)
-            if (disks.length === 0) continue
-            // Never undock the system disk based on /dev/engine listing —
-            // the root partition is always present and /dev/engine may not
-            // be populated yet (e.g. tmpfiles.d race) or may be empty in
-            // testMode. System disk presence is guaranteed by the OS itself.
-            const systemDisk = disks.find(d => d.diskTypes?.includes('system'))
-            if (systemDisk) {
-                log(`Skipping undock of system disk ${systemDisk.id} on device ${device} — system disk is always present`)
-                continue
+            for (let device of [...new Set(storedDevices)]) {
+                const disks = findDisksByDevice(storeHandle.doc(), device, localEngine.id)
+                if (disks.length === 0) continue
+                // Never undock the system disk based on /dev/engine listing —
+                // the root partition is always present and /dev/engine may not
+                // be populated yet (e.g. tmpfiles.d race) or may be empty in
+                // testMode. System disk presence is guaranteed by the OS itself.
+                const systemDisk = disks.find(d => d.diskTypes?.includes('system'))
+                if (systemDisk) {
+                    log(`Skipping undock of system disk ${systemDisk.id} on device ${device} — system disk is always present`)
+                    continue
+                }
+                if (!actualDevices.includes(device)) {
+                    log(`Removing disk from previously mounted device ${device}`)
+                    const undocked = await undockAllOnDevice(storeHandle, localEngine.id, device)
+                    log(`Disk(s) ${undocked.join(', ')} removed from local engine`)
+                } else {
+                    // Still attached: if stale records share the device, keep the one
+                    // META.yaml names (idea#152)
+                    await resolveDuplicateDisksOnDevice(storeHandle, localEngine.id, device)
+                }
             }
-            if (!actualDevices.includes(device)) {
-                log(`Removing disk from previously mounted device ${device}`)
-                const undocked = await undockAllOnDevice(storeHandle, localEngine.id, device)
-                log(`Disk(s) ${undocked.join(', ')} removed from local engine`)
-            } else {
-                // Still attached: if stale records share the device, keep the one
-                // META.yaml names (idea#152)
-                await resolveDuplicateDisksOnDevice(storeHandle, localEngine.id, device)
+        } else {
+            log(`No previous disks found in the network database`)
+        }
+
+        log(`Cleaning the mount points...`)
+        const previousMounts = (config.settings.isDev || config.settings.testMode) ? [] : (await listDeviceFolder(disksRoot())).filter(device => validDevice(device))
+        log(`Previously mounted devices: ${previousMounts}`)
+        // Stale mount point folders of devices that are no longer attached. A folder
+        // that is still a mount point (by findmnt target or mountpoint -q) is left
+        // alone; an empty one is removed with rmdir, never rm -fr (idea#126).
+        for (let device of previousMounts) {
+            log(`Checking if device ${device} is still actual or mounted`)
+            if (actualDevices.includes(device)) continue
+            try {
+                const mounts = await mountOps().listMounts()
+                const mountPoint = mountPointOf(device)
+                if (mounts.some(m => m.target === mountPoint) || await mountOps().isMountPoint(mountPoint)) {
+                    log(`Stale mount point ${mountPoint} is still mounted — leaving it`)
+                    continue
+                }
+                log(`Cleaning up stale mount point for ${device}`)
+                await mountOps().rmdir(mountPoint)
+                log(`Device ${device} has been successfully cleaned up`)
+            } catch (e) {
+                log(`Error cleaning up the stale mount point of ${device}: ${errorMessage(e)}`)
             }
         }
-    } else {
-        log(`No previous disks found in the network database`)
-    }
-
-    log(`Cleaning the mount points...`)
-    const previousMounts = (config.settings.isDev || config.settings.testMode) ? [] : (await $`ls ${disksRoot()}`).toString().split('\n').filter(device => validDevice(device))
-    log(`Previously mounted devices: ${previousMounts}`)
-    // Stale mount point folders of devices that are no longer attached. A folder
-    // that is still a mount point (by findmnt target or mountpoint -q) is left
-    // alone; an empty one is removed with rmdir, never rm -fr (idea#126).
-    for (let device of previousMounts) {
-        log(`Checking if device ${device} is still actual or mounted`)
-        if (actualDevices.includes(device)) continue
-        try {
-            const mounts = await mountOps().listMounts()
-            const mountPoint = mountPointOf(device)
-            if (mounts.some(m => m.target === mountPoint) || await mountOps().isMountPoint(mountPoint)) {
-                log(`Stale mount point ${mountPoint} is still mounted — leaving it`)
-                continue
-            }
-            log(`Cleaning up stale mount point for ${device}`)
-            await mountOps().rmdir(mountPoint)
-            log(`Device ${device} has been successfully cleaned up`)
-        } catch (e) {
-            log(`Error cleaning up the stale mount point of ${device}: ${errorMessage(e)}`)
-        }
+    } catch (e) {
+        recordDiskDetectionFailure('monitorStart', `USB device monitor startup cleanup failed (monitor continues): ${errorMessage(e)}`, { watchDir })
     }
 
     // Teacher sticks (idea#193 §3.4): unmount leftovers under /run/idea-usb before the
     // watcher's initial adds mount the sticks that are still plugged in.
     if (usbStickRoutingActive()) {
-        await usbStartupCleanup(storeHandle)
+        await usbStartupCleanup(storeHandle).catch(e => log(`USB sticks startup cleanup: ${errorMessage(e)}`))
         void syncUsbApps(storeHandle, 'start')
     }
 
-    const watchDir = process.env.IDEA_WATCH_DIR || '/dev/engine'
-    const watcher = watchDeviceFolder(watchDir)
+    // agent-engine-dev#228: register a root device the udev rule does not link
+    // (nvme0n1p2, mmcblk0p2) directly, whether or not the watch folder exists.
+    registerUnlinkedSystemDisk({ systemDevice, watchDir, systemDiskSkip: !!config.settings.systemDiskSkip, addDevice })
 
-    watcher
-        .on('add', addDevice)
-        .on('unlink', removeDevice)
-        .on('error', error => recordDiskDetectionFailure('watcher', `Watcher error on ${watchDir}: ${errorMessage(error)}`, { watchDir }))
+    // Also when the folder is missing (no USB disk yet on an NVMe/SD-root Pi):
+    // the watcher attaches as soon as udev creates it (agent-engine-dev#228).
+    const watcher = watchDeviceFolderWhenPresent(watchDir, {
+        add: addDevice,
+        unlink: removeDevice,
+        error: error => recordDiskDetectionFailure('watcher', `Watcher error on ${watchDir}: ${errorMessage(error)}`, { watchDir }),
+    })
 
     log(`Watching ${watchDir} for USB devices`)
-
-    // agent-engine-dev#228: a root device outside the udev rule (nvme0n1p2 on a
-    // Pi 5 booting from NVMe, mmcblk0p2 on an SD-booted Pi) gets no link in the
-    // watch folder, so the watcher never reports it. Register it directly.
-    if (needsDirectSystemAdd(systemDevice, {
-        systemDiskSkip: !!config.settings.systemDiskSkip,
-        linkExists: !!systemDevice && fs.existsSync(`${watchDir}/${systemDevice}`),
-    })) {
-        log(`System disk ${systemDevice} has no link in ${watchDir} — registering it directly`)
-        void addDevice(`${watchDir}/${systemDevice}`).catch(e =>
-            recordDiskDetectionFailure('dock', `Could not register the system disk on ${systemDevice}: ${errorMessage(e)}`, { device: systemDevice }))
-    }
     return watcher
 }
 

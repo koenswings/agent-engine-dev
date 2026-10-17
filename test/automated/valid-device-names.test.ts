@@ -13,11 +13,13 @@
  *   6. partitionName / driveNameOf for sd, nvme and mmcblk
  *   7. Direct registration of a root device the udev rule does not link
  *   8. The monitor uses these helpers
+ *   9. boot.sh grows the root partition found by findmnt/lsblk, not /dev/sda
  */
 
 import { describe, it, expect } from 'vitest'
+import os from 'os'
 import path from 'path'
-import { fs } from 'zx'
+import { $, fs } from 'zx'
 import { isValidDeviceName, isSdWholeDisk, partitionName, udevLinksDevice, needsDirectSystemAdd } from '../../src/monitors/deviceNames.js'
 import { driveNameOf } from '../../src/data/SystemDisk.js'
 import { driveOf } from '../../src/data/Disk.js'
@@ -142,5 +144,53 @@ describe('usbDeviceMonitor uses the shared helpers', () => {
         expect(src).toMatch(/needsDirectSystemAdd\(systemDevice/)
         expect(src).not.toMatch(/\^sd\[a-z\]/)
         expect(src).not.toMatch(/parent \+ '1'/)
+    })
+})
+
+describe('boot.sh grows the root partition, not a fixed /dev/sda (agent-engine-dev#228)', () => {
+    const boot = fs.readFileSync(path.join(ROOT, 'script/build_image_assets/boot.sh'), 'utf8')
+    const fn = boot.slice(boot.indexOf('# --- grow_root_partition: begin'), boot.indexOf('# --- grow_root_partition: end'))
+
+    // Fake findmnt / lsblk / sudo / growpart / resize2fs that record their calls
+    const run = async (rootSource: string, pkname: string, partition: string | null) => {
+        const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-228-grow-'))
+        try {
+            const bin = path.join(tmp, 'bin')
+            const calls = path.join(tmp, 'calls')
+            const sys = path.join(tmp, 'sys')
+            await fs.ensureDir(bin)
+            const dev = rootSource.replace(/^\/dev\//, '')
+            if (partition !== null) await fs.outputFile(path.join(sys, dev, 'partition'), `${partition}\n`)
+            await fs.writeFile(path.join(bin, 'findmnt'), `#!/bin/sh\necho "${rootSource}"\n`, { mode: 0o755 })
+            await fs.writeFile(path.join(bin, 'lsblk'), `#!/bin/sh\necho "${pkname}"\n`, { mode: 0o755 })
+            await fs.writeFile(path.join(bin, 'sudo'), `#!/bin/sh\nexec "$@"\n`, { mode: 0o755 })
+            await fs.writeFile(path.join(bin, 'growpart'), `#!/bin/sh\necho "growpart $*" >> ${calls}\n`, { mode: 0o755 })
+            await fs.writeFile(path.join(bin, 'resize2fs'), `#!/bin/sh\necho "resize2fs $*" >> ${calls}\n`, { mode: 0o755 })
+            const script = path.join(tmp, 'grow.sh')
+            await fs.writeFile(script, `${fn}\ngrow_root_partition\n`)
+            const out = await $({ env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, SYS_BLOCK_DIR: sys } })`bash ${script}`.nothrow()
+            return { code: out.exitCode, calls: fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').trim().split('\n') : [] }
+        } finally {
+            await fs.remove(tmp)
+        }
+    }
+
+    it('sda2 root: exactly the old commands', async () => {
+        expect(await run('/dev/sda2', 'sda', '2')).toEqual({ code: 0, calls: ['growpart /dev/sda 2', 'resize2fs /dev/sda2'] })
+    })
+    it('NVMe root: grows nvme0n1 partition 2, never sda', async () => {
+        expect(await run('/dev/nvme0n1p2', 'nvme0n1', '2')).toEqual({ code: 0, calls: ['growpart /dev/nvme0n1 2', 'resize2fs /dev/nvme0n1p2'] })
+    })
+    it('SD root: grows mmcblk0 partition 2', async () => {
+        expect(await run('/dev/mmcblk0p2', 'mmcblk0', '2')).toEqual({ code: 0, calls: ['growpart /dev/mmcblk0 2', 'resize2fs /dev/mmcblk0p2'] })
+    })
+    it('no block root or no partition number: grows nothing', async () => {
+        expect(await run('overlay', '', null)).toEqual({ code: 0, calls: [] })
+        expect(await run('/dev/nvme0n1p2', 'nvme0n1', null)).toEqual({ code: 0, calls: [] })
+    })
+    it('runs on every boot and no fixed /dev/sda growpart is left', () => {
+        expect(boot.indexOf('\ngrow_root_partition >>')).toBeGreaterThan(boot.indexOf('# This part runs on every boot'))
+        expect(boot).not.toMatch(/growpart \/dev\/sda/)
+        expect(boot).not.toMatch(/resize2fs \/dev\/sda2/)
     })
 })
