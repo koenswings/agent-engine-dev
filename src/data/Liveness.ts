@@ -19,7 +19,7 @@ import { DocHandle } from '@automerge/automerge-repo'
 import { Store } from './Store.js'
 import { Timestamp } from './CommonTypes.js'
 import { log } from '../utils/utils.js'
-import { currentLanSelection, lanChangeLines, LanSelection } from './LanAddress.js'
+import { currentLanAddress } from './LanAddress.js'
 
 export const HB_INTERVAL_MS = 10_000
 export const LAST_SEEN_INTERVAL_MS = 60 * 60 * 1000
@@ -59,24 +59,15 @@ export const writeLastSeen = (handle: DocHandle<Store>, engineId: string, now: n
 }
 
 /**
- * Engine.lanAddress / lanAddresses (agent-console-dev#138, #165): re-read the LAN IPv4s
- * on every beat and store them only when they changed (DHCP, cable out), so they add no
- * store history while the addresses are stable. Returns true when it wrote.
+ * Engine.lanAddress (agent-console-dev#138, #165): re-read the LAN IPv4 on every beat
+ * and store it only when it changed (DHCP, cable out), so it adds no store history
+ * while the address is stable. Returns true when it wrote.
  */
-export const writeLanAddress = (handle: DocHandle<Store>, engineId: string, sel: LanSelection = currentLanSelection()): boolean => {
+export const writeLanAddress = (handle: DocHandle<Store>, engineId: string, lan: string | null = currentLanAddress()): boolean => {
     const eng: any = (handle.doc() as any)?.engineDB?.[engineId]
-    if (!eng) return false
-    const lines = lanChangeLines(eng, sel)
-    if (!lines.length) return false
-    for (const l of lines) log(l)
-    const addrChanged = (eng.lanAddress ?? null) !== sel.address
-    const listChanged = lines.length > (addrChanged ? 1 : 0)
-    handle.change((d: any) => {
-        const e = d.engineDB?.[engineId]
-        if (!e) return
-        if (addrChanged) e.lanAddress = sel.address
-        if (listChanged) e.lanAddresses = sel.addresses ? [...sel.addresses] : null
-    })
+    if (!eng || (eng.lanAddress ?? null) === lan) return false
+    log(`Engine lanAddress ${eng.lanAddress ?? 'unset'} → ${lan ?? 'null'}`)
+    handle.change((d: any) => { const e = d.engineDB?.[engineId]; if (e) e.lanAddress = lan })
     return true
 }
 
