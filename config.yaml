@@ -7,6 +7,7 @@ settings:
   consolePath: /home/pi/idea/agents/agent-console-dev/dist  # Absolute path to Console dist/. Empty = Console UI not served.
   storeDataFolder: store-data
   storeIdentityFolder: store-identity
+  # lanPreferCidrs: ['10.42.0.0/16']  # Engine.lanAddress prefers an address in these IPv4 CIDRs over the default route (default: the school/kit LAN 10.42.0.0/16; [] = default-route order only). See docs/ARCHITECTURE.md, Engine LAN address.
   heartbeatIntervalMs: 30000  # Peer-access repair + op archive tick (ms). The store is no longer written per tick: live hb is ephemeral every 10 s, lastRun stored at boot + hourly (Liveness.ts)
 defaults:
   user: pi
