@@ -102,8 +102,11 @@ These commands perform actions on the system. Some are restricted to an `engine`
 - **Usage:** `backupApp <instanceId|instanceName> <backupDiskId>` (idea#168). The instance is an instance id or a unique instance name (see [Instance arguments](#instance-arguments)); the disk goes through the shared disk resolver (see [Disk arguments](#disk-arguments)). Every refusal ends the command trace as `error` with the reason. The trace arg keys stay `instanceName` and `backupDiskId`.
 - **Scope:** `engine`
 
+- **Excludes (agent-engine-dev#241):** an app can list content to leave out of its backups in its `compose.yaml` as `x-app.backup.exclude: [<path relative to the instance folder>, ...]` (borg shell patterns, e.g. `data/kolibri/content/storage`, `"data/*.zim"`; rules in docs/ARCHITECTURE.md, "Backup excludes"). The list is read from the instance's `compose.yaml` before the instance is stopped; an invalid entry refuses the backup (`x-app.backup.exclude is invalid: entry '../x' has a '..' segment`). The trace prints `Backup of <id>: excluded: <list>` (or `(none)`) and its result holds `excluded`. Excluded content is not restored by `restoreApp` (Kolibri: re-import the channel content; Kiwix: put the ZIM back). Needs root helper version 4.
+
 ### `restoreApp`
 - **Description:** Restores the latest backup archive for an instance from any docked Backup Disk onto a target disk. Extracts the archive and calls processInstance to register and start the restored instance.
+- **Excluded content:** content the app listed in `x-app.backup.exclude` was never backed up and is not restored (see `backupApp`): a restored Kolibri needs its channel content re-imported, a restored Kiwix needs its ZIM file(s).
 - **Usage:** `restoreApp <instanceId|instanceName> <targetDiskId>` (idea#168). The instance is an instance id or a unique instance name (see [Instance arguments](#instance-arguments)); the target disk goes through the shared disk resolver (see [Disk arguments](#disk-arguments)). Every refusal ends the command trace as `error` with the reason. The trace arg keys stay `instanceName` and `backupDiskId` (the latter holds the target disk).
 - **Scope:** `engine`
 

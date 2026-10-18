@@ -134,7 +134,7 @@ describe('idea-peer-gate end to end (gate → sudo → helper)', () => {
     it('version answers the helper protocol version (3)', async () => {
         const r = await sb.runGate([PEER], `sudo -n ${H} version`)
         expect(r.exitCode, r.stderr).toBe(0)
-        expect(r.stdout.trim()).toBe('idea-app-data 3')
+        expect(r.stdout.trim()).toBe('idea-app-data 4')
     })
 
     it('a receive is recorded for the peer named by the key; only that peer may delete it', async () => {

@@ -27,6 +27,7 @@ import fs from 'fs'
 import { $ } from 'zx'
 import { log } from './utils.js'
 import { config } from '../data/Config.js'
+import { validateBackupExclude } from '../data/BackupExclude.js'
 import { peerSshArgv, checkEngineId } from './peerSsh.js'
 
 /** Installed path of the helper (a root-owned copy, 0755; build-engine installUdev). */
@@ -37,7 +38,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '3'
+export const APP_DATA_HELPER_VERSION = '4'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -110,8 +111,15 @@ export const putFilesArgs = (root: string, id: string, stagingDir: string): stri
 export const deleteArgs = (root: string, id: string): string[] => ['delete', checkRoot(root), checkId(id)]
 export const borgInitArgs = (bdev: string, id: string): string[] => ['borg-init', checkRoot(bdev), checkId(id)]
 export const borgInfoArgs = (bdev: string, id: string): string[] => ['borg-info', checkRoot(bdev), checkId(id)]
-export const borgCreateArgs = (bdev: string, id: string, archive: string, srcRoot: string): string[] =>
-    ['borg-create', checkRoot(bdev), checkId(id), checkArchive(archive), checkRoot(srcRoot)]
+/**
+ * borg-create <bdev> <id> <archive> <srcRoot> [--exclude <rel>]... (agent-engine-dev#241).
+ * Each exclude is checked with the x-app.backup.exclude rules (BackupExclude.ts); the
+ * helper checks them again. No excludes: exactly the old five words.
+ */
+export const borgCreateArgs = (bdev: string, id: string, archive: string, srcRoot: string, excludes: string[] = []): string[] => {
+    const ex = validateBackupExclude(excludes)
+    return ['borg-create', checkRoot(bdev), checkId(id), checkArchive(archive), checkRoot(srcRoot), ...ex.flatMap(e => ['--exclude', e])]
+}
 export const borgExtractArgs = (bdev: string, id: string, archive: string, strip: number, dstRoot: string): string[] => {
     if (!Number.isInteger(strip) || strip < 1 || strip > 9) throw new Error(`strip ${strip} is out of range (1-9)`)
     return ['borg-extract', checkRoot(bdev), checkId(id), checkArchive(archive), String(strip), checkRoot(dstRoot)]

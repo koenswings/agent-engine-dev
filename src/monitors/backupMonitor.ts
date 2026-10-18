@@ -20,6 +20,8 @@ import { $, YAML, chalk, fs } from 'zx'
 import { log, print } from '../utils/utils.js'
 import { disksRoot, skipBorg } from '../data/Config.js'
 import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot, appDataRoot } from '../data/Disk.js'
+import { readBackupExclude } from '../data/BackupExclude.js'
+import { attachTraceResult } from '../data/SummariseDisk.js'
 import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgProblem } from '../utils/appDataHelper.js'
 import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { createOperation, updateOperation } from '../data/Operations.js'
@@ -169,6 +171,12 @@ export const backupInstance = async (
             if (borgMissing) throw new Error(borgMissing)
         }
 
+        // x-app.backup.exclude of the instance (agent-engine-dev#241): read and checked before
+        // anything is stopped or written; an invalid list refuses the backup
+        const excludes = await readBackupExclude(`${await diskMountRoot(appDisk as Disk)}/instances/${instanceId}/compose.yaml`)
+        print(`Backup of ${instanceId}: excluded: ${excludes.length ? excludes.join(', ') : '(none)'}`)
+        attachTraceResult({ instanceId, backupDiskId: backupDisk.id, excluded: excludes })
+
         // 1. Init Borg repo if this is the first backup
         setBackupStep(0, BACKUP_STEPS[0])
         const repoExists = await fs.pathExists(`${repoPath}/config`)
@@ -198,7 +206,7 @@ export const backupInstance = async (
         const archiveName = new Date().toISOString().replace(/[:.]/g, '-')
         if (!skipBorg()) {
             log(`Running borg create for instance ${instanceId}`)
-            await runAppData(borgCreateArgs(backupDevice, instanceId, archiveName, await appDataRoot(appDisk as Disk)))
+            await runAppData(borgCreateArgs(backupDevice, instanceId, archiveName, await appDataRoot(appDisk as Disk), excludes))
         } else {
             log(`skipBorg: skipping borg create for instance ${instanceId}`)
         }

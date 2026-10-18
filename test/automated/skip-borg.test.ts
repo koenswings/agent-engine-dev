@@ -197,3 +197,34 @@ describe('backupInstance / restoreApp with testMode on', () => {
         expect(log).toHaveLength(4)
     })
 })
+
+describe('backupInstance with x-app.backup.exclude (agent-engine-dev#241)', () => {
+    const compose = (body: string) => fs.writeFile(`${DISKS_ROOT}/${appDevice}/instances/${INST}/compose.yaml`, body)
+
+    it('reads the list from the instance compose.yaml and passes each entry as --exclude <rel>', async () => {
+        config.settings.skipBorg = false
+        await compose('services: {}\nx-app:\n  backup:\n    exclude:\n      - data/kolibri/content/storage\n      - "data/*.zim"\n')
+        const { backupOp } = await backupThenRestore()
+        const log = await calls()
+        expect(backupOp?.status, JSON.stringify(backupOp)).toBe('Done')
+        expect(log[1]).toMatch(new RegExp(`^borg-create ${backupDevice} ${INST} \\S+ ${appDevice} --exclude data/kolibri/content/storage --exclude data/\\*\\.zim$`))
+        const lines = (console.info as any).mock.calls.map((c: any[]) => c.join(' ')).join('\n')
+        expect(lines).toContain(`Backup of ${INST}: excluded: data/kolibri/content/storage, data/*.zim`)
+    })
+
+    it('no list: borg-create keeps its old five words', async () => {
+        config.settings.skipBorg = false
+        await compose('services: {}\n')
+        await backupThenRestore()
+        expect((await calls())[1]).toMatch(new RegExp(`^borg-create ${backupDevice} ${INST} \\S+ ${appDevice}$`))
+    })
+
+    it('an invalid entry refuses the backup with a clear error; borg never runs', async () => {
+        config.settings.skipBorg = false
+        await compose('services: {}\nx-app:\n  backup:\n    exclude:\n      - ../../etc\n')
+        const { backupOp } = await backupThenRestore()
+        expect(backupOp?.status).toBe('Failed')
+        expect(backupOp?.error).toMatch(/x-app\.backup\.exclude is invalid: entry '\.\.\/\.\.\/etc' has a '\.\.' segment/)
+        expect((await calls()).filter(c => c.startsWith('borg-init') || c.startsWith('borg-create'))).toEqual([])
+    })
+})

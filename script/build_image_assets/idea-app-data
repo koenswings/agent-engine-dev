@@ -41,7 +41,9 @@
 #   idea-app-data sync-peers   < "<engineId> ssh-ed25519 <key> ssh-ed25519 <hostkey>" lines
 #   idea-app-data borg-init    <bdev> <id>
 #   idea-app-data borg-info    <bdev> <id>
-#   idea-app-data borg-create  <bdev> <id> <archive> <srcRoot>
+#   idea-app-data borg-create  <bdev> <id> <archive> <srcRoot> [--exclude <rel>]...
+#                                    (each <rel> -> borg --exclude sh:<SRC>/<rel>; with none,
+#                                    the same borg command as before the option existed)
 #   idea-app-data borg-extract <bdev> <id> <archive> <strip> <dstRoot>
 #
 # Tokens (none can start with '-' or hold '/' or '..'):
@@ -55,6 +57,9 @@
 #   strip    ^[1-9]$
 #   engine   ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$   (a peer's Engine id)
 #   app      ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$, no '..'   (an app id, e.g. kolibri-1.0)
+#   rel      an x-app.backup.exclude entry (agent-engine-dev#241): ^[A-Za-z0-9._*/-]{1,200}$,
+#            not starting with '/' or '-', no empty, '.' or '..' segment, at most 32;
+#            its folder part (before the first '*') must resolve inside the source
 #   host     an IPv4 address or ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$, resolved HERE;
 #            every resolved IPv4 address must be in 10/8, 172.16/12, 192.168/16 or
 #            100.64/10 (LAN and Tailscale). Public, loopback or unresolvable: refused.
@@ -107,7 +112,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=3
+readonly IDEA_APP_DATA_VERSION=4
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -182,6 +187,8 @@ RE_HOST='^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$'
 RE_SERVER_ARG='^[A-Za-z0-9._=,:+@/-]*$'
 RE_ENGINE='^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
 RE_APP='^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+RE_EXCLUDE='^[A-Za-z0-9._*/-]{1,200}$'
+EXCLUDE_MAX=32
 RE_KEY64='AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}'
 RE_PEER_LINE="^([A-Za-z0-9][A-Za-z0-9_.-]{0,127}) ssh-ed25519 ($RE_KEY64) ssh-ed25519 ($RE_KEY64)\$"
 
@@ -489,6 +496,30 @@ inst_dir() { echo "$1/instances/$2"; }   # inst_dir <R_DIR> <id>
 
 check_engine_id() { [[ "$1" =~ $RE_ENGINE ]] || refuse "Engine id '$1' does not match $RE_ENGINE"; }
 check_app() { [[ "$1" =~ $RE_APP && "$1" != *..* ]] || refuse "app id '$1' does not match $RE_APP (or holds '..')"; }
+
+# check_exclude <src> <rel>: one x-app.backup.exclude entry (agent-engine-dev#241),
+# the same rules as the Engine's BackupExclude.ts. The folder part of <rel> (the
+# segments before the first one holding '*') must not resolve outside <src>, e.g.
+# through a symlink inside the instance folder.
+check_exclude() {
+    local src="$1" rel="$2" seg fixed real
+    local -a segs
+    [[ "$rel" =~ $RE_EXCLUDE ]] || refuse "exclude '$rel' does not match $RE_EXCLUDE"
+    [[ "$rel" != /* ]] || refuse "exclude '$rel' is absolute; it must be relative to the instance folder"
+    [[ "$rel" != -* ]] || refuse "exclude '$rel' starts with '-'"
+    [[ "$rel" != */ && "$rel" != *//* ]] || refuse "exclude '$rel' has an empty path segment"
+    IFS=/ read -r -a segs <<< "$rel"
+    for seg in "${segs[@]}"; do
+        [[ "$seg" != . && "$seg" != .. ]] || refuse "exclude '$rel' has a '$seg' segment"
+    done
+    fixed=""
+    for seg in "${segs[@]}"; do
+        [[ "$seg" != *'*'* ]] || break
+        fixed="$fixed/$seg"
+    done
+    real=$($REALPATH -m -- "$src$fixed") || refuse "exclude '$rel': cannot resolve $src$fixed"
+    [[ "$real" == "$src" || "$real" == "$src"/* ]] || refuse "exclude '$rel' resolves outside the source instance folder ($real)"
+}
 
 # The rsync server arguments of every receive: --server first, write-only, no
 # character outside the safe set (rrsync -wo checks them again).
@@ -876,7 +907,17 @@ case "$SUB" in
         ;;
 
     borg-create)
-        need 4 $(($# - 1)) "<bdev> <id> <archive> <srcRoot>"
+        # <bdev> <id> <archive> <srcRoot>, then zero or more "--exclude <rel>" pairs
+        if (( $# < 5 || ($# - 5) % 2 != 0 )); then
+            refuse "$SUB takes exactly 4 argument(s) (<bdev> <id> <archive> <srcRoot>) plus --exclude <rel> pairs, got $(($# - 1))"
+        fi
+        EXCL_RELS=()
+        for (( i = 6; i <= $#; i += 2 )); do
+            [[ "${!i}" == --exclude ]] || refuse "$SUB: expected --exclude, got '${!i}'"
+            j=$((i + 1))
+            EXCL_RELS+=("${!j}")
+        done
+        (( ${#EXCL_RELS[@]} <= EXCLUDE_MAX )) || refuse "$SUB: ${#EXCL_RELS[@]} excludes; at most $EXCLUDE_MAX are allowed"
         check_id "$3"
         [[ "$4" =~ $RE_ARCHIVE ]] || refuse "archive name '$4' does not match $RE_ARCHIVE"
         resolve_root "$2" backup; B_DIR="$R_DIR"
@@ -886,9 +927,18 @@ case "$SUB" in
         [[ -f "$REPO/config" ]] || refuse "$REPO is not a Borg repository"
         SRC=$(inst_dir "$S_DIR" "$3")
         existing_dir "$SRC" "source instance folder"
+        EXCL_ARGS=()
+        for rel in "${EXCL_RELS[@]}"; do
+            check_exclude "$SRC" "$rel"
+            EXCL_ARGS+=(--exclude "sh:$SRC/$rel")
+        done
         take_locks "repo.$2.$3" "inst.$5.$3"
         borg_env
-        run_child $BORG create --numeric-ids -- "$REPO::$4" "$SRC"
+        if (( ${#EXCL_ARGS[@]} == 0 )); then
+            run_child $BORG create --numeric-ids -- "$REPO::$4" "$SRC"
+        else
+            run_child $BORG create --numeric-ids "${EXCL_ARGS[@]}" -- "$REPO::$4" "$SRC"
+        fi
         exit $?
         ;;
 
