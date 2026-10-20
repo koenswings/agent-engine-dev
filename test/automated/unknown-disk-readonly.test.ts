@@ -22,6 +22,8 @@ import {
     MountEntry, MountOps, lookForIdeaMeta, setMountOps, mountPointOf,
     mountExt4ReadOnlyCommand, SUDO_MOUNT_RO_PATTERN,
 } from '../../src/monitors/mounts.js'
+import { initialiseDisk, setFlashCardOpsForTests, clearFlashStateForTests } from '../../src/data/FlashCard.js'
+import { CandidateID } from '../../src/data/ClientCards.js'
 import {
     createTestStore, dockFixture, cleanupDisk, waitFor, uniqueTestDevice, sentinelPath, diskPath,
 } from '../harness/diskSim.js'
@@ -177,6 +179,42 @@ describe('dock flow: unknown disks are never written or mounted rw (idea#201 §1
         const ro = state.calls.indexOf(`mount -o ro ${device}`)
         expect(ro).toBeGreaterThanOrEqual(0)
         expect(state.calls.indexOf(`mount ${device}`)).toBeGreaterThan(ro)
+    })
+
+    it('initialiseDisk after a "no META.yaml" plug-in look: the live monitor docks it, already mounted rw, no second mount (happy-zebra 4526)', { timeout: 20_000 }, async () => {
+        // initialiseDisk only accepts partition 1 or 2 of an sd* disk, so this pretend disk has an
+        // sd* name; it only exists in this run's private watch folder and mount root, and every mount
+        // command is faked (setMountOps).
+        const device = 'sdy2'
+        devices.push(device)
+        state.calls.length = 0
+        await dockFixture(await fixture({}), device)   // plug-in: the monitor caches "no META.yaml"
+        expect(await waitFor(storeHandle, () => state.calls.includes(`umount ${device}`), 10_000)).toBe(true)
+        await sleep(300)
+        const before = diskCount()
+        const candidateId = 'AA000000000000004526' as CandidateID
+        setFlashCardOpsForTests({
+            scan: async () => ({
+                newDisks: [{ candidateId, device: 'sdy', byId: '/dev/disk/by-id/usb-Old_SSD_4526-0:0', sizeBytes: 500e9, model: 'Old SSD', serial: '4526',
+                    removable: false, readerId: null, partitions: [{ label: 'data', fsType: 'ext4', sizeBytes: 500e9 }], contents: { kind: 'unknown' } as any,
+                    mountedReadOnly: false, firstSeen: 1 as any }],
+                newDiskPartitions: { [candidateId]: ['sdy2'] },
+                cardReaders: [], clientCards: [],
+            }),
+            isSystemDevice: async () => false,
+            // a plain write under the private mount root (production: sudo tee /disks/<dev>/META.yaml)
+            writeMeta: async (p, yaml) => { await fs.writeFile(path.join(diskPath(p), 'META.yaml'), yaml) },
+        })
+        try {
+            const r = await initialiseDisk(storeHandle, candidateId, 'empty')
+            expect(storeHandle.doc()!.diskDB[r.diskId as DiskID]).toMatchObject({ device, dockedTo: localEngineId })
+            expect(diskCount()).toBe(before + 1)
+            expect(rwMounts(state, device)).toHaveLength(1)       // initialiseDisk's rw mount only
+            expect(state.mounts.filter(m => m.target === mountPointOf(device))).toHaveLength(1)
+        } finally {
+            setFlashCardOpsForTests(null)
+            clearFlashStateForTests()
+        }
     })
 
     it('testMode without mount commands: fixture without META.yaml gets no META.yaml and is not registered', { timeout: 20_000 }, async () => {
