@@ -70,3 +70,50 @@ export const resolveInstanceArg = (store: Store, arg: string, command: string, d
     }
     throw new Error(`${command}: instance '${arg}' not found.`)
 }
+
+/**
+ * True when the instance is stored on a disk that is docked to the given Engine
+ * (an App Disk or the system disk of that Engine).
+ */
+export const instanceIsOnEngine = (store: Store, instance: Instance, engineId: string): boolean => {
+    if (!instance?.storedOn) return false
+    const disk = store.diskDB?.[instance.storedOn]
+    return !!disk && String(disk.dockedTo) === String(engineId)
+}
+
+export type LocalInstanceArgLookup =
+    | { ok: true; instance: Instance; via: 'id' | 'name' }
+    | { ok: false; reason: 'not-found' }
+    | { ok: false; reason: 'not-local'; instance: Instance }
+    | { ok: false; reason: 'ambiguous'; candidates: Instance[] }
+
+/**
+ * Lookup scoped to one Engine (createBackupDisk, kind-panda / happy-zebra 2026-10-17):
+ * kit Engines share one store and have instances with identical names, so a name
+ * must only match instances stored on disks docked to this Engine.
+ *   1. Id first: accepted when that instance is on this Engine, else 'not-local'.
+ *   2. Exactly one instance with that name on this Engine.
+ *   3. Otherwise refused: ambiguous on this Engine, or not found on this Engine.
+ * Never throws.
+ */
+export const lookupLocalInstanceArg = (store: Store, arg: string, engineId: string): LocalInstanceArgLookup => {
+    const byId = store.instanceDB?.[arg as InstanceID]
+    if (byId) return instanceIsOnEngine(store, byId, engineId) ? { ok: true, instance: byId, via: 'id' } : { ok: false, reason: 'not-local', instance: byId }
+    const named = Object.values(store.instanceDB ?? {}).filter(i => i && String(i.name) === arg && instanceIsOnEngine(store, i, engineId))
+    if (named.length === 1) return { ok: true, instance: named[0], via: 'name' }
+    if (named.length > 1) return { ok: false, reason: 'ambiguous', candidates: named }
+    return { ok: false, reason: 'not-found' }
+}
+
+/** Command form of lookupLocalInstanceArg: returns the instance or throws. */
+export const resolveLocalInstanceArg = (store: Store, arg: string, command: string, engineId: string): Instance => {
+    const r = lookupLocalInstanceArg(store, arg, engineId)
+    if (r.ok) return r.instance
+    if (r.reason === 'ambiguous') {
+        throw new Error(`${command}: instance name '${arg}' is ambiguous on this Engine: ${describeInstanceCandidates(r.candidates)}. Use the instance id.`)
+    }
+    if (r.reason === 'not-local') {
+        throw new Error(`${command}: instance ${arg} is not on this Engine (stored on disk ${r.instance.storedOn ?? 'none'}, not docked here).`)
+    }
+    throw new Error(`${command}: instance '${arg}' not found on this Engine.`)
+}
