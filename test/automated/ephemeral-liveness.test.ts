@@ -20,13 +20,16 @@ import {
     updateOperation, isProgressOnly, operationsToArchive, archiveOldOperations, OPERATION_ARCHIVE_AGE_MS,
 } from '../../src/data/Operations.js'
 
+import { currentLanAddress } from '../../src/data/LanAddress.js'
+
 const DAY = 86_400_000
 const T0 = 1_791_000_000_000
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
+// lanAddress as createOrUpdateEngine published it at start: a stable address adds no beat writes (#166)
 const newStore = (extra: any = {}): DocHandle<any> => {
     const repo = new Repo({ network: [] })
-    return repo.create<any>({ engineDB: { ENGINE_me: { id: 'ENGINE_me', hostname: 'me', lastBooted: T0, lastRun: T0 } }, operationDB: {}, instanceDB: {}, diskDB: {}, appDB: {}, userDB: {}, ...extra })
+    return repo.create<any>({ engineDB: { ENGINE_me: { id: 'ENGINE_me', hostname: 'me', lastBooted: T0, lastRun: T0, lanAddress: currentLanAddress() } }, operationDB: {}, instanceDB: {}, diskDB: {}, appDB: {}, userDB: {}, ...extra })
 }
 const changes = (h: DocHandle<any>) => A.getAllChanges(h.doc()).length
 
