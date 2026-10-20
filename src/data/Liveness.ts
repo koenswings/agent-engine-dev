@@ -19,6 +19,7 @@ import { DocHandle } from '@automerge/automerge-repo'
 import { Store } from './Store.js'
 import { Timestamp } from './CommonTypes.js'
 import { log } from '../utils/utils.js'
+import { currentLanAddress } from './LanAddress.js'
 
 export const HB_INTERVAL_MS = 10_000
 export const LAST_SEEN_INTERVAL_MS = 60 * 60 * 1000
@@ -57,6 +58,19 @@ export const writeLastSeen = (handle: DocHandle<Store>, engineId: string, now: n
     return true
 }
 
+/**
+ * Engine.lanAddress (agent-console-dev#138, #165): re-read the LAN IPv4 on every beat
+ * and store it only when it changed (DHCP, cable out), so it adds no store history
+ * while the address is stable. Returns true when it wrote.
+ */
+export const writeLanAddress = (handle: DocHandle<Store>, engineId: string, lan: string | null = currentLanAddress()): boolean => {
+    const eng: any = (handle.doc() as any)?.engineDB?.[engineId]
+    if (!eng || (eng.lanAddress ?? null) === lan) return false
+    log(`Engine lanAddress ${eng.lanAddress ?? 'unset'} → ${lan ?? 'null'}`)
+    handle.change((d: any) => { const e = d.engineDB?.[engineId]; if (e) e.lanAddress = lan })
+    return true
+}
+
 export const hbMessage = (handle: DocHandle<Store>, engineId: string, now: number): HbMessage => {
     const booted = Number((handle.doc() as any)?.engineDB?.[engineId]?.lastBooted)
     return { type: HB_TYPE, v: 1, engineId, now, bootedAt: Number.isFinite(booted) ? booted : null }
@@ -77,6 +91,7 @@ export const startLiveness = (handle: DocHandle<Store>, engineId: string, opts: 
         try {
             handle.broadcast(hbMessage(handle, engineId, now()))
             writeLastSeen(handle, engineId, now(), opts.lastSeenIntervalMs ?? LAST_SEEN_INTERVAL_MS)
+            writeLanAddress(handle, engineId)
         } catch (e) { log(`liveness: ${e}`) }
     }
     beat()
