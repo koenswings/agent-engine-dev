@@ -1,6 +1,6 @@
 import { CommandDefinition } from "./CommandDefinition.js";
 import { Store, getApps, getDisks, getDisk, getRunningEngines, getInstances, getEngine, findDiskByName, getLocalEngine, createClientStore } from "./Store.js";
-import { resolveInstanceArg } from './InstanceArg.js';
+import { resolveInstanceArg, resolveLocalInstanceArg } from './InstanceArg.js';
 import { Disk, clearDuplicateDiskRecords, isSystemDiskRecord } from "./Disk.js";
 import { deepPrint, log, print } from "../utils/utils.js";
 import { Instance, buildInstance, startInstance, runInstance, stopInstance, markInstanceError } from "./Instance.js";
@@ -14,10 +14,10 @@ $.verbose = false;
 import { DocHandle, Repo } from "@automerge/automerge-repo";
 import { config } from "./Config.js";
 import { readStoreDocId } from "./StoreIdentity.js";
-import { generateHostName } from "../utils/nameGenerator.js";
+import { realStickerNameDeps, resolveStickerName } from "../install/stickerName.js";
 import pack from '../../package.json' with { type: "json" };
 import { sendCommand } from "../utils/commandUtils.js";
-import { installApp } from './InstallApp.js';
+import { installApp, parseInstallAppArgs } from './InstallApp.js';
 import { copyApp, moveApp } from './CopyMoveApp.js';
 import { resourceLock, diskKey } from '../utils/ResourceLock.js';
 import { undockDisk } from "../monitors/usbDeviceMonitor.js";
@@ -27,6 +27,7 @@ import { DiskArgResult, lookupDiskArg, resolveDiskArg } from './DiskArg.js';
 import { createFilesDisk } from './CreateFilesDisk.js';
 import { summariseDisk, attachTraceResult } from './SummariseDisk.js';
 import { eraseDisk } from './EraseDisk.js';
+import { flashCard, cancelFlash, initialiseDisk } from './FlashCard.js';
 import { testContext } from "../../test/testContext.js";
 
 
@@ -107,7 +108,7 @@ const buildEngineWrapper = async (storeHandle: DocHandle<Store> | null, argsStri
         isLocalMode: false,
         machine: machine,
         user: user,
-        hostname: parsedArgs.hostname || generateHostName(),
+        hostname: '' as string, // resolved after the sync, see below
         language: parsedArgs.language || defaults.language,
         keyboard: parsedArgs.keyboard || defaults.keyboard,
         timezone: parsedArgs.timezone || defaults.timezone,
@@ -123,6 +124,10 @@ const buildEngineWrapper = async (storeHandle: DocHandle<Store> | null, argsStri
     };
     try {
         await syncEngine(user, machine);
+        // idea#184: same checked resolution as script/build-engine.ts (explicit,
+        // else persisted, else a name free on LAN, store and tailnet), run on the
+        // target Pi once it is reachable.
+        buildArgs.hostname = (await resolveStickerName(parsedArgs.hostname, realStickerNameDeps(exec))).name;
         await buildEngine(buildArgs);
         print(chalk.green('buildEngine command finished successfully.'));
     } catch (e: any) {
@@ -170,32 +175,18 @@ const lsInstances = (storeHandle: DocHandle<Store> | null): void => {
 
 /**
  * installApp command wrapper (idea#128).
- * Usage: installApp <appId> <targetDiskId> [--source <sourceDiskId>] [--name <instanceName>]
+ * Usage: installApp <appId> <targetDiskId> [--source <sourceDiskId>] [--name <instanceName>] [--fresh]
+ * A value with spaces is quoted: --name "Kolibri Demo".
  *
  * All arguments are passed as a single string and parsed here. Disk arguments
  * go through resolveDiskArg (a unique disk name still works, with a warning).
  * Refusals throw, so the trace ends as `error`.
  */
-const INSTALL_APP_USAGE = 'Usage: installApp <appId> <targetDiskId> [--source <sourceDiskId>] [--name <instanceName>]'
 const installAppWrapper = async (storeHandle: DocHandle<Store> | null, argsString: string) => {
     if (!storeHandle) throw new Error("Store is not available.")
-
-    // Parse: installApp kolibri-1.0 <targetDiskId> --source <sourceDiskId> --name my-kolibri
-    const parts = (argsString ?? '').trim().split(/\s+/).filter(Boolean)
-    const appId = parts[0] as any
-    const targetDiskId = parts[1]
-    if (!appId || !targetDiskId || targetDiskId.startsWith('--')) throw new Error(INSTALL_APP_USAGE)
-    const flagValue = (flag: string): string | undefined => {
-        const i = parts.indexOf(flag)
-        if (i === -1) return undefined
-        const v = parts[i + 1]
-        if (!v || v.startsWith('--')) throw new Error(`installApp: ${flag} needs a value. ${INSTALL_APP_USAGE}`)
-        return v
-    }
-    const sourceDiskId = flagValue('--source')
-    const instanceName = flagValue('--name') as any
-
-    await installApp(storeHandle, { appId, targetDiskId, sourceDiskId, instanceName })
+    // Quote-aware: installApp kolibri-1.0 <targetDiskId> --name "Kolibri Demo" --fresh
+    const { appId, targetDiskId, sourceDiskId, instanceName, fresh } = parseInstallAppArgs(argsString)
+    await installApp(storeHandle, { appId, targetDiskId, sourceDiskId, instanceName, fresh })
 }
 
 /**
@@ -334,7 +325,8 @@ const restoreAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceA
 
 /**
  * createBackupDisk <diskId> <mode> <instanceName…> (idea#128). The disk goes
- * through resolveDiskArg; refusals throw, so the trace ends as `error`.
+ * through resolveDiskArg, each instance (name or id) through resolveLocalInstanceArg
+ * (only instances on this Engine); refusals throw, so the trace ends as `error`.
  */
 const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskId: string, mode: string, ...instanceNames: InstanceName[]) => {
     if (!storeHandle) throw new Error("Store is not available. Please connect first.")
@@ -343,11 +335,15 @@ const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, dis
     const store = storeHandle.doc()
     const disk = resolveDiskArg(store, getLocalEngine(store)?.id, diskId, 'createBackupDisk')
 
-    const instanceIds = instanceNames.map(name => {
-        const inst = Object.values(store.instanceDB).find(i => i.name === name)
-        if (!inst) console.warn(chalk.yellow(`Warning: instance '${name}' not found — it will be added to the links list anyway`))
-        return inst?.id
-    }).filter(Boolean) as any[]
+    // Names resolve only among instances on this Engine (kit Engines share one store and
+    // have identical instance names); an instance id is accepted too. An unknown or
+    // ambiguous argument refuses the whole command, so nothing is linked by mistake.
+    const engineId = getLocalEngine(store)?.id ?? localEngineId
+    const instanceIds: InstanceID[] = []
+    for (const arg of instanceNames) {
+        const inst = resolveLocalInstanceArg(store, String(arg), 'createBackupDisk', String(engineId))
+        if (!instanceIds.includes(inst.id)) instanceIds.push(inst.id)
+    }
 
     print(chalk.blue(`Creating Backup Disk config on '${disk.name}' (${disk.id}, mode: ${mode})...`))
     await createBackupDiskConfig(storeHandle, disk as any, mode as any, instanceIds)
@@ -482,6 +478,21 @@ export const commands: CommandDefinition[] = [
     { name: "createFilesDisk", execute: createFilesDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "shareName", variadic: true, optional: true }], scope: 'engine' },
     { name: "summariseDisk", execute: summariseDiskWrapper, args: [{ type: "string", name: "targetId" }], scope: 'engine' },
     { name: "eraseDisk", execute: eraseDiskWrapper, args: [{ type: "string", name: "targetId" }, { type: "string", name: "summaryTraceId" }, { type: "string", name: "confirmName", variadic: true }], scope: 'engine' },
+    // idea#201 §10 (Engine API contract v2): ids only. Trace arg keys are the contract names.
+    { name: "flashCard", execute: async (storeHandle: DocHandle<Store> | null, candidateId: string, version: string, confirmSizeBytes: string) => {
+        if (!storeHandle) throw new Error('Store is not available.')
+        const { operationId } = await flashCard(storeHandle, candidateId, version, confirmSizeBytes)
+        attachTraceResult({ candidateId, version, operationId, started: true })
+        print(chalk.green(`Flash started: operation ${operationId}`))
+    }, args: [{ type: "string", name: "candidateId" }, { type: "string", name: "version" }, { type: "string", name: "confirmSizeBytes" }], scope: 'engine' },
+    { name: "cancelFlash", execute: async (storeHandle: DocHandle<Store> | null, operationId: string) => {
+        if (!storeHandle) throw new Error('Store is not available.')
+        cancelFlash(storeHandle, operationId)
+    }, args: [{ type: "string", name: "operationId" }], scope: 'engine' },
+    { name: "initialiseDisk", execute: async (storeHandle: DocHandle<Store> | null, candidateId: string, role?: string) => {
+        if (!storeHandle) throw new Error('Store is not available.')
+        await initialiseDisk(storeHandle, candidateId, role ?? 'empty')
+    }, args: [{ type: "string", name: "candidateId" }, { type: "string", name: "role", optional: true }], scope: 'engine' },
     { name: "cancelOperation", execute: async (storeHandle: DocHandle<Store> | null, opId: string) => {
         if (!storeHandle) throw new Error('Store is not available.')
         const err = cancelOperation(storeHandle, opId)

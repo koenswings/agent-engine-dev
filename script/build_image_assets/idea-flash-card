@@ -1,0 +1,161 @@
+#!/bin/bash
+# idea-flash-card — write a verified IDEA client image to a removable card (idea#201 §10)
+#
+# Installed as a root-owned COPY at /usr/local/sbin/idea-flash-card (never a symlink).
+# Allowed by sudoers with no argument list; this script re-checks EVERYTHING itself
+# and does not trust the Engine.
+#
+# Usage:
+#   idea-flash-card --by-id <path> --expect-device <sdX> --expect-size <bytes> \
+#                   --image <file> --sha256 <hex>
+#   idea-flash-card --version
+#
+#   --by-id         /dev/disk/by-id/usb-...  (whole disk link, never a -partN link)
+#   --expect-device sdX the by-id link must resolve to (what the Engine saw)
+#   --expect-size   bytes; must equal the device size now (dialog → write binding)
+#   --image         /var/lib/idea/client-images/<version>/idea-client-<version>.img.xz
+#   --sha256        64 hex; must equal the image's .sha256 file AND the recomputed hash
+#
+# Output: JSON lines on stdout {"step":..,"bytes":..,"total":..}, last line
+#   {"result":"ok","bytesWritten":N,"sha256":"..","readBackSha256":"..","safeToRemove":true|false}
+# Exit: 0 ok (incl. POWER_OFF_FAILED → safeToRemove false), 2 refused (stderr "refused: CODE: text"),
+#       3 failed (stderr "failed: CODE: text"). SIGTERM → failed CANCELLED.
+# Never mounts anything. No size limit (any card size; only IMAGE_TOO_LARGE is physical).
+
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+VERSION=1
+IMAGES_ROOT=/var/lib/idea/client-images
+
+refuse() { echo "refused: $1: $2" >&2; exit 2; }
+fail()   { echo "failed: $1: $2" >&2; cleanup_children; try_power_off >/dev/null; exit 3; }
+emit()   { printf '{"step":"%s","bytes":%s,"total":%s}\n' "$1" "${2:-0}" "${3:-0}"; }
+
+if [[ "${1:-}" == "--version" ]]; then echo "idea-flash-card $VERSION"; exit 0; fi
+
+BYID= DEV= SIZE= IMAGE= SHA=
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --by-id) BYID="${2:-}"; shift 2 ;;
+    --expect-device) DEV="${2:-}"; shift 2 ;;
+    --expect-size) SIZE="${2:-}"; shift 2 ;;
+    --image) IMAGE="${2:-}"; shift 2 ;;
+    --sha256) SHA="${2:-}"; shift 2 ;;
+    *) refuse BAD_ARGS "unknown argument '$1'" ;;
+  esac
+done
+[[ "$BYID" =~ ^/dev/disk/by-id/usb-[A-Za-z0-9_.:-]+$ ]] || refuse BAD_ARGS "by-id must be /dev/disk/by-id/usb-..."
+[[ "$BYID" =~ -part[0-9]+$ ]] && refuse BAD_ARGS "by-id must name the whole disk, not a partition"
+[[ "$DEV" =~ ^sd[a-z]$ ]] || refuse BAD_ARGS "expect-device must be sdX"
+[[ "$SIZE" =~ ^[0-9]+$ && "$SIZE" -gt 0 ]] || refuse BAD_ARGS "expect-size must be digits"
+[[ "$SHA" =~ ^[0-9a-f]{64}$ ]] || refuse BAD_ARGS "sha256 must be 64 lower-case hex"
+[[ "$IMAGE" =~ ^$IMAGES_ROOT/([A-Za-z0-9._-]+)/idea-client-([A-Za-z0-9._-]+)\.img\.xz$ ]] || refuse BAD_ARGS "image must be $IMAGES_ROOT/<version>/idea-client-<version>.img.xz"
+[[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]] || refuse BAD_ARGS "image folder and file version differ"
+check="$IMAGE"; while [[ "$check" != "/" ]]; do [[ -L "$check" ]] && refuse BAD_ARGS "image path contains a symlink ($check)"; check=$(dirname "$check"); done
+
+DEVPATH="/dev/$DEV"
+DD_PID= HASH_PID= WATCH_PID= TMPD=$(mktemp -d)
+cleanup_children() {
+  for p in $WATCH_PID $DD_PID $HASH_PID; do kill "$p" 2>/dev/null; done
+  pkill -P $$ 2>/dev/null; wait 2>/dev/null
+}
+try_power_off() {
+  sync
+  blockdev --flushbufs "$DEVPATH" 2>/dev/null
+  if [[ -w "/sys/block/$DEV/device/delete" ]] && echo 1 > "/sys/block/$DEV/device/delete" 2>/dev/null; then echo true; else echo false; fi
+}
+trap 'echo "failed: CANCELLED: flash cancelled" >&2; cleanup_children; try_power_off >/dev/null; rm -rf "$TMPD"; exit 3' TERM INT
+trap 'rm -rf "$TMPD"' EXIT
+
+resolve_ok() {   # by-id still points at the same whole disk with the same size
+  local r s
+  r=$(readlink -f "$BYID" 2>/dev/null) || return 1
+  [[ "$r" == "$DEVPATH" ]] || return 1
+  s=$(blockdev --getsize64 "$DEVPATH" 2>/dev/null) || return 1
+  [[ "$s" == "$SIZE" ]]
+}
+
+# ── Checks (authoritative) ──────────────────────────────────────────────────
+emit checking 0 0
+[[ -L "$BYID" ]] || refuse NOT_FOUND "$BYID does not exist"
+resolve_ok || {
+  [[ "$(readlink -f "$BYID")" == "$DEVPATH" ]] && refuse SIZE_CHANGED "size of $DEVPATH is not $SIZE"
+  refuse MEDIUM_SWAPPED "$BYID no longer resolves to $DEVPATH"
+}
+[[ "$(lsblk -dn -o TYPE "$DEVPATH" | tr -d '[:space:]')" == "disk" ]] || refuse BAD_ARGS "$DEVPATH is not a whole disk"
+rm_flag=$(cat "/sys/block/$DEV/removable" 2>/dev/null || echo 0)
+tran=$(lsblk -dn -o TRAN "$DEVPATH" | tr -d '[:space:]')
+[[ "$rm_flag" == "1" ]] || refuse NOT_REMOVABLE "$DEVPATH is not removable media (removable=$rm_flag, tran=$tran)"
+for mp in / /boot/firmware /boot; do
+  src=$(findmnt -n -o SOURCE "$mp" 2>/dev/null | head -1); [[ -n "$src" ]] || continue
+  src=${src%%[*}; pk=$(lsblk -no PKNAME "$src" 2>/dev/null | head -1 | tr -d '[:space:]')
+  [[ -z "$pk" ]] && pk=$(basename "$src")
+  [[ "$pk" == "$DEV" ]] && { [[ "$mp" == "/" ]] && refuse SYSTEM_DISK "$DEVPATH holds /"; refuse BOOT_DEVICE "$DEVPATH holds $mp"; }
+done
+while read -r name mnt; do
+  [[ -n "${mnt:-}" ]] && refuse MOUNTED "/dev/$name is mounted on $mnt"
+done < <(lsblk -ln -o NAME,MOUNTPOINT "$DEVPATH")
+if grep -q "^/dev/$DEV" /proc/swaps; then refuse MOUNTED "$DEVPATH holds active swap"; fi
+shopt -s nullglob; holders=(/sys/block/$DEV/holders/* /sys/block/$DEV/$DEV*/holders/*); shopt -u nullglob
+[[ ${#holders[@]} -eq 0 ]] || refuse IN_USE_BY_APP "$DEVPATH has holders (${holders[*]})"
+# IDEA META on any ext4 partition (read without mounting): never a flash target
+while read -r name fst; do
+  [[ "$fst" == "ext4" ]] || continue
+  if debugfs -R "stat /META.yaml" "/dev/$name" 2>/dev/null | grep -q "^Inode:"; then
+    refuse HAS_IDEA_META "/dev/$name has an IDEA META.yaml"
+  fi
+done < <(lsblk -ln -o NAME,FSTYPE "$DEVPATH" | tail -n +2)
+
+# ── Image ───────────────────────────────────────────────────────────────────
+emit verifying-image 0 0
+[[ -f "$IMAGE" ]] || refuse IMAGE_NOT_FOUND "$IMAGE missing"
+[[ -f "$IMAGE.sha256" ]] || refuse IMAGE_NOT_FOUND "$IMAGE.sha256 missing"
+read -r file_sha file_name < "$IMAGE.sha256"
+[[ "$file_sha" == "$SHA" ]] || refuse IMAGE_BAD_SHA ".sha256 file does not match the requested sha256"
+[[ "${file_name#\*}" == "$(basename "$IMAGE")" ]] || refuse IMAGE_BAD_SHA ".sha256 names '${file_name}', not $(basename "$IMAGE")"
+calc=$(sha256sum "$IMAGE" | cut -d' ' -f1)
+[[ "$calc" == "$SHA" ]] || refuse IMAGE_BAD_SHA "recomputed sha256 $calc differs"
+usize=$(xz --robot --list "$IMAGE" 2>/dev/null | awk '$1=="totals"{print $5}')
+[[ "$usize" =~ ^[0-9]+$ ]] || refuse IMAGE_BAD_SHA "cannot read the uncompressed size (xz --list)"
+[[ "$usize" -le "$SIZE" ]] || refuse IMAGE_TOO_LARGE "image needs $usize bytes, card has $SIZE"
+
+# ── Write ───────────────────────────────────────────────────────────────────
+resolve_ok || refuse MEDIUM_SWAPPED "$BYID changed before the write"
+exec 9<>"$DEVPATH" || refuse BUSY "cannot open $DEVPATH"
+flock -x -n 9 || refuse BUSY "$DEVPATH is locked by another process"
+emit writing 0 "$usize"
+mkfifo "$TMPD/f"
+sha256sum < "$TMPD/f" > "$TMPD/written.sha" & HASH_PID=$!
+( xz -dc "$IMAGE" | tee "$TMPD/f" | dd of="$DEVPATH" bs=4M iflag=fullblock oflag=direct conv=fsync status=none ) 2>"$TMPD/dd.err" & DD_PID=$!
+( while sleep 2; do resolve_ok || { echo swapped > "$TMPD/swapped"; kill $DD_PID 2>/dev/null; pkill -P $DD_PID 2>/dev/null; exit; }; done ) & WATCH_PID=$!
+base=$(awk '{print $7*512}' /sys/block/$DEV/stat 2>/dev/null || echo 0)
+last=0
+while kill -0 $DD_PID 2>/dev/null; do
+  sleep 1
+  done_b=$(awk -v b="$base" '{print $7*512-b}' /sys/block/$DEV/stat 2>/dev/null)
+  [[ -n "$done_b" && "$done_b" != "$last" ]] && { emit writing "$done_b" "$usize"; last=$done_b; }
+done
+wait $DD_PID; rc=$?
+kill $WATCH_PID 2>/dev/null; wait $WATCH_PID 2>/dev/null; WATCH_PID=
+wait $HASH_PID; HASH_PID=
+[[ -f "$TMPD/swapped" ]] && fail MEDIUM_SWAPPED "$BYID changed during the write"
+[[ $rc -eq 0 ]] || fail WRITE_FAILED "$(tail -c 300 "$TMPD/dd.err" | tr '\n' ' ')"
+wsha=$(cut -d' ' -f1 "$TMPD/written.sha")
+resolve_ok || fail MEDIUM_SWAPPED "$BYID changed after the write"
+
+# ── Read back ───────────────────────────────────────────────────────────────
+emit reading-back 0 "$usize"
+blockdev --flushbufs "$DEVPATH"
+echo 3 > /proc/sys/vm/drop_caches
+rsha=$(head -c "$usize" "$DEVPATH" | sha256sum | cut -d' ' -f1)
+emit reading-back "$usize" "$usize"
+[[ "$rsha" == "$wsha" ]] || fail VERIFY_FAILED "read-back $rsha differs from written $wsha"
+
+# ── Flush + power off ──────────────────────────────────────────────────────
+emit flushing 0 0
+sync
+exec 9>&-
+emit powering-off 0 0
+safe=$(try_power_off)
+printf '{"result":"ok","bytesWritten":%s,"sha256":"%s","imageSha256":"%s","readBackSha256":"%s","safeToRemove":%s}\n' "$usize" "$wsha" "$SHA" "$rsha" "$safe"
+exit 0

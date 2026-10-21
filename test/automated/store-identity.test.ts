@@ -131,6 +131,28 @@ describe('store identity at startup (idea#120)', () => {
         expect(() => readStoreDocId(paths.urlPath)).to.throw(/empty/)
     })
 
+    it('readStoreDocId trims a trailing newline / CRLF / spaces; the untrimmed id is what automerge-repo rejects (kind-panda 2026-10-18)', async () => {
+        const { isValidDocumentId } = await import('@automerge/automerge-repo')
+        const url = new Repo({ network: [] }).create<Store>({} as Store).url
+        const id = storeDocIdFromUrl(url)
+        for (const content of [`${url}\n`, `${url}\r\n`, `  ${url}  \n\n`, url]) {
+            await fs.writeFile(paths.urlPath, content)
+            expect(readStoreDocId(paths.urlPath), JSON.stringify(content)).to.equal(id)
+            expect(isValidDocumentId(readStoreDocId(paths.urlPath))).to.be.true
+        }
+        // the old script/client.ts read: no trim, so '<id>\n' reached repo.find
+        await fs.writeFile(paths.urlPath, `${url}\n`)
+        const oldId = fs.readFileSync(paths.urlPath, 'utf-8').replace('automerge:', '')
+        expect(isValidDocumentId(oldId as any)).to.be.false
+        await expect((async () => new Repo({ network: [] }).find(oldId as any))()).rejects.toThrow(/Invalid AutomergeUrl/)
+    })
+
+    it('script/client.ts (the ./client CLI, dist/script/client.js) reads store-url.txt through readStoreDocId', async () => {
+        const src = await fs.readFile(path.resolve('script/client.ts'), 'utf8')
+        expect(src).to.match(/readStoreDocId\(STORE_URL_PATH\)/)
+        expect(src).to.not.match(/readFileSync\(STORE_URL_PATH/)
+    })
+
     it('writeFileAtomic replaces the file and leaves no temp file', async () => {
         const f = path.join(tmp, 'x.txt')
         await writeFileAtomic(f, 'one')

@@ -39,6 +39,8 @@ export const RECOVERY_STRATEGY: Record<OperationKind, RecoveryStrategy> = {
     upgradeEngine: 'fail',    // not yet implemented
     startApp:      'fail',    // partial start state unknown — operator must re-issue
     stopApp:       'fail',    // partial stop state unknown — operator must re-issue
+    flashCard:     'fail',    // idea#201: never retried; Failed 'INTERRUPTED: ...'
+    initialiseDisk:'fail',    // idea#201: operator re-issues
 }
 
 // ── Operation CRUD ────────────────────────────────────────────────────────────
@@ -77,7 +79,7 @@ export const createOperation = (
 export const updateOperation = (
     storeHandle: DocHandle<Store>,
     id: string,
-    patch: Partial<Pick<Operation, 'status' | 'progressPercent' | 'currentStep' | 'totalSteps' | 'stepLabel' | 'completedAt' | 'error'>>
+    patch: Partial<Pick<Operation, 'status' | 'progressPercent' | 'currentStep' | 'totalSteps' | 'stepLabel' | 'completedAt' | 'error' | 'safeToRemove'>>
 ): void => {
     // Log a step-advance marker before mutating the store.
     // Uses console.log directly (not log()) so it always lands in the CommandLog trace
@@ -109,6 +111,7 @@ export const updateOperation = (
         if (patch.stepLabel !== undefined) op.stepLabel = patch.stepLabel
         if (patch.completedAt !== undefined) op.completedAt = patch.completedAt
         if (patch.error !== undefined) op.error = patch.error
+        if (patch.safeToRemove !== undefined) op.safeToRemove = patch.safeToRemove
         // Clear step progress when operation reaches a terminal state
         if (patch.status === 'Done' || patch.status === 'Failed' || patch.status === 'Cancelled') {
             op.currentStep = null
@@ -351,19 +354,20 @@ export const recoverInterruptedOperations = async (
             })
         } else {
             log(chalk.yellow(`  ${op.id.slice(0, 8)} ${op.kind}: marking Failed (strategy: ${strategy}${strategy === 'retry' ? ', no handler' : ''})`))
+            const base = strategy === 'retry'
+                ? 'Engine restarted while operation was in progress — re-issue to retry'
+                : 'Engine restarted while operation was in progress — re-issue manually'
+            // idea#201 §10: client-card operations carry a code the Console can map
+            const isCardOp = op.kind === 'flashCard' || op.kind === 'initialiseDisk'
+            const message = isCardOp ? `INTERRUPTED: ${base}` : base
             if (cmdLogHandle) {
                 addTrace(cmdLogHandle, { traceId, command: op.kind, args: traceArgs, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
-                closeTrace(cmdLogHandle, traceId, 'error',
-                    strategy === 'retry'
-                        ? 'Engine restarted while operation was in progress — re-issue to retry'
-                        : 'Engine restarted while operation was in progress — re-issue manually'
-                )
+                closeTrace(cmdLogHandle, traceId, 'error', message)
             }
             updateOperation(storeHandle, op.id, {
                 status: 'Failed',
-                error: strategy === 'retry'
-                    ? 'Engine restarted while operation was in progress — re-issue to retry'
-                    : 'Engine restarted while operation was in progress — re-issue manually',
+                error: message,
+                ...(op.kind === 'flashCard' ? { safeToRemove: false } : {}),
                 completedAt: Date.now() as Timestamp,
             })
         }

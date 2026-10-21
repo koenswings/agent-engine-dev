@@ -19,7 +19,7 @@ import { DocHandle, Repo } from '@automerge/automerge-repo'
 import { fs, path, YAML } from 'zx'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId, ENGINE_CAPABILITIES } from '../../src/data/Engine.js'
-import { createOrUpdateDisk, processDisk } from '../../src/data/Disk.js'
+import { createOrUpdateDisk, processDisk, setRootDeviceForTests } from '../../src/data/Disk.js'
 import { createOrUpdateApp } from '../../src/data/App.js'
 import {
     FILES_REMOUNT_GROUP_MS, IDEA_FILES_JSON,
@@ -133,7 +133,7 @@ describe('Files mount helpers (idea#133)', () => {
     })
 
     it('ENGINE_CAPABILITIES includes filesMount', () => {
-        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly'])
+        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages'])
     })
 })
 
@@ -211,6 +211,7 @@ describe('remountInstance status handling', () => {
     let h: DocHandle<Store>
     let composeCalls: { dir: string; override: string; args: string[] }[]
     const roots: string[] = []
+    let appDeviceName = ''
 
     beforeEach(async () => {
         h = await newStore()
@@ -230,6 +231,7 @@ describe('remountInstance status handling', () => {
         await processDisk(h, filesDisk)
 
         const appDevice = uniqueTestDevice()
+        appDeviceName = appDevice
         const appRoot = `${DISKS_ROOT}/${appDevice}`
         await fs.ensureDir(`${appRoot}/apps/sample-files-1.0`)
         await fs.ensureDir(`${appRoot}/instances/inst-1`)
@@ -267,6 +269,28 @@ describe('remountInstance status handling', () => {
         expect(ov.services.sample.volumes[0].target).toMatch(/\/school-files-files-/)
         const display = JSON.parse(await fs.readFile(displayJsonHostPath('inst-1' as InstanceID), 'utf8'))
         expect(Object.values(display)).toContain('School Files')
+    })
+
+    it('instance on the SYSTEM disk: compose cwd is the absolute /instances/<id>, never relative (idea#237)', async () => {
+        // kind-panda / happy-zebra: diskMountRoot is '' for the system disk and
+        // path.join('', 'instances', id) was the relative 'instances/<id>' → "spawn /usr/bin/bash ENOENT"
+        addInstance(h, 'inst-1', { status: 'Running', diskId: 'app-disk' })
+        setRootDeviceForTests(appDeviceName)
+        try {
+            expect(await remountInstance(h, 'inst-1' as InstanceID)).toBe('done')
+        } finally {
+            setRootDeviceForTests(null)
+        }
+        expect(composeCalls).toHaveLength(1)
+        expect(path.isAbsolute(composeCalls[0].dir)).toBe(true)
+        expect(composeCalls[0].dir).toBe('/instances/inst-1')
+    })
+
+    it('instance on a regular disk: compose cwd is <disksRoot>/<device>/instances/<id> (unchanged)', async () => {
+        addInstance(h, 'inst-1', { status: 'Running', diskId: 'app-disk' })
+        expect(await remountInstance(h, 'inst-1' as InstanceID)).toBe('done')
+        expect(composeCalls[0].dir).toBe(`${DISKS_ROOT}/${appDeviceName}/instances/inst-1`)
+        expect(path.isAbsolute(composeCalls[0].dir)).toBe(true)
     })
 
     it('Stopped → left alone; filesMounts unchanged', async () => {

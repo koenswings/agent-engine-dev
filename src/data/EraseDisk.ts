@@ -15,7 +15,7 @@ import path from 'path'
 import { $, chalk, fs, YAML } from 'zx'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Store } from './Store.js'
-import { Disk, diskMountRoot, processDisk, createOrUpdateDisk } from './Disk.js'
+import { Disk, diskPath, processDisk, createOrUpdateDisk } from './Disk.js'
 import { localEngineId, EraseInProgress } from './Engine.js'
 import { DiskID, EngineID, Timestamp } from './CommonTypes.js'
 import { resourceLock, diskKey, instanceKey } from '../utils/ResourceLock.js'
@@ -27,6 +27,7 @@ import { isSystemDevice, driveNameOf, bareDevice } from './SystemDisk.js'
 import { log, print, uuid } from '../utils/utils.js'
 import { disksRoot } from './Config.js'
 import { APP_DATA_HELPER, eraseSlotArgs } from '../utils/appDataHelper.js'
+import { forgetMetaLook } from '../monitors/metaLookCache.js'
 
 /** Same pattern as TEST_DEVICE_PATTERN in usbDeviceMonitor (avoid a circular import). */
 export const SLOT_ERASE_DEVICE_PATTERN = /^idea-test-[0-9]+$/
@@ -37,10 +38,18 @@ export const isSlotEraseDevice = (device: string | null | undefined): boolean =>
 export const ERASE_SCRIPT = '/usr/local/sbin/idea-erase-disk'
 export const ERASE_STAGING_ROOT = path.join(ENGINE_STATE_DIR, 'erase-staging')
 export const IDEA_DISK_LABEL = 'IDEA Disk'
+/** How long eraseDisk waits for the erased disk to be republished as empty after the add. */
+export const ERASE_REPUBLISH_WAIT_MS = 20_000
 
 /** Devices currently locked for erase; addDevice skips these. */
 const lockedDevices = new Set<string>()
 export const isEraseDeviceLocked = (device: string): boolean => lockedDevices.has(device)
+/**
+ * The addDevice guard (usbDeviceMonitor): a device, or its whole drive, that an erase holds is not
+ * mounted by udev / chokidar adds while it is being repartitioned.
+ */
+export const eraseLockRefusesAdd = (device: string): boolean =>
+    isEraseDeviceLocked(device) || isEraseDeviceLocked(driveNameOf(device.replace(/^\/dev\/(engine\/)?/, '')))
 export const eraseLockedDevicesForTests = (): Set<string> => lockedDevices
 
 export interface EraseScriptArgs {
@@ -193,7 +202,7 @@ export const composeVolumeHostPaths = async (store: Store, inst: { id: string; s
     try {
         const home = inst.storedOn ? store.diskDB[inst.storedOn as DiskID] : null
         if (!home?.device) return []
-        const file = path.join(await diskMountRoot(home), 'instances', inst.id, 'compose.yaml')
+        const file = await diskPath(home, 'instances', inst.id, 'compose.yaml')
         const doc = YAML.parse(await fs.readFile(file, 'utf8')) ?? {}
         const out: string[] = []
         for (const svc of Object.values<any>(doc.services ?? {})) {
@@ -388,8 +397,7 @@ export const eraseDisk = async (
                     name: inst.name as string,
                     dataBytes: instSummary?.dataBytes ?? 0,
                 })
-                const mountRoot = await diskMountRoot(disk)
-                const instanceDir = path.join(mountRoot, 'instances', inst.id)
+                const instanceDir = await diskPath(disk, 'instances', inst.id)
                 try { await ops.composeDownV(instanceDir) } catch (e: any) {
                     log(`compose down -v for ${inst.id}: ${e.message ?? e}`)
                 }
@@ -397,7 +405,7 @@ export const eraseDisk = async (
             // Capture apps on this disk before undock
             const appIds = new Set<string>()
             try {
-                const appsRoot = path.join(await diskMountRoot(disk), 'apps')
+                const appsRoot = await diskPath(disk, 'apps')
                 for (const id of await fs.readdir(appsRoot)) appIds.add(id)
             } catch { /* */ }
             for (const inst of instances) appIds.add(inst.instanceOf)
@@ -495,11 +503,20 @@ export const eraseDisk = async (
         const partition = slotErase ? (devicePartition ?? whole) : `${whole}1`
         // Engine mounts via addDevice (testMode slots: fixture already remounted by erase-slot)
         const add = addDeviceImpl ?? ops.addDevice
+        // The repartitioning is done: release the erase lock BEFORE the post-erase add. While the lock
+        // was held, addDevice refused both this add and the udev add event of the new partition
+        // ("Device sdb1 is locked for erase — addDevice skipped"). The disk then never came back, and
+        // the erase failed with "did not come back as empty" (wizardly-hugle 2026-10-12 18:46).
+        // The finally below still deletes the lock (idempotent) on every path.
+        lockedDevices.delete(whole)
+        // The erase wrote a new META.yaml: a META look the usb monitor cached before the erase must not decide this add
+        forgetMetaLook(partition)
         await add(`/dev/engine/${partition}`)
 
         // Wait briefly for the disk to appear as empty
         let published: Disk | undefined
-        for (let i = 0; i < 20; i++) {
+        // A USB first mount can take longer than the old 4 s: wait up to ERASE_REPUBLISH_WAIT_MS.
+        for (let i = 0; i < Math.ceil(ERASE_REPUBLISH_WAIT_MS / 200); i++) {
             const s = storeHandle.doc()!
             published = Object.values(s.diskDB).find(d => d.id === keptId && d.dockedTo === localEngineId)
             if (published && published.diskTypes?.includes('empty')) break

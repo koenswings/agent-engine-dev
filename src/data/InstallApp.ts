@@ -23,13 +23,14 @@ import * as net from 'net'
 import { log } from '../utils/utils.js'
 import { Store, getDisk, getLocalEngine } from './Store.js'
 import { resolveDiskArg } from './DiskArg.js'
-import { buildInstance } from './Instance.js'
+import { buildInstance, versionDirName } from './Instance.js'
 import { parseAppId } from './App.js'
 import { AppID, AppName, DiskID, DiskName, InstanceName, Version } from './CommonTypes.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Disk, diskMountRoot } from './Disk.js'
 import { App, createOrUpdateApp } from './App.js'
-import { assertNoExternalLinks } from './InstanceCopy.js'
+import { assertNoExternalLinks, setComposeInstanceName } from './InstanceCopy.js'
+import { splitArgs } from '../utils/commandUtils.js'
 import { trackInFlight } from './InstanceInFlight.js'
 
 // ── Internet probe ────────────────────────────────────────────────────────────
@@ -51,6 +52,84 @@ export const hasInternet = (): Promise<boolean> => {
     })
 }
 
+// ── Arguments and name checks (Kid, idea#235) ────────────────────────────────
+
+export const INSTALL_APP_USAGE = 'Usage: installApp <appId> <targetDiskId> [--source <sourceDiskId>] [--name <instanceName>] [--fresh]'
+
+/** Longest display name accepted by installApp --name. */
+export const MAX_INSTANCE_NAME_LENGTH = 64
+
+/**
+ * Check a display name for an instance: not empty or blank, at most
+ * MAX_INSTANCE_NAME_LENGTH characters, no control characters (newlines, tabs).
+ * Spaces are fine: the name only goes into x-app.instanceName and the store
+ * record, never into the instance id, folder or Docker project name.
+ */
+export const validateInstanceName = (name: string): string => {
+    if (name.trim().length === 0) throw new Error('installApp: --name must not be empty')
+    if (name.length > MAX_INSTANCE_NAME_LENGTH) throw new Error(`installApp: --name is longer than ${MAX_INSTANCE_NAME_LENGTH} characters`)
+    if (/[\u0000-\u001f\u007f]/.test(name)) throw new Error('installApp: --name must not contain control characters or newlines')
+    return name
+}
+
+export interface ParsedInstallAppArgs {
+    appId: AppID
+    targetDiskId: string
+    sourceDiskId?: string
+    instanceName?: InstanceName
+    fresh: boolean
+}
+
+/**
+ * Parse the installApp argument line with the quote-aware splitArgs, so
+ * `--name "Kolibri Demo"` is one value. Unquoted lines parse as before.
+ */
+export const parseInstallAppArgs = (argsString: string): ParsedInstallAppArgs => {
+    const parts = splitArgs((argsString ?? '').trim())
+    const appId = parts[0] as AppID
+    const targetDiskId = parts[1]
+    if (!appId || !targetDiskId || targetDiskId.startsWith('--')) throw new Error(INSTALL_APP_USAGE)
+    const known = new Set(['--source', '--name', '--fresh'])
+    for (let i = 2; i < parts.length; i++) {
+        const p = parts[i]
+        if (p === '--fresh') continue
+        if (p === '--source' || p === '--name') { i++; continue }
+        throw new Error(`installApp: unexpected argument '${p}'. ${INSTALL_APP_USAGE}`)
+    }
+    const flagValue = (flag: string): string | undefined => {
+        const i = parts.indexOf(flag)
+        if (i === -1) return undefined
+        const v = parts[i + 1]
+        if (v === undefined || known.has(v)) throw new Error(`installApp: ${flag} needs a value. ${INSTALL_APP_USAGE}`)
+        return v
+    }
+    const name = flagValue('--name')
+    return {
+        appId,
+        targetDiskId,
+        sourceDiskId: flagValue('--source'),
+        instanceName: name === undefined ? undefined : validateInstanceName(name) as InstanceName,
+        fresh: parts.includes('--fresh'),
+    }
+}
+
+/** True when both paths exist and resolve (realpath) to the same folder. */
+export const sameRealPath = async (a: string, b: string): Promise<boolean> => {
+    if (!await fs.pathExists(a) || !await fs.pathExists(b)) return false
+    return (await fs.realpath(a)) === (await fs.realpath(b))
+}
+
+/**
+ * The app id as it is stored on a disk: `<name>@<ref>` (installApp input, any git
+ * ref) becomes `<name>-<versionDirName(ref)>`, the apps/ folder buildInstance writes.
+ * Other ids are returned unchanged.
+ */
+export const diskAppId = (appId: string): AppID => {
+    if (!String(appId).includes('@')) return appId as AppID
+    const { name, version } = parseAppId(appId)
+    return `${name}-${versionDirName(version)}` as AppID
+}
+
 // ── Local install path ────────────────────────────────────────────────────────
 
 /**
@@ -63,7 +142,8 @@ export const installAppFromDisk = async (
     appId: AppID,
     sourceDisk: Disk,
     targetDisk: Disk,
-    instanceName: InstanceName
+    instanceName: InstanceName,
+    opts: { fresh?: boolean } = {}
 ): Promise<void> => {
     const sourceDevice = sourceDisk.device
     const targetDevice = targetDisk.device
@@ -85,8 +165,9 @@ export const installAppFromDisk = async (
     const sourceInstanceBase = `${sourceMountRoot}/instances`
 
     // If source has an instance of this app, copy its data as the starting point
+    // --fresh: never copy an existing instance's data (a demo must not inherit a school's data)
     let sourceInstanceId: string | null = null
-    if (await fs.pathExists(sourceInstanceBase)) {
+    if (!opts.fresh && await fs.pathExists(sourceInstanceBase)) {
         const store = storeHandle.doc()
         const sourceInstance = Object.values(store.instanceDB).find(
             i => String(i.instanceOf) === String(appId) && String(i.storedOn) === String(sourceDisk.id)
@@ -109,10 +190,15 @@ export const installAppFromDisk = async (
     await fs.ensureDir(`${targetMountRoot}/instances`)
     await fs.ensureDir(`${targetMountRoot}/services`)
 
-    // Copy app bundle
+    // Copy app bundle, unless source and target are the same folder (--source is the
+    // target disk; Kid, #221): fs.copy refuses to copy a folder onto itself
     const targetAppPath = `${targetMountRoot}/apps/${appId}`
-    log(`Copying app bundle: ${sourcePath} → ${targetAppPath}`)
-    await fs.copy(sourcePath, targetAppPath, { overwrite: true })
+    if (await sameRealPath(sourcePath, targetAppPath)) {
+        log(`App bundle already in place at ${targetAppPath} (source is the target disk); not copying it`)
+    } else {
+        log(`Copying app bundle: ${sourcePath} → ${targetAppPath}`)
+        await fs.copy(sourcePath, targetAppPath, { overwrite: true })
+    }
 
     // Register app in store
     await createOrUpdateApp(storeHandle, appId, targetDisk)
@@ -123,12 +209,25 @@ export const installAppFromDisk = async (
     if (copyFromSourceInstance) {
         log(`Copying instance data from ${sourceInstanceId} to new instance ${instanceId}`)
         await fs.copy(`${sourceInstanceBase}/${sourceInstanceId}`, instanceDir, { overwrite: true })
+    } else if (opts.fresh) {
+        // --fresh: the whole app bundle is the instance's starting point (entrypoint
+        // scripts, hooks, bundled apps; Nextcloud needs them), never a source instance's data
+        log(`Fresh instance ${instanceId}: copying the whole app bundle ${targetAppPath}`)
+        await fs.copy(targetAppPath, instanceDir, { overwrite: true })
     } else {
         // No existing instance data — copy compose.yaml from app bundle as baseline
         const composeSrc = `${targetAppPath}/compose.yaml`
         if (await fs.pathExists(composeSrc)) {
             await fs.copy(composeSrc, `${instanceDir}/compose.yaml`)
         }
+    }
+
+    // Write the requested display name (Kid, idea#235). Only x-app.instanceName
+    // changes; the instance id, folder and Docker project stay the generated id.
+    const composeFile = `${instanceDir}/compose.yaml`
+    if (await fs.pathExists(composeFile)) {
+        const text = await fs.readFile(composeFile, 'utf8')
+        await fs.writeFile(composeFile, setComposeInstanceName(text, String(instanceName)))
     }
 
     // processInstance registers the new instance in the store and starts it
@@ -145,6 +244,7 @@ export interface InstallAppOptions {
     targetDiskId: string         // disk id (a unique disk name still resolves, deprecated; idea#128)
     sourceDiskId?: string        // --source flag; omit for auto-routing
     instanceName?: InstanceName  // --name flag; defaults to appId
+    fresh?: boolean              // --fresh flag; local route starts from the bundle, no source instance data
     gitAccount?: string          // for GitHub path; defaults to 'koenswings'
 }
 
@@ -185,8 +285,11 @@ const installAppRouted = async (
     storeHandle: DocHandle<Store>,
     opts: InstallAppOptions
 ): Promise<void> => {
+    // `<name>@<ref>` (Kid, #221): the ref goes to git as given; disks use the folder-safe id
+    const refAppId = opts.appId
+    opts = { ...opts, appId: diskAppId(opts.appId) }
     const store = storeHandle.doc()
-    const instanceName = (opts.instanceName ?? opts.appId) as InstanceName
+    const instanceName = (opts.instanceName === undefined ? opts.appId : validateInstanceName(String(opts.instanceName))) as InstanceName
     const gitAccount = opts.gitAccount ?? 'koenswings'
 
     // Resolve the disks on this engine (idea#128): by id, or a unique docked name
@@ -202,7 +305,7 @@ const installAppRouted = async (
         const sourceDisk = resolveDiskArg(store, engineId, opts.sourceDiskId, 'installApp --source')
         if (await diskHasAppBundle(sourceDisk as Disk, opts.appId)) {
             log(chalk.blue(`installApp: local path — source '${sourceDisk.name}' (${sourceDisk.id})`))
-            await installAppFromDisk(storeHandle, opts.appId, sourceDisk as Disk, targetDisk as Disk, instanceName)
+            await installAppFromDisk(storeHandle, opts.appId, sourceDisk as Disk, targetDisk as Disk, instanceName, { fresh: opts.fresh })
             return
         }
         log(chalk.yellow(
@@ -217,7 +320,8 @@ const installAppRouted = async (
     if (online) {
         // Route 2: GitHub path (existing buildInstance logic)
         log(chalk.blue(`installApp: GitHub path (internet available)`))
-        const { name: appName, version } = parseAppId(opts.appId)
+        const { name: appName, version } = parseAppId(refAppId)
+        if (!appName || !version) throw new Error(`installApp: cannot read an app name and version from '${refAppId}'. Use <name>-<version> or <name>@<git ref>.`)
         const targetDevice = targetDisk.device!
         const instanceId = await buildInstance(instanceName, appName, gitAccount, version, targetDevice as any)
         if (!instanceId) {
@@ -242,7 +346,7 @@ const installAppRouted = async (
         const sourceDisk = getDisk(store, sourceDiskId)
         if (sourceDisk?.device && await diskHasAppBundle(sourceDisk as Disk, opts.appId)) {
             log(chalk.blue(`installApp: auto-selected source disk '${sourceDisk.name}'`))
-            await installAppFromDisk(storeHandle, opts.appId, sourceDisk as Disk, targetDisk as Disk, instanceName)
+            await installAppFromDisk(storeHandle, opts.appId, sourceDisk as Disk, targetDisk as Disk, instanceName, { fresh: opts.fresh })
             return
         }
     }
@@ -250,7 +354,7 @@ const installAppRouted = async (
     const alt = await findDockedDiskWithApp(store, opts.appId, String(targetDisk.id))
     if (alt) {
         log(chalk.blue(`installApp: found apps/${opts.appId} on docked disk '${alt.name}' (${alt.id})`))
-        await installAppFromDisk(storeHandle, opts.appId, alt, targetDisk as Disk, instanceName)
+        await installAppFromDisk(storeHandle, opts.appId, alt, targetDisk as Disk, instanceName, { fresh: opts.fresh })
         return
     }
 

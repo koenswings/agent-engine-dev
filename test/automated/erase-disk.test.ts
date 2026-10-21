@@ -14,11 +14,13 @@ import { createOrUpdateDisk, processDisk } from '../../src/data/Disk.js'
 import {
     eraseDisk, setEraseOpsForTests, clearStaleEraseStaging, ERASE_STAGING_ROOT,
     eraseBlocker, IDEA_DISK_LABEL, isEraseDeviceLocked, isSlotEraseDevice,
+    eraseLockRefusesAdd, eraseLockedDevicesForTests, setEraseAddDevice,
 } from '../../src/data/EraseDisk.js'
 import { summariseDisk, attachTraceResult, SUMMARY_MAX_AGE_MS, setSummariseOpsForTests } from '../../src/data/SummariseDisk.js'
 import { scanUnformattedDisks, setUnformattedOpsForTests, uniquifyLabels, clearGeneratedUnformattedIdsForTests, labelForUnformatted } from '../../src/data/UnformattedDisks.js'
 import { setSystemDiskOpsForTests, isSystemDevice, driveNameOf } from '../../src/data/SystemDisk.js'
 import { SUDO_MOUNT_PATTERN, mountExt4Command } from '../../src/monitors/mounts.js'
+import { metaLookCache } from '../../src/monitors/metaLookCache.js'
 import { CommandLogStore, setCommandLogHandle, addTrace, closeTrace } from '../../src/data/CommandLogStore.js'
 import { DeviceName, DiskID, DiskName, EngineID, Timestamp } from '../../src/data/CommonTypes.js'
 import { DISKS_ROOT, FIXTURES_DIR, uniqueTestDevice } from '../harness/diskSim.js'
@@ -62,7 +64,7 @@ describe('system disk helper + mount command (idea#134)', () => {
     })
 
     it('ENGINE_CAPABILITIES includes eraseDisk', () => {
-        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly'])
+        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages'])
     })
 })
 
@@ -103,6 +105,22 @@ describe('unformattedDisks scan (idea#134)', () => {
         expect(list.find(d => d.device === 'sdb')!.label).toMatch(/SanDisk/)
     })
 
+    it('a removable medium (client card / card reader) is never listed (idea#201 §10)', async () => {
+        setSystemDiskOpsForTests({ findmntSource: async () => null, pkname: async () => null })
+        setUnformattedOpsForTests({
+            lsblkJson: async () => [
+                { name: 'sdc', type: 'disk', size: '15931539456', model: 'Mass Storage Device', serial: '121220160204', rm: true, children: [
+                    { name: 'sdc1', type: 'part', fstype: 'vfat', size: '268435456' },
+                    { name: 'sdc2', type: 'part', fstype: null, size: '268435456' },
+                ]},
+                { name: 'sdd', type: 'disk', size: '0', model: 'Card Reader', serial: 'R2', rm: '1', children: [] },
+                { name: 'sde', type: 'disk', size: '8000000000', model: 'HDD', serial: 'FIXED', rm: false, children: [] },
+            ],
+        })
+        const names = (await scanUnformattedDisks()).map(d => d.device)
+        expect(names).toEqual(['sde'])
+    })
+
     it('labels get (2) on a clash (display only)', () => {
         const items = [
             { label: labelForUnformatted('SanDisk', 32e9) },
@@ -129,6 +147,7 @@ describe('unformattedDisks scan (idea#134)', () => {
     })
 })
 
+let eraseOpsForTestsAdd: (p: string) => Promise<void>
 describe('summariseDisk + eraseDisk (idea#134)', () => {
     let h: DocHandle<Store>
     let logHandle: DocHandle<CommandLogStore>
@@ -168,7 +187,7 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
             composeDownV: async () => {},
             lsblkSizeSerial: async () => ({ sizeBytes: 32_000_000_000, serial: 'FAKE1' }),
             isMountPoint: async () => false,
-            addDevice: async (p) => {
+            addDevice: eraseOpsForTestsAdd = async (p) => {
                 const device = p.split('/').pop()!
                 const root = `${DISKS_ROOT}/${device}`
                 if (!(await fs.pathExists(root))) await fs.ensureDir(root)
@@ -274,6 +293,44 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
         expect(isEraseDeviceLocked('sdb')).toBe(false)
     })
 
+    it('post-erase add goes through the real erase-lock guard and is not refused (wh 2026-10-12)', async () => {
+        // Production wires usbDeviceMonitor.addDevice, which refuses locked devices via eraseLockRefusesAdd.
+        // Before the fix the lock on 'sdb' was held across the add → "did not come back as empty".
+        const refused: string[] = []
+        const realAdd = (eraseOpsForTestsAdd as any)
+        setEraseAddDevice(async (p) => {
+            const device = p.split('/').pop()!
+            if (eraseLockRefusesAdd(device)) { refused.push(device); return }
+            await realAdd(p)
+        })
+        try {
+            h.change(doc => {
+                doc.engineDB[LOCAL].unformattedDisks = [{
+                    candidateId: 'CAND1', device: 'sdb', sizeBytes: 32e9,
+                    model: 'SanDisk', fsType: 'exfat', label: 'SanDisk 32 GB', serial: 'FAKE1',
+                }]
+            })
+            const tid = putSummary('CAND1', 'SanDisk 32 GB')
+            const result = await eraseDisk(h, 'CAND1', tid, 'SanDisk 32 GB')
+            expect(refused).toEqual([])
+            expect(result.diskId).toBe('CAND1')
+            expect([...h.doc()!.diskDB['CAND1' as DiskID].diskTypes]).toEqual(['empty'])
+            expect(isEraseDeviceLocked('sdb')).toBe(false)
+        } finally {
+            setEraseAddDevice(null)
+        }
+    })
+
+    it('eraseLockRefusesAdd: partition and whole drive of a locked erase are refused, others not', () => {
+        eraseLockedDevicesForTests().add('sdc')
+        try {
+            expect(eraseLockRefusesAdd('sdc1')).toBe(true)
+            expect(eraseLockRefusesAdd('/dev/engine/sdc1')).toBe(true)
+            expect(eraseLockRefusesAdd('sdc')).toBe(true)
+            expect(eraseLockRefusesAdd('sdd1')).toBe(false)
+        } finally { eraseLockedDevicesForTests().delete('sdc') }
+    })
+
     it('second concurrent erase is refused', async () => {
         h.change(doc => {
             doc.engineDB[LOCAL].eraseInProgress = { targetId: 'other', label: 'Other', step: 'partitioning' }
@@ -284,6 +341,36 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
         })
         const tid = putSummary('CAND1', 'SanDisk 32 GB')
         await expect(eraseDisk(h, 'CAND1', tid, 'SanDisk 32 GB')).rejects.toThrow(/already in progress/)
+    })
+
+    it('post-erase add looks again: a "no META.yaml" look cached before the erase does not decide it (happy-zebra 2026-10-17)', async () => {
+        // The usb monitor caches one META look per device (metaLookCache). A look of sdb1 taken
+        // before the erase (no META.yaml) must be forgotten before the post-erase add.
+        metaLookCache.clear()
+        await metaLookCache.get('sdb1', async () => ({ ok: true, hasMeta: false, alreadyMounted: false }))
+        const realAdd = (eraseOpsForTestsAdd as any)
+        const looks: boolean[] = []
+        setEraseAddDevice(async (p) => {
+            const device = p.split('/').pop()!
+            const look = await metaLookCache.get(device, async () => ({ ok: true, hasMeta: true, alreadyMounted: false }))
+            looks.push(look.ok && look.hasMeta)
+            if (look.ok && look.hasMeta) await realAdd(p)   // otherwise "has no IDEA META.yaml — left untouched"
+        })
+        try {
+            h.change(doc => {
+                doc.engineDB[LOCAL].unformattedDisks = [{
+                    candidateId: 'CAND1', device: 'sdb', sizeBytes: 32e9,
+                    model: 'SanDisk', fsType: 'exfat', label: 'SanDisk 32 GB', serial: 'FAKE1',
+                }]
+            })
+            const tid = putSummary('CAND1', 'SanDisk 32 GB')
+            await eraseDisk(h, 'CAND1', tid, 'SanDisk 32 GB')
+            expect(looks).toEqual([true])
+            expect([...h.doc()!.diskDB['CAND1' as DiskID].diskTypes]).toEqual(['empty'])
+        } finally {
+            setEraseAddDevice(null)
+            metaLookCache.clear()
+        }
     })
 
     it('clearStaleEraseStaging removes leftover folders', async () => {
