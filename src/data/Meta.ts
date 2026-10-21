@@ -4,6 +4,7 @@ import pack from '../../package.json' with { type: "json" }
 import { deepPrint, fileExists, log, stripPartition, uuid, print } from '../utils/utils.js'
 import { DeviceName, DiskID, DiskName, Timestamp, Version } from './CommonTypes.js'
 import { disksRoot, skipHardwareId, skipMetaUpdate } from './Config.js'
+import { HardwareIdentity, readPartitionFacts, resolveHardwareDiskId } from './DiskIdentity.js'
 
 export interface DiskMeta {
   diskId: DiskID         
@@ -102,7 +103,53 @@ export const ensureSystemMeta = async (
   return meta
 }
 
-export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMeta> => {
+/**
+ * The serial of the drive behind a device plus the partition facts the diskId
+ * depends on (idea#168 D4, DiskIdentity.ts). undefined when the drive has no
+ * hardware serial (readHardwareId: Intenso / Samsung FIT only).
+ */
+export const readHardwareIdentity = async (
+  device: DeviceName,
+  deps: { readHardwareId?: (d: DeviceName) => Promise<DiskID | undefined>, readPartitionFacts?: typeof readPartitionFacts } = {},
+): Promise<HardwareIdentity | undefined> => {
+  const serial = await (deps.readHardwareId ?? readHardwareId)(device)
+  if (!serial) return undefined
+  const facts = await (deps.readPartitionFacts ?? readPartitionFacts)(device)
+  return {
+    serial: String(serial),
+    self: facts.self ?? { name: device, partn: null, partuuid: null, fstype: null },
+    siblings: facts.siblings,
+  }
+}
+
+/**
+ * The diskId for a partition that has no META.yaml yet: the drive serial for a
+ * single-partition drive, `<serial>-<PARTUUID>` when the drive has several ext4
+ * partitions (idea#168 D4); undefined without a hardware serial.
+ */
+export const newHardwareDiskId = async (
+  device: DeviceName,
+  readIdentity: (d: DeviceName) => Promise<HardwareIdentity | undefined> = (d) => readHardwareIdentity(d),
+): Promise<DiskID | undefined> => {
+  const identity = await readIdentity(device).catch(() => undefined)
+  if (!identity) return undefined
+  const r = resolveHardwareDiskId(null, identity)
+  log(`Hardware id for ${device}: ${r.diskId} (drive serial ${identity.serial}, PARTUUID ${identity.self.partuuid ?? '-'})`)
+  return r.diskId
+}
+
+export interface MetaIdDeps {
+  /** Hardware identity of an App Disk partition (serial + partition facts) */
+  readIdentity: (device: DeviceName) => Promise<HardwareIdentity | undefined>
+  /** Serial of the system disk (its id stays the bare serial) */
+  readHardwareId: (device: DeviceName) => Promise<DiskID | undefined>
+}
+
+export const readMetaUpdateId = async (deviceSpec?: DeviceName, depsIn: Partial<MetaIdDeps> = {}): Promise<DiskMeta> => {
+  const deps: MetaIdDeps = {
+    readIdentity: depsIn.readIdentity ?? ((d) => readHardwareIdentity(d)),
+    readHardwareId: depsIn.readHardwareId ?? ((d) => readHardwareId(d)),
+  }
   let path
   let device: DeviceName
   // Every Engine runs on a Pi with a real /META.yaml. We always read it.
@@ -160,7 +207,17 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
         log(`skipHardwareId: using diskId from META file (${meta.diskId}), skipping hardware id lookup`)
         diskId = meta.diskId
       } else {
-        diskId = await readHardwareId(device) as DiskID
+        // App Disk partitions: serial + partition identity (idea#168 D4, DiskIdentity.ts).
+        // The system disk keeps the bare root-drive serial (the Engine id depends on it).
+        const identity = deviceSpec ? await deps.readIdentity(device).catch(() => undefined) : undefined
+        if (identity) {
+          const r = resolveHardwareDiskId(meta, identity)
+          log(`Disk id for ${device}: ${r.diskId} (${r.decision}; drive serial ${identity.serial}, PARTUUID ${identity.self.partuuid ?? '-'}, partition ${identity.self.partn ?? '-'})`)
+          diskId = r.diskId
+          if (String(meta.diskId) !== String(diskId)) meta.isHardwareId = r.isHardwareId
+        } else {
+          diskId = (deviceSpec ? undefined : await deps.readHardwareId(device)) as DiskID
+        }
         if (!diskId) {
           log(`No hardware id found for device ${device}`)
           if (meta.hasOwnProperty('isHardwareId') && meta.isHardwareId) {
@@ -305,7 +362,7 @@ export const readHardwareIdIntenso = async (device: DeviceName): Promise<DiskID 
 export const createMeta = async (device: DeviceName, engineVersion: Version | undefined = undefined): Promise<DiskMeta> => {
   // Find the hardware id
   let isHardwareId
-  let diskId = await readHardwareId(device) as DiskID
+  let diskId = await newHardwareDiskId(device) as DiskID
   if (!diskId) {
     diskId = uuid() as DiskID
     isHardwareId = false

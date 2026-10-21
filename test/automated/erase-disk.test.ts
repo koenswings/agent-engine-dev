@@ -20,6 +20,7 @@ import { summariseDisk, attachTraceResult, SUMMARY_MAX_AGE_MS, setSummariseOpsFo
 import { scanUnformattedDisks, setUnformattedOpsForTests, uniquifyLabels, clearGeneratedUnformattedIdsForTests, labelForUnformatted } from '../../src/data/UnformattedDisks.js'
 import { setSystemDiskOpsForTests, isSystemDevice, driveNameOf } from '../../src/data/SystemDisk.js'
 import { SUDO_MOUNT_PATTERN, mountExt4Command } from '../../src/monitors/mounts.js'
+import { metaLookCache } from '../../src/monitors/metaLookCache.js'
 import { CommandLogStore, setCommandLogHandle, addTrace, closeTrace } from '../../src/data/CommandLogStore.js'
 import { DeviceName, DiskID, DiskName, EngineID, Timestamp } from '../../src/data/CommonTypes.js'
 import { DISKS_ROOT, FIXTURES_DIR, uniqueTestDevice } from '../harness/diskSim.js'
@@ -340,6 +341,36 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
         })
         const tid = putSummary('CAND1', 'SanDisk 32 GB')
         await expect(eraseDisk(h, 'CAND1', tid, 'SanDisk 32 GB')).rejects.toThrow(/already in progress/)
+    })
+
+    it('post-erase add looks again: a "no META.yaml" look cached before the erase does not decide it (happy-zebra 2026-10-17)', async () => {
+        // The usb monitor caches one META look per device (metaLookCache). A look of sdb1 taken
+        // before the erase (no META.yaml) must be forgotten before the post-erase add.
+        metaLookCache.clear()
+        await metaLookCache.get('sdb1', async () => ({ ok: true, hasMeta: false, alreadyMounted: false }))
+        const realAdd = (eraseOpsForTestsAdd as any)
+        const looks: boolean[] = []
+        setEraseAddDevice(async (p) => {
+            const device = p.split('/').pop()!
+            const look = await metaLookCache.get(device, async () => ({ ok: true, hasMeta: true, alreadyMounted: false }))
+            looks.push(look.ok && look.hasMeta)
+            if (look.ok && look.hasMeta) await realAdd(p)   // otherwise "has no IDEA META.yaml — left untouched"
+        })
+        try {
+            h.change(doc => {
+                doc.engineDB[LOCAL].unformattedDisks = [{
+                    candidateId: 'CAND1', device: 'sdb', sizeBytes: 32e9,
+                    model: 'SanDisk', fsType: 'exfat', label: 'SanDisk 32 GB', serial: 'FAKE1',
+                }]
+            })
+            const tid = putSummary('CAND1', 'SanDisk 32 GB')
+            await eraseDisk(h, 'CAND1', tid, 'SanDisk 32 GB')
+            expect(looks).toEqual([true])
+            expect([...h.doc()!.diskDB['CAND1' as DiskID].diskTypes]).toEqual(['empty'])
+        } finally {
+            setEraseAddDevice(null)
+            metaLookCache.clear()
+        }
     })
 
     it('clearStaleEraseStaging removes leftover folders', async () => {

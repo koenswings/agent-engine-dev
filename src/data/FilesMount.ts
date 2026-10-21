@@ -18,7 +18,7 @@ import { $, YAML, chalk, fs } from 'zx'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Store } from './Store.js'
 import type { App } from './App.js'
-import { diskMountRoot } from './Disk.js'
+import { diskMountRoot, diskPath, joinMountRoot } from './Disk.js'
 import type { Disk } from './Disk.js'
 import type { Instance, Status } from './Instance.js'
 import { DiskID, InstanceID } from './CommonTypes.js'
@@ -307,7 +307,7 @@ export const writeInstanceOverride = async (
         diskInfos.push({
             id: d.id,
             shareName: d.filesConfig!.shareName,
-            hostFilesPath: path.join(root, 'files'),
+            hostFilesPath: joinMountRoot(root, 'files'),
         })
     }
     const displayHost = displayJsonHostPath(instance.id)
@@ -380,7 +380,7 @@ export const remountInstance = async (
             log(`Files remount of ${instanceId}: disk undocked or instance Undocked — skipping`)
             return 'skipped'
         }
-        const instanceDir = path.join(await diskMountRoot(disk), 'instances', instanceId)
+        const instanceDir = await diskPath(disk, 'instances', instanceId)
         const composeArgs = action === 'up-d' ? ['up', '-d'] : ['up', '--no-start', '--force-recreate']
         await ops().composeUp(instanceDir, written.overridePath, composeArgs)
         // filesMounts only after success (§7.3)

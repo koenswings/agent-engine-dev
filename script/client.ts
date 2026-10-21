@@ -12,6 +12,7 @@ import { config } from '../src/data/Config.js'
 
 import { DocumentId, PeerId } from '@automerge/automerge-repo';
 import { localEngineId } from '../src/data/Engine.js';
+import { readStoreDocId } from '../src/data/StoreIdentity.js';
 
 // **********************
 // Command-line arguments
@@ -52,8 +53,10 @@ const hostname = engineName.endsWith('.local') ? engineName : `${engineName}.loc
 
 const clientPeerId = `client-on-${localEngineId}` as PeerId; // Unique identifier for the client
 const STORE_URL_PATH = "./store-identity/store-url.txt";
-const storeDocUrlStr = fs.readFileSync(STORE_URL_PATH, 'utf-8');
-const storeDocId = storeDocUrlStr.replace('automerge:', '') as DocumentId;
+// readStoreDocId trims surrounding whitespace: a store-url.txt written with a trailing
+// newline (e.g. `echo automerge:… > store-url.txt`) gave '<id>\n' and automerge-repo
+// refused it with 'Invalid AutomergeUrl' (kind-panda, 2026-10-18).
+const storeDocId: DocumentId = readStoreDocId(STORE_URL_PATH);
 console.log(`Using document ID: ${storeDocId}`);
 
 const { handle: storeHandle } = await createClientStore([hostname], clientPeerId, storeDocId);

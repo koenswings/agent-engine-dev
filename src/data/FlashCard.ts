@@ -31,7 +31,8 @@ import { attachTraceResult } from './SummariseDisk.js'
 import { getActiveTrace } from '../utils/CommandLogger.js'
 import { isSystemDevice } from './SystemDisk.js'
 import { ENGINE_STATE_DIR } from './FilesMount.js'
-import { lookForIdeaMeta, safeMount, mountPointOf } from '../monitors/mounts.js'
+import { lookForIdeaMeta, safeMount, mountPointOf, unmountAndRemove } from '../monitors/mounts.js'
+import { forgetMetaLook } from '../monitors/metaLookCache.js'
 import { log, print, uuid } from '../utils/utils.js'
 
 export const FLASH_HELPER = '/usr/local/sbin/idea-flash-card'
@@ -60,8 +61,12 @@ export interface FlashCardOps {
     lookForMeta: (partition: string) => ReturnType<typeof lookForIdeaMeta>
     mountRw: (partition: string) => ReturnType<typeof safeMount>
     writeMeta: (partition: string, yaml: string) => Promise<void>
+    /** Forget the usb monitor's cached ro META look, so addDevice sees the new META.yaml */
+    forgetMetaLook: (partition: string) => void
     /** The usb monitor's addDevice (registers the now-IDEA disk) */
     addDevice: (partition: string) => Promise<void>
+    /** Unmount the rw mount this command made and remove the mount point (never rm -fr) */
+    unmount: (partition: string) => Promise<{ ok: boolean; message?: string }>
     createFilesDisk: (h: DocHandle<Store>, diskId: string) => Promise<unknown>
     createBackupDisk: (h: DocHandle<Store>, diskId: string) => Promise<unknown>
     now: () => number
@@ -84,7 +89,9 @@ const defaultOps: FlashCardOps = {
         const r = await $({ input: yaml })`sudo -n /usr/bin/tee ${mountPointOf(p)}/META.yaml`.nothrow()
         if (r.exitCode !== 0) throw new Error(`could not write META.yaml on ${p}: ${r.stderr.trim()}`)
     },
+    forgetMetaLook: (p) => forgetMetaLook(p),
     addDevice: async (p) => { if (!addDeviceImpl) throw new Error('usb monitor not running'); await addDeviceImpl(`/dev/engine/${p}`) },
+    unmount: (p) => unmountAndRemove(p),
     createFilesDisk: async (h, id) => (await import('./CreateFilesDisk.js')).createFilesDisk(h, id),
     createBackupDisk: async (h, id) => {
         const disk = h.doc()?.diskDB?.[id as DiskID]
@@ -266,6 +273,26 @@ export const cancelFlash = (storeHandle: DocHandle<Store>, operationId: string):
 
 // ── initialiseDisk ───────────────────────────────────────────────────────────
 
+/**
+ * initialiseDisk failure cleanup: unmount the rw mount initialiseDisk made, unless a disk
+ * record on this Engine uses the partition (then it is a docked disk and is left alone).
+ * Never throws; a failed unmount is logged and the mount is left as it is.
+ */
+const releaseRwMount = async (storeHandle: DocHandle<Store>, partition: string): Promise<void> => {
+    const inUse = Object.values(storeHandle.doc()?.diskDB ?? {})
+        .some((d: any) => d?.device === partition && d?.dockedTo === localEngineId)
+    if (inUse) { log(`initialiseDisk: ${partition} failed to register but a disk record uses it; left mounted`); return }
+    try {
+        const r = await ops.unmount(partition)
+        log(r.ok ? `initialiseDisk: unmounted ${partition} after the failed registration`
+            : `initialiseDisk: could not unmount ${partition} after the failed registration: ${r.message}`)
+    } catch (e) {
+        log(`initialiseDisk: could not unmount ${partition} after the failed registration: ${e instanceof Error ? e.message : String(e)}`)
+    }
+    // The next add of this partition must look again (it now has META.yaml)
+    ops.forgetMetaLook(partition)
+}
+
 export const initialiseDisk = async (
     storeHandle: DocHandle<Store>, candidateId: string, roleArg: string = 'empty',
 ): Promise<{ operationId: string; diskId: string; partition: string }> => {
@@ -291,6 +318,10 @@ export const initialiseDisk = async (
 
     const opId = createOperation(storeHandle, 'initialiseDisk', { candidateId, role }, 'console-command', { type: 'disk', id: candidateId })
     running.set(opId, { proc: null, cancelled: false, kind: 'initialiseDisk' })
+    // Set once this command has mounted the partition read-write itself; cleared once the disk is registered
+    let mountedHere = false
+    let registered = false
+    let diskId: DiskID | null = null
     const fail = (code: string, text: string): never => {
         updateOperation(storeHandle, opId, { status: 'Failed', completedAt: ops.now() as Timestamp, error: `${code}: ${text}` })
         throw new CardError(code, text)
@@ -303,12 +334,17 @@ export const initialiseDisk = async (
         updateOperation(storeHandle, opId, { currentStep: 1, stepLabel: 'writing META.yaml' })
         const m = await ops.mountRw(target.name)
         if (!m.ok) fail('MOUNTED', m.message)
-        const diskId = uuid() as DiskID
+        mountedHere = m.ok && !m.alreadyMounted
+        diskId = uuid() as DiskID
         const meta = { diskId, diskName: 'IDEA Disk' as DiskName, isHardwareId: false, created: ops.now(), version: '1.0' }
         await ops.writeMeta(target.name, YAML.stringify(meta))
         updateOperation(storeHandle, opId, { currentStep: 2, stepLabel: 'registering' })
+        // The monitor cached "no META.yaml" for this partition when it was plugged in: forget it,
+        // or addDevice reuses that answer and never docks the disk (happy-zebra 2026-10-17).
+        ops.forgetMetaLook(target.name)
         await ops.addDevice(target.name)
-        if (!storeHandle.doc()?.diskDB?.[diskId]) fail('WRITE_FAILED', `${target.name} got META.yaml but did not dock as ${diskId}`)
+        registered = !!storeHandle.doc()?.diskDB?.[diskId]
+        if (!registered) fail('WRITE_FAILED', `${target.name} got META.yaml but did not dock as ${diskId}`)
         if (role === 'files') await ops.createFilesDisk(storeHandle, diskId)
         if (role === 'backup') await ops.createBackupDisk(storeHandle, diskId)
         updateOperation(storeHandle, opId, { status: 'Done', completedAt: ops.now() as Timestamp })
@@ -316,6 +352,10 @@ export const initialiseDisk = async (
         print(`Initialised ${target.name} (${candidateId}) as IDEA disk ${diskId} (${role})`)
         return { operationId: opId, diskId, partition: target.name }
     } catch (e) {
+        // Registration failed after this command mounted the partition read-write: release the
+        // mount again (umount, then rmdir of the mount point), unless a disk record now uses the
+        // partition. META.yaml stays on the disk, so a re-plug or Engine restart docks it.
+        if (mountedHere && !registered) await releaseRwMount(storeHandle, target.name)
         if (e instanceof CardError) throw e
         const msg = e instanceof Error ? e.message : String(e)
         return fail('WRITE_FAILED', msg)

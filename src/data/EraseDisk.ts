@@ -15,7 +15,7 @@ import path from 'path'
 import { $, chalk, fs, YAML } from 'zx'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Store } from './Store.js'
-import { Disk, diskMountRoot, processDisk, createOrUpdateDisk } from './Disk.js'
+import { Disk, diskPath, processDisk, createOrUpdateDisk } from './Disk.js'
 import { localEngineId, EraseInProgress } from './Engine.js'
 import { DiskID, EngineID, Timestamp } from './CommonTypes.js'
 import { resourceLock, diskKey, instanceKey } from '../utils/ResourceLock.js'
@@ -27,6 +27,7 @@ import { isSystemDevice, driveNameOf, bareDevice } from './SystemDisk.js'
 import { log, print, uuid } from '../utils/utils.js'
 import { disksRoot } from './Config.js'
 import { APP_DATA_HELPER, eraseSlotArgs } from '../utils/appDataHelper.js'
+import { forgetMetaLook } from '../monitors/metaLookCache.js'
 
 /** Same pattern as TEST_DEVICE_PATTERN in usbDeviceMonitor (avoid a circular import). */
 export const SLOT_ERASE_DEVICE_PATTERN = /^idea-test-[0-9]+$/
@@ -201,7 +202,7 @@ export const composeVolumeHostPaths = async (store: Store, inst: { id: string; s
     try {
         const home = inst.storedOn ? store.diskDB[inst.storedOn as DiskID] : null
         if (!home?.device) return []
-        const file = path.join(await diskMountRoot(home), 'instances', inst.id, 'compose.yaml')
+        const file = await diskPath(home, 'instances', inst.id, 'compose.yaml')
         const doc = YAML.parse(await fs.readFile(file, 'utf8')) ?? {}
         const out: string[] = []
         for (const svc of Object.values<any>(doc.services ?? {})) {
@@ -396,8 +397,7 @@ export const eraseDisk = async (
                     name: inst.name as string,
                     dataBytes: instSummary?.dataBytes ?? 0,
                 })
-                const mountRoot = await diskMountRoot(disk)
-                const instanceDir = path.join(mountRoot, 'instances', inst.id)
+                const instanceDir = await diskPath(disk, 'instances', inst.id)
                 try { await ops.composeDownV(instanceDir) } catch (e: any) {
                     log(`compose down -v for ${inst.id}: ${e.message ?? e}`)
                 }
@@ -405,7 +405,7 @@ export const eraseDisk = async (
             // Capture apps on this disk before undock
             const appIds = new Set<string>()
             try {
-                const appsRoot = path.join(await diskMountRoot(disk), 'apps')
+                const appsRoot = await diskPath(disk, 'apps')
                 for (const id of await fs.readdir(appsRoot)) appIds.add(id)
             } catch { /* */ }
             for (const inst of instances) appIds.add(inst.instanceOf)
@@ -509,6 +509,8 @@ export const eraseDisk = async (
         // the erase failed with "did not come back as empty" (wizardly-hugle 2026-10-12 18:46).
         // The finally below still deletes the lock (idempotent) on every path.
         lockedDevices.delete(whole)
+        // The erase wrote a new META.yaml: a META look the usb monitor cached before the erase must not decide this add
+        forgetMetaLook(partition)
         await add(`/dev/engine/${partition}`)
 
         // Wait briefly for the disk to appear as empty

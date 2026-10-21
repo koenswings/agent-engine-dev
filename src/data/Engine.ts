@@ -752,6 +752,11 @@ export const installRootHelpers = async (exec: any, enginePath: string) => {
   print(chalk.blue('  - Installing idea-erase-disk...'))
   await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-erase-disk /usr/local/sbin/idea-erase-disk`
   print(chalk.green('  - /usr/local/sbin/idea-erase-disk installed'))
+  // idea-write-home-engine (idea#203): called only by the flash-card root helper after a verified
+  // write; root-owned COPY like idea-erase-disk, no sudoers entry (the Engine never calls it).
+  print(chalk.blue('  - Installing idea-write-home-engine...'))
+  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-write-home-engine /usr/local/sbin/idea-write-home-engine`
+  print(chalk.green('  - /usr/local/sbin/idea-write-home-engine installed'))
   // idea-flash-card: client-card flash helper (idea#201 §10), root-owned COPY, 0755
   print(chalk.blue('  - Installing idea-flash-card...'))
   await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-flash-card ${FLASH_HELPER_PATH}`
