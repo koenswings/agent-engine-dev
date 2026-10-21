@@ -8,7 +8,7 @@ import { readMetaUpdateId, DiskMeta, addMeta, readRemoteDiskId } from './Meta.js
 import { Version, Command, Hostname, Timestamp, DiskID, EngineID } from './CommonTypes.js';
 import { Store, getAppsOfEngine, getDisksOfEngine, getInstancesOfEngine } from './Store.js';
 import { DocHandle } from '@automerge/automerge-repo';
-import { currentLanAddress } from './LanAddress.js';
+import { currentLanSelection, lanChangeLines, LanSelection } from './LanAddress.js';
 import type { NewDisk, CardReader, ClientCard } from './ClientCards.js';
 import type { ClientImageStore } from './ClientImages.js';
 import type { FlashInProgress } from './FlashCard.js';
@@ -61,6 +61,8 @@ export interface Engine {
    * Written at start and when it changes (checked on every heartbeat).
    */
   lanAddress?: string | null;
+  /** Every eligible LAN IPv4 in selection order; lanAddress is the first (null: none). Written only on change. See LanAddress.ts. */
+  lanAddresses?: string[] | null;
 }
 
 /** Engine.peerAccess (design-per-pi-engine-key.md) */
@@ -181,7 +183,7 @@ export const createEngineIdFromDiskId = (diskId: DiskID): EngineID => {
   return "ENGINE_" + diskId as EngineID
 }
 
-export const initialiseLocalEngine = async (): Promise<Engine> => {
+export const initialiseLocalEngine = async (lanSel: LanSelection = currentLanSelection()): Promise<Engine> => {
   try {
     const meta: DiskMeta = await readMetaUpdateId()
     const booted = (new Date()).getTime() as Timestamp
@@ -200,7 +202,8 @@ export const initialiseLocalEngine = async (): Promise<Engine> => {
       capabilitiesBootedAt: booted,
       eraseInProgress: null,
       unformattedDisks: [],
-      lanAddress: currentLanAddress(),
+      lanAddress: lanSel.address,
+      lanAddresses: lanSel.addresses ? [...lanSel.addresses] : null,
       usbSticks: [],
       flashInProgress: null,
     }
@@ -212,9 +215,12 @@ export const initialiseLocalEngine = async (): Promise<Engine> => {
 }
 
 export const createOrUpdateEngine = async (storeHandle: DocHandle<Store>, engineId: EngineID): Promise<Engine | undefined> => {
-  const newEngine: Engine = await initialiseLocalEngine()
+  const lanSel = currentLanSelection()
+  const newEngine: Engine = await initialiseLocalEngine(lanSel)
   let engine: Engine
   try {
+    // The lanAddress / lanAddresses change lines, same format as the heartbeat's (Liveness.ts)
+    for (const l of lanChangeLines(storeHandle.doc()?.engineDB?.[engineId] ?? {}, lanSel)) log(l)
     storeHandle.change(doc => {
       const storedEngine: Engine | undefined = doc.engineDB[engineId]
       if (!storedEngine) {
@@ -238,6 +244,12 @@ export const createOrUpdateEngine = async (storeHandle: DocHandle<Store>, engine
         if (engine.usbSticks === undefined || engine.usbSticks.length > 0) engine.usbSticks = []
         if (engine.eraseInProgress === undefined) engine.eraseInProgress = null
         if (engine.lanAddress !== newEngine.lanAddress) engine.lanAddress = newEngine.lanAddress ?? null
+        const lanList = newEngine.lanAddresses ?? null
+        const storedList = engine.lanAddresses ?? null
+        if (engine.lanAddresses === undefined || (storedList === null) !== (lanList === null) ||
+            (storedList && lanList && (storedList.length !== lanList.length || storedList.some((x, i) => x !== lanList[i])))) {
+          engine.lanAddresses = lanList ? [...lanList] : null
+        }
         // idea#201: a flash never survives a restart (its Operation is failed INTERRUPTED)
         if (engine.flashInProgress !== null) engine.flashInProgress = null
       }
