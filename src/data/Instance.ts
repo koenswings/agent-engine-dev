@@ -2,6 +2,7 @@ import { isCommitSha } from './AppIdParse.js'
 import { $, YAML, chalk, fs, os, sleep } from "zx";
 
 $.verbose = false;
+import { ensureNcAdminPassword } from "./AppSecrets.js";
 import { addOrUpdateEnvVariable, deepPrint, log, randomPort, readEnvVariable, uuid, print, isEngineOnline } from "../utils/utils.js";
 import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber, ServiceImage, Timestamp, Version, DeviceName, InstanceName, AppName, Hostname, DiskID, OperationCause } from "./CommonTypes.js";
 import { createOperation, updateOperation } from './Operations.js'
@@ -1089,6 +1090,8 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
     } catch (e) {
       log(`No .env file found for instance ${instance.id}`)
     }
+    // A new instance: no pass before this start (idea#202 keys on this)
+    const newInstance = !(pass && !(pass == ""))
     // Check if port is undefined or NaN
     if (pass && !(pass == "")) {
       log(`Found a pass for instance ${instance.id} in the .env file`)
@@ -1099,6 +1102,8 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
       // Write the password to the .env file
       await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'pass', pass)
     }
+    // Separate Nextcloud admin secret, once, for apps whose compose reads it (idea#202)
+    await ensureNcAdminPassword(`${mountRoot}/instances/${instance.id}`, newInstance)
 
 
     // **************************
