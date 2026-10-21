@@ -19,6 +19,7 @@ import { CommandLogStore, LogEntry, getCommandLogHandle, liveCommandLogHandle, a
 import { getActiveTrace, flushTrace } from '../utils/CommandLogger.js'
 import { dockerAvailable } from '../utils/dockerAvailable.js'
 import { rebindKolibriMorangoInstanceId } from './InstanceCopy.js'
+import { hostIdentity, writeHostIdentityEnv, isNextcloudInstance, nextcloudTrustedDomainsBridge, hostNetworkInterfaces } from './HostIdentity.js'
 import { trackInFlight, startDiskGoneReason, dockIdentityOf } from './InstanceInFlight.js'
 
 // ── Step-progress helpers ─────────────────────────────────────────────────────
@@ -1334,9 +1335,18 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
   const mountRoot = await diskMountRoot(disk)
   log(`Creating the containers for the services of the app instance`)
 
-  // Pass the Engine hostname and eth0 IP to every app's compose file via .env
-  // (previously Nextcloud only; apps such as the channel builder use ${hostname}).
-  await writeEngineHostEnv(`${mountRoot}/instances/${instance.id}/.env`, getLocalEngine(store).hostname, instance.id)
+  // Every app, every start: tell the instance which Pi it runs on
+  // (IDEA_HOSTNAME / IDEA_HOST_IPS, agent-engine-dev#163). Rewritten on each
+  // start, so the values follow a moved or copied disk to its new Pi.
+  const instanceDir = `${mountRoot}/instances/${instance.id}`
+  const envPath = `${instanceDir}/.env`
+  const identity = hostIdentity(store)
+  await writeHostIdentityEnv(envPath, identity)
+  log(`Host identity for instance ${instance.id}: IDEA_HOSTNAME=${identity.hostname} IDEA_HOST_IPS=${identity.ips.join(',')}`)
+
+  // hostname / ip for every app's compose (${hostname}, ${ip}): main's #217
+  // writeEngineHostEnv, which replaced this PR's Nextcloud-only block.
+  await writeEngineHostEnv(envPath, getLocalEngine(store).hostname, instance.id, hostNetworkInterfaces())
 
   log(`Creating containers of app instance '${instance.id}' on disk ${disk.id} of engine ${localEngineId}.`)
   try {
@@ -1477,32 +1487,15 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
     void syncUsbApps(storeHandle, 'start', true, instance.id)
   }
 
-  // App-specific post-processing commands
-  // If the app on which the instance is based is nextcloud, 
-  //    find the IP address of the server and store it in IPADDRESS
-  //    issue the following command: runuser --user www-data -- php occ config:app:set --value=http://<${PADDRESS}:9980 richdocuments wopi_url
-  const app = store.appDB[instance.instanceOf]
-  const ip = await readEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'ip')
-  if (app && app.name === 'nextcloud') {
-    if (ip) {
-      try {
-        // For unclear reasons, the occ command sometimes does not work, preventing the start of the container
-        // So we catch the error so that the container can still start
-        log(`Configuring nextcloud office`)
-        log('Sleeping for 20 seconds to allow the app to start')
-        await sleep(20000)
-        log(`Running the occ command to use the Collabora server at ${ip}:9980`)
-        await $`docker exec ${instance.id}-nextcloud-app-1 runuser --user www-data -- php occ config:app:set --value=http://${ip}:9980 richdocuments wopi_url`
-        log('Running the occ commands to set the trusted domains')
-        await $`docker exec ${instance.id}-nextcloud-app-1 runuser --user www-data -- php occ config:system:set trusted_domains 0 --value=*.local:*`
-        await $`docker exec ${instance.id}-nextcloud-app-1 runuser --user www-data -- php occ config:system:set trusted_domains 2 --value=192.168.0.*:*`
-        log(`occ commands executed`)
-      } catch (e) {
-        log(chalk.red(`Error configuring nextcloud office to use the Collabora server at ${ip}:9980`))
-        console.error(e)
-        await markInstanceError(storeHandle, instance, disk, e)
-      }
-    }
+  // Nextcloud post-start bridge. TODO-remove (agent-engine-dev#163) once every
+  // disk's app-nextcloud carries before-starting/20-idea-trusted-domains.sh.
+  // Sets the full trusted_domains list for this Pi (same managed-key algorithm as
+  // the hook, so it is a no-op after the hook ran) and the Collabora wopi_url.
+  // No fixed wait (the port-ready probe already ran) and never marks Error: a
+  // failing occ only logs. Replaces the old `*.local:*` / `192.168.0.*:*` hack.
+  if (await isNextcloudInstance(`${mountRoot}/instances/${instance.id}`)) {
+    const ip = await readEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'ip')
+    await nextcloudTrustedDomainsBridge(instance.id, hostIdentity(storeHandle.doc() ?? store), undefined, ip || undefined)
   }
 }
 
