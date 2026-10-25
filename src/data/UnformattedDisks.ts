@@ -34,6 +34,8 @@ export interface LsblkDevice {
     serial?: string | null
     /** lsblk RM: removable medium (card reader / SD). Such a device is a client card (idea#201 §10), never an Erase target. */
     rm?: boolean | number | string | null
+    vendor?: string | null
+    tran?: string | null
     children?: LsblkDevice[]
 }
 
@@ -44,7 +46,7 @@ export interface UnformattedOps {
 
 const defaultOps: UnformattedOps = {
     lsblkJson: async () => {
-        const out = await $`lsblk -J -b -o NAME,TYPE,FSTYPE,SIZE,MODEL,SERIAL,RM`.nothrow()
+        const out = await $`lsblk -J -b -o NAME,TYPE,FSTYPE,SIZE,MODEL,VENDOR,SERIAL,RM,TRAN`.nothrow()
         if (out.exitCode !== 0 || !out.stdout.trim()) return []
         const parsed = JSON.parse(out.stdout) as { blockdevices?: LsblkDevice[] }
         return parsed.blockdevices ?? []
@@ -124,6 +126,28 @@ export const candidateIdFor = async (name: string, serialRaw: string | null): Pr
 /** lsblk RM column (bool in recent util-linux, "1"/1 in older). Same rule as ClientCards. */
 export const isRemovableMedium = (d: LsblkDevice): boolean => d.rm === true || d.rm === 1 || d.rm === '1' || d.rm === 'true'
 
+/**
+ * idea#303: a removable USB device is a card reader (its medium an SD card, flash
+ * only) when its vendor/model looks like one, or when it was seen without a medium
+ * (size 0; a USB stick never reports size 0). Anything else removable on USB is a
+ * USB disk (stick) that can also become an IDEA disk. A false positive keeps the
+ * pre-#303 behaviour (flash only), the safe direction.
+ */
+export const CARD_READER_PATTERN = /card|reader|\bsd\b|mmc|multi|storage device/i
+const readersSeenEmpty = new Set<string>()
+export const clearCardReaderMemoryForTests = (): void => { readersSeenEmpty.clear() }
+const readerKey = (d: LsblkDevice): string => (d.serial ?? '').trim() || d.name
+const sizeOf = (d: LsblkDevice): number => typeof d.size === 'number' ? d.size : parseInt(String(d.size ?? '0'), 10) || 0
+
+/** True when this removable whole disk is a medium in a card reader (or a native card slot): flash only, never an IDEA disk. */
+export const isSdCardMedium = (d: LsblkDevice): boolean => {
+    if (!isRemovableMedium(d)) return false
+    if ((d.tran ?? 'usb') !== 'usb') return true          // removable but not USB: a native card slot
+    if (sizeOf(d) <= 0) { readersSeenEmpty.add(readerKey(d)); return true }
+    const text = `${d.vendor ?? ''} ${d.model ?? ''}`
+    return CARD_READER_PATTERN.test(text) || readersSeenEmpty.has(readerKey(d))
+}
+
 /** Forget the generated id of a device that is gone (called by every scanner). */
 export const forgetGeneratedIdsExcept = (present: Set<string>): void => {
     for (const k of [...generatedIds.keys()]) if (!present.has(k)) generatedIds.delete(k)
@@ -146,8 +170,9 @@ export const scanUnformattedDisks = async (): Promise<UnformattedDisk[]> => {
         if (!/^sd[a-z]$/.test(name)) continue  // whole sdX only; partitions 3+ out of scope for listing parents with ext4 on p3 still excluded via hasExt4
         seen.add(name)
         if (await isSystemDevice(name)) continue
-        // idea#201 §10: a removable medium is listed in Engine.clientCards (Flash), never here (no Erase on a client card)
-        if (isRemovableMedium(d)) continue
+        // idea#201 §10 / idea#303: an SD card in a reader is listed in Engine.clientCards (Flash) only, never here.
+        // A USB stick (removable, not in a reader) is listed here like an SSD (idea#303).
+        if (isSdCardMedium(d)) continue
         if (hasExt4(d)) continue
         const sizeBytes = typeof d.size === 'number' ? d.size : parseInt(String(d.size ?? '0'), 10) || 0
         const model = d.model?.trim() || null

@@ -20,7 +20,7 @@ import { DocHandle } from '@automerge/automerge-repo'
 import { Store } from './Store.js'
 import { EngineID, Timestamp } from './CommonTypes.js'
 import { isSystemDevice } from './SystemDisk.js'
-import { LsblkDevice, candidateIdFor } from './UnformattedDisks.js'
+import { LsblkDevice, candidateIdFor, isSdCardMedium } from './UnformattedDisks.js'
 import { localEngineId } from './Engine.js'
 import { log } from '../utils/utils.js'
 
@@ -84,7 +84,30 @@ export interface ScannedCard extends ClientCard {
     mountpoints: string[]
 }
 
+/** idea#303: what a physical non-IDEA disk can become. */
+export type DiskAction = 'initialise' | 'erase' | 'flash'
+export type DiskCandidateKind = 'usbDisk' | 'sdCard'
+
+/** idea#303: one entry per physical non-IDEA disk, with the actions it allows (Engine.diskCandidates). */
+export interface DiskCandidate {
+    candidateId: CandidateID
+    kind: DiskCandidateKind
+    device: string
+    sizeBytes: number
+    model: string | null
+    serial: string | null
+    removable: boolean
+    readerId: ReaderID | null
+    partitions: NewDiskPartition[]
+    contents: CardContents
+    actions: DiskAction[]
+    flashRefusal: FlashRefusal | null
+    mountedReadOnly: boolean
+    firstSeen: Timestamp
+}
+
 export interface ScanResult {
+    diskCandidates?: DiskCandidate[]
     /** candidateId → partition device names, in the order of NewDisk.partitions (internal) */
     newDiskPartitions?: Record<string, string[]>
     newDisks: NewDisk[]
@@ -203,7 +226,7 @@ export const scanClientCards = async (
     const links = await ops.byIdLinks()
     const docked = ops.dockedDevices(store, engineId)
     const now = ops.now()
-    const res: ScanResult = { newDisks: [], cardReaders: [], clientCards: [], newDiskPartitions: {} }
+    const res: ScanResult = { newDisks: [], cardReaders: [], clientCards: [], newDiskPartitions: {}, diskCandidates: [] }
     const present = new Set<string>()
 
     for (const d of devices) {
@@ -227,7 +250,7 @@ export const scanClientCards = async (
         const mounts = mountsOf(d)
 
         let readerId: ReaderID | null = null
-        if (removable && (d.tran ?? 'usb') === 'usb') {
+        if (removable && (d.tran ?? 'usb') === 'usb' && isSdCardMedium(d)) {
             const usbPath = usbPathOf(await ops.sysfsPath(d.name))
             readerId = sha16(`${usbPath || d.name}|${serial ?? ''}`)
             const hasMedium = sizeBytes > 0
@@ -247,30 +270,60 @@ export const scanClientCards = async (
                 device: d.name, byId, ptuuid: clean(d.ptuuid), serial,
                 partitionNames: children.map(c => c.name), mountpoints: mounts,
             })
+            res.diskCandidates!.push({
+                candidateId: candidateId!, kind: 'sdCard', device: d.name, sizeBytes, model, serial, removable: true, readerId,
+                partitions, contents, actions: ['flash'], flashRefusal: refusal, mountedReadOnly: false,
+                firstSeen: firstSeenByKey.get(candidateId!)! as Timestamp,
+            })
             continue
         }
-        if (removable) {
+        if (removable && (d.tran ?? 'usb') !== 'usb') {
             // Removable but not on USB (e.g. a native SD slot that is not the system disk): a card without a reader entry
             const candidateId = `card-${sha16(`${serial ?? d.name}|${sizeBytes}|${clean(d.ptuuid) ?? ''}`)}`
             if (sizeBytes <= 0) continue
             present.add(candidateId)
+            if (!firstSeenByKey.has(candidateId)) firstSeenByKey.set(candidateId, now)
             const refusal: FlashRefusal | null = opts.helperInstalled === false ? 'HELPER_MISSING' : mounts.length ? 'MOUNTED' : opts.busy ? 'BUSY' : null
             res.clientCards.push({
                 candidateId, sizeBytes, model, readerId: null, contents, flashable: refusal === null, refusal,
                 device: d.name, byId, ptuuid: clean(d.ptuuid), serial, partitionNames: children.map(c => c.name), mountpoints: mounts,
             })
+            res.diskCandidates!.push({
+                candidateId, kind: 'sdCard', device: d.name, sizeBytes, model, serial, removable: true, readerId: null,
+                partitions, contents, actions: ['flash'], flashRefusal: refusal, mountedReadOnly: false,
+                firstSeen: firstSeenByKey.get(candidateId)! as Timestamp,
+            })
             continue
         }
+        // idea#303: a USB disk (stick, SSD or HDD, whatever its rm flag) or a non-USB disk.
+        // Both IDEA-disk roles and, on USB with a usb-* by-id link, the client-image role.
         if (sizeBytes <= 0) continue
         const { candidateId, serial: idSerial } = await candidateIdFor(d.name, serial)
         present.add(candidateId)
         if (!firstSeenByKey.has(candidateId)) firstSeenByKey.set(candidateId, now)
+        const firstSeen = firstSeenByKey.get(candidateId)! as Timestamp
+        const mountedReadOnly = mounts.length > 0 && mounts.every(m => m.startsWith('/run/idea-usb'))
         res.newDiskPartitions![candidateId] = children.map(c => c.name)
         res.newDisks.push({
             candidateId, device: d.name, byId: byId ?? '', sizeBytes, model, serial: idSerial,
-            removable: false, readerId: null, partitions, contents,
-            mountedReadOnly: mounts.length > 0 && mounts.every(m => m.startsWith('/run/idea-usb')),
-            firstSeen: firstSeenByKey.get(candidateId)! as Timestamp,
+            removable, readerId: null, partitions, contents, mountedReadOnly, firstSeen,
+        })
+        const anyExt4 = clean(d.fstype) === 'ext4' || children.some(c => clean(c.fstype) === 'ext4')
+        const actions: DiskAction[] = []
+        if (children.some(c => clean(c.fstype) === 'ext4' && /^sd[a-z][12]$/.test(c.name))) actions.push('initialise')
+        if (!anyExt4) actions.push('erase')
+        let flashRefusal: FlashRefusal | null = null
+        if ((d.tran ?? 'usb') === 'usb' && byId && byId.startsWith('/dev/disk/by-id/usb-')) {
+            actions.push('flash')
+            flashRefusal = opts.helperInstalled === false ? 'HELPER_MISSING' : mounts.length ? 'MOUNTED' : opts.busy ? 'BUSY' : null
+            res.clientCards.push({
+                candidateId, sizeBytes, model, readerId: null, contents, flashable: flashRefusal === null, refusal: flashRefusal,
+                device: d.name, byId, ptuuid: clean(d.ptuuid), serial, partitionNames: children.map(c => c.name), mountpoints: mounts,
+            })
+        }
+        res.diskCandidates!.push({
+            candidateId, kind: 'usbDisk', device: d.name, sizeBytes, model, serial: idSerial, removable, readerId: null,
+            partitions, contents, actions, flashRefusal, mountedReadOnly, firstSeen,
         })
     }
     for (const k of [...firstSeenByKey.keys()]) if (!present.has(k)) firstSeenByKey.delete(k)
@@ -293,7 +346,7 @@ const publicCard = (c: ScannedCard): ClientCard => ({
     contents: c.contents, flashable: c.flashable, refusal: c.refusal,
 })
 
-const fingerprint = (r: ScanResult): string => JSON.stringify([r.newDisks, r.cardReaders, r.clientCards.map(publicCard)])
+const fingerprint = (r: ScanResult): string => JSON.stringify([r.newDisks, r.cardReaders, r.clientCards.map(publicCard), r.diskCandidates ?? []])
 let lastWritten = ''
 
 /**
@@ -327,6 +380,7 @@ const refreshClientCardsNow = async (
         e.newDisks = JSON.parse(JSON.stringify(scan.newDisks))
         e.cardReaders = JSON.parse(JSON.stringify(scan.cardReaders))
         e.clientCards = scan.clientCards.map(publicCard)
+        e.diskCandidates = JSON.parse(JSON.stringify(scan.diskCandidates ?? []))
     })
     log(`Client cards: ${scan.clientCards.map(c => `${c.device}(${c.candidateId}${c.refusal ? ' ' + c.refusal : ''})`).join(', ') || '(none)'}; ` +
         `new disks: ${scan.newDisks.map(d => d.device).join(', ') || '(none)'}; readers: ${scan.cardReaders.length}`)

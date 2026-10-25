@@ -25,7 +25,7 @@ import {
     flashCard, cancelFlash, initialiseDisk, setFlashCardOpsForTests, clearFlashStateForTests, parseHelperError, CardError,
 } from '../../src/data/FlashCard.js'
 import { recoverInterruptedOperations, createOperation, updateOperation } from '../../src/data/Operations.js'
-import { setUnformattedOpsForTests, scanUnformattedDisks, clearGeneratedUnformattedIdsForTests } from '../../src/data/UnformattedDisks.js'
+import { setUnformattedOpsForTests, scanUnformattedDisks, clearGeneratedUnformattedIdsForTests, clearCardReaderMemoryForTests, candidateIdFor } from '../../src/data/UnformattedDisks.js'
 
 const LOCAL = localEngineId as EngineID
 const newStore = async (): Promise<DocHandle<Store>> => {
@@ -258,8 +258,10 @@ describe('flashCard / cancelFlash (idea#201 §10)', () => {
     it('refuses with contract codes before any Operation exists', async () => {
         const size = String(32 * GB)
         expect(await code(flashCard(h, 'card-nope', 'current', size))).toBe('NOT_FOUND')
-        const ssd = (await scanClientCards(undefined, String(LOCAL))).newDisks[0].candidateId
-        expect(await code(flashCard(h, ssd, 'current', size))).toBe('NOT_REMOVABLE')
+        // idea#303: a USB SSD is a flash target now; a non-USB disk is not
+        lsblk = [...lsblk, { ...FOREIGN_SSD, name: 'sdg', serial: 'SATA1', tran: 'sata' }]
+        const sata = (await scanClientCards(undefined, String(LOCAL))).newDisks.find(d => d.device === 'sdg')!.candidateId
+        expect(await code(flashCard(h, sata, 'current', size))).toBe('NOT_REMOVABLE')
         expect(await code(flashCard(h, cardId, 'current', String(16 * GB)))).toBe('SIZE_CHANGED')
         expect(await code(flashCard(h, cardId, '26.04-20990101-abcdef0', size))).toBe('IMAGE_NOT_FOUND')
         expect(await code(flashCard(h, cardId, 'current', 'abc'))).toBe('BAD_ARGS')
@@ -272,7 +274,7 @@ describe('flashCard / cancelFlash (idea#201 §10)', () => {
     })
 
     it('never flashes the system disk even if it were listed as a card', async () => {
-        useDevices([{ ...SYS, rm: true }, RPI_CARD], ['sdf1'], () => false)  // scanner fooled
+        useDevices([{ ...SYS, rm: true, model: 'SD Card Reader' }, RPI_CARD], ['sdf1'], () => false)  // scanner fooled
         const sysCard = (await scanClientCards(undefined, String(LOCAL))).clientCards.find(c => c.device === 'sda')
         expect(sysCard).toBeDefined()
         expect(await code(flashCard(h, sysCard!.candidateId, 'current', String(500 * GB)))).toMatch(/SYSTEM_DISK|MOUNTED/)
@@ -452,5 +454,90 @@ describe('capabilities + helper script (idea#201 §10)', () => {
     it('sudoers allows the helper (validated by itself)', async () => {
         const s = await fs.readFile(path.resolve(process.cwd(), 'script/build_image_assets/11-engine-files.sudoers'), 'utf8')
         expect(s).toMatch(/^pi ALL=\(root\) NOPASSWD: \/usr\/local\/sbin\/idea-flash-card$/m)
+    })
+})
+
+// ── idea#303: disk roles (one candidate per physical disk, allowed actions) ─
+describe('disk roles: USB disks get both roles, SD cards flash only (idea#303)', () => {
+    const STICK: CardLsblkDevice = { name: 'sdh', type: 'disk', size: 64 * GB, rm: true, tran: 'usb', model: 'Flash Drive FIT', vendor: 'Samsung', serial: 'FIT303',
+        children: [{ name: 'sdh1', type: 'part', fstype: 'exfat', label: 'SAMSUNG', size: 64 * GB }] }
+    const EXT4_STICK: CardLsblkDevice = { ...STICK, name: 'sdi', serial: 'FIT304', children: [{ name: 'sdi1', type: 'part', fstype: 'ext4', label: 'old', size: 64 * GB }] }
+    let h: DocHandle<Store>, spawned: any[]
+    beforeEach(async () => {
+        clearClientCardStateForTests(); clearGeneratedUnformattedIdsForTests(); resetClientCardWriteCacheForTests(); clearFlashStateForTests(); clearCardReaderMemoryForTests()
+        h = await newStore()
+        spawned = []
+        setFlashCardOpsForTests({
+            helperInstalled: () => true,
+            spawnHelper: (a) => { spawned.push(a); return new FakeProc() as any },
+            images: async () => ({ current: V2, previous: null, images: [IMG] }),
+            appendFlashLog: async () => {},
+            isSystemDevice: async (d) => d.startsWith('sda'),
+        })
+    })
+    afterEach(() => { setFlashCardOpsForTests(null); setClientCardOpsForTests(null); setUnformattedOpsForTests(null); clearFlashStateForTests() })
+    const code = async (p: Promise<unknown>) => { try { await p; return 'OK' } catch (e) { return (e as CardError).code ?? String(e) } }
+
+    it('one candidate per physical disk with its actions; same candidateId across the legacy lists', async () => {
+        useDevices([SYS, RPI_CARD, STICK, EXT4_STICK, FOREIGN_SSD, EXFAT_SSD, IDEA_SSD])
+        const r = await scanClientCards(undefined, String(LOCAL))
+        const by = (dev: string) => r.diskCandidates!.find(c => c.device === dev)
+        expect(r.diskCandidates!.map(c => c.device).sort()).toEqual(['sdb', 'sdd', 'sde', 'sdh', 'sdi'])   // never sda (system) or sdf (docked IDEA)
+        expect(by('sdb')).toMatchObject({ kind: 'sdCard', actions: ['flash'], removable: true })
+        expect(by('sdh')).toMatchObject({ kind: 'usbDisk', actions: ['erase', 'flash'], removable: true, readerId: null, flashRefusal: null })
+        expect(by('sdi')).toMatchObject({ kind: 'usbDisk', actions: ['initialise', 'flash'] })
+        expect(by('sdd')).toMatchObject({ kind: 'usbDisk', actions: ['initialise', 'flash'], removable: false })
+        expect(by('sde')).toMatchObject({ kind: 'usbDisk', actions: ['erase', 'flash'] })
+        // legacy lists: SD card only in clientCards; USB disks in newDisks AND clientCards with one id
+        expect(r.newDisks.map(d => d.device).sort()).toEqual(['sdd', 'sde', 'sdh', 'sdi'])
+        expect(r.clientCards.map(c => c.device).sort()).toEqual(['sdb', 'sdd', 'sde', 'sdh', 'sdi'])
+        for (const dev of ['sdd', 'sde', 'sdh', 'sdi']) {
+            expect(r.clientCards.find(c => c.device === dev)!.candidateId).toBe(r.newDisks.find(d => d.device === dev)!.candidateId)
+            expect(by(dev)!.candidateId).toBe(r.newDisks.find(d => d.device === dev)!.candidateId)
+        }
+        expect(r.cardReaders.map(x => x.candidateId)).toEqual([by('sdb')!.candidateId])   // a stick is not a card reader
+        const unf = await scanUnformattedDisks()
+        expect(unf.map(u => u.device).sort()).toEqual(['sde', 'sdh'])                  // sticks without ext4 get Erase too; never the SD card
+        expect(unf.find(u => u.device === 'sdh')!.candidateId).toBe(by('sdh')!.candidateId)
+    })
+
+    it('card reader vs stick: reader-like model, or seen without a medium, stays an SD card', async () => {
+        const generic: CardLsblkDevice = { ...STICK, name: 'sdj', serial: 'GEN1', model: 'USB DISK 3.0', vendor: 'Generic', size: 0, children: [] }
+        useDevices([generic])
+        expect((await scanClientCards(undefined, String(LOCAL))).diskCandidates).toEqual([])   // empty reader
+        lsblk = [{ ...generic, size: 32 * GB, children: [{ name: 'sdj1', type: 'part', fstype: 'vfat', label: 'bootfs', size: 1 * GB }] }]
+        expect((await scanClientCards(undefined, String(LOCAL))).diskCandidates!.map(c => [c.kind, c.actions])).toEqual([['sdCard', ['flash']]])
+        clearCardReaderMemoryForTests()
+        expect((await scanClientCards(undefined, String(LOCAL))).diskCandidates!.map(c => c.kind)).toEqual(['usbDisk'])
+    })
+
+    it('SSD flash target: the helper gets the SSD by-id (usb-*), size and image', async () => {
+        useDevices([SYS, FOREIGN_SSD])
+        const ssd = (await scanClientCards(undefined, String(LOCAL))).diskCandidates!.find(c => c.device === 'sdd')!
+        const { done } = await flashCard(h, ssd.candidateId, 'current', String(240 * GB))
+        expect(spawned).toHaveLength(1)
+        expect(spawned[0]).toMatchObject({ byId: expect.stringMatching(/^\/dev\/disk\/by-id\/usb-/), device: 'sdd', sizeBytes: 240 * GB, sha256: IMG.sha256 })
+        void done
+    })
+
+    it('refuses a docked IDEA SSD, a mounted USB disk and the system disk; nothing is spawned', async () => {
+        useDevices([SYS, IDEA_SSD, { ...STICK, children: [{ name: 'sdh1', type: 'part', fstype: 'exfat', label: 'T', size: 64 * GB, mountpoint: '/run/idea-usb/sdh1' }] }])
+        const r = await scanClientCards(undefined, String(LOCAL))
+        expect(r.diskCandidates!.some(c => c.device === 'sdf' || c.device === 'sda')).toBe(false)
+        expect(r.clientCards.some(c => c.device === 'sdf' || c.device === 'sda')).toBe(false)
+        const idea = await candidateIdFor('sdf', 'IDEA1')
+        expect(await code(flashCard(h, idea.candidateId, 'current', String(240 * GB)))).toBe('NOT_FOUND')
+        const stick = r.diskCandidates!.find(c => c.device === 'sdh')!
+        expect(stick.flashRefusal).toBe('MOUNTED')
+        expect(await code(flashCard(h, stick.candidateId, 'current', String(64 * GB)))).toBe('MOUNTED')
+        expect(spawned).toHaveLength(0)
+    })
+
+    it('helper: accepts removable=1 or tran=usb, everything else unchanged', () => {
+        const helper = fs.readFileSync(path.join(process.cwd(), 'script/build_image_assets/idea-flash-card'), 'utf8')
+        expect(helper).toContain('[[ "$rm_flag" == "1" || "$tran" == "usb" ]] || refuse NOT_REMOVABLE')
+        expect(helper).toContain('by-id must be /dev/disk/by-id/usb-...')
+        expect(helper).toContain('refuse SYSTEM_DISK')
+        expect(helper).toContain('refuse HAS_IDEA_META')
     })
 })

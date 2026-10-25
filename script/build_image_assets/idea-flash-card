@@ -1,5 +1,5 @@
 #!/bin/bash
-# idea-flash-card — write a verified IDEA client image to a removable card (idea#201 §10)
+# idea-flash-card — write a verified IDEA client image to a removable card or USB disk (idea#201 §10, idea#303)
 #
 # Installed as a root-owned COPY at /usr/local/sbin/idea-flash-card (never a symlink).
 # Allowed by sudoers with no argument list; this script re-checks EVERYTHING itself
@@ -85,7 +85,8 @@ resolve_ok || {
 [[ "$(lsblk -dn -o TYPE "$DEVPATH" | tr -d '[:space:]')" == "disk" ]] || refuse BAD_ARGS "$DEVPATH is not a whole disk"
 rm_flag=$(cat "/sys/block/$DEV/removable" 2>/dev/null || echo 0)
 tran=$(lsblk -dn -o TRAN "$DEVPATH" | tr -d '[:space:]')
-[[ "$rm_flag" == "1" ]] || refuse NOT_REMOVABLE "$DEVPATH is not removable media (removable=$rm_flag, tran=$tran)"
+# idea#303: a USB SSD/HDD (removable=0, tran=usb) is a valid client-image target too
+[[ "$rm_flag" == "1" || "$tran" == "usb" ]] || refuse NOT_REMOVABLE "$DEVPATH is neither removable media nor a USB disk (removable=$rm_flag, tran=$tran)"
 for mp in / /boot/firmware /boot; do
   src=$(findmnt -n -o SOURCE "$mp" 2>/dev/null | head -1); [[ -n "$src" ]] || continue
   src=${src%%[*}; pk=$(lsblk -no PKNAME "$src" 2>/dev/null | head -1 | tr -d '[:space:]')
