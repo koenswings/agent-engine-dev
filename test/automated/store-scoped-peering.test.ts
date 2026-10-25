@@ -27,6 +27,7 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest'
+import { removeTestDir } from '../harness/removeTestDir.js'
 import net from 'net'
 import os from 'os'
 import path from 'path'
@@ -64,7 +65,9 @@ const until = async (cond: () => boolean, timeoutMs = 15_000, what = 'condition'
     const end = Date.now() + timeoutMs
     while (!cond()) { if (Date.now() > end) throw new Error(`timeout waiting for ${what}`); await sleep(50) }
 }
-const tmp = (p: string) => fs.mkdtempSync(path.join(os.tmpdir(), `idea-storescope-${p}-`))
+// Every temp dir is removed after the file (PR #248 re-run on idea04 left 18 /tmp/idea-storescope-*).
+const tempDirs: string[] = []
+const tmp = (p: string) => { const d = fs.mkdtempSync(path.join(os.tmpdir(), `idea-storescope-${p}-`)); tempDirs.push(d); return d }
 /** NodeFS storage path of a doc (as createServerStore checks it). */
 const onDisk = (dir: string, id: string) => fs.existsSync(path.join(dir, id.slice(0, 2), id.slice(2)))
 /**
@@ -160,6 +163,11 @@ const findWithTimeout = async (repo: Repo, id: DocumentId, ms = 8_000): Promise<
 }
 
 afterEach(stopAll)
+afterAll(async () => {
+    await stopAll()
+    await sleep(1_000)   // let throttled sync-state saves land first
+    for (const d of tempDirs) await removeTestDir(d)
+})
 
 // ── pure units ──────────────────────────────────────────────────────────────
 

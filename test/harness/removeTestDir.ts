@@ -5,7 +5,8 @@
  * `fs.remove(...).catch(() => {})` then silently left /tmp/idea-test-* behind on pool Pis
  * (PR #248 re-run, idea01/idea03, 2026-10-25). Here a failed removal is retried with
  * `sudo -n rm -rf` (only where non-interactive sudo exists, e.g. on a Pi) and ONLY for paths
- * inside os.tmpdir() whose name starts with idea-test- / idea-1 (the test prefixes). Whatever
+ * inside os.tmpdir() whose name starts with idea-test-, idea-NNN-fixture-, idea-postburst- or idea-storescope-
+ * (the test prefixes). Whatever
  * still remains is reported as a LEFTOVER line instead of being swallowed.
  */
 import os from 'os'
@@ -13,7 +14,7 @@ import path from 'path'
 import { spawnSync } from 'child_process'
 import { fs } from 'zx'
 
-const TEST_PREFIX = /^(idea-test-|idea-\d+-fixture-)/
+const TEST_PREFIX = /^(idea-test-|idea-\d+-fixture-|idea-postburst-|idea-storescope-)/
 
 /** Is `dir` a test-owned temp dir (or inside one) that may be force-removed? */
 export const isTestTempDir = (dir: string): boolean => {

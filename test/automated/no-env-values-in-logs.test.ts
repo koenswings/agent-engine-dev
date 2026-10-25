@@ -24,7 +24,7 @@ import os from 'os'
 import crypto from 'crypto'
 import { $, fs, path, YAML } from 'zx'
 import { Repo, DocHandle } from '@automerge/automerge-repo'
-import { Store } from '../../src/data/Store.js'
+import { Store, getLocalEngine } from '../../src/data/Store.js'
 import {
     CommandLogStore,
     CommandTrace,
@@ -51,6 +51,7 @@ import {
     TEST_CONTAINER_LABEL_VALUE,
 } from '../harness/diskSim.js'
 import { removeTestDir } from '../harness/removeTestDir.js'
+import { engineHost, isOwnHostValue } from '../harness/engineHostValues.js'
 
 const IMAGE = 'traefik/whoami'
 
@@ -226,19 +227,18 @@ describe('startInstance History entry holds no .env values (idea#111, real conta
             if (c.kind === 'existing') {
                 expect(env.pass, 'the existing pass is reused').to.equal(c.secrets[0])
             }
-            // Not secrets: the Engine itself writes port, hostname and ip (writeEngineHostEnv); they
-            // are in the store and shown in the Console. On a Pi named idea04 the hostname is in
-            // every log line (on-Pi triage idea04 2026-10-25), so they are left out of the check.
-            // The re-run on idea04 (PR #248, 2026-10-25) still found 'idea04' among the checked values,
-            // so the Engine's own host identity is also left out BY VALUE: whatever key it ends up
-            // under, the Engine hostname/ip are public. The fixture secrets are always checked.
-            const ENGINE_PUBLIC_KEYS = new Set(['port', 'hostname', 'ip'])
-            const enginePublicValues = new Set([os.hostname(), env.hostname, env.ip].filter(Boolean))
+            // Not secrets: the Engine's own host identity (port; hostname/ip from writeEngineHostEnv;
+            // IDEA_HOSTNAME / IDEA_HOST_IPS from HostIdentity). It is logged on purpose and on a Pi
+            // it is real (idea04: hostname, then IDEA_HOST_IPS = LAN + Tailscale IPs, PR #248
+            // re-runs 2026-10-25). A value is left out only when it is THIS Engine's own (see
+            // test/harness/engineHostValues.ts); the fixture secrets are always checked.
+            const localEngine = getLocalEngine(storeHandle.doc()!)
+            const host = engineHost({ hostname: localEngine?.hostname })   // + os.hostname() + os.networkInterfaces()
             const checked: Array<[string, string]> = [
-                ...Object.entries(env).filter(([k, v]) => !ENGINE_PUBLIC_KEYS.has(k) && !enginePublicValues.has(v)),
+                ...Object.entries(env).filter(([k, v]) => k !== 'port' && !isOwnHostValue(v, host)),
                 ...c.secrets.map((v, i): [string, string] => [`fixture secret #${i}`, v]),
             ].filter(([, v]) => v)
-            for (const v of c.secrets) expect(enginePublicValues.has(v), 'a fixture secret is never exempt').to.be.false
+            for (const v of c.secrets) expect(isOwnHostValue(v, host), 'a fixture secret is never exempt').to.be.false
             const values = checked.map(([, v]) => v)
             expect(values.length).to.be.greaterThan(0)
 

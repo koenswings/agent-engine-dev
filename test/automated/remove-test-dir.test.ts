@@ -11,10 +11,16 @@ describe('removeTestDir / isTestTempDir', () => {
         expect(isTestTempDir(path.join(t, 'idea-test-AbC123'))).toBe(true)
         expect(isTestTempDir(path.join(t, 'idea-test-envlog-x1', 'instances', 'a'))).toBe(true)
         expect(isTestTempDir(path.join(t, 'idea-152-fixture-q'))).toBe(true)
+        expect(isTestTempDir(path.join(t, 'idea-postburst-peer-Xy12'))).toBe(true)
+        expect(isTestTempDir(path.join(t, 'idea-storescope-c-Ab34', 'sync-state'))).toBe(true)
     })
     it('refuses tmpdir itself, other tmp dirs, traversal and anything outside tmpdir', () => {
         expect(isTestTempDir(t)).toBe(false)
         expect(isTestTempDir(path.join(t, 'something-else'))).toBe(false)
+        expect(isTestTempDir(path.join(t, 'idea-postburst'))).toBe(false)      // prefix needs its dash
+        expect(isTestTempDir(path.join(t, 'xidea-storescope-a'))).toBe(false)  // anchored at the start
+        expect(isTestTempDir(path.join('/home/pi', 'idea-storescope-a'))).toBe(false)
+        expect(isTestTempDir(path.join(t, 'idea-postburst-a', '..', '..', 'home'))).toBe(false)
         expect(isTestTempDir(path.join(t, 'idea-test-x', '..', '..', 'etc'))).toBe(false)
         expect(isTestTempDir('/home/pi/idea')).toBe(false)
         expect(isTestTempDir('/')).toBe(false)

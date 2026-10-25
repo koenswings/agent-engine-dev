@@ -16,6 +16,7 @@
  * docs (a command-log-like list and a smaller doc), loaded from NodeFS storage.
  */
 import { PI_TIMING_FACTOR } from '../harness/hostEnv.js'
+import { removeTestDir } from '../harness/removeTestDir.js'
 import { describe, it, beforeAll, afterAll, expect } from 'vitest'
 import os from 'os'
 import path from 'path'
@@ -35,6 +36,15 @@ import { largeStoreDoc } from '../harness/largeStoreDoc.js'
 import type { WsSyncClientInput, WsSyncClientResult } from '../harness/wsSyncClientWorker.js'
 
 const BURST = Number(process.env.POSTBURST_CLIENTS ?? 10)
+
+// Every temp dir this file creates; removed once all repos are shut down (PR #248 re-run on
+// idea04 left 4 /tmp/idea-postburst-* behind).
+const tempDirs: string[] = []
+const tempDir = (prefix: string): string => { const d = fs.mkdtempSync(path.join(os.tmpdir(), prefix)); tempDirs.push(d); return d }
+afterAll(async () => {
+    await new Promise(r => setTimeout(r, 1_000))   // let throttled sync-state saves land first
+    for (const d of tempDirs) await removeTestDir(d)
+})
 
 const freePort = (): Promise<number> => new Promise((resolve, reject) => {
     const s = net.createServer(); s.once('error', reject)
@@ -73,7 +83,7 @@ describe('Automerge WS server after a burst of short-lived clients (r34 POST-BUR
     const extraIds: DocumentId[] = []
 
     beforeAll(async () => {
-        dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'idea-postburst-'))
+        dataDir = tempDir('idea-postburst-')
         const seed = new Repo({ network: [], storage: new NodeFSStorageAdapter(dataDir) })
         mainId = seed.import(largeStoreDoc()).documentId
         extraIds.push(seed.import(extraDoc(6_000)).documentId, seed.import(extraDoc(1_000)).documentId)
@@ -87,7 +97,7 @@ describe('Automerge WS server after a burst of short-lived clients (r34 POST-BUR
     afterAll(async () => {
         const adapter: any = repo?.networkSubsystem.adapters[0]
         if (typeof adapter?.close === 'function') await adapter.close()
-        // dataDir is left in os.tmpdir(): throttled sync-state saves may still be writing into it.
+        try { await repo?.shutdown() } catch { /* adapter already closed */ }   // flushes storage; dataDir is removed by the file-level afterAll
     })
 
     it('a storage-less client (Console, probe) is sent only the doc it asked for', async () => {
@@ -98,7 +108,7 @@ describe('Automerge WS server after a burst of short-lived clients (r34 POST-BUR
     }, 60_000)
 
     it('a peer with storage (another Engine of the same store) still gets every doc announced', async () => {
-        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'idea-postburst-peer-'))
+        const dir = tempDir('idea-postburst-peer-')
         // Store-scoped peering (StoreScope.ts): an Engine peer carries its store tag in its peerId
         const c = await inProcessClient(url, mainId, dir, enginePeerId(mainId, 'ENGINE_postburst-peer'))
         const until = Date.now() + 10_000
@@ -142,8 +152,8 @@ describe('storage-less clients still get docs their Engine relays (Console remot
     let a: Repo, b: Repo, urlA: string, onlyOnB: DocumentId
 
     beforeAll(async () => {
-        const dirA = fs.mkdtempSync(path.join(os.tmpdir(), 'idea-postburst-a-'))
-        const dirB = fs.mkdtempSync(path.join(os.tmpdir(), 'idea-postburst-b-'))
+        const dirA = tempDir('idea-postburst-a-')
+        const dirB = tempDir('idea-postburst-b-')
         const seedB = new Repo({ network: [], storage: new NodeFSStorageAdapter(dirB) })
         onlyOnB = seedB.import(extraDoc(200)).documentId
         await seedB.flush()
@@ -165,6 +175,7 @@ describe('storage-less clients still get docs their Engine relays (Console remot
             for (const ad of (r?.networkSubsystem.adapters ?? []) as any[]) {
                 try { if (typeof ad.close === 'function') await ad.close(); else ad.disconnect?.() } catch { /* already closed */ }
             }
+            try { await r?.shutdown() } catch { /* adapters already closed */ }
         }
     })
 
