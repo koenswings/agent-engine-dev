@@ -329,12 +329,14 @@ describe('slot-layout preflight: helper present vs absent', () => {
         expect(s).not.toMatch(/\b(rm|mv|mkdir|rmdir|chmod|chown|tee|touch|cp)\b/)
         expect(s.replace(/2>\/dev\/null|2>&1/g, '')).not.toContain('>') // no redirect writes anything
         expect(s).toContain(`if [ -e '${APP_DATA_HELPER}' ] || [ -L '${APP_DATA_HELPER}' ]; then echo "HELPER present"; if [ -x '${APP_DATA_HELPER}' ]; then _v=$(sudo -n '${APP_DATA_HELPER}' version`)
-        expect(fs.existsSync(APP_DATA_HELPER)).toBe(false)
+        // The probe reports THIS machine's helper: absent on the box; present on a pool Pi
+        // (on-Pi triage idea04 2026-10-25), where it then also asks `sudo -n … version`.
+        const helperHere = fs.existsSync(APP_DATA_HELPER)
         fs.mkdirSync(`${ROOT}/idea-test-1`)
         fs.symlinkSync(dir, `${ROOT}/idea-test-2`)
         const p = parseSlotLayoutProbe(bash(buildSlotLayoutProbeRemote(ROOT, requiredSlotNames())).out)
-        expect(p.helper).toBe('absent')
-        expect(p.versionRc).toBeNull()
+        expect(p.helper).toBe(helperHere ? 'present' : 'absent')
+        if (!helperHere) expect(p.versionRc).toBeNull()
         expect(p.root).toMatchObject({ state: 'dir', uid: process.getuid!() })
         expect(p.slots.map(x => `${x.name}=${x.state}`)).toEqual(['idea-test-1=dir', 'idea-test-2=symlink', 'idea-test-3=missing', 'idea-test-4=missing', 'idea-test-5=missing', 'idea-test-6=missing'])
         expect(p.slots[0]).toMatchObject({ writable: true })

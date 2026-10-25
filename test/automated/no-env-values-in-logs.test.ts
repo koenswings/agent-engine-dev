@@ -24,7 +24,7 @@ import os from 'os'
 import crypto from 'crypto'
 import { $, fs, path, YAML } from 'zx'
 import { Repo, DocHandle } from '@automerge/automerge-repo'
-import { Store } from '../../src/data/Store.js'
+import { Store, getLocalEngine } from '../../src/data/Store.js'
 import {
     CommandLogStore,
     CommandTrace,
@@ -50,6 +50,8 @@ import {
     TEST_CONTAINER_LABEL_KEY,
     TEST_CONTAINER_LABEL_VALUE,
 } from '../harness/diskSim.js'
+import { removeTestDir } from '../harness/removeTestDir.js'
+import { engineHost, isOwnHostValue } from '../harness/engineHostValues.js'
 
 const IMAGE = 'traefik/whoami'
 
@@ -203,8 +205,8 @@ describe('startInstance History entry holds no .env values (idea#111, real conta
         for (const c of cases) {
             await cleanupContainers(c.instanceId)
             await cleanupNetworks(c.instanceId)
-            await cleanupDisk(c.device).catch(() => {})
-            if (c.fixtureDir) await fs.remove(c.fixtureDir).catch(() => {})
+            await removeTestDir(diskPath(c.device))
+            await removeTestDir(c.fixtureDir)
         }
     }, 60_000)
 
@@ -225,7 +227,19 @@ describe('startInstance History entry holds no .env values (idea#111, real conta
             if (c.kind === 'existing') {
                 expect(env.pass, 'the existing pass is reused').to.equal(c.secrets[0])
             }
-            const values = [...Object.entries(env).filter(([k]) => k !== 'port').map(([, v]) => v), ...c.secrets].filter(v => v)
+            // Not secrets: the Engine's own host identity (port; hostname/ip from writeEngineHostEnv;
+            // IDEA_HOSTNAME / IDEA_HOST_IPS from HostIdentity). It is logged on purpose and on a Pi
+            // it is real (idea04: hostname, then IDEA_HOST_IPS = LAN + Tailscale IPs, PR #248
+            // re-runs 2026-10-25). A value is left out only when it is THIS Engine's own (see
+            // test/harness/engineHostValues.ts); the fixture secrets are always checked.
+            const localEngine = getLocalEngine(storeHandle.doc()!)
+            const host = engineHost({ hostname: localEngine?.hostname })   // + os.hostname() + os.networkInterfaces()
+            const checked: Array<[string, string]> = [
+                ...Object.entries(env).filter(([k, v]) => k !== 'port' && !isOwnHostValue(v, host)),
+                ...c.secrets.map((v, i): [string, string] => [`fixture secret #${i}`, v]),
+            ].filter(([, v]) => v)
+            for (const v of c.secrets) expect(isOwnHostValue(v, host), 'a fixture secret is never exempt').to.be.false
+            const values = checked.map(([, v]) => v)
             expect(values.length).to.be.greaterThan(0)
 
             const entry = logHandle.doc()!.traces[t.traceId]
@@ -234,9 +248,9 @@ describe('startInstance History entry holds no .env values (idea#111, real conta
             expect(messages.some(m => /\bpass\b/.test(m)), 'the variable name is in the entry').to.be.true
             const entryText = JSON.stringify(entry)
             const allText = JSON.stringify(logHandle.doc())
-            for (const v of values) {
-                expect(entryText, 'startInstance History entry must not contain a .env value').to.not.include(v)
-                expect(allText, 'no command log entry may contain a .env value').to.not.include(v)
+            for (const [k, v] of checked) {
+                expect(entryText, `startInstance History entry must not contain the .env value of ${k}`).to.not.include(v)
+                expect(allText, `no command log entry may contain the .env value of ${k}`).to.not.include(v)
             }
         })
     }

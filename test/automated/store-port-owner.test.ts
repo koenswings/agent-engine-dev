@@ -26,6 +26,7 @@ import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import { DeviceName, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/data/CommonTypes.js'
 import { choosePortForStart, storePortOwner, createPortNumber, Instance } from '../../src/data/Instance.js'
 import { randomPort } from '../../src/utils/utils.js'
+import { freeTcpPort } from '../harness/hostEnv.js'
 
 const LOCAL = localEngineId as EngineID
 const OTHER = 'ENGINE_other-engine-000000' as EngineID
@@ -86,13 +87,16 @@ describe('storePortOwner / choosePortForStart (idea#168 r35)', () => {
         expect(await fs.readFile(envPath, 'utf8')).toContain('pass=x')
     })
 
+    // "Keeps its port" needs a port that is free on this machine: 18080 is in use on a pool
+    // Pi (on-Pi triage idea04 2026-10-25), so these two take a port that is free right now.
     it('two records claiming one port (pre-fix data): the older keeps it, the newer moves', async () => {
-        addInstance(h, 'orig', { storedOn: 'd-src', port: 18080, status: 'Docked', created: 100 })
-        addInstance(h, 'stale-copy', { storedOn: 'd-tgt', port: 18080, status: 'Docked', created: 200 })
-        expect(storePortOwner(h.doc()!, inst(h, 'orig'), 18080)).toBeUndefined()
-        expect(storePortOwner(h.doc()!, inst(h, 'stale-copy'), 18080)?.id).toBe('orig')
-        await fs.writeFile(envPath, 'port=18080\n')
-        expect(await choosePortForStart(h, inst(h, 'orig'), envPath)).toBe(18080)
+        const P = await freeTcpPort()
+        addInstance(h, 'orig', { storedOn: 'd-src', port: P, status: 'Docked', created: 100 })
+        addInstance(h, 'stale-copy', { storedOn: 'd-tgt', port: P, status: 'Docked', created: 200 })
+        expect(storePortOwner(h.doc()!, inst(h, 'orig'), P)).toBeUndefined()
+        expect(storePortOwner(h.doc()!, inst(h, 'stale-copy'), P)?.id).toBe('orig')
+        await fs.writeFile(envPath, `port=${P}\n`)
+        expect(await choosePortForStart(h, inst(h, 'orig'), envPath)).toBe(P)
     })
 
     it('a Running claimant owns the port even when it is the newer record', async () => {
@@ -102,11 +106,12 @@ describe('storePortOwner / choosePortForStart (idea#168 r35)', () => {
     })
 
     it('only instances on this engine count: a port owned on another engine is kept', async () => {
-        addInstance(h, 'far', { storedOn: 'd-far', port: 18080, status: 'Running', created: 1 })
-        addInstance(h, 'mine', { storedOn: 'd-src', port: 18080, status: 'Docked', created: 100 })
-        expect(storePortOwner(h.doc()!, inst(h, 'mine'), 18080)).toBeUndefined()
-        await fs.writeFile(envPath, 'port=18080\n')
-        expect(await choosePortForStart(h, inst(h, 'mine'), envPath)).toBe(18080)
+        const P = await freeTcpPort()
+        addInstance(h, 'far', { storedOn: 'd-far', port: P, status: 'Running', created: 1 })
+        addInstance(h, 'mine', { storedOn: 'd-src', port: P, status: 'Docked', created: 100 })
+        expect(storePortOwner(h.doc()!, inst(h, 'mine'), P)).toBeUndefined()
+        await fs.writeFile(envPath, `port=${P}\n`)
+        expect(await choosePortForStart(h, inst(h, 'mine'), envPath)).toBe(P)
     })
 
     it('no port in .env (a copy): createPortNumber skips a store-owned port', async () => {

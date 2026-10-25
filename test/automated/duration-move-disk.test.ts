@@ -236,6 +236,11 @@ class LocalFleetOps extends RealFleetOps {
         const env = `export PATH=${this.sb.dir}/fakebin:$PATH FAKE_DOCKER_HOST=${host} FAKE_DOCKER_STATE=${this.sb.dir}/${host}/docker.tsv ` +
             `FAKE_DOCKER_LOG=${this.sb.dir}/docker.log FAKE_DOCKER_BROKEN=${this.sb.dir}/${host}/docker.broken ` +
             `FAKE_HELPER_DISKS=${p.disks} FAKE_SUDO_LOG=${this.sb.dir}/sudo.log; `
+        // The slot-layout probe looks for the root helper at its absolute path. The sandbox
+        // Pis are helper-less (HelperLocalFleetOps stubs the probe for helper Pis), so point
+        // the probe at a path that never exists: otherwise a Pi that HAS the helper leaks in
+        // and every dock fails its root-owned-layout check (on-Pi triage idea04 2026-10-25).
+        if (cmd.includes('echo "HELPER present"')) cmd = cmd.replaceAll(APP_DATA_HELPER, `${this.sb.dir}/${host}/no-idea-app-data`)
         return env + cmd
             .replaceAll(this.sb.ROOT, p.disks)
             .replaceAll(this.sb.WATCH, p.watch)

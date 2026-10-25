@@ -45,6 +45,7 @@ import {
     diskPath,
     sentinelPath,
 } from '../harness/diskSim.js'
+import { removeTestDir } from '../harness/removeTestDir.js'
 
 const LOCAL = localEngineId as EngineID
 const OTHER = 'ENGINE_other-engine-000000' as EngineID
@@ -247,8 +248,8 @@ describe('eject → re-plug round trip with a stale same-name record (harness, t
     afterAll(async () => {
         await watcher?.close()
         await fs.remove(sentinelPath(device)).catch(() => {})
-        await cleanupDisk(device).catch(() => {})
-        if (fixtureDir) await fs.remove(fixtureDir).catch(() => {})
+        await removeTestDir(diskPath(device))
+        await removeTestDir(fixtureDir)
     })
 
     it('dock, stale record appears, eject by name is ambiguous, eject by id clears both, re-plug docks only the live record', async () => {

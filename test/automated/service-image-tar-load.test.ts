@@ -54,6 +54,7 @@ import {
     TEST_CONTAINER_LABEL_VALUE,
     TEST_HOST,
 } from '../harness/diskSim.js'
+import { removeTestDir } from '../harness/removeTestDir.js'
 
 const BASE_IMAGE = 'traefik/whoami'
 const IMAGE_REPO = 'idea-test/tarload'
@@ -141,7 +142,7 @@ const cleanupCase = async (c: TarLoadCase): Promise<void> => {
     await cleanupContainers(c.instanceId)
     await cleanupNetworks(c.instanceId)
     await cleanupDisk(c.device).catch(() => {})
-    if (c.fixtureDir) await fs.remove(c.fixtureDir).catch(() => {})
+    await removeTestDir(c.fixtureDir)
     // Only ever remove this run's own nonce tag (untags; the base image stays).
     if (await imageExists(c.image)) await $`docker image rm ${c.image}`.quiet().nothrow()
 }

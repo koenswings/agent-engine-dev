@@ -239,7 +239,15 @@ const readConfig = (path: string): Config => {
   }
 }
 
-export const config = readConfig('./config.yaml');
+/**
+ * Path of the config file: ./config.yaml, unless IDEA_CONFIG_FILE names another one.
+ * script/test-run.sh points it at a pristine copy of the committed config.yaml, so a
+ * test run inside a Pi's deployed tree never reads that Pi's live settings
+ * (skipBorg, skipHardwareId, peerAccess, ...): on-Pi triage, idea04 2026-10-25.
+ */
+export const configFilePath = (): string => process.env.IDEA_CONFIG_FILE || './config.yaml'
+
+export const config = readConfig(configFilePath());
 
 // Allow IDEA_TEST_MODE=true env var to force testMode on without editing config.yaml.
 // NOTE: This mutates the already-exported config object at module load time.

@@ -69,6 +69,7 @@ import {
     TEST_CONTAINER_LABEL_KEY,
     TEST_CONTAINER_LABEL_VALUE,
 } from '../harness/diskSim.js'
+import { removeTestDir } from '../harness/removeTestDir.js'
 
 const IMAGE = 'traefik/whoami'
 
@@ -281,7 +282,7 @@ describe('Running only after compose up; failures end in Error (idea#109, real c
             await cleanupContainers(c.instanceId)
             await cleanupNetworks(c.instanceId)
             await cleanupDisk(c.device).catch(() => {})
-            if (c.fixtureDir) await fs.remove(c.fixtureDir).catch(() => {})
+            await removeTestDir(c.fixtureDir)
         }
         setCommandLogHandle(null)
         config.settings.skipImageLoad = savedSkip

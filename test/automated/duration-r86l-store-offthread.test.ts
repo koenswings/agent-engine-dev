@@ -11,6 +11,7 @@
  *    and a failed write still ends in StoreWriteError via changeStore;
  *  - the soft RSS guard FAILs loud (RESULT.txt source=rss-guard) and RSS samples land in LOOPLAG.jsonl.
  */
+import { PI_TIMING_FACTOR } from '../harness/hostEnv.js'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import http from 'node:http'
 import net from 'node:net'
@@ -88,7 +89,9 @@ describe('r86l: store doc synced off the main thread', () => {
             expect(Object.keys((await ops.listOperations('idea01')))).toHaveLength(4000)
             expect(view).toBeTruthy()
             expect(ops.isWsOpen('idea01')).toBe(true)
-            expect(maxLag).toBeLessThan(250)
+            // 250 ms on the box; a Pi 4 under the full parallel suite measured 304 ms (on-Pi triage
+            // idea04 2026-10-25). A main-thread first sync costs seconds there, so 2x still catches it.
+            expect(maxLag).toBeLessThan(250 * PI_TIMING_FACTOR)
             console.log(JSON.stringify({ event: 'r86l_test_main_lag', maxLagMs: Math.round(maxLag) }))
             // write: ejectDisk-like push through changeStore
             const conn = (ops as any).conns.get('idea01')

@@ -45,6 +45,7 @@ import {
     diskPath,
     sentinelPath,
 } from '../harness/diskSim.js'
+import { removeTestDir } from '../harness/removeTestDir.js'
 
 const newCommandLog = (): DocHandle<CommandLogStore> => {
     const repo = new Repo({ network: [], storage: undefined })
@@ -82,9 +83,9 @@ describe('first dock without META.yaml (idea#121, superseded by idea#201 §10 ru
         for (const device of devices) {
             await fs.remove(sentinelPath(device)).catch(() => {})
             await fs.chmod(diskPath(device), 0o755).catch(() => {})
-            await cleanupDisk(device).catch(() => {})
+            await removeTestDir(diskPath(device))
         }
-        if (fixtureDir) await fs.remove(fixtureDir).catch(() => {})
+        await removeTestDir(fixtureDir)
         setCommandLogHandle(null)
         config.settings.skipMetaWrite = savedSkip
     })

@@ -22,7 +22,8 @@ import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import { DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/data/CommonTypes.js'
 import { Disk } from '../../src/data/Disk.js'
 import { config, skipBorg } from '../../src/data/Config.js'
-import { backupInstance, restoreApp } from '../../src/monitors/backupMonitor.js'
+import { backupInstance, restoreApp, runningBackupOnDisk } from '../../src/monitors/backupMonitor.js'
+import { resourceLock, instanceKey, diskKey } from '../../src/utils/ResourceLock.js'
 import { borgPresence } from '../../src/utils/appDataHelper.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
 
@@ -68,6 +69,9 @@ const FAKE_SUDO = `#!/usr/bin/env bash
 shift 2
 echo "$*" >> "$FAKE_BORG_LOG"
 case "$1" in
+  borg-create) [ -n "$FAKE_BORG_REFUSE_CREATE" ] && [ -e "$FAKE_BORG_REFUSE_CREATE" ] && { echo "idea-app-data borg-create refused: unknown root '$2'" >&2; exit 2; } ;;
+esac
+case "$1" in
   borg-init) mkdir -p "$IDEA_DISKS_ROOT/$2/backups/$3" && echo '[repository]' > "$IDEA_DISKS_ROOT/$2/backups/$3/config" ;;
   borg-info) echo '{"archives":[{"name":"2026-10-06T08-00-00-000Z","command_line":["borg","create","--numeric-ids","--","r::a","/disks/x/instances/${INST}"]}]}' ;;
 esac
@@ -103,6 +107,7 @@ afterEach(async () => {
     config.settings.testMode = saved.testMode
     config.settings.skipBorg = saved.skipBorg
     process.env.PATH = saved.path
+    delete process.env.FAKE_BORG_REFUSE_CREATE
     if (saved.log === undefined) delete process.env.FAKE_BORG_LOG
     else process.env.FAKE_BORG_LOG = saved.log
     await fs.remove(`${DISKS_ROOT}/${appDevice}`)
@@ -195,5 +200,36 @@ describe('backupInstance / restoreApp with testMode on', () => {
         expect(log[2]).toBe(`borg-info ${backupDevice} ${INST}`)
         expect(log[3]).toBe(`borg-extract ${backupDevice} ${INST} 2026-10-06T08-00-00-000Z 3 ${appDevice}`)
         expect(log).toHaveLength(4)
+    })
+    it('a failed borg create keeps the .backup-in-progress lock (boot-resume) but blocks nothing: no running op, locks released, the next backup runs and removes it', async () => {
+        // On-Pi triage idea04 2026-10-25: the real helper refused borg-create and the lock stayed.
+        // That is by design (boot-resume); here we prove it can never block the next backup or an eject.
+        config.settings.skipBorg = false
+        const refuse = path.join(binDir, 'refuse-create')
+        await fs.writeFile(refuse, '')
+        process.env.FAKE_BORG_REFUSE_CREATE = refuse
+        const h = await createMinimalStore()
+        const appDisk = makeDisk('borg-ad', appDevice, false)
+        const backupDisk = makeDisk('borg-bd', backupDevice, true)
+        h.change(doc => { doc.diskDB[appDisk.id] = appDisk; doc.diskDB[backupDisk.id] = backupDisk })
+        addInstance(h, appDisk.id)
+        const lock = `${DISKS_ROOT}/${backupDevice}/backups/${INST}/.backup-in-progress`
+
+        await backupInstance(h, INST, backupDisk)   // no trace: failure is recorded, not thrown
+        const failed = Object.values(h.doc()!.operationDB ?? {}).filter((o: any) => o.kind === 'backupApp')
+        expect(failed.map((o: any) => o.status)).toEqual(['Failed'])
+        expect((failed[0] as any).error).toMatch(/borg-create refused/)
+        expect(await fs.pathExists(lock), 'lock kept for boot-resume').toBe(true)
+        expect(runningBackupOnDisk(h.doc()!, backupDisk.id), 'eject is not blocked').toBeUndefined()
+        expect(resourceLock.isLocked(instanceKey(INST))).toBe(false)
+        expect(resourceLock.isLocked(diskKey(backupDisk.id))).toBe(false)
+        expect(h.doc()!.instanceDB[INST].lastBackup).toBeNull()
+
+        await fs.remove(refuse)
+        await backupInstance(h, INST, backupDisk)
+        const ops = Object.values(h.doc()!.operationDB ?? {}).filter((o: any) => o.kind === 'backupApp').map((o: any) => o.status).sort()
+        expect(ops).toEqual(['Done', 'Failed'])
+        expect(await fs.pathExists(lock), 'the next successful backup removes the stale lock').toBe(false)
+        expect(h.doc()!.instanceDB[INST].lastBackup).toBeGreaterThan(0)
     })
 })

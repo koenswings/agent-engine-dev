@@ -20,7 +20,7 @@ import { DocHandle, Repo } from '@automerge/automerge-repo'
 import { fs, path } from 'zx'
 import { createRequire } from 'module'
 import { Store } from '../../src/data/Store.js'
-import { createOrUpdateEngine, localEngineId, ENGINE_CAPABILITIES } from '../../src/data/Engine.js'
+import { createOrUpdateEngine, localEngineId, ENGINE_CAPABILITIES, FLASH_CARD_CAPABILITY, FLASH_HELPER_PATH } from '../../src/data/Engine.js'
 import { commands } from '../../src/data/Commands.js'
 import { lookupDiskArg, resolveDiskArg } from '../../src/data/DiskArg.js'
 import { handleCommand } from '../../src/utils/commandUtils.js'
@@ -275,12 +275,18 @@ describe('optional variadic last arg (idea#128)', () => {
 
 // ── capabilities ─────────────────────────────────────────────────────────────
 
+// flashCard (idea#201 §10, #219) is advertised only where /usr/local/sbin/idea-flash-card is
+// installed: on a pool Pi with the helper the record has it, on the dev box it does not.
+const expectedCapabilities = (): string[] =>
+    [...ENGINE_CAPABILITIES, ...(isExecutable(FLASH_HELPER_PATH) ? [FLASH_CARD_CAPABILITY] : [])]
+const isExecutable = (p: string): boolean => { try { fs.accessSync(p, fs.constants.X_OK); return true } catch { return false } }
+
 describe('capabilities and capabilitiesBootedAt (idea#128)', () => {
     it('a new engine record gets capabilities [diskIdArgs, filesDisk] stamped with its lastBooted', async () => {
         const h = await newStore()
         const e = h.doc()!.engineDB[LOCAL]
         expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates'])   // filesDisk: idea#131; filesMount: idea#133; instanceIdArgs: idea#168
-        expect(e.capabilities).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates'])
+        expect(e.capabilities).toEqual(expectedCapabilities())
         expect(e.capabilitiesBootedAt).toBe(e.lastBooted)
     })
     it('every startup rewrites the whole list (stale/extra entries gone) and re-stamps it with the new lastBooted', async () => {
@@ -294,7 +300,7 @@ describe('capabilities and capabilitiesBootedAt (idea#128)', () => {
         await new Promise(r => setTimeout(r, 5))
         await createOrUpdateEngine(h, LOCAL)
         const e = h.doc()!.engineDB[LOCAL]
-        expect(e.capabilities).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates'])
+        expect(e.capabilities).toEqual(expectedCapabilities())
         expect(e.lastBooted).toBeGreaterThan(5)
         expect(e.capabilitiesBootedAt).toBe(e.lastBooted)
     })
