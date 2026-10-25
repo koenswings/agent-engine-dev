@@ -81,6 +81,8 @@ export interface ScannedCard extends ClientCard {
     ptuuid: string | null
     serial: string | null
     partitionNames: string[]
+    /** ext4 partitions (idea#303: looked at for an OS rootfs layout before a flash) */
+    ext4PartitionNames: string[]
     mountpoints: string[]
 }
 
@@ -268,7 +270,7 @@ export const scanClientCards = async (
                 candidateId: candidateId!, sizeBytes, model, readerId, contents,
                 flashable: refusal === null, refusal,
                 device: d.name, byId, ptuuid: clean(d.ptuuid), serial,
-                partitionNames: children.map(c => c.name), mountpoints: mounts,
+                partitionNames: children.map(c => c.name), ext4PartitionNames: children.filter(c => c.fstype === 'ext4').map(c => c.name), mountpoints: mounts,
             })
             res.diskCandidates!.push({
                 candidateId: candidateId!, kind: 'sdCard', device: d.name, sizeBytes, model, serial, removable: true, readerId,
@@ -286,7 +288,7 @@ export const scanClientCards = async (
             const refusal: FlashRefusal | null = opts.helperInstalled === false ? 'HELPER_MISSING' : mounts.length ? 'MOUNTED' : opts.busy ? 'BUSY' : null
             res.clientCards.push({
                 candidateId, sizeBytes, model, readerId: null, contents, flashable: refusal === null, refusal,
-                device: d.name, byId, ptuuid: clean(d.ptuuid), serial, partitionNames: children.map(c => c.name), mountpoints: mounts,
+                device: d.name, byId, ptuuid: clean(d.ptuuid), serial, partitionNames: children.map(c => c.name), ext4PartitionNames: children.filter(c => c.fstype === 'ext4').map(c => c.name), mountpoints: mounts,
             })
             res.diskCandidates!.push({
                 candidateId, kind: 'sdCard', device: d.name, sizeBytes, model, serial, removable: true, readerId: null,
@@ -318,7 +320,7 @@ export const scanClientCards = async (
             flashRefusal = opts.helperInstalled === false ? 'HELPER_MISSING' : mounts.length ? 'MOUNTED' : opts.busy ? 'BUSY' : null
             res.clientCards.push({
                 candidateId, sizeBytes, model, readerId: null, contents, flashable: flashRefusal === null, refusal: flashRefusal,
-                device: d.name, byId, ptuuid: clean(d.ptuuid), serial, partitionNames: children.map(c => c.name), mountpoints: mounts,
+                device: d.name, byId, ptuuid: clean(d.ptuuid), serial, partitionNames: children.map(c => c.name), ext4PartitionNames: children.filter(c => c.fstype === 'ext4').map(c => c.name), mountpoints: mounts,
             })
         }
         res.diskCandidates!.push({

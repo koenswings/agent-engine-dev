@@ -248,6 +248,7 @@ describe('flashCard / cancelFlash (idea#201 §10)', () => {
             images: async () => ({ current: V2, previous: null, images: [IMG] }),
             appendFlashLog: async (l) => { logLines.push(l) },
             isSystemDevice: async (d) => d.startsWith('sda'),
+            lookForMeta: async () => ({ ok: true, hasMeta: false, alreadyMounted: false, ignored: false }),
         })
     })
     afterEach(() => { setFlashCardOpsForTests(null); setClientCardOpsForTests(null); setUnformattedOpsForTests(null); clearFlashStateForTests() })
@@ -284,7 +285,7 @@ describe('flashCard / cancelFlash (idea#201 §10)', () => {
     it('runs the helper with the re-resolvable by-id, steps → Operation, Done with safeToRemove true; log line', async () => {
         const { operationId, done } = await flashCard(h, cardId, 'current', String(32 * GB))
         expect(spawned[0]).toEqual({ byId: '/dev/disk/by-id/usb-STORAGE_DEVICE_000000001206-0:0', device: 'sdb', sizeBytes: 32 * GB,
-            image: path.join(process.env.IDEA_CLIENT_IMAGES_DIR || '/var/lib/idea/client-images', V2, `idea-client-${V2}.img.xz`), sha256: IMG.sha256 })
+            image: path.join(process.env.IDEA_CLIENT_IMAGES_DIR || '/var/lib/idea/client-images', V2, `idea-client-${V2}.img.xz`), sha256: IMG.sha256, osRootfsPartitions: [] })
         expect(op(operationId)).toMatchObject({ kind: 'flashCard', status: 'Running', subject: { type: 'disk', id: cardId },
             args: { candidateId: cardId, version: V2, confirmSizeBytes: String(32 * GB) }, cause: 'console-command' })
         expect((h.doc()!.engineDB[LOCAL] as any).flashInProgress).toMatchObject({ operationId, candidateId: cardId, version: V2 })
@@ -431,7 +432,7 @@ describe('capabilities + helper script (idea#201 §10)', () => {
 
     it('helper parses (bash -n) and reports its version', () => {
         execFileSync('bash', ['-n', HELPER])
-        expect(run(['--version']).stdout.trim()).toBe('idea-flash-card 1')
+        expect(run(['--version']).stdout.trim()).toBe('idea-flash-card 2')
     })
 
     it('helper refuses bad arguments before touching any device (exit 2, BAD_ARGS)', () => {
@@ -473,6 +474,7 @@ describe('disk roles: USB disks get both roles, SD cards flash only (idea#303)',
             images: async () => ({ current: V2, previous: null, images: [IMG] }),
             appendFlashLog: async () => {},
             isSystemDevice: async (d) => d.startsWith('sda'),
+            lookForMeta: async () => ({ ok: true, hasMeta: false, alreadyMounted: false, ignored: false }),
         })
     })
     afterEach(() => { setFlashCardOpsForTests(null); setClientCardOpsForTests(null); setUnformattedOpsForTests(null); clearFlashStateForTests() })
@@ -531,6 +533,97 @@ describe('disk roles: USB disks get both roles, SD cards flash only (idea#303)',
         expect(stick.flashRefusal).toBe('MOUNTED')
         expect(await code(flashCard(h, stick.candidateId, 'current', String(64 * GB)))).toBe('MOUNTED')
         expect(spawned).toHaveLength(0)
+    })
+
+    it('reader first seen WITH a card in it: a reader-like model is an SD card at once (flash only)', async () => {
+        const reader: CardLsblkDevice = { name: 'sdm', type: 'disk', size: 16 * GB, rm: true, tran: 'usb', model: 'SD/MMC', vendor: 'Generic', serial: 'RDR9',
+            children: [{ name: 'sdm1', type: 'part', fstype: 'vfat', label: 'bootfs', size: 1 * GB }] }
+        useDevices([reader])
+        const r = await scanClientCards(undefined, String(LOCAL))
+        expect(r.diskCandidates!.map(c => [c.kind, c.actions])).toEqual([['sdCard', ['flash']]])
+        expect(r.newDisks).toEqual([])
+        expect(await scanUnformattedDisks()).toEqual([])
+    })
+
+    it('empty reader that gets a card later: remembered from size 0, the card is an SD card (flash only)', async () => {
+        const empty: CardLsblkDevice = { name: 'sdn', type: 'disk', size: 0, rm: true, tran: 'usb', model: 'USB3.0 CRW', vendor: 'Generic', serial: 'CRW1' }
+        useDevices([empty])
+        const r0 = await scanClientCards(undefined, String(LOCAL))
+        expect(r0.diskCandidates).toEqual([])
+        expect(r0.cardReaders.map(x => x.hasMedium)).toEqual([false])
+        lsblk = [{ ...empty, size: 32 * GB, children: [{ name: 'sdn1', type: 'part', fstype: 'exfat', label: 'X', size: 32 * GB }] }]
+        const r1 = await scanClientCards(undefined, String(LOCAL))
+        expect(r1.diskCandidates!.map(c => [c.kind, c.actions])).toEqual([['sdCard', ['flash']]])
+        expect((await scanUnformattedDisks()).map(u => u.device)).toEqual([])   // no Erase for an SD card
+    })
+
+    it('old Engine stick (OS rootfs + META.yaml, the "anna" case) is flashable: not HAS_IDEA_META, helper told --os-rootfs', async () => {
+        const anna: CardLsblkDevice = { name: 'sdk', type: 'disk', size: 64 * GB, rm: true, tran: 'usb', model: 'Flash Drive', vendor: 'Samsung', serial: 'ANNA1',
+            children: [{ name: 'sdk1', type: 'part', fstype: 'vfat', label: 'bootfs', size: 512e6 },
+                       { name: 'sdk2', type: 'part', fstype: 'ext4', label: 'rootfs', size: 63 * GB }] }
+        useDevices([SYS, anna])
+        const looked: string[] = []
+        setFlashCardOpsForTests({
+            helperInstalled: () => true,
+            spawnHelper: (a) => { spawned.push(a); return new FakeProc() as any },
+            images: async () => ({ current: V2, previous: null, images: [IMG] }),
+            appendFlashLog: async () => {},
+            isSystemDevice: async (d) => d.startsWith('sda'),
+            // what lookForIdeaMeta returns for an OS rootfs (hasOsRootfsLayout matched; META.yaml not counted)
+            lookForMeta: async (p) => { looked.push(p); return p === 'sdk2' ? { ok: true, hasMeta: false, alreadyMounted: false, ignored: false, osRootfs: true } : { ok: true, hasMeta: false, alreadyMounted: false, ignored: false } },
+        })
+        const c = (await scanClientCards(undefined, String(LOCAL))).diskCandidates!.find(x => x.device === 'sdk')!
+        expect(c).toMatchObject({ kind: 'usbDisk', flashRefusal: null })
+        expect(c.actions).toContain('flash')
+        expect(await code(flashCard(h, c.candidateId, 'current', String(64 * GB)))).toBe('OK')
+        expect(looked).toEqual(['sdk2'])                      // only ext4 partitions 1/2 are looked at
+        expect(spawned[0].osRootfsPartitions).toEqual(['sdk2'])
+    })
+
+    it('a real App/Files/Backup disk (META.yaml, no OS rootfs) that is not docked: helper gets no --os-rootfs, so it refuses HAS_IDEA_META', async () => {
+        const app: CardLsblkDevice = { name: 'sdl', type: 'disk', size: 240 * GB, rm: false, tran: 'usb', model: 'App SSD', serial: 'APP1',
+            children: [{ name: 'sdl1', type: 'part', fstype: 'ext4', label: 'IDEA Disk', size: 240 * GB }] }
+        useDevices([SYS, app], [])
+        setFlashCardOpsForTests({
+            helperInstalled: () => true,
+            spawnHelper: (a) => { spawned.push(a); return new FakeProc() as any },
+            images: async () => ({ current: V2, previous: null, images: [IMG] }),
+            appendFlashLog: async () => {},
+            isSystemDevice: async (d) => d.startsWith('sda'),
+            lookForMeta: async () => ({ ok: true, hasMeta: true, alreadyMounted: false, ignored: false }),
+        })
+        const c = (await scanClientCards(undefined, String(LOCAL))).diskCandidates!.find(x => x.device === 'sdl')!
+        await code(flashCard(h, c.candidateId, 'current', String(240 * GB)))
+        expect(spawned[0].osRootfsPartitions).toEqual([])
+        expect(spawned[0].byId).toMatch(/^\/dev\/disk\/by-id\/usb-/)
+    })
+
+    it('helper META check (the real bash block): META.yaml refused unless that partition is named --os-rootfs', () => {
+        const helper = fs.readFileSync(path.join(process.cwd(), 'script/build_image_assets/idea-flash-card'), 'utf8')
+        const block = helper.slice(helper.indexOf('# >>> meta-check'), helper.indexOf('# <<< meta-check'))
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'meta-check-'))
+        fs.writeFileSync(path.join(dir, 'lsblk'), '#!/bin/bash\nprintf "sdz\\nsdz1 vfat\\nsdz2 ext4\\nsdz3 ext4\\n"\n', { mode: 0o755 })
+        // debugfs stub: META.yaml exists on the partitions listed in $META_ON
+        fs.writeFileSync(path.join(dir, 'debugfs'), '#!/bin/bash\nfor m in $META_ON; do [[ "${@: -1}" == "/dev/$m" ]] && echo "Inode: 12"; done; exit 0\n', { mode: 0o755 })
+        const run = (metaOn: string, rootfs: string[]) => spawnSync('bash', ['-c',
+            `refuse() { echo "refused: $1: $2" >&2; exit 2; }; DEVPATH=/dev/sdz; OSROOTFS=(${rootfs.join(' ')})\n${block}\necho PASSED`],
+            { encoding: 'utf8', env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, META_ON: metaOn } })
+        expect(run('', []).stdout).toContain('PASSED')                                     // no META anywhere
+        expect(run('sdz2', []).stderr).toMatch(/^refused: HAS_IDEA_META: \/dev\/sdz2/)   // App/Files/Backup disk
+        expect(run('sdz2', ['sdz2']).stdout).toContain('PASSED')                         // anna: OS rootfs + META
+        expect(run('sdz3', ['sdz2']).stderr).toMatch(/^refused: HAS_IDEA_META: \/dev\/sdz3/)   // META elsewhere still refused
+        fs.rmSync(dir, { recursive: true, force: true })
+    })
+
+    it('helper: --os-rootfs must be partition 1 or 2 of the target device', () => {
+        const HELPER = path.resolve(process.cwd(), 'script/build_image_assets/idea-flash-card')
+        const base = ['--by-id', '/dev/disk/by-id/usb-Generic_X-0:0', '--expect-device', 'sdz', '--expect-size', '100',
+            '--image', `/var/lib/idea/client-images/${V2}/idea-client-${V2}.img.xz`, '--sha256', 'a'.repeat(64)]
+        for (const bad of ['sdy2', 'sdz3', 'sdz', '../x']) {
+            const r = spawnSync('bash', [HELPER, ...base, '--os-rootfs', bad], { encoding: 'utf8' })
+            expect(r.status).toBe(2)
+            expect(r.stderr).toMatch(/^refused: BAD_ARGS: os-rootfs/)
+        }
     })
 
     it('helper: accepts removable=1 or tran=usb, everything else unchanged', () => {
