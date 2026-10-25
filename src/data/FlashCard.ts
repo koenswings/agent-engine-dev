@@ -48,7 +48,11 @@ export class CardError extends Error {
     constructor(public code: string, text: string) { super(`${code}: ${text}`) }
 }
 
-export interface FlashHelperArgs { byId: string; device: string; sizeBytes: number; image: string; sha256: string }
+export interface FlashHelperArgs {
+    byId: string; device: string; sizeBytes: number; image: string; sha256: string
+    /** idea#303: partitions with an OS rootfs layout (hasOsRootfsLayout); a META.yaml there does not block the flash */
+    osRootfsPartitions: string[]
+}
 
 export interface FlashCardOps {
     helperInstalled: () => boolean
@@ -78,7 +82,8 @@ export const setInitialiseAddDevice = (fn: ((p: string) => Promise<void>) | null
 const defaultOps: FlashCardOps = {
     helperInstalled: () => { try { fs.accessSync(FLASH_HELPER, fs.constants.X_OK); return true } catch { return false } },
     spawnHelper: (a) => spawn('sudo', ['-n', FLASH_HELPER, '--by-id', a.byId, '--expect-device', a.device,
-        '--expect-size', String(a.sizeBytes), '--image', a.image, '--sha256', a.sha256], { stdio: ['ignore', 'pipe', 'pipe'] }),
+        '--expect-size', String(a.sizeBytes), '--image', a.image, '--sha256', a.sha256,
+        ...a.osRootfsPartitions.flatMap(p => ['--os-rootfs', p])], { stdio: ['ignore', 'pipe', 'pipe'] }),
     scan: (h) => refreshClientCards(h),
     images: (h) => refreshClientImages(h),
     appendFlashLog: async (line) => { await fs.ensureDir(path.dirname(FLASH_LOG)); await fs.appendFile(FLASH_LOG, line + '\n') },
@@ -170,6 +175,15 @@ export const flashCard = async (
         throw new CardError('IMAGE_TOO_LARGE', `image needs ${image.imageSizeBytes} bytes, the card has ${card.sizeBytes}`)
     }
 
+    // idea#303: an old Engine system disk (OS rootfs + META.yaml, e.g. a retired Engine stick) may be
+    // reflashed. Same read-only look and rootfs rule as adoption (lookForIdeaMeta / hasOsRootfsLayout,
+    // idea#279); the helper still refuses META.yaml on every partition not named here.
+    const osRootfsPartitions: string[] = []
+    for (const p of card.ext4PartitionNames.filter(n => /^sd[a-z][12]$/.test(n))) {
+        const look = await ops.lookForMeta(p)
+        if (look.ok && look.osRootfs) osRootfsPartitions.push(p)
+    }
+
     const traceId = getActiveTrace()?.traceId
     const opId = createOperation(storeHandle, 'flashCard',
         { candidateId, version: image.version, confirmSizeBytes: String(confirmSize) }, 'console-command', { type: 'disk', id: candidateId })
@@ -184,7 +198,7 @@ export const flashCard = async (
     const done = new Promise<FlashResult | null>((resolve) => {
         let proc: ChildProcess
         try {
-            proc = ops.spawnHelper({ byId: card.byId!, device: card.device, sizeBytes: card.sizeBytes, image: imagePathOf(image.version), sha256: image.sha256 })
+            proc = ops.spawnHelper({ byId: card.byId!, device: card.device, sizeBytes: card.sizeBytes, image: imagePathOf(image.version), sha256: image.sha256, osRootfsPartitions })
         } catch (e) {
             finish(null, { code: 'HELPER_MISSING', text: String(e) }); return
         }
@@ -330,6 +344,7 @@ export const initialiseDisk = async (
         updateOperation(storeHandle, opId, { status: 'Running', currentStep: 0, totalSteps: 3, stepLabel: 'checking' })
         const look = await ops.lookForMeta(target.name)
         if (!look.ok) fail('MOUNTED', look.message)
+        if (look.ok && look.osRootfs) fail('OS_ROOTFS', `${target.name} holds an operating system (etc/os-release + usr/ or boot/); it cannot become an IDEA disk in place — flash it instead`)
         if (look.ok && look.hasMeta) fail('ALREADY_IDEA', `${target.name} already has an IDEA META.yaml`)
         updateOperation(storeHandle, opId, { currentStep: 1, stepLabel: 'writing META.yaml' })
         const m = await ops.mountRw(target.name)

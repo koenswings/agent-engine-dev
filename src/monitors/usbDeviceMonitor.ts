@@ -391,9 +391,13 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                         return
                     }
                     if (!look.hasMeta) {
-                        if (look.osRootfs) log(`Device ${device} has an operating-system rootfs layout (etc/os-release + usr/ or boot/) — never an IDEA disk, even with META.yaml (idea#279)`)
-                        if (look.alreadyMounted) log(`Device ${device} is already mounted without META.yaml — left as it is`)
-                        logUnknownDisk(device)
+                        if (look.osRootfs) {
+                            // One line only: the rootfs rule decided, whether or not META.yaml is there
+                            log(`Device ${device} has an operating-system rootfs layout (etc/os-release + usr/ or boot/) — never an IDEA disk, even with META.yaml (idea#279); left untouched (never mounted read-write, not registered)`)
+                        } else {
+                            if (look.alreadyMounted) log(`Device ${device} is already mounted without META.yaml — left as it is`)
+                            logUnknownDisk(device)
+                        }
                         await refreshAfterPartition()
                         return
                     }

@@ -9,7 +9,7 @@ import { Version, Command, Hostname, Timestamp, DiskID, EngineID } from './Commo
 import { Store, getAppsOfEngine, getDisksOfEngine, getInstancesOfEngine } from './Store.js';
 import { DocHandle } from '@automerge/automerge-repo';
 import { currentLanSelection, lanChangeLines, LanSelection } from './LanAddress.js';
-import type { NewDisk, CardReader, ClientCard } from './ClientCards.js';
+import type { NewDisk, CardReader, ClientCard, DiskCandidate } from './ClientCards.js';
 import type { ClientImageStore } from './ClientImages.js';
 import type { FlashInProgress } from './FlashCard.js';
 
@@ -37,12 +37,14 @@ export interface Engine {
    * by this Engine, whole-list replace on plug/unplug; emptied at startup.
    */
   usbSticks?: UsbStickPublic[];
-  /** idea#201 §10: non-removable disks without IDEA META.yaml, never written (rule 1) */
+  /** idea#201 §10 / idea#303: USB and other non-card disks without IDEA META.yaml (sticks too since idea#303), never written (rule 1) */
   newDisks?: NewDisk[];
   /** idea#201 §10: card readers on this Engine (with or without a card) */
   cardReaders?: CardReader[];
-  /** idea#201 §10: removable media present now (the only Flash targets) */
+  /** idea#201 §10 / idea#303: Flash targets present now: SD cards in readers and USB disks (same candidateId as in newDisks) */
   clientCards?: ClientCard[];
+  /** idea#303: one entry per physical non-IDEA disk with its allowed actions (initialise / erase / flash) */
+  diskCandidates?: DiskCandidate[];
   /** idea#201 §10: client images stored on this Engine */
   clientImages?: ClientImageStore | null;
   /** idea#201 §10: set for the whole run of a flash; one at a time per Engine */
@@ -155,7 +157,7 @@ export interface EraseInProgress {
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates']
 /** idea#201 §10: advertised only when the flash helper is installed (HELPER_MISSING otherwise) */
 export const FLASH_CARD_CAPABILITY = 'flashCard'
 export const FLASH_HELPER_PATH = '/usr/local/sbin/idea-flash-card'

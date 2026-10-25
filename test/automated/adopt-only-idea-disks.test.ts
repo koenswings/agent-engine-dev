@@ -11,7 +11,7 @@
  * /disks is never touched.
  */
 
-import { describe, it, beforeAll, afterAll, expect } from 'vitest'
+import { describe, it, beforeAll, afterAll, expect, vi } from 'vitest'
 import os from 'os'
 import { fs, path, sleep } from 'zx'
 import { DocHandle, Repo } from '@automerge/automerge-repo'
@@ -22,6 +22,7 @@ import { enableUsbDeviceMonitor } from '../../src/monitors/usbDeviceMonitor.js'
 import {
     MountEntry, MountOps, lookForIdeaMeta, setMountOps, mountPointOf, isValidIdeaMetaFile, IDEA_IGNORE_MARKER, hasOsRootfsLayout,
 } from '../../src/monitors/mounts.js'
+import { setVerbosity, verbosityLevel } from '../../src/utils/utils.js'
 import { checkForgetDisk, forgetDisk } from '../../src/data/ForgetDisk.js'
 import { commands } from '../../src/data/Commands.js'
 import {
@@ -193,6 +194,22 @@ describe('dock flow: adopt only IDEA disks, never write to others (idea#279, ide
             'etc/hostname': 'student\n',
         })
         expect(fs.existsSync(path.join(diskPath(device), 'META.yaml'))).toBe(false)
+    })
+
+    it('old Engine disk (OS rootfs + valid META.yaml, idea#303): logs only the rootfs line, not "has no IDEA META.yaml"', { timeout: 20_000 }, async () => {
+        const lines: string[] = []
+        const level = verbosityLevel
+        setVerbosity(2)
+        const spy = vi.spyOn(console, 'info').mockImplementation((...a: unknown[]) => { lines.push(a.map(String).join(' ')) })
+        try {
+            const device = await expectUntouched({
+                'etc/os-release': 'NAME="Debian GNU/Linux"\n', 'usr/bin/.keep': '', 'boot/.keep': '',
+                'META.yaml': 'diskId: anna-rootfs-test\ndiskName: ANNA\ncreated: 1792935947450\n',
+            })
+            const mine = lines.filter(l => l.includes(`Device ${device} `))
+            expect(mine.some(l => l.includes('operating-system rootfs layout'))).toBe(true)
+            expect(mine.some(l => l.includes('has no IDEA META.yaml'))).toBe(false)
+        } finally { spy.mockRestore(); setVerbosity(level) }
     })
 
     it('a META.yaml that is not IDEA\'s (empty or not a mapping): not adopted, left as it is', { timeout: 20_000 }, async () => {
