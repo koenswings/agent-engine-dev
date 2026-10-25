@@ -23,6 +23,7 @@ import { isSystemDevice } from './SystemDisk.js'
 import { LsblkDevice, candidateIdFor, isSdCardMedium } from './UnformattedDisks.js'
 import { localEngineId } from './Engine.js'
 import { log } from '../utils/utils.js'
+import { metaLookCache } from '../monitors/metaLookCache.js'
 
 export type CandidateID = string
 export type ReaderID = string
@@ -137,6 +138,8 @@ export interface ClientCardOps {
     isSystemDevice: (device: string) => Promise<boolean>
     /** Devices (partitions or whole disks) of IDEA disks docked on this Engine */
     dockedDevices: (store: Store | undefined, engineId: string) => Set<string>
+    /** idea#303: true when the cached read-only look of this partition found an OS rootfs layout (hasOsRootfsLayout) */
+    osRootfsPartition: (partition: string) => boolean
     now: () => number
 }
 
@@ -169,6 +172,7 @@ const defaultOps: ClientCardOps = {
         }
         return s
     },
+    osRootfsPartition: (p) => (l => l?.ok === true && l.osRootfs === true)(metaLookCache.peek(p)),
     now: () => Date.now(),
 }
 
@@ -312,7 +316,10 @@ export const scanClientCards = async (
         })
         const anyExt4 = clean(d.fstype) === 'ext4' || children.some(c => clean(c.fstype) === 'ext4')
         const actions: DiskAction[] = []
-        if (children.some(c => clean(c.fstype) === 'ext4' && /^sd[a-z][12]$/.test(c.name))) actions.push('initialise')
+        // idea#303 (Steve, 2026-10-25): an OS rootfs partition (old Engine disk) is never initialised in
+        // place; initialiseDisk refuses it too (OS_ROOTFS). Such a disk can only be flashed for now.
+        const osRootfs = children.some(c => clean(c.fstype) === 'ext4' && ops.osRootfsPartition(c.name))
+        if (!osRootfs && children.some(c => clean(c.fstype) === 'ext4' && /^sd[a-z][12]$/.test(c.name))) actions.push('initialise')
         if (!anyExt4) actions.push('erase')
         let flashRefusal: FlashRefusal | null = null
         if ((d.tran ?? 'usb') === 'usb' && byId && byId.startsWith('/dev/disk/by-id/usb-')) {

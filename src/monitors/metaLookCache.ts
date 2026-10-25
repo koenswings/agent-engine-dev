@@ -19,6 +19,8 @@ import { IdeaLookResult } from './mounts.js'
 export interface MetaLookCache {
     /** The cached look of the device, or a new one from `look` (a failed look is not kept) */
     get: (device: string, look: () => Promise<IdeaLookResult>) => Promise<IdeaLookResult>
+    /** The finished, successful look of the device, if one is cached (never starts a look; idea#303) */
+    peek: (device: string) => IdeaLookResult | undefined
     /** Forget the device's look, so the next get looks again */
     forget: (device: string) => void
     /** Forget every look */
@@ -27,6 +29,7 @@ export interface MetaLookCache {
 
 export const createMetaLookCache = (): MetaLookCache => {
     const looks = new Map<string, Promise<IdeaLookResult>>()
+    const done = new Map<string, IdeaLookResult>()
     return {
         get: (device, look) => {
             let p = looks.get(device)
@@ -35,14 +38,19 @@ export const createMetaLookCache = (): MetaLookCache => {
                 p = fresh
                 looks.set(device, fresh)
                 // A failed look may be retried on the next add event
-                fresh.then(r => { if (!r.ok && looks.get(device) === fresh) looks.delete(device) }, () => {
+                fresh.then(r => {
+                    if (looks.get(device) !== fresh) return
+                    if (r.ok) done.set(device, r)
+                    else looks.delete(device)
+                }, () => {
                     if (looks.get(device) === fresh) looks.delete(device)
                 })
             }
             return p
         },
-        forget: (device) => { looks.delete(device) },
-        clear: () => { looks.clear() },
+        peek: (device) => (looks.has(device) ? done.get(device) : undefined),
+        forget: (device) => { looks.delete(device); done.delete(device) },
+        clear: () => { looks.clear(); done.clear() },
     }
 }
 

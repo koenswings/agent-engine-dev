@@ -344,6 +344,7 @@ export const initialiseDisk = async (
         updateOperation(storeHandle, opId, { status: 'Running', currentStep: 0, totalSteps: 3, stepLabel: 'checking' })
         const look = await ops.lookForMeta(target.name)
         if (!look.ok) fail('MOUNTED', look.message)
+        if (look.ok && look.osRootfs) fail('OS_ROOTFS', `${target.name} holds an operating system (etc/os-release + usr/ or boot/); it cannot become an IDEA disk in place — flash it instead`)
         if (look.ok && look.hasMeta) fail('ALREADY_IDEA', `${target.name} already has an IDEA META.yaml`)
         updateOperation(storeHandle, opId, { currentStep: 1, stepLabel: 'writing META.yaml' })
         const m = await ops.mountRw(target.name)

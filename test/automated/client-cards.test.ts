@@ -55,10 +55,13 @@ const IDEA_SSD: CardLsblkDevice = { name: 'sdf', type: 'disk', size: 240 * GB, r
 
 let lsblk: CardLsblkDevice[] = []
 let lsblkHook: (() => Promise<void>) | null = null
+let osRootfsParts = new Set<string>()
 const useDevices = (devs: CardLsblkDevice[], docked: string[] = ['sdf1'], sys: (d: string) => boolean = (d) => d.startsWith('sda')) => {
     lsblk = devs
     lsblkHook = null
+    osRootfsParts = new Set()
     setClientCardOpsForTests({
+        osRootfsPartition: (p) => osRootfsParts.has(p),
         lsblkJson: async () => { if (lsblkHook) await lsblkHook(); return JSON.parse(JSON.stringify(lsblk)) },
         byIdLinks: async () => lsblk.filter(d => d.name !== 'sda').map(d => ({ link: `/dev/disk/by-id/usb-${(d.model ?? 'X').replace(/ /g, '_')}_${d.serial}-0:0`, device: d.name })),
         sysfsPath: async (d) => `/sys/devices/platform/scb/fd500000.pcie/pci0000:00/0000:01:00.0/usb1/1-1/1-1.${d.charCodeAt(2) - 96}/1-1.${d.charCodeAt(2) - 96}:1.0/host0/target0:0:0/0:0:0:0/block/${d}`,
@@ -520,6 +523,31 @@ describe('disk roles: USB disks get both roles, SD cards flash only (idea#303)',
         expect(spawned).toHaveLength(1)
         expect(spawned[0]).toMatchObject({ byId: expect.stringMatching(/^\/dev\/disk\/by-id\/usb-/), device: 'sdd', sizeBytes: 240 * GB, sha256: IMG.sha256 })
         void done
+    })
+
+    it('old Engine disk (OS rootfs on sdX2, idea#303 Steve 2026-10-25): flash only, no initialise; initialiseDisk refuses OS_ROOTFS', async () => {
+        const ANNA: CardLsblkDevice = { name: 'sdk', type: 'disk', size: 120 * GB, rm: false, tran: 'usb', model: 'WDS120G2G0A', vendor: 'WDC', serial: 'ANNA303',
+            children: [{ name: 'sdk1', type: 'part', fstype: 'vfat', label: 'bootfs', size: 1 * GB }, { name: 'sdk2', type: 'part', fstype: 'ext4', label: 'rootfs', size: 119 * GB }] }
+        useDevices([SYS, ANNA, EXT4_STICK])
+        osRootfsParts.add('sdk2')
+        let wrote = false
+        setFlashCardOpsForTests({
+            isSystemDevice: async (d) => d.startsWith('sda'),
+            lookForMeta: async (p) => p === 'sdk2'
+                ? { ok: true, hasMeta: false, alreadyMounted: false, ignored: false, osRootfs: true }
+                : { ok: true, hasMeta: false, alreadyMounted: false, ignored: false },
+            mountRw: async () => { wrote = true; return { ok: true, alreadyMounted: false, fsUuid: null } },
+            writeMeta: async () => { wrote = true },
+        })
+        const r = await scanClientCards(undefined, String(LOCAL))
+        const anna = r.diskCandidates!.find(c => c.device === 'sdk')!
+        expect(anna.actions).toEqual(['flash'])
+        expect(anna.flashRefusal).toBeNull()
+        expect(r.diskCandidates!.find(c => c.device === 'sdi')!.actions).toEqual(['initialise', 'flash'])   // a plain ext4 disk still can
+        // Server side too, even if a stale Console offers it
+        expect(await code(initialiseDisk(h, anna.candidateId, 'files'))).toBe('OS_ROOTFS')
+        expect(wrote).toBe(false)
+        expect(Object.keys(h.doc()!.diskDB)).toHaveLength(0)
     })
 
     it('refuses a docked IDEA SSD, a mounted USB disk and the system disk; nothing is spawned', async () => {
