@@ -384,7 +384,8 @@ export const buildEngine = async (args: any) => {
 
   await setHostname(exec, hostname);
   await installAvahi(exec, enginePath);
-  await installDhcpVendorClass(exec, enginePath);
+  // DHCP vendor class (idea#209 D8) is applied by installRootHelpers (via installUdev
+  // below), the same step every update runs (idea#284).
   await localiseSystem(exec, enginePath, language, keyboard, timezone);
   await installCrontabs(exec, enginePath);
 
@@ -737,7 +738,8 @@ export const ensureAptPackages = async (exec: any, pkgs: string[]): Promise<stri
  * Everything root-owned the Engine needs at run time, safe to run again on every
  * install AND every update (build-engine installUdev, ./install-root-helpers,
  * sync-engine): rsync + borgbackup, the sudoers files, /usr/local/sbin/idea-erase-disk,
- * /usr/local/sbin/idea-app-data and the peer-access parts. `install` overwrites
+ * /usr/local/sbin/idea-app-data, the peer-access parts and the DHCP vendor class
+ * (idea#284). `install` overwrites
  * the helpers with the checkout's copies, so an outdated helper is upgraded.
  * Ends by checking /usr/bin/borg and `idea-app-data version`; throws if either is wrong.
  */
@@ -775,6 +777,11 @@ export const installRootHelpers = async (exec: any, enginePath: string) => {
   await exec`sudo systemd-tmpfiles --create ${USB_TMPFILES_CONF}`
   // Per-Pi Engine keys: the forced command for peer keys and the sshd drop-in
   await installPeerAccess(exec, enginePath)
+  // DHCP option 60 "idea-engine" (idea#209 D8). Here, not only in build-engine, so
+  // Engines installed before #216 get it from a normal update (idea#284). Idempotent;
+  // never restarts NM or touches a link. A failure is logged, not fatal: the fleet
+  // health check reports an Engine whose drop-in is missing.
+  await installDhcpVendorClass(exec, enginePath)
   // Verify, so a broken install stops here and not at the first backup (exit 127)
   try {
     await exec`test -x ${BORG_PATH}`
