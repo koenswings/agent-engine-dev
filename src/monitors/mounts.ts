@@ -21,7 +21,7 @@
  * can inject fakes.
  */
 
-import { $, fs, sleep } from 'zx'
+import { $, YAML, fs, sleep } from 'zx'
 import { log } from '../utils/utils.js'
 import { disksRoot } from '../data/Config.js'
 import type { DocHandle } from '@automerge/automerge-repo'
@@ -219,8 +219,51 @@ export const safeMount = async (device: string, ops: MountOps = mountOps()): Pro
 // ── Read-only look (idea#201 §10 rule 1) ────────────────────────────────────
 
 export type IdeaLookResult =
-    | { ok: true, hasMeta: boolean, alreadyMounted: boolean }
+    | { ok: true, hasMeta: boolean, alreadyMounted: boolean, ignored?: boolean, osRootfs?: boolean }
     | { ok: false, message: string }
+
+/**
+ * The on-disk ignore marker (idea#279, proposal for review): a file named
+ * IDEA-IGNORE in the root of the partition, next to META.yaml. Content is free
+ * text (an optional reason) and is never parsed. A partition with the marker is
+ * treated like an unrecognised disk even when it carries a valid META.yaml: it
+ * is released after the read-only look, never mounted read-write and never
+ * registered. The Engine never creates or removes the marker itself.
+ */
+export const IDEA_IGNORE_MARKER = 'IDEA-IGNORE'
+
+/**
+ * idea#279: a META.yaml counts as IDEA's mark only when it parses as a YAML
+ * mapping. An empty, unreadable or non-mapping META.yaml does not make a disk
+ * an IDEA disk. No field is required here, so every META.yaml the Engine reads
+ * today (readMetaUpdateId may fill in a missing hardware diskId) still docks.
+ */
+export const isValidIdeaMetaFile = (metaPath: string): boolean => {
+    try {
+        if (!fs.existsSync(metaPath)) return false
+        const parsed = YAML.parse(fs.readFileSync(metaPath, 'utf8'))
+        return !!parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Object.keys(parsed).length > 0
+    } catch {
+        return false
+    }
+}
+
+const lexists = (p: string): boolean => { try { fs.lstatSync(p); return true } catch { return false } }
+const isDirNoFollow = (p: string): boolean => { try { return fs.lstatSync(p).isDirectory() } catch { return false } }
+
+/**
+ * idea#279 (Steve, Lead, 2026-10-25): an operating-system root filesystem is never
+ * an IDEA data disk, even when it carries a META.yaml (an old Engine rootfs, or a
+ * client card that got a META.yaml from the idea#121 write). Rule: the partition
+ * root has `etc/os-release` (file or symlink, not followed) AND a real directory
+ * `usr/` or `boot/` (symlinks not followed). App, Files and Backup Disks have no
+ * `etc/` at their root, so they are never caught.
+ */
+export const hasOsRootfsLayout = (mountPoint: string): boolean =>
+    lexists(`${mountPoint}/etc/os-release`) && (isDirNoFollow(`${mountPoint}/usr`) || isDirNoFollow(`${mountPoint}/boot`))
+
+/** idea#279: true when the partition mounted at mountPoint carries the IDEA-IGNORE marker. */
+export const hasIgnoreMarker = (mountPoint: string): boolean => fs.existsSync(`${mountPoint}/${IDEA_IGNORE_MARKER}`)
 
 /**
  * Decide whether /dev/<device> is an IDEA disk WITHOUT writing to it
@@ -235,7 +278,9 @@ export type IdeaLookResult =
 export const lookForIdeaMeta = async (
     device: string,
     ops: MountOps = mountOps(),
-    metaExists: (mountPoint: string) => boolean = (mp) => fs.existsSync(`${mp}/META.yaml`),
+    metaExists: (mountPoint: string) => boolean = (mp) => isValidIdeaMetaFile(`${mp}/META.yaml`),
+    ignoreMarker: (mountPoint: string) => boolean = hasIgnoreMarker,
+    osRootfs: (mountPoint: string) => boolean = hasOsRootfsLayout,
 ): Promise<IdeaLookResult> => {
     const target = mountPointOf(device)
     const check = await checkMountState(device, ops)
@@ -246,7 +291,8 @@ export const lookForIdeaMeta = async (
         return { ok: false, message: `Refusing to look at /dev/${device}: it is already mounted (${check.mounts.map(m => m.target).join(', ')})` }
     }
     if (check.state === 'mounted') {
-        return { ok: true, hasMeta: metaExists(target), alreadyMounted: true }
+        if (osRootfs(target)) return { ok: true, hasMeta: false, alreadyMounted: true, ignored: ignoreMarker(target), osRootfs: true }
+        return { ok: true, hasMeta: metaExists(target), alreadyMounted: true, ignored: ignoreMarker(target) }
     }
     try {
         await ops.mkdir(device)
@@ -256,15 +302,21 @@ export const lookForIdeaMeta = async (
         return { ok: false, message: `Could not mount /dev/${device} read-only on ${target}: ${e instanceof Error ? e.message : String(e)}` }
     }
     let hasMeta = false
+    let ignored = false
+    let rootfs = false
     try {
-        hasMeta = metaExists(target)
+        rootfs = osRootfs(target)
+        hasMeta = !rootfs && metaExists(target)
+        ignored = ignoreMarker(target)
     } finally {
         const released = await unmountAndRemove(device, ops)
         if (!released.ok) {
             return { ok: false, message: `Read-only look at /dev/${device}: ${released.message}` }
         }
     }
-    return { ok: true, hasMeta, alreadyMounted: false }
+    return rootfs
+        ? { ok: true, hasMeta: false, alreadyMounted: false, ignored, osRootfs: true }
+        : { ok: true, hasMeta, alreadyMounted: false, ignored }
 }
 
 // ── Unmounting ──────────────────────────────────────────────────────────────
