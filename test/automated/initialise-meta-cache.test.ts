@@ -76,6 +76,17 @@ describe('metaLookCache (one ro META look per device)', () => {
         expect(fails).toBe(2)
     })
 
+    it('peek returns only a finished, successful look and never starts one (idea#303)', async () => {
+        const c = createMetaLookCache()
+        expect(c.peek('sdx2')).toBeUndefined()
+        await c.get('sdx2', async () => ({ ok: true, hasMeta: false, alreadyMounted: false, osRootfs: true }))
+        expect((c.peek('sdx2') as any)?.osRootfs).toBe(true)
+        await c.get('sdy2', async () => ({ ok: false, message: 'wrong fs type' }))
+        expect(c.peek('sdy2')).toBeUndefined()
+        c.forget('sdx2')
+        expect(c.peek('sdx2')).toBeUndefined()
+    })
+
     it('forgetMetaLook accepts /dev/engine/<dev>, /dev/<dev> and <dev>', async () => {
         for (const name of ['/dev/engine/sdb2', '/dev/sdb2', 'sdb2']) {
             metaLookCache.clear()

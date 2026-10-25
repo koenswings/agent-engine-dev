@@ -1,5 +1,5 @@
 #!/bin/bash
-# idea-flash-card — write a verified IDEA client image to a removable card (idea#201 §10)
+# idea-flash-card — write a verified IDEA client image to a removable card or USB disk (idea#201 §10, idea#303)
 #
 # Installed as a root-owned COPY at /usr/local/sbin/idea-flash-card (never a symlink).
 # Allowed by sudoers with no argument list; this script re-checks EVERYTHING itself
@@ -7,7 +7,7 @@
 #
 # Usage:
 #   idea-flash-card --by-id <path> --expect-device <sdX> --expect-size <bytes> \
-#                   --image <file> --sha256 <hex>
+#                   --image <file> --sha256 <hex> [--os-rootfs <sdXN>]...
 #   idea-flash-card --version
 #
 #   --by-id         /dev/disk/by-id/usb-...  (whole disk link, never a -partN link)
@@ -15,6 +15,10 @@
 #   --expect-size   bytes; must equal the device size now (dialog → write binding)
 #   --image         /var/lib/idea/client-images/<version>/idea-client-<version>.img.xz
 #   --sha256        64 hex; must equal the image's .sha256 file AND the recomputed hash
+#   --os-rootfs     sdXN (partition 1 or 2 of --expect-device), repeatable: the Engine found an OS
+#                   root filesystem layout on it with hasOsRootfsLayout (src/monitors/mounts.ts, idea#279),
+#                   so a META.yaml there is an old Engine system disk, not an IDEA disk (idea#303).
+#                   The layout check lives only in the Engine; this helper does not repeat it.
 #
 # Output: JSON lines on stdout {"step":..,"bytes":..,"total":..}, last line
 #   {"result":"ok","bytesWritten":N,"sha256":"..","readBackSha256":"..","safeToRemove":true|false}
@@ -24,7 +28,7 @@
 
 set -u
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
-VERSION=1
+VERSION=2
 IMAGES_ROOT=/var/lib/idea/client-images
 
 refuse() { echo "refused: $1: $2" >&2; exit 2; }
@@ -34,6 +38,7 @@ emit()   { printf '{"step":"%s","bytes":%s,"total":%s}\n' "$1" "${2:-0}" "${3:-0
 if [[ "${1:-}" == "--version" ]]; then echo "idea-flash-card $VERSION"; exit 0; fi
 
 BYID= DEV= SIZE= IMAGE= SHA=
+OSROOTFS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --by-id) BYID="${2:-}"; shift 2 ;;
@@ -41,6 +46,7 @@ while [[ $# -gt 0 ]]; do
     --expect-size) SIZE="${2:-}"; shift 2 ;;
     --image) IMAGE="${2:-}"; shift 2 ;;
     --sha256) SHA="${2:-}"; shift 2 ;;
+    --os-rootfs) OSROOTFS+=("${2:-}"); shift 2 ;;
     *) refuse BAD_ARGS "unknown argument '$1'" ;;
   esac
 done
@@ -49,6 +55,7 @@ done
 [[ "$DEV" =~ ^sd[a-z]$ ]] || refuse BAD_ARGS "expect-device must be sdX"
 [[ "$SIZE" =~ ^[0-9]+$ && "$SIZE" -gt 0 ]] || refuse BAD_ARGS "expect-size must be digits"
 [[ "$SHA" =~ ^[0-9a-f]{64}$ ]] || refuse BAD_ARGS "sha256 must be 64 lower-case hex"
+for p in "${OSROOTFS[@]}"; do [[ "$p" =~ ^${DEV}[12]$ ]] || refuse BAD_ARGS "os-rootfs must be partition 1 or 2 of $DEV"; done
 [[ "$IMAGE" =~ ^$IMAGES_ROOT/([A-Za-z0-9._-]+)/idea-client-([A-Za-z0-9._-]+)\.img\.xz$ ]] || refuse BAD_ARGS "image must be $IMAGES_ROOT/<version>/idea-client-<version>.img.xz"
 [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]] || refuse BAD_ARGS "image folder and file version differ"
 check="$IMAGE"; while [[ "$check" != "/" ]]; do [[ -L "$check" ]] && refuse BAD_ARGS "image path contains a symlink ($check)"; check=$(dirname "$check"); done
@@ -85,7 +92,8 @@ resolve_ok || {
 [[ "$(lsblk -dn -o TYPE "$DEVPATH" | tr -d '[:space:]')" == "disk" ]] || refuse BAD_ARGS "$DEVPATH is not a whole disk"
 rm_flag=$(cat "/sys/block/$DEV/removable" 2>/dev/null || echo 0)
 tran=$(lsblk -dn -o TRAN "$DEVPATH" | tr -d '[:space:]')
-[[ "$rm_flag" == "1" ]] || refuse NOT_REMOVABLE "$DEVPATH is not removable media (removable=$rm_flag, tran=$tran)"
+# idea#303: a USB SSD/HDD (removable=0, tran=usb) is a valid client-image target too
+[[ "$rm_flag" == "1" || "$tran" == "usb" ]] || refuse NOT_REMOVABLE "$DEVPATH is neither removable media nor a USB disk (removable=$rm_flag, tran=$tran)"
 for mp in / /boot/firmware /boot; do
   src=$(findmnt -n -o SOURCE "$mp" 2>/dev/null | head -1); [[ -n "$src" ]] || continue
   src=${src%%[*}; pk=$(lsblk -no PKNAME "$src" 2>/dev/null | head -1 | tr -d '[:space:]')
@@ -98,13 +106,17 @@ done < <(lsblk -ln -o NAME,MOUNTPOINT "$DEVPATH")
 if grep -q "^/dev/$DEV" /proc/swaps; then refuse MOUNTED "$DEVPATH holds active swap"; fi
 shopt -s nullglob; holders=(/sys/block/$DEV/holders/* /sys/block/$DEV/$DEV*/holders/*); shopt -u nullglob
 [[ ${#holders[@]} -eq 0 ]] || refuse IN_USE_BY_APP "$DEVPATH has holders (${holders[*]})"
-# IDEA META on any ext4 partition (read without mounting): never a flash target
+# IDEA META on any ext4 partition (read without mounting): never a flash target, unless the
+# Engine named that partition with --os-rootfs (an old Engine system disk, idea#303)
+# >>> meta-check
 while read -r name fst; do
   [[ "$fst" == "ext4" ]] || continue
   if debugfs -R "stat /META.yaml" "/dev/$name" 2>/dev/null | grep -q "^Inode:"; then
-    refuse HAS_IDEA_META "/dev/$name has an IDEA META.yaml"
+    rootfs_ok=0; for p in "${OSROOTFS[@]}"; do [[ "$p" == "$name" ]] && rootfs_ok=1; done
+    [[ $rootfs_ok -eq 1 ]] || refuse HAS_IDEA_META "/dev/$name has an IDEA META.yaml"
   fi
 done < <(lsblk -ln -o NAME,FSTYPE "$DEVPATH" | tail -n +2)
+# <<< meta-check
 
 # ── Image ───────────────────────────────────────────────────────────────────
 emit verifying-image 0 0
