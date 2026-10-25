@@ -20,7 +20,7 @@ import { DeviceName, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '.
 import { createOrUpdateEngine, localEngineId, ENGINE_CAPABILITIES } from '../../src/data/Engine.js'
 import { enableUsbDeviceMonitor } from '../../src/monitors/usbDeviceMonitor.js'
 import {
-    MountEntry, MountOps, lookForIdeaMeta, setMountOps, mountPointOf, isValidIdeaMetaFile, IDEA_IGNORE_MARKER,
+    MountEntry, MountOps, lookForIdeaMeta, setMountOps, mountPointOf, isValidIdeaMetaFile, IDEA_IGNORE_MARKER, hasOsRootfsLayout,
 } from '../../src/monitors/mounts.js'
 import { checkForgetDisk, forgetDisk } from '../../src/data/ForgetDisk.js'
 import { commands } from '../../src/data/Commands.js'
@@ -96,6 +96,37 @@ describe('valid META.yaml and the IDEA-IGNORE marker (idea#279)', () => {
         expect(state.mounts).toHaveLength(0)
     })
 
+    it('OS rootfs rule: etc/os-release plus a real usr/ or boot/ dir; App, Files and Backup Disk layouts never match', async () => {
+        const mk = async (files: string[], dirsIn: string[] = []) => {
+            const d = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-279-rootfs-'))
+            for (const x of dirsIn) await fs.ensureDir(path.join(d, x))
+            for (const f of files) { await fs.ensureDir(path.dirname(path.join(d, f))); await fs.writeFile(path.join(d, f), 'x\n') }
+            return d
+        }
+        expect(hasOsRootfsLayout(await mk(['etc/os-release', 'META.yaml'], ['usr/bin']))).toBe(true)
+        expect(hasOsRootfsLayout(await mk(['etc/os-release'], ['boot']))).toBe(true)
+        const sym = await mk([], ['usr/lib', 'etc'])                      // Ubuntu: etc/os-release -> ../usr/lib/os-release
+        await fs.symlink('../usr/lib/os-release', path.join(sym, 'etc/os-release'))
+        expect(hasOsRootfsLayout(sym)).toBe(true)
+        expect(hasOsRootfsLayout(await mk(['etc/os-release']))).toBe(false)               // no usr/ or boot/
+        expect(hasOsRootfsLayout(await mk(['boot/cmdline.txt'], ['usr']))).toBe(false)     // no etc/os-release
+        const usrLink = await mk(['etc/os-release'])
+        await fs.symlink('/usr', path.join(usrLink, 'usr'))
+        expect(hasOsRootfsLayout(usrLink)).toBe(false)                                   // symlinks not followed
+        // Legitimate IDEA layouts
+        expect(hasOsRootfsLayout(await mk(['META.yaml', 'apps/kolibri-1.0/compose.yaml', 'instances/kolibri/compose.yaml', 'services/kolibri.tar']))).toBe(false)
+        expect(hasOsRootfsLayout(await mk(['META.yaml', 'FILES.yaml', 'files/boot/readme.txt', 'files/usr/notes.txt']))).toBe(false)
+        expect(hasOsRootfsLayout(await mk(['META.yaml', 'BACKUP.yaml', 'backups/kolibri/etc/os-release'], ['backups/kolibri/usr']))).toBe(false)
+    })
+
+    it('lookForIdeaMeta: rootfs with META.yaml is not IDEA META, and the device is released', async () => {
+        const state: FakeState = { mounts: [], calls: [] }
+        const r = await lookForIdeaMeta('sdz2', fakeOps(state), () => true, () => false, () => true)
+        expect(r).toEqual({ ok: true, hasMeta: false, alreadyMounted: false, ignored: false, osRootfs: true })
+        expect(rwMounts(state, 'sdz2')).toHaveLength(0)
+        expect(state.mounts).toHaveLength(0)
+    })
+
     it('capabilities forgetDisk and ideaIgnoreMarker are advertised', () => {
         expect(ENGINE_CAPABILITIES).toContain('forgetDisk')
         expect(ENGINE_CAPABILITIES).toContain('ideaIgnoreMarker')
@@ -167,6 +198,20 @@ describe('dock flow: adopt only IDEA disks, never write to others (idea#279, ide
     it('a META.yaml that is not IDEA\'s (empty or not a mapping): not adopted, left as it is', { timeout: 20_000 }, async () => {
         await expectUntouched({ 'META.yaml': '' })
         await expectUntouched({ 'META.yaml': '- not\n- a mapping\n' })
+    })
+
+    it("old Engine rootfs with META.yaml (the 'anna' Samsung stick on 'idea', 2026-10-25): no writes, no record, released", { timeout: 20_000 }, async () => {
+        const id = `idea279-anna-${Date.now()}` as DiskID
+        const device = await expectUntouched({
+            'META.yaml': `diskId: ${id}\ndiskName: anna\ncreated: 1\nlastDocked: 1\n`,
+            'etc/os-release': 'PRETTY_NAME="Debian GNU/Linux 12 (bookworm)"\nID=debian\n',
+            'etc/hostname': 'anna\n',
+            'usr/bin/node': 'x\n',
+            'boot/firmware/config.txt': 'x\n',
+            'home/pi/idea/agents/agent-engine-dev/package.json': '{}\n',
+        })
+        expect(storeHandle.doc()!.diskDB[id]).toBeUndefined()
+        expect(state.mounts.filter(m => m.target === mountPointOf(device))).toHaveLength(0)
     })
 
     it('IDEA disk with the IDEA-IGNORE marker: ignored like an unrecognised disk', { timeout: 20_000 }, async () => {

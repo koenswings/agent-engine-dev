@@ -22,7 +22,7 @@ import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogSto
 import { runWithTrace } from '../utils/CommandLogger.js';
 import { recordDiskDetectionFailure, errorMessage } from './diskDetection.js';
 import { addStick, classifyFsType, stickBlockedBySiblings, removeStick, removeSticksOnDrive, usbStartupCleanup, usbStickOps, usbStickRoutingActive, syncUsbApps } from '../data/UsbSticks.js'
-import { lookForIdeaMeta, IdeaLookResult, isValidIdeaMetaFile, hasIgnoreMarker, safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointOf } from './mounts.js';
+import { lookForIdeaMeta, IdeaLookResult, isValidIdeaMetaFile, hasIgnoreMarker, hasOsRootfsLayout, safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointOf } from './mounts.js';
 import { isTestDeviceName, isValidDeviceName, isSdWholeDisk, partitionName, needsDirectSystemAdd } from './deviceNames.js'
 import { metaLookCache } from './metaLookCache.js';
 
@@ -240,7 +240,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     metaLookCache.clear()
     const sharedMetaLook = (device: DeviceName): Promise<IdeaLookResult> =>
         metaLookCache.get(device, () => !mountCommandsActive(config.settings.testMode)
-            ? Promise.resolve({ ok: true, hasMeta: isValidIdeaMetaFile(`${disksRoot()}/${device}/META.yaml`), alreadyMounted: false, ignored: hasIgnoreMarker(`${disksRoot()}/${device}`) } as IdeaLookResult)
+            ? Promise.resolve({ ok: true, hasMeta: !hasOsRootfsLayout(`${disksRoot()}/${device}`) && isValidIdeaMetaFile(`${disksRoot()}/${device}/META.yaml`), alreadyMounted: false, ignored: hasIgnoreMarker(`${disksRoot()}/${device}`) } as IdeaLookResult)
             : lookForIdeaMeta(device).catch(e => ({ ok: false, message: errorMessage(e) }) as IdeaLookResult))
 
     /**
@@ -374,7 +374,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                 const metaPath = `${disksRoot()}/${device}/META.yaml`
                 if (!mountCommandsActive(config.settings.testMode)) {
                     log(`testMode: skipping mount for device ${device} — fixture expected at ${disksRoot()}/${device}`)
-                    if (!isValidIdeaMetaFile(metaPath)) {
+                    if (hasOsRootfsLayout(`${disksRoot()}/${device}`) || !isValidIdeaMetaFile(metaPath)) {
                         logUnknownDisk(device)
                         await refreshAfterPartition()
                         return
@@ -391,6 +391,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                         return
                     }
                     if (!look.hasMeta) {
+                        if (look.osRootfs) log(`Device ${device} has an operating-system rootfs layout (etc/os-release + usr/ or boot/) — never an IDEA disk, even with META.yaml (idea#279)`)
                         if (look.alreadyMounted) log(`Device ${device} is already mounted without META.yaml — left as it is`)
                         logUnknownDisk(device)
                         await refreshAfterPartition()

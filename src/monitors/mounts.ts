@@ -219,7 +219,7 @@ export const safeMount = async (device: string, ops: MountOps = mountOps()): Pro
 // ── Read-only look (idea#201 §10 rule 1) ────────────────────────────────────
 
 export type IdeaLookResult =
-    | { ok: true, hasMeta: boolean, alreadyMounted: boolean, ignored?: boolean }
+    | { ok: true, hasMeta: boolean, alreadyMounted: boolean, ignored?: boolean, osRootfs?: boolean }
     | { ok: false, message: string }
 
 /**
@@ -248,6 +248,20 @@ export const isValidIdeaMetaFile = (metaPath: string): boolean => {
     }
 }
 
+const lexists = (p: string): boolean => { try { fs.lstatSync(p); return true } catch { return false } }
+const isDirNoFollow = (p: string): boolean => { try { return fs.lstatSync(p).isDirectory() } catch { return false } }
+
+/**
+ * idea#279 (Steve, Lead, 2026-10-25): an operating-system root filesystem is never
+ * an IDEA data disk, even when it carries a META.yaml (an old Engine rootfs, or a
+ * client card that got a META.yaml from the idea#121 write). Rule: the partition
+ * root has `etc/os-release` (file or symlink, not followed) AND a real directory
+ * `usr/` or `boot/` (symlinks not followed). App, Files and Backup Disks have no
+ * `etc/` at their root, so they are never caught.
+ */
+export const hasOsRootfsLayout = (mountPoint: string): boolean =>
+    lexists(`${mountPoint}/etc/os-release`) && (isDirNoFollow(`${mountPoint}/usr`) || isDirNoFollow(`${mountPoint}/boot`))
+
 /** idea#279: true when the partition mounted at mountPoint carries the IDEA-IGNORE marker. */
 export const hasIgnoreMarker = (mountPoint: string): boolean => fs.existsSync(`${mountPoint}/${IDEA_IGNORE_MARKER}`)
 
@@ -266,6 +280,7 @@ export const lookForIdeaMeta = async (
     ops: MountOps = mountOps(),
     metaExists: (mountPoint: string) => boolean = (mp) => isValidIdeaMetaFile(`${mp}/META.yaml`),
     ignoreMarker: (mountPoint: string) => boolean = hasIgnoreMarker,
+    osRootfs: (mountPoint: string) => boolean = hasOsRootfsLayout,
 ): Promise<IdeaLookResult> => {
     const target = mountPointOf(device)
     const check = await checkMountState(device, ops)
@@ -276,6 +291,7 @@ export const lookForIdeaMeta = async (
         return { ok: false, message: `Refusing to look at /dev/${device}: it is already mounted (${check.mounts.map(m => m.target).join(', ')})` }
     }
     if (check.state === 'mounted') {
+        if (osRootfs(target)) return { ok: true, hasMeta: false, alreadyMounted: true, ignored: ignoreMarker(target), osRootfs: true }
         return { ok: true, hasMeta: metaExists(target), alreadyMounted: true, ignored: ignoreMarker(target) }
     }
     try {
@@ -287,8 +303,10 @@ export const lookForIdeaMeta = async (
     }
     let hasMeta = false
     let ignored = false
+    let rootfs = false
     try {
-        hasMeta = metaExists(target)
+        rootfs = osRootfs(target)
+        hasMeta = !rootfs && metaExists(target)
         ignored = ignoreMarker(target)
     } finally {
         const released = await unmountAndRemove(device, ops)
@@ -296,7 +314,9 @@ export const lookForIdeaMeta = async (
             return { ok: false, message: `Read-only look at /dev/${device}: ${released.message}` }
         }
     }
-    return { ok: true, hasMeta, alreadyMounted: false, ignored }
+    return rootfs
+        ? { ok: true, hasMeta: false, alreadyMounted: false, ignored, osRootfs: true }
+        : { ok: true, hasMeta, alreadyMounted: false, ignored }
 }
 
 // ── Unmounting ──────────────────────────────────────────────────────────────
