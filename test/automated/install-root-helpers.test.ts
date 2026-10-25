@@ -82,6 +82,37 @@ describe('installRootHelpers', () => {
     })
 })
 
+describe('installRootHelpers applies the DHCP vendor class on every update (idea#284)', () => {
+    const helper = '/usr/local/sbin/idea-dhcp-vendor-class'
+    it('installs and runs idea-dhcp-vendor-class, only reloads NM config, before the final checks', async () => {
+        const { exec, cmds } = recordingExec({ installed: ['rsync', 'borgbackup'] })
+        const q = quiet()
+        try { await installRootHelpers(exec, '/e') } finally { q.mockRestore() }
+        const idx = (c: string) => cmds.indexOf(c)
+        const inst = idx(`sudo install -o root -g root -m 0755 /e/script/build_image_assets/idea-dhcp-vendor-class ${helper}`)
+        const run = idx(`sudo ${helper}`)
+        const reload = idx('if systemctl is-active --quiet NetworkManager; then sudo nmcli general reload conf; fi')
+        expect(inst).toBeGreaterThanOrEqual(0)
+        expect(run).toBeGreaterThan(inst)
+        expect(reload).toBeGreaterThan(run)
+        expect(reload).toBeLessThan(idx(`test -x ${BORG_PATH}`))
+        for (const c of cmds) expect(c).not.toMatch(/restart NetworkManager|connection (up|down)|device (disconnect|reapply)|dhcpcd -[nk]/)
+    })
+    it('runs it again on a second update (the helper itself is idempotent)', async () => {
+        const { exec, cmds } = recordingExec({ installed: ['rsync', 'borgbackup'] })
+        const q = quiet()
+        try { await installRootHelpers(exec, '/e'); await installRootHelpers(exec, '/e') } finally { q.mockRestore() }
+        expect(cmds.filter(c => c === `sudo ${helper}`)).toHaveLength(2)
+    })
+    it('a failing vendor-class step does not abort the update (the fleet health check reports it)', async () => {
+        const { exec, cmds } = recordingExec({ installed: ['rsync', 'borgbackup'], fail: [/^sudo \/usr\/local\/sbin\/idea-dhcp-vendor-class$/] })
+        const q = quiet()
+        const e = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+        try { await expect(installRootHelpers(exec, '/e')).resolves.toBeUndefined() } finally { q.mockRestore(); e.mockRestore() }
+        expect(cmds.slice(-1)).toEqual(['sudo -n /usr/local/sbin/idea-app-data version'])
+    })
+})
+
 describe('borgProblem (startup + backup preflight)', () => {
     it('null when /usr/bin/borg exists', () => {
         expect(borgProblem(p => p === '/usr/bin/borg')).toBeNull()
