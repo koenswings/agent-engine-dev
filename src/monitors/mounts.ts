@@ -21,7 +21,7 @@
  * can inject fakes.
  */
 
-import { $, fs, sleep } from 'zx'
+import { $, YAML, fs, sleep } from 'zx'
 import { log } from '../utils/utils.js'
 import { disksRoot } from '../data/Config.js'
 import type { DocHandle } from '@automerge/automerge-repo'
@@ -219,8 +219,37 @@ export const safeMount = async (device: string, ops: MountOps = mountOps()): Pro
 // ── Read-only look (idea#201 §10 rule 1) ────────────────────────────────────
 
 export type IdeaLookResult =
-    | { ok: true, hasMeta: boolean, alreadyMounted: boolean }
+    | { ok: true, hasMeta: boolean, alreadyMounted: boolean, ignored?: boolean }
     | { ok: false, message: string }
+
+/**
+ * The on-disk ignore marker (idea#279, proposal for review): a file named
+ * IDEA-IGNORE in the root of the partition, next to META.yaml. Content is free
+ * text (an optional reason) and is never parsed. A partition with the marker is
+ * treated like an unrecognised disk even when it carries a valid META.yaml: it
+ * is released after the read-only look, never mounted read-write and never
+ * registered. The Engine never creates or removes the marker itself.
+ */
+export const IDEA_IGNORE_MARKER = 'IDEA-IGNORE'
+
+/**
+ * idea#279: a META.yaml counts as IDEA's mark only when it parses as a YAML
+ * mapping. An empty, unreadable or non-mapping META.yaml does not make a disk
+ * an IDEA disk. No field is required here, so every META.yaml the Engine reads
+ * today (readMetaUpdateId may fill in a missing hardware diskId) still docks.
+ */
+export const isValidIdeaMetaFile = (metaPath: string): boolean => {
+    try {
+        if (!fs.existsSync(metaPath)) return false
+        const parsed = YAML.parse(fs.readFileSync(metaPath, 'utf8'))
+        return !!parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Object.keys(parsed).length > 0
+    } catch {
+        return false
+    }
+}
+
+/** idea#279: true when the partition mounted at mountPoint carries the IDEA-IGNORE marker. */
+export const hasIgnoreMarker = (mountPoint: string): boolean => fs.existsSync(`${mountPoint}/${IDEA_IGNORE_MARKER}`)
 
 /**
  * Decide whether /dev/<device> is an IDEA disk WITHOUT writing to it
@@ -235,7 +264,8 @@ export type IdeaLookResult =
 export const lookForIdeaMeta = async (
     device: string,
     ops: MountOps = mountOps(),
-    metaExists: (mountPoint: string) => boolean = (mp) => fs.existsSync(`${mp}/META.yaml`),
+    metaExists: (mountPoint: string) => boolean = (mp) => isValidIdeaMetaFile(`${mp}/META.yaml`),
+    ignoreMarker: (mountPoint: string) => boolean = hasIgnoreMarker,
 ): Promise<IdeaLookResult> => {
     const target = mountPointOf(device)
     const check = await checkMountState(device, ops)
@@ -246,7 +276,7 @@ export const lookForIdeaMeta = async (
         return { ok: false, message: `Refusing to look at /dev/${device}: it is already mounted (${check.mounts.map(m => m.target).join(', ')})` }
     }
     if (check.state === 'mounted') {
-        return { ok: true, hasMeta: metaExists(target), alreadyMounted: true }
+        return { ok: true, hasMeta: metaExists(target), alreadyMounted: true, ignored: ignoreMarker(target) }
     }
     try {
         await ops.mkdir(device)
@@ -256,15 +286,17 @@ export const lookForIdeaMeta = async (
         return { ok: false, message: `Could not mount /dev/${device} read-only on ${target}: ${e instanceof Error ? e.message : String(e)}` }
     }
     let hasMeta = false
+    let ignored = false
     try {
         hasMeta = metaExists(target)
+        ignored = ignoreMarker(target)
     } finally {
         const released = await unmountAndRemove(device, ops)
         if (!released.ok) {
             return { ok: false, message: `Read-only look at /dev/${device}: ${released.message}` }
         }
     }
-    return { ok: true, hasMeta, alreadyMounted: false }
+    return { ok: true, hasMeta, alreadyMounted: false, ignored }
 }
 
 // ── Unmounting ──────────────────────────────────────────────────────────────

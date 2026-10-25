@@ -22,7 +22,7 @@ import { enableDockerMetricsMonitor } from './monitors/dockerMetricsMonitor.js'
 import { enableDiskSizeMonitor } from './data/DiskSize.js'
 import { ensureEngineStateDir, setFilesMountStore } from './data/FilesMount.js'
 import { clearStaleEraseStaging } from './data/EraseDisk.js'
-import { refreshUnformattedDisks, setAfterUnformattedRefresh } from './data/UnformattedDisks.js'
+import { refreshUnformattedDisks, setAfterUnformattedRefresh, startUnformattedDiskPoll } from './data/UnformattedDisks.js'
 import { refreshClientCards, startClientCardPoll } from './data/ClientCards.js'
 import { refreshClientImages } from './data/ClientImages.js'
 import './data/FlashCard.js'
@@ -262,6 +262,8 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     setAfterUnformattedRefresh((h) => refreshClientCards(h).then(() => undefined))
     await refreshUnformattedDisks(storeHandle).catch(e => log(`unformattedDisks at startup: ${e}`))
     startClientCardPoll(storeHandle)
+    // idea#279: partitions that change while a disk stays plugged re-evaluate 'Unformatted'
+    startUnformattedDiskPoll(storeHandle)
     // Hashing a new image takes a while: in the background, then every 10 minutes
     const imagesRefresh = () => refreshClientImages(storeHandle).catch(e => log(`client images: ${e}`))
     imagesRefresh()

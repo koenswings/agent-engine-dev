@@ -65,7 +65,7 @@ describe('lookForIdeaMeta: read-only look before any rw mount (idea#201 §10)', 
     it('no META.yaml: ro mount, released, mount point removed, never mounted rw', async () => {
         const state = newState()
         const r = await lookForIdeaMeta(dev, fakeOps(state), () => false)
-        expect(r).toEqual({ ok: true, hasMeta: false, alreadyMounted: false })
+        expect(r).toEqual({ ok: true, hasMeta: false, alreadyMounted: false, ignored: false })
         expect(state.calls[0]).toBe(`mkdir ${dev}`)
         expect(state.calls[1]).toBe(`mount -o ro ${dev}`)
         expect(state.calls).toContain(`umount ${dev}`)
@@ -76,7 +76,7 @@ describe('lookForIdeaMeta: read-only look before any rw mount (idea#201 §10)', 
     it('META.yaml present: hasMeta, and still released (the rw mount is the caller\'s step)', async () => {
         const state = newState()
         const r = await lookForIdeaMeta(dev, fakeOps(state), () => true)
-        expect(r).toEqual({ ok: true, hasMeta: true, alreadyMounted: false })
+        expect(r).toEqual({ ok: true, hasMeta: true, alreadyMounted: false, ignored: false })
         expect(rwMounts(state, dev)).toHaveLength(0)
         expect(state.mounts).toHaveLength(0)
     })
@@ -84,7 +84,7 @@ describe('lookForIdeaMeta: read-only look before any rw mount (idea#201 §10)', 
     it('already mounted at its target (Engine restart): looked at in place, nothing mounted or unmounted', async () => {
         const state = newState([{ source: `/dev/${dev}`, target: mp, fstype: 'ext4' }])
         const r = await lookForIdeaMeta(dev, fakeOps(state), () => false)
-        expect(r).toEqual({ ok: true, hasMeta: false, alreadyMounted: true })
+        expect(r).toEqual({ ok: true, hasMeta: false, alreadyMounted: true, ignored: false })
         expect(state.calls).toEqual([])
     })
 

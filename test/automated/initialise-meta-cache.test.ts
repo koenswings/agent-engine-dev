@@ -103,7 +103,7 @@ describe('addDevice of a partition already mounted rw at its mount point with ME
             rmdir: async (p) => { calls.push(`rmdir ${p}`) },
         }
         const look = await lookForIdeaMeta('sdb2', ops, () => true)
-        expect(look).toEqual({ ok: true, hasMeta: true, alreadyMounted: true })
+        expect(look).toEqual({ ok: true, hasMeta: true, alreadyMounted: true, ignored: false })
         const m = await safeMount('sdb2', ops)
         expect(m).toEqual({ ok: true, alreadyMounted: true, fsUuid: 'uuid-4526' })
         expect(calls).toEqual([])   // no ro look mount, no second rw mount, no unmount

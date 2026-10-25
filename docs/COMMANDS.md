@@ -146,6 +146,12 @@ These commands perform actions on the system. Some are restricted to an `engine`
 - **Usage:** `ejectDisk <diskId>` (the Console sends `disk.id`). A disk name is still accepted for older Consoles and the CLI, under the rules in [Disk arguments](#disk-arguments) (idea#128; eject by id instead). Every refusal ends the command trace as `error` with the reason (idea#152).
 - **Scope:** `engine`
 
+### `forgetDisk`
+- **Description:** Removes a stale disk record from the shared store (idea#279, idea#282), e.g. the record an older Engine created when it wrote `META.yaml` onto a client SD card. A store edit only: nothing on any disk is read or written. Refused (trace ends as `error` with the reason) when there is no record with exactly that id (no name fallback, because forgetting cannot be undone), when the record is docked (`dockedTo` or `device` set: eject or unplug it first), or when instance records are still stored on the disk (they would be orphaned; forgetDisk never removes instances). If the disk is an IDEA disk and is plugged in again later, it docks and gets a new record from its `META.yaml` as usual.
+- **Usage:** `forgetDisk <diskId>`, e.g. `forgetDisk 7wt29vdzvj3b2xxt605`
+- **Scope:** `engine`
+- **Capability:** `forgetDisk`
+
 ### `reboot`
 - **Description:** Reboots the engine device.
 - **Usage:** `reboot`

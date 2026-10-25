@@ -22,7 +22,7 @@ import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogSto
 import { runWithTrace } from '../utils/CommandLogger.js';
 import { recordDiskDetectionFailure, errorMessage } from './diskDetection.js';
 import { addStick, classifyFsType, stickBlockedBySiblings, removeStick, removeSticksOnDrive, usbStartupCleanup, usbStickOps, usbStickRoutingActive, syncUsbApps } from '../data/UsbSticks.js'
-import { lookForIdeaMeta, IdeaLookResult, safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointOf } from './mounts.js';
+import { lookForIdeaMeta, IdeaLookResult, isValidIdeaMetaFile, hasIgnoreMarker, safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointOf } from './mounts.js';
 import { isTestDeviceName, isValidDeviceName, isSdWholeDisk, partitionName, needsDirectSystemAdd } from './deviceNames.js'
 import { metaLookCache } from './metaLookCache.js';
 
@@ -240,7 +240,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     metaLookCache.clear()
     const sharedMetaLook = (device: DeviceName): Promise<IdeaLookResult> =>
         metaLookCache.get(device, () => !mountCommandsActive(config.settings.testMode)
-            ? Promise.resolve({ ok: true, hasMeta: fs.existsSync(`${disksRoot()}/${device}/META.yaml`), alreadyMounted: false } as IdeaLookResult)
+            ? Promise.resolve({ ok: true, hasMeta: isValidIdeaMetaFile(`${disksRoot()}/${device}/META.yaml`), alreadyMounted: false, ignored: hasIgnoreMarker(`${disksRoot()}/${device}`) } as IdeaLookResult)
             : lookForIdeaMeta(device).catch(e => ({ ok: false, message: errorMessage(e) }) as IdeaLookResult))
 
     /**
@@ -267,7 +267,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
             try { parts = await usbStickOps().drivePartitions(device) } catch (e) { log(`USB stick sibling check of ${device}: ${errorMessage(e)}`) }
             const why = await stickBlockedBySiblings(device, parts, async (sib) => {
                 const look = await sharedMetaLook(sib as DeviceName)
-                return look.ok ? look.hasMeta : null
+                return look.ok ? (look.hasMeta && !look.ignored) : null
             })
             if (why) {
                 log(`Device ${device} (${probe.fsType}) is not a teacher stick: ${why} — not mounted`)
@@ -282,6 +282,20 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     /** idea#201 §10 rule 1: a device without IDEA META.yaml is left untouched. */
     const logUnknownDisk = (device: DeviceName): void => {
         log(`Device ${device} has no IDEA META.yaml — not an IDEA disk; left untouched (never mounted read-write, no META.yaml written)`)
+    }
+
+    /** idea#279: an IDEA disk with the IDEA-IGNORE marker is treated like an unrecognised disk. */
+    const logIgnoredDisk = (device: DeviceName): void => {
+        log(`Device ${device} carries the IDEA-IGNORE marker — treated as unrecognised; left untouched (never mounted read-write, not registered)`)
+    }
+
+    /**
+     * idea#279: a partition that is not adopted may still change what the whole
+     * disk looks like (an 'Unformatted' disk that just got an ext4 partition), so
+     * the whole-disk lists are re-evaluated after every partition outcome.
+     */
+    const refreshAfterPartition = async (): Promise<void> => {
+        await refreshUnformattedDisks(storeHandle).catch(e => log(`unformatted refresh: ${e}`))
     }
 
     const addDevice = async function (path: string) {
@@ -360,8 +374,14 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                 const metaPath = `${disksRoot()}/${device}/META.yaml`
                 if (!mountCommandsActive(config.settings.testMode)) {
                     log(`testMode: skipping mount for device ${device} — fixture expected at ${disksRoot()}/${device}`)
-                    if (!fs.existsSync(metaPath)) {
+                    if (!isValidIdeaMetaFile(metaPath)) {
                         logUnknownDisk(device)
+                        await refreshAfterPartition()
+                        return
+                    }
+                    if (hasIgnoreMarker(`${disksRoot()}/${device}`)) {
+                        logIgnoredDisk(device)
+                        await refreshAfterPartition()
                         return
                     }
                 } else {
@@ -373,6 +393,13 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                     if (!look.hasMeta) {
                         if (look.alreadyMounted) log(`Device ${device} is already mounted without META.yaml — left as it is`)
                         logUnknownDisk(device)
+                        await refreshAfterPartition()
+                        return
+                    }
+                    if (look.ignored) {
+                        if (look.alreadyMounted) log(`Device ${device} is already mounted with the IDEA-IGNORE marker — left as it is`)
+                        logIgnoredDisk(device)
+                        await refreshAfterPartition()
                         return
                     }
                     // findmnt-based check by target and source, for every filesystem
@@ -391,6 +418,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                     const meta: DiskMeta = await readMetaUpdateId(device)
                     const disk: Disk = createOrUpdateDisk(storeHandle, localEngine.id, device, meta.diskId, meta.diskName, meta.created)
                     await processDisk(storeHandle, disk)
+                    await refreshAfterPartition()
                 } catch (error) {
                     log('Error processing the META file on the disk: ' + error)
                     recordDiskDetectionFailure('readMeta', `Could not process META.yaml on ${device}: ${errorMessage(error)}`, { device })

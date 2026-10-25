@@ -189,3 +189,41 @@ export const refreshUnformattedDisks = async (
     if (afterRefresh) await afterRefresh(storeHandle).catch(e => log(`after unformatted refresh: ${e}`))
     return list
 }
+
+/** The stored list, in the same shape refreshUnformattedDisks writes (for change detection). */
+const storedFingerprint = (storeHandle: DocHandle<Store>, engineId: EngineID): string =>
+    JSON.stringify(storeHandle.doc()?.engineDB?.[engineId]?.unformattedDisks ?? [])
+
+const listFingerprint = (list: UnformattedDisk[]): string =>
+    JSON.stringify(list.map(({ candidateId, device, sizeBytes, model, fsType, label, serial }) => ({
+        candidateId, device, sizeBytes, model, fsType, label, serial,
+    })))
+
+/**
+ * idea#279: re-evaluate Engine.unformattedDisks when the partitions of a plugged
+ * disk change without an add or remove event for the whole disk (an
+ * 'Unformatted' disk partitioned or formatted while it stays plugged; the
+ * Samsung stick on 'idea', 2026-10-25). Writes only when the list differs from
+ * the stored one. Read-only: lsblk only, nothing is mounted.
+ */
+export const reevaluateUnformattedDisks = async (
+    storeHandle: DocHandle<Store>,
+    engineId: EngineID = localEngineId as EngineID,
+): Promise<boolean> => {
+    const list = await scanUnformattedDisks()
+    if (listFingerprint(list) === storedFingerprint(storeHandle, engineId)) return false
+    log(`Unformatted disks changed without a whole-disk event: re-evaluating`)
+    await refreshUnformattedDisks(storeHandle, engineId)
+    return true
+}
+
+export const UNFORMATTED_POLL_MS = 5_000
+export const startUnformattedDiskPoll = (storeHandle: DocHandle<Store>, ms: number = UNFORMATTED_POLL_MS): (() => void) => {
+    let running = false
+    const t = setInterval(() => {
+        if (running) return
+        running = true
+        reevaluateUnformattedDisks(storeHandle).catch(e => log(`unformatted poll: ${e}`)).finally(() => { running = false })
+    }, ms)
+    return () => clearInterval(t)
+}
