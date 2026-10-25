@@ -27,6 +27,16 @@ import { CommandLogStore, CommandTrace, setCommandLogHandle } from '../../src/da
 import { commands } from '../../src/data/Commands.js'
 import { handleCommand } from '../../src/utils/commandUtils.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
+import { config } from '../../src/data/Config.js'
+
+// These tests exercise the Engine side of a backup (store, BACKUP.yaml, lock file) with
+// borg skipped. Pin skipBorg rather than inherit it from the machine's config.yaml: in a
+// Pi's deployed tree skipBorg: false fell through, borg ran through the real helper,
+// which refuses idea-test-N roots, and the backup failed (lock kept on purpose for
+// boot-resume) - on-Pi triage idea04 2026-10-25.
+let prevSkipBorg: boolean | undefined
+beforeEach(() => { prevSkipBorg = config.settings.skipBorg; config.settings.skipBorg = true })
+afterEach(() => { config.settings.skipBorg = prevSkipBorg })
 
 const INST = 'inst-126' as InstanceID
 let appDevice = ''

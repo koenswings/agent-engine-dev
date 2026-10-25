@@ -15,6 +15,7 @@
  * The server is startAutomergeServer() with the synthetic store doc plus two extra
  * docs (a command-log-like list and a smaller doc), loaded from NodeFS storage.
  */
+import { PI_TIMING_FACTOR } from '../harness/hostEnv.js'
 import { describe, it, beforeAll, afterAll, expect } from 'vitest'
 import os from 'os'
 import path from 'path'
@@ -81,7 +82,7 @@ describe('Automerge WS server after a burst of short-lived clients (r34 POST-BUR
         repo = await startAutomergeServer(dataDir, port as PortNumber, { storeDocId: mainId, engineId: 'ENGINE_postburst' })
         for (const id of [mainId, ...extraIds]) await (await repo.find(id)).whenReady()
         url = `ws://127.0.0.1:${port}`
-    }, 180_000)
+    }, 180_000 * PI_TIMING_FACTOR)   // setup only (large doc import + server start): timed out at 180 s on a Pi 4 under the full suite (on-Pi triage idea04 2026-10-25)
 
     afterAll(async () => {
         const adapter: any = repo?.networkSubsystem.adapters[0]

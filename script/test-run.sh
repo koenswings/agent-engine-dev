@@ -52,13 +52,19 @@ trap cleanup EXIT
 
 if [ "$TEST_MODE" = "true" ]; then
     export IDEA_TEST_MODE=true
+    # Never read this machine's live config.yaml (a Pi's deployed tree has its own
+    # skipBorg / skipHardwareId / peerAccess ...): tests read a pristine copy of the
+    # committed config.yaml instead (Config.ts configFilePath, on-Pi triage idea04).
+    git show HEAD:config.yaml > "$TEST_TMP/config.yaml" 2>/dev/null \
+        || { echo "test-run.sh: cannot read the committed config.yaml (git show HEAD:config.yaml)" >&2; exit 1; }
+    export IDEA_CONFIG_FILE="$TEST_TMP/config.yaml"
 fi
 
 mkdir -p test/testresults
 OUT="test/testresults/test-$SUITE-$(date -u +%Y-%m-%d-%H%M).log"
 {
     echo "Suite: test:$SUITE | $(date -u) | Branch: $(git branch --show-current) | Commit: $(git rev-parse --short HEAD)"
-    echo "Isolation: IDEA_SYSTEM_DISK_SKIP=$IDEA_SYSTEM_DISK_SKIP IDEA_WATCH_DIR=$IDEA_WATCH_DIR IDEA_DISKS_ROOT=$IDEA_DISKS_ROOT build=dist-test"
+    echo "Isolation: IDEA_SYSTEM_DISK_SKIP=$IDEA_SYSTEM_DISK_SKIP IDEA_WATCH_DIR=$IDEA_WATCH_DIR IDEA_DISKS_ROOT=$IDEA_DISKS_ROOT IDEA_CONFIG_FILE=${IDEA_CONFIG_FILE:-./config.yaml} build=dist-test"
     echo "---"
     node_modules/.bin/vitest run "dist-test/test/$SUBDIR/"
 } 2>&1 | tee "$OUT"

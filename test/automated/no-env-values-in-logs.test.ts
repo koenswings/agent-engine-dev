@@ -225,7 +225,11 @@ describe('startInstance History entry holds no .env values (idea#111, real conta
             if (c.kind === 'existing') {
                 expect(env.pass, 'the existing pass is reused').to.equal(c.secrets[0])
             }
-            const values = [...Object.entries(env).filter(([k]) => k !== 'port').map(([, v]) => v), ...c.secrets].filter(v => v)
+            // Not secrets: the Engine itself writes port, hostname and ip (writeEngineHostEnv); they
+            // are in the store and shown in the Console. On a Pi named idea04 the hostname is in
+            // every log line (on-Pi triage idea04 2026-10-25), so they are left out of the check.
+            const ENGINE_PUBLIC_KEYS = new Set(['port', 'hostname', 'ip'])
+            const values = [...Object.entries(env).filter(([k]) => !ENGINE_PUBLIC_KEYS.has(k)).map(([, v]) => v), ...c.secrets].filter(v => v)
             expect(values.length).to.be.greaterThan(0)
 
             const entry = logHandle.doc()!.traces[t.traceId]

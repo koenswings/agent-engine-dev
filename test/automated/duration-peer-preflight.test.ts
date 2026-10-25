@@ -8,6 +8,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import { spawnSync } from 'node:child_process'
+import fs from 'node:fs'
 import crypto from 'node:crypto'
 import { loadWalk } from '../duration/scenario.js'
 import {
@@ -325,9 +326,12 @@ describe('peer probe (read-only)', () => {
         const r = spawnSync('bash', ['-c', s], { encoding: 'utf8' })
         expect(r.status).toBe(0)
         const p = parsePeerProbe(r.stdout)
-        expect(p.helper).toBe('absent')
-        expect(p.authorizedKeys.state).toBe('missing')
-        expect(p.knownHosts.state).toBe('missing')
+        // The probe reports THIS machine: on the box nothing is installed; on a pool Pi
+        // (on-Pi triage idea04 2026-10-25) the helper and peer files are there. Check the real state.
+        const here = (f: string) => fs.existsSync(f) || isLink(f)
+        expect(p.helper).toBe(here('/usr/local/sbin/idea-app-data') ? 'present' : 'absent')
+        expect(p.authorizedKeys.state === 'missing').toBe(!here(PEER_AUTHORIZED_KEYS))
+        expect(p.knownHosts.state === 'missing').toBe(!here(PEER_KNOWN_HOSTS))
     })
 
     it('parses helper version, file lines (comments dropped by the remote awk) and unreadable/missing files', () => {
@@ -343,6 +347,8 @@ describe('peer probe (read-only)', () => {
         expect(() => parsePeerProbe('nonsense')).toThrow(/unparseable/)
     })
 })
+
+const isLink = (f: string): boolean => { try { return fs.lstatSync(f).isSymbolicLink() } catch { return false } }
 
 /** RealFleetOps with a canned ssh per host (no network). */
 class CannedFleet extends RealFleetOps {

@@ -67,6 +67,17 @@ const until = async (cond: () => boolean, timeoutMs = 15_000, what = 'condition'
 const tmp = (p: string) => fs.mkdtempSync(path.join(os.tmpdir(), `idea-storescope-${p}-`))
 /** NodeFS storage path of a doc (as createServerStore checks it). */
 const onDisk = (dir: string, id: string) => fs.existsSync(path.join(dir, id.slice(0, 2), id.slice(2)))
+/**
+ * Does `dir` hold any of the doc's DATA (snapshot or incremental chunks)? Leak checks use this,
+ * not onDisk: a repo that itself asks for an id (and gets "unavailable") may write a tiny
+ * sync-state/<storageId> marker under that id — its own bookkeeping, no foreign content. On a
+ * loaded Pi that marker landed before the check (on-Pi triage idea04 2026-10-25; reproduced on
+ * the box under CPU starvation, the only file was a 2-byte sync-state).
+ */
+const docDataOnDisk = (dir: string, id: string) => {
+    const base = path.join(dir, id.slice(0, 2), id.slice(2))
+    return ['snapshot', 'incremental'].some(k => { try { return fs.readdirSync(path.join(base, k)).length > 0 } catch { return false } })
+}
 
 /** A store doc (Store shape) as a saved binary. */
 const storeBinary = (label: string): Uint8Array =>
@@ -127,8 +138,8 @@ const expectIsolated = (x: TestEngine, y: TestEngine) => {
     expect(isEnginePeerOf(y, x), `${y.name} must not be peered with ${x.name}`).toBe(false)
     expect(hasDoc(x, y.storeId), `${x.name} must not hold ${y.name}'s store doc`).toBe(false)
     expect(hasDoc(y, x.storeId), `${y.name} must not hold ${x.name}'s store doc`).toBe(false)
-    expect(onDisk(x.dir, y.storeId)).toBe(false)
-    expect(onDisk(y.dir, x.storeId)).toBe(false)
+    expect(docDataOnDisk(x.dir, y.storeId)).toBe(false)
+    expect(docDataOnDisk(y.dir, x.storeId)).toBe(false)
 }
 
 /** An ephemeral client (Console-like: storage-less, random peerId). */
@@ -405,7 +416,7 @@ describe('store-scoped peering between real Engine repos', () => {
         expect(await findWithTimeout(con.repo, Y)).toBe('unavailable')
         expect(await findWithTimeout(con.repo, Y2)).toBe('unavailable')     // dormant copy on disk
         expect(con.seen.has(Y) || con.seen.has(Y2)).toBe(false)
-        expect(onDisk(c.dir, Y)).toBe(false)
+        expect(docDataOnDisk(c.dir, Y)).toBe(false)
         // a's copies are untouched (not deleted, not changed)
         expect(A.getHeads((await a.repo.find<any>(Y)).doc())).toEqual(yHeads)
         await a.repo.flush()
@@ -444,7 +455,7 @@ describe('store-scoped peering between real Engine repos', () => {
         } finally { cap.restore() }
         expect(a.store.doc().oldEdit).toBeUndefined()          // its edits to our store did not get in
         expect(hasDoc(a, O)).toBe(false)
-        expect(onDisk(a.dir, O)).toBe(false)
+        expect(docDataOnDisk(a.dir, O)).toBe(false)
         expect(peersOf(a).some(p => !p.startsWith('idea-engine/'))).toBe(false)
         expect(cap.lines.some(l => l.includes('REFUSED peer') && l.includes('no store id') && l.includes(`ours ${storeTag(X)}`))).toBe(true)
         // the old Engine redials every 500 ms here: the refusal is logged once, not per attempt
