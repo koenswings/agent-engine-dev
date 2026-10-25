@@ -285,8 +285,13 @@ describe('capabilities and capabilitiesBootedAt (idea#128)', () => {
     it('a new engine record gets capabilities [diskIdArgs, filesDisk] stamped with its lastBooted', async () => {
         const h = await newStore()
         const e = h.doc()!.engineDB[LOCAL]
+<<<<<<< HEAD
         expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages'])   // filesDisk: idea#131; filesMount: idea#133; instanceIdArgs: idea#168
         expect(e.capabilities).toEqual(expectedCapabilities())
+=======
+        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker'])   // filesDisk: idea#131; filesMount: idea#133; instanceIdArgs: idea#168
+        expect(e.capabilities).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker'])
+>>>>>>> origin/main
         expect(e.capabilitiesBootedAt).toBe(e.lastBooted)
     })
     it('every startup rewrites the whole list (stale/extra entries gone) and re-stamps it with the new lastBooted', async () => {
@@ -300,7 +305,11 @@ describe('capabilities and capabilitiesBootedAt (idea#128)', () => {
         await new Promise(r => setTimeout(r, 5))
         await createOrUpdateEngine(h, LOCAL)
         const e = h.doc()!.engineDB[LOCAL]
+<<<<<<< HEAD
         expect(e.capabilities).toEqual(expectedCapabilities())
+=======
+        expect(e.capabilities).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker'])
+>>>>>>> origin/main
         expect(e.lastBooted).toBeGreaterThan(5)
         expect(e.capabilitiesBootedAt).toBe(e.lastBooted)
     })

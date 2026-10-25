@@ -27,6 +27,7 @@ import { DiskArgResult, lookupDiskArg, resolveDiskArg } from './DiskArg.js';
 import { createFilesDisk } from './CreateFilesDisk.js';
 import { summariseDisk, attachTraceResult } from './SummariseDisk.js';
 import { eraseDisk } from './EraseDisk.js';
+import { forgetDisk } from './ForgetDisk.js';
 import { flashCard, cancelFlash, initialiseDisk } from './FlashCard.js';
 import { testContext } from "../../test/testContext.js";
 
@@ -393,6 +394,14 @@ const moveAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName
 
 export type EjectTarget = DiskArgResult
 
+/** forgetDisk <diskId> (idea#279): remove an undocked, stale disk record. Refusals throw. */
+const forgetDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskId: string) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    if (!diskId) throw new Error("Usage: forgetDisk <diskId>")
+    const removed = forgetDisk(storeHandle, diskId)
+    print(chalk.green(`Forgot disk record ${removed}`))
+}
+
 /** The ejectDisk lookup (idea#152), now the shared disk-argument lookup (idea#128). */
 export const resolveEjectTarget = (store: Store, arg: string, engineId: EngineID | undefined): EjectTarget =>
     lookupDiskArg(store, engineId, arg)
@@ -469,6 +478,7 @@ export const commands: CommandDefinition[] = [
     { name: "copyApp", execute: copyAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
     { name: "moveApp", execute: moveAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
     { name: "ejectDisk", execute: ejectDiskWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
+    { name: "forgetDisk", execute: forgetDiskWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
     // backupApp / restoreApp (idea#168): the instance is an id or unique name, the disk
     // an id or unique docked name (resolveInstanceArg / resolveDiskArg). The trace arg
     // keys stay 'instanceName' / 'backupDiskId' (Console trace filters read them).

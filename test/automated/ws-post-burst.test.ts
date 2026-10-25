@@ -62,7 +62,7 @@ const inProcessClient = async (url: string, docId: DocumentId, storageDir?: stri
     const repo = new Repo({ network: [adapter], storage: storageDir ? new NodeFSStorageAdapter(storageDir) : undefined, peerId: (peerId ?? `postburst-${Math.random().toString(36).slice(2)}`) as PeerId })
     const handle = await repo.find(docId)
     await handle.whenReady()
-    return { seen, close: async () => { try { await repo.shutdown() } catch { /* already disconnected */ } } }
+    return { seen, repo, close: async () => { try { await repo.shutdown() } catch { /* already disconnected */ } } }
 }
 
 describe('Automerge WS server after a burst of short-lived clients (r34 POST-BURST-CPU)', () => {
@@ -103,9 +103,19 @@ describe('Automerge WS server after a burst of short-lived clients (r34 POST-BUR
         const c = await inProcessClient(url, mainId, dir, enginePeerId(mainId, 'ENGINE_postburst-peer'))
         const until = Date.now() + 10_000
         while (!extraIds.every(id => c.seen.has(id)) && Date.now() < until) await new Promise(r => setTimeout(r, 100))
-        await c.close()
         expect(extraIds.every(id => c.seen.has(id))).toBe(true)
-    }, 60_000)
+        // The server announced the extra docs and this peer says it "has" them, so automerge-repo
+        // (2.3.1 CollectionSynchronizer → `void docSynchronizer.beginSync()`, DocSynchronizer.js:176)
+        // awaits each handle's whenReady() with nobody catching it. Closing before they are ready
+        // left two 60 s withTimeout rejections unhandled (PR #248 re-run on idea04, 2026-10-25).
+        // So await them here, which settles those pending waits. A doc that never gets ready is a
+        // real failure: find() rejects and the test fails.
+        try {
+            for (const id of extraIds) expect((await c.repo.find(id)).isReady(), `announced doc ${id} becomes ready`).toBe(true)
+        } finally {
+            await c.close()
+        }
+    }, 60_000 * PI_TIMING_FACTOR)
 
     it(`after ${BURST} clients connect, sync and leave at once, a new client is ready promptly`, async () => {
         const input = (index: number): WsSyncClientInput => ({ url, docId: mainId, index, timeoutMs: 60_000, retryIntervalMs: 2_000 })

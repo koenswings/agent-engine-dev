@@ -50,6 +50,7 @@ import {
     TEST_CONTAINER_LABEL_KEY,
     TEST_CONTAINER_LABEL_VALUE,
 } from '../harness/diskSim.js'
+import { removeTestDir } from '../harness/removeTestDir.js'
 
 const IMAGE = 'traefik/whoami'
 
@@ -203,8 +204,8 @@ describe('startInstance History entry holds no .env values (idea#111, real conta
         for (const c of cases) {
             await cleanupContainers(c.instanceId)
             await cleanupNetworks(c.instanceId)
-            await cleanupDisk(c.device).catch(() => {})
-            if (c.fixtureDir) await fs.remove(c.fixtureDir).catch(() => {})
+            await removeTestDir(diskPath(c.device))
+            await removeTestDir(c.fixtureDir)
         }
     }, 60_000)
 
@@ -228,8 +229,17 @@ describe('startInstance History entry holds no .env values (idea#111, real conta
             // Not secrets: the Engine itself writes port, hostname and ip (writeEngineHostEnv); they
             // are in the store and shown in the Console. On a Pi named idea04 the hostname is in
             // every log line (on-Pi triage idea04 2026-10-25), so they are left out of the check.
+            // The re-run on idea04 (PR #248, 2026-10-25) still found 'idea04' among the checked values,
+            // so the Engine's own host identity is also left out BY VALUE: whatever key it ends up
+            // under, the Engine hostname/ip are public. The fixture secrets are always checked.
             const ENGINE_PUBLIC_KEYS = new Set(['port', 'hostname', 'ip'])
-            const values = [...Object.entries(env).filter(([k]) => !ENGINE_PUBLIC_KEYS.has(k)).map(([, v]) => v), ...c.secrets].filter(v => v)
+            const enginePublicValues = new Set([os.hostname(), env.hostname, env.ip].filter(Boolean))
+            const checked: Array<[string, string]> = [
+                ...Object.entries(env).filter(([k, v]) => !ENGINE_PUBLIC_KEYS.has(k) && !enginePublicValues.has(v)),
+                ...c.secrets.map((v, i): [string, string] => [`fixture secret #${i}`, v]),
+            ].filter(([, v]) => v)
+            for (const v of c.secrets) expect(enginePublicValues.has(v), 'a fixture secret is never exempt').to.be.false
+            const values = checked.map(([, v]) => v)
             expect(values.length).to.be.greaterThan(0)
 
             const entry = logHandle.doc()!.traces[t.traceId]
@@ -238,9 +248,9 @@ describe('startInstance History entry holds no .env values (idea#111, real conta
             expect(messages.some(m => /\bpass\b/.test(m)), 'the variable name is in the entry').to.be.true
             const entryText = JSON.stringify(entry)
             const allText = JSON.stringify(logHandle.doc())
-            for (const v of values) {
-                expect(entryText, 'startInstance History entry must not contain a .env value').to.not.include(v)
-                expect(allText, 'no command log entry may contain a .env value').to.not.include(v)
+            for (const [k, v] of checked) {
+                expect(entryText, `startInstance History entry must not contain the .env value of ${k}`).to.not.include(v)
+                expect(allText, `no command log entry may contain the .env value of ${k}`).to.not.include(v)
             }
         })
     }

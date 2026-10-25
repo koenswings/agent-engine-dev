@@ -47,7 +47,17 @@ TEST_TMP=$(mktemp -d -t idea-test-XXXXXX) || { echo "mktemp failed" >&2; exit 1;
 export IDEA_WATCH_DIR="$TEST_TMP/watch"
 export IDEA_DISKS_ROOT="$TEST_TMP/disks"
 mkdir -p "$IDEA_WATCH_DIR" "$IDEA_DISKS_ROOT"
-cleanup() { rm -rf "$TEST_TMP" 2>/dev/null || true; }
+# Docked test disks can hold root-owned files (containers, the app-data helper); a plain rm
+# then left /tmp/idea-test-* behind on pool Pis (PR #248 re-run, 2026-10-25). Retry with
+# non-interactive sudo, only for this run's own mktemp dir, and report what still remains.
+cleanup() {
+    rm -rf "$TEST_TMP" 2>/dev/null
+    case "$TEST_TMP" in
+        /tmp/idea-test-??????) [ -e "$TEST_TMP" ] && sudo -n true 2>/dev/null && sudo -n rm -rf -- "$TEST_TMP" 2>/dev/null ;;
+    esac
+    [ -e "$TEST_TMP" ] && echo "test-run.sh: LEFTOVER test dir (could not remove): $TEST_TMP" >&2
+    true
+}
 trap cleanup EXIT
 
 if [ "$TEST_MODE" = "true" ]; then
