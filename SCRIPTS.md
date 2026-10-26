@@ -6,9 +6,9 @@ This document provides a reference for the main provisioning and utility scripts
 
 ### `install.sh`
 
--   **Purpose:** A bootstrap script for setting up a new Engine device from scratch. This is the easiest way to perform a fresh installation on a new Raspberry Pi.
--   **Usage:** `curl -sSL <URL_to_install.sh> | sudo bash`
--   **Details:** This script installs the necessary base system dependencies (like Node.js, `zx`, `git`) and then runs the `./build-engine` wrapper (`script/build-engine.ts`) in local mode to complete the provisioning.
+-   **Purpose:** Thin wrapper around `build-engine` (idea#322: one install path).
+-   **Usage:** as pi, in a checkout of an `engine-vYYYY.MM.DD[-N]` tag: `bash script/install.sh [build-engine options]`
+-   **Details:** Runs `pnpm install --frozen-lockfile` if build-engine's own dependencies are missing, then `exec ./build-engine "$@"` (local mode). It installs nothing else; all provisioning is in build-engine. `script/setup-dev.sh` calls it.
 
 ---
 
@@ -95,3 +95,10 @@ This document provides a reference for the main provisioning and utility scripts
 -   **Purpose:** Bundles the project source code into a single Markdown file (`docs/source-bundle.md`). This is useful for providing context to LLMs like NotebookLM or Gemini.
 -   **Usage:** `pnpm bundle-context`
 -   **Details:** Ignores `node_modules` and `dist`.
+
+---
+
+### `script/archive-debs.py` and `script/release-archive.sh` (idea#322)
+
+-   **archive-debs.py:** `--out DIR [--packages packages.tsv] [--rpi-current NAMES] [--snapshot ID]` downloads and verifies `.deb`s (Debian from snapshot.debian.org, Raspberry Pi from archive.raspberrypi.com) plus the indices used; writes `index.tsv`, `missing.tsv`, `SHA256SUMS`. Called by `archive-engine-inputs.sh`.
+-   **release-archive.sh:** `<tag> <commit> <archive-dir> <release-dir>` packs an archive into <2 GB parts with `SHA256SUMS`, `RELEASE-NOTES.md` and `gh-commands.sh` (tag + release + upload). It never runs those commands; they need Koen's go.

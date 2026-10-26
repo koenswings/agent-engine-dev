@@ -1,13 +1,14 @@
 /**
  * deploymentRecord.ts — content manifests for Engine installs (idea#322).
  *
- * A deployment record is a folder of plain text files written by
- * script/capture-engine-record.sh (read-only capture) and committed under
- * records/engines/<hostname>/<label>/:
+ * A deployment record follows the idea repo's schema `idea-deployment-record/1`
+ * (koenswings/idea deployments/README.md, idea#323): a folder
+ * deployments/engines/<hostname>/<label>/ in the idea repo with a key=value
+ * record.txt plus sidecar lists, written by script/capture-engine-record.sh:
  *
- *   record.txt     key=value facts (commits, tag, tool versions, lockfile sha256)
- *   apt.txt        <package>\t<version>\t<arch>       (dpkg-query -W), sorted
- *   images.txt     <ref>\t<image id>\t<repo digests>  (docker image inspect), sorted
+ *   record.txt     key=value summary (schema keys + Engine keys)
+ *   packages.tsv   <package>\t<version>\t<arch>      (dpkg-query -W), sorted
+ *   images.tsv     <ref>\t<image id>\t<repo digests> (docker image inspect), sorted
  *   files.sha256   sha256sum lines of the Engine's tracked files, sorted by path
  *   dist.sha256    sha256sum lines of the compiled dist/, sorted by path
  *
@@ -15,11 +16,35 @@
  * equal; byte-identical images are not required (Koen, idea#322).
  */
 
-export const RECORD_FILES = ['record.txt', 'apt.txt', 'images.txt', 'files.sha256', 'dist.sha256'] as const
+export const RECORD_FILES = ['record.txt', 'packages.tsv', 'images.tsv', 'files.sha256', 'dist.sha256'] as const
 export type RecordFile = typeof RECORD_FILES[number]
 
 /** Keys of record.txt that change on every capture or every install and are never compared. */
-export const VOLATILE_KEYS = new Set(['capturedUtc', 'hostname', 'captureHost', 'uptime', 'recordLabel', 'notes'])
+export const VOLATILE_KEYS = new Set([
+    'capturedUtc', 'hostname', 'stickerName', 'cardId', 'captureHost', 'uptime', 'recordLabel', 'notes',
+    'batch', 'deployedAt', 'evidence', 'confidence', 'open', 'packageArchive', 'secrets',
+    'buildOptions', 'buildSourceFlags',
+])
+
+/** Keys idea deployments/README.md (idea#323) marks required, as they apply to an Engine. */
+export const REQUIRED_KEYS = [
+    'schema', 'batch', 'deviceType', 'arch', 'model', 'osRelease',
+    'imageCommit', 'imageBranch', 'imageTag', 'imageVersion',
+    'packageArchive', 'secrets', 'deployedAt', 'evidence', 'confidence', 'open',
+] as const
+export const SCHEMA = 'idea-deployment-record/1'
+/** For image-only keys (imageFile, imageSha256, …) that do not apply: an Engine is built on the device. */
+export const NOT_APPLICABLE = 'n/a'
+
+/** Missing required keys and identity check; empty = valid. */
+export const validateRecord = (recordTxt: string): string[] => {
+    const kv = parseKeyValues(recordTxt)
+    const errs = REQUIRED_KEYS.filter(k => !kv.has(k)).map(k => `missing ${k}`)
+    if (kv.has('schema') && kv.get('schema') !== SCHEMA) errs.push(`schema is ${kv.get('schema')}`)
+    if (!kv.get('hostname') && !kv.get('stickerName') && !kv.get('cardId')) errs.push('missing hostname/stickerName/cardId')
+    if (kv.has('deviceType') && kv.get('deviceType') !== 'engine') errs.push(`deviceType is ${kv.get('deviceType')}, expected engine`)
+    return errs
+}
 
 /** Value used in retro records for a field that could not be recovered. */
 export const UNKNOWN = 'UNKNOWN'
@@ -36,6 +61,17 @@ export const parseKeyValues = (text: string): Map<string, string> => {
         m.set(line.slice(0, i).trim(), line.slice(i + 1).trim())
     }
     return m
+}
+
+/** Replace `key=` lines in place, append the ones that are new. */
+export const setKeys = (recordTxt: string, lines: string[]): string => {
+    const out = recordTxt.replace(/\n*$/, '').split('\n')
+    for (const l of lines) {
+        const k = l.slice(0, l.indexOf('='))
+        const i = out.findIndex(o => o.startsWith(k + '='))
+        if (i >= 0) out[i] = l; else out.push(l)
+    }
+    return out.join('\n') + '\n'
 }
 
 /** Non-empty, non-comment lines, trimmed of trailing whitespace, sorted. */
@@ -99,8 +135,8 @@ export const compareRecords = (expected: Record, actual: Record, opts: CompareOp
         if (e === undefined) continue
         if (a === undefined) { out.push({ file: f, key: '<file>', expected: 'present', actual: undefined }); continue }
         if (f === 'record.txt') out.push(...diffMaps(f, parseKeyValues(e), parseKeyValues(a), k => ignoreKeys.has(k)))
-        else if (f === 'apt.txt') out.push(...diffMaps(f, parseApt(e), parseApt(a), () => false))
-        else if (f === 'images.txt') {
+        else if (f === 'packages.tsv') out.push(...diffMaps(f, parseApt(e), parseApt(a), () => false))
+        else if (f === 'images.tsv') {
             const toMap = (t: string) => new Map(normaliseLines(t).map(l => { const [ref, ...rest] = l.split('\t'); return [ref, rest.join('\t')] as [string, string] }))
             out.push(...diffMaps(f, toMap(e), toMap(a), () => false))
         } else out.push(...diffMaps(f, parseSha256(e), parseSha256(a), pathIgnored))
@@ -131,6 +167,10 @@ export const findSecrets = (rec: Record): string[] => {
     return hits
 }
 
+/** Engine release tags (idea#322, Steve 2026-10-26): engine-vYYYY.MM.DD[-N], created on main after Koen merges. */
+export const ENGINE_TAG_RE = /^engine-v\d{4}\.(0[1-9]|1[0-2])\.(0[1-9]|[12]\d|3[01])(-[1-9]\d*)?$/
+export const isEngineTag = (t: string) => ENGINE_TAG_RE.test(t)
+
 export type SourceState = { commit: string, tags: string[], dirty: boolean, onMain: boolean }
 export type SourceVerdict = { ok: boolean, tag: string | null, reasons: string[] }
 
@@ -142,9 +182,10 @@ export type SourceVerdict = { ok: boolean, tag: string | null, reasons: string[]
 export const judgeSource = (s: SourceState, allowUntagged = false): SourceVerdict => {
     const reasons: string[] = []
     if (!/^[0-9a-f]{40}$/.test(s.commit)) reasons.push(`not a full commit id: ${s.commit}`)
-    if (s.tags.length === 0) reasons.push('HEAD has no tag')
+    const tags = s.tags.filter(isEngineTag)
+    if (tags.length === 0) reasons.push(s.tags.length ? `HEAD has no engine-vYYYY.MM.DD[-N] tag (has: ${s.tags.join(', ')})` : 'HEAD has no tag')
     if (s.dirty) reasons.push('working tree has uncommitted changes')
     if (!s.onMain) reasons.push('HEAD is not on origin/main')
-    const tag = s.tags.length ? [...s.tags].sort()[0] : null
+    const tag = tags.length ? [...tags].sort().reverse()[0] : null
     return { ok: reasons.length === 0 || allowUntagged, tag, reasons }
 }

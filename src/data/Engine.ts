@@ -381,7 +381,9 @@ export const buildEngine = async (args: any) => {
     await clearKnownHost(machine);
   }
 
+  await pinAptSnapshot(exec);
   await updateSystem(exec);
+  await installRpiPins(exec, enginePath);
   if (upgrade) await upgradeSystem(exec);
 
   await setHostname(exec, hostname);
@@ -471,6 +473,54 @@ export const createDir = async (exec: any, dir: string, chmod: string | null = "
     console.error(e);
     process.exit(1);
   }
+}
+
+/**
+ * Debian side of apt pinned to a dated snapshot.debian.org (idea#322, Steve
+ * 2026-10-26). The Raspberry Pi archive has no snapshots: its packages are
+ * pinned by version in script/build_image_assets/apt-rpi-pins.tsv and, when the
+ * release's cached .debs are present in <enginePath>/deb-cache/, installed from them.
+ */
+export const DEBIAN_SNAPSHOT = '20261026T000000Z'
+export const DEBIAN_SNAPSHOT_SOURCES = (suite: string, snapshot = DEBIAN_SNAPSHOT) =>
+  `# Written by build-engine (idea#322): Debian pinned to snapshot ${snapshot}\n` +
+  `Types: deb\nURIs: https://snapshot.debian.org/archive/debian/${snapshot}/\nSuites: ${suite} ${suite}-updates\n` +
+  `Components: main contrib non-free non-free-firmware\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\nCheck-Valid-Until: no\n\n` +
+  `Types: deb\nURIs: https://snapshot.debian.org/archive/debian-security/${snapshot}/\nSuites: ${suite}-security\n` +
+  `Components: main contrib non-free non-free-firmware\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\nCheck-Valid-Until: no\n`
+
+/** Parse apt-rpi-pins.tsv: `<package>\t<version>` lines, # comments. */
+export const parseAptPins = (text: string): { pkg: string, version: string }[] =>
+  text.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'))
+    .map(l => l.split(/\s+/)).filter(p => p.length >= 2).map(([pkg, version]) => ({ pkg, version }))
+
+export const pinAptSnapshot = async (exec: any) => {
+  print(chalk.blue(`Pinning Debian apt sources to snapshot.debian.org ${DEBIAN_SNAPSHOT}...`));
+  try {
+    const suite = String((await exec`bash -c ${'. /etc/os-release && echo $VERSION_CODENAME'}`).stdout ?? '').trim()
+    if (!/^[a-z]+$/.test(suite)) throw new Error(`unexpected VERSION_CODENAME ${suite}`)
+    // Keep the original Debian sources as a disabled copy (quarantine, never delete).
+    await exec`bash -c ${'for f in /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list; do [ -s "$f" ] && grep -q "deb.debian.org" "$f" && sudo mv "$f" "$f.idea-disabled"; done; true'}`
+    await exec`echo ${DEBIAN_SNAPSHOT_SOURCES(suite)} | sudo tee /etc/apt/sources.list.d/idea-debian-snapshot.sources > /dev/null`
+  } catch (e) {
+    print(chalk.red('Error pinning apt to the Debian snapshot'));
+    console.error(e);
+    process.exit(1);
+  }
+  print(chalk.green('Debian apt pinned to snapshot'));
+}
+
+/** Install the pinned Raspberry Pi archive packages, from deb-cache/ when the release ships them. */
+export const installRpiPins = async (exec: any, enginePath: string) => {
+  const pinsFile = path.join(enginePath, 'script/build_image_assets/apt-rpi-pins.tsv')
+  const text = String((await exec`cat ${pinsFile}`).stdout ?? '')
+  const pins = parseAptPins(text)
+  if (pins.length === 0) { print(chalk.yellow('apt-rpi-pins.tsv lists no packages; Raspberry Pi archive packages are recorded only')); return }
+  print(chalk.blue(`Installing ${pins.length} pinned Raspberry Pi archive packages...`));
+  const cache = `${enginePath}/deb-cache`
+  const cached = String((await exec`bash -c ${`ls ${cache}/*.deb 2>/dev/null || true`}`).stdout ?? '').split('\n').filter(Boolean)
+  if (cached.length) await exec`sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades ${cached}`
+  else await exec`sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades ${pins.map(p => `${p.pkg}=${p.version}`)}`
 }
 
 export const updateSystem = async (exec: any) => {
@@ -923,6 +973,19 @@ export const installRaspAP = async (exec: any, enginePath: string) => {
   print(chalk.green('RaspAP installed'));
 }
 
+/** Pinned Tailscale static build (idea#322). Change both together; sha256 from pkgs.tailscale.com/<ver>.tgz.sha256, re-hashed locally. */
+export const TAILSCALE_VERSION = '1.104.2'
+export const TAILSCALE_ARM64_SHA256 = '5776aaa901b5ef1916e66be5bb54b9f481cd399c9c28db123a8cab620efa237b'
+
+/** bash run on the Pi: download the pinned arm64 tarball, check sha256, install the two binaries. */
+export const tailscaleDownloadScript = (version = TAILSCALE_VERSION, sha256 = TAILSCALE_ARM64_SHA256) => {
+  const f = `tailscale_${version}_arm64.tgz`
+  return `set -e; t=$(mktemp -d); curl -fsSL -o "$t/${f}" "https://pkgs.tailscale.com/stable/${f}"` +
+    ` && echo "${sha256}  $t/${f}" | sha256sum -c -` +
+    ` && sudo tar -xzf "$t/${f}" --strip-components=1 -C /usr/sbin "tailscale_${version}_arm64/tailscale" "tailscale_${version}_arm64/tailscaled"` +
+    ` && rm -rf "$t"`
+}
+
 /** Where installTailscale stores the auth key on the Pi (root-only, 0600). */
 export const TAILSCALE_AUTHKEY_PATH = '/etc/tailscale/debug-authkey'
 const TAILSCALE_AUTHKEY_DIR = '/etc/tailscale'
@@ -993,11 +1056,8 @@ export const installTailscale = async (exec: any, enginePath: string) => {
     // The service is NOT enabled after installation.
     // The script is one interpolated (quoted) argument, so $TSVER is expanded by
     // the bash on the Pi, not by TypeScript or the local shell.
-    const downloadScript =
-      'TSVER=$(curl -sL https://pkgs.tailscale.com/stable/ | grep -oP \'tailscale_\\K[\\d.]+(?=_arm64.tgz)\' | head -1)' +
-      ' && curl -sL "https://pkgs.tailscale.com/stable/tailscale_${TSVER}_arm64.tgz"' +
-      ' | sudo tar -xz --strip-components=1 -C /usr/sbin' +
-      ' "tailscale_${TSVER}_arm64/tailscale" "tailscale_${TSVER}_arm64/tailscaled"'
+    // Pinned version + sha256 (idea#322); the build fails on a mismatch.
+    const downloadScript = tailscaleDownloadScript()
     await exec`bash -c ${downloadScript}`
 
     // 2. Install systemd service (disabled — does not start on boot)

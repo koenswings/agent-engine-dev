@@ -26,7 +26,7 @@ with usage examples.
 
 ## SCRIPTS.md
 **Status:** Authoritative  ·  **Maintained by:** Axle
-Reference for provisioning and utility scripts (`install.sh` and others): purpose,
+Reference for provisioning and utility scripts (`build-engine`, the `install.sh` wrapper, archive/release scripts): purpose,
 parameters, and usage.
 → [docs/SCRIPTS.md](SCRIPTS.md)
 

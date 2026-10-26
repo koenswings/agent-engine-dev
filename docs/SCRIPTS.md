@@ -6,9 +6,9 @@ This document provides a reference for the main provisioning and utility scripts
 
 ### `install.sh`
 
--   **Purpose:** A bootstrap script for setting up a new Engine device from scratch. This is the easiest way to perform a fresh installation on a new Raspberry Pi.
--   **Usage:** `curl -sSL <URL_to_install.sh> | sudo bash`
--   **Details:** This script installs the necessary base system dependencies (like Node.js, `zx`, `git`) and then runs the `./build-engine` wrapper (`script/build-engine.ts`) in local mode to complete the provisioning.
+-   **Purpose:** Thin wrapper around `build-engine` (idea#322: one install path).
+-   **Usage:** as pi, in a checkout of an `engine-vYYYY.MM.DD[-N]` tag: `bash script/install.sh [build-engine options]`
+-   **Details:** Runs `pnpm install --frozen-lockfile` if build-engine's own dependencies are missing, then `exec ./build-engine "$@"` (local mode). It installs nothing else; all provisioning is in build-engine. `script/setup-dev.sh` calls it.
 
 ---
 
@@ -34,7 +34,7 @@ This document provides a reference for the main provisioning and utility scripts
     -   `--personalize`: Personalize Mode (see above).
 -   **Details:** A full build handles everything from setting the hostname and installing Docker to deploying the Engine software itself. It also installs the Engine's two sudoers files (`installEngineSudoers`, each validated with `visudo` first, mode 0440, owner root:root): `/etc/sudoers.d/10-engine` from `script/build_image_assets/10-engine.sudoers`, the exact commands the Engine, running as `pi`, may run as root; and `/etc/sudoers.d/11-engine-files` from `script/build_image_assets/11-engine-files.sudoers`, the files and folders it may write, remove or re-own as root under `/disks` (`/usr/bin/tee /disks/sd[a-z][12]/META.yaml`, idea#121; `/usr/bin/rmdir /disks/sd[a-z][12]`, idea#126; the disk root owner for `createFilesDisk`: `/usr/bin/chown -h / idea-erase-disk / mount -t ext4 pi\:pi /disks/sd[a-z][12]`, idea#131). It also installs `rsync` and `borgbackup` and the root helpers as root-owned 0755 copies: `/usr/local/sbin/idea-erase-disk` (idea#134) and `/usr/local/sbin/idea-app-data` (instance data as root, idea#168; `11-engine-files` has its line `pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-app-data`). An updated `11-engine-files` (or helper) must be installed before an Engine that needs it is deployed; the Engine refuses to start when `idea-app-data` is missing or the wrong version; `sudo -ll -U pi <exact command>` shows which sudoers file allows a command. pm2 and `pm2-logrotate` are installed into pi's pm2.
 
--   **Reproducibility (idea#322):** refuses to build unless the local checkout is a clean, tagged commit on `origin/main` (`--allow-untagged` overrides and is recorded). Installs the Engine with `pnpm install --frozen-lockfile` and pinned n/pnpm/pm2/pm2-logrotate/Node. After a full build it writes a deployment record to `records/engines/<hostname>/<label>/` (skip with `--no-record`); commit it. See [REPRODUCIBLE_BUILDS.md](REPRODUCIBLE_BUILDS.md).
+-   **Reproducibility (idea#322):** refuses to build unless the local checkout is a clean, tagged commit on `origin/main` (`--allow-untagged` overrides and is recorded). Installs the Engine with `pnpm install --frozen-lockfile` and pinned n/pnpm/pm2/pm2-logrotate/Node. After a full build it pins Debian apt to `DEBIAN_SNAPSHOT`, Raspberry Pi packages to `apt-rpi-pins.tsv` and Tailscale to version + sha256. Accepts only `engine-vYYYY.MM.DD[-N]` tags. After a full build it writes a deployment record to `<idea checkout>/deployments/engines/<hostname>/<label>/` (`--idea-repo`, default `$IDEA_REPO_DIR`; `--batch`; skip with `--no-record`); commit it in the idea repo. See [REPRODUCIBLE_BUILDS.md](REPRODUCIBLE_BUILDS.md).
 
 ---
 
@@ -165,3 +165,10 @@ On-Pi hardware test for `idea-write-home-engine` (#213, idea#203 §2). Run on a 
     -   A refused serial, the drive backing `/` or `/boot/firmware`, a non-USB disk, or a USB device that is or sits above the system drive's is refused outright.
     -   After an error, it always re-plugs the disk.
 -   **Result:** exit code 0 only if every check passes. The log goes to `test/testresults/hw-roundtrip-<UTC yyyy-mm-dd-hhmmss>.log`.
+
+---
+
+### `script/archive-debs.py` and `script/release-archive.sh` (idea#322)
+
+-   **archive-debs.py:** `--out DIR [--packages packages.tsv] [--rpi-current NAMES] [--snapshot ID]` downloads and verifies `.deb`s (Debian from snapshot.debian.org, Raspberry Pi from archive.raspberrypi.com) plus the indices used; writes `index.tsv`, `missing.tsv`, `SHA256SUMS`. Called by `archive-engine-inputs.sh`.
+-   **release-archive.sh:** `<tag> <commit> <archive-dir> <release-dir>` packs an archive into <2 GB parts with `SHA256SUMS`, `RELEASE-NOTES.md` and `gh-commands.sh` (tag + release + upload). It never runs those commands; they need Koen's go.

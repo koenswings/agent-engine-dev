@@ -1,52 +1,16 @@
 #!/bin/bash
 #
-# Bootstrap installer for the Engine software
+# install.sh — thin wrapper around build-engine (idea#322: one install path).
 #
-
-set -e # Exit immediately if a command exits with a non-zero status.
-
-echo "--- Starting Engine Bootstrap Installation ---"
-
-# 1. Install base system dependencies and Node.js tools
-echo "--> Installing git, curl, and Node.js environment..."
-apt-get update -y
-# rsync (with rrsync) and borgbackup are run as root by the app-data helper
-# /usr/local/sbin/idea-app-data (idea#168); step 5 (build-engine, installUdev)
-# installs the helper and its sudoers line. After every later Engine update run
-# ./install-root-helpers (idempotent) so the helper and borg stay current.
-apt-get install -y npm git curl rsync borgbackup
-npm install -g n pnpm
-echo "--> Setting Node.js version for script execution..."
-n 20
-
-# 2. Get the main application code
-echo "--> Cloning repository..."
-# Clean up previous attempts if they exist
-rm -rf /tmp/engine-install
-git clone https://github.com/koenswings/engine.git /tmp/engine-install
-cd /tmp/engine-install
-
-# 3. Install project-specific dependencies (including zx)
-echo "--> Installing project dependencies..."
-pnpm install --no-frozen-lockfile
-
-# 4. Configure /dev/engine ownership
-# /dev/engine is created by udev for disk sentinel detection. The Engine runs
-# as 'pi', so pi must own the directory — on every Pi, dev and production alike.
-echo "--> Configuring /dev/engine ownership ..."
-tee /etc/tmpfiles.d/idea-engine.conf > /dev/null << 'EOF'
-# /dev/engine is created by udev for the IDEA Engine disk detection mechanism.
-# The Engine runs as pi, so pi owns this directory on all Pis.
-d /dev/engine 0775 pi pi -
-EOF
-systemd-tmpfiles --create /etc/tmpfiles.d/idea-engine.conf
-
-# 5. Run the main provisioning script in Local Mode
-# (installs the sudoers files 10-engine/11-engine-files after visudo -cf, and the
-# root helpers /usr/local/sbin/idea-erase-disk and /usr/local/sbin/idea-app-data
-# as root-owned 0755 copies; the Engine refuses to start without idea-app-data)
-echo "--> Executing main build script in Local Mode..."
-# Execute the main build script using its new wrapper
-./build-engine
-
-echo "--- Bootstrap Installation Complete ---"
+# Run as pi from a checkout of a tagged Engine release (engine-vYYYY.MM.DD[-N]):
+#   git clone https://github.com/koenswings/agent-engine-dev && cd agent-engine-dev
+#   git checkout engine-vYYYY.MM.DD && bash script/install.sh [build-engine options]
+# It installs the committed lockfile's packages (needs node + pnpm on PATH) and
+# hands every argument to ./build-engine (local mode). Everything else — apt
+# snapshot, pinned Node/pnpm/pm2/Tailscale, udev, sudoers, root helpers, the
+# deployment record — is done by build-engine only.
+set -euo pipefail
+[ "$(id -u)" -eq 0 ] && { echo "run as pi, not root (build-engine uses sudo itself)" >&2; exit 1; }
+cd "$(dirname "$0")/.."
+[ -x node_modules/.bin/tsx ] || pnpm install --frozen-lockfile
+exec ./build-engine "$@"

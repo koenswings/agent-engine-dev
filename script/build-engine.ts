@@ -10,7 +10,7 @@ import { config } from '../src/data/Config.js';
 import { buildEngine, setHostname, syncEngine } from '../src/data/Engine.js';
 import { addMeta } from '../src/data/Meta.js';
 import { parseBoolFlag, parseModel, resolveGadget } from '../src/utils/cliFlags.js';
-import { judgeSource, SourceState } from '../src/install/deploymentRecord.js';
+import { judgeSource, setKeys, SourceState } from '../src/install/deploymentRecord.js';
 
 const defaults = config.defaults;
 
@@ -26,25 +26,30 @@ const readSourceState = async (repo: string): Promise<SourceState> => {
 }
 
 /**
- * Capture the deployment record on the target (read-only script) and keep a copy
- * in records/engines/<hostname>/<label>/ of the local checkout, with the build's
- * source verdict and non-secret build options appended (idea#322).
+ * Capture the deployment record on the target (read-only script) and copy it into
+ * the idea repo checkout at <ideaRepo>/deployments/engines/<hostname>/<label>/
+ * (schema idea-deployment-record/1, idea deployments/README.md), with the build's
+ * source verdict and non-secret build options appended (idea#322). Without an
+ * idea checkout it stays in /tmp on this machine and the path is printed.
  */
 const captureDeploymentRecord = async (exec: any, enginePath: string, repo: string, isLocalMode: boolean,
-                                       user: string, machine: string, hostname: string, extra: string[]) => {
+                                       user: string, machine: string, hostname: string, ideaRepo: string | undefined,
+                                       batch: string, extra: string[]) => {
     const label = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z')
     const remoteOut = `/tmp/idea-record-${hostname}-${label}`
-    await exec`bash ${enginePath}/script/capture-engine-record.sh --engine-dir ${enginePath} --out ${remoteOut} --label ${label}`
-    const dest = `${repo}/records/engines/${hostname}/${label}`
+    await exec`bash ${enginePath}/script/capture-engine-record.sh --engine-dir ${enginePath} --out ${remoteOut} --label ${label} --batch ${batch}`
+    const haveIdea = !!ideaRepo && fs.existsSync(`${ideaRepo}/deployments`)
+    if (!haveIdea) console.log(chalk.yellow(`No idea repo checkout with deployments/ (--idea-repo / IDEA_REPO_DIR); keeping the record in /tmp`))
+    const dest = haveIdea ? `${ideaRepo}/deployments/engines/${hostname}/${label}` : `/tmp/idea-deployment-${hostname}-${label}`
     await fs.mkdirp(dest)
     if (isLocalMode) await $`cp -r ${remoteOut}/. ${dest}/`
     else await $`rsync -a ${user}@${machine}:${remoteOut}/ ${dest}/`
-    await fs.appendFile(`${dest}/record.txt`, extra.map(l => l + '\n').join(''))
+    await fs.writeFile(`${dest}/record.txt`, setKeys(await fs.readFile(`${dest}/record.txt`, 'utf8'), extra))
     const check = await $({ cwd: repo, nothrow: true })`npx tsx script/engine-record.ts check-secrets ${dest}`
     if (check.exitCode !== 0) {
         console.log(chalk.red(`Deployment record ${dest} looks like it contains a secret; do not commit it:\n${check.stdout}`))
     } else {
-        console.log(chalk.green(`Deployment record written to ${dest} (commit it; see docs/REPRODUCIBLE_BUILDS.md)`))
+        console.log(chalk.green(`Deployment record written to ${dest} (commit it in the idea repo; see docs/REPRODUCIBLE_BUILDS.md)`))
     }
 }
 
@@ -88,6 +93,8 @@ const main = async () => {
         console.log(`  --prod                  whether to build in production mode (default: false)`)
         console.log(`  --dry-run               print the resolved build options and exit without changing anything`)
         console.log(`  --allow-untagged        build from a commit that is not a clean, tagged commit on main (flagged in the record, idea#322)`)
+        console.log(`  --idea-repo <path>      idea repo checkout for the record (default: $IDEA_REPO_DIR); written to deployments/engines/<hostname>/<label>/`)
+        console.log(`  --batch <name>          deployment batch for the record, e.g. zimbabwe-2026-10 (default: UNKNOWN)`)
         console.log(`  --no-record             skip the deployment record (default: write it, idea#322)`)
         console.log(`  --personalize           only set the hostname and add meta information without building the engine`)
         console.log(``)
@@ -119,7 +126,7 @@ const main = async () => {
     if (verdict.reasons.length) {
         console.log(chalk.yellow(`Source ${source.commit}: ${verdict.reasons.join('; ')}`));
         if (!verdict.ok && !argv['dry-run'] && !argv.personalize) {
-            console.log(chalk.red(`Refusing to build: tag a clean commit on main, or pass --allow-untagged (idea#322).`));
+            console.log(chalk.red(`Refusing to build: tag a clean commit on main with engine-vYYYY.MM.DD[-N], or pass --allow-untagged (idea#322).`));
             process.exit(1);
         }
     } else {
@@ -178,8 +185,10 @@ const main = async () => {
         }
         await buildEngine(buildArgs);
         if (parseBoolFlag(argv.record, true)) {
-            await captureDeploymentRecord(exec, enginePath, repoRoot, isLocalMode, user, machine, hostname, [
+            await captureDeploymentRecord(exec, enginePath, repoRoot, isLocalMode, user, machine, hostname,
+                argv['idea-repo'] || process.env.IDEA_REPO_DIR, String(argv.batch || 'UNKNOWN'), [
                 `buildSourceCommit=${source.commit}`,
+                `packageArchive=${verdict.tag ? `GitHub release ${verdict.tag} on koenswings/agent-engine-dev` : 'none (untagged build)'}`,
                 `buildSourceTag=${verdict.tag ?? ''}`,
                 `buildSourceFlags=${verdict.reasons.join('; ') || 'clean-tagged-main'}`,
                 `buildOptions=${JSON.stringify({ model: model ?? null, ...shown })}`,
