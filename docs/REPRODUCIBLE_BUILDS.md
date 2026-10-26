@@ -12,7 +12,12 @@ that day `engine-v2026.10.27-2`). They go on `main` only, and only **after Koen 
 never create tags or releases. `build-engine` reads the local checkout it syncs from
 (`git fetch origin main --tags`) and refuses to build unless HEAD carries such a tag, is clean
 and is on `origin/main` (`judgeSource()` / `ENGINE_TAG_RE` in `src/install/deploymentRecord.ts`;
-other tags do not count). `--allow-untagged` builds anyway; the reasons are printed and
+other tags do not count).
+
+**Field/archive tags** `field/<batch>/engine-<sha7>` (e.g. `field/zimbabwe-2026-10/engine-adfd9d3`)
+mark the commit a field batch was installed from and carry its input-archive release. They are
+recognised (`FIELD_TAG_RE`, `isFieldTag`) but are **not** build tags: the gate still wants
+`engine-v…`. Records name them as `sourceTag=`. `--allow-untagged` builds anyway; the reasons are printed and
 written into the record (`buildSourceFlags`). `--dry-run` and `--personalize` only warn.
 
 There is **one install path**: `build-engine`. `script/install.sh` (and `script/setup-dev.sh`)
@@ -30,9 +35,11 @@ only run `pnpm install --frozen-lockfile` for build-engine itself and then `exec
 | Debian apt | `DEBIAN_SNAPSHOT`: `pinAptSnapshot` writes `/etc/apt/sources.list.d/idea-debian-snapshot.sources` (snapshot.debian.org, `Check-Valid-Until: no`) and moves the stock Debian sources to `*.idea-disabled` (kept, not deleted) | `src/data/Engine.ts` |
 | Raspberry Pi archive | has no snapshots: exact versions in `script/build_image_assets/apt-rpi-pins.tsv` (`pkg<TAB>version`, filled from a captured reference Engine's `packages.tsv`); `installRpiPins` installs `<engine>/deb-cache/*.deb` if present, else `pkg=version`. The `.deb`s ship in the release archive | `src/data/Engine.ts` |
 | Tailscale | `TAILSCALE_VERSION` + `TAILSCALE_ARM64_SHA256`, checked with `sha256sum -c` before install | `src/data/Engine.ts` |
+| Docker Engine | `script/build_image_assets/docker-pins.tsv`: docker-ce / docker-ce-cli 5:29.9.2-1~debian.13~trixie, containerd.io 2.4.2-3~debian.13~trixie, docker-buildx-plugin 0.38.1-1~debian.13~trixie, docker-compose-plugin 5.6.1-1~debian.13~trixie (arm64) with sha256. download.docker.com has no snapshots, so `install-docker-pinned.sh` uses `<engine>/deb-cache/docker/*.deb` if present, else downloads that exact file; every .deb is sha256-checked before `apt-get install`, then held (`apt-mark hold`). No Docker apt repo is added | `installDocker` |
+| Dev image | `Dockerfile` `FROM ubuntu:focal-20240123@sha256:bb1c4168…` (resolved with `crane digest`) | `Dockerfile` |
 | Docker images | the Engine runs none in production; app images are recorded by digest | `images.tsv` |
 
-Still unpinned (listed in the PR): the `cli.github.com` apt repo (gh) and the Docker install.
+Deliberately unpinned: the `cli.github.com` apt repo (`installGh`, gh). It is a **dev-only** tool for agents and is not used by the running Engine or by any app; installs on field Engines do not depend on it. (The dev `Dockerfile` still installs its own Docker via get.docker.com `--version 25.0.3`; dev only.)
 Kits get the same approach once their versions are captured.
 
 ## 3. Deployment record (idea `deployments/` schema)
@@ -77,19 +84,31 @@ A rebuild check = build from the same tag on a spare Pi, capture, compare.
 `SHASUMS256.txt`), `npm pack` tarballs of n/pnpm/pm2/pm2-logrotate, the pinned Tailscale
 tarball (sha-checked), `debs/` from `script/archive-debs.py` (Debian `.deb`s from the
 snapshot, Raspberry Pi `.deb`s from the pins or `ARCHIVE_RPI_CURRENT`, the indices used,
-`index.tsv`, `missing.tsv`), Docker images for linux/arm64 and `SHA256SUMS` + `ARCHIVE.json`.
+`index.tsv`, `missing.tsv`), `debs/docker/` (the exact Docker Engine debs of `docker-pins.tsv`, sha-checked), Docker images for linux/arm64 and `SHA256SUMS` + `ARCHIVE.json`.
 `ARCHIVE_PACKAGES=<packages.tsv>` archives exact versions from a captured record.
 
 **Home (Steve, 2026-10-26):** GitHub release assets on the Engine release tag in
 agent-engine-dev, plus the copy on the box (`/workspace/idea322-archive/`).
 
-    script/release-archive.sh <tag> <commit> <archive-dir> <release-dir>
+    script/release-archive.sh <name> <commit> <archive-dir> <release-dir> [--tag T] [--prerelease]
 
-tars the archive, splits it into parts under 2 GB (`PART_SIZE`, default 1900m), writes
-`SHA256SUMS`, `RELEASE-NOTES.md` (restore steps) and `gh-commands.sh` with the exact
-`git tag` / `gh release create --verify-tag` / `gh release upload` commands. It runs none of
-them: **Koen gives the go** and the commands are run then. Restore:
-`cat <tag>.tar.part-* > <tag>.tar`, check `SHA256SUMS`, `tar -xf`.
+tars the archive, splits it into parts (`PART_SIZE`, default 200m), writes `SHA256SUMS`
+(parts only), `RELEASE-NOTES.md` (restore steps, joined-tar sha256) and `gh-commands.sh` with
+`gh release create <existing tag> --verify-tag` / `gh release upload` / `gh release view`. It
+creates no tag and runs none of them: **Koen gives the go** and the tag is made separately. Restore:
+`sha256sum -c SHA256SUMS`, `cat <name>.tar.part-* > <name>.tar`, check the joined sum from the notes, `tar -xf`. It also writes
+`record-keys.txt` with the record keys below. The parts are not byte-reproducible (tar mtimes),
+so publish exactly the prepared files whose sha256 the records carry.
+
+**Record ↔ archive link.** Engine records carry `archiveBoxPath` (box copy), `archiveSha256`
+(`<asset>:<sha256>` per part, comma-separated) and, once a GitHub release exists, the optional
+`archiveUrl`. build-engine writes `archiveUrl` only for tagged builds (`archiveKeys()`); fill the
+sha from `release-archive.sh`'s `record-keys.txt`. Parts are 200 MiB by default (`PART_SIZE`):
+1 GB uploads from the box failed with `unexpected EOF`.
+
+**Volatile keys** are the built-in `VOLATILE_KEYS` plus, for `engine-record.ts compare`, the
+shared list in idea `tools/repro/volatile.txt` (`--volatile-file F`, or `$IDEA_VOLATILE_FILE`, or
+`$IDEA_REPO_DIR/tools/repro/volatile.txt` when present; one key per line, `#` comments).
 
 ## 6. Zimbabwe kit Engines (retro records)
 
@@ -97,11 +116,13 @@ Retro records for sunny-robin, happy-zebra and kind-panda are in the idea repo a
 `deployments/engines/<host>/retro-2026-10-18/`: Engine `adfd9d3` (branch `deploy/kit-229-232`),
 Console `62bd2ba` (dist only, checkout `main@654224e`), the adfd9d3 lockfile and tracked-file
 hashes, and the manual MORANGO edit. Unknown fields say `UNKNOWN`; fill them in by running the
-capture script when each Engine is next online (no other changes to kit Engines). The
-adfd9d3 inputs are prepared as release `kit-adfd9d3-archive` (tag on `adfd9d3`; not
-published until Koen's go). The kits' Tailscale and apt versions are unknown: the archive
-holds Tailscale 1.104.2 (today's pin), the Debian snapshot indices of 2026-10-17 and today's
-Raspberry Pi chromium `.deb`s.
+capture script when each Engine is next online (no other changes to kit Engines). Source tag:
+`field/zimbabwe-2026-10/engine-adfd9d3`. The adfd9d3 inputs are published as the **prerelease**
+https://github.com/koenswings/agent-engine-dev/releases/tag/field/zimbabwe-2026-10/engine-adfd9d3
+(assets `kit-adfd9d3-archive.tar.part-00..05` + `SHA256SUMS`; box copy
+`/workspace/idea322-archive/release-kit-adfd9d3/`). The kits' Tailscale, Docker and apt versions
+are unknown: the archive holds today's pins (Tailscale 1.104.2, `docker-pins.tsv`), the Debian
+snapshot indices of 2026-10-17 and today's Raspberry Pi chromium `.deb`s.
 
 ## 7. MORANGO fix (app-kolibri#8)
 

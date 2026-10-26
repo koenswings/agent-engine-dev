@@ -34,6 +34,8 @@ This document provides a reference for the main provisioning and utility scripts
     -   `--personalize`: Personalize Mode (see above).
 -   **Details:** A full build handles everything from setting the hostname and installing Docker to deploying the Engine software itself.
 
+-   **Reproducibility (idea#322):** see [docs/REPRODUCIBLE_BUILDS.md](docs/REPRODUCIBLE_BUILDS.md): `engine-vYYYY.MM.DD[-N]` tag gate, Debian snapshot, RPi pins, Tailscale version + sha256, Docker Engine `docker-pins.tsv` (sha-checked debs via `install-docker-pinned.sh`, cache first); records to `<idea checkout>/deployments/engines/<host>/<label>/`.
+
 ---
 
 ### `build-app-instance.ts`
@@ -101,4 +103,4 @@ This document provides a reference for the main provisioning and utility scripts
 ### `script/archive-debs.py` and `script/release-archive.sh` (idea#322)
 
 -   **archive-debs.py:** `--out DIR [--packages packages.tsv] [--rpi-current NAMES] [--snapshot ID]` downloads and verifies `.deb`s (Debian from snapshot.debian.org, Raspberry Pi from archive.raspberrypi.com) plus the indices used; writes `index.tsv`, `missing.tsv`, `SHA256SUMS`. Called by `archive-engine-inputs.sh`.
--   **release-archive.sh:** `<tag> <commit> <archive-dir> <release-dir>` packs an archive into <2 GB parts with `SHA256SUMS`, `RELEASE-NOTES.md` and `gh-commands.sh` (tag + release + upload). It never runs those commands; they need Koen's go.
+-   **release-archive.sh:** `<name> <commit> <archive-dir> <release-dir> [--tag T] [--prerelease]` packs an archive into <2 GB parts with `SHA256SUMS`, `RELEASE-NOTES.md` `gh-commands.sh` (release + upload on an existing tag; creates no tag) and `record-keys.txt` (`archiveBoxPath`/`archiveSha256`). It never runs those commands; they need Koen's go.

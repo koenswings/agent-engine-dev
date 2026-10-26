@@ -1,0 +1,8 @@
+# Docker Engine pins (idea#322): download.docker.com has no snapshots, so these exact arm64 debs for
+# Debian 13 trixie are cached in <engine>/deb-cache/docker/ and in the release archive (debs/docker/),
+# checked against sha256 before install. Columns: package<TAB>version<TAB>pool path<TAB>sha256
+docker-ce	5:29.9.2-1~debian.13~trixie	dists/trixie/pool/stable/arm64/docker-ce_29.9.2-1~debian.13~trixie_arm64.deb	4007107183bd9f9e36fc2efb599fecb4202666d7bb6cf1a0bb23ce57bfb47f8f
+docker-ce-cli	5:29.9.2-1~debian.13~trixie	dists/trixie/pool/stable/arm64/docker-ce-cli_29.9.2-1~debian.13~trixie_arm64.deb	57d51835bd8fd02b3f83492aff3ffe1f4990e77effbd4fc81d64a3f1c59eccbf
+containerd.io	2.4.2-3~debian.13~trixie	dists/trixie/pool/stable/arm64/containerd.io_2.4.2-3~debian.13~trixie_arm64.deb	fca3f3a279c0d2675e4a97eae4f0b192632d52c962c8f142fc4a77d3455c9e06
+docker-buildx-plugin	0.38.1-1~debian.13~trixie	dists/trixie/pool/stable/arm64/docker-buildx-plugin_0.38.1-1~debian.13~trixie_arm64.deb	d58f8151519b4349cdc3b1f5df3d2d0220300fa7eed16097ca8f82198bde1b9e
+docker-compose-plugin	5.6.1-1~debian.13~trixie	dists/trixie/pool/stable/arm64/docker-compose-plugin_5.6.1-1~debian.13~trixie_arm64.deb	2afa72712ea87271ea59b93e893d4addc78356ff295cee07ccadd319ff3bd1fe

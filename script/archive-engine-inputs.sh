@@ -9,7 +9,7 @@
 #         <out>/node/node-v<ver>-linux-arm64.tar.xz (+ upstream SHASUMS256.txt),
 #         <out>/npm-global/*.tgz (n, pnpm, pm2, pm2-logrotate),
 #         <out>/docker/<name>.tar (linux/arm64, with RepoDigests), <out>/tailscale/ (pinned tarball),
-#         <out>/debs/ (script/archive-debs.py),
+#         <out>/debs/ (script/archive-debs.py), <out>/debs/docker/ (docker-pins.tsv),
 #         <out>/SHA256SUMS and <out>/ARCHIVE.json.
 set -euo pipefail
 commit=${1:?commit}; out=${2:?out dir}; shift 2
@@ -47,6 +47,21 @@ rpi_pins="$out/src/script/build_image_assets/apt-rpi-pins.tsv"
 [ -z "${ARCHIVE_PACKAGES:-}" ] && [ -f "$rpi_pins" ] && grep -qv '^#' "$rpi_pins" && deb_args+=(--packages "$rpi_pins")
 [ -n "${ARCHIVE_RPI_CURRENT:-}" ] && deb_args+=(--rpi-current $ARCHIVE_RPI_CURRENT)
 python3 "$repo/script/archive-debs.py" --out "$out/debs" --snapshot "$snap" "${deb_args[@]}"
+# 3d. Docker Engine debs (download.docker.com has no snapshots): exact files from docker-pins.tsv
+dpins="$out/src/script/build_image_assets/docker-pins.tsv"
+mkdir -p "$out/debs/docker"
+if [ ! -f "$dpins" ]; then
+  dpins="$repo/script/build_image_assets/docker-pins.tsv"
+  echo "$commit has no docker-pins.tsv (Docker was installed unpinned); these are the pins of $(git -C "$repo" rev-parse --short HEAD)" > "$out/debs/docker/NOTE.txt"
+fi
+cp "$dpins" "$out/debs/docker/docker-pins.tsv"
+grep -v '^#' "$dpins" | while IFS=$'\t' read -r pkg ver pool sha; do
+  [ -n "$pkg" ] || continue
+  f=$(basename "$pool")
+  curl -fsSL -o "$out/debs/docker/$f" "https://download.docker.com/linux/debian/$pool"
+  ( cd "$out/debs/docker" && echo "$sha  $f" | sha256sum -c - )
+done
+( cd "$out/debs/docker" && sha256sum *.deb > SHA256SUMS )
 # 4. Docker images, linux/arm64
 imgs=()
 for ref in "$@"; do

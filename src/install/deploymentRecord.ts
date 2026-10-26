@@ -23,6 +23,7 @@ export type RecordFile = typeof RECORD_FILES[number]
 export const VOLATILE_KEYS = new Set([
     'capturedUtc', 'hostname', 'stickerName', 'cardId', 'captureHost', 'uptime', 'recordLabel', 'notes',
     'batch', 'deployedAt', 'evidence', 'confidence', 'open', 'packageArchive', 'secrets',
+    'archiveUrl', 'archiveSha256', 'archiveStatus', 'archiveBoxPath', 'sourceTag',
     'buildOptions', 'buildSourceFlags',
 ])
 
@@ -188,4 +189,40 @@ export const judgeSource = (s: SourceState, allowUntagged = false): SourceVerdic
     if (!s.onMain) reasons.push('HEAD is not on origin/main')
     const tag = tags.length ? [...tags].sort().reverse()[0] : null
     return { ok: reasons.length === 0 || allowUntagged, tag, reasons }
+}
+
+/**
+ * Field/archive tags: field/<batch>/engine-<sha7> marks the commit a field batch was installed
+ * from (e.g. field/zimbabwe-2026-10/engine-adfd9d3). They are references, not build tags:
+ * judgeSource only accepts engine-vYYYY.MM.DD[-N].
+ */
+export const FIELD_TAG_RE = /^field\/[a-z0-9][a-z0-9-]*\/engine-[0-9a-f]{7}$/
+export const isFieldTag = (t: string): boolean => FIELD_TAG_RE.test(t)
+
+/** Volatile keys from a list file (idea tools/repro/volatile.txt): one key per line, # comments. */
+export const parseVolatileList = (text: string): string[] =>
+    text.split('\n').map(l => l.replace(/#.*/, '').trim()).filter(Boolean)
+
+/** Where the input archive for an Engine install lives (idea#322). */
+export const ARCHIVE_REPO = 'koenswings/agent-engine-dev'
+export const archiveReleaseUrl = (tag: string): string => `https://github.com/${ARCHIVE_REPO}/releases/tag/${tag}`
+
+export interface ArchiveRef {
+    /** Engine build tag; gives the optional archiveUrl of a future release. */
+    tag?: string | null
+    /** Box copy of the archive (required for kits: Koen keeps them on the box). */
+    boxPath?: string
+    parts?: { file: string, sha256: string }[]
+}
+
+/**
+ * Record lines linking an install to its input archive: archiveBoxPath (box copy), archiveSha256
+ * (`<file>:<sha256>`, comma-separated per part) and, only for tagged Engine builds, the optional
+ * archiveUrl of a GitHub release (none exists yet).
+ */
+export const archiveKeys = (ref: ArchiveRef): string[] => {
+    const out = [`archiveBoxPath=${ref.boxPath ?? UNKNOWN}`,
+        `archiveSha256=${ref.parts?.length ? ref.parts.map(p => `${p.file}:${p.sha256}`).join(',') : UNKNOWN}`]
+    if (ref.tag) out.push(`archiveUrl=${archiveReleaseUrl(ref.tag)}`)
+    return out
 }

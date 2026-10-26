@@ -11,7 +11,7 @@ import os from 'os'
 import { fs, $ } from 'zx'
 import {
     compareRecords, findSecrets, judgeSource, parseApt, parseKeyValues, parseSha256, formatDifferences, UNKNOWN,
-    validateRecord, setKeys, isEngineTag, REQUIRED_KEYS,
+    validateRecord, setKeys, isEngineTag, REQUIRED_KEYS, archiveKeys, isFieldTag, parseVolatileList,
 } from '../../src/install/deploymentRecord.js'
 import {
     N_VERSION, PM2_VERSION, PM2_LOGROTATE_VERSION, TAILSCALE_VERSION, TAILSCALE_ARM64_SHA256, tailscaleDownloadScript,
@@ -168,6 +168,50 @@ describe('capture-engine-record.sh (read-only)', () => {
     })
 })
 
+describe('Docker and dev image pins (idea#322)', () => {
+    const A = path.join(ROOT, 'script/build_image_assets')
+    it('pins the five Docker Engine debs for arm64 trixie by version and sha256', () => {
+        const rows = fs.readFileSync(path.join(A, 'docker-pins.tsv'), 'utf8').split('\n').filter(l => l && !l.startsWith('#')).map(l => l.split('\t'))
+        expect(rows.map(r => r[0])).toEqual(['docker-ce', 'docker-ce-cli', 'containerd.io', 'docker-buildx-plugin', 'docker-compose-plugin'])
+        for (const [, ver, pool, sha] of rows) {
+            expect(ver).toMatch(/~debian\.13~trixie$/)
+            expect(pool).toMatch(/^dists\/trixie\/pool\/stable\/arm64\/.+_arm64\.deb$/)
+            expect(sha).toMatch(/^[0-9a-f]{64}$/)
+        }
+    })
+    it('installs Docker only from sha-checked debs, cache first', () => {
+        const sh = fs.readFileSync(path.join(A, 'install-docker-pinned.sh'), 'utf8')
+        expect(sh).toContain('deb-cache/docker')
+        expect(sh.indexOf('sha256sum -c')).toBeLessThan(sh.indexOf('apt-get install'))
+        expect(sh).not.toContain('get.docker.com')
+        const engine = fs.readFileSync(path.join(ROOT, 'src/data/Engine.ts'), 'utf8')
+        expect(engine).toContain('install-docker-pinned.sh')
+        expect(engine).not.toMatch(/build_image_assets\/install-docker\.sh/)
+        expect(fs.readFileSync(path.join(ROOT, 'script/archive-engine-inputs.sh'), 'utf8')).toContain('debs/docker')
+    })
+    it('pins the dev Dockerfile base image by digest', () => {
+        const from = fs.readFileSync(path.join(ROOT, 'Dockerfile'), 'utf8').split('\n').filter(l => /^FROM \S+:\S+/.test(l) && !/^FROM base/.test(l))
+        expect(from.length).toBeGreaterThan(0)
+        for (const l of from) expect(l).toMatch(/^FROM [^ ]+:[^ @]+@sha256:[0-9a-f]{64}( |$)/)
+    })
+    it('archiveKeys links a record to its box archive and sha256, release URL only when tagged', () => {
+        expect(archiveKeys({ boxPath: '/workspace/a', parts: [{ file: 'a.part-00', sha256: 'f'.repeat(64) }] })).toEqual([
+            'archiveBoxPath=/workspace/a', `archiveSha256=a.part-00:${'f'.repeat(64)}`,
+        ])
+        expect(archiveKeys({ tag: 'engine-v2026.10.27' })[2]).toBe('archiveUrl=https://github.com/koenswings/agent-engine-dev/releases/tag/engine-v2026.10.27')
+        expect(archiveKeys({ tag: null }).some(l => l.startsWith('archiveUrl='))).toBe(false)
+    })
+    it('field/<batch>/engine-<sha7> tags are recognised but are not build tags', () => {
+        expect(isFieldTag('field/zimbabwe-2026-10/engine-adfd9d3')).toBe(true)
+        expect(isFieldTag('field/zimbabwe-2026-10/engine-adfd9d')).toBe(false)
+        expect(isFieldTag('engine-v2026.10.27')).toBe(false)
+        expect(isEngineTag('field/zimbabwe-2026-10/engine-adfd9d3')).toBe(false)
+    })
+    it('reads a shared volatile list (idea tools/repro/volatile.txt)', () => {
+        expect(parseVolatileList('# c\nuptime\n  capturedUtc # x\n\n')).toEqual(['uptime', 'capturedUtc'])
+    })
+})
+
 describe('idea deployments/ schema (idea#323)', () => {
     const full = REQUIRED_KEYS.map(k => `${k}=${k === 'schema' ? 'idea-deployment-record/1' : k === 'deviceType' ? 'engine' : 'x'}`).join('\n') + '\nhostname=h\n'
     it('accepts a complete Engine record and names what is missing or wrong', () => {
@@ -187,16 +231,21 @@ describe('release-archive.sh (prep only, never publishes)', () => {
         try {
             await fs.mkdirp(`${tmp}/arc/sub`)
             await fs.writeFile(`${tmp}/arc/sub/blob`, Buffer.alloc(300_000, 7))
-            await $({ env: { ...process.env, PART_SIZE: '100k' } })`bash ${path.join(ROOT, 'script/release-archive.sh')} t-1 ${C} ${tmp}/arc ${tmp}/rel`
+            await $({ env: { ...process.env, PART_SIZE: '100k' } })`bash ${path.join(ROOT, 'script/release-archive.sh')} t-1 ${C} ${tmp}/arc ${tmp}/rel --tag field/b-1/engine-abcdef0 --prerelease`
             const parts = (await fs.readdir(`${tmp}/rel`)).filter(f => f.startsWith('t-1.tar.part-'))
             expect(parts.length).toBeGreaterThan(2)
-            await $({ cwd: `${tmp}/rel` })`sha256sum -c --ignore-missing SHA256SUMS`
-            await $({ cwd: `${tmp}/rel` })`bash -c ${'cat t-1.tar.part-* > t-1.tar && grep " t-1.tar$" SHA256SUMS | sha256sum -c - && mkdir x && tar -xf t-1.tar -C x'}`
+            await $({ cwd: `${tmp}/rel` })`sha256sum -c SHA256SUMS`
+            await $({ cwd: `${tmp}/rel` })`bash -c ${'cat t-1.tar.part-* > t-1.tar && echo "$(grep -oP "has sha256 .\\K[0-9a-f]{64}" RELEASE-NOTES.md)  t-1.tar" | sha256sum -c - && mkdir x && tar -xf t-1.tar -C x'}`
             expect((await fs.readFile(`${tmp}/rel/x/arc/sub/blob`)).length).toBe(300_000)
             const gh = await fs.readFile(`${tmp}/rel/gh-commands.sh`, 'utf8')
-            expect(gh).toContain('NOT RUN')
-            expect(gh).toContain(`tag -a t-1 ${C}`)
-            expect(gh).toContain('gh release create t-1 --repo koenswings/agent-engine-dev --verify-tag')
+            expect(gh).toContain('creates no tag')
+            expect(gh).not.toMatch(/git .*tag -a|git push/)
+            expect(gh).toContain('gh release create field/b-1/engine-abcdef0 --repo koenswings/agent-engine-dev --verify-tag --prerelease')
+            expect(await fs.readFile(`${tmp}/rel/SHA256SUMS`, 'utf8')).not.toMatch(/ t-1\.tar$/m)
+            const keys = await fs.readFile(`${tmp}/rel/record-keys.txt`, 'utf8')
+            expect(keys).toContain(`archiveBoxPath=${tmp}/rel`)
+            expect(keys).toMatch(/archiveSha256=t-1\.tar\.part-00:[0-9a-f]{64},/)
+            expect(keys).not.toContain('archiveUrl')
         } finally { await fs.remove(tmp) }
     })
 })

@@ -10,7 +10,7 @@ import { config } from '../src/data/Config.js';
 import { buildEngine, setHostname, syncEngine } from '../src/data/Engine.js';
 import { addMeta } from '../src/data/Meta.js';
 import { parseBoolFlag, parseModel, resolveGadget } from '../src/utils/cliFlags.js';
-import { judgeSource, setKeys, SourceState } from '../src/install/deploymentRecord.js';
+import { archiveKeys, judgeSource, setKeys, SourceState } from '../src/install/deploymentRecord.js';
 
 const defaults = config.defaults;
 
@@ -189,6 +189,7 @@ const main = async () => {
                 argv['idea-repo'] || process.env.IDEA_REPO_DIR, String(argv.batch || 'UNKNOWN'), [
                 `buildSourceCommit=${source.commit}`,
                 `packageArchive=${verdict.tag ? `GitHub release ${verdict.tag} on koenswings/agent-engine-dev` : 'none (untagged build)'}`,
+                ...archiveKeys({ tag: verdict.tag }),
                 `buildSourceTag=${verdict.tag ?? ''}`,
                 `buildSourceFlags=${verdict.reasons.join('; ') || 'clean-tagged-main'}`,
                 `buildOptions=${JSON.stringify({ model: model ?? null, ...shown })}`,

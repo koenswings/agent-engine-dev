@@ -1321,12 +1321,10 @@ export const buildAppsInfrastructure = async (exec: any) => {
 
 const installDocker = async (exec, enginePath, user) => {
 
-  // Run the install-docker.sh script
-  print(chalk.blue('Installing Docker'))
+  // Exact Docker debs from docker-pins.tsv, sha256-checked, cache first (idea#322)
+  print(chalk.blue('Installing Docker (pinned)'))
   try {
-    // Make the script executable
-    await exec`sudo chmod +x ${enginePath}/script/build_image_assets/install-docker.sh`;
-    await exec`sudo ${enginePath}/script/build_image_assets/install-docker.sh`;
+    await exec`sudo bash ${enginePath}/script/build_image_assets/install-docker-pinned.sh ${enginePath}`;
   } catch (e) {
     print(chalk.red('Error installing Docker'));
     console.error(e);
