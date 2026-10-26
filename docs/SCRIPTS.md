@@ -40,7 +40,7 @@ This document provides a reference for the main provisioning and utility scripts
 
 ### `capture-engine-record.sh`, `engine-record.ts`, `archive-engine-inputs.sh` (idea#322)
 
--   `bash script/capture-engine-record.sh [--engine-dir D] [--console-dir D] [--out /tmp/D]`: read-only capture of an install (no sudo, no installs, no restarts; writes only its own `/tmp` folder).
+-   `bash script/capture-engine-record.sh [--engine-dir D] [--console-dir D] [--out /tmp/D]`: read-only capture of an install (no sudo, no installs, no restarts; writes only its own `/tmp` folder). Writes `record.txt`, `packages.tsv`, `images.tsv`, `files.sha256`, `dist.sha256` and `helpers.sha256` (every `/usr/local/sbin/idea-*`); finds `tailscale` in `/usr/sbin` or `/usr/bin` when it is not on PATH.
 -   `npx tsx script/engine-record.ts compare <expected> <actual>` (exit 1 on any content difference) and `check-secrets <dir>`.
 -   `script/archive-engine-inputs.sh <commit> <out> [image...]`: archive the source, pnpm store (linux/arm64), Node tarball, global npm tools and arm64 Docker images of one commit, with `SHA256SUMS`.
 

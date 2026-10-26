@@ -8,6 +8,7 @@
 import { describe, it, expect } from 'vitest'
 import path from 'path'
 import os from 'os'
+import crypto from 'crypto'
 import { fs, $ } from 'zx'
 import {
     compareRecords, findSecrets, judgeSource, parseApt, parseKeyValues, parseSha256, formatDifferences, UNKNOWN,
@@ -170,6 +171,32 @@ describe('capture-engine-record.sh (read-only)', () => {
             expect(findSecrets(a)).toEqual([])
             expect(validateRecord(a['record.txt'])).toEqual([])
         } finally { await fs.remove(tmp) }
+    })
+    it('finds tailscale off PATH and hashes every /usr/local/sbin/idea-* helper into helpers.sha256', async () => {
+        const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-test-rec'))
+        try {
+            const sbin = `${tmp}/sbin`, tsDir = `${tmp}/usr-sbin`
+            await fs.mkdirp(sbin); await fs.mkdirp(tsDir)
+            const names = ['idea-app-data', 'idea-avahi-lan-only', 'idea-dhcp-vendor-class', 'idea-erase-disk', 'idea-flash-card', 'idea-peer-gate', 'idea-new-helper']
+            for (const n of names) await fs.writeFile(`${sbin}/${n}`, `#!/bin/sh\necho ${n}\n`, { mode: 0o755 })
+            await fs.writeFile(`${sbin}/other-tool`, 'x\n')
+            await fs.writeFile(`${tsDir}/tailscale`, '#!/bin/sh\n[ "$1" = version ] && printf "1.104.1\\n  tailscale commit: abc\\n"\n', { mode: 0o755 })
+            // PATH without any tailscale: only the fallback can find it
+            const PATH = (process.env.PATH ?? '').split(':').filter(d => !fs.existsSync(`${d}/tailscale`)).join(':')
+            const r = await $({ env: { ...process.env, PATH, IDEA_CAPTURE_SBIN_DIR: sbin, IDEA_CAPTURE_TAILSCALE_FALLBACK: `${tmp}/nope/tailscale ${tsDir}/tailscale` } })`bash ${script} --engine-dir ${ROOT} --out ${tmp}/out --label t`
+            expect(r.exitCode).toBe(0)
+            expect(parseKeyValues(fs.readFileSync(`${tmp}/out/record.txt`, 'utf8')).get('tailscaleVersion')).toBe('1.104.1')
+            const helpers = fs.readFileSync(`${tmp}/out/helpers.sha256`, 'utf8')
+            const map = parseSha256(helpers)
+            expect(helpers.split('\n').filter(Boolean).map(l => l.slice(66))).toEqual(names.slice().sort().map(n => `${sbin}/${n}`))
+            for (const n of names) expect(map.get(`${sbin}/${n}`)).toBe(crypto.createHash('sha256').update(`#!/bin/sh\necho ${n}\n`).digest('hex'))
+            expect(fs.readFileSync(`${tmp}/out/record.txt`, 'utf8')).not.toMatch(/^helper\./m)
+        } finally { await fs.remove(tmp) }
+    })
+    it('compares helpers.sha256 when the expected record has it', () => {
+        const e = { 'record.txt': 'schema=idea-deployment-record/1\n', 'helpers.sha256': `${'a'.repeat(64)}  /usr/local/sbin/idea-app-data\n` }
+        expect(compareRecords(e, { ...e })).toEqual([])
+        expect(compareRecords(e, { ...e, 'helpers.sha256': `${'b'.repeat(64)}  /usr/local/sbin/idea-app-data\n` }).map(d => d.file)).toEqual(['helpers.sha256'])
     })
 })
 

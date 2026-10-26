@@ -28,6 +28,15 @@ done
 case "$(realpath -m "$out")" in /tmp/*) ;; *) echo "refusing: --out must be under /tmp" >&2; exit 2;; esac
 [ -e "$out" ] && { echo "refusing: $out exists" >&2; exit 2; }
 mkdir -p "$out"
+# Test hooks only: where the root helpers live and where tailscale is when it is not on PATH
+# (/usr/sbin is not on pi's PATH on Raspberry Pi OS).
+sbin_dir=${IDEA_CAPTURE_SBIN_DIR:-/usr/local/sbin}
+tailscale_fallback=${IDEA_CAPTURE_TAILSCALE_FALLBACK:-/usr/sbin/tailscale /usr/bin/tailscale}
+tailscale_bin() {
+  command -v tailscale 2>/dev/null && return
+  for t in $tailscale_fallback; do [ -x "$t" ] && { echo "$t"; return; }; done
+  echo tailscale
+}
 v() { "$@" 2>/dev/null | head -1 | tr -d '\r' || true; }
 g() { git -C "$1" "${@:2}" 2>/dev/null || true; }
 {
@@ -67,11 +76,10 @@ g() { git -C "$1" "${@:2}" 2>/dev/null || true; }
   echo "pnpmVersion=$(v pnpm --version)"
   echo "pm2Version=$(v pm2 --version)"
   echo "dockerVersion=$(v docker version --format '{{.Server.Version}}')"
-  echo "tailscaleVersion=$(v tailscale version)"
-  for h in idea-app-data idea-erase-disk idea-flash-card idea-write-card-timezone idea-write-home-engine idea-dhcp-vendor-class; do
-    [ -f "/usr/local/sbin/$h" ] && echo "helper.$h=$(sha256sum "/usr/local/sbin/$h" | cut -d' ' -f1)"
-  done
+  echo "tailscaleVersion=$(v "$(tailscale_bin)" version)"
 } > "$out/record.txt"
+# Root helpers: every /usr/local/sbin/idea-* (new helpers are picked up), sha256sum lines sorted by path.
+( for h in "$sbin_dir"/idea-*; do [ -f "$h" ] && sha256sum "$h"; done ) 2>/dev/null | sort -k2 > "$out/helpers.sha256"
 dpkg-query -W -f '${Package}\t${Version}\t${Architecture}\n' 2>/dev/null | sort > "$out/packages.tsv"
 : > "$out/images.tsv"
 if docker info >/dev/null 2>&1; then

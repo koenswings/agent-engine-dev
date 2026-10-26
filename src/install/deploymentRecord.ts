@@ -11,12 +11,13 @@
  *   images.tsv     <ref>\t<image id>\t<repo digests> (docker image inspect), sorted
  *   files.sha256   sha256sum lines of the Engine's tracked files, sorted by path
  *   dist.sha256    sha256sum lines of the compiled dist/, sorted by path
+ *   helpers.sha256 sha256sum lines of the root helpers /usr/local/sbin/idea-*, sorted by path
  *
  * Two records are "content-identical" when every non-volatile field and line is
  * equal; byte-identical images are not required (Koen, idea#322).
  */
 
-export const RECORD_FILES = ['record.txt', 'packages.tsv', 'images.tsv', 'files.sha256', 'dist.sha256'] as const
+export const RECORD_FILES = ['record.txt', 'packages.tsv', 'images.tsv', 'files.sha256', 'dist.sha256', 'helpers.sha256'] as const
 export type RecordFile = typeof RECORD_FILES[number]
 
 /**

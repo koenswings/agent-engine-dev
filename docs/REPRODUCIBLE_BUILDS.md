@@ -56,7 +56,10 @@ The record format, required keys, sidecars and archive keys (`packageArchive`,
 `buildOptions` and `packageArchive*` (`UNKNOWN` / `not published yet` until an archive exists;
 fill from `release-archive.sh`'s `record-keys.txt`). `--batch NAME` sets `batch=`; `--no-record`
 skips it. Commit the record in the idea repo. Engine-only keys: dirty/skip-worktree counts,
-Console commit and dist hash, lockfile sha256, tool versions, root helper sha256.
+Console commit and dist hash, lockfile sha256, tool versions (`tailscaleVersion` falls back to
+`/usr/sbin/tailscale` or `/usr/bin/tailscale` when `tailscale` is not on PATH, as for `pi` on
+Raspberry Pi OS). Sidecar `helpers.sha256`: `sha256sum` lines of every root helper
+`/usr/local/sbin/idea-*`, sorted by path (a new helper is picked up without a script change).
 
 **Capture** is strictly **read-only** (no sudo, no installs, no restarts, output only to a new
 folder under `/tmp`, never reads `/etc/tailscale`, `~/.ssh`, `.env` or store keys). It is the only
