@@ -80,6 +80,8 @@ export interface FlashCardOps {
     /** idea#208: the Engine's own time zone (timedatectl, as pi) */
     engineTimezone: () => Promise<string>
     zoneinfoDir: string
+    /** `sudo -n idea-flash-card --version` → its protocol number; null when unknown or the probe fails */
+    helperVersion: () => Promise<number | null>
 }
 
 let addDeviceImpl: ((p: string) => Promise<void>) | null = null
@@ -113,9 +115,21 @@ const defaultOps: FlashCardOps = {
     now: () => Date.now(),
     engineTimezone: () => readEngineTimezone(),
     zoneinfoDir: ZONEINFO_DIR,
+    helperVersion: async () => {
+        const r = await $`sudo -n ${FLASH_HELPER} --version`.nothrow().quiet()
+        return r.exitCode === 0 ? parseFlashHelperVersion(r.stdout) : null
+    },
 }
 let ops: FlashCardOps = defaultOps
 export const setFlashCardOpsForTests = (o: Partial<FlashCardOps> | null): void => { ops = o ? { ...defaultOps, ...o } : defaultOps }
+
+/** idea#208: --timezone needs idea-flash-card v3 or later */
+export const FLASH_HELPER_TIMEZONE_MIN = 3
+/** Parse "idea-flash-card <N>" (the helper's --version line); null for anything else. */
+export const parseFlashHelperVersion = (out: string): number | null => {
+    const m = /^idea-flash-card ([0-9]{1,6})$/.exec(String(out ?? '').trim())
+    return m ? Number(m[1]) : null
+}
 
 // ── Busy state (one flash / initialise per Engine) ───────────────────────────
 const running = new Map<string, { proc: ChildProcess | null; cancelled: boolean; kind: 'flashCard' | 'initialiseDisk' }>()
@@ -194,9 +208,16 @@ export const flashCard = async (
     }
 
     // idea#208: pass the Engine's own zone; an empty or invalid one is skipped (logged), never fatal
-    const tz = validateClientTimezone(await ops.engineTimezone().catch(() => ''), ops.zoneinfoDir)
-    const timezone = tz.ok ? tz.zone : undefined
-    if (!tz.ok) log(`flashCard: idea-timezone.txt skipped (${tz.reason}); the client stays on UTC`)
+    // Version gate: an older helper refuses the unknown --timezone with BAD_ARGS, so never pass it there.
+    const helperVersion = await ops.helperVersion().catch(() => null)
+    let timezone: string | undefined
+    if (helperVersion == null || helperVersion < FLASH_HELPER_TIMEZONE_MIN) {
+        print(`flashCard: idea-timezone.txt skipped: ${FLASH_HELPER} is too old (version ${helperVersion ?? 'unknown'}, needs >= ${FLASH_HELPER_TIMEZONE_MIN}); the client stays on UTC`)
+    } else {
+        const tz = validateClientTimezone(await ops.engineTimezone().catch(() => ''), ops.zoneinfoDir)
+        timezone = tz.ok ? tz.zone : undefined
+        if (!tz.ok) log(`flashCard: idea-timezone.txt skipped (${tz.reason}); the client stays on UTC`)
+    }
 
     const traceId = getActiveTrace()?.traceId
     const opId = createOperation(storeHandle, 'flashCard',

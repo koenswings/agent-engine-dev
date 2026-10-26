@@ -22,7 +22,7 @@ import {
 } from '../../src/data/ClientCards.js'
 import { scanClientImages, setClientImageOpsForTests, resolveImage, parseShaLine } from '../../src/data/ClientImages.js'
 import {
-    flashCard, cancelFlash, initialiseDisk, setFlashCardOpsForTests, clearFlashStateForTests, parseHelperError, CardError,
+    parseFlashHelperVersion, flashCard, cancelFlash, initialiseDisk, setFlashCardOpsForTests, clearFlashStateForTests, parseHelperError, CardError,
 } from '../../src/data/FlashCard.js'
 import { recoverInterruptedOperations, createOperation, updateOperation } from '../../src/data/Operations.js'
 import { setUnformattedOpsForTests, scanUnformattedDisks, clearGeneratedUnformattedIdsForTests, clearCardReaderMemoryForTests, candidateIdFor } from '../../src/data/UnformattedDisks.js'
@@ -246,7 +246,7 @@ describe('flashCard / cancelFlash (idea#201 §10)', () => {
         cardId = (await scanClientCards(undefined, String(LOCAL))).clientCards[0].candidateId
         spawned = []; logLines = []
         setFlashCardOpsForTests({
-            helperInstalled: () => true, engineTimezone: async () => '',
+            helperInstalled: () => true, engineTimezone: async () => '', helperVersion: async () => 3,
             spawnHelper: (a) => { spawned.push(a); proc = new FakeProc(); return proc as any },
             images: async () => ({ current: V2, previous: null, images: [IMG] }),
             appendFlashLog: async (l) => { logLines.push(l) },
@@ -281,10 +281,10 @@ describe('flashCard / cancelFlash (idea#201 §10)', () => {
         const zi = fs.mkdtempSync(path.join(os.tmpdir(), 'idea-test-zoneinfo-'))
         try {
             fs.mkdirSync(path.join(zi, 'Africa')); fs.writeFileSync(path.join(zi, 'Africa/Harare'), 'TZif2')
-            const flashWith = async (zone: string) => {
+            const flashWith = async (zone: string, ver: number | null = 3, probeThrows = false) => {
                 clearFlashStateForTests(); spawned.length = 0
                 setFlashCardOpsForTests({
-                    helperInstalled: () => true, engineTimezone: async () => zone, zoneinfoDir: zi,
+                    helperInstalled: () => true, engineTimezone: async () => zone, zoneinfoDir: zi, helperVersion: async () => { if (probeThrows) throw new Error('sudo failed'); return ver },
                     spawnHelper: (a) => { spawned.push(a); proc = new FakeProc(); return proc as any },
                     images: async () => ({ current: V2, previous: null, images: [IMG] }),
                     appendFlashLog: async (l) => { logLines.push(l) },
@@ -306,6 +306,19 @@ describe('flashCard / cancelFlash (idea#201 §10)', () => {
                 expect(r.tz, bad).toBeUndefined()
                 expect(r.log).toMatchObject({ result: 'ok', timezone: null, timezoneFile: 'skipped' })
             }
+            // version gate: v2, unknown, failed probe → no --timezone, flash still succeeds, skip logged
+            const logged: string[] = []
+            const orig = console.info; console.info = (...a: any[]) => { logged.push(a.join(' ')) }
+            try {
+                for (const [ver, thr] of [[2, false], [null, false], [3, true]] as const) {
+                    logged.length = 0
+                    const r = await flashWith('Africa/Harare', ver, thr)
+                    expect(r.tz, String(ver)).toBeUndefined()
+                    expect(r.log).toMatchObject({ result: 'ok', timezone: null, timezoneFile: 'skipped' })
+                    expect(logged.join('\n')).toMatch(/idea-timezone\.txt skipped: .*too old/)
+                }
+                expect((await flashWith('Africa/Harare', 4)).tz).toBe('Africa/Harare')   // v4+ still passes it
+            } finally { console.info = orig }
         } finally { fs.rmSync(zi, { recursive: true, force: true }) }
     })
 
@@ -454,6 +467,13 @@ describe('initialiseDisk (idea#201 §10, NOT_EXT4)', () => {
 })
 
 describe('capabilities + helper script (idea#201 §10)', () => {
+    it('parseFlashHelperVersion: "idea-flash-card N" only; anything else is unknown (null)', () => {
+        expect(parseFlashHelperVersion('idea-flash-card 3\n')).toBe(3)
+        expect(parseFlashHelperVersion('idea-flash-card 2')).toBe(2)
+        for (const bad of ['', 'idea-flash-card', 'idea-flash-card v3', 'other 3', 'idea-flash-card 3 extra', 'sudo: a password is required'])
+            expect(parseFlashHelperVersion(bad), bad).toBeNull()
+    })
+
     it('clientCards and clientImages always; flashCard only with the helper installed', () => {
         expect(ENGINE_CAPABILITIES).toContain('clientCards')
         expect(ENGINE_CAPABILITIES).toContain('clientImages')
@@ -504,7 +524,7 @@ describe('disk roles: USB disks get both roles, SD cards flash only (idea#303)',
         h = await newStore()
         spawned = []
         setFlashCardOpsForTests({
-            helperInstalled: () => true, engineTimezone: async () => '',
+            helperInstalled: () => true, engineTimezone: async () => '', helperVersion: async () => 3,
             spawnHelper: (a) => { spawned.push(a); return new FakeProc() as any },
             images: async () => ({ current: V2, previous: null, images: [IMG] }),
             appendFlashLog: async () => {},
@@ -624,7 +644,7 @@ describe('disk roles: USB disks get both roles, SD cards flash only (idea#303)',
         useDevices([SYS, anna])
         const looked: string[] = []
         setFlashCardOpsForTests({
-            helperInstalled: () => true, engineTimezone: async () => '',
+            helperInstalled: () => true, engineTimezone: async () => '', helperVersion: async () => 3,
             spawnHelper: (a) => { spawned.push(a); return new FakeProc() as any },
             images: async () => ({ current: V2, previous: null, images: [IMG] }),
             appendFlashLog: async () => {},
@@ -645,7 +665,7 @@ describe('disk roles: USB disks get both roles, SD cards flash only (idea#303)',
             children: [{ name: 'sdl1', type: 'part', fstype: 'ext4', label: 'IDEA Disk', size: 240 * GB }] }
         useDevices([SYS, app], [])
         setFlashCardOpsForTests({
-            helperInstalled: () => true, engineTimezone: async () => '',
+            helperInstalled: () => true, engineTimezone: async () => '', helperVersion: async () => 3,
             spawnHelper: (a) => { spawned.push(a); return new FakeProc() as any },
             images: async () => ({ current: V2, previous: null, images: [IMG] }),
             appendFlashLog: async () => {},
