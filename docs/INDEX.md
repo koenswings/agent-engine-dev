@@ -36,6 +36,12 @@ IDEA Pi test fleet: node inventory (idea01–idea04), hardware specs, provisioni
 procedure, SSH access, and fleet management commands.
 → [docs/PI_FLEET.md](PI_FLEET.md)
 
+## REPRODUCIBLE_BUILDS.md
+**Status:** Authoritative  ·  **Maintained by:** Axle
+Content-identical reproducible Engine installs (idea#322): tagged-source gate, pinned inputs,
+deployment records, comparison, input archives, kit retro records, MORANGO procedure.
+→ [docs/REPRODUCIBLE_BUILDS.md](REPRODUCIBLE_BUILDS.md)
+
 ## STORE_HISTORY_R86Q.md
 **Status:** Record (2026-10-13)  ·  **Maintained by:** Axle
 r86q diagnosis: why the shared store's history (heartbeats, metrics) made syncs slow, and the fixes (#192/#194, compaction).

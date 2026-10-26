@@ -10,8 +10,43 @@ import { config } from '../src/data/Config.js';
 import { buildEngine, setHostname, syncEngine } from '../src/data/Engine.js';
 import { addMeta } from '../src/data/Meta.js';
 import { parseBoolFlag, parseModel, resolveGadget } from '../src/utils/cliFlags.js';
+import { judgeSource, SourceState } from '../src/install/deploymentRecord.js';
 
 const defaults = config.defaults;
+
+/** Read the source state of the local checkout this build syncs from (idea#322). */
+const readSourceState = async (repo: string): Promise<SourceState> => {
+    const q = async (cmd: string[]) => (await $({ cwd: repo, nothrow: true })`git ${cmd}`).stdout.trim()
+    await $({ cwd: repo, nothrow: true })`git fetch -q origin main --tags`
+    const commit = await q(['rev-parse', 'HEAD'])
+    const tags = (await q(['tag', '--points-at', 'HEAD'])).split('\n').filter(Boolean)
+    const dirty = (await q(['status', '--porcelain', '--untracked-files=no'])) !== ''
+    const onMain = (await $({ cwd: repo, nothrow: true })`git merge-base --is-ancestor HEAD origin/main`).exitCode === 0
+    return { commit, tags, dirty, onMain }
+}
+
+/**
+ * Capture the deployment record on the target (read-only script) and keep a copy
+ * in records/engines/<hostname>/<label>/ of the local checkout, with the build's
+ * source verdict and non-secret build options appended (idea#322).
+ */
+const captureDeploymentRecord = async (exec: any, enginePath: string, repo: string, isLocalMode: boolean,
+                                       user: string, machine: string, hostname: string, extra: string[]) => {
+    const label = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z')
+    const remoteOut = `/tmp/idea-record-${hostname}-${label}`
+    await exec`bash ${enginePath}/script/capture-engine-record.sh --engine-dir ${enginePath} --out ${remoteOut} --label ${label}`
+    const dest = `${repo}/records/engines/${hostname}/${label}`
+    await fs.mkdirp(dest)
+    if (isLocalMode) await $`cp -r ${remoteOut}/. ${dest}/`
+    else await $`rsync -a ${user}@${machine}:${remoteOut}/ ${dest}/`
+    await fs.appendFile(`${dest}/record.txt`, extra.map(l => l + '\n').join(''))
+    const check = await $({ cwd: repo, nothrow: true })`npx tsx script/engine-record.ts check-secrets ${dest}`
+    if (check.exitCode !== 0) {
+        console.log(chalk.red(`Deployment record ${dest} looks like it contains a secret; do not commit it:\n${check.stdout}`))
+    } else {
+        console.log(chalk.green(`Deployment record written to ${dest} (commit it; see docs/REPRODUCIBLE_BUILDS.md)`))
+    }
+}
 
 
 
@@ -52,6 +87,8 @@ const main = async () => {
         console.log(`                          e.g. --no-argon --no-gadget (idea#146).`)
         console.log(`  --prod                  whether to build in production mode (default: false)`)
         console.log(`  --dry-run               print the resolved build options and exit without changing anything`)
+        console.log(`  --allow-untagged        build from a commit that is not a clean, tagged commit on main (flagged in the record, idea#322)`)
+        console.log(`  --no-record             skip the deployment record (default: write it, idea#322)`)
         console.log(`  --personalize           only set the hostname and add meta information without building the engine`)
         console.log(``)
         process.exit(0);
@@ -74,6 +111,20 @@ const main = async () => {
     }
 
     const model = parseModel(argv.model);
+
+    // Source gate (idea#322): only a clean, tagged commit on main, unless --allow-untagged.
+    const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+    const source = await readSourceState(repoRoot);
+    const verdict = judgeSource(source, parseBoolFlag(argv['allow-untagged'], false));
+    if (verdict.reasons.length) {
+        console.log(chalk.yellow(`Source ${source.commit}: ${verdict.reasons.join('; ')}`));
+        if (!verdict.ok && !argv['dry-run'] && !argv.personalize) {
+            console.log(chalk.red(`Refusing to build: tag a clean commit on main, or pass --allow-untagged (idea#322).`));
+            process.exit(1);
+        }
+    } else {
+        console.log(chalk.green(`Source ${source.commit} (tag ${verdict.tag})`));
+    }
 
     // Sticker name (idea#184): explicit --hostname, else the name persisted by an
     // earlier run, else a new two-word name not taken on the LAN or in the store.
@@ -126,6 +177,14 @@ const main = async () => {
             await syncEngine(user, machine);
         }
         await buildEngine(buildArgs);
+        if (parseBoolFlag(argv.record, true)) {
+            await captureDeploymentRecord(exec, enginePath, repoRoot, isLocalMode, user, machine, hostname, [
+                `buildSourceCommit=${source.commit}`,
+                `buildSourceTag=${verdict.tag ?? ''}`,
+                `buildSourceFlags=${verdict.reasons.join('; ') || 'clean-tagged-main'}`,
+                `buildOptions=${JSON.stringify({ model: model ?? null, ...shown })}`,
+            ]);
+        }
     }
     
     const sticker = stickerText(hostname, config.settings.httpPort ?? 80);

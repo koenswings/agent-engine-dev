@@ -34,6 +34,16 @@ This document provides a reference for the main provisioning and utility scripts
     -   `--personalize`: Personalize Mode (see above).
 -   **Details:** A full build handles everything from setting the hostname and installing Docker to deploying the Engine software itself. It also installs the Engine's two sudoers files (`installEngineSudoers`, each validated with `visudo` first, mode 0440, owner root:root): `/etc/sudoers.d/10-engine` from `script/build_image_assets/10-engine.sudoers`, the exact commands the Engine, running as `pi`, may run as root; and `/etc/sudoers.d/11-engine-files` from `script/build_image_assets/11-engine-files.sudoers`, the files and folders it may write, remove or re-own as root under `/disks` (`/usr/bin/tee /disks/sd[a-z][12]/META.yaml`, idea#121; `/usr/bin/rmdir /disks/sd[a-z][12]`, idea#126; the disk root owner for `createFilesDisk`: `/usr/bin/chown -h / idea-erase-disk / mount -t ext4 pi\:pi /disks/sd[a-z][12]`, idea#131). It also installs `rsync` and `borgbackup` and the root helpers as root-owned 0755 copies: `/usr/local/sbin/idea-erase-disk` (idea#134) and `/usr/local/sbin/idea-app-data` (instance data as root, idea#168; `11-engine-files` has its line `pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-app-data`). An updated `11-engine-files` (or helper) must be installed before an Engine that needs it is deployed; the Engine refuses to start when `idea-app-data` is missing or the wrong version; `sudo -ll -U pi <exact command>` shows which sudoers file allows a command. pm2 and `pm2-logrotate` are installed into pi's pm2.
 
+-   **Reproducibility (idea#322):** refuses to build unless the local checkout is a clean, tagged commit on `origin/main` (`--allow-untagged` overrides and is recorded). Installs the Engine with `pnpm install --frozen-lockfile` and pinned n/pnpm/pm2/pm2-logrotate/Node. After a full build it writes a deployment record to `records/engines/<hostname>/<label>/` (skip with `--no-record`); commit it. See [REPRODUCIBLE_BUILDS.md](REPRODUCIBLE_BUILDS.md).
+
+---
+
+### `capture-engine-record.sh`, `engine-record.ts`, `archive-engine-inputs.sh` (idea#322)
+
+-   `bash script/capture-engine-record.sh [--engine-dir D] [--console-dir D] [--out /tmp/D]`: read-only capture of an install (no sudo, no installs, no restarts; writes only its own `/tmp` folder).
+-   `npx tsx script/engine-record.ts compare <expected> <actual>` (exit 1 on any content difference) and `check-secrets <dir>`.
+-   `script/archive-engine-inputs.sh <commit> <out> [image...]`: archive the source, pnpm store (linux/arm64), Node tarball, global npm tools and arm64 Docker images of one commit, with `SHA256SUMS`.
+
 ---
 
 ### `build-app-instance.ts`

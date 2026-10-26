@@ -1,0 +1,30 @@
+# RETRO record (idea#322), written 2026-10-26 from git history and the idea repo's
+# fleet-state.json (@4e515d4). Not captured on the Engine. UNKNOWN = not recoverable
+# from the box; fill in from script/capture-engine-record.sh when the Engine is next online.
+schema=idea-deployment-record/1
+recordLabel=retro-2026-10-18
+hostname=sunny-robin
+stickerName=sunny-robin
+arch=aarch64
+kernel=UNKNOWN
+osRelease=Raspberry Pi OS trixie Lite + cloud-init (USB SSD, re-provisioned 2026-10-17 11:31-11:42 CEST)
+engineCommit=adfd9d354ffd83c5ecc0a9eea64a474eae08de8f
+engineBranch=deploy/kit-229-232
+engineTag=
+engineDirtyFiles=UNKNOWN
+engineSkipWorktree=UNKNOWN
+engineLocalOverride=~/.idea-local (store-identity files skip-worktree, per fleet-state)
+engineDeployedAt=2026-10-18 10:40:33 CEST
+enginePrevious=main@07456c3
+consoleCommit=62bd2ba03544fd7b2ef490a07de2b8780f81105b
+consoleCheckout=main@654224e (dist-only swap of agent-console-dev#162)
+consoleDistSha256=UNKNOWN
+lockfileSha256=37fd94bcc8c528652d898a8b2acd7eb02841fbd91b3c05ca247bfef6eba4b3c3
+nodeVersion=v22.20.0 (expected from NODE_VERSION at adfd9d3; not verified on the Engine)
+npmVersion=UNKNOWN
+pnpmVersion=10.33.0 (expected from PNPM_VERSION at adfd9d3; not verified)
+pm2Version=UNKNOWN (installed unpinned)
+dockerVersion=UNKNOWN
+tailscaleVersion=UNKNOWN (installed as latest stable tarball)
+appKolibriCommit=UNKNOWN
+manualEdit.morango=MORANGO_SYSTEM_ID=idea-${hostname}-${port} added by hand to /instances/<id>/compose.yaml of Kolibri and Kolibri Demo on 2026-10-17 (app-kolibri#8; procedure in docs/REPRODUCIBLE_BUILDS.md)

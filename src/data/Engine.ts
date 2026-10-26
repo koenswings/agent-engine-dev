@@ -1054,13 +1054,17 @@ export const installRSync = async (exec: any) => {
 export const PNPM_VERSION = '10.33.0'
 /** The Node.js version `n` installs for the Engine. */
 export const NODE_VERSION = '22.20.0'
+/** Pinned global npm tools (idea#322: no unpinned "latest" in a build). */
+export const N_VERSION = '11.0.0'
+export const PM2_VERSION = '7.1.1'
+export const PM2_LOGROTATE_VERSION = '3.0.0'
 
 export const installBaseNpm = async (exec: any) => {
   print(chalk.blue(`Installing base node ${NODE_VERSION}, n, npm and pnpm ${PNPM_VERSION} for script execution...`));
   try {
     await exec`sudo apt install npm -y`
     // Pinned pnpm, never latest (idea#146)
-    await exec`sudo npm install -g -y n pnpm@${PNPM_VERSION}`
+    await exec`sudo npm install -g -y n@${N_VERSION} pnpm@${PNPM_VERSION}`
     await exec`sudo n ${NODE_VERSION}`
   } catch (e) {
     print(chalk.red('Error installing base node, n, npm and pnpm...'));
@@ -1118,11 +1122,11 @@ export const configurePnpm = async (exec: any) => {
 export const installPm2 = async (exec: any, enginePath: string) => {
   print(chalk.blue('Installing pm2...'));
   try {
-    await exec`sudo npm install -g pm2`
+    await exec`sudo npm install -g pm2@${PM2_VERSION}`
     await exec`cd ${enginePath}`
     print(chalk.blue('Installing pm2-logrotate...'))
     // Install into pi's pm2 (no sudo), the same process list startEnginePM2 uses (idea#80).
-    await exec`cd ${enginePath} && pm2 install pm2-logrotate`
+    await exec`cd ${enginePath} && pm2 install pm2-logrotate@${PM2_LOGROTATE_VERSION}`
   } catch (e) {
     print(chalk.red('Error installing pm2'));
     console.error(e);
@@ -1133,7 +1137,8 @@ export const installPm2 = async (exec: any, enginePath: string) => {
 
 export const installEnginePM2 = async (exec: any, enginePath: string) => {
   print(chalk.blue('Installing the engine...'))
-  await exec`cd ${enginePath} && pnpm install_packages`
+  // Exactly the committed lockfile, never a re-resolve (idea#322)
+  await exec`cd ${enginePath} && pnpm install --frozen-lockfile`
 }
 
 export const buildEnginePM2 = async (exec: any, enginePath: string) => {
