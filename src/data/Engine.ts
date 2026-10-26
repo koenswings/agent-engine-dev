@@ -761,6 +761,11 @@ export const installRootHelpers = async (exec: any, enginePath: string) => {
   print(chalk.blue('  - Installing idea-write-home-engine...'))
   await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-write-home-engine /usr/local/sbin/idea-write-home-engine`
   print(chalk.green('  - /usr/local/sbin/idea-write-home-engine installed'))
+  // idea-write-card-timezone (idea#208): called only by idea-flash-card --timezone after a verified
+  // write; root-owned COPY, no sudoers entry (the Engine never calls it).
+  print(chalk.blue('  - Installing idea-write-card-timezone...'))
+  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-write-card-timezone /usr/local/sbin/idea-write-card-timezone`
+  print(chalk.green('  - /usr/local/sbin/idea-write-card-timezone installed'))
   // idea-flash-card: client-card flash helper (idea#201 §10), root-owned COPY, 0755
   print(chalk.blue('  - Installing idea-flash-card...'))
   await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-flash-card ${FLASH_HELPER_PATH}`

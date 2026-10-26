@@ -1,0 +1,127 @@
+#!/bin/bash
+# idea-write-card-timezone — write the client time zone onto a client card that was
+# JUST flashed and verified (idea#208; image side koenswings/idea#319).
+#
+# Called ONLY by the flash-card root helper (idea-flash-card --timezone), after the
+# read-back SHA matched and before flush + power-off. Never called by the Engine
+# directly (no sudoers entry), never for any other disk. Root-owned COPY in
+# /usr/local/sbin, modelled on idea-write-home-engine (same identity checks).
+#
+# Usage: idea-write-card-timezone <byIdPath> <expectDevice> <expectSizeBytes> <zone>
+#   byIdPath, expectDevice, expectSizeBytes: as idea-write-home-engine
+#   zone            the Engine's own tz database name, e.g. Africa/Harare. Validated
+#                   again here (root): ^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9_+-]+){0,2}$
+#                   (no '..', no absolute path) AND $ZONEINFO/<zone> is a regular file.
+#
+# Writes exactly one file: idea-timezone.txt = "<zone>\n" in the root of partition 1
+# (next to idea-home.txt), which must be FAT (vfat). The client's idea-timezone.service
+# reads it on every boot; without it the client stays on the image default (UTC).
+#
+# Refuses (exit 2, "refused: <CODE>: ...") with MEDIUM_SWAPPED, NOT_REMOVABLE,
+# SYSTEM_DISK, BOOT_DEVICE, MOUNTED, NOT_FAT and BAD_ARGS (also for a bad zone).
+
+set -eu
+umask 022
+export LC_ALL=C
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+# Constants (tests rewrite these in a sandbox copy)
+DEV_DIR=/dev
+BYID_DIR=/dev/disk/by-id
+SYS_BLOCK=/sys/class/block
+MNT_BASE=/run
+LSBLK=/usr/bin/lsblk
+FINDMNT=/usr/bin/findmnt
+BLKID=/usr/sbin/blkid
+UDEVADM=/usr/bin/udevadm
+MOUNT=/usr/bin/mount
+UMOUNT=/usr/bin/umount
+REALPATH=/usr/bin/realpath
+SYNC=/usr/bin/sync
+MKTEMP=/usr/bin/mktemp
+TZ_FILE=idea-timezone.txt
+ZONEINFO=/usr/share/zoneinfo
+is_block() { [ -b "$1" ]; }
+
+refuse() { echo "refused: $1: $2" >&2; exit 2; }
+
+[ "$#" -eq 4 ] || refuse BAD_ARGS "usage: idea-write-card-timezone <byIdPath> <expectDevice> <expectSizeBytes> <zone>"
+BYID="$1"; EXPECT_DEV="$2"; EXPECT_SIZE="$3"; ZONE="$4"
+
+# ── Argument checks ──────────────────────────────────────────────────────────
+[[ "$BYID" =~ ^${BYID_DIR}/[A-Za-z0-9_.:-]{1,200}$ ]] || refuse BAD_ARGS "byIdPath must be ${BYID_DIR}/<link>"
+[[ "$BYID" =~ -part[0-9]+$ ]] && refuse BAD_ARGS "byIdPath is a partition link; the whole card is required"
+[[ "$EXPECT_DEV" =~ ^${DEV_DIR}/(sd[a-z]{1,2}|mmcblk[0-9]{1,2})$ ]] || refuse BAD_ARGS "expectDevice must be a whole disk /dev/sdX or /dev/mmcblkN"
+[[ "$EXPECT_SIZE" =~ ^[1-9][0-9]{0,18}$ ]] || refuse BAD_ARGS "expectSizeBytes must be digits"
+[[ "$ZONE" =~ ^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9_+-]+){0,2}$ ]] || refuse BAD_ARGS "zone '$ZONE' is not a tz database name"
+case "/$ZONE/" in */../*|*/./*) refuse BAD_ARGS "zone '$ZONE' has a . or .. component" ;; esac
+[ -f "$ZONEINFO/$ZONE" ] || refuse BAD_ARGS "zone '$ZONE' is not in $ZONEINFO"
+
+DEVNAME=${EXPECT_DEV#"$DEV_DIR"/}
+
+# ── Identity: the by-id link still points at the device we wrote ────────────
+resolve_check() {
+    [ -L "$BYID" ] || refuse MEDIUM_SWAPPED "$BYID is gone"
+    local now
+    now=$($REALPATH -e -- "$BYID" 2>/dev/null) || refuse MEDIUM_SWAPPED "$BYID does not resolve"
+    [ "$now" = "$EXPECT_DEV" ] || refuse MEDIUM_SWAPPED "$BYID now resolves to $now, not $EXPECT_DEV"
+    [ -r "$SYS_BLOCK/$DEVNAME/size" ] || refuse MEDIUM_SWAPPED "$EXPECT_DEV has no size"
+    [ ! -e "$SYS_BLOCK/$DEVNAME/partition" ] || refuse MEDIUM_SWAPPED "$EXPECT_DEV is a partition"
+    local sectors
+    sectors=$(cat "$SYS_BLOCK/$DEVNAME/size")
+    [[ "$sectors" =~ ^[0-9]+$ ]] || refuse MEDIUM_SWAPPED "unreadable size"
+    [ "$((sectors * 512))" = "$EXPECT_SIZE" ] || refuse MEDIUM_SWAPPED "size is now $((sectors * 512)), wrote $EXPECT_SIZE"
+}
+resolve_check
+
+# ── Never the system disk, the boot device, a fixed disk or a mounted card ───
+removable=$(cat "$SYS_BLOCK/$DEVNAME/removable" 2>/dev/null || echo 0)
+tran=$($LSBLK -dno TRAN "$EXPECT_DEV" 2>/dev/null | tr -d ' ' || true)
+case "$DEVNAME" in mmcblk*) sd_slot=1 ;; *) sd_slot=0 ;; esac
+[ "$removable" = "1" ] || [ "$tran" = "usb" ] || [ "$sd_slot" = "1" ] || refuse NOT_REMOVABLE "$EXPECT_DEV is not removable media"
+
+parent_of() { # mount source -> whole-disk name
+    local src=$1 pk
+    src=$($REALPATH -e -- "$src" 2>/dev/null || echo "$src")
+    pk=$($LSBLK -no PKNAME "$src" 2>/dev/null | head -n1 | tr -d ' ' || true)
+    if [ -n "$pk" ]; then echo "$pk"; else echo "${src##*/}"; fi
+}
+for mp in / /boot /boot/firmware; do
+    src=$($FINDMNT -n -o SOURCE --mountpoint "$mp" 2>/dev/null || true)
+    [ -n "$src" ] || continue
+    if [ "$(parent_of "$src")" = "$DEVNAME" ]; then
+        [ "$mp" = "/" ] && refuse SYSTEM_DISK "$EXPECT_DEV holds /"
+        refuse BOOT_DEVICE "$EXPECT_DEV holds $mp"
+    fi
+done
+while read -r part; do
+    [ -n "$part" ] || continue
+    if $FINDMNT -n --source "$DEV_DIR/$part" >/dev/null 2>&1; then
+        refuse MOUNTED "$DEV_DIR/$part is mounted"
+    fi
+done < <($LSBLK -lno NAME "$EXPECT_DEV" 2>/dev/null)
+
+# ── Partition 1 must be FAT ──────────────────────────────────────────────────
+$UDEVADM settle --timeout=10 >/dev/null 2>&1 || true
+case "$DEVNAME" in mmcblk*) P1="${EXPECT_DEV}p1" ;; *) P1="${EXPECT_DEV}1" ;; esac
+is_block "$P1" || refuse NOT_FAT "$EXPECT_DEV has no partition 1"
+fstype=$($BLKID -o value -s TYPE "$P1" 2>/dev/null || true)
+[ "$fstype" = "vfat" ] || refuse NOT_FAT "partition 1 of $EXPECT_DEV is '${fstype:-none}', not vfat"
+
+# ── Write ────────────────────────────────────────────────────────────────────
+MP=$($MKTEMP -d "$MNT_BASE/idea-card-timezone.XXXXXX")
+cleanup() {
+    if $FINDMNT -n --mountpoint "$MP" >/dev/null 2>&1; then $UMOUNT "$MP" || true; fi
+    rmdir "$MP" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+resolve_check   # immediately before the mount
+$MOUNT -t vfat -o rw,nosuid,nodev,noexec,umask=022 "$P1" "$MP"
+printf '%s\n' "$ZONE" > "$MP/.$TZ_FILE.tmp"
+mv -f "$MP/.$TZ_FILE.tmp" "$MP/$TZ_FILE"
+$SYNC
+got=$(cat "$MP/$TZ_FILE")
+[ "$got" = "$ZONE" ] || { echo "error: WRITE_FAILED: read back '$got'" >&2; exit 1; }
+$UMOUNT "$MP"
+echo "ok: $TZ_FILE = $ZONE on $P1 ($BYID)"

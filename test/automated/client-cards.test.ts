@@ -246,7 +246,7 @@ describe('flashCard / cancelFlash (idea#201 §10)', () => {
         cardId = (await scanClientCards(undefined, String(LOCAL))).clientCards[0].candidateId
         spawned = []; logLines = []
         setFlashCardOpsForTests({
-            helperInstalled: () => true,
+            helperInstalled: () => true, engineTimezone: async () => '',
             spawnHelper: (a) => { spawned.push(a); proc = new FakeProc(); return proc as any },
             images: async () => ({ current: V2, previous: null, images: [IMG] }),
             appendFlashLog: async (l) => { logLines.push(l) },
@@ -275,6 +275,38 @@ describe('flashCard / cancelFlash (idea#201 §10)', () => {
         expect(await code(flashCard(h, cardId, 'current', size))).toBe('IMAGE_TOO_LARGE')
         expect(Object.keys(h.doc()!.operationDB)).toHaveLength(0)
         expect(spawned).toHaveLength(0)
+    })
+
+    it('idea#208: passes the Engine\'s own validated zone as timezone; empty/invalid/missing → no timezone, flash still runs', async () => {
+        const zi = fs.mkdtempSync(path.join(os.tmpdir(), 'idea-test-zoneinfo-'))
+        try {
+            fs.mkdirSync(path.join(zi, 'Africa')); fs.writeFileSync(path.join(zi, 'Africa/Harare'), 'TZif2')
+            const flashWith = async (zone: string) => {
+                clearFlashStateForTests(); spawned.length = 0
+                setFlashCardOpsForTests({
+                    helperInstalled: () => true, engineTimezone: async () => zone, zoneinfoDir: zi,
+                    spawnHelper: (a) => { spawned.push(a); proc = new FakeProc(); return proc as any },
+                    images: async () => ({ current: V2, previous: null, images: [IMG] }),
+                    appendFlashLog: async (l) => { logLines.push(l) },
+                    isSystemDevice: async (d) => d.startsWith('sda'),
+                    lookForMeta: async () => ({ ok: true, hasMeta: false, alreadyMounted: false, ignored: false }),
+                })
+                const { done } = await flashCard(h, cardId, 'current', String(32 * GB))
+                const tz = spawned[0].timezone
+                proc.line({ result: 'ok', bytesWritten: 9, sha256: 'c'.repeat(64), readBackSha256: 'c'.repeat(64), safeToRemove: true, timezoneFile: tz ? 'written' : 'skipped' })
+                proc.end(0)
+                expect(await done).not.toBeNull()   // the flash succeeds either way
+                return { tz, log: JSON.parse(logLines[logLines.length - 1]) }
+            }
+            const ok = await flashWith('Africa/Harare\n')
+            expect(ok.tz).toBe('Africa/Harare')
+            expect(ok.log).toMatchObject({ result: 'ok', timezone: 'Africa/Harare', timezoneFile: 'written' })
+            for (const bad of ['', 'Europe/Nowhere', '../etc/passwd', 'Africa/../../etc/shadow', '/etc/passwd', 'Africa/Harare; rm -rf /']) {
+                const r = await flashWith(bad)
+                expect(r.tz, bad).toBeUndefined()
+                expect(r.log).toMatchObject({ result: 'ok', timezone: null, timezoneFile: 'skipped' })
+            }
+        } finally { fs.rmSync(zi, { recursive: true, force: true }) }
     })
 
     it('never flashes the system disk even if it were listed as a card', async () => {
@@ -435,7 +467,7 @@ describe('capabilities + helper script (idea#201 §10)', () => {
 
     it('helper parses (bash -n) and reports its version', () => {
         execFileSync('bash', ['-n', HELPER])
-        expect(run(['--version']).stdout.trim()).toBe('idea-flash-card 2')
+        expect(run(['--version']).stdout.trim()).toBe('idea-flash-card 3')
     })
 
     it('helper refuses bad arguments before touching any device (exit 2, BAD_ARGS)', () => {
@@ -472,7 +504,7 @@ describe('disk roles: USB disks get both roles, SD cards flash only (idea#303)',
         h = await newStore()
         spawned = []
         setFlashCardOpsForTests({
-            helperInstalled: () => true,
+            helperInstalled: () => true, engineTimezone: async () => '',
             spawnHelper: (a) => { spawned.push(a); return new FakeProc() as any },
             images: async () => ({ current: V2, previous: null, images: [IMG] }),
             appendFlashLog: async () => {},
@@ -592,7 +624,7 @@ describe('disk roles: USB disks get both roles, SD cards flash only (idea#303)',
         useDevices([SYS, anna])
         const looked: string[] = []
         setFlashCardOpsForTests({
-            helperInstalled: () => true,
+            helperInstalled: () => true, engineTimezone: async () => '',
             spawnHelper: (a) => { spawned.push(a); return new FakeProc() as any },
             images: async () => ({ current: V2, previous: null, images: [IMG] }),
             appendFlashLog: async () => {},
@@ -613,7 +645,7 @@ describe('disk roles: USB disks get both roles, SD cards flash only (idea#303)',
             children: [{ name: 'sdl1', type: 'part', fstype: 'ext4', label: 'IDEA Disk', size: 240 * GB }] }
         useDevices([SYS, app], [])
         setFlashCardOpsForTests({
-            helperInstalled: () => true,
+            helperInstalled: () => true, engineTimezone: async () => '',
             spawnHelper: (a) => { spawned.push(a); return new FakeProc() as any },
             images: async () => ({ current: V2, previous: null, images: [IMG] }),
             appendFlashLog: async () => {},
