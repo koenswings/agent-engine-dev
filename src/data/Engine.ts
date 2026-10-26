@@ -521,6 +521,9 @@ export const installRpiPins = async (exec: any, enginePath: string) => {
   const cached = String((await exec`bash -c ${`ls ${cache}/*.deb 2>/dev/null || true`}`).stdout ?? '').split('\n').filter(Boolean)
   if (cached.length) await exec`sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades ${cached}`
   else await exec`sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades ${pins.map(p => `${p.pkg}=${p.version}`)}`
+  // Raspberry Pi OS keeps raspi.sources (archive.raspberrypi.com, no snapshots) enabled: hold the pins
+  // so the following apt upgrade cannot move them.
+  await exec`sudo apt-mark hold ${pins.map(p => p.pkg)}`
 }
 
 export const updateSystem = async (exec: any) => {

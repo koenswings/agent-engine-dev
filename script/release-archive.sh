@@ -8,7 +8,7 @@
 #   SHA256SUMS          sha256 of every part (the joined tar sum is in RELEASE-NOTES.md)
 #   RELEASE-NOTES.md    what is in it and how to restore it
 #   gh-commands.sh      the exact tag + release + upload commands. NOT RUN: they need Koen's go.
-#   record-keys.txt     archiveBoxPath / archiveSha256 lines for deployment records
+#   record-keys.txt     packageArchive* lines for deployment records
 # It never creates a tag or a release itself.
 set -euo pipefail
 tag=${1:?tag}; commit=${2:?commit}; src=${3:?archive dir}; out=${4:?release dir}; shift 4
@@ -58,7 +58,10 @@ CMD
 chmod +x "$out/gh-commands.sh"
 # record lines for idea deployments/ records of installs built from this archive
 {
-  echo "archiveBoxPath=$(cd "$out" && pwd)"
-  echo "archiveSha256=$(cd "$out" && sha256sum "$tag".tar.part-* | awk '{printf "%s%s:%s", (NR>1?",":""), $2, $1}')"
+  echo "packageArchive=$(cd "$out" && pwd)/"
+  echo "packageArchiveSha256=$(sha256sum "$out/SHA256SUMS" | cut -d' ' -f1)"
+  echo "packageArchiveUrl=https://github.com/$repo/releases/tag/$reltag (once published; until then: not published yet)"
+  echo "packageArchiveParts=$(cd "$out" && sha256sum "$tag".tar.part-* | awk '{printf "%s%s:%s", (NR>1?",":""), $2, $1}')"
+  echo "packageArchiveTarSha256=$whole"
 } > "$out/record-keys.txt"
 echo "$out"; ls -la "$out"

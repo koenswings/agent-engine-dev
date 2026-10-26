@@ -50,6 +50,8 @@ g() { git -C "$1" "${@:2}" 2>/dev/null || true; }
   echo "imageSha256=n/a"
   echo "imageManifest=n/a"
   echo "packageArchive=UNKNOWN"
+  echo "packageArchiveSha256=UNKNOWN"
+  echo "packageArchiveUrl=UNKNOWN"
   echo "secrets=Tailscale auth key and node key (names only; never read or recorded)"
   echo "deployedAt=UNKNOWN"
   echo "evidence=capture-engine-record.sh (read-only) at capture time"

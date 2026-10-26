@@ -19,11 +19,16 @@
 export const RECORD_FILES = ['record.txt', 'packages.tsv', 'images.tsv', 'files.sha256', 'dist.sha256'] as const
 export type RecordFile = typeof RECORD_FILES[number]
 
-/** Keys of record.txt that change on every capture or every install and are never compared. */
+/**
+ * Keys of record.txt that change on every capture or every install and are never compared.
+ * Built-in fallback; the shared list is idea tools/repro/volatile.txt (`key:<name>` lines),
+ * used instead when present (volatileKeys()).
+ */
 export const VOLATILE_KEYS = new Set([
     'capturedUtc', 'hostname', 'stickerName', 'cardId', 'captureHost', 'uptime', 'recordLabel', 'notes',
     'batch', 'deployedAt', 'evidence', 'confidence', 'open', 'packageArchive', 'secrets',
-    'archiveUrl', 'archiveSha256', 'archiveStatus', 'archiveBoxPath', 'sourceTag',
+    'packageArchiveSha256', 'packageArchiveUrl', 'packageArchiveParts', 'packageArchiveTarSha256',
+    'previousCardId', 'readBackSha256',
     'buildOptions', 'buildSourceFlags',
 ])
 
@@ -31,7 +36,7 @@ export const VOLATILE_KEYS = new Set([
 export const REQUIRED_KEYS = [
     'schema', 'batch', 'deviceType', 'arch', 'model', 'osRelease',
     'imageCommit', 'imageBranch', 'imageTag', 'imageVersion',
-    'packageArchive', 'secrets', 'deployedAt', 'evidence', 'confidence', 'open',
+    'packageArchive', 'packageArchiveSha256', 'packageArchiveUrl', 'secrets', 'deployedAt', 'evidence', 'confidence', 'open',
 ] as const
 export const SCHEMA = 'idea-deployment-record/1'
 /** For image-only keys (imageFile, imageSha256, …) that do not apply: an Engine is built on the device. */
@@ -49,6 +54,8 @@ export const validateRecord = (recordTxt: string): string[] => {
 
 /** Value used in retro records for a field that could not be recovered. */
 export const UNKNOWN = 'UNKNOWN'
+/** `UNKNOWN`, optionally followed by an explanation (same rule as idea compare-record.py). */
+export const isUnknown = (v: string | undefined): boolean => v !== undefined && v.split(' ')[0] === UNKNOWN
 
 export type Record = { [K in RecordFile]?: string }
 
@@ -107,7 +114,7 @@ const diffMaps = (file: RecordFile, a: Map<string, string>, b: Map<string, strin
     for (const k of keys) {
         if (skip(k)) continue
         const x = a.get(k), y = b.get(k)
-        if (x === UNKNOWN || y === UNKNOWN) continue
+        if (isUnknown(x) || isUnknown(y)) continue
         if (x !== y) out.push({ file, key: k, expected: x, actual: y })
     }
     return out
@@ -116,6 +123,8 @@ const diffMaps = (file: RecordFile, a: Map<string, string>, b: Map<string, strin
 export type CompareOptions = {
     /** Extra record.txt keys to ignore (on top of VOLATILE_KEYS). */
     ignoreKeys?: string[]
+    /** Replaces VOLATILE_KEYS (e.g. volatileKeys(<idea tools/repro/volatile.txt>)). */
+    volatile?: Set<string>
     /** Paths in files.sha256 / dist.sha256 to ignore (exact match or prefix ending in '/'). */
     ignorePaths?: string[]
 }
@@ -127,7 +136,7 @@ export type CompareOptions = {
  * never count as a difference.
  */
 export const compareRecords = (expected: Record, actual: Record, opts: CompareOptions = {}): Difference[] => {
-    const ignoreKeys = new Set([...VOLATILE_KEYS, ...(opts.ignoreKeys ?? [])])
+    const ignoreKeys = new Set([...(opts.volatile ?? VOLATILE_KEYS), ...(opts.ignoreKeys ?? [])])
     const ignorePaths = opts.ignorePaths ?? []
     const pathIgnored = (p: string) => ignorePaths.some(ip => ip.endsWith('/') ? p.startsWith(ip) : p === ip)
     const out: Difference[] = []
@@ -199,30 +208,32 @@ export const judgeSource = (s: SourceState, allowUntagged = false): SourceVerdic
 export const FIELD_TAG_RE = /^field\/[a-z0-9][a-z0-9-]*\/engine-[0-9a-f]{7}$/
 export const isFieldTag = (t: string): boolean => FIELD_TAG_RE.test(t)
 
-/** Volatile keys from a list file (idea tools/repro/volatile.txt): one key per line, # comments. */
+/** Record keys from idea tools/repro/volatile.txt: its `key:<name>` lines (path globs are for image manifests). */
 export const parseVolatileList = (text: string): string[] =>
-    text.split('\n').map(l => l.replace(/#.*/, '').trim()).filter(Boolean)
+    text.split('\n').map(l => l.trim()).filter(l => l.startsWith('key:')).map(l => l.slice(4).trim()).filter(Boolean)
+
+/** Volatile keys: the shared list when given (and non-empty), else the built-in VOLATILE_KEYS. */
+export const volatileKeys = (sharedListText?: string): Set<string> => {
+    const shared = sharedListText === undefined ? [] : parseVolatileList(sharedListText)
+    return shared.length ? new Set(shared) : new Set(VOLATILE_KEYS)
+}
 
 /** Where the input archive for an Engine install lives (idea#322). */
 export const ARCHIVE_REPO = 'koenswings/agent-engine-dev'
 export const archiveReleaseUrl = (tag: string): string => `https://github.com/${ARCHIVE_REPO}/releases/tag/${tag}`
 
 export interface ArchiveRef {
-    /** Engine build tag; gives the optional archiveUrl of a future release. */
-    tag?: string | null
-    /** Box copy of the archive (required for kits: Koen keeps them on the box). */
+    /** Box path of the archive directory (has SHA256SUMS). */
     boxPath?: string
-    parts?: { file: string, sha256: string }[]
+    /** sha256 of the archive's SHA256SUMS (published asset). */
+    sumsSha256?: string
+    /** Release tag the archive is published on, if any. */
+    releaseTag?: string | null
 }
 
-/**
- * Record lines linking an install to its input archive: archiveBoxPath (box copy), archiveSha256
- * (`<file>:<sha256>`, comma-separated per part) and, only for tagged Engine builds, the optional
- * archiveUrl of a GitHub release (none exists yet).
- */
-export const archiveKeys = (ref: ArchiveRef): string[] => {
-    const out = [`archiveBoxPath=${ref.boxPath ?? UNKNOWN}`,
-        `archiveSha256=${ref.parts?.length ? ref.parts.map(p => `${p.file}:${p.sha256}`).join(',') : UNKNOWN}`]
-    if (ref.tag) out.push(`archiveUrl=${archiveReleaseUrl(ref.tag)}`)
-    return out
-}
+/** packageArchive / packageArchiveSha256 / packageArchiveUrl lines (idea deployments/README.md). */
+export const archiveKeys = (ref: ArchiveRef): string[] => [
+    `packageArchive=${ref.boxPath ?? UNKNOWN}`,
+    `packageArchiveSha256=${ref.sumsSha256 ?? UNKNOWN}`,
+    `packageArchiveUrl=${ref.releaseTag ? archiveReleaseUrl(ref.releaseTag) : 'not published yet'}`,
+]

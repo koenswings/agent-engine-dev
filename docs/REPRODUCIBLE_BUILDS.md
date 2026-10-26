@@ -17,7 +17,7 @@ other tags do not count).
 **Field/archive tags** `field/<batch>/engine-<sha7>` (e.g. `field/zimbabwe-2026-10/engine-adfd9d3`)
 mark the commit a field batch was installed from and carry its input-archive release. They are
 recognised (`FIELD_TAG_RE`, `isFieldTag`) but are **not** build tags: the gate still wants
-`engine-v…`. Records name them as `sourceTag=`. `--allow-untagged` builds anyway; the reasons are printed and
+`engine-v…`. Records put the field tag in `imageTag=`. `--allow-untagged` builds anyway; the reasons are printed and
 written into the record (`buildSourceFlags`). `--dry-run` and `--personalize` only warn.
 
 There is **one install path**: `build-engine`. `script/install.sh` (and `script/setup-dev.sh`)
@@ -33,7 +33,7 @@ only run `pnpm install --frozen-lockfile` for build-engine itself and then `exec
 | Node | `NODE_VERSION` (via `n`) | `src/data/Engine.ts` |
 | n, pm2, pm2-logrotate | `N_VERSION`, `PM2_VERSION`, `PM2_LOGROTATE_VERSION` | `src/data/Engine.ts` |
 | Debian apt | `DEBIAN_SNAPSHOT`: `pinAptSnapshot` writes `/etc/apt/sources.list.d/idea-debian-snapshot.sources` (snapshot.debian.org, `Check-Valid-Until: no`) and moves the stock Debian sources to `*.idea-disabled` (kept, not deleted) | `src/data/Engine.ts` |
-| Raspberry Pi archive | has no snapshots: exact versions in `script/build_image_assets/apt-rpi-pins.tsv` (`pkg<TAB>version`, filled from a captured reference Engine's `packages.tsv`); `installRpiPins` installs `<engine>/deb-cache/*.deb` if present, else `pkg=version`. The `.deb`s ship in the release archive | `src/data/Engine.ts` |
+| Raspberry Pi archive | Raspberry Pi OS keeps `raspi.sources` (archive.raspberrypi.com) enabled; it has no snapshots: exact versions in `script/build_image_assets/apt-rpi-pins.tsv` (`pkg<TAB>version`, filled from a captured reference Engine's `packages.tsv`); `installRpiPins` installs `<engine>/deb-cache/*.deb` if present, else `pkg=version`, then `apt-mark hold`. The `.deb`s ship in the release archive. (No Launchpad: that path is Ubuntu-only.) Unpinned RPi-archive packages still follow `apt upgrade` until they are listed | `src/data/Engine.ts` |
 | Tailscale | `TAILSCALE_VERSION` + `TAILSCALE_ARM64_SHA256`, checked with `sha256sum -c` before install | `src/data/Engine.ts` |
 | Docker Engine | `script/build_image_assets/docker-pins.tsv`: docker-ce / docker-ce-cli 5:29.9.2-1~debian.13~trixie, containerd.io 2.4.2-3~debian.13~trixie, docker-buildx-plugin 0.38.1-1~debian.13~trixie, docker-compose-plugin 5.6.1-1~debian.13~trixie (arm64) with sha256. download.docker.com has no snapshots, so `install-docker-pinned.sh` uses `<engine>/deb-cache/docker/*.deb` if present, else downloads that exact file; every .deb is sha256-checked before `apt-get install`, then held (`apt-mark hold`). No Docker apt repo is added | `installDocker` |
 | Dev image | `Dockerfile` `FROM ubuntu:focal-20240123@sha256:bb1c4168…` (resolved with `crane digest`) | `Dockerfile` |
@@ -42,39 +42,40 @@ only run `pnpm install --frozen-lockfile` for build-engine itself and then `exec
 Deliberately unpinned: the `cli.github.com` apt repo (`installGh`, gh). It is a **dev-only** tool for agents and is not used by the running Engine or by any app; installs on field Engines do not depend on it. (The dev `Dockerfile` still installs its own Docker via get.docker.com `--version 25.0.3`; dev only.)
 Kits get the same approach once their versions are captured.
 
-## 3. Deployment record (idea `deployments/` schema)
+## 3. Deployment record (schema: idea `deployments/README.md`)
 
-Records live in the **idea repo** (koenswings/idea) at
-`deployments/engines/<hostname>/<label>/`, in the `idea-deployment-record/1` format defined by
-idea `deployments/README.md` (idea#323). Schema helpers and tooling stay here.
-At the end of a full build, `build-engine` runs `script/capture-engine-record.sh` on the
-target and copies the result into `<idea checkout>/deployments/engines/<host>/<label>/`
-(`--idea-repo DIR`, default `$IDEA_REPO_DIR`; without one it writes `/tmp/idea-deployment-<host>-<label>/`).
-Commit it in the idea repo. `--batch NAME` sets `batch=`; `--no-record` skips it.
+The record format, required keys, sidecars and archive keys (`packageArchive`,
+`packageArchiveSha256`, `packageArchiveUrl`) are defined **only** in koenswings/idea
+`deployments/README.md` (idea#323, `idea-deployment-record/1`). Engine records live at
+`deployments/engines/<hostname>/<label>/`. This page keeps the Engine specifics.
 
-| File | Content |
-|---|---|
-| `record.txt` | `#` comments then `key=value`: the schema's required keys (`schema`, `batch`, `deviceType=engine`, `hostname`/`stickerName`, `arch`, `model`, `osRelease`, `imageCommit`/`Branch`/`Tag`/`Version`, `imageFile`/`imageSha256`/`imageManifest`=`n/a` for Engines, `packageArchive`, `secrets` (names only), `deployedAt`, `evidence`, `confidence`, `open`), then Engine keys (dirty/skip-worktree counts, Console commit and dist hash, lockfile sha256, tool versions, root helper sha256, `buildSource*`, `buildOptions`), `manualEdit.<id>`/`postInstall.<id>` for field changes, and `contentSha256` = sha256 of `files.sha256` + `dist.sha256` |
-| `packages.tsv` | `dpkg-query -W` package, version, arch |
-| `images.tsv` | every local Docker image: ref, image id, repo digests |
-| `files.sha256` | sha256 of every tracked Engine file (except `store-identity/`) |
-| `dist.sha256` | sha256 of the compiled `dist/` |
+**Writing a record.** At the end of a full build, `build-engine` runs
+`script/capture-engine-record.sh` on the target and copies the result into
+`<idea checkout>/deployments/engines/<host>/<label>/` (`--idea-repo DIR`, default
+`$IDEA_REPO_DIR`; without one `/tmp/idea-deployment-<host>-<label>/`), adds `buildSource*`,
+`buildOptions` and `packageArchive*` (`UNKNOWN` / `not published yet` until an archive exists;
+fill from `release-archive.sh`'s `record-keys.txt`). `--batch NAME` sets `batch=`; `--no-record`
+skips it. Commit the record in the idea repo. Engine-only keys: dirty/skip-worktree counts,
+Console commit and dist hash, lockfile sha256, tool versions, root helper sha256.
 
-**No secrets:** the capture never reads `/etc/tailscale`, `~/.ssh`, `.env` or store keys;
-build-engine runs `engine-record.ts check-secrets` on the copy and warns before commit.
-
-The capture script is strictly **read-only**: no sudo, no installs, no restarts, output only
-to a new folder under `/tmp` (it refuses anything else). It is safe to run on a kit Engine:
+**Capture** is strictly **read-only** (no sudo, no installs, no restarts, output only to a new
+folder under `/tmp`, never reads `/etc/tailscale`, `~/.ssh`, `.env` or store keys). It is the only
+thing to run on a kit Engine:
 
     bash script/capture-engine-record.sh [--engine-dir DIR] [--console-dir DIR] [--batch NAME] [--out /tmp/DIR]
 
-## 4. Automatic comparison
+## 4. Checking and comparing
 
-    npx tsx script/engine-record.ts compare <record dir> <fresh record dir>
+    npx tsx script/engine-record.ts compare <expected dir> <actual dir> [--ignore-path P]... [--idea-repo DIR]
+    npx tsx script/engine-record.ts check <dir> [--idea-repo DIR]
+    npx tsx script/engine-record.ts check-secrets <dir>
 
-Exit 0 and `IDENTICAL (content)` when everything except the volatile keys (`VOLATILE_KEYS`:
-`capturedUtc`, `hostname`, `batch`, `deployedAt`, `evidence`, …) matches. `UNKNOWN` values
-never count. `--ignore-key K` and `--ignore-path P` add exclusions.
+`compare` and `check` are a thin wrapper: with python3 and an idea checkout (`--idea-repo` or
+`$IDEA_REPO_DIR`) they run idea `tools/repro/compare-record.py` with its `volatile.txt`. Without
+them (or with `--ts`, or `--ignore-key`) the same rules run in TypeScript: `UNKNOWN` never
+differs, a sidecar is compared only when the expected side has it, `--ignore-path` is an exact
+path or a prefix ending in `/`, and volatile keys are the `key:` lines of `volatile.txt`, else the
+built-in `VOLATILE_KEYS`. `check-secrets` runs in build-engine before a record is kept.
 A rebuild check = build from the same tag on a spare Pi, capture, compare.
 
 ## 5. Archiving inputs and release assets
@@ -100,15 +101,7 @@ creates no tag and runs none of them: **Koen gives the go** and the tag is made 
 `record-keys.txt` with the record keys below. The parts are not byte-reproducible (tar mtimes),
 so publish exactly the prepared files whose sha256 the records carry.
 
-**Record ↔ archive link.** Engine records carry `archiveBoxPath` (box copy), `archiveSha256`
-(`<asset>:<sha256>` per part, comma-separated) and, once a GitHub release exists, the optional
-`archiveUrl`. build-engine writes `archiveUrl` only for tagged builds (`archiveKeys()`); fill the
-sha from `release-archive.sh`'s `record-keys.txt`. Parts are 200 MiB by default (`PART_SIZE`):
-1 GB uploads from the box failed with `unexpected EOF`.
-
-**Volatile keys** are the built-in `VOLATILE_KEYS` plus, for `engine-record.ts compare`, the
-shared list in idea `tools/repro/volatile.txt` (`--volatile-file F`, or `$IDEA_VOLATILE_FILE`, or
-`$IDEA_REPO_DIR/tools/repro/volatile.txt` when present; one key per line, `#` comments).
+Parts default to 200 MiB (`PART_SIZE`): 1 GB uploads from the box failed with `unexpected EOF`.
 
 ## 6. Zimbabwe kit Engines (retro records)
 
@@ -116,7 +109,7 @@ Retro records for sunny-robin, happy-zebra and kind-panda are in the idea repo a
 `deployments/engines/<host>/retro-2026-10-18/`: Engine `adfd9d3` (branch `deploy/kit-229-232`),
 Console `62bd2ba` (dist only, checkout `main@654224e`), the adfd9d3 lockfile and tracked-file
 hashes, and the manual MORANGO edit. Unknown fields say `UNKNOWN`; fill them in by running the
-capture script when each Engine is next online (no other changes to kit Engines). Source tag:
+capture script when each Engine is next online (no other changes to kit Engines). `imageTag`:
 `field/zimbabwe-2026-10/engine-adfd9d3`. The adfd9d3 inputs are published as the **prerelease**
 https://github.com/koenswings/agent-engine-dev/releases/tag/field/zimbabwe-2026-10/engine-adfd9d3
 (assets `kit-adfd9d3-archive.tar.part-00..05` + `SHA256SUMS`; box copy

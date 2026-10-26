@@ -11,7 +11,7 @@ import os from 'os'
 import { fs, $ } from 'zx'
 import {
     compareRecords, findSecrets, judgeSource, parseApt, parseKeyValues, parseSha256, formatDifferences, UNKNOWN,
-    validateRecord, setKeys, isEngineTag, REQUIRED_KEYS, archiveKeys, isFieldTag, parseVolatileList,
+    validateRecord, setKeys, isEngineTag, REQUIRED_KEYS, archiveKeys, isFieldTag, parseVolatileList, volatileKeys, VOLATILE_KEYS, isUnknown,
 } from '../../src/install/deploymentRecord.js'
 import {
     N_VERSION, PM2_VERSION, PM2_LOGROTATE_VERSION, TAILSCALE_VERSION, TAILSCALE_ARM64_SHA256, tailscaleDownloadScript,
@@ -134,6 +134,11 @@ describe('build-engine pins (idea#322)', () => {
         expect(parseAptPins('# c\nchromium\t1:155-1+rpt1\n\nbad\n')).toEqual([{ pkg: 'chromium', version: '1:155-1+rpt1' }])
         expect(engine.indexOf('await pinAptSnapshot(exec)')).toBeLessThan(engine.indexOf('await updateSystem(exec)'))
         expect(fs.existsSync(path.join(ROOT, 'script/build_image_assets/apt-rpi-pins.tsv'))).toBe(true)
+        // Raspberry Pi OS: Debian sources (debian.sources, deb.debian.org) are replaced; raspi.sources stays and pins are held
+        expect(engine).toContain('/etc/apt/sources.list.d/debian.sources')
+        expect(engine).not.toMatch(/raspi\.sources.*idea-disabled/)
+        expect(engine.indexOf('apt-mark hold ${pins')).toBeGreaterThan(engine.indexOf('const installRpiPins'))
+        expect(fs.readFileSync(path.join(ROOT, 'script/archive-debs.py'), 'utf8')).not.toMatch(/launchpad/i)
     })
     it('has one install path: install.sh only wraps build-engine; install_packages is frozen', () => {
         const inst = fs.readFileSync(path.join(ROOT, 'script/install.sh'), 'utf8')
@@ -194,12 +199,12 @@ describe('Docker and dev image pins (idea#322)', () => {
         expect(from.length).toBeGreaterThan(0)
         for (const l of from) expect(l).toMatch(/^FROM [^ ]+:[^ @]+@sha256:[0-9a-f]{64}( |$)/)
     })
-    it('archiveKeys links a record to its box archive and sha256, release URL only when tagged', () => {
-        expect(archiveKeys({ boxPath: '/workspace/a', parts: [{ file: 'a.part-00', sha256: 'f'.repeat(64) }] })).toEqual([
-            'archiveBoxPath=/workspace/a', `archiveSha256=a.part-00:${'f'.repeat(64)}`,
+    it('archiveKeys writes #323 packageArchive / packageArchiveSha256 / packageArchiveUrl', () => {
+        expect(archiveKeys({ boxPath: '/workspace/a/', sumsSha256: 'f'.repeat(64), releaseTag: 'field/b-1/engine-abcdef0' })).toEqual([
+            'packageArchive=/workspace/a/', `packageArchiveSha256=${'f'.repeat(64)}`,
+            'packageArchiveUrl=https://github.com/koenswings/agent-engine-dev/releases/tag/field/b-1/engine-abcdef0',
         ])
-        expect(archiveKeys({ tag: 'engine-v2026.10.27' })[2]).toBe('archiveUrl=https://github.com/koenswings/agent-engine-dev/releases/tag/engine-v2026.10.27')
-        expect(archiveKeys({ tag: null }).some(l => l.startsWith('archiveUrl='))).toBe(false)
+        expect(archiveKeys({})).toEqual(['packageArchive=UNKNOWN', 'packageArchiveSha256=UNKNOWN', 'packageArchiveUrl=not published yet'])
     })
     it('field/<batch>/engine-<sha7> tags are recognised but are not build tags', () => {
         expect(isFieldTag('field/zimbabwe-2026-10/engine-adfd9d3')).toBe(true)
@@ -207,8 +212,13 @@ describe('Docker and dev image pins (idea#322)', () => {
         expect(isFieldTag('engine-v2026.10.27')).toBe(false)
         expect(isEngineTag('field/zimbabwe-2026-10/engine-adfd9d3')).toBe(false)
     })
-    it('reads a shared volatile list (idea tools/repro/volatile.txt)', () => {
-        expect(parseVolatileList('# c\nuptime\n  capturedUtc # x\n\n')).toEqual(['uptime', 'capturedUtc'])
+    it('reads `key:` lines of idea tools/repro/volatile.txt, else the built-in list', () => {
+        expect(parseVolatileList('# c\netc/machine-id\nkey:uptime\n  key: capturedUtc \n')).toEqual(['uptime', 'capturedUtc'])
+        expect([...volatileKeys('key:a\nvar/log/*\n')]).toEqual(['a'])
+        expect(volatileKeys('var/log/*\n')).toEqual(VOLATILE_KEYS)
+        expect(volatileKeys(undefined)).toEqual(VOLATILE_KEYS)
+        for (const k of ['packageArchiveSha256', 'packageArchiveUrl', 'previousCardId', 'readBackSha256']) expect(VOLATILE_KEYS.has(k)).toBe(true)
+        expect(REQUIRED_KEYS).toEqual(expect.arrayContaining(['packageArchive', 'packageArchiveSha256', 'packageArchiveUrl']))
     })
 })
 
@@ -222,6 +232,44 @@ describe('idea deployments/ schema (idea#323)', () => {
     })
     it('setKeys replaces keys in place and appends new ones', () => {
         expect(setKeys('a=1\nb=2\n', ['b=3', 'c=4'])).toBe('a=1\nb=3\nc=4\n')
+    })
+})
+
+describe('compare rules shared with idea tools/repro/compare-record.py', () => {
+    const rec = (o: Partial<Record<string, string>>) => o as any
+    it('UNKNOWN (with or without an explanation) never differs', () => {
+        expect(isUnknown('UNKNOWN (not captured)')).toBe(true)
+        expect(isUnknown('UNKNOWNISH')).toBe(false)
+        expect(compareRecords(rec({ 'record.txt': 'nodeVersion=UNKNOWN (expected v22)\n' }), rec({ 'record.txt': 'nodeVersion=v22.20.0\n' }))).toEqual([])
+    })
+    it('compares a sidecar only when the expected side has it; missing on actual is a difference', () => {
+        const base = { 'record.txt': 'a=1\n' }
+        expect(compareRecords(rec(base), rec({ ...base, 'packages.tsv': 'x\t1\tarm64\n' }))).toEqual([])
+        expect(compareRecords(rec({ ...base, 'images.tsv': 'r\ti\td\n' }), rec(base)).map(d => d.file)).toEqual(['images.tsv'])
+    })
+    it('--ignore-path is an exact path or a prefix ending in /', () => {
+        const e = rec({ 'files.sha256': `${'a'.repeat(64)}  src/x.ts\n${'a'.repeat(64)}  src/y.ts\n${'a'.repeat(64)}  srcfoo/z\n` })
+        const a = rec({ 'files.sha256': `${'b'.repeat(64)}  src/x.ts\n${'b'.repeat(64)}  src/y.ts\n${'b'.repeat(64)}  srcfoo/z\n` })
+        expect(compareRecords(e, a, { ignorePaths: ['src/'] }).map(d => d.key)).toEqual(['srcfoo/z'])
+        expect(compareRecords(e, a, { ignorePaths: ['src/x.ts', 'src'] }).map(d => d.key)).toEqual(['src/y.ts', 'srcfoo/z'])
+    })
+    it('engine-record.ts prefers compare-record.py from the idea checkout and falls back to TS', async () => {
+        const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-test-cr'))
+        try {
+            await fs.mkdirp(`${tmp}/idea/tools/repro`)
+            await fs.writeFile(`${tmp}/idea/tools/repro/compare-record.py`, 'import sys\nprint("PY", *sys.argv[1:])\n')
+            await fs.writeFile(`${tmp}/idea/tools/repro/volatile.txt`, 'key:x\n')
+            for (const d of ['e', 'f']) { await fs.mkdirp(`${tmp}/${d}`); await fs.writeFile(`${tmp}/${d}/record.txt`, `x=${d}\nschema=idea-deployment-record/1\n`) }
+            const tool = path.join(ROOT, 'script/engine-record.ts'), tsx = path.join(ROOT, 'node_modules/.bin/tsx')
+            const py = await $`${tsx} ${tool} compare ${tmp}/e ${tmp}/f --idea-repo ${tmp}/idea --ignore-path src/`
+            expect(py.stdout).toContain(`PY ${tmp}/e ${tmp}/f --volatile ${tmp}/idea/tools/repro/volatile.txt --ignore-path src/`)
+            const ts = await $`${tsx} ${tool} compare ${tmp}/e ${tmp}/f --idea-repo ${tmp}/idea --ts`
+            expect(ts.stdout).toContain('IDENTICAL')   // x is volatile per the idea list
+            const ts2 = await $({ nothrow: true })`${tsx} ${tool} compare ${tmp}/e ${tmp}/f --ts`
+            expect(ts2.exitCode).toBe(1)               // built-in list: x is compared
+            const chk = await $`${tsx} ${tool} check ${tmp}/e --idea-repo ${tmp}/idea`
+            expect(chk.stdout).toContain(`PY --check ${tmp}/e`)
+        } finally { await fs.remove(tmp) }
     })
 })
 
@@ -243,9 +291,10 @@ describe('release-archive.sh (prep only, never publishes)', () => {
             expect(gh).toContain('gh release create field/b-1/engine-abcdef0 --repo koenswings/agent-engine-dev --verify-tag --prerelease')
             expect(await fs.readFile(`${tmp}/rel/SHA256SUMS`, 'utf8')).not.toMatch(/ t-1\.tar$/m)
             const keys = await fs.readFile(`${tmp}/rel/record-keys.txt`, 'utf8')
-            expect(keys).toContain(`archiveBoxPath=${tmp}/rel`)
-            expect(keys).toMatch(/archiveSha256=t-1\.tar\.part-00:[0-9a-f]{64},/)
-            expect(keys).not.toContain('archiveUrl')
+            expect(keys).toContain(`packageArchive=${tmp}/rel/`)
+            expect(keys).toMatch(/^packageArchiveSha256=[0-9a-f]{64}$/m)
+            expect(keys).toMatch(/packageArchiveParts=t-1\.tar\.part-00:[0-9a-f]{64},/)
+            expect(keys).toContain('packageArchiveUrl=https://github.com/koenswings/agent-engine-dev/releases/tag/field/b-1/engine-abcdef0')
         } finally { await fs.remove(tmp) }
     })
 })

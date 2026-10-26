@@ -188,8 +188,7 @@ const main = async () => {
             await captureDeploymentRecord(exec, enginePath, repoRoot, isLocalMode, user, machine, hostname,
                 argv['idea-repo'] || process.env.IDEA_REPO_DIR, String(argv.batch || 'UNKNOWN'), [
                 `buildSourceCommit=${source.commit}`,
-                `packageArchive=${verdict.tag ? `GitHub release ${verdict.tag} on koenswings/agent-engine-dev` : 'none (untagged build)'}`,
-                ...archiveKeys({ tag: verdict.tag }),
+                ...archiveKeys({}),
                 `buildSourceTag=${verdict.tag ?? ''}`,
                 `buildSourceFlags=${verdict.reasons.join('; ') || 'clean-tagged-main'}`,
                 `buildOptions=${JSON.stringify({ model: model ?? null, ...shown })}`,
