@@ -6,9 +6,9 @@ This document provides a reference for the main provisioning and utility scripts
 
 ### `install.sh`
 
--   **Purpose:** A bootstrap script for setting up a new Engine device from scratch. This is the easiest way to perform a fresh installation on a new Raspberry Pi.
--   **Usage:** `curl -sSL <URL_to_install.sh> | sudo bash`
--   **Details:** This script installs the necessary base system dependencies (like Node.js, `zx`, `git`) and then runs the `./build-engine` wrapper (`script/build-engine.ts`) in local mode to complete the provisioning.
+-   **Purpose:** Thin wrapper around `build-engine` (idea#322: one install path).
+-   **Usage:** as pi, in a checkout of an `engine-vYYYY.MM.DD[-N]` tag: `bash script/install.sh [build-engine options]`
+-   **Details:** Runs `pnpm install --frozen-lockfile` if build-engine's own dependencies are missing, then `exec ./build-engine "$@"` (local mode). It installs nothing else; all provisioning is in build-engine. `script/setup-dev.sh` calls it.
 
 ---
 
@@ -33,6 +33,16 @@ This document provides a reference for the main provisioning and utility scripts
     -   `--prod`: Build in production mode.
     -   `--personalize`: Personalize Mode (see above).
 -   **Details:** A full build handles everything from setting the hostname and installing Docker to deploying the Engine software itself. It also installs the Engine's two sudoers files (`installEngineSudoers`, each validated with `visudo` first, mode 0440, owner root:root): `/etc/sudoers.d/10-engine` from `script/build_image_assets/10-engine.sudoers`, the exact commands the Engine, running as `pi`, may run as root; and `/etc/sudoers.d/11-engine-files` from `script/build_image_assets/11-engine-files.sudoers`, the files and folders it may write, remove or re-own as root under `/disks` (`/usr/bin/tee /disks/sd[a-z][12]/META.yaml`, idea#121; `/usr/bin/rmdir /disks/sd[a-z][12]`, idea#126; the disk root owner for `createFilesDisk`: `/usr/bin/chown -h / idea-erase-disk / mount -t ext4 pi\:pi /disks/sd[a-z][12]`, idea#131). It also installs `rsync` and `borgbackup` and the root helpers as root-owned 0755 copies: `/usr/local/sbin/idea-erase-disk` (idea#134) and `/usr/local/sbin/idea-app-data` (instance data as root, idea#168; `11-engine-files` has its line `pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-app-data`). An updated `11-engine-files` (or helper) must be installed before an Engine that needs it is deployed; the Engine refuses to start when `idea-app-data` is missing or the wrong version; `sudo -ll -U pi <exact command>` shows which sudoers file allows a command. pm2 and `pm2-logrotate` are installed into pi's pm2. The Engine is started and saved with pi's pm2 (`pm2 start`, `pm2 save`, no sudo); boot start-up is enabled with `sudo env PATH=$PATH:<node bin> <pm2> startup systemd -u pi --hp /home/pi`, which needs root to write the systemd unit but runs pm2 as pi (idea#273). `TAILSCALE_AUTHKEY` is used only by `installTailscale`: it is removed from build-engine's environment right after it is read, and the pm2 calls run under `env -u TAILSCALE_AUTHKEY`, so the key is never in pm2's environment or `~/.pm2/dump.pm2` (idea#273).
+
+-   **Reproducibility (idea#322):** refuses to build unless the local checkout is a clean, tagged commit on `origin/main` (`--allow-untagged` overrides and is recorded). Installs the Engine with `pnpm install --frozen-lockfile` and pinned n/pnpm/pm2/pm2-logrotate/Node. After a full build it pins Debian apt to `DEBIAN_SNAPSHOT`, Docker Engine to `docker-pins.tsv` (sha-checked debs via `install-docker-pinned.sh`, cache first), Raspberry Pi packages to `apt-rpi-pins.tsv` and Tailscale to version + sha256. Accepts only `engine-vYYYY.MM.DD[-N]` tags. After a full build it writes a deployment record to `<idea checkout>/deployments/engines/<hostname>/<label>/` (`--idea-repo`, default `$IDEA_REPO_DIR`; `--batch`; skip with `--no-record`); commit it in the idea repo. See [REPRODUCIBLE_BUILDS.md](REPRODUCIBLE_BUILDS.md).
+
+---
+
+### `capture-engine-record.sh`, `engine-record.ts`, `archive-engine-inputs.sh` (idea#322)
+
+-   `bash script/capture-engine-record.sh [--engine-dir D] [--console-dir D] [--out /tmp/D]`: read-only capture of an install (no sudo, no installs, no restarts; writes only its own `/tmp` folder). Writes `record.txt`, `packages.tsv`, `images.tsv`, `files.sha256`, `dist.sha256` and `helpers.sha256` (every `/usr/local/sbin/idea-*`); finds `tailscale` in `/usr/sbin` or `/usr/bin` when it is not on PATH.
+-   `npx tsx script/engine-record.ts compare <expected> <actual>` (exit 1 on any content difference) and `check-secrets <dir>`.
+-   `script/archive-engine-inputs.sh <commit> <out> [image...]`: archive the source, pnpm store (linux/arm64), Node tarball, global npm tools and arm64 Docker images of one commit, with `SHA256SUMS`.
 
 ---
 
@@ -125,6 +135,10 @@ This document provides a reference for the main provisioning and utility scripts
 
 ---
 
+### Root helpers `idea-flash-card` (v3) and `idea-write-card-timezone` (`script/build_image_assets/`, idea#208)
+
+Installed by build-engine (`installRootHelpers`) as root-owned 0755 copies in `/usr/local/sbin`. `idea-flash-card` is the only one in sudoers (`11-engine-files`, unchanged). v3 adds `--timezone <Area/City>`: re-validated as root (tz regex, no `..`, file under `/usr/share/zoneinfo`; else `refused: BAD_ARGS`), then after the verified write and before power-off it calls `idea-write-card-timezone <byId> /dev/sdX <sizeBytes> <zone>`, which writes `idea-timezone.txt` = `<zone>\n` on FAT partition 1 (same identity checks as `idea-write-home-engine`). A failed timezone write leaves the flash `ok` with `"timezoneFile":"failed"`. Tests: `test/automated/client-timezone.test.ts`. Any Pi that flashes cards needs both helpers redeployed (`installRootHelpers`).
+
 ### `hw-home-engine-card.sh` (`script/hw-home-engine-card.sh`)
 
 On-Pi hardware test for `idea-write-home-engine` (#213, idea#203 §2). Run on a pool Pi (never golden idea02), against a client card that was just flashed and verified, sitting in a card reader:
@@ -155,3 +169,10 @@ On-Pi hardware test for `idea-write-home-engine` (#213, idea#203 §2). Run on a 
     -   A refused serial, the drive backing `/` or `/boot/firmware`, a non-USB disk, or a USB device that is or sits above the system drive's is refused outright.
     -   After an error, it always re-plugs the disk.
 -   **Result:** exit code 0 only if every check passes. The log goes to `test/testresults/hw-roundtrip-<UTC yyyy-mm-dd-hhmmss>.log`.
+
+---
+
+### `script/archive-debs.py` and `script/release-archive.sh` (idea#322)
+
+-   **archive-debs.py:** `--out DIR [--packages packages.tsv] [--rpi-current NAMES] [--snapshot ID]` downloads and verifies `.deb`s (Debian from snapshot.debian.org, Raspberry Pi from archive.raspberrypi.com) plus the indices used; writes `index.tsv`, `missing.tsv`, `SHA256SUMS`. Called by `archive-engine-inputs.sh`.
+-   **release-archive.sh:** `<name> <commit> <archive-dir> <release-dir> [--tag T] [--prerelease]` packs an archive into <2 GB parts with `SHA256SUMS`, `RELEASE-NOTES.md` `gh-commands.sh` (release + upload on an existing tag; creates no tag) and `record-keys.txt` (`packageArchive*`). It never runs those commands; they need Koen's go.

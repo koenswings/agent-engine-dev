@@ -6,7 +6,7 @@
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "install_packages": "pnpm install --no-frozen-lockfile",
+    "install_packages": "pnpm install --frozen-lockfile",
     "start": "tsc && node dist/src/index.js",
     "startDB": "tsc && YPERSISTENCE=./yjs-db node dist/src/index.js",
     "dev": "nodemon --watch 'src/**/*' -e ts,tsx --exec 'tsc && VERBOSITY=3 node dist/src/index.js'",
