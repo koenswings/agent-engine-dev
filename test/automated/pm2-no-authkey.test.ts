@@ -17,7 +17,7 @@ import path from 'path'
 import crypto from 'crypto'
 import { $, fs } from 'zx'
 import { ssh } from '../../src/utils/ssh.js'
-import { installTailscale, installPm2, startEnginePM2 } from '../../src/data/Engine.js'
+import { installTailscale, installPm2, startEnginePM2, PM2_LOGROTATE_VERSION } from '../../src/data/Engine.js'
 
 const newKey = () => `tskey-auth-ideatest${crypto.randomBytes(12).toString('hex')}`
 
@@ -98,7 +98,7 @@ describe('build-engine keeps TAILSCALE_AUTHKEY out of pm2 and dump.pm2 (idea#273
         const calls = await pm2Calls()
         const argvs = calls.map(c => c.split('\n')[0])
         expect(argvs).toEqual(expect.arrayContaining([
-            'ARGV install pm2-logrotate', 'ARGV show engine', 'ARGV start pm2.config.cjs --env production', 'ARGV save',
+            `ARGV install pm2-logrotate@${PM2_LOGROTATE_VERSION}`, 'ARGV show engine', 'ARGV start pm2.config.cjs --env production', 'ARGV save',
             'ARGV startup systemd -u pi --hp /home/pi',
         ]))
         for (const c of calls) {
