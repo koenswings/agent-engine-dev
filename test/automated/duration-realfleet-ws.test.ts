@@ -25,6 +25,9 @@ import {
 } from '../duration/realFleetOps.js'
 import { resetTimeoutGuard, setGuardIo, timeoutSummary } from '../duration/automergeTimeoutGuard.js'
 
+/** Adapter retry interval (2 s) plus generous headroom for open + join + pong under load (idea#332). */
+const REATTACH_WINDOW_MS = 2_000 + 8_000
+
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
 
 interface FakeEngine {
@@ -266,9 +269,35 @@ describe('RealFleetOps WS model — fake Engine (r32)', () => {
             fe.sockets[0]!.terminate() // real disconnect
             await sleep(200)
             expect(ops.isWsOpen('idea01')).toBe(false)
-            const r = await ops.waitReady('idea01', 3_000)
+            // idea#332: the adapter re-dials only after its 2 s retry interval (TrackedWebSocketClientAdapter
+            // in realFleetOps), then needs open + join + ping/pong. A 3 s window left < 1 s of headroom, so a
+            // ~1.5 s event-loop stall of the fake Engine under full-suite load ran the reattach past the window
+            // and waitReady fell back to a fresh connection (count 2). The window is sized from the retry
+            // interval; a fresh connection still only happens after the whole window, so count 1 stays the proof.
+            const r = await ops.waitReady('idea01', REATTACH_WINDOW_MS)
             expect(r.wsUp).toBe(true)
             expect(ops.getConnectionCount('idea01')).toBe(1) // adapter reconnected itself
+            expect(fe.connections).toBe(2)
+            expect(fe.openNow).toBe(1)
+        } finally {
+            await ops.close()
+            await fe.close()
+        }
+    }, 30_000)
+
+    it('idea#332: a 1.5 s Engine stall during the re-dial still reattaches on the SAME connection', async () => {
+        const fe = await startFakeEngine()
+        const { ops } = makeOps(fe.port, fe.docUrl)
+        try {
+            expect((await ops.waitReady('idea01', 5_000)).wsUp).toBe(true)
+            fe.sockets[0]!.terminate()
+            await sleep(200)
+            // Block the fake Engine's thread across the adapter's 2 s re-dial (what full-suite load did).
+            const stall = setTimeout(() => { const end = performance.now() + 1_500; while (performance.now() < end) { /* spin */ } }, 1_700)
+            const r = await ops.waitReady('idea01', REATTACH_WINDOW_MS)
+            clearTimeout(stall)
+            expect(r.wsUp).toBe(true)
+            expect(ops.getConnectionCount('idea01')).toBe(1)
             expect(fe.connections).toBe(2)
             expect(fe.openNow).toBe(1)
         } finally {
