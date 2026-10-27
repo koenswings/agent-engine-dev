@@ -91,5 +91,9 @@ for f in "${findings[@]}"; do echo "  - $f" >&2; done
 echo "" >&2
 echo "Engine tests must share nothing with a live Engine (idea#105)." >&2
 echo "Stop the live Engine / undock its disks, or run on a machine without one." >&2
+echo "Where Engine tests run (idea#335): the Grok Bot box, or a claimed idle pool Pi after" >&2
+echo "'pm2 stop engine' (AGENTS.md, 'Where Engine tests run'). Never next to a live production" >&2
+echo "Engine (idea01 while it serves, golden idea02, 'idea'). Ports are not the conflict: tests" >&2
+echo "use ephemeral ports only." >&2
 echo "Override at your own risk with IDEA_TEST_ALLOW_LIVE=1." >&2
 exit 1
