@@ -26,7 +26,7 @@ with usage examples.
 
 ## SCRIPTS.md
 **Status:** Authoritative  ·  **Maintained by:** Axle
-Reference for provisioning and utility scripts (`install.sh` and others): purpose,
+Reference for provisioning and utility scripts (`build-engine`, the `install.sh` wrapper, archive/release scripts): purpose,
 parameters, and usage.
 → [docs/SCRIPTS.md](SCRIPTS.md)
 
@@ -35,6 +35,12 @@ parameters, and usage.
 IDEA Pi test fleet: node inventory (idea01–idea04), hardware specs, provisioning
 procedure, SSH access, and fleet management commands.
 → [docs/PI_FLEET.md](PI_FLEET.md)
+
+## REPRODUCIBLE_BUILDS.md
+**Status:** Authoritative  ·  **Maintained by:** Axle
+Content-identical reproducible Engine installs (idea#322): tagged-source gate, pinned inputs,
+deployment records, comparison, input archives, kit retro records, MORANGO procedure.
+→ [docs/REPRODUCIBLE_BUILDS.md](REPRODUCIBLE_BUILDS.md)
 
 ## STORE_HISTORY_R86Q.md
 **Status:** Record (2026-10-13)  ·  **Maintained by:** Axle

@@ -1,0 +1,4 @@
+# Raspberry Pi archive (archive.raspberrypi.com) packages pinned by version (idea#322).
+# The RPi archive has no snapshots: fill this from the packages.tsv of a captured reference Engine
+# (packages whose origin is archive.raspberrypi.com) and ship the .debs in the release (deb-cache/).
+# Format: <package>\t<version>
