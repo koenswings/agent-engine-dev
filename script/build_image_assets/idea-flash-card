@@ -7,7 +7,7 @@
 #
 # Usage:
 #   idea-flash-card --by-id <path> --expect-device <sdX> --expect-size <bytes> \
-#                   --image <file> --sha256 <hex> [--os-rootfs <sdXN>]...
+#                   --image <file> --sha256 <hex> [--os-rootfs <sdXN>]... [--timezone <Area/City>]
 #   idea-flash-card --version
 #
 #   --by-id         /dev/disk/by-id/usb-...  (whole disk link, never a -partN link)
@@ -19,17 +19,27 @@
 #                   root filesystem layout on it with hasOsRootfsLayout (src/monitors/mounts.ts, idea#279),
 #                   so a META.yaml there is an old Engine system disk, not an IDEA disk (idea#303).
 #                   The layout check lives only in the Engine; this helper does not repeat it.
+#   --timezone      the Engine's own tz name (idea#208). Re-validated here (regex, no '..', must be a
+#                   file under /usr/share/zoneinfo; BAD_ARGS before anything is touched). After the
+#                   read-back matched and before flush + power-off, idea-write-card-timezone writes
+#                   idea-timezone.txt = "<zone>\n" on FAT partition 1. A failure of that step does
+#                   not fail the flash (the client stays on UTC): it is reported on stderr as
+#                   "warning: TIMEZONE_FAILED: ..." and as "timezoneFile":"failed" in the result.
+#                   Without --timezone no file is written ("timezoneFile":"skipped").
 #
 # Output: JSON lines on stdout {"step":..,"bytes":..,"total":..}, last line
-#   {"result":"ok","bytesWritten":N,"sha256":"..","readBackSha256":"..","safeToRemove":true|false}
+#   {"result":"ok","bytesWritten":N,"sha256":"..","readBackSha256":"..","safeToRemove":true|false,
+#    "timezoneFile":"written|skipped|failed"}
 # Exit: 0 ok (incl. POWER_OFF_FAILED → safeToRemove false), 2 refused (stderr "refused: CODE: text"),
 #       3 failed (stderr "failed: CODE: text"). SIGTERM → failed CANCELLED.
-# Never mounts anything. No size limit (any card size; only IMAGE_TOO_LARGE is physical).
+# Never mounts anything itself (idea-write-card-timezone mounts partition 1 for --timezone). No size limit (any card size; only IMAGE_TOO_LARGE is physical).
 
 set -u
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
-VERSION=2
+VERSION=3
 IMAGES_ROOT=/var/lib/idea/client-images
+ZONEINFO=/usr/share/zoneinfo
+TZ_WRITER=/usr/local/sbin/idea-write-card-timezone
 
 refuse() { echo "refused: $1: $2" >&2; exit 2; }
 fail()   { echo "failed: $1: $2" >&2; cleanup_children; try_power_off >/dev/null; exit 3; }
@@ -37,7 +47,7 @@ emit()   { printf '{"step":"%s","bytes":%s,"total":%s}\n' "$1" "${2:-0}" "${3:-0
 
 if [[ "${1:-}" == "--version" ]]; then echo "idea-flash-card $VERSION"; exit 0; fi
 
-BYID= DEV= SIZE= IMAGE= SHA=
+BYID= DEV= SIZE= IMAGE= SHA= TZONE= TZ_SET=0
 OSROOTFS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -47,6 +57,7 @@ while [[ $# -gt 0 ]]; do
     --image) IMAGE="${2:-}"; shift 2 ;;
     --sha256) SHA="${2:-}"; shift 2 ;;
     --os-rootfs) OSROOTFS+=("${2:-}"); shift 2 ;;
+    --timezone) TZONE="${2:-}"; TZ_SET=1; shift 2 ;;
     *) refuse BAD_ARGS "unknown argument '$1'" ;;
   esac
 done
@@ -58,6 +69,13 @@ done
 for p in "${OSROOTFS[@]}"; do [[ "$p" =~ ^${DEV}[12]$ ]] || refuse BAD_ARGS "os-rootfs must be partition 1 or 2 of $DEV"; done
 [[ "$IMAGE" =~ ^$IMAGES_ROOT/([A-Za-z0-9._-]+)/idea-client-([A-Za-z0-9._-]+)\.img\.xz$ ]] || refuse BAD_ARGS "image must be $IMAGES_ROOT/<version>/idea-client-<version>.img.xz"
 [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]] || refuse BAD_ARGS "image folder and file version differ"
+# >>> tz-check (idea#208): runs as root, so never trust the Engine's zone
+if [[ $TZ_SET -eq 1 ]]; then
+  [[ "$TZONE" =~ ^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9_+-]+){0,2}$ ]] || refuse BAD_ARGS "timezone '$TZONE' is not a tz database name"
+  case "/$TZONE/" in */../*|*/./*) refuse BAD_ARGS "timezone '$TZONE' has a . or .. component" ;; esac
+  [[ -f "$ZONEINFO/$TZONE" ]] || refuse BAD_ARGS "timezone '$TZONE' is not in $ZONEINFO"
+fi
+# <<< tz-check
 check="$IMAGE"; while [[ "$check" != "/" ]]; do [[ -L "$check" ]] && refuse BAD_ARGS "image path contains a symlink ($check)"; check=$(dirname "$check"); done
 
 DEVPATH="/dev/$DEV"
@@ -163,11 +181,20 @@ rsha=$(head -c "$usize" "$DEVPATH" | sha256sum | cut -d' ' -f1)
 emit reading-back "$usize" "$usize"
 [[ "$rsha" == "$wsha" ]] || fail VERIFY_FAILED "read-back $rsha differs from written $wsha"
 
+# ── Client time zone (idea#208): idea-timezone.txt on FAT partition 1 ─────
+tzfile=skipped
+if [[ $TZ_SET -eq 1 ]]; then
+  blockdev --rereadpt "$DEVPATH" 2>/dev/null || partx -u "$DEVPATH" 2>/dev/null || true
+  udevadm settle --timeout=10 >/dev/null 2>&1 || true
+  if tzout=$("$TZ_WRITER" "$BYID" "$DEVPATH" "$SIZE" "$TZONE" 2>&1); then tzfile=written
+  else tzfile=failed; echo "warning: TIMEZONE_FAILED: $(echo "$tzout" | tail -n 1)" >&2; fi
+fi
+
 # ── Flush + power off ──────────────────────────────────────────────────────
 emit flushing 0 0
 sync
 exec 9>&-
 emit powering-off 0 0
 safe=$(try_power_off)
-printf '{"result":"ok","bytesWritten":%s,"sha256":"%s","imageSha256":"%s","readBackSha256":"%s","safeToRemove":%s}\n' "$usize" "$wsha" "$SHA" "$rsha" "$safe"
+printf '{"result":"ok","bytesWritten":%s,"sha256":"%s","imageSha256":"%s","readBackSha256":"%s","safeToRemove":%s,"timezoneFile":"%s"}\n' "$usize" "$wsha" "$SHA" "$rsha" "$safe" "$tzfile"
 exit 0

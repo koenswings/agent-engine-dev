@@ -34,6 +34,7 @@ import { ENGINE_STATE_DIR } from './FilesMount.js'
 import { lookForIdeaMeta, safeMount, mountPointOf, unmountAndRemove } from '../monitors/mounts.js'
 import { forgetMetaLook } from '../monitors/metaLookCache.js'
 import { log, print, uuid } from '../utils/utils.js'
+import { readEngineTimezone, validateClientTimezone, ZONEINFO_DIR } from './ClientTimezone.js'
 
 export const FLASH_HELPER = '/usr/local/sbin/idea-flash-card'
 export const FLASH_LOG = path.join(ENGINE_STATE_DIR, 'flash.log')
@@ -52,6 +53,8 @@ export interface FlashHelperArgs {
     byId: string; device: string; sizeBytes: number; image: string; sha256: string
     /** idea#303: partitions with an OS rootfs layout (hasOsRootfsLayout); a META.yaml there does not block the flash */
     osRootfsPartitions: string[]
+    /** idea#208: the Engine's own validated tz name → idea-timezone.txt on the card; absent: no file (client stays UTC) */
+    timezone?: string
 }
 
 export interface FlashCardOps {
@@ -74,6 +77,11 @@ export interface FlashCardOps {
     createFilesDisk: (h: DocHandle<Store>, diskId: string) => Promise<unknown>
     createBackupDisk: (h: DocHandle<Store>, diskId: string) => Promise<unknown>
     now: () => number
+    /** idea#208: the Engine's own time zone (timedatectl, as pi) */
+    engineTimezone: () => Promise<string>
+    zoneinfoDir: string
+    /** `sudo -n idea-flash-card --version` → its protocol number; null when unknown or the probe fails */
+    helperVersion: () => Promise<number | null>
 }
 
 let addDeviceImpl: ((p: string) => Promise<void>) | null = null
@@ -83,7 +91,8 @@ const defaultOps: FlashCardOps = {
     helperInstalled: () => { try { fs.accessSync(FLASH_HELPER, fs.constants.X_OK); return true } catch { return false } },
     spawnHelper: (a) => spawn('sudo', ['-n', FLASH_HELPER, '--by-id', a.byId, '--expect-device', a.device,
         '--expect-size', String(a.sizeBytes), '--image', a.image, '--sha256', a.sha256,
-        ...a.osRootfsPartitions.flatMap(p => ['--os-rootfs', p])], { stdio: ['ignore', 'pipe', 'pipe'] }),
+        ...a.osRootfsPartitions.flatMap(p => ['--os-rootfs', p]),
+        ...(a.timezone ? ['--timezone', a.timezone] : [])], { stdio: ['ignore', 'pipe', 'pipe'] }),
     scan: (h) => refreshClientCards(h),
     images: (h) => refreshClientImages(h),
     appendFlashLog: async (line) => { await fs.ensureDir(path.dirname(FLASH_LOG)); await fs.appendFile(FLASH_LOG, line + '\n') },
@@ -104,9 +113,23 @@ const defaultOps: FlashCardOps = {
         return (await import('../monitors/backupMonitor.js')).createBackupDiskConfig(h, disk as any, 'on-demand' as any, [])
     },
     now: () => Date.now(),
+    engineTimezone: () => readEngineTimezone(),
+    zoneinfoDir: ZONEINFO_DIR,
+    helperVersion: async () => {
+        const r = await $`sudo -n ${FLASH_HELPER} --version`.nothrow().quiet()
+        return r.exitCode === 0 ? parseFlashHelperVersion(r.stdout) : null
+    },
 }
 let ops: FlashCardOps = defaultOps
 export const setFlashCardOpsForTests = (o: Partial<FlashCardOps> | null): void => { ops = o ? { ...defaultOps, ...o } : defaultOps }
+
+/** idea#208: --timezone needs idea-flash-card v3 or later */
+export const FLASH_HELPER_TIMEZONE_MIN = 3
+/** Parse "idea-flash-card <N>" (the helper's --version line); null for anything else. */
+export const parseFlashHelperVersion = (out: string): number | null => {
+    const m = /^idea-flash-card ([0-9]{1,6})$/.exec(String(out ?? '').trim())
+    return m ? Number(m[1]) : null
+}
 
 // ── Busy state (one flash / initialise per Engine) ───────────────────────────
 const running = new Map<string, { proc: ChildProcess | null; cancelled: boolean; kind: 'flashCard' | 'initialiseDisk' }>()
@@ -184,6 +207,18 @@ export const flashCard = async (
         if (look.ok && look.osRootfs) osRootfsPartitions.push(p)
     }
 
+    // idea#208: pass the Engine's own zone; an empty or invalid one is skipped (logged), never fatal
+    // Version gate: an older helper refuses the unknown --timezone with BAD_ARGS, so never pass it there.
+    const helperVersion = await ops.helperVersion().catch(() => null)
+    let timezone: string | undefined
+    if (helperVersion == null || helperVersion < FLASH_HELPER_TIMEZONE_MIN) {
+        print(`flashCard: idea-timezone.txt skipped: ${FLASH_HELPER} is too old (version ${helperVersion ?? 'unknown'}, needs >= ${FLASH_HELPER_TIMEZONE_MIN}); the client stays on UTC`)
+    } else {
+        const tz = validateClientTimezone(await ops.engineTimezone().catch(() => ''), ops.zoneinfoDir)
+        timezone = tz.ok ? tz.zone : undefined
+        if (!tz.ok) log(`flashCard: idea-timezone.txt skipped (${tz.reason}); the client stays on UTC`)
+    }
+
     const traceId = getActiveTrace()?.traceId
     const opId = createOperation(storeHandle, 'flashCard',
         { candidateId, version: image.version, confirmSizeBytes: String(confirmSize) }, 'console-command', { type: 'disk', id: candidateId })
@@ -198,7 +233,7 @@ export const flashCard = async (
     const done = new Promise<FlashResult | null>((resolve) => {
         let proc: ChildProcess
         try {
-            proc = ops.spawnHelper({ byId: card.byId!, device: card.device, sizeBytes: card.sizeBytes, image: imagePathOf(image.version), sha256: image.sha256, osRootfsPartitions })
+            proc = ops.spawnHelper({ byId: card.byId!, device: card.device, sizeBytes: card.sizeBytes, image: imagePathOf(image.version), sha256: image.sha256, osRootfsPartitions, timezone })
         } catch (e) {
             finish(null, { code: 'HELPER_MISSING', text: String(e) }); return
         }
@@ -249,6 +284,8 @@ export const flashCard = async (
                 bytesWritten: ok ? Number(ok.bytesWritten) || 0 : 0, readBackSha256: ok?.readBackSha256 ?? null, durationMs, safeToRemove: safe,
             }
             if (ok) {
+                if (ok.timezoneFile === 'failed') log(`Flash ${opId}: idea-timezone.txt could not be written (${(err.match(/^warning: TIMEZONE_FAILED: (.*)$/m) ?? [])[1] ?? 'no detail'}); the client stays on UTC`)
+                else if (ok.timezoneFile === 'written') log(`Flash ${opId}: idea-timezone.txt = ${timezone}`)
                 updateOperation(storeHandle, opId, {
                     status: 'Done', completedAt: ops.now() as Timestamp, progressPercent: 100, safeToRemove: safe,
                     error: safe ? null : 'POWER_OFF_FAILED: the card was written but could not be switched off — eject it before removing it',
@@ -260,7 +297,8 @@ export const flashCard = async (
             if (traceId) attachTraceResult(ok ? result : { ...result, error: `${failure!.code}: ${failure!.text}` }, traceId)
             const line = JSON.stringify({ at: new Date(ops.now()).toISOString(), operationId: opId, traceId: traceId ?? null,
                 result: ok ? (safe ? 'ok' : 'POWER_OFF_FAILED') : failure!.code, version: image.version, sha256: image.sha256,
-                byId: card!.byId, device: card!.device, sizeBytes: card!.sizeBytes, bytesWritten: result.bytesWritten, durationMs })
+                byId: card!.byId, device: card!.device, sizeBytes: card!.sizeBytes, bytesWritten: result.bytesWritten, durationMs,
+                timezone: timezone ?? null, timezoneFile: ok ? (ok.timezoneFile ?? null) : null })
             ops.appendFlashLog(line).catch(e => log(`flash.log: ${e}`))
             log(ok ? `Flash ${opId} done (safeToRemove=${safe})` : `Flash ${opId} failed: ${failure!.code}: ${failure!.text}`)
             refreshClientCards(storeHandle).catch(() => {})
