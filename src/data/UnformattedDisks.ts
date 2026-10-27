@@ -242,13 +242,20 @@ export const reevaluateUnformattedDisks = async (
     return true
 }
 
+/** idea#307: extra work for each poll tick (the usb monitor's failed-look retry); set once at monitor start */
+let afterPoll: (() => Promise<unknown>) | null = null
+export const setAfterUnformattedPoll = (fn: (() => Promise<unknown>) | null): void => { afterPoll = fn }
+
 export const UNFORMATTED_POLL_MS = 5_000
 export const startUnformattedDiskPoll = (storeHandle: DocHandle<Store>, ms: number = UNFORMATTED_POLL_MS): (() => void) => {
     let running = false
     const t = setInterval(() => {
         if (running) return
         running = true
-        reevaluateUnformattedDisks(storeHandle).catch(e => log(`unformatted poll: ${e}`)).finally(() => { running = false })
+        reevaluateUnformattedDisks(storeHandle).catch(e => log(`unformatted poll: ${e}`))
+            .then(() => afterPoll?.())
+            .catch(e => log(`unformatted poll (after): ${e}`))
+            .finally(() => { running = false })
     }, ms)
     return () => clearInterval(t)
 }

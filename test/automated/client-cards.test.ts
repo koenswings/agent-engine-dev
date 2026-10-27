@@ -19,6 +19,7 @@ import { EngineID, DiskID } from '../../src/data/CommonTypes.js'
 import {
     scanClientCards, setClientCardOpsForTests, clearClientCardStateForTests, refreshClientCards,
     resetClientCardWriteCacheForTests, classifyContents, usbPathOf, CardLsblkDevice, setClientCardProbes,
+    isAlreadyIdeaLook,
 } from '../../src/data/ClientCards.js'
 import { scanClientImages, setClientImageOpsForTests, resolveImage, parseShaLine } from '../../src/data/ClientImages.js'
 import {
@@ -56,12 +57,15 @@ const IDEA_SSD: CardLsblkDevice = { name: 'sdf', type: 'disk', size: 240 * GB, r
 let lsblk: CardLsblkDevice[] = []
 let lsblkHook: (() => Promise<void>) | null = null
 let osRootfsParts = new Set<string>()
+let ideaMetaParts = new Set<string>()
 const useDevices = (devs: CardLsblkDevice[], docked: string[] = ['sdf1'], sys: (d: string) => boolean = (d) => d.startsWith('sda')) => {
     lsblk = devs
     lsblkHook = null
     osRootfsParts = new Set()
+    ideaMetaParts = new Set()
     setClientCardOpsForTests({
         osRootfsPartition: (p) => osRootfsParts.has(p),
+        ideaMetaPartition: (p) => ideaMetaParts.has(p),
         lsblkJson: async () => { if (lsblkHook) await lsblkHook(); return JSON.parse(JSON.stringify(lsblk)) },
         byIdLinks: async () => lsblk.filter(d => d.name !== 'sda').map(d => ({ link: `/dev/disk/by-id/usb-${(d.model ?? 'X').replace(/ /g, '_')}_${d.serial}-0:0`, device: d.name })),
         sysfsPath: async (d) => `/sys/devices/platform/scb/fd500000.pcie/pci0000:00/0000:01:00.0/usb1/1-1/1-1.${d.charCodeAt(2) - 96}/1-1.${d.charCodeAt(2) - 96}:1.0/host0/target0:0:0/0:0:0:0/block/${d}`,
@@ -641,6 +645,26 @@ describe('disk roles: USB disks get both roles, SD cards flash only (idea#303)',
         expect(await code(initialiseDisk(h, anna.candidateId, 'files'))).toBe('OS_ROOTFS')
         expect(wrote).toBe(false)
         expect(Object.keys(h.doc()!.diskDB)).toHaveLength(0)
+    })
+
+    it('idea#311: an ejected IDEA disk (valid META.yaml, no IDEA-IGNORE) left plugged in is not offered initialise', async () => {
+        useDevices([SYS, EXT4_STICK])
+        ideaMetaParts.add('sdi1')
+        const c = (await scanClientCards(undefined, String(LOCAL))).diskCandidates!.find(x => x.device === 'sdi')!
+        expect(c.actions).not.toContain('initialise')
+        expect(c.actions).toEqual(['flash'])
+    })
+
+    it('idea#311: a disk with META.yaml and an IDEA-IGNORE marker keeps initialise (teacher may re-take it)', async () => {
+        useDevices([SYS, EXT4_STICK])
+        // the default op's predicate: META + IGNORE is not "already IDEA"; META alone is
+        expect(isAlreadyIdeaLook({ ok: true, hasMeta: true, alreadyMounted: false, ignored: true })).toBe(false)
+        expect(isAlreadyIdeaLook({ ok: true, hasMeta: true, alreadyMounted: false, ignored: false })).toBe(true)
+        expect(isAlreadyIdeaLook({ ok: true, hasMeta: false, alreadyMounted: false })).toBe(false)
+        expect(isAlreadyIdeaLook({ ok: false, message: 'x' })).toBe(false)
+        expect(isAlreadyIdeaLook(undefined)).toBe(false)
+        const c = (await scanClientCards(undefined, String(LOCAL))).diskCandidates!.find(x => x.device === 'sdi')!
+        expect(c.actions).toEqual(['initialise', 'flash'])
     })
 
     it('refuses a docked IDEA SSD, a mounted USB disk and the system disk; nothing is spawned', async () => {
