@@ -47,9 +47,16 @@ deployment records, comparison, input archives, kit retro records, MORANGO proce
 r86q diagnosis: why the shared store's history (heartbeats, metrics) made syncs slow, and the fixes (#192/#194, compaction).
 → [docs/STORE_HISTORY_R86Q.md](STORE_HISTORY_R86Q.md)
 
+## USB-STICKS.md
+**Status:** Authoritative  ·  **Maintained by:** Axle
+Teacher USB sticks (idea#193): Engine ⇄ app interface — `/run/idea-usb` mount root, read-only
+vfat/exFAT mount options, store fields and what apps (Nextcloud, Kolibri) see.
+→ [docs/USB-STICKS.md](USB-STICKS.md)
+
 ## interfaces.json
-**Status:** Supporting asset  ·  **Maintained by:** Axle
-Generated/supporting JSON describing Engine interfaces (not narrative docs).
+**Status:** Static snapshot (intentionally not updated; idea#308)  ·  **Maintained by:** Axle
+A one-off sample of Node's `os.networkInterfaces()` output from a Pi, kept as an example of the
+shape the Engine reads. Not generated, not read by any code or test; it does not track the source.
 → [docs/interfaces.json](interfaces.json)
 
 ## source-bundle.md
@@ -60,14 +67,17 @@ Generated source bundle of Engine docs/code for offline review and PDF export.
 ## styles/markdown-pdf.css
 **Status:** Supporting asset (PDF styles)  ·  **Maintained by:** Axle
 CSS stylesheet used by markdown-to-PDF rendering for Engine documentation.
+Static stylesheet: intentionally unchanged unless the rendering changes (idea#308).
 → [docs/styles/markdown-pdf.css](styles/markdown-pdf.css)
 
 ## styles/markdown.css
 **Status:** Supporting asset (styles)  ·  **Maintained by:** Axle
 Base CSS stylesheet for rendered Engine markdown documentation.
+Static stylesheet: intentionally unchanged unless the rendering changes (idea#308).
 → [docs/styles/markdown.css](styles/markdown.css)
 
 ## styles/tomorrow.css
 **Status:** Supporting asset (styles)  ·  **Maintained by:** Axle
 Syntax-highlight / theme CSS (Tomorrow) for rendered Engine markdown documentation.
+Static stylesheet: intentionally unchanged unless the rendering changes (idea#308).
 → [docs/styles/tomorrow.css](styles/tomorrow.css)
