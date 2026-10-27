@@ -322,6 +322,47 @@ describe('flashCard / cancelFlash (idea#201 §10)', () => {
         } finally { fs.rmSync(zi, { recursive: true, force: true }) }
     })
 
+    it('idea#203 §2: --home <engine name> only with helper v4+ and a valid name; otherwise skipped, logged, flash still ok', async () => {
+        const flashWith = async (ver: number | null, name: string, probeThrows = false) => {
+            clearFlashStateForTests(); spawned.length = 0
+            setFlashCardOpsForTests({
+                helperInstalled: () => true, engineTimezone: async () => '', homeEngineName: () => name,
+                helperVersion: async () => { if (probeThrows) throw new Error('sudo failed'); return ver },
+                spawnHelper: (a) => { spawned.push(a); proc = new FakeProc(); return proc as any },
+                images: async () => ({ current: V2, previous: null, images: [IMG] }),
+                appendFlashLog: async (l) => { logLines.push(l) },
+                isSystemDevice: async (d) => d.startsWith('sda'),
+                lookForMeta: async () => ({ ok: true, hasMeta: false, alreadyMounted: false, ignored: false }),
+            })
+            const { done } = await flashCard(h, cardId, 'current', String(32 * GB))
+            const home = spawned[0].home
+            proc.line({ result: 'ok', bytesWritten: 9, sha256: 'c'.repeat(64), readBackSha256: 'c'.repeat(64), safeToRemove: true, timezoneFile: 'skipped', homeFile: home ? 'written' : 'skipped' })
+            proc.end(0)
+            expect(await done).not.toBeNull()
+            return { home, log: JSON.parse(logLines[logLines.length - 1]) }
+        }
+        const logged: string[] = []
+        const orig = console.info; console.info = (...a: any[]) => { logged.push(a.join(' ')) }
+        try {
+            const ok = await flashWith(4, 'brave-otter')
+            expect(ok.home).toBe('brave-otter')
+            expect(ok.log).toMatchObject({ result: 'ok', home: 'brave-otter', homeFile: 'written' })
+            for (const [ver, thr] of [[3, false], [2, false], [null, false], [4, true]] as const) {
+                logged.length = 0
+                const r = await flashWith(ver, 'brave-otter', thr)
+                expect(r.home, String(ver)).toBeUndefined()
+                expect(r.log).toMatchObject({ result: 'ok', home: null, homeFile: 'skipped' })
+                expect(logged.join('\n')).toMatch(/idea-home\.txt skipped: .*too old/)
+            }
+            for (const bad of ['', 'Brave-Otter', 'brave-otter.local', '-x', 'x-', 'a_b', '../x', 'a'.repeat(64), 'x; rm -rf /']) {
+                logged.length = 0
+                const r = await flashWith(4, bad)
+                expect(r.home, bad).toBeUndefined()
+                expect(logged.join('\n')).toMatch(/idea-home\.txt skipped: .*not a valid Engine name/)
+            }
+        } finally { console.info = orig }
+    })
+
     it('never flashes the system disk even if it were listed as a card', async () => {
         useDevices([{ ...SYS, rm: true, model: 'SD Card Reader' }, RPI_CARD], ['sdf1'], () => false)  // scanner fooled
         const sysCard = (await scanClientCards(undefined, String(LOCAL))).clientCards.find(c => c.device === 'sda')
@@ -487,7 +528,7 @@ describe('capabilities + helper script (idea#201 §10)', () => {
 
     it('helper parses (bash -n) and reports its version', () => {
         execFileSync('bash', ['-n', HELPER])
-        expect(run(['--version']).stdout.trim()).toBe('idea-flash-card 3')
+        expect(run(['--version']).stdout.trim()).toBe('idea-flash-card 4')
     })
 
     it('helper refuses bad arguments before touching any device (exit 2, BAD_ARGS)', () => {

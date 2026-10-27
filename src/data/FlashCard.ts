@@ -34,6 +34,7 @@ import { ENGINE_STATE_DIR } from './FilesMount.js'
 import { lookForIdeaMeta, safeMount, mountPointOf, unmountAndRemove } from '../monitors/mounts.js'
 import { forgetMetaLook } from '../monitors/metaLookCache.js'
 import { log, print, uuid } from '../utils/utils.js'
+import { hostIdentity } from './HostIdentity.js'
 import { readEngineTimezone, validateClientTimezone, ZONEINFO_DIR } from './ClientTimezone.js'
 
 export const FLASH_HELPER = '/usr/local/sbin/idea-flash-card'
@@ -55,6 +56,8 @@ export interface FlashHelperArgs {
     osRootfsPartitions: string[]
     /** idea#208: the Engine's own validated tz name → idea-timezone.txt on the card; absent: no file (client stays UTC) */
     timezone?: string
+    /** idea#203 §2: the home-Engine name (bare hostname) → idea-home.txt "<name>.local\n"; absent: no file */
+    home?: string
 }
 
 export interface FlashCardOps {
@@ -82,6 +85,8 @@ export interface FlashCardOps {
     zoneinfoDir: string
     /** `sudo -n idea-flash-card --version` → its protocol number; null when unknown or the probe fails */
     helperVersion: () => Promise<number | null>
+    /** This Engine's bare hostname (the client's home Engine) */
+    homeEngineName: (h: DocHandle<Store>) => string
 }
 
 let addDeviceImpl: ((p: string) => Promise<void>) | null = null
@@ -92,7 +97,8 @@ const defaultOps: FlashCardOps = {
     spawnHelper: (a) => spawn('sudo', ['-n', FLASH_HELPER, '--by-id', a.byId, '--expect-device', a.device,
         '--expect-size', String(a.sizeBytes), '--image', a.image, '--sha256', a.sha256,
         ...a.osRootfsPartitions.flatMap(p => ['--os-rootfs', p]),
-        ...(a.timezone ? ['--timezone', a.timezone] : [])], { stdio: ['ignore', 'pipe', 'pipe'] }),
+        ...(a.timezone ? ['--timezone', a.timezone] : []),
+        ...(a.home ? ['--home', a.home] : [])], { stdio: ['ignore', 'pipe', 'pipe'] }),
     scan: (h) => refreshClientCards(h),
     images: (h) => refreshClientImages(h),
     appendFlashLog: async (line) => { await fs.ensureDir(path.dirname(FLASH_LOG)); await fs.appendFile(FLASH_LOG, line + '\n') },
@@ -119,12 +125,17 @@ const defaultOps: FlashCardOps = {
         const r = await $`sudo -n ${FLASH_HELPER} --version`.nothrow().quiet()
         return r.exitCode === 0 ? parseFlashHelperVersion(r.stdout) : null
     },
+    homeEngineName: (h) => { const d = h.doc(); return d ? hostIdentity(d).hostname : '' },
 }
 let ops: FlashCardOps = defaultOps
 export const setFlashCardOpsForTests = (o: Partial<FlashCardOps> | null): void => { ops = o ? { ...defaultOps, ...o } : defaultOps }
 
 /** idea#208: --timezone needs idea-flash-card v3 or later */
 export const FLASH_HELPER_TIMEZONE_MIN = 3
+/** idea#203 §2: --home needs idea-flash-card v4 or later */
+export const FLASH_HELPER_HOME_MIN = 4
+/** Same rule as idea-write-home-engine and the client's idea-home-engine boot step */
+export const HOME_ENGINE_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/
 /** Parse "idea-flash-card <N>" (the helper's --version line); null for anything else. */
 export const parseFlashHelperVersion = (out: string): number | null => {
     const m = /^idea-flash-card ([0-9]{1,6})$/.exec(String(out ?? '').trim())
@@ -219,6 +230,16 @@ export const flashCard = async (
         if (!tz.ok) log(`flashCard: idea-timezone.txt skipped (${tz.reason}); the client stays on UTC`)
     }
 
+    let home: string | undefined
+    if (helperVersion == null || helperVersion < FLASH_HELPER_HOME_MIN) {
+        print(`flashCard: idea-home.txt skipped: ${FLASH_HELPER} is too old (version ${helperVersion ?? 'unknown'}, needs >= ${FLASH_HELPER_HOME_MIN}); the client has no home Engine`)
+    } else {
+        let name = ''
+        try { name = ops.homeEngineName(storeHandle) } catch { name = '' }
+        if (HOME_ENGINE_NAME_RE.test(name)) home = name
+        else print(`flashCard: idea-home.txt skipped: '${name}' is not a valid Engine name; the client has no home Engine`)
+    }
+
     const traceId = getActiveTrace()?.traceId
     const opId = createOperation(storeHandle, 'flashCard',
         { candidateId, version: image.version, confirmSizeBytes: String(confirmSize) }, 'console-command', { type: 'disk', id: candidateId })
@@ -233,7 +254,7 @@ export const flashCard = async (
     const done = new Promise<FlashResult | null>((resolve) => {
         let proc: ChildProcess
         try {
-            proc = ops.spawnHelper({ byId: card.byId!, device: card.device, sizeBytes: card.sizeBytes, image: imagePathOf(image.version), sha256: image.sha256, osRootfsPartitions, timezone })
+            proc = ops.spawnHelper({ byId: card.byId!, device: card.device, sizeBytes: card.sizeBytes, image: imagePathOf(image.version), sha256: image.sha256, osRootfsPartitions, timezone, home })
         } catch (e) {
             finish(null, { code: 'HELPER_MISSING', text: String(e) }); return
         }
@@ -286,6 +307,8 @@ export const flashCard = async (
             if (ok) {
                 if (ok.timezoneFile === 'failed') log(`Flash ${opId}: idea-timezone.txt could not be written (${(err.match(/^warning: TIMEZONE_FAILED: (.*)$/m) ?? [])[1] ?? 'no detail'}); the client stays on UTC`)
                 else if (ok.timezoneFile === 'written') log(`Flash ${opId}: idea-timezone.txt = ${timezone}`)
+                if (ok.homeFile === 'failed') print(`Flash ${opId}: idea-home.txt could not be written (${(err.match(/^warning: HOME_FAILED: (.*)$/m) ?? [])[1] ?? 'no detail'}); the client has no home Engine`)
+                else if (ok.homeFile === 'written') log(`Flash ${opId}: idea-home.txt = ${home}.local`)
                 updateOperation(storeHandle, opId, {
                     status: 'Done', completedAt: ops.now() as Timestamp, progressPercent: 100, safeToRemove: safe,
                     error: safe ? null : 'POWER_OFF_FAILED: the card was written but could not be switched off — eject it before removing it',
@@ -298,7 +321,8 @@ export const flashCard = async (
             const line = JSON.stringify({ at: new Date(ops.now()).toISOString(), operationId: opId, traceId: traceId ?? null,
                 result: ok ? (safe ? 'ok' : 'POWER_OFF_FAILED') : failure!.code, version: image.version, sha256: image.sha256,
                 byId: card!.byId, device: card!.device, sizeBytes: card!.sizeBytes, bytesWritten: result.bytesWritten, durationMs,
-                timezone: timezone ?? null, timezoneFile: ok ? (ok.timezoneFile ?? null) : null })
+                timezone: timezone ?? null, timezoneFile: ok ? (ok.timezoneFile ?? null) : null,
+                home: home ?? null, homeFile: ok ? (ok.homeFile ?? null) : null })
             ops.appendFlashLog(line).catch(e => log(`flash.log: ${e}`))
             log(ok ? `Flash ${opId} done (safeToRemove=${safe})` : `Flash ${opId} failed: ${failure!.code}: ${failure!.text}`)
             refreshClientCards(storeHandle).catch(() => {})
