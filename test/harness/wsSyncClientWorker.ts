@@ -43,6 +43,10 @@ export interface WsSyncClientResult {
     firstDisconnectMs?: number
     /** the handle was seen in state 'unavailable' at some point */
     sawUnavailable?: boolean
+    /** idea#332: how late this thread's own timeout timer fired (ms); large = the whole thread/host was stalled */
+    timerLateMs?: number
+    /** idea#332: longest gap between this thread's 100 ms heartbeats (ms); large = this thread was blocked */
+    maxLoopGapMs?: number
 }
 
 const run = async (input: WsSyncClientInput): Promise<WsSyncClientResult> => {
@@ -57,7 +61,10 @@ const run = async (input: WsSyncClientInput): Promise<WsSyncClientResult> => {
     adapter.on('peer-candidate', () => { peerConnects++; peerMs ??= since() })
     adapter.on('peer-disconnected', () => { peerDisconnects++; firstDisconnectMs ??= since() })
     let timer: NodeJS.Timeout | undefined
-    const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`timeout after ${input.timeoutMs} ms`)), input.timeoutMs) })
+    let timerLateMs: number | undefined
+    let lastBeat = performance.now(), maxLoopGapMs = 0
+    const beat = setInterval(() => { const n = performance.now(); maxLoopGapMs = Math.max(maxLoopGapMs, Math.round(n - lastBeat)); lastBeat = n }, 100)
+    const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => { timerLateMs = Math.max(0, since() - input.timeoutMs); reject(new Error(`timeout after ${input.timeoutMs} ms (timer fired ${timerLateMs} ms late)`)) }, input.timeoutMs) })
     let state = 'none'
     let sawUnavailable = false
     try {
@@ -69,18 +76,19 @@ const run = async (input: WsSyncClientInput): Promise<WsSyncClientResult> => {
                 await new Promise(r => setTimeout(r, 25))
             }
             state = handle.state
-            return { index: input.index, ok: handle.isReady(), elapsedMs: since(), state, error: handle.isReady() ? undefined : `not ready after ${input.timeoutMs} ms`, openMs, peerMs, peerConnects, peerDisconnects, firstDisconnectMs, sawUnavailable }
+            return { index: input.index, ok: handle.isReady(), elapsedMs: since(), state, error: handle.isReady() ? undefined : `not ready after ${input.timeoutMs} ms`, openMs, peerMs, peerConnects, peerDisconnects, firstDisconnectMs, sawUnavailable, maxLoopGapMs }
         }
         const handle = await Promise.race([repo.find(input.docId as DocumentId), timeout])
         await Promise.race([handle.whenReady(), timeout])
         state = handle.state
-        return { index: input.index, ok: handle.isReady(), elapsedMs: since(), state, openMs, peerMs, peerConnects, peerDisconnects, firstDisconnectMs }
+        return { index: input.index, ok: handle.isReady(), elapsedMs: since(), state, openMs, peerMs, peerConnects, peerDisconnects, firstDisconnectMs, maxLoopGapMs }
     } catch (e) {
         const h = repo.handles[input.docId as DocumentId]
         state = h?.state ?? state
-        return { index: input.index, ok: false, elapsedMs: since(), state, error: e instanceof Error ? e.message : String(e), openMs, peerMs, peerConnects, peerDisconnects, firstDisconnectMs }
+        return { index: input.index, ok: false, elapsedMs: since(), state, error: e instanceof Error ? e.message : String(e), openMs, peerMs, peerConnects, peerDisconnects, firstDisconnectMs, timerLateMs, maxLoopGapMs }
     } finally {
         clearTimeout(timer)
+        clearInterval(beat)
     }
 }
 
