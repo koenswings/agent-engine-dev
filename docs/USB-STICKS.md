@@ -1,6 +1,6 @@
 # idea#193 teacher USB sticks: Engine ⇄ app interface (for Kid, app-nextcloud#7 @84ef94a)
 
-Engine side: agent-engine-dev branch `feat/193-usb-sticks` (PR link in the report). Not merged.
+Engine side: merged on agent-engine-dev main (idea#193; originally branch `feat/193-usb-sticks`).
 
 ## 1. Host side (Engine)
 - Mount root: `/run/idea-usb`, created at every boot by `/etc/tmpfiles.d/idea-usb.conf`
