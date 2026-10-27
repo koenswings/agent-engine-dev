@@ -1,5 +1,6 @@
 import { chalk } from 'zx'
 import { Hostname } from '../data/CommonTypes.js'
+import { print } from '../utils/utils.js'
 import { isStickerName, normaliseName, pickUniqueName, Rand } from '../utils/nameGenerator.js'
 
 /**
@@ -99,7 +100,7 @@ export interface RealDepsOpts {
 
 export const realStickerNameDeps = (exec: any, opts: RealDepsOpts = {}): StickerNameDeps => {
     const file = opts.stickerFile ?? STICKER_NAME_FILE
-    const log = opts.log ?? ((m: string) => console.log(chalk.yellow(m)))
+    const log = opts.log ?? ((m: string) => print(chalk.yellow(m)))
     let avahiWarned = false
     return {
     log,

@@ -63,6 +63,24 @@ describe('idea#184 --no-rename tool and real deps', () => {
     })
 })
 
+describe('idea#336 default sticker-name logger', () => {
+    it('logs through the Engine print() helper, not console.log', async () => {
+        expect(read('src/install/stickerName.ts')).not.toMatch(/console\.log/)
+        const { realStickerNameDeps } = await import('../../src/install/stickerName.js')
+        const seen: unknown[][] = []
+        const origInfo = console.info, origLog = console.log
+        const logCalls: unknown[][] = []
+        console.info = (...a: unknown[]) => { seen.push(a) }
+        console.log = (...a: unknown[]) => { logCalls.push(a) }
+        try {
+            const exec = async () => ({ stdout: '' })
+            realStickerNameDeps(exec).log!('hello-336')
+        } finally { console.info = origInfo; console.log = origLog }
+        expect(seen.some((a) => String(a[0]).includes('hello-336'))).toBe(true)
+        expect(logCalls.length).toBe(0)
+    })
+})
+
 describe('idea#184 store check ports', () => {
     it('tries the default and the pool Console port', async () => {
         const { STORE_PORTS } = await import('../../src/install/stickerName.js')
