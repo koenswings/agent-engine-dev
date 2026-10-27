@@ -18,6 +18,7 @@ import { DiskID, Timestamp } from './CommonTypes.js'
 import { getCommandLogHandle, stashTraceResult } from './CommandLogStore.js'
 import { getActiveTrace } from '../utils/CommandLogger.js'
 import { log } from '../utils/utils.js'
+import { labelForUnformatted } from './UnformattedDisks.js'
 
 export const SUMMARY_MAX_ENTRIES = 100_000
 export const SUMMARY_MAX_MS = 10_000
@@ -99,6 +100,19 @@ export const resolveSummaryTarget = (store: Store, targetId: string): {
     const cand = eng?.unformattedDisks?.find(c => c.candidateId === targetId)
     if (cand) {
         return { kind: 'unformatted', candidate: cand, label: cand.label, serial: (cand as any).serial ?? cand.candidateId }
+    }
+    // idea#310: a non-IDEA USB disk the scanner offers Erase for (e.g. an old Engine SSD with an OS
+    // rootfs) is in neither list above; resolve it from diskCandidates. Docked disks are never candidates;
+    // the system-disk and mounted refusals stay in eraseDisk.
+    const dc = (eng?.diskCandidates ?? []).find(c => c?.candidateId === targetId && c.kind === 'usbDisk' && (c.actions ?? []).includes('erase'))
+    if (dc) {
+        const parts = dc.partitions ?? []
+        const fsType = parts.some(p => p.fsType === 'ext4') ? 'ext4' : (parts.find(p => p.fsType)?.fsType ?? null)
+        const candidate = {
+            candidateId: dc.candidateId, device: dc.device, sizeBytes: dc.sizeBytes, model: dc.model,
+            fsType, label: labelForUnformatted(dc.model, dc.sizeBytes), serial: dc.serial,
+        }
+        return { kind: 'unformatted', candidate, label: candidate.label, serial: dc.serial ?? dc.candidateId }
     }
     return null
 }

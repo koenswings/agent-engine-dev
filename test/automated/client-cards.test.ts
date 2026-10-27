@@ -577,7 +577,7 @@ describe('disk roles: USB disks get both roles, SD cards flash only (idea#303)',
         void done
     })
 
-    it('old Engine disk (OS rootfs on sdX2, idea#303 Steve 2026-10-25): flash only, no initialise; initialiseDisk refuses OS_ROOTFS', async () => {
+    it('old Engine disk (OS rootfs on sdX2, idea#303 Steve 2026-10-25): flash or erase (idea#310), no initialise; initialiseDisk refuses OS_ROOTFS', async () => {
         const ANNA: CardLsblkDevice = { name: 'sdk', type: 'disk', size: 120 * GB, rm: false, tran: 'usb', model: 'WDS120G2G0A', vendor: 'WDC', serial: 'ANNA303',
             children: [{ name: 'sdk1', type: 'part', fstype: 'vfat', label: 'bootfs', size: 1 * GB }, { name: 'sdk2', type: 'part', fstype: 'ext4', label: 'rootfs', size: 119 * GB }] }
         useDevices([SYS, ANNA, EXT4_STICK])
@@ -593,7 +593,7 @@ describe('disk roles: USB disks get both roles, SD cards flash only (idea#303)',
         })
         const r = await scanClientCards(undefined, String(LOCAL))
         const anna = r.diskCandidates!.find(c => c.device === 'sdk')!
-        expect(anna.actions).toEqual(['flash'])
+        expect(anna.actions).toEqual(['erase', 'flash'])   // idea#310: erase too, never initialise
         expect(anna.flashRefusal).toBeNull()
         expect(r.diskCandidates!.find(c => c.device === 'sdi')!.actions).toEqual(['initialise', 'flash'])   // a plain ext4 disk still can
         // Server side too, even if a stale Console offers it
