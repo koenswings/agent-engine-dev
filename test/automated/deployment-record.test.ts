@@ -1,0 +1,327 @@
+/**
+ * deployment-record.test.ts — reproducible Engine installs (idea#322).
+ *
+ * Unit level, runs on the box (no Pi): record parsing and comparison, the
+ * secret check, the build-engine source gate, the pins in Engine.ts, the
+ * read-only capture script and the committed kit retro records.
+ */
+import { describe, it, expect } from 'vitest'
+import path from 'path'
+import os from 'os'
+import crypto from 'crypto'
+import { fs, $ } from 'zx'
+import {
+    compareRecords, findSecrets, judgeSource, parseApt, parseKeyValues, parseSha256, formatDifferences, UNKNOWN,
+    validateRecord, setKeys, isEngineTag, REQUIRED_KEYS, archiveKeys, isFieldTag, parseVolatileList, volatileKeys, VOLATILE_KEYS, isUnknown,
+} from '../../src/install/deploymentRecord.js'
+import {
+    N_VERSION, PM2_VERSION, PM2_LOGROTATE_VERSION, TAILSCALE_VERSION, TAILSCALE_ARM64_SHA256, tailscaleDownloadScript,
+    DEBIAN_SNAPSHOT, DEBIAN_SNAPSHOT_SOURCES, parseAptPins,
+} from '../../src/data/Engine.js'
+
+const ROOT = process.cwd()
+const SHA_A = 'a'.repeat(64), SHA_B = 'b'.repeat(64)
+const C = '0123456789abcdef0123456789abcdef01234567'
+
+const base = () => ({
+    'record.txt': `schema=idea-deployment-record/1\ncapturedUtc=2026-10-26T10:00:00Z\nhostname=one\nengineCommit=${C}\nnodeVersion=v22.20.0\n`,
+    'packages.tsv': 'avahi-daemon\t0.8-16\tarm64\ngit\t1:2.47.3-0+deb13u1\tarm64\n',
+    'images.tsv': 'koenswings/kolibri:1.0\tsha256:1\tkoenswings/kolibri@sha256:2\n',
+    'files.sha256': `${SHA_A}  src/index.ts\n${SHA_B}  package.json\n`,
+    'dist.sha256': `${SHA_A}  src/index.js\n`,
+})
+
+describe('record parsing (idea#322)', () => {
+    it('parses key=value, apt and sha256 lines and ignores comments', () => {
+        expect(parseKeyValues('# c\na=1\nb = x=y\n').get('b')).toBe('x=y')
+        expect(parseApt('git\t1:2.47\tarm64\n').get('git:arm64')).toBe('1:2.47')
+        expect(parseSha256(`${SHA_A}  a b.txt\n`).get('a b.txt')).toBe(SHA_A)
+    })
+})
+
+describe('compareRecords (idea#322)', () => {
+    it('treats two installs with only volatile differences as content-identical', () => {
+        const b = base(); b['record.txt'] = b['record.txt'].replace('hostname=one', 'hostname=two').replace('10:00:00', '11:11:11')
+        b['packages.tsv'] = b['packages.tsv'].split('\n').reverse().join('\n')
+        expect(compareRecords(base(), b)).toEqual([])
+        expect(formatDifferences([])).toContain('IDENTICAL')
+    })
+    it('reports a changed package version, file hash, image digest and commit', () => {
+        const b = base()
+        b['packages.tsv'] = b['packages.tsv'].replace('0.8-16', '0.8-17')
+        b['files.sha256'] = b['files.sha256'].replace(`${SHA_A}  src/index.ts`, `${SHA_B}  src/index.ts`)
+        b['images.tsv'] = b['images.tsv'].replace('sha256:2', 'sha256:3')
+        b['record.txt'] = b['record.txt'].replace(C, C.replace('0', 'f'))
+        const keys = compareRecords(base(), b).map(d => `${d.file}:${d.key}`).sort()
+        expect(keys).toEqual(['files.sha256:src/index.ts', 'images.tsv:koenswings/kolibri:1.0', 'packages.tsv:avahi-daemon:arm64', 'record.txt:engineCommit'])
+    })
+    it('reports added and missing files and a missing record file', () => {
+        const b = base(); b['files.sha256'] += `${SHA_A}  extra.ts\n`; delete (b as any)['dist.sha256']
+        const d = compareRecords(base(), b)
+        expect(d.find(x => x.key === 'extra.ts')?.expected).toBeUndefined()
+        expect(d.find(x => x.file === 'dist.sha256')?.key).toBe('<file>')
+    })
+    it('never counts UNKNOWN (retro) values and honours ignore options', () => {
+        const a = base(); a['record.txt'] = a['record.txt'].replace('nodeVersion=v22.20.0', `nodeVersion=${UNKNOWN}`)
+        const b = base(); b['record.txt'] = b['record.txt'].replace('v22.20.0', 'v22.21.0'); b['files.sha256'] += `${SHA_A}  store-identity/x\n`
+        expect(compareRecords(a, b, { ignorePaths: ['store-identity/'] })).toEqual([])
+    })
+})
+
+describe('findSecrets (idea#322: records carry no secrets)', () => {
+    it('is clean for a normal record and flags auth keys, private keys and passwords', () => {
+        expect(findSecrets(base())).toEqual([])
+        expect(findSecrets({ 'record.txt': 'x=tskey-auth-abc123' })).toHaveLength(1)
+        expect(findSecrets({ 'record.txt': '-----BEGIN OPENSSH PRIVATE KEY-----' })).toHaveLength(1)
+        expect(findSecrets({ 'record.txt': 'password=raspberry' })).toHaveLength(1)
+    })
+})
+
+describe('judgeSource (idea#322 build gate)', () => {
+    it('accepts a clean tagged commit on main and names the tag', () => {
+        expect(judgeSource({ commit: C, tags: ['engine-v2026.10.27', 'engine-v2026.10.27-2', 'other'], dirty: false, onMain: true }))
+            .toEqual({ ok: true, tag: 'engine-v2026.10.27-2', reasons: [] })
+    })
+    it('only engine-vYYYY.MM.DD[-N] tags count', () => {
+        for (const t of ['engine-v2026.10.27', 'engine-v2026.01.01-1', 'engine-v2026.12.31-12']) expect(isEngineTag(t)).toBe(true)
+        for (const t of ['v1.0', 'engine-v2026.13.01', 'engine-v2026.10.1', 'engine-v2026.10.27-0', 'kit-adfd9d3-archive', 'engine-v2026.10.27-rc1'])
+            expect(isEngineTag(t)).toBe(false)
+        const v = judgeSource({ commit: C, tags: ['kit-adfd9d3-archive'], dirty: false, onMain: true })
+        expect(v.ok).toBe(false)
+        expect(v.reasons[0]).toContain('engine-vYYYY.MM.DD')
+    })
+    it('refuses untagged, dirty or off-main trees unless allowed, and always lists why', () => {
+        const s = { commit: C, tags: [], dirty: true, onMain: false }
+        const v = judgeSource(s)
+        expect(v.ok).toBe(false)
+        expect(v.reasons).toHaveLength(3)
+        expect(judgeSource(s, true)).toMatchObject({ ok: true, reasons: v.reasons })
+    })
+})
+
+describe('build-engine pins (idea#322)', () => {
+    const engine = fs.readFileSync(path.join(ROOT, 'src/data/Engine.ts'), 'utf8')
+    it('installs the Engine from the frozen lockfile and pins global npm tools', () => {
+        expect(engine).toContain('pnpm install --frozen-lockfile')
+        expect(engine).toMatch(/npm install -g -y n@\$\{N_VERSION\}/)
+        expect(engine).toMatch(/npm install -g pm2@\$\{PM2_VERSION\}/)
+        expect(engine).toMatch(/pm2-logrotate@\$\{PM2_LOGROTATE_VERSION\}/)
+        for (const v of [N_VERSION, PM2_VERSION, PM2_LOGROTATE_VERSION]) expect(v).toMatch(/^\d+\.\d+\.\d+$/)
+    })
+    it('build-engine gates on the source and writes a deployment record', () => {
+        const be = fs.readFileSync(path.join(ROOT, 'script/build-engine.ts'), 'utf8')
+        expect(be).toContain('judgeSource(')
+        expect(be).toContain('--allow-untagged')
+        expect(be).toContain('capture-engine-record.sh')
+        expect(be).toContain('deployments/engines/')
+        expect(be).not.toMatch(/records\/engines/)
+    })
+    it('pins Tailscale to a version and sha256 checked before install', () => {
+        expect(TAILSCALE_VERSION).toMatch(/^\d+\.\d+\.\d+$/)
+        expect(TAILSCALE_ARM64_SHA256).toMatch(/^[0-9a-f]{64}$/)
+        const sh = tailscaleDownloadScript()
+        expect(sh).toContain(`tailscale_${TAILSCALE_VERSION}_arm64.tgz`)
+        expect(sh.indexOf('sha256sum -c')).toBeLessThan(sh.indexOf('sudo tar'))
+        expect(sh).not.toContain('grep -oP')
+        expect(engine).toContain('tailscaleDownloadScript()')
+    })
+    it('points Debian apt at a dated snapshot and reads the Raspberry Pi pins', () => {
+        expect(DEBIAN_SNAPSHOT).toMatch(/^\d{8}T\d{6}Z$/)
+        const src = DEBIAN_SNAPSHOT_SOURCES('trixie')
+        expect(src).toContain(`https://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/`)
+        expect(src).toContain(`https://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/`)
+        expect(src).toContain('Suites: trixie-security')
+        expect(src).not.toContain('deb.debian.org')
+        expect(parseAptPins('# c\nchromium\t1:155-1+rpt1\n\nbad\n')).toEqual([{ pkg: 'chromium', version: '1:155-1+rpt1' }])
+        expect(engine.indexOf('await pinAptSnapshot(exec)')).toBeLessThan(engine.indexOf('await updateSystem(exec)'))
+        expect(fs.existsSync(path.join(ROOT, 'script/build_image_assets/apt-rpi-pins.tsv'))).toBe(true)
+        // Raspberry Pi OS: Debian sources (debian.sources, deb.debian.org) are replaced; raspi.sources stays and pins are held
+        expect(engine).toContain('/etc/apt/sources.list.d/debian.sources')
+        expect(engine).not.toMatch(/raspi\.sources.*idea-disabled/)
+        expect(engine.indexOf('apt-mark hold ${pins')).toBeGreaterThan(engine.indexOf('const installRpiPins'))
+        expect(fs.readFileSync(path.join(ROOT, 'script/archive-debs.py'), 'utf8')).not.toMatch(/launchpad/i)
+    })
+    it('has one install path: install.sh only wraps build-engine; install_packages is frozen', () => {
+        const inst = fs.readFileSync(path.join(ROOT, 'script/install.sh'), 'utf8')
+        expect(inst).toMatch(/exec \.\/build-engine "\$@"/)
+        expect(inst).not.toMatch(/apt-get|npm install -g|\bn 20\b|git clone https:\/\/github.com\/koenswings\/engine/m)
+        const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'))
+        expect(pkg.scripts.install_packages).toBe('pnpm install --frozen-lockfile')
+    })
+})
+
+describe('capture-engine-record.sh (read-only)', () => {
+    const script = path.join(ROOT, 'script/capture-engine-record.sh')
+    it('refuses an output folder outside /tmp and has no write/install/restart commands', async () => {
+        const r = await $({ nothrow: true })`bash ${script} --out ${path.join(ROOT, 'x-record')}`
+        expect(r.exitCode).toBe(2)
+        expect(fs.existsSync(path.join(ROOT, 'x-record'))).toBe(false)
+        const body = fs.readFileSync(script, 'utf8').split('\n').filter(l => !l.trim().startsWith('#')).join('\n')
+        expect(body).not.toMatch(/\bsudo\b|apt(-get)? install|npm install|pm2 (restart|start|stop|save)|systemctl|docker (pull|run|rm|load)|\/etc\/tailscale|\.ssh/)
+    })
+    it('captures a record of this checkout whose two captures are content-identical and secret-free', async () => {
+        const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-test-rec'))
+        try {
+            for (const l of ['a', 'b']) await $`bash ${script} --engine-dir ${ROOT} --out ${tmp}/${l} --label ${l}`
+            const read = (d: string) => Object.fromEntries(['record.txt', 'packages.tsv', 'images.tsv', 'files.sha256', 'dist.sha256'].map(f => [f, fs.readFileSync(`${d}/${f}`, 'utf8')]))
+            const a = read(`${tmp}/a`), b = read(`${tmp}/b`)
+            expect(parseKeyValues(a['record.txt']).get('schema')).toBe('idea-deployment-record/1')
+            expect(parseSha256(a['files.sha256']).has('package.json')).toBe(true)
+            expect(compareRecords(a, b)).toEqual([])
+            expect(findSecrets(a)).toEqual([])
+            expect(validateRecord(a['record.txt'])).toEqual([])
+        } finally { await fs.remove(tmp) }
+    })
+    it('finds tailscale off PATH and hashes every /usr/local/sbin/idea-* helper into helpers.sha256', async () => {
+        const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-test-rec'))
+        try {
+            const sbin = `${tmp}/sbin`, tsDir = `${tmp}/usr-sbin`
+            await fs.mkdirp(sbin); await fs.mkdirp(tsDir)
+            const names = ['idea-app-data', 'idea-avahi-lan-only', 'idea-dhcp-vendor-class', 'idea-erase-disk', 'idea-flash-card', 'idea-peer-gate', 'idea-new-helper']
+            for (const n of names) await fs.writeFile(`${sbin}/${n}`, `#!/bin/sh\necho ${n}\n`, { mode: 0o755 })
+            await fs.writeFile(`${sbin}/other-tool`, 'x\n')
+            await fs.writeFile(`${tsDir}/tailscale`, '#!/bin/sh\n[ "$1" = version ] && printf "1.104.1\\n  tailscale commit: abc\\n"\n', { mode: 0o755 })
+            // PATH without any tailscale: only the fallback can find it
+            const PATH = (process.env.PATH ?? '').split(':').filter(d => !fs.existsSync(`${d}/tailscale`)).join(':')
+            const r = await $({ env: { ...process.env, PATH, IDEA_CAPTURE_SBIN_DIR: sbin, IDEA_CAPTURE_TAILSCALE_FALLBACK: `${tmp}/nope/tailscale ${tsDir}/tailscale` } })`bash ${script} --engine-dir ${ROOT} --out ${tmp}/out --label t`
+            expect(r.exitCode).toBe(0)
+            expect(parseKeyValues(fs.readFileSync(`${tmp}/out/record.txt`, 'utf8')).get('tailscaleVersion')).toBe('1.104.1')
+            const helpers = fs.readFileSync(`${tmp}/out/helpers.sha256`, 'utf8')
+            const map = parseSha256(helpers)
+            expect(helpers.split('\n').filter(Boolean).map(l => l.slice(66))).toEqual(names.slice().sort().map(n => `${sbin}/${n}`))
+            for (const n of names) expect(map.get(`${sbin}/${n}`)).toBe(crypto.createHash('sha256').update(`#!/bin/sh\necho ${n}\n`).digest('hex'))
+            expect(fs.readFileSync(`${tmp}/out/record.txt`, 'utf8')).not.toMatch(/^helper\./m)
+        } finally { await fs.remove(tmp) }
+    })
+    it('compares helpers.sha256 when the expected record has it', () => {
+        const e = { 'record.txt': 'schema=idea-deployment-record/1\n', 'helpers.sha256': `${'a'.repeat(64)}  /usr/local/sbin/idea-app-data\n` }
+        expect(compareRecords(e, { ...e })).toEqual([])
+        expect(compareRecords(e, { ...e, 'helpers.sha256': `${'b'.repeat(64)}  /usr/local/sbin/idea-app-data\n` }).map(d => d.file)).toEqual(['helpers.sha256'])
+    })
+})
+
+describe('Docker and dev image pins (idea#322)', () => {
+    const A = path.join(ROOT, 'script/build_image_assets')
+    it('pins the five Docker Engine debs for arm64 trixie by version and sha256', () => {
+        const rows = fs.readFileSync(path.join(A, 'docker-pins.tsv'), 'utf8').split('\n').filter(l => l && !l.startsWith('#')).map(l => l.split('\t'))
+        expect(rows.map(r => r[0])).toEqual(['docker-ce', 'docker-ce-cli', 'containerd.io', 'docker-buildx-plugin', 'docker-compose-plugin'])
+        for (const [, ver, pool, sha] of rows) {
+            expect(ver).toMatch(/~debian\.13~trixie$/)
+            expect(pool).toMatch(/^dists\/trixie\/pool\/stable\/arm64\/.+_arm64\.deb$/)
+            expect(sha).toMatch(/^[0-9a-f]{64}$/)
+        }
+    })
+    it('installs Docker only from sha-checked debs, cache first', () => {
+        const sh = fs.readFileSync(path.join(A, 'install-docker-pinned.sh'), 'utf8')
+        expect(sh).toContain('deb-cache/docker')
+        expect(sh.indexOf('sha256sum -c')).toBeLessThan(sh.indexOf('apt-get install'))
+        expect(sh).not.toContain('get.docker.com')
+        const engine = fs.readFileSync(path.join(ROOT, 'src/data/Engine.ts'), 'utf8')
+        expect(engine).toContain('install-docker-pinned.sh')
+        expect(engine).not.toMatch(/build_image_assets\/install-docker\.sh/)
+        expect(fs.readFileSync(path.join(ROOT, 'script/archive-engine-inputs.sh'), 'utf8')).toContain('debs/docker')
+    })
+    it('pins the dev Dockerfile base image by digest', () => {
+        const from = fs.readFileSync(path.join(ROOT, 'Dockerfile'), 'utf8').split('\n').filter(l => /^FROM \S+:\S+/.test(l) && !/^FROM base/.test(l))
+        expect(from.length).toBeGreaterThan(0)
+        for (const l of from) expect(l).toMatch(/^FROM [^ ]+:[^ @]+@sha256:[0-9a-f]{64}( |$)/)
+    })
+    it('archiveKeys writes #323 packageArchive / packageArchiveSha256 / packageArchiveUrl', () => {
+        expect(archiveKeys({ boxPath: '/workspace/a/', sumsSha256: 'f'.repeat(64), releaseTag: 'field/b-1/engine-abcdef0' })).toEqual([
+            'packageArchive=/workspace/a/', `packageArchiveSha256=${'f'.repeat(64)}`,
+            'packageArchiveUrl=https://github.com/koenswings/agent-engine-dev/releases/tag/field/b-1/engine-abcdef0',
+        ])
+        expect(archiveKeys({})).toEqual(['packageArchive=UNKNOWN', 'packageArchiveSha256=UNKNOWN', 'packageArchiveUrl=not published yet'])
+    })
+    it('field/<batch>/engine-<sha7> tags are recognised but are not build tags', () => {
+        expect(isFieldTag('field/zimbabwe-2026-10/engine-adfd9d3')).toBe(true)
+        expect(isFieldTag('field/zimbabwe-2026-10/engine-adfd9d')).toBe(false)
+        expect(isFieldTag('engine-v2026.10.27')).toBe(false)
+        expect(isEngineTag('field/zimbabwe-2026-10/engine-adfd9d3')).toBe(false)
+    })
+    it('reads `key:` lines of idea tools/repro/volatile.txt, else the built-in list', () => {
+        expect(parseVolatileList('# c\netc/machine-id\nkey:uptime\n  key: capturedUtc \n')).toEqual(['uptime', 'capturedUtc'])
+        expect([...volatileKeys('key:a\nvar/log/*\n')]).toEqual(['a'])
+        expect(volatileKeys('var/log/*\n')).toEqual(VOLATILE_KEYS)
+        expect(volatileKeys(undefined)).toEqual(VOLATILE_KEYS)
+        for (const k of ['packageArchiveSha256', 'packageArchiveUrl', 'previousCardId', 'readBackSha256']) expect(VOLATILE_KEYS.has(k)).toBe(true)
+        expect(REQUIRED_KEYS).toEqual(expect.arrayContaining(['packageArchive', 'packageArchiveSha256', 'packageArchiveUrl']))
+    })
+})
+
+describe('idea deployments/ schema (idea#323)', () => {
+    const full = REQUIRED_KEYS.map(k => `${k}=${k === 'schema' ? 'idea-deployment-record/1' : k === 'deviceType' ? 'engine' : 'x'}`).join('\n') + '\nhostname=h\n'
+    it('accepts a complete Engine record and names what is missing or wrong', () => {
+        expect(validateRecord(full)).toEqual([])
+        expect(validateRecord(full.replace(/^batch=.*$/m, ''))).toEqual(['missing batch'])
+        expect(validateRecord(full.replace('hostname=h', ''))).toContain('missing hostname/stickerName/cardId')
+        expect(validateRecord(full.replace('deviceType=engine', 'deviceType=router'))).toContain('deviceType is router, expected engine')
+    })
+    it('setKeys replaces keys in place and appends new ones', () => {
+        expect(setKeys('a=1\nb=2\n', ['b=3', 'c=4'])).toBe('a=1\nb=3\nc=4\n')
+    })
+})
+
+describe('compare rules shared with idea tools/repro/compare-record.py', () => {
+    const rec = (o: Partial<Record<string, string>>) => o as any
+    it('UNKNOWN (with or without an explanation) never differs', () => {
+        expect(isUnknown('UNKNOWN (not captured)')).toBe(true)
+        expect(isUnknown('UNKNOWNISH')).toBe(false)
+        expect(compareRecords(rec({ 'record.txt': 'nodeVersion=UNKNOWN (expected v22)\n' }), rec({ 'record.txt': 'nodeVersion=v22.20.0\n' }))).toEqual([])
+    })
+    it('compares a sidecar only when the expected side has it; missing on actual is a difference', () => {
+        const base = { 'record.txt': 'a=1\n' }
+        expect(compareRecords(rec(base), rec({ ...base, 'packages.tsv': 'x\t1\tarm64\n' }))).toEqual([])
+        expect(compareRecords(rec({ ...base, 'images.tsv': 'r\ti\td\n' }), rec(base)).map(d => d.file)).toEqual(['images.tsv'])
+    })
+    it('--ignore-path is an exact path or a prefix ending in /', () => {
+        const e = rec({ 'files.sha256': `${'a'.repeat(64)}  src/x.ts\n${'a'.repeat(64)}  src/y.ts\n${'a'.repeat(64)}  srcfoo/z\n` })
+        const a = rec({ 'files.sha256': `${'b'.repeat(64)}  src/x.ts\n${'b'.repeat(64)}  src/y.ts\n${'b'.repeat(64)}  srcfoo/z\n` })
+        expect(compareRecords(e, a, { ignorePaths: ['src/'] }).map(d => d.key)).toEqual(['srcfoo/z'])
+        expect(compareRecords(e, a, { ignorePaths: ['src/x.ts', 'src'] }).map(d => d.key)).toEqual(['src/y.ts', 'srcfoo/z'])
+    })
+    it('engine-record.ts prefers compare-record.py from the idea checkout and falls back to TS', async () => {
+        const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-test-cr'))
+        try {
+            await fs.mkdirp(`${tmp}/idea/tools/repro`)
+            await fs.writeFile(`${tmp}/idea/tools/repro/compare-record.py`, 'import sys\nprint("PY", *sys.argv[1:])\n')
+            await fs.writeFile(`${tmp}/idea/tools/repro/volatile.txt`, 'key:x\n')
+            for (const d of ['e', 'f']) { await fs.mkdirp(`${tmp}/${d}`); await fs.writeFile(`${tmp}/${d}/record.txt`, `x=${d}\nschema=idea-deployment-record/1\n`) }
+            const tool = path.join(ROOT, 'script/engine-record.ts'), tsx = path.join(ROOT, 'node_modules/.bin/tsx')
+            const py = await $`${tsx} ${tool} compare ${tmp}/e ${tmp}/f --idea-repo ${tmp}/idea --ignore-path src/`
+            expect(py.stdout).toContain(`PY ${tmp}/e ${tmp}/f --volatile ${tmp}/idea/tools/repro/volatile.txt --ignore-path src/`)
+            const ts = await $`${tsx} ${tool} compare ${tmp}/e ${tmp}/f --idea-repo ${tmp}/idea --ts`
+            expect(ts.stdout).toContain('IDENTICAL')   // x is volatile per the idea list
+            const ts2 = await $({ nothrow: true })`${tsx} ${tool} compare ${tmp}/e ${tmp}/f --ts`
+            expect(ts2.exitCode).toBe(1)               // built-in list: x is compared
+            const chk = await $`${tsx} ${tool} check ${tmp}/e --idea-repo ${tmp}/idea`
+            expect(chk.stdout).toContain(`PY --check ${tmp}/e`)
+        } finally { await fs.remove(tmp) }
+    })
+})
+
+describe('release-archive.sh (prep only, never publishes)', () => {
+    it('splits an archive into parts that restore to the original and writes unrun gh commands', async () => {
+        const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-test-rel'))
+        try {
+            await fs.mkdirp(`${tmp}/arc/sub`)
+            await fs.writeFile(`${tmp}/arc/sub/blob`, Buffer.alloc(300_000, 7))
+            await $({ env: { ...process.env, PART_SIZE: '100k' } })`bash ${path.join(ROOT, 'script/release-archive.sh')} t-1 ${C} ${tmp}/arc ${tmp}/rel --tag field/b-1/engine-abcdef0 --prerelease`
+            const parts = (await fs.readdir(`${tmp}/rel`)).filter(f => f.startsWith('t-1.tar.part-'))
+            expect(parts.length).toBeGreaterThan(2)
+            await $({ cwd: `${tmp}/rel` })`sha256sum -c SHA256SUMS`
+            await $({ cwd: `${tmp}/rel` })`bash -c ${'cat t-1.tar.part-* > t-1.tar && echo "$(grep -oP "has sha256 .\\K[0-9a-f]{64}" RELEASE-NOTES.md)  t-1.tar" | sha256sum -c - && mkdir x && tar -xf t-1.tar -C x'}`
+            expect((await fs.readFile(`${tmp}/rel/x/arc/sub/blob`)).length).toBe(300_000)
+            const gh = await fs.readFile(`${tmp}/rel/gh-commands.sh`, 'utf8')
+            expect(gh).toContain('creates no tag')
+            expect(gh).not.toMatch(/git .*tag -a|git push/)
+            expect(gh).toContain('gh release create field/b-1/engine-abcdef0 --repo koenswings/agent-engine-dev --verify-tag --prerelease')
+            expect(await fs.readFile(`${tmp}/rel/SHA256SUMS`, 'utf8')).not.toMatch(/ t-1\.tar$/m)
+            const keys = await fs.readFile(`${tmp}/rel/record-keys.txt`, 'utf8')
+            expect(keys).toContain(`packageArchive=${tmp}/rel/`)
+            expect(keys).toMatch(/^packageArchiveSha256=[0-9a-f]{64}$/m)
+            expect(keys).toMatch(/packageArchiveParts=t-1\.tar\.part-00:[0-9a-f]{64},/)
+            expect(keys).toContain('packageArchiveUrl=https://github.com/koenswings/agent-engine-dev/releases/tag/field/b-1/engine-abcdef0')
+        } finally { await fs.remove(tmp) }
+    })
+})

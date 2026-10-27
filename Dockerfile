@@ -3,7 +3,7 @@
 # Use this target in compose-dev.yaml to run the repo using Docker Dev Environments
 # ------------------------------------------------------------------------------
 
-FROM ubuntu:focal-20240123 as base
+FROM ubuntu:focal-20240123@sha256:bb1c41682308d7040f74d103022816d41c50d7b0c89e9d706a74b4e548636e54 as base
 RUN apt-get update --fix-missing
 
 # Add ssh
