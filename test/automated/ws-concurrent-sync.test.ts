@@ -41,6 +41,7 @@
  */
 
 import { describe, it, beforeAll, afterAll, expect } from 'vitest'
+import { stallIt } from '../harness/stallGuard.js'
 import os from 'os'
 import path from 'path'
 import net from 'net'
@@ -133,7 +134,7 @@ describe('Automerge WS server: slow and crowded store sync (IDEA04-WS)', () => {
         if (dataDir) fs.rmSync(dataDir, { recursive: true, force: true })
     })
 
-    it('slow host + slow link: ONE client gets the store ready with zero WS drops', async () => {
+    stallIt('slow host + slow link: ONE client gets the store ready with zero WS drops', async () => {
         const proxy = await startThrottledProxy({ targetPort: port, downBytesPerSec: SLOW_LINK_BYTES_PER_SEC })
         const stall = (msg: any) => { if (msg?.documentId === docId && msg?.type !== 'ephemeral') burn(SLOW_HOST_STALL_MS) }
         repo.networkSubsystem.on('message', stall)
@@ -153,7 +154,7 @@ describe('Automerge WS server: slow and crowded store sync (IDEA04-WS)', () => {
         }
     }, SLOW_BUDGET_MS + 30_000)
 
-    it('link drop in the middle of the sync: the client reconnects and converges', async () => {
+    stallIt('link drop in the middle of the sync: the client reconnects and converges', async () => {
         const proxy = await startThrottledProxy({ targetPort: port, downBytesPerSec: 4 * 1024 * 1024, dropAfterDownBytes: DROP_AFTER_BYTES })
         try {
             const client = await startClient({ url: `ws://127.0.0.1:${proxy.port}`, docId, index: 0, timeoutMs: READY_BUDGET_MS, retryIntervalMs: CLIENT_RETRY_MS, tolerateUnavailable: true })
@@ -168,7 +169,7 @@ describe('Automerge WS server: slow and crowded store sync (IDEA04-WS)', () => {
         }
     }, READY_BUDGET_MS + 30_000)
 
-    it(`${CLIENTS} simultaneous fresh clients all get the store doc ready`, async () => {
+    stallIt(`${CLIENTS} simultaneous fresh clients all get the store doc ready`, async () => {
         const clients = await Promise.all(Array.from({ length: CLIENTS }, (_, index) => startClient({
             url: `ws://127.0.0.1:${port}`, docId, index, timeoutMs: READY_BUDGET_MS, retryIntervalMs: CLIENT_RETRY_MS,
         })))

@@ -13,6 +13,7 @@
  */
 import { PI_TIMING_FACTOR } from '../harness/hostEnv.js'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { stallIt } from '../harness/stallGuard.js'
 import http from 'node:http'
 import net from 'node:net'
 import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
@@ -72,7 +73,7 @@ describe('r86l: JSON ops for store writes', () => {
 })
 
 describe('r86l: store doc synced off the main thread', () => {
-    it('heavy first sync: main loop stays responsive; reads see the snapshot; a write reaches the Engine', async () => {
+    stallIt('heavy first sync: main loop stays responsive; reads see the snapshot; a write reaches the Engine', async () => {
         // ~4k operationDB rows with history: a first sync that costs real WASM time.
         const fe = await startEngine(d => {
             d.engineDB.E1 = { id: 'E1', hostname: 'idea01', commands: [] }
@@ -112,7 +113,7 @@ describe('r86l: store doc synced off the main thread', () => {
         expect(liveStoreLinks.size).toBe(0)
     }, 60_000)
 
-    it('a write the worker cannot make (Engine gone) ends in StoreWriteError, never a silent warn', async () => {
+    stallIt('a write the worker cannot make (Engine gone) ends in StoreWriteError, never a silent warn', async () => {
         const fe = await startEngine(d => { d.engineDB.E1 = { id: 'E1', hostname: 'idea01', commands: [] } })
         const ops = mkOps(fe.port, fe.docUrl)
         try {
