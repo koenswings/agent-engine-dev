@@ -24,6 +24,7 @@ import { LsblkDevice, candidateIdFor, isSdCardMedium } from './UnformattedDisks.
 import { localEngineId } from './Engine.js'
 import { log } from '../utils/utils.js'
 import { metaLookCache } from '../monitors/metaLookCache.js'
+import type { IdeaLookResult } from '../monitors/mounts.js'
 
 export type CandidateID = string
 export type ReaderID = string
@@ -140,8 +141,13 @@ export interface ClientCardOps {
     dockedDevices: (store: Store | undefined, engineId: string) => Set<string>
     /** idea#303: true when the cached read-only look of this partition found an OS rootfs layout (hasOsRootfsLayout) */
     osRootfsPartition: (partition: string) => boolean
+    /** idea#311: true when the cached read-only look found a valid META.yaml and no IDEA-IGNORE marker */
+    ideaMetaPartition: (partition: string) => boolean
     now: () => number
 }
+
+/** idea#311: a look that found a valid META.yaml (hasMeta) and no IDEA-IGNORE marker, i.e. initialiseDisk would refuse ALREADY_IDEA */
+export const isAlreadyIdeaLook = (l: IdeaLookResult | undefined): boolean => l?.ok === true && l.hasMeta === true && l.ignored !== true
 
 const defaultOps: ClientCardOps = {
     lsblkJson: async () => {
@@ -173,6 +179,7 @@ const defaultOps: ClientCardOps = {
         return s
     },
     osRootfsPartition: (p) => (l => l?.ok === true && l.osRootfs === true)(metaLookCache.peek(p)),
+    ideaMetaPartition: (p) => isAlreadyIdeaLook(metaLookCache.peek(p)),
     now: () => Date.now(),
 }
 
@@ -319,7 +326,11 @@ export const scanClientCards = async (
         // idea#303 (Steve, 2026-10-25): an OS rootfs partition (old Engine disk) is never initialised in
         // place; initialiseDisk refuses it too (OS_ROOTFS). Such a disk can only be flashed for now.
         const osRootfs = children.some(c => clean(c.fstype) === 'ext4' && ops.osRootfsPartition(c.name))
-        if (!osRootfs && children.some(c => clean(c.fstype) === 'ext4' && /^sd[a-z][12]$/.test(c.name))) actions.push('initialise')
+        // idea#311: a disk that already carries a valid META.yaml (and no IDEA-IGNORE marker) is an IDEA disk
+        // left plugged in after eject; initialiseDisk would refuse it (ALREADY_IDEA), so it is not offered.
+        // An ignored disk keeps initialise: a teacher may deliberately re-take it (Steve, 2026-10-25).
+        const alreadyIdea = children.some(c => clean(c.fstype) === 'ext4' && ops.ideaMetaPartition(c.name))
+        if (!osRootfs && !alreadyIdea && children.some(c => clean(c.fstype) === 'ext4' && /^sd[a-z][12]$/.test(c.name))) actions.push('initialise')
         if (!anyExt4) actions.push('erase')
         let flashRefusal: FlashRefusal | null = null
         if ((d.tran ?? 'usb') === 'usb' && byId && byId.startsWith('/dev/disk/by-id/usb-')) {
