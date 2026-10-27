@@ -80,6 +80,13 @@ live Engine (idea#105):
   `IDEA_DIAGNOSTIC_LIVE=true pnpm test:diagnostic` reads a live store, so it needs
   the override on purpose.
 
+## Where Engine tests run (idea#335)
+
+- **The Grok Bot box** (no live Engine): the default place for `pnpm test:full`, including the quality scan's Engine run.
+- **A claimed idle pool Pi** with the pm2 Engine stopped (`pm2 stop engine`), per the claim protocol below; needed for `test:hw` and on-Pi checks.
+- **Never** next to a live production Engine: idea01 while it serves the fleet, golden idea02, or 'idea'. The idea#105 pre-flight refuses there (live pm2 Engine, unlabelled containers, App Disks) and says so; do not override it with `IDEA_TEST_ALLOW_LIVE=1` to get a run through.
+- Ports are not the conflict: the suite binds only ephemeral ports (`listen(0)` / freePort), never 80, 4321 or 8080, and uses its own temp `IDEA_WATCH_DIR` / `IDEA_DISKS_ROOT` and `dist-test/`. `test/automated/tests-beside-live-engine.test.ts` guards this, and it was checked on the box with 80, 4321 and 8080 held by other listeners during `test:full`.
+
 ## Workflow (idea#147)
 
 1. Read the GitHub issue and the agreed-approach comment (no comment → ask Lead Bot). Implement with your own tools and read this file.
