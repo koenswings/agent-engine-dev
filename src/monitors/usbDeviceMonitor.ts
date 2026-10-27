@@ -9,7 +9,7 @@ import { Disk, clearDuplicateDiskRecords, createOrUpdateDisk, isSystemDiskRecord
 import { flushFilesRemountNow, optedInInstances } from '../data/FilesMount.js'
 import { clearUndockPending, dockChangedReason, dockIdentityOf, ejectInFlightWaitMs, markUndockPending, waitInFlightOnDisk } from '../data/InstanceInFlight.js'
 import { isSystemDevice, systemDriveNames, driveNameOf } from '../data/SystemDisk.js'
-import { refreshUnformattedDisks } from '../data/UnformattedDisks.js'
+import { refreshUnformattedDisks, setAfterUnformattedPoll } from '../data/UnformattedDisks.js'
 import { setInitialiseAddDevice } from '../data/FlashCard.js'
 import { eraseLockRefusesAdd, isEraseDeviceLocked, setEraseAddDevice } from '../data/EraseDisk.js'
 import { findDiskByDevice, findDisksByDevice, Store, getDisksOfEngine, getLocalEngine } from '../data/Store.js'
@@ -25,6 +25,7 @@ import { addStick, classifyFsType, stickBlockedBySiblings, removeStick, removeSt
 import { lookForIdeaMeta, IdeaLookResult, isValidIdeaMetaFile, hasIgnoreMarker, hasOsRootfsLayout, safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointOf } from './mounts.js';
 import { isTestDeviceName, isValidDeviceName, isSdWholeDisk, partitionName, needsDirectSystemAdd } from './deviceNames.js'
 import { metaLookCache } from './metaLookCache.js';
+import { clearFailedLook, readPartitionSignatures, recordFailedLook, retryChangedFailedLooks } from './failedLookRetry.js'
 
 /**
  * Filesystem UUID of each mounted device, recorded at mount time (or when an
@@ -385,11 +386,16 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                         return
                     }
                 } else {
+                    // idea#307: the fs signature before the look, so a look that fails because mkfs
+                    // is still running is retried once lsblk shows the new filesystem
+                    const sigBefore = (await readPartitionSignatures().catch(() => new Map())).get(device) ?? null
                     const look = await sharedMetaLook(device)
                     if (!look.ok) {
                         recordDiskDetectionFailure('mount', look.message, { device })
+                        recordFailedLook(device, sigBefore)
                         return
                     }
+                    clearFailedLook(device)
                     if (!look.hasMeta) {
                         if (look.osRootfs) {
                             // One line only: the rootfs rule decided, whether or not META.yaml is there
@@ -446,6 +452,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         if (validDevice(device!)) {
             log(`Processing the removal of USB device ${device}`)
             metaLookCache.forget(device!)
+            clearFailedLook(device!)
             // Teacher sticks first (idea#193 §3.4): partition, or every stick of a whole drive
             const removedSticks = isSdWholeDisk(device)
                 ? await removeSticksOnDrive(storeHandle, device!, 'unplugged')
@@ -566,6 +573,15 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         unlink: removeDevice,
         error: error => recordDiskDetectionFailure('watcher', `Watcher error on ${watchDir}: ${errorMessage(error)}`, { watchDir }),
     })
+
+    // idea#307: on each lsblk poll tick, look again at a partition whose failed look was followed
+    // by a filesystem change (fs type or UUID); it goes through addDevice, so the read-only rules hold
+    setAfterUnformattedPoll(() => retryChangedFailedLooks(async (device) => {
+        const p = `${watchDir}/${device}`
+        try { await fs.lstat(p) } catch { return }
+        log(`Device ${device}: its filesystem changed after a failed look — looking again (idea#307)`)
+        await addDevice(p)
+    }))
 
     log(`Watching ${watchDir} for USB devices`)
     return watcher
