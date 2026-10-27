@@ -60,7 +60,7 @@ info "Joining IDEA Tailnet (ephemeral)..."
 tailscale up \
   --auth-key="file:$AUTH_KEY_FILE" \
   --ephemeral \
-  --advertise-tags=tag:school-pi \
+  --advertise-tags=tag:idea \
   --hostname="$(hostname)"
 
 TAILSCALE_IP=$(tailscale ip -4 2>/dev/null || echo "<not yet assigned>")

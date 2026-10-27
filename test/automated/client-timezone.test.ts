@@ -67,9 +67,9 @@ describe('idea-flash-card --timezone: re-validated as root before anything is to
         `refuse() { echo "refused: $1: $2" >&2; exit 2; }; ZONEINFO=${zi}; TZ_SET=${zone === null ? 0 : 1}; TZONE="$1"\n${block()}\necho PASSED`, 'x', zone ?? ''],
         { encoding: 'utf8' })
 
-    it('version 3, --timezone documented, writer called before flush + power-off', () => {
+    it('version 4, --timezone documented, writer called before flush + power-off', () => {
         const t = fs.readFileSync(FLASH, 'utf8')
-        expect(spawnSync('bash', [FLASH, '--version'], { encoding: 'utf8' }).stdout.trim()).toBe('idea-flash-card 3')
+        expect(spawnSync('bash', [FLASH, '--version'], { encoding: 'utf8' }).stdout.trim()).toBe('idea-flash-card 4')
         expect(t).toMatch(/^TZ_WRITER=\/usr\/local\/sbin\/idea-write-card-timezone$/m)
         expect(t).toMatch(/^ZONEINFO=\/usr\/share\/zoneinfo$/m)
         const w = t.indexOf('"$TZ_WRITER" "$BYID" "$DEVPATH" "$SIZE" "$TZONE"')

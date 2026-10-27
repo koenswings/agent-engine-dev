@@ -7,7 +7,7 @@
 #
 # Usage:
 #   idea-flash-card --by-id <path> --expect-device <sdX> --expect-size <bytes> \
-#                   --image <file> --sha256 <hex> [--os-rootfs <sdXN>]... [--timezone <Area/City>]
+#                   --image <file> --sha256 <hex> [--os-rootfs <sdXN>]... [--timezone <Area/City>] [--home <engine-name>]
 #   idea-flash-card --version
 #
 #   --by-id         /dev/disk/by-id/usb-...  (whole disk link, never a -partN link)
@@ -26,20 +26,26 @@
 #                   not fail the flash (the client stays on UTC): it is reported on stderr as
 #                   "warning: TIMEZONE_FAILED: ..." and as "timezoneFile":"failed" in the result.
 #                   Without --timezone no file is written ("timezoneFile":"skipped").
+#   --home          the home-Engine name, e.g. brave-otter (idea#203 §2, v4). Re-validated here
+#                   ([a-z0-9-], 1-63, no leading/trailing hyphen; BAD_ARGS before anything is touched).
+#                   After the verified write, idea-write-home-engine writes idea-home.txt =
+#                   "<name>.local\n" on FAT partition 1. Same failure rule as --timezone:
+#                   "warning: HOME_FAILED: ..." and "homeFile":"written|skipped|failed".
 #
 # Output: JSON lines on stdout {"step":..,"bytes":..,"total":..}, last line
 #   {"result":"ok","bytesWritten":N,"sha256":"..","readBackSha256":"..","safeToRemove":true|false,
-#    "timezoneFile":"written|skipped|failed"}
+#    "timezoneFile":"written|skipped|failed","homeFile":"written|skipped|failed"}
 # Exit: 0 ok (incl. POWER_OFF_FAILED → safeToRemove false), 2 refused (stderr "refused: CODE: text"),
 #       3 failed (stderr "failed: CODE: text"). SIGTERM → failed CANCELLED.
-# Never mounts anything itself (idea-write-card-timezone mounts partition 1 for --timezone). No size limit (any card size; only IMAGE_TOO_LARGE is physical).
+# Never mounts anything itself (idea-write-card-timezone / idea-write-home-engine mount partition 1 for --timezone / --home). No size limit (any card size; only IMAGE_TOO_LARGE is physical).
 
 set -u
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
-VERSION=3
+VERSION=4
 IMAGES_ROOT=/var/lib/idea/client-images
 ZONEINFO=/usr/share/zoneinfo
 TZ_WRITER=/usr/local/sbin/idea-write-card-timezone
+HOME_WRITER=/usr/local/sbin/idea-write-home-engine
 
 refuse() { echo "refused: $1: $2" >&2; exit 2; }
 fail()   { echo "failed: $1: $2" >&2; cleanup_children; try_power_off >/dev/null; exit 3; }
@@ -47,7 +53,7 @@ emit()   { printf '{"step":"%s","bytes":%s,"total":%s}\n' "$1" "${2:-0}" "${3:-0
 
 if [[ "${1:-}" == "--version" ]]; then echo "idea-flash-card $VERSION"; exit 0; fi
 
-BYID= DEV= SIZE= IMAGE= SHA= TZONE= TZ_SET=0
+BYID= DEV= SIZE= IMAGE= SHA= TZONE= TZ_SET=0 HOMENAME= HOME_SET=0
 OSROOTFS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -58,6 +64,7 @@ while [[ $# -gt 0 ]]; do
     --sha256) SHA="${2:-}"; shift 2 ;;
     --os-rootfs) OSROOTFS+=("${2:-}"); shift 2 ;;
     --timezone) TZONE="${2:-}"; TZ_SET=1; shift 2 ;;
+    --home) HOMENAME="${2:-}"; HOME_SET=1; shift 2 ;;
     *) refuse BAD_ARGS "unknown argument '$1'" ;;
   esac
 done
@@ -76,6 +83,11 @@ if [[ $TZ_SET -eq 1 ]]; then
   [[ -f "$ZONEINFO/$TZONE" ]] || refuse BAD_ARGS "timezone '$TZONE' is not in $ZONEINFO"
 fi
 # <<< tz-check
+# >>> home-check (idea#203 §2): same rule as idea-write-home-engine
+if [[ $HOME_SET -eq 1 ]]; then
+  [[ "$HOMENAME" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || refuse BAD_ARGS "home '$HOMENAME' must be 1-63 of a-z 0-9 -, no leading or trailing hyphen"
+fi
+# <<< home-check
 check="$IMAGE"; while [[ "$check" != "/" ]]; do [[ -L "$check" ]] && refuse BAD_ARGS "image path contains a symlink ($check)"; check=$(dirname "$check"); done
 
 DEVPATH="/dev/$DEV"
@@ -190,11 +202,21 @@ if [[ $TZ_SET -eq 1 ]]; then
   else tzfile=failed; echo "warning: TIMEZONE_FAILED: $(echo "$tzout" | tail -n 1)" >&2; fi
 fi
 
+homefile=skipped
+if [[ $HOME_SET -eq 1 ]]; then
+  if [[ $TZ_SET -ne 1 ]]; then
+    blockdev --rereadpt "$DEVPATH" 2>/dev/null || partx -u "$DEVPATH" 2>/dev/null || true
+    udevadm settle --timeout=10 >/dev/null 2>&1 || true
+  fi
+  if hout=$("$HOME_WRITER" "$BYID" "$DEVPATH" "$SIZE" "$HOMENAME" 2>&1); then homefile=written
+  else homefile=failed; echo "warning: HOME_FAILED: $(echo "$hout" | tail -n 1)" >&2; fi
+fi
+
 # ── Flush + power off ──────────────────────────────────────────────────────
 emit flushing 0 0
 sync
 exec 9>&-
 emit powering-off 0 0
 safe=$(try_power_off)
-printf '{"result":"ok","bytesWritten":%s,"sha256":"%s","imageSha256":"%s","readBackSha256":"%s","safeToRemove":%s,"timezoneFile":"%s"}\n' "$usize" "$wsha" "$SHA" "$rsha" "$safe" "$tzfile"
+printf '{"result":"ok","bytesWritten":%s,"sha256":"%s","imageSha256":"%s","readBackSha256":"%s","safeToRemove":%s,"timezoneFile":"%s","homeFile":"%s"}\n' "$usize" "$wsha" "$SHA" "$rsha" "$safe" "$tzfile" "$homefile"
 exit 0

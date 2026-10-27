@@ -147,6 +147,7 @@ The script checks internet connectivity, joins the IDEA Tailnet (ephemeral), and
 **How the auth key is handled (idea#115):** the key is never a command-line argument, so it can't be seen with `ps`, and it never goes into logs, shell history or Console History.
 - `installTailscale()` sends it over the stdin of `umask 077 && sudo tee /etc/tailscale/debug-authkey` (through ssh). The file is `0600 root:root`, in a `0700` folder.
 - `tailscale-debug-activate.sh` passes `--auth-key=file:/etc/tailscale/debug-authkey`, so `tailscale up` reads the key from the file.
+- The key never reaches pm2: build-engine drops `TAILSCALE_AUTHKEY` from its environment once `installTailscale()` has read it, and runs pm2 under `env -u TAILSCALE_AUTHKEY`, so it is not in `~/.pm2/dump.pm2` (idea#273).
 - Never put the key on a command line yourself, e.g. `tailscale up --authkey tskey-…` or `echo tskey-… | …`.
 
 **Field Pis use one reusable, ephemeral fleet auth key (idea#117).** Every field Pi stores the same key at `/etc/tailscale/debug-authkey` (`0600 root:root`, never on a command line, see above).
