@@ -331,7 +331,9 @@ export const scanClientCards = async (
         // An ignored disk keeps initialise: a teacher may deliberately re-take it (Steve, 2026-10-25).
         const alreadyIdea = children.some(c => clean(c.fstype) === 'ext4' && ops.ideaMetaPartition(c.name))
         if (!osRootfs && !alreadyIdea && children.some(c => clean(c.fstype) === 'ext4' && /^sd[a-z][12]$/.test(c.name))) actions.push('initialise')
-        if (!anyExt4) actions.push('erase')
+        // idea#310 (Steve, 2026-10-25): an OS rootfs disk (old Engine SSD) may also be erased, after which
+        // it is initialised through the normal path. Never offered together with initialise (see above).
+        if (!anyExt4 || osRootfs) actions.push('erase')
         let flashRefusal: FlashRefusal | null = null
         if ((d.tran ?? 'usb') === 'usb' && byId && byId.startsWith('/dev/disk/by-id/usb-')) {
             actions.push('flash')

@@ -293,6 +293,56 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
         expect(isEraseDeviceLocked('sdb')).toBe(false)
     })
 
+    // idea#310: an old Engine SSD (ext4 OS rootfs) is only in diskCandidates, not in unformattedDisks
+    const putOsRootfsCandidate = (over: Record<string, unknown> = {}) => h.change(doc => {
+        ;(doc.engineDB[LOCAL] as any).diskCandidates = [{
+            candidateId: 'OLDENG', kind: 'usbDisk', device: 'sdc', sizeBytes: 120e9, model: 'WDS120G2G0A', serial: 'FAKE1',
+            removable: false, readerId: null,
+            partitions: [{ label: 'bootfs', fsType: 'vfat', sizeBytes: 1e9 }, { label: 'rootfs', fsType: 'ext4', sizeBytes: 119e9 }],
+            contents: { kind: 'raspios' }, actions: ['erase', 'flash'], flashRefusal: null, mountedReadOnly: false, firstSeen: 1,
+            ...over,
+        }]
+    })
+
+    it('idea#310: summariseDisk finds an OS-rootfs diskCandidate (readable false, label from model + size)', async () => {
+        putOsRootfsCandidate()
+        const summary = await summariseDisk(h, 'OLDENG')
+        expect(summary.readable).toBe(false)
+        expect(summary.label).toBe('WDS120G2G0A 120 GB')
+        expect(summary.fsType).toBe('ext4')
+        expect(summary.serial).toBe('FAKE1')
+    })
+
+    it('idea#310: eraseDisk erases an OS-rootfs diskCandidate through the normal helper path', async () => {
+        putOsRootfsCandidate()
+        const label = (await summariseDisk(h, 'OLDENG')).label
+        const tid = putSummary('OLDENG', label)
+        const result = await eraseDisk(h, 'OLDENG', tid, label)
+        expect(result.diskId).toBe('OLDENG')
+        expect(scriptCalls).toHaveLength(1)
+        expect(scriptCalls[0]).toMatchObject({ device: '/dev/sdc', serial: 'FAKE1', label: IDEA_DISK_LABEL })
+        expect([...h.doc()!.diskDB['OLDENG' as DiskID].diskTypes]).toEqual(['empty'])
+    })
+
+    it('idea#310: a diskCandidate without the erase action (e.g. plain ext4 → initialise) is not resolved', async () => {
+        putOsRootfsCandidate({ actions: ['initialise', 'flash'] })
+        await expect(summariseDisk(h, 'OLDENG')).rejects.toThrow(/No disk or unformatted candidate/)
+        const tid = putSummary('OLDENG', 'WDS120G2G0A 120 GB')
+        await expect(eraseDisk(h, 'OLDENG', tid, 'WDS120G2G0A 120 GB')).rejects.toThrow(/No disk or unformatted candidate/)
+        expect(scriptCalls).toHaveLength(0)
+    })
+
+    it('idea#310: OS-rootfs diskCandidate keeps the system-disk and mounted refusals', async () => {
+        putOsRootfsCandidate({ device: 'sda' })
+        const tid = putSummary('OLDENG', 'WDS120G2G0A 120 GB')
+        await expect(eraseDisk(h, 'OLDENG', tid, 'WDS120G2G0A 120 GB')).rejects.toThrow(/system disk/)
+        putOsRootfsCandidate()
+        setEraseOpsForTests({ mountedPartitions: async () => [{ partition: 'sdc2', mountpoint: '/mnt/x' }] as any })
+        const tid2 = putSummary('OLDENG', 'WDS120G2G0A 120 GB')
+        await expect(eraseDisk(h, 'OLDENG', tid2, 'WDS120G2G0A 120 GB')).rejects.toThrow(/shares its physical disk|mounted/)
+        expect(scriptCalls).toHaveLength(0)
+    })
+
     it('post-erase add goes through the real erase-lock guard and is not refused (wh 2026-10-12)', async () => {
         // Production wires usbDeviceMonitor.addDevice, which refuses locked devices via eraseLockRefusesAdd.
         // Before the fix the lock on 'sdb' was held across the add → "did not come back as empty".
