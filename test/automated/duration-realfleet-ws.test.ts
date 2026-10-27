@@ -10,6 +10,7 @@
  *  - reconnectEngine (reboot_engine) closes the old socket and opens a fresh one.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { stallIt } from '../harness/stallGuard.js'
 import http from 'node:http'
 import net from 'node:net'
 import { WebSocketServer, type WebSocket } from 'ws'
@@ -149,7 +150,7 @@ describe('RealFleetOps WS model — fake Engine (r32)', () => {
         }
     })
 
-    it('close-before-retry: a stalled handshake is closed before the next attempt (never 2 sockets at once)', async () => {
+    stallIt('close-before-retry: a stalled handshake is closed before the next attempt (never 2 sockets at once)', async () => {
         const fe = await startFakeEngine({ silentFirst: 2 })
         const { ops, stalls } = makeOps(fe.port, fe.docUrl, { wsHandshakeTimeoutMs: 1_000 })
         try {
@@ -170,7 +171,7 @@ describe('RealFleetOps WS model — fake Engine (r32)', () => {
         }
     }, 40_000)
 
-    it('unreachable host → "engine X unreachable for Ns" result, not a sync timeout or stall', async () => {
+    stallIt('unreachable host → "engine X unreachable for Ns" result, not a sync timeout or stall', async () => {
         const port = await freePort()
         const { ops, stalls } = makeOps(port, 'automerge:3zoqdSVsEtj4ygNJPNcDyKWvdxo6', { wsHandshakeTimeoutMs: 1_000 })
         try {
@@ -191,7 +192,7 @@ describe('RealFleetOps WS model — fake Engine (r32)', () => {
         }
     }, 30_000)
 
-    it('a slow (8 s) initial sync passes within the doc wait (no WS-down, no stall)', async () => {
+    stallIt('a slow (8 s) initial sync passes within the doc wait (no WS-down, no stall)', async () => {
         const fe = await startFakeEngine({ syncDelayMs: 8_000 })
         const { ops, stalls } = makeOps(fe.port, fe.docUrl, { docWaitMs: undefined })
         try {
@@ -209,7 +210,7 @@ describe('RealFleetOps WS model — fake Engine (r32)', () => {
         }
     }, 40_000)
 
-    it('WS up but the store never becomes ready → own-store stall handler (FATAL path), distinct from unreachable', async () => {
+    stallIt('WS up but the store never becomes ready → own-store stall handler (FATAL path), distinct from unreachable', async () => {
         const fe = await startFakeEngine({ syncDelayMs: 60_000 })
         const { ops, stalls } = makeOps(fe.port, fe.docUrl, { docWaitMs: 1_500 })
         try {
@@ -224,7 +225,7 @@ describe('RealFleetOps WS model — fake Engine (r32)', () => {
         }
     }, 30_000)
 
-    it('reconnectEngine (reboot_engine) closes the old socket and opens a fresh one', async () => {
+    stallIt('reconnectEngine (reboot_engine) closes the old socket and opens a fresh one', async () => {
         const fe = await startFakeEngine()
         const { ops } = makeOps(fe.port, fe.docUrl)
         try {
@@ -246,7 +247,7 @@ describe('RealFleetOps WS model — fake Engine (r32)', () => {
         }
     }, 30_000)
 
-    it('a stall inside the reboot window (reconnectEngine) is retried, not the own-store FATAL', async () => {
+    stallIt('a stall inside the reboot window (reconnectEngine) is retried, not the own-store FATAL', async () => {
         const fe = await startFakeEngine({ syncDelayMs: 60_000 })
         const { ops, stalls } = makeOps(fe.port, fe.docUrl, { docWaitMs: 1_000 })
         try {
@@ -261,7 +262,7 @@ describe('RealFleetOps WS model — fake Engine (r32)', () => {
         }
     }, 30_000)
 
-    it('a dropped socket is re-established by the SAME connection (no new Repo)', async () => {
+    stallIt('a dropped socket is re-established by the SAME connection (no new Repo)', async () => {
         const fe = await startFakeEngine()
         const { ops } = makeOps(fe.port, fe.docUrl)
         try {
@@ -285,7 +286,7 @@ describe('RealFleetOps WS model — fake Engine (r32)', () => {
         }
     }, 30_000)
 
-    it('idea#332: a 1.5 s Engine stall during the re-dial still reattaches on the SAME connection', async () => {
+    stallIt('idea#332: a 1.5 s Engine stall during the re-dial still reattaches on the SAME connection', async () => {
         const fe = await startFakeEngine()
         const { ops } = makeOps(fe.port, fe.docUrl)
         try {
