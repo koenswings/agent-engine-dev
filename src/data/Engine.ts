@@ -999,6 +999,15 @@ export const TAILSCALE_AUTHKEY_PATH = '/etc/tailscale/debug-authkey'
 const TAILSCALE_AUTHKEY_DIR = '/etc/tailscale'
 const TAILSCALE_AUTHKEY_SECRETS_FILE = '/home/pi/openclaw/secrets/tailscale_authkey.txt'
 
+/**
+ * Removes TAILSCALE_AUTHKEY from this process's environment (and zx's $.env, which
+ * child commands inherit), so pm2 never sees it (idea#273).
+ */
+export const scrubTailscaleAuthKeyEnv = () => {
+  delete process.env.TAILSCALE_AUTHKEY
+  if ($.env && $.env !== process.env) delete $.env.TAILSCALE_AUTHKEY
+}
+
 /** TAILSCALE_AUTHKEY env var first, then the secrets file on the management Pi. */
 export const resolveTailscaleAuthKey = (): string | null => {
   const fromEnv = process.env.TAILSCALE_AUTHKEY?.trim()
@@ -1052,6 +1061,9 @@ export const installTailscale = async (exec: any, enginePath: string) => {
   print(chalk.blue('Installing Tailscale (latent debug mode)...'))
 
   const authKey = resolveTailscaleAuthKey()
+  // The key is only for this step. Drop it from our environment now, so nothing
+  // started later (pm2 daemon, `pm2 start`, `pm2 save` → dump.pm2) inherits it (idea#273).
+  scrubTailscaleAuthKeyEnv()
 
   if (!authKey) {
     console.error(chalk.red(`installTailscale: no auth key found. Set TAILSCALE_AUTHKEY env var or ensure ${TAILSCALE_AUTHKEY_SECRETS_FILE} exists.`))
@@ -1194,7 +1206,7 @@ export const installPm2 = async (exec: any, enginePath: string) => {
     await exec`cd ${enginePath}`
     print(chalk.blue('Installing pm2-logrotate...'))
     // Install into pi's pm2 (no sudo), the same process list startEnginePM2 uses (idea#80).
-    await exec`cd ${enginePath} && pm2 install pm2-logrotate@${PM2_LOGROTATE_VERSION}`
+    await exec`cd ${enginePath} && env -u TAILSCALE_AUTHKEY pm2 install pm2-logrotate@${PM2_LOGROTATE_VERSION}`
   } catch (e) {
     print(chalk.red('Error installing pm2'));
     console.error(e);
@@ -1229,23 +1241,20 @@ export const startEnginePM2 = async (exec: any, enginePath: string, permanentEng
 
       // Run pm2 as the pi user (no sudo) so the engine process is owned by pi.
       if (productionMode) {
-        await exec`cd ${permanentEnginePath} && pm2 start pm2.config.cjs --env production`
+        await exec`cd ${permanentEnginePath} && env -u TAILSCALE_AUTHKEY pm2 start pm2.config.cjs --env production`
       } else {
-        await exec`cd ${permanentEnginePath} && pm2 start pm2.config.cjs --env development`
+        await exec`cd ${permanentEnginePath} && env -u TAILSCALE_AUTHKEY pm2 start pm2.config.cjs --env development`
       }
       print(chalk.blue('Saving the pm2 process list...'))
-      await exec`pm2 save`
+      await exec`env -u TAILSCALE_AUTHKEY pm2 save`
       print(chalk.blue('Enabling pm2 to start on boot...'))
-      // Generate the startup command for the pi user and run it with sudo.
-      // pm2 startup outputs a line beginning with 'sudo env PATH=...' — extract and execute it.
-      const startupOutput = (await exec`pm2 startup systemd -u pi --hp /home/pi`).stdout
-      const startupCmd = startupOutput.split('\n').find((l: string) => l.trimStart().startsWith('sudo env PATH='))
-      if (startupCmd) {
-        await exec`${startupCmd.trim()}`
-      } else {
-        print(chalk.yellow('Could not extract pm2 startup command from output — run manually if needed'))
-        print(startupOutput)
-      }
+      // `pm2 startup` must run as root to write the systemd unit; run as pi it only
+      // prints this command and exits 1, which aborted build-engine on a fresh Pi
+      // (idea#273). The unit still runs the pm2 daemon as pi (-u pi --hp /home/pi).
+      const nodeBin = (await exec`dirname "$(command -v node)"`).stdout.trim()
+      const pm2Bin = (await exec`command -v pm2`).stdout.trim()
+      const userPath = (await exec`printf %s "$PATH"`).stdout.trim()
+      await exec`sudo env -u TAILSCALE_AUTHKEY PATH=${`${userPath}:${nodeBin}`} ${pm2Bin} startup systemd -u pi --hp /home/pi`
     }
   } catch (e) {
     print(chalk.red('Error starting the engine with pm2'));
