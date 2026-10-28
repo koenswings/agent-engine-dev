@@ -10,7 +10,7 @@ import { createOrUpdateEngine, localEngineId, ENGINE_CAPABILITIES } from '../../
 import { removeInstance, RemoveDeps } from '../../src/data/RemoveInstance.js'
 import { resourceLock, instanceKey } from '../../src/utils/ResourceLock.js'
 import { commands } from '../../src/data/Commands.js'
-import { quarantineArgs } from '../../src/utils/appDataHelper.js'
+import { quarantineArgs, helperAtLeast } from '../../src/utils/appDataHelper.js'
 import { isIdeaDiskPath } from '../../src/data/SummariseDisk.js'
 
 const ME = String(localEngineId)
@@ -18,6 +18,7 @@ let h: DocHandle<Store>
 let calls: string[]
 
 const deps = (over: Partial<RemoveDeps> = {}): Partial<RemoveDeps> => ({
+    helperProblem: async () => null,
     instanceDir: async (_d, id) => `/fake/instances/${id}`,
     composeDown: async (dir) => { calls.push(`down ${dir}`) },
     listVolumes: async (id) => [`${id}_data`],
@@ -89,5 +90,15 @@ describe('removeInstance', () => {
         expect(disk).toMatch(/ls \$\{mountRoot\}\/apps/)
         expect(disk).toMatch(/ls \$\{mountRoot\}\/instances/)
         expect(disk).not.toMatch(/idea-quarantine/)
+    })
+    it('HELPER_OUTDATED against a helper older than v4; nothing changes', async () => {
+        add('i1', 'k', 'd1')
+        const fakeRun = async () => 'idea-app-data 3'
+        const problem = await helperAtLeast(4, 'removeInstance', fakeRun)
+        expect(problem).toMatch(/removeInstance needs the app-data root helper .* v4 or later, but the installed one reports 'idea-app-data 3'/)
+        expect(await helperAtLeast(4, 'removeInstance', async () => 'idea-app-data 5')).toBeNull()
+        expect(await codeOf(removeInstance(h, 'i1', ME, deps({ helperProblem: async () => problem })))).toBe('HELPER_OUTDATED')
+        expect(calls).toEqual([])
+        expect(h.doc().instanceDB['i1' as any]).toBeDefined()
     })
 })
