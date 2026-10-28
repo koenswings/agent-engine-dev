@@ -58,12 +58,15 @@ let lsblk: CardLsblkDevice[] = []
 let lsblkHook: (() => Promise<void>) | null = null
 let osRootfsParts = new Set<string>()
 let ideaMetaParts = new Set<string>()
+let ignoredParts = new Set<string>()
 const useDevices = (devs: CardLsblkDevice[], docked: string[] = ['sdf1'], sys: (d: string) => boolean = (d) => d.startsWith('sda')) => {
     lsblk = devs
     lsblkHook = null
     osRootfsParts = new Set()
     ideaMetaParts = new Set()
+    ignoredParts = new Set()
     setClientCardOpsForTests({
+        ignoredPartition: (p) => ignoredParts.has(p),
         osRootfsPartition: (p) => osRootfsParts.has(p),
         ideaMetaPartition: (p) => ideaMetaParts.has(p),
         lsblkJson: async () => { if (lsblkHook) await lsblkHook(); return JSON.parse(JSON.stringify(lsblk)) },
@@ -665,6 +668,21 @@ describe('disk roles: USB disks get both roles, SD cards flash only (idea#303)',
         expect(isAlreadyIdeaLook(undefined)).toBe(false)
         const c = (await scanClientCards(undefined, String(LOCAL))).diskCandidates!.find(x => x.device === 'sdi')!
         expect(c.actions).toEqual(['initialise', 'flash'])
+    })
+
+    it('console#163: an IDEA-IGNORE disk is published with ignored: true and keeps its actions', async () => {
+        useDevices([SYS, EXT4_STICK])
+        ignoredParts.add('sdi1')
+        const c = (await scanClientCards(undefined, String(LOCAL))).diskCandidates!.find(x => x.device === 'sdi')!
+        expect(c.ignored).toBe(true)
+        expect(c.actions).toEqual(['initialise', 'flash'])
+    })
+
+    it('console#163: a disk without IDEA-IGNORE has no ignored key (omitted, not false)', async () => {
+        useDevices([SYS, EXT4_STICK, EXFAT_SSD])
+        const r = await scanClientCards(undefined, String(LOCAL))
+        for (const c of r.diskCandidates!) expect('ignored' in c).toBe(false)
+        expect(r.diskCandidates!.find(x => x.device === 'sdi')!.actions).toEqual(['initialise', 'flash'])
     })
 
     it('refuses a docked IDEA SSD, a mounted USB disk and the system disk; nothing is spawned', async () => {
