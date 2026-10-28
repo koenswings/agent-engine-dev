@@ -28,8 +28,7 @@ const deps = (over: Partial<UpdateDeps> = {}): Partial<UpdateDeps> => {
         helperProblem: async () => null,
         mountRoot: async () => tmp,
         verifySums: async () => true,
-        instanceBytes: async () => 1000,
-        freeBytes: async () => 50 * 1024 ** 3,
+        estimate: async () => ({ folderBytes: 1000, volumeBytes: 0, freeBytes: 50 * 1024 ** 3 }),
         dirBytes: async () => 10,
         stop: async () => { calls.push('stop'); h.change(d => { (d.instanceDB['i1' as any] as any).status = 'Stopped' }) },
         containerIds: async () => { gone++; return [] },
@@ -113,11 +112,19 @@ describe('updateApp (#230)', () => {
         expect(sumsLookUsable('b'.repeat(64) + '  other.txt')).toBe(false)
     })
     it('NO_SPACE before anything changes: "snapshot needs X, free Y", no stop, no snapshot', async () => {
-        const m = await codeOf(updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps({ freeBytes: async () => 5 })))
+        const m = await codeOf(updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps({ estimate: async () => ({ folderBytes: 1000, volumeBytes: 0, freeBytes: 5 }) })))
         expect(m).toMatch(new RegExp(`^NO_SPACE: not enough free space on d1 \\(snapshot needs ${1000 + snapshotMarginBytes(1000)}, free 5\\)`))
         expect(calls).toEqual([])
         expect(inst().status).toBe('Running')
         expect(Object.values(h.doc().operationDB)).toEqual([])
+    })
+    it('volume-driven NO_SPACE refuses before the stop: the estimate counts named volumes, nothing changes', async () => {
+        const vol = 3 * 1024 ** 3
+        const m = await codeOf(updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps({ estimate: async () => ({ folderBytes: 1000, volumeBytes: vol, freeBytes: 2 * 1024 ** 3 }) })))
+        expect(m).toMatch(new RegExp(`^NO_SPACE: .*snapshot needs ${1000 + vol + snapshotMarginBytes(1000 + vol)}, free ${2 * 1024 ** 3}`))
+        expect(calls).toEqual([])
+        expect(inst().status).toBe('Running')
+        expect(Object.values(h.doc().operationDB).some(o => o.kind === 'updateApp')).toBe(false)
     })
     it('NO_SPACE from the helper: the old version is started again, nothing swapped', async () => {
         const m = await codeOf(updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps({ snapshot: async () => { throw new Error('idea-app-data snapshot exited 3: NO_SPACE: snapshot needs 2000 bytes, free 10 bytes') } })))

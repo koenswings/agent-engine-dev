@@ -305,6 +305,13 @@ export const reportBorgAtStartup = (exists: (p: string) => boolean = borgPresenc
 export const snapshotArgs = (root: string, id: string): string[] => ['snapshot', checkRoot(root), checkId(id)]
 export const restoreSnapshotArgs = (root: string, id: string): string[] => ['restore-snapshot', checkRoot(root), checkId(id)]
 export const snapshotsArgs = (root: string): string[] => ['snapshots', checkRoot(root)]
+export const estimateArgs = (root: string, id: string): string[] => ['estimate', checkRoot(root), checkId(id)]
+/** `estimate` result: "<folder kb> <volumes kb> <free kb>" (read-only; nothing is stopped). */
+export const parseEstimate = (out: string): { folderBytes: number, volumeBytes: number, freeBytes: number } => {
+    const m = lastLine(out).match(/^(\d+) (\d+) (\d+)$/)
+    if (!m) throw new Error(`idea-app-data estimate gave no result line: ${lastLine(out) || '(empty)'}`)
+    return { folderBytes: Number(m[1]) * 1024, volumeBytes: Number(m[2]) * 1024, freeBytes: Number(m[3]) * 1024 }
+}
 
 /** The helper prints rsync progress first; its result is the last non-empty line. */
 export const lastLine = (out: string): string => out.trim().split('\n').map(s => s.trim()).filter(Boolean).pop() ?? ''

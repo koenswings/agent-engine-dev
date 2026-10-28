@@ -106,7 +106,7 @@ describe('idea-app-data: argument checks', () => {
 
     it('refuses the wrong argument count for every subcommand', async () => {
         const cases: [string, number][] = [
-            ['version', 0], ['size', 2], ['copy', 4], ['send', 6], ['delete', 2], ['quarantine', 2], ['snapshot', 2], ['restore-snapshot', 2], ['snapshots', 1],
+            ['version', 0], ['size', 2], ['copy', 4], ['send', 6], ['delete', 2], ['quarantine', 2], ['snapshot', 2], ['restore-snapshot', 2], ['snapshots', 1], ['estimate', 2],
             ['borg-init', 2], ['borg-info', 2], ['borg-create', 4], ['borg-extract', 5],
             ['ensure-dirs', 1], ['erase-slot', 2], ['put-files', 3], ['peer-delete', 3], ['sync-peers', 0],
         ]
@@ -488,6 +488,40 @@ describe('idea-app-data: updateApp snapshots (v5, idea#230)', () => {
         expect(await fs.readFile(path.join(inst, 'db.sqlite3'), 'utf8')).toBe('v1')
         expect(await fs.pathExists(path.join(snap(root, 'inst1'), 'COMPLETE'))).toBe(true)
         expect(await fs.readFile(path.join(snap(root, 'inst1'), 'JOURNAL'), 'utf8')).toMatch(/restore sdb1 inst1 done aside=/)
+    })
+    it('estimate is read-only: folder + volume KB and free KB, even while the app runs; nothing written, no lock taken', async () => {
+        const root = await sb.addDisk('sdb1')
+        await sb.addInstance(root, 'inst1')
+        const vd = path.join(sb.volumesDir, 'inst1_db', '_data')
+        await fs.ensureDir(vd); await fs.writeFile(path.join(vd, 'big'), Buffer.alloc(200 * 1024))
+        const r = await sb.run(['estimate', 'sdb1', 'inst1'], { FAKE_DOCKER_VOLUMES: 'inst1_db', FAKE_DOCKER_PS: 'running', FAKE_DF_AVAIL_KB: '4242' })
+        expect(r.exitCode, r.stderr).toBe(0)
+        const [f, v, free] = r.stdout.trim().split(' ').map(Number)
+        expect(f).toBeGreaterThan(0); expect(v).toBeGreaterThanOrEqual(200); expect(free).toBe(4242)
+        expect(await fs.pathExists(path.join(root, '.pre-update'))).toBe(false)
+        expect(await fs.pathExists(path.join(root, '.idea-quarantine'))).toBe(false)
+        const body = await fs.readFile(path.join(process.cwd(), 'script/build_image_assets/idea-app-data'), 'utf8')
+        expect(body.slice(body.indexOf('    estimate)'), body.indexOf('    snapshots)'))).not.toMatch(/take_locks|\$MV|\$MKDIR|\$RSYNC|\$TAR|>> "|> "/)
+    })
+    it('a volume mounted by any running container is refused for export and restore (IN_USE); a vanished volume is recreated on restore', async () => {
+        const root = await sb.addDisk('sdb1')
+        await sb.addInstance(root, 'inst1')
+        const vd = path.join(sb.volumesDir, 'inst1_db', '_data')
+        await fs.ensureDir(vd); await fs.writeFile(path.join(vd, 'row'), 'r1')
+        const env = { FAKE_DOCKER_VOLUMES: 'inst1_db' }
+        refused(await sb.run(['snapshot', 'sdb1', 'inst1'], { ...env, FAKE_DOCKER_VOLUME_PS: 'other1' }), /IN_USE: volume inst1_db is mounted by a running container \(other1\)/)
+        expect(await fs.pathExists(path.join(root, '.pre-update'))).toBe(false)
+        expect((await sb.run(['snapshot', 'sdb1', 'inst1'], env)).exitCode).toBe(0)
+        refused(await sb.run(['restore-snapshot', 'sdb1', 'inst1'], { ...env, FAKE_DOCKER_VOLUME_PS: 'other1' }), /IN_USE: volume inst1_db/)
+        expect(await fs.readFile(path.join(vd, 'row'), 'utf8')).toBe('r1')
+        await fs.remove(path.join(sb.volumesDir, 'inst1_db'))
+        const r = await sb.run(['restore-snapshot', 'sdb1', 'inst1'], { ...env, FAKE_DOCKER_GONE: 'inst1_db' })
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(await fs.readFile(path.join(vd, 'row'), 'utf8')).toBe('r1')
+        const docker = (await sb.calls('docker')).map(c => c.argv.join(' '))
+        expect(docker.some(a => /^volume create --driver local --label com\.docker\.compose\.project=inst1 --label com\.docker\.compose\.volume=db -- inst1_db$/.test(a))).toBe(true)
+        expect(docker.some(a => /^ps -q --filter volume=inst1_db$/.test(a))).toBe(true)
+        expect(await fs.readFile(path.join(snap(root, 'inst1'), 'JOURNAL'), 'utf8')).toMatch(/volume inst1_db recreated/)
     })
     it('refuses symlinked snapshot folders and has no removing code path', async () => {
         const root = await sb.addDisk('sdb1')

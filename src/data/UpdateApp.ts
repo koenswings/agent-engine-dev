@@ -32,7 +32,7 @@ import { diskMountRoot, appDataRoot, Disk, PreUpdateSnapshot } from './Disk.js'
 import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
 import {
     runAppData, snapshotArgs, restoreSnapshotArgs, snapshotsArgs, parseSnapshotResult, parseSnapshotsList,
-    helperAtLeast, instanceDataBytes, lastLine, SnapshotResult,
+    helperAtLeast, lastLine, SnapshotResult, estimateArgs, parseEstimate,
 } from '../utils/appDataHelper.js'
 import { createOperation, updateOperation } from './Operations.js'
 import { log } from '../utils/utils.js'
@@ -66,8 +66,8 @@ export interface UpdateDeps {
     helperProblem: () => Promise<string | null>
     mountRoot: (disk: Disk) => Promise<string>
     verifySums: (bundleDir: string) => Promise<boolean>
-    instanceBytes: (disk: Disk, id: InstanceID) => Promise<number>
-    freeBytes: (dir: string) => Promise<number>
+    /** read-only helper `estimate`: folder + named-volume bytes and the App Disk's free bytes; stops nothing */
+    estimate: (disk: Disk, id: InstanceID) => Promise<{ folderBytes: number, volumeBytes: number, freeBytes: number }>
     dirBytes: (dir: string) => Promise<number>
     copyBundle: (src: string, dst: string) => Promise<void>
     stop: (inst: Instance, disk: Disk) => Promise<void>
@@ -113,8 +113,7 @@ export const defaultUpdateDeps = (storeHandle: DocHandle<Store>): UpdateDeps => 
         if (!await fs.pathExists(path.join(dir, 'SHA256SUMS'))) return false
         try { await $({ cwd: dir })`sha256sum --check --strict --quiet SHA256SUMS`.quiet(); return true } catch { return false }
     },
-    instanceBytes: async (disk, id) => instanceDataBytes(await appDataRoot(disk), String(id)),
-    freeBytes: async (dir) => (await import('./CopyMoveApp.js')).availableBytes(dir),
+    estimate: async (disk, id) => parseEstimate(await runAppData(estimateArgs(await appDataRoot(disk), String(id)))),
     dirBytes: async (dir) => (await import('./CopyMoveApp.js')).directoryBytes(dir),
     copyBundle: async (src, dst) => {
         for (const name of await fs.readdir(src)) {
@@ -233,11 +232,13 @@ export const updateApp = async (
         let shortDisks: string[] = []
         let dataBytes = 0
         if (bundle && gotLock) {
-            dataBytes = await d.instanceBytes(disk, inst.id)
+            // NO_SPACE changes nothing (Steve): the helper's read-only estimate counts the folder AND
+            // the named volumes before anything is stopped; the snapshot's own check is the backstop.
+            const est = await d.estimate(disk, inst.id)
+            dataBytes = est.folderBytes + est.volumeBytes
             const bundleBytes = String(bundle.disk.id) === String(disk.id) ? 0 : await d.dirBytes(bundle.dir)
             const need = dataBytes + snapshotMarginBytes(dataBytes) + bundleBytes
-            const free = await d.freeBytes(instRoot)
-            if (free < need) shortDisks = [`${disk.name} (snapshot needs ${need}, free ${free})`]
+            if (est.freeBytes < need) shortDisks = [`${disk.name} (snapshot needs ${need}, free ${est.freeBytes})`]
         }
         const refusal = checkUpdate({
             diskDocked: true, busy: !gotLock, currentAppId: String(inst.instanceOf), newAppId,

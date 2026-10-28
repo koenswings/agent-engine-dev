@@ -326,6 +326,12 @@ volume_dir() {   # volume_dir <vol>: echo its checked local mountpoint
     [[ -d "$mp" && ! -L "$mp" && ! -L "$VOLUMES_DIR/$1" ]] || refuse "volume $1 mountpoint $mp is missing or a symlink"
     echo "$mp"
 }
+volume_idle() {   # volume_idle <vol>: refuse while any running container (any project) mounts it
+    local ids
+    ids=$($DOCKER ps -q --filter "volume=$1" 2>/dev/null) || refuse "cannot list the containers that mount volume $1"
+    [[ -z "$ids" ]] || refuse "IN_USE: volume $1 is mounted by a running container ($(echo $ids)); stop it first"
+}
+volume_exists() { $DOCKER volume inspect -f '{{.Name}}' -- "$1" >/dev/null 2>&1; }
 dir_kb() { $DU -sk -x -- "$1" | { read -r k _; echo "${k:-}"; }; }
 
 # ── Checks ───────────────────────────────────────────────────────────────────
@@ -956,6 +962,7 @@ case "$SUB" in
         list_volumes "$3"
         VOL_DIRS=(); VOL_KB=0
         for v in ${VOL_NAMES[@]+"${VOL_NAMES[@]}"}; do
+            volume_idle "$v"
             vd=$(volume_dir "$v") || exit 2
             k=$(dir_kb "$vd"); [[ "$k" =~ ^[0-9]+$ ]] || refuse "cannot tell the size of volume $v"
             VOL_DIRS+=("$vd"); VOL_KB=$(( VOL_KB + k ))
@@ -1042,6 +1049,14 @@ case "$SUB" in
                 [[ -f "$a" && ! -L "$a" ]] || continue
                 v=${a##*/}; v=${v%.tar}
                 [[ "$v" =~ $RE_VOL ]] || refuse "archive name '$v' does not match $RE_VOL"
+                if ! volume_exists "$v"; then
+                    # Gone (e.g. compose down -v): recreate it as a local volume with the compose labels.
+                    $DOCKER volume create --driver local --label "com.docker.compose.project=$3" \
+                        --label "com.docker.compose.volume=${v#"$3"_}" -- "$v" >/dev/null || refuse "cannot recreate volume $v"
+                    echo "restore volume $v recreated" >> "$SDIR/JOURNAL"
+                    journal "restore-snapshot: volume $v recreated"
+                fi
+                volume_idle "$v"
                 vd=$(volume_dir "$v") || exit 2
                 # Current contents moved aside by a same-filesystem rename (undoable), never removed.
                 vaside="$VOLUMES_DIR/$v/_data.idea-quarantine-$($DATE -u +%Y%m%dT%H%M%S%NZ)"
@@ -1059,6 +1074,27 @@ case "$SUB" in
         echo "restore $2 $3 done aside=${ASIDE:-none}" >> "$SDIR/JOURNAL"
         journal "restore-snapshot: $INST restored from $SDIR (previous folder: ${ASIDE:-none})"
         echo "${ASIDE:-none}"
+        exit 0
+        ;;
+
+    estimate)
+        # Read-only (no lock, nothing stopped or written): "<folder kb> <volumes kb> <free kb>"
+        # so updateApp can refuse NO_SPACE before it stops anything; snapshot re-checks.
+        need 2 $(($# - 1)) "<root> <id>"
+        check_id "$3"
+        resolve_root "$2" instances
+        INST=$(inst_dir "$R_DIR" "$3")
+        [[ ! -L "$INST" ]] || refuse "$INST is a symlink"
+        existing_dir "$INST" "instance folder"
+        list_volumes "$3"
+        VOL_KB=0
+        for v in ${VOL_NAMES[@]+"${VOL_NAMES[@]}"}; do
+            vd=$(volume_dir "$v") || exit 2
+            k=$(dir_kb "$vd"); [[ "$k" =~ ^[0-9]+$ ]] || refuse "cannot tell the size of volume $v"
+            VOL_KB=$(( VOL_KB + k ))
+        done
+        INST_KB=$(dir_kb "$INST"); [[ "$INST_KB" =~ ^[0-9]+$ ]] || refuse "cannot tell the size of $INST"
+        echo "$INST_KB $VOL_KB $(avail_kb "$R_DIR")"
         exit 0
         ;;
 
@@ -1270,7 +1306,7 @@ case "$SUB" in
         ;;
 
     "")
-        refuse "no subcommand (version, size, copy, send, receive, delete, borg-init, borg-info, borg-create, borg-extract, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, sync-peers)"
+        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, borg-init, borg-info, borg-create, borg-extract, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, sync-peers)"
         ;;
     *)
         refuse "unknown subcommand '$(printf '%q' "$SUB")'"

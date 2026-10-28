@@ -131,6 +131,11 @@ exit \${FAKE_RSYNC_EXIT:-0}`)
     await fake('docker', `${RECORD('docker', callsDir)}
 # docker volume ls -q ...: FAKE_DOCKER_VOLUMES (names); docker volume inspect -f ... -- <v>:
 # "\${FAKE_DOCKER_DRIVER:-local} <VOLUMES_DIR>/<v>/_data" (FAKE_VOLUMES_DIR)
+# docker ps -q --filter volume=<v>: FAKE_DOCKER_VOLUME_PS. FAKE_DOCKER_GONE=<v>: inspect fails until "volume create" makes it.
+VD=${path.join(tmp, 'volumes')}
+if [[ "\${1:-}" == ps && "$*" == *volume=* ]]; then [[ -n "\${FAKE_DOCKER_VOLUME_PS:-}" ]] && echo "$FAKE_DOCKER_VOLUME_PS"; exit 0; fi
+if [[ "\${1:-}" == volume && "\${2:-}" == create ]]; then mkdir -p "$VD/\${@: -1}/_data"; touch "$VD/\${@: -1}/.created"; exit 0; fi
+if [[ "\${1:-}" == volume && "\${2:-}" == inspect && "\${@: -1}" == "\${FAKE_DOCKER_GONE:-}" && ! -e "$VD/\${@: -1}/.created" ]]; then exit 1; fi
 if [[ "\${1:-}" == volume && "\${2:-}" == ls ]]; then echo "\${FAKE_DOCKER_VOLUMES:-}"; exit 0; fi
 if [[ "\${1:-}" == volume && "\${2:-}" == inspect ]]; then echo "\${FAKE_DOCKER_DRIVER:-local} ${path.join(tmp, 'volumes')}/\${@: -1}/_data"; exit 0; fi
 [[ -n "\${FAKE_DOCKER_PS:-}" ]] && echo "$FAKE_DOCKER_PS"
