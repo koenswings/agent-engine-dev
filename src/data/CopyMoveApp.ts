@@ -424,6 +424,7 @@ export const copyApp = async (
                     status: 'Docked' as Status,
                     statusCondition: null,
                     port: 0 as any,
+                    portZip: null,
                     serviceImages: serviceImages as ServiceImage[],
                     created: Date.now() as Timestamp,
                     lastBackup: null,
