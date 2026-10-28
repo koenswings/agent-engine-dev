@@ -219,8 +219,22 @@ export const safeMount = async (device: string, ops: MountOps = mountOps()): Pro
 // ── Read-only look (idea#201 §10 rule 1) ────────────────────────────────────
 
 export type IdeaLookResult =
-    | { ok: true, hasMeta: boolean, alreadyMounted: boolean, ignored?: boolean, osRootfs?: boolean }
+    | { ok: true, hasMeta: boolean, alreadyMounted: boolean, ignored?: boolean, osRootfs?: boolean, contents?: PartitionContents }
     | { ok: false, message: string }
+
+/** What is in the root of a partition (#236): entries other than lost+found, and whether the root is owned by root. */
+export interface PartitionContents { rootOwned: boolean; entries: string[] }
+
+/** #236: read the partition root without following anything. Unreadable → treated as non-empty. */
+export const partitionContents = (mountPoint: string): PartitionContents => {
+    let rootOwned = false
+    try { rootOwned = fs.lstatSync(mountPoint).uid === 0 } catch { /* unknown owner: not root-owned */ }
+    try {
+        return { rootOwned, entries: fs.readdirSync(mountPoint).filter(e => e !== 'lost+found').sort() }
+    } catch (e) {
+        return { rootOwned, entries: [`(unreadable: ${e instanceof Error ? e.message : String(e)})`] }
+    }
+}
 
 /**
  * The on-disk ignore marker (idea#279, proposal for review): a file named
@@ -281,6 +295,7 @@ export const lookForIdeaMeta = async (
     metaExists: (mountPoint: string) => boolean = (mp) => isValidIdeaMetaFile(`${mp}/META.yaml`),
     ignoreMarker: (mountPoint: string) => boolean = hasIgnoreMarker,
     osRootfs: (mountPoint: string) => boolean = hasOsRootfsLayout,
+    contentsOf: (mountPoint: string) => PartitionContents = partitionContents,
 ): Promise<IdeaLookResult> => {
     const target = mountPointOf(device)
     const check = await checkMountState(device, ops)
@@ -292,7 +307,7 @@ export const lookForIdeaMeta = async (
     }
     if (check.state === 'mounted') {
         if (osRootfs(target)) return { ok: true, hasMeta: false, alreadyMounted: true, ignored: ignoreMarker(target), osRootfs: true }
-        return { ok: true, hasMeta: metaExists(target), alreadyMounted: true, ignored: ignoreMarker(target) }
+        return { ok: true, hasMeta: metaExists(target), alreadyMounted: true, ignored: ignoreMarker(target), contents: contentsOf(target) }
     }
     try {
         await ops.mkdir(device)
@@ -304,10 +319,12 @@ export const lookForIdeaMeta = async (
     let hasMeta = false
     let ignored = false
     let rootfs = false
+    let contents: PartitionContents | undefined
     try {
         rootfs = osRootfs(target)
         hasMeta = !rootfs && metaExists(target)
         ignored = ignoreMarker(target)
+        contents = contentsOf(target)
     } finally {
         const released = await unmountAndRemove(device, ops)
         if (!released.ok) {
@@ -316,7 +333,7 @@ export const lookForIdeaMeta = async (
     }
     return rootfs
         ? { ok: true, hasMeta: false, alreadyMounted: false, ignored, osRootfs: true }
-        : { ok: true, hasMeta, alreadyMounted: false, ignored }
+        : { ok: true, hasMeta, alreadyMounted: false, ignored, contents }
 }
 
 // ── Unmounting ──────────────────────────────────────────────────────────────
