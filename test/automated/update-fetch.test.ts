@@ -116,7 +116,7 @@ describe('pushAppBundle (source side, #263)', () => {
         expect(a).toEqual({ ok: true })
         expect(replies).toEqual(['appFetchResult req-1 ok'])
         expect(msgs.some(m => m.type === 'idea/updateProgress' && m.step === 'Fetch' && m.bytesDone === 500 && m.bytesTotal === 1000 && m.instanceId === 'i1')).toBe(true)
-        expect(rsyncToPeerArgs('/x/', { host: 'h', engineId: 'e' }, ['receive-app', 'sda1', 'a'], ['--partial'])).toContain('--partial')
+        expect(rsyncToPeerArgs('/x/', { host: 'h', engineId: 'e' }, ['receive-app', 'sda1', 'a'], true, ['--partial'])).toContain('--partial')
     })
     it('3 retries with backoff, then TRANSFER_FAILED; a later success stops retrying', async () => {
         const a = await pushAppBundle(store, 'eng-b', preq, pushDeps(async () => { pushes++; throw new Error('rsync exited with code 12') }))

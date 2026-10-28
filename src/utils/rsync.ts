@@ -128,28 +128,57 @@ export interface PeerEngine { host: string, engineId: string }
  * A src ending in '/' sends a folder's contents (and that folder's own owner and
  * mode, for the target folder); a file or a list of files sends just those files.
  */
-export const rsyncToPeerArgs = (src: string | string[], peer: PeerEngine, helperArgs: string[], extraArgs: string[] = []): string[] => [
+/**
+ * The ssh cipher pinned for Engine-to-Engine pushes (idea#351 §6, measured in idea#354):
+ * the Pi 4 has no hardware AES, and chacha20-poly1305 is about 1.9x faster than aes128-gcm.
+ */
+export const PEER_CIPHER = 'chacha20-poly1305@openssh.com'
+
+/** True when ssh failed only because the peer does not offer the pinned cipher. */
+export const isCipherNegotiationFailure = (stderr: string): boolean =>
+    /no matching cipher|Unable to negotiate[^\n]*cipher|Bad SSH2 cipher spec|Unknown cipher type/i.test(stderr)
+
+export const rsyncToPeerArgs = (src: string | string[], peer: PeerEngine, helperArgs: string[], pinCipher = true, extraArgs: string[] = []): string[] => [
     '-a',
     '--info=progress2',
     '--no-inc-recursive',
     ...extraArgs,
-    '-e', peerRsyncShell(peer.engineId),
+    '-e', pinCipher ? `${peerRsyncShell(peer.engineId)} -c ${PEER_CIPHER}` : peerRsyncShell(peer.engineId),
     `--rsync-path=${remoteHelperRsyncPath(helperArgs)}`,
     '--', ...[src].flat(), `${peerTarget(peer.host)}:.`,
 ]
 
-/** Send a pi-owned folder (src ending in '/') or files to a peer Engine's helper (see rsyncToPeerArgs). */
-export const rsyncToPeer = (
+/** Runs one rsync; rejects with an Error whose message ends in rsync's stderr. Swappable in tests. */
+export type PeerRsyncRunner = (args: string[], formatError: (code: number | null, signal: string | null, stderr: string) => string,
+    onProgress?: RsyncProgressCallback, opId?: string) => Promise<void>
+export const peerRsyncRunner: { run: PeerRsyncRunner } = {
+    run: (args, formatError, onProgress, opId) => runRsyncProcess('rsync', args, formatError, onProgress, opId),
+}
+
+/**
+ * Send a pi-owned folder (src ending in '/') or files to a peer Engine's helper (see rsyncToPeerArgs).
+ * Pins PEER_CIPHER first; if the peer does not offer it (cipher negotiation failure, which ssh
+ * reports at once), retries ONCE with ssh's default cipher list. Any other failure is reported
+ * as is. ConnectTimeout=10 (peerSshOptions) stays on both attempts, so neither can hang on connect.
+ */
+export const rsyncToPeer = async (
     src: string | string[],
     peer: PeerEngine,
     helperArgs: string[],
     onProgress?: RsyncProgressCallback,
     opId?: string,
     extraArgs: string[] = [],
-): Promise<void> =>
-    runRsyncProcess('rsync', rsyncToPeerArgs(src, peer, helperArgs, extraArgs),
-        (code, _signal, stderr) => `rsync to Engine ${peer.engineId} (${peer.host}, ${helperArgs[0]}) exited with code ${code}: ${stderr.trim()}`,
-        onProgress, opId)
+): Promise<void> => {
+    const fmt = (code: number | null, _signal: string | null, stderr: string) =>
+        `rsync to Engine ${peer.engineId} (${peer.host}, ${helperArgs[0]}) exited with code ${code}: ${stderr.trim()}`
+    try {
+        await peerRsyncRunner.run(rsyncToPeerArgs(src, peer, helperArgs, true, extraArgs), fmt, onProgress, opId)
+    } catch (e) {
+        if (!isCipherNegotiationFailure(String((e as Error)?.message ?? e))) throw e
+        log(`rsync to Engine ${peer.engineId}: peer does not offer ${PEER_CIPHER}; retrying once with the default ssh ciphers`)
+        await peerRsyncRunner.run(rsyncToPeerArgs(src, peer, helperArgs, false, extraArgs), fmt, onProgress, opId)
+    }
+}
 
 /** One instance-data transfer through the root helper. Roots are helper root tokens. */
 export type InstanceDataTransfer =
