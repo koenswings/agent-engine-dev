@@ -128,10 +128,11 @@ export interface PeerEngine { host: string, engineId: string }
  * A src ending in '/' sends a folder's contents (and that folder's own owner and
  * mode, for the target folder); a file or a list of files sends just those files.
  */
-export const rsyncToPeerArgs = (src: string | string[], peer: PeerEngine, helperArgs: string[]): string[] => [
+export const rsyncToPeerArgs = (src: string | string[], peer: PeerEngine, helperArgs: string[], extraArgs: string[] = []): string[] => [
     '-a',
     '--info=progress2',
     '--no-inc-recursive',
+    ...extraArgs,
     '-e', peerRsyncShell(peer.engineId),
     `--rsync-path=${remoteHelperRsyncPath(helperArgs)}`,
     '--', ...[src].flat(), `${peerTarget(peer.host)}:.`,
@@ -144,8 +145,9 @@ export const rsyncToPeer = (
     helperArgs: string[],
     onProgress?: RsyncProgressCallback,
     opId?: string,
+    extraArgs: string[] = [],
 ): Promise<void> =>
-    runRsyncProcess('rsync', rsyncToPeerArgs(src, peer, helperArgs),
+    runRsyncProcess('rsync', rsyncToPeerArgs(src, peer, helperArgs, extraArgs),
         (code, _signal, stderr) => `rsync to Engine ${peer.engineId} (${peer.host}, ${helperArgs[0]}) exited with code ${code}: ${stderr.trim()}`,
         onProgress, opId)
 

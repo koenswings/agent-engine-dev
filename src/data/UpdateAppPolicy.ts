@@ -19,7 +19,7 @@ export const UPDATE_STEPS: readonly UpdateStep[] = ['Fetch', 'Check', 'Snapshot'
 export type UpdateRefusal =
     | 'NOT_DOCKED' | 'BUSY' | 'SOURCE_MISSING' | 'DIFFERENT_APP' | 'NOT_NEWER'
     | 'MAJOR_NOT_ALLOWED' | 'NEEDS_BACKUP' | 'NO_SPACE' | 'NO_SUMS'
-    | 'NOT_FOUND' | 'AMBIGUOUS' | 'HELPER_OUTDATED'
+    | 'NOT_FOUND' | 'AMBIGUOUS' | 'HELPER_OUTDATED' | 'TRANSFER_FAILED'
 
 /** Error text starts with the code; the two rollback outcomes use the console#168 wording. */
 export const ROLLED_BACK_PREFIX = 'ROLLED BACK:'

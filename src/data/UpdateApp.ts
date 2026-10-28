@@ -42,6 +42,7 @@ import {
 } from './UpdateAppPolicy.js'
 import { parseAppId } from './App.js'
 import { setComposeInstanceName } from './InstanceCopy.js'
+import { isUnfinishedFetch } from './UpdateFetch.js'
 
 export const UPDATE_HELPER_MIN = 5
 export const UPDATE_PROGRESS_TYPE = 'idea/updateProgress'
@@ -50,7 +51,12 @@ export const UPDATE_APP_USAGE = 'Usage: updateApp <instanceId|name> <newAppId> [
 /** Same margin as the helper: 10 % of the data, at least 1 GiB. */
 export const snapshotMarginBytes = (bytes: number): number => Math.max(Math.floor(bytes / 10), 1024 * 1024 * 1024)
 
-export interface UpdateProgress { type: typeof UPDATE_PROGRESS_TYPE; engineId: string; instanceId: string; step: UpdateStep; bytesDone: number; bytesTotal: number }
+export interface UpdateProgress {
+    type: typeof UPDATE_PROGRESS_TYPE; engineId: string; instanceId: string; step: UpdateStep; bytesDone: number; bytesTotal: number
+    /** #263: set while a cross-Engine Fetch waits (thermal pause), absent otherwise */
+    fetchPaused?: FetchPaused
+}
+export interface FetchPaused { reason: 'thermal'; bytesDone: number; bytesTotal: number; since: number }
 
 export interface UpdateResult {
     instanceId: InstanceID; name: string; fromAppId: AppID; toAppId: AppID
@@ -73,6 +79,8 @@ export interface UpdateDeps {
     stop: (inst: Instance, disk: Disk) => Promise<void>
     containerIds: (id: InstanceID) => Promise<string[]>
     composeDown: (dir: string, id: InstanceID) => Promise<void>
+    /** #263: cross-Engine Fetch onto the instance's disk; resolves with the local bundle folder */
+    fetch: (req: import('./UpdateFetch.js').FetchRequest) => Promise<string>
     snapshot: (disk: Disk, id: InstanceID) => Promise<SnapshotResult>
     restoreSnapshot: (disk: Disk, id: InstanceID) => Promise<string>
     listSnapshots: (disk: Disk) => Promise<SnapshotsInfo>
@@ -106,18 +114,24 @@ export const aggregateHealth = (states: { status: string, health?: string, exitC
     return { state, restartCount }
 }
 
+const defaultVerifySums = async (dir: string): Promise<boolean> => {
+    if (!await fs.pathExists(path.join(dir, 'SHA256SUMS'))) return false
+    try { await $({ cwd: dir })`sha256sum --check --strict --quiet SHA256SUMS`.quiet(); return true } catch { return false }
+}
+
 export const defaultUpdateDeps = (storeHandle: DocHandle<Store>): UpdateDeps => ({
     helperProblem: () => helperAtLeast(UPDATE_HELPER_MIN, 'updateApp'),
     mountRoot: (disk) => diskMountRoot(disk),
-    verifySums: async (dir) => {
-        if (!await fs.pathExists(path.join(dir, 'SHA256SUMS'))) return false
-        try { await $({ cwd: dir })`sha256sum --check --strict --quiet SHA256SUMS`.quiet(); return true } catch { return false }
+    verifySums: (dir) => defaultVerifySums(dir),
+    fetch: async (req) => {
+        const f = await import('./UpdateFetch.js')
+        return f.fetchBundle(req, f.defaultFetchTargetDeps(storeHandle, defaultVerifySums))
     },
     estimate: async (disk, id) => parseEstimate(await runAppData(estimateArgs(await appDataRoot(disk), String(id)))),
     dirBytes: async (dir) => (await import('./CopyMoveApp.js')).directoryBytes(dir),
     copyBundle: async (src, dst) => {
         for (const name of await fs.readdir(src)) {
-            if (name === '.env' || name === 'SHA256SUMS') continue
+            if (name === '.env' || name === 'SHA256SUMS' || name.startsWith('.idea-')) continue
             await fs.copy(path.join(src, name), path.join(dst, name), { overwrite: true })
         }
     },
@@ -192,7 +206,7 @@ const findBundleDisk = async (store: Store, d: UpdateDeps, engineId: string, ins
         : [...docked.filter(x => String(x.id) === String(inst.storedOn)), ...docked.filter(x => String(x.id) !== String(inst.storedOn))]
     for (const disk of order) {
         const dir = path.join(await d.mountRoot(disk), 'apps', newAppId)
-        if (await fs.pathExists(path.join(dir, 'compose.yaml'))) return { disk, dir }
+        if (await fs.pathExists(path.join(dir, 'compose.yaml')) && !await isUnfinishedFetch(dir)) return { disk, dir }
     }
     return null
 }
@@ -226,7 +240,13 @@ export const updateApp = async (
             d.broadcast({ type: UPDATE_PROGRESS_TYPE, engineId, instanceId: String(inst.id), step, bytesDone, bytesTotal })
         // ── Fetch (local) + Check: nothing changes before every refusal has been checked
         progress('Fetch')
-        const bundle = await findBundleDisk(store, d, engineId, inst, newAppId, opts.sourceDiskId)
+        let bundle = await findBundleDisk(store, d, engineId, inst, newAppId, opts.sourceDiskId)
+        // #263: --source names a disk docked to ANOTHER Engine: that Engine pushes the bundle here.
+        const remote = opts.sourceDiskId ? store.diskDB[opts.sourceDiskId as DiskID] as Disk | undefined : undefined
+        if (!bundle && gotLock && remote?.dockedTo && remote.device && String(remote.dockedTo) !== engineId) {
+            const dir = await d.fetch({ localEngineId: engineId, instanceId: String(inst.id), newAppId, sourceDisk: remote, targetDisk: disk })
+            bundle = { disk, dir }
+        }
         const instRoot = await d.mountRoot(disk)
         const instDir = path.join(instRoot, 'instances', String(inst.id))
         let shortDisks: string[] = []
