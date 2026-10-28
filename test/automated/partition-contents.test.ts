@@ -14,10 +14,10 @@ describe('partitionContents (#236)', () => {
             mkdirSync(path.join(dir, 'lost+found'))
             expect(partitionContents(dir)).toEqual({ rootOwned: process.getuid?.() === 0, entries: [] })
             writeFileSync(path.join(dir, 'z.txt'), 'x'); mkdirSync(path.join(dir, 'Photos'))
-            expect(partitionContents(dir).entries).toEqual(['Photos', 'z.txt'])
+            expect(partitionContents(dir)?.entries).toEqual(['Photos', 'z.txt'])
         } finally { rmSync(dir, { recursive: true, force: true }) }
     })
-    it('an unreadable root counts as non-empty', () => {
-        expect(partitionContents('/nonexistent-236').entries[0]).toMatch(/^\(unreadable: /)
+    it('a missing mount point reports nothing', () => {
+        expect(partitionContents('/nonexistent-236')).toBeUndefined()
     })
 })
