@@ -25,7 +25,7 @@ import { ContentSummary, readSummaryFromTrace, resolveSummaryTarget } from './Su
 import { refreshUnformattedDisks } from './UnformattedDisks.js'
 import { isSystemDevice, driveNameOf, bareDevice } from './SystemDisk.js'
 import { log, print, uuid } from '../utils/utils.js'
-import { disksRoot } from './Config.js'
+import { disksRoot, usbRoot } from './Config.js'
 import { APP_DATA_HELPER, eraseSlotArgs } from '../utils/appDataHelper.js'
 import { forgetMetaLook } from '../monitors/metaLookCache.js'
 
@@ -275,6 +275,10 @@ export const eraseBlocker = async (store: Store, disk: Disk | null): Promise<str
     return null
 }
 
+
+/** A teacher-stick mount (read-only, directly under the USB root, idea#193 §3.2). */
+const isUsbStickMount = (mountpoint: string): boolean => path.dirname(mountpoint) === usbRoot()
+
 export const eraseDisk = async (
     storeHandle: DocHandle<Store>,
     targetId: string,
@@ -345,7 +349,10 @@ export const eraseDisk = async (
     // or the system disk must refuse here, not after the target was undocked.
     if (!isSlotEraseDevice(devicePartition ?? whole)) {
         if (await isSystemDevice(whole)) throw new Error(`${summary.label} is on this Pi's system disk and cannot be erased.`)
-        const siblings = (await ops.mountedPartitions(whole)).filter(m => m.partition !== devicePartition)
+        // A read-only teacher stick under the USB root (e.g. the EFI vfat partition of an old
+        // OS disk, #235) is not a blocker: it is unmounted below, before anything is wiped.
+        const siblings = (await ops.mountedPartitions(whole))
+            .filter(m => m.partition !== devicePartition && !isUsbStickMount(m.mountpoint))
         if (siblings.length > 0) {
             throw new Error(
                 `${summary.label} shares its physical disk (/dev/${whole}) with ${siblings.map(m => `${m.partition} mounted at ${m.mountpoint}`).join(', ')}. ` +
@@ -380,6 +387,15 @@ export const eraseDisk = async (
             const { removeSticksOnDrive } = await import('./UsbSticks.js')
             const gone = await removeSticksOnDrive(storeHandle, whole, 'erase requested')
             if (gone.length) log(`eraseDisk: unmounted USB stick(s) ${gone.join(', ')} before erasing`)
+            // #235: the sibling check above let stick mounts through; never wipe one that is still mounted.
+            if (!isSlotEraseDevice(devicePartition ?? whole)) {
+                const left = (await ops.mountedPartitions(whole)).filter(m => m.partition !== devicePartition)
+                if (left.length > 0) {
+                    throw new Error(
+                        `${summary.label} shares its physical disk (/dev/${whole}) with ${left.map(m => `${m.partition} mounted at ${m.mountpoint}`).join(', ')}, ` +
+                        `which could not be unmounted. Erasing wipes the whole disk, so nothing was erased.`)
+                }
+            }
         }
 
         if (disk) {
