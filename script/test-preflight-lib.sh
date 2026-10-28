@@ -60,10 +60,33 @@ is_on_disk() {
     [[ "$name" =~ ^${disk}p?[0-9]+$ ]]
 }
 
+# preflight_is_block <path> — true if <path> is a block device. A function so tests can fake it.
+preflight_is_block() { [ -b "$1" ]; }
+
+# is_live_app_disk_link <link> <disks-root> — true when <link> resolves to a present block
+#   device and that device, or one of its partitions, is mounted under <disks-root>
+#   (mount table: $PREFLIGHT_MOUNTS, default /proc/mounts; \040 in mount points = space).
+is_live_app_disk_link() {
+    local link="$1" disks_root="${2%/}" dev name src mnt _rest
+    dev=$(readlink -f "$link" 2>/dev/null) || return 1
+    [ -n "$dev" ] && preflight_is_block "$dev" || return 1
+    name="${dev##*/}"
+    while read -r src mnt _rest; do
+        [[ "$src" == /dev/* ]] || continue
+        src=$(readlink -f "$src" 2>/dev/null || echo "$src")
+        is_on_disk "${src##*/}" "$name" || continue
+        mnt="${mnt//\\040/ }"
+        [[ "$mnt" == "$disks_root" || "$mnt" == "$disks_root"/* ]] && return 0
+    done < "${PREFLIGHT_MOUNTS:-/proc/mounts}"
+    return 1
+}
+
 # find_app_disks <disks-root> <watch-dir> <root-disk>
 #   Prints one line per App Disk found:
 #     <disks-root>/<name>   folders with META.yaml or apps/ (except old/)
-#     <watch-dir>/sd*       sentinels
+#     <watch-dir>/sd*       links that resolve to a present block device mounted
+#                           under <disks-root> (agent-engine-dev#223: udev keeps stale
+#                           links of an ejected, unmounted disk; those are not counted)
 #   Devices on <root-disk> (the Pi's own disk) are skipped. An empty <root-disk>
 #   excludes nothing.
 find_app_disks() {
@@ -81,8 +104,9 @@ find_app_disks() {
     fi
     if [ -d "$watch_dir" ]; then
         for s in "$watch_dir"/sd*; do
-            [ -e "$s" ] || continue
+            [ -e "$s" ] || [ -L "$s" ] || continue
             is_on_disk "$(basename "$s")" "$root_disk" && continue
+            is_live_app_disk_link "$s" "$disks_root" || continue
             echo "$s"
         done
     fi

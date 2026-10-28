@@ -10,6 +10,9 @@
  *   - this Engine itself is skipped
  *   - connectEngine: optional port (static peers); without it the key uses
  *     settings.port exactly as before (mDNS path)
+ *
+ * Fixture hostnames are peer-fixture-a/b/c/d, never a real fleet name (idea#345: on idea01
+ * the local Engine record carries hostname idea01 and shadowed the static: placeholder).
  */
 
 import { describe, it, beforeEach, afterEach, expect, vi } from 'vitest'
@@ -37,27 +40,27 @@ const clearConnections = () => { for (const k of Object.keys(network.connections
 
 describe('parseStaticPeers', () => {
     it('host or host:port; default port when omitted', () => {
-        expect(parseStaticPeers('idea01,10.0.0.3:5000', 4321)).toEqual({
-            peers: [{ host: 'idea01', port: 4321 }, { host: '10.0.0.3', port: 5000 }], warnings: [],
+        expect(parseStaticPeers('peer-fixture-a,10.0.0.3:5000', 4321)).toEqual({
+            peers: [{ host: 'peer-fixture-a', port: 4321 }, { host: '10.0.0.3', port: 5000 }], warnings: [],
         })
     })
     it('whitespace and empty entries are ignored; unset/empty gives no peers', () => {
-        expect(parseStaticPeers('  idea01 , ,, idea03.local:4321 ,', 4321).peers)
-            .toEqual([{ host: 'idea01', port: 4321 }, { host: 'idea03.local', port: 4321 }])
+        expect(parseStaticPeers('  peer-fixture-a , ,, peer-fixture-b.local:4321 ,', 4321).peers)
+            .toEqual([{ host: 'peer-fixture-a', port: 4321 }, { host: 'peer-fixture-b.local', port: 4321 }])
         expect(parseStaticPeers('', 4321)).toEqual({ peers: [], warnings: [] })
         expect(parseStaticPeers(undefined, 4321)).toEqual({ peers: [], warnings: [] })
         expect(parseStaticPeers(' , ', 4321)).toEqual({ peers: [], warnings: [] })
     })
     it('invalid entries are skipped with a warning; valid ones still count', () => {
-        const r = parseStaticPeers('idea01:0,idea02:99999,bad host,idea04:abc,a:1:2,-x,10.0.0.4', 4321)
+        const r = parseStaticPeers('peer-fixture-a:0,peer-fixture-c:99999,bad host,peer-fixture-d:abc,a:1:2,-x,10.0.0.4', 4321)
         expect(r.peers).toEqual([{ host: '10.0.0.4', port: 4321 }])
         expect(r.warnings).toHaveLength(6)
-        expect(r.warnings[0]).toBe(`${STATIC_PEERS_ENV}: skipping invalid entry 'idea01:0' (port must be 1..65535)`)
+        expect(r.warnings[0]).toBe(`${STATIC_PEERS_ENV}: skipping invalid entry 'peer-fixture-a:0' (port must be 1..65535)`)
         expect(r.warnings[2]).toBe(`${STATIC_PEERS_ENV}: skipping invalid entry 'bad host' (expected host or host:port)`)
     })
     it('duplicates (same host and port) are listed once', () => {
-        expect(parseStaticPeers('idea01,IDEA01:4321,idea01:4322', 4321).peers)
-            .toEqual([{ host: 'idea01', port: 4321 }, { host: 'idea01', port: 4322 }])
+        expect(parseStaticPeers('peer-fixture-a,PEER-FIXTURE-A:4321,peer-fixture-a:4322', 4321).peers)
+            .toEqual([{ host: 'peer-fixture-a', port: 4321 }, { host: 'peer-fixture-a', port: 4322 }])
     })
 })
 
@@ -77,7 +80,7 @@ describe('startStaticPeers', () => {
     const repo = {} as Repo
     let logs: string[]
     let connect: any
-    const resolveMap: Record<string, string> = { idea01: '10.0.0.1', 'idea03.local': '10.0.0.3', idea04: '10.0.0.4', me: '10.0.0.99' }
+    const resolveMap: Record<string, string> = { 'peer-fixture-a': '10.0.0.1', 'peer-fixture-b.local': '10.0.0.3', 'peer-fixture-d': '10.0.0.4', me: '10.0.0.99' }
     const resolve = vi.fn(async (host: string) => {
         if (host in resolveMap) return resolveMap[host]
         if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return host
@@ -145,44 +148,44 @@ describe('startStaticPeers', () => {
     })
 
     it('only invalid entries: warns, returns undefined, never connects', async () => {
-        expect(start('bad host,idea01:0')).toBeUndefined()
+        expect(start('bad host,peer-fixture-a:0')).toBeUndefined()
         await vi.advanceTimersByTimeAsync(60_000)
         expect(connect).not.toHaveBeenCalled()
         expect(logs).toHaveLength(2)
     })
 
     it('connectEngine is called once per peer (resolved ip, port, short hostname), then only checked', async () => {
-        start('idea01, idea03.local:5000 ,10.0.0.4,idea01')
+        start('peer-fixture-a, peer-fixture-b.local:5000 ,10.0.0.4,peer-fixture-a')
         await vi.advanceTimersByTimeAsync(0)
         expect(connect).toHaveBeenCalledTimes(3)
         expect(connect.mock.calls.map(c => [c[0], c[1], c[3]])).toEqual([
-            ['10.0.0.1', 'idea01', 4321], ['10.0.0.3', 'idea03', 5000], ['10.0.0.4', '10.0.0.4', 4321],
+            ['10.0.0.1', 'peer-fixture-a', 4321], ['10.0.0.3', 'peer-fixture-b', 5000], ['10.0.0.4', '10.0.0.4', 4321],
         ])
         await vi.advanceTimersByTimeAsync(STATIC_PEER_CHECK_INTERVAL_MS * 5)
         expect(connect).toHaveBeenCalledTimes(3)
     })
 
     it('engineId comes from the store record with that hostname, else a static: placeholder that is filled in later', async () => {
-        start('idea01')
+        start('peer-fixture-a')
         await vi.advanceTimersByTimeAsync(0)
-        expect(connect.mock.calls[0][2]).toBe('static:idea01')
-        const record = { ...JSON.parse(JSON.stringify(h.doc().engineDB[localEngineId])), id: 'ENGINE_idea01', hostname: 'idea01' }
-        h.change(doc => { (doc.engineDB as any)['ENGINE_idea01'] = record })
+        expect(connect.mock.calls[0][2]).toBe('static:peer-fixture-a')
+        const record = { ...JSON.parse(JSON.stringify(h.doc().engineDB[localEngineId])), id: 'ENGINE_peer-fixture-a', hostname: 'peer-fixture-a' }
+        h.change(doc => { (doc.engineDB as any)['ENGINE_peer-fixture-a'] = record })
         await vi.advanceTimersByTimeAsync(STATIC_PEER_CHECK_INTERVAL_MS)
-        expect((network.connections as any)['10.0.0.1:4321'].engineId).toBe('ENGINE_idea01')
+        expect((network.connections as any)['10.0.0.1:4321'].engineId).toBe('ENGINE_peer-fixture-a')
     })
 
     it('a peer the mDNS path already connected (same ip:port) is not dialled again; its missed count is reset', async () => {
-        (network.connections as any)['10.0.0.1:4321'] = { adapter: {} as any, missedDiscoveryCount: 2, hostname: 'idea01', engineId: 'ENGINE_idea01' }
-        start('idea01')
+        (network.connections as any)['10.0.0.1:4321'] = { adapter: {} as any, missedDiscoveryCount: 2, hostname: 'peer-fixture-a', engineId: 'ENGINE_peer-fixture-a' }
+        start('peer-fixture-a')
         await vi.advanceTimersByTimeAsync(0)
         expect(connect).not.toHaveBeenCalled()
         expect((network.connections as any)['10.0.0.1:4321'].missedDiscoveryCount).toBe(0)
-        expect((network.connections as any)['10.0.0.1:4321'].engineId).toBe('ENGINE_idea01')
+        expect((network.connections as any)['10.0.0.1:4321'].engineId).toBe('ENGINE_peer-fixture-a')
     })
 
     it('reconnects after the connection is gone', async () => {
-        start('idea01')
+        start('peer-fixture-a')
         await vi.advanceTimersByTimeAsync(0)
         expect(connect).toHaveBeenCalledTimes(1)
         delete (network.connections as any)['10.0.0.1:4321']        // e.g. disconnectEngine
@@ -193,7 +196,7 @@ describe('startStaticPeers', () => {
 
     it('retries failures with backoff (5 s, 10 s, 20 s ...) and resets after a success', async () => {
         connect.mockRejectedValueOnce(new Error('boom 1')).mockRejectedValueOnce(new Error('boom 2')).mockRejectedValueOnce(new Error('boom 3'))
-        start('idea01')
+        start('peer-fixture-a')
         await vi.advanceTimersByTimeAsync(0)
         expect(connect).toHaveBeenCalledTimes(1)
         await vi.advanceTimersByTimeAsync(STATIC_PEER_BASE_DELAY_MS - 1)
@@ -224,16 +227,16 @@ describe('startStaticPeers', () => {
     })
 
     it('this Engine itself is skipped (and not retried)', async () => {
-        start('me,idea01')
+        start('me,peer-fixture-a')
         await vi.advanceTimersByTimeAsync(STATIC_PEER_CHECK_INTERVAL_MS * 3)
         expect(connect).toHaveBeenCalledTimes(1)
-        expect(connect.mock.calls[0][1]).toBe('idea01')
+        expect(connect.mock.calls[0][1]).toBe('peer-fixture-a')
         expect(logs).toContain('Static peer me:4321 is this Engine — skipped')
     })
 
     it('stop() cancels all pending attempts', async () => {
         connect.mockRejectedValue(new Error('down'))
-        const s = start('idea01')!
+        const s = start('peer-fixture-a')!
         await vi.advanceTimersByTimeAsync(0)
         s.stop()
         await vi.advanceTimersByTimeAsync(STATIC_PEER_BASE_DELAY_MS * 10)
