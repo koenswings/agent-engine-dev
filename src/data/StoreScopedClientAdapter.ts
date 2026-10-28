@@ -21,6 +21,7 @@
 import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websocket'
 import { cbor, Message, PeerId, PeerMetadata } from '@automerge/automerge-repo'
 import { parseRefusalMessage, peerVerdict, PeerVerdict } from './StoreScope.js'
+import { WsLiveness, wsDeadMs, wsPingMs } from './WsLiveness.js'
 
 export interface ClientRefusal {
     url: string
@@ -36,6 +37,9 @@ export interface StoreScopedClientOptions {
     /** true = the doc is another fleet's store doc: never send or accept it. */
     docGuard?: (documentId: string) => boolean
     retryInterval?: number
+    /** #168 dead-socket watchdog timings (default IDEA_WS_PING_MS / IDEA_WS_DEAD_MS). */
+    pingMs?: number
+    deadMs?: number
 }
 
 /** Small messages are peeked before the stock adapter sees them (handshake/error replies are tiny). */
@@ -56,13 +60,26 @@ export class StoreScopedWebSocketClientAdapter extends WebSocketClientAdapter {
     #docGuard?: (documentId: string) => boolean
     #admitted = false
     refusal?: ClientRefusal
+    /** #168: sockets dropped by the watchdog because nothing was heard. */
+    forcedReconnects = 0
+    #liveness: WsLiveness
 
     constructor(url: string, opts: StoreScopedClientOptions) {
         super(url, opts.retryInterval ?? 5000)
         this.ownTag = opts.ownTag
         this.#onRefused = opts.onRefused
         this.#docGuard = opts.docGuard
+        this.#liveness = new WsLiveness({ pingMs: opts.pingMs ?? wsPingMs(), deadMs: opts.deadMs ?? wsDeadMs(), label: url, onDead: () => { this.forcedReconnects++ } })
     }
+
+    /** #168: every (re)connect gets a fresh socket; watch it for silence. */
+    override connect(peerId: PeerId, peerMetadata?: PeerMetadata): void {
+        super.connect(peerId, peerMetadata)
+        if (this.socket && !this.refusal) this.#liveness.attach(this.socket as any)
+    }
+
+    /** ms since anything (message, ping, pong) arrived on the current socket. */
+    get lastHeardAgeMs(): number { return this.#liveness.lastHeardAgeMs }
 
     /** True once the server's handshake passed the store check. */
     get admitted(): boolean { return this.#admitted }
@@ -110,6 +127,7 @@ export class StoreScopedWebSocketClientAdapter extends WebSocketClientAdapter {
 
     /** Idempotent: removeNetworkAdapter calls it again after a refusal already closed the socket. */
     override disconnect(): void {
+        this.#liveness.detach()
         if (!this.socket || !this.peerId) return
         super.disconnect()
     }
