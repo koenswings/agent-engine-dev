@@ -140,14 +140,14 @@ export const uniqueCopyName = (store: Store, name: string): InstanceName => {
 // ── Copied .env / compose.yaml ────────────────────────────────────────────────
 
 /**
- * Remove the Engine-written `port=` line from .env text. Other lines (pass,
+ * Remove the Engine-written `port=` and `port_zip=` (#267) lines from .env text. Other lines (pass,
  * hostname, ip, app keys) are kept. App/fixture keys such as
  * KOLIBRI_HTTP_PORT in .env are not Engine-written and are left alone: the
  * Engine rewrites the compose listen env to the allocated port at every start
  * (syncKolibriHostListenPort).
  */
 export const clearEnginePort = (envText: string): string =>
-    envText.split('\n').filter(line => !/^port=/.test(line)).join('\n')
+    envText.split('\n').filter(line => !/^port(_zip)?=/.test(line)).join('\n')
 
 /** Set compose.yaml `x-app.instanceName`, keeping comments and layout. */
 export const setComposeInstanceName = (composeText: string, name: string): string => {
