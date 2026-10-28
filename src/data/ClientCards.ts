@@ -108,6 +108,11 @@ export interface DiskCandidate {
     flashRefusal: FlashRefusal | null
     mountedReadOnly: boolean
     firstSeen: Timestamp
+    /**
+     * console#163: true when the cached read-only look (IdeaLookResult.ignored, mounts.ts) of any
+     * ext4 partition found an IDEA-IGNORE marker. Omitted (never false) otherwise. Actions are unchanged.
+     */
+    ignored?: boolean
 }
 
 export interface ScanResult {
@@ -143,6 +148,8 @@ export interface ClientCardOps {
     osRootfsPartition: (partition: string) => boolean
     /** idea#311: true when the cached read-only look found a valid META.yaml and no IDEA-IGNORE marker */
     ideaMetaPartition: (partition: string) => boolean
+    /** console#163: true when the cached read-only look of this partition found an IDEA-IGNORE marker */
+    ignoredPartition: (partition: string) => boolean
     now: () => number
 }
 
@@ -180,6 +187,7 @@ const defaultOps: ClientCardOps = {
     },
     osRootfsPartition: (p) => (l => l?.ok === true && l.osRootfs === true)(metaLookCache.peek(p)),
     ideaMetaPartition: (p) => isAlreadyIdeaLook(metaLookCache.peek(p)),
+    ignoredPartition: (p) => (l => l?.ok === true && l.ignored === true)(metaLookCache.peek(p)),
     now: () => Date.now(),
 }
 
@@ -343,9 +351,12 @@ export const scanClientCards = async (
                 device: d.name, byId, ptuuid: clean(d.ptuuid), serial, partitionNames: children.map(c => c.name), ext4PartitionNames: children.filter(c => c.fstype === 'ext4').map(c => c.name), mountpoints: mounts,
             })
         }
+        // console#163: publish IDEA-IGNORE; the key is omitted (not false) on other disks.
+        const ignored = children.some(c => clean(c.fstype) === 'ext4' && ops.ignoredPartition(c.name))
         res.diskCandidates!.push({
             candidateId, kind: 'usbDisk', device: d.name, sizeBytes, model, serial: idSerial, removable, readerId: null,
             partitions, contents, actions, flashRefusal, mountedReadOnly, firstSeen,
+            ...(ignored ? { ignored: true } : {}),
         })
     }
     for (const k of [...firstSeenByKey.keys()]) if (!present.has(k)) firstSeenByKey.delete(k)
