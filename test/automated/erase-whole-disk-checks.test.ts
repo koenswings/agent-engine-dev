@@ -10,7 +10,7 @@ import { fs, path, YAML } from 'zx'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import { createOrUpdateDisk, processDisk } from '../../src/data/Disk.js'
-import { eraseDisk, parseHiddenPartitions, setEraseOpsForTests, setEraseAddDevice, ERASE_STAGING_ROOT, isEraseDeviceLocked } from '../../src/data/EraseDisk.js'
+import { eraseDisk, isEspPartType, parseHiddenPartitions, setEraseOpsForTests, setEraseAddDevice, ERASE_STAGING_ROOT, isEraseDeviceLocked } from '../../src/data/EraseDisk.js'
 import { setSystemDiskOpsForTests } from '../../src/data/SystemDisk.js'
 import { CommandLogStore, setCommandLogHandle, addTrace } from '../../src/data/CommandLogStore.js'
 import { DeviceName, DiskID, DiskName, EngineID, Timestamp } from '../../src/data/CommonTypes.js'
@@ -27,6 +27,7 @@ describe('eraseDisk whole-disk checks and remount on failure (#188)', () => {
     let addCalls: string[] = []
     let siblings: { partition: string; mountpoint: string }[] = []
     let siblingsFn: (() => { partition: string; mountpoint: string }[]) | null = null
+    let espFn: ((p: string) => boolean) | null = null
     let scriptError: Error | null = null
     let hidden: { partition: string; name: string | null }[] | Error = []
 
@@ -60,9 +61,10 @@ describe('eraseDisk whole-disk checks and remount on failure (#188)', () => {
         h = new Repo({ network: [], storage: undefined }).create<Store>({ engineDB: {}, diskDB: {}, appDB: {}, instanceDB: {}, userDB: {}, operationDB: {} } as any)
         await h.whenReady()
         await createOrUpdateEngine(h, LOCAL)
-        scriptCalls = 0; downCalls = 0; addCalls = []; siblings = []; siblingsFn = null; scriptError = null; hidden = []
+        scriptCalls = 0; downCalls = 0; addCalls = []; siblings = []; siblingsFn = null; espFn = null; scriptError = null; hidden = []
         setEraseOpsForTests({
             mountedPartitions: async () => (siblingsFn ? siblingsFn() : siblings),
+            isEspPartition: async (p) => { if (espFn) return espFn(p); return false },
             hiddenTablePartitions: async () => { if (hidden instanceof Error) throw hidden; return hidden },
             runScript: async () => { scriptCalls++; if (scriptError) throw scriptError; return { stdout: '' } },
             runSlotErase: async () => { throw new Error('no slots here') },
@@ -127,6 +129,33 @@ describe('eraseDisk whole-disk checks and remount on failure (#188)', () => {
         expect(scriptCalls).toBe(0)
         expect(h.doc()!.engineDB[LOCAL].eraseInProgress ?? null).toBeNull()
         expect(isEraseDeviceLocked('sdc')).toBe(false)
+    })
+
+    it('#235: a mounted EFI System Partition (even as a stick) means an OS disk: refuse, nothing wiped', async () => {
+        await dock('sdc2', 'os-disk', 'Old OS Disk')
+        siblings = [{ partition: 'sdc1', mountpoint: path.join(usbRoot(), 'sdc1') }]
+        espFn = (p) => p === 'sdc1'
+        const tid = await summary('os-disk', 'Old OS Disk')
+        await expect(eraseDisk(h, 'os-disk', tid, 'Old OS Disk')).rejects.toThrow(/EFI System Partition \(sdc1 mounted at .*\)\. That makes it an OS disk, so nothing was erased/)
+        expect(scriptCalls).toBe(0)
+        expect(isEraseDeviceLocked('sdc')).toBe(false)
+    })
+
+    it('#235: a partition type that cannot be read refuses (fail closed)', async () => {
+        await dock('sdc2', 'os-disk', 'Old OS Disk')
+        siblings = [{ partition: 'sdc1', mountpoint: path.join(usbRoot(), 'sdc1') }]
+        espFn = () => { throw new Error('lsblk gone') }
+        const tid = await summary('os-disk', 'Old OS Disk')
+        await expect(eraseDisk(h, 'os-disk', tid, 'Old OS Disk')).rejects.toThrow(/Could not check the partition type of \/dev\/sdc1 \(lsblk gone\).*nothing was erased/)
+        expect(scriptCalls).toBe(0)
+    })
+
+    it('#235: isEspPartType recognises GPT and MBR ESP types only', () => {
+        expect(isEspPartType('C12A7328-F81F-11D2-BA4B-00A0C93EC93B\n')).toBe(true)
+        expect(isEspPartType('0xef')).toBe(true)
+        expect(isEspPartType('0x83')).toBe(false)
+        expect(isEspPartType('0fc63daf-8483-4772-8e79-3d69d8477de4')).toBe(false)
+        expect(isEspPartType('')).toBe(false)
     })
 
     it('#235: a sibling mounted anywhere else (not a stick) still refuses up front', async () => {

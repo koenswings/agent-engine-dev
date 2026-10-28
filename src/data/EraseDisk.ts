@@ -83,6 +83,11 @@ export interface EraseOps {
      * table can't be checked. Injectable for tests.
      */
     hiddenTablePartitions: (wholeDevice: string) => Promise<HiddenPartition[]>
+    /**
+     * Is this partition an EFI System Partition (GPT type C12A7328-..., or MBR type 0xef)?
+     * Throws when lsblk can't tell. Injectable for tests (#235).
+     */
+    isEspPartition: (partition: string) => Promise<boolean>
 }
 
 export interface HiddenPartition { partition: string; name: string | null }
@@ -143,6 +148,11 @@ const defaultOps: EraseOps = {
             throw new Error((out.stderr || out.stdout).trim() || `exit ${out.exitCode}`)
         }
         return parseHiddenPartitions(out.stdout)
+    },
+    isEspPartition: async (partition) => {
+        const out = await $`lsblk -dn -o PARTTYPE /dev/${partition}`.nothrow()
+        if (out.exitCode !== 0) throw new Error((out.stderr || out.stdout).trim() || `lsblk exit ${out.exitCode}`)
+        return isEspPartType(out.stdout)
     },
 }
 
@@ -276,6 +286,12 @@ export const eraseBlocker = async (store: Store, disk: Disk | null): Promise<str
 }
 
 
+/** GPT EFI System Partition type GUID, or MBR partition type 0xef (#235). */
+export const isEspPartType = (partType: string): boolean => {
+    const t = partType.trim().toLowerCase()
+    return t === 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b' || t === '0xef'
+}
+
 /** A teacher-stick mount (read-only, directly under the USB root, idea#193 §3.2). */
 const isUsbStickMount = (mountpoint: string): boolean => path.dirname(mountpoint) === usbRoot()
 
@@ -349,10 +365,25 @@ export const eraseDisk = async (
     // or the system disk must refuse here, not after the target was undocked.
     if (!isSlotEraseDevice(devicePartition ?? whole)) {
         if (await isSystemDevice(whole)) throw new Error(`${summary.label} is on this Pi's system disk and cannot be erased.`)
-        // A read-only teacher stick under the USB root (e.g. the EFI vfat partition of an old
-        // OS disk, #235) is not a blocker: it is unmounted below, before anything is wiped.
-        const siblings = (await ops.mountedPartitions(whole))
-            .filter(m => m.partition !== devicePartition && !isUsbStickMount(m.mountpoint))
+        // A read-only teacher stick under the USB root is not a blocker: it is unmounted
+        // below, before anything is wiped. But a mounted EFI System Partition means this is
+        // an OS disk, so refuse (#235, Steve). If the type can't be read, refuse too.
+        const mounted = (await ops.mountedPartitions(whole)).filter(m => m.partition !== devicePartition)
+        // Only stick mounts need the check: any other mounted sibling refuses below anyway.
+        for (const m of mounted.filter(x => isUsbStickMount(x.mountpoint))) {
+            let esp: boolean
+            try {
+                esp = await ops.isEspPartition(m.partition)
+            } catch (e: any) {
+                throw new Error(`Could not check the partition type of /dev/${m.partition} (${e.message ?? e}), so nothing was erased.`)
+            }
+            if (esp) {
+                throw new Error(
+                    `${summary.label} is on /dev/${whole}, which has an EFI System Partition (${m.partition} mounted at ${m.mountpoint}). ` +
+                    `That makes it an OS disk, so nothing was erased.`)
+            }
+        }
+        const siblings = mounted.filter(m => !isUsbStickMount(m.mountpoint))
         if (siblings.length > 0) {
             throw new Error(
                 `${summary.label} shares its physical disk (/dev/${whole}) with ${siblings.map(m => `${m.partition} mounted at ${m.mountpoint}`).join(', ')}. ` +
