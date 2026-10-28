@@ -253,7 +253,9 @@ const stopInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanc
     // to dockedTo != null and would miss disks that appear undocked in the CRDT.
     const disk = (instance.storedOn ? getDisk(store, instance.storedOn) : undefined) ?? findDiskByName(store, diskName)
     if (!disk) throw new Error(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`)
-    stopInstance(storeHandle, instance, disk, 'console-command')
+    // #239: await the stop, so the trace closes only once the containers are stopped and the
+    // command queue (one command at a time) cannot run a following startInstance mid-stop.
+    await stopInstance(storeHandle, instance, disk, 'console-command')
 }
 
 const sendWrapper = (storeHandle: DocHandle<Store> | null, args: string) => {
