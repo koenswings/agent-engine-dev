@@ -10,7 +10,7 @@
  *
  * Refusals throw `CODE: text`, and the store is untouched on any failure:
  *   NOT_FOUND, NOT_LOCAL, AMBIGUOUS, RUNNING, BUSY_BACKUP, BUSY_MOVE, BUSY,
- *   COMPOSE_DOWN_FAILED, QUARANTINE_FAILED.
+ *   COMPOSE_DOWN_FAILED, QUARANTINE_FAILED, HELPER_OUTDATED (helper older than v4).
  */
 import { DocHandle } from '@automerge/automerge-repo'
 import { $, fs, path } from 'zx'
@@ -20,7 +20,7 @@ import type { InstanceID } from './CommonTypes.js'
 import { lookupLocalInstanceArg } from './InstanceArg.js'
 import { diskMountRoot, appDataRoot, Disk } from './Disk.js'
 import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
-import { runAppData, quarantineArgs } from '../utils/appDataHelper.js'
+import { runAppData, quarantineArgs, helperAtLeast } from '../utils/appDataHelper.js'
 import { log } from '../utils/utils.js'
 
 export const QUARANTINE_DIR = '.idea-quarantine'
@@ -31,7 +31,10 @@ export class RemoveError extends Error {
 
 export interface RemoveResult { instanceId: InstanceID; name: string; quarantinePath: string; keptVolumes: string[] }
 
+export const REMOVE_HELPER_MIN = 4
+
 export interface RemoveDeps {
+    helperProblem: () => Promise<string | null>
     instanceDir: (disk: Disk, id: InstanceID) => Promise<string>
     composeDown: (dir: string, id: InstanceID) => Promise<void>
     listVolumes: (id: InstanceID) => Promise<string[]>
@@ -39,6 +42,7 @@ export interface RemoveDeps {
 }
 
 const defaultDeps: RemoveDeps = {
+    helperProblem: () => helperAtLeast(REMOVE_HELPER_MIN, 'removeInstance'),
     instanceDir: async (disk, id) => path.join(await diskMountRoot(disk), 'instances', String(id)),
     composeDown: async (dir, id) => {
         if (!fs.existsSync(path.join(dir, 'compose.yaml'))) return
@@ -70,6 +74,9 @@ export const removeInstance = async (
     }
     const inst: Instance = r.instance
     if (RUNNING_STATES.has(String(inst.status))) throw new RemoveError('RUNNING', `instance '${inst.name}' is ${inst.status}; stop it first`)
+
+    const helper = await d.helperProblem()
+    if (helper) throw new RemoveError('HELPER_OUTDATED', helper)
 
     const key = instanceKey(inst.id)
     if (!resourceLock.acquire(key, 'removeInstance')) {
