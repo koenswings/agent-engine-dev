@@ -19,9 +19,16 @@ export const UPDATE_STEPS: readonly UpdateStep[] = ['Fetch', 'Check', 'Snapshot'
 export type UpdateRefusal =
     | 'NOT_DOCKED' | 'BUSY' | 'SOURCE_MISSING' | 'DIFFERENT_APP' | 'NOT_NEWER'
     | 'MAJOR_NOT_ALLOWED' | 'NEEDS_BACKUP' | 'NO_SPACE' | 'NO_SUMS'
+    | 'NOT_FOUND' | 'AMBIGUOUS' | 'HELPER_OUTDATED'
+
+/** Error text starts with the code; the two rollback outcomes use the console#168 wording. */
+export const ROLLED_BACK_PREFIX = 'ROLLED BACK:'
+export const ROLLBACK_FAILED_PREFIX = 'ROLLBACK FAILED:'
 
 export class UpdateAppError extends Error {
-    constructor(public code: UpdateRefusal | 'ROLLED_BACK' | 'ROLLBACK_FAILED', text: string) { super(`${code}: ${text}`) }
+    constructor(public code: UpdateRefusal | 'ROLLED_BACK' | 'ROLLBACK_FAILED', text: string) {
+        super(code === 'ROLLED_BACK' ? `${ROLLED_BACK_PREFIX} ${text}` : code === 'ROLLBACK_FAILED' ? `${ROLLBACK_FAILED_PREFIX} ${text}` : `${code}: ${text}`)
+    }
 }
 
 /** Numeric version parts from "1.2.3", "v1.2", or tool output like "kolibri, version 0.19.5"; null if none. */

@@ -285,3 +285,35 @@ export const reportBorgAtStartup = (exists: (p: string) => boolean = borgPresenc
     else log(`${BORG_PATH} is installed`)
     return problem
 }
+
+// ── updateApp snapshots (helper v5, agent-engine-dev#230) ────────────────────
+export const snapshotArgs = (root: string, id: string): string[] => ['snapshot', checkRoot(root), checkId(id)]
+export const restoreSnapshotArgs = (root: string, id: string): string[] => ['restore-snapshot', checkRoot(root), checkId(id)]
+export const snapshotsArgs = (root: string): string[] => ['snapshots', checkRoot(root)]
+
+/** The helper prints rsync progress first; its result is the last non-empty line. */
+export const lastLine = (out: string): string => out.trim().split('\n').map(s => s.trim()).filter(Boolean).pop() ?? ''
+
+/** `snapshot` result: "<dir> <kb>". */
+export const parseSnapshotResult = (out: string): { path: string, sizeBytes: number } => {
+    const m = lastLine(out).match(/^(\/\S+) (\d+)$/)
+    if (!m) throw new Error(`idea-app-data snapshot gave no result line: ${lastLine(out) || '(empty)'}`)
+    return { path: m[1], sizeBytes: Number(m[2]) * 1024 }
+}
+
+/** `snapshots` lines: "<id> <kb> complete|incomplete". */
+export const parseSnapshotsList = (out: string): { instanceId: string, sizeBytes: number, complete: boolean }[] =>
+    out.split('\n').map(l => l.trim().match(/^([a-z0-9][a-z0-9-]{0,63}) (\d+) (complete|incomplete)$/))
+        .filter((m): m is RegExpMatchArray => !!m)
+        .map(m => ({ instanceId: m[1], sizeBytes: Number(m[2]) * 1024, complete: m[3] === 'complete' }))
+
+/** null when the installed helper is at least `min`; else a clear message (updateApp needs v5). */
+export const helperAtLeast = async (min: number, what: string, run: AppDataRunner = runAppData): Promise<string | null> => {
+    let got = ''
+    try { got = (await run(['version'])).trim() } catch (e: any) {
+        return `${what} needs the app-data root helper ${APP_DATA_HELPER} v${min} or later, but it cannot be run with sudo -n (${e?.message ?? e}); ${APP_DATA_HELPER_UPDATE}.`
+    }
+    const v = Number(got.match(/^idea-app-data (\d+)$/)?.[1])
+    if (Number.isFinite(v) && v >= min) return null
+    return `${what} needs the app-data root helper ${APP_DATA_HELPER} v${min} or later, but the installed one reports '${got || 'nothing'}'; ${APP_DATA_HELPER_UPDATE}.`
+}

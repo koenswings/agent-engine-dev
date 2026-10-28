@@ -29,6 +29,7 @@ import { summariseDisk, attachTraceResult } from './SummariseDisk.js';
 import { eraseDisk } from './EraseDisk.js';
 import { forgetDisk } from './ForgetDisk.js';
 import { removeInstance } from './RemoveInstance.js';
+import { updateApp, parseUpdateAppArgs } from './UpdateApp.js';
 import { flashCard, cancelFlash, initialiseDisk } from './FlashCard.js';
 import { testContext } from "../../test/testContext.js";
 
@@ -367,6 +368,16 @@ const removeInstanceWrapper = async (storeHandle: DocHandle<Store> | null, insta
     print(chalk.green(`Removed instance ${result.instanceId}; its folder is kept at ${result.quarantinePath}`))
 }
 
+/** updateApp <instance> <newAppId> [--allow-major] [--source <diskId>] (#230). Result: snapshot path and size. */
+const updateAppWrapper = async (storeHandle: DocHandle<Store> | null, argsString: string) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    const engineId = String(getLocalEngine(storeHandle.doc())?.id ?? localEngineId)
+    const { instanceArg, newAppId, opts } = parseUpdateAppArgs(argsString)
+    const result = await updateApp(storeHandle, instanceArg, newAppId, engineId, opts)
+    attachTraceResult(result)
+    print(chalk.green(`Updated ${result.name} ${result.fromAppId} -> ${result.toAppId}; snapshot kept at ${result.snapshotPath} (${result.snapshotBytes} bytes)`))
+}
+
 /** summariseDisk <diskId|candidateId> (idea#134). Result in CommandTrace.result. */
 const summariseDiskWrapper = async (storeHandle: DocHandle<Store> | null, targetId: string) => {
     if (!storeHandle) throw new Error('Store is not available.')
@@ -497,6 +508,7 @@ export const commands: CommandDefinition[] = [
     { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "mode" }, { type: "string", name: "instanceNames", variadic: true }], scope: 'engine' },
     { name: "createFilesDisk", execute: createFilesDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "shareName", variadic: true, optional: true }], scope: 'engine' },
     { name: "removeInstance", execute: removeInstanceWrapper, args: [{ type: "string", name: "instanceId" }], scope: 'engine' },
+    { name: "updateApp", execute: updateAppWrapper, args: [{ type: "string" }], scope: 'engine' },
     { name: "summariseDisk", execute: summariseDiskWrapper, args: [{ type: "string", name: "targetId" }], scope: 'engine' },
     { name: "eraseDisk", execute: eraseDiskWrapper, args: [{ type: "string", name: "targetId" }, { type: "string", name: "summaryTraceId" }, { type: "string", name: "confirmName", variadic: true }], scope: 'engine' },
     // idea#201 §10 (Engine API contract v2): ids only. Trace arg keys are the contract names.

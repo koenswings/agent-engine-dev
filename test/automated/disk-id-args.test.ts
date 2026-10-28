@@ -285,7 +285,7 @@ describe('capabilities and capabilitiesBootedAt (idea#128)', () => {
     it('a new engine record gets capabilities [diskIdArgs, filesDisk] stamped with its lastBooted', async () => {
         const h = await newStore()
         const e = h.doc()!.engineDB[LOCAL]
-        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance'])   // filesDisk: idea#131; filesMount: idea#133; instanceIdArgs: idea#168
+        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp'])   // filesDisk: idea#131; filesMount: idea#133; instanceIdArgs: idea#168
         expect(e.capabilities).toEqual(expectedCapabilities())
         expect(e.capabilitiesBootedAt).toBe(e.lastBooted)
     })

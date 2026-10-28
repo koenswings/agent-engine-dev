@@ -112,6 +112,22 @@ These commands perform actions on the system. Some are restricted to an `engine`
 
 Refusals (code at the start of the error text; the store is untouched): `NOT_FOUND`, `NOT_LOCAL`, `AMBIGUOUS`, `RUNNING` (Running/Starting), `BUSY_BACKUP` (backup/restore holds the lock), `BUSY_MOVE` (move/copy holds it), `BUSY` (other holder), `COMPOSE_DOWN_FAILED`, `QUARANTINE_FAILED`.
 
+### `updateApp`
+`updateApp <instanceId|name> <newAppId> [--allow-major] [--source <diskId>]` (capability `updateApp`, #230, proposal idea#351). Updates an instance to a newer bundle `apps/<newAppId>/` on a disk docked to this Engine (cross-Engine Fetch: #263). Needs root helper `idea-app-data` v5.
+
+Steps (progress: ephemeral message `idea/updateProgress` with `{engineId, instanceId, step, bytesDone, bytesTotal}`; also the `updateApp` operation's step): Fetch, Check, Snapshot, Swap, Start, Health.
+- **Check** refuses before anything changes.
+- **Snapshot** stops the instance and waits until its containers are gone. Then `idea-app-data snapshot` copies `instances/<id>` (bundle files, `.env`, data) to `<disk>/.pre-update/<id>/` (root, 0700). A `COMPLETE` marker is written last; a snapshot without it is never restored. Named Docker volumes are not part of the snapshot.
+- **Swap** copies the new bundle files over the instance folder (`.env` kept) and sets `x-app.instanceName` again.
+- **Health** waits for healthy within `x-app.healthTimeout` (defaults: Kolibri 900 s, Nextcloud 300 s, others 600 s). `starting`/`unhealthy` mean "wait"; an exited container, a crash loop (3 restarts) or the timeout fail.
+- A failure from Snapshot on rolls back: compose down (no `-v`), `restore-snapshot` (the current folder goes to `.idea-quarantine` first), old version started. The error starts `ROLLED BACK: <why>`. If the rollback fails, the instance is left Stopped with a status starting `ROLLBACK FAILED:`.
+- The result and History carry `snapshotPath` and `snapshotBytes`. Snapshots are kept; `Disk.preUpdateSnapshots` lists `{instanceId, sizeBytes, complete}` per disk. Nothing is purged automatically.
+- An Engine restart during an update rolls back at startup when the snapshot is complete and the swap had started; the operation ends Failed with `INTERRUPTED: ...`.
+
+Refusal codes (start of the error text): `NOT_FOUND`, `AMBIGUOUS`, `NOT_DOCKED`, `HELPER_OUTDATED` (helper older than v5), `BUSY`, `SOURCE_MISSING`, `NO_SUMS` (the bundle has no valid `SHA256SUMS`, root-relative, checked with `sha256sum --check --strict`; such an App is never offered an update), `DIFFERENT_APP`, `NOT_NEWER`, `MAJOR_NOT_ALLOWED`, `NEEDS_BACKUP` (major update without a backup in the last hour), `NO_SPACE` (`NO_SPACE: ... snapshot needs X, free Y`; the snapshot needs its size plus 10 %, at least 1 GiB). Reserved: `TRANSFER_FAILED` (#263 only), `SOURCE_UNSUPPORTED` (not emitted in v1).
+
+`Instance.updateAvailable`: `{appId, sourceDiskId?, sourceEngineId?, fromVersion?, toVersion?, major?, estimatedMinutes?, sizeBytes?, migrationNote?}` or null.
+
 ### `createBackupDisk`
 - **Description:** Writes a BACKUP.yaml configuration onto a docked disk, turning it into a Backup Disk. Specify the mode (`immediate`, `on-demand`, or `scheduled`) and one or more instance names to link.
 - **Usage:** `createBackupDisk <diskId> <mode> <instanceName...>` (idea#128; the argument was `diskName`). The disk is resolved by the shared disk resolver (see [Disk arguments](#disk-arguments)). An unknown, undocked, remote or ambiguous disk, a bad mode or a missing store ends the command trace as `error` with the reason.
