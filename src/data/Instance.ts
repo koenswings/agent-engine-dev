@@ -257,6 +257,8 @@ export interface Instance {
   status: Status;
   statusCondition: string | null;  // Human-readable error diagnosis; null when not in Error state
   port: PortNumber;
+  /** Second Engine-allocated host port, only for Apps whose compose references `${port_zip` (agent-engine-dev#267); null/absent otherwise. */
+  portZip?: PortNumber | null;
   serviceImages: ServiceImage[];
   created: Timestamp;       // We must use a timestamp number as Date objects are not supported in YJS
   lastBackup: Timestamp | null;  // Unix ms of last successful backup; null if never backed up
@@ -601,7 +603,7 @@ export const isReservedHostPort = (port: number): boolean => RESERVED_HOST_PORTS
  * Duration fixtures hardcode 18080. After Engine allocates a free port, keep compose listen
  * env in sync so the container binds the same port Automerge / Console proxy use.
  */
-export const syncKolibriHostListenPort = async (composePath: string, port: PortNumber): Promise<void> => {
+export const syncKolibriHostListenPort = async (composePath: string, port: PortNumber, portZip: PortNumber | null = null): Promise<void> => {
   if (!fs.existsSync(composePath)) return
   const raw = await fs.readFile(composePath, 'utf8')
   let compose: any
@@ -638,15 +640,27 @@ export const syncKolibriHostListenPort = async (composePath: string, port: PortN
       }
       setEnv('KOLIBRI_HTTP_PORT')
       setEnv('KOLIBRI_LISTEN_PORT')
+      if (portZip) {
+        const idx = next.findIndex((e: unknown) => typeof e === 'string' && (e as string).startsWith('KOLIBRI_ZIP_CONTENT_PORT='))
+        // A `${port_zip…}` reference stays: compose resolves it from .env at every up (#267)
+        if (idx < 0 || !String(next[idx]).includes('${port_zip')) {
+          const line = `KOLIBRI_ZIP_CONTENT_PORT=${portZip}`
+          if (idx < 0) { next.push(line); changed = true } else if (next[idx] !== line) { next[idx] = line; changed = true }
+        }
+      }
       svc.environment = next
     } else if (env && typeof env === 'object') {
       if (String(env.KOLIBRI_HTTP_PORT ?? '') !== portStr) { env.KOLIBRI_HTTP_PORT = portStr; changed = true }
       if (String(env.KOLIBRI_LISTEN_PORT ?? '') !== portStr) { env.KOLIBRI_LISTEN_PORT = portStr; changed = true }
+      if (portZip && !String(env.KOLIBRI_ZIP_CONTENT_PORT ?? '').includes('${port_zip') && String(env.KOLIBRI_ZIP_CONTENT_PORT ?? '') !== String(portZip)) {
+        env.KOLIBRI_ZIP_CONTENT_PORT = String(portZip); changed = true
+      }
       svc.environment = env
     } else {
       svc.environment = [
         `KOLIBRI_HTTP_PORT=${portStr}`,
         `KOLIBRI_LISTEN_PORT=${portStr}`,
+        ...(portZip ? [`KOLIBRI_ZIP_CONTENT_PORT=${portZip}`] : []),
       ]
       changed = true
     }
@@ -803,7 +817,7 @@ export const assertInstancePortReady = async (
   )
 }
 
-export const createPortNumber = async (store: Store): Promise<PortNumber> => {
+export const createPortNumber = async (store: Store, exclude: readonly number[] = []): Promise<PortNumber> => {
   let port = randomPort()
   let portInUse = true
   let portInUseResult
@@ -812,8 +826,8 @@ export const createPortNumber = async (store: Store): Promise<PortNumber> => {
 
   // Check if the port is already in use on the system / reserved for Console
   while (portInUse) {
-    if (isReservedHostPort(port)) {
-      log(`Port ${port} is reserved for Engine/Console. Generating a new one.`)
+    if (isReservedHostPort(port) || exclude.includes(port)) {
+      log(`Port ${port} is reserved for Engine/Console or excluded. Generating a new one.`)
       port = randomPort()
       continue
     }
@@ -824,7 +838,7 @@ export const createPortNumber = async (store: Store): Promise<PortNumber> => {
       port = randomPort()
     } catch (e) {
       log(`Port ${port} is not in use. Checking if it is reserved by another instance`)
-      const inst = instances.find(instance => instance && instance.port == port)
+      const inst = instances.find(instance => instance && (instance.port == port || Number(instance.portZip ?? 0) == port))
       if (inst) {
         log(`Port ${port} is reserved by another instance. Generating a new one.`)
         //port++
@@ -870,7 +884,7 @@ export const storePortOwner = (store: Store, self: Instance, port: number): Inst
   const myCreated = Number(me.created ?? 0)
   return getInstancesOfEngine(store, engine).find(other => {
     if (!other || String(other.id) === String(self.id)) return false
-    if (Number(other.port) !== Number(port)) return false
+    if (Number(other.port) !== Number(port) && Number(other.portZip ?? 0) !== Number(port)) return false
     if (other.status === 'Running' || other.status === 'Starting') return true
     const otherCreated = Number(other.created ?? 0)
     return otherCreated < myCreated || (otherCreated === myCreated && String(other.id) < String(self.id))
@@ -920,6 +934,46 @@ export const choosePortForStart = async (storeHandle: DocHandle<Store>, instance
     await addOrUpdateEnvVariable(envPath, 'port', port.toString())
   }
   return port
+}
+
+/** True when compose text references `${port_zip}` or a default form such as `${port_zip:-8081}` (#267). */
+export const composeUsesPortZip = (composeText: string): boolean => /\$\{port_zip(?=[}:?+-])/.test(composeText)
+
+/** Write one .env variable atomically (temp file + rename), keeping every other line. */
+export const writeEnvVariableAtomic = async (envPath: string, variable: string, value: string): Promise<void> => {
+  const text = fs.existsSync(envPath) ? await fs.readFile(envPath, 'utf8') : ''
+  const lines = text.split('\n')
+  const idx = lines.findIndex(l => l.startsWith(`${variable}=`))
+  if (idx >= 0) lines[idx] = `${variable}=${value}`
+  else {
+    if (lines.length && lines[lines.length - 1] === '') lines.pop()
+    lines.push(`${variable}=${value}`, '')
+  }
+  const tmp = `${envPath}.tmp-${process.pid}-${Date.now()}`
+  await fs.writeFile(tmp, lines.join('\n'))
+  await fs.rename(tmp, envPath)
+}
+
+/**
+ * Decide `port_zip` for a start (agent-engine-dev#267): null unless the compose references
+ * `${port_zip`. Keeps the .env value unless it is listening, reserved, equal to this
+ * instance's `port`, or owned (port or portZip) by another instance in the store; else a
+ * fresh createPortNumber port that is not `port`. Written atomically to .env next to `port`.
+ */
+export const choosePortZipForStart = async (
+  storeHandle: DocHandle<Store>, instance: Instance, envPath: string, composePath: string, port: PortNumber,
+): Promise<PortNumber | null> => {
+  const composeText = fs.existsSync(composePath) ? await fs.readFile(composePath, 'utf8') : ''
+  if (!composeUsesPortZip(composeText)) return null
+  const current = parseInt(await readEnvVariable(envPath, 'port_zip') ?? '') || 0
+  if (current > 0 && current !== Number(port) && !isReservedHostPort(current)
+    && !storePortOwner(storeHandle.doc(), instance, current) && !(await checkPortNumber(current as PortNumber))) {
+    return current as PortNumber
+  }
+  const zip = await createPortNumber(storeHandle.doc(), [Number(port)])
+  await writeEnvVariableAtomic(envPath, 'port_zip', String(zip))
+  log(`Allocated port_zip ${zip} for instance ${instance.id}`)
+  return zip
 }
 
 /**
@@ -1076,7 +1130,8 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
     const port = await choosePortForStart(storeHandle, instance, `${mountRoot}/instances/${instance.id}/.env`)
 
     // Host-network Kolibri must listen on the Engine-allocated port (tag 1.0 omit; fixtures hardcode 18080).
-    await syncKolibriHostListenPort(`${mountRoot}/instances/${instance.id}/compose.yaml`, port)
+    const portZip = await choosePortZipForStart(storeHandle, instance, `${mountRoot}/instances/${instance.id}/.env`, `${mountRoot}/instances/${instance.id}/compose.yaml`, port)
+    await syncKolibriHostListenPort(`${mountRoot}/instances/${instance.id}/compose.yaml`, port, portZip)
 
     print(`Found a port number for instance ${instance.id}: ${port}`)
     // Assign the port number to the instance object
@@ -1084,6 +1139,8 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
       const inst = doc.instanceDB[instance.id]
       if (!inst) return  // #179: never write to (or resurrect) a deleted row
       inst.port = port as PortNumber
+      if (portZip) inst.portZip = portZip
+      else if (inst.portZip) inst.portZip = null
     })
 
     // **************************
