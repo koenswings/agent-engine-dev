@@ -87,7 +87,7 @@ describe('checkAndSetUndockedApps: only this Engine\'s instances', () => {
         const handle = await makeTwoEngineStore()
         await checkAndSetUndockedApps(handle, B, async (id) => String(id) === 'b-running')
         const s = statuses(handle)
-        expect(s['b-running']).toBe('Running')
+        expect(s['b-running']).toBe('Starting')   // #167: containers found, the dock pass confirms Running
         expect(s['b-gone']).toBe('Undocked')
         expect(s['b-undocked']).toBe('Undocked')
         expect(s['b-stopped']).toBe('Stopped')
@@ -97,7 +97,7 @@ describe('checkAndSetUndockedApps: only this Engine\'s instances', () => {
         const handle = await makeTwoEngineStore()
         await checkAndSetUndockedApps(handle, A, async (id) => String(id) === 'kolibri-path-a')
         const s = statuses(handle)
-        expect(s['kolibri-path-a']).toBe('Running')
+        expect(s['kolibri-path-a']).toBe('Starting')   // #167
         expect(s['nextcloud-path-a']).toBe('Undocked')
         expect(s['b-running']).toBe('Running')
         expect(s['b-gone']).toBe('Docked')
@@ -123,11 +123,11 @@ describe('checkAndSetUndockedApps: only this Engine\'s instances', () => {
         expect(statuses(handle)['b-gone']).toBe('Docked')
     })
 
-    it('a docker error leaves the instance as it is', async () => {
+    it('a docker error never keeps a stale Running (#167): Running → Starting, others as they are', async () => {
         const handle = await makeTwoEngineStore()
         await checkAndSetUndockedApps(handle, B, async () => { throw new Error('docker: command not found') })
         const s = statuses(handle)
-        expect(s['b-running']).toBe('Running')
+        expect(s['b-running']).toBe('Starting')
         expect(s['b-gone']).toBe('Docked')
     })
 

@@ -29,7 +29,7 @@ import { $ } from 'zx'
 import { DocHandle } from '@automerge/automerge-repo'
 import { log } from '../utils/utils.js'
 import { EngineID, InstanceID } from './CommonTypes.js'
-import { isUserStopped, lastStopOperation, userStopInForce } from './AutoStart.js'
+import { isUserStopped, lastStopOperation, shouldAutoStart, userStopInForce } from './AutoStart.js'
 import { Instance, Status } from './Instance.js'
 import { Store } from './Store.js'
 import { localEngineId } from './Engine.js'
@@ -71,8 +71,20 @@ export const checkAndSetUndockedApps = async (
             log(`checkAndSetUndockedApps: leaving instance ${instanceId} Stopped (${op ? `stopped by ${op.cause}` : 'no stop record'}); it is not auto-started`)
             return
         }
+        // #167: after a restart, never keep claiming Running for a container nobody has checked yet.
+        // Containers present (or docker not answering yet, e.g. right after a reboot): mark the
+        // instance Starting; the dock pass (startInstance) then sets Running, or does a full start.
+        const markStarting = (why: string) => storeHandle.change(doc => {
+            const inst = doc.instanceDB[instanceId]
+            if (!inst || inst.status !== 'Running' || !isInstanceDockedOn(doc, inst, engineId)) return
+            // Only when the dock pass will start (and so re-check) it; else it would stay Starting.
+            if (!shouldAutoStart(doc, inst).start) return
+            log(`Setting status of instance ${instanceId} to Starting until the dock pass checks it (${why})`)
+            inst.status = 'Starting' as Status
+            inst.statusCondition = null
+        })
         try {
-            if (await containerRunning(instanceId)) return
+            if (await containerRunning(instanceId)) { markStarting('containers found after restart'); return }
             storeHandle.change(doc => {
                 const inst = doc.instanceDB[instanceId]
                 // Re-check inside the change: the disk may have been undocked or moved
@@ -92,6 +104,7 @@ export const checkAndSetUndockedApps = async (
             })
         } catch (error) {
             log(`Error checking docker status for ${instance.name}: ${error}`)
+            markStarting('docker not answering')
         }
     }))
 }
