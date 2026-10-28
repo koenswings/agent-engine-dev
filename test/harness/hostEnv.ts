@@ -21,6 +21,18 @@ export const onRaspberryPi = (): boolean => {
  */
 export const PI_TIMING_FACTOR = onRaspberryPi() ? 2 : 1
 
+/**
+ * A wall-clock budget (ms) from env var `name` when it holds a positive integer, else `fallback`.
+ * Lets a slow host (e.g. quality-scan.sh on a pool Pi, idea#332) raise a setup budget without
+ * changing the default. Invalid values (empty, 0, negative, non-numeric) fall back.
+ */
+export const envTimeoutMs = (name: string, fallback: number, env: NodeJS.ProcessEnv = process.env): number => {
+    const raw = env[name]
+    if (raw === undefined || !/^\d+$/.test(raw.trim())) return fallback
+    const n = Number(raw.trim())
+    return Number.isSafeInteger(n) && n > 0 ? n : fallback
+}
+
 /** Does this machine have a root helper installed at `p` (e.g. /usr/local/sbin/idea-app-data)? */
 export const helperInstalledHere = (p: string): boolean => fs.existsSync(p)
 

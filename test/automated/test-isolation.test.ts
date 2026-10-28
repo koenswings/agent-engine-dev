@@ -158,8 +158,11 @@ describe('Test container labelling', () => {
 const PREFLIGHT_LIB = path.resolve(process.cwd(), 'script/test-preflight-lib.sh')
 
 /** Run a function from the pre-flight library in bash and return its output lines. */
-const preflightLib = (fn: string, ...args: string[]): string[] => {
-    const out = execFileSync('bash', ['-c', `source "$0" && ${fn} "$@"`, PREFLIGHT_LIB, ...args], { encoding: 'utf-8' })
+const preflightLib = (fn: string, ...args: string[]): string[] => preflightLibWith('', {}, fn, ...args)
+
+/** Same, with a bash prelude run after sourcing (e.g. a fake preflight_is_block) and extra env. */
+const preflightLibWith = (prelude: string, env: Record<string, string>, fn: string, ...args: string[]): string[] => {
+    const out = execFileSync('bash', ['-c', `source "$0" && ${prelude} ${fn} "$@"`, PREFLIGHT_LIB, ...args], { encoding: 'utf-8', env: { ...process.env, ...env } })
     return out.split('\n').filter(l => l.length > 0)
 }
 
@@ -167,14 +170,30 @@ describe('Pre-flight App Disk detection excludes the root disk', () => {
     let tmp: string
     let disksRoot: string
     let watchDir: string
+    let devDir: string
+    let mounts: string
 
-    /** Fake machine state: sentinels in the watch dir, disk folders with META.yaml under the mount root. */
-    const setup = async (sentinels: string[], disks: string[] = []) => {
+    /**
+     * Fake machine state: /dev/engine links to fake block devices (present, and mounted under
+     * the disks root unless `opts` says otherwise), disk folders with META.yaml under the mount root.
+     */
+    const setup = async (sentinels: string[], disks: string[] = [], opts: { absent?: string[], unmounted?: string[], mountedElsewhere?: string[], mountLines?: string[] } = {}) => {
         tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-preflight-'))
         disksRoot = path.join(tmp, 'disks')
         watchDir = path.join(tmp, 'engine')
+        devDir = path.join(tmp, 'dev')
+        mounts = path.join(tmp, 'mounts')
         await fs.ensureDir(watchDir)
-        for (const s of sentinels) await fs.writeFile(path.join(watchDir, s), '')
+        await fs.ensureDir(devDir)
+        const lines: string[] = [...(opts.mountLines ?? [])]
+        for (const s of sentinels) {
+            const dev = path.join(devDir, s)
+            if (!opts.absent?.includes(s)) await fs.writeFile(dev, '')
+            await fs.symlink(dev, path.join(watchDir, s))
+            if (opts.absent?.includes(s) || opts.unmounted?.includes(s)) continue
+            lines.push(`${dev} ${opts.mountedElsewhere?.includes(s) ? '/mnt/' + s : path.join(disksRoot, s)} ext4 rw 0 0`)
+        }
+        await fs.writeFile(mounts, lines.join('\n') + '\n')
         for (const d of disks) {
             await fs.ensureDir(path.join(disksRoot, d))
             await fs.writeFile(path.join(disksRoot, d, 'META.yaml'), 'diskId: x\n')
@@ -184,7 +203,9 @@ describe('Pre-flight App Disk detection excludes the root disk', () => {
     /** App Disks the pre-flight would report, with the root disk derived from a findmnt SOURCE. */
     const appDisksFor = (rootSource: string): string[] => {
         const rootDisk = preflightLib('root_disk_from_source', rootSource)[0] ?? ''
-        return preflightLib('find_app_disks', disksRoot, watchDir, rootDisk).map(p => path.basename(p))
+        // Files under the fake dev dir stand in for block devices.
+        const fakeBlock = `preflight_is_block() { [[ "$1" == "${devDir}"/* && -e "$1" ]]; };`
+        return preflightLibWith(fakeBlock, { PREFLIGHT_MOUNTS: mounts }, 'find_app_disks', disksRoot, watchDir, rootDisk).map(p => path.basename(p))
     }
 
     const teardown = async () => { if (tmp) await fs.remove(tmp) }
@@ -230,6 +251,31 @@ describe('Pre-flight App Disk detection excludes the root disk', () => {
             expect(appDisksFor('overlay').sort()).toEqual(['sda1', 'sda2'])
             expect(appDisksFor('').sort()).toEqual(['sda1', 'sda2'])
         } finally { await teardown() }
+    })
+
+    it('agent-engine-dev#223: a stale link (device gone) does not refuse', async () => {
+        await setup(['sdb1'], [], { absent: ['sdb1'] })
+        try { expect(appDisksFor('/dev/sda2')).toEqual([]) } finally { await teardown() }
+    })
+
+    it('agent-engine-dev#223: a present but unmounted disk (ejected, Engine stopped) does not refuse', async () => {
+        await setup(['sdb', 'sdb1'], [], { unmounted: ['sdb', 'sdb1'] })
+        try { expect(appDisksFor('/dev/sda2')).toEqual([]) } finally { await teardown() }
+    })
+
+    it('agent-engine-dev#223: a disk mounted outside the disks root does not refuse', async () => {
+        await setup(['sdb1'], [], { mountedElsewhere: ['sdb1'] })
+        try { expect(appDisksFor('/dev/sda2')).toEqual([]) } finally { await teardown() }
+    })
+
+    it('agent-engine-dev#223: a whole-disk link refuses when one of its partitions is mounted under the disks root', async () => {
+        await setup(['sdb', 'sdb1'], [], { unmounted: ['sdb'] })
+        try { expect(appDisksFor('/dev/sda2').sort()).toEqual(['sdb', 'sdb1']) } finally { await teardown() }
+    })
+
+    it('agent-engine-dev#223: a mounted root disk is still excluded', async () => {
+        await setup(['sda1', 'sda2'])
+        try { expect(appDisksFor('/dev/sda2')).toEqual([]) } finally { await teardown() }
     })
 
     it('parent_disk_of maps partitions to their disk', () => {

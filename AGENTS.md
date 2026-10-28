@@ -204,3 +204,7 @@ The shared box sometimes freezes every process at once, for minutes at a time. T
 `ENVIRONMENT STALL (Ns): inconclusive — the process/box froze during this test; original error: ...`
 
 The test still FAILS: it never passes silently. When you scan a test log, a failure whose message contains `ENVIRONMENT STALL (` is inconclusive (re-run it); any other failure is real. A main-thread-only block, meaning our own code hogging the loop, is not counted as a stall. Use `stallIt(name, body, timeoutMs)` for new timing-sensitive tests; vitest gets timeoutMs + 15 s so the guard reports first.
+
+## Slow-host setup budgets (idea#332)
+
+`ws-post-burst.test.ts`'s `beforeAll` (large doc import + server start) defaults to `180_000 * PI_TIMING_FACTOR` ms (180 s box, 360 s Pi). Set `IDEA_TEST_POST_BURST_SETUP_MS` (positive integer ms) to raise it on a slow host; `quality-scan.sh` sets it on Pi targets only. Profile (2026-10-28, main 2583608): setup 11 s on the box, 76 s on idea04 alone, >360 s under the full suite on idea04. Use `envTimeoutMs()` from `test/harness/hostEnv.ts` for such overrides; never for product assertions.
