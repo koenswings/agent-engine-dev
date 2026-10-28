@@ -461,6 +461,10 @@ describe('idea-app-data: updateApp snapshots (v5, idea#230)', () => {
         const root = await sb.addDisk('sdb1')
         const inst = await sb.addInstance(root, 'inst1')
         await fs.writeFile(path.join(inst, 'db.sqlite3'), 'v1')
+        // The helper creates .pre-update as root 0700 and refuses a group/other-writable one;
+        // create it the same way so the fixture does not depend on the host umask (Pi umask 002 → 0775).
+        await fs.mkdir(path.join(root, '.pre-update'), { mode: 0o700 })
+        await fs.chmod(path.join(root, '.pre-update'), 0o700)
         await fs.ensureDir(path.join(snap(root, 'inst1'), 'data'))
         await fs.writeFile(path.join(snap(root, 'inst1'), 'data', 'half'), 'x')
         refused(await sb.run(['restore-snapshot', 'sdb1', 'inst1']), /no COMPLETE marker; it is never restored/)
