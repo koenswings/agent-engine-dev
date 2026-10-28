@@ -8,7 +8,8 @@ import { DocHandle, Repo } from '@automerge/automerge-repo'
 import { fs, path, os } from 'zx'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId, ENGINE_CAPABILITIES } from '../../src/data/Engine.js'
-import { updateApp, UpdateDeps, UpdateProgress, waitContainersGone, aggregateHealth, parseUpdateAppArgs, recoverInterruptedUpdates, snapshotMarginBytes } from '../../src/data/UpdateApp.js'
+import { updateApp, UpdateDeps, UpdateProgress, waitContainersGone, aggregateHealth, parseUpdateAppArgs, recoverInterruptedUpdates, snapshotMarginBytes, refreshUpdateAvailable, sumsLookUsable } from '../../src/data/UpdateApp.js'
+import { parseSnapshotResult, parseSnapshotsList } from '../../src/utils/appDataHelper.js'
 import { createOperation, updateOperation } from '../../src/data/Operations.js'
 import { resourceLock, instanceKey } from '../../src/utils/ResourceLock.js'
 import { commands } from '../../src/data/Commands.js'
@@ -33,9 +34,9 @@ const deps = (over: Partial<UpdateDeps> = {}): Partial<UpdateDeps> => {
         stop: async () => { calls.push('stop'); h.change(d => { (d.instanceDB['i1' as any] as any).status = 'Stopped' }) },
         containerIds: async () => { gone++; return [] },
         composeDown: async () => { calls.push('down') },
-        snapshot: async () => { calls.push('snapshot'); return { path: `${tmp}/.pre-update/i1`, sizeBytes: 4096 } },
+        snapshot: async () => { calls.push('snapshot'); return { path: `${tmp}/.pre-update/i1`, sizeBytes: 4096, previousQuarantinedAt: null, volumes: [] } },
         restoreSnapshot: async () => { calls.push('restore'); await fs.writeFile(`${tmp}/instances/i1/compose.yaml`, compose('1.0')); return `${tmp}/.idea-quarantine/i1-before-restore-x` },
-        listSnapshots: async () => [{ instanceId: 'i1' as any, sizeBytes: 4096, complete: true }],
+        listSnapshots: async () => ({ snapshots: [{ instanceId: 'i1' as any, sizeBytes: 4096, complete: true }], preUpdateBytes: 8192, quarantineBytes: 1024 }),
         reread: async () => {
             calls.push('reread')
             const v = (await fs.readFile(`${tmp}/instances/i1/compose.yaml`, 'utf8')).match(/version: "([^"]+)"/)![1]
@@ -80,11 +81,36 @@ describe('updateApp (#230)', () => {
         expect(await fs.readFile(`${tmp}/instances/i1/.env`, 'utf8')).toBe('port=50001\n')
         expect(await fs.readFile(`${tmp}/instances/i1/compose.yaml`, 'utf8')).toMatch(/instanceName: Old/)
         expect(h.doc().diskDB['d1' as any].preUpdateSnapshots).toEqual([{ instanceId: 'i1', sizeBytes: 4096, complete: true }])
+        expect(h.doc().diskDB['d1' as any].preUpdateBytes).toBe(8192)
+        expect(h.doc().diskDB['d1' as any].quarantineBytes).toBe(1024)
         const op = Object.values(h.doc().operationDB).find(o => o.kind === 'updateApp')!
         expect(op.status).toBe('Done')
         expect(new Set(msgs.map(m => m.step))).toEqual(new Set(['Fetch', 'Check', 'Snapshot', 'Swap', 'Start', 'Health']))
         expect(Object.keys(msgs[0]).sort()).toEqual(['bytesDone', 'bytesTotal', 'engineId', 'instanceId', 'step', 'type'])
         expect(msgs[0].type).toBe('idea/updateProgress')
+    })
+    it('second update and volumes: result and op log carry the quarantined previous snapshot and per-volume export time', async () => {
+        health = ['healthy']
+        const r = await updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps({ snapshot: async () => ({ path: `${tmp}/.pre-update/i1`, sizeBytes: 4096, previousQuarantinedAt: `${tmp}/.idea-quarantine/pre-update-i1-x`, volumes: [{ name: 'i1_db', bytes: 2048, exportMs: 7 }] }) }))
+        expect(r.previousSnapshotQuarantinedAt).toBe(`${tmp}/.idea-quarantine/pre-update-i1-x`)
+        expect(r.volumes).toEqual([{ name: 'i1_db', bytes: 2048, exportMs: 7 }])
+        expect(parseSnapshotResult('x\nVOLUME v_a 10 3\n/d/.pre-update/i 4 /d/.idea-quarantine/p').volumes).toEqual([{ name: 'v_a', bytes: 10, exportMs: 3 }])
+        expect(parseSnapshotResult('/d/.pre-update/i 4 none').previousQuarantinedAt).toBeNull()
+        expect(parseSnapshotsList('i 4 complete\nTOTAL pre-update 8\nTOTAL quarantine 2')).toEqual({ snapshots: [{ instanceId: 'i', sizeBytes: 4096, complete: true }], preUpdateBytes: 8192, quarantineBytes: 2048 })
+    })
+    it('dock-time updateAvailable: SHA256SUMS presence and version only, highest newer wins, null when none', async () => {
+        const SUM = 'a'.repeat(64) + '  compose.yaml\n'
+        const apps: Record<string, string | null> = { 'kolibri-1.1': SUM, 'kolibri-2.0': SUM, 'kolibri-3.0': null, 'kolibri-0.9': SUM, 'nextcloud-9.0': SUM }
+        const read: string[] = []
+        const deps = { mountRoot: async () => tmp, listApps: async () => Object.keys(apps), readSums: async (dir: string) => { read.push(path.basename(dir)); return apps[path.basename(dir)] } }
+        expect(await refreshUpdateAvailable(h, ME, deps)).toBe(1)
+        expect(inst().updateAvailable).toMatchObject({ appId: 'kolibri-2.0', sourceDiskId: 'd1', fromVersion: '1.0', toVersion: '2.0', major: true })
+        expect(read.sort()).toEqual(Object.keys(apps).sort())   // only SHA256SUMS is read, nothing verified
+        delete apps['kolibri-2.0']; delete apps['kolibri-1.1']
+        await refreshUpdateAvailable(h, ME, deps)
+        expect(inst().updateAvailable).toBeNull()
+        expect(sumsLookUsable('')).toBe(false)
+        expect(sumsLookUsable('b'.repeat(64) + '  other.txt')).toBe(false)
     })
     it('NO_SPACE before anything changes: "snapshot needs X, free Y", no stop, no snapshot', async () => {
         const m = await codeOf(updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps({ freeBytes: async () => 5 })))
@@ -130,7 +156,7 @@ describe('updateApp (#230)', () => {
         const order: string[] = []
         const r = await updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps({
             containerIds: async () => { order.push('ps'); return n++ < 2 ? ['c1'] : [] },
-            snapshot: async () => { order.push('snapshot'); return { path: '/x', sizeBytes: 1 } },
+            snapshot: async () => { order.push('snapshot'); return { path: '/x', sizeBytes: 1, previousQuarantinedAt: null, volumes: [] } },
         }))
         expect(r.toAppId).toBe('kolibri-1.1')
         expect(order.slice(0, 4)).toEqual(['ps', 'ps', 'ps', 'snapshot'])
@@ -160,7 +186,7 @@ describe('updateApp (#230)', () => {
     it('power loss before the snapshot completed: old version untouched, no restore', async () => {
         const opId = createOperation(h, 'updateApp', { instanceId: 'i1', diskId: 'd1' }, 'console-command')
         updateOperation(h, opId, { status: 'Running', currentStep: 2, totalSteps: 6, stepLabel: 'Snapshot' })
-        const out = await recoverInterruptedUpdates(h, ME, deps({ listSnapshots: async () => [{ instanceId: 'i1' as any, sizeBytes: 1, complete: false }] }))
+        const out = await recoverInterruptedUpdates(h, ME, deps({ listSnapshots: async () => ({ snapshots: [{ instanceId: 'i1' as any, sizeBytes: 1, complete: false }], preUpdateBytes: 1, quarantineBytes: 0 }) }))
         expect(out[0]).toMatch(/old version untouched/)
         expect(calls).toEqual([])
     })

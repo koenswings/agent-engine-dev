@@ -155,6 +155,8 @@ MOUNT=/usr/bin/mount
 MKFS=/usr/sbin/mkfs.ext4
 LOSETUP=/usr/sbin/losetup
 DOCKER=/usr/bin/docker
+TAR=/usr/bin/tar
+SHA256SUM=/usr/bin/sha256sum
 
 # ── Fixed locations ──────────────────────────────────────────────────────────
 DISKS_DIR=/disks
@@ -177,6 +179,7 @@ LEDGER_TTL_SECONDS=86400
 FREE_FLOOR_KB=1048576
 SNAPSHOT_MARGIN_PCT=10
 EXIT_NO_SPACE=3
+VOLUMES_DIR=/var/lib/docker/volumes
 PEER_MAX=256
 
 export HOME="$ROOT_HOME"
@@ -190,6 +193,7 @@ RE_IPV4='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$'
 RE_HOST='^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$'
 RE_SERVER_ARG='^[A-Za-z0-9._=,:+@/-]*$'
 RE_ENGINE='^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
+RE_VOL='^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
 RE_APP='^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
 RE_KEY64='AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}'
 RE_PEER_LINE="^([A-Za-z0-9][A-Za-z0-9_.-]{0,127}) ssh-ed25519 ($RE_KEY64) ssh-ed25519 ($RE_KEY64)\$"
@@ -296,6 +300,33 @@ quarantine_aside() {   # quarantine_aside <R_DIR> <path> <name>: move <path> to 
     journal "quarantine: $2 -> $dest"
     echo "$dest"
 }
+
+# Named Docker volumes of compose project <id> (v5 call 1, Atlas conditions): exported with the
+# HOST's GNU tar straight from the local-driver mountpoint under $VOLUMES_DIR, so no image is
+# run or pulled at all (stricter than --pull=never); a non-local driver or an unexpected
+# mountpoint is refused. Ownership, permissions, ACLs and xattrs are kept.
+TAR_OPTS=(--numeric-owner --xattrs --xattrs-include='*' --acls --sparse)
+VOL_NAMES=()
+list_volumes() {   # list_volumes <id>: fills VOL_NAMES
+    VOL_NAMES=()
+    [[ -x "$DOCKER" ]] || refuse "cannot list the volumes of $1 ($DOCKER missing)"
+    local out v
+    out=$($DOCKER volume ls -q --filter "label=com.docker.compose.project=$1" 2>/dev/null) || refuse "cannot list the volumes of $1"
+    for v in $out; do
+        [[ "$v" =~ $RE_VOL ]] || refuse "volume name '$v' does not match $RE_VOL"
+        VOL_NAMES+=("$v")
+    done
+}
+volume_dir() {   # volume_dir <vol>: echo its checked local mountpoint
+    local info drv mp
+    info=$($DOCKER volume inspect -f '{{.Driver}} {{.Mountpoint}}' -- "$1" 2>/dev/null) || refuse "cannot inspect volume $1"
+    read -r drv mp <<<"$info"
+    [[ "$drv" == local ]] || refuse "volume $1 uses driver '${drv:-unknown}'; only local volumes can be snapshotted"
+    [[ "$mp" == "$VOLUMES_DIR/$1/_data" ]] || refuse "volume $1 has an unexpected mountpoint '$mp'"
+    [[ -d "$mp" && ! -L "$mp" && ! -L "$VOLUMES_DIR/$1" ]] || refuse "volume $1 mountpoint $mp is missing or a symlink"
+    echo "$mp"
+}
+dir_kb() { $DU -sk -x -- "$1" | { read -r k _; echo "${k:-}"; }; }
 
 # ── Checks ───────────────────────────────────────────────────────────────────
 need() {   # need <count> <given> <usage>
@@ -922,37 +953,65 @@ case "$SUB" in
         PDIR="$R_DIR/.pre-update"
         SDIR="$PDIR/$3"
         [[ ! -L "$PDIR" && ! -L "$SDIR" ]] || refuse "$SDIR is a symlink"
-        if [[ -e "$SDIR" ]]; then
-            [[ ! -e "$SDIR/COMPLETE" ]] || refuse "a complete snapshot of $3 already exists at $SDIR; restore it or quarantine it first"
-            OLD=$(quarantine_aside "$R_DIR" "$SDIR" "pre-update-$3-incomplete") || exit 2
-            echo "an interrupted snapshot of $3 was moved to $OLD" >&2
-        fi
+        list_volumes "$3"
+        VOL_DIRS=(); VOL_KB=0
+        for v in ${VOL_NAMES[@]+"${VOL_NAMES[@]}"}; do
+            vd=$(volume_dir "$v") || exit 2
+            k=$(dir_kb "$vd"); [[ "$k" =~ ^[0-9]+$ ]] || refuse "cannot tell the size of volume $v"
+            VOL_DIRS+=("$vd"); VOL_KB=$(( VOL_KB + k ))
+        done
         pin_cwd "$INST"
-        NEED_KB=$($DU -sk -x -- . | { read -r k _; echo "${k:-}"; })
-        [[ "$NEED_KB" =~ ^[0-9]+$ ]] || refuse "cannot tell the size of $INST"
+        INST_KB=$(dir_kb .)
+        [[ "$INST_KB" =~ ^[0-9]+$ ]] || refuse "cannot tell the size of $INST"
+        # Volumes may live on the system SSD; the check is against THIS (destination) App Disk.
+        NEED_KB=$(( INST_KB + VOL_KB ))
         MARGIN_KB=$(( NEED_KB * SNAPSHOT_MARGIN_PCT / 100 ))
         (( MARGIN_KB >= FREE_FLOOR_KB )) || MARGIN_KB=$FREE_FLOOR_KB
         FREE_KB=$(avail_kb "$R_DIR")
         if (( FREE_KB < NEED_KB + MARGIN_KB )); then
             REFUSAL="NO_SPACE"
-            echo "NO_SPACE: snapshot needs $(( (NEED_KB + MARGIN_KB) * 1024 )) bytes ($NEED_KB KB + $MARGIN_KB KB margin), free $(( FREE_KB * 1024 )) bytes" >&2
+            echo "NO_SPACE: snapshot needs $(( (NEED_KB + MARGIN_KB) * 1024 )) bytes ($INST_KB KB folder + $VOL_KB KB volumes + $MARGIN_KB KB margin), free $(( FREE_KB * 1024 )) bytes" >&2
             exit $EXIT_NO_SPACE
+        fi
+        # A previous snapshot (complete or interrupted) is moved aside by a same-filesystem
+        # rename into .idea-quarantine, never copied and never removed (Steve call 2, Atlas OK).
+        OLD=none
+        if [[ -e "$SDIR" ]]; then
+            if [[ -e "$SDIR/COMPLETE" ]]; then OLDNAME="pre-update-$3"; else OLDNAME="pre-update-$3-incomplete"; fi
+            OLD=$(quarantine_aside "$R_DIR" "$SDIR" "$OLDNAME") || exit 2
+            echo "the previous snapshot of $3 was moved to $OLD" >&2
         fi
         root_dir "$PDIR" 0700 "pre-update folder"
         $CHMOD 0700 -- "$PDIR" || refuse "cannot set mode 0700 on $PDIR"
         $MKDIR -m 0700 -- "$SDIR" || refuse "cannot create $SDIR"
         $CHOWN root:root -- "$SDIR" 2>/dev/null || true
         STAMP=$($DATE -u +%Y-%m-%dT%H:%M:%SZ)
-        echo "snapshot $2 $3 started $STAMP need_kb=$NEED_KB" > "$SDIR/JOURNAL" || refuse "cannot write $SDIR/JOURNAL"
+        echo "snapshot $2 $3 started $STAMP need_kb=$NEED_KB volumes=${#VOL_NAMES[@]} old=$OLD" > "$SDIR/JOURNAL" || refuse "cannot write $SDIR/JOURNAL"
         journal "snapshot: $INST -> $SDIR started"
         $MKDIR -m 0700 -- "$SDIR/data" || refuse "cannot create $SDIR/data"
         run_child $RSYNC "${RSYNC_OPTS[@]}" -- ./ "$SDIR/data/" || exit $?
-        GOT_KB=$($DU -sk -x -- "$SDIR/data" | { read -r k _; echo "${k:-0}"; })
+        if (( ${#VOL_NAMES[@]} > 0 )); then
+            $MKDIR -m 0700 -- "$SDIR/volumes" || refuse "cannot create $SDIR/volumes"
+            for i in "${!VOL_NAMES[@]}"; do
+                v=${VOL_NAMES[$i]}; vd=${VOL_DIRS[$i]}; t0=$($DATE +%s%3N)
+                run_child $TAR "${TAR_OPTS[@]}" -C "$vd" -cf "$SDIR/volumes/$v.tar" . || refuse "export of volume $v failed"
+                # Verify before COMPLETE: the archive lists, and its checksum is recorded and re-read.
+                $TAR -tf "$SDIR/volumes/$v.tar" >/dev/null 2>&1 || refuse "the archive of volume $v does not list"
+                ( cd "$SDIR/volumes" && $SHA256SUM -- "$v.tar" >> SHA256SUMS ) || refuse "cannot checksum the archive of volume $v"
+                bytes=$($STAT -c %s -- "$SDIR/volumes/$v.tar") || refuse "cannot size the archive of volume $v"
+                ms=$(( $($DATE +%s%3N) - t0 ))
+                echo "volume $v bytes=$bytes ms=$ms" >> "$SDIR/JOURNAL"
+                journal "snapshot: volume $v exported ($bytes bytes, $ms ms)"
+                echo "VOLUME $v $bytes $ms"
+            done
+            ( cd "$SDIR/volumes" && $SHA256SUM -c --quiet -- SHA256SUMS ) >/dev/null 2>&1 || refuse "the volume archives of $3 do not match their checksums"
+        fi
+        GOT_KB=$(dir_kb "$SDIR"); GOT_KB=${GOT_KB:-0}
         echo "complete $($DATE -u +%Y-%m-%dT%H:%M:%SZ) kb=$GOT_KB" > "$SDIR/.COMPLETE.tmp" || refuse "cannot write the COMPLETE marker"
         $MV -T -- "$SDIR/.COMPLETE.tmp" "$SDIR/COMPLETE" || refuse "cannot write the COMPLETE marker"
         echo "snapshot $2 $3 complete $GOT_KB" >> "$SDIR/JOURNAL"
         journal "snapshot: $SDIR complete ($GOT_KB KB)"
-        echo "$SDIR $GOT_KB"
+        echo "$SDIR $GOT_KB $OLD"
         exit 0
         ;;
 
@@ -977,6 +1036,26 @@ case "$SUB" in
         $MKDIR -m 0700 -- "$INST" || refuse "cannot create $INST"
         pin_cwd "$SDIR/data"
         run_child $RSYNC "${RSYNC_OPTS[@]}" -- ./ "$INST/" || exit $?
+        if [[ -d "$SDIR/volumes" && ! -L "$SDIR/volumes" ]]; then
+            ( cd "$SDIR/volumes" && $SHA256SUM -c --quiet -- SHA256SUMS ) >/dev/null 2>&1 || refuse "the volume archives of $3 do not match their checksums; not restoring volumes"
+            for a in "$SDIR/volumes"/*.tar; do
+                [[ -f "$a" && ! -L "$a" ]] || continue
+                v=${a##*/}; v=${v%.tar}
+                [[ "$v" =~ $RE_VOL ]] || refuse "archive name '$v' does not match $RE_VOL"
+                vd=$(volume_dir "$v") || exit 2
+                # Current contents moved aside by a same-filesystem rename (undoable), never removed.
+                vaside="$VOLUMES_DIR/$v/_data.idea-quarantine-$($DATE -u +%Y%m%dT%H%M%S%NZ)"
+                MODE=$($STAT -c '%u:%g %a' -- "$vd") || refuse "cannot stat $vd"
+                $MV -T -- "$vd" "$vaside" || refuse "cannot move $vd aside"
+                $MKDIR -- "$vd" || refuse "cannot recreate $vd"
+                $CHOWN "${MODE% *}" -- "$vd" 2>/dev/null || true
+                $CHMOD "${MODE#* }" -- "$vd" || true
+                run_child $TAR "${TAR_OPTS[@]}" -C "$vd" -xf "$a" || refuse "restore of volume $v failed (previous contents at $vaside)"
+                echo "restore volume $v aside=$vaside" >> "$SDIR/JOURNAL"
+                journal "restore-snapshot: volume $v restored (previous contents: $vaside)"
+                echo "VOLUME $v $vaside"
+            done
+        fi
         echo "restore $2 $3 done aside=${ASIDE:-none}" >> "$SDIR/JOURNAL"
         journal "restore-snapshot: $INST restored from $SDIR (previous folder: ${ASIDE:-none})"
         echo "${ASIDE:-none}"
@@ -987,7 +1066,12 @@ case "$SUB" in
         need 1 $(($# - 1)) "<root>"
         resolve_root "$2" instances
         PDIR="$R_DIR/.pre-update"
-        [[ -e "$PDIR" ]] || exit 0
+        QDIR="$R_DIR/.idea-quarantine"
+        if [[ ! -e "$PDIR" ]]; then
+            echo "TOTAL pre-update 0"
+            if [[ -d "$QDIR" && ! -L "$QDIR" ]]; then echo "TOTAL quarantine $(dir_kb "$QDIR")"; else echo "TOTAL quarantine 0"; fi
+            exit 0
+        fi
         [[ ! -L "$PDIR" ]] || refuse "$PDIR is a symlink"
         for d in "$PDIR"/*/; do
             [[ -d "$d" && ! -L "${d%/}" ]] || continue
@@ -996,6 +1080,9 @@ case "$SUB" in
             kb=$($DU -sk -x -- "$d" | { read -r k _; echo "${k:-0}"; })
             if [[ -f "$d/COMPLETE" ]]; then echo "$n $kb complete"; else echo "$n $kb incomplete"; fi
         done
+        echo "TOTAL pre-update $(dir_kb "$PDIR")"
+        QDIR="$R_DIR/.idea-quarantine"
+        if [[ -d "$QDIR" && ! -L "$QDIR" ]]; then echo "TOTAL quarantine $(dir_kb "$QDIR")"; else echo "TOTAL quarantine 0"; fi
         exit 0
         ;;
 

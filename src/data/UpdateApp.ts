@@ -18,7 +18,9 @@
  * itself fails the instance is left Stopped with statusCondition "ROLLBACK FAILED: ...".
  * Nothing is ever deleted; snapshots are kept (cleanup is a backlog item, quarantine only).
  *
- * Named Docker volumes are not part of the snapshot (the snapshot is the instance folder).
+ * Named Docker volumes of the instance are exported into the snapshot too (helper v5, offline host
+ * tar, verified before COMPLETE) and restored on rollback; a previous snapshot is renamed into
+ * .idea-quarantine first (never copied or removed).
  */
 import { DocHandle } from '@automerge/automerge-repo'
 import { $, fs, path, YAML, sleep } from 'zx'
@@ -30,13 +32,13 @@ import { diskMountRoot, appDataRoot, Disk, PreUpdateSnapshot } from './Disk.js'
 import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
 import {
     runAppData, snapshotArgs, restoreSnapshotArgs, snapshotsArgs, parseSnapshotResult, parseSnapshotsList,
-    helperAtLeast, instanceDataBytes, lastLine,
+    helperAtLeast, instanceDataBytes, lastLine, SnapshotResult,
 } from '../utils/appDataHelper.js'
 import { createOperation, updateOperation } from './Operations.js'
 import { log } from '../utils/utils.js'
 import {
     UpdateAppError, UpdateStep, UPDATE_STEPS, checkUpdate, healthGate, healthTimeoutSeconds, rollbackPlan,
-    HealthSample, ContainerHealth,
+    HealthSample, ContainerHealth, offerable, compareVersions, parseVersion,
 } from './UpdateAppPolicy.js'
 import { parseAppId } from './App.js'
 import { setComposeInstanceName } from './InstanceCopy.js'
@@ -53,7 +55,12 @@ export interface UpdateProgress { type: typeof UPDATE_PROGRESS_TYPE; engineId: s
 export interface UpdateResult {
     instanceId: InstanceID; name: string; fromAppId: AppID; toAppId: AppID
     snapshotPath: string; snapshotBytes: number; steps: UpdateStep[]
+    /** the previous snapshot, renamed into .idea-quarantine before this one (or null) */
+    previousSnapshotQuarantinedAt: string | null
+    /** named Docker volumes exported into the snapshot, with their export time */
+    volumes: { name: string, bytes: number, exportMs: number }[]
 }
+export interface SnapshotsInfo { snapshots: PreUpdateSnapshot[], preUpdateBytes: number | null, quarantineBytes: number | null }
 
 export interface UpdateDeps {
     helperProblem: () => Promise<string | null>
@@ -66,9 +73,9 @@ export interface UpdateDeps {
     stop: (inst: Instance, disk: Disk) => Promise<void>
     containerIds: (id: InstanceID) => Promise<string[]>
     composeDown: (dir: string, id: InstanceID) => Promise<void>
-    snapshot: (disk: Disk, id: InstanceID) => Promise<{ path: string, sizeBytes: number }>
+    snapshot: (disk: Disk, id: InstanceID) => Promise<SnapshotResult>
     restoreSnapshot: (disk: Disk, id: InstanceID) => Promise<string>
-    listSnapshots: (disk: Disk) => Promise<PreUpdateSnapshot[]>
+    listSnapshots: (disk: Disk) => Promise<SnapshotsInfo>
     reread: (disk: Disk, id: InstanceID) => Promise<void>
     start: (inst: Instance, disk: Disk) => Promise<void>
     health: (id: InstanceID) => Promise<Omit<HealthSample, 'elapsedMs'>>
@@ -123,7 +130,7 @@ export const defaultUpdateDeps = (storeHandle: DocHandle<Store>): UpdateDeps => 
     },
     snapshot: async (disk, id) => parseSnapshotResult(await runAppData(snapshotArgs(await appDataRoot(disk), String(id)))),
     restoreSnapshot: async (disk, id) => lastLine(await runAppData(restoreSnapshotArgs(await appDataRoot(disk), String(id)))),
-    listSnapshots: async (disk) => parseSnapshotsList(await runAppData(snapshotsArgs(await appDataRoot(disk)))) as PreUpdateSnapshot[],
+    listSnapshots: async (disk) => parseSnapshotsList(await runAppData(snapshotsArgs(await appDataRoot(disk)))) as SnapshotsInfo,
     reread: async (disk, id) => { await (await import('./Instance.js')).createOrUpdateInstance(storeHandle, id, disk) },
     start: async (inst, disk) => (await import('./Instance.js')).startInstance(storeHandle, inst, disk),
     health: async (id) => {
@@ -166,12 +173,18 @@ export const waitContainersGone = async (d: Pick<UpdateDeps, 'containerIds' | 'n
     }
 }
 
-/** Refresh Disk.preUpdateSnapshots from the helper (best effort; Ops visibility, Atlas). */
+/** Refresh Disk.preUpdateSnapshots, preUpdateBytes and quarantineBytes from the helper (best effort; Ops visibility, Atlas). */
 export const refreshPreUpdateSnapshots = async (storeHandle: DocHandle<Store>, disk: Disk, list: UpdateDeps['listSnapshots']): Promise<PreUpdateSnapshot[] | null> => {
-    let snaps: PreUpdateSnapshot[] | null = null
-    try { snaps = await list(disk) } catch (e) { log(`updateApp: cannot list .pre-update snapshots on ${disk.id}: ${(e as Error).message}`); return null }
-    storeHandle.change(doc => { const d = doc.diskDB[disk.id]; if (d) d.preUpdateSnapshots = snaps!.map(s => ({ ...s })) })
-    return snaps
+    let info: SnapshotsInfo
+    try { info = await list(disk) } catch (e) { log(`updateApp: cannot list .pre-update snapshots on ${disk.id}: ${(e as Error).message}`); return null }
+    storeHandle.change(doc => {
+        const d = doc.diskDB[disk.id]
+        if (!d) return
+        d.preUpdateSnapshots = info.snapshots.map(s => ({ ...s }))
+        d.preUpdateBytes = info.preUpdateBytes
+        d.quarantineBytes = info.quarantineBytes
+    })
+    return info.snapshots
 }
 
 const findBundleDisk = async (store: Store, d: UpdateDeps, engineId: string, inst: Instance, newAppId: string, sourceDiskId?: string): Promise<{ disk: Disk, dir: string } | null> => {
@@ -241,7 +254,7 @@ export const updateApp = async (
         updateOperation(storeHandle, opId, { status: 'Running' })
         const setStep = (step: UpdateStep) => updateOperation(storeHandle, opId, { currentStep: UPDATE_STEPS.indexOf(step), totalSteps: UPDATE_STEPS.length, stepLabel: step })
         let step: UpdateStep = 'Snapshot'
-        let snap: { path: string, sizeBytes: number } | null = null
+        let snap: SnapshotResult | null = null
         const done: UpdateStep[] = ['Fetch', 'Check']
         try {
             // ── Snapshot
@@ -255,6 +268,9 @@ export const updateApp = async (
                 throw e
             }
             progress('Snapshot', snap.sizeBytes, snap.sizeBytes); done.push('Snapshot')
+            if (snap.previousQuarantinedAt) log(`updateApp: ${inst.id}: the previous snapshot was moved to ${snap.previousQuarantinedAt}`)
+            for (const v of snap.volumes) log(`updateApp: ${inst.id}: volume ${v.name} exported (${v.bytes} bytes, ${v.exportMs} ms)`)
+            updateOperation(storeHandle, opId, { stepLabel: `Snapshot ${snap.path} (${snap.sizeBytes} bytes${snap.volumes.length ? `; volumes ${snap.volumes.map(v => `${v.name} ${v.bytes} B in ${v.exportMs} ms`).join(', ')}` : ''}${snap.previousQuarantinedAt ? `; previous snapshot quarantined at ${snap.previousQuarantinedAt}` : ''})` })
             await refreshPreUpdateSnapshots(storeHandle, disk, d.listSnapshots)
             // ── Swap
             step = 'Swap'; setStep('Swap'); progress('Swap')
@@ -287,7 +303,7 @@ export const updateApp = async (
             done.push('Health')
             updateOperation(storeHandle, opId, { status: 'Done', completedAt: d.now() as Timestamp })
             log(`updateApp: ${inst.id} ('${inst.name}') ${fromAppId} -> ${newAppId}; snapshot ${snap.path} (${snap.sizeBytes} bytes) kept`)
-            return { instanceId: inst.id, name: String(inst.name), fromAppId, toAppId: newAppId as AppID, snapshotPath: snap.path, snapshotBytes: snap.sizeBytes, steps: done }
+            return { instanceId: inst.id, name: String(inst.name), fromAppId, toAppId: newAppId as AppID, snapshotPath: snap.path, snapshotBytes: snap.sizeBytes, steps: done, previousSnapshotQuarantinedAt: snap.previousQuarantinedAt, volumes: snap.volumes }
         } catch (e) {
             const why = e instanceof UpdateAppError && e.code === 'NO_SPACE' ? null : String((e as Error).message)
             if (!why || !snap) {
@@ -357,7 +373,7 @@ export const recoverInterruptedUpdates = async (storeHandle: DocHandle<Store>, e
         const disk = inst && store.diskDB[inst.storedOn as DiskID] as Disk
         if (!inst || !disk || String(disk.dockedTo) !== engineId) { out.push(`${op.args.instanceId}: disk not docked; left as is`); continue }
         const step = UPDATE_STEPS[op.currentStep ?? 0] ?? 'Snapshot'
-        const snaps = await d.listSnapshots(disk).catch(() => [] as PreUpdateSnapshot[])
+        const snaps = (await d.listSnapshots(disk).catch(() => null))?.snapshots ?? []
         const complete = snaps.some(s => String(s.instanceId) === String(inst.id) && s.complete)
         const swapped = UPDATE_STEPS.indexOf(step) >= UPDATE_STEPS.indexOf('Swap')
         if (!complete || !swapped) { out.push(`${inst.id}: interrupted at ${step}; old version untouched`); continue }
@@ -368,3 +384,62 @@ export const recoverInterruptedUpdates = async (storeHandle: DocHandle<Store>, e
     return out
 }
 
+
+/**
+ * Dock-time updateAvailable (Steve call 3): cheap, no full verify. For every instance on a disk
+ * docked to this Engine, look for a newer bundle of the same App under apps/ on any disk docked
+ * here whose SHA256SUMS exists, is non-empty and lists compose.yaml (read, not checked). The
+ * full SHA256SUMS verify stays at update start (NO_SUMS). Sets Instance.updateAvailable (highest
+ * version wins; the instance's own disk first on a tie) or null.
+ */
+export interface UpdateAvailableDeps {
+    mountRoot: (disk: Disk) => Promise<string>
+    listApps: (appsDir: string) => Promise<string[]>
+    readSums: (bundleDir: string) => Promise<string | null>
+}
+const defaultAvailableDeps: UpdateAvailableDeps = {
+    mountRoot: (disk) => diskMountRoot(disk),
+    listApps: async (dir) => (await fs.pathExists(dir)) ? (await fs.readdir(dir)).filter(n => !n.startsWith('.')) : [],
+    readSums: async (dir) => { try { return await fs.readFile(path.join(dir, 'SHA256SUMS'), 'utf8') } catch { return null } },
+}
+export const sumsLookUsable = (sums: string | null): boolean =>
+    !!sums && sums.split('\n').some(l => /^[0-9a-f]{64} [ *]\.?\/?compose\.yaml$/.test(l.trim()))
+
+export const refreshUpdateAvailable = async (storeHandle: DocHandle<Store>, engineId: string, deps: Partial<UpdateAvailableDeps> = {}): Promise<number> => {
+    const d = { ...defaultAvailableDeps, ...deps }
+    const store = storeHandle.doc()
+    const docked = Object.values(store.diskDB ?? {}).filter(x => x && String(x.dockedTo) === engineId && x.device) as Disk[]
+    const bundles: { disk: Disk, appId: string }[] = []
+    for (const disk of docked) {
+        let root: string
+        try { root = await d.mountRoot(disk) } catch { continue }
+        for (const appId of await d.listApps(path.join(root, 'apps')).catch(() => [] as string[])) {
+            if (sumsLookUsable(await d.readSums(path.join(root, 'apps', appId)))) bundles.push({ disk, appId })
+        }
+    }
+    const updates: Record<string, Instance['updateAvailable']> = {}
+    for (const inst of Object.values(store.instanceDB ?? {}) as Instance[]) {
+        if (!inst || !docked.some(x => String(x.id) === String(inst.storedOn))) continue
+        let best: { disk: Disk, appId: string } | null = null
+        for (const b of bundles) {
+            if (!offerable({ currentAppId: String(inst.instanceOf), newAppId: b.appId, sumsValid: true })) continue
+            const c = best ? compareVersions(parseAppId(b.appId).version, parseAppId(best.appId).version) : 1
+            if (c !== null && (c > 0 || (c === 0 && String(b.disk.id) === String(inst.storedOn)))) best = b
+        }
+        if (!best) { updates[String(inst.id)] = null; continue }
+        const from = parseAppId(String(inst.instanceOf)).version, to = parseAppId(best.appId).version
+        updates[String(inst.id)] = {
+            appId: best.appId as AppID, sourceDiskId: best.disk.id as DiskID, sourceEngineId: engineId as any,
+            fromVersion: from, toVersion: to, major: (parseVersion(to)?.[0] ?? 0) !== (parseVersion(from)?.[0] ?? 0),
+        }
+    }
+    storeHandle.change(doc => {
+        for (const [id, u] of Object.entries(updates)) {
+            const i = doc.instanceDB[id as InstanceID]
+            if (!i) continue
+            const cur = JSON.stringify(i.updateAvailable ?? null), next = JSON.stringify(u ?? null)
+            if (cur !== next) i.updateAvailable = u ? { ...u } : null
+        }
+    })
+    return Object.values(updates).filter(Boolean).length
+}

@@ -77,7 +77,7 @@ describe('idea-app-data: the source script (idea#168)', () => {
         // Every external command is a $VAR set to an absolute path
         for (const m of text.matchAll(/^([A-Z_]+)=(\/\S+)$/gm)) {
             if (['PATH', 'DISKS_DIR', 'ROOTS_FILE', 'LOCK_DIR', 'ROOT_HOME', 'HELPER_PATH',
-                'PEER_KEY', 'PEER_KNOWN_HOSTS', 'PEER_AUTH_DIR', 'PEER_GATE', 'LEDGER_DIR'].includes(m[1])) continue
+                'PEER_KEY', 'PEER_KNOWN_HOSTS', 'PEER_AUTH_DIR', 'PEER_GATE', 'LEDGER_DIR', 'VOLUMES_DIR'].includes(m[1])) continue
             expect(m[2], m[1]).toMatch(/^\/usr\/(s?bin)\/[a-z0-9.]+$/)
         }
     })
@@ -366,7 +366,8 @@ describe('idea-app-data: updateApp snapshots (v5, idea#230)', () => {
         await fs.writeFile(path.join(inst, 'db.sqlite3'), 'v1')
         const r = await sb.run(['snapshot', 'sdb1', 'inst1'])
         expect(r.exitCode, r.stderr).toBe(0)
-        const [dir, kb] = r.stdout.trim().split('\n').pop()!.split(' ')  // last line; rsync progress comes first
+        const [dir, kb, old] = r.stdout.trim().split('\n').pop()!.split(' ')  // last line; rsync progress comes first
+        expect(old).toBe('none')
         expect(dir).toBe(snap(root, 'inst1'))
         expect(Number(kb)).toBeGreaterThanOrEqual(0)
         expect(await fs.readFile(path.join(dir, 'data', 'db.sqlite3'), 'utf8')).toBe('v1')
@@ -375,8 +376,69 @@ describe('idea-app-data: updateApp snapshots (v5, idea#230)', () => {
         expect((await fs.stat(path.join(root, '.pre-update'))).mode & 0o777).toBe(0o700)
         expect((await fs.stat(dir)).mode & 0o777).toBe(0o700)
         expect(await fs.readFile(path.join(inst, 'db.sqlite3'), 'utf8')).toBe('v1')
-        refused(await sb.run(['snapshot', 'sdb1', 'inst1']), /complete snapshot of inst1 already exists/)
-        expect((await sb.run(['snapshots', 'sdb1'])).stdout.trim()).toMatch(/^inst1 \d+ complete$/)
+        expect((await sb.run(['snapshots', 'sdb1'])).stdout.trim()).toMatch(/^inst1 \d+ complete\nTOTAL pre-update \d+\nTOTAL quarantine 0$/)
+    })
+    it('a second update: the previous COMPLETE snapshot is renamed into .idea-quarantine (same inode, never copied or removed)', async () => {
+        const root = await sb.addDisk('sdb1')
+        const inst = await sb.addInstance(root, 'inst1')
+        await fs.writeFile(path.join(inst, 'db.sqlite3'), 'v1')
+        expect((await sb.run(['snapshot', 'sdb1', 'inst1'])).exitCode).toBe(0)
+        const ino = (await fs.stat(path.join(snap(root, 'inst1'), 'data', 'db.sqlite3'))).ino
+        await fs.writeFile(path.join(inst, 'db.sqlite3'), 'v2')
+        const r = await sb.run(['snapshot', 'sdb1', 'inst1'])
+        expect(r.exitCode, r.stderr).toBe(0)
+        const [dir, , old] = r.stdout.trim().split('\n').pop()!.split(' ')
+        expect(old).toMatch(/\/\.idea-quarantine\/pre-update-inst1-\d{8}T/)
+        expect(await fs.readFile(path.join(old, 'data', 'db.sqlite3'), 'utf8')).toBe('v1')
+        expect((await fs.stat(path.join(old, 'data', 'db.sqlite3'))).ino).toBe(ino)   // a rename, not a copy
+        expect(await fs.readFile(path.join(dir, 'data', 'db.sqlite3'), 'utf8')).toBe('v2')
+        expect(await fs.readFile(path.join(dir, 'JOURNAL'), 'utf8')).toContain(`old=${old}`)
+        const totals = (await sb.run(['snapshots', 'sdb1'])).stdout
+        expect(Number(totals.match(/TOTAL quarantine (\d+)/)![1])).toBeGreaterThan(0)
+        expect(Number(totals.match(/TOTAL pre-update (\d+)/)![1])).toBeGreaterThan(0)
+    })
+    it('named volumes: exported with host tar (owner/mode/xattrs kept), verified and checksummed before COMPLETE, timed; restore moves current contents aside', async () => {
+        const root = await sb.addDisk('sdb1')
+        await sb.addInstance(root, 'inst1')
+        const vd = path.join(sb.volumesDir, 'inst1_db', '_data')
+        await fs.ensureDir(path.join(vd, 'sub')); await fs.writeFile(path.join(vd, 'sub', 'row'), 'r1'); await fs.chmod(path.join(vd, 'sub', 'row'), 0o640)
+        const env = { FAKE_DOCKER_VOLUMES: 'inst1_db' }
+        const r = await sb.run(['snapshot', 'sdb1', 'inst1'], env)
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(r.stdout).toMatch(/^VOLUME inst1_db \d+ \d+$/m)
+        const s = snap(root, 'inst1')
+        expect(await fs.readFile(path.join(s, 'volumes', 'SHA256SUMS'), 'utf8')).toMatch(/^[0-9a-f]{64}  inst1_db\.tar$/m)
+        expect(await fs.readFile(path.join(s, 'JOURNAL'), 'utf8')).toMatch(/volume inst1_db bytes=\d+ ms=\d+[\s\S]*complete/)
+        const tarCalls = (await sb.calls('tar').catch(() => [])) as any[]
+        expect(tarCalls.length).toBe(0)   // real tar: no fake; the options are checked in the source
+        const body = await fs.readFile(path.join(process.cwd(), 'script/build_image_assets/idea-app-data'), 'utf8')
+        expect(body).toMatch(/TAR_OPTS=\(--numeric-owner --xattrs/)
+        expect(body.slice(body.indexOf('    snapshot)'), body.indexOf('    snapshots)'))).not.toMatch(/docker run|pull/)
+        await fs.writeFile(path.join(vd, 'sub', 'row'), 'r2-migrated')
+        const rr = await sb.run(['restore-snapshot', 'sdb1', 'inst1'], env)
+        expect(rr.exitCode, rr.stderr).toBe(0)
+        const aside = rr.stdout.match(/^VOLUME inst1_db (\S+)$/m)![1]
+        expect(aside.startsWith(path.join(sb.volumesDir, 'inst1_db', '_data.idea-quarantine-'))).toBe(true)
+        expect(await fs.readFile(path.join(aside, 'sub', 'row'), 'utf8')).toBe('r2-migrated')
+        expect(await fs.readFile(path.join(vd, 'sub', 'row'), 'utf8')).toBe('r1')
+        expect((await fs.stat(path.join(vd, 'sub', 'row'))).mode & 0o777).toBe(0o640)
+    })
+    it('volumes: a corrupted archive is never restored; a non-local driver or odd volume name is refused; volumes count in NO_SPACE', async () => {
+        const root = await sb.addDisk('sdb1')
+        await sb.addInstance(root, 'inst1')
+        const vd = path.join(sb.volumesDir, 'inst1_db', '_data')
+        await fs.ensureDir(vd); await fs.writeFile(path.join(vd, 'big'), Buffer.alloc(300 * 1024))
+        const env = { FAKE_DOCKER_VOLUMES: 'inst1_db' }
+        refused(await sb.run(['snapshot', 'sdb1', 'inst1'], { ...env, FAKE_DOCKER_DRIVER: 'nfs' }), /driver 'nfs'; only local volumes/)
+        refused(await sb.run(['snapshot', 'sdb1', 'inst1'], { FAKE_DOCKER_VOLUMES: '../x' }), /volume name '\.\.\/x' does not match/)
+        const ns = await sb.run(['snapshot', 'sdb1', 'inst1'], { ...env, FAKE_DF_AVAIL_KB: '1048800' })
+        expect(ns.exitCode).toBe(3)
+        expect(ns.stderr).toMatch(/NO_SPACE: .*\+ [1-9]\d* KB volumes \+/)
+        expect(await fs.pathExists(path.join(root, '.pre-update'))).toBe(false)
+        expect((await sb.run(['snapshot', 'sdb1', 'inst1'], env)).exitCode).toBe(0)
+        await fs.appendFile(path.join(snap(root, 'inst1'), 'volumes', 'inst1_db.tar'), 'x')
+        refused(await sb.run(['restore-snapshot', 'sdb1', 'inst1'], env), /do not match their checksums/)
+        expect(await fs.readdir(path.join(sb.volumesDir, 'inst1_db'))).toEqual(['_data'])
     })
     it('NO_SPACE: refuses before writing anything when free space is below size + margin', async () => {
         const root = await sb.addDisk('sdb1')
@@ -406,7 +468,7 @@ describe('idea-app-data: updateApp snapshots (v5, idea#230)', () => {
         expect((await sb.run(['snapshots', 'sdb1'])).stdout).toMatch(/inst1 \d+ incomplete/)
         const r = await sb.run(['snapshot', 'sdb1', 'inst1'])
         expect(r.exitCode, r.stderr).toBe(0)
-        expect(r.stderr).toMatch(/interrupted snapshot of inst1 was moved to .*\.idea-quarantine\/pre-update-inst1-incomplete-/)
+        expect(r.stderr).toMatch(/previous snapshot of inst1 was moved to .*\.idea-quarantine\/pre-update-inst1-incomplete-/)
         const q = await fs.readdir(path.join(root, '.idea-quarantine'))
         expect(await fs.readFile(path.join(root, '.idea-quarantine', q[0], 'data', 'half'), 'utf8')).toBe('x')
         expect(await fs.pathExists(path.join(snap(root, 'inst1'), 'data', 'half'))).toBe(false)

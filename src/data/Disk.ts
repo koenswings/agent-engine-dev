@@ -41,6 +41,9 @@ export interface Disk {
     freeBytes?: number | null;          // Docked disks: free bytes, rounded to MB (idea#131); null when undocked
     /** updateApp snapshots in <disk>/.pre-update (agent-engine-dev#230), so Ops can see their size; null/absent when unknown. */
     preUpdateSnapshots?: PreUpdateSnapshot[] | null;
+    /** total bytes of the pre-update and quarantine folders on this disk (Atlas: Ops visibility; nothing auto-deletes) */
+    preUpdateBytes?: number | null;
+    quarantineBytes?: number | null;
 }
 
 export interface PreUpdateSnapshot {
@@ -700,6 +703,13 @@ export const processAppDisk = async (storeHandle: DocHandle<Store>, disk: Disk):
     if (!config.settings.isDev) {
         const { refreshPreUpdateSnapshots, defaultUpdateDeps } = await import('./UpdateApp.js')
         await refreshPreUpdateSnapshots(storeHandle, disk, defaultUpdateDeps(storeHandle).listSnapshots)
+    }
+    // #230 call 3: dock-time updateAvailable from SHA256SUMS presence and versions only (cheap).
+    try {
+        const { refreshUpdateAvailable } = await import('./UpdateApp.js')
+        if (disk.dockedTo) await refreshUpdateAvailable(storeHandle, String(disk.dockedTo))
+    } catch (e) {
+        log(`updateAvailable refresh failed on dock of ${disk.id}: ${(e as Error).message}`)
     }
 
     // Trigger backups on any docked Backup Disk linked to instances on this App Disk

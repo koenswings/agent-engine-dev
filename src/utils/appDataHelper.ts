@@ -309,16 +309,30 @@ export const snapshotsArgs = (root: string): string[] => ['snapshots', checkRoot
 /** The helper prints rsync progress first; its result is the last non-empty line. */
 export const lastLine = (out: string): string => out.trim().split('\n').map(s => s.trim()).filter(Boolean).pop() ?? ''
 
-/** `snapshot` result: "<dir> <kb>". */
-export const parseSnapshotResult = (out: string): { path: string, sizeBytes: number } => {
-    const m = lastLine(out).match(/^(\/\S+) (\d+)$/)
-    if (!m) throw new Error(`idea-app-data snapshot gave no result line: ${lastLine(out) || '(empty)'}`)
-    return { path: m[1], sizeBytes: Number(m[2]) * 1024 }
+export interface SnapshotVolume { name: string, bytes: number, exportMs: number }
+export interface SnapshotResult {
+    path: string, sizeBytes: number
+    /** where the previous snapshot of this instance was renamed to (.idea-quarantine), or null */
+    previousQuarantinedAt: string | null
+    volumes: SnapshotVolume[]
 }
 
-/** `snapshots` lines: "<id> <kb> complete|incomplete". */
-export const parseSnapshotsList = (out: string): { instanceId: string, sizeBytes: number, complete: boolean }[] =>
-    out.split('\n').map(l => l.trim().match(/^([a-z0-9][a-z0-9-]{0,63}) (\d+) (complete|incomplete)$/))
-        .filter((m): m is RegExpMatchArray => !!m)
-        .map(m => ({ instanceId: m[1], sizeBytes: Number(m[2]) * 1024, complete: m[3] === 'complete' }))
+/** `snapshot` result: "VOLUME <name> <bytes> <ms>" lines, then "<dir> <kb> <old|none>" last. */
+export const parseSnapshotResult = (out: string): SnapshotResult => {
+    const m = lastLine(out).match(/^(\/\S+) (\d+)(?: (\S+))?$/)
+    if (!m) throw new Error(`idea-app-data snapshot gave no result line: ${lastLine(out) || '(empty)'}`)
+    const volumes = [...out.matchAll(/^VOLUME (\S+) (\d+) (\d+)$/gm)].map(v => ({ name: v[1], bytes: Number(v[2]), exportMs: Number(v[3]) }))
+    return { path: m[1], sizeBytes: Number(m[2]) * 1024, previousQuarantinedAt: m[3] && m[3] !== 'none' ? m[3] : null, volumes }
+}
+
+/** `snapshots` lines: "<id> <kb> complete|incomplete", then "TOTAL pre-update <kb>" and "TOTAL quarantine <kb>". */
+export const parseSnapshotsList = (out: string): { snapshots: { instanceId: string, sizeBytes: number, complete: boolean }[], preUpdateBytes: number | null, quarantineBytes: number | null } => {
+    const total = (what: string) => { const m = out.match(new RegExp(`^TOTAL ${what} (\\d+)$`, 'm')); return m ? Number(m[1]) * 1024 : null }
+    return {
+        snapshots: out.split('\n').map(l => l.trim().match(/^([a-z0-9][a-z0-9-]{0,63}) (\d+) (complete|incomplete)$/))
+            .filter((m): m is RegExpMatchArray => !!m)
+            .map(m => ({ instanceId: m[1], sizeBytes: Number(m[2]) * 1024, complete: m[3] === 'complete' })),
+        preUpdateBytes: total('pre-update'), quarantineBytes: total('quarantine'),
+    }
+}
 
