@@ -72,8 +72,8 @@ is_live_app_disk_link() {
     [ -n "$dev" ] && preflight_is_block "$dev" || return 1
     name="${dev##*/}"
     while read -r src mnt _rest; do
-        [[ "$src" == /dev/* ]] || continue
-        src=$(readlink -f "$src" 2>/dev/null || echo "$src")
+        src=$(readlink -f "$src" 2>/dev/null) || continue
+        preflight_is_block "$src" || continue
         is_on_disk "${src##*/}" "$name" || continue
         mnt="${mnt//\\040/ }"
         [[ "$mnt" == "$disks_root" || "$mnt" == "$disks_root"/* ]] && return 0
