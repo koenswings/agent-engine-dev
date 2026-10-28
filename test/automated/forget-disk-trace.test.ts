@@ -46,7 +46,7 @@ describe('forgetDisk reports what it did (#262)', () => {
         enableStoreMonitor(h, log)
         h.change(d => { (d.engineDB[localEngineId].commands as any[]).push(`forgetDisk ${DISK}`, 'forgetDisk 1so47cqrv6kor7anvxm') })
         await vi.waitFor(() => expect(queue(h)).toEqual([]))
-        await vi.waitFor(() => expect(traces(log).filter(t => t.command?.startsWith('forgetDisk') && t.status !== 'pending' && t.status !== 'running').length).toBe(2))
+        await vi.waitFor(() => expect(traces(log).filter(t => t.command?.startsWith('forgetDisk') && t.status !== 'running').length).toBe(2))
         expect(h.doc()!.diskDB[DISK as any]).toBeUndefined()
         const ts = traces(log).filter(t => t.command?.startsWith('forgetDisk'))
         for (const t of ts) expect({ c: t.command, s: t.status, e: t.errorMessage ?? null }).toEqual({ c: t.command, s: "ok", e: null })
