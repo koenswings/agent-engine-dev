@@ -31,7 +31,7 @@ import { Disk, diskMountRoot } from './Disk.js'
 import { App, createOrUpdateApp } from './App.js'
 import { assertNoExternalLinks, setComposeInstanceName } from './InstanceCopy.js'
 import { splitArgs } from '../utils/commandUtils.js'
-import { trackInFlight } from './InstanceInFlight.js'
+import { assertSameDockAfterWait, dockIdentityOf, trackInFlight } from './InstanceInFlight.js'
 
 // ── Internet probe ────────────────────────────────────────────────────────────
 
@@ -147,6 +147,9 @@ export const installAppFromDisk = async (
 ): Promise<void> => {
     const sourceDevice = sourceDisk.device
     const targetDevice = targetDisk.device
+    // #170: the copies below can take minutes; an eject/erase/re-dock meanwhile must not get a store record
+    const targetDock = dockIdentityOf(targetDisk)
+    const recheck = (step: string) => assertSameDockAfterWait(storeHandle.doc(), String(targetDisk.id), targetDock, `installApp '${appId}' on '${targetDisk.name}' (${step})`)
 
     if (!sourceDevice) throw new Error(`Source disk '${sourceDisk.name}' is not docked`)
     if (!targetDevice) throw new Error(`Target disk '${targetDisk.name}' is not docked`)
@@ -201,6 +204,7 @@ export const installAppFromDisk = async (
     }
 
     // Register app in store
+    recheck('before registering the app')
     await createOrUpdateApp(storeHandle, appId, targetDisk)
 
     const instanceDir = `${targetInstanceBase}/${instanceId}`
@@ -231,6 +235,7 @@ export const installAppFromDisk = async (
     }
 
     // processInstance registers the new instance in the store and starts it
+    recheck('before registering the instance')
     const { processInstance } = await import('./Disk.js')
     await processInstance(storeHandle, targetDisk, instanceId as any)
 
@@ -323,6 +328,7 @@ const installAppRouted = async (
         const { name: appName, version } = parseAppId(refAppId)
         if (!appName || !version) throw new Error(`installApp: cannot read an app name and version from '${refAppId}'. Use <name>-<version> or <name>@<git ref>.`)
         const targetDevice = targetDisk.device!
+        const targetDock = dockIdentityOf(targetDisk)
         const instanceId = await buildInstance(instanceName, appName, gitAccount, version, targetDevice as any)
         if (!instanceId) {
             throw new Error(`installApp: GitHub build of '${opts.appId}' on disk '${targetDisk.name}' failed (see Engine log)`)
@@ -331,6 +337,8 @@ const installAppRouted = async (
         // app and the instance in the store and start it, exactly like the local route
         // (installAppFromDisk). Without this the instance stayed invisible (no instanceDB row,
         // no container) until the disk was next re-docked.
+        // #170: the build can take minutes; never register on a dock that changed meanwhile
+        assertSameDockAfterWait(storeHandle.doc(), String(targetDisk.id), targetDock, `installApp '${opts.appId}' on '${targetDisk.name}' (GitHub build)`)
         await createOrUpdateApp(storeHandle, opts.appId, targetDisk as Disk)
         const { processInstance } = await import('./Disk.js')
         await processInstance(storeHandle, targetDisk as Disk, instanceId)

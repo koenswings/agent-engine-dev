@@ -84,7 +84,7 @@ describe('peerSsh: one ssh-options builder for every peer call', () => {
         const peer = { host: '10.0.0.4', engineId: 'ENGINE_d4' }
         expect(rsyncToPeerArgs('/apps/kolibri-1.0/', peer, receiveAppArgs('sdb1', 'kolibri-1.0'))).toEqual([
             '-a', '--info=progress2', '--no-inc-recursive',
-            '-e', `ssh ${peerSshOptions('ENGINE_d4').join(' ')}`,
+            '-e', `ssh ${peerSshOptions('ENGINE_d4').join(' ')} -c chacha20-poly1305@openssh.com`,
             '--rsync-path=sudo -n /usr/local/sbin/idea-app-data receive-app sdb1 kolibri-1.0',
             '--', '/apps/kolibri-1.0/', 'pi@10.0.0.4:.',
         ])
