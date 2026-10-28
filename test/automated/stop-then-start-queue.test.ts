@@ -9,6 +9,7 @@ import { DocHandle, Repo } from '@automerge/automerge-repo'
 
 const events: string[] = []
 let releaseStop: () => void = () => {}
+let releaseStart: (() => void) | null = null
 
 vi.mock('../../src/data/Instance.js', async (importOriginal) => {
     const actual = await importOriginal<any>()
@@ -19,7 +20,12 @@ vi.mock('../../src/data/Instance.js', async (importOriginal) => {
             await new Promise<void>(r => { releaseStop = r })
             events.push('stop:end')
         }),
-        startInstance: vi.fn(async () => { events.push('start') }),
+        startInstance: vi.fn(async () => {
+            if (!releaseStart) { events.push('start'); return }
+            events.push('start:begin')
+            await new Promise<void>(r => { releaseStart = r })
+            events.push('start:end')
+        }),
     }
 })
 
@@ -37,6 +43,7 @@ describe('stopInstance is awaited (#239)', () => {
     let err: ReturnType<typeof vi.spyOn>
     beforeEach(async () => {
         events.length = 0
+        releaseStart = null
         err = vi.spyOn(console, 'error').mockImplementation(() => {})
         h = new Repo({ network: [], storage: undefined }).create<Store>({
             engineDB: {}, diskDB: {}, appDB: {}, instanceDB: {}, userDB: {}, operationDB: {},
@@ -63,6 +70,22 @@ describe('stopInstance is awaited (#239)', () => {
         expect(stopTrace?.status).toBe('running')
         releaseStop()
         await vi.waitFor(() => expect(events).toEqual(['stop:begin', 'stop:end', 'start']))
+        await vi.waitFor(() => expect(traces().find(t => t.command === 'stopInstance')?.status).toBe('ok'))
+    })
+
+    it('a stopInstance queued right after startInstance runs only after the start finished', async () => {
+        releaseStart = () => {}
+        enableStoreMonitor(h, log)
+        h.change(d => { (d.engineDB[localEngineId].commands as any[]).push(`startInstance ${INST} ${DISK}`, `stopInstance ${INST} ${DISK}`) })
+        await vi.waitFor(() => expect(events).toContain('start:begin'))
+        await new Promise(r => setTimeout(r, 200))
+        expect(events).toEqual(['start:begin'])
+        expect(traces().find(t => t.command === 'startInstance')?.status).toBe('running')
+        releaseStart!()
+        await vi.waitFor(() => expect(events).toContain('stop:begin'))
+        expect(events.slice(0, 3)).toEqual(['start:begin', 'start:end', 'stop:begin'])
+        releaseStop()
+        await vi.waitFor(() => expect(traces().find(t => t.command === 'startInstance')?.status).toBe('ok'))
         await vi.waitFor(() => expect(traces().find(t => t.command === 'stopInstance')?.status).toBe('ok'))
     })
 })

@@ -226,7 +226,9 @@ const startInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instan
     // disks that appear undocked in the CRDT but are physically still attached.
     const disk = (instance.storedOn ? getDisk(store, instance.storedOn) : undefined) ?? findDiskByName(store, diskName)
     if (!disk) throw new Error(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`)
-    startInstance(storeHandle, instance, disk, cause)
+    // #239 (Steve): await the start too, so a stopInstance queued behind it cannot run mid-start
+    // and the start trace closes only once the start is done.
+    await startInstance(storeHandle, instance, disk, cause)
 }
 
 const runInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName) => {
