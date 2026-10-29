@@ -39,7 +39,17 @@ No SSH, nothing started, no device identity. Inside `chroot <MNT>`:
 4. Docker from the pinned debs, enabled, not started; pi in the docker group; `daemon.json`.
 5. Tailscale from the pinned tarball (`tailscale` in /usr/bin, `tailscaled` in /usr/sbin, as the Debian package) + unit, NOT enabled, no key, no state
    (idea-engine-identity enables it on first boot when the card carries a key, engine#291).
-6. Node, pnpm, pm2 from the cache (pinned, checked); `pnpm install --frozen-lockfile --offline` + `pnpm build` as pi.
+6. Node from the cache (SHASUMS256 checked). pnpm, pm2 and pm2-logrotate with their WHOLE dependency trees: each tree is
+   pinned by a committed lockfile (`script/build_image_assets/npm-tools/<tool>/package-lock.json`, integrity per package);
+   `script/archive-npm-tools.sh` installs it with `npm ci` and packs the tool with bundleDependencies (byte-identical on
+   re-run), listing the tarballs in `<cache>/npm-global/NPM-TOOLS.tsv`. The lock's `npmTools` records version, lockfile
+   sha256 and tarball sha256 (a `--lock` rebuild must match). In the chroot: sha256 checked, then `npm install -g` with
+   `--offline`, an unreachable registry and an empty cache; pm2 is never run there (any pm2 command starts its daemon).
+   pm2-logrotate goes to the preload folder; first boot `pm2 install`s it, also with no registry. Verify checks versions,
+   that every dependency is bundled and present, the bin links, and the preload sha256.
+   Then `pnpm install --frozen-lockfile --offline` + `pnpm build` as pi, with no registry and no pnpm self-download
+   (packageManager must equal the locked pnpm). Upgrading a tool: edit `npm-tools/<tool>/package.json` and regenerate
+   its lockfile (`npm install --package-lock-only --install-strategy=shallow --omit=dev --os linux --cpu arm64`).
 7. Docker images (pinned by digest) copied as docker-save tarballs to `/var/lib/idea/preload/docker/` with `images.lock`.
 8. Units: `pm2-pi.service` (User=pi, `pm2 resurrect`; written, not `pm2 startup`), `idea-engine-firstboot.service`,
    and Raspberry Pi OS's `regenerate_ssh_host_keys.service`, all enabled with docker, avahi-daemon and ssh.
