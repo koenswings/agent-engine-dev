@@ -196,21 +196,21 @@ describe('startup version check', () => {
     it('passes when the helper reports this version', async () => {
         process.env.FAKE_SUDO_OUT = `idea-app-data ${APP_DATA_HELPER_VERSION}`
         expect(await appDataHelperProblem()).toBeNull()
-        await expect(assertAppDataHelper()).resolves.toBeUndefined()
+        await expect(assertAppDataHelper()).resolves.toBeNull()
         expect((await sudoCalls())[0]).toEqual(['-n', '/usr/local/sbin/idea-app-data', 'version'])
     })
 
-    it('refuses to start on a version mismatch, saying ask Ops to update', async () => {
+    it('starts anyway on a version mismatch and returns the problem, saying ask Ops to update', async () => {
         process.env.FAKE_SUDO_OUT = 'idea-app-data 0'
-        await expect(assertAppDataHelper()).rejects.toThrow(new RegExp(
+        await expect(assertAppDataHelper()).resolves.toMatch(new RegExp(
             `needs the app-data root helper /usr/local/sbin/idea-app-data version ${APP_DATA_HELPER_VERSION}, but the installed one reports 'idea-app-data 0'; ask Ops to update`,
         ))
     })
 
-    it('refuses to start when the helper is missing or sudo will not run it', async () => {
+    it('starts anyway when the helper is missing or sudo will not run it', async () => {
         process.env.FAKE_SUDO_ERR = 'sudo: a password is required'
         process.env.FAKE_SUDO_EXIT = '1'
-        await expect(assertAppDataHelper()).rejects.toThrow(/cannot be run with sudo -n .*ask Ops to update the Engine's root helper/)
+        await expect(assertAppDataHelper()).resolves.toMatch(/cannot be run with sudo -n .*ask Ops to update the Engine's root helper/)
     })
 
     it('the real helper script passes the check (fake sudo execs it)', async () => {
@@ -224,7 +224,7 @@ describe('startup version check', () => {
     it('isDev skips the check (dev containers have no helper)', async () => {
         config.settings.isDev = true
         process.env.FAKE_SUDO_EXIT = '1'
-        await expect(assertAppDataHelper()).resolves.toBeUndefined()
+        await expect(assertAppDataHelper()).resolves.toBeNull()
         expect(await sudoCalls()).toEqual([])
     })
 })

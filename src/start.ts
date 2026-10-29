@@ -62,9 +62,8 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     log(`  Endianness: ${os.endianness()}`)
     log(`  Network Hostname: ${os.hostname()}`)
 
-    // The app-data root helper (idea#168) must be installed, allowed by sudoers and
-    // the version this Engine speaks; otherwise refuse to start with an "ask Ops to
-    // update" message (copy, move, backup and restore of app data depend on it).
+    // The app-data root helper (idea#168): checked and logged, never fatal (Steve,
+    // 2026-10-28). Commands that need a newer helper refuse with HELPER_OUTDATED.
     await assertAppDataHelper()
     // borg: loud but not fatal (only Backup Disks need it)
     reportBorgAtStartup()
