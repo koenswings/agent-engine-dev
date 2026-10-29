@@ -108,6 +108,13 @@ These commands perform actions on the system. Some are restricted to an `engine`
 - **Usage:** `restoreApp <instanceId|instanceName> <targetDiskId>` (idea#168). The instance is an instance id or a unique instance name (see [Instance arguments](#instance-arguments)); the target disk goes through the shared disk resolver (see [Disk arguments](#disk-arguments)). Every refusal ends the command trace as `error` with the reason. The trace arg keys stay `instanceName` and `backupDiskId` (the latter holds the target disk).
 - **Scope:** `engine`
 
+### `removeInstance`
+`removeInstance <instanceId>` (capability `removeInstance`, idea#347). Removes a stopped instance on a disk docked to this Engine without deleting any data. Under the instance lock it runs `docker compose -p <id> down` (never `-v`, so named volumes are kept), then the root helper `idea-app-data quarantine <root> <id>` (helper v4) renames `instances/<id>` to `<disk>/.idea-quarantine/<id>-<UTC stamp>` (root-owned, 0700). Only then is the instance record dropped from the store. The `removeInstance` log entry and History name the quarantine path and the kept volumes. Nothing is ever purged automatically; clearing `.idea-quarantine` needs Koen's OK. Disk scans, listing, backups and space accounting ignore `.idea-quarantine`.
+
+Refusals (code at the start of the error text; the store is untouched): `NOT_FOUND`, `NOT_LOCAL`, `AMBIGUOUS`, `RUNNING` (Running/Starting), `BUSY_BACKUP` (backup/restore holds the lock), `BUSY_MOVE` (move/copy holds it), `BUSY` (other holder), `COMPOSE_DOWN_FAILED`, `QUARANTINE_FAILED`, `HELPER_OUTDATED` (root helper older than v4).
+
+**Helper version:** the Engine always starts, whatever `idea-app-data` version is installed; a missing or different helper is only logged as a warning at startup. Commands that need a newer helper refuse with `HELPER_OUTDATED`: `removeInstance` needs v4 (and `updateApp` v5).
+
 ### `createBackupDisk`
 - **Description:** Writes a BACKUP.yaml configuration onto a docked disk, turning it into a Backup Disk. Specify the mode (`immediate`, `on-demand`, or `scheduled`) and one or more instance names to link.
 - **Usage:** `createBackupDisk <diskId> <mode> <instanceName...>` (idea#128; the argument was `diskName`). The disk is resolved by the shared disk resolver (see [Disk arguments](#disk-arguments)). An unknown, undocked, remote or ambiguous disk, a bad mode or a missing store ends the command trace as `error` with the reason.
