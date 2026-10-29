@@ -44,6 +44,8 @@ export interface CommandTrace {
 export interface CommandLogStore {
   traces: Record<string, CommandTrace>
   recentTraceIds: string[]  // insertion-ordered ring buffer, max MAX_TRACES entries
+  /** #158: storeTag of the fleet whose Engine wrote this log; another tag = a foreign log, never served. */
+  storeTag?: string
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -101,7 +103,13 @@ export interface CommandLogStoreOptions {
   archiveDir?: string
   /** Size cap of archiveDir in bytes; oldest archives are deleted until under it. Default: settings.commandLogArchiveMaxBytes (1 GB) */
   archiveMaxBytes?: number
+  /** #158: this fleet's storeTag, stamped on every log this Engine creates (and backfilled on load). */
+  storeTag?: string
 }
+
+/** storeTag stamped on new command logs (#158); set by createCommandLogStore. */
+let _storeTag: string | undefined
+const tagged = (): CommandLogStore => ({ traces: {}, recentTraceIds: [], ...(_storeTag ? { storeTag: _storeTag } : {}) })
 
 /**
  * Load the doc at `url`, giving up after `timeoutMs` (idea#145). Rejects when
@@ -150,6 +158,7 @@ export const createCommandLogStore = async (
 ): Promise<DocHandle<CommandLogStore>> => {
   const urlFile = options.urlFile ?? defaultUrlFile()
   const timeoutMs = options.timeoutMs ?? COMMAND_LOG_LOAD_TIMEOUT_MS
+  if (options.storeTag) _storeTag = options.storeTag
 
   let handle: DocHandle<CommandLogStore>
 
@@ -168,6 +177,11 @@ export const createCommandLogStore = async (
     handle = await _createFresh(repo, urlFile)
   }
 
+  // #158: logs created before the tag existed get our tag (this is our own log, by our url file)
+  if (_storeTag && handle.doc() && !handle.doc().storeTag) {
+    handle.change(d => { d.storeTag = _storeTag })
+    log(`[commandLog] Stamped storeTag ${_storeTag} on ${handle.url}`)
+  }
   _handle = handle
   const today = localDay(options.now?.() ?? new Date())
   if (!existingUrl || handle.url !== existingUrl) {
@@ -266,7 +280,7 @@ const _rotate = async (repo: Repo, options: CommandLogStoreOptions): Promise<Doc
   const old = _handle
   const oldDay = _currentDay ?? 'unknown'
 
-  const fresh = repo.create<CommandLogStore>({ traces: {}, recentTraceIds: [] })
+  const fresh = repo.create<CommandLogStore>(tagged())
   await fresh.whenReady()
 
   // Snapshot + carry + switch with no await in between, so no write is lost.
@@ -397,10 +411,7 @@ const _createFresh = async (
   repo: Repo,
   urlFile: string
 ): Promise<DocHandle<CommandLogStore>> => {
-  const handle = repo.create<CommandLogStore>({
-    traces: {},
-    recentTraceIds: [],
-  })
+  const handle = repo.create<CommandLogStore>(tagged())
   await handle.whenReady()
   await fs.ensureDir(path.dirname(urlFile))
   await fs.writeFile(urlFile, handle.url)

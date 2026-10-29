@@ -1,3 +1,4 @@
+import { storeTag } from './data/StoreScope.js'
 import os from 'os'
 import { enableUsbDeviceMonitor } from './monitors/usbDeviceMonitor.js'
 import { runDiskDetectionSelfCheck, recordDiskDetectionFailure, errorMessage } from './monitors/diskDetection.js'
@@ -170,7 +171,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
 
     // Create the command log store and initialise the console patcher
     log(chalk.bgMagenta('STARTING COMMAND LOG STORE'))
-    const commandLogHandle = await createCommandLogStore(repo)
+    const commandLogHandle = await createCommandLogStore(repo, { storeTag: storeTag(storeDocId) })
     initCommandLogger(commandLogHandle)
     // idea#183: fresh CommandLog doc each local day, previous one archived
     startCommandLogRotation(repo)
