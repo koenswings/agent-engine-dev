@@ -125,7 +125,7 @@ describe('command log never hangs on an unavailable command-log-url.txt (idea#14
 
     it('the default timeout is 10 s and start.ts still uses createCommandLogStore', () => {
         expect(COMMAND_LOG_LOAD_TIMEOUT_MS).toBe(10_000)
-        expect(fs.readFileSync(path.join(ROOT, 'src/start.ts'), 'utf-8')).toContain('await createCommandLogStore(repo)')
+        expect(fs.readFileSync(path.join(ROOT, 'src/start.ts'), 'utf-8')).toMatch(/await createCommandLogStore\(repo[,)]/)
     })
 })
 
