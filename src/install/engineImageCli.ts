@@ -14,7 +14,7 @@ import crypto from 'crypto'
 import { config } from '../data/Config.js'
 import {
     EngineLock, FIRSTBOOT_SCRIPT, IMAGE_ENABLED_UNITS, ImageArgs, LOCK_SCHEMA, LockedFile, LockedImage, UsageError,
-    imageIdFromManifest, imageTarName, parseDockerPins, readLock, serialiseLock, sha256File, validateLock, verifyRootfs,
+    imageIdFromManifest, imageTarName, parseDockerPins, readLock, serialiseLock, sha256File, validateLock, verifyRootfsChecks, VERIFY_CHECKS,
 } from './engineImage.js'
 import { NpmTool, NPM_TOOL_INSTALL } from './engineImage.js'
 import { Installers, Runner, realRunner, runRootfsBuild } from './engineRootfs.js'
@@ -119,14 +119,13 @@ export const piUidOf = async (root: string): Promise<number | undefined> => {
 }
 
 export interface Report { engine_commit: string, engine_version: string, lock_sha256: string, verify: { passed: number, failed: string[] } }
-export const VERIFY_CHECK_COUNT = 9
 
-export const writeReport = async (file: string | undefined, lock: EngineLock | undefined, lockText: string, problems: string[]) => {
+export const writeReport = async (file: string | undefined, lock: EngineLock | undefined, lockText: string, problems: string[], passed = 0) => {
     if (!file) return
     const r: Report = {
         engine_commit: lock?.engineCommit ?? '', engine_version: lock?.engineVersion ?? '',
         lock_sha256: lockText ? crypto.createHash('sha256').update(lockText).digest('hex') : '',
-        verify: { passed: problems.length ? 0 : VERIFY_CHECK_COUNT, failed: problems },
+        verify: { passed, failed: problems },
     }
     await fs.ensureDir(path.dirname(file)); await fs.writeFile(file, JSON.stringify(r, null, 2) + '\n')
 }
@@ -164,9 +163,10 @@ export const runImageMode = async (a: ImageArgs, repo: string): Promise<number> 
     if (a.mode === 'verify') {
         const lock = await readLock(a.lock!)
         const commit = lock.engineCommit
-        const problems = await verifyRootfs({ root, enginePath, lock, storeIdentity: await trackedStoreIdentity(repo, commit), piUid: await piUidOf(root) })
+        const checks = await verifyRootfsChecks({ root, enginePath, lock, storeIdentity: await trackedStoreIdentity(repo, commit), piUid: await piUidOf(root) })
+        const problems = checks.flatMap(x => x.problems)
         problems.forEach(p => console.error(`verify: ${p}`))
-        await writeReport(a.report, lock, await fs.readFile(a.lock!, 'utf8'), problems)
+        await writeReport(a.report, lock, await fs.readFile(a.lock!, 'utf8'), problems, checks.filter(x => !x.problems.length).length)
         console.log(problems.length ? `verify FAILED (${problems.length})` : 'verify OK')
         return problems.length ? 1 : 0
     }
@@ -200,15 +200,17 @@ export const runImageMode = async (a: ImageArgs, repo: string): Promise<number> 
     await writeReport(a.report, lock, lockText, ['build did not finish (see the log)'])
     let problems: string[]
     let finalLock = lockText
+    let passed = 0
     try {
         const res = await runRootfsBuild(opts, runner, inst, lockText, await piUidOf(root))
-        problems = res.problems; finalLock = res.lockText
+        problems = res.problems; passed = res.passed; finalLock = res.lockText
     } catch (e) {
         problems = [`build step failed: ${e instanceof Error ? e.message : e}`]
     }
     if (a.dryRun) log.forEach(l => console.log(l))
     problems.forEach(p => console.error(`verify: ${p}`))
-    await writeReport(a.report, lock, finalLock, problems)
+    await writeReport(a.report, lock, finalLock, problems, passed)
+    console.log(`verify: ${passed}/${VERIFY_CHECKS.length} checks passed`)
     console.log(problems.length ? `engine offline build FAILED (${problems.length})` : `engine offline build OK (${lock.engineCommit})`)
     return problems.length ? 1 : 0
 }

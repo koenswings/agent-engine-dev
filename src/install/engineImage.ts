@@ -357,10 +357,20 @@ export interface VerifyContext {
 const modeOf = (st: { mode: number }) => '0' + (st.mode & 0o777).toString(8).padStart(3, '0')
 
 /** Every check a built rootfs must pass. Returns problems; empty = OK. Read-only. */
-export const verifyRootfs = async (c: VerifyContext): Promise<string[]> => {
-    const p: string[] = []
+/** verify's checks, in order; the report counts how many passed (VERIFY_CHECKS.length in all). */
+export const VERIFY_CHECKS = ['identity', 'store-identity', 'engine-tree', 'pm2-as-pi', 'enabled-units', 'locked-files', 'permissions', 'npm-tools', 'docker-preload', 'packages', 'lock-in-image'] as const
+export interface VerifyCheckResult { name: string, problems: string[] }
+
+export const verifyRootfs = async (c: VerifyContext): Promise<string[]> => (await verifyRootfsChecks(c)).flatMap(x => x.problems)
+
+/** verify, per check: every name in VERIFY_CHECKS, each with its problems (none = passed). */
+export const verifyRootfsChecks = async (c: VerifyContext): Promise<VerifyCheckResult[]> => {
+    const results: VerifyCheckResult[] = []
+    let p: string[] = []
+    const check = (name: (typeof VERIFY_CHECKS)[number]) => { p = []; results.push({ name, problems: p }) }
     const R = (rel: string) => path.join(c.root, rel)
     const eng = R(c.enginePath)
+    check('identity')
     // 1. no identity
     for (const pat of IDENTITY_PATHS) for (const f of await globRel(c.root, pat)) p.push(`identity/runtime state present: /${path.relative(c.root, f)}`)
     for (const rel of ENGINE_RUNTIME_PATHS) if (await fs.pathExists(path.join(eng, rel))) p.push(`Engine runtime state present: ${c.enginePath}/${rel}`)
@@ -369,6 +379,7 @@ export const verifyRootfs = async (c: VerifyContext): Promise<string[]> => {
     else if ((await fs.readFile(mid, 'utf8')).trim() !== '' ) p.push('/etc/machine-id is not empty')
     const hn = R('etc/hostname')
     if (!(await fs.pathExists(hn)) || (await fs.readFile(hn, 'utf8')).trim() !== GENERIC_HOSTNAME) p.push(`/etc/hostname must be the generic ${GENERIC_HOSTNAME}`)
+    check('store-identity')
     // 2. store identity: exactly the tracked files, byte-identical (store-template.json never modified)
     const sid = path.join(eng, 'store-identity')
     const have = (await fs.pathExists(sid)) ? await fs.readdir(sid) : []
@@ -377,6 +388,7 @@ export const verifyRootfs = async (c: VerifyContext): Promise<string[]> => {
         else if (await sha256File(path.join(sid, n)) !== c.storeIdentity[n]) p.push(`store-identity/${n} differs from git (${n === 'store-template.json' ? 'store-template.json must never change' : 'modified'})`)
     }
     for (const n of Object.keys(c.storeIdentity)) if (!have.includes(n)) p.push(`store-identity/${n} missing`)
+    check('engine-tree')
     // 3. Engine tree at the locked commit, built, owned by pi
     const head = path.join(eng, '.git/HEAD')
     if (!(await fs.pathExists(head))) p.push(`${c.enginePath}/.git/HEAD missing`)
@@ -389,16 +401,16 @@ export const verifyRootfs = async (c: VerifyContext): Promise<string[]> => {
             if (await fs.pathExists(f) && (await fs.lstat(f)).uid !== c.piUid) p.push(`${c.enginePath}/${rel} is not owned by pi`)
         }
     }
+    check('pm2-as-pi')
     // 4. pm2 as pi, never root
     const pm2 = R(`etc/systemd/system/${PM2_UNIT}`)
     if (!(await fs.pathExists(pm2))) p.push(`${PM2_UNIT} missing`)
     else if (!/^User=pi$/m.test(await fs.readFile(pm2, 'utf8'))) p.push(`${PM2_UNIT} must run as User=pi`)
     if (await fs.pathExists(R('etc/systemd/system/pm2-root.service'))) p.push('pm2-root.service present: pm2 must never run as root')
+    check('enabled-units')
     // 5. enabled units
-    for (const u of c.lock.enabledUnits) {
-        const wants = R(`etc/systemd/system/multi-user.target.wants/${u}`)
-        if (!(await isSymlink(wants)) && !(await fs.pathExists(wants))) p.push(`unit ${u} is not enabled`)
-    }
+    for (const u of c.lock.enabledUnits) if (!(await unitEnabled(c.root, u))) p.push(`unit ${u} is not enabled`)
+    check('locked-files')
     // 6. locked files: content, mode, owner
     for (const f of c.lock.files) {
         const fp = R(f.path.slice(1))
@@ -409,6 +421,7 @@ export const verifyRootfs = async (c: VerifyContext): Promise<string[]> => {
         if (f.owner === 'root' && st.uid !== 0) p.push(`${f.path} must be owned by root`)
         if (f.owner === 'pi' && c.piUid !== undefined && st.uid !== c.piUid) p.push(`${f.path} must be owned by pi`)
     }
+    check('permissions')
     // 7. permissions that must hold whatever the lock says
     for (const [rel, want] of [['var/lib/idea-app-data', '0700'], ['etc/tailscale', '0700']] as const) {
         if (await fs.pathExists(R(rel))) { const m = modeOf(await fs.stat(R(rel))); if (m !== want) p.push(`/${rel} mode ${m}, must be ${want}`) }
@@ -416,6 +429,7 @@ export const verifyRootfs = async (c: VerifyContext): Promise<string[]> => {
     if (await fs.pathExists(R('etc/sudoers.d'))) for (const n of await fs.readdir(R('etc/sudoers.d'))) {
         const st = await fs.stat(R(`etc/sudoers.d/${n}`)); if (modeOf(st) !== '0440' || st.uid !== 0) p.push(`/etc/sudoers.d/${n} must be root 0440`)
     }
+    check('npm-tools')
     // 7b. npm tools: global installs at the locked version with their whole bundled tree; preloads by sha256
     for (const t of c.lock.npmTools ?? []) {
         if (t.install === 'preload') {
@@ -436,6 +450,7 @@ export const verifyRootfs = async (c: VerifyContext): Promise<string[]> => {
         for (const bin of Object.keys(typeof meta.bin === 'string' ? { [t.name]: meta.bin } : meta.bin ?? {}))
             if (!(await isSymlink(R(`usr/local/bin/${bin}`))) && !(await fs.pathExists(R(`usr/local/bin/${bin}`)))) p.push(`/usr/local/bin/${bin} missing`)
     }
+    check('docker-preload')
     // 8. preloaded Docker images
     for (const i of c.lock.dockerImages) {
         const t = R(path.join(PRELOAD_DOCKER_DIR, i.tar).slice(1))
@@ -444,6 +459,7 @@ export const verifyRootfs = async (c: VerifyContext): Promise<string[]> => {
     }
     const manifest = R(path.join(PRELOAD_DOCKER_DIR, 'images.lock').slice(1))
     if (c.lock.dockerImages.length && !(await fs.pathExists(manifest))) p.push(`${PRELOAD_DOCKER_DIR}/images.lock missing`)
+    check('packages')
     // 9. packages at their pinned versions: Raspberry Pi pins, Docker debs, the recorded RPi archive set and all packages
     const status = new Map((await readDpkgStatus(c.root)).map(x => [x.pkg, x.version]))
     if (status.size) {
@@ -454,20 +470,67 @@ export const verifyRootfs = async (c: VerifyContext): Promise<string[]> => {
             else if (got !== w.version) p.push(`package ${w.pkg} ${got}, lock says ${w.version}`)
         }
     } else if (c.lock.aptPins.length || c.lock.dockerDebs.length) p.push('no dpkg status in the rootfs: pinned packages cannot be checked')
+    check('lock-in-image')
     // 10. the lock itself is in the image
     if (!(await fs.pathExists(R(IMAGE_LOCK_PATH.slice(1))))) p.push(`${IMAGE_LOCK_PATH} missing`)
     if (!(await fs.pathExists(R(IMAGE_VERSION_PATH.slice(1))))) p.push(`${IMAGE_VERSION_PATH} missing`)
-    return p
+    return results
 }
 
-/** Installed packages from <root>/var/lib/dpkg/status (Status: install ok installed). Multi-arch names keep the bare name. */
+const UNIT_DIRS = ['etc/systemd/system', 'usr/lib/systemd/system', 'lib/systemd/system']
+
+/** [Install] WantedBy= and RequiredBy= targets of a unit in <root> (first unit file found, systemd's order). */
+export const unitInstallTargets = async (root: string, unit: string): Promise<{ found: boolean, wants: string[], requires: string[] }> => {
+    for (const d of UNIT_DIRS) {
+        const f = path.join(root, d, unit)
+        if (!(await fs.pathExists(f)) || (await fs.stat(f)).isDirectory()) continue
+        const wants: string[] = [], requires: string[] = []
+        let inInstall = false
+        for (const raw of (await fs.readFile(f, 'utf8')).split('\n')) {
+            const l = raw.trim()
+            if (l.startsWith('[')) { inInstall = l === '[Install]'; continue }
+            if (!inInstall) continue
+            const m = l.match(/^(WantedBy|RequiredBy)\s*=\s*(.*)$/)
+            if (m) (m[1] === 'WantedBy' ? wants : requires).push(...m[2].split(/\s+/).filter(Boolean))
+        }
+        return { found: true, wants, requires }
+    }
+    return { found: false, wants: [], requires: [] }
+}
+
+const linkAt = async (p: string) => (await isSymlink(p)) || (await fs.pathExists(p))
+
+/** Every /etc/systemd/system/*.wants|*.requires/<unit> link in <root>. */
+export const unitLinks = async (root: string, unit: string): Promise<string[]> => {
+    const base = path.join(root, 'etc/systemd/system')
+    if (!(await fs.pathExists(base))) return []
+    const out: string[] = []
+    for (const d of await fs.readdir(base)) {
+        if (!/\.(wants|requires)$/.test(d)) continue
+        if (await linkAt(path.join(base, d, unit))) out.push(`/etc/systemd/system/${d}/${unit}`)
+    }
+    return out.sort()
+}
+
+/** Enabled = linked in a .wants/ (WantedBy) or .requires/ (RequiredBy) dir its [Install] names; a unit with no
+ *  unit file or no [Install] targets in the rootfs counts as enabled when linked in any .wants/.requires dir. */
+export const unitEnabled = async (root: string, unit: string): Promise<boolean> => {
+    const t = await unitInstallTargets(root, unit)
+    const dirs = [...t.wants.map(x => `${x}.wants`), ...t.requires.map(x => `${x}.requires`)]
+    if (!dirs.length) return (await unitLinks(root, unit)).length > 0
+    for (const d of dirs) if (await linkAt(path.join(root, 'etc/systemd/system', d, unit))) return true
+    return false
+}
+
+/** Installed packages from <root>/var/lib/dpkg/status (Status: install|hold ok installed). Multi-arch names keep the bare name. */
 export const readDpkgStatus = async (root: string): Promise<{ pkg: string, version: string, arch: string }[]> => {
     const f = path.join(root, 'var/lib/dpkg/status')
     if (!(await fs.pathExists(f))) return []
     const out: { pkg: string, version: string, arch: string }[] = []
     for (const block of (await fs.readFile(f, 'utf8')).split(/\n\n+/)) {
         const field = (k: string) => block.match(new RegExp(`^${k}: (.*)$`, 'm'))?.[1]?.trim()
-        if (field('Status') !== 'install ok installed') continue
+        // "<want> ok installed": install or hold (apt-mark hold); never half-installed, config-files, unpacked...
+        if (!/^(install|hold) ok installed$/.test(field('Status') ?? '')) continue
         const pkg = field('Package'), version = field('Version')
         if (pkg && version) out.push({ pkg, version, arch: field('Architecture') ?? '' })
     }

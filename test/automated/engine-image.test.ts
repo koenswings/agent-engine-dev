@@ -10,10 +10,10 @@ import crypto from 'crypto'
 import {
     parseImageArgs, UsageError, validateLock, serialiseLock, writeLock, readLock, LOCK_SCHEMA, EngineLock,
     sanitiseRootfs, verifyRootfs, IDENTITY_PATHS, GENERIC_HOSTNAME, IMAGE_ENABLED_UNITS, PM2_UNIT, SSH_REGEN_UNIT,
-    pm2UnitText, preloadManifest, imageIdFromManifest, imageTarName, readDpkgStatus, PRELOAD_DOCKER_DIR, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH,
+    pm2UnitText, preloadManifest, imageIdFromManifest, imageTarName, readDpkgStatus, unitEnabled, unitLinks, unitInstallTargets, verifyRootfsChecks, VERIFY_CHECKS, PRELOAD_DOCKER_DIR, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH,
 } from '../../src/install/engineImage.js'
 import { rootfsSteps, runRootfsBuild, Runner, Installers, SHIMS, quoteTemplate } from '../../src/install/engineRootfs.js'
-import { pinNpmTools } from '../../src/install/engineImageCli.js'
+import { pinNpmTools, writeReport } from '../../src/install/engineImageCli.js'
 import { diskIdWithoutHardware, hasDiskId, ensureSystemMeta } from '../../src/data/Meta.js'
 
 const ENGINE = '/home/pi/idea/agents/agent-engine-dev'
@@ -171,6 +171,63 @@ const writeDpkg = async (root: string, pkgs: [string, string][]) => {
     await fs.writeFile(path.join(root, 'var/lib/dpkg/status'), pkgs.map(([p, v]) => `Package: ${p}\nStatus: install ok installed\nArchitecture: arm64\nVersion: ${v}\n`).join('\n') +
         '\nPackage: gone\nStatus: deinstall ok config-files\nArchitecture: arm64\nVersion: 1\n')
 }
+
+describe('verify: held packages, units enabled via [Install], per-check count', () => {
+    let root: string
+    beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'rootfs-')); await goodRootfs(root) })
+    afterEach(async () => { await fs.remove(root) })
+    const R = (p: string) => path.join(root, p)
+    it('dpkg: install/hold ok installed count; half-installed, config-files, unpacked do not', async () => {
+        await fs.ensureDir(R('var/lib/dpkg'))
+        const st = (pkg: string, status: string) => `Package: ${pkg}\nStatus: ${status}\nArchitecture: arm64\nVersion: 1\n`
+        await fs.writeFile(R('var/lib/dpkg/status'), [st('a', 'install ok installed'), st('docker-ce', 'hold ok installed'), st('b', 'install ok half-installed'),
+            st('c', 'deinstall ok config-files'), st('d', 'install ok unpacked'), st('e', 'hold ok half-configured'), st('f', 'purge ok not-installed')].join('\n'))
+        expect((await readDpkgStatus(root)).map(x => x.pkg)).toEqual(['a', 'docker-ce'])
+        const p = (await verifyRootfs({ root, enginePath: ENGINE, lock: lock({ dockerDebs: [{ pkg: 'docker-ce', version: '1', sha256: 'a'.repeat(64) }, { pkg: 'b', version: '1', sha256: 'a'.repeat(64) }] }), storeIdentity: storeShas })).join('\n')
+        expect(p).not.toContain('docker-ce'); expect(p).toContain('package b not installed')
+    })
+    it('a unit is enabled by a link in its WantedBy/RequiredBy dir, from /etc, /usr/lib or /lib unit files', async () => {
+        const W = 'etc/systemd/system'
+        await fs.ensureDir(R('lib/systemd/system')); await fs.ensureDir(R('usr/lib/systemd/system'))
+        await fs.writeFile(R('lib/systemd/system/regenerate_ssh_host_keys.service'), '[Unit]\nDescription=x\n[Install]\nWantedBy=sysinit.target\n')
+        await fs.writeFile(R('usr/lib/systemd/system/req.service'), '[Install]\nRequiredBy=foo.target\nWantedBy=a.target b.target\n')
+        await fs.writeFile(R(`${W}/own.service`), '[Service]\nExecStart=/bin/true\n# WantedBy=fake.target\n[Install]\nWantedBy=multi-user.target\n')
+        // sysinit.target.wants: enabled; multi-user only: not (its [Install] says sysinit)
+        await fs.remove(R(`${W}/multi-user.target.wants/regenerate_ssh_host_keys.service`))
+        await fs.ensureDir(R(`${W}/sysinit.target.wants`)); await fs.symlink('/lib/systemd/system/regenerate_ssh_host_keys.service', R(`${W}/sysinit.target.wants/regenerate_ssh_host_keys.service`))
+        expect(await unitEnabled(root, 'regenerate_ssh_host_keys.service')).toBe(true)
+        expect(await verifyRootfs({ root, enginePath: ENGINE, lock: lock(), storeIdentity: storeShas })).toEqual([])
+        await fs.remove(R(`${W}/sysinit.target.wants/regenerate_ssh_host_keys.service`))
+        await fs.writeFile(R(`${W}/multi-user.target.wants/regenerate_ssh_host_keys.service`), '')
+        expect(await unitEnabled(root, 'regenerate_ssh_host_keys.service')).toBe(false)
+        expect((await verifyRootfs({ root, enginePath: ENGINE, lock: lock(), storeIdentity: storeShas })).join('\n')).toContain('unit regenerate_ssh_host_keys.service is not enabled')
+        // RequiredBy -> .requires; second WantedBy target; /etc unit file wins; nothing linked -> not enabled
+        expect(await unitEnabled(root, 'req.service')).toBe(false)
+        await fs.ensureDir(R(`${W}/foo.target.requires`)); await fs.writeFile(R(`${W}/foo.target.requires/req.service`), '')
+        expect(await unitEnabled(root, 'req.service')).toBe(true)
+        await fs.remove(R(`${W}/foo.target.requires`)); await fs.ensureDir(R(`${W}/b.target.wants`)); await fs.writeFile(R(`${W}/b.target.wants/req.service`), '')
+        expect(await unitEnabled(root, 'req.service')).toBe(true)
+        expect(await unitInstallTargets(root, 'own.service')).toEqual({ found: true, wants: ['multi-user.target'], requires: [] })
+        expect(await unitEnabled(root, 'own.service')).toBe(false)
+        // no unit file in the rootfs: any .wants/.requires link counts
+        expect(await unitEnabled(root, 'nofile.service')).toBe(false)
+        await fs.ensureDir(R(`${W}/graphical.target.wants`)); await fs.writeFile(R(`${W}/graphical.target.wants/nofile.service`), '')
+        expect(await unitEnabled(root, 'nofile.service')).toBe(true)
+        expect(await unitLinks(root, 'nofile.service')).toEqual(['/etc/systemd/system/graphical.target.wants/nofile.service'])
+    })
+    it('the report counts passed checks out of VERIFY_CHECKS; a clean rootfs passes all', async () => {
+        const all = await verifyRootfsChecks({ root, enginePath: ENGINE, lock: lock(), storeIdentity: storeShas })
+        expect(all.map(x => x.name)).toEqual([...VERIFY_CHECKS])
+        expect(all.every(x => !x.problems.length)).toBe(true)
+        await fs.writeFile(R('etc/machine-id'), 'abc\n')
+        await fs.remove(R(`etc/systemd/system/multi-user.target.wants/${PM2_UNIT}`))
+        const bad = await verifyRootfsChecks({ root, enginePath: ENGINE, lock: lock(), storeIdentity: storeShas })
+        expect(bad.filter(x => x.problems.length).map(x => x.name)).toEqual(['identity', 'enabled-units'])
+        const rep = path.join(root, 'r.json')
+        await writeReport(rep, lock(), 'x', bad.flatMap(x => x.problems), bad.filter(x => !x.problems.length).length)
+        expect((await fs.readJson(rep)).verify.passed).toBe(VERIFY_CHECKS.length - 2)
+    })
+})
 
 describe('package pins against dpkg status', () => {
     let root: string
