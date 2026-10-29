@@ -10,9 +10,9 @@ import crypto from 'crypto'
 import {
     parseImageArgs, UsageError, validateLock, serialiseLock, writeLock, readLock, LOCK_SCHEMA, EngineLock,
     sanitiseRootfs, verifyRootfs, IDENTITY_PATHS, GENERIC_HOSTNAME, IMAGE_ENABLED_UNITS, PM2_UNIT, SSH_REGEN_UNIT,
-    pm2UnitText, preloadManifest, imageIdFromManifest, imageTarName, readDpkgStatus, unitEnabled, unitLinks, unitInstallTargets, verifyRootfsChecks, VERIFY_CHECKS, PRELOAD_DOCKER_DIR, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH,
+    pm2UnitText, preloadManifest, imageIdFromManifest, imageTarName, readDpkgStatus, unitEnabled, unitLinks, unitInstallTargets, verifyRootfsChecks, VERIFY_CHECKS, IMAGE_SPARSE_PATTERNS, filesWithAuthKeyShape, PRELOAD_DOCKER_DIR, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH,
 } from '../../src/install/engineImage.js'
-import { rootfsSteps, runRootfsBuild, Runner, Installers, SHIMS, quoteTemplate } from '../../src/install/engineRootfs.js'
+import { rootfsSteps, runRootfsBuild, engineCloneCommand, Runner, Installers, SHIMS, quoteTemplate } from '../../src/install/engineRootfs.js'
 import { pinNpmTools, writeReport } from '../../src/install/engineImageCli.js'
 import { diskIdWithoutHardware, hasDiskId, ensureSystemMeta } from '../../src/data/Meta.js'
 
@@ -119,7 +119,7 @@ const addIdentity = async (root: string) => {
     await fs.writeFile(R('META.yaml'), 'diskId: ABC\nisHardwareId: true\n')
     await fs.ensureDir(R('etc/ssh')); await fs.writeFile(R('etc/ssh/ssh_host_ed25519_key'), 'k')
     await fs.ensureDir(R('var/lib/tailscale')); await fs.writeFile(R('var/lib/tailscale/tailscaled.state'), '{}')
-    await fs.ensureDir(R('etc/tailscale')); await fs.chmod(R('etc/tailscale'), 0o700); await fs.writeFile(R('etc/tailscale/debug-authkey'), 'tskey-auth-FAKE')
+    await fs.ensureDir(R('etc/tailscale')); await fs.chmod(R('etc/tailscale'), 0o700); await fs.writeFile(R('etc/tailscale/debug-authkey'), 'tskey-' + 'auth-' + 'FAKE')
     await fs.writeFile(R('etc/machine-id'), '0123456789abcdef0123456789abcdef\n'); await fs.writeFile(R('etc/hostname'), 'brave-otter\n')
     await fs.writeFile(R('etc/hosts'), '127.0.0.1\tlocalhost\n127.0.1.1\tbrave-otter\n')
     await fs.ensureDir(R('home/pi/.pm2')); await fs.writeFile(R('home/pi/.pm2/dump.pm2'), '[]')
@@ -421,5 +421,69 @@ describe('first start from an image /META.yaml (idea#322)', () => {
         expect(a).toMatchObject({ diskId: 'SERIAL9', isHardwareId: true }); expect(written.diskId).toBe('SERIAL9')
         const b = await ensureSystemMeta('sda2' as any, { path: '/tmp/x/META.yaml', allowCreate: true, deps: { ...deps, readHardwareId: async () => undefined } })
         expect(b!.isHardwareId).toBe(false); expect(String(b!.diskId)).toMatch(/^[0-9a-z-]{10,}$/)
+    })
+})
+
+describe('no dev files in the image (sparse Engine clone, secret scan)', () => {
+    let root: string
+    const R = (rel: string) => path.join(root, rel)
+    const KEY = 'tskey-' + 'auth-' + 'k1x'
+    beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'rootfs-')); await goodRootfs(root) })
+    afterEach(async () => { await fs.remove(root) })
+    const devProblems = async (l = lock()) =>
+        (await verifyRootfsChecks({ root, enginePath: ENGINE, lock: l, storeIdentity: storeShas })).find(x => x.name === 'no-dev-files')!.problems
+    it('a clean rootfs passes; test/, dist/test/ and other dev trees fail', async () => {
+        expect(await devProblems()).toEqual([])
+        for (const d of ['test/automated', 'dist/test', 'script/idea02-walker']) {
+            await fs.ensureDir(R(`${ENGINE}/${d}`))
+            expect((await devProblems()).join('\n')).toContain(`${ENGINE}/${d.split('/automated')[0]} present`)
+            await fs.remove(R(`${ENGINE}/${d.split('/')[0] === 'script' ? d : d.split('/')[0] === 'dist' ? d : 'test'}`))
+        }
+        expect(await devProblems()).toEqual([])
+    })
+    it('any tskey-auth- string under the Engine tree fails (node_modules included, .git skipped)', async () => {
+        await fs.outputFile(R(`${ENGINE}/node_modules/x/a.js`), `const k = "${KEY}"`)
+        await fs.outputFile(R(`${ENGINE}/dist/src/b.js`), Buffer.concat([Buffer.from([0, 1, 2]), Buffer.from(KEY)]))
+        await fs.outputFile(R(`${ENGINE}/src/ok.ts`), "/tskey-auth-[A-Za-z0-9]/ or 'tskey-' + 'auth-' + x")
+        await fs.outputFile(R(`${ENGINE}/.git/objects/x`), KEY)
+        expect(await filesWithAuthKeyShape(R(ENGINE))).toEqual(['dist/src/b.js', 'node_modules/x/a.js'])
+        expect((await devProblems()).length).toBe(2)
+    })
+    it('the sparse patterns in .git/info/sparse-checkout must match the lock', async () => {
+        const l = lock({ sparseCheckout: IMAGE_SPARSE_PATTERNS })
+        await fs.outputFile(R(`${ENGINE}/.git/info/sparse-checkout`), IMAGE_SPARSE_PATTERNS.join('\n') + '\n')
+        expect(await devProblems(l)).toEqual([])
+        await fs.outputFile(R(`${ENGINE}/.git/info/sparse-checkout`), '/*\n')
+        expect((await devProblems(l)).join()).toContain('does not match')
+        expect(validateLock({ ...l, sparseCheckout: [''] })).toContain('sparseCheckout must be a list of patterns')
+    })
+    it('the clone step: real git, sparse, clean status, and an update (fetch + checkout -B, pull) stays sparse', async () => {
+        const $ = (cmd: string, cwd = root) => require('child_process').execSync(cmd, { cwd, encoding: 'utf8', stdio: 'pipe', env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } }) as string
+        const repo = R('repo')
+        for (const f of ['src/a.ts', 'script/s.sh', 'script/idea02-walker/w.ts', 'test/automated/x.test.ts', 'proposals/p.md', 'store-identity/store-template.json', 'pm2.config.cjs'])
+            await fs.outputFile(path.join(repo, f), f)
+        await fs.outputFile(path.join(repo, '.gitignore'), 'dist\nnode_modules/\n')
+        $('git init -q -b main && git add -A && git commit -qm one', repo)
+        const sha1 = $('git rev-parse HEAD', repo).trim()
+        const dest = R('rootfs/home/pi/idea')
+        $(engineCloneCommand(repo, dest, sha1, IMAGE_SPARSE_PATTERNS))
+        expect((await fs.readdir(dest)).sort()).toEqual(['.git', '.gitignore', 'pm2.config.cjs', 'script', 'src', 'store-identity'])
+        expect(await fs.readdir(path.join(dest, 'script'))).toEqual(['s.sh'])
+        expect(await fs.readFile(path.join(dest, 'store-identity/store-template.json'), 'utf8')).toBe('store-identity/store-template.json')
+        await fs.outputFile(path.join(dest, 'dist/src/a.js'), ''); await fs.ensureDir(path.join(dest, 'node_modules/m'))
+        expect($('git status --porcelain', dest)).toBe('')
+        expect($('git rev-parse --is-shallow-repository', dest).trim()).toBe('true')
+        // update path (provision-fleet.sh: fetch + checkout -B <branch> origin/<branch>; or git pull)
+        await fs.outputFile(path.join(repo, 'test/automated/y.test.ts'), 'y'); await fs.outputFile(path.join(repo, 'src/b.ts'), 'b')
+        $('git add -A && git commit -qm two', repo)
+        $(`git remote set-url origin file://${repo} && git fetch -q origin && git checkout -q -B main origin/main`, dest)
+        expect(await fs.pathExists(path.join(dest, 'src/b.ts'))).toBe(true)
+        expect(await fs.pathExists(path.join(dest, 'test'))).toBe(false)
+        expect($('git status --porcelain', dest)).toBe('')
+        await fs.outputFile(path.join(repo, 'src/c.ts'), 'c'); $('git add -A && git commit -qm three', repo)
+        $('git pull -q --ff-only origin main', dest)
+        expect(await fs.pathExists(path.join(dest, 'src/c.ts'))).toBe(true)
+        expect(await fs.pathExists(path.join(dest, 'test'))).toBe(false)
+        expect($('git status --porcelain', dest)).toBe('')
     })
 })

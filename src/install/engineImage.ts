@@ -125,6 +125,39 @@ export interface EngineLock {
     packages?: { pkg: string, version: string, arch: string }[]
     /** The installed packages that come from archive.raspberrypi.com (it has no snapshots); a rebuild with --lock installs exactly these */
     rpiPackages?: { pkg: string, version: string }[]
+    /** git sparse-checkout patterns (no-cone) of the Engine clone: everything but dev-only trees (IMAGE_SPARSE_PATTERNS) */
+    sparseCheckout?: string[]
+}
+
+/** The Engine clone in the image is a no-cone sparse checkout: every tracked file except trees that are never
+ *  used at runtime (tests and their fixtures, design proposals, reports, old data, editor settings, the idea02
+ *  duration walker, which imports test/). `git fetch` + `git checkout`/`pull` keep these patterns, so updates stay sparse. */
+export const IMAGE_SPARSE_PATTERNS = ['/*', '!/test/', '!/proposals/', '!/reports/', '!/old-yjs-db/', '!/.vscode/', '!/script/idea02-walker/']
+/** Trees that must not be in the image's Engine tree (dist/test would be compiled tests). */
+export const IMAGE_FORBIDDEN_DIRS = ['test', 'dist/test', 'proposals', 'reports', 'old-yjs-db', '.vscode', 'script/idea02-walker', 'dist/script/idea02-walker']
+/** A Tailscale auth key shape; no file of the Engine tree may contain one (Atlas's image secret scan). */
+export const TS_AUTHKEY_RE = /tskey-auth-[A-Za-z0-9]/
+
+/** Files under dir (no symlinks followed, .git skipped: its objects are compressed) containing a Tailscale auth key shape. */
+export const filesWithAuthKeyShape = async (dir: string): Promise<string[]> => {
+    const hits: string[] = []
+    const needle = Buffer.from('tskey-auth-')
+    const walk = async (d: string): Promise<void> => {
+        for (const e of await fs.readdir(d, { withFileTypes: true })) {
+            const f = path.join(d, e.name)
+            if (e.isDirectory()) { if (!(d === dir && e.name === '.git')) await walk(f) }
+            else if (e.isFile()) {
+                const b = await fs.readFile(f)
+                let i = b.indexOf(needle)
+                while (i >= 0) {
+                    if (TS_AUTHKEY_RE.test(b.subarray(i, i + 12).toString('latin1'))) { hits.push(path.relative(dir, f)); break }
+                    i = b.indexOf(needle, i + 1)
+                }
+            }
+        }
+    }
+    if (await fs.pathExists(dir)) await walk(dir)
+    return hits.sort()
 }
 
 const HEX40 = /^[0-9a-f]{40}$/
@@ -157,6 +190,7 @@ export const validateLock = (l: any): string[] => {
         if (!/^0[0-7]{3}$/.test(f.mode ?? '')) e.push(`files ${f.path}: bad mode`)
     }
     if (!Array.isArray(l.enabledUnits)) e.push('enabledUnits must be a list')
+    if (l.sparseCheckout !== undefined && (!Array.isArray(l.sparseCheckout) || !l.sparseCheckout.every((x: unknown) => typeof x === 'string' && x))) e.push('sparseCheckout must be a list of patterns')
     if (l.pm2Env !== 'production' && l.pm2Env !== 'development') e.push('pm2Env must be production or development')
     return e
 }
@@ -358,7 +392,7 @@ const modeOf = (st: { mode: number }) => '0' + (st.mode & 0o777).toString(8).pad
 
 /** Every check a built rootfs must pass. Returns problems; empty = OK. Read-only. */
 /** verify's checks, in order; the report counts how many passed (VERIFY_CHECKS.length in all). */
-export const VERIFY_CHECKS = ['identity', 'store-identity', 'engine-tree', 'pm2-as-pi', 'enabled-units', 'identity-boot', 'tailscaled-off', 'locked-files', 'permissions', 'npm-tools', 'docker-preload', 'packages', 'lock-in-image'] as const
+export const VERIFY_CHECKS = ['identity', 'store-identity', 'engine-tree', 'pm2-as-pi', 'enabled-units', 'identity-boot', 'tailscaled-off', 'locked-files', 'permissions', 'npm-tools', 'docker-preload', 'packages', 'no-dev-files', 'lock-in-image'] as const
 export interface VerifyCheckResult { name: string, problems: string[] }
 
 export const verifyRootfs = async (c: VerifyContext): Promise<string[]> => (await verifyRootfsChecks(c)).flatMap(x => x.problems)
@@ -477,8 +511,17 @@ export const verifyRootfsChecks = async (c: VerifyContext): Promise<VerifyCheckR
             else if (got !== w.version) p.push(`package ${w.pkg} ${got}, lock says ${w.version}`)
         }
     } else if (c.lock.aptPins.length || c.lock.dockerDebs.length) p.push('no dpkg status in the rootfs: pinned packages cannot be checked')
+    check('no-dev-files')
+    // 10. no tests or other dev-only trees, no auth-key-shaped strings, the clone sparse as locked
+    for (const rel of IMAGE_FORBIDDEN_DIRS) if (await fs.pathExists(path.join(eng, rel))) p.push(`${c.enginePath}/${rel} present (not needed at runtime)`)
+    for (const f of await filesWithAuthKeyShape(eng)) p.push(`${c.enginePath}/${f} contains a tskey-auth- string`)
+    if (c.lock.sparseCheckout && await fs.pathExists(path.join(eng, '.git'))) {
+        const sc = path.join(eng, '.git/info/sparse-checkout')
+        const got = (await fs.pathExists(sc)) ? (await fs.readFile(sc, 'utf8')).split('\n').filter(Boolean) : []
+        if (got.join('\n') !== c.lock.sparseCheckout.join('\n')) p.push(`${c.enginePath}/.git/info/sparse-checkout does not match the lock's sparseCheckout`)
+    }
     check('lock-in-image')
-    // 10. the lock itself is in the image
+    // 11. the lock itself is in the image
     if (!(await fs.pathExists(R(IMAGE_LOCK_PATH.slice(1))))) p.push(`${IMAGE_LOCK_PATH} missing`)
     if (!(await fs.pathExists(R(IMAGE_VERSION_PATH.slice(1))))) p.push(`${IMAGE_VERSION_PATH} missing`)
     return results

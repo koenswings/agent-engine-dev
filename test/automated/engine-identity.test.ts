@@ -11,7 +11,7 @@ import os from 'os'
 
 const SRC = path.join(process.cwd(), 'script/build_image_assets/idea-engine-identity')
 const BOOT_SH = path.join(process.cwd(), 'script/build_image_assets/boot.sh')
-const KEY = 'tskey-auth-kTESTFAKE0123-abcdefABCDEF0123456789'
+const KEY = 'tskey-' + 'auth-' + 'kTESTFAKE0123-abcdefABCDEF0123456789'
 
 interface Sb { tmp: string, boot: string, etc: string, state: string, zi: string, calls: string, script: string, bin: string }
 let sb: Sb

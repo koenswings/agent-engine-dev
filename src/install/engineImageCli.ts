@@ -16,7 +16,7 @@ import {
     EngineLock, FIRSTBOOT_SCRIPT, IMAGE_ENABLED_UNITS, ImageArgs, LOCK_SCHEMA, LockedFile, LockedImage, UsageError,
     imageIdFromManifest, imageTarName, parseDockerPins, readLock, serialiseLock, sha256File, validateLock, verifyRootfsChecks, VERIFY_CHECKS,
 } from './engineImage.js'
-import { NpmTool, NPM_TOOL_INSTALL } from './engineImage.js'
+import { NpmTool, NPM_TOOL_INSTALL, IMAGE_SPARSE_PATTERNS } from './engineImage.js'
 import { Installers, Runner, realRunner, runRootfsBuild } from './engineRootfs.js'
 
 export const STORE_IDENTITY_DIR = 'store-identity'
@@ -88,7 +88,7 @@ export const buildLock = async (repo: string, E: any, images: string[], cache: s
         tailscaleVersion: E.TAILSCALE_VERSION, tailscaleSha256: E.TAILSCALE_ARM64_SHA256, debianSnapshot: E.DEBIAN_SNAPSHOT,
         aptPins: E.parseAptPins(await fs.readFile(path.join(assets, 'apt-rpi-pins.tsv'), 'utf8')),
         dockerDebs: parseDockerPins(await fs.readFile(path.join(assets, 'docker-pins.tsv'), 'utf8')),
-        dockerImages, pm2Env, files, enabledUnits: [...IMAGE_ENABLED_UNITS].sort(), npmTools,
+        dockerImages, pm2Env, files, enabledUnits: [...IMAGE_ENABLED_UNITS].sort(), npmTools, sparseCheckout: [...IMAGE_SPARSE_PATTERNS],
     }
 }
 

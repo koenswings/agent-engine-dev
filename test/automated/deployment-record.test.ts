@@ -71,7 +71,7 @@ describe('compareRecords (idea#322)', () => {
 describe('findSecrets (idea#322: records carry no secrets)', () => {
     it('is clean for a normal record and flags auth keys, private keys and passwords', () => {
         expect(findSecrets(base())).toEqual([])
-        expect(findSecrets({ 'record.txt': 'x=tskey-auth-abc123' })).toHaveLength(1)
+        expect(findSecrets({ 'record.txt': 'x=' + 'tskey-' + 'auth-' + 'abc123' })).toHaveLength(1)
         expect(findSecrets({ 'record.txt': '-----BEGIN OPENSSH PRIVATE KEY-----' })).toHaveLength(1)
         expect(findSecrets({ 'record.txt': 'password=raspberry' })).toHaveLength(1)
     })
