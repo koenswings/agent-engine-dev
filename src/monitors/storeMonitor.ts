@@ -51,7 +51,12 @@ export const processCommandQueue = (storeHandle: DocHandle<Store>, engineId: Eng
     const command = typeof head === 'string' ? head : String(head ?? '')
     busy.add(String(engineId))
     log(`Processing command for engine ${engineId}: ${command}`)
-    handleCommand(commands, storeHandle, 'engine', command, cmdLogHandle ?? null)
+    // agent-engine-dev#262: never run a command inside the store 'change' event that announced
+    // it. A storeHandle.change() made from inside that event is applied only after the event
+    // returns, so a command that changes the store and then checks the result (forgetDisk)
+    // saw its own change as not done. setImmediate runs it on a clean stack.
+    new Promise<void>(resolve => setImmediate(resolve))
+        .then(() => handleCommand(commands, storeHandle, 'engine', command, cmdLogHandle ?? null))
         .catch(e => log(`Command '${command}' failed outside its trace: ${e?.message ?? e}`))
         .finally(() => {
             busy!.delete(String(engineId))
