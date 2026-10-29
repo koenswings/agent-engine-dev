@@ -96,6 +96,12 @@ These commands perform actions on the system. Some are restricted to an `engine`
 ### `moveApp`
 - **Description:** Moves an app instance from one disk to another. The instance keeps its original InstanceID so backup disk links remain intact. The source instance directory (and app master, if no other instance on the source disk uses it) is removed after a successful transfer.
 - **Usage:** `moveApp <instanceId|instanceName> <sourceDiskId> <targetDiskId>`. The instance resolves id-first (see [Instance arguments](#instance-arguments)). Refused when the instance folder holds a symlink that resolves outside it (see [Instance data links](#instance-data-links)).
+- **Across Engines** (capability `moveAppCrossEngine`, idea#79): when the target disk is docked to another Engine, the move is a copy followed by a delete in one `moveApp` operation with steps `Copying`, `Checking`, `Removing the old copy` and an `Operation.move` record (shapes: `src/data/MoveAppShapes.ts`). 1) The existing cross-Engine copyApp path copies it (the copy gets a fresh id and keeps the name). 2) The target Engine runs `verifyMoveTarget`: registered on a disk docked to it, instance data size matches (within 1 MB or 1 %), and Running when the source was running; it writes the verdict into the operation. 3) Only after a recorded good verify the source is stopped and removed with `removeInstance` (helper v4 quarantine, never rm). Copy or verify failure deletes nothing: `MOVE FAILED: <reason>; source kept`. A failed removal after a good copy: `MOVED, source not removed: <reason>` (status Done). Success: `MOVED to <Engine>`. Refused before anything happens (`MOVE FAILED: …; source kept`, codes `NOT_FOUND`, `AMBIGUOUS`, `SOURCE_REMOTE`, `TARGET_UNREACHABLE`, `PEER_ACCESS`, `TARGET_OUTDATED` (target lacks the capability), `HELPER_OUTDATED` (helper < v4), `BUSY`, `INVALID`). An Engine restart never retries it and never removes the source (`INTERRUPTED`, or `SOURCE_NOT_REMOVED` when verify was already recorded). The command trace result is the `MoveResult`.
+- **Scope:** `engine`
+
+### `verifyMoveTarget`
+- **Description:** Internal, Engine → Engine (idea#79): the source Engine of a cross-Engine `moveApp` sends it to the target Engine, which checks the copy and writes `{ ok, bytes, detail, at }` into the move operation's `move.verify`. Not for the Console.
+- **Usage:** `verifyMoveTarget <opId> <instanceId> <expectedBytes> <true|false>`
 - **Scope:** `engine`
 
 ### `backupApp`
@@ -113,7 +119,7 @@ These commands perform actions on the system. Some are restricted to an `engine`
 
 Refusals (code at the start of the error text; the store is untouched): `NOT_FOUND`, `NOT_LOCAL`, `AMBIGUOUS`, `RUNNING` (Running/Starting), `BUSY_BACKUP` (backup/restore holds the lock), `BUSY_MOVE` (move/copy holds it), `BUSY` (other holder), `COMPOSE_DOWN_FAILED`, `QUARANTINE_FAILED`, `HELPER_OUTDATED` (root helper older than v4).
 
-**Helper version:** the Engine always starts, whatever `idea-app-data` version is installed; a missing or different helper is only logged as a warning at startup. Commands that need a newer helper refuse with `HELPER_OUTDATED`: `removeInstance` needs v4 (and `updateApp` v5).
+**Helper version:** the Engine always starts, whatever `idea-app-data` version is installed; a missing or different helper is only logged as a warning at startup. Commands that need a newer helper refuse with `HELPER_OUTDATED`: `removeInstance` and a cross-Engine `moveApp` need v4 (and `updateApp` v5).
 
 ### `updateApp`
 `updateApp <instanceId|name> <newAppId> [--allow-major] [--source <diskId>]` (capability `updateApp`, #230, proposal idea#351). Updates an instance to a newer bundle `apps/<newAppId>/` on a disk docked to this Engine (cross-Engine Fetch: #263). Needs root helper `idea-app-data` v5.

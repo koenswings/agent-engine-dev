@@ -135,6 +135,8 @@ export interface Operation {
    * (POWER_OFF_FAILED). Absent on other kinds.
    */
   safeToRemove?: boolean
+  /** cross-Engine moveApp only (idea#79): steps, verify verdict, result. See MoveAppShapes.ts. */
+  move?: import('./MoveAppShapes.js').MoveProgress
 }
 
 // References to top-level YMaps and YArrays in the Yjs document

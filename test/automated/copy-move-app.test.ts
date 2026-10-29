@@ -468,7 +468,7 @@ describe('moveApp', () => {
         expect(Object.keys(handle.doc().operationDB)).toHaveLength(0)
     })
 
-    it('refuses a cross-engine target: throws, and via handleCommand the trace ends as error', async () => {
+    it('refuses a cross-engine move it cannot do yet (no peer access here; idea#79): throws MOVE FAILED, trace ends as error', async () => {
         const { handle } = await makeHandle()
         const { network } = await import('../../src/data/Network.js')
         const REMOTE = 'ENGINE_remote-1' as EngineID
@@ -476,7 +476,7 @@ describe('moveApp', () => {
         network.connections['10.0.0.9:4321' as any] = { adapter: {} as any, missedDiscoveryCount: 0, hostname: 'idea09' as any, engineId: REMOTE }
         try {
             await expect(moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID))
-                .rejects.toThrow('Cross-engine move is not supported')
+                .rejects.toThrow(/^MOVE FAILED: .*source kept$/)
             const { commands } = await import('../../src/data/Commands.js')
             const { handleCommand } = await import('../../src/utils/commandUtils.js')
             const log = makeRepo().create<any>({ traces: {}, recentTraceIds: [] })
@@ -485,7 +485,7 @@ describe('moveApp', () => {
             const ids = log.doc().recentTraceIds
             const t = log.doc().traces[ids[ids.length - 1]]
             expect(t.status).toBe('error')
-            expect(t.errorMessage).toContain('Cross-engine move is not supported')
+            expect(t.errorMessage).toMatch(/^MOVE FAILED: .*source kept$/)
             expect(Object.keys(handle.doc().operationDB)).toHaveLength(0)
             consoleSpy.mockRestore()
         } finally {
