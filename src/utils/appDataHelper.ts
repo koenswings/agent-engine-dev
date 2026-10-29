@@ -37,7 +37,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '4'
+export const APP_DATA_HELPER_VERSION = '5'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -300,3 +300,46 @@ export const reportBorgAtStartup = (exists: (p: string) => boolean = borgPresenc
     else log(`${BORG_PATH} is installed`)
     return problem
 }
+
+// ── updateApp snapshots (helper v5, agent-engine-dev#230) ────────────────────
+export const snapshotArgs = (root: string, id: string): string[] => ['snapshot', checkRoot(root), checkId(id)]
+export const restoreSnapshotArgs = (root: string, id: string): string[] => ['restore-snapshot', checkRoot(root), checkId(id)]
+export const snapshotsArgs = (root: string): string[] => ['snapshots', checkRoot(root)]
+export const estimateArgs = (root: string, id: string): string[] => ['estimate', checkRoot(root), checkId(id)]
+/** `estimate` result: "<folder kb> <volumes kb> <free kb>" (read-only; nothing is stopped). */
+export const parseEstimate = (out: string): { folderBytes: number, volumeBytes: number, freeBytes: number } => {
+    const m = lastLine(out).match(/^(\d+) (\d+) (\d+)$/)
+    if (!m) throw new Error(`idea-app-data estimate gave no result line: ${lastLine(out) || '(empty)'}`)
+    return { folderBytes: Number(m[1]) * 1024, volumeBytes: Number(m[2]) * 1024, freeBytes: Number(m[3]) * 1024 }
+}
+
+/** The helper prints rsync progress first; its result is the last non-empty line. */
+export const lastLine = (out: string): string => out.trim().split('\n').map(s => s.trim()).filter(Boolean).pop() ?? ''
+
+export interface SnapshotVolume { name: string, bytes: number, exportMs: number }
+export interface SnapshotResult {
+    path: string, sizeBytes: number
+    /** where the previous snapshot of this instance was renamed to (.idea-quarantine), or null */
+    previousQuarantinedAt: string | null
+    volumes: SnapshotVolume[]
+}
+
+/** `snapshot` result: "VOLUME <name> <bytes> <ms>" lines, then "<dir> <kb> <old|none>" last. */
+export const parseSnapshotResult = (out: string): SnapshotResult => {
+    const m = lastLine(out).match(/^(\/\S+) (\d+)(?: (\S+))?$/)
+    if (!m) throw new Error(`idea-app-data snapshot gave no result line: ${lastLine(out) || '(empty)'}`)
+    const volumes = [...out.matchAll(/^VOLUME (\S+) (\d+) (\d+)$/gm)].map(v => ({ name: v[1], bytes: Number(v[2]), exportMs: Number(v[3]) }))
+    return { path: m[1], sizeBytes: Number(m[2]) * 1024, previousQuarantinedAt: m[3] && m[3] !== 'none' ? m[3] : null, volumes }
+}
+
+/** `snapshots` lines: "<id> <kb> complete|incomplete", then "TOTAL pre-update <kb>" and "TOTAL quarantine <kb>". */
+export const parseSnapshotsList = (out: string): { snapshots: { instanceId: string, sizeBytes: number, complete: boolean }[], preUpdateBytes: number | null, quarantineBytes: number | null } => {
+    const total = (what: string) => { const m = out.match(new RegExp(`^TOTAL ${what} (\\d+)$`, 'm')); return m ? Number(m[1]) * 1024 : null }
+    return {
+        snapshots: out.split('\n').map(l => l.trim().match(/^([a-z0-9][a-z0-9-]{0,63}) (\d+) (complete|incomplete)$/))
+            .filter((m): m is RegExpMatchArray => !!m)
+            .map(m => ({ instanceId: m[1], sizeBytes: Number(m[2]) * 1024, complete: m[3] === 'complete' })),
+        preUpdateBytes: total('pre-update'), quarantineBytes: total('quarantine'),
+    }
+}
+
