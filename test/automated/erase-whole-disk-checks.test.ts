@@ -107,6 +107,17 @@ describe('eraseDisk whole-disk checks and remount on failure (#188)', () => {
         expect(isEraseDeviceLocked('sdb')).toBe(false)
     })
 
+    it('refuses a disk whose store record is the system disk even when its device name now points at another drive', async () => {
+        await dock('sdb2', 'f-disk', 'System Disk')
+        h.change(d => { (d.diskDB['f-disk' as DiskID] as any).diskTypes = ['system'] })
+        const before = JSON.stringify(h.doc()!.diskDB)
+        const tid = await summary('f-disk', 'System Disk')
+        await expect(eraseDisk(h, 'f-disk', tid, 'System Disk')).rejects.toThrow(/system disk and cannot be erased/)
+        expect(scriptCalls).toBe(0)
+        expect(addCalls).toEqual([])
+        expect(JSON.stringify(h.doc()!.diskDB)).toBe(before)
+    })
+
     it('#235: a teacher-stick sibling under the USB root does not block; it is unmounted before the wipe', async () => {
         await dock('sdc2', 'os-disk', 'Old OS Disk')
         const stick = { partition: 'sdc1', mountpoint: path.join(usbRoot(), 'sdc1') }

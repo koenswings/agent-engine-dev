@@ -322,6 +322,12 @@ export const eraseDisk = async (
 
     if (target.kind === 'disk') {
         disk = target.disk!
+        // The store record itself says "system disk": refuse whatever device name it carries.
+        // A stale record (device names swapped since it was written) must never send the wipe to
+        // the drive that now holds that name (found in the #278 hw round-trip on idea04).
+        if ((disk.diskTypes ?? []).includes('system') || `ENGINE_${disk.id}` === localEngineId) {
+            throw new Error(`${disk.name} is this Pi's system disk and cannot be erased.`)
+        }
         if (!disk.device) throw new Error(`${disk.name} is not docked.`)
         if (await isSystemDevice(disk.device)) throw new Error(`${disk.name} is this Pi's system disk and cannot be erased.`)
         devicePartition = disk.device
