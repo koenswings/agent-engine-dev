@@ -650,6 +650,39 @@ describe('disk roles: USB disks get both roles, SD cards flash only (idea#303)',
         expect(Object.keys(h.doc()!.diskDB)).toHaveLength(0)
     })
 
+    it('#236: a non-empty root-owned ext4 (not an OS disk) is refused NOT_EMPTY, naming what was found; nothing written', async () => {
+        useDevices([SYS, EXT4_STICK])
+        let wrote = false
+        setFlashCardOpsForTests({
+            isSystemDevice: async (d) => d.startsWith('sda'),
+            lookForMeta: async () => ({ ok: true, hasMeta: false, alreadyMounted: false, ignored: false,
+                contents: { rootOwned: true, entries: ['a', 'b', 'c', 'd', 'e', 'photos'] } }),
+            mountRw: async () => { wrote = true; return { ok: true, alreadyMounted: false, fsUuid: null } },
+            writeMeta: async () => { wrote = true },
+        })
+        const r = await scanClientCards(undefined, String(LOCAL))
+        const stick = r.diskCandidates!.find(c => c.device === 'sdi')!
+        const err = await initialiseDisk(h, stick.candidateId, 'files').then(() => null, (e) => e)
+        expect(err?.code).toBe('NOT_EMPTY')
+        expect(err.message).toMatch(/is not empty: found a, b, c, d, e, … \(6 entries\) in its root.*erase it first/)
+        expect(wrote).toBe(false)
+        expect(Object.keys(h.doc()!.diskDB)).toHaveLength(0)
+    })
+
+    it('#236: an empty root-owned ext4 (only lost+found) and a non-root-owned one are not refused NOT_EMPTY', async () => {
+        useDevices([SYS, EXT4_STICK])
+        for (const contents of [{ rootOwned: true, entries: [] as string[] }, { rootOwned: false, entries: ['x'] }]) {
+            setFlashCardOpsForTests({
+                isSystemDevice: async (d) => d.startsWith('sda'),
+                lookForMeta: async () => ({ ok: true, hasMeta: false, alreadyMounted: false, ignored: false, contents }),
+                mountRw: async () => ({ ok: false, message: 'stop here' }),
+            })
+            const r = await scanClientCards(undefined, String(LOCAL))
+            const stick = r.diskCandidates!.find(c => c.device === 'sdi')!
+            expect(await code(initialiseDisk(h, stick.candidateId, 'files'))).toBe('MOUNTED')
+        }
+    })
+
     it('idea#311: an ejected IDEA disk (valid META.yaml, no IDEA-IGNORE) left plugged in is not offered initialise', async () => {
         useDevices([SYS, EXT4_STICK])
         ideaMetaParts.add('sdi1')
