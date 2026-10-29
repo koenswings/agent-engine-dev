@@ -120,7 +120,7 @@ export const resolveSummaryTarget = (store: Store, targetId: string): {
 /** Disk paths that are IDEA data, never counted as "other" user files. idea#347: .idea-quarantine included. */
 export const isIdeaDiskPath = (rel: string): boolean =>
     rel === 'META.yaml' || rel === 'FILES.yaml' || rel === 'BACKUP.yaml' ||
-    ['apps', 'instances', 'services', 'backups', 'lost+found', 'files', '.idea-quarantine'].some(d => rel === d || rel.startsWith(`${d}/`))
+    ['apps', 'instances', 'services', 'backups', 'lost+found', 'files', '.idea-quarantine', '.pre-update'].some(d => rel === d || rel.startsWith(`${d}/`))
 
 export const summariseDisk = async (
     storeHandle: DocHandle<Store>,

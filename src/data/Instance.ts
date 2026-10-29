@@ -4,7 +4,7 @@ import { $, YAML, chalk, fs, os, sleep } from "zx";
 $.verbose = false;
 import { ensureNcAdminPassword } from "./AppSecrets.js";
 import { addOrUpdateEnvVariable, deepPrint, log, randomPort, readEnvVariable, uuid, print, isEngineOnline } from "../utils/utils.js";
-import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber, ServiceImage, Timestamp, Version, DeviceName, InstanceName, AppName, Hostname, DiskID, OperationCause } from "./CommonTypes.js";
+import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber, ServiceImage, Timestamp, Version, DeviceName, InstanceName, AppName, Hostname, DiskID, OperationCause, EngineID } from "./CommonTypes.js";
 import { createOperation, updateOperation } from './Operations.js'
 import { composeFileEnv } from './FilesMount.js'
 import { Store, getDisk, getEngine, getLocalEngine, getInstancesOfEngine, } from "./Store.js";
@@ -272,6 +272,20 @@ export interface Instance {
   metrics: DockerMetrics | null;
   /** Files Disks currently mounted into this instance; written only after a successful compose up (idea#133). */
   filesMounts?: DiskID[] | null;
+  /** A newer, offerable bundle of this App on a docked disk (agent-engine-dev#230, console#168 shape); null when none. */
+  updateAvailable?: UpdateAvailable | null;
+}
+
+export interface UpdateAvailable {
+  appId: AppID;
+  sourceDiskId?: DiskID;
+  sourceEngineId?: EngineID;
+  fromVersion?: string;
+  toVersion?: string;
+  major?: boolean;
+  estimatedMinutes?: number;
+  sizeBytes?: number;
+  migrationNote?: string;
 }
 
 export type Status = 'Undocked'      // Disk is not currently docked; instance data is intact on the disk
