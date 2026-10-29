@@ -101,6 +101,7 @@ export const writeReport = async (file: string | undefined, lock: EngineLock | u
 /** A runner that only logs (dry run on any host): canned answers for the installers' self-checks. */
 export const dryRunner = (lock: EngineLock, log: string[], appDataVersion: string): Runner => {
     const answer = (cmd: string): string => {
+        if (cmd.includes('VERSION_CODENAME')) return 'trixie'
         if (cmd.includes('dpkg-query')) return 'install ok installed'
         if (cmd.includes('idea-app-data') && cmd.includes('version')) return `idea-app-data ${appDataVersion}`
         if (cmd.includes('sshd -T')) return 'authorizedkeysfile .ssh/authorized_keys /etc/ssh/idea_authorized_keys/%u'
@@ -160,6 +161,8 @@ export const runImageMode = async (a: ImageArgs, repo: string): Promise<number> 
     const log: string[] = []
     const runner = a.dryRun ? dryRunner(lock, log, APP_DATA_HELPER_VERSION) : realRunner(root)
     const inst = E as Installers
+    // An installer that fails calls process.exit(1): leave a failed report behind first
+    await writeReport(a.report, lock, lockText, ['build did not finish (see the log)'])
     let problems: string[]
     try {
         problems = await runRootfsBuild(opts, runner, inst, lockText, await piUidOf(root))
