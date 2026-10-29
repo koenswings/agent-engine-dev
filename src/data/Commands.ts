@@ -29,6 +29,7 @@ import { summariseDisk, attachTraceResult } from './SummariseDisk.js';
 import { eraseDisk } from './EraseDisk.js';
 import { forgetDisk } from './ForgetDisk.js';
 import { removeInstance } from './RemoveInstance.js';
+import { renameInstance } from './RenameInstance.js';
 import { updateApp, parseUpdateAppArgs } from './UpdateApp.js';
 import { flashCard, cancelFlash, initialiseDisk } from './FlashCard.js';
 import { testContext } from "../../test/testContext.js";
@@ -372,6 +373,18 @@ const removeInstanceWrapper = async (storeHandle: DocHandle<Store> | null, insta
     print(chalk.green(`Removed instance ${result.instanceId}; its folder is kept at ${result.quarantinePath}`))
 }
 
+/**
+ * renameInstance <instanceId> <newName…> (agent-engine-dev#220). Display name only
+ * (compose.yaml x-app.instanceName + store); result in CommandTrace.result.
+ */
+const renameInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: string, ...nameTokens: string[]) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    const engineId = String(getLocalEngine(storeHandle.doc())?.id ?? localEngineId)
+    const result = await renameInstance(storeHandle, instanceArg, nameTokens.join(' '), engineId)
+    attachTraceResult(result)
+    print(chalk.green(result.changed ? `Renamed instance ${result.instanceId}: '${result.oldName}' -> '${result.newName}'` : `Instance ${result.instanceId} is already named '${result.newName}'`))
+}
+
 /** updateApp <instance> <newAppId> [--allow-major] [--source <diskId>] (#230). Result: snapshot path and size. */
 const updateAppWrapper = async (storeHandle: DocHandle<Store> | null, argsString: string) => {
     if (!storeHandle) throw new Error("Store is not available. Please connect first.")
@@ -528,6 +541,7 @@ export const commands: CommandDefinition[] = [
     { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "mode" }, { type: "string", name: "instanceNames", variadic: true }], scope: 'engine' },
     { name: "createFilesDisk", execute: createFilesDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "shareName", variadic: true, optional: true }], scope: 'engine' },
     { name: "removeInstance", execute: removeInstanceWrapper, args: [{ type: "string", name: "instanceId" }], scope: 'engine' },
+    { name: "renameInstance", execute: renameInstanceWrapper, args: [{ type: "string", name: "instanceId" }, { type: "string", name: "newName", variadic: true }], scope: 'engine' },
     { name: "updateApp", execute: updateAppWrapper, args: [{ type: "string" }], scope: 'engine' },
     { name: "pushAppBundle", execute: pushAppBundleWrapper, args: ['sourceDiskId', 'appId', 'targetEngineId', 'targetRoot', 'requestId', 'instanceId'].map(name => ({ type: "string" as const, name })), scope: 'engine' },
     { name: "appFetchResult", execute: appFetchResultWrapper, args: [{ type: "string", name: "requestId" }, { type: "string", name: "status" }, { type: "string", name: "why", variadic: true, optional: true }], scope: 'engine' },
