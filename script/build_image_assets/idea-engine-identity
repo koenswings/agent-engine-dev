@@ -1,0 +1,184 @@
+#!/bin/bash
+# idea-engine-identity — apply the flash-time identity on an Engine (idea#322, Stage 2).
+#
+# Run as root by boot.sh (@reboot cron) on EVERY boot, before the /boot/MASTER
+# personalisation. Root-owned COPY in /usr/local/sbin, installed by build-engine /
+# ./install-root-helpers (installRootHelpers). No sudoers entry: the Engine (pi)
+# never calls it.
+#
+# Reads the files idea-flash.sh (koenswings/idea tools/identity, #380) writes to the
+# FAT boot partition. With none of them present it does nothing (exit 0).
+#   idea-hostname.txt              NAME. First 256 bytes, first line, CR/tab/space
+#                                  stripped, lowercased, must match
+#                                  [a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?. Applied
+#                                  (hostname, /etc/hosts, /etc/idea/sticker-name),
+#                                  then deleted. Invalid: refused, file deleted,
+#                                  the device keeps its default name.
+#   idea-timezone.txt              tz zone, applied on every boot when it differs
+#                                  (idea#208 pattern). Kept on the card.
+#   idea-home.txt                  home Engine. An Engine has no home Engine: the
+#                                  value is only checked and logged. Kept.
+#   idea-secrets/tailscale-authkey raw key. Moved to /etc/tailscale/debug-authkey
+#                                  (root 0600, the existing latent-debug key path,
+#                                  idea#115) and wiped from the card at once; then
+#                                  tailscaled is started and `tailscale up
+#                                  --auth-key=file:...` runs. Offline / failed: the
+#                                  join is retried on later boots until it succeeds.
+#   idea-identity.txt              informational, never read.
+#
+# The key is never logged and never a command-line argument. Invalid values are
+# refused with one "refused: <CODE>: ..." log line; the device keeps its default.
+# Idempotent: a second run with the same card changes nothing.
+#
+# Usage: idea-engine-identity [--version]
+
+set -u
+umask 077
+export LC_ALL=C
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+VERSION=1
+# Constants (tests rewrite these in a sandbox copy)
+BOOT_DIR=/boot/firmware
+ETC_DIR=/etc
+STATE_DIR=/var/lib/idea/identity
+ZONEINFO=/usr/share/zoneinfo
+HOSTNAMECTL=/usr/bin/hostnamectl
+TIMEDATECTL=/usr/bin/timedatectl
+SYSTEMCTL=/usr/bin/systemctl
+TAILSCALE=/usr/bin/tailscale
+SHRED=/usr/bin/shred
+SYNC=/usr/bin/sync
+
+[ "${1:-}" = "--version" ] && { echo "idea-engine-identity $VERSION"; exit 0; }
+
+# Older Pi OS mounts the FAT partition at /boot
+[ -d "$BOOT_DIR" ] || [ ! -d /boot ] || [ "$BOOT_DIR" != /boot/firmware ] || BOOT_DIR=/boot
+HOSTNAME_SRC=${IDEA_HOSTNAME_SRC:-$BOOT_DIR/idea-hostname.txt}
+TZ_SRC=$BOOT_DIR/idea-timezone.txt
+HOME_SRC=$BOOT_DIR/idea-home.txt
+SECRETS_DIR=$BOOT_DIR/idea-secrets
+KEY_SRC=$SECRETS_DIR/tailscale-authkey
+KEY_DST=$ETC_DIR/tailscale/debug-authkey
+TS_PENDING=$STATE_DIR/tailscale-pending
+
+NAME_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'
+ZONE_RE='^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9_+-]+){0,2}$'
+KEY_RE='^tskey-[A-Za-z0-9_-]{8,200}$'
+
+log() { echo "idea-engine-identity: $*"; }
+refuse() { log "refused: $1: $2"; }
+
+# Overwrite then remove (FAT has no real secure delete; this is the best effort).
+wipe() {
+    local f=$1
+    [ -e "$f" ] || return 0
+    if [ -x "$SHRED" ]; then "$SHRED" -u -z -n 1 -- "$f" 2>/dev/null || true; fi
+    if [ -e "$f" ]; then
+        local n; n=$(stat -c %s -- "$f" 2>/dev/null || echo 0)
+        [ "$n" -gt 0 ] 2>/dev/null && head -c "$n" /dev/zero > "$f" 2>/dev/null
+        rm -f -- "$f"
+    fi
+    "$SYNC" 2>/dev/null || true
+}
+
+# ── Hostname (one-shot) ──────────────────────────────────────────────────────
+apply_hostname() {
+    [ -e "$HOSTNAME_SRC" ] || return 0
+    local n
+    n=$(head -c 256 "$HOSTNAME_SRC" 2>/dev/null | head -n 1 | tr -d '\r\t ' | tr 'A-Z' 'a-z')
+    rm -f -- "$HOSTNAME_SRC"; "$SYNC" 2>/dev/null || true
+    if ! [[ "$n" =~ $NAME_RE ]]; then
+        refuse BAD_NAME "idea-hostname.txt does not hold a valid host name; keeping '$(cat "$ETC_DIR/hostname" 2>/dev/null)'"
+        return 0
+    fi
+    mkdir -p "$ETC_DIR/idea" && chmod 0755 "$ETC_DIR/idea"
+    printf '%s\n' "$n" > "$ETC_DIR/idea/sticker-name.tmp" && chmod 0644 "$ETC_DIR/idea/sticker-name.tmp" \
+        && mv -f "$ETC_DIR/idea/sticker-name.tmp" "$ETC_DIR/idea/sticker-name"
+    if [ "$(cat "$ETC_DIR/hostname" 2>/dev/null)" = "$n" ]; then
+        log "hostname is already $n"
+        return 0
+    fi
+    if [ -f "$ETC_DIR/hosts" ] && grep -q '^127\.0\.1\.1' "$ETC_DIR/hosts"; then
+        sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t$n/" "$ETC_DIR/hosts"
+    else
+        printf '127.0.1.1\t%s\n' "$n" >> "$ETC_DIR/hosts"
+    fi
+    "$HOSTNAMECTL" set-hostname "$n" >/dev/null 2>&1 || log "hostnamectl failed; /etc/hostname written directly"
+    printf '%s\n' "$n" > "$ETC_DIR/hostname"; chmod 0644 "$ETC_DIR/hostname"
+    log "hostname set to $n (from idea-hostname.txt)"
+}
+
+# ── Time zone (every boot) ───────────────────────────────────────────────────
+apply_timezone() {
+    [ -e "$TZ_SRC" ] || return 0
+    local z
+    z=$(head -c 256 "$TZ_SRC" 2>/dev/null | head -n 1 | tr -d '\r\t ')
+    [ -n "$z" ] || { refuse BAD_TIMEZONE "idea-timezone.txt is empty"; return 0; }
+    if ! [[ "$z" =~ $ZONE_RE ]] || [[ "/$z/" == */../* || "/$z/" == */./* ]] || [ ! -f "$ZONEINFO/$z" ]; then
+        refuse BAD_TIMEZONE "'$z' is not a tz database zone in $ZONEINFO; keeping the current zone"
+        return 0
+    fi
+    local cur; cur=$(cat "$ETC_DIR/timezone" 2>/dev/null)
+    [ "$cur" = "$z" ] && return 0
+    if "$TIMEDATECTL" set-timezone "$z" >/dev/null 2>&1; then
+        log "time zone set to $z (was ${cur:-unknown})"
+    else
+        refuse TIMEZONE_FAILED "timedatectl set-timezone $z failed; keeping ${cur:-unknown}"
+    fi
+}
+
+# ── Home mode (check only) ───────────────────────────────────────────────────
+check_home() {
+    [ -e "$HOME_SRC" ] || return 0
+    local h
+    h=$(head -c 256 "$HOME_SRC" 2>/dev/null | head -n 1 | tr -d '\r\t ' | tr 'A-Z' 'a-z')
+    h=${h%.local}
+    if [ -z "$h" ] || [ "$h" = none ]; then return 0; fi
+    if ! [[ "$h" =~ $NAME_RE ]]; then refuse BAD_HOME "idea-home.txt does not hold a valid Engine name; ignored"; return 0; fi
+    log "idea-home.txt names $h; an Engine has no home Engine, nothing applied"
+}
+
+# ── Tailscale key (one-shot on the card, join retried until it succeeds) ─────
+take_key() {
+    [ -e "$KEY_SRC" ] || return 0
+    local k
+    k=$(head -c 512 "$KEY_SRC" 2>/dev/null | head -n 1 | tr -d '\r\t ')
+    if ! [[ "$k" =~ $KEY_RE ]]; then
+        k=''
+        wipe "$KEY_SRC"; rmdir "$SECRETS_DIR" 2>/dev/null || true
+        refuse BAD_KEY "idea-secrets/tailscale-authkey is not a Tailscale auth key; wiped, not used"
+        return 0
+    fi
+    mkdir -p "$ETC_DIR/tailscale" && chmod 0700 "$ETC_DIR/tailscale"
+    printf '%s\n' "$k" > "$KEY_DST.tmp" && chmod 0600 "$KEY_DST.tmp" && mv -f "$KEY_DST.tmp" "$KEY_DST"
+    k=''
+    wipe "$KEY_SRC"; rmdir "$SECRETS_DIR" 2>/dev/null || true
+    mkdir -p "$STATE_DIR" && chmod 0700 "$STATE_DIR" && : > "$TS_PENDING"
+    log "Tailscale key moved to $KEY_DST and wiped from the boot partition"
+}
+
+join_tailnet() {
+    [ -e "$TS_PENDING" ] || return 0
+    [ -f "$KEY_DST" ] || { rm -f "$TS_PENDING"; refuse NO_KEY "$KEY_DST is gone; not joining"; return 0; }
+    [ -x "$TAILSCALE" ] || { refuse NO_TAILSCALE "$TAILSCALE is not installed; will retry next boot"; return 0; }
+    "$SYSTEMCTL" start tailscaled >/dev/null 2>&1 || true
+    local out rc
+    out=$("$TAILSCALE" up --auth-key="file:$KEY_DST" --advertise-tags=tag:idea --hostname="$(cat "$ETC_DIR/hostname" 2>/dev/null || hostname)" --timeout=60s 2>&1)
+    rc=$?
+    # Never log a line that holds the key, whatever the tool prints.
+    out=$(printf '%s\n' "$out" | grep -v -F -f "$KEY_DST" | grep -v 'tskey-' | tail -n 3)
+    if [ "$rc" -eq 0 ]; then
+        rm -f "$TS_PENDING"
+        log "joined the tailnet"
+    else
+        log "tailscale up failed (exit $rc; offline?); will retry next boot${out:+: $out}"
+    fi
+}
+
+apply_hostname
+apply_timezone
+check_home
+take_key
+join_tailnet
+exit 0
