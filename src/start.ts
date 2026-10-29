@@ -146,6 +146,11 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // auto-start it (idea#176)
     await checkAndSetUndockedApps(storeHandle)
 
+    // #230 power-loss safety: roll back an interrupted updateApp from its complete .pre-update snapshot
+    await import('./data/UpdateApp.js').then(m => m.recoverInterruptedUpdates(storeHandle, String(localEngineId)))
+        .then(r => r.forEach(line => log(`recoverInterruptedUpdates: ${line}`)))
+        .catch(e => log(`recoverInterruptedUpdates failed: ${e}`))
+
     // Crash recovery: retry idempotent interrupted ops; mark others Failed
     await recoverInterruptedOperations(storeHandle, {
         copyApp: async (args, handle) => {

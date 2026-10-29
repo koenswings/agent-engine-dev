@@ -193,7 +193,7 @@ describe('peer-verify.sh check 4: the exact gate calls on the system root', () =
         expect(await sb.calls('rrsync')).toEqual([])
         const version = await sb.runGate([PEER], `sudo -n ${H} version`)
         expect(version.exitCode, version.stderr).toBe(0)
-        expect(version.stdout).toMatch(/idea-app-data 4/)
+        expect(version.stdout.trim()).toBe(`idea-app-data ${APP_DATA_HELPER_VERSION}`)
     })
 })
 

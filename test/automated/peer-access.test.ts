@@ -32,7 +32,7 @@ import {
 import { prepareStoreIdentity, restoredMarkerPath, FLEET_STORE_URL } from '../../src/data/StoreIdentity.js'
 import { makeAppDataSandbox, AppDataSandbox, HELPER_SOURCE } from '../harness/appDataSandbox.js'
 import { rsyncToPeerArgs } from '../../src/utils/rsync.js'
-import { receiveAppArgs, receiveFilesArgs, receiveServiceArgs } from '../../src/utils/appDataHelper.js'
+import { receiveAppArgs, receiveFilesArgs, receiveServiceArgs, APP_DATA_HELPER_VERSION } from '../../src/utils/appDataHelper.js'
 import { peerAccessEnabled, peerStaleMs, PEER_STALE_HOURS_DEFAULT } from '../../src/data/Config.js'
 import { testKey } from '../harness/peerKeys.js'
 
@@ -546,7 +546,7 @@ describe('two-engine store simulation (per-Pi keys exchanged through the store)'
 
         // what A's key may do on B: the gate named in B's file, with A's id
         const v = await sbB.runGate(['ENGINE_a'], 'sudo -n /usr/local/sbin/idea-app-data version')
-        expect(v.stdout.trim()).toBe('idea-app-data 4')
+        expect(v.stdout.trim()).toBe(`idea-app-data ${APP_DATA_HELPER_VERSION}`)
 
         // B is reimaged: new Engine key. A re-authorizes it from the store and logs it loudly
         await fs.remove(path.join(sbB.tmp, 'pi-ssh'))

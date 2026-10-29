@@ -22,6 +22,8 @@ import { disksRoot, skipBorg } from '../data/Config.js'
 import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot, appDataRoot } from '../data/Disk.js'
 import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgProblem } from '../utils/appDataHelper.js'
 import { indexBackupDiskApps } from '../data/InstallApp.js'
+import { localEngineId } from '../data/Engine.js'
+import { assertPreQuarantineHelper, quarantinePreRestore } from '../data/RestorePreQuarantine.js'
 import { createOperation, updateOperation } from '../data/Operations.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
 import { stopInstance, startInstance, BACKUP_STEPS } from '../data/Instance.js'
@@ -520,6 +522,9 @@ export const restoreApp = async (
             throw new Error(`Target disk ${targetDisk.id} is not docked`)
         }
 
+        // #190: restoring to another disk quarantines the old folder afterwards (helper v4)
+        const prevDisk = await assertPreQuarantineHelper(store, instanceId, targetDisk, String(localEngineId))
+
         const repoPath = backupDir(backupDevice, instanceId)
         const instancesDir = `${await diskMountRoot(targetDisk)}/instances`
 
@@ -541,6 +546,7 @@ export const restoreApp = async (
 
         const { processInstance } = await import('../data/Disk.js')
         await processInstance(storeHandle, targetDisk, instanceId)
+        await quarantinePreRestore(storeHandle.doc(), instanceId, targetDisk, prevDisk)
 
         updateOperation(storeHandle, opId, {
             status: 'Done',

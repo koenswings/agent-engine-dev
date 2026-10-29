@@ -49,6 +49,8 @@ export interface AppDataSandbox {
     peerKnownHosts: string
     /** /var/lib/idea-app-data (the receive ledger folder) */
     ledgerDir: string
+    /** /var/lib/docker/volumes: the fake docker reports <volumesDir>/<v>/_data */
+    volumesDir: string
     gateScript: string
     run: (args: string[], env?: Record<string, string>) => Promise<RunResult>
     /** the gate as sshd runs it: argv [peerEngineId], SSH_ORIGINAL_COMMAND = cmd */
@@ -123,8 +125,21 @@ exit $(( found ? 2 : 0 ))`)
 [[ -n "\${FAKE_RSYNC_SLEEP:-}" ]] && exec /bin/sleep "$FAKE_RSYNC_SLEEP"
 echo "      1,024 100%   1.00MB/s    0:00:00 (xfr#1, to-chk=0/1)"
 last="\${@: -1}"
-if [[ "$last" == /proc/self/fd/* ]]; then cp -a ./. "$last" || exit 23; fi
+if [[ "$last" == /proc/self/fd/* || ( "$last" == /*/ && -d "$last" ) ]]; then cp -a ./. "$last" || exit 23; fi
 exit \${FAKE_RSYNC_EXIT:-0}`)
+    // docker ps -q --filter label=com.docker.compose.project=<id>: FAKE_DOCKER_PS (default: none running)
+    await fake('docker', `${RECORD('docker', callsDir)}
+# docker volume ls -q ...: FAKE_DOCKER_VOLUMES (names); docker volume inspect -f ... -- <v>:
+# "\${FAKE_DOCKER_DRIVER:-local} <VOLUMES_DIR>/<v>/_data" (FAKE_VOLUMES_DIR)
+# docker ps -q --filter volume=<v>: FAKE_DOCKER_VOLUME_PS. FAKE_DOCKER_GONE=<v>: inspect fails until "volume create" makes it.
+VD=${path.join(tmp, 'volumes')}
+if [[ "\${1:-}" == ps && "$*" == *volume=* ]]; then [[ -n "\${FAKE_DOCKER_VOLUME_PS:-}" ]] && echo "$FAKE_DOCKER_VOLUME_PS"; exit 0; fi
+if [[ "\${1:-}" == volume && "\${2:-}" == create ]]; then mkdir -p "$VD/\${@: -1}/_data"; touch "$VD/\${@: -1}/.created"; exit 0; fi
+if [[ "\${1:-}" == volume && "\${2:-}" == inspect && "\${@: -1}" == "\${FAKE_DOCKER_GONE:-}" && ! -e "$VD/\${@: -1}/.created" ]]; then exit 1; fi
+if [[ "\${1:-}" == volume && "\${2:-}" == ls ]]; then echo "\${FAKE_DOCKER_VOLUMES:-}"; exit 0; fi
+if [[ "\${1:-}" == volume && "\${2:-}" == inspect ]]; then echo "\${FAKE_DOCKER_DRIVER:-local} ${path.join(tmp, 'volumes')}/\${@: -1}/_data"; exit 0; fi
+[[ -n "\${FAKE_DOCKER_PS:-}" ]] && echo "$FAKE_DOCKER_PS"
+exit \${FAKE_DOCKER_EXIT:-0}`)
     // df -Pk -- <dir>: header + one line, Available = FAKE_DF_AVAIL_KB (default: plenty)
     await fake('df', `${RECORD('df', callsDir)}
 echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
@@ -173,7 +188,9 @@ exit 1`)
         if (!re.test(text)) throw new Error(`idea-app-data has no ${name}= line`)
         text = text.replace(re, `${name}=${value}`)
     }
-    for (const tool of ['rsync', 'rrsync', 'findmnt', 'logger', 'getent', 'df', 'runuser', 'umount', 'mount', 'losetup']) setConst(tool.toUpperCase(), path.join(bin, tool))
+    for (const tool of ['rsync', 'rrsync', 'findmnt', 'logger', 'getent', 'df', 'runuser', 'umount', 'mount', 'losetup', 'docker']) setConst(tool.toUpperCase(), path.join(bin, tool))
+    setConst('VOLUMES_DIR', path.join(tmp, 'volumes'))
+    await fs.ensureDir(path.join(tmp, 'volumes'))
     setConst('MKFS', path.join(bin, 'mkfs.ext4'))
     if (!opts.realBorg) setConst('BORG', path.join(bin, 'borg'))
     setConst('DISKS_DIR', disks)
@@ -276,7 +293,7 @@ SUDO_USER=pi exec ${script} "$@"`)
     const journalText = async () => (await fs.pathExists(journal)) ? fs.readFile(journal, 'utf8') : ''
     return {
         tmp, bin, script, disks, sys, rootsFile, lockDir: path.join(lockParent, 'idea-app-data'), mounts, hosts, journal,
-        peerAuthDir, peerAuthFile: path.join(peerAuthDir, 'pi'), peerKnownHosts, ledgerDir, gateScript,
+        peerAuthDir, peerAuthFile: path.join(peerAuthDir, 'pi'), peerKnownHosts, ledgerDir, gateScript, volumesDir: path.join(tmp, 'volumes'),
         run, runGate, calls, fake, addDisk, addInstance, journalText,
     }
 }
