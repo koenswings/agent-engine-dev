@@ -21,7 +21,7 @@
 #   idea-secrets/tailscale-authkey raw key. Moved to /etc/tailscale/debug-authkey
 #                                  (root 0600, the existing latent-debug key path,
 #                                  idea#115) and wiped from the card at once; then
-#                                  tailscaled is started and `tailscale up
+#                                  `systemctl enable --now tailscaled` and `tailscale up
 #                                  --auth-key=file:...` runs. Offline / failed: the
 #                                  join is retried on later boots until it succeeds.
 #   idea-identity.txt              informational, never read.
@@ -162,7 +162,9 @@ join_tailnet() {
     [ -e "$TS_PENDING" ] || return 0
     [ -f "$KEY_DST" ] || { rm -f "$TS_PENDING"; refuse NO_KEY "$KEY_DST is gone; not joining"; return 0; }
     [ -x "$TAILSCALE" ] || { refuse NO_TAILSCALE "$TAILSCALE is not installed; will retry next boot"; return 0; }
-    "$SYSTEMCTL" start tailscaled >/dev/null 2>&1 || true
+    # Always on (Koen 2026-10-13: one tag:idea, one fleet key; supersedes idea#115's
+    # "tailscaled disabled on Engines"), so the join survives reboots. Not an ephemeral node.
+    "$SYSTEMCTL" enable --now tailscaled >/dev/null 2>&1 || true
     local out rc
     out=$("$TAILSCALE" up --auth-key="file:$KEY_DST" --advertise-tags=tag:idea --hostname="$(cat "$ETC_DIR/hostname" 2>/dev/null || hostname)" --timeout=60s 2>&1)
     rc=$?
