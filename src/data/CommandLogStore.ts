@@ -12,6 +12,7 @@ import { DocHandle, Repo, isValidAutomergeUrl } from '@automerge/automerge-repo'
 import { log, print } from '../utils/utils.js'
 import { fs } from 'zx'
 import path from 'path'
+import { redactString } from '../utils/redact.js'
 import { config, commandLogArchiveMaxBytes } from './Config.js'
 import { stopPeriodicFlush } from '../repo.js'
 
@@ -492,7 +493,7 @@ export const closeTrace = (
     if (trace.status === 'error' && status === 'ok') return
     trace.status = status
     trace.completedAt = Date.now()
-    if (errorMessage) trace.errorMessage = errorMessage
-    if (fromStash !== undefined && fromStash !== null) trace.result = fromStash
+    if (errorMessage) trace.errorMessage = redactString(errorMessage)
+    if (fromStash !== undefined && fromStash !== null) trace.result = redactString(fromStash)
   })
 }
