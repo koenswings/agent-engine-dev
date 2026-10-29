@@ -28,6 +28,7 @@ import { createFilesDisk } from './CreateFilesDisk.js';
 import { summariseDisk, attachTraceResult } from './SummariseDisk.js';
 import { eraseDisk } from './EraseDisk.js';
 import { forgetDisk } from './ForgetDisk.js';
+import { removeInstance } from './RemoveInstance.js';
 import { flashCard, cancelFlash, initialiseDisk } from './FlashCard.js';
 import { testContext } from "../../test/testContext.js";
 
@@ -226,7 +227,9 @@ const startInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instan
     // disks that appear undocked in the CRDT but are physically still attached.
     const disk = (instance.storedOn ? getDisk(store, instance.storedOn) : undefined) ?? findDiskByName(store, diskName)
     if (!disk) throw new Error(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`)
-    startInstance(storeHandle, instance, disk, cause)
+    // #239 (Steve): await the start too, so a stopInstance queued behind it cannot run mid-start
+    // and the start trace closes only once the start is done.
+    await startInstance(storeHandle, instance, disk, cause)
 }
 
 const runInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName) => {
@@ -253,7 +256,9 @@ const stopInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanc
     // to dockedTo != null and would miss disks that appear undocked in the CRDT.
     const disk = (instance.storedOn ? getDisk(store, instance.storedOn) : undefined) ?? findDiskByName(store, diskName)
     if (!disk) throw new Error(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`)
-    stopInstance(storeHandle, instance, disk, 'console-command')
+    // #239: await the stop, so the trace closes only once the containers are stopped and the
+    // command queue (one command at a time) cannot run a following startInstance mid-stop.
+    await stopInstance(storeHandle, instance, disk, 'console-command')
 }
 
 const sendWrapper = (storeHandle: DocHandle<Store> | null, args: string) => {
@@ -356,6 +361,15 @@ const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, dis
  * command has no old name form); the share name takes the rest of the line and
  * defaults to "School Files". Refusals throw, so the trace ends as `error`.
  */
+
+/** removeInstance <instanceId> (idea#347): compose down (volumes kept), quarantine the folder, drop the record. */
+const removeInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: string) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    const engineId = String(getLocalEngine(storeHandle.doc())?.id ?? localEngineId)
+    const result = await removeInstance(storeHandle, instanceArg, engineId)
+    attachTraceResult(result)
+    print(chalk.green(`Removed instance ${result.instanceId}; its folder is kept at ${result.quarantinePath}`))
+}
 
 /** summariseDisk <diskId|candidateId> (idea#134). Result in CommandTrace.result. */
 const summariseDiskWrapper = async (storeHandle: DocHandle<Store> | null, targetId: string) => {
@@ -486,6 +500,7 @@ export const commands: CommandDefinition[] = [
     { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "mode" }, { type: "string", name: "instanceNames", variadic: true }], scope: 'engine' },
     { name: "createFilesDisk", execute: createFilesDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "shareName", variadic: true, optional: true }], scope: 'engine' },
+    { name: "removeInstance", execute: removeInstanceWrapper, args: [{ type: "string", name: "instanceId" }], scope: 'engine' },
     { name: "summariseDisk", execute: summariseDiskWrapper, args: [{ type: "string", name: "targetId" }], scope: 'engine' },
     { name: "eraseDisk", execute: eraseDiskWrapper, args: [{ type: "string", name: "targetId" }, { type: "string", name: "summaryTraceId" }, { type: "string", name: "confirmName", variadic: true }], scope: 'engine' },
     // idea#201 §10 (Engine API contract v2): ids only. Trace arg keys are the contract names.

@@ -16,7 +16,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { fs, path } from 'zx'
 import { makeAppDataSandbox, AppDataSandbox } from '../harness/appDataSandbox.js'
-import { remoteHelperCommand, remoteHelperRsyncPath, receiveAppArgs, receiveServiceArgs, receiveFilesArgs, deleteArgs, ensureDirsArgs, APP_DATA_HELPER } from '../../src/utils/appDataHelper.js'
+import { remoteHelperCommand, remoteHelperRsyncPath, receiveAppArgs, receiveServiceArgs, receiveFilesArgs, deleteArgs, ensureDirsArgs, APP_DATA_HELPER, APP_DATA_HELPER_VERSION } from '../../src/utils/appDataHelper.js'
 
 let sb: AppDataSandbox
 beforeEach(async () => { sb = await makeAppDataSandbox() })
@@ -131,10 +131,10 @@ describe('idea-peer-gate: everything outside the allow-list is refused, sudo nev
 })
 
 describe('idea-peer-gate end to end (gate → sudo → helper)', () => {
-    it('version answers the helper protocol version (3)', async () => {
+    it('version answers the helper protocol version (APP_DATA_HELPER_VERSION)', async () => {
         const r = await sb.runGate([PEER], `sudo -n ${H} version`)
         expect(r.exitCode, r.stderr).toBe(0)
-        expect(r.stdout.trim()).toBe('idea-app-data 3')
+        expect(r.stdout.trim()).toBe(`idea-app-data ${APP_DATA_HELPER_VERSION}`)
     })
 
     it('a receive is recorded for the peer named by the key; only that peer may delete it', async () => {
