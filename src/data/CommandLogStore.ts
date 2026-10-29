@@ -35,6 +35,8 @@ export interface CommandTrace {
   completedAt: number | null
   status: TraceStatus
   errorMessage: string | null
+  /** Stable machine code of the error (e.g. moveApp's MoveCode, idea#79); absent when the error has none */
+  errorCode?: string | null
   /** JSON result for commands that return data (summariseDisk, idea#134); null otherwise */
   result?: string | null
   logs: LogEntry[]          // Automerge list — appended in batches via flushLogs
@@ -473,6 +475,7 @@ export const closeTrace = (
   errorMessage?: string,
   /** When set, written in the same Automerge change as status (Console sees both together). */
   resultJson?: string | null,
+  errorCode?: string | null,
 ): void => {
   const fromStash = resultJson !== undefined ? resultJson : takePendingTraceResult(traceId)
   liveCommandLogHandle(handle).change(doc => {
@@ -482,6 +485,7 @@ export const closeTrace = (
     trace.status = status
     trace.completedAt = Date.now()
     if (errorMessage) trace.errorMessage = errorMessage
+    if (errorCode) trace.errorCode = errorCode
     if (fromStash !== undefined && fromStash !== null) trace.result = fromStash
   })
 }

@@ -486,6 +486,8 @@ describe('moveApp', () => {
             const t = log.doc().traces[ids[ids.length - 1]]
             expect(t.status).toBe('error')
             expect(t.errorMessage).toMatch(/^MOVE FAILED: .*source kept$/)
+            expect(t.errorCode).toBe('PEER_ACCESS')
+            expect(JSON.parse(t.result!)).toMatchObject({ code: 'PEER_ACCESS', text: t.errorMessage })
             expect(Object.keys(handle.doc().operationDB)).toHaveLength(0)
             consoleSpy.mockRestore()
         } finally {

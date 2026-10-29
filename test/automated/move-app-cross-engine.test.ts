@@ -11,8 +11,8 @@ import { Repo, DocHandle } from '@automerge/automerge-repo'
 import { Store } from '../../src/data/Store.js'
 import { localEngineId } from '../../src/data/Engine.js'
 import { InstanceID, DiskID, DiskName, EngineID, Timestamp, AppID } from '../../src/data/CommonTypes.js'
-import { moveAppCrossEngine, verifyMoveTarget, MoveDeps, refusalCode } from '../../src/data/MoveAppRemote.js'
-import { MoveError, MOVE_CROSS_ENGINE_CAPABILITY, moveFailedText, sourceNotRemovedText, sizesMatch } from '../../src/data/MoveAppShapes.js'
+import { moveAppCrossEngine, verifyMoveTarget, MoveDeps, refusalCode, moveCommandOutcome } from '../../src/data/MoveAppRemote.js'
+import { MoveError, MOVE_CODES, MOVE_FAILURE_CODES, MOVE_REFUSAL_CODES, MOVE_DONE_CODES, MOVE_CROSS_ENGINE_CAPABILITY, moveFailedText, sourceNotRemovedText, sizesMatch } from '../../src/data/MoveAppShapes.js'
 import { recoverInterruptedOperations } from '../../src/data/Operations.js'
 import { RemoveError } from '../../src/data/RemoveInstance.js'
 
@@ -107,7 +107,7 @@ describe('moveApp across Engines (idea#79)', () => {
         const h = makeStore()
         const { deps, removeSource } = twoEngines(h, { targetBytes: 10 * 1024 * 1024 })
         const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)
-        expect(r.code).toBe('VERIFY_FAILED')
+        expect(r.code).toBe('VERIFY_SIZE')
         expect(r.text).toMatch(/^MOVE FAILED: .*; source kept$/)
         expect(removeSource).not.toHaveBeenCalled()
         expect(h.doc().instanceDB[INST]?.storedOn).toBe(SRC_DISK)
@@ -119,7 +119,7 @@ describe('moveApp across Engines (idea#79)', () => {
         const h = makeStore({ status: 'Running' })
         const { deps, removeSource } = twoEngines(h, { targetStatus: 'Error' })
         const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)
-        expect(r.code).toBe('VERIFY_FAILED')
+        expect(r.code).toBe('VERIFY_NOT_RUNNING')
         expect(r.text).toContain('failed to start')
         expect(removeSource).not.toHaveBeenCalled()
     })
@@ -256,7 +256,7 @@ describe('moveApp across Engines (idea#79)', () => {
         const h = makeStore({ status: 'Running' })
         const { deps, startSource } = twoEngines(h, { targetBytes: 1 })
         const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)
-        expect(r.code).toBe('VERIFY_FAILED')
+        expect(r.code).toBe('VERIFY_SIZE')
         expect(startSource).toHaveBeenCalledTimes(1)
         expect(h.doc().instanceDB[INST]?.status).toBe('Running')
     })
@@ -277,5 +277,70 @@ describe('moveApp across Engines (idea#79)', () => {
         expect(refusalCode("Source disk 'x' is docked to a remote engine. Copy/move must be initiated from that engine.")).toBe('SOURCE_REMOTE')
         expect(sizesMatch(BYTES, BYTES + 1000)).toBe(true)
         expect(sizesMatch(BYTES, BYTES / 2)).toBe(false)
+    })
+
+    // ── stable machine code on BOTH the op and the command trace (console#179) ──
+    const viaTrace = async (h: DocHandle<Store>, deps: Partial<MoveDeps>) => {
+        const { handleCommand } = await import('../../src/utils/commandUtils.js')
+        const log = new Repo({ network: [] }).create<any>({ traces: {}, recentTraceIds: [] })
+        const commands = [{ name: 'moveApp', args: [], scope: 'engine' as const, execute: async (sh: any) => {
+            moveCommandOutcome(await moveAppCrossEngine(sh, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps))
+        } }]
+        await handleCommand(commands, h, 'engine', 'moveApp', log)
+        const ids = log.doc().recentTraceIds
+        return log.doc().traces[ids[ids.length - 1]]
+    }
+    const scenarios: [string, any, (h: DocHandle<Store>, d: Partial<MoveDeps>) => void, string][] = [
+        ['MOVED', {}, () => {}, 'MOVED'],
+        ['VERIFY_SIZE', { targetBytes: 1 }, () => {}, 'VERIFY_SIZE'],
+        ['VERIFY_NOT_RUNNING', { status: 'Running', targetStatus: 'Stopped' }, () => {}, 'VERIFY_NOT_RUNNING'],
+        ['VERIFY_NOT_FOUND', { copyNotRegistered: true }, () => {}, 'VERIFY_NOT_FOUND'],
+        ['VERIFY_TIMEOUT', { verifyReply: false }, () => {}, 'VERIFY_TIMEOUT'],
+        ['COPY_FAILED', { copyFails: 'rsync died' }, () => {}, 'COPY_FAILED'],
+        ['SOURCE_NOT_REMOVED', { removeFails: true }, () => {}, 'SOURCE_NOT_REMOVED'],
+        ['SOURCE_CHANGED', { sourceBytesSeq: [BYTES, BYTES * 2] }, () => {}, 'SOURCE_CHANGED'],
+        ['HELPER_OUTDATED (refusal)', {}, (_h, d) => { d.helperProblem = async () => 'needs helper v4' }, 'HELPER_OUTDATED'],
+        ['TARGET_UNREACHABLE (refusal)', {}, (_h, d) => { d.validate = async () => `Target engine '${TGT}' is not currently reachable (not in network connections).` }, 'TARGET_UNREACHABLE'],
+    ]
+    it.each(scenarios)('%s: code on op.move.code and trace errorCode/result.code', async (_n, o, tweak, code) => {
+        const h = makeStore(o.status ? { status: o.status } : undefined)
+        const { deps } = twoEngines(h, o)
+        if (o.copyNotRegistered) deps.copy = async (sh) => { sh.change(d => { (d.instanceDB as any)[INST].status = 'Stopped' }); return NEW }
+        tweak(h, deps)
+        const t = await viaTrace(h, deps)
+        const result = JSON.parse(t.result)
+        expect(result.code).toBe(code)
+        expect(typeof result.text).toBe('string')
+        const refusal = (MOVE_REFUSAL_CODES as readonly string[]).includes(code)
+        const failed = refusal || (MOVE_FAILURE_CODES as readonly string[]).includes(code)
+        expect(t.status).toBe(failed ? 'error' : 'ok')
+        if (failed) {
+            expect(t.errorCode).toBe(code)
+            expect(t.errorMessage).toBe(result.text)
+            expect(t.errorMessage).toMatch(/^MOVE FAILED: .*source kept$/)
+        } else {
+            expect(t.errorCode ?? null).toBeNull()
+        }
+        if (refusal) expect(Object.keys(h.doc().operationDB)).toHaveLength(0)
+        else {
+            expect(theOp(h).move.code).toBe(code)
+            expect(theOp(h).status).toBe(failed ? 'Failed' : 'Done')
+        }
+    })
+
+    it('BUSY: a locked instance is refused with BUSY', async () => {
+        const { resourceLock, instanceKey } = await import('../../src/utils/ResourceLock.js')
+        const h = makeStore()
+        const { deps } = twoEngines(h)
+        expect(resourceLock.acquire(instanceKey(INST), 'test')).toBe(true)
+        try {
+            await expect(moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)).rejects.toMatchObject({ code: 'BUSY' })
+        } finally { resourceLock.release(instanceKey(INST)) }
+    })
+
+    it('MOVE_CODES is the single list: refusals + failures + done, no duplicates', () => {
+        expect(MOVE_CODES).toEqual([...MOVE_REFUSAL_CODES, ...MOVE_FAILURE_CODES, ...MOVE_DONE_CODES])
+        expect(new Set(MOVE_CODES).size).toBe(MOVE_CODES.length)
+        expect(MOVE_CODES).toEqual(expect.arrayContaining(['VERIFY_SIZE', 'VERIFY_NOT_RUNNING', 'VERIFY_NOT_FOUND', 'VERIFY_TIMEOUT']))
     })
 })

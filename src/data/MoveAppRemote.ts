@@ -21,12 +21,14 @@ import { Disk, appDataRoot } from './Disk.js'
 import { Instance, startInstance } from './Instance.js'
 import { InstanceID, InstanceName, DiskID, EngineID, OperationCause, Timestamp, Command } from './CommonTypes.js'
 import { createOperation, updateOperation } from './Operations.js'
+import { attachTraceResult } from './SummariseDisk.js'
 import { sendCommand } from '../utils/commandUtils.js'
+import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
 import { instanceDataBytes, helperAtLeast } from '../utils/appDataHelper.js'
 import { REMOVE_HELPER_MIN, RemoveError, removeInstance } from './RemoveInstance.js'
 import {
     MOVE_CROSS_ENGINE_CAPABILITY, MOVE_STEPS, MOVE_STEP_INDEX, MoveError, MoveProgress, MoveResult,
-    MoveRefusalCode, MoveVerify, moveFailedText, movedText, sourceNotRemovedText, sizesMatch,
+    MOVE_FAILURE_CODES, MoveRefusalCode, MoveVerify, VerifyCode, MoveFailureCode, moveFailedText, movedText, sourceNotRemovedText, sizesMatch,
 } from './MoveAppShapes.js'
 
 export interface MoveDeps {
@@ -115,7 +117,10 @@ export const moveAppCrossEngine = async (
     deps: Partial<MoveDeps> = {},
 ): Promise<MoveResult> => {
     const d = { ...defaultDeps, ...deps }
-    const refuse = (code: MoveRefusalCode, reason: string): never => { throw new MoveError(code, moveFailedText(reason)) }
+    const refuse = (code: MoveRefusalCode, reason: string): never => {
+        const text = moveFailedText(reason)
+        throw new MoveError(code, text, { code, text, sourceInstanceId: String(instanceName), targetInstanceId: null, targetEngineId: '', quarantinePath: null })
+    }
 
     // ── Refusals: nothing has happened yet ──────────────────────────────────
     const v = await d.validate(storeHandle.doc(), instanceName, sourceDiskId, targetDiskId)
@@ -130,6 +135,9 @@ export const moveAppCrossEngine = async (
     }
     const helper = await d.helperProblem()
     if (helper) refuse('HELPER_OUTDATED', helper)
+    if (resourceLock.isLocked(instanceKey(instance.id)) || resourceLock.isLocked(diskKey(targetDisk.id))) {
+        refuse('BUSY', `another operation is running on '${instance.name}' or the target disk; retry when it completes`)
+    }
 
     const expectRunning = instance.status === 'Running' || instance.status === 'Starting'
     const move: MoveProgress = {
@@ -188,7 +196,7 @@ export const moveAppCrossEngine = async (
         await sleep(d.pollMs)
     }
     if (!verdict) { await restartIfNeeded(); return fail('VERIFY_TIMEOUT', `${targetName} did not confirm the copy in time`, String(targetInstanceId)) }
-    if (!verdict.ok) { await restartIfNeeded(); return fail('VERIFY_FAILED', `the copy on ${targetName} did not check out (${verdict.detail ?? 'no detail'})`, String(targetInstanceId)) }
+    if (!verdict.ok) { await restartIfNeeded(); return fail(verdict.code ?? 'VERIFY_FAILED', `the copy on ${targetName} did not check out (${verdict.detail ?? 'no detail'})`, String(targetInstanceId)) }
     // The one gate for removing the source: recorded before any removal step
     patchMove(storeHandle, opId, { verified: true })
 
@@ -222,6 +230,16 @@ export const moveAppCrossEngine = async (
     }
 }
 
+/**
+ * The moveApp command's trace for a cross-Engine outcome (idea#79): a failure
+ * throws, so the trace ends as 'error' with errorCode + errorMessage + result;
+ * Done outcomes attach the result (result.code, result.text).
+ */
+export const moveCommandOutcome = (result: MoveResult): void => {
+    if ((MOVE_FAILURE_CODES as readonly string[]).includes(result.code)) throw new MoveError(result.code, result.text, result)
+    attachTraceResult(result)
+}
+
 // ── verifyMoveTarget (runs on the TARGET Engine) ─────────────────────────────
 
 export interface VerifyDeps {
@@ -252,7 +270,7 @@ export const verifyMoveTarget = async (
         storeHandle.change(doc => { const op = doc.operationDB?.[opId] as any; if (op?.move) op.move.verify = { ...v } })
         return v
     }
-    const bad = (detail: string) => write({ ok: false, bytes: null, detail, at: Date.now() })
+    const bad = (code: VerifyCode, detail: string) => write({ ok: false, code, bytes: null, detail, at: Date.now() })
     const deadline = Date.now() + d.timeoutMs
     let inst = getInstance(storeHandle.doc(), instanceId as InstanceID)
     const wantRunning = expectRunning === 'true'
@@ -263,18 +281,18 @@ export const verifyMoveTarget = async (
         if (inst && (!wantRunning || inst.status === 'Running')) break
         await new Promise(r => setTimeout(r, d.pollMs))
     }
-    if (!inst) return bad('the copy is not registered')
+    if (!inst) return bad('VERIFY_NOT_FOUND', 'the copy is not registered')
     const disk = getDisk(storeHandle.doc(), inst.storedOn as DiskID)
-    if (!disk || String(disk.dockedTo) !== me) return bad('the copy is not on a disk docked to this Engine')
-    if (inst.status === 'Error') return bad('the copy failed to start')
-    if (wantRunning && inst.status !== 'Running') return bad(`the copy did not start (status ${inst.status})`)
+    if (!disk || String(disk.dockedTo) !== me) return bad('VERIFY_NOT_FOUND', 'the copy is not on a disk docked to this Engine')
+    if (inst.status === 'Error') return bad('VERIFY_NOT_RUNNING', 'the copy failed to start')
+    if (wantRunning && inst.status !== 'Running') return bad('VERIFY_NOT_RUNNING', `the copy did not start (status ${inst.status})`)
     let bytes: number
-    try { bytes = await d.targetBytes(disk, inst.id) } catch (e: any) { return bad(`cannot size the copy (${e?.message ?? e})`) }
+    try { bytes = await d.targetBytes(disk, inst.id) } catch (e: any) { return bad('VERIFY_FAILED', `cannot size the copy (${e?.message ?? e})`) }
     const expected = Number(expectedBytes)
     if (!Number.isFinite(expected) || !sizesMatch(expected, bytes)) {
-        const v = write({ ok: false, bytes, detail: `size ${bytes} bytes, expected ${expectedBytes}`, at: Date.now() })
+        const v = write({ ok: false, code: 'VERIFY_SIZE', bytes, detail: `size ${bytes} bytes, expected ${expectedBytes}`, at: Date.now() })
         return v
     }
     log(`verifyMoveTarget: copy ${instanceId} checks out (${bytes} bytes)`)
-    return write({ ok: true, bytes, detail: null, at: Date.now() })
+    return write({ ok: true, code: null, bytes, detail: null, at: Date.now() })
 }

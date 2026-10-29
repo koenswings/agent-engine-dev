@@ -416,7 +416,8 @@ const moveAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName
     if (!storeHandle) throw new Error('Store is not available.')
     const result = await moveApp(storeHandle, instanceName, sourceDiskId, targetDiskId, 'console-command')
     if (result) {
-        attachTraceResult(result)
+        const { moveCommandOutcome } = await import('./MoveAppRemote.js')
+        moveCommandOutcome(result)
         print(result.code === 'MOVED' ? chalk.green(result.text) : chalk.yellow(result.text))
     }
 }
