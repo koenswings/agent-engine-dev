@@ -84,6 +84,15 @@ These commands perform actions on the system. Some are restricted to an `engine`
 - **Usage:** `stopInstance <instanceId|instanceName> <diskId|diskName>` (idea#168). The instance resolves id-first (see [Instance arguments](#instance-arguments)); an ambiguous name is refused.
 - **Scope:** `engine`
 
+### `renameInstance`
+- **Description:** Changes only an instance's display name (agent-engine-dev#220). It rewrites `x-app.instanceName` in `<disk>/instances/<id>/compose.yaml` (written as pi) and then `instance.name` in the store, so the name survives the next dock or Engine restart without a `pm2 restart`. The id, folder, Docker project, containers, volumes, data and port are unchanged. Nothing uses the display name as a key, so a running instance may be renamed.
+- **Usage:** `renameInstance <instanceId|instanceName> <newName…>`. The new name is the rest of the line, quoted or not (`renameInstance kolibri-g3c6r "Kolibri Demo"`). An instance name must be unique among instances on this Engine (see [Instance arguments](#instance-arguments)); send the id.
+- **Validation:** the name is trimmed, then must be 1–64 characters with no control characters (the same limits as `installApp --name`, `MAX_INSTANCE_NAME_LENGTH`), and unique, case-insensitive, among instances stored on this Engine. The same name as now is a no-op ok (`changed: false`, nothing written).
+- **Result:** `CommandTrace.result` = `{ instanceId, oldName, newName, changed }`.
+- **Refusals** (trace ends as `error`, `errorMessage` starts with the code): `NOT_FOUND`, `NOT_LOCAL` (stored on a disk not docked here), `AMBIGUOUS` (name shared on this Engine), `EMPTY_NAME`, `NAME_TOO_LONG`, `BAD_NAME`, `NAME_TAKEN`, `BUSY` (a copy, move, backup or restore holds the instance lock), `COMPOSE_WRITE_FAILED` (compose.yaml not written; store unchanged).
+- **Capability:** `capabilities.includes('renameInstance') && capabilitiesBootedAt === lastBooted`
+- **Scope:** `engine`
+
 ### `copyApp`
 - **Description:** Copies an app instance from one disk to another. The copy receives a brand new InstanceID — it is treated as a fresh instance. The original instance is stopped during the file copy (for a consistent snapshot) and restarted **before the copy starts**, so it keeps its port (idea#168 r35). Progress is tracked in `operationDB` in the store and visible to all Consoles.
 - **The copy is its own instance (idea#168 r35):**
