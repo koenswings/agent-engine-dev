@@ -3,6 +3,7 @@ import { $, chalk, fs, os, question } from 'zx';
 import { IPAddress, PortNumber } from '../data/CommonTypes.js';
 import net from 'net';
 import crypto from 'crypto';
+import { redactSecrets, redactString } from './redact.js'
 
 
 // Dummy key
@@ -85,17 +86,17 @@ export const log = (msg:string, level?:number):void => {
     level = 2
   }
   if (verbosityLevel >= level) {
-    console.info(chalk.gray(msg))
+    console.info(chalk.gray(redactString(String(msg))))
   }
 }
 
 export const error = (msg:string):void => {
-  console.error(chalk.red(msg))
+  console.error(chalk.red(redactString(String(msg))))
 }
 
 /** Always-on status/output helper. Uses console.info (captured by CommandLogger). */
 export const print = (...args: unknown[]): void => {
-  console.info(...args)
+  console.info(...args.map(a => redactSecrets(a)))
 }
 
 export const setVerbosity = (level:number):void => {
@@ -199,7 +200,7 @@ export const contains = (yarray, value) => {
   }
 
 export const deepPrint = (obj, depth:(number | null)=null) => {
-    return util.inspect(obj, {showHidden: false, depth: depth, colors: true})
+    return util.inspect(redactSecrets(obj), {showHidden: false, depth: depth, colors: true})
     // Alternative: return JSON.stringify(obj, null, 2)
     // Alternative: return console.dir(obj, {depth: null, colors: true})
 }
