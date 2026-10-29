@@ -799,6 +799,8 @@ export const ensureAptPackages = async (exec: any, pkgs: string[]): Promise<stri
  * Ends by checking /usr/bin/borg and `idea-app-data version`; throws if either is wrong.
  */
 /** tmpfiles.d entry that creates /run/idea-usb at boot (idea#193). */
+/** Installed copy of script/build_image_assets/idea-engine-identity (idea#322). */
+export const ENGINE_IDENTITY_HELPER = '/usr/local/sbin/idea-engine-identity'
 export const USB_TMPFILES_CONF = '/etc/tmpfiles.d/idea-usb.conf'
 
 export const installRootHelpers = async (exec: any, enginePath: string) => {
@@ -819,6 +821,11 @@ export const installRootHelpers = async (exec: any, enginePath: string) => {
   print(chalk.blue('  - Installing idea-write-card-timezone...'))
   await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-write-card-timezone /usr/local/sbin/idea-write-card-timezone`
   print(chalk.green('  - /usr/local/sbin/idea-write-card-timezone installed'))
+  // idea-engine-identity (idea#322): applies the flash-time identity from the boot partition.
+  // Run as root by boot.sh on every boot; root-owned COPY, no sudoers entry (the Engine never calls it).
+  print(chalk.blue('  - Installing idea-engine-identity...'))
+  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-engine-identity ${ENGINE_IDENTITY_HELPER}`
+  print(chalk.green(`  - ${ENGINE_IDENTITY_HELPER} installed`))
   // idea-flash-card: client-card flash helper (idea#201 §10), root-owned COPY, 0755
   print(chalk.blue('  - Installing idea-flash-card...'))
   await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-flash-card ${FLASH_HELPER_PATH}`
