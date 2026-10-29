@@ -267,7 +267,8 @@ describe('regression: normal autostart and interrupted operations', () => {
     it('Running instances whose containers survived keep running (the already-running path)', async () => {
         const handle = await makeStore()
         await checkAndSetUndockedApps(handle, localEngineId, async (id) => h.running.has(String(id)))
-        for (const id of [MILKWISE, KOLIBRI, NEXTCLOUD]) expect(status(handle, id)).toBe('Running')
+        // #167: Starting until the dock pass confirms them (startInstance's already-running path)
+        for (const id of [MILKWISE, KOLIBRI, NEXTCLOUD]) expect(status(handle, id)).toBe('Starting')
     })
 
     for (const cause of ['backup-pre-stop', 'post-copy', 'post-move', 'disk-undocked'] as OperationCause[]) {
@@ -315,6 +316,12 @@ describe('regression: normal autostart and interrupted operations', () => {
 
         expect(status(handle, KOLIBRI)).toBe('Stopped')
         expect(h.started).not.toContain(KOLIBRI)
+    })
+
+    it('#167: survived containers go Starting at startup, then Running after the dock pass', async () => {
+        const handle = await makeStore()
+        await restartEngine(handle)
+        for (const id of [MILKWISE, KOLIBRI, NEXTCLOUD]) expect(status(handle, id)).toBe('Running')
     })
 
     it('a user stop interrupted before its containers stopped leaves the running instance alone', async () => {

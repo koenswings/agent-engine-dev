@@ -25,6 +25,9 @@
 #   idea-app-data send         <srcRoot> <srcId> <host> <peerEngineId> <dstRoot> <dstId>
 #   idea-app-data receive      <dstRoot> <dstId> <rsync server args...>   (remote side of send only)
 #   idea-app-data delete       <root> <id>
+#   idea-app-data quarantine   <root> <id>   (v4, idea#347: rename instances/<id> to
+#                                            .idea-quarantine/<id>-<UTC stamp> on the same disk,
+#                                            root-owned 0700; never deletes from .idea-quarantine)
 #   Peer side (through idea-peer-gate; every receive refuses below the free-space floor):
 #   idea-app-data peer-receive       <peerEngineId> <dstRoot> <dstId> <rsync server args...>
 #                                    (a NEW instance folder; recorded in the ledger)
@@ -107,7 +110,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=3
+readonly IDEA_APP_DATA_VERSION=4
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -845,6 +848,31 @@ case "$SUB" in
         pin_cwd "$PARENT"
         run_child $RM -rf --one-file-system -- "./$3"
         exit $?
+        ;;
+
+    quarantine)
+        need 2 $(($# - 1)) "<root> <id>"
+        check_id "$3"
+        resolve_root "$2" instances
+        PARENT="$R_DIR/instances"
+        existing_dir "$PARENT" "instances folder"
+        INST="$PARENT/$3"
+        [[ ! -L "$INST" ]] || refuse "$INST is a symlink"
+        [[ -e "$INST" ]] || refuse "$INST does not exist; nothing to quarantine"
+        existing_dir "$INST" "instance folder"
+        take_locks "inst.$2.$3"
+        QDIR="$R_DIR/.idea-quarantine"
+        root_dir "$QDIR" 0700 "quarantine folder"
+        $CHMOD 0700 -- "$QDIR" || refuse "cannot set mode 0700 on $QDIR"
+        QDEST="$QDIR/$3-$($DATE -u +%Y%m%dT%H%M%SZ)"
+        [[ ! -e "$QDEST" && ! -L "$QDEST" ]] || refuse "$QDEST already exists"
+        pin_cwd "$PARENT"
+        $MV -T -- "./$3" "$QDEST" || refuse "cannot move $INST to $QDEST"
+        $CHOWN root:root -- "$QDEST" 2>/dev/null || true
+        $CHMOD 0700 -- "$QDEST" || true
+        journal "quarantine: $INST -> $QDEST"
+        echo "$QDEST"
+        exit 0
         ;;
 
     borg-init)
