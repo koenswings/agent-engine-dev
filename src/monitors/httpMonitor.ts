@@ -15,8 +15,10 @@
  * same-origin calls such as /api/store-url keep working. Closing the main server
  * closes the extra listener.
  *
- * If `consolePath` is empty or the directory does not exist, the static file
- * serving is skipped but /api/store-url is still available.
+ * If `consolePath` is empty, static requests get 404 "Console UI not configured". If it is
+ * set but `<consolePath>/index.html` is missing (e.g. mid-rebuild), they get 503 "Console UI
+ * not built yet" and the check is repeated on every request, so a Console built after the
+ * Engine started is served without a restart (agent-engine-dev#264). /api/* always works.
  *
  * The Console uses /api/store-url as:
  *   GET http://<engine-hostname>/api/store-url
@@ -100,15 +102,21 @@ export const enableHttpMonitor = (
     opts: { engineId?: string, wsPort?: number } = {},  // engineId for /api/store-url; wsPort = Engine WebSocket port for Upgrade pass-through
 ): http.Server => {
 
-    const hasConsole = consolePath && fs.existsSync(consolePath)
-
-    if (consolePath && !hasConsole) {
-        log(`[http] consolePath "${consolePath}" not found — Console UI will not be served`)
-    } else if (hasConsole) {
-        log(`[http] Serving Console UI from ${consolePath}`)
-    } else {
-        log(`[http] No consolePath configured — Console UI will not be served`)
+    // agent-engine-dev#264: the Console is not settled at startup. A build that lands after
+    // the Engine started (vite empties dist/ first) is served on the next request, no restart.
+    let lastState: 'none' | 'missing' | 'ready' | null = null
+    const consoleState = (): 'none' | 'missing' | 'ready' => {
+        const state = !consolePath ? 'none'
+            : fs.existsSync(path.join(consolePath, 'index.html')) ? 'ready' : 'missing'
+        if (state !== lastState) {
+            lastState = state
+            if (state === 'ready') log(`[http] Serving Console UI from ${consolePath}`)
+            else if (state === 'missing') log(`[http] Console UI not built yet in "${consolePath}" (no index.html) — answering 503 until it appears`)
+            else log(`[http] No consolePath configured — Console UI will not be served`)
+        }
+        return state
     }
+    consoleState()
 
     const handler: http.RequestListener = async (req, res) => {
         const url = req.url ?? '/'
@@ -147,9 +155,15 @@ export const enableHttpMonitor = (
         }
 
         // ── Static Console files ────────────────────────────────────────────
-        if (!hasConsole) {
+        const state = consoleState()
+        if (state === 'none') {
             res.writeHead(404, { 'Content-Type': 'text/plain' })
             res.end('Console UI not configured on this Engine')
+            return
+        }
+        if (state === 'missing') {
+            res.writeHead(503, { 'Content-Type': 'text/plain', 'Retry-After': '5' })
+            res.end('Console UI not built yet on this Engine')
             return
         }
 
