@@ -28,6 +28,7 @@ const deps = (over: Partial<UpdateDeps> = {}): Partial<UpdateDeps> => {
         helperProblem: async () => null,
         mountRoot: async () => tmp,
         verifySums: async () => true,
+        fetch: async () => { calls.push('fetch'); throw new Error('no fetch expected') },
         estimate: async () => ({ folderBytes: 1000, volumeBytes: 0, freeBytes: 50 * 1024 ** 3 }),
         dirBytes: async () => 10,
         stop: async () => { calls.push('stop'); h.change(d => { (d.instanceDB['i1' as any] as any).status = 'Stopped' }) },
@@ -197,9 +198,40 @@ describe('updateApp (#230)', () => {
         expect(out[0]).toMatch(/old version untouched/)
         expect(calls).toEqual([])
     })
+    it('#263: --source on a disk docked to another Engine fetches first (under the lock), then updates from the fetched bundle', async () => {
+        health = ['healthy']
+        await fs.remove(`${tmp}/apps/kolibri-1.1`)
+        h.change(doc => { doc.diskDB['r1' as any] = { id: 'r1', name: 'r1', device: 'sdb1', dockedTo: 'other-engine', diskTypes: ['app'] } as any })
+        const seen: any[] = []
+        const r = await updateApp(h, 'i1', 'kolibri-1.1', ME, { sourceDiskId: 'r1' }, deps({ fetch: async (req) => {
+            seen.push(req); calls.push('fetch')
+            expect(resourceLock.isLocked(instanceKey('i1' as any))).toBe(true)
+            await fs.outputFile(`${tmp}/apps/kolibri-1.1/compose.yaml`, compose('1.1'))
+            await fs.outputFile(`${tmp}/apps/kolibri-1.1/.idea-fetched`, 'x')
+            return `${tmp}/apps/kolibri-1.1`
+        } }))
+        expect(r.toAppId).toBe('kolibri-1.1')
+        expect(calls[0]).toBe('fetch')
+        expect(seen[0]).toMatchObject({ localEngineId: ME, instanceId: 'i1', newAppId: 'kolibri-1.1' })
+        expect(String(seen[0].sourceDisk.id)).toBe('r1'); expect(String(seen[0].targetDisk.id)).toBe('d1')
+        expect(await fs.pathExists(`${tmp}/instances/i1/.idea-fetched`)).toBe(false)   // markers are not copied into the instance
+    })
+    it('#263: TRANSFER_FAILED from the Fetch changes nothing (no stop, no snapshot); a local source never fetches', async () => {
+        await fs.remove(`${tmp}/apps/kolibri-1.1`)
+        h.change(doc => { doc.diskDB['r1' as any] = { id: 'r1', name: 'r1', device: 'sdb1', dockedTo: 'other-engine', diskTypes: ['app'] } as any })
+        const m = await codeOf(updateApp(h, 'i1', 'kolibri-1.1', ME, { sourceDiskId: 'r1' }, deps({ fetch: async () => { const { UpdateAppError } = await import('../../src/data/UpdateAppPolicy.js'); throw new UpdateAppError('TRANSFER_FAILED', 'rsync failed after 3 retries') } })))
+        expect(m).toMatch(/^TRANSFER_FAILED: rsync failed after 3 retries/)
+        expect(calls).toEqual([])
+        expect(inst().status).toBe('Running')
+        expect(await codeOf(updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps()))).toMatch(/^SOURCE_MISSING/)
+        expect(calls).toEqual([])
+    })
     it('wiring: command, capability, args, health aggregation, scans ignore .pre-update', () => {
         expect(commands.find(c => c.name === 'updateApp')).toBeTruthy()
         expect(ENGINE_CAPABILITIES).toContain('updateApp')
+        expect(ENGINE_CAPABILITIES).toContain('updateAppFetch')
+        expect(commands.find(c => c.name === 'pushAppBundle')?.args).toHaveLength(6)
+        expect(commands.find(c => c.name === 'appFetchResult')).toBeTruthy()
         expect(parseUpdateAppArgs('Kolibri kolibri-1.1 --allow-major --source d2')).toEqual({ instanceArg: 'Kolibri', newAppId: 'kolibri-1.1', opts: { allowMajor: true, sourceDiskId: 'd2' } })
         expect(() => parseUpdateAppArgs('one')).toThrow(/Usage: updateApp/)
         expect(aggregateHealth([{ status: 'running', health: 'healthy' }, { status: 'exited', exitCode: 0 }]).state).toBe('healthy')

@@ -5,6 +5,7 @@ import { ArgumentDescriptor, CommandDefinition } from "../data/CommandDefinition
 import { CommandLogStore, addTrace, closeTrace, getCommandLogHandle, takePendingTraceResult } from "../data/CommandLogStore.js";
 import { runWithTrace, flushTrace } from "./CommandLogger.js";
 import { print } from './utils.js';
+import { redactString } from './redact.js';
 
 
 /**
@@ -23,13 +24,13 @@ const recordErrorTrace = (
     addTrace(commandLogHandle, {
         traceId,
         command: commandName || '(empty)',
-        args: argsJson,
+        args: redactString(argsJson),
         startedAt: Date.now(),
         completedAt: null,
         status: 'running',
         errorMessage: null,
     });
-    closeTrace(commandLogHandle, traceId, 'error', message);
+    closeTrace(commandLogHandle, traceId, 'error', redactString(message));
 }
 
 

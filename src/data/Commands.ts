@@ -382,6 +382,22 @@ const updateAppWrapper = async (storeHandle: DocHandle<Store> | null, argsString
     print(chalk.green(`Updated ${result.name} ${result.fromAppId} -> ${result.toAppId}; snapshot kept at ${result.snapshotPath} (${result.snapshotBytes} bytes)`))
 }
 
+/** #263 source side: pushAppBundle <sourceDiskId> <appId> <targetEngineId> <targetRoot> <requestId> <instanceId> */
+const pushAppBundleWrapper = async (storeHandle: DocHandle<Store> | null, sourceDiskId: string, appId: string, targetEngineId: string, targetRoot: string, requestId: string, instanceId: string) => {
+    if (!storeHandle) throw new Error('Store is not available.')
+    const { pushAppBundle, defaultPushDeps } = await import('./UpdateFetch.js')
+    const engineId = String(getLocalEngine(storeHandle.doc())?.id ?? localEngineId)
+    const a = await pushAppBundle(storeHandle.doc(), engineId, { sourceDiskId, appId, targetEngineId, targetRoot, requestId, instanceId }, defaultPushDeps(storeHandle))
+    attachTraceResult({ requestId, appId, targetEngineId, ok: a.ok, ...(a.ok ? {} : { why: a.why }) })
+    if (!a.ok) throw new Error(`TRANSFER_FAILED: ${a.why}`)
+}
+
+/** #263 target side: appFetchResult <requestId> ok|TRANSFER_FAILED <why…> */
+const appFetchResultWrapper = async (_storeHandle: DocHandle<Store> | null, requestId: string, status: string, ...why: string[]) => {
+    const { handleAppFetchResult } = await import('./UpdateFetch.js')
+    handleAppFetchResult(requestId, status, why)
+}
+
 /** summariseDisk <diskId|candidateId> (idea#134). Result in CommandTrace.result. */
 const summariseDiskWrapper = async (storeHandle: DocHandle<Store> | null, targetId: string) => {
     if (!storeHandle) throw new Error('Store is not available.')
@@ -528,6 +544,8 @@ export const commands: CommandDefinition[] = [
     { name: "createFilesDisk", execute: createFilesDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "shareName", variadic: true, optional: true }], scope: 'engine' },
     { name: "removeInstance", execute: removeInstanceWrapper, args: [{ type: "string", name: "instanceId" }], scope: 'engine' },
     { name: "updateApp", execute: updateAppWrapper, args: [{ type: "string" }], scope: 'engine' },
+    { name: "pushAppBundle", execute: pushAppBundleWrapper, args: ['sourceDiskId', 'appId', 'targetEngineId', 'targetRoot', 'requestId', 'instanceId'].map(name => ({ type: "string" as const, name })), scope: 'engine' },
+    { name: "appFetchResult", execute: appFetchResultWrapper, args: [{ type: "string", name: "requestId" }, { type: "string", name: "status" }, { type: "string", name: "why", variadic: true, optional: true }], scope: 'engine' },
     { name: "summariseDisk", execute: summariseDiskWrapper, args: [{ type: "string", name: "targetId" }], scope: 'engine' },
     { name: "eraseDisk", execute: eraseDiskWrapper, args: [{ type: "string", name: "targetId" }, { type: "string", name: "summaryTraceId" }, { type: "string", name: "confirmName", variadic: true }], scope: 'engine' },
     // idea#201 §10 (Engine API contract v2): ids only. Trace arg keys are the contract names.
