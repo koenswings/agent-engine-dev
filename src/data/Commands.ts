@@ -443,7 +443,21 @@ const copyAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName
 
 const moveAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, sourceDiskId: DiskID, targetDiskId: DiskID) => {
     if (!storeHandle) throw new Error('Store is not available.')
-    await moveApp(storeHandle, instanceName, sourceDiskId, targetDiskId, 'console-command')
+    const result = await moveApp(storeHandle, instanceName, sourceDiskId, targetDiskId, 'console-command')
+    if (result) {
+        const { moveCommandOutcome } = await import('./MoveAppRemote.js')
+        moveCommandOutcome(result)
+        print(result.code === 'MOVED' ? chalk.green(result.text) : chalk.yellow(result.text))
+    }
+}
+
+/** verifyMoveTarget <opId> <instanceId> <expectedBytes> <expectRunning> (idea#79): sent Engine → Engine by a cross-Engine moveApp. */
+const verifyMoveTargetWrapper = async (storeHandle: DocHandle<Store> | null, opId: string, instanceId: string, expectedBytes: string, expectRunning: string) => {
+    if (!storeHandle) throw new Error('Store is not available.')
+    const { verifyMoveTarget } = await import('./MoveAppRemote.js')
+    const v = await verifyMoveTarget(storeHandle, opId, instanceId, expectedBytes, expectRunning)
+    attachTraceResult(v)
+    print(v.ok ? chalk.green(`Move copy ${instanceId} checks out`) : chalk.yellow(`Move copy ${instanceId} does not check out: ${v.detail}`))
 }
 
 export type EjectTarget = DiskArgResult
@@ -531,6 +545,7 @@ export const commands: CommandDefinition[] = [
     { name: "disconnect", execute: disconnect, args: [], scope: 'any' },
     { name: "copyApp", execute: copyAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
     { name: "moveApp", execute: moveAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
+    { name: "verifyMoveTarget", execute: verifyMoveTargetWrapper, args: [{ type: "string", name: "opId" }, { type: "string", name: "instanceId" }, { type: "string", name: "expectedBytes" }, { type: "string", name: "expectRunning" }], scope: 'engine' },
     { name: "ejectDisk", execute: ejectDiskWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
     { name: "forgetDisk", execute: forgetDiskWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
     // backupApp / restoreApp (idea#168): the instance is an id or unique name, the disk

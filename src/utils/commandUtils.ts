@@ -178,7 +178,10 @@ export const handleCommand = async (
         if (commandLogHandle) {
             await flushTrace(traceId);
             takePendingTraceResult(traceId); // discard — do not publish result on error
-            closeTrace(commandLogHandle, traceId, 'error', error.message);
+            // An error may carry a stable machine code and its own result (idea#79 moveApp)
+            const errorCode = typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]*$/.test(error.code) ? error.code : null
+            const errorResult = error?.traceResult !== undefined ? JSON.stringify(error.traceResult) : null
+            closeTrace(commandLogHandle, traceId, 'error', error.message, errorResult, errorCode);
         }
     }
 }
