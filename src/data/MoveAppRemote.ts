@@ -18,7 +18,7 @@ import { DocHandle } from '@automerge/automerge-repo'
 import { log } from '../utils/utils.js'
 import { Store, getDisk, getInstance, getEngine } from './Store.js'
 import { Disk, appDataRoot } from './Disk.js'
-import { Instance, stopInstance } from './Instance.js'
+import { Instance, startInstance } from './Instance.js'
 import { InstanceID, InstanceName, DiskID, EngineID, OperationCause, Timestamp, Command } from './CommonTypes.js'
 import { createOperation, updateOperation } from './Operations.js'
 import { sendCommand } from '../utils/commandUtils.js'
@@ -36,7 +36,7 @@ export interface MoveDeps {
     sourceBytes: (disk: Disk, id: InstanceID) => Promise<number>
     copy: (storeHandle: DocHandle<Store>, instanceId: InstanceID, src: DiskID, tgt: DiskID, cause: OperationCause, opId: string) => Promise<InstanceID>
     requestVerify: (storeHandle: DocHandle<Store>, targetEngineId: string, command: string) => void
-    stopSource: (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk) => Promise<void>
+    startSource: (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk) => Promise<void>
     removeSource: (storeHandle: DocHandle<Store>, instanceId: InstanceID, engineId: string) => Promise<{ quarantinePath: string }>
     verifyTimeoutMs: number
     pollMs: number
@@ -52,12 +52,12 @@ const defaultDeps: MoveDeps = {
     sourceBytes: async (disk, id) => instanceDataBytes(await appDataRoot(disk), String(id)),
     copy: async (storeHandle, instanceId, src, tgt, cause, opId) => {
         const { copyApp } = await import('./CopyMoveApp.js')
-        const id = await copyApp(storeHandle, instanceId as unknown as InstanceName, src, tgt, cause, { journalOpId: opId, keepName: true, rethrow: true })
+        const id = await copyApp(storeHandle, instanceId as unknown as InstanceName, src, tgt, cause, { journalOpId: opId, keepName: true, rethrow: true, keepSourceStopped: true })
         if (!id) throw new Error('the copy did not finish')
         return id
     },
     requestVerify: (storeHandle, engineId, command) => sendCommand(storeHandle, engineId as EngineID, command as Command),
-    stopSource: (storeHandle, instance, disk) => stopInstance(storeHandle, instance, disk, 'post-move'),
+    startSource: (storeHandle, instance, disk) => startInstance(storeHandle, instance, disk, 'post-move'),
     removeSource: (storeHandle, instanceId, engineId) => removeInstance(storeHandle, String(instanceId), engineId),
     verifyTimeoutMs: 6 * 60 * 1000,
     pollMs: 2000,
@@ -144,6 +144,13 @@ export const moveAppCrossEngine = async (
 
     const result = (code: MoveResult['code'], text: string, targetInstanceId: string | null, quarantinePath: string | null = null): MoveResult =>
         ({ code, text, sourceInstanceId: String(instance.id), targetInstanceId, targetEngineId, quarantinePath })
+    // On a failed move the source comes back as it was (the copy kept it stopped)
+    const restartIfNeeded = async () => {
+        if (!expectRunning) return
+        const src = getInstance(storeHandle.doc(), instance.id)
+        if (!src || src.status === 'Running' || src.status === 'Starting') return
+        try { await d.startSource(storeHandle, src, sourceDisk) } catch (e: any) { log(`moveApp: could not restart the source '${instance.name}': ${e?.message ?? e}`) }
+    }
     const fail = (code: MoveResult['code'], reason: string, targetInstanceId: string | null): MoveResult => {
         const r = result(code, moveFailedText(reason), targetInstanceId)
         log(`moveApp: ${r.text}`)
@@ -153,20 +160,26 @@ export const moveAppCrossEngine = async (
 
     // ── 1. Copying ─────────────────────────────────────────────────────────
     setPhase(storeHandle, opId, 'copying')
+    // The source must not be started or written to from here until it is removed
+    // (idea#79 call 3): the copy stops it and keeps it stopped; the remove step
+    // re-checks lastStarted, status and size against this baseline.
+    const startedBaseline = Number(getInstance(storeHandle.doc(), instance.id)?.lastStarted ?? 0)
     let targetInstanceId: InstanceID
+    let baselineBytes: number
     try {
-        const bytes = await d.sourceBytes(sourceDisk, instance.id)
-        patchMove(storeHandle, opId, { expectedBytes: bytes })
         targetInstanceId = await d.copy(storeHandle, instance.id, sourceDisk.id, targetDisk.id, cause, opId)
         patchMove(storeHandle, opId, { targetInstanceId: String(targetInstanceId) })
+        // Measured with the source stopped, right after the copy
+        baselineBytes = await d.sourceBytes(sourceDisk, instance.id)
+        patchMove(storeHandle, opId, { expectedBytes: baselineBytes })
     } catch (e: any) {
+        await restartIfNeeded()
         return fail('COPY_FAILED', `the copy to ${targetName} failed (${e?.message ?? e})`, null)
     }
 
     // ── 2. Checking (on the target) ───────────────────────────────────────────
     setPhase(storeHandle, opId, 'checking')
-    const expected = (storeHandle.doc().operationDB?.[opId] as any)?.move?.expectedBytes ?? 0
-    d.requestVerify(storeHandle, targetEngineId, `verifyMoveTarget ${opId} ${targetInstanceId} ${expected} ${expectRunning}`)
+    d.requestVerify(storeHandle, targetEngineId, `verifyMoveTarget ${opId} ${targetInstanceId} ${baselineBytes} ${expectRunning}`)
     const deadline = Date.now() + d.verifyTimeoutMs
     let verdict: MoveVerify | null = null
     while (Date.now() < deadline) {
@@ -174,8 +187,8 @@ export const moveAppCrossEngine = async (
         if (verdict) break
         await sleep(d.pollMs)
     }
-    if (!verdict) return fail('VERIFY_TIMEOUT', `${targetName} did not confirm the copy in time`, String(targetInstanceId))
-    if (!verdict.ok) return fail('VERIFY_FAILED', `the copy on ${targetName} did not check out (${verdict.detail ?? 'no detail'})`, String(targetInstanceId))
+    if (!verdict) { await restartIfNeeded(); return fail('VERIFY_TIMEOUT', `${targetName} did not confirm the copy in time`, String(targetInstanceId)) }
+    if (!verdict.ok) { await restartIfNeeded(); return fail('VERIFY_FAILED', `the copy on ${targetName} did not check out (${verdict.detail ?? 'no detail'})`, String(targetInstanceId)) }
     // The one gate for removing the source: recorded before any removal step
     patchMove(storeHandle, opId, { verified: true })
 
@@ -185,7 +198,14 @@ export const moveAppCrossEngine = async (
         const verifiedNow = (storeHandle.doc().operationDB?.[opId] as any)?.move?.verified === true
         if (!verifiedNow) throw new Error('verify was not recorded')
         const src = getInstance(storeHandle.doc(), instance.id)
-        if (src && (src.status === 'Running' || src.status === 'Starting')) await d.stopSource(storeHandle, src, sourceDisk)
+        if (!src) throw new MoveError('SOURCE_CHANGED', 'the source instance record is gone')
+        if (src.status === 'Running' || src.status === 'Starting' || Number(src.lastStarted ?? 0) !== startedBaseline) {
+            throw new MoveError('SOURCE_CHANGED', `the source was started during the move (status ${src.status}); it may hold newer data than the copy`)
+        }
+        const nowBytes = await d.sourceBytes(sourceDisk, instance.id)
+        if (nowBytes !== baselineBytes) {
+            throw new MoveError('SOURCE_CHANGED', `the source was written to during the move (${baselineBytes} → ${nowBytes} bytes); it may hold newer data than the copy`)
+        }
         const removed = await d.removeSource(storeHandle, instance.id, engineId)
         patchMove(storeHandle, opId, { sourceRemoved: true, quarantinePath: removed.quarantinePath })
         const r = result('MOVED', movedText(targetName), String(targetInstanceId), removed.quarantinePath)
@@ -193,8 +213,9 @@ export const moveAppCrossEngine = async (
         finish(storeHandle, opId, r, false)
         return r
     } catch (e: any) {
+        const changed = e instanceof MoveError && e.code === 'SOURCE_CHANGED'
         const why = e instanceof RemoveError ? `${e.code}: ${e.message}` : (e?.message ?? String(e))
-        const r = result('SOURCE_NOT_REMOVED', sourceNotRemovedText(why), String(targetInstanceId))
+        const r = result(changed ? 'SOURCE_CHANGED' : 'SOURCE_NOT_REMOVED', sourceNotRemovedText(why), String(targetInstanceId))
         log(`moveApp: ${r.text}`)
         finish(storeHandle, opId, r, false)
         return r

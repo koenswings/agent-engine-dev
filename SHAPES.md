@@ -58,7 +58,13 @@ Refusals (command trace error, thrown before anything is copied; text
 `TARGET_OUTDATED`, `HELPER_OUTDATED`, `BUSY`, `INVALID`.
 
 Outcomes (`move.code`): `MOVED`, `COPY_FAILED`, `VERIFY_FAILED`, `VERIFY_TIMEOUT`,
-`INTERRUPTED`, `SOURCE_NOT_REMOVED`.
+`INTERRUPTED`, `SOURCE_NOT_REMOVED`, `SOURCE_CHANGED`.
+
+`SOURCE_CHANGED` (Steve call 3): the copy is good, but the source was started (status or
+`lastStarted` changed) or written to (helper size changed) after the copy began, so it is not
+removed: status **Done**, `op.error` = `MOVED, source not removed: the source was started during
+the move …` or `MOVED, source not removed: the source was written to during the move …`.
+The source is kept stopped from the copy until it is removed (a failed move restarts it).
 
 ## Restart / interrupt
 On Engine restart an interrupted cross-Engine move is never retried automatically:

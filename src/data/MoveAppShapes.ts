@@ -41,6 +41,7 @@ export type MoveOutcomeCode =
     | 'VERIFY_TIMEOUT'     // the target did not report a verdict in time: source kept
     | 'INTERRUPTED'        // Engine restarted before verify was recorded: source kept
     | 'SOURCE_NOT_REMOVED' // copied and verified, but removing the source failed (or restart after verify)
+    | 'SOURCE_CHANGED'     // copied and verified, but the source was started or written to during the move: kept
 
 export type MoveCode = MoveRefusalCode | MoveOutcomeCode
 

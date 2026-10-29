@@ -49,34 +49,38 @@ const makeStore = (opts: { status?: string, targetCaps?: string[] } = {}): DocHa
 }
 
 /** Two-Engine wiring: copy registers the new instance on the TARGET disk; verify runs as TARGET. */
-const twoEngines = (h: DocHandle<Store>, o: { targetStatus?: string, targetBytes?: number, copyFails?: string, verifyReply?: boolean, removeFails?: boolean } = {}) => {
+const twoEngines = (h: DocHandle<Store>, o: { targetStatus?: string, targetBytes?: number, copyFails?: string, verifyReply?: boolean, removeFails?: boolean, sourceBytesSeq?: number[], duringVerify?: (sh: DocHandle<Store>) => void } = {}) => {
     const removeSource = vi.fn(async (sh: DocHandle<Store>, id: InstanceID) => {
         if (o.removeFails) throw new RemoveError('QUARANTINE_FAILED', 'cannot quarantine /disks/sda1/instances/inst-src: busy; the store is unchanged')
         sh.change(d => { delete d.instanceDB[id] })
         return { quarantinePath: `/disks/sda1/.idea-quarantine/${id}` }
     })
+    const startSource = vi.fn(async (sh: DocHandle<Store>, i: any) => { sh.change(d => { (d.instanceDB as any)[i.id].status = 'Running' }) })
     const deps: Partial<MoveDeps> = {
         localEngineId: async () => SRC,
         validate: async (store) => ({ instance: store.instanceDB[INST] as any, sourceDisk: store.diskDB[SRC_DISK] as any, targetDisk: store.diskDB[TGT_DISK] as any }),
         helperProblem: async () => null,
-        sourceBytes: async () => BYTES,
+        sourceBytes: async () => (o.sourceBytesSeq?.shift() ?? BYTES),
         copy: async (sh) => {
+            // like copyApp with keepSourceStopped: the source is stopped for the copy and stays stopped
+            sh.change(d => { (d.instanceDB as any)[INST].status = 'Stopped' })
             if (o.copyFails) throw new Error(o.copyFails)
             sh.change(d => { (d.instanceDB as any)[NEW] = inst(NEW, TGT_DISK, o.targetStatus ?? 'Running') })
             return NEW
         },
         requestVerify: (sh, engineId, command) => {
             expect(engineId).toBe(String(TGT))
+            o.duringVerify?.(sh)
             if (o.verifyReply === false) return
             const [, opId, id, bytes, running] = command.split(' ')
             void verifyMoveTarget(sh, opId, id, bytes, running, { localEngineId: async () => String(TGT), targetBytes: async () => o.targetBytes ?? BYTES, timeoutMs: 50, pollMs: 5 })
         },
-        stopSource: vi.fn(async (sh: DocHandle<Store>, i: any) => { sh.change(d => { (d.instanceDB as any)[i.id].status = 'Stopped' }) }),
+        startSource: startSource as any,
         removeSource: removeSource as any,
         verifyTimeoutMs: 300,
         pollMs: 5,
     }
-    return { deps, removeSource }
+    return { deps, removeSource, startSource }
 }
 const theOp = (h: DocHandle<Store>) => Object.values(h.doc().operationDB)[0] as any
 
@@ -216,6 +220,45 @@ describe('moveApp across Engines (idea#79)', () => {
         expect(theOp(h).status).toBe('Done')
         expect(theOp(h).move).toMatchObject({ verified: true, sourceRemoved: false })
         expect(h.doc().instanceDB[INST]).toBeDefined()
+    })
+
+    it('source started during the move: SOURCE_CHANGED, MOVED, source not removed, nothing quarantined', async () => {
+        const h = makeStore()
+        const { deps, removeSource } = twoEngines(h, { duringVerify: sh => sh.change(d => { const i = (d.instanceDB as any)[INST]; i.status = 'Running'; i.lastStarted = 999 }) })
+        const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)
+        expect(r.code).toBe('SOURCE_CHANGED')
+        expect(r.text).toMatch(/^MOVED, source not removed: the source was started during the move/)
+        expect(removeSource).not.toHaveBeenCalled()
+        expect(theOp(h)).toMatchObject({ status: 'Done', error: r.text })
+        expect(theOp(h).move).toMatchObject({ verified: true, sourceRemoved: false, code: 'SOURCE_CHANGED' })
+        expect(h.doc().instanceDB[INST]).toBeDefined()
+    })
+
+    it('source started and stopped again during the move (lastStarted moved): SOURCE_CHANGED', async () => {
+        const h = makeStore()
+        const { deps, removeSource } = twoEngines(h, { duringVerify: sh => sh.change(d => { (d.instanceDB as any)[INST].lastStarted = 999 }) })
+        const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)
+        expect(r.code).toBe('SOURCE_CHANGED')
+        expect(removeSource).not.toHaveBeenCalled()
+    })
+
+    it('source written to during the move (size changed): SOURCE_CHANGED, source kept', async () => {
+        const h = makeStore()
+        const { deps, removeSource } = twoEngines(h, { sourceBytesSeq: [BYTES, BYTES + 4096] })
+        const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)
+        expect(r.code).toBe('SOURCE_CHANGED')
+        expect(r.text).toMatch(/^MOVED, source not removed: the source was written to during the move/)
+        expect(removeSource).not.toHaveBeenCalled()
+        expect(h.doc().instanceDB[INST]).toBeDefined()
+    })
+
+    it('a failed verify restarts a source that was running (it was kept stopped for the copy)', async () => {
+        const h = makeStore({ status: 'Running' })
+        const { deps, startSource } = twoEngines(h, { targetBytes: 1 })
+        const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)
+        expect(r.code).toBe('VERIFY_FAILED')
+        expect(startSource).toHaveBeenCalledTimes(1)
+        expect(h.doc().instanceDB[INST]?.status).toBe('Running')
     })
 
     it('progress steps are Copying, Checking, Removing the old copy', async () => {

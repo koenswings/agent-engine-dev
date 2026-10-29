@@ -179,6 +179,8 @@ export interface CopyAppOptions {
     keepName?: boolean
     /** throw the copy failure instead of only recording it */
     rethrow?: boolean
+    /** a move keeps the source stopped after a good copy (it restarts it itself on failure) */
+    keepSourceStopped?: boolean
 }
 
 // ── copyApp ───────────────────────────────────────────────────────────────────
@@ -419,7 +421,7 @@ export const copyApp = async (
         // Restart the source BEFORE the copy starts (idea#168 r35): the
         // original takes its own port back first, and the copy can never grab
         // it while the original is down for the snapshot.
-        if (wasRunning) await restartSource('before the copy starts')
+        if (wasRunning && !opts.keepSourceStopped) await restartSource('before the copy starts')
 
         if (isCrossEngine) {
             // Cross-engine: create instance record in shared store (as Docked),
@@ -494,7 +496,7 @@ export const copyApp = async (
     } finally {
         resourceLock.releaseAll(lockKeys)
         // Always restart the source if we stopped it and the success path did not
-        if (wasRunning && !sourceRestarted) await restartSource('after a failed copy')
+        if (wasRunning && !sourceRestarted && (copyError || !opts.keepSourceStopped)) await restartSource('after a failed copy')
     }
     if (copyError && opts.rethrow) throw copyError
     return copyError ? null : newInstanceId
