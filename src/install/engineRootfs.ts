@@ -18,7 +18,7 @@ import { shellQuote } from '../utils/ssh.js'
 import { print } from '../utils/utils.js'
 import {
     EngineLock, FIRSTBOOT_SCRIPT, FIRSTBOOT_UNIT, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH, PM2_UNIT, PRELOAD_DOCKER_DIR, PRELOAD_NPM_DIR, SSH_REGEN_UNIT, NPM_OFFLINE_ENV,
-    firstbootUnitText, pm2UnitText, preloadManifest, readDpkgStatus, rpiArchivePackageNames, sanitiseRootfs, serialiseLock, verifyRootfs,
+    firstbootUnitText, pm2UnitText, preloadManifest, readDpkgStatus, rpiArchivePackageNames, sanitiseRootfs, serialiseLock, verifyRootfsChecks,
 } from './engineImage.js'
 
 export interface Out { stdout: string }
@@ -211,7 +211,7 @@ export const rootfsSteps = (o: RootfsBuildOptions, r: Runner, inst: Installers):
 }
 
 /** Writes the lock to /etc/idea/engine.lock and the version to /etc/idea/engine-version, then verifies. */
-export const runRootfsBuild = async (o: RootfsBuildOptions, r: Runner, inst: Installers, lockText: string, piUid?: number): Promise<{ problems: string[], lockText: string }> => {
+export const runRootfsBuild = async (o: RootfsBuildOptions, r: Runner, inst: Installers, lockText: string, piUid?: number): Promise<{ problems: string[], passed: number, lockText: string }> => {
     for (const s of rootfsSteps(o, r, inst)) {
         print(`==> ${s.name}`)
         await s.run()
@@ -225,6 +225,6 @@ export const runRootfsBuild = async (o: RootfsBuildOptions, r: Runner, inst: Ins
     await fs.ensureDir(path.join(o.rootfs, 'etc/idea'))
     await fs.writeFile(path.join(o.rootfs, IMAGE_LOCK_PATH.slice(1)), lockText)
     await fs.writeFile(path.join(o.rootfs, IMAGE_VERSION_PATH.slice(1)), `${o.lock.engineVersion} ${o.lock.engineCommit}\n`)
-    const problems = await verifyRootfs({ root: o.rootfs, enginePath: o.enginePath, lock: o.lock, storeIdentity: o.storeIdentity, piUid })
-    return { problems, lockText }
+    const checks = await verifyRootfsChecks({ root: o.rootfs, enginePath: o.enginePath, lock: o.lock, storeIdentity: o.storeIdentity, piUid })
+    return { problems: checks.flatMap(x => x.problems), passed: checks.filter(x => !x.problems.length).length, lockText }
 }
