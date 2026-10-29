@@ -46,6 +46,7 @@ export type OperationKind =
   | 'backupApp'
   | 'restoreApp'
   | 'upgradeApp'
+  | 'updateApp'      // agent-engine-dev#230: local swap with a .pre-update snapshot
   | 'upgradeEngine'
   | 'startApp'
   | 'stopApp'

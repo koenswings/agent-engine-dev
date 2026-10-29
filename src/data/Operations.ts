@@ -36,6 +36,7 @@ export const RECOVERY_STRATEGY: Record<OperationKind, RecoveryStrategy> = {
     backupApp:     'retry',   // BorgBackup — idempotent; lock file already guards double-run
     restoreApp:    'fail',    // restore may have partially written target — safer to fail
     upgradeApp:    'fail',    // not yet implemented
+    updateApp:     'fail',    // #230: recoverInterruptedUpdates rolls back from the .pre-update snapshot first
     upgradeEngine: 'fail',    // not yet implemented
     startApp:      'fail',    // partial start state unknown — operator must re-issue
     stopApp:       'fail',    // partial stop state unknown — operator must re-issue
