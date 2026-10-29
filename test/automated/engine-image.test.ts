@@ -401,13 +401,15 @@ describe('no dev files in the image (sparse Engine clone, secret scan)', () => {
         }
         expect(await devProblems()).toEqual([])
     })
-    it('any tskey-auth- string under the Engine tree fails (node_modules included, .git skipped)', async () => {
+    it('any Tailscale auth/client key prefix under the Engine tree fails (node_modules included, .git skipped)', async () => {
         await fs.outputFile(R(`${ENGINE}/node_modules/x/a.js`), `const k = "${KEY}"`)
         await fs.outputFile(R(`${ENGINE}/dist/src/b.js`), Buffer.concat([Buffer.from([0, 1, 2]), Buffer.from(KEY)]))
-        await fs.outputFile(R(`${ENGINE}/src/ok.ts`), "/tskey-auth-[A-Za-z0-9]/ or 'tskey-' + 'auth-' + x")
+        await fs.outputFile(R(`${ENGINE}/src/ok.ts`), "/tskey[-](auth|client)[-]x/ or 'tskey-' + 'auth-' + x, tskey-other-1")
         await fs.outputFile(R(`${ENGINE}/.git/objects/x`), KEY)
-        expect(await filesWithAuthKeyShape(R(ENGINE))).toEqual(['dist/src/b.js', 'node_modules/x/a.js'])
-        expect((await devProblems()).length).toBe(2)
+        await fs.outputFile(R(`${ENGINE}/script/c.sh`), 'K=' + 'tskey-' + 'client-' + 'Q9z')
+        expect(await filesWithAuthKeyShape(R(ENGINE))).toEqual(['dist/src/b.js', 'node_modules/x/a.js', 'script/c.sh'])
+        expect((await devProblems()).length).toBe(3)
+        expect((await devProblems()).join()).toContain('Tailscale auth-key prefix')
     })
     it('the sparse patterns in .git/info/sparse-checkout must match the lock', async () => {
         const l = lock({ sparseCheckout: IMAGE_SPARSE_PATTERNS })

@@ -92,6 +92,6 @@ files are never written; tsc then has no tests to compile, so there is no `dist/
 Updates (`git fetch` + `git checkout -B <b> origin/<b>` as in provision-fleet.sh, or `git pull`) keep the
 patterns. `git sparse-checkout disable` restores the full tree. sync-engine (dev rsync) copies test/ back and
 leaves the tree dirty; don't use it on an image-built Engine. Verify's `no-dev-files` check fails on any of those trees,
-on `dist/test`, on any `tskey-auth-` + alphanumeric string under the Engine tree (node_modules included, .git
+on `dist/test`, on any Tailscale auth-key or client-key prefix followed by an alphanumeric under the Engine tree (node_modules included, .git
 skipped), or on a sparse-checkout file that differs from the lock. Test fixtures build fake keys at runtime.
 `testContext` moved to src/data/TestContext.ts (the Engine imports it; test/testContext.ts re-exports it).

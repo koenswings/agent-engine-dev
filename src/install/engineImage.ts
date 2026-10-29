@@ -135,13 +135,13 @@ export interface EngineLock {
 export const IMAGE_SPARSE_PATTERNS = ['/*', '!/test/', '!/proposals/', '!/reports/', '!/old-yjs-db/', '!/.vscode/', '!/script/idea02-walker/']
 /** Trees that must not be in the image's Engine tree (dist/test would be compiled tests). */
 export const IMAGE_FORBIDDEN_DIRS = ['test', 'dist/test', 'proposals', 'reports', 'old-yjs-db', '.vscode', 'script/idea02-walker', 'dist/script/idea02-walker']
-/** A Tailscale auth key shape; no file of the Engine tree may contain one (Atlas's image secret scan). */
-export const TS_AUTHKEY_RE = /tskey-auth-[A-Za-z0-9]/
+/** A Tailscale auth or OAuth client key shape (the prefix is spelled with char classes, so this file holds no key prefix); no file of the Engine tree may contain one (Atlas's image secret scan). */
+export const TS_AUTHKEY_RE = /tskey[-](auth|client)[-][A-Za-z0-9]/
 
 /** Files under dir (no symlinks followed, .git skipped: its objects are compressed) containing a Tailscale auth key shape. */
 export const filesWithAuthKeyShape = async (dir: string): Promise<string[]> => {
     const hits: string[] = []
-    const needle = Buffer.from('tskey-auth-')
+    const needle = Buffer.from('tskey' + '-')
     const walk = async (d: string): Promise<void> => {
         for (const e of await fs.readdir(d, { withFileTypes: true })) {
             const f = path.join(d, e.name)
@@ -150,7 +150,7 @@ export const filesWithAuthKeyShape = async (dir: string): Promise<string[]> => {
                 const b = await fs.readFile(f)
                 let i = b.indexOf(needle)
                 while (i >= 0) {
-                    if (TS_AUTHKEY_RE.test(b.subarray(i, i + 12).toString('latin1'))) { hits.push(path.relative(dir, f)); break }
+                    if (TS_AUTHKEY_RE.test(b.subarray(i, i + 16).toString('latin1'))) { hits.push(path.relative(dir, f)); break }
                     i = b.indexOf(needle, i + 1)
                 }
             }
@@ -507,7 +507,7 @@ export const verifyRootfsChecks = async (c: VerifyContext): Promise<VerifyCheckR
     check('no-dev-files')
     // 10. no tests or other dev-only trees, no auth-key-shaped strings, the clone sparse as locked
     for (const rel of IMAGE_FORBIDDEN_DIRS) if (await fs.pathExists(path.join(eng, rel))) p.push(`${c.enginePath}/${rel} present (not needed at runtime)`)
-    for (const f of await filesWithAuthKeyShape(eng)) p.push(`${c.enginePath}/${f} contains a tskey-auth- string`)
+    for (const f of await filesWithAuthKeyShape(eng)) p.push(`${c.enginePath}/${f} contains a Tailscale auth-key prefix`)
     if (c.lock.sparseCheckout && await fs.pathExists(path.join(eng, '.git'))) {
         const sc = path.join(eng, '.git/info/sparse-checkout')
         const got = (await fs.pathExists(sc)) ? (await fs.readFile(sc, 'utf8')).split('\n').filter(Boolean) : []
