@@ -89,6 +89,12 @@ export interface LockedImage {
 
 export interface LockedFile { path: string, sha256: string, mode: string, owner: string }
 
+/** 'global': npm install -g in the image; 'preload': tarball in PRELOAD_NPM_DIR (pm2 install at first boot) */
+export interface NpmTool { name: string, version: string, install: 'global' | 'preload', lockfileSha256: string, tgz: string, sha256?: string }
+export const NPM_TOOL_INSTALL: Record<string, NpmTool['install']> = { pnpm: 'global', pm2: 'global', 'pm2-logrotate': 'preload' }
+/** npm with no registry and no network: an unreachable registry plus --offline, an empty private cache */
+export const NPM_OFFLINE_ENV = 'npm_config_offline=true npm_config_registry=http://127.0.0.1:9/ npm_config_cache=/root/.idea-build/npm-cache npm_config_audit=false npm_config_fund=false npm_config_update_notifier=false'
+
 export interface EngineLock {
     schema: typeof LOCK_SCHEMA
     engineCommit: string
@@ -111,6 +117,10 @@ export interface EngineLock {
     files: LockedFile[]
     /** systemd units that must be enabled in the image */
     enabledUnits: string[]
+    /** pnpm, pm2, pm2-logrotate with their whole dependency trees: a committed lockfile per tool
+     *  (script/build_image_assets/npm-tools/<tool>/package-lock.json) and the bundled tarball archive-npm-tools.sh made
+     *  from it (sha256 recorded when the build reads the cache; a --lock rebuild must match it). */
+    npmTools?: NpmTool[]
     /** Every installed package at its exact version (recorded after the build, from dpkg status) */
     packages?: { pkg: string, version: string, arch: string }[]
     /** The installed packages that come from archive.raspberrypi.com (it has no snapshots); a rebuild with --lock installs exactly these */
@@ -129,6 +139,11 @@ export const validateLock = (l: any): string[] => {
     for (const k of ['engineVersion', 'nodeVersion', 'pnpmVersion', 'pm2Version', 'pm2LogrotateVersion', 'tailscaleVersion', 'debianSnapshot'])
         if (typeof l[k] !== 'string' || !l[k]) e.push(`${k} missing`)
     if (!SHA256.test(l.tailscaleSha256 ?? '')) e.push('tailscaleSha256 must be 64 hex')
+    for (const t of l.npmTools ?? []) {
+        if (!SHA256.test(t.lockfileSha256 ?? '')) e.push(`npmTools ${t.name}: bad lockfileSha256`)
+        if (t.sha256 !== undefined && !SHA256.test(t.sha256)) e.push(`npmTools ${t.name}: bad sha256`)
+        if (!['global', 'preload'].includes(t.install)) e.push(`npmTools ${t.name}: install must be global or preload`)
+    }
     for (const d of l.dockerDebs ?? []) if (!SHA256.test(d.sha256 ?? '')) e.push(`dockerDebs ${d.pkg}: bad sha256`)
     for (const i of l.dockerImages ?? []) {
         if (!IMAGE_DIGEST_RE.test(i.ref ?? '')) e.push(`dockerImages ${i.ref}: not pinned by digest`)
@@ -152,6 +167,7 @@ export const serialiseLock = (l: EngineLock): string => JSON.stringify({
     aptPins: [...l.aptPins].sort((a, b) => a.pkg.localeCompare(b.pkg)),
     dockerImages: [...l.dockerImages].sort((a, b) => a.ref.localeCompare(b.ref)),
     files: [...l.files].sort((a, b) => a.path.localeCompare(b.path)),
+    ...(l.npmTools ? { npmTools: [...l.npmTools].sort((a, b) => a.name.localeCompare(b.name)) } : {}),
     ...(l.packages ? { packages: [...l.packages].sort((a, b) => a.pkg.localeCompare(b.pkg) || a.arch.localeCompare(b.arch)) } : {}),
     ...(l.rpiPackages ? { rpiPackages: [...l.rpiPackages].sort((a, b) => a.pkg.localeCompare(b.pkg)) } : {}),
     enabledUnits: [...l.enabledUnits].sort(),
@@ -407,6 +423,26 @@ export const verifyRootfs = async (c: VerifyContext): Promise<string[]> => {
     }
     if (await fs.pathExists(R('etc/sudoers.d'))) for (const n of await fs.readdir(R('etc/sudoers.d'))) {
         const st = await fs.stat(R(`etc/sudoers.d/${n}`)); if (modeOf(st) !== '0440' || st.uid !== 0) p.push(`/etc/sudoers.d/${n} must be root 0440`)
+    }
+    // 7b. npm tools: global installs at the locked version with their whole bundled tree; preloads by sha256
+    for (const t of c.lock.npmTools ?? []) {
+        if (t.install === 'preload') {
+            const f = R(`${PRELOAD_NPM_DIR}/${t.tgz}`.slice(1))
+            if (!(await fs.pathExists(f))) p.push(`${PRELOAD_NPM_DIR}/${t.tgz} missing`)
+            else if (t.sha256 && await sha256File(f) !== t.sha256) p.push(`${PRELOAD_NPM_DIR}/${t.tgz} sha256 differs from the lock`)
+            continue
+        }
+        const dir = R(`usr/local/lib/node_modules/${t.name}`)
+        const pj = path.join(dir, 'package.json')
+        if (!(await fs.pathExists(pj))) { p.push(`npm tool ${t.name} not installed in /usr/local/lib/node_modules`); continue }
+        const meta = await fs.readJson(pj)
+        if (meta.version !== t.version) p.push(`npm tool ${t.name} ${meta.version}, lock says ${t.version}`)
+        const deps = Object.keys(meta.dependencies ?? {})
+        const bundled: string[] = Array.isArray(meta.bundleDependencies) ? meta.bundleDependencies : []
+        for (const dep of deps) if (!bundled.includes(dep)) p.push(`npm tool ${t.name}: dependency ${dep} not bundled`)
+        for (const b of bundled) if (!(await fs.pathExists(path.join(dir, 'node_modules', b, 'package.json')))) p.push(`npm tool ${t.name}: bundled ${b} missing`)
+        for (const bin of Object.keys(typeof meta.bin === 'string' ? { [t.name]: meta.bin } : meta.bin ?? {}))
+            if (!(await isSymlink(R(`usr/local/bin/${bin}`))) && !(await fs.pathExists(R(`usr/local/bin/${bin}`)))) p.push(`/usr/local/bin/${bin} missing`)
     }
     // 8. preloaded Docker images
     for (const i of c.lock.dockerImages) {

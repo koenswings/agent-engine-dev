@@ -13,6 +13,7 @@ import {
     pm2UnitText, preloadManifest, imageIdFromManifest, imageTarName, readDpkgStatus, PRELOAD_DOCKER_DIR, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH,
 } from '../../src/install/engineImage.js'
 import { rootfsSteps, runRootfsBuild, Runner, Installers, SHIMS, quoteTemplate } from '../../src/install/engineRootfs.js'
+import { pinNpmTools } from '../../src/install/engineImageCli.js'
 import { diskIdWithoutHardware, hasDiskId, ensureSystemMeta } from '../../src/data/Meta.js'
 
 const ENGINE = '/home/pi/idea/agents/agent-engine-dev'
@@ -20,11 +21,17 @@ const COMMIT = 'a'.repeat(40)
 const sha = (s: string) => crypto.createHash('sha256').update(s).digest('hex')
 const DIGEST = 'b'.repeat(64)
 
+const LR_SHA = crypto.createHash('sha256').update('lr').digest('hex')
 const lock = (over: Partial<EngineLock> = {}): EngineLock => ({
     schema: LOCK_SCHEMA, engineCommit: COMMIT, engineVersion: '1.0', arch: 'arm64',
     nodeVersion: '22.20.0', pnpmVersion: '10.33.0', pm2Version: '7.1.1', pm2LogrotateVersion: '3.0.0',
     tailscaleVersion: '1.104.2', tailscaleSha256: 'c'.repeat(64), debianSnapshot: '20261026T000000Z',
     aptPins: [], dockerDebs: [], dockerImages: [], pm2Env: 'production', files: [], enabledUnits: [...IMAGE_ENABLED_UNITS].sort(),
+    npmTools: [
+        { name: 'pm2', version: '7.1.1', install: 'global', lockfileSha256: 'd'.repeat(64), tgz: 'pm2-7.1.1.tgz', sha256: 'e'.repeat(64) },
+        { name: 'pm2-logrotate', version: '3.0.0', install: 'preload', lockfileSha256: 'd'.repeat(64), tgz: 'pm2-logrotate-3.0.0.tgz', sha256: LR_SHA },
+        { name: 'pnpm', version: '10.33.0', install: 'global', lockfileSha256: 'd'.repeat(64), tgz: 'pnpm-10.33.0.tgz', sha256: '1'.repeat(64) },
+    ],
     ...over,
 })
 
@@ -90,6 +97,14 @@ const goodRootfs = async (root: string) => {
     await fs.ensureDir(R('var/spool/cron/crontabs')); await fs.writeFile(R('var/spool/cron/crontabs/root'), '0 * * * * systemctl restart avahi-daemon\n@reboot /usr/local/bin/boot.sh\n')
     await fs.ensureDir(R('etc/systemd/system/multi-user.target.wants')); await fs.writeFile(R('etc/systemd/system/multi-user.target.wants/cron.service'), '')
     await fs.ensureDir(R('usr/bin')); await fs.writeFile(R('usr/bin/tailscale'), ''); await fs.ensureDir(R('usr/sbin')); await fs.writeFile(R('usr/sbin/tailscaled'), '')
+    for (const [n, ver] of [['pm2', '7.1.1'], ['pnpm', '10.33.0']]) {
+        const dir = R(`usr/local/lib/node_modules/${n}`)
+        await fs.ensureDir(path.join(dir, 'node_modules/dep'))
+        await fs.writeJson(path.join(dir, 'node_modules/dep/package.json'), { name: 'dep' })
+        await fs.writeJson(path.join(dir, 'package.json'), { name: n, version: ver, bin: { [n]: `bin/${n}` }, dependencies: { dep: '1' }, bundleDependencies: ['dep'] })
+        await fs.ensureDir(R('usr/local/bin')); await fs.writeFile(R(`usr/local/bin/${n}`), '')
+    }
+    await fs.ensureDir(R('var/lib/idea/preload/npm')); await fs.writeFile(R('var/lib/idea/preload/npm/pm2-logrotate-3.0.0.tgz'), 'lr')
     await fs.ensureDir(path.join(eng, 'store-identity'))
     for (const [k, v] of Object.entries(STORE)) await fs.writeFile(path.join(eng, 'store-identity', k), v)
     await fs.ensureDir(R('etc/systemd/system/multi-user.target.wants'))
@@ -208,6 +223,36 @@ describe('idea-engine-identity on every boot, tailscaled not enabled (#291 combi
     })
 })
 
+describe('npm tools (bundled trees)', () => {
+    let root: string
+    beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'rootfs-')); await goodRootfs(root) })
+    afterEach(async () => { await fs.remove(root) })
+    const v = async (l = lock()) => (await verifyRootfs({ root, enginePath: ENGINE, lock: l, storeIdentity: storeShas })).join('\n')
+    it('verify fails on a wrong version, an unbundled or missing dependency, a missing bin and a preload sha256 drift', async () => {
+        const pm2 = path.join(root, 'usr/local/lib/node_modules/pm2')
+        await fs.writeJson(path.join(pm2, 'package.json'), { name: 'pm2', version: '7.1.0', bin: { pm2: 'bin/pm2' }, dependencies: { a: '1', b: '1' }, bundleDependencies: ['a', 'c'] })
+        await fs.remove(path.join(root, 'usr/local/bin/pm2'))
+        await fs.writeFile(path.join(root, 'var/lib/idea/preload/npm/pm2-logrotate-3.0.0.tgz'), 'other')
+        const p = await v()
+        expect(p).toContain('npm tool pm2 7.1.0, lock says 7.1.1'); expect(p).toContain('dependency b not bundled')
+        expect(p).toContain('bundled c missing'); expect(p).toContain('/usr/local/bin/pm2 missing')
+        expect(p).toContain('pm2-logrotate-3.0.0.tgz sha256 differs')
+    })
+    it('the lock rejects a bad npm tool entry; pinNpmTools records the cache sha256 and refuses drift', async () => {
+        expect(validateLock({ ...lock(), npmTools: [{ name: 'pm2', version: '1', install: 'x', lockfileSha256: 'no', tgz: 'pm2-1.tgz' }] })).toEqual(expect.arrayContaining(['npmTools pm2: bad lockfileSha256', 'npmTools pm2: install must be global or preload']))
+        const cache = await fs.mkdtemp(path.join(os.tmpdir(), 'cache-'))
+        await fs.ensureDir(path.join(cache, 'npm-global'))
+        const rows: string[] = []
+        for (const t of lock().npmTools!) { await fs.writeFile(path.join(cache, 'npm-global', t.tgz), t.name); rows.push([t.name, t.version, t.tgz, sha(t.name), t.lockfileSha256].join('\t')) }
+        await fs.writeFile(path.join(cache, 'npm-global/NPM-TOOLS.tsv'), '# header\n' + rows.join('\n') + '\n')
+        const fresh = lock({ npmTools: lock().npmTools!.map(({ sha256, ...t }) => t) })
+        expect((await pinNpmTools(fresh, cache)).npmTools!.map(t => t.sha256)).toEqual(lock().npmTools!.map(t => sha(t.name)))
+        await expect(pinNpmTools(lock(), cache)).rejects.toThrow('the lock says')
+        await expect(pinNpmTools(lock({ npmTools: [{ ...fresh.npmTools![0], lockfileSha256: '9'.repeat(64) }] }), cache)).rejects.toThrow('another package-lock.json')
+        await fs.remove(cache)
+    })
+})
+
 describe('rootfs build plan (stubbed runner and installers)', () => {
     let root: string
     beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'rootfs-')); await goodRootfs(root) })
@@ -248,6 +293,13 @@ describe('rootfs build plan (stubbed runner and installers)', () => {
         expect(all).toMatch(/-C \/usr\/bin 'tailscale_1\.104\.2_arm64\/tailscale'/)
         expect(all).toMatch(/-C \/usr\/sbin 'tailscale_1\.104\.2_arm64\/tailscaled'/)
         expect(all).not.toMatch(/install-tailscale|TAILSCALE_AUTHKEY|tskey/)
+        // npm tools: sha256 checked, installed with no registry, pm2 never run in the chroot
+        expect(all).toContain(`echo '${'e'.repeat(64)}  /root/.idea-build/npm/pm2-7.1.1.tgz' | sha256sum -c -`)
+        expect(all).toMatch(/env 'npm_config_offline=true' 'npm_config_registry=http:\/\/127\.0\.0\.1:9\/' .* npm install -g '\.\/pm2-7\.1\.1\.tgz' '\.\/pnpm-10\.33\.0\.tgz'/)
+        expect(all).toContain(`install -m 0644 '/root/.idea-build/npm/pm2-logrotate-3.0.0.tgz' '/var/lib/idea/preload/npm/pm2-logrotate-3.0.0.tgz'`)
+        expect(log.filter(l => l.startsWith("chroot:")).join("\n")).not.toMatch(/pm2 (--version|install|start|ls)|(^|[^p])npm (install|i) (?!-g)/m)
+        expect(all).toContain('pnpm install --frozen-lockfile --offline')
+        expect(all).toContain('npm_config_manage_package_manager_versions=false')
         expect(calls).toEqual(['pinAptSnapshot', 'updateSystem', 'installRpiPins', 'installAvahi', 'localiseSystem', 'installCrontabs', 'installUdev', 'installVarious', 'installVarious2', 'buildAppsInfrastructure', 'grantNetBindCapability'])
         expect(await fs.readFile(path.join(root, IMAGE_LOCK_PATH.slice(1)), 'utf8')).toBe(serialiseLock({ ...lock(), packages: [], rpiPackages: [] }))
         expect(await fs.readFile(path.join(root, IMAGE_VERSION_PATH.slice(1)), 'utf8')).toBe(`1.0 ${COMMIT}\n`)
