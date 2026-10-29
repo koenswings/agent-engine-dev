@@ -48,6 +48,9 @@ No SSH, nothing started, no device identity. Inside `chroot <MNT>`:
    (`apt-rpi-pins.tsv`), the Docker debs, `rpiPackages` and `packages` against dpkg status.
    Not installed: gh (dev only) and Chromium (only `script/md-to-pdf.ts`, doc PDFs; no kit Engine use).
    No Docker images are preloaded unless `--image` is given. pm2 runs `production` unless `--pm2-env development`.
+   idea-engine-identity (engine#291): installed by installRootHelpers to /usr/local/sbin (root 0755, in the lock's
+   files) and run on every boot by boot.sh from the root `@reboot` crontab; verify checks the helper, boot.sh calling
+   it, the crontab line and cron.service enabled, and that tailscaled is installed but not enabled.
 10. Sanitise: no /META.yaml, no SSH host keys, empty machine-id, generic hostname `raspberrypi`, no Tailscale state or
    key, no pm2 dump, no Engine store state, store-identity/ exactly the git-tracked files (store-template.json is
    never written), build guards removed.

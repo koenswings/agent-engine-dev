@@ -85,6 +85,11 @@ const goodRootfs = async (root: string) => {
     await fs.ensureDir(path.join(eng, '.git')); await fs.writeFile(path.join(eng, '.git/HEAD'), COMMIT + '\n')
     await fs.ensureDir(path.join(eng, 'dist/src')); await fs.writeFile(path.join(eng, 'dist/src/index.js'), '')
     await fs.ensureDir(path.join(eng, 'node_modules')); await fs.writeFile(path.join(eng, 'pm2.config.cjs'), '')
+    await fs.ensureDir(R('usr/local/sbin')); await fs.writeFile(R('usr/local/sbin/idea-engine-identity'), '#!/bin/bash\n'); await fs.chmod(R('usr/local/sbin/idea-engine-identity'), 0o755)
+    await fs.ensureDir(R('usr/local/bin')); await fs.writeFile(R('usr/local/bin/boot.sh'), 'if [[ -x /usr/local/sbin/idea-engine-identity ]]; then /usr/local/sbin/idea-engine-identity; fi\n'); await fs.chmod(R('usr/local/bin/boot.sh'), 0o755)
+    await fs.ensureDir(R('var/spool/cron/crontabs')); await fs.writeFile(R('var/spool/cron/crontabs/root'), '0 * * * * systemctl restart avahi-daemon\n@reboot /usr/local/bin/boot.sh\n')
+    await fs.ensureDir(R('etc/systemd/system/multi-user.target.wants')); await fs.writeFile(R('etc/systemd/system/multi-user.target.wants/cron.service'), '')
+    await fs.ensureDir(R('usr/bin')); await fs.writeFile(R('usr/bin/tailscale'), ''); await fs.ensureDir(R('usr/sbin')); await fs.writeFile(R('usr/sbin/tailscaled'), '')
     await fs.ensureDir(path.join(eng, 'store-identity'))
     for (const [k, v] of Object.entries(STORE)) await fs.writeFile(path.join(eng, 'store-identity', k), v)
     await fs.ensureDir(R('etc/systemd/system/multi-user.target.wants'))
@@ -175,6 +180,31 @@ describe('package pins against dpkg status', () => {
         const p = (await verifyRootfs({ root, enginePath: ENGINE, lock: bad, storeIdentity: storeShas })).join('\n')
         expect(p).toContain('raspi-config 20261001, lock says 20260901'); expect(p).toContain('docker-ce 5:28.0.0-1, lock says 5:27.0.0-1')
         expect(p).toContain('rpi-eeprom not installed'); expect(p).toContain('libc6 2.41-12, lock says 2.41-11')
+    })
+})
+
+describe('idea-engine-identity on every boot, tailscaled not enabled (#291 combined)', () => {
+    let root: string
+    beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'rootfs-')); await goodRootfs(root) })
+    afterEach(async () => { await fs.remove(root) })
+    const v = async () => (await verifyRootfs({ root, enginePath: ENGINE, lock: lock(), storeIdentity: storeShas })).join('\n')
+    it('fails without the helper, boot.sh call, @reboot cron or cron enabled', async () => {
+        const R = (p: string) => path.join(root, p)
+        await fs.chmod(R('usr/local/sbin/idea-engine-identity'), 0o644)
+        await fs.writeFile(R('usr/local/bin/boot.sh'), 'echo hi\n')
+        await fs.writeFile(R('var/spool/cron/crontabs/root'), '#@reboot /usr/local/bin/boot.sh\n')
+        await fs.remove(R('etc/systemd/system/multi-user.target.wants/cron.service'))
+        const p = await v()
+        expect(p).toContain('idea-engine-identity must be mode 0755'); expect(p).toContain('boot.sh does not run')
+        expect(p).toContain('no @reboot'); expect(p).toContain('cron.service is not enabled')
+        await fs.remove(R('usr/local/sbin/idea-engine-identity'))
+        expect(await v()).toContain('/usr/local/sbin/idea-engine-identity missing')
+    })
+    it('fails when tailscaled is enabled or tailscale is missing', async () => {
+        await fs.writeFile(path.join(root, 'etc/systemd/system/multi-user.target.wants/tailscaled.service'), '')
+        await fs.remove(path.join(root, 'usr/bin/tailscale'))
+        const p = await v()
+        expect(p).toContain('tailscaled.service is enabled'); expect(p).toContain('tailscale not installed')
     })
 })
 

@@ -34,6 +34,7 @@ export const LOCKED_FILE_SPECS: { asset: string, path: string, mode: string }[] 
     { asset: '10-engine.sudoers', path: '/etc/sudoers.d/10-engine', mode: '0440' },
     { asset: '11-engine-files.sudoers', path: '/etc/sudoers.d/11-engine-files', mode: '0440' },
     { asset: 'idea-engine-firstboot', path: FIRSTBOOT_SCRIPT, mode: '0755' },
+    { asset: 'idea-engine-identity', path: '/usr/local/sbin/idea-engine-identity', mode: '0755' },
 ]
 
 const git = async (repo: string, args: string[]) => (await $({ cwd: repo })`git ${args}`).stdout.trim()

@@ -383,6 +383,14 @@ export const verifyRootfs = async (c: VerifyContext): Promise<string[]> => {
         const wants = R(`etc/systemd/system/multi-user.target.wants/${u}`)
         if (!(await isSymlink(wants)) && !(await fs.pathExists(wants))) p.push(`unit ${u} is not enabled`)
     }
+    // 5b. idea-engine-identity (#291) runs on every boot: root @reboot cron -> /usr/local/bin/boot.sh -> the helper
+    p.push(...await identityBootProblems(R))
+    // 5c. tailscaled installed but NOT enabled (idea-engine-identity enables it on a card that carries a key)
+    if (!(await fs.pathExists(R('usr/sbin/tailscaled'))) || !(await fs.pathExists(R('usr/bin/tailscale')))) p.push('tailscale not installed (/usr/bin/tailscale, /usr/sbin/tailscaled)')
+    for (const t of ['multi-user.target.wants', 'default.target.wants']) {
+        const w = R(`etc/systemd/system/${t}/tailscaled.service`)
+        if ((await isSymlink(w)) || (await fs.pathExists(w))) p.push('tailscaled.service is enabled: the image must not enable it')
+    }
     // 6. locked files: content, mode, owner
     for (const f of c.lock.files) {
         const fp = R(f.path.slice(1))
@@ -421,6 +429,32 @@ export const verifyRootfs = async (c: VerifyContext): Promise<string[]> => {
     // 10. the lock itself is in the image
     if (!(await fs.pathExists(R(IMAGE_LOCK_PATH.slice(1))))) p.push(`${IMAGE_LOCK_PATH} missing`)
     if (!(await fs.pathExists(R(IMAGE_VERSION_PATH.slice(1))))) p.push(`${IMAGE_VERSION_PATH} missing`)
+    return p
+}
+
+export const ENGINE_IDENTITY_HELPER_PATH = '/usr/local/sbin/idea-engine-identity'
+export const BOOT_SCRIPT_PATH = '/usr/local/bin/boot.sh'
+export const ROOT_CRONTAB_PATH = '/var/spool/cron/crontabs/root'
+
+/** The identity helper is present (root, 0755) and "enabled": cron enabled, root crontab @reboot boot.sh, boot.sh runs the helper. */
+export const identityBootProblems = async (R: (p: string) => string): Promise<string[]> => {
+    const p: string[] = []
+    const helper = R(ENGINE_IDENTITY_HELPER_PATH.slice(1))
+    if (!(await fs.pathExists(helper))) p.push(`${ENGINE_IDENTITY_HELPER_PATH} missing`)
+    else {
+        // owner root and content are checked through the lock's files (LOCKED_FILE_SPECS)
+        if (((await fs.stat(helper)).mode & 0o777) !== 0o755) p.push(`${ENGINE_IDENTITY_HELPER_PATH} must be mode 0755`)
+    }
+    const boot = R(BOOT_SCRIPT_PATH.slice(1))
+    if (!(await fs.pathExists(boot))) p.push(`${BOOT_SCRIPT_PATH} missing`)
+    else {
+        if (((await fs.stat(boot)).mode & 0o111) === 0) p.push(`${BOOT_SCRIPT_PATH} not executable`)
+        if (!(await fs.readFile(boot, 'utf8')).includes(ENGINE_IDENTITY_HELPER_PATH)) p.push(`${BOOT_SCRIPT_PATH} does not run ${ENGINE_IDENTITY_HELPER_PATH}`)
+    }
+    const cron = R(ROOT_CRONTAB_PATH.slice(1))
+    if (!(await fs.pathExists(cron)) || !new RegExp(`^@reboot\\s+${BOOT_SCRIPT_PATH}\\s*$`, 'm').test(await fs.readFile(cron, 'utf8'))) p.push(`root crontab has no @reboot ${BOOT_SCRIPT_PATH}`)
+    const cronUnit = R('etc/systemd/system/multi-user.target.wants/cron.service')
+    if (!(await isSymlink(cronUnit)) && !(await fs.pathExists(cronUnit))) p.push('cron.service is not enabled: idea-engine-identity would never run')
     return p
 }
 
