@@ -23,7 +23,7 @@ console.info("Document handle is ready.");
 
 // 4. Set up a listener to log changes to the document.
 docHandle.on("change", ({ doc }) => {
-  console.info("Document changed:", JSON.stringify(doc, null, 2));
+  console.info("Document changed:", JSON.stringify(doc, (k, v) => (k === "passwordHash" ? "<redacted>" : typeof v === "string" ? v.replace(/\$2[abxy]\$\d{2}\$[./A-Za-z0-9]{0,53}/g, "<redacted>") : v), 2));
 });
 
 // 5. Make a change to the document.
