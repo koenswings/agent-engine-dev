@@ -17,7 +17,7 @@ import { $, fs, path } from 'zx'
 import { shellQuote } from '../utils/ssh.js'
 import { print } from '../utils/utils.js'
 import {
-    EngineLock, FIRSTBOOT_SCRIPT, FIRSTBOOT_UNIT, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH, PM2_UNIT, PRELOAD_DOCKER_DIR, PRELOAD_NPM_DIR, SSH_REGEN_UNIT,
+    EngineLock, FIRSTBOOT_SCRIPT, FIRSTBOOT_UNIT, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH, PM2_UNIT, PRELOAD_DOCKER_DIR, PRELOAD_NPM_DIR, SSH_REGEN_UNIT, NPM_OFFLINE_ENV,
     firstbootUnitText, pm2UnitText, preloadManifest, readDpkgStatus, rpiArchivePackageNames, sanitiseRootfs, serialiseLock, verifyRootfs,
 } from './engineImage.js'
 
@@ -119,7 +119,7 @@ export const rootfsSteps = (o: RootfsBuildOptions, r: Runner, inst: Installers):
             await r.host(`test "$(git -C ${q(o.repo)} rev-parse ${q(L.engineCommit)}^{commit})" = ${q(L.engineCommit)}`)
             // Shallow clone at the pinned commit: current Engines run from a git checkout
             // (provision-fleet.sh, install.sh); .git holds only that one commit.
-            await r.host(`rm -rf ${q(R(E))} && install -d ${q(path.posix.dirname(R(E)))} && git init -q ${q(R(E))}` +
+            await r.host(`rm -rf ${q(R(E))} && install -d ${q(path.posix.dirname(R(E)))} && git -c init.defaultBranch=main init -q ${q(R(E))}` +
                 ` && git -C ${q(R(E))} fetch -q --depth 1 ${q(`file://${o.repo}`)} ${q(L.engineCommit)}` +
                 ` && git -C ${q(R(E))} checkout -q --detach FETCH_HEAD` +
                 ` && git -C ${q(R(E))} remote add origin https://github.com/koenswings/agent-engine-dev.git`)
@@ -163,15 +163,26 @@ export const rootfsSteps = (o: RootfsBuildOptions, r: Runner, inst: Installers):
             await r.host(`install -d ${q(R('/root/.idea-build/node'))} && cp -a ${q(`${o.cache}/node/${node}`)} ${q(`${o.cache}/node/SHASUMS256.txt`)} ${q(R('/root/.idea-build/node/'))}`)
             await exec`cd /root/.idea-build/node && grep ${` ${node}$`} SHASUMS256.txt | sha256sum -c -`
             await exec`tar -xJf ${`/root/.idea-build/node/${node}`} -C /usr/local --strip-components=1 --exclude=CHANGELOG.md --exclude=LICENSE --exclude=README.md`
-            await r.host(`install -d ${q(R('/root/.idea-build/npm'))} ${q(R(PRELOAD_NPM_DIR))} && cp -a ${q(o.cache)}/npm-global/*.tgz ${q(R('/root/.idea-build/npm/'))}`)
-            await exec`cd /root/.idea-build/npm && npm install -g --offline ${`pnpm-${L.pnpmVersion}.tgz`} ${`pm2-${L.pm2Version}.tgz`}`
-            await exec`test "$(pnpm --version)" = ${L.pnpmVersion} && test "$(node --version)" = ${`v${L.nodeVersion}`} && test "$(/usr/local/bin/pm2 --version)" = ${L.pm2Version}`
-            await exec`cp /root/.idea-build/npm/${`pm2-logrotate-${L.pm2LogrotateVersion}.tgz`} ${PRELOAD_NPM_DIR}/`
+            // pnpm, pm2, pm2-logrotate: bundled tarballs (whole dependency tree inside, archive-npm-tools.sh), checked by sha256,
+            // installed with no registry at all. Never run pm2 itself here: any pm2 command spawns its daemon.
+            const tools = L.npmTools ?? []
+            if (!tools.length) throw new Error('lock has no npmTools: rebuild the lock with this build-engine (bundled pnpm/pm2/pm2-logrotate)')
+            await r.host(`install -d ${q(R('/root/.idea-build/npm'))} ${q(R('/root/.idea-build/npm-cache'))} ${q(R(PRELOAD_NPM_DIR))}` +
+                tools.map(t => ` && cp -a ${q(`${o.cache}/npm-global/${t.tgz}`)} ${q(R(`/root/.idea-build/npm/${t.tgz}`))}`).join(''))
+            for (const t of tools) {
+                if (!t.sha256) throw new Error(`npmTools ${t.name}: no sha256 (the cache has no NPM-TOOLS.tsv entry)`)
+                await exec`echo ${`${t.sha256}  /root/.idea-build/npm/${t.tgz}`} | sha256sum -c -`
+            }
+            const globals = tools.filter(t => t.install === 'global')
+            await exec`cd /root/.idea-build/npm && env ${NPM_OFFLINE_ENV.split(' ')} npm install -g ${globals.map(t => `./${t.tgz}`)}`
+            for (const t of globals) await exec`test "$(node -p ${`require('/usr/local/lib/node_modules/${t.name}/package.json').version`})" = ${t.version}`
+            await exec`test "$(node --version)" = ${`v${L.nodeVersion}`} && test "$(pnpm --version)" = ${L.pnpmVersion}`
+            for (const t of tools.filter(t => t.install === 'preload')) await exec`install -m 0644 ${`/root/.idea-build/npm/${t.tgz}`} ${`${PRELOAD_NPM_DIR}/${t.tgz}`}`
         } },
         { name: 'Engine install + build as pi (frozen lockfile, offline store)', run: async () => {
             await r.host(`rm -rf ${q(R('/home/pi/.idea-pnpm-store'))} && cp -a ${q(`${o.cache}/pnpm-store`)} ${q(R('/home/pi/.idea-pnpm-store'))}`)
             await exec`chown -R pi:pi /home/pi/.idea-pnpm-store /home/pi/idea`
-            await exec`runuser -u pi -- env HOME=/home/pi bash -c ${`cd ${E} && pnpm install --frozen-lockfile --offline --store-dir /home/pi/.idea-pnpm-store && pnpm build`}`
+            await exec`runuser -u pi -- env HOME=/home/pi bash -c ${`cd ${E} && test "$(node -p "require('./package.json').packageManager")" = pnpm@${L.pnpmVersion} && export npm_config_registry=http://127.0.0.1:9/ npm_config_manage_package_manager_versions=false npm_config_update_notifier=false && pnpm install --frozen-lockfile --offline --store-dir /home/pi/.idea-pnpm-store && pnpm build`}`
             await exec`rm -rf /home/pi/.idea-pnpm-store`
             await inst.grantNetBindCapability(exec)
         } },

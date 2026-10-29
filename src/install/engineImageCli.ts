@@ -16,6 +16,7 @@ import {
     EngineLock, FIRSTBOOT_SCRIPT, IMAGE_ENABLED_UNITS, ImageArgs, LOCK_SCHEMA, LockedFile, LockedImage, UsageError,
     imageIdFromManifest, imageTarName, parseDockerPins, readLock, serialiseLock, sha256File, validateLock, verifyRootfs,
 } from './engineImage.js'
+import { NpmTool, NPM_TOOL_INSTALL } from './engineImage.js'
 import { Installers, Runner, realRunner, runRootfsBuild } from './engineRootfs.js'
 
 export const STORE_IDENTITY_DIR = 'store-identity'
@@ -68,14 +69,46 @@ export const buildLock = async (repo: string, E: any, images: string[], cache: s
         const a = path.join(assets, s.asset)
         if (await fs.pathExists(a)) files.push({ path: s.path, sha256: await sha256File(a), mode: s.mode, owner: 'root' })
     }
+    const npmTools: NpmTool[] = []
+    const toolsDir = path.join(assets, 'npm-tools')
+    for (const name of (await fs.pathExists(toolsDir)) ? (await fs.readdir(toolsDir)).sort() : []) {
+        const install = NPM_TOOL_INSTALL[name]
+        if (!install) throw new UsageError(`npm-tools/${name}: unknown tool (add it to NPM_TOOL_INSTALL)`)
+        const version = String((await fs.readJson(path.join(toolsDir, name, 'package.json'))).dependencies?.[name] ?? '')
+        const lockfile = await fs.readJson(path.join(toolsDir, name, 'package-lock.json'))
+        if (lockfile.packages?.[`node_modules/${name}`]?.version !== version) throw new UsageError(`npm-tools/${name}: package-lock.json is not for ${name}@${version}`)
+        npmTools.push({ name, version, install, lockfileSha256: await sha256File(path.join(toolsDir, name, 'package-lock.json')), tgz: `${name}-${version}.tgz` })
+    }
+    for (const [name, v] of [['pnpm', E.PNPM_VERSION], ['pm2', E.PM2_VERSION], ['pm2-logrotate', E.PM2_LOGROTATE_VERSION]])
+        if (!npmTools.some(t => t.name === name && t.version === v)) throw new UsageError(`npm-tools/${name} must pin ${name}@${v} (Engine.ts)`)
     return {
         schema: LOCK_SCHEMA, engineCommit, engineVersion: String(pkg.version), arch: 'arm64',
         nodeVersion: E.NODE_VERSION, pnpmVersion: E.PNPM_VERSION, pm2Version: E.PM2_VERSION, pm2LogrotateVersion: E.PM2_LOGROTATE_VERSION,
         tailscaleVersion: E.TAILSCALE_VERSION, tailscaleSha256: E.TAILSCALE_ARM64_SHA256, debianSnapshot: E.DEBIAN_SNAPSHOT,
         aptPins: E.parseAptPins(await fs.readFile(path.join(assets, 'apt-rpi-pins.tsv'), 'utf8')),
         dockerDebs: parseDockerPins(await fs.readFile(path.join(assets, 'docker-pins.tsv'), 'utf8')),
-        dockerImages, pm2Env, files, enabledUnits: [...IMAGE_ENABLED_UNITS].sort(),
+        dockerImages, pm2Env, files, enabledUnits: [...IMAGE_ENABLED_UNITS].sort(), npmTools,
     }
+}
+
+/** Record (or, for a --lock rebuild, check) the bundled tarballs in <cache>/npm-global/NPM-TOOLS.tsv against the lock. */
+export const pinNpmTools = async (lock: EngineLock, cache: string): Promise<EngineLock> => {
+    const tsv = path.join(cache, 'npm-global', 'NPM-TOOLS.tsv')
+    if (!(await fs.pathExists(tsv))) throw new Error(`${tsv} missing: the cache predates bundled npm tools (re-run archive-engine-inputs.sh)`)
+    const rows = new Map<string, string[]>((await fs.readFile(tsv, 'utf8')).split('\n').filter(l => l && !l.startsWith('#')).map(l => l.split("\t")).map(c => [c[0], c] as [string, string[]]))
+    const tools: NpmTool[] = []
+    for (const t of lock.npmTools ?? []) {
+        const c = rows.get(t.name)
+        if (!c) throw new Error(`${tsv}: no ${t.name}`)
+        const [, version, tgz, sha256, lockfileSha256] = c
+        if (version !== t.version || tgz !== t.tgz) throw new Error(`${tsv}: ${t.name} ${version} (${tgz}), lock says ${t.version} (${t.tgz})`)
+        if (lockfileSha256 !== t.lockfileSha256) throw new Error(`${tsv}: ${t.name} was archived from another package-lock.json`)
+        const actual = await sha256File(path.join(cache, 'npm-global', tgz))
+        if (actual !== sha256) throw new Error(`${tgz}: sha256 ${actual}, NPM-TOOLS.tsv says ${sha256}`)
+        if (t.sha256 && t.sha256 !== actual) throw new Error(`${tgz}: sha256 ${actual}, the lock says ${t.sha256}`)
+        tools.push({ ...t, sha256: actual })
+    }
+    return { ...lock, npmTools: tools }
 }
 
 export const piUidOf = async (root: string): Promise<number | undefined> => {
@@ -143,15 +176,17 @@ export const runImageMode = async (a: ImageArgs, repo: string): Promise<number> 
         if (process.getuid?.() !== 0) throw new UsageError('--root builds run as root')
     }
     if ((await piUidOf(root)) === undefined) throw new UsageError(`${root}/etc/passwd has no pi user`)
-    const lock = a.lock ? await readLock(a.lock) : await buildLock(repo, E, a.images, a.cache, a.pm2Env)
+    let lock = a.lock ? await readLock(a.lock) : await buildLock(repo, E, a.images, a.cache, a.pm2Env)
     const bad = validateLock(lock); if (bad.length) throw new UsageError(`lock: ${bad.join('; ')}`)
-    const lockText = serialiseLock(lock)
     let cache = a.cache
     if (!cache && !a.dryRun) {
         cache = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-engine-inputs-'))
         console.log(`no --cache: fetching the pinned inputs for ${lock.engineCommit} into ${cache} (archive-engine-inputs.sh, checksummed)`)
         await $({ cwd: repo, stdio: 'inherit' })`bash script/archive-engine-inputs.sh ${lock.engineCommit} ${cache} ${lock.dockerImages.map(i => i.ref)}`
     }
+    if (cache) lock = await pinNpmTools(lock, cache)
+    else lock = { ...lock, npmTools: (lock.npmTools ?? []).map(t => ({ ...t, sha256: t.sha256 ?? '0'.repeat(64) })) } // dry run without a cache
+    const lockText = serialiseLock(lock)
     const storeIdentity = await trackedStoreIdentity(repo, lock.engineCommit)
     const opts = {
         rootfs: root, lock, cache: cache ?? '/nonexistent-cache', repo, enginePath,

@@ -7,7 +7,8 @@
 #        ARCHIVE_SNAPSHOT=<YYYYMMDDTHHMMSSZ> Debian snapshot (default: DEBIAN_SNAPSHOT of <commit>)
 # Writes: <out>/source.tar, <out>/pnpm-store/ (pnpm fetch, linux/arm64),
 #         <out>/node/node-v<ver>-linux-arm64.tar.xz (+ upstream SHASUMS256.txt),
-#         <out>/npm-global/*.tgz (n, pnpm, pm2, pm2-logrotate),
+#         <out>/npm-global/*.tgz: n (npm pack) and pnpm, pm2, pm2-logrotate WITH their dependency trees
+#         (script/archive-npm-tools.sh, from the committed npm-tools/<tool>/package-lock.json) + NPM-TOOLS.tsv,
 #         <out>/docker/<name>.tar (linux/arm64, with RepoDigests), <out>/tailscale/ (pinned tarball),
 #         <out>/debs/ (script/archive-debs.py), <out>/debs/docker/ (docker-pins.tsv),
 #         <out>/SHA256SUMS and <out>/ARCHIVE.json.
@@ -32,7 +33,15 @@ curl -fsSL -o "$out/node/node-v${node_ver}-linux-arm64.tar.xz" "$base/node-v${no
 pm2_ver=$(grep -oP "PM2_VERSION = '\K[0-9.]+" "$out/src/src/data/Engine.ts" || true)
 lr_ver=$(grep -oP "PM2_LOGROTATE_VERSION = '\K[0-9.]+" "$out/src/src/data/Engine.ts" || true)
 # pm2/pm2-logrotate pinned when the commit pins them (build-engine --rootfs needs pm2-<ver>.tgz, idea#322)
-( cd "$out/npm-global" && npm pack "pnpm@${pnpm_ver:-10.33.0}" n "pm2${pm2_ver:+@$pm2_ver}" "pm2-logrotate${lr_ver:+@$lr_ver}" >/dev/null )
+# whole trees, offline-installable (idea#322): needs the commit's script/build_image_assets/npm-tools/
+if [ -d "$out/src/script/build_image_assets/npm-tools" ]; then
+  bash "$repo/script/archive-npm-tools.sh" "$out/src/script/build_image_assets/npm-tools" "$out/npm-global"
+  ( cd "$out/npm-global" && npm pack n --loglevel=warn >/dev/null )
+else
+  # older commits: top-level packages only (they install online); not usable by build-engine --root
+  ( cd "$out/npm-global" && npm pack "pnpm@${pnpm_ver:-10.33.0}" n "pm2${pm2_ver:+@$pm2_ver}" "pm2-logrotate${lr_ver:+@$lr_ver}" >/dev/null )
+  echo "$commit has no npm-tools/ lockfiles: top-level tarballs only, NOT offline-installable" > "$out/npm-global/NOT-BUNDLED.txt"
+fi
 # 3b. Tailscale (pinned in Engine.ts since idea#322; older commits installed "latest")
 ts_ver=$(grep -oP "TAILSCALE_VERSION = '\K[0-9.]+" "$out/src/src/data/Engine.ts" || true)
 ts_sha=$(grep -oP "TAILSCALE_ARM64_SHA256 = '\K[0-9a-f]+" "$out/src/src/data/Engine.ts" || true)

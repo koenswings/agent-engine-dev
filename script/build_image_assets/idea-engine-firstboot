@@ -31,6 +31,8 @@ env_name=$(sed -n 's/.*"pm2Env": *"\([a-z]*\)".*/\1/p' "$LOCK" | head -1)
 logrotate=$(ls "$PRE"/npm/pm2-logrotate-*.tgz 2>/dev/null | head -1 || true)
 runuser -u pi -- env -u TAILSCALE_AUTHKEY HOME=/home/pi PM2_HOME=/home/pi/.pm2 bash -c "
   set -e; cd '$ENGINE'
+  # the tarball carries its whole dependency tree: never reach for a registry
+  export npm_config_offline=true npm_config_registry=http://127.0.0.1:9/ npm_config_update_notifier=false
   if [ -n '$logrotate' ]; then pm2 install '$logrotate' || echo 'pm2-logrotate install failed (not fatal)'; fi
   pm2 describe engine >/dev/null 2>&1 || pm2 start pm2.config.cjs --env '${env_name:-production}'
   pm2 save"
