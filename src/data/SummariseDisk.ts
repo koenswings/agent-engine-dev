@@ -117,6 +117,11 @@ export const resolveSummaryTarget = (store: Store, targetId: string): {
     return null
 }
 
+/** Disk paths that are IDEA data, never counted as "other" user files. idea#347: .idea-quarantine included. */
+export const isIdeaDiskPath = (rel: string): boolean =>
+    rel === 'META.yaml' || rel === 'FILES.yaml' || rel === 'BACKUP.yaml' ||
+    ['apps', 'instances', 'services', 'backups', 'lost+found', 'files', '.idea-quarantine'].some(d => rel === d || rel.startsWith(`${d}/`))
+
 export const summariseDisk = async (
     storeHandle: DocHandle<Store>,
     targetId: string,
@@ -156,14 +161,7 @@ export const summariseDisk = async (
     let truncated = false
 
     const underFiles = (rel: string) => rel === 'files' || rel.startsWith('files/')
-    const isIdeaPath = (rel: string) =>
-        rel === 'META.yaml' || rel === 'FILES.yaml' || rel === 'BACKUP.yaml' ||
-        rel === 'apps' || rel.startsWith('apps/') ||
-        rel === 'instances' || rel.startsWith('instances/') ||
-        rel === 'services' || rel.startsWith('services/') ||
-        rel === 'backups' || rel.startsWith('backups/') ||
-        rel === 'lost+found' || rel.startsWith('lost+found/') ||
-        underFiles(rel)
+    const isIdeaPath = isIdeaDiskPath
 
     const walkResult = await ops.walk(root, (rel, size) => {
         entries++

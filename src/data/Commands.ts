@@ -28,6 +28,7 @@ import { createFilesDisk } from './CreateFilesDisk.js';
 import { summariseDisk, attachTraceResult } from './SummariseDisk.js';
 import { eraseDisk } from './EraseDisk.js';
 import { forgetDisk } from './ForgetDisk.js';
+import { removeInstance } from './RemoveInstance.js';
 import { flashCard, cancelFlash, initialiseDisk } from './FlashCard.js';
 import { testContext } from "../../test/testContext.js";
 
@@ -361,6 +362,15 @@ const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, dis
  * defaults to "School Files". Refusals throw, so the trace ends as `error`.
  */
 
+/** removeInstance <instanceId> (idea#347): compose down (volumes kept), quarantine the folder, drop the record. */
+const removeInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: string) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    const engineId = String(getLocalEngine(storeHandle.doc())?.id ?? localEngineId)
+    const result = await removeInstance(storeHandle, instanceArg, engineId)
+    attachTraceResult(result)
+    print(chalk.green(`Removed instance ${result.instanceId}; its folder is kept at ${result.quarantinePath}`))
+}
+
 /** summariseDisk <diskId|candidateId> (idea#134). Result in CommandTrace.result. */
 const summariseDiskWrapper = async (storeHandle: DocHandle<Store> | null, targetId: string) => {
     if (!storeHandle) throw new Error('Store is not available.')
@@ -490,6 +500,7 @@ export const commands: CommandDefinition[] = [
     { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "mode" }, { type: "string", name: "instanceNames", variadic: true }], scope: 'engine' },
     { name: "createFilesDisk", execute: createFilesDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "shareName", variadic: true, optional: true }], scope: 'engine' },
+    { name: "removeInstance", execute: removeInstanceWrapper, args: [{ type: "string", name: "instanceId" }], scope: 'engine' },
     { name: "summariseDisk", execute: summariseDiskWrapper, args: [{ type: "string", name: "targetId" }], scope: 'engine' },
     { name: "eraseDisk", execute: eraseDiskWrapper, args: [{ type: "string", name: "targetId" }, { type: "string", name: "summaryTraceId" }, { type: "string", name: "confirmName", variadic: true }], scope: 'engine' },
     // idea#201 §10 (Engine API contract v2): ids only. Trace arg keys are the contract names.
