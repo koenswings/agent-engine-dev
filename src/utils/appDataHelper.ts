@@ -37,7 +37,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '3'
+export const APP_DATA_HELPER_VERSION = '4'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -107,6 +107,8 @@ export const putFilesArgs = (root: string, id: string, stagingDir: string): stri
     if (!stagingDir.startsWith('/tmp/')) throw new Error('stagingDir for put-files must be under /tmp')
     return ['put-files', checkRoot(root), checkId(id), stagingDir]
 }
+/** idea#347: rename instances/<id> to <disk>/.idea-quarantine/<id>-<UTC stamp>; prints the new path. */
+export const quarantineArgs = (root: string, id: string): string[] => ['quarantine', checkRoot(root), checkId(id)]
 export const deleteArgs = (root: string, id: string): string[] => ['delete', checkRoot(root), checkId(id)]
 export const borgInitArgs = (bdev: string, id: string): string[] => ['borg-init', checkRoot(bdev), checkId(id)]
 export const borgInfoArgs = (bdev: string, id: string): string[] => ['borg-info', checkRoot(bdev), checkId(id)]
@@ -256,19 +258,34 @@ export const appDataHelperProblem = async (run: AppDataRunner = runAppData): Pro
 }
 
 /**
- * Refuses to start the Engine when the helper is missing, not allowed by sudoers,
- * or the wrong version (like CreateFilesDisk's "ask Ops to install the new
- * 11-engine-files" message, but at startup). isDev machines (the dev containers)
- * have no helper and skip the check, as they skip the other root-only startup steps.
+ * Startup check (softened, Steve 2026-10-28): the Engine ALWAYS starts. A missing,
+ * unrunnable or different helper is logged loudly and returned; each command that
+ * needs a newer helper refuses on its own with HELPER_OUTDATED (helperAtLeast):
+ * removeInstance needs v4, updateApp v5. isDev machines skip the check.
  */
-export const assertAppDataHelper = async (run: AppDataRunner = runAppData): Promise<void> => {
+export const assertAppDataHelper = async (run: AppDataRunner = runAppData): Promise<string | null> => {
     if (config.settings.isDev) {
         log('isDev: not checking the app-data root helper (idea-app-data)')
-        return
+        return null
     }
     const problem = await appDataHelperProblem(run)
-    if (problem) throw new Error(problem)
+    if (problem) {
+        log(`WARNING: ${problem} The Engine starts anyway; commands that need a newer helper refuse with HELPER_OUTDATED.`)
+        return problem
+    }
     log(`app-data root helper ${APP_DATA_HELPER} version ${APP_DATA_HELPER_VERSION} is installed`)
+    return null
+}
+
+/** null when the installed helper is at least `min`; else a clear message for HELPER_OUTDATED. */
+export const helperAtLeast = async (min: number, what: string, run: AppDataRunner = runAppData): Promise<string | null> => {
+    let got = ''
+    try { got = (await run(['version'])).trim() } catch (e: any) {
+        return `${what} needs the app-data root helper ${APP_DATA_HELPER} v${min} or later, but it cannot be run with sudo -n (${e?.message ?? e}); ${APP_DATA_HELPER_UPDATE}.`
+    }
+    const v = Number(got.match(/^idea-app-data (\d+)$/)?.[1])
+    if (Number.isFinite(v) && v >= min) return null
+    return `${what} needs the app-data root helper ${APP_DATA_HELPER} v${min} or later, but the installed one reports '${got || 'nothing'}'; ${APP_DATA_HELPER_UPDATE}.`
 }
 
 /**

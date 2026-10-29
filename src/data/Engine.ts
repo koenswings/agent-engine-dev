@@ -157,7 +157,7 @@ export interface EraseInProgress {
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'renameInstance']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'renameInstance']
 /** idea#201 §10: advertised only when the flash helper is installed (HELPER_MISSING otherwise) */
 export const FLASH_CARD_CAPABILITY = 'flashCard'
 export const FLASH_HELPER_PATH = '/usr/local/sbin/idea-flash-card'
