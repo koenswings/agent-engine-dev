@@ -408,6 +408,13 @@ export const initialiseDisk = async (
         if (!look.ok) fail('MOUNTED', look.message)
         if (look.ok && look.osRootfs) fail('OS_ROOTFS', `${target.name} holds an operating system (etc/os-release + usr/ or boot/); it cannot become an IDEA disk in place — flash it instead`)
         if (look.ok && look.hasMeta) fail('ALREADY_IDEA', `${target.name} already has an IDEA META.yaml`)
+        // #236 (Steve): a root-owned ext4 that already holds data is not a blank disk. Initialise
+        // never wipes, and never claims someone's data without an explicit erase first.
+        if (look.ok && look.contents?.rootOwned && look.contents.entries.length > 0) {
+            const e = look.contents.entries
+            const shown = e.slice(0, 5).join(', ') + (e.length > 5 ? `, … (${e.length} entries)` : '')
+            fail('NOT_EMPTY', `${target.name} is not empty: found ${shown} in its root. Initialise only takes an empty disk; erase it first if its contents can go`)
+        }
         updateOperation(storeHandle, opId, { currentStep: 1, stepLabel: 'writing META.yaml' })
         const m = await ops.mountRw(target.name)
         if (!m.ok) fail('MOUNTED', m.message)
