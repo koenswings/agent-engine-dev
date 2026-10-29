@@ -7,7 +7,9 @@ import { dirname } from 'path';
 import pack from '../package.json' with { type: "json" };
 import { realStickerNameDeps, resolveStickerName, stickerText, writeStickerFile } from '../src/install/stickerName.js';
 import { config } from '../src/data/Config.js';
-import { buildEngine, setHostname, syncEngine } from '../src/data/Engine.js';
+// Engine.js is imported dynamically (main): its import looks up this machine's Engine id, which an image
+// build host must never do (idea#322).
+import { UsageError, parseImageArgs } from '../src/install/engineImage.js';
 import { addMeta } from '../src/data/Meta.js';
 import { parseBoolFlag, parseModel, resolveGadget } from '../src/utils/cliFlags.js';
 import { archiveKeys, judgeSource, setKeys, SourceState } from '../src/install/deploymentRecord.js';
@@ -57,6 +59,18 @@ const captureDeploymentRecord = async (exec: any, enginePath: string, repo: stri
 
 // Main execution logic
 const main = async () => {
+    // Image modes (idea#322 Option A): --root/--rootfs, --verify-rootfs, --write-lock. No SSH, no device identity.
+    // Exit 0 ok, 1 build or verify failed, 2 usage (idea tools/engine-image/INTERFACE.md).
+    let image
+    try { image = parseImageArgs(argv) } catch (e) { console.error(chalk.red(`${(e as Error).message}`)); process.exit(2) }
+    if (image) {
+        const { runImageMode } = await import('../src/install/engineImageCli.js')
+        const repo = dirname(dirname(fileURLToPath(import.meta.url)))
+        try { process.exit(await runImageMode(image, repo)) } catch (e) {
+            console.error(chalk.red(`${(e as Error).message}`)); process.exit(e instanceof UsageError ? 2 : 1)
+        }
+    }
+    const { buildEngine, setHostname, syncEngine } = await import('../src/data/Engine.js');
     // Command line argument parsing
     const user = argv.u || argv.user || defaults.user;
     const machine = argv.m || argv.machine || defaults.machine;
@@ -97,6 +111,18 @@ const main = async () => {
         console.log(`  --batch <name>          deployment batch for the record, e.g. zimbabwe-2026-10 (default: UNKNOWN)`)
         console.log(`  --no-record             skip the deployment record (default: write it, idea#322)`)
         console.log(`  --personalize           only set the hostname and add meta information without building the engine`)
+        console.log(``)
+        console.log(`Image modes (idea#322; no SSH, nothing started, no device identity; exit 0 ok / 1 failed / 2 usage):`)
+        console.log(`  --root <dir>            build into the mounted root fs <dir> (arm64 host, root); alias --rootfs`)
+        console.log(`  --boot <dir>            its mounted boot partition (default <root>/boot/firmware)`)
+        console.log(`  --report <file>         write engine-build.json (commit, version, lock sha256, verify result)`)
+        console.log(`  --cache <dir>           script/archive-engine-inputs.sh output (default: fetched now into a temp dir)`)
+        console.log(`  --lock <file>           use this engine lock (default: generated from this clean checkout)`)
+        console.log(`  --image <ref@sha256:d>  Docker image to preload (repeatable; pinned by digest)`)
+        console.log(`  --pm2-env <env>         production (default) or development`)
+        console.log(`  --verify-rootfs <dir>   only verify a built root fs against --lock`)
+        console.log(`  --write-lock --lock <f> write the lock for this clean checkout`)
+        console.log(`  --dry-run               with --root: print every step, run none (any host)`)
         console.log(``)
         process.exit(0);
     }

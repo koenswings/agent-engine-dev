@@ -29,7 +29,10 @@ curl -fsSL -o "$out/node/SHASUMS256.txt" "$base/SHASUMS256.txt"
 curl -fsSL -o "$out/node/node-v${node_ver}-linux-arm64.tar.xz" "$base/node-v${node_ver}-linux-arm64.tar.xz"
 ( cd "$out/node" && grep " node-v${node_ver}-linux-arm64.tar.xz\$" SHASUMS256.txt | sha256sum -c - )
 # 3. global npm tools (build-engine installs these unpinned at $commit; we record what we got)
-( cd "$out/npm-global" && npm pack "pnpm@${pnpm_ver:-10.33.0}" n pm2 pm2-logrotate >/dev/null )
+pm2_ver=$(grep -oP "PM2_VERSION = '\K[0-9.]+" "$out/src/src/data/Engine.ts" || true)
+lr_ver=$(grep -oP "PM2_LOGROTATE_VERSION = '\K[0-9.]+" "$out/src/src/data/Engine.ts" || true)
+# pm2/pm2-logrotate pinned when the commit pins them (build-engine --rootfs needs pm2-<ver>.tgz, idea#322)
+( cd "$out/npm-global" && npm pack "pnpm@${pnpm_ver:-10.33.0}" n "pm2${pm2_ver:+@$pm2_ver}" "pm2-logrotate${lr_ver:+@$lr_ver}" >/dev/null )
 # 3b. Tailscale (pinned in Engine.ts since idea#322; older commits installed "latest")
 ts_ver=$(grep -oP "TAILSCALE_VERSION = '\K[0-9.]+" "$out/src/src/data/Engine.ts" || true)
 ts_sha=$(grep -oP "TAILSCALE_ARM64_SHA256 = '\K[0-9a-f]+" "$out/src/src/data/Engine.ts" || true)

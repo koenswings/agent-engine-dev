@@ -1,0 +1,230 @@
+/**
+ * engine-image.test.ts: build-engine image modes (idea#322 Option A), all on a temp-dir rootfs.
+ * Arg parsing, the lock, sanitise, verify, the build step plan with a stubbed runner,
+ * and first start from an image /META.yaml without a diskId.
+ */
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { fs, path } from 'zx'
+import os from 'os'
+import crypto from 'crypto'
+import {
+    parseImageArgs, UsageError, validateLock, serialiseLock, writeLock, readLock, LOCK_SCHEMA, EngineLock,
+    sanitiseRootfs, verifyRootfs, IDENTITY_PATHS, GENERIC_HOSTNAME, IMAGE_ENABLED_UNITS, PM2_UNIT, SSH_REGEN_UNIT,
+    pm2UnitText, preloadManifest, imageIdFromManifest, imageTarName, PRELOAD_DOCKER_DIR, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH,
+} from '../../src/install/engineImage.js'
+import { rootfsSteps, runRootfsBuild, Runner, Installers, SHIMS, quoteTemplate } from '../../src/install/engineRootfs.js'
+import { diskIdWithoutHardware, hasDiskId, ensureSystemMeta } from '../../src/data/Meta.js'
+
+const ENGINE = '/home/pi/idea/agents/agent-engine-dev'
+const COMMIT = 'a'.repeat(40)
+const sha = (s: string) => crypto.createHash('sha256').update(s).digest('hex')
+const DIGEST = 'b'.repeat(64)
+
+const lock = (over: Partial<EngineLock> = {}): EngineLock => ({
+    schema: LOCK_SCHEMA, engineCommit: COMMIT, engineVersion: '1.0', arch: 'arm64',
+    nodeVersion: '22.20.0', pnpmVersion: '10.33.0', pm2Version: '7.1.1', pm2LogrotateVersion: '3.0.0',
+    tailscaleVersion: '1.104.2', tailscaleSha256: 'c'.repeat(64), debianSnapshot: '20261026T000000Z',
+    aptPins: [], dockerDebs: [], dockerImages: [], pm2Env: 'production', files: [], enabledUnits: [...IMAGE_ENABLED_UNITS].sort(),
+    ...over,
+})
+
+describe('parseImageArgs', () => {
+    it('returns null without an image flag (live/SSH path unchanged)', () => {
+        expect(parseImageArgs({ m: 'idea04' })).toBeNull()
+        expect(parseImageArgs({})).toBeNull()
+    })
+    it('accepts the INTERFACE.md invocation (--root --boot --report), lock optional', () => {
+        const a = parseImageArgs({ root: '/mnt/r', boot: '/mnt/r/boot/firmware', report: '/out/engine-build.json' })!
+        expect(a).toMatchObject({ mode: 'rootfs', rootfs: '/mnt/r', boot: '/mnt/r/boot/firmware', report: '/out/engine-build.json', pm2Env: 'production', dryRun: false })
+        expect(a.lock).toBeUndefined()
+    })
+    it('refuses device or remote options with a UsageError', () => {
+        for (const bad of [{ m: 'x' }, { u: 'pi' }, { hostname: 'h' }, { personalize: true }, { peer: 'p' }])
+            expect(() => parseImageArgs({ root: '/mnt/r', ...bad })).toThrow(UsageError)
+    })
+    it('refuses /, relative paths, two modes, undigested images, bad pm2 env', () => {
+        expect(() => parseImageArgs({ root: '/' })).toThrow(/refusing/)
+        expect(() => parseImageArgs({ root: 'mnt' })).toThrow(/absolute/)
+        expect(() => parseImageArgs({ root: '/a', 'verify-rootfs': '/a', lock: '/l' })).toThrow(/only one/)
+        expect(() => parseImageArgs({ root: '/a', image: 'nginx:1.27' })).toThrow(/digest/)
+        expect(() => parseImageArgs({ root: '/a', 'pm2-env': 'staging' })).toThrow(/pm2-env/)
+        expect(() => parseImageArgs({ root: '/a', report: 'x.json' })).toThrow(/absolute/)
+        expect(parseImageArgs({ root: '/a', image: `nginx:1.27@sha256:${DIGEST}` })!.images).toHaveLength(1)
+    })
+    it('verify and write-lock need --lock', () => {
+        expect(() => parseImageArgs({ 'verify-rootfs': '/a' })).toThrow(/--lock/)
+        expect(parseImageArgs({ 'write-lock': true, lock: '/x/engine.lock' })!.mode).toBe('write-lock')
+    })
+})
+
+describe('lock', () => {
+    it('validates and round-trips sorted, stable JSON', async () => {
+        expect(validateLock(lock())).toEqual([])
+        expect(validateLock(lock({ engineCommit: 'abc' }))).toContain('engineCommit must be a full 40-hex git SHA')
+        expect(validateLock(lock({ dockerImages: [{ ref: 'nginx:1', imageId: 'x', tar: '../t', tarSha256: 'z' } as any] })).length).toBe(4)
+        const d = await fs.mkdtemp(path.join(os.tmpdir(), 'lock-'))
+        await writeLock(path.join(d, 'l.json'), lock())
+        expect(await readLock(path.join(d, 'l.json'))).toEqual(JSON.parse(serialiseLock(lock())))
+        expect(serialiseLock(lock())).toBe(serialiseLock(JSON.parse(serialiseLock(lock()))))
+        await fs.remove(d)
+    })
+    it('names preload tarballs like archive-engine-inputs.sh and reads the image id', () => {
+        expect(imageTarName(`ghcr.io/a/b:1@sha256:${DIGEST}`)).toBe(`ghcr.io_a_b_1_sha256_${DIGEST}.tar`)
+        expect(imageIdFromManifest(JSON.stringify([{ Config: `blobs/sha256/${DIGEST}` }]))).toBe(`sha256:${DIGEST}`)
+        expect(() => imageIdFromManifest('[]')).toThrow()
+        expect(preloadManifest([])).toBe('')
+    })
+})
+
+/** A rootfs that passes verify (built by hand), with the store-identity files of the "commit". */
+const STORE = { 'store-template.json': '{"t":1}\n', 'store-url.txt': 'automerge:x\n', 'command-log-url.txt': 'automerge:y\n' }
+const storeShas = Object.fromEntries(Object.entries(STORE).map(([k, v]) => [k, sha(v)]))
+const goodRootfs = async (root: string) => {
+    const R = (p: string) => path.join(root, p)
+    const eng = R(ENGINE)
+    await fs.ensureDir(path.join(eng, '.git')); await fs.writeFile(path.join(eng, '.git/HEAD'), COMMIT + '\n')
+    await fs.ensureDir(path.join(eng, 'dist/src')); await fs.writeFile(path.join(eng, 'dist/src/index.js'), '')
+    await fs.ensureDir(path.join(eng, 'node_modules')); await fs.writeFile(path.join(eng, 'pm2.config.cjs'), '')
+    await fs.ensureDir(path.join(eng, 'store-identity'))
+    for (const [k, v] of Object.entries(STORE)) await fs.writeFile(path.join(eng, 'store-identity', k), v)
+    await fs.ensureDir(R('etc/systemd/system/multi-user.target.wants'))
+    await fs.writeFile(R(`etc/systemd/system/${PM2_UNIT}`), pm2UnitText())
+    for (const u of IMAGE_ENABLED_UNITS) await fs.writeFile(R(`etc/systemd/system/multi-user.target.wants/${u}`), '')
+    await fs.writeFile(R('etc/machine-id'), ''); await fs.writeFile(R('etc/hostname'), GENERIC_HOSTNAME + '\n')
+    await fs.writeFile(R('etc/hosts'), '127.0.0.1\tlocalhost\n127.0.1.1\traspberrypi\n')
+    await fs.ensureDir(R('etc/idea')); await fs.writeFile(R(IMAGE_LOCK_PATH.slice(1)), serialiseLock(lock())); await fs.writeFile(R(IMAGE_VERSION_PATH.slice(1)), '1.0\n')
+}
+const addIdentity = async (root: string) => {
+    const R = (p: string) => path.join(root, p)
+    await fs.writeFile(R('META.yaml'), 'diskId: ABC\nisHardwareId: true\n')
+    await fs.ensureDir(R('etc/ssh')); await fs.writeFile(R('etc/ssh/ssh_host_ed25519_key'), 'k')
+    await fs.ensureDir(R('var/lib/tailscale')); await fs.writeFile(R('var/lib/tailscale/tailscaled.state'), '{}')
+    await fs.ensureDir(R('etc/tailscale')); await fs.chmod(R('etc/tailscale'), 0o700); await fs.writeFile(R('etc/tailscale/debug-authkey'), 'tskey-auth-FAKE')
+    await fs.writeFile(R('etc/machine-id'), '0123456789abcdef0123456789abcdef\n'); await fs.writeFile(R('etc/hostname'), 'brave-otter\n')
+    await fs.writeFile(R('etc/hosts'), '127.0.0.1\tlocalhost\n127.0.1.1\tbrave-otter\n')
+    await fs.ensureDir(R('home/pi/.pm2')); await fs.writeFile(R('home/pi/.pm2/dump.pm2'), '[]')
+    await fs.ensureDir(R(`${ENGINE}/store-data`)); await fs.writeFile(R(`${ENGINE}/store-identity/extra-store.txt`), 'x')
+    await fs.ensureDir(R('root/.idea-build/shims')); await fs.ensureDir(R('usr/sbin')); await fs.writeFile(R('usr/sbin/policy-rc.d'), 'exit 101')
+}
+
+describe('sanitise + verify', () => {
+    let root: string
+    beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'rootfs-')); await goodRootfs(root) })
+    afterEach(async () => { await fs.remove(root) })
+    const ctx = () => ({ root, enginePath: ENGINE, lock: lock(), storeIdentity: storeShas })
+
+    it('a clean rootfs verifies', async () => { expect(await verifyRootfs(ctx())).toEqual([]) })
+    it('verify fails on every kind of identity, sanitise removes it, then verify passes', async () => {
+        await addIdentity(root)
+        const p = await verifyRootfs(ctx())
+        for (const s of ['/META.yaml', 'ssh_host_ed25519_key', 'tailscaled.state', 'debug-authkey', 'machine-id is not empty', 'hostname', 'dump.pm2', 'store-data', 'extra-store.txt', 'policy-rc.d', '.idea-build'])
+            expect(p.join('\n')).toContain(s)
+        const done = await sanitiseRootfs({ root, enginePath: ENGINE, trackedStoreIdentity: Object.keys(STORE) })
+        expect(done.length).toBeGreaterThan(5)
+        expect(await verifyRootfs(ctx())).toEqual([])
+        expect(await fs.readFile(path.join(root, 'etc/machine-id'), 'utf8')).toBe('')
+        expect(await fs.readlink(path.join(root, 'var/lib/dbus/machine-id'))).toBe('/etc/machine-id')
+        expect(await sanitiseRootfs({ root, enginePath: ENGINE, trackedStoreIdentity: Object.keys(STORE) })).toEqual([]) // idempotent
+    })
+    it('sanitise never touches store-template.json; verify fails if it changed', async () => {
+        const f = path.join(root, ENGINE, 'store-identity/store-template.json')
+        await sanitiseRootfs({ root, enginePath: ENGINE, trackedStoreIdentity: Object.keys(STORE) })
+        expect(await fs.readFile(f, 'utf8')).toBe(STORE['store-template.json'])
+        await fs.writeFile(f, '{"t":2}\n')
+        expect((await verifyRootfs(ctx())).join()).toContain('store-template.json must never change')
+    })
+    it('verify fails on a wrong commit, missing build, pm2 as root, unit not enabled, locked file drift, preload drift', async () => {
+        await fs.writeFile(path.join(root, ENGINE, '.git/HEAD'), 'ref: refs/heads/main\n')
+        await fs.remove(path.join(root, ENGINE, 'dist'))
+        await fs.writeFile(path.join(root, `etc/systemd/system/${PM2_UNIT}`), '[Service]\nUser=root\n')
+        await fs.writeFile(path.join(root, 'etc/systemd/system/pm2-root.service'), '')
+        await fs.remove(path.join(root, `etc/systemd/system/multi-user.target.wants/${SSH_REGEN_UNIT}`))
+        await fs.ensureDir(path.join(root, 'usr/local/sbin')); await fs.writeFile(path.join(root, 'usr/local/sbin/idea-app-data'), 'v5')
+        await fs.chmod(path.join(root, 'usr/local/sbin/idea-app-data'), 0o755)
+        const l = lock({
+            files: [{ path: '/usr/local/sbin/idea-app-data', sha256: sha('v4'), mode: '0700', owner: 'root' }],
+            dockerImages: [{ ref: `nginx:1@sha256:${DIGEST}`, imageId: `sha256:${DIGEST}`, tar: 'n.tar', tarSha256: DIGEST } as any],
+        })
+        const p = (await verifyRootfs({ ...ctx(), lock: l })).join('\n')
+        for (const s of ['not detached', 'dist/src/index.js missing', 'User=pi', 'pm2-root', SSH_REGEN_UNIT, 'content differs', 'mode 0755', 'preload nginx', 'images.lock missing'])
+            expect(p).toContain(s)
+    })
+})
+
+describe('rootfs build plan (stubbed runner and installers)', () => {
+    let root: string
+    beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'rootfs-')); await goodRootfs(root) })
+    afterEach(async () => { await fs.remove(root) })
+
+    const record = () => {
+        const log: string[] = []
+        const r: Runner = { host: async c => { log.push(`host: ${c}`); return { stdout: '' } }, chroot: async c => { log.push(`chroot: ${c}`); return { stdout: '' } } }
+        const calls: string[] = []
+        const inst = new Proxy({}, { get: (_t, k) => async (exec: any) => { calls.push(String(k)); await exec`echo ${String(k)}` } }) as Installers
+        return { log, r, inst, calls }
+    }
+    const opts = () => ({ rootfs: root, lock: lock(), cache: '/cache', repo: '/repo', enginePath: ENGINE, language: 'en_GB.UTF-8', keyboard: 'gb', timezone: 'Europe/Brussels', trackedStoreIdentity: Object.keys(STORE), storeIdentity: storeShas })
+
+    it('quotes template args like zx (arrays one word each)', () => {
+        const t = (p: TemplateStringsArray, ...a: unknown[]) => quoteTemplate(p, a)
+        expect(t`systemctl enable ${['a.service', "b c"]}`).toBe(`systemctl enable 'a.service' 'b c'`)
+        expect(t`echo ${"it's"}`).toBe(`echo 'it'\\''s'`)
+    })
+    it('guards come first, no SSH, nothing started, units enabled; sanitise last; verify passes', async () => {
+        const { log, r, inst, calls } = record()
+        const problems = await runRootfsBuild(opts(), r, inst, serialiseLock(lock()))
+        expect(problems).toEqual([])
+        const all = log.join('\n')
+        expect(log[0]).toContain('/root/.idea-build')
+        const firstInstaller = log.findIndex(l => l.includes("echo 'pinAptSnapshot'"))
+        expect(log.findIndex(l => l.includes('policy-rc.d'))).toBeLessThan(firstInstaller)
+        expect(log.findIndex(l => l.includes('ssh-keygen -A'))).toBeLessThan(log.findIndex(l => l.includes("echo 'installUdev'")))
+        expect(all).not.toMatch(/\bssh\s+\S+@/)
+        // commands only, not file contents written (shim bodies, unit files)
+        const cmds = log.filter(l => !l.startsWith('host: printf %s')).join('\n')
+        expect(cmds).not.toMatch(/systemctl (start|restart)|pm2 (start|startup|save|resurrect)|docker (load|run|network create)|udevadm trigger|tailscale up/)
+        expect(all).toContain(`systemctl enable ${[...IMAGE_ENABLED_UNITS].sort().map(u => `'${u}'`).join(' ')}`)
+        expect(all).toContain('--frozen-lockfile --offline')
+        expect(all).toContain(`checkout -q --detach '${COMMIT}'`)
+        expect(all).not.toMatch(/install-tailscale|TAILSCALE_AUTHKEY|tskey/)
+        expect(calls).toEqual(['pinAptSnapshot', 'updateSystem', 'installRpiPins', 'installAvahi', 'localiseSystem', 'installCrontabs', 'installUdev', 'installVarious', 'installVarious2', 'buildAppsInfrastructure', 'grantNetBindCapability'])
+        expect(await fs.readFile(path.join(root, IMAGE_LOCK_PATH.slice(1)), 'utf8')).toBe(serialiseLock(lock()))
+        expect(await fs.readFile(path.join(root, IMAGE_VERSION_PATH.slice(1)), 'utf8')).toBe(`1.0 ${COMMIT}\n`)
+    })
+    it('the build stops at the first failing step', async () => {
+        const { r, inst } = record()
+        const bad: Runner = { host: r.host, chroot: async c => { if (c.includes('ssh-keygen')) throw new Error('boom'); return { stdout: '' } } }
+        await expect(runRootfsBuild(opts(), bad, inst, '')).rejects.toThrow('boom')
+    })
+    it('shims refuse daemon work and an image hostname; sudo shim keeps the shims on PATH', () => {
+        expect(SHIMS.pm2).toMatch(/refused/); expect(SHIMS.docker).toMatch(/refused/); expect(SHIMS.hostnamectl).toMatch(/exit 1/)
+        expect(SHIMS.udevadm).toMatch(/exit 0/); expect(SHIMS.sudo).toMatch(/exec "\$@"/)
+        expect(rootfsSteps(opts(), record().r, record().inst).at(-1)!.name).toMatch(/sanitise/)
+    })
+    it('identity list covers the INTERFACE.md items', () => {
+        for (const p of ['META.yaml', 'etc/ssh/ssh_host_*', 'var/lib/tailscale/*', 'etc/tailscale/debug-authkey']) expect(IDENTITY_PATHS).toContain(p)
+        expect(PRELOAD_DOCKER_DIR).toBe('/var/lib/idea/preload/docker')
+    })
+})
+
+describe('first start from an image /META.yaml (idea#322)', () => {
+    it('no diskId (missing, empty, "undefined") -> a generated id, never ENGINE_undefined', () => {
+        for (const m of [{}, { diskId: '' }, { diskId: 'undefined' }, { diskId: null }] as any[]) {
+            expect(hasDiskId(m)).toBe(false)
+            const r = diskIdWithoutHardware(m, () => 'gen-1')
+            expect(r).toMatchObject({ diskId: 'gen-1', generated: true })
+        }
+    })
+    it('keeps a user-assigned id; regenerates a cloned hardware id', () => {
+        expect(diskIdWithoutHardware({ diskId: 'mine' as any, isHardwareId: false }, () => 'g')).toMatchObject({ diskId: 'mine', generated: false })
+        expect(diskIdWithoutHardware({ diskId: 'SER1' as any, isHardwareId: true }, () => 'g')).toMatchObject({ diskId: 'g', generated: true })
+    })
+    it('a missing /META.yaml is created with the hardware serial, else a UUID', async () => {
+        let written: any
+        const deps = { exists: () => false, write: async (m: any) => { written = m }, now: () => 1 }
+        const a = await ensureSystemMeta('sda2' as any, { path: '/tmp/x/META.yaml', allowCreate: true, deps: { ...deps, readHardwareId: async () => 'SERIAL9' as any } })
+        expect(a).toMatchObject({ diskId: 'SERIAL9', isHardwareId: true }); expect(written.diskId).toBe('SERIAL9')
+        const b = await ensureSystemMeta('sda2' as any, { path: '/tmp/x/META.yaml', allowCreate: true, deps: { ...deps, readHardwareId: async () => undefined } })
+        expect(b!.isHardwareId).toBe(false); expect(String(b!.diskId)).toMatch(/^[0-9a-z-]{10,}$/)
+    })
+})

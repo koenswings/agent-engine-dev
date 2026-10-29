@@ -138,6 +138,21 @@ export const newHardwareDiskId = async (
   return r.diskId
 }
 
+/** A META file's diskId is usable (an Engine image ships /META.yaml without one, idea#322). */
+export const hasDiskId = (meta: Partial<DiskMeta> | null | undefined): boolean =>
+  !!meta && meta.diskId !== undefined && meta.diskId !== null && String(meta.diskId).trim() !== '' && String(meta.diskId) !== 'undefined'
+
+/**
+ * The disk id when no hardware id was found: a fresh UUID for a clone of a hardware id
+ * or for a META file without a diskId (an Engine image's first boot, idea#322);
+ * otherwise the user-assigned id from the file.
+ */
+export const diskIdWithoutHardware = (meta: Partial<DiskMeta>, newId: () => string = uuid): { diskId: DiskID, generated: boolean, reason: string } => {
+  if (meta.isHardwareId) return { diskId: newId() as DiskID, generated: true, reason: 'The disk id in the META file is a hardware id from another disk (a clone on media without one): generating a new id' }
+  if (!hasDiskId(meta)) return { diskId: newId() as DiskID, generated: true, reason: 'The META file has no diskId (e.g. an Engine image first boot, idea#322): generating a new id' }
+  return { diskId: meta.diskId as DiskID, generated: false, reason: 'The disk id in the META file is a user-assigned id. Keeping it as is' }
+}
+
 export interface MetaIdDeps {
   /** Hardware identity of an App Disk partition (serial + partition facts) */
   readIdentity: (device: DeviceName) => Promise<HardwareIdentity | undefined>
@@ -206,6 +221,8 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName, depsIn: Partial<
       if (skipHardwareId()) {
         log(`skipHardwareId: using diskId from META file (${meta.diskId}), skipping hardware id lookup`)
         diskId = meta.diskId
+        // An image's /META.yaml carries no diskId (idea#322): generate one, never ENGINE_undefined
+        if (!hasDiskId(meta)) { diskId = uuid() as DiskID; meta.isHardwareId = false; log(`META file has no diskId: generated ${diskId}`) }
       } else {
         // App Disk partitions: serial + partition identity (idea#168 D4, DiskIdentity.ts).
         // The system disk keeps the bare root-drive serial (the Engine id depends on it).
@@ -220,15 +237,10 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName, depsIn: Partial<
         }
         if (!diskId) {
           log(`No hardware id found for device ${device}`)
-          if (meta.hasOwnProperty('isHardwareId') && meta.isHardwareId) {
-            log(`The disk id in the META file is a hardware id, so must come from another disk. So this disk is a clone and it is cloned onto media without a hardware id. Generating a new hardware id`)
-            diskId = uuid() as DiskID
-            // Resetting the isHardwareId flag
-            meta.isHardwareId = false
-          } else {
-            log(`The disk id in the META file is a user-assigned id. Keeping it as is`)
-            diskId = meta.diskId
-          }
+          const r = diskIdWithoutHardware(meta)
+          log(r.reason)
+          diskId = r.diskId
+          if (r.generated) meta.isHardwareId = false
         }
       }
 

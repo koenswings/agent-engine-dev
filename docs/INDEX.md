@@ -30,6 +30,12 @@ Reference for provisioning and utility scripts (`build-engine`, the `install.sh`
 parameters, and usage.
 → [docs/SCRIPTS.md](SCRIPTS.md)
 
+## ENGINE_IMAGE.md
+**Status:** Authoritative  ·  **Maintained by:** Axle
+The offline Engine build into a mounted root filesystem for the release image builder (idea#322 Option A):
+`script/build-engine-offline`, steps, sanitise/verify, lock, first boot, exit codes.
+→ [docs/ENGINE_IMAGE.md](ENGINE_IMAGE.md)
+
 ## PI_FLEET.md
 **Status:** Authoritative  ·  **Maintained by:** Axle
 IDEA Pi test fleet: node inventory (idea01–idea04), hardware specs, provisioning

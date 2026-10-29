@@ -264,7 +264,9 @@ export const createOrUpdateEngine = async (storeHandle: DocHandle<Store>, engine
   }
 }
 
-export const localEngineId = await getLocalEngineId()
+// IDEA_IMAGE_BUILD=1 (build-engine --root/--rootfs, idea#322): this module is loaded on the image BUILD HOST
+// for its installers only; looking up the Engine id there would create /META.yaml on that host.
+export const localEngineId: EngineID = process.env.IDEA_IMAGE_BUILD === '1' ? undefined as unknown as EngineID : await getLocalEngineId()
 
 /**
  * Remove phantom engine entries from the shared CRDT store.

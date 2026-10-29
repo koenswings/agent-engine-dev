@@ -1,0 +1,38 @@
+#!/bin/bash
+# idea-engine-firstboot: first boot of an Engine image built by build-engine --rootfs (idea#322).
+# Run once by idea-engine-firstboot.service (root), after docker.service and pm2-pi.service.
+#  1. docker load every tarball in /var/lib/idea/preload/docker/images.lock, check its sha256
+#     before and its image id after loading; tag it with the locked ref's name[:tag].
+#  2. Create the internal docker networks frontend and backend (as buildDockerInfrastructure).
+#  3. As pi (never root): install pm2-logrotate from the preloaded tarball, start the Engine
+#     with pm2.config.cjs and pm2 save, so pm2-pi.service resurrects it on every later boot.
+#  4. Write /var/lib/idea/firstboot-done. A failure leaves it absent, so the next boot retries.
+# The Engine makes its own /META.yaml (diskId from the root drive serial, else a UUID) at its
+# first start (Meta.ts ensureSystemMeta); this script never writes any identity.
+set -euo pipefail
+PRE=/var/lib/idea/preload
+LOCK=/etc/idea/engine.lock
+ENGINE=${IDEA_ENGINE_DIR:-/home/pi/idea/agents/agent-engine-dev}
+DONE=/var/lib/idea/firstboot-done
+echo "idea-engine-firstboot: start $(date -u +%FT%TZ)"
+if [ -f "$PRE/docker/images.lock" ]; then
+  while IFS=$'\t' read -r tar sha id ref; do
+    [ -n "$tar" ] || continue
+    echo "$sha  $PRE/docker/$tar" | sha256sum -c --quiet - || { echo "preload $ref: sha256 mismatch" >&2; exit 1; }
+    docker load -i "$PRE/docker/$tar" >/dev/null
+    got=$(docker image inspect --format '{{.Id}}' "$id")
+    [ "$got" = "$id" ] || { echo "preload $ref: loaded id $got, expected $id" >&2; exit 1; }
+    docker tag "$id" "${ref%@*}"
+    echo "preload $ref loaded ($id)"
+  done < "$PRE/docker/images.lock"
+fi
+for n in frontend backend; do docker network inspect "$n" >/dev/null 2>&1 || docker network create --internal "$n" >/dev/null; done
+env_name=$(sed -n 's/.*"pm2Env": *"\([a-z]*\)".*/\1/p' "$LOCK" | head -1)
+logrotate=$(ls "$PRE"/npm/pm2-logrotate-*.tgz 2>/dev/null | head -1 || true)
+runuser -u pi -- env -u TAILSCALE_AUTHKEY HOME=/home/pi PM2_HOME=/home/pi/.pm2 bash -c "
+  set -e; cd '$ENGINE'
+  if [ -n '$logrotate' ]; then pm2 install '$logrotate' || echo 'pm2-logrotate install failed (not fatal)'; fi
+  pm2 describe engine >/dev/null 2>&1 || pm2 start pm2.config.cjs --env '${env_name:-production}'
+  pm2 save"
+install -d -m 0755 "$(dirname "$DONE")"; date -u +%FT%TZ > "$DONE"
+echo "idea-engine-firstboot: done"
