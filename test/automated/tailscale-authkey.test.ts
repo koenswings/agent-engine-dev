@@ -27,7 +27,7 @@ import { ssh } from '../../src/utils/ssh.js'
 import { installTailscale, storeTailscaleAuthKey, TAILSCALE_AUTHKEY_PATH } from '../../src/data/Engine.js'
 
 const ROOT = process.cwd()
-const newKey = () => `tskey-auth-ideatest${crypto.randomBytes(12).toString('hex')}`
+const newKey = () => `${'tskey-' + 'auth-'}ideatest${crypto.randomBytes(12).toString('hex')}`
 
 interface Recorded { command: string, stdin: string }
 

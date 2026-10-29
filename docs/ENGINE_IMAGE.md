@@ -82,3 +82,16 @@ UUID (`diskIdWithoutHardware`), never `ENGINE_undefined`.
 - `build-engine --write-lock --lock <file> [--image ...] [--cache <dir>]`: write the lock for a clean checkout.
 
 Tests: `test/automated/engine-image.test.ts` (temp-dir rootfs, stubbed runner).
+
+## No dev files in the image (sparse clone)
+
+The Engine clone is a shallow **no-cone sparse checkout** (`IMAGE_SPARSE_PATTERNS`, recorded in the lock as
+`sparseCheckout`): every tracked file except `test/`, `proposals/`, `reports/`, `old-yjs-db/`, `.vscode/` and
+`script/idea02-walker/` (a dev tool that imports `test/`). The patterns are set before the checkout, so those
+files are never written; tsc then has no tests to compile, so there is no `dist/test/`. `git status` is clean.
+Updates (`git fetch` + `git checkout -B <b> origin/<b>` as in provision-fleet.sh, or `git pull`) keep the
+patterns. `git sparse-checkout disable` restores the full tree. sync-engine (dev rsync) copies test/ back and
+leaves the tree dirty; don't use it on an image-built Engine. Verify's `no-dev-files` check fails on any of those trees,
+on `dist/test`, on any `tskey-auth-` + alphanumeric string under the Engine tree (node_modules included, .git
+skipped), or on a sparse-checkout file that differs from the lock. Test fixtures build fake keys at runtime.
+`testContext` moved to src/data/TestContext.ts (the Engine imports it; test/testContext.ts re-exports it).

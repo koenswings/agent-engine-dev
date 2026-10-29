@@ -19,6 +19,7 @@ import { print } from '../utils/utils.js'
 import {
     EngineLock, FIRSTBOOT_SCRIPT, FIRSTBOOT_UNIT, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH, PM2_UNIT, PRELOAD_DOCKER_DIR, PRELOAD_NPM_DIR, SSH_REGEN_UNIT, NPM_OFFLINE_ENV,
     firstbootUnitText, pm2UnitText, preloadManifest, readDpkgStatus, rpiArchivePackageNames, sanitiseRootfs, serialiseLock, verifyRootfsChecks,
+    IMAGE_SPARSE_PATTERNS,
 } from './engineImage.js'
 
 export interface Out { stdout: string }
@@ -103,6 +104,15 @@ const q = shellQuote
  * The ordered build steps. Host steps touch only paths under <rootfs>; chroot steps
  * run inside it. Nothing here connects to a device or starts a service.
  */
+/** Shell command: a shallow, sparse (no-cone) clone of <repo> at <sha> into <dest>, detached, origin = GitHub.
+ *  Sparse patterns are set before the checkout, so excluded trees are never written; later fetch/checkout/pull keep them. */
+export const engineCloneCommand = (repo: string, dest: string, sha: string, patterns: string[]): string =>
+    `rm -rf ${q(dest)} && install -d ${q(path.posix.dirname(dest))} && git -c init.defaultBranch=main init -q ${q(dest)}` +
+    ` && git -C ${q(dest)} fetch -q --depth 1 ${q(`file://${repo}`)} ${q(sha)}` +
+    ` && git -C ${q(dest)} sparse-checkout set --no-cone ${patterns.map(q).join(' ')}` +
+    ` && git -C ${q(dest)} checkout -q --detach FETCH_HEAD` +
+    ` && git -C ${q(dest)} remote add origin https://github.com/koenswings/agent-engine-dev.git`
+
 export const rootfsSteps = (o: RootfsBuildOptions, r: Runner, inst: Installers): Step[] => {
     const R = (p: string) => path.posix.join(o.rootfs, p)
     const exec = chrootExec(r)
@@ -119,10 +129,7 @@ export const rootfsSteps = (o: RootfsBuildOptions, r: Runner, inst: Installers):
             await r.host(`test "$(git -C ${q(o.repo)} rev-parse ${q(L.engineCommit)}^{commit})" = ${q(L.engineCommit)}`)
             // Shallow clone at the pinned commit: current Engines run from a git checkout
             // (provision-fleet.sh, install.sh); .git holds only that one commit.
-            await r.host(`rm -rf ${q(R(E))} && install -d ${q(path.posix.dirname(R(E)))} && git -c init.defaultBranch=main init -q ${q(R(E))}` +
-                ` && git -C ${q(R(E))} fetch -q --depth 1 ${q(`file://${o.repo}`)} ${q(L.engineCommit)}` +
-                ` && git -C ${q(R(E))} checkout -q --detach FETCH_HEAD` +
-                ` && git -C ${q(R(E))} remote add origin https://github.com/koenswings/agent-engine-dev.git`)
+            await r.host(engineCloneCommand(o.repo, R(E), L.engineCommit, L.sparseCheckout ?? IMAGE_SPARSE_PATTERNS))
             // install-docker-pinned.sh and installRpiPins read <engine>/deb-cache/ first
             await r.host(`install -d ${q(R(`${E}/deb-cache/docker`))} && { cp -a ${q(o.cache)}/debs/docker/*.deb ${q(R(`${E}/deb-cache/docker/`))} 2>/dev/null || true; }`)
             await r.host(`{ cp -a ${q(o.cache)}/debs/*.deb ${q(R(`${E}/deb-cache/`))} 2>/dev/null || true; }`)
