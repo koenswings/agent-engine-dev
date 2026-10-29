@@ -84,6 +84,27 @@ export const dockChangedReason = (before: DockIdentity, now: DockIdentity | null
     return null
 }
 
+/** Thrown by assertSameDockAfterWait: the disk's dock changed while a long step ran (#170, #196). */
+export class DockChangedError extends Error {
+    constructor(public reason: string, what: string) { super(`${what}: stopped, ${reason}; nothing registered`) }
+}
+
+/**
+ * Shared re-check-after-wait (#170, #196, #239): call after any long await that ran against a
+ * disk (an in-flight wait, a copy, a build). Throws DockChangedError when the disk's current
+ * dock is no longer `before` (pulled, re-docked on another device or Engine, or re-docked again),
+ * so the caller never writes the store or starts containers for a dock that is gone.
+ */
+export const assertSameDockAfterWait = (
+    store: { diskDB?: Record<string, any> } | undefined,
+    diskId: string,
+    before: DockIdentity,
+    what: string,
+): void => {
+    const reason = dockChangedReason(before, dockIdentityOf(store?.diskDB?.[diskId]))
+    if (reason) throw new DockChangedError(reason, what)
+}
+
 /**
  * Why a failed start on `diskId` is a pulled disk rather than a real start failure; null = real failure.
  * `deviceAtStart` is the device the start ran against; `deviceExists` checks the node (injected for tests).
