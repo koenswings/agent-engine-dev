@@ -329,7 +329,7 @@ volume_dir() {   # volume_dir <vol>: echo its checked local mountpoint
 volume_idle() {   # volume_idle <vol>: refuse while any running container (any project) mounts it
     local ids
     ids=$($DOCKER ps -q --filter "volume=$1" 2>/dev/null) || refuse "cannot list the containers that mount volume $1"
-    [[ -z "$ids" ]] || refuse "IN_USE: volume $1 is mounted by a running container ($(echo $ids)); stop it first"
+    [[ -z "$ids" ]] || refuse "IN_USE: volume $1 is mounted by a running container (${ids//$'\n'/ }); stop it first"
 }
 volume_exists() { $DOCKER volume inspect -f '{{.Name}}' -- "$1" >/dev/null 2>&1; }
 dir_kb() { $DU -sk -x -- "$1" | { read -r k _; echo "${k:-}"; }; }
@@ -1038,6 +1038,10 @@ case "$SUB" in
         containers_stopped "$3"
         echo "restore $2 $3 started $($DATE -u +%Y-%m-%dT%H:%M:%SZ)" >> "$SDIR/JOURNAL" || refuse "cannot write $SDIR/JOURNAL"
         journal "restore-snapshot: $SDIR -> $INST started"
+        # RESTORING marks an unfinished restore (e.g. a reboot mid-restore) for Ops and the
+        # Console; at "done" it is renamed to RESTORED (no rm). Atlas review on #268.
+        [[ ! -L "$SDIR/RESTORING" && ! -L "$SDIR/RESTORED" ]] || refuse "$SDIR/RESTORING is a symlink"
+        echo "restoring $2 $3 since $($DATE -u +%Y-%m-%dT%H:%M:%SZ)" > "$SDIR/RESTORING" || refuse "cannot write $SDIR/RESTORING"
         ASIDE=""
         if [[ -e "$INST" ]]; then ASIDE=$(quarantine_aside "$R_DIR" "$INST" "$3-before-restore") || exit 2; fi
         $MKDIR -m 0700 -- "$INST" || refuse "cannot create $INST"
@@ -1072,6 +1076,7 @@ case "$SUB" in
             done
         fi
         echo "restore $2 $3 done aside=${ASIDE:-none}" >> "$SDIR/JOURNAL"
+        $MV -T -- "$SDIR/RESTORING" "$SDIR/RESTORED" || refuse "cannot clear $SDIR/RESTORING"
         journal "restore-snapshot: $INST restored from $SDIR (previous folder: ${ASIDE:-none})"
         echo "${ASIDE:-none}"
         exit 0

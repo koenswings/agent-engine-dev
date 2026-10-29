@@ -20,7 +20,7 @@ import { CommandLogStore, LogEntry, getCommandLogHandle, liveCommandLogHandle, a
 import { getActiveTrace, flushTrace } from '../utils/CommandLogger.js'
 import { dockerAvailable } from '../utils/dockerAvailable.js'
 import { rebindKolibriMorangoInstanceId } from './InstanceCopy.js'
-import { hostIdentity, writeHostIdentityEnv, isNextcloudInstance, nextcloudTrustedDomainsBridge, hostNetworkInterfaces } from './HostIdentity.js'
+import { hostIdentity, writeHostIdentityEnv, nextcloudUrl, writeNextcloudUrlEnv, isNextcloudInstance, nextcloudTrustedDomainsBridge, hostNetworkInterfaces } from './HostIdentity.js'
 import { trackInFlight, startDiskGoneReason, dockIdentityOf } from './InstanceInFlight.js'
 
 // ── Step-progress helpers ─────────────────────────────────────────────────────
@@ -1419,6 +1419,10 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
   const identity = hostIdentity(store)
   await writeHostIdentityEnv(envPath, identity)
   log(`Host identity for instance ${instance.id}: IDEA_HOSTNAME=${identity.hostname} IDEA_HOST_IPS=${identity.ips.join(',')}`)
+  // Every app, every start: where this Pi's (or the fleet's) Nextcloud is (#169); '' when none.
+  const ncUrl = nextcloudUrl(store, localEngineId, instance.id)
+  await writeNextcloudUrlEnv(envPath, ncUrl)
+  log(`IDEA_NEXTCLOUD_URL for instance ${instance.id}: ${ncUrl || '(none)'}`)
 
   // hostname / ip for every app's compose (${hostname}, ${ip}): main's #217
   // writeEngineHostEnv, which replaced this PR's Nextcloud-only block.

@@ -439,6 +439,9 @@ describe('idea-app-data: updateApp snapshots (v5, idea#230)', () => {
         await fs.appendFile(path.join(snap(root, 'inst1'), 'volumes', 'inst1_db.tar'), 'x')
         refused(await sb.run(['restore-snapshot', 'sdb1', 'inst1'], env), /do not match their checksums/)
         expect(await fs.readdir(path.join(sb.volumesDir, 'inst1_db'))).toEqual(['_data'])
+        // an unfinished restore stays marked RESTORING (Atlas review on #268)
+        expect(await fs.readFile(path.join(snap(root, 'inst1'), 'RESTORING'), 'utf8')).toMatch(/^restoring sdb1 inst1 since /)
+        expect(await fs.pathExists(path.join(snap(root, 'inst1'), 'RESTORED'))).toBe(false)
     })
     it('NO_SPACE: refuses before writing anything when free space is below size + margin', async () => {
         const root = await sb.addDisk('sdb1')
@@ -492,6 +495,12 @@ describe('idea-app-data: updateApp snapshots (v5, idea#230)', () => {
         expect(await fs.readFile(path.join(inst, 'db.sqlite3'), 'utf8')).toBe('v1')
         expect(await fs.pathExists(path.join(snap(root, 'inst1'), 'COMPLETE'))).toBe(true)
         expect(await fs.readFile(path.join(snap(root, 'inst1'), 'JOURNAL'), 'utf8')).toMatch(/restore sdb1 inst1 done aside=/)
+        // RESTORING is written at the start and renamed to RESTORED at "done" (no rm)
+        expect(await fs.pathExists(path.join(snap(root, 'inst1'), 'RESTORING'))).toBe(false)
+        expect(await fs.readFile(path.join(snap(root, 'inst1'), 'RESTORED'), 'utf8')).toMatch(/^restoring sdb1 inst1 since /)
+        const body = await fs.readFile(path.join(process.cwd(), 'script/build_image_assets/idea-app-data'), 'utf8')
+        const restore = body.slice(body.indexOf('    restore-snapshot)'), body.indexOf('    estimate)'))
+        expect(restore.indexOf('> "$SDIR/RESTORING"')).toBeLessThan(restore.indexOf('quarantine_aside'))
     })
     it('estimate is read-only: folder + volume KB and free KB, even while the app runs; nothing written, no lock taken', async () => {
         const root = await sb.addDisk('sdb1')
@@ -515,6 +524,10 @@ describe('idea-app-data: updateApp snapshots (v5, idea#230)', () => {
         const env = { FAKE_DOCKER_VOLUMES: 'inst1_db' }
         refused(await sb.run(['snapshot', 'sdb1', 'inst1'], { ...env, FAKE_DOCKER_VOLUME_PS: 'other1' }), /IN_USE: volume inst1_db is mounted by a running container \(other1\)/)
         expect(await fs.pathExists(path.join(root, '.pre-update'))).toBe(false)
+        // several container ids are listed on one line, space-separated (quoted expansion)
+        refused(await sb.run(['snapshot', 'sdb1', 'inst1'], { ...env, FAKE_DOCKER_VOLUME_PS: 'other1\nother2' }), /IN_USE: volume inst1_db is mounted by a running container \(other1 other2\); stop it first/)
+        const src = await fs.readFile(path.join(process.cwd(), 'script/build_image_assets/idea-app-data'), 'utf8')
+        expect(src).not.toMatch(/\$\(echo \$ids\)/)
         expect((await sb.run(['snapshot', 'sdb1', 'inst1'], env)).exitCode).toBe(0)
         refused(await sb.run(['restore-snapshot', 'sdb1', 'inst1'], { ...env, FAKE_DOCKER_VOLUME_PS: 'other1' }), /IN_USE: volume inst1_db/)
         expect(await fs.readFile(path.join(vd, 'row'), 'utf8')).toBe('r1')
