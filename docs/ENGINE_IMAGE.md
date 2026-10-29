@@ -29,18 +29,26 @@ No SSH, nothing started, no device identity. Inside `chroot <MNT>`:
    (`/root/.idea-build/shims`: `sudo` without secure_path, `udevadm`/`systemd-tmpfiles`/`reboot` no-ops,
    `hostnamectl` refused, `timedatectl set-timezone` as a symlink, `pm2` and `docker` refuse anything but `--version`),
    temporary SSH host keys so `sshd -t` can check the peer drop-in. `systemctl` in a chroot only enables.
-2. The Engine at the locked commit: `git clone` of `<engine-src>` into `/home/pi/idea/agents/agent-engine-dev`,
-   detached at the commit, origin set to the GitHub URL.
+2. The Engine at the locked commit, as current Engines have it (a git checkout, like provision-fleet.sh and install.sh):
+   a SHALLOW clone (`git init` + `git fetch --depth 1 file://<engine-src> <commit>`) into
+   `/home/pi/idea/agents/agent-engine-dev`, detached at the commit, origin set to the GitHub URL. `.git` holds that
+   one commit only; leave `.git` out of any file-manifest comparison (verify checks `.git/HEAD` = the lock commit).
 3. The existing installers from `src/data/Engine.ts`, unchanged: apt snapshot + Raspberry Pi pins, avahi, locale,
-   crontabs, udev + root helpers + sudoers + peer access, packages, apps folders.
+   crontabs, udev + root helpers + sudoers + peer access, packages, apps folders. A rebuild with `--lock` whose lock
+   has `rpiPackages` installs exactly those versions from archive.raspberrypi.com (it has no snapshots).
 4. Docker from the pinned debs, enabled, not started; pi in the docker group; `daemon.json`.
-5. Tailscale binaries + unit from the pinned tarball, NOT enabled, no key, no state
+5. Tailscale from the pinned tarball (`tailscale` in /usr/bin, `tailscaled` in /usr/sbin, as the Debian package) + unit, NOT enabled, no key, no state
    (idea-engine-identity enables it on first boot when the card carries a key, engine#291).
 6. Node, pnpm, pm2 from the cache (pinned, checked); `pnpm install --frozen-lockfile --offline` + `pnpm build` as pi.
 7. Docker images (pinned by digest) copied as docker-save tarballs to `/var/lib/idea/preload/docker/` with `images.lock`.
 8. Units: `pm2-pi.service` (User=pi, `pm2 resurrect`; written, not `pm2 startup`), `idea-engine-firstboot.service`,
    and Raspberry Pi OS's `regenerate_ssh_host_keys.service`, all enabled with docker, avahi-daemon and ssh.
-9. Sanitise: no /META.yaml, no SSH host keys, empty machine-id, generic hostname `raspberrypi`, no Tailscale state or
+9. Package record: after the build every installed package and its exact version (dpkg status) goes into the lock
+   (`packages`), and the ones from archive.raspberrypi.com into `rpiPackages`; verify checks the Raspberry Pi pins
+   (`apt-rpi-pins.tsv`), the Docker debs, `rpiPackages` and `packages` against dpkg status.
+   Not installed: gh (dev only) and Chromium (only `script/md-to-pdf.ts`, doc PDFs; no kit Engine use).
+   No Docker images are preloaded unless `--image` is given. pm2 runs `production` unless `--pm2-env development`.
+10. Sanitise: no /META.yaml, no SSH host keys, empty machine-id, generic hostname `raspberrypi`, no Tailscale state or
    key, no pm2 dump, no Engine store state, store-identity/ exactly the git-tracked files (store-template.json is
    never written), build guards removed.
 10. `/etc/idea/engine.lock`, `/etc/idea/engine-version`, then verify (`verifyRootfs`): any identity, a store-identity
