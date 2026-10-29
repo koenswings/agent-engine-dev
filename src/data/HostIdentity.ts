@@ -102,6 +102,45 @@ export const setEnvLines = async (envPath: string, vars: Record<string, string>)
     await fs.writeFile(envPath, lines.join('\n') + '\n')
 }
 
+/**
+ * IDEA_NEXTCLOUD_URL (agent-engine-dev#169): base URL of the Nextcloud instance an app on this
+ * Pi should use, '' when there is none. Decided from the store only:
+ *   1. a Nextcloud instance on a disk docked to this Engine that is Running or Starting
+ *      (Starting: at boot it may come up after the app that asks), http://<this host>.local:<port>
+ *   2. otherwise a Running one on another Engine of this fleet, http://<its host>.local:<port>
+ * Never the asking instance itself. No trailing slash.
+ */
+export const nextcloudUrl = (store: Store, localEngineId: string, selfId?: string): string => {
+    const isNc = (i: any) => /^nextcloud(-|$)/i.test(String(i?.instanceOf ?? '')) || String(i?.name ?? '').toLowerCase() === 'nextcloud'
+    const pick = (engineId: string, ok: (status: string) => boolean): string => {
+        const engine: any = (store.engineDB as any)?.[engineId]
+        const host = String(engine?.hostname ?? '').replace(/\.local$/, '')
+        if (!host) return ''
+        const disks = new Set(Object.values(store.diskDB ?? {}).filter((d: any) => d?.dockedTo === engineId).map((d: any) => String(d.id)))
+        const nc = Object.values(store.instanceDB ?? {})
+            .filter((i: any) => i && i.id !== selfId && isNc(i) && disks.has(String(i.storedOn)) && ok(String(i.status)) && Number(i.port) > 0)
+            .sort((a: any, b: any) => String(a.id).localeCompare(String(b.id)))[0] as any
+        return nc ? `http://${host}.local:${Number(nc.port)}` : ''
+    }
+    const local = pick(localEngineId, s => s === 'Running' || s === 'Starting')
+    if (local) return local
+    for (const id of Object.keys(store.engineDB ?? {}).sort()) {
+        if (id === localEngineId) continue
+        const url = pick(id, s => s === 'Running')
+        if (url) return url
+    }
+    return ''
+}
+
+/** Write IDEA_NEXTCLOUD_URL into an instance's .env (every app, every start; #169). */
+export const writeNextcloudUrlEnv = async (envPath: string, url: string): Promise<void> => {
+    try {
+        await setEnvLines(envPath, { IDEA_NEXTCLOUD_URL: url })
+    } catch (e: any) {
+        log(`Could not write IDEA_NEXTCLOUD_URL to ${envPath}: ${e?.message ?? e}`)
+    }
+}
+
 /** Write IDEA_HOSTNAME / IDEA_HOST_IPS into an instance's .env (every app, every start). */
 export const writeHostIdentityEnv = async (envPath: string, id: HostIdentity): Promise<void> => {
     try {
