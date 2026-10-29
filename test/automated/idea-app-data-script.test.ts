@@ -106,7 +106,7 @@ describe('idea-app-data: argument checks', () => {
 
     it('refuses the wrong argument count for every subcommand', async () => {
         const cases: [string, number][] = [
-            ['version', 0], ['size', 2], ['copy', 4], ['send', 6], ['delete', 2],
+            ['version', 0], ['size', 2], ['copy', 4], ['send', 6], ['delete', 2], ['quarantine', 2],
             ['borg-init', 2], ['borg-info', 2], ['borg-create', 4], ['borg-extract', 5],
             ['ensure-dirs', 1], ['erase-slot', 2], ['put-files', 3], ['peer-delete', 3], ['sync-peers', 0],
         ]
@@ -327,6 +327,34 @@ describe('idea-app-data: send and receive', () => {
         await fs.writeFile(path.join(dst, 'instances', 'busy', 'f'), 'x')
         refused(await sb.run(['receive', 'sdc1', 'busy', '--server', '-logDtpre', '.', '.']), /already exists and is not empty/)
         expect(await sb.calls('rrsync')).toEqual([])
+    })
+})
+
+describe('idea-app-data: quarantine (idea#347)', () => {
+    it('renames instances/<id> to .idea-quarantine/<id>-<UTC stamp> (0700), refuses symlinks and missing folders', async () => {
+        const root = await sb.addDisk('sdb1')
+        const inst = await sb.addInstance(root, 'inst1')
+        await fs.writeFile(path.join(inst, 'data.db'), 'keep')
+        const r = await sb.run(['quarantine', 'sdb1', 'inst1'])
+        expect(r.exitCode, r.stderr).toBe(0)
+        const dest = r.stdout.trim()
+        expect(dest).toMatch(new RegExp(`/\\.idea-quarantine/inst1-\\d{8}T\\d{6}Z$`))
+        expect(path.dirname(dest)).toBe(path.join(root, '.idea-quarantine'))
+        expect(await fs.pathExists(inst)).toBe(false)
+        expect(await fs.readFile(path.join(dest, 'data.db'), 'utf8')).toBe('keep')
+        expect((await fs.stat(path.join(root, '.idea-quarantine'))).mode & 0o777).toBe(0o700)
+        refused(await sb.run(['quarantine', 'sdb1', 'inst1']), /does not exist/)
+        const victim = path.join(sb.tmp, 'victim-q')
+        await fs.ensureDir(victim)
+        await fs.symlink(victim, path.join(root, 'instances', 'inst2'))
+        refused(await sb.run(['quarantine', 'sdb1', 'inst2']), /symlink/)
+        expect(await fs.pathExists(victim)).toBe(true)
+    })
+
+    it('has no code path that removes anything under .idea-quarantine', async () => {
+        const body = await fs.readFile(path.join(process.cwd(), 'script/build_image_assets/idea-app-data'), 'utf8')
+        const block = body.slice(body.indexOf('    quarantine)'), body.indexOf('    borg-init)'))
+        expect(block).not.toMatch(/\$RM|\$RMDIR|rm -/)
     })
 })
 

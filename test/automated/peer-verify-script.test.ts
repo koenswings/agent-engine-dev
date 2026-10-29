@@ -12,6 +12,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { $, fs, path, os } from 'zx'
 import { makeAppDataSandbox, AppDataSandbox } from '../harness/appDataSandbox.js'
+import { APP_DATA_HELPER_VERSION } from '../../src/utils/appDataHelper.js'
 
 const SCRIPT = path.resolve('script/peer-verify.sh')
 const IP = { idea01: '100.99.231.94', idea03: '100.126.117.80', idea04: '100.108.39.45' }
@@ -192,7 +193,16 @@ describe('peer-verify.sh check 4: the exact gate calls on the system root', () =
         expect(await sb.calls('rrsync')).toEqual([])
         const version = await sb.runGate([PEER], `sudo -n ${H} version`)
         expect(version.exitCode, version.stderr).toBe(0)
-        expect(version.stdout).toMatch(/idea-app-data 3/)
+        expect(version.stdout).toMatch(/idea-app-data 4/)
+    })
+})
+
+describe('peer-verify.sh: helper version', () => {
+    it('checks for the helper protocol version this Engine speaks (no stale version left)', async () => {
+        const text = await fs.readFile(SCRIPT, 'utf8')
+        const seen = [...text.matchAll(/idea-app-data (\d+)/g)].map(m => m[1])
+        expect(seen.length).toBeGreaterThan(0)
+        expect(new Set(seen)).toEqual(new Set([APP_DATA_HELPER_VERSION]))
     })
 })
 
