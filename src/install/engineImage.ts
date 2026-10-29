@@ -111,6 +111,10 @@ export interface EngineLock {
     files: LockedFile[]
     /** systemd units that must be enabled in the image */
     enabledUnits: string[]
+    /** Every installed package at its exact version (recorded after the build, from dpkg status) */
+    packages?: { pkg: string, version: string, arch: string }[]
+    /** The installed packages that come from archive.raspberrypi.com (it has no snapshots); a rebuild with --lock installs exactly these */
+    rpiPackages?: { pkg: string, version: string }[]
 }
 
 const HEX40 = /^[0-9a-f]{40}$/
@@ -148,6 +152,8 @@ export const serialiseLock = (l: EngineLock): string => JSON.stringify({
     aptPins: [...l.aptPins].sort((a, b) => a.pkg.localeCompare(b.pkg)),
     dockerImages: [...l.dockerImages].sort((a, b) => a.ref.localeCompare(b.ref)),
     files: [...l.files].sort((a, b) => a.path.localeCompare(b.path)),
+    ...(l.packages ? { packages: [...l.packages].sort((a, b) => a.pkg.localeCompare(b.pkg) || a.arch.localeCompare(b.arch)) } : {}),
+    ...(l.rpiPackages ? { rpiPackages: [...l.rpiPackages].sort((a, b) => a.pkg.localeCompare(b.pkg)) } : {}),
     enabledUnits: [...l.enabledUnits].sort(),
 }, null, 2) + '\n'
 
@@ -402,10 +408,46 @@ export const verifyRootfs = async (c: VerifyContext): Promise<string[]> => {
     }
     const manifest = R(path.join(PRELOAD_DOCKER_DIR, 'images.lock').slice(1))
     if (c.lock.dockerImages.length && !(await fs.pathExists(manifest))) p.push(`${PRELOAD_DOCKER_DIR}/images.lock missing`)
-    // 9. the lock itself is in the image
+    // 9. packages at their pinned versions: Raspberry Pi pins, Docker debs, the recorded RPi archive set and all packages
+    const status = new Map((await readDpkgStatus(c.root)).map(x => [x.pkg, x.version]))
+    if (status.size) {
+        const want = [...c.lock.aptPins, ...c.lock.dockerDebs, ...(c.lock.rpiPackages ?? []), ...(c.lock.packages ?? [])]
+        for (const w of want) {
+            const got = status.get(w.pkg)
+            if (got === undefined) p.push(`package ${w.pkg} not installed (lock: ${w.version})`)
+            else if (got !== w.version) p.push(`package ${w.pkg} ${got}, lock says ${w.version}`)
+        }
+    } else if (c.lock.aptPins.length || c.lock.dockerDebs.length) p.push('no dpkg status in the rootfs: pinned packages cannot be checked')
+    // 10. the lock itself is in the image
     if (!(await fs.pathExists(R(IMAGE_LOCK_PATH.slice(1))))) p.push(`${IMAGE_LOCK_PATH} missing`)
     if (!(await fs.pathExists(R(IMAGE_VERSION_PATH.slice(1))))) p.push(`${IMAGE_VERSION_PATH} missing`)
     return p
+}
+
+/** Installed packages from <root>/var/lib/dpkg/status (Status: install ok installed). Multi-arch names keep the bare name. */
+export const readDpkgStatus = async (root: string): Promise<{ pkg: string, version: string, arch: string }[]> => {
+    const f = path.join(root, 'var/lib/dpkg/status')
+    if (!(await fs.pathExists(f))) return []
+    const out: { pkg: string, version: string, arch: string }[] = []
+    for (const block of (await fs.readFile(f, 'utf8')).split(/\n\n+/)) {
+        const field = (k: string) => block.match(new RegExp(`^${k}: (.*)$`, 'm'))?.[1]?.trim()
+        if (field('Status') !== 'install ok installed') continue
+        const pkg = field('Package'), version = field('Version')
+        if (pkg && version) out.push({ pkg, version, arch: field('Architecture') ?? '' })
+    }
+    return out.sort((a, b) => a.pkg.localeCompare(b.pkg) || a.arch.localeCompare(b.arch))
+}
+
+/** Package names in the apt lists of archive.raspberrypi.com in <root> (the Raspberry Pi archive). */
+export const rpiArchivePackageNames = async (root: string): Promise<Set<string>> => {
+    const dir = path.join(root, 'var/lib/apt/lists')
+    const names = new Set<string>()
+    if (!(await fs.pathExists(dir))) return names
+    for (const n of await fs.readdir(dir)) {
+        if (!/^archive\.raspberrypi\.(com|org)_.*_Packages$/.test(n)) continue
+        for (const m of (await fs.readFile(path.join(dir, n), 'utf8')).matchAll(/^Package: (\S+)$/gm)) names.add(m[1])
+    }
+    return names
 }
 
 /** images.lock lines the first-boot loader checks: <tar>\t<tarSha256>\t<imageId>\t<ref> */

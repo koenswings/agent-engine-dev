@@ -10,7 +10,7 @@ import crypto from 'crypto'
 import {
     parseImageArgs, UsageError, validateLock, serialiseLock, writeLock, readLock, LOCK_SCHEMA, EngineLock,
     sanitiseRootfs, verifyRootfs, IDENTITY_PATHS, GENERIC_HOSTNAME, IMAGE_ENABLED_UNITS, PM2_UNIT, SSH_REGEN_UNIT,
-    pm2UnitText, preloadManifest, imageIdFromManifest, imageTarName, PRELOAD_DOCKER_DIR, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH,
+    pm2UnitText, preloadManifest, imageIdFromManifest, imageTarName, readDpkgStatus, PRELOAD_DOCKER_DIR, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH,
 } from '../../src/install/engineImage.js'
 import { rootfsSteps, runRootfsBuild, Runner, Installers, SHIMS, quoteTemplate } from '../../src/install/engineRootfs.js'
 import { diskIdWithoutHardware, hasDiskId, ensureSystemMeta } from '../../src/data/Meta.js'
@@ -151,6 +151,33 @@ describe('sanitise + verify', () => {
     })
 })
 
+const writeDpkg = async (root: string, pkgs: [string, string][]) => {
+    await fs.ensureDir(path.join(root, 'var/lib/dpkg'))
+    await fs.writeFile(path.join(root, 'var/lib/dpkg/status'), pkgs.map(([p, v]) => `Package: ${p}\nStatus: install ok installed\nArchitecture: arm64\nVersion: ${v}\n`).join('\n') +
+        '\nPackage: gone\nStatus: deinstall ok config-files\nArchitecture: arm64\nVersion: 1\n')
+}
+
+describe('package pins against dpkg status', () => {
+    let root: string
+    beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'rootfs-')); await goodRootfs(root) })
+    afterEach(async () => { await fs.remove(root) })
+    it('reads installed packages only', async () => {
+        await writeDpkg(root, [['raspi-config', '20261001']])
+        expect(await readDpkgStatus(root)).toEqual([{ pkg: 'raspi-config', version: '20261001', arch: 'arm64' }])
+    })
+    it('verify fails on a Raspberry Pi pin, Docker deb, RPi archive or recorded package at another version or missing', async () => {
+        await writeDpkg(root, [['raspi-config', '20261001'], ['docker-ce', '5:28.0.0-1'], ['libc6', '2.41-12']])
+        const ok = lock({ aptPins: [{ pkg: 'raspi-config', version: '20261001' }] as any, dockerDebs: [{ pkg: 'docker-ce', version: '5:28.0.0-1' }] as any,
+            rpiPackages: [{ pkg: 'raspi-config', version: '20261001' }], packages: [{ pkg: 'libc6', version: '2.41-12', arch: 'arm64' }] })
+        expect(await verifyRootfs({ root, enginePath: ENGINE, lock: ok, storeIdentity: storeShas })).toEqual([])
+        const bad = lock({ aptPins: [{ pkg: 'raspi-config', version: '20260901' }] as any, dockerDebs: [{ pkg: 'docker-ce', version: '5:27.0.0-1' }] as any,
+            rpiPackages: [{ pkg: 'rpi-eeprom', version: '1' }], packages: [{ pkg: 'libc6', version: '2.41-11', arch: 'arm64' }] })
+        const p = (await verifyRootfs({ root, enginePath: ENGINE, lock: bad, storeIdentity: storeShas })).join('\n')
+        expect(p).toContain('raspi-config 20261001, lock says 20260901'); expect(p).toContain('docker-ce 5:28.0.0-1, lock says 5:27.0.0-1')
+        expect(p).toContain('rpi-eeprom not installed'); expect(p).toContain('libc6 2.41-12, lock says 2.41-11')
+    })
+})
+
 describe('rootfs build plan (stubbed runner and installers)', () => {
     let root: string
     beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'rootfs-')); await goodRootfs(root) })
@@ -172,7 +199,7 @@ describe('rootfs build plan (stubbed runner and installers)', () => {
     })
     it('guards come first, no SSH, nothing started, units enabled; sanitise last; verify passes', async () => {
         const { log, r, inst, calls } = record()
-        const problems = await runRootfsBuild(opts(), r, inst, serialiseLock(lock()))
+        const { problems } = await runRootfsBuild(opts(), r, inst, serialiseLock(lock()))
         expect(problems).toEqual([])
         const all = log.join('\n')
         expect(log[0]).toContain('/root/.idea-build')
@@ -185,11 +212,30 @@ describe('rootfs build plan (stubbed runner and installers)', () => {
         expect(cmds).not.toMatch(/systemctl (start|restart)|pm2 (start|startup|save|resurrect)|docker (load|run|network create)|udevadm trigger|tailscale up/)
         expect(all).toContain(`systemctl enable ${[...IMAGE_ENABLED_UNITS].sort().map(u => `'${u}'`).join(' ')}`)
         expect(all).toContain('--frozen-lockfile --offline')
-        expect(all).toContain(`checkout -q --detach '${COMMIT}'`)
+        expect(all).toContain(`fetch -q --depth 1 'file:///repo' '${COMMIT}'`)
+        expect(all).toContain('checkout -q --detach FETCH_HEAD')
+        expect(all).not.toContain('git clone')
+        expect(all).toMatch(/-C \/usr\/bin 'tailscale_1\.104\.2_arm64\/tailscale'/)
+        expect(all).toMatch(/-C \/usr\/sbin 'tailscale_1\.104\.2_arm64\/tailscaled'/)
         expect(all).not.toMatch(/install-tailscale|TAILSCALE_AUTHKEY|tskey/)
         expect(calls).toEqual(['pinAptSnapshot', 'updateSystem', 'installRpiPins', 'installAvahi', 'localiseSystem', 'installCrontabs', 'installUdev', 'installVarious', 'installVarious2', 'buildAppsInfrastructure', 'grantNetBindCapability'])
-        expect(await fs.readFile(path.join(root, IMAGE_LOCK_PATH.slice(1)), 'utf8')).toBe(serialiseLock(lock()))
+        expect(await fs.readFile(path.join(root, IMAGE_LOCK_PATH.slice(1)), 'utf8')).toBe(serialiseLock({ ...lock(), packages: [], rpiPackages: [] }))
         expect(await fs.readFile(path.join(root, IMAGE_VERSION_PATH.slice(1)), 'utf8')).toBe(`1.0 ${COMMIT}\n`)
+    })
+    it('records every package version and the Raspberry Pi archive set in the lock; a lock with rpiPackages installs exactly those', async () => {
+        await writeDpkg(root, [['raspi-config', '20261001'], ['libc6', '2.41-12']])
+        await fs.ensureDir(path.join(root, 'var/lib/apt/lists'))
+        await fs.writeFile(path.join(root, 'var/lib/apt/lists/archive.raspberrypi.com_debian_dists_trixie_main_binary-arm64_Packages'), 'Package: raspi-config\nVersion: 20261001\n\n')
+        const { r, inst } = record()
+        const res = await runRootfsBuild(opts(), r, inst, serialiseLock(lock()))
+        expect(res.problems).toEqual([])
+        const written = JSON.parse(await fs.readFile(path.join(root, IMAGE_LOCK_PATH.slice(1)), 'utf8'))
+        expect(written.packages).toEqual([{ pkg: 'libc6', version: '2.41-12', arch: 'arm64' }, { pkg: 'raspi-config', version: '20261001', arch: 'arm64' }])
+        expect(written.rpiPackages).toEqual([{ pkg: 'raspi-config', version: '20261001' }])
+        expect(res.lockText).toBe(await fs.readFile(path.join(root, IMAGE_LOCK_PATH.slice(1)), 'utf8'))
+        const again = record()
+        await runRootfsBuild({ ...opts(), lock: lock({ rpiPackages: [{ pkg: 'raspi-config', version: '20261001' }] }) }, again.r, again.inst, '')
+        expect(again.log.join('\n')).toContain(`apt-get install -y --allow-downgrades 'raspi-config=20261001'`)
     })
     it('the build stops at the first failing step', async () => {
         const { r, inst } = record()
