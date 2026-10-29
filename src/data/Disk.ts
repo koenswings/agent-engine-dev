@@ -1,4 +1,5 @@
 import { config } from "./Config.js";
+import { isUnfinishedFetch } from './UpdateFetch.js'
 import { $, YAML, chalk, fs, os } from 'zx';
 import path from 'path';
 import { deepPrint, log } from '../utils/utils.js';
@@ -653,6 +654,8 @@ export const processAppDisk = async (storeHandle: DocHandle<Store>, disk: Disk):
         log(`App ids found on disk ${disk.id}: ${appIds}`)
         for (let appId of appIds) {
             if (!(appId === "") && !(disk.device == null)) {
+                // #263: a cross-Engine Fetch still in progress (no .idea-fetched yet) is not an App
+                if (await isUnfinishedFetch(`${mountRoot}/apps/${appId}`)) { log(`Skipping unfinished Fetch apps/${appId} on ${disk.id}`); continue }
                 const app = await processApp(storeHandle, disk, appId as AppID)
                 if (app) {
                     actualApps.push(app)

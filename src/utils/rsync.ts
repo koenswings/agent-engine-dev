@@ -138,10 +138,11 @@ export const PEER_CIPHER = 'chacha20-poly1305@openssh.com'
 export const isCipherNegotiationFailure = (stderr: string): boolean =>
     /no matching cipher|Unable to negotiate[^\n]*cipher|Bad SSH2 cipher spec|Unknown cipher type/i.test(stderr)
 
-export const rsyncToPeerArgs = (src: string | string[], peer: PeerEngine, helperArgs: string[], pinCipher = true): string[] => [
+export const rsyncToPeerArgs = (src: string | string[], peer: PeerEngine, helperArgs: string[], pinCipher = true, extraArgs: string[] = []): string[] => [
     '-a',
     '--info=progress2',
     '--no-inc-recursive',
+    ...extraArgs,
     '-e', pinCipher ? `${peerRsyncShell(peer.engineId)} -c ${PEER_CIPHER}` : peerRsyncShell(peer.engineId),
     `--rsync-path=${remoteHelperRsyncPath(helperArgs)}`,
     '--', ...[src].flat(), `${peerTarget(peer.host)}:.`,
@@ -166,15 +167,16 @@ export const rsyncToPeer = async (
     helperArgs: string[],
     onProgress?: RsyncProgressCallback,
     opId?: string,
+    extraArgs: string[] = [],
 ): Promise<void> => {
     const fmt = (code: number | null, _signal: string | null, stderr: string) =>
         `rsync to Engine ${peer.engineId} (${peer.host}, ${helperArgs[0]}) exited with code ${code}: ${stderr.trim()}`
     try {
-        await peerRsyncRunner.run(rsyncToPeerArgs(src, peer, helperArgs, true), fmt, onProgress, opId)
+        await peerRsyncRunner.run(rsyncToPeerArgs(src, peer, helperArgs, true, extraArgs), fmt, onProgress, opId)
     } catch (e) {
         if (!isCipherNegotiationFailure(String((e as Error)?.message ?? e))) throw e
         log(`rsync to Engine ${peer.engineId}: peer does not offer ${PEER_CIPHER}; retrying once with the default ssh ciphers`)
-        await peerRsyncRunner.run(rsyncToPeerArgs(src, peer, helperArgs, false), fmt, onProgress, opId)
+        await peerRsyncRunner.run(rsyncToPeerArgs(src, peer, helperArgs, false, extraArgs), fmt, onProgress, opId)
     }
 }
 
