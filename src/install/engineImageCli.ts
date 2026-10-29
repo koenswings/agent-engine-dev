@@ -164,14 +164,16 @@ export const runImageMode = async (a: ImageArgs, repo: string): Promise<number> 
     // An installer that fails calls process.exit(1): leave a failed report behind first
     await writeReport(a.report, lock, lockText, ['build did not finish (see the log)'])
     let problems: string[]
+    let finalLock = lockText
     try {
-        problems = await runRootfsBuild(opts, runner, inst, lockText, await piUidOf(root))
+        const res = await runRootfsBuild(opts, runner, inst, lockText, await piUidOf(root))
+        problems = res.problems; finalLock = res.lockText
     } catch (e) {
         problems = [`build step failed: ${e instanceof Error ? e.message : e}`]
     }
     if (a.dryRun) log.forEach(l => console.log(l))
     problems.forEach(p => console.error(`verify: ${p}`))
-    await writeReport(a.report, lock, lockText, problems)
+    await writeReport(a.report, lock, finalLock, problems)
     console.log(problems.length ? `engine offline build FAILED (${problems.length})` : `engine offline build OK (${lock.engineCommit})`)
     return problems.length ? 1 : 0
 }

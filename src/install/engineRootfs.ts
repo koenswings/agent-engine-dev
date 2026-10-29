@@ -18,7 +18,7 @@ import { shellQuote } from '../utils/ssh.js'
 import { print } from '../utils/utils.js'
 import {
     EngineLock, FIRSTBOOT_SCRIPT, FIRSTBOOT_UNIT, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH, PM2_UNIT, PRELOAD_DOCKER_DIR, PRELOAD_NPM_DIR, SSH_REGEN_UNIT,
-    firstbootUnitText, pm2UnitText, preloadManifest, sanitiseRootfs, verifyRootfs,
+    firstbootUnitText, pm2UnitText, preloadManifest, readDpkgStatus, rpiArchivePackageNames, sanitiseRootfs, serialiseLock, verifyRootfs,
 } from './engineImage.js'
 
 export interface Out { stdout: string }
@@ -117,15 +117,20 @@ export const rootfsSteps = (o: RootfsBuildOptions, r: Runner, inst: Installers):
         } },
         { name: 'Engine source at the locked commit + offline caches', run: async () => {
             await r.host(`test "$(git -C ${q(o.repo)} rev-parse ${q(L.engineCommit)}^{commit})" = ${q(L.engineCommit)}`)
-            await r.host(`rm -rf ${q(R(E))} && install -d ${q(path.posix.dirname(R(E)))} && git clone -q --no-hardlinks ${q(o.repo)} ${q(R(E))}` +
-                ` && git -C ${q(R(E))} checkout -q --detach ${q(L.engineCommit)}` +
-                ` && git -C ${q(R(E))} remote set-url origin https://github.com/koenswings/agent-engine-dev.git`)
+            // Shallow clone at the pinned commit: current Engines run from a git checkout
+            // (provision-fleet.sh, install.sh); .git holds only that one commit.
+            await r.host(`rm -rf ${q(R(E))} && install -d ${q(path.posix.dirname(R(E)))} && git init -q ${q(R(E))}` +
+                ` && git -C ${q(R(E))} fetch -q --depth 1 ${q(`file://${o.repo}`)} ${q(L.engineCommit)}` +
+                ` && git -C ${q(R(E))} checkout -q --detach FETCH_HEAD` +
+                ` && git -C ${q(R(E))} remote add origin https://github.com/koenswings/agent-engine-dev.git`)
             // install-docker-pinned.sh and installRpiPins read <engine>/deb-cache/ first
             await r.host(`install -d ${q(R(`${E}/deb-cache/docker`))} && { cp -a ${q(o.cache)}/debs/docker/*.deb ${q(R(`${E}/deb-cache/docker/`))} 2>/dev/null || true; }`)
             await r.host(`{ cp -a ${q(o.cache)}/debs/*.deb ${q(R(`${E}/deb-cache/`))} 2>/dev/null || true; }`)
         } },
         { name: 'apt: Debian snapshot + Raspberry Pi pins', run: async () => {
             await inst.pinAptSnapshot(exec); await inst.updateSystem(exec); await inst.installRpiPins(exec, E)
+            // Rebuild from a lock (--lock): the Raspberry Pi archive packages at exactly the recorded versions
+            if (L.rpiPackages?.length) await exec`DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades ${L.rpiPackages.map(p => `${p.pkg}=${p.version}`)}`
         } },
         { name: 'system: avahi, locale, crontabs, udev + root helpers + sudoers + peer access, packages', run: async () => {
             await inst.installAvahi(exec, E)
@@ -147,7 +152,9 @@ export const rootfsSteps = (o: RootfsBuildOptions, r: Runner, inst: Installers):
             const f = `tailscale_${L.tailscaleVersion}_arm64.tgz`
             await r.host(`install -d ${q(R('/root/.idea-build/tailscale'))} && cp -a ${q(`${o.cache}/tailscale/${f}`)} ${q(R(`/root/.idea-build/tailscale/${f}`))}`)
             await exec`echo ${`${L.tailscaleSha256}  /root/.idea-build/tailscale/${f}`} | sha256sum -c -`
-            await exec`tar -xzf ${`/root/.idea-build/tailscale/${f}`} --strip-components=1 -C /usr/sbin ${`tailscale_${L.tailscaleVersion}_arm64/tailscale`} ${`tailscale_${L.tailscaleVersion}_arm64/tailscaled`}`
+            await exec`tar -xzf ${`/root/.idea-build/tailscale/${f}`} --strip-components=1 -C /usr/sbin ${`tailscale_${L.tailscaleVersion}_arm64/tailscaled`}`
+            // tailscale where the Debian package and idea-engine-identity expect it
+            await exec`tar -xzf ${`/root/.idea-build/tailscale/${f}`} --strip-components=1 -C /usr/bin ${`tailscale_${L.tailscaleVersion}_arm64/tailscale`}`
             await exec`install -o root -g root -m 0644 ${E}/script/build_image_assets/tailscaled.service /etc/systemd/system/tailscaled.service`
             await exec`install -o root -g root -m 0755 ${E}/script/build_image_assets/tailscale-debug-activate.sh /usr/local/bin/tailscale-debug-activate.sh`
         } },
@@ -193,13 +200,20 @@ export const rootfsSteps = (o: RootfsBuildOptions, r: Runner, inst: Installers):
 }
 
 /** Writes the lock to /etc/idea/engine.lock and the version to /etc/idea/engine-version, then verifies. */
-export const runRootfsBuild = async (o: RootfsBuildOptions, r: Runner, inst: Installers, lockText: string, piUid?: number): Promise<string[]> => {
+export const runRootfsBuild = async (o: RootfsBuildOptions, r: Runner, inst: Installers, lockText: string, piUid?: number): Promise<{ problems: string[], lockText: string }> => {
     for (const s of rootfsSteps(o, r, inst)) {
         print(`==> ${s.name}`)
         await s.run()
     }
+    // Exact versions of every installed package, and which come from archive.raspberrypi.com
+    const installed = await readDpkgStatus(o.rootfs)
+    const rpiNames = await rpiArchivePackageNames(o.rootfs)
+    const recorded = { ...o.lock, packages: installed, rpiPackages: o.lock.rpiPackages ?? installed.filter(p => rpiNames.has(p.pkg)).map(({ pkg, version }) => ({ pkg, version })) }
+    lockText = serialiseLock(recorded)
+    o.lock = recorded
     await fs.ensureDir(path.join(o.rootfs, 'etc/idea'))
     await fs.writeFile(path.join(o.rootfs, IMAGE_LOCK_PATH.slice(1)), lockText)
     await fs.writeFile(path.join(o.rootfs, IMAGE_VERSION_PATH.slice(1)), `${o.lock.engineVersion} ${o.lock.engineCommit}\n`)
-    return verifyRootfs({ root: o.rootfs, enginePath: o.enginePath, lock: o.lock, storeIdentity: o.storeIdentity, piUid })
+    const problems = await verifyRootfs({ root: o.rootfs, enginePath: o.enginePath, lock: o.lock, storeIdentity: o.storeIdentity, piUid })
+    return { problems, lockText }
 }
