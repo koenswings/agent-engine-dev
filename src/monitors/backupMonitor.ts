@@ -22,13 +22,14 @@ import { disksRoot, skipBorg } from '../data/Config.js'
 import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot, appDataRoot } from '../data/Disk.js'
 import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgProblem } from '../utils/appDataHelper.js'
 import { indexBackupDiskApps } from '../data/InstallApp.js'
+import { ensureAppFilesOnTarget } from '../data/RestoreAppFiles.js'
 import { localEngineId } from '../data/Engine.js'
 import { assertPreQuarantineHelper, quarantinePreRestore } from '../data/RestorePreQuarantine.js'
 import { createOperation, updateOperation } from '../data/Operations.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
 import { stopInstance, startInstance, BACKUP_STEPS } from '../data/Instance.js'
 import { BackupMode, DiskID, DiskName, InstanceID, Timestamp, OperationCause, Operation } from '../data/CommonTypes.js'
-import { Store, getInstance, getDisks, findDiskByName } from '../data/Store.js'
+import { Store, getInstance, getDisks, findDiskByName, getLocalEngine } from '../data/Store.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js'
 import { runWithTrace, flushTrace, getActiveTrace } from '../utils/CommandLogger.js'
@@ -542,6 +543,15 @@ export const restoreApp = async (
             await extractLatestArchive(backupDevice, instanceId, await appDataRoot(targetDisk))
         } else {
             log(`skipBorg: skipping borg extract for instance ${instanceId}`)
+        }
+
+        // #189: restored onto another disk → bring the app master and service tars along
+        if (instance) {
+            const now = storeHandle.doc()
+            const prev = instance.storedOn ? now.diskDB[instance.storedOn] : undefined
+            const local = Object.values(now.diskDB).filter(d => d.device != null && String(d.dockedTo) === String(getLocalEngine(now)?.id)) as Disk[]
+            const candidates = [...(prev ? [prev as Disk] : []), ...local.filter(d => String(d.id) !== String(prev?.id))]
+            await ensureAppFilesOnTarget(String(instance.instanceOf), (instance.serviceImages ?? []).map(String), targetDisk, candidates)
         }
 
         const { processInstance } = await import('../data/Disk.js')
