@@ -197,6 +197,14 @@ export const registerProcess = (opId: string, proc: ChildProcess): void => {
     log(`registerProcess: registered process for op ${opId} (pid ${proc.pid})`)
 }
 
+/** SIGTERM the process registered for `opId` (e.g. a thermal pause of a Fetch); false when none. */
+export const killRegisteredProcess = (opId: string): boolean => {
+    const proc = _activeProcesses.get(opId)
+    if (!proc) return false
+    proc.kill('SIGTERM')
+    return true
+}
+
 export const deregisterProcess = (opId: string): void => {
     _activeProcesses.delete(opId)
     log(`deregisterProcess: cleared process for op ${opId}`)
