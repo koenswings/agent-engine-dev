@@ -10,11 +10,12 @@ import { fs, path, YAML } from 'zx'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import { createOrUpdateDisk, processDisk } from '../../src/data/Disk.js'
-import { eraseDisk, parseHiddenPartitions, setEraseOpsForTests, setEraseAddDevice, ERASE_STAGING_ROOT, isEraseDeviceLocked } from '../../src/data/EraseDisk.js'
+import { eraseDisk, isEspPartType, parseHiddenPartitions, setEraseOpsForTests, setEraseAddDevice, ERASE_STAGING_ROOT, isEraseDeviceLocked } from '../../src/data/EraseDisk.js'
 import { setSystemDiskOpsForTests } from '../../src/data/SystemDisk.js'
 import { CommandLogStore, setCommandLogHandle, addTrace } from '../../src/data/CommandLogStore.js'
 import { DeviceName, DiskID, DiskName, EngineID, Timestamp } from '../../src/data/CommonTypes.js'
 import { DISKS_ROOT } from '../harness/diskSim.js'
+import { usbRoot } from '../../src/data/Config.js'
 
 const LOCAL = localEngineId as EngineID
 
@@ -25,6 +26,8 @@ describe('eraseDisk whole-disk checks and remount on failure (#188)', () => {
     let downCalls = 0
     let addCalls: string[] = []
     let siblings: { partition: string; mountpoint: string }[] = []
+    let siblingsFn: (() => { partition: string; mountpoint: string }[]) | null = null
+    let espFn: ((p: string) => boolean) | null = null
     let scriptError: Error | null = null
     let hidden: { partition: string; name: string | null }[] | Error = []
 
@@ -58,9 +61,10 @@ describe('eraseDisk whole-disk checks and remount on failure (#188)', () => {
         h = new Repo({ network: [], storage: undefined }).create<Store>({ engineDB: {}, diskDB: {}, appDB: {}, instanceDB: {}, userDB: {}, operationDB: {} } as any)
         await h.whenReady()
         await createOrUpdateEngine(h, LOCAL)
-        scriptCalls = 0; downCalls = 0; addCalls = []; siblings = []; scriptError = null; hidden = []
+        scriptCalls = 0; downCalls = 0; addCalls = []; siblings = []; siblingsFn = null; espFn = null; scriptError = null; hidden = []
         setEraseOpsForTests({
-            mountedPartitions: async () => siblings,
+            mountedPartitions: async () => (siblingsFn ? siblingsFn() : siblings),
+            isEspPartition: async (p) => { if (espFn) return espFn(p); return false },
             hiddenTablePartitions: async () => { if (hidden instanceof Error) throw hidden; return hidden },
             runScript: async () => { scriptCalls++; if (scriptError) throw scriptError; return { stdout: '' } },
             runSlotErase: async () => { throw new Error('no slots here') },
@@ -101,6 +105,76 @@ describe('eraseDisk whole-disk checks and remount on failure (#188)', () => {
         expect(JSON.stringify(h.doc()!.diskDB)).toBe(before)
         expect(h.doc()!.engineDB[LOCAL].eraseInProgress ?? null).toBeNull()
         expect(isEraseDeviceLocked('sdb')).toBe(false)
+    })
+
+    it('refuses a disk whose store record is the system disk even when its device name now points at another drive', async () => {
+        await dock('sdb2', 'f-disk', 'System Disk')
+        h.change(d => { (d.diskDB['f-disk' as DiskID] as any).diskTypes = ['system'] })
+        const before = JSON.stringify(h.doc()!.diskDB)
+        const tid = await summary('f-disk', 'System Disk')
+        await expect(eraseDisk(h, 'f-disk', tid, 'System Disk')).rejects.toThrow(/system disk and cannot be erased/)
+        expect(scriptCalls).toBe(0)
+        expect(addCalls).toEqual([])
+        expect(JSON.stringify(h.doc()!.diskDB)).toBe(before)
+    })
+
+    it('#235: a teacher-stick sibling under the USB root does not block; it is unmounted before the wipe', async () => {
+        await dock('sdc2', 'os-disk', 'Old OS Disk')
+        const stick = { partition: 'sdc1', mountpoint: path.join(usbRoot(), 'sdc1') }
+        let calls = 0
+        siblingsFn = () => (++calls === 1 ? [stick, { partition: 'sdc2', mountpoint: '/disks/sdc2' }] : [{ partition: 'sdc2', mountpoint: '/disks/sdc2' }])
+        const tid = await summary('os-disk', 'Old OS Disk')
+        scriptError = new Error('stop here')
+        await expect(eraseDisk(h, 'os-disk', tid, 'Old OS Disk')).rejects.toThrow(/stop here/)
+        expect(calls).toBe(2)
+        expect(scriptCalls).toBe(1)
+    })
+
+    it('#235: a stick that is still mounted after the stick unmount refuses, nothing wiped', async () => {
+        await dock('sdc2', 'os-disk', 'Old OS Disk')
+        const stick = { partition: 'sdc1', mountpoint: path.join(usbRoot(), 'sdc1') }
+        siblings = [stick]
+        const tid = await summary('os-disk', 'Old OS Disk')
+        await expect(eraseDisk(h, 'os-disk', tid, 'Old OS Disk'))
+            .rejects.toThrow(/shares its physical disk \(\/dev\/sdc\) with sdc1 mounted at .*sdc1, which could not be unmounted.*nothing was erased/)
+        expect(scriptCalls).toBe(0)
+        expect(h.doc()!.engineDB[LOCAL].eraseInProgress ?? null).toBeNull()
+        expect(isEraseDeviceLocked('sdc')).toBe(false)
+    })
+
+    it('#235: a mounted EFI System Partition (even as a stick) means an OS disk: refuse, nothing wiped', async () => {
+        await dock('sdc2', 'os-disk', 'Old OS Disk')
+        siblings = [{ partition: 'sdc1', mountpoint: path.join(usbRoot(), 'sdc1') }]
+        espFn = (p) => p === 'sdc1'
+        const tid = await summary('os-disk', 'Old OS Disk')
+        await expect(eraseDisk(h, 'os-disk', tid, 'Old OS Disk')).rejects.toThrow(/EFI System Partition \(sdc1 mounted at .*\)\. That makes it an OS disk, so nothing was erased/)
+        expect(scriptCalls).toBe(0)
+        expect(isEraseDeviceLocked('sdc')).toBe(false)
+    })
+
+    it('#235: a partition type that cannot be read refuses (fail closed)', async () => {
+        await dock('sdc2', 'os-disk', 'Old OS Disk')
+        siblings = [{ partition: 'sdc1', mountpoint: path.join(usbRoot(), 'sdc1') }]
+        espFn = () => { throw new Error('lsblk gone') }
+        const tid = await summary('os-disk', 'Old OS Disk')
+        await expect(eraseDisk(h, 'os-disk', tid, 'Old OS Disk')).rejects.toThrow(/Could not check the partition type of \/dev\/sdc1 \(lsblk gone\).*nothing was erased/)
+        expect(scriptCalls).toBe(0)
+    })
+
+    it('#235: isEspPartType recognises GPT and MBR ESP types only', () => {
+        expect(isEspPartType('C12A7328-F81F-11D2-BA4B-00A0C93EC93B\n')).toBe(true)
+        expect(isEspPartType('0xef')).toBe(true)
+        expect(isEspPartType('0x83')).toBe(false)
+        expect(isEspPartType('0fc63daf-8483-4772-8e79-3d69d8477de4')).toBe(false)
+        expect(isEspPartType('')).toBe(false)
+    })
+
+    it('#235: a sibling mounted anywhere else (not a stick) still refuses up front', async () => {
+        await dock('sdc2', 'os-disk', 'Old OS Disk')
+        siblings = [{ partition: 'sdc1', mountpoint: '/media/sdc1' }]
+        const tid = await summary('os-disk', 'Old OS Disk')
+        await expect(eraseDisk(h, 'os-disk', tid, 'Old OS Disk')).rejects.toThrow(/sdc1 mounted at \/media\/sdc1\. Erasing/)
+        expect(scriptCalls).toBe(0)
     })
 
     it('the target partition itself being mounted is not a sibling', async () => {
