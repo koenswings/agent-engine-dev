@@ -1,4 +1,5 @@
 import { splitAppId } from './AppIdParse.js'
+import { parseVersion, isMajorChange } from './Version.js'
 import { $, YAML, chalk } from 'zx';
 import { Version, URL, AppID, AppName, Hostname, DeviceName, DiskName, DiskID } from './CommonTypes.js';
 import { log } from '../utils/utils.js';
@@ -45,8 +46,7 @@ export const extractAppVersion = (appId: AppID): Version => parseAppId(appId).ve
  * integer-major style (1.x, 2.x). No 0.x or pre-release versions in use.
  */
 export const extractMajorVersion = (appId: AppID): number => {
-    const version = extractAppVersion(appId)   // e.g. "1.0"
-    return parseInt(version.split('.')[0], 10)
+    return parseVersion(extractAppVersion(appId))?.[0] ?? NaN   // e.g. "1.0" -> 1; NaN when unversioned (idea#76)
 }
 
 /**
@@ -61,7 +61,7 @@ export const extractMajorVersion = (appId: AppID): number => {
  */
 export const isMajorUpgrade = (oldAppId: AppID, newAppId: AppID): boolean => {
     if (oldAppId === newAppId) return false
-    return extractMajorVersion(oldAppId) !== extractMajorVersion(newAppId)
+    return isMajorChange(extractAppVersion(oldAppId), extractAppVersion(newAppId))
 }
 
 export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: AppID, disk: Disk) => {

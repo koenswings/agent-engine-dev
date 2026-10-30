@@ -9,6 +9,10 @@
  *   1. `<name>@<ref>`: explicit, unambiguous. The ref may contain '-' and '/'
  *      (`nextcloud@feat/nextcloud-demo`, `nextcloud@21d7f75`). Only used as
  *      installApp input; on disk this becomes `<name>-<versionDirName(ref)>`.
+ *   1b. Trailing date (YYYY-MM-DD / YYYY.MM.DD / YYYY_MM_DD, idea#76): the date is version, and so is
+ *      ONE letters-only segment right before it when at least one name segment stays:
+ *      kolibri-zimbabwe-2026-10-20 -> kolibri / zimbabwe-2026-10-20; kolibri-2026-10-20 -> kolibri / 2026-10-20.
+ *      (Trade-off: a hyphenated name directly before a date, e.g. a-b-2026-10-20, reads as a / b-2026-10-20.)
  *   2. Numeric version from the FIRST '-' followed by digits:
  *      nextcloud-1.0-31.0.1 -> nextcloud / 1.0-31.0.1
  *   3. Trailing commit SHA (7–40 hex) or `latest` after the last '-':
@@ -16,12 +20,16 @@
  *   4. Otherwise the last '-' (old behaviour; ambiguous for refs with '-', use rule 1).
  */
 const NUMERIC_RE = /^(.+?)-(\d+(?:\.\d+)*(?:[-.+][0-9A-Za-z.+-]*)?)$/
-const SHA_OR_LATEST_RE = /^(.+)-([0-9a-f]{7,40}|latest)$/
+const SHA_OR_LATEST_RE = /^(.+)-(g?[0-9a-f]{7,40}|latest)$/
+const DATE_LABEL_RE = /^(.+)-([A-Za-z]+-\d{4}([-._])\d{1,2}\3\d{1,2})$/
+const DATE_ONLY_RE = /^(.+)-(\d{4}([-._])\d{1,2}\3\d{1,2})$/
 
 export const splitAppId = (appId: string): { name: string, version: string } => {
     const id = String(appId)
     const at = id.indexOf('@')
     if (at > 0) return { name: id.slice(0, at), version: id.slice(at + 1) }
+    const d = DATE_LABEL_RE.exec(id) ?? DATE_ONLY_RE.exec(id)
+    if (d) return { name: d[1], version: d[2] }
     const m = NUMERIC_RE.exec(id) ?? SHA_OR_LATEST_RE.exec(id)
     if (m) return { name: m[1], version: m[2] }
     const dash = id.lastIndexOf('-')
