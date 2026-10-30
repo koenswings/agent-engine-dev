@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { fs, path } from 'zx'
 import os from 'os'
-import { ENGINE_IMAGE_PLATFORM, buildImageSteps, checkLoadedDigest, legacyServiceImageTarName, parseImageRef, saveName, serviceImageTarName } from '../../src/data/ImageRef.js'
+import { ENGINE_IMAGE_PLATFORM, buildImageSteps, saveFailedMessage, checkLoadedDigest, legacyServiceImageTarName, parseImageRef, saveName, serviceImageTarName } from '../../src/data/ImageRef.js'
 import { serviceImageTarPath, verifyServiceImageDigest } from '../../src/data/Instance.js'
 
 const INDEX = 'sha256:a5ae1caf3e31b5bb9f2df9c94d45c4cf6fdb8ce3cfe8730364bd6648cdbadc31'
@@ -41,13 +41,40 @@ describe('parseImageRef / saveName / tar names', () => {
 
 describe('buildImageSteps (persist path)', () => {
     it('tag-only: pull + save, exactly as before', () => {
-        expect(buildImageSteps(TAG)).toEqual([['docker', 'image', 'pull', TAG], ['docker', 'save', '--platform', 'linux/arm64', TAG]])
+        expect(buildImageSteps(TAG)).toEqual([['docker', 'image', 'pull', '--platform', 'linux/arm64', TAG], ['docker', 'save', TAG]])
     })
     it('pinned: pull by the full ref, tag as repo:tag, save by repo:tag (never save by digest)', () => {
         const s = buildImageSteps(PINNED)
-        expect(s).toEqual([['docker', 'image', 'pull', PINNED], ['docker', 'image', 'tag', PINNED, TAG], ['docker', 'save', '--platform', 'linux/arm64', TAG]])
+        expect(s).toEqual([['docker', 'image', 'pull', '--platform', 'linux/arm64', PINNED], ['docker', 'image', 'tag', PINNED, TAG], ['docker', 'save', TAG]])
         expect(s.some(x => x[1] === 'save' && x.join(' ').includes('@'))).toBe(false)
         expect(ENGINE_IMAGE_PLATFORM).toBe('linux/arm64')
+    })
+})
+
+describe('idea03 real inspect shapes (Docker 29.4.0, PR #296 comment 6520480056)', () => {
+    const K_INDEX = 'sha256:a5ae1caf3e31b5bb9f2df9c94d45c4cf6fdb8ce3cfe8730364bd6648cdbadc31'
+    const K_ARM64 = 'sha256:2b1cb1ed1dda1d626ac7dc0b4c23c04d575eeac6fc208d848a10282ba2f64079'
+    const K_TAG = 'koenswings/kolibri:1.1-0.19.5'
+    it('never saves with --platform; pulls with it', () => {
+        const s = buildImageSteps(`${K_TAG}@${K_INDEX}`)
+        expect(s.find(x => x[1] === 'save')).toEqual(['docker', 'save', K_TAG])
+        expect(s[0]).toEqual(['docker', 'image', 'pull', '--platform', ENGINE_IMAGE_PLATFORM, `${K_TAG}@${K_INDEX}`])
+    })
+    it('--platform-saved image (arm64-only RepoDigest, .Id arm64) fails the index pin', () => {
+        expect(checkLoadedDigest(`${K_TAG}@${K_INDEX}`, [`koenswings/kolibri@${K_ARM64}`], K_ARM64).ok).toBe(false)
+    })
+    it('plain-saved image (index RepoDigest, .Id index) passes the index pin', () => {
+        expect(checkLoadedDigest(`${K_TAG}@${K_INDEX}`, [`koenswings/kolibri@${K_INDEX}`], K_INDEX)).toEqual({ ok: true })
+    })
+    it('wrong arm64 pin fails in the plain-save shape', () => {
+        expect(checkLoadedDigest(`${K_TAG}@${K_ARM64}`, [`koenswings/kolibri@${K_INDEX}`], K_INDEX).ok).toBe(false)
+    })
+    it('save failure message names the image and Docker version, and rules out a --platform fallback', () => {
+        const m = saveFailedMessage(`${K_TAG}@${K_INDEX}`, '29.8.1', 'content digest sha256:x: not found')
+        expect(m).toContain(K_TAG)
+        expect(m).toContain('Docker 29.8.1')
+        expect(m).toMatch(/not found/)
+        expect(m).toMatch(/--platform save is not used as a fallback/)
     })
 })
 

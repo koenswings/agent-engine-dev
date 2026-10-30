@@ -1,5 +1,5 @@
 import { isCommitSha } from './AppIdParse.js'
-import { buildImageSteps, checkLoadedDigest, legacyServiceImageTarName, saveName, serviceImageTarName } from './ImageRef.js'
+import { buildImageSteps, checkLoadedDigest, legacyServiceImageTarName, saveFailedMessage, saveName, serviceImageTarName } from './ImageRef.js'
 import { $, YAML, chalk, fs, os, sleep } from "zx";
 
 $.verbose = false;
@@ -451,8 +451,17 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
         print(`Pulling service image ${serviceImage}`)
         await $`${pull}`
         for (const step of rest) {
-          if (step[1] === 'save') await $`${step} > ${serviceImageTar}`
-          else await $`${step}`
+          if (step[1] === 'save') {
+            // Plain save (never --platform, see ImageRef.ts). Write to a .partial file so a failed save
+            // never leaves a tar under the real name (which a later build would treat as done).
+            const partial = `${serviceImageTar}.partial`
+            const r = await $`${step} > ${partial}`.nothrow()
+            if (r.exitCode !== 0) {
+              const v = await $`docker version --format ${'{{.Server.Version}}'}`.nothrow()
+              throw new Error(saveFailedMessage(serviceImage, v.exitCode === 0 ? v.stdout.trim() : '', r.stderr || r.stdout))
+            }
+            await $`mv -f ${partial} ${serviceImageTar}`
+          } else await $`${step}`
         }
         await verifyServiceImageDigest(serviceImage)
       }

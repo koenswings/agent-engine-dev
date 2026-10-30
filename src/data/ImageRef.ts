@@ -96,9 +96,10 @@ export const checkLoadedDigest = (ref: string, repoDigests: string[] | null, ima
     })
     if (match) return { ok: true }
     // A single-platform image (no index) pinned by its manifest digest matches above via RepoDigests.
-    // .Id equal to the pinned digest: meant for the top-level digest on the containerd store. Still needs a
-    // check on a real Pi: after a --platform save the loaded .Id may be the arm64 manifest digest instead,
-    // and a repo:tag@<platform digest> start is known to fail, so RepoDigests stays the primary check (idea#322).
+    // .Id equal to the pinned digest: the top-level digest on the containerd store. Checked on idea03
+    // (Docker 29.4.0, PR #296 comment 6520480056): after a plain save the loaded .Id is the index digest;
+    // after a --platform save it is the arm64 manifest, and this check then rejects the index pin, which
+    // is correct because that tar does not start offline by tag@index. RepoDigests stays the primary check.
     // If RepoDigests name this repo under another digest, the pin is not the top-level digest: .Id
     // equal to a per-platform manifest digest inside an index never counts as a pass.
     const repoHasOtherDigest = repoDigests.some(d => { const i = d.lastIndexOf('@'); return i !== -1 && normRepo(d.slice(0, i)) === normRepo(p.repo) })
@@ -114,9 +115,13 @@ export const checkLoadedDigest = (ref: string, repoDigests: string[] | null, ima
 }
 
 /**
- * The Engine runs on ARM64 only. On Docker 29 with the containerd image store, a pull by index digest
- * with --platform keeps the full index but only the arm64 content, so a plain `docker save repo:tag` can
- * fail with "content not found" or write a partial index. Save only this platform (idea#322).
+ * The Engine runs on ARM64 only: images are PULLED for this platform only. The SAVE is a plain
+ * `docker save repo:tag`, never `--platform`. Real Pi check on idea03 (Docker 29.4.0, containerd
+ * store, PR #296 comment 6520480056): `save --platform linux/arm64` loads back as the arm64 manifest
+ * (RepoDigests and .Id = arm64 digest), so `repo:tag@<index>` no longer resolves offline. A plain save
+ * after a --platform pull by index digest kept the index (RepoDigests and .Id = index), and both the
+ * start and the verify worked. If the plain save fails (possible "content not found" on Docker 29.8.1,
+ * untested), the build fails: there is no fallback to a --platform save, which would not start offline.
  */
 export const ENGINE_IMAGE_PLATFORM = 'linux/arm64'
 
@@ -124,8 +129,14 @@ export const ENGINE_IMAGE_PLATFORM = 'linux/arm64'
 export const buildImageSteps = (ref: string): string[][] => {
     const p = parseImageRef(ref)
     const name = saveName(ref)
-    const steps: string[][] = [['docker', 'image', 'pull', p.ref]]
+    const steps: string[][] = [['docker', 'image', 'pull', '--platform', ENGINE_IMAGE_PLATFORM, p.ref]]
     if (p.digest) steps.push(['docker', 'image', 'tag', p.ref, name])
-    steps.push(['docker', 'save', '--platform', ENGINE_IMAGE_PLATFORM, name])
+    steps.push(['docker', 'save', name])
     return steps
 }
+
+/** Build-failure message when the plain `docker save repo:tag` of a service image fails (idea#322). */
+export const saveFailedMessage = (ref: string, dockerVersion: string, detail: string): string =>
+    `Service image ${ref}: \`docker save ${saveName(ref)}\` failed on Docker ${dockerVersion || 'unknown'}: ${detail.trim() || '(no output)'}. ` +
+    `The build stops: a --platform save is not used as a fallback because that tar loads as the platform manifest ` +
+    `and does not start offline by tag@index digest (idea#322, PR #296 comment 6520480056)`
