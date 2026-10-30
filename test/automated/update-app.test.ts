@@ -348,9 +348,9 @@ describe('idea#76 gaps', () => {
         h.change(d => { (d.diskDB['d1' as any] as any).dockedTo = null })   // undocked
         await refreshUpdateAvailable(h, ME, deps)
         expect(inst().updateAvailable).toBeNull()
-        h.change(d => { (d.instanceDB['i1' as any] as any).updateAvailable = { appId: 'kolibri-1.1', sourceEngineId: 'other' } })
+        h.change(d => { (d.diskDB['d1' as any] as any).dockedTo = 'other'; (d.instanceDB['i1' as any] as any).updateAvailable = { appId: 'kolibri-1.1', sourceEngineId: 'other' } })
         await refreshUpdateAvailable(h, ME, deps)
-        expect(inst().updateAvailable).toMatchObject({ sourceEngineId: 'other' })   // another Engine's hint is left alone
+        expect(inst().updateAvailable).toMatchObject({ sourceEngineId: 'other' })   // disk docked on another Engine: its hint is that Engine's (gap 1)
     })
     it('refreshUpdateAvailable skips a major the bundle does not accept per updatesFrom', async () => {
         const SUM = 'a'.repeat(64) + '  compose.yaml\n'
