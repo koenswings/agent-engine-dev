@@ -45,13 +45,14 @@
 #   idea-app-data snapshot         <root> <id>   (v5, idea#230: copy instances/<id> to .pre-update/<id>/data, COMPLETE marker last)
 #   idea-app-data restore-snapshot <root> <id>   (v5: current folder to .idea-quarantine, then copy the snapshot back)
 #   idea-app-data snapshots        <root>        (v5: "<id> <kb> complete|incomplete" per .pre-update snapshot)
+#   (v6, idea#406: device roots are partitions 1-9, RE_DEV ^sd[a-z][1-9]$; was [12])
 #   idea-app-data borg-init    <bdev> <id>
 #   idea-app-data borg-info    <bdev> <id>
 #   idea-app-data borg-create  <bdev> <id> <archive> <srcRoot>
 #   idea-app-data borg-extract <bdev> <id> <archive> <strip> <dstRoot>
 #
 # Tokens (none can start with '-' or hold '/' or '..'):
-#   root     sd[a-z][12]  → /disks/<dev>: findmnt must show source /dev/<dev>, type
+#   root     sd[a-z][1-9] → /disks/<dev>: findmnt must show source /dev/<dev>, type
 #                           ext4, not the root filesystem's drive, META.yaml at its root
 #            system       → /instances/<id> on the system disk
 #            <slot name>  → TEST-ONLY root bridge (see below), e.g. idea-test-1
@@ -113,7 +114,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=5
+readonly IDEA_APP_DATA_VERSION=6
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -184,7 +185,7 @@ PEER_MAX=256
 
 export HOME="$ROOT_HOME"
 
-RE_DEV='^sd[a-z][12]$'
+RE_DEV='^sd[a-z][1-9]$'
 RE_ID='^[a-z0-9][a-z0-9-]{0,63}$'
 RE_SLOT='^[a-z0-9][a-z0-9-]{0,63}$'
 RE_ARCHIVE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9-]{8,16}Z$'
@@ -343,7 +344,7 @@ check_id() { [[ "$1" =~ $RE_ID ]] || refuse "instance id '$1' does not match $RE
 
 check_root_shape() {
     [[ "$1" == system || "$1" =~ $RE_DEV || "$1" =~ $RE_SLOT ]] \
-        || refuse "root '$1' is not sd[a-z][12], system or a test-only slot name"
+        || refuse "root '$1' is not sd[a-z][1-9], system or a test-only slot name"
 }
 
 # realpath -e must give back exactly the path we built: it exists and no
@@ -448,7 +449,7 @@ resolve_root() {
     else
         b=$(bridge_lookup "$tok")
         [[ "$b" != AMBIGUOUS ]] || refuse "the test-only root bridge file $ROOTS_FILE lists '$tok' more than once"
-        [[ -n "$b" ]] || refuse "unknown root '$tok': not sd[a-z][12] or system, and not listed in a valid test-only root bridge file ($ROOTS_FILE)"
+        [[ -n "$b" ]] || refuse "unknown root '$tok': not sd[a-z][1-9] or system, and not listed in a valid test-only root bridge file ($ROOTS_FILE)"
         R_DIR="$b"
         BRIDGE_USED+="${BRIDGE_USED:+ }$tok=$b"
         echo "idea-app-data: test-only root bridge: $tok -> $b" >&2

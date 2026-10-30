@@ -123,7 +123,7 @@ describe('idea-app-data: argument checks', () => {
     it('refuses bad roots, ids, archives, strips and hosts (.., leading -, /, case, length)', async () => {
         await sb.addDisk('sdb1')
         for (const root of ['..', '-x', '/disks/sdb1', 'sdb1/../..', 'SDB1', 'a b', '', '-rf']) {
-            refused(await sb.run(['size', root, 'inst1']), /root '.*' is not sd\[a-z\]\[12\]|unknown root/)
+            refused(await sb.run(['size', root, 'inst1']), /root '.*' is not sd\[a-z\]\[1-9\]|unknown root/)
         }
         for (const id of ['..', '-rf', 'a/b', 'Inst', 'a..b', 'x'.repeat(65), '', '.hidden']) {
             refused(await sb.run(['size', 'sdb1', id]), /instance id '.*' does not match/)
@@ -355,6 +355,28 @@ describe('idea-app-data: quarantine (idea#347)', () => {
         const body = await fs.readFile(path.join(process.cwd(), 'script/build_image_assets/idea-app-data'), 'utf8')
         const block = body.slice(body.indexOf('    quarantine)'), body.indexOf('    borg-init)'))
         expect(block).not.toMatch(/\$RM|\$RMDIR|rm -/)
+    })
+})
+
+describe('idea-app-data v6: device roots are partitions 1-9 (idea#406)', () => {
+    it('reports version 6', async () => {
+        const r = await sb.run(['version'])
+        expect(r.stdout.trim()).toBe('idea-app-data 6')
+    })
+    it('size and snapshot work on partitions 3 and 4 (the #76 fixture layout)', async () => {
+        for (const dev of ['sdb3', 'sdb4', 'sdc9']) {
+            const root = await sb.addDisk(dev)
+            await sb.addInstance(root, 'inst1')
+            const sz = await sb.run(['size', dev, 'inst1'])
+            expect(sz.exitCode, `${dev}: ${sz.stderr}`).toBe(0)
+            const sn = await sb.run(['snapshot', dev, 'inst1'])
+            expect(sn.exitCode, `${dev}: ${sn.stderr}`).toBe(0)
+        }
+    })
+    it('refuses partition 0, 10+ and sdaa-style roots (no bridge entry)', async () => {
+        for (const root of ['sda0', 'sdb0', 'sda10', 'sdb12', 'sdaa', 'sdaa1']) {
+            refused(await sb.run(['size', root, 'inst1']), /unknown root|is not sd\[a-z\]\[1-9\]/)
+        }
     })
 })
 
