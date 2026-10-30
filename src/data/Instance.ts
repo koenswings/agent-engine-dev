@@ -1057,6 +1057,13 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
           if (port > 0) inst.port = port as PortNumber
           inst.lastStarted = Date.now() as Timestamp
         })
+        // idea#139 step 9: running containers may predate a Files role on this
+        // disk (Add Files) or carry a stale override; recreate once if needed.
+        const { resolveInstanceApp } = await import('./InstanceApp.js')
+        if ((await resolveInstanceApp(storeHandle.doc(), instance))?.filesMount) {
+          const { reconcileFilesMounts } = await import('./FilesMount.js')
+          await reconcileFilesMounts(storeHandle, instance.id)
+        }
         return
       } else {
         log(`Instance '${instance.id}' containers are not running — proceeding with full start`)
