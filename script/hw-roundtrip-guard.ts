@@ -4,10 +4,13 @@
  * The hardware test ejects and unplugs (sysfs unbind) a real USB disk, so it
  * only ever touches the recorded test disk, matched by its IDs and never by a
  * device name such as sdb:
- *   - every expected filesystem UUID is found, all on one disk, and that disk
- *     has no other partitions;
- *   - the disk serial (lsblk SERIAL = udev ID_SERIAL_SHORT) and the USB serial
- *     (sysfs `serial` of its USB device = ID_USB_SERIAL_SHORT) match;
+ *   - the disk serial (lsblk SERIAL = udev ID_SERIAL_SHORT) matches exactly one
+ *     disk. This is the only required ID: the recorded config
+ *     (hw-roundtrip-disks.json) pins diskSerial only, because USB enclosures get
+ *     swapped and dd rewrites (idea#139) change the filesystem UUIDs;
+ *   - optional, only when given with --stick-usb-serial / --uuid: the USB serial
+ *     (sysfs `serial` of its USB device = ID_USB_SERIAL_SHORT) matches, and every
+ *     expected filesystem UUID is found on that disk, which has no other partitions;
  *   - never a refused serial (e.g. idea03's root SSD), never the drive backing
  *     / or /boot/firmware, never a USB device that is or sits above theirs.
  *
@@ -19,9 +22,9 @@ import { $, YAML, fs } from 'zx'
 import path from 'path'
 
 export interface StickExpectation {
-    usbSerial: string          // ID_USB_SERIAL_SHORT of the USB bridge
-    diskSerial: string         // ID_SERIAL_SHORT of the disk (lsblk SERIAL)
-    uuids: string[]            // filesystem UUIDs of all its partitions
+    usbSerial: string          // optional ('' = not checked): ID_USB_SERIAL_SHORT of the USB bridge
+    diskSerial: string         // required: ID_SERIAL_SHORT of the disk (lsblk SERIAL)
+    uuids: string[]            // optional ([] = not checked): filesystem UUIDs of all its partitions
     refuseSerials: string[]    // disk serials that are never a target (root SSD)
 }
 
@@ -44,26 +47,32 @@ export type StickResolution =
 const refuse = (reason: string): StickResolution => ({ ok: false, reason })
 
 export const resolveStick = (exp: StickExpectation, facts: BlockFacts): StickResolution => {
-    if (!exp.usbSerial) return refuse('no expected USB serial (--stick-usb-serial or the stick config)')
     if (!exp.diskSerial) return refuse('no expected disk serial (--disk-serial or the stick config)')
-    if (exp.uuids.length === 0) return refuse('no expected filesystem UUIDs (--uuid or the stick config)')
     if (exp.refuseSerials.includes(exp.diskSerial)) return refuse(`the expected disk serial ${exp.diskSerial} is a refused serial (root SSD)`)
 
     // Refused serials and the system drive: never a target, whatever else matches
     for (const d of facts.systemDisks) {
         const f = facts.disks[d]
         if (f?.serial && f.serial === exp.diskSerial) return refuse(`disk serial ${exp.diskSerial} is the system drive ${d}`)
-        if (f?.usbSerial && f.usbSerial === exp.usbSerial) return refuse(`USB serial ${exp.usbSerial} is the system drive ${d}'s USB device`)
+        if (exp.usbSerial && f?.usbSerial && f.usbSerial === exp.usbSerial) return refuse(`USB serial ${exp.usbSerial} is the system drive ${d}'s USB device`)
     }
 
-    const found = exp.uuids.map(u => ({ uuid: u, parts: facts.partitions.filter(p => p.uuid === u) }))
-    const missing = found.filter(f => f.parts.length === 0).map(f => f.uuid)
-    if (missing.length) return refuse(`filesystem UUID(s) not found: ${missing.join(', ')}`)
-    const dup = found.filter(f => f.parts.length > 1)
-    if (dup.length) return refuse(`filesystem UUID(s) on more than one partition: ${dup.map(f => `${f.uuid} (${f.parts.map(p => p.name).join(', ')})`).join('; ')}`)
-    const disks = [...new Set(found.map(f => f.parts[0].disk))]
-    if (disks.length !== 1) return refuse(`the expected UUIDs are on different disks: ${disks.join(', ')}`)
-    const disk = disks[0]
+    let disk: string
+    if (exp.uuids.length) {
+        const found = exp.uuids.map(u => ({ uuid: u, parts: facts.partitions.filter(p => p.uuid === u) }))
+        const missing = found.filter(f => f.parts.length === 0).map(f => f.uuid)
+        if (missing.length) return refuse(`filesystem UUID(s) not found: ${missing.join(', ')}`)
+        const dup = found.filter(f => f.parts.length > 1)
+        if (dup.length) return refuse(`filesystem UUID(s) on more than one partition: ${dup.map(f => `${f.uuid} (${f.parts.map(p => p.name).join(', ')})`).join('; ')}`)
+        const disks = [...new Set(found.map(f => f.parts[0].disk))]
+        if (disks.length !== 1) return refuse(`the expected UUIDs are on different disks: ${disks.join(', ')}`)
+        disk = disks[0]
+    } else {
+        const bySerial = Object.keys(facts.disks).filter(k => facts.disks[k].serial === exp.diskSerial)
+        if (bySerial.length === 0) return refuse(`no disk with serial ${exp.diskSerial} found`)
+        if (bySerial.length > 1) return refuse(`disk serial ${exp.diskSerial} is on more than one disk: ${bySerial.join(', ')}`)
+        disk = bySerial[0]
+    }
     const d = facts.disks[disk]
     if (!d) return refuse(`no facts for disk ${disk}`)
 
@@ -72,15 +81,15 @@ export const resolveStick = (exp: StickExpectation, facts: BlockFacts): StickRes
     if (!d.serial) return refuse(`disk ${disk} reports no serial; expected ${exp.diskSerial}`)
     if (d.serial !== exp.diskSerial) return refuse(`disk ${disk} serial ${d.serial} is not the expected ${exp.diskSerial}`)
     if (!d.usbPath) return refuse(`disk ${disk} is not on USB`)
-    if (!d.usbSerial) return refuse(`USB device of ${disk} reports no serial; expected ${exp.usbSerial}`)
-    if (d.usbSerial !== exp.usbSerial) return refuse(`USB device of ${disk} has serial ${d.usbSerial}, not the expected ${exp.usbSerial}`)
+    if (exp.usbSerial && !d.usbSerial) return refuse(`USB device of ${disk} reports no serial; expected ${exp.usbSerial}`)
+    if (exp.usbSerial && d.usbSerial !== exp.usbSerial) return refuse(`USB device of ${disk} has serial ${d.usbSerial}, not the expected ${exp.usbSerial}`)
     for (const s of facts.systemDisks) {
         const u = facts.disks[s]?.usbPath
         if (u && (u === d.usbPath || u.startsWith(d.usbPath + '/'))) return refuse(`USB device ${d.usbPath} is (or is above) the system drive ${s}'s USB device`)
     }
 
     const partitions = facts.partitions.filter(p => p.disk === disk)
-    const extra = partitions.filter(p => !exp.uuids.includes(p.uuid))
+    const extra = exp.uuids.length ? partitions.filter(p => !exp.uuids.includes(p.uuid)) : []
     if (extra.length) return refuse(`disk ${disk} has partitions that are not expected: ${extra.map(p => `${p.name} (${p.uuid || 'no UUID'})`).join(', ')}`)
     return { ok: true, disk, usbPath: d.usbPath, usbId: path.basename(d.usbPath), partitions: partitions.map(p => p.name) }
 }
@@ -124,7 +133,9 @@ export const collectBlockFacts = async (): Promise<BlockFacts> => {
 
 /**
  * The recorded test disk of a host from script/hw-roundtrip-disks.json (keyed
- * by hostname), overridden by --stick-usb-serial, --disk-serial, --uuid
+ * by hostname). Only diskSerial and refuseSerials are read from it; anything
+ * under `informational` (USB bridge serial, current UUIDs) is never matched on.
+ * Overridden by --stick-usb-serial, --disk-serial, --uuid
  * (repeatable; replaces the list) and --refuse-serial (repeatable; added).
  */
 export const loadExpectation = (argv: string[], configFile: string, hostname: string): StickExpectation => {
@@ -136,9 +147,9 @@ export const loadExpectation = (argv: string[], configFile: string, hostname: st
         base = cfg[hostname] ?? {}
     }
     return {
-        usbSerial: one('stick-usb-serial') ?? base.usbSerial ?? '',
+        usbSerial: one('stick-usb-serial') ?? '',
         diskSerial: one('disk-serial') ?? base.diskSerial ?? '',
-        uuids: all('uuid').length ? all('uuid') : (base.uuids ?? []),
+        uuids: all('uuid'),
         refuseSerials: [...(base.refuseSerials ?? []), ...all('refuse-serial')],
     }
 }
