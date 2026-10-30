@@ -83,7 +83,7 @@ import os from 'os'
 import path from 'path'
 import { spawn, ChildProcess } from 'child_process'
 import { fileURLToPath } from 'url'
-import { collectBlockFacts, loadExpectation, resolveStick } from './hw-roundtrip-guard.js'
+import { collectBlockFacts, loadExpectation, planSystemRecordChecks, resolveStick, systemDiskSkipFromConfig } from './hw-roundtrip-guard.js'
 import { readHardwareId } from '../src/data/Meta.js'
 import { readPartitionFacts, resolveHardwareDiskId } from '../src/data/DiskIdentity.js'
 import { inflightPullChecks, inflightReplugChecks } from './hw-inflight-pull.js'
@@ -232,6 +232,12 @@ if (!localEngine) abort(`no engine with hostname ${os.hostname()} in store ${sto
 const ENGINE_ID = localEngine.id as string
 info(`store ${storeUrl}, engine ${ENGINE_ID}`)
 
+const readConfigText = (): string | null => {
+    try { return fs.readFileSync(process.env.IDEA_CONFIG_FILE || path.join(ENGINE_DIR, 'config.yaml'), 'utf8') } catch { return null }
+}
+const SYSTEM_DISK_SKIP = systemDiskSkipFromConfig(readConfigText(), process.env)
+info(`systemDiskSkip: ${SYSTEM_DISK_SKIP}`)
+
 const disks = (): any[] => Object.values(store().diskDB ?? {})
 const dockedOn = (dev: string) => disks().filter(d => d.device === dev && d.dockedTo === ENGINE_ID)
 
@@ -321,9 +327,11 @@ const systemChecks = async (when: string) => {
     write(`== system disk checks (${when})`)
     const sysDevs = new Set<string>()
     for (const d of systemDisks) (await partitionsOf(d)).forEach(p => sysDevs.add(p))
-    const sysRecords = disks().filter(d => d.dockedTo === ENGINE_ID && d.device && sysDevs.has(d.device))
+    const plan = planSystemRecordChecks({ systemDiskSkip: SYSTEM_DISK_SKIP, allDisks: disks(), engineId: ENGINE_ID, systemDevs: sysDevs })
+    const sysRecords = plan.records
     info(`system drive records docked here: ${sysRecords.map(d => `${d.id} '${d.name}' ${d.device} [${(d.diskTypes ?? []).join(',')}]`).join('; ') || 'none'}`)
-    for (const d of sysRecords) {
+    if (!plan.checkRecords) write(`SKIP  system-record diskTypes/Console eject-rule checks: ${plan.reason} (engine#288)`)
+    for (const d of plan.checkRecords ? sysRecords : []) {
         check((d.diskTypes ?? []).includes('system'), `system record ${d.id} (${d.device}) carries diskTypes 'system'`, `diskTypes=${JSON.stringify(d.diskTypes)}`)
         check(!consoleCanEject(d), `system record ${d.id} fails the Console eject rule (Console #124 rule + 'system' gate)`)
         if (console124CanEject(d)) info(`note: the unchanged Console #124 rule would still show eject for ${d.id}; the Console needs the 'system' gate`)
