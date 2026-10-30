@@ -15,7 +15,7 @@
  * reads lsblk and sysfs on the Pi.
  */
 
-import { $, fs } from 'zx'
+import { $, YAML, fs } from 'zx'
 import path from 'path'
 
 export interface StickExpectation {
@@ -162,3 +162,41 @@ export const unformattedExpectation = (hasExt4: boolean, listed: boolean): { ok:
     hasExt4
         ? { ok: !listed, label: 'disk has an ext4 partition: NOT in unformattedDisks (no erase offered)' }
         : { ok: listed, label: 'still in unformattedDisks (erase offered)' }
+
+/**
+ * engine#288: read `settings.systemDiskSkip` from the Engine's config.yaml (YAML text),
+ * with IDEA_SYSTEM_DISK_SKIP=true overriding it like src/data/Config.ts does.
+ * An unreadable or unparsable config counts as false.
+ */
+export const systemDiskSkipFromConfig = (yamlText: string | null, env: Record<string, string | undefined> = {}): boolean => {
+    if (env.IDEA_SYSTEM_DISK_SKIP === 'true') return true
+    if (!yamlText) return false
+    try { return (YAML.parse(yamlText) as any)?.settings?.systemDiskSkip === true } catch { return false }
+}
+
+export interface SystemRecordPlan {
+    /** false: skip the diskTypes 'system' and Console eject-rule checks, with `reason` as a SKIP line */
+    checkRecords: boolean
+    reason: string
+    /** records docked here on a system drive partition (still used for the eject-refusal checks) */
+    records: any[]
+}
+
+/**
+ * engine#288: decide whether the system-record checks apply. With systemDiskSkip:true, or a store
+ * with no record carrying diskTypes 'system', the Engine never registers the boot disk, so any record
+ * found on a system partition is a stale App/other record (e.g. duration-kolibri-grade5a-001 on sda2)
+ * and checking its diskTypes gives false FAILs. The root/boot-mounted and eject-refused checks stay.
+ */
+export const planSystemRecordChecks = (opts: {
+    systemDiskSkip: boolean
+    allDisks: any[]
+    engineId: string
+    systemDevs: Set<string>
+}): SystemRecordPlan => {
+    const records = opts.allDisks.filter(d => d.dockedTo === opts.engineId && d.device && opts.systemDevs.has(d.device))
+    if (opts.systemDiskSkip) return { checkRecords: false, reason: "config systemDiskSkip:true — the Engine does not register the system disk, so the system-record checks are skipped", records }
+    const anySystem = opts.allDisks.some(d => d.dockedTo === opts.engineId && (d.diskTypes ?? []).includes('system'))
+    if (!anySystem) return { checkRecords: false, reason: "the store has no record with diskTypes 'system' docked to this Engine — the system-record checks are skipped", records }
+    return { checkRecords: true, reason: '', records }
+}
