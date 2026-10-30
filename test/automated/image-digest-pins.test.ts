@@ -1,0 +1,168 @@
+/**
+ * image-digest-pins.test.ts (koenswings/idea#322)
+ *
+ * Load-then-start with digest-pinned service images: pull by the full ref, save by repo:tag,
+ * verify the pinned digest after `docker image load`. Digests are the real ones measured on
+ * idea04 (koenswings/kolibri:1.1-0.19.5: index a5ae1caf…, linux/arm64 manifest 2b1cb1ed…).
+ */
+import { describe, it, expect, beforeAll, afterAll } from 'vitest'
+import { fs, path } from 'zx'
+import os from 'os'
+import { ENGINE_IMAGE_PLATFORM, buildImageSteps, saveFailedMessage, checkLoadedDigest, legacyServiceImageTarName, parseImageRef, saveName, serviceImageTarName } from '../../src/data/ImageRef.js'
+import { serviceImageTarPath, verifyServiceImageDigest } from '../../src/data/Instance.js'
+
+const INDEX = 'sha256:a5ae1caf3e31b5bb9f2df9c94d45c4cf6fdb8ce3cfe8730364bd6648cdbadc31'
+const PLATFORM = 'sha256:2b1cb1ed1dda1d626ac7dc0b4c23c04d575eeac6fc208d848a10282ba2f64079'
+const TAG = 'koenswings/kolibri:1.1-0.19.5'
+const PINNED = `${TAG}@${INDEX}`
+
+describe('parseImageRef / saveName / tar names', () => {
+    it('parses tag-only, pinned, registry-with-port and digest-only refs', () => {
+        expect(parseImageRef(TAG)).toEqual({ ref: TAG, repo: 'koenswings/kolibri', tag: '1.1-0.19.5', digest: null })
+        expect(parseImageRef(PINNED)).toMatchObject({ repo: 'koenswings/kolibri', tag: '1.1-0.19.5', digest: INDEX })
+        expect(parseImageRef('localhost:5000/a/b:1@' + INDEX)).toMatchObject({ repo: 'localhost:5000/a/b', tag: '1', digest: INDEX })
+        expect(parseImageRef('localhost:5000/a/b')).toMatchObject({ repo: 'localhost:5000/a/b', tag: null, digest: null })
+        expect(parseImageRef('busybox@' + INDEX)).toMatchObject({ repo: 'busybox', tag: null, digest: INDEX })
+        expect(() => parseImageRef('busybox@sha256:xyz')).toThrow(/not a sha256 digest/)
+    })
+    it('saves a pinned ref by repo:tag; digest-only refs are refused clearly', () => {
+        expect(saveName(PINNED)).toBe(TAG)
+        expect(saveName(TAG)).toBe(TAG)
+        expect(() => saveName('busybox@' + INDEX)).toThrow(/without a tag/)
+    })
+    it('tar name: tag-only unchanged from before, pinned maps to the tag file', () => {
+        expect(serviceImageTarName('traefik/whoami:v1')).toBe('traefik_whoami:v1.tar')
+        expect(serviceImageTarName(PINNED)).toBe('koenswings_kolibri:1.1-0.19.5.tar')
+        expect(serviceImageTarPath('/disks/sdb1', PINNED)).toBe('/disks/sdb1/services/koenswings_kolibri:1.1-0.19.5.tar')
+        expect(serviceImageTarPath('/disks/sdb1', 'ghcr.io/kiwix/kiwix-serve:3.8.2')).toBe('/disks/sdb1/services/ghcr.io_kiwix_kiwix-serve:3.8.2.tar')
+        expect(legacyServiceImageTarName(PINNED)).toBe(`koenswings_kolibri:1.1-0.19.5@${INDEX}.tar`)
+    })
+})
+
+describe('buildImageSteps (persist path)', () => {
+    it('tag-only: pull + save, exactly as before', () => {
+        expect(buildImageSteps(TAG)).toEqual([['docker', 'image', 'pull', '--platform', 'linux/arm64', TAG], ['docker', 'save', TAG]])
+    })
+    it('pinned: pull by the full ref, tag as repo:tag, save by repo:tag (never save by digest)', () => {
+        const s = buildImageSteps(PINNED)
+        expect(s).toEqual([['docker', 'image', 'pull', '--platform', 'linux/arm64', PINNED], ['docker', 'image', 'tag', PINNED, TAG], ['docker', 'save', TAG]])
+        expect(s.some(x => x[1] === 'save' && x.join(' ').includes('@'))).toBe(false)
+        expect(ENGINE_IMAGE_PLATFORM).toBe('linux/arm64')
+    })
+})
+
+describe('idea03 real inspect shapes (Docker 29.4.0, PR #296 comment 6520480056)', () => {
+    const K_INDEX = 'sha256:a5ae1caf3e31b5bb9f2df9c94d45c4cf6fdb8ce3cfe8730364bd6648cdbadc31'
+    const K_ARM64 = 'sha256:2b1cb1ed1dda1d626ac7dc0b4c23c04d575eeac6fc208d848a10282ba2f64079'
+    const K_TAG = 'koenswings/kolibri:1.1-0.19.5'
+    it('never saves with --platform; pulls with it', () => {
+        const s = buildImageSteps(`${K_TAG}@${K_INDEX}`)
+        expect(s.find(x => x[1] === 'save')).toEqual(['docker', 'save', K_TAG])
+        expect(s[0]).toEqual(['docker', 'image', 'pull', '--platform', ENGINE_IMAGE_PLATFORM, `${K_TAG}@${K_INDEX}`])
+    })
+    it('--platform-saved image (arm64-only RepoDigest, .Id arm64) fails the index pin', () => {
+        expect(checkLoadedDigest(`${K_TAG}@${K_INDEX}`, [`koenswings/kolibri@${K_ARM64}`], K_ARM64).ok).toBe(false)
+    })
+    it('plain-saved image (index RepoDigest, .Id index) passes the index pin', () => {
+        expect(checkLoadedDigest(`${K_TAG}@${K_INDEX}`, [`koenswings/kolibri@${K_INDEX}`], K_INDEX)).toEqual({ ok: true })
+    })
+    it('wrong arm64 pin fails in the plain-save shape', () => {
+        expect(checkLoadedDigest(`${K_TAG}@${K_ARM64}`, [`koenswings/kolibri@${K_INDEX}`], K_INDEX).ok).toBe(false)
+    })
+    it('save failure message names the image and Docker version, and rules out a --platform fallback', () => {
+        const m = saveFailedMessage(`${K_TAG}@${K_INDEX}`, '29.8.1', 'content digest sha256:x: not found')
+        expect(m).toContain(K_TAG)
+        expect(m).toContain('Docker 29.8.1')
+        expect(m).toMatch(/not found/)
+        expect(m).toMatch(/--platform save is not used as a fallback/)
+    })
+})
+
+describe('checkLoadedDigest (after docker image load)', () => {
+    it('tag-only refs are never checked', () => {
+        expect(checkLoadedDigest(TAG, null, null)).toEqual({ ok: true })
+    })
+    it('index pin + tag-saved tar (idea04 case 4): ok via RepoDigests, docker.io prefix tolerated', () => {
+        expect(checkLoadedDigest(PINNED, [`koenswings/kolibri@${INDEX}`], INDEX)).toEqual({ ok: true })
+        expect(checkLoadedDigest(PINNED, [`docker.io/koenswings/kolibri@${INDEX}`], null)).toEqual({ ok: true })
+        expect(checkLoadedDigest('busybox:1.36@' + INDEX, [`docker.io/library/busybox@${INDEX}`], null)).toEqual({ ok: true })
+    })
+    it('ok via the image Id on the containerd store', () => {
+        expect(checkLoadedDigest(PINNED, [], INDEX)).toEqual({ ok: true })
+    })
+    it('platform-manifest pin (app-kolibri main, idea04 case 2): clear error naming the index digest fix', () => {
+        const c = checkLoadedDigest(`${TAG}@${PLATFORM}`, [`koenswings/kolibri@${INDEX}`], INDEX)
+        expect(c.ok).toBe(false)
+        if (!c.ok) {
+            expect(c.reason).toContain(PLATFORM)
+            expect(c.reason).toMatch(/per-platform manifest digest/)
+            expect(c.reason).toMatch(/imagetools inspect koenswings\/kolibri:1\.1-0\.19\.5/)
+        }
+    })
+    it('platform pin + --platform save whose .Id is the arm64 manifest digest: still fails (RepoDigests show the index)', () => {
+        expect(checkLoadedDigest(`${TAG}@${PLATFORM}`, [`koenswings/kolibri@${INDEX}`], PLATFORM).ok).toBe(false)
+    })
+    it('single-platform image (no index, e.g. nextcloud): a top-level manifest pin passes', () => {
+        const M = 'sha256:' + 'c'.repeat(64)
+        expect(checkLoadedDigest(`nextcloud:31@${M}`, [`docker.io/library/nextcloud@${M}`], M)).toEqual({ ok: true })
+        expect(checkLoadedDigest(`koenswings/nextcloud-mariadb:1@${M}`, [`koenswings/nextcloud-mariadb@${M}`], null)).toEqual({ ok: true })
+        expect(checkLoadedDigest(`koenswings/nextcloud-code:1@${M}`, [], M)).toEqual({ ok: true })
+    })
+    it('platform digest inside an index (kolibri 2b1cb1ed… under a5ae1caf…) still fails', () => {
+        expect(checkLoadedDigest(`${TAG}@${PLATFORM}`, [`koenswings/kolibri@${INDEX}`], INDEX).ok).toBe(false)
+        expect(checkLoadedDigest(`${TAG}@${PLATFORM}`, [`koenswings/kolibri@${INDEX}`], PLATFORM).ok).toBe(false)
+    })
+    it('index pin passes', () => {
+        expect(checkLoadedDigest(PINNED, [`koenswings/kolibri@${INDEX}`], PLATFORM)).toEqual({ ok: true })
+    })
+    it('error text asks for the top-level digest', () => {
+        const c = checkLoadedDigest(`${TAG}@${PLATFORM}`, [`koenswings/kolibri@${INDEX}`], INDEX)
+        if (!c.ok) expect(c.reason).toMatch(/top-level digest: the index digest if the image has one, otherwise its single manifest digest/)
+    })
+    it('mismatch: a different build under the same tag fails', () => {
+        expect(checkLoadedDigest(PINNED, [`koenswings/kolibri@${PLATFORM}`], PLATFORM).ok).toBe(false)
+    })
+    it('same digest under another repo does not count', () => {
+        expect(checkLoadedDigest(PINNED, [`other/kolibri@${INDEX}`], null).ok).toBe(false)
+    })
+    it('image absent after load (tar saved by digest → untagged, idea04 cases 1/5): clear error', () => {
+        const c = checkLoadedDigest(PINNED, null, null)
+        expect(c.ok).toBe(false)
+        if (!c.ok) expect(c.reason).toMatch(/not present after loading/)
+    })
+})
+
+// verifyServiceImageDigest against a fake `docker` on PATH (no real Docker needed)
+describe('verifyServiceImageDigest (fake docker inspect)', () => {
+    let dir = ''
+    let oldPath = ''
+    const setInspect = (out: string | null) => {
+        fs.writeFileSync(path.join(dir, 'inspect.out'), out ?? '')
+        fs.writeFileSync(path.join(dir, 'inspect.rc'), out === null ? '1' : '0')
+    }
+    beforeAll(() => {
+        dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-docker-322-'))
+        fs.writeFileSync(path.join(dir, 'docker'), `#!/bin/sh\nD=$(dirname "$0")\n[ "$1 $2" = "image inspect" ] || exit 2\ncat "$D/inspect.out"\nexit $(cat "$D/inspect.rc")\n`, { mode: 0o755 })
+        oldPath = process.env.PATH ?? ''
+        process.env.PATH = `${dir}:${oldPath}`
+    })
+    afterAll(() => { process.env.PATH = oldPath; fs.removeSync(dir) })
+
+    it('tag-only: no inspect at all', async () => {
+        setInspect(null)
+        await expect(verifyServiceImageDigest(TAG)).resolves.toBeUndefined()
+    })
+    it('pinned index digest present: ok', async () => {
+        setInspect(`["koenswings/kolibri@${INDEX}"]|${INDEX}`)
+        await expect(verifyServiceImageDigest(PINNED)).resolves.toBeUndefined()
+    })
+    it('pinned platform digest: throws the clear error', async () => {
+        setInspect(`["koenswings/kolibri@${INDEX}"]|${INDEX}`)
+        await expect(verifyServiceImageDigest(`${TAG}@${PLATFORM}`)).rejects.toThrow(/per-platform manifest digest/)
+    })
+    it('absent: build path (requirePresent) throws, start path leaves it to compose', async () => {
+        setInspect(null)
+        await expect(verifyServiceImageDigest(PINNED)).rejects.toThrow(/not present/)
+        await expect(verifyServiceImageDigest(PINNED, { requirePresent: false })).resolves.toBeUndefined()
+    })
+})
