@@ -165,10 +165,10 @@ export const createOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: Engi
             log(`Creating disk ${diskId} on engine ${engineId}`);
             disk = {
                 id: diskId,
-                name: diskName,
+                name: diskName ?? (diskId as unknown as DiskName),
                 device: device,
                 dockedTo: engineId,
-                created: created,
+                created: created ?? (new Date().getTime() as Timestamp),
                 lastDocked: new Date().getTime() as Timestamp,
                 diskTypes: [],
                 backupConfig: null,
@@ -182,9 +182,10 @@ export const createOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: Engi
             log(`Granularly updating disk ${diskId} on engine ${engineId}`);
             disk = storedDisk;
             disk.dockedTo = engineId;
-            disk.name = diskName;
+            if (diskName != null) disk.name = diskName;
             disk.device = device;
-            disk.created = created;
+            // Never assign undefined: Automerge rejects it (idea#394)
+            if (created != null) disk.created = created;
             disk.lastDocked = new Date().getTime() as Timestamp;
             disk.diskTypes = [];        // reset; will be repopulated by processDisk
             disk.backupConfig = null;   // reset; will be repopulated if Backup Disk
