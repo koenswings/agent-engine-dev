@@ -133,3 +133,56 @@ describe('App lookup fallback by App folder (idea#392)', () => {
         expect(warnings()).toHaveLength(0)
     })
 })
+
+describe('#297 recreate on a mismatched instanceOf/folder disk (idea#139 + idea#392)', () => {
+    it('reconcileFilesMounts recreates once via the folder App, then is unchanged', async () => {
+        const { reconcileFilesMounts } = await import('../../src/data/FilesMount.js')
+        const h = new Repo({ network: [], storage: undefined }).create<Store>({
+            engineDB: {}, diskDB: {}, appDB: {}, instanceDB: {}, userDB: {}, operationDB: {},
+        } as any)
+        await h.whenReady()
+        await createOrUpdateEngine(h, LOCAL)
+        resetInstanceAppAliasesForTests()
+        resetFilesRemountScheduleForTests()
+        const calls: string[][] = []
+        setFilesMountOpsForTests({
+            composeUp: async (_d, _o, args) => { calls.push(args) },
+            nextcloudOccStatus: async () => ({ installed: true, maintenance: false, needsDbUpgrade: false }),
+        })
+        await ensureEngineStateDir()
+        const device = uniqueTestDevice()
+        const root = `${DISKS_ROOT}/${device}`
+        try {
+            // Disk B shape: one disk, App + Files, apps/sample-files-1.0 with x-app.version 1.0-smoke
+            const disk = createOrUpdateDisk(h, LOCAL, device as DeviceName, 'disk-b' as DiskID, 'Disk B' as DiskName, 1 as Timestamp)
+            const c = YAML.parse(await fs.readFile(SAMPLE, 'utf8'))
+            c['x-app'].name = 'sample-files'; c['x-app'].version = '1.0-smoke'
+            await fs.ensureDir(`${root}/apps/sample-files-1.0`); await fs.ensureDir(`${root}/instances/inst-1`)
+            await fs.writeFile(`${root}/apps/sample-files-1.0/compose.yaml`, YAML.stringify(c))
+            await fs.writeFile(`${root}/instances/inst-1/compose.yaml`, YAML.stringify(c))
+            await createOrUpdateApp(h, 'sample-files-1.0' as AppID, disk)
+            await fs.copy(path.join(FIXTURES_DIR, 'disk-files'), root, { overwrite: false })
+            h.change(doc => {
+                const d = doc.diskDB['disk-b' as DiskID]
+                d.filesConfig = { shareName: 'School Files', readOnly: false, passwordProtected: false, error: null }
+                d.diskTypes = ['app', 'files']
+                doc.instanceDB['inst-1' as InstanceID] = {
+                    id: 'inst-1', instanceOf: 'sample-files-1.0-smoke', name: 'inst-1', status: 'Running',
+                    statusCondition: null, port: 0, serviceImages: [], created: 1, lastBackup: null, lastStarted: 1,
+                    storedOn: 'disk-b', currentStep: null, totalSteps: null, stepLabel: null, metrics: null, filesMounts: null,
+                } as any
+            })
+            expect(h.doc()!.appDB['sample-files-1.0-smoke' as AppID]).toBeUndefined()
+            expect(await reconcileFilesMounts(h, 'inst-1' as InstanceID)).toBe('done')
+            expect(calls).toEqual([['up', '-d']])
+            expect([...h.doc()!.instanceDB['inst-1' as InstanceID].filesMounts!]).toEqual(['disk-b'])
+            expect(await reconcileFilesMounts(h, 'inst-1' as InstanceID)).toBe('unchanged')
+            expect(calls).toHaveLength(1)
+        } finally {
+            setFilesMountOpsForTests(null)
+            resetFilesRemountScheduleForTests()
+            resetInstanceAppAliasesForTests()
+            await fs.remove(root)
+        }
+    })
+})

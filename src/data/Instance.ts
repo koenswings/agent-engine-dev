@@ -1059,7 +1059,8 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
         })
         // idea#139 step 9: running containers may predate a Files role on this
         // disk (Add Files) or carry a stale override; recreate once if needed.
-        if (storeHandle.doc()?.appDB?.[instance.instanceOf]?.filesMount) {
+        const { resolveInstanceApp } = await import('./InstanceApp.js')
+        if ((await resolveInstanceApp(storeHandle.doc(), instance))?.filesMount) {
           const { reconcileFilesMounts } = await import('./FilesMount.js')
           await reconcileFilesMounts(storeHandle, instance.id)
         }
