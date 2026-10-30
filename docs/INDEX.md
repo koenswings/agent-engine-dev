@@ -61,7 +61,8 @@ shape the Engine reads. Not generated, not read by any code or test; it does not
 
 ## source-bundle.md
 **Status:** Generated bundle  ·  **Maintained by:** Axle
-Generated source bundle of Engine docs/code for offline review and PDF export.
+Generated bundle of the Engine source (`src/**/*.ts`, `package.json`, `tsconfig.json`) for offline/LLM review.
+Regenerate with `pnpm bundle-context` (script/bundle-context.ts) when the source changes; last refreshed 2026-10-30 (idea#366).
 → [docs/source-bundle.md](source-bundle.md)
 
 ## styles/markdown-pdf.css
