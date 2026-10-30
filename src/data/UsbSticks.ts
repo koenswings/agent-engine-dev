@@ -20,6 +20,7 @@
  *
  * All commands sit behind UsbStickOps so tests inject fakes.
  */
+import { resolveInstanceApp } from './InstanceApp.js'
 import path from 'path'
 import { $, fs } from 'zx'
 import type { DocHandle } from '@automerge/automerge-repo'
@@ -352,7 +353,7 @@ const runSync = async (storeHandle: DocHandle<Store>, event: UsbSyncEvent, retry
         if (onlyInstanceId && String(inst.id) !== String(onlyInstanceId)) continue
         const disk = inst.storedOn ? store.diskDB[inst.storedOn] : null
         if (!disk || disk.dockedTo !== engineId) continue
-        const um = store.appDB[inst.instanceOf]?.usbMount
+        const um = (await resolveInstanceApp(store, inst))?.usbMount
         if (!um?.sync) continue
         const container = `${inst.id}-${um.sync.service}-1`
         const env = {
