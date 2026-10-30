@@ -1,5 +1,5 @@
 # Project Source Code Context
-Generated on 2026-09-29T07:29:24.831Z
+Generated on 2026-10-30T08:10:46.856Z
 
 ## File: package.json
 ```typescript
@@ -11,7 +11,7 @@ Generated on 2026-09-29T07:29:24.831Z
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "install_packages": "pnpm install --no-frozen-lockfile",
+    "install_packages": "pnpm install --frozen-lockfile",
     "start": "tsc && node dist/src/index.js",
     "startDB": "tsc && YPERSISTENCE=./yjs-db node dist/src/index.js",
     "dev": "nodemon --watch 'src/**/*' -e ts,tsx --exec 'tsc && VERBOSITY=3 node dist/src/index.js'",
@@ -43,7 +43,8 @@ Generated on 2026-09-29T07:29:24.831Z
     "test:hw": "npx tsx script/hw-roundtrip.ts",
     "bundle-context": "tsx script/bundle-context.ts",
     "dump-store": "npx tsx script/dump-store.ts",
-    "cleanup-store": "npx tsx script/cleanup-store.ts"
+    "cleanup-store": "npx tsx script/cleanup-store.ts",
+    "test:duration": "npx tsx test/duration/cli.ts"
   },
   "keywords": [],
   "author": "Koen Swings",
@@ -68,11 +69,12 @@ Generated on 2026-09-29T07:29:24.831Z
   },
   "dependencies": {
     "@automerge/automerge": "3.1.1-alpha.0",
-    "@automerge/automerge-repo": "2.3.0-alpha.0",
-    "@automerge/automerge-repo-network-websocket": "2.3.0-alpha.0",
+    "@automerge/automerge-repo": "2.3.1",
+    "@automerge/automerge-repo-network-websocket": "2.3.1",
     "@automerge/automerge-repo-storage-nodefs": "^2.2.0",
     "@homebridge/ciao": "^1.3.4",
     "chokidar": "^3.6.0",
+    "dbus-next": "0.10.2",
     "fast-deep-equal": "^3.1.3",
     "lib0": "^0.2.114",
     "network-interfaces-listener": "^1.0.1",
@@ -95,9 +97,13 @@ Generated on 2026-09-29T07:29:24.831Z
       "postcss": "^8.5.10",
       "vite@8": "^8.0.5",
       "serialize-javascript@6": "^7.0.3"
-    }
+    },
+    "ignoredOptionalDependencies": [
+      "usocket"
+    ]
   }
 }
+
 ```
 
 ## File: tsconfig.json
@@ -236,33 +242,147 @@ main();
 
 ## File: src/repo.ts
 ```typescript
-import { Repo } from "@automerge/automerge-repo";
+import { Repo, PeerMetadata, PeerId } from "@automerge/automerge-repo";
 import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
-import { WebSocketServer } from "ws";
-import { WebSocketServerAdapter } from "@automerge/automerge-repo-network-websocket";
+import { ThreadedWebSocketServerAdapter } from "./wsServerThread.js";
 import { PortNumber } from "./data/CommonTypes.js";
 import { deepPrint, log, error } from './utils/utils.js'
+import { enginePeerId, isForeignStoreDoc, peerVerdict, storeTag } from './data/StoreScope.js'
+export { isForeignStoreDoc }
 
 
-export const startAutomergeServer = async (dataDir:string, port:PortNumber):Promise<Repo> => {
+/**
+ * r34 DURABILITY. automerge-repo 2.3.0-alpha.0 (and 2.3.0) never wrote a document
+ * to disk after the first change: Repo's throttled save closure ignored its
+ * arguments and kept saving the doc version captured at the first
+ * 'heads-changed' (automerge-repo src/Repo.ts:166-168), so
+ * StorageSubsystem.saveDoc saw unchanged heads and returned. Only repo.flush()
+ * (SIGINT/SIGTERM -> shutdownRepo) wrote, so a crash or power cut lost
+ * everything since the last clean stop. Fixed upstream in 2.3.1 (package.json).
+ *
+ * Backstop, independent of the library version: flush the ready docs every
+ * STORE_FLUSH_INTERVAL_MS. saveDoc is a no-op when a doc's heads have not moved
+ * since it was last stored, writes one incremental chunk when they have, and
+ * compacts on its own when the incrementals outgrow the snapshot. This bounds a
+ * crash/power-cut loss to this interval even if a future library version
+ * regresses. shutdownRepo stops it (stopPeriodicFlush) before the final flush.
+ */
+export const STORE_FLUSH_INTERVAL_MS = 5_000
+
+const periodicFlushes = new WeakMap<Repo, () => Promise<void>>()
+
+/** Start the backstop flush for `repo`; returns its stop function (also reachable via stopPeriodicFlush). */
+export const startPeriodicFlush = (repo: Repo, intervalMs: number = STORE_FLUSH_INTERVAL_MS): (() => Promise<void>) => {
+    void periodicFlushes.get(repo)?.()
+    let stopped = false
+    let inFlight: Promise<void> | undefined
+    const tick = async (): Promise<void> => {
+        try {
+            // Only ready handles: flush() of a handle that never loaded (e.g. a command
+            // log that timed out) throws (see shutdownRepo in CommandLogStore.ts).
+            const ready = Object.values(repo.handles).filter(h => h.isReady()).map(h => h.documentId)
+            if (ready.length > 0) await repo.flush(ready)
+        } catch (e) {
+            error(`[repo] periodic flush failed: ${e instanceof Error ? e.message : e}`)
+        }
+    }
+    const timer = setInterval(() => {
+        if (stopped || inFlight) return
+        inFlight = tick().finally(() => { inFlight = undefined })
+    }, intervalMs)
+    timer.unref()
+    const stop = async (): Promise<void> => {
+        stopped = true
+        clearInterval(timer)
+        if (periodicFlushes.get(repo) === stop) periodicFlushes.delete(repo)
+        await inFlight
+    }
+    periodicFlushes.set(repo, stop)
+    return stop
+}
+
+/** Stop `repo`'s backstop flush and wait for a running tick to finish. No-op if none is running. */
+export const stopPeriodicFlush = async (repo: Repo): Promise<void> => {
+    await periodicFlushes.get(repo)?.()
+}
+
+/** Keepalive ping interval of the Engine's WS server (adapter default: 5000 ms). */
+export const WS_KEEPALIVE_INTERVAL_MS = 30_000
+
+/**
+ * Share policy (r34 POST-BURST-CPU). With `async () => true` the Engine announced
+ * EVERY document it holds (store, command logs, golden doc, relayed foreign docs:
+ * 6-9 docs, ~3 MB on idea04) to EVERY peer that connected, so each fresh Console tab
+ * or probe got a full sync of all of them, unasked, on top of the store it asked for
+ * (r34 raw/ws/conc6-idea04e-*.json: 6 unrequested docs per client).
+ *
+ * Announce only to peers that persist documents (other Engines: they have storage,
+ * so isEphemeral is false) - Engine-to-Engine replication and relaying stay as they
+ * are. Storage-less clients (Console, walker/probe, CLI) get exactly what they
+ * find(): a request is always answered (also for a doc this Engine has to fetch
+ * from its Engine peers first), and after it the peer receives live updates for
+ * that doc. Unknown metadata (should not happen: the WS join carries it) is
+ * treated as an Engine, i.e. the old behaviour.
+ */
+export const shouldAnnounceTo = (meta: PeerMetadata | undefined): boolean => meta?.isEphemeral !== true
+
+/**
+ * Store-scoped peering (StoreScope.ts). The adapters refuse other stores' Engines
+ * at the handshake; this is the Repo-level backstop on top of shouldAnnounceTo:
+ *   - announce only to Engines of OUR store (an unverified non-ephemeral peer, which
+ *     the adapters never let through, would get nothing either);
+ *   - never announce another fleet's store doc, even to our own Engines: copies
+ *     relayed here before this fix stay on disk untouched (quarantine is separate)
+ *     but are not passed on.
+ * Storage-less clients (Console, CLI) still get nothing unasked, as before.
+ */
+export const storeScopedSharePolicy = (repo: Repo, ownStoreDocId: string) => {
+    const ownTag = storeTag(ownStoreDocId)
+    return async (peerId: PeerId, documentId?: string): Promise<boolean> => {
+        const meta = repo.peerMetadataByPeerId[peerId]
+        if (!shouldAnnounceTo(meta)) return false
+        if (peerVerdict(ownTag, peerId, meta).kind !== 'same-store') return false
+        return !(documentId && isForeignStoreDoc(repo, ownStoreDocId, documentId))
+    }
+}
+
+export interface EngineIdentity {
+    /** This Engine's store doc id (store-url.txt). */
+    storeDocId: string
+    engineId: string
+}
+
+export const startAutomergeServer = async (dataDir:string, port:PortNumber, identity: EngineIdentity):Promise<Repo> => {
     log(`Using data directory: ${dataDir}`);
 
     // 1. Create a storage adapter for the server to persist data.
     const storage = new NodeFSStorageAdapter(dataDir);
 
-    // 2. Create a WebSocket server.
-    const ws = new WebSocketServer({ port: port });
-    ws.on('error', (err) => {
-        error(`WebSocket server error on port ${port}: ${err.message}`)
-    })
-    const network = new WebSocketServerAdapter(ws);
+    // 2. Create the WebSocket server.
+    // IDEA04-WS: the server runs in a worker thread (wsServerThread.ts) so that
+    // accepting sockets, answering joins and the keepalive keep working while
+    // the main thread is busy syncing the large store doc to many fresh peers.
+    // Keepalive 30 s instead of the adapter's 5 s default: a peer is only
+    // dropped after a full interval without a pong. Listen errors (e.g. port
+    // in use) are logged as 'WebSocket server error on port ...' as before.
+    const network = new ThreadedWebSocketServerAdapter(port, WS_KEEPALIVE_INTERVAL_MS);
 
-    // 3. Create the Automerge repo.
-    const repo = new Repo({
+    // 3. Create the Automerge repo. Its peerId carries our store tag
+    // (idea-engine/<storeTag>/<engineId>/<session>): both WS adapters check the
+    // other side's against it before any document is exchanged (StoreScope.ts).
+    const peerId = enginePeerId(identity.storeDocId, identity.engineId) as PeerId
+    let sharePolicy: (peerId: PeerId, documentId?: string) => Promise<boolean> = async () => false
+    const repo: Repo = new Repo({
         storage: storage,
         network: [network],
-        sharePolicy: async (peerId) => true // Allow all peers to sync
+        peerId,
+        sharePolicy: (p, d) => sharePolicy(p, d)
     });
+    sharePolicy = storeScopedSharePolicy(repo, identity.storeDocId)
+    network.setDocGuard((documentId) => isForeignStoreDoc(repo, identity.storeDocId, documentId))
+    log(`[store-scope] Engine peerId ${peerId}: syncing only with Engines of store ${storeTag(identity.storeDocId)}`)
+
+    startPeriodicFlush(repo);
 
     log(`Automerge server is running on port ${port}`);
 
@@ -309,37 +429,45 @@ export const startAutomergeServer = async (dataDir:string, port:PortNumber):Prom
 
 ## File: src/start.ts
 ```typescript
+import { storeTag } from './data/StoreScope.js'
 import os from 'os'
 import { enableUsbDeviceMonitor } from './monitors/usbDeviceMonitor.js'
 import { runDiskDetectionSelfCheck, recordDiskDetectionFailure, errorMessage } from './monitors/diskDetection.js'
-import { enableTimeMonitor, generateHeartBeat } from './monitors/timeMonitor.js'
+import { enableTimeMonitor } from './monitors/timeMonitor.js'
+import { startLiveness, writeLastSeen } from './data/Liveness.js'
 import { $, chalk, fs, sleep } from 'zx'
 import { deepPrint, log, print } from './utils/utils.js'
-import { config } from './data/Config.js'
+import { config, peerAccessEnabled, peerStaleMs } from './data/Config.js'
 import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
 import { enableHttpMonitor } from './monitors/httpMonitor.js'
-import { DocumentId, Repo, DocHandle } from '@automerge/automerge-repo'
+import { enableIdeaLocalPublisher, IdeaLocalPublisher } from './monitors/ideaLocal.js'
+import { DocumentId, Repo } from '@automerge/automerge-repo'
 import { startAutomergeServer } from './repo.js'
 import { enableMulticastDNSEngineMonitor } from './monitors/mdnsMonitor.js'
+import { startStaticPeers, staticPeersSetting } from './data/StaticPeers.js'
 import { createServerStore } from './data/Store.js'
 import { prepareStoreIdentity, storeIdentityPaths } from './data/StoreIdentity.js'
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
-import { recoverInterruptedOperations } from './data/Operations.js'
+import { recoverInterruptedOperations, archiveOldOperations } from './data/Operations.js'
 import { enableDockerMetricsMonitor } from './monitors/dockerMetricsMonitor.js'
 import { enableDiskSizeMonitor } from './data/DiskSize.js'
 import { ensureEngineStateDir, setFilesMountStore } from './data/FilesMount.js'
 import { clearStaleEraseStaging } from './data/EraseDisk.js'
-import { refreshUnformattedDisks } from './data/UnformattedDisks.js'
+import { refreshUnformattedDisks, setAfterUnformattedRefresh, startUnformattedDiskPoll } from './data/UnformattedDisks.js'
+import { refreshClientCards, startClientCardPoll } from './data/ClientCards.js'
+import { refreshClientImages } from './data/ClientImages.js'
+import './data/FlashCard.js'
 import { diskFsRoot } from './data/Disk.js'
 import { copyApp, moveApp } from './data/CopyMoveApp.js'
 import { backupInstance } from './monitors/backupMonitor.js'
 import { clearStaleUnmountErrors } from './monitors/mounts.js'
-import { InstanceID } from './data/CommonTypes.js'
-import { Status } from './data/Instance.js'
-import { Store } from './data/Store.js'
-import { createCommandLogStore, shutdownRepo } from './data/CommandLogStore.js'
+import { createCommandLogStore, shutdownRepo, startCommandLogRotation } from './data/CommandLogStore.js'
 import { initCommandLogger } from './utils/CommandLogger.js'
+import { assertAppDataHelper, reportBorgAtStartup } from './utils/appDataHelper.js'
+import { startPeerAccess } from './data/PeerAccess.js'
+import { checkAndSetUndockedApps } from './data/UndockedApps.js'
+export { checkAndSetUndockedApps }
 
 
 
@@ -365,6 +493,12 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     log(`  Endianness: ${os.endianness()}`)
     log(`  Network Hostname: ${os.hostname()}`)
 
+    // The app-data root helper (idea#168): checked and logged, never fatal (Steve,
+    // 2026-10-28). Commands that need a newer helper refuse with HELPER_OUTDATED.
+    await assertAppDataHelper()
+    // borg: loud but not fatal (only Backup Disks need it)
+    reportBorgAtStartup()
+
     // Process the config
     const settings = config.settings
     const STORE_DATA_PATH = "./"+config.settings.storeDataFolder
@@ -383,15 +517,19 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         await $`mkdir -p ${STORE_IDENTITY_PATH}`
     }
 
-    log(`Starting Automerge server...`)
-    const repo = await startAutomergeServer(STORE_DATA_PATH, settings.port as PortNumber || 1234 as PortNumber)
-
     // Store identity (idea#120): a missing store-url.txt is written back with the
     // shared fleet store URL; an existing one is used as it is. store-template.json
     // is never written; if it is missing, startup stops with a clear error.
-    const { storeDocId, restored } = await prepareStoreIdentity(storeIdentity)
+    // Read BEFORE the Automerge server starts: the Repo's peerId carries the store
+    // tag, so the Engine only ever peers with Engines of this store (StoreScope.ts).
+    const { storeDocId, restored, fallback } = await prepareStoreIdentity(storeIdentity)
     if (restored) print(chalk.yellow(`store-url.txt was missing: restored the fleet store URL`))
+    if (fallback) print(chalk.bgRed.white(`store-url.txt was restored by the Engine (store-identity/store-url.restored): peer access fails closed until Ops confirms the store`))
     log(`Using document ID: ${storeDocId}`)
+
+    log(`Starting Automerge server...`)
+    const repo = await startAutomergeServer(STORE_DATA_PATH, settings.port as PortNumber || 1234 as PortNumber,
+        { storeDocId, engineId: String(localEngineId) })
 
     // HACK: Force save on remote changes
     // The repo doesn't persist changes that come in from a remote peer automatically.
@@ -421,12 +559,28 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // all peers on the next Automerge sync.
     cleanupPhantomEngines(storeHandle)
 
+    // Per-Pi Engine key (design-per-pi-engine-key.md): make it if missing, publish
+    // it with the host key in this Engine's entry, and sync peers' keys into the
+    // root-owned authorized_keys/known_hosts through idea-app-data sync-peers.
+    // Fails closed (no key published, nobody authorized) on a restored store URL.
+    const peerAccess = await startPeerAccess(storeHandle, String(localEngineId), {
+        enabled: peerAccessEnabled(), fallbackStore: fallback, storeUrlPath: storeIdentity.urlPath, staleMs: peerStaleMs(),
+    })
+
     // Clear unmount errors (idea#126) this Engine recorded for disks whose mount
     // point is no longer mounted, or now holds another filesystem (fsUuid).
     await clearStaleUnmountErrors(storeHandle, localEngineId).catch(e => log(`Could not clear stale unmount errors: ${e}`))
 
-    // Check for undocked apps after restart
+    // Check for undocked apps after restart: only instances on disks docked on
+    // this Engine (Disk.dockedTo); other Engines' instances are left alone.
+    // An instance the operator stopped stays Stopped, so the dock pass does not
+    // auto-start it (idea#176)
     await checkAndSetUndockedApps(storeHandle)
+
+    // #230 power-loss safety: roll back an interrupted updateApp from its complete .pre-update snapshot
+    await import('./data/UpdateApp.js').then(m => m.recoverInterruptedUpdates(storeHandle, String(localEngineId)))
+        .then(r => r.forEach(line => log(`recoverInterruptedUpdates: ${line}`)))
+        .catch(e => log(`recoverInterruptedUpdates failed: ${e}`))
 
     // Crash recovery: retry idempotent interrupted ops; mark others Failed
     await recoverInterruptedOperations(storeHandle, {
@@ -448,12 +602,15 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
 
     // Create the command log store and initialise the console patcher
     log(chalk.bgMagenta('STARTING COMMAND LOG STORE'))
-    const commandLogHandle = await createCommandLogStore(repo)
+    const commandLogHandle = await createCommandLogStore(repo, { storeTag: storeTag(storeDocId) })
     initCommandLogger(commandLogHandle)
+    // idea#183: fresh CommandLog doc each local day, previous one archived
+    startCommandLogRotation(repo)
 
     // Start the HTTP server (serves Console UI + /api/store-url)
     log(chalk.bgMagenta('STARTING HTTP SERVER'))
-    const httpServer = enableHttpMonitor(undefined, undefined, commandLogHandle)
+    // idea#203: http://idea.local (port 80) must reach this Engine's Console even when httpPort is not 80
+    const httpServer = enableHttpMonitor(undefined, undefined, commandLogHandle, config.settings.ideaLocalHttpPort ?? 80, { engineId: String(localEngineId) })
 
     // Start the instances monitor
     // log(chalk.bgMagenta('STARTING INSTANCES MONITOR'))
@@ -474,6 +631,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         // this will be fired when you kill the app with ctrl + c.
         log('Shutting down automerge')
         log('*** SIGINT received ****');
+        await ideaLocalPublisher?.stop().catch(() => {})
         await shutdownProcedure(repo, httpServer, mdnsHandle)
         process.exit(0)
     })
@@ -481,6 +639,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         // this will be fired by the Linux shutdown command
         log('Shutting down automerge')
         log('*** SIGTERM received ****');
+        await ideaLocalPublisher?.stop().catch(() => {})
         await shutdownProcedure(repo, httpServer, mdnsHandle)
         process.exit(0)
     })
@@ -491,10 +650,23 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
 
     const configMDNS = config.settings.mdns
     let mdnsHandle: { end: () => Promise<void> } | undefined
+    let ideaLocalPublisher: IdeaLocalPublisher | undefined
     if (!disableMDNS && configMDNS) {
         await sleep(1000)
         log(chalk.bgMagenta('STARTING MULTICAST DNS MONITOR'))
         mdnsHandle = enableMulticastDNSEngineMonitor(storeHandle, repo)
+        // idea#203: every Engine competes for the shared name idea.local (one holder, takeover)
+        if (config.settings.ideaLocal !== false) {
+            log(chalk.bgMagenta('STARTING idea.local PUBLISHER'))
+            ideaLocalPublisher = enableIdeaLocalPublisher()
+        }
+    }
+
+    // Opt-in static peer list (IDEA_STATIC_PEERS / settings.staticPeers): dials
+    // the listed Engines via connectEngine, independent of mDNS. Unset: no-op.
+    if (staticPeersSetting()?.trim()) {
+        log(chalk.bgMagenta('STARTING STATIC PEERS'))
+        startStaticPeers(repo, storeHandle)
     }
 
 
@@ -521,39 +693,34 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     await ensureEngineStateDir()
     setFilesMountStore(storeHandle)
     await clearStaleEraseStaging()
+    // idea#201 §10: client cards / new disks follow every unformattedDisks refresh, plus a
+    // lsblk poll (a card put into a reader sends no add event for the whole disk)
+    setAfterUnformattedRefresh((h) => refreshClientCards(h).then(() => undefined))
     await refreshUnformattedDisks(storeHandle).catch(e => log(`unformattedDisks at startup: ${e}`))
+    startClientCardPoll(storeHandle)
+    // idea#279: partitions that change while a disk stays plugged re-evaluate 'Unformatted'
+    startUnformattedDiskPoll(storeHandle)
+    // Hashing a new image takes a while: in the background, then every 10 minutes
+    const imagesRefresh = () => refreshClientImages(storeHandle).catch(e => log(`client images: ${e}`))
+    imagesRefresh()
+    setInterval(imagesRefresh, 10 * 60_000)
 
     log(chalk.bgMagenta('STARTING HEARTBEAT GENERATION'))
     const heartbeatIntervalMs = config.settings.heartbeatIntervalMs ?? 50000
-    generateHeartBeat(storeHandle)
-    enableTimeMonitor(heartbeatIntervalMs, () => generateHeartBeat(storeHandle))
+    // Liveness without store history (store-design 2026-10-13): ephemeral hb every
+    // 10 s, stored lastRun at boot + hourly (Liveness.ts)
+    writeLastSeen(storeHandle, String(localEngineId), Date.now(), 0, true)
+    startLiveness(storeHandle, String(localEngineId))
+    // The heartbeat timer still repairs this Engine's peerAccess, expires stale
+    // peers and archives old operations; it no longer writes to the store itself
+    enableTimeMonitor(heartbeatIntervalMs, () => {
+        archiveOldOperations(storeHandle).catch(e => print(chalk.red(`archive operations: ${e}`)))
+        peerAccess.onHeartbeat().catch(e => print(chalk.red(`peer access heartbeat: ${e}`)))
+    })
 
 
 }
 
-
-export const checkAndSetUndockedApps = async (storeHandle: DocHandle<Store>): Promise<void> => {
-    const { instanceDB } = storeHandle.doc();
-    const promises = Object.keys(instanceDB).map(async (instanceId) => {
-        const instance = instanceDB[instanceId];
-        if (instance.status !== "Undocked") {
-            try {
-                const result = await $`docker ps -q -f name=${instance.id}`;
-                if (result.stdout.trim() === "") {
-                    // No container running, set to undocked
-                    log(`Setting status of instance ${instanceId} to Undocked`)
-                    storeHandle.change(doc => {
-                          const inst = doc.instanceDB[instanceId]
-                          inst.status = 'Undocked' as Status 
-                        })
-                }
-            } catch (error) {
-                console.error(`Error checking docker status for ${instance.name}: ${error}`);
-            }
-        }
-    });
-    await Promise.all(promises);
-};
 
 async function shutdownProcedure(repo: Repo, httpServer?: import('http').Server, mdnsHandle?: { end: () => Promise<void> }): Promise<void> {
     print('*** Engine is now closing ***');
@@ -612,6 +779,894 @@ runner.run(function(failures) {
 });
 ```
 
+## File: src/wsServerThread.ts
+```typescript
+/**
+ * wsServerThread.ts — keep the Engine's Automerge WS server responsive while it syncs (IDEA04-WS).
+ *
+ * Problem (r33, IDEA04-WS.md; reproduced by test/automated/ws-concurrent-sync.test.ts):
+ * a fresh peer's full sync of the large store doc is synchronous Automerge work
+ * on the main thread (generateSyncMessage of the whole doc, plus the JS<->wasm
+ * round trip of a sync state that lists every change hash sent): a few hundred
+ * ms on x86, seconds on a Pi 4. With the stock WebSocketServerAdapter on the
+ * main thread, a classroom of peers connecting at once stalls the event loop
+ * for N times that, and while it is stalled:
+ *   - new sockets are not accepted and joins are not answered; the client's
+ *     WebSocketClientAdapter declares itself ready after 1 s anyway, its find()
+ *     sees no peer and the doc goes 'unavailable';
+ *   - pongs are not read before the next keepalive tick (5 s default), so the
+ *     adapter terminates every socket at once.
+ *
+ * ThreadedWebSocketServerAdapter is a drop-in NetworkAdapter for the Repo that
+ * runs the stock WebSocketServerAdapter in a worker thread
+ * (wsServerThreadWorker.ts). The worker owns the sockets, the handshake and
+ * the keepalive, so they no longer depend on the main thread. The Repo side is
+ * unchanged: the same 'peer-candidate' / 'peer-disconnected' / 'message' events
+ * arrive, in the same order. They are handed to the Repo one event per
+ * event-loop turn (setImmediate), so one peer's long sync does not run back to
+ * back with the next one and the main thread still gets to its own timers and
+ * sockets (HTTP monitor, outbound Engine connections) in between.
+ *
+ * If the worker dies it is restarted (after RESTART_DELAY_MS) and its peers are
+ * reported disconnected; clients reconnect on their own.
+ */
+
+import { Worker } from 'worker_threads'
+import { next as A } from '@automerge/automerge'
+import { NetworkAdapter, Message, PeerId, PeerMetadata } from '@automerge/automerge-repo'
+import { log, error, print } from './utils/utils.js'
+import type { WsServerThreadData, StoreRefusal } from './wsServerThreadWorker.js'
+import { describeRefusal, RefusalLog } from './data/StoreScope.js'
+import { guardOutgoing } from './data/StoreScopedClientAdapter.js'
+
+const RESTART_DELAY_MS = 1000
+
+export type QueuedEvent = { event: 'peer-candidate' | 'peer-disconnected' | 'message', payload: any }
+
+/**
+ * Start the worker module next to this one: .js when compiled (the Engine runs
+ * dist/src/index.js). When run from source under tsx (dev scripts), the .ts
+ * worker is loaded through tsx's ESM API, since loader hooks registered on the
+ * main thread do not apply inside workers.
+ */
+const startWorker = (workerData: WsServerThreadData): Worker => {
+    if (!import.meta.url.endsWith('.ts')) return new Worker(new URL('./wsServerThreadWorker.js', import.meta.url), { workerData })
+    const tsUrl = new URL('./wsServerThreadWorker.ts', import.meta.url).href
+    const boot = `import('tsx/esm/api').then(m => m.register()).then(() => import(${JSON.stringify(tsUrl)}))`
+    return new Worker(boot, { eval: true, workerData })
+}
+
+/** A sync/request message that carries changes must be applied even if its sender has left. */
+export const carriesChanges = (msg: any): boolean => {
+    if ((msg?.type !== 'sync' && msg?.type !== 'request') || !msg.data) return false
+    try { return A.decodeSyncMessage(msg.data).changes.length > 0 } catch { return true }
+}
+
+/** The queue without `peerId`'s messages that carry no changes (see #dropQueuedFrom). */
+export const pruneDepartedMessages = (queue: QueuedEvent[], peerId: PeerId): QueuedEvent[] =>
+    queue.filter(e => !(e.event === 'message' && e.payload?.senderId === peerId && !carriesChanges(e.payload)))
+
+export interface ThreadedServerStoreScope {
+    /** Called for every join the worker refused (store check, StoreScope.ts). Default: a rate-limited log line. */
+    onRefused?: (r: StoreRefusal) => void
+    /** true = documentId is another fleet's store doc: never served, never accepted. */
+    docGuard?: (documentId: string) => boolean
+}
+
+const serverRefusalLog = new RefusalLog(print)
+const logServerRefusal = (r: StoreRefusal): void => {
+    const host = r.remote.replace(/:\d+$/, '')
+    serverRefusalLog.report(`in|${host}|${r.verdict.kind}|${r.verdict.theirTag ?? ''}`,
+        describeRefusal(r.verdict, r.ownTag, r.peerId, `inbound from ${r.remote}`))
+}
+
+export class ThreadedWebSocketServerAdapter extends NetworkAdapter {
+    readonly port: number
+    readonly keepAliveIntervalMs: number
+    /** Resolves when the server first listens; rejects if the first listen fails (e.g. EADDRINUSE). */
+    readonly listening: Promise<void>
+
+    #worker!: Worker
+    #closed = false
+    #connectArgs?: { peerId: PeerId, peerMetadata?: PeerMetadata }
+    #peers = new Set<PeerId>()
+    #queue: QueuedEvent[] = []
+    #scheduled = false
+    #ready = false
+    #readyResolve!: () => void
+    #readyPromise = new Promise<void>(resolve => { this.#readyResolve = resolve })
+    #listeningSettled = false
+    #listeningResolve!: () => void
+    #listeningReject!: (e: Error) => void
+
+    #scope: ThreadedServerStoreScope
+    /** Joins refused by the store check (diagnostics/tests). */
+    readonly refusals: StoreRefusal[] = []
+
+    constructor(port: number, keepAliveIntervalMs: number, scope: ThreadedServerStoreScope = {}) {
+        super()
+        this.port = port
+        this.keepAliveIntervalMs = keepAliveIntervalMs
+        this.#scope = scope
+        this.listening = new Promise<void>((resolve, reject) => { this.#listeningResolve = resolve; this.#listeningReject = reject })
+        this.listening.catch(() => { /* reported via error(); callers may await it */ })
+        this.#spawn()
+    }
+
+    /** Same meaning as the stock server adapter: ready once the first client has connected. */
+    isReady(): boolean { return this.#ready }
+    whenReady(): Promise<void> { return this.#readyPromise }
+
+    /** Repo events waiting to be handed to the Repo (diagnostics/tests). */
+    get pendingEvents(): number { return this.#queue.length }
+
+    connect(peerId: PeerId, peerMetadata?: PeerMetadata): void {
+        this.peerId = peerId
+        this.peerMetadata = peerMetadata
+        this.#connectArgs = { peerId, peerMetadata }
+        this.#worker.postMessage({ type: 'connect', peerId, peerMetadata })
+    }
+
+    /** Set the foreign-doc guard once the Repo exists (src/repo.ts). */
+    setDocGuard(docGuard: (documentId: string) => boolean): void { this.#scope.docGuard = docGuard }
+
+    send(message: Message): void {
+        if ('data' in message && message.data?.byteLength === 0) throw new Error('Tried to send a zero-length message')
+        const out = guardOutgoing(message, this.#scope.docGuard)
+        if (out) this.#worker.postMessage({ type: 'send', message: out })
+    }
+
+    disconnect(): void {
+        this.#worker.postMessage({ type: 'disconnect' })
+    }
+
+    /** Stop the server thread (tests; the Engine just exits). */
+    async close(): Promise<void> {
+        this.#closed = true
+        await this.#worker.terminate()
+    }
+
+    #spawn(): void {
+        const data: WsServerThreadData = { port: this.port, keepAliveIntervalMs: this.keepAliveIntervalMs }
+        const worker = startWorker(data)
+        this.#worker = worker
+        worker.on('message', (m: any) => this.#onWorkerMessage(m))
+        worker.on('error', (err) => error(`WebSocket server thread error: ${err.stack ?? err.message}`))
+        worker.on('exit', (code) => {
+            if (this.#closed || worker !== this.#worker) return
+            error(`WebSocket server thread exited (code ${code}); restarting in ${RESTART_DELAY_MS} ms`)
+            for (const peerId of this.#peers) this.#enqueue({ event: 'peer-disconnected', payload: { peerId } })
+            setTimeout(() => {
+                if (this.#closed) return
+                this.#spawn()
+                if (this.#connectArgs) this.#worker.postMessage({ type: 'connect', ...this.#connectArgs })
+            }, RESTART_DELAY_MS)
+        })
+    }
+
+    #onWorkerMessage(m: any): void {
+        switch (m?.type) {
+            case 'event':
+                if (m.event === 'peer-disconnected') this.#dropQueuedFrom(m.payload?.peerId)
+                // A sync/request for another fleet's store doc that is loaded here is not
+                // processed (that would serve or change the foreign copy): answer unavailable.
+                if (m.event === 'message' && m.payload?.documentId && (m.payload.type === 'sync' || m.payload.type === 'request')
+                    && this.#scope.docGuard?.(String(m.payload.documentId))) {
+                    this.send({ type: 'doc-unavailable', senderId: this.peerId!, targetId: m.payload.senderId, documentId: m.payload.documentId } as Message)
+                    break
+                }
+                this.#enqueue({ event: m.event, payload: m.payload })
+                break
+            case 'refused': {
+                const r: StoreRefusal = { peerId: m.peerId, remote: m.remote, verdict: m.verdict, ownTag: m.ownTag }
+                this.refusals.push(r)
+                if (this.refusals.length > 100) this.refusals.shift()
+                ;(this.#scope.onRefused ?? logServerRefusal)(r)
+                break
+            }
+            case 'ready':
+                if (!this.#ready) { this.#ready = true; this.#readyResolve() }
+                break
+            case 'listening':
+                if (!this.#listeningSettled) { this.#listeningSettled = true; this.#listeningResolve() }
+                break
+            case 'server-error':
+                error(`WebSocket server error on port ${this.port}: ${m.message}`)
+                if (!this.#listeningSettled) { this.#listeningSettled = true; this.#listeningReject(new Error(m.message)) }
+                break
+            case 'log':
+                (m.level === 'error' ? error : log)(m.message)
+                break
+        }
+    }
+
+    /**
+     * r34 POST-BURST-CPU: the peer's socket is gone. Its messages still waiting in
+     * the queue would each cost a receiveSyncMessage + generateSyncMessage on the
+     * main thread (seconds for a full sync on a Pi 4) for a reply nobody can
+     * receive; after a burst of short-lived clients that kept idea04's main thread
+     * at 100% for ~2 min while new clients got nothing. Drop them, EXCEPT sync
+     * messages that carry changes: those may hold the peer's last edits and must
+     * still be applied to the doc.
+     */
+    #dropQueuedFrom(peerId: PeerId | undefined): void {
+        if (!peerId) return
+        const before = this.#queue.length
+        this.#queue = pruneDepartedMessages(this.#queue, peerId)
+        const dropped = before - this.#queue.length
+        if (dropped > 0) this.droppedFromDeparted += dropped
+    }
+
+    /** Messages dropped because their sender had disconnected (diagnostics/tests). */
+    droppedFromDeparted = 0
+
+    #enqueue(e: QueuedEvent): void {
+        this.#queue.push(e)
+        if (!this.#scheduled) { this.#scheduled = true; setImmediate(this.#drainOne) }
+    }
+
+    #drainOne = (): void => {
+        const next = this.#queue.shift()
+        try {
+            if (next) {
+                if (next.event === 'peer-candidate') this.#peers.add(next.payload.peerId)
+                else if (next.event === 'peer-disconnected') this.#peers.delete(next.payload.peerId)
+                this.emit(next.event as any, next.payload)
+            }
+        } finally {
+            if (this.#queue.length > 0) setImmediate(this.#drainOne)
+            else this.#scheduled = false
+        }
+    }
+}
+
+```
+
+## File: src/wsServerThreadWorker.ts
+```typescript
+/**
+ * wsServerThreadWorker.ts — the Engine's Automerge WebSocket server, run in a worker thread (IDEA04-WS).
+ *
+ * Started by ThreadedWebSocketServerAdapter (wsServerThread.ts). This thread owns
+ * the listening socket and every client socket, and runs the stock
+ * WebSocketServerAdapter: the WS upgrade, the join -> 'peer' handshake, the
+ * keepalive ping/pong and CBOR (de)coding all happen here, so they keep working
+ * while the main thread is busy with a long synchronous Automerge sync.
+ * Repo-facing adapter events are forwarded to the main thread, and the main
+ * thread's outgoing messages are sent from here.
+ *
+ * Messages from the main thread:
+ *   { type: 'connect', peerId, peerMetadata }  start listening and accept peers
+ *   { type: 'send', message }                  send a repo message to a peer
+ *   { type: 'disconnect' }                     terminate all client sockets (Repo shutdown)
+ * Messages to the main thread:
+ *   { type: 'listening' } | { type: 'ready' } | { type: 'server-error', message }
+ *   { type: 'event', event: 'peer-candidate' | 'peer-disconnected' | 'message', payload }
+ *   { type: 'log', level: 'log' | 'error', message }
+ *   { type: 'refused', peerId, remote, verdict, ownTag }   a join refused by the store check
+ *
+ * Store-scoped peering (StoreScope.ts): when our own peerId is an Engine peerId
+ * (`idea-engine/<storeTag>/...`, always the case for the Engine, src/repo.ts),
+ * every join is checked BEFORE the stock adapter sees it. A peer of another store,
+ * or a non-ephemeral peer without a store tag (an old Engine), gets an
+ * `idea-store-refused ours=<tag> kind=<kind>` error and its socket is closed: no
+ * peer-candidate, no 'peer' reply, none of its messages reach the Repo. Messages on
+ * a socket that has not completed an admitted join are dropped too (the stock
+ * adapter would forward them with whatever senderId they claim).
+ */
+
+import { parentPort, workerData } from 'worker_threads'
+import { WebSocketServer } from 'ws'
+import { WebSocketServerAdapter } from '@automerge/automerge-repo-network-websocket'
+import { cbor } from '@automerge/automerge-repo'
+import { parseEnginePeerId, peerVerdict, refusalMessage, PeerVerdict } from './data/StoreScope.js'
+
+export interface WsServerThreadData { port: number, keepAliveIntervalMs: number }
+
+const FORWARDED_EVENTS = ['peer-candidate', 'peer-disconnected', 'message'] as const
+
+/** setInterval's maximum: effectively switches off the stock adapter's own keepalive. */
+const STOCK_KEEPALIVE_OFF = 0x7fffffff
+
+interface TrackedSocket {
+    isAlive?: boolean          // set by the stock adapter on pong, and by us on any message
+    lastBufferedAmount?: number
+    bufferedAmount: number
+    readyState: number
+    ping(): void
+    terminate(): void
+    on(event: string, cb: (...a: any[]) => void): void
+}
+
+/**
+ * Keepalive that does not drop a peer we are still streaming a sync to.
+ *
+ * The stock keepalive pings every interval and terminates a socket whose pong
+ * has not been read by the next tick. A ping is queued BEHIND whatever we are
+ * already sending on that socket, so while a large full-doc sync message is
+ * still crossing a slow link (box -> DERP relay -> Pi), the client cannot even
+ * see the ping in time and is terminated mid-sync; it reconnects, the full sync
+ * restarts and the same thing happens again (r33: 4 handshakes, never ready).
+ *
+ * Here a socket counts as alive for a tick if any of these happened since the
+ * previous tick: a pong, any message from the peer, or our send backlog to it
+ * (bufferedAmount) went down, i.e. the peer is still taking our data.
+ */
+const startKeepalive = (wss: WebSocketServer, intervalMs: number): NodeJS.Timeout => {
+    wss.on('connection', (socket: TrackedSocket) => {
+        socket.isAlive = true
+        socket.lastBufferedAmount = 0
+        socket.on('message', () => { socket.isAlive = true })
+    })
+    const timer = setInterval(() => {
+        wss.clients.forEach((ws) => {
+            const socket = ws as unknown as TrackedSocket
+            const buffered = socket.bufferedAmount
+            const draining = buffered < (socket.lastBufferedAmount ?? 0)
+            socket.lastBufferedAmount = buffered
+            if (socket.isAlive || draining) {
+                socket.isAlive = false
+                socket.ping()
+            } else {
+                socket.terminate()
+            }
+        })
+    }, intervalMs)
+    wss.on('close', () => clearInterval(timer))
+    return timer
+}
+
+export interface StoreRefusal { peerId?: string, remote: string, verdict: PeerVerdict, ownTag: string }
+
+/**
+ * The stock server adapter with the store check on each socket's join (see header).
+ * ownTag undefined (our own peerId is not an Engine peerId: tests/tools that run a
+ * plain server) = no check, the stock behaviour.
+ */
+export class StoreScopedWebSocketServerAdapter extends WebSocketServerAdapter {
+    ownTag?: string
+    #admitted = new WeakSet<object>()
+    readonly #onRefused: (r: StoreRefusal) => void
+    readonly #wss: WebSocketServer
+
+    constructor(server: WebSocketServer, keepAliveInterval: number, onRefused: (r: StoreRefusal) => void) {
+        super(server, keepAliveInterval)
+        this.#wss = server
+        this.#onRefused = onRefused
+    }
+
+    override connect(peerId: any, peerMetadata?: any): void {
+        this.ownTag = parseEnginePeerId(peerId)?.storeTag
+        super.connect(peerId, peerMetadata)
+        this.#wss.on('connection', (socket: any, req: any) => {
+            socket.ideaRemote = `${req?.socket?.remoteAddress ?? '?'}:${req?.socket?.remotePort ?? '?'}`
+        })
+    }
+
+    override receiveMessage(messageBytes: Uint8Array, socket: any): void {
+        if (!this.ownTag || this.#admitted.has(socket)) return super.receiveMessage(messageBytes, socket)
+        let message: any
+        try { message = cbor.decode(new Uint8Array(messageBytes as any)) } catch { socket.close(); return }
+        if (message?.type !== 'join') return   // nothing before the join is processed
+        const verdict = peerVerdict(this.ownTag, message.senderId, message.peerMetadata)
+        if (!verdict.admit) {
+            try {
+                socket.send(cbor.encode({ type: 'error', senderId: this.peerId, targetId: message.senderId,
+                    message: refusalMessage(this.ownTag, verdict.kind) }))
+            } catch { /* socket already closing */ }
+            try { socket.close(4403, 'store mismatch') } catch { /* ignore */ }
+            this.#onRefused({ peerId: message.senderId, remote: socket.ideaRemote ?? '?', verdict, ownTag: this.ownTag })
+            return
+        }
+        this.#admitted.add(socket)
+        super.receiveMessage(messageBytes, socket)
+    }
+}
+
+if (parentPort) {
+    const port = parentPort
+    const { port: listenPort, keepAliveIntervalMs } = workerData as WsServerThreadData
+    const post = (m: unknown) => port.postMessage(m)
+    const logError = (message: string) => post({ type: 'log', level: 'error', message })
+
+    // Same policy as the Engine's main thread (start.ts): log and keep serving.
+    process.on('uncaughtException', (err: Error) => logError(`[ws-server-thread uncaughtException] ${err.stack ?? err.message}`))
+    process.on('unhandledRejection', (reason: any) => logError(`[ws-server-thread unhandledRejection] ${reason instanceof Error ? reason.stack : String(reason)}`))
+
+    let adapter: StoreScopedWebSocketServerAdapter | undefined
+
+    port.on('message', (m: any) => {
+        try {
+            switch (m?.type) {
+                case 'connect': {
+                    if (adapter) return
+                    // Listen only once the adapter has its peerId: a join that arrived
+                    // before connect() would hit the adapter's peerId assertion.
+                    const wss = new WebSocketServer({ port: listenPort })
+                    wss.on('error', (err) => post({ type: 'server-error', message: err.message }))
+                    wss.on('listening', () => post({ type: 'listening' }))
+                    // Our keepalive (startKeepalive) replaces the stock one, which
+                    // would terminate a peer whose pong is stuck behind its own sync.
+                    adapter = new StoreScopedWebSocketServerAdapter(wss, STOCK_KEEPALIVE_OFF, (r) => post({ type: 'refused', ...r }))
+                    startKeepalive(wss, keepAliveIntervalMs)
+                    for (const event of FORWARDED_EVENTS) {
+                        adapter.on(event, (payload: unknown) => post({ type: 'event', event, payload }))
+                    }
+                    void adapter.whenReady().then(() => post({ type: 'ready' }))
+                    adapter.connect(m.peerId, m.peerMetadata)
+                    break
+                }
+                case 'send':
+                    adapter?.send(m.message)
+                    break
+                case 'disconnect':
+                    adapter?.disconnect()
+                    break
+            }
+        } catch (e) {
+            logError(`[ws-server-thread] ${m?.type} failed: ${e instanceof Error ? e.stack ?? e.message : String(e)}`)
+        }
+    })
+}
+
+```
+
+## File: src/install/deploymentRecord.ts
+```typescript
+/**
+ * deploymentRecord.ts — content manifests for Engine installs (idea#322).
+ *
+ * A deployment record follows the idea repo's schema `idea-deployment-record/1`
+ * (koenswings/idea deployments/README.md, idea#323): a folder
+ * deployments/engines/<hostname>/<label>/ in the idea repo with a key=value
+ * record.txt plus sidecar lists, written by script/capture-engine-record.sh:
+ *
+ *   record.txt     key=value summary (schema keys + Engine keys)
+ *   packages.tsv   <package>\t<version>\t<arch>      (dpkg-query -W), sorted
+ *   images.tsv     <ref>\t<image id>\t<repo digests> (docker image inspect), sorted
+ *   files.sha256   sha256sum lines of the Engine's tracked files, sorted by path
+ *   dist.sha256    sha256sum lines of the compiled dist/, sorted by path
+ *   helpers.sha256 sha256sum lines of the root helpers /usr/local/sbin/idea-*, sorted by path
+ *
+ * Two records are "content-identical" when every non-volatile field and line is
+ * equal; byte-identical images are not required (Koen, idea#322).
+ */
+
+export const RECORD_FILES = ['record.txt', 'packages.tsv', 'images.tsv', 'files.sha256', 'dist.sha256', 'helpers.sha256'] as const
+export type RecordFile = typeof RECORD_FILES[number]
+
+/**
+ * Keys of record.txt that change on every capture or every install and are never compared.
+ * Built-in fallback; the shared list is idea tools/repro/volatile.txt (`key:<name>` lines),
+ * used instead when present (volatileKeys()).
+ */
+export const VOLATILE_KEYS = new Set([
+    'capturedUtc', 'hostname', 'stickerName', 'cardId', 'captureHost', 'uptime', 'recordLabel', 'notes',
+    'batch', 'deployedAt', 'evidence', 'confidence', 'open', 'packageArchive', 'secrets',
+    'packageArchiveSha256', 'packageArchiveUrl', 'packageArchiveParts', 'packageArchiveTarSha256',
+    'previousCardId', 'readBackSha256',
+    'buildOptions', 'buildSourceFlags',
+])
+
+/** Keys idea deployments/README.md (idea#323) marks required, as they apply to an Engine. */
+export const REQUIRED_KEYS = [
+    'schema', 'batch', 'deviceType', 'arch', 'model', 'osRelease',
+    'imageCommit', 'imageBranch', 'imageTag', 'imageVersion',
+    'packageArchive', 'packageArchiveSha256', 'packageArchiveUrl', 'secrets', 'deployedAt', 'evidence', 'confidence', 'open',
+] as const
+export const SCHEMA = 'idea-deployment-record/1'
+/** For image-only keys (imageFile, imageSha256, …) that do not apply: an Engine is built on the device. */
+export const NOT_APPLICABLE = 'n/a'
+
+/** Missing required keys and identity check; empty = valid. */
+export const validateRecord = (recordTxt: string): string[] => {
+    const kv = parseKeyValues(recordTxt)
+    const errs = REQUIRED_KEYS.filter(k => !kv.has(k)).map(k => `missing ${k}`)
+    if (kv.has('schema') && kv.get('schema') !== SCHEMA) errs.push(`schema is ${kv.get('schema')}`)
+    if (!kv.get('hostname') && !kv.get('stickerName') && !kv.get('cardId')) errs.push('missing hostname/stickerName/cardId')
+    if (kv.has('deviceType') && kv.get('deviceType') !== 'engine') errs.push(`deviceType is ${kv.get('deviceType')}, expected engine`)
+    return errs
+}
+
+/** Value used in retro records for a field that could not be recovered. */
+export const UNKNOWN = 'UNKNOWN'
+/** `UNKNOWN`, optionally followed by an explanation (same rule as idea compare-record.py). */
+export const isUnknown = (v: string | undefined): boolean => v !== undefined && v.split(' ')[0] === UNKNOWN
+
+export type Record = { [K in RecordFile]?: string }
+
+export const parseKeyValues = (text: string): Map<string, string> => {
+    const m = new Map<string, string>()
+    for (const raw of text.split('\n')) {
+        const line = raw.trim()
+        if (!line || line.startsWith('#')) continue
+        const i = line.indexOf('=')
+        if (i <= 0) continue
+        m.set(line.slice(0, i).trim(), line.slice(i + 1).trim())
+    }
+    return m
+}
+
+/** Replace `key=` lines in place, append the ones that are new. */
+export const setKeys = (recordTxt: string, lines: string[]): string => {
+    const out = recordTxt.replace(/\n*$/, '').split('\n')
+    for (const l of lines) {
+        const k = l.slice(0, l.indexOf('='))
+        const i = out.findIndex(o => o.startsWith(k + '='))
+        if (i >= 0) out[i] = l; else out.push(l)
+    }
+    return out.join('\n') + '\n'
+}
+
+/** Non-empty, non-comment lines, trimmed of trailing whitespace, sorted. */
+export const normaliseLines = (text: string): string[] =>
+    text.split('\n').map(l => l.replace(/\s+$/, '')).filter(l => l && !l.startsWith('#')).sort()
+
+/** `pkg\tver\tarch` lines from `dpkg-query -W -f '${Package}\t${Version}\t${Architecture}\n'`. */
+export const parseApt = (text: string): Map<string, string> => {
+    const m = new Map<string, string>()
+    for (const l of normaliseLines(text)) {
+        const [pkg, ver, arch] = l.split('\t')
+        if (pkg && ver !== undefined) m.set(arch ? `${pkg}:${arch}` : pkg, ver)
+    }
+    return m
+}
+
+/** `sha256  path` lines (sha256sum output) → path → sha256. */
+export const parseSha256 = (text: string): Map<string, string> => {
+    const m = new Map<string, string>()
+    for (const l of normaliseLines(text)) {
+        const match = /^([0-9a-f]{64})\s+\*?(.+)$/.exec(l)
+        if (match) m.set(match[2], match[1])
+    }
+    return m
+}
+
+export type Difference = { file: RecordFile, key: string, expected: string | undefined, actual: string | undefined }
+
+const diffMaps = (file: RecordFile, a: Map<string, string>, b: Map<string, string>, skip: (k: string) => boolean): Difference[] => {
+    const out: Difference[] = []
+    const keys = [...new Set([...a.keys(), ...b.keys()])].sort()
+    for (const k of keys) {
+        if (skip(k)) continue
+        const x = a.get(k), y = b.get(k)
+        if (isUnknown(x) || isUnknown(y)) continue
+        if (x !== y) out.push({ file, key: k, expected: x, actual: y })
+    }
+    return out
+}
+
+export type CompareOptions = {
+    /** Extra record.txt keys to ignore (on top of VOLATILE_KEYS). */
+    ignoreKeys?: string[]
+    /** Replaces VOLATILE_KEYS (e.g. volatileKeys(<idea tools/repro/volatile.txt>)). */
+    volatile?: Set<string>
+    /** Paths in files.sha256 / dist.sha256 to ignore (exact match or prefix ending in '/'). */
+    ignorePaths?: string[]
+}
+
+/**
+ * Compare a committed record (expected) with a fresh one (actual).
+ * A file missing on one side is only compared when it exists on both;
+ * the expected side decides which files matter. UNKNOWN values (retro records)
+ * never count as a difference.
+ */
+export const compareRecords = (expected: Record, actual: Record, opts: CompareOptions = {}): Difference[] => {
+    const ignoreKeys = new Set([...(opts.volatile ?? VOLATILE_KEYS), ...(opts.ignoreKeys ?? [])])
+    const ignorePaths = opts.ignorePaths ?? []
+    const pathIgnored = (p: string) => ignorePaths.some(ip => ip.endsWith('/') ? p.startsWith(ip) : p === ip)
+    const out: Difference[] = []
+    for (const f of RECORD_FILES) {
+        const e = expected[f], a = actual[f]
+        if (e === undefined) continue
+        if (a === undefined) { out.push({ file: f, key: '<file>', expected: 'present', actual: undefined }); continue }
+        if (f === 'record.txt') out.push(...diffMaps(f, parseKeyValues(e), parseKeyValues(a), k => ignoreKeys.has(k)))
+        else if (f === 'packages.tsv') out.push(...diffMaps(f, parseApt(e), parseApt(a), () => false))
+        else if (f === 'images.tsv') {
+            const toMap = (t: string) => new Map(normaliseLines(t).map(l => { const [ref, ...rest] = l.split('\t'); return [ref, rest.join('\t')] as [string, string] }))
+            out.push(...diffMaps(f, toMap(e), toMap(a), () => false))
+        } else out.push(...diffMaps(f, parseSha256(e), parseSha256(a), pathIgnored))
+    }
+    return out
+}
+
+export const formatDifferences = (d: Difference[]): string =>
+    d.length === 0 ? 'IDENTICAL (content)\n'
+        : d.map(x => `DIFF ${x.file} ${x.key}: expected=${x.expected ?? '<missing>'} actual=${x.actual ?? '<missing>'}`).join('\n') + `\n${d.length} difference(s)\n`
+
+/** Patterns that must never appear in a committed record (no secrets, idea#322). */
+export const SECRET_PATTERNS: RegExp[] = [
+    /tskey-[A-Za-z0-9-]+/,
+    /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
+    /^\s*(password|passwd|psk|wifi_psk|authkey|auth_key|token|secret)\s*=/im,
+    /ghp_[A-Za-z0-9]{20,}/,
+]
+
+/** Returns `file: pattern` for every secret-looking match; empty means clean. */
+export const findSecrets = (rec: Record): string[] => {
+    const hits: string[] = []
+    for (const f of RECORD_FILES) {
+        const t = rec[f]
+        if (!t) continue
+        for (const p of SECRET_PATTERNS) if (p.test(t)) hits.push(`${f}: ${p}`)
+    }
+    return hits
+}
+
+/** Engine release tags (idea#322, Steve 2026-10-26): engine-vYYYY.MM.DD[-N], created on main after Koen merges. */
+export const ENGINE_TAG_RE = /^engine-v\d{4}\.(0[1-9]|1[0-2])\.(0[1-9]|[12]\d|3[01])(-[1-9]\d*)?$/
+export const isEngineTag = (t: string) => ENGINE_TAG_RE.test(t)
+
+export type SourceState = { commit: string, tags: string[], dirty: boolean, onMain: boolean }
+export type SourceVerdict = { ok: boolean, tag: string | null, reasons: string[] }
+
+/**
+ * build-engine gate (idea#322 plan item 1): build only from a clean, tagged
+ * commit that is on main. With allowUntagged the build continues, but the
+ * reasons are printed and recorded in the deployment record (sourceVerdict).
+ */
+export const judgeSource = (s: SourceState, allowUntagged = false): SourceVerdict => {
+    const reasons: string[] = []
+    if (!/^[0-9a-f]{40}$/.test(s.commit)) reasons.push(`not a full commit id: ${s.commit}`)
+    const tags = s.tags.filter(isEngineTag)
+    if (tags.length === 0) reasons.push(s.tags.length ? `HEAD has no engine-vYYYY.MM.DD[-N] tag (has: ${s.tags.join(', ')})` : 'HEAD has no tag')
+    if (s.dirty) reasons.push('working tree has uncommitted changes')
+    if (!s.onMain) reasons.push('HEAD is not on origin/main')
+    const tag = tags.length ? [...tags].sort().reverse()[0] : null
+    return { ok: reasons.length === 0 || allowUntagged, tag, reasons }
+}
+
+/**
+ * Field/archive tags: field/<batch>/engine-<sha7> marks the commit a field batch was installed
+ * from (e.g. field/zimbabwe-2026-10/engine-adfd9d3). They are references, not build tags:
+ * judgeSource only accepts engine-vYYYY.MM.DD[-N].
+ */
+export const FIELD_TAG_RE = /^field\/[a-z0-9][a-z0-9-]*\/engine-[0-9a-f]{7}$/
+export const isFieldTag = (t: string): boolean => FIELD_TAG_RE.test(t)
+
+/** Record keys from idea tools/repro/volatile.txt: its `key:<name>` lines (path globs are for image manifests). */
+export const parseVolatileList = (text: string): string[] =>
+    text.split('\n').map(l => l.trim()).filter(l => l.startsWith('key:')).map(l => l.slice(4).trim()).filter(Boolean)
+
+/** Volatile keys: the shared list when given (and non-empty), else the built-in VOLATILE_KEYS. */
+export const volatileKeys = (sharedListText?: string): Set<string> => {
+    const shared = sharedListText === undefined ? [] : parseVolatileList(sharedListText)
+    return shared.length ? new Set(shared) : new Set(VOLATILE_KEYS)
+}
+
+/** Where the input archive for an Engine install lives (idea#322). */
+export const ARCHIVE_REPO = 'koenswings/agent-engine-dev'
+export const archiveReleaseUrl = (tag: string): string => `https://github.com/${ARCHIVE_REPO}/releases/tag/${tag}`
+
+export interface ArchiveRef {
+    /** Box path of the archive directory (has SHA256SUMS). */
+    boxPath?: string
+    /** sha256 of the archive's SHA256SUMS (published asset). */
+    sumsSha256?: string
+    /** Release tag the archive is published on, if any. */
+    releaseTag?: string | null
+}
+
+/** packageArchive / packageArchiveSha256 / packageArchiveUrl lines (idea deployments/README.md). */
+export const archiveKeys = (ref: ArchiveRef): string[] => [
+    `packageArchive=${ref.boxPath ?? UNKNOWN}`,
+    `packageArchiveSha256=${ref.sumsSha256 ?? UNKNOWN}`,
+    `packageArchiveUrl=${ref.releaseTag ? archiveReleaseUrl(ref.releaseTag) : 'not published yet'}`,
+]
+
+```
+
+## File: src/install/stickerName.ts
+```typescript
+import { chalk } from 'zx'
+import { Hostname } from '../data/CommonTypes.js'
+import { print } from '../utils/utils.js'
+import { isStickerName, normaliseName, pickUniqueName, Rand } from '../utils/nameGenerator.js'
+
+/**
+ * Install-time sticker name resolution (idea#184).
+ *
+ * Order:
+ *  1. An explicit --hostname is used as given (existing idea01-04 keep their
+ *     names; operators may re-use a sticker name on a re-install).
+ *  2. A name persisted by an earlier run (/etc/idea/sticker-name) is kept, so
+ *     re-running the installer or --personalize never renames a stickered Pi.
+ *  3. Otherwise a new two-word name is generated that is not taken on the LAN
+ *     (mDNS), nor in the network database (engineDB hostnames of the store),
+ *     nor on the tailnet when tailscale is installed and online (read-only
+ *     `tailscale status --json`; no central registry).
+ */
+export const STICKER_NAME_FILE = '/etc/idea/sticker-name'
+
+export interface StickerNameDeps {
+    readPersisted: () => Promise<string | null>
+    persist: (name: string) => Promise<void>
+    /** Hostnames of every Engine in the network database (may be empty if unreachable). */
+    storeNames: () => Promise<{ names: string[], checked: boolean }>
+    /** True when `<name>.local` already answers on the LAN. */
+    lanTaken: (name: string) => Promise<boolean>
+    /** Hostnames on the tailnet; checked=false when tailscale is absent or not online. */
+    tailnetNames?: () => Promise<{ names: string[], checked: boolean }>
+    rand?: Rand
+    log?: (msg: string) => void
+}
+
+export interface StickerNameResult {
+    name: Hostname
+    source: 'explicit' | 'persisted' | 'generated'
+    storeChecked: boolean
+    tailnetChecked: boolean
+}
+
+export const resolveStickerName = async (explicit: string | undefined, deps: StickerNameDeps, maxLanTries = 20): Promise<StickerNameResult> => {
+    const log = deps.log ?? (() => {})
+    if (explicit) {
+        const n = normaliseName(explicit)
+        if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(n)) throw new Error(`bad hostname '${explicit}'`)
+        await deps.persist(n)
+        return { name: n as Hostname, source: 'explicit', storeChecked: false, tailnetChecked: false }
+    }
+    const persisted = await deps.readPersisted()
+    if (persisted && isStickerName(normaliseName(persisted))) {
+        return { name: normaliseName(persisted) as Hostname, source: 'persisted', storeChecked: false, tailnetChecked: false }
+    }
+    const { names, checked } = await deps.storeNames()
+    if (!checked) log('WARNING: network database not reachable; name checked against the LAN only')
+    const tailnet = deps.tailnetNames ? await deps.tailnetNames() : { names: [], checked: false }
+    if (tailnet.checked) log(`checking the name against ${tailnet.names.length} tailnet name(s)`)
+    const taken = new Set([...names, ...tailnet.names].map(normaliseName))
+    for (let i = 0; i < maxLanTries; i++) {
+        const candidate = pickUniqueName(taken, deps.rand)
+        if (await deps.lanTaken(candidate)) {
+            log(`${candidate}.local is already on the LAN; picking another name`)
+            taken.add(candidate)
+            continue
+        }
+        await deps.persist(candidate)
+        return { name: candidate, source: 'generated', storeChecked: checked, tailnetChecked: tailnet.checked }
+    }
+    throw new Error(`no free sticker name after ${maxLanTries} LAN checks`)
+}
+
+/** Unique hostnames in a store document's engineDB. */
+export const engineHostnames = (doc: { engineDB?: Record<string, { hostname?: string }> } | undefined): string[] =>
+    [...new Set(Object.values(doc?.engineDB ?? {}).map((e) => e?.hostname).filter((h): h is string => !!h))]
+
+/** Text for the sticker, printed at the end of the install and saved next to it. */
+export const stickerText = (name: string, consolePort: number): string => {
+    const url = `http://${name}.local${consolePort === 80 ? '' : `:${consolePort}`}`
+    return [
+        '+------------------------------------------+',
+        `  STICKER NAME:  ${name}`,
+        `  Console:       ${url}`,
+        '+------------------------------------------+',
+    ].join('\n')
+}
+
+// ---------------------------------------------------------------------------
+// Real dependencies (Pi). `exec` is zx `$` locally or the ssh wrapper remotely.
+// ---------------------------------------------------------------------------
+
+/** tailscale and avahi tools live in /usr/sbin and /usr/bin; a non-login ssh PATH may lack /usr/sbin. */
+const TOOL_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+export interface RealDepsOpts {
+    peers?: string[]
+    log?: (m: string) => void
+    /** Where the chosen name is kept (default /etc/idea/sticker-name). A non-default
+     *  path is written without sudo (used by script/sticker-name.ts --no-rename). */
+    stickerFile?: string
+}
+
+export const realStickerNameDeps = (exec: any, opts: RealDepsOpts = {}): StickerNameDeps => {
+    const file = opts.stickerFile ?? STICKER_NAME_FILE
+    const log = opts.log ?? ((m: string) => print(chalk.yellow(m)))
+    let avahiWarned = false
+    return {
+    log,
+    readPersisted: async () => {
+        try { return (await exec`cat ${file} 2>/dev/null || true`).stdout.trim() || null } catch { return null }
+    },
+    persist: async (name) => {
+        if (file === STICKER_NAME_FILE) await exec`sudo mkdir -p /etc/idea && echo ${name} | sudo tee ${file} > /dev/null`
+        else await exec`mkdir -p "$(dirname ${file})" && echo ${name} > ${file}`
+    },
+    lanTaken: async (name) => {
+        try {
+            const r = await exec`PATH=${TOOL_PATH}; if command -v avahi-resolve-host-name >/dev/null 2>&1; then timeout 5 avahi-resolve-host-name -4 ${name + '.local'} 2>/dev/null || true; else echo NO-AVAHI-UTILS; fi`
+            const out = r.stdout.trim()
+            if (out === 'NO-AVAHI-UTILS') {
+                if (!avahiWarned) log('WARNING: avahi-resolve-host-name missing (apt install avahi-utils); name NOT checked on the LAN')
+                avahiWarned = true
+                return false
+            }
+            return out.length > 0
+        } catch { return false }
+    },
+    storeNames: async () => storeNamesFromPeers(opts.peers ?? await lanEnginePeers(exec)),
+    tailnetNames: async () => {
+        try {
+            const r = await exec`PATH=${TOOL_PATH}; command -v tailscale >/dev/null 2>&1 && timeout 10 tailscale status --json 2>/dev/null || true`
+            return parseTailscaleStatusNames(r.stdout)
+        } catch { return { names: [], checked: false } }
+    },
+    }
+}
+
+/**
+ * Hostnames from `tailscale status --json` (read-only). Only counts when the
+ * node is online (BackendState "Running"); otherwise checked=false. Takes both
+ * the OS HostName and the MagicDNS label (first part of DNSName) of self and peers.
+ */
+export const parseTailscaleStatusNames = (out: string): { names: string[], checked: boolean } => {
+    let j: any
+    try { j = JSON.parse(out) } catch { return { names: [], checked: false } }
+    if (!j || j.BackendState !== 'Running') return { names: [], checked: false }
+    const names = new Set<string>()
+    const add = (n: any) => {
+        if (!n) return
+        if (typeof n.HostName === 'string' && n.HostName) names.add(normaliseName(n.HostName))
+        if (typeof n.DNSName === 'string' && n.DNSName) {
+            const label = n.DNSName.split('.')[0]
+            if (label) names.add(normaliseName(label))
+        }
+    }
+    add(j.Self)
+    for (const p of Object.values(j.Peer ?? {})) add(p)
+    return { names: [...names], checked: true }
+}
+
+/** Hostnames of Engines advertising on the LAN (ciao service, TXT name=...). */
+export const lanEnginePeers = async (exec: any): Promise<string[]> => {
+    try {
+        const r = await exec`PATH=${TOOL_PATH}; timeout 6 avahi-browse -atrp 2>/dev/null || true`
+        return parseAvahiEngineNames(r.stdout)
+    } catch { return [] }
+}
+
+/** Engine names from `avahi-browse -atrp` output: resolved (=) lines with a TXT "name=" and "id=". */
+export const parseAvahiEngineNames = (out: string): string[] => {
+    const names = new Set<string>()
+    for (const line of out.split('\n')) {
+        if (!line.startsWith('=')) continue
+        if (!line.includes('"id=')) continue
+        const m = line.match(/"name=([^"]+)"/)
+        if (m) names.add(normaliseName(m[1]))
+    }
+    return [...names]
+}
+
+/** Read engineDB hostnames from the first peer that serves its store. */
+/** Console ports to try on a peer: an Engine serves /api/store-url on its httpPort,
+ *  which is 80 on a default install but often 8080 on the pool. */
+export const STORE_PORTS = [80, 8080]
+
+export const storeNamesFromPeers = async (peers: string[], ports: number[] = STORE_PORTS): Promise<{ names: string[], checked: boolean }> => {
+    const { createClientStore } = await import('../data/Store.js')
+    for (const peer of peers) for (const port of ports) {
+        const host = peer.endsWith('.local') ? peer : `${peer}.local`
+        try {
+            const res = await fetch(`http://${host}${port === 80 ? '' : `:${port}`}/api/store-url`, { signal: AbortSignal.timeout(5000) })
+            if (!res.ok) continue
+            const url = (await res.json())?.url as string | undefined
+            if (!url?.startsWith('automerge:')) continue
+            const conn = createClientStore([host], `installer-${process.pid}` as any, url.replace('automerge:', '') as any, 15)
+            const { handle, repo } = await Promise.race([conn, new Promise<never>((_, rej) => setTimeout(() => rej(new Error('timeout')), 20_000))])
+            const doc = await Promise.resolve(handle.doc()) as any
+            const names = engineHostnames(doc)
+            try { await repo.shutdown() } catch { /* ignore */ }
+            return { names: [...names, ...peers], checked: true }
+        } catch { /* try next peer */ }
+    }
+    return { names: peers, checked: false }
+}
+
+export const writeStickerFile = async (exec: any, text: string, path = '/home/pi/STICKER.txt') => {
+    try { await exec`echo ${text} > ${path}` } catch { /* best effort */ }
+}
+
+```
+
 ## File: src/monitors/backupMonitor.ts
 ```typescript
 /**
@@ -623,19 +1678,29 @@ runner.run(function(failures) {
  *  - BorgBackup for deduplicating, atomic, resumable archives
  *  - activeBackups Set prevents double-backup on reboot race
  *  - Lock file (.backup-in-progress) enables boot-resume after interrupted backup
- *  - testMode: skips borg commands but exercises all other logic (store updates, YAML, lock files)
+ *  - skipBorg() (settings.skipBorg / IDEA_SKIP_BORG, default testMode): skips borg commands but
+ *    exercises all other logic (store updates, YAML, lock files)
+ *  - Borg runs as root through the app-data helper (idea#168):
+ *    `sudo -n /usr/local/sbin/idea-app-data borg-init|borg-info|borg-create|borg-extract`,
+ *    so it can read instance data written by root/999/www-data and restores owners
+ *    (--numeric-ids). Repositories become root-owned; the repo folder and the
+ *    .backup-in-progress lock file stay the Engine's (pi).
  */
 
 import { $, YAML, chalk, fs } from 'zx'
 import { log, print } from '../utils/utils.js'
-import { config, disksRoot } from '../data/Config.js'
-import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot } from '../data/Disk.js'
+import { disksRoot, skipBorg } from '../data/Config.js'
+import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot, appDataRoot } from '../data/Disk.js'
+import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgProblem } from '../utils/appDataHelper.js'
 import { indexBackupDiskApps } from '../data/InstallApp.js'
+import { ensureAppFilesOnTarget } from '../data/RestoreAppFiles.js'
+import { localEngineId } from '../data/Engine.js'
+import { assertPreQuarantineHelper, quarantinePreRestore } from '../data/RestorePreQuarantine.js'
 import { createOperation, updateOperation } from '../data/Operations.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
 import { stopInstance, startInstance, BACKUP_STEPS } from '../data/Instance.js'
 import { BackupMode, DiskID, DiskName, InstanceID, Timestamp, OperationCause, Operation } from '../data/CommonTypes.js'
-import { Store, getInstance, getDisks, findDiskByName } from '../data/Store.js'
+import { Store, getInstance, getDisks, findDiskByName, getLocalEngine } from '../data/Store.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js'
 import { runWithTrace, flushTrace, getActiveTrace } from '../utils/CommandLogger.js'
@@ -707,6 +1772,9 @@ export const backupInstance = async (
     }
 
     if (activeBackups.has(instanceId)) {
+        // A console backupApp refusal must fail its trace (idea#168 r29@97); a duplicate
+        // automatic trigger stays a quiet skip.
+        if (cause === 'console-command') throw new Error(`Backup for ${instanceId} already in progress — not started again`)
         log(`Backup for ${instanceId} already in progress — skipping duplicate trigger`)
         return
     }
@@ -769,16 +1837,22 @@ export const backupInstance = async (
 
         log(`Starting backup of instance ${instanceId} from ${appDevice} to ${backupDevice}`)
 
+        // 0. Preflight: no borg means exit 127 from the helper; say so plainly instead
+        if (!skipBorg()) {
+            const borgMissing = borgProblem()
+            if (borgMissing) throw new Error(borgMissing)
+        }
+
         // 1. Init Borg repo if this is the first backup
         setBackupStep(0, BACKUP_STEPS[0])
         const repoExists = await fs.pathExists(`${repoPath}/config`)
         if (!repoExists) {
             log(`Initialising Borg repo at ${repoPath}`)
             await fs.ensureDir(repoPath)
-            if (!config.settings.testMode) {
-                await $`borg init --encryption=none ${repoPath}`
+            if (!skipBorg()) {
+                await runAppData(borgInitArgs(backupDevice, instanceId))
             } else {
-                log(`testMode: skipping borg init`)
+                log(`skipBorg: skipping borg init`)
             }
         }
 
@@ -796,11 +1870,11 @@ export const backupInstance = async (
         // 4. Run borg create
         setBackupStep(2, BACKUP_STEPS[2])
         const archiveName = new Date().toISOString().replace(/[:.]/g, '-')
-        if (!config.settings.testMode) {
+        if (!skipBorg()) {
             log(`Running borg create for instance ${instanceId}`)
-            await $`borg create ${repoPath}::${archiveName} ${await diskMountRoot(appDisk)}/instances/${instanceId}`
+            await runAppData(borgCreateArgs(backupDevice, instanceId, archiveName, await appDataRoot(appDisk as Disk)))
         } else {
-            log(`testMode: skipping borg create for instance ${instanceId}`)
+            log(`skipBorg: skipping borg create for instance ${instanceId}`)
         }
 
         // 5. Restart instance if it was running
@@ -1024,6 +2098,51 @@ export const checkPendingBackups = async (
     }
 }
 
+// ── borg archive selection (idea#168) ─────────────────────────────────────────
+
+/**
+ * The newest archive of a repo and how to extract it into <mount root>/instances/.
+ *
+ * Archives are named by ISO timestamp (backupInstance), and borg 1.x has no
+ * `latest` alias: `borg extract <repo>::latest` fails with "Archive latest does
+ * not exist". So the newest archive is picked explicitly (`borg info --last 1`,
+ * sorted by archive time).
+ *
+ * borg stores the backed-up path without its leading '/', e.g.
+ * `disks/sda1/instances/<id>/...`, so the archive's own command line gives the
+ * prefix to strip: everything before `<id>`, so the files land in
+ * instances/<id>/ whatever the source disk's mount root was.
+ */
+export const latestArchiveFromInfo = (infoJson: string, instanceId: string): { name: string, stripComponents: number } => {
+    const archive = JSON.parse(infoJson)?.archives?.[0]
+    if (!archive?.name) throw new Error('No backup archives found in the repository')
+    const suffix = `instances/${instanceId}`
+    const source = (archive.command_line as string[] | undefined ?? [])
+        .map(a => a.replace(/^\/+/, '').replace(/\/+$/, ''))
+        .find(a => a === suffix || a.endsWith(`/${suffix}`))
+    if (!source) throw new Error(`Archive ${archive.name} does not contain instances/${instanceId}`)
+    return { name: archive.name, stripComponents: source.split('/').length - 1 }
+}
+
+/**
+ * Extract the newest archive of the instance's repo on the Backup Disk so the
+ * instance lands in <target mount root>/instances/<instanceId>, as root through the
+ * app-data helper: `borg-info` (JSON), then `borg-extract`, which extracts into a
+ * fresh staging folder on the target disk, checks that only <instanceId> came out
+ * and moves it into place (replacing a previous folder of that instance).
+ * Roots are app-data helper root tokens. The runner is injectable for tests.
+ */
+export const extractLatestArchive = async (backupRoot: string, instanceId: string, targetRoot: string, run: AppDataRunner = runAppData): Promise<string> => {
+    if (run === runAppData) {
+        const borgMissing = borgProblem()
+        if (borgMissing) throw new Error(borgMissing)
+    }
+    const { name, stripComponents } = latestArchiveFromInfo(await run(borgInfoArgs(backupRoot, instanceId)), instanceId)
+    log(`Extracting archive ${name} (--strip-components ${stripComponents}) onto ${targetRoot} instances/${instanceId}`)
+    await run(borgExtractArgs(backupRoot, instanceId, name, stripComponents, targetRoot))
+    return name
+}
+
 // ── restoreApp ────────────────────────────────────────────────────────────────
 
 /**
@@ -1039,9 +2158,9 @@ export const restoreApp = async (
 ): Promise<void> => {
     // Acquire lock: instance + target disk
     const restoreLockKeys = [instanceKey(instanceId), diskKey(targetDisk.id)]
+    // Refusals and failures throw (idea#168 r29@97), so the restoreApp command trace ends as error.
     if (!resourceLock.acquireAll(restoreLockKeys, 'restoreApp')) {
-        console.error(chalk.red(`restoreApp: resource locked — another operation is already running on instance or target disk. Retry when it completes.`))
-        return
+        throw new Error(`restoreApp: resource locked — another operation is already running on instance or target disk. Retry when it completes.`)
     }
 
     const opId = existingOpId ?? createOperation(storeHandle, 'restoreApp', {
@@ -1075,6 +2194,9 @@ export const restoreApp = async (
             throw new Error(`Target disk ${targetDisk.id} is not docked`)
         }
 
+        // #190: restoring to another disk quarantines the old folder afterwards (helper v4)
+        const prevDisk = await assertPreQuarantineHelper(store, instanceId, targetDisk, String(localEngineId))
+
         const repoPath = backupDir(backupDevice, instanceId)
         const instancesDir = `${await diskMountRoot(targetDisk)}/instances`
 
@@ -1087,15 +2209,25 @@ export const restoreApp = async (
 
         await fs.ensureDir(instancesDir)
 
-        if (!config.settings.testMode) {
-            log(`Restoring instance ${instanceId} from ${backupDevice} to ${targetDevice}`)
-            await $`bash -c ${'cd ' + instancesDir + ' && borg extract ' + repoPath + '::latest'}`
+        if (!skipBorg()) {
+            log(`Restoring instance ${instanceId} from ${backupDevice} to ${targetDevice} (repo ${repoPath})`)
+            await extractLatestArchive(backupDevice, instanceId, await appDataRoot(targetDisk))
         } else {
-            log(`testMode: skipping borg extract for instance ${instanceId}`)
+            log(`skipBorg: skipping borg extract for instance ${instanceId}`)
+        }
+
+        // #189: restored onto another disk → bring the app master and service tars along
+        if (instance) {
+            const now = storeHandle.doc()
+            const prev = instance.storedOn ? now.diskDB[instance.storedOn] : undefined
+            const local = Object.values(now.diskDB).filter(d => d.device != null && String(d.dockedTo) === String(getLocalEngine(now)?.id)) as Disk[]
+            const candidates = [...(prev ? [prev as Disk] : []), ...local.filter(d => String(d.id) !== String(prev?.id))]
+            await ensureAppFilesOnTarget(String(instance.instanceOf), (instance.serviceImages ?? []).map(String), targetDisk, candidates)
         }
 
         const { processInstance } = await import('../data/Disk.js')
         await processInstance(storeHandle, targetDisk, instanceId)
+        await quarantinePreRestore(storeHandle.doc(), instanceId, targetDisk, prevDisk)
 
         updateOperation(storeHandle, opId, {
             status: 'Done',
@@ -1111,6 +2243,7 @@ export const restoreApp = async (
             completedAt: Date.now() as Timestamp,
         })
         log(chalk.red(`Restore of instance ${instanceId} failed: ${e.message ?? e}`))
+        throw e
     } finally {
         resourceLock.releaseAll(restoreLockKeys)
     }
@@ -1128,10 +2261,7 @@ export const createBackupDiskConfig = async (
     mode: BackupMode,
     instanceIds: InstanceID[]
 ): Promise<void> => {
-    if (!disk.device) {
-        log(chalk.red(`createBackupDiskConfig: disk ${disk.id} is not docked`))
-        return
-    }
+    if (!disk.device) throw new Error(`createBackupDiskConfig: disk ${disk.id} is not docked`)
 
     const yaml: BackupYaml = {
         mode,
@@ -1147,6 +2277,92 @@ export const createBackupDiskConfig = async (
 
 ```
 
+## File: src/monitors/deviceNames.ts
+```typescript
+/**
+ * deviceNames.ts — which block device names the USB device monitor handles
+ * (agent-engine-dev#228).
+ *
+ * The udev rule (90-docking.rules) links only sd?, sd?1 and sd?2 into
+ * /dev/engine, so USB App Disks are always sd*. The Pi's own system disk is
+ * not always sd*: a Pi 5 booting from NVMe has its root on nvme0n1p2 and an
+ * SD-booted Pi on mmcblk0p2. Those names must be accepted too, or the system
+ * disk is never registered and installApp has no disk to target.
+ */
+
+import { RULE_DEVICE_PATTERN } from './diskDetection.js'
+
+/**
+ * Pretend disks created by the test harness use names that real hardware never
+ * produces (e.g. `idea-test-1`). Only an Engine in testMode accepts them.
+ */
+export const TEST_DEVICE_PATTERN = /^idea-test-[0-9]+$/
+export const isTestDeviceName = (device: string | undefined | null): boolean =>
+    !!device && TEST_DEVICE_PATTERN.test(device)
+
+/** USB partitions handled since the start: sda1, sdb2 (the udev rule's sd?1|sd?2). */
+export const SD_PARTITION_PATTERN = /^sd[a-z][1-2]$/
+/** USB whole disks (sda): listed as unformatted candidates, never mounted. */
+export const SD_WHOLE_DISK_PATTERN = /^sd[a-z]$/
+/** NVMe partitions (nvme0n1p2). Whole NVMe disks (nvme0n1) are not accepted. */
+export const NVME_PARTITION_PATTERN = /^nvme\d+n\d+p\d+$/
+/** SD card / eMMC partitions (mmcblk0p2). Whole disks (mmcblk0) and mmcblk0boot0 are not accepted. */
+export const MMCBLK_PARTITION_PATTERN = /^mmcblk\d+p\d+$/
+
+export interface ValidDeviceContext {
+    /** The detected root partition (findmnt -n -o SOURCE /), e.g. nvme0n1p2; null when unknown. */
+    systemDevice?: string | null
+    testMode?: boolean
+}
+
+/**
+ * True when the monitor handles this device name: the existing sd* forms,
+ * NVMe and mmcblk partitions, the detected root device itself, and idea-test-N
+ * in testMode only (idea#105). Everything else (loop0, zram0, dm-0, whole
+ * nvme0n1 / mmcblk0, ...) is ignored.
+ */
+export const isValidDeviceName = (device: string | undefined | null, ctx: ValidDeviceContext = {}): boolean => {
+    if (!device) return false
+    // A live Engine (testMode off) ignores pretend disks, so a pretend disk can
+    // never be picked up and mounted by a live Engine (idea#105).
+    if (isTestDeviceName(device)) return !!ctx.testMode
+    if (ctx.systemDevice && device === ctx.systemDevice) return true
+    return SD_PARTITION_PATTERN.test(device)
+        || SD_WHOLE_DISK_PATTERN.test(device)
+        || NVME_PARTITION_PATTERN.test(device)
+        || MMCBLK_PARTITION_PATTERN.test(device)
+}
+
+/** Whole sd disk entry (sda): never mounted, only listed (idea#134, idea#193 §3.2). */
+export const isSdWholeDisk = (device: string | undefined | null): boolean =>
+    !!device && SD_WHOLE_DISK_PATTERN.test(device)
+
+/**
+ * Partition `n` of a whole drive: sda + 1 → sda1, nvme0n1 + 1 → nvme0n1p1,
+ * mmcblk0 + 1 → mmcblk0p1 (the kernel adds a `p` when the drive name ends in a
+ * digit).
+ */
+export const partitionName = (drive: string, n: number): string =>
+    /\d$/.test(drive) ? `${drive}p${n}` : `${drive}${n}`
+
+/** True when the udev rule links this device into /dev/engine (sd?, sd?1, sd?2). */
+export const udevLinksDevice = (device: string): boolean => RULE_DEVICE_PATTERN.test(device)
+
+/**
+ * agent-engine-dev#228: the root device gets no /dev/engine link when its name
+ * is outside the udev rule (nvme0n1p2, mmcblk0p2), so the watcher never reports
+ * it. The monitor then registers it directly at start. Not when the system disk
+ * is skipped (IDEA_SYSTEM_DISK_SKIP, tests), when there is no block root
+ * (containers), or when the watch folder already holds a link for it.
+ */
+export const needsDirectSystemAdd = (
+    systemDevice: string | null | undefined,
+    opts: { systemDiskSkip: boolean, linkExists: boolean },
+): boolean =>
+    !!systemDevice && !opts.systemDiskSkip && !opts.linkExists && !udevLinksDevice(systemDevice)
+
+```
+
 ## File: src/monitors/diskDetection.ts
 ```typescript
 /**
@@ -1155,9 +2371,11 @@ export const createBackupDiskConfig = async (
  * Makes USB disk detection failures visible (idea#82).
  *
  * Disk detection depends on the udev rule 90-docking.rules, which creates the
- * /dev/engine/<device> links the USB device monitor watches. tmpfiles.d always
- * creates /dev/engine, so a missing rule leaves an empty folder and docking
- * silently does nothing. boot.sh reinstalls the rule on every boot when it is
+ * /dev/engine/<device> links the USB device monitor watches. tmpfiles.d
+ * (idea-engine.conf, build-engine installUdev) should create /dev/engine at boot,
+ * so a missing rule leaves an empty folder and docking silently does nothing.
+ * Without that entry udev creates the folder only with the first sd* link; the
+ * monitor copes with a missing folder (agent-engine-dev#228). boot.sh reinstalls the rule on every boot when it is
  * missing or differs from the shipped asset (self-repair). This module:
  *
  *   - runs a startup self-check that reports what the self-repair could not fix
@@ -1235,7 +2453,7 @@ export const defaultDiskDetectionPaths = (): DiskDetectionPaths => ({
  * Check the udev setup disk detection relies on. Returns the problems found
  * (empty when everything is in place):
  *   - the udev rule file exists (and matches the shipped asset, when present)
- *   - the watch folder (/dev/engine) exists
+ *   - the watch folder (/dev/engine) exists when there is an sd* device to link
  *   - every sd* device covered by the rule has a matching /dev/engine/<name> entry
  */
 export const checkDiskDetection = (paths: DiskDetectionPaths): string[] => {
@@ -1249,16 +2467,19 @@ export const checkDiskDetection = (paths: DiskDetectionPaths): string[] => {
         if (installed !== shipped) problems.push(`udev rule ${paths.rulePath} differs from ${paths.ruleAsset}`)
     }
 
-    if (!fs.existsSync(paths.watchDir)) {
-        problems.push(`${paths.watchDir} does not exist`)
-        return problems
-    }
-
     let devices: string[] = []
     try {
         devices = fs.readdirSync(paths.sysBlockDir).filter(d => RULE_DEVICE_PATTERN.test(d))
     } catch (e) {
         problems.push(`cannot list ${paths.sysBlockDir}: ${errorMessage(e)}`)
+    }
+
+    // udev creates the watch folder with the first sd* link, so without any sd*
+    // device (NVMe/SD-root Pi, no USB disk) a missing folder is normal; the USB
+    // device monitor attaches once it appears (agent-engine-dev#228).
+    if (!fs.existsSync(paths.watchDir)) {
+        if (devices.length > 0) problems.push(`${paths.watchDir} does not exist`)
+        return problems
     }
     const present = new Set(fs.readdirSync(paths.watchDir))
     const missing = devices.filter(d => !present.has(d)).sort()
@@ -1326,20 +2547,23 @@ export const runDiskDetectionSelfCheck = async (opts: SelfCheckOptions = {}): Pr
  *
  * Polls `docker stats --no-stream --format json` every POLL_INTERVAL_MS for
  * all containers belonging to Running instances on the local engine, then
- * writes parsed metrics to instance.metrics in the Automerge store.
+ * broadcasts them as an ephemeral 'idea/metrics' message on the store handle
+ * (never stored; store design 2026-10-13). Stored instance.metrics left by
+ * older Engines is cleared once.
  *
- * When an instance stops running (status !== 'Running'), metrics is set to null.
- *
- * The Console reads instance.metrics and formats the raw numbers itself.
+ * The Console (src/store/live.ts) keeps the latest message per Engine and
+ * formats the raw numbers itself.
  */
 
 import { $ } from 'zx'
 import { log } from '../utils/utils.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Store, getLocalEngine, getInstancesOfEngine } from '../data/Store.js'
+import { METRICS_TYPE } from '../data/Liveness.js'
 import { DockerMetrics } from '../data/CommonTypes.js'
 import { localEngineId } from '../data/Engine.js'
-import { config } from '../data/Config.js'
+import { dockerAvailable } from '../utils/dockerAvailable.js'
+import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
 
 $.verbose = false
 
@@ -1433,18 +2657,21 @@ const parseStatsLine = (line: string): { name: string; metrics: DockerMetrics } 
 
 const collectMetrics = async (
     instanceIds: string[]
-): Promise<Map<string, DockerMetrics>> => {
+): Promise<{ metrics: Map<string, DockerMetrics>, runningContainers: string[] | null }> => {
     // docker stats container names follow the pattern: <instanceId>-<service>-1
     // We filter containers by name prefix matching any of the instance IDs.
     const result = new Map<string, DockerMetrics>()
-    if (instanceIds.length === 0) return result
+    // null = docker ps did not answer: never conclude anything about container state
+    let runningContainers: string[] | null = null
+    if (instanceIds.length === 0) return { metrics: result, runningContainers: [] }
 
     try {
         // docker stats does not support --filter; resolve container names via docker ps first
         const filterArgs = instanceIds.flatMap(id => ['--filter', `name=${id}`])
         const psProc = await $`docker ps --format {{.Names}} ${filterArgs}`
         const containerNames = psProc.stdout.split('\n').map(l => l.trim()).filter(Boolean)
-        if (containerNames.length === 0) return result
+        runningContainers = containerNames
+        if (containerNames.length === 0) return { metrics: result, runningContainers }
         const proc = await $`docker stats --no-stream --format json ${containerNames}`
         const lines = proc.stdout.split('\n').filter(l => l.trim())
 
@@ -1473,13 +2700,57 @@ const collectMetrics = async (
         log(`[dockerMetrics] docker stats error: ${e.message ?? e}`)
     }
 
-    return result
+    return { metrics: result, runningContainers }
+}
+
+// ── Containers stopped outside the Engine ─────────────────────────────────────
+// A `docker compose stop` (or a crash) done outside the Engine leaves the store at
+// Running. Each poll already lists the running containers of Running instances, so
+// a Running instance with no running container on EXTERNAL_STOP_MISSES consecutive
+// polls is set to Docked: present, not running, NOT an operator stop (Stopped stays
+// reserved for stops through the Engine), so auto-start rules that act on
+// Docked/Error apply again. Skipped while the Engine holds the instance's lock
+// (its own start/stop/remount) and within EXTERNAL_STOP_GRACE_MS of lastStarted.
+
+export const EXTERNAL_STOP_MISSES = 2
+export const EXTERNAL_STOP_GRACE_MS = 60_000
+const externalStopMisses = new Map<string, number>()
+/** Tests only. */
+export const resetExternalStopTrackingForTests = (): void => { externalStopMisses.clear() }
+
+/** Instance ids to mark Docked now; updates the miss counters. */
+export const detectExternalStops = (
+    instances: { id: string, status: string, lastStarted?: number | null }[],
+    runningContainers: string[] | null,
+    isLocked: (instanceId: string) => boolean,
+    now: number = Date.now(),
+): string[] => {
+    if (runningContainers === null) return []
+    const stopped: string[] = []
+    const seen = new Set<string>()
+    for (const inst of instances) {
+        if (inst.status !== 'Running') continue
+        seen.add(inst.id)
+        const hasContainer = runningContainers.some(n => n.startsWith(inst.id))
+        if (hasContainer || isLocked(inst.id) || now - (inst.lastStarted ?? 0) < EXTERNAL_STOP_GRACE_MS) {
+            externalStopMisses.delete(inst.id)
+            continue
+        }
+        const misses = (externalStopMisses.get(inst.id) ?? 0) + 1
+        externalStopMisses.set(inst.id, misses)
+        if (misses >= EXTERNAL_STOP_MISSES) {
+            externalStopMisses.delete(inst.id)
+            stopped.push(inst.id)
+        }
+    }
+    for (const id of [...externalStopMisses.keys()]) if (!seen.has(id)) externalStopMisses.delete(id)
+    return stopped
 }
 
 // ── Main monitor loop ─────────────────────────────────────────────────────────
 
-const poll = async (storeHandle: DocHandle<Store>): Promise<void> => {
-    if (config.settings.testMode) return  // no Docker in test mode
+export const pollDockerMetricsOnce = async (storeHandle: DocHandle<Store>): Promise<void> => {
+    if (!(await dockerAvailable())) return  // no Docker daemon (was: testMode; idea#168)
 
     const store = storeHandle.doc()
     const localEngine = getLocalEngine(store)
@@ -1490,36 +2761,50 @@ const poll = async (storeHandle: DocHandle<Store>): Promise<void> => {
     const runningIds = runningInstances.map(i => i.id as string)
 
     // Collect live metrics for running containers
-    const metricsMap = await collectMetrics(runningIds)
+    const { metrics: metricsMap, runningContainers } = await collectMetrics(runningIds)
+    const externallyStopped = new Set(detectExternalStops(
+        runningInstances as any, runningContainers, id => resourceLock.isLocked(instanceKey(id))))
 
-    // Write back to store — one change() call covers all instances
-    storeHandle.change(doc => {
-        for (const inst of allInstances) {
+    // Store design 2026-10-13: metrics are NOT written into the store doc any more
+    // (9.8k changes/day kept forever). They go out as an ephemeral message that the
+    // Engines relay to every peer of the store doc, so a Console on any Pi shows the
+    // latest metrics of every Pi (agent-console-dev src/store/live.ts).
+    const instances: Record<string, DockerMetrics> = {}
+    for (const [id, m] of metricsMap) instances[id] = m
+    storeHandle.broadcast(metricsMessage(String(localEngine.id), Date.now(), instances))
+
+    // One-time cleanup: stored metrics left by older Engines are cleared (only
+    // writes when something is still there). An instance stopped outside the
+    // Engine (#208: no container on EXTERNAL_STOP_MISSES polls) goes Running → Docked.
+    const doc0 = storeHandle.doc() as any
+    const leftovers = allInstances.filter(i => doc0?.instanceDB?.[i.id as any]?.metrics != null)
+    const stopped = allInstances.filter(i => externallyStopped.has(i.id as string) && doc0?.instanceDB?.[i.id as any]?.status === 'Running')
+    if (leftovers.length || stopped.length) storeHandle.change(doc => {
+        for (const inst of stopped) {
             const instanceInDoc = doc.instanceDB[inst.id as any]
-            if (!instanceInDoc) continue
-
-            if (inst.status === 'Running') {
-                const m = metricsMap.get(inst.id as string)
-                // If running but no container found yet (brief window during start), keep previous metrics
-                if (m) {
-                    instanceInDoc.metrics = m as any
-                }
-            } else {
-                // Not running — clear metrics
-                if (instanceInDoc.metrics !== null) {
-                    instanceInDoc.metrics = null
-                }
-            }
+            if (!instanceInDoc || instanceInDoc.status !== 'Running') continue
+            log(`[dockerMetrics] Instance ${inst.id}: no running container on ${EXTERNAL_STOP_MISSES} polls (stopped outside the Engine) — status Running → Docked`)
+            instanceInDoc.status = 'Docked' as any
+        }
+        for (const inst of leftovers) {
+            const instanceInDoc = doc.instanceDB[inst.id as any]
+            if (instanceInDoc && instanceInDoc.metrics != null) instanceInDoc.metrics = null
         }
     })
 }
+
+export interface MetricsMessage { type: typeof METRICS_TYPE, v: 1, engineId: string, sampledAt: number, instances: Record<string, DockerMetrics> }
+
+/** The ephemeral metrics message (Running instances only). */
+export const metricsMessage = (engineId: string, sampledAt: number, instances: Record<string, DockerMetrics>): MetricsMessage =>
+    ({ type: METRICS_TYPE, v: 1, engineId, sampledAt, instances })
 
 export const enableDockerMetricsMonitor = (storeHandle: DocHandle<Store>): void => {
     log('[dockerMetrics] Starting Docker metrics monitor')
 
     const run = async () => {
         try {
-            await poll(storeHandle)
+            await pollDockerMetricsOnce(storeHandle)
         } catch (e: any) {
             log(`[dockerMetrics] Unhandled error in poll: ${e.message ?? e}`)
         }
@@ -1528,6 +2813,86 @@ export const enableDockerMetricsMonitor = (storeHandle: DocHandle<Store>): void 
 
     // First poll after a short delay (give instances time to start on engine boot)
     setTimeout(run, 5_000)
+}
+
+```
+
+## File: src/monitors/failedLookRetry.ts
+```typescript
+/**
+ * idea#307: look at a partition again after its filesystem changes while it stays plugged in.
+ *
+ * The usb monitor's read-only look runs on the `add` event. When a disk is partitioned and
+ * formatted while plugged in, that look can run before mkfs finishes and fail ('wrong fs type',
+ * 'bad geometry'); no new `add` event follows, so the partition was never looked at again.
+ *
+ * The monitor records the partition's filesystem signature (fs type + UUID, from lsblk, read just
+ * before the look) when the look fails. The existing lsblk poll (UnformattedDisks, every 5 s)
+ * then calls retryChangedFailedLooks: a partition whose signature has changed since its failed
+ * look gets the monitor's normal add path again, so the same read-only rules apply (ro,noload;
+ * a device mounted elsewhere is refused). An unchanged partition is never retried, so a disk
+ * that keeps failing is not mounted in a loop.
+ *
+ * Kept in its own module (no Store or monitor imports) so it can be unit-tested on its own.
+ */
+import { $ } from 'zx'
+
+export interface PartitionSignature { fsType: string | null; uuid: string | null }
+
+const failed = new Map<string, PartitionSignature | null>()
+
+const sameSignature = (a: PartitionSignature | null, b: PartitionSignature | null): boolean =>
+    (a?.fsType ?? null) === (b?.fsType ?? null) && (a?.uuid ?? null) === (b?.uuid ?? null)
+
+/** Remember that the look of `device` failed while it had signature `sig` (null = unknown). */
+export const recordFailedLook = (device: string, sig: PartitionSignature | null): void => { failed.set(device, sig) }
+
+/** Forget a failed look (the partition was unplugged, or a later look succeeded). */
+export const clearFailedLook = (device: string): void => { failed.delete(device) }
+
+/** The partitions whose last look failed (for tests and logs). */
+export const failedLookDevices = (): string[] => [...failed.keys()].sort()
+
+export const clearFailedLooksForTests = (): void => { failed.clear() }
+
+type LsblkNode = { name: string; fstype?: string | null; uuid?: string | null; children?: LsblkNode[] }
+
+/** Read-only: fs type and UUID of every block device, from lsblk (no mount, no sudo). */
+export const readPartitionSignatures = async (): Promise<Map<string, PartitionSignature>> => {
+    const out = new Map<string, PartitionSignature>()
+    const r = await $`lsblk -J -o NAME,FSTYPE,UUID`.nothrow().quiet()
+    if (r.exitCode !== 0 || !r.stdout.trim()) return out
+    const walk = (nodes: LsblkNode[] | undefined): void => {
+        for (const n of nodes ?? []) {
+            out.set(n.name, { fsType: (n.fstype ?? '').trim() || null, uuid: (n.uuid ?? '').trim() || null })
+            walk(n.children)
+        }
+    }
+    try { walk((JSON.parse(r.stdout) as { blockdevices?: LsblkNode[] }).blockdevices) } catch { /* unreadable lsblk output: no retry this round */ }
+    return out
+}
+
+/**
+ * For every partition with a failed look: when lsblk now shows a different fs type or UUID,
+ * forget the failure and call `retry` (the monitor's add path). A partition lsblk no longer
+ * lists is dropped (its unlink event handles the rest). Returns the retried devices.
+ */
+export const retryChangedFailedLooks = async (
+    retry: (device: string) => Promise<unknown>,
+    readSignatures: () => Promise<Map<string, PartitionSignature>> = readPartitionSignatures,
+): Promise<string[]> => {
+    if (failed.size === 0) return []
+    const now = await readSignatures()
+    const retried: string[] = []
+    for (const [device, before] of [...failed.entries()]) {
+        const current = now.get(device)
+        if (!current) { failed.delete(device); continue }
+        if (sameSignature(before, current)) continue
+        failed.delete(device)
+        retried.push(device)
+        await retry(device)
+    }
+    return retried
 }
 
 ```
@@ -1544,8 +2909,17 @@ export const enableDockerMetricsMonitor = (storeHandle: DocHandle<Store>): void 
  *
  * Port: configurable via `config.yaml` settings.httpPort (default 80).
  *
- * If `consolePath` is empty or the directory does not exist, the static file
- * serving is skipped but /api/store-url is still available.
+ * idea#203: clients open `http://idea.local` (port 80) and must get the Console of
+ * whichever Engine holds that name. When httpPort is not 80 (e.g. an Engine that
+ * serves its Console on :8080), start.ts passes `alsoPort` = settings.ideaLocalHttpPort
+ * (default 80) and the same handler (Console + API) is also served there, so
+ * same-origin calls such as /api/store-url keep working. Closing the main server
+ * closes the extra listener.
+ *
+ * If `consolePath` is empty, static requests get 404 "Console UI not configured". If it is
+ * set but `<consolePath>/index.html` is missing (e.g. mid-rebuild), they get 503 "Console UI
+ * not built yet" and the check is repeated on every request, so a Console built after the
+ * Engine started is served without a restart (agent-engine-dev#264). /api/* always works.
  *
  * The Console uses /api/store-url as:
  *   GET http://<engine-hostname>/api/store-url
@@ -1557,6 +2931,7 @@ export const enableDockerMetricsMonitor = (storeHandle: DocHandle<Store>): void 
  */
 
 import http from 'http'
+import net from 'net'
 import path from 'path'
 import { fs } from 'zx'
 import { log } from '../utils/utils.js'
@@ -1592,6 +2967,8 @@ const MIME_TYPES: Record<string, string> = {
 export interface StoreUrlPayload {
     url: string
     wsPort: number
+    /** idea#203 / Console #159: which Engine answered (behind idea.local the Console must know). Omitted when unknown. */
+    engineId?: string
 }
 
 /**
@@ -1603,8 +2980,9 @@ export interface StoreUrlPayload {
  */
 export const buildStoreUrlPayload = (
     storeUrl: string,
-    wsPort: number = config.settings.port
-): StoreUrlPayload => ({ url: storeUrl, wsPort })
+    wsPort: number = config.settings.port,
+    engineId?: string
+): StoreUrlPayload => (engineId ? { url: storeUrl, wsPort, engineId } : { url: storeUrl, wsPort })
 
 const mimeType = (filePath: string): string => {
     const ext = path.extname(filePath).toLowerCase()
@@ -1620,20 +2998,28 @@ const mimeType = (filePath: string): string => {
 export const enableHttpMonitor = (
     port: number = config.settings.httpPort,
     consolePath: string = config.settings.consolePath,
-    _commandLogHandle?: DocHandle<CommandLogStore> | null   // unused at runtime — URL comes from disk
+    _commandLogHandle?: DocHandle<CommandLogStore> | null,  // unused at runtime — URL comes from disk
+    alsoPort?: number,     // idea#203: also serve on this port (idea.local, :80) when it differs from `port`
+    opts: { engineId?: string, wsPort?: number } = {},  // engineId for /api/store-url; wsPort = Engine WebSocket port for Upgrade pass-through
 ): http.Server => {
 
-    const hasConsole = consolePath && fs.existsSync(consolePath)
-
-    if (consolePath && !hasConsole) {
-        log(`[http] consolePath "${consolePath}" not found — Console UI will not be served`)
-    } else if (hasConsole) {
-        log(`[http] Serving Console UI from ${consolePath}`)
-    } else {
-        log(`[http] No consolePath configured — Console UI will not be served`)
+    // agent-engine-dev#264: the Console is not settled at startup. A build that lands after
+    // the Engine started (vite empties dist/ first) is served on the next request, no restart.
+    let lastState: 'none' | 'missing' | 'ready' | null = null
+    const consoleState = (): 'none' | 'missing' | 'ready' => {
+        const state = !consolePath ? 'none'
+            : fs.existsSync(path.join(consolePath, 'index.html')) ? 'ready' : 'missing'
+        if (state !== lastState) {
+            lastState = state
+            if (state === 'ready') log(`[http] Serving Console UI from ${consolePath}`)
+            else if (state === 'missing') log(`[http] Console UI not built yet in "${consolePath}" (no index.html) — answering 503 until it appears`)
+            else log(`[http] No consolePath configured — Console UI will not be served`)
+        }
+        return state
     }
+    consoleState()
 
-    const server = http.createServer(async (req, res) => {
+    const handler: http.RequestListener = async (req, res) => {
         const url = req.url ?? '/'
 
         // ── API routes ──────────────────────────────────────────────────────
@@ -1644,10 +3030,10 @@ export const enableHttpMonitor = (
                     'Content-Type': 'application/json',
                     'Access-Control-Allow-Origin': '*',  // Console may be on a different origin during dev
                 })
-                res.end(JSON.stringify(buildStoreUrlPayload(storeUrl)))
+                res.end(JSON.stringify(buildStoreUrlPayload(storeUrl, undefined, opts.engineId)))
             } catch (e) {
                 log(`[http] /api/store-url: failed to read store URL — ${e}`)
-                res.writeHead(503, { 'Content-Type': 'application/json' })
+                res.writeHead(503, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })  // Console on another Pi must see the 503 too
                 res.end(JSON.stringify({ error: 'Store URL not available yet' }))
             }
             return
@@ -1663,16 +3049,22 @@ export const enableHttpMonitor = (
                 res.end(JSON.stringify({ url: logUrl }))
             } catch (e) {
                 log(`[http] /api/command-log-url: failed to read URL — ${e}`)
-                res.writeHead(503, { 'Content-Type': 'application/json' })
+                res.writeHead(503, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })  // Console on another Pi must see the 503 too
                 res.end(JSON.stringify({ error: 'Command log URL not available yet' }))
             }
             return
         }
 
         // ── Static Console files ────────────────────────────────────────────
-        if (!hasConsole) {
+        const state = consoleState()
+        if (state === 'none') {
             res.writeHead(404, { 'Content-Type': 'text/plain' })
             res.end('Console UI not configured on this Engine')
+            return
+        }
+        if (state === 'missing') {
+            res.writeHead(503, { 'Content-Type': 'text/plain', 'Retry-After': '5' })
+            res.end('Console UI not built yet on this Engine')
             return
         }
 
@@ -1697,31 +3089,632 @@ export const enableHttpMonitor = (
             res.writeHead(500, { 'Content-Type': 'text/plain' })
             res.end('Internal error')
         }
-    })
+    }
 
-    server.on('error', (e: NodeJS.ErrnoException) => {
-        if (e.code === 'EACCES') {
-            log(`[http] Permission denied on port ${port}. Run with sudo or use a port > 1024.`)
-        } else if (e.code === 'EADDRINUSE') {
-            log(`[http] Port ${port} already in use.`)
-        } else {
-            log(`[http] Server error: ${e}`)
-        }
-    })
+    const listen = (p: number, what: string): http.Server => {
+        const srv = http.createServer(handler)
+        // idea#203: a WebSocket Upgrade on the HTTP port(s) is passed through to the Engine's
+        // WebSocket server (127.0.0.1:wsPort), so the store sync also works via http://idea.local.
+        srv.on('upgrade', (req, socket, head) => {
+            const wsPort = opts.wsPort ?? config.settings.port
+            const up = net.connect(wsPort, '127.0.0.1', () => {
+                const lines = [`${req.method} ${req.url} HTTP/${req.httpVersion}`]
+                for (let i = 0; i < req.rawHeaders.length; i += 2) lines.push(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}`)
+                up.write(lines.join('\r\n') + '\r\n\r\n')
+                if (head?.length) up.write(head)
+                up.pipe(socket); socket.pipe(up)
+            })
+            const end = () => { up.destroy(); socket.destroy() }
+            up.on('error', end); socket.on('error', end); up.on('close', end); socket.on('close', end)
+        })
+        srv.on('error', (e: NodeJS.ErrnoException) => {
+            if (e.code === 'EACCES') {
+                log(`[http] Permission denied on port ${p} (${what}). Grant node cap_net_bind_service or use a port > 1024.`)
+            } else if (e.code === 'EADDRINUSE') {
+                log(`[http] Port ${p} already in use (${what}).`)
+            } else {
+                log(`[http] Server error on port ${p} (${what}): ${e}`)
+            }
+        })
+        srv.listen(p, () => {
+            log(`[http] Engine HTTP server listening on port ${(srv.address() as any)?.port ?? p} (${what})`)
+        })
+        return srv
+    }
 
-    server.listen(port, () => {
-        log(`[http] Engine HTTP server listening on port ${port}`)
-    })
+    const server = listen(port, 'Console')
+    if (alsoPort !== undefined && alsoPort !== port) {
+        const extra = listen(alsoPort, 'idea.local Console')
+        ;(server as any).ideaLocalServer = extra
+        server.on('close', () => { if (extra.listening) extra.close() })
+    }
 
     return server
 }
 
 ```
 
+## File: src/monitors/ideaLocal.ts
+```typescript
+/**
+ * ideaLocal.ts — publish the shared mDNS name `idea.local` (idea#203 §3).
+ *
+ * Every Engine runs this publisher. avahi lets only one host hold an address
+ * name: the first Engine to register `idea.local` wins and the others get a
+ * COLLISION (no `idea-2.local` is created; tested on the pool 2026-10-15). So
+ * every Engine keeps retrying every 2-5 s; when the holder leaves (clean
+ * withdraw, or gone without a goodbye and no longer answering probes), the next
+ * retry's probe succeeds and that Engine becomes the holder. No election through
+ * the store.
+ *
+ * The name is registered through the Pi's own avahi-daemon over D-Bus
+ * (avahi-utils is not installed on the Pis), as an address record with
+ * AVAHI_PUBLISH_NO_REVERSE: the equivalent of `avahi-publish -a -R idea.local
+ * <ip>`. Without NO_REVERSE avahi refuses with "Local name collision", because
+ * the reverse (PTR) record of our IP already belongs to our own hostname.
+ * No second mDNS responder is started (compatible with the avahi-hostname-clash
+ * proposal of 2026-10-13).
+ *
+ * LAN only: the record is added once per LAN interface, with that interface's
+ * own IPv4 address and interface index, never on lo, docker*, br-*, veth* and
+ * other virtual interfaces (idea03.local currently resolves to the docker bridge
+ * 172.21.0.1 because avahi's own hostname record is on every interface; that is
+ * avahi-daemon.conf, not this file — see the PR description).
+ *
+ * The logic (IdeaLocalPublisher.tick) is independent of D-Bus so it can be unit
+ * tested with a fake avahi; createDbusAvahi() is the real D-Bus binding.
+ */
+
+import os from 'os'
+import { readFileSync } from 'fs'
+import dgram from 'dgram'
+import { log } from '../utils/utils.js'
+
+export const IDEA_LOCAL_NAME = 'idea.local'
+
+/** avahi constants (avahi-common/defs.h) */
+export const AVAHI_IF_UNSPEC = -1
+export const AVAHI_PROTO_INET = 0
+export const AVAHI_PUBLISH_NO_REVERSE = 16
+export enum EntryGroupState { UNCOMMITED = 0, REGISTERING = 1, ESTABLISHED = 2, COLLISION = 3, FAILURE = 4 }
+
+/** Interface name prefixes that are never the school LAN. */
+export const NON_LAN_IF_PREFIXES = ['lo', 'docker', 'br-', 'veth', 'virbr', 'tailscale', 'zt', 'wg', 'cni', 'flannel', 'vxlan', 'tun', 'tap']
+
+export interface LanAddress { ifName: string, ifIndex: number, address: string }
+
+export const isLanInterfaceName = (name: string): boolean =>
+    !NON_LAN_IF_PREFIXES.some(p => name === p || name.startsWith(p))
+
+/**
+ * The IPv4 addresses this Engine should publish idea.local on: one per LAN
+ * interface (non-internal IPv4, interface name not virtual). Link-local
+ * 169.254/16 is skipped. Sorted for stable comparison.
+ */
+export const lanAddresses = (
+    ifaces: NodeJS.Dict<os.NetworkInterfaceInfo[]> = os.networkInterfaces(),
+    ifIndexOf: (name: string) => number | undefined = sysIfIndex,
+): LanAddress[] => {
+    const out: LanAddress[] = []
+    for (const [ifName, infos] of Object.entries(ifaces)) {
+        if (!infos || !isLanInterfaceName(ifName)) continue
+        const ifIndex = ifIndexOf(ifName)
+        if (ifIndex === undefined) continue
+        for (const i of infos) {
+            if (i.family !== 'IPv4' || i.internal) continue
+            if (i.address.startsWith('169.254.')) continue
+            out.push({ ifName, ifIndex, address: i.address })
+        }
+    }
+    return out.sort((a, b) => (a.ifName + a.address).localeCompare(b.ifName + b.address))
+}
+
+const sysIfIndex = (name: string): number | undefined => {
+    try {
+        const n = parseInt(readFileSync(`/sys/class/net/${name}/ifindex`, 'utf-8').trim(), 10)
+        return Number.isFinite(n) ? n : undefined
+    } catch { return undefined }
+}
+
+/**
+ * True when a D-Bus error means our entry group object no longer exists in avahi-daemon.
+ * avahi keeps groups only in memory: when avahi-daemon restarts (e.g. after an
+ * avahi-daemon.conf change, PR #215) the new daemon owns org.freedesktop.Avahi but has no
+ * /ClientN/EntryGroupM objects, and libdbus answers any call on the old path with
+ * UnknownMethod 'Method "GetState" with signature "" on interface ... doesn't exist'.
+ * That is not a bus failure: the right reaction is to publish a fresh group.
+ */
+export const isEntryGroupGone = (e: any): boolean => {
+    const name = String(e?.type ?? e?.name ?? '')
+    const msg = String(e?.text ?? e?.message ?? e ?? '')
+    return /org\.freedesktop\.DBus\.Error\.(UnknownMethod|UnknownObject|UnknownInterface)/.test(name)
+        || /org\.freedesktop\.DBus\.Error\.(UnknownMethod|UnknownObject|UnknownInterface)/.test(msg)
+        || /on interface "org\.freedesktop\.Avahi\.EntryGroup" doesn't exist/.test(msg)
+}
+
+/**
+ * avahi-daemon did not answer a D-Bus call in time. Seen on the pool when avahi is frozen
+ * (SIGSTOP, takeover test mode avahi-freeze; also a hung or overloaded daemon): dbus-next
+ * has no call timeout, so without this the publisher's tick waited forever.
+ */
+export class AvahiTimeoutError extends Error {
+    readonly code = 'AVAHI_DBUS_TIMEOUT'
+    constructor(what: string, ms: number) { super(`avahi-daemon did not answer ${what} within ${(ms / 1000).toFixed(1)} s`) }
+}
+export const isAvahiTimeout = (e: any): boolean => e instanceof AvahiTimeoutError || e?.code === 'AVAHI_DBUS_TIMEOUT'
+
+/** `p`, or an AvahiTimeoutError after `ms`. The late result of `p` is ignored (never unhandled). */
+export const withAvahiTimeout = <T>(p: Promise<T>, ms: number, what: string): Promise<T> => {
+    if (!(ms > 0) || !Number.isFinite(ms)) return p
+    let t: NodeJS.Timeout | undefined
+    const late = p.catch(() => undefined as any)
+    return Promise.race([
+        p.finally(() => clearTimeout(t)),
+        new Promise<T>((_, reject) => { t = setTimeout(() => { void late; reject(new AvahiTimeoutError(what, ms)) }, ms) }),
+    ])
+}
+
+const addrKey = (a: LanAddress[]) => a.map(x => `${x.ifIndex}/${x.address}`).join(',')
+
+// ── avahi abstraction ────────────────────────────────────────────────────────
+
+export interface AvahiEntryGroup {
+    addAddress(ifIndex: number, proto: number, flags: number, name: string, address: string): Promise<void>
+    commit(): Promise<void>
+    getState(): Promise<number>
+    free(): Promise<void>
+}
+
+export interface AvahiClient {
+    entryGroupNew(): Promise<AvahiEntryGroup>
+    close(): void
+}
+
+// ── second-holder detection (raw mDNS) ──────────────────────────────────────
+
+export interface MdnsResponder { from: string, addresses: string[] }
+
+const ipNum = (ip: string): number => ip.split('.').reduce((n, o) => n * 256 + (parseInt(o, 10) & 255), 0)
+
+/** Addresses other hosts give for the name (our own addresses excluded), sorted lowest first. */
+export const foreignHolders = (responders: MdnsResponder[], own: string[]): string[] => {
+    const out = new Set<string>()
+    for (const r of responders) {
+        for (const a of r.addresses) if (!own.includes(a)) out.add(a)
+    }
+    return [...out].sort((a, b) => ipNum(a) - ipNum(b))
+}
+
+/**
+ * The fixed rule for two holders after a partition heals: the Engine with the numerically
+ * lowest LAN IPv4 keeps idea.local, the other withdraws. Both sides compute the same answer
+ * from what is on the wire, with no shared state.
+ */
+export const conflictWinner = (own: string[], foreign: string[]): 'us' | 'them' => {
+    if (foreign.length === 0) return 'us'
+    const lowOwn = Math.min(...own.map(ipNum))
+    const lowForeign = Math.min(...foreign.map(ipNum))
+    return lowOwn < lowForeign ? 'us' : 'them'
+}
+
+/** DNS query for `name` type A, class IN with the QU (unicast response) bit. */
+export const encodeMdnsQuery = (name: string, id: number): Buffer => {
+    const labels = name.replace(/\.$/, '').split('.')
+    const parts: Buffer[] = [Buffer.from([id >> 8 & 255, id & 255, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0])]
+    for (const l of labels) { const b = Buffer.from(l, 'utf8'); parts.push(Buffer.from([b.length]), b) }
+    parts.push(Buffer.from([0, 0, 1, 0x80, 1]))
+    return Buffer.concat(parts)
+}
+
+const readName = (buf: Buffer, off: number): [string, number] => {
+    const labels: string[] = []
+    let end = -1; let jumps = 0
+    for (;;) {
+        if (off >= buf.length) throw new Error('truncated name')
+        const len = buf[off]
+        if (len === 0) { off++; break }
+        if ((len & 0xc0) === 0xc0) {
+            if (++jumps > 20) throw new Error('pointer loop')
+            if (end < 0) end = off + 2
+            off = ((len & 0x3f) << 8) | buf[off + 1]
+            continue
+        }
+        labels.push(buf.toString('utf8', off + 1, off + 1 + len)); off += 1 + len
+    }
+    return [labels.join('.'), end < 0 ? off : end]
+}
+
+/** IPv4 addresses in A records for `name` in a DNS response (answers + additionals); [] if not a response. */
+export const parseMdnsAnswers = (buf: Buffer, name: string): string[] => {
+    try {
+        if (buf.length < 12 || !(buf[2] & 0x80)) return []
+        const qd = buf.readUInt16BE(4); const rr = buf.readUInt16BE(6) + buf.readUInt16BE(8) + buf.readUInt16BE(10)
+        let off = 12
+        for (let i = 0; i < qd; i++) { off = readName(buf, off)[1] + 4 }
+        const want = name.replace(/\.$/, '').toLowerCase()
+        const out: string[] = []
+        for (let i = 0; i < rr; i++) {
+            const [n, o] = readName(buf, off); off = o
+            const type = buf.readUInt16BE(off); const ttl = buf.readUInt32BE(off + 4); const len = buf.readUInt16BE(off + 8)
+            off += 10
+            if (type === 1 && len === 4 && ttl > 0 && n.toLowerCase() === want) out.push([...buf.subarray(off, off + 4)].join('.'))
+            off += len
+        }
+        return out
+    } catch { return [] }
+}
+
+/** A probe's outcome: every responder, plus one line per LAN interface whose query could not be sent. */
+export interface ProbeResult { responders: MdnsResponder[], errors: string[] }
+
+/**
+ * Send a one-shot (legacy unicast, RFC 6762 §6.7) mDNS query for `name` and collect every
+ * answer for `waitMs`. One socket per LAN address, bound to that address on an ephemeral
+ * port (never 5353, so it does not compete with avahi-daemon), with IP_MULTICAST_IF set to
+ * that same address: the query leaves only on the LAN interfaces we publish on, never on
+ * docker*, br-*, veth*, tailscale* (the caller passes lanAddresses()). Every responder (our
+ * own avahi included, via multicast loopback) answers straight to our socket, so a second
+ * holder is seen even though avahi itself only reports one answer. Sent twice for loss.
+ * Send/bind errors never throw: they are returned per interface in `errors`.
+ */
+export const queryIdeaLocalResponders = async (name: string, addrs: LanAddress[], waitMs = 1200): Promise<ProbeResult> => {
+    const byFrom = new Map<string, Set<string>>()
+    const errors = new Set<string>()
+    await Promise.all(addrs.filter(a => isLanInterfaceName(a.ifName)).map(a => new Promise<void>((resolve) => {
+        const where = `${a.ifName} ${a.address}`
+        const fail = (what: string, e: any) => errors.add(`${what} on ${where}: ${e?.code ?? e?.message ?? e}`)
+        let sock: dgram.Socket
+        try { sock = dgram.createSocket({ type: 'udp4', reuseAddr: false }) } catch (e) { fail('socket', e); return resolve() }
+        const id = Math.floor(Math.random() * 65535) + 1
+        const q = encodeMdnsQuery(name, id)
+        const timers: NodeJS.Timeout[] = []
+        let finished = false
+        const done = () => {
+            if (finished) return
+            finished = true; timers.forEach(clearTimeout)
+            try { sock.close() } catch { /* closed */ }
+            resolve()
+        }
+        sock.on('error', (e) => { fail('socket', e); done() })
+        sock.on('message', (msg, rinfo) => {
+            if (msg.length < 2 || msg.readUInt16BE(0) !== id) return
+            const found = parseMdnsAnswers(msg, name)
+            if (found.length === 0) return
+            const s = byFrom.get(rinfo.address) ?? new Set<string>()
+            found.forEach(x => s.add(x)); byFrom.set(rinfo.address, s)
+        })
+        try {
+            sock.bind(0, a.address, () => {
+                try {
+                    sock.setMulticastInterface(a.address)
+                    sock.setMulticastLoopback(true)
+                    sock.setMulticastTTL(255)
+                } catch (e) { fail('IP_MULTICAST_IF', e); return done() }
+                const send = () => { if (!finished) sock.send(q, 5353, '224.0.0.251', (e) => { if (e) fail('send', e) }) }
+                send(); timers.push(setTimeout(send, 300))
+                timers.push(setTimeout(done, waitMs))
+            })
+        } catch (e) { fail('bind', e); done() }
+    })))
+    return { responders: [...byFrom].map(([from, s]) => ({ from, addresses: [...s].sort() })), errors: [...errors].sort() }
+}
+
+// ── publisher ────────────────────────────────────────────────────────────────
+
+export type PublisherStatus = 'idle' | 'registering' | 'holder' | 'waiting' | 'error'
+
+export interface IdeaLocalPublisherOptions {
+    name?: string
+    connect: () => Promise<AvahiClient>
+    addresses?: () => LanAddress[]
+    logger?: (line: string) => void
+    /** delay before the next tick, ms; default uniform 2000-5000 */
+    nextDelayMs?: () => number
+    /**
+     * Raw mDNS query for the name on our LAN addresses: every host that answers, with the
+     * A addresses it gave. Used by the holder on every tick to find a second holder (after a
+     * partition heals avahi does not re-probe). Default: queryIdeaLocalResponders (raw socket).
+     */
+    probe?: (name: string, addrs: LanAddress[]) => Promise<MdnsResponder[] | ProbeResult>
+    /**
+     * A non-holder whose entry group vanished (avahi-daemon restarted; on the pool image a root
+     * cron restarts it at :00 on every Pi at the same second) waits this long before
+     * re-publishing, so the Engine that held the name re-claims it first. Must exceed the
+     * holder's worst-case detection time (one tick delay + one probe). Default 6.5-9.5 s.
+     */
+    reclaimGraceMs?: () => number
+    /** consecutive probes that must see a lower-ranked holder before we withdraw (default 2) */
+    conflictConfirmations?: number
+    /** after withdrawing for a conflict, do not re-register for this long, ms (default 15000) */
+    conflictHoldoffMs?: number
+    now?: () => number
+    /**
+     * Every avahi D-Bus call (connect, EntryGroupNew, AddAddress, Commit, GetState, Free) must
+     * answer within this time (default 4000 ms). On a timeout the Engine frees its entry group
+     * and closes its D-Bus connection: the frees queue in avahi's socket, so a frozen avahi
+     * (SIGSTOP) drops our idea.local record and multicasts a goodbye (TTL 0) the moment it runs
+     * again, instead of carrying on as a second holder. Measured on a real avahi 2026-10-15.
+     */
+    dbusTimeoutMs?: number
+}
+
+export class IdeaLocalPublisher {
+    readonly name: string
+    status: PublisherStatus = 'idle'
+    private client?: AvahiClient
+    private group?: AvahiEntryGroup
+    private publishedKey = ''
+    private timer?: NodeJS.Timeout
+    private stopped = false
+    private lastLogged = ''
+    private readonly connect: () => Promise<AvahiClient>
+    private readonly addresses: () => LanAddress[]
+    private readonly logger: (line: string) => void
+    private readonly nextDelayMs: () => number
+    private readonly probe?: (name: string, addrs: LanAddress[]) => Promise<MdnsResponder[] | ProbeResult>
+    private readonly reclaimGraceMs: () => number
+    private probeTrouble = ''
+    private readonly conflictConfirmations: number
+    private readonly conflictHoldoffMs: number
+    private readonly now: () => number
+    private conflictSeen = 0
+    private holdoffUntil = 0
+    private readonly dbusTimeoutMs: number
+
+    constructor(o: IdeaLocalPublisherOptions) {
+        this.name = o.name ?? IDEA_LOCAL_NAME
+        this.connect = o.connect
+        this.addresses = o.addresses ?? (() => lanAddresses())
+        this.logger = o.logger ?? log
+        this.nextDelayMs = o.nextDelayMs ?? (() => 2000 + Math.floor(Math.random() * 3001))
+        this.probe = 'probe' in o ? o.probe : queryIdeaLocalResponders
+        this.conflictConfirmations = Math.max(1, o.conflictConfirmations ?? 2)
+        this.conflictHoldoffMs = o.conflictHoldoffMs ?? 15000
+        this.now = o.now ?? Date.now
+        this.reclaimGraceMs = o.reclaimGraceMs ?? (() => 6500 + Math.floor(Math.random() * 3001))
+        this.dbusTimeoutMs = o.dbusTimeoutMs ?? 4000
+    }
+
+    /** Log probe trouble once per change (not every tick), and once when it clears. */
+    private noteProbe(trouble: string) {
+        if (trouble === this.probeTrouble) return
+        if (trouble) this.logger(`[idea.local] second-holder check: ${trouble} (keeping the current state; logged once until it changes)`)
+        else this.logger(`[idea.local] second-holder check working again`)
+        this.probeTrouble = trouble
+    }
+
+    /**
+     * Holder only: is another host also answering for the name? Returns true when we must
+     * withdraw (the other holder wins the fixed rule, seen on enough consecutive probes).
+     */
+    private async checkSecondHolder(addrs: LanAddress[]): Promise<boolean> {
+        if (!this.probe) return false
+        let responders: MdnsResponder[]
+        try {
+            const r = await this.probe(this.name, addrs)
+            const res: ProbeResult = Array.isArray(r) ? { responders: r, errors: [] } : r
+            responders = res.responders
+            this.noteProbe(res.errors.join('; '))
+            // Nothing could be sent at all: this check says nothing. Keep the name and the
+            // confirmation count as they are (a failed check never withdraws).
+            if (res.errors.length > 0 && res.errors.length >= addrs.length && responders.length === 0) return false
+        } catch (e: any) {
+            this.noteProbe(`probe failed: ${e?.message ?? e}`)
+            return false
+        }
+        const own = addrs.map(a => a.address)
+        const foreign = foreignHolders(responders, own)
+        if (foreign.length === 0) { this.conflictSeen = 0; return false }
+        const verdict = conflictWinner(own, foreign)
+        if (verdict === 'us') {
+            this.conflictSeen = 0
+            this.note('holder', `holding ${this.name}; ${foreign.join(', ')} also answers: we keep it (lowest IPv4 keeps the name), the other Engine withdraws`)
+            return false
+        }
+        this.conflictSeen++
+        if (this.conflictSeen < this.conflictConfirmations) {
+            this.logger(`[idea.local] ${foreign.join(', ')} also answers for ${this.name} and wins (lowest IPv4); confirming (${this.conflictSeen}/${this.conflictConfirmations})`)
+            return false
+        }
+        this.conflictSeen = 0
+        this.holdoffUntil = this.now() + this.conflictHoldoffMs
+        this.note('waiting', `second holder of ${this.name}: ${foreign.join(', ')} (lower IPv4 keeps it); withdrawing, retrying in ${Math.round(this.conflictHoldoffMs / 1000)} s`)
+        return true
+    }
+
+    /** Log a status line only when it changes (a waiting Engine retries every few seconds). */
+    private note(status: PublisherStatus, line: string) {
+        this.status = status
+        if (line !== this.lastLogged) { this.logger(`[idea.local] ${line}`); this.lastLogged = line }
+    }
+
+    /** D-Bus call to avahi with the call timeout. */
+    private av<T>(p: Promise<T>, what: string): Promise<T> { return withAvahiTimeout(p, this.dbusTimeoutMs, what) }
+
+    private async dropGroup() {
+        const g = this.group
+        this.group = undefined
+        this.publishedKey = ''
+        if (g) { try { await this.av(g.free(), 'EntryGroup.Free') } catch { /* gone with the connection, or avahi not answering */ } }
+    }
+
+    private async dropClient() {
+        await this.dropGroup()
+        const c = this.client
+        this.client = undefined
+        if (c) { try { c.close() } catch { /* ignore */ } }
+    }
+
+    /** The group's state, or undefined when avahi no longer has the group (daemon restarted). */
+    private async readGroupState(g: AvahiEntryGroup): Promise<number | undefined> {
+        try { return await this.av(g.getState(), 'EntryGroup.GetState') } catch (e: any) {
+            if (isEntryGroupGone(e)) return undefined
+            throw e
+        }
+    }
+
+    /** One step of the retry/takeover loop. Never throws. */
+    async tick(): Promise<PublisherStatus> {
+        if (this.stopped) return this.status
+        try {
+            const addrs = this.addresses()
+            const key = addrKey(addrs)
+
+            if (this.group) {
+                const st = await this.readGroupState(this.group)
+                if (st === undefined) {
+                    // avahi-daemon restarted and our group went with it. The bus connection is
+                    // fine. The holder publishes a fresh group in this same tick (no reconnect,
+                    // no error line); an Engine that was not holding waits the reclaim grace
+                    // first, so a simultaneous restart on every Pi (pool cron at :00) leaves
+                    // the name with the Engine that already had it.
+                    const wasHolder = this.status === 'holder'
+                    this.group = undefined
+                    this.publishedKey = ''
+                    if (wasHolder) {
+                        this.note('registering', `avahi-daemon lost our ${this.name} entry group (daemon restarted); re-publishing`)
+                    } else {
+                        const grace = this.reclaimGraceMs()
+                        this.holdoffUntil = Math.max(this.holdoffUntil, this.now() + grace)
+                        this.note('waiting', `avahi-daemon restarted; not holding ${this.name}, so letting the previous holder re-claim it first (${(grace / 1000).toFixed(1)} s)`)
+                    }
+                } else if (key === this.publishedKey && st === EntryGroupState.ESTABLISHED) {
+                    if (this.status !== 'holder') {
+                        this.conflictSeen = 0
+                        this.note('holder', `holding ${this.name} on ${addrs.map(a => `${a.ifName} ${a.address}`).join(', ')}`)
+                    }
+                    if (!(await this.checkSecondHolder(addrs))) return this.status
+                    await this.dropGroup()
+                    return this.status
+                } else if (key === this.publishedKey && (st === EntryGroupState.REGISTERING || st === EntryGroupState.UNCOMMITED)) {
+                    this.status = 'registering'
+                    return this.status
+                } else {
+                    if (st === EntryGroupState.COLLISION) {
+                        this.note('waiting', `${this.name} is held by another Engine; retrying every 2-5 s`)
+                    } else if (key !== this.publishedKey) {
+                        this.note('registering', `LAN addresses changed (${key || 'none'}); re-publishing ${this.name}`)
+                    } else {
+                        this.note('waiting', `${this.name} registration ended in state ${EntryGroupState[st] ?? st}; retrying`)
+                    }
+                    await this.dropGroup()
+                }
+            }
+
+            if (this.now() < this.holdoffUntil) return this.status
+
+            if (addrs.length === 0) {
+                this.note('idle', `no LAN IPv4 address; not publishing ${this.name}`)
+                return this.status
+            }
+
+            if (!this.client) {
+                const pending = this.connect()
+                this.client = await this.av(pending, 'the D-Bus connect').catch((e) => {
+                    // A connect that completes after we gave up must not leak a bus connection.
+                    if (isAvahiTimeout(e)) pending.then(c => c.close(), () => {})
+                    throw e
+                })
+            }
+            const g = await this.av(this.client.entryGroupNew(), 'Server.EntryGroupNew')
+            this.group = g
+            try {
+                for (const a of addrs) {
+                    await this.av(g.addAddress(a.ifIndex, AVAHI_PROTO_INET, AVAHI_PUBLISH_NO_REVERSE, this.name, a.address), 'EntryGroup.AddAddress')
+                }
+                await this.av(g.commit(), 'EntryGroup.Commit')
+            } catch (e: any) {
+                if (isAvahiTimeout(e)) throw e
+                // A local collision (e.g. this host already publishes the name) is not fatal: retry later.
+                await this.dropGroup()
+                this.note('waiting', `could not register ${this.name}: ${e?.message ?? e}; retrying`)
+                return this.status
+            }
+            this.publishedKey = key
+            if (this.status !== 'waiting') this.status = 'registering'
+            return this.status
+        } catch (e: any) {
+            if (isAvahiTimeout(e)) {
+                // avahi-daemon is not running its main loop (frozen/hung). Our record is still in
+                // its memory and it will answer with it as soon as it runs again. Queue the Free
+                // and close the D-Bus connection now (avahi frees every group of a client that
+                // disconnected), without waiting for answers: when avahi resumes it handles both
+                // right after the queries that piled up while it was stopped, and multicasts a
+                // goodbye for idea.local. Then reconnect and compete again like any other Engine.
+                const wasHolder = this.status === 'holder'
+                const g = this.group; const c = this.client
+                this.group = undefined; this.client = undefined; this.publishedKey = ''
+                if (g) { try { void g.free().catch(() => {}) } catch { /* ignore */ } }
+                if (c) { try { c.close() } catch { /* ignore */ } }
+                this.note('error', g
+                    ? `${e.message}; ${wasHolder ? `giving up ${this.name}: ` : ''}freed our entry group and closed the D-Bus connection so a frozen avahi drops the record when it runs again; reconnecting`
+                    : `${e.message}; reconnecting`)
+                return this.status
+            }
+            // avahi-daemon or D-Bus gone: reconnect on the next tick.
+            await this.dropClient()
+            this.note('error', `avahi D-Bus error: ${e?.message ?? e}; reconnecting`)
+            return this.status
+        }
+    }
+
+    start(): this {
+        const loop = async () => {
+            await this.tick()
+            if (!this.stopped) this.timer = setTimeout(loop, this.nextDelayMs())
+        }
+        void loop()
+        return this
+    }
+
+    /** Withdraw the name (avahi sends a goodbye, so another Engine takes over within seconds). */
+    async stop(): Promise<void> {
+        this.stopped = true
+        if (this.timer) clearTimeout(this.timer)
+        await this.dropClient()
+        this.note('idle', `withdrew ${this.name}`)
+    }
+}
+
+// ── D-Bus binding ────────────────────────────────────────────────────────────
+
+/** Connect to avahi-daemon on the system bus (org.freedesktop.Avahi). */
+export const createDbusAvahi = async (): Promise<AvahiClient> => {
+    const dbus: any = await import('dbus-next')
+    const bus = (dbus.default ?? dbus).systemBus()
+    let dead: Error | undefined
+    // A lost bus connection is reported as an event; turn it into a failed call so tick() reconnects.
+    bus.on('error', (e: Error) => { dead = e })
+    const alive = () => { if (dead) throw dead }
+    const server = await bus.getProxyObject('org.freedesktop.Avahi', '/')
+    const srv = server.getInterface('org.freedesktop.Avahi.Server')
+    return {
+        entryGroupNew: async () => {
+            alive()
+            const path: string = await srv.EntryGroupNew()
+            const obj = await bus.getProxyObject('org.freedesktop.Avahi', path)
+            const eg = obj.getInterface('org.freedesktop.Avahi.EntryGroup')
+            return {
+                addAddress: (ifIndex, proto, flags, name, address) => eg.AddAddress(ifIndex, proto, flags, name, address),
+                commit: () => eg.Commit(),
+                getState: async () => { alive(); return Number(await eg.GetState()) },
+                free: () => eg.Free(),
+            }
+        },
+        close: () => bus.disconnect(),
+    }
+}
+
+/** Start the idea.local publisher (start.ts, when mDNS is on). */
+export const enableIdeaLocalPublisher = (): IdeaLocalPublisher =>
+    new IdeaLocalPublisher({ connect: createDbusAvahi }).start()
+
+```
+
 ## File: src/monitors/mdnsMonitor.ts
 ```typescript
 import mDnsSd from 'node-dns-sd'
-import { deepPrint, log, error } from '../utils/utils.js';
+import { deepPrint, log, error, print } from '../utils/utils.js';
 import { chalk } from 'zx';
 import { Store, getLocalEngine } from '../data/Store.js';
 import { manageDiscoveredPeers } from '../data/Network.js'
@@ -1729,6 +3722,146 @@ import ciao, { CiaoService } from '@homebridge/ciao'
 import { DocHandle, DocumentId, Repo } from '@automerge/automerge-repo';
 import { EngineID, Hostname, IPAddress } from '../data/CommonTypes.js';
 import { config } from '../data/Config.js';
+import { readStoreDocId } from '../data/StoreIdentity.js';
+import { RefusalLog, storeTag } from '../data/StoreScope.js';
+import { readdirSync } from 'fs';
+import { isLanInterfaceName, lanAddresses } from './ideaLocal.js';
+
+/**
+ * node-dns-sd (peer discovery) binds 0.0.0.0:5353 and, by default, sends its query on every
+ * non-internal IPv4 address: tailscale0 (no MULTICAST flag → `send EPERM 224.0.0.251:5353`,
+ * pool idea03), docker0/br-* (a bridge that is down or just removed → `send ENODEV`, pool
+ * idea04) and veth*. The first failing interface rejects the whole discover(), so discovery
+ * also skipped the real LAN for that round. Restrict it to the LAN addresses idea.local
+ * publishes on (lanAddresses: never lo, docker*, br-*, veth*, tailscale*, …). Applied to the
+ * singleton; node-dns-sd re-reads the list through this method at every start.
+ */
+export const restrictDnsSdToLan = (sd: any = mDnsSd, lan: () => string[] = () => lanAddresses().map(a => a.address)): void => {
+    sd._getNetifAddressList = () => lan()
+    if (Array.isArray(sd._netif_address_list)) sd._netif_address_list = lan()
+}
+
+/**
+ * node-dns-sd's discover() starts `this._sendQueryPacket(buf)` without awaiting or catching it,
+ * so a failing multicast send (`send EPERM 224.0.0.251:5353` when OUTPUT udp/5353 is dropped,
+ * pool idea03 takeover run 2026-10-15 18:08: 36 -> 110 lines) is an unhandledRejection on
+ * every 10 s round, and the remaining interfaces are skipped. Make every send resolve: an
+ * error is reported (once per distinct message, see discoverySendError) and the query goes on
+ * to the next interface; the round still collects answers until its wait ends.
+ */
+export const catchDnsSdSendErrors = (sd: any = mDnsSd, report: (e: any) => void = (e) => discoverySendError(e)): void => {
+    if (sd.__ideaSendErrorsCaught) return
+    const udpSend = sd._udpSend?.bind(sd)
+    if (typeof udpSend === 'function') {
+        sd._udpSend = (buf: Buffer, port: number, addr: string) =>
+            Promise.resolve().then(() => udpSend(buf, port, addr)).catch((e: any) => { report(e) })
+    }
+    const sendQuery = sd._sendQueryPacket?.bind(sd)
+    if (typeof sendQuery === 'function') {
+        // setMulticastInterface can throw (EADDRNOTAVAIL when an address just went away)
+        sd._sendQueryPacket = (buf: Buffer) =>
+            Promise.resolve().then(() => sendQuery(buf)).catch((e: any) => { report(e) })
+    }
+    sd.__ideaSendErrorsCaught = true
+}
+
+let lastSendError = ''
+/** Log a discovery send error once until a different one happens (not an EPERM flood). */
+export const discoverySendError = (e: any, logger: (line: string) => void = log): void => {
+    const line = `${e?.code ?? ''} ${e?.message ?? e}`.trim()
+    if (line === lastSendError) return
+    lastSendError = line
+    logger(`***node-dns-sd*** engine discovery query could not be sent: ${line} (logged once until it changes; discovery keeps running)`)
+}
+
+/**
+ * The interfaces the Engine's own mDNS service (ciao, `_engine._tcp`) is advertised on: the
+ * school LAN only (every /sys/class/net name that isLanInterfaceName accepts: eth0, wlan0,
+ * also while down), never docker0/br-* (pool idea03 advertised itself at 172.21.0.1 and
+ * 172.22.0.1), veth*, tailscale*, lo. undefined (ciao: all interfaces) only when no LAN
+ * interface exists at all, so discovery is never switched off.
+ */
+export const engineAdvertiseInterfaces = (names: () => string[] = () => readdirSync('/sys/class/net')): string[] | undefined => {
+    let all: string[] = []
+    try { all = names() } catch { return undefined }
+    const lan = all.filter(isLanInterfaceName).sort()
+    return lan.length > 0 ? lan : undefined
+}
+
+/** One log line per distinct discovery error, not one every 10 s round. */
+let lastDiscoveryError = ''
+
+
+/**
+ * The host name ciao publishes A records for in the Engine's `_engine._tcp` SRV record.
+ *
+ * ciao defaults it to the service name, i.e. `<hostname>.local`, which avahi-daemon already
+ * owns on every Pi (it is how clients reach the Engine). ciao probes that name, sees avahi
+ * answer for it, and resolves the "conflict" by renaming BOTH the service and its host:
+ * every Engine was advertised as 'idea03 (2)' on idea03-(2).local (pool, 2026-10-15; also
+ * on main since the ciao advertiser was added, not a leftover of restarts). A distinct name
+ * leaves `<hostname>.local` to avahi and keeps the service name equal to the hostname.
+ * Discovery reads the hostname from the TXT record and the address from the answer, so the
+ * SRV target name is not used for dialling.
+ */
+export const engineServiceHostname = (engineName: string): string => `${engineName}-engine`
+
+/**
+ * The TXT record this Engine advertises. `store` (StoreScope.ts storeTag: a short
+ * prefix plus a hash, never the full store id) lets other Engines skip us without
+ * dialling when we are not in their store (store-scoped peering).
+ */
+export const engineTxtRecord = (name: string, id: string, version: string, ownStoreTag: string): Record<string, string> => ({
+    name, id, version, store: ownStoreTag,
+})
+
+export interface DiscoveredEngine { address: IPAddress, hostname: Hostname, engineId: EngineID, port?: number, store?: string }
+
+/**
+ * One node-dns-sd answer -> the Engine it describes, or undefined without a TXT record.
+ * The TXT record is looked up in the additionals (as before) and then in the answers:
+ * ciao puts it in the answer section when it answers a direct query (seen on a
+ * loopback-only host), and an Engine skipped for that would never be store-checked.
+ */
+export const parseEngineDevice = (device: any): DiscoveredEngine | undefined => {
+    const isTxt = (r: any) => typeof r == 'object' && r !== null && r.type === 'TXT' && r.rdata
+    const txt = (device?.packet?.additionals ?? []).find(isTxt) ?? (device?.packet?.answers ?? []).find(isTxt)
+    if (!txt) return undefined
+    const t = txt.rdata
+    return {
+        address: device.address as IPAddress,
+        hostname: t.name as Hostname,
+        engineId: t.id as EngineID,
+        port: device.service?.port,
+        store: typeof t.store === 'string' && t.store ? t.store : undefined,
+    }
+}
+
+const mdnsRefusalLog = new RefusalLog((line) => print(chalk.yellow(line)))
+
+/**
+ * Which discovered Engines may be dialled (store-scoped peering): only those whose
+ * TXT `store` equals ours. A different tag, or none (an Engine older than this
+ * change), is skipped and logged (rate-limited). The WS handshake check is the
+ * authoritative one; this only saves the dial.
+ */
+export const selectStorePeers = (
+    engines: DiscoveredEngine[], localEngineId: string, ownStoreTag: string,
+    report: (key: string, line: string) => void = (k, l) => { mdnsRefusalLog.report(k, l) },
+): Map<IPAddress, { hostname: Hostname, engineId: EngineID }> => {
+    const peers = new Map<IPAddress, { hostname: Hostname, engineId: EngineID }>()
+    for (const e of engines) {
+        if (e.engineId && e.engineId === localEngineId) continue
+        if (!(e.address && e.hostname && e.engineId)) continue
+        if (e.store !== ownStoreTag) {
+            const why = e.store ? `different store: theirs ${e.store}, ours ${ownStoreTag}` : `no store id in its mDNS TXT record (an Engine older than store-scoped peering); ours ${ownStoreTag}`
+            report(`mdns|${e.address}|${e.store ?? ''}`, `[store-scope] REFUSED mDNS peer ${e.hostname} (${e.engineId}) at ${e.address}${e.port ? `:${e.port}` : ''}: ${why}. Not dialling it.`)
+            continue
+        }
+        peers.set(e.address, { hostname: e.hostname, engineId: e.engineId })
+    }
+    return peers
+}
 
 export const startAdvertising = (store: Store): CiaoService => {
     const engine = getLocalEngine(store)
@@ -1738,32 +3871,31 @@ export const startAdvertising = (store: Store): CiaoService => {
     }
     const engineName = engine.hostname
     const engineVersion = engine.version
-    const responder = ciao.getResponder()
+    const interfaces = engineAdvertiseInterfaces()
+    const responder = ciao.getResponder(interfaces ? { interface: interfaces } : undefined)
 
     if (!engineName) {
         throw new Error(`No engine hostname found in the store`)
     }
 
-    log(`Advertising on all interfaces`)
+    log(`Advertising on ${interfaces ? `LAN interfaces ${interfaces.join(', ')}` : 'all interfaces (no LAN interface found)'}`)
     const service = responder.createService({
         name: engineName.toString(),
+        hostname: engineServiceHostname(engineName.toString()),
         type: 'engine',
         port: config.settings.port,
-        txt: {
-            name: engineName,
-            id: engine.id,
-            version: engineVersion
-        }
+        txt: engineTxtRecord(engineName, engine.id, engineVersion, storeTag(readStoreDocId()))
     })
 
-    // Log name conflicts without updating the store — the (2) suffix is a service
-    // advertisement detail, not the machine hostname.
+    // A name conflict now means a second Engine with the same hostname on the LAN (the
+    // host name is no longer shared with avahi, see engineServiceHostname). Log it without
+    // updating the store: the (2) suffix is an advertisement detail, not the machine hostname.
     service.on('name-change', (newName: string) => {
         log(`mDNS service name changed to '${newName}' due to conflict — hostname in store unchanged`);
     });
 
     service.advertise().then(() => {
-        log(`The following service is published on all interfaces: ${engineName}._engine._tcp.local`);
+        log(`The following service is published on ${interfaces ? interfaces.join(', ') : 'all interfaces'}: ${engineName}._engine._tcp.local`);
     }).catch((err) => {
         error(`Error advertising mDNS service: ${err}`)
     })
@@ -1771,53 +3903,48 @@ export const startAdvertising = (store: Store): CiaoService => {
     return service
 }
 
-const discoverEngines = async (storeHandle: DocHandle<Store>, repo:Repo): Promise<void> => {
+/** One browse round: discover, keep Engines of our store (selectStorePeers), connect/prune. `discover` is injectable for tests. */
+export const discoverEngines = async (storeHandle: DocHandle<Store>, repo:Repo, discover: (q: { name: string }) => Promise<any[]> = (q) => mDnsSd.discover(q)): Promise<void> => {
     const localEngine = getLocalEngine(storeHandle.doc());
     try {
-        const deviceList = await mDnsSd.discover({ name: '_engine._tcp.local' });
-        const discoveredPeers = new Map<IPAddress, {hostname: Hostname, engineId: EngineID}>();
+        const deviceList = await discover({ name: '_engine._tcp.local' });
+        const discovered: DiscoveredEngine[] = [];
 
         if (deviceList.length > 0) {
             log(chalk.bgBlackBright(`Discovered engines:`));
         }
 
         deviceList.forEach(device => {
-            const txt = device.packet.additionals.find((add: any) => ((typeof add == 'object') && add.hasOwnProperty('type') && add.type === 'TXT'));
-
-            if (!txt || !txt.rdata) {
+            const e = parseEngineDevice(device);
+            if (!e) {
                 log(chalk.redBright(`  - No TXT record for ${device.modelName || device.address}. Skipping.`));
                 return;
             }
-
-            const txtRecord = txt.rdata;
-            const engineId = txtRecord.id as EngineID;
-            const hostname = txtRecord.name as Hostname;
-            const address = device.address as IPAddress;
-            const port = device.service?.port;
-
-            log(`  - Name: ${hostname || 'N/A'}, ID: ${engineId || 'N/A'}, Address: ${address || 'N/A'}:${port || 'N/A'}`);
-
-            if (engineId && engineId === localEngine.id) {
-                return; // Skip local engine
-            }
-
-            if (address && hostname && engineId) {
-                discoveredPeers.set(address, { hostname, engineId });
-            }
+            log(`  - Name: ${e.hostname || 'N/A'}, ID: ${e.engineId || 'N/A'}, Store: ${e.store || 'N/A'}, Address: ${e.address || 'N/A'}:${e.port || 'N/A'}`);
+            discovered.push(e);
         });
+
+        // Store-scoped peering: only Engines of our own store are dialled.
+        const discoveredPeers = selectStorePeers(discovered, localEngine.id, storeTag(readStoreDocId()));
 
         await manageDiscoveredPeers(repo, discoveredPeers, storeHandle);
 
         if (deviceList.length === 0) {
             log(chalk.bgBlackBright(`No remote engines found`))
         }
-    } catch (error) {
-        log(`***node-dns-sd*** Error discovering engines`)
-        console.error(error);
+        if (lastDiscoveryError) { log(`[mdns] engine discovery working again`); lastDiscoveryError = '' }
+    } catch (error: any) {
+        const line = `${error?.message ?? error}`
+        if (line !== lastDiscoveryError) {
+            log(`***node-dns-sd*** Error discovering engines: ${line} (logged once until it changes)`)
+            lastDiscoveryError = line
+        }
     }
 }
 
 export const enableMulticastDNSEngineMonitor = (storeHandle: DocHandle<Store>, repo: Repo): { end: () => Promise<void> } => {
+    restrictDnsSdToLan()
+    catchDnsSdSendErrors()
     const service = startAdvertising(storeHandle.doc())
     
     const runDiscovery = async () => {
@@ -1831,6 +3958,77 @@ export const enableMulticastDNSEngineMonitor = (storeHandle: DocHandle<Store>, r
     return {
         end: () => service.end()
     }
+}
+
+```
+
+## File: src/monitors/metaLookCache.ts
+```typescript
+/**
+ * The read-only META look cache (idea#201 §10), one look per device.
+ *
+ * The usb monitor shares one read-only look per device between the device's own
+ * addDevice and the stick check of a FAT partition on the same drive, so they
+ * never race (two ro mounts of one device) and agree on the answer.
+ *
+ * A cached answer is only true until something writes META.yaml on the device.
+ * Every command that writes META.yaml and then calls addDevice (initialiseDisk,
+ * eraseDisk) must forget the device's look first (forgetMetaLook), or addDevice
+ * reuses the old "no META.yaml" answer and leaves the disk undocked
+ * (happy-zebra 2026-10-17, initialiseDisk AA000000000000004526).
+ *
+ * Kept in its own module (no Store or monitor imports) so commands can forget a
+ * look without importing the usb monitor.
+ */
+import { IdeaLookResult } from './mounts.js'
+
+export interface MetaLookCache {
+    /** The cached look of the device, or a new one from `look` (a failed look is not kept) */
+    get: (device: string, look: () => Promise<IdeaLookResult>) => Promise<IdeaLookResult>
+    /** The finished, successful look of the device, if one is cached (never starts a look; idea#303) */
+    peek: (device: string) => IdeaLookResult | undefined
+    /** Forget the device's look, so the next get looks again */
+    forget: (device: string) => void
+    /** Forget every look */
+    clear: () => void
+}
+
+export const createMetaLookCache = (): MetaLookCache => {
+    const looks = new Map<string, Promise<IdeaLookResult>>()
+    const done = new Map<string, IdeaLookResult>()
+    return {
+        get: (device, look) => {
+            let p = looks.get(device)
+            if (!p) {
+                const fresh = look()
+                p = fresh
+                looks.set(device, fresh)
+                // A failed look may be retried on the next add event
+                fresh.then(r => {
+                    if (looks.get(device) !== fresh) return
+                    if (r.ok) done.set(device, r)
+                    else looks.delete(device)
+                }, () => {
+                    if (looks.get(device) === fresh) looks.delete(device)
+                })
+            }
+            return p
+        },
+        peek: (device) => (looks.has(device) ? done.get(device) : undefined),
+        forget: (device) => { looks.delete(device); done.delete(device) },
+        clear: () => { looks.clear(); done.clear() },
+    }
+}
+
+/** The usb monitor's cache (one per Engine process). */
+export const metaLookCache: MetaLookCache = createMetaLookCache()
+
+/**
+ * Forget the cached read-only META look of a device. Call it after writing
+ * META.yaml on the device and before calling addDevice for it.
+ */
+export const forgetMetaLook = (device: string): void => {
+    metaLookCache.forget(device.replace(/^\/dev\/(engine\/)?/, ''))
 }
 
 ```
@@ -1860,7 +4058,7 @@ export const enableMulticastDNSEngineMonitor = (storeHandle: DocHandle<Store>, r
  * can inject fakes.
  */
 
-import { $, fs, sleep } from 'zx'
+import { $, YAML, fs, sleep } from 'zx'
 import { log } from '../utils/utils.js'
 import { disksRoot } from '../data/Config.js'
 import type { DocHandle } from '@automerge/automerge-repo'
@@ -1887,6 +4085,12 @@ export interface MountOps {
     mkdir(device: string): Promise<void>
     /** `sudo /usr/bin/mount -t ext4 /dev/<device> <disksRoot>/<device>` (idea#134) */
     mount(device: string): Promise<void>
+    /**
+     * Read-only look (idea#201 §10 rule 1):
+     * `sudo /usr/bin/mount -t ext4 -o ro,noload /dev/<device> <disksRoot>/<device>`.
+     * noload skips the journal replay, so nothing at all is written to the device.
+     */
+    mountReadOnly(device: string): Promise<void>
     /** `sudo umount <disksRoot>/<device>` (removes the top mount only) */
     umount(device: string): Promise<void>
     /** Remove the empty mount point folder (see removeMountPointFolder) */
@@ -1900,10 +4104,13 @@ export const SUDO_RMDIR = '/usr/bin/rmdir'
 /**
  * Typed ext4 mount (idea#134). Must match exactly the 11-engine-files entry
  * `/usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]` (same args, same order).
- * Old untyped entry stays in 10-engine until idea#143.
+ * Untyped mount removed from 10-engine in idea#143; only umount remains there.
  */
 export const SUDO_MOUNT = '/usr/bin/mount'
 export const SUDO_MOUNT_PATTERN = '/usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]'
+export const SUDO_MOUNT_RO_PATTERN = '/usr/bin/mount -t ext4 -o ro,noload /dev/sd[a-z][12] /disks/sd[a-z][12]'
+export const mountExt4ReadOnlyCommand = (device: string, mountPoint: string): string[] =>
+    [SUDO_MOUNT, '-t', 'ext4', '-o', 'ro,noload', `/dev/${device}`, mountPoint]
 export const mountExt4Command = (device: string, mountPoint: string): string[] =>
     [SUDO_MOUNT, '-t', 'ext4', `/dev/${device}`, mountPoint]
 
@@ -1953,6 +4160,11 @@ export const defaultMountOps: MountOps = {
         const mp = `${disksRoot()}/${device}`
         // Exact argv order required by 11-engine-files (idea#134)
         await $`sudo /usr/bin/mount -t ext4 /dev/${device} ${mp}`
+    },
+    mountReadOnly: async (device) => {
+        const mp = `${disksRoot()}/${device}`
+        // Exact argv order required by 11-engine-files (idea#201 §10)
+        await $`sudo /usr/bin/mount -t ext4 -o ro,noload /dev/${device} ${mp}`
     },
     umount: async (device) => { await $`sudo umount ${disksRoot()}/${device}` },
     rmdir: removeMountPointFolder,
@@ -2039,6 +4251,131 @@ export const safeMount = async (device: string, ops: MountOps = mountOps()): Pro
     }
     const fsUuid = await ops.fsUuidOfDevice(device).catch(() => null)
     return { ok: true, alreadyMounted, fsUuid }
+}
+
+// ── Read-only look (idea#201 §10 rule 1) ────────────────────────────────────
+
+export type IdeaLookResult =
+    | { ok: true, hasMeta: boolean, alreadyMounted: boolean, ignored?: boolean, osRootfs?: boolean, contents?: PartitionContents }
+    | { ok: false, message: string }
+
+/** What is in the root of a partition (#236): entries other than lost+found, and whether the root is owned by root. */
+export interface PartitionContents { rootOwned: boolean; entries: string[] }
+
+/** #236: read the partition root without following anything. Unreadable → treated as non-empty; a missing mount point → undefined (nothing to report). */
+export const partitionContents = (mountPoint: string): PartitionContents | undefined => {
+    let rootOwned = false
+    try { rootOwned = fs.lstatSync(mountPoint).uid === 0 } catch { /* unknown owner: not root-owned */ }
+    try {
+        return { rootOwned, entries: fs.readdirSync(mountPoint).filter(e => e !== 'lost+found').sort() }
+    } catch (e) {
+        if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return undefined
+        return { rootOwned, entries: [`(unreadable: ${e instanceof Error ? e.message : String(e)})`] }
+    }
+}
+
+/** Only report contents when there is something in the root, so an empty disk's look is unchanged. */
+const withContents = (c: PartitionContents | undefined): { contents?: PartitionContents } =>
+    c && c.entries.length > 0 ? { contents: c } : {}
+
+/**
+ * The on-disk ignore marker (idea#279, proposal for review): a file named
+ * IDEA-IGNORE in the root of the partition, next to META.yaml. Content is free
+ * text (an optional reason) and is never parsed. A partition with the marker is
+ * treated like an unrecognised disk even when it carries a valid META.yaml: it
+ * is released after the read-only look, never mounted read-write and never
+ * registered. The Engine never creates or removes the marker itself.
+ */
+export const IDEA_IGNORE_MARKER = 'IDEA-IGNORE'
+
+/**
+ * idea#279: a META.yaml counts as IDEA's mark only when it parses as a YAML
+ * mapping. An empty, unreadable or non-mapping META.yaml does not make a disk
+ * an IDEA disk. No field is required here, so every META.yaml the Engine reads
+ * today (readMetaUpdateId may fill in a missing hardware diskId) still docks.
+ */
+export const isValidIdeaMetaFile = (metaPath: string): boolean => {
+    try {
+        if (!fs.existsSync(metaPath)) return false
+        const parsed = YAML.parse(fs.readFileSync(metaPath, 'utf8'))
+        return !!parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Object.keys(parsed).length > 0
+    } catch {
+        return false
+    }
+}
+
+const lexists = (p: string): boolean => { try { fs.lstatSync(p); return true } catch { return false } }
+const isDirNoFollow = (p: string): boolean => { try { return fs.lstatSync(p).isDirectory() } catch { return false } }
+
+/**
+ * idea#279 (Steve, Lead, 2026-10-25): an operating-system root filesystem is never
+ * an IDEA data disk, even when it carries a META.yaml (an old Engine rootfs, or a
+ * client card that got a META.yaml from the idea#121 write). Rule: the partition
+ * root has `etc/os-release` (file or symlink, not followed) AND a real directory
+ * `usr/` or `boot/` (symlinks not followed). App, Files and Backup Disks have no
+ * `etc/` at their root, so they are never caught.
+ */
+export const hasOsRootfsLayout = (mountPoint: string): boolean =>
+    lexists(`${mountPoint}/etc/os-release`) && (isDirNoFollow(`${mountPoint}/usr`) || isDirNoFollow(`${mountPoint}/boot`))
+
+/** idea#279: true when the partition mounted at mountPoint carries the IDEA-IGNORE marker. */
+export const hasIgnoreMarker = (mountPoint: string): boolean => fs.existsSync(`${mountPoint}/${IDEA_IGNORE_MARKER}`)
+
+/**
+ * Decide whether /dev/<device> is an IDEA disk WITHOUT writing to it
+ * (idea#201 §10 rule 1). A device that is not mounted yet is mounted
+ * read-only (ext4 ro,noload) on <disksRoot>/<device>, META.yaml is looked
+ * for, and the device is unmounted again and the mount point removed. Only
+ * a device with META.yaml may then be mounted read-write (safeMount).
+ * A device that is already mounted at its target (Engine restart) is looked
+ * at in place and left as it is. A busy target or a device mounted elsewhere
+ * is refused, as in safeMount.
+ */
+export const lookForIdeaMeta = async (
+    device: string,
+    ops: MountOps = mountOps(),
+    metaExists: (mountPoint: string) => boolean = (mp) => isValidIdeaMetaFile(`${mp}/META.yaml`),
+    ignoreMarker: (mountPoint: string) => boolean = hasIgnoreMarker,
+    osRootfs: (mountPoint: string) => boolean = hasOsRootfsLayout,
+    contentsOf: (mountPoint: string) => PartitionContents | undefined = partitionContents,
+): Promise<IdeaLookResult> => {
+    const target = mountPointOf(device)
+    const check = await checkMountState(device, ops)
+    if (check.state === 'targetBusy') {
+        return { ok: false, message: `Refusing to look at /dev/${device}: ${target} is already a mount point` }
+    }
+    if (check.state === 'deviceElsewhere') {
+        return { ok: false, message: `Refusing to look at /dev/${device}: it is already mounted (${check.mounts.map(m => m.target).join(', ')})` }
+    }
+    if (check.state === 'mounted') {
+        if (osRootfs(target)) return { ok: true, hasMeta: false, alreadyMounted: true, ignored: ignoreMarker(target), osRootfs: true }
+        return { ok: true, hasMeta: metaExists(target), alreadyMounted: true, ignored: ignoreMarker(target), ...withContents(contentsOf(target)) }
+    }
+    try {
+        await ops.mkdir(device)
+        await ops.mountReadOnly(device)
+    } catch (e) {
+        await ops.rmdir(target).catch(() => undefined)
+        return { ok: false, message: `Could not mount /dev/${device} read-only on ${target}: ${e instanceof Error ? e.message : String(e)}` }
+    }
+    let hasMeta = false
+    let ignored = false
+    let rootfs = false
+    let contents: PartitionContents | undefined
+    try {
+        rootfs = osRootfs(target)
+        hasMeta = !rootfs && metaExists(target)
+        ignored = ignoreMarker(target)
+        contents = contentsOf(target)
+    } finally {
+        const released = await unmountAndRemove(device, ops)
+        if (!released.ok) {
+            return { ok: false, message: `Read-only look at /dev/${device}: ${released.message}` }
+        }
+    }
+    return rootfs
+        ? { ok: true, hasMeta: false, alreadyMounted: false, ignored, osRootfs: true }
+        : { ok: true, hasMeta, alreadyMounted: false, ignored, ...withContents(contents) }
 }
 
 // ── Unmounting ──────────────────────────────────────────────────────────────
@@ -2167,10 +4504,53 @@ const engineSetMonitor = (patch, storeHandle): boolean => {
     }
 }
 
-// Track which commands are currently in-flight, keyed by engineId + command string.
-// Commands for different instances can execute concurrently; commands for the same
-// engine still execute serially (queue[0] is always processed next).
-const _currentlyExecuting = new Set<string>()
+// One command at a time per engine queue (per store handle): the head is run,
+// then removed, then the next head is run. idea#168: a queue head is never left
+// in place, so it can never block the queue.
+const _busy = new WeakMap<object, Set<string>>()
+
+/**
+ * Run the head of an engine's command queue, remove it, and go on with the next
+ * head. Used by the live path (queue patches) and by the startup replay, so both
+ * behave the same and a command is never run twice.
+ *
+ * Every head goes through handleCommand, also a bare word without a space
+ * (idea#168): a registered command without arguments (reboot, ls, disks, ...)
+ * runs; anything else (unknown, or a command that needs arguments) is refused by
+ * handleCommand with an error trace and nothing runs. Either way the head is
+ * removed afterwards. Before, a bare word was skipped and stayed at the head,
+ * blocking every later command until a restart.
+ */
+export const processCommandQueue = (storeHandle: DocHandle<Store>, engineId: EngineID, cmdLogHandle?: DocHandle<CommandLogStore> | null): void => {
+    let busy = _busy.get(storeHandle)
+    if (!busy) { busy = new Set(); _busy.set(storeHandle, busy) }
+    if (busy.has(String(engineId))) return
+    const queue = storeHandle.doc()?.engineDB[engineId as any]?.commands as unknown[] | undefined
+    if (!queue?.length) return
+
+    const head = queue[0]
+    const command = typeof head === 'string' ? head : String(head ?? '')
+    busy.add(String(engineId))
+    log(`Processing command for engine ${engineId}: ${command}`)
+    // agent-engine-dev#262: never run a command inside the store 'change' event that announced
+    // it. A storeHandle.change() made from inside that event is applied only after the event
+    // returns, so a command that changes the store and then checks the result (forgetDisk)
+    // saw its own change as not done. setImmediate runs it on a clean stack.
+    new Promise<void>(resolve => setImmediate(resolve))
+        .then(() => handleCommand(commands, storeHandle, 'engine', command, cmdLogHandle ?? null))
+        .catch(e => log(`Command '${command}' failed outside its trace: ${e?.message ?? e}`))
+        .finally(() => {
+            busy!.delete(String(engineId))
+            storeHandle.change(doc => {
+                const list = doc.engineDB[engineId as any]?.commands as any[] | undefined
+                if (!list) return
+                // Remove the command that ran: normally still the head
+                const i = list.findIndex(c => (typeof c === 'string' ? c : String(c ?? '')) === command)
+                if (i !== -1) list.splice(i, 1)
+            })
+            processCommandQueue(storeHandle, engineId, cmdLogHandle)
+        })
+}
 
 const engineCommandsMonitor = (patch, storeHandle): boolean => {
     const isCommandPath =
@@ -2184,28 +4564,7 @@ const engineCommandsMonitor = (patch, storeHandle): boolean => {
     const engineId = patch.path[1] as EngineID
     if (engineId !== localEngineId) return true
 
-    const doc = storeHandle.doc()
-    const queue = doc?.engineDB[engineId as any]?.commands as string[] | undefined
-    if (!queue?.length) return true
-
-    const command = queue[0]
-    if (!command || !command.includes(' ')) return true
-
-    // Use engineId+command as the dedup key so a new command with the same text
-    // (but on a different instance) can still run concurrently.
-    const key = `${engineId}:${command}`
-    if (_currentlyExecuting.has(key)) return true
-
-    _currentlyExecuting.add(key)
-    log(`Processing command for engine ${engineId}: ${command}`)
-    const cmdLogHandle = (storeHandle as any).__commandLogHandle ?? null
-    handleCommand(commands, storeHandle, 'engine', command, cmdLogHandle).then(() => {
-        _currentlyExecuting.delete(key)
-        storeHandle.change(doc => {
-            const eng = doc.engineDB[engineId as any]
-            if (eng) (eng.commands as any[]).splice(0, 1)
-        })
-    })
+    processCommandQueue(storeHandle, engineId, (storeHandle as any).__commandLogHandle ?? null)
     return true
 }
 
@@ -2263,25 +4622,14 @@ export const enableStoreMonitor = (storeHandle: DocHandle<Store>, commandLogHand
     // On startup, process any commands already queued for this engine.
     // The storeMonitor only fires on new patches, so commands written before
     // this engine started (or while it was offline) would otherwise be silently ignored.
-    // Replay any commands already in the queue at startup.
-    const startupStore = storeHandle.doc()
-    const startupCmds = [...((startupStore?.engineDB[localEngineId]?.commands as string[]) ?? [])]
-    if (startupCmds.length) {
-        log(`Replaying ${startupCmds.length} pending command(s) from queue on startup`)
-        ;(async () => {
-            for (const cmd of startupCmds) {
-                const startupKey = `${localEngineId}:${cmd}`
-                _currentlyExecuting.add(startupKey)
-                await handleCommand(commands, storeHandle, 'engine', cmd, commandLogHandle)
-                _currentlyExecuting.delete(startupKey)
-                storeHandle.change(doc => {
-                    const eng = doc.engineDB[localEngineId as any]
-                    if (eng) (eng.commands as any[]).splice(0, 1)
-                })
-            }
-        })()
+    // Same path as live commands (idea#168): serial, each command runs once.
+    const pending = storeHandle.doc()?.engineDB[localEngineId]?.commands?.length ?? 0
+    if (pending) {
+        log(`Replaying ${pending} pending command(s) from queue on startup`)
+        processCommandQueue(storeHandle, localEngineId, commandLogHandle)
     }
 }
+
 ```
 
 ## File: src/monitors/timeMonitor.ts
@@ -2358,44 +4706,41 @@ export const logTimeCallback = () => {
 //     }
 // }
 
-let runs = 0
+// The stored heartbeat (lastRun every 30 s) moved to data/Liveness.ts (store-design
+// 2026-10-13): an ephemeral hb every 10 s plus a stored lastRun at boot and hourly.
 
-export const generateHeartBeat = (storeHandle) => {
-    runs++
-    storeHandle.change(doc => {
-        const lastRun = (new Date()).getTime() as Timestamp
-        log(`UPDATING ENGINE LASTRUN TO ${lastRun}`)
-        //log(`This is the doc to change: ${deepPrint(doc, 2)}`)
-        const localEngine = getLocalEngine(doc)
-        localEngine.lastRun = lastRun
-        //inspectEngine(store, localEngine)
-    })
-} 
 ```
 
 ## File: src/monitors/usbDeviceMonitor.ts
 ```typescript
-import chokidar from 'chokidar'
-import { getKeys, log, uuid } from '../utils/utils.js'
-import { DiskMeta, readHardwareId, readMetaUpdateId, writeMetaFile } from '../data/Meta.js';
+import chokidar, { FSWatcher } from 'chokidar'
+import nodePath from 'path'
+import { getKeys, log } from '../utils/utils.js'
+import { DiskMeta, readMetaUpdateId } from '../data/Meta.js';
 import { $, fs, YAML, chalk } from 'zx'
 
 $.verbose = false;
 import { Disk, clearDuplicateDiskRecords, createOrUpdateDisk, isSystemDiskRecord, processDisk } from '../data/Disk.js'
 import { flushFilesRemountNow, optedInInstances } from '../data/FilesMount.js'
+import { clearUndockPending, dockChangedReason, dockIdentityOf, ejectInFlightWaitMs, markUndockPending, waitInFlightOnDisk } from '../data/InstanceInFlight.js'
 import { isSystemDevice, systemDriveNames, driveNameOf } from '../data/SystemDisk.js'
-import { refreshUnformattedDisks } from '../data/UnformattedDisks.js'
-import { isEraseDeviceLocked, setEraseAddDevice } from '../data/EraseDisk.js'
+import { refreshUnformattedDisks, setAfterUnformattedPoll } from '../data/UnformattedDisks.js'
+import { setInitialiseAddDevice } from '../data/FlashCard.js'
+import { eraseLockRefusesAdd, isEraseDeviceLocked, setEraseAddDevice } from '../data/EraseDisk.js'
 import { findDiskByDevice, findDisksByDevice, Store, getDisksOfEngine, getLocalEngine } from '../data/Store.js'
 import { DeviceName, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../data/CommonTypes.js'
 
 import { Instance, Status, stopInstance } from '../data/Instance.js';
-import { config, disksRoot, skipMetaWrite } from '../data/Config.js'
+import { config, disksRoot } from '../data/Config.js'
 import { DocHandle } from '@automerge/automerge-repo';
 import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js';
 import { runWithTrace } from '../utils/CommandLogger.js';
 import { recordDiskDetectionFailure, errorMessage } from './diskDetection.js';
-import { safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointOf } from './mounts.js';
+import { addStick, classifyFsType, stickBlockedBySiblings, removeStick, removeSticksOnDrive, usbStartupCleanup, usbStickOps, usbStickRoutingActive, syncUsbApps } from '../data/UsbSticks.js'
+import { lookForIdeaMeta, IdeaLookResult, isValidIdeaMetaFile, hasIgnoreMarker, hasOsRootfsLayout, safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointOf } from './mounts.js';
+import { isTestDeviceName, isValidDeviceName, isSdWholeDisk, partitionName, needsDirectSystemAdd } from './deviceNames.js'
+import { metaLookCache } from './metaLookCache.js';
+import { clearFailedLook, readPartitionSignatures, recordFailedLook, retryChangedFailedLooks } from './failedLookRetry.js'
 
 /**
  * Filesystem UUID of each mounted device, recorded at mount time (or when an
@@ -2404,13 +4749,9 @@ import { safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointO
  */
 const mountedFsUuids = new Map<string, string | null>()
 
-/**
- * Pretend disks created by the test harness use names that real hardware never
- * produces (e.g. `idea-test-1`). Only an Engine in testMode accepts them.
- */
-export const TEST_DEVICE_PATTERN = /^idea-test-[0-9]+$/
-export const isTestDeviceName = (device: string | undefined | null): boolean =>
-    !!device && TEST_DEVICE_PATTERN.test(device)
+// Test-only device names (idea#105) now live in deviceNames.ts; re-exported here
+// for existing importers.
+export { TEST_DEVICE_PATTERN, isTestDeviceName } from './deviceNames.js'
 
 /**
  * Options for the watcher on the udev watch folder (/dev/engine).
@@ -2427,6 +4768,135 @@ export const DEVICE_WATCH_OPTIONS = { persistent: true, followSymlinks: false } 
 
 /** Watch the udev watch folder for device links (see DEVICE_WATCH_OPTIONS). */
 export const watchDeviceFolder = (watchDir: string) => chokidar.watch(watchDir, { ...DEVICE_WATCH_OPTIONS })
+
+/**
+ * Device names in the watch folder. A missing folder means "no USB devices", not
+ * an error (agent-engine-dev#228): udev only creates /dev/engine with the first
+ * sd* link, so a Pi with an NVMe or SD root and no USB disk has none. tmpfiles.d
+ * (idea-engine.conf) should create it at boot, but the Engine cannot rely on it
+ * and cannot create it itself (pi can't mkdir in /dev). Other errors are logged
+ * and also read as empty, so they never stop the monitor from starting.
+ */
+export const listDeviceFolder = async (dir: string): Promise<string[]> => {
+    try {
+        return (await fs.readdir(dir)).filter(Boolean)
+    } catch (e: any) {
+        if (e?.code === 'ENOENT') log(`${dir} does not exist — no USB devices attached yet`)
+        else log(`Could not list ${dir}: ${errorMessage(e)} — treating it as empty`)
+        return []
+    }
+}
+
+/** How often watchDeviceFolderWhenPresent checks whether the watch folder exists (one stat). */
+export const DEVICE_FOLDER_POLL_MS = 2000
+
+export interface DeviceFolderHandlers {
+    add: (path: string) => unknown
+    unlink: (path: string) => unknown
+    error: (error: unknown) => void
+}
+
+export interface DeviceFolderWatch {
+    /** True while a chokidar watcher is attached to the folder. */
+    isAttached: () => boolean
+    close: () => Promise<void>
+}
+
+/**
+ * Watch the udev watch folder, also when it does not exist yet or disappears
+ * again (agent-engine-dev#228). chokidar 3 on a missing folder reports the folder
+ * appearing but not the links created in it, and a watcher on a folder that was
+ * removed and recreated stays blind. So: one stat every `pollMs`; when the
+ * folder is there (and not yet watched, or replaced by a new inode) a watcher is
+ * attached with watchDeviceFolder, whose initial scan reports the links already
+ * in it; when it is gone the watcher is closed and every link it had reported is
+ * reported as unlinked (udev removes the folder only after its last link).
+ */
+export const watchDeviceFolderWhenPresent = (
+    watchDir: string,
+    handlers: DeviceFolderHandlers,
+    pollMs: number = DEVICE_FOLDER_POLL_MS,
+): DeviceFolderWatch => {
+    const root = nodePath.resolve(watchDir)
+    let watcher: FSWatcher | null = null
+    let ino: number | null = null
+    let closed = false
+    const present = new Set<string>()
+
+    const folderIno = (): number | null => {
+        try {
+            const st = fs.statSync(root)
+            return st.isDirectory() ? st.ino : null
+        } catch {
+            return null
+        }
+    }
+    const detach = (): void => {
+        const w = watcher
+        if (!w) return
+        watcher = null
+        ino = null
+        const gone = [...present]
+        present.clear()
+        void w.close().catch(e => log(`Closing the watcher on ${root}: ${errorMessage(e)}`))
+        log(`${root} is gone — device watcher detached${gone.length ? `; ${gone.length} device(s) unlinked` : ''}`)
+        for (const p of gone) handlers.unlink(p)
+    }
+    const attach = (i: number): void => {
+        ino = i
+        const w = watchDeviceFolder(root)
+        watcher = w
+        w.on('add', p => { if (watcher !== w) return; present.add(p); handlers.add(p) })
+            .on('unlink', p => { if (watcher !== w) return; present.delete(p); handlers.unlink(p) })
+            .on('unlinkDir', p => { if (watcher === w && nodePath.resolve(p) === root) detach() })
+            .on('error', e => { if (watcher === w) handlers.error(e) })
+        log(`Device watcher attached to ${root}`)
+    }
+    const check = (): void => {
+        if (closed) return
+        const i = folderIno()
+        if (watcher && i !== ino) detach()
+        if (!watcher && i !== null) attach(i)
+    }
+
+    check()
+    if (!watcher) log(`${root} does not exist yet — checking every ${pollMs} ms and watching it once it appears`)
+    const timer = setInterval(check, pollMs)
+    timer.unref?.()
+    return {
+        isAttached: () => watcher !== null,
+        close: async () => {
+            closed = true
+            clearInterval(timer)
+            const w = watcher
+            watcher = null
+            present.clear()
+            await w?.close()
+        },
+    }
+}
+
+/**
+ * agent-engine-dev#228: a root device outside the udev rule (nvme0n1p2 on a Pi 5
+ * booting from NVMe, mmcblk0p2 on an SD-booted Pi) gets no link in the watch
+ * folder, so the watcher never reports it: register it directly through
+ * addDevice. Independent of whether the watch folder exists. Returns true when
+ * it was started.
+ */
+export const registerUnlinkedSystemDisk = (opts: {
+    systemDevice: string | null | undefined
+    watchDir: string
+    systemDiskSkip: boolean
+    addDevice: (path: string) => Promise<unknown>
+}): boolean => {
+    const { systemDevice, watchDir, systemDiskSkip, addDevice } = opts
+    const linkExists = !!systemDevice && fs.existsSync(`${watchDir}/${systemDevice}`)
+    if (!needsDirectSystemAdd(systemDevice, { systemDiskSkip, linkExists })) return false
+    log(`System disk ${systemDevice} has no link in ${watchDir} — registering it directly`)
+    void addDevice(`${watchDir}/${systemDevice}`).catch(e =>
+        recordDiskDetectionFailure('dock', `Could not register the system disk on ${systemDevice}: ${errorMessage(e)}`, { device: systemDevice }))
+    return true
+}
 
 export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
 
@@ -2460,9 +4930,9 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                 const bootSrc = (await $`findmnt -n -o SOURCE /boot/firmware`).stdout.trim()
                 const bootDev = bootSrc.replace(/^\/dev\//, '').replace(/\[.*\]$/, '')
                 if (bootDev) systemBootDevice = bootDev as DeviceName
-                else systemBootDevice = (parent + '1') as DeviceName
+                else systemBootDevice = partitionName(parent, 1) as DeviceName
             } catch {
-                systemBootDevice = (parent + '1') as DeviceName
+                systemBootDevice = partitionName(parent, 1) as DeviceName
             }
             log(`System disk detected: root=${systemDevice}, boot=${systemBootDevice}, drives=${systemDrives.join(',')}`)
         }
@@ -2470,14 +4940,78 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         log(`Could not detect system device: ${e}`)
     }
 
+    // sd* (sda, sda1, sda2), NVMe / mmcblk partitions and the detected root
+    // device itself (agent-engine-dev#228); idea-test-N only in testMode (idea#105).
     const validDevice = function (device: string): boolean {
-        // Test-only device names (idea-test-N) are accepted only in testMode.
-        // A live Engine (testMode off) ignores them, so a pretend disk can never
-        // be picked up and mounted by a live Engine (idea#105).
-        if (isTestDeviceName(device)) return config.settings.testMode
-        // Check if the device begins with "sd", is then followed by a letter and ends with the number 2
-        // We need the m flag - see https://regexr.com/7rvpq 
-        return device && (device.match(/^sd[a-z][1-2]$/m) || device.match(/^sd[a-z]$/m)) ? true : false
+        return isValidDeviceName(device, { systemDevice, testMode: config.settings.testMode })
+    }
+
+    /**
+     * idea#201 §10: one read-only META look per device, shared by the device's own
+     * addDevice and by the stick check of a FAT partition on the same drive, so
+     * they never race (two ro mounts of one device) and agree on the answer.
+     * Forgotten when the device is removed, and by every command that writes
+     * META.yaml before it calls addDevice (forgetMetaLook, metaLookCache.ts).
+     */
+    metaLookCache.clear()
+    const sharedMetaLook = (device: DeviceName): Promise<IdeaLookResult> =>
+        metaLookCache.get(device, () => !mountCommandsActive(config.settings.testMode)
+            ? Promise.resolve({ ok: true, hasMeta: !hasOsRootfsLayout(`${disksRoot()}/${device}`) && isValidIdeaMetaFile(`${disksRoot()}/${device}/META.yaml`), alreadyMounted: false, ignored: hasIgnoreMarker(`${disksRoot()}/${device}`) } as IdeaLookResult)
+            : lookForIdeaMeta(device).catch(e => ({ ok: false, message: errorMessage(e) }) as IdeaLookResult))
+
+    /**
+     * idea#193 §3.1: probe the filesystem type; vfat/exfat on a non-system disk is
+     * mounted read-only as a teacher stick. Returns true when the device was a
+     * stick (mounted, or refused with a recorded failure), false for ext4 and
+     * anything else (the IDEA disk path continues unchanged).
+     */
+    const tryAddStick = async (device: DeviceName): Promise<boolean> => {
+        if (isTestDeviceName(device) || !usbStickRoutingActive()) return false
+        let probe
+        try { probe = await usbStickOps().probe(device) } catch (e) { log(`USB stick probe of ${device}: ${errorMessage(e)}`); return false }
+        if (!probe || classifyFsType(probe.fsType) !== 'stick') return false
+        if (await isSystemDevice(device) || device === systemBootDevice || device === systemDevice) {
+            log(`Device ${device} (${probe.fsType}) is on the system drive — never mounted as a USB stick`)
+            return true
+        }
+        // idea#201 §10 follow-up: the FAT boot partition of an OS card (Linux
+        // partition without META.yaml) is not a stick. The sibling is judged by
+        // the same shared read-only look its own addDevice uses, so the order of
+        // the add events does not matter. Never mounted, never registered.
+        if (driveNameOf(device) !== device) {
+            let parts: Awaited<ReturnType<ReturnType<typeof usbStickOps>['drivePartitions']>> = []
+            try { parts = await usbStickOps().drivePartitions(device) } catch (e) { log(`USB stick sibling check of ${device}: ${errorMessage(e)}`) }
+            const why = await stickBlockedBySiblings(device, parts, async (sib) => {
+                const look = await sharedMetaLook(sib as DeviceName)
+                return look.ok ? (look.hasMeta && !look.ignored) : null
+            })
+            if (why) {
+                log(`Device ${device} (${probe.fsType}) is not a teacher stick: ${why} — not mounted`)
+                return true
+            }
+        }
+        const result = await addStick(storeHandle, device, probe)
+        if (!result.ok) recordDiskDetectionFailure('mount', result.message, { device })
+        return true
+    }
+
+    /** idea#201 §10 rule 1: a device without IDEA META.yaml is left untouched. */
+    const logUnknownDisk = (device: DeviceName): void => {
+        log(`Device ${device} has no IDEA META.yaml — not an IDEA disk; left untouched (never mounted read-write, no META.yaml written)`)
+    }
+
+    /** idea#279: an IDEA disk with the IDEA-IGNORE marker is treated like an unrecognised disk. */
+    const logIgnoredDisk = (device: DeviceName): void => {
+        log(`Device ${device} carries the IDEA-IGNORE marker — treated as unrecognised; left untouched (never mounted read-write, not registered)`)
+    }
+
+    /**
+     * idea#279: a partition that is not adopted may still change what the whole
+     * disk looks like (an 'Unformatted' disk that just got an ext4 partition), so
+     * the whole-disk lists are re-evaluated after every partition outcome.
+     */
+    const refreshAfterPartition = async (): Promise<void> => {
+        await refreshUnformattedDisks(storeHandle).catch(e => log(`unformatted refresh: ${e}`))
     }
 
     const addDevice = async function (path: string) {
@@ -2489,13 +5023,19 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
 
             // Skip whole-disk entries for mounting (idea#134): accepted by validDevice
             // so lsblk can list them as unformatted candidates; never mounted.
-            if (device.match(/^sd[a-z]$/)) {
+            if (isSdWholeDisk(device)) {
+                // A stick formatted without a partition table carries FAT/exFAT on the
+                // whole disk (idea#193 §3.2): mount it read-only like a partition.
+                if (!isEraseDeviceLocked(device) && await tryAddStick(device)) {
+                    await refreshUnformattedDisks(storeHandle).catch(e => log(`unformatted refresh: ${e}`))
+                    return
+                }
                 log(`Device ${device} is a whole-disk entry — refreshing unformattedDisks, not mounting`)
                 await refreshUnformattedDisks(storeHandle).catch(e => log(`unformatted refresh: ${e}`))
                 return
             }
             // Skip devices locked by eraseDisk for the whole erase (idea#134)
-            if (isEraseDeviceLocked(device) || isEraseDeviceLocked(driveNameOf(device))) {
+            if (eraseLockRefusesAdd(device)) {
                 log(`Device ${device} is locked for erase — addDevice skipped`)
                 return
             }
@@ -2535,9 +5075,59 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                     return
                 }
 
+                // FAT/exFAT teacher stick (idea#193 §3.1): read-only under /run/idea-usb, never an IDEA disk
+                if (await tryAddStick(device)) {
+                    await refreshUnformattedDisks(storeHandle).catch(e => log(`unformatted refresh: ${e}`))
+                    return
+                }
+
+                // idea#201 §10 rule 1: only a device with IDEA META.yaml is ever
+                // mounted read-write. Anything else (client SD cards, an Ubuntu or
+                // Raspberry Pi OS card, a foreign ext4 disk) is looked at read-only
+                // at most, released again, and never gets a META.yaml. Such a disk
+                // becomes an IDEA disk only through an explicit command
+                // (eraseDisk today, initialiseDisk later).
+                const metaPath = `${disksRoot()}/${device}/META.yaml`
                 if (!mountCommandsActive(config.settings.testMode)) {
                     log(`testMode: skipping mount for device ${device} — fixture expected at ${disksRoot()}/${device}`)
+                    if (hasOsRootfsLayout(`${disksRoot()}/${device}`) || !isValidIdeaMetaFile(metaPath)) {
+                        logUnknownDisk(device)
+                        await refreshAfterPartition()
+                        return
+                    }
+                    if (hasIgnoreMarker(`${disksRoot()}/${device}`)) {
+                        logIgnoredDisk(device)
+                        await refreshAfterPartition()
+                        return
+                    }
                 } else {
+                    // idea#307: the fs signature before the look, so a look that fails because mkfs
+                    // is still running is retried once lsblk shows the new filesystem
+                    const sigBefore = (await readPartitionSignatures().catch(() => new Map())).get(device) ?? null
+                    const look = await sharedMetaLook(device)
+                    if (!look.ok) {
+                        recordDiskDetectionFailure('mount', look.message, { device })
+                        recordFailedLook(device, sigBefore)
+                        return
+                    }
+                    clearFailedLook(device)
+                    if (!look.hasMeta) {
+                        if (look.osRootfs) {
+                            // One line only: the rootfs rule decided, whether or not META.yaml is there
+                            log(`Device ${device} has an operating-system rootfs layout (etc/os-release + usr/ or boot/) — never an IDEA disk, even with META.yaml (idea#279); left untouched (never mounted read-write, not registered)`)
+                        } else {
+                            if (look.alreadyMounted) log(`Device ${device} is already mounted without META.yaml — left as it is`)
+                            logUnknownDisk(device)
+                        }
+                        await refreshAfterPartition()
+                        return
+                    }
+                    if (look.ignored) {
+                        if (look.alreadyMounted) log(`Device ${device} is already mounted with the IDEA-IGNORE marker — left as it is`)
+                        logIgnoredDisk(device)
+                        await refreshAfterPartition()
+                        return
+                    }
                     // findmnt-based check by target and source, for every filesystem
                     // type; never mounts twice or onto an existing mount point (idea#126)
                     const result = await safeMount(device)
@@ -2549,68 +5139,15 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                     log(result.alreadyMounted ? `Device ${device} already mounted` : `Device ${device} has been successfully mounted`)
                 }
 
-                let meta: DiskMeta
-                if (fs.existsSync(`${disksRoot()}/${device}/META.yaml`)) {
-                    log(`Found a META file on device ${device}. This disk has been processed by the system before.`)
-                    try {
-                        meta = await readMetaUpdateId(device)
-                        const disk: Disk = createOrUpdateDisk(storeHandle, localEngine.id, device, meta.diskId, meta.diskName, meta.created)
-                        await processDisk(storeHandle, disk)
-                    } catch (error) {
-                        log('Error processing the META file on the disk: ' + error)
-                        recordDiskDetectionFailure('readMeta', `Could not process META.yaml on ${device}: ${errorMessage(error)}`, { device })
-                    }
-                } else {
-                    // Before creating a new disk entry, check if a disk is already
-                    // registered for this device on THIS engine in the store. This prevents
-                    // spurious empty-disk entries when addDevice fires for a device that's
-                    // already docked (e.g. during docker compose up -d Recreate cycles).
-                    // Scoped to localEngine.id to avoid false matches on other engines' disks
-                    // in the shared CRDT store (e.g. all Pis having sda2 as the root device).
-                    const existingDisk = findDiskByDevice(storeHandle.doc(), device as DeviceName, localEngine.id)
-                    if (existingDisk) {
-                        log(`Device ${device} already has a registered disk (${existingDisk.id}) on this engine — skipping new disk creation`)
-                        return
-                    }
-                    log('Could not find a META file. Creating one now.')
-                    const diskId = await readHardwareId(device) as DiskID
-                    // The disk name should be the name of the volume if available, otherwise 'Unnamed Disk'
-                    let diskName: DiskName = 'Unnamed Disk' as DiskName
-                    try {
-                        const volumeNameOutput = await $`lsblk -no LABEL /dev/${device}`
-                        const volumeName = volumeNameOutput.stdout.trim()
-                        // Check if it is a valid volume name (not empty) - it should also not have any newlines
-                        if (volumeName && volumeName.length > 0 && !volumeName.includes('\n')) {
-                            diskName = volumeName as DiskName
-                        }
-                    } catch (e) {
-                        log(`Error reading volume name for device ${device}: ${e}`)
-                    }
-                    meta = {
-                        diskId: diskId ? diskId : uuid() as DiskID,
-                        isHardwareId: !!diskId,
-                        diskName: diskName,
-                        created: Date.now() as Timestamp,
-                        lastDocked: Date.now() as Timestamp
-                    }
-                    // Persist the identity on the disk (idea#121). Without this every
-                    // dock generated a new diskId (when there is no hardware serial)
-                    // and left an orphan diskDB entry behind. Under /disks the write goes through
-                    // sudo tee (11-engine-files). A failed write (read-only
-                    // mount, sudoers entry missing) is recorded and the disk is still registered.
-                    const metaPath = `${disksRoot()}/${device}/META.yaml`
-                    if (skipMetaWrite()) {
-                        log(`Not writing ${metaPath} (skipMetaWrite)`)
-                    } else {
-                        try {
-                            await writeMetaFile(meta, metaPath)
-                        } catch (e) {
-                            const idNote = meta.isHardwareId ? 'its id comes from the hardware serial' : 'it will get a new id on its next dock'
-                            recordDiskDetectionFailure('writeMeta', `Could not write META.yaml on ${device} (${idNote}); registering the disk anyway: ${errorMessage(e)}`, { device, diskId: meta.diskId })
-                        }
-                    }
+                log(`Found a META file on device ${device}. This disk has been processed by the system before.`)
+                try {
+                    const meta: DiskMeta = await readMetaUpdateId(device)
                     const disk: Disk = createOrUpdateDisk(storeHandle, localEngine.id, device, meta.diskId, meta.diskName, meta.created)
                     await processDisk(storeHandle, disk)
+                    await refreshAfterPartition()
+                } catch (error) {
+                    log('Error processing the META file on the disk: ' + error)
+                    recordDiskDetectionFailure('readMeta', `Could not process META.yaml on ${device}: ${errorMessage(error)}`, { device })
                 }
             } catch (e) {
                 log(`Error processing device ${device}`)
@@ -2623,16 +5160,29 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     }
 
         setEraseAddDevice(addDevice)
+        setInitialiseAddDevice(addDevice)
 
     const removeDevice = async (path: string) => {
         const device = path.split('/').pop()
         if (validDevice(device!)) {
             log(`Processing the removal of USB device ${device}`)
+            metaLookCache.forget(device!)
+            clearFailedLook(device!)
+            // Teacher sticks first (idea#193 §3.4): partition, or every stick of a whole drive
+            const removedSticks = isSdWholeDisk(device)
+                ? await removeSticksOnDrive(storeHandle, device!, 'unplugged')
+                : (await removeStick(storeHandle, device!, 'unplugged')) ? [device] : []
+            if (removedSticks.length) {
+                await refreshUnformattedDisks(storeHandle).catch(e => log(`unformatted refresh: ${e}`))
+                return
+            }
             // Every record on the device, not just the first (idea#152)
             const undocked = await undockAllOnDevice(storeHandle, localEngine.id, device as DeviceName)
             if (undocked.length === 0) {
                 log(`No disk found on ${device}`)
             }
+            // idea#201 §10: a pulled card / new disk leaves clientCards / newDisks at once
+            await refreshUnformattedDisks(storeHandle).catch(e => log(`unformatted refresh: ${e}`))
         } else {
             log(`Non-USB device ${device} has been removed`)
         }
@@ -2651,75 +5201,102 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
         }
     }
 
-    const engineWatchDir = process.env.IDEA_WATCH_DIR || '/dev/engine'
-    const actualDevices = (config.settings.isDev || config.settings.testMode) ? [] : (await $`ls ${engineWatchDir}`).toString().split('\n').filter(device => validDevice(device))
-    log(`Actual devices: ${actualDevices}`)
-
-    log(`Removing from the network database disks that were attached before the current boot but are no longer attached now...`)
-
-    const storedDisks = getDisksOfEngine(store, localEngine)
-    if (storedDisks.length !== 0) {
-        log(`The engine object shows previously mounted disks: ${storedDisks.map(d => d.id)}`)
-        const storedDevices = storedDisks.map(disk => disk.device).filter((device): device is DeviceName => device !== undefined && device !== null)
-        log(`Which were on devices: ${storedDevices}`)
-
-        for (let device of [...new Set(storedDevices)]) {
-            const disks = findDisksByDevice(storeHandle.doc(), device, localEngine.id)
-            if (disks.length === 0) continue
-            // Never undock the system disk based on /dev/engine listing —
-            // the root partition is always present and /dev/engine may not
-            // be populated yet (e.g. tmpfiles.d race) or may be empty in
-            // testMode. System disk presence is guaranteed by the OS itself.
-            const systemDisk = disks.find(d => d.diskTypes?.includes('system'))
-            if (systemDisk) {
-                log(`Skipping undock of system disk ${systemDisk.id} on device ${device} — system disk is always present`)
-                continue
-            }
-            if (!actualDevices.includes(device)) {
-                log(`Removing disk from previously mounted device ${device}`)
-                const undocked = await undockAllOnDevice(storeHandle, localEngine.id, device)
-                log(`Disk(s) ${undocked.join(', ')} removed from local engine`)
-            } else {
-                // Still attached: if stale records share the device, keep the one
-                // META.yaml names (idea#152)
-                await resolveDuplicateDisksOnDevice(storeHandle, localEngine.id, device)
-            }
-        }
-    } else {
-        log(`No previous disks found in the network database`)
-    }
-
-    log(`Cleaning the mount points...`)
-    const previousMounts = (config.settings.isDev || config.settings.testMode) ? [] : (await $`ls ${disksRoot()}`).toString().split('\n').filter(device => validDevice(device))
-    log(`Previously mounted devices: ${previousMounts}`)
-    // Stale mount point folders of devices that are no longer attached. A folder
-    // that is still a mount point (by findmnt target or mountpoint -q) is left
-    // alone; an empty one is removed with rmdir, never rm -fr (idea#126).
-    for (let device of previousMounts) {
-        log(`Checking if device ${device} is still actual or mounted`)
-        if (actualDevices.includes(device)) continue
-        try {
-            const mounts = await mountOps().listMounts()
-            const mountPoint = mountPointOf(device)
-            if (mounts.some(m => m.target === mountPoint) || await mountOps().isMountPoint(mountPoint)) {
-                log(`Stale mount point ${mountPoint} is still mounted — leaving it`)
-                continue
-            }
-            log(`Cleaning up stale mount point for ${device}`)
-            await mountOps().rmdir(mountPoint)
-            log(`Device ${device} has been successfully cleaned up`)
-        } catch (e) {
-            log(`Error cleaning up the stale mount point of ${device}: ${errorMessage(e)}`)
-        }
-    }
-
     const watchDir = process.env.IDEA_WATCH_DIR || '/dev/engine'
-    const watcher = watchDeviceFolder(watchDir)
+    // Startup cleanup of records and mount points from before this start. A
+    // failure here is reported but never stops the system disk registration or
+    // the watcher below (agent-engine-dev#228).
+    try {
+        const actualDevices = (config.settings.isDev || config.settings.testMode) ? [] : (await listDeviceFolder(watchDir)).filter(device => validDevice(device))
+        log(`Actual devices: ${actualDevices}`)
 
-    watcher
-        .on('add', addDevice)
-        .on('unlink', removeDevice)
-        .on('error', error => recordDiskDetectionFailure('watcher', `Watcher error on ${watchDir}: ${errorMessage(error)}`, { watchDir }))
+        log(`Removing from the network database disks that were attached before the current boot but are no longer attached now...`)
+
+        const storedDisks = getDisksOfEngine(store, localEngine)
+        if (storedDisks.length !== 0) {
+            log(`The engine object shows previously mounted disks: ${storedDisks.map(d => d.id)}`)
+            const storedDevices = storedDisks.map(disk => disk.device).filter((device): device is DeviceName => device !== undefined && device !== null)
+            log(`Which were on devices: ${storedDevices}`)
+
+            for (let device of [...new Set(storedDevices)]) {
+                const disks = findDisksByDevice(storeHandle.doc(), device, localEngine.id)
+                if (disks.length === 0) continue
+                // Never undock the system disk based on /dev/engine listing —
+                // the root partition is always present and /dev/engine may not
+                // be populated yet (e.g. tmpfiles.d race) or may be empty in
+                // testMode. System disk presence is guaranteed by the OS itself.
+                const systemDisk = disks.find(d => d.diskTypes?.includes('system'))
+                if (systemDisk) {
+                    log(`Skipping undock of system disk ${systemDisk.id} on device ${device} — system disk is always present`)
+                    continue
+                }
+                if (!actualDevices.includes(device)) {
+                    log(`Removing disk from previously mounted device ${device}`)
+                    const undocked = await undockAllOnDevice(storeHandle, localEngine.id, device)
+                    log(`Disk(s) ${undocked.join(', ')} removed from local engine`)
+                } else {
+                    // Still attached: if stale records share the device, keep the one
+                    // META.yaml names (idea#152)
+                    await resolveDuplicateDisksOnDevice(storeHandle, localEngine.id, device)
+                }
+            }
+        } else {
+            log(`No previous disks found in the network database`)
+        }
+
+        log(`Cleaning the mount points...`)
+        const previousMounts = (config.settings.isDev || config.settings.testMode) ? [] : (await listDeviceFolder(disksRoot())).filter(device => validDevice(device))
+        log(`Previously mounted devices: ${previousMounts}`)
+        // Stale mount point folders of devices that are no longer attached. A folder
+        // that is still a mount point (by findmnt target or mountpoint -q) is left
+        // alone; an empty one is removed with rmdir, never rm -fr (idea#126).
+        for (let device of previousMounts) {
+            log(`Checking if device ${device} is still actual or mounted`)
+            if (actualDevices.includes(device)) continue
+            try {
+                const mounts = await mountOps().listMounts()
+                const mountPoint = mountPointOf(device)
+                if (mounts.some(m => m.target === mountPoint) || await mountOps().isMountPoint(mountPoint)) {
+                    log(`Stale mount point ${mountPoint} is still mounted — leaving it`)
+                    continue
+                }
+                log(`Cleaning up stale mount point for ${device}`)
+                await mountOps().rmdir(mountPoint)
+                log(`Device ${device} has been successfully cleaned up`)
+            } catch (e) {
+                log(`Error cleaning up the stale mount point of ${device}: ${errorMessage(e)}`)
+            }
+        }
+    } catch (e) {
+        recordDiskDetectionFailure('monitorStart', `USB device monitor startup cleanup failed (monitor continues): ${errorMessage(e)}`, { watchDir })
+    }
+
+    // Teacher sticks (idea#193 §3.4): unmount leftovers under /run/idea-usb before the
+    // watcher's initial adds mount the sticks that are still plugged in.
+    if (usbStickRoutingActive()) {
+        await usbStartupCleanup(storeHandle).catch(e => log(`USB sticks startup cleanup: ${errorMessage(e)}`))
+        void syncUsbApps(storeHandle, 'start')
+    }
+
+    // agent-engine-dev#228: register a root device the udev rule does not link
+    // (nvme0n1p2, mmcblk0p2) directly, whether or not the watch folder exists.
+    registerUnlinkedSystemDisk({ systemDevice, watchDir, systemDiskSkip: !!config.settings.systemDiskSkip, addDevice })
+
+    // Also when the folder is missing (no USB disk yet on an NVMe/SD-root Pi):
+    // the watcher attaches as soon as udev creates it (agent-engine-dev#228).
+    const watcher = watchDeviceFolderWhenPresent(watchDir, {
+        add: addDevice,
+        unlink: removeDevice,
+        error: error => recordDiskDetectionFailure('watcher', `Watcher error on ${watchDir}: ${errorMessage(error)}`, { watchDir }),
+    })
+
+    // idea#307: on each lsblk poll tick, look again at a partition whose failed look was followed
+    // by a filesystem change (fs type or UUID); it goes through addDevice, so the read-only rules hold
+    setAfterUnformattedPoll(() => retryChangedFailedLooks(async (device) => {
+        const p = `${watchDir}/${device}`
+        try { await fs.lstat(p) } catch { return }
+        log(`Device ${device}: its filesystem changed after a failed look — looking again (idea#307)`)
+        await addDevice(p)
+    }))
 
     log(`Watching ${watchDir} for USB devices`)
     return watcher
@@ -2782,20 +5359,62 @@ export const undockAllOnDevice = async (storeHandle: DocHandle<Store>, engineId:
         storeHandle.change(doc => { cleared = clearDuplicateDiskRecords(doc, engineId, device, primary.id) })
         log(`Undocked stale disk record(s) ${cleared.join(', ')} on ${device}`)
     }
-    await undockDisk(storeHandle, primary)
+    // Device-removal path: the disk is already gone, so no in-flight wait (#179 applies to eject).
+    await undockDisk(storeHandle, primary, { waitInFlight: false })
     return [primary.id, ...cleared]
 }
 
-export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
+/** Result of undockDisk: `aborted` names why an eject stopped after its in-flight wait (disk pulled/re-docked meanwhile). */
+export type UndockResult = { aborted: string | null }
+
+/** Device node + mount still the one this dock made? Only with real mount commands (not testMode/sim). */
+const liveMountChangedReason = async (device: string): Promise<string | null> => {
+    if (!mountCommandsActive(config.settings.testMode)) return null
+    if (!fs.existsSync(`/dev/${device}`)) return `device /dev/${device} is gone`
+    const src = (await $`findmnt -n -o SOURCE ${mountPointOf(device)}`.nothrow()).stdout.trim()
+    if (src !== `/dev/${device}`) return `${mountPointOf(device)} is not mounted from /dev/${device} (source ${src || 'none'})`
+    return null
+}
+
+export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk, opts: { waitInFlight?: boolean } = {}): Promise<UndockResult | void> => {
+    markUndockPending(String(disk.id))
+    try { return await undockDiskInner(storeHandle, disk, opts) } finally { clearUndockPending(String(disk.id)) }
+}
+
+const undockDiskInner = async (storeHandle: DocHandle<Store>, disk: Disk, opts: { waitInFlight?: boolean }): Promise<UndockResult> => {
+    const device0 = disk.device
+    const before = dockIdentityOf(disk)
+    // #179: an instance start/install still running on this disk must settle first (bounded),
+    // then it is stopped below. Otherwise it carries on against the unmounted disk (r82b/r83).
+    // Only for an Engine-initiated undock (ejectDisk, erase), where the disk is still there and
+    // the Engine itself unmounts it. After a physical removal (device gone, undockAllOnDevice
+    // from the monitor) the disk is already gone: waiting cannot help the start and would only
+    // keep the pulled disk listed as docked for up to the bound (disk-dock-undock).
+    if (opts.waitInFlight !== false && device0 && !(await isSystemDiskRecord(disk))) {
+        const w = await waitInFlightOnDisk(String(disk.id), ejectInFlightWaitMs())
+        if (w.timedOut.length) log(`Undock ${disk.id}: still in flight after ${w.waitedMs}ms (${w.timedOut.join(', ')}) — stopping anyway`)
+        else if (w.waitedMs > 0) log(`Undock ${disk.id}: in-flight start(s) settled after ${w.waitedMs}ms`)
+        // hw180: the disk may have been pulled (and even re-plugged on a new device) during the wait.
+        // Only act on the very dock this eject was for: same device node, mount and dock generation.
+        if (w.waitedMs > 0 || w.timedOut.length) {
+            const reason = dockChangedReason(before, dockIdentityOf(storeHandle.doc()?.diskDB?.[disk.id]))
+                ?? await liveMountChangedReason(device0)
+            if (reason) {
+                log(`Eject of ${disk.id} aborted after the in-flight wait: ${reason}; nothing unmounted, store left as is`)
+                return { aborted: reason }
+            }
+        }
+    }
+    // Read the store AFTER the wait, so instances registered by a settling install are stopped too
     const store: Store = storeHandle.doc()
     const device = disk.device
     if (!device) {
         log(`Disk ${disk.id} is not mounted on any device. Nothing to undock.`)
-        return
+        return { aborted: null }
     }
     if (await isSystemDiskRecord(disk)) {
         log(`Disk ${disk.id} on ${device} is this Pi's system disk — never undocked`)
-        return
+        return { aborted: null }
     }
     try {
         // Combined Files Disk eject (§7.3): recreate opted-in instances on *other*
@@ -2862,6 +5481,7 @@ export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk) => {
         log(e)
         recordDiskDetectionFailure('undock', `Could not undock the disk on ${device}: ${errorMessage(e)}`, { device, diskId: disk.id })
     }
+    return { aborted: null }
 }
 
 /**
@@ -2920,6 +5540,7 @@ import { AsyncLocalStorage } from 'async_hooks'
 import type { DocHandle } from '@automerge/automerge-repo'
 import type { CommandLogStore, LogEntry } from '../data/CommandLogStore.js'
 import { flushLogs } from '../data/CommandLogStore.js'
+import { redactSecrets, redactString, redactedJson } from './redact.js'
 
 export interface TraceContext {
   traceId: string
@@ -2970,7 +5591,7 @@ const scheduleFlush = (traceId: string): void => {
  */
 export const appendToTrace = (traceId: string, entry: LogEntry): void => {
   if (!pendingBuffers.has(traceId)) pendingBuffers.set(traceId, [])
-  pendingBuffers.get(traceId)!.push(entry)
+  pendingBuffers.get(traceId)!.push({ ...entry, message: redactString(entry.message) })
   scheduleFlush(traceId)
 }
 
@@ -3012,12 +5633,12 @@ const patchConsole = (): void => {
 
   const patch = (level: Level) => {
     console[level] = (...args: unknown[]) => {
-      originals[level](...args)              // always write to stdout
+      originals[level](...args.map(a => redactSecrets(a)))  // always write to stdout (idea#113: hashes redacted)
       const ctx = getActiveTrace()
       if (ctx) {
         appendToTrace(ctx.traceId, {
           level,
-          message: args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '),
+          message: args.map(a => (typeof a === 'string' ? redactString(a) : redactedJson(a))).join(' '),
           timestamp: Date.now(),
         })
       }
@@ -3160,6 +5781,356 @@ export const diskKey = (diskId: string) => `disk:${diskId}`
 
 ```
 
+## File: src/utils/appDataHelper.ts
+```typescript
+/**
+ * appDataHelper.ts — the Engine side of the app-data root helper (idea#168)
+ *
+ * App containers write their instance data as root (Kolibri sessions, 0600),
+ * 999 (MariaDB, 0700 folders) and www-data (Nextcloud). The Engine runs as pi, so
+ * it cannot read that data, and a copy made by pi loses the owners. Instance data
+ * is therefore sized, copied, sent, deleted, backed up and restored by
+ * /usr/local/sbin/idea-app-data (script/build_image_assets/idea-app-data), run with
+ * `sudo -n`. One sudoers line with no argument list allows it (11-engine-files);
+ * the helper validates every argument itself and builds every path from tokens:
+ *
+ *   root  'system' (the system disk), 'sdX1'/'sdX2' (a mounted Engine disk), or a
+ *         pool slot name such as 'idea-test-1' (only through the helper's TEST-ONLY
+ *         root bridge file /etc/idea/app-data-roots, which production never has)
+ *   id    an instance id (^[a-z0-9][a-z0-9-]{0,63}$)
+ *
+ * App masters and service tars are Engine-written and pi-owned, so locally they stay
+ * plain pi operations. Every call is an argv array (never a shell string). Commands
+ * for a PEER Engine (ensure-dirs, receive-app/-service/-files, delete) go over ssh
+ * with this Engine's own key (utils/peerSsh.ts) as one remote command built from
+ * checked tokens; on the peer the forced command idea-peer-gate parses it and runs
+ * that Engine's helper (helper version 2, per-Pi Engine keys).
+ */
+
+import { spawn } from 'child_process'
+import fs from 'fs'
+import { $ } from 'zx'
+import { log } from './utils.js'
+import { config } from '../data/Config.js'
+import { peerSshArgv, checkEngineId } from './peerSsh.js'
+
+/** Installed path of the helper (a root-owned copy, 0755; build-engine installUdev). */
+export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
+
+/**
+ * The helper version this Engine speaks. Must equal IDEA_APP_DATA_VERSION in
+ * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
+ * subcommands or their arguments change.
+ */
+export const APP_DATA_HELPER_VERSION = '5'
+
+export const APP_DATA_HELPER_UPDATE =
+    'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
+    '/usr/local/sbin/idea-app-data and its line in /etc/sudoers.d/11-engine-files; build-engine does the same) (idea#168)'
+
+/** The borg binary idea-app-data runs by absolute path (BORG= in the helper; Debian package borgbackup). */
+export const BORG_PATH = '/usr/bin/borg'
+
+const ROOT_TOKEN = /^(system|sd[a-z][12]|[a-z0-9][a-z0-9-]{0,63})$/
+const ID_TOKEN = /^[a-z0-9][a-z0-9-]{0,63}$/
+const ARCHIVE_TOKEN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9-]{8,16}Z$/
+const APP_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+
+const checkRoot = (root: string): string => {
+    if (!ROOT_TOKEN.test(root)) throw new Error(`'${root}' is not a disk root the app-data helper accepts (system, sdX1/sdX2 or a test slot name)`)
+    return root
+}
+const checkId = (id: string): string => {
+    if (!ID_TOKEN.test(id)) throw new Error(`'${id}' is not an instance id the app-data helper accepts`)
+    return id
+}
+const checkApp = (appId: string): string => {
+    if (!APP_TOKEN.test(appId) || appId.includes('..')) throw new Error(`'${appId}' is not an app id the app-data helper accepts`)
+    return appId
+}
+const checkArchive = (archive: string): string => {
+    if (!ARCHIVE_TOKEN.test(archive)) throw new Error(`'${archive}' is not a backup archive name the app-data helper accepts`)
+    return archive
+}
+
+// ── Helper arguments (subcommand first) ──────────────────────────────────────
+
+export const sizeArgs = (root: string, id: string): string[] => ['size', checkRoot(root), checkId(id)]
+export const copyArgs = (srcRoot: string, srcId: string, dstRoot: string, dstId: string): string[] =>
+    ['copy', checkRoot(srcRoot), checkId(srcId), checkRoot(dstRoot), checkId(dstId)]
+/** send: the peer's address AND its Engine id (the helper pins the peer's host key by Engine id). */
+export const sendArgs = (srcRoot: string, srcId: string, host: string, peerEngineId: string, dstRoot: string, dstId: string): string[] => {
+    if (!/^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/.test(host)) throw new Error(`'${host}' is not a host the app-data helper accepts`)
+    return ['send', checkRoot(srcRoot), checkId(srcId), host, checkEngineId(peerEngineId), checkRoot(dstRoot), checkId(dstId)]
+}
+/** On a peer (through its gate): create apps/, instances/, services/ on <root>, owned by pi. */
+export const ensureDirsArgs = (root: string): string[] => ['ensure-dirs', checkRoot(root)]
+/**
+ * TEST-ONLY: erase a loop-backed duration slot (idea-test-N) to an empty IDEA disk.
+ * umount + mkfs.ext4 + remount via the helper; production USB erase stays on idea-erase-disk.
+ */
+export const eraseSlotArgs = (slot: string, stagingDir: string): string[] => {
+    checkRoot(slot)
+    if (slot === 'system' || /^sd[a-z][12]$/.test(slot)) {
+        throw new Error(`'${slot}' is not a test slot name erase-slot accepts`)
+    }
+    if (!stagingDir || stagingDir.includes('\0')) throw new Error('stagingDir is required for erase-slot')
+    return ['erase-slot', slot, stagingDir]
+}
+/** On a peer: the rsync server for an app master, <root>/apps/<appId> (written as pi). */
+export const receiveAppArgs = (root: string, appId: string): string[] => ['receive-app', checkRoot(root), checkApp(appId)]
+/** On a peer: the rsync server for service image tars, <root>/services (written as pi). */
+export const receiveServiceArgs = (root: string): string[] => ['receive-service', checkRoot(root)]
+/** On a peer: the rsync server for compose.yaml/.env into an instance folder this Engine's receive created. */
+export const receiveFilesArgs = (root: string, id: string): string[] => ['receive-files', checkRoot(root), checkId(id)]
+/**
+ * Local Engine: copy basenames from a /tmp staging dir into an existing instance
+ * folder as root (idea-app-data put-files). Peers use receive-files through the gate.
+ */
+export const putFilesArgs = (root: string, id: string, stagingDir: string): string[] => {
+    if (!stagingDir || stagingDir.includes('\0')) throw new Error('stagingDir is required for put-files')
+    if (!stagingDir.startsWith('/tmp/')) throw new Error('stagingDir for put-files must be under /tmp')
+    return ['put-files', checkRoot(root), checkId(id), stagingDir]
+}
+/** idea#347: rename instances/<id> to <disk>/.idea-quarantine/<id>-<UTC stamp>; prints the new path. */
+export const quarantineArgs = (root: string, id: string): string[] => ['quarantine', checkRoot(root), checkId(id)]
+export const deleteArgs = (root: string, id: string): string[] => ['delete', checkRoot(root), checkId(id)]
+export const borgInitArgs = (bdev: string, id: string): string[] => ['borg-init', checkRoot(bdev), checkId(id)]
+export const borgInfoArgs = (bdev: string, id: string): string[] => ['borg-info', checkRoot(bdev), checkId(id)]
+export const borgCreateArgs = (bdev: string, id: string, archive: string, srcRoot: string): string[] =>
+    ['borg-create', checkRoot(bdev), checkId(id), checkArchive(archive), checkRoot(srcRoot)]
+export const borgExtractArgs = (bdev: string, id: string, archive: string, strip: number, dstRoot: string): string[] => {
+    if (!Number.isInteger(strip) || strip < 1 || strip > 9) throw new Error(`strip ${strip} is out of range (1-9)`)
+    return ['borg-extract', checkRoot(bdev), checkId(id), checkArchive(archive), String(strip), checkRoot(dstRoot)]
+}
+
+/** The argv for `sudo`: sudo -n /usr/local/sbin/idea-app-data <args…> */
+export const appDataSudoArgv = (args: string[]): string[] => ['-n', APP_DATA_HELPER, ...args]
+
+/** A helper call as the words of a remote command: sudo -n /usr/local/sbin/idea-app-data <args…> */
+export const remoteHelperCommand = (args: string[]): string[] => ['sudo', '-n', APP_DATA_HELPER, ...args]
+
+/** The same as one string, for `rsync --rsync-path=` (tokens are checked, no quoting needed). */
+export const remoteHelperRsyncPath = (args: string[]): string => remoteHelperCommand(args).join(' ')
+
+/**
+ * The ssh argv that deletes a partial copy on a peer Engine with that Engine's
+ * helper (its gate allows it only for a folder this Engine's receive created). The
+ * remote command is ONE argument built from checked tokens only.
+ */
+export const remoteDeleteSshArgs = (host: string, peerEngineId: string, root: string, id: string): string[] =>
+    peerSshArgv(host, peerEngineId, remoteHelperCommand(deleteArgs(root, id)))
+
+/** The ssh argv that creates apps/, instances/ and services/ on the peer's target disk (idea#80). */
+export const remoteEnsureDirsSshArgs = (host: string, peerEngineId: string, root: string): string[] =>
+    peerSshArgv(host, peerEngineId, remoteHelperCommand(ensureDirsArgs(root)))
+
+// ── Running the helper ───────────────────────────────────────────────────────
+
+/** Runs the helper with these arguments (subcommand first) and returns stdout. */
+export type AppDataRunner = (args: string[]) => Promise<string>
+
+/**
+ * The error text for a failed helper run: the helper's own "refused: …" line when
+ * there is one, else its stderr; plus the update hint when sudo could not run it.
+ */
+export const appDataErrorMessage = (sub: string, code: number | null, signal: string | null, stderr: string): string => {
+    const lines = stderr.split('\n').map(l => l.trim()).filter(Boolean)
+    const refusal = lines.find(l => l.startsWith('refused: '))
+    const missing = /a password is required|command not found|No such file or directory|not allowed to execute|may not run sudo/.test(stderr)
+    const what = refusal ?? (signal ? `stopped by ${signal}` : `exited with code ${code}`) + (lines.length ? `: ${lines.filter(l => !l.startsWith('idea-app-data: test-only root bridge:')).join(' | ')}` : '')
+    return `idea-app-data ${sub} ${what}${missing ? ` — ${APP_DATA_HELPER_UPDATE}` : ''}`
+}
+
+/** Default runner: `sudo -n /usr/local/sbin/idea-app-data <args…>` (no shell). */
+export const runAppData: AppDataRunner = (args) => new Promise((resolve, reject) => {
+    log(`sudo -n ${APP_DATA_HELPER} ${args.join(' ')}`)
+    const proc = spawn('sudo', appDataSudoArgv(args), { stdio: ['ignore', 'pipe', 'pipe'] })
+    let stdout = ''
+    let stderr = ''
+    proc.stdout.on('data', (c: Buffer) => { stdout += c.toString() })
+    proc.stderr.on('data', (c: Buffer) => { stderr += c.toString() })
+    proc.on('error', (err) => reject(new Error(`idea-app-data ${args[0]}: could not start sudo: ${err.message}`)))
+    proc.on('close', (code, signal) => {
+        if (code === 0) resolve(stdout)
+        else reject(new Error(appDataErrorMessage(args[0], code, signal, stderr)))
+    })
+})
+
+/** Bytes used by an instance folder (du -sk -x as root). */
+export const instanceDataBytes = async (root: string, id: string, run: AppDataRunner = runAppData): Promise<number> => {
+    const out = (await run(sizeArgs(root, id))).trim()
+    const kb = parseInt(out, 10)
+    if (!/^[0-9]+$/.test(out) || isNaN(kb)) throw new Error(`idea-app-data size gave no size: '${out}'`)
+    return kb * 1024
+}
+
+/** Removes an instance folder as root (rm -rf --one-file-system). A missing folder is fine. */
+export const deleteInstanceData = async (root: string, id: string, run: AppDataRunner = runAppData): Promise<void> => {
+    await run(deleteArgs(root, id))
+}
+
+/** Place basename files from staging into an instance folder as root (local Engine). */
+export const putInstanceFiles = async (
+    root: string,
+    id: string,
+    stagingDir: string,
+    run: AppDataRunner = runAppData,
+): Promise<void> => {
+    await run(putFilesArgs(root, id, stagingDir))
+}
+
+/** Removes an instance folder on a peer Engine: ssh pi@host sudo -n idea-app-data delete <root> <id> (through its gate). */
+export const deleteRemoteInstanceData = async (host: string, peerEngineId: string, root: string, id: string): Promise<void> => {
+    await $`${remoteDeleteSshArgs(host, peerEngineId, root, id)}`
+}
+
+/** Creates apps/, instances/ and services/ on a peer's disk (through its gate). */
+export const ensureRemoteDirs = async (host: string, peerEngineId: string, root: string): Promise<void> => {
+    await $`${remoteEnsureDirsSshArgs(host, peerEngineId, root)}`
+}
+
+/**
+ * `sudo -n idea-app-data sync-peers` with the FULL peer set on stdin (one line per
+ * peer: `<engineId> ssh-ed25519 <key> ssh-ed25519 <hostkey>`). Returns stdout.
+ */
+export type AppDataInputRunner = (args: string[], input: string) => Promise<string>
+
+export const runAppDataWithInput: AppDataInputRunner = (args, input) => new Promise((resolve, reject) => {
+    log(`sudo -n ${APP_DATA_HELPER} ${args.join(' ')} (${input.split('\n').filter(Boolean).length} line(s) on stdin)`)
+    const proc = spawn('sudo', appDataSudoArgv(args), { stdio: ['pipe', 'pipe', 'pipe'] })
+    let stdout = ''
+    let stderr = ''
+    proc.stdout.on('data', (c: Buffer) => { stdout += c.toString() })
+    proc.stderr.on('data', (c: Buffer) => { stderr += c.toString() })
+    proc.on('error', (err) => reject(new Error(`idea-app-data ${args[0]}: could not start sudo: ${err.message}`)))
+    proc.on('close', (code, signal) => {
+        if (code === 0) resolve(stdout)
+        else reject(new Error(appDataErrorMessage(args[0], code, signal, stderr)))
+    })
+    proc.stdin.on('error', () => undefined)
+    proc.stdin.end(input)
+})
+
+// ── Version check at startup ─────────────────────────────────────────────────
+
+/**
+ * What is wrong with borg for the helper, or null. The helper runs /usr/bin/borg
+ * by absolute path; without it backup and restore fail with exit 127 (wh, 2026-10-13).
+ */
+/** How borgProblem looks for the binary; tests that fake the helper replace `exists`. */
+export const borgPresence: { exists: (p: string) => boolean } = { exists: (p) => fs.existsSync(p) }
+
+export const borgProblem = (exists: (p: string) => boolean = borgPresence.exists): string | null =>
+    exists(BORG_PATH) ? null :
+        `${BORG_PATH} is not installed, so Backup Disk backups and restores cannot run (the app-data helper calls it by absolute path); ${APP_DATA_HELPER_UPDATE}.`
+
+/** What is wrong with the installed helper, or null when it is the version this Engine needs. */
+export const appDataHelperProblem = async (run: AppDataRunner = runAppData): Promise<string | null> => {
+    const want = `idea-app-data ${APP_DATA_HELPER_VERSION}`
+    let got: string
+    try {
+        got = (await run(['version'])).trim()
+    } catch (e: any) {
+        return `This Engine needs the app-data root helper ${APP_DATA_HELPER} (version ${APP_DATA_HELPER_VERSION}), ` +
+            `but it cannot be run with sudo -n (${e?.message ?? e}). Copy, move, backup and restore of app data need it; ${APP_DATA_HELPER_UPDATE}.`
+    }
+    if (got !== want) {
+        return `This Engine needs the app-data root helper ${APP_DATA_HELPER} version ${APP_DATA_HELPER_VERSION}, ` +
+            `but the installed one reports '${got}'; ${APP_DATA_HELPER_UPDATE}.`
+    }
+    return null
+}
+
+/**
+ * Startup check (softened, Steve 2026-10-28): the Engine ALWAYS starts. A missing,
+ * unrunnable or different helper is logged loudly and returned; each command that
+ * needs a newer helper refuses on its own with HELPER_OUTDATED (helperAtLeast):
+ * removeInstance needs v4, updateApp v5. isDev machines skip the check.
+ */
+export const assertAppDataHelper = async (run: AppDataRunner = runAppData): Promise<string | null> => {
+    if (config.settings.isDev) {
+        log('isDev: not checking the app-data root helper (idea-app-data)')
+        return null
+    }
+    const problem = await appDataHelperProblem(run)
+    if (problem) {
+        log(`WARNING: ${problem} The Engine starts anyway; commands that need a newer helper refuse with HELPER_OUTDATED.`)
+        return problem
+    }
+    log(`app-data root helper ${APP_DATA_HELPER} version ${APP_DATA_HELPER_VERSION} is installed`)
+    return null
+}
+
+/** null when the installed helper is at least `min`; else a clear message for HELPER_OUTDATED. */
+export const helperAtLeast = async (min: number, what: string, run: AppDataRunner = runAppData): Promise<string | null> => {
+    let got = ''
+    try { got = (await run(['version'])).trim() } catch (e: any) {
+        return `${what} needs the app-data root helper ${APP_DATA_HELPER} v${min} or later, but it cannot be run with sudo -n (${e?.message ?? e}); ${APP_DATA_HELPER_UPDATE}.`
+    }
+    const v = Number(got.match(/^idea-app-data (\d+)$/)?.[1])
+    if (Number.isFinite(v) && v >= min) return null
+    return `${what} needs the app-data root helper ${APP_DATA_HELPER} v${min} or later, but the installed one reports '${got || 'nothing'}'; ${APP_DATA_HELPER_UPDATE}.`
+}
+
+/**
+ * Startup preflight for borg. Not fatal (an Engine without a Backup Disk works),
+ * but loud at start, and backupMonitor refuses a backup with the same message
+ * instead of running into exit 127.
+ */
+export const reportBorgAtStartup = (exists: (p: string) => boolean = borgPresence.exists): string | null => {
+    if (config.settings.isDev) return null
+    const problem = borgProblem(exists)
+    if (problem) console.error(`ERROR (preflight): ${problem}`)
+    else log(`${BORG_PATH} is installed`)
+    return problem
+}
+
+// ── updateApp snapshots (helper v5, agent-engine-dev#230) ────────────────────
+export const snapshotArgs = (root: string, id: string): string[] => ['snapshot', checkRoot(root), checkId(id)]
+export const restoreSnapshotArgs = (root: string, id: string): string[] => ['restore-snapshot', checkRoot(root), checkId(id)]
+export const snapshotsArgs = (root: string): string[] => ['snapshots', checkRoot(root)]
+export const estimateArgs = (root: string, id: string): string[] => ['estimate', checkRoot(root), checkId(id)]
+/** `estimate` result: "<folder kb> <volumes kb> <free kb>" (read-only; nothing is stopped). */
+export const parseEstimate = (out: string): { folderBytes: number, volumeBytes: number, freeBytes: number } => {
+    const m = lastLine(out).match(/^(\d+) (\d+) (\d+)$/)
+    if (!m) throw new Error(`idea-app-data estimate gave no result line: ${lastLine(out) || '(empty)'}`)
+    return { folderBytes: Number(m[1]) * 1024, volumeBytes: Number(m[2]) * 1024, freeBytes: Number(m[3]) * 1024 }
+}
+
+/** The helper prints rsync progress first; its result is the last non-empty line. */
+export const lastLine = (out: string): string => out.trim().split('\n').map(s => s.trim()).filter(Boolean).pop() ?? ''
+
+export interface SnapshotVolume { name: string, bytes: number, exportMs: number }
+export interface SnapshotResult {
+    path: string, sizeBytes: number
+    /** where the previous snapshot of this instance was renamed to (.idea-quarantine), or null */
+    previousQuarantinedAt: string | null
+    volumes: SnapshotVolume[]
+}
+
+/** `snapshot` result: "VOLUME <name> <bytes> <ms>" lines, then "<dir> <kb> <old|none>" last. */
+export const parseSnapshotResult = (out: string): SnapshotResult => {
+    const m = lastLine(out).match(/^(\/\S+) (\d+)(?: (\S+))?$/)
+    if (!m) throw new Error(`idea-app-data snapshot gave no result line: ${lastLine(out) || '(empty)'}`)
+    const volumes = [...out.matchAll(/^VOLUME (\S+) (\d+) (\d+)$/gm)].map(v => ({ name: v[1], bytes: Number(v[2]), exportMs: Number(v[3]) }))
+    return { path: m[1], sizeBytes: Number(m[2]) * 1024, previousQuarantinedAt: m[3] && m[3] !== 'none' ? m[3] : null, volumes }
+}
+
+/** `snapshots` lines: "<id> <kb> complete|incomplete", then "TOTAL pre-update <kb>" and "TOTAL quarantine <kb>". */
+export const parseSnapshotsList = (out: string): { snapshots: { instanceId: string, sizeBytes: number, complete: boolean }[], preUpdateBytes: number | null, quarantineBytes: number | null } => {
+    const total = (what: string) => { const m = out.match(new RegExp(`^TOTAL ${what} (\\d+)$`, 'm')); return m ? Number(m[1]) * 1024 : null }
+    return {
+        snapshots: out.split('\n').map(l => l.trim().match(/^([a-z0-9][a-z0-9-]{0,63}) (\d+) (complete|incomplete)$/))
+            .filter((m): m is RegExpMatchArray => !!m)
+            .map(m => ({ instanceId: m[1], sizeBytes: Number(m[2]) * 1024, complete: m[3] === 'complete' })),
+        preUpdateBytes: total('pre-update'), quarantineBytes: total('quarantine'),
+    }
+}
+
+
+```
+
 ## File: src/utils/cliFlags.ts
 ```typescript
 /**
@@ -3229,9 +6200,72 @@ import { DocHandle } from "@automerge/automerge-repo";
 import { Store } from "../data/Store.js";
 import { Command, EngineID } from "../data/CommonTypes.js";
 import { ArgumentDescriptor, CommandDefinition } from "../data/CommandDefinition.js";
-import { CommandLogStore, addTrace, closeTrace, getCommandLogHandle } from "../data/CommandLogStore.js";
+import { CommandLogStore, addTrace, closeTrace, getCommandLogHandle, takePendingTraceResult } from "../data/CommandLogStore.js";
 import { runWithTrace, flushTrace } from "./CommandLogger.js";
 import { print } from './utils.js';
+import { redactString } from './redact.js';
+
+
+/**
+ * One-shot error trace for refusals before execute (unknown command, scope,
+ * argument parse). idea#122: every queued command must leave a trace the
+ * Console can show; previously these paths printed and returned with no trace.
+ */
+const recordErrorTrace = (
+    commandLogHandle: DocHandle<CommandLogStore> | null | undefined,
+    commandName: string,
+    argsJson: string,
+    message: string
+): void => {
+    if (!commandLogHandle) return;
+    const traceId = crypto.randomUUID();
+    addTrace(commandLogHandle, {
+        traceId,
+        command: commandName || '(empty)',
+        args: redactString(argsJson),
+        startedAt: Date.now(),
+        completedAt: null,
+        status: 'running',
+        errorMessage: null,
+    });
+    closeTrace(commandLogHandle, traceId, 'error', redactString(message));
+}
+
+
+/**
+ * Split the argument part of a command line into tokens (idea#168 r29@97).
+ *
+ * Without a double quote this is exactly the old split on single spaces
+ * (empty tokens dropped). With quotes, a token that starts with `"` runs to
+ * the next `"` that ends a token (followed by a space or the end), so a disk
+ * name with spaces can be one argument: `restoreApp kolibri "My Disk"`. The
+ * quotes are removed. A `"` inside a token, or an opening quote with no
+ * closing one, stays literal.
+ */
+export const splitArgs = (argString: string): string[] => {
+    if (!argString.includes('"')) return argString.split(' ').filter(arg => arg.length > 0);
+    const tokens: string[] = [];
+    let i = 0;
+    while (i < argString.length) {
+        if (argString[i] === ' ') { i++; continue; }
+        if (argString[i] === '"') {
+            let close = argString.indexOf('"', i + 1);
+            while (close !== -1 && close + 1 < argString.length && argString[close + 1] !== ' ') {
+                close = argString.indexOf('"', close + 1);
+            }
+            if (close !== -1) {
+                tokens.push(argString.substring(i + 1, close));
+                i = close + 1;
+                continue;
+            }
+        }
+        let end = argString.indexOf(' ', i);
+        if (end === -1) end = argString.length;
+        tokens.push(argString.substring(i, end));
+        i = end;
+    }
+    return tokens;
+}
 
 
 export const handleCommand = async (
@@ -3246,7 +6280,14 @@ export const handleCommand = async (
     const command = commands.find(cmd => cmd.name === commandName);
 
     if (!command) {
-        print(`Unknown command: ${commandName}`);
+        const message = `Unknown command: ${commandName}`;
+        print(message);
+        recordErrorTrace(
+            commandLogHandle,
+            commandName || '(empty)',
+            JSON.stringify({ input: trimmedInput }),
+            message
+        );
         return;
     }
 
@@ -3262,17 +6303,21 @@ export const handleCommand = async (
             stringArgs.push(trimmedInput.substring(firstSpaceIndex + 1));
         }
     } else {
-        stringArgs = trimmedInput.split(' ').slice(1).filter(arg => arg.length > 0);
+        stringArgs = splitArgs(trimmedInput.split(' ').slice(1).join(' '));
     }
 
     // Scope checking
     if (context === 'console' && command.scope === 'engine') {
-        print(`Error: Command '${commandName}' can only be executed on an engine. Use 'send <engineId> ${commandName} ...' to execute it remotely.`);
+        const message = `Error: Command '${commandName}' can only be executed on an engine. Use 'send <engineId> ${commandName} ...' to execute it remotely.`;
+        print(message);
+        recordErrorTrace(commandLogHandle, commandName, JSON.stringify(stringArgs), message);
         return;
     }
 
     if (context === 'engine' && command.scope === 'console') {
-        print(`Error: Command '${commandName}' can only be executed on a console.`);
+        const message = `Error: Command '${commandName}' can only be executed on a console.`;
+        print(message);
+        recordErrorTrace(commandLogHandle, commandName, JSON.stringify(stringArgs), message);
         return;
     }
 
@@ -3287,7 +6332,9 @@ export const handleCommand = async (
         const required = isVariadic && lastArg.optional ? command.args.length - 1 : command.args.length;
         if (args.length < required) throw new Error("Insufficient arguments");
     } catch (error: any) {
-        console.error(`Error: ${error.message}`);
+        const message = `Error: ${error.message}`;
+        console.error(message);
+        recordErrorTrace(commandLogHandle, commandName, JSON.stringify(stringArgs), message);
         return;
     }
 
@@ -3328,6 +6375,7 @@ export const handleCommand = async (
         console.error(`Error: ${error.message}`);
         if (commandLogHandle) {
             await flushTrace(traceId);
+            takePendingTraceResult(traceId); // discard — do not publish result on error
             closeTrace(commandLogHandle, traceId, 'error', error.message);
         }
     }
@@ -3409,853 +6457,340 @@ const convertToType = (str: string, descriptor: ArgumentDescriptor): any => {
 
 ```
 
+## File: src/utils/dockerAvailable.ts
+```typescript
+/**
+ * dockerAvailable() — is there a Docker daemon this Engine can use? (idea#168 Stage 1)
+ *
+ * Three Docker-only paths used to be gated on testMode: the metrics poll
+ * (dockerMetricsMonitor), the startInstance "containers already running"
+ * shortcut and the container logs in diagnoseInstance. testMode means "fixture
+ * disks, no sudo mount/umount"; the duration pool runs it AND real Docker, so
+ * those paths were off exactly where they matter (no metrics, a re-dock
+ * recreated running containers, failures had no container logs).
+ *
+ * They now ask dockerAvailable():
+ *   - settings.dockerAvailable (env IDEA_DOCKER_AVAILABLE=true|false) when set;
+ *   - else a cached `docker info` probe: true is kept DOCKER_PROBE_TTL_OK_MS,
+ *     false DOCKER_PROBE_TTL_FAIL_MS (a daemon that comes up later is noticed).
+ * Concurrent callers share one probe. Never throws.
+ */
+
+import { $ } from 'zx'
+import { config } from '../data/Config.js'
+import { log } from './utils.js'
+
+export const DOCKER_PROBE_TTL_OK_MS = 10 * 60_000
+export const DOCKER_PROBE_TTL_FAIL_MS = 60_000
+export const DOCKER_PROBE_TIMEOUT_MS = 5_000
+
+/** Resolves true when a Docker daemon answers. Injectable for tests. */
+export type DockerProbe = () => Promise<boolean>
+
+const defaultProbe: DockerProbe = async () => {
+    try {
+        const r = await $`docker info --format {{.ServerVersion}}`.quiet().nothrow().timeout(DOCKER_PROBE_TIMEOUT_MS)
+        return r.exitCode === 0 && r.stdout.trim().length > 0
+    } catch {
+        return false
+    }
+}
+
+let probe: DockerProbe = defaultProbe
+let cached: { value: boolean, at: number } | null = null
+let inflight: Promise<boolean> | null = null
+let now: () => number = () => Date.now()
+
+export const dockerAvailable = async (): Promise<boolean> => {
+    const forced = config.settings.dockerAvailable
+    if (typeof forced === 'boolean') return forced
+    if (cached && now() - cached.at < (cached.value ? DOCKER_PROBE_TTL_OK_MS : DOCKER_PROBE_TTL_FAIL_MS)) return cached.value
+    if (inflight) return inflight
+    inflight = (async () => {
+        let value = false
+        try {
+            value = await probe()
+        } catch {
+            value = false
+        }
+        if (!cached || cached.value !== value) log(`dockerAvailable: docker ${value ? 'answers' : 'does not answer'} (docker info)`)
+        cached = { value, at: now() }
+        return value
+    })().finally(() => { inflight = null })
+    return inflight
+}
+
+/** Tests: replace the probe and/or the clock; always clears the cache. */
+export const setDockerProbeForTests = (p: DockerProbe | null, clock?: (() => number) | null): void => {
+    probe = p ?? defaultProbe
+    now = clock ?? (() => Date.now())
+    cached = null
+    inflight = null
+}
+
+```
+
 ## File: src/utils/nameGenerator.ts
 ```typescript
-import util from 'util';
 import { Hostname } from '../data/CommonTypes.js';
 
-// Docker-style name generation
-// Inspired by
-// - https://github.com/moby/moby/blob/39f7b2b6d0156811d9683c6cb0743118ae516a11/pkg/namesgenerator/names-generator.go#L852-L863 
-// - https://github.com/subfuzion/docker-namesgenerator/blob/master/namesgenerator.js
-  
-  const adjectives = [
-    "admiring",
-          "adoring",
-          "affectionate",
-          "agitated",
-          "amazing",
-          "angry",
-          "awesome",
-          "beautiful",
-          "blissful",
-          "bold",
-          "boring",
-          "brave",
-          "busy",
-          "charming",
-          "clever",
-          "cool",
-          "compassionate",
-          "competent",
-          "condescending",
-          "confident",
-          "cranky",
-          "crazy",
-          "dazzling",
-          "determined",
-          "distracted",
-          "dreamy",
-          "eager",
-          "ecstatic",
-          "elastic",
-          "elated",
-          "elegant",
-          "eloquent",
-          "epic",
-          "exciting",
-          "fervent",
-          "festive",
-          "flamboyant",
-          "focused",
-          "friendly",
-          "frosty",
-          "funny",
-          "gallant",
-          "gifted",
-          "goofy",
-          "gracious",
-          "great",
-          "happy",
-          "hardcore",
-          "heuristic",
-          "hopeful",
-          "hungry",
-          "infallible",
-          "inspiring",
-          "intelligent",
-          "interesting",
-          "jolly",
-          "jovial",
-          "keen",
-          "kind",
-          "laughing",
-          "loving",
-          "lucid",
-          "magical",
-          "mystifying",
-          "modest",
-          "musing",
-          "naughty",
-          "nervous",
-          "nice",
-          "nifty",
-          "nostalgic",
-          "objective",
-          "optimistic",
-          "peaceful",
-          "pedantic",
-          "pensive",
-          "practical",
-          "priceless",
-          "quirky",
-          "quizzical",
-          "recursing",
-          "relaxed",
-          "reverent",
-          "romantic",
-          "sad",
-          "serene",
-          "sharp",
-          "silly",
-          "sleepy",
-          "stoic",
-          "strange",
-          "stupefied",
-          "suspicious",
-          "sweet",
-          "tender",
-          "thirsty",
-          "trusting",
-          "unruffled",
-          "upbeat",
-          "vibrant",
-          "vigilant",
-          "vigorous",
-          "wizardly",
-          "wonderful",
-          "xenodochial",
-          "youthful",
-          "zealous",
-          "zen",
-  ]
-  
-  const scientists = [
-    // Maria Gaetana Agnesi - Italian mathematician, philosopher, theologian and humanitarian. She was the first woman to write a mathematics handbook and the first woman appointed as a Mathematics Professor at a University. https://en.wikipedia.org/wiki/Maria_Gaetana_Agnesi
-    "agnesi",
-  
-    // Muhammad ibn Jābir al-Ḥarrānī al-Battānī was a founding father of astronomy. https://en.wikipedia.org/wiki/Mu%E1%B8%A5ammad_ibn_J%C4%81bir_al-%E1%B8%A4arr%C4%81n%C4%AB_al-Batt%C4%81n%C4%AB
-    "albattani",
-  
-    // Frances E. Allen, became the first female IBM Fellow in 1989. In 2006, she became the first female recipient of the ACM's Turing Award. https://en.wikipedia.org/wiki/Frances_E._Allen
-    "allen",
-  
-    // June Almeida - Scottish virologist who took the first pictures of the rubella virus - https://en.wikipedia.org/wiki/June_Almeida
-    "almeida",
-  
-    // Kathleen Antonelli, American computer programmer and one of the six original programmers of the ENIAC - https://en.wikipedia.org/wiki/Kathleen_Antonelli
-    "antonelli",
-  
-    // Archimedes was a physicist, engineer and mathematician who invented too many things to list them here. https://en.wikipedia.org/wiki/Archimedes
-    "archimedes",
-  
-    // Maria Ardinghelli - Italian translator, mathematician and physicist - https://en.wikipedia.org/wiki/Maria_Ardinghelli
-    "ardinghelli",
-  
-    // Aryabhata - Ancient Indian mathematician-astronomer during 476-550 CE https://en.wikipedia.org/wiki/Aryabhata
-    "aryabhata",
-  
-    // Wanda Austin - Wanda Austin is the President and CEO of The Aerospace Corporation, a leading architect for the US security space programs. https://en.wikipedia.org/wiki/Wanda_Austin
-    "austin",
-  
-    // Charles Babbage invented the concept of a programmable computer. https://en.wikipedia.org/wiki/Charles_Babbage.
-    "babbage",
-  
-    // Stefan Banach - Polish mathematician, was one of the founders of modern functional analysis. https://en.wikipedia.org/wiki/Stefan_Banach
-    "banach",
-  
-    // Buckaroo Banzai and his mentor Dr. Hikita perfected the "oscillation overthruster", a device that allows one to pass through solid matter. - https://en.wikipedia.org/wiki/The_Adventures_of_Buckaroo_Banzai_Across_the_8th_Dimension
-    "banzai",
-  
-    // John Bardeen co-invented the transistor - https://en.wikipedia.org/wiki/John_Bardeen
-    "bardeen",
-  
-    // Jean Bartik, born Betty Jean Jennings, was one of the original programmers for the ENIAC computer. https://en.wikipedia.org/wiki/Jean_Bartik
-    "bartik",
-  
-    // Laura Bassi, the world's first female professor https://en.wikipedia.org/wiki/Laura_Bassi
-    "bassi",
-  
-    // Hugh Beaver, British engineer, founder of the Guinness Book of World Records https://en.wikipedia.org/wiki/Hugh_Beaver
-    "beaver",
-  
-    // Alexander Graham Bell - an eminent Scottish-born scientist, inventor, engineer and innovator who is credited with inventing the first practical telephone - https://en.wikipedia.org/wiki/Alexander_Graham_Bell
-    "bell",
-  
-    // Karl Friedrich Benz - a German automobile engineer. Inventor of the first practical motorcar. https://en.wikipedia.org/wiki/Karl_Benz
-    "benz",
-  
-    // Homi J Bhabha - was an Indian nuclear physicist, founding director, and professor of physics at the Tata Institute of Fundamental Research. Colloquially known as "father of Indian nuclear programme"- https://en.wikipedia.org/wiki/Homi_J._Bhabha
-    "bhabha",
-  
-    // Bhaskara II - Ancient Indian mathematician-astronomer whose work on calculus predates Newton and Leibniz by over half a millennium - https://en.wikipedia.org/wiki/Bh%C4%81skara_II#Calculus
-    "bhaskara",
-  
-    // Sue Black - British computer scientist and campaigner. She has been instrumental in saving Bletchley Park, the site of World War II codebreaking - https://en.wikipedia.org/wiki/Sue_Black_(computer_scientist)
-    "black",
-  
-    // Elizabeth Helen Blackburn - Australian-American Nobel laureate; best known for co-discovering telomerase. https://en.wikipedia.org/wiki/Elizabeth_Blackburn
-    "blackburn",
-  
-    // Elizabeth Blackwell - American doctor and first American woman to receive a medical degree - https://en.wikipedia.org/wiki/Elizabeth_Blackwell
-    "blackwell",
-  
-    // Niels Bohr is the father of quantum theory. https://en.wikipedia.org/wiki/Niels_Bohr.
-    "bohr",
-  
-    // Kathleen Booth, she's credited with writing the first assembly language. https://en.wikipedia.org/wiki/Kathleen_Booth
-    "booth",
-  
-    // Anita Borg - Anita Borg was the founding director of the Institute for Women and Technology (IWT). https://en.wikipedia.org/wiki/Anita_Borg
-    "borg",
-  
-    // Satyendra Nath Bose - He provided the foundation for Bose–Einstein statistics and the theory of the Bose–Einstein condensate. - https://en.wikipedia.org/wiki/Satyendra_Nath_Bose
-    "bose",
-  
-    // Katherine Louise Bouman is an imaging scientist and Assistant Professor of Computer Science at the California Institute of Technology. She researches computational methods for imaging, and developed an algorithm that made possible the picture first visualization of a black hole using the Event Horizon Telescope. - https://en.wikipedia.org/wiki/Katie_Bouman
-    "bouman",
-  
-    // Evelyn Boyd Granville - She was one of the first African-American woman to receive a Ph.D. in mathematics; she earned it in 1949 from Yale University. https://en.wikipedia.org/wiki/Evelyn_Boyd_Granville
-    "boyd",
-  
-    // Brahmagupta - Ancient Indian mathematician during 598-670 CE who gave rules to compute with zero - https://en.wikipedia.org/wiki/Brahmagupta#Zero
-    "brahmagupta",
-  
-    // Walter Houser Brattain co-invented the transistor - https://en.wikipedia.org/wiki/Walter_Houser_Brattain
-    "brattain",
-  
-    // Emmett Brown invented time travel. https://en.wikipedia.org/wiki/Emmett_Brown (thanks Brian Goff)
-    "brown",
-  
-    // Linda Brown Buck - American biologist and Nobel laureate best known for her genetic and molecular analyses of the mechanisms of smell. https://en.wikipedia.org/wiki/Linda_B._Buck
-    "buck",
-  
-    // Dame Susan Jocelyn Bell Burnell - Northern Irish astrophysicist who discovered radio pulsars and was the first to analyse them. https://en.wikipedia.org/wiki/Jocelyn_Bell_Burnell
-    "burnell",
-  
-    // Annie Jump Cannon - pioneering female astronomer who classified hundreds of thousands of stars and created the system we use to understand stars today. https://en.wikipedia.org/wiki/Annie_Jump_Cannon
-    "cannon",
-  
-    // Rachel Carson - American marine biologist and conservationist, her book Silent Spring and other writings are credited with advancing the global environmental movement. https://en.wikipedia.org/wiki/Rachel_Carson
-    "carson",
-  
-    // Dame Mary Lucy Cartwright - British mathematician who was one of the first to study what is now known as chaos theory. Also known for Cartwright's theorem which finds applications in signal processing. https://en.wikipedia.org/wiki/Mary_Cartwright
-    "cartwright",
-  
-    // George Washington Carver - American agricultural scientist and inventor. He was the most prominent black scientist of the early 20th century. https://en.wikipedia.org/wiki/George_Washington_Carver
-    "carver",
-  
-    // Vinton Gray Cerf - American Internet pioneer, recognised as one of "the fathers of the Internet". With Robert Elliot Kahn, he designed TCP and IP, the primary data communication protocols of the Internet and other computer networks. https://en.wikipedia.org/wiki/Vint_Cerf
-    "cerf",
-  
-    // Subrahmanyan Chandrasekhar - Astrophysicist known for his mathematical theory on different stages and evolution in structures of the stars. He has won nobel prize for physics - https://en.wikipedia.org/wiki/Subrahmanyan_Chandrasekhar
-    "chandrasekhar",
-  
-    // Sergey Alexeyevich Chaplygin (Russian: Серге́й Алексе́евич Чаплы́гин; April 5, 1869 – October 8, 1942) was a Russian and Soviet physicist, mathematician, and mechanical engineer. He is known for mathematical formulas such as Chaplygin's equation and for a hypothetical substance in cosmology called Chaplygin gas, named after him. https://en.wikipedia.org/wiki/Sergey_Chaplygin
-    "chaplygin",
-  
-    // Émilie du Châtelet - French natural philosopher, mathematician, physicist, and author during the early 1730s, known for her translation of and commentary on Isaac Newton's book Principia containing basic laws of physics. https://en.wikipedia.org/wiki/%C3%89milie_du_Ch%C3%A2telet
-    "chatelet",
-  
-    // Asima Chatterjee was an Indian organic chemist noted for her research on vinca alkaloids, development of drugs for treatment of epilepsy and malaria - https://en.wikipedia.org/wiki/Asima_Chatterjee
-    "chatterjee",
-  
-    // David Lee Chaum - American computer scientist and cryptographer. Known for his seminal contributions in the field of anonymous communication. https://en.wikipedia.org/wiki/David_Chaum
-    "chaum",
-  
-    // Pafnuty Chebyshev - Russian mathematician. He is known fo his works on probability, statistics, mechanics, analytical geometry and number theory https://en.wikipedia.org/wiki/Pafnuty_Chebyshev
-    "chebyshev",
-  
-    // Joan Clarke - Bletchley Park code breaker during the Second World War who pioneered techniques that remained top secret for decades. Also an accomplished numismatist https://en.wikipedia.org/wiki/Joan_Clarke
-    "clarke",
-  
-    // Bram Cohen - American computer programmer and author of the BitTorrent peer-to-peer protocol. https://en.wikipedia.org/wiki/Bram_Cohen
-    "cohen",
-  
-    // Jane Colden - American botanist widely considered the first female American botanist - https://en.wikipedia.org/wiki/Jane_Colden
-    "colden",
-  
-    // Gerty Theresa Cori - American biochemist who became the third woman—and first American woman—to win a Nobel Prize in science, and the first woman to be awarded the Nobel Prize in Physiology or Medicine. Cori was born in Prague. https://en.wikipedia.org/wiki/Gerty_Cori
-    "cori",
-  
-    // Seymour Roger Cray was an American electrical engineer and supercomputer architect who designed a series of computers that were the fastest in the world for decades. https://en.wikipedia.org/wiki/Seymour_Cray
-    "cray",
-  
-    // This entry reflects a husband and wife team who worked together:
-    // Joan Curran was a Welsh scientist who developed radar and invented chaff, a radar countermeasure. https://en.wikipedia.org/wiki/Joan_Curran
-    // Samuel Curran was an Irish physicist who worked alongside his wife during WWII and invented the proximity fuse. https://en.wikipedia.org/wiki/Samuel_Curran
-    "curran",
-  
-    // Marie Curie discovered radioactivity. https://en.wikipedia.org/wiki/Marie_Curie.
-    "curie",
-  
-    // Charles Darwin established the principles of natural evolution. https://en.wikipedia.org/wiki/Charles_Darwin.
-    "darwin",
-  
-    // Leonardo Da Vinci invented too many things to list here. https://en.wikipedia.org/wiki/Leonardo_da_Vinci.
-    "davinci",
-  
-    // A. K. (Alexander Keewatin) Dewdney, Canadian mathematician, computer scientist, author and filmmaker. Contributor to Scientific American's "Computer Recreations" from 1984 to 1991. Author of Core War (program), The Planiverse, The Armchair Universe, The Magic Machine, The New Turing Omnibus, and more. https://en.wikipedia.org/wiki/Alexander_Dewdney
-    "dewdney",
-  
-    // Satish Dhawan - Indian mathematician and aerospace engineer, known for leading the successful and indigenous development of the Indian space programme. https://en.wikipedia.org/wiki/Satish_Dhawan
-    "dhawan",
-  
-    // Bailey Whitfield Diffie - American cryptographer and one of the pioneers of public-key cryptography. https://en.wikipedia.org/wiki/Whitfield_Diffie
-    "diffie",
-  
-    // Edsger Wybe Dijkstra was a Dutch computer scientist and mathematical scientist. https://en.wikipedia.org/wiki/Edsger_W._Dijkstra.
-    "dijkstra",
-  
-    // Paul Adrien Maurice Dirac - English theoretical physicist who made fundamental contributions to the early development of both quantum mechanics and quantum electrodynamics. https://en.wikipedia.org/wiki/Paul_Dirac
-    "dirac",
-  
-    // Agnes Meyer Driscoll - American cryptanalyst during World Wars I and II who successfully cryptanalysed a number of Japanese ciphers. She was also the co-developer of one of the cipher machines of the US Navy, the CM. https://en.wikipedia.org/wiki/Agnes_Meyer_Driscoll
-    "driscoll",
-  
-    // Donna Dubinsky - played an integral role in the development of personal digital assistants (PDAs) serving as CEO of Palm, Inc. and co-founding Handspring. https://en.wikipedia.org/wiki/Donna_Dubinsky
-    "dubinsky",
-  
-    // Annie Easley - She was a leading member of the team which developed software for the Centaur rocket stage and one of the first African-Americans in her field. https://en.wikipedia.org/wiki/Annie_Easley
-    "easley",
-  
-    // Thomas Alva Edison, prolific inventor https://en.wikipedia.org/wiki/Thomas_Edison
-    "edison",
-  
-    // Albert Einstein invented the general theory of relativity. https://en.wikipedia.org/wiki/Albert_Einstein
-    "einstein",
-  
-    // Alexandra Asanovna Elbakyan (Russian: Алекса́ндра Аса́новна Элбакя́н) is a Kazakhstani graduate student, computer programmer, internet pirate in hiding, and the creator of the site Sci-Hub. Nature has listed her in 2016 in the top ten people that mattered in science, and Ars Technica has compared her to Aaron Swartz. - https://en.wikipedia.org/wiki/Alexandra_Elbakyan
-    "elbakyan",
-  
-    // Taher A. ElGamal - Egyptian cryptographer best known for the ElGamal discrete log cryptosystem and the ElGamal digital signature scheme. https://en.wikipedia.org/wiki/Taher_Elgamal
-    "elgamal",
-  
-    // Gertrude Elion - American biochemist, pharmacologist and the 1988 recipient of the Nobel Prize in Medicine - https://en.wikipedia.org/wiki/Gertrude_Elion
-    "elion",
-  
-    // James Henry Ellis - British engineer and cryptographer employed by the GCHQ. Best known for conceiving for the first time, the idea of public-key cryptography. https://en.wikipedia.org/wiki/James_H._Ellis
-    "ellis",
-  
-    // Douglas Engelbart gave the mother of all demos: https://en.wikipedia.org/wiki/Douglas_Engelbart
-    "engelbart",
-  
-    // Euclid invented geometry. https://en.wikipedia.org/wiki/Euclid
-    "euclid",
-  
-    // Leonhard Euler invented large parts of modern mathematics. https://de.wikipedia.org/wiki/Leonhard_Euler
-    "euler",
-  
-    // Michael Faraday - British scientist who contributed to the study of electromagnetism and electrochemistry. https://en.wikipedia.org/wiki/Michael_Faraday
-    "faraday",
-  
-    // Horst Feistel - German-born American cryptographer who was one of the earliest non-government researchers to study the design and theory of block ciphers. Co-developer of DES and Lucifer. Feistel networks, a symmetric structure used in the construction of block ciphers are named after him. https://en.wikipedia.org/wiki/Horst_Feistel
-    "feistel",
-  
-    // Pierre de Fermat pioneered several aspects of modern mathematics. https://en.wikipedia.org/wiki/Pierre_de_Fermat
-    "fermat",
-  
-    // Enrico Fermi invented the first nuclear reactor. https://en.wikipedia.org/wiki/Enrico_Fermi.
-    "fermi",
-  
-    // Richard Feynman was a key contributor to quantum mechanics and particle physics. https://en.wikipedia.org/wiki/Richard_Feynman
-    "feynman",
-  
-    // Benjamin Franklin is famous for his experiments in electricity and the invention of the lightning rod.
-    "franklin",
-  
-    // Yuri Alekseyevich Gagarin - Soviet pilot and cosmonaut, best known as the first human to journey into outer space. https://en.wikipedia.org/wiki/Yuri_Gagarin
-    "gagarin",
-  
-    // Galileo was a founding father of modern astronomy, and faced politics and obscurantism to establish scientific truth.  https://en.wikipedia.org/wiki/Galileo_Galilei
-    "galileo",
-  
-    // Évariste Galois - French mathematician whose work laid the foundations of Galois theory and group theory, two major branches of abstract algebra, and the subfield of Galois connections, all while still in his late teens. https://en.wikipedia.org/wiki/%C3%89variste_Galois
-    "galois",
-  
-    // Kadambini Ganguly - Indian physician, known for being the first South Asian female physician, trained in western medicine, to graduate in South Asia. https://en.wikipedia.org/wiki/Kadambini_Ganguly
-    "ganguly",
-  
-    // William Henry "Bill" Gates III is an American business magnate, philanthropist, investor, computer programmer, and inventor. https://en.wikipedia.org/wiki/Bill_Gates
-    "gates",
-  
-    // Johann Carl Friedrich Gauss - German mathematician who made significant contributions to many fields, including number theory, algebra, statistics, analysis, differential geometry, geodesy, geophysics, mechanics, electrostatics, magnetic fields, astronomy, matrix theory, and optics. https://en.wikipedia.org/wiki/Carl_Friedrich_Gauss
-    "gauss",
-  
-    // Marie-Sophie Germain - French mathematician, physicist and philosopher. Known for her work on elasticity theory, number theory and philosophy. https://en.wikipedia.org/wiki/Sophie_Germain
-    "germain",
-  
-    // Adele Goldberg, was one of the designers and developers of the Smalltalk language. https://en.wikipedia.org/wiki/Adele_Goldberg_(computer_scientist)
-    "goldberg",
-  
-    // Adele Goldstine, born Adele Katz, wrote the complete technical description for the first electronic digital computer, ENIAC. https://en.wikipedia.org/wiki/Adele_Goldstine
-    "goldstine",
-  
-    // Shafi Goldwasser is a computer scientist known for creating theoretical foundations of modern cryptography. Winner of 2012 ACM Turing Award. https://en.wikipedia.org/wiki/Shafi_Goldwasser
-    "goldwasser",
-  
-    // James Golick, all around gangster.
-    "golick",
-  
-    // Jane Goodall - British primatologist, ethologist, and anthropologist who is considered to be the world's foremost expert on chimpanzees - https://en.wikipedia.org/wiki/Jane_Goodall
-    "goodall",
-  
-    // Stephen Jay Gould was was an American paleontologist, evolutionary biologist, and historian of science. He is most famous for the theory of punctuated equilibrium - https://en.wikipedia.org/wiki/Stephen_Jay_Gould
-    "gould",
-  
-    // Carolyn Widney Greider - American molecular biologist and joint winner of the 2009 Nobel Prize for Physiology or Medicine for the discovery of telomerase. https://en.wikipedia.org/wiki/Carol_W._Greider
-    "greider",
-  
-    // Alexander Grothendieck - German-born French mathematician who became a leading figure in the creation of modern algebraic geometry. https://en.wikipedia.org/wiki/Alexander_Grothendieck
-    "grothendieck",
-  
-    // Lois Haibt - American computer scientist, part of the team at IBM that developed FORTRAN - https://en.wikipedia.org/wiki/Lois_Haibt
-    "haibt",
-  
-    // Margaret Hamilton - Director of the Software Engineering Division of the MIT Instrumentation Laboratory, which developed on-board flight software for the Apollo space program. https://en.wikipedia.org/wiki/Margaret_Hamilton_(scientist)
-    "hamilton",
-  
-    // Caroline Harriet Haslett - English electrical engineer, electricity industry administrator and champion of women's rights. Co-author of British Standard 1363 that specifies AC power plugs and sockets used across the United Kingdom (which is widely considered as one of the safest designs). https://en.wikipedia.org/wiki/Caroline_Haslett
-    "haslett",
-  
-    // Stephen Hawking pioneered the field of cosmology by combining general relativity and quantum mechanics. https://en.wikipedia.org/wiki/Stephen_Hawking
-    "hawking",
-  
-    // Martin Edward Hellman - American cryptologist, best known for his invention of public-key cryptography in co-operation with Whitfield Diffie and Ralph Merkle. https://en.wikipedia.org/wiki/Martin_Hellman
-    "hellman",
-  
-    // Werner Heisenberg was a founding father of quantum mechanics. https://en.wikipedia.org/wiki/Werner_Heisenberg
-    "heisenberg",
-  
-    // Grete Hermann was a German philosopher noted for her philosophical work on the foundations of quantum mechanics. https://en.wikipedia.org/wiki/Grete_Hermann
-    "hermann",
-  
-    // Caroline Lucretia Herschel - German astronomer and discoverer of several comets. https://en.wikipedia.org/wiki/Caroline_Herschel
-    "herschel",
-  
-    // Heinrich Rudolf Hertz - German physicist who first conclusively proved the existence of the electromagnetic waves. https://en.wikipedia.org/wiki/Heinrich_Hertz
-    "hertz",
-  
-    // Jaroslav Heyrovský was the inventor of the polarographic method, father of the electroanalytical method, and recipient of the Nobel Prize in 1959. His main field of work was polarography. https://en.wikipedia.org/wiki/Jaroslav_Heyrovsk%C3%BD
-    "heyrovsky",
-  
-    // Dorothy Hodgkin was a British biochemist, credited with the development of protein crystallography. She was awarded the Nobel Prize in Chemistry in 1964. https://en.wikipedia.org/wiki/Dorothy_Hodgkin
-    "hodgkin",
-  
-    // Douglas R. Hofstadter is an American professor of cognitive science and author of the Pulitzer Prize and American Book Award-winning work Goedel, Escher, Bach: An Eternal Golden Braid in 1979. A mind-bending work which coined Hofstadter's Law: "It always takes longer than you expect, even when you take into account Hofstadter's Law." https://en.wikipedia.org/wiki/Douglas_Hofstadter
-    "hofstadter",
-  
-    // Erna Schneider Hoover revolutionized modern communication by inventing a computerized telephone switching method. https://en.wikipedia.org/wiki/Erna_Schneider_Hoover
-    "hoover",
-  
-    // Grace Hopper developed the first compiler for a computer programming language and  is credited with popularizing the term "debugging" for fixing computer glitches. https://en.wikipedia.org/wiki/Grace_Hopper
-    "hopper",
-  
-    // Frances Hugle, she was an American scientist, engineer, and inventor who contributed to the understanding of semiconductors, integrated circuitry, and the unique electrical principles of microscopic materials. https://en.wikipedia.org/wiki/Frances_Hugle
-    "hugle",
-  
-    // Hypatia - Greek Alexandrine Neoplatonist philosopher in Egypt who was one of the earliest mothers of mathematics - https://en.wikipedia.org/wiki/Hypatia
-    "hypatia",
-  
-    // Teruko Ishizaka - Japanese scientist and immunologist who co-discovered the antibody class Immunoglobulin E. https://en.wikipedia.org/wiki/Teruko_Ishizaka
-    "ishizaka",
-  
-    // Mary Jackson, American mathematician and aerospace engineer who earned the highest title within NASA's engineering department - https://en.wikipedia.org/wiki/Mary_Jackson_(engineer)
-    "jackson",
-  
-    // Yeong-Sil Jang was a Korean scientist and astronomer during the Joseon Dynasty; he invented the first metal printing press and water gauge. https://en.wikipedia.org/wiki/Jang_Yeong-sil
-    "jang",
-  
-    // Mae Carol Jemison -  is an American engineer, physician, and former NASA astronaut. She became the first black woman to travel in space when she served as a mission specialist aboard the Space Shuttle Endeavour - https://en.wikipedia.org/wiki/Mae_Jemison
-    "jemison",
-  
-    // Betty Jennings - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Jean_Bartik
-    "jennings",
-  
-    // Mary Lou Jepsen, was the founder and chief technology officer of One Laptop Per Child (OLPC), and the founder of Pixel Qi. https://en.wikipedia.org/wiki/Mary_Lou_Jepsen
-    "jepsen",
-  
-    // Katherine Coleman Goble Johnson - American physicist and mathematician contributed to the NASA. https://en.wikipedia.org/wiki/Katherine_Johnson
-    "johnson",
-  
-    // Irène Joliot-Curie - French scientist who was awarded the Nobel Prize for Chemistry in 1935. Daughter of Marie and Pierre Curie. https://en.wikipedia.org/wiki/Ir%C3%A8ne_Joliot-Curie
-    "joliot",
-  
-    // Karen Spärck Jones came up with the concept of inverse document frequency, which is used in most search engines today. https://en.wikipedia.org/wiki/Karen_Sp%C3%A4rck_Jones
-    "jones",
-  
-    // A. P. J. Abdul Kalam - is an Indian scientist aka Missile Man of India for his work on the development of ballistic missile and launch vehicle technology - https://en.wikipedia.org/wiki/A._P._J._Abdul_Kalam
-    "kalam",
-  
-    // Sergey Petrovich Kapitsa (Russian: Серге́й Петро́вич Капи́ца; 14 February 1928 – 14 August 2012) was a Russian physicist and demographer. He was best known as host of the popular and long-running Russian scientific TV show, Evident, but Incredible. His father was the Nobel laureate Soviet-era physicist Pyotr Kapitsa, and his brother was the geographer and Antarctic explorer Andrey Kapitsa. - https://en.wikipedia.org/wiki/Sergey_Kapitsa
-    "kapitsa",
-  
-    // Susan Kare, created the icons and many of the interface elements for the original Apple Macintosh in the 1980s, and was an original employee of NeXT, working as the Creative Director. https://en.wikipedia.org/wiki/Susan_Kare
-    "kare",
-  
-    // Mstislav Keldysh - a Soviet scientist in the field of mathematics and mechanics, academician of the USSR Academy of Sciences (1946), President of the USSR Academy of Sciences (1961–1975), three times Hero of Socialist Labor (1956, 1961, 1971), fellow of the Royal Society of Edinburgh (1968). https://en.wikipedia.org/wiki/Mstislav_Keldysh
-    "keldysh",
-  
-    // Mary Kenneth Keller, Sister Mary Kenneth Keller became the first American woman to earn a PhD in Computer Science in 1965. https://en.wikipedia.org/wiki/Mary_Kenneth_Keller
-    "keller",
-  
-    // Johannes Kepler, German astronomer known for his three laws of planetary motion - https://en.wikipedia.org/wiki/Johannes_Kepler
-    "kepler",
-  
-    // Omar Khayyam - Persian mathematician, astronomer and poet. Known for his work on the classification and solution of cubic equations, for his contribution to the understanding of Euclid's fifth postulate and for computing the length of a year very accurately. https://en.wikipedia.org/wiki/Omar_Khayyam
-    "khayyam",
-  
-    // Har Gobind Khorana - Indian-American biochemist who shared the 1968 Nobel Prize for Physiology - https://en.wikipedia.org/wiki/Har_Gobind_Khorana
-    "khorana",
-  
-    // Jack Kilby invented silicon integrated circuits and gave Silicon Valley its name. - https://en.wikipedia.org/wiki/Jack_Kilby
-    "kilby",
-  
-    // Maria Kirch - German astronomer and first woman to discover a comet - https://en.wikipedia.org/wiki/Maria_Margarethe_Kirch
-    "kirch",
-  
-    // Donald Knuth - American computer scientist, author of "The Art of Computer Programming" and creator of the TeX typesetting system. https://en.wikipedia.org/wiki/Donald_Knuth
-    "knuth",
-  
-    // Sophie Kowalevski - Russian mathematician responsible for important original contributions to analysis, differential equations and mechanics - https://en.wikipedia.org/wiki/Sofia_Kovalevskaya
-    "kowalevski",
-  
-    // Marie-Jeanne de Lalande - French astronomer, mathematician and cataloguer of stars - https://en.wikipedia.org/wiki/Marie-Jeanne_de_Lalande
-    "lalande",
-  
-    // Hedy Lamarr - Actress and inventor. The principles of her work are now incorporated into modern Wi-Fi, CDMA and Bluetooth technology. https://en.wikipedia.org/wiki/Hedy_Lamarr
-    "lamarr",
-  
-    // Leslie B. Lamport - American computer scientist. Lamport is best known for his seminal work in distributed systems and was the winner of the 2013 Turing Award. https://en.wikipedia.org/wiki/Leslie_Lamport
-    "lamport",
-  
-    // Mary Leakey - British paleoanthropologist who discovered the first fossilized Proconsul skull - https://en.wikipedia.org/wiki/Mary_Leakey
-    "leakey",
-  
-    // Henrietta Swan Leavitt - she was an American astronomer who discovered the relation between the luminosity and the period of Cepheid variable stars. https://en.wikipedia.org/wiki/Henrietta_Swan_Leavitt
-    "leavitt",
-  
-    // Esther Miriam Zimmer Lederberg - American microbiologist and a pioneer of bacterial genetics. https://en.wikipedia.org/wiki/Esther_Lederberg
-    "lederberg",
-  
-    // Inge Lehmann - Danish seismologist and geophysicist. Known for discovering in 1936 that the Earth has a solid inner core inside a molten outer core. https://en.wikipedia.org/wiki/Inge_Lehmann
-    "lehmann",
-  
-    // Daniel Lewin - Mathematician, Akamai co-founder, soldier, 9/11 victim-- Developed optimization techniques for routing traffic on the internet. Died attempting to stop the 9-11 hijackers. https://en.wikipedia.org/wiki/Daniel_Lewin
-    "lewin",
-  
-    // Ruth Lichterman - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Ruth_Teitelbaum
-    "lichterman",
-  
-    // Barbara Liskov - co-developed the Liskov substitution principle. Liskov was also the winner of the Turing Prize in 2008. - https://en.wikipedia.org/wiki/Barbara_Liskov
-    "liskov",
-  
-    // Ada Lovelace invented the first algorithm. https://en.wikipedia.org/wiki/Ada_Lovelace (thanks James Turnbull)
-    "lovelace",
-  
-    // Auguste and Louis Lumière - the first filmmakers in history - https://en.wikipedia.org/wiki/Auguste_and_Louis_Lumi%C3%A8re
-    "lumiere",
-  
-    // Mahavira - Ancient Indian mathematician during 9th century AD who discovered basic algebraic identities - https://en.wikipedia.org/wiki/Mah%C4%81v%C4%ABra_(mathematician)
-    "mahavira",
-  
-    // Lynn Margulis (b. Lynn Petra Alexander) - an American evolutionary theorist and biologist, science author, educator, and popularizer, and was the primary modern proponent for the significance of symbiosis in evolution. - https://en.wikipedia.org/wiki/Lynn_Margulis
-    "margulis",
-  
-    // Yukihiro Matsumoto - Japanese computer scientist and software programmer best known as the chief designer of the Ruby programming language. https://en.wikipedia.org/wiki/Yukihiro_Matsumoto
-    "matsumoto",
-  
-    // James Clerk Maxwell - Scottish physicist, best known for his formulation of electromagnetic theory. https://en.wikipedia.org/wiki/James_Clerk_Maxwell
-    "maxwell",
-  
-    // Maria Mayer - American theoretical physicist and Nobel laureate in Physics for proposing the nuclear shell model of the atomic nucleus - https://en.wikipedia.org/wiki/Maria_Mayer
-    "mayer",
-  
-    // John McCarthy invented LISP: https://en.wikipedia.org/wiki/John_McCarthy_(computer_scientist)
-    "mccarthy",
-  
-    // Barbara McClintock - a distinguished American cytogeneticist, 1983 Nobel Laureate in Physiology or Medicine for discovering transposons. https://en.wikipedia.org/wiki/Barbara_McClintock
-    "mcclintock",
-  
-    // Anne Laura Dorinthea McLaren - British developmental biologist whose work helped lead to human in-vitro fertilisation. https://en.wikipedia.org/wiki/Anne_McLaren
-    "mclaren",
-  
-    // Malcolm McLean invented the modern shipping container: https://en.wikipedia.org/wiki/Malcom_McLean
-    "mclean",
-  
-    // Kay McNulty - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Kathleen_Antonelli
-    "mcnulty",
-  
-    // Gregor Johann Mendel - Czech scientist and founder of genetics. https://en.wikipedia.org/wiki/Gregor_Mendel
-    "mendel",
-  
-    // Dmitri Mendeleev - a chemist and inventor. He formulated the Periodic Law, created a farsighted version of the periodic table of elements, and used it to correct the properties of some already discovered elements and also to predict the properties of eight elements yet to be discovered. https://en.wikipedia.org/wiki/Dmitri_Mendeleev
-    "mendeleev",
-  
-    // Lise Meitner - Austrian/Swedish physicist who was involved in the discovery of nuclear fission. The element meitnerium is named after her - https://en.wikipedia.org/wiki/Lise_Meitner
-    "meitner",
-  
-    // Carla Meninsky, was the game designer and programmer for Atari 2600 games Dodge 'Em and Warlords. https://en.wikipedia.org/wiki/Carla_Meninsky
-    "meninsky",
-  
-    // Ralph C. Merkle - American computer scientist, known for devising Merkle's puzzles - one of the very first schemes for public-key cryptography. Also, inventor of Merkle trees and co-inventor of the Merkle-Damgård construction for building collision-resistant cryptographic hash functions and the Merkle-Hellman knapsack cryptosystem. https://en.wikipedia.org/wiki/Ralph_Merkle
-    "merkle",
-  
-    // Johanna Mestorf - German prehistoric archaeologist and first female museum director in Germany - https://en.wikipedia.org/wiki/Johanna_Mestorf
-    "mestorf",
-  
-    // Maryam Mirzakhani - an Iranian mathematician and the first woman to win the Fields Medal. https://en.wikipedia.org/wiki/Maryam_Mirzakhani
-    "mirzakhani",
-  
-    // Rita Levi-Montalcini - Won Nobel Prize in Physiology or Medicine jointly with colleague Stanley Cohen for the discovery of nerve growth factor (https://en.wikipedia.org/wiki/Rita_Levi-Montalcini)
-    "montalcini",
-  
-    // Gordon Earle Moore - American engineer, Silicon Valley founding father, author of Moore's law. https://en.wikipedia.org/wiki/Gordon_Moore
-    "moore",
-  
-    // Samuel Morse - contributed to the invention of a single-wire telegraph system based on European telegraphs and was a co-developer of the Morse code - https://en.wikipedia.org/wiki/Samuel_Morse
-    "morse",
-  
-    // Ian Murdock - founder of the Debian project - https://en.wikipedia.org/wiki/Ian_Murdock
-    "murdock",
-  
-    // May-Britt Moser - Nobel prize winner neuroscientist who contributed to the discovery of grid cells in the brain. https://en.wikipedia.org/wiki/May-Britt_Moser
-    "moser",
-  
-    // John Napier of Merchiston - Scottish landowner known as an astronomer, mathematician and physicist. Best known for his discovery of logarithms. https://en.wikipedia.org/wiki/John_Napier
-    "napier",
-  
-    // John Forbes Nash, Jr. - American mathematician who made fundamental contributions to game theory, differential geometry, and the study of partial differential equations. https://en.wikipedia.org/wiki/John_Forbes_Nash_Jr.
-    "nash",
-  
-    // John von Neumann - todays computer architectures are based on the von Neumann architecture. https://en.wikipedia.org/wiki/Von_Neumann_architecture
-    "neumann",
-  
-    // Isaac Newton invented classic mechanics and modern optics. https://en.wikipedia.org/wiki/Isaac_Newton
-    "newton",
-  
-    // Florence Nightingale, more prominently known as a nurse, was also the first female member of the Royal Statistical Society and a pioneer in statistical graphics https://en.wikipedia.org/wiki/Florence_Nightingale#Statistics_and_sanitary_reform
-    "nightingale",
-  
-    // Alfred Nobel - a Swedish chemist, engineer, innovator, and armaments manufacturer (inventor of dynamite) - https://en.wikipedia.org/wiki/Alfred_Nobel
-    "nobel",
-  
-    // Emmy Noether, German mathematician. Noether's Theorem is named after her. https://en.wikipedia.org/wiki/Emmy_Noether
-    "noether",
-  
-    // Poppy Northcutt. Poppy Northcutt was the first woman to work as part of NASA’s Mission Control. http://www.businessinsider.com/poppy-northcutt-helped-apollo-astronauts-2014-12?op=1
-    "northcutt",
-  
-    // Robert Noyce invented silicon integrated circuits and gave Silicon Valley its name. - https://en.wikipedia.org/wiki/Robert_Noyce
-    "noyce",
-  
-    // Panini - Ancient Indian linguist and grammarian from 4th century CE who worked on the world's first formal system - https://en.wikipedia.org/wiki/P%C4%81%E1%B9%87ini#Comparison_with_modern_formal_systems
-    "panini",
-  
-    // Ambroise Pare invented modern surgery. https://en.wikipedia.org/wiki/Ambroise_Par%C3%A9
-    "pare",
-  
-    // Blaise Pascal, French mathematician, physicist, and inventor - https://en.wikipedia.org/wiki/Blaise_Pascal
-    "pascal",
-  
-    // Louis Pasteur discovered vaccination, fermentation and pasteurization. https://en.wikipedia.org/wiki/Louis_Pasteur.
-    "pasteur",
-  
-    // Cecilia Payne-Gaposchkin was an astronomer and astrophysicist who, in 1925, proposed in her Ph.D. thesis an explanation for the composition of stars in terms of the relative abundances of hydrogen and helium. https://en.wikipedia.org/wiki/Cecilia_Payne-Gaposchkin
-    "payne",
-  
-    // Radia Perlman is a software designer and network engineer and most famous for her invention of the spanning-tree protocol (STP). https://en.wikipedia.org/wiki/Radia_Perlman
-    "perlman",
-  
-    // Rob Pike was a key contributor to Unix, Plan 9, the X graphic system, utf-8, and the Go programming language. https://en.wikipedia.org/wiki/Rob_Pike
-    "pike",
-  
-    // Henri Poincaré made fundamental contributions in several fields of mathematics. https://en.wikipedia.org/wiki/Henri_Poincar%C3%A9
-    "poincare",
-  
-    // Laura Poitras is a director and producer whose work, made possible by open source crypto tools, advances the causes of truth and freedom of information by reporting disclosures by whistleblowers such as Edward Snowden. https://en.wikipedia.org/wiki/Laura_Poitras
-    "poitras",
-  
-    // Tat’yana Avenirovna Proskuriakova (Russian: Татья́на Авени́ровна Проскуряко́ва) (January 23 [O.S. January 10] 1909 – August 30, 1985) was a Russian-American Mayanist scholar and archaeologist who contributed significantly to the deciphering of Maya hieroglyphs, the writing system of the pre-Columbian Maya civilization of Mesoamerica. https://en.wikipedia.org/wiki/Tatiana_Proskouriakoff
-    "proskuriakova",
-  
-    // Claudius Ptolemy - a Greco-Egyptian writer of Alexandria, known as a mathematician, astronomer, geographer, astrologer, and poet of a single epigram in the Greek Anthology - https://en.wikipedia.org/wiki/Ptolemy
-    "ptolemy",
-  
-    // C. V. Raman - Indian physicist who won the Nobel Prize in 1930 for proposing the Raman effect. - https://en.wikipedia.org/wiki/C._V._Raman
-    "raman",
-  
-    // Srinivasa Ramanujan - Indian mathematician and autodidact who made extraordinary contributions to mathematical analysis, number theory, infinite series, and continued fractions. - https://en.wikipedia.org/wiki/Srinivasa_Ramanujan
-    "ramanujan",
-  
-    // Sally Kristen Ride was an American physicist and astronaut. She was the first American woman in space, and the youngest American astronaut. https://en.wikipedia.org/wiki/Sally_Ride
-    "ride",
-  
-    // Dennis Ritchie - co-creator of UNIX and the C programming language. - https://en.wikipedia.org/wiki/Dennis_Ritchie
-    "ritchie",
-  
-    // Ida Rhodes - American pioneer in computer programming, designed the first computer used for Social Security. https://en.wikipedia.org/wiki/Ida_Rhodes
-    "rhodes",
-  
-    // Julia Hall Bowman Robinson - American mathematician renowned for her contributions to the fields of computability theory and computational complexity theory. https://en.wikipedia.org/wiki/Julia_Robinson
-    "robinson",
-  
-    // Wilhelm Conrad Röntgen - German physicist who was awarded the first Nobel Prize in Physics in 1901 for the discovery of X-rays (Röntgen rays). https://en.wikipedia.org/wiki/Wilhelm_R%C3%B6ntgen
-    "roentgen",
-  
-    // Rosalind Franklin - British biophysicist and X-ray crystallographer whose research was critical to the understanding of DNA - https://en.wikipedia.org/wiki/Rosalind_Franklin
-    "rosalind",
-  
-    // Vera Rubin - American astronomer who pioneered work on galaxy rotation rates. https://en.wikipedia.org/wiki/Vera_Rubin
-    "rubin",
-  
-    // Meghnad Saha - Indian astrophysicist best known for his development of the Saha equation, used to describe chemical and physical conditions in stars - https://en.wikipedia.org/wiki/Meghnad_Saha
-    "saha",
-  
-    // Jean E. Sammet developed FORMAC, the first widely used computer language for symbolic manipulation of mathematical formulas. https://en.wikipedia.org/wiki/Jean_E._Sammet
-    "sammet",
-  
-    // Mildred Sanderson - American mathematician best known for Sanderson's theorem concerning modular invariants. https://en.wikipedia.org/wiki/Mildred_Sanderson
-    "sanderson",
-  
-    // Satoshi Nakamoto is the name used by the unknown person or group of people who developed bitcoin, authored the bitcoin white paper, and created and deployed bitcoin's original reference implementation. https://en.wikipedia.org/wiki/Satoshi_Nakamoto
-    "satoshi",
-  
-    // Adi Shamir - Israeli cryptographer whose numerous inventions and contributions to cryptography include the Ferge Fiat Shamir identification scheme, the Rivest Shamir Adleman (RSA) public-key cryptosystem, the Shamir's secret sharing scheme, the breaking of the Merkle-Hellman cryptosystem, the TWINKLE and TWIRL factoring devices and the discovery of differential cryptanalysis (with Eli Biham). https://en.wikipedia.org/wiki/Adi_Shamir
-    "shamir",
-  
-    // Claude Shannon - The father of information theory and founder of digital circuit design theory. (https://en.wikipedia.org/wiki/Claude_Shannon)
-    "shannon",
-  
-    // Carol Shaw - Originally an Atari employee, Carol Shaw is said to be the first female video game designer. https://en.wikipedia.org/wiki/Carol_Shaw_(video_game_designer)
-    "shaw",
-  
-    // Dame Stephanie "Steve" Shirley - Founded a software company in 1962 employing women working from home. https://en.wikipedia.org/wiki/Steve_Shirley
-    "shirley",
-  
-    // William Shockley co-invented the transistor - https://en.wikipedia.org/wiki/William_Shockley
-    "shockley",
-  
-    // Lina Solomonovna Stern (or Shtern; Russian: Лина Соломоновна Штерн; 26 August 1878 – 7 March 1968) was a Soviet biochemist, physiologist and humanist whose medical discoveries saved thousands of lives at the fronts of World War II. She is best known for her pioneering work on blood–brain barrier, which she described as hemato-encephalic barrier in 1921. https://en.wikipedia.org/wiki/Lina_Stern
-    "shtern",
-  
-    // Françoise Barré-Sinoussi - French virologist and Nobel Prize Laureate in Physiology or Medicine; her work was fundamental in identifying HIV as the cause of AIDS. https://en.wikipedia.org/wiki/Fran%C3%A7oise_Barr%C3%A9-Sinoussi
-    "sinoussi",
-  
-    // Betty Snyder - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Betty_Holberton
-    "snyder",
-  
-    // Cynthia Solomon - Pioneer in the fields of artificial intelligence, computer science and educational computing. Known for creation of Logo, an educational programming language.  https://en.wikipedia.org/wiki/Cynthia_Solomon
-    "solomon",
-  
-    // Frances Spence - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Frances_Spence
-    "spence",
-  
-    // Michael Stonebraker is a database research pioneer and architect of Ingres, Postgres, VoltDB and SciDB. Winner of 2014 ACM Turing Award. https://en.wikipedia.org/wiki/Michael_Stonebraker
-    "stonebraker",
-  
-    // Ivan Edward Sutherland - American computer scientist and Internet pioneer, widely regarded as the father of computer graphics. https://en.wikipedia.org/wiki/Ivan_Sutherland
-    "sutherland",
-  
-    // Janese Swanson (with others) developed the first of the Carmen Sandiego games. She went on to found Girl Tech. https://en.wikipedia.org/wiki/Janese_Swanson
-    "swanson",
-  
-    // Aaron Swartz was influential in creating RSS, Markdown, Creative Commons, Reddit, and much of the internet as we know it today. He was devoted to freedom of information on the web. https://en.wikiquote.org/wiki/Aaron_Swartz
-    "swartz",
-  
-    // Bertha Swirles was a theoretical physicist who made a number of contributions to early quantum theory. https://en.wikipedia.org/wiki/Bertha_Swirles
-    "swirles",
-  
-    // Helen Brooke Taussig - American cardiologist and founder of the field of paediatric cardiology. https://en.wikipedia.org/wiki/Helen_B._Taussig
-    "taussig",
-  
-    // Valentina Tereshkova is a Russian engineer, cosmonaut and politician. She was the first woman to fly to space in 1963. In 2013, at the age of 76, she offered to go on a one-way mission to Mars. https://en.wikipedia.org/wiki/Valentina_Tereshkova
-    "tereshkova",
-  
-    // Nikola Tesla invented the AC electric system and every gadget ever used by a James Bond villain. https://en.wikipedia.org/wiki/Nikola_Tesla
-    "tesla",
-  
-    // Marie Tharp - American geologist and oceanic cartographer who co-created the first scientific map of the Atlantic Ocean floor. Her work led to the acceptance of the theories of plate tectonics and continental drift. https://en.wikipedia.org/wiki/Marie_Tharp
-    "tharp",
-  
-    // Ken Thompson - co-creator of UNIX and the C programming language - https://en.wikipedia.org/wiki/Ken_Thompson
-    "thompson",
-  
-    // Linus Torvalds invented Linux and Git. https://en.wikipedia.org/wiki/Linus_Torvalds
-    "torvalds",
-  
-    // Youyou Tu - Chinese pharmaceutical chemist and educator known for discovering artemisinin and dihydroartemisinin, used to treat malaria, which has saved millions of lives. Joint winner of the 2015 Nobel Prize in Physiology or Medicine. https://en.wikipedia.org/wiki/Tu_Youyou
-    "tu",
-  
-    // Alan Turing was a founding father of computer science. https://en.wikipedia.org/wiki/Alan_Turing.
-    "turing",
-  
-    // Varahamihira - Ancient Indian mathematician who discovered trigonometric formulae during 505-587 CE - https://en.wikipedia.org/wiki/Var%C4%81hamihira#Contributions
-    "varahamihira",
-  
-    // Dorothy Vaughan was a NASA mathematician and computer programmer on the SCOUT launch vehicle program that put America's first satellites into space - https://en.wikipedia.org/wiki/Dorothy_Vaughan
-    "vaughan",
-  
-    // Cédric Villani - French mathematician, won Fields Medal, Fermat Prize and Poincaré Price for his work in differential geometry and statistical mechanics. https://en.wikipedia.org/wiki/C%C3%A9dric_Villani
-    "villani",
-  
-    // Sir Mokshagundam Visvesvaraya - is a notable Indian engineer.  He is a recipient of the Indian Republic's highest honour, the Bharat Ratna, in 1955. On his birthday, 15 September is celebrated as Engineer's Day in India in his memory - https://en.wikipedia.org/wiki/Visvesvaraya
-    "visvesvaraya",
-  
-    // Christiane Nüsslein-Volhard - German biologist, won Nobel Prize in Physiology or Medicine in 1995 for research on the genetic control of embryonic development. https://en.wikipedia.org/wiki/Christiane_N%C3%BCsslein-Volhard
-    "volhard",
-  
-    // Marlyn Wescoff - one of the original programmers of the ENIAC. https://en.wikipedia.org/wiki/ENIAC - https://en.wikipedia.org/wiki/Marlyn_Meltzer
-    "wescoff",
-  
-    // Sylvia B. Wilbur - British computer scientist who helped develop the ARPANET, was one of the first to exchange email in the UK and a leading researcher in computer-supported collaborative work. https://en.wikipedia.org/wiki/Sylvia_Wilbur
-    "wilbur",
-  
-    // Andrew Wiles - Notable British mathematician who proved the enigmatic Fermat's Last Theorem - https://en.wikipedia.org/wiki/Andrew_Wiles
-    "wiles",
-  
-    // Roberta Williams, did pioneering work in graphical adventure games for personal computers, particularly the King's Quest series. https://en.wikipedia.org/wiki/Roberta_Williams
-    "williams",
-  
-    // Malcolm John Williamson - British mathematician and cryptographer employed by the GCHQ. Developed in 1974 what is now known as Diffie-Hellman key exchange (Diffie and Hellman first published the scheme in 1976). https://en.wikipedia.org/wiki/Malcolm_J._Williamson
-    "williamson",
-  
-    // Sophie Wilson designed the first Acorn Micro-Computer and the instruction set for ARM processors. https://en.wikipedia.org/wiki/Sophie_Wilson
-    "wilson",
-  
-    // Jeannette Wing - co-developed the Liskov substitution principle. - https://en.wikipedia.org/wiki/Jeannette_Wing
-    "wing",
-  
-    // Steve Wozniak invented the Apple I and Apple II. https://en.wikipedia.org/wiki/Steve_Wozniak
-    "wozniak",
-  
-    // The Wright brothers, Orville and Wilbur - credited with inventing and building the world's first successful airplane and making the first controlled, powered and sustained heavier-than-air human flight - https://en.wikipedia.org/wiki/Wright_brothers
-    "wright",
-  
-    // Chien-Shiung Wu - Chinese-American experimental physicist who made significant contributions to nuclear physics. https://en.wikipedia.org/wiki/Chien-Shiung_Wu
-    "wu",
-  
-    // Rosalyn Sussman Yalow - Rosalyn Sussman Yalow was an American medical physicist, and a co-winner of the 1977 Nobel Prize in Physiology or Medicine for development of the radioimmunoassay technique. https://en.wikipedia.org/wiki/Rosalyn_Sussman_Yalow
-    "yalow",
-  
-    // Ada Yonath - an Israeli crystallographer, the first woman from the Middle East to win a Nobel prize in the sciences. https://en.wikipedia.org/wiki/Ada_Yonath
-    "yonath",
-  
-    // Nikolay Yegorovich Zhukovsky (Russian: Никола́й Его́рович Жуко́вский, January 17 1847 – March 17, 1921) was a Russian scientist, mathematician and engineer, and a founding father of modern aero- and hydrodynamics. Whereas contemporary scientists scoffed at the idea of human flight, Zhukovsky was the first to undertake the study of airflow. He is often called the Father of Russian Aviation. https://en.wikipedia.org/wiki/Nikolay_Yegorovich_Zhukovsky
-    "zhukovsky",
-  ]
-  
-  export const generateHostName = ():Hostname => {
-    return util.format('%s-%s', randelem(adjectives), randelem(scientists)) as Hostname
-  }
-  
-  function randnum(n:number):number {
-    return Math.floor(Math.random() * n);
-  }
-  
-  function randelem(a:string[]):string {
-    return a[randnum(a.length)];
-  }
+/**
+ * Sticker names for Engines (idea#184).
+ *
+ * Every Pi gets a unique, memorable two-word hostname at install, e.g.
+ * `brave-otter`. It is printed on a sticker on the case; the operator opens
+ * the Console at `http://<name>.local:<port>`. Names never contain digits:
+ * Pis are no longer identified by numbers (no `idea<N>`).
+ *
+ * Words are short, common, friendly and easy to pronounce and spell when read
+ * aloud over a phone line. The lists live in ./stickerWords.ts (one reviewable
+ * file, >= 100,000 combinations).
+ */
+export { ADJECTIVES, NOUNS, BLOCKED_PAIRS } from './stickerWords.js'
+import { ADJECTIVES, NOUNS, BLOCKED_PAIRS } from './stickerWords.js'
+
+const DERIVING_SUFFIXES = ['y', 'en', 'al', 'ed', 'ful', 'ish', 'ly', 'ic', 'ous']
+
+/** True when `adj` is formed from `noun` by a suffix (sandy-sand, stony-stone,
+ *  starry-star, oaken-oak, coastal-coast). Such pairs read as a stutter. */
+export const isDerivedPair = (adj: string, noun: string): boolean => {
+    const stems = new Set([noun, noun.endsWith('e') ? noun.slice(0, -1) : noun])
+    for (const stem of stems) {
+        for (const st of [stem, stem + stem[stem.length - 1]]) {
+            if (adj.startsWith(st) && DERIVING_SUFFIXES.includes(adj.slice(st.length))) return true
+        }
+    }
+    return false
+}
+
+const blocked = new Set(BLOCKED_PAIRS)
+
+/** True when adjective-noun may be used as a sticker name. */
+export const isAllowedPair = (adj: string, noun: string): boolean =>
+    !isDerivedPair(adj, noun) && !blocked.has(`${adj}-${noun}`)
+
+/** Every allowed sticker name, in list order. */
+export const allStickerNames = (): string[] => {
+    const out: string[] = []
+    for (const a of ADJECTIVES) for (const n of NOUNS) if (isAllowedPair(a, n)) out.push(`${a}-${n}`)
+    return out
+}
+
+/** A sticker name: two lower-case words joined by one hyphen, no digits. */
+export const STICKER_NAME_RE = /^[a-z]+-[a-z]+$/
+
+export const isStickerName = (name: string): boolean =>
+    STICKER_NAME_RE.test(name) && name.length <= 63
+
+/** Lower-case, strip `.local` and a trailing dot, for comparisons. */
+export const normaliseName = (name: string): string =>
+    name.trim().toLowerCase().replace(/\.$/, '').replace(/\.local$/, '')
+
+export type Rand = () => number
+
+const pick = <T>(a: readonly T[], rand: Rand): T => a[Math.floor(rand() * a.length) % a.length]
+
+/** One random two-word name, NOT checked for collisions. Installers must use
+ *  resolveStickerName (src/install/stickerName.ts) instead. */
+export const generateHostName = (rand: Rand = Math.random): Hostname => {
+    for (;;) {
+        const a = pick(ADJECTIVES, rand), n = pick(NOUNS, rand)
+        if (isAllowedPair(a, n)) return `${a}-${n}` as Hostname
+    }
+}
+
+export class NoFreeNameError extends Error {}
+
+/**
+ * A random sticker name that is not in `taken` (compared case-insensitively,
+ * `.local` ignored). Tries random names first, then walks every combination
+ * from a random start so it only fails when every combination is taken.
+ */
+export const pickUniqueName = (taken: Iterable<string>, rand: Rand = Math.random, tries = 50): Hostname => {
+    const t = new Set([...taken].map(normaliseName))
+    for (let i = 0; i < tries; i++) {
+        const n = generateHostName(rand)
+        if (!t.has(n)) return n
+    }
+    const total = ADJECTIVES.length * NOUNS.length
+    const start = Math.floor(rand() * total)
+    for (let k = 0; k < total; k++) {
+        const i = (start + k) % total
+        const a = ADJECTIVES[Math.floor(i / NOUNS.length)], b = NOUNS[i % NOUNS.length]
+        if (!isAllowedPair(a, b)) continue
+        const n = `${a}-${b}`
+        if (!t.has(n)) return n as Hostname
+    }
+    throw new NoFreeNameError(`all ${total} sticker names are taken`)
+}
+
+```
+
+## File: src/utils/peerSsh.ts
+```typescript
+/**
+ * peerSsh.ts — the ONE place that builds the ssh/rsync options for Engine-to-Engine
+ * transfers (per-Pi Engine keys, design-per-pi-engine-key.md).
+ *
+ * Every Engine has its own ed25519 key (/home/pi/.ssh/idea_engine_ed25519, made at
+ * first start) and publishes it, with its ssh host key, in its Engine entry in the
+ * store (Engine.peerAccess). Each Engine writes its peers' keys into the root-owned
+ * /etc/ssh/idea_authorized_keys/pi (restricted to /usr/local/sbin/idea-peer-gate)
+ * and their host keys into /etc/idea/peer_known_hosts, both through
+ * `idea-app-data sync-peers`. A peer is addressed by IP, but its host key is pinned
+ * by Engine id (HostKeyAlias), so a changed IP never needs a known_hosts fix and a
+ * host that is not the peer fails closed. Never StrictHostKeyChecking=no.
+ *
+ * The root helper's `send` (script/build_image_assets/idea-app-data) builds the
+ * same option list itself; a test checks that the two stay equal.
+ */
+
+import crypto from 'crypto'
+
+/** The Engine's private key (pi:pi 0600); `<path>.pub` holds the public key. */
+export const PEER_KEY_PATH = '/home/pi/.ssh/idea_engine_ed25519'
+/** Peers' host keys by Engine id, written by `idea-app-data sync-peers` (root:root 0644). */
+export const PEER_KNOWN_HOSTS = '/etc/idea/peer_known_hosts'
+/** Peers' Engine keys, each restricted to the gate, written by `sync-peers` (root:root 0644). */
+export const PEER_AUTHORIZED_KEYS = '/etc/ssh/idea_authorized_keys/pi'
+/** The forced command of every peer key (root-owned 0755, installed by build-engine). */
+export const PEER_GATE = '/usr/local/sbin/idea-peer-gate'
+/** This Pi's ssh host key (public part), published so peers can pin it. */
+export const HOST_KEY_PUB = '/etc/ssh/ssh_host_ed25519_key.pub'
+/** The remote user every peer connection logs in as. */
+export const PEER_USER = 'pi'
+
+/** Engine ids the peer files accept (also HostKeyAlias and the gate's argument). */
+export const ENGINE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/
+/** An ed25519 public key blob in base64: always 68 characters with this prefix. */
+export const ED25519_B64_RE = /^AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}$/
+
+export const checkEngineId = (engineId: string): string => {
+    if (!ENGINE_ID_RE.test(engineId)) throw new Error(`'${engineId}' is not an Engine id the peer files accept (${ENGINE_ID_RE})`)
+    return engineId
+}
+
+/**
+ * `ssh-ed25519 <base64> [comment]` → `ssh-ed25519 <base64>` (comment dropped), or
+ * null when it is not exactly one well-formed ed25519 public key.
+ */
+export const normaliseEd25519 = (line: string | null | undefined): string | null => {
+    if (typeof line !== 'string') return null
+    const parts = line.trim().split(/\s+/)
+    if (parts.length < 2 || parts[0] !== 'ssh-ed25519' || !ED25519_B64_RE.test(parts[1])) return null
+    const blob = Buffer.from(parts[1], 'base64')
+    // uint32 11, "ssh-ed25519", uint32 32, 32 key bytes
+    if (blob.length !== 51 || blob.readUInt32BE(0) !== 11 || blob.toString('latin1', 4, 15) !== 'ssh-ed25519' || blob.readUInt32BE(15) !== 32) return null
+    if (blob.toString('base64').replace(/=+$/, '') !== parts[1]) return null
+    return `ssh-ed25519 ${parts[1]}`
+}
+
+/** OpenSSH's fingerprint of a public key line: `SHA256:<base64, no padding>`. */
+export const keyFingerprint = (keyLine: string): string => {
+    const k = normaliseEd25519(keyLine)
+    if (!k) throw new Error('not an ed25519 public key')
+    const digest = crypto.createHash('sha256').update(Buffer.from(k.split(' ')[1], 'base64')).digest('base64')
+    return `SHA256:${digest.replace(/=+$/, '')}`
+}
+
+/**
+ * The ssh options for a connection to the peer Engine `engineId`: its own key only,
+ * no prompts, the pinned host key (by Engine id) and nothing else.
+ */
+export const peerSshOptions = (engineId: string): string[] => [
+    '-i', PEER_KEY_PATH,
+    '-o', 'IdentitiesOnly=yes',
+    '-o', 'BatchMode=yes',
+    '-o', 'StrictHostKeyChecking=yes',
+    '-o', `UserKnownHostsFile=${PEER_KNOWN_HOSTS}`,
+    '-o', `HostKeyAlias=${checkEngineId(engineId)}`,
+    '-o', 'ConnectTimeout=10',
+]
+
+/** The value for `rsync -e` (no option value holds a space, so this splits safely). */
+export const peerRsyncShell = (engineId: string): string => ['ssh', ...peerSshOptions(engineId)].join(' ')
+
+/** `user@host` for a peer; the host must be an IPv4 address or host name. */
+export const peerTarget = (host: string): string => {
+    if (!/^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/.test(host) || host.includes('..')) throw new Error(`'${host}' is not a peer address`)
+    return `${PEER_USER}@${host}`
+}
+
+/**
+ * The ssh argv that runs ONE remote command on a peer. The remote command is a
+ * single argument built from checked tokens; on the peer, the gate parses it.
+ */
+export const peerSshArgv = (host: string, engineId: string, remoteCommand: string[]): string[] => {
+    for (const w of remoteCommand) {
+        if (!/^[A-Za-z0-9._=,:+@/-]+$/.test(w)) throw new Error(`unsafe word '${w}' in a peer command`)
+    }
+    return ['ssh', ...peerSshOptions(engineId), peerTarget(host), '--', remoteCommand.join(' ')]
+}
+
+```
+
+## File: src/utils/redact.ts
+```typescript
+/**
+ * Redaction of operator password hashes from every dump/log path (idea#113 option b).
+ *
+ * The hashes stay in the synced store unchanged (Console logins verify against them);
+ * this only changes what the Engine prints or records in logs/traces.
+ */
+
+export const REDACTED = '<redacted>'
+
+/** Keys whose values are always secrets, wherever they appear. */
+const SECRET_KEYS = new Set(['passwordHash'])
+
+/** bcrypt hash: $2a$/$2b$/$2x$/$2y$, cost, 53 chars of salt+hash. Also catches truncated/odd forms. */
+const BCRYPT_RE = /\$2[abxy]\$\d{2}\$[./A-Za-z0-9]{0,53}/g
+
+/** Replace any bcrypt hash inside a string with "<redacted>". */
+export const redactString = (s: string): string =>
+    s.includes('$2') ? s.replace(BCRYPT_RE, REDACTED) : s
+
+/**
+ * Return a redacted copy of `value`: every `passwordHash` field becomes "<redacted>" and any
+ * bcrypt-looking string is replaced. All other fields are kept. Never mutates the input
+ * (safe on Automerge docs). Cycles are preserved.
+ */
+export const redactSecrets = <T>(value: T, seen: WeakMap<object, unknown> = new WeakMap()): T => {
+    if (typeof value === 'string') return redactString(value) as unknown as T
+    if (value === null || typeof value !== 'object') return value
+    if (value instanceof Date || value instanceof Uint8Array || value instanceof RegExp) return value
+    if (seen.has(value as object)) return seen.get(value as object) as T
+    if (Array.isArray(value)) {
+        const out: unknown[] = []
+        seen.set(value, out)
+        for (const v of value) out.push(redactSecrets(v, seen))
+        return out as unknown as T
+    }
+    if (value instanceof Map) {
+        const out = new Map()
+        seen.set(value, out)
+        for (const [k, v] of value) out.set(k, SECRET_KEYS.has(String(k)) ? REDACTED : redactSecrets(v, seen))
+        return out as unknown as T
+    }
+    if (value instanceof Error) {
+        const e = new (value.constructor as ErrorConstructor)(redactString(value.message))
+        e.stack = value.stack ? redactString(value.stack) : value.stack
+        seen.set(value, e)
+        for (const k of Object.keys(value)) (e as any)[k] = SECRET_KEYS.has(k) ? REDACTED : redactSecrets((value as any)[k], seen)
+        return e as unknown as T
+    }
+    const out: Record<string, unknown> = {}
+    seen.set(value as object, out)
+    for (const k of Object.keys(value as object)) {
+        out[k] = SECRET_KEYS.has(k) ? REDACTED : redactSecrets((value as any)[k], seen)
+    }
+    return out as T
+}
+
+/** JSON.stringify with redaction applied. */
+export const redactedJson = (value: unknown, space?: number): string =>
+    JSON.stringify(redactSecrets(value), null, space)
+
 ```
 
 ## File: src/utils/rsync.ts
@@ -4266,13 +6801,23 @@ import { Hostname } from '../data/CommonTypes.js';
  * Design: design/copy-move-app.md
  *
  * Phase 1: same-engine, local paths only.
- * Phase 2: cross-engine — pass remoteHost to rsync over SSH to pi@host.
+ * Phase 2: cross-engine — rsyncToPeer: rsync over ssh with this Engine's own key
+ *   (utils/peerSsh.ts); on the peer, the gate runs that Engine's helper as the
+ *   rsync server (receive-app / receive-service / receive-files), never a shell.
+ *
+ * Helper mode (idea#168): instance DATA is copied by the root helper
+ * /usr/local/sbin/idea-app-data (`sudo -n … copy|send`), which runs
+ * `rsync -aHAX --numeric-ids -x` as root so owners and modes survive. App masters
+ * (pi-owned) still use rsyncDirectory. Both share progress parsing and
+ * cancellation (registerProcess → SIGTERM; sudo relays it to the helper, which
+ * stops rsync and dies of the same signal).
  */
 
-import { chalk } from 'zx'
-import { spawn, ChildProcess } from 'child_process'
+import { spawn } from 'child_process'
 import { log } from './utils.js'
 import { registerProcess, deregisterProcess } from '../data/Operations.js'
+import { appDataSudoArgv, appDataErrorMessage, copyArgs, sendArgs, remoteHelperRsyncPath } from './appDataHelper.js'
+import { peerRsyncShell, peerTarget } from './peerSsh.js'
 
 export interface RsyncProgress {
     progressPercent: number
@@ -4281,50 +6826,29 @@ export interface RsyncProgress {
 export type RsyncProgressCallback = (progress: RsyncProgress) => void
 
 /**
- * Copy src/ to dest/ using rsync.
- *
- * - Preserves permissions, symlinks, timestamps (-a / archive mode)
- * - Reports per-transfer progress via onProgress callback (0-100)
- * - Idempotent: re-running after interruption transfers only the delta
- * - Throws on non-zero exit
- *
- * src must be a local absolute path.
- * dest must be an absolute path. If remoteHost is provided, rsync runs over
- * SSH to `pi@<remoteHost>:<dest>` (cross-engine Phase 2).
- * Trailing slash is appended to src so rsync copies the *contents*.
+ * Spawn an rsync-like process, report `progress2` percentages, register it for
+ * cancellation and reject with `formatError` on failure.
  */
-export const rsyncDirectory = (
-    src: string,
-    dest: string,
+const runRsyncProcess = (
+    command: string,
+    args: string[],
+    formatError: (code: number | null, signal: string | null, stderr: string) => string,
     onProgress?: RsyncProgressCallback,
     opId?: string,
-    remoteHost?: string,
+    detached = false,
 ): Promise<void> => {
     return new Promise((resolve, reject) => {
-        // Ensure src has trailing slash so rsync copies contents, not the directory itself
-        const srcArg = src.endsWith('/') ? src : src + '/'
-        const destArg = remoteHost ? `pi@${remoteHost}:${dest}` : dest
+        log(`${command} ${args.join(' ')}`)
 
-        const args = [
-            '-a',
-            '--info=progress2',
-            '--no-inc-recursive',  // required for accurate total-progress reporting
-        ]
-
-        if (remoteHost) {
-            args.push('-e', 'ssh -o StrictHostKeyChecking=no')
-        }
-
-        args.push(srcArg, destArg)
-
-        log(`rsync ${args.join(' ')}`)
-
-        const proc = spawn('rsync', args)
+        // detached (helper mode): sudo gets its own process group, so the SIGTERM a
+        // cancel sends is relayed to the helper (sudo ignores signals that come from
+        // its own process group).
+        const proc = spawn(command, args, { detached })
         if (opId) registerProcess(opId, proc)
 
         let stderr = ''
 
-        proc.stdout.on('data', (chunk: Buffer) => {
+        proc.stdout?.on('data', (chunk: Buffer) => {
             const text = chunk.toString()
             // progress2 lines look like: "  1,234,567  42%    1.23MB/s    0:00:05"
             // We scan for the percentage value.
@@ -4337,7 +6861,7 @@ export const rsyncDirectory = (
             }
         })
 
-        proc.stderr.on('data', (chunk: Buffer) => {
+        proc.stderr?.on('data', (chunk: Buffer) => {
             stderr += chunk.toString()
         })
 
@@ -4346,18 +6870,140 @@ export const rsyncDirectory = (
             if (code === 0) {
                 if (onProgress) onProgress({ progressPercent: 100 })
                 resolve()
-            } else if (signal === 'SIGTERM') {
+            } else if (signal === 'SIGTERM' || code === 143) {
                 reject(new Error(`rsync cancelled (SIGTERM)`))
             } else {
-                reject(new Error(`rsync exited with code ${code}: ${stderr.trim()}`))
+                reject(new Error(formatError(code, signal, stderr)))
             }
         })
 
         proc.on('error', (err) => {
             if (opId) deregisterProcess(opId)
-            reject(new Error(`rsync spawn error: ${err.message}`))
+            reject(new Error(`${command} spawn error: ${err.message}`))
         })
     })
+}
+
+/**
+ * Copy src/ to dest/ using rsync (both local).
+ *
+ * - Preserves permissions, symlinks, timestamps (-a / archive mode)
+ * - Reports per-transfer progress via onProgress callback (0-100)
+ * - Idempotent: re-running after interruption transfers only the delta
+ * - Throws on non-zero exit
+ *
+ * src and dest must be local absolute paths (a peer Engine: rsyncToPeer).
+ * Trailing slash is appended to src so rsync copies the *contents*.
+ *
+ * Runs as the Engine user (pi): use it for pi-owned trees (app masters, the
+ * copy's prepared compose.yaml/.env), never for instance data (rsyncInstanceData).
+ */
+export const rsyncDirectory = (
+    src: string,
+    dest: string,
+    onProgress?: RsyncProgressCallback,
+    opId?: string,
+): Promise<void> => {
+    // Ensure src has trailing slash so rsync copies contents, not the directory itself
+    const srcArg = src.endsWith('/') ? src : src + '/'
+    const args = [
+        '-a',
+        '--info=progress2',
+        '--no-inc-recursive',  // required for accurate total-progress reporting
+        srcArg, dest,
+    ]
+    return runRsyncProcess('rsync', args, (code, _signal, stderr) => `rsync exited with code ${code}: ${stderr.trim()}`, onProgress, opId)
+}
+
+/** A peer Engine: its current address and its Engine id (the host key is pinned by id). */
+export interface PeerEngine { host: string, engineId: string }
+
+/**
+ * The rsync argv (as pi) that sends `src` to a peer, where the peer's helper runs
+ * the rsync server for `helperArgs` (receive-app <root> <appId>, receive-service
+ * <root> or receive-files <root> <id>) into a folder it builds from those tokens.
+ * A src ending in '/' sends a folder's contents (and that folder's own owner and
+ * mode, for the target folder); a file or a list of files sends just those files.
+ */
+/**
+ * The ssh cipher pinned for Engine-to-Engine pushes (idea#351 §6, measured in idea#354):
+ * the Pi 4 has no hardware AES, and chacha20-poly1305 is about 1.9x faster than aes128-gcm.
+ */
+export const PEER_CIPHER = 'chacha20-poly1305@openssh.com'
+
+/** True when ssh failed only because the peer does not offer the pinned cipher. */
+export const isCipherNegotiationFailure = (stderr: string): boolean =>
+    /no matching cipher|Unable to negotiate[^\n]*cipher|Bad SSH2 cipher spec|Unknown cipher type/i.test(stderr)
+
+export const rsyncToPeerArgs = (src: string | string[], peer: PeerEngine, helperArgs: string[], pinCipher = true, extraArgs: string[] = []): string[] => [
+    '-a',
+    '--info=progress2',
+    '--no-inc-recursive',
+    ...extraArgs,
+    '-e', pinCipher ? `${peerRsyncShell(peer.engineId)} -c ${PEER_CIPHER}` : peerRsyncShell(peer.engineId),
+    `--rsync-path=${remoteHelperRsyncPath(helperArgs)}`,
+    '--', ...[src].flat(), `${peerTarget(peer.host)}:.`,
+]
+
+/** Runs one rsync; rejects with an Error whose message ends in rsync's stderr. Swappable in tests. */
+export type PeerRsyncRunner = (args: string[], formatError: (code: number | null, signal: string | null, stderr: string) => string,
+    onProgress?: RsyncProgressCallback, opId?: string) => Promise<void>
+export const peerRsyncRunner: { run: PeerRsyncRunner } = {
+    run: (args, formatError, onProgress, opId) => runRsyncProcess('rsync', args, formatError, onProgress, opId),
+}
+
+/**
+ * Send a pi-owned folder (src ending in '/') or files to a peer Engine's helper (see rsyncToPeerArgs).
+ * Pins PEER_CIPHER first; if the peer does not offer it (cipher negotiation failure, which ssh
+ * reports at once), retries ONCE with ssh's default cipher list. Any other failure is reported
+ * as is. ConnectTimeout=10 (peerSshOptions) stays on both attempts, so neither can hang on connect.
+ */
+export const rsyncToPeer = async (
+    src: string | string[],
+    peer: PeerEngine,
+    helperArgs: string[],
+    onProgress?: RsyncProgressCallback,
+    opId?: string,
+    extraArgs: string[] = [],
+): Promise<void> => {
+    const fmt = (code: number | null, _signal: string | null, stderr: string) =>
+        `rsync to Engine ${peer.engineId} (${peer.host}, ${helperArgs[0]}) exited with code ${code}: ${stderr.trim()}`
+    try {
+        await peerRsyncRunner.run(rsyncToPeerArgs(src, peer, helperArgs, true, extraArgs), fmt, onProgress, opId)
+    } catch (e) {
+        if (!isCipherNegotiationFailure(String((e as Error)?.message ?? e))) throw e
+        log(`rsync to Engine ${peer.engineId}: peer does not offer ${PEER_CIPHER}; retrying once with the default ssh ciphers`)
+        await peerRsyncRunner.run(rsyncToPeerArgs(src, peer, helperArgs, false, extraArgs), fmt, onProgress, opId)
+    }
+}
+
+/** One instance-data transfer through the root helper. Roots are helper root tokens. */
+export type InstanceDataTransfer =
+    | { kind: 'copy', srcRoot: string, srcId: string, dstRoot: string, dstId: string }
+    | { kind: 'send', srcRoot: string, srcId: string, host: string, peerEngineId: string, dstRoot: string, dstId: string }
+
+/** The helper arguments for a transfer (subcommand first). */
+export const instanceDataTransferArgs = (t: InstanceDataTransfer): string[] =>
+    t.kind === 'copy'
+        ? copyArgs(t.srcRoot, t.srcId, t.dstRoot, t.dstId)
+        : sendArgs(t.srcRoot, t.srcId, t.host, t.peerEngineId, t.dstRoot, t.dstId)
+
+/**
+ * Copy (same Engine) or send (to `pi@host` with this Engine's key, received there
+ * by that Engine's helper through its gate and rrsync) an instance folder as root, keeping owners, modes, hard links,
+ * ACLs and xattrs: `sudo -n /usr/local/sbin/idea-app-data copy|send …`. The helper
+ * creates the destination (it must not exist yet, or be empty) and refuses data
+ * that links off the instance folder.
+ */
+export const rsyncInstanceData = (
+    t: InstanceDataTransfer,
+    onProgress?: RsyncProgressCallback,
+    opId?: string,
+): Promise<void> => {
+    const args = instanceDataTransferArgs(t)
+    return runRsyncProcess('sudo', appDataSudoArgv(args),
+        (code, signal, stderr) => `rsync (${appDataErrorMessage(t.kind, code, signal, stderr)})`,
+        onProgress, opId, true)
 }
 
 ```
@@ -4399,6 +7045,128 @@ export function ssh(host: string, shell: typeof $ = $) {
 
 ```
 
+## File: src/utils/stickerWords.ts
+```typescript
+/**
+ * Sticker-name word lists (idea#184). REVIEW FILE: every word a Pi can be named with.
+ *
+ * Rules for these lists (keep them when editing):
+ *  - lower-case letters a-z only, 3-8 letters, no digits;
+ *  - common, short, easy to read, spell and pronounce for teachers in Africa
+ *    and second-language readers (Latin script, no slang, no hard or
+ *    variable spellings, no homophones or easily confused words);
+ *  - neutral and friendly: no people, body, romance, religion or witchcraft,
+ *    politics, currency, skin colour or race, insults, sexual slang, animals
+ *    used as slurs (e.g. no ape/monkey/pig/donkey), animals that are bad omens
+ *    in southern African folklore (e.g. owl), or conservation-sensitive goods
+ *    (e.g. ivory);
+ *  - no words that suggest numbering or rank (e.g. first, prime);
+ *  - adjectives are positive or neutral; no word appears in both lists.
+ *  Reviewed by Marco on PR #201 (2026-10-14).
+ *
+ * The generator (nameGenerator.ts) never pairs an adjective with the noun it
+ * derives from (sandy-sand, starry-star, stony-stone, oaken-oak; detected by
+ * suffix, see isDerivedPair) and skips the double-meaning pairs in
+ * BLOCKED_PAIRS (e.g. silver-fox).
+ *
+ * 299 adjectives x 335 nouns = 100165 pairs; 100145 valid two-word names
+ * after excluded pairs. Tests check the rules above and that the number of
+ * valid names stays >= 100,000.
+ */
+export const ADJECTIVES = [
+    'able', 'active', 'agile', 'airy', 'alert', 'alive', 'amber', 'ample',
+    'artful', 'artistic', 'aware', 'azure', 'balanced', 'balmy', 'beige', 'best',
+    'big', 'bold', 'bouncy', 'brave', 'breezy', 'brief', 'bright', 'brisk',
+    'broad', 'bubbly', 'busy', 'calm', 'candid', 'capable', 'careful', 'caring',
+    'casual', 'chatty', 'cheerful', 'chilly', 'chirpy', 'classic', 'clean', 'clear',
+    'clever', 'cloudy', 'coastal', 'comfy', 'cool', 'copper', 'cosmic', 'creative',
+    'crisp', 'curious', 'daily', 'daring', 'dashing', 'dazzling', 'decent', 'deep',
+    'dewy', 'direct', 'dreamy', 'dry', 'dusty', 'dutiful', 'dynamic', 'eager',
+    'early', 'earnest', 'easy', 'elegant', 'even', 'exact', 'expert', 'fabled',
+    'famous', 'fancy', 'fast', 'fearless', 'festive', 'fine', 'fizzy', 'fleet',
+    'floral', 'fluent', 'fluffy', 'flying', 'focused', 'fond', 'frank', 'free',
+    'fresh', 'friendly', 'frosty', 'fruity', 'full', 'funny', 'gallant', 'generous',
+    'gentle', 'genuine', 'gifted', 'glad', 'gleaming', 'gleeful', 'global', 'glossy',
+    'glowing', 'golden', 'good', 'graceful', 'gracious', 'grand', 'grassy', 'grateful',
+    'great', 'green', 'handy', 'happy', 'hardy', 'hazy', 'hearty', 'helpful',
+    'heroic', 'hilly', 'honest', 'hopeful', 'humble', 'hushed', 'ideal', 'immense',
+    'indigo', 'inspired', 'jade', 'jolly', 'jovial', 'joyful', 'joyous', 'keen',
+    'kind', 'lasting', 'leafy', 'level', 'light', 'lilac', 'lively', 'local',
+    'lofty', 'logical', 'lovely', 'loyal', 'lucky', 'lunar', 'lush', 'majestic',
+    'marine', 'mellow', 'merry', 'mighty', 'mild', 'mindful', 'misty', 'modern',
+    'modest', 'mossy', 'musical', 'mutual', 'natural', 'neat', 'nimble', 'noble',
+    'novel', 'oaken', 'open', 'orderly', 'organic', 'pastel', 'patient', 'peaceful',
+    'peachy', 'perfect', 'pink', 'plain', 'playful', 'pleasant', 'plucky', 'plush',
+    'polar', 'polite', 'popular', 'precise', 'prompt', 'proper', 'proud', 'punctual',
+    'purple', 'quick', 'radiant', 'rainy', 'rapid', 'rare', 'ready', 'real',
+    'regal', 'relaxed', 'reliable', 'restful', 'rich', 'robust', 'rocky', 'rosy',
+    'round', 'royal', 'rugged', 'rural', 'rustic', 'safe', 'sandy', 'satin',
+    'scenic', 'secure', 'sensible', 'serene', 'sharp', 'shining', 'shiny', 'silent',
+    'silky', 'silver', 'simple', 'sincere', 'skilled', 'sleek', 'smart', 'smiling',
+    'smooth', 'snowy', 'snug', 'social', 'soft', 'solar', 'solid', 'sound',
+    'sparkly', 'speedy', 'spirited', 'sporty', 'spotless', 'stable', 'starry', 'steady',
+    'steep', 'stellar', 'stony', 'strong', 'sturdy', 'sunny', 'sunset', 'super',
+    'sweet', 'swift', 'tactful', 'tall', 'tasty', 'terrific', 'thankful', 'thrifty',
+    'tidal', 'tidy', 'timely', 'tiny', 'tireless', 'tranquil', 'trim', 'tropical',
+    'true', 'trusty', 'tuneful', 'unique', 'upbeat', 'upright', 'useful', 'valiant',
+    'vast', 'velvet', 'vibrant', 'vital', 'vivid', 'warm', 'watchful', 'wavy',
+    'welcome', 'wide', 'willing', 'windy', 'winged', 'wise', 'witty', 'wooden',
+    'worthy', 'zesty', 'zippy',
+] as const
+
+export const NOUNS = [
+    'acacia', 'acorn', 'almond', 'aloe', 'alpaca', 'anchor', 'antelope', 'apple',
+    'apricot', 'arch', 'arrow', 'aster', 'atlas', 'avocado', 'badger', 'bakery',
+    'bamboo', 'banjo', 'baobab', 'barley', 'basil', 'basket', 'bay', 'beacon',
+    'bean', 'bee', 'beetle', 'bicycle', 'bird', 'bison', 'blossom', 'boat',
+    'bobcat', 'boulder', 'branch', 'bread', 'breeze', 'brick', 'bridge', 'brook',
+    'bubble', 'bucket', 'buffalo', 'bugle', 'butter', 'button', 'cabin', 'cactus',
+    'calabash', 'camel', 'candle', 'canoe', 'canyon', 'cape', 'carrot', 'cashew',
+    'cassava', 'castle', 'cedar', 'chalk', 'cheetah', 'chess', 'cider', 'citrus',
+    'clay', 'cliff', 'clock', 'cloud', 'clover', 'coast', 'cobalt', 'cocoa',
+    'comet', 'compass', 'condor', 'cookie', 'coral', 'cotton', 'crane', 'crayon',
+    'creek', 'cricket', 'crystal', 'cup', 'daisy', 'delta', 'desert', 'dew',
+    'dolphin', 'dove', 'drum', 'dune', 'eagle', 'earth', 'echo', 'eland',
+    'elm', 'ember', 'emerald', 'eraser', 'falcon', 'feather', 'fern', 'ferry',
+    'field', 'fig', 'finch', 'flame', 'flamingo', 'flute', 'forest', 'fossil',
+    'fountain', 'fox', 'garden', 'garnet', 'gazelle', 'gecko', 'ginger', 'giraffe',
+    'glacier', 'globe', 'gorge', 'granite', 'grape', 'grove', 'guava', 'guitar',
+    'harp', 'hawk', 'hazel', 'hedgehog', 'heron', 'hibiscus', 'hill', 'hilltop',
+    'hippo', 'honey', 'horizon', 'ibis', 'impala', 'island', 'jasmine', 'jay',
+    'jewel', 'journey', 'kalimba', 'kayak', 'kestrel', 'kettle', 'kite', 'kiwi',
+    'koala', 'kudu', 'ladder', 'lagoon', 'lake', 'lantern', 'lark', 'lava',
+    'leaf', 'lemon', 'lens', 'lily', 'lime', 'lion', 'lizard', 'llama',
+    'lobster', 'lotus', 'lute', 'magnet', 'maize', 'mango', 'maple', 'marble',
+    'marigold', 'marimba', 'marsh', 'marula', 'mbira', 'meadow', 'meerkat', 'melon',
+    'meteor', 'millet', 'mint', 'mirror', 'mongoose', 'moon', 'moose', 'mopane',
+    'moss', 'mountain', 'nectar', 'needle', 'nest', 'notebook', 'nova', 'nutmeg',
+    'oak', 'oasis', 'ocean', 'okapi', 'olive', 'onyx', 'opal', 'orange',
+    'orbit', 'orchid', 'oriole', 'osprey', 'ostrich', 'otter', 'oyster', 'paddle',
+    'palm', 'panda', 'parrot', 'pawpaw', 'peanut', 'pearl', 'pebble', 'pelican',
+    'pencil', 'pepper', 'petal', 'piano', 'pillar', 'pine', 'planet', 'plum',
+    'pond', 'poplar', 'pottery', 'prairie', 'protea', 'puffin', 'pumpkin', 'quail',
+    'quartz', 'quill', 'rabbit', 'radish', 'rain', 'rainbow', 'reef', 'rhino',
+    'ribbon', 'ridge', 'river', 'robin', 'rocket', 'rose', 'ruby', 'saddle',
+    'saffron', 'sage', 'salmon', 'sand', 'sapphire', 'satchel', 'scarf', 'seal',
+    'seashell', 'seed', 'sesame', 'shell', 'shore', 'sky', 'slate', 'sorghum',
+    'sparrow', 'spice', 'spoon', 'spring', 'spruce', 'squash', 'star', 'starfish',
+    'starling', 'stone', 'stork', 'stream', 'summit', 'sun', 'sunbeam', 'sunbird',
+    'sunrise', 'swan', 'tamarind', 'tango', 'tea', 'teacup', 'teapot', 'thunder',
+    'tiger', 'tilapia', 'timber', 'tomato', 'topaz', 'torch', 'tortoise', 'toucan',
+    'tower', 'trail', 'trumpet', 'tulip', 'tundra', 'turtle', 'ukulele', 'umbrella',
+    'valley', 'vanilla', 'violet', 'violin', 'volcano', 'wagon', 'walnut', 'walrus',
+    'warbler', 'water', 'wave', 'weaver', 'wheat', 'wheel', 'willow', 'wind',
+    'windmill', 'window', 'wolf', 'wren', 'yak', 'yam', 'zebra',
+] as const
+
+/** Pairs with a double meaning that the generator never produces. */
+export const BLOCKED_PAIRS: readonly string[] = [
+    'silver-fox',
+    'sweet-honey',
+]
+
+```
+
 ## File: src/utils/utils.ts
 ```typescript
 import util from 'util';
@@ -4406,6 +7174,7 @@ import { $, chalk, fs, os, question } from 'zx';
 import { IPAddress, PortNumber } from '../data/CommonTypes.js';
 import net from 'net';
 import crypto from 'crypto';
+import { redactSecrets, redactString } from './redact.js'
 
 
 // Dummy key
@@ -4488,17 +7257,17 @@ export const log = (msg:string, level?:number):void => {
     level = 2
   }
   if (verbosityLevel >= level) {
-    console.info(chalk.gray(msg))
+    console.info(chalk.gray(redactString(String(msg))))
   }
 }
 
 export const error = (msg:string):void => {
-  console.error(chalk.red(msg))
+  console.error(chalk.red(redactString(String(msg))))
 }
 
 /** Always-on status/output helper. Uses console.info (captured by CommandLogger). */
 export const print = (...args: unknown[]): void => {
-  console.info(...args)
+  console.info(...args.map(a => redactSecrets(a)))
 }
 
 export const setVerbosity = (level:number):void => {
@@ -4602,7 +7371,7 @@ export const contains = (yarray, value) => {
   }
 
 export const deepPrint = (obj, depth:(number | null)=null) => {
-    return util.inspect(obj, {showHidden: false, depth: depth, colors: true})
+    return util.inspect(redactSecrets(obj), {showHidden: false, depth: depth, colors: true})
     // Alternative: return JSON.stringify(obj, null, 2)
     // Alternative: return console.dir(obj, {depth: null, colors: true})
 }
@@ -4775,13 +7544,14 @@ export const stripPartition = (device: string):string => {
 
 ## File: src/data/App.ts
 ```typescript
+import { splitAppId } from './AppIdParse.js'
 import { $, YAML, chalk } from 'zx';
 import { Version, URL, AppID, AppName, Hostname, DeviceName, DiskName, DiskID } from './CommonTypes.js';
 import { log } from '../utils/utils.js';
 import { Store } from './Store.js';
 import { Disk, diskMountRoot } from './Disk.js';
 import { DocHandle } from '@automerge/automerge-repo';
-import { AppFilesMount, parseFilesMount } from './FilesMount.js';
+import { AppFilesMount, AppUsbMount, parseFilesMount, parseUsbMount } from './FilesMount.js';
 
 export interface App {
     id: AppID;
@@ -4795,6 +7565,8 @@ export interface App {
     author: string | null;
     /** Opt-in to Files Disk mounts (x-app.filesMount); null when the App does not opt in (idea#133). */
     filesMount?: AppFilesMount | null;
+    /** Opt-in to teacher USB sticks (x-app.usbMount, idea#193 §4); null when the App does not opt in. */
+    usbMount?: AppUsbMount | null;
 }
 
 type AppCategory = 'Productivity' | 'Utilities' | 'Games' | 'education' | 'office' | 'it' | string;
@@ -4803,16 +7575,15 @@ export const createAppId = (appName: AppName, version: Version): AppID => {
     return appName + "-" + version as AppID
 }
 
-export const extractAppName = (appId: AppID): AppName => {
-    // Use lastIndexOf so hyphenated names like 'kolibri-with-plugins-1.0' work correctly.
-    // The convention is: last hyphen separates the name from the version.
-    return appId.slice(0, appId.lastIndexOf('-')) as AppName
+/** Split an app id into name and version (rules in AppIdParse.ts). */
+export const parseAppId = (appId: string): { name: AppName, version: Version } => {
+    const { name, version } = splitAppId(appId)
+    return { name: name as AppName, version: version as Version }
 }
 
-export const extractAppVersion = (appId: AppID): Version => {
-    // Use lastIndexOf so hyphenated names like 'kolibri-with-plugins-1.0' work correctly.
-    return appId.slice(appId.lastIndexOf('-') + 1) as Version
-}
+export const extractAppName = (appId: AppID): AppName => parseAppId(appId).name
+
+export const extractAppVersion = (appId: AppID): Version => parseAppId(appId).version
 
 /**
  * Returns the major version number from an appId (e.g. 'sample-1.0' → 1).
@@ -4870,6 +7641,7 @@ export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: Ap
                     icon: xapp.icon ?? null,
                     author: xapp.author ?? null,
                     filesMount: parseFilesMount(xapp),
+                    usbMount: parseUsbMount(xapp),
                 }
                 // Store the new app object in the store
                 doc.appDB[appId] = app
@@ -4886,6 +7658,7 @@ export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: Ap
                 app.icon = xapp.icon ?? null
                 app.author = xapp.author ?? null
                 app.filesMount = parseFilesMount(xapp)
+                app.usbMount = parseUsbMount(xapp)
             }
         })
     return app!
@@ -4894,6 +7667,120 @@ export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: Ap
         console.error(e)
         return undefined
     }
+}
+
+```
+
+## File: src/data/AppIdParse.ts
+```typescript
+/**
+ * AppIdParse.ts — the one rule for splitting an app id into name and version.
+ * No imports, so App.ts and Store.ts can both use it (App.ts imports Store.ts).
+ *
+ * An app id on a disk is `<name>-<version>`: the folder apps/<name>-<version>/,
+ * from repo koenswings/app-<name> at git ref <version> (a branch or SHA ref is
+ * stored under its folder-safe form, see versionDirName in Instance.ts).
+ * Rules, first match wins:
+ *   1. `<name>@<ref>`: explicit, unambiguous. The ref may contain '-' and '/'
+ *      (`nextcloud@feat/nextcloud-demo`, `nextcloud@21d7f75`). Only used as
+ *      installApp input; on disk this becomes `<name>-<versionDirName(ref)>`.
+ *   2. Numeric version from the FIRST '-' followed by digits:
+ *      nextcloud-1.0-31.0.1 -> nextcloud / 1.0-31.0.1
+ *   3. Trailing commit SHA (7–40 hex) or `latest` after the last '-':
+ *      kolibri-channel-builder-2551b7d… -> kolibri-channel-builder / 2551b7d…
+ *   4. Otherwise the last '-' (old behaviour; ambiguous for refs with '-', use rule 1).
+ */
+const NUMERIC_RE = /^(.+?)-(\d+(?:\.\d+)*(?:[-.+][0-9A-Za-z.+-]*)?)$/
+const SHA_OR_LATEST_RE = /^(.+)-([0-9a-f]{7,40}|latest)$/
+
+export const splitAppId = (appId: string): { name: string, version: string } => {
+    const id = String(appId)
+    const at = id.indexOf('@')
+    if (at > 0) return { name: id.slice(0, at), version: id.slice(at + 1) }
+    const m = NUMERIC_RE.exec(id) ?? SHA_OR_LATEST_RE.exec(id)
+    if (m) return { name: m[1], version: m[2] }
+    const dash = id.lastIndexOf('-')
+    if (dash <= 0) return { name: id, version: '' }
+    return { name: id.slice(0, dash), version: id.slice(dash + 1) }
+}
+
+/** True for a git commit SHA (7–40 lowercase hex), which `git clone --branch` cannot take. */
+export const isCommitSha = (ref: string): boolean => /^[0-9a-f]{7,40}$/.test(ref)
+
+```
+
+## File: src/data/AppSecrets.ts
+```typescript
+/**
+ * AppSecrets.ts — per-instance app secrets the Engine writes to an instance's .env
+ *
+ * IDEA_NC_ADMIN_PASSWORD (idea#202): Nextcloud's admin password, kept apart from
+ * `pass` (MariaDB root/user). app-nextcloud's compose reads
+ * `NEXTCLOUD_ADMIN_PASSWORD=${IDEA_NC_ADMIN_PASSWORD:-${pass}}`, and Nextcloud
+ * reads it only at its first install.
+ *
+ * Scope: written only for an instance whose compose.yaml references the
+ * variable. That keys on what the app asks for, not on its name, so a renamed
+ * or forked Nextcloud app still gets it and no other app gets a secret it
+ * never reads.
+ *
+ * Lifecycle:
+ *  - Generated once, when the instance is new (the start that also first
+ *    generates `pass`), before compose up, so Nextcloud installs with it.
+ *  - Never regenerated: an existing value is kept on every later start.
+ *  - Copy and move carry it: move transfers the instance folder as is, and
+ *    copy's prepared .env keeps every line but `port=` (InstanceCopy.ts).
+ *  - An older instance (already has `pass`, no value) gets none: its
+ *    Nextcloud was installed with `pass`, so the compose fallback stays right.
+ *    A new value there would not match the real admin password.
+ *
+ * The value is never logged; only the variable name and the outcome are.
+ */
+
+import { fs } from 'zx'
+import { addOrUpdateEnvVariable, log, readEnvVariable, secureRandomString } from '../utils/utils.js'
+
+export const NC_ADMIN_PASSWORD_VAR = 'IDEA_NC_ADMIN_PASSWORD'
+
+/** URL-safe and safe in the .env writer's sed/echo: letters and digits only. */
+export const NC_ADMIN_PASSWORD_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
+/** 32 characters of 62: about 190 bits. */
+export const NC_ADMIN_PASSWORD_LENGTH = 32
+
+export const generateNcAdminPassword = (): string =>
+    secureRandomString(NC_ADMIN_PASSWORD_LENGTH, NC_ADMIN_PASSWORD_ALPHABET)
+
+export const composeUsesNcAdminPassword = (composeText: string): boolean =>
+    new RegExp(`\\b${NC_ADMIN_PASSWORD_VAR}\\b`).test(composeText)
+
+export type NcAdminPasswordOutcome = 'not-used' | 'kept' | 'generated' | 'legacy-fallback'
+
+/**
+ * Make sure a new instance whose compose reads IDEA_NC_ADMIN_PASSWORD has one
+ * in its .env. `newInstance` is true when this start is the instance's first
+ * (no `pass` in .env before this start).
+ */
+export const ensureNcAdminPassword = async (instanceDir: string, newInstance: boolean): Promise<NcAdminPasswordOutcome> => {
+    let composeText = ''
+    try {
+        composeText = await fs.readFile(`${instanceDir}/compose.yaml`, 'utf8')
+    } catch {
+        return 'not-used'
+    }
+    if (!composeUsesNcAdminPassword(composeText)) return 'not-used'
+    const envPath = `${instanceDir}/.env`
+    const existing = await readEnvVariable(envPath, NC_ADMIN_PASSWORD_VAR)
+    if (existing) {
+        log(`${NC_ADMIN_PASSWORD_VAR} already set for this instance; keeping it`)
+        return 'kept'
+    }
+    if (!newInstance) {
+        log(`${NC_ADMIN_PASSWORD_VAR} not set on an existing instance; not generating one (the app keeps its install-time fallback)`)
+        return 'legacy-fallback'
+    }
+    await addOrUpdateEnvVariable(envPath, NC_ADMIN_PASSWORD_VAR, generateNcAdminPassword())
+    log(`Generated ${NC_ADMIN_PASSWORD_VAR} for this new instance`)
+    return 'generated'
 }
 
 ```
@@ -4987,6 +7874,884 @@ export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: Ap
 
 ```
 
+## File: src/data/AutoStart.ts
+```typescript
+/**
+ * AutoStart.ts: the one gate for every start the Engine does on its own (idea#176).
+ *
+ * The Engine starts instances by itself when a disk is docked: at boot (the
+ * watcher's initial 'add' for every device in the watch folder), on a real USB
+ * plug, after the testMode/dev startup undock + re-add of every disk, and when a
+ * move, restore or install registers an instance on a disk (processInstance /
+ * processSystemInstance → tracedStartInstance). All of those ask shouldAutoStart.
+ *
+ * Rule: the operator's last word wins. An instance is not auto-started while
+ *   - its status is Stopped, or
+ *   - an operator stop is "in force": the latest stopApp operation of the
+ *     instance with an operator cause (console/cli/cross-engine command), not
+ *     Cancelled, with no operator start after it and no successful start of any
+ *     kind after it (instance.lastStarted).
+ * Status alone is not enough: the undock of a disk (a real unplug, a boot where
+ * the disk is gone or renamed, or the testMode/dev startup undock of every disk)
+ * overwrites Stopped with Undocked, and the dock pass then resets Undocked to
+ * Docked. The operation record survives that.
+ *
+ * Stops the Engine does itself as one step of a longer operation (backup-pre-stop,
+ * post-copy, post-move, disk-undocked) are not operator stops: an instance
+ * stopped that way and interrupted is still started again, as before. They also
+ * do not end an operator stop that is in force (a user-stopped app on a disk that
+ * is unplugged and plugged back stays Stopped).
+ *
+ * Pure functions on the store (no Engine, Docker or file system access).
+ */
+import { InstanceID, Operation, OperationCause } from './CommonTypes.js'
+import type { Instance } from './Instance.js'
+import type { Store } from './Store.js'
+
+/** Operation causes that come from the operator (idea#176). */
+export const USER_CAUSES: ReadonlySet<OperationCause> = new Set<OperationCause>([
+    'console-command', 'cli-command', 'cross-engine-cmd',
+])
+/** Kept for readers of the first version of the fix. */
+export const USER_STOP_CAUSES = USER_CAUSES
+
+const opInstanceId = (op: Operation): string | undefined =>
+    op.subject?.type === 'instance' ? String(op.subject.id) : (op.args?.instanceId ? String(op.args.instanceId) : undefined)
+
+const instanceOps = (store: Store, instanceId: InstanceID, kind: Operation['kind'], pred: (op: Operation) => boolean = () => true): Operation[] =>
+    Object.values(store.operationDB ?? {}).filter((op): op is Operation =>
+        !!op && op.kind === kind && opInstanceId(op) === String(instanceId) && pred(op))
+
+const latest = (ops: Operation[]): Operation | undefined =>
+    ops.reduce<Operation | undefined>((a, b) => (!a || (b.startedAt ?? 0) >= (a.startedAt ?? 0)) ? b : a, undefined)
+
+/** The most recent stopApp operation of the instance, any cause and any Engine. */
+export const lastStopOperation = (store: Store, instanceId: InstanceID): Operation | undefined =>
+    latest(instanceOps(store, instanceId, 'stopApp'))
+
+/** The most recent operator stop of the instance (not Cancelled), any Engine. */
+export const lastUserStop = (store: Store, instanceId: InstanceID): Operation | undefined =>
+    latest(instanceOps(store, instanceId, 'stopApp', op => USER_CAUSES.has(op.cause) && op.status !== 'Cancelled'))
+
+/**
+ * The operator stop that is still in force for the instance, or undefined. It ends
+ * with an operator start issued after it (whatever its outcome) or with any
+ * successful start after it (lastStarted: a user start, the "already running"
+ * shortcut, a restart after a copy/move/backup of a running app).
+ */
+export const userStopInForce = (store: Store, instance: Instance | undefined | null): Operation | undefined => {
+    if (!instance) return undefined
+    const stop = lastUserStop(store, instance.id)
+    if (!stop) return undefined
+    const at = stop.startedAt ?? 0
+    if ((instance.lastStarted ?? 0) > at) return undefined
+    const laterUserStart = instanceOps(store, instance.id, 'startApp', op =>
+        USER_CAUSES.has(op.cause) && op.status !== 'Cancelled' && (op.startedAt ?? 0) > at)
+    return laterUserStart.length ? undefined : stop
+}
+
+export interface AutoStartDecision {
+    start: boolean
+    reason: string
+    /** Set when an operator stop is the reason not to start. */
+    userStop?: Operation
+}
+
+/** May the Engine start this instance by itself (disk dock, re-add, registration)? */
+export const shouldAutoStart = (store: Store, instance: Instance): AutoStartDecision => {
+    const stop = userStopInForce(store, instance)
+    if (stop) return { start: false, reason: `stopped by the operator (${stop.cause}, operation ${String(stop.id).slice(0, 8)})`, userStop: stop }
+    if (instance.status === 'Stopped') return { start: false, reason: 'status is Stopped' }
+    return { start: true, reason: 'no operator stop in force' }
+}
+
+/**
+ * Startup (checkAndSetUndockedApps): a Stopped instance stays Stopped when an
+ * operator stop is in force, or when the store has no stop record at all for it
+ * (trust the store's status). A Stopped instance whose last stop was the Engine's
+ * own step of an interrupted operation is not "user stopped".
+ */
+export const isUserStopped = (store: Store, instance: Instance): boolean => {
+    if (instance.status !== 'Stopped') return false
+    return !!userStopInForce(store, instance) || !lastStopOperation(store, instance.id)
+}
+
+```
+
+## File: src/data/ChannelBuilderAutoStart.ts
+```typescript
+/**
+ * ChannelBuilderAutoStart.ts: the Engine starts the channel builder when a teacher
+ * stick with a kolibri folder is mounted (idea#193 §8.2a, decided by Koen 2026-10-14).
+ *
+ * A deliberate, narrow exception to "the Engine starts apps only on operator
+ * command" (AutoStart.ts covers disk docks):
+ *   - only the App named kolibri-channel-builder (CHANNEL_BUILDER_APP_NAME), never a list;
+ *   - only on the mount of a FAT/exFAT stick with a top-level kolibri folder on
+ *     THIS Engine (UsbSticks.addStick); ext4 docks and startup cleanup never call it;
+ *   - only an instance on a disk docked to this Engine; several → most recent lastStarted;
+ *   - only from Docked (or Error: one try per trigger). Stopped / Pauzed, or an
+ *     operator stop in force (userStopInForce), mean someone chose that: no start;
+ *   - through the normal startInstance, cause 'usb-stick', under the instance lock
+ *     (no second start while one runs), with a startInstance command trace;
+ *   - never stops the builder afterwards; kill switch settings.autoStartChannelBuilder.
+ */
+import type { DocHandle } from '@automerge/automerge-repo'
+import type { Store } from './Store.js'
+import type { Instance } from './Instance.js'
+import type { ChannelBuilderAutoStartResult, UsbStickPublic } from './Engine.js'
+import { autoStartChannelBuilder } from './Config.js'
+import { userStopInForce } from './AutoStart.js'
+import { extractAppName } from './App.js'
+import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
+import { log } from '../utils/utils.js'
+
+export const CHANNEL_BUILDER_APP_NAME = 'kolibri-channel-builder'
+
+export interface BuilderDecision {
+    result: ChannelBuilderAutoStartResult | 'start'
+    instance?: Instance
+    reason: string
+}
+
+const appNameOf = (store: Store, inst: Instance): string =>
+    String(store.appDB?.[inst.instanceOf]?.name ?? extractAppName(inst.instanceOf))
+
+/** Builder instances on disks docked to this Engine (not Undocked/Missing). */
+export const dockedBuilderInstances = (store: Store, engineId: string): Instance[] =>
+    Object.values(store.instanceDB ?? {}).filter(inst => {
+        if (!inst || inst.status === 'Undocked' || inst.status === 'Missing') return false
+        if (appNameOf(store, inst) !== CHANNEL_BUILDER_APP_NAME) return false
+        const disk = inst.storedOn ? store.diskDB[inst.storedOn] : null
+        return !!disk && disk.dockedTo === engineId && !!disk.device
+    })
+
+/** Pure decision (no Docker, no store writes). */
+export const decideBuilderAutoStart = (store: Store, engineId: string, enabled: boolean): BuilderDecision => {
+    if (!enabled) return { result: 'disabled', reason: 'settings.autoStartChannelBuilder is false' }
+    const all = dockedBuilderInstances(store, engineId)
+    if (all.length === 0) return { result: 'noBuilder', reason: 'no kolibri-channel-builder instance docked on this Engine' }
+    const inst = all.reduce((a, b) => ((b.lastStarted ?? 0) > (a.lastStarted ?? 0) ? b : a))
+    if (inst.status === 'Running' || inst.status === 'Starting') return { result: 'alreadyRunning', instance: inst, reason: `status is ${inst.status}` }
+    const stop = userStopInForce(store, inst)
+    if (stop) return { result: 'operatorStopped', instance: inst, reason: `stopped by the operator (${stop.cause})` }
+    if (inst.status === 'Stopped' || inst.status === 'Pauzed') return { result: 'operatorStopped', instance: inst, reason: `status is ${inst.status}` }
+    if (inst.status === 'Docked' || inst.status === 'Error') return { result: 'start', instance: inst, reason: `status is ${inst.status}` }
+    return { result: 'notStartable', instance: inst, reason: `status is ${inst.status}` }
+}
+
+export interface AutoStartDeps {
+    engineId: () => Promise<string>
+    start: (storeHandle: DocHandle<Store>, instance: Instance, stick: UsbStickPublic) => Promise<void>
+}
+
+const defaultDeps: AutoStartDeps = {
+    engineId: async () => (await import('./Engine.js')).localEngineId,
+    start: async (storeHandle, instance, stick) => {
+        const { startInstance } = await import('./Instance.js')
+        const { getCommandLogHandle, addTrace, closeTrace } = await import('./CommandLogStore.js')
+        const { runWithTrace } = await import('../utils/CommandLogger.js')
+        const disk = storeHandle.doc().diskDB[instance.storedOn!]
+        const traceId = crypto.randomUUID()
+        const args = JSON.stringify({ instanceName: instance.name, diskId: disk.id, reason: `auto-start: usb stick ${stick.stickId} with kolibri folder` })
+        const h = getCommandLogHandle()
+        if (h) addTrace(h, { traceId, command: 'startInstance', args, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
+        try {
+            await runWithTrace({ traceId, command: 'startInstance', args }, () => startInstance(storeHandle, instance, disk, 'usb-stick'))
+            if (h) closeTrace(h, traceId, 'ok')
+        } catch (e: any) {
+            if (h) closeTrace(h, traceId, 'error', e?.message ?? String(e))
+            throw e
+        }
+    },
+}
+let deps: AutoStartDeps = defaultDeps
+/** Tests only; null restores. */
+export const setBuilderAutoStartDepsForTests = (d: Partial<AutoStartDeps> | null): void => {
+    deps = d ? { ...defaultDeps, ...d } : defaultDeps
+}
+
+/** §8.2a: called by UsbSticks.addStick for a stick with hasKolibriFolder. */
+export const autoStartChannelBuilderForStick = async (
+    storeHandle: DocHandle<Store>,
+    stick: UsbStickPublic,
+): Promise<ChannelBuilderAutoStartResult> => {
+    if (!stick.hasKolibriFolder) return 'notStartable'
+    const decision = decideBuilderAutoStart(storeHandle.doc(), await deps.engineId(), autoStartChannelBuilder())
+    if (decision.result !== 'start') {
+        log(`auto-start: usb stick ${stick.stickId} with kolibri folder: not starting the channel builder (${decision.result}: ${decision.reason})`)
+        return decision.result
+    }
+    const inst = decision.instance!
+    const key = instanceKey(inst.id)
+    if (!resourceLock.acquire(key, 'startApp')) {
+        log(`auto-start: usb stick ${stick.stickId}: channel builder ${inst.id} is busy (${resourceLock.getLockInfo(key)?.kind}); not starting`)
+        return 'busy'
+    }
+    try {
+        log(`auto-start: usb stick ${stick.stickId} with kolibri folder: starting channel builder ${inst.id} (${decision.reason})`)
+        await deps.start(storeHandle, inst, stick)
+        const after = storeHandle.doc().instanceDB[inst.id]?.status
+        return after === 'Error' ? 'failed' : 'started'
+    } catch (e: any) {
+        log(`auto-start: usb stick ${stick.stickId}: starting channel builder ${inst.id} failed: ${e?.message ?? e}`)
+        return 'failed'
+    } finally {
+        resourceLock.release(key)
+    }
+}
+
+```
+
+## File: src/data/ClientCards.ts
+```typescript
+/**
+ * ClientCards.ts — new disks, card readers and client cards (idea#201 §10, contract v2)
+ *
+ * Read-only view of every whole disk on this Engine that is NOT an IDEA disk:
+ *   Engine.cardReaders  every removable USB mass-storage device (a card reader), with or without a medium
+ *   Engine.clientCards  removable media present now (the only Flash targets)
+ *   Engine.newDisks     non-removable disks without IDEA META (the Initialise targets);
+ *                       a removable card is never in newDisks (contract v2 decision 6)
+ * Nothing here mounts or writes anything (rule 1): the view comes from lsblk, sysfs and
+ * /dev/disk/by-id only. IDEA disks (any partition docked in diskDB on this Engine) and the
+ * system drive are never listed.
+ *
+ * Ids: a non-removable new disk uses the unformattedDisks candidateId (one id space,
+ * decision 5). A card uses 'card-' + sha1(reader serial, size, PTUUID): it changes when the
+ * medium is swapped, which the reader serial alone would not.
+ */
+import crypto from 'crypto'
+import { $, fs } from 'zx'
+import { DocHandle } from '@automerge/automerge-repo'
+import { Store } from './Store.js'
+import { EngineID, Timestamp } from './CommonTypes.js'
+import { isSystemDevice } from './SystemDisk.js'
+import { LsblkDevice, candidateIdFor, isSdCardMedium } from './UnformattedDisks.js'
+import { localEngineId } from './Engine.js'
+import { log } from '../utils/utils.js'
+import { metaLookCache } from '../monitors/metaLookCache.js'
+import type { IdeaLookResult } from '../monitors/mounts.js'
+
+export type CandidateID = string
+export type ReaderID = string
+export type ClientImageVersion = string
+
+export type CardContents =
+    | { kind: 'idea-client'; imageName: string; version: ClientImageVersion | null }
+    | { kind: 'raspios' }
+    | { kind: 'ubuntu' }
+    | { kind: 'empty' }
+    | { kind: 'other'; summary: string }
+    | { kind: 'unknown' }
+
+export interface NewDiskPartition { label: string | null; fsType: string | null; sizeBytes: number }
+
+export interface NewDisk {
+    candidateId: CandidateID
+    device: string
+    byId: string
+    sizeBytes: number
+    model: string | null
+    serial: string | null
+    removable: boolean
+    readerId: ReaderID | null
+    partitions: NewDiskPartition[]
+    contents: CardContents
+    mountedReadOnly: boolean
+    firstSeen: Timestamp
+}
+
+export interface CardReader {
+    id: ReaderID
+    name: string
+    usbPath: string
+    hasMedium: boolean
+    candidateId: CandidateID | null
+}
+
+/** Refusal codes (contract §5) a card can carry before any command is sent. */
+export type FlashRefusal = 'MOUNTED' | 'IN_USE_BY_APP' | 'BUSY' | 'NOT_REMOVABLE' | 'HELPER_MISSING' | 'SYSTEM_DISK' | 'HAS_IDEA_META'
+
+export interface ClientCard {
+    candidateId: CandidateID
+    sizeBytes: number
+    model: string | null
+    readerId: ReaderID | null
+    contents: CardContents
+    flashable: boolean
+    refusal: FlashRefusal | null
+}
+
+/** Internal scan result: the published shapes plus what the commands need (device, by-id, partitions). */
+export interface ScannedCard extends ClientCard {
+    device: string
+    byId: string | null
+    ptuuid: string | null
+    serial: string | null
+    partitionNames: string[]
+    /** ext4 partitions (idea#303: looked at for an OS rootfs layout before a flash) */
+    ext4PartitionNames: string[]
+    mountpoints: string[]
+}
+
+/** idea#303: what a physical non-IDEA disk can become. */
+export type DiskAction = 'initialise' | 'erase' | 'flash'
+export type DiskCandidateKind = 'usbDisk' | 'sdCard'
+
+/** idea#303: one entry per physical non-IDEA disk, with the actions it allows (Engine.diskCandidates). */
+export interface DiskCandidate {
+    candidateId: CandidateID
+    kind: DiskCandidateKind
+    device: string
+    sizeBytes: number
+    model: string | null
+    serial: string | null
+    removable: boolean
+    readerId: ReaderID | null
+    partitions: NewDiskPartition[]
+    contents: CardContents
+    actions: DiskAction[]
+    flashRefusal: FlashRefusal | null
+    mountedReadOnly: boolean
+    firstSeen: Timestamp
+    /**
+     * console#163: true when the cached read-only look (IdeaLookResult.ignored, mounts.ts) of any
+     * ext4 partition found an IDEA-IGNORE marker. Omitted (never false) otherwise. Actions are unchanged.
+     */
+    ignored?: boolean
+}
+
+export interface ScanResult {
+    diskCandidates?: DiskCandidate[]
+    /** candidateId → partition device names, in the order of NewDisk.partitions (internal) */
+    newDiskPartitions?: Record<string, string[]>
+    newDisks: NewDisk[]
+    cardReaders: CardReader[]
+    clientCards: ScannedCard[]
+}
+
+export interface CardLsblkDevice extends LsblkDevice {
+    label?: string | null
+    rm?: boolean | string | number | null
+    tran?: string | null
+    mountpoint?: string | null
+    mountpoints?: (string | null)[] | null
+    ptuuid?: string | null
+    vendor?: string | null
+    children?: CardLsblkDevice[]
+}
+
+export interface ClientCardOps {
+    lsblkJson: () => Promise<CardLsblkDevice[]>
+    /** /dev/disk/by-id whole-disk links → target device name (sdX) */
+    byIdLinks: () => Promise<{ link: string; device: string }[]>
+    /** realpath of /sys/block/<dev> (USB topology) */
+    sysfsPath: (device: string) => Promise<string | null>
+    isSystemDevice: (device: string) => Promise<boolean>
+    /** Devices (partitions or whole disks) of IDEA disks docked on this Engine */
+    dockedDevices: (store: Store | undefined, engineId: string) => Set<string>
+    /** idea#303: true when the cached read-only look of this partition found an OS rootfs layout (hasOsRootfsLayout) */
+    osRootfsPartition: (partition: string) => boolean
+    /** idea#311: true when the cached read-only look found a valid META.yaml and no IDEA-IGNORE marker */
+    ideaMetaPartition: (partition: string) => boolean
+    /** console#163: true when the cached read-only look of this partition found an IDEA-IGNORE marker */
+    ignoredPartition: (partition: string) => boolean
+    now: () => number
+}
+
+/** idea#311: a look that found a valid META.yaml (hasMeta) and no IDEA-IGNORE marker, i.e. initialiseDisk would refuse ALREADY_IDEA */
+export const isAlreadyIdeaLook = (l: IdeaLookResult | undefined): boolean => l?.ok === true && l.hasMeta === true && l.ignored !== true
+
+const defaultOps: ClientCardOps = {
+    lsblkJson: async () => {
+        const out = await $`lsblk -J -b -o NAME,TYPE,FSTYPE,SIZE,MODEL,VENDOR,SERIAL,LABEL,RM,TRAN,MOUNTPOINT,PTUUID`.nothrow()
+        if (out.exitCode !== 0 || !out.stdout.trim()) return []
+        return (JSON.parse(out.stdout) as { blockdevices?: CardLsblkDevice[] }).blockdevices ?? []
+    },
+    byIdLinks: async () => {
+        const dir = '/dev/disk/by-id'
+        let names: string[] = []
+        try { names = await fs.readdir(dir) } catch { return [] }
+        const out: { link: string; device: string }[] = []
+        for (const n of names) {
+            if (/-part\d+$/.test(n)) continue
+            try {
+                const target = await fs.realpath(`${dir}/${n}`)
+                out.push({ link: `${dir}/${n}`, device: target.replace(/^\/dev\//, '') })
+            } catch { /* dangling */ }
+        }
+        return out
+    },
+    sysfsPath: async (device) => { try { return await fs.realpath(`/sys/block/${device}`) } catch { return null } },
+    isSystemDevice: (d) => isSystemDevice(d),
+    dockedDevices: (store, engineId) => {
+        const s = new Set<string>()
+        for (const d of Object.values(store?.diskDB ?? {}) as any[]) {
+            if (d && String(d.dockedTo) === engineId && d.device) s.add(String(d.device))
+        }
+        return s
+    },
+    osRootfsPartition: (p) => (l => l?.ok === true && l.osRootfs === true)(metaLookCache.peek(p)),
+    ideaMetaPartition: (p) => isAlreadyIdeaLook(metaLookCache.peek(p)),
+    ignoredPartition: (p) => (l => l?.ok === true && l.ignored === true)(metaLookCache.peek(p)),
+    now: () => Date.now(),
+}
+
+let ops: ClientCardOps = defaultOps
+export const setClientCardOpsForTests = (o: Partial<ClientCardOps> | null): void => {
+    ops = o ? { ...defaultOps, ...o } : defaultOps
+}
+
+const firstSeenByKey = new Map<string, number>()
+export const clearClientCardStateForTests = (): void => { firstSeenByKey.clear() }
+
+const sha16 = (s: string): string => crypto.createHash('sha1').update(s).digest('hex').slice(0, 16)
+const num = (v: unknown): number => typeof v === 'number' ? v : parseInt(String(v ?? '0'), 10) || 0
+const isRemovable = (d: CardLsblkDevice): boolean => d.rm === true || d.rm === 1 || d.rm === '1' || d.rm === 'true'
+const clean = (v: string | null | undefined): string | null => (v ?? '').trim() || null
+const mountsOf = (d: CardLsblkDevice): string[] => {
+    const own = [d.mountpoint, ...(d.mountpoints ?? [])].filter((m): m is string => !!m)
+    return [...new Set([...own, ...(d.children ?? []).flatMap(mountsOf)])]
+}
+
+/** "1-1.2" from /sys/devices/platform/.../usb1/1-1/1-1.2/1-1.2:1.0/host0/... */
+export const usbPathOf = (sysfs: string | null): string => {
+    if (!sysfs) return ''
+    const segs = sysfs.split('/').filter(s => /^\d+-[\d.]+$/.test(s))
+    return segs[segs.length - 1] ?? ''
+}
+
+/** Read-only classification from partition labels and types (no mount, contract §1). */
+export const classifyContents = (parts: NewDiskPartition[], wholeFsType: string | null): CardContents => {
+    if (parts.length === 0) {
+        if (!wholeFsType) return { kind: 'empty' }
+        return { kind: 'other', summary: `whole disk ${wholeFsType}` }
+    }
+    const labels = parts.map(p => (p.label ?? '').toLowerCase())
+    const idea = parts.find(p => /^idea-client/i.test(p.label ?? ''))
+    if (idea) {
+        const m = /^idea-client[-_]?(.+)?$/i.exec(idea.label ?? '')
+        return { kind: 'idea-client', imageName: idea.label ?? 'IDEA client', version: m?.[1] ?? null }
+    }
+    if (labels.includes('bootfs') && labels.includes('rootfs')) return { kind: 'raspios' }
+    if (labels.includes('system-boot') && labels.includes('writable')) return { kind: 'ubuntu' }
+    if (parts.every(p => !p.fsType)) return { kind: 'unknown' }
+    const summary = parts.map(p => `${p.fsType ?? 'unknown'}${p.label ? ` '${p.label}'` : ''}`).join(', ')
+    return { kind: 'other', summary }
+}
+
+/**
+ * Scan this Engine's whole sd* disks. `busy` = a flash/erase/initialise runs here (cards
+ * then carry BUSY); `helperInstalled` false → HELPER_MISSING.
+ */
+export const scanClientCards = async (
+    store: Store | undefined,
+    engineId: string,
+    opts: { busy?: boolean; helperInstalled?: boolean } = {},
+): Promise<ScanResult> => {
+    const devices = await ops.lsblkJson()
+    const links = await ops.byIdLinks()
+    const docked = ops.dockedDevices(store, engineId)
+    const now = ops.now()
+    const res: ScanResult = { newDisks: [], cardReaders: [], clientCards: [], newDiskPartitions: {}, diskCandidates: [] }
+    const present = new Set<string>()
+
+    for (const d of devices) {
+        if ((d.type ?? 'disk') !== 'disk' || !/^sd[a-z]$/.test(d.name)) continue
+        if (await ops.isSystemDevice(d.name)) continue
+        const children = (d.children ?? []).filter(c => (c.type ?? 'part') === 'part')
+        // An IDEA disk (any partition, or the whole disk, docked here) is never listed
+        if (docked.has(d.name) || children.some(c => docked.has(c.name))) continue
+
+        const removable = isRemovable(d)
+        const sizeBytes = num(d.size)
+        const model = clean(d.model)
+        const serial = clean(d.serial)
+        const byId = links.filter(l => l.device === d.name).map(l => l.link).sort((a, b) => {
+            // prefer usb-* links (what the helper accepts)
+            const ua = a.includes('/usb-') ? 0 : 1, ub = b.includes('/usb-') ? 0 : 1
+            return ua - ub || a.localeCompare(b)
+        })[0] ?? null
+        const partitions: NewDiskPartition[] = children.map(c => ({ label: clean(c.label), fsType: clean(c.fstype), sizeBytes: num(c.size) }))
+        const contents = classifyContents(partitions, clean(d.fstype))
+        const mounts = mountsOf(d)
+
+        let readerId: ReaderID | null = null
+        if (removable && (d.tran ?? 'usb') === 'usb' && isSdCardMedium(d)) {
+            const usbPath = usbPathOf(await ops.sysfsPath(d.name))
+            readerId = sha16(`${usbPath || d.name}|${serial ?? ''}`)
+            const hasMedium = sizeBytes > 0
+            const name = [clean(d.vendor), model].filter(Boolean).join(' ') || 'Card reader'
+            const candidateId = hasMedium ? `card-${sha16(`${serial ?? d.name}|${sizeBytes}|${clean(d.ptuuid) ?? ''}`)}` : null
+            res.cardReaders.push({ id: readerId, name, usbPath, hasMedium, candidateId })
+            if (!hasMedium) continue
+            present.add(candidateId!)
+            if (!firstSeenByKey.has(candidateId!)) firstSeenByKey.set(candidateId!, now)
+            let refusal: FlashRefusal | null = null
+            if (opts.helperInstalled === false) refusal = 'HELPER_MISSING'
+            else if (mounts.length > 0) refusal = 'MOUNTED'
+            else if (opts.busy) refusal = 'BUSY'
+            res.clientCards.push({
+                candidateId: candidateId!, sizeBytes, model, readerId, contents,
+                flashable: refusal === null, refusal,
+                device: d.name, byId, ptuuid: clean(d.ptuuid), serial,
+                partitionNames: children.map(c => c.name), ext4PartitionNames: children.filter(c => c.fstype === 'ext4').map(c => c.name), mountpoints: mounts,
+            })
+            res.diskCandidates!.push({
+                candidateId: candidateId!, kind: 'sdCard', device: d.name, sizeBytes, model, serial, removable: true, readerId,
+                partitions, contents, actions: ['flash'], flashRefusal: refusal, mountedReadOnly: false,
+                firstSeen: firstSeenByKey.get(candidateId!)! as Timestamp,
+            })
+            continue
+        }
+        if (removable && (d.tran ?? 'usb') !== 'usb') {
+            // Removable but not on USB (e.g. a native SD slot that is not the system disk): a card without a reader entry
+            const candidateId = `card-${sha16(`${serial ?? d.name}|${sizeBytes}|${clean(d.ptuuid) ?? ''}`)}`
+            if (sizeBytes <= 0) continue
+            present.add(candidateId)
+            if (!firstSeenByKey.has(candidateId)) firstSeenByKey.set(candidateId, now)
+            const refusal: FlashRefusal | null = opts.helperInstalled === false ? 'HELPER_MISSING' : mounts.length ? 'MOUNTED' : opts.busy ? 'BUSY' : null
+            res.clientCards.push({
+                candidateId, sizeBytes, model, readerId: null, contents, flashable: refusal === null, refusal,
+                device: d.name, byId, ptuuid: clean(d.ptuuid), serial, partitionNames: children.map(c => c.name), ext4PartitionNames: children.filter(c => c.fstype === 'ext4').map(c => c.name), mountpoints: mounts,
+            })
+            res.diskCandidates!.push({
+                candidateId, kind: 'sdCard', device: d.name, sizeBytes, model, serial, removable: true, readerId: null,
+                partitions, contents, actions: ['flash'], flashRefusal: refusal, mountedReadOnly: false,
+                firstSeen: firstSeenByKey.get(candidateId)! as Timestamp,
+            })
+            continue
+        }
+        // idea#303: a USB disk (stick, SSD or HDD, whatever its rm flag) or a non-USB disk.
+        // Both IDEA-disk roles and, on USB with a usb-* by-id link, the client-image role.
+        if (sizeBytes <= 0) continue
+        const { candidateId, serial: idSerial } = await candidateIdFor(d.name, serial)
+        present.add(candidateId)
+        if (!firstSeenByKey.has(candidateId)) firstSeenByKey.set(candidateId, now)
+        const firstSeen = firstSeenByKey.get(candidateId)! as Timestamp
+        const mountedReadOnly = mounts.length > 0 && mounts.every(m => m.startsWith('/run/idea-usb'))
+        res.newDiskPartitions![candidateId] = children.map(c => c.name)
+        res.newDisks.push({
+            candidateId, device: d.name, byId: byId ?? '', sizeBytes, model, serial: idSerial,
+            removable, readerId: null, partitions, contents, mountedReadOnly, firstSeen,
+        })
+        const anyExt4 = clean(d.fstype) === 'ext4' || children.some(c => clean(c.fstype) === 'ext4')
+        const actions: DiskAction[] = []
+        // idea#303 (Steve, 2026-10-25): an OS rootfs partition (old Engine disk) is never initialised in
+        // place; initialiseDisk refuses it too (OS_ROOTFS). Such a disk can only be flashed for now.
+        const osRootfs = children.some(c => clean(c.fstype) === 'ext4' && ops.osRootfsPartition(c.name))
+        // idea#311: a disk that already carries a valid META.yaml (and no IDEA-IGNORE marker) is an IDEA disk
+        // left plugged in after eject; initialiseDisk would refuse it (ALREADY_IDEA), so it is not offered.
+        // An ignored disk keeps initialise: a teacher may deliberately re-take it (Steve, 2026-10-25).
+        const alreadyIdea = children.some(c => clean(c.fstype) === 'ext4' && ops.ideaMetaPartition(c.name))
+        if (!osRootfs && !alreadyIdea && children.some(c => clean(c.fstype) === 'ext4' && /^sd[a-z][12]$/.test(c.name))) actions.push('initialise')
+        // idea#310 (Steve, 2026-10-25): an OS rootfs disk (old Engine SSD) may also be erased, after which
+        // it is initialised through the normal path. Never offered together with initialise (see above).
+        if (!anyExt4 || osRootfs) actions.push('erase')
+        let flashRefusal: FlashRefusal | null = null
+        if ((d.tran ?? 'usb') === 'usb' && byId && byId.startsWith('/dev/disk/by-id/usb-')) {
+            actions.push('flash')
+            flashRefusal = opts.helperInstalled === false ? 'HELPER_MISSING' : mounts.length ? 'MOUNTED' : opts.busy ? 'BUSY' : null
+            res.clientCards.push({
+                candidateId, sizeBytes, model, readerId: null, contents, flashable: flashRefusal === null, refusal: flashRefusal,
+                device: d.name, byId, ptuuid: clean(d.ptuuid), serial, partitionNames: children.map(c => c.name), ext4PartitionNames: children.filter(c => c.fstype === 'ext4').map(c => c.name), mountpoints: mounts,
+            })
+        }
+        // console#163: publish IDEA-IGNORE; the key is omitted (not false) on other disks.
+        const ignored = children.some(c => clean(c.fstype) === 'ext4' && ops.ignoredPartition(c.name))
+        res.diskCandidates!.push({
+            candidateId, kind: 'usbDisk', device: d.name, sizeBytes, model, serial: idSerial, removable, readerId: null,
+            partitions, contents, actions, flashRefusal, mountedReadOnly, firstSeen,
+            ...(ignored ? { ignored: true } : {}),
+        })
+    }
+    for (const k of [...firstSeenByKey.keys()]) if (!present.has(k)) firstSeenByKey.delete(k)
+    return res
+}
+
+/** Last scan, for the commands (device / by-id never travel in a command). */
+let lastScan: ScanResult = { newDisks: [], cardReaders: [], clientCards: [] }
+export const lastClientCardScan = (): ScanResult => lastScan
+
+let busyProbe: () => boolean = () => false
+let helperProbe: () => boolean = () => true
+export const setClientCardProbes = (p: { busy?: () => boolean; helperInstalled?: () => boolean }): void => {
+    if (p.busy) busyProbe = p.busy
+    if (p.helperInstalled) helperProbe = p.helperInstalled
+}
+
+const publicCard = (c: ScannedCard): ClientCard => ({
+    candidateId: c.candidateId, sizeBytes: c.sizeBytes, model: c.model, readerId: c.readerId,
+    contents: c.contents, flashable: c.flashable, refusal: c.refusal,
+})
+
+const fingerprint = (r: ScanResult): string => JSON.stringify([r.newDisks, r.cardReaders, r.clientCards.map(publicCard), r.diskCandidates ?? []])
+let lastWritten = ''
+
+/**
+ * Rescan and write Engine.newDisks / cardReaders / clientCards (whole-list replace, only on change).
+ * Refreshes run one at a time and read the busy probe when they start: a poll scan that began
+ * during a flash used to finish after the flash's own end-of-flash refresh and write its BUSY
+ * last, leaving a stale BUSY hint on the card (idea#201).
+ */
+let refreshChain: Promise<unknown> = Promise.resolve()
+export const refreshClientCards = (
+    storeHandle: DocHandle<Store>,
+    engineId: EngineID = localEngineId as EngineID,
+): Promise<ScanResult> => {
+    const run = refreshChain.then(() => refreshClientCardsNow(storeHandle, engineId))
+    refreshChain = run.catch(() => {})
+    return run
+}
+const refreshClientCardsNow = async (
+    storeHandle: DocHandle<Store>,
+    engineId: EngineID,
+): Promise<ScanResult> => {
+    const scan = await scanClientCards(storeHandle.doc(), String(engineId), { busy: busyProbe(), helperInstalled: helperProbe() })
+    lastScan = scan
+    const fp = fingerprint(scan)
+    const eng = storeHandle.doc()?.engineDB?.[engineId]
+    if (fp === lastWritten && eng?.clientCards !== undefined) return scan
+    lastWritten = fp
+    storeHandle.change(doc => {
+        const e = doc.engineDB[engineId]
+        if (!e) return
+        e.newDisks = JSON.parse(JSON.stringify(scan.newDisks))
+        e.cardReaders = JSON.parse(JSON.stringify(scan.cardReaders))
+        e.clientCards = scan.clientCards.map(publicCard)
+        e.diskCandidates = JSON.parse(JSON.stringify(scan.diskCandidates ?? []))
+    })
+    log(`Client cards: ${scan.clientCards.map(c => `${c.device}(${c.candidateId}${c.refusal ? ' ' + c.refusal : ''})`).join(', ') || '(none)'}; ` +
+        `new disks: ${scan.newDisks.map(d => d.device).join(', ') || '(none)'}; readers: ${scan.cardReaders.length}`)
+    return scan
+}
+
+export const resetClientCardWriteCacheForTests = (): void => { refreshChain = Promise.resolve(); lastWritten = ''; lastScan = { newDisks: [], cardReaders: [], clientCards: [] } }
+
+/** Media changes in a reader send no add event for the whole disk: poll lsblk (cheap, write only on change). */
+export const CLIENT_CARD_POLL_MS = 5_000
+export const startClientCardPoll = (storeHandle: DocHandle<Store>): (() => void) => {
+    let running = false
+    const t = setInterval(() => {
+        if (running) return
+        running = true
+        refreshClientCards(storeHandle).catch(e => log(`client card poll: ${e}`)).finally(() => { running = false })
+    }, CLIENT_CARD_POLL_MS)
+    return () => clearInterval(t)
+}
+
+```
+
+## File: src/data/ClientImages.ts
+```typescript
+/**
+ * ClientImages.ts — IDEA client images stored on this Engine (idea#201 §10, idea#202 naming)
+ *
+ * Layout: <root>/<version>/idea-client-<version>.img.xz (+ .img.xz.sha256 in sha256sum format,
+ * optional MANIFEST.txt). <root> = /var/lib/idea/client-images (IDEA_CLIENT_IMAGES_DIR for tests).
+ * <version> = 26.04-<YYYYMMDD>-<gitsha>. Verify = recompute SHA-256; it must equal the .sha256
+ * line AND the line must name the file. Verified results are cached by (size, mtime) so a
+ * 4.5 GB image is hashed once, not at every scan. A bad image is marked 'bad-sha' and never
+ * offered; it is NOT deleted (quarantine-never-delete; an operator removes it).
+ * Sync from docked disks / peer Engines is a follow-up (only 'local' sources today).
+ */
+import crypto from 'crypto'
+import path from 'path'
+import { $, fs } from 'zx'
+import { DocHandle } from '@automerge/automerge-repo'
+import { Store } from './Store.js'
+import { EngineID, Timestamp } from './CommonTypes.js'
+import { localEngineId } from './Engine.js'
+import { ENGINE_STATE_DIR } from './FilesMount.js'
+import { log } from '../utils/utils.js'
+import { ClientImageVersion } from './ClientCards.js'
+
+export interface ClientImage {
+    version: ClientImageVersion
+    fileName: string
+    sizeBytes: number
+    imageSizeBytes: number | null
+    sha256: string
+    state: 'arriving' | 'verified' | 'bad-sha'
+    source: { type: 'disk'; diskId: string } | { type: 'engine'; engineId: string } | { type: 'local' }
+    addedAt: Timestamp
+}
+
+export interface ClientImageStore {
+    current: ClientImageVersion | null
+    previous: ClientImageVersion | null
+    images: ClientImage[]
+}
+
+export const clientImagesRoot = (): string => process.env.IDEA_CLIENT_IMAGES_DIR || '/var/lib/idea/client-images'
+export const VERSION_PATTERN = /^\d{2}\.\d{2}-(\d{8})-[0-9a-f]{7,40}$/
+export const imageFileName = (v: string): string => `idea-client-${v}.img.xz`
+export const imagePathOf = (v: string): string => path.join(clientImagesRoot(), v, imageFileName(v))
+
+export interface ClientImageOps {
+    sha256File: (file: string) => Promise<string>
+    uncompressedSize: (file: string) => Promise<number | null>
+    cacheFile: () => string
+}
+
+const defaultOps: ClientImageOps = {
+    sha256File: (file) => new Promise((resolve, reject) => {
+        const h = crypto.createHash('sha256')
+        fs.createReadStream(file).on('error', reject).on('data', (c) => h.update(c)).on('end', () => resolve(h.digest('hex')))
+    }),
+    uncompressedSize: async (file) => {
+        const out = await $`xz --robot --list ${file}`.nothrow()
+        if (out.exitCode !== 0) return null
+        const line = out.stdout.split('\n').find(l => l.startsWith('totals'))
+        const n = parseInt(line?.split('\t')[4] ?? '', 10)
+        return Number.isFinite(n) ? n : null
+    },
+    cacheFile: () => path.join(ENGINE_STATE_DIR, 'client-images-verified.json'),
+}
+let ops: ClientImageOps = defaultOps
+export const setClientImageOpsForTests = (o: Partial<ClientImageOps> | null): void => { ops = o ? { ...defaultOps, ...o } : defaultOps }
+
+type CacheEntry = { size: number; mtimeMs: number; sha256: string; imageSizeBytes: number | null; ok: boolean }
+const readCache = async (): Promise<Record<string, CacheEntry>> => {
+    try { return JSON.parse(await fs.readFile(ops.cacheFile(), 'utf8')) } catch { return {} }
+}
+const writeCache = async (c: Record<string, CacheEntry>): Promise<void> => {
+    try { await fs.ensureDir(path.dirname(ops.cacheFile())); await fs.writeFile(ops.cacheFile(), JSON.stringify(c)) } catch (e) { log(`client image cache: ${e}`) }
+}
+
+/** Parse a sha256sum line "<64 hex>  <name>" (also "*name"). */
+export const parseShaLine = (text: string): { sha256: string; name: string } | null => {
+    const m = /^([0-9a-fA-F]{64})\s+\*?(\S+)\s*$/.exec(text.trim().split('\n')[0] ?? '')
+    return m ? { sha256: m[1].toLowerCase(), name: m[2] } : null
+}
+
+/** Newest first: by YYYYMMDD in the version, then by arrival. */
+export const sortImages = (images: ClientImage[]): ClientImage[] =>
+    [...images].sort((a, b) => {
+        const da = VERSION_PATTERN.exec(a.version)?.[1] ?? '', db = VERSION_PATTERN.exec(b.version)?.[1] ?? ''
+        return db.localeCompare(da) || b.addedAt - a.addedAt
+    })
+
+export const scanClientImages = async (): Promise<ClientImageStore> => {
+    const root = clientImagesRoot()
+    let dirs: string[] = []
+    try { dirs = await fs.readdir(root) } catch { return { current: null, previous: null, images: [] } }
+    const cache = await readCache()
+    let cacheChanged = false
+    const images: ClientImage[] = []
+    for (const v of dirs) {
+        if (!VERSION_PATTERN.test(v)) continue
+        const file = imagePathOf(v)
+        let st: import("fs").Stats
+        try { st = await fs.lstat(file) } catch { continue }
+        if (!st.isFile()) continue
+        let shaText = ''
+        try { shaText = await fs.readFile(`${file}.sha256`, 'utf8') } catch { /* arriving */ }
+        const line = parseShaLine(shaText)
+        const base: Omit<ClientImage, 'state' | 'sha256' | 'imageSizeBytes'> = {
+            version: v, fileName: imageFileName(v), sizeBytes: st.size, source: { type: 'local' }, addedAt: Math.round(st.mtimeMs) as Timestamp,
+        }
+        if (!line) { images.push({ ...base, sha256: '', imageSizeBytes: null, state: 'arriving' }); continue }
+        if (line.name !== imageFileName(v)) { images.push({ ...base, sha256: line.sha256, imageSizeBytes: null, state: 'bad-sha' }); continue }
+        let c = cache[file]
+        if (!c || c.size !== st.size || c.mtimeMs !== st.mtimeMs || c.sha256 !== line.sha256) {
+            const calc = await ops.sha256File(file)
+            const ok = calc === line.sha256
+            c = { size: st.size, mtimeMs: st.mtimeMs, sha256: line.sha256, ok, imageSizeBytes: ok ? await ops.uncompressedSize(file) : null }
+            cache[file] = c
+            cacheChanged = true
+            log(`Client image ${v}: sha256 ${ok ? 'verified' : `MISMATCH (got ${calc})`}`)
+        }
+        images.push({ ...base, sha256: line.sha256, imageSizeBytes: c.imageSizeBytes, state: c.ok ? 'verified' : 'bad-sha' })
+    }
+    if (cacheChanged) await writeCache(cache)
+    const sorted = sortImages(images)
+    const verified = sorted.filter(i => i.state === 'verified')
+    return { current: verified[0]?.version ?? null, previous: verified[1]?.version ?? null, images: sorted }
+}
+
+let lastImages: ClientImageStore = { current: null, previous: null, images: [] }
+export const lastClientImages = (): ClientImageStore => lastImages
+
+export const refreshClientImages = async (
+    storeHandle: DocHandle<Store>,
+    engineId: EngineID = localEngineId as EngineID,
+): Promise<ClientImageStore> => {
+    const st = await scanClientImages()
+    lastImages = st
+    const prev = JSON.stringify(storeHandle.doc()?.engineDB?.[engineId]?.clientImages ?? null)
+    if (prev !== JSON.stringify(st)) {
+        storeHandle.change(doc => {
+            const e = doc.engineDB[engineId]
+            if (e) e.clientImages = JSON.parse(JSON.stringify(st))
+        })
+    }
+    return st
+}
+
+/** Resolve a flashCard version arg ('current' or a version) to a verified image. */
+export const resolveImage = (st: ClientImageStore, arg: string): { ok: true; image: ClientImage } | { ok: false; code: 'IMAGE_NOT_FOUND' | 'IMAGE_BAD_SHA'; text: string } => {
+    const v = arg === 'current' ? st.current : arg
+    if (!v) return { ok: false, code: 'IMAGE_NOT_FOUND', text: 'no verified client image on this Engine' }
+    const img = st.images.find(i => i.version === v)
+    if (!img) return { ok: false, code: 'IMAGE_NOT_FOUND', text: `client image ${v} is not stored on this Engine` }
+    if (img.state === 'bad-sha') return { ok: false, code: 'IMAGE_BAD_SHA', text: `client image ${v} failed its SHA-256 check` }
+    if (img.state !== 'verified') return { ok: false, code: 'IMAGE_NOT_FOUND', text: `client image ${v} is still arriving` }
+    return { ok: true, image: img }
+}
+
+```
+
+## File: src/data/ClientTimezone.ts
+```typescript
+/**
+ * ClientTimezone.ts — idea#208: the client time zone is a flash-time parameter.
+ *
+ * The client image defaults to UTC (koenswings/idea#319). When the Engine flashes a client
+ * card it passes its OWN time zone to the root helper (idea-flash-card --timezone), which
+ * writes idea-timezone.txt = "<zone>\n" on the card's FAT partition 1, next to idea-home.txt.
+ * The zone is read here as pi (`timedatectl show -p Timezone --value`) and validated; the
+ * helper validates it again as root. An empty or invalid zone means: no file, log it, and
+ * the flash still goes ahead (the client stays on UTC).
+ */
+import { execFile } from 'child_process'
+import fs from 'fs'
+import path from 'path'
+
+export const CLIENT_TIMEZONE_FILE = 'idea-timezone.txt'
+export const ZONEINFO_DIR = '/usr/share/zoneinfo'
+/** Same regex as idea#319 set-card-timezone.sh and the root helpers */
+export const TIMEZONE_RE = /^[A-Za-z][A-Za-z0-9_+-]*(\/[A-Za-z0-9_+-]+){0,2}$/
+
+export type TimezoneCheck = { ok: true; zone: string } | { ok: false; reason: string }
+
+/** Validate a tz name: regex, no '.'/'..' component, and <zoneinfoDir>/<zone> is a regular file. */
+export const validateClientTimezone = (raw: string | null | undefined, zoneinfoDir: string = ZONEINFO_DIR): TimezoneCheck => {
+    const zone = (raw ?? '').trim()
+    if (!zone) return { ok: false, reason: 'the Engine has no time zone (empty)' }
+    if (!TIMEZONE_RE.test(zone)) return { ok: false, reason: `'${zone}' is not a tz database name` }
+    if (zone.split('/').some(c => c === '..' || c === '.')) return { ok: false, reason: `'${zone}' has a . or .. component` }
+    try {
+        if (!fs.statSync(path.join(zoneinfoDir, zone)).isFile()) return { ok: false, reason: `'${zone}' is not a file in ${zoneinfoDir}` }
+    } catch {
+        return { ok: false, reason: `'${zone}' is not in ${zoneinfoDir}` }
+    }
+    return { ok: true, zone }
+}
+
+/** The exact bytes of idea-timezone.txt for a validated zone: one line with a trailing newline. */
+export const clientTimezoneFileContent = (zone: string): string => `${zone}\n`
+
+/** The Engine's own zone, as pi: `timedatectl show -p Timezone --value` ('' when it fails). */
+export const readEngineTimezone = (): Promise<string> => new Promise((resolve) => {
+    execFile('timedatectl', ['show', '-p', 'Timezone', '--value'], { timeout: 5000 }, (err, stdout) => {
+        resolve(err ? '' : String(stdout).trim())
+    })
+})
+
+```
+
 ## File: src/data/CommandDefinition.ts
 ```typescript
 import { DocHandle } from "@automerge/automerge-repo";
@@ -5035,10 +8800,12 @@ export interface CommandDefinition {
  */
 
 import { DocHandle, Repo, isValidAutomergeUrl } from '@automerge/automerge-repo'
-import { log } from '../utils/utils.js'
+import { log, print } from '../utils/utils.js'
 import { fs } from 'zx'
 import path from 'path'
-import { config } from './Config.js'
+import { redactString } from '../utils/redact.js'
+import { config, commandLogArchiveMaxBytes } from './Config.js'
+import { stopPeriodicFlush } from '../repo.js'
 
 // ── Types (also exported for use in CommonTypes consumers) ───────────────────
 
@@ -5068,6 +8835,8 @@ export interface CommandTrace {
 export interface CommandLogStore {
   traces: Record<string, CommandTrace>
   recentTraceIds: string[]  // insertion-ordered ring buffer, max MAX_TRACES entries
+  /** #158: storeTag of the fleet whose Engine wrote this log; another tag = a foreign log, never served. */
+  storeTag?: string
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -5081,12 +8850,25 @@ let _handle: DocHandle<CommandLogStore> | null = null
 export const getCommandLogHandle = (): DocHandle<CommandLogStore> | null => _handle
 
 /**
+ * Doc ids of command logs retired by a daily rotation (idea#183). A caller that
+ * captured the handle at startup (storeMonitor, CommandLogger, a long command
+ * that started before midnight) still passes the old handle; every write helper
+ * redirects such a handle to the current doc, where open traces were carried.
+ */
+const _retired = new Set<string>()
+
+/** The doc a write for `handle` should go to: the current doc if `handle` was rotated out. */
+export const liveCommandLogHandle = (handle: DocHandle<CommandLogStore>): DocHandle<CommandLogStore> =>
+  (_handle && handle !== _handle && _retired.has(handle.documentId)) ? _handle : handle
+
+/**
  * Point the module-level handle at an existing doc. createCommandLogStore sets
  * it in production; tests use this to record into an in-memory doc without
  * touching store-identity/.
  */
 export const setCommandLogHandle = (handle: DocHandle<CommandLogStore> | null): void => {
   _handle = handle
+  if (handle === null) { _retired.clear(); _currentDay = null }
 }
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
@@ -5106,7 +8888,19 @@ export interface CommandLogStoreOptions {
   urlFile?: string
   /** Default: COMMAND_LOG_LOAD_TIMEOUT_MS */
   timeoutMs?: number
+  /** Clock, for tests. Default: () => new Date() */
+  now?: () => Date
+  /** Default: <dir of urlFile>/command-log-archive */
+  archiveDir?: string
+  /** Size cap of archiveDir in bytes; oldest archives are deleted until under it. Default: settings.commandLogArchiveMaxBytes (1 GB) */
+  archiveMaxBytes?: number
+  /** #158: this fleet's storeTag, stamped on every log this Engine creates (and backfilled on load). */
+  storeTag?: string
 }
+
+/** storeTag stamped on new command logs (#158); set by createCommandLogStore. */
+let _storeTag: string | undefined
+const tagged = (): CommandLogStore => ({ traces: {}, recentTraceIds: [], ...(_storeTag ? { storeTag: _storeTag } : {}) })
 
 /**
  * Load the doc at `url`, giving up after `timeoutMs` (idea#145). Rejects when
@@ -5153,8 +8947,9 @@ export const createCommandLogStore = async (
   repo: Repo,
   options: CommandLogStoreOptions = {},
 ): Promise<DocHandle<CommandLogStore>> => {
-  const urlFile = options.urlFile ?? path.join('./' + config.settings.storeIdentityFolder, 'command-log-url.txt')
+  const urlFile = options.urlFile ?? defaultUrlFile()
   const timeoutMs = options.timeoutMs ?? COMMAND_LOG_LOAD_TIMEOUT_MS
+  if (options.storeTag) _storeTag = options.storeTag
 
   let handle: DocHandle<CommandLogStore>
 
@@ -5173,8 +8968,214 @@ export const createCommandLogStore = async (
     handle = await _createFresh(repo, urlFile)
   }
 
+  // #158: logs created before the tag existed get our tag (this is our own log, by our url file)
+  if (_storeTag && handle.doc() && !handle.doc().storeTag) {
+    handle.change(d => { d.storeTag = _storeTag })
+    log(`[commandLog] Stamped storeTag ${_storeTag} on ${handle.url}`)
+  }
   _handle = handle
-  return handle
+  const today = localDay(options.now?.() ?? new Date())
+  if (!existingUrl || handle.url !== existingUrl) {
+    // A fresh doc was just created: it belongs to today.
+    await writeAtomic(dayFileFor(urlFile), today)
+    _currentDay = today
+    return handle
+  }
+  _currentDay = readDayFile(urlFile)
+
+  // idea#183: rotate at startup when the loaded doc is from another day (or
+  // predates rotation and has no day file), so an Engine that was off at
+  // midnight, or is upgraded, starts on a small doc.
+  if (_currentDay !== today) {
+    log(`[commandLog] CommandLog day is ${_currentDay ?? 'unknown'}, today is ${today}: rotating at startup`)
+    await rotateCommandLog(repo, options)
+  }
+  return _handle!
+}
+
+// ── Daily rotation (idea#183) ────────────────────────────────────────────────
+
+
+/**
+ * Traces closed less than this long before a rotation are carried into the new
+ * doc, so a reader that switches docs right after midnight still finds the
+ * result of a command it sent just before. Running traces are always carried.
+ */
+export const COMMAND_LOG_CARRY_GRACE_MS = 15 * 60_000
+
+/** How often the Engine checks for a local date change. */
+export const COMMAND_LOG_ROTATION_CHECK_MS = 60_000
+
+let _currentDay: string | null = null
+let _rotating: Promise<DocHandle<CommandLogStore>> | null = null
+
+/** YYYY-MM-DD of `d` in the Engine's local timezone. */
+export const localDay = (d: Date): string => {
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+const dayFileFor = (urlFile: string) => path.join(path.dirname(urlFile), 'command-log-day.txt')
+const defaultUrlFile = () => path.join('./' + config.settings.storeIdentityFolder, 'command-log-url.txt')
+
+const readDayFile = (urlFile: string): string | null => {
+  try {
+    const d = fs.readFileSync(dayFileFor(urlFile), 'utf-8').trim()
+    return /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null
+  } catch { return null }
+}
+
+/** Write via temp file + rename, so a reader of /api/command-log-url never sees a half-written URL. */
+const writeAtomic = async (file: string, content: string): Promise<void> => {
+  await fs.ensureDir(path.dirname(file))
+  const tmp = `${file}.tmp-${process.pid}`
+  await fs.writeFile(tmp, content)
+  await fs.rename(tmp, file)
+}
+
+/** Day of the current CommandLog doc (null before createCommandLogStore). */
+export const getCommandLogDay = (): string | null => _currentDay
+
+/**
+ * Start a fresh CommandLog doc and archive the current one (idea#183).
+ *
+ * 1. Create the new doc with every running trace, and every trace closed in the
+ *    last COMMAND_LOG_CARRY_GRACE_MS, copied in (same traceIds, same order).
+ * 2. Switch synchronously: module handle, retired set, so writes made through
+ *    the old handle from now on land in the new doc.
+ * 3. Point readers at it: command-log-url.txt (served by /api/command-log-url)
+ *    and command-log-day.txt are rewritten atomically.
+ * 4. Archive the old doc: Automerge binary saved to
+ *    <archiveDir>/command-log-<day>-<documentId>.automerge, then the doc is
+ *    deleted from the Repo (no more sync, removed from store-data).
+ * 5. Size cap: while archiveDir is over archiveMaxBytes, delete the oldest archive
+ *    (one at a time, each deletion logged). No age-based deletion (Koen 2026-10-15).
+ *
+ * Concurrent calls share one rotation.
+ */
+export const rotateCommandLog = (
+  repo: Repo,
+  options: CommandLogStoreOptions = {},
+): Promise<DocHandle<CommandLogStore>> => {
+  if (_rotating) return _rotating
+  _rotating = _rotate(repo, options).finally(() => { _rotating = null })
+  return _rotating
+}
+
+const _rotate = async (repo: Repo, options: CommandLogStoreOptions): Promise<DocHandle<CommandLogStore>> => {
+  const urlFile = options.urlFile ?? defaultUrlFile()
+  const archiveDir = options.archiveDir ?? path.join(path.dirname(urlFile), 'command-log-archive')
+  const archiveMaxBytes = options.archiveMaxBytes ?? commandLogArchiveMaxBytes()
+  const now = options.now?.() ?? new Date()
+  const today = localDay(now)
+  const old = _handle
+  const oldDay = _currentDay ?? 'unknown'
+
+  const fresh = repo.create<CommandLogStore>(tagged())
+  await fresh.whenReady()
+
+  // Snapshot + carry + switch with no await in between, so no write is lost.
+  let carried = 0
+  const oldDoc = old?.isReady() ? old.doc() : undefined
+  if (oldDoc) {
+    const cutoff = now.getTime() - COMMAND_LOG_CARRY_GRACE_MS
+    const keep = (oldDoc.recentTraceIds ?? []).filter(id => {
+      const t = oldDoc.traces[id]
+      return t && (t.status === 'running' || (t.completedAt ?? 0) >= cutoff)
+    })
+    if (keep.length) {
+      fresh.change(doc => {
+        for (const id of keep) {
+          doc.traces[id] = JSON.parse(JSON.stringify(oldDoc.traces[id]))
+          ;(doc.recentTraceIds as string[]).push(id)
+        }
+      })
+    }
+    carried = keep.length
+  }
+  if (old) _retired.add(old.documentId)
+  _handle = fresh
+  _currentDay = today
+
+  await writeAtomic(urlFile, fresh.url)
+  await writeAtomic(dayFileFor(urlFile), today)
+  log(`[commandLog] Rotated CommandLog ${old?.url ?? '(none)'} (${oldDay}) -> ${fresh.url} (${today}), carried ${carried} open/recent trace(s)`)
+
+  if (old) {
+    try {
+      const bin = old.isReady() ? await repo.export(old.documentId) : undefined
+      if (bin) {
+        await fs.ensureDir(archiveDir)
+        const file = path.join(archiveDir, `command-log-${oldDay}-${old.documentId}.automerge`)
+        await fs.writeFile(file, bin)
+        log(`[commandLog] Archived previous CommandLog to ${file} (${bin.byteLength} bytes)`)
+      }
+      repo.delete(old.documentId)
+    } catch (e) {
+      log(`[commandLog] Could not archive previous CommandLog ${old.url}: ${e instanceof Error ? e.message : e}`)
+    }
+  }
+  await capCommandLogArchives(archiveDir, archiveMaxBytes)
+  return fresh
+}
+
+const ARCHIVE_RE = /^command-log-(.+)-[^-]+\.automerge$/
+const ARCHIVE_DAY_RE = /^command-log-(\d{4}-\d{2}-\d{2})-.+\.automerge$/
+
+/** Archive files of archiveDir, oldest first: by the day in the name, then mtime, then name. Other files are ignored. */
+export const listCommandLogArchives = async (archiveDir: string): Promise<{ name: string, size: number, day: string, mtimeMs: number }[]> => {
+  if (!fs.existsSync(archiveDir)) return []
+  const out: { name: string, size: number, day: string, mtimeMs: number }[] = []
+  for (const name of await fs.readdir(archiveDir)) {
+    if (!ARCHIVE_RE.test(name)) continue
+    const st = await fs.stat(path.join(archiveDir, name))
+    if (!st.isFile()) continue
+    // A file without a day in its name (command-log-unknown-…) sorts by mtime among dated ones of the same mtime day.
+    const day = ARCHIVE_DAY_RE.exec(name)?.[1] ?? localDay(new Date(st.mtimeMs))
+    out.push({ name, size: st.size, day, mtimeMs: st.mtimeMs })
+  }
+  return out.sort((a, b) => a.day.localeCompare(b.day) || a.mtimeMs - b.mtimeMs || a.name.localeCompare(b.name))
+}
+
+/**
+ * Size cap (#185, Koen 2026-10-15): while the archive files of archiveDir total more
+ * than maxBytes, delete the oldest one, logging each deletion. Never deletes by age,
+ * never touches other files. Returns the deleted file names in deletion order.
+ */
+export const capCommandLogArchives = async (archiveDir: string, maxBytes: number): Promise<string[]> => {
+  const files = await listCommandLogArchives(archiveDir)
+  let total = files.reduce((n, f) => n + f.size, 0)
+  const removed: string[] = []
+  for (const f of files) {
+    if (total <= maxBytes) break
+    await fs.remove(path.join(archiveDir, f.name))
+    total -= f.size
+    removed.push(f.name)
+    // print, not log: always written (log is verbosity-gated), every deletion must be in the Engine log
+    print(`[commandLog] Archive folder over its size cap (${maxBytes} bytes): deleted oldest archive ${f.name} (${f.size} bytes), ${total} bytes left`)
+  }
+  // One line per cap check that deletes nothing (Koen 2026-10-15), so every rotation shows the check ran
+  if (removed.length === 0) print(`[commandLog] command-log archive ${total} bytes under cap ${maxBytes}, nothing deleted`)
+  return removed
+}
+
+/**
+ * Check the local date every COMMAND_LOG_ROTATION_CHECK_MS and rotate when it
+ * changed (idea#183). Returns a stop function.
+ */
+export const startCommandLogRotation = (
+  repo: Repo,
+  options: CommandLogStoreOptions & { intervalMs?: number } = {},
+): (() => void) => {
+  const timer = setInterval(() => {
+    const today = localDay(options.now?.() ?? new Date())
+    if (_currentDay && _currentDay !== today && !_rotating) {
+      rotateCommandLog(repo, options).catch(e =>
+        log(`[commandLog] Rotation failed: ${e instanceof Error ? e.message : e}`))
+    }
+  }, options.intervalMs ?? COMMAND_LOG_ROTATION_CHECK_MS)
+  timer.unref?.()
+  return () => clearInterval(timer)
 }
 
 /**
@@ -5185,6 +9186,9 @@ export const createCommandLogStore = async (
  * so the store and the new command log are still saved.
  */
 export const shutdownRepo = async (repo: Repo): Promise<void> => {
+  // r34 DURABILITY: stop the backstop flush (src/repo.ts) first, so no periodic
+  // tick runs during or after the final flush.
+  await stopPeriodicFlush(repo)
   try {
     await repo.shutdown()
   } catch (e) {
@@ -5198,10 +9202,7 @@ const _createFresh = async (
   repo: Repo,
   urlFile: string
 ): Promise<DocHandle<CommandLogStore>> => {
-  const handle = repo.create<CommandLogStore>({
-    traces: {},
-    recentTraceIds: [],
-  })
+  const handle = repo.create<CommandLogStore>(tagged())
   await handle.whenReady()
   await fs.ensureDir(path.dirname(urlFile))
   await fs.writeFile(urlFile, handle.url)
@@ -5218,7 +9219,7 @@ export const addTrace = (
   handle: DocHandle<CommandLogStore>,
   trace: Omit<CommandTrace, 'logs'>
 ): void => {
-  handle.change(doc => {
+  liveCommandLogHandle(handle).change(doc => {
     doc.traces[trace.traceId] = { ...trace, logs: [] }
     ;(doc.recentTraceIds as string[]).push(trace.traceId)
 
@@ -5240,7 +9241,7 @@ export const flushLogs = (
   entries: LogEntry[]
 ): void => {
   if (!entries.length) return
-  handle.change(doc => {
+  liveCommandLogHandle(handle).change(doc => {
     const trace = doc.traces[traceId]
     if (!trace) return
     for (const entry of entries) {
@@ -5249,25 +9250,42 @@ export const flushLogs = (
   })
 }
 
+/** Stash for attachTraceResult → closeTrace atomic publish (Prefer A r42). */
+const pendingTraceResults = new Map<string, string>()
+
+export const stashTraceResult = (traceId: string, resultJson: string): void => {
+  pendingTraceResults.set(traceId, resultJson)
+}
+
+export const takePendingTraceResult = (traceId: string): string | undefined => {
+  const v = pendingTraceResults.get(traceId)
+  pendingTraceResults.delete(traceId)
+  return v
+}
+
 /**
  * Mark a trace as completed. Call after the command resolves or rejects.
  * A trace already closed as 'error' stays 'error': a later 'ok' close (e.g. the
  * wrapper of a command whose inner work recorded a failure, idea#109) does not
- * hide the failure.
+ * hide the failure. Pending attachTraceResult is applied in the same change.
  */
 export const closeTrace = (
   handle: DocHandle<CommandLogStore>,
   traceId: string,
   status: 'ok' | 'error',
-  errorMessage?: string
+  errorMessage?: string,
+  /** When set, written in the same Automerge change as status (Console sees both together). */
+  resultJson?: string | null,
 ): void => {
-  handle.change(doc => {
+  const fromStash = resultJson !== undefined ? resultJson : takePendingTraceResult(traceId)
+  liveCommandLogHandle(handle).change(doc => {
     const trace = doc.traces[traceId]
     if (!trace) return
     if (trace.status === 'error' && status === 'ok') return
     trace.status = status
     trace.completedAt = Date.now()
-    if (errorMessage) trace.errorMessage = errorMessage
+    if (errorMessage) trace.errorMessage = redactString(errorMessage)
+    if (fromStash !== undefined && fromStash !== null) trace.result = redactString(fromStash)
   })
 }
 
@@ -5276,12 +9294,13 @@ export const closeTrace = (
 ## File: src/data/Commands.ts
 ```typescript
 import { CommandDefinition } from "./CommandDefinition.js";
-import { Store, getApps, getDisks, getDisk, getRunningEngines, getInstances, getEngine, findDiskByName, findInstanceByName, getLocalEngine, createClientStore } from "./Store.js";
+import { Store, getApps, getDisks, getDisk, getRunningEngines, getInstances, getEngine, findDiskByName, getLocalEngine, createClientStore } from "./Store.js";
+import { resolveInstanceArg, resolveLocalInstanceArg } from './InstanceArg.js';
 import { Disk, clearDuplicateDiskRecords, isSystemDiskRecord } from "./Disk.js";
 import { deepPrint, log, print } from "../utils/utils.js";
-import { buildInstance, startInstance, runInstance, stopInstance, markInstanceError } from "./Instance.js";
+import { Instance, buildInstance, startInstance, runInstance, stopInstance, markInstanceError } from "./Instance.js";
 import { buildEngine, syncEngine, clearKnownHost, rebootEngine } from "./Engine.js";
-import { AppName, Command, DeviceName, DiskID, DiskName, EngineID, Hostname, InstanceName, Version } from "./CommonTypes.js";
+import { AppName, Command, DeviceName, DiskID, DiskName, EngineID, Hostname, InstanceID, InstanceName, Version } from "./CommonTypes.js";
 import { localEngineId } from "./Engine.js";
 import { chalk, fs, $ } from "zx";
 import { ssh } from '../utils/ssh.js'
@@ -5290,10 +9309,10 @@ $.verbose = false;
 import { DocHandle, Repo } from "@automerge/automerge-repo";
 import { config } from "./Config.js";
 import { readStoreDocId } from "./StoreIdentity.js";
-import { generateHostName } from "../utils/nameGenerator.js";
+import { realStickerNameDeps, resolveStickerName } from "../install/stickerName.js";
 import pack from '../../package.json' with { type: "json" };
 import { sendCommand } from "../utils/commandUtils.js";
-import { installApp } from './InstallApp.js';
+import { installApp, parseInstallAppArgs } from './InstallApp.js';
 import { copyApp, moveApp } from './CopyMoveApp.js';
 import { resourceLock, diskKey } from '../utils/ResourceLock.js';
 import { undockDisk } from "../monitors/usbDeviceMonitor.js";
@@ -5303,6 +9322,11 @@ import { DiskArgResult, lookupDiskArg, resolveDiskArg } from './DiskArg.js';
 import { createFilesDisk } from './CreateFilesDisk.js';
 import { summariseDisk, attachTraceResult } from './SummariseDisk.js';
 import { eraseDisk } from './EraseDisk.js';
+import { forgetDisk } from './ForgetDisk.js';
+import { removeInstance } from './RemoveInstance.js';
+import { renameInstance } from './RenameInstance.js';
+import { updateApp, parseUpdateAppArgs } from './UpdateApp.js';
+import { flashCard, cancelFlash, initialiseDisk } from './FlashCard.js';
 import { testContext } from "../../test/testContext.js";
 
 
@@ -5355,7 +9379,7 @@ const buildEngineWrapper = async (storeHandle: DocHandle<Store> | null, argsStri
     // Basic parser for a string of command-line args
     const parseArgs = (str: string): any => {
         const output: { [key: string]: any } = {};
-        const parts = str.match(/--(\w+)(?:[= ]([^\s"'\[\]]+|"[^"]*"|'[^']*'))?/g) || [];
+        const parts: string[] = str.match(/--(\w+)(?:[= ]([^\s"'\[\]]+|"[^"]*"|'[^']*'))?/g) || [];
         parts.forEach(part => {
             const match = part.match(/--(\w+)(?:[= ](.+))?/);
             if (match) {
@@ -5371,10 +9395,7 @@ const buildEngineWrapper = async (storeHandle: DocHandle<Store> | null, argsStri
     const defaults = config.defaults;
 
     const machine = parsedArgs.machine;
-    if (!machine) {
-        console.error(chalk.red('buildEngine command requires a --machine argument.'));
-        return;
-    }
+    if (!machine) throw new Error('buildEngine command requires a --machine argument.')
 
     // Clear the known_hosts entry for the target machine before attempting to connect
     await clearKnownHost(machine);
@@ -5386,7 +9407,7 @@ const buildEngineWrapper = async (storeHandle: DocHandle<Store> | null, argsStri
         isLocalMode: false,
         machine: machine,
         user: user,
-        hostname: parsedArgs.hostname || generateHostName(),
+        hostname: '' as string, // resolved after the sync, see below
         language: parsedArgs.language || defaults.language,
         keyboard: parsedArgs.keyboard || defaults.keyboard,
         timezone: parsedArgs.timezone || defaults.timezone,
@@ -5402,21 +9423,25 @@ const buildEngineWrapper = async (storeHandle: DocHandle<Store> | null, argsStri
     };
     try {
         await syncEngine(user, machine);
+        // idea#184: same checked resolution as script/build-engine.ts (explicit,
+        // else persisted, else a name free on LAN, store and tailnet), run on the
+        // target Pi once it is reachable.
+        buildArgs.hostname = (await resolveStickerName(parsedArgs.hostname, realStickerNameDeps(exec))).name;
         await buildEngine(buildArgs);
         print(chalk.green('buildEngine command finished successfully.'));
     } catch (e: any) {
-        console.error(chalk.red(`buildEngine command failed: ${e.message}`));
+        throw new Error(`buildEngine command failed: ${e.message}`)
     }
 }
 
 const ls = (storeHandle: DocHandle<Store> | null): void => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     print('NetworkData on this engine:');
     print(deepPrint(storeHandle.doc()), 3);
 }
 
 const lsEngines = (storeHandle: DocHandle<Store> | null): void => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     print('Engines:');
     const engines = getRunningEngines(storeHandle.doc());
     print(`Total engines: ${engines.length}`);
@@ -5424,7 +9449,7 @@ const lsEngines = (storeHandle: DocHandle<Store> | null): void => {
 }
 
 const lsDisks = (storeHandle: DocHandle<Store> | null): void => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     print('Disks:');
     const disks = getDisks(storeHandle.doc());
     print(`Total disks: ${disks.length}`);
@@ -5432,7 +9457,7 @@ const lsDisks = (storeHandle: DocHandle<Store> | null): void => {
 }
 
 const lsApps = (storeHandle: DocHandle<Store> | null): void => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     print('Apps:');
     const apps = getApps(storeHandle.doc());
     print(`Total apps: ${apps.length}`);
@@ -5440,7 +9465,7 @@ const lsApps = (storeHandle: DocHandle<Store> | null): void => {
 }
 
 const lsInstances = (storeHandle: DocHandle<Store> | null): void => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     print('Instances:');
     const instances = getInstances(storeHandle.doc());
     print(`Total instances: ${instances.length}`);
@@ -5449,32 +9474,18 @@ const lsInstances = (storeHandle: DocHandle<Store> | null): void => {
 
 /**
  * installApp command wrapper (idea#128).
- * Usage: installApp <appId> <targetDiskId> [--source <sourceDiskId>] [--name <instanceName>]
+ * Usage: installApp <appId> <targetDiskId> [--source <sourceDiskId>] [--name <instanceName>] [--fresh]
+ * A value with spaces is quoted: --name "Kolibri Demo".
  *
  * All arguments are passed as a single string and parsed here. Disk arguments
  * go through resolveDiskArg (a unique disk name still works, with a warning).
  * Refusals throw, so the trace ends as `error`.
  */
-const INSTALL_APP_USAGE = 'Usage: installApp <appId> <targetDiskId> [--source <sourceDiskId>] [--name <instanceName>]'
 const installAppWrapper = async (storeHandle: DocHandle<Store> | null, argsString: string) => {
     if (!storeHandle) throw new Error("Store is not available.")
-
-    // Parse: installApp kolibri-1.0 <targetDiskId> --source <sourceDiskId> --name my-kolibri
-    const parts = (argsString ?? '').trim().split(/\s+/).filter(Boolean)
-    const appId = parts[0] as any
-    const targetDiskId = parts[1]
-    if (!appId || !targetDiskId || targetDiskId.startsWith('--')) throw new Error(INSTALL_APP_USAGE)
-    const flagValue = (flag: string): string | undefined => {
-        const i = parts.indexOf(flag)
-        if (i === -1) return undefined
-        const v = parts[i + 1]
-        if (!v || v.startsWith('--')) throw new Error(`installApp: ${flag} needs a value. ${INSTALL_APP_USAGE}`)
-        return v
-    }
-    const sourceDiskId = flagValue('--source')
-    const instanceName = flagValue('--name') as any
-
-    await installApp(storeHandle, { appId, targetDiskId, sourceDiskId, instanceName })
+    // Quote-aware: installApp kolibri-1.0 <targetDiskId> --name "Kolibri Demo" --fresh
+    const { appId, targetDiskId, sourceDiskId, instanceName, fresh } = parseInstallAppArgs(argsString)
+    await installApp(storeHandle, { appId, targetDiskId, sourceDiskId, instanceName, fresh })
 }
 
 /**
@@ -5485,52 +9496,45 @@ const installAppWrapper = async (storeHandle: DocHandle<Store> | null, argsStrin
 const createInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, appName: AppName, gitAccount: string, gitTag: string, diskName: DiskName) => {
     console.warn(chalk.yellow('createInstance is deprecated — use installApp instead'))
     const store = storeHandle?.doc()
-    if (!store) { console.error(chalk.red("Store is not available to create instance.")); return; }
-    const disk = findDiskByName(store, diskName)
-    if (!disk || !disk.device) {
-        print(chalk.red(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`))
-        return
-    }
+    if (!store) throw new Error("Store is not available to create instance.")
+    // Disk by id (preferred) or unique name; a name with spaces must be quoted ("System Disk")
+    const disk = resolveDiskArg(store, localEngineId as any, String(diskName), 'createInstance')
+    if (!disk.device) throw new Error(`Disk '${diskName}' has no device on engine ${localEngineId}`)
     await buildInstance(instanceName, appName, gitAccount, gitTag as Version, disk.device)
 }
 
+/**
+ * startInstance <instanceId|instanceName> <diskId|diskName> [--cause <cause>]
+ * The instance resolves id-first (idea#168, resolveInstanceArg): an id, a
+ * unique name, or the one instance with that name on the given disk (the
+ * Console sends `<name> <storedOn>`); an ambiguous name is refused.
+ * `--cause` comes from the cross-engine copyApp dispatch.
+ */
 const startInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName, ...rest: string[]) => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available.")); return; }
+    if (!storeHandle) throw new Error("Store is not available.")
     // Parse optional --cause flag forwarded by cross-engine copyApp dispatch
     const causeFlag = rest.find(a => a.startsWith('--cause'))
     const cause: import('./CommonTypes.js').OperationCause =
         causeFlag ? (causeFlag.split('=')[1] ?? rest[rest.indexOf(causeFlag) + 1] ?? 'cross-engine-cmd') as any
         : 'console-command'
     const store = storeHandle.doc()
-    const instance = findInstanceByName(store, instanceName)
-    if (!instance) {
-        print(chalk.red(`Instance ${instanceName} not found`))
-        return
-    }
+    const instance = resolveInstanceArg(store, instanceName, 'startInstance', diskName)
     // Look up disk by ID from instance.storedOn — same fix as stopInstanceWrapper.
     // findDiskByName uses getDisks() which filters dockedTo != null and misses
     // disks that appear undocked in the CRDT but are physically still attached.
     const disk = (instance.storedOn ? getDisk(store, instance.storedOn) : undefined) ?? findDiskByName(store, diskName)
-    if (!disk) {
-        print(chalk.red(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`))
-        return
-    }
-    startInstance(storeHandle, instance, disk, cause)
+    if (!disk) throw new Error(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`)
+    // #239 (Steve): await the start too, so a stopInstance queued behind it cannot run mid-start
+    // and the start trace closes only once the start is done.
+    await startInstance(storeHandle, instance, disk, cause)
 }
 
 const runInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName) => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available.")); return; }
+    if (!storeHandle) throw new Error("Store is not available.")
     const store = storeHandle.doc()
-    const instance = findInstanceByName(store, instanceName)
+    const instance = resolveInstanceArg(store, instanceName, 'runInstance', diskName)
     const disk = findDiskByName(store, diskName)
-    if (!instance) {
-        print(chalk.red(`Instance ${instanceName} not found`))
-        return
-    }
-    if (!disk) {
-        print(chalk.red(`Disk ${diskName} not found`))
-        return
-    }
+    if (!disk) throw new Error(`Disk ${diskName} not found`)
     // runInstance propagates compose up failures (idea#109): mark the instance
     // Error and rethrow, so handleCommand closes this command's trace as failed.
     try {
@@ -5542,50 +9546,55 @@ const runInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instance
 }
 
 const stopInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName) => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available.")); return; }
+    if (!storeHandle) throw new Error("Store is not available.")
     const store = storeHandle.doc()
-    const instance = findInstanceByName(store, instanceName)
-    if (!instance) {
-        print(chalk.red(`Instance ${instanceName} not found`))
-        return
-    }
+    const instance = resolveInstanceArg(store, instanceName, 'stopInstance', diskName)
     // Look up disk by ID from instance.storedOn — not via getDisks() which filters
     // to dockedTo != null and would miss disks that appear undocked in the CRDT.
     const disk = (instance.storedOn ? getDisk(store, instance.storedOn) : undefined) ?? findDiskByName(store, diskName)
-    if (!disk) {
-        print(chalk.red(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`))
-        return
-    }
-    stopInstance(storeHandle, instance, disk, 'console-command')
+    if (!disk) throw new Error(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`)
+    // #239: await the stop, so the trace closes only once the containers are stopped and the
+    // command queue (one command at a time) cannot run a following startInstance mid-stop.
+    await stopInstance(storeHandle, instance, disk, 'console-command')
 }
 
 const sendWrapper = (storeHandle: DocHandle<Store> | null, args: string) => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     const firstSpaceIndex = args.indexOf(' ');
-    if (firstSpaceIndex === -1) {
-        console.error(chalk.red("Send command requires at least two arguments: <engineId> <command>"));
-        return;
-    }
+    if (firstSpaceIndex === -1) throw new Error("Send command requires at least two arguments: <engineId> <command>")
     const engineId = args.substring(0, firstSpaceIndex);
     const command = args.substring(firstSpaceIndex + 1);
+    if (!storeHandle.doc()?.engineDB[engineId as EngineID]) throw new Error(`Cannot send command: Engine ${engineId} not found in store.`)
     sendCommand(storeHandle, engineId as EngineID, command as Command);
 }
 
 const rebootWrapper = async (storeHandle: DocHandle<Store> | null) => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     const localEngine = getLocalEngine(storeHandle.doc());
     await rebootEngine(storeHandle, localEngine);
 }
 
-const backupAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, backupDiskName?: DiskName) => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
-    const store = storeHandle.doc()
-    const instance = Object.values(store.instanceDB).find(i => i.name === instanceName)
-    if (!instance) { console.error(chalk.red(`Instance '${instanceName}' not found.`)); return; }
+/**
+ * Resolve an instance argument id-first (idea#168). Moved to InstanceArg.ts so
+ * copyApp / moveApp share it; re-exported here for existing importers.
+ */
+export { resolveInstanceArg } from './InstanceArg.js'
 
-    // Find backup disk: named or first linked docked Backup Disk
-    let backupDisk = backupDiskName
-        ? Object.values(store.diskDB).find(d => d.name === backupDiskName && d.device != null)
+/**
+ * backupApp <instanceIdOrName> <backupDiskIdOrName> (idea#168 r29@97). The
+ * instance goes through resolveInstanceArg, the disk through resolveDiskArg:
+ * an id, or a unique name (a disk name with a warning).
+ */
+const backupAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: string, backupDiskId?: string) => {
+    // Refusals throw so the command-log trace closes as error (idea#122).
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    const store = storeHandle.doc()
+    const instance = resolveInstanceArg(store, instanceArg, 'backupApp')
+    const instanceName = instance.name
+
+    // Find backup disk: by id or unique name, or first linked docked Backup Disk
+    let backupDisk = backupDiskId
+        ? resolveDiskArg(store, getLocalEngine(store)?.id, backupDiskId, 'backupApp')
         : Object.values(store.diskDB).find(d =>
             d.device != null &&
             d.diskTypes?.includes('backup') &&
@@ -5593,29 +9602,34 @@ const backupAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceNa
           )
 
     if (!backupDisk) {
-        console.error(chalk.red(`No docked Backup Disk found${backupDiskName ? ` named '${backupDiskName}'` : ` linked to instance '${instanceName}'`}.`))
-        return
+        throw new Error(`No docked Backup Disk found linked to instance '${instanceName}'.`)
     }
-    print(chalk.blue(`Backing up instance '${instanceName}' to disk '${backupDisk.name}'...`))
+    print(chalk.blue(`Backing up instance '${instanceName}' to disk '${backupDisk.name}' (${backupDisk.id})...`))
     await backupInstance(storeHandle, instance.id, backupDisk as any, undefined, 'console-command')
 }
 
-const restoreAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, targetDiskName: DiskName) => {
-    if (!storeHandle) { console.error(chalk.red("Store is not available. Please connect first.")); return; }
+/**
+ * restoreApp <instanceIdOrName> <targetDiskIdOrName> (idea#168 r29@97). The
+ * instance goes through resolveInstanceArg, the disk through resolveDiskArg:
+ * an id, or a unique name (a disk name with a warning).
+ */
+const restoreAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: string, targetDiskId: string) => {
+    // Refusals throw so the command-log trace closes as error (idea#122).
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     const store = storeHandle.doc()
-    const instance = Object.values(store.instanceDB).find(i => i.name === instanceName)
-    if (!instance) { console.error(chalk.red(`Instance '${instanceName}' not found in store.`)); return; }
+    const instance = resolveInstanceArg(store, instanceArg, 'restoreApp')
+    const instanceName = instance.name
 
-    const targetDisk = Object.values(store.diskDB).find(d => d.name === targetDiskName && d.device != null)
-    if (!targetDisk) { console.error(chalk.red(`Target disk '${targetDiskName}' not found or not docked.`)); return; }
+    const targetDisk = resolveDiskArg(store, getLocalEngine(store)?.id, targetDiskId, 'restoreApp')
 
-    print(chalk.blue(`Restoring instance '${instanceName}' to disk '${targetDiskName}'...`))
+    print(chalk.blue(`Restoring instance '${instanceName}' to disk '${targetDisk.name}' (${targetDisk.id})...`))
     await restoreApp(storeHandle, instance.id, targetDisk as any, undefined, 'console-command')
 }
 
 /**
  * createBackupDisk <diskId> <mode> <instanceName…> (idea#128). The disk goes
- * through resolveDiskArg; refusals throw, so the trace ends as `error`.
+ * through resolveDiskArg, each instance (name or id) through resolveLocalInstanceArg
+ * (only instances on this Engine); refusals throw, so the trace ends as `error`.
  */
 const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskId: string, mode: string, ...instanceNames: InstanceName[]) => {
     if (!storeHandle) throw new Error("Store is not available. Please connect first.")
@@ -5624,11 +9638,15 @@ const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, dis
     const store = storeHandle.doc()
     const disk = resolveDiskArg(store, getLocalEngine(store)?.id, diskId, 'createBackupDisk')
 
-    const instanceIds = instanceNames.map(name => {
-        const inst = Object.values(store.instanceDB).find(i => i.name === name)
-        if (!inst) console.warn(chalk.yellow(`Warning: instance '${name}' not found — it will be added to the links list anyway`))
-        return inst?.id
-    }).filter(Boolean) as any[]
+    // Names resolve only among instances on this Engine (kit Engines share one store and
+    // have identical instance names); an instance id is accepted too. An unknown or
+    // ambiguous argument refuses the whole command, so nothing is linked by mistake.
+    const engineId = getLocalEngine(store)?.id ?? localEngineId
+    const instanceIds: InstanceID[] = []
+    for (const arg of instanceNames) {
+        const inst = resolveLocalInstanceArg(store, String(arg), 'createBackupDisk', String(engineId))
+        if (!instanceIds.includes(inst.id)) instanceIds.push(inst.id)
+    }
 
     print(chalk.blue(`Creating Backup Disk config on '${disk.name}' (${disk.id}, mode: ${mode})...`))
     await createBackupDiskConfig(storeHandle, disk as any, mode as any, instanceIds)
@@ -5641,17 +9659,65 @@ const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, dis
  * defaults to "School Files". Refusals throw, so the trace ends as `error`.
  */
 
+/** removeInstance <instanceId> (idea#347): compose down (volumes kept), quarantine the folder, drop the record. */
+const removeInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: string) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    const engineId = String(getLocalEngine(storeHandle.doc())?.id ?? localEngineId)
+    const result = await removeInstance(storeHandle, instanceArg, engineId)
+    attachTraceResult(result)
+    print(chalk.green(`Removed instance ${result.instanceId}; its folder is kept at ${result.quarantinePath}`))
+}
+
+/**
+ * renameInstance <instanceId> <newName…> (agent-engine-dev#220). Display name only
+ * (compose.yaml x-app.instanceName + store); result in CommandTrace.result.
+ */
+const renameInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: string, ...nameTokens: string[]) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    const engineId = String(getLocalEngine(storeHandle.doc())?.id ?? localEngineId)
+    const result = await renameInstance(storeHandle, instanceArg, nameTokens.join(' '), engineId)
+    attachTraceResult(result)
+    print(chalk.green(result.changed ? `Renamed instance ${result.instanceId}: '${result.oldName}' -> '${result.newName}'` : `Instance ${result.instanceId} is already named '${result.newName}'`))
+}
+
+/** updateApp <instance> <newAppId> [--allow-major] [--source <diskId>] (#230). Result: snapshot path and size. */
+const updateAppWrapper = async (storeHandle: DocHandle<Store> | null, argsString: string) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    const engineId = String(getLocalEngine(storeHandle.doc())?.id ?? localEngineId)
+    const { instanceArg, newAppId, opts } = parseUpdateAppArgs(argsString)
+    const result = await updateApp(storeHandle, instanceArg, newAppId, engineId, opts)
+    attachTraceResult(result)
+    print(chalk.green(`Updated ${result.name} ${result.fromAppId} -> ${result.toAppId}; snapshot kept at ${result.snapshotPath} (${result.snapshotBytes} bytes)`))
+}
+
+/** #263 source side: pushAppBundle <sourceDiskId> <appId> <targetEngineId> <targetRoot> <requestId> <instanceId> */
+const pushAppBundleWrapper = async (storeHandle: DocHandle<Store> | null, sourceDiskId: string, appId: string, targetEngineId: string, targetRoot: string, requestId: string, instanceId: string) => {
+    if (!storeHandle) throw new Error('Store is not available.')
+    const { pushAppBundle, defaultPushDeps } = await import('./UpdateFetch.js')
+    const engineId = String(getLocalEngine(storeHandle.doc())?.id ?? localEngineId)
+    const a = await pushAppBundle(storeHandle.doc(), engineId, { sourceDiskId, appId, targetEngineId, targetRoot, requestId, instanceId }, defaultPushDeps(storeHandle))
+    attachTraceResult({ requestId, appId, targetEngineId, ok: a.ok, ...(a.ok ? {} : { why: a.why }) })
+    if (!a.ok) throw new Error(`TRANSFER_FAILED: ${a.why}`)
+}
+
+/** #263 target side: appFetchResult <requestId> ok|TRANSFER_FAILED <why…> */
+const appFetchResultWrapper = async (_storeHandle: DocHandle<Store> | null, requestId: string, status: string, ...why: string[]) => {
+    const { handleAppFetchResult } = await import('./UpdateFetch.js')
+    handleAppFetchResult(requestId, status, why)
+}
+
 /** summariseDisk <diskId|candidateId> (idea#134). Result in CommandTrace.result. */
 const summariseDiskWrapper = async (storeHandle: DocHandle<Store> | null, targetId: string) => {
-    if (!storeHandle) { console.error(chalk.red('Store is not available.')); return }
+    if (!storeHandle) throw new Error('Store is not available.')
     const summary = await summariseDisk(storeHandle, targetId)
     attachTraceResult(summary)
-    print(chalk.green(`Summary for ${summary.label}: readable=${summary.readable} partial=${summary.partial}`))
+    const partial = !!(summary.files?.partial || summary.other?.partial)
+    print(chalk.green(`Summary for ${summary.label}: readable=${summary.readable} partial=${partial}`))
 }
 
 /** eraseDisk <targetId> <summaryTraceId> <confirmName…> (idea#134). */
 const eraseDiskWrapper = async (storeHandle: DocHandle<Store> | null, targetId: string, summaryTraceId: string, ...confirmTokens: string[]) => {
-    if (!storeHandle) { console.error(chalk.red('Store is not available.')); return }
+    if (!storeHandle) throw new Error('Store is not available.')
     const confirmName = confirmTokens.join(' ')
     const result = await eraseDisk(storeHandle, targetId, summaryTraceId, confirmName)
     attachTraceResult({ diskId: result.diskId, removedInstances: result.removedInstances })
@@ -5666,16 +9732,24 @@ const createFilesDiskWrapper = async (storeHandle: DocHandle<Store> | null, disk
 }
 
 const copyAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, sourceDiskId: DiskID, targetDiskId: DiskID) => {
-    if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
+    if (!storeHandle) throw new Error('Store is not available.')
     await copyApp(storeHandle, instanceName, sourceDiskId, targetDiskId, 'console-command')
 }
 
 const moveAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, sourceDiskId: DiskID, targetDiskId: DiskID) => {
-    if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
+    if (!storeHandle) throw new Error('Store is not available.')
     await moveApp(storeHandle, instanceName, sourceDiskId, targetDiskId, 'console-command')
 }
 
 export type EjectTarget = DiskArgResult
+
+/** forgetDisk <diskId> (idea#279): remove an undocked, stale disk record. Refusals throw. */
+const forgetDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskId: string) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    if (!diskId) throw new Error("Usage: forgetDisk <diskId>")
+    const removed = forgetDisk(storeHandle, diskId)
+    print(chalk.green(`Forgot disk record ${removed}`))
+}
 
 /** The ejectDisk lookup (idea#152), now the shared disk-argument lookup (idea#128). */
 export const resolveEjectTarget = (store: Store, arg: string, engineId: EngineID | undefined): EjectTarget =>
@@ -5730,7 +9804,10 @@ export const commands: CommandDefinition[] = [
     },
     { name: "installApp", execute: installAppWrapper, args: [{ type: "string" }], scope: 'engine' },
     { name: "createInstance", execute: createInstanceWrapper, args: [{ type: "string" }, { type: "string" }, { type: "string" }, { type: "string" }, { type: "string" }], scope: 'engine' },
-    { name: "startInstance", execute: startInstanceWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "diskId" }], scope: 'engine' },
+    // Instance args resolve id-first (idea#168, InstanceArg.ts). The trace arg key stays
+    // 'instanceName' (Console trace filters read it). startInstance takes optional flags
+    // (`--cause <cause>`, sent by the cross-engine copyApp dispatch).
+    { name: "startInstance", execute: startInstanceWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "diskId" }, { type: "string", name: "options", variadic: true, optional: true }], scope: 'engine' },
     { name: "runInstance", execute: runInstanceWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "diskId" }], scope: 'engine' },
     { name: "stopInstance", execute: stopInstanceWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "diskId" }], scope: 'engine' },
     {
@@ -5750,17 +9827,41 @@ export const commands: CommandDefinition[] = [
     { name: "copyApp", execute: copyAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
     { name: "moveApp", execute: moveAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
     { name: "ejectDisk", execute: ejectDiskWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
+    { name: "forgetDisk", execute: forgetDiskWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
+    // backupApp / restoreApp (idea#168): the instance is an id or unique name, the disk
+    // an id or unique docked name (resolveInstanceArg / resolveDiskArg). The trace arg
+    // keys stay 'instanceName' / 'backupDiskId' (Console trace filters read them).
     { name: "backupApp", execute: backupAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "mode" }, { type: "string", name: "instanceNames", variadic: true }], scope: 'engine' },
     { name: "createFilesDisk", execute: createFilesDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "shareName", variadic: true, optional: true }], scope: 'engine' },
+    { name: "removeInstance", execute: removeInstanceWrapper, args: [{ type: "string", name: "instanceId" }], scope: 'engine' },
+    { name: "renameInstance", execute: renameInstanceWrapper, args: [{ type: "string", name: "instanceId" }, { type: "string", name: "newName", variadic: true }], scope: 'engine' },
+    { name: "updateApp", execute: updateAppWrapper, args: [{ type: "string" }], scope: 'engine' },
+    { name: "pushAppBundle", execute: pushAppBundleWrapper, args: ['sourceDiskId', 'appId', 'targetEngineId', 'targetRoot', 'requestId', 'instanceId'].map(name => ({ type: "string" as const, name })), scope: 'engine' },
+    { name: "appFetchResult", execute: appFetchResultWrapper, args: [{ type: "string", name: "requestId" }, { type: "string", name: "status" }, { type: "string", name: "why", variadic: true, optional: true }], scope: 'engine' },
     { name: "summariseDisk", execute: summariseDiskWrapper, args: [{ type: "string", name: "targetId" }], scope: 'engine' },
     { name: "eraseDisk", execute: eraseDiskWrapper, args: [{ type: "string", name: "targetId" }, { type: "string", name: "summaryTraceId" }, { type: "string", name: "confirmName", variadic: true }], scope: 'engine' },
+    // idea#201 §10 (Engine API contract v2): ids only. Trace arg keys are the contract names.
+    { name: "flashCard", execute: async (storeHandle: DocHandle<Store> | null, candidateId: string, version: string, confirmSizeBytes: string) => {
+        if (!storeHandle) throw new Error('Store is not available.')
+        const { operationId } = await flashCard(storeHandle, candidateId, version, confirmSizeBytes)
+        attachTraceResult({ candidateId, version, operationId, started: true })
+        print(chalk.green(`Flash started: operation ${operationId}`))
+    }, args: [{ type: "string", name: "candidateId" }, { type: "string", name: "version" }, { type: "string", name: "confirmSizeBytes" }], scope: 'engine' },
+    { name: "cancelFlash", execute: async (storeHandle: DocHandle<Store> | null, operationId: string) => {
+        if (!storeHandle) throw new Error('Store is not available.')
+        cancelFlash(storeHandle, operationId)
+    }, args: [{ type: "string", name: "operationId" }], scope: 'engine' },
+    { name: "initialiseDisk", execute: async (storeHandle: DocHandle<Store> | null, candidateId: string, role?: string) => {
+        if (!storeHandle) throw new Error('Store is not available.')
+        await initialiseDisk(storeHandle, candidateId, role ?? 'empty')
+    }, args: [{ type: "string", name: "candidateId" }, { type: "string", name: "role", optional: true }], scope: 'engine' },
     { name: "cancelOperation", execute: async (storeHandle: DocHandle<Store> | null, opId: string) => {
-        if (!storeHandle) { console.error(chalk.red('Store is not available.')); return; }
+        if (!storeHandle) throw new Error('Store is not available.')
         const err = cancelOperation(storeHandle, opId)
-        if (err) console.error(chalk.red(`cancelOperation: ${err}`))
-        else print(chalk.green(`Operation ${opId} cancelled`))
+        if (err) throw new Error(`cancelOperation: ${err}`)
+        print(chalk.green(`Operation ${opId} cancelled`))
     }, args: [{ type: "string" }], scope: 'engine' },
 ];
 
@@ -5816,9 +9917,13 @@ export type OperationKind =
   | 'backupApp'
   | 'restoreApp'
   | 'upgradeApp'
+  | 'updateApp'      // agent-engine-dev#230: local swap with a .pre-update snapshot
   | 'upgradeEngine'
   | 'startApp'
   | 'stopApp'
+  // idea#201 §10 (client cards)
+  | 'flashCard'
+  | 'initialiseDisk'
 
 /**
  * What triggered an operation.
@@ -5849,6 +9954,9 @@ export type OperationKind =
  * backup-app-docked — backup monitor triggers backup when App Disk docks while Backup
  *                     Disk is already present
  *                     (backupMonitor.ts: checkPendingBackups app-disk-docked branch)
+ * usb-stick         — a FAT/exFAT stick with a top-level kolibri folder was mounted;
+ *                     the Engine starts the docked channel builder (idea#193 §8.2a,
+ *                     ChannelBuilderAutoStart.ts). Not an operator cause.
  * crash-recovery    — engine restarted with a Pending/Running operation in the store;
  *                     recoverInterruptedOperations() re-queues idempotent ops
  *                     (Operations.ts + start.ts)
@@ -5866,6 +9974,7 @@ export type OperationCause =
   | 'backup-stale-lock'
   | 'backup-app-docked'
   | 'crash-recovery'
+  | 'usb-stick'
 
 export interface OperationSubject {
   type: 'instance' | 'disk' | 'engine'
@@ -5891,6 +10000,12 @@ export interface Operation {
   startedAt: Timestamp
   completedAt: Timestamp | null
   error: string | null
+  /**
+   * flashCard only (idea#201 contract v2): set together with Done/Failed. true = the
+   * card was flushed and powered off, safe to pull; false = eject first
+   * (POWER_OFF_FAILED). Absent on other kinds.
+   */
+  safeToRemove?: boolean
 }
 
 // References to top-level YMaps and YArrays in the Yjs document
@@ -5944,11 +10059,24 @@ export interface Settings {
     consolePath: string;
     storeDataFolder: string;
     storeIdentityFolder: string;
-    heartbeatIntervalMs: number;  // How often the engine writes a heartbeat to the store (default: 50000ms)
+    heartbeatIntervalMs: number;  // Peer-access repair + op-archive tick (default 50000 ms); no store write per tick (Liveness.ts)
     systemDiskSkip?: boolean;     // If true, skip registering the Pi boot disk as a system disk (for test harnesses)
     disksRoot?: string;           // Mount root for App Disks (default: /disks). Tests point this at a private temp folder.
     skipImageLoad?: boolean;      // If true, don't load service images from services/*.tar at app start (default: same as testMode). See skipImageLoad().
     skipMetaWrite?: boolean;      // If true, don't write META.yaml on the first dock of a disk without one (default: same as testMode). See skipMetaWrite().
+    skipBorg?: boolean;           // If true, backup/restore skip borg init/create/extract (default: same as testMode). See skipBorg().
+    skipHardwareId?: boolean;     // If true, readMetaUpdateId keeps the META diskId (no block-device serial lookup) (default: isDev || testMode). See skipHardwareId().
+    skipMetaUpdate?: boolean;     // If true, readMetaUpdateId never rewrites an existing META.yaml and /META.yaml is never created (default: isDev || testMode). See skipMetaUpdate().
+    dockerAvailable?: boolean;    // Force the Docker-available answer (default: unset → cached `docker info` probe). See utils/dockerAvailable.ts.
+    staticPeers?: string;         // Opt-in static peer list 'host[:port],...' (IDEA_STATIC_PEERS wins). See StaticPeers.ts.
+    peerAccess?: boolean;         // Per-Pi Engine keys for cross-Engine copy (default: on unless isDev || testMode). See peerAccessEnabled().
+    commandLogArchiveMaxBytes?: number; // Size cap of store-identity/command-log-archive/ in bytes (default 1 GB = 1_000_000_000). Over the cap, the oldest archives are deleted one by one, each logged (#185, Koen 2026-10-15). See commandLogArchiveMaxBytes().
+    peerStaleHours?: number;      // A peer Engine without a heartbeat for this long loses its key here (default 168 = 7 days). See peerStaleMs().
+    autoStartChannelBuilder?: boolean; // Start the docked kolibri-channel-builder when a stick with a kolibri folder is mounted (idea#193 §8.2a; default true). See autoStartChannelBuilder().
+    usbRoot?: string;             // Mount root for teacher USB sticks (default /run/idea-usb; IDEA_USB_ROOT wins). Tests point this at a temp folder. See usbRoot().
+    ideaLocalHttpPort?: number;   // Port that http://idea.local is served on, in addition to httpPort (idea#203; default 80). See httpMonitor.ts.
+    ideaLocal?: boolean;          // Publish the shared name idea.local via avahi D-Bus when mdns is on (idea#203; default true). See monitors/ideaLocal.ts.
+    lanPreferCidrs?: string[];    // IPv4 CIDRs whose addresses win the Engine.lanAddress choice over the default route (default ['10.42.0.0/16'], the school/kit LAN; [] = default-route order only). See lanPreferCidrs() and LanAddress.ts.
 }
 
 export interface Defaults {
@@ -6030,7 +10158,7 @@ function validate<T>(obj: any, validator: (obj: any, path: string) => string[]):
     return validator(obj, '');
 }
 
-function validateSettings(obj: any, path: string): string[] {
+export function validateSettings(obj: any, path: string): string[] {
     const errors: string[] = [];
     if (typeof obj.mdns !== 'boolean') errors.push(`'${path}mdns' must be a boolean.`);
     if (typeof obj.isDev !== 'boolean') errors.push(`'${path}isDev' must be a boolean.`);
@@ -6043,7 +10171,20 @@ function validateSettings(obj: any, path: string): string[] {
     if (obj.heartbeatIntervalMs !== undefined && typeof obj.heartbeatIntervalMs !== 'number') errors.push(`'${path}heartbeatIntervalMs' must be a number.`);
     if (obj.disksRoot !== undefined && typeof obj.disksRoot !== 'string') errors.push(`'${path}disksRoot' must be a string.`);
     if (obj.skipImageLoad !== undefined && typeof obj.skipImageLoad !== 'boolean') errors.push(`'${path}skipImageLoad' must be a boolean.`);
+    if (obj.skipBorg !== undefined && typeof obj.skipBorg !== 'boolean') errors.push(`'${path}skipBorg' must be a boolean.`);
+    if (obj.skipHardwareId !== undefined && typeof obj.skipHardwareId !== 'boolean') errors.push(`'${path}skipHardwareId' must be a boolean.`);
+    if (obj.skipMetaUpdate !== undefined && typeof obj.skipMetaUpdate !== 'boolean') errors.push(`'${path}skipMetaUpdate' must be a boolean.`);
+    if (obj.dockerAvailable !== undefined && typeof obj.dockerAvailable !== 'boolean') errors.push(`'${path}dockerAvailable' must be a boolean.`);
     if (obj.skipMetaWrite !== undefined && typeof obj.skipMetaWrite !== 'boolean') errors.push(`'${path}skipMetaWrite' must be a boolean.`);
+    if (obj.staticPeers !== undefined && obj.staticPeers !== null && typeof obj.staticPeers !== 'string') errors.push(`'${path}staticPeers' must be a string.`);
+    if (obj.peerAccess !== undefined && typeof obj.peerAccess !== 'boolean') errors.push(`'${path}peerAccess' must be a boolean.`);
+    if (obj.commandLogArchiveMaxBytes !== undefined && (typeof obj.commandLogArchiveMaxBytes !== 'number' || !(obj.commandLogArchiveMaxBytes > 0))) errors.push(`'${path}commandLogArchiveMaxBytes' must be a positive number.`);
+    if (obj.peerStaleHours !== undefined && (typeof obj.peerStaleHours !== 'number' || !(obj.peerStaleHours > 0))) errors.push(`'${path}peerStaleHours' must be a positive number.`);
+    if (obj.autoStartChannelBuilder !== undefined && typeof obj.autoStartChannelBuilder !== 'boolean') errors.push(`'${path}autoStartChannelBuilder' must be a boolean.`);
+    if (obj.lanPreferCidrs !== undefined && (!Array.isArray(obj.lanPreferCidrs) || obj.lanPreferCidrs.some((c: unknown) => typeof c !== 'string' || !LAN_CIDR.test(c)))) errors.push(`'${path}lanPreferCidrs' must be a list of IPv4 CIDRs such as '10.42.0.0/16'.`);
+    if (obj.ideaLocalHttpPort !== undefined && (typeof obj.ideaLocalHttpPort !== 'number' || !Number.isInteger(obj.ideaLocalHttpPort) || obj.ideaLocalHttpPort < 1 || obj.ideaLocalHttpPort > 65535)) errors.push(`'${path}ideaLocalHttpPort' must be a port number.`);
+    if (obj.ideaLocal !== undefined && typeof obj.ideaLocal !== 'boolean') errors.push(`'${path}ideaLocal' must be a boolean.`);
+    if (obj.usbRoot !== undefined && typeof obj.usbRoot !== 'string') errors.push(`'${path}usbRoot' must be a string.`);
     return errors;
 }
 
@@ -6141,7 +10282,15 @@ const readConfig = (path: string): Config => {
   }
 }
 
-export const config = readConfig('./config.yaml');
+/**
+ * Path of the config file: ./config.yaml, unless IDEA_CONFIG_FILE names another one.
+ * script/test-run.sh points it at a pristine copy of the committed config.yaml, so a
+ * test run inside a Pi's deployed tree never reads that Pi's live settings
+ * (skipBorg, skipHardwareId, peerAccess, ...): on-Pi triage, idea04 2026-10-25.
+ */
+export const configFilePath = (): string => process.env.IDEA_CONFIG_FILE || './config.yaml'
+
+export const config = readConfig(configFilePath());
 
 // Allow IDEA_TEST_MODE=true env var to force testMode on without editing config.yaml.
 // NOTE: This mutates the already-exported config object at module load time.
@@ -6225,6 +10374,34 @@ if (process.env.IDEA_SKIP_META_WRITE === 'true' || process.env.IDEA_SKIP_META_WR
  */
 export const skipMetaWrite = (): boolean => config.settings.skipMetaWrite ?? config.settings.testMode;
 
+// Allow IDEA_SKIP_BORG=true|false to override whether backup/restore run borg
+// (idea#168 r36@98). Unset: follows testMode.
+if (process.env.IDEA_SKIP_BORG === 'true' || process.env.IDEA_SKIP_BORG === 'false') {
+    config.settings.skipBorg = process.env.IDEA_SKIP_BORG === 'true';
+}
+
+/**
+ * Whether backupApp / restoreApp skip the borg commands (idea#168 r36@98).
+ *
+ * Like skipImageLoad: testMode means "fixture disks, no sudo mount/umount", which
+ * the duration pool needs, but it also skipped borg, so a backup on the pool ended
+ * Done with no Borg repository and restoreApp then refused "No docked Backup Disk
+ * with archives". settings.skipBorg, when set, decides on its own; unset, it follows
+ * testMode (ordinary tests keep skipping borg). Read at call time.
+ */
+export const skipBorg = (): boolean => config.settings.skipBorg ?? config.settings.testMode;
+
+/**
+ * Whether this Engine makes and publishes its own Engine key and syncs its peers'
+ * keys into the root-owned authorized_keys/known_hosts (data/PeerAccess.ts).
+ * Unset: on, except on dev containers and in test mode (no root helper there).
+ */
+export const peerAccessEnabled = (): boolean => config.settings.peerAccess ?? !(config.settings.isDev || config.settings.testMode);
+
+/** After how long without a heartbeat a peer's key is removed (settings.peerStaleHours; default 7 days). */
+export const PEER_STALE_HOURS_DEFAULT = 168;
+export const peerStaleMs = (): number => (config.settings.peerStaleHours ?? PEER_STALE_HOURS_DEFAULT) * 60 * 60 * 1000;
+
 export const DEFAULT_DISKS_ROOT = '/disks';
 
 /**
@@ -6232,7 +10409,65 @@ export const DEFAULT_DISKS_ROOT = '/disks';
  * Production: /disks. Tests: a private temp folder set via IDEA_DISKS_ROOT.
  * Read at call time (not import time) so the env override always applies.
  */
+/** Default mount root for teacher USB sticks (idea#193 §3.2); the only root the sudoers lines allow. */
+export const DEFAULT_USB_ROOT = '/run/idea-usb'
+/** Mount root for teacher USB sticks: IDEA_USB_ROOT, else settings.usbRoot, else /run/idea-usb. */
+export const usbRoot = (): string => process.env.IDEA_USB_ROOT || config.settings.usbRoot || DEFAULT_USB_ROOT
+/** idea#193 §8.2a kill switch: settings.autoStartChannelBuilder (default true). */
+export const autoStartChannelBuilder = (): boolean => config.settings.autoStartChannelBuilder ?? true
+
+/** The school/kit LAN range: every school uses 10.42.x. */
+export const LAN_PREFER_CIDRS_DEFAULT: readonly string[] = ['10.42.0.0/16']
+const LAN_CIDR = /^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\/(3[0-2]|[12]?\d)$/
+/** settings.lanPreferCidrs (default ['10.42.0.0/16']; [] switches the preference off). See LanAddress.ts. */
+export const lanPreferCidrs = (): string[] => [...(config.settings.lanPreferCidrs ?? LAN_PREFER_CIDRS_DEFAULT)]
 export const disksRoot = (): string => config.settings.disksRoot || DEFAULT_DISKS_ROOT;
+
+// Allow IDEA_DOCKER_AVAILABLE=true|false to force whether the Docker-only paths
+// (metrics poll, already-running shortcut, container logs) run (idea#168).
+// Unset: a cached `docker info` probe decides (utils/dockerAvailable.ts).
+if (process.env.IDEA_DOCKER_AVAILABLE === 'true' || process.env.IDEA_DOCKER_AVAILABLE === 'false') {
+    config.settings.dockerAvailable = process.env.IDEA_DOCKER_AVAILABLE === 'true';
+}
+
+// Allow IDEA_SKIP_HARDWARE_ID=true|false and IDEA_SKIP_META_UPDATE=true|false to
+// override the META.yaml identity gates (idea#168). Unset: follow isDev || testMode.
+if (process.env.IDEA_SKIP_HARDWARE_ID === 'true' || process.env.IDEA_SKIP_HARDWARE_ID === 'false') {
+    config.settings.skipHardwareId = process.env.IDEA_SKIP_HARDWARE_ID === 'true';
+}
+if (process.env.IDEA_SKIP_META_UPDATE === 'true' || process.env.IDEA_SKIP_META_UPDATE === 'false') {
+    config.settings.skipMetaUpdate = process.env.IDEA_SKIP_META_UPDATE === 'true';
+}
+
+/**
+ * Whether readMetaUpdateId keeps the diskId from META.yaml instead of reading the
+ * block device's hardware serial (readHardwareId: /sys/block/<dev>/device/model +
+ * vendor, scsi_id / sudo hdparm) (idea#168).
+ *
+ * testMode/isDev used to decide this together with sudo mount/umount. Like
+ * skipBorg: settings.skipHardwareId, when set, decides on its own; unset it follows
+ * isDev || testMode (the old gate). Under fixture mounts (pi-owned IDEA_DISKS_ROOT,
+ * device names like idea-test-1) there is no /sys/block entry: the lookup finds
+ * nothing and a META with isHardwareId: false keeps its id. Read at call time.
+ *
+ * Not needed for multi-partition SSDs (idea#168 D4): with the lookup on, each
+ * partition gets serial + PARTUUID and assigned ids are kept (DiskIdentity.ts).
+ */
+export const skipHardwareId = (): boolean => config.settings.skipHardwareId ?? (config.settings.isDev || config.settings.testMode);
+
+/**
+ * Whether readMetaUpdateId leaves an existing META.yaml as it is (no lastDocked /
+ * diskId / format rewrite) and whether a missing system /META.yaml may NOT be
+ * created (idea#168). Unset: follows isDev || testMode (the old gate). Disk META
+ * files under a pi-owned IDEA_DISKS_ROOT are written as pi; /META.yaml and
+ * /disks/sd[a-z][12]/META.yaml go through the sudoers-allowed tee (writeMetaFile).
+ * Separate from skipMetaWrite (the FIRST write on a disk without META.yaml).
+ */
+export const skipMetaUpdate = (): boolean => config.settings.skipMetaUpdate ?? (config.settings.isDev || config.settings.testMode);
+
+/** #185: size cap of the CommandLog archive folder (bytes, default 1 GB). No age-based deletion. */
+export const COMMAND_LOG_ARCHIVE_DEFAULT_MAX_BYTES = 1_000_000_000
+export const commandLogArchiveMaxBytes = (): number => config.settings.commandLogArchiveMaxBytes ?? COMMAND_LOG_ARCHIVE_DEFAULT_MAX_BYTES
 
 ```
 
@@ -6245,19 +10480,26 @@ export const disksRoot = (): string => config.settings.disksRoot || DEFAULT_DISK
  *
  * Phase 1: same-engine — source and target on local engine.
  * Phase 2: cross-engine — source on local engine, target on remote engine;
- *   rsync over SSH, remote start via sendCommand.
+ *   rsync over ssh with this Engine's own key (per-Pi Engine keys,
+ *   data/PeerAccess.ts, utils/peerSsh.ts), remote start via sendCommand. Every
+ *   remote step runs the peer's helper through its gate (ensure-dirs, receive-app,
+ *   receive / receive-files, receive-service, delete); none is a plain ssh command.
  */
 
 import { chalk, fs, $ } from 'zx'
 import { log } from '../utils/utils.js'
-import { rsyncDirectory } from '../utils/rsync.js'
-import { shellQuote } from '../utils/ssh.js'
+import { rsyncDirectory, rsyncInstanceData, rsyncToPeer, PeerEngine } from '../utils/rsync.js'
+import {
+    instanceDataBytes, deleteInstanceData, deleteRemoteInstanceData, ensureRemoteDirs,
+    receiveAppArgs, receiveFilesArgs, receiveServiceArgs, putInstanceFiles,
+} from '../utils/appDataHelper.js'
+import { peerCopyRefusal, peerAccessProblem } from './PeerAccess.js'
 import {
     InstanceID, DiskID, DiskName, InstanceName, Timestamp,
     OperationKind, OperationCause, ServiceImage
 } from './CommonTypes.js'
 import { Store, getDisk, getInstance, getInstancesOfDisk } from './Store.js'
-import { Disk, processInstance, diskMountRoot, diskFsRoot } from './Disk.js'
+import { Disk, processInstance, diskMountRoot, diskFsRoot, appDataRoot } from './Disk.js'
 import { stopInstance, startInstance } from './Instance.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { uuid } from '../utils/utils.js'
@@ -6267,7 +10509,10 @@ import { sendCommand } from '../utils/commandUtils.js'
 import { getEngineAddress } from './Network.js'
 import { Instance, Status } from './Instance.js'
 import { IPAddress } from './CommonTypes.js'
+import { lookupInstanceArg, describeInstanceCandidates } from './InstanceArg.js'
+import { findExternalLinks, externalLinksMessage, uniqueCopyName, preparedCopyFiles, instanceDirLooksLikeKolibri } from './InstanceCopy.js'
 import os from 'os'
+import path from 'path'
 
 // ── Disk free-space check ─────────────────────────────────────────────────────
 
@@ -6283,7 +10528,9 @@ export const availableBytes = async (path: string): Promise<number> => {
 }
 
 /**
- * Returns total size in bytes of `path` (recursive).
+ * Returns total size in bytes of `path` (recursive), as the Engine user.
+ * Used for the pi-owned app master; instance data is sized as root by the
+ * app-data helper (instanceDataBytes), because pi cannot read all of it (idea#168).
  * Exported so tests can mock it.
  */
 export const directoryBytes = async (path: string): Promise<number> => {
@@ -6303,17 +10550,31 @@ interface ValidatedCopyMove {
     targetDevice: string
     appMasterSrc: string
     instanceSrc: string
+    /** app-data helper root tokens (idea#168): 'system', 'sdX1' or a test slot name */
+    sourceRoot: string
+    targetRoot: string
 }
 
 const validate = async (
     store: Store,
     instanceName: InstanceName,
     sourceDiskId: DiskID,
-    targetDiskId: DiskID
+    targetDiskId: DiskID,
+    kind: 'copy' | 'move' = 'copy'
 ): Promise<ValidatedCopyMove | string> => {
-    // Look up instance — search all (not just Running) so we can copy stopped instances too
-    const instance = Object.values(store.instanceDB).find(i => i.name === instanceName)
-    if (!instance) return `Instance '${instanceName}' not found`
+    // Look up the instance id-first (idea#168): an instance id, else a unique
+    // name, else the one instance with that name on the source disk (the
+    // Console sends `<name> <sourceDiskId> <targetDiskId>`). Any status, so
+    // stopped instances can be copied too. Crash recovery passes the id.
+    const found = lookupInstanceArg(store, String(instanceName), String(sourceDiskId))
+    if (!found.ok && found.reason === 'ambiguous') {
+        return `Instance name '${instanceName}' is ambiguous: ${describeInstanceCandidates(found.candidates)}. Use the instance id.`
+    }
+    if (!found.ok) return `Instance '${instanceName}' not found`
+    const instance = found.instance
+    if (found.via === 'name-on-disk') {
+        console.warn(`Instance name '${instanceName}' is shared by several instances; using ${instance.id}, the one on disk ${sourceDiskId}. Send the instance id.`)
+    }
 
     const sourceDisk = getDisk(store, sourceDiskId) as Disk | undefined
     if (!sourceDisk) return `Source disk '${sourceDiskId}' not found`
@@ -6338,6 +10599,12 @@ const validate = async (
         const remoteAddress = getEngineAddress(targetEngineId as any)
         if (!remoteAddress) {
             return `Target engine '${targetEngineId}' is not currently reachable (not in network connections). Ensure it is online and connected.`
+        }
+        // Per-Pi Engine keys: both Engines must have accepted each other's key
+        // (a move refuses a remote target itself, with its own message)
+        if (kind === 'copy') {
+            const refusal = peerCopyRefusal(store, String(localEngineId), String(targetEngineId), peerAccessProblem())
+            if (refusal) return refusal
         }
     }
 
@@ -6366,41 +10633,26 @@ const validate = async (
     if (!await fs.pathExists(appMasterSrc)) return `App master directory not found: ${appMasterSrc}`
     if (!await fs.pathExists(instanceSrc)) return `Instance directory not found: ${instanceSrc}`
 
-    return { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc }
+    // Refuse instance data that links off the disk (idea#168 r35), before the
+    // source is stopped: rsync -a copies a link verbatim, so the result would
+    // share the original's data.
+    const externalLinks = await findExternalLinks(instanceSrc)
+    if (externalLinks.length > 0) return externalLinksMessage(instanceSrc, sourceDisk, externalLinks)
+
+    const sourceRoot = await appDataRoot(sourceDisk)
+    const targetRoot = await appDataRoot(targetDisk)
+
+    return { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc, sourceRoot, targetRoot }
 }
 
 // ── copyApp ───────────────────────────────────────────────────────────────────
 
 /**
- * The remote command that creates apps/, instances/ and services/ on the target disk of a
- * cross-engine copy (idea#80). It runs entirely on the remote Engine, as pi.
- *
- * - System disk (mount root '' or '/'): the folders live in '/', which only root can write.
- *   Uses the exact commands allowed by 10-engine.sudoers (full binary paths, non-recursive
- *   chown to pi). The paths are fixed, so no quoting is needed.
- * - App Disk (<disksRoot>/<device>): the disk root is writable by pi, so no sudo. The
- *   paths are single-quoted, so spaces or quotes in them stay one shell word.
- */
-export const SYSTEM_DISK_ENSURE_DIRS =
-    'sudo /usr/bin/mkdir -p /apps /instances /services && sudo /usr/bin/chown pi:pi /apps /instances /services'
-
-export const remoteEnsureDirsCommand = (targetMountRoot: string): string => {
-    if (targetMountRoot === '' || targetMountRoot === '/') return SYSTEM_DISK_ENSURE_DIRS
-    const dirs = ['apps', 'instances', 'services'].map(d => shellQuote(`${targetMountRoot}/${d}`))
-    return `mkdir -p ${dirs.join(' ')}`
-}
-
-/**
- * The argv for the ssh call: the whole remote command is ONE argument, so nothing
- * in it (such as '&&') is run by the local shell.
- */
-export const remoteEnsureDirsSshArgs = (remoteAddress: string, targetMountRoot: string): string[] =>
-    ['ssh', '-o', 'StrictHostKeyChecking=no', `pi@${remoteAddress}`, '--', remoteEnsureDirsCommand(targetMountRoot)]
-
-/**
  * Copy an app instance from sourceDisk to targetDisk.
- * The copy receives a fresh InstanceID — it is a brand new instance.
- * The original keeps running (it is stopped during the file copy, then restarted).
+ * The copy receives a fresh InstanceID — it is a brand new instance — and its
+ * own name (`<name>-2`, `<name>-3`, …) and port (idea#168 r35).
+ * The original keeps running: it is stopped during the file copy and restarted
+ * before the copy starts, so it keeps its port.
  */
 export const copyApp = async (
     storeHandle: DocHandle<Store>,
@@ -6412,17 +10664,15 @@ export const copyApp = async (
     const store = storeHandle.doc()
 
     const v = await validate(store, instanceName, sourceDiskId, targetDiskId)
-    if (typeof v === 'string') {
-        console.error(chalk.red(`copyApp: ${v}`))
-        return
-    }
-    const { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc } = v
+    // Validation refusals throw (idea#168 r29@97), so the command trace or
+    // crash-recovery retry ends as error instead of silently succeeding.
+    if (typeof v === 'string') throw new Error(`copyApp: ${v}`)
+    const { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc, sourceRoot, targetRoot } = v
 
     // Acquire per-resource locks: source instance + target disk
     const lockKeys = [instanceKey(instance.id), diskKey(targetDisk.id)]
     if (!resourceLock.acquireAll(lockKeys, 'copyApp')) {
-        console.error(chalk.red(`copyApp: resource locked — another operation is already running on instance '${instanceName}' or target disk '${targetDisk.name}'. Retry when it completes.`))
-        return
+        throw new Error(`copyApp: resource locked — another operation is already running on instance '${instanceName}' or target disk '${targetDisk.name}'. Retry when it completes.`)
     }
 
     const opId = createOperation(storeHandle, 'copyApp', {
@@ -6433,6 +10683,27 @@ export const copyApp = async (
 
     const newInstanceId = uuid() as InstanceID
     let wasRunning = false
+    let sourceRestarted = false
+    // idea#168 r36: the folder this copy creates on the target disk. A failed copy
+    // removes it, else the next dock of that disk registers the partial folder as a
+    // new instance (r36: the @43 copy failed in rsync and its folder vuf3im3mbayl9z6uou3,
+    // named like the original, registered on Nextcloud Grade 5A).
+    let createdInstanceDest: string | null = null
+
+    // Restart the source if we stopped it. Called once: before the copy starts
+    // on success (idea#168 r35), else from finally.
+    const restartSource = async (when: string): Promise<void> => {
+        sourceRestarted = true
+        try {
+            const freshInstance = getInstance(storeHandle.doc(), instance.id)
+            if (freshInstance) {
+                log(`copyApp: restarting source instance '${instance.name}' (${instance.id}) ${when}`)
+                await startInstance(storeHandle, freshInstance, sourceDisk, 'post-copy')
+            }
+        } catch (restartErr: any) {
+            console.error(chalk.red(`copyApp: failed to restart source instance: ${restartErr.message}`))
+        }
+    }
 
     // Detect cross-engine: target disk is on a different engine
     const { localEngineId } = await import('./Engine.js')
@@ -6440,6 +10711,8 @@ export const copyApp = async (
     const remoteAddress = isCrossEngine
         ? getEngineAddress(targetDisk.dockedTo as any) as string
         : undefined
+    // The peer: its address now, and its Engine id (key and host key pinned by id)
+    const peer: PeerEngine | undefined = isCrossEngine ? { host: remoteAddress!, engineId: String(targetDisk.dockedTo) } : undefined
 
     // ── step definitions ──────────────────────────────────────────────────────
     const COPY_STEPS = [
@@ -6467,7 +10740,9 @@ export const copyApp = async (
         // 2. Check free space (local only — skip for cross-engine)
         setCopyStep(1)
         if (!isCrossEngine) {
-            const needed = await directoryBytes(appMasterSrc) + await directoryBytes(instanceSrc)
+            // Instance data is sized as root by the app-data helper (idea#168): pi cannot
+            // read all of it (root 0600 sessions, MariaDB 0700 folders).
+            const needed = await directoryBytes(appMasterSrc) + await instanceDataBytes(sourceRoot, instance.id)
             const available = await availableBytes(await diskFsRoot(targetDisk))
             if (available < needed) {
                 throw new Error(
@@ -6478,11 +10753,11 @@ export const copyApp = async (
         }
 
         // 3. Ensure target directory structure
-        // For cross-engine: SSH mkdir on remote Pi
+        // For cross-engine: the peer's helper (ensure-dirs <root>, through its gate)
         const targetMountRoot = await diskMountRoot(targetDisk) // '' for system disk (both local and remote)
-        if (isCrossEngine) {
-            log(`copyApp: ensuring remote directories on ${remoteAddress}`)
-            await $`${remoteEnsureDirsSshArgs(remoteAddress!, targetMountRoot)}`
+        if (peer) {
+            log(`copyApp: ensuring remote directories on ${peer.host} (Engine ${peer.engineId}, idea-app-data ensure-dirs ${targetRoot})`)
+            await ensureRemoteDirs(peer.host, peer.engineId, targetRoot)
         } else {
             await fs.ensureDir(`${targetMountRoot}/apps`)
             await fs.ensureDir(`${targetMountRoot}/instances`)
@@ -6493,19 +10768,81 @@ export const copyApp = async (
         setCopyStep(2)
         const appMasterDest = `${targetMountRoot}/apps/${appId}`
         log(`copyApp: syncing app master ${appMasterSrc} → ${isCrossEngine ? remoteAddress + ':' : ''}${appMasterDest}`)
-        await rsyncDirectory(appMasterSrc, appMasterDest, ({ progressPercent }) => {
+        const appMasterProgress = ({ progressPercent }: { progressPercent: number }) => {
             updateOperation(storeHandle, opId, { progressPercent: Math.round(progressPercent * 0.25) })
-        }, opId, remoteAddress)
+        }
+        if (peer) await rsyncToPeer(appMasterSrc.replace(/\/*$/, '/'), peer, receiveAppArgs(targetRoot, appId), appMasterProgress, opId)
+        else await rsyncDirectory(appMasterSrc, appMasterDest, appMasterProgress, opId)
 
-        // 5. rsync instance data into a NEW instance directory (new ID)
+        // 5. Copy instance data into a NEW instance directory (new ID), as root through
+        //    the app-data helper (idea#168): owners and modes are kept, and data pi
+        //    cannot read is copied too. The helper creates the folder; cross-engine it
+        //    sends to pi@<remote>, where that Engine's helper receives it (rrsync -wo).
         setCopyStep(3)
         const instanceDest = `${targetMountRoot}/instances/${newInstanceId}`
-        if (!isCrossEngine) await fs.ensureDir(instanceDest)
-        else await $`ssh -o StrictHostKeyChecking=no pi@${remoteAddress} mkdir -p ${instanceDest}`
-        log(`copyApp: syncing instance data ${instanceSrc} → ${isCrossEngine ? remoteAddress + ':' : ''}${instanceDest}`)
-        await rsyncDirectory(instanceSrc, instanceDest, ({ progressPercent }) => {
-            updateOperation(storeHandle, opId, { progressPercent: 25 + Math.round(progressPercent * 0.30) })
-        }, opId, remoteAddress)
+        createdInstanceDest = instanceDest
+        log(`copyApp: syncing instance data ${instanceSrc} → ${isCrossEngine ? remoteAddress + ':' : ''}${instanceDest} (idea-app-data ${isCrossEngine ? 'send' : 'copy'})`)
+        await rsyncInstanceData(
+            peer
+                ? { kind: 'send', srcRoot: sourceRoot, srcId: instance.id, host: peer.host, peerEngineId: peer.engineId, dstRoot: targetRoot, dstId: newInstanceId }
+                : { kind: 'copy', srcRoot: sourceRoot, srcId: instance.id, dstRoot: targetRoot, dstId: newInstanceId },
+            ({ progressPercent }) => {
+                updateOperation(storeHandle, opId, { progressPercent: 25 + Math.round(progressPercent * 0.30) })
+            }, opId)
+
+        // 5a. Give the copy its own name and port (idea#168 r35). The rsync
+        //     copied the original's compose.yaml (x-app.instanceName) and .env
+        //     (port=). The copy gets a unique name (<name>-2, -3, …; see
+        //     uniqueCopyName) and no port, so startInstance allocates one that is
+        //     neither listening nor owned by another instance in the store.
+        const copyName = uniqueCopyName(storeHandle.doc(), String(instance.name))
+        const prepared = await preparedCopyFiles(instanceSrc, copyName)
+        const preparedNames = Object.keys(prepared) as (keyof typeof prepared)[]
+        if (preparedNames.length > 0) {
+            if (peer) {
+                const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-copy-'))
+                try {
+                    for (const f of preparedNames) await fs.writeFile(`${tmp}/${f}`, prepared[f]!)
+                    // only into the folder this Engine's receive just created (the peer's gate checks
+                    // its ledger); the files only, so the instance folder keeps its own owner and mode
+                    await rsyncToPeer(preparedNames.map(f => `${tmp}/${f}`), peer, receiveFilesArgs(targetRoot, newInstanceId), undefined, opId)
+                } finally {
+                    await fs.remove(tmp).catch(() => undefined)
+                }
+            } else {
+                for (const f of preparedNames) await fs.writeFile(`${instanceDest}/${f}`, prepared[f]!)
+            }
+        }
+        log(`copyApp: the copy is named '${copyName}'; its .env has no port, so it gets its own port at start`)
+
+        // 5a2. r40: mark Kolibri copies so startInstance rebinds morango id before
+        //     zeroconf advertise (NonUniqueNameException → fake Docker Running).
+        //     Marker works for local and cross-engine (file is in the instance folder).
+        const kolibriCopy = peer
+            ? await instanceDirLooksLikeKolibri(instanceSrc)
+            : await instanceDirLooksLikeKolibri(instanceDest)
+        if (kolibriCopy) {
+            // Flat marker at instance root (receive-files / put-files place basenames).
+            // Peer: receive-files through the gate. Local: put-files as root (app-data policy).
+            const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-kolibri-rebind-'))
+            try {
+                await fs.writeFile(`${tmp}/.idea-rebind-morango`, 'r40\n')
+                if (peer) {
+                    await rsyncToPeer(
+                        [`${tmp}/.idea-rebind-morango`],
+                        peer,
+                        receiveFilesArgs(targetRoot, newInstanceId),
+                        undefined,
+                        opId,
+                    )
+                } else {
+                    await putInstanceFiles(targetRoot, newInstanceId, tmp)
+                }
+            } finally {
+                await fs.remove(tmp).catch(() => undefined)
+            }
+            log(`copyApp: wrote Kolibri morango-rebind marker so start mints a fresh id (r40)`)
+        }
 
         // 5b. rsync service image tars needed by this instance
         //     services/ holds the Docker image tars that startInstance loads via
@@ -6521,8 +10858,8 @@ export const copyApp = async (
                 const tarSrc = `${copyServicesSrcDir}/${tarName}`
                 if (await fs.pathExists(tarSrc)) {
                     log(`copyApp: syncing service image ${tarName}`)
-                    if (isCrossEngine) {
-                        await $`rsync -a -e ${'ssh -o StrictHostKeyChecking=no'} ${tarSrc} pi@${remoteAddress}:${copyServicesDestDir}/`
+                    if (peer) {
+                        await rsyncToPeer(tarSrc, peer, receiveServiceArgs(targetRoot), undefined, opId)
                     } else {
                         await $`rsync -a ${tarSrc} ${copyServicesDestDir}/`
                     }
@@ -6538,6 +10875,12 @@ export const copyApp = async (
 
         // 6. Register/start the new instance
         setCopyStep(5)
+
+        // Restart the source BEFORE the copy starts (idea#168 r35): the
+        // original takes its own port back first, and the copy can never grab
+        // it while the original is down for the snapshot.
+        if (wasRunning) await restartSource('before the copy starts')
+
         if (isCrossEngine) {
             // Cross-engine: create instance record in shared store (as Docked),
             // then tell the remote engine to start it via sendCommand.
@@ -6551,11 +10894,12 @@ export const copyApp = async (
                 const newInst: Instance = {
                     id: newInstanceId,
                     instanceOf: instance.instanceOf,
-                    name: instance.name,
+                    name: copyName,
                     storedOn: targetDisk.id,
                     status: 'Docked' as Status,
                     statusCondition: null,
                     port: 0 as any,
+                    portZip: null,
                     serviceImages: serviceImages as ServiceImage[],
                     created: Date.now() as Timestamp,
                     lastBackup: null,
@@ -6567,9 +10911,9 @@ export const copyApp = async (
                 }
                 doc.instanceDB[newInstanceId] = newInst
             })
-            // Tell the remote engine to start this instance
+            // Tell the remote engine to start this instance, by id (idea#168)
             log(`copyApp: sending startInstance command to remote engine '${targetDisk.dockedTo}'`)
-            sendCommand(storeHandle, targetDisk.dockedTo as any, `startInstance ${instance.name} ${targetDisk.id} --cause cross-engine-cmd` as any)
+            sendCommand(storeHandle, targetDisk.dockedTo as any, `startInstance ${newInstanceId} ${targetDisk.id} --cause cross-engine-cmd` as any)
         } else {
             // Local: use existing processInstance flow
             log(`copyApp: registering new instance ${newInstanceId} on disk '${targetDisk.name}' (${targetDisk.id})`)
@@ -6594,21 +10938,22 @@ export const copyApp = async (
             })
         }
         console.error(chalk.red(`copyApp: failed — ${e.message ?? e}`))
-    } finally {
-        resourceLock.releaseAll(lockKeys)
-        // Always restart source instance if we stopped it
-        if (wasRunning) {
+        // Remove the partial copy unless it was already registered (fresh id, so the
+        // folder holds only what this op wrote). As root through the app-data helper
+        // (idea#168): the copy holds files owned by root, 999 and www-data.
+        if (createdInstanceDest && !storeHandle.doc()?.instanceDB?.[newInstanceId]) {
             try {
-                const freshStore = storeHandle.doc()
-                const freshInstance = getInstance(freshStore, instance.id)
-                if (freshInstance) {
-                    log(`copyApp: restarting source instance '${instanceName}'`)
-                    await startInstance(storeHandle, freshInstance, sourceDisk, 'post-copy')
-                }
-            } catch (restartErr: any) {
-                console.error(chalk.red(`copyApp: failed to restart source instance: ${restartErr.message}`))
+                if (peer) await deleteRemoteInstanceData(peer.host, peer.engineId, targetRoot, newInstanceId)
+                else await deleteInstanceData(targetRoot, newInstanceId)
+                log(`copyApp: removed the partial copy ${isCrossEngine ? remoteAddress + ':' : ''}${createdInstanceDest}`)
+            } catch (cleanupErr: any) {
+                console.error(chalk.red(`copyApp: could not remove the partial copy ${createdInstanceDest}: ${cleanupErr?.message ?? cleanupErr}`))
             }
         }
+    } finally {
+        resourceLock.releaseAll(lockKeys)
+        // Always restart the source if we stopped it and the success path did not
+        if (wasRunning && !sourceRestarted) await restartSource('after a failed copy')
     }
 }
 
@@ -6629,26 +10974,23 @@ export const moveApp = async (
 ): Promise<void> => {
     const store = storeHandle.doc()
 
-    const v = await validate(store, instanceName, sourceDiskId, targetDiskId)
-    if (typeof v === 'string') {
-        console.error(chalk.red(`moveApp: ${v}`))
-        return
-    }
-    const { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc } = v
+    const v = await validate(store, instanceName, sourceDiskId, targetDiskId, 'move')
+    // Validation refusals throw (idea#168 r29@97), so the command trace or
+    // crash-recovery retry ends as error instead of silently succeeding.
+    if (typeof v === 'string') throw new Error(`moveApp: ${v}`)
+    const { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc, sourceRoot, targetRoot } = v
 
     // moveApp does not support cross-engine targets (data integrity risk if move fails midway).
     // Use copyApp + manual delete instead.
     const { localEngineId: localId } = await import('./Engine.js')
     if (String(targetDisk.dockedTo) !== String(localId)) {
-        log(`moveApp: Target disk '${targetDisk.name}' is on a remote engine. Cross-engine move is not supported — use copyApp instead, then delete the source.`)
-        return
+        throw new Error(`moveApp: Target disk '${targetDisk.name}' is on a remote engine. Cross-engine move is not supported — use copyApp instead, then delete the source.`)
     }
 
     // Acquire per-resource locks: instance + both disks
     const moveLockKeys = [instanceKey(instance.id), diskKey(sourceDisk.id), diskKey(targetDisk.id)]
     if (!resourceLock.acquireAll(moveLockKeys, 'moveApp')) {
-        console.error(chalk.red(`moveApp: resource locked — another operation is already running on instance '${instanceName}' or one of its disks. Retry when it completes.`))
-        return
+        throw new Error(`moveApp: resource locked — another operation is already running on instance '${instanceName}' or one of its disks. Retry when it completes.`)
     }
 
     const opId = createOperation(storeHandle, 'moveApp', {
@@ -6658,6 +11000,11 @@ export const moveApp = async (
     }, cause, { type: 'instance', id: instance.id })
 
     let wasRunning = false
+    // idea#168: set once the helper copy into the target started, cleared when the
+    // instance is registered there. A failed move removes this partial copy, else a
+    // retry is refused (the helper needs an absent or empty destination) and the next
+    // dock of the target disk would register the partial folder.
+    let partialTarget = false
 
     // ── step definitions ──────────────────────────────────────────────────────
     const MOVE_STEPS = [
@@ -6685,7 +11032,7 @@ export const moveApp = async (
 
         // 2. Check free space
         setMoveStep(1)
-        const needed = await directoryBytes(appMasterSrc) + await directoryBytes(instanceSrc)
+        const needed = await directoryBytes(appMasterSrc) + await instanceDataBytes(sourceRoot, instance.id)
         const available = await availableBytes(await diskFsRoot(targetDisk))
         if (available < needed) {
             throw new Error(
@@ -6708,14 +11055,16 @@ export const moveApp = async (
             updateOperation(storeHandle, opId, { progressPercent: Math.round(progressPercent * 0.25) })
         }, opId)
 
-        // 5. rsync instance data — same instance ID, new location
+        // 5. Copy instance data as root through the app-data helper (idea#168) —
+        //    same instance ID, new location; owners and modes are kept.
         setMoveStep(3)
         const instanceDest = `${targetMountRoot}/instances/${instance.id}`
-        await fs.ensureDir(instanceDest)
-        log(`moveApp: syncing instance data ${instanceSrc} → ${instanceDest}`)
-        await rsyncDirectory(instanceSrc, instanceDest, ({ progressPercent }) => {
-            updateOperation(storeHandle, opId, { progressPercent: 25 + Math.round(progressPercent * 0.30) })
-        }, opId)
+        log(`moveApp: syncing instance data ${instanceSrc} → ${instanceDest} (idea-app-data copy)`)
+        partialTarget = true
+        await rsyncInstanceData({ kind: 'copy', srcRoot: sourceRoot, srcId: instance.id, dstRoot: targetRoot, dstId: instance.id },
+            ({ progressPercent }) => {
+                updateOperation(storeHandle, opId, { progressPercent: 25 + Math.round(progressPercent * 0.30) })
+            }, opId)
 
         // 5b. rsync service image tars needed by this instance
         //     services/ holds the Docker image tars that startInstance loads via
@@ -6748,18 +11097,19 @@ export const moveApp = async (
         setMoveStep(5)
         log(`moveApp: registering instance ${instance.id} on disk '${targetDisk.name}' (${targetDisk.id})`)
         await processInstance(storeHandle, targetDisk, instance.id)
+        partialTarget = false
 
         // 8. Remove source instance directory
         setMoveStep(6)
-        // Removed as pi, without sudo (idea#80): instance folders on disks must be
-        // removable by pi, and the Engine's sudoers file does not allow rm on them.
+        // Removed as root through the app-data helper (idea#168): the folder holds
+        // files containers wrote as root, 999 or www-data, which pi cannot remove.
         // The instance already runs from the target disk at this point, so a failure
-        // (e.g. files a container created as root) is logged and does not fail the move.
-        log(`moveApp: removing source instance directory ${instanceSrc}`)
+        // is logged and does not fail the move.
+        log(`moveApp: removing source instance directory ${instanceSrc} (idea-app-data delete)`)
         try {
-            await fs.remove(instanceSrc)
+            await deleteInstanceData(sourceRoot, instance.id)
         } catch (e: any) {
-            log(chalk.yellow(`moveApp: could not fully remove ${instanceSrc} as pi: ${e.message}. Remove the leftover folder by hand.`))
+            log(chalk.yellow(`moveApp: could not remove ${instanceSrc}: ${e.message}. Remove the leftover folder by hand.`))
         }
 
         // 9. Remove source app master only if no other instance on the source disk uses it
@@ -6791,6 +11141,22 @@ export const moveApp = async (
             })
         }
         console.error(chalk.red(`moveApp: failed — ${e.message ?? e}`))
+
+        // Remove the partial copy on the target (idea#168) while the instance is still
+        // registered on the source disk. Never the source: the helper refuses a copy
+        // onto the same root, so target root ≠ source root. Not after a helper
+        // refusal: it wrote nothing, and a folder that was already there (e.g. an
+        // earlier restore of this instance onto the target) is not ours to remove.
+        const stillOnSource = String(storeHandle.doc()?.instanceDB?.[instance.id]?.storedOn) === String(sourceDisk.id)
+        const helperRefused = /idea-app-data [\w-]+ refused: /.test(String(e?.message ?? ''))
+        if (partialTarget && stillOnSource && !helperRefused && targetRoot !== sourceRoot) {
+            try {
+                await deleteInstanceData(targetRoot, instance.id)
+                log(`moveApp: removed the partial copy of ${instance.id} on '${targetDisk.name}'`)
+            } catch (cleanupErr: any) {
+                console.error(chalk.red(`moveApp: could not remove the partial copy of ${instance.id} on '${targetDisk.name}': ${cleanupErr?.message ?? cleanupErr}`))
+            }
+        }
 
         // On failure, try to restart the source instance if we stopped it
         if (wasRunning) {
@@ -7025,7 +11391,10 @@ export const createFilesDisk = async (storeHandle: DocHandle<Store>, diskId: str
 
 ## File: src/data/Disk.ts
 ```typescript
+import { config } from "./Config.js";
+import { isUnfinishedFetch } from './UpdateFetch.js'
 import { $, YAML, chalk, fs, os } from 'zx';
+import path from 'path';
 import { deepPrint, log } from '../utils/utils.js';
 import { App, createAppId, createOrUpdateApp, extractAppName, extractAppVersion } from './App.js'
 import { Instance, Status, createOrUpdateInstance, startInstance } from './Instance.js'
@@ -7037,9 +11406,10 @@ import { addTrace, closeTrace } from './CommandLogStore.js';
 import { runWithTrace } from '../utils/CommandLogger.js';
 import { disksRoot } from './Config.js';
 import { FilesConfig, hasFilesYaml, processFilesDisk } from './FilesDisk.js';
-import { parseFilesMount } from './FilesMount.js';
+import { parseFilesMount, parseUsbMount } from './FilesMount.js';
 import { updateDiskSize } from './DiskSize.js';
 import { recordDiskDetectionFailure } from '../monitors/diskDetection.js';
+import { shouldAutoStart } from './AutoStart.js';
 
 
 
@@ -7063,6 +11433,18 @@ export interface Disk {
     filesConfig?: FilesConfig | null;   // Set when the disk is a Files Disk (FILES.yaml, idea#131); null otherwise
     sizeBytes?: number | null;          // Docked disks: size in bytes, rounded to MB (idea#131); null when undocked
     freeBytes?: number | null;          // Docked disks: free bytes, rounded to MB (idea#131); null when undocked
+    /** updateApp snapshots in <disk>/.pre-update (agent-engine-dev#230), so Ops can see their size; null/absent when unknown. */
+    preUpdateSnapshots?: PreUpdateSnapshot[] | null;
+    /** total bytes of the pre-update and quarantine folders on this disk (Atlas: Ops visibility; nothing auto-deletes) */
+    preUpdateBytes?: number | null;
+    quarantineBytes?: number | null;
+}
+
+export interface PreUpdateSnapshot {
+    instanceId: InstanceID;
+    sizeBytes: number;
+    /** false: interrupted (no COMPLETE marker); never restorable */
+    complete: boolean;
 }
 
 /**
@@ -7300,6 +11682,13 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
             log(`Disk ${disk.id} is an empty disk`)
             detectedTypes.push('empty')
         }
+        // #179: processAppDisk reconciles instance records only on an App Disk. On any other
+        // disk (e.g. a reset Empty) a record stored on it whose files are gone would survive
+        // the dock (idea#168 r82b kolibri-244pq…, r83 kolibri-kwffass…). Same handling as an App
+        // Disk: removeInstance (Missing, storedOn cleared).
+        if (!detectedTypes.includes('app')) {
+            await dropInstancesWithoutFiles(storeHandle, disk, mountRoot)
+        }
     }
 
     // Persist detected types to the store. Roles are listed in a fixed order
@@ -7387,6 +11776,41 @@ export const diskMountRoot = async (disk: Disk): Promise<string> => {
 }
 
 /**
+ * Mount-root prefix for a bare device name, same rule as diskMountRoot. System disk
+ * (root partition, e.g. sda2 on a Pi 4 USB root, nvme0n1p2 / mmcblk0p2 on a Pi 5
+ * internal root): '' so paths become /apps/..., /instances/.... Any other device:
+ * '<disksRoot>/<device>'. Never /disks/<dev> for the system disk: that folder is an
+ * empty root-owned mount point there.
+ */
+export const deviceMountRoot = async (device: string): Promise<string> =>
+    diskMountRoot({ device } as unknown as Disk)
+
+/**
+ * Join path parts under a mount root from diskMountRoot / deviceMountRoot (idea#237).
+ * The system disk's root is '' (right for template strings: `${root}/instances` is
+ * /instances), but path.join('', 'instances', id) is the RELATIVE 'instances/<id>'.
+ * This always gives an absolute path: '/instances/<id>' for the system disk,
+ * '<disksRoot>/<device>/instances/<id>' for any other disk.
+ */
+export const joinMountRoot = (mountRoot: string, ...parts: string[]): string =>
+    path.join(mountRoot || '/', ...parts)
+
+/** Absolute path of parts on a disk (joinMountRoot of diskMountRoot), e.g. diskPath(disk, 'instances', id). */
+export const diskPath = async (disk: Disk, ...parts: string[]): Promise<string> =>
+    joinMountRoot(await diskMountRoot(disk), ...parts)
+
+/**
+ * The disk's root token for the app-data root helper (/usr/local/sbin/idea-app-data,
+ * idea#168): 'system' for the system disk (the helper uses /instances/<id>), else
+ * the device ('sdX1'; on the duration pool a slot name such as 'idea-test-1', which
+ * the helper accepts only through its TEST-ONLY root bridge file). Same rule as
+ * diskMountRoot, so both name the same folder.
+ */
+export const appDataRoot = async (disk: Disk): Promise<string> => {
+    return (await isSystemDisk(disk)) ? 'system' : String(disk.device)
+}
+
+/**
  * Returns the filesystem root for free-space checks and similar operations
  * that need the actual mount point.
  * System disk: '/'   Regular disk: '<disksRoot>/<device>' (disksRoot defaults to /disks)
@@ -7450,9 +11874,10 @@ export const processSystemDisk = async (storeHandle: DocHandle<Store>, disk: Dis
 /**
  * Process a single app on the system disk (reads from /apps/<appId>/compose.yaml).
  */
-export const processSystemApp = async (storeHandle: DocHandle<Store>, disk: Disk, appId: AppID): Promise<App | undefined> => {
+export const processSystemApp = async (storeHandle: DocHandle<Store>, disk: Disk, appId: AppID, appsRoot: string = '/apps'): Promise<App | undefined> => {
     try {
-        const appComposeFile = await $`cat /apps/${appId}/compose.yaml`
+        // appsRoot is a parameter only so tests can point it at a fixture folder
+        const appComposeFile = await $`cat ${appsRoot}/${appId}/compose.yaml`
         const appCompose = YAML.parse(appComposeFile.stdout)
         let app: App
         storeHandle.change(doc => {
@@ -7471,12 +11896,23 @@ export const processSystemApp = async (storeHandle: DocHandle<Store>, disk: Disk
                     icon: xapp.icon ?? null,
                     author: xapp.author ?? null,
                     filesMount: parseFilesMount(xapp),
+                    usbMount: parseUsbMount(xapp),
                 }
                 doc.appDB[appId] = app
             } else {
                 log(`Updating existing system app ${appId}`)
+                // Same granular update as createOrUpdateApp (App.ts): every x-app field is refreshed
                 app = storedApp
+                app.name = extractAppName(appId)
+                app.version = extractAppVersion(appId)
+                app.title = xapp.title
+                app.description = xapp.description ?? null
+                app.url = xapp.url ?? null
+                app.category = xapp.category
+                app.icon = xapp.icon ?? null
+                app.author = xapp.author ?? null
                 app.filesMount = parseFilesMount(xapp)
+                app.usbMount = parseUsbMount(xapp)
             }
         })
         return app!
@@ -7484,6 +11920,60 @@ export const processSystemApp = async (storeHandle: DocHandle<Store>, disk: Disk
         log(`Error processing system app ${appId}: ${e}`)
         return undefined
     }
+}
+
+/**
+ * Create or update the store record of a system-disk instance from its compose.yaml.
+ * Same rules as createOrUpdateInstance (docked disks): instanceOf, name and
+ * serviceImages follow the instance's compose x-app on every pass, so an instance
+ * whose compose now names a newer app version moves to that app record (and gets
+ * its usbMount / filesMount). Stopped is preserved; Missing/Undocked/Error → Docked.
+ */
+export const upsertSystemInstanceRecord = (storeHandle: DocHandle<Store>, disk: Disk, instanceId: InstanceID, compose: any): Instance | undefined => {
+    let instance: Instance | undefined
+    const services = Object.keys(compose.services)
+    const serviceImages = services.map((s: string) => compose.services[s].image)
+    const instanceName = compose['x-app'].instanceName
+    const appId = createAppId(compose['x-app'].name, compose['x-app'].version) as AppID
+    storeHandle.change(doc => {
+        const stored = doc.instanceDB[instanceId]
+        if (!stored) {
+            log(`Creating new system instance ${instanceId}`)
+            const newInst: Instance = {
+                id: instanceId,
+                instanceOf: appId,
+                name: instanceName,
+                storedOn: disk.id,
+                status: 'Docked' as Status,
+                statusCondition: null,
+                port: 0 as PortNumber,
+                serviceImages: serviceImages as ServiceImage[],
+                created: new Date().getTime() as Timestamp,
+                lastBackup: null,
+                lastStarted: 0 as Timestamp,
+                currentStep: null,
+                totalSteps: null,
+                stepLabel: null,
+                metrics: null,
+            }
+            doc.instanceDB[instanceId] = newInst
+            instance = newInst
+        } else {
+            log(`Updating existing system instance ${instanceId}`)
+            if (stored.instanceOf !== appId) log(`System instance ${instanceId} moves from app ${stored.instanceOf} to ${appId}`)
+            stored.instanceOf = appId
+            stored.name = instanceName
+            stored.storedOn = disk.id
+            stored.serviceImages = serviceImages as ServiceImage[]
+            // Preserve Stopped status — same rule as createOrUpdateInstance:
+            // only reset to Docked from transient/detached states.
+            if (stored.status === 'Missing' || stored.status === 'Undocked' || stored.status === 'Error') {
+                stored.status = 'Docked' as Status
+            }
+            instance = stored
+        }
+    })
+    return instance
 }
 
 /**
@@ -7496,43 +11986,7 @@ export const processSystemInstance = async (storeHandle: DocHandle<Store>, disk:
     try {
         const composeFile = await $`cat /instances/${instanceId}/compose.yaml`
         const compose = YAML.parse(composeFile.stdout)
-        const services = Object.keys(compose.services)
-        const serviceImages = services.map((s: string) => compose.services[s].image)
-        const instanceName = compose['x-app'].instanceName
-        storeHandle.change(doc => {
-            const stored = doc.instanceDB[instanceId]
-            if (!stored) {
-                log(`Creating new system instance ${instanceId}`)
-                const newInst: Instance = {
-                    id: instanceId,
-                    instanceOf: createAppId(compose['x-app'].name, compose['x-app'].version) as AppID,
-                    name: instanceName,
-                    storedOn: disk.id,
-                    status: 'Docked' as Status,
-                    statusCondition: null,
-                    port: 0 as PortNumber,
-                    serviceImages: serviceImages as ServiceImage[],
-                    created: new Date().getTime() as Timestamp,
-                    lastBackup: null,
-                    lastStarted: 0 as Timestamp,
-                    currentStep: null,
-                    totalSteps: null,
-                    stepLabel: null,
-                    metrics: null,
-                }
-                doc.instanceDB[instanceId] = newInst
-                instance = newInst
-            } else {
-                log(`Updating existing system instance ${instanceId}`)
-                stored.storedOn = disk.id
-                // Preserve Stopped status — same rule as createOrUpdateInstance:
-                // only reset to Docked from transient/detached states.
-                if (stored.status === 'Missing' || stored.status === 'Undocked' || stored.status === 'Error') {
-                    stored.status = 'Docked' as Status
-                }
-                instance = stored
-            }
-        })
+        instance = upsertSystemInstanceRecord(storeHandle, disk, instanceId, compose)
     } catch (e) {
         log(`Error processing system instance ${instanceId}: ${e}`)
         return undefined
@@ -7593,6 +12047,8 @@ export const processAppDisk = async (storeHandle: DocHandle<Store>, disk: Disk):
         log(`App ids found on disk ${disk.id}: ${appIds}`)
         for (let appId of appIds) {
             if (!(appId === "") && !(disk.device == null)) {
+                // #263: a cross-Engine Fetch still in progress (no .idea-fetched yet) is not an App
+                if (await isUnfinishedFetch(`${mountRoot}/apps/${appId}`)) { log(`Skipping unfinished Fetch apps/${appId} on ${disk.id}`); continue }
                 const app = await processApp(storeHandle, disk, appId as AppID)
                 if (app) {
                     actualApps.push(app)
@@ -7639,6 +12095,19 @@ export const processAppDisk = async (storeHandle: DocHandle<Store>, disk: Disk):
         }
     })
 
+    // #230 (Atlas): publish the sizes of .pre-update snapshots so Ops can see them. Best effort.
+    if (!config.settings.isDev) {
+        const { refreshPreUpdateSnapshots, defaultUpdateDeps } = await import('./UpdateApp.js')
+        await refreshPreUpdateSnapshots(storeHandle, disk, defaultUpdateDeps(storeHandle).listSnapshots)
+    }
+    // #230 call 3: dock-time updateAvailable from SHA256SUMS presence and versions only (cheap).
+    try {
+        const { refreshUpdateAvailable } = await import('./UpdateApp.js')
+        if (disk.dockedTo) await refreshUpdateAvailable(storeHandle, String(disk.dockedTo))
+    } catch (e) {
+        log(`updateAvailable refresh failed on dock of ${disk.id}: ${(e as Error).message}`)
+    }
+
     // Trigger backups on any docked Backup Disk linked to instances on this App Disk
     const { checkPendingBackups } = await import('../monitors/backupMonitor.js')
     await checkPendingBackups(storeHandle, disk)
@@ -7678,11 +12147,25 @@ export const processInstance = async (storeHandle: DocHandle<Store>, disk: Disk,
  * issued explicitly via the 'startInstance' command.
  */
 const tracedStartInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk): Promise<void> => {
-    // Never auto-start an instance that was explicitly stopped by the operator.
-    // processInstance is called on every disk-dock event; without this guard a
-    // re-dock (or a spurious udev re-add) would restart a stopped instance.
-    if (instance.status === 'Stopped') {
-        log(`tracedStartInstance: skipping auto-start of '${instance.name}' (${instance.id}) — status is Stopped`)
+    // Never auto-start an instance the operator stopped (idea#176). processInstance
+    // runs on every dock: boot, a real USB plug, the testMode/dev startup undock +
+    // re-add of every disk, a spurious udev re-add, and move/restore/install
+    // registration. An undock overwrites Stopped with Undocked and the dock pass
+    // resets that to Docked, so the gate also reads the operator's last stop
+    // (AutoStart.ts). The instance is put back to Stopped so the Console shows it.
+    const current = storeHandle.doc()?.instanceDB?.[instance.id] ?? instance
+    const gate = shouldAutoStart(storeHandle.doc(), current)
+    if (!gate.start) {
+        log(`tracedStartInstance: skipping auto-start of '${current.name}' (${current.id}) on disk ${disk.id}: ${gate.reason}`)
+        if (gate.userStop && current.status !== 'Stopped') {
+            storeHandle.change(doc => {
+                const inst = doc.instanceDB[instance.id]
+                if (inst && inst.status !== 'Stopped' && inst.status !== 'Missing') {
+                    log(`Setting status of instance ${instance.id} to Stopped (was ${inst.status}; the operator's stop is still in force)`)
+                    inst.status = 'Stopped' as Status
+                }
+            })
+        }
         return
     }
     const cmdLogHandle = getCommandLogHandle()
@@ -7710,6 +12193,18 @@ const tracedStartInstance = async (storeHandle: DocHandle<Store>, instance: Inst
         if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'error', e.message ?? String(e))
         throw e
     }
+}
+
+/** #179: on dock, the records stored on `disk` whose instances/<id> folder is missing are removed. */
+export const dropInstancesWithoutFiles = async (storeHandle: DocHandle<Store>, disk: Disk, mountRoot: string): Promise<InstanceID[]> => {
+    const dropped: InstanceID[] = []
+    for (const inst of getInstancesOfDisk(storeHandle.doc(), disk)) {
+        if (await fs.pathExists(`${mountRoot}/instances/${inst.id}`)) continue
+        removeInstance(storeHandle, disk, inst.id)
+        dropped.push(inst.id)
+    }
+    if (dropped.length) log(`Dock ${disk.id}: dropped ${dropped.length} instance record(s) without files: ${dropped.join(', ')}`)
+    return dropped
 }
 
 export const removeInstance = (storeHandle: DocHandle<Store>, disk: Disk, instanceId: InstanceID): void => {
@@ -7803,6 +12298,218 @@ export const resolveDiskArg = (store: Store, engineId: EngineID | undefined, arg
         console.warn(`${command}: disk '${r.disk.name}' was given by name; use the disk id ${r.disk.id} (names are deprecated, idea#128).`)
     }
     return r.disk
+}
+
+```
+
+## File: src/data/DiskIdentity.ts
+```typescript
+/**
+ * DiskIdentity.ts — the diskId of an App Disk partition with a hardware serial (idea#168 D4)
+ *
+ * Problem: readHardwareId() returns the serial of the WHOLE drive (Intenso via
+ * hdparm, Samsung FIT via scsi_id). Every partition of one SSD therefore got the
+ * same diskId, so two partitions on one SSD were one store record that flipped
+ * between devices. Stage 2 had to pin skipHardwareId to avoid it.
+ *
+ * Rule (pure, see resolveHardwareDiskId):
+ *   - A drive with ONE ext4 partition: diskId = serial (unchanged, legacy form;
+ *     also what eraseDisk's candidateId and every production App Disk use).
+ *   - A drive with SEVERAL ext4 partitions: diskId = `<serial>-<partition key>`,
+ *     partition key = the partition's PARTUUID (GPT GUID, or MBR `<disk id>-<nn>`),
+ *     lower-case; `p<N>` (partition number) only when there is no PARTUUID.
+ *     PARTUUID and the number live in the partition table, so the id survives
+ *     unplug/replug, reboot and a kernel rename (sdb2 → sdc2). The device name
+ *     (sdX) is never part of the id.
+ *   - Existing META ids are kept when they are still valid for this partition:
+ *       * `<serial>-<key>` of THIS partition: kept (even if siblings come or go);
+ *       * bare `<serial>` (legacy): kept on the drive's primary partition (lowest
+ *         numbered ext4 partition), so every single-partition disk already in the
+ *         store keeps its id; a non-primary partition carrying it (the old
+ *         collision) moves to `<serial>-<key>`;
+ *       * an assigned/generated id (isHardwareId not true): kept. The serial no
+ *         longer overrides it — that override is what re-keyed both Stage 2
+ *         fixtures on one SSD to the same serial;
+ *       * isHardwareId true but not this drive's serial (a clone of another
+ *         disk): replaced by this partition's hardware id, as before.
+ *
+ * The system disk (/META.yaml) is not handled here: its id stays the bare root
+ * drive serial, because the Engine id is derived from it.
+ */
+
+import { $ } from 'zx'
+import { stripPartition, log } from '../utils/utils.js'
+import { DeviceName, DiskID } from './CommonTypes.js'
+
+/** One partition of the drive, as lsblk/sysfs report it. */
+export interface PartitionFacts {
+    name: string                // kernel name now (sdb2) — informational only, never part of the id
+    partn: number | null        // partition number in the table
+    partuuid: string | null     // PARTUUID (GPT GUID or MBR <disk id>-<nn>)
+    fstype: string | null
+}
+
+/** What the id of one partition depends on. */
+export interface HardwareIdentity {
+    serial: string
+    self: PartitionFacts
+    /** Every partition of the same drive, self included; null when it could not be read */
+    siblings: PartitionFacts[] | null
+}
+
+export interface MetaIdClaim {
+    diskId: DiskID
+    isHardwareId?: boolean
+}
+
+export type IdDecision =
+    | 'new'               // no META: the computed hardware id
+    | 'keep-partition'    // META holds <serial>-<key> of this partition
+    | 'keep-legacy'       // META holds the bare serial and this is the primary partition
+    | 'migrate-legacy'    // META holds the bare serial on a non-primary partition → <serial>-<key>
+    | 'keep-assigned'     // META holds an assigned/generated id (isHardwareId not true)
+    | 'clone'             // META holds another drive's hardware id → this partition's id
+
+export interface IdResolution {
+    diskId: DiskID
+    isHardwareId: boolean
+    decision: IdDecision
+}
+
+/** The Engine docks only ext4 partitions (idea#134). */
+const docked = (p: PartitionFacts) => (p.fstype ?? '').toLowerCase() === 'ext4'
+
+/** Stable per-partition key: PARTUUID, else the partition number; null when neither is known. */
+export const partitionKey = (p: PartitionFacts): string | null => {
+    const u = p.partuuid?.trim().toLowerCase()
+    if (u) return u
+    if (p.partn != null && Number.isFinite(p.partn)) return `p${p.partn}`
+    return null
+}
+
+/** `<serial>-<partition key>`, or null when the partition has no stable key. */
+export const partitionDiskId = (serial: string, p: PartitionFacts): DiskID | null => {
+    const key = partitionKey(p)
+    return key ? `${serial}-${key}` as DiskID : null
+}
+
+/** ext4 partitions of the drive; self always counts (it is being docked). */
+const dockedSiblings = (id: HardwareIdentity): PartitionFacts[] | null => {
+    if (!id.siblings) return null
+    const same = (a: PartitionFacts, b: PartitionFacts) =>
+        (a.partuuid && b.partuuid) ? a.partuuid.toLowerCase() === b.partuuid.toLowerCase()
+            : (a.partn != null && b.partn != null) ? a.partn === b.partn : a.name === b.name
+    const list = id.siblings.filter(docked)
+    if (!list.some(p => same(p, id.self))) list.push(id.self)
+    return list
+}
+
+/** Whether the drive holds more than one ext4 partition (null: unknown). */
+export const isSharedDrive = (id: HardwareIdentity): boolean | null => {
+    const s = dockedSiblings(id)
+    return s ? s.length > 1 : null
+}
+
+/**
+ * Whether this is the drive's primary partition: the lowest-numbered ext4
+ * partition (null: unknown). Partition numbers come from the table, so this does
+ * not change on replug or rename.
+ */
+export const isPrimaryPartition = (id: HardwareIdentity): boolean | null => {
+    const s = dockedSiblings(id)
+    if (!s || id.self.partn == null) return null
+    const nums = s.map(p => p.partn).filter((n): n is number => n != null)
+    return nums.length === 0 ? null : id.self.partn === Math.min(...nums)
+}
+
+/** The id a partition gets when it has no (valid) META id. */
+export const hardwareDiskId = (id: HardwareIdentity): DiskID => {
+    if (isSharedDrive(id) === true) {
+        const pid = partitionDiskId(id.serial, id.self)
+        if (pid) return pid
+        log(`Drive ${id.serial} has several ext4 partitions but ${id.self.name} has no PARTUUID or number; using the serial`)
+    }
+    return id.serial as DiskID
+}
+
+/**
+ * Decide the diskId of a partition whose drive has a hardware serial.
+ * meta: the current META.yaml claim, or null for a disk without META.yaml.
+ */
+export const resolveHardwareDiskId = (meta: MetaIdClaim | null, id: HardwareIdentity): IdResolution => {
+    const fresh = hardwareDiskId(id)
+    if (!meta || meta.diskId == null || String(meta.diskId) === '') {
+        return { diskId: fresh, isHardwareId: true, decision: 'new' }
+    }
+    const current = String(meta.diskId)
+    const own = partitionDiskId(id.serial, id.self)
+    if (own && current === own) {
+        return { diskId: own, isHardwareId: true, decision: 'keep-partition' }
+    }
+    if (current === id.serial) {
+        const primary = isPrimaryPartition(id)
+        const shared = isSharedDrive(id)
+        // Unknown layout: keep (never re-key on missing information)
+        if (primary === null || shared === null || primary || !shared) {
+            return { diskId: meta.diskId, isHardwareId: meta.isHardwareId ?? true, decision: 'keep-legacy' }
+        }
+        if (own) return { diskId: own, isHardwareId: true, decision: 'migrate-legacy' }
+        return { diskId: meta.diskId, isHardwareId: meta.isHardwareId ?? true, decision: 'keep-legacy' }
+    }
+    if (meta.isHardwareId !== true) {
+        return { diskId: meta.diskId, isHardwareId: false, decision: 'keep-assigned' }
+    }
+    return { diskId: fresh, isHardwareId: true, decision: 'clone' }
+}
+
+// ── Facts from the running system ────────────────────────────────────────────
+
+export interface PartitionFactsDeps {
+    lsblkJson: (wholeDevice: string) => Promise<string>
+    readSysfs: (path: string) => Promise<string>
+}
+
+const defaultFactsDeps: PartitionFactsDeps = {
+    // lsblk reads PARTUUID/FSTYPE from the udev database: no root needed
+    lsblkJson: async (whole) => (await $`lsblk -J -o NAME,TYPE,PARTUUID,FSTYPE /dev/${whole}`).stdout,
+    readSysfs: async (p) => (await $`cat ${p}`).stdout,
+}
+
+const partnFromName = (name: string): number | null => {
+    const m = name.match(/(?:p)?(\d+)$/)
+    return m && stripPartition(name) !== name ? parseInt(m[1], 10) : null
+}
+
+/**
+ * Read this partition and its siblings: lsblk for PARTUUID/FSTYPE, sysfs
+ * /sys/class/block/<part>/partition for the number (name suffix as fallback).
+ * self is null when the device is not a partition of a block device we can read.
+ */
+export const readPartitionFacts = async (device: DeviceName, deps: Partial<PartitionFactsDeps> = {}): Promise<{ self: PartitionFacts | null, siblings: PartitionFacts[] | null }> => {
+    const d = { ...defaultFactsDeps, ...deps }
+    const whole = stripPartition(device)
+    if (whole === device) return { self: null, siblings: null }
+    try {
+        const parsed = JSON.parse(await d.lsblkJson(whole))
+        const flat: any[] = []
+        const walk = (n: any) => { flat.push(n); (n.children ?? []).forEach(walk) }
+        ;(parsed.blockdevices ?? []).forEach(walk)
+        const parts: PartitionFacts[] = []
+        for (const n of flat.filter(n => n.type === 'part')) {
+            let partn: number | null = null
+            try {
+                const v = parseInt((await d.readSysfs(`/sys/class/block/${n.name}/partition`)).trim(), 10)
+                partn = Number.isFinite(v) ? v : null
+            } catch { /* fall back to the name */ }
+            if (partn == null) partn = partnFromName(n.name)
+            parts.push({ name: n.name, partn, partuuid: n.partuuid || null, fstype: n.fstype || null })
+        }
+        const self = parts.find(p => p.name === device) ?? null
+        return { self, siblings: self ? parts : null }
+    } catch (e) {
+        log(`Could not read the partitions of ${whole}: ${e}`)
+        return { self: { name: device, partn: partnFromName(device), partuuid: null, fstype: null }, siblings: null }
+    }
 }
 
 ```
@@ -7901,10 +12608,16 @@ import { $, chalk, os, YAML, fs, path, sleep } from 'zx';
 
 $.verbose = false;
 import { deepPrint, log, uuid, print } from '../utils/utils.js';
+import { APP_DATA_HELPER, APP_DATA_HELPER_VERSION, BORG_PATH } from '../utils/appDataHelper.js';
+import { PEER_GATE, PEER_AUTHORIZED_KEYS, PEER_KNOWN_HOSTS } from '../utils/peerSsh.js';
 import { readMetaUpdateId, DiskMeta, addMeta, readRemoteDiskId } from './Meta.js';
 import { Version, Command, Hostname, Timestamp, DiskID, EngineID } from './CommonTypes.js';
 import { Store, getAppsOfEngine, getDisksOfEngine, getInstancesOfEngine } from './Store.js';
 import { DocHandle } from '@automerge/automerge-repo';
+import { currentLanSelection, lanChangeLines, LanSelection } from './LanAddress.js';
+import type { NewDisk, CardReader, ClientCard, DiskCandidate } from './ClientCards.js';
+import type { ClientImageStore } from './ClientImages.js';
+import type { FlashInProgress } from './FlashCard.js';
 
 export interface Engine {
   id: EngineID,
@@ -7924,7 +12637,91 @@ export interface Engine {
   eraseInProgress?: EraseInProgress | null;
   /** Whole non-system disks without ext4 (idea#134); rebuilt on dock/undock and at startup */
   unformattedDisks?: UnformattedDiskPublic[];
+  /**
+   * Teacher USB sticks (FAT/exFAT) mounted read-only under /run/idea-usb on this
+   * Engine (idea#193 §3.3). Not IDEA disks: no diskDB entry, no roles. Written only
+   * by this Engine, whole-list replace on plug/unplug; emptied at startup.
+   */
+  usbSticks?: UsbStickPublic[];
+  /** idea#201 §10 / idea#303: USB and other non-card disks without IDEA META.yaml (sticks too since idea#303), never written (rule 1) */
+  newDisks?: NewDisk[];
+  /** idea#201 §10: card readers on this Engine (with or without a card) */
+  cardReaders?: CardReader[];
+  /** idea#201 §10 / idea#303: Flash targets present now: SD cards in readers and USB disks (same candidateId as in newDisks) */
+  clientCards?: ClientCard[];
+  /** idea#303: one entry per physical non-IDEA disk with its allowed actions (initialise / erase / flash) */
+  diskCandidates?: DiskCandidate[];
+  /** idea#201 §10: client images stored on this Engine */
+  clientImages?: ClientImageStore | null;
+  /** idea#201 §10: set for the whole run of a flash; one at a time per Engine */
+  flashInProgress?: FlashInProgress | null;
+  /**
+   * This Engine's own ssh key and host key for Engine-to-Engine copies (per-Pi
+   * Engine keys, data/PeerAccess.ts). Written by this Engine only, at every start
+   * and repaired on the heartbeat; null (or absent) when peer access is off here.
+   */
+  peerAccess?: PeerAccess | null;
+  /**
+   * LAN IPv4 of this Engine (agent-console-dev#138), e.g. '192.168.0.139': the
+   * address of the default-route interface, else the first eligible wired/Wi-Fi
+   * address; never Docker bridges, Tailscale 100.64/10 or link-local 169.254/16.
+   * null when there is none; absent on Engines older than this field.
+   * Written at start and when it changes (checked on every heartbeat).
+   */
+  lanAddress?: string | null;
+  /** Every eligible LAN IPv4 in selection order; lanAddress is the first (null: none). Written only on change. See LanAddress.ts. */
+  lanAddresses?: string[] | null;
 }
+
+/** Engine.peerAccess (design-per-pi-engine-key.md) */
+export interface PeerAccess {
+  /** 'ssh-ed25519 <base64>' of /home/pi/.ssh/idea_engine_ed25519.pub (no comment) */
+  sshKey: string;
+  /** 'ssh-ed25519 <base64>' of /etc/ssh/ssh_host_ed25519_key.pub, pinned by peers under this Engine's id */
+  hostKey: string;
+  /** When sshKey/hostKey were last (re)published */
+  publishedAt: Timestamp;
+  /**
+   * The peers this Engine has written into its authorized_keys and known_hosts
+   * (idea-app-data sync-peers), as '<engineId> <sshKey fingerprint> <hostKey fingerprint>'.
+   * A peer may copy to this Engine once its entry (with its CURRENT keys) is listed here.
+   */
+  authorized: string[];
+}
+
+/** Engine.usbSticks entry (idea#193 §3.3, §8.2a) */
+export interface UsbStickPublic {
+  /** 'usb-' + filesystem UUID (FAT/exFAT serial), stable per stick */
+  stickId: string
+  /** Partition or whole-disk device, e.g. sdb1 (or sdb for a stick without a partition table) */
+  device: string
+  /** Filesystem label, else the drive model, else 'USB stick' */
+  label: string
+  /** 'USB: <label>', unique on this Engine (' (2)' on a clash) */
+  displayName: string
+  fsType: 'vfat' | 'exfat'
+  sizeBytes: number
+  usedBytes: number
+  mountedAt: Timestamp
+  readOnly: true
+  /** The stick has a top-level folder named kolibri (any case): auto-build source (§8) */
+  hasKolibriFolder: boolean
+  /**
+   * What the Engine did about the channel builder for this stick (§8.2a), for the
+   * Console hint. null when the stick has no kolibri folder.
+   */
+  builderAutoStart: ChannelBuilderAutoStartResult | null
+}
+
+/**
+ * started: the Engine started the docked builder; alreadyRunning: it was Running or
+ * Starting; noBuilder: no kolibri-channel-builder instance docked on this Engine;
+ * operatorStopped: Stopped / Pauzed / an operator stop in force; disabled: setting
+ * autoStartChannelBuilder is false; busy: another operation holds the instance;
+ * failed: the start was tried and failed; notStartable: any other status.
+ */
+export type ChannelBuilderAutoStartResult =
+  'started' | 'alreadyRunning' | 'noBuilder' | 'operatorStopped' | 'disabled' | 'busy' | 'failed' | 'notStartable'
 
 export interface UnformattedDiskPublic {
   candidateId: string
@@ -7950,13 +12747,30 @@ export interface EraseInProgress {
  *   filesDisk:  the Files Disk role and createFilesDisk <diskId> [<shareName…>] (idea#131).
  *   filesMount: Files Disk binds into opted-in Apps (x-app.filesMount, idea#133).
  *   eraseDisk:  summariseDisk + eraseDisk (idea#134).
+ *   instanceIdArgs: startInstance, runInstance, stopInstance, copyApp, moveApp,
+ *               backupApp and restoreApp take an instance id (idea#168); a name
+ *               still works when it is unambiguous.
+ *   unknownDiskReadOnly: a disk without IDEA META.yaml is never mounted read-write
+ *               and never gets a META.yaml (idea#201 §10 rule 1).
+ *   clientCards: Engine.clientCards, cardReaders and newDisks are published, and
+ *               initialiseDisk <candidateId> [empty|files|backup] (idea#201 §10).
+ *   flashCard:  flashCard / cancelFlash; only when the root helper
+ *               /usr/local/sbin/idea-flash-card is installed (checked at startup).
+ *   clientImages: Engine.clientImages is published.
  * Written at every startup as a whole new list, with capabilitiesBootedAt set
  * to that startup's lastBooted. A Console counts a capability only when
  * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance']
+/** idea#201 §10: advertised only when the flash helper is installed (HELPER_MISSING otherwise) */
+export const FLASH_CARD_CAPABILITY = 'flashCard'
+export const FLASH_HELPER_PATH = '/usr/local/sbin/idea-flash-card'
+const flashHelperInstalled = (): boolean => { try { fs.accessSync(FLASH_HELPER_PATH, fs.constants.X_OK); return true } catch { return false } }
+/** The capability list written at this startup */
+export const engineCapabilities = (helperInstalled: boolean = flashHelperInstalled()): string[] =>
+  helperInstalled ? [...ENGINE_CAPABILITIES, FLASH_CARD_CAPABILITY] : [...ENGINE_CAPABILITIES]
 
 import { config } from './Config.js';
 
@@ -7977,7 +12791,7 @@ export const createEngineIdFromDiskId = (diskId: DiskID): EngineID => {
   return "ENGINE_" + diskId as EngineID
 }
 
-export const initialiseLocalEngine = async (): Promise<Engine> => {
+export const initialiseLocalEngine = async (lanSel: LanSelection = currentLanSelection()): Promise<Engine> => {
   try {
     const meta: DiskMeta = await readMetaUpdateId()
     const booted = (new Date()).getTime() as Timestamp
@@ -7992,10 +12806,14 @@ export const initialiseLocalEngine = async (): Promise<Engine> => {
       lastRun: booted,
       lastHalted: null,
       commands: [],
-      capabilities: [...ENGINE_CAPABILITIES],
+      capabilities: engineCapabilities(),
       capabilitiesBootedAt: booted,
       eraseInProgress: null,
       unformattedDisks: [],
+      lanAddress: lanSel.address,
+      lanAddresses: lanSel.addresses ? [...lanSel.addresses] : null,
+      usbSticks: [],
+      flashInProgress: null,
     }
     return localEngine
   } catch (e) {
@@ -8005,9 +12823,12 @@ export const initialiseLocalEngine = async (): Promise<Engine> => {
 }
 
 export const createOrUpdateEngine = async (storeHandle: DocHandle<Store>, engineId: EngineID): Promise<Engine | undefined> => {
-  const newEngine: Engine = await initialiseLocalEngine()
+  const lanSel = currentLanSelection()
+  const newEngine: Engine = await initialiseLocalEngine(lanSel)
   let engine: Engine
   try {
+    // The lanAddress / lanAddresses change lines, same format as the heartbeat's (Liveness.ts)
+    for (const l of lanChangeLines(storeHandle.doc()?.engineDB?.[engineId] ?? {}, lanSel)) log(l)
     storeHandle.change(doc => {
       const storedEngine: Engine | undefined = doc.engineDB[engineId]
       if (!storedEngine) {
@@ -8024,10 +12845,21 @@ export const createOrUpdateEngine = async (storeHandle: DocHandle<Store>, engine
         engine.lastBooted = booted
         engine.lastRun = booted
         // Whole new list, never appended: a stale or extra entry disappears
-        engine.capabilities = [...ENGINE_CAPABILITIES]
+        engine.capabilities = engineCapabilities()
         engine.capabilitiesBootedAt = booted
         if (engine.unformattedDisks === undefined) engine.unformattedDisks = []
+        // Sticks are re-mounted by the watcher's initial add events (idea#193 §3.4)
+        if (engine.usbSticks === undefined || engine.usbSticks.length > 0) engine.usbSticks = []
         if (engine.eraseInProgress === undefined) engine.eraseInProgress = null
+        if (engine.lanAddress !== newEngine.lanAddress) engine.lanAddress = newEngine.lanAddress ?? null
+        const lanList = newEngine.lanAddresses ?? null
+        const storedList = engine.lanAddresses ?? null
+        if (engine.lanAddresses === undefined || (storedList === null) !== (lanList === null) ||
+            (storedList && lanList && (storedList.length !== lanList.length || storedList.some((x, i) => x !== lanList[i])))) {
+          engine.lanAddresses = lanList ? [...lanList] : null
+        }
+        // idea#201: a flash never survives a restart (its Operation is failed INTERRUPTED)
+        if (engine.flashInProgress !== null) engine.flashInProgress = null
       }
     })
   return engine!
@@ -8155,11 +12987,15 @@ export const buildEngine = async (args: any) => {
     await clearKnownHost(machine);
   }
 
+  await pinAptSnapshot(exec);
   await updateSystem(exec);
+  await installRpiPins(exec, enginePath);
   if (upgrade) await upgradeSystem(exec);
 
   await setHostname(exec, hostname);
-  await installAvahi(exec);
+  await installAvahi(exec, enginePath);
+  // DHCP vendor class (idea#209 D8) is applied by installRootHelpers (via installUdev
+  // below), the same step every update runs (idea#284).
   await localiseSystem(exec, enginePath, language, keyboard, timezone);
   await installCrontabs(exec, enginePath);
 
@@ -8243,6 +13079,57 @@ export const createDir = async (exec: any, dir: string, chmod: string | null = "
     console.error(e);
     process.exit(1);
   }
+}
+
+/**
+ * Debian side of apt pinned to a dated snapshot.debian.org (idea#322, Steve
+ * 2026-10-26). The Raspberry Pi archive has no snapshots: its packages are
+ * pinned by version in script/build_image_assets/apt-rpi-pins.tsv and, when the
+ * release's cached .debs are present in <enginePath>/deb-cache/, installed from them.
+ */
+export const DEBIAN_SNAPSHOT = '20261026T000000Z'
+export const DEBIAN_SNAPSHOT_SOURCES = (suite: string, snapshot = DEBIAN_SNAPSHOT) =>
+  `# Written by build-engine (idea#322): Debian pinned to snapshot ${snapshot}\n` +
+  `Types: deb\nURIs: https://snapshot.debian.org/archive/debian/${snapshot}/\nSuites: ${suite} ${suite}-updates\n` +
+  `Components: main contrib non-free non-free-firmware\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\nCheck-Valid-Until: no\n\n` +
+  `Types: deb\nURIs: https://snapshot.debian.org/archive/debian-security/${snapshot}/\nSuites: ${suite}-security\n` +
+  `Components: main contrib non-free non-free-firmware\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\nCheck-Valid-Until: no\n`
+
+/** Parse apt-rpi-pins.tsv: `<package>\t<version>` lines, # comments. */
+export const parseAptPins = (text: string): { pkg: string, version: string }[] =>
+  text.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'))
+    .map(l => l.split(/\s+/)).filter(p => p.length >= 2).map(([pkg, version]) => ({ pkg, version }))
+
+export const pinAptSnapshot = async (exec: any) => {
+  print(chalk.blue(`Pinning Debian apt sources to snapshot.debian.org ${DEBIAN_SNAPSHOT}...`));
+  try {
+    const suite = String((await exec`bash -c ${'. /etc/os-release && echo $VERSION_CODENAME'}`).stdout ?? '').trim()
+    if (!/^[a-z]+$/.test(suite)) throw new Error(`unexpected VERSION_CODENAME ${suite}`)
+    // Keep the original Debian sources as a disabled copy (quarantine, never delete).
+    await exec`bash -c ${'for f in /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list; do [ -s "$f" ] && grep -q "deb.debian.org" "$f" && sudo mv "$f" "$f.idea-disabled"; done; true'}`
+    await exec`echo ${DEBIAN_SNAPSHOT_SOURCES(suite)} | sudo tee /etc/apt/sources.list.d/idea-debian-snapshot.sources > /dev/null`
+  } catch (e) {
+    print(chalk.red('Error pinning apt to the Debian snapshot'));
+    console.error(e);
+    process.exit(1);
+  }
+  print(chalk.green('Debian apt pinned to snapshot'));
+}
+
+/** Install the pinned Raspberry Pi archive packages, from deb-cache/ when the release ships them. */
+export const installRpiPins = async (exec: any, enginePath: string) => {
+  const pinsFile = path.join(enginePath, 'script/build_image_assets/apt-rpi-pins.tsv')
+  const text = String((await exec`cat ${pinsFile}`).stdout ?? '')
+  const pins = parseAptPins(text)
+  if (pins.length === 0) { print(chalk.yellow('apt-rpi-pins.tsv lists no packages; Raspberry Pi archive packages are recorded only')); return }
+  print(chalk.blue(`Installing ${pins.length} pinned Raspberry Pi archive packages...`));
+  const cache = `${enginePath}/deb-cache`
+  const cached = String((await exec`bash -c ${`ls ${cache}/*.deb 2>/dev/null || true`}`).stdout ?? '').split('\n').filter(Boolean)
+  if (cached.length) await exec`sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades ${cached}`
+  else await exec`sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades ${pins.map(p => `${p.pkg}=${p.version}`)}`
+  // Raspberry Pi OS keeps raspi.sources (archive.raspberrypi.com, no snapshots) enabled: hold the pins
+  // so the following apt upgrade cannot move them.
+  await exec`sudo apt-mark hold ${pins.map(p => p.pkg)}`
 }
 
 export const updateSystem = async (exec: any) => {
@@ -8355,12 +13242,46 @@ export const setHostname = async (exec: any, hostname: string) => {
   print(hostname); // Print hostname for capture
 }
 
-export const installAvahi = async (exec: any) => {
+/** Installed copy of script/build_image_assets/idea-dhcp-vendor-class (idea#209 D8). */
+export const DHCP_VENDOR_CLASS_HELPER = '/usr/local/sbin/idea-dhcp-vendor-class'
+export const DHCP_VENDOR_CLASS = 'idea-engine'
+
+/**
+ * idea#209 D8: the Engine sends DHCP option 60 "idea-engine", so the school router
+ * gives every Engine an address in .2–.9 without MAC reservations. The helper writes a
+ * NetworkManager conf.d connection default (and/or a dhcpcd.conf vendorclassid line),
+ * idempotently, with a .idea-bak-<UTC> backup. Only the NM *config* is reloaded: no
+ * connection is touched and no link drops; the value is used from the next DHCP
+ * activation (the nightly 05:00 reboot at the latest).
+ */
+export const installDhcpVendorClass = async (exec: any, enginePath: string) => {
+  print(chalk.blue(`Setting DHCP vendor class (option 60) to ${DHCP_VENDOR_CLASS}...`));
+  try {
+    await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-dhcp-vendor-class ${DHCP_VENDOR_CLASS_HELPER}`;
+    await exec`sudo ${DHCP_VENDOR_CLASS_HELPER}`;
+    // Reload NM's config files only (like SIGHUP); never restart NM or dhcpcd.
+    await exec`if systemctl is-active --quiet NetworkManager; then sudo nmcli general reload conf; fi`;
+  } catch (e) {
+    print(chalk.red('Error setting the DHCP vendor class'));
+    console.error(e);
+  }
+}
+
+/** Installed copy of script/build_image_assets/idea-avahi-lan-only (idea#203). */
+export const AVAHI_LAN_ONLY_HELPER = '/usr/local/sbin/idea-avahi-lan-only'
+export const AVAHI_CONF = '/etc/avahi/avahi-daemon.conf'
+
+export const installAvahi = async (exec: any, enginePath: string) => {
   print(chalk.blue('Installing Avahi for .local mDNS discovery...'));
   try {
-    await exec`sudo apt install avahi-daemon libnss-mdns -y`;
+    await exec`sudo apt install avahi-daemon avahi-utils libnss-mdns -y`;
+    // LAN only (idea#203): allow-interfaces=eth0,wlan0 under [server], so <host>.local
+    // never resolves to a docker bridge (idea03.local -> 172.21.0.1). Idempotent; the
+    // helper backs the conf up to avahi-daemon.conf.idea-bak-<UTC> before any change.
+    await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-avahi-lan-only ${AVAHI_LAN_ONLY_HELPER}`;
+    await exec`sudo ${AVAHI_LAN_ONLY_HELPER} ${AVAHI_CONF}`;
     await exec`sudo systemctl enable avahi-daemon`;
-    await exec`sudo systemctl start avahi-daemon`;
+    await exec`sudo systemctl restart avahi-daemon`;
   } catch (e) {
     print(chalk.red('Error installing Avahi'));
     console.error(e);
@@ -8413,11 +13334,9 @@ export const installUdev = async (exec: any, enginePath: string) => {
   try {
     await exec`sudo apt install udev -y`;
     await copyAsset(exec, enginePath, '90-docking.rules', '/etc/udev/rules.d')
-    await installEngineSudoers(exec, enginePath)
-    // idea-erase-disk: root-owned COPY in /usr/local/sbin (never a symlink) (idea#134)
-    print(chalk.blue('  - Installing idea-erase-disk...'))
-    await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-erase-disk /usr/local/sbin/idea-erase-disk`
-    print(chalk.green('  - /usr/local/sbin/idea-erase-disk installed'))
+    // Root helpers, their packages (rsync, borgbackup), sudoers and peer access.
+    // Same function as ./install-root-helpers, which every Engine update runs too.
+    await installRootHelpers(exec, enginePath)
     await createDir(exec, '/disks', "0755", "0:0")
 
     // Configure /dev/engine ownership so the pi user can write sentinel files.
@@ -8446,6 +13365,143 @@ EOF`
     process.exit(1);
   }
   print(chalk.green('Udev and udev rules installed'));
+}
+
+/**
+ * Debian packages the root helpers run by absolute path: idea-app-data uses
+ * /usr/bin/rsync (+ rrsync) and /usr/bin/borg (backup/restore). Before this list
+ * existed borgbackup was only in script/install.sh and the installUdev step, so a
+ * Pi that got the helper any other way (by hand, idea#168) had no borg (wh, idea02).
+ */
+export const ROOT_HELPER_PACKAGES = ['rsync', 'borgbackup']
+
+/** Installs the packages in `pkgs` that dpkg does not report as installed; idempotent. */
+export const ensureAptPackages = async (exec: any, pkgs: string[]): Promise<string[]> => {
+  const missing: string[] = []
+  for (const pkg of pkgs) {
+    let status = ''
+    try {
+      status = String((await exec`dpkg-query -W -f=${'${Status}'} ${pkg}`)?.stdout ?? '')
+    } catch { status = '' }
+    if (!/install ok installed/.test(status)) missing.push(pkg)
+  }
+  if (missing.length === 0) {
+    print(chalk.green(`  - packages already installed: ${pkgs.join(' ')}`))
+    return missing
+  }
+  print(chalk.blue(`  - installing missing packages: ${missing.join(' ')}`))
+  await exec`sudo apt-get update -y`
+  await exec`sudo DEBIAN_FRONTEND=noninteractive apt-get install -y ${missing}`
+  return missing
+}
+
+/**
+ * Everything root-owned the Engine needs at run time, safe to run again on every
+ * install AND every update (build-engine installUdev, ./install-root-helpers,
+ * sync-engine): rsync + borgbackup, the sudoers files, /usr/local/sbin/idea-erase-disk,
+ * /usr/local/sbin/idea-app-data, the peer-access parts and the DHCP vendor class
+ * (idea#284). `install` overwrites
+ * the helpers with the checkout's copies, so an outdated helper is upgraded.
+ * Ends by checking /usr/bin/borg and `idea-app-data version`; throws if either is wrong.
+ */
+/** tmpfiles.d entry that creates /run/idea-usb at boot (idea#193). */
+export const USB_TMPFILES_CONF = '/etc/tmpfiles.d/idea-usb.conf'
+
+export const installRootHelpers = async (exec: any, enginePath: string) => {
+  print(chalk.blue('  - Installing root helper packages...'))
+  await ensureAptPackages(exec, ROOT_HELPER_PACKAGES)
+  await installEngineSudoers(exec, enginePath)
+  // idea-erase-disk: root-owned COPY in /usr/local/sbin (never a symlink) (idea#134)
+  print(chalk.blue('  - Installing idea-erase-disk...'))
+  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-erase-disk /usr/local/sbin/idea-erase-disk`
+  print(chalk.green('  - /usr/local/sbin/idea-erase-disk installed'))
+  // idea-write-home-engine (idea#203): called only by the flash-card root helper after a verified
+  // write; root-owned COPY like idea-erase-disk, no sudoers entry (the Engine never calls it).
+  print(chalk.blue('  - Installing idea-write-home-engine...'))
+  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-write-home-engine /usr/local/sbin/idea-write-home-engine`
+  print(chalk.green('  - /usr/local/sbin/idea-write-home-engine installed'))
+  // idea-write-card-timezone (idea#208): called only by idea-flash-card --timezone after a verified
+  // write; root-owned COPY, no sudoers entry (the Engine never calls it).
+  print(chalk.blue('  - Installing idea-write-card-timezone...'))
+  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-write-card-timezone /usr/local/sbin/idea-write-card-timezone`
+  print(chalk.green('  - /usr/local/sbin/idea-write-card-timezone installed'))
+  // idea-flash-card: client-card flash helper (idea#201 §10), root-owned COPY, 0755
+  print(chalk.blue('  - Installing idea-flash-card...'))
+  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-flash-card ${FLASH_HELPER_PATH}`
+  // Client images (idea#202 layout): written by the Engine (pi), read by the helper (root)
+  await exec`sudo install -d -o pi -g pi -m 0755 /var/lib/idea /var/lib/idea/client-images`
+  print(chalk.green(`  - ${FLASH_HELPER_PATH} installed`))
+  // idea-app-data: the app-data root helper (idea#168), same rules: root-owned COPY,
+  // 0755, in /usr/local/sbin; its sudoers line is in 11-engine-files (visudo -cf above).
+  // It runs rsync/rrsync, borg, runuser and ssh by absolute path.
+  print(chalk.blue('  - Installing idea-app-data...'))
+  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-app-data ${APP_DATA_HELPER}`
+  print(chalk.green(`  - ${APP_DATA_HELPER} installed`))
+  // Teacher USB sticks (idea#193): /run/idea-usb (pi:pi 0755) at every boot via tmpfiles.d
+  print(chalk.blue('  - Installing /etc/tmpfiles.d/idea-usb.conf...'))
+  await exec`sudo install -o root -g root -m 0644 ${enginePath}/script/build_image_assets/idea-usb.tmpfiles.conf ${USB_TMPFILES_CONF}`
+  await exec`sudo systemd-tmpfiles --create ${USB_TMPFILES_CONF}`
+  // Per-Pi Engine keys: the forced command for peer keys and the sshd drop-in
+  await installPeerAccess(exec, enginePath)
+  // DHCP option 60 "idea-engine" (idea#209 D8). Here, not only in build-engine, so
+  // Engines installed before #216 get it from a normal update (idea#284). Idempotent;
+  // never restarts NM or touches a link. A failure is logged, not fatal: the fleet
+  // health check reports an Engine whose drop-in is missing.
+  await installDhcpVendorClass(exec, enginePath)
+  // Verify, so a broken install stops here and not at the first backup (exit 127)
+  try {
+    await exec`test -x ${BORG_PATH}`
+  } catch {
+    throw new Error(`${BORG_PATH} is still missing after installing borgbackup`)
+  }
+  const got = String((await exec`sudo -n ${APP_DATA_HELPER} version`)?.stdout ?? '').trim()
+  if (got !== `idea-app-data ${APP_DATA_HELPER_VERSION}`) {
+    throw new Error(`${APP_DATA_HELPER} reports '${got}' after install, expected 'idea-app-data ${APP_DATA_HELPER_VERSION}'`)
+  }
+  print(chalk.green(`  - root helpers OK: ${BORG_PATH}, ${got}`))
+}
+
+/** The sshd drop-in that adds the root-owned peer key file (per-Pi Engine keys). */
+export const PEER_SSHD_DROPIN = '/etc/ssh/sshd_config.d/10-idea-peer.conf'
+/** The helper's ledger of folders a peer's receive created (LEDGER_DIR in idea-app-data). */
+export const PEER_LEDGER_DIR = '/var/lib/idea-app-data'
+
+/**
+ * Per-Pi Engine keys (design-per-pi-engine-key.md), the root-owned parts. No key
+ * is installed here: each Engine makes its own at first start and the helper's
+ * sync-peers writes the peer files.
+ *   - /usr/local/sbin/idea-peer-gate: root-owned COPY, 0755 (the forced command of
+ *     every peer key line)
+ *   - /etc/ssh/idea_authorized_keys and /etc/idea: root 0755 (sync-peers writes
+ *     idea_authorized_keys/pi and /etc/idea/peer_known_hosts there)
+ *   - /var/lib/idea-app-data: root 0700 (the helper's receive ledger)
+ *   - /etc/ssh/sshd_config.d/10-idea-peer.conf: adds idea_authorized_keys/%u to
+ *     AuthorizedKeysFile. Checked with `sshd -t` (on failure it is removed again
+ *     and the build stops), then `sshd -T` must show it in effect, then sshd is
+ *     reloaded (open sessions stay).
+ */
+export const installPeerAccess = async (exec: any, enginePath: string) => {
+  print(chalk.blue('  - Installing idea-peer-gate and the sshd drop-in for peer Engine keys...'))
+  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-peer-gate ${PEER_GATE}`
+  await exec`sudo install -d -o root -g root -m 0755 ${path.dirname(PEER_AUTHORIZED_KEYS)} ${path.dirname(PEER_KNOWN_HOSTS)}`
+  await exec`sudo install -d -o root -g root -m 0700 ${PEER_LEDGER_DIR}`
+  await exec`sudo install -o root -g root -m 0644 ${enginePath}/script/build_image_assets/10-idea-peer.conf ${PEER_SSHD_DROPIN}`
+  try {
+    await exec`sudo /usr/sbin/sshd -t`
+  } catch (e) {
+    await exec`sudo rm -f ${PEER_SSHD_DROPIN}`
+    throw new Error(`sshd -t rejected the configuration with ${PEER_SSHD_DROPIN}; removed it again (peer Engine keys will not work): ${e}`)
+  }
+  const effective = await exec`sudo /usr/sbin/sshd -T -C user=pi,host=localhost,addr=127.0.0.1`
+  if (!/^authorizedkeysfile .*\/etc\/ssh\/idea_authorized_keys\/%u/m.test(String(effective?.stdout ?? ''))) {
+    print(chalk.red(`  - WARNING: sshd does not use /etc/ssh/idea_authorized_keys/%u: an earlier drop-in or sshd_config sets AuthorizedKeysFile first. Peer Engine keys will not work until it is fixed.`))
+  }
+  try {
+    await exec`sudo systemctl reload ssh`
+  } catch {
+    await exec`sudo systemctl reload sshd`
+  }
+  print(chalk.green(`  - ${PEER_GATE} and ${PEER_SSHD_DROPIN} installed; sshd reloaded`))
 }
 
 /**
@@ -8531,10 +13587,32 @@ export const installRaspAP = async (exec: any, enginePath: string) => {
   print(chalk.green('RaspAP installed'));
 }
 
+/** Pinned Tailscale static build (idea#322). Change both together; sha256 from pkgs.tailscale.com/<ver>.tgz.sha256, re-hashed locally. */
+export const TAILSCALE_VERSION = '1.104.2'
+export const TAILSCALE_ARM64_SHA256 = '5776aaa901b5ef1916e66be5bb54b9f481cd399c9c28db123a8cab620efa237b'
+
+/** bash run on the Pi: download the pinned arm64 tarball, check sha256, install the two binaries. */
+export const tailscaleDownloadScript = (version = TAILSCALE_VERSION, sha256 = TAILSCALE_ARM64_SHA256) => {
+  const f = `tailscale_${version}_arm64.tgz`
+  return `set -e; t=$(mktemp -d); curl -fsSL -o "$t/${f}" "https://pkgs.tailscale.com/stable/${f}"` +
+    ` && echo "${sha256}  $t/${f}" | sha256sum -c -` +
+    ` && sudo tar -xzf "$t/${f}" --strip-components=1 -C /usr/sbin "tailscale_${version}_arm64/tailscale" "tailscale_${version}_arm64/tailscaled"` +
+    ` && rm -rf "$t"`
+}
+
 /** Where installTailscale stores the auth key on the Pi (root-only, 0600). */
 export const TAILSCALE_AUTHKEY_PATH = '/etc/tailscale/debug-authkey'
 const TAILSCALE_AUTHKEY_DIR = '/etc/tailscale'
 const TAILSCALE_AUTHKEY_SECRETS_FILE = '/home/pi/openclaw/secrets/tailscale_authkey.txt'
+
+/**
+ * Removes TAILSCALE_AUTHKEY from this process's environment (and zx's $.env, which
+ * child commands inherit), so pm2 never sees it (idea#273).
+ */
+export const scrubTailscaleAuthKeyEnv = () => {
+  delete process.env.TAILSCALE_AUTHKEY
+  if ($.env && $.env !== process.env) delete $.env.TAILSCALE_AUTHKEY
+}
 
 /** TAILSCALE_AUTHKEY env var first, then the secrets file on the management Pi. */
 export const resolveTailscaleAuthKey = (): string | null => {
@@ -8589,6 +13667,9 @@ export const installTailscale = async (exec: any, enginePath: string) => {
   print(chalk.blue('Installing Tailscale (latent debug mode)...'))
 
   const authKey = resolveTailscaleAuthKey()
+  // The key is only for this step. Drop it from our environment now, so nothing
+  // started later (pm2 daemon, `pm2 start`, `pm2 save` → dump.pm2) inherits it (idea#273).
+  scrubTailscaleAuthKeyEnv()
 
   if (!authKey) {
     console.error(chalk.red(`installTailscale: no auth key found. Set TAILSCALE_AUTHKEY env var or ensure ${TAILSCALE_AUTHKEY_SECRETS_FILE} exists.`))
@@ -8601,11 +13682,8 @@ export const installTailscale = async (exec: any, enginePath: string) => {
     // The service is NOT enabled after installation.
     // The script is one interpolated (quoted) argument, so $TSVER is expanded by
     // the bash on the Pi, not by TypeScript or the local shell.
-    const downloadScript =
-      'TSVER=$(curl -sL https://pkgs.tailscale.com/stable/ | grep -oP \'tailscale_\\K[\\d.]+(?=_arm64.tgz)\' | head -1)' +
-      ' && curl -sL "https://pkgs.tailscale.com/stable/tailscale_${TSVER}_arm64.tgz"' +
-      ' | sudo tar -xz --strip-components=1 -C /usr/sbin' +
-      ' "tailscale_${TSVER}_arm64/tailscale" "tailscale_${TSVER}_arm64/tailscaled"'
+    // Pinned version + sha256 (idea#322); the build fails on a mismatch.
+    const downloadScript = tailscaleDownloadScript()
     await exec`bash -c ${downloadScript}`
 
     // 2. Install systemd service (disabled — does not start on boot)
@@ -8662,13 +13740,17 @@ export const installRSync = async (exec: any) => {
 export const PNPM_VERSION = '10.33.0'
 /** The Node.js version `n` installs for the Engine. */
 export const NODE_VERSION = '22.20.0'
+/** Pinned global npm tools (idea#322: no unpinned "latest" in a build). */
+export const N_VERSION = '11.0.0'
+export const PM2_VERSION = '7.1.1'
+export const PM2_LOGROTATE_VERSION = '3.0.0'
 
 export const installBaseNpm = async (exec: any) => {
   print(chalk.blue(`Installing base node ${NODE_VERSION}, n, npm and pnpm ${PNPM_VERSION} for script execution...`));
   try {
     await exec`sudo apt install npm -y`
     // Pinned pnpm, never latest (idea#146)
-    await exec`sudo npm install -g -y n pnpm@${PNPM_VERSION}`
+    await exec`sudo npm install -g -y n@${N_VERSION} pnpm@${PNPM_VERSION}`
     await exec`sudo n ${NODE_VERSION}`
   } catch (e) {
     print(chalk.red('Error installing base node, n, npm and pnpm...'));
@@ -8726,11 +13808,11 @@ export const configurePnpm = async (exec: any) => {
 export const installPm2 = async (exec: any, enginePath: string) => {
   print(chalk.blue('Installing pm2...'));
   try {
-    await exec`sudo npm install -g pm2`
+    await exec`sudo npm install -g pm2@${PM2_VERSION}`
     await exec`cd ${enginePath}`
     print(chalk.blue('Installing pm2-logrotate...'))
     // Install into pi's pm2 (no sudo), the same process list startEnginePM2 uses (idea#80).
-    await exec`cd ${enginePath} && pm2 install pm2-logrotate`
+    await exec`cd ${enginePath} && env -u TAILSCALE_AUTHKEY pm2 install pm2-logrotate@${PM2_LOGROTATE_VERSION}`
   } catch (e) {
     print(chalk.red('Error installing pm2'));
     console.error(e);
@@ -8741,7 +13823,8 @@ export const installPm2 = async (exec: any, enginePath: string) => {
 
 export const installEnginePM2 = async (exec: any, enginePath: string) => {
   print(chalk.blue('Installing the engine...'))
-  await exec`cd ${enginePath} && pnpm install_packages`
+  // Exactly the committed lockfile, never a re-resolve (idea#322)
+  await exec`cd ${enginePath} && pnpm install --frozen-lockfile`
 }
 
 export const buildEnginePM2 = async (exec: any, enginePath: string) => {
@@ -8764,23 +13847,20 @@ export const startEnginePM2 = async (exec: any, enginePath: string, permanentEng
 
       // Run pm2 as the pi user (no sudo) so the engine process is owned by pi.
       if (productionMode) {
-        await exec`cd ${permanentEnginePath} && pm2 start pm2.config.cjs --env production`
+        await exec`cd ${permanentEnginePath} && env -u TAILSCALE_AUTHKEY pm2 start pm2.config.cjs --env production`
       } else {
-        await exec`cd ${permanentEnginePath} && pm2 start pm2.config.cjs --env development`
+        await exec`cd ${permanentEnginePath} && env -u TAILSCALE_AUTHKEY pm2 start pm2.config.cjs --env development`
       }
       print(chalk.blue('Saving the pm2 process list...'))
-      await exec`pm2 save`
+      await exec`env -u TAILSCALE_AUTHKEY pm2 save`
       print(chalk.blue('Enabling pm2 to start on boot...'))
-      // Generate the startup command for the pi user and run it with sudo.
-      // pm2 startup outputs a line beginning with 'sudo env PATH=...' — extract and execute it.
-      const startupOutput = (await exec`pm2 startup systemd -u pi --hp /home/pi`).stdout
-      const startupCmd = startupOutput.split('\n').find((l: string) => l.trimStart().startsWith('sudo env PATH='))
-      if (startupCmd) {
-        await exec`${startupCmd.trim()}`
-      } else {
-        print(chalk.yellow('Could not extract pm2 startup command from output — run manually if needed'))
-        print(startupOutput)
-      }
+      // `pm2 startup` must run as root to write the systemd unit; run as pi it only
+      // prints this command and exits 1, which aborted build-engine on a fresh Pi
+      // (idea#273). The unit still runs the pm2 daemon as pi (-u pi --hp /home/pi).
+      const nodeBin = (await exec`dirname "$(command -v node)"`).stdout.trim()
+      const pm2Bin = (await exec`command -v pm2`).stdout.trim()
+      const userPath = (await exec`printf %s "$PATH"`).stdout.trim()
+      await exec`sudo env -u TAILSCALE_AUTHKEY PATH=${`${userPath}:${nodeBin}`} ${pm2Bin} startup systemd -u pi --hp /home/pi`
     }
   } catch (e) {
     print(chalk.red('Error starting the engine with pm2'));
@@ -8864,12 +13944,10 @@ export const buildAppsInfrastructure = async (exec: any) => {
 
 const installDocker = async (exec, enginePath, user) => {
 
-  // Run the install-docker.sh script
-  print(chalk.blue('Installing Docker'))
+  // Exact Docker debs from docker-pins.tsv, sha256-checked, cache first (idea#322)
+  print(chalk.blue('Installing Docker (pinned)'))
   try {
-    // Make the script executable
-    await exec`sudo chmod +x ${enginePath}/script/build_image_assets/install-docker.sh`;
-    await exec`sudo ${enginePath}/script/build_image_assets/install-docker.sh`;
+    await exec`sudo bash ${enginePath}/script/build_image_assets/install-docker-pinned.sh ${enginePath}`;
   } catch (e) {
     print(chalk.red('Error installing Docker'));
     console.error(e);
@@ -9025,6 +14103,10 @@ const startDockerEngine = async (exec: any, enginePath: string, productionMode: 
  * eraseDisk <targetId> <summaryTraceId> <confirmName…>
  * Uses a fakeable script runner for tests. Never formats the fleet test stick
  * in automated tests — success paths inject runEraseScript.
+ *
+ * Loop-backed duration slots (device idea-test-N under IDEA_DISKS_ROOT): erase
+ * goes through idea-app-data erase-slot (umount + mkfs.ext4 on the loop/image +
+ * remount). Production USB (/dev/sdX) still uses idea-erase-disk unchanged.
  */
 
 import os from 'os'
@@ -9032,7 +14114,7 @@ import path from 'path'
 import { $, chalk, fs, YAML } from 'zx'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Store } from './Store.js'
-import { Disk, diskMountRoot, processDisk, createOrUpdateDisk } from './Disk.js'
+import { Disk, diskPath, processDisk, createOrUpdateDisk } from './Disk.js'
 import { localEngineId, EraseInProgress } from './Engine.js'
 import { DiskID, EngineID, Timestamp } from './CommonTypes.js'
 import { resourceLock, diskKey, instanceKey } from '../utils/ResourceLock.js'
@@ -9040,17 +14122,33 @@ import { remountInstance, optedInInstances, ENGINE_STATE_DIR } from './FilesMoun
 import { shouldHoldFilesRemount } from './FilesMount.js'
 import { ContentSummary, readSummaryFromTrace, resolveSummaryTarget } from './SummariseDisk.js'
 import { refreshUnformattedDisks } from './UnformattedDisks.js'
-import { isSystemDevice, driveNameOf } from './SystemDisk.js'
+import { isSystemDevice, driveNameOf, bareDevice } from './SystemDisk.js'
 import { log, print, uuid } from '../utils/utils.js'
-import { disksRoot } from './Config.js'
+import { disksRoot, usbRoot } from './Config.js'
+import { APP_DATA_HELPER, eraseSlotArgs } from '../utils/appDataHelper.js'
+import { forgetMetaLook } from '../monitors/metaLookCache.js'
+
+/** Same pattern as TEST_DEVICE_PATTERN in usbDeviceMonitor (avoid a circular import). */
+export const SLOT_ERASE_DEVICE_PATTERN = /^idea-test-[0-9]+$/
+/** True when erase should use the loop-slot helper path, not idea-erase-disk. */
+export const isSlotEraseDevice = (device: string | null | undefined): boolean =>
+    !!device && SLOT_ERASE_DEVICE_PATTERN.test(device)
 
 export const ERASE_SCRIPT = '/usr/local/sbin/idea-erase-disk'
 export const ERASE_STAGING_ROOT = path.join(ENGINE_STATE_DIR, 'erase-staging')
 export const IDEA_DISK_LABEL = 'IDEA Disk'
+/** How long eraseDisk waits for the erased disk to be republished as empty after the add. */
+export const ERASE_REPUBLISH_WAIT_MS = 20_000
 
 /** Devices currently locked for erase; addDevice skips these. */
 const lockedDevices = new Set<string>()
 export const isEraseDeviceLocked = (device: string): boolean => lockedDevices.has(device)
+/**
+ * The addDevice guard (usbDeviceMonitor): a device, or its whole drive, that an erase holds is not
+ * mounted by udev / chokidar adds while it is being repartitioned.
+ */
+export const eraseLockRefusesAdd = (device: string): boolean =>
+    isEraseDeviceLocked(device) || isEraseDeviceLocked(driveNameOf(device.replace(/^\/dev\/(engine\/)?/, '')))
 export const eraseLockedDevicesForTests = (): Set<string> => lockedDevices
 
 export interface EraseScriptArgs {
@@ -9061,17 +14159,64 @@ export interface EraseScriptArgs {
     stagingDir: string
 }
 
+export interface EraseSlotArgs {
+    slot: string         // idea-test-N
+    stagingDir: string
+}
+
 export interface EraseOps {
     runScript: (args: EraseScriptArgs) => Promise<{ stdout: string }>
+    /** TEST-ONLY loop slot: sudo -n idea-app-data erase-slot <slot> <stagingDir> */
+    runSlotErase: (args: EraseSlotArgs) => Promise<{ stdout: string }>
     udevadmSettle: () => Promise<void>
     composeDownV: (instanceDir: string) => Promise<void>
     lsblkSizeSerial: (wholeDevice: string) => Promise<{ sizeBytes: number; serial: string | null }>
     addDevice: (devicePath: string) => Promise<void>
+    /** mountpoint -q; injectable so tests can simulate a still-mounted refusal */
+    isMountPoint: (mp: string) => Promise<boolean>
+    /** Mounted partitions of a whole device as [partition, mountpoint] (findmnt); injectable for tests */
+    mountedPartitions: (wholeDevice: string) => Promise<{ partition: string; mountpoint: string }[]>
+    /**
+     * Partitions in the on-disk partition table that the kernel does not show
+     * (root helper `idea-erase-disk --check-table`, read-only). Throws when the
+     * table can't be checked. Injectable for tests.
+     */
+    hiddenTablePartitions: (wholeDevice: string) => Promise<HiddenPartition[]>
+    /**
+     * Is this partition an EFI System Partition (GPT type C12A7328-..., or MBR type 0xef)?
+     * Throws when lsblk can't tell. Injectable for tests (#235).
+     */
+    isEspPartition: (partition: string) => Promise<boolean>
 }
+
+export interface HiddenPartition { partition: string; name: string | null }
+
+/** Parse `idea-erase-disk --check-table` output: lines "hidden: sda1 start=..., name=\"X\"". */
+export const parseHiddenPartitions = (stdout: string): HiddenPartition[] => {
+    const res: HiddenPartition[] = []
+    for (const line of stdout.split('\n')) {
+        const m = line.trim().match(/^hidden:\s+(\S+)(.*)$/)
+        if (!m) continue
+        const name = m[2].match(/name="([^"]*)"/)?.[1] ?? null
+        res.push({ partition: m[1], name: name || null })
+    }
+    return res
+}
+
+export const hiddenPartitionsMessage = (label: string, whole: string, hidden: HiddenPartition[]): string =>
+    `${label} is on /dev/${whole}, whose partition table also has ` +
+    `${hidden.map(h => h.name ? `${h.partition} ("${h.name}")` : h.partition).join(', ')}, ` +
+    `which this Pi does not show (not in lsblk). Erasing wipes the whole disk, so nothing was erased. ` +
+    `Unplug the disk and plug it in again, then check it.`
 
 const defaultOps: EraseOps = {
     runScript: async (a) => {
         const out = await $`sudo -n ${ERASE_SCRIPT} ${a.device} ${a.serial} ${String(a.sizeBytes)} ${a.label} ${a.stagingDir}`
+        return { stdout: out.stdout }
+    },
+    runSlotErase: async (a) => {
+        const argv = eraseSlotArgs(a.slot, a.stagingDir)
+        const out = await $`sudo -n ${APP_DATA_HELPER} ${argv[0]} ${argv[1]} ${argv[2]}`
         return { stdout: out.stdout }
     },
     udevadmSettle: async () => { await $`udevadm settle` },
@@ -9084,6 +14229,30 @@ const defaultOps: EraseOps = {
         return { sizeBytes: parseInt(size, 10) || 0, serial: serial || null }
     },
     addDevice: async () => { /* wired from usb monitor at runtime */ },
+    isMountPoint: async (mp) => (await $`mountpoint -q ${mp}`.nothrow()).exitCode === 0,
+    mountedPartitions: async (whole) => {
+        const out = (await $`findmnt -rn -o SOURCE,TARGET`.nothrow()).stdout
+        const res: { partition: string; mountpoint: string }[] = []
+        for (const line of out.split('\n')) {
+            const [src, target] = line.trim().split(/\s+/)
+            if (!src?.startsWith('/dev/') || !target) continue
+            const part = bareDevice(src)
+            if (part !== whole && driveNameOf(part) === whole) res.push({ partition: part, mountpoint: target.replace(/\\x20/g, ' ') })
+        }
+        return res
+    },
+    hiddenTablePartitions: async (whole) => {
+        const out = await $`sudo -n ${ERASE_SCRIPT} --check-table /dev/${whole}`.nothrow()
+        if (out.exitCode !== 0) {
+            throw new Error((out.stderr || out.stdout).trim() || `exit ${out.exitCode}`)
+        }
+        return parseHiddenPartitions(out.stdout)
+    },
+    isEspPartition: async (partition) => {
+        const out = await $`lsblk -dn -o PARTTYPE /dev/${partition}`.nothrow()
+        if (out.exitCode !== 0) throw new Error((out.stderr || out.stdout).trim() || `lsblk exit ${out.exitCode}`)
+        return isEspPartType(out.stdout)
+    },
 }
 
 let ops = defaultOps
@@ -9130,6 +14299,63 @@ const wholeDeviceOf = (device: string): string => {
 }
 
 /**
+ * Instances that live on ANOTHER disk but hold this disk open: a Files Disk
+ * bind-mounted through filesMounts (e.g. Nextcloud /files), or an app volume
+ * whose host path is under this disk's mount root. A running container keeps
+ * the block device busy, so wipefs fails with "Device or resource busy" and the
+ * fallback fails too. Erase refuses up front and names them instead.
+ * (Could be extended to stop them first if preferred.)
+ */
+/** Host paths of bind volumes in an instance's compose.yaml (absolute paths only). */
+export const composeVolumeHostPaths = async (store: Store, inst: { id: string; storedOn?: any }): Promise<string[]> => {
+    try {
+        const home = inst.storedOn ? store.diskDB[inst.storedOn as DiskID] : null
+        if (!home?.device) return []
+        const file = await diskPath(home, 'instances', inst.id, 'compose.yaml')
+        const doc = YAML.parse(await fs.readFile(file, 'utf8')) ?? {}
+        const out: string[] = []
+        for (const svc of Object.values<any>(doc.services ?? {})) {
+            for (const v of svc?.volumes ?? []) {
+                const src = typeof v === 'string' ? v.split(':')[0] : v?.source
+                if (typeof src === 'string' && src.startsWith('/')) out.push(path.normalize(src))
+            }
+        }
+        return out
+    } catch {
+        return []
+    }
+}
+
+export const instancesUsingDisk = async (
+    store: Store,
+    disk: Disk,
+    volumeHostPaths: (store: Store, inst: any) => Promise<string[]> = composeVolumeHostPaths,
+): Promise<{ id: string; name: string; via: 'filesMounts' | 'volume' }[]> => {
+    const out: { id: string; name: string; via: 'filesMounts' | 'volume' }[] = []
+    const mp = disk.device ? `${disksRoot()}/${disk.device}` : null
+    for (const inst of Object.values(store.instanceDB)) {
+        if (inst.storedOn === disk.id) continue // removed by the erase itself
+        const status = String(inst.status ?? '')
+        if (['Stopped', 'Undocked', 'Docked', 'Missing'].includes(status)) continue
+        if ((inst.filesMounts ?? []).includes(disk.id)) {
+            out.push({ id: inst.id, name: String(inst.name ?? inst.id), via: 'filesMounts' })
+            continue
+        }
+        if (mp) {
+            const paths = await volumeHostPaths(store, inst)
+            if (paths.some(p => p === mp || p.startsWith(mp + '/'))) {
+                out.push({ id: inst.id, name: String(inst.name ?? inst.id), via: 'volume' })
+            }
+        }
+    }
+    return out
+}
+
+export const instancesUsingDiskMessage = (label: string, users: { name: string; via: string }[]): string =>
+    `${label} is in use by ${users.map(u => `${u.name} (${u.via === 'filesMounts' ? 'Files mount' : 'app volume'})`).join(', ')}. ` +
+    `Stop ${users.length === 1 ? 'that instance' : 'those instances'} or remove the Files mount first; nothing was erased.`
+
+/**
  * Blockers: running backup, held instance lock, Nextcloud first-start/upgrade,
  * another erase in progress. Returns an error message or null.
  */
@@ -9158,6 +14384,16 @@ export const eraseBlocker = async (store: Store, disk: Disk | null): Promise<str
     return null
 }
 
+
+/** GPT EFI System Partition type GUID, or MBR partition type 0xef (#235). */
+export const isEspPartType = (partType: string): boolean => {
+    const t = partType.trim().toLowerCase()
+    return t === 'c12a7328-f81f-11d2-ba4b-00a0c93ec93b' || t === '0xef'
+}
+
+/** A teacher-stick mount (read-only, directly under the USB root, idea#193 §3.2). */
+const isUsbStickMount = (mountpoint: string): boolean => path.dirname(mountpoint) === usbRoot()
+
 export const eraseDisk = async (
     storeHandle: DocHandle<Store>,
     targetId: string,
@@ -9185,16 +14421,28 @@ export const eraseDisk = async (
 
     if (target.kind === 'disk') {
         disk = target.disk!
+        // The store record itself says "system disk": refuse whatever device name it carries.
+        // A stale record (device names swapped since it was written) must never send the wipe to
+        // the drive that now holds that name (found in the #278 hw round-trip on idea04).
+        if ((disk.diskTypes ?? []).includes('system') || `ENGINE_${disk.id}` === localEngineId) {
+            throw new Error(`${disk.name} is this Pi's system disk and cannot be erased.`)
+        }
         if (!disk.device) throw new Error(`${disk.name} is not docked.`)
         if (await isSystemDevice(disk.device)) throw new Error(`${disk.name} is this Pi's system disk and cannot be erased.`)
         devicePartition = disk.device
         whole = wholeDeviceOf(disk.device)
-        const info = await ops.lsblkSizeSerial(whole)
-        sizeBytes = info.sizeBytes
-        serial = info.serial ?? summary.serial ?? '-'
-        // Summary serial check when both known
-        if (summary.serial && info.serial && summary.serial !== info.serial) {
-            throw new Error(`The summary is for a different disk (serial mismatch). Check the disk again.`)
+        if (isSlotEraseDevice(disk.device)) {
+            // Loop slots have no /dev/<name> for lsblk; size/serial come from the summary.
+            sizeBytes = summary.sizeBytes
+            serial = summary.serial ?? '-'
+        } else {
+            const info = await ops.lsblkSizeSerial(whole)
+            sizeBytes = info.sizeBytes
+            serial = info.serial ?? summary.serial ?? '-'
+            // Summary serial check when both known
+            if (summary.serial && info.serial && summary.serial !== info.serial) {
+                throw new Error(`The summary is for a different disk (serial mismatch). Check the disk again.`)
+            }
         }
         keptId = disk.id
     } else {
@@ -9212,14 +14460,79 @@ export const eraseDisk = async (
     const blocker = await eraseBlocker(store, disk)
     if (blocker) throw new Error(blocker)
 
+    if (disk) {
+        const users = await instancesUsingDisk(storeHandle.doc()!, disk)
+        if (users.length > 0) throw new Error(instancesUsingDiskMessage(summary.label, users))
+    }
+
+    // Whole-device checks BEFORE any unmount or store change (#188): erase wipes the
+    // whole physical disk, so another mounted partition on it (e.g. sdb1 next to sdb2)
+    // or the system disk must refuse here, not after the target was undocked.
+    if (!isSlotEraseDevice(devicePartition ?? whole)) {
+        if (await isSystemDevice(whole)) throw new Error(`${summary.label} is on this Pi's system disk and cannot be erased.`)
+        // A read-only teacher stick under the USB root is not a blocker: it is unmounted
+        // below, before anything is wiped. But a mounted EFI System Partition means this is
+        // an OS disk, so refuse (#235, Steve). If the type can't be read, refuse too.
+        const mounted = (await ops.mountedPartitions(whole)).filter(m => m.partition !== devicePartition)
+        // Only stick mounts need the check: any other mounted sibling refuses below anyway.
+        for (const m of mounted.filter(x => isUsbStickMount(x.mountpoint))) {
+            let esp: boolean
+            try {
+                esp = await ops.isEspPartition(m.partition)
+            } catch (e: any) {
+                throw new Error(`Could not check the partition type of /dev/${m.partition} (${e.message ?? e}), so nothing was erased.`)
+            }
+            if (esp) {
+                throw new Error(
+                    `${summary.label} is on /dev/${whole}, which has an EFI System Partition (${m.partition} mounted at ${m.mountpoint}). ` +
+                    `That makes it an OS disk, so nothing was erased.`)
+            }
+        }
+        const siblings = mounted.filter(m => !isUsbStickMount(m.mountpoint))
+        if (siblings.length > 0) {
+            throw new Error(
+                `${summary.label} shares its physical disk (/dev/${whole}) with ${siblings.map(m => `${m.partition} mounted at ${m.mountpoint}`).join(', ')}. ` +
+                `Erasing wipes the whole disk, so nothing was erased.`)
+        }
+        // lsblk/findmnt only see partitions the kernel knows. A partition that is in
+        // the on-disk table but missing from /proc/partitions (idea01 sda1,
+        // 2026-10-15) would be wiped unseen, so read the table itself. Fail closed.
+        let hidden: HiddenPartition[]
+        try {
+            hidden = await ops.hiddenTablePartitions(whole)
+        } catch (e: any) {
+            throw new Error(`Could not check the partition table of /dev/${whole} (${e.message ?? e}), so nothing was erased.`)
+        }
+        if (hidden.length > 0) throw new Error(hiddenPartitionsMessage(summary.label, whole, hidden))
+    }
+
     setEraseStep(storeHandle, 'checking', targetId, summary.label)
     lockedDevices.add(whole)
     const stagingId = keptId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64) || uuid()
     const stagingDir = path.join(ERASE_STAGING_ROOT, stagingId)
     const removedInstances: { id: string; name: string; dataBytes: number }[] = []
+    let undocked = false
+    let erased = false
 
     try {
         setEraseStep(storeHandle, 'stopping and unmounting', targetId, summary.label)
+
+        // A teacher stick on this drive is mounted read-only under /run/idea-usb
+        // (idea#193 §3.5): unmount it first; nothing was written, so this is safe.
+        {
+            const { removeSticksOnDrive } = await import('./UsbSticks.js')
+            const gone = await removeSticksOnDrive(storeHandle, whole, 'erase requested')
+            if (gone.length) log(`eraseDisk: unmounted USB stick(s) ${gone.join(', ')} before erasing`)
+            // #235: the sibling check above let stick mounts through; never wipe one that is still mounted.
+            if (!isSlotEraseDevice(devicePartition ?? whole)) {
+                const left = (await ops.mountedPartitions(whole)).filter(m => m.partition !== devicePartition)
+                if (left.length > 0) {
+                    throw new Error(
+                        `${summary.label} shares its physical disk (/dev/${whole}) with ${left.map(m => `${m.partition} mounted at ${m.mountpoint}`).join(', ')}, ` +
+                        `which could not be unmounted. Erasing wipes the whole disk, so nothing was erased.`)
+                }
+            }
+        }
 
         if (disk) {
             // Recreate other-disk Files mounts without this bind (R1 / §7.3)
@@ -9236,8 +14549,7 @@ export const eraseDisk = async (
                     name: inst.name as string,
                     dataBytes: instSummary?.dataBytes ?? 0,
                 })
-                const mountRoot = await diskMountRoot(disk)
-                const instanceDir = path.join(mountRoot, 'instances', inst.id)
+                const instanceDir = await diskPath(disk, 'instances', inst.id)
                 try { await ops.composeDownV(instanceDir) } catch (e: any) {
                     log(`compose down -v for ${inst.id}: ${e.message ?? e}`)
                 }
@@ -9245,7 +14557,7 @@ export const eraseDisk = async (
             // Capture apps on this disk before undock
             const appIds = new Set<string>()
             try {
-                const appsRoot = path.join(await diskMountRoot(disk), 'apps')
+                const appsRoot = await diskPath(disk, 'apps')
                 for (const id of await fs.readdir(appsRoot)) appIds.add(id)
             } catch { /* */ }
             for (const inst of instances) appIds.add(inst.instanceOf)
@@ -9253,14 +14565,15 @@ export const eraseDisk = async (
             const { undockDisk } = await import('../monitors/usbDeviceMonitor.js')
             await undockDisk(storeHandle, disk)
 
-            // If still mounted, refuse
+            // USB: undock must have unmounted. Loop slots skip umount in testMode;
+            // erase-slot does the real umount — do not refuse here for slots.
             const mp = `${disksRoot()}/${devicePartition}`
-            const still = await $`mountpoint -q ${mp}`.nothrow()
-            if (still.exitCode === 0) {
-                // Restore
+            const slotErase = isSlotEraseDevice(devicePartition)
+            if (!slotErase && await ops.isMountPoint(mp)) {
                 await processDisk(storeHandle, disk).catch(() => {})
                 throw new Error(`${summary.label} couldn't be unmounted, so nothing was erased.`)
             }
+            undocked = true
 
             // Remove Disk entry and instances/apps from store
             storeHandle.change(doc => {
@@ -9299,14 +14612,32 @@ export const eraseDisk = async (
         }
         await fs.writeFile(path.join(stagingDir, 'META.yaml'), YAML.stringify(meta))
 
-        setEraseStep(storeHandle, 'partitioning', targetId, summary.label)
-        const scriptOut = await ops.runScript({
-            device: `/dev/${whole}`,
-            serial: serial || '-',
-            sizeBytes,
-            label: IDEA_DISK_LABEL,
-            stagingDir,
-        })
+        const slotErase = isSlotEraseDevice(devicePartition ?? whole)
+        setEraseStep(storeHandle, slotErase ? 'creating filesystem' : 'partitioning', targetId, summary.label)
+        let scriptOut: { stdout: string }
+        if (slotErase) {
+            try {
+                scriptOut = await ops.runSlotErase({
+                    slot: devicePartition ?? whole,
+                    stagingDir,
+                })
+            } catch (e) {
+                const mp = `${disksRoot()}/${devicePartition ?? whole}`
+                if (await ops.isMountPoint(mp)) {
+                    throw new Error(`${summary.label} couldn't be unmounted, so nothing was erased.`)
+                }
+                throw e
+            }
+        } else {
+            scriptOut = await ops.runScript({
+                device: `/dev/${whole}`,
+                serial: serial || '-',
+                sizeBytes,
+                label: IDEA_DISK_LABEL,
+                stagingDir,
+            })
+        }
+        erased = true
         // Parse STEP markers into eraseInProgress
         for (const line of scriptOut.stdout.split('\n')) {
             if (line.startsWith('STEP:')) {
@@ -9314,19 +14645,30 @@ export const eraseDisk = async (
                 if (step === 'creating filesystem') setEraseStep(storeHandle, 'creating filesystem', targetId, summary.label)
                 else if (step === 'mounting') setEraseStep(storeHandle, 'mounting', targetId, summary.label)
                 else if (step === 'partitioning') setEraseStep(storeHandle, 'partitioning', targetId, summary.label)
+                else if (step === 'unmounting') setEraseStep(storeHandle, 'stopping and unmounting', targetId, summary.label)
             }
         }
 
         setEraseStep(storeHandle, 'mounting', targetId, summary.label)
-        await ops.udevadmSettle()
-        const partition = `${whole}1`
-        // Engine mounts via addDevice
+        if (!slotErase) await ops.udevadmSettle()
+        // USB: partition is whole+1 (sdb → sdb1). Loop slots keep the slot name.
+        const partition = slotErase ? (devicePartition ?? whole) : `${whole}1`
+        // Engine mounts via addDevice (testMode slots: fixture already remounted by erase-slot)
         const add = addDeviceImpl ?? ops.addDevice
+        // The repartitioning is done: release the erase lock BEFORE the post-erase add. While the lock
+        // was held, addDevice refused both this add and the udev add event of the new partition
+        // ("Device sdb1 is locked for erase — addDevice skipped"). The disk then never came back, and
+        // the erase failed with "did not come back as empty" (wizardly-hugle 2026-10-12 18:46).
+        // The finally below still deletes the lock (idempotent) on every path.
+        lockedDevices.delete(whole)
+        // The erase wrote a new META.yaml: a META look the usb monitor cached before the erase must not decide this add
+        forgetMetaLook(partition)
         await add(`/dev/engine/${partition}`)
 
         // Wait briefly for the disk to appear as empty
         let published: Disk | undefined
-        for (let i = 0; i < 20; i++) {
+        // A USB first mount can take longer than the old 4 s: wait up to ERASE_REPUBLISH_WAIT_MS.
+        for (let i = 0; i < Math.ceil(ERASE_REPUBLISH_WAIT_MS / 200); i++) {
             const s = storeHandle.doc()!
             published = Object.values(s.diskDB).find(d => d.id === keptId && d.dockedTo === localEngineId)
             if (published && published.diskTypes?.includes('empty')) break
@@ -9347,6 +14689,17 @@ export const eraseDisk = async (
         print(chalk.green(`Erased ${summary.label} → empty IDEA disk ${keptId}`))
         return { diskId: keptId as DiskID, removedInstances }
     } catch (e) {
+        // Failed after the target was unmounted but before the erase ran (#188):
+        // mount it again and re-register it, so it reappears in the store.
+        if (undocked && !erased && devicePartition) {
+            try {
+                const add = addDeviceImpl ?? ops.addDevice
+                await add(`/dev/engine/${devicePartition}`)
+                log(`Erase of ${summary.label} failed after unmounting; ${devicePartition} was mounted and registered again`)
+            } catch (re: any) {
+                log(`Erase of ${summary.label} failed after unmounting and ${devicePartition} could not be mounted again: ${re?.message ?? re}`)
+            }
+        }
         throw e
     } finally {
         lockedDevices.delete(whole)
@@ -9467,7 +14820,16 @@ export const processFilesDisk = async (storeHandle: DocHandle<Store>, diskId: Di
     }
     storeHandle.change(doc => {
         const d = doc.diskDB[diskId]
-        if (d) d.filesConfig = filesConfig
+        if (!d) return
+        d.filesConfig = filesConfig
+        // Mark the Files role now, not only when processDisk finishes. processDisk
+        // writes diskTypes after the App role, which can take a long time (apps and
+        // instances). Until then the record had diskTypes [] (reset on dock), so
+        // mountableFilesDisks() skipped this disk: a Files remount set off by another
+        // disk docking at the same time, or an instance on this disk starting, built
+        // its override without this disk's files/ (startup remount race, 2026-10-15).
+        if (!d.diskTypes) d.diskTypes = ['files']
+        else if (!d.diskTypes.includes('files')) d.diskTypes.push('files')
     })
     if (filesConfig.passwordProtected) {
         log(`Files Disk ${diskId}: ${FILES_PASSWORD_ERROR}; not mounted`)
@@ -9513,13 +14875,14 @@ import { $, YAML, chalk, fs } from 'zx'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Store } from './Store.js'
 import type { App } from './App.js'
-import { diskMountRoot } from './Disk.js'
+import { diskMountRoot, diskPath, joinMountRoot } from './Disk.js'
 import type { Disk } from './Disk.js'
 import type { Instance, Status } from './Instance.js'
 import { DiskID, InstanceID } from './CommonTypes.js'
 import { localEngineId } from './Engine.js'
 import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
 import { log } from '../utils/utils.js'
+import { usbRoot } from './Config.js'
 
 /** Grouping window for runtime Files Disk docks (open Q2). Documented in ARCHITECTURE.md. */
 export const FILES_REMOUNT_GROUP_MS = 3_000
@@ -9534,6 +14897,51 @@ export interface AppFilesMount {
     path: string
     services: string[]
 }
+
+/**
+ * App.usbMount from x-app.usbMount (idea#193 §4): one static read-only bind of the
+ * Engine's USB root (/run/idea-usb) at `path` in each of `services`, with
+ * bind.propagation rslave so sticks mounted later appear without a recreate.
+ * `sync` (optional): the command the Engine runs with `docker exec` in
+ * <instanceId>-<service>-1 after each plug/unplug and at Engine start.
+ */
+export interface AppUsbMount {
+    path: string
+    services: string[]
+    sync: { service: string, user: string | null, command: string } | null
+}
+
+/** Default sync for an App binding into nextcloud-app (app-nextcloud#7 contract). */
+export const NEXTCLOUD_USB_SYNC = { service: 'nextcloud-app', user: 'www-data', command: '/idea/usb-sync.sh' } as const
+
+/** Parse x-app.usbMount; null when missing or invalid. */
+export const parseUsbMount = (xapp: any): AppUsbMount | null => {
+    const um = xapp?.usbMount
+    if (!um || typeof um !== 'object') return null
+    if (typeof um.path !== 'string' || !um.path.startsWith('/') || um.path.includes('..')) return null
+    if (!Array.isArray(um.services)) return null
+    const services = um.services.filter((s: unknown): s is string => typeof s === 'string' && s.length > 0)
+    if (services.length === 0) return null
+    let sync: AppUsbMount['sync'] = null
+    const sy = um.sync
+    if (sy && typeof sy === 'object' && typeof sy.command === 'string' && /^\/[A-Za-z0-9._\/-]+$/.test(sy.command)) {
+        const service = typeof sy.service === 'string' && sy.service ? sy.service : services[0]
+        const user = typeof sy.user === 'string' && /^[a-z_][a-z0-9_-]*$/.test(sy.user) ? sy.user : null
+        if (services.includes(service)) sync = { service, user, command: sy.command }
+    }
+    // app-nextcloud#7 declares no sync key: the Nextcloud contract is the default
+    if (!sync && !sy && services.includes(NEXTCLOUD_USB_SYNC.service)) sync = { ...NEXTCLOUD_USB_SYNC }
+    return { path: um.path, services: [...services], sync }
+}
+
+/** The usbMount bind entry for a compose override (long syntax). */
+export const usbBindEntry = (usbMount: AppUsbMount, hostRoot: string) => ({
+    type: 'bind',
+    source: hostRoot,
+    target: usbMount.path.replace(/\/$/, ''),
+    read_only: true,
+    bind: { create_host_path: false, propagation: 'rslave' },
+})
 
 export type RemountAction = 'up-d' | 'up-no-start' | 'skip' | 'hold'
 
@@ -9692,10 +15100,16 @@ export const shouldHoldFilesRemount = async (
 
 /** Build the compose override YAML (long bind syntax) and the display-name JSON. */
 export const buildOverride = (
-    filesMount: AppFilesMount,
+    filesMount: AppFilesMount | null,
     disks: { id: DiskID; shareName: string; hostFilesPath: string }[],
     displayJsonHost: string,
+    usb: { usbMount: AppUsbMount, hostRoot: string } | null = null,
 ): { yaml: string; display: Record<string, string> } => {
+    const services: Record<string, { volumes: any[] }> = {}
+    if (!filesMount) {
+        for (const s of usb!.usbMount.services) services[s] = { volumes: [usbBindEntry(usb!.usbMount, usb!.hostRoot)] }
+        return { yaml: YAML.stringify({ services }), display: {} }
+    }
     const display: Record<string, string> = {}
     const volumeEntries: any[] = []
     for (const d of disks) {
@@ -9716,9 +15130,13 @@ export const buildOverride = (
         read_only: true,
         bind: { create_host_path: false },
     })
-    const services: Record<string, { volumes: any[] }> = {}
     for (const s of filesMount.services) {
-        services[s] = { volumes: volumeEntries }
+        services[s] = { volumes: [...volumeEntries] }
+    }
+    if (usb) {
+        for (const s of usb.usbMount.services) {
+            services[s] = { volumes: [...(services[s]?.volumes ?? []), usbBindEntry(usb.usbMount, usb.hostRoot)] }
+        }
     }
     return { yaml: YAML.stringify({ services }), display }
 }
@@ -9730,8 +15148,15 @@ export const writeInstanceOverride = async (
     excludeDiskId?: DiskID,
 ): Promise<{ overridePath: string; diskIds: DiskID[] } | null> => {
     const app = store.appDB[instance.instanceOf]
-    if (!app?.filesMount) return null
+    if (!app?.filesMount && !app?.usbMount) return null
     await ensureEngineStateDir()
+    const usb = app.usbMount ? { usbMount: app.usbMount, hostRoot: usbRoot() } : null
+    if (!app.filesMount) {
+        const { yaml } = buildOverride(null, [], '', usb)
+        const overridePath = overridePathFor(instance.id)
+        await fs.writeFile(overridePath, yaml)
+        return { overridePath, diskIds: [] }
+    }
     const disks = mountableFilesDisks(store).filter(d => d.id !== excludeDiskId)
     const diskInfos: { id: DiskID; shareName: string; hostFilesPath: string }[] = []
     for (const d of disks) {
@@ -9739,11 +15164,11 @@ export const writeInstanceOverride = async (
         diskInfos.push({
             id: d.id,
             shareName: d.filesConfig!.shareName,
-            hostFilesPath: path.join(root, 'files'),
+            hostFilesPath: joinMountRoot(root, 'files'),
         })
     }
     const displayHost = displayJsonHostPath(instance.id)
-    const { yaml, display } = buildOverride(app.filesMount, diskInfos, displayHost)
+    const { yaml, display } = buildOverride(app.filesMount, diskInfos, displayHost, usb)
     await fs.writeFile(displayHost, JSON.stringify(display, null, 2) + '\n')
     const overridePath = overridePathFor(instance.id)
     await fs.writeFile(overridePath, yaml)
@@ -9812,7 +15237,7 @@ export const remountInstance = async (
             log(`Files remount of ${instanceId}: disk undocked or instance Undocked — skipping`)
             return 'skipped'
         }
-        const instanceDir = path.join(await diskMountRoot(disk), 'instances', instanceId)
+        const instanceDir = await diskPath(disk, 'instances', instanceId)
         const composeArgs = action === 'up-d' ? ['up', '-d'] : ['up', '--no-start', '--force-recreate']
         await ops().composeUp(instanceDir, written.overridePath, composeArgs)
         // filesMounts only after success (§7.3)
@@ -9917,6 +15342,776 @@ export const resetFilesRemountScheduleForTests = (): void => {
 
 ```
 
+## File: src/data/FlashCard.ts
+```typescript
+/**
+ * FlashCard.ts — flashCard, cancelFlash, initialiseDisk (idea#201 §10, Engine API contract v2)
+ *
+ *   flashCard <candidateId> <version|current> <confirmSizeBytes>
+ *   cancelFlash <operationId>
+ *   initialiseDisk <candidateId> [empty|files|backup]
+ *
+ * Refusals throw "CODE: text" (trace ends error, Console maps the code). Accepted work
+ * runs as an Operation (kind flashCard / initialiseDisk, subject {type:'disk', id: candidateId}).
+ * A flash runs in the background so the serial command queue stays free for cancelFlash;
+ * its Operation carries progress and ends Done with safeToRemove, or Failed "CODE: text"
+ * (a cancel ends Failed "CANCELLED: ..."; there is no Cancelled status, decision 1).
+ *
+ * Safety (§10): only a card in this Engine's current clientCards scan is a flash target;
+ * the root helper idea-flash-card re-checks everything itself (by-id re-resolve before and
+ * during the write, removable, not system/boot, nothing mounted, no IDEA META, image SHA,
+ * read-back SHA) and powers the card off. initialiseDisk is the only path that mounts an
+ * unknown disk read-write and writes META.yaml, and only after a read-only look found none.
+ */
+import path from 'path'
+import { spawn, ChildProcess } from 'child_process'
+import { $, fs, YAML } from 'zx'
+import { DocHandle } from '@automerge/automerge-repo'
+import { Store } from './Store.js'
+import { DeviceName, DiskID, DiskName, EngineID, Timestamp } from './CommonTypes.js'
+import { localEngineId } from './Engine.js'
+import { createOperation, updateOperation } from './Operations.js'
+import { refreshClientCards, ScannedCard, ScanResult, NewDisk, setClientCardProbes } from './ClientCards.js'
+import { refreshClientImages, imagePathOf, resolveImage } from './ClientImages.js'
+import { attachTraceResult } from './SummariseDisk.js'
+import { getActiveTrace } from '../utils/CommandLogger.js'
+import { isSystemDevice } from './SystemDisk.js'
+import { ENGINE_STATE_DIR } from './FilesMount.js'
+import { lookForIdeaMeta, safeMount, mountPointOf, unmountAndRemove } from '../monitors/mounts.js'
+import { forgetMetaLook } from '../monitors/metaLookCache.js'
+import { log, print, uuid } from '../utils/utils.js'
+import { hostIdentity } from './HostIdentity.js'
+import { readEngineTimezone, validateClientTimezone, ZONEINFO_DIR } from './ClientTimezone.js'
+
+export const FLASH_HELPER = '/usr/local/sbin/idea-flash-card'
+export const FLASH_LOG = path.join(ENGINE_STATE_DIR, 'flash.log')
+export const FLASH_STEPS = ['checking', 'verifying-image', 'writing', 'reading-back', 'flushing', 'powering-off'] as const
+export type FlashStep = typeof FLASH_STEPS[number]
+export const INITIALISE_ROLES = ['empty', 'files', 'backup'] as const
+export type InitialiseRole = typeof INITIALISE_ROLES[number]
+
+export interface FlashInProgress { operationId: string; candidateId: string; version: string; step: FlashStep }
+
+export class CardError extends Error {
+    constructor(public code: string, text: string) { super(`${code}: ${text}`) }
+}
+
+export interface FlashHelperArgs {
+    byId: string; device: string; sizeBytes: number; image: string; sha256: string
+    /** idea#303: partitions with an OS rootfs layout (hasOsRootfsLayout); a META.yaml there does not block the flash */
+    osRootfsPartitions: string[]
+    /** idea#208: the Engine's own validated tz name → idea-timezone.txt on the card; absent: no file (client stays UTC) */
+    timezone?: string
+    /** idea#203 §2: the home-Engine name (bare hostname) → idea-home.txt "<name>.local\n"; absent: no file */
+    home?: string
+}
+
+export interface FlashCardOps {
+    helperInstalled: () => boolean
+    spawnHelper: (a: FlashHelperArgs) => ChildProcess
+    scan: (h: DocHandle<Store>) => Promise<ScanResult>
+    images: (h: DocHandle<Store>) => ReturnType<typeof refreshClientImages>
+    appendFlashLog: (line: string) => Promise<void>
+    isSystemDevice: (d: string) => Promise<boolean>
+    /** ro look for META (rule 1); never rw */
+    lookForMeta: (partition: string) => ReturnType<typeof lookForIdeaMeta>
+    mountRw: (partition: string) => ReturnType<typeof safeMount>
+    writeMeta: (partition: string, yaml: string) => Promise<void>
+    /** Forget the usb monitor's cached ro META look, so addDevice sees the new META.yaml */
+    forgetMetaLook: (partition: string) => void
+    /** The usb monitor's addDevice (registers the now-IDEA disk) */
+    addDevice: (partition: string) => Promise<void>
+    /** Unmount the rw mount this command made and remove the mount point (never rm -fr) */
+    unmount: (partition: string) => Promise<{ ok: boolean; message?: string }>
+    createFilesDisk: (h: DocHandle<Store>, diskId: string) => Promise<unknown>
+    createBackupDisk: (h: DocHandle<Store>, diskId: string) => Promise<unknown>
+    now: () => number
+    /** idea#208: the Engine's own time zone (timedatectl, as pi) */
+    engineTimezone: () => Promise<string>
+    zoneinfoDir: string
+    /** `sudo -n idea-flash-card --version` → its protocol number; null when unknown or the probe fails */
+    helperVersion: () => Promise<number | null>
+    /** This Engine's bare hostname (the client's home Engine) */
+    homeEngineName: (h: DocHandle<Store>) => string
+}
+
+let addDeviceImpl: ((p: string) => Promise<void>) | null = null
+export const setInitialiseAddDevice = (fn: ((p: string) => Promise<void>) | null): void => { addDeviceImpl = fn }
+
+const defaultOps: FlashCardOps = {
+    helperInstalled: () => { try { fs.accessSync(FLASH_HELPER, fs.constants.X_OK); return true } catch { return false } },
+    spawnHelper: (a) => spawn('sudo', ['-n', FLASH_HELPER, '--by-id', a.byId, '--expect-device', a.device,
+        '--expect-size', String(a.sizeBytes), '--image', a.image, '--sha256', a.sha256,
+        ...a.osRootfsPartitions.flatMap(p => ['--os-rootfs', p]),
+        ...(a.timezone ? ['--timezone', a.timezone] : []),
+        ...(a.home ? ['--home', a.home] : [])], { stdio: ['ignore', 'pipe', 'pipe'] }),
+    scan: (h) => refreshClientCards(h),
+    images: (h) => refreshClientImages(h),
+    appendFlashLog: async (line) => { await fs.ensureDir(path.dirname(FLASH_LOG)); await fs.appendFile(FLASH_LOG, line + '\n') },
+    isSystemDevice: (d) => isSystemDevice(d),
+    lookForMeta: (p) => lookForIdeaMeta(p),
+    mountRw: (p) => safeMount(p),
+    writeMeta: async (p, yaml) => {
+        const r = await $({ input: yaml })`sudo -n /usr/bin/tee ${mountPointOf(p)}/META.yaml`.nothrow()
+        if (r.exitCode !== 0) throw new Error(`could not write META.yaml on ${p}: ${r.stderr.trim()}`)
+    },
+    forgetMetaLook: (p) => forgetMetaLook(p),
+    addDevice: async (p) => { if (!addDeviceImpl) throw new Error('usb monitor not running'); await addDeviceImpl(`/dev/engine/${p}`) },
+    unmount: (p) => unmountAndRemove(p),
+    createFilesDisk: async (h, id) => (await import('./CreateFilesDisk.js')).createFilesDisk(h, id),
+    createBackupDisk: async (h, id) => {
+        const disk = h.doc()?.diskDB?.[id as DiskID]
+        if (!disk) throw new Error(`disk ${id} is not in the store`)
+        return (await import('../monitors/backupMonitor.js')).createBackupDiskConfig(h, disk as any, 'on-demand' as any, [])
+    },
+    now: () => Date.now(),
+    engineTimezone: () => readEngineTimezone(),
+    zoneinfoDir: ZONEINFO_DIR,
+    helperVersion: async () => {
+        const r = await $`sudo -n ${FLASH_HELPER} --version`.nothrow().quiet()
+        return r.exitCode === 0 ? parseFlashHelperVersion(r.stdout) : null
+    },
+    homeEngineName: (h) => { const d = h.doc(); return d ? hostIdentity(d).hostname : '' },
+}
+let ops: FlashCardOps = defaultOps
+export const setFlashCardOpsForTests = (o: Partial<FlashCardOps> | null): void => { ops = o ? { ...defaultOps, ...o } : defaultOps }
+
+/** idea#208: --timezone needs idea-flash-card v3 or later */
+export const FLASH_HELPER_TIMEZONE_MIN = 3
+/** idea#203 §2: --home needs idea-flash-card v4 or later */
+export const FLASH_HELPER_HOME_MIN = 4
+/** Same rule as idea-write-home-engine and the client's idea-home-engine boot step */
+export const HOME_ENGINE_NAME_RE = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/
+/** Parse "idea-flash-card <N>" (the helper's --version line); null for anything else. */
+export const parseFlashHelperVersion = (out: string): number | null => {
+    const m = /^idea-flash-card ([0-9]{1,6})$/.exec(String(out ?? '').trim())
+    return m ? Number(m[1]) : null
+}
+
+// ── Busy state (one flash / initialise per Engine) ───────────────────────────
+const running = new Map<string, { proc: ChildProcess | null; cancelled: boolean; kind: 'flashCard' | 'initialiseDisk' }>()
+export const cardOperationRunning = (): boolean => running.size > 0
+export const clearFlashStateForTests = (): void => { running.clear() }
+setClientCardProbes({ busy: () => cardOperationRunning(), helperInstalled: () => ops.helperInstalled() })
+
+const engineBusyReason = (store: Store | undefined, engineId: string): string | null => {
+    const e: any = store?.engineDB?.[engineId as EngineID]
+    if (running.size) return 'another flash or initialise is running on this Engine'
+    if (e?.flashInProgress) return 'a flash is running on this Engine'
+    if (e?.eraseInProgress) return 'an erase is running on this Engine'
+    return null
+}
+
+const setFlashInProgress = (h: DocHandle<Store>, v: FlashInProgress | null) => {
+    h.change(doc => { const e: any = doc.engineDB[localEngineId]; if (e) e.flashInProgress = v })
+}
+
+/** Parse a helper stderr line "refused: CODE: text" / "failed: CODE: text". */
+export const parseHelperError = (stderr: string): { code: string; text: string } => {
+    const lines = stderr.trim().split('\n').reverse()
+    for (const l of lines) {
+        const m = /^(?:refused|failed):\s*([A-Z][A-Z0-9_]+):\s*(.*)$/.exec(l.trim())
+        if (m) return { code: m[1], text: m[2] }
+    }
+    return { code: 'WRITE_FAILED', text: stderr.trim().split('\n').pop() || 'flash helper failed without a message' }
+}
+
+export interface FlashResult {
+    candidateId: string; byId: string; version: string; sha256: string
+    bytesWritten: number; readBackSha256: string | null; durationMs: number; safeToRemove: boolean
+}
+
+// ── flashCard ────────────────────────────────────────────────────────────────
+
+/**
+ * Checks, then starts the flash and returns { operationId, done }. Refusals throw CardError
+ * before any Operation is created. `done` settles when the helper exits (never rejects).
+ */
+export const flashCard = async (
+    storeHandle: DocHandle<Store>, candidateId: string, versionArg: string, confirmSizeArg: string,
+): Promise<{ operationId: string; done: Promise<FlashResult | null> }> => {
+    if (!candidateId || !versionArg || !/^[0-9]+$/.test(confirmSizeArg ?? '')) {
+        throw new CardError('BAD_ARGS', 'usage: flashCard <candidateId> <version|current> <confirmSizeBytes>')
+    }
+    const confirmSize = Number(confirmSizeArg)
+    const busy = engineBusyReason(storeHandle.doc(), String(localEngineId))
+    if (busy) throw new CardError('BUSY', busy)
+    const scan = await ops.scan(storeHandle)
+    const card: ScannedCard | undefined = scan.clientCards.find(c => c.candidateId === candidateId)
+    if (!card) {
+        if (scan.newDisks.some(d => d.candidateId === candidateId)) throw new CardError('NOT_REMOVABLE', `${candidateId} is not a removable card`)
+        throw new CardError('NOT_FOUND', `card ${candidateId} is not present on this Engine`)
+    }
+    if (await ops.isSystemDevice(card.device)) throw new CardError('SYSTEM_DISK', `${card.device} is this Pi's system disk`)
+    if (card.refusal) throw new CardError(card.refusal, `card ${candidateId} cannot be flashed now (${card.refusal}${card.mountpoints.length ? `: ${card.mountpoints.join(', ')}` : ''})`)
+    if (!ops.helperInstalled()) throw new CardError('HELPER_MISSING', `${FLASH_HELPER} is not installed`)
+    if (card.sizeBytes !== confirmSize) throw new CardError('SIZE_CHANGED', `card size is ${card.sizeBytes}, the dialog showed ${confirmSize}`)
+    if (!card.byId || !card.byId.startsWith('/dev/disk/by-id/usb-')) throw new CardError('NOT_REMOVABLE', `${card.device} has no USB by-id link`)
+    const imgs = await ops.images(storeHandle)
+    const r = resolveImage(imgs, versionArg)
+    if (!r.ok) throw new CardError(r.code, r.text)
+    const image = r.image
+    if (image.imageSizeBytes != null && image.imageSizeBytes > card.sizeBytes) {
+        throw new CardError('IMAGE_TOO_LARGE', `image needs ${image.imageSizeBytes} bytes, the card has ${card.sizeBytes}`)
+    }
+
+    // idea#303: an old Engine system disk (OS rootfs + META.yaml, e.g. a retired Engine stick) may be
+    // reflashed. Same read-only look and rootfs rule as adoption (lookForIdeaMeta / hasOsRootfsLayout,
+    // idea#279); the helper still refuses META.yaml on every partition not named here.
+    const osRootfsPartitions: string[] = []
+    for (const p of card.ext4PartitionNames.filter(n => /^sd[a-z][12]$/.test(n))) {
+        const look = await ops.lookForMeta(p)
+        if (look.ok && look.osRootfs) osRootfsPartitions.push(p)
+    }
+
+    // idea#208: pass the Engine's own zone; an empty or invalid one is skipped (logged), never fatal
+    // Version gate: an older helper refuses the unknown --timezone with BAD_ARGS, so never pass it there.
+    const helperVersion = await ops.helperVersion().catch(() => null)
+    let timezone: string | undefined
+    if (helperVersion == null || helperVersion < FLASH_HELPER_TIMEZONE_MIN) {
+        print(`flashCard: idea-timezone.txt skipped: ${FLASH_HELPER} is too old (version ${helperVersion ?? 'unknown'}, needs >= ${FLASH_HELPER_TIMEZONE_MIN}); the client stays on UTC`)
+    } else {
+        const tz = validateClientTimezone(await ops.engineTimezone().catch(() => ''), ops.zoneinfoDir)
+        timezone = tz.ok ? tz.zone : undefined
+        if (!tz.ok) log(`flashCard: idea-timezone.txt skipped (${tz.reason}); the client stays on UTC`)
+    }
+
+    let home: string | undefined
+    if (helperVersion == null || helperVersion < FLASH_HELPER_HOME_MIN) {
+        print(`flashCard: idea-home.txt skipped: ${FLASH_HELPER} is too old (version ${helperVersion ?? 'unknown'}, needs >= ${FLASH_HELPER_HOME_MIN}); the client has no home Engine`)
+    } else {
+        let name = ''
+        try { name = ops.homeEngineName(storeHandle) } catch { name = '' }
+        if (HOME_ENGINE_NAME_RE.test(name)) home = name
+        else print(`flashCard: idea-home.txt skipped: '${name}' is not a valid Engine name; the client has no home Engine`)
+    }
+
+    const traceId = getActiveTrace()?.traceId
+    const opId = createOperation(storeHandle, 'flashCard',
+        { candidateId, version: image.version, confirmSizeBytes: String(confirmSize) }, 'console-command', { type: 'disk', id: candidateId })
+    const started = ops.now()
+    const entry = { proc: null as ChildProcess | null, cancelled: false, kind: 'flashCard' as const }
+    running.set(opId, entry)
+    updateOperation(storeHandle, opId, { status: 'Running', currentStep: 0, totalSteps: FLASH_STEPS.length, stepLabel: 'checking' })
+    setFlashInProgress(storeHandle, { operationId: opId, candidateId, version: image.version, step: 'checking' })
+    refreshClientCards(storeHandle).catch(() => {})   // show BUSY now, not at the next poll
+    print(`Flashing ${image.fileName} to ${card.device} (${card.byId}, ${card.sizeBytes} bytes), operation ${opId}`)
+
+    const done = new Promise<FlashResult | null>((resolve) => {
+        let proc: ChildProcess
+        try {
+            proc = ops.spawnHelper({ byId: card.byId!, device: card.device, sizeBytes: card.sizeBytes, image: imagePathOf(image.version), sha256: image.sha256, osRootfsPartitions, timezone, home })
+        } catch (e) {
+            finish(null, { code: 'HELPER_MISSING', text: String(e) }); return
+        }
+        entry.proc = proc
+        let out = '', err = '', lastStep: FlashStep = 'checking', lastPct = -1
+        let final: any = null
+        proc.stdout?.on('data', (b: Buffer) => {
+            out += b.toString()
+            let i
+            while ((i = out.indexOf('\n')) >= 0) {
+                const line = out.slice(0, i); out = out.slice(i + 1)
+                let j: any
+                try { j = JSON.parse(line) } catch { continue }
+                if (j.result) { final = j; continue }
+                const step = j.step as FlashStep
+                const idx = FLASH_STEPS.indexOf(step)
+                if (idx < 0) continue
+                const pct = j.total > 0 ? Math.min(100, Math.floor((j.bytes / j.total) * 100)) : null
+                if (step !== lastStep) {
+                    lastStep = step
+                    updateOperation(storeHandle, opId, { currentStep: idx, totalSteps: FLASH_STEPS.length, stepLabel: step, progressPercent: pct })
+                    setFlashInProgress(storeHandle, { operationId: opId, candidateId, version: image.version, step })
+                } else if (pct != null && pct !== lastPct && Math.floor(pct / 5) !== Math.floor(Math.max(lastPct, 0) / 5)) {
+                    // Store design 2026-10-13 drops progress-only patches; a flash stores its
+                    // progress in 5 % steps (≤ 20 changes per step) by repeating currentStep.
+                    updateOperation(storeHandle, opId, { currentStep: idx, progressPercent: pct })
+                }
+                if (pct != null) lastPct = pct
+            }
+        })
+        proc.stderr?.on('data', (b: Buffer) => { err += b.toString() })
+        proc.on('error', (e) => finish(null, { code: 'HELPER_MISSING', text: e.message }))
+        proc.on('close', (code) => {
+            if (code === 0 && final?.result === 'ok') finish(final, null)
+            else if (entry.cancelled) finish(null, { code: 'CANCELLED', text: 'flash cancelled; the card is wiped or incomplete — flash it again before use' })
+            else finish(null, parseHelperError(err || `helper exited with code ${code}`))
+        })
+
+        let settled = false
+        function finish(ok: any, failure: { code: string; text: string } | null) {
+            if (settled) return
+            settled = true
+            running.delete(opId)
+            const durationMs = ops.now() - started
+            const safe = ok ? ok.safeToRemove === true : false
+            const result: FlashResult = {
+                candidateId, byId: card!.byId!, version: image.version, sha256: image.sha256,
+                bytesWritten: ok ? Number(ok.bytesWritten) || 0 : 0, readBackSha256: ok?.readBackSha256 ?? null, durationMs, safeToRemove: safe,
+            }
+            if (ok) {
+                if (ok.timezoneFile === 'failed') log(`Flash ${opId}: idea-timezone.txt could not be written (${(err.match(/^warning: TIMEZONE_FAILED: (.*)$/m) ?? [])[1] ?? 'no detail'}); the client stays on UTC`)
+                else if (ok.timezoneFile === 'written') log(`Flash ${opId}: idea-timezone.txt = ${timezone}`)
+                if (ok.homeFile === 'failed') print(`Flash ${opId}: idea-home.txt could not be written (${(err.match(/^warning: HOME_FAILED: (.*)$/m) ?? [])[1] ?? 'no detail'}); the client has no home Engine`)
+                else if (ok.homeFile === 'written') log(`Flash ${opId}: idea-home.txt = ${home}.local`)
+                updateOperation(storeHandle, opId, {
+                    status: 'Done', completedAt: ops.now() as Timestamp, progressPercent: 100, safeToRemove: safe,
+                    error: safe ? null : 'POWER_OFF_FAILED: the card was written but could not be switched off — eject it before removing it',
+                })
+            } else {
+                updateOperation(storeHandle, opId, { status: 'Failed', completedAt: ops.now() as Timestamp, error: `${failure!.code}: ${failure!.text}`, safeToRemove: false })
+            }
+            setFlashInProgress(storeHandle, null)
+            if (traceId) attachTraceResult(ok ? result : { ...result, error: `${failure!.code}: ${failure!.text}` }, traceId)
+            const line = JSON.stringify({ at: new Date(ops.now()).toISOString(), operationId: opId, traceId: traceId ?? null,
+                result: ok ? (safe ? 'ok' : 'POWER_OFF_FAILED') : failure!.code, version: image.version, sha256: image.sha256,
+                byId: card!.byId, device: card!.device, sizeBytes: card!.sizeBytes, bytesWritten: result.bytesWritten, durationMs,
+                timezone: timezone ?? null, timezoneFile: ok ? (ok.timezoneFile ?? null) : null,
+                home: home ?? null, homeFile: ok ? (ok.homeFile ?? null) : null })
+            ops.appendFlashLog(line).catch(e => log(`flash.log: ${e}`))
+            log(ok ? `Flash ${opId} done (safeToRemove=${safe})` : `Flash ${opId} failed: ${failure!.code}: ${failure!.text}`)
+            refreshClientCards(storeHandle).catch(() => {})
+            resolve(ok ? result : null)
+        }
+    })
+    return { operationId: opId, done }
+}
+
+/** cancelFlash <operationId>: allowed while the write has not finished (before reading-back). */
+export const cancelFlash = (storeHandle: DocHandle<Store>, operationId: string): void => {
+    const op = storeHandle.doc()?.operationDB?.[operationId]
+    const entry = running.get(operationId)
+    if (!op || op.kind !== 'flashCard') throw new CardError('NOT_FOUND', `no flash operation ${operationId}`)
+    if (!entry || op.status !== 'Running') throw new CardError('NOT_FOUND', `flash ${operationId} is not running (${op.status})`)
+    const step = op.stepLabel as FlashStep | null
+    if (step && FLASH_STEPS.indexOf(step) > FLASH_STEPS.indexOf('writing')) {
+        throw new CardError('BUSY', `flash ${operationId} has finished writing (${step}); it cannot be cancelled now`)
+    }
+    entry.cancelled = true
+    entry.proc?.kill('SIGTERM')
+    print(`Cancel sent to flash ${operationId}`)
+}
+
+// ── initialiseDisk ───────────────────────────────────────────────────────────
+
+/**
+ * initialiseDisk failure cleanup: unmount the rw mount initialiseDisk made, unless a disk
+ * record on this Engine uses the partition (then it is a docked disk and is left alone).
+ * Never throws; a failed unmount is logged and the mount is left as it is.
+ */
+const releaseRwMount = async (storeHandle: DocHandle<Store>, partition: string): Promise<void> => {
+    const inUse = Object.values(storeHandle.doc()?.diskDB ?? {})
+        .some((d: any) => d?.device === partition && d?.dockedTo === localEngineId)
+    if (inUse) { log(`initialiseDisk: ${partition} failed to register but a disk record uses it; left mounted`); return }
+    try {
+        const r = await ops.unmount(partition)
+        log(r.ok ? `initialiseDisk: unmounted ${partition} after the failed registration`
+            : `initialiseDisk: could not unmount ${partition} after the failed registration: ${r.message}`)
+    } catch (e) {
+        log(`initialiseDisk: could not unmount ${partition} after the failed registration: ${e instanceof Error ? e.message : String(e)}`)
+    }
+    // The next add of this partition must look again (it now has META.yaml)
+    ops.forgetMetaLook(partition)
+}
+
+export const initialiseDisk = async (
+    storeHandle: DocHandle<Store>, candidateId: string, roleArg: string = 'empty',
+): Promise<{ operationId: string; diskId: string; partition: string }> => {
+    const role = (roleArg || 'empty') as InitialiseRole
+    if (!candidateId || !INITIALISE_ROLES.includes(role)) throw new CardError('BAD_ARGS', 'usage: initialiseDisk <candidateId> [empty|files|backup]')
+    const busy = engineBusyReason(storeHandle.doc(), String(localEngineId))
+    if (busy) throw new CardError('BUSY', busy)
+    const scan = await ops.scan(storeHandle)
+    const disk: NewDisk | undefined = scan.newDisks.find(d => d.candidateId === candidateId)
+    if (!disk) {
+        if (scan.clientCards.some(c => c.candidateId === candidateId)) throw new CardError('NOT_FOUND', `${candidateId} is a client card; cards are flashed, not initialised`)
+        throw new CardError('NOT_FOUND', `disk ${candidateId} is not a new disk on this Engine`)
+    }
+    if (await ops.isSystemDevice(disk.device)) throw new CardError('SYSTEM_DISK', `${disk.device} is this Pi's system disk`)
+    const unformatted = (storeHandle.doc()?.engineDB?.[localEngineId]?.unformattedDisks ?? []).some(u => u?.candidateId === candidateId)
+    const names = scan.newDiskPartitions?.[candidateId] ?? []
+    const ext4 = disk.partitions.map((p, i) => ({ ...p, name: names[i] ?? `${disk.device}${i + 1}` })).filter(p => p.fsType === 'ext4')
+    if (unformatted || ext4.length === 0) throw new CardError('NOT_EXT4', `${disk.device} has no ext4 partition; erase it first, then initialise it`)
+    const target = ext4.find(p => /^sd[a-z][12]$/.test(p.name))
+    if (!target) throw new CardError('NOT_EXT4', `${disk.device}: only partition 1 or 2 can become an IDEA disk`)
+    const mounted = scan.newDisks.find(d => d.candidateId === candidateId)?.mountedReadOnly
+    if (mounted) throw new CardError('MOUNTED', `${disk.device} is mounted`)
+
+    const opId = createOperation(storeHandle, 'initialiseDisk', { candidateId, role }, 'console-command', { type: 'disk', id: candidateId })
+    running.set(opId, { proc: null, cancelled: false, kind: 'initialiseDisk' })
+    // Set once this command has mounted the partition read-write itself; cleared once the disk is registered
+    let mountedHere = false
+    let registered = false
+    let diskId: DiskID | null = null
+    const fail = (code: string, text: string): never => {
+        updateOperation(storeHandle, opId, { status: 'Failed', completedAt: ops.now() as Timestamp, error: `${code}: ${text}` })
+        throw new CardError(code, text)
+    }
+    try {
+        updateOperation(storeHandle, opId, { status: 'Running', currentStep: 0, totalSteps: 3, stepLabel: 'checking' })
+        const look = await ops.lookForMeta(target.name)
+        if (!look.ok) fail('MOUNTED', look.message)
+        if (look.ok && look.osRootfs) fail('OS_ROOTFS', `${target.name} holds an operating system (etc/os-release + usr/ or boot/); it cannot become an IDEA disk in place — flash it instead`)
+        if (look.ok && look.hasMeta) fail('ALREADY_IDEA', `${target.name} already has an IDEA META.yaml`)
+        // #236 (Steve): a root-owned ext4 that already holds data is not a blank disk. Initialise
+        // never wipes, and never claims someone's data without an explicit erase first.
+        if (look.ok && look.contents?.rootOwned && look.contents.entries.length > 0) {
+            const e = look.contents.entries
+            const shown = e.slice(0, 5).join(', ') + (e.length > 5 ? `, … (${e.length} entries)` : '')
+            fail('NOT_EMPTY', `${target.name} is not empty: found ${shown} in its root. Initialise only takes an empty disk; erase it first if its contents can go`)
+        }
+        updateOperation(storeHandle, opId, { currentStep: 1, stepLabel: 'writing META.yaml' })
+        const m = await ops.mountRw(target.name)
+        if (!m.ok) fail('MOUNTED', m.message)
+        mountedHere = m.ok && !m.alreadyMounted
+        diskId = uuid() as DiskID
+        const meta = { diskId, diskName: 'IDEA Disk' as DiskName, isHardwareId: false, created: ops.now(), version: '1.0' }
+        await ops.writeMeta(target.name, YAML.stringify(meta))
+        updateOperation(storeHandle, opId, { currentStep: 2, stepLabel: 'registering' })
+        // The monitor cached "no META.yaml" for this partition when it was plugged in: forget it,
+        // or addDevice reuses that answer and never docks the disk (happy-zebra 2026-10-17).
+        ops.forgetMetaLook(target.name)
+        await ops.addDevice(target.name)
+        registered = !!storeHandle.doc()?.diskDB?.[diskId]
+        if (!registered) fail('WRITE_FAILED', `${target.name} got META.yaml but did not dock as ${diskId}`)
+        if (role === 'files') await ops.createFilesDisk(storeHandle, diskId)
+        if (role === 'backup') await ops.createBackupDisk(storeHandle, diskId)
+        updateOperation(storeHandle, opId, { status: 'Done', completedAt: ops.now() as Timestamp })
+        attachTraceResult({ candidateId, diskId, role, partition: target.name })
+        print(`Initialised ${target.name} (${candidateId}) as IDEA disk ${diskId} (${role})`)
+        return { operationId: opId, diskId, partition: target.name }
+    } catch (e) {
+        // Registration failed after this command mounted the partition read-write: release the
+        // mount again (umount, then rmdir of the mount point), unless a disk record now uses the
+        // partition. META.yaml stays on the disk, so a re-plug or Engine restart docks it.
+        if (mountedHere && !registered) await releaseRwMount(storeHandle, target.name)
+        if (e instanceof CardError) throw e
+        const msg = e instanceof Error ? e.message : String(e)
+        return fail('WRITE_FAILED', msg)
+    } finally {
+        running.delete(opId)
+        refreshClientCards(storeHandle).catch(() => {})
+    }
+}
+
+```
+
+## File: src/data/ForgetDisk.ts
+```typescript
+/**
+ * ForgetDisk.ts — forgetDisk <diskId> (idea#279, idea#282)
+ *
+ * The sanctioned way to remove a stale disk record from the shared store, for
+ * example the record an older Engine created when it wrote META.yaml onto a
+ * client SD card (idea#282). Only an undocked record can be forgotten. Nothing
+ * on any disk is touched: this is a store edit only.
+ */
+
+import { DocHandle } from '@automerge/automerge-repo'
+import { Store, getInstancesOfDisk } from './Store.js'
+import { DiskID } from './CommonTypes.js'
+import { log } from '../utils/utils.js'
+
+export type ForgetDiskCheck =
+    | { ok: true }
+    | { ok: false, reason: string }
+
+/**
+ * Why a record may not be forgotten, or ok. Refused when:
+ *   - there is no record with exactly that id (no name fallback: forgetting is irreversible)
+ *   - the record is docked (dockedTo or device set): eject it first
+ *   - instances are still stored on it (their records would be orphaned)
+ */
+export const checkForgetDisk = (store: Store, diskId: string): ForgetDiskCheck => {
+    const disk = store.diskDB?.[diskId as DiskID]
+    if (!disk) return { ok: false, reason: `Disk '${diskId}' not found (forgetDisk takes the exact disk id).` }
+    const label = `'${disk.name}' (${disk.id})`
+    if (disk.dockedTo || disk.device) {
+        return { ok: false, reason: `Disk ${label} is docked${disk.dockedTo ? ` to ${disk.dockedTo}` : ''}; only an undocked disk can be forgotten. Eject or unplug it first.` }
+    }
+    const instances = getInstancesOfDisk(store, disk)
+    if (instances.length > 0) {
+        return { ok: false, reason: `Disk ${label} still holds instance record(s) ${instances.map(i => i.id).join(', ')}; forgetDisk does not remove instances.` }
+    }
+    return { ok: true }
+}
+
+/** Remove the undocked disk record. Throws with the reason when refused. */
+export const forgetDisk = (storeHandle: DocHandle<Store>, diskId: string): DiskID => {
+    const check = checkForgetDisk(storeHandle.doc(), diskId)
+    if (!check.ok) throw new Error(check.reason)
+    let removed = false
+    storeHandle.change(doc => {
+        // Re-check inside the change: the doc may have moved on since doc()
+        if (checkForgetDisk(doc as Store, diskId).ok && doc.diskDB[diskId as DiskID]) {
+            delete doc.diskDB[diskId as DiskID]
+            removed = true
+        }
+    })
+    if (!removed) throw new Error(`Disk '${diskId}' changed while it was being forgotten; nothing removed.`)
+    log(`forgetDisk: removed the undocked disk record ${diskId}`)
+    return diskId as DiskID
+}
+
+```
+
+## File: src/data/HostIdentity.ts
+```typescript
+/**
+ * HostIdentity: which Pi an instance is running on, for the apps (agent-engine-dev#163).
+ *
+ * On every start the Engine writes two variables into every instance's .env:
+ *   IDEA_HOSTNAME  bare hostname of this Pi ('idea03'; no '.local')
+ *   IDEA_HOST_IPS  comma-separated IPv4 addresses of this Pi (LAN, Wi-Fi, Tailscale), no ports
+ * An app's compose file passes them to the containers that need them. Nextcloud's
+ * before-starting hook (app-nextcloud docker-entrypoint-hooks.d/before-starting/
+ * 20-idea-trusted-domains.sh) uses them to set trusted_domains.
+ *
+ * Because the values are rewritten on every start, they follow the instance
+ * when its disk is moved or copied to another Pi.
+ */
+import os from 'os'
+import { $, fs, YAML } from 'zx'
+import { log } from '../utils/utils.js'
+import { Store, getLocalEngine } from './Store.js'
+
+export interface HostIdentity {
+    hostname: string        // bare, no '.local'; '' when unknown
+    ips: string[]           // IPv4, ordered: wired, wireless, others, Tailscale
+}
+
+type Ifaces = ReturnType<typeof os.networkInterfaces>
+
+/** Injectable for tests: the network interfaces and os.hostname() this Pi reports. */
+let ops: { networkInterfaces: () => Ifaces; osHostname: () => string } = {
+    networkInterfaces: () => os.networkInterfaces(),
+    osHostname: () => os.hostname(),
+}
+/** Tests only: replace the interface / hostname source (null: the real os). */
+export const setHostIdentityOpsForTests = (o: Partial<typeof ops> | null): void => {
+    ops = o
+        ? { ...{ networkInterfaces: () => os.networkInterfaces(), osHostname: () => os.hostname() }, ...o }
+        : { networkInterfaces: () => os.networkInterfaces(), osHostname: () => os.hostname() }
+}
+
+/** Container / bridge interfaces: their addresses are not reachable from a school laptop. */
+const VIRTUAL_IFACE = /^(docker\d*|br-|veth|virbr|cni|flannel|lxc|lxd)/
+
+const ifaceRank = (name: string): number => {
+    if (/^(eth|en)/.test(name)) return 0
+    if (/^(wlan|wl)/.test(name)) return 1
+    if (/^tailscale/.test(name)) return 3
+    return 2
+}
+
+/** All non-internal IPv4 addresses of this host, container bridges excluded, deduplicated. */
+/** The network interfaces as HostIdentity sees them (test hook aware). */
+export const hostNetworkInterfaces = (): Ifaces => ops.networkInterfaces()
+
+export const hostIPv4s = (ifaces: Ifaces = ops.networkInterfaces()): string[] => {
+    const names = Object.keys(ifaces ?? {})
+        .filter(n => !VIRTUAL_IFACE.test(n))
+        .sort((a, b) => ifaceRank(a) - ifaceRank(b) || a.localeCompare(b))
+    const out: string[] = []
+    for (const n of names) {
+        for (const a of ifaces[n] ?? []) {
+            const fam = (a as any).family
+            if ((fam === 'IPv4' || fam === 4) && !a.internal && !out.includes(a.address)) out.push(a.address)
+        }
+    }
+    return out
+}
+
+/** Bare hostname: lower-case, trailing '.local' (and any domain) dropped. */
+export const bareHostname = (h: string | undefined | null): string =>
+    String(h ?? '').trim().replace(/\.local\.?$/i, '').split('.')[0].toLowerCase()
+
+/** This Pi's identity: the local Engine's hostname (os.hostname() as fallback) and its IPv4s. */
+export const hostIdentity = (store: Store): HostIdentity => {
+    let hostname = ''
+    try { hostname = bareHostname(getLocalEngine(store).hostname) } catch { /* no local engine record */ }
+    if (!hostname) hostname = bareHostname(ops.osHostname())
+    return { hostname, ips: hostIPv4s() }
+}
+
+/**
+ * The wired address (eth0), else the first IPv4. Nextcloud's compose
+ * uses it as `${ip}` for Collabora's extra_hosts entry.
+ */
+export const primaryIPv4 = (ifaces: Ifaces = ops.networkInterfaces()): string | undefined =>
+    ifaces['eth0']?.find(a => ((a as any).family === 'IPv4' || (a as any).family === 4) && !a.internal)?.address
+    ?? hostIPv4s(ifaces)[0]
+
+/**
+ * Set `KEY=value` lines in a .env file: replace an existing line, else append.
+ * Written with fs, not addOrUpdateEnvVariable: that one goes through zx's shell
+ * quoting, which turns a value with a comma into `$'a,b'` in the file, and its
+ * `echo >>` glues the line onto a last line without a newline.
+ */
+export const setEnvLines = async (envPath: string, vars: Record<string, string>): Promise<void> => {
+    const cur = (await fs.pathExists(envPath)) ? await fs.readFile(envPath, 'utf8') : ''
+    let lines = cur.length ? cur.replace(/\n$/, '').split('\n') : []
+    for (const [k, v] of Object.entries(vars)) {
+        const first = lines.findIndex(l => l.startsWith(`${k}=`))
+        lines = lines.filter((l, i) => i === first || !l.startsWith(`${k}=`))
+        if (first >= 0) lines[first] = `${k}=${v}`
+        else lines.push(`${k}=${v}`)
+    }
+    // In place (keeps the file's owner and mode; .env holds the app password)
+    await fs.writeFile(envPath, lines.join('\n') + '\n')
+}
+
+/**
+ * IDEA_NEXTCLOUD_URL (agent-engine-dev#169): base URL of the Nextcloud instance an app on this
+ * Pi should use, '' when there is none. Decided from the store only:
+ *   1. a Nextcloud instance on a disk docked to this Engine that is Running or Starting
+ *      (Starting: at boot it may come up after the app that asks), http://<this host>.local:<port>
+ *   2. otherwise a Running one on another Engine of this fleet, http://<its host>.local:<port>
+ * Never the asking instance itself. No trailing slash.
+ */
+export const nextcloudUrl = (store: Store, localEngineId: string, selfId?: string): string => {
+    const isNc = (i: any) => /^nextcloud(-|$)/i.test(String(i?.instanceOf ?? '')) || String(i?.name ?? '').toLowerCase() === 'nextcloud'
+    const pick = (engineId: string, ok: (status: string) => boolean): string => {
+        const engine: any = (store.engineDB as any)?.[engineId]
+        const host = String(engine?.hostname ?? '').replace(/\.local$/, '')
+        if (!host) return ''
+        const disks = new Set(Object.values(store.diskDB ?? {}).filter((d: any) => d?.dockedTo === engineId).map((d: any) => String(d.id)))
+        const nc = Object.values(store.instanceDB ?? {})
+            .filter((i: any) => i && i.id !== selfId && isNc(i) && disks.has(String(i.storedOn)) && ok(String(i.status)) && Number(i.port) > 0)
+            .sort((a: any, b: any) => String(a.id).localeCompare(String(b.id)))[0] as any
+        return nc ? `http://${host}.local:${Number(nc.port)}` : ''
+    }
+    const local = pick(localEngineId, s => s === 'Running' || s === 'Starting')
+    if (local) return local
+    for (const id of Object.keys(store.engineDB ?? {}).sort()) {
+        if (id === localEngineId) continue
+        const url = pick(id, s => s === 'Running')
+        if (url) return url
+    }
+    return ''
+}
+
+/** Write IDEA_NEXTCLOUD_URL into an instance's .env (every app, every start; #169). */
+export const writeNextcloudUrlEnv = async (envPath: string, url: string): Promise<void> => {
+    try {
+        await setEnvLines(envPath, { IDEA_NEXTCLOUD_URL: url })
+    } catch (e: any) {
+        log(`Could not write IDEA_NEXTCLOUD_URL to ${envPath}: ${e?.message ?? e}`)
+    }
+}
+
+/** Write IDEA_HOSTNAME / IDEA_HOST_IPS into an instance's .env (every app, every start). */
+export const writeHostIdentityEnv = async (envPath: string, id: HostIdentity): Promise<void> => {
+    try {
+        await setEnvLines(envPath, { IDEA_HOSTNAME: id.hostname, IDEA_HOST_IPS: id.ips.join(',') })
+    } catch (e: any) {
+        log(`Could not write IDEA_HOSTNAME / IDEA_HOST_IPS to ${envPath}: ${e?.message ?? e}`)
+    }
+}
+
+/**
+ * Is this instance a Nextcloud instance? Decided from the instance's own
+ * compose.yaml, not from store.appDB[instance.instanceOf]. instanceOf is built
+ * from the instance compose's x-app.name/version, which need not match the
+ * apps/ folder the appDB key comes from: the r54 duration fixture has
+ * version '1.0-duration' in apps/nextcloud-1.0, so the appDB lookup missed and
+ * the Nextcloud steps were skipped on idea03 (agent-engine-dev#163).
+ */
+export const isNextcloudInstance = async (instanceDir: string): Promise<boolean> => {
+    try {
+        const c = YAML.parse(await fs.readFile(`${instanceDir}/compose.yaml`, 'utf8')) ?? {}
+        if (String(c?.['x-app']?.name ?? '').toLowerCase() === 'nextcloud') return true
+        return Object.prototype.hasOwnProperty.call(c?.services ?? {}, 'nextcloud-app')
+    } catch {
+        return false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TODO-remove (agent-engine-dev#163): temporary bridge for Nextcloud instances
+// on disks whose app does not yet carry 20-idea-trusted-domains.sh. Same
+// algorithm and same managed key as the hook, so the two agree and the bridge
+// is a no-op once the hook has run. Remove when all disks carry the hook.
+// ---------------------------------------------------------------------------
+
+export const MANAGED_KEY = 'idea_trusted_domains_managed'
+
+/** desired = localhost, host, host.local, IPs; keeps entries the hook/bridge did not write. */
+export const planTrustedDomains = (current: string[], managed: string[], id: HostIdentity) => {
+    const desired: string[] = []
+    const add = (v: string) => { if (v && !desired.includes(v)) desired.push(v) }
+    add('localhost')
+    if (id.hostname) { add(id.hostname); add(`${id.hostname}.local`) }
+    for (const ip of id.ips) add(ip)
+    const kept = current.filter((v, i) => v && !managed.includes(v) && !desired.includes(v) && current.indexOf(v) === i)
+    const final = [...desired, ...kept]
+    const own = desired.filter(v => v !== 'localhost')
+    const changed = final.join('\n') !== current.join('\n') || own.join('\n') !== managed.join('\n')
+    return { final, own, kept, changed }
+}
+
+/** occ runner: args after `php occ`; resolves stdout, rejects on non-zero exit. */
+export type OccRunner = (args: string[]) => Promise<string>
+
+export const dockerOcc = (instanceId: string): OccRunner => async (args) =>
+    (await $`docker exec ${instanceId}-nextcloud-app-1 runuser --user www-data -- php occ ${args}`.quiet()).stdout
+
+const getList = async (occ: OccRunner, key: string): Promise<string[]> => {
+    try {
+        return (await occ(['config:system:get', key])).split('\n').map(s => s.trim()).filter(Boolean)
+    } catch {
+        return []   // occ exits 1 for a missing key
+    }
+}
+
+/** Write `values` to array key `key` by index, then drop the stale tail (never empties the list first). */
+const setList = async (occ: OccRunner, key: string, values: string[], oldLen: number) => {
+    for (let i = 0; i < values.length; i++) await occ(['config:system:set', key, String(i), `--value=${values[i]}`])
+    for (let i = oldLen - 1; i >= values.length; i--) await occ(['config:system:delete', key, String(i)])
+}
+
+export interface BridgeResult { ok: boolean; changed: boolean; trustedDomains?: string[]; error?: string }
+
+/**
+ * Set Nextcloud's trusted_domains (and the Collabora wopi_url) for this Pi.
+ * Never throws: a failure is logged and returned, the instance is not marked
+ * Error (r54: the old post-start occ hack turned a slow occ into an Error).
+ * No fixed wait: called after runInstance's port-ready probe.
+ */
+export const nextcloudTrustedDomainsBridge = async (
+    instanceId: string, id: HostIdentity, occ: OccRunner = dockerOcc(instanceId), wopiIp?: string,
+): Promise<BridgeResult> => {
+    const tag = `nextcloud bridge ${instanceId}`
+    try {
+        if (!id.hostname && id.ips.length === 0) {
+            log(`${tag}: no hostname or IPv4 known — trusted_domains left unchanged`)
+            return { ok: true, changed: false }
+        }
+        if (wopiIp) {
+            try { await occ(['config:app:set', '--value=http://' + wopiIp + ':9980', 'richdocuments', 'wopi_url']) }
+            catch (e: any) { log(`${tag}: wopi_url not set (${e?.message ?? e}) — continuing`) }
+        }
+        const current = await getList(occ, 'trusted_domains')
+        const managed = await getList(occ, MANAGED_KEY)
+        const plan = planTrustedDomains(current, managed, id)
+        if (!plan.changed) {
+            log(`${tag}: trusted_domains already up to date (${plan.final.join(', ')})`)
+            return { ok: true, changed: false, trustedDomains: plan.final }
+        }
+        await setList(occ, 'trusted_domains', plan.final, current.length)
+        await setList(occ, MANAGED_KEY, plan.own, managed.length)
+        log(`${tag}: trusted_domains = ${plan.final.join(', ')}${plan.kept.length ? ` (kept: ${plan.kept.join(', ')})` : ''}`)
+        return { ok: true, changed: true, trustedDomains: plan.final }
+    } catch (e: any) {
+        const msg = String(e?.stderr || e?.message || e).trim().split('\n')[0]
+        log(`${tag}: could not set trusted_domains (${msg}) — instance stays as it is`)
+        return { ok: false, changed: false, error: msg }
+    }
+}
+
+```
+
 ## File: src/data/InstallApp.ts
 ```typescript
 /**
@@ -9927,9 +16122,10 @@ export const resetFilesRemountScheduleForTests = (): void => {
  * Replaces the old `createInstance` (GitHub-only) command with a unified
  * `installApp` that routes to the right source automatically:
  *
- *   --source given          → local copy from docked disk (offline-capable)
+ *   --source given + bundle present → local copy from docked disk (offline-capable)
+ *   --source given but apps/<appId> missing → treat as omitted (Prefer A r31 stale catalog)
  *   --source omitted + net  → GitHub clone (existing buildInstance logic)
- *   --source omitted, no net, appDB has local source → auto-select local disk
+ *   --source omitted, no net, usable local source → auto-select docked disk with bundle
  *   --source omitted, no net, no local source → clear error
  *
  * Phases implemented here:
@@ -9943,11 +16139,15 @@ import * as net from 'net'
 import { log } from '../utils/utils.js'
 import { Store, getDisk, getLocalEngine } from './Store.js'
 import { resolveDiskArg } from './DiskArg.js'
-import { buildInstance } from './Instance.js'
+import { buildInstance, versionDirName } from './Instance.js'
+import { parseAppId } from './App.js'
 import { AppID, AppName, DiskID, DiskName, InstanceName, Version } from './CommonTypes.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Disk, diskMountRoot } from './Disk.js'
 import { App, createOrUpdateApp } from './App.js'
+import { assertNoExternalLinks, setComposeInstanceName } from './InstanceCopy.js'
+import { splitArgs } from '../utils/commandUtils.js'
+import { assertSameDockAfterWait, dockIdentityOf, trackInFlight } from './InstanceInFlight.js'
 
 // ── Internet probe ────────────────────────────────────────────────────────────
 
@@ -9955,13 +16155,96 @@ import { App, createOrUpdateApp } from './App.js'
  * Check internet availability with a short TCP connect to 1.1.1.1:53.
  * No HTTP request — no data sent. Timeout: 2 seconds.
  */
-export const hasInternet = (): Promise<boolean> =>
-    new Promise(resolve => {
+export const hasInternet = (): Promise<boolean> => {
+    // Test hook: Prefer A r31 unit coverage for offline alt-disk fallback
+    if (process.env.IDEA_INSTALL_FORCE_OFFLINE === 'true') return Promise.resolve(false)
+    // Test hook: idea#168 r81 unit coverage for the GitHub route without a network probe
+    if (process.env.IDEA_INSTALL_FORCE_ONLINE === 'true') return Promise.resolve(true)
+    return new Promise(resolve => {
         const socket = net.createConnection({ host: '1.1.1.1', port: 53 })
         const timer = setTimeout(() => { socket.destroy(); resolve(false) }, 2000)
         socket.on('connect', () => { clearTimeout(timer); socket.destroy(); resolve(true) })
         socket.on('error', () => { clearTimeout(timer); resolve(false) })
     })
+}
+
+// ── Arguments and name checks (Kid, idea#235) ────────────────────────────────
+
+export const INSTALL_APP_USAGE = 'Usage: installApp <appId> <targetDiskId> [--source <sourceDiskId>] [--name <instanceName>] [--fresh]'
+
+/** Longest display name accepted by installApp --name. */
+export const MAX_INSTANCE_NAME_LENGTH = 64
+
+/**
+ * Check a display name for an instance: not empty or blank, at most
+ * MAX_INSTANCE_NAME_LENGTH characters, no control characters (newlines, tabs).
+ * Spaces are fine: the name only goes into x-app.instanceName and the store
+ * record, never into the instance id, folder or Docker project name.
+ */
+export const validateInstanceName = (name: string): string => {
+    if (name.trim().length === 0) throw new Error('installApp: --name must not be empty')
+    if (name.length > MAX_INSTANCE_NAME_LENGTH) throw new Error(`installApp: --name is longer than ${MAX_INSTANCE_NAME_LENGTH} characters`)
+    if (/[\u0000-\u001f\u007f]/.test(name)) throw new Error('installApp: --name must not contain control characters or newlines')
+    return name
+}
+
+export interface ParsedInstallAppArgs {
+    appId: AppID
+    targetDiskId: string
+    sourceDiskId?: string
+    instanceName?: InstanceName
+    fresh: boolean
+}
+
+/**
+ * Parse the installApp argument line with the quote-aware splitArgs, so
+ * `--name "Kolibri Demo"` is one value. Unquoted lines parse as before.
+ */
+export const parseInstallAppArgs = (argsString: string): ParsedInstallAppArgs => {
+    const parts = splitArgs((argsString ?? '').trim())
+    const appId = parts[0] as AppID
+    const targetDiskId = parts[1]
+    if (!appId || !targetDiskId || targetDiskId.startsWith('--')) throw new Error(INSTALL_APP_USAGE)
+    const known = new Set(['--source', '--name', '--fresh'])
+    for (let i = 2; i < parts.length; i++) {
+        const p = parts[i]
+        if (p === '--fresh') continue
+        if (p === '--source' || p === '--name') { i++; continue }
+        throw new Error(`installApp: unexpected argument '${p}'. ${INSTALL_APP_USAGE}`)
+    }
+    const flagValue = (flag: string): string | undefined => {
+        const i = parts.indexOf(flag)
+        if (i === -1) return undefined
+        const v = parts[i + 1]
+        if (v === undefined || known.has(v)) throw new Error(`installApp: ${flag} needs a value. ${INSTALL_APP_USAGE}`)
+        return v
+    }
+    const name = flagValue('--name')
+    return {
+        appId,
+        targetDiskId,
+        sourceDiskId: flagValue('--source'),
+        instanceName: name === undefined ? undefined : validateInstanceName(name) as InstanceName,
+        fresh: parts.includes('--fresh'),
+    }
+}
+
+/** True when both paths exist and resolve (realpath) to the same folder. */
+export const sameRealPath = async (a: string, b: string): Promise<boolean> => {
+    if (!await fs.pathExists(a) || !await fs.pathExists(b)) return false
+    return (await fs.realpath(a)) === (await fs.realpath(b))
+}
+
+/**
+ * The app id as it is stored on a disk: `<name>@<ref>` (installApp input, any git
+ * ref) becomes `<name>-<versionDirName(ref)>`, the apps/ folder buildInstance writes.
+ * Other ids are returned unchanged.
+ */
+export const diskAppId = (appId: string): AppID => {
+    if (!String(appId).includes('@')) return appId as AppID
+    const { name, version } = parseAppId(appId)
+    return `${name}-${versionDirName(version)}` as AppID
+}
 
 // ── Local install path ────────────────────────────────────────────────────────
 
@@ -9975,10 +16258,14 @@ export const installAppFromDisk = async (
     appId: AppID,
     sourceDisk: Disk,
     targetDisk: Disk,
-    instanceName: InstanceName
+    instanceName: InstanceName,
+    opts: { fresh?: boolean } = {}
 ): Promise<void> => {
     const sourceDevice = sourceDisk.device
     const targetDevice = targetDisk.device
+    // #170: the copies below can take minutes; an eject/erase/re-dock meanwhile must not get a store record
+    const targetDock = dockIdentityOf(targetDisk)
+    const recheck = (step: string) => assertSameDockAfterWait(storeHandle.doc(), String(targetDisk.id), targetDock, `installApp '${appId}' on '${targetDisk.name}' (${step})`)
 
     if (!sourceDevice) throw new Error(`Source disk '${sourceDisk.name}' is not docked`)
     if (!targetDevice) throw new Error(`Target disk '${targetDisk.name}' is not docked`)
@@ -9990,30 +16277,16 @@ export const installAppFromDisk = async (
         throw new Error(`App '${appId}' not found on disk '${sourceDisk.name}' at ${sourcePath}`)
     }
 
-    // Ensure target has the required directory structure
-    const targetMountRoot = await diskMountRoot(targetDisk)
-    await fs.ensureDir(`${targetMountRoot}/apps`)
-    await fs.ensureDir(`${targetMountRoot}/instances`)
-    await fs.ensureDir(`${targetMountRoot}/services`)
-
-    // Copy app bundle
-    const targetAppPath = `${targetMountRoot}/apps/${appId}`
-    log(`Copying app bundle: ${sourcePath} → ${targetAppPath}`)
-    await fs.copy(sourcePath, targetAppPath, { overwrite: true })
-
-    // Register app in store
-    await createOrUpdateApp(storeHandle, appId, targetDisk)
-
-    // Generate a fresh instance ID and create the instance directory
+    // Generate a fresh instance ID
     const { uuid } = await import('../utils/utils.js')
     const instanceId = uuid()
 
     const sourceInstanceBase = `${sourceMountRoot}/instances`
-    const targetInstanceBase = `${targetMountRoot}/instances`
 
     // If source has an instance of this app, copy its data as the starting point
+    // --fresh: never copy an existing instance's data (a demo must not inherit a school's data)
     let sourceInstanceId: string | null = null
-    if (await fs.pathExists(sourceInstanceBase)) {
+    if (!opts.fresh && await fs.pathExists(sourceInstanceBase)) {
         const store = storeHandle.doc()
         const sourceInstance = Object.values(store.instanceDB).find(
             i => String(i.instanceOf) === String(appId) && String(i.storedOn) === String(sourceDisk.id)
@@ -10021,12 +16294,46 @@ export const installAppFromDisk = async (
         if (sourceInstance) sourceInstanceId = sourceInstance.id
     }
 
+    // Refuse source instance data that links off the disk (idea#168 r35) before
+    // anything is written to the target: fs.copy reproduces a link verbatim, so the new
+    // instance would share the source instance's data.
+    const copyFromSourceInstance = !!sourceInstanceId && await fs.pathExists(`${sourceInstanceBase}/${sourceInstanceId}`)
+    if (copyFromSourceInstance) {
+        await assertNoExternalLinks('installApp', `${sourceInstanceBase}/${sourceInstanceId}`, sourceDisk)
+    }
+
+    // Ensure target has the required directory structure
+    const targetMountRoot = await diskMountRoot(targetDisk)
+    const targetInstanceBase = `${targetMountRoot}/instances`
+    await fs.ensureDir(`${targetMountRoot}/apps`)
+    await fs.ensureDir(`${targetMountRoot}/instances`)
+    await fs.ensureDir(`${targetMountRoot}/services`)
+
+    // Copy app bundle, unless source and target are the same folder (--source is the
+    // target disk; Kid, #221): fs.copy refuses to copy a folder onto itself
+    const targetAppPath = `${targetMountRoot}/apps/${appId}`
+    if (await sameRealPath(sourcePath, targetAppPath)) {
+        log(`App bundle already in place at ${targetAppPath} (source is the target disk); not copying it`)
+    } else {
+        log(`Copying app bundle: ${sourcePath} → ${targetAppPath}`)
+        await fs.copy(sourcePath, targetAppPath, { overwrite: true })
+    }
+
+    // Register app in store
+    recheck('before registering the app')
+    await createOrUpdateApp(storeHandle, appId, targetDisk)
+
     const instanceDir = `${targetInstanceBase}/${instanceId}`
     await fs.ensureDir(instanceDir)
 
-    if (sourceInstanceId && await fs.pathExists(`${sourceInstanceBase}/${sourceInstanceId}`)) {
+    if (copyFromSourceInstance) {
         log(`Copying instance data from ${sourceInstanceId} to new instance ${instanceId}`)
         await fs.copy(`${sourceInstanceBase}/${sourceInstanceId}`, instanceDir, { overwrite: true })
+    } else if (opts.fresh) {
+        // --fresh: the whole app bundle is the instance's starting point (entrypoint
+        // scripts, hooks, bundled apps; Nextcloud needs them), never a source instance's data
+        log(`Fresh instance ${instanceId}: copying the whole app bundle ${targetAppPath}`)
+        await fs.copy(targetAppPath, instanceDir, { overwrite: true })
     } else {
         // No existing instance data — copy compose.yaml from app bundle as baseline
         const composeSrc = `${targetAppPath}/compose.yaml`
@@ -10035,7 +16342,16 @@ export const installAppFromDisk = async (
         }
     }
 
+    // Write the requested display name (Kid, idea#235). Only x-app.instanceName
+    // changes; the instance id, folder and Docker project stay the generated id.
+    const composeFile = `${instanceDir}/compose.yaml`
+    if (await fs.pathExists(composeFile)) {
+        const text = await fs.readFile(composeFile, 'utf8')
+        await fs.writeFile(composeFile, setComposeInstanceName(text, String(instanceName)))
+    }
+
     // processInstance registers the new instance in the store and starts it
+    recheck('before registering the instance')
     const { processInstance } = await import('./Disk.js')
     await processInstance(storeHandle, targetDisk, instanceId as any)
 
@@ -10049,6 +16365,7 @@ export interface InstallAppOptions {
     targetDiskId: string         // disk id (a unique disk name still resolves, deprecated; idea#128)
     sourceDiskId?: string        // --source flag; omit for auto-routing
     instanceName?: InstanceName  // --name flag; defaults to appId
+    fresh?: boolean              // --fresh flag; local route starts from the bundle, no source instance data
     gitAccount?: string          // for GitHub path; defaults to 'koenswings'
 }
 
@@ -10056,12 +16373,44 @@ export interface InstallAppOptions {
  * Unified installApp — routes to local or GitHub path based on --source and
  * internet availability.
  */
+/** True when docked disk still has apps/<appId> on disk (not stale appDB). */
+const diskHasAppBundle = async (disk: Disk, appId: AppID): Promise<boolean> => {
+    if (!disk.device) return false
+    const root = await diskMountRoot(disk)
+    return fs.pathExists(`${root}/apps/${appId}`)
+}
+
+/**
+ * Prefer A r31: find a docked disk that still has apps/<appId>.
+ * Skips stale backup/empty sources that appDB may still advertise.
+ */
+const findDockedDiskWithApp = async (store: Store, appId: AppID, excludeDiskId?: string): Promise<Disk | undefined> => {
+    for (const disk of Object.values(store.diskDB) as Disk[]) {
+        if (!disk?.device) continue
+        if (excludeDiskId && String(disk.id) === String(excludeDiskId)) continue
+        if (await diskHasAppBundle(disk, appId)) return disk
+    }
+    return undefined
+}
+
+/** #179: an install is in flight on its target disk until it settles, so an eject waits for it. */
 export const installApp = async (
     storeHandle: DocHandle<Store>,
     opts: InstallAppOptions
 ): Promise<void> => {
+    const target = resolveDiskArg(storeHandle.doc(), getLocalEngine(storeHandle.doc())?.id, opts.targetDiskId, 'installApp')
+    return trackInFlight(String(target.id), `installApp ${opts.appId}`, installAppRouted(storeHandle, opts))
+}
+
+const installAppRouted = async (
+    storeHandle: DocHandle<Store>,
+    opts: InstallAppOptions
+): Promise<void> => {
+    // `<name>@<ref>` (Kid, #221): the ref goes to git as given; disks use the folder-safe id
+    const refAppId = opts.appId
+    opts = { ...opts, appId: diskAppId(opts.appId) }
     const store = storeHandle.doc()
-    const instanceName = (opts.instanceName ?? opts.appId) as InstanceName
+    const instanceName = (opts.instanceName === undefined ? opts.appId : validateInstanceName(String(opts.instanceName))) as InstanceName
     const gitAccount = opts.gitAccount ?? 'koenswings'
 
     // Resolve the disks on this engine (idea#128): by id, or a unique docked name
@@ -10069,42 +16418,72 @@ export const installApp = async (
     const engineId = getLocalEngine(store)?.id
     const targetDisk = resolveDiskArg(store, engineId, opts.targetDiskId, 'installApp')
 
-    // ── Route 1: --source given → local path ──────────────────────────────
+    // ── Route 1: --source given → local path if bundle still present ───────
+    // Prefer A r31: Console EmptyDiskPanel may pass stale appDB.sourceDiskId
+    // (e.g. empty-001 after make_backup wiped apps/). Missing bundle → fall
+    // through to GitHub (online) or another docked disk that still has apps/.
     if (opts.sourceDiskId) {
         const sourceDisk = resolveDiskArg(store, engineId, opts.sourceDiskId, 'installApp --source')
-        log(chalk.blue(`installApp: local path — source '${sourceDisk.name}' (${sourceDisk.id})`))
-        await installAppFromDisk(storeHandle, opts.appId, sourceDisk, targetDisk as Disk, instanceName)
-        return
+        if (await diskHasAppBundle(sourceDisk as Disk, opts.appId)) {
+            log(chalk.blue(`installApp: local path — source '${sourceDisk.name}' (${sourceDisk.id})`))
+            await installAppFromDisk(storeHandle, opts.appId, sourceDisk as Disk, targetDisk as Disk, instanceName, { fresh: opts.fresh })
+            return
+        }
+        log(chalk.yellow(
+            `installApp: --source '${sourceDisk.name}' (${sourceDisk.id}) has no apps/${opts.appId} — ` +
+            `stale catalog pointer; falling back to GitHub / other docked disks`
+        ))
     }
 
-    // ── Route 2/3: no --source → probe internet ───────────────────────────
+    // ── Route 2/3: no usable --source → probe internet ────────────────────
     const online = await hasInternet()
 
     if (online) {
         // Route 2: GitHub path (existing buildInstance logic)
         log(chalk.blue(`installApp: GitHub path (internet available)`))
-        const appName = opts.appId.slice(0, opts.appId.lastIndexOf('-')) as AppName
-        const version = opts.appId.slice(opts.appId.lastIndexOf('-') + 1) as Version
+        const { name: appName, version } = parseAppId(refAppId)
+        if (!appName || !version) throw new Error(`installApp: cannot read an app name and version from '${refAppId}'. Use <name>-<version> or <name>@<git ref>.`)
         const targetDevice = targetDisk.device!
-        await buildInstance(instanceName, appName, gitAccount, version, targetDevice as any)
+        const targetDock = dockIdentityOf(targetDisk)
+        const instanceId = await buildInstance(instanceName, appName, gitAccount, version, targetDevice as any)
+        if (!instanceId) {
+            throw new Error(`installApp: GitHub build of '${opts.appId}' on disk '${targetDisk.name}' failed (see Engine log)`)
+        }
+        // idea#168 r81: buildInstance only writes apps/ + instances/<id> on the disk. Register the
+        // app and the instance in the store and start it, exactly like the local route
+        // (installAppFromDisk). Without this the instance stayed invisible (no instanceDB row,
+        // no container) until the disk was next re-docked.
+        // #170: the build can take minutes; never register on a dock that changed meanwhile
+        assertSameDockAfterWait(storeHandle.doc(), String(targetDisk.id), targetDock, `installApp '${opts.appId}' on '${targetDisk.name}' (GitHub build)`)
+        await createOrUpdateApp(storeHandle, opts.appId, targetDisk as Disk)
+        const { processInstance } = await import('./Disk.js')
+        await processInstance(storeHandle, targetDisk as Disk, instanceId)
+        log(chalk.green(`installApp: installed '${opts.appId}' as instance '${instanceName}' on disk '${targetDisk.name}' (GitHub)`))
         return
     }
 
-    // Route 3: offline — look for a local source in appDB
-    log(chalk.yellow(`installApp: no internet — searching appDB for local source of '${opts.appId}'`))
+    // Route 3: offline — appDB pointer only if bundle still on that disk; else scan docked disks
+    log(chalk.yellow(`installApp: no internet — searching for local source of '${opts.appId}'`))
     const appEntry = store.appDB[opts.appId]
     if (appEntry && (appEntry as any).sourceDiskId) {
         const sourceDiskId: DiskID = (appEntry as any).sourceDiskId
         const sourceDisk = getDisk(store, sourceDiskId)
-        if (sourceDisk?.device) {
+        if (sourceDisk?.device && await diskHasAppBundle(sourceDisk as Disk, opts.appId)) {
             log(chalk.blue(`installApp: auto-selected source disk '${sourceDisk.name}'`))
-            await installAppFromDisk(storeHandle, opts.appId, sourceDisk, targetDisk as Disk, instanceName)
+            await installAppFromDisk(storeHandle, opts.appId, sourceDisk as Disk, targetDisk as Disk, instanceName, { fresh: opts.fresh })
             return
         }
     }
 
+    const alt = await findDockedDiskWithApp(store, opts.appId, String(targetDisk.id))
+    if (alt) {
+        log(chalk.blue(`installApp: found apps/${opts.appId} on docked disk '${alt.name}' (${alt.id})`))
+        await installAppFromDisk(storeHandle, opts.appId, alt, targetDisk as Disk, instanceName, { fresh: opts.fresh })
+        return
+    }
+
     // No local source found
-    const appName = opts.appId.slice(0, opts.appId.lastIndexOf('-')) as AppName
+    const appName = parseAppId(opts.appId).name
     throw new Error(
         `installApp: App '${appName}' not found locally. ` +
         `Insert a disk containing '${appName}' or connect to the internet.`
@@ -10131,12 +16510,18 @@ export const indexBackupDiskApps = async (
     const appsDir = `${await diskMountRoot(backupDisk)}/apps`
     if (!await fs.pathExists(appsDir)) {
         log(`indexBackupDiskApps: no apps/ directory on disk ${backupDisk.name}`)
+        clearStaleSourcePointers(storeHandle, backupDisk)
         return
     }
 
-    const appIds = (await fs.readdir(appsDir)) as AppID[]
+    const appIds = ((await fs.readdir(appsDir)) as AppID[]).filter(Boolean)
+    if (appIds.length === 0) {
+        log(`indexBackupDiskApps: empty apps/ on disk ${backupDisk.name} — clearing stale source pointers`)
+        clearStaleSourcePointers(storeHandle, backupDisk)
+        return
+    }
+
     for (const appId of appIds) {
-        if (!appId) continue
         try {
             // Register in appDB using existing createOrUpdateApp (reads compose.yaml for metadata)
             await createOrUpdateApp(storeHandle, appId, backupDisk)
@@ -10157,19 +16542,43 @@ export const indexBackupDiskApps = async (
     }
 }
 
+/**
+ * Prefer A r31: when a Backup/Catalog disk no longer has apps/, drop appDB
+ * sourceDiskId pointers at this disk so Console omits stale --source and
+ * installApp can GitHub-route (or pick a docked disk that still has the bundle).
+ */
+export const clearStaleSourcePointers = (
+    storeHandle: DocHandle<Store>,
+    backupDisk: Disk
+): void => {
+    storeHandle.change(doc => {
+        for (const appId of Object.keys(doc.appDB)) {
+            const entry = doc.appDB[appId as AppID] as any
+            if (!entry) continue
+            if (String(entry.sourceDiskId) !== String(backupDisk.id)) continue
+            delete entry.source
+            delete entry.sourceDiskId
+            delete entry.sourceDiskName
+            log(`clearStaleSourcePointers: cleared source for '${appId}' (was disk '${backupDisk.name}')`)
+        }
+    })
+}
+
 ```
 
 ## File: src/data/Instance.ts
 ```typescript
+import { isCommitSha } from './AppIdParse.js'
 import { $, YAML, chalk, fs, os, sleep } from "zx";
 
 $.verbose = false;
-import { addOrUpdateEnvVariable, deepPrint, log, randomPort, readEnvVariable, uuid, print } from "../utils/utils.js";
-import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber, ServiceImage, Timestamp, Version, DeviceName, InstanceName, AppName, Hostname, DiskID, OperationCause } from "./CommonTypes.js";
+import { ensureNcAdminPassword } from "./AppSecrets.js";
+import { addOrUpdateEnvVariable, deepPrint, log, randomPort, readEnvVariable, uuid, print, isEngineOnline } from "../utils/utils.js";
+import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber, ServiceImage, Timestamp, Version, DeviceName, InstanceName, AppName, Hostname, DiskID, OperationCause, EngineID } from "./CommonTypes.js";
 import { createOperation, updateOperation } from './Operations.js'
 import { composeFileEnv } from './FilesMount.js'
 import { Store, getDisk, getEngine, getLocalEngine, getInstancesOfEngine, } from "./Store.js";
-import { Disk, diskMountRoot, diskFsRoot } from "./Disk.js";
+import { Disk, diskMountRoot, diskFsRoot, deviceMountRoot } from "./Disk.js";
 import { localEngineId } from "./Engine.js";
 import { network } from "./Network.js";
 import { createAppId } from "./App.js";
@@ -10177,8 +16586,12 @@ import { Docker } from "node-docker-api";
 import { createMeta } from '../data/Meta.js'
 import { config, disksRoot, skipImageLoad } from '../data/Config.js'
 import { DocHandle } from "@automerge/automerge-repo";
-import { CommandLogStore, LogEntry, getCommandLogHandle, addTrace, closeTrace, flushLogs } from './CommandLogStore.js'
+import { CommandLogStore, LogEntry, getCommandLogHandle, liveCommandLogHandle, addTrace, closeTrace, flushLogs } from './CommandLogStore.js'
 import { getActiveTrace, flushTrace } from '../utils/CommandLogger.js'
+import { dockerAvailable } from '../utils/dockerAvailable.js'
+import { rebindKolibriMorangoInstanceId } from './InstanceCopy.js'
+import { hostIdentity, writeHostIdentityEnv, nextcloudUrl, writeNextcloudUrlEnv, isNextcloudInstance, nextcloudTrustedDomainsBridge, hostNetworkInterfaces } from './HostIdentity.js'
+import { trackInFlight, startDiskGoneReason, dockIdentityOf } from './InstanceInFlight.js'
 
 // ── Step-progress helpers ─────────────────────────────────────────────────────
 
@@ -10230,7 +16643,7 @@ export const START_INSTANCE_COMMAND = 'startInstance'
  */
 const activeStartTraceId = (handle: DocHandle<CommandLogStore>): string | null => {
   const active = getActiveTrace()
-  if (active && active.command === START_INSTANCE_COMMAND && handle.doc()?.traces[active.traceId]) {
+  if (active && active.command === START_INSTANCE_COMMAND && liveCommandLogHandle(handle).doc()?.traces[active.traceId]) {
     return active.traceId
   }
   return null
@@ -10350,7 +16763,27 @@ export const recordInstanceStartWarnings = async (
 /**
  * Set an instance to Error with a diagnosis in statusCondition.
  */
+/** Device-node check for a pulled disk; null in testMode (simulated devices). Tests may override. */
+let deviceExistsCheck: ((dev: string) => boolean) | null | undefined = undefined
+export const setDeviceExistsCheckForTests = (fn: ((dev: string) => boolean) | null | undefined): void => { deviceExistsCheck = fn }
+const deviceExists = (): ((dev: string) => boolean) | null =>
+  deviceExistsCheck !== undefined ? deviceExistsCheck : (config.settings.testMode ? null : (dev: string) => fs.existsSync(`/dev/${dev}`))
+
 export const markInstanceError = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, e: unknown): Promise<void> => {
+  // hw180: a start that fails because its disk was pulled (undock pending, record undocked or
+  // moved, device node gone) is not an app failure: the instance goes to Undocked, never Error.
+  const gone = startDiskGoneReason(String(disk.id), disk.device ?? null, dockIdentityOf(storeHandle.doc()?.diskDB?.[disk.id]), deviceExists())
+  if (gone) {
+    log(`Instance ${instance.id}: start failed because ${gone} — marking Undocked, not Error (${e instanceof Error ? e.message : String(e)})`)
+    storeHandle.change(doc => {
+      const inst = doc.instanceDB[instance.id]
+      if (!inst) return
+      inst.status = 'Undocked' as Status
+      inst.statusCondition = null
+      inst.metrics = null
+    })
+    return
+  }
   const condition = await diagnoseInstance(instance, disk, e)
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
@@ -10394,6 +16827,8 @@ export interface Instance {
   status: Status;
   statusCondition: string | null;  // Human-readable error diagnosis; null when not in Error state
   port: PortNumber;
+  /** Second Engine-allocated host port, only for Apps whose compose references `${port_zip` (agent-engine-dev#267); null/absent otherwise. */
+  portZip?: PortNumber | null;
   serviceImages: ServiceImage[];
   created: Timestamp;       // We must use a timestamp number as Date objects are not supported in YJS
   lastBackup: Timestamp | null;  // Unix ms of last successful backup; null if never backed up
@@ -10407,6 +16842,20 @@ export interface Instance {
   metrics: DockerMetrics | null;
   /** Files Disks currently mounted into this instance; written only after a successful compose up (idea#133). */
   filesMounts?: DiskID[] | null;
+  /** A newer, offerable bundle of this App on a docked disk (agent-engine-dev#230, console#168 shape); null when none. */
+  updateAvailable?: UpdateAvailable | null;
+}
+
+export interface UpdateAvailable {
+  appId: AppID;
+  sourceDiskId?: DiskID;
+  sourceEngineId?: EngineID;
+  fromVersion?: string;
+  toVersion?: string;
+  major?: boolean;
+  estimatedMinutes?: number;
+  sizeBytes?: number;
+  migrationNote?: string;
 }
 
 export type Status = 'Undocked'      // Disk is not currently docked; instance data is intact on the disk
@@ -10419,7 +16868,7 @@ export type Status = 'Undocked'      // Disk is not currently docked; instance d
   | 'Error';
 
 
-export const buildInstance = async (instanceName: InstanceName, appName: AppName, gitAccount: string, version: Version, device: DeviceName): Promise<void> => {
+export const buildInstance = async (instanceName: InstanceName, appName: AppName, gitAccount: string, version: Version, device: DeviceName): Promise<InstanceID | undefined> => {
   print(`Building new instance '${instanceName}' from version ${version} of app '${appName}' on device '${device}' of the local engine.`)
 
   // CODING STYLE: only use absolute pathnames !
@@ -10440,13 +16889,25 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     //   log(`Instance ID: ${instanceId}`)
     // } 
     const instanceId = createInstanceId(appName).toString() as InstanceID
+    // System disk -> '' (/apps, /instances); other disks -> <disksRoot>/<device>
+    const root = await deviceMountRoot(String(device))
+    const onSystemDisk = root === ''
+    log(`buildInstance: target root '${root || '/'}' for device ${device}`)
     log(`Instance ID: ${instanceId}`)
 
 
     // Create the app infrastructure if it does not exist
     // TODO: This should be done when creating the disk — https://github.com/koenswings/idea/issues/46
     // TODO: Here we should only be checking if it is an apps disk! — https://github.com/koenswings/idea/issues/46
-    await $`mkdir -p ${disksRoot()}/${device}/apps ${disksRoot()}/${device}/services ${disksRoot()}/${device}/instances`
+    if (onSystemDisk) {
+      // /apps, /instances, /services may be root-owned on the system disk (idea04).
+      // Use exactly the sudoers ENGINE_APPDIRS commands (10-engine) to create them
+      // and hand them to pi; the Engine runs as pi and writes into them.
+      await $`sudo -n /usr/bin/mkdir -p /apps /instances /services`
+      await $`sudo -n /usr/bin/chown pi:pi /apps /instances /services`
+    } else {
+      await $`mkdir -p ${root}/apps ${root}/services ${root}/instances`
+    }
 
     // **************************
     // STEP 1 - App Type creation
@@ -10467,8 +16928,18 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
 
     } else {
       print(`Cloning version ${version} of app ${appName} from git account ${gitAccount}`)
-      await $`git clone -b ${version} https://github.com/koenswings/app-${appName} /tmp/apps/${appName}`
-      appVersion = version
+      // A branch name may contain '/' (feat/x): the ref goes to git intact as one
+      // argument, the folder name of the App master is derived from it (Atlas).
+      assertGitRef(version)
+      if (isCommitSha(version)) {
+        // A commit SHA is not a branch or tag: clone, then check the commit out (Kid, #221)
+        await $`git ${['clone', '--', `https://github.com/koenswings/app-${appName}`, `/tmp/apps/${appName}`]}`
+        await $`git ${['-C', `/tmp/apps/${appName}`, 'checkout', '--detach', version]}`
+      } else {
+        await $`git ${appCloneArgs('koenswings', appName, version, `/tmp/apps/${appName}`)}`
+      }
+      appVersion = versionDirName(version)
+      if (appVersion !== version) log(`App ref '${version}' is stored as version '${appVersion}' (folder ${appName}-${appVersion})`)
     }
 
 
@@ -10476,7 +16947,7 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     // Overwrite if it exists
     // We want to copy the content of a directory and rename the directory at the same time: 
     //   See https://unix.stackexchange.com/questions/412259/how-can-i-copy-a-directory-and-rename-it-in-the-same-command
-    await $`cp -fr /tmp/apps/${appName}/. ${disksRoot()}/${device}/apps/${appName}-${appVersion}/`
+    await $`cp -fr /tmp/apps/${appName}/. ${root}/apps/${appName}-${appVersion}/`
 
 
     // **************************
@@ -10498,19 +16969,19 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     //   }
     // }
     // Again use /. to specify the content of the dir, not the dir itself 
-    await $`cp -fr /tmp/apps/${appName}/. ${disksRoot()}/${device}/instances/${instanceId}/`
+    await $`cp -fr /tmp/apps/${appName}/. ${root}/instances/${instanceId}/`
 
 
 
 
     // If the app has an init_data.tar.gz file, unpack it in the app folder
-    if (fs.existsSync(`${disksRoot()}/${device}/instances/${instanceId}/init_data.tar.gz`)) {
+    if (fs.existsSync(`${root}/instances/${instanceId}/init_data.tar.gz`)) {
       print(`Unpacking the init_data.tar.gz file in the app folder`)
-      await $`tar -xzf ${disksRoot()}/${device}/instances/${instanceId}/init_data.tar.gz -C ${disksRoot()}/${device}/instances/${instanceId}`
+      await $`tar -xzf ${root}/instances/${instanceId}/init_data.tar.gz -C ${root}/instances/${instanceId}`
       // Rename the folder init_data to data
-      await $`mv ${disksRoot()}/${device}/instances/${instanceId}/init_data ${disksRoot()}/${device}/instances/${instanceId}/data`
+      await $`mv ${root}/instances/${instanceId}/init_data ${root}/instances/${instanceId}/data`
       // Remove the init_data.tar.gz file
-      await $`rm ${disksRoot()}/${device}/instances/${instanceId}/init_data.tar.gz`
+      await $`rm ${root}/instances/${instanceId}/init_data.tar.gz`
     }
     // Not needed as Docker will auto-create any data folder we specify in the compose
     // } else {
@@ -10520,12 +16991,12 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
 
     // Open the compose.yaml file of the app instance and add the version info to the compose file and the instance name
     print(`Opening the compose.yaml file of the app instance and adding the version info to the compose file (${appVersion}) and the instance name (${instanceName})`)
-    const composeFile = await $`cat ${disksRoot()}/${device}/instances/${instanceId}/compose.yaml`
+    const composeFile = await $`cat ${root}/instances/${instanceId}/compose.yaml`
     const compose = YAML.parse(composeFile.stdout)
     compose['x-app'].version = appVersion
     compose['x-app'].instanceName = instanceName
     const composeYAML = YAML.stringify(compose)
-    await $`echo ${composeYAML} > ${disksRoot()}/${device}/instances/${instanceId}/compose.yaml`
+    await $`echo ${composeYAML} > ${root}/instances/${instanceId}/compose.yaml`
 
     // Remove the temporary app folder
     await $`rm -rf /tmp/apps/${appName}`
@@ -10539,7 +17010,7 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     for (const serviceName in services) {
       const serviceImage = services[serviceName].image
       // Pull the sercice image
-      const serviceImageTar = serviceImageTarPath(`${disksRoot()}/${device}`, serviceImage)
+      const serviceImageTar = serviceImageTarPath(`${root}`, serviceImage)
       if (fs.existsSync(serviceImageTar)) {
         print(`Service image ${serviceImage} already exists`)
       } else {
@@ -10554,7 +17025,10 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     // STEP 4 - Create the META.yaml file if it is not already there
     // **************************
 
-    if (!fs.existsSync(`${disksRoot()}/${device}/META.yaml`)) {
+    if (onSystemDisk) {
+      // The system disk's META is /META.yaml, written at image build; never create a second one
+      print(`System disk ${device}: using existing /META.yaml`)
+    } else if (!fs.existsSync(`${root}/META.yaml`)) {
       log(`Creating META.yaml file on disk ${device}`)
       createMeta(device)
     } else {
@@ -10592,9 +17066,11 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
 
 
     print(chalk.green(`Instance ${instanceId} built`))
+    return instanceId
   } catch (e) {
     print(chalk.red('Error building app instance'))
     console.error(e)
+    return undefined
   }
 }
 
@@ -10678,15 +17154,253 @@ export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, inst
   }
 }
 
-export const createPortNumber = async (store: Store): Promise<PortNumber> => {
+
+/**
+ * Host ports reserved for Engine / Console on host-network fleets.
+ * Prefer A r30: never allocate these to apps (Console serves :8080; :80 legacy/proxy).
+ * Live grade5a Kolibri uses :18080 by fixture — that is instance-owned, not reserved here.
+ */
+export const RESERVED_HOST_PORTS: ReadonlySet<number> = new Set([
+  80,
+  8080,
+])
+
+export const isReservedHostPort = (port: number): boolean => RESERVED_HOST_PORTS.has(port)
+
+/**
+ * Prefer A r30: app-kolibri tag 1.0 host-network compose does not wire `${port}` into
+ * KOLIBRI_HTTP_PORT / KOLIBRI_LISTEN_PORT (process defaults to 8080 → Console collision).
+ * Duration fixtures hardcode 18080. After Engine allocates a free port, keep compose listen
+ * env in sync so the container binds the same port Automerge / Console proxy use.
+ */
+export const syncKolibriHostListenPort = async (composePath: string, port: PortNumber, portZip: PortNumber | null = null): Promise<void> => {
+  if (!fs.existsSync(composePath)) return
+  const raw = await fs.readFile(composePath, 'utf8')
+  let compose: any
+  try {
+    compose = YAML.parse(raw)
+  } catch {
+    return
+  }
+  const services = compose?.services
+  if (!services || typeof services !== 'object') return
+
+  let changed = false
+  for (const name of Object.keys(services)) {
+    const svc = services[name]
+    if (!svc || typeof svc !== 'object') continue
+    if (svc.network_mode !== 'host') continue
+    const img = String(svc.image ?? '')
+    const isKolibri = name.includes('kolibri') || img.includes('kolibri')
+    if (!isKolibri) continue
+
+    const portStr = String(port)
+    const env = svc.environment
+    if (Array.isArray(env)) {
+      const next = [...env]
+      const setEnv = (key: string) => {
+        const idx = next.findIndex((e: unknown) => typeof e === 'string' && (e as string).startsWith(`${key}=`))
+        const line = `${key}=${portStr}`
+        if (idx >= 0) {
+          if (next[idx] !== line) { next[idx] = line; changed = true }
+        } else {
+          next.push(line)
+          changed = true
+        }
+      }
+      setEnv('KOLIBRI_HTTP_PORT')
+      setEnv('KOLIBRI_LISTEN_PORT')
+      if (portZip) {
+        const idx = next.findIndex((e: unknown) => typeof e === 'string' && (e as string).startsWith('KOLIBRI_ZIP_CONTENT_PORT='))
+        // A `${port_zip…}` reference stays: compose resolves it from .env at every up (#267)
+        if (idx < 0 || !String(next[idx]).includes('${port_zip')) {
+          const line = `KOLIBRI_ZIP_CONTENT_PORT=${portZip}`
+          if (idx < 0) { next.push(line); changed = true } else if (next[idx] !== line) { next[idx] = line; changed = true }
+        }
+      }
+      svc.environment = next
+    } else if (env && typeof env === 'object') {
+      if (String(env.KOLIBRI_HTTP_PORT ?? '') !== portStr) { env.KOLIBRI_HTTP_PORT = portStr; changed = true }
+      if (String(env.KOLIBRI_LISTEN_PORT ?? '') !== portStr) { env.KOLIBRI_LISTEN_PORT = portStr; changed = true }
+      if (portZip && !String(env.KOLIBRI_ZIP_CONTENT_PORT ?? '').includes('${port_zip') && String(env.KOLIBRI_ZIP_CONTENT_PORT ?? '') !== String(portZip)) {
+        env.KOLIBRI_ZIP_CONTENT_PORT = String(portZip); changed = true
+      }
+      svc.environment = env
+    } else {
+      svc.environment = [
+        `KOLIBRI_HTTP_PORT=${portStr}`,
+        `KOLIBRI_LISTEN_PORT=${portStr}`,
+        ...(portZip ? [`KOLIBRI_ZIP_CONTENT_PORT=${portZip}`] : []),
+      ]
+      changed = true
+    }
+  }
+
+  if (changed) {
+    await fs.writeFile(composePath, YAML.stringify(compose))
+    log(`Synced KOLIBRI_HTTP_PORT/KOLIBRI_LISTEN_PORT=${port} in ${composePath}`)
+  }
+}
+
+/**
+ * Prefer A r30: `docker compose up -d` can succeed while a host-network process
+ * immediately Exits (e.g. "Port 8080 is occupied"). Probe shortly after up and
+ * throw so startInstance marks Error — never Automerge Running with docker missing.
+ */
+export const assertComposeContainersHealthy = async (instanceDir: string, instanceId: InstanceID): Promise<void> => {
+  void instanceDir
+  await sleep(2500)
+  let psOut = ''
+  try {
+    const format = '{{.Names}}\t{{.Status}}\t{{.ID}}'
+    const r = await $`docker ps -a --filter name=${instanceId} --format ${format}`
+    psOut = (r.stdout || '').trim()
+  } catch (e) {
+    log(`assertComposeContainersHealthy: docker ps failed for ${instanceId}: ${e instanceof Error ? e.message : String(e)}`)
+    return
+  }
+  if (!psOut) {
+    log(`assertComposeContainersHealthy: no containers matching ${instanceId}`)
+    return
+  }
+  const lines = psOut.split('\n').filter(Boolean)
+  const exited: { name: string; status: string; id: string }[] = []
+  for (const line of lines) {
+    const [name, status, id] = line.split('\t')
+    if (!name) continue
+    if (/Exited|Dead/i.test(status || '')) {
+      exited.push({ name, status: status || '', id: id || '' })
+    }
+  }
+  if (exited.length === 0) return
+
+  const parts: string[] = []
+  for (const c of exited) {
+    let logs = ''
+    try {
+      const lr = await $`docker logs --tail 60 ${c.name}`.quiet()
+      logs = `${lr.stdout || ''}${lr.stderr || ''}`.trim()
+    } catch {
+      try {
+        const lr = await $`docker logs --tail 60 ${c.id}`.quiet()
+        logs = `${lr.stdout || ''}${lr.stderr || ''}`.trim()
+      } catch { /* ignore */ }
+    }
+    const occupied = logs.match(/Port\s+\d+\s+is occupied\.?/i)
+    if (occupied) {
+      parts.push(`${c.name}: ${occupied[0]} (${c.status})`)
+    } else {
+      const tail = logs.split('\n').slice(-8).join(' | ')
+      parts.push(`${c.name}: ${c.status}${tail ? ` — ${tail}` : ''}`)
+    }
+  }
+  throw new Error(
+    `Container(s) exited after compose up for ${instanceId}. ` +
+    `Automerge must not stay Running. ${parts.join('; ')}`
+  )
+}
+
+
+/**
+ * Prefer A r40: after compose up, require the instance host port to accept TCP
+ * for a short stable window before Automerge Running. Covers the Kolibri
+ * `start && tail -f` pattern where ZeroConfPlugin dies (~8s) but Docker stays
+ * Up (r40 FAIL@102). When the port stays dead, force-recreate once and
+ * re-probe; still dead → throw (startInstance marks Error).
+ */
+export const assertInstancePortReady = async (
+  instanceId: InstanceID,
+  port: number,
+  instanceDir: string,
+  opts: { readyTimeoutMs?: number; stableMs?: number; forceRecreate?: boolean } = {},
+): Promise<void> => {
+  if (!port || !Number.isFinite(port) || port <= 0) {
+    log(`assertInstancePortReady: no port for ${instanceId}; skipping sidecar probe`)
+    return
+  }
+  const readyTimeoutMs = opts.readyTimeoutMs ?? 60_000
+  const stableMs = opts.stableMs ?? 10_000
+  const forceRecreate = opts.forceRecreate !== false
+
+  const probeStable = async (budgetMs: number): Promise<boolean> => {
+    const deadline = Date.now() + budgetMs
+    let firstReadyAt: number | null = null
+    while (Date.now() < deadline) {
+      const up = await isEngineOnline('127.0.0.1', port)
+      if (up) {
+        if (firstReadyAt === null) firstReadyAt = Date.now()
+        else if (Date.now() - firstReadyAt >= stableMs) return true
+      } else {
+        firstReadyAt = null
+      }
+      await sleep(1000)
+    }
+    return false
+  }
+
+  if (await probeStable(readyTimeoutMs)) {
+    log(`assertInstancePortReady: ${instanceId} :${port} stable for ${stableMs}ms`)
+    return
+  }
+
+  if (forceRecreate) {
+    log(`assertInstancePortReady: ${instanceId} :${port} not ready — force-recreate once (r40/r22)`)
+    try {
+      await $({ cwd: instanceDir } as any)`docker compose up -d --force-recreate`
+    } catch (e: any) {
+      log(`assertInstancePortReady: force-recreate failed: ${e?.message ?? e}`)
+    }
+    await assertComposeContainersHealthy(instanceDir, instanceId)
+    if (await probeStable(readyTimeoutMs)) {
+      log(`assertInstancePortReady: ${instanceId} :${port} stable after force-recreate`)
+      return
+    }
+  }
+
+  // Pull a short log tail to surface ZeroConf / NonUniqueNameException in the Error.
+  let hint = ''
+  try {
+    const format = '{{.Names}}'
+    const r = await $`docker ps -a --filter name=${instanceId} --format ${format}`.quiet()
+    const name = (r.stdout || '').trim().split('\n').filter(Boolean)[0]
+    if (name) {
+      const lr = await $`docker logs --tail 40 ${name}`.quiet()
+      const logs = `${lr.stdout || ''}${lr.stderr || ''}`
+      const m = logs.match(/NonUniqueNameException|ZeroConfPlugin|AttributeError.*name|START_ERROR|Bus state: EXITED/i)
+      if (m) hint = ` Last logs mention: ${m[0]}.`
+      // Also try kolibri.txt inside the container when present.
+      try {
+        const kt = await $`docker exec ${name} tail -n 30 /root/.kolibri/logs/kolibri.txt`.quiet()
+        const klogs = `${kt.stdout || ''}`
+        const km = klogs.match(/NonUniqueNameException|ZeroConfPlugin|AttributeError.*name|START_ERROR/i)
+        if (km) hint = ` Kolibri logs: ${km[0]}.`
+      } catch { /* ignore */ }
+    }
+  } catch { /* ignore */ }
+
+  throw new Error(
+    `Instance ${instanceId} container is up but host port ${port} never stayed ready ` +
+    `for ${stableMs}ms within ${readyTimeoutMs}ms (and after one force-recreate). ` +
+    `Automerge must not stay Running with a dead sidecar.${hint} ` +
+    `If this is Kolibri after copyApp, the copy likely still shares the original morango ` +
+    `instance id (zeroconf NonUniqueNameException); see rebindKolibriMorangoInstanceId.`,
+  )
+}
+
+export const createPortNumber = async (store: Store, exclude: readonly number[] = []): Promise<PortNumber> => {
   let port = randomPort()
   let portInUse = true
   let portInUseResult
   const localEngine = getLocalEngine(store)
   const instances = getInstancesOfEngine(store, localEngine)
 
-  // Check if the port is already in use on the system
+  // Check if the port is already in use on the system / reserved for Console
   while (portInUse) {
+    if (isReservedHostPort(port) || exclude.includes(port)) {
+      log(`Port ${port} is reserved for Engine/Console or excluded. Generating a new one.`)
+      port = randomPort()
+      continue
+    }
     log(`Checking if port ${port} is in use`)
     try {
       portInUseResult = await $`netstat -tuln | grep -w ${port}`
@@ -10694,7 +17408,7 @@ export const createPortNumber = async (store: Store): Promise<PortNumber> => {
       port = randomPort()
     } catch (e) {
       log(`Port ${port} is not in use. Checking if it is reserved by another instance`)
-      const inst = instances.find(instance => instance && instance.port == port)
+      const inst = instances.find(instance => instance && (instance.port == port || Number(instance.portZip ?? 0) == port))
       if (inst) {
         log(`Port ${port} is reserved by another instance. Generating a new one.`)
         //port++
@@ -10723,6 +17437,116 @@ export const checkPortNumber = async (port: PortNumber): Promise<boolean> => {
 // KSW - UNTESTED <<<
 
 /**
+ * The other instance in the store that owns `port` on this engine (idea#168
+ * r35), or undefined. Candidates are the instances on disks docked to this
+ * engine, other than `self`, whose stored port equals `port`; a stored port
+ * stays with an instance while it is stopped, so a copy can no longer take
+ * the port of an original that is down for a moment. When two records claim
+ * the same port (data from before this fix), exactly one of them owns it: a
+ * Running/Starting claimant, else the older record (created, then id), so the
+ * original keeps its port and the newer copy moves.
+ */
+export const storePortOwner = (store: Store, self: Instance, port: number): Instance | undefined => {
+  if (!port) return undefined
+  let engine: ReturnType<typeof getLocalEngine>
+  try { engine = getLocalEngine(store) } catch { return undefined }
+  const me = store.instanceDB?.[self.id] ?? self
+  const myCreated = Number(me.created ?? 0)
+  return getInstancesOfEngine(store, engine).find(other => {
+    if (!other || String(other.id) === String(self.id)) return false
+    if (Number(other.port) !== Number(port) && Number(other.portZip ?? 0) !== Number(port)) return false
+    if (other.status === 'Running' || other.status === 'Starting') return true
+    const otherCreated = Number(other.created ?? 0)
+    return otherCreated < myCreated || (otherCreated === myCreated && String(other.id) < String(self.id))
+  })
+}
+
+/**
+ * Decide the host port for a start (step 1 of startInstance) and write it to
+ * the instance's .env. Keeps the .env port unless it is listening right now
+ * (netstat), reserved for Engine/Console, or owned by another instance in the
+ * store on this engine (storePortOwner, idea#168 r35); otherwise, and when the
+ * .env has no port (a fresh install or a copy), allocates one with
+ * createPortNumber, which skips listening, reserved and store-owned ports.
+ */
+export const choosePortForStart = async (storeHandle: DocHandle<Store>, instance: Instance, envPath: string): Promise<PortNumber> => {
+  let port: PortNumber = 0 as PortNumber
+  try {
+    log(`Trying to find a port number for instance ${instance.id} in the .env file`)
+    port = parseInt(await readEnvVariable(envPath, 'port') as string) as PortNumber
+  } catch (e) {
+    log(`No .env file found for instance ${instance.id}`)
+  }
+  if (!(port == 0) && !isNaN(port)) {
+    log(`Found a port number for instance ${instance.id} in the .env file: ${port}`)
+    // Prefer A r30: if .env port is in use OR reserved (Console :8080), reallocate for
+    // every app — including kolibri. idea#168 r35: also when another instance in the
+    // store owns it (e.g. the original of a copy, stopped for the snapshot).
+    const portInUse = await checkPortNumber(port)
+    const portReserved = isReservedHostPort(port)
+    const owner = portInUse || portReserved ? undefined : storePortOwner(storeHandle.doc(), instance, port)
+    if (portInUse || portReserved || owner) {
+      const why = portReserved ? 'reserved for Engine/Console'
+        : portInUse ? 'already in use'
+        : `owned by instance '${owner!.name}' (${owner!.id}) in the store`
+      log(`Port ${port} is ${why}. Generating a new port number.`)
+      port = await createPortNumber(storeHandle.doc())
+      await addOrUpdateEnvVariable(envPath, 'port', port.toString())
+    } else {
+      log(`Port ${port} is not in use`)
+    }
+  } else {
+    log(`No port number has previously been generated.`)
+    // Prefer A r30: never hardcode kolibri → 8080 (collides with host-net Console).
+    log(`Generating a new port number for instance ${instance.id}.`)
+    port = await createPortNumber(storeHandle.doc())
+    // Write a .env file in which you define the port variable
+    await addOrUpdateEnvVariable(envPath, 'port', port.toString())
+  }
+  return port
+}
+
+/** True when compose text references `${port_zip}` or a default form such as `${port_zip:-8081}` (#267). */
+export const composeUsesPortZip = (composeText: string): boolean => /\$\{port_zip(?=[}:?+-])/.test(composeText)
+
+/** Write one .env variable atomically (temp file + rename), keeping every other line. */
+export const writeEnvVariableAtomic = async (envPath: string, variable: string, value: string): Promise<void> => {
+  const text = fs.existsSync(envPath) ? await fs.readFile(envPath, 'utf8') : ''
+  const lines = text.split('\n')
+  const idx = lines.findIndex(l => l.startsWith(`${variable}=`))
+  if (idx >= 0) lines[idx] = `${variable}=${value}`
+  else {
+    if (lines.length && lines[lines.length - 1] === '') lines.pop()
+    lines.push(`${variable}=${value}`, '')
+  }
+  const tmp = `${envPath}.tmp-${process.pid}-${Date.now()}`
+  await fs.writeFile(tmp, lines.join('\n'))
+  await fs.rename(tmp, envPath)
+}
+
+/**
+ * Decide `port_zip` for a start (agent-engine-dev#267): null unless the compose references
+ * `${port_zip`. Keeps the .env value unless it is listening, reserved, equal to this
+ * instance's `port`, or owned (port or portZip) by another instance in the store; else a
+ * fresh createPortNumber port that is not `port`. Written atomically to .env next to `port`.
+ */
+export const choosePortZipForStart = async (
+  storeHandle: DocHandle<Store>, instance: Instance, envPath: string, composePath: string, port: PortNumber,
+): Promise<PortNumber | null> => {
+  const composeText = fs.existsSync(composePath) ? await fs.readFile(composePath, 'utf8') : ''
+  if (!composeUsesPortZip(composeText)) return null
+  const current = parseInt(await readEnvVariable(envPath, 'port_zip') ?? '') || 0
+  if (current > 0 && current !== Number(port) && !isReservedHostPort(current)
+    && !storePortOwner(storeHandle.doc(), instance, current) && !(await checkPortNumber(current as PortNumber))) {
+    return current as PortNumber
+  }
+  const zip = await createPortNumber(storeHandle.doc(), [Number(port)])
+  await writeEnvVariableAtomic(envPath, 'port_zip', String(zip))
+  log(`Allocated port_zip ${zip} for instance ${instance.id}`)
+  return zip
+}
+
+/**
  * Build a human-readable diagnosis string when an instance fails.
  * Collects: the caught error message + recent docker logs for each service container.
  * Safe to call in a catch block — never throws.
@@ -10736,8 +17560,8 @@ export const diagnoseInstance = async (instance: Instance, disk: Disk, caughtErr
     parts.push(`Engine error: ${msg}`)
   }
 
-  // 2. Docker container logs (last 20 lines per service)
-  if (!config.settings.testMode) {
+  // 2. Docker container logs (last 20 lines per service) — whenever Docker answers (idea#168; was !testMode)
+  if (await dockerAvailable()) {
     for (const image of (instance.serviceImages ?? [])) {
       // Container name convention: <instanceId>-<serviceName>-1
       // Derive service name from image: last path segment before tag
@@ -10756,13 +17580,39 @@ export const diagnoseInstance = async (instance: Instance, disk: Disk, caughtErr
   return parts.join('\n\n') || 'Unknown error'
 }
 
-export const startInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> => {
+/**
+ * Refuse a git ref that git itself would refuse or that could be read as an
+ * option (git check-ref-format rules, simplified). '/' is allowed.
+ */
+export const assertGitRef = (ref: string): void => {
+  const bad = !ref || ref.startsWith('-') || ref.startsWith('/') || ref.endsWith('/') || ref.endsWith('.') ||
+    ref.endsWith('.lock') || ref.includes('..') || ref.includes('//') || ref.includes('@{') ||
+    /[\x00-\x20\x7f~^:?*\[\\]/.test(ref) || ref.split('/').some(c => c.startsWith('.'))
+  if (bad) throw new Error(`Invalid app version / git ref '${ref}'`)
+}
+
+/** Folder-safe form of a ref for <appName>-<version> (one path component): feat/x → feat-x. */
+export const versionDirName = (ref: string): string => {
+  const v = ref.replace(/[^A-Za-z0-9._+-]+/g, '-').replace(/-+/g, '-').replace(/^[-.]+/, '').replace(/-+$/, '')
+  return v || 'ref'
+}
+
+/** argv after `git` for cloning one branch/tag of an App repo; the ref is passed unchanged. */
+export const appCloneArgs = (gitAccount: string, appName: string, ref: string, dest: string): string[] =>
+  ['clone', '--branch', ref, '--', `https://github.com/${gitAccount}/app-${appName}`, dest]
+
+/** #179: every start is tracked in flight on its disk so an eject waits for it to settle. */
+export const startInstance = (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> =>
+  trackInFlight(String(disk.id), `startInstance ${instance.id}`, startInstanceTracked(storeHandle, instance, disk, cause))
+
+const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> => {
   const store: Store = storeHandle.doc()
   print(`Starting instance '${instance.id}' on disk ${disk.id} of engine '${localEngineId}'.`)
 
   // Short-circuit: if containers are already running (e.g. engine restarted while app was up),
   // just update the status to Running and return — no need to recreate containers.
-  if (!config.settings.testMode) {
+  // Gated on a Docker daemon, not testMode (idea#168: the duration pool runs testMode with real Docker).
+  if (await dockerAvailable()) {
     try {
       const ps = await $`docker ps --filter name=${instance.id} --format {{.Names}}`
       if (ps.stdout.trim().length > 0) {
@@ -10770,6 +17620,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
         const port = parseInt(await readEnvVariable(`${await diskMountRoot(disk)}/instances/${instance.id}/.env`, 'port') as string) || 0
         storeHandle.change(doc => {
           const inst = doc.instanceDB[instance.id]
+          if (!inst) return  // #179: never write to (or resurrect) a deleted row
           inst.status = 'Running' as Status
           inst.statusCondition = null
           if (port > 0) inst.port = port as PortNumber
@@ -10798,6 +17649,7 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
   log(`Setting instance '${instance.id}' status to Starting`)
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
+    if (!inst) return  // #179: never write to (or resurrect) a deleted row
     inst.status = 'Starting' as Status
   })
 
@@ -10845,67 +17697,20 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     //   }
     // }
 
-    let port: PortNumber = 0 as PortNumber
+    const port = await choosePortForStart(storeHandle, instance, `${mountRoot}/instances/${instance.id}/.env`)
 
-    // Check if the port is defined in the .env file
-    try {
-      log(`Trying to find a port number for instance ${instance.id} in the .env file`)
-      // const envContent = (await $`cat /disks/${disk.device}/instances/${instance.id}/.env`).stdout
-      // port = parseInt(envContent.split('=')[1].slice(0, -1)) as PortNumber
-      port = parseInt(await readEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'port') as string) as PortNumber
-    } catch (e) {
-      log(`No .env file found for instance ${instance.id}`)
-    }
-    // Check if port is undefined or NaN
-    if (!(port == 0) && !isNaN(port)) {
-      log(`Found a port number for instance ${instance.id} in the .env file: ${port}`)
-
-      // >>> KSW - UNTESTED
-      // Check if the port is already in use on the system
-      const portInUse = await checkPortNumber(port)
-      if (portInUse) {
-        log(`Port ${port} is already in use. Generating a new port number.`)
-        // If the app is kolibri, it means that it has a fixed port and so either another kolibri instance is already running, ]
-        // or it is still running after being stopped because the disk was disconnected. 
-        // If the instance was still running after being stopped, lets wait for 10 secs and try again. If it is still running, we throw an error.
-        if (instance.instanceOf.startsWith('kolibri' as AppID)) {
-          log(`Instance ${instance.id} is a kolibri instance. Waiting 10 seconds to see if the port becomes free.`)
-          await sleep(10000)
-          const portStillInUse = await checkPortNumber(port)
-          if (portStillInUse) {
-            throw new Error(`Port ${port} is still in use after waiting. Cannot start kolibri instance ${instance.id}.`)
-          } else {
-            log(`Port ${port} is now free.`)
-          }
-        } else {
-          port = await createPortNumber(store)
-          // Write the new port number to the .env file
-          await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'port', port.toString())
-        }
-      } else {
-        log(`Port ${port} is not in use`)
-      }
-      // KSW UNTESTED <<<
-
-    } else {
-      log(`No port number has previously been generated.`)
-      // If the app is kolibri, assign it port 8080
-      if (instance.instanceOf.startsWith('kolibri' as AppID)) {
-        port = 8080 as PortNumber
-        log(`Instance ${instance.id} is a kolibri instance. Assigning it port ${port}.`)
-      } else {
-        log(`Generating a new port number for instance ${instance.id}.`)
-        port = await createPortNumber(store)
-      }
-      // Write a .env file in which you define the port variable
-      await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'port', port.toString())
-    }
+    // Host-network Kolibri must listen on the Engine-allocated port (tag 1.0 omit; fixtures hardcode 18080).
+    const portZip = await choosePortZipForStart(storeHandle, instance, `${mountRoot}/instances/${instance.id}/.env`, `${mountRoot}/instances/${instance.id}/compose.yaml`, port)
+    await syncKolibriHostListenPort(`${mountRoot}/instances/${instance.id}/compose.yaml`, port, portZip)
 
     print(`Found a port number for instance ${instance.id}: ${port}`)
     // Assign the port number to the instance object
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
+      if (!inst) return  // #179: never write to (or resurrect) a deleted row
       inst.port = port as PortNumber
+      if (portZip) inst.portZip = portZip
+      else if (inst.portZip) inst.portZip = null
     })
 
     // **************************
@@ -10926,6 +17731,8 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
     } catch (e) {
       log(`No .env file found for instance ${instance.id}`)
     }
+    // A new instance: no pass before this start (idea#202 keys on this)
+    const newInstance = !(pass && !(pass == ""))
     // Check if port is undefined or NaN
     if (pass && !(pass == "")) {
       log(`Found a pass for instance ${instance.id} in the .env file`)
@@ -10936,6 +17743,8 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
       // Write the password to the .env file
       await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'pass', pass)
     }
+    // Separate Nextcloud admin secret, once, for apps whose compose reads it (idea#202)
+    await ensureNcAdminPassword(`${mountRoot}/instances/${instance.id}`, newInstance)
 
 
     // **************************
@@ -11140,6 +17949,29 @@ export const startInstance = async (storeHandle: DocHandle<Store>, instance: Ins
 // }
 
 /**
+ * Write the Engine hostname and eth0 IPv4 address into an instance .env as the
+ * `hostname` and `ip` variables. Applies to every app, not only Nextcloud.
+ * A missing hostname or IP is skipped (logged) rather than written empty.
+ */
+export const writeEngineHostEnv = async (
+  envPath: string,
+  hostname: string | undefined,
+  instanceId: string,
+  interfaces: NodeJS.Dict<os.NetworkInterfaceInfo[]> = os.networkInterfaces(),
+): Promise<void> => {
+  if (hostname) {
+    await addOrUpdateEnvVariable(envPath, 'hostname', hostname)
+  }
+  const ip = interfaces["eth0"]?.find((iface) => iface.family === "IPv4")?.address
+  if (ip) {
+    log(`Found IP address ${ip} for instance ${instanceId}`)
+    await addOrUpdateEnvVariable(envPath, 'ip', ip)
+  } else {
+    log(chalk.red(`No IP address found for instance ${instanceId}`))
+  }
+}
+
+/**
  * Create the containers of an instance (`docker compose create`) and set it to
  * Pauzed. Errors propagate to the caller (idea#109): startInstance turns them
  * into Error status and a failed command-log trace.
@@ -11149,27 +17981,22 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
   const mountRoot = await diskMountRoot(disk)
   log(`Creating the containers for the services of the app instance`)
 
-  // App-specific pre-processing commands
-  const app = store.appDB[instance.instanceOf]
-  if (app && app.name === 'nextcloud') {
+  // Every app, every start: tell the instance which Pi it runs on
+  // (IDEA_HOSTNAME / IDEA_HOST_IPS, agent-engine-dev#163). Rewritten on each
+  // start, so the values follow a moved or copied disk to its new Pi.
+  const instanceDir = `${mountRoot}/instances/${instance.id}`
+  const envPath = `${instanceDir}/.env`
+  const identity = hostIdentity(store)
+  await writeHostIdentityEnv(envPath, identity)
+  log(`Host identity for instance ${instance.id}: IDEA_HOSTNAME=${identity.hostname} IDEA_HOST_IPS=${identity.ips.join(',')}`)
+  // Every app, every start: where this Pi's (or the fleet's) Nextcloud is (#169); '' when none.
+  const ncUrl = nextcloudUrl(store, localEngineId, instance.id)
+  await writeNextcloudUrlEnv(envPath, ncUrl)
+  log(`IDEA_NEXTCLOUD_URL for instance ${instance.id}: ${ncUrl || '(none)'}`)
 
-    // Pass the hostname to the compose file via .env
-    const localEngine = getLocalEngine(store)
-    const hostname = localEngine.hostname
-    if (hostname) {
-      await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'hostname', hostname)
-    }
-
-    // Pass the ip address to the compose file via .env
-    const interfaceData = os.networkInterfaces()
-    const ip = interfaceData["eth0"]?.find((iface) => iface.family === "IPv4")?.address
-    if (ip) {
-      log(`Found IP address ${ip} for instance ${instance.id}`)
-      await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'ip', ip)
-    } else {
-      log(chalk.red(`No IP address found for instance ${instance.id}`))
-    }
-  }
+  // hostname / ip for every app's compose (${hostname}, ${ip}): main's #217
+  // writeEngineHostEnv, which replaced this PR's Nextcloud-only block.
+  await writeEngineHostEnv(envPath, getLocalEngine(store).hostname, instance.id, hostNetworkInterfaces())
 
   log(`Creating containers of app instance '${instance.id}' on disk ${disk.id} of engine ${localEngineId}.`)
   try {
@@ -11184,6 +18011,7 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
   }
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
+    if (!inst) return  // #179: never write to (or resurrect) a deleted row
     inst.status = 'Pauzed' as Status
   })
 }
@@ -11212,6 +18040,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
       log(`Port number extracted from .env file for instance ${instance.id}: ${parsedPort}`)
       storeHandle.change(doc => {
         const inst = doc.instanceDB[instance.id]
+        if (!inst) return  // #179: never write to (or resurrect) a deleted row
         inst.port = parsedPort as PortNumber
       })
     } else {
@@ -11240,6 +18069,26 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
   }
   if (!stillStartable('before compose up')) return
 
+  // r40: Kolibri copyApp leaves .idea-rebind-morango so we mint a fresh morango
+  // instance id before the first advertise (zeroconf NonUniqueNameException).
+  {
+    const home = `${mountRoot}/instances/${instance.id}`
+    const markers = [
+      `${home}/data/kolibri/.idea-rebind-morango`,
+      `${home}/.idea-rebind-morango`,
+    ]
+    const hit: string[] = []
+    for (const m of markers) { if (await fs.pathExists(m)) hit.push(m) }
+    if (hit.length) {
+      try {
+        await rebindKolibriMorangoInstanceId(home)
+        for (const m of hit) await fs.remove(m).catch(() => undefined)
+      } catch (e: any) {
+        throw new Error(`Kolibri morango rebind before start failed: ${e?.message ?? e}`)
+      }
+    }
+  }
+
   // Compose up the app. A failure throws and the instance never becomes Running.
   // Opted-in Apps get COMPOSE_FILE=compose.yaml:<override> (idea#133).
   let mountedDiskIds: DiskID[] | null = null
@@ -11249,7 +18098,17 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
       ? { cwd: `${mountRoot}/instances/${instance.id}`, env: { ...process.env, ...composeEnv } }
       : { cwd: `${mountRoot}/instances/${instance.id}` }
     await $(upOpts)`docker compose up -d`
-    if (composeEnv) {
+    // Prefer A r30: fail loud if host-net process Exits immediately (port occupied, etc.)
+    await assertComposeContainersHealthy(`${mountRoot}/instances/${instance.id}`, instance.id)
+    // Prefer A r40: container Up is not enough (Kolibri start&&tail; ZeroConf death).
+    const readyPort = storeHandle.doc()?.instanceDB?.[instance.id]?.port
+      ?? (port && !isNaN(parseInt(port)) ? parseInt(port) : 0)
+    await assertInstancePortReady(
+      instance.id,
+      Number(readyPort) || 0,
+      `${mountRoot}/instances/${instance.id}`,
+    )
+    if (composeEnv && store.appDB[instance.instanceOf]?.filesMount) {
       // filesMounts only after success — read back from the override we just wrote
       const { mountableFilesDisks } = await import('./FilesMount.js')
       mountedDiskIds = mountableFilesDisks(store).map(d => d.id)
@@ -11263,6 +18122,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
   if (!stillStartable('after compose up')) return
   storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
+    if (!inst) return  // #179: never write to (or resurrect) a deleted row
     inst.lastStarted = new Date().getTime() as Timestamp
     inst.status = 'Running' as Status
     inst.statusCondition = null  // clear any previous error diagnosis
@@ -11271,33 +18131,21 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
 
   print(chalk.green(`App ${instance.id} running`))
   clearStep(storeHandle, instance.id)
+  // idea#193 §4: reconcile USB stick storages once the App runs (x-app.usbMount.sync)
+  if (storeHandle.doc()?.appDB?.[instance.instanceOf]?.usbMount?.sync) {
+    const { syncUsbApps } = await import('./UsbSticks.js')
+    void syncUsbApps(storeHandle, 'start', true, instance.id)
+  }
 
-  // App-specific post-processing commands
-  // If the app on which the instance is based is nextcloud, 
-  //    find the IP address of the server and store it in IPADDRESS
-  //    issue the following command: runuser --user www-data -- php occ config:app:set --value=http://<${PADDRESS}:9980 richdocuments wopi_url
-  const app = store.appDB[instance.instanceOf]
-  const ip = await readEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'ip')
-  if (app && app.name === 'nextcloud') {
-    if (ip) {
-      try {
-        // For unclear reasons, the occ command sometimes does not work, preventing the start of the container
-        // So we catch the error so that the container can still start
-        log(`Configuring nextcloud office`)
-        log('Sleeping for 20 seconds to allow the app to start')
-        await sleep(20000)
-        log(`Running the occ command to use the Collabora server at ${ip}:9980`)
-        await $`docker exec ${instance.id}-nextcloud-app-1 runuser --user www-data -- php occ config:app:set --value=http://${ip}:9980 richdocuments wopi_url`
-        log('Running the occ commands to set the trusted domains')
-        await $`docker exec ${instance.id}-nextcloud-app-1 runuser --user www-data -- php occ config:system:set trusted_domains 0 --value=*.local:*`
-        await $`docker exec ${instance.id}-nextcloud-app-1 runuser --user www-data -- php occ config:system:set trusted_domains 2 --value=192.168.0.*:*`
-        log(`occ commands executed`)
-      } catch (e) {
-        log(chalk.red(`Error configuring nextcloud office to use the Collabora server at ${ip}:9980`))
-        console.error(e)
-        await markInstanceError(storeHandle, instance, disk, e)
-      }
-    }
+  // Nextcloud post-start bridge. TODO-remove (agent-engine-dev#163) once every
+  // disk's app-nextcloud carries before-starting/20-idea-trusted-domains.sh.
+  // Sets the full trusted_domains list for this Pi (same managed-key algorithm as
+  // the hook, so it is a no-op after the hook ran) and the Collabora wopi_url.
+  // No fixed wait (the port-ready probe already ran) and never marks Error: a
+  // failing occ only logs. Replaces the old `*.local:*` / `192.168.0.*:*` hack.
+  if (await isNextcloudInstance(`${mountRoot}/instances/${instance.id}`)) {
+    const ip = await readEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'ip')
+    await nextcloudTrustedDomainsBridge(instance.id, hostIdentity(storeHandle.doc() ?? store), undefined, ip || undefined)
   }
 }
 
@@ -11361,6 +18209,7 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
     // Set the status of the instance to Stopped
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
+      if (!inst) return  // #179: never write to (or resurrect) a deleted row
       inst.status = 'Stopped' as Status // Set the status to Stopped when the instance is stopped
     })
     clearStep(storeHandle, instance.id)
@@ -11375,6 +18224,7 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
     const condition = await diagnoseInstance(instance, disk, e)
     storeHandle.change(doc => {
       const inst = doc.instanceDB[instance.id]
+      if (!inst) return  // #179: never write to (or resurrect) a deleted row
       inst.status = 'Error' as Status
       inst.statusCondition = condition
     })
@@ -11389,6 +18239,781 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
 
 ```
 
+## File: src/data/InstanceArg.ts
+```typescript
+/**
+ * InstanceArg.ts — resolve an instance argument id-first (idea#168).
+ *
+ * Instance names are not unique: copyApp used to give the copy the original's
+ * name, so two instances named e.g. "kolibri" could exist, and name lookups
+ * (findInstanceByName, `find(i => i.name === …)`) silently took the first one.
+ * Every command that takes an instance argument now goes through this module:
+ *
+ *   1. Id first. An instanceDB key equal to the argument wins.
+ *   2. Unique name. Exactly one instance with that name.
+ *   3. Name on the command's disk. When several instances share the name and
+ *      the command also names a disk (startInstance/stopInstance/runInstance
+ *      `<instance> <diskId|diskName>`, copyApp/moveApp `<instance> <sourceDiskId> …`),
+ *      exactly one of them stored on that disk. This keeps the Console's wire
+ *      format (`startInstance <name> <storedOn>`, `copyApp <name> <sourceDiskId> …`)
+ *      working and unambiguous.
+ *   4. Otherwise refused: ambiguous (the candidate ids are listed) or not found.
+ */
+
+import type { Store } from './Store.js'
+import type { Instance } from './Instance.js'
+import type { InstanceID } from './CommonTypes.js'
+
+export type InstanceArgLookup =
+    | { ok: true; instance: Instance; via: 'id' | 'name' | 'name-on-disk' }
+    | { ok: false; reason: 'not-found' }
+    | { ok: false; reason: 'ambiguous'; candidates: Instance[] }
+
+/** True when the instance is stored on the disk given as an id or a disk name. */
+export const instanceIsOnDisk = (store: Store, instance: Instance, diskArg: string): boolean => {
+    if (!instance.storedOn) return false
+    if (String(instance.storedOn) === diskArg) return true
+    const disk = store.diskDB?.[instance.storedOn]
+    return !!disk && String(disk.name) === diskArg
+}
+
+/** Pure lookup; see the module comment for the order. Never throws. */
+export const lookupInstanceArg = (store: Store, arg: string, diskArg?: string): InstanceArgLookup => {
+    const byId = store.instanceDB?.[arg as InstanceID]
+    if (byId) return { ok: true, instance: byId, via: 'id' }
+    const named = Object.values(store.instanceDB ?? {}).filter(i => i && String(i.name) === arg)
+    if (named.length === 0) return { ok: false, reason: 'not-found' }
+    if (named.length === 1) return { ok: true, instance: named[0], via: 'name' }
+    if (diskArg) {
+        const onDisk = named.filter(i => instanceIsOnDisk(store, i, diskArg))
+        if (onDisk.length === 1) return { ok: true, instance: onDisk[0], via: 'name-on-disk' }
+        if (onDisk.length > 1) return { ok: false, reason: 'ambiguous', candidates: onDisk }
+    }
+    return { ok: false, reason: 'ambiguous', candidates: named }
+}
+
+export const describeInstanceCandidates = (candidates: Instance[]): string =>
+    candidates.map(i => `${i.id} (on disk ${i.storedOn ?? 'none'})`).join(', ')
+
+/**
+ * Command form: returns the instance or throws (so the command trace ends as
+ * `error`). A name that was only unambiguous on the given disk logs a warning
+ * into the trace, naming the id to use instead.
+ */
+export const resolveInstanceArg = (store: Store, arg: string, command: string, diskArg?: string): Instance => {
+    const r = lookupInstanceArg(store, arg, diskArg)
+    if (r.ok) {
+        if (r.via === 'name-on-disk') {
+            console.warn(`${command}: instance name '${arg}' is shared by several instances; using ${r.instance.id}, the one on disk ${diskArg}. Send the instance id.`)
+        }
+        return r.instance
+    }
+    if (r.reason === 'ambiguous') {
+        throw new Error(`${command}: instance name '${arg}' is ambiguous: ${describeInstanceCandidates(r.candidates)}. Use the instance id.`)
+    }
+    throw new Error(`${command}: instance '${arg}' not found.`)
+}
+
+/**
+ * True when the instance is stored on a disk that is docked to the given Engine
+ * (an App Disk or the system disk of that Engine).
+ */
+export const instanceIsOnEngine = (store: Store, instance: Instance, engineId: string): boolean => {
+    if (!instance?.storedOn) return false
+    const disk = store.diskDB?.[instance.storedOn]
+    return !!disk && String(disk.dockedTo) === String(engineId)
+}
+
+export type LocalInstanceArgLookup =
+    | { ok: true; instance: Instance; via: 'id' | 'name' }
+    | { ok: false; reason: 'not-found' }
+    | { ok: false; reason: 'not-local'; instance: Instance }
+    | { ok: false; reason: 'ambiguous'; candidates: Instance[] }
+
+/**
+ * Lookup scoped to one Engine (createBackupDisk, kind-panda / happy-zebra 2026-10-17):
+ * kit Engines share one store and have instances with identical names, so a name
+ * must only match instances stored on disks docked to this Engine.
+ *   1. Id first: accepted when that instance is on this Engine, else 'not-local'.
+ *   2. Exactly one instance with that name on this Engine.
+ *   3. Otherwise refused: ambiguous on this Engine, or not found on this Engine.
+ * Never throws.
+ */
+export const lookupLocalInstanceArg = (store: Store, arg: string, engineId: string): LocalInstanceArgLookup => {
+    const byId = store.instanceDB?.[arg as InstanceID]
+    if (byId) return instanceIsOnEngine(store, byId, engineId) ? { ok: true, instance: byId, via: 'id' } : { ok: false, reason: 'not-local', instance: byId }
+    const named = Object.values(store.instanceDB ?? {}).filter(i => i && String(i.name) === arg && instanceIsOnEngine(store, i, engineId))
+    if (named.length === 1) return { ok: true, instance: named[0], via: 'name' }
+    if (named.length > 1) return { ok: false, reason: 'ambiguous', candidates: named }
+    return { ok: false, reason: 'not-found' }
+}
+
+/** Command form of lookupLocalInstanceArg: returns the instance or throws. */
+export const resolveLocalInstanceArg = (store: Store, arg: string, command: string, engineId: string): Instance => {
+    const r = lookupLocalInstanceArg(store, arg, engineId)
+    if (r.ok) return r.instance
+    if (r.reason === 'ambiguous') {
+        throw new Error(`${command}: instance name '${arg}' is ambiguous on this Engine: ${describeInstanceCandidates(r.candidates)}. Use the instance id.`)
+    }
+    if (r.reason === 'not-local') {
+        throw new Error(`${command}: instance ${arg} is not on this Engine (stored on disk ${r.instance.storedOn ?? 'none'}, not docked here).`)
+    }
+    throw new Error(`${command}: instance '${arg}' not found on this Engine.`)
+}
+
+```
+
+## File: src/data/InstanceCopy.ts
+```typescript
+/**
+ * InstanceCopy.ts — helpers for commands that copy an instance folder
+ * (copyApp, moveApp, installApp from a disk). idea#168 r35.
+ *
+ *  - assertNoExternalLinks: refuse instance data that links off the disk.
+ *    rsync -a (copy/move) and fs.copy (install) reproduce a symlink verbatim,
+ *    so a link that leaves the instance folder makes the copy share the
+ *    original's data (r35: two Kolibris on one SQLite DB). We refuse rather
+ *    than dereference: dereferencing silently copies an arbitrarily large
+ *    external tree.
+ *  - uniqueCopyName: the copy's instance name (`<name>-2`, `<name>-3`, …).
+ *  - clearEnginePort: drop the Engine-written `port=` line from a copied .env
+ *    so startInstance allocates a fresh, store-checked port for the copy.
+ *  - setComposeInstanceName: write the copy's name into compose.yaml
+ *    `x-app.instanceName`, which createOrUpdateInstance stores.
+ *  - rebindKolibriMorangoInstanceId: give a Kolibri copy its own morango
+ *    instance id so host-network zeroconf does not NonUniqueNameException
+ *    when the original and the copy both advertise (r40 FAIL@102).
+ */
+
+import path from 'path'
+import crypto from 'crypto'
+import { fs, chalk, $ } from 'zx'
+import { parseDocument } from 'yaml'
+import { log } from '../utils/utils.js'
+import type { Store } from './Store.js'
+import type { InstanceName } from './CommonTypes.js'
+
+// ── Off-disk links ────────────────────────────────────────────────────────────
+
+export interface ExternalLink {
+    /** The link, relative to the instance folder (e.g. 'data/kolibri') */
+    link: string
+    /** Where it points: the resolved real path when it exists, else the lexical target */
+    target: string
+}
+
+const isWithin = (p: string, root: string): boolean => {
+    const rel = path.relative(root, p)
+    return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel))
+}
+
+/**
+ * Every symlink under `root` that resolves outside `root` (lexically, or after
+ * following the link chain). Symlinked directories are not descended into.
+ * A directory the Engine (pi) cannot read is skipped with a log line: rsync /
+ * fs.copy cannot read it either, so nothing in it can be copied as a link.
+ */
+export const findExternalLinks = async (root: string): Promise<ExternalLink[]> => {
+    const rootLex = path.resolve(root)
+    let rootReal: string | undefined
+    const realRoot = async (): Promise<string> => {
+        if (rootReal === undefined) {
+            try { rootReal = await fs.realpath(rootLex) } catch { rootReal = rootLex }
+        }
+        return rootReal as string
+    }
+    const found: ExternalLink[] = []
+    const walk = async (dir: string): Promise<void> => {
+        let entries: any[]
+        try {
+            entries = await fs.readdir(dir, { withFileTypes: true }) as any[]
+        } catch (e: any) {
+            if (dir !== rootLex || e?.code !== 'ENOENT') {
+                log(chalk.yellow(`findExternalLinks: cannot read ${dir} (${e?.code ?? e}); skipped`))
+            }
+            return
+        }
+        for (const entry of entries ?? []) {
+            if (!entry || typeof entry !== 'object' || typeof entry.isSymbolicLink !== 'function') continue
+            const p = path.join(dir, entry.name)
+            if (entry.isSymbolicLink()) {
+                let raw: string
+                try { raw = await fs.readlink(p) } catch { continue }
+                const lexical = path.resolve(path.dirname(p), raw)
+                const rr = await realRoot()
+                let real: string | null = null
+                try { real = await fs.realpath(p) } catch { /* dangling link */ }
+                const lexicalInside = isWithin(lexical, rootLex) || isWithin(lexical, rr)
+                const realInside = real === null || isWithin(real, rr) || isWithin(real, rootLex)
+                if (!lexicalInside || !realInside) {
+                    found.push({ link: path.relative(rootLex, p), target: real ?? lexical })
+                }
+            } else if (entry.isDirectory()) {
+                await walk(p)
+            }
+        }
+    }
+    await walk(rootLex)
+    return found
+}
+
+/**
+ * The refusal text for off-disk links (no command prefix): names each link and
+ * its target, the folder and the disk.
+ */
+export const externalLinksMessage = (
+    instanceDir: string,
+    disk: { id: unknown, name: unknown },
+    links: ExternalLink[],
+): string => {
+    const shown = links.slice(0, 10).map(l => `'${l.link}' -> '${l.target}'`).join(', ')
+    const more = links.length > 10 ? ` (and ${links.length - 10} more)` : ''
+    return `instance data links off the disk: ${shown}${more}. ` +
+        `These links in ${instanceDir} on disk '${disk.name}' (${disk.id}) resolve outside the instance folder, ` +
+        `so the result would share that data with the original. Replace each link with the real data, then retry.`
+}
+
+/** Throw `<command>: instance data links off the disk: …` when there is any. */
+export const assertNoExternalLinks = async (
+    command: string,
+    instanceDir: string,
+    disk: { id: unknown, name: unknown },
+): Promise<void> => {
+    const links = await findExternalLinks(instanceDir)
+    if (links.length > 0) throw new Error(`${command}: ${externalLinksMessage(instanceDir, disk, links)}`)
+}
+
+// ── Copy name ─────────────────────────────────────────────────────────────────
+
+/**
+ * The instance name for a copy: `<base>-<n>` with the smallest n >= 2 that no
+ * instance in the store (any engine) uses. The base is the original's name,
+ * except that a name that is itself a copy name (`<x>-<n>`, n >= 2, where an
+ * instance named `<x>` exists) continues that series: copying `kolibri-2`
+ * gives `kolibri-3`, not `kolibri-2-2`. Names such as `kolibri-grade5a-001`
+ * are kept whole (`kolibri-grade5a-001-2`).
+ */
+export const uniqueCopyName = (store: Store, name: string): InstanceName => {
+    const taken = new Set(Object.values(store.instanceDB ?? {}).filter(Boolean).map(i => String(i.name)))
+    let base = name
+    const m = /^(.+)-([1-9]\d*)$/.exec(name)
+    if (m && Number(m[2]) >= 2 && taken.has(m[1])) base = m[1]
+    for (let n = 2; ; n++) {
+        const candidate = `${base}-${n}`
+        if (!taken.has(candidate)) return candidate as InstanceName
+    }
+}
+
+// ── Copied .env / compose.yaml ────────────────────────────────────────────────
+
+/**
+ * Remove the Engine-written `port=` and `port_zip=` (#267) lines from .env text. Other lines (pass,
+ * hostname, ip, app keys) are kept. App/fixture keys such as
+ * KOLIBRI_HTTP_PORT in .env are not Engine-written and are left alone: the
+ * Engine rewrites the compose listen env to the allocated port at every start
+ * (syncKolibriHostListenPort).
+ */
+export const clearEnginePort = (envText: string): string =>
+    envText.split('\n').filter(line => !/^port(_zip)?=/.test(line)).join('\n')
+
+/** Set compose.yaml `x-app.instanceName`, keeping comments and layout. */
+export const setComposeInstanceName = (composeText: string, name: string): string => {
+    const doc = parseDocument(composeText)
+    if (doc.errors.length > 0) throw new Error(`compose.yaml does not parse: ${doc.errors[0].message}`)
+    doc.setIn(['x-app', 'instanceName'], name)
+    return doc.toString()
+}
+
+/**
+ * The copy's rewritten files, built from the SOURCE instance folder (so the
+ * same content serves a local and a cross-engine target). A file that does not
+ * exist in the source is omitted.
+ */
+export const preparedCopyFiles = async (
+    instanceSrc: string,
+    copyName: string,
+): Promise<{ 'compose.yaml'?: string, '.env'?: string }> => {
+    const out: { 'compose.yaml'?: string, '.env'?: string } = {}
+    const read = async (f: string): Promise<string | null> => {
+        try { return await fs.readFile(`${instanceSrc}/${f}`, 'utf8') } catch (e: any) {
+            if (e?.code === 'ENOENT') return null
+            throw e
+        }
+    }
+    const compose = await read('compose.yaml')
+    if (typeof compose === 'string') out['compose.yaml'] = setComposeInstanceName(compose, copyName)
+    const env = await read('.env')
+    if (typeof env === 'string') out['.env'] = clearEnginePort(env)
+    return out
+}
+
+// ── Kolibri morango identity on copy (r40) ────────────────────────────────────
+
+/**
+ * Kolibri 0.15 zeroconf registers with the current morango InstanceIDModel id.
+ * copyApp clones the SQLite home, so the copy keeps the original's id. Two
+ * host-network Kolibris on the same LAN then hit NonUniqueNameException, the
+ * bus exits, and `start && tail -f` leaves Docker "Up" with nothing on the port
+ * (r40 FAIL@102 move_app). Mint a fresh 32-hex id for the copy's current row
+ * before the copy starts. mDNS itself stays on (Koen rule) — only the service
+ * instance id changes.
+ *
+ * No-op when the folder is not a Kolibri home or has no current row. Throws when
+ * the DB exists but cannot be updated.
+ */
+export const rebindKolibriMorangoInstanceId = async (instanceDir: string): Promise<string | null> => {
+    const dbPath = path.join(instanceDir, 'data', 'kolibri', 'db.sqlite3')
+    if (!(await fs.pathExists(dbPath))) return null
+
+    const newId = crypto.randomBytes(16).toString('hex')
+    // Stale pid/cache from the source must not convince Kolibri it is already up.
+    for (const rel of ['data/kolibri/server.pid', 'data/kolibri/process_cache']) {
+        try { await fs.remove(path.join(instanceDir, rel)) } catch { /* ignore */ }
+    }
+
+    // python3 + stdlib sqlite3 (no better-sqlite3 dependency on the Engine host).
+    const script =
+        'import sqlite3,sys\n' +
+        'db,new_id=sys.argv[1],sys.argv[2]\n' +
+        'c=sqlite3.connect(db)\n' +
+        "row=c.execute('select id from morango_instanceidmodel where current=1').fetchone()\n" +
+        'if not row:\n' +
+        " print('none'); c.close(); raise SystemExit(0)\n" +
+        "c.execute('update morango_instanceidmodel set id=? where current=1',(new_id,))\n" +
+        'c.commit(); c.close(); print(new_id)\n'
+
+    let result
+    try {
+        result = await $`python3 -c ${script} ${dbPath} ${newId}`.quiet()
+    } catch (e: any) {
+        const msg = (e?.stderr?.toString?.() || e?.message || String(e)).trim()
+        throw new Error(
+            `rebindKolibriMorangoInstanceId: cannot update ${dbPath}: ${msg}. ` +
+            `Without a fresh morango id, a host-network Kolibri copy will clash with the original on zeroconf.`,
+        )
+    }
+    const out = (result.stdout || '').trim()
+    if (out === 'none' || !out) {
+        log(`rebindKolibriMorangoInstanceId: no current morango row in ${dbPath}; leaving as-is`)
+        return null
+    }
+    log(`rebindKolibriMorangoInstanceId: ${dbPath} current id → ${out}`)
+    return out
+}
+
+/** True when this instance folder looks like Kolibri (data home or compose). */
+export const instanceDirLooksLikeKolibri = async (instanceDir: string): Promise<boolean> => {
+    if (await fs.pathExists(path.join(instanceDir, 'data', 'kolibri', 'db.sqlite3'))) return true
+    try {
+        const raw = await fs.readFile(path.join(instanceDir, 'compose.yaml'), 'utf8')
+        return /kolibri/i.test(raw)
+    } catch {
+        return false
+    }
+}
+
+```
+
+## File: src/data/InstanceInFlight.ts
+```typescript
+/**
+ * InstanceInFlight.ts — in-flight instance starts/installs per disk (#179).
+ *
+ * ejectDisk/undockDisk must not stop and unmount a disk while a start (or an install
+ * that ends in a start) is still running on it: the start would carry on against the
+ * unmounted disk and leave the row in Error/Pauzed (idea#168 r82b/r83). There is no
+ * cancel API, so the undock waits for those to settle (bounded), then stops them.
+ */
+import { log } from '../utils/utils.js'
+
+const inFlight = new Map<string, { diskId: string; label: string; promise: Promise<unknown> }>()
+let seq = 0
+
+/** Register `promise` as in flight on `diskId` until it settles (resolve or reject). */
+export const trackInFlight = <T>(diskId: string, label: string, promise: Promise<T>): Promise<T> => {
+    const key = `${label}#${++seq}`
+    inFlight.set(key, { diskId: String(diskId), label, promise })
+    const done = () => { inFlight.delete(key) }
+    promise.then(done, done)
+    return promise
+}
+
+/** Labels of the operations currently in flight on `diskId`. */
+export const inFlightOnDisk = (diskId: string): string[] =>
+    [...inFlight.values()].filter(e => e.diskId === String(diskId)).map(e => e.label)
+
+/** Default bound for the eject wait; IDEA_EJECT_INFLIGHT_WAIT_MS overrides. */
+export const ejectInFlightWaitMs = (env: NodeJS.ProcessEnv = process.env): number => {
+    const n = Number(env.IDEA_EJECT_INFLIGHT_WAIT_MS)
+    return Number.isFinite(n) && n >= 0 && env.IDEA_EJECT_INFLIGHT_WAIT_MS !== undefined && env.IDEA_EJECT_INFLIGHT_WAIT_MS !== '' ? n : 120_000
+}
+
+/**
+ * Wait until nothing is in flight on `diskId`, at most `timeoutMs`. Never throws:
+ * returns what settled and what was still running at the timeout (the caller then stops it).
+ */
+export const waitInFlightOnDisk = async (diskId: string, timeoutMs: number): Promise<{ waitedMs: number; timedOut: string[] }> => {
+    const t0 = Date.now()
+    for (;;) {
+        const pending = [...inFlight.values()].filter(e => e.diskId === String(diskId))
+        if (pending.length === 0) return { waitedMs: Date.now() - t0, timedOut: [] }
+        const left = timeoutMs - (Date.now() - t0)
+        if (left <= 0) return { waitedMs: Date.now() - t0, timedOut: pending.map(e => e.label) }
+        log(`Waiting up to ${left}ms for ${pending.map(e => e.label).join(', ')} on disk ${diskId} to settle before undock`)
+        let timer: NodeJS.Timeout | undefined
+        await Promise.race([
+            Promise.allSettled(pending.map(e => e.promise)),
+            new Promise<void>(r => { timer = setTimeout(r, left) }),
+        ])
+        if (timer) clearTimeout(timer)
+    }
+}
+
+/** Test hook. */
+export const resetInFlightForTests = (): void => { inFlight.clear() }
+
+// ── Undock pending + dock identity (hw180 idea04, 2026-10-13) ───────────────────────────
+
+const undockPending = new Map<string, number>()
+
+/** An undock (eject, erase or physical removal) of `diskId` has begun and has not finished. */
+export const markUndockPending = (diskId: string): void => { undockPending.set(String(diskId), (undockPending.get(String(diskId)) ?? 0) + 1) }
+export const clearUndockPending = (diskId: string): void => {
+    const n = (undockPending.get(String(diskId)) ?? 0) - 1
+    if (n > 0) undockPending.set(String(diskId), n); else undockPending.delete(String(diskId))
+}
+export const isUndockPending = (diskId: string): boolean => (undockPending.get(String(diskId)) ?? 0) > 0
+
+/** What identifies one dock of a disk: device node, engine, dock time (generation). */
+export interface DockIdentity { device: string | null; dockedTo: string | null; lastDocked: number | null }
+export const dockIdentityOf = (d: { device?: unknown; dockedTo?: unknown; lastDocked?: unknown } | null | undefined): DockIdentity => ({
+    device: (d?.device as string) ?? null, dockedTo: (d?.dockedTo as string) ?? null, lastDocked: (d?.lastDocked as number) ?? null,
+})
+
+/**
+ * Why the dock `before` (captured when the eject began) is no longer the disk's current dock
+ * `now` (store record after the in-flight wait); null when it is still the same dock.
+ */
+export const dockChangedReason = (before: DockIdentity, now: DockIdentity | null): string | null => {
+    if (!now || !now.dockedTo || !now.device) return `disk is no longer docked (was ${before.device})`
+    if (now.dockedTo !== before.dockedTo) return `disk is now docked to ${now.dockedTo} (was ${before.dockedTo})`
+    if (now.device !== before.device) return `disk was re-docked on ${now.device} (was ${before.device})`
+    if (now.lastDocked !== before.lastDocked) return `disk was re-docked on ${now.device} (dock generation ${before.lastDocked} → ${now.lastDocked})`
+    return null
+}
+
+/** Thrown by assertSameDockAfterWait: the disk's dock changed while a long step ran (#170, #196). */
+export class DockChangedError extends Error {
+    constructor(public reason: string, what: string) { super(`${what}: stopped, ${reason}; nothing registered`) }
+}
+
+/**
+ * Shared re-check-after-wait (#170, #196, #239): call after any long await that ran against a
+ * disk (an in-flight wait, a copy, a build). Throws DockChangedError when the disk's current
+ * dock is no longer `before` (pulled, re-docked on another device or Engine, or re-docked again),
+ * so the caller never writes the store or starts containers for a dock that is gone.
+ */
+export const assertSameDockAfterWait = (
+    store: { diskDB?: Record<string, any> } | undefined,
+    diskId: string,
+    before: DockIdentity,
+    what: string,
+): void => {
+    const reason = dockChangedReason(before, dockIdentityOf(store?.diskDB?.[diskId]))
+    if (reason) throw new DockChangedError(reason, what)
+}
+
+/**
+ * Why a failed start on `diskId` is a pulled disk rather than a real start failure; null = real failure.
+ * `deviceAtStart` is the device the start ran against; `deviceExists` checks the node (injected for tests).
+ */
+export const startDiskGoneReason = (diskId: string, deviceAtStart: string | null, now: DockIdentity | null,
+    deviceExists: ((dev: string) => boolean) | null): string | null => {
+    if (isUndockPending(diskId)) return 'an undock of the disk is pending'
+    if (!now || !now.dockedTo || !now.device) return 'the disk is no longer docked'
+    if (deviceAtStart && now.device !== deviceAtStart) return `the disk moved from ${deviceAtStart} to ${now.device}`
+    if (deviceExists && deviceAtStart && !deviceExists(deviceAtStart)) return `device ${deviceAtStart} is gone`
+    return null
+}
+
+/** Test hook. */
+export const resetUndockPendingForTests = (): void => { undockPending.clear() }
+
+```
+
+## File: src/data/LanAddress.ts
+```typescript
+/**
+ * LanAddress: the LAN IPv4 address this Engine publishes as Engine.lanAddress
+ * (agent-console-dev#138: Open works without mDNS). The Console can link apps
+ * to http://<lanAddress>:<port> when `<hostname>.local` doesn't resolve.
+ *
+ * Choice, in order:
+ *   0. Preferred LAN (settings.lanPreferCidrs, default ['10.42.0.0/16'], the school/kit
+ *      LAN range): an eligible address inside one of those CIDRs wins over everything
+ *      below, even when another interface (home Wi-Fi, a USB tether) holds the default
+ *      route. Several: the default-route interface first, then wired over wireless,
+ *      then the lowest address. An empty list switches this step off.
+ *   1. The default-route interface (lowest metric among the up default routes in
+ *      /proc/net/route) when it has an eligible address. This is eth0 on a wired
+ *      Pi, wlan0 on a Wi-Fi-only Pi, and the lower-metric one when both are up.
+ *   2. No usable default route (offline school LAN, or the default route goes via
+ *      Tailscale or a container bridge): the first eligible address, wired (eth*, en*)
+ *      before wireless (wlan*, wl*) before others.
+ *   3. Nothing eligible: null.
+ * Eligible: IPv4, not internal, not link-local 169.254.0.0/16, not Tailscale/CGNAT
+ * 100.64.0.0/10, and not on a virtual interface (docker*, br-*, veth*, virbr*,
+ * cni*, flannel*, lxc*, tailscale*, wg*, zt*).
+ *
+ * Engine.lanAddresses lists every eligible address in this same order (lanAddress is
+ * its first entry), so a Console can fall back or match its own subnet.
+ *
+ * Written at start (createOrUpdateEngine) and checked on every heartbeat; the
+ * store is written only when the value changes (e.g. a DHCP renewal).
+ */
+import os from 'os'
+import { readFileSync } from 'fs'
+import { lanPreferCidrs } from './Config.js'
+
+type Ifaces = ReturnType<typeof os.networkInterfaces>
+
+/** Injectable for tests: the interfaces and the /proc/net/route text this host reports. */
+const realOps = {
+    networkInterfaces: (): Ifaces => os.networkInterfaces(),
+    routeTable: (): string => { try { return readFileSync('/proc/net/route', 'utf8') } catch { return '' } },
+}
+let ops = { ...realOps }
+/** Tests only: replace the interface / route source (null: the real host). */
+export const setLanAddressOpsForTests = (o: Partial<typeof realOps> | null): void => {
+    ops = { ...realOps, ...(o ?? {}) }
+}
+
+export const VIRTUAL_IFACE = /^(docker|br-|veth|virbr|cni|flannel|lxc|lxd|tailscale|wg|zt|tun|tap)/
+
+const ipv4ToInt = (ip: string): number => ip.split('.').reduce((a, o) => (a * 256) + Number(o), 0)
+
+const IPV4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/
+/** 'a.b.c.d/n' → { base, bits }, or null when it is not an IPv4 CIDR. */
+export const parseCidr = (cidr: string): { base: string; bits: number } | null => {
+    if (typeof cidr !== 'string') return null
+    const m = /^([0-9.]+)\/(\d{1,2})$/.exec(cidr.trim())
+    if (!m || !IPV4.test(m[1])) return null
+    const bits = Number(m[2])
+    return bits >= 0 && bits <= 32 ? { base: m[1], bits } : null
+}
+const inCidr = (ip: string, base: string, bits: number): boolean => {
+    const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0
+    return ((ipv4ToInt(ip) & mask) >>> 0) === ((ipv4ToInt(base) & mask) >>> 0)
+}
+
+/** An address the Console on the school LAN could reach. */
+export const isEligibleLanIPv4 = (iface: string, a: { address: string; family: string | number; internal: boolean }): boolean =>
+    (a.family === 'IPv4' || a.family === 4)
+    && !a.internal
+    && !VIRTUAL_IFACE.test(iface)
+    && !inCidr(a.address, '169.254.0.0', 16)
+    && !inCidr(a.address, '100.64.0.0', 10)
+    && !inCidr(a.address, '127.0.0.0', 8)
+
+/** Interfaces carrying an up default route, lowest metric first (from /proc/net/route text). */
+export const defaultRouteIfaces = (routeText: string): string[] => {
+    const rows: { iface: string; metric: number }[] = []
+    for (const line of routeText.split('\n').slice(1)) {
+        const f = line.trim().split(/\s+/)
+        if (f.length < 8) continue
+        const [iface, dest, , flags, , , metric, mask] = f
+        const up = (parseInt(flags, 16) & 0x1) === 0x1
+        if (dest === '00000000' && mask === '00000000' && up) rows.push({ iface, metric: Number(metric) || 0 })
+    }
+    rows.sort((a, b) => a.metric - b.metric)
+    return [...new Set(rows.map(r => r.iface))]
+}
+
+const rank = (n: string) => /^(eth|en)/.test(n) ? 0 : /^(wlan|wl)/.test(n) ? 1 : 2
+
+export interface LanCandidate { iface: string; address: string }
+
+/**
+ * Every eligible address, in selection order (see the module comment): first the ones
+ * inside a preferred CIDR (default-route interface, then wired, then lowest address),
+ * then the rest in the #166 order (default-route interfaces by metric, then wired before
+ * wireless before others, by name; an interface's own address order kept). preferCidrs
+ * defaults to [] here (pure #166 order); currentLanSelection passes the setting.
+ */
+export const lanCandidates = (ifaces: Ifaces, routeText: string, preferCidrs: string[] = []): LanCandidate[] => {
+    const routeOrder = defaultRouteIfaces(routeText)
+    const routeIdx = (n: string) => { const i = routeOrder.indexOf(n); return i < 0 ? Number.MAX_SAFE_INTEGER : i }
+    const prefer = (preferCidrs ?? []).map(parseCidr).filter((c): c is { base: string; bits: number } => c !== null)
+    const preferred = (ip: string) => prefer.some(c => inCidr(ip, c.base, c.bits))
+    const all: (LanCandidate & { pos: number })[] = []
+    for (const [iface, addrs] of Object.entries(ifaces ?? {})) {
+        (addrs ?? []).forEach((a, pos) => { if (isEligibleLanIPv4(iface, a as any)) all.push({ iface, address: a.address, pos }) })
+    }
+    const seen = new Set<string>()
+    const unique = (l: typeof all) => l.filter(c => !seen.has(c.address) && (seen.add(c.address), true))
+    const tierA = all.filter(c => preferred(c.address)).sort((a, b) =>
+        routeIdx(a.iface) - routeIdx(b.iface) || rank(a.iface) - rank(b.iface) || ipv4ToInt(a.address) - ipv4ToInt(b.address))
+    const tierB = all.filter(c => !preferred(c.address)).sort((a, b) =>
+        routeIdx(a.iface) - routeIdx(b.iface) || rank(a.iface) - rank(b.iface) || a.iface.localeCompare(b.iface) || a.pos - b.pos)
+    return [...unique(tierA), ...unique(tierB)].map(({ iface, address }) => ({ iface, address }))
+}
+
+/** Pick the LAN IPv4 (see the module comment), or null. */
+export const pickLanAddress = (ifaces: Ifaces, routeText: string, preferCidrs: string[] = []): string | null =>
+    lanCandidates(ifaces, routeText, preferCidrs)[0]?.address ?? null
+
+/** What the Engine publishes: lanAddress (+ its interface, for the log) and lanAddresses. */
+export interface LanSelection { address: string | null; iface: string | null; addresses: string[] | null }
+
+/** This host's LAN selection now, with settings.lanPreferCidrs. */
+export const currentLanSelection = (): LanSelection => {
+    try {
+        const c = lanCandidates(ops.networkInterfaces(), ops.routeTable(), lanPreferCidrs())
+        return c.length ? { address: c[0].address, iface: c[0].iface, addresses: c.map(x => x.address) } : { address: null, iface: null, addresses: null }
+    } catch {
+        return { address: null, iface: null, addresses: null }
+    }
+}
+
+/** This host's LAN IPv4 now. */
+export const currentLanAddress = (): string | null => currentLanSelection().address
+
+const sameList = (a: readonly string[] | null | undefined, b: readonly string[] | null | undefined): boolean =>
+    (a ?? null) === null || (b ?? null) === null ? (a ?? null) === (b ?? null) : a!.length === b!.length && a!.every((x, i) => x === b![i])
+
+/**
+ * The log lines for a change from the stored values to sel (empty: nothing changed).
+ *   Engine lanAddress <old|unset> → <new|null> (<iface>)       (no "(iface)" when null)
+ *   Engine lanAddresses [<old, ...>|unset] → [<new, ...>|null]  (only when the list changed)
+ */
+export const lanChangeLines = (stored: { lanAddress?: string | null; lanAddresses?: readonly string[] | null }, sel: LanSelection): string[] => {
+    const out: string[] = []
+    if ((stored.lanAddress ?? null) !== sel.address) {
+        out.push(`Engine lanAddress ${stored.lanAddress ?? 'unset'} → ${sel.address ?? 'null'}${sel.address && sel.iface ? ` (${sel.iface})` : ''}`)
+    }
+    if (!sameList(stored.lanAddresses, sel.addresses)) {
+        const fmt = (l: readonly string[] | null | undefined, none: string) => l ? `[${l.join(', ')}]` : none
+        out.push(`Engine lanAddresses ${fmt(stored.lanAddresses, stored.lanAddresses === null ? 'null' : 'unset')} → ${fmt(sel.addresses, 'null')}`)
+    }
+    return out
+}
+
+```
+
+## File: src/data/Liveness.ts
+```typescript
+/**
+ * Liveness.ts: this Engine's heartbeat without store history (store-design
+ * PROPOSAL, Koen decision 2026-10-13).
+ *
+ * Before: every 30 s each Engine wrote engineDB[self].lastRun into the shared
+ * store doc (8.6k changes/day for 3 Pis, kept forever). Now:
+ *   - every HB_INTERVAL_MS (10 s) an automerge-repo ephemeral message on the
+ *     store handle: { type: 'idea/hb', v: 1, engineId, now, bootedAt }. Engines
+ *     relay it to every peer of the doc (test/automated/ephemeral-relay.test.ts),
+ *     so a Console on any Pi sees every Pi. It is never stored.
+ *   - engineDB[self].lastRun is still the stored "last seen" (written at boot and
+ *     at most once per LAST_SEEN_INTERVAL_MS, 1 h): 24 changes/day per Pi. The
+ *     field name is kept so old Engines and Consoles keep reading it.
+ *   - peers' hb pings are remembered in memory (receive time on OUR clock);
+ *     PeerAccess's stale rule uses max(stored lastRun, last ping), so the
+ *     7-day expiry (and peer-verify's short test threshold) still works.
+ */
+import { DocHandle } from '@automerge/automerge-repo'
+import { Store } from './Store.js'
+import { Timestamp } from './CommonTypes.js'
+import { log } from '../utils/utils.js'
+import { currentLanSelection, lanChangeLines, LanSelection } from './LanAddress.js'
+
+export const HB_INTERVAL_MS = 10_000
+export const LAST_SEEN_INTERVAL_MS = 60 * 60 * 1000
+export const HB_TYPE = 'idea/hb'
+export const METRICS_TYPE = 'idea/metrics'
+
+export interface HbMessage { type: typeof HB_TYPE, v: 1, engineId: string, now: number, bootedAt: number | null }
+
+/** engineId -> when we last received its hb or metrics (our clock). */
+const pings = new Map<string, number>()
+
+/** When we last heard a live message from `engineId` (our clock), or undefined. */
+export const peerLiveSeen = (engineId: string): number | undefined => pings.get(engineId)
+/** Tests only. */
+export const clearPeerPings = (): void => { pings.clear() }
+
+/** Record an incoming ephemeral message; returns true when it was one of ours. */
+export const notePing = (message: unknown, receivedAt: number = Date.now()): boolean => {
+    const m = message as { type?: unknown, engineId?: unknown } | null
+    if (!m || (m.type !== HB_TYPE && m.type !== METRICS_TYPE) || typeof m.engineId !== 'string' || !m.engineId) return false
+    pings.set(m.engineId, receivedAt)
+    return true
+}
+
+/**
+ * Write engineDB[self].lastRun when it is missing or at least `intervalMs` old
+ * (or `force`). Returns true when it wrote.
+ */
+export const writeLastSeen = (handle: DocHandle<Store>, engineId: string, now: number, intervalMs = LAST_SEEN_INTERVAL_MS, force = false): boolean => {
+    const eng: any = (handle.doc() as any)?.engineDB?.[engineId]
+    if (!eng) return false
+    const last = Number(eng.lastRun)
+    if (!force && Number.isFinite(last) && last > 0 && now - last < intervalMs && now >= last) return false
+    handle.change((d: any) => { const e = d.engineDB?.[engineId]; if (e) e.lastRun = now as Timestamp })
+    log(`last seen (lastRun) stored: ${now}`)
+    return true
+}
+
+/**
+ * Engine.lanAddress / lanAddresses (agent-console-dev#138, #165): re-read the LAN IPv4s
+ * on every beat and store them only when they changed (DHCP, cable out), so they add no
+ * store history while the addresses are stable. Returns true when it wrote.
+ */
+export const writeLanAddress = (handle: DocHandle<Store>, engineId: string, sel: LanSelection = currentLanSelection()): boolean => {
+    const eng: any = (handle.doc() as any)?.engineDB?.[engineId]
+    if (!eng) return false
+    const lines = lanChangeLines(eng, sel)
+    if (!lines.length) return false
+    for (const l of lines) log(l)
+    const addrChanged = (eng.lanAddress ?? null) !== sel.address
+    const listChanged = lines.length > (addrChanged ? 1 : 0)
+    handle.change((d: any) => {
+        const e = d.engineDB?.[engineId]
+        if (!e) return
+        if (addrChanged) e.lanAddress = sel.address
+        if (listChanged) e.lanAddresses = sel.addresses ? [...sel.addresses] : null
+    })
+    return true
+}
+
+export const hbMessage = (handle: DocHandle<Store>, engineId: string, now: number): HbMessage => {
+    const booted = Number((handle.doc() as any)?.engineDB?.[engineId]?.lastBooted)
+    return { type: HB_TYPE, v: 1, engineId, now, bootedAt: Number.isFinite(booted) ? booted : null }
+}
+
+export interface LivenessOptions {
+    hbIntervalMs?: number
+    lastSeenIntervalMs?: number
+    now?: () => number
+}
+
+/** Start the hb broadcast, the hourly lastSeen write and the ping listener. Returns stop(). */
+export const startLiveness = (handle: DocHandle<Store>, engineId: string, opts: LivenessOptions = {}): (() => void) => {
+    const now = opts.now ?? Date.now
+    const onEphemeral = (ev: any) => { notePing(ev?.message) }
+    handle.on('ephemeral-message', onEphemeral)
+    const beat = () => {
+        try {
+            handle.broadcast(hbMessage(handle, engineId, now()))
+            writeLastSeen(handle, engineId, now(), opts.lastSeenIntervalMs ?? LAST_SEEN_INTERVAL_MS)
+            writeLanAddress(handle, engineId)
+        } catch (e) { log(`liveness: ${e}`) }
+    }
+    beat()
+    const t = setInterval(beat, opts.hbIntervalMs ?? HB_INTERVAL_MS)
+    return () => { clearInterval(t); handle.off('ephemeral-message', onEphemeral) }
+}
+
+```
+
 ## File: src/data/Meta.ts
 ```typescript
 import { $, chalk, fs, YAML } from 'zx'
@@ -11396,7 +19021,8 @@ import { posix } from 'path'
 import pack from '../../package.json' with { type: "json" }
 import { deepPrint, fileExists, log, stripPartition, uuid, print } from '../utils/utils.js'
 import { DeviceName, DiskID, DiskName, Timestamp, Version } from './CommonTypes.js'
-import { config, disksRoot } from './Config.js'
+import { disksRoot, skipHardwareId, skipMetaUpdate } from './Config.js'
+import { HardwareIdentity, readPartitionFacts, resolveHardwareDiskId } from './DiskIdentity.js'
 
 export interface DiskMeta {
   diskId: DiskID         
@@ -11495,11 +19121,58 @@ export const ensureSystemMeta = async (
   return meta
 }
 
-export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMeta> => {
+/**
+ * The serial of the drive behind a device plus the partition facts the diskId
+ * depends on (idea#168 D4, DiskIdentity.ts). undefined when the drive has no
+ * hardware serial (readHardwareId: Intenso / Samsung FIT only).
+ */
+export const readHardwareIdentity = async (
+  device: DeviceName,
+  deps: { readHardwareId?: (d: DeviceName) => Promise<DiskID | undefined>, readPartitionFacts?: typeof readPartitionFacts } = {},
+): Promise<HardwareIdentity | undefined> => {
+  const serial = await (deps.readHardwareId ?? readHardwareId)(device)
+  if (!serial) return undefined
+  const facts = await (deps.readPartitionFacts ?? readPartitionFacts)(device)
+  return {
+    serial: String(serial),
+    self: facts.self ?? { name: device, partn: null, partuuid: null, fstype: null },
+    siblings: facts.siblings,
+  }
+}
+
+/**
+ * The diskId for a partition that has no META.yaml yet: the drive serial for a
+ * single-partition drive, `<serial>-<PARTUUID>` when the drive has several ext4
+ * partitions (idea#168 D4); undefined without a hardware serial.
+ */
+export const newHardwareDiskId = async (
+  device: DeviceName,
+  readIdentity: (d: DeviceName) => Promise<HardwareIdentity | undefined> = (d) => readHardwareIdentity(d),
+): Promise<DiskID | undefined> => {
+  const identity = await readIdentity(device).catch(() => undefined)
+  if (!identity) return undefined
+  const r = resolveHardwareDiskId(null, identity)
+  log(`Hardware id for ${device}: ${r.diskId} (drive serial ${identity.serial}, PARTUUID ${identity.self.partuuid ?? '-'})`)
+  return r.diskId
+}
+
+export interface MetaIdDeps {
+  /** Hardware identity of an App Disk partition (serial + partition facts) */
+  readIdentity: (device: DeviceName) => Promise<HardwareIdentity | undefined>
+  /** Serial of the system disk (its id stays the bare serial) */
+  readHardwareId: (device: DeviceName) => Promise<DiskID | undefined>
+}
+
+export const readMetaUpdateId = async (deviceSpec?: DeviceName, depsIn: Partial<MetaIdDeps> = {}): Promise<DiskMeta> => {
+  const deps: MetaIdDeps = {
+    readIdentity: depsIn.readIdentity ?? ((d) => readHardwareIdentity(d)),
+    readHardwareId: depsIn.readHardwareId ?? ((d) => readHardwareId(d)),
+  }
   let path
   let device: DeviceName
   // Every Engine runs on a Pi with a real /META.yaml. We always read it.
-  // testMode only affects hardware ID lookup (skipped) and writeMeta (skipped) — not identity.
+  // skipHardwareId() gates the hardware ID lookup and skipMetaUpdate() the rewrite
+  // (both default to isDev || testMode; idea#168) — not identity.
   try {
     if (deviceSpec) {
       path = `${disksRoot()}/${deviceSpec}/META.yaml`
@@ -11514,7 +19187,7 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
         device = sourceParts[1] as DeviceName  // e.g. sda2 from /dev/sda2
       } else {
         // Non-block root (overlay, etc.) — device is only used for hardware-id
-        // lookup, which is skipped in testMode/isDev. Use a stable placeholder.
+        // lookup, which skipHardwareId() usually skips there. Use a stable placeholder.
         device = 'system' as DeviceName
         log(`Root SOURCE is '${rootSource}' (non-/dev); using device placeholder '${device}'`)
       }
@@ -11523,7 +19196,7 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
 
     // The system disk's /META.yaml: create it when it is missing (idea#145)
     if (!deviceSpec) {
-      await ensureSystemMeta(device, { allowCreate: !config.settings.isDev && !config.settings.testMode })
+      await ensureSystemMeta(device, { allowCreate: allowSystemMetaCreate() })
     }
 
     //log(`Our current dir is ${await $`pwd`} with content ${await $`ls`} and path ${path}`)
@@ -11544,14 +19217,25 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
       let update = false
 
       // Find the hardware id.
-      // In testMode/isDev: skip block device access and use the id from the META file as-is.
-      // Fixture disks have isHardwareId: false and a stable generated id — no hardware lookup needed.
+      // skipHardwareId() (default isDev || testMode): skip block device access and use the id
+      // from the META file as-is. Fixture disks have isHardwareId: false and a stable generated
+      // id — with the lookup on, they find no serial and keep it.
       let diskId: DiskID
-      if (config.settings.isDev || config.settings.testMode) {
-        log(`testMode/isDev: using diskId from META file (${meta.diskId}), skipping hardware id lookup`)
+      if (skipHardwareId()) {
+        log(`skipHardwareId: using diskId from META file (${meta.diskId}), skipping hardware id lookup`)
         diskId = meta.diskId
       } else {
-        diskId = await readHardwareId(device) as DiskID
+        // App Disk partitions: serial + partition identity (idea#168 D4, DiskIdentity.ts).
+        // The system disk keeps the bare root-drive serial (the Engine id depends on it).
+        const identity = deviceSpec ? await deps.readIdentity(device).catch(() => undefined) : undefined
+        if (identity) {
+          const r = resolveHardwareDiskId(meta, identity)
+          log(`Disk id for ${device}: ${r.diskId} (${r.decision}; drive serial ${identity.serial}, PARTUUID ${identity.self.partuuid ?? '-'}, partition ${identity.self.partn ?? '-'})`)
+          diskId = r.diskId
+          if (String(meta.diskId) !== String(diskId)) meta.isHardwareId = r.isHardwareId
+        } else {
+          diskId = (deviceSpec ? undefined : await deps.readHardwareId(device)) as DiskID
+        }
         if (!diskId) {
           log(`No hardware id found for device ${device}`)
           if (meta.hasOwnProperty('isHardwareId') && meta.isHardwareId) {
@@ -11595,8 +19279,8 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
       }
 
       // Update the META file if necessary.
-      // Skip in testMode/isDev — we don't want to mutate fixtures (or /META.yaml, which needs sudo).
-      if (update && !config.settings.isDev && !config.settings.testMode) {
+      // skipMetaUpdate() (default isDev || testMode) leaves fixtures and /META.yaml untouched.
+      if (update && !skipMetaUpdate()) {
         await writeMeta(meta, path)
       }
       return meta
@@ -11610,20 +19294,42 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName): Promise<DiskMet
   }
 }
 
-export const readHardwareId = async (device: DeviceName): Promise<DiskID | undefined> => {
+/** /META.yaml may be created when missing unless skipMetaUpdate() (idea#145, idea#168). */
+export const allowSystemMetaCreate = (): boolean => !skipMetaUpdate()
+
+/**
+ * Which serial reader a block device needs, from its sysfs model and vendor.
+ * The vendor compare is case-insensitive (idea#168): an Intenso stick reports
+ * 'INTENSO' on some kernels/firmware and 'Intenso' on others (idea01).
+ */
+export const hardwareIdReaderFor = (model: string, vendor: string): 'samsungFit' | 'intenso' | null => {
+  if (model.trim() === 'Flash Drive FIT') return 'samsungFit'
+  if (vendor.trim().toUpperCase() === 'INTENSO') return 'intenso'
+  return null
+}
+
+export interface HardwareIdDeps {
+  readSysfs: (path: string) => Promise<string>
+  samsungFit: (device: DeviceName) => Promise<DiskID | undefined>
+  intenso: (device: DeviceName) => Promise<DiskID | undefined>
+}
+
+export const readHardwareId = async (device: DeviceName, deps: Partial<HardwareIdDeps> = {}): Promise<DiskID | undefined> => {
   log(`Reading disk id for device ${device}`)
+  const readSysfs = deps.readSysfs ?? (async (p: string) => (await $`cat ${p}`).stdout)
   try {
     const rootDevice = stripPartition(device)
     log(`Root device is ${rootDevice}`)
     //const model = (await $`lsblk -o MODEL /dev/${rootDevice} --noheadings`).stdout.trim()
-    const model = (await $`cat /sys/block/${rootDevice}/device/model`).stdout.trim()
+    const model = (await readSysfs(`/sys/block/${rootDevice}/device/model`)).trim()
     log(`Model is ${model}`)
-    const vendor = (await $`cat /sys/block/${rootDevice}/device/vendor`).stdout.trim()
+    const vendor = (await readSysfs(`/sys/block/${rootDevice}/device/vendor`)).trim()
     log(`Vendor is ${vendor}`)
-    if (model === 'Flash Drive FIT') {
-      return await readHardwareIdSamsungFIT(device)
-    } else if (vendor === 'INTENSO') {
-      return await readHardwareIdIntenso(device)
+    const reader = hardwareIdReaderFor(model, vendor)
+    if (reader === 'samsungFit') {
+      return await (deps.samsungFit ?? readHardwareIdSamsungFIT)(device)
+    } else if (reader === 'intenso') {
+      return await (deps.intenso ?? readHardwareIdIntenso)(device)
     } else {
       log(`Model ${model} of vendor ${vendor} not recognized`)
       return undefined
@@ -11674,7 +19380,7 @@ export const readHardwareIdIntenso = async (device: DeviceName): Promise<DiskID 
 export const createMeta = async (device: DeviceName, engineVersion: Version | undefined = undefined): Promise<DiskMeta> => {
   // Find the hardware id
   let isHardwareId
-  let diskId = await readHardwareId(device) as DiskID
+  let diskId = await newHardwareDiskId(device) as DiskID
   if (!diskId) {
     diskId = uuid() as DiskID
     isHardwareId = false
@@ -11862,12 +19568,14 @@ export const addMeta = async (exec: any, hostname: string, version: string) => {
 ```typescript
 import { BrowserWebSocketClientAdapter, WebSocketClientAdapter } from "@automerge/automerge-repo-network-websocket";
 import { Engine } from './Engine.js'
-import { findIp, log } from '../utils/utils.js';
+import { findIp, log, print } from '../utils/utils.js';
 import { EngineID, Hostname, IPAddress, InterfaceName, PortNumber, Timestamp } from './CommonTypes.js';
 import { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
 import { config } from './Config.js';
 import { Store, findRunningEngineByHostname } from "./Store.js";
 import { readStoreDocId } from "./StoreIdentity.js";
+import { describeRefusal, isForeignStoreDoc, PeerVerdict, RefusalLog, storeTag } from "./StoreScope.js";
+import { ClientRefusal, StoreScopedWebSocketClientAdapter } from "./StoreScopedClientAdapter.js";
 
 const settings = config.settings
 
@@ -11912,6 +19620,17 @@ export const network: Network = {
 }
 
 const MAX_MISSED_DISCOVERIES = 3;
+
+/**
+ * Store-scoped peering (StoreScope.ts): a peer (ip:port) that was refused because it
+ * belongs to another store, or is an old Engine without a store tag, is not dialled
+ * again for REFUSED_PEER_BACKOFF_MS (mDNS discovery and the static-peer supervisor
+ * would otherwise redial it every 10 s). After that one new attempt is made, so a
+ * peer that was moved into our store (or upgraded) is picked up on its own.
+ */
+export const REFUSED_PEER_BACKOFF_MS = 5 * 60_000
+export const refusedPeers = new Map<string, { until: number, verdict: PeerVerdict, by: 'local' | 'remote' }>()
+const outboundRefusalLog = new RefusalLog(print)
 
 // **********
 // Functions
@@ -11985,18 +19704,34 @@ export const disconnectEngine = (repo: Repo, address: IPAddress, port: PortNumbe
 
 
 
-export const connectEngine = async (repo:Repo, address: IPAddress, hostname: Hostname, engineId: EngineID, storeDocId: DocumentId): Promise<WebSocketClientAdapter | undefined> => {
+export const connectEngine = async (repo:Repo, address: IPAddress, hostname: Hostname, engineId: EngineID, storeDocId: DocumentId, peerPort?: PortNumber): Promise<WebSocketClientAdapter | undefined> => {
 
-  const port = settings.port as PortNumber || 1234 as PortNumber
+  // peerPort: static peers (StaticPeers.ts) only; mDNS peers use the own port as before
+  const port = peerPort ?? (settings.port as PortNumber || 1234 as PortNumber)
+  const key = `${address}:${port}`
+  const ownTag = storeTag(storeDocId)
 
-  log(`Connecting to engine at ${address}:${port}`)
+  const refused = refusedPeers.get(key)
+  if (refused && refused.until > Date.now()) {
+    log(`[store-scope] Not dialling ${key} (${hostname}): refused at ${new Date(refused.until - REFUSED_PEER_BACKOFF_MS).toISOString()} (${refused.verdict.kind}); next attempt after ${new Date(refused.until).toISOString()}`)
+    return undefined
+  }
+
+  log(`Connecting to engine at ${key}`)
 
 
   log(`Checking connection with ${address}`)
-  if (!network.connections.hasOwnProperty(`${address}:${port}`) && address !== 'localhost' && address !== '127.0.0.1') {
-    log(`Creating a new connection to ${address}:${port}`)
+  if (!network.connections.hasOwnProperty(key) && address !== 'localhost' && address !== '127.0.0.1') {
+    log(`Creating a new connection to ${key}`)
 
-    const clientConnection = new WebSocketClientAdapter(`ws://${address}:${port}`)
+    // Store-scoped client: the server's peerId must carry our store tag, or the
+    // link is dropped before any document is exchanged (StoreScopedClientAdapter.ts).
+    const clientConnection: StoreScopedWebSocketClientAdapter = new StoreScopedWebSocketClientAdapter(`ws://${key}`, {
+      ownTag,
+      docGuard: (documentId) => isForeignStoreDoc(repo as any, storeDocId, documentId),
+      onRefused: (r) => refuseEngine(repo, key, hostname, ownTag, clientConnection, r),
+    })
+    refusedPeers.delete(key)
     repo.networkSubsystem.addNetworkAdapter(clientConnection)
     
     log(`Finding document with ID: ${storeDocId}`);
@@ -12006,22 +19741,42 @@ export const connectEngine = async (repo:Repo, address: IPAddress, hostname: Hos
     await handle.whenReady(); // Ensure it's loaded before returning
     log(`Handle is ready. State: ${handle.state}`);
 
+    if (clientConnection.refusal) {
+      log(`Connection to ${key} was refused by the store check; not registered`)
+      return undefined
+    }
+
     handle.on('change', () => {
       // no-op: CRDT sync events are handled by storeMonitor
     });
 
-    network.connections[`${address}:${port}`] = { adapter: clientConnection, missedDiscoveryCount: 0, hostname, engineId };
+    network.connections[key] = { adapter: clientConnection, missedDiscoveryCount: 0, hostname, engineId };
     
-    log(`Created an websocket client connection on adddress ws://${address}:${port}`)
+    log(`Created an websocket client connection on adddress ws://${key}`)
     return clientConnection
   } else {
     // Return a resolved promise of ConnectionResult
-    log(`Connection to ${address}:${port} already exists or address is localhost or 127.0.0.1`)
-    if (network.connections[`${address}:${port}`]) {
-        network.connections[`${address}:${port}`].missedDiscoveryCount = 0;
+    log(`Connection to ${key} already exists or address is localhost or 127.0.0.1`)
+    if (network.connections[key]) {
+        network.connections[key].missedDiscoveryCount = 0;
     }
     return undefined
   }
+}
+
+/**
+ * The store check refused the link to `key` (we refused the server, or it refused
+ * us): log it (peer address, its store, ours), drop the adapter and the connection
+ * entry, and back off before dialling it again.
+ */
+const refuseEngine = (repo: Repo, key: string, hostname: Hostname, ownTag: string, adapter: StoreScopedWebSocketClientAdapter, r: ClientRefusal): void => {
+  refusedPeers.set(key, { until: Date.now() + REFUSED_PEER_BACKOFF_MS, verdict: r.verdict, by: r.by })
+  const where = r.by === 'local' ? `outbound to ${key} (${hostname})` : `outbound to ${key} (${hostname}), which refused us`
+  outboundRefusalLog.report(`out|${key}|${r.verdict.kind}|${r.verdict.theirTag ?? ''}`,
+    describeRefusal(r.verdict, ownTag, r.remotePeerId, where) + ` Not dialling it again for ${REFUSED_PEER_BACKOFF_MS / 60_000} min.`)
+  try { repo.networkSubsystem.removeNetworkAdapter(adapter) } catch (e: any) { log(`removeNetworkAdapter after refusal: ${e?.message ?? e}`) }
+  const conn = network.connections[key as IPAddress]
+  if (conn && conn.adapter === adapter) delete network.connections[key as IPAddress]
 }
 
 /**
@@ -12091,9 +19846,12 @@ export const RECOVERY_STRATEGY: Record<OperationKind, RecoveryStrategy> = {
     backupApp:     'retry',   // BorgBackup — idempotent; lock file already guards double-run
     restoreApp:    'fail',    // restore may have partially written target — safer to fail
     upgradeApp:    'fail',    // not yet implemented
+    updateApp:     'fail',    // #230: recoverInterruptedUpdates rolls back from the .pre-update snapshot first
     upgradeEngine: 'fail',    // not yet implemented
     startApp:      'fail',    // partial start state unknown — operator must re-issue
     stopApp:       'fail',    // partial stop state unknown — operator must re-issue
+    flashCard:     'fail',    // idea#201: never retried; Failed 'INTERRUPTED: ...'
+    initialiseDisk:'fail',    // idea#201: operator re-issues
 }
 
 // ── Operation CRUD ────────────────────────────────────────────────────────────
@@ -12132,7 +19890,7 @@ export const createOperation = (
 export const updateOperation = (
     storeHandle: DocHandle<Store>,
     id: string,
-    patch: Partial<Pick<Operation, 'status' | 'progressPercent' | 'currentStep' | 'totalSteps' | 'stepLabel' | 'completedAt' | 'error'>>
+    patch: Partial<Pick<Operation, 'status' | 'progressPercent' | 'currentStep' | 'totalSteps' | 'stepLabel' | 'completedAt' | 'error' | 'safeToRemove'>>
 ): void => {
     // Log a step-advance marker before mutating the store.
     // Uses console.log directly (not log()) so it always lands in the CommandLog trace
@@ -12150,6 +19908,10 @@ export const updateOperation = (
             print(`└${bar}┘`)
         }
     }
+    // Store design 2026-10-13: progress is written only when the step (or status,
+    // or anything else) changes. A patch that only moves progressPercent inside the
+    // same step (rsync percentages, 1-2k changes/day kept forever) is not stored.
+    if (isProgressOnly(patch)) return
     storeHandle.change(doc => {
         const op = doc.operationDB?.[id]
         if (!op) return
@@ -12160,6 +19922,7 @@ export const updateOperation = (
         if (patch.stepLabel !== undefined) op.stepLabel = patch.stepLabel
         if (patch.completedAt !== undefined) op.completedAt = patch.completedAt
         if (patch.error !== undefined) op.error = patch.error
+        if (patch.safeToRemove !== undefined) op.safeToRemove = patch.safeToRemove
         // Clear step progress when operation reaches a terminal state
         if (patch.status === 'Done' || patch.status === 'Failed' || patch.status === 'Cancelled') {
             op.currentStep = null
@@ -12167,6 +19930,67 @@ export const updateOperation = (
             op.stepLabel = null
         }
     })
+}
+
+/** True when `patch` only carries progressPercent (no step, status or other field). */
+export const isProgressOnly = (patch: Record<string, unknown>): boolean => {
+    const keys = Object.keys(patch).filter(k => patch[k] !== undefined)
+    return keys.length > 0 && keys.every(k => k === 'progressPercent')
+}
+
+// ── Archiving finished operations (store design 2026-10-13) ──────────────────
+
+/** Finished operations older than this move out of the store into the CommandLog. */
+export const OPERATION_ARCHIVE_AGE_MS = 7 * 24 * 60 * 60 * 1000
+/** Operations per archive trace (one CommandLog trace each). */
+export const OPERATION_ARCHIVE_BATCH = 100
+const FINISHED: ReadonlySet<string> = new Set(['Done', 'Failed', 'Cancelled'])
+
+/**
+ * This Engine's finished operations (Done/Failed/Cancelled) whose completedAt
+ * (or startedAt when missing) is older than `ageMs` on this Engine's clock.
+ * Only our own: each Engine archives the ops it ran, so no two Engines archive
+ * the same record.
+ */
+export const operationsToArchive = (store: Store | undefined, engineId: string, now: number, ageMs = OPERATION_ARCHIVE_AGE_MS): Operation[] => {
+    const out: Operation[] = []
+    for (const op of Object.values(store?.operationDB ?? {}) as Operation[]) {
+        if (!op || String(op.engineId) !== engineId || !FINISHED.has(String(op.status))) continue
+        const at = Number(op.completedAt ?? op.startedAt)
+        if (Number.isFinite(at) && at > 0 && now - at > ageMs) out.push(op)
+    }
+    return out.sort((a, b) => Number(a.completedAt ?? a.startedAt) - Number(b.completedAt ?? b.startedAt))
+}
+
+/**
+ * Move old finished operations into the CommandLog (a closed 'archiveOperations'
+ * trace per batch; result = JSON array of the records), then delete them from
+ * operationDB. Nothing is deleted when there is no CommandLog. Returns how many
+ * were archived.
+ */
+export const archiveOldOperations = async (
+    storeHandle: DocHandle<Store>,
+    opts: { engineId?: string, now?: number, ageMs?: number, commandLog?: DocHandle<any> | null } = {},
+): Promise<number> => {
+    const cl = opts.commandLog === undefined ? getCommandLogHandle() : opts.commandLog
+    if (!cl) return 0
+    const engineId = opts.engineId ?? String(localEngineId)
+    const now = opts.now ?? Date.now()
+    const ops = operationsToArchive(storeHandle.doc(), engineId, now, opts.ageMs)
+    let archived = 0
+    for (let i = 0; i < ops.length; i += OPERATION_ARCHIVE_BATCH) {
+        const batch = ops.slice(i, i + OPERATION_ARCHIVE_BATCH)
+        const traceId = `archive-ops-${now}-${i / OPERATION_ARCHIVE_BATCH}`
+        addTrace(cl, {
+            traceId, command: 'archiveOperations', args: JSON.stringify([engineId, batch.length]),
+            startedAt: now, completedAt: now, status: 'ok', errorMessage: null,
+            result: JSON.stringify(batch.map(op => JSON.parse(JSON.stringify(op)))),
+        })
+        storeHandle.change(doc => { for (const op of batch) delete (doc.operationDB as any)[op.id] })
+        archived += batch.length
+    }
+    if (archived) print(`archived ${archived} finished operation(s) older than ${Math.round((opts.ageMs ?? OPERATION_ARCHIVE_AGE_MS) / 86_400_000)} days into the CommandLog`)
+    return archived
 }
 
 // ── Active process registry ──────────────────────────────────────────────
@@ -12181,6 +20005,14 @@ const _activeProcesses = new Map<string, ChildProcess>()
 export const registerProcess = (opId: string, proc: ChildProcess): void => {
     _activeProcesses.set(opId, proc)
     log(`registerProcess: registered process for op ${opId} (pid ${proc.pid})`)
+}
+
+/** SIGTERM the process registered for `opId` (e.g. a thermal pause of a Fetch); false when none. */
+export const killRegisteredProcess = (opId: string): boolean => {
+    const proc = _activeProcesses.get(opId)
+    if (!proc) return false
+    proc.kill('SIGTERM')
+    return true
 }
 
 export const deregisterProcess = (opId: string): void => {
@@ -12292,14 +20124,22 @@ export const cancelOperation = (
  */
 export const recoverInterruptedOperations = async (
     storeHandle: DocHandle<Store>,
-    retryHandlers: Partial<Record<OperationKind, (args: Record<string, string>, storeHandle: DocHandle<Store>) => Promise<void>>>
+    retryHandlers: Partial<Record<OperationKind, (args: Record<string, string>, storeHandle: DocHandle<Store>) => Promise<void>>>,
+    engineId: EngineID = localEngineId,
 ): Promise<void> => {
     const store = storeHandle.doc()
     if (!store.operationDB) return
 
-    const interrupted = Object.values(store.operationDB).filter(
-        op => op.status === 'Running' || op.status === 'Pending'
+    // operationDB is shared by all Engines. Only this Engine's own operations
+    // (Operation.engineId, set by createOperation) were interrupted by this
+    // restart; another Engine's Running/Pending op is still running there, and an
+    // op without an engineId has an unknown owner. Both are left alone.
+    const unfinished = Object.values(store.operationDB).filter(
+        op => op && (op.status === 'Running' || op.status === 'Pending')
     )
+    const interrupted = unfinished.filter(op => op.engineId && String(op.engineId) === String(engineId))
+    const others = unfinished.length - interrupted.length
+    if (others > 0) log(`recoverInterruptedOperations: leaving ${others} unfinished operation(s) of other (or unknown) Engines alone`)
     if (interrupted.length === 0) return
 
     log(`recoverInterruptedOperations: ${interrupted.length} interrupted operation(s) found`)
@@ -12333,23 +20173,471 @@ export const recoverInterruptedOperations = async (
             })
         } else {
             log(chalk.yellow(`  ${op.id.slice(0, 8)} ${op.kind}: marking Failed (strategy: ${strategy}${strategy === 'retry' ? ', no handler' : ''})`))
+            const base = strategy === 'retry'
+                ? 'Engine restarted while operation was in progress — re-issue to retry'
+                : 'Engine restarted while operation was in progress — re-issue manually'
+            // idea#201 §10: client-card operations carry a code the Console can map
+            const isCardOp = op.kind === 'flashCard' || op.kind === 'initialiseDisk'
+            const message = isCardOp ? `INTERRUPTED: ${base}` : base
             if (cmdLogHandle) {
                 addTrace(cmdLogHandle, { traceId, command: op.kind, args: traceArgs, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
-                closeTrace(cmdLogHandle, traceId, 'error',
-                    strategy === 'retry'
-                        ? 'Engine restarted while operation was in progress — re-issue to retry'
-                        : 'Engine restarted while operation was in progress — re-issue manually'
-                )
+                closeTrace(cmdLogHandle, traceId, 'error', message)
             }
             updateOperation(storeHandle, op.id, {
                 status: 'Failed',
-                error: strategy === 'retry'
-                    ? 'Engine restarted while operation was in progress — re-issue to retry'
-                    : 'Engine restarted while operation was in progress — re-issue manually',
+                error: message,
+                ...(op.kind === 'flashCard' ? { safeToRemove: false } : {}),
                 completedAt: Date.now() as Timestamp,
             })
         }
     }
+}
+
+```
+
+## File: src/data/PeerAccess.ts
+```typescript
+/**
+ * PeerAccess.ts — per-Pi Engine keys, exchanged through the store
+ * (design-per-pi-engine-key.md; Koen's decision 2026-10-06).
+ *
+ * 1. At start, this Engine makes its own ed25519 key if it has none
+ *    (/home/pi/.ssh/idea_engine_ed25519, pi 0600) and publishes the public key and
+ *    its ssh host key in its Engine entry (Engine.peerAccess). The image and
+ *    install.sh stay key-free. The heartbeat re-publishes the entry if it went
+ *    missing (store reset) or a key file changed (reimage, host key rotation).
+ * 2. On every Engine-entry change (debounced) and on the heartbeat, it computes the
+ *    FULL peer set — every other Engine in THIS Engine's store document with a
+ *    well-formed peerAccess and a heartbeat in the last 7 days — and hands it to
+ *    `sudo -n idea-app-data sync-peers` (stdin). The helper validates every line,
+ *    adds the restrict,command="idea-peer-gate <engineId>" prefix itself and swaps
+ *    in /etc/ssh/idea_authorized_keys/pi and /etc/idea/peer_known_hosts atomically.
+ *    An Engine whose entry is deleted or whose heartbeat is older than 7 days drops
+ *    out of the set, so its key is removed. Then it lists what it authorized in
+ *    peerAccess.authorized, so a sender can see it has been accepted.
+ * 3. Every key change of a peer (added, removed, ssh key or host key changed) is
+ *    logged loudly.
+ *
+ * Trust: anything that can write the store can already make an Engine run
+ * commands (engineDB[x].commands), so taking keys from the store opens no new
+ * door; the gate limits what a peer key can do (receive into a new folder,
+ * ensure-dirs, version, delete only of folders that peer's receive created).
+ *
+ * Fail closed: when store-url.txt was missing and the Engine wrote back the fleet
+ * store URL (StoreIdentity), this Engine does not know it is in the right store:
+ * it publishes no key (peerAccess = null), authorizes nobody (sync-peers with the
+ * empty set) and says so loudly until Ops confirms the store.
+ */
+
+import { peerLiveSeen } from './Liveness.js'
+import { DocHandle } from '@automerge/automerge-repo'
+import { spawn } from 'child_process'
+import { fs, chalk } from 'zx'
+import path from 'path'
+import { print } from '../utils/utils.js'
+import type { Store } from './Store.js'
+import type { Engine, PeerAccess } from './Engine.js'
+import type { Timestamp } from './CommonTypes.js'
+import { AppDataInputRunner, runAppDataWithInput } from '../utils/appDataHelper.js'
+import {
+    PEER_KEY_PATH, HOST_KEY_PUB, ENGINE_ID_RE,
+    normaliseEd25519, keyFingerprint,
+} from '../utils/peerSsh.js'
+
+/** A peer whose last heartbeat (Engine.lastRun) is older than this is dropped. */
+export const PEER_STALE_MS = 7 * 24 * 60 * 60 * 1000
+/** Engine-entry changes are synced after this quiet time. */
+export const PEER_SYNC_DEBOUNCE_MS = 5000
+/** The helper refuses more lines than this; the Engine never sends more. */
+export const PEER_SET_MAX = 256
+
+// ── Pure parts ───────────────────────────────────────────────────────────────
+
+export interface PeerLine { engineId: string, sshKey: string, hostKey: string }
+export interface SkippedPeer { engineId: string, reason: string }
+
+/** '<engineId> <sshKey fingerprint> <hostKey fingerprint>' (Engine.peerAccess.authorized) */
+export const authorizedEntry = (engineId: string, keys: { sshKey: string, hostKey: string }): string =>
+    `${engineId} ${keyFingerprint(keys.sshKey)} ${keyFingerprint(keys.hostKey)}`
+
+const ageText = (ms: number): string => {
+    const h = Math.floor(ms / 3_600_000)
+    return h >= 48 ? `${Math.floor(h / 24)} days` : `${h} hours`
+}
+
+/**
+ * The full peer set for this Engine: every OTHER Engine in the store with a
+ * well-formed peerAccess and a heartbeat within `staleMs`. Engines that share a
+ * key (a cloned SD card) are all left out. Sorted by Engine id, at most 256.
+ */
+export const computePeerSet = (
+    store: Store, localEngineId: string, now: number, staleMs: number = PEER_STALE_MS,
+    /** last live hb/metrics from that Engine (our clock), store-design 2026-10-13; see Liveness.ts */
+    liveSeen: (engineId: string) => number | undefined = () => undefined,
+): { peers: PeerLine[], skipped: SkippedPeer[] } => {
+    const skipped: SkippedPeer[] = []
+    let peers: PeerLine[] = []
+    const ownKey = normaliseEd25519((store.engineDB as any)?.[localEngineId]?.peerAccess?.sshKey)
+    for (const [engineId, eng] of Object.entries(store.engineDB ?? {}) as [string, Engine][]) {
+        if (engineId === String(localEngineId)) continue
+        const pa = eng?.peerAccess
+        if (!pa) continue   // older Engine, or peer access off there: nothing to authorize
+        if (!ENGINE_ID_RE.test(engineId)) { skipped.push({ engineId, reason: `its Engine id is not one the peer files accept (${ENGINE_ID_RE})` }); continue }
+        if (eng.id && String(eng.id) !== engineId) { skipped.push({ engineId, reason: `its id field '${eng.id}' differs from its key` }); continue }
+        const sshKey = normaliseEd25519(pa.sshKey)
+        const hostKey = normaliseEd25519(pa.hostKey)
+        if (!sshKey) { skipped.push({ engineId, reason: 'its published sshKey is not one ed25519 public key' }); continue }
+        if (!hostKey) { skipped.push({ engineId, reason: 'its published hostKey is not one ed25519 public key' }); continue }
+        // stored lastRun (boot + hourly) or a live hb ping, whichever is newer
+        const stored = Number(eng.lastRun)
+        const ping = liveSeen(engineId)
+        const lastRun = ping !== undefined && (!Number.isFinite(stored) || ping > stored) ? ping : stored
+        if (!Number.isFinite(lastRun) || now - lastRun > staleMs) {
+            skipped.push({ engineId, reason: Number.isFinite(lastRun) ? `stale: no heartbeat for ${ageText(now - lastRun)}` : 'stale: no heartbeat recorded' })
+            continue
+        }
+        if (ownKey && sshKey === ownKey) { skipped.push({ engineId, reason: 'it publishes THIS Engine\'s own key (cloned key file?)' }); continue }
+        peers.push({ engineId, sshKey, hostKey })
+    }
+    // A key published by two Engines: neither is trusted (cloned key file)
+    const byKey = new Map<string, string[]>()
+    for (const p of peers) byKey.set(p.sshKey, [...(byKey.get(p.sshKey) ?? []), p.engineId])
+    peers = peers.filter(p => {
+        const ids = byKey.get(p.sshKey)!
+        if (ids.length === 1) return true
+        skipped.push({ engineId: p.engineId, reason: `it shares its key with ${ids.filter(i => i !== p.engineId).join(', ')} (cloned key file?)` })
+        return false
+    })
+    peers.sort((a, b) => (a.engineId < b.engineId ? -1 : a.engineId > b.engineId ? 1 : 0))
+    if (peers.length > PEER_SET_MAX) {
+        for (const p of peers.slice(PEER_SET_MAX)) skipped.push({ engineId: p.engineId, reason: `more than ${PEER_SET_MAX} peers` })
+        peers = peers.slice(0, PEER_SET_MAX)
+    }
+    return { peers, skipped }
+}
+
+/** stdin for `idea-app-data sync-peers`: one '<engineId> <sshKey> <hostKey>' line per peer. */
+export const peerSetInput = (peers: PeerLine[]): string =>
+    peers.map(p => `${p.engineId} ${p.sshKey} ${p.hostKey}\n`).join('')
+
+/** The key changes between two peer sets, as log lines. */
+export const describePeerChanges = (before: PeerLine[], after: PeerLine[], skipped: SkippedPeer[] = []): string[] => {
+    const lines: string[] = []
+    const prev = new Map(before.map(p => [p.engineId, p]))
+    const next = new Map(after.map(p => [p.engineId, p]))
+    const why = new Map(skipped.map(s => [s.engineId, s.reason]))
+    for (const p of after) {
+        const o = prev.get(p.engineId)
+        if (!o) { lines.push(`peer key added: Engine ${p.engineId} (key ${keyFingerprint(p.sshKey)}, host key ${keyFingerprint(p.hostKey)})`); continue }
+        if (o.sshKey !== p.sshKey) lines.push(`PEER KEY CHANGED: Engine ${p.engineId} ssh key ${keyFingerprint(o.sshKey)} -> ${keyFingerprint(p.sshKey)}`)
+        if (o.hostKey !== p.hostKey) lines.push(`PEER HOST KEY CHANGED: Engine ${p.engineId} host key ${keyFingerprint(o.hostKey)} -> ${keyFingerprint(p.hostKey)}`)
+    }
+    for (const o of before) {
+        if (!next.has(o.engineId)) lines.push(`peer key removed: Engine ${o.engineId} (key ${keyFingerprint(o.sshKey)}): ${why.get(o.engineId) ?? 'its Engine entry or peer key is gone'}`)
+    }
+    return lines
+}
+
+const engineName = (store: Store, engineId: string): string => {
+    const h = (store.engineDB as any)?.[engineId]?.hostname
+    return h ? `'${h}' (${engineId})` : `'${engineId}'`
+}
+
+/**
+ * Why a cross-Engine copy from this Engine to `targetEngineId` cannot run yet, or
+ * null when both sides have exchanged keys: the target lists this Engine's CURRENT
+ * keys in peerAccess.authorized (it accepts this Engine's key) and this Engine lists
+ * the target's (it has pinned the target's host key).
+ */
+export const peerCopyRefusal = (store: Store, localEngineId: string, targetEngineId: string, localProblem: string | null = null): string | null => {
+    const local = (store.engineDB as any)?.[localEngineId] as Engine | undefined
+    const target = (store.engineDB as any)?.[targetEngineId] as Engine | undefined
+    const tname = engineName(store, targetEngineId)
+    if (localProblem) return `Cross-Engine copy is off on this Engine: ${localProblem}`
+    if (!local?.peerAccess || !normaliseEd25519(local.peerAccess.sshKey) || !normaliseEd25519(local.peerAccess.hostKey)) {
+        return `This Engine has not published its Engine key yet, so no other Engine accepts its copies. It is published at start; check the Engine log for 'peer access'.`
+    }
+    if (!target?.peerAccess || !normaliseEd25519(target.peerAccess.sshKey) || !normaliseEd25519(target.peerAccess.hostKey)) {
+        return `Engine ${tname} has not published an Engine key (it runs an older Engine, or peer access is off there). Cross-Engine copy to it is not possible until it does.`
+    }
+    const mine = authorizedEntry(localEngineId, local.peerAccess)
+    if (!(target.peerAccess.authorized ?? []).includes(mine)) {
+        return `Engine ${tname} has not accepted this Engine's key yet (Engines add each other's keys within a minute of seeing them in the store). Try again in a minute.`
+    }
+    const theirs = authorizedEntry(targetEngineId, target.peerAccess)
+    if (!(local.peerAccess.authorized ?? []).includes(theirs)) {
+        return `This Engine has not pinned the host key of Engine ${tname} yet (it adds peer keys within a minute of seeing them in the store). Try again in a minute.`
+    }
+    return null
+}
+
+// ── This Engine's key files ──────────────────────────────────────────────────
+
+const execFile = (cmd: string, args: string[]): Promise<string> => new Promise((resolve, reject) => {
+    const proc = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = ''
+    let err = ''
+    proc.stdout.on('data', (c: Buffer) => { out += c })
+    proc.stderr.on('data', (c: Buffer) => { err += c })
+    proc.on('error', e => reject(new Error(`${cmd}: ${e.message}`)))
+    proc.on('close', code => code === 0 ? resolve(out) : reject(new Error(`${cmd} ${args.join(' ')} exited with code ${code}: ${err.trim()}`)))
+})
+
+/**
+ * This Engine's public Engine key; makes the key pair first if there is none
+ * (`ssh-keygen -t ed25519`, no passphrase, mode 0600 in a 0700 folder).
+ */
+export const ensurePeerKey = async (engineId: string, keyPath: string = PEER_KEY_PATH, keygen = 'ssh-keygen'): Promise<{ sshKey: string, created: boolean }> => {
+    let created = false
+    const dir = path.dirname(keyPath)
+    if (!await fs.pathExists(dir)) {
+        await fs.ensureDir(dir)
+        await fs.chmod(dir, 0o700)
+    }
+    if (!await fs.pathExists(keyPath)) {
+        await fs.remove(`${keyPath}.pub`)
+        print(chalk.yellow(`peer access: no Engine key at ${keyPath}; making a new ed25519 key`))
+        await execFile(keygen, ['-q', '-t', 'ed25519', '-N', '', '-C', `idea-engine-${engineId}`, '-f', keyPath])
+        created = true
+    }
+    const st = await fs.stat(keyPath)
+    if ((st.mode & 0o077) !== 0) {
+        print(chalk.yellow(`peer access: ${keyPath} had mode 0${(st.mode & 0o777).toString(8)}; setting 0600`))
+        await fs.chmod(keyPath, 0o600)
+    }
+    let pub = (await fs.pathExists(`${keyPath}.pub`)) ? await fs.readFile(`${keyPath}.pub`, 'utf8') : ''
+    if (!normaliseEd25519(pub)) {
+        pub = await execFile(keygen, ['-y', '-f', keyPath])
+        await fs.writeFile(`${keyPath}.pub`, pub.trim() + ` idea-engine-${engineId}\n`, { mode: 0o644 })
+    }
+    const sshKey = normaliseEd25519(pub)
+    if (!sshKey) throw new Error(`${keyPath} is not an ed25519 key; remove ${keyPath} and ${keyPath}.pub so the Engine makes a new one`)
+    if (created) print(chalk.green(`peer access: made the Engine key ${keyPath} (${keyFingerprint(sshKey)})`))
+    return { sshKey, created }
+}
+
+/** This Pi's ed25519 host key (public), or null when it is missing or malformed. */
+export const readHostKey = async (p: string = HOST_KEY_PUB): Promise<string | null> => {
+    try {
+        return normaliseEd25519(await fs.readFile(p, 'utf8'))
+    } catch {
+        return null
+    }
+}
+
+/**
+ * Write (or clear, with null) this Engine's peerAccess. `authorized` is kept while
+ * the keys stay the same. Logs a change of this Engine's own keys. Returns true if
+ * the store changed.
+ */
+export const publishPeerAccess = (handle: DocHandle<Store>, localEngineId: string, keys: { sshKey: string, hostKey: string } | null, now: number = Date.now(), say: (line: string) => void = l => print(l)): boolean => {
+    const cur = (handle.doc()?.engineDB as any)?.[localEngineId] as Engine | undefined
+    if (!cur) return false
+    const pa = cur.peerAccess
+    if (keys === null) {
+        if (pa === null) return false
+        handle.change(doc => { (doc.engineDB as any)[localEngineId].peerAccess = null })
+        return true
+    }
+    if (pa && pa.sshKey === keys.sshKey && pa.hostKey === keys.hostKey) return false
+    if (pa?.sshKey && normaliseEd25519(pa.sshKey) && pa.sshKey !== keys.sshKey) {
+        say(chalk.red(`peer access: THIS Engine's key changed: ${keyFingerprint(pa.sshKey)} -> ${keyFingerprint(keys.sshKey)} (new key file, e.g. after a reimage); peers re-authorize it from the store`))
+    }
+    if (pa?.hostKey && normaliseEd25519(pa.hostKey) && pa.hostKey !== keys.hostKey) {
+        say(chalk.red(`peer access: THIS Engine's ssh host key changed: ${keyFingerprint(pa.hostKey)} -> ${keyFingerprint(keys.hostKey)}; peers re-pin it from the store`))
+    }
+    handle.change(doc => {
+        const e = (doc.engineDB as any)[localEngineId]
+        const authorized: string[] = pa?.authorized ? [...pa.authorized] : []
+        e.peerAccess = { sshKey: keys.sshKey, hostKey: keys.hostKey, publishedAt: now as Timestamp, authorized } as PeerAccess
+    })
+    return true
+}
+
+// ── The controller (start, store changes, heartbeat) ─────────────────────────
+
+export type PeerAccessMode = 'on' | 'fail-closed' | 'off'
+
+export interface PeerAccessOptions {
+    mode: PeerAccessMode
+    /** why peer access is not 'on' (shown in copy refusals) */
+    reason?: string
+    run?: AppDataInputRunner
+    now?: () => number
+    staleMs?: number
+    /** last live ping per peer (default Liveness.peerLiveSeen) */
+    liveSeen?: (engineId: string) => number | undefined
+    debounceMs?: number
+    keyPath?: string
+    hostKeyPath?: string
+    keygen?: string
+    logger?: (line: string) => void
+}
+
+/** The reason cross-Engine copy is off on this Engine (validate() shows it), or null. */
+let localProblem: string | null = null
+export const peerAccessProblem = (): string | null => localProblem
+/** Tests only. */
+export const setPeerAccessProblem = (p: string | null): void => { localProblem = p }
+
+export class PeerAccessController {
+    private lastInput: string | null = null
+    private lastPeers: PeerLine[] = []
+    private keys: { sshKey: string, hostKey: string } | null = null
+    private timer: ReturnType<typeof setTimeout> | null = null
+    private chain: Promise<void> = Promise.resolve()
+    private unsubscribe: (() => void) | null = null
+    private readonly run: AppDataInputRunner
+    private readonly now: () => number
+    private readonly say: (line: string) => void
+
+    constructor(private readonly handle: DocHandle<Store>, private readonly localEngineId: string, private readonly opts: PeerAccessOptions) {
+        this.run = opts.run ?? runAppDataWithInput
+        this.now = opts.now ?? Date.now
+        this.say = opts.logger ?? ((l: string) => print(l))
+    }
+
+    get mode(): PeerAccessMode { return this.opts.mode }
+
+    /** Make/read the key, publish it, sync once and follow Engine-entry changes. */
+    async start(): Promise<void> {
+        if (this.opts.mode === 'off') {
+            localProblem = this.opts.reason ?? 'peer access is off on this Engine'
+            this.say(`peer access: off (${localProblem}); no Engine key is made or published and peer keys are not synced`)
+            return
+        }
+        if (this.opts.mode === 'fail-closed') {
+            localProblem = this.opts.reason ?? 'this Engine is not sure it is in the right store'
+            this.say(chalk.bgRed.white(`PEER ACCESS FAIL-CLOSED: ${localProblem}. This Engine publishes no Engine key and authorizes no peer.`))
+            publishPeerAccess(this.handle, this.localEngineId, null, this.now(), this.say)
+            await this.syncNow()
+            return
+        }
+        localProblem = null
+        await this.refreshKeys()
+        await this.syncNow()
+        const onChange = (ev: any) => {
+            const relevant = (ev?.patches ?? []).some((p: any) => p.path?.[0] === 'engineDB' && !(
+                p.path[1] === this.localEngineId && p.path[2] === 'peerAccess' && p.path[3] === 'authorized'))
+            if (relevant) this.schedule()
+        }
+        this.handle.on('change', onChange)
+        this.unsubscribe = () => this.handle.off('change', onChange)
+    }
+
+    /** Heartbeat: re-publish a missing or outdated entry (repair), then sync (stale expiry). */
+    async onHeartbeat(): Promise<void> {
+        if (this.opts.mode === 'off') return
+        if (this.opts.mode === 'fail-closed') {
+            if (publishPeerAccess(this.handle, this.localEngineId, null, this.now(), this.say)) this.say(chalk.red('peer access: removed this Engine\'s peerAccess again (fail-closed)'))
+            return
+        }
+        await this.refreshKeys(true)
+        await this.syncNow()
+    }
+
+    stop(): void {
+        if (this.timer) clearTimeout(this.timer)
+        this.timer = null
+        this.unsubscribe?.()
+        this.unsubscribe = null
+    }
+
+    private schedule(): void {
+        if (this.timer) clearTimeout(this.timer)
+        this.timer = setTimeout(() => { this.timer = null; this.syncNow().catch(() => undefined) }, this.opts.debounceMs ?? PEER_SYNC_DEBOUNCE_MS)
+    }
+
+    /** Re-read the key files and (re)publish when the entry is missing or differs. */
+    private async refreshKeys(isHeartbeat = false): Promise<void> {
+        try {
+            const { sshKey } = await ensurePeerKey(this.localEngineId, this.opts.keyPath, this.opts.keygen)
+            const hostKey = await readHostKey(this.opts.hostKeyPath)
+            if (!hostKey) {
+                localProblem = `this Pi has no readable ed25519 ssh host key (${this.opts.hostKeyPath ?? HOST_KEY_PUB})`
+                this.say(chalk.red(`peer access: ${localProblem}; not publishing an Engine key`))
+                publishPeerAccess(this.handle, this.localEngineId, null, this.now(), this.say)
+                this.keys = null
+                return
+            }
+            this.keys = { sshKey, hostKey }
+            const before = (this.handle.doc()?.engineDB as any)?.[this.localEngineId]?.peerAccess
+            if (publishPeerAccess(this.handle, this.localEngineId, this.keys, this.now(), this.say)) {
+                this.say(isHeartbeat && !before
+                    ? chalk.yellow(`peer access: this Engine's peerAccess was missing from the store; re-published (key ${keyFingerprint(sshKey)})`)
+                    : `peer access: published this Engine's key ${keyFingerprint(sshKey)} and host key ${keyFingerprint(hostKey)}`)
+            }
+            localProblem = null
+        } catch (e: any) {
+            localProblem = `this Engine's key could not be made or read: ${e?.message ?? e}`
+            this.say(chalk.red(`peer access: ${localProblem}`))
+        }
+    }
+
+    /** Compute the peer set and hand it to the helper when it changed. Serialised. */
+    syncNow(): Promise<void> {
+        this.chain = this.chain.then(() => this.sync()).catch(e => this.say(chalk.red(`peer access: sync failed: ${e?.message ?? e}`)))
+        return this.chain
+    }
+
+    private async sync(): Promise<void> {
+        const store = this.handle.doc()
+        if (!store) return
+        const { peers, skipped } = this.opts.mode === 'on'
+            ? computePeerSet(store, this.localEngineId, this.now(), this.opts.staleMs ?? PEER_STALE_MS, this.opts.liveSeen ?? peerLiveSeen)
+            : { peers: [] as PeerLine[], skipped: [] as SkippedPeer[] }
+        const input = peerSetInput(peers)
+        if (input !== this.lastInput) {
+            for (const s of skipped) this.say(chalk.yellow(`peer access: not authorizing Engine ${s.engineId}: ${s.reason}`))
+            try {
+                const out = await this.run(['sync-peers'], input)
+                if (out.trim()) this.say(`peer access: ${out.trim()}`)
+            } catch (e: any) {
+                this.say(chalk.red(`peer access: idea-app-data sync-peers failed (${peers.length} peer(s)); retrying on the next change or heartbeat: ${e?.message ?? e}`))
+                return
+            }
+            for (const l of describePeerChanges(this.lastInput === null ? [] : this.lastPeers, peers, skipped)) {
+                this.say(/CHANGED/.test(l) ? chalk.bgRed.white(`peer access: ${l}`) : `peer access: ${l}`)
+            }
+            if (this.lastInput !== null && this.lastPeers.length > 0 && peers.length === 0) {
+                this.say(chalk.yellow(`peer access: the peer set went from ${this.lastPeers.length} to 0 (store reset, or every peer stale/removed); keys come back as peers re-publish`))
+            }
+            this.lastInput = input
+            this.lastPeers = peers
+        }
+        this.writeAuthorized(peers)
+    }
+
+    /** List what this Engine has authorized (only the helper's success changes it). */
+    private writeAuthorized(peers: PeerLine[]): void {
+        if (this.opts.mode !== 'on') return
+        const want = peers.map(p => authorizedEntry(p.engineId, p))
+        const cur = (this.handle.doc()?.engineDB as any)?.[this.localEngineId]?.peerAccess as PeerAccess | null | undefined
+        if (!cur) return
+        const have = [...(cur.authorized ?? [])]
+        if (have.length === want.length && have.every((v, i) => v === want[i])) return
+        this.handle.change(doc => {
+            const pa = (doc.engineDB as any)[this.localEngineId]?.peerAccess
+            if (pa) pa.authorized = want
+        })
+    }
+}
+
+/**
+ * Start peer access for this Engine (start.ts). `fallbackStore`: store-url.txt was
+ * missing and the fleet store URL was written back (fail closed).
+ */
+export const startPeerAccess = async (handle: DocHandle<Store>, localEngineId: string, o: { enabled: boolean, fallbackStore: boolean, storeUrlPath?: string, staleMs?: number }): Promise<PeerAccessController> => {
+    const mode: PeerAccessMode = !o.enabled ? 'off' : o.fallbackStore ? 'fail-closed' : 'on'
+    const reason = mode === 'off'
+        ? 'peer access is off on this machine (dev container or test mode, or settings.peerAccess=false)'
+        : mode === 'fail-closed'
+            ? `store-url.txt was missing, so the Engine wrote back the fleet store URL and cannot tell it is in its own store. ` +
+              `Check ${o.storeUrlPath ?? 'store-identity/store-url.txt'}, then delete store-identity/store-url.restored and restart the Engine`
+            : undefined
+    const c = new PeerAccessController(handle, localEngineId, { mode, reason, staleMs: o.staleMs })
+    await c.start()
+    return c
 }
 
 ```
@@ -12359,8 +20647,590 @@ export const recoverInterruptedOperations = async (
 
 ```
 
+## File: src/data/RemoveInstance.ts
+```typescript
+/**
+ * RemoveInstance.ts — removeInstance <instanceId> (idea#347, option A: quarantine).
+ *
+ * 1. `docker compose down` WITHOUT -v: containers go, named volumes are kept.
+ * 2. Under the instance lock, the root helper renames <disk>/instances/<id> to
+ *    <disk>/.idea-quarantine/<id>-<UTC stamp> (idea-app-data quarantine, helper v4).
+ * 3. The record is dropped from instanceDB.
+ * Nothing is deleted: the quarantine is never purged automatically; clearing it is
+ * manual and needs Koen's OK.
+ *
+ * Refusals throw `CODE: text`, and the store is untouched on any failure:
+ *   NOT_FOUND, NOT_LOCAL, AMBIGUOUS, RUNNING, BUSY_BACKUP, BUSY_MOVE, BUSY,
+ *   COMPOSE_DOWN_FAILED, QUARANTINE_FAILED, HELPER_OUTDATED (helper older than v4).
+ */
+import { DocHandle } from '@automerge/automerge-repo'
+import { $, fs, path } from 'zx'
+import type { Store } from './Store.js'
+import type { Instance } from './Instance.js'
+import type { InstanceID } from './CommonTypes.js'
+import { lookupLocalInstanceArg } from './InstanceArg.js'
+import { diskMountRoot, appDataRoot, Disk } from './Disk.js'
+import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
+import { runAppData, quarantineArgs, helperAtLeast } from '../utils/appDataHelper.js'
+import { log } from '../utils/utils.js'
+
+export const QUARANTINE_DIR = '.idea-quarantine'
+
+export class RemoveError extends Error {
+    constructor(public code: string, text: string) { super(`${code}: ${text}`) }
+}
+
+export interface RemoveResult { instanceId: InstanceID; name: string; quarantinePath: string; keptVolumes: string[] }
+
+export const REMOVE_HELPER_MIN = 4
+
+export interface RemoveDeps {
+    helperProblem: () => Promise<string | null>
+    instanceDir: (disk: Disk, id: InstanceID) => Promise<string>
+    composeDown: (dir: string, id: InstanceID) => Promise<void>
+    listVolumes: (id: InstanceID) => Promise<string[]>
+    quarantine: (disk: Disk, id: InstanceID) => Promise<string>
+}
+
+const defaultDeps: RemoveDeps = {
+    helperProblem: () => helperAtLeast(REMOVE_HELPER_MIN, 'removeInstance'),
+    instanceDir: async (disk, id) => path.join(await diskMountRoot(disk), 'instances', String(id)),
+    composeDown: async (dir, id) => {
+        if (!fs.existsSync(path.join(dir, 'compose.yaml'))) return
+        await $({ cwd: dir })`docker compose -p ${id} down`.quiet()
+    },
+    listVolumes: async (id) => {
+        try {
+            const r = await $`docker volume ls -q --filter label=com.docker.compose.project=${id}`.quiet()
+            return r.stdout.split('\n').map(s => s.trim()).filter(Boolean)
+        } catch { return [] }
+    },
+    quarantine: async (disk, id) => (await runAppData(quarantineArgs(await appDataRoot(disk), String(id)))).trim(),
+}
+
+const RUNNING_STATES = new Set(['Running', 'Starting'])
+const BACKUP_KINDS = new Set(['backupApp', 'restoreApp'])
+const MOVE_KINDS = new Set(['moveApp', 'copyApp'])
+
+export const removeInstance = async (
+    storeHandle: DocHandle<Store>, instanceArg: string, engineId: string, deps: Partial<RemoveDeps> = {},
+): Promise<RemoveResult> => {
+    const d = { ...defaultDeps, ...deps }
+    const store = storeHandle.doc()
+    const r = lookupLocalInstanceArg(store, String(instanceArg ?? ''), engineId)
+    if (!r.ok) {
+        if (r.reason === 'not-found') throw new RemoveError('NOT_FOUND', `instance '${instanceArg}' not found on this Engine`)
+        if (r.reason === 'not-local') throw new RemoveError('NOT_LOCAL', `instance '${instanceArg}' is not stored on a disk docked to this Engine`)
+        throw new RemoveError('AMBIGUOUS', `instance name '${instanceArg}' is shared by several instances on this Engine; use the instance id`)
+    }
+    const inst: Instance = r.instance
+    if (RUNNING_STATES.has(String(inst.status))) throw new RemoveError('RUNNING', `instance '${inst.name}' is ${inst.status}; stop it first`)
+
+    const helper = await d.helperProblem()
+    if (helper) throw new RemoveError('HELPER_OUTDATED', helper)
+
+    const key = instanceKey(inst.id)
+    if (!resourceLock.acquire(key, 'removeInstance')) {
+        const kind = resourceLock.getLockInfo(key)?.kind ?? ''
+        if (BACKUP_KINDS.has(kind)) throw new RemoveError('BUSY_BACKUP', `instance '${inst.name}' is being backed up or restored; retry when it completes`)
+        if (MOVE_KINDS.has(kind)) throw new RemoveError('BUSY_MOVE', `instance '${inst.name}' is being copied or moved; retry when it completes`)
+        throw new RemoveError('BUSY', `instance '${inst.name}' is busy (${kind || 'another operation'}); retry when it completes`)
+    }
+    try {
+        const disk = store.diskDB[inst.storedOn!] as Disk
+        const dir = await d.instanceDir(disk, inst.id)
+        try {
+            await d.composeDown(dir, inst.id)
+        } catch (e) {
+            throw new RemoveError('COMPOSE_DOWN_FAILED', `docker compose down failed for '${inst.name}': ${(e as Error).message}; nothing changed`)
+        }
+        const keptVolumes = await d.listVolumes(inst.id)
+        let quarantinePath: string
+        try {
+            quarantinePath = await d.quarantine(disk, inst.id)
+        } catch (e) {
+            throw new RemoveError('QUARANTINE_FAILED', `cannot quarantine ${dir}: ${(e as Error).message}; the store is unchanged`)
+        }
+        storeHandle.change(doc => { delete doc.instanceDB[inst.id] })
+        log(`removeInstance: ${inst.id} ('${inst.name}') quarantined at ${quarantinePath}; kept volumes: ${keptVolumes.length ? keptVolumes.join(', ') : 'none'}`)
+        return { instanceId: inst.id, name: String(inst.name), quarantinePath, keptVolumes }
+    } finally {
+        resourceLock.release(key)
+    }
+}
+
+```
+
+## File: src/data/RenameInstance.ts
+```typescript
+/**
+ * RenameInstance.ts — renameInstance <instanceId> <newName…> (agent-engine-dev#220).
+ *
+ * Changes only the display name: x-app.instanceName in the instance's compose.yaml
+ * (dock and Engine start re-read the name from there, Instance.ts) and instance.name
+ * in the store. The id, folder, Docker project, containers, data and port stay the same.
+ * Nothing uses the display name as a key (paths, volumes and projects use the id), so a
+ * running instance may be renamed. The instance lock is held for the compose write, so a
+ * copy, move, backup or restore never sees a half-written compose.yaml (BUSY instead).
+ *
+ * Refusals throw `CODE: text` so the command trace ends as `error`:
+ *   NOT_FOUND, NOT_LOCAL, AMBIGUOUS, EMPTY_NAME, NAME_TOO_LONG, BAD_NAME, NAME_TAKEN,
+ *   BUSY, COMPOSE_WRITE_FAILED. The same name as now is a no-op ok.
+ */
+import { DocHandle } from '@automerge/automerge-repo'
+import { fs, path } from 'zx'
+import type { Store } from './Store.js'
+import type { InstanceID, InstanceName } from './CommonTypes.js'
+import { lookupLocalInstanceArg } from './InstanceArg.js'
+import { MAX_INSTANCE_NAME_LENGTH } from './InstallApp.js'
+import { setComposeInstanceName } from './InstanceCopy.js'
+import { diskMountRoot } from './Disk.js'
+import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
+import { log } from '../utils/utils.js'
+
+export class RenameError extends Error {
+    constructor(public code: string, text: string) { super(`${code}: ${text}`) }
+}
+
+export interface RenameResult { instanceId: InstanceID; oldName: string; newName: string; changed: boolean }
+
+/** Trimmed, checked name or a RenameError (same limits as installApp --name). */
+export const validateNewInstanceName = (raw: string): string => {
+    const name = (raw ?? '').trim()
+    if (name.length === 0) throw new RenameError('EMPTY_NAME', 'the new name is empty')
+    if (name.length > MAX_INSTANCE_NAME_LENGTH) throw new RenameError('NAME_TOO_LONG', `the new name is longer than ${MAX_INSTANCE_NAME_LENGTH} characters`)
+    if (/[\u0000-\u001f\u007f]/.test(name)) throw new RenameError('BAD_NAME', 'the new name must not contain control characters or newlines')
+    return name
+}
+
+export interface RenameDeps {
+    instanceRoot: (store: Store, instanceId: InstanceID) => Promise<string>
+}
+const defaultDeps: RenameDeps = {
+    instanceRoot: async (store, id) => {
+        const inst = store.instanceDB[id]
+        const disk = store.diskDB[inst.storedOn!]
+        return path.join(await diskMountRoot(disk as any), 'instances', String(id))
+    },
+}
+
+export const renameInstance = async (
+    storeHandle: DocHandle<Store>, instanceArg: string, rawName: string, engineId: string,
+    deps: Partial<RenameDeps> = {},
+): Promise<RenameResult> => {
+    const d = { ...defaultDeps, ...deps }
+    const store = storeHandle.doc()
+    const r = lookupLocalInstanceArg(store, String(instanceArg ?? ''), engineId)
+    if (!r.ok) {
+        if (r.reason === 'not-found') throw new RenameError('NOT_FOUND', `instance '${instanceArg}' not found on this Engine`)
+        if (r.reason === 'not-local') throw new RenameError('NOT_LOCAL', `instance '${instanceArg}' is not stored on a disk docked to this Engine`)
+        throw new RenameError('AMBIGUOUS', `instance name '${instanceArg}' is shared by several instances on this Engine; use the instance id`)
+    }
+    const inst = r.instance
+    const newName = validateNewInstanceName(rawName)
+    const oldName = String(inst.name)
+    if (newName === oldName) return { instanceId: inst.id, oldName, newName, changed: false }
+    const taken = Object.values(store.instanceDB ?? {}).find(i =>
+        i && i.id !== inst.id && String(i.name).toLowerCase() === newName.toLowerCase()
+        && lookupLocalInstanceArg(store, String(i.id), engineId).ok)
+    if (taken) throw new RenameError('NAME_TAKEN', `instance ${taken.id} on this Engine is already named '${taken.name}'`)
+
+    const key = instanceKey(inst.id)
+    if (!resourceLock.acquire(key, 'renameInstance')) {
+        const held = resourceLock.getLockInfo(key)
+        throw new RenameError('BUSY', `instance '${oldName}' is busy (${held?.kind ?? 'another operation'}); retry when it completes`)
+    }
+    try {
+        const composeFile = path.join(await d.instanceRoot(store, inst.id), 'compose.yaml')
+        try {
+            const text = await fs.readFile(composeFile, 'utf-8')
+            await fs.writeFile(composeFile, setComposeInstanceName(text, newName))
+        } catch (e) {
+            throw new RenameError('COMPOSE_WRITE_FAILED', `cannot update ${composeFile}: ${(e as Error).message}; nothing changed`)
+        }
+        storeHandle.change(doc => {
+            const s = doc.instanceDB[inst.id]
+            if (s) s.name = newName as InstanceName
+        })
+        log(`renameInstance: '${oldName}' -> '${newName}' (${inst.id})`)
+        return { instanceId: inst.id, oldName, newName, changed: true }
+    } finally {
+        resourceLock.release(key)
+    }
+}
+
+```
+
+## File: src/data/RestoreAppFiles.ts
+```typescript
+/**
+ * RestoreAppFiles.ts (#189): a restore onto another disk brings only the instance
+ * data from the Backup Disk. The app master (apps/<appId>) and the service image
+ * tars (services/*.tar) stay where the instance was, so the restored instance
+ * could not load its images and moveApp/copyApp refused ("App master not found").
+ * Copy them onto the target from a docked disk that has them, the previous disk
+ * first, the same way moveApp/copyApp sync them.
+ */
+
+import { fs } from 'zx'
+import { log } from '../utils/utils.js'
+import { rsyncDirectory } from '../utils/rsync.js'
+import { Disk, diskMountRoot } from './Disk.js'
+
+export interface RestoreAppFilesResult {
+    appMasterFrom: string | null
+    servicesCopied: string[]
+    servicesMissing: string[]
+}
+
+export const serviceTarName = (serviceImage: string): string => serviceImage.replace(/\//g, '_') + '.tar'
+
+/**
+ * Make `target` hold apps/<appId> and the service tars of `serviceImages`.
+ * `candidates` are docked local disks in order of preference (previous disk first).
+ * Missing pieces are logged, never thrown: the instance data is already restored.
+ */
+export const ensureAppFilesOnTarget = async (
+    appId: string,
+    serviceImages: string[],
+    target: Disk,
+    candidates: Disk[],
+): Promise<RestoreAppFilesResult> => {
+    const targetRoot = await diskMountRoot(target)
+    const roots: string[] = []
+    for (const d of candidates) {
+        if (!d?.device || String(d.id) === String(target.id)) continue
+        const r = await diskMountRoot(d)
+        if (r !== targetRoot && !roots.includes(r)) roots.push(r)
+    }
+    const res: RestoreAppFilesResult = { appMasterFrom: null, servicesCopied: [], servicesMissing: [] }
+
+    const masterDest = `${targetRoot}/apps/${appId}`
+    if (await fs.pathExists(masterDest)) {
+        res.appMasterFrom = masterDest
+    } else {
+        const from = await firstExisting(roots.map(r => `${r}/apps/${appId}`))
+        if (from) {
+            log(`restoreApp: copying app master ${from} → ${masterDest} (#189)`)
+            await fs.ensureDir(`${targetRoot}/apps`)
+            await rsyncDirectory(from, masterDest)
+            res.appMasterFrom = from
+        } else {
+            log(`restoreApp: no docked disk has apps/${appId}; the restored instance cannot be moved or copied until it is installed again`)
+        }
+    }
+
+    for (const image of serviceImages) {
+        const tar = serviceTarName(image)
+        const dest = `${targetRoot}/services/${tar}`
+        if (await fs.pathExists(dest)) continue
+        const from = await firstExisting(roots.map(r => `${r}/services/${tar}`))
+        if (!from) { res.servicesMissing.push(tar); log(`restoreApp: service image ${tar} not found on any docked disk`); continue }
+        log(`restoreApp: copying service image ${from} → ${dest} (#189)`)
+        await fs.ensureDir(`${targetRoot}/services`)
+        await fs.copy(from, dest, { preserveTimestamps: true })
+        res.servicesCopied.push(tar)
+    }
+    return res
+}
+
+const firstExisting = async (paths: string[]): Promise<string | null> => {
+    for (const p of paths) if (await fs.pathExists(p)) return p
+    return null
+}
+
+```
+
+## File: src/data/RestorePreQuarantine.ts
+```typescript
+/**
+ * RestorePreQuarantine.ts (#190): restore onto ANOTHER disk leaves the instance's
+ * pre-restore folder (<old disk>/instances/<id>) behind, so a later moveApp back to
+ * that disk finds a non-empty destination and refuses.
+ *
+ * Decision (Steve, #190 option a): quarantine, never delete. After restoreApp has
+ * registered the instance on the new disk, the old folder is renamed with the
+ * EXISTING helper v4 op `idea-app-data quarantine <root> <id>` (from #271) to
+ * <old disk>/.idea-quarantine/<id>-<UTC stamp>. That pre-restore data may be newer
+ * than the backup, so it is kept; clearing the quarantine is manual.
+ *
+ * Only when: the old disk is docked to this Engine, the store says the instance now
+ * lives on the target, the old folder exists, and the old copy is not running.
+ * A helper older than v4 refuses the restore up front with HELPER_OUTDATED.
+ */
+import { fs, path } from 'zx'
+import type { Store } from './Store.js'
+import type { InstanceID } from './CommonTypes.js'
+import { Disk, diskMountRoot, appDataRoot } from './Disk.js'
+import { runAppData, quarantineArgs, helperAtLeast } from '../utils/appDataHelper.js'
+import { log } from '../utils/utils.js'
+
+export const RESTORE_QUARANTINE_HELPER_MIN = 4
+
+export interface PreQuarantineDeps {
+    helperProblem: () => Promise<string | null>
+    folderExists: (disk: Disk, id: InstanceID) => Promise<boolean>
+    quarantine: (disk: Disk, id: InstanceID) => Promise<string>
+}
+
+export const defaultPreQuarantineDeps: PreQuarantineDeps = {
+    helperProblem: () => helperAtLeast(RESTORE_QUARANTINE_HELPER_MIN, 'restoreApp to another disk'),
+    folderExists: async (disk, id) => fs.pathExists(path.join(await diskMountRoot(disk), 'instances', String(id))),
+    quarantine: async (disk, id) => (await runAppData(quarantineArgs(await appDataRoot(disk), String(id)))).trim(),
+}
+
+const RUNNING_STATES = new Set(['Running', 'Starting'])
+
+/** The old disk whose pre-restore folder would be left behind, or null. */
+export const preRestoreDisk = async (
+    store: Store, instanceId: InstanceID, targetDisk: Disk, localEngineId: string, deps: PreQuarantineDeps = defaultPreQuarantineDeps,
+): Promise<Disk | null> => {
+    const inst = store.instanceDB?.[instanceId]
+    const prevId = inst?.storedOn
+    if (!prevId || String(prevId) === String(targetDisk.id)) return null
+    const prev = store.diskDB?.[prevId] as Disk | undefined
+    if (!prev?.device || String(prev.dockedTo) !== String(localEngineId)) return null
+    return (await deps.folderExists(prev, instanceId)) ? prev : null
+}
+
+/** Before any change: refuse HELPER_OUTDATED when a quarantine will be needed and the helper is below v4. */
+export const assertPreQuarantineHelper = async (
+    store: Store, instanceId: InstanceID, targetDisk: Disk, localEngineId: string, deps: PreQuarantineDeps = defaultPreQuarantineDeps,
+): Promise<Disk | null> => {
+    const prev = await preRestoreDisk(store, instanceId, targetDisk, localEngineId, deps)
+    if (!prev) return null
+    const problem = await deps.helperProblem()
+    if (problem) throw new Error(`HELPER_OUTDATED: ${problem}`)
+    return prev
+}
+
+/**
+ * After registration on the target: quarantine the old folder. Returns the quarantine
+ * path, or null when skipped. A failure is logged, not thrown: the restore itself is done.
+ */
+export const quarantinePreRestore = async (
+    store: Store, instanceId: InstanceID, targetDisk: Disk, prevDisk: Disk | null, deps: PreQuarantineDeps = defaultPreQuarantineDeps,
+): Promise<string | null> => {
+    if (!prevDisk) return null
+    const inst = store.instanceDB?.[instanceId]
+    if (!inst || String(inst.storedOn) !== String(targetDisk.id)) {
+        log(`restoreApp: instance ${instanceId} is not registered on ${targetDisk.name}; pre-restore folder on ${prevDisk.name} left in place (#190)`)
+        return null
+    }
+    const prevNow = store.diskDB?.[prevDisk.id]
+    if (!prevNow?.device) {
+        log(`restoreApp: ${prevDisk.name} is no longer docked; pre-restore folder of ${instanceId} left in place (#190)`)
+        return null
+    }
+    if (RUNNING_STATES.has(String(inst.status)) && String(inst.storedOn) === String(prevDisk.id)) return null
+    try {
+        const q = await deps.quarantine(prevDisk, instanceId)
+        log(`restoreApp: pre-restore folder of ${instanceId} on ${prevDisk.name} quarantined at ${q} (#190); clearing it is manual`)
+        return q
+    } catch (e) {
+        log(`restoreApp: WARNING could not quarantine the pre-restore folder of ${instanceId} on ${prevDisk.name}: ${(e as Error).message}; it stays in place (#190)`)
+        return null
+    }
+}
+
+```
+
+## File: src/data/StaticPeers.ts
+```typescript
+/**
+ * StaticPeers.ts: an opt-in static peer list (idea#168 follow-up)
+ *
+ * The Engine links peers via mDNS discovery only (mdnsMonitor → manageDiscoveredPeers
+ * → connectEngine). Where mDNS is off (the pool), Engines never sync. This module
+ * dials a fixed list of peers through the SAME connectEngine path instead.
+ *
+ * Config: IDEA_STATIC_PEERS=host[:port],host[:port],...  (env var; wins), or
+ *         settings.staticPeers in config.yaml (same string format).
+ *   - host: an IPv4 address or a hostname (resolved to IPv4 before dialling).
+ *   - port: optional; defaults to the Engine's own peer port (config settings.port,
+ *     4321 in config.yaml, overridable with IDEA_ENGINE_PORT).
+ *   - Whitespace around entries is ignored; empty entries are skipped.
+ *   - Invalid entries (bad host characters, port not 1..65535) are SKIPPED with a
+ *     warning; valid entries still run. Duplicate entries are dialled once.
+ * Unset or empty: nothing runs (no timers, no logs); behaviour is unchanged.
+ *
+ * Store-scoped peering (StoreScope.ts): a static peer is dialled through connectEngine
+ * like an mDNS peer, so the same handshake store check applies. A host that resolves
+ * to a Tailscale (or any) address of an Engine in ANOTHER store, or to an old Engine
+ * without a store tag, is refused before any document moves and logged with its
+ * store and ours; connectEngine then waits REFUSED_PEER_BACKOFF_MS before redialling.
+ *
+ * Per peer:
+ *   - The host is resolved to IPv4; the connection key is `${ip}:${port}`, the
+ *     same key the mDNS path uses, so a peer also found by mDNS is not dialled twice.
+ *   - This Engine itself is skipped: host equal to os.hostname() (with or without
+ *     .local), a loopback address, or an address of a local interface.
+ *   - A failed attempt (DNS failure, connectEngine error) is retried with backoff:
+ *     5 s, 10 s, 20 s, ... capped at 5 min; reset after a success.
+ *   - A live connection is checked every 10 s. If it is gone (removed from
+ *     network.connections, e.g. dropped by the mDNS path), it is dialled again,
+ *     with the same backoff on failure. The check also resets the connection's
+ *     missedDiscoveryCount, so a running mDNS monitor does not drop a static peer.
+ *   - Socket-level reconnects of an existing connection are done by the Automerge
+ *     WebSocketClientAdapter itself (fixed 5 s retry), as for mDNS peers.
+ */
+
+import os from 'os'
+import { lookup } from 'dns/promises'
+import { DocHandle, Repo } from '@automerge/automerge-repo'
+import { EngineID, Hostname, IPAddress, PortNumber } from './CommonTypes.js'
+import { Store } from './Store.js'
+import { config } from './Config.js'
+import { connectEngine, network, refusedPeers } from './Network.js'
+import { readStoreDocId } from './StoreIdentity.js'
+import { log } from '../utils/utils.js'
+
+export const STATIC_PEERS_ENV = 'IDEA_STATIC_PEERS'
+export const STATIC_PEER_BASE_DELAY_MS = 5_000
+export const STATIC_PEER_MAX_DELAY_MS = 300_000
+export const STATIC_PEER_CHECK_INTERVAL_MS = 10_000
+
+export interface StaticPeer { host: string, port: PortNumber }
+
+const HOST_RE = /^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$/
+
+/** Parse `host[:port],...`. Invalid entries are skipped and reported in warnings. */
+export const parseStaticPeers = (raw: string | undefined, defaultPort: number): { peers: StaticPeer[], warnings: string[] } => {
+    const peers: StaticPeer[] = []
+    const warnings: string[] = []
+    for (const entry of (raw ?? '').split(',').map(e => e.trim()).filter(e => e.length > 0)) {
+        const parts = entry.split(':')
+        const host = parts[0]
+        let port = defaultPort
+        if (parts.length > 2 || !HOST_RE.test(host)) {
+            warnings.push(`${STATIC_PEERS_ENV}: skipping invalid entry '${entry}' (expected host or host:port)`)
+            continue
+        }
+        if (parts.length === 2) {
+            port = /^\d+$/.test(parts[1]) ? parseInt(parts[1], 10) : NaN
+            if (!(port >= 1 && port <= 65535)) {
+                warnings.push(`${STATIC_PEERS_ENV}: skipping invalid entry '${entry}' (port must be 1..65535)`)
+                continue
+            }
+        }
+        if (!peers.some(p => p.host.toLowerCase() === host.toLowerCase() && p.port === port)) {
+            peers.push({ host, port: port as PortNumber })
+        }
+    }
+    return { peers, warnings }
+}
+
+/** The raw setting: the env var wins over config.yaml settings.staticPeers. */
+export const staticPeersSetting = (): string | undefined =>
+    process.env[STATIC_PEERS_ENV] ?? config.settings.staticPeers
+
+const shortName = (host: string): string => host.toLowerCase().replace(/\.local$/, '')
+
+export const isSelfPeer = (host: string, address: string): boolean => {
+    if (shortName(host) === shortName(os.hostname())) return true
+    if (address.startsWith('127.') || address === '::1' || address === 'localhost') return true
+    return Object.values(os.networkInterfaces()).some(list => (list ?? []).some(i => i.address === address))
+}
+
+export interface StaticPeerDeps {
+    resolve: (host: string) => Promise<string>
+    connect: (address: IPAddress, hostname: Hostname, engineId: EngineID, port: PortNumber) => Promise<unknown>
+    isSelf: (host: string, address: string) => boolean
+    log: (msg: string) => void
+}
+
+export interface StaticPeerOptions {
+    raw?: string
+    defaultPort?: number
+    deps?: Partial<StaticPeerDeps>
+    baseDelayMs?: number
+    maxDelayMs?: number
+    checkIntervalMs?: number
+}
+
+/**
+ * Start dialling the static peers. Returns undefined (and does nothing) when
+ * the setting is unset, empty or has no valid entry; otherwise a stop handle.
+ */
+export const startStaticPeers = (repo: Repo, storeHandle: DocHandle<Store>, opts: StaticPeerOptions = {}): { stop: () => void, peers: StaticPeer[] } | undefined => {
+    const raw = opts.raw ?? staticPeersSetting()
+    if (!raw || raw.trim() === '') return undefined
+    const deps: StaticPeerDeps = {
+        resolve: async (host) => HOST_IS_IPV4(host) ? host : (await lookup(host, { family: 4 })).address,
+        connect: (address, hostname, engineId, port) => connectEngine(repo, address, hostname, engineId, readStoreDocId(), port),
+        isSelf: isSelfPeer,
+        log,
+        ...opts.deps,
+    }
+    const defaultPort = opts.defaultPort ?? (config.settings.port || 1234)
+    const base = opts.baseDelayMs ?? STATIC_PEER_BASE_DELAY_MS
+    const max = opts.maxDelayMs ?? STATIC_PEER_MAX_DELAY_MS
+    const check = opts.checkIntervalMs ?? STATIC_PEER_CHECK_INTERVAL_MS
+
+    const { peers, warnings } = parseStaticPeers(raw, defaultPort)
+    warnings.forEach(w => deps.log(w))
+    if (peers.length === 0) return undefined
+    deps.log(`Static peers (${STATIC_PEERS_ENV}): ${peers.map(p => `${p.host}:${p.port}`).join(', ')}`)
+
+    let stopped = false
+    const timers = new Set<ReturnType<typeof setTimeout>>()
+    const schedule = (fn: () => void, ms: number) => {
+        const t = setTimeout(() => { timers.delete(t); if (!stopped) fn() }, ms)
+        t.unref?.()
+        timers.add(t)
+    }
+
+    const engineIdFor = (host: string): EngineID => {
+        const engine = Object.values(storeHandle.doc()?.engineDB ?? {}).find(e => shortName(String(e.hostname)) === shortName(host))
+        return (engine?.id ?? `static:${host}`) as EngineID
+    }
+
+    const supervise = (peer: StaticPeer) => {
+        let failures = 0
+        const attempt = async () => {
+            try {
+                const address = await deps.resolve(peer.host)
+                if (deps.isSelf(peer.host, address)) {
+                    deps.log(`Static peer ${peer.host}:${peer.port} is this Engine — skipped`)
+                    return
+                }
+                const key = `${address}:${peer.port}`
+                const existing = network.connections[key as IPAddress]
+                if (existing) {
+                    existing.missedDiscoveryCount = 0
+                    if (String(existing.engineId).startsWith('static:')) existing.engineId = engineIdFor(peer.host)
+                } else {
+                    // Store-scoped peering: a static peer goes through the same handshake store
+                    // check as an mDNS peer (connectEngine); a refused one is backed off there.
+                    if (!((refusedPeers.get(key)?.until ?? 0) > Date.now())) deps.log(`Static peer ${peer.host}:${peer.port}: connecting to ${key}`)
+                    await deps.connect(address as IPAddress, shortName(peer.host) as Hostname, engineIdFor(peer.host), peer.port)
+                }
+                failures = 0
+                schedule(attempt, check)
+            } catch (e: any) {
+                failures++
+                const delay = Math.min(base * 2 ** (failures - 1), max)
+                deps.log(`Static peer ${peer.host}:${peer.port}: attempt ${failures} failed (${e?.message ?? e}); retrying in ${Math.round(delay / 1000)}s`)
+                schedule(attempt, delay)
+            }
+        }
+        schedule(attempt, 0)
+    }
+    peers.forEach(supervise)
+
+    return {
+        peers,
+        stop: () => { stopped = true; timers.forEach(t => clearTimeout(t)); timers.clear() },
+    }
+}
+
+const HOST_IS_IPV4 = (s: string): boolean => /^(\d{1,3}\.){3}\d{1,3}$/.test(s)
+
+```
+
 ## File: src/data/Store.ts
 ```typescript
+import { splitAppId } from './AppIdParse.js'
 import path from 'path'
 import { Engine, localEngineId } from './Engine.js'
 import { Disk } from './Disk.js'
@@ -12637,6 +21507,11 @@ export const getInstancesOfDisk = (store: Store, disk: Disk): Instance[] => {
     })
 }
 
+/**
+ * @deprecated Takes the FIRST instance with that name; names are not unique
+ * (idea#168). Commands resolve instance arguments with resolveInstanceArg /
+ * lookupInstanceArg (InstanceArg.ts), which refuse an ambiguous name.
+ */
 export const findInstanceByName = (store: Store, instanceName: string): Instance | undefined => {
     return getInstances(store).find(instance => instance.name === instanceName)
 }
@@ -12706,9 +21581,7 @@ export const findDisksByApp = (store: Store, appId: AppID): Disk[] => {
     })
 }
 
-export const extractAppName = (appId: AppID): string => {
-    return appId.split('-')[0]
-}
+export const extractAppName = (appId: AppID): string => splitAppId(String(appId)).name
 
 export const getDisk = (store: Store, diskId: DiskID): Disk | undefined => {
     if (store.diskDB.hasOwnProperty(diskId)) {
@@ -12830,14 +21703,42 @@ export const readStoreDocId = (urlPath: string = storeIdentityPaths().urlPath): 
 }
 
 /**
+ * store-url.restored, next to store-url.txt: written when the Engine restored a
+ * missing store-url.txt with the fleet store URL. While it exists and still names
+ * the URL in store-url.txt, peer access fails closed (data/PeerAccess.ts): the
+ * Engine cannot tell it is in its own store, so it publishes no Engine key and
+ * authorizes no peer. Ops confirms the store by deleting the file; changing
+ * store-url.txt makes it stale, and it is removed at the next start.
+ */
+export const restoredMarkerPath = (paths: StoreIdentityPaths): string =>
+    path.join(path.dirname(paths.urlPath), 'store-url.restored')
+
+/**
  * Startup check of the store identity folder (idea#120):
  *   - store-template.json must exist; it is never created or written here. If it
  *     is missing the Engine stops with a clear error (restore it from git).
- *   - store-url.txt missing → written atomically with FLEET_STORE_URL.
+ *   - store-url.txt missing → startup stops with a clear error (engine#193), unless
+ *     IDEA_ALLOW_STORE_URL_FALLBACK=true: then written atomically with FLEET_STORE_URL.
  *   - store-url.txt present → used as it is, whatever it contains (an isolated
  *     Engine may deliberately use its own store, e.g. idea03); never rewritten.
+ *   - fallback: true while store-url.restored (see restoredMarkerPath) names the
+ *     URL in use, i.e. the Engine runs on a store URL it restored itself.
  */
-export const prepareStoreIdentity = async (paths: StoreIdentityPaths = storeIdentityPaths()): Promise<{ storeDocId: DocumentId, restored: boolean }> => {
+/**
+ * Env flag that lets the Engine write the fleet store URL into a missing
+ * store-url.txt (engine#193). Off by default: without the file the Engine refuses
+ * to start, so a dev/pool Pi that lost its file never silently joins production.
+ */
+export const STORE_URL_FALLBACK_ENV = 'IDEA_ALLOW_STORE_URL_FALLBACK'
+
+export const storeUrlFallbackAllowed = (env: NodeJS.ProcessEnv = process.env): boolean =>
+    env[STORE_URL_FALLBACK_ENV] === 'true' || env[STORE_URL_FALLBACK_ENV] === '1'
+
+export const prepareStoreIdentity = async (
+    paths: StoreIdentityPaths = storeIdentityPaths(),
+    opts: { allowFallback?: boolean } = {},
+): Promise<{ storeDocId: DocumentId, restored: boolean, fallback: boolean }> => {
+    const allowFallback = opts.allowFallback ?? storeUrlFallbackAllowed()
     if (!fs.existsSync(paths.templatePath)) {
         throw new Error(
             `Store template ${paths.templatePath} is missing. Every Engine must start from the shared ` +
@@ -12846,12 +21747,354 @@ export const prepareStoreIdentity = async (paths: StoreIdentityPaths = storeIden
     }
     let restored = false
     if (!fs.existsSync(paths.urlPath)) {
+        if (!allowFallback) {
+            throw new Error(
+                `Store URL file ${paths.urlPath} is missing: refusing to start (engine#193). ` +
+                `Without it the Engine would join the fleet store ${FLEET_STORE_URL}. Restore the file ` +
+                `(e.g. 'git checkout -- store-identity/store-url.txt', or the pool's store URL), or set ` +
+                `${STORE_URL_FALLBACK_ENV}=true to write the fleet store URL deliberately.`)
+        }
         log(`Store URL file ${paths.urlPath} not found. Writing the fleet store URL ${FLEET_STORE_URL}.`)
         await writeFileAtomic(paths.urlPath, FLEET_STORE_URL)
+        await fs.remove(restoredMarkerPath(paths))
+        await writeFileAtomic(restoredMarkerPath(paths), FLEET_STORE_URL + '\n')
         restored = true
     }
     const storeDocId = readStoreDocId(paths.urlPath)
-    return { storeDocId, restored }
+    let fallback = false
+    const marker = restoredMarkerPath(paths)
+    if (fs.existsSync(marker)) {
+        if (storeDocIdFromUrl(fs.readFileSync(marker, 'utf-8')) === storeDocId) {
+            fallback = true
+        } else {
+            log(`store-url.txt no longer holds the URL the Engine restored; removing ${marker}`)
+            await fs.remove(marker)
+        }
+    }
+    return { storeDocId, restored, fallback }
+}
+
+```
+
+## File: src/data/StoreScope.ts
+```typescript
+/**
+ * StoreScope.ts: an Engine only peers with Engines of its OWN store (store-scoped peering).
+ *
+ * Bug (2026-10-08, tailscale-isolation SUMMARY.md §1 row 5): when two Engines
+ * connected they handed each other EVERY document they held, whatever store
+ * (fleet) it belonged to. idea02 (store 4GQm) and the pool (store 3zoqd) ended up
+ * holding and relaying each other's store docs. Any link did it: mDNS on a shared
+ * LAN, a static peer resolving to a Tailscale address, or a stray inbound dial.
+ *
+ * Fix: every Engine carries a store tag in its identity and checks the other
+ * side's tag before any document moves.
+ *
+ *   - store tag      `<first 5 chars of the store doc id>-<12 hex of sha256(id)>`,
+ *                    e.g. `3zoqd-1a2b3c4d5e6f`. The prefix keeps logs readable; the
+ *                    hash makes the match exact. The full store id is never
+ *                    broadcast (it is a write capability: SUMMARY.md §1 row 6).
+ *   - Engine peerId  `idea-engine/<storeTag>/<engineId>/<session>`, the Repo's
+ *                    peerId. It travels in the automerge-repo WS handshake in both
+ *                    directions (client `join`, server `peer`), so both the dialler
+ *                    and the listener can check it before a sync message is
+ *                    processed. PeerMetadata cannot carry it (2.3.1 only has
+ *                    storageId/isEphemeral).
+ *   - mDNS TXT       `store=<storeTag>` next to name/id/version: a mismatch is not
+ *                    even dialled (mdnsMonitor.ts). The handshake check is the
+ *                    authoritative one and also covers static peers (incl. names
+ *                    that resolve to Tailscale IPs) and inbound connections.
+ *
+ * Verdicts (peerVerdict):
+ *   same-store     Engine peerId with our tag                  -> admitted, syncs
+ *   foreign-store  Engine peerId with another tag              -> refused
+ *   legacy-engine  no Engine peerId and not ephemeral (an Engine
+ *                  from before this change, or a tool that keeps
+ *                  storage): its store cannot be verified      -> refused (fail closed)
+ *   client         no Engine peerId and isEphemeral === true
+ *                  (Console, CLI, walker: storage-less, they only
+ *                  get what they find() by id)                 -> admitted
+ *
+ * This module has no Engine imports so the WS server worker thread can use it.
+ */
+
+import crypto from 'crypto'
+
+export const ENGINE_PEER_PREFIX = 'idea-engine'
+
+/** The error text a refusing Engine sends before closing (parsed by the other side). */
+export const REFUSAL_PREFIX = 'idea-store-refused'
+
+export type PeerKind = 'same-store' | 'foreign-store' | 'legacy-engine' | 'client'
+
+export interface PeerVerdict {
+    admit: boolean
+    kind: PeerKind
+    /** The peer's store tag, when it sent one. */
+    theirTag?: string
+    engineId?: string
+}
+
+/** Minimal shape of automerge-repo's PeerMetadata (kept local: worker-safe, no runtime import). */
+export interface PeerMetaLike { isEphemeral?: boolean, storageId?: string }
+
+const TAG_RE = /^[A-Za-z0-9]{1,5}-[0-9a-f]{12}$/
+const SESSION_RE = /^[a-z0-9]{1,16}$/
+
+/** The store tag of a store doc id (`automerge:` prefix and whitespace ignored). */
+export const storeTag = (storeDocId: string): string => {
+    const id = String(storeDocId).trim().replace(/^automerge:/, '')
+    if (!id) throw new Error('storeTag: empty store doc id')
+    return `${id.slice(0, 5)}-${crypto.createHash('sha256').update(id).digest('hex').slice(0, 12)}`
+}
+
+/** The Repo peerId of an Engine of `storeDocId`. A random session suffix keeps two runs apart. */
+export const enginePeerId = (storeDocId: string, engineId: string, session: string = crypto.randomBytes(4).toString('hex')): string => {
+    const eid = String(engineId).replace(/[^A-Za-z0-9_.:-]/g, '_')
+    return `${ENGINE_PEER_PREFIX}/${storeTag(storeDocId)}/${eid}/${session}`
+}
+
+/** `idea-engine/<tag>/<engineId>/<session>` -> its parts; anything else -> undefined. */
+export const parseEnginePeerId = (peerId: string | undefined | null): { storeTag: string, engineId: string } | undefined => {
+    if (typeof peerId !== 'string') return undefined
+    const parts = peerId.split('/')
+    if (parts.length !== 4 || parts[0] !== ENGINE_PEER_PREFIX) return undefined
+    const [, tag, engineId, session] = parts
+    if (!TAG_RE.test(tag) || !engineId || !SESSION_RE.test(session)) return undefined
+    return { storeTag: tag, engineId }
+}
+
+/** Should `ownTag`'s Engine sync with the peer `peerId` (see the table above)? */
+export const peerVerdict = (ownTag: string, peerId: string | undefined, meta: PeerMetaLike | undefined): PeerVerdict => {
+    const parsed = parseEnginePeerId(peerId)
+    if (parsed) {
+        const same = parsed.storeTag === ownTag
+        return { admit: same, kind: same ? 'same-store' : 'foreign-store', theirTag: parsed.storeTag, engineId: parsed.engineId }
+    }
+    if (meta?.isEphemeral === true) return { admit: true, kind: 'client' }
+    return { admit: false, kind: 'legacy-engine' }
+}
+
+/** One readable line for a refused peer (peer address, its store, ours). */
+export const describeRefusal = (v: PeerVerdict, ownTag: string, peerId: string | undefined, where: string): string => {
+    const reason = v.kind === 'foreign-store'
+        ? `different store: theirs ${v.theirTag}, ours ${ownTag}`
+        : `no store id in its identity (an Engine older than store-scoped peering, or a tool with storage; peerId '${peerId ?? '?'}'); ours ${ownTag}`
+    return `[store-scope] REFUSED peer ${where}${v.engineId ? ` (${v.engineId})` : ''}: ${reason}. No documents exchanged.`
+}
+
+/** The error message text sent to a refused peer: `idea-store-refused ours=<tag> kind=<kind>`. */
+export const refusalMessage = (ownTag: string, kind: PeerKind): string => `${REFUSAL_PREFIX} ours=${ownTag} kind=${kind}`
+
+/** Parse a refusal error message from the other side; undefined if it is not one. */
+export const parseRefusalMessage = (message: unknown): { theirTag: string, kind: string } | undefined => {
+    if (typeof message !== 'string' || !message.startsWith(REFUSAL_PREFIX)) return undefined
+    const tag = /ours=(\S+)/.exec(message)?.[1] ?? '?'
+    const kind = /kind=(\S+)/.exec(message)?.[1] ?? '?'
+    return { theirTag: tag, kind }
+}
+
+/**
+ * Is `doc` another fleet's store document? A store doc is recognised by its
+ * engineDB map (Store.ts); `docId` equal to our own store is never foreign.
+ * Used to keep foreign store copies that are already on disk (relayed before this
+ * fix) from being announced or served to anyone. They are left in place:
+ * clean-up is the separate quarantine proposal.
+ */
+export const isForeignStoreDocContent = (ownStoreDocId: string, docId: string, doc: unknown): boolean => {
+    if (String(docId) === String(ownStoreDocId).replace(/^automerge:/, '')) return false
+    if (!doc || typeof doc !== 'object') return false
+    if ('engineDB' in (doc as object) && typeof (doc as any).engineDB === 'object' && (doc as any).engineDB !== null) return true
+    return isForeignCommandLogContent(ownStoreDocId, doc)
+}
+
+/**
+ * #158: a command log (`{ traces, recentTraceIds }`) stamped with another fleet's storeTag.
+ * An untagged log (written before the tag existed) cannot be judged and is let through;
+ * existing foreign copies on disk are handled by the store-data quarantine.
+ */
+export const isForeignCommandLogContent = (ownStoreDocId: string, doc: unknown): boolean => {
+    const d = doc as any
+    if (!d || typeof d !== 'object' || typeof d.traces !== 'object' || !Array.isArray(d.recentTraceIds)) return false
+    return typeof d.storeTag === 'string' && d.storeTag !== storeTag(ownStoreDocId)
+}
+
+/**
+ * Is `documentId` another fleet's store doc that is loaded in `repo`? A doc that is
+ * not loaded cannot be judged, and cannot be sent either (a sync reply needs the
+ * loaded doc), so the send-side guard catches it once it is loaded.
+ */
+export const isForeignStoreDoc = (repo: { handles: Record<string, any> }, ownStoreDocId: string, documentId: string): boolean => {
+    const handle = repo.handles[documentId]
+    if (!handle || !handle.isReady?.()) return false
+    try { return isForeignStoreDocContent(ownStoreDocId, documentId, handle.doc()) } catch { return false }
+}
+
+/**
+ * Rate-limited logging of refusals: the same peer (key) is logged at once, then at
+ * most every `intervalMs` with the number of refusals in between. A refused old
+ * Engine redials every 5 s, so unthrottled this would flood the log.
+ */
+export class RefusalLog {
+    #last = new Map<string, { at: number, suppressed: number }>()
+    constructor(private readonly sink: (line: string) => void, private readonly intervalMs = 5 * 60_000, private readonly now: () => number = Date.now) {}
+    report(key: string, line: string): boolean {
+        const t = this.now()
+        const prev = this.#last.get(key)
+        if (prev && t - prev.at < this.intervalMs) { prev.suppressed++; return false }
+        const extra = prev && prev.suppressed > 0 ? ` (${prev.suppressed} more refusal(s) of this peer since the last log line)` : ''
+        this.#last.set(key, { at: t, suppressed: 0 })
+        this.sink(line + extra)
+        return true
+    }
+}
+
+```
+
+## File: src/data/StoreScopedClientAdapter.ts
+```typescript
+/**
+ * StoreScopedClientAdapter.ts: the Engine's outgoing Engine-to-Engine WS link,
+ * checked against the store (see StoreScope.ts).
+ *
+ * A stock WebSocketClientAdapter that, before the Repo learns about the remote
+ * side, checks the remote peerId from the server's `peer` handshake reply:
+ *   - same store: passed on as usual (peer-candidate), syncs.
+ *   - another store, or an old Engine without a store tag: refused. The Repo never
+ *     sees the peer, so nothing is announced, sent or requested; every message
+ *     that arrives on the socket anyway (an old Engine announces all its docs right
+ *     after the handshake) is dropped; the socket is closed and the adapter stops
+ *     redialling. onRefused tells Network.ts, which drops the connection and backs off.
+ *   - a server that refuses US (it sent an `idea-store-refused` error) is handled
+ *     the same way, with its store tag from the message.
+ * Messages before an admitted handshake are dropped as well.
+ *
+ * Also: a sync/request for a foreign store doc (docGuard) is never sent; it goes out
+ * as `doc-unavailable` instead, and such a message from the peer is not processed.
+ */
+
+import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websocket'
+import { cbor, Message, PeerId, PeerMetadata } from '@automerge/automerge-repo'
+import { parseRefusalMessage, peerVerdict, PeerVerdict } from './StoreScope.js'
+import { WsLiveness, wsDeadMs, wsPingMs } from './WsLiveness.js'
+
+export interface ClientRefusal {
+    url: string
+    /** 'local': we refused the server; 'remote': the server refused us. */
+    by: 'local' | 'remote'
+    verdict: PeerVerdict
+    remotePeerId?: string
+}
+
+export interface StoreScopedClientOptions {
+    ownTag: string
+    onRefused: (r: ClientRefusal) => void
+    /** true = the doc is another fleet's store doc: never send or accept it. */
+    docGuard?: (documentId: string) => boolean
+    retryInterval?: number
+    /** #168 dead-socket watchdog timings (default IDEA_WS_PING_MS / IDEA_WS_DEAD_MS). */
+    pingMs?: number
+    deadMs?: number
+}
+
+/** Small messages are peeked before the stock adapter sees them (handshake/error replies are tiny). */
+const PEEK_MAX_BYTES = 4096
+
+export const guardOutgoing = (message: Message, docGuard: ((id: string) => boolean) | undefined): Message | undefined => {
+    const docId = (message as any).documentId
+    if (!docGuard || !docId) return message
+    if ((message.type === 'sync' || message.type === 'request') && docGuard(String(docId))) {
+        return { type: 'doc-unavailable', senderId: message.senderId, targetId: message.targetId, documentId: docId } as Message
+    }
+    return message
+}
+
+export class StoreScopedWebSocketClientAdapter extends WebSocketClientAdapter {
+    readonly ownTag: string
+    #onRefused: (r: ClientRefusal) => void
+    #docGuard?: (documentId: string) => boolean
+    #admitted = false
+    refusal?: ClientRefusal
+    /** #168: sockets dropped by the watchdog because nothing was heard. */
+    forcedReconnects = 0
+    #liveness: WsLiveness
+
+    constructor(url: string, opts: StoreScopedClientOptions) {
+        super(url, opts.retryInterval ?? 5000)
+        this.ownTag = opts.ownTag
+        this.#onRefused = opts.onRefused
+        this.#docGuard = opts.docGuard
+        this.#liveness = new WsLiveness({ pingMs: opts.pingMs ?? wsPingMs(), deadMs: opts.deadMs ?? wsDeadMs(), label: url, onDead: () => { this.forcedReconnects++ } })
+    }
+
+    /** #168: every (re)connect gets a fresh socket; watch it for silence. */
+    override connect(peerId: PeerId, peerMetadata?: PeerMetadata): void {
+        super.connect(peerId, peerMetadata)
+        if (this.socket && !this.refusal) this.#liveness.attach(this.socket as any)
+    }
+
+    /** ms since anything (message, ping, pong) arrived on the current socket. */
+    get lastHeardAgeMs(): number { return this.#liveness.lastHeardAgeMs }
+
+    /** True once the server's handshake passed the store check. */
+    get admitted(): boolean { return this.#admitted }
+
+    override peerCandidate(remotePeerId: PeerId, peerMetadata: PeerMetadata): void {
+        if (this.refusal) return
+        const verdict = peerVerdict(this.ownTag, remotePeerId, peerMetadata)
+        if (!verdict.admit) { this.#refuse({ url: this.url, by: 'local', verdict, remotePeerId }); return }
+        this.#admitted = true
+        super.peerCandidate(remotePeerId, peerMetadata)
+    }
+
+    override receiveMessage(messageBytes: Uint8Array): void {
+        if (this.refusal) return
+        if (!this.#admitted || messageBytes.byteLength <= PEEK_MAX_BYTES) {
+            let m: any
+            try { m = cbor.decode(new Uint8Array(messageBytes)) } catch { return }
+            if (m?.type === 'error') {
+                const r = parseRefusalMessage(m.message)
+                if (r) {
+                    this.#refuse({ url: this.url, by: 'remote', remotePeerId: m.senderId,
+                        verdict: { admit: false, kind: r.kind === 'foreign-store' ? 'foreign-store' : 'legacy-engine', theirTag: r.theirTag } })
+                    return
+                }
+            } else if (m?.type !== 'peer' && !this.#admitted) {
+                return   // nothing but the handshake before the store check passed
+            }
+            if (this.#admitted && m?.documentId && this.#docGuard?.(String(m.documentId))) return
+        }
+        super.receiveMessage(messageBytes)
+    }
+
+    override emit(event: any, ...args: any[]): boolean {
+        // Last line of defence: no message reaches the Repo from a refused/unverified server.
+        if (event === 'message' && (!this.#admitted || this.refusal)) return false
+        return (super.emit as any)(event, ...args)
+    }
+
+    override send(message: Message): void {
+        if (this.refusal) return
+        if (message.type !== 'join' && !this.#admitted) return
+        const out = guardOutgoing(message, this.#docGuard)
+        if (out) super.send(out)
+    }
+
+    /** Idempotent: removeNetworkAdapter calls it again after a refusal already closed the socket. */
+    override disconnect(): void {
+        this.#liveness.detach()
+        if (!this.socket || !this.peerId) return
+        super.disconnect()
+    }
+
+    #refuse(r: ClientRefusal): void {
+        if (this.refusal) return
+        this.refusal = r
+        this.#admitted = false
+        ;(this as any).retryInterval = 0   // the stock onClose must not redial
+        try { this.disconnect() } catch { /* socket already gone */ }
+        this.#onRefused(r)
+    }
 }
 
 ```
@@ -12867,36 +22110,40 @@ export const prepareStoreIdentity = async (paths: StoreIdentityPaths = storeIden
  * Backups come from BACKUP.yaml + the store, never borg list.
  */
 
+import { parseAppId } from './App.js'
 import path from 'path'
 import { fs, YAML } from 'zx'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Store } from './Store.js'
-import { Disk, diskMountRoot } from './Disk.js'
+import { Disk, diskMountRoot, joinMountRoot } from './Disk.js'
 import { localEngineId } from './Engine.js'
 import { DiskID, Timestamp } from './CommonTypes.js'
-import { getCommandLogHandle } from './CommandLogStore.js'
+import { getCommandLogHandle, stashTraceResult } from './CommandLogStore.js'
 import { getActiveTrace } from '../utils/CommandLogger.js'
 import { log } from '../utils/utils.js'
+import { labelForUnformatted } from './UnformattedDisks.js'
 
 export const SUMMARY_MAX_ENTRIES = 100_000
 export const SUMMARY_MAX_MS = 10_000
 export const SUMMARY_MAX_AGE_MS = 10 * 60 * 1000
 
 export interface ContentSummary {
+    /** files-disk.md §7.4 / Console store.ts — must match Console parse + EraseDialog. */
     targetId: string
     label: string
-    serial: string | null
     model: string | null
-    sizeBytes: number | null
-    filesystem: string | null
+    sizeBytes: number
     usedBytes: number | null
+    fsType: string | null
+    apps: { name: string; version: string }[]
+    instances: { id: string; name: string; running: boolean; dataBytes: number | null }[]
+    backups: { instanceId: string; instanceName: string; lastBackup: number | null; snapshots: number | null }[]
+    files: { fileCount: number; totalBytes: number; partial: boolean } | null
+    other: { entryCount: number; totalBytes: number; partial: boolean } | null
+    otherPartitions: { device: string; fsType: string | null }[]
     readable: boolean
-    partial: boolean
-    apps: { id: string; name: string; version: string }[]
-    instances: { id: string; name: string; status: string; dataBytes: number }[]
-    backups: { instanceName: string; lastBackup: number | null }[]
-    files: { count: number; bytes: number }
-    other: { count: number; bytes: number }
+    serial: string | null
+    computedAt: number
 }
 
 export interface SummariseOps {
@@ -12957,8 +22204,26 @@ export const resolveSummaryTarget = (store: Store, targetId: string): {
     if (cand) {
         return { kind: 'unformatted', candidate: cand, label: cand.label, serial: (cand as any).serial ?? cand.candidateId }
     }
+    // idea#310: a non-IDEA USB disk the scanner offers Erase for (e.g. an old Engine SSD with an OS
+    // rootfs) is in neither list above; resolve it from diskCandidates. Docked disks are never candidates;
+    // the system-disk and mounted refusals stay in eraseDisk.
+    const dc = (eng?.diskCandidates ?? []).find(c => c?.candidateId === targetId && c.kind === 'usbDisk' && (c.actions ?? []).includes('erase'))
+    if (dc) {
+        const parts = dc.partitions ?? []
+        const fsType = parts.some(p => p.fsType === 'ext4') ? 'ext4' : (parts.find(p => p.fsType)?.fsType ?? null)
+        const candidate = {
+            candidateId: dc.candidateId, device: dc.device, sizeBytes: dc.sizeBytes, model: dc.model,
+            fsType, label: labelForUnformatted(dc.model, dc.sizeBytes), serial: dc.serial,
+        }
+        return { kind: 'unformatted', candidate, label: candidate.label, serial: dc.serial ?? dc.candidateId }
+    }
     return null
 }
+
+/** Disk paths that are IDEA data, never counted as "other" user files. idea#347: .idea-quarantine included. */
+export const isIdeaDiskPath = (rel: string): boolean =>
+    rel === 'META.yaml' || rel === 'FILES.yaml' || rel === 'BACKUP.yaml' ||
+    ['apps', 'instances', 'services', 'backups', 'lost+found', 'files', '.idea-quarantine', '.pre-update'].some(d => rel === d || rel.startsWith(`${d}/`))
 
 export const summariseDisk = async (
     storeHandle: DocHandle<Store>,
@@ -12973,16 +22238,19 @@ export const summariseDisk = async (
         const summary: ContentSummary = {
             targetId,
             label: c.label,
-            serial: (c as any).serial ?? c.candidateId,
             model: c.model,
             sizeBytes: c.sizeBytes,
-            filesystem: c.fsType,
             usedBytes: null,
+            fsType: c.fsType,
+            apps: [],
+            instances: [],
+            backups: [],
+            files: null,
+            other: null,
+            otherPartitions: [],
             readable: false,
-            partial: false,
-            apps: [], instances: [], backups: [],
-            files: { count: 0, bytes: 0 },
-            other: { count: 0, bytes: 0 },
+            serial: (c as any).serial ?? c.candidateId,
+            computedAt: ops.now(),
         }
         return summary
     }
@@ -12996,14 +22264,7 @@ export const summariseDisk = async (
     let truncated = false
 
     const underFiles = (rel: string) => rel === 'files' || rel.startsWith('files/')
-    const isIdeaPath = (rel: string) =>
-        rel === 'META.yaml' || rel === 'FILES.yaml' || rel === 'BACKUP.yaml' ||
-        rel === 'apps' || rel.startsWith('apps/') ||
-        rel === 'instances' || rel.startsWith('instances/') ||
-        rel === 'services' || rel.startsWith('services/') ||
-        rel === 'backups' || rel.startsWith('backups/') ||
-        rel === 'lost+found' || rel.startsWith('lost+found/') ||
-        underFiles(rel)
+    const isIdeaPath = isIdeaDiskPath
 
     const walkResult = await ops.walk(root, (rel, size) => {
         entries++
@@ -13013,86 +22274,112 @@ export const summariseDisk = async (
     }, deadline)
     truncated = walkResult.truncated || entries > SUMMARY_MAX_ENTRIES
 
-    const apps = Object.values(store.appDB)
+    const apps: ContentSummary['apps'] = Object.values(store.appDB)
         .filter(a => {
             // Apps that came from this disk: instances stored here reference them,
             // or apps/ folder listing — use instances on disk + apps folder if present
             return Object.values(store.instanceDB).some(i => i.storedOn === disk.id && i.instanceOf === a.id)
         })
-        .map(a => ({ id: a.id, name: a.name as string, version: a.version as string }))
+        .map(a => ({ name: a.name as string, version: a.version as string }))
 
     // Also list apps present on the disk filesystem
+    const seenAppKeys = new Set(apps.map(a => `${a.name}@${a.version}`))
     try {
-        const appDirs = await fs.readdir(path.join(root, 'apps'))
+        const appDirs = await fs.readdir(joinMountRoot(root, 'apps'))
         for (const id of appDirs) {
-            if (!apps.some(a => a.id === id)) {
-                const dash = id.lastIndexOf('-')
-                apps.push({ id, name: dash > 0 ? id.slice(0, dash) : id, version: dash > 0 ? id.slice(dash + 1) : '' })
+            const { name, version } = parseAppId(id)
+            const key = `${name}@${version}`
+            if (!seenAppKeys.has(key)) {
+                seenAppKeys.add(key)
+                apps.push({ name, version })
             }
         }
     } catch { /* no apps/ */ }
 
-    const instances = Object.values(store.instanceDB)
+    const instances: ContentSummary['instances'] = Object.values(store.instanceDB)
         .filter(i => i.storedOn === disk.id)
-        .map(i => {
-            let dataBytes = 0
-            // Approximate from walk of instances/<id> if we can stat quickly
-            return { id: i.id, name: i.name as string, status: i.status, dataBytes }
-        })
+        .map(i => ({
+            id: i.id,
+            name: i.name as string,
+            running: i.status === 'Running' || i.status === 'Starting',
+            dataBytes: 0 as number | null,
+        }))
 
     // Fill instance data sizes from a focused walk
     for (const inst of instances) {
-        const instRoot = path.join(root, 'instances', inst.id)
+        const instRoot = joinMountRoot(root, 'instances', inst.id)
         try {
-            const r = await ops.walk(instRoot, (_rel, size) => { inst.dataBytes += size }, deadline)
+            const r = await ops.walk(instRoot, (_rel, size) => { inst.dataBytes = (inst.dataBytes ?? 0) + size }, deadline)
             if (r.truncated) truncated = true
         } catch { /* missing */ }
     }
 
-    const backups: { instanceName: string; lastBackup: number | null }[] = []
+    const backups: ContentSummary['backups'] = []
     try {
-        const text = await fs.readFile(path.join(root, 'BACKUP.yaml'), 'utf8')
-        const parsed = YAML.parse(text)
+        const yamlText = await fs.readFile(joinMountRoot(root, 'BACKUP.yaml'), 'utf8')
+        const parsed = YAML.parse(yamlText)
         const links = parsed?.links ?? disk.backupConfig?.links ?? []
         for (const link of links) {
             const name = typeof link === 'string' ? link : link?.instanceName ?? link?.name
             if (!name) continue
             const inst = Object.values(store.instanceDB).find(i => i.name === name || i.id === name)
-            backups.push({ instanceName: name, lastBackup: inst?.lastBackup ?? null })
+            backups.push({
+                instanceId: inst?.id ?? String(name),
+                instanceName: name,
+                lastBackup: inst?.lastBackup ?? null,
+                snapshots: null,
+            })
         }
     } catch {
         if (disk.backupConfig?.links) {
             for (const link of disk.backupConfig.links as any[]) {
                 const name = typeof link === 'string' ? link : link?.instanceName
-                if (name) backups.push({ instanceName: name, lastBackup: null })
+                if (!name) continue
+                const inst = Object.values(store.instanceDB).find(i => i.name === name || i.id === name)
+                backups.push({
+                    instanceId: inst?.id ?? String(name),
+                    instanceName: name,
+                    lastBackup: null,
+                    snapshots: null,
+                })
             }
         }
     }
 
+    const filesPartial = truncated
+    const otherPartial = truncated
     return {
         targetId,
         label: disk.name,
-        serial: null,
         model: null,
-        sizeBytes: disk.sizeBytes ?? null,
-        filesystem: 'ext4',
+        sizeBytes: disk.sizeBytes ?? 0,
         usedBytes: disk.sizeBytes != null && disk.freeBytes != null ? disk.sizeBytes - disk.freeBytes : null,
-        readable: true,
-        partial: truncated,
+        fsType: 'ext4',
         apps,
         instances,
         backups,
-        files: { count: filesCount, bytes: filesBytes },
-        other: { count: otherCount, bytes: otherBytes },
+        files: { fileCount: filesCount, totalBytes: filesBytes, partial: filesPartial },
+        other: { entryCount: otherCount, totalBytes: otherBytes, partial: otherPartial },
+        otherPartitions: [],
+        readable: true,
+        serial: null,
+        computedAt: ops.now(),
     }
 }
 
-/** Attach a JSON result to a command trace (defaults to the active one). */
+/**
+ * Stash a JSON result for the active (or given) trace. closeTrace applies it in
+ * the same Automerge change as status=ok so Console sees both together
+ * (Prefer A r42: summariseDisk printed OK but EraseDialog timed out — no result).
+ */
 export const attachTraceResult = (result: unknown, traceId?: string): void => {
-    const h = getCommandLogHandle()
     const id = traceId ?? getActiveTrace()?.traceId
-    if (!h || !id) return
+    if (!id) return
     const json = JSON.stringify(result)
+    stashTraceResult(id, json)
+    // Eager write when a handle exists (unit tests / mid-flight readers).
+    const h = getCommandLogHandle()
+    if (!h) return
     h.change(doc => {
         const t = doc.traces[id]
         if (t) t.result = json
@@ -13207,6 +22494,121 @@ export const logSystemDrives = async (): Promise<void> => {
 
 ```
 
+## File: src/data/UndockedApps.ts
+```typescript
+/**
+ * UndockedApps.ts: the startup check that marks this Engine's instances Undocked
+ * when their containers are not running (called from start.ts).
+ *
+ * All Engines share one store (instanceDB, diskDB). An Engine may only judge the
+ * instances whose disk is docked on it: the store's disk -> engine relation
+ * (Disk.dockedTo, the same relation getDisksOfEngine / getInstancesOfEngine use).
+ * The local `docker ps` says nothing about containers on another Pi, so an instance
+ * on a disk docked elsewhere, on a disk that is not docked anywhere, on a disk
+ * missing from diskDB or with no storedOn is left exactly as it is.
+ *
+ * A user's Stop survives a restart (idea#176). An instance the operator stopped has
+ * no running container by design, so "no container" must not turn it into
+ * Undocked: the dock pass (processSystemInstance / createOrUpdateInstance) would
+ * then reset Undocked to Docked and tracedStartInstance would auto-start it. The
+ * last stopApp operation of the instance says who stopped it:
+ *   - an operator stop (console/cli/cross-engine command), or no stop record at
+ *     all: the instance stays Stopped and is not auto-started;
+ *   - a stop the Engine did itself as one step of a longer operation (backup,
+ *     copy, move, disk undock): an interrupted operation, so the instance is
+ *     marked Undocked as before and the dock pass starts it again;
+ *   - any other status with an operator stop still in force (AutoStart.ts, e.g.
+ *     an operator stop interrupted by the restart) and no container: Stopped.
+ * The dock pass applies the same rule (shouldAutoStart in tracedStartInstance),
+ * so the testMode/dev startup undock + re-add of every disk, a boot where a disk
+ * is gone or renamed, and a real unplug + replug keep the Stop too.
+ */
+import { $ } from 'zx'
+import { DocHandle } from '@automerge/automerge-repo'
+import { log } from '../utils/utils.js'
+import { EngineID, InstanceID } from './CommonTypes.js'
+import { isUserStopped, lastStopOperation, shouldAutoStart, userStopInForce } from './AutoStart.js'
+import { Instance, Status } from './Instance.js'
+import { Store } from './Store.js'
+import { localEngineId } from './Engine.js'
+
+/** True when the instance's disk is docked on `engineId` according to the store. */
+export const isInstanceDockedOn = (store: Store, instance: Instance | undefined | null, engineId: EngineID): boolean => {
+    if (!instance?.storedOn) return false
+    const disk = store.diskDB?.[instance.storedOn]
+    if (!disk?.dockedTo) return false
+    return String(disk.dockedTo) === String(engineId)
+}
+
+// The decision rules live in AutoStart.ts, shared with the dock path (idea#176).
+export { USER_CAUSES, USER_STOP_CAUSES, lastStopOperation, lastUserStop, userStopInForce, isUserStopped, shouldAutoStart } from './AutoStart.js'
+
+/** Does this Pi run a container of the instance? (`docker ps -q -f name=<id>`) */
+export type ContainerRunningCheck = (instanceId: InstanceID) => Promise<boolean>
+
+const dockerContainerRunning: ContainerRunningCheck = async (instanceId) => {
+    const result = await $`docker ps -q -f name=${instanceId}`
+    return result.stdout.trim() !== ''
+}
+
+export const checkAndSetUndockedApps = async (
+    storeHandle: DocHandle<Store>,
+    engineId: EngineID = localEngineId,
+    containerRunning: ContainerRunningCheck = dockerContainerRunning,
+): Promise<void> => {
+    const store = storeHandle.doc()
+    const all = Object.values(store.instanceDB ?? {}).filter(Boolean)
+    const mine = all.filter(inst => isInstanceDockedOn(store, inst, engineId))
+    const others = all.length - mine.length
+    if (others > 0) log(`checkAndSetUndockedApps: leaving ${others} instance(s) alone (disk docked on another Engine, not docked, or unknown)`)
+    await Promise.all(mine.map(async (instance) => {
+        if (instance.status === 'Undocked') return
+        const instanceId = instance.id
+        if (isUserStopped(store, instance)) {
+            const op = lastStopOperation(store, instanceId)
+            log(`checkAndSetUndockedApps: leaving instance ${instanceId} Stopped (${op ? `stopped by ${op.cause}` : 'no stop record'}); it is not auto-started`)
+            return
+        }
+        // #167: after a restart, never keep claiming Running for a container nobody has checked yet.
+        // Containers present (or docker not answering yet, e.g. right after a reboot): mark the
+        // instance Starting; the dock pass (startInstance) then sets Running, or does a full start.
+        const markStarting = (why: string) => storeHandle.change(doc => {
+            const inst = doc.instanceDB[instanceId]
+            if (!inst || inst.status !== 'Running' || !isInstanceDockedOn(doc, inst, engineId)) return
+            // Only when the dock pass will start (and so re-check) it; else it would stay Starting.
+            if (!shouldAutoStart(doc, inst).start) return
+            log(`Setting status of instance ${instanceId} to Starting until the dock pass checks it (${why})`)
+            inst.status = 'Starting' as Status
+            inst.statusCondition = null
+        })
+        try {
+            if (await containerRunning(instanceId)) { markStarting('containers found after restart'); return }
+            storeHandle.change(doc => {
+                const inst = doc.instanceDB[instanceId]
+                // Re-check inside the change: the disk may have been undocked or moved
+                // to another Engine (a sync) while docker ps ran.
+                if (!inst || inst.status === 'Undocked' || !isInstanceDockedOn(doc, inst, engineId)) return
+                if (isUserStopped(doc, inst)) return
+                // An operator stop is still in force (e.g. it was interrupted by the
+                // restart after its containers stopped): the instance is Stopped.
+                const stopOp = userStopInForce(doc, inst)
+                if (stopOp) {
+                    log(`Setting status of instance ${instanceId} to Stopped (operator stop ${String(stopOp.id).slice(0, 8)} by ${stopOp.cause} is in force; no container on this Engine)`)
+                    inst.status = 'Stopped' as Status
+                    return
+                }
+                log(`Setting status of instance ${instanceId} to Undocked (no container on this Engine)`)
+                inst.status = 'Undocked' as Status
+            })
+        } catch (error) {
+            log(`Error checking docker status for ${instance.name}: ${error}`)
+            markStarting('docker not answering')
+        }
+    }))
+}
+
+```
+
 ## File: src/data/UnformattedDisks.ts
 ```typescript
 /**
@@ -13243,20 +22645,26 @@ export interface LsblkDevice {
     size?: string | number
     model?: string | null
     serial?: string | null
+    /** lsblk RM: removable medium (card reader / SD). Such a device is a client card (idea#201 §10), never an Erase target. */
+    rm?: boolean | number | string | null
+    vendor?: string | null
+    tran?: string | null
     children?: LsblkDevice[]
 }
 
 export interface UnformattedOps {
     lsblkJson: () => Promise<LsblkDevice[]>
+    hardwareId: (device: string) => Promise<string | undefined>
 }
 
 const defaultOps: UnformattedOps = {
     lsblkJson: async () => {
-        const out = await $`lsblk -J -b -o NAME,TYPE,FSTYPE,SIZE,MODEL,SERIAL`.nothrow()
+        const out = await $`lsblk -J -b -o NAME,TYPE,FSTYPE,SIZE,MODEL,VENDOR,SERIAL,RM,TRAN`.nothrow()
         if (out.exitCode !== 0 || !out.stdout.trim()) return []
         const parsed = JSON.parse(out.stdout) as { blockdevices?: LsblkDevice[] }
         return parsed.blockdevices ?? []
     },
+    hardwareId: async (device) => (await readHardwareId(device as any)) as string | undefined,
 }
 
 let ops = defaultOps
@@ -13310,6 +22718,55 @@ export const uniquifyLabels = (items: { label: string }[]): void => {
 }
 
 /**
+ * The candidateId of a whole disk without IDEA META (idea#134; idea#201 §10 contract v2:
+ * one id space, so Engine.newDisks / clientCards use the same id as unformattedDisks).
+ * Hardware id for known models (Meta.readHardwareId), else the lsblk serial, else a
+ * generated id that stays stable while the disk stays plugged.
+ */
+export const candidateIdFor = async (name: string, serialRaw: string | null): Promise<{ candidateId: string, serial: string | null }> => {
+    const generated = (): string => {
+        if (!generatedIds.has(name)) generatedIds.set(name, uuid())
+        return generatedIds.get(name)!
+    }
+    try {
+        const hw = await ops.hardwareId(name)
+        if (hw) return { candidateId: hw, serial: hw }
+    } catch { /* fall through */ }
+    if (serialRaw) return { candidateId: serialRaw, serial: serialRaw }
+    return { candidateId: generated(), serial: null }
+}
+
+/** lsblk RM column (bool in recent util-linux, "1"/1 in older). Same rule as ClientCards. */
+export const isRemovableMedium = (d: LsblkDevice): boolean => d.rm === true || d.rm === 1 || d.rm === '1' || d.rm === 'true'
+
+/**
+ * idea#303: a removable USB device is a card reader (its medium an SD card, flash
+ * only) when its vendor/model looks like one, or when it was seen without a medium
+ * (size 0; a USB stick never reports size 0). Anything else removable on USB is a
+ * USB disk (stick) that can also become an IDEA disk. A false positive keeps the
+ * pre-#303 behaviour (flash only), the safe direction.
+ */
+export const CARD_READER_PATTERN = /card|reader|\bsd\b|mmc|multi|storage device/i
+const readersSeenEmpty = new Set<string>()
+export const clearCardReaderMemoryForTests = (): void => { readersSeenEmpty.clear() }
+const readerKey = (d: LsblkDevice): string => (d.serial ?? '').trim() || d.name
+const sizeOf = (d: LsblkDevice): number => typeof d.size === 'number' ? d.size : parseInt(String(d.size ?? '0'), 10) || 0
+
+/** True when this removable whole disk is a medium in a card reader (or a native card slot): flash only, never an IDEA disk. */
+export const isSdCardMedium = (d: LsblkDevice): boolean => {
+    if (!isRemovableMedium(d)) return false
+    if ((d.tran ?? 'usb') !== 'usb') return true          // removable but not USB: a native card slot
+    if (sizeOf(d) <= 0) { readersSeenEmpty.add(readerKey(d)); return true }
+    const text = `${d.vendor ?? ''} ${d.model ?? ''}`
+    return CARD_READER_PATTERN.test(text) || readersSeenEmpty.has(readerKey(d))
+}
+
+/** Forget the generated id of a device that is gone (called by every scanner). */
+export const forgetGeneratedIdsExcept = (present: Set<string>): void => {
+    for (const k of [...generatedIds.keys()]) if (!present.has(k)) generatedIds.delete(k)
+}
+
+/**
  * Scan lsblk and return whole non-system disks that have no ext4 anywhere
  * (including partition 3+). System and swap-only handling: a disk with swap but
  * no ext4 is still listed (erase script refuses swap at erase time); we exclude
@@ -13326,28 +22783,14 @@ export const scanUnformattedDisks = async (): Promise<UnformattedDisk[]> => {
         if (!/^sd[a-z]$/.test(name)) continue  // whole sdX only; partitions 3+ out of scope for listing parents with ext4 on p3 still excluded via hasExt4
         seen.add(name)
         if (await isSystemDevice(name)) continue
+        // idea#201 §10 / idea#303: an SD card in a reader is listed in Engine.clientCards (Flash) only, never here.
+        // A USB stick (removable, not in a reader) is listed here like an SSD (idea#303).
+        if (isSdCardMedium(d)) continue
         if (hasExt4(d)) continue
         const sizeBytes = typeof d.size === 'number' ? d.size : parseInt(String(d.size ?? '0'), 10) || 0
         const model = d.model?.trim() || null
         const serialRaw = d.serial?.trim() || null
-        // Prefer hardware id for known models (Meta.readHardwareId), else lsblk serial, else generated
-        let candidateId: string
-        let serial: string | null = serialRaw
-        try {
-            const hw = await readHardwareId(name as any)
-            if (hw) { candidateId = hw; serial = hw }
-            else if (serialRaw) candidateId = serialRaw
-            else {
-                if (!generatedIds.has(name)) generatedIds.set(name, uuid())
-                candidateId = generatedIds.get(name)!
-            }
-        } catch {
-            if (serialRaw) candidateId = serialRaw
-            else {
-                if (!generatedIds.has(name)) generatedIds.set(name, uuid())
-                candidateId = generatedIds.get(name)!
-            }
-        }
+        const { candidateId, serial } = await candidateIdFor(name, serialRaw)
         out.push({
             candidateId,
             device: name,
@@ -13358,10 +22801,14 @@ export const scanUnformattedDisks = async (): Promise<UnformattedDisk[]> => {
             serial,
         })
     }
-    for (const k of [...generatedIds.keys()]) if (!seen.has(k)) generatedIds.delete(k)
+    forgetGeneratedIdsExcept(seen)
     uniquifyLabels(out)
     return out
 }
+
+let afterRefresh: ((h: DocHandle<Store>) => Promise<void>) | null = null
+/** idea#201 §10: run after every refresh (client cards / new disks share the trigger). */
+export const setAfterUnformattedRefresh = (fn: ((h: DocHandle<Store>) => Promise<void>) | null): void => { afterRefresh = fn }
 
 /** Write Engine.unformattedDisks for this Engine (whole-list replace). */
 export const refreshUnformattedDisks = async (
@@ -13377,8 +22824,1440 @@ export const refreshUnformattedDisks = async (
         }))
     })
     log(`Unformatted disks: ${list.map(d => `${d.device}(${d.label})`).join(', ') || '(none)'}`)
+    if (afterRefresh) await afterRefresh(storeHandle).catch(e => log(`after unformatted refresh: ${e}`))
     return list
 }
+
+/** The stored list, in the same shape refreshUnformattedDisks writes (for change detection). */
+const storedFingerprint = (storeHandle: DocHandle<Store>, engineId: EngineID): string =>
+    JSON.stringify(storeHandle.doc()?.engineDB?.[engineId]?.unformattedDisks ?? [])
+
+const listFingerprint = (list: UnformattedDisk[]): string =>
+    JSON.stringify(list.map(({ candidateId, device, sizeBytes, model, fsType, label, serial }) => ({
+        candidateId, device, sizeBytes, model, fsType, label, serial,
+    })))
+
+/**
+ * idea#279: re-evaluate Engine.unformattedDisks when the partitions of a plugged
+ * disk change without an add or remove event for the whole disk (an
+ * 'Unformatted' disk partitioned or formatted while it stays plugged; the
+ * Samsung stick on 'idea', 2026-10-25). Writes only when the list differs from
+ * the stored one. Read-only: lsblk only, nothing is mounted.
+ */
+export const reevaluateUnformattedDisks = async (
+    storeHandle: DocHandle<Store>,
+    engineId: EngineID = localEngineId as EngineID,
+): Promise<boolean> => {
+    const list = await scanUnformattedDisks()
+    if (listFingerprint(list) === storedFingerprint(storeHandle, engineId)) return false
+    log(`Unformatted disks changed without a whole-disk event: re-evaluating`)
+    await refreshUnformattedDisks(storeHandle, engineId)
+    return true
+}
+
+/** idea#307: extra work for each poll tick (the usb monitor's failed-look retry); set once at monitor start */
+let afterPoll: (() => Promise<unknown>) | null = null
+export const setAfterUnformattedPoll = (fn: (() => Promise<unknown>) | null): void => { afterPoll = fn }
+
+export const UNFORMATTED_POLL_MS = 5_000
+export const startUnformattedDiskPoll = (storeHandle: DocHandle<Store>, ms: number = UNFORMATTED_POLL_MS): (() => void) => {
+    let running = false
+    const t = setInterval(() => {
+        if (running) return
+        running = true
+        reevaluateUnformattedDisks(storeHandle).catch(e => log(`unformatted poll: ${e}`))
+            .then(() => afterPoll?.())
+            .catch(e => log(`unformatted poll (after): ${e}`))
+            .finally(() => { running = false })
+    }, ms)
+    return () => clearInterval(t)
+}
+
+```
+
+## File: src/data/UpdateApp.ts
+```typescript
+/**
+ * UpdateApp.ts — updateApp <instance> <newAppId> [--allow-major] [--source <diskId>]
+ * (agent-engine-dev#230, v1 local swap; proposal idea#351, shapes console#168).
+ *
+ * Steps (UPDATE_STEPS): Fetch → Check → Snapshot → Swap → Start → Health.
+ *  - Fetch: the bundle apps/<newAppId>/ on a disk docked HERE (cross-Engine Fetch is #263).
+ *  - Check: refusals from checkUpdate (UpdateAppPolicy.ts), full SHA256SUMS verify, helper v5,
+ *    a free-space pre-check, all before anything changes.
+ *  - Snapshot: stop the instance, wait until its containers are really gone (the
+ *    restart: unless-stopped race), then `idea-app-data snapshot` copies instances/<id>
+ *    (bundle files, .env and data) to <disk>/.pre-update/<id>/ with a COMPLETE marker last.
+ *  - Swap: copy the new bundle files over the instance folder (.env kept), set
+ *    x-app.instanceName again, re-read the record (instanceOf = newAppId).
+ *  - Start, Health: startInstance, then the health gate (healthGate) within healthTimeout.
+ * Any failure from Snapshot on rolls back: compose down (no -v), `restore-snapshot` (the
+ * current folder is moved aside to .idea-quarantine first, so even that is undoable), re-read
+ * the record, start the old version. Result text: "ROLLED BACK: <why>"; when the rollback
+ * itself fails the instance is left Stopped with statusCondition "ROLLBACK FAILED: ...".
+ * Nothing is ever deleted; snapshots are kept (cleanup is a backlog item, quarantine only).
+ *
+ * Named Docker volumes of the instance are exported into the snapshot too (helper v5, offline host
+ * tar, verified before COMPLETE) and restored on rollback; a previous snapshot is renamed into
+ * .idea-quarantine first (never copied or removed).
+ */
+import { DocHandle } from '@automerge/automerge-repo'
+import { $, fs, path, YAML, sleep } from 'zx'
+import type { Store } from './Store.js'
+import type { Instance } from './Instance.js'
+import type { AppID, DiskID, InstanceID, Timestamp } from './CommonTypes.js'
+import { lookupLocalInstanceArg } from './InstanceArg.js'
+import { diskMountRoot, appDataRoot, Disk, PreUpdateSnapshot } from './Disk.js'
+import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
+import {
+    runAppData, snapshotArgs, restoreSnapshotArgs, snapshotsArgs, parseSnapshotResult, parseSnapshotsList,
+    helperAtLeast, lastLine, SnapshotResult, estimateArgs, parseEstimate,
+} from '../utils/appDataHelper.js'
+import { createOperation, updateOperation } from './Operations.js'
+import { log } from '../utils/utils.js'
+import {
+    UpdateAppError, UpdateStep, UPDATE_STEPS, checkUpdate, healthGate, healthTimeoutSeconds, rollbackPlan,
+    HealthSample, ContainerHealth, offerable, compareVersions, parseVersion,
+} from './UpdateAppPolicy.js'
+import { parseAppId } from './App.js'
+import { setComposeInstanceName } from './InstanceCopy.js'
+import { isUnfinishedFetch } from './UpdateFetch.js'
+
+export const UPDATE_HELPER_MIN = 5
+export const UPDATE_PROGRESS_TYPE = 'idea/updateProgress'
+export const PRE_UPDATE_DIR = '.pre-update'
+export const UPDATE_APP_USAGE = 'Usage: updateApp <instanceId|name> <newAppId> [--allow-major] [--source <diskId>]'
+/** Same margin as the helper: 10 % of the data, at least 1 GiB. */
+export const snapshotMarginBytes = (bytes: number): number => Math.max(Math.floor(bytes / 10), 1024 * 1024 * 1024)
+
+export interface UpdateProgress {
+    type: typeof UPDATE_PROGRESS_TYPE; engineId: string; instanceId: string; step: UpdateStep; bytesDone: number; bytesTotal: number
+    /** #263: set while a cross-Engine Fetch waits (thermal pause), absent otherwise */
+    fetchPaused?: FetchPaused
+}
+export interface FetchPaused { reason: 'thermal'; bytesDone: number; bytesTotal: number; since: number }
+
+export interface UpdateResult {
+    instanceId: InstanceID; name: string; fromAppId: AppID; toAppId: AppID
+    snapshotPath: string; snapshotBytes: number; steps: UpdateStep[]
+    /** the previous snapshot, renamed into .idea-quarantine before this one (or null) */
+    previousSnapshotQuarantinedAt: string | null
+    /** named Docker volumes exported into the snapshot, with their export time */
+    volumes: { name: string, bytes: number, exportMs: number }[]
+}
+export interface SnapshotsInfo { snapshots: PreUpdateSnapshot[], preUpdateBytes: number | null, quarantineBytes: number | null }
+
+export interface UpdateDeps {
+    helperProblem: () => Promise<string | null>
+    mountRoot: (disk: Disk) => Promise<string>
+    verifySums: (bundleDir: string) => Promise<boolean>
+    /** read-only helper `estimate`: folder + named-volume bytes and the App Disk's free bytes; stops nothing */
+    estimate: (disk: Disk, id: InstanceID) => Promise<{ folderBytes: number, volumeBytes: number, freeBytes: number }>
+    dirBytes: (dir: string) => Promise<number>
+    copyBundle: (src: string, dst: string) => Promise<void>
+    stop: (inst: Instance, disk: Disk) => Promise<void>
+    containerIds: (id: InstanceID) => Promise<string[]>
+    composeDown: (dir: string, id: InstanceID) => Promise<void>
+    /** #263: cross-Engine Fetch onto the instance's disk; resolves with the local bundle folder */
+    fetch: (req: import('./UpdateFetch.js').FetchRequest) => Promise<string>
+    snapshot: (disk: Disk, id: InstanceID) => Promise<SnapshotResult>
+    restoreSnapshot: (disk: Disk, id: InstanceID) => Promise<string>
+    listSnapshots: (disk: Disk) => Promise<SnapshotsInfo>
+    reread: (disk: Disk, id: InstanceID) => Promise<void>
+    start: (inst: Instance, disk: Disk) => Promise<void>
+    health: (id: InstanceID) => Promise<Omit<HealthSample, 'elapsedMs'>>
+    broadcast: (msg: UpdateProgress) => void
+    now: () => number
+    sleep: (ms: number) => Promise<void>
+    stopWaitMs: number
+    pollMs: number
+}
+
+const docker = async (args: string[]): Promise<string> => (await $`docker ${args}`.quiet()).stdout
+
+/** Worst state over the instance's containers; a one-shot container that exited 0 is fine. */
+export const aggregateHealth = (states: { status: string, health?: string, exitCode?: number, restartCount?: number }[]): Omit<HealthSample, 'elapsedMs'> => {
+    let state: ContainerHealth = 'none'
+    const rank: Record<ContainerHealth, number> = { none: 0, healthy: 0, starting: 1, unhealthy: 1, restarting: 2, exited: 3 }
+    let restartCount = 0
+    for (const c of states) {
+        restartCount = Math.max(restartCount, c.restartCount ?? 0)
+        let s: ContainerHealth
+        if (c.status === 'exited' || c.status === 'dead') { if ((c.exitCode ?? 1) === 0) continue; s = 'exited' }
+        else if (c.status === 'restarting') s = 'restarting'
+        else if (c.status === 'created') s = 'starting'
+        else s = (c.health === 'healthy' || c.health === 'starting' || c.health === 'unhealthy') ? c.health : 'none'
+        if (rank[s] > rank[state] || (rank[s] === rank[state] && s !== 'none')) state = s
+    }
+    if (!states.length) state = 'exited'
+    return { state, restartCount }
+}
+
+const defaultVerifySums = async (dir: string): Promise<boolean> => {
+    if (!await fs.pathExists(path.join(dir, 'SHA256SUMS'))) return false
+    try { await $({ cwd: dir })`sha256sum --check --strict --quiet SHA256SUMS`.quiet(); return true } catch { return false }
+}
+
+export const defaultUpdateDeps = (storeHandle: DocHandle<Store>): UpdateDeps => ({
+    helperProblem: () => helperAtLeast(UPDATE_HELPER_MIN, 'updateApp'),
+    mountRoot: (disk) => diskMountRoot(disk),
+    verifySums: (dir) => defaultVerifySums(dir),
+    fetch: async (req) => {
+        const f = await import('./UpdateFetch.js')
+        return f.fetchBundle(req, f.defaultFetchTargetDeps(storeHandle, defaultVerifySums))
+    },
+    estimate: async (disk, id) => parseEstimate(await runAppData(estimateArgs(await appDataRoot(disk), String(id)))),
+    dirBytes: async (dir) => (await import('./CopyMoveApp.js')).directoryBytes(dir),
+    copyBundle: async (src, dst) => {
+        for (const name of await fs.readdir(src)) {
+            if (name === '.env' || name === 'SHA256SUMS' || name.startsWith('.idea-')) continue
+            await fs.copy(path.join(src, name), path.join(dst, name), { overwrite: true })
+        }
+    },
+    stop: async (inst, disk) => (await import('./Instance.js')).stopInstance(storeHandle, inst, disk),
+    containerIds: async (id) => (await docker(['ps', '-q', '--filter', `label=com.docker.compose.project=${id}`])).split('\n').map(s => s.trim()).filter(Boolean),
+    composeDown: async (dir, id) => {
+        if (!await fs.pathExists(path.join(dir, 'compose.yaml'))) return
+        await $({ cwd: dir })`docker compose -p ${id} down`.quiet()
+    },
+    snapshot: async (disk, id) => parseSnapshotResult(await runAppData(snapshotArgs(await appDataRoot(disk), String(id)))),
+    restoreSnapshot: async (disk, id) => lastLine(await runAppData(restoreSnapshotArgs(await appDataRoot(disk), String(id)))),
+    listSnapshots: async (disk) => parseSnapshotsList(await runAppData(snapshotsArgs(await appDataRoot(disk)))) as SnapshotsInfo,
+    reread: async (disk, id) => { await (await import('./Instance.js')).createOrUpdateInstance(storeHandle, id, disk) },
+    start: async (inst, disk) => (await import('./Instance.js')).startInstance(storeHandle, inst, disk),
+    health: async (id) => {
+        const ids = (await docker(['ps', '-aq', '--filter', `label=com.docker.compose.project=${id}`])).split('\n').map(s => s.trim()).filter(Boolean)
+        if (!ids.length) return aggregateHealth([])
+        const info = JSON.parse(await docker(['inspect', ...ids])) as any[]
+        return aggregateHealth(info.map(c => ({ status: c?.State?.Status, health: c?.State?.Health?.Status, exitCode: c?.State?.ExitCode, restartCount: c?.RestartCount })))
+    },
+    broadcast: (msg) => { try { storeHandle.broadcast(msg) } catch { /* no peers */ } },
+    now: () => Date.now(),
+    sleep: (ms) => sleep(ms),
+    stopWaitMs: 120_000,
+    pollMs: 5_000,
+})
+
+export interface UpdateOptions { allowMajor?: boolean; sourceDiskId?: string }
+
+export const parseUpdateAppArgs = (argsString: string): { instanceArg: string, newAppId: string, opts: UpdateOptions } => {
+    const words = String(argsString ?? '').trim().split(/\s+/).filter(Boolean)
+    const opts: UpdateOptions = {}
+    const pos: string[] = []
+    for (let i = 0; i < words.length; i++) {
+        if (words[i] === '--allow-major') opts.allowMajor = true
+        else if (words[i] === '--source') { opts.sourceDiskId = words[++i]; if (!opts.sourceDiskId) throw new Error(UPDATE_APP_USAGE) }
+        else if (words[i].startsWith('--')) throw new Error(`unknown option ${words[i]}. ${UPDATE_APP_USAGE}`)
+        else pos.push(words[i])
+    }
+    if (pos.length !== 2) throw new Error(UPDATE_APP_USAGE)
+    return { instanceArg: pos[0], newAppId: pos[1], opts }
+}
+
+/** Wait until no container of the compose project exists any more (restart: unless-stopped race). */
+export const waitContainersGone = async (d: Pick<UpdateDeps, 'containerIds' | 'now' | 'sleep' | 'stopWaitMs' | 'pollMs'>, id: InstanceID): Promise<void> => {
+    const until = d.now() + d.stopWaitMs
+    for (;;) {
+        const left = await d.containerIds(id)
+        if (!left.length) return
+        if (d.now() >= until) throw new Error(`containers of ${id} are still running ${Math.round(d.stopWaitMs / 1000)} s after the stop: ${left.join(', ')}`)
+        await d.sleep(d.pollMs)
+    }
+}
+
+/** Refresh Disk.preUpdateSnapshots, preUpdateBytes and quarantineBytes from the helper (best effort; Ops visibility, Atlas). */
+export const refreshPreUpdateSnapshots = async (storeHandle: DocHandle<Store>, disk: Disk, list: UpdateDeps['listSnapshots']): Promise<PreUpdateSnapshot[] | null> => {
+    let info: SnapshotsInfo
+    try { info = await list(disk) } catch (e) { log(`updateApp: cannot list .pre-update snapshots on ${disk.id}: ${(e as Error).message}`); return null }
+    storeHandle.change(doc => {
+        const d = doc.diskDB[disk.id]
+        if (!d) return
+        d.preUpdateSnapshots = info.snapshots.map(s => ({ ...s }))
+        d.preUpdateBytes = info.preUpdateBytes
+        d.quarantineBytes = info.quarantineBytes
+    })
+    return info.snapshots
+}
+
+const findBundleDisk = async (store: Store, d: UpdateDeps, engineId: string, inst: Instance, newAppId: string, sourceDiskId?: string): Promise<{ disk: Disk, dir: string } | null> => {
+    const docked = Object.values(store.diskDB ?? {}).filter(x => x && String(x.dockedTo) === engineId && x.device) as Disk[]
+    const order = sourceDiskId ? docked.filter(x => String(x.id) === sourceDiskId)
+        : [...docked.filter(x => String(x.id) === String(inst.storedOn)), ...docked.filter(x => String(x.id) !== String(inst.storedOn))]
+    for (const disk of order) {
+        const dir = path.join(await d.mountRoot(disk), 'apps', newAppId)
+        if (await fs.pathExists(path.join(dir, 'compose.yaml')) && !await isUnfinishedFetch(dir)) return { disk, dir }
+    }
+    return null
+}
+
+const readHealthTimeout = async (composePath: string, appName: string): Promise<number> => {
+    try { return healthTimeoutSeconds(appName, YAML.parse(await fs.readFile(composePath, 'utf8'))?.['x-app']?.healthTimeout) }
+    catch { return healthTimeoutSeconds(appName) }
+}
+
+export const updateApp = async (
+    storeHandle: DocHandle<Store>, instanceArg: string, newAppId: string, engineId: string,
+    opts: UpdateOptions = {}, deps: Partial<UpdateDeps> = {},
+): Promise<UpdateResult> => {
+    const d: UpdateDeps = { ...defaultUpdateDeps(storeHandle), ...deps }
+    const store = storeHandle.doc()
+    const r = lookupLocalInstanceArg(store, String(instanceArg ?? ''), engineId)
+    if (!r.ok) {
+        if (r.reason === 'not-found') throw new UpdateAppError('NOT_FOUND', `instance '${instanceArg}' not found on this Engine`)
+        if (r.reason === 'not-local') throw new UpdateAppError('NOT_DOCKED', 'the App Disk is not docked to this Engine')
+        throw new UpdateAppError('AMBIGUOUS', `instance name '${instanceArg}' is shared by several instances on this Engine; use the instance id`)
+    }
+    const inst: Instance = r.instance
+    const disk = store.diskDB[inst.storedOn as DiskID] as Disk
+    const helper = await d.helperProblem()
+    if (helper) throw new UpdateAppError('HELPER_OUTDATED', helper)
+
+    const key = instanceKey(inst.id)
+    const gotLock = resourceLock.acquire(key, 'updateApp')
+    try {
+        const progress = (step: UpdateStep, bytesDone = 0, bytesTotal = 0) =>
+            d.broadcast({ type: UPDATE_PROGRESS_TYPE, engineId, instanceId: String(inst.id), step, bytesDone, bytesTotal })
+        // ── Fetch (local) + Check: nothing changes before every refusal has been checked
+        progress('Fetch')
+        let bundle = await findBundleDisk(store, d, engineId, inst, newAppId, opts.sourceDiskId)
+        // #263: --source names a disk docked to ANOTHER Engine: that Engine pushes the bundle here.
+        const remote = opts.sourceDiskId ? store.diskDB[opts.sourceDiskId as DiskID] as Disk | undefined : undefined
+        if (!bundle && gotLock && remote?.dockedTo && remote.device && String(remote.dockedTo) !== engineId) {
+            const dir = await d.fetch({ localEngineId: engineId, instanceId: String(inst.id), newAppId, sourceDisk: remote, targetDisk: disk })
+            bundle = { disk, dir }
+        }
+        const instRoot = await d.mountRoot(disk)
+        const instDir = path.join(instRoot, 'instances', String(inst.id))
+        let shortDisks: string[] = []
+        let dataBytes = 0
+        if (bundle && gotLock) {
+            // NO_SPACE changes nothing (Steve): the helper's read-only estimate counts the folder AND
+            // the named volumes before anything is stopped; the snapshot's own check is the backstop.
+            const est = await d.estimate(disk, inst.id)
+            dataBytes = est.folderBytes + est.volumeBytes
+            const bundleBytes = String(bundle.disk.id) === String(disk.id) ? 0 : await d.dirBytes(bundle.dir)
+            const need = dataBytes + snapshotMarginBytes(dataBytes) + bundleBytes
+            if (est.freeBytes < need) shortDisks = [`${disk.name} (snapshot needs ${need}, free ${est.freeBytes})`]
+        }
+        const refusal = checkUpdate({
+            diskDocked: true, busy: !gotLock, currentAppId: String(inst.instanceOf), newAppId,
+            sourcePresent: !!bundle, sumsValid: bundle ? await d.verifySums(bundle.dir) : false,
+            allowMajor: !!opts.allowMajor,
+            backupAgeMs: inst.lastBackup ? d.now() - Number(inst.lastBackup) : null,
+            shortDisks,
+        })
+        if (refusal) throw refusal
+        progress('Check')
+
+        const fromAppId = inst.instanceOf
+        const opId = createOperation(storeHandle, 'updateApp', { instanceId: String(inst.id), diskId: String(disk.id), fromAppId: String(fromAppId), toAppId: newAppId }, 'console-command', { type: 'instance', id: inst.id })
+        updateOperation(storeHandle, opId, { status: 'Running' })
+        const setStep = (step: UpdateStep) => updateOperation(storeHandle, opId, { currentStep: UPDATE_STEPS.indexOf(step), totalSteps: UPDATE_STEPS.length, stepLabel: step })
+        let step: UpdateStep = 'Snapshot'
+        let snap: SnapshotResult | null = null
+        const done: UpdateStep[] = ['Fetch', 'Check']
+        try {
+            // ── Snapshot
+            setStep('Snapshot'); progress('Snapshot', 0, dataBytes)
+            if (inst.status === 'Running' || inst.status === 'Starting') await d.stop(inst, disk)
+            await waitContainersGone(d, inst.id)
+            try { snap = await d.snapshot(disk, inst.id) } catch (e) {
+                const m = String((e as Error).message)
+                const ns = m.match(/NO_SPACE: [^\n]*/)
+                if (ns) throw new UpdateAppError('NO_SPACE', ns[0].replace(/^NO_SPACE: /, ''))
+                throw e
+            }
+            progress('Snapshot', snap.sizeBytes, snap.sizeBytes); done.push('Snapshot')
+            if (snap.previousQuarantinedAt) log(`updateApp: ${inst.id}: the previous snapshot was moved to ${snap.previousQuarantinedAt}`)
+            for (const v of snap.volumes) log(`updateApp: ${inst.id}: volume ${v.name} exported (${v.bytes} bytes, ${v.exportMs} ms)`)
+            updateOperation(storeHandle, opId, { stepLabel: `Snapshot ${snap.path} (${snap.sizeBytes} bytes${snap.volumes.length ? `; volumes ${snap.volumes.map(v => `${v.name} ${v.bytes} B in ${v.exportMs} ms`).join(', ')}` : ''}${snap.previousQuarantinedAt ? `; previous snapshot quarantined at ${snap.previousQuarantinedAt}` : ''})` })
+            await refreshPreUpdateSnapshots(storeHandle, disk, d.listSnapshots)
+            // ── Swap
+            step = 'Swap'; setStep('Swap'); progress('Swap')
+            const targetApps = path.join(instRoot, 'apps', newAppId)
+            if (bundle!.dir !== targetApps) await d.copyBundle(bundle!.dir, targetApps)
+            await d.copyBundle(bundle!.dir, instDir)
+            const composePath = path.join(instDir, 'compose.yaml')
+            await fs.writeFile(composePath, setComposeInstanceName(await fs.readFile(composePath, 'utf8'), String(inst.name)))
+            await d.reread(disk, inst.id)
+            done.push('Swap')
+            // ── Start
+            step = 'Start'; setStep('Start'); progress('Start')
+            const fresh = storeHandle.doc().instanceDB[inst.id] as Instance
+            await d.start(fresh, disk)
+            const after = storeHandle.doc().instanceDB[inst.id]
+            if (!after || after.status === 'Error') throw new Error(`start failed: ${after?.statusCondition ?? 'instance record missing'}`)
+            done.push('Start')
+            // ── Health
+            step = 'Health'; setStep('Health')
+            const timeoutS = await readHealthTimeout(composePath, parseAppId(newAppId).name)
+            const t0 = d.now()
+            for (;;) {
+                const elapsedMs = d.now() - t0
+                const v = healthGate({ ...(await d.health(inst.id)), elapsedMs }, timeoutS)
+                progress('Health', Math.min(elapsedMs, timeoutS * 1000), timeoutS * 1000)
+                if (v.verdict === 'pass') break
+                if (v.verdict === 'fail') throw new Error(`health gate: ${v.why}`)
+                await d.sleep(d.pollMs)
+            }
+            done.push('Health')
+            updateOperation(storeHandle, opId, { status: 'Done', completedAt: d.now() as Timestamp })
+            log(`updateApp: ${inst.id} ('${inst.name}') ${fromAppId} -> ${newAppId}; snapshot ${snap.path} (${snap.sizeBytes} bytes) kept`)
+            return { instanceId: inst.id, name: String(inst.name), fromAppId, toAppId: newAppId as AppID, snapshotPath: snap.path, snapshotBytes: snap.sizeBytes, steps: done, previousSnapshotQuarantinedAt: snap.previousQuarantinedAt, volumes: snap.volumes }
+        } catch (e) {
+            const why = e instanceof UpdateAppError && e.code === 'NO_SPACE' ? null : String((e as Error).message)
+            if (!why || !snap) {
+                // Before a complete snapshot nothing was swapped: the old version is intact.
+                // It may have been stopped for the snapshot: start the old version again.
+                if (inst.status === 'Running' || inst.status === 'Starting') {
+                    try { await d.start(storeHandle.doc().instanceDB[inst.id] as Instance, disk) } catch (se) { log(`updateApp: restarting ${inst.id} failed: ${(se as Error).message}`) }
+                }
+                const err = e instanceof UpdateAppError ? e : new UpdateAppError('ROLLED_BACK', `${step} failed: ${why}; nothing was changed`)
+                updateOperation(storeHandle, opId, { status: 'Failed', error: err.message, completedAt: d.now() as Timestamp })
+                throw err
+            }
+            const err = await rollBack(storeHandle, d, inst, disk, instDir, step, why, snap)
+            updateOperation(storeHandle, opId, { status: 'Failed', error: err.message, completedAt: d.now() as Timestamp })
+            throw err
+        }
+    } finally {
+        if (gotLock) resourceLock.release(key)
+    }
+}
+
+/** Restore the snapshot and start the old version. Returns the error to report. */
+const rollBack = async (
+    storeHandle: DocHandle<Store>, d: UpdateDeps, inst: Instance, disk: Disk, instDir: string,
+    failedAt: UpdateStep, why: string, snap: { path: string, sizeBytes: number },
+): Promise<UpdateAppError> => {
+    const plan = rollbackPlan(failedAt)
+    log(`updateApp: ${failedAt} failed for ${inst.id} (${why}); rolling back from ${snap.path}`)
+    try {
+        await d.composeDown(instDir, inst.id)
+        await waitContainersGone(d, inst.id)
+        if (plan.restoreData) {
+            const aside = await d.restoreSnapshot(disk, inst.id)
+            log(`updateApp: ${inst.id} restored from ${snap.path}; the updated folder is kept at ${aside}`)
+        }
+        await d.reread(disk, inst.id)
+        if (plan.startOld && (inst.status === 'Running' || inst.status === 'Starting')) {
+            await d.start(storeHandle.doc().instanceDB[inst.id] as Instance, disk)
+            const after = storeHandle.doc().instanceDB[inst.id]
+            if (!after || after.status === 'Error') throw new Error(`the old version did not start: ${after?.statusCondition ?? 'record missing'}`)
+        }
+        return new UpdateAppError('ROLLED_BACK', `${failedAt} failed: ${why}. ${inst.instanceOf} and its data were restored from ${snap.path}`)
+    } catch (e) {
+        const err = new UpdateAppError('ROLLBACK_FAILED', `${failedAt} failed: ${why}; then the rollback failed: ${(e as Error).message}. The snapshot is kept at ${snap.path}`)
+        storeHandle.change(doc => {
+            const i = doc.instanceDB[inst.id]
+            if (!i) return
+            i.status = 'Stopped' as any
+            i.statusCondition = err.message
+        })
+        return err
+    }
+}
+
+/**
+ * Startup (power-loss safety): an updateApp operation of this Engine left Running is
+ * rolled back when a complete snapshot exists (the helper's COMPLETE marker); otherwise
+ * the old folder was never touched. The op is then marked Failed by recoverInterruptedOperations.
+ */
+export const recoverInterruptedUpdates = async (storeHandle: DocHandle<Store>, engineId: string, deps: Partial<UpdateDeps> = {}): Promise<string[]> => {
+    const d: UpdateDeps = { ...defaultUpdateDeps(storeHandle), ...deps }
+    const store = storeHandle.doc()
+    const out: string[] = []
+    for (const op of Object.values(store.operationDB ?? {})) {
+        if (!op || op.kind !== 'updateApp' || String(op.engineId) !== engineId || (op.status !== 'Running' && op.status !== 'Pending')) continue
+        const inst = store.instanceDB[op.args.instanceId as InstanceID]
+        const disk = inst && store.diskDB[inst.storedOn as DiskID] as Disk
+        if (!inst || !disk || String(disk.dockedTo) !== engineId) { out.push(`${op.args.instanceId}: disk not docked; left as is`); continue }
+        const step = UPDATE_STEPS[op.currentStep ?? 0] ?? 'Snapshot'
+        const snaps = (await d.listSnapshots(disk).catch(() => null))?.snapshots ?? []
+        const complete = snaps.some(s => String(s.instanceId) === String(inst.id) && s.complete)
+        const swapped = UPDATE_STEPS.indexOf(step) >= UPDATE_STEPS.indexOf('Swap')
+        if (!complete || !swapped) { out.push(`${inst.id}: interrupted at ${step}; old version untouched`); continue }
+        const err = await rollBack(storeHandle, d, inst, disk, path.join(await d.mountRoot(disk), 'instances', String(inst.id)), step, 'the Engine restarted during the update', { path: path.join(await d.mountRoot(disk), PRE_UPDATE_DIR, String(inst.id)), sizeBytes: 0 })
+        updateOperation(storeHandle, op.id, { status: 'Failed', error: `INTERRUPTED: ${err.message}`, completedAt: d.now() as Timestamp })
+        out.push(`${inst.id}: ${err.message}`)
+    }
+    return out
+}
+
+
+/**
+ * Dock-time updateAvailable (Steve call 3): cheap, no full verify. For every instance on a disk
+ * docked to this Engine, look for a newer bundle of the same App under apps/ on any disk docked
+ * here whose SHA256SUMS exists, is non-empty and lists compose.yaml (read, not checked). The
+ * full SHA256SUMS verify stays at update start (NO_SUMS). Sets Instance.updateAvailable (highest
+ * version wins; the instance's own disk first on a tie) or null.
+ */
+export interface UpdateAvailableDeps {
+    mountRoot: (disk: Disk) => Promise<string>
+    listApps: (appsDir: string) => Promise<string[]>
+    readSums: (bundleDir: string) => Promise<string | null>
+}
+const defaultAvailableDeps: UpdateAvailableDeps = {
+    mountRoot: (disk) => diskMountRoot(disk),
+    listApps: async (dir) => (await fs.pathExists(dir)) ? (await fs.readdir(dir)).filter(n => !n.startsWith('.')) : [],
+    readSums: async (dir) => { try { return await fs.readFile(path.join(dir, 'SHA256SUMS'), 'utf8') } catch { return null } },
+}
+export const sumsLookUsable = (sums: string | null): boolean =>
+    !!sums && sums.split('\n').some(l => /^[0-9a-f]{64} [ *]\.?\/?compose\.yaml$/.test(l.trim()))
+
+export const refreshUpdateAvailable = async (storeHandle: DocHandle<Store>, engineId: string, deps: Partial<UpdateAvailableDeps> = {}): Promise<number> => {
+    const d = { ...defaultAvailableDeps, ...deps }
+    const store = storeHandle.doc()
+    const docked = Object.values(store.diskDB ?? {}).filter(x => x && String(x.dockedTo) === engineId && x.device) as Disk[]
+    const bundles: { disk: Disk, appId: string }[] = []
+    for (const disk of docked) {
+        let root: string
+        try { root = await d.mountRoot(disk) } catch { continue }
+        for (const appId of await d.listApps(path.join(root, 'apps')).catch(() => [] as string[])) {
+            if (sumsLookUsable(await d.readSums(path.join(root, 'apps', appId)))) bundles.push({ disk, appId })
+        }
+    }
+    const updates: Record<string, Instance['updateAvailable']> = {}
+    for (const inst of Object.values(store.instanceDB ?? {}) as Instance[]) {
+        if (!inst || !docked.some(x => String(x.id) === String(inst.storedOn))) continue
+        let best: { disk: Disk, appId: string } | null = null
+        for (const b of bundles) {
+            if (!offerable({ currentAppId: String(inst.instanceOf), newAppId: b.appId, sumsValid: true })) continue
+            const c = best ? compareVersions(parseAppId(b.appId).version, parseAppId(best.appId).version) : 1
+            if (c !== null && (c > 0 || (c === 0 && String(b.disk.id) === String(inst.storedOn)))) best = b
+        }
+        if (!best) { updates[String(inst.id)] = null; continue }
+        const from = parseAppId(String(inst.instanceOf)).version, to = parseAppId(best.appId).version
+        updates[String(inst.id)] = {
+            appId: best.appId as AppID, sourceDiskId: best.disk.id as DiskID, sourceEngineId: engineId as any,
+            fromVersion: from, toVersion: to, major: (parseVersion(to)?.[0] ?? 0) !== (parseVersion(from)?.[0] ?? 0),
+        }
+    }
+    storeHandle.change(doc => {
+        for (const [id, u] of Object.entries(updates)) {
+            const i = doc.instanceDB[id as InstanceID]
+            if (!i) continue
+            const cur = JSON.stringify(i.updateAvailable ?? null), next = JSON.stringify(u ?? null)
+            if (cur !== next) i.updateAvailable = u ? { ...u } : null
+        }
+    })
+    return Object.values(updates).filter(Boolean).length
+}
+
+```
+
+## File: src/data/UpdateAppPolicy.ts
+```typescript
+/**
+ * UpdateAppPolicy.ts — pure rules for updateApp v1, local swap (agent-engine-dev#230).
+ *
+ * No I/O here: the command (UpdateApp.ts, next increment) feeds facts in and acts on
+ * the decisions. Agreed rules (#230 comment 6469233119):
+ *  - No move-aside metadata field and no Kolibri special case.
+ *  - Rollback after a failed step at or after Snapshot ALWAYS restores the pre-update
+ *    data snapshot as well as the old bundle/image, never just the old image.
+ *  - Health gate: during healthTimeout, `starting` and `unhealthy` are "not ready yet";
+ *    fail only on container exit, crash-loop or timeout.
+ *  - healthTimeout per App: kolibri 900 s, nextcloud 300 s, default 600 s.
+ *  - An App without valid SHA256SUMS is never offered an update (NO_SUMS).
+ */
+import { parseAppId } from './App.js'
+
+export type UpdateStep = 'Fetch' | 'Check' | 'Snapshot' | 'Swap' | 'Start' | 'Health'
+export const UPDATE_STEPS: readonly UpdateStep[] = ['Fetch', 'Check', 'Snapshot', 'Swap', 'Start', 'Health']
+
+export type UpdateRefusal =
+    | 'NOT_DOCKED' | 'BUSY' | 'SOURCE_MISSING' | 'DIFFERENT_APP' | 'NOT_NEWER'
+    | 'MAJOR_NOT_ALLOWED' | 'NEEDS_BACKUP' | 'NO_SPACE' | 'NO_SUMS'
+    | 'NOT_FOUND' | 'AMBIGUOUS' | 'HELPER_OUTDATED' | 'TRANSFER_FAILED'
+
+/** Error text starts with the code; the two rollback outcomes use the console#168 wording. */
+export const ROLLED_BACK_PREFIX = 'ROLLED BACK:'
+export const ROLLBACK_FAILED_PREFIX = 'ROLLBACK FAILED:'
+
+export class UpdateAppError extends Error {
+    constructor(public code: UpdateRefusal | 'ROLLED_BACK' | 'ROLLBACK_FAILED', text: string) {
+        super(code === 'ROLLED_BACK' ? `${ROLLED_BACK_PREFIX} ${text}` : code === 'ROLLBACK_FAILED' ? `${ROLLBACK_FAILED_PREFIX} ${text}` : `${code}: ${text}`)
+    }
+}
+
+/** Numeric version parts from "1.2.3", "v1.2", or tool output like "kolibri, version 0.19.5"; null if none. */
+export const parseVersion = (raw: string | null | undefined): number[] | null => {
+    const m = String(raw ?? '').match(/(\d+(?:\.\d+)*)/)
+    return m ? m[1].split('.').map(n => Number(n)) : null
+}
+
+/** <0, 0, >0 like a comparator; null when either side can't be read. */
+export const compareVersions = (a: string, b: string): number | null => {
+    const x = parseVersion(a), y = parseVersion(b)
+    if (!x || !y) return null
+    for (let i = 0; i < Math.max(x.length, y.length); i++) {
+        const d = (x[i] ?? 0) - (y[i] ?? 0)
+        if (d !== 0) return d
+    }
+    return 0
+}
+
+const DEFAULT_HEALTH_TIMEOUT_S = 600
+const HEALTH_TIMEOUT_S: Record<string, number> = { kolibri: 900, nextcloud: 300 }
+
+/** x-app.healthTimeout (seconds) wins when valid; else the per-App default. */
+export const healthTimeoutSeconds = (appName: string, declared?: unknown): number => {
+    const n = Number(declared)
+    if (declared !== undefined && declared !== null && Number.isFinite(n) && n > 0) return n
+    return HEALTH_TIMEOUT_S[appName.toLowerCase()] ?? DEFAULT_HEALTH_TIMEOUT_S
+}
+
+export interface CheckFacts {
+    diskDocked: boolean
+    busy: boolean
+    currentAppId: string
+    newAppId: string
+    sourcePresent: boolean
+    sumsValid: boolean
+    allowMajor: boolean
+    /** ms since the last Borg backup; null if never */
+    backupAgeMs: number | null
+    /** disks that lack space (name), empty when all fit */
+    shortDisks: string[]
+}
+
+export const BACKUP_MAX_AGE_MS = 60 * 60 * 1000
+
+/** First refusal in the agreed order, or null when the update may go ahead. */
+export const checkUpdate = (f: CheckFacts): UpdateAppError | null => {
+    if (!f.diskDocked) return new UpdateAppError('NOT_DOCKED', 'the App Disk is not docked to this Engine')
+    if (f.busy) return new UpdateAppError('BUSY', 'another operation is running on this instance')
+    if (!f.sourcePresent) return new UpdateAppError('SOURCE_MISSING', `bundle ${f.newAppId} was not found on the source`)
+    if (!f.sumsValid) return new UpdateAppError('NO_SUMS', `bundle ${f.newAppId} has no valid SHA256SUMS`)
+    const cur = parseAppId(f.currentAppId), nxt = parseAppId(f.newAppId)
+    if (cur.name !== nxt.name) return new UpdateAppError('DIFFERENT_APP', `${f.newAppId} is not a version of ${cur.name}`)
+    const cmp = compareVersions(nxt.version, cur.version)
+    if (cmp === null || cmp <= 0) return new UpdateAppError('NOT_NEWER', `${nxt.version} is not newer than ${cur.version}`)
+    const major = (parseVersion(nxt.version)![0] ?? 0) !== (parseVersion(cur.version)![0] ?? 0)
+    if (major && !f.allowMajor) return new UpdateAppError('MAJOR_NOT_ALLOWED', `${cur.version} -> ${nxt.version} is a major update; pass --allow-major`)
+    if (major && (f.backupAgeMs === null || f.backupAgeMs > BACKUP_MAX_AGE_MS)) return new UpdateAppError('NEEDS_BACKUP', 'Dock a Backup Disk and make a backup first')
+    if (f.shortDisks.length) return new UpdateAppError('NO_SPACE', `not enough free space on ${f.shortDisks.join(', ')}`)
+    return null
+}
+
+/** True when the App may be offered an update at all (updateAvailable). */
+export const offerable = (f: Pick<CheckFacts, 'currentAppId' | 'newAppId' | 'sumsValid'>): boolean => {
+    if (!f.sumsValid) return false
+    const cur = parseAppId(f.currentAppId), nxt = parseAppId(f.newAppId)
+    if (cur.name !== nxt.name) return false
+    const cmp = compareVersions(nxt.version, cur.version)
+    return cmp !== null && cmp > 0
+}
+
+export type ContainerHealth = 'starting' | 'healthy' | 'unhealthy' | 'none' | 'exited' | 'restarting'
+export interface HealthSample { state: ContainerHealth; restartCount: number; elapsedMs: number; bodyOk?: boolean }
+export type GateVerdict = { verdict: 'wait' } | { verdict: 'pass' } | { verdict: 'fail'; why: string }
+
+export const CRASH_LOOP_RESTARTS = 3
+
+/** One poll of the health gate. `starting`/`unhealthy` are not ready yet, never a failure by themselves. */
+export const healthGate = (s: HealthSample, timeoutS: number): GateVerdict => {
+    if (s.state === 'exited') return { verdict: 'fail', why: 'the primary container exited' }
+    if (s.restartCount >= CRASH_LOOP_RESTARTS || (s.state === 'restarting' && s.restartCount > 0 && s.restartCount >= CRASH_LOOP_RESTARTS))
+        return { verdict: 'fail', why: `crash-loop (${s.restartCount} restarts)` }
+    if ((s.state === 'healthy' || s.state === 'none') && s.bodyOk !== false) return { verdict: 'pass' }
+    if (s.elapsedMs >= timeoutS * 1000) return { verdict: 'fail', why: `not healthy after ${timeoutS} s` }
+    return { verdict: 'wait' }
+}
+
+export interface RollbackPlan { restoreBundle: boolean; restoreData: boolean; startOld: boolean }
+
+/** What a rollback must do after `failedAt` failed. Data is ALWAYS restored once a snapshot exists. */
+export const rollbackPlan = (failedAt: UpdateStep): RollbackPlan => {
+    const idx = UPDATE_STEPS.indexOf(failedAt)
+    const touched = idx >= UPDATE_STEPS.indexOf('Snapshot')
+    return { restoreBundle: idx >= UPDATE_STEPS.indexOf('Swap'), restoreData: touched, startOld: touched }
+}
+
+```
+
+## File: src/data/UpdateFetch.ts
+```typescript
+/**
+ * UpdateFetch.ts — cross-Engine Fetch for updateApp (agent-engine-dev#263, builds on #230).
+ *
+ * Push model, no gate or helper change: the instance's Engine (target) asks the Engine where
+ * the source disk is docked (`pushAppBundle`, sent with sendCommand) to push apps/<appId>/ with
+ * rsyncToPeer through the existing receive-app path into <target disk>/apps/<appId>/. The source
+ * answers with `appFetchResult <requestId> ok|TRANSFER_FAILED <why>`.
+ *
+ *  - Before the push the target writes apps/<appId>/.idea-fetching (the request id). Dock and the
+ *    app listing ignore such a folder until apps/<appId>/.idea-fetched exists.
+ *  - After the push the target refuses any other bundle-root `.idea-*` entry (pushed by the
+ *    source), re-checks SHA256SUMS in full, then renames .idea-fetching to .idea-fetched.
+ *  - Failure: TRANSFER_FAILED; the partial folder is moved aside (apps/.idea-aborted-<appId>-<stamp>,
+ *    same filesystem, never removed).
+ *  - Source: rsync --partial, 3 retries with backoff; a thermal pause at 75 °C (resumes at 65 °C)
+ *    stops the rsync (the --partial resume continues it) and is reported as
+ *    idea/updateProgress `fetchPaused {reason, bytesDone, bytesTotal, since}`.
+ */
+import { DocHandle } from '@automerge/automerge-repo'
+import { fs, path } from 'zx'
+import type { Store } from './Store.js'
+import type { Command, EngineID } from './CommonTypes.js'
+import { Disk, diskMountRoot, appDataRoot } from './Disk.js'
+import { log, uuid } from '../utils/utils.js'
+import { UpdateAppError } from './UpdateAppPolicy.js'
+import type { UpdateProgress, FetchPaused } from './UpdateApp.js'
+
+const UPDATE_PROGRESS_TYPE = 'idea/updateProgress' as const   // = UpdateApp.UPDATE_PROGRESS_TYPE (no import cycle)
+import type { PeerEngine } from '../utils/rsync.js'
+import { killRegisteredProcess } from './Operations.js'
+
+export const FETCHING_MARKER = '.idea-fetching'
+export const FETCHED_MARKER = '.idea-fetched'
+export const FETCH_RETRIES = 3
+export const FETCH_BACKOFF_MS = [5_000, 20_000, 60_000]
+export const THERMAL_PAUSE_C = 75
+export const THERMAL_RESUME_C = 65
+export const THERMAL_POLL_MS = 10_000
+/** No answer from the source Engine within this time: TRANSFER_FAILED. */
+export const FETCH_TIMEOUT_MS = 6 * 60 * 60 * 1000
+const RE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+
+/** True when apps/<appId>/ is a Fetch still in progress (or aborted): dock and listing skip it. */
+export const isUnfinishedFetch = async (bundleDir: string): Promise<boolean> =>
+    await fs.pathExists(path.join(bundleDir, FETCHING_MARKER)) && !await fs.pathExists(path.join(bundleDir, FETCHED_MARKER))
+
+// ── Target side ─────────────────────────────────────────────────────────────
+
+type FetchAnswer = { ok: true } | { ok: false, why: string }
+const pending = new Map<string, (a: FetchAnswer) => void>()
+
+/** `appFetchResult <requestId> ok|TRANSFER_FAILED <why…>` from the source Engine. */
+export const handleAppFetchResult = (requestId: string, status: string, why: string[] = []): boolean => {
+    const resolve = pending.get(requestId)
+    if (!resolve) { log(`appFetchResult: no Fetch waits for request ${requestId}`); return false }
+    pending.delete(requestId)
+    resolve(status === 'ok' ? { ok: true } : { ok: false, why: why.join(' ') || status })
+    return true
+}
+
+export interface FetchTargetDeps {
+    mountRoot: (disk: Disk) => Promise<string>
+    rootToken: (disk: Disk) => Promise<string>
+    send: (engineId: EngineID, command: string) => void
+    verifySums: (dir: string) => Promise<boolean>
+    newId: () => string
+    now: () => number
+    timeoutMs: number
+}
+
+export interface FetchRequest {
+    localEngineId: string; instanceId: string; newAppId: string
+    sourceDisk: Disk; targetDisk: Disk
+}
+
+const stamp = (now: number) => new Date(now).toISOString().replace(/[-:.]/g, '')
+
+/** Move a partial Fetch aside on the same filesystem (never removed). Returns the new path. */
+export const setFetchAside = async (bundleDir: string, now: number): Promise<string> => {
+    const aside = path.join(path.dirname(bundleDir), `.idea-aborted-${path.basename(bundleDir)}-${stamp(now)}`)
+    await fs.rename(bundleDir, aside)
+    log(`updateApp Fetch: partial ${bundleDir} moved aside to ${aside}`)
+    return aside
+}
+
+/** Bundle-root `.idea-*` entries the source pushed (anything but our own .idea-fetching). */
+export const pushedIdeaEntries = async (bundleDir: string): Promise<string[]> =>
+    (await fs.readdir(bundleDir)).filter(n => n.startsWith('.idea-') && n !== FETCHING_MARKER)
+
+/**
+ * Fetch apps/<newAppId>/ from the source disk (docked to another Engine) onto the instance's
+ * disk. Resolves with the local bundle folder (marker .idea-fetched written) or throws
+ * TRANSFER_FAILED. A folder that already carries .idea-fetched and passes SHA256SUMS is reused.
+ */
+export const fetchBundle = async (req: FetchRequest, d: FetchTargetDeps): Promise<string> => {
+    const sourceEngine = String(req.sourceDisk.dockedTo ?? '')
+    if (!sourceEngine || !req.sourceDisk.device) throw new UpdateAppError('SOURCE_MISSING', `source disk ${req.sourceDisk.id} is not docked to any Engine`)
+    for (const t of [req.newAppId, String(req.sourceDisk.id), req.localEngineId, String(req.targetDisk.id), req.instanceId]) {
+        if (!RE_TOKEN.test(t)) throw new UpdateAppError('TRANSFER_FAILED', `cannot ask for a Fetch with the token '${t}'`)
+    }
+    const root = await d.mountRoot(req.targetDisk)
+    const dir = path.join(root, 'apps', req.newAppId)
+    if (await fs.pathExists(dir)) {
+        if (await fs.pathExists(path.join(dir, FETCHED_MARKER)) && await d.verifySums(dir)) return dir
+        if (await fs.pathExists(path.join(dir, FETCHING_MARKER))) await setFetchAside(dir, d.now())
+        else throw new UpdateAppError('TRANSFER_FAILED', `${dir} exists and is not a finished Fetch; not overwriting it`)
+    }
+    const requestId = d.newId()
+    await fs.ensureDir(dir)
+    await fs.writeFile(path.join(dir, FETCHING_MARKER), `${requestId}\n`)
+    const answer = new Promise<FetchAnswer>((resolve) => {
+        pending.set(requestId, resolve)
+        const t = setTimeout(() => { if (pending.delete(requestId)) resolve({ ok: false, why: `no answer from Engine ${sourceEngine} within ${Math.round(d.timeoutMs / 60000)} min` }) }, d.timeoutMs)
+        ;(t as any).unref?.()
+    })
+    const token = await d.rootToken(req.targetDisk)
+    log(`updateApp Fetch: asking Engine ${sourceEngine} to push ${req.newAppId} from ${req.sourceDisk.id} (request ${requestId})`)
+    d.send(sourceEngine as EngineID, `pushAppBundle ${req.sourceDisk.id} ${req.newAppId} ${req.localEngineId} ${token} ${requestId} ${req.instanceId}`)
+    const a = await answer
+    const fail = async (why: string): Promise<never> => {
+        const aside = await setFetchAside(dir, d.now()).catch(() => null)
+        throw new UpdateAppError('TRANSFER_FAILED', `${why}${aside ? `; the partial folder was moved aside to ${aside}` : ''}`)
+    }
+    if (!a.ok) return fail(a.why)
+    const pushed = await pushedIdeaEntries(dir)
+    if (pushed.length) return fail(`the source pushed bundle-root ${pushed.join(', ')}; refused`)
+    const marker = (await fs.readFile(path.join(dir, FETCHING_MARKER), 'utf8').catch(() => '')).trim()
+    if (marker !== requestId) return fail(`${FETCHING_MARKER} was changed by the transfer; refused`)
+    if (!await d.verifySums(dir)) return fail('the fetched bundle does not match its SHA256SUMS')
+    await fs.rename(path.join(dir, FETCHING_MARKER), path.join(dir, FETCHED_MARKER))   // one atomic step
+    log(`updateApp Fetch: ${dir} fetched and verified`)
+    return dir
+}
+
+export const defaultFetchTargetDeps = (storeHandle: DocHandle<Store>, verifySums: (dir: string) => Promise<boolean>): FetchTargetDeps => ({
+    mountRoot: (disk) => diskMountRoot(disk),
+    rootToken: (disk) => appDataRoot(disk),
+    send: (engineId, command) => { void import('../utils/commandUtils.js').then(m => m.sendCommand(storeHandle, engineId, command as Command)) },
+    verifySums,
+    newId: () => uuid(),
+    now: () => Date.now(),
+    timeoutMs: FETCH_TIMEOUT_MS,
+})
+
+// ── Source side ─────────────────────────────────────────────────────────────
+
+export interface PushDeps {
+    mountRoot: (disk: Disk) => Promise<string>
+    address: (engineId: string) => Promise<string | undefined>
+    push: (src: string, peer: PeerEngine, helperArgs: string[], onProgress: (p: { progressPercent: number }) => void, opId: string) => Promise<void>
+    stop: (opId: string) => boolean
+    dirBytes: (dir: string) => Promise<number>
+    temperatureC: () => Promise<number | null>
+    reply: (engineId: EngineID, command: string) => void
+    broadcast: (msg: UpdateProgress) => void
+    now: () => number
+    sleep: (ms: number) => Promise<void>
+    backoffMs: number[]
+    thermalPollMs: number
+}
+
+export interface PushRequest { sourceDiskId: string; appId: string; targetEngineId: string; targetRoot: string; requestId: string; instanceId: string }
+
+/** Read /sys/class/thermal/thermal_zone0/temp (millidegrees); null when there is none. */
+export const readCpuTemperatureC = async (): Promise<number | null> => {
+    try { const v = Number((await fs.readFile('/sys/class/thermal/thermal_zone0/temp', 'utf8')).trim()); return Number.isFinite(v) ? v / 1000 : null } catch { return null }
+}
+
+/** Push apps/<appId>/ to the target Engine and answer it. Never throws; the answer carries the outcome. */
+export const pushAppBundle = async (store: Store, localEngineId: string, req: PushRequest, d: PushDeps): Promise<FetchAnswer> => {
+    const answer = (a: FetchAnswer): FetchAnswer => {
+        d.reply(req.targetEngineId as EngineID, a.ok ? `appFetchResult ${req.requestId} ok` : `appFetchResult ${req.requestId} TRANSFER_FAILED ${a.why.replace(/\s+/g, ' ')}`)
+        return a
+    }
+    const disk = store.diskDB?.[req.sourceDiskId as any] as Disk | undefined
+    if (!disk || String(disk.dockedTo) !== localEngineId || !disk.device) return answer({ ok: false, why: `source disk ${req.sourceDiskId} is not docked to Engine ${localEngineId}` })
+    const src = path.join(await d.mountRoot(disk), 'apps', req.appId)
+    if (!await fs.pathExists(path.join(src, 'compose.yaml')) || !await fs.pathExists(path.join(src, 'SHA256SUMS'))) return answer({ ok: false, why: `${req.appId} on ${req.sourceDiskId} has no compose.yaml or SHA256SUMS` })
+    if ((await fs.readdir(src)).some(n => n.startsWith('.idea-'))) return answer({ ok: false, why: `${src} holds bundle-root .idea-* files; not pushing them` })
+    const host = await d.address(req.targetEngineId)
+    if (!host) return answer({ ok: false, why: `Engine ${req.targetEngineId} is not connected` })
+    const peer: PeerEngine = { host, engineId: req.targetEngineId }
+    const bytesTotal = await d.dirBytes(src).catch(() => 0)
+    let bytesDone = 0
+    const progress = (fetchPaused?: FetchPaused) => d.broadcast({ type: UPDATE_PROGRESS_TYPE, engineId: req.targetEngineId, instanceId: req.instanceId, step: 'Fetch', bytesDone, bytesTotal, ...(fetchPaused ? { fetchPaused } : {}) })
+    const hot = async () => { const t = await d.temperatureC(); return t !== null && t >= THERMAL_PAUSE_C }
+    const coolDown = async () => {
+        const since = d.now()
+        log(`pushAppBundle: thermal pause (>= ${THERMAL_PAUSE_C} °C) for ${req.appId} -> ${req.targetEngineId}`)
+        for (;;) {
+            progress({ reason: 'thermal', bytesDone, bytesTotal, since })
+            const t = await d.temperatureC()
+            if (t === null || t <= THERMAL_RESUME_C) break
+            await d.sleep(d.thermalPollMs)
+        }
+        log(`pushAppBundle: resumed after ${Math.round((d.now() - since) / 1000)} s`)
+    }
+    const opId = `fetch-${req.requestId}`
+    let lastErr = ''
+    for (let attempt = 0; attempt <= FETCH_RETRIES; attempt++) {
+        if (attempt > 0) await d.sleep(d.backoffMs[Math.min(attempt - 1, d.backoffMs.length - 1)])
+        if (await hot()) await coolDown()
+        let pausedHot = false
+        let watching = true
+        const watcher = (async () => {
+            while (watching) {
+                await d.sleep(d.thermalPollMs)
+                if (watching && await hot()) { pausedHot = true; d.stop(opId); return }
+            }
+        })()
+        try {
+            await d.push(src.replace(/\/*$/, '/'), peer, ['receive-app', req.targetRoot, req.appId], ({ progressPercent }) => {
+                bytesDone = Math.round(bytesTotal * progressPercent / 100); progress()
+            }, opId)
+            watching = false
+            bytesDone = bytesTotal; progress()
+            return answer({ ok: true })
+        } catch (e) {
+            watching = false
+            lastErr = String((e as Error).message)
+            if (pausedHot) { await coolDown(); attempt-- ; continue }   // a thermal pause is not a failed try
+            log(`pushAppBundle: try ${attempt + 1} of ${FETCH_RETRIES + 1} failed: ${lastErr}`)
+        }
+        await watcher.catch(() => undefined)
+    }
+    return answer({ ok: false, why: `rsync failed after ${FETCH_RETRIES} retries: ${lastErr}` })
+}
+
+export const defaultPushDeps = (storeHandle: DocHandle<Store>): PushDeps => ({
+    mountRoot: (disk) => diskMountRoot(disk),
+    address: async (engineId) => (await import('./Network.js')).getEngineAddress(engineId as EngineID),
+    push: async (src, peer, args, onProgress, opId) => (await import('../utils/rsync.js')).rsyncToPeer(src, peer, args, onProgress, opId, ['--partial']),
+    stop: (opId) => killRegisteredProcess(opId),
+    dirBytes: async (dir) => (await import('./CopyMoveApp.js')).directoryBytes(dir),
+    temperatureC: readCpuTemperatureC,
+    reply: (engineId, command) => { void import('../utils/commandUtils.js').then(m => m.sendCommand(storeHandle, engineId, command as Command)) },
+    broadcast: (msg) => { try { storeHandle.broadcast(msg) } catch { /* no peers */ } },
+    now: () => Date.now(),
+    sleep: (ms) => new Promise(r => setTimeout(r, ms)),
+    backoffMs: FETCH_BACKOFF_MS,
+    thermalPollMs: THERMAL_POLL_MS,
+})
+
+```
+
+## File: src/data/UsbSticks.ts
+```typescript
+/**
+ * UsbSticks.ts: teacher USB sticks, mounted read-only (idea#193, proposals/2026-10-14-teacher-usb-sticks.md)
+ *
+ *   §3.1 fstype routing: vfat / exfat on a non-system disk → this module; ext4 and
+ *        everything else stay on the IDEA disk path (usbDeviceMonitor).
+ *   §3.2 mount: /run/idea-usb/<dev>, exactly the typed commands in 11-engine-files:
+ *          /usr/bin/mount -t vfat  -o ro,nosuid,nodev,noexec,uid=1000,gid=1000,fmask=0222,dmask=0222,iocharset=utf8,shortname=mixed /dev/<dev> /run/idea-usb/<dev>
+ *          /usr/bin/mount -t exfat -o ro,nosuid,nodev,noexec,uid=1000,gid=1000,fmask=0222,dmask=0222,iocharset=utf8 /dev/<dev> /run/idea-usb/<dev>
+ *          /usr/bin/umount /run/idea-usb/<dev>        (/usr/bin/umount -l … only when busy)
+ *        /run/idea-usb itself is created by tmpfiles.d (idea-usb.conf: pi:pi 0755), so the
+ *        mount point folders and .idea-usb.json are made and removed by pi without sudo.
+ *        Never fsck, never chown, never a write under a stick's mount point.
+ *   §3.3 Engine.usbSticks (whole-list replace; written only by this Engine).
+ *   §3.4 unplug: store → .idea-usb.json + app sync → umount (lazy if busy) → rmdir.
+ *        Startup: unmount and remove leftovers; the watcher's initial adds remount.
+ *   §4   x-app.usbMount: one static read-only rslave bind of the whole root
+ *        (FilesMount.ts buildOverride) + `docker exec` of the App's sync command
+ *        after each plug/unplug and at Engine start (syncUsbApps).
+ *   §8.2a kolibri folder → ChannelBuilderAutoStart.ts.
+ *
+ * All commands sit behind UsbStickOps so tests inject fakes.
+ */
+import path from 'path'
+import { $, fs } from 'zx'
+import type { DocHandle } from '@automerge/automerge-repo'
+import type { Store } from './Store.js'
+import type { ChannelBuilderAutoStartResult, UsbStickPublic } from './Engine.js'
+import type { Timestamp } from './CommonTypes.js'
+import { DEFAULT_USB_ROOT, config, usbRoot } from './Config.js'
+import { log } from '../utils/utils.js'
+import { driveNameOf } from './SystemDisk.js'
+import { mountOps, MountEntry } from '../monitors/mounts.js'
+
+// ── Exact root commands (pinned by test/automated/usb-sticks.test.ts against 11-engine-files) ──
+
+export const STICK_FS_TYPES = ['vfat', 'exfat'] as const
+export type StickFsType = typeof STICK_FS_TYPES[number]
+
+export const STICK_MOUNT_OPTIONS: Record<StickFsType, string> = {
+    vfat: 'ro,nosuid,nodev,noexec,uid=1000,gid=1000,fmask=0222,dmask=0222,iocharset=utf8,shortname=mixed',
+    exfat: 'ro,nosuid,nodev,noexec,uid=1000,gid=1000,fmask=0222,dmask=0222,iocharset=utf8',
+}
+export const SUDO_MOUNT_BIN = '/usr/bin/mount'
+export const SUDO_UMOUNT_BIN = '/usr/bin/umount'
+/** Devices a stick may be on: partition 1/2 or a whole disk without a partition table. */
+export const STICK_DEVICE = /^sd[a-z][12]?$/
+
+export const stickMountArgv = (fsType: StickFsType, device: string, mountPoint: string): string[] =>
+    [SUDO_MOUNT_BIN, '-t', fsType, '-o', STICK_MOUNT_OPTIONS[fsType], `/dev/${device}`, mountPoint]
+export const stickUmountArgv = (mountPoint: string, lazy = false): string[] =>
+    lazy ? [SUDO_UMOUNT_BIN, '-l', mountPoint] : [SUDO_UMOUNT_BIN, mountPoint]
+
+/** The display/contract JSON in the root of /run/idea-usb (seen in Apps as <path>/.idea-usb.json). */
+export const IDEA_USB_JSON = '.idea-usb.json'
+export const IDEA_USB_JSON_VERSION = 1
+
+export const isStickFsType = (t: string | null | undefined): t is StickFsType =>
+    !!t && (STICK_FS_TYPES as readonly string[]).includes(t.toLowerCase())
+
+/** §3.1 routing of one device by its filesystem type. */
+export const classifyFsType = (t: string | null | undefined): 'ext4' | 'stick' | 'other' => {
+    const v = (t ?? '').toLowerCase()
+    if (v === 'ext4') return 'ext4'
+    if (isStickFsType(v)) return 'stick'
+    return 'other'
+}
+
+export const stickMountPoint = (device: string): string => path.join(usbRoot(), device)
+
+// ── Ops ─────────────────────────────────────────────────────────────────────
+
+export interface StickProbe {
+    fsType: string | null
+    label: string | null
+    uuid: string | null
+    sizeBytes: number
+    model: string | null
+}
+
+/** One partition of the drive a stick candidate sits on (lsblk only, nothing mounted). */
+export interface DrivePartition {
+    name: string
+    fsType: string | null
+    /** GPT type GUID or MBR type (0x83 = Linux), from lsblk PARTTYPE */
+    partType: string | null
+}
+
+/** Linux filesystem partition types: MBR 0x83 and the GPT Linux filesystem / root (arm64, x86-64) GUIDs. */
+const LINUX_PART_TYPES = new Set([
+    '0x83',
+    '0fc63daf-8483-4772-8e79-3d69d8477de4',
+    'b921b045-1df0-41c3-af44-4c6f280d3fae',
+    '4f68bce3-e8cd-4db1-96e7-fbcaf984b709',
+])
+
+const LINUX_FS = new Set(['ext4', 'ext3', 'ext2', 'btrfs', 'xfs', 'f2fs'])
+
+/** Other partitions on the same drive that carry (or are typed as) a Linux filesystem. */
+export const linuxSiblings = (device: string, parts: DrivePartition[]): string[] =>
+    parts.filter(p => p.name !== device && (
+        LINUX_FS.has((p.fsType ?? '').toLowerCase()) || LINUX_PART_TYPES.has((p.partType ?? '').toLowerCase())
+    )).map(p => p.name)
+
+/**
+ * idea#201 §10 follow-up: a FAT/exFAT partition is not a teacher stick when its
+ * drive also has a Linux partition WITHOUT IDEA META.yaml (an OS card: Raspberry
+ * Pi OS / Ubuntu boot partition). An IDEA drive (Linux partition WITH META.yaml,
+ * e.g. the dual-partition hw-roundtrip fixture) keeps its FAT partition as a
+ * stick, and so does a FAT-only drive. `hasMeta` answers from the shared
+ * read-only look (never writes); `null` = could not tell → skipped (safe side).
+ * Returns the reason to skip, or null to offer the stick.
+ */
+export const stickBlockedBySiblings = async (
+    device: string,
+    parts: DrivePartition[],
+    hasMeta: (sibling: string) => Promise<boolean | null>,
+): Promise<string | null> => {
+    for (const sib of linuxSiblings(device, parts)) {
+        const m = await hasMeta(sib)
+        if (m === true) continue
+        return m === null
+            ? `${sib} on the same drive is a Linux partition whose META.yaml could not be checked`
+            : `${sib} on the same drive is a Linux partition without IDEA META.yaml (OS card)`
+    }
+    return null
+}
+
+export interface UsbStickOps {
+    /** lsblk -J -o NAME,FSTYPE,PARTTYPE of the whole drive (partitions only); never mounts */
+    drivePartitions(device: string): Promise<DrivePartition[]>
+    /** lsblk -J -b -o NAME,FSTYPE,LABEL,UUID,SIZE,MODEL /dev/<dev> (+ the drive's model) */
+    probe(device: string): Promise<StickProbe | null>
+    listMounts(): Promise<MountEntry[]>
+    isMountPoint(p: string): Promise<boolean>
+    /** Run one of the exact sudo commands above (argv without 'sudo') */
+    sudo(argv: string[]): Promise<void>
+    mkdir(p: string): Promise<void>
+    rmdir(p: string): Promise<void>
+    /** Top-level entries of a mounted stick (read only) */
+    readdir(p: string): Promise<{ name: string, isDirectory: boolean }[]>
+    statfs(p: string): Promise<{ sizeBytes: number, usedBytes: number } | null>
+    writeFileAtomic(p: string, content: string): Promise<void>
+    /** docker exec [-u user] -e K=V … <container> <command> */
+    dockerExec(container: string, user: string | null, env: Record<string, string>, command: string): Promise<void>
+    now(): number
+}
+
+export const defaultUsbStickOps: UsbStickOps = {
+    drivePartitions: async (device) => {
+        const drive = driveNameOf(device)
+        const out = await $`lsblk -J -o NAME,FSTYPE,PARTTYPE /dev/${drive}`.nothrow()
+        if (out.exitCode !== 0 || !out.stdout.trim()) return []
+        try {
+            const root = (JSON.parse(out.stdout)?.blockdevices ?? [])[0]
+            return ((root?.children ?? []) as any[]).map(c => ({ name: String(c.name), fsType: c.fstype ?? null, partType: c.parttype ?? null }))
+        } catch { return [] }
+    },
+    probe: async (device) => {
+        const out = await $`lsblk -J -b -o NAME,FSTYPE,LABEL,UUID,SIZE,MODEL /dev/${device}`.nothrow()
+        if (out.exitCode !== 0 || !out.stdout.trim()) return null
+        const node = (JSON.parse(out.stdout)?.blockdevices ?? [])[0]
+        if (!node) return null
+        let model: string | null = node.model?.trim() || null
+        if (!model && driveNameOf(device) !== device) {
+            const m = await $`lsblk -dno MODEL /dev/${driveNameOf(device)}`.nothrow()
+            model = m.exitCode === 0 ? (m.stdout.trim() || null) : null
+        }
+        return {
+            fsType: node.fstype ?? null,
+            label: node.label?.trim() || null,
+            uuid: node.uuid?.trim() || null,
+            sizeBytes: Number(node.size) || 0,
+            model,
+        }
+    },
+    listMounts: () => mountOps().listMounts(),
+    isMountPoint: (p) => mountOps().isMountPoint(p),
+    sudo: async (argv) => { await $`sudo -n ${argv}` },
+    mkdir: async (p) => { await fs.mkdir(p) },
+    rmdir: async (p) => { await fs.rmdir(p) },
+    readdir: async (p) => (await fs.readdir(p, { withFileTypes: true })).map(d => ({ name: d.name, isDirectory: d.isDirectory() })),
+    statfs: async (p) => {
+        try {
+            const s = await fs.promises.statfs(p)
+            return { sizeBytes: s.blocks * s.bsize, usedBytes: (s.blocks - s.bfree) * s.bsize }
+        } catch { return null }
+    },
+    writeFileAtomic: async (p, content) => {
+        const tmp = `${p}.tmp-${process.pid}`
+        await fs.writeFile(tmp, content, { mode: 0o644 })
+        await fs.rename(tmp, p)
+    },
+    dockerExec: async (container, user, env, command) => {
+        const envArgs = Object.entries(env).flatMap(([k, v]) => ['-e', `${k}=${v}`])
+        const userArgs = user ? ['-u', user] : []
+        await $`timeout 120 docker exec ${userArgs} ${envArgs} ${container} ${command}`
+    },
+    now: () => Date.now(),
+}
+
+let ops: UsbStickOps = defaultUsbStickOps
+export const usbStickOps = (): UsbStickOps => ops
+/** Tests: replace some or all ops; null restores the real commands. */
+export const setUsbStickOpsForTests = (o: Partial<UsbStickOps> | null): void => {
+    ops = o ? { ...defaultUsbStickOps, ...o } : defaultUsbStickOps
+}
+/** Real commands only outside testMode, or when a test injected fakes (like mountCommandsActive). */
+export const usbStickRoutingActive = (): boolean => !config.settings.testMode || ops !== defaultUsbStickOps
+
+// ── State ───────────────────────────────────────────────────────────────────
+
+interface StickRecord extends UsbStickPublic {
+    uuid: string | null
+    mountPoint: string
+    kolibriFolder: string | null
+}
+
+const sticks = new Map<string, StickRecord>()   // device → record
+/** Tests only. */
+export const resetUsbSticksForTests = (): void => { sticks.clear(); syncChain = Promise.resolve() }
+export const mountedSticks = (): UsbStickPublic[] => [...sticks.values()].map(toPublic)
+export const stickOnDevice = (device: string): UsbStickPublic | undefined => {
+    const r = sticks.get(device); return r ? toPublic(r) : undefined
+}
+
+const toPublic = (r: StickRecord): UsbStickPublic => ({
+    stickId: r.stickId, device: r.device, label: r.label, displayName: r.displayName,
+    fsType: r.fsType, sizeBytes: r.sizeBytes, usedBytes: r.usedBytes, mountedAt: r.mountedAt,
+    readOnly: true, hasKolibriFolder: r.hasKolibriFolder, builderAutoStart: r.builderAutoStart,
+})
+
+export const stickIdFor = (uuid: string | null, device: string): string =>
+    uuid ? `usb-${uuid}` : `usb-nouuid-${device}`
+
+export const stickLabel = (p: Pick<StickProbe, 'label' | 'model'>): string =>
+    p.label || p.model || 'USB stick'
+
+/** 'USB: <label>', ' (2)', ' (3)' … for clashes with sticks already mounted on this Engine. */
+export const uniqueDisplayName = (label: string, taken: string[]): string => {
+    const base = `USB: ${label}`
+    if (!taken.includes(base)) return base
+    for (let n = 2; ; n++) if (!taken.includes(`${base} (${n})`)) return `${base} (${n})`
+}
+
+/** Name of the top-level kolibri folder (any case), or null. Read only. */
+export const findKolibriFolder = (entries: { name: string, isDirectory: boolean }[]): string | null =>
+    entries.find(e => e.isDirectory && e.name.toLowerCase() === 'kolibri')?.name ?? null
+
+// ── Store + JSON ────────────────────────────────────────────────────────────
+
+const engineIdOf = async (): Promise<string> => (await import('./Engine.js')).localEngineId
+
+const publishToStore = async (storeHandle: DocHandle<Store>): Promise<void> => {
+    const id = await engineIdOf()
+    const list = mountedSticks()
+    storeHandle.change(doc => {
+        const eng = doc.engineDB[id as any]
+        if (eng) eng.usbSticks = list
+    })
+}
+
+/** The .idea-usb.json Apps read (Kid's contract, see docs/USB-STICKS.md). */
+export const buildUsbJson = (engineId: string, updatedAt: number, records: Array<UsbStickPublic & { uuid: string | null, kolibriFolder: string | null }>) => ({
+    version: IDEA_USB_JSON_VERSION,
+    engineId,
+    updatedAt,
+    sticks: records.map(r => ({
+        stickId: r.stickId,
+        uuid: r.uuid,
+        device: r.device,
+        dir: r.device,
+        label: r.label,
+        displayName: r.displayName,
+        fsType: r.fsType,
+        sizeBytes: r.sizeBytes,
+        usedBytes: r.usedBytes,
+        mountedAt: r.mountedAt,
+        readOnly: true,
+        hasKolibriFolder: r.hasKolibriFolder,
+        kolibriFolder: r.kolibriFolder,
+    })),
+})
+
+/**
+ * Make sure the USB root exists without needing a restart. tmpfiles.d
+ * (install-root-helpers) normally creates /run/idea-usb as pi:pi 0755; when the
+ * Engine runs before that, it creates the folder itself if the parent lets it
+ * (parent exists and is writable by this user, e.g. pi-owned 0755). Otherwise it
+ * returns false and is retried on the next plug and the next JSON write/sync.
+ * A non-default root (tests, dev) whose parent is missing is created recursively.
+ */
+let rootMissingLogged = false
+export const ensureUsbRoot = async (): Promise<boolean> => {
+    const root = usbRoot()
+    if (await fs.pathExists(root)) { rootMissingLogged = false; return true }
+    const parent = path.dirname(root)
+    try {
+        if (root !== DEFAULT_USB_ROOT && !(await fs.pathExists(parent))) {
+            await fs.ensureDir(root)
+        } else {
+            await fs.access(parent, fs.constants.W_OK | fs.constants.X_OK)
+            await fs.mkdir(root, { mode: 0o755 })
+            await fs.chmod(root, 0o755)   // umask-independent
+        }
+        log(`USB sticks: created ${root}`)
+        rootMissingLogged = false
+        return true
+    } catch (e: any) {
+        if (e?.code === 'EEXIST') return true
+        if (!rootMissingLogged) {
+            log(`USB sticks: ${root} is missing and ${parent} does not let the Engine create it (${e?.code ?? e?.message ?? e}); tmpfiles.d idea-usb.conf not installed? Will retry on the next plug/sync; Ops: run install-root-helpers`)
+            rootMissingLogged = true
+        }
+        return false
+    }
+}
+
+const writeUsbJson = async (): Promise<void> => {
+    const root = usbRoot()
+    if (!(await ensureUsbRoot())) return
+    const json = buildUsbJson(await engineIdOf(), ops.now(), [...sticks.values()])
+    try {
+        await ops.writeFileAtomic(path.join(root, IDEA_USB_JSON), JSON.stringify(json, null, 2) + '\n')
+    } catch (e: any) {
+        log(`USB sticks: could not write ${path.join(root, IDEA_USB_JSON)}: ${e?.message ?? e}`)
+    }
+}
+
+// ── App sync (x-app.usbMount.sync) ─────────────────────────────────────────
+
+export type UsbSyncEvent = 'plug' | 'unplug' | 'start'
+
+let syncChain: Promise<void> = Promise.resolve()
+
+/**
+ * Run each Running opted-in App's sync command (x-app.usbMount.sync) once, one
+ * at a time. A failure is logged and retried once after SYNC_RETRY_MS; the next
+ * plug/unplug reconciles again anyway.
+ */
+export const SYNC_RETRY_MS = 15_000
+export const syncUsbApps = (storeHandle: DocHandle<Store>, event: UsbSyncEvent, retry = true, onlyInstanceId?: string): Promise<void> => {
+    syncChain = syncChain.then(() => runSync(storeHandle, event, retry, onlyInstanceId)).catch(() => {})
+    return syncChain
+}
+
+const runSync = async (storeHandle: DocHandle<Store>, event: UsbSyncEvent, retry: boolean, onlyInstanceId?: string): Promise<void> => {
+    const store = storeHandle.doc()
+    if (!store) return
+    const engineId = await engineIdOf()
+    for (const inst of Object.values(store.instanceDB ?? {})) {
+        if (inst.status !== 'Running') continue
+        if (onlyInstanceId && String(inst.id) !== String(onlyInstanceId)) continue
+        const disk = inst.storedOn ? store.diskDB[inst.storedOn] : null
+        if (!disk || disk.dockedTo !== engineId) continue
+        const um = store.appDB[inst.instanceOf]?.usbMount
+        if (!um?.sync) continue
+        const container = `${inst.id}-${um.sync.service}-1`
+        const env = {
+            IDEA_USB_EVENT: event,
+            IDEA_USB_ROOT: um.path,
+            IDEA_USB_JSON: `${um.path.replace(/\/$/, '')}/${IDEA_USB_JSON}`,
+        }
+        try {
+            await ops.dockerExec(container, um.sync.user, env, um.sync.command)
+            log(`USB sticks: ${um.sync.command} in ${container} (${event}) ok`)
+        } catch (e: any) {
+            log(`USB sticks: ${um.sync.command} in ${container} (${event}) failed: ${e?.message ?? e}`)
+            if (retry) setTimeout(() => { void syncUsbApps(storeHandle, event, false, onlyInstanceId) }, SYNC_RETRY_MS).unref?.()
+        }
+    }
+}
+
+// ── Plug ────────────────────────────────────────────────────────────────────
+
+export type StickAddResult =
+    | { ok: true, stick: UsbStickPublic, alreadyMounted: boolean }
+    | { ok: false, message: string }
+
+/**
+ * Mount a FAT/exFAT stick read-only and publish it. The caller (usbDeviceMonitor)
+ * has already checked: valid device, not erase-locked, not a system device,
+ * classifyFsType(probe.fsType) === 'stick'.
+ */
+export const addStick = async (
+    storeHandle: DocHandle<Store>,
+    device: string,
+    probe: StickProbe,
+    opts: { autoStart?: boolean } = {},
+): Promise<StickAddResult> => {
+    if (!STICK_DEVICE.test(device)) return { ok: false, message: `Refusing to mount ${device} as a USB stick: not an sdX/sdXN device` }
+    const fsType = (probe.fsType ?? '').toLowerCase()
+    if (!isStickFsType(fsType)) return { ok: false, message: `Refusing to mount ${device} as a USB stick: filesystem ${probe.fsType}` }
+    const mp = stickMountPoint(device)
+    if (usbRoot() === DEFAULT_USB_ROOT && path.dirname(mp) !== DEFAULT_USB_ROOT) return { ok: false, message: `bad mount point ${mp}` }
+    if (!(await ensureUsbRoot())) return { ok: false, message: `Cannot mount USB stick /dev/${device}: ${usbRoot()} is missing and could not be created (run install-root-helpers)` }
+    const mounts = await ops.listMounts()
+    const atTarget = mounts.filter(m => m.target === mp)
+    const ofSource = mounts.filter(m => m.source === `/dev/${device}`)
+    let alreadyMounted = false
+    if (atTarget.length) {
+        if (!atTarget.every(m => m.source === `/dev/${device}`)) return { ok: false, message: `Refusing to mount /dev/${device}: ${mp} is already a mount point` }
+        alreadyMounted = true
+    } else if (ofSource.length) {
+        return { ok: false, message: `Refusing to mount /dev/${device} on ${mp}: it is already mounted on ${ofSource.map(m => m.target).join(', ')}` }
+    } else if (await ops.isMountPoint(mp)) {
+        return { ok: false, message: `Refusing to mount /dev/${device}: ${mp} is already a mount point` }
+    }
+    if (!alreadyMounted) {
+        try {
+            if (!(await fs.pathExists(mp))) await ops.mkdir(mp)
+            await ops.sudo(stickMountArgv(fsType, device, mp))
+        } catch (e: any) {
+            try { if (!(await ops.isMountPoint(mp))) await ops.rmdir(mp) } catch { /* */ }
+            return { ok: false, message: `Could not mount USB stick /dev/${device} read-only on ${mp}: ${e?.stderr?.trim() || e?.message || e}` }
+        }
+    }
+    let kolibriFolder: string | null = null
+    try { kolibriFolder = findKolibriFolder(await ops.readdir(mp)) } catch (e: any) { log(`USB stick ${device}: could not list ${mp}: ${e?.message ?? e}`) }
+    const fs_ = await ops.statfs(mp)
+    const label = stickLabel(probe)
+    const taken = [...sticks.values()].filter(s => s.device !== device).map(s => s.displayName)
+    const record: StickRecord = {
+        stickId: stickIdFor(probe.uuid, device),
+        device,
+        label,
+        displayName: uniqueDisplayName(label, taken),
+        fsType,
+        sizeBytes: fs_?.sizeBytes ?? probe.sizeBytes,
+        usedBytes: fs_?.usedBytes ?? 0,
+        mountedAt: ops.now() as Timestamp,
+        readOnly: true,
+        hasKolibriFolder: !!kolibriFolder,
+        builderAutoStart: null,
+        uuid: probe.uuid,
+        mountPoint: mp,
+        kolibriFolder,
+    }
+    sticks.set(device, record)
+    log(`USB stick ${record.displayName} (${fsType}, ${record.stickId}) mounted read-only on ${mp}${kolibriFolder ? `; has a '${kolibriFolder}' folder` : ''}`)
+    await publishToStore(storeHandle)
+    await writeUsbJson()
+    void syncUsbApps(storeHandle, 'plug')
+    if (kolibriFolder && opts.autoStart !== false) {
+        const { autoStartChannelBuilderForStick } = await import('./ChannelBuilderAutoStart.js')
+        const result = await autoStartChannelBuilderForStick(storeHandle, toPublic(record))
+        await setBuilderAutoStart(storeHandle, device, result)
+    }
+    return { ok: true, stick: toPublic(sticks.get(device) ?? record), alreadyMounted }
+}
+
+const setBuilderAutoStart = async (storeHandle: DocHandle<Store>, device: string, result: ChannelBuilderAutoStartResult): Promise<void> => {
+    const r = sticks.get(device)
+    if (!r) return
+    r.builderAutoStart = result
+    await publishToStore(storeHandle)
+}
+
+// ── Unplug / cleanup ────────────────────────────────────────────────────────
+
+/** Unmount a stick mount point: umount, `umount -l` only if busy; then rmdir. */
+export const unmountStickPath = async (mp: string): Promise<{ ok: boolean, lazy: boolean, message?: string }> => {
+    let lazy = false
+    if (await ops.isMountPoint(mp)) {
+        try {
+            await ops.sudo(stickUmountArgv(mp))
+        } catch (e: any) {
+            // Read-only: nothing to flush, so a lazy unmount is safe (§3.4)
+            log(`USB stick: umount ${mp} failed (${e?.stderr?.trim() || e?.message || e}); lazy unmount`)
+            try { await ops.sudo(stickUmountArgv(mp, true)); lazy = true } catch (e2: any) {
+                return { ok: false, lazy: true, message: `Could not unmount ${mp}: ${e2?.stderr?.trim() || e2?.message || e2}` }
+            }
+        }
+    }
+    try {
+        if (await ops.isMountPoint(mp)) return { ok: false, lazy, message: `${mp} is still a mount point` }
+        await ops.rmdir(mp)
+    } catch (e: any) {
+        if (e?.code !== 'ENOENT') return { ok: false, lazy, message: `Unmounted, but could not remove ${mp}: ${e?.message ?? e}` }
+    }
+    return { ok: true, lazy }
+}
+
+/** §3.4: store → JSON + app sync → umount → rmdir. Returns false when no stick was on the device. */
+export const removeStick = async (storeHandle: DocHandle<Store>, device: string, reason = 'unplugged'): Promise<boolean> => {
+    const r = sticks.get(device)
+    if (!r) return false
+    sticks.delete(device)
+    log(`USB stick ${r.displayName} on ${device} ${reason}: removing`)
+    await publishToStore(storeHandle)
+    await writeUsbJson()
+    await syncUsbApps(storeHandle, 'unplug')
+    const res = await unmountStickPath(r.mountPoint)
+    if (!res.ok) log(`USB stick ${device}: ${res.message}`)
+    return true
+}
+
+/** All sticks on a whole drive (erase / whole-disk unplug). Returns the devices removed. */
+export const removeSticksOnDrive = async (storeHandle: DocHandle<Store>, drive: string, reason: string): Promise<string[]> => {
+    const devs = [...sticks.keys()].filter(d => driveNameOf(d) === drive || d === drive)
+    for (const d of devs) await removeStick(storeHandle, d, reason)
+    return devs
+}
+
+/**
+ * Startup (§3.4): forget every stick, unmount anything still mounted under the
+ * USB root, remove the empty folders, write an empty JSON and clear
+ * Engine.usbSticks. The watcher's initial add events mount present sticks again.
+ */
+export const usbStartupCleanup = async (storeHandle: DocHandle<Store>): Promise<void> => {
+    sticks.clear()
+    const root = usbRoot()
+    await ensureUsbRoot()
+    try {
+        const mounts = (await ops.listMounts()).filter(m => path.dirname(m.target) === root)
+        for (const m of mounts) {
+            const res = await unmountStickPath(m.target)
+            log(`USB sticks startup: ${m.target} ${res.ok ? 'unmounted and removed' : res.message}`)
+        }
+        if (await fs.pathExists(root)) {
+            for (const name of await fs.readdir(root)) {
+                const p = path.join(root, name)
+                if (!STICK_DEVICE.test(name) || mounts.some(m => m.target === p)) continue
+                try { if (!(await ops.isMountPoint(p))) await ops.rmdir(p) } catch (e: any) { log(`USB sticks startup: could not remove ${p}: ${e?.message ?? e}`) }
+            }
+        }
+    } catch (e: any) {
+        log(`USB sticks startup cleanup: ${e?.message ?? e}`)
+    }
+    await publishToStore(storeHandle)
+    await writeUsbJson()   // retries creating the root
+}
+
 
 ```
 
@@ -13399,6 +24278,100 @@ export interface User {
     passwordHash: string   // bcrypt hash — never stored in plain text
     role: 'operator'       // only operators have accounts
     created: Timestamp     // unix ms — set on createOperator()
+}
+
+```
+
+## File: src/data/WsLiveness.ts
+```typescript
+/**
+ * WsLiveness.ts (#168): dead-socket detection for the Engine's outgoing WS links.
+ *
+ * A half-open TCP/WS connection (relay blip, VM pause) never fires `close`, so the
+ * stock client never redials and the Repo keeps serving a frozen view. The watchdog
+ * counts every inbound message, ping and pong as "heard", pings every `pingMs`, and
+ * terminates the socket when nothing was heard for `deadMs`; the adapter's own
+ * close handling then redials and the Repo re-syncs.
+ */
+
+import { log } from '../utils/utils.js'
+
+export interface LivenessSocket {
+    readyState: number
+    ping?: () => void
+    terminate?: () => void
+    close: () => void
+    on?: (ev: string, fn: (...a: any[]) => void) => void
+    off?: (ev: string, fn: (...a: any[]) => void) => void
+    addEventListener?: (ev: string, fn: (...a: any[]) => void) => void
+    removeEventListener?: (ev: string, fn: (...a: any[]) => void) => void
+}
+
+export interface LivenessOptions { pingMs: number; deadMs: number; label: string; onDead?: () => void; now?: () => number }
+
+const OPEN = 1
+
+const envMs = (name: string, dflt: number): number => {
+    const n = Number(process.env[name])
+    return Number.isFinite(n) && n > 0 ? n : dflt
+}
+export const wsPingMs = (): number => envMs('IDEA_WS_PING_MS', 5_000)
+export const wsDeadMs = (): number => envMs('IDEA_WS_DEAD_MS', 15_000)
+
+export class WsLiveness {
+    lastHeard: number
+    #timer?: ReturnType<typeof setInterval>
+    #socket?: LivenessSocket
+    #now: () => number
+    #heard = () => { this.lastHeard = this.#now() }
+
+    constructor(private opts: LivenessOptions) {
+        this.#now = opts.now ?? Date.now
+        this.lastHeard = this.#now()
+    }
+
+    /** Watch a (new) socket; replaces any previous one. */
+    attach(socket: LivenessSocket): void {
+        this.detach()
+        this.#socket = socket
+        this.lastHeard = this.#now()
+        socket.addEventListener?.('message', this.#heard)
+        socket.addEventListener?.('open', this.#heard)
+        socket.on?.('ping', this.#heard)
+        socket.on?.('pong', this.#heard)
+        this.#timer = setInterval(() => this.tick(), this.opts.pingMs)
+        ;(this.#timer as any).unref?.()
+    }
+
+    /** One watchdog step (exported for tests). */
+    tick(): void {
+        const s = this.#socket
+        if (!s || s.readyState !== OPEN) { this.lastHeard = this.#now(); return }   // connecting: the redial owns it
+        const age = this.#now() - this.lastHeard
+        if (age >= this.opts.deadMs) {
+            log(`WS ${this.opts.label}: nothing heard for ${age} ms, dropping the dead socket to reconnect (#168)`)
+            this.detach()
+            try { s.terminate ? s.terminate() : s.close() } catch { /* already gone */ }
+            this.opts.onDead?.()
+            return
+        }
+        try { s.ping?.() } catch { /* closing */ }
+    }
+
+    get lastHeardAgeMs(): number { return this.#now() - this.lastHeard }
+
+    detach(): void {
+        if (this.#timer) clearInterval(this.#timer)
+        this.#timer = undefined
+        const s = this.#socket
+        if (s) {
+            s.removeEventListener?.('message', this.#heard)
+            s.removeEventListener?.('open', this.#heard)
+            s.off?.('ping', this.#heard)
+            s.off?.('pong', this.#heard)
+        }
+        this.#socket = undefined
+    }
 }
 
 ```
