@@ -2,8 +2,8 @@
  * hw-roundtrip-guard.test.ts (idea#152)
  *
  * script/hw-roundtrip.ts may only eject and unplug the recorded test disk,
- * matched by IDs (filesystem UUIDs, disk serial, USB serial), never by device
- * name. Fake lsblk/sysfs facts modelled on idea03: root SSD sda (serial
+ * matched by IDs (disk serial; USB serial and filesystem UUIDs only when given
+ * as flags), never by device name. Fake lsblk/sysfs facts modelled on idea03: root SSD sda (serial
  * AA202000000000004820, USB 2-1), test disk sdb (serial 3813430-532011020,
  * USB 4-1 serial 26A1EE83197F).
  */
@@ -21,6 +21,14 @@ const expected = (): StickExpectation => ({
     diskSerial: '3813430-532011020',
     uuids: ['3E50-902A', '378383c9-0612-4c82-9c07-8c34d15253ba'],
     refuseSerials: ['AA202000000000004820'],
+})
+
+/** What the committed config yields: disk serial + refused serials only */
+const serialOnly = (): StickExpectation => ({
+    usbSerial: '',
+    diskSerial: '3813430-532011020',
+    uuids: [],
+    refuseSerials: ['AA202000000000004820', 'AA000000000000005638'],
 })
 
 const idea03 = (): BlockFacts => ({
@@ -98,16 +106,35 @@ describe('hw-roundtrip test disk guard (idea#152)', () => {
         refusedWith(expected(), f, 'is (or is above) the system drive')
     })
 
-    it('missing IDs are refused', () => {
-        refusedWith({ ...expected(), usbSerial: '' }, idea03(), 'no expected USB serial')
+    it('missing disk serial is refused; missing USB serial / UUIDs only skip those checks', () => {
         refusedWith({ ...expected(), diskSerial: '' }, idea03(), 'no expected disk serial')
-        refusedWith({ ...expected(), uuids: [] }, idea03(), 'no expected filesystem UUIDs')
+        expect(resolveStick({ ...expected(), usbSerial: '', uuids: [] }, idea03())).toMatchObject({ ok: true, disk: 'sdb' })
         const f = idea03(); f.disks.sdb.usbSerial = null
         refusedWith(expected(), f, 'reports no serial')
         const g = idea03(); g.disks.sdb.serial = ''
         refusedWith(expected(), g, 'reports no serial')
         const h = idea03(); h.disks.sdb.usbPath = null
         refusedWith(expected(), h, 'not on USB')
+    })
+
+    it('serial-only (the committed config): matches after an enclosure swap and a dd rewrite', () => {
+        const f = idea03()
+        f.partitions = f.partitions.filter(p => p.disk !== 'sdb').concat([{ name: 'sdb1', uuid: 'b3e90dc7-d00a-4465-9ccf-d8e8d9993bbb', disk: 'sdb' }])
+        f.disks.sdb.usbSerial = '26A1EE830E37'
+        expect(resolveStick(serialOnly(), f)).toEqual({ ok: true, disk: 'sdb', usbPath: USB_B, usbId: '4-1', partitions: ['sdb1'] })
+    })
+
+    it('serial-only: unknown or duplicated disk serial is refused', () => {
+        refusedWith({ ...serialOnly(), diskSerial: 'NOPE' }, idea03(), 'no disk with serial NOPE')
+        const f = idea03(); f.disks.sdc = { ...f.disks.sdb }
+        refusedWith(serialOnly(), f, 'more than one disk')
+    })
+
+    it('serial-only: both refused serials (root SSD, Intenso fixture) are refused', () => {
+        refusedWith({ ...serialOnly(), diskSerial: 'AA000000000000005638' }, idea03(), 'refused serial')
+        const f = idea03(); f.disks.sdb.serial = 'AA000000000000005638'
+        refusedWith(serialOnly(), f, 'no disk with serial 3813430-532011020')
+        refusedWith({ ...serialOnly(), diskSerial: 'AA202000000000004820', refuseSerials: [] }, idea03(), 'system drive')
     })
 
     it('usbPathFromSysPath takes the deepest bus-port component', () => {
@@ -120,8 +147,8 @@ describe('hw-roundtrip expected IDs: config file + CLI flags', () => {
     const file = path.join(os.tmpdir(), `hw-disks-${process.pid}.json`)
     fs.writeFileSync(file, JSON.stringify({ idea03: expected() }))
 
-    it('reads the host entry from the config', () => {
-        expect(loadExpectation([], file, 'idea03')).toEqual(expected())
+    it('reads only diskSerial and refuseSerials from the config (usbSerial/uuids are not matched on)', () => {
+        expect(loadExpectation([], file, 'idea03')).toEqual({ ...expected(), usbSerial: '', uuids: [] })
     })
     it('an unknown host has no IDs (refused later as missing)', () => {
         expect(loadExpectation([], file, 'idea09')).toEqual({ usbSerial: '', diskSerial: '', uuids: [], refuseSerials: [] })
@@ -130,9 +157,13 @@ describe('hw-roundtrip expected IDs: config file + CLI flags', () => {
         const e = loadExpectation(['--uuid', 'U1', '--uuid', 'U2', '--stick-usb-serial', 'S', '--refuse-serial', 'R'], file, 'idea03')
         expect(e).toEqual({ usbSerial: 'S', diskSerial: '3813430-532011020', uuids: ['U1', 'U2'], refuseSerials: ['AA202000000000004820', 'R'] })
     })
-    it('the committed config records the idea03 stick', () => {
-        const cfg = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'script', 'hw-roundtrip-disks.json'), 'utf8'))
-        expect(cfg.idea03).toMatchObject(expected())
+    it('the committed config records the idea03 disk by serial only, refusing both serials', () => {
+        const file = path.join(process.cwd(), 'script', 'hw-roundtrip-disks.json')
+        const cfg = JSON.parse(fs.readFileSync(file, 'utf8'))
+        expect(cfg.idea03.usbSerial).toBeUndefined()
+        expect(cfg.idea03.uuids).toBeUndefined()
+        expect(cfg.idea03.note).toMatch(/idea#139/)
+        expect(loadExpectation([], file, 'idea03')).toEqual(serialOnly())
     })
 })
 
