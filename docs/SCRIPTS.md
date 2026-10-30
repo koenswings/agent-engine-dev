@@ -12,6 +12,12 @@ This document provides a reference for the main provisioning and utility scripts
 
 ---
 
+### `build-engine-offline` (`script/build-engine-offline`)
+
+-   **Purpose:** Build the Engine into a mounted image root filesystem for the idea repo's Engine image builder (idea#322 Option A, idea `tools/engine-image/INTERFACE.md`). Thin wrapper around `build-engine --root`.
+-   **Usage:** as root on an arm64 host: `script/build-engine-offline --root <MNT> --boot <MNT>/boot/firmware --report <OUT>/engine-build.json [--cache <dir>] [--lock <file>] [--image <ref@sha256:d>]... [--dry-run]`
+-   **Details:** No SSH, nothing started (units enabled only), no device identity; sanitises and verifies the result and writes `/etc/idea/engine.lock`, `/etc/idea/engine-version` and the report. Exit 0 ok, 1 build/verify failed, 2 usage. `build-engine --verify-rootfs <dir> --lock <file>` only verifies; `build-engine --write-lock --lock <file>` writes the lock. The live/SSH modes below are unchanged. See docs/ENGINE_IMAGE.md.
+
 ### `build-engine` (`script/build-engine.ts`)
 
 -   **Purpose:** The primary, all-in-one script for provisioning a full Engine device. It runs via the `./build-engine` wrapper in the repo root (which calls `tsx script/build-engine.ts`). It has three modes:

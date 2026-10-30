@@ -154,3 +154,11 @@ The system forms a self-organising mesh on the local network with no configurati
 3.  **Discovery:** Engine A and Engine B detect the new advertisement and each open a WebSocket to Engine C.
 4.  **Merge:** Automerge sync runs; Engine C's empty document merges with the full document from Engine A and B. Engine C now knows about all disks and instances on the network.
 5.  **Visible to consoles:** Any Console UI immediately shows Engine C in its engine list, even before any disk is inserted into it.
+
+## Engine image (idea#322 Option A)
+
+An Engine can also be installed from an image instead of over SSH: the idea repo's builder mounts a Raspberry Pi OS
+image and runs `script/build-engine-offline` into it (docs/ENGINE_IMAGE.md). The image carries no device identity;
+at first boot Raspberry Pi OS regenerates SSH host keys, systemd makes machine-id, `idea-engine-firstboot` loads the
+preloaded Docker images and starts the Engine under pi's pm2, and the Engine creates `/META.yaml` (and so its Engine
+id) at its first start, from the root drive's serial or a UUID. The Engine still runs natively under pm2 as pi.

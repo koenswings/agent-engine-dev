@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# build-engine-offline: build the Engine into a mounted Raspberry Pi OS root filesystem (idea#322 Option A).
+# The entry point of idea tools/engine-image/INTERFACE.md, called by the idea repo's release builder:
+#   sudo <engine-src>/script/build-engine-offline --root <MNT> --boot <MNT>/boot/firmware --report <OUT>/engine-build.json
+#        [--cache <archive-engine-inputs.sh dir>] [--lock <engine.lock>] [--image name[:tag]@sha256:<d> ...] [--dry-run]
+# A thin wrapper around `build-engine.ts --root ...` (see docs/SCRIPTS.md). No SSH, starts nothing, leaves no device
+# identity, verifies the result. Exit: 0 ok, 1 build or verify failed, 2 usage error.
+# Needs on the host: node 22 + pnpm (the Engine checkout's own dev dependencies are installed if missing).
+set -uo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd); SRC=$(dirname "$HERE")
+[ $# -gt 0 ] || { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+command -v node >/dev/null || { echo "build-engine-offline: node is not installed on this host" >&2; exit 1; }
+if [ ! -x "$SRC/node_modules/.bin/tsx" ]; then
+  ( cd "$SRC" && pnpm install --frozen-lockfile >/dev/null ) || { echo "build-engine-offline: pnpm install of the build tools failed" >&2; exit 1; }
+fi
+cd "$SRC" && exec "$SRC/node_modules/.bin/tsx" script/build-engine.ts "$@"

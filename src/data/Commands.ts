@@ -32,7 +32,7 @@ import { removeInstance } from './RemoveInstance.js';
 import { renameInstance } from './RenameInstance.js';
 import { updateApp, parseUpdateAppArgs } from './UpdateApp.js';
 import { flashCard, cancelFlash, initialiseDisk } from './FlashCard.js';
-import { testContext } from "../../test/testContext.js";
+import { testContext } from "./TestContext.js";
 
 
 import { BrowserWebSocketClientAdapter } from "@automerge/automerge-repo-network-websocket";
