@@ -14,7 +14,7 @@ import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import { createOrUpdateDisk } from '../../src/data/Disk.js'
 import { createOrUpdateApp } from '../../src/data/App.js'
-import { appForInstance, resolveInstanceApp, resetInstanceAppAliasesForTests } from '../../src/data/InstanceApp.js'
+import { appForInstance, resolveInstanceApp, resetInstanceAppAliasesForTests, instanceUsbSync } from '../../src/data/InstanceApp.js'
 import {
     writeInstanceOverride, optedInInstances, remountInstance, ensureEngineStateDir,
     setFilesMountOpsForTests, resetFilesRemountScheduleForTests,
@@ -119,6 +119,22 @@ describe('App lookup fallback by App folder (idea#392)', () => {
         expect((await resolveInstanceApp(h.doc()!, inst))?.id).toBe('sample-files-1.0')
         expect(await remountInstance(h, 'inst-1' as InstanceID)).toBe('done')
         expect(warnings()).toHaveLength(0)
+    })
+
+    it('runInstance USB sync lookup (instanceUsbSync) uses the folder App on a mismatch', async () => {
+        const inst = await setup('sample-files-1.0', 'sample-files', '1.0-smoke')
+        // give the folder App a usbMount with sync, as x-app.usbMount would
+        h.change(doc => {
+            (doc.appDB['sample-files-1.0' as AppID] as any).usbMount = {
+                path: '/mnt/idea-usb', services: ['sample'], sync: { service: 'sample', user: null, command: '/idea/usb-sync.sh' },
+            }
+        })
+        expect(h.doc()!.appDB['sample-files-1.0-smoke' as AppID]).toBeUndefined()
+        expect(await instanceUsbSync(h.doc()!, inst)).toEqual({ service: 'sample', user: null, command: '/idea/usb-sync.sh' })
+        expect(warnings()).toHaveLength(1)
+        h.change(doc => { delete doc.appDB['sample-files-1.0' as AppID] })
+        resetInstanceAppAliasesForTests()
+        expect(await instanceUsbSync(h.doc()!, inst)).toBeNull()
     })
 
     it('nothing by either id: clean skip, no warning, no compose', async () => {
