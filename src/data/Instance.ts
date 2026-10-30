@@ -7,6 +7,7 @@ import { addOrUpdateEnvVariable, deepPrint, log, randomPort, readEnvVariable, uu
 import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber, ServiceImage, Timestamp, Version, DeviceName, InstanceName, AppName, Hostname, DiskID, OperationCause, EngineID } from "./CommonTypes.js";
 import { createOperation, updateOperation } from './Operations.js'
 import { composeFileEnv } from './FilesMount.js'
+import { appForInstance } from './InstanceApp.js'
 import { Store, getDisk, getEngine, getLocalEngine, getInstancesOfEngine, } from "./Store.js";
 import { Disk, diskMountRoot, diskFsRoot, deviceMountRoot } from "./Disk.js";
 import { localEngineId } from "./Engine.js";
@@ -1538,7 +1539,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
       Number(readyPort) || 0,
       `${mountRoot}/instances/${instance.id}`,
     )
-    if (composeEnv && store.appDB[instance.instanceOf]?.filesMount) {
+    if (composeEnv && appForInstance(store, instance)?.filesMount) {
       // filesMounts only after success — read back from the override we just wrote
       const { mountableFilesDisks } = await import('./FilesMount.js')
       mountedDiskIds = mountableFilesDisks(store).map(d => d.id)
