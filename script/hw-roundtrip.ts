@@ -68,8 +68,8 @@
  * Root: only the unplug simulation (a write to /sys/bus/usb/...) needs root.
  * It runs as `sudo -n tee <sysfs file>` with the tester's own sudo; it is NOT
  * in the Engine sudoers. Refuses to run on idea02 (golden). Touches only the
- * recorded test disk, matched by filesystem UUIDs, disk serial and USB serial
- * (never by a device name like sdb), checked before anything is ejected and again
+ * recorded test disk, matched by its disk serial (plus USB serial and filesystem
+ * UUIDs when given as flags; never by a device name like sdb), checked before anything is ejected and again
  * before every unplug; refuses the root SSD serial and the drive backing / or
  * /boot/firmware (hw-roundtrip-guard.ts).
  *
@@ -200,7 +200,7 @@ write(`hw-roundtrip on ${os.hostname()}: engine-dir=${ENGINE_DIR} port=${PORT} l
 info(`system drive: root=${rootSource} boot=${bootSource || '(none)'} disks=${[...systemDisks].join(',')} usb=${[...systemUsb].join(',') || '(not USB)'}`)
 
 const expected = loadExpectation(argv, STICK_CONFIG, os.hostname())
-info(`expected test disk: usbSerial=${expected.usbSerial || '?'} diskSerial=${expected.diskSerial || '?'} uuids=${expected.uuids.join(',') || '?'} refused serials=${expected.refuseSerials.join(',') || 'none'} (${STICK_CONFIG})`)
+info(`expected test disk: diskSerial=${expected.diskSerial || '?'} usbSerial=${expected.usbSerial || '(not checked)'} uuids=${expected.uuids.join(',') || '(not checked)'} refused serials=${expected.refuseSerials.join(',') || 'none'} (${STICK_CONFIG})`)
 
 /** Resolve the recorded test disk by its IDs; abort on any mismatch (before touching anything) */
 const verifyStick = async (when: string) => {
@@ -210,7 +210,7 @@ const verifyStick = async (when: string) => {
         if (DEVICE && r.disk !== DEVICE) info(`test disk is now ${r.disk} (was ${DEVICE})`)
         DEVICE = r.disk
         usbId = r.usbId
-        write(`PASS  test disk verified (${when}): ${r.disk} [${r.partitions.join(',')}] on USB ${r.usbId}, disk serial ${expected.diskSerial}, USB serial ${expected.usbSerial}`)
+        write(`PASS  test disk verified (${when}): ${r.disk} [${r.partitions.join(',')}] on USB ${r.usbId}, disk serial ${expected.diskSerial}, USB serial ${expected.usbSerial || '(not checked)'}`)
     }
 }
 let usbId = ''
