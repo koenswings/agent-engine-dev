@@ -7,7 +7,7 @@ import { addOrUpdateEnvVariable, deepPrint, log, randomPort, readEnvVariable, uu
 import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber, ServiceImage, Timestamp, Version, DeviceName, InstanceName, AppName, Hostname, DiskID, OperationCause, EngineID } from "./CommonTypes.js";
 import { createOperation, updateOperation } from './Operations.js'
 import { composeFileEnv } from './FilesMount.js'
-import { appForInstance } from './InstanceApp.js'
+import { appForInstance, instanceUsbSync } from './InstanceApp.js'
 import { Store, getDisk, getEngine, getLocalEngine, getInstancesOfEngine, } from "./Store.js";
 import { Disk, diskMountRoot, diskFsRoot, deviceMountRoot } from "./Disk.js";
 import { localEngineId } from "./Engine.js";
@@ -1570,7 +1570,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
   print(chalk.green(`App ${instance.id} running`))
   clearStep(storeHandle, instance.id)
   // idea#193 §4: reconcile USB stick storages once the App runs (x-app.usbMount.sync)
-  if (storeHandle.doc()?.appDB?.[instance.instanceOf]?.usbMount?.sync) {
+  if (await instanceUsbSync(storeHandle.doc(), instance)) {
     const { syncUsbApps } = await import('./UsbSticks.js')
     void syncUsbApps(storeHandle, 'start', true, instance.id)
   }

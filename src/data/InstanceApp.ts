@@ -75,3 +75,7 @@ export const resolveAllInstanceApps = async (store: Store): Promise<void> => {
         if (!store.appDB?.[inst.instanceOf]) await resolveInstanceApp(store, inst)
     }
 }
+
+/** The App's usbMount.sync for an instance, through the fallback; null when none (runInstance, idea#193 §4). */
+export const instanceUsbSync = async (store: Store, instance: Instance): Promise<NonNullable<App['usbMount']>['sync'] | null> =>
+    (await resolveInstanceApp(store, instance))?.usbMount?.sync ?? null
