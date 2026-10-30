@@ -25,7 +25,7 @@ import {
     FILES_REMOUNT_GROUP_MS, IDEA_FILES_JSON,
     buildOverride, slugFromShareName, containerFilesPath, diskId6,
     parseFilesMount, remountActionFor, shouldHoldFilesRemount,
-    remountInstance, writeInstanceOverride, scheduleFilesRemount,
+    remountInstance, reconcileFilesMounts, writeInstanceOverride, scheduleFilesRemount,
     flushFilesRemountNow, resetFilesRemountScheduleForTests,
     setFilesMountOpsForTests, ensureEngineStateDir,
     overridePathFor, displayJsonHostPath,
@@ -347,6 +347,95 @@ describe('remountInstance status handling', () => {
         const second = await fs.readFile(overridePathFor('inst-1' as InstanceID), 'utf8')
         expect(second).toBe(first)
         expect(composeCalls).toHaveLength(2)
+    })
+})
+
+describe('reconcileFilesMounts (idea#139 step 9)', () => {
+    let h: DocHandle<Store>
+    let composeCalls: { dir: string; override: string; args: string[] }[]
+    const roots: string[] = []
+    let appRoot = ''
+
+    beforeEach(async () => {
+        h = await newStore()
+        composeCalls = []
+        resetFilesRemountScheduleForTests()
+        setFilesMountOpsForTests({
+            composeUp: async (dir, override, args) => { composeCalls.push({ dir, override, args }) },
+            nextcloudOccStatus: async () => ({ installed: true, maintenance: false, needsDbUpgrade: false }),
+        })
+        await ensureEngineStateDir()
+        // One disk that is an App Disk with a running instance (no Files role yet)
+        const device = uniqueTestDevice()
+        appRoot = `${DISKS_ROOT}/${device}`
+        roots.push(appRoot)
+        await fs.ensureDir(`${appRoot}/apps/sample-files-1.0`)
+        await fs.ensureDir(`${appRoot}/instances/inst-1`)
+        const compose = await fs.readFile(path.join(FIXTURES_DIR, 'disk-files-app/apps/sample-files-1.0/compose.yaml'), 'utf8')
+        await fs.writeFile(`${appRoot}/apps/sample-files-1.0/compose.yaml`, compose)
+        await fs.writeFile(`${appRoot}/instances/inst-1/compose.yaml`, compose)
+        const disk = createOrUpdateDisk(h, LOCAL, device as DeviceName, 'appfiles-1' as DiskID, 'Disk B' as DiskName, 1 as Timestamp)
+        await createOrUpdateApp(h, 'sample-files-1.0' as AppID, disk)
+        addInstance(h, 'inst-1', { status: 'Running', diskId: 'appfiles-1', filesMounts: null })
+    })
+    afterEach(async () => {
+        setFilesMountOpsForTests(null)
+        resetFilesRemountScheduleForTests()
+        resourceLock.releaseAll([...resourceLock.allLocks().keys()])
+        for (const r of roots.splice(0)) await fs.remove(r)
+    })
+
+    /** Add Files: FILES.yaml + files/ appear on the same disk and it gets the Files role. */
+    const addFilesRole = async () => {
+        await fs.copy(path.join(FIXTURES_DIR, 'disk-files'), appRoot, { overwrite: false })
+        h.change(doc => {
+            const d = doc.diskDB['appfiles-1' as DiskID]
+            d.filesConfig = { shareName: 'School Files', readOnly: false, passwordProtected: false, error: null }
+            d.diskTypes = ['app', 'files']
+        })
+    }
+
+    it('Add Files on a running instance: recreates once with the files bind, filesMounts set', async () => {
+        await addFilesRole()
+        expect(await reconcileFilesMounts(h, 'inst-1' as InstanceID)).toBe('done')
+        expect(composeCalls).toHaveLength(1)
+        expect(composeCalls[0].args).toEqual(['up', '-d'])
+        expect([...h.doc()!.instanceDB['inst-1' as InstanceID].filesMounts!]).toEqual(['appfiles-1'])
+        const ov = YAML.parse(await fs.readFile(composeCalls[0].override, 'utf8'))
+        expect(ov.services.sample.volumes[0].source).toBe(`${appRoot}/files`)
+        expect(ov.services.sample.volumes[0].target).toMatch(/^\/mnt\/idea-files\/school-files-/)
+    })
+
+    it('dock of an App+Files disk with a stale override: override rewritten, recreated once', async () => {
+        await addFilesRole()
+        // Stale override from an earlier run: only the display JSON bind, filesMounts null
+        await fs.writeFile(overridePathFor('inst-1' as InstanceID), YAML.stringify({
+            services: { sample: { volumes: [{ type: 'bind', source: '/x', target: `/mnt/idea-files/${IDEA_FILES_JSON}` }] } },
+        }))
+        expect(await reconcileFilesMounts(h, 'inst-1' as InstanceID)).toBe('done')
+        expect(composeCalls).toHaveLength(1)
+        const ov = YAML.parse(await fs.readFile(overridePathFor('inst-1' as InstanceID), 'utf8'))
+        expect(ov.services.sample.volumes).toHaveLength(2)
+        expect(ov.services.sample.volumes[0].source).toBe(`${appRoot}/files`)
+        expect([...h.doc()!.instanceDB['inst-1' as InstanceID].filesMounts!]).toEqual(['appfiles-1'])
+    })
+
+    it('exactly once: a second call with nothing changed does not recreate', async () => {
+        await addFilesRole()
+        expect(await reconcileFilesMounts(h, 'inst-1' as InstanceID)).toBe('done')
+        expect(await reconcileFilesMounts(h, 'inst-1' as InstanceID)).toBe('unchanged')
+        expect(await reconcileFilesMounts(h, 'inst-1' as InstanceID)).toBe('unchanged')
+        expect(composeCalls).toHaveLength(1)
+    })
+
+    it('failed compose leaves filesMounts null so the next call retries', async () => {
+        await addFilesRole()
+        setFilesMountOpsForTests({
+            composeUp: async () => { throw new Error('compose boom') },
+            nextcloudOccStatus: async () => ({ installed: true, maintenance: false, needsDbUpgrade: false }),
+        })
+        expect(await reconcileFilesMounts(h, 'inst-1' as InstanceID)).toBe('failed')
+        expect(h.doc()!.instanceDB['inst-1' as InstanceID].filesMounts).toBeNull()
     })
 })
 
