@@ -150,15 +150,20 @@ The script checks internet connectivity, joins the IDEA Tailnet (ephemeral), and
 - The key never reaches pm2: build-engine drops `TAILSCALE_AUTHKEY` from its environment once `installTailscale()` has read it, and runs pm2 under `env -u TAILSCALE_AUTHKEY`, so it is not in `~/.pm2/dump.pm2` (idea#273).
 - Never put the key on a command line yourself, e.g. `tailscale up --authkey tskey-…` or `echo tskey-… | …`.
 
-**Field Pis use one reusable, ephemeral fleet auth key (idea#117).** Every field Pi stores the same key at `/etc/tailscale/debug-authkey` (`0600 root:root`, never on a command line, see above).
-- **Why:** during an intervention, someone at the school runs `tailscale-debug-activate.sh`, and the Pi joins the tailnet with that key.
-- **Reusable:** the key has to work for every session on every field Pi. We usually can't reach a Pi in the field to give it a new key, so a single-use key would be spent after its first session.
-- **Ephemeral:** the Pi drops off the tailnet when the session ends. That way it doesn't keep using a device slot, which keeps the licence count low.
-- **The current key:** "idea fleet authentication", created in the Tailscale admin console (Settings → Keys). It expires 2026-12-20. Koen is keeping it, so don't revoke it.
+**Target design: Tailscale always on, one fleet tag and one fleet key (Koen, 2026-10-13, idea#117).** See `proposals/2026-10-13-tailscale-single-fleet-tag.md` in koenswings/idea.
+- Tailscale is always on at schools, on the router and on every Pi. There are no per-school tags or keys, so a Pi can move between schools without admin work.
+- **One fleet tag, `tag:idea`, and one fleet auth key** tagged `tag:idea`. Every field Pi stores the same key at `/etc/tailscale/debug-authkey` (`0600 root:root`, never on a command line, see above).
+- **ACL:** admins → `tag:idea` allowed; `tag:idea` → anything denied. Pis talk to each other only over the school LAN websocket, never over Tailscale.
+- The key is a secret: never in docs, issues or chat.
 
-The permanent fleet Pis (idea02, idea03) didn't join with this key and aren't ephemeral.
+**Current state (not yet the target design).**
+- The routers already enrol with `--advertise-tags=tag:idea` and no `--ephemeral` (`tools/router-image/idea-router-enrol` in koenswings/idea). The kit Engines' nodes carry `tag:idea` and stay registered while offline.
+- The Engine code still uses the older latent-debug model: `tailscale-debug-activate.sh` joins with `--ephemeral --advertise-tags=tag:idea` during an intervention. Moving the Engine to always-on is an open decision for Koen in [idea#117](https://github.com/koenswings/idea/issues/117). Don't change it until that decision is made.
+- The fleet Pis (idea01–idea04) and the ops box are untagged members of the tailnet.
 
-**Refresh the key before it expires.** Tailscale auth keys expire after at most 90 days. Once the stored key has expired, a field Pi can no longer join the tailnet, so every Pi's stored key must be replaced with a new fleet key before that happens. How the refresh works in the field is still open in [idea#117](https://github.com/koenswings/idea/issues/117). That issue also covers the key's tag and the tailnet access rules. Options for the refresh include refreshing during site visits or pushing a new key while a Pi is connected.
+**Not yet confirmed (idea#117 audit, 2026-10-29).** The fleet key's expiry, whether it is reusable or ephemeral, whether it carries `tag:idea`, and what the ACL allows `tag:idea` to reach have not been checked in the admin console. Treat any expiry date or the "at most 90 days" limit as unverified until Koen's console read (idea#375) is recorded on idea#117. Don't revoke the current key ("idea fleet authentication"): Koen is keeping it.
+
+**Refresh the key before it expires.** Once the stored key has expired, a Pi that still has to join with it can't, so every Pi's stored key has to be replaced with the new fleet key before the real expiry date. Atlas writes the rotation plan on idea#117 once the console facts are known.
 
 To replace the stored key on a Pi you can reach, without the key appearing on any command line:
 1. Put the new key in a local file only you can read (`chmod 600`).
