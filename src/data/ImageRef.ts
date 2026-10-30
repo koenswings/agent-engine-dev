@@ -91,7 +91,14 @@ export const checkLoadedDigest = (ref: string, repoDigests: string[] | null, ima
         const i = d.lastIndexOf('@')
         return i !== -1 && d.slice(i + 1) === want && normRepo(d.slice(0, i)) === normRepo(p.repo)
     })
-    if (match || imageId === want) return { ok: true }
+    if (match) return { ok: true }
+    // .Id equal to the pinned digest: meant for the index digest on the containerd store. Still needs a
+    // check on a real Pi: after a --platform save the loaded .Id may be the arm64 manifest digest instead,
+    // and a repo:tag@<platform digest> start is known to fail, so RepoDigests stays the primary check (idea#322).
+    // If RepoDigests name this repo under another digest, the pin is not the index: .Id equal to a
+    // per-platform manifest digest never counts as a pass.
+    const repoHasOtherDigest = repoDigests.some(d => { const i = d.lastIndexOf('@'); return i !== -1 && normRepo(d.slice(0, i)) === normRepo(p.repo) })
+    if (imageId === want && !repoHasOtherDigest) return { ok: true }
     const have = repoDigests.length ? repoDigests.join(', ') : '(no RepoDigests)'
     return {
         ok: false,
@@ -101,12 +108,19 @@ export const checkLoadedDigest = (ref: string, repoDigests: string[] | null, ima
     }
 }
 
+/**
+ * The Engine runs on ARM64 only. On Docker 29 with the containerd image store, a pull by index digest
+ * with --platform keeps the full index but only the arm64 content, so a plain `docker save repo:tag` can
+ * fail with "content not found" or write a partial index. Save only this platform (idea#322).
+ */
+export const ENGINE_IMAGE_PLATFORM = 'linux/arm64'
+
 /** The docker steps of the build (persist) path for one service image, in order. Pure, for tests. */
 export const buildImageSteps = (ref: string): string[][] => {
     const p = parseImageRef(ref)
     const name = saveName(ref)
     const steps: string[][] = [['docker', 'image', 'pull', p.ref]]
     if (p.digest) steps.push(['docker', 'image', 'tag', p.ref, name])
-    steps.push(['docker', 'save', name])
+    steps.push(['docker', 'save', '--platform', ENGINE_IMAGE_PLATFORM, name])
     return steps
 }

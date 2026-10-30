@@ -8,7 +8,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { fs, path } from 'zx'
 import os from 'os'
-import { buildImageSteps, checkLoadedDigest, legacyServiceImageTarName, parseImageRef, saveName, serviceImageTarName } from '../../src/data/ImageRef.js'
+import { ENGINE_IMAGE_PLATFORM, buildImageSteps, checkLoadedDigest, legacyServiceImageTarName, parseImageRef, saveName, serviceImageTarName } from '../../src/data/ImageRef.js'
 import { serviceImageTarPath, verifyServiceImageDigest } from '../../src/data/Instance.js'
 
 const INDEX = 'sha256:a5ae1caf3e31b5bb9f2df9c94d45c4cf6fdb8ce3cfe8730364bd6648cdbadc31'
@@ -41,12 +41,13 @@ describe('parseImageRef / saveName / tar names', () => {
 
 describe('buildImageSteps (persist path)', () => {
     it('tag-only: pull + save, exactly as before', () => {
-        expect(buildImageSteps(TAG)).toEqual([['docker', 'image', 'pull', TAG], ['docker', 'save', TAG]])
+        expect(buildImageSteps(TAG)).toEqual([['docker', 'image', 'pull', TAG], ['docker', 'save', '--platform', 'linux/arm64', TAG]])
     })
     it('pinned: pull by the full ref, tag as repo:tag, save by repo:tag (never save by digest)', () => {
         const s = buildImageSteps(PINNED)
-        expect(s).toEqual([['docker', 'image', 'pull', PINNED], ['docker', 'image', 'tag', PINNED, TAG], ['docker', 'save', TAG]])
+        expect(s).toEqual([['docker', 'image', 'pull', PINNED], ['docker', 'image', 'tag', PINNED, TAG], ['docker', 'save', '--platform', 'linux/arm64', TAG]])
         expect(s.some(x => x[1] === 'save' && x.join(' ').includes('@'))).toBe(false)
+        expect(ENGINE_IMAGE_PLATFORM).toBe('linux/arm64')
     })
 })
 
@@ -70,6 +71,9 @@ describe('checkLoadedDigest (after docker image load)', () => {
             expect(c.reason).toMatch(/per-platform manifest digest/)
             expect(c.reason).toMatch(/imagetools inspect koenswings\/kolibri:1\.1-0\.19\.5/)
         }
+    })
+    it('platform pin + --platform save whose .Id is the arm64 manifest digest: still fails (RepoDigests show the index)', () => {
+        expect(checkLoadedDigest(`${TAG}@${PLATFORM}`, [`koenswings/kolibri@${INDEX}`], PLATFORM).ok).toBe(false)
     })
     it('mismatch: a different build under the same tag fails', () => {
         expect(checkLoadedDigest(PINNED, [`koenswings/kolibri@${PLATFORM}`], PLATFORM).ok).toBe(false)
