@@ -9,7 +9,7 @@ import { fs, path, os } from 'zx'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId, ENGINE_CAPABILITIES } from '../../src/data/Engine.js'
 import { updateApp, UpdateDeps, UpdateProgress, waitContainersGone, aggregateHealth, parseUpdateAppArgs, recoverInterruptedUpdates, snapshotMarginBytes, refreshUpdateAvailable, sumsLookUsable } from '../../src/data/UpdateApp.js'
-import { majorAllowedByUpdatesFrom, checkUpdate, offerable, parseHealthCheck, healthBodyOk, estimateUpdateMinutes, SNAPSHOT_BYTES_PER_MIN } from '../../src/data/UpdateAppPolicy.js'
+import { fallbackUp, fallbackHealthTimeoutSeconds, FALLBACK_HEALTH_TIMEOUT_S, majorAllowedByUpdatesFrom, checkUpdate, offerable, parseHealthCheck, healthBodyOk, estimateUpdateMinutes, SNAPSHOT_BYTES_PER_MIN } from '../../src/data/UpdateAppPolicy.js'
 import { serviceImageTarName } from '../../src/data/ImageRef.js'
 import { readXApp } from '../../src/data/UpdateApp.js'
 import { parseSnapshotResult, parseSnapshotsList } from '../../src/utils/appDataHelper.js'
@@ -80,7 +80,7 @@ describe('updateApp (#230)', () => {
         const r = await updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps())
         expect(r).toMatchObject({ instanceId: 'i1', fromAppId: 'kolibri-1.0', toAppId: 'kolibri-1.1', snapshotPath: `${tmp}/.pre-update/i1`, snapshotBytes: 4096 })
         expect(r.steps).toEqual(['Fetch', 'Check', 'Snapshot', 'Swap', 'Start', 'Health'])
-        expect(calls).toEqual(['stop', 'snapshot', 'reread', 'start'])
+        expect(calls).toEqual(['stop', 'snapshot', 'reread', 'start', 'probe'])   // probe: fallback main-URL check
         expect(inst().instanceOf).toBe('kolibri-1.1')
         expect(await fs.readFile(`${tmp}/instances/i1/.env`, 'utf8')).toBe('port=50001\n')
         expect(await fs.readFile(`${tmp}/instances/i1/compose.yaml`, 'utf8')).toMatch(/instanceName: Old/)
@@ -293,10 +293,42 @@ describe('idea#76 gaps', () => {
         const m = await codeOf(updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps({ now: () => t, sleep: async () => { t += 600 }, probe: async () => ({ status: 503, body: '' }) })))
         expect(m, m).toMatch(/ROLLED BACK: .*health gate/)
     })
-    it('no healthCheck declared: no probe (old behaviour)', async () => {
-        health = ['healthy']
-        await updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps())
-        expect(calls).not.toContain('probe')
+    const reset = async () => {
+        await fs.outputFile(`${tmp}/instances/i1/compose.yaml`, compose('1.0'))
+        h.change(d => { (d.instanceDB['i1' as any] as any).instanceOf = 'kolibri-1.0'; (d.instanceDB['i1' as any] as any).status = 'Running' })
+        calls = []
+    }
+    it('fallback (no healthCheck): GET the main URL; 200/302/401 count as up', async () => {
+        for (const status of [200, 302, 401]) {
+            await reset()
+            const urls: string[] = []
+            const r = await updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps({ probe: async (u) => { urls.push(u); return { status, body: '' } } }))
+            expect(r.steps).toContain('Health')
+            expect(urls).toEqual(['http://127.0.0.1:50001/'])
+        }
+    })
+    it('fallback: 5xx and connection refused keep waiting, then roll back at the timeout', async () => {
+        for (const ans of [{ status: 503, body: '' }, null]) {
+            await reset()
+            let t = 0
+            const answers = [ans, ans, { status: 200, body: '' }]
+            const ok = await updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps({ now: () => t, sleep: async () => { t += 1000 }, probe: async () => answers.shift() ?? null }))
+            expect(ok.steps).toContain('Health')   // waited through two bad answers
+            await reset(); t = 0
+            const m = await codeOf(updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps({ now: () => t, sleep: async () => { t += 60_000 }, probe: async () => ans })))
+            expect(m).toMatch(/ROLLED BACK: .*health gate: not healthy after 900 s/)   // kolibri: agreed per-App default
+        }
+    })
+    it('fallback timeout: declared healthTimeout honoured; else per-App default; else 300 s', async () => {
+        expect(fallbackHealthTimeoutSeconds('updtest', 60)).toBe(60)
+        expect(fallbackHealthTimeoutSeconds('updtest')).toBe(FALLBACK_HEALTH_TIMEOUT_S)
+        expect(FALLBACK_HEALTH_TIMEOUT_S).toBe(300)
+        expect(fallbackHealthTimeoutSeconds('kolibri')).toBe(900)
+        expect(fallbackUp(null)).toBe(false); expect(fallbackUp({ status: 500 })).toBe(false); expect(fallbackUp({ status: 404 })).toBe(true)
+        await fs.outputFile(`${tmp}/apps/kolibri-1.1/compose.yaml`, compose('1.1') + '  healthTimeout: 7\n')
+        let t = 0
+        const m = await codeOf(updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps({ now: () => t, sleep: async () => { t += 1000 }, probe: async () => null })))
+        expect(m).toMatch(/not healthy after 7 s/)
     })
     it('success sets previousAppId and clears updateAvailable', async () => {
         h.change(d => { (d.instanceDB['i1' as any] as any).updateAvailable = { appId: 'kolibri-1.1' } })
@@ -338,5 +370,23 @@ describe('idea#76 gaps', () => {
         expect(checkUpdate({ ...facts, allowMajor: false, currentAppId: 'updtest-1.0', newAppId: 'updtest-2.0', updatesFrom: x20.updatesFrom })?.message).toMatch(/pass --allow-major$/)
         expect(checkUpdate({ ...facts, currentAppId: 'updtest-0.9', newAppId: 'updtest-2.0', updatesFrom: x20.updatesFrom })?.message).toBe('MAJOR_NOT_ALLOWED: version 2.0 cannot update directly from major 0; supported: 1')
         expect(serviceImageTarName(`busybox:1.36.1@sha256:${'7'.repeat(64)}`)).toBe('busybox:1.36.1.tar')
+    })
+    it('updatesFrom is read from the TARGET bundle: installed updtest-1.1 ([]) -> 2.0 ([1]) allowed; target [] from major 1 refused', async () => {
+        const run = async (target: string, uf: string) => {
+            await fs.remove(`${tmp}/apps`)
+            await fs.outputFile(`${tmp}/instances/i1/compose.yaml`, updtest('1.1', '[]'))
+            await fs.outputFile(`${tmp}/apps/updtest-${target}/compose.yaml`, updtest(target, uf))
+            h.change(d => { const i = d.instanceDB['i1' as any] as any; i.instanceOf = 'updtest-1.1'; i.status = 'Running'; i.lastBackup = Date.now() })
+            calls = []
+            return codeOf(updateApp(h, 'i1', `updtest-${target}`, ME, { allowMajor: true }, deps({
+                reread: async () => { h.change(d => { (d.instanceDB['i1' as any] as any).instanceOf = `updtest-${target}` }) },
+                probe: async () => ({ status: 200, body: `updtest ${target}` }),
+            })))
+        }
+        expect(await run('2.0', '[1]')).toBe('ok')
+        expect(inst().instanceOf).toBe('updtest-2.0')
+        expect(inst().previousAppId).toBe('updtest-1.1')
+        expect(await run('3.0', '[]')).toBe('MAJOR_NOT_ALLOWED: version 3.0 cannot update directly from major 1; supported: none')
+        expect(calls).toEqual([])
     })
 })

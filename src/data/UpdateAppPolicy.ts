@@ -113,6 +113,17 @@ export const parseHealthCheck = (v: unknown): { path: string, expect?: string } 
 export const healthBodyOk = (r: { status: number, body: string } | null, expect?: string): boolean =>
     !!r && r.status >= 200 && r.status < 400 && (!expect || r.body.includes(expect))
 
+/** Fallback gate (no x-app.healthCheck, idea#351 §4.3): any HTTP answer below 500 on the main URL means up (login redirects and 401 are fine). */
+export const fallbackUp = (r: { status: number } | null): boolean => !!r && r.status < 500
+/** Fallback gate timeout when the App declares no healthTimeout and has no agreed per-App default; pending Kid's measured timings (idea#351 §10.1). */
+export const FALLBACK_HEALTH_TIMEOUT_S = 300
+/** Timeout for the fallback gate: declared x-app.healthTimeout, else the agreed per-App default (#230), else 300 s. */
+export const fallbackHealthTimeoutSeconds = (appName: string, declared?: unknown): number => {
+    const n = Number(declared)
+    if (declared !== undefined && declared !== null && Number.isFinite(n) && n > 0) return n
+    return HEALTH_TIMEOUT_S[appName.toLowerCase()] ?? FALLBACK_HEALTH_TIMEOUT_S
+}
+
 /** Rough snapshot copy rate until Kid's measured timings (idea#351 §10.1). */
 export const SNAPSHOT_BYTES_PER_MIN = 1024 ** 3
 /** estimatedMinutes = snapshot copy estimate + health timeout (same-Engine source: no transfer). */

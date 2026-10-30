@@ -38,7 +38,7 @@ import { createOperation, updateOperation } from './Operations.js'
 import { log } from '../utils/utils.js'
 import {
     UpdateAppError, UpdateStep, UPDATE_STEPS, checkUpdate, healthGate, healthTimeoutSeconds, rollbackPlan,
-    parseHealthCheck, healthBodyOk, estimateUpdateMinutes,
+    parseHealthCheck, healthBodyOk, estimateUpdateMinutes, fallbackUp, fallbackHealthTimeoutSeconds,
     HealthSample, ContainerHealth, offerable, compareVersions, isMajorChange,
 } from './UpdateAppPolicy.js'
 import { parseAppId } from './App.js'
@@ -327,15 +327,20 @@ export const updateApp = async (
             done.push('Start')
             // ── Health
             step = 'Health'; setStep('Health')
-            const timeoutS = await readHealthTimeout(composePath, parseAppId(newAppId).name)
-            const hc = parseHealthCheck((await readXApp(composePath)).healthCheck)
+            const newX = await readXApp(composePath)
+            const hc = parseHealthCheck(newX.healthCheck)
+            // Declared healthCheck: agreed per-App timeout rule; fallback (main URL): healthTimeout, per-App default, else 300 s
+            const timeoutS = hc ? await readHealthTimeout(composePath, parseAppId(newAppId).name) : fallbackHealthTimeoutSeconds(parseAppId(newAppId).name, newX.healthTimeout)
             const t0 = d.now()
             for (;;) {
                 const elapsedMs = d.now() - t0
                 const sample = await d.health(inst.id)
                 // x-app.healthCheck (idea#351 §4.3): only once Docker says the containers are up
                 const ready = sample.state === 'healthy' || sample.state === 'none'
-                const bodyOk = hc && ready ? healthBodyOk(await d.probe(`http://127.0.0.1:${(storeHandle.doc().instanceDB[inst.id] as Instance)?.port ?? inst.port}${hc.path}`), hc.expect) : undefined
+                const base = `http://127.0.0.1:${(storeHandle.doc().instanceDB[inst.id] as Instance)?.port ?? inst.port}`
+                const bodyOk = !ready ? undefined
+                    : hc ? healthBodyOk(await d.probe(`${base}${hc.path}`), hc.expect)
+                    : fallbackUp(await d.probe(`${base}/`))
                 const v = healthGate({ ...sample, bodyOk, elapsedMs }, timeoutS)
                 progress('Health', Math.min(elapsedMs, timeoutS * 1000), timeoutS * 1000)
                 if (v.verdict === 'pass') break
