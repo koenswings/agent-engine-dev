@@ -75,6 +75,23 @@ describe('checkLoadedDigest (after docker image load)', () => {
     it('platform pin + --platform save whose .Id is the arm64 manifest digest: still fails (RepoDigests show the index)', () => {
         expect(checkLoadedDigest(`${TAG}@${PLATFORM}`, [`koenswings/kolibri@${INDEX}`], PLATFORM).ok).toBe(false)
     })
+    it('single-platform image (no index, e.g. nextcloud): a top-level manifest pin passes', () => {
+        const M = 'sha256:' + 'c'.repeat(64)
+        expect(checkLoadedDigest(`nextcloud:31@${M}`, [`docker.io/library/nextcloud@${M}`], M)).toEqual({ ok: true })
+        expect(checkLoadedDigest(`koenswings/nextcloud-mariadb:1@${M}`, [`koenswings/nextcloud-mariadb@${M}`], null)).toEqual({ ok: true })
+        expect(checkLoadedDigest(`koenswings/nextcloud-code:1@${M}`, [], M)).toEqual({ ok: true })
+    })
+    it('platform digest inside an index (kolibri 2b1cb1ed… under a5ae1caf…) still fails', () => {
+        expect(checkLoadedDigest(`${TAG}@${PLATFORM}`, [`koenswings/kolibri@${INDEX}`], INDEX).ok).toBe(false)
+        expect(checkLoadedDigest(`${TAG}@${PLATFORM}`, [`koenswings/kolibri@${INDEX}`], PLATFORM).ok).toBe(false)
+    })
+    it('index pin passes', () => {
+        expect(checkLoadedDigest(PINNED, [`koenswings/kolibri@${INDEX}`], PLATFORM)).toEqual({ ok: true })
+    })
+    it('error text asks for the top-level digest', () => {
+        const c = checkLoadedDigest(`${TAG}@${PLATFORM}`, [`koenswings/kolibri@${INDEX}`], INDEX)
+        if (!c.ok) expect(c.reason).toMatch(/top-level digest: the index digest if the image has one, otherwise its single manifest digest/)
+    })
     it('mismatch: a different build under the same tag fails', () => {
         expect(checkLoadedDigest(PINNED, [`koenswings/kolibri@${PLATFORM}`], PLATFORM).ok).toBe(false)
     })

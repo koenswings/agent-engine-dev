@@ -11,9 +11,12 @@
  * So: pull by the full ref, tag it as repo:tag, save by repo:tag, and after load verify that the
  * loaded image carries the pinned digest. Tag-only refs behave exactly as before.
  *
- * Platform digests: a pin on a per-platform manifest digest (e.g. the linux/arm64 entry of the
- * index) cannot be resolved offline from a tag-saved tar. The verify step fails with an error that
- * names this case and asks for the index digest (`docker buildx imagetools inspect repo:tag`,
+ * Accepted pins: the TOP-LEVEL digest of the image, i.e. the index digest for a multi-platform
+ * image, or the manifest digest for a single-platform image with no index above it (e.g. the
+ * nextcloud images). Both show up in RepoDigests after a repo:tag load.
+ * Rejected: a per-platform manifest digest that sits inside an index (e.g. the linux/arm64 entry of
+ * the index) cannot be resolved offline from a tag-saved tar. The verify step fails with an error that
+ * names this case and asks for the top-level digest (`docker buildx imagetools inspect repo:tag`,
  * the top-level "Digest:").
  */
 
@@ -92,18 +95,20 @@ export const checkLoadedDigest = (ref: string, repoDigests: string[] | null, ima
         return i !== -1 && d.slice(i + 1) === want && normRepo(d.slice(0, i)) === normRepo(p.repo)
     })
     if (match) return { ok: true }
-    // .Id equal to the pinned digest: meant for the index digest on the containerd store. Still needs a
+    // A single-platform image (no index) pinned by its manifest digest matches above via RepoDigests.
+    // .Id equal to the pinned digest: meant for the top-level digest on the containerd store. Still needs a
     // check on a real Pi: after a --platform save the loaded .Id may be the arm64 manifest digest instead,
     // and a repo:tag@<platform digest> start is known to fail, so RepoDigests stays the primary check (idea#322).
-    // If RepoDigests name this repo under another digest, the pin is not the index: .Id equal to a
-    // per-platform manifest digest never counts as a pass.
+    // If RepoDigests name this repo under another digest, the pin is not the top-level digest: .Id
+    // equal to a per-platform manifest digest inside an index never counts as a pass.
     const repoHasOtherDigest = repoDigests.some(d => { const i = d.lastIndexOf('@'); return i !== -1 && normRepo(d.slice(0, i)) === normRepo(p.repo) })
     if (imageId === want && !repoHasOtherDigest) return { ok: true }
     const have = repoDigests.length ? repoDigests.join(', ') : '(no RepoDigests)'
     return {
         ok: false,
         reason: `Service image ${ref}: the loaded ${name} has digest ${have}${imageId ? ` (id ${imageId})` : ''}, not the pinned ${want}. ` +
-            `Either the saved image is a different build, or the compose pins a per-platform manifest digest instead of the image index digest ` +
+            `Either the saved image is a different build, or the compose pins a per-platform manifest digest from inside an index. ` +
+            `Pin the top-level digest: the index digest if the image has one, otherwise its single manifest digest ` +
             `(use the top-level "Digest:" of \`docker buildx imagetools inspect ${name}\`) (idea#322)`,
     }
 }
