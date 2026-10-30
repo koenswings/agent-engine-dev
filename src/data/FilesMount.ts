@@ -399,6 +399,39 @@ export const remountInstance = async (
     }
 }
 
+/**
+ * Bring one opted-in instance's Files mounts up to date (idea#139 step 9).
+ *
+ * Instance.filesMounts is the set of Files Disks its containers were last
+ * created with. When that set differs from the Files Disks docked now (or was
+ * never written, null), rewrite the override and recreate through
+ * remountInstance: exactly one compose call. When it already matches, do
+ * nothing, so calling this again never recreates the containers again.
+ *
+ * Used where an instance on a disk that just gained, or docked with, the Files
+ * role would otherwise keep containers created without it: startInstance's
+ * "containers already running" shortcut (Add Files on a running App Disk, and
+ * a dock where the containers survived). A held remount is retried through the
+ * grouped schedule.
+ */
+export const reconcileFilesMounts = async (
+    storeHandle: DocHandle<Store>,
+    instanceId: InstanceID,
+): Promise<'unchanged' | 'done' | 'skipped' | 'held' | 'failed'> => {
+    const store = storeHandle.doc()!
+    const instance = store.instanceDB[instanceId]
+    if (!instance) return 'skipped'
+    const app = store.appDB[instance.instanceOf]
+    if (!app?.filesMount) return 'skipped'
+    const want = mountableFilesDisks(store).map(d => String(d.id)).sort()
+    const have = instance.filesMounts ? [...instance.filesMounts].map(String).sort() : null
+    if (have && have.length === want.length && have.every((id, i) => id === want[i])) return 'unchanged'
+    log(`Files mounts of ${instanceId} are out of date (have ${have ? have.join(',') || '(none)' : 'null'}, want ${want.join(',') || '(none)'}): remounting`)
+    const result = await remountInstance(storeHandle, instanceId)
+    if (result === 'held') scheduleFilesRemount(storeHandle)
+    return result
+}
+
 // ── Grouped runtime remount (Q2: FILES_REMOUNT_GROUP_MS) ─────────────────────
 
 interface PendingRemount {
