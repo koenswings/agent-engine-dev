@@ -594,8 +594,9 @@ export type ServiceTarSpec = {
     approxBytes: number
 }
 
-/** Mirrors Engine src/data/Instance.ts serviceImageTarPath (file name part). */
-export const serviceImageTarName = (image: string): string => `${image.replace(/\//g, '_')}.tar`
+/** Engine src/data/ImageRef.ts serviceImageTarName (file name part of serviceImageTarPath; a digest pin maps to repo:tag, idea#322). */
+export { serviceImageTarName } from '../../src/data/ImageRef.js'
+import { serviceImageTarName } from '../../src/data/ImageRef.js'
 
 const tarSpec = (image: string, approxBytes: number): ServiceTarSpec => ({ image, tar: serviceImageTarName(image), approxBytes })
 
