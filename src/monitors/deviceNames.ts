@@ -2,7 +2,7 @@
  * deviceNames.ts — which block device names the USB device monitor handles
  * (agent-engine-dev#228).
  *
- * The udev rule (90-docking.rules) links only sd?, sd?1 and sd?2 into
+ * The udev rule (90-docking.rules) links sd[a-z] and partitions sd[a-z][1-9] into
  * /dev/engine, so USB App Disks are always sd*. The Pi's own system disk is
  * not always sd*: a Pi 5 booting from NVMe has its root on nvme0n1p2 and an
  * SD-booted Pi on mmcblk0p2. Those names must be accepted too, or the system
@@ -19,8 +19,8 @@ export const TEST_DEVICE_PATTERN = /^idea-test-[0-9]+$/
 export const isTestDeviceName = (device: string | undefined | null): boolean =>
     !!device && TEST_DEVICE_PATTERN.test(device)
 
-/** USB partitions handled since the start: sda1, sdb2 (the udev rule's sd?1|sd?2). */
-export const SD_PARTITION_PATTERN = /^sd[a-z][1-2]$/
+/** USB partitions 1-9: sda1 .. sdb9 (the udev rule's sd[a-z][1-9]). */
+export const SD_PARTITION_PATTERN = /^sd[a-z][1-9]$/
 /** USB whole disks (sda): listed as unformatted candidates, never mounted. */
 export const SD_WHOLE_DISK_PATTERN = /^sd[a-z]$/
 /** NVMe partitions (nvme0n1p2). Whole NVMe disks (nvme0n1) are not accepted. */
@@ -64,7 +64,7 @@ export const isSdWholeDisk = (device: string | undefined | null): boolean =>
 export const partitionName = (drive: string, n: number): string =>
     /\d$/.test(drive) ? `${drive}p${n}` : `${drive}${n}`
 
-/** True when the udev rule links this device into /dev/engine (sd?, sd?1, sd?2). */
+/** True when the udev rule links this device into /dev/engine (sd[a-z], sd[a-z][1-9]). */
 export const udevLinksDevice = (device: string): boolean => RULE_DEVICE_PATTERN.test(device)
 
 /**

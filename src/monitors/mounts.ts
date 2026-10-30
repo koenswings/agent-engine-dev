@@ -16,7 +16,7 @@
  *     Disk.unmountError and the startup cleanup.
  *
  * Root commands: mkdir and umount are in 10-engine; the typed ext4 mount and
- * rmdir of /disks/sd[a-z][12] are in 11-engine-files (idea#134). findmnt,
+ * rmdir of /disks/sd[a-z][1-9] are in 11-engine-files (idea#134). findmnt,
  * mountpoint and lsblk need no root. The commands are behind MountOps so tests
  * can inject fakes.
  */
@@ -60,25 +60,25 @@ export interface MountOps {
     rmdir(mountPoint: string): Promise<void>
 }
 
-/** Mount points the 11-engine-files entry `/usr/bin/rmdir /disks/sd[a-z][12]` covers. */
-export const SUDO_RMDIR_PATH = /^\/disks\/sd[a-z][12]$/
+/** Mount points the 11-engine-files entry `/usr/bin/rmdir /disks/sd[a-z][1-9]` covers. */
+export const SUDO_RMDIR_PATH = /^\/disks\/sd[a-z][1-9]$/
 export const SUDO_RMDIR = '/usr/bin/rmdir'
 
 /**
  * Typed ext4 mount (idea#134). Must match exactly the 11-engine-files entry
- * `/usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]` (same args, same order).
+ * `/usr/bin/mount -t ext4 /dev/sd[a-z][1-9] /disks/sd[a-z][1-9]` (same args, same order).
  * Untyped mount removed from 10-engine in idea#143; only umount remains there.
  */
 export const SUDO_MOUNT = '/usr/bin/mount'
-export const SUDO_MOUNT_PATTERN = '/usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]'
-export const SUDO_MOUNT_RO_PATTERN = '/usr/bin/mount -t ext4 -o ro,noload /dev/sd[a-z][12] /disks/sd[a-z][12]'
+export const SUDO_MOUNT_PATTERN = '/usr/bin/mount -t ext4 /dev/sd[a-z][1-9] /disks/sd[a-z][1-9]'
+export const SUDO_MOUNT_RO_PATTERN = '/usr/bin/mount -t ext4 -o ro,noload /dev/sd[a-z][1-9] /disks/sd[a-z][1-9]'
 export const mountExt4ReadOnlyCommand = (device: string, mountPoint: string): string[] =>
     [SUDO_MOUNT, '-t', 'ext4', '-o', 'ro,noload', `/dev/${device}`, mountPoint]
 export const mountExt4Command = (device: string, mountPoint: string): string[] =>
     [SUDO_MOUNT, '-t', 'ext4', `/dev/${device}`, mountPoint]
 
 /**
- * Remove an empty mount point folder. /disks/sd[a-z][12] folders are created
+ * Remove an empty mount point folder. /disks/sd[a-z][1-9] folders are created
  * with sudo under the root-owned /disks, so they are removed with exactly
  * `sudo /usr/bin/rmdir /disks/<device>` (11-engine-files). Other roots (test and
  * fixture roots from IDEA_DISKS_ROOT) are owned by pi and use a plain rmdir.

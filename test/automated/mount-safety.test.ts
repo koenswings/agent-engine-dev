@@ -235,7 +235,7 @@ describe('real mount commands: exact arguments (fake binaries on PATH)', () => {
     // The command of the rmdir rule in 11-engine-files as a regex (sudo glob: [..] classes)
     const rmdirRule = (): RegExp => {
         const rules = fs.readFileSync(SUDOERS_11, 'utf-8').split('\n').filter(l => /^pi\s/.test(l) && l.includes(`${SUDO_RMDIR} `))
-        expect(rules).toEqual(['pi ALL=(root) NOPASSWD: /usr/bin/rmdir /disks/sd[a-z][12]'])
+        expect(rules).toEqual(['pi ALL=(root) NOPASSWD: /usr/bin/rmdir /disks/sd[a-z][1-9]'])
         const glob = rules[0].replace(/^pi ALL=\(root\) NOPASSWD: /, '')
         return new RegExp('^' + glob.split(/(\[[^\]]+\])/).map(p =>
             p.startsWith('[') ? p : p.replace(/[.*+?^${}()|\\/]/g, c => '\\' + c)).join('') + '$')
@@ -248,13 +248,13 @@ describe('real mount commands: exact arguments (fake binaries on PATH)', () => {
         expect(calls[0].slice(1).join(' ')).toMatch(rmdirRule())
     })
 
-    it('only /disks/sd[a-z][12] goes through sudo; the pattern equals the sudoers entry', () => {
+    it('only /disks/sd[a-z][1-9] goes through sudo; the pattern equals the sudoers entry', () => {
         const rule = rmdirRule()
         for (const p of ['/disks/sda1', '/disks/sdb2', '/disks/sdz1']) {
             expect(SUDO_RMDIR_PATH.test(p), p).toBe(true)
             expect(`${SUDO_RMDIR} ${p}`).toMatch(rule)
         }
-        for (const p of ['/disks/sda', '/disks/sda3', '/disks/old', '/disks/sda1/x', '/disks/sda1/', '/tmp/disks/sda1', '/disks/sd*']) {
+        for (const p of ['/disks/sda', '/disks/sda10', '/disks/sda0', '/disks/old', '/disks/sda1/x', '/disks/sda1/', '/tmp/disks/sda1', '/disks/sd*']) {
             expect(SUDO_RMDIR_PATH.test(p), p).toBe(false)
             expect(`${SUDO_RMDIR} ${p}`).not.toMatch(rule)
         }

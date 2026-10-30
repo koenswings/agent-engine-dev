@@ -68,7 +68,7 @@ describe('checkDiskDetection (idea#82)', () => {
     const block = ['sda', 'sda1', 'sda2', 'sdb', 'sdb1', 'sdc3', 'mmcblk0', 'mmcblk0p1', 'loop0']
 
     it('reports nothing when the rule is installed and every covered device has an entry', async () => {
-        const paths = await makeFakeSystem(tmp, block, ['sda', 'sda1', 'sda2', 'sdb', 'sdb1'])
+        const paths = await makeFakeSystem(tmp, block, ['sda', 'sda1', 'sda2', 'sdb', 'sdb1', 'sdc3'])
         expect(checkDiskDetection(paths)).toEqual([])
     })
 
@@ -98,7 +98,7 @@ describe('checkDiskDetection (idea#82)', () => {
 
     it('reports covered sd* devices without a watch-folder entry (the empty /dev/engine case)', async () => {
         const paths = await makeFakeSystem(tmp, block, [])
-        expect(checkDiskDetection(paths)).toEqual([`no ${paths.watchDir} entry for sda, sda1, sda2, sdb, sdb1`])
+        expect(checkDiskDetection(paths)).toEqual([`no ${paths.watchDir} entry for sda, sda1, sda2, sdb, sdb1, sdc3`])
     })
 })
 
