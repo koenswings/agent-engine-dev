@@ -417,7 +417,7 @@ export const skipHardwareId = (): boolean => config.settings.skipHardwareId ?? (
  * diskId / format rewrite) and whether a missing system /META.yaml may NOT be
  * created (idea#168). Unset: follows isDev || testMode (the old gate). Disk META
  * files under a pi-owned IDEA_DISKS_ROOT are written as pi; /META.yaml and
- * /disks/sd[a-z][12]/META.yaml go through the sudoers-allowed tee (writeMetaFile).
+ * /disks/sd[a-z][1-9]/META.yaml go through the sudoers-allowed tee (writeMetaFile).
  * Separate from skipMetaWrite (the FIRST write on a disk without META.yaml).
  */
 export const skipMetaUpdate = (): boolean => config.settings.skipMetaUpdate ?? (config.settings.isDev || config.settings.testMode);

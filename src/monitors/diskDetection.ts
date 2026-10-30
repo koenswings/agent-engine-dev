@@ -29,8 +29,8 @@ export const UDEV_RULE_ASSET = 'script/build_image_assets/90-docking.rules'
 export const ENGINE_WATCH_DIR = '/dev/engine'
 export const SYS_BLOCK_DIR = '/sys/class/block'
 
-// Devices the udev rule links into /dev/engine: KERNEL=="sd?|sd?1|sd?2"
-export const RULE_DEVICE_PATTERN = /^sd[a-z][12]?$/
+// Devices the udev rule links into /dev/engine: whole sd[a-z] and partitions sd[a-z][1-9]
+export const RULE_DEVICE_PATTERN = /^sd[a-z][1-9]?$/
 
 export type DiskDetectionStep = 'selfCheck' | 'monitorStart' | 'watcher' | 'mount' | 'readMeta' | 'writeMeta' | 'dock' | 'undock' | 'files'
 

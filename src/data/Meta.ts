@@ -419,11 +419,11 @@ export const createMeta = async (device: DeviceName, engineVersion: Version | un
  *
  * Mount roots under /disks are root:root, so the Engine (running as pi) cannot
  * create META.yaml there. /etc/sudoers.d/11-engine-files allows exactly
- * `/usr/bin/tee /disks/sd[a-z][12]/META.yaml`; this regex is the same pattern.
+ * `/usr/bin/tee /disks/sd[a-z][1-9]/META.yaml`; this regex is the same pattern.
  * Other roots (test and fixture roots set with IDEA_DISKS_ROOT) are pi-owned and
  * are not covered by that entry, so they are written without sudo.
  */
-export const SUDO_META_PATH = /^\/disks\/sd[a-z][12]\/META\.yaml$/
+export const SUDO_META_PATH = /^\/disks\/sd[a-z][1-9]\/META\.yaml$/
 export const SUDO_TEE = '/usr/bin/tee'
 
 /**
@@ -442,7 +442,7 @@ export const runSudoTee: SudoTeeRunner = async (metaPath, content) => {
  * disk without META.yaml) use this; writeMeta() below logs and swallows errors.
  *
  *   - /META.yaml (system disk): `sudo tee /META.yaml` (10-engine, idea#80)
- *   - /disks/sd[a-z][12]/META.yaml (App Disk mount roots, root:root):
+ *   - /disks/sd[a-z][1-9]/META.yaml (App Disk mount roots, root:root):
  *     `sudo /usr/bin/tee <path>` (11-engine-files, idea#121)
  *   - any other path (test/fixture roots owned by pi): a plain write as pi
  */

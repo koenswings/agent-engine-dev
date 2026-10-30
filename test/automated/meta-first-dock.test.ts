@@ -246,14 +246,14 @@ describe('META.yaml under /disks is written with sudo tee (idea#121)', () => {
     })
 
     it('11-engine-files has exactly the agreed entry, matching SUDO_META_PATH', async (ctx) => {
-        expect(sudoersCommand()).toBe(`${SUDO_TEE} /disks/sd[a-z][12]/META.yaml`)
+        expect(sudoersCommand()).toBe(`${SUDO_TEE} /disks/sd[a-z][1-9]/META.yaml`)
         const rule = globToRegex(sudoersCommand())
-        for (const device of ['sda1', 'sda2', 'sdb1', 'sdz2']) {
+        for (const device of ['sda1', 'sda2', 'sdb1', 'sdb3', 'sdb4', 'sdz2']) {
             const p = `/disks/${device}/META.yaml`
             expect(SUDO_META_PATH.test(p), p).toBe(true)
             expect(`${SUDO_TEE} ${p}`, p).toMatch(rule)
         }
-        for (const p of ['/disks/sda/META.yaml', '/disks/sda3/META.yaml', '/disks/old/sda1/META.yaml',
+        for (const p of ['/disks/sda/META.yaml', '/disks/sda10/META.yaml', '/disks/sda0/META.yaml', '/disks/old/sda1/META.yaml',
                          '/disks/sda1/META.yaml.bak', '/disks/sda1/x/META.yaml', '/tmp/disks/sda1/META.yaml']) {
             expect(SUDO_META_PATH.test(p), p).toBe(false)
             expect(`${SUDO_TEE} ${p}`, p).not.toMatch(rule)

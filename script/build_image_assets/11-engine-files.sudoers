@@ -35,23 +35,30 @@
 # createFilesDisk runs `sudo /usr/bin/chown -h pi:pi /disks/<device>`: the disk root
 # folder only, not recursive (no -R), and -h changes a symlink itself, never what it
 # points to. The ':' is escaped as '\:' because it is special in sudoers.
-# Patterns are narrow on purpose (sd[a-z][12], never /disks/*): in sudoers a '*' in
+# Patterns are narrow on purpose (sd[a-z][1-9], never /disks/*): in sudoers a '*' in
 # arguments also matches spaces, '/' and '..'. tee without -a truncates the file.
 # In the stick mount lines ',' and '=' inside -o are escaped as '\,' and '\=' (sudoers
 # special characters); sudo matches them as plain ',' and '='.
 # Paths are for Raspberry Pi OS (merged /usr).
-pi ALL=(root) NOPASSWD: /usr/bin/tee /disks/sd[a-z][12]/META.yaml
-pi ALL=(root) NOPASSWD: /usr/bin/rmdir /disks/sd[a-z][12]
-pi ALL=(root) NOPASSWD: /usr/bin/chown -h pi\:pi /disks/sd[a-z][12]
+pi ALL=(root) NOPASSWD: /usr/bin/tee /disks/sd[a-z][1-9]/META.yaml
+pi ALL=(root) NOPASSWD: /usr/bin/rmdir /disks/sd[a-z][1-9]
+pi ALL=(root) NOPASSWD: /usr/bin/chown -h pi\:pi /disks/sd[a-z][1-9]
 pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-erase-disk
 # idea#201 §10: client-card flash helper (validates every argument itself)
 pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-flash-card
 pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-app-data
-pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]
-pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 -o ro\,noload /dev/sd[a-z][12] /disks/sd[a-z][12]
+pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 /dev/sd[a-z][1-9] /disks/sd[a-z][1-9]
+pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 -o ro\,noload /dev/sd[a-z][1-9] /disks/sd[a-z][1-9]
 pi ALL=(root) NOPASSWD: /usr/bin/mount -t vfat -o ro\,nosuid\,nodev\,noexec\,uid\=1000\,gid\=1000\,fmask\=0222\,dmask\=0222\,iocharset\=utf8\,shortname\=mixed /dev/sd[a-z][12] /run/idea-usb/sd[a-z][12]
 pi ALL=(root) NOPASSWD: /usr/bin/mount -t vfat -o ro\,nosuid\,nodev\,noexec\,uid\=1000\,gid\=1000\,fmask\=0222\,dmask\=0222\,iocharset\=utf8\,shortname\=mixed /dev/sd[a-z] /run/idea-usb/sd[a-z]
 pi ALL=(root) NOPASSWD: /usr/bin/mount -t exfat -o ro\,nosuid\,nodev\,noexec\,uid\=1000\,gid\=1000\,fmask\=0222\,dmask\=0222\,iocharset\=utf8 /dev/sd[a-z][12] /run/idea-usb/sd[a-z][12]
 pi ALL=(root) NOPASSWD: /usr/bin/mount -t exfat -o ro\,nosuid\,nodev\,noexec\,uid\=1000\,gid\=1000\,fmask\=0222\,dmask\=0222\,iocharset\=utf8 /dev/sd[a-z] /run/idea-usb/sd[a-z]
 pi ALL=(root) NOPASSWD: /usr/bin/umount /run/idea-usb/sd[a-z][12], /usr/bin/umount /run/idea-usb/sd[a-z]
 pi ALL=(root) NOPASSWD: /usr/bin/umount -l /run/idea-usb/sd[a-z][12], /usr/bin/umount -l /run/idea-usb/sd[a-z]
+# idea#76 fixture / partitions 3+: 10-engine.sudoers covers only sd[a-z][12] and is
+# not edited, so the same mount-point and serial commands for partitions 3-9 live here.
+pi ALL=(root) NOPASSWD: /usr/bin/umount /disks/sd[a-z][3-9]
+pi ALL=(root) NOPASSWD: /usr/bin/mkdir -p /disks/sd[a-z][3-9]
+pi ALL=(root) NOPASSWD: /usr/bin/mv /disks/sd[a-z][3-9] /disks/old/sd[a-z][3-9]
+pi ALL=(root) NOPASSWD: /usr/bin/rm -fr /disks/sd[a-z][3-9]
+pi ALL=(root) NOPASSWD: /usr/sbin/hdparm -I /dev/sd[a-z][3-9]

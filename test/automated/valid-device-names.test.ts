@@ -32,8 +32,9 @@ describe('isValidDeviceName: sd* unchanged', () => {
             expect(isValidDeviceName(d), d).toBe(true)
         }
     })
-    it('still rejects sd partitions 3+ and malformed sd names', () => {
-        for (const d of ['sda3', 'sdb9', 'sda0', 'sdaa', 'sdaa1', 'sd', 'sd1', 'sda12', 'xsda1', 'sda1 ', 'sda\nsda1']) {
+    it('accepts sd partitions 3-9 (idea#76 fixture), rejects 0, 10+ and malformed sd names', () => {
+        for (const d of ['sda3', 'sdb4', 'sdb9']) expect(isValidDeviceName(d), d).toBe(true)
+        for (const d of ['sda0', 'sdaa', 'sdaa1', 'sd', 'sd1', 'sda12', 'xsda1', 'sda1 ', 'sda\nsda1']) {
             expect(isValidDeviceName(d), JSON.stringify(d)).toBe(false)
         }
     })
@@ -78,11 +79,12 @@ describe('isValidDeviceName: detected root device', () => {
         expect(isValidDeviceName('mmcblk0p2', { systemDevice: 'mmcblk0p2' })).toBe(true)
         expect(isValidDeviceName('sda2', { systemDevice: 'sda2' })).toBe(true)
         expect(isValidDeviceName('sda3', { systemDevice: 'sda3' })).toBe(true)
-        expect(isValidDeviceName('sda3', { systemDevice: 'sda2' })).toBe(false)
+        expect(isValidDeviceName('loop3', { systemDevice: 'nvme0n1p2' })).toBe(false)
     })
     it('no root device (container, overlay) changes nothing', () => {
         expect(isValidDeviceName('sda1', { systemDevice: null })).toBe(true)
-        expect(isValidDeviceName('sda3', { systemDevice: null })).toBe(false)
+        expect(isValidDeviceName('sda3', { systemDevice: null })).toBe(true)
+        expect(isValidDeviceName('sda10', { systemDevice: null })).toBe(false)
     })
 })
 
@@ -118,9 +120,15 @@ describe('partition and parent-disk names', () => {
 })
 
 describe('direct registration of a root device without a udev link', () => {
-    it('the udev rule links only sd?, sd?1, sd?2', () => {
-        for (const d of ['sda', 'sda1', 'sda2']) expect(udevLinksDevice(d), d).toBe(true)
-        for (const d of ['sda3', 'nvme0n1p2', 'mmcblk0p2']) expect(udevLinksDevice(d), d).toBe(false)
+    it('the udev rule links sd[a-z] and partitions sd[a-z][1-9] only', () => {
+        for (const d of ['sda', 'sda1', 'sda2', 'sdb3', 'sdb4', 'sdz9']) expect(udevLinksDevice(d), d).toBe(true)
+        for (const d of ['sda0', 'sda10', 'sdaa', 'sdaa1', 'nvme0n1', 'nvme0n1p2', 'mmcblk0', 'mmcblk0p2', 'loop0', 'zram0']) expect(udevLinksDevice(d), d).toBe(false)
+    })
+    it('partitions 3+ are valid device names (idea#76 fixture)', () => {
+        for (const d of ['sdb3', 'sdb4', 'sdc9']) expect(isValidDeviceName(d), d).toBe(true)
+        expect(isValidDeviceName('sdb10')).toBe(false)
+        expect(driveNameOf('sdb4')).toBe('sdb')
+        expect(partitionName('sdb', 4)).toBe('sdb4')
     })
     it('nvme / mmcblk root is registered directly', () => {
         expect(needsDirectSystemAdd('nvme0n1p2', { systemDiskSkip: false, linkExists: false })).toBe(true)
@@ -192,5 +200,29 @@ describe('boot.sh grows the root partition, not a fixed /dev/sda (agent-engine-d
         expect(boot.indexOf('\ngrow_root_partition >>')).toBeGreaterThan(boot.indexOf('# This part runs on every boot'))
         expect(boot).not.toMatch(/growpart \/dev\/sda/)
         expect(boot).not.toMatch(/resize2fs \/dev\/sda2/)
+    })
+})
+
+describe('90-docking.rules text (idea#76 fixture: partitions 3+)', () => {
+    const rules = fs.readFileSync(path.resolve('script/build_image_assets/90-docking.rules'), 'utf8')
+        .split('\n').filter(l => l.trim() && !l.trimStart().startsWith('#'))
+    // udev KERNEL globs -> regex ([...] classes and ? / * only)
+    const globRe = (g: string) => new RegExp('^' + g.replace(/\?/g, '.').replace(/\*/g, '.*') + '$')
+    const kernelGlobs = rules.map(l => /KERNEL=="([^"]+)"/.exec(l)![1])
+    const ruleMatches = (dev: string) => kernelGlobs.filter(g => g.split('|').some(alt => globRe(alt).test(dev))).length
+    it('has one whole-disk rule and one separate partition rule', () => {
+        expect(rules).toHaveLength(2)
+        expect(rules[0]).toContain('ENV{DEVTYPE}=="disk"')
+        expect(rules[1]).toContain('ENV{DEVTYPE}=="partition"')
+        for (const r of rules) expect(r).toContain('SYMLINK+="engine/%k"')
+    })
+    it('every node matches at most once, and the rule agrees with RULE_DEVICE_PATTERN', () => {
+        const names = ['sda', 'sda1', 'sda2', 'sdb3', 'sdb4', 'sdz9', 'sda0', 'sda10', 'sdaa', 'sdaa1', 'nvme0n1', 'nvme0n1p1', 'nvme0n1p2', 'mmcblk0', 'mmcblk0p1', 'mmcblk0p2', 'mmcblk0boot0', 'loop0', 'zram0']
+        for (const d of names) {
+            const n = ruleMatches(d)
+            expect(n, d).toBeLessThanOrEqual(1)
+            expect(n === 1, d).toBe(udevLinksDevice(d))
+        }
+        for (const d of ['nvme0n1', 'nvme0n1p2', 'mmcblk0', 'mmcblk0p2']) expect(ruleMatches(d), d).toBe(0)
     })
 })
