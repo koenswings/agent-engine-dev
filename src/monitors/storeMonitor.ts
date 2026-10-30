@@ -132,6 +132,12 @@ export const enableStoreMonitor = (storeHandle: DocHandle<Store>, commandLogHand
         for (const patch of patches) {
             applyUntilTrue([engineSetMonitor, engineCommandsMonitor, engineLastRunMonitor, instancesMonitor], patch, storeHandle)
         }
+        // idea#76 gap 1: a disk docked/undocked anywhere, or its appBundles changed: recompute update hints
+        if (patches.some(p => p.path[0] === 'diskDB')) {
+            import('../data/UpdateApp.js').then(m => {
+                if (patches.some(p => m.patchTouchesBundles(p as any))) m.scheduleHintRefresh(storeHandle, String(localEngineId))
+            }).catch(e => log(`update hint trigger failed: ${e}`))
+        }
     })
 
     // Inject commandLogHandle into the monitor closure so engineCommandsMonitor

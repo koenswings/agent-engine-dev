@@ -144,6 +144,8 @@ Refusal codes (start of the error text): `NOT_FOUND`, `AMBIGUOUS`, `NOT_DOCKED`,
 
 `Instance.updateAvailable`: `{appId, sourceDiskId?, sourceEngineId?, fromVersion?, toVersion?, major?, estimatedMinutes?, sizeBytes?, migrationNote?}` or null. Filled at dock time, cheaply: a newer `apps/<name>-<version>/` of the same App on a disk docked to this Engine whose `SHA256SUMS` exists and lists `compose.yaml` (the file is read, not verified; the highest version wins). The full `SHA256SUMS` check runs at update start (`NO_SUMS`).
 
+`Disk.appBundles` (idea#76 gap 1): `[{appId, version, sumsListed, sizeBytes, updatesFrom?, healthTimeout?, migrationNote?}]`, or null/missing when unknown (readers then fall back to the `--source` disk). Written only by the Engine the disk is docked to, on dock and only when the list changes; cleared on undock. Other Engines use it for the hint: a bundle with `sumsListed` true on a disk docked to an Engine that advertises `updateAppFetch` is offered with that Engine as `sourceEngineId`, and `sizeBytes` plus transfer time is added to the estimate. Hints are refreshed on any change to a disk's `dockedTo` or `appBundles`; a hint on an instance whose disk is docked nowhere is cleared.
+
 ### `createBackupDisk`
 - **Description:** Writes a BACKUP.yaml configuration onto a docked disk, turning it into a Backup Disk. Specify the mode (`immediate`, `on-demand`, or `scheduled`) and one or more instance names to link.
 - **Usage:** `createBackupDisk <diskId> <mode> <instanceName...>` (idea#128; the argument was `diskName`). The disk is resolved by the shared disk resolver (see [Disk arguments](#disk-arguments)). An unknown, undocked, remote or ambiguous disk, a bad mode or a missing store ends the command trace as `error` with the reason.
