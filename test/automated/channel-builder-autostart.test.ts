@@ -161,6 +161,9 @@ describe('idea#193 §8.2a channel builder auto-start', () => {
 
     it('startInstance runs the usb sync once the App is Running (instance-start hook)', async () => {
         const src = await fs.readFile(path.join(process.cwd(), 'src/data/Instance.ts'), 'utf-8')
-        expect(src).toMatch(/usbMount\?\.sync\)[\s\S]{0,200}syncUsbApps\(storeHandle, 'start', true, instance\.id\)/)
+        // idea#392 (#298): the usbMount.sync check moved into instanceUsbSync() (InstanceApp.ts)
+        expect(src).toMatch(/if \(await instanceUsbSync\(storeHandle\.doc\(\), instance\)\)[\s\S]{0,200}syncUsbApps\(storeHandle, 'start', true, instance\.id\)/)
+        const appSrc = await fs.readFile(path.join(process.cwd(), 'src/data/InstanceApp.ts'), 'utf-8')
+        expect(appSrc).toMatch(/export const instanceUsbSync = [\s\S]{0,300}\.usbMount\?\.sync/)
     })
 })
