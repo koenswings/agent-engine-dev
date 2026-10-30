@@ -276,6 +276,8 @@ export interface Instance {
   filesMounts?: DiskID[] | null;
   /** A newer, offerable bundle of this App on a docked disk (agent-engine-dev#230, console#168 shape); null when none. */
   updateAvailable?: UpdateAvailable | null;
+  /** App ID before the last successful updateApp ("Updated from 0.15.5", idea#76); null/absent otherwise. */
+  previousAppId?: AppID | null;
 }
 
 export interface UpdateAvailable {

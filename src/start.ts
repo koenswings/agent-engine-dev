@@ -150,6 +150,9 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     await import('./data/UpdateApp.js').then(m => m.recoverInterruptedUpdates(storeHandle, String(localEngineId)))
         .then(r => r.forEach(line => log(`recoverInterruptedUpdates: ${line}`)))
         .catch(e => log(`recoverInterruptedUpdates failed: ${e}`))
+    // idea#76: recompute updateAvailable at boot (stale hints from before the restart go)
+    await import('./data/UpdateApp.js').then(m => m.refreshUpdateAvailable(storeHandle, String(localEngineId)))
+        .catch(e => log(`updateAvailable refresh at boot failed: ${e}`))
 
     // Crash recovery: retry idempotent interrupted ops; mark others Failed
     await recoverInterruptedOperations(storeHandle, {
