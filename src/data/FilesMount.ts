@@ -421,7 +421,7 @@ export const reconcileFilesMounts = async (
     const store = storeHandle.doc()!
     const instance = store.instanceDB[instanceId]
     if (!instance) return 'skipped'
-    const app = store.appDB[instance.instanceOf]
+    const app = await resolveInstanceApp(store, instance)
     if (!app?.filesMount) return 'skipped'
     const want = mountableFilesDisks(store).map(d => String(d.id)).sort()
     const have = instance.filesMounts ? [...instance.filesMounts].map(String).sort() : null
