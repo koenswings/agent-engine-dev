@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { isUnversioned, parseVersion, compareVersions, isUpgrade, isMajorChange } from '../../src/data/Version.js'
 import { offerable, checkUpdate, CheckFacts } from '../../src/data/UpdateAppPolicy.js'
+import { splitAppId } from '../../src/data/AppIdParse.js'
 import { RE_TOKEN } from '../../src/data/UpdateFetch.js'
 import { isMajorUpgrade, extractMajorVersion } from '../../src/data/App.js'
 
@@ -38,24 +39,27 @@ describe('Version (idea#76)', () => {
         expect(isUpgrade('zimbabwe-2026-10-20', '1.0')).toBe(true)
         expect(isUpgrade('1.0', '1.1')).toBe(true)
         expect(isUpgrade('1.1', '1.0')).toBe(false)
-        expect(isMajorChange('5d02788', '2.0')).toBe(false)
+        expect(isMajorChange('5d02788', '2.0')).toBe(true)
+        expect(isMajorChange('5d02788', '1.1-0.19.5')).toBe(true)
+        expect(isMajorChange('1.0', '5d02788')).toBe(false)
         expect(isMajorChange('1.4', '2.0')).toBe(true)
     })
     it('policy: offerable and checkUpdate follow the rule', () => {
         expect(offerable({ currentAppId: 'kolibri-1.0', newAppId: 'kolibri-zimbabwe-2026-10-20', sumsValid: true })).toBe(false)
         expect(offerable({ currentAppId: 'kolibri-5d02788', newAppId: 'kolibri-1.1', sumsValid: true })).toBe(true)
         expect(offerable({ currentAppId: 'kolibri@zimbabwe-2026-10-20', newAppId: 'kolibri-1.0', sumsValid: true })).toBe(true)
-        // Known gap (idea#76, see PR body): splitAppId reads the folder form as name 'kolibri-zimbabwe', so it is DIFFERENT_APP
-        expect(offerable({ currentAppId: 'kolibri-zimbabwe-2026-10-20', newAppId: 'kolibri-1.0', sumsValid: true })).toBe(false)
+        expect(offerable({ currentAppId: 'kolibri-zimbabwe-2026-10-20', newAppId: 'kolibri-1.0', sumsValid: true })).toBe(true)
         const f: CheckFacts = { diskDocked: true, busy: false, currentAppId: 'kolibri-5d02788', newAppId: 'kolibri-1.1',
             sourcePresent: true, sumsValid: true, allowMajor: false, backupAgeMs: null, shortDisks: [] }
-        expect(checkUpdate(f)).toBeNull()
+        expect(checkUpdate(f)?.code).toBe('MAJOR_NOT_ALLOWED')
+        expect(checkUpdate({ ...f, allowMajor: true })?.code).toBe('NEEDS_BACKUP')
+        expect(checkUpdate({ ...f, allowMajor: true, backupAgeMs: 60_000 })).toBeNull()
         expect(checkUpdate({ ...f, currentAppId: 'kolibri-1.1', newAppId: 'kolibri-8abcdef' })?.code).toBe('NOT_NEWER')
     })
     it('App.ts major helpers use the same rule', () => {
         expect(isMajorUpgrade('sample-1.0' as any, 'sample-2.0' as any)).toBe(true)
         expect(isMajorUpgrade('sample-1.0' as any, 'sample-1.1' as any)).toBe(false)
-        expect(isMajorUpgrade('sample-5d02788' as any, 'sample-1.0' as any)).toBe(false)
+        expect(isMajorUpgrade('sample-5d02788' as any, 'sample-1.0' as any)).toBe(true)
         expect(Number.isNaN(extractMajorVersion('sample-8abcdef' as any))).toBe(true)
     })
     it('kit App Disks on SHA versions are offered tagged releases (agent-app-dev#36)', () => {
@@ -72,5 +76,20 @@ describe('Version (idea#76)', () => {
         expect(offerable({ currentAppId: 'kolibri-5ab9f64', newAppId: 'kolibri-0.0-dev+5ab9f64c1d2e', sumsValid: true })).toBe(false)
         expect(RE_TOKEN.test('kolibri-0.0-dev+5ab9f64c1d2e')).toBe(false)
         expect(RE_TOKEN.test('kolibri-1.1-0.19.5')).toBe(true)
+    })
+    it('splitAppId keeps a trailing date or SHA out of the app name (idea#76)', () => {
+        const cases: [string, string, string][] = [
+            ['kolibri-zimbabwe-2026-10-20', 'kolibri', 'zimbabwe-2026-10-20'],
+            ['kolibri-zimbabwe-2026.10.20', 'kolibri', 'zimbabwe-2026.10.20'],
+            ['kolibri-zimbabwe-2026_10_20', 'kolibri', 'zimbabwe-2026_10_20'],
+            ['kolibri-2026-10-20', 'kolibri', '2026-10-20'],
+            ['kolibri-5ab9f64', 'kolibri', '5ab9f64'],
+            ['nextcloud-b8ad438', 'nextcloud', 'b8ad438'],
+            ['kolibri-channel-builder-2551b7d', 'kolibri-channel-builder', '2551b7d'],
+            ['kolibri-channel-builder-g2551b7d', 'kolibri-channel-builder', 'g2551b7d'],
+            ['nextcloud-1.0-31.0.1', 'nextcloud', '1.0-31.0.1'],
+            ['kolibri-1.1-0.19.5', 'kolibri', '1.1-0.19.5'],
+        ]
+        for (const [id, name, version] of cases) expect(splitAppId(id), id).toEqual({ name, version })
     })
 })

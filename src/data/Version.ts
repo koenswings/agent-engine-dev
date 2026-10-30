@@ -60,9 +60,10 @@ export const isUpgrade = (from: string, to: string): boolean => {
     return c !== null && c > 0
 }
 
-/** True when from -> to crosses a major version. From an unversioned version: false (no major to compare). */
+/** True when from -> to crosses a major version. Unversioned -> a proper tag is always major (idea#76): --allow-major and a fresh backup. */
 export const isMajorChange = (from: string, to: string): boolean => {
     const x = parseVersion(from), y = parseVersion(to)
-    if (!x || !y) return false
+    if (!y) return false
+    if (!x) return true
     return (x[0] ?? 0) !== (y[0] ?? 0)
 }
