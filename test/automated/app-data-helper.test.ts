@@ -110,6 +110,9 @@ describe('helper argv builders', () => {
     })
 
     it('refuse paths, option-looking tokens and bad archives/strips before anything runs', () => {
+        for (const d of ['sdb3', 'sdb4', 'sdz9']) expect(sizeArgs(d, 'inst-1')).toEqual(['size', d, 'inst-1'])
+        expect(APP_DATA_HELPER_VERSION).toBe('6')
+        for (const d of ['sdb3', 'sdb9']) expect(() => eraseSlotArgs(d, '/tmp/x')).toThrow(/not a test slot name/)
         expect(() => sizeArgs('/disks/sdb1', 'x')).toThrow(/not a disk root/)
         expect(() => sizeArgs('..', 'x')).toThrow(/not a disk root/)
         expect(() => sizeArgs('sdb1', '../etc')).toThrow(/not an instance id/)
