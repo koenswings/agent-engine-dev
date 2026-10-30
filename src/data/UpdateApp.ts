@@ -38,7 +38,7 @@ import { createOperation, updateOperation } from './Operations.js'
 import { log } from '../utils/utils.js'
 import {
     UpdateAppError, UpdateStep, UPDATE_STEPS, checkUpdate, healthGate, healthTimeoutSeconds, rollbackPlan,
-    HealthSample, ContainerHealth, offerable, compareVersions, parseVersion,
+    HealthSample, ContainerHealth, offerable, compareVersions, isMajorChange,
 } from './UpdateAppPolicy.js'
 import { parseAppId } from './App.js'
 import { setComposeInstanceName } from './InstanceCopy.js'
@@ -451,7 +451,7 @@ export const refreshUpdateAvailable = async (storeHandle: DocHandle<Store>, engi
         const from = parseAppId(String(inst.instanceOf)).version, to = parseAppId(best.appId).version
         updates[String(inst.id)] = {
             appId: best.appId as AppID, sourceDiskId: best.disk.id as DiskID, sourceEngineId: engineId as any,
-            fromVersion: from, toVersion: to, major: (parseVersion(to)?.[0] ?? 0) !== (parseVersion(from)?.[0] ?? 0),
+            fromVersion: from, toVersion: to, major: isMajorChange(from, to),
         }
     }
     storeHandle.change(doc => {

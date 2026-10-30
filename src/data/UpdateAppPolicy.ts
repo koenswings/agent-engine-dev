@@ -12,6 +12,7 @@
  *  - An App without valid SHA256SUMS is never offered an update (NO_SUMS).
  */
 import { parseAppId } from './App.js'
+import { isUpgrade, isMajorChange } from './Version.js'
 
 export type UpdateStep = 'Fetch' | 'Check' | 'Snapshot' | 'Swap' | 'Start' | 'Health'
 export const UPDATE_STEPS: readonly UpdateStep[] = ['Fetch', 'Check', 'Snapshot', 'Swap', 'Start', 'Health']
@@ -31,22 +32,8 @@ export class UpdateAppError extends Error {
     }
 }
 
-/** Numeric version parts from "1.2.3", "v1.2", or tool output like "kolibri, version 0.19.5"; null if none. */
-export const parseVersion = (raw: string | null | undefined): number[] | null => {
-    const m = String(raw ?? '').match(/(\d+(?:\.\d+)*)/)
-    return m ? m[1].split('.').map(n => Number(n)) : null
-}
-
-/** <0, 0, >0 like a comparator; null when either side can't be read. */
-export const compareVersions = (a: string, b: string): number | null => {
-    const x = parseVersion(a), y = parseVersion(b)
-    if (!x || !y) return null
-    for (let i = 0; i < Math.max(x.length, y.length); i++) {
-        const d = (x[i] ?? 0) - (y[i] ?? 0)
-        if (d !== 0) return d
-    }
-    return 0
-}
+/** Version rules live in Version.ts (idea#76); re-exported for existing callers. */
+export { parseVersion, compareVersions, isUnversioned, isUpgrade, isMajorChange } from './Version.js'
 
 const DEFAULT_HEALTH_TIMEOUT_S = 600
 const HEALTH_TIMEOUT_S: Record<string, number> = { kolibri: 900, nextcloud: 300 }
@@ -82,9 +69,8 @@ export const checkUpdate = (f: CheckFacts): UpdateAppError | null => {
     if (!f.sumsValid) return new UpdateAppError('NO_SUMS', `bundle ${f.newAppId} has no valid SHA256SUMS`)
     const cur = parseAppId(f.currentAppId), nxt = parseAppId(f.newAppId)
     if (cur.name !== nxt.name) return new UpdateAppError('DIFFERENT_APP', `${f.newAppId} is not a version of ${cur.name}`)
-    const cmp = compareVersions(nxt.version, cur.version)
-    if (cmp === null || cmp <= 0) return new UpdateAppError('NOT_NEWER', `${nxt.version} is not newer than ${cur.version}`)
-    const major = (parseVersion(nxt.version)![0] ?? 0) !== (parseVersion(cur.version)![0] ?? 0)
+    if (!isUpgrade(cur.version, nxt.version)) return new UpdateAppError('NOT_NEWER', `${nxt.version} is not newer than ${cur.version}`)
+    const major = isMajorChange(cur.version, nxt.version)
     if (major && !f.allowMajor) return new UpdateAppError('MAJOR_NOT_ALLOWED', `${cur.version} -> ${nxt.version} is a major update; pass --allow-major`)
     if (major && (f.backupAgeMs === null || f.backupAgeMs > BACKUP_MAX_AGE_MS)) return new UpdateAppError('NEEDS_BACKUP', 'Dock a Backup Disk and make a backup first')
     if (f.shortDisks.length) return new UpdateAppError('NO_SPACE', `not enough free space on ${f.shortDisks.join(', ')}`)
@@ -96,8 +82,7 @@ export const offerable = (f: Pick<CheckFacts, 'currentAppId' | 'newAppId' | 'sum
     if (!f.sumsValid) return false
     const cur = parseAppId(f.currentAppId), nxt = parseAppId(f.newAppId)
     if (cur.name !== nxt.name) return false
-    const cmp = compareVersions(nxt.version, cur.version)
-    return cmp !== null && cmp > 0
+    return isUpgrade(cur.version, nxt.version)
 }
 
 export type ContainerHealth = 'starting' | 'healthy' | 'unhealthy' | 'none' | 'exited' | 'restarting'

@@ -38,7 +38,8 @@ export const THERMAL_RESUME_C = 65
 export const THERMAL_POLL_MS = 10_000
 /** No answer from the source Engine within this time: TRANSFER_FAILED. */
 export const FETCH_TIMEOUT_MS = 6 * 60 * 60 * 1000
-const RE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+/** App ids and request tokens accepted for a cross-Engine Fetch; rejects `+`, so dev bundles `0.0-dev+<sha12>` never travel (agent-app-dev#36). */
+export const RE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 
 /** True when apps/<appId>/ is a Fetch still in progress (or aborted): dock and listing skip it. */
 export const isUnfinishedFetch = async (bundleDir: string): Promise<boolean> =>
