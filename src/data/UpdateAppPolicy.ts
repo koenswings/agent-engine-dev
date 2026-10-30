@@ -12,7 +12,7 @@
  *  - An App without valid SHA256SUMS is never offered an update (NO_SUMS).
  */
 import { parseAppId } from './App.js'
-import { isUpgrade, isMajorChange } from './Version.js'
+import { isUpgrade, isMajorChange, parseVersion } from './Version.js'
 
 export type UpdateStep = 'Fetch' | 'Check' | 'Snapshot' | 'Swap' | 'Start' | 'Health'
 export const UPDATE_STEPS: readonly UpdateStep[] = ['Fetch', 'Check', 'Snapshot', 'Swap', 'Start', 'Health']
@@ -57,6 +57,20 @@ export interface CheckFacts {
     backupAgeMs: number | null
     /** disks that lack space (name), empty when all fit */
     shortDisks: string[]
+    /** x-app.updatesFrom of the NEW bundle (idea#76); absent = no extra rule */
+    updatesFrom?: unknown
+}
+
+/**
+ * x-app.updatesFrom (idea#76, idea#351 §4.4): when the new bundle declares it, a major update is
+ * only allowed from a listed major. Absent or not a list: no extra rule. An unversioned current
+ * version (kit SHA/date, #301) has no major and is not restricted by it.
+ */
+export const majorAllowedByUpdatesFrom = (fromVersion: string, updatesFrom: unknown): boolean => {
+    if (!Array.isArray(updatesFrom)) return true
+    const x = parseVersion(fromVersion)
+    if (!x) return true
+    return updatesFrom.some(m => Number(m) === (x[0] ?? 0))
 }
 
 export const BACKUP_MAX_AGE_MS = 60 * 60 * 1000
@@ -72,18 +86,38 @@ export const checkUpdate = (f: CheckFacts): UpdateAppError | null => {
     if (!isUpgrade(cur.version, nxt.version)) return new UpdateAppError('NOT_NEWER', `${nxt.version} is not newer than ${cur.version}`)
     const major = isMajorChange(cur.version, nxt.version)
     if (major && !f.allowMajor) return new UpdateAppError('MAJOR_NOT_ALLOWED', `${cur.version} -> ${nxt.version} is a major update; pass --allow-major`)
+    if (major && !majorAllowedByUpdatesFrom(cur.version, f.updatesFrom)) return new UpdateAppError('MAJOR_NOT_ALLOWED', `version ${nxt.version} cannot update directly from major ${parseVersion(cur.version)?.[0]}; supported: ${(f.updatesFrom as unknown[]).join(', ') || 'none'}`)
     if (major && (f.backupAgeMs === null || f.backupAgeMs > BACKUP_MAX_AGE_MS)) return new UpdateAppError('NEEDS_BACKUP', 'Dock a Backup Disk and make a backup first')
     if (f.shortDisks.length) return new UpdateAppError('NO_SPACE', `not enough free space on ${f.shortDisks.join(', ')}`)
     return null
 }
 
 /** True when the App may be offered an update at all (updateAvailable). */
-export const offerable = (f: Pick<CheckFacts, 'currentAppId' | 'newAppId' | 'sumsValid'>): boolean => {
+export const offerable = (f: Pick<CheckFacts, 'currentAppId' | 'newAppId' | 'sumsValid' | 'updatesFrom'>): boolean => {
     if (!f.sumsValid) return false
     const cur = parseAppId(f.currentAppId), nxt = parseAppId(f.newAppId)
     if (cur.name !== nxt.name) return false
-    return isUpgrade(cur.version, nxt.version)
+    if (!isUpgrade(cur.version, nxt.version)) return false
+    return !isMajorChange(cur.version, nxt.version) || majorAllowedByUpdatesFrom(cur.version, f.updatesFrom)
 }
+
+/** x-app.healthCheck {path, expect?} (idea#351 §4.3); null when absent or malformed. */
+export const parseHealthCheck = (v: unknown): { path: string, expect?: string } | null => {
+    if (!v || typeof v !== 'object') return null
+    const p = (v as any).path, e = (v as any).expect
+    if (typeof p !== 'string' || !p.startsWith('/')) return null
+    return typeof e === 'string' && e.length ? { path: p, expect: e } : { path: p }
+}
+
+/** A probe answer passes on 2xx/3xx and, when `expect` is given, a body containing it. */
+export const healthBodyOk = (r: { status: number, body: string } | null, expect?: string): boolean =>
+    !!r && r.status >= 200 && r.status < 400 && (!expect || r.body.includes(expect))
+
+/** Rough snapshot copy rate until Kid's measured timings (idea#351 §10.1). */
+export const SNAPSHOT_BYTES_PER_MIN = 1024 ** 3
+/** estimatedMinutes = snapshot copy estimate + health timeout (same-Engine source: no transfer). */
+export const estimateUpdateMinutes = (dataBytes: number, healthTimeoutS: number): number =>
+    Math.max(1, Math.ceil(dataBytes / SNAPSHOT_BYTES_PER_MIN + healthTimeoutS / 60))
 
 export type ContainerHealth = 'starting' | 'healthy' | 'unhealthy' | 'none' | 'exited' | 'restarting'
 export interface HealthSample { state: ContainerHealth; restartCount: number; elapsedMs: number; bodyOk?: boolean }

@@ -38,6 +38,7 @@ import { createOperation, updateOperation } from './Operations.js'
 import { log } from '../utils/utils.js'
 import {
     UpdateAppError, UpdateStep, UPDATE_STEPS, checkUpdate, healthGate, healthTimeoutSeconds, rollbackPlan,
+    parseHealthCheck, healthBodyOk, estimateUpdateMinutes,
     HealthSample, ContainerHealth, offerable, compareVersions, isMajorChange,
 } from './UpdateAppPolicy.js'
 import { parseAppId } from './App.js'
@@ -87,6 +88,8 @@ export interface UpdateDeps {
     reread: (disk: Disk, id: InstanceID) => Promise<void>
     start: (inst: Instance, disk: Disk) => Promise<void>
     health: (id: InstanceID) => Promise<Omit<HealthSample, 'elapsedMs'>>
+    /** GET an x-app.healthCheck URL (idea#76); null when it does not answer */
+    probe: (url: string) => Promise<{ status: number, body: string } | null>
     broadcast: (msg: UpdateProgress) => void
     now: () => number
     sleep: (ms: number) => Promise<void>
@@ -152,6 +155,12 @@ export const defaultUpdateDeps = (storeHandle: DocHandle<Store>): UpdateDeps => 
         const info = JSON.parse(await docker(['inspect', ...ids])) as any[]
         return aggregateHealth(info.map(c => ({ status: c?.State?.Status, health: c?.State?.Health?.Status, exitCode: c?.State?.ExitCode, restartCount: c?.RestartCount })))
     },
+    probe: async (url) => {
+        try {
+            const r = await fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(10_000) })
+            return { status: r.status, body: await r.text() }
+        } catch { return null }
+    },
     broadcast: (msg) => { try { storeHandle.broadcast(msg) } catch { /* no peers */ } },
     now: () => Date.now(),
     sleep: (ms) => sleep(ms),
@@ -211,6 +220,12 @@ const findBundleDisk = async (store: Store, d: UpdateDeps, engineId: string, ins
     return null
 }
 
+/** x-app of a compose file; {} when unreadable. */
+export const readXApp = async (composePath: string): Promise<Record<string, any>> => {
+    try { const x = YAML.parse(await fs.readFile(composePath, 'utf8'))?.['x-app']; return x && typeof x === 'object' ? x : {} }
+    catch { return {} }
+}
+
 const readHealthTimeout = async (composePath: string, appName: string): Promise<number> => {
     try { return healthTimeoutSeconds(appName, YAML.parse(await fs.readFile(composePath, 'utf8'))?.['x-app']?.healthTimeout) }
     catch { return healthTimeoutSeconds(appName) }
@@ -266,6 +281,7 @@ export const updateApp = async (
             allowMajor: !!opts.allowMajor,
             backupAgeMs: inst.lastBackup ? d.now() - Number(inst.lastBackup) : null,
             shortDisks,
+            updatesFrom: bundle ? (await readXApp(path.join(bundle.dir, 'compose.yaml'))).updatesFrom : undefined,
         })
         if (refusal) throw refusal
         progress('Check')
@@ -312,16 +328,25 @@ export const updateApp = async (
             // ── Health
             step = 'Health'; setStep('Health')
             const timeoutS = await readHealthTimeout(composePath, parseAppId(newAppId).name)
+            const hc = parseHealthCheck((await readXApp(composePath)).healthCheck)
             const t0 = d.now()
             for (;;) {
                 const elapsedMs = d.now() - t0
-                const v = healthGate({ ...(await d.health(inst.id)), elapsedMs }, timeoutS)
+                const sample = await d.health(inst.id)
+                // x-app.healthCheck (idea#351 §4.3): only once Docker says the containers are up
+                const ready = sample.state === 'healthy' || sample.state === 'none'
+                const bodyOk = hc && ready ? healthBodyOk(await d.probe(`http://127.0.0.1:${(storeHandle.doc().instanceDB[inst.id] as Instance)?.port ?? inst.port}${hc.path}`), hc.expect) : undefined
+                const v = healthGate({ ...sample, bodyOk, elapsedMs }, timeoutS)
                 progress('Health', Math.min(elapsedMs, timeoutS * 1000), timeoutS * 1000)
                 if (v.verdict === 'pass') break
                 if (v.verdict === 'fail') throw new Error(`health gate: ${v.why}`)
                 await d.sleep(d.pollMs)
             }
             done.push('Health')
+            storeHandle.change(doc => {
+                const i = doc.instanceDB[inst.id]
+                if (i) { i.previousAppId = fromAppId; i.updateAvailable = null }
+            })
             updateOperation(storeHandle, opId, { status: 'Done', completedAt: d.now() as Timestamp })
             log(`updateApp: ${inst.id} ('${inst.name}') ${fromAppId} -> ${newAppId}; snapshot ${snap.path} (${snap.sizeBytes} bytes) kept`)
             return { instanceId: inst.id, name: String(inst.name), fromAppId, toAppId: newAppId as AppID, snapshotPath: snap.path, snapshotBytes: snap.sizeBytes, steps: done, previousSnapshotQuarantinedAt: snap.previousQuarantinedAt, volumes: snap.volumes }
@@ -417,11 +442,19 @@ export interface UpdateAvailableDeps {
     mountRoot: (disk: Disk) => Promise<string>
     listApps: (appsDir: string) => Promise<string[]>
     readSums: (bundleDir: string) => Promise<string | null>
+    /** x-app of a bundle (updatesFrom, healthTimeout, migrationNote) */
+    readXApp: (bundleDir: string) => Promise<Record<string, any>>
+    /** data bytes a snapshot of the instance would copy; null when unknown (estimatedMinutes then left out) */
+    dataBytes: (disk: Disk, id: InstanceID) => Promise<number | null>
 }
 const defaultAvailableDeps: UpdateAvailableDeps = {
     mountRoot: (disk) => diskMountRoot(disk),
     listApps: async (dir) => (await fs.pathExists(dir)) ? (await fs.readdir(dir)).filter(n => !n.startsWith('.')) : [],
     readSums: async (dir) => { try { return await fs.readFile(path.join(dir, 'SHA256SUMS'), 'utf8') } catch { return null } },
+    readXApp: (dir) => readXApp(path.join(dir, 'compose.yaml')),
+    dataBytes: async (disk, id) => {
+        try { const e = parseEstimate(await runAppData(estimateArgs(await appDataRoot(disk), String(id)))); return e.folderBytes + e.volumeBytes } catch { return null }
+    },
 }
 export const sumsLookUsable = (sums: string | null): boolean =>
     !!sums && sums.split('\n').some(l => /^[0-9a-f]{64} [ *]\.?\/?compose\.yaml$/.test(l.trim()))
@@ -430,29 +463,41 @@ export const refreshUpdateAvailable = async (storeHandle: DocHandle<Store>, engi
     const d = { ...defaultAvailableDeps, ...deps }
     const store = storeHandle.doc()
     const docked = Object.values(store.diskDB ?? {}).filter(x => x && String(x.dockedTo) === engineId && x.device) as Disk[]
-    const bundles: { disk: Disk, appId: string }[] = []
+    const bundles: { disk: Disk, appId: string, xapp: Record<string, any> }[] = []
     for (const disk of docked) {
         let root: string
         try { root = await d.mountRoot(disk) } catch { continue }
         for (const appId of await d.listApps(path.join(root, 'apps')).catch(() => [] as string[])) {
-            if (sumsLookUsable(await d.readSums(path.join(root, 'apps', appId)))) bundles.push({ disk, appId })
+            const dir = path.join(root, 'apps', appId)
+            if (sumsLookUsable(await d.readSums(dir))) bundles.push({ disk, appId, xapp: await d.readXApp(dir).catch(() => ({})) })
         }
     }
     const updates: Record<string, Instance['updateAvailable']> = {}
     for (const inst of Object.values(store.instanceDB ?? {}) as Instance[]) {
-        if (!inst || !docked.some(x => String(x.id) === String(inst.storedOn))) continue
-        let best: { disk: Disk, appId: string } | null = null
+        if (!inst) continue
+        if (!docked.some(x => String(x.id) === String(inst.storedOn))) {
+            // idea#76: a hint this Engine wrote for an instance whose disk is no longer docked here goes
+            if (inst.updateAvailable && String(inst.updateAvailable.sourceEngineId ?? engineId) === engineId) updates[String(inst.id)] = null
+            continue
+        }
+        let best: (typeof bundles)[number] | null = null
         for (const b of bundles) {
-            if (!offerable({ currentAppId: String(inst.instanceOf), newAppId: b.appId, sumsValid: true })) continue
+            if (!offerable({ currentAppId: String(inst.instanceOf), newAppId: b.appId, sumsValid: true, updatesFrom: b.xapp.updatesFrom })) continue
             const c = best ? compareVersions(parseAppId(b.appId).version, parseAppId(best.appId).version) : 1
             if (c !== null && (c > 0 || (c === 0 && String(b.disk.id) === String(inst.storedOn)))) best = b
         }
         if (!best) { updates[String(inst.id)] = null; continue }
         const from = parseAppId(String(inst.instanceOf)).version, to = parseAppId(best.appId).version
-        updates[String(inst.id)] = {
+        const u: NonNullable<Instance['updateAvailable']> = {
             appId: best.appId as AppID, sourceDiskId: best.disk.id as DiskID, sourceEngineId: engineId as any,
             fromVersion: from, toVersion: to, major: isMajorChange(from, to),
         }
+        // idea#76: estimatedMinutes (snapshot copy + health timeout) and the App's migrationNote
+        const disk = docked.find(x => String(x.id) === String(inst.storedOn))!
+        const bytes = await d.dataBytes(disk, inst.id).catch(() => null)
+        if (bytes !== null) u.estimatedMinutes = estimateUpdateMinutes(bytes, healthTimeoutSeconds(parseAppId(best.appId).name, best.xapp.healthTimeout))
+        if (typeof best.xapp.migrationNote === 'string' && best.xapp.migrationNote.trim()) u.migrationNote = best.xapp.migrationNote.trim()
+        updates[String(inst.id)] = u
     }
     storeHandle.change(doc => {
         for (const [id, u] of Object.entries(updates)) {
