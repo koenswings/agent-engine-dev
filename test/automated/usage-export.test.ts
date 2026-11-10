@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { EXIT_DISABLED, EXIT_INVALID, EXIT_OK, parseExportArgs, runExport } from '../../src/usage/exportCmd.js'
+import { EXIT_DISABLED, EXIT_INVALID, EXIT_OK, EXIT_RUNTIME, parseExportArgs, runExport } from '../../src/usage/exportCmd.js'
 import { writeUsageMonitoring } from '../../src/usage/settings.js'
 import { appendPresence, appendSample, writeDayFile } from '../../src/usage/store.js'
 import type { DayFile, PresenceRecord, SampleRecord } from '../../src/usage/types.js'
@@ -126,6 +126,30 @@ describe('runExport', () => {
         expect(r.stdout).toBe('')
         expect(fs.existsSync(path.join(tmp, '2026-10-31', 'old.json'))).toBe(true)
         expect(fs.existsSync(path.join(tmp, '.archive'))).toBe(false)
+    })
+    it('exits 1 with unreadable settings when settings.json is malformed', async () => {
+        fs.writeFileSync(path.join(tmp, 'settings.json'), '{nope\n')
+        const r = await exportText(['since', '2026-11-01'])
+        expect(r).toEqual({ code: EXIT_RUNTIME, stdout: '', stderr: 'unreadable settings\n' })
+    })
+    it('does not create an archive dest when no days are selected', async () => {
+        writeUsageMonitoring('on', tmp)
+        writeDayFile(dayRec('2026-11-12', 'keep'), tmp)
+        const r = await exportText(['archive-and-clear', '--before', '2026-11-01'])
+        expect(r.code).toBe(EXIT_OK)
+        expect(JSON.parse(r.stdout.trim())).toMatchObject({ type: 'archived', before: '2026-11-01', days: 0, files: 0 })
+        expect(fs.existsSync(path.join(tmp, '.archive'))).toBe(false)
+        expect(fs.existsSync(path.join(tmp, '2026-11-12', 'keep.json'))).toBe(true)
+    })
+    it('sorts day records by envelope instance, not filename', async () => {
+        writeUsageMonitoring('on', tmp)
+        const dir = path.join(tmp, '2026-11-12')
+        fs.mkdirSync(dir, { recursive: true })
+        fs.writeFileSync(path.join(dir, 'zzz.json'), JSON.stringify(dayRec('2026-11-12', 'a-first')) + '\n')
+        fs.writeFileSync(path.join(dir, 'aaa.json'), JSON.stringify(dayRec('2026-11-12', 'z-last')) + '\n')
+        const r = await exportText(['since', '2026-11-12'])
+        const lines = r.stdout.trim().split('\n').map(l => JSON.parse(l))
+        expect(lines.filter(l => l.type === 'day').map(l => l.instance)).toEqual(['a-first', 'z-last'])
     })
     it('counts an unreadable day file as an error and still writes end', async () => {
         writeUsageMonitoring('on', tmp)

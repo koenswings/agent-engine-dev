@@ -18,7 +18,7 @@ import {
     usageRoot,
     utcStamp,
 } from './paths.js'
-import { readUsageMonitoring } from './settings.js'
+import { inspectUsageMonitoring } from './settings.js'
 import {
     instanceIdFromDayFileName,
     instanceIdFromSamplesFileName,
@@ -87,8 +87,12 @@ export async function runExport(opts: ExportIO): Promise<number> {
         opts.stderr.write('invalid arguments\n')
         return EXIT_INVALID
     }
-    const sw = readUsageMonitoring(root)
-    if (sw !== 'on') {
+    const sw = inspectUsageMonitoring(root)
+    if (sw.status === 'unreadable') {
+        opts.stderr.write('unreadable settings\n')
+        return EXIT_RUNTIME
+    }
+    if (sw.status !== 'on') {
         opts.stderr.write('disabled\n')
         return EXIT_DISABLED
     }
@@ -136,6 +140,7 @@ function exportSince(since: string, root: string, opts: ExportIO): number {
             errors += 1
             continue
         }
+        const dayRows: { instance: string; payload: unknown }[] = []
         for (const name of names) {
             if (!name.endsWith('.json') || name.endsWith('.samples.ndjson')) continue
             const file = path.join(dir, name)
@@ -143,11 +148,15 @@ function exportSince(since: string, root: string, opts: ExportIO): number {
             try {
                 const payload = JSON.parse(fs.readFileSync(file, 'utf8'))
                 const instance = typeof payload?.instance === 'string' ? payload.instance : instanceIdFromDayFileName(name)
-                writeln(opts.stdout, { type: 'day', schema: USAGE_SCHEMA_DAY, day, instance, payload })
-                counts.day += 1
+                dayRows.push({ instance, payload })
             } catch {
                 errors += 1
             }
+        }
+        dayRows.sort((a, b) => a.instance < b.instance ? -1 : a.instance > b.instance ? 1 : 0)
+        for (const row of dayRows) {
+            writeln(opts.stdout, { type: 'day', schema: USAGE_SCHEMA_DAY, day, instance: row.instance, payload: row.payload })
+            counts.day += 1
         }
         for (const name of names) {
             if (!name.endsWith('.samples.ndjson')) continue
@@ -197,17 +206,24 @@ function archiveAndClear(before: string, root: string, opts: ExportIO): number {
     const stamp = utcStamp((opts.now ?? (() => new Date()))())
     const destParent = archiveRoot(root)
     const dest = path.join(destParent, `${before}-${stamp}`)
-    fs.mkdirSync(dest, { recursive: true, mode: 0o750 })
-    let days = 0
-    let files = 0
+    const toMove: string[] = []
     for (const day of listLiveDays(root)) {
         if (day >= before) continue
         const src = dayDir(day, root)
         if (fs.lstatSync(src).isSymbolicLink()) continue
         if (!pathIsInside(src, root)) continue
-        files += countFilesRecursive(src)
-        fs.renameSync(src, path.join(dest, day))
-        days += 1
+        toMove.push(day)
+    }
+    let days = 0
+    let files = 0
+    if (toMove.length > 0) {
+        fs.mkdirSync(dest, { recursive: true, mode: 0o750 })
+        for (const day of toMove) {
+            const src = dayDir(day, root)
+            files += countFilesRecursive(src)
+            fs.renameSync(src, path.join(dest, day))
+            days += 1
+        }
     }
     writeln(opts.stdout, {
         type: 'archived',

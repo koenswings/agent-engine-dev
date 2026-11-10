@@ -247,7 +247,7 @@ App-specific payload fields sit alongside those three (plus optional `demo`). Nu
 
 These names refine proposal §7.6. Unknown extra keys are ignored (forward compatible); required keys missing from an app that should have them fail the schema.
 
-Role keys are singular everywhere — `admin`, `teacher`, `learner` — in `setup`, `logins` and `office.byGroup`, for every App (never `admins`, `teachers` or `learners`). Each of those counts is `{total, beyondSeed}`: `total` includes demo-seed accounts, `beyondSeed` excludes them. Nextcloud `setup` also keeps `otherGroups`, a map of extra group names to the same `{total, beyondSeed}` shape. Kolibri `signins` also carry `sessions` and `minutes` on the same object (`coach` is an extra Kolibri role and uses the same shape).
+Role keys are singular everywhere — `admin`, `teacher`, `learner` — in `setup`, `logins` and `office.byGroup`, for every App (never `admins`, `teachers` or `learners`). `setup` and `logins` (and Kolibri `signins`) use `{total, beyondSeed}`: `total` includes demo-seed accounts, `beyondSeed` excludes them. `office.byGroup` holds open counts as plain numbers (`{admin: n, teacher: n, learner: n}`), not `{total, beyondSeed}`. Nextcloud `setup` also keeps `otherGroups`, a map of extra group names to `{total, beyondSeed}`. Kolibri `signins` also carry `sessions` and `minutes` on the same object (`coach` is an extra Kolibri role and uses the same shape).
 
 **Kolibri** (`app: "kolibri"`) — Q3, Q4, Q6:
 
@@ -309,11 +309,7 @@ Role keys are singular everywhere — `admin`, `teacher`, `learner` — in `setu
   "office": {
     "opens": 0, "distinctDocuments": 0, "read": 0, "edit": 0,
     "estimatedMinutes": 0,
-    "byGroup": {
-      "admin": { "total": 0, "beyondSeed": 0 },
-      "teacher": { "total": 0, "beyondSeed": 0 },
-      "learner": { "total": 0, "beyondSeed": 0 }
-    },
+    "byGroup": { "admin": 0, "teacher": 0, "learner": 0 },
     "mime": { "text": 0, "sheet": 0, "slides": 0 }
   },
   "workflows": {
@@ -357,11 +353,7 @@ Printed every 15 minutes. Nextcloud reads current WOPI token rows (no usernames:
     "documentIds": ["aaaaaaaaaaaaaaaa"],
     "read": 0,
     "edit": 0,
-    "byGroup": {
-      "admin": { "total": 0, "beyondSeed": 0 },
-      "teacher": { "total": 0, "beyondSeed": 0 },
-      "learner": { "total": 0, "beyondSeed": 0 }
-    },
+    "byGroup": { "admin": 0, "teacher": 0, "learner": 0 },
     "mime": { "text": 0, "sheet": 0, "slides": 0 }
   }
 }
@@ -404,7 +396,7 @@ The stored object is the hook body plus the Engine envelope:
 1. **Presence is not merged into the instance file.** Kit-level presence samples stay in a sibling file (proposal §7.6: “not inside an instance file”). idea intersects presence windows with instance summaries after the pull.
 2. **Identity and honesty** (`engine`, `instance`, `name`, `listed`, `clock`, `collectedAt`, `hookStatus`) always come from the Engine.
 3. **`demo`** is the OR described in §5.1.
-4. **`office` (Nextcloud):** if the Engine stored any `idea-usage-sample/1` records for that instance and day, it reduces them into a stored `office` object with exactly these keys: `{opens, distinctDocuments, read, edit, estimatedMinutes, byGroup:{admin,teacher,learner}, mime:{text,sheet,slides}}`. `opens` is the max of the sample `tokens` values. `distinctDocuments` is the size of the union of every sample’s `office.documentIds` (not a max of counts). `read` and `edit` are the max across samples (they are snapshot counts, not additive events). `estimatedMinutes` is the number of consecutive `tokens > 0` samples × 15 (each contiguous run of active samples counts every sample in the run). `byGroup` takes the max of `total` and of `beyondSeed` per role and always emits `admin`, `teacher` and `learner` as `{total, beyondSeed}` (zeros if never seen). `mime` takes the max per key and always emits `text`, `sheet` and `slides` (0 if never seen). If no samples exist, the hook’s `office` is kept when present; otherwise `office` is omitted.
+4. **`office` (Nextcloud):** if the Engine stored any `idea-usage-sample/1` records for that instance and day, it reduces them into a stored `office` object with exactly these keys: `{opens, distinctDocuments, read, edit, estimatedMinutes, byGroup:{admin,teacher,learner}, mime:{text,sheet,slides}}`. `opens` is the max of the sample `tokens` values. `distinctDocuments` is the size of the union of every sample’s `office.documentIds` (not a max of counts). `read` and `edit` are the max across samples (they are snapshot counts, not additive events). `estimatedMinutes` is the number of consecutive `tokens > 0` samples × 15 (each contiguous run of active samples counts every sample in the run). `byGroup` and `mime` take the max per key and always emit the keys above (0 if never seen). `byGroup` values are plain open counts (`admin`, `teacher`, `learner`), not `{total, beyondSeed}`. If no samples exist, the hook’s `office` is kept when present; otherwise `office` is omitted.
 5. Other app payload fields are copied from the hook as validated.
 
 ### 5.6 Presence samples: `idea-usage-presence/1`
@@ -523,7 +515,7 @@ Stdout is **NDJSON** (one JSON object per line, UTF-8). Records are wrapped in a
 **Order**
 
 1. By `day` ascending.
-2. Within a day: all `presence` records in file order (chronological), then `day` files sorted by `instance`, then `sample` records sorted by `instance` then file order.
+2. Within a day: all `presence` records in file order (chronological), then `day` records sorted by the envelope `instance`, then `sample` records sorted by `instance` then file order.
 3. Exactly one `end` marker, last.
 
 `payload` for `day` is the stored file as written (§5.5). `payload` for `presence` and `sample` is the stored object as written (one NDJSON line each). Partial or unreadable files are skipped and counted in `end.errors`; the stream still ends with `end`.
@@ -537,16 +529,16 @@ When there is nothing since that date, stdout is only the `end` marker with zero
 | 0 | `since` produced a valid stream (including an empty range); `archive-and-clear` succeeded | NDJSON as specified | empty (or diagnostics that the collector ignores) |
 | 2 | arguments rejected | empty | `invalid arguments` |
 | 10 | `usageMonitoring` is off | **empty** | `disabled` |
-| 1 | unexpected runtime failure (unreadable settings, permissions) | empty or a partial stream; no promise of `end` | a short reason, no paths that are secrets |
+| 1 | unexpected runtime failure (unreadable or unparsable `settings.json`, permissions) | empty or a partial stream; no promise of `end` | `unreadable settings` when the switch file cannot be read or parsed; otherwise a short reason, no paths that are secrets |
 
-[idea#411](https://github.com/koenswings/idea/issues/411) / [idea#412](https://github.com/koenswings/idea/issues/412) require that a disabled export “returns `disabled` with an empty body” and does not modify files. That is exit 10, empty stdout, stderr line `disabled`. The collector treats 10 as “no new data”, not as a parse error.
+[idea#411](https://github.com/koenswings/idea/issues/411) / [idea#412](https://github.com/koenswings/idea/issues/412) require that a disabled export “returns `disabled` with an empty body” and does not modify files. That is exit 10, empty stdout, stderr line `disabled`. A missing `settings.json` is off (exit 10). An unreadable or unparsable `settings.json` is exit 1, empty stdout, stderr line `unreadable settings`. The collector treats 10 as “no new data”, not as a parse error.
 
 ### 7.3 `archive-and-clear --before YYYY-MM-DD`
 
-The collector sends `archive-and-clear --before (today-14)` only after a successful store, so one school’s data never travels to the next school. `(today-14)` is the cut date: live day directories strictly before that calendar day are archived.
+The collector sends `archive-and-clear --before (today-14)` only after a successful store, so one school’s data never travels to the next school. `(today-14)` is the cut date: live day directories strictly before that calendar day are archived. The space form `--before YYYY-MM-DD` is the contract spelling; `--before=YYYY-MM-DD` is accepted as an extra alias.
 
 - Selects live day directories whose date is **strictly before** `<YYYY-MM-DD>` (and their instance files, samples and presence files).
-- Moves them to `/var/lib/idea/usage/.archive/<before>-<UTC stamp>/`.
+- Moves them to `/var/lib/idea/usage/.archive/<before>-<UTC stamp>/`. If no days are selected (`days` is 0), that destination directory is not created and nothing is written under `.archive/`.
 - Does not touch `settings.json`, does not touch other files on the system, and does not follow symlinks out of `/var/lib/idea/usage/`.
 - Does not run when the switch is off (exit 10, no modifications).
 

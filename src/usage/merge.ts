@@ -35,33 +35,14 @@ function mapMax(offices: Record<string, unknown>[], field: string, keys: readonl
     return out
 }
 
-function roleMax(offices: Record<string, unknown>[], keys: readonly string[]): Record<string, { total: number; beyondSeed: number }> {
-    const out: Record<string, { total: number; beyondSeed: number }> = {}
-    for (const key of keys) {
-        let total = 0
-        let beyondSeed = 0
-        for (const o of offices) {
-            const m = o.byGroup
-            if (!m || typeof m !== 'object') continue
-            const row = (m as Record<string, unknown>)[key]
-            if (!row || typeof row !== 'object') continue
-            const rec = row as Record<string, unknown>
-            total = Math.max(total, num(rec.total))
-            beyondSeed = Math.max(beyondSeed, num(rec.beyondSeed))
-        }
-        out[key] = { total, beyondSeed }
-    }
-    return out
-}
-
 /**
  * Reduce Nextcloud Office samples into the stored office object:
  *   opens              = max(tokens)
  *   distinctDocuments  = |union(office.documentIds)|
  *   read, edit         = max across samples (snapshot counts)
  *   estimatedMinutes   = consecutive tokens>0 samples × 15
- *   byGroup            = max of {total, beyondSeed} per role
- *   mime               = max per key, always the canonical keys
+ *   byGroup / mime     = max per key, always the canonical keys
+ *   byGroup values     = plain open counts (not {total, beyondSeed})
  */
 export function reduceOffice(samples: SampleRecord[]): Record<string, unknown> | undefined {
     const withOffice = samples.filter(s => s.office && typeof s.office === 'object')
@@ -98,7 +79,7 @@ export function reduceOffice(samples: SampleRecord[]): Record<string, unknown> |
         read: maxOf('read'),
         edit: maxOf('edit'),
         estimatedMinutes,
-        byGroup: roleMax(offices, GROUP_KEYS),
+        byGroup: mapMax(offices, 'byGroup', GROUP_KEYS),
         mime: mapMax(offices, 'mime', MIME_KEYS),
     }
 }

@@ -173,8 +173,13 @@ function validateOfficeLike(value: unknown, label: string, requireTokens: boolea
         }
     }
     if (obj.byGroup !== undefined) {
-        const gErr = expectRoleCountMap(obj.byGroup, `${label}.byGroup`, ['admin', 'teacher', 'learner'])
-        if (gErr) return gErr
+        const map = expectObj(obj.byGroup, `${label}.byGroup`)
+        if (typeof map === 'string') return map
+        const plural = rejectPluralRoleKeys(map, `${label}.byGroup`)
+        if (plural) return plural
+        for (const [k, v] of Object.entries(map)) {
+            if (!isNonNegInt(v)) return `${label}.byGroup.${k} must be a non-negative integer`
+        }
     }
     if (obj.mime !== undefined) {
         const map = expectObj(obj.mime, `${label}.mime`)

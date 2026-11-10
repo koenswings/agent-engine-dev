@@ -40,7 +40,7 @@ const nextcloud = (over: Record<string, unknown> = {}) => ({
         teacher: { total: 2, beyondSeed: 2 },
         learner: { total: 5, beyondSeed: 5 },
     },
-    office: { opens: 1, distinctDocuments: 2, read: 1, edit: 1, estimatedMinutes: 15, byGroup: { admin: { total: 0, beyondSeed: 0 }, teacher: { total: 1, beyondSeed: 1 }, learner: { total: 0, beyondSeed: 0 } }, mime: { text: 1 } },
+    office: { opens: 1, distinctDocuments: 2, read: 1, edit: 1, estimatedMinutes: 15, byGroup: { admin: 0, teacher: 1, learner: 0 }, mime: { text: 1 } },
     ...over,
 })
 
@@ -125,7 +125,7 @@ describe('validateSampleHook', () => {
         const r = validateSampleHook({
             schema: 'idea-usage-sample/1',
             app: 'nextcloud',
-            office: { tokens: 2, documentIds: ['aaaaaaaaaaaaaaaa'], read: 1, edit: 1, byGroup: { admin: { total: 0, beyondSeed: 0 }, teacher: { total: 2, beyondSeed: 2 }, learner: { total: 0, beyondSeed: 0 } }, mime: { text: 2 } },
+            office: { tokens: 2, documentIds: ['aaaaaaaaaaaaaaaa'], read: 1, edit: 1, byGroup: { admin: 0, teacher: 2, learner: 0 }, mime: { text: 2 } },
         })
         expect(r.ok).toBe(true)
     })
@@ -155,11 +155,16 @@ describe('validateSampleHook', () => {
         expect(validateSampleHook({ schema: 'idea-usage-sample/1', app: 'nextcloud', office: { ...office, documentIds: ['aaaaaaaaaaaaaaa'] } }).ok).toBe(false)
         expect(validateSampleHook({ schema: 'idea-usage-sample/1', app: 'nextcloud', office: { ...office, documentIds: ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'] } }).ok).toBe(false)
     })
-    it('rejects integer office.byGroup values', () => {
+    it('accepts plain-number office.byGroup and rejects {total, beyondSeed} there', () => {
         expect(validateSampleHook({
             schema: 'idea-usage-sample/1',
             app: 'nextcloud',
             office: { tokens: 1, documentIds: [], read: 0, edit: 0, byGroup: { admin: 0, teacher: 1, learner: 0 } },
+        }).ok).toBe(true)
+        expect(validateSampleHook({
+            schema: 'idea-usage-sample/1',
+            app: 'nextcloud',
+            office: { tokens: 1, documentIds: [], read: 0, edit: 0, byGroup: { admin: { total: 0, beyondSeed: 0 }, teacher: { total: 1, beyondSeed: 1 }, learner: { total: 0, beyondSeed: 0 } } },
         }).ok).toBe(false)
     })
 })
