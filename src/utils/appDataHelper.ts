@@ -27,7 +27,7 @@ import fs from 'fs'
 import { $ } from 'zx'
 import { log } from './utils.js'
 import { config } from '../data/Config.js'
-import { peerSshArgv, checkEngineId } from './peerSsh.js'
+import { peerSshArgv, checkEngineId, normaliseEd25519 } from './peerSsh.js'
 
 /** Installed path of the helper (a root-owned copy, 0755; build-engine installUdev). */
 export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
@@ -37,7 +37,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '5'
+export const APP_DATA_HELPER_VERSION = '7'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -107,6 +107,39 @@ export const putFilesArgs = (root: string, id: string, stagingDir: string): stri
     if (!stagingDir.startsWith('/tmp/')) throw new Error('stagingDir for put-files must be under /tmp')
     return ['put-files', checkRoot(root), checkId(id), stagingDir]
 }
+
+/**
+ * Tailscale CGNAT (100.64.0.0/10): the sidecar node's own Tailscale IPv4
+ * (idea#412). The helper constructs from= itself; callers must not pass options.
+ */
+export const checkUsageFromIpv4 = (ip: string): string => {
+    const m = /^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/.exec(ip)
+    if (!m) throw new Error(`'${ip}' is not an IPv4 address the usage-key helper accepts`)
+    const o1 = Number(m[1]), o2 = Number(m[2]), o3 = Number(m[3]), o4 = Number(m[4])
+    if (o1 > 255 || o2 > 255 || o3 > 255 || o4 > 255) {
+        throw new Error(`'${ip}' is not an IPv4 address the usage-key helper accepts`)
+    }
+    if (!(o1 === 100 && o2 >= 64 && o2 <= 127)) {
+        throw new Error(`'${ip}' is not a Tailscale IPv4 address (100.64/10) the usage-key helper accepts`)
+    }
+    return ip
+}
+
+/**
+ * idea#412: argv for `idea-app-data install-usage-key`. The helper writes
+ * restrict,from="<ipv4>",command="/usr/local/sbin/idea-usage-export" itself.
+ * `pubKey` is `ssh-ed25519 <base64>` or just the base64 blob (test fixtures;
+ * never a real usage-pull key).
+ */
+export const installUsageKeyArgs = (ipv4: string, pubKey: string): string[] => {
+    const ip = checkUsageFromIpv4(ipv4)
+    const trimmed = pubKey.trim()
+    const line = trimmed.startsWith('ssh-ed25519 ') ? trimmed : `ssh-ed25519 ${trimmed}`
+    const normalised = normaliseEd25519(line)
+    if (!normalised) throw new Error(`'${pubKey}' is not an ed25519 public key the usage-key helper accepts`)
+    return ['install-usage-key', ip, 'ssh-ed25519', normalised.split(' ')[1]]
+}
+
 /** idea#347: rename instances/<id> to <disk>/.idea-quarantine/<id>-<UTC stamp>; prints the new path. */
 export const quarantineArgs = (root: string, id: string): string[] => ['quarantine', checkRoot(root), checkId(id)]
 export const deleteArgs = (root: string, id: string): string[] => ['delete', checkRoot(root), checkId(id)]
