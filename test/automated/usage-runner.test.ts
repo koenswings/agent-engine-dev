@@ -39,7 +39,7 @@ const okKolibri = (day = '2026-11-12') => JSON.stringify({
     setup: {
         classes: 0, classesDelta: 0,
         learner: { total: 0, beyondSeed: 0 }, learnerDelta: 0, learnerEnrolled: 0,
-        teacher: { total: 0, beyondSeed: 0 }, teacherDelta: 0,
+        teacher: { total: 0, beyondSeed: 0 }, teachersDelta: 0,
         admin: { total: 0, beyondSeed: 0 },
     },
     signins: {
@@ -198,7 +198,7 @@ describe('runDayHook', () => {
             target: listed({ instanceId: 'nc-1', app: 'nextcloud', name: 'Nextcloud', hook: { service: 'app', command: ['/hooks/usage.sh'], timeoutS: 20 } }),
             root: tmp,
             clock,
-            exec: async () => ({ stdout: JSON.stringify({ schema: 'idea-usage-sample/1', app: 'nextcloud', office: { tokens: 2, documents: ['1111111111111111111111111111111111111111111111111111111111111111'], read: 1, edit: 1 } }), stderr: '', exitCode: 0, timedOut: false }),
+            exec: async () => ({ stdout: JSON.stringify({ schema: 'idea-usage-sample/1', app: 'nextcloud', office: { tokens: 2, documentIds: ['1111111111111111'], read: 1, edit: 1 } }), stderr: '', exitCode: 0, timedOut: false }),
         })
         expect(rec?.office).toMatchObject({ tokens: 2 })
         expect(fs.existsSync(path.join(tmp, '2026-11-13', 'nc-1.samples.ndjson'))).toBe(true)

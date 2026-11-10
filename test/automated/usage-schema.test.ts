@@ -11,7 +11,7 @@ const kolibri = (over: Record<string, unknown> = {}) => ({
     setup: {
         classes: 1, classesDelta: 0,
         learner: { total: 2, beyondSeed: 2 }, learnerDelta: -1, learnerEnrolled: 2,
-        teacher: { total: 1, beyondSeed: 1 }, teacherDelta: 0,
+        teacher: { total: 1, beyondSeed: 1 }, teachersDelta: 0,
         admin: { total: 1, beyondSeed: 1 },
     },
     signins: {
@@ -40,7 +40,7 @@ const nextcloud = (over: Record<string, unknown> = {}) => ({
         teacher: { total: 2, beyondSeed: 2 },
         learner: { total: 5, beyondSeed: 5 },
     },
-    office: { opens: 1, distinctDocuments: 2, read: 1, edit: 1, estimatedMinutes: 15, byGroup: { teacher: 1 }, mime: { text: 1 } },
+    office: { opens: 1, distinctDocuments: 2, read: 1, edit: 1, estimatedMinutes: 15, byGroup: { admin: { total: 0, beyondSeed: 0 }, teacher: { total: 1, beyondSeed: 1 }, learner: { total: 0, beyondSeed: 0 } }, mime: { text: 1 } },
     ...over,
 })
 
@@ -84,7 +84,7 @@ describe('validateDayHook', () => {
         expect(validateDayHook(body, '2026-11-12').ok).toBe(false)
     })
     it('accepts a negative Kolibri delta', () => {
-        expect(validateDayHook(kolibri({ setup: { ...kolibri().setup, learnerDelta: -3, teacherDelta: -1 } }), '2026-11-12').ok).toBe(true)
+        expect(validateDayHook(kolibri({ setup: { ...kolibri().setup, learnerDelta: -3, teachersDelta: 0 } }), '2026-11-12').ok).toBe(true)
     })
     it('rejects a Kiwix byHour that is not 24 long', () => {
         expect(validateDayHook(kiwix({ byHour: [1, 2, 3] }), '2026-11-12').ok).toBe(false)
@@ -125,7 +125,7 @@ describe('validateSampleHook', () => {
         const r = validateSampleHook({
             schema: 'idea-usage-sample/1',
             app: 'nextcloud',
-            office: { tokens: 2, documents: ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'], read: 1, edit: 1, byGroup: { teacher: 2 }, mime: { text: 2 } },
+            office: { tokens: 2, documentIds: ['aaaaaaaaaaaaaaaa'], read: 1, edit: 1, byGroup: { admin: { total: 0, beyondSeed: 0 }, teacher: { total: 2, beyondSeed: 2 }, learner: { total: 0, beyondSeed: 0 } }, mime: { text: 2 } },
         })
         expect(r.ok).toBe(true)
     })
@@ -135,19 +135,32 @@ describe('validateSampleHook', () => {
     it('rejects an unknown sample schema', () => {
         expect(validateSampleHook({ schema: 'idea-usage-sample/2', app: 'nextcloud' }).ok).toBe(false)
     })
-    it('rejects a sample office without documents', () => {
+    it('rejects a sample office without documentIds', () => {
         expect(validateSampleHook({
             schema: 'idea-usage-sample/1',
             app: 'nextcloud',
             office: { tokens: 1, read: 1, edit: 0 },
         }).ok).toBe(false)
+        expect(validateSampleHook({
+            schema: 'idea-usage-sample/1',
+            app: 'nextcloud',
+            office: { tokens: 1, documents: ['aaaaaaaaaaaaaaaa'], read: 1, edit: 0 },
+        }).ok).toBe(false)
     })
-    it('rejects documents that are not 64-char lowercase hex', () => {
-        const office = { tokens: 1, documents: ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'], read: 0, edit: 0 }
+    it('rejects documentIds that are not 16-char lowercase hex', () => {
+        const office = { tokens: 1, documentIds: ['aaaaaaaaaaaaaaaa'], read: 0, edit: 0 }
         expect(validateSampleHook({ schema: 'idea-usage-sample/1', app: 'nextcloud', office }).ok).toBe(true)
-        expect(validateSampleHook({ schema: 'idea-usage-sample/1', app: 'nextcloud', office: { ...office, documents: ['DOC-1'] } }).ok).toBe(false)
-        expect(validateSampleHook({ schema: 'idea-usage-sample/1', app: 'nextcloud', office: { ...office, documents: ['AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'] } }).ok).toBe(false)
-        expect(validateSampleHook({ schema: 'idea-usage-sample/1', app: 'nextcloud', office: { ...office, documents: ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'] } }).ok).toBe(false)
+        expect(validateSampleHook({ schema: 'idea-usage-sample/1', app: 'nextcloud', office: { ...office, documentIds: ['DOC-1'] } }).ok).toBe(false)
+        expect(validateSampleHook({ schema: 'idea-usage-sample/1', app: 'nextcloud', office: { ...office, documentIds: ['AAAAAAAAAAAAAAAA'] } }).ok).toBe(false)
+        expect(validateSampleHook({ schema: 'idea-usage-sample/1', app: 'nextcloud', office: { ...office, documentIds: ['aaaaaaaaaaaaaaa'] } }).ok).toBe(false)
+        expect(validateSampleHook({ schema: 'idea-usage-sample/1', app: 'nextcloud', office: { ...office, documentIds: ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'] } }).ok).toBe(false)
+    })
+    it('rejects integer office.byGroup values', () => {
+        expect(validateSampleHook({
+            schema: 'idea-usage-sample/1',
+            app: 'nextcloud',
+            office: { tokens: 1, documentIds: [], read: 0, edit: 0, byGroup: { admin: 0, teacher: 1, learner: 0 } },
+        }).ok).toBe(false)
     })
 })
 

@@ -247,7 +247,7 @@ App-specific payload fields sit alongside those three (plus optional `demo`). Nu
 
 These names refine proposal §7.6. Unknown extra keys are ignored (forward compatible); required keys missing from an app that should have them fail the schema.
 
-Role keys are singular everywhere — `admin`, `teacher`, `learner` — in `setup`, `logins` and `office.byGroup`, for every App (never `admins`, `teachers` or `learners`). Each role count is `{total, beyondSeed}`: `total` includes demo-seed accounts, `beyondSeed` excludes them. Kolibri `signins` also carry `sessions` and `minutes` on the same object (`coach` is an extra Kolibri role and uses the same shape).
+Role keys are singular everywhere — `admin`, `teacher`, `learner` — in `setup`, `logins` and `office.byGroup`, for every App (never `admins`, `teachers` or `learners`). Each of those counts is `{total, beyondSeed}`: `total` includes demo-seed accounts, `beyondSeed` excludes them. Nextcloud `setup` also keeps `otherGroups`, a map of extra group names to the same `{total, beyondSeed}` shape. Kolibri `signins` also carry `sessions` and `minutes` on the same object (`coach` is an extra Kolibri role and uses the same shape).
 
 **Kolibri** (`app: "kolibri"`) — Q3, Q4, Q6:
 
@@ -262,7 +262,7 @@ Role keys are singular everywhere — `admin`, `teacher`, `learner` — in `setu
     "learner": { "total": 0, "beyondSeed": 0 },
     "learnerDelta": 0, "learnerEnrolled": 0,
     "teacher": { "total": 0, "beyondSeed": 0 },
-    "teacherDelta": 0,
+    "teachersDelta": 0,
     "admin": { "total": 0, "beyondSeed": 0 }
   },
   "signins": {
@@ -285,7 +285,7 @@ Role keys are singular everywhere — `admin`, `teacher`, `learner` — in `setu
 }
 ```
 
-`flags` is an array of short tokens. The shared-account flag is `sharedLearnerAccount` (the `?` in the §7.6 sketch was a placeholder). Deltas are day-over-day net change; a deletion is negative.
+`flags` is an array of short tokens. The shared-account flag is `sharedLearnerAccount` (the `?` in the §7.6 sketch was a placeholder). Deltas are day-over-day net change; a deletion is negative. Kolibri `classesDelta` and `teachersDelta` are always `0` (Kolibri has no timestamps for class or teacher-role changes).
 
 **Nextcloud** (`app: "nextcloud"`) — Q3, Q5:
 
@@ -309,10 +309,13 @@ Role keys are singular everywhere — `admin`, `teacher`, `learner` — in `setu
   "office": {
     "opens": 0, "distinctDocuments": 0, "read": 0, "edit": 0,
     "estimatedMinutes": 0,
-    "byGroup": { "admin": 0, "teacher": 0, "learner": 0 },
+    "byGroup": {
+      "admin": { "total": 0, "beyondSeed": 0 },
+      "teacher": { "total": 0, "beyondSeed": 0 },
+      "learner": { "total": 0, "beyondSeed": 0 }
+    },
     "mime": { "text": 0, "sheet": 0, "slides": 0 }
   },
-  "appsOpened": { "files": 0, "richdocuments": 0 },
   "workflows": {
     "worksheetShares": 0, "editShares": 0,
     "fileDropLinks": 0, "fileDropUploads": 0, "schoolFilesShares": 0
@@ -320,7 +323,7 @@ Role keys are singular everywhere — `admin`, `teacher`, `learner` — in `setu
 }
 ```
 
-`office` from the day hook may be incomplete (WOPI rows expire). The Engine prefers its own reduction of that day’s samples when any samples exist (see §5.5). `appsOpened` may be omitted until Phase 3 instrumentation exists; an omitted or empty object is valid.
+`office` from the day hook may be incomplete (WOPI rows expire). The Engine prefers its own reduction of that day’s samples when any samples exist (see §5.5). Nextcloud `appsOpened` is omitted for now.
 
 **Kiwix** (`app: "kiwix"`) — Q8:
 
@@ -351,16 +354,20 @@ Printed every 15 minutes. Nextcloud reads current WOPI token rows (no usernames:
   "sampledAt": "2026-11-12T10:15:00+02:00",
   "office": {
     "tokens": 0,
-    "documents": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+    "documentIds": ["aaaaaaaaaaaaaaaa"],
     "read": 0,
     "edit": 0,
-    "byGroup": { "admin": 0, "teacher": 0, "learner": 0 },
+    "byGroup": {
+      "admin": { "total": 0, "beyondSeed": 0 },
+      "teacher": { "total": 0, "beyondSeed": 0 },
+      "learner": { "total": 0, "beyondSeed": 0 }
+    },
     "mime": { "text": 0, "sheet": 0, "slides": 0 }
   }
 }
 ```
 
-`documents` is an array of SHA-256 hex digests (64 lowercase hex characters) of the WOPI `fileId`, hashed with a per-instance salt. It must not contain file names, raw file ids, or other content. The Engine uses the union of these ids across the day to compute stored `distinctDocuments`. `sampledAt` is optional (the Engine also records its own collection time). `supported: false` is the only required extra key when the App has no sample.
+`office.documentIds` is an array of 16-character lowercase hex strings: a truncated HMAC-SHA256 of the WOPI `fileId`, salted per instance. It is a field of `office`, not a top-level sample key, and it must not contain file names, raw file ids, or other content. The Engine uses the union of these ids across the day’s samples to compute stored `distinctDocuments`. `sampledAt` is optional (the Engine also records its own collection time). `supported: false` is the only required extra key when the App has no sample.
 
 ### 5.5 Stored day file (what lands on disk and is exported as `type: day`)
 
@@ -397,7 +404,7 @@ The stored object is the hook body plus the Engine envelope:
 1. **Presence is not merged into the instance file.** Kit-level presence samples stay in a sibling file (proposal §7.6: “not inside an instance file”). idea intersects presence windows with instance summaries after the pull.
 2. **Identity and honesty** (`engine`, `instance`, `name`, `listed`, `clock`, `collectedAt`, `hookStatus`) always come from the Engine.
 3. **`demo`** is the OR described in §5.1.
-4. **`office` (Nextcloud):** if the Engine stored any `idea-usage-sample/1` records for that instance and day, it reduces them into a stored `office` object with exactly these keys: `{opens, distinctDocuments, read, edit, estimatedMinutes, byGroup:{admin,teacher,learner}, mime:{text,sheet,slides}}`. `opens` is the max of the sample `tokens` values. `distinctDocuments` is the size of the union of every sample’s `documents` (not a max of counts). `read` and `edit` are the max across samples (they are snapshot counts, not additive events). `estimatedMinutes` is the number of consecutive `tokens > 0` samples × 15 (each contiguous run of active samples counts every sample in the run). `byGroup` and `mime` take the max per key and always emit the keys above (0 if never seen). If no samples exist, the hook’s `office` is kept when present; otherwise `office` is omitted.
+4. **`office` (Nextcloud):** if the Engine stored any `idea-usage-sample/1` records for that instance and day, it reduces them into a stored `office` object with exactly these keys: `{opens, distinctDocuments, read, edit, estimatedMinutes, byGroup:{admin,teacher,learner}, mime:{text,sheet,slides}}`. `opens` is the max of the sample `tokens` values. `distinctDocuments` is the size of the union of every sample’s `office.documentIds` (not a max of counts). `read` and `edit` are the max across samples (they are snapshot counts, not additive events). `estimatedMinutes` is the number of consecutive `tokens > 0` samples × 15 (each contiguous run of active samples counts every sample in the run). `byGroup` takes the max of `total` and of `beyondSeed` per role and always emits `admin`, `teacher` and `learner` as `{total, beyondSeed}` (zeros if never seen). `mime` takes the max per key and always emits `text`, `sheet` and `slides` (0 if never seen). If no samples exist, the hook’s `office` is kept when present; otherwise `office` is omitted.
 5. Other app payload fields are copied from the hook as validated.
 
 ### 5.6 Presence samples: `idea-usage-presence/1`
@@ -536,7 +543,7 @@ When there is nothing since that date, stdout is only the `end` marker with zero
 
 ### 7.3 `archive-and-clear --before YYYY-MM-DD`
 
-Sent by idea only after it has confirmed its copy, so one school’s data never travels to the next school.
+The collector sends `archive-and-clear --before (today-14)` only after a successful store, so one school’s data never travels to the next school. `(today-14)` is the cut date: live day directories strictly before that calendar day are archived.
 
 - Selects live day directories whose date is **strictly before** `<YYYY-MM-DD>` (and their instance files, samples and presence files).
 - Moves them to `/var/lib/idea/usage/.archive/<before>-<UTC stamp>/`.

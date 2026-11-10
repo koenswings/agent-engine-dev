@@ -39,7 +39,7 @@ const okBody = (day: string) => JSON.stringify({
     setup: {
         classes: 0, classesDelta: 0,
         learner: { total: 0, beyondSeed: 0 }, learnerDelta: 0, learnerEnrolled: 0,
-        teacher: { total: 0, beyondSeed: 0 }, teacherDelta: 0,
+        teacher: { total: 0, beyondSeed: 0 }, teachersDelta: 0,
         admin: { total: 0, beyondSeed: 0 },
     },
     signins: {

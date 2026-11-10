@@ -62,6 +62,8 @@ function expectRoleCount(value: unknown, label: string): string | null {
 function expectRoleCountMap(value: unknown, label: string, keys: string[]): string | null {
     const obj = expectObj(value, label)
     if (typeof obj === 'string') return obj
+    const plural = rejectPluralRoleKeys(obj, label)
+    if (plural) return plural
     for (const k of keys) {
         const err = expectRoleCount(obj[k], `${label}.${k}`)
         if (err) return err
@@ -69,11 +71,21 @@ function expectRoleCountMap(value: unknown, label: string, keys: string[]): stri
     return null
 }
 
+const PLURAL_ROLE_KEYS = ['admins', 'teachers', 'learners'] as const
+
+function rejectPluralRoleKeys(obj: Record<string, unknown>, label: string): string | null {
+    for (const k of PLURAL_ROLE_KEYS) {
+        if (Object.prototype.hasOwnProperty.call(obj, k)) return `${label} must not use plural role key '${k}'`
+    }
+    return null
+}
+
 function validateKolibri(body: Record<string, unknown>): string | null {
     const setup = expectObj(body.setup, 'setup')
     if (typeof setup === 'string') return setup
-    const err = expectNonNegFields(setup, ['classes', 'learnerEnrolled'], 'setup')
-        || expectIntFields(setup, ['classesDelta', 'learnerDelta', 'teacherDelta'], 'setup')
+    const err = rejectPluralRoleKeys(setup, 'setup')
+        || expectNonNegFields(setup, ['classes', 'learnerEnrolled'], 'setup')
+        || expectIntFields(setup, ['classesDelta', 'learnerDelta', 'teachersDelta'], 'setup')
         || expectRoleCount(setup.learner, 'setup.learner')
         || expectRoleCount(setup.teacher, 'setup.teacher')
         || expectRoleCount(setup.admin, 'setup.admin')
@@ -155,17 +167,20 @@ function validateOfficeLike(value: unknown, label: string, requireTokens: boolea
     }
     if (requireTokens && obj.tokens === undefined) return `${label}.tokens is required`
     if (requireTokens) {
-        const HEX64 = /^[0-9a-f]{64}$/
-        if (!Array.isArray(obj.documents) || !obj.documents.every(x => typeof x === 'string' && HEX64.test(x))) {
-            return `${label}.documents must be an array of 64-char lowercase hex SHA-256 strings`
+        const HEX16 = /^[0-9a-f]{16}$/
+        if (!Array.isArray(obj.documentIds) || !obj.documentIds.every(x => typeof x === 'string' && HEX16.test(x))) {
+            return `${label}.documentIds must be an array of 16-char lowercase hex strings`
         }
     }
-    for (const mapName of ['byGroup', 'mime']) {
-        if (obj[mapName] === undefined) continue
-        const map = expectObj(obj[mapName], `${label}.${mapName}`)
+    if (obj.byGroup !== undefined) {
+        const gErr = expectRoleCountMap(obj.byGroup, `${label}.byGroup`, ['admin', 'teacher', 'learner'])
+        if (gErr) return gErr
+    }
+    if (obj.mime !== undefined) {
+        const map = expectObj(obj.mime, `${label}.mime`)
         if (typeof map === 'string') return map
         for (const [k, v] of Object.entries(map)) {
-            if (!isNonNegInt(v)) return `${label}.${mapName}.${k} must be a non-negative integer`
+            if (!isNonNegInt(v)) return `${label}.mime.${k} must be a non-negative integer`
         }
     }
     return null

@@ -133,9 +133,9 @@ describe('demo and office merge', () => {
     })
     it('reduces office samples: opens=max tokens, distinctDocuments=union of ids, read/edit=max, minutes=consecutive tokens>0 × 15', () => {
         const samples: SampleRecord[] = [
-            { schema: 'idea-usage-sample/1', app: 'nextcloud', office: { tokens: 2, documents: ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'], read: 2, edit: 1, byGroup: { teacher: 2 }, mime: { text: 2 } } },
-            { schema: 'idea-usage-sample/1', app: 'nextcloud', office: { tokens: 3, documents: ['bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'], read: 1, edit: 2, byGroup: { teacher: 1, learner: 2 }, mime: { text: 1, sheet: 1 } } },
-            { schema: 'idea-usage-sample/1', app: 'nextcloud', office: { tokens: 0, documents: [], read: 0, edit: 0 } },
+            { schema: 'idea-usage-sample/1', app: 'nextcloud', office: { tokens: 2, documentIds: ['aaaaaaaaaaaaaaaa', 'bbbbbbbbbbbbbbbb'], read: 2, edit: 1, byGroup: { teacher: { total: 2, beyondSeed: 2 } }, mime: { text: 2 } } },
+            { schema: 'idea-usage-sample/1', app: 'nextcloud', office: { tokens: 3, documentIds: ['bbbbbbbbbbbbbbbb', 'cccccccccccccccc'], read: 1, edit: 2, byGroup: { teacher: { total: 1, beyondSeed: 1 }, learner: { total: 2, beyondSeed: 2 } }, mime: { text: 1, sheet: 1 } } },
+            { schema: 'idea-usage-sample/1', app: 'nextcloud', office: { tokens: 0, documentIds: [], read: 0, edit: 0 } },
         ]
         const office = reduceOffice(samples) as Record<string, any>
         expect(office).toEqual({
@@ -144,13 +144,17 @@ describe('demo and office merge', () => {
             read: 2,
             edit: 2,
             estimatedMinutes: 30,
-            byGroup: { admin: 0, teacher: 2, learner: 2 },
+            byGroup: {
+                admin: { total: 0, beyondSeed: 0 },
+                teacher: { total: 2, beyondSeed: 2 },
+                learner: { total: 2, beyondSeed: 2 },
+            },
             mime: { text: 2, sheet: 1, slides: 0 },
         })
         expect(office.tokens).toBeUndefined()
     })
     it('prefers the sample reduction on a stored Nextcloud day file', () => {
-        appendSample('2026-11-12', 'nc-1', { schema: 'idea-usage-sample/1', app: 'nextcloud', office: { tokens: 4, documents: ['1111111111111111111111111111111111111111111111111111111111111111'], read: 1, edit: 0 } }, tmp)
+        appendSample('2026-11-12', 'nc-1', { schema: 'idea-usage-sample/1', app: 'nextcloud', office: { tokens: 4, documentIds: ['1111111111111111'], read: 1, edit: 0 } }, tmp)
         const rec = applyOfficeMerge(dayFile({ app: 'nextcloud', instance: 'nc-1', office: { tokens: 1 } }), tmp)
         expect((rec.office as any).opens).toBe(4)
         expect((rec.office as any).distinctDocuments).toBe(1)
