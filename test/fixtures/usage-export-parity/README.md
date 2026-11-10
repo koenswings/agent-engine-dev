@@ -15,9 +15,9 @@ present there. Copy the whole `test/fixtures/usage-export-parity/` tree onto
   lowercase hex** strings. They do **not** have a top-level `documents` field
   and they do not use `office.documents` (the older 64-hex SHA-256 sketch).
 - Role keys are singular everywhere: `admin`, `teacher`, `learner` (never
-  `admins` / `teachers` / `learners`). Each role count is
-  `{ "total": <n>, "beyondSeed": <n> }` in `setup`, `logins` and
-  `office.byGroup`.
+  `admins` / `teachers` / `learners`). `setup` and `logins` (and Kolibri
+  `signins`) use `{ "total": <n>, "beyondSeed": <n> }`. `office.byGroup`
+  holds open counts as plain numbers: `{ "admin": n, "teacher": n, "learner": n }`.
 - Kolibri `signins` add `sessions` and `minutes` on the same object, plus
   extra role `coach`.
 - `2026-11-12/bad.json` is deliberately not JSON (`end.errors === 1`).
@@ -153,9 +153,9 @@ the stream.
    a filename and `payload.instance` ever diverge.
 5. **Schema vs export.** Export must wrap stored JSON as `payload`
    unchanged. `src/usage/schema.ts` / `merge.ts` on #308 still describe
-   `office.documents` as 64-hex SHA-256 digests and `office.byGroup` values
-   as plain integers. Update those to `office.documentIds` (16-hex) and
-   singular `{total, beyondSeed}` role counts if that work is not already
-   queued — it is independent of matching these goldens.
+   `office.documents` as 64-hex SHA-256 digests. Update those to
+   `office.documentIds` (16-hex). `setup` / `logins` use singular
+   `{total, beyondSeed}` role counts; `office.byGroup` is plain numbers
+   with singular keys (`admin` / `teacher` / `learner`).
 
 Engine: `happy-zebra`. `since` cut: `2026-11-11`. Archive cut: `2026-11-01`.

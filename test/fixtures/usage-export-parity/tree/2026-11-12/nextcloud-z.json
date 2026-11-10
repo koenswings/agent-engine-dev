@@ -54,18 +54,9 @@
     "edit": 1,
     "estimatedMinutes": 30,
     "byGroup": {
-      "admin": {
-        "total": 0,
-        "beyondSeed": 0
-      },
-      "teacher": {
-        "total": 1,
-        "beyondSeed": 1
-      },
-      "learner": {
-        "total": 1,
-        "beyondSeed": 1
-      }
+      "admin": 0,
+      "teacher": 1,
+      "learner": 1
     },
     "mime": {
       "text": 1,
