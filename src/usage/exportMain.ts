@@ -1,5 +1,5 @@
 /**
- * CLI entry for idea-usage-export (idea#411). Helper v8 (idea#412) installs
+ * CLI entry for idea-usage-export (idea#411). Helper v7 (idea#412) installs
  * the root-owned forced-command binary that invokes this compiled file.
  */
 import { runExport } from './exportCmd.js'
