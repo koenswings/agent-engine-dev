@@ -1,0 +1,68 @@
+{
+  "schema": "idea-usage-day/1",
+  "engine": "happy-zebra",
+  "day": "2026-11-01",
+  "app": "kolibri",
+  "instance": "boundary",
+  "name": "Boundary",
+  "demo": false,
+  "listed": true,
+  "clock": {
+    "synced": true,
+    "correctedBoots": 0
+  },
+  "collectedAt": "2026-11-02T02:00:00+01:00",
+  "hookStatus": "ok",
+  "setup": {
+    "classes": 1,
+    "classesDelta": 0,
+    "learner": {
+      "total": 2,
+      "beyondSeed": 1
+    },
+    "learnerDelta": 0,
+    "learnerEnrolled": 2,
+    "teacher": {
+      "total": 1,
+      "beyondSeed": 1
+    },
+    "teacherDelta": 0,
+    "admin": {
+      "total": 1,
+      "beyondSeed": 1
+    }
+  },
+  "signins": {
+    "learner": {
+      "total": 1,
+      "beyondSeed": 1,
+      "sessions": 1,
+      "minutes": 5
+    },
+    "coach": {
+      "total": 0,
+      "beyondSeed": 0,
+      "sessions": 0,
+      "minutes": 0
+    },
+    "admin": {
+      "total": 0,
+      "beyondSeed": 0,
+      "sessions": 0,
+      "minutes": 0
+    }
+  },
+  "content": [],
+  "teaching": {
+    "lessonsCreated": 0,
+    "lessonsVisible": 0,
+    "quizzesCreated": 0,
+    "quizzesStarted": 0,
+    "quizzesEnded": 0
+  },
+  "guest": {
+    "visits": 0,
+    "seconds": 0
+  },
+  "flags": []
+}

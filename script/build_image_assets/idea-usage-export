@@ -45,11 +45,23 @@ def usage_root() -> Path:
 
 
 def engine_name() -> str:
-    return os.environ.get("IDEA_USAGE_ENGINE") or socket.gethostname()
+    raw = os.environ.get("IDEA_USAGE_ENGINE") or socket.gethostname()
+    return raw.split(".")[0] or raw
+
+
+def js_ready(value):
+    """Match JSON.stringify number spelling (52 not 52.0) so TS and Python streams match."""
+    if isinstance(value, float) and value.is_integer() and abs(value) <= 2 ** 53:
+        return int(value)
+    if isinstance(value, dict):
+        return {k: js_ready(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [js_ready(v) for v in value]
+    return value
 
 
 def emit(obj: dict) -> None:
-    sys.stdout.write(json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n")
+    sys.stdout.write(json.dumps(js_ready(obj), separators=(",", ":"), ensure_ascii=False, allow_nan=False) + "\n")
 
 
 def reject_args() -> None:
@@ -182,7 +194,7 @@ def export_since(since: str) -> None:
                 for payload in records:
                     emit({
                         "type": "presence",
-                        "schema": payload.get("schema") or DEFAULT_SCHEMAS["presence"],
+                        "schema": DEFAULT_SCHEMAS["presence"],
                         "day": day,
                         "payload": payload,
                     })
@@ -212,18 +224,22 @@ def export_since(since: str) -> None:
                 if instance:
                     day_files.append((instance, entry))
 
-        day_files.sort(key=lambda item: item[0])
         sample_files.sort(key=lambda item: item[0])
 
-        for instance, path in day_files:
+        loaded_days = []
+        for file_instance, path in day_files:
             try:
                 payload = load_json_file(path)
             except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
                 errors += 1
                 continue
+            instance = payload["instance"] if isinstance(payload.get("instance"), str) else file_instance
+            loaded_days.append((instance, payload))
+        loaded_days.sort(key=lambda item: item[0])
+        for instance, payload in loaded_days:
             emit({
                 "type": "day",
-                "schema": payload.get("schema") or DEFAULT_SCHEMAS["day"],
+                "schema": DEFAULT_SCHEMAS["day"],
                 "day": day,
                 "instance": instance,
                 "payload": payload,
@@ -240,7 +256,7 @@ def export_since(since: str) -> None:
             for payload in records:
                 emit({
                     "type": "sample",
-                    "schema": payload.get("schema") or DEFAULT_SCHEMAS["sample"],
+                    "schema": DEFAULT_SCHEMAS["sample"],
                     "day": day,
                     "instance": instance,
                     "payload": payload,
