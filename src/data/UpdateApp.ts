@@ -43,6 +43,7 @@ import {
 import { parseAppId } from './App.js'
 import { setComposeInstanceName } from './InstanceCopy.js'
 import { isUnfinishedFetch } from './UpdateFetch.js'
+import { beginUsageSkip, endUsageSkip } from '../usage/opFlags.js'
 
 export const UPDATE_HELPER_MIN = 5
 export const UPDATE_PROGRESS_TYPE = 'idea/updateProgress'
@@ -235,6 +236,7 @@ export const updateApp = async (
 
     const key = instanceKey(inst.id)
     const gotLock = resourceLock.acquire(key, 'updateApp')
+    if (gotLock) beginUsageSkip('update')
     try {
         const progress = (step: UpdateStep, bytesDone = 0, bytesTotal = 0) =>
             d.broadcast({ type: UPDATE_PROGRESS_TYPE, engineId, instanceId: String(inst.id), step, bytesDone, bytesTotal })
@@ -342,7 +344,10 @@ export const updateApp = async (
             throw err
         }
     } finally {
-        if (gotLock) resourceLock.release(key)
+        if (gotLock) {
+            resourceLock.release(key)
+            endUsageSkip('update')
+        }
     }
 }
 

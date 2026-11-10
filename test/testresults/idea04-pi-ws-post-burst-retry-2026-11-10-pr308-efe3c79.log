@@ -1,0 +1,18 @@
+
+ RUN  v4.1.2 /home/pi/axle-tests/aed-usage-411
+
+ ✓ dist-test/test/automated/ws-post-burst.test.js > Automerge WS server after a burst of short-lived clients (r34 POST-BURST-CPU) > a storage-less client (Console, probe) is sent only the doc it asked for 8038ms
+ ✓ dist-test/test/automated/ws-post-burst.test.js > Automerge WS server after a burst of short-lived clients (r34 POST-BURST-CPU) > a peer with storage (another Engine of the same store) still gets every doc announced 17419ms
+stdout | dist-test/test/automated/ws-post-burst.test.js > Automerge WS server after a burst of short-lived clients (r34 POST-BURST-CPU) > after 10 clients connect, sync and leave at once, a new client is ready promptly
+[post-burst] warm single 6840 ms; burst 25929, 20973, 11627, 27575, 14537, 16681, 8744, 24759, 18834, 22883 ms; next client 6879 ms (budget 13680); server ELU meanwhile 0.19; wall 7568 ms
+
+ ✓ dist-test/test/automated/ws-post-burst.test.js > Automerge WS server after a burst of short-lived clients (r34 POST-BURST-CPU) > after 10 clients connect, sync and leave at once, a new client is ready promptly 45913ms
+ ✓ dist-test/test/automated/ws-post-burst.test.js > storage-less clients still get docs their Engine relays (Console remote command logs) > a doc only Engine B has is found through Engine A 270ms
+ ✓ dist-test/test/automated/ws-post-burst.test.js > storage-less clients still get docs their Engine relays (Console remote command logs) > a doc no Engine has ends unavailable instead of hanging 83ms
+ ✓ dist-test/test/automated/ws-post-burst.test.js > pruneDepartedMessages > drops the departed peer's change-less messages, keeps its edits and everyone else's 42ms
+
+ Test Files  1 passed (1)
+      Tests  6 passed (6)
+   Start at  23:05:26
+   Duration  153.86s (transform 366ms, setup 0ms, import 1.33s, tests 152.01s, environment 0ms)
+
