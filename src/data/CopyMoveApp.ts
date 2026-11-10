@@ -28,6 +28,7 @@ import { Disk, processInstance, diskMountRoot, diskFsRoot, appDataRoot } from '.
 import { stopInstance, startInstance } from './Instance.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { uuid } from '../utils/utils.js'
+import { beginUsageSkip, endUsageSkip } from '../usage/opFlags.js'
 import { createOperation, updateOperation } from './Operations.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
 import { sendCommand } from '../utils/commandUtils.js'
@@ -205,6 +206,7 @@ export const copyApp = async (
         sourceDiskId: sourceDisk.id,
         targetDiskId: targetDisk.id,
     }, cause, { type: 'instance', id: instance.id })
+    beginUsageSkip('move')
 
     const newInstanceId = uuid() as InstanceID
     let wasRunning = false
@@ -477,6 +479,7 @@ export const copyApp = async (
         }
     } finally {
         resourceLock.releaseAll(lockKeys)
+        endUsageSkip('move')
         // Always restart the source if we stopped it and the success path did not
         if (wasRunning && !sourceRestarted) await restartSource('after a failed copy')
     }
@@ -523,6 +526,7 @@ export const moveApp = async (
         sourceDiskId: sourceDisk.id,
         targetDiskId: targetDisk.id,
     }, cause, { type: 'instance', id: instance.id })
+    beginUsageSkip('move')
 
     let wasRunning = false
     // idea#168: set once the helper copy into the target started, cleared when the
@@ -698,6 +702,7 @@ export const moveApp = async (
         }
     } finally {
         resourceLock.releaseAll(moveLockKeys)
+        endUsageSkip('move')
     }
 }
 

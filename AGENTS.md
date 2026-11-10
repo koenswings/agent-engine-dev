@@ -17,6 +17,7 @@ src/               Production TypeScript source
   index.ts         Entry point
   data/            Store, Config, CommandLogStore
   monitors/        USB, mDNS, HTTP, Store, time monitors
+  usage/           idea-usage process (idea#411): sampler, hooks, export — never opens Automerge
   utils/           Shared utilities
 test/
   automated/       Vitest unit + integration tests
@@ -111,7 +112,7 @@ BOT_NAME=<bot> tools/fleet/update-fleet-state.sh <pi> claim "<bot>: <repo>#<issu
 Engine test rules on a claimed Pi:
 
 - Leave the Pi's isolated store, `mdns: false` and its local `config.yaml` untouched.
-- Stop the pm2 Engine as pi before testing (`pm2 stop engine`, never `sudo pm2`): the Engine needs exclusive USB/udev and `/disks`, and the test pre-flight refuses to run next to a live Engine.
+- Stop the pm2 Engine as pi before testing (`pm2 stop engine idea-usage`, never `sudo pm2`): the Engine needs exclusive USB/udev and `/disks`, and the test pre-flight refuses to run next to a live Engine or a live `idea-usage` process (idea#411).
 - Test from a separate checkout, not the deployed tree (`/home/pi/idea/agents/agent-engine-dev`), kept off the fleet store.
 - Keep `IDEA_NETWORK_TESTS` off unless an issue asks for it.
 - Sudoers: you may install your PR's version of `11-engine-files` with `installEngineSudoers` **only** on a Pi you have claimed, and must restore main's version before releasing it. Golden idea02 sudoers stays with Atlas.
@@ -120,7 +121,7 @@ Engine test rules on a claimed Pi:
   `pnpm test:hw --engine-log <engine stdout log> --cycles 2`
   On idea03 this is `cd /home/pi/axle-tests/<checkout> && pnpm test:hw --engine-log $(ls -t engine-run-*.log | head -1) --cycles 2`. The recorded test disk is matched by its IDs from `script/hw-roundtrip-disks.json`, and the run aborts before touching anything if they don't match. On another Pi, add its test disk to that file or pass `--stick-usb-serial`, `--disk-serial` and `--uuid`. It must pass twice in a row. Put the command and the `RESULT PASS` log lines in the PR body. It uses the tester's own `sudo` for the sysfs unplug/re-plug (never the Engine sudoers) and never touches the system drive or golden idea02.
 
-Release when done: restore main in every tree you touched (and main's sudoers if you changed them), restart the Engine with pm2 as pi (`pm2 restart engine`), then:
+Release when done: restore main in every tree you touched (and main's sudoers if you changed them), restart the Engine with pm2 as pi (`pm2 restart engine idea-usage` — or `pm2 start pm2.config.cjs && pm2 save` if `idea-usage` is not in the dump yet), then:
 
 ```bash
 BOT_NAME=<bot> tools/fleet/update-fleet-state.sh --null <pi> claim
@@ -132,6 +133,7 @@ BOT_NAME=<bot> tools/fleet/update-fleet-state.sh <pi> status idle
 The fleet deploy scripts handle all deployment logic. The Dev Bot's job is to produce a passing test suite and open a PR — Ops Bot does the rest.
 
 - **pm2 config changes (idea#128):** `pm2 restart engine` does not re-read `pm2.config.cjs`. A PR that changes it (e.g. `kill_timeout: 10000`) needs, as pi, `pm2 delete engine && pm2 start pm2.config.cjs && pm2 save` (or `pm2 reload pm2.config.cjs`) at deploy. Check with `pm2 describe engine` (`kill timeout` should read 10000). Say so in the PR body.
+- **idea-usage process (idea#411):** `pm2.config.cjs` now also starts `idea-usage` (`./dist/src/usage/main.js`, same env/kill_timeout as `engine`). `pm2 restart engine` does not start it. Deploy needs, as pi, `pm2 delete engine idea-usage && pm2 start pm2.config.cjs && pm2 save` (or `pm2 start pm2.config.cjs --only idea-usage && pm2 save` if `engine` is already running from this file). Check with `pm2 list` that both `engine` and `idea-usage` are online. `installRootHelpers` installs `/etc/tmpfiles.d/idea-usage.conf` (`/run/idea` 0755 pi:pi and `/var/lib/idea/usage` 0750 pi:pi) and creates `/var/lib/idea/usage`. Helper v8 (idea#412) still has to install the root-owned `/usr/local/sbin/idea-usage-export` binary.
 
 ## config.yaml key settings
 

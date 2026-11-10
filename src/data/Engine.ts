@@ -151,13 +151,14 @@ export interface EraseInProgress {
  *   flashCard:  flashCard / cancelFlash; only when the root helper
  *               /usr/local/sbin/idea-flash-card is installed (checked at startup).
  *   clientImages: Engine.clientImages is published.
+ *   usageSummaries: this Engine can export usage (idea#411). Advertised even when usageMonitoring is off.
  * Written at every startup as a whole new list, with capabilitiesBootedAt set
  * to that startup's lastBooted. A Console counts a capability only when
  * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'usageSummaries']
 /** idea#201 §10: advertised only when the flash helper is installed (HELPER_MISSING otherwise) */
 export const FLASH_CARD_CAPABILITY = 'flashCard'
 export const FLASH_HELPER_PATH = '/usr/local/sbin/idea-flash-card'
@@ -800,6 +801,8 @@ export const ensureAptPackages = async (exec: any, pkgs: string[]): Promise<stri
  */
 /** tmpfiles.d entry that creates /run/idea-usb at boot (idea#193). */
 export const USB_TMPFILES_CONF = '/etc/tmpfiles.d/idea-usb.conf'
+/** tmpfiles.d entry that creates /run/idea and /var/lib/idea/usage (idea#411). */
+export const USAGE_TMPFILES_CONF = '/etc/tmpfiles.d/idea-usage.conf'
 
 export const installRootHelpers = async (exec: any, enginePath: string) => {
   print(chalk.blue('  - Installing root helper packages...'))
@@ -824,6 +827,7 @@ export const installRootHelpers = async (exec: any, enginePath: string) => {
   await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-flash-card ${FLASH_HELPER_PATH}`
   // Client images (idea#202 layout): written by the Engine (pi), read by the helper (root)
   await exec`sudo install -d -o pi -g pi -m 0755 /var/lib/idea /var/lib/idea/client-images`
+  await exec`sudo install -d -o pi -g pi -m 0750 /var/lib/idea/usage`
   print(chalk.green(`  - ${FLASH_HELPER_PATH} installed`))
   // idea-app-data: the app-data root helper (idea#168), same rules: root-owned COPY,
   // 0755, in /usr/local/sbin; its sudoers line is in 11-engine-files (visudo -cf above).
@@ -835,6 +839,10 @@ export const installRootHelpers = async (exec: any, enginePath: string) => {
   print(chalk.blue('  - Installing /etc/tmpfiles.d/idea-usb.conf...'))
   await exec`sudo install -o root -g root -m 0644 ${enginePath}/script/build_image_assets/idea-usb.tmpfiles.conf ${USB_TMPFILES_CONF}`
   await exec`sudo systemd-tmpfiles --create ${USB_TMPFILES_CONF}`
+  // idea-usage (idea#411): /run/idea skip flags and /var/lib/idea/usage owned by pi
+  print(chalk.blue('  - Installing /etc/tmpfiles.d/idea-usage.conf...'))
+  await exec`sudo install -o root -g root -m 0644 ${enginePath}/script/build_image_assets/idea-usage.tmpfiles.conf ${USAGE_TMPFILES_CONF}`
+  await exec`sudo systemd-tmpfiles --create ${USAGE_TMPFILES_CONF}`
   // Per-Pi Engine keys: the forced command for peer keys and the sshd drop-in
   await installPeerAccess(exec, enginePath)
   // DHCP option 60 "idea-engine" (idea#209 D8). Here, not only in build-engine, so
