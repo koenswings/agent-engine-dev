@@ -1,0 +1,78 @@
+{
+  "schema": "idea-usage-day/1",
+  "engine": "happy-zebra",
+  "day": "2026-11-12",
+  "app": "nextcloud",
+  "instance": "nextcloud-z",
+  "name": "Nextcloud",
+  "demo": false,
+  "listed": true,
+  "clock": {
+    "synced": true,
+    "correctedBoots": 0
+  },
+  "collectedAt": "2026-11-13T02:12:04+01:00",
+  "hookStatus": "ok",
+  "setup": {
+    "admin": {
+      "total": 1,
+      "beyondSeed": 1
+    },
+    "teacher": {
+      "total": 2,
+      "beyondSeed": 2
+    },
+    "learner": {
+      "total": 10,
+      "beyondSeed": 8
+    },
+    "otherGroups": {
+      "Grade 5": {
+        "total": 4,
+        "beyondSeed": 4
+      }
+    }
+  },
+  "logins": {
+    "admin": {
+      "total": 1,
+      "beyondSeed": 1
+    },
+    "teacher": {
+      "total": 2,
+      "beyondSeed": 2
+    },
+    "learner": {
+      "total": 5,
+      "beyondSeed": 5
+    }
+  },
+  "office": {
+    "opens": 2,
+    "distinctDocuments": 2,
+    "read": 1,
+    "edit": 1,
+    "estimatedMinutes": 30,
+    "byGroup": {
+      "admin": 0,
+      "teacher": 1,
+      "learner": 1
+    },
+    "mime": {
+      "text": 1,
+      "sheet": 1,
+      "slides": 0
+    }
+  },
+  "appsOpened": {
+    "files": 3,
+    "richdocuments": 2
+  },
+  "workflows": {
+    "worksheetShares": 1,
+    "editShares": 0,
+    "fileDropLinks": 0,
+    "fileDropUploads": 0,
+    "schoolFilesShares": 1
+  }
+}

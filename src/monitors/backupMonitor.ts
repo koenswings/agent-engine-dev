@@ -33,6 +33,7 @@ import { Store, getInstance, getDisks, findDiskByName, getLocalEngine } from '..
 import { DocHandle } from '@automerge/automerge-repo'
 import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js'
 import { runWithTrace, flushTrace, getActiveTrace } from '../utils/CommandLogger.js'
+import { beginUsageSkip, endUsageSkip } from '../usage/opFlags.js'
 
 $.verbose = false
 
@@ -124,6 +125,7 @@ export const backupInstance = async (
         instanceId,
         backupDiskId: backupDisk.id,
     }, cause, { type: 'instance', id: instanceId })
+    beginUsageSkip('backup')
 
     try {
         updateOperation(storeHandle, opId, { status: 'Running' })
@@ -267,6 +269,7 @@ export const backupInstance = async (
     } finally {
         activeBackups.delete(instanceId)
         resourceLock.releaseAll(backupLockKeys)
+        endUsageSkip('backup')
     }
 }
 
@@ -496,6 +499,7 @@ export const restoreApp = async (
         instanceId,
         targetDiskId: targetDisk.id,
     }, cause, { type: 'instance', id: instanceId })
+    beginUsageSkip('backup')
 
     try {
         updateOperation(storeHandle, opId, { status: 'Running' })
@@ -575,6 +579,7 @@ export const restoreApp = async (
         throw e
     } finally {
         resourceLock.releaseAll(restoreLockKeys)
+        endUsageSkip('backup')
     }
 }
 

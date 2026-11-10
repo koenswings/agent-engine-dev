@@ -1,0 +1,81 @@
+{
+  "schema": "idea-usage-day/1",
+  "engine": "happy-zebra",
+  "day": "2026-11-12",
+  "app": "kolibri",
+  "instance": "kolibri-a",
+  "name": "Kolibri",
+  "demo": false,
+  "listed": true,
+  "clock": {
+    "synced": true,
+    "correctedBoots": 0
+  },
+  "collectedAt": "2026-11-13T02:12:04+01:00",
+  "hookStatus": "ok",
+  "setup": {
+    "classes": 2,
+    "classesDelta": 1,
+    "learner": {
+      "total": 6,
+      "beyondSeed": 5
+    },
+    "learnerDelta": 2,
+    "learnerEnrolled": 6,
+    "teacher": {
+      "total": 2,
+      "beyondSeed": 1
+    },
+    "teacherDelta": 1,
+    "admin": {
+      "total": 1,
+      "beyondSeed": 1
+    }
+  },
+  "signins": {
+    "learner": {
+      "total": 3,
+      "beyondSeed": 3,
+      "sessions": 4,
+      "minutes": 55
+    },
+    "coach": {
+      "total": 1,
+      "beyondSeed": 1,
+      "sessions": 2,
+      "minutes": 15
+    },
+    "admin": {
+      "total": 1,
+      "beyondSeed": 1,
+      "sessions": 1,
+      "minutes": 3
+    }
+  },
+  "content": [
+    {
+      "channel": "Maths",
+      "title": "Fractions",
+      "kind": "exercise",
+      "role": "learner",
+      "visits": 5,
+      "seconds": 120,
+      "completions": 2,
+      "assigned": true
+    }
+  ],
+  "teaching": {
+    "lessonsCreated": 2,
+    "lessonsVisible": 2,
+    "quizzesCreated": 1,
+    "quizzesStarted": 1,
+    "quizzesEnded": 0
+  },
+  "guest": {
+    "visits": 0,
+    "seconds": 0
+  },
+  "flags": [
+    "sharedLearnerAccount"
+  ]
+}
