@@ -36,11 +36,16 @@ const okKolibri = (day = '2026-11-12') => JSON.stringify({
     schema: 'idea-usage-day/1',
     day,
     app: 'kolibri',
-    setup: { classes: 0, classesDelta: 0, learnersRegistered: 0, learnersRegisteredDelta: 0, learnersEnrolled: 0, teachers: 0, teachersDelta: 0, admins: 0 },
+    setup: {
+        classes: 0, classesDelta: 0,
+        learner: { total: 0, beyondSeed: 0 }, learnerDelta: 0, learnerEnrolled: 0,
+        teacher: { total: 0, beyondSeed: 0 }, teacherDelta: 0,
+        admin: { total: 0, beyondSeed: 0 },
+    },
     signins: {
-        learner: { users: 0, sessions: 0, minutes: 0 },
-        coach: { users: 0, sessions: 0, minutes: 0 },
-        admin: { users: 0, sessions: 0, minutes: 0 },
+        learner: { total: 0, beyondSeed: 0, sessions: 0, minutes: 0 },
+        coach: { total: 0, beyondSeed: 0, sessions: 0, minutes: 0 },
+        admin: { total: 0, beyondSeed: 0, sessions: 0, minutes: 0 },
     },
     content: [],
     teaching: { lessonsCreated: 0, lessonsVisible: 0, quizzesCreated: 0, quizzesStarted: 0, quizzesEnded: 0 },
@@ -141,6 +146,29 @@ describe('runDayHook', () => {
         const n = await runDayHook({ target: listed({ hook: null, instanceId: 'plain-1' }), day: '2026-11-12', root: tmp, clock })
         expect(n.hookStatus).toBe('no-hook')
     })
+    it('writes a no-payload stub that a later ok result replaces', async () => {
+        const failed = await runDayHook({
+            target: listed(),
+            day: '2026-11-12',
+            root: tmp,
+            clock,
+            exec: async () => ({ stdout: '', stderr: 'boom', exitCode: 1, timedOut: false }),
+        })
+        expect(failed.hookStatus).toBe('failed')
+        expect(failed.setup).toBeUndefined()
+        expect(failed.signins).toBeUndefined()
+        expect(readDayFile('2026-11-12', 'kolibri-1', tmp)?.hookStatus).toBe('failed')
+        const ok = await runDayHook({
+            target: listed(),
+            day: '2026-11-12',
+            root: tmp,
+            clock,
+            exec: async () => ({ stdout: okKolibri(), stderr: '', exitCode: 0, timedOut: false }),
+        })
+        expect(ok.hookStatus).toBe('ok')
+        expect(ok.setup).toBeTruthy()
+        expect(readDayFile('2026-11-12', 'kolibri-1', tmp)?.hookStatus).toBe('ok')
+    })
     it('writes skipped with skipReason and does not call exec', async () => {
         let called = 0
         const rec = await runDayHook({
@@ -170,7 +198,7 @@ describe('runDayHook', () => {
             target: listed({ instanceId: 'nc-1', app: 'nextcloud', name: 'Nextcloud', hook: { service: 'app', command: ['/hooks/usage.sh'], timeoutS: 20 } }),
             root: tmp,
             clock,
-            exec: async () => ({ stdout: JSON.stringify({ schema: 'idea-usage-sample/1', app: 'nextcloud', office: { tokens: 2, distinctDocuments: 1, read: 1, edit: 1 } }), stderr: '', exitCode: 0, timedOut: false }),
+            exec: async () => ({ stdout: JSON.stringify({ schema: 'idea-usage-sample/1', app: 'nextcloud', office: { tokens: 2, documents: ['1111111111111111111111111111111111111111111111111111111111111111'], read: 1, edit: 1 } }), stderr: '', exitCode: 0, timedOut: false }),
         })
         expect(rec?.office).toMatchObject({ tokens: 2 })
         expect(fs.existsSync(path.join(tmp, '2026-11-13', 'nc-1.samples.ndjson'))).toBe(true)

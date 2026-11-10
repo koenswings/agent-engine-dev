@@ -210,7 +210,7 @@ The hook does **not** know the Engine instance id, the display name, or whether 
 | `schema` | hook (required) | `idea-usage-day/1` or `idea-usage-sample/1`. |
 | `day` | hook (required in day mode) | Must equal the requested `YYYY-MM-DD`. |
 | `app` | hook (required) | Lowercase app name: `kolibri`, `nextcloud`, `kiwix`, or another app. Not a closed enum. |
-| `demo` | hook optional + Engine | Hook may set `true` when the Kolibri facility is the seed “IDEA Demo School”, or when a Kiwix ZIM is the simple-English demo set. Engine ORs that with a display-name heuristic: the instance name contains `Demo` as a word, or equals / contains `Wikipedia (Demo)`. |
+| `demo` | hook optional + Engine | Hook may set `true` when the Kolibri facility is the seed “IDEA Demo School”, or when a Kiwix ZIM is the simple-English demo set. Engine ORs that with a display-name heuristic: after splitting the instance name on spaces, `_` or `-`, any token equals `demo` (case-insensitive), so `Kolibri_Demo` and `Wikipedia (Demo)` both match. |
 | app payload | hook | `setup`, `signins`, `content`, `teaching`, `guest`, `flags`, `logins`, `office`, `appsOpened`, `workflows`, `pageViews`, `distinctArticles`, `sessions`, `topArticles`, `byHour`, … See §5.3. |
 | `engine` | Engine | Kernel / Pi hostname (`happy-zebra`), not the Automerge engine UUID and not a deployment id. |
 | `instance` | Engine | Listed: store instance id (`kolibri-3f2a…`). Unlisted: synthetic id (§4.2). |
@@ -221,7 +221,7 @@ The hook does **not** know the Engine instance id, the display name, or whether 
 | `hookStatus` | Engine | `ok` \| `timeout` \| `failed` \| `invalid` \| `skipped` \| `unlisted-no-hook` \| `no-hook`. |
 | `skipReason` | Engine | `backup` \| `update` \| `move` \| `temperature`, only when `hookStatus` is `skipped`. |
 
-Demo-seed classwork is excluded **inside** the Kolibri hook by the seed’s IDs, not by username (#413). That is hook logic, not an Engine field.
+The hook emits each role count as `{total, beyondSeed}` so idea can see both the raw figure and the count after excluding demo-seed classwork. Seed exclusion uses the seed’s IDs, not usernames (#413). That is hook logic, not an Engine field.
 
 ### 5.2 Hook stdout: `idea-usage-day/1`
 
@@ -247,6 +247,8 @@ App-specific payload fields sit alongside those three (plus optional `demo`). Nu
 
 These names refine proposal §7.6. Unknown extra keys are ignored (forward compatible); required keys missing from an app that should have them fail the schema.
 
+Role keys are singular everywhere — `admin`, `teacher`, `learner` — in `setup`, `logins` and `office.byGroup`, for every App (never `admins`, `teachers` or `learners`). Each role count is `{total, beyondSeed}`: `total` includes demo-seed accounts, `beyondSeed` excludes them. Kolibri `signins` also carry `sessions` and `minutes` on the same object (`coach` is an extra Kolibri role and uses the same shape).
+
 **Kolibri** (`app: "kolibri"`) — Q3, Q4, Q6:
 
 ```json
@@ -257,13 +259,16 @@ These names refine proposal §7.6. Unknown extra keys are ignored (forward compa
   "demo": false,
   "setup": {
     "classes": 0, "classesDelta": 0,
-    "learnersRegistered": 0, "learnersRegisteredDelta": 0, "learnersEnrolled": 0,
-    "teachers": 0, "teachersDelta": 0, "admins": 0
+    "learner": { "total": 0, "beyondSeed": 0 },
+    "learnerDelta": 0, "learnerEnrolled": 0,
+    "teacher": { "total": 0, "beyondSeed": 0 },
+    "teacherDelta": 0,
+    "admin": { "total": 0, "beyondSeed": 0 }
   },
   "signins": {
-    "learner": { "users": 0, "sessions": 0, "minutes": 0 },
-    "coach":   { "users": 0, "sessions": 0, "minutes": 0 },
-    "admin":   { "users": 0, "sessions": 0, "minutes": 0 }
+    "learner": { "total": 0, "beyondSeed": 0, "sessions": 0, "minutes": 0 },
+    "coach":   { "total": 0, "beyondSeed": 0, "sessions": 0, "minutes": 0 },
+    "admin":   { "total": 0, "beyondSeed": 0, "sessions": 0, "minutes": 0 }
   },
   "content": [
     {
@@ -291,16 +296,20 @@ These names refine proposal §7.6. Unknown extra keys are ignored (forward compa
   "app": "nextcloud",
   "demo": false,
   "setup": {
-    "admin": 0, "teachers": 0, "learners": 0,
-    "otherGroups": { "Grade 5": 0 }
+    "admin": { "total": 0, "beyondSeed": 0 },
+    "teacher": { "total": 0, "beyondSeed": 0 },
+    "learner": { "total": 0, "beyondSeed": 0 },
+    "otherGroups": { "Grade 5": { "total": 0, "beyondSeed": 0 } }
   },
   "logins": {
-    "admin": { "users": 0 }, "teachers": { "users": 0 }, "learners": { "users": 0 }
+    "admin": { "total": 0, "beyondSeed": 0 },
+    "teacher": { "total": 0, "beyondSeed": 0 },
+    "learner": { "total": 0, "beyondSeed": 0 }
   },
   "office": {
     "opens": 0, "distinctDocuments": 0, "read": 0, "edit": 0,
     "estimatedMinutes": 0,
-    "byGroup": { "admin": 0, "teachers": 0, "learners": 0 },
+    "byGroup": { "admin": 0, "teacher": 0, "learner": 0 },
     "mime": { "text": 0, "sheet": 0, "slides": 0 }
   },
   "appsOpened": { "files": 0, "richdocuments": 0 },
@@ -342,22 +351,22 @@ Printed every 15 minutes. Nextcloud reads current WOPI token rows (no usernames:
   "sampledAt": "2026-11-12T10:15:00+02:00",
   "office": {
     "tokens": 0,
-    "distinctDocuments": 0,
+    "documents": ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
     "read": 0,
     "edit": 0,
-    "byGroup": { "admin": 0, "teachers": 0, "learners": 0 },
+    "byGroup": { "admin": 0, "teacher": 0, "learner": 0 },
     "mime": { "text": 0, "sheet": 0, "slides": 0 }
   }
 }
 ```
 
-`sampledAt` is optional (the Engine also records its own collection time). `supported: false` is the only required extra key when the App has no sample.
+`documents` is an array of SHA-256 hex digests (64 lowercase hex characters) of the WOPI `fileId`, hashed with a per-instance salt. It must not contain file names, raw file ids, or other content. The Engine uses the union of these ids across the day to compute stored `distinctDocuments`. `sampledAt` is optional (the Engine also records its own collection time). `supported: false` is the only required extra key when the App has no sample.
 
 ### 5.5 Stored day file (what lands on disk and is exported as `type: day`)
 
 Path: `/var/lib/idea/usage/<day>/<instanceId>.json`.
 
-The Engine writes this file only after a successful schema check (`hookStatus: ok`), except for the explicit stub rows in §5.7. Invalid, failed, timed-out or skipped output does not overwrite a good file.
+The Engine writes this file after a successful schema check (`hookStatus: ok`), or as a no-payload stub (§5.7). A non-`ok` result never overwrites a file whose `hookStatus` is `ok`; a later `ok` result replaces a stub.
 
 The stored object is the hook body plus the Engine envelope:
 
@@ -388,7 +397,7 @@ The stored object is the hook body plus the Engine envelope:
 1. **Presence is not merged into the instance file.** Kit-level presence samples stay in a sibling file (proposal §7.6: “not inside an instance file”). idea intersects presence windows with instance summaries after the pull.
 2. **Identity and honesty** (`engine`, `instance`, `name`, `listed`, `clock`, `collectedAt`, `hookStatus`) always come from the Engine.
 3. **`demo`** is the OR described in §5.1.
-4. **`office` (Nextcloud):** if the Engine stored any `idea-usage-sample/1` records for that instance and day, it reduces them into the stored `office` object (max `tokens` seen, union of `distinctDocuments` estimated as the max distinct count observed, sums of `read`/`edit` treated as snapshot counts not additive events, `byGroup` and `mime` taken from the same reduction, `estimatedMinutes` from consecutive samples in which the same mime/group still has tokens, × 15). If no samples exist, the hook’s `office` is kept when present; otherwise `office` is omitted.
+4. **`office` (Nextcloud):** if the Engine stored any `idea-usage-sample/1` records for that instance and day, it reduces them into a stored `office` object with exactly these keys: `{opens, distinctDocuments, read, edit, estimatedMinutes, byGroup:{admin,teacher,learner}, mime:{text,sheet,slides}}`. `opens` is the max of the sample `tokens` values. `distinctDocuments` is the size of the union of every sample’s `documents` (not a max of counts). `read` and `edit` are the max across samples (they are snapshot counts, not additive events). `estimatedMinutes` is the number of consecutive `tokens > 0` samples × 15 (each contiguous run of active samples counts every sample in the run). `byGroup` and `mime` take the max per key and always emit the keys above (0 if never seen). If no samples exist, the hook’s `office` is kept when present; otherwise `office` is omitted.
 5. Other app payload fields are copied from the hook as validated.
 
 ### 5.6 Presence samples: `idea-usage-presence/1`
@@ -412,9 +421,13 @@ One append every 5 minutes to `/var/lib/idea/usage/<day>/presence.ndjson` (the `
 
 Sources: `/proc/sys/kernel/random/boot_id`, `/proc/uptime`, `timedatectl show --property=NTPSynchronized`, `vcgencmd get_throttled` and `vcgencmd measure_temp`. Clock honesty: `bootId` plus `uptimeS` gives reliable on-durations; an off-duration is only known once a later NTP-synced sample arrives. The dashboard uses `gapUnknown` rather than guessing (that derivation happens on idea, not on the kit).
 
-### 5.7 Stub row: `unlisted-no-hook` (and `no-hook`)
+### 5.7 Stub rows (`timeout`, `failed`, `invalid`, `skipped`, `unlisted-no-hook`, `no-hook`)
 
-When an unlisted container has no borrowed hook, or a listed instance’s App has no usable `x-app.usage`, the Engine writes (or updates) a day file with no app payload:
+A hook run whose status is not `ok` writes a **no-payload** stub day file (identity and honesty fields only: `schema`, `engine`, `day`, `app`, `instance`, `name`, `demo`, `listed`, `clock`, `collectedAt`, `hookStatus`, and `skipReason` when `hookStatus` is `skipped`). This happens only when no `ok` file already exists for that `instance` and `day`. A stub never overwrites an `ok` file; a later `ok` result replaces the stub. One stub may replace another (for example `failed` then `skipped`).
+
+When `hookStatus` is `skipped`, `skipReason` is one of `backup`, `update`, `move` or `temperature`.
+
+Unlisted container with no borrowed hook:
 
 ```json
 {
@@ -432,7 +445,25 @@ When an unlisted container has no borrowed hook, or a listed instance’s App ha
 }
 ```
 
-`app` is best-effort from the image name. This file may overwrite a previous stub for the same day and instance, but never a file whose `hookStatus` was `ok`.
+Listed instance whose App has no usable `x-app.usage`:
+
+```json
+{
+  "schema": "idea-usage-day/1",
+  "engine": "happy-zebra",
+  "day": "2026-11-12",
+  "app": "kolibri",
+  "instance": "kolibri-3f2a…",
+  "name": "Kolibri",
+  "demo": false,
+  "listed": true,
+  "clock": { "synced": true, "correctedBoots": 0 },
+  "collectedAt": "2026-11-13T02:12:04+02:00",
+  "hookStatus": "no-hook"
+}
+```
+
+`app` is best-effort from the image name when the instance is unlisted.
 
 ---
 

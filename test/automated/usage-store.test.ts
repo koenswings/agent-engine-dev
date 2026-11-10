@@ -127,27 +127,34 @@ describe('demo and office merge', () => {
         expect(resolveDemo(true, 'Kolibri')).toBe(true)
         expect(resolveDemo(false, 'Kolibri Demo Class')).toBe(true)
         expect(resolveDemo(false, 'Wikipedia (Demo)')).toBe(true)
+        expect(resolveDemo(false, 'Kolibri_Demo')).toBe(true)
+        expect(resolveDemo(false, 'Kolibri-Demo')).toBe(true)
+        expect(resolveDemo(false, 'Demonstration')).toBe(false)
     })
-    it('reduces office samples using max snapshot counts and 15-minute consecutive tokens', () => {
+    it('reduces office samples: opens=max tokens, distinctDocuments=union of ids, read/edit=max, minutes=consecutive tokens>0 × 15', () => {
         const samples: SampleRecord[] = [
-            { schema: 'idea-usage-sample/1', app: 'nextcloud', office: { tokens: 2, distinctDocuments: 1, read: 2, edit: 1, byGroup: { teachers: 2 }, mime: { text: 2 } } },
-            { schema: 'idea-usage-sample/1', app: 'nextcloud', office: { tokens: 3, distinctDocuments: 2, read: 1, edit: 2, byGroup: { teachers: 1, learners: 2 }, mime: { text: 1, sheet: 1 } } },
-            { schema: 'idea-usage-sample/1', app: 'nextcloud', office: { tokens: 0, distinctDocuments: 0, read: 0, edit: 0 } },
+            { schema: 'idea-usage-sample/1', app: 'nextcloud', office: { tokens: 2, documents: ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'], read: 2, edit: 1, byGroup: { teacher: 2 }, mime: { text: 2 } } },
+            { schema: 'idea-usage-sample/1', app: 'nextcloud', office: { tokens: 3, documents: ['bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'], read: 1, edit: 2, byGroup: { teacher: 1, learner: 2 }, mime: { text: 1, sheet: 1 } } },
+            { schema: 'idea-usage-sample/1', app: 'nextcloud', office: { tokens: 0, documents: [], read: 0, edit: 0 } },
         ]
         const office = reduceOffice(samples) as Record<string, any>
-        expect(office.tokens).toBe(3)
-        expect(office.distinctDocuments).toBe(2)
-        expect(office.read).toBe(2)
-        expect(office.edit).toBe(2)
-        expect(office.byGroup).toEqual({ teachers: 2, learners: 2 })
-        expect(office.mime).toEqual({ text: 2, sheet: 1 })
-        expect(office.estimatedMinutes).toBe(15)
-        expect(office.opens).toBe(2)
+        expect(office).toEqual({
+            opens: 3,
+            distinctDocuments: 3,
+            read: 2,
+            edit: 2,
+            estimatedMinutes: 30,
+            byGroup: { admin: 0, teacher: 2, learner: 2 },
+            mime: { text: 2, sheet: 1, slides: 0 },
+        })
+        expect(office.tokens).toBeUndefined()
     })
     it('prefers the sample reduction on a stored Nextcloud day file', () => {
-        appendSample('2026-11-12', 'nc-1', { schema: 'idea-usage-sample/1', app: 'nextcloud', office: { tokens: 4, distinctDocuments: 1, read: 1, edit: 0 } }, tmp)
+        appendSample('2026-11-12', 'nc-1', { schema: 'idea-usage-sample/1', app: 'nextcloud', office: { tokens: 4, documents: ['1111111111111111111111111111111111111111111111111111111111111111'], read: 1, edit: 0 } }, tmp)
         const rec = applyOfficeMerge(dayFile({ app: 'nextcloud', instance: 'nc-1', office: { tokens: 1 } }), tmp)
-        expect((rec.office as any).tokens).toBe(4)
+        expect((rec.office as any).opens).toBe(4)
+        expect((rec.office as any).distinctDocuments).toBe(1)
+        expect((rec.office as any).tokens).toBeUndefined()
     })
 })
 

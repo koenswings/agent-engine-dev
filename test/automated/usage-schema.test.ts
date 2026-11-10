@@ -8,11 +8,16 @@ const kolibri = (over: Record<string, unknown> = {}) => ({
     schema: 'idea-usage-day/1',
     day: '2026-11-12',
     app: 'kolibri',
-    setup: { classes: 1, classesDelta: 0, learnersRegistered: 2, learnersRegisteredDelta: -1, learnersEnrolled: 2, teachers: 1, teachersDelta: 0, admins: 1 },
+    setup: {
+        classes: 1, classesDelta: 0,
+        learner: { total: 2, beyondSeed: 2 }, learnerDelta: -1, learnerEnrolled: 2,
+        teacher: { total: 1, beyondSeed: 1 }, teacherDelta: 0,
+        admin: { total: 1, beyondSeed: 1 },
+    },
     signins: {
-        learner: { users: 1, sessions: 2, minutes: 3 },
-        coach: { users: 0, sessions: 0, minutes: 0 },
-        admin: { users: 1, sessions: 1, minutes: 4 },
+        learner: { total: 1, beyondSeed: 1, sessions: 2, minutes: 3 },
+        coach: { total: 0, beyondSeed: 0, sessions: 0, minutes: 0 },
+        admin: { total: 1, beyondSeed: 1, sessions: 1, minutes: 4 },
     },
     content: [{ channel: 'Maths', title: 'Intro', kind: 'video', role: 'learner', visits: 1, seconds: 10, completions: 0, assigned: true }],
     teaching: { lessonsCreated: 0, lessonsVisible: 0, quizzesCreated: 0, quizzesStarted: 0, quizzesEnded: 0 },
@@ -24,9 +29,18 @@ const nextcloud = (over: Record<string, unknown> = {}) => ({
     schema: 'idea-usage-day/1',
     day: '2026-11-12',
     app: 'nextcloud',
-    setup: { admin: 1, teachers: 2, learners: 10, otherGroups: { 'Grade 5': 4 } },
-    logins: { admin: { users: 1 }, teachers: { users: 2 }, learners: { users: 5 } },
-    office: { opens: 1, distinctDocuments: 2, read: 1, edit: 1, estimatedMinutes: 15, byGroup: { teachers: 1 }, mime: { text: 1 } },
+    setup: {
+        admin: { total: 1, beyondSeed: 1 },
+        teacher: { total: 2, beyondSeed: 2 },
+        learner: { total: 10, beyondSeed: 8 },
+        otherGroups: { 'Grade 5': { total: 4, beyondSeed: 4 } },
+    },
+    logins: {
+        admin: { total: 1, beyondSeed: 1 },
+        teacher: { total: 2, beyondSeed: 2 },
+        learner: { total: 5, beyondSeed: 5 },
+    },
+    office: { opens: 1, distinctDocuments: 2, read: 1, edit: 1, estimatedMinutes: 15, byGroup: { teacher: 1 }, mime: { text: 1 } },
     ...over,
 })
 
@@ -70,7 +84,7 @@ describe('validateDayHook', () => {
         expect(validateDayHook(body, '2026-11-12').ok).toBe(false)
     })
     it('accepts a negative Kolibri delta', () => {
-        expect(validateDayHook(kolibri({ setup: { ...kolibri().setup, learnersRegisteredDelta: -3 } }), '2026-11-12').ok).toBe(true)
+        expect(validateDayHook(kolibri({ setup: { ...kolibri().setup, learnerDelta: -3, teacherDelta: -1 } }), '2026-11-12').ok).toBe(true)
     })
     it('rejects a Kiwix byHour that is not 24 long', () => {
         expect(validateDayHook(kiwix({ byHour: [1, 2, 3] }), '2026-11-12').ok).toBe(false)
@@ -88,6 +102,22 @@ describe('validateDayHook', () => {
         delete (body as any).office
         expect(validateDayHook(body, '2026-11-12').ok).toBe(true)
     })
+    it('rejects plural role keys and bare-number role counts', () => {
+        expect(validateDayHook(nextcloud({ setup: { admin: 1, teacher: 2, learner: 3 } }), '2026-11-12').ok).toBe(false)
+        const body = nextcloud()
+        delete (body.setup as any).teacher
+        ;(body.setup as any).teachers = { total: 2, beyondSeed: 2 }
+        expect(validateDayHook(body, '2026-11-12').ok).toBe(false)
+    })
+    it('rejects a role count whose beyondSeed exceeds total', () => {
+        expect(validateDayHook(nextcloud({
+            setup: {
+                admin: { total: 1, beyondSeed: 1 },
+                teacher: { total: 1, beyondSeed: 2 },
+                learner: { total: 1, beyondSeed: 1 },
+            },
+        }), '2026-11-12').ok).toBe(false)
+    })
 })
 
 describe('validateSampleHook', () => {
@@ -95,7 +125,7 @@ describe('validateSampleHook', () => {
         const r = validateSampleHook({
             schema: 'idea-usage-sample/1',
             app: 'nextcloud',
-            office: { tokens: 2, distinctDocuments: 1, read: 1, edit: 1, byGroup: { teachers: 2 }, mime: { text: 2 } },
+            office: { tokens: 2, documents: ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'], read: 1, edit: 1, byGroup: { teacher: 2 }, mime: { text: 2 } },
         })
         expect(r.ok).toBe(true)
     })
@@ -104,6 +134,20 @@ describe('validateSampleHook', () => {
     })
     it('rejects an unknown sample schema', () => {
         expect(validateSampleHook({ schema: 'idea-usage-sample/2', app: 'nextcloud' }).ok).toBe(false)
+    })
+    it('rejects a sample office without documents', () => {
+        expect(validateSampleHook({
+            schema: 'idea-usage-sample/1',
+            app: 'nextcloud',
+            office: { tokens: 1, read: 1, edit: 0 },
+        }).ok).toBe(false)
+    })
+    it('rejects documents that are not 64-char lowercase hex', () => {
+        const office = { tokens: 1, documents: ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'], read: 0, edit: 0 }
+        expect(validateSampleHook({ schema: 'idea-usage-sample/1', app: 'nextcloud', office }).ok).toBe(true)
+        expect(validateSampleHook({ schema: 'idea-usage-sample/1', app: 'nextcloud', office: { ...office, documents: ['DOC-1'] } }).ok).toBe(false)
+        expect(validateSampleHook({ schema: 'idea-usage-sample/1', app: 'nextcloud', office: { ...office, documents: ['AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'] } }).ok).toBe(false)
+        expect(validateSampleHook({ schema: 'idea-usage-sample/1', app: 'nextcloud', office: { ...office, documents: ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'] } }).ok).toBe(false)
     })
 })
 

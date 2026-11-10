@@ -36,11 +36,16 @@ const target: ListedTarget = {
 
 const okBody = (day: string) => JSON.stringify({
     schema: 'idea-usage-day/1', day, app: 'kolibri',
-    setup: { classes: 0, classesDelta: 0, learnersRegistered: 0, learnersRegisteredDelta: 0, learnersEnrolled: 0, teachers: 0, teachersDelta: 0, admins: 0 },
+    setup: {
+        classes: 0, classesDelta: 0,
+        learner: { total: 0, beyondSeed: 0 }, learnerDelta: 0, learnerEnrolled: 0,
+        teacher: { total: 0, beyondSeed: 0 }, teacherDelta: 0,
+        admin: { total: 0, beyondSeed: 0 },
+    },
     signins: {
-        learner: { users: 0, sessions: 0, minutes: 0 },
-        coach: { users: 0, sessions: 0, minutes: 0 },
-        admin: { users: 0, sessions: 0, minutes: 0 },
+        learner: { total: 0, beyondSeed: 0, sessions: 0, minutes: 0 },
+        coach: { total: 0, beyondSeed: 0, sessions: 0, minutes: 0 },
+        admin: { total: 0, beyondSeed: 0, sessions: 0, minutes: 0 },
     },
     content: [],
     teaching: { lessonsCreated: 0, lessonsVisible: 0, quizzesCreated: 0, quizzesStarted: 0, quizzesEnded: 0 },

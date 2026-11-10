@@ -229,7 +229,7 @@ export function buildDayRecord(opts: {
     engine: string
 }): DayFile {
     const demo = resolveDemo(opts.hookBody?.demo, opts.target.name)
-    const payload = opts.hookBody ? hookPayloadFields(opts.hookBody) : {}
+    const payload = (opts.hookStatus === 'ok' && opts.hookBody) ? hookPayloadFields(opts.hookBody) : {}
     const record: DayFile = {
         schema: USAGE_SCHEMA_DAY,
         engine: opts.engine,

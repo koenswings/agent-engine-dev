@@ -50,13 +50,21 @@ function expectIntFields(obj: Record<string, unknown>, fields: string[], label: 
     return null
 }
 
-function roleCounts(value: unknown, label: string, keys: string[]): string | null {
+function expectRoleCount(value: unknown, label: string): string | null {
+    const obj = expectObj(value, label)
+    if (typeof obj === 'string') return obj
+    if (!isNonNegInt(obj.total)) return `${label}.total must be a non-negative integer`
+    if (!isNonNegInt(obj.beyondSeed)) return `${label}.beyondSeed must be a non-negative integer`
+    if ((obj.beyondSeed as number) > (obj.total as number)) return `${label}.beyondSeed cannot exceed total`
+    return null
+}
+
+function expectRoleCountMap(value: unknown, label: string, keys: string[]): string | null {
     const obj = expectObj(value, label)
     if (typeof obj === 'string') return obj
     for (const k of keys) {
-        const row = expectObj(obj[k], `${label}.${k}`)
-        if (typeof row === 'string') return row
-        if (!isNonNegInt(row.users)) return `${label}.${k}.users must be a non-negative integer`
+        const err = expectRoleCount(obj[k], `${label}.${k}`)
+        if (err) return err
     }
     return null
 }
@@ -64,16 +72,20 @@ function roleCounts(value: unknown, label: string, keys: string[]): string | nul
 function validateKolibri(body: Record<string, unknown>): string | null {
     const setup = expectObj(body.setup, 'setup')
     if (typeof setup === 'string') return setup
-    const err = expectNonNegFields(setup, ['classes', 'learnersRegistered', 'learnersEnrolled', 'teachers', 'admins'], 'setup')
-        || expectIntFields(setup, ['classesDelta', 'learnersRegisteredDelta', 'teachersDelta'], 'setup')
+    const err = expectNonNegFields(setup, ['classes', 'learnerEnrolled'], 'setup')
+        || expectIntFields(setup, ['classesDelta', 'learnerDelta', 'teacherDelta'], 'setup')
+        || expectRoleCount(setup.learner, 'setup.learner')
+        || expectRoleCount(setup.teacher, 'setup.teacher')
+        || expectRoleCount(setup.admin, 'setup.admin')
     if (err) return err
 
     const signins = expectObj(body.signins, 'signins')
     if (typeof signins === 'string') return signins
     for (const role of ['learner', 'coach', 'admin']) {
-        const row = expectObj(signins[role], `signins.${role}`)
-        if (typeof row === 'string') return row
-        const sErr = expectNonNegFields(row, ['users', 'sessions', 'minutes'], `signins.${role}`)
+        const rowErr = expectRoleCount(signins[role], `signins.${role}`)
+        if (rowErr) return rowErr
+        const row = signins[role] as Record<string, unknown>
+        const sErr = expectNonNegFields(row, ['sessions', 'minutes'], `signins.${role}`)
         if (sErr) return sErr
     }
 
@@ -108,16 +120,17 @@ function validateKolibri(body: Record<string, unknown>): string | null {
 function validateNextcloud(body: Record<string, unknown>): string | null {
     const setup = expectObj(body.setup, 'setup')
     if (typeof setup === 'string') return setup
-    const err = expectNonNegFields(setup, ['admin', 'teachers', 'learners'], 'setup')
+    const err = expectRoleCountMap(setup, 'setup', ['admin', 'teacher', 'learner'])
     if (err) return err
     if (setup.otherGroups !== undefined) {
         const og = expectObj(setup.otherGroups, 'setup.otherGroups')
         if (typeof og === 'string') return og
         for (const [k, v] of Object.entries(og)) {
-            if (!isNonNegInt(v)) return `setup.otherGroups.${k} must be a non-negative integer`
+            const gErr = expectRoleCount(v, `setup.otherGroups.${k}`)
+            if (gErr) return gErr
         }
     }
-    const loginErr = roleCounts(body.logins, 'logins', ['admin', 'teachers', 'learners'])
+    const loginErr = expectRoleCountMap(body.logins, 'logins', ['admin', 'teacher', 'learner'])
     if (loginErr) return loginErr
     if (body.office !== undefined) {
         const oErr = validateOfficeLike(body.office, 'office', false)
@@ -141,6 +154,12 @@ function validateOfficeLike(value: unknown, label: string, requireTokens: boolea
         if (obj[k] !== undefined && !isNonNegInt(obj[k])) return `${label}.${k} must be a non-negative integer`
     }
     if (requireTokens && obj.tokens === undefined) return `${label}.tokens is required`
+    if (requireTokens) {
+        const HEX64 = /^[0-9a-f]{64}$/
+        if (!Array.isArray(obj.documents) || !obj.documents.every(x => typeof x === 'string' && HEX64.test(x))) {
+            return `${label}.documents must be an array of 64-char lowercase hex SHA-256 strings`
+        }
+    }
     for (const mapName of ['byGroup', 'mime']) {
         if (obj[mapName] === undefined) continue
         const map = expectObj(obj[mapName], `${label}.${mapName}`)
