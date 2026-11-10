@@ -44,6 +44,18 @@ describe('pm2 and install', () => {
         expect(cfg.apps.map((a: { name: string }) => a.name)).toEqual(['engine', 'idea-usage'])
         expect(cfg.apps[1].script).toBe('./dist/src/usage/main.js')
         expect(cfg.apps[1].kill_timeout).toBe(10000)
+        // Belt-and-braces env is optional; the entry must not need it (idea#416).
+        expect(cfg.apps[1].env?.IDEA_USAGE_AS_MAIN).toBeUndefined()
+    })
+    it('main.ts always starts; the loop lives in an importable module (idea#416)', () => {
+        const strip = (s: string) => s.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '')
+        const main = strip(read('src/usage/main.ts'))
+        const proc = strip(read('src/usage/process.ts'))
+        expect(proc).toMatch(/export async function startUsageProcess/)
+        expect(main).toMatch(/startUsageProcess\(/)
+        expect(main).not.toMatch(/process\.argv\[1\]/)
+        expect(main).not.toMatch(/IDEA_USAGE_AS_MAIN/)
+        expect(main).not.toMatch(/isMain/)
     })
     it('tmpfiles config creates /run/idea and /var/lib/idea/usage', () => {
         const conf = read('script/build_image_assets/idea-usage.tmpfiles.conf')
