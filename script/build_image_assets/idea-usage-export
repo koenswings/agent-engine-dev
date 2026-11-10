@@ -1,0 +1,348 @@
+#!/usr/bin/python3
+# idea-usage-export — forced command for the field-usage pull (idea#412).
+#
+# Installed as a root-owned COPY at /usr/local/sbin/idea-usage-export (0755, never
+# a symlink) by build-engine (installPeerAccess) and by
+# `idea-app-data install-usage-key`. sshd runs it as pi for the usage-pull key in
+# /etc/ssh/idea_usage_keys/pi:
+#   restrict,from="<sidecar Tailscale IPv4>",command="/usr/local/sbin/idea-usage-export"
+# so this process cannot open a shell, change unrelated files, or run anything else.
+# It is not reached through idea-peer-gate; sync-peers never writes that key file.
+#
+# Accepts only (via SSH_ORIGINAL_COMMAND, or argv so tests can call it directly):
+#   since YYYY-MM-DD
+#   archive-and-clear --before YYYY-MM-DD
+# Wire format: idea#411 docs/USAGE-CONTRACT.md §7 (PR agent-engine-dev#308) /
+# idea PR #410 §7.4. Exit 0 stream; exit 2 invalid arguments; exit 10 disabled
+# (empty stdout, stderr "disabled"); exit 1 unexpected failure.
+#
+# Reads /var/lib/idea/usage (or IDEA_USAGE_ROOT in tests). Never follows symlinks
+# out of that tree. Does not touch settings.json. No secrets, no real keys.
+
+from __future__ import annotations
+
+import datetime
+import json
+import os
+import re
+import socket
+import sys
+from pathlib import Path
+
+DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+DEFAULT_ROOT = "/var/lib/idea/usage"
+DEFAULT_SCHEMAS = {
+    "presence": "idea-usage-presence/1",
+    "day": "idea-usage-day/1",
+    "sample": "idea-usage-sample/1",
+}
+SHELL_META = set('|;&<>`$(){}[]!*?~#\\\'\"\n\r')
+
+
+def usage_root() -> Path:
+    raw = os.environ.get("IDEA_USAGE_ROOT") or DEFAULT_ROOT
+    return Path(raw)
+
+
+def engine_name() -> str:
+    raw = os.environ.get("IDEA_USAGE_ENGINE") or socket.gethostname()
+    return raw.split(".")[0] or raw
+
+
+def js_ready(value):
+    """Match JSON.stringify number spelling (52 not 52.0) so TS and Python streams match."""
+    if isinstance(value, float) and value.is_integer() and abs(value) <= 2 ** 53:
+        return int(value)
+    if isinstance(value, dict):
+        return {k: js_ready(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [js_ready(v) for v in value]
+    return value
+
+
+def emit(obj: dict) -> None:
+    sys.stdout.write(json.dumps(js_ready(obj), separators=(",", ":"), ensure_ascii=False, allow_nan=False) + "\n")
+
+
+def reject_args() -> None:
+    sys.stderr.write("invalid arguments\n")
+    raise SystemExit(2)
+
+
+def disabled() -> None:
+    sys.stderr.write("disabled\n")
+    raise SystemExit(10)
+
+
+def fail(reason: str) -> None:
+    sys.stderr.write(reason + "\n")
+    raise SystemExit(1)
+
+
+def valid_day(token: str) -> bool:
+    if not DATE_RE.fullmatch(token):
+        return False
+    try:
+        datetime.date.fromisoformat(token)
+    except ValueError:
+        return False
+    return True
+
+
+def parse_command(raw: str) -> tuple:
+    if raw is None:
+        reject_args()
+    if any(ch in SHELL_META for ch in raw):
+        reject_args()
+    tokens = raw.split()
+    if len(tokens) == 2 and tokens[0] == "since" and valid_day(tokens[1]):
+        return ("since", tokens[1])
+    if len(tokens) == 2 and tokens[0] == "archive-and-clear" and tokens[1].startswith("--before="):
+        day = tokens[1][len("--before="):]
+        if valid_day(day):
+            return ("archive-and-clear", day)
+    if len(tokens) == 3 and tokens[0] == "archive-and-clear" and tokens[1] == "--before" and valid_day(tokens[2]):
+        return ("archive-and-clear", tokens[2])
+    reject_args()
+    raise AssertionError("unreachable")
+
+
+def read_monitoring(root: Path) -> str:
+    settings = root / "settings.json"
+    if not settings.exists():
+        return "off"
+    if settings.is_symlink() or not settings.is_file():
+        fail("unreadable settings")
+    try:
+        data = json.loads(settings.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        fail("unreadable settings")
+    if not isinstance(data, dict):
+        fail("unreadable settings")
+    value = data.get("usageMonitoring", "off")
+    if value not in ("on", "off"):
+        fail("unreadable settings")
+    return value
+
+
+def require_on(root: Path) -> str:
+    status = read_monitoring(root)
+    if status != "on":
+        disabled()
+    return status
+
+
+def is_live_day_dir(entry: Path) -> bool:
+    if not DATE_RE.fullmatch(entry.name):
+        return False
+    if entry.is_symlink():
+        return False
+    return entry.is_dir()
+
+
+def load_json_file(path: Path) -> dict:
+    if path.is_symlink() or not path.is_file():
+        raise OSError("not a regular file")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("not an object")
+    return data
+
+
+def load_ndjson(path: Path) -> tuple[list, int]:
+    if path.is_symlink() or not path.is_file():
+        raise OSError("not a regular file")
+    records = []
+    errors = 0
+    text = path.read_text(encoding="utf-8")
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            errors += 1
+            continue
+        if not isinstance(obj, dict):
+            errors += 1
+            continue
+        records.append(obj)
+    return records, errors
+
+
+def export_since(since: str) -> None:
+    root = usage_root()
+    status = require_on(root)
+    counts = {"day": 0, "sample": 0, "presence": 0}
+    errors = 0
+    if root.exists() and (root.is_symlink() or not root.is_dir()):
+        fail("usage root is not a directory")
+
+    day_dirs = []
+    if root.is_dir():
+        for entry in root.iterdir():
+            if is_live_day_dir(entry) and entry.name >= since:
+                day_dirs.append(entry)
+    day_dirs.sort(key=lambda p: p.name)
+
+    for day_dir in day_dirs:
+        day = day_dir.name
+        presence = day_dir / "presence.ndjson"
+        if presence.exists():
+            try:
+                records, line_errors = load_ndjson(presence)
+            except (OSError, UnicodeError):
+                errors += 1
+            else:
+                errors += line_errors
+                for payload in records:
+                    emit({
+                        "type": "presence",
+                        "schema": DEFAULT_SCHEMAS["presence"],
+                        "day": day,
+                        "payload": payload,
+                    })
+                    counts["presence"] += 1
+
+        day_files = []
+        sample_files = []
+        try:
+            names = list(day_dir.iterdir())
+        except OSError:
+            errors += 1
+            continue
+        for entry in names:
+            if entry.is_symlink():
+                errors += 1
+                continue
+            if not entry.is_file():
+                continue
+            if entry.name == "presence.ndjson":
+                continue
+            if entry.name.endswith(".samples.ndjson"):
+                instance = entry.name[: -len(".samples.ndjson")]
+                if instance:
+                    sample_files.append((instance, entry))
+            elif entry.name.endswith(".json"):
+                instance = entry.name[: -len(".json")]
+                if instance:
+                    day_files.append((instance, entry))
+
+        sample_files.sort(key=lambda item: item[0])
+
+        loaded_days = []
+        for file_instance, path in day_files:
+            try:
+                payload = load_json_file(path)
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+                errors += 1
+                continue
+            instance = payload["instance"] if isinstance(payload.get("instance"), str) else file_instance
+            loaded_days.append((instance, payload))
+        loaded_days.sort(key=lambda item: item[0])
+        for instance, payload in loaded_days:
+            emit({
+                "type": "day",
+                "schema": DEFAULT_SCHEMAS["day"],
+                "day": day,
+                "instance": instance,
+                "payload": payload,
+            })
+            counts["day"] += 1
+
+        for instance, path in sample_files:
+            try:
+                records, line_errors = load_ndjson(path)
+            except (OSError, UnicodeError):
+                errors += 1
+                continue
+            errors += line_errors
+            for payload in records:
+                emit({
+                    "type": "sample",
+                    "schema": DEFAULT_SCHEMAS["sample"],
+                    "day": day,
+                    "instance": instance,
+                    "payload": payload,
+                })
+                counts["sample"] += 1
+
+    emit({
+        "type": "end",
+        "schema": "idea-usage-export/1",
+        "since": since,
+        "engine": engine_name(),
+        "usageMonitoring": status,
+        "counts": counts,
+        "errors": errors,
+    })
+
+
+def count_tree_files(path: Path) -> int:
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+        total += len(filenames)
+        dirnames[:] = [name for name in dirnames if not os.path.islink(os.path.join(dirpath, name))]
+    return total
+
+
+def archive_and_clear(before: str) -> None:
+    root = usage_root()
+    require_on(root)
+    if root.exists() and (root.is_symlink() or not root.is_dir()):
+        fail("usage root is not a directory")
+
+    selected = []
+    if root.is_dir():
+        for entry in root.iterdir():
+            if is_live_day_dir(entry) and entry.name < before:
+                selected.append(entry)
+    selected.sort(key=lambda p: p.name)
+
+    files = 0
+    if selected:
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        archive_root = root / ".archive"
+        if archive_root.exists() and (archive_root.is_symlink() or not archive_root.is_dir()):
+            fail("archive folder is not a directory")
+        dest_parent = archive_root / f"{before}-{stamp}"
+        try:
+            archive_root.mkdir(mode=0o750, exist_ok=True)
+            dest_parent.mkdir(mode=0o750)
+            for day_dir in selected:
+                files += count_tree_files(day_dir)
+                os.rename(day_dir, dest_parent / day_dir.name)
+        except OSError:
+            fail("cannot archive usage files")
+
+    emit({
+        "type": "archived",
+        "schema": "idea-usage-export/1",
+        "before": before,
+        "days": len(selected),
+        "files": files,
+    })
+
+
+def original_command() -> str:
+    env_cmd = os.environ.get("SSH_ORIGINAL_COMMAND")
+    if env_cmd:
+        return env_cmd
+    return " ".join(sys.argv[1:])
+
+
+def main() -> None:
+    action, day = parse_command(original_command())
+    if action == "since":
+        export_since(day)
+        return
+    archive_and_clear(day)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        fail("unexpected error")

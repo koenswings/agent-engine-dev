@@ -22,7 +22,7 @@ const recordingExec = (opts: { installed?: string[], fail?: RegExp[], version?: 
             if ((opts.installed ?? []).includes(m[1])) return { stdout: 'install ok installed' }
             throw new Error(`dpkg-query: no packages found matching ${m[1]}`)
         }
-        if (/sshd -T/.test(cmd)) return { stdout: 'authorizedkeysfile .ssh/authorized_keys /etc/ssh/idea_authorized_keys/%u\n' }
+        if (/sshd -T/.test(cmd)) return { stdout: 'authorizedkeysfile .ssh/authorized_keys /etc/ssh/idea_authorized_keys/%u /etc/ssh/idea_usage_keys/%u\n' }
         if (/idea-app-data version$/.test(cmd)) return { stdout: `${opts.version ?? `idea-app-data ${APP_DATA_HELPER_VERSION}`}\n` }
         return { stdout: '' }
     }
@@ -63,6 +63,7 @@ describe('installRootHelpers', () => {
         expect(cmds).toContain('sudo install -d -o pi -g pi -m 0750 /var/lib/idea/usage')
         expect(cmds.some(c => /idea-usage\.tmpfiles\.conf/.test(c))).toBe(true)
         expect(idx(/idea-peer-gate/)).toBeGreaterThan(idx(/idea-app-data \/usr\/local/))
+        expect(idx(/idea-usage-export/)).toBeGreaterThan(idx(/idea-app-data \/usr\/local/))
         expect(cmds.slice(-2)).toEqual([`test -x ${BORG_PATH}`, 'sudo -n /usr/local/sbin/idea-app-data version'])
     })
     it('a second run reinstalls the helper (upgrade) but runs no apt', async () => {

@@ -495,7 +495,7 @@ This matches [idea#411](https://github.com/koenswings/idea/issues/411): `/var/li
 
 ## 7. Export wire format
 
-Binary: root-owned `/usr/local/sbin/idea-usage-export` (not a script under `/home/pi/idea/scripts/`, which `pi` can rewrite). It accepts only the two verbs below. It cannot open a shell, change unrelated files, or run anything else. It reads `$SSH_ORIGINAL_COMMAND` when invoked as an SSH forced command, and also accepts the same tokens as argv (so tests can call it directly).
+Binary: root-owned `/usr/local/sbin/idea-usage-export` (not a script under `/home/pi/idea/scripts/`, which `pi` can rewrite). Helper v7 installs that path from `script/build_image_assets/idea-usage-export` (standalone Python forced command). `src/usage/exportCmd.ts` / `exportMain.ts` is the TypeScript implementation used by the idea-usage tests and in-process runner; it is not copied to `/usr/local/sbin`. Both must produce the same wire format. The installed binary accepts only the two verbs below. It cannot open a shell, change unrelated files, or run anything else. It reads `$SSH_ORIGINAL_COMMAND` when invoked as an SSH forced command, and also accepts the same tokens as argv (so tests can call it directly).
 
 A date token must match `^[0-9]{4}-[0-9]{2}-[0-9]{2}$` and be a real calendar date. Any other argument, a shell metacharacter, or a missing flag is rejected.
 

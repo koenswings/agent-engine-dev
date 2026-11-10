@@ -867,6 +867,12 @@ export const installRootHelpers = async (exec: any, enginePath: string) => {
 export const PEER_SSHD_DROPIN = '/etc/ssh/sshd_config.d/10-idea-peer.conf'
 /** The helper's ledger of folders a peer's receive created (LEDGER_DIR in idea-app-data). */
 export const PEER_LEDGER_DIR = '/var/lib/idea-app-data'
+/** Forced command for the usage-export key (idea#412); root-owned COPY, 0755. */
+export const USAGE_EXPORT = '/usr/local/sbin/idea-usage-export'
+/** Directory of the usage-export authorized_keys file (idea#412); root 0755. */
+export const USAGE_AUTH_DIR = '/etc/ssh/idea_usage_keys'
+/** Usage-export public key file, written only by `idea-app-data install-usage-key`. */
+export const USAGE_AUTHORIZED_KEYS = '/etc/ssh/idea_usage_keys/pi'
 
 /**
  * Per-Pi Engine keys (design-per-pi-engine-key.md), the root-owned parts. No key
@@ -877,15 +883,24 @@ export const PEER_LEDGER_DIR = '/var/lib/idea-app-data'
  *   - /etc/ssh/idea_authorized_keys and /etc/idea: root 0755 (sync-peers writes
  *     idea_authorized_keys/pi and /etc/idea/peer_known_hosts there)
  *   - /var/lib/idea-app-data: root 0700 (the helper's receive ledger)
- *   - /etc/ssh/sshd_config.d/10-idea-peer.conf: adds idea_authorized_keys/%u to
- *     AuthorizedKeysFile. Checked with `sshd -t` (on failure it is removed again
- *     and the build stops), then `sshd -T` must show it in effect, then sshd is
- *     reloaded (open sessions stay).
+ *   - /etc/ssh/sshd_config.d/10-idea-peer.conf: adds idea_authorized_keys/%u and
+ *     idea_usage_keys/%u to AuthorizedKeysFile (existing entries kept). Checked
+ *     with `sshd -t` (on failure it is removed again and the build stops), then
+ *     `sshd -T` must show both paths in effect, then sshd is reloaded (open
+ *     sessions stay).
+ *   - /usr/local/sbin/idea-usage-export: root-owned COPY of
+ *     script/build_image_assets/idea-usage-export (standalone Python, 0755) —
+ *     the forced command of the usage-pull key (idea#412). Not
+ *     src/usage/exportMain.ts. No key is written here: Atlas fills from= with
+ *     the sidecar Tailscale IPv4 via `idea-app-data install-usage-key` during
+ *     the idea#374 window.
+ *   - /etc/ssh/idea_usage_keys: root 0755 (install-usage-key writes `pi` there).
  */
 export const installPeerAccess = async (exec: any, enginePath: string) => {
-  print(chalk.blue('  - Installing idea-peer-gate and the sshd drop-in for peer Engine keys...'))
+  print(chalk.blue('  - Installing idea-peer-gate, idea-usage-export and the sshd drop-in for peer and usage keys...'))
   await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-peer-gate ${PEER_GATE}`
-  await exec`sudo install -d -o root -g root -m 0755 ${path.dirname(PEER_AUTHORIZED_KEYS)} ${path.dirname(PEER_KNOWN_HOSTS)}`
+  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-usage-export ${USAGE_EXPORT}`
+  await exec`sudo install -d -o root -g root -m 0755 ${path.dirname(PEER_AUTHORIZED_KEYS)} ${path.dirname(PEER_KNOWN_HOSTS)} ${USAGE_AUTH_DIR}`
   await exec`sudo install -d -o root -g root -m 0700 ${PEER_LEDGER_DIR}`
   await exec`sudo install -o root -g root -m 0644 ${enginePath}/script/build_image_assets/10-idea-peer.conf ${PEER_SSHD_DROPIN}`
   try {
@@ -895,15 +910,19 @@ export const installPeerAccess = async (exec: any, enginePath: string) => {
     throw new Error(`sshd -t rejected the configuration with ${PEER_SSHD_DROPIN}; removed it again (peer Engine keys will not work): ${e}`)
   }
   const effective = await exec`sudo /usr/sbin/sshd -T -C user=pi,host=localhost,addr=127.0.0.1`
-  if (!/^authorizedkeysfile .*\/etc\/ssh\/idea_authorized_keys\/%u/m.test(String(effective?.stdout ?? ''))) {
+  const akf = String(effective?.stdout ?? '')
+  if (!/^authorizedkeysfile .*\/etc\/ssh\/idea_authorized_keys\/%u/m.test(akf)) {
     print(chalk.red(`  - WARNING: sshd does not use /etc/ssh/idea_authorized_keys/%u: an earlier drop-in or sshd_config sets AuthorizedKeysFile first. Peer Engine keys will not work until it is fixed.`))
+  }
+  if (!/^authorizedkeysfile .*\/etc\/ssh\/idea_usage_keys\/%u/m.test(akf)) {
+    print(chalk.red(`  - WARNING: sshd does not use /etc/ssh/idea_usage_keys/%u: an earlier drop-in or sshd_config sets AuthorizedKeysFile first. Usage export keys will not work until it is fixed.`))
   }
   try {
     await exec`sudo systemctl reload ssh`
   } catch {
     await exec`sudo systemctl reload sshd`
   }
-  print(chalk.green(`  - ${PEER_GATE} and ${PEER_SSHD_DROPIN} installed; sshd reloaded`))
+  print(chalk.green(`  - ${PEER_GATE}, ${USAGE_EXPORT} and ${PEER_SSHD_DROPIN} installed; sshd reloaded`))
 }
 
 /**
