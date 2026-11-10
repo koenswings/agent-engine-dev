@@ -1,6 +1,9 @@
 /**
- * CLI entry for idea-usage-export (idea#411). Helper v7 (idea#412) installs
- * the root-owned forced-command binary that invokes this compiled file.
+ * TypeScript CLI entry for the export verbs (idea#411). Used by unit tests and
+ * `runExport` in this process. The binary installed at
+ * `/usr/local/sbin/idea-usage-export` (sshd `command=`, helper v7 / idea#412)
+ * is `script/build_image_assets/idea-usage-export` (standalone Python), not
+ * this file. Both must match `test/fixtures/usage-export-parity/` goldens.
  */
 import { runExport } from './exportCmd.js'
 

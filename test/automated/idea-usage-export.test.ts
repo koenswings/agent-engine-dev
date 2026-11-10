@@ -97,6 +97,9 @@ describe('idea-usage-export: argument checks', () => {
         const viaEnv = await run({ root, args: ['ignored'], env: { SSH_ORIGINAL_COMMAND: 'archive-and-clear --before 2026-11-01' } })
         expect(viaEnv.exitCode, viaEnv.stderr).toBe(0)
         expect(lines(viaEnv.stdout)).toEqual([expect.objectContaining({ type: 'archived', before: '2026-11-01', days: 0, files: 0 })])
+        const viaEq = await run({ root, args: ['archive-and-clear', '--before=2026-11-01'] })
+        expect(viaEq.exitCode, viaEq.stderr).toBe(0)
+        expect(lines(viaEq.stdout)).toEqual([expect.objectContaining({ type: 'archived', before: '2026-11-01', days: 0, files: 0 })])
     })
 })
 

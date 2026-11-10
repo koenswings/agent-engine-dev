@@ -97,6 +97,10 @@ def parse_command(raw: str) -> tuple:
     tokens = raw.split()
     if len(tokens) == 2 and tokens[0] == "since" and valid_day(tokens[1]):
         return ("since", tokens[1])
+    if len(tokens) == 2 and tokens[0] == "archive-and-clear" and tokens[1].startswith("--before="):
+        day = tokens[1][len("--before="):]
+        if valid_day(day):
+            return ("archive-and-clear", day)
     if len(tokens) == 3 and tokens[0] == "archive-and-clear" and tokens[1] == "--before" and valid_day(tokens[2]):
         return ("archive-and-clear", tokens[2])
     reject_args()

@@ -888,10 +888,12 @@ export const USAGE_AUTHORIZED_KEYS = '/etc/ssh/idea_usage_keys/pi'
  *     with `sshd -t` (on failure it is removed again and the build stops), then
  *     `sshd -T` must show both paths in effect, then sshd is reloaded (open
  *     sessions stay).
- *   - /usr/local/sbin/idea-usage-export: root-owned COPY, 0755 (the forced
- *     command of the usage-pull key, idea#412). No key is written here: Atlas
- *     fills from= with the sidecar Tailscale IPv4 via `idea-app-data
- *     install-usage-key` during the idea#374 window.
+ *   - /usr/local/sbin/idea-usage-export: root-owned COPY of
+ *     script/build_image_assets/idea-usage-export (standalone Python, 0755) —
+ *     the forced command of the usage-pull key (idea#412). Not
+ *     src/usage/exportMain.ts. No key is written here: Atlas fills from= with
+ *     the sidecar Tailscale IPv4 via `idea-app-data install-usage-key` during
+ *     the idea#374 window.
  *   - /etc/ssh/idea_usage_keys: root 0755 (install-usage-key writes `pi` there).
  */
 export const installPeerAccess = async (exec: any, enginePath: string) => {
