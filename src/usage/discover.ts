@@ -10,6 +10,39 @@ import { INSTANCE_ID_RE, disksRootPath, systemAppsRoot, systemInstancesRoot } fr
 import { parseHookDecl } from './runner.js'
 import type { BundleHook, DockerContainer, ListedTarget, UsageTarget } from './types.js'
 
+export function createdAtFromFsPath(dir: string): string | undefined {
+    try {
+        const st = fs.statSync(dir)
+        const ms = st.birthtimeMs > 0 ? st.birthtimeMs : st.ctimeMs
+        if (!Number.isFinite(ms) || ms <= 0) return undefined
+        return new Date(ms).toISOString()
+    } catch {
+        return undefined
+    }
+}
+
+/** Parse `docker ps` CreatedAt (`2026-11-11 02:05:22 +0100 CET`) or an RFC 3339 stamp. */
+export function parseDockerCreatedAt(raw: string | undefined): string | undefined {
+    if (!raw) return undefined
+    const trimmed = raw.trim()
+    if (!trimmed) return undefined
+    const m = trimmed.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.\d+)?\s*([+-]\d{2}):?(\d{2})?/)
+    if (m) {
+        const d = new Date(`${m[1]}T${m[2]}${m[3]}:${m[4] ?? '00'}`)
+        if (!Number.isNaN(d.getTime())) return d.toISOString()
+    }
+    const stripped = trimmed.replace(/\s+[A-Za-z]{2,5}$/, '')
+    const d = new Date(stripped)
+    if (!Number.isNaN(d.getTime())) return d.toISOString()
+    return undefined
+}
+
+export function targetCreatedAt(target: UsageTarget): string | undefined {
+    if (target.createdAt) return target.createdAt
+    if (target.kind === 'listed') return createdAtFromFsPath(target.cwd)
+    return undefined
+}
+
 const COMPOSE_NAMES = ['compose.yaml', 'compose.yml', 'docker-compose.yaml', 'docker-compose.yml']
 
 export function syntheticInstanceId(project: string | undefined, containerName: string): string {
@@ -68,6 +101,7 @@ function listedFromDir(dir: string): ListedTarget | null {
         listed: true,
         cwd: dir,
         hook: parseHookDecl(xapp?.usage ?? null),
+        createdAt: createdAtFromFsPath(dir),
     }
 }
 
@@ -199,6 +233,7 @@ export function discoverTargets(
             containerId: c.id,
             hook: bundle?.hook ?? null,
             hookScript: bundle?.hookScript,
+            createdAt: c.createdAt,
         })
     }
     for (const id of runningListed) {
@@ -214,7 +249,7 @@ export async function listDockerContainers(): Promise<DockerContainer[]> {
         const child = spawn('docker', [
             'ps', '--no-trunc',
             '--format',
-            '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.service"}}\t{{.Label "com.docker.compose.project.working_dir"}}',
+            '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.service"}}\t{{.Label "com.docker.compose.project.working_dir"}}\t{{.CreatedAt}}',
         ], { shell: false })
         let out = ''
         child.stdout.on('data', (c: Buffer) => { out += c.toString('utf8') })
@@ -230,7 +265,7 @@ export async function listDockerContainers(): Promise<DockerContainer[]> {
             const rows: DockerContainer[] = []
             for (const line of out.split('\n')) {
                 if (!line.trim()) continue
-                const [id, name, image, project, service, workingDir] = line.split('\t')
+                const [id, name, image, project, service, workingDir, createdAtRaw] = line.split('\t')
                 if (!id) continue
                 rows.push({
                     id,
@@ -239,6 +274,7 @@ export async function listDockerContainers(): Promise<DockerContainer[]> {
                     project: project || undefined,
                     service: service || undefined,
                     workingDir: workingDir || undefined,
+                    createdAt: parseDockerCreatedAt(createdAtRaw),
                 })
             }
             resolve(rows)

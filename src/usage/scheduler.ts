@@ -9,6 +9,7 @@ import {
     addDays,
     ensureUsageDirs,
     inNightWindow,
+    instanceExistedOnDay,
     kitLocalDay,
     runDir as defaultRunDir,
     usageRoot,
@@ -18,7 +19,7 @@ import { currentSkipReason } from './skip.js'
 import { hasGoodDayFile } from './store.js'
 import { samplePresence, type SamplerDeps } from './sampler.js'
 import { runDayHook, runSampleHook, type ClockDeps, type ExecHook } from './runner.js'
-import { defaultListTargets } from './discover.js'
+import { defaultListTargets, targetCreatedAt } from './discover.js'
 import type { DayFile, SampleRecord, SkipReason, UsageSwitch, UsageTarget } from './types.js'
 
 export function catchUpDays(today: string, hasGood: (day: string) => boolean): string[] {
@@ -116,8 +117,9 @@ export async function processTick(state: TickState, deps: TickDeps = {}): Promis
         // Per-target missing days, oldest first (a day can be missing for only some instances).
         for (const day of catchUpDays(today, () => false)) {
             for (const target of targets) {
+                if (!instanceExistedOnDay(targetCreatedAt(target), day)) continue
                 if (hasGoodDayFile(day, target.instanceId, root)) continue
-                const rec = await runDayHook({ target, day, root, exec: deps.execHook, clock, skipReason: skip })
+                const rec = await runDayHook({ target, day, root, exec: deps.execHook, clock, skipReason: skip, overwriteOk: false })
                 result.days.push(rec)
             }
         }

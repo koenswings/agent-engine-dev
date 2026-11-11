@@ -5,8 +5,9 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { discoverBundles, discoverListed, discoverTargets, matchBundle, syntheticInstanceId } from '../../src/usage/discover.js'
+import { discoverBundles, discoverListed, discoverTargets, matchBundle, parseDockerCreatedAt, syntheticInstanceId } from '../../src/usage/discover.js'
 import type { BundleHook, DockerContainer } from '../../src/usage/types.js'
+import { instanceExistedOnDay, kitLocalDay } from '../../src/usage/paths.js'
 
 let tmp: string
 beforeEach(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'idea-usage-disc-')) })
@@ -61,6 +62,9 @@ describe('discoverListed and discoverTargets', () => {
         expect(k.name).toBe('Grade 5 Kolibri')
         expect(k.hook?.service).toBe('kolibri')
         expect(listed.find(t => t.instanceId === 'nextcloud-xyz')!.hook).toBeNull()
+        expect(k.createdAt).toBeTruthy()
+        expect(instanceExistedOnDay(k.createdAt, kitLocalDay(new Date()))).toBe(true)
+        expect(instanceExistedOnDay(k.createdAt, '2020-01-01')).toBe(false)
     })
     it('marks a running non-listed compose project as unlisted and borrows a matching bundle hook', () => {
         const bundleDir = path.join(tmp, 'apps', 'kolibri-0.19.5')
@@ -108,5 +112,25 @@ describe('discoverListed and discoverTargets', () => {
         }
         expect(matchBundle({ id: '1', name: 'a', image: 'example/kolibri:0.19.5' }, [bundle])).toBe(bundle)
         expect(matchBundle({ id: '2', name: 'b', image: 'example/kolibri:0.15.5' }, [bundle])).toBeUndefined()
+    })
+})
+
+describe('parseDockerCreatedAt', () => {
+    it('parses docker ps CreatedAt and RFC 3339', () => {
+        const iso = parseDockerCreatedAt('2026-11-11 02:05:22 +0100 CET')
+        expect(iso).toBe('2026-11-11T01:05:22.000Z')
+        expect(parseDockerCreatedAt('2026-11-11T01:05:22.000Z')).toBe('2026-11-11T01:05:22.000Z')
+        expect(parseDockerCreatedAt(undefined)).toBeUndefined()
+        expect(parseDockerCreatedAt('nonsense')).toBeUndefined()
+    })
+    it('copies container Created onto unlisted targets', () => {
+        const createdAt = '2026-11-08T14:00:00.000Z'
+        const out = discoverTargets(
+            [{ id: 'c1', name: 'old_kolibri', image: 'example/kolibri:0.19.5', project: 'legacy-kolibri', createdAt }],
+            [],
+            [],
+        )
+        expect(out).toHaveLength(1)
+        expect(out[0].createdAt).toBe(createdAt)
     })
 })
