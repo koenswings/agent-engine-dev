@@ -19,7 +19,7 @@ import { fs, os, path } from 'zx'
 import { Repo, DocHandle } from '@automerge/automerge-repo'
 import {
     APP_DATA_HELPER, APP_DATA_HELPER_VERSION, sizeArgs, copyArgs, sendArgs, deleteArgs, eraseSlotArgs,
-    borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, appDataSudoArgv, remoteDeleteSshArgs,
+    borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgListArgs, borgDeleteArgs, borgCompactArgs, appDataSudoArgv, remoteDeleteSshArgs,
     runAppData, appDataErrorMessage, appDataHelperProblem, assertAppDataHelper,
     instanceDataBytes, deleteInstanceData, deleteRemoteInstanceData,
     remoteEnsureDirsSshArgs, ensureDirsArgs, receiveAppArgs, receiveServiceArgs, receiveFilesArgs, putFilesArgs,
@@ -105,6 +105,10 @@ describe('helper argv builders', () => {
             'data/keys', 'data/tailscale', 'data/tailscale-run',
         ])
         expect(borgExtractArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', 3, 'sdb1')).toEqual(['borg-extract', 'sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', '3', 'sdb1'])
+        expect(borgListArgs('sdc1', 'inst-1')).toEqual(['borg-list', 'sdc1', 'inst-1'])
+        expect(borgDeleteArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z')).toEqual(['borg-delete', 'sdc1', 'inst-1', '2026-10-06T10-18-00-123Z'])
+        expect(borgDeleteArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', 3)).toEqual(['borg-delete', 'sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', '3'])
+        expect(borgCompactArgs('sdc1', 'inst-1')).toEqual(['borg-compact', 'sdc1', 'inst-1'])
         expect(appDataSudoArgv(['size', 'sdb1', 'x'])).toEqual(['-n', '/usr/local/sbin/idea-app-data', 'size', 'sdb1', 'x'])
     })
 
@@ -133,6 +137,8 @@ describe('helper argv builders', () => {
         expect(() => borgExtractArgs('sdc1', 'x', '2026-10-06T10-18-00-123Z', 0, 'sdb1')).toThrow(/out of range/)
         expect(() => borgExtractArgs('sdc1', 'x', '2026-10-06T10-18-00-123Z', 10, 'sdb1')).toThrow(/out of range/)
         expect(() => borgExtractArgs('sdc1', 'x', '2026-10-06T10-18-00-123Z', 1.5, 'sdb1')).toThrow(/out of range/)
+        expect(() => borgDeleteArgs('sdc1', 'inst-1', 'latest')).toThrow(/not a backup archive name/)
+        expect(() => borgDeleteArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', 0)).toThrow(/keepMin/)
     })
 
     it('instanceDataTransferArgs maps copy and send', () => {

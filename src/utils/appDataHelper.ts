@@ -38,7 +38,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '8'
+export const APP_DATA_HELPER_VERSION = '9'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -161,6 +161,23 @@ export const borgExtractArgs = (bdev: string, id: string, archive: string, strip
     if (!Number.isInteger(strip) || strip < 1 || strip > 9) throw new Error(`strip ${strip} is out of range (1-9)`)
     return ['borg-extract', checkRoot(bdev), checkId(id), checkArchive(archive), String(strip), checkRoot(dstRoot)]
 }
+/** idea#401 / helper v9: JSON of archives (borg info --json) so the Engine can pick. */
+export const borgListArgs = (bdev: string, id: string): string[] => ['borg-list', checkRoot(bdev), checkId(id)]
+/** idea#401: delete one archive. Omit keepMin to use the helper default (3). */
+export const borgDeleteArgs = (bdev: string, id: string, archive: string, keepMin?: number): string[] => {
+    const args = ['borg-delete', checkRoot(bdev), checkId(id), checkArchive(archive)]
+    if (keepMin !== undefined) {
+        if (!Number.isInteger(keepMin) || keepMin < 1 || keepMin > 9999) {
+            throw new Error(`keepMin ${keepMin} is not a positive integer`)
+        }
+        args.push(String(keepMin))
+    }
+    return args
+}
+export const borgCompactArgs = (bdev: string, id: string): string[] => ['borg-compact', checkRoot(bdev), checkId(id)]
+
+/** Helper protocol that adds borg-list / borg-delete / borg-compact (idea#401). */
+export const BACKUP_CLEANUP_HELPER_MIN = 9
 
 /** The argv for `sudo`: sudo -n /usr/local/sbin/idea-app-data <args…> */
 export const appDataSudoArgv = (args: string[]): string[] => ['-n', APP_DATA_HELPER, ...args]

@@ -108,7 +108,7 @@ describe('idea-app-data: argument checks', () => {
     it('refuses the wrong argument count for every subcommand', async () => {
         const cases: [string, number][] = [
             ['version', 0], ['size', 2], ['copy', 4], ['send', 6], ['delete', 2], ['quarantine', 2], ['snapshot', 2], ['restore-snapshot', 2], ['snapshots', 1], ['estimate', 2],
-            ['borg-init', 2], ['borg-info', 2], ['borg-extract', 5],
+            ['borg-init', 2], ['borg-info', 2], ['borg-extract', 5], ['borg-list', 2], ['borg-compact', 2],
             ['ensure-dirs', 1], ['erase-slot', 2], ['put-files', 3], ['peer-delete', 3], ['sync-peers', 0], ['install-usage-key', 3],
         ]
         for (const [sub, n] of cases) {
@@ -120,6 +120,8 @@ describe('idea-app-data: argument checks', () => {
         }
         refused(await sb.run(['receive', 'sdb1', 'id1', '--server']), /receive takes <dstRoot> <dstId> and the rsync server arguments/)
         refused(await sb.run(['borg-create', 'x', 'x', 'x']), /borg-create takes at least 4 argument/)
+        refused(await sb.run(['borg-delete', 'x', 'x']), /borg-delete takes 3 or 4 argument/)
+        refused(await sb.run(['borg-delete', 'x', 'x', 'x', 'x', 'x']), /borg-delete takes 3 or 4 argument/)
     })
 
     it('refuses bad roots, ids, archives, strips and hosts (.., leading -, /, case, length)', async () => {
@@ -770,6 +772,86 @@ describe('idea-app-data: borg', () => {
         await fs.symlink(outside, path.join(src, 'data', 'keys'))
         refused(await sb.run(['borg-create', 'sdc1', 'inst1', ARCHIVE, 'sdb1', 'keys']), /points outside the instance folder/)
         expect(await sb.calls('borg')).toEqual([])
+    })
+})
+
+
+describe('idea-app-data: borg-list / borg-delete / borg-compact (idea#401, helper v9)', () => {
+    const A = [
+        '2026-01-01T00-00-00-000Z',
+        '2026-01-02T00-00-00-000Z',
+        '2026-01-03T00-00-00-000Z',
+        '2026-01-04T00-00-00-000Z',
+        '2026-01-05T00-00-00-000Z',
+    ]
+    const listEnv = (names: string[]) => ({ FAKE_BORG_LIST: names.join('\n') })
+    let bk: string
+    beforeEach(async () => {
+        bk = await sb.addDisk('sdc1', { backup: true })
+    })
+
+    it('borg-list prints borg info --json (no --last) for the repo', async () => {
+        const payload = JSON.stringify({
+            archives: [
+                { name: A[1], start: '2026-01-02T00:00:00.000000', stats: { original_size: 200, compressed_size: 80 } },
+                { name: A[0], start: '2026-01-01T00:00:00.000000', stats: { original_size: 100, compressed_size: 40 } },
+            ],
+        })
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        const r = await sb.run(['borg-list', 'sdc1', 'inst1'], { FAKE_BORG_INFO: payload })
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(JSON.parse(r.stdout)).toEqual(JSON.parse(payload))
+        const [info] = await sb.calls('borg')
+        expect(info.argv).toEqual(['info', '--json', '--', repo])
+        expect(info.argv).not.toContain('--last')
+    })
+
+    it('borg-delete of an older-than-newest-3 archive succeeds; a 3-argument call uses keepMin 3', async () => {
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        expect((await sb.run(['borg-delete', 'sdc1', 'inst1', A[0]], listEnv(A))).exitCode).toBe(0)
+        const [listCall, delCall] = await sb.calls('borg')
+        expect(listCall.argv[0]).toBe('list')
+        expect(listCall.argv).toContain('--sort-by')
+        expect(listCall.argv).toContain('timestamp')
+        expect(delCall.argv).toEqual(['delete', '--', `${repo}::${A[0]}`])
+    })
+
+    it('borg-delete refuses the newest 3, the last remaining archive, and a keepMin underflow', async () => {
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        for (const newest of A.slice(-3)) {
+            refused(await sb.run(['borg-delete', 'sdc1', 'inst1', newest], listEnv(A)), /among the newest 3/)
+        }
+        refused(await sb.run(['borg-delete', 'sdc1', 'inst1', A[0]], listEnv([A[0]])), /only archive/)
+        refused(await sb.run(['borg-delete', 'sdc1', 'inst1', A[0]], listEnv(A.slice(0, 3))), /fewer than 3 archives/)
+        refused(await sb.run(['borg-delete', 'sdc1', 'inst1', A[0], '5'], listEnv(A)), /fewer than 5 archives/)
+        const calls = await sb.calls('borg')
+        expect(calls.every(c => c.argv[0] === 'list')).toBe(true)
+        expect(calls.filter(c => c.argv[0] === 'delete')).toEqual([])
+    })
+
+    it('borg-delete refuses a bad archive token, a bad keepMin and a system target', async () => {
+        refused(await sb.run(['borg-delete', 'sdc1', 'inst1', 'latest']), /archive name 'latest' does not match/)
+        refused(await sb.run(['borg-delete', 'sdc1', 'inst1', A[0], '0']), /keepMin '0' is not a positive integer/)
+        refused(await sb.run(['borg-delete', 'sdc1', 'inst1', A[0], '-3']), /keepMin '-3' is not a positive integer/)
+        refused(await sb.run(['borg-delete', 'system', 'inst1', A[0]]), /a Backup Disk is never the system disk/)
+        refused(await sb.run(['borg-list', 'system', 'inst1']), /a Backup Disk is never the system disk/)
+        refused(await sb.run(['borg-compact', 'system', 'inst1']), /a Backup Disk is never the system disk/)
+        expect(await sb.calls('borg')).toEqual([])
+    })
+
+    it('borg-compact invokes borg compact on the repo', async () => {
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        expect((await sb.run(['borg-compact', 'sdc1', 'inst1'])).exitCode).toBe(0)
+        const [c] = await sb.calls('borg')
+        expect(c.argv).toEqual(['compact', '--', repo])
     })
 })
 

@@ -10,7 +10,7 @@
  *  - skipBorg() (settings.skipBorg / IDEA_SKIP_BORG, default testMode): skips borg commands but
  *    exercises all other logic (store updates, YAML, lock files)
  *  - Borg runs as root through the app-data helper (idea#168):
- *    `sudo -n /usr/local/sbin/idea-app-data borg-init|borg-info|borg-create|borg-extract`,
+ *    `sudo -n /usr/local/sbin/idea-app-data borg-init|borg-info|borg-create|borg-extract|borg-list|borg-delete|borg-compact`,
  *    so it can read instance data written by root/999/www-data and restores owners
  *    (--numeric-ids). Repositories become root-owned; the repo folder and the
  *    .backup-in-progress lock file stay the Engine's (pi).
@@ -22,6 +22,7 @@ import { disksRoot, skipBorg } from '../data/Config.js'
 import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot, appDataRoot, joinMountRoot } from '../data/Disk.js'
 import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgProblem, helperAtLeast } from '../utils/appDataHelper.js'
 import { parseBackupExcludeList, BACKUP_EXCLUDE_HELPER_MIN } from '../utils/backupExclude.js'
+import { backupCleanupRunner, backupDiskFullError, cleanupIsEnabled } from '../utils/backupCleanup.js'
 import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { ensureAppFilesOnTarget } from '../data/RestoreAppFiles.js'
 import { localEngineId } from '../data/Engine.js'
@@ -199,6 +200,18 @@ export const backupInstance = async (
             if (helper) throw new Error(`HELPER_OUTDATED: ${helper}`)
         }
 
+        // 0c. Fullness cleanup (idea#401, helper v9) before the instance is
+        // stopped. An older helper skips cleanup and the backup still runs.
+        let cleanupWarning: string | null = null
+        const backupMountRoot = joinMountRoot(await diskMountRoot(backupDisk as Disk))
+        if (cleanupIsEnabled()) {
+            const before = await backupCleanupRunner.run({
+                backupDevice, mountRoot: backupMountRoot, currentInstanceId: instanceId, phase: 'before',
+            })
+            if (before.status === 'HELPER_OUTDATED') cleanupWarning = before.warning ?? 'HELPER_OUTDATED'
+            if (before.status === 'full') throw backupDiskFullError()
+        }
+
         // 1. Init Borg repo if this is the first backup
         setBackupStep(0, BACKUP_STEPS[0])
         const repoExists = await fs.pathExists(`${repoPath}/config`)
@@ -259,6 +272,21 @@ export const backupInstance = async (
 
         // 8. Remove lock file (success)
         await fs.remove(lockPath)
+
+        if (cleanupIsEnabled()) {
+            const after = await backupCleanupRunner.run({
+                backupDevice, mountRoot: backupMountRoot, currentInstanceId: instanceId, phase: 'after',
+            })
+            if (after.status === 'HELPER_OUTDATED' && !cleanupWarning) {
+                cleanupWarning = after.warning ?? 'HELPER_OUTDATED'
+            }
+        }
+        if (cleanupWarning) {
+            storeHandle.change(doc => {
+                const op = doc.operationDB?.[opId]
+                if (op) op.args = { ...op.args, cleanup: cleanupWarning as string }
+            })
+        }
 
         updateOperation(storeHandle, opId, {
             status: 'Done',

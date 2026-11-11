@@ -56,6 +56,9 @@
 #   idea-app-data borg-info    <bdev> <id>
 #   idea-app-data borg-create  <bdev> <id> <archive> <srcRoot> [exclude…]   (v8, idea#443)
 #   idea-app-data borg-extract <bdev> <id> <archive> <strip> <dstRoot>
+#   idea-app-data borg-list    <bdev> <id>                                   (v9, idea#401)
+#   idea-app-data borg-delete  <bdev> <id> <archive> [keepMin]               (v9, idea#401; keepMin default 3)
+#   idea-app-data borg-compact <bdev> <id>                                   (v9, idea#401)
 #
 # Tokens (none can start with '-' or hold '..'; only trailing borg-create
 # excludes may hold '/'):
@@ -127,7 +130,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=8
+readonly IDEA_APP_DATA_VERSION=9
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -1419,6 +1422,72 @@ case "$SUB" in
         exit 0
         ;;
 
+    borg-list)
+        # idea#401 / helper v9: JSON of every archive (borg info --json, no --last)
+        # so the Engine can pick what to delete. Oldest-first sorting is Engine-side.
+        need 2 $(($# - 1)) "<bdev> <id>"
+        check_id "$3"
+        resolve_root "$2" backup
+        REPO="$R_DIR/backups/$3"
+        existing_dir "$REPO" "repository folder"
+        [[ -f "$REPO/config" ]] || refuse "$REPO is not a Borg repository"
+        borg_env
+        run_child $BORG info --json -- "$REPO"
+        exit $?
+        ;;
+
+    borg-delete)
+        # idea#401: delete exactly the named archive. The Engine chooses; the helper
+        # enforces the retention floor (default keepMin 3, never the only archive,
+        # never one of the newest keepMin by borg's timestamp order).
+        given=$(($# - 1))
+        (( given == 3 || given == 4 )) || refuse "$SUB takes 3 or 4 argument(s) (<bdev> <id> <archive> [keepMin]), got $given"
+        check_id "$3"
+        [[ "$4" =~ $RE_ARCHIVE ]] || refuse "archive name '$4' does not match $RE_ARCHIVE"
+        KEEP_MIN=3
+        if (( given == 4 )); then
+            [[ "$5" =~ ^[1-9][0-9]{0,3}$ ]] || refuse "keepMin '$5' is not a positive integer"
+            KEEP_MIN=$((10#$5))
+        fi
+        resolve_root "$2" backup
+        REPO="$R_DIR/backups/$3"
+        existing_dir "$REPO" "repository folder"
+        [[ -f "$REPO/config" ]] || refuse "$REPO is not a Borg repository"
+        borg_env
+        LIST=$($BORG list --format '{name}{NL}' --sort-by timestamp -- "$REPO") || refuse "cannot list archives in $REPO"
+        NAMES=()
+        while IFS= read -r n; do
+            [[ -n "$n" ]] && NAMES+=("$n")
+        done <<< "$LIST"
+        COUNT=${#NAMES[@]}
+        FOUND=0
+        IDX=-1
+        for i in "${!NAMES[@]}"; do
+            if [[ "${NAMES[$i]}" == "$4" ]]; then FOUND=1; IDX=$i; break; fi
+        done
+        (( FOUND == 1 )) || refuse "archive '$4' is not in the repository"
+        (( COUNT > 1 )) || refuse "refusing to delete the only archive"
+        (( COUNT > KEEP_MIN )) || refuse "deleting archive '$4' would leave fewer than $KEEP_MIN archives"
+        CUT=$((COUNT - KEEP_MIN))
+        (( IDX < CUT )) || refuse "archive '$4' is among the newest $KEEP_MIN"
+        take_locks "repo.$2.$3"
+        run_child $BORG delete -- "$REPO::$4"
+        exit $?
+        ;;
+
+    borg-compact)
+        need 2 $(($# - 1)) "<bdev> <id>"
+        check_id "$3"
+        resolve_root "$2" backup
+        REPO="$R_DIR/backups/$3"
+        existing_dir "$REPO" "repository folder"
+        [[ -f "$REPO/config" ]] || refuse "$REPO is not a Borg repository"
+        take_locks "repo.$2.$3"
+        borg_env
+        run_child $BORG compact -- "$REPO"
+        exit $?
+        ;;
+
     erase-slot)
         # TEST-ONLY: erase a loop-backed duration slot to an empty IDEA disk (Path A /
         # idea#168 confirm_erase). Production USB erase stays on idea-erase-disk.
@@ -1510,7 +1579,7 @@ case "$SUB" in
         ;;
 
     "")
-        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, borg-init, borg-info, borg-create, borg-extract, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, sync-peers, install-usage-key)"
+        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, borg-init, borg-info, borg-create, borg-extract, borg-list, borg-delete, borg-compact, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, sync-peers, install-usage-key)"
         ;;
     *)
         refuse "unknown subcommand '$(printf '%q' "$SUB")'"
