@@ -3,7 +3,7 @@ import { isUnfinishedFetch } from './UpdateFetch.js'
 import { $, YAML, chalk, fs, os } from 'zx';
 import path from 'path';
 import { deepPrint, log } from '../utils/utils.js';
-import { App, createAppId, createOrUpdateApp, extractAppName, extractAppVersion } from './App.js'
+import { App, appTitleFromXapp, createAppId, createOrUpdateApp, extractAppName, extractAppVersion } from './App.js'
 import { Instance, Status, createOrUpdateInstance, startInstance } from './Instance.js'
 import { AppID, BackupMode, DeviceName, DiskID, DiskType, EngineID, DiskName, InstanceID, PortNumber, ServiceImage, Timestamp } from './CommonTypes.js';
 import { Store, getAppsOfDisk, getInstance, getInstancesOfDisk } from './Store.js';
@@ -490,17 +490,18 @@ export const processSystemApp = async (storeHandle: DocHandle<Store>, disk: Disk
         let app: App
         storeHandle.change(doc => {
             const storedApp: App | undefined = doc.appDB[appId]
-            const xapp = appCompose['x-app']
+            const xapp = appCompose['x-app'] ?? {}
+            const appName = extractAppName(appId)
             if (!storedApp) {
                 log(`Creating new system app ${appId}`)
                 app = {
                     id: appId,
-                    name: extractAppName(appId),
+                    name: appName,
                     version: extractAppVersion(appId),
-                    title: xapp.title,
+                    title: appTitleFromXapp(xapp, appName),
                     description: xapp.description ?? null,
                     url: xapp.url ?? null,
-                    category: xapp.category,
+                    category: xapp.category ?? '',
                     icon: xapp.icon ?? null,
                     author: xapp.author ?? null,
                     filesMount: parseFilesMount(xapp),
@@ -511,12 +512,12 @@ export const processSystemApp = async (storeHandle: DocHandle<Store>, disk: Disk
                 log(`Updating existing system app ${appId}`)
                 // Same granular update as createOrUpdateApp (App.ts): every x-app field is refreshed
                 app = storedApp
-                app.name = extractAppName(appId)
+                app.name = appName
                 app.version = extractAppVersion(appId)
-                app.title = xapp.title
+                app.title = appTitleFromXapp(xapp, appName)
                 app.description = xapp.description ?? null
                 app.url = xapp.url ?? null
-                app.category = xapp.category
+                app.category = xapp.category ?? ''
                 app.icon = xapp.icon ?? null
                 app.author = xapp.author ?? null
                 app.filesMount = parseFilesMount(xapp)

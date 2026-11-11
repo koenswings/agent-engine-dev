@@ -13,6 +13,8 @@
  * 2. Under the instance lock, the root helper renames <disk>/instances/<id> to
  *    <disk>/.idea-quarantine/<id>-<UTC stamp> (idea-app-data quarantine, helper v4).
  * 3. The record is dropped from instanceDB.
+ * 4. Disk.preUpdateSnapshots, preUpdateBytes and quarantineBytes are refreshed
+ *    from the helper (idea#428), the same way updateApp does after a snapshot.
  * Nothing is deleted: the quarantine is never purged automatically; clearing it is
  * manual and needs Koen's OK.
  *
@@ -84,6 +86,8 @@ export interface RemoveDeps {
     removeProjectContainers: (id: InstanceID) => Promise<void>
     listVolumes: (id: InstanceID) => Promise<string[]>
     quarantine: (disk: Disk, id: InstanceID) => Promise<string>
+    /** Refresh Disk.preUpdateSnapshots / preUpdateBytes / quarantineBytes (idea#428). */
+    refreshSnapshots: (disk: Disk) => Promise<void>
 }
 
 const defaultDeps: RemoveDeps = {
@@ -98,6 +102,7 @@ const defaultDeps: RemoveDeps = {
         } catch { return [] }
     },
     quarantine: async (disk, id) => (await runAppData(quarantineArgs(await appDataRoot(disk), String(id)))).trim(),
+    refreshSnapshots: async () => { /* replaced in removeInstance with a storeHandle-bound default */ },
 }
 
 const RUNNING_STATES = new Set(['Running', 'Starting'])
@@ -107,7 +112,14 @@ const MOVE_KINDS = new Set(['moveApp', 'copyApp'])
 export const removeInstance = async (
     storeHandle: DocHandle<Store>, instanceArg: string, engineId: string, deps: Partial<RemoveDeps> = {},
 ): Promise<RemoveResult> => {
-    const d = { ...defaultDeps, ...deps }
+    const d: RemoveDeps = {
+        ...defaultDeps,
+        refreshSnapshots: async (disk) => {
+            const { refreshPreUpdateSnapshots, defaultUpdateDeps } = await import('./UpdateApp.js')
+            await refreshPreUpdateSnapshots(storeHandle, disk, defaultUpdateDeps(storeHandle).listSnapshots)
+        },
+        ...deps,
+    }
     const store = storeHandle.doc()
     const r = lookupLocalInstanceArg(store, String(instanceArg ?? ''), engineId)
     if (!r.ok) {
@@ -147,6 +159,11 @@ export const removeInstance = async (
             throw new RemoveError('QUARANTINE_FAILED', `cannot quarantine ${dir}: ${(e as Error).message}; the store is unchanged`)
         }
         storeHandle.change(doc => { delete doc.instanceDB[inst.id] })
+        try {
+            await d.refreshSnapshots(disk)
+        } catch (e) {
+            log(`removeInstance: could not refresh pre-update snapshot info on ${disk.id}: ${(e as Error).message}`)
+        }
         log(`removeInstance: ${inst.id} ('${inst.name}') quarantined at ${quarantinePath}; kept volumes: ${keptVolumes.length ? keptVolumes.join(', ') : 'none'}`)
         return { instanceId: inst.id, name: String(inst.name), quarantinePath, keptVolumes }
     } finally {
