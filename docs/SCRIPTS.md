@@ -194,7 +194,15 @@ The file installed at `/usr/local/sbin/idea-usage-export` is `script/build_image
 
 **Pool rollback:** quarantine the new `idea-app-data`, `idea-usage-export`, `/etc/ssh/idea_usage_keys/pi` and the edited `10-idea-peer.conf` with a `.quarantine-<utc-ts>` suffix (never `rm -rf`). Copy the pre-change drop-in back (the three-path `AuthorizedKeysFile` line). Restore helper v5. `visudo -c`. `sudo sshd -t` and reload ssh if the drop-in changed. Restart the Engine as `pi` (`pm2 restart engine` / `pm2 save`). idea01 rolls back the same way, only after a spare already did.
 
-idea#401 (borg prune/delete/compact) moves to helper v8. Tests: `test/automated/idea-app-data-usage-key.test.ts`, `test/automated/idea-usage-export.test.ts`, `test/automated/install-peer-access.test.ts`.
+Tests: `test/automated/idea-app-data-usage-key.test.ts`, `test/automated/idea-usage-export.test.ts`, `test/automated/install-peer-access.test.ts`.
+
+### `idea-app-data` v8: `borg-create` excludes (idea#443)
+
+`borg-create <bdev> <id> <archive> <srcRoot> [exclude…]` accepts optional instance-relative exclude paths after the four existing arguments. A 4-argument call is unchanged. Each path is validated (no absolute path, no `..`, no glob, no leading `-`); a bare name other than `data` is treated as `data/<name>`. The helper writes a root-only temp pattern file of `- pp:$SRC/<rel>` lines and runs `borg create --numeric-ids --patterns-from <file> -- repo::archive $SRC`, then removes the file. A symlink whose target leaves the instance folder is refused. The Engine reads `x-app.backup.exclude` from the instance compose and, when the list is non-empty, requires helper v8 (`HELPER_OUTDATED` otherwise) so an old helper cannot silently pack secrets. `install-root-helpers` already replaces the helper and checks `idea-app-data version`; no new sudoers line. Tests: `test/automated/backup-exclude.test.ts`, `test/automated/idea-app-data-script.test.ts`, `test/automated/app-data-helper.test.ts`.
+
+### `idea-app-data` v9 (reserved): borg prune/delete/compact (idea#401)
+
+Steve (19:19 CET, 2026-11-11) assigned helper v8 to the idea#443 secret-exclusion fix ([agent-engine-dev#324](https://github.com/koenswings/agent-engine-dev/pull/324)) and moved [idea#401](https://github.com/koenswings/idea/issues/401) (borg prune/delete/compact) to helper v9. The issue title still says v6; later versions were taken by other work (v6 App Disk partitions, v7 usage-export key, v8 backup excludes). This section is a reservation only — no prune/delete/compact verbs in this tree yet.
 
 ### `idea-usage-settings`: operator toggle for `usageMonitoring` (idea#411)
 

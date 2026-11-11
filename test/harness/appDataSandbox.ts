@@ -171,6 +171,18 @@ case "$1" in
   init) mkdir -p "\${@: -1}" && echo '[repository]' > "\${@: -1}/config" ;;
   info) if [[ -n "\${FAKE_BORG_INFO:-}" ]]; then echo "$FAKE_BORG_INFO"; else echo '{"archives":[]}'; fi ;;
   extract) for e in \${FAKE_BORG_EXTRACT:-}; do mkdir -p "$e" && echo restored > "$e/data.txt"; done ;;
+  create)
+    i=1
+    while [[ $i -le $# ]]; do
+      ev="\${!i}"
+      if [[ "$ev" == --patterns-from ]]; then
+        i=$((i + 1))
+        pat="\${!i}"
+        if [[ -f "$pat" ]]; then cp -- "$pat" "${callsDir}/borg.patterns"; fi
+      fi
+      i=$((i + 1))
+    done
+    ;;
 esac
 exit \${FAKE_BORG_EXIT:-0}`)
 

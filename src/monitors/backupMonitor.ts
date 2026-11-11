@@ -19,8 +19,9 @@
 import { $, YAML, chalk, fs } from 'zx'
 import { log, print } from '../utils/utils.js'
 import { disksRoot, skipBorg } from '../data/Config.js'
-import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot, appDataRoot } from '../data/Disk.js'
-import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgProblem } from '../utils/appDataHelper.js'
+import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot, appDataRoot, joinMountRoot } from '../data/Disk.js'
+import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgProblem, helperAtLeast } from '../utils/appDataHelper.js'
+import { parseBackupExcludeList, BACKUP_EXCLUDE_HELPER_MIN } from '../utils/backupExclude.js'
 import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { ensureAppFilesOnTarget } from '../data/RestoreAppFiles.js'
 import { localEngineId } from '../data/Engine.js'
@@ -174,6 +175,30 @@ export const backupInstance = async (
             if (borgMissing) throw new Error(borgMissing)
         }
 
+        // 0b. Honour x-app.backup.exclude (idea#443). Fail closed: a non-empty
+        // list on a helper older than v8 refuses before the instance is stopped
+        // or lastBackup is written, so secrets are never packed silently.
+        const composePath = joinMountRoot(await diskMountRoot(appDisk as Disk), 'instances', instanceId, 'compose.yaml')
+        let backupExcludes: string[] = []
+        if (await fs.pathExists(composePath)) {
+            let parsed: unknown
+            try {
+                parsed = YAML.parse(await fs.readFile(composePath, 'utf-8'))
+            } catch (e: any) {
+                throw new Error(`Cannot parse ${composePath} for x-app.backup.exclude (${e?.message ?? e})`)
+            }
+            const xapp = (parsed && typeof parsed === 'object') ? (parsed as Record<string, unknown>)['x-app'] : undefined
+            try {
+                backupExcludes = parseBackupExcludeList(xapp)
+            } catch (e: any) {
+                throw new Error(`backupApp: invalid x-app.backup.exclude (${e?.message ?? e})`)
+            }
+        }
+        if (backupExcludes.length && !skipBorg()) {
+            const helper = await helperAtLeast(BACKUP_EXCLUDE_HELPER_MIN, 'backupApp with x-app.backup.exclude')
+            if (helper) throw new Error(`HELPER_OUTDATED: ${helper}`)
+        }
+
         // 1. Init Borg repo if this is the first backup
         setBackupStep(0, BACKUP_STEPS[0])
         const repoExists = await fs.pathExists(`${repoPath}/config`)
@@ -202,8 +227,8 @@ export const backupInstance = async (
         setBackupStep(2, BACKUP_STEPS[2])
         const archiveName = new Date().toISOString().replace(/[:.]/g, '-')
         if (!skipBorg()) {
-            log(`Running borg create for instance ${instanceId}`)
-            await runAppData(borgCreateArgs(backupDevice, instanceId, archiveName, await appDataRoot(appDisk as Disk)))
+            log(`Running borg create for instance ${instanceId}${backupExcludes.length ? ` (${backupExcludes.length} exclude(s))` : ''}`)
+            await runAppData(borgCreateArgs(backupDevice, instanceId, archiveName, await appDataRoot(appDisk as Disk), backupExcludes))
         } else {
             log(`skipBorg: skipping borg create for instance ${instanceId}`)
         }

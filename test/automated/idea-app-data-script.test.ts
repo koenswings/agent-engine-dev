@@ -108,7 +108,7 @@ describe('idea-app-data: argument checks', () => {
     it('refuses the wrong argument count for every subcommand', async () => {
         const cases: [string, number][] = [
             ['version', 0], ['size', 2], ['copy', 4], ['send', 6], ['delete', 2], ['quarantine', 2], ['snapshot', 2], ['restore-snapshot', 2], ['snapshots', 1], ['estimate', 2],
-            ['borg-init', 2], ['borg-info', 2], ['borg-create', 4], ['borg-extract', 5],
+            ['borg-init', 2], ['borg-info', 2], ['borg-extract', 5],
             ['ensure-dirs', 1], ['erase-slot', 2], ['put-files', 3], ['peer-delete', 3], ['sync-peers', 0], ['install-usage-key', 3],
         ]
         for (const [sub, n] of cases) {
@@ -119,6 +119,7 @@ describe('idea-app-data: argument checks', () => {
             }
         }
         refused(await sb.run(['receive', 'sdb1', 'id1', '--server']), /receive takes <dstRoot> <dstId> and the rsync server arguments/)
+        refused(await sb.run(['borg-create', 'x', 'x', 'x']), /borg-create takes at least 4 argument/)
     })
 
     it('refuses bad roots, ids, archives, strips and hosts (.., leading -, /, case, length)', async () => {
@@ -724,6 +725,51 @@ describe('idea-app-data: borg', () => {
         expect(await fs.readdir(path.join(target, 'instances'))).toEqual([])
         expect(await fs.pathExists(path.join(target, '.idea-app-data-staging'))).toBe(false)
         refused(await sb.run(['borg-extract', 'sdc1', 'inst1', ARCHIVE, '2', 'sdd1'], { FAKE_BORG_EXTRACT: '' }), /got: nothing/)
+    })
+
+    it('borg-create with excludes writes path-prefix patterns and keeps a 4-arg create unchanged (idea#443)', async () => {
+        const repo = path.join(bk, 'backups', 'inst1')
+        const src = path.join(app, 'instances', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        expect((await sb.run(['borg-create', 'sdc1', 'inst1', ARCHIVE, 'sdb1', 'keys', 'data/tailscale', 'tailscale-run'])).exitCode).toBe(0)
+        const calls = await sb.calls('borg')
+        expect(calls).toHaveLength(1)
+        const snapshot = path.join(sb.tmp, 'calls', 'borg.patterns')
+        expect(await fs.readFile(snapshot, 'utf8')).toBe(
+            `- pp:${src}/data/keys\n- pp:${src}/data/tailscale\n- pp:${src}/data/tailscale-run\n`,
+        )
+        const patIdx = calls[0].argv.indexOf('--patterns-from')
+        expect(patIdx).toBe(2)
+        const patArg = calls[0].argv[patIdx + 1]
+        expect(patArg.startsWith(path.join(sb.lockDir, 'borg-exclude.'))).toBe(true)
+        expect(calls[0].argv).toEqual([
+            'create', '--numeric-ids', '--patterns-from', patArg, '--', `${repo}::${ARCHIVE}`, src,
+        ])
+        // the temp pattern file itself is removed after borg returns
+        const leftover = (await fs.readdir(sb.lockDir)).filter(n => n.startsWith('borg-exclude.'))
+        expect(leftover).toEqual([])
+
+        await fs.remove(path.join(sb.tmp, 'calls', 'borg.log'))
+        expect((await sb.run(['borg-create', 'sdc1', 'inst1', '2026-10-06T11-00-00-000Z', 'sdb1'])).exitCode).toBe(0)
+        const [plain] = await sb.calls('borg')
+        expect(plain.argv).toEqual(['create', '--numeric-ids', '--', `${repo}::2026-10-06T11-00-00-000Z`, src])
+    })
+
+    it('borg-create refuses exclude paths that escape the instance folder or look like options (idea#443)', async () => {
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        for (const bad of ['/etc/passwd', '../etc', 'data/../../etc', '-patterns-from', 'data/*', 'foo//bar', '', '.']) {
+            refused(await sb.run(['borg-create', 'sdc1', 'inst1', ARCHIVE, 'sdb1', bad]), /exclude/)
+        }
+        const src = path.join(app, 'instances', 'inst1')
+        await fs.ensureDir(path.join(src, 'data'))
+        const outside = path.join(sb.tmp, 'outside-secret')
+        await fs.writeFile(outside, 'nope')
+        await fs.symlink(outside, path.join(src, 'data', 'keys'))
+        refused(await sb.run(['borg-create', 'sdc1', 'inst1', ARCHIVE, 'sdb1', 'keys']), /points outside the instance folder/)
+        expect(await sb.calls('borg')).toEqual([])
     })
 })
 

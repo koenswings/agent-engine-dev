@@ -28,6 +28,7 @@ import { $ } from 'zx'
 import { log } from './utils.js'
 import { config } from '../data/Config.js'
 import { peerSshArgv, checkEngineId, normaliseEd25519 } from './peerSsh.js'
+import { normalizeBackupExclude } from './backupExclude.js'
 
 /** Installed path of the helper (a root-owned copy, 0755; build-engine installUdev). */
 export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
@@ -37,7 +38,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '7'
+export const APP_DATA_HELPER_VERSION = '8'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -145,8 +146,17 @@ export const quarantineArgs = (root: string, id: string): string[] => ['quaranti
 export const deleteArgs = (root: string, id: string): string[] => ['delete', checkRoot(root), checkId(id)]
 export const borgInitArgs = (bdev: string, id: string): string[] => ['borg-init', checkRoot(bdev), checkId(id)]
 export const borgInfoArgs = (bdev: string, id: string): string[] => ['borg-info', checkRoot(bdev), checkId(id)]
-export const borgCreateArgs = (bdev: string, id: string, archive: string, srcRoot: string): string[] =>
-    ['borg-create', checkRoot(bdev), checkId(id), checkArchive(archive), checkRoot(srcRoot)]
+export const borgCreateArgs = (bdev: string, id: string, archive: string, srcRoot: string, excludes: string[] = []): string[] => {
+    const args = ['borg-create', checkRoot(bdev), checkId(id), checkArchive(archive), checkRoot(srcRoot)]
+    const seen = new Set<string>()
+    for (const raw of excludes) {
+        const n = normalizeBackupExclude(raw)
+        if (seen.has(n)) continue
+        seen.add(n)
+        args.push(n)
+    }
+    return args
+}
 export const borgExtractArgs = (bdev: string, id: string, archive: string, strip: number, dstRoot: string): string[] => {
     if (!Number.isInteger(strip) || strip < 1 || strip > 9) throw new Error(`strip ${strip} is out of range (1-9)`)
     return ['borg-extract', checkRoot(bdev), checkId(id), checkArchive(archive), String(strip), checkRoot(dstRoot)]
