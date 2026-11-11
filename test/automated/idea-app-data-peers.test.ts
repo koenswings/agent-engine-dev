@@ -108,6 +108,18 @@ describe('idea-app-data sync-peers', () => {
         expect((await authLines()).length).toBe(256)
     }, 60_000)
 
+    it('does not wipe or rewrite the usage key file (idea#412)', async () => {
+        await fs.ensureDir(sb.usageAuthDir)
+        const planted = `restrict,from="100.64.1.2",command="/usr/local/sbin/idea-usage-export" ${testKey('planted')} idea-usage\n`
+        await fs.writeFile(sb.usageAuthFile, planted)
+        const ino = (await fs.stat(sb.usageAuthFile)).ino
+        const r = await sync([peerLine('ENGINE_a')])
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(await fs.readFile(sb.usageAuthFile, 'utf8')).toBe(planted)
+        expect((await fs.stat(sb.usageAuthFile)).ino).toBe(ino)
+        expect(await authLines()).toHaveLength(1)
+    })
+
     it('refuses a peer-file folder that is a symlink or group/other writable', async () => {
         await fs.ensureDir(sb.peerAuthDir)
         await fs.chmod(sb.peerAuthDir, 0o777)

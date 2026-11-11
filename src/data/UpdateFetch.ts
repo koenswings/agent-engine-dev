@@ -20,7 +20,7 @@ import { DocHandle } from '@automerge/automerge-repo'
 import { fs, path } from 'zx'
 import type { Store } from './Store.js'
 import type { Command, EngineID } from './CommonTypes.js'
-import { Disk, diskMountRoot, appDataRoot } from './Disk.js'
+import { Disk, diskMountRoot, appDataRoot, joinMountRoot } from './Disk.js'
 import { log, uuid } from '../utils/utils.js'
 import { UpdateAppError } from './UpdateAppPolicy.js'
 import type { UpdateProgress, FetchPaused } from './UpdateApp.js'
@@ -38,7 +38,8 @@ export const THERMAL_RESUME_C = 65
 export const THERMAL_POLL_MS = 10_000
 /** No answer from the source Engine within this time: TRANSFER_FAILED. */
 export const FETCH_TIMEOUT_MS = 6 * 60 * 60 * 1000
-const RE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+/** App ids and request tokens accepted for a cross-Engine Fetch; rejects `+`, so dev bundles `0.0-dev+<sha12>` never travel (agent-app-dev#36). */
+export const RE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 
 /** True when apps/<appId>/ is a Fetch still in progress (or aborted): dock and listing skip it. */
 export const isUnfinishedFetch = async (bundleDir: string): Promise<boolean> =>
@@ -99,7 +100,7 @@ export const fetchBundle = async (req: FetchRequest, d: FetchTargetDeps): Promis
         if (!RE_TOKEN.test(t)) throw new UpdateAppError('TRANSFER_FAILED', `cannot ask for a Fetch with the token '${t}'`)
     }
     const root = await d.mountRoot(req.targetDisk)
-    const dir = path.join(root, 'apps', req.newAppId)
+    const dir = joinMountRoot(root, 'apps', req.newAppId)
     if (await fs.pathExists(dir)) {
         if (await fs.pathExists(path.join(dir, FETCHED_MARKER)) && await d.verifySums(dir)) return dir
         if (await fs.pathExists(path.join(dir, FETCHING_MARKER))) await setFetchAside(dir, d.now())
@@ -174,7 +175,7 @@ export const pushAppBundle = async (store: Store, localEngineId: string, req: Pu
     }
     const disk = store.diskDB?.[req.sourceDiskId as any] as Disk | undefined
     if (!disk || String(disk.dockedTo) !== localEngineId || !disk.device) return answer({ ok: false, why: `source disk ${req.sourceDiskId} is not docked to Engine ${localEngineId}` })
-    const src = path.join(await d.mountRoot(disk), 'apps', req.appId)
+    const src = joinMountRoot(await d.mountRoot(disk), 'apps', req.appId)
     if (!await fs.pathExists(path.join(src, 'compose.yaml')) || !await fs.pathExists(path.join(src, 'SHA256SUMS'))) return answer({ ok: false, why: `${req.appId} on ${req.sourceDiskId} has no compose.yaml or SHA256SUMS` })
     if ((await fs.readdir(src)).some(n => n.startsWith('.idea-'))) return answer({ ok: false, why: `${src} holds bundle-root .idea-* files; not pushing them` })
     const host = await d.address(req.targetEngineId)

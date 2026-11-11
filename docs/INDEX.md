@@ -53,6 +53,13 @@ Teacher USB sticks (idea#193): Engine ⇄ app interface — `/run/idea-usb` moun
 vfat/exFAT mount options, store fields and what apps (Nextcloud, Kolibri) see.
 → [docs/USB-STICKS.md](USB-STICKS.md)
 
+## USAGE-CONTRACT.md
+**Status:** Authoritative (idea-usage process on main since #308 / `16c3174`; `/usr/local/sbin/idea-usage-export` is the Python asset, idea#412)  ·  **Maintained by:** Axle
+Field usage monitoring (idea#411 / idea#412): `x-app.usage` hook shape and invocation,
+day/sample/presence JSON schemas, on-disk layout under `/var/lib/idea/usage/`,
+export wire format (`since`, `archive-and-clear`), off switch and `usageSummaries`.
+→ [docs/USAGE-CONTRACT.md](USAGE-CONTRACT.md)
+
 ## interfaces.json
 **Status:** Static snapshot (intentionally not updated; idea#308)  ·  **Maintained by:** Axle
 A one-off sample of Node's `os.networkInterfaces()` output from a Pi, kept as an example of the
@@ -61,7 +68,8 @@ shape the Engine reads. Not generated, not read by any code or test; it does not
 
 ## source-bundle.md
 **Status:** Generated bundle  ·  **Maintained by:** Axle
-Generated source bundle of Engine docs/code for offline review and PDF export.
+Generated bundle of the Engine source (`src/**/*.ts`, `package.json`, `tsconfig.json`) for offline/LLM review.
+Regenerate with `pnpm bundle-context` (script/bundle-context.ts) when the source changes; last refreshed 2026-10-30 (idea#366).
 → [docs/source-bundle.md](source-bundle.md)
 
 ## styles/markdown-pdf.css

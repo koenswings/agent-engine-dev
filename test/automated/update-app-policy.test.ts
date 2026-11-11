@@ -1,6 +1,6 @@
 /** update-app-policy.test.ts — pure rules for updateApp v1 (agent-engine-dev#230). */
 import { describe, it, expect } from 'vitest'
-import { compareVersions, parseVersion, healthTimeoutSeconds, checkUpdate, offerable, healthGate, rollbackPlan, CheckFacts, BACKUP_MAX_AGE_MS } from '../../src/data/UpdateAppPolicy.js'
+import { compareVersions, parseVersion, healthTimeoutSeconds, checkUpdate, offerable, healthGate, rollbackPlan, appIdentityProblems, CheckFacts, BACKUP_MAX_AGE_MS } from '../../src/data/UpdateAppPolicy.js'
 
 const ok: CheckFacts = { diskDocked: true, busy: false, currentAppId: 'kolibri-0.15.5', newAppId: 'kolibri-0.19.5', sourcePresent: true, sumsValid: true, allowMajor: false, backupAgeMs: null, shortDisks: [] }
 const code = (f: Partial<CheckFacts>) => checkUpdate({ ...ok, ...f })?.code ?? null
@@ -33,6 +33,22 @@ describe('checkUpdate refusals', () => {
     it('SOURCE_MISSING', () => expect(code({ sourcePresent: false })).toBe('SOURCE_MISSING'))
     it('NO_SUMS', () => expect(code({ sumsValid: false })).toBe('NO_SUMS'))
     it('DIFFERENT_APP', () => expect(code({ newAppId: 'kiwix-3.0' })).toBe('DIFFERENT_APP'))
+    it('DIFFERENT_APP names mismatched x-app.name and x-app.version with actual and expected values', () => {
+        const err = checkUpdate({ ...ok, newAppId: 'kiwix-3.0' })
+        expect(err?.code).toBe('DIFFERENT_APP')
+        expect(err?.message).toBe('DIFFERENT_APP: x-app.name mismatch (actual: kolibri, expected: kiwix); x-app.version mismatch (actual: 0.15.5, expected: 3.0)')
+    })
+    it('DIFFERENT_APP says which of x-app.name and/or x-app.version is missing (idea#427, undefined-undefined instanceOf)', () => {
+        const both = checkUpdate({ ...ok, currentAppId: 'undefined-undefined', newAppId: 'axleproof-1.1' })
+        expect(both?.code).toBe('DIFFERENT_APP')
+        expect(both?.message).toBe('DIFFERENT_APP: x-app.name is missing (actual: (missing), expected: axleproof); x-app.version is missing (actual: (missing), expected: 1.1)')
+        const noName = checkUpdate({ ...ok, currentAppId: 'undefined-1.0', newAppId: 'axleproof-1.1' })
+        expect(noName?.message).toBe('DIFFERENT_APP: x-app.name is missing (actual: (missing), expected: axleproof); x-app.version mismatch (actual: 1.0, expected: 1.1)')
+        const noVer = checkUpdate({ ...ok, currentAppId: 'axleproof-undefined', newAppId: 'axleproof-1.1' })
+        expect(noVer?.code).toBe('DIFFERENT_APP')
+        expect(noVer?.message).toBe('DIFFERENT_APP: x-app.version is missing (actual: (missing), expected: 1.1)')
+        expect(appIdentityProblems('kolibri-0.15.5', 'kolibri-0.19.5')).toBeNull()
+    })
     it('NOT_NEWER', () => { expect(code({ newAppId: 'kolibri-0.15.5' })).toBe('NOT_NEWER'); expect(code({ newAppId: 'kolibri-0.14.0' })).toBe('NOT_NEWER') })
     it('MAJOR_NOT_ALLOWED', () => expect(code({ newAppId: 'kolibri-1.0.0' })).toBe('MAJOR_NOT_ALLOWED'))
     it('NEEDS_BACKUP', () => {

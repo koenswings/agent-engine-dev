@@ -77,7 +77,8 @@ describe('idea-app-data: the source script (idea#168)', () => {
         // Every external command is a $VAR set to an absolute path
         for (const m of text.matchAll(/^([A-Z_]+)=(\/\S+)$/gm)) {
             if (['PATH', 'DISKS_DIR', 'ROOTS_FILE', 'LOCK_DIR', 'ROOT_HOME', 'HELPER_PATH',
-                'PEER_KEY', 'PEER_KNOWN_HOSTS', 'PEER_AUTH_DIR', 'PEER_GATE', 'LEDGER_DIR', 'VOLUMES_DIR'].includes(m[1])) continue
+                'PEER_KEY', 'PEER_KNOWN_HOSTS', 'PEER_AUTH_DIR', 'PEER_GATE', 'LEDGER_DIR', 'VOLUMES_DIR',
+                'USAGE_AUTH_DIR', 'USAGE_EXPORT', 'USAGE_EXPORT_CMD', 'USAGE_EXPORT_SRC', 'PEER_SSHD_DROPIN'].includes(m[1])) continue
             expect(m[2], m[1]).toMatch(/^\/usr\/(s?bin)\/[a-z0-9.]+$/)
         }
     })
@@ -108,7 +109,7 @@ describe('idea-app-data: argument checks', () => {
         const cases: [string, number][] = [
             ['version', 0], ['size', 2], ['copy', 4], ['send', 6], ['delete', 2], ['quarantine', 2], ['snapshot', 2], ['restore-snapshot', 2], ['snapshots', 1], ['estimate', 2],
             ['borg-init', 2], ['borg-info', 2], ['borg-create', 4], ['borg-extract', 5],
-            ['ensure-dirs', 1], ['erase-slot', 2], ['put-files', 3], ['peer-delete', 3], ['sync-peers', 0],
+            ['ensure-dirs', 1], ['erase-slot', 2], ['put-files', 3], ['peer-delete', 3], ['sync-peers', 0], ['install-usage-key', 3],
         ]
         for (const [sub, n] of cases) {
             for (const count of [n - 1, n + 1]) {
@@ -515,6 +516,61 @@ describe('idea-app-data: updateApp snapshots (v5, idea#230)', () => {
         expect(await fs.pathExists(path.join(root, '.idea-quarantine'))).toBe(false)
         const body = await fs.readFile(path.join(process.cwd(), 'script/build_image_assets/idea-app-data'), 'utf8')
         expect(body.slice(body.indexOf('    estimate)'), body.indexOf('    snapshots)'))).not.toMatch(/take_locks|\$MV|\$MKDIR|\$RSYNC|\$TAR|>> "|> "/)
+    })
+    it('estimate system reports three integers; df is called on the system root not an empty path (idea#427)', async () => {
+        await sb.addInstance(sb.sys, 'inst1')
+        const r = await sb.run(['estimate', 'system', 'inst1'], { FAKE_DF_AVAIL_KB: '4242' })
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(r.stdout.trim()).toMatch(/^\d+ \d+ 4242$/)
+        const dfs = await sb.calls('df')
+        expect(dfs.length).toBeGreaterThan(0)
+        expect(dfs.every(c => c.argv.includes(sb.sys))).toBe(true)
+        expect(dfs.every(c => !c.argv.includes(''))).toBe(true)
+    })
+    it('avail_kb and free_floor treat an empty SYSTEM_ROOT as / so df is never called with "" (idea#427)', async () => {
+        const body = await fs.readFile(HELPER_SOURCE, 'utf8')
+        expect(body).toMatch(/^SYSTEM_ROOT=$/m)
+        expect(body).not.toMatch(/^SYSTEM_ROOT=\//m)
+        const avail = body.slice(body.indexOf('avail_kb() {'), body.indexOf('quarantine_aside() {'))
+        expect(avail).toContain('local dir="${1:-/}"')
+        expect(avail).toContain('$DF -Pk -- "$dir"')
+        const floor = body.slice(body.indexOf('free_floor() {'), body.indexOf('engine_user_dir() {'))
+        expect(floor).toContain('local dir="${1:-/}"')
+        expect(floor).toContain('$DF -Pk -- "$dir"')
+        expect(body).toContain('FREE_KB=$(avail_kb "${R_DIR:-/}")')
+        expect(body).toContain('$(avail_kb "${R_DIR:-/}")')
+
+        const lines = body.split('\n')
+        const start = lines.findIndex(l => l.startsWith('avail_kb()'))
+        let end = start + 1
+        while (end < lines.length && lines[end] !== '}') end++
+        const fn = lines.slice(start, end + 1).join('\n')
+        expect(fn).toContain('avail_kb()')
+        expect(fn).toContain('local dir="${1:-/}"')
+
+        const runner = path.join(sb.tmp, 'run-avail-kb.sh')
+        await fs.writeFile(runner, [
+            '#!/bin/bash',
+            'set -euo pipefail',
+            `DF=${sb.bin}/df`,
+            'refuse() { echo "refused: $*" >&2; exit 2; }',
+            fn,
+            'avail_kb ""',
+            '',
+        ].join('\n'), { mode: 0o755 })
+        const out = await new Promise<{ exitCode: number | null, stdout: string, stderr: string }>((resolve, reject) => {
+            const proc = spawn(runner, [], { stdio: ['ignore', 'pipe', 'pipe'] })
+            let stdout = '', stderr = ''
+            proc.stdout!.on('data', d => { stdout += d })
+            proc.stderr!.on('data', d => { stderr += d })
+            proc.on('error', reject)
+            proc.on('close', (exitCode) => resolve({ exitCode, stdout, stderr }))
+        })
+        expect(out.exitCode, out.stderr).toBe(0)
+        expect(out.stdout.trim()).toMatch(/^\d+$/)
+        const dfs = await sb.calls('df')
+        expect(dfs.some(c => c.argv[c.argv.length - 1] === '/')).toBe(true)
+        expect(dfs.every(c => c.argv[c.argv.length - 1] !== '')).toBe(true)
     })
     it('a volume mounted by any running container is refused for export and restore (IN_USE); a vanished volume is recreated on restore', async () => {
         const root = await sb.addDisk('sdb1')

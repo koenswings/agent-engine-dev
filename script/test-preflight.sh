@@ -35,9 +35,9 @@ if command -v pm2 >/dev/null 2>&1; then
         if pm2 jlist 2>/dev/null | node -e '
             let s = ""; process.stdin.on("data", d => s += d).on("end", () => {
                 let list = []; try { list = JSON.parse(s) } catch { process.exit(1) }
-                process.exit(list.some(p => p.name === "engine" && p.pm2_env && p.pm2_env.status === "online") ? 0 : 1)
+                process.exit(list.some(p => (p.name === "engine" || p.name === "idea-usage") && p.pm2_env && p.pm2_env.status === "online") ? 0 : 1)
             })'; then
-            findings+=("pm2 process 'engine' is online")
+            findings+=("pm2 process 'engine' or 'idea-usage' is online")
         fi
     fi
 fi
@@ -46,6 +46,11 @@ fi
 engine_re='^(\S*/)?node(\s|$).*dist/src/index\.js'
 if pgrep -f "$engine_re" >/dev/null 2>&1; then
     findings+=("an Engine process (node .../dist/src/index.js) is running: $(pgrep -af "$engine_re" | head -3 | tr '\n' ';')")
+fi
+# idea-usage (idea#411): a live sampler/hook runner must not sit next to tests.
+usage_re='^(\S*/)?node(\s|$).*dist/src/usage/main\.js'
+if pgrep -f "$usage_re" >/dev/null 2>&1; then
+    findings+=("an idea-usage process (node .../dist/src/usage/main.js) is running: $(pgrep -af "$usage_re" | head -3 | tr '\n' ';')")
 fi
 
 # ── 2. Live (non-test) containers ──────────────────────────────────────────

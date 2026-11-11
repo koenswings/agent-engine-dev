@@ -42,6 +42,13 @@
 #   idea-app-data put-files        <root> <id> <stagingDir>  (local Engine: copy basenames from staging into instance as root)
 #   Peer keys (the Engine, from its store):
 #   idea-app-data sync-peers   < "<engineId> ssh-ed25519 <key> ssh-ed25519 <hostkey>" lines
+#   idea-app-data install-usage-key <ipv4> ssh-ed25519 <base64>
+#                                    (v7, idea#412: write /etc/ssh/idea_usage_keys/pi with
+#                                    restrict,from="<ipv4>",command="/usr/local/sbin/idea-usage-export"
+#                                    constructed here — never taken from the caller; <ipv4> must be
+#                                    Tailscale 100.64/10. Appends /etc/ssh/idea_usage_keys/%u to the
+#                                    existing AuthorizedKeysFile in 10-idea-peer.conf without dropping
+#                                    other entries, checks sshd -t, installs idea-usage-export)
 #   idea-app-data snapshot         <root> <id>   (v5, idea#230: copy instances/<id> to .pre-update/<id>/data, COMPLETE marker last)
 #   idea-app-data restore-snapshot <root> <id>   (v5: current folder to .idea-quarantine, then copy the snapshot back)
 #   idea-app-data snapshots        <root>        (v5: "<id> <kb> complete|incomplete" per .pre-update snapshot)
@@ -99,6 +106,9 @@
 # The prefix is written here, never taken from the caller. An empty set empties both.
 # sshd reads the first file through /etc/ssh/sshd_config.d/10-idea-peer.conf
 # (AuthorizedKeysFile), installed by build-engine.
+# sync-peers must never touch /etc/ssh/idea_usage_keys (idea#412); that file is
+# written only by install-usage-key, and those keys are not routed through
+# idea-peer-gate.
 #
 # send connects as pi with the Engine's own key only and the peer's host key pinned
 # by Engine id: ssh -i /home/pi/.ssh/idea_engine_ed25519 -o IdentitiesOnly=yes
@@ -113,7 +123,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=5
+readonly IDEA_APP_DATA_VERSION=7
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -150,6 +160,9 @@ DF=/usr/bin/df
 CMP=/usr/bin/cmp
 CHMOD=/usr/bin/chmod
 CHOWN=/usr/bin/chown
+INSTALL=/usr/bin/install
+SSHD=/usr/sbin/sshd
+SYSTEMCTL=/usr/bin/systemctl
 UMOUNT=/usr/bin/umount
 MOUNT=/usr/bin/mount
 MKFS=/usr/sbin/mkfs.ext4
@@ -160,6 +173,9 @@ SHA256SUM=/usr/bin/sha256sum
 
 # ── Fixed locations ──────────────────────────────────────────────────────────
 DISKS_DIR=/disks
+# Empty on purpose so "$SYSTEM_ROOT/instances/<id>" is /instances/<id>.
+# SYSTEM_ROOT=/ would produce //instances/<id> and fail exact_path (idea#237).
+# Verbs that pass the root itself to df must treat '' as / (avail_kb, free_floor; idea#427).
 SYSTEM_ROOT=
 ROOTS_FILE=/etc/idea/app-data-roots
 LOCK_DIR=/run/lock/idea-app-data
@@ -174,6 +190,11 @@ PEER_KEY=/home/pi/.ssh/idea_engine_ed25519
 PEER_KNOWN_HOSTS=/etc/idea/peer_known_hosts
 PEER_AUTH_DIR=/etc/ssh/idea_authorized_keys
 PEER_GATE=/usr/local/sbin/idea-peer-gate
+USAGE_EXPORT=/usr/local/sbin/idea-usage-export
+USAGE_EXPORT_CMD=/usr/local/sbin/idea-usage-export
+USAGE_EXPORT_SRC=
+USAGE_AUTH_DIR=/etc/ssh/idea_usage_keys
+PEER_SSHD_DROPIN=/etc/ssh/sshd_config.d/10-idea-peer.conf
 LEDGER_DIR=/var/lib/idea-app-data
 LEDGER_TTL_SECONDS=86400
 FREE_FLOOR_KB=1048576
@@ -283,10 +304,10 @@ containers_stopped() {   # containers_stopped <id>: refuse while any container o
     ids=$($DOCKER ps -q --filter "label=com.docker.compose.project=$1" 2>/dev/null) || refuse "cannot list the containers of $1"
     [[ -z "$ids" ]] || refuse "RUNNING: the containers of $1 are still running; stop the instance first"
 }
-avail_kb() {   # avail_kb <existing folder>
-    local a
-    a=$($DF -Pk -- "$1" 2>/dev/null | { read -r _; read -r _ _ _ a _; echo "${a:-}"; })
-    [[ "$a" =~ ^[0-9]+$ ]] || refuse "cannot tell the free space of $1"
+avail_kb() {   # avail_kb <existing folder>  (empty means /; idea#427)
+    local dir="${1:-/}" a
+    a=$($DF -Pk -- "$dir" 2>/dev/null | { read -r _; read -r _ _ _ a _; echo "${a:-}"; })
+    [[ "$a" =~ ^[0-9]+$ ]] || refuse "cannot tell the free space of $dir"
     echo "$a"
 }
 quarantine_aside() {   # quarantine_aside <R_DIR> <path> <name>: move <path> to .idea-quarantine/<name>-<stamp>, echo it
@@ -432,7 +453,7 @@ bridge_lookup() {
     echo "$found"
 }
 
-# resolve_root <token> <instances|backup> → sets R_DIR (no trailing slash; '' is /)
+# resolve_root <token> <instances|backup> → sets R_DIR (no trailing slash; '' is /; idea#237/#427)
 resolve_root() {
     local tok="$1" purpose="$2" b
     R_DIR=""
@@ -564,6 +585,55 @@ inst_dir() { echo "$1/instances/$2"; }   # inst_dir <R_DIR> <id>
 check_engine_id() { [[ "$1" =~ $RE_ENGINE ]] || refuse "Engine id '$1' does not match $RE_ENGINE"; }
 check_app() { [[ "$1" =~ $RE_APP && "$1" != *..* ]] || refuse "app id '$1' does not match $RE_APP (or holds '..')"; }
 
+# Sidecar Tailscale IPv4 for install-usage-key (idea#412). Options are never
+# taken from the caller; only a dotted-quad in 100.64.0.0/10 is accepted.
+check_usage_ipv4() {
+    local ip="$1" o1 o2 o3 o4
+    [[ "$ip" =~ $RE_IPV4 ]] || refuse "usage key from= address '$ip' is not an IPv4 address"
+    o1=$((10#${BASH_REMATCH[1]})); o2=$((10#${BASH_REMATCH[2]})); o3=$((10#${BASH_REMATCH[3]})); o4=$((10#${BASH_REMATCH[4]}))
+    (( o1 <= 255 && o2 <= 255 && o3 <= 255 && o4 <= 255 )) || refuse "usage key from= address '$ip' is not an IPv4 address"
+    (( o1 == 100 && o2 >= 64 && o2 <= 127 )) || refuse "usage key from= address '$ip' is not a Tailscale IPv4 address (100.64/10)"
+}
+
+# Build the drop-in text with /etc/ssh/idea_usage_keys/%u appended to the existing
+# AuthorizedKeysFile line, without dropping other entries. Prints the new file
+# contents (no write). A second drop-in would replace the peer file (Debian reads
+# sshd_config.d first), so this only edits the existing first line.
+usage_akf_content() {
+    local dropin="$PEER_SSHD_DROPIN" token="/etc/ssh/idea_usage_keys/%u"
+    local st uid mode line out="" found=0
+    [[ -f "$dropin" && ! -L "$dropin" ]] || refuse "sshd drop-in $dropin is missing or a symlink"
+    st=$(stat_fields "$dropin") || refuse "cannot stat $dropin"
+    read -r uid _ mode <<<"$st"
+    [[ "$uid" == "$ROOT_UID" ]] || refuse "sshd drop-in $dropin must be owned by root (got uid $uid)"
+    no_group_other_write "$mode" || refuse "sshd drop-in $dropin (mode 0$mode) must not be group or other writable"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line//$'\r'/}"
+        if [[ "$line" =~ ^[Aa]uthorized[Kk]eys[Ff]ile[[:space:]]+ ]]; then
+            found=$((found + 1))
+            (( found == 1 )) || refuse "sshd drop-in $dropin has more than one AuthorizedKeysFile line; refusing to guess which one wins"
+            if [[ "$line" != *"$token"* ]]; then
+                line="${line%"${line##*[![:space:]]}"}"
+                line="$line $token"
+            fi
+        fi
+        out+="$line"$'\n'
+    done < "$dropin"
+    (( found == 1 )) || refuse "sshd drop-in $dropin has no AuthorizedKeysFile line; refusing to invent one"
+    printf '%s' "$out"
+}
+
+install_usage_export() {
+    if [[ -n "$USAGE_EXPORT_SRC" ]]; then
+        [[ -f "$USAGE_EXPORT_SRC" && ! -L "$USAGE_EXPORT_SRC" ]] || refuse "usage export source is missing or a symlink"
+        $INSTALL -o "$ROOT_UID" -g "$ROOT_GID" -m 0755 -- "$USAGE_EXPORT_SRC" "$USAGE_EXPORT" \
+            || refuse "cannot install $USAGE_EXPORT"
+    else
+        [[ -f "$USAGE_EXPORT" && ! -L "$USAGE_EXPORT" && -x "$USAGE_EXPORT" ]] \
+            || refuse "usage export $USAGE_EXPORT is not installed (run ./install-root-helpers)"
+    fi
+}
+
 # The rsync server arguments of every receive: --server first, write-only, no
 # character outside the safe set (rrsync -wo checks them again).
 check_server_args() {
@@ -577,11 +647,11 @@ check_server_args() {
 
 # Free-space floor: a receive is refused when the target filesystem has less than
 # FREE_FLOOR_KB free (a peer cannot fill a disk to the last byte).
-free_floor() {   # free_floor <existing folder>
-    local avail
-    avail=$($DF -Pk -- "$1" 2>/dev/null | { read -r _; read -r _ _ _ a _; echo "${a:-}"; })
-    [[ "$avail" =~ ^[0-9]+$ ]] || refuse "cannot tell the free space of $1"
-    (( avail >= FREE_FLOOR_KB )) || refuse "only ${avail} KB free on the filesystem of $1; receives need at least ${FREE_FLOOR_KB} KB"
+free_floor() {   # free_floor <existing folder>  (empty means /; idea#427)
+    local dir="${1:-/}" avail
+    avail=$($DF -Pk -- "$dir" 2>/dev/null | { read -r _; read -r _ _ _ a _; echo "${a:-}"; })
+    [[ "$avail" =~ ^[0-9]+$ ]] || refuse "cannot tell the free space of $dir"
+    (( avail >= FREE_FLOOR_KB )) || refuse "only ${avail} KB free on the filesystem of $dir; receives need at least ${FREE_FLOOR_KB} KB"
 }
 
 # A folder written as the Engine user (app masters, service tars): created 0755 if
@@ -902,6 +972,52 @@ case "$SUB" in
         journal "sync-peers: $N peer(s); authorized_keys $R_AUTH; known_hosts $R_KNOWN; peers=[${SEEN_IDS# }]"
         ;;
 
+    install-usage-key)
+        need 3 $(($# - 1)) "<ipv4> ssh-ed25519 <base64>"
+        check_usage_ipv4 "$2"
+        [[ "$3" == ssh-ed25519 ]] || refuse "usage key type must be ssh-ed25519 (options are not accepted from the caller)"
+        [[ "$4" =~ ^$RE_KEY64$ ]] || refuse "usage key is not a well-formed ssh-ed25519 public key"
+        root_dir "$USAGE_AUTH_DIR" 0755 "usage keys folder"
+        take_locks usage-keys
+        KEYFILE="$USAGE_AUTH_DIR/$REMOTE_USER"
+        [[ ! -L "$KEYFILE" ]] || refuse "usage key file $KEYFILE is a symlink"
+        LINE="restrict,from=\"$2\",command=\"$USAGE_EXPORT_CMD\" ssh-ed25519 $4 idea-usage"
+        NEW_DROPIN=$(usage_akf_content) || exit $?
+        PREV_DROPIN=$($MKTEMP -- "${PEER_SSHD_DROPIN%/*}/.10-idea-peer.conf.XXXXXX") || refuse "cannot create a backup of $PEER_SSHD_DROPIN"
+        PREV_KEY=""
+        HAD_KEY=0
+        $CP -- "$PEER_SSHD_DROPIN" "$PREV_DROPIN" || { $RM -f -- "$PREV_DROPIN"; refuse "cannot backup $PEER_SSHD_DROPIN"; }
+        if [[ -f "$KEYFILE" ]]; then
+            PREV_KEY=$($MKTEMP -- "$USAGE_AUTH_DIR/.pi.XXXXXX") || { $RM -f -- "$PREV_DROPIN"; refuse "cannot create a backup of $KEYFILE"; }
+            $CP -- "$KEYFILE" "$PREV_KEY" || { $RM -f -- "$PREV_DROPIN" "$PREV_KEY"; refuse "cannot backup $KEYFILE"; }
+            HAD_KEY=1
+        fi
+        restore_usage_install() {
+            $CP -- "$PREV_DROPIN" "$PEER_SSHD_DROPIN" 2>/dev/null || true
+            if (( HAD_KEY )); then
+                $CP -- "$PREV_KEY" "$KEYFILE" 2>/dev/null || true
+            else
+                $RM -f -- "$KEYFILE"
+            fi
+            $RM -f -- "$PREV_DROPIN" "$PREV_KEY"
+        }
+        R_DROPIN=$(swap_file "$PEER_SSHD_DROPIN" "$NEW_DROPIN") || { restore_usage_install; exit $?; }
+        R_KEY=$(swap_file "$KEYFILE" "$LINE"$'\n') || { restore_usage_install; exit $?; }
+        install_usage_export || { restore_usage_install; exit $?; }
+        if ! $SSHD -t; then
+            restore_usage_install
+            refuse "sshd -t rejected the configuration after install-usage-key"
+        fi
+        $RM -f -- "$PREV_DROPIN" "$PREV_KEY"
+        if [[ "$R_DROPIN" == updated ]]; then
+            if ! $SYSTEMCTL reload ssh; then
+                $SYSTEMCTL reload sshd || refuse "cannot reload sshd after updating $PEER_SSHD_DROPIN"
+            fi
+        fi
+        echo "install-usage-key: key $R_KEY; drop-in $R_DROPIN; export $USAGE_EXPORT"
+        journal "install-usage-key: from=$2 key=$R_KEY drop-in=$R_DROPIN"
+        ;;
+
     delete)
         need 2 $(($# - 1)) "<root> <id>"
         check_id "$3"
@@ -974,7 +1090,7 @@ case "$SUB" in
         NEED_KB=$(( INST_KB + VOL_KB ))
         MARGIN_KB=$(( NEED_KB * SNAPSHOT_MARGIN_PCT / 100 ))
         (( MARGIN_KB >= FREE_FLOOR_KB )) || MARGIN_KB=$FREE_FLOOR_KB
-        FREE_KB=$(avail_kb "$R_DIR")
+        FREE_KB=$(avail_kb "${R_DIR:-/}")
         if (( FREE_KB < NEED_KB + MARGIN_KB )); then
             REFUSAL="NO_SPACE"
             echo "NO_SPACE: snapshot needs $(( (NEED_KB + MARGIN_KB) * 1024 )) bytes ($INST_KB KB folder + $VOL_KB KB volumes + $MARGIN_KB KB margin), free $(( FREE_KB * 1024 )) bytes" >&2
@@ -1099,7 +1215,7 @@ case "$SUB" in
             VOL_KB=$(( VOL_KB + k ))
         done
         INST_KB=$(dir_kb "$INST"); [[ "$INST_KB" =~ ^[0-9]+$ ]] || refuse "cannot tell the size of $INST"
-        echo "$INST_KB $VOL_KB $(avail_kb "$R_DIR")"
+        echo "$INST_KB $VOL_KB $(avail_kb "${R_DIR:-/}")"
         exit 0
         ;;
 
@@ -1311,7 +1427,7 @@ case "$SUB" in
         ;;
 
     "")
-        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, borg-init, borg-info, borg-create, borg-extract, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, sync-peers)"
+        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, borg-init, borg-info, borg-create, borg-extract, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, sync-peers, install-usage-key)"
         ;;
     *)
         refuse "unknown subcommand '$(printf '%q' "$SUB")'"

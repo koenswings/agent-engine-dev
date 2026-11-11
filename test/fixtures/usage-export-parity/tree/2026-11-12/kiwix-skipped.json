@@ -1,0 +1,17 @@
+{
+  "schema": "idea-usage-day/1",
+  "engine": "happy-zebra",
+  "day": "2026-11-12",
+  "app": "kiwix",
+  "instance": "kiwix-skipped",
+  "name": "Kiwix",
+  "demo": false,
+  "listed": true,
+  "clock": {
+    "synced": false,
+    "correctedBoots": 1
+  },
+  "collectedAt": "2026-11-13T02:12:04+01:00",
+  "hookStatus": "skipped",
+  "skipReason": "backup"
+}

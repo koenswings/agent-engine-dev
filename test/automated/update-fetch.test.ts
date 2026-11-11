@@ -158,3 +158,14 @@ describe('pushAppBundle (source side, #263)', () => {
         expect(replies).toHaveLength(4)
     })
 })
+
+describe('system-disk paths (idea#424)', () => {
+    it('fetch and push join apps/ via joinMountRoot, not path.join(mountRoot)', async () => {
+        const src = await fs.readFile(path.join(process.cwd(), 'src/data/UpdateFetch.ts'), 'utf8')
+        expect(src).toMatch(/joinMountRoot\(root, 'apps', req.newAppId\)/)
+        expect(src).toMatch(/joinMountRoot\(await d\.mountRoot\(disk\), 'apps', req.appId\)/)
+        expect(src).not.toMatch(/path\.join\(root, 'apps', req.newAppId\)/)
+        expect(src).not.toMatch(/path\.join\(await d\.mountRoot\(disk\), 'apps'/)
+    })
+})
+
