@@ -141,7 +141,7 @@ describe('idea-engine-identity (idea#322)', () => {
     })
 
     describe('Tailscale key', () => {
-        it('moves the key to /etc/tailscale (0600), wipes it from the card, joins, never logs it', () => {
+        it('moves the key to /etc/tailscale (0600), wipes it from the card, joins, deletes the dest key, never logs it', () => {
             sb = mk({ tailscaleEcho: true })
             writeKey()
             const r = run()
@@ -153,8 +153,9 @@ describe('idea-engine-identity (idea#322)', () => {
             expect(fs.existsSync(b('idea-secrets'))).toBe(false)
             expect(r.calls).toMatch(/^shred -u -z -n 1 -- .*tailscale-authkey$/m)
             const dst = e('tailscale/debug-authkey')
-            expect(fs.readFileSync(dst, 'utf8')).toBe(KEY + '\n')
-            expect(fs.statSync(dst).mode & 0o777).toBe(0o600)
+            // idea#117 D-2: the dest key is deleted only after a successful join
+            expect(fs.existsSync(dst)).toBe(false)
+            expect(r.calls).toMatch(/^shred -u -- .*\/debug-authkey$/m)
             expect(fs.statSync(e('tailscale')).mode & 0o777).toBe(0o700)
             expect(r.calls).toMatch(/^systemctl enable --now tailscaled$/m)
             expect(r.calls).toMatch(new RegExp(`^tailscale up --auth-key=file:${dst} --advertise-tags=tag:idea --hostname=idea-default --timeout=60s$`, 'm'))
@@ -170,21 +171,49 @@ describe('idea-engine-identity (idea#322)', () => {
             expect(r.calls).not.toMatch(/ephemeral/)
             expect(fs.readFileSync(SRC, 'utf8')).not.toMatch(/--ephemeral/)
         })
+        it('deletes /etc/tailscale/debug-authkey only after a successful join (idea#117 D-2)', () => {
+            sb = mk()
+            writeKey()
+            const ok = run()
+            expect(ok.out).toMatch(/joined the tailnet/)
+            expect(ok.calls).toMatch(new RegExp(`^tailscale up --auth-key=file:${e('tailscale/debug-authkey')} --advertise-tags=tag:idea `, 'm'))
+            expect(ok.calls).not.toMatch(/ephemeral/)
+            expect(ok.calls).toMatch(/^shred -u -- .*\/debug-authkey$/m)
+            expect(fs.existsSync(e('tailscale/debug-authkey'))).toBe(false)
+            fs.rmSync(sb.tmp, { recursive: true, force: true })
+
+            sb = mk({ tailscaleRc: 1 })
+            writeKey()
+            const fail = run()
+            expect(fail.out).toMatch(/tailscale up failed/)
+            expect(fail.calls).toMatch(/--advertise-tags=tag:idea/)
+            expect(fail.calls).not.toMatch(/ephemeral/)
+            expect(fail.calls).not.toMatch(/^shred -u -- .*\/debug-authkey$/m)
+            expect(fs.readFileSync(e('tailscale/debug-authkey'), 'utf8')).toBe(KEY + '\n')
+            expect(fs.existsSync(path.join(sb.state, 'tailscale-pending'))).toBe(true)
+        })
         it('offline: key wiped from the card at once, join retried next boot', () => {
             sb = mk({ tailscaleRc: 1 })
             writeKey()
             const r = run()
             expect(r.out).toMatch(/tailscale up failed \(exit 1; offline\?\); will retry next boot/)
             expect(fs.existsSync(b('idea-secrets/tailscale-authkey'))).toBe(false)
+            const dst = e('tailscale/debug-authkey')
+            expect(fs.readFileSync(dst, 'utf8')).toBe(KEY + '\n')
+            expect(fs.statSync(dst).mode & 0o777).toBe(0o600)
+            expect(r.calls).not.toMatch(/shred -u -- .*\/debug-authkey/)
             expect(fs.existsSync(path.join(sb.state, 'tailscale-pending'))).toBe(true)
             fs.writeFileSync(sb.calls, '')
             expect(run().calls).toMatch(/^tailscale up /m)
+            // still failing, so the dest key stays for the retry
+            expect(fs.readFileSync(dst, 'utf8')).toBe(KEY + '\n')
         })
         it('no tailscale installed: refused, retried later', () => {
             sb = mk({ noTailscale: true })
             writeKey()
             expect(run().out).toMatch(/refused: NO_TAILSCALE/)
             expect(fs.existsSync(path.join(sb.state, 'tailscale-pending'))).toBe(true)
+            expect(fs.readFileSync(e('tailscale/debug-authkey'), 'utf8')).toBe(KEY + '\n')
         })
         it('an invalid key is wiped and not used', () => {
             sb = mk()
@@ -201,8 +230,11 @@ describe('idea-engine-identity (idea#322)', () => {
             let t = fs.readFileSync(sb.script, 'utf8').replace(/^SHRED=.*$/m, `SHRED=${path.join(sb.bin, 'no-shred')}`)
             fs.writeFileSync(sb.script, t)
             writeKey()
-            run()
+            const r = run()
+            expect(r.out).toMatch(/joined the tailnet/)
             expect(fs.existsSync(b('idea-secrets/tailscale-authkey'))).toBe(false)
+            expect(fs.existsSync(e('tailscale/debug-authkey'))).toBe(false)
+            expect(r.calls).not.toMatch(/^shred /m)
         })
     })
 
