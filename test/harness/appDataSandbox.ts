@@ -25,6 +25,8 @@ import os from 'os'
 import { spawn } from 'child_process'
 
 export const HELPER_SOURCE = path.resolve('script/build_image_assets/idea-app-data')
+/** the real rsync the realRsync sandbox runs (the helper's own RSYNC= path) */
+export const REAL_RSYNC = '/usr/bin/rsync'
 export const GATE_SOURCE = path.resolve('script/build_image_assets/idea-peer-gate')
 
 export interface RunResult { exitCode: number | null, signal: string | null, stdout: string, stderr: string }
@@ -74,6 +76,9 @@ export interface AppDataSandbox {
 export interface SandboxOptions {
     /** use the real /usr/bin/borg (when installed) instead of the fake */
     realBorg?: boolean
+    /** record, then run the real rsync (REAL_RSYNC, /usr/bin/rsync): needed where --exclude,
+     *  --delete and --backup-dir semantics matter (idea#448 snapshot / in-place restore) */
+    realRsync?: boolean
     /** the uid/gid the rewritten script treats as root (default: the test user) */
     rootUid?: number
     rootGid?: number
@@ -128,7 +133,11 @@ done < ${hosts}
 if [[ $found -ne 0 && "$2" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$ ]]; then echo "$2      STREAM $2"; found=0; fi
 exit $(( found ? 2 : 0 ))`)
     // rsync: record; a local copy (dest /proc/self/fd/N/) really copies with cp -a
-    await fake('rsync', `${RECORD('rsync', callsDir)}
+    if (opts.realRsync) {
+        if (!await fs.pathExists(REAL_RSYNC)) throw new Error(`realRsync: ${REAL_RSYNC} is not installed`)
+        await fake('rsync', `${RECORD('rsync', callsDir)}
+exec ${REAL_RSYNC} "$@"`)
+    } else await fake('rsync', `${RECORD('rsync', callsDir)}
 [[ -n "\${FAKE_RSYNC_SLEEP:-}" ]] && exec /bin/sleep "$FAKE_RSYNC_SLEEP"
 echo "      1,024 100%   1.00MB/s    0:00:00 (xfr#1, to-chk=0/1)"
 last="\${@: -1}"

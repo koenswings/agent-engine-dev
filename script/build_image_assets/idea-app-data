@@ -49,8 +49,11 @@
 #                                    Tailscale 100.64/10. Appends /etc/ssh/idea_usage_keys/%u to the
 #                                    existing AuthorizedKeysFile in 10-idea-peer.conf without dropping
 #                                    other entries, checks sshd -t, installs idea-usage-export)
-#   idea-app-data snapshot         <root> <id>   (v5, idea#230: copy instances/<id> to .pre-update/<id>/data, COMPLETE marker last)
-#   idea-app-data restore-snapshot <root> <id>   (v5: current folder to .idea-quarantine, then copy the snapshot back)
+#   idea-app-data snapshot         <root> <id> [exclude…]   (v5, idea#230: copy instances/<id> to .pre-update/<id>/data, COMPLETE marker last;
+#                                               v9, idea#448: excludes left out, recorded in JOURNAL and EXCLUDE)
+#   idea-app-data restore-snapshot <root> <id> [exclude…]   (v9, idea#448: in place; instances/<id> is never moved. Live files that
+#                                               are replaced or deleted go to .idea-quarantine/<id>-before-restore-<stamp>/;
+#                                               EXCLUDE ∪ given excludes are never written, deleted or moved)
 #   idea-app-data snapshots        <root>        (v5: "<id> <kb> complete|incomplete" per .pre-update snapshot)
 #   idea-app-data borg-init    <bdev> <id>
 #   idea-app-data borg-info    <bdev> <id>
@@ -425,6 +428,23 @@ check_exclude_inside() {
             refuse "exclude '$rel' cannot be resolved under the instance folder"
         fi
     fi
+}
+
+# parse_excludes <instance folder> <token>...: normalise, confine and de-duplicate
+# exclude tokens into EXCLUDES and their rsync options into RSYNC_EXCL (anchored at the
+# transfer root, which is always the instance folder). Any bad token refuses (fail closed).
+EXCLUDES=(); RSYNC_EXCL=()
+parse_excludes() {
+    local inst="$1" tok rel e seen
+    shift
+    for tok in "$@"; do
+        rel=$(normalize_exclude "$tok") || exit 2
+        check_exclude_inside "$inst" "$rel"
+        seen=0
+        for e in ${EXCLUDES[@]+"${EXCLUDES[@]}"}; do [[ "$e" == "$rel" ]] && seen=1; done
+        (( seen )) && continue
+        EXCLUDES+=("$rel"); RSYNC_EXCL+=("--exclude=/$rel")
+    done
 }
 
 check_id() { [[ "$1" =~ $RE_ID ]] || refuse "instance id '$1' does not match $RE_ID"; }
@@ -1135,12 +1155,14 @@ case "$SUB" in
         ;;
 
     snapshot)
-        need 2 $(($# - 1)) "<root> <id>"
+        need_min 2 $(($# - 1)) "<root> <id> [exclude…]"
         check_id "$3"
         resolve_root "$2" instances
         INST=$(inst_dir "$R_DIR" "$3")
         [[ ! -L "$INST" ]] || refuse "$INST is a symlink"
         existing_dir "$INST" "instance folder"
+        # v9 (idea#448): excludes are checked before anything is locked, moved or written.
+        parse_excludes "$INST" "${@:4}"
         refuse_external_links "$INST"
         take_locks "inst.$2.$3"
         containers_stopped "$3"
@@ -1181,10 +1203,13 @@ case "$SUB" in
         $MKDIR -m 0700 -- "$SDIR" || refuse "cannot create $SDIR"
         $CHOWN root:root -- "$SDIR" 2>/dev/null || true
         STAMP=$($DATE -u +%Y-%m-%dT%H:%M:%SZ)
-        echo "snapshot $2 $3 started $STAMP need_kb=$NEED_KB volumes=${#VOL_NAMES[@]} old=$OLD" > "$SDIR/JOURNAL" || refuse "cannot write $SDIR/JOURNAL"
-        journal "snapshot: $INST -> $SDIR started"
+        echo "snapshot $2 $3 started $STAMP need_kb=$NEED_KB volumes=${#VOL_NAMES[@]} old=$OLD excludes=${#EXCLUDES[@]}" > "$SDIR/JOURNAL" || refuse "cannot write $SDIR/JOURNAL"
+        for rel in ${EXCLUDES[@]+"${EXCLUDES[@]}"}; do
+            echo "exclude $rel" >> "$SDIR/JOURNAL" || refuse "cannot write $SDIR/JOURNAL"
+        done
+        journal "snapshot: $INST -> $SDIR started (${#EXCLUDES[@]} excludes)"
         $MKDIR -m 0700 -- "$SDIR/data" || refuse "cannot create $SDIR/data"
-        run_child $RSYNC "${RSYNC_OPTS[@]}" -- ./ "$SDIR/data/" || exit $?
+        run_child $RSYNC "${RSYNC_OPTS[@]}" ${RSYNC_EXCL[@]+"${RSYNC_EXCL[@]}"} -- ./ "$SDIR/data/" || exit $?
         if (( ${#VOL_NAMES[@]} > 0 )); then
             $MKDIR -m 0700 -- "$SDIR/volumes" || refuse "cannot create $SDIR/volumes"
             for i in "${!VOL_NAMES[@]}"; do
@@ -1201,6 +1226,12 @@ case "$SUB" in
             done
             ( cd "$SDIR/volumes" && $SHA256SUM -c --quiet -- SHA256SUMS ) >/dev/null 2>&1 || refuse "the volume archives of $3 do not match their checksums"
         fi
+        # EXCLUDE (one instance-relative path per line, maybe empty) is written before COMPLETE,
+        # so every complete v9 snapshot says what it left out; restore-snapshot reads it.
+        : > "$SDIR/EXCLUDE" || refuse "cannot write $SDIR/EXCLUDE"
+        for rel in ${EXCLUDES[@]+"${EXCLUDES[@]}"}; do
+            printf '%s\n' "$rel" >> "$SDIR/EXCLUDE" || refuse "cannot write $SDIR/EXCLUDE"
+        done
         GOT_KB=$(dir_kb "$SDIR"); GOT_KB=${GOT_KB:-0}
         echo "complete $($DATE -u +%Y-%m-%dT%H:%M:%SZ) kb=$GOT_KB" > "$SDIR/.COMPLETE.tmp" || refuse "cannot write the COMPLETE marker"
         $MV -T -- "$SDIR/.COMPLETE.tmp" "$SDIR/COMPLETE" || refuse "cannot write the COMPLETE marker"
@@ -1211,7 +1242,7 @@ case "$SUB" in
         ;;
 
     restore-snapshot)
-        need 2 $(($# - 1)) "<root> <id>"
+        need_min 2 $(($# - 1)) "<root> <id> [exclude…]"
         check_id "$3"
         resolve_root "$2" instances
         PARENT="$R_DIR/instances"
@@ -1222,19 +1253,51 @@ case "$SUB" in
         existing_dir "$SDIR/data" "snapshot of $3"
         [[ -f "$SDIR/COMPLETE" && ! -L "$SDIR/COMPLETE" ]] || refuse "the snapshot of $3 at $SDIR has no COMPLETE marker; it is never restored"
         [[ ! -L "$INST" ]] || refuse "$INST is a symlink"
+        # v9 (idea#448): the excludes recorded at snapshot time plus any given here (the
+        # Engine passes the live ∪ new compose list, so an older snapshot that still holds an
+        # identity file cannot write it back). Checked before anything is locked or written.
+        REC=()
+        if [[ -e "$SDIR/EXCLUDE" || -L "$SDIR/EXCLUDE" ]]; then
+            [[ -f "$SDIR/EXCLUDE" && ! -L "$SDIR/EXCLUDE" ]] || refuse "$SDIR/EXCLUDE is not a regular file"
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                [[ -n "$line" ]] && REC+=("$line")
+            done < "$SDIR/EXCLUDE"
+        fi
+        parse_excludes "$INST" ${REC[@]+"${REC[@]}"} "${@:4}"
         take_locks "inst.$2.$3"
         containers_stopped "$3"
-        echo "restore $2 $3 started $($DATE -u +%Y-%m-%dT%H:%M:%SZ)" >> "$SDIR/JOURNAL" || refuse "cannot write $SDIR/JOURNAL"
+        echo "restore $2 $3 started $($DATE -u +%Y-%m-%dT%H:%M:%SZ) excludes=${#EXCLUDES[@]}" >> "$SDIR/JOURNAL" || refuse "cannot write $SDIR/JOURNAL"
         journal "restore-snapshot: $SDIR -> $INST started"
         # RESTORING marks an unfinished restore (e.g. a reboot mid-restore) for Ops and the
         # Console; at "done" it is renamed to RESTORED (no rm). Atlas review on #268.
         [[ ! -L "$SDIR/RESTORING" && ! -L "$SDIR/RESTORED" ]] || refuse "$SDIR/RESTORING is a symlink"
         echo "restoring $2 $3 since $($DATE -u +%Y-%m-%dT%H:%M:%SZ)" > "$SDIR/RESTORING" || refuse "cannot write $SDIR/RESTORING"
+        # In place (idea#448): instances/<id> keeps its inode and is never moved. Excluded paths
+        # (e.g. data/tailscale) are neither written, deleted nor moved, so their inodes survive.
+        # Every live non-excluded file that rsync replaces or deletes is first put into ASIDE
+        # (--backup-dir on the same filesystem: undoable, nothing removed).
         ASIDE=""
-        if [[ -e "$INST" ]]; then ASIDE=$(quarantine_aside "$R_DIR" "$INST" "$3-before-restore") || exit 2; fi
-        $MKDIR -m 0700 -- "$INST" || refuse "cannot create $INST"
+        if [[ -e "$INST" ]]; then
+            existing_dir "$INST" "instance folder"
+            QDIR="$R_DIR/.idea-quarantine"
+            root_dir "$QDIR" 0700 "quarantine folder"
+            $CHMOD 0700 -- "$QDIR" || refuse "cannot set mode 0700 on $QDIR"
+            ASIDE="$QDIR/$3-before-restore-$($DATE -u +%Y%m%dT%H%M%S%NZ)"
+            [[ ! -e "$ASIDE" && ! -L "$ASIDE" ]] || refuse "$ASIDE already exists"
+            $MKDIR -m 0700 -- "$ASIDE" || refuse "cannot create $ASIDE"
+            echo "restore $2 $3 aside=$ASIDE" >> "$SDIR/JOURNAL"
+        else
+            $MKDIR -m 0700 -- "$INST" || refuse "cannot create $INST"
+        fi
+        for rel in ${EXCLUDES[@]+"${EXCLUDES[@]}"}; do
+            echo "restore exclude $rel" >> "$SDIR/JOURNAL"
+        done
         pin_cwd "$SDIR/data"
-        run_child $RSYNC "${RSYNC_OPTS[@]}" -- ./ "$INST/" || exit $?
+        if [[ -n "$ASIDE" ]]; then
+            run_child $RSYNC "${RSYNC_OPTS[@]}" --delete --backup "--backup-dir=$ASIDE" ${RSYNC_EXCL[@]+"${RSYNC_EXCL[@]}"} -- ./ "$INST/" || exit $?
+        else
+            run_child $RSYNC "${RSYNC_OPTS[@]}" ${RSYNC_EXCL[@]+"${RSYNC_EXCL[@]}"} -- ./ "$INST/" || exit $?
+        fi
         if [[ -d "$SDIR/volumes" && ! -L "$SDIR/volumes" ]]; then
             ( cd "$SDIR/volumes" && $SHA256SUM -c --quiet -- SHA256SUMS ) >/dev/null 2>&1 || refuse "the volume archives of $3 do not match their checksums; not restoring volumes"
             for a in "$SDIR/volumes"/*.tar; do
@@ -1265,7 +1328,7 @@ case "$SUB" in
         fi
         echo "restore $2 $3 done aside=${ASIDE:-none}" >> "$SDIR/JOURNAL"
         $MV -T -- "$SDIR/RESTORING" "$SDIR/RESTORED" || refuse "cannot clear $SDIR/RESTORING"
-        journal "restore-snapshot: $INST restored from $SDIR (previous folder: ${ASIDE:-none})"
+        journal "restore-snapshot: $INST restored in place from $SDIR (replaced files: ${ASIDE:-none})"
         echo "${ASIDE:-none}"
         exit 0
         ;;

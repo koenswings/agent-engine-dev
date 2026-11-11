@@ -107,7 +107,7 @@ describe('idea-app-data: argument checks', () => {
 
     it('refuses the wrong argument count for every subcommand', async () => {
         const cases: [string, number][] = [
-            ['version', 0], ['size', 2], ['copy', 4], ['send', 6], ['delete', 2], ['quarantine', 2], ['snapshot', 2], ['restore-snapshot', 2], ['snapshots', 1], ['estimate', 2],
+            ['version', 0], ['size', 2], ['copy', 4], ['send', 6], ['delete', 2], ['quarantine', 2], ['snapshots', 1], ['estimate', 2],
             ['borg-init', 2], ['borg-info', 2], ['borg-extract', 5], ['borg-extract-verify', 4], ['borg-compact', 2], ['quarantine-backups', 1],
             ['ensure-dirs', 1], ['erase-slot', 2], ['put-files', 3], ['peer-delete', 3], ['sync-peers', 0], ['install-usage-key', 3],
         ]
@@ -120,6 +120,8 @@ describe('idea-app-data: argument checks', () => {
         }
         refused(await sb.run(['receive', 'sdb1', 'id1', '--server']), /receive takes <dstRoot> <dstId> and the rsync server arguments/)
         refused(await sb.run(['borg-create', 'x', 'x', 'x']), /borg-create takes at least 4 argument/)
+        refused(await sb.run(['snapshot', 'x']), /snapshot takes at least 2 argument/)
+        refused(await sb.run(['restore-snapshot', 'x']), /restore-snapshot takes at least 2 argument/)
         refused(await sb.run(['borg-delete', 'x', 'x']), /borg-delete takes 3 or 4 argument/)
         refused(await sb.run(['borg-delete', 'x', 'x', 'x', 'x', 'x']), /borg-delete takes 3 or 4 argument/)
         refused(await sb.run(['borg-list', 'x']), /borg-list takes 2 or 3 argument/)
@@ -489,19 +491,25 @@ describe('idea-app-data: updateApp snapshots (v5, idea#230)', () => {
         expect(await fs.readFile(path.join(root, '.idea-quarantine', q[0], 'data', 'half'), 'utf8')).toBe('x')
         expect(await fs.pathExists(path.join(snap(root, 'inst1'), 'data', 'half'))).toBe(false)
     })
-    it('restore-snapshot moves the current folder aside (undoable), then copies the snapshot back', async () => {
+    it('restore-snapshot restores in place (v9, idea#448): the folder keeps its inode, replaced/deleted files go to .idea-quarantine', async () => {
+        sb = await sandbox({ realRsync: true })
         const root = await sb.addDisk('sdb1')
         const inst = await sb.addInstance(root, 'inst1')
         await fs.writeFile(path.join(inst, 'db.sqlite3'), 'v1')
         expect((await sb.run(['snapshot', 'sdb1', 'inst1'])).exitCode).toBe(0)
+        const dirIno = (await fs.stat(inst)).ino
         await fs.writeFile(path.join(inst, 'db.sqlite3'), 'v2-migrated')
+        await fs.writeFile(path.join(inst, 'new-in-v2'), 'n')
         refused(await sb.run(['restore-snapshot', 'sdb1', 'inst1'], { FAKE_DOCKER_PS: 'abc' }), /RUNNING/)
         const r = await sb.run(['restore-snapshot', 'sdb1', 'inst1'])
         expect(r.exitCode, r.stderr).toBe(0)
         const aside = r.stdout.trim().split('\n').pop()!
         expect(aside).toMatch(/\.idea-quarantine\/inst1-before-restore-/)
         expect(await fs.readFile(path.join(aside, 'db.sqlite3'), 'utf8')).toBe('v2-migrated')
+        expect(await fs.readFile(path.join(aside, 'new-in-v2'), 'utf8')).toBe('n')   // deleted from live, kept aside
+        expect(await fs.pathExists(path.join(inst, 'new-in-v2'))).toBe(false)
         expect(await fs.readFile(path.join(inst, 'db.sqlite3'), 'utf8')).toBe('v1')
+        expect((await fs.stat(inst)).ino).toBe(dirIno)   // never moved
         expect(await fs.pathExists(path.join(snap(root, 'inst1'), 'COMPLETE'))).toBe(true)
         expect(await fs.readFile(path.join(snap(root, 'inst1'), 'JOURNAL'), 'utf8')).toMatch(/restore sdb1 inst1 done aside=/)
         // RESTORING is written at the start and renamed to RESTORED at "done" (no rm)
@@ -509,7 +517,22 @@ describe('idea-app-data: updateApp snapshots (v5, idea#230)', () => {
         expect(await fs.readFile(path.join(snap(root, 'inst1'), 'RESTORED'), 'utf8')).toMatch(/^restoring sdb1 inst1 since /)
         const body = await fs.readFile(path.join(process.cwd(), 'script/build_image_assets/idea-app-data'), 'utf8')
         const restore = body.slice(body.indexOf('    restore-snapshot)'), body.indexOf('    estimate)'))
-        expect(restore.indexOf('> "$SDIR/RESTORING"')).toBeLessThan(restore.indexOf('quarantine_aside'))
+        expect(restore.indexOf('> "$SDIR/RESTORING"')).toBeLessThan(restore.indexOf('--backup-dir'))
+        // the instance folder itself is never moved or quarantined aside
+        expect(restore).not.toMatch(/quarantine_aside/)
+        expect(restore).not.toMatch(/\$MV[^\n]*\$INST/)
+    })
+    it('restore-snapshot into a missing instance folder creates it and reports none', async () => {
+        sb = await sandbox({ realRsync: true })
+        const root = await sb.addDisk('sdb1')
+        const inst = await sb.addInstance(root, 'inst1')
+        await fs.writeFile(path.join(inst, 'db.sqlite3'), 'v1')
+        expect((await sb.run(['snapshot', 'sdb1', 'inst1'])).exitCode).toBe(0)
+        await fs.move(inst, path.join(sb.tmp, 'gone'))
+        const r = await sb.run(['restore-snapshot', 'sdb1', 'inst1'])
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(r.stdout.trim().split('\n').pop()).toBe('none')
+        expect(await fs.readFile(path.join(inst, 'db.sqlite3'), 'utf8')).toBe('v1')
     })
     it('estimate is read-only: folder + volume KB and free KB, even while the app runs; nothing written, no lock taken', async () => {
         const root = await sb.addDisk('sdb1')
@@ -617,6 +640,127 @@ describe('idea-app-data: updateApp snapshots (v5, idea#230)', () => {
         for (const [a, b] of [['    snapshot)', '    borg-init)'], ['containers_stopped() {', '# ── Checks']]) {
             expect(body.slice(body.indexOf(a), body.indexOf(b))).not.toMatch(/\$RM|\$RMDIR|rm -/)
         }
+    })
+})
+
+describe('idea-app-data: snapshot excludes and in-place restore keep identity (v9, idea#448)', () => {
+    const snap = (root: string, id: string) => path.join(root, '.pre-update', id)
+    const identity = async (inst: string) => {
+        await fs.ensureDir(path.join(inst, 'data', 'tailscale'))
+        await fs.ensureDir(path.join(inst, 'data', 'keys'))
+        await fs.writeFile(path.join(inst, 'data', 'tailscale', 'tailscaled.state'), 'nodekey-LIVE')
+        await fs.writeFile(path.join(inst, 'data', 'keys', 'id'), 'key-LIVE')
+        await fs.writeFile(path.join(inst, 'data', 'app.db'), 'db-v1')
+    }
+
+    it('snapshot leaves excluded paths out and records them in JOURNAL and EXCLUDE (before COMPLETE)', async () => {
+        sb = await sandbox({ realRsync: true })
+        const root = await sb.addDisk('sdb1')
+        const inst = await sb.addInstance(root, 'inst1')
+        await identity(inst)
+        const r = await sb.run(['snapshot', 'sdb1', 'inst1', 'tailscale', './data/keys/', 'data/tailscale'])
+        expect(r.exitCode, r.stderr).toBe(0)
+        const d = path.join(snap(root, 'inst1'), 'data')
+        expect(await fs.readFile(path.join(d, 'data', 'app.db'), 'utf8')).toBe('db-v1')
+        expect(await fs.pathExists(path.join(d, 'data', 'tailscale'))).toBe(false)
+        expect(await fs.pathExists(path.join(d, 'data', 'keys'))).toBe(false)
+        expect(await fs.readFile(path.join(snap(root, 'inst1'), 'EXCLUDE'), 'utf8')).toBe('data/tailscale\ndata/keys\n')   // normalised, de-duplicated
+        const journal = await fs.readFile(path.join(snap(root, 'inst1'), 'JOURNAL'), 'utf8')
+        expect(journal).toMatch(/excludes=2\nexclude data\/tailscale\nexclude data\/keys\n/)
+        const argv = (await sb.calls('rsync')).pop()!.argv
+        expect(argv).toEqual(expect.arrayContaining(['--exclude=/data/tailscale', '--exclude=/data/keys']))
+        const body = await fs.readFile(path.join(process.cwd(), 'script/build_image_assets/idea-app-data'), 'utf8')
+        const block = body.slice(body.indexOf('    snapshot)'), body.indexOf('    restore-snapshot)'))
+        expect(block.indexOf('"$SDIR/EXCLUDE"')).toBeLessThan(block.indexOf('"$SDIR/.COMPLETE.tmp"'))
+    })
+
+    it('snapshot without excludes writes an empty EXCLUDE', async () => {
+        const root = await sb.addDisk('sdb1')
+        await sb.addInstance(root, 'inst1')
+        expect((await sb.run(['snapshot', 'sdb1', 'inst1'])).exitCode).toBe(0)
+        expect(await fs.readFile(path.join(snap(root, 'inst1'), 'EXCLUDE'), 'utf8')).toBe('')
+    })
+
+    it('an invalid exclude fails closed: no snapshot, the previous snapshot is not moved, no rsync, no lock', async () => {
+        const root = await sb.addDisk('sdb1')
+        const inst = await sb.addInstance(root, 'inst1')
+        await identity(inst)
+        expect((await sb.run(['snapshot', 'sdb1', 'inst1'])).exitCode).toBe(0)
+        const before = await fs.readFile(path.join(snap(root, 'inst1'), 'JOURNAL'), 'utf8')
+        const rsyncCalls = (await sb.calls('rsync')).length
+        for (const [bad, re] of [
+            ['../etc', /'\.\.' component/], ['/etc/shadow', /absolute path/], ['data/*', /glob/], ['--delete', /looks like an option/], ['', /empty/],
+        ] as [string, RegExp][]) {
+            refused(await sb.run(['snapshot', 'sdb1', 'inst1', 'data/keys', bad]), re)
+        }
+        // an exclude that resolves outside the instance folder through a symlink
+        await fs.symlink(sb.tmp, path.join(inst, 'data', 'out'))
+        refused(await sb.run(['snapshot', 'sdb1', 'inst1', 'data/out']), /points outside the instance folder/)
+        expect(await fs.readFile(path.join(snap(root, 'inst1'), 'JOURNAL'), 'utf8')).toBe(before)
+        expect(await fs.pathExists(path.join(root, '.idea-quarantine'))).toBe(false)
+        expect((await sb.calls('rsync')).length).toBe(rsyncCalls)
+    })
+
+    it('snapshot + in-place restore: an excluded file keeps its inode and content; other files are restored', async () => {
+        sb = await sandbox({ realRsync: true })
+        const root = await sb.addDisk('sdb1')
+        const inst = await sb.addInstance(root, 'inst1')
+        await identity(inst)
+        const state = path.join(inst, 'data', 'tailscale', 'tailscaled.state')
+        const ino = (await fs.stat(state)).ino
+        const dirIno = (await fs.stat(inst)).ino
+        expect((await sb.run(['snapshot', 'sdb1', 'inst1', 'data/tailscale', 'data/keys'])).exitCode).toBe(0)
+        // the update changes data and the identity is rewritten in place (same inode) by the running app
+        await fs.writeFile(path.join(inst, 'data', 'app.db'), 'db-v2-migrated')
+        await fs.writeFile(state, 'nodekey-LIVE-2')
+        const r = await sb.run(['restore-snapshot', 'sdb1', 'inst1'])
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect((await fs.stat(state)).ino).toBe(ino)
+        expect(await fs.readFile(state, 'utf8')).toBe('nodekey-LIVE-2')
+        expect(await fs.readFile(path.join(inst, 'data', 'keys', 'id'), 'utf8')).toBe('key-LIVE')
+        expect(await fs.readFile(path.join(inst, 'data', 'app.db'), 'utf8')).toBe('db-v1')
+        expect((await fs.stat(inst)).ino).toBe(dirIno)
+        const aside = r.stdout.trim().split('\n').pop()!
+        expect(await fs.readFile(path.join(aside, 'data', 'app.db'), 'utf8')).toBe('db-v2-migrated')
+        expect(await fs.pathExists(path.join(aside, 'data', 'tailscale'))).toBe(false)
+        const argv = (await sb.calls('rsync')).pop()!.argv
+        expect(argv).toEqual(expect.arrayContaining(['--delete', '--backup', `--backup-dir=${aside}`, '--exclude=/data/tailscale', '--exclude=/data/keys']))
+        expect(await fs.readFile(path.join(snap(root, 'inst1'), 'JOURNAL'), 'utf8')).toMatch(/restore exclude data\/tailscale\nrestore exclude data\/keys\n/)
+    })
+
+    it('an older snapshot that still holds the identity never writes it back when the excludes are given on restore', async () => {
+        sb = await sandbox({ realRsync: true })
+        const root = await sb.addDisk('sdb1')
+        const inst = await sb.addInstance(root, 'inst1')
+        await identity(inst)
+        // a pre-v9 style snapshot: no excludes, so data/tailscale is inside it
+        expect((await sb.run(['snapshot', 'sdb1', 'inst1'])).exitCode).toBe(0)
+        const state = path.join(inst, 'data', 'tailscale', 'tailscaled.state')
+        await fs.writeFile(state, 'nodekey-NEWER')
+        const ino = (await fs.stat(state)).ino
+        await fs.writeFile(path.join(inst, 'data', 'keys', 'extra'), 'only-live')
+        const r = await sb.run(['restore-snapshot', 'sdb1', 'inst1', 'tailscale', 'data/keys'])
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect((await fs.stat(state)).ino).toBe(ino)
+        expect(await fs.readFile(state, 'utf8')).toBe('nodekey-NEWER')
+        expect(await fs.readFile(path.join(inst, 'data', 'keys', 'extra'), 'utf8')).toBe('only-live')   // --delete spares excluded paths
+    })
+
+    it('restore refuses a bad EXCLUDE entry or a bad given exclude before anything is written', async () => {
+        const root = await sb.addDisk('sdb1')
+        const inst = await sb.addInstance(root, 'inst1')
+        await identity(inst)
+        expect((await sb.run(['snapshot', 'sdb1', 'inst1', 'data/keys'])).exitCode).toBe(0)
+        const journal = await fs.readFile(path.join(snap(root, 'inst1'), 'JOURNAL'), 'utf8')
+        refused(await sb.run(['restore-snapshot', 'sdb1', 'inst1', '../x']), /'\.\.' component/)
+        await fs.writeFile(path.join(snap(root, 'inst1'), 'EXCLUDE'), 'data/keys\n/etc\n')
+        refused(await sb.run(['restore-snapshot', 'sdb1', 'inst1']), /absolute path/)
+        expect(await fs.readFile(path.join(snap(root, 'inst1'), 'JOURNAL'), 'utf8')).toBe(journal)
+        expect(await fs.pathExists(path.join(snap(root, 'inst1'), 'RESTORING'))).toBe(false)
+        expect(await fs.readFile(path.join(inst, 'data', 'app.db'), 'utf8')).toBe('db-v1')
+        await fs.remove(path.join(snap(root, 'inst1'), 'EXCLUDE'))
+        await fs.symlink(path.join(sb.tmp, 'x'), path.join(snap(root, 'inst1'), 'EXCLUDE'))
+        refused(await sb.run(['restore-snapshot', 'sdb1', 'inst1']), /EXCLUDE is not a regular file/)
     })
 })
 
