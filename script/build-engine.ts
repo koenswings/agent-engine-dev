@@ -115,6 +115,7 @@ const main = async () => {
         console.log(`Image modes (idea#322; no SSH, nothing started, no device identity; exit 0 ok / 1 failed / 2 usage):`)
         console.log(`  --root <dir>            build into the mounted root fs <dir> (arm64 host, root); alias --rootfs`)
         console.log(`  --boot <dir>            its mounted boot partition (default <root>/boot/firmware)`)
+        console.log(`  --console-repo <path>   agent-console-dev checkout to bake in (default: sibling or $IDEA_CONSOLE_REPO)`)
         console.log(`  --report <file>         write engine-build.json (commit, version, lock sha256, verify result)`)
         console.log(`  --cache <dir>           script/archive-engine-inputs.sh output (default: fetched now into a temp dir)`)
         console.log(`  --lock <file>           use this engine lock (default: generated from this clean checkout)`)

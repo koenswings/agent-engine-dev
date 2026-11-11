@@ -33,6 +33,8 @@ export interface ImageArgs {
     boot?: string
     /** engine-build.json report (idea tools/engine-image/INTERFACE.md) */
     report?: string
+    /** Local agent-console-dev checkout (absolute). Used to clone the Console into the image. */
+    consoleRepo?: string
 }
 
 /** Options of the live/SSH path that make no sense for an image (identity or remote). */
@@ -69,8 +71,8 @@ export const parseImageArgs = (argv: Record<string, any>): ImageArgs | null => {
     for (const i of images) if (!IMAGE_DIGEST_RE.test(i)) throw new UsageError(`--image ${i}: must be name[:tag]@sha256:<digest> (pinned by digest)`)
     const env = String(argv['pm2-env'] ?? 'production')
     if (env !== 'production' && env !== 'development') throw new UsageError('--pm2-env must be production or development')
-    for (const k of ['boot', 'report', 'cache']) if (argv[k] !== undefined && (typeof argv[k] !== 'string' || !path.isAbsolute(argv[k]))) throw new UsageError(`--${k} needs an absolute path`)
-    return { mode, rootfs, lock, boot: argv.boot, report: argv.report, cache: argv.cache ? String(argv.cache) : undefined, images, pm2Env: env as ImageArgs['pm2Env'], dryRun: !!argv['dry-run'] }
+    for (const k of ['boot', 'report', 'cache', 'console-repo']) if (argv[k] !== undefined && (typeof argv[k] !== 'string' || !path.isAbsolute(argv[k]))) throw new UsageError(`--${k} needs an absolute path`)
+    return { mode, rootfs, lock, boot: argv.boot, report: argv.report, cache: argv.cache ? String(argv.cache) : undefined, consoleRepo: argv['console-repo'], images, pm2Env: env as ImageArgs['pm2Env'], dryRun: !!argv['dry-run'] }
 }
 
 // ── Lock ────────────────────────────────────────────────────────────────────
@@ -127,6 +129,8 @@ export interface EngineLock {
     rpiPackages?: { pkg: string, version: string }[]
     /** git sparse-checkout patterns (no-cone) of the Engine clone: everything but dev-only trees (IMAGE_SPARSE_PATTERNS) */
     sparseCheckout?: string[]
+    /** agent-console-dev commit baked into /home/pi/idea/agents/agent-console-dev (full 40-hex SHA) */
+    consoleCommit?: string
 }
 
 /** The Engine clone in the image is a no-cone sparse checkout: every tracked file except trees that are never
@@ -191,6 +195,7 @@ export const validateLock = (l: any): string[] => {
     }
     if (!Array.isArray(l.enabledUnits)) e.push('enabledUnits must be a list')
     if (l.sparseCheckout !== undefined && (!Array.isArray(l.sparseCheckout) || !l.sparseCheckout.every((x: unknown) => typeof x === 'string' && x))) e.push('sparseCheckout must be a list of patterns')
+    if (l.consoleCommit !== undefined && !HEX40.test(l.consoleCommit)) e.push('consoleCommit must be a full 40-hex git SHA')
     if (l.pm2Env !== 'production' && l.pm2Env !== 'development') e.push('pm2Env must be production or development')
     return e
 }
@@ -245,7 +250,57 @@ export const FIRSTBOOT_DONE = '/var/lib/idea/firstboot-done'
 /** Units an image must have enabled (multi-user.target.wants). tailscaled is enabled by idea-engine-identity when a key is on the card (#291). */
 /** Raspberry Pi OS's own first-boot host-key unit (idea tools/engine-image/verify-sanitised.sh checks it is enabled) */
 export const SSH_REGEN_UNIT = 'regenerate_ssh_host_keys.service'
-export const IMAGE_ENABLED_UNITS = ['docker.service', 'avahi-daemon.service', 'ssh.service', PM2_UNIT, SSH_REGEN_UNIT, FIRSTBOOT_UNIT]
+/** Generates host keys when they are missing, without ConditionFirstBoot (systemd 257 does not treat an empty /etc/machine-id as first boot). */
+export const SSH_HOSTKEYS_UNIT = 'idea-ssh-host-keys.service'
+export const IMAGE_ENABLED_UNITS = ['docker.service', 'avahi-daemon.service', 'ssh.service', PM2_UNIT, SSH_REGEN_UNIT, SSH_HOSTKEYS_UNIT, FIRSTBOOT_UNIT]
+/** Where the Engine serves the Console from (config.yaml settings.consolePath default). */
+export const DEFAULT_CONSOLE_PATH = '/home/pi/idea/agents/agent-console-dev/dist'
+export const DEFAULT_CONSOLE_REPO = 'https://github.com/koenswings/agent-console-dev.git'
+export const BOOT_SSH_NAMES = ['ssh', 'ssh.txt'] as const
+
+/** Raspberry Pi OS's regenerate_ssh_host_keys.service (Trixie / raspberrypi-sys-mods 20260914) is ConditionFirstBoot=yes only. */
+export const sshHostKeysUnitText = () => `[Unit]
+Description=IDEA: generate SSH host keys when missing (idea#322)
+DefaultDependencies=no
+After=systemd-remount-fs.service
+Before=ssh.service sshd-keygen.service first-boot-complete.target
+ConditionPathIsReadWrite=/etc
+ConditionFileIsExecutable=/usr/bin/ssh-keygen
+ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/ssh-keygen -A
+
+[Install]
+WantedBy=sysinit.target
+`
+
+/** True when the unit will generate host keys even if this is not a systemd "first boot". */
+export const sshHostKeyUnitIsUnconditional = (unitText: string): boolean =>
+    !/^\s*ConditionFirstBoot\s*=\s*yes\s*$/mi.test(unitText) && /ssh-keygen\s+-A/.test(unitText)
+
+export const consolePathFromEngine = async (engineRoot: string): Promise<string> => {
+    const cfg = path.join(engineRoot, 'config.yaml')
+    if (await fs.pathExists(cfg)) {
+        const m = (await fs.readFile(cfg, 'utf8')).match(/^\s*consolePath:\s*(\S+)/m)
+        if (m?.[1] && m[1] !== '""' && m[1] !== "''") return m[1].replace(/^['"]|['"]$/g, '')
+    }
+    return DEFAULT_CONSOLE_PATH
+}
+
+export const bootSshTriggerPresent = async (boot: string): Promise<boolean> => {
+    for (const n of BOOT_SSH_NAMES) if (await fs.pathExists(path.join(boot, n))) return true
+    return false
+}
+
+export const writeBootSshTrigger = async (boot: string): Promise<string> => {
+    await fs.ensureDir(boot)
+    const f = path.join(boot, 'ssh')
+    if (!(await fs.pathExists(f)) && !(await fs.pathExists(path.join(boot, 'ssh.txt')))) await fs.writeFile(f, '')
+    return f
+}
 /** In the image (idea tools/engine-image/INTERFACE.md) */
 export const IMAGE_LOCK_PATH = '/etc/idea/engine.lock'
 export const IMAGE_VERSION_PATH = '/etc/idea/engine-version'
@@ -386,13 +441,15 @@ export interface VerifyContext {
     storeIdentity: Record<string, string>
     /** uid of pi in the rootfs (from its /etc/passwd) */
     piUid?: number
+    /** Mounted boot partition (default <root>/boot/firmware) used by the ssh-first-boot check */
+    boot?: string
 }
 
 const modeOf = (st: { mode: number }) => '0' + (st.mode & 0o777).toString(8).padStart(3, '0')
 
 /** Every check a built rootfs must pass. Returns problems; empty = OK. Read-only. */
 /** verify's checks, in order; the report counts how many passed (VERIFY_CHECKS.length in all). */
-export const VERIFY_CHECKS = ['identity', 'store-identity', 'engine-tree', 'pm2-as-pi', 'enabled-units', 'identity-boot', 'tailscaled-off', 'locked-files', 'permissions', 'npm-tools', 'docker-preload', 'packages', 'no-dev-files', 'lock-in-image'] as const
+export const VERIFY_CHECKS = ['identity', 'store-identity', 'engine-tree', 'pm2-as-pi', 'enabled-units', 'identity-boot', 'tailscaled-off', 'locked-files', 'permissions', 'npm-tools', 'docker-preload', 'packages', 'no-dev-files', 'lock-in-image', 'ssh-first-boot', 'console-ui'] as const
 export interface VerifyCheckResult { name: string, problems: string[] }
 
 export const verifyRootfs = async (c: VerifyContext): Promise<string[]> => (await verifyRootfsChecks(c)).flatMap(x => x.problems)
@@ -524,6 +581,27 @@ export const verifyRootfsChecks = async (c: VerifyContext): Promise<VerifyCheckR
     // 11. the lock itself is in the image
     if (!(await fs.pathExists(R(IMAGE_LOCK_PATH.slice(1))))) p.push(`${IMAGE_LOCK_PATH} missing`)
     if (!(await fs.pathExists(R(IMAGE_VERSION_PATH.slice(1))))) p.push(`${IMAGE_VERSION_PATH} missing`)
+    check('ssh-first-boot')
+    // 12. sshd will listen on first boot: ssh enabled, and host keys are generated even when
+    // /etc/machine-id is empty (systemd 257 does not treat that as ConditionFirstBoot).
+    if (!(await unitEnabled(c.root, 'ssh.service'))) p.push('unit ssh.service is not enabled')
+    const hostKeysUnit = R(`etc/systemd/system/${SSH_HOSTKEYS_UNIT}`)
+    const hostKeysLib = R(`usr/lib/systemd/system/${SSH_HOSTKEYS_UNIT}`)
+    const hostKeysSrc = (await fs.pathExists(hostKeysUnit)) ? hostKeysUnit : hostKeysLib
+    if (!(await fs.pathExists(hostKeysSrc))) p.push(`${SSH_HOSTKEYS_UNIT} is missing (needed because ConditionFirstBoot does not fire on an empty machine-id)`)
+    else if (!sshHostKeyUnitIsUnconditional(await fs.readFile(hostKeysSrc, 'utf8'))) p.push(`${SSH_HOSTKEYS_UNIT} must run ssh-keygen -A without ConditionFirstBoot=yes`)
+    else if (!(await unitEnabled(c.root, SSH_HOSTKEYS_UNIT))) p.push(`unit ${SSH_HOSTKEYS_UNIT} is not enabled`)
+    const boot = c.boot ?? (await fs.pathExists(R('boot/firmware')) ? R('boot/firmware') : await fs.pathExists(R('boot')) ? R('boot') : undefined)
+    if (boot && !(await bootSshTriggerPresent(boot))) p.push(`bootfs has no ssh or ssh.txt trigger under ${boot} (sshswitch will not enable ssh)`)
+    check('console-ui')
+    // 13. Console production build is present at consolePath (Engine answers 503 otherwise)
+    const consolePath = await consolePathFromEngine(eng)
+    if (!consolePath) p.push('consolePath is empty: the Engine image must ship the Console UI')
+    else if (!(await fs.pathExists(path.join(c.root, consolePath.replace(/^\/+/, ''), 'index.html')))) p.push(`Console dist index.html missing at ${consolePath}/index.html`)
+    else if (c.lock.consoleCommit) {
+        const head = path.join(c.root, 'home/pi/idea/agents/agent-console-dev/.git/HEAD')
+        if (await fs.pathExists(head) && (await fs.readFile(head, 'utf8')).trim() !== c.lock.consoleCommit) p.push(`Console checkout is not detached at ${c.lock.consoleCommit}`)
+    }
     return results
 }
 

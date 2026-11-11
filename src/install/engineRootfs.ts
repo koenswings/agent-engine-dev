@@ -17,9 +17,9 @@ import { $, fs, path } from 'zx'
 import { shellQuote } from '../utils/ssh.js'
 import { print } from '../utils/utils.js'
 import {
-    EngineLock, FIRSTBOOT_SCRIPT, FIRSTBOOT_UNIT, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH, PM2_UNIT, PRELOAD_DOCKER_DIR, PRELOAD_NPM_DIR, SSH_REGEN_UNIT, NPM_OFFLINE_ENV,
-    firstbootUnitText, pm2UnitText, preloadManifest, readDpkgStatus, rpiArchivePackageNames, sanitiseRootfs, serialiseLock, verifyRootfsChecks,
-    IMAGE_SPARSE_PATTERNS,
+    EngineLock, FIRSTBOOT_SCRIPT, FIRSTBOOT_UNIT, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH, PM2_UNIT, PRELOAD_DOCKER_DIR, PRELOAD_NPM_DIR, SSH_REGEN_UNIT, SSH_HOSTKEYS_UNIT, NPM_OFFLINE_ENV,
+    firstbootUnitText, pm2UnitText, sshHostKeysUnitText, preloadManifest, readDpkgStatus, rpiArchivePackageNames, sanitiseRootfs, serialiseLock, verifyRootfsChecks,
+    IMAGE_SPARSE_PATTERNS, writeBootSshTrigger,
 } from './engineImage.js'
 
 export interface Out { stdout: string }
@@ -79,6 +79,10 @@ export interface RootfsBuildOptions {
     /** git-tracked store-identity file names */
     trackedStoreIdentity: string[]
     storeIdentity: Record<string, string>
+    /** Mounted boot partition (default <rootfs>/boot/firmware); an empty `ssh` file is written here */
+    boot?: string
+    /** Local agent-console-dev checkout; cloned into the image at lock.consoleCommit */
+    consoleRepo?: string
 }
 
 /** The Engine.ts installers this build reuses (passed in: Engine.ts must not be imported at module load). */
@@ -112,6 +116,13 @@ export const engineCloneCommand = (repo: string, dest: string, sha: string, patt
     ` && git -C ${q(dest)} sparse-checkout set --no-cone ${patterns.map(q).join(' ')}` +
     ` && git -C ${q(dest)} checkout -q --detach FETCH_HEAD` +
     ` && git -C ${q(dest)} remote add origin https://github.com/koenswings/agent-engine-dev.git`
+
+/** Shallow clone of agent-console-dev at <sha> into <dest>, detached, origin = GitHub. Not sparse: the production build needs the whole tree. */
+export const consoleCloneCommand = (repo: string, dest: string, sha: string): string =>
+    `rm -rf ${q(dest)} && install -d ${q(path.posix.dirname(dest))} && git -c init.defaultBranch=main init -q ${q(dest)}` +
+    ` && git -C ${q(dest)} fetch -q --depth 1 ${q(`file://${repo}`)} ${q(sha)}` +
+    ` && git -C ${q(dest)} checkout -q --detach FETCH_HEAD` +
+    ` && git -C ${q(dest)} remote add origin https://github.com/koenswings/agent-console-dev.git`
 
 export const rootfsSteps = (o: RootfsBuildOptions, r: Runner, inst: Installers): Step[] => {
     const R = (p: string) => path.posix.join(o.rootfs, p)
@@ -193,6 +204,17 @@ export const rootfsSteps = (o: RootfsBuildOptions, r: Runner, inst: Installers):
             await exec`rm -rf /home/pi/.idea-pnpm-store`
             await inst.grantNetBindCapability(exec)
         } },
+        { name: 'Console UI: clone agent-console-dev and pnpm build (dist/index.html)', run: async () => {
+            if (!o.consoleRepo) throw new Error('Console checkout missing: pass --console-repo <absolute path to a clean agent-console-dev checkout>')
+            const sha = L.consoleCommit
+            if (!sha) throw new Error('lock.consoleCommit missing: rebuild the lock with --console-repo (or pass a lock that records the Console commit)')
+            const dest = R('/home/pi/idea/agents/agent-console-dev')
+            await r.host(consoleCloneCommand(o.consoleRepo, dest, sha))
+            await exec`chown -R pi:pi /home/pi/idea/agents/agent-console-dev`
+            // Network in the chroot (apt already uses it). The Engine pnpm store does not hold Console packages.
+            await exec`runuser -u pi -- env HOME=/home/pi bash -c ${`cd /home/pi/idea/agents/agent-console-dev && pnpm install --frozen-lockfile && pnpm build`}`
+            await r.host(`test -f ${q(path.posix.join(dest, 'dist/index.html'))}`)
+        } },
         { name: 'Docker image preload (tarballs + images.lock; loaded at first boot)', run: async () => {
             await r.host(`install -d -m 0755 ${q(R(PRELOAD_DOCKER_DIR))}`)
             for (const i of L.dockerImages) await r.host(`cp -a ${q(`${o.cache}/docker/${i.tar}`)} ${q(R(`${PRELOAD_DOCKER_DIR}/${i.tar}`))}`)
@@ -201,18 +223,22 @@ export const rootfsSteps = (o: RootfsBuildOptions, r: Runner, inst: Installers):
         { name: 'pm2-pi + first-boot units (enabled, not started)', run: async () => {
             await r.host(`printf %s ${q(pm2UnitText())} > ${q(R(`/etc/systemd/system/${PM2_UNIT}`))}`)
             await r.host(`printf %s ${q(firstbootUnitText())} > ${q(R(`/etc/systemd/system/${FIRSTBOOT_UNIT}`))}`)
+            await r.host(`printf %s ${q(sshHostKeysUnitText())} > ${q(R(`/etc/systemd/system/${SSH_HOSTKEYS_UNIT}`))}`)
             await exec`install -o root -g root -m 0755 ${E}/script/build_image_assets/idea-engine-firstboot ${FIRSTBOOT_SCRIPT}`
-            await exec`install -d -m 0755 /etc/idea && chmod 0644 /etc/systemd/system/${PM2_UNIT} /etc/systemd/system/${FIRSTBOOT_UNIT}`
+            await exec`install -d -m 0755 /etc/idea && chmod 0644 /etc/systemd/system/${PM2_UNIT} /etc/systemd/system/${FIRSTBOOT_UNIT} /etc/systemd/system/${SSH_HOSTKEYS_UNIT}`
             await exec`test -f /lib/systemd/system/${SSH_REGEN_UNIT} || test -f /usr/lib/systemd/system/${SSH_REGEN_UNIT}`
             await exec`systemctl enable ${L.enabledUnits}`
         } },
         { name: 'ownership: the Engine tree belongs to pi', run: async () => {
             await exec`chown -R pi:pi /home/pi/idea`
         } },
-        { name: 'sanitise (no device identity)', run: async () => {
+        { name: 'sanitise (no device identity) + bootfs ssh trigger', run: async () => {
             await r.host(`rm -rf ${q(R(`${E}/deb-cache`))}`)
             const changed = await sanitiseRootfs({ root: o.rootfs, enginePath: E, trackedStoreIdentity: o.trackedStoreIdentity })
             print(`sanitise: ${changed.length ? changed.join(', ') : 'nothing to do'}`)
+            const boot = o.boot ?? R('boot/firmware')
+            const trigger = await writeBootSshTrigger(boot)
+            print(`bootfs ssh trigger: ${trigger}`)
         } },
     ]
 }
@@ -232,6 +258,6 @@ export const runRootfsBuild = async (o: RootfsBuildOptions, r: Runner, inst: Ins
     await fs.ensureDir(path.join(o.rootfs, 'etc/idea'))
     await fs.writeFile(path.join(o.rootfs, IMAGE_LOCK_PATH.slice(1)), lockText)
     await fs.writeFile(path.join(o.rootfs, IMAGE_VERSION_PATH.slice(1)), `${o.lock.engineVersion} ${o.lock.engineCommit}\n`)
-    const checks = await verifyRootfsChecks({ root: o.rootfs, enginePath: o.enginePath, lock: o.lock, storeIdentity: o.storeIdentity, piUid })
+    const checks = await verifyRootfsChecks({ root: o.rootfs, enginePath: o.enginePath, lock: o.lock, storeIdentity: o.storeIdentity, piUid, boot: o.boot ?? path.join(o.rootfs, 'boot/firmware') })
     return { problems: checks.flatMap(x => x.problems), passed: checks.filter(x => !x.problems.length).length, lockText }
 }

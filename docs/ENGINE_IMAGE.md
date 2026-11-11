@@ -52,7 +52,16 @@ No SSH, nothing started, no device identity. Inside `chroot <MNT>`:
    its lockfile (`npm install --package-lock-only --install-strategy=shallow --omit=dev --os linux --cpu arm64`).
 7. Docker images (pinned by digest) copied as docker-save tarballs to `/var/lib/idea/preload/docker/` with `images.lock`.
 8. Units: `pm2-pi.service` (User=pi, `pm2 resurrect`; written, not `pm2 startup`), `idea-engine-firstboot.service`,
-   and Raspberry Pi OS's `regenerate_ssh_host_keys.service`, all enabled with docker, avahi-daemon and ssh.
+   Raspberry Pi OS's `regenerate_ssh_host_keys.service`, and `idea-ssh-host-keys.service` (generates host keys when
+   they are missing, *without* `ConditionFirstBoot` — systemd 257 does not treat an empty `/etc/machine-id` as a first
+   boot, which is what sanitise writes so idea `verify-sanitised.sh` still passes), all enabled with docker,
+   avahi-daemon and ssh. An empty `ssh` file is written on the boot partition so `sshswitch.service` will also enable
+   ssh (the official Raspberry Pi OS trigger; the unit is already enabled in the image).
+8b. Console UI: a shallow clone of `agent-console-dev` at the lock's `consoleCommit` into
+   `/home/pi/idea/agents/agent-console-dev`, then `pnpm install --frozen-lockfile && pnpm build` as pi. Pass
+   `--console-repo` (or a sibling checkout / `$IDEA_CONSOLE_REPO`). Verify fails if `dist/index.html` is missing
+   (the Engine would otherwise answer HTTP 503 "Console UI not built yet"). This is a JS/Vite build; it runs in the
+   arm64 chroot with the image's Node/pnpm, not on the x86 box.
 9. Package record: after the build every installed package and its exact version (dpkg status) goes into the lock
    (`packages`), and the ones from archive.raspberrypi.com into `rpiPackages`; verify checks the Raspberry Pi pins
    (`apt-rpi-pins.tsv`), the Docker debs, `rpiPackages` and `packages` against dpkg status.
@@ -72,7 +81,11 @@ No SSH, nothing started, no device identity. Inside `chroot <MNT>`:
 
 ## First boot
 
-`regenerate_ssh_host_keys.service` makes the host keys. systemd makes machine-id. `idea-engine-firstboot`
+`idea-ssh-host-keys.service` makes the SSH host keys if they are missing (`ssh-keygen -A`, no `ConditionFirstBoot`).
+Raspberry Pi OS's `regenerate_ssh_host_keys.service` is still enabled, but on systemd 257 it will *not* run when
+`/etc/machine-id` is an empty file (machine-id(5) first-boot rule 4) — that was the build 6 sshd failure on idea04.
+The bootfs `ssh` trigger is present at flash time; `sshswitch.service` enables ssh if needed and then deletes it.
+systemd writes a machine-id. `idea-engine-firstboot`
 (`script/build_image_assets/idea-engine-firstboot`) loads the preloaded images (sha256 and image id checked), creates
 the docker networks, installs pm2-logrotate from the preloaded tarball and, as pi, starts the Engine with
 `pm2.config.cjs` and `pm2 save`; `pm2-pi.service` resurrects it on later boots. The Engine creates `/META.yaml` itself
