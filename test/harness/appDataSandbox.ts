@@ -241,6 +241,9 @@ exit \${FAKE_SYSTEMCTL_EXIT:-0}`)
         'AuthorizedKeysFile .ssh/authorized_keys .ssh/authorized_keys2 /etc/ssh/idea_authorized_keys/%u',
         '',
     ].join('\n'))
+    // Production drop-ins are 0644. writeFile's default 0666 becomes 0664 under
+    // Debian's pi umask 0002; usage_akf_content then refuses the file (idea#412).
+    await fs.chmod(peerSshdDropin, 0o644)
     setConst('ENGINE_USER', os.userInfo().username)
     // erase-slot: allow staging under <tmp>/erase-staging/<id> instead of /home/pi/...
     const stagingRootEscaped = path.join(tmp, 'erase-staging').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
