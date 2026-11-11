@@ -14,7 +14,7 @@ import crypto from 'crypto'
 import { config } from '../data/Config.js'
 import {
     EngineLock, FIRSTBOOT_SCRIPT, IMAGE_ENABLED_UNITS, ImageArgs, LOCK_SCHEMA, LockedFile, LockedImage, UsageError,
-    imageIdFromManifest, imageTarName, parseDockerPins, readLock, serialiseLock, sha256File, validateLock, verifyRootfsChecks, VERIFY_CHECKS,
+    imageIdFromManifest, imageTarName, parseDockerPins, readLock, serialiseLock, sha256File, validateLock, verifyRootfsChecks, VERIFY_CHECKS, QEMU_AARCH64_STATIC, rootfsHostProblem,
 } from './engineImage.js'
 import { NpmTool, NPM_TOOL_INSTALL, IMAGE_SPARSE_PATTERNS } from './engineImage.js'
 import { Installers, Runner, realRunner, runRootfsBuild } from './engineRootfs.js'
@@ -190,7 +190,9 @@ export const runImageMode = async (a: ImageArgs, repo: string): Promise<number> 
     }
     // rootfs build
     if (!a.dryRun) {
-        if (os.arch() !== 'arm64') throw new UsageError(`--root builds run on an arm64 host (this is ${os.arch()}); use --dry-run elsewhere`)
+        const hostProblem = rootfsHostProblem(os.arch(), await fs.pathExists(QEMU_AARCH64_STATIC))
+        if (hostProblem) throw new UsageError(hostProblem)
+        if (os.arch() !== 'arm64') console.log(`--root build on ${os.arch()} via ${QEMU_AARCH64_STATIC}`)
         if (process.getuid?.() !== 0) throw new UsageError('--root builds run as root')
     }
     if ((await piUidOf(root)) === undefined) throw new UsageError(`${root}/etc/passwd has no pi user`)
