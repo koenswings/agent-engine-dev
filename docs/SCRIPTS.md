@@ -196,3 +196,10 @@ The file installed at `/usr/local/sbin/idea-usage-export` is `script/build_image
 
 idea#401 (borg prune/delete/compact) moves to helper v8. Tests: `test/automated/idea-app-data-usage-key.test.ts`, `test/automated/idea-usage-export.test.ts`, `test/automated/install-peer-access.test.ts`.
 
+### `idea-usage-settings`: operator toggle for `usageMonitoring` (idea#411)
+
+Installed by `installRootHelpers` as a root-owned 0755 copy at `/usr/local/sbin/idea-usage-settings`. It is not in sudoers (`11-engine-files` is unchanged): the Engine never calls it. Operators and `tools/fleet/usage-monitoring.sh` (idea repo) run it as `pi`. `/var/lib/idea/usage` is `pi:pi` 0750, so `pi` can write `settings.json`.
+
+Accepts only `on`, `off` and `status`, via argv or `$SSH_ORIGINAL_COMMAND`. A missing file is `off`. `on`/`off` are idempotent (exit 0; no rewrite when the file already has that value; `off` when the file is absent creates nothing). Writes `{"usageMonitoring":"on"|"off"}` atomically (mode 0640; `pi:pi` when invoked as root). Exit 2 and stderr `invalid arguments` for anything else, including shell metacharacters. It never starts, stops or restarts pm2, docker or any App; the running `idea-usage` process re-reads the file at least once a minute. It is not `idea-usage-export` (the collector forced command still accepts only `since` and `archive-and-clear`). Tests: `test/automated/idea-usage-settings.test.ts`.
+
+
