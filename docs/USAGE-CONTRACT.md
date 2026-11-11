@@ -249,7 +249,7 @@ App-specific payload fields sit alongside those three (plus optional `demo`). Nu
 
 These names refine proposal §7.6. Unknown extra keys are ignored (forward compatible); required keys missing from an app that should have them fail the schema.
 
-Role keys are singular everywhere — `admin`, `teacher`, `learner` — in `setup`, `logins` and `office.byGroup`, for every App (never `admins`, `teachers` or `learners`). `setup` and `logins` (and Kolibri `signins`) use `{total, beyondSeed}`: `total` includes demo-seed accounts, `beyondSeed` excludes them. `office.byGroup` holds open counts as plain numbers (`{admin: n, teacher: n, learner: n}`), not `{total, beyondSeed}`. Nextcloud `setup` also keeps `otherGroups`, a map of extra group names to `{total, beyondSeed}`. Kolibri `signins` also carry `sessions` and `minutes` on the same object (`coach` is an extra Kolibri role and uses the same shape).
+Role keys are singular everywhere — `admin`, `teacher`, `learner` — in `setup`, `logins`, `office.byGroup` and Nextcloud `workflows.byGroup`, for every App (never `admins`, `teachers` or `learners`). `setup` and `logins` (and Kolibri `signins`) use `{total, beyondSeed}`: `total` includes demo-seed accounts, `beyondSeed` excludes them. `office.byGroup` holds open counts as plain numbers (`{admin: n, teacher: n, learner: n}`), not `{total, beyondSeed}`. Nextcloud `workflows.byGroup` uses the same plain-number maps. Nextcloud `setup` also keeps `otherGroups`, a map of extra group names to `{total, beyondSeed}`. Kolibri `signins` also carry `sessions` and `minutes` on the same object (`coach` is an extra Kolibri role and uses the same shape).
 
 **Kolibri** (`app: "kolibri"`) — Q3, Q4, Q6:
 
@@ -316,10 +316,18 @@ Role keys are singular everywhere — `admin`, `teacher`, `learner` — in `setu
   },
   "workflows": {
     "worksheetShares": 0, "editShares": 0,
-    "fileDropLinks": 0, "fileDropUploads": 0, "schoolFilesShares": 0
+    "fileDropLinks": 0, "fileDropUploads": 0, "schoolFilesShares": 0,
+    "byGroup": {
+      "worksheetShares": { "admin": 0, "teacher": 0, "learner": 0 },
+      "editShares": { "admin": 0, "teacher": 0, "learner": 0 },
+      "fileDropUploads": { "admin": 0, "teacher": 0, "learner": 0 },
+      "schoolFilesShares": { "admin": 0, "teacher": 0, "learner": 0 }
+    }
   }
 }
 ```
+
+`workflows.byGroup` (idea#431, [app-nextcloud#21](https://github.com/koenswings/app-nextcloud/pull/21)) is additive: a day payload without `workflows`, or with `workflows` but no `byGroup`, stays valid. When present, each of `worksheetShares`, `editShares`, `fileDropUploads` and `schoolFilesShares` is a plain-number map with the same singular role keys as `office.byGroup` (not `{total, beyondSeed}`). `fileDropLinks` has no split.
 
 `office` from the day hook may be incomplete (WOPI rows expire). The Engine prefers its own reduction of that day’s samples when any samples exist (see §5.5). Nextcloud `appsOpened` is omitted for now.
 
