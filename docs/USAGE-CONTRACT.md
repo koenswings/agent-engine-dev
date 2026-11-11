@@ -571,7 +571,7 @@ When `usageMonitoring` is `off` (missing file = off):
 
 ## 8. Helper v7 and the key drop-in (idea#412)
 
-Current `main` ships `idea-app-data` **v8** (`APP_DATA_HELPER_VERSION` is `'8'` in `src/utils/appDataHelper.ts`), which includes the usage-export key install (idea#412) and `borg-create` exclude passthrough (idea#443). [idea#401](https://github.com/koenswings/idea/issues/401) (borg prune/delete/compact) is tracked for helper v9.
+This change ships `idea-app-data` **v8** (`APP_DATA_HELPER_VERSION` is `'8'` in `src/utils/appDataHelper.ts`), which includes the usage-export key install (idea#412) and `borg-create` exclude passthrough (idea#443). Steve (19:19 CET, 2026-11-11) assigned v8 to idea#443 and moved [idea#401](https://github.com/koenswings/idea/issues/401) (borg prune/delete/compact) to helper v9.
 
 The usage-pull public key must not live in `~/.ssh/authorized_keys` or `/etc/ssh/idea_authorized_keys/pi`: `sync-peers` rewrites that file in one atomic swap. It must not go through `idea-peer-gate`: every peer Engine key shares that gate, and making export a gate verb would let any kit pull another school’s summaries.
 
