@@ -21,7 +21,7 @@ import { log, print } from '../utils/utils.js'
 import { disksRoot, skipBorg } from '../data/Config.js'
 import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot, appDataRoot, joinMountRoot } from '../data/Disk.js'
 import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgProblem, helperAtLeast } from '../utils/appDataHelper.js'
-import { parseBackupExcludeList, BACKUP_EXCLUDE_HELPER_MIN } from '../utils/backupExclude.js'
+import { parseBackupExcludeList, parseBackupHookExcludeList, mergeBackupExcludeLists, BACKUP_EXCLUDE_HELPER_MIN } from '../utils/backupExclude.js'
 import { parseBackupSpec, assertHookServicesExist, backupHookRunner, defaultBackupSpec } from '../utils/backupMethod.js'
 import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { ensureAppFilesOnTarget } from '../data/RestoreAppFiles.js'
@@ -189,6 +189,7 @@ export const backupInstance = async (
         const composePath = joinMountRoot(await diskMountRoot(appDisk as Disk), 'instances', instanceId, 'compose.yaml')
         const instanceDir = joinMountRoot(await diskMountRoot(appDisk as Disk), 'instances', instanceId)
         let backupExcludes: string[] = []
+        let hookExcludes: string[] = []
         let backupSpec = defaultBackupSpec()
         if (await fs.pathExists(composePath)) {
             let parsed: unknown
@@ -204,13 +205,18 @@ export const backupInstance = async (
                 throw new Error(`backupApp: invalid x-app.backup.exclude (${e?.message ?? e})`)
             }
             try {
+                hookExcludes = parseBackupHookExcludeList(xapp)
+            } catch (e: any) {
+                throw new Error(`backupApp: invalid x-app.backup.hookExclude (${e?.message ?? e})`)
+            }
+            try {
                 backupSpec = parseBackupSpec(xapp)
                 assertHookServicesExist(parsed, backupSpec)
             } catch (e: any) {
                 throw new Error(`backupApp: invalid x-app.backup (${e?.message ?? e})`)
             }
         }
-        if (backupExcludes.length && !skipBorg()) {
+        if ((backupExcludes.length || hookExcludes.length) && !skipBorg()) {
             const helper = await helperAtLeast(BACKUP_EXCLUDE_HELPER_MIN, 'backupApp with x-app.backup.exclude')
             if (helper) throw new Error(`HELPER_OUTDATED: ${helper}`)
         }
@@ -260,12 +266,12 @@ export const backupInstance = async (
             return `${which} ${why}${detail ? `: ${detail}` : ''}`
         }
 
-        const runBorgCreate = async (): Promise<void> => {
+        const runBorgCreate = async (excludes: string[]): Promise<void> => {
             setBackupStep(2, BACKUP_STEPS[2])
             const archiveName = new Date().toISOString().replace(/[:.]/g, '-')
             if (!skipBorg()) {
-                log(`Running borg create for instance ${instanceId}${backupExcludes.length ? ` (${backupExcludes.length} exclude(s))` : ''}`)
-                await runAppData(borgCreateArgs(backupDevice, instanceId, archiveName, await appDataRoot(appDisk as Disk), backupExcludes))
+                log(`Running borg create for instance ${instanceId}${excludes.length ? ` (${excludes.length} exclude(s))` : ''}`)
+                await runAppData(borgCreateArgs(backupDevice, instanceId, archiveName, await appDataRoot(appDisk as Disk), excludes))
             } else {
                 log(`skipBorg: skipping borg create for instance ${instanceId}`)
             }
@@ -294,7 +300,7 @@ export const backupInstance = async (
             const pre = await runDeclaredHook(backupSpec.preHook, 'preHook')
             if (!pre.failed) {
                 hookResult = 'hook'
-                await runBorgCreate()
+                await runBorgCreate(mergeBackupExcludeLists(backupExcludes, hookExcludes))
                 setBackupStep(3, 'Running post-backup hook')
                 const post = await runDeclaredHook(backupSpec.postHook, 'postHook')
                 if (post.failed) {
@@ -311,10 +317,10 @@ export const backupInstance = async (
                 }
                 hookResult = 'HOOK_FALLBACK'
                 log(`HOOK_FALLBACK: ${hookFailureMessage('preHook', pre)}; falling back to a short stop`)
-                await stopThenStartAround(runBorgCreate)
+                await stopThenStartAround(() => runBorgCreate(backupExcludes))
             }
         } else {
-            await stopThenStartAround(runBorgCreate)
+            await stopThenStartAround(() => runBorgCreate(backupExcludes))
         }
 
         // 6. Update store: set lastBackup on the instance

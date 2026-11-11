@@ -22,6 +22,7 @@ import {
     defaultBackupSpec, DEFAULT_HOOK_TIMEOUT_S,
     assertHookServicesExist,
 } from '../../src/utils/backupMethod.js'
+import { parseBackupHookExcludeList, parseBackupExcludeList, mergeBackupExcludeLists } from '../../src/utils/backupExclude.js'
 
 describe('parseBackupSpec / parseBackupHookDecl / backupHookArgv', () => {
     it('defaults to method stop, fallback stop, timeout 300, no hooks', () => {
@@ -135,6 +136,30 @@ describe('parseBackupSpec / parseBackupHookDecl / backupHookArgv', () => {
     })
 })
 
+
+describe('parseBackupHookExcludeList', () => {
+    it('uses the same path rules as exclude and keeps the two lists separate', () => {
+        expect(parseBackupHookExcludeList(undefined)).toEqual([])
+        expect(parseBackupHookExcludeList({ backup: {} })).toEqual([])
+        expect(parseBackupHookExcludeList({
+            backup: {
+                exclude: ['keys'],
+                hookExclude: ['usage.sqlite', 'usage.sqlite-wal', './data/usage.sqlite-shm'],
+            },
+        })).toEqual(['data/usage.sqlite', 'data/usage.sqlite-wal', 'data/usage.sqlite-shm'])
+        expect(parseBackupExcludeList({
+            backup: { exclude: ['keys'], hookExclude: ['usage.sqlite'] },
+        })).toEqual(['data/keys'])
+        expect(mergeBackupExcludeLists(
+            ['data/keys', 'data/tailscale'],
+            ['data/usage.sqlite', 'data/keys'],
+        )).toEqual(['data/keys', 'data/tailscale', 'data/usage.sqlite'])
+        expect(() => parseBackupHookExcludeList({ backup: { hookExclude: '../etc' } })).toThrow(/hookExclude/)
+        expect(() => parseBackupHookExcludeList({ backup: { hookExclude: 'keys' } })).toThrow(/must be a list/)
+        expect(parseBackupHookExcludeList({ backup: { hookExclude: ['keys'] } })).toEqual(['data/keys'])
+    })
+})
+
 const INST = 'inst-hook-1' as InstanceID
 
 const FAKE_SUDO = `#!/usr/bin/env bash
@@ -201,7 +226,8 @@ describe('backupInstance method hook (idea#444)', () => {
         method: 'hook',
         preHook: { service: 'collector', command: '/app/scripts/backup-snapshot.sh' },
         postHook: { service: 'collector', command: '/app/scripts/backup-snapshot-cleanup.sh' },
-        exclude: ['keys', 'tailscale', 'tailscale-run', 'usage.sqlite', 'usage.sqlite-wal', 'usage.sqlite-shm'],
+        exclude: ['keys', 'tailscale', 'tailscale-run'],
+        hookExclude: ['usage.sqlite', 'usage.sqlite-wal', 'usage.sqlite-shm'],
         ...extra,
     })
 
@@ -347,7 +373,24 @@ describe('backupInstance method hook (idea#444)', () => {
         expect(stopCount).toBe(1)
         expect(startCount).toBe(1)
         expect(hookCalls.map(c => c.which)).toEqual(['preHook', 'postHook'])
-        expect((await calls()).some(l => l.startsWith('borg-create'))).toBe(true)
+        const create = (await calls()).find(l => l.startsWith('borg-create '))
+        expect(create).toBeTruthy()
+        expect(create).toMatch(new RegExp(` data/keys data/tailscale data/tailscale-run$`))
+        expect(create).not.toMatch(/usage\.sqlite/)
+    })
+
+    it('successful hook archive excludes hookExclude live DB; always-exclude keys stay out', async () => {
+        await writeCompose(hookBlock())
+        const h = await runBackup('Running')
+        expect(opOf(h)?.args?.hookResult).toBe('hook')
+        const create = (await calls()).find(l => l.startsWith('borg-create ')) ?? ''
+        expect(create).toContain(' data/keys ')
+        expect(create).toContain(' data/tailscale ')
+        expect(create).toContain(' data/tailscale-run ')
+        expect(create).toContain(' data/usage.sqlite ')
+        expect(create).toContain(' data/usage.sqlite-wal ')
+        expect(create).toMatch(/data\/usage\.sqlite-shm$/)
+        expect(stopCount).toBe(0)
     })
 
     it('preHook timeout with fallback stop: HOOK_FALLBACK and postHook still runs', async () => {
