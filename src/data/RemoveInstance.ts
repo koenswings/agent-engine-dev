@@ -15,6 +15,9 @@
  * 3. The record is dropped from instanceDB.
  * 4. Disk.preUpdateSnapshots, preUpdateBytes and quarantineBytes are refreshed
  *    from the helper (idea#428), the same way updateApp does after a snapshot.
+ *    The removed instance's own snapshot entry is then dropped from the disk
+ *    row (and subtracted from preUpdateBytes) so it does not linger if
+ *    .pre-update/<id> is still on disk. That folder is never deleted.
  * Nothing is deleted: the quarantine is never purged automatically; clearing it is
  * manual and needs Koen's OK.
  *
@@ -164,6 +167,21 @@ export const removeInstance = async (
         } catch (e) {
             log(`removeInstance: could not refresh pre-update snapshot info on ${disk.id}: ${(e as Error).message}`)
         }
+        // Drop this instance from the disk row even if the helper still lists
+        // .pre-update/<id> (the folder is never deleted). quarantineBytes stays
+        // as the helper reported it, including the new quarantine folder (idea#428).
+        storeHandle.change(doc => {
+            const row = doc.diskDB[disk.id]
+            if (!row) return
+            const snaps = row.preUpdateSnapshots ?? []
+            const kept = snaps.filter(s => String(s.instanceId) !== String(inst.id))
+            if (kept.length === snaps.length) return
+            const droppedBytes = snaps
+                .filter(s => String(s.instanceId) === String(inst.id))
+                .reduce((n, s) => n + (Number(s.sizeBytes) || 0), 0)
+            row.preUpdateSnapshots = kept.map(s => ({ ...s }))
+            row.preUpdateBytes = Math.max(0, (Number(row.preUpdateBytes) || 0) - droppedBytes)
+        })
         log(`removeInstance: ${inst.id} ('${inst.name}') quarantined at ${quarantinePath}; kept volumes: ${keptVolumes.length ? keptVolumes.join(', ') : 'none'}`)
         return { instanceId: inst.id, name: String(inst.name), quarantinePath, keptVolumes }
     } finally {

@@ -147,6 +147,27 @@ describe('removeInstance', () => {
         expect(h.doc().diskDB['d1' as any].preUpdateBytes).toBe(0)
         expect(h.doc().diskDB['d1' as any].quarantineBytes).toBe(5000)
     })
+    it('drops the removed instance from preUpdateSnapshots even if the helper still lists its folder (idea#428)', async () => {
+        add('i1', 'kolibri', 'd1')
+        await removeInstance(h, 'i1', ME, deps({
+            refreshSnapshots: async (disk) => {
+                calls.push(`refresh ${disk.id}`)
+                h.change(doc => {
+                    const d = doc.diskDB[disk.id as any] as any
+                    d.preUpdateSnapshots = [
+                        { instanceId: 'i1', sizeBytes: 4096, complete: true },
+                        { instanceId: 'other', sizeBytes: 100, complete: true },
+                    ]
+                    d.preUpdateBytes = 4196
+                    d.quarantineBytes = 5000
+                })
+            },
+        }))
+        expect(calls).toContain('refresh d1')
+        expect(h.doc().diskDB['d1' as any].preUpdateSnapshots).toEqual([{ instanceId: 'other', sizeBytes: 100, complete: true }])
+        expect(h.doc().diskDB['d1' as any].preUpdateBytes).toBe(100)
+        expect(h.doc().diskDB['d1' as any].quarantineBytes).toBe(5000)
+    })
     it('does not refresh snapshot info when compose down or quarantine fails (idea#428)', async () => {
         add('i1', 'k', 'd1')
         h.change(doc => {
