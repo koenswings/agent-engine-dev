@@ -843,6 +843,12 @@ export const installRootHelpers = async (exec: any, enginePath: string) => {
   print(chalk.blue('  - Installing /etc/tmpfiles.d/idea-usage.conf...'))
   await exec`sudo install -o root -g root -m 0644 ${enginePath}/script/build_image_assets/idea-usage.tmpfiles.conf ${USAGE_TMPFILES_CONF}`
   await exec`sudo systemd-tmpfiles --create ${USAGE_TMPFILES_CONF}`
+  // idea-usage-settings: operator toggle for usageMonitoring (idea#411). Root-owned
+  // COPY, 0755. Not in sudoers: the Engine never calls it; operators and
+  // tools/fleet/usage-monitoring.sh run it as pi. /var/lib/idea/usage is pi:pi.
+  print(chalk.blue('  - Installing idea-usage-settings...'))
+  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-usage-settings ${USAGE_SETTINGS}`
+  print(chalk.green(`  - ${USAGE_SETTINGS} installed`))
   // Per-Pi Engine keys: the forced command for peer keys and the sshd drop-in
   await installPeerAccess(exec, enginePath)
   // DHCP option 60 "idea-engine" (idea#209 D8). Here, not only in build-engine, so
@@ -869,6 +875,8 @@ export const PEER_SSHD_DROPIN = '/etc/ssh/sshd_config.d/10-idea-peer.conf'
 export const PEER_LEDGER_DIR = '/var/lib/idea-app-data'
 /** Forced command for the usage-export key (idea#412); root-owned COPY, 0755. */
 export const USAGE_EXPORT = '/usr/local/sbin/idea-usage-export'
+/** Operator toggle for usageMonitoring (idea#411); root-owned COPY, 0755. */
+export const USAGE_SETTINGS = '/usr/local/sbin/idea-usage-settings'
 /** Directory of the usage-export authorized_keys file (idea#412); root 0755. */
 export const USAGE_AUTH_DIR = '/etc/ssh/idea_usage_keys'
 /** Usage-export public key file, written only by `idea-app-data install-usage-key`. */

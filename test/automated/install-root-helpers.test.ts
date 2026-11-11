@@ -60,6 +60,7 @@ describe('installRootHelpers', () => {
         expect(idx(/visudo -cf \/e\/script\/build_image_assets\/11-engine-files.sudoers/)).toBeGreaterThan(idx(/apt-get install/))
         expect(cmds).toContain('sudo install -o root -g root -m 0755 /e/script/build_image_assets/idea-app-data /usr/local/sbin/idea-app-data')
         expect(cmds).toContain('sudo install -o root -g root -m 0755 /e/script/build_image_assets/idea-erase-disk /usr/local/sbin/idea-erase-disk')
+        expect(cmds).toContain('sudo install -o root -g root -m 0755 /e/script/build_image_assets/idea-usage-settings /usr/local/sbin/idea-usage-settings')
         expect(cmds).toContain('sudo install -d -o pi -g pi -m 0750 /var/lib/idea/usage')
         expect(cmds.some(c => /idea-usage\.tmpfiles\.conf/.test(c))).toBe(true)
         expect(idx(/idea-peer-gate/)).toBeGreaterThan(idx(/idea-app-data \/usr\/local/))
