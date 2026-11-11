@@ -173,6 +173,9 @@ SHA256SUM=/usr/bin/sha256sum
 
 # ── Fixed locations ──────────────────────────────────────────────────────────
 DISKS_DIR=/disks
+# Empty on purpose so "$SYSTEM_ROOT/instances/<id>" is /instances/<id>.
+# SYSTEM_ROOT=/ would produce //instances/<id> and fail exact_path (idea#237).
+# Verbs that pass the root itself to df must treat '' as / (avail_kb, free_floor; idea#427).
 SYSTEM_ROOT=
 ROOTS_FILE=/etc/idea/app-data-roots
 LOCK_DIR=/run/lock/idea-app-data
@@ -301,10 +304,10 @@ containers_stopped() {   # containers_stopped <id>: refuse while any container o
     ids=$($DOCKER ps -q --filter "label=com.docker.compose.project=$1" 2>/dev/null) || refuse "cannot list the containers of $1"
     [[ -z "$ids" ]] || refuse "RUNNING: the containers of $1 are still running; stop the instance first"
 }
-avail_kb() {   # avail_kb <existing folder>
-    local a
-    a=$($DF -Pk -- "$1" 2>/dev/null | { read -r _; read -r _ _ _ a _; echo "${a:-}"; })
-    [[ "$a" =~ ^[0-9]+$ ]] || refuse "cannot tell the free space of $1"
+avail_kb() {   # avail_kb <existing folder>  (empty means /; idea#427)
+    local dir="${1:-/}" a
+    a=$($DF -Pk -- "$dir" 2>/dev/null | { read -r _; read -r _ _ _ a _; echo "${a:-}"; })
+    [[ "$a" =~ ^[0-9]+$ ]] || refuse "cannot tell the free space of $dir"
     echo "$a"
 }
 quarantine_aside() {   # quarantine_aside <R_DIR> <path> <name>: move <path> to .idea-quarantine/<name>-<stamp>, echo it
@@ -450,7 +453,7 @@ bridge_lookup() {
     echo "$found"
 }
 
-# resolve_root <token> <instances|backup> → sets R_DIR (no trailing slash; '' is /)
+# resolve_root <token> <instances|backup> → sets R_DIR (no trailing slash; '' is /; idea#237/#427)
 resolve_root() {
     local tok="$1" purpose="$2" b
     R_DIR=""
@@ -644,11 +647,11 @@ check_server_args() {
 
 # Free-space floor: a receive is refused when the target filesystem has less than
 # FREE_FLOOR_KB free (a peer cannot fill a disk to the last byte).
-free_floor() {   # free_floor <existing folder>
-    local avail
-    avail=$($DF -Pk -- "$1" 2>/dev/null | { read -r _; read -r _ _ _ a _; echo "${a:-}"; })
-    [[ "$avail" =~ ^[0-9]+$ ]] || refuse "cannot tell the free space of $1"
-    (( avail >= FREE_FLOOR_KB )) || refuse "only ${avail} KB free on the filesystem of $1; receives need at least ${FREE_FLOOR_KB} KB"
+free_floor() {   # free_floor <existing folder>  (empty means /; idea#427)
+    local dir="${1:-/}" avail
+    avail=$($DF -Pk -- "$dir" 2>/dev/null | { read -r _; read -r _ _ _ a _; echo "${a:-}"; })
+    [[ "$avail" =~ ^[0-9]+$ ]] || refuse "cannot tell the free space of $dir"
+    (( avail >= FREE_FLOOR_KB )) || refuse "only ${avail} KB free on the filesystem of $dir; receives need at least ${FREE_FLOOR_KB} KB"
 }
 
 # A folder written as the Engine user (app masters, service tars): created 0755 if
@@ -1087,7 +1090,7 @@ case "$SUB" in
         NEED_KB=$(( INST_KB + VOL_KB ))
         MARGIN_KB=$(( NEED_KB * SNAPSHOT_MARGIN_PCT / 100 ))
         (( MARGIN_KB >= FREE_FLOOR_KB )) || MARGIN_KB=$FREE_FLOOR_KB
-        FREE_KB=$(avail_kb "$R_DIR")
+        FREE_KB=$(avail_kb "${R_DIR:-/}")
         if (( FREE_KB < NEED_KB + MARGIN_KB )); then
             REFUSAL="NO_SPACE"
             echo "NO_SPACE: snapshot needs $(( (NEED_KB + MARGIN_KB) * 1024 )) bytes ($INST_KB KB folder + $VOL_KB KB volumes + $MARGIN_KB KB margin), free $(( FREE_KB * 1024 )) bytes" >&2
@@ -1212,7 +1215,7 @@ case "$SUB" in
             VOL_KB=$(( VOL_KB + k ))
         done
         INST_KB=$(dir_kb "$INST"); [[ "$INST_KB" =~ ^[0-9]+$ ]] || refuse "cannot tell the size of $INST"
-        echo "$INST_KB $VOL_KB $(avail_kb "$R_DIR")"
+        echo "$INST_KB $VOL_KB $(avail_kb "${R_DIR:-/}")"
         exit 0
         ;;
 
