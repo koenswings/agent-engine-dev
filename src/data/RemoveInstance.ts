@@ -1,12 +1,23 @@
 /**
  * RemoveInstance.ts — removeInstance <instanceId> (idea#347, option A: quarantine).
  *
- * 1. `docker compose down` WITHOUT -v: containers go, named volumes are kept.
+ * 1. `docker compose -p <id> -f <instanceDir>/compose.yaml down` WITHOUT -v:
+ *    containers go, named volumes are kept. instanceDir comes from diskPath
+ *    (idea#237 / idea#424): on the system disk that is /instances/<id>, never
+ *    path.join(diskMountRoot()) which is the relative `instances/<id>` and
+ *    makes the compose.yaml check silently skip. Never glob
+ *    /.idea-quarantine/<id>-<stamp> — that directory is root:root 0700, so a
+ *    path glob as pi matches nothing and compose down never runs.
+ *    Then remove any leftover containers by com.docker.compose.project=<id>
+ *    (`docker rm -f`, also without -v).
  * 2. Under the instance lock, the root helper renames <disk>/instances/<id> to
  *    <disk>/.idea-quarantine/<id>-<UTC stamp> (idea-app-data quarantine, helper v4).
  * 3. The record is dropped from instanceDB.
  * Nothing is deleted: the quarantine is never purged automatically; clearing it is
  * manual and needs Koen's OK.
+ *
+ * If compose down or the label cleanup fails: COMPOSE_DOWN_FAILED is logged and
+ * thrown, the folder is left in place, and the store is untouched.
  *
  * Refusals throw `CODE: text`, and the store is untouched on any failure:
  *   NOT_FOUND, NOT_LOCAL, AMBIGUOUS, RUNNING, BUSY_BACKUP, BUSY_MOVE, BUSY,
@@ -18,7 +29,7 @@ import type { Store } from './Store.js'
 import type { Instance } from './Instance.js'
 import type { InstanceID } from './CommonTypes.js'
 import { lookupLocalInstanceArg } from './InstanceArg.js'
-import { diskMountRoot, appDataRoot, Disk } from './Disk.js'
+import { diskPath, appDataRoot, Disk } from './Disk.js'
 import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
 import { runAppData, quarantineArgs, helperAtLeast } from '../utils/appDataHelper.js'
 import { log } from '../utils/utils.js'
@@ -33,25 +44,57 @@ export interface RemoveResult { instanceId: InstanceID; name: string; quarantine
 
 export const REMOVE_HELPER_MIN = 4
 
+/** Live instance folder. Absolute even on the system disk (idea#424 / idea#237). */
+export const defaultInstanceDir = (disk: Disk, id: InstanceID): Promise<string> =>
+    diskPath(disk, 'instances', String(id))
+
+export const dockerQuiet = async (args: string[]): Promise<string> =>
+    (await $`docker ${args}`.quiet()).stdout
+
+/**
+ * Bring the compose project down using the live instance path and file
+ * (idea#424). Does not glob the quarantine directory. Missing compose.yaml is
+ * not an error — the caller still runs label cleanup.
+ */
+export const composeDownAt = async (
+    dir: string, id: InstanceID, run: (args: string[]) => Promise<string> = dockerQuiet,
+): Promise<void> => {
+    const composeFile = path.join(dir, 'compose.yaml')
+    if (!fs.existsSync(composeFile)) {
+        log(`removeInstance: no compose.yaml at ${composeFile}; will clean containers by project label ${id}`)
+        return
+    }
+    await run(['compose', '-p', String(id), '-f', composeFile, 'down'])
+}
+
+/** Fallback: remove leftover containers of this compose project. No -v (volumes stay). */
+export const removeContainersByComposeProject = async (
+    id: InstanceID, run: (args: string[]) => Promise<string> = dockerQuiet,
+): Promise<void> => {
+    const raw = await run(['ps', '-aq', '--filter', `label=com.docker.compose.project=${id}`])
+    for (const cid of raw.split('\n').map(s => s.trim()).filter(Boolean)) {
+        await run(['rm', '-f', cid])
+    }
+}
+
 export interface RemoveDeps {
     helperProblem: () => Promise<string | null>
     instanceDir: (disk: Disk, id: InstanceID) => Promise<string>
     composeDown: (dir: string, id: InstanceID) => Promise<void>
+    removeProjectContainers: (id: InstanceID) => Promise<void>
     listVolumes: (id: InstanceID) => Promise<string[]>
     quarantine: (disk: Disk, id: InstanceID) => Promise<string>
 }
 
 const defaultDeps: RemoveDeps = {
     helperProblem: () => helperAtLeast(REMOVE_HELPER_MIN, 'removeInstance'),
-    instanceDir: async (disk, id) => path.join(await diskMountRoot(disk), 'instances', String(id)),
-    composeDown: async (dir, id) => {
-        if (!fs.existsSync(path.join(dir, 'compose.yaml'))) return
-        await $({ cwd: dir })`docker compose -p ${id} down`.quiet()
-    },
+    instanceDir: defaultInstanceDir,
+    composeDown: (dir, id) => composeDownAt(dir, id),
+    removeProjectContainers: (id) => removeContainersByComposeProject(id),
     listVolumes: async (id) => {
         try {
-            const r = await $`docker volume ls -q --filter label=com.docker.compose.project=${id}`.quiet()
-            return r.stdout.split('\n').map(s => s.trim()).filter(Boolean)
+            const out = await dockerQuiet(['volume', 'ls', '-q', '--filter', `label=com.docker.compose.project=${id}`])
+            return out.split('\n').map(s => s.trim()).filter(Boolean)
         } catch { return [] }
     },
     quarantine: async (disk, id) => (await runAppData(quarantineArgs(await appDataRoot(disk), String(id)))).trim(),
@@ -90,8 +133,11 @@ export const removeInstance = async (
         const dir = await d.instanceDir(disk, inst.id)
         try {
             await d.composeDown(dir, inst.id)
+            await d.removeProjectContainers(inst.id)
         } catch (e) {
-            throw new RemoveError('COMPOSE_DOWN_FAILED', `docker compose down failed for '${inst.name}': ${(e as Error).message}; nothing changed`)
+            const msg = `docker compose down failed for '${inst.name}': ${(e as Error).message}; nothing changed`
+            log(`removeInstance: ${msg}`)
+            throw new RemoveError('COMPOSE_DOWN_FAILED', msg)
         }
         const keptVolumes = await d.listVolumes(inst.id)
         let quarantinePath: string

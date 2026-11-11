@@ -20,7 +20,7 @@ import { DocHandle } from '@automerge/automerge-repo'
 import { fs, path } from 'zx'
 import type { Store } from './Store.js'
 import type { Command, EngineID } from './CommonTypes.js'
-import { Disk, diskMountRoot, appDataRoot } from './Disk.js'
+import { Disk, diskMountRoot, appDataRoot, joinMountRoot } from './Disk.js'
 import { log, uuid } from '../utils/utils.js'
 import { UpdateAppError } from './UpdateAppPolicy.js'
 import type { UpdateProgress, FetchPaused } from './UpdateApp.js'
@@ -100,7 +100,7 @@ export const fetchBundle = async (req: FetchRequest, d: FetchTargetDeps): Promis
         if (!RE_TOKEN.test(t)) throw new UpdateAppError('TRANSFER_FAILED', `cannot ask for a Fetch with the token '${t}'`)
     }
     const root = await d.mountRoot(req.targetDisk)
-    const dir = path.join(root, 'apps', req.newAppId)
+    const dir = joinMountRoot(root, 'apps', req.newAppId)
     if (await fs.pathExists(dir)) {
         if (await fs.pathExists(path.join(dir, FETCHED_MARKER)) && await d.verifySums(dir)) return dir
         if (await fs.pathExists(path.join(dir, FETCHING_MARKER))) await setFetchAside(dir, d.now())
@@ -175,7 +175,7 @@ export const pushAppBundle = async (store: Store, localEngineId: string, req: Pu
     }
     const disk = store.diskDB?.[req.sourceDiskId as any] as Disk | undefined
     if (!disk || String(disk.dockedTo) !== localEngineId || !disk.device) return answer({ ok: false, why: `source disk ${req.sourceDiskId} is not docked to Engine ${localEngineId}` })
-    const src = path.join(await d.mountRoot(disk), 'apps', req.appId)
+    const src = joinMountRoot(await d.mountRoot(disk), 'apps', req.appId)
     if (!await fs.pathExists(path.join(src, 'compose.yaml')) || !await fs.pathExists(path.join(src, 'SHA256SUMS'))) return answer({ ok: false, why: `${req.appId} on ${req.sourceDiskId} has no compose.yaml or SHA256SUMS` })
     if ((await fs.readdir(src)).some(n => n.startsWith('.idea-'))) return answer({ ok: false, why: `${src} holds bundle-root .idea-* files; not pushing them` })
     const host = await d.address(req.targetEngineId)

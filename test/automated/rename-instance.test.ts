@@ -111,6 +111,12 @@ describe('renameInstance (agent-engine-dev#220)', () => {
         expect(validateNewInstanceName('  Kolibri  Demo ')).toBe('Kolibri  Demo')
     })
 
+    it('default instanceRoot uses diskPath so the system disk is /instances/<id> (idea#424)', async () => {
+        const src = await fs.readFile(path.join(process.cwd(), 'src/data/RenameInstance.ts'), 'utf8')
+        expect(src).toMatch(/diskPath\(disk as any, 'instances', String\(id\)\)/)
+        expect(src).not.toMatch(/path\.join\(await diskMountRoot/)
+    })
+
     it('is a registered engine command with a variadic name, and advertised as a capability', () => {
         const c = commands.find(x => x.name === 'renameInstance')!
         expect(c.scope).toBe('engine')

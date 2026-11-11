@@ -19,7 +19,7 @@ import type { InstanceID, InstanceName } from './CommonTypes.js'
 import { lookupLocalInstanceArg } from './InstanceArg.js'
 import { MAX_INSTANCE_NAME_LENGTH } from './InstallApp.js'
 import { setComposeInstanceName } from './InstanceCopy.js'
-import { diskMountRoot } from './Disk.js'
+import { diskPath } from './Disk.js'
 import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
 import { log } from '../utils/utils.js'
 
@@ -45,7 +45,7 @@ const defaultDeps: RenameDeps = {
     instanceRoot: async (store, id) => {
         const inst = store.instanceDB[id]
         const disk = store.diskDB[inst.storedOn!]
-        return path.join(await diskMountRoot(disk as any), 'instances', String(id))
+        return diskPath(disk as any, 'instances', String(id))
     },
 }
 
