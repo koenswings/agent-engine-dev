@@ -86,6 +86,18 @@ describe('day files', () => {
         expect(writeDayFile(dayFile({ hookStatus: 'no-hook', name: 'later' }), tmp).written).toBe(true)
         expect(readDayFile('2026-11-12', 'kolibri-1', tmp)?.hookStatus).toBe('no-hook')
     })
+    it('does not overwrite an ok file with another ok when overwriteOk is false', () => {
+        writeDayFile(dayFile({ collectedAt: 'first' }), tmp)
+        const r = writeDayFile(dayFile({ collectedAt: 'second', hookStatus: 'ok' }), tmp, { overwriteOk: false })
+        expect(r).toEqual({ written: false, reason: 'keep-good' })
+        expect(readDayFile('2026-11-12', 'kolibri-1', tmp)?.collectedAt).toBe('first')
+    })
+    it('still lets a later ok replace a stub when overwriteOk is false', () => {
+        writeDayFile(dayFile({ hookStatus: 'no-hook', collectedAt: 'stub' }), tmp)
+        expect(writeDayFile(dayFile({ hookStatus: 'ok', collectedAt: 'later' }), tmp, { overwriteOk: false }).written).toBe(true)
+        expect(readDayFile('2026-11-12', 'kolibri-1', tmp)?.collectedAt).toBe('later')
+        expect(readDayFile('2026-11-12', 'kolibri-1', tmp)?.hookStatus).toBe('ok')
+    })
     it('refuses an oversized day file', () => {
         const huge = dayFile({ notes: 'x'.repeat(300_000) })
         expect(writeDayFile(huge, tmp)).toEqual({ written: false, reason: 'oversize' })

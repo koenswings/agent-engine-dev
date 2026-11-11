@@ -67,10 +67,10 @@ export function warnIfTooManyDayDirs(root = usageRoot()): void {
 
 export type WriteDayResult = { written: boolean; reason?: string }
 
-export function writeDayFile(record: DayFile, root = usageRoot()): WriteDayResult {
+export function writeDayFile(record: DayFile, root = usageRoot(), opts?: { overwriteOk?: boolean }): WriteDayResult {
     const dest = dayFile(record.day, record.instance, root)
     const existing = readDayFile(record.day, record.instance, root)
-    if (existing?.hookStatus === 'ok' && record.hookStatus !== 'ok') {
+    if (existing?.hookStatus === 'ok' && (record.hookStatus !== 'ok' || opts?.overwriteOk === false)) {
         return { written: false, reason: 'keep-good' }
     }
     const text = `${JSON.stringify(record)}\n`

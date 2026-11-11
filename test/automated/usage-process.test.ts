@@ -8,8 +8,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { writeUsageMonitoring } from '../../src/usage/settings.js'
 import { processTick, catchUpDays, type TickState } from '../../src/usage/scheduler.js'
-import { inNightWindow, kitLocalDay, addDays } from '../../src/usage/paths.js'
-import { hasGoodDayFile, writeDayFile } from '../../src/usage/store.js'
+import { inNightWindow, kitLocalDay, addDays, instanceExistedOnDay } from '../../src/usage/paths.js'
+import { hasGoodDayFile, readDayFile, writeDayFile } from '../../src/usage/store.js'
 import { collectPresence } from '../../src/usage/sampler.js'
 import type { DayFile, ListedTarget } from '../../src/usage/types.js'
 
@@ -32,6 +32,7 @@ const target: ListedTarget = {
     listed: true,
     cwd: '/instances/kolibri-1',
     hook: { service: 'kolibri', command: ['/hooks/usage.sh'], timeoutS: 30 },
+    createdAt: new Date(2026, 0, 1, 0, 0, 0).toISOString(),
 }
 
 const okBody = (day: string) => JSON.stringify({
@@ -82,6 +83,15 @@ describe('scheduler helpers', () => {
         expect(missing).not.toContain('2026-11-12')
         expect(missing).not.toContain('2026-11-05')
         expect(missing).toHaveLength(12)
+    })
+    it('instanceExistedOnDay compares kit-local calendar days and rejects unknown times', () => {
+        const created = new Date(2026, 10, 11, 2, 5, 0)
+        expect(instanceExistedOnDay(created, '2026-11-11')).toBe(true)
+        expect(instanceExistedOnDay(created, '2026-11-10')).toBe(false)
+        expect(instanceExistedOnDay(created.toISOString(), '2026-11-11')).toBe(true)
+        expect(instanceExistedOnDay(undefined, '2026-11-11')).toBe(false)
+        expect(instanceExistedOnDay('not-a-date', '2026-11-11')).toBe(false)
+        expect(instanceExistedOnDay(created, 'not-a-day')).toBe(false)
     })
 })
 
@@ -151,6 +161,95 @@ describe('processTick', () => {
             },
         })
         expect(asked).not.toContain(yesterday)
+        expect(readDayFile(yesterday, 'kolibri-1', tmp)?.collectedAt).toBe('x')
+        expect(readDayFile(yesterday, 'kolibri-1', tmp)?.hookStatus).toBe('ok')
+    })
+    it('does not write past days for an instance created today', async () => {
+        writeUsageMonitoring('on', tmp)
+        const newborn: ListedTarget = {
+            ...target,
+            instanceId: 'usage-dashboard-new',
+            name: 'usage-dashboard',
+            app: 'usage-dashboard',
+            createdAt: new Date(2026, 10, 11, 2, 5, 0).toISOString(),
+        }
+        const asked: string[] = []
+        await processTick({}, {
+            root: tmp, runDir: runTmp,
+            now: () => new Date(2026, 10, 11, 2, 10),
+            hostname: () => 'idea03',
+            listTargets: () => [newborn],
+            readTempC: () => 40,
+            collectPresence: { engineUp: () => true, listInstancesUp: () => [], readTempC: () => 40, readThrottled: () => '0x0', readBootId: () => 'b', readUptimeS: () => 1, readNtpSynced: () => true },
+            execHook: async spec => {
+                if (spec.mode === 'sample') {
+                    return { stdout: JSON.stringify({ schema: 'idea-usage-sample/1', app: 'usage-dashboard', supported: false }), stderr: '', exitCode: 0, timedOut: false }
+                }
+                asked.push(spec.day ?? '')
+                return { stdout: okBody(spec.day ?? ''), stderr: '', exitCode: 0, timedOut: false }
+            },
+        })
+        expect(asked).toEqual([])
+        expect(listWritten(tmp).filter(p => p.endsWith('usage-dashboard-new.json'))).toEqual([])
+    })
+    it('catch-up writes a past day only from the instance creation day onward', async () => {
+        writeUsageMonitoring('on', tmp)
+        const mid: ListedTarget = {
+            ...target,
+            instanceId: 'kolibri-mid',
+            createdAt: new Date(2026, 10, 8, 15, 0, 0).toISOString(),
+        }
+        const asked: string[] = []
+        await processTick({}, {
+            root: tmp, runDir: runTmp,
+            now: () => new Date(2026, 10, 11, 2, 10),
+            hostname: () => 'idea03',
+            listTargets: () => [mid],
+            readTempC: () => 40,
+            collectPresence: { engineUp: () => true, listInstancesUp: () => [], readTempC: () => 40, readThrottled: () => '0x0', readBootId: () => 'b', readUptimeS: () => 1, readNtpSynced: () => true },
+            execHook: async spec => {
+                if (spec.mode === 'sample') {
+                    return { stdout: JSON.stringify({ schema: 'idea-usage-sample/1', app: 'kolibri', supported: false }), stderr: '', exitCode: 0, timedOut: false }
+                }
+                asked.push(spec.day ?? '')
+                return { stdout: okBody(spec.day ?? ''), stderr: '', exitCode: 0, timedOut: false }
+            },
+        })
+        expect(asked[0]).toBe('2026-11-08')
+        expect(asked).toEqual(['2026-11-08', '2026-11-09', '2026-11-10'])
+        expect(hasGoodDayFile('2026-11-08', 'kolibri-mid', tmp)).toBe(true)
+        expect(hasGoodDayFile('2026-11-07', 'kolibri-mid', tmp)).toBe(false)
+        expect(fs.existsSync(path.join(tmp, '2026-11-07', 'kolibri-mid.json'))).toBe(false)
+    })
+    it('does not invent a past day when creation time is unknown', async () => {
+        writeUsageMonitoring('on', tmp)
+        const unknown: ListedTarget = {
+            kind: 'listed',
+            instanceId: 'unknown-1',
+            name: 'Unknown',
+            app: 'kolibri',
+            listed: true,
+            cwd: '/no/such/instance',
+            hook: target.hook,
+        }
+        const asked: string[] = []
+        await processTick({}, {
+            root: tmp, runDir: runTmp,
+            now: () => new Date(2026, 10, 11, 2, 10),
+            hostname: () => 'idea03',
+            listTargets: () => [unknown],
+            readTempC: () => 40,
+            collectPresence: { engineUp: () => true, listInstancesUp: () => [], readTempC: () => 40, readThrottled: () => '0x0', readBootId: () => 'b', readUptimeS: () => 1, readNtpSynced: () => true },
+            execHook: async spec => {
+                if (spec.mode === 'sample') {
+                    return { stdout: JSON.stringify({ schema: 'idea-usage-sample/1', app: 'kolibri', supported: false }), stderr: '', exitCode: 0, timedOut: false }
+                }
+                asked.push(spec.day ?? '')
+                return { stdout: okBody(spec.day ?? ''), stderr: '', exitCode: 0, timedOut: false }
+            },
+        })
+        expect(asked).toEqual([])
+        expect(listWritten(tmp).filter(p => p.endsWith('unknown-1.json'))).toEqual([])
     })
     it('writeUsageMonitoring only touches settings.json — no pm2 or compose restart path', () => {
         writeUsageMonitoring('off', tmp)

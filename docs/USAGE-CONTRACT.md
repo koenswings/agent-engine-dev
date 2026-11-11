@@ -182,7 +182,9 @@ The runner is global one-at-a-time (one hook in flight on the Pi). Fail open: th
 
 - **`sample`:** every 15 minutes, for every listed or unlisted target whose hook does not report `supported: false`. This is the Nextcloud Office token snapshot.
 - **`day`:** once per night by default, in the window 02:00–03:30 in the **kit’s local timezone**, and not within 30 minutes of the 05:00 reboot. The date argument is the calendar day just finished (so at 02:10 on 2026-11-13 the runner asks for `day 2026-11-12`) plus any catch-up dates.
-- **Catch-up:** a past `YYYY-MM-DD` is allowed and required. After a power-off, on process start and each night, the runner requests any missing day in the last 14 days (oldest first) that has no good stored file. Kolibri and Nextcloud keep durable logs; Kiwix only has the rolled access log (14 days).
+- **Catch-up:** a past `YYYY-MM-DD` is allowed and required. After a power-off, on process start and each night, the runner requests any missing day in the last 14 days (oldest first) that has no good stored file *for that instance*. The window is `today-14` through yesterday inclusive (on 2026-11-11 the oldest catch-up day is 2026-10-28; 2026-10-26 and 2026-10-27 are outside the window). Kolibri and Nextcloud keep durable logs; Kiwix only has the rolled access log (14 days).
+- **Catch-up existence:** a past day is written for an instance only when that instance provably existed on that day: its creation time is on or before the end of that kit-local day (the kit-local calendar date of `createdAt` is `<=` the requested day). Creation time is the instance directory’s birth time for a listed instance (the directory created by `installApp` or restore), or the container’s Docker `Created` timestamp for an unlisted container. If creation time cannot be determined, the instance is not written onto a past day. Catch-up must not copy the current instance inventory onto dates before those instances existed; it writes nothing for that instance and day rather than a stub.
+- **Catch-up overwrite:** catch-up never overwrites an existing file whose `hookStatus` is `ok`, not even with another `ok` result. A stub may still be replaced by a later `ok` or by another stub (§5.5 / §5.7).
 - Dates are kit-local calendar dates (`YYYY-MM-DD`). The Engine does not rewrite hook timestamps. Kolibri timestamps from before NTP sync cannot be corrected inside the hook.
 
 ### 4.5 Skip conditions
@@ -365,7 +367,7 @@ Printed every 15 minutes. Nextcloud reads current WOPI token rows (no usernames:
 
 Path: `/var/lib/idea/usage/<day>/<instanceId>.json`.
 
-The Engine writes this file after a successful schema check (`hookStatus: ok`), or as a no-payload stub (§5.7). A non-`ok` result never overwrites a file whose `hookStatus` is `ok`; a later `ok` result replaces a stub.
+The Engine writes this file after a successful schema check (`hookStatus: ok`), or as a no-payload stub (§5.7). A non-`ok` result never overwrites a file whose `hookStatus` is `ok`; a later `ok` result replaces a stub. During catch-up, an existing `ok` file is left untouched (not rewritten by another `ok` result either).
 
 The stored object is the hook body plus the Engine envelope:
 
@@ -422,7 +424,7 @@ Sources: `/proc/sys/kernel/random/boot_id`, `/proc/uptime`, `timedatectl show --
 
 ### 5.7 Stub rows (`timeout`, `failed`, `invalid`, `skipped`, `unlisted-no-hook`, `no-hook`)
 
-A hook run whose status is not `ok` writes a **no-payload** stub day file (identity and honesty fields only: `schema`, `engine`, `day`, `app`, `instance`, `name`, `demo`, `listed`, `clock`, `collectedAt`, `hookStatus`, and `skipReason` when `hookStatus` is `skipped`). This happens only when no `ok` file already exists for that `instance` and `day`. A stub never overwrites an `ok` file; a later `ok` result replaces the stub. One stub may replace another (for example `failed` then `skipped`).
+A hook run whose status is not `ok` writes a **no-payload** stub day file (identity and honesty fields only: `schema`, `engine`, `day`, `app`, `instance`, `name`, `demo`, `listed`, `clock`, `collectedAt`, `hookStatus`, and `skipReason` when `hookStatus` is `skipped`). This happens only when no `ok` file already exists for that `instance` and `day`, and (during catch-up) only when the instance existed on that day (§4.4). A stub never overwrites an `ok` file; a later `ok` result replaces the stub. One stub may replace another (for example `failed` then `skipped`). Catch-up does not invent a stub for an instance on a date before that instance existed.
 
 When `hookStatus` is `skipped`, `skipReason` is one of `backup`, `update`, `move` or `temperature`.
 
