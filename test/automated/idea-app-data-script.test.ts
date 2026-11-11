@@ -734,12 +734,12 @@ describe('idea-app-data: borg', () => {
         const src = path.join(app, 'instances', 'inst1')
         await fs.ensureDir(repo)
         await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
-        expect((await sb.run(['borg-create', 'sdc1', 'inst1', ARCHIVE, 'sdb1', 'keys', 'data/tailscale', 'tailscale-run'])).exitCode).toBe(0)
+        expect((await sb.run(['borg-create', 'sdc1', 'inst1', ARCHIVE, 'sdb1', 'keys', 'data/tailscale', 'tailscale-run', 'data/backup/daily'])).exitCode).toBe(0)
         const calls = await sb.calls('borg')
         expect(calls).toHaveLength(1)
         const snapshot = path.join(sb.tmp, 'calls', 'borg.patterns')
         expect(await fs.readFile(snapshot, 'utf8')).toBe(
-            `- pp:${src}/data/keys\n- pp:${src}/data/tailscale\n- pp:${src}/data/tailscale-run\n`,
+            `- pp:${src}/data/keys\n- pp:${src}/data/tailscale\n- pp:${src}/data/tailscale-run\n- pp:${src}/data/backup/daily\n`,
         )
         const patIdx = calls[0].argv.indexOf('--patterns-from')
         expect(patIdx).toBe(2)

@@ -29,6 +29,11 @@ describe('normalizeBackupExclude / parseBackupExcludeList', () => {
         expect(normalizeBackupExclude('data/keys/')).toBe('data/keys')
         expect(normalizeBackupExclude('data')).toBe('data')
         expect(normalizeBackupExclude('data/kolibri/content')).toBe('data/kolibri/content')
+        expect(normalizeBackupExclude('data/backup/daily')).toBe('data/backup/daily')
+        expect(normalizeBackupExclude('data/backup/daily/')).toBe('data/backup/daily')
+        expect(normalizeBackupExclude('./data/backup/daily')).toBe('data/backup/daily')
+        // a slash already present is not prefixed, so write data/backup/daily not backup/daily
+        expect(normalizeBackupExclude('backup/daily')).toBe('backup/daily')
         expect(normalizeBackupExclude('.env')).toBe('.env')
     })
 

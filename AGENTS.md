@@ -72,6 +72,9 @@ live Engine (idea#105):
   `skipImageLoad = false` and `pull_policy: never` (a missing tar is only a History
   warning, so its no-tar case ends in Error from `compose create`, idea#109). It needs `traefik/whoami` cached
   locally (it pulls it once in setup if missing) and only removes its own nonce tags.
+- `test/automated/image-digest-pins.test.ts` (idea#322, idea#445) covers digest-pin
+  parse/save/verify, skip-if-present vs stale-tar fail, `index.json` top-level digest
+  (wrapper index vs platform manifest vs image index), and quarantine-never-delete.
 - Pre-flight (`script/test-preflight.sh`) refuses to run (exit 1) when it finds a live
   Engine: pm2 `engine` online (or a `node …/dist/src/index.js` process), running
   containers without the test label, `/instances/*`, or App Disks under `/disks`
@@ -153,8 +156,13 @@ settings:
 `testMode`: testMode only skips the mount, the offline image load follows
 `skipImageLoad()` in `src/data/Config.ts`. Production leaves both unset/false, so
 Engines load every service image from the App Disk's `services/` folder
-(`serviceImageTarPath()`: `/` in the image name → `_`). A missing tar or failed load
-is a warning, not a failure: compose then pulls the image if the Pi has internet (idea#109).
+(`serviceImageTarPath()`: `/` in the image name → `_`; a digest pin uses the `repo:tag`
+file). A missing tar or failed load of an unpinned image is a warning, not a failure:
+compose then pulls the image if the Pi has internet (idea#109). A digest-pinned image
+is verified as `repo@digest` (idea#445). If that pin is already local, the load is
+skipped and `repo:tag` is retagged onto it. Otherwise the tar's `index.json` is
+checked against the pin before any `docker image load`; a mismatch is quarantined
+(never deleted) and start fails unless the pin was already local.
 
 `skipMetaWrite` (env override `IDEA_SKIP_META_WRITE=true|false`) works the same way
 for the META.yaml written on the first dock of a disk that has none (idea#121,
