@@ -140,7 +140,7 @@ Tailscale latent remote-access is **installed and ready** on all three fleet nod
 ssh pi@idea01.local
 sudo /usr/local/bin/tailscale-debug-activate.sh
 ```
-The script checks internet connectivity, joins the IDEA Tailnet (ephemeral), and prints the Tailscale IP. Press Enter when done — Pi leaves the Tailnet automatically.
+The script checks internet connectivity, joins the IDEA Tailnet with `--advertise-tags=tag:idea` (not `--ephemeral`: an ephemeral node vanishes after it has been offline, and the D-2 key is non-ephemeral), and prints the Tailscale IP. Press Enter when done — the script runs `tailscale down` and stops tailscaled; the node stays registered.
 
 **Fresh Pi provisioning:** `buildEngine` now calls `installTailscale()` automatically. Auth key is read from `TAILSCALE_AUTHKEY` env var or `/home/pi/openclaw/secrets/tailscale_authkey.txt` on wizardly-hugle.
 
@@ -158,7 +158,7 @@ The script checks internet connectivity, joins the IDEA Tailnet (ephemeral), and
 
 **Current state (not yet the target design).**
 - The routers already enrol with `--advertise-tags=tag:idea` and no `--ephemeral` (`tools/router-image/idea-router-enrol` in koenswings/idea). The kit Engines' nodes carry `tag:idea` and stay registered while offline.
-- The Engine code still uses the older latent-debug model: `tailscale-debug-activate.sh` joins with `--ephemeral --advertise-tags=tag:idea` during an intervention. Moving the Engine to always-on is an open decision for Koen in [idea#117](https://github.com/koenswings/idea/issues/117). Don't change it until that decision is made.
+- The Engine still uses the latent-debug activate script during an intervention (`tailscale-debug-activate.sh` starts tailscaled, joins, then `tailscale down`). It joins with `--advertise-tags=tag:idea` and no `--ephemeral` (an ephemeral node vanishes after it has been offline, and the D-2 key is non-ephemeral; idea#117 D-2 option 3). Always-on first-boot join remains [engine#291](https://github.com/koenswings/agent-engine-dev/pull/291).
 - The fleet Pis (idea01–idea04) and the ops box are untagged members of the tailnet.
 
 **Not yet confirmed (idea#117 audit, 2026-10-29).** The fleet key's expiry, whether it is reusable or ephemeral, whether it carries `tag:idea`, and what the ACL allows `tag:idea` to reach have not been checked in the admin console. Treat any expiry date or the "at most 90 days" limit as unverified until Koen's console read (idea#375) is recorded on idea#117. Don't revoke the current key ("idea fleet authentication"): Koen is keeping it.
