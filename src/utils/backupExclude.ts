@@ -4,7 +4,10 @@
  * Paths are relative to the instance folder (the borg source). A path with no
  * slash, other than `data` itself, is treated as `data/<name>`, so the
  * usage-dashboard list (`keys`, `tailscale`, `tailscale-run`) excludes
- * `./data/keys` and friends rather than a top-level `keys` folder.
+ * `./data/keys` and friends rather than a top-level `keys` folder. A path that
+ * already contains a slash (for example `data/backup/daily`) is instance-relative
+ * and is not auto-prefixed; multi-segment directory paths are allowed and become
+ * borg path-prefix excludes (the directory and everything under it).
  *
  * `hookExclude` (idea#444) uses the same path rules. It is applied only when a
  * preHook succeeded (live files the dump replaces). On HOOK_FALLBACK / method

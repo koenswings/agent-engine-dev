@@ -158,6 +158,18 @@ describe('parseBackupHookExcludeList', () => {
         expect(() => parseBackupHookExcludeList({ backup: { hookExclude: 'keys' } })).toThrow(/must be a list/)
         expect(parseBackupHookExcludeList({ backup: { hookExclude: ['keys'] } })).toEqual(['data/keys'])
     })
+
+    it('accepts a multi-segment directory path such as data/backup/daily on both lists', () => {
+        expect(parseBackupExcludeList({
+            backup: { exclude: ['keys', 'data/backup/daily'], hookExclude: ['usage.sqlite'] },
+        })).toEqual(['data/keys', 'data/backup/daily'])
+        expect(parseBackupHookExcludeList({
+            backup: { exclude: ['keys'], hookExclude: ['data/backup/daily', 'usage.sqlite'] },
+        })).toEqual(['data/backup/daily', 'data/usage.sqlite'])
+        expect(parseBackupExcludeList({
+            backup: { exclude: ['./data/backup/daily/'] },
+        })).toEqual(['data/backup/daily'])
+    })
 })
 
 const INST = 'inst-hook-1' as InstanceID
@@ -226,7 +238,7 @@ describe('backupInstance method hook (idea#444)', () => {
         method: 'hook',
         preHook: { service: 'collector', command: '/app/scripts/backup-snapshot.sh' },
         postHook: { service: 'collector', command: '/app/scripts/backup-snapshot-cleanup.sh' },
-        exclude: ['keys', 'tailscale', 'tailscale-run'],
+        exclude: ['keys', 'tailscale', 'tailscale-run', 'data/backup/daily'],
         hookExclude: ['usage.sqlite', 'usage.sqlite-wal', 'usage.sqlite-shm'],
         ...extra,
     })
@@ -326,7 +338,7 @@ describe('backupInstance method hook (idea#444)', () => {
         const log = await calls()
         const create = log.find(l => l.startsWith('borg-create '))
         expect(create).toMatch(new RegExp(
-            `^borg-create ${backupDevice} ${INST} \\d{4}-\\d{2}-\\d{2}T[0-9-]+Z ${appDevice} data/keys data/tailscale data/tailscale-run data/usage\\.sqlite data/usage\\.sqlite-wal data/usage\\.sqlite-shm$`,
+            `^borg-create ${backupDevice} ${INST} \\d{4}-\\d{2}-\\d{2}T[0-9-]+Z ${appDevice} data/keys data/tailscale data/tailscale-run data/backup/daily data/usage\\.sqlite data/usage\\.sqlite-wal data/usage\\.sqlite-shm$`,
         ))
         const createIdx = log.findIndex(l => l.startsWith('borg-create '))
         expect(createIdx).toBeGreaterThanOrEqual(0)
@@ -375,7 +387,7 @@ describe('backupInstance method hook (idea#444)', () => {
         expect(hookCalls.map(c => c.which)).toEqual(['preHook', 'postHook'])
         const create = (await calls()).find(l => l.startsWith('borg-create '))
         expect(create).toBeTruthy()
-        expect(create).toMatch(new RegExp(` data/keys data/tailscale data/tailscale-run$`))
+        expect(create).toMatch(new RegExp(` data/keys data/tailscale data/tailscale-run data/backup/daily$`))
         expect(create).not.toMatch(/usage\.sqlite/)
     })
 
@@ -387,6 +399,7 @@ describe('backupInstance method hook (idea#444)', () => {
         expect(create).toContain(' data/keys ')
         expect(create).toContain(' data/tailscale ')
         expect(create).toContain(' data/tailscale-run ')
+        expect(create).toContain(' data/backup/daily ')
         expect(create).toContain(' data/usage.sqlite ')
         expect(create).toContain(' data/usage.sqlite-wal ')
         expect(create).toMatch(/data\/usage\.sqlite-shm$/)
