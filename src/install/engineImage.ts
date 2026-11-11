@@ -2,7 +2,8 @@
  * engineImage.ts: the offline Engine image builder's pure parts (idea#322, Option A).
  *
  * `build-engine --rootfs <dir>` installs the Engine into a mounted Raspberry Pi OS
- * Lite (arm64) root filesystem from a chroot on an arm64 host. Nothing is started at
+ * Lite (arm64) root filesystem from a chroot on an arm64 host, or on another arch with
+ * qemu-user-static binfmt (as idea tools/engine-image/build.sh documents). Nothing is started at
  * build time, services are only enabled, and the image carries no device identity.
  * This module holds what can be tested without a chroot: argument parsing, the
  * Engine lock (engine.lock.json), the sanitise list, the verify checks and the
@@ -27,7 +28,7 @@ export interface ImageArgs {
     images: string[]
     /** pm2 environment the first boot starts the Engine with */
     pm2Env: 'production' | 'development'
-    /** Skip the arm64 host check (tests / dry runs only) */
+    /** Skip the arm64/qemu host check (tests / dry runs only) */
     dryRun: boolean
     /** Mounted boot partition (default <rootfs>/boot/firmware) */
     boot?: string
@@ -41,6 +42,19 @@ export interface ImageArgs {
 const LIVE_ONLY = ['m', 'machine', 'u', 'user', 'hostname', 'personalize', 'peer']
 
 export const IMAGE_DIGEST_RE = /^[a-z0-9][a-z0-9._\/-]*(:[A-Za-z0-9._-]+)?@sha256:[0-9a-f]{64}$/
+
+/** Path idea build.sh copies into the chroot when the host is not aarch64. */
+export const QEMU_AARCH64_STATIC = '/usr/bin/qemu-aarch64-static'
+
+/**
+ * A real --root build needs an arm64 host, or qemu-user-static on the host
+ * (idea tools/engine-image/build.sh: "arm64 host or qemu-user-static binfmt").
+ * Returns an error message, or undefined if the host is acceptable.
+ */
+export const rootfsHostProblem = (arch: string, qemuStaticPresent: boolean): string | undefined => {
+    if (arch === 'arm64' || qemuStaticPresent) return undefined
+    return `--root builds run on an arm64 host (this is ${arch}); install qemu-user-static or use --dry-run elsewhere`
+}
 
 /**
  * Image modes: --rootfs <dir> (build), --verify-rootfs <dir> (check only),

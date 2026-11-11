@@ -13,7 +13,8 @@ The Engine side of the idea repo's Engine image builder (`tools/engine-image/bui
   checkout's own dev dependencies (`pnpm install --frozen-lockfile`) when missing, then runs
   `tsx script/build-engine.ts --root ...`. The host needs node 22 + pnpm.
 - `<MNT>`: the mounted root of the image, with /dev /dev/pts /proc /sys /run bind-mounted, /etc/resolv.conf working
-  and the boot partition at `<MNT>/boot/firmware`. The host is arm64 and the command runs as root
+  and the boot partition at `<MNT>/boot/firmware`. The host is arm64, or another arch with `/usr/bin/qemu-aarch64-static`
+  (idea `build.sh` already copies that into the chroot). The command runs as root
   (`--dry-run` lifts both checks and runs nothing).
 - `--cache`: `script/archive-engine-inputs.sh <commit> <dir> [image ...]` output. Without it the inputs are fetched
   into a temp dir first with that script (network; every input checksummed).

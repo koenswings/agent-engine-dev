@@ -1,7 +1,7 @@
 /**
  * engineRootfs.ts: build-engine --rootfs, the chroot orchestration (idea#322, Option A).
  *
- * Runs on an arm64 host as root. The caller (idea release.sh --type engine) has
+ * Runs on an arm64 host as root, or on another arch with qemu-user-static binfmt. The caller (idea release.sh --type engine) has
  * mounted the image's root partition at <rootfs>, its boot partition at
  * <rootfs>/boot/firmware, bind-mounted /dev /dev/pts /proc /sys /run and provided
  * /etc/resolv.conf. This module never mounts, never uses SSH and starts nothing:

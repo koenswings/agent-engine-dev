@@ -113,7 +113,7 @@ const main = async () => {
         console.log(`  --personalize           only set the hostname and add meta information without building the engine`)
         console.log(``)
         console.log(`Image modes (idea#322; no SSH, nothing started, no device identity; exit 0 ok / 1 failed / 2 usage):`)
-        console.log(`  --root <dir>            build into the mounted root fs <dir> (arm64 host, root); alias --rootfs`)
+        console.log(`  --root <dir>            build into the mounted root fs <dir> (arm64 host or qemu-user-static, root); alias --rootfs`)
         console.log(`  --boot <dir>            its mounted boot partition (default <root>/boot/firmware)`)
         console.log(`  --console-repo <path>   agent-console-dev checkout to bake in (default: sibling or $IDEA_CONSOLE_REPO)`)
         console.log(`  --report <file>         write engine-build.json (commit, version, lock sha256, verify result)`)

@@ -10,7 +10,7 @@ import crypto from 'crypto'
 import {
     parseImageArgs, UsageError, validateLock, serialiseLock, writeLock, readLock, LOCK_SCHEMA, EngineLock,
     sanitiseRootfs, verifyRootfs, IDENTITY_PATHS, GENERIC_HOSTNAME, IMAGE_ENABLED_UNITS, PM2_UNIT, SSH_REGEN_UNIT, SSH_HOSTKEYS_UNIT,
-    pm2UnitText, sshHostKeysUnitText, sshHostKeyUnitIsUnconditional, DEFAULT_CONSOLE_PATH, preloadManifest, imageIdFromManifest, imageTarName, readDpkgStatus, unitEnabled, unitLinks, unitInstallTargets, verifyRootfsChecks, VERIFY_CHECKS, IMAGE_SPARSE_PATTERNS, filesWithAuthKeyShape, PRELOAD_DOCKER_DIR, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH,
+    pm2UnitText, sshHostKeysUnitText, sshHostKeyUnitIsUnconditional, DEFAULT_CONSOLE_PATH, preloadManifest, imageIdFromManifest, imageTarName, readDpkgStatus, unitEnabled, unitLinks, unitInstallTargets, verifyRootfsChecks, VERIFY_CHECKS, IMAGE_SPARSE_PATTERNS, filesWithAuthKeyShape, PRELOAD_DOCKER_DIR, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH, rootfsHostProblem,
 } from '../../src/install/engineImage.js'
 import { rootfsSteps, runRootfsBuild, engineCloneCommand, consoleCloneCommand, Runner, Installers, SHIMS, quoteTemplate } from '../../src/install/engineRootfs.js'
 import { pinNpmTools, writeReport } from '../../src/install/engineImageCli.js'
@@ -47,7 +47,15 @@ describe('parseImageArgs', () => {
         expect(parseImageArgs({ root: '/mnt/r', 'console-repo': '/src/agent-console-dev' })!.consoleRepo).toBe('/src/agent-console-dev')
         expect(() => parseImageArgs({ root: '/mnt/r', 'console-repo': 'relative' })).toThrow(/absolute/)
     })
+    it('a real --root build allows arm64, or another arch with qemu-user-static', () => {
+        expect(rootfsHostProblem('arm64', false)).toBeUndefined()
+        expect(rootfsHostProblem('arm64', true)).toBeUndefined()
+        expect(rootfsHostProblem('x64', true)).toBeUndefined()
+        expect(rootfsHostProblem('x64', false)).toMatch(/qemu-user-static/)
+        expect(rootfsHostProblem('x64', false)).toMatch(/x64/)
+    })
     it('refuses device or remote options with a UsageError', () => {
+
         for (const bad of [{ m: 'x' }, { u: 'pi' }, { hostname: 'h' }, { personalize: true }, { peer: 'p' }])
             expect(() => parseImageArgs({ root: '/mnt/r', ...bad })).toThrow(UsageError)
     })
