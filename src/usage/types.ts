@@ -27,6 +27,8 @@ export interface ListedTarget {
     listed: true
     cwd: string
     hook: UsageHookDecl | null
+    /** ISO-8601 creation time (instance directory birth). */
+    createdAt?: string
 }
 
 export interface UnlistedTarget {
@@ -39,6 +41,8 @@ export interface UnlistedTarget {
     containerId: string
     hook: UsageHookDecl | null
     hookScript?: string
+    /** ISO-8601 creation time (container Created). */
+    createdAt?: string
 }
 
 export type UsageTarget = ListedTarget | UnlistedTarget
@@ -102,6 +106,8 @@ export interface DockerContainer {
     project?: string
     service?: string
     workingDir?: string
+    /** ISO-8601 creation time parsed from docker ps CreatedAt. */
+    createdAt?: string
 }
 
 export interface BundleHook {

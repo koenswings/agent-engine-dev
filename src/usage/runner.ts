@@ -269,20 +269,23 @@ export async function runDayHook(opts: {
     exec?: ExecHook
     clock?: ClockDeps
     skipReason?: SkipReason | null
+    overwriteOk?: boolean
 }): Promise<DayFile> {
     const root = opts.root ?? usageRoot()
+    const writeOpts = opts.overwriteOk === false ? { overwriteOk: false } : undefined
+    const persist = (rec: DayFile) => writeDayFile(rec, root, writeOpts)
     const { collectedAt, clock, engine } = collectionClock(opts.clock, root)
     const stamp = { clock, collectedAt, engine, day: opts.day, target: opts.target }
 
     if (opts.skipReason) {
         const rec = buildDayRecord({ ...stamp, hookStatus: 'skipped', skipReason: opts.skipReason })
-        writeDayFile(rec, root)
+        persist(rec)
         return rec
     }
     if (!opts.target.hook) {
         const hookStatus = opts.target.listed ? 'no-hook' : 'unlisted-no-hook'
         const rec = buildDayRecord({ ...stamp, hookStatus })
-        writeDayFile(rec, root)
+        persist(rec)
         return rec
     }
     const argvSpec = hookArgvFor(opts.target, 'day', opts.day)
@@ -293,36 +296,36 @@ export async function runDayHook(opts: {
     } catch (e) {
         usageLog(`hook threw for ${opts.target.instanceId}: ${e instanceof Error ? e.message : String(e)}`)
         const rec = buildDayRecord({ ...stamp, hookStatus: 'failed' })
-        writeDayFile(rec, root)
+        persist(rec)
         return rec
     }
     if (result.stderr) usageLog(`hook stderr ${opts.target.instanceId}: ${result.stderr.replace(/\n/g, ' ').slice(0, STDERR_CAP)}`)
     if (result.timedOut) {
         const rec = buildDayRecord({ ...stamp, hookStatus: 'timeout' })
-        writeDayFile(rec, root)
+        persist(rec)
         return rec
     }
     if (result.oversizeStdout || result.exitCode !== 0) {
         const rec = buildDayRecord({ ...stamp, hookStatus: result.oversizeStdout ? 'invalid' : 'failed' })
-        writeDayFile(rec, root)
+        persist(rec)
         return rec
     }
     const parsed = parseHookStdout(result.stdout, DAY_FILE_CAP)
     if (!parsed.ok) {
         const rec = buildDayRecord({ ...stamp, hookStatus: 'invalid' })
-        writeDayFile(rec, root)
+        persist(rec)
         return rec
     }
     const checked = validateDayHook(parsed.value, opts.day)
     if (!checked.ok) {
         usageLog(`invalid day hook for ${opts.target.instanceId}: ${checked.error}`)
         const rec = buildDayRecord({ ...stamp, hookStatus: 'invalid' })
-        writeDayFile(rec, root)
+        persist(rec)
         return rec
     }
     let rec = buildDayRecord({ ...stamp, hookStatus: 'ok', hookBody: checked.value })
     rec = applyOfficeMerge(rec, root)
-    writeDayFile(rec, root)
+    persist(rec)
     return rec
 }
 

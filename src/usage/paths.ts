@@ -115,6 +115,15 @@ export function kitLocalDay(d: Date): string {
     return `${y}-${mo}-${day}`
 }
 
+/** True when `createdAt` falls on or before the end of kit-local `day`. Unknown or invalid → false. */
+export function instanceExistedOnDay(createdAt: string | Date | undefined | null, day: string): boolean {
+    if (createdAt == null || createdAt === '') return false
+    const d = createdAt instanceof Date ? createdAt : new Date(createdAt)
+    if (Number.isNaN(d.getTime())) return false
+    if (!isValidDate(day)) return false
+    return kitLocalDay(d) <= day
+}
+
 export function minutesOfDay(d: Date): number {
     return d.getHours() * 60 + d.getMinutes()
 }
