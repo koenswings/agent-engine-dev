@@ -28,7 +28,7 @@ import type { Store } from './Store.js'
 import type { Instance } from './Instance.js'
 import type { AppID, DiskID, InstanceID, Timestamp } from './CommonTypes.js'
 import { lookupLocalInstanceArg } from './InstanceArg.js'
-import { diskMountRoot, appDataRoot, Disk, PreUpdateSnapshot } from './Disk.js'
+import { diskMountRoot, appDataRoot, Disk, PreUpdateSnapshot, joinMountRoot } from './Disk.js'
 import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
 import {
     runAppData, snapshotArgs, restoreSnapshotArgs, snapshotsArgs, parseSnapshotResult, parseSnapshotsList,
@@ -139,8 +139,14 @@ export const defaultUpdateDeps = (storeHandle: DocHandle<Store>): UpdateDeps => 
     stop: async (inst, disk) => (await import('./Instance.js')).stopInstance(storeHandle, inst, disk),
     containerIds: async (id) => (await docker(['ps', '-q', '--filter', `label=com.docker.compose.project=${id}`])).split('\n').map(s => s.trim()).filter(Boolean),
     composeDown: async (dir, id) => {
-        if (!await fs.pathExists(path.join(dir, 'compose.yaml'))) return
-        await $({ cwd: dir })`docker compose -p ${id} down`.quiet()
+        const composeFile = path.join(dir, 'compose.yaml')
+        if (!await fs.pathExists(composeFile)) {
+            log(`updateApp: no compose.yaml at ${composeFile}; skipping compose down`)
+            return
+        }
+        // idea#424: -p and -f with the live absolute path; never cwd-only or a
+        // quarantine glob. No -v (named volumes stay).
+        await docker(['compose', '-p', String(id), '-f', composeFile, 'down'])
     },
     snapshot: async (disk, id) => parseSnapshotResult(await runAppData(snapshotArgs(await appDataRoot(disk), String(id)))),
     restoreSnapshot: async (disk, id) => lastLine(await runAppData(restoreSnapshotArgs(await appDataRoot(disk), String(id)))),
@@ -206,7 +212,7 @@ const findBundleDisk = async (store: Store, d: UpdateDeps, engineId: string, ins
     const order = sourceDiskId ? docked.filter(x => String(x.id) === sourceDiskId)
         : [...docked.filter(x => String(x.id) === String(inst.storedOn)), ...docked.filter(x => String(x.id) !== String(inst.storedOn))]
     for (const disk of order) {
-        const dir = path.join(await d.mountRoot(disk), 'apps', newAppId)
+        const dir = joinMountRoot(await d.mountRoot(disk), 'apps', newAppId)
         if (await fs.pathExists(path.join(dir, 'compose.yaml')) && !await isUnfinishedFetch(dir)) return { disk, dir }
     }
     return null
@@ -250,7 +256,7 @@ export const updateApp = async (
             bundle = { disk, dir }
         }
         const instRoot = await d.mountRoot(disk)
-        const instDir = path.join(instRoot, 'instances', String(inst.id))
+        const instDir = joinMountRoot(instRoot, 'instances', String(inst.id))
         let shortDisks: string[] = []
         let dataBytes = 0
         if (bundle && gotLock) {
@@ -297,7 +303,7 @@ export const updateApp = async (
             await refreshPreUpdateSnapshots(storeHandle, disk, d.listSnapshots)
             // ── Swap
             step = 'Swap'; setStep('Swap'); progress('Swap')
-            const targetApps = path.join(instRoot, 'apps', newAppId)
+            const targetApps = joinMountRoot(instRoot, 'apps', newAppId)
             if (bundle!.dir !== targetApps) await d.copyBundle(bundle!.dir, targetApps)
             await d.copyBundle(bundle!.dir, instDir)
             const composePath = path.join(instDir, 'compose.yaml')
@@ -403,7 +409,7 @@ export const recoverInterruptedUpdates = async (storeHandle: DocHandle<Store>, e
         const complete = snaps.some(s => String(s.instanceId) === String(inst.id) && s.complete)
         const swapped = UPDATE_STEPS.indexOf(step) >= UPDATE_STEPS.indexOf('Swap')
         if (!complete || !swapped) { out.push(`${inst.id}: interrupted at ${step}; old version untouched`); continue }
-        const err = await rollBack(storeHandle, d, inst, disk, path.join(await d.mountRoot(disk), 'instances', String(inst.id)), step, 'the Engine restarted during the update', { path: path.join(await d.mountRoot(disk), PRE_UPDATE_DIR, String(inst.id)), sizeBytes: 0 })
+        const err = await rollBack(storeHandle, d, inst, disk, joinMountRoot(await d.mountRoot(disk), 'instances', String(inst.id)), step, 'the Engine restarted during the update', { path: joinMountRoot(await d.mountRoot(disk), PRE_UPDATE_DIR, String(inst.id)), sizeBytes: 0 })
         updateOperation(storeHandle, op.id, { status: 'Failed', error: `INTERRUPTED: ${err.message}`, completedAt: d.now() as Timestamp })
         out.push(`${inst.id}: ${err.message}`)
     }
@@ -439,8 +445,8 @@ export const refreshUpdateAvailable = async (storeHandle: DocHandle<Store>, engi
     for (const disk of docked) {
         let root: string
         try { root = await d.mountRoot(disk) } catch { continue }
-        for (const appId of await d.listApps(path.join(root, 'apps')).catch(() => [] as string[])) {
-            if (sumsLookUsable(await d.readSums(path.join(root, 'apps', appId)))) bundles.push({ disk, appId })
+        for (const appId of await d.listApps(joinMountRoot(root, 'apps')).catch(() => [] as string[])) {
+            if (sumsLookUsable(await d.readSums(joinMountRoot(root, 'apps', appId)))) bundles.push({ disk, appId })
         }
     }
     const updates: Record<string, Instance['updateAvailable']> = {}
