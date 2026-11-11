@@ -32,6 +32,7 @@ const deps = (over: Partial<RemoveDeps> = {}): Partial<RemoveDeps> => ({
     removeProjectContainers: async (id) => { calls.push(`rm-project ${id}`) },
     listVolumes: async (id) => [`${id}_data`],
     quarantine: async (_d, id) => { calls.push(`quarantine ${id}`); return `/fake/.idea-quarantine/${id}-20261028T130000Z` },
+    refreshSnapshots: async () => { calls.push('refresh') },
     ...over,
 })
 const add = (id: string, name: string, disk: string, status = 'Stopped') => h.change(doc => {
@@ -54,7 +55,7 @@ describe('removeInstance', () => {
     it('downs without -v, cleans leftover project containers, quarantines, then drops the record', async () => {
         add('i1', 'kolibri', 'd1')
         const r = await removeInstance(h, 'i1', ME, deps())
-        expect(calls).toEqual(['down /fake/instances/i1', 'rm-project i1', 'quarantine i1'])
+        expect(calls).toEqual(['down /fake/instances/i1', 'rm-project i1', 'quarantine i1', 'refresh'])
         expect(r).toEqual({ instanceId: 'i1', name: 'kolibri', quarantinePath: '/fake/.idea-quarantine/i1-20261028T130000Z', keptVolumes: ['i1_data'] })
         expect(h.doc().instanceDB['i1' as any]).toBeUndefined()
     })
@@ -120,6 +121,66 @@ describe('removeInstance', () => {
         expect(disk).toMatch(/ls \$\{mountRoot\}\/apps/)
         expect(disk).toMatch(/ls \$\{mountRoot\}\/instances/)
         expect(disk).not.toMatch(/idea-quarantine/)
+    })
+    it('refreshes Disk.preUpdateSnapshots, preUpdateBytes and quarantineBytes after a successful remove (idea#428)', async () => {
+        add('i1', 'kolibri', 'd1')
+        h.change(doc => {
+            const d = doc.diskDB['d1' as any] as any
+            d.preUpdateSnapshots = [{ instanceId: 'i1', sizeBytes: 4096, complete: true }]
+            d.preUpdateBytes = 8192
+            d.quarantineBytes = 100
+        })
+        await removeInstance(h, 'i1', ME, deps({
+            refreshSnapshots: async (disk) => {
+                calls.push(`refresh ${disk.id}`)
+                h.change(doc => {
+                    const d = doc.diskDB[disk.id as any] as any
+                    d.preUpdateSnapshots = []
+                    d.preUpdateBytes = 0
+                    d.quarantineBytes = 5000
+                })
+            },
+        }))
+        expect(calls).toContain('refresh d1')
+        expect(h.doc().instanceDB['i1' as any]).toBeUndefined()
+        expect(h.doc().diskDB['d1' as any].preUpdateSnapshots).toEqual([])
+        expect(h.doc().diskDB['d1' as any].preUpdateBytes).toBe(0)
+        expect(h.doc().diskDB['d1' as any].quarantineBytes).toBe(5000)
+    })
+    it('drops the removed instance from preUpdateSnapshots even if the helper still lists its folder (idea#428)', async () => {
+        add('i1', 'kolibri', 'd1')
+        await removeInstance(h, 'i1', ME, deps({
+            refreshSnapshots: async (disk) => {
+                calls.push(`refresh ${disk.id}`)
+                h.change(doc => {
+                    const d = doc.diskDB[disk.id as any] as any
+                    d.preUpdateSnapshots = [
+                        { instanceId: 'i1', sizeBytes: 4096, complete: true },
+                        { instanceId: 'other', sizeBytes: 100, complete: true },
+                    ]
+                    d.preUpdateBytes = 4196
+                    d.quarantineBytes = 5000
+                })
+            },
+        }))
+        expect(calls).toContain('refresh d1')
+        expect(h.doc().diskDB['d1' as any].preUpdateSnapshots).toEqual([{ instanceId: 'other', sizeBytes: 100, complete: true }])
+        expect(h.doc().diskDB['d1' as any].preUpdateBytes).toBe(100)
+        expect(h.doc().diskDB['d1' as any].quarantineBytes).toBe(5000)
+    })
+    it('does not refresh snapshot info when compose down or quarantine fails (idea#428)', async () => {
+        add('i1', 'k', 'd1')
+        h.change(doc => {
+            const d = doc.diskDB['d1' as any] as any
+            d.preUpdateSnapshots = [{ instanceId: 'i1', sizeBytes: 1, complete: true }]
+            d.preUpdateBytes = 1
+            d.quarantineBytes = 1
+        })
+        expect(await codeOf(removeInstance(h, 'i1', ME, deps({ composeDown: async () => { throw new Error('boom') } })))).toBe('COMPOSE_DOWN_FAILED')
+        expect(calls.filter(c => c.startsWith('refresh'))).toEqual([])
+        expect(h.doc().diskDB['d1' as any].preUpdateSnapshots).toEqual([{ instanceId: 'i1', sizeBytes: 1, complete: true }])
+        expect(h.doc().diskDB['d1' as any].preUpdateBytes).toBe(1)
+        expect(h.doc().diskDB['d1' as any].quarantineBytes).toBe(1)
     })
     it('HELPER_OUTDATED against a helper older than v4; nothing changes', async () => {
         add('i1', 'k', 'd1')
