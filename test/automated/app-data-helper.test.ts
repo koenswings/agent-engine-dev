@@ -100,6 +100,10 @@ describe('helper argv builders', () => {
         expect(borgInitArgs('sdc1', 'inst-1')).toEqual(['borg-init', 'sdc1', 'inst-1'])
         expect(borgInfoArgs('sdc1', 'inst-1')).toEqual(['borg-info', 'sdc1', 'inst-1'])
         expect(borgCreateArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', 'system')).toEqual(['borg-create', 'sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', 'system'])
+        expect(borgCreateArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', 'system', ['keys', 'data/tailscale', 'tailscale-run', 'keys'])).toEqual([
+            'borg-create', 'sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', 'system',
+            'data/keys', 'data/tailscale', 'data/tailscale-run',
+        ])
         expect(borgExtractArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', 3, 'sdb1')).toEqual(['borg-extract', 'sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', '3', 'sdb1'])
         expect(appDataSudoArgv(['size', 'sdb1', 'x'])).toEqual(['-n', '/usr/local/sbin/idea-app-data', 'size', 'sdb1', 'x'])
     })
@@ -123,6 +127,9 @@ describe('helper argv builders', () => {
         expect(() => receiveAppArgs('sdb1', '-rf')).toThrow(/not an app id/)
         expect(() => receiveFilesArgs('sdb1', 'a/b')).toThrow(/not an instance id/)
         expect(() => borgCreateArgs('sdc1', 'x', 'latest', 'sdb1')).toThrow(/not a backup archive name/)
+        expect(() => borgCreateArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', 'sdb1', ['/etc/passwd'])).toThrow(/absolute paths are not allowed/)
+        expect(() => borgCreateArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', 'sdb1', ['../etc'])).toThrow(/\.\./)
+        expect(() => borgCreateArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', 'sdb1', ['-rf'])).toThrow(/looks like an option/)
         expect(() => borgExtractArgs('sdc1', 'x', '2026-10-06T10-18-00-123Z', 0, 'sdb1')).toThrow(/out of range/)
         expect(() => borgExtractArgs('sdc1', 'x', '2026-10-06T10-18-00-123Z', 10, 'sdb1')).toThrow(/out of range/)
         expect(() => borgExtractArgs('sdc1', 'x', '2026-10-06T10-18-00-123Z', 1.5, 'sdb1')).toThrow(/out of range/)

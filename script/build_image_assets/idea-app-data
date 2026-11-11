@@ -54,10 +54,11 @@
 #   idea-app-data snapshots        <root>        (v5: "<id> <kb> complete|incomplete" per .pre-update snapshot)
 #   idea-app-data borg-init    <bdev> <id>
 #   idea-app-data borg-info    <bdev> <id>
-#   idea-app-data borg-create  <bdev> <id> <archive> <srcRoot>
+#   idea-app-data borg-create  <bdev> <id> <archive> <srcRoot> [exclude…]   (v8, idea#443)
 #   idea-app-data borg-extract <bdev> <id> <archive> <strip> <dstRoot>
 #
-# Tokens (none can start with '-' or hold '/' or '..'):
+# Tokens (none can start with '-' or hold '..'; only trailing borg-create
+# excludes may hold '/'):
 #   root     sd[a-z][12]  → /disks/<dev>: findmnt must show source /dev/<dev>, type
 #                           ext4, not the root filesystem's drive, META.yaml at its root
 #            system       → /instances/<id> on the system disk
@@ -66,6 +67,9 @@
 #   id       ^[a-z0-9][a-z0-9-]{0,63}$
 #   archive  ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9-]{8,16}Z$   (backupInstance's format)
 #   strip    ^[1-9]$
+#   exclude  instance-relative path (v8, idea#443): no leading '/', no '..',
+#            no globs; a bare name other than 'data' is treated as data/<name>.
+#            Mapped to a borg path-prefix pattern under the source instance folder.
 #   engine   ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$   (a peer's Engine id)
 #   app      ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$, no '..'   (an app id, e.g. kolibri-1.0)
 #   host     an IPv4 address or ^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$, resolved HERE;
@@ -123,7 +127,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=7
+readonly IDEA_APP_DATA_VERSION=8
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -358,6 +362,61 @@ dir_kb() { $DU -sk -x -- "$1" | { read -r k _; echo "${k:-}"; }; }
 # ── Checks ───────────────────────────────────────────────────────────────────
 need() {   # need <count> <given> <usage>
     [[ "$2" -eq "$1" ]] || refuse "$SUB takes exactly $1 argument(s) ($3), got $2"
+}
+
+need_min() {   # need_min <count> <given> <usage>
+    [[ "$2" -ge "$1" ]] || refuse "$SUB takes at least $1 argument(s) ($3), got $2"
+}
+
+# Normalise one x-app.backup.exclude path (idea#443). Same rules as
+# src/utils/backupExclude.ts. Prints the instance-relative path or refuses.
+normalize_exclude() {
+    local raw="$1" p
+    p=${raw#"${raw%%[![:space:]]*}"}
+    p=${p%"${p##*[![:space:]]}"}
+    [[ -n "$p" ]] || refuse "exclude '$raw' is empty"
+    [[ "$p" != -* ]] || refuse "exclude '$raw' looks like an option"
+    [[ "$p" != /* ]] || refuse "exclude '$raw' is an absolute path"
+    while [[ "$p" == ./* ]]; do p=${p#./}; done
+    p=${p%/}
+    while [[ "$p" == */ ]]; do p=${p%/}; done
+    [[ -n "$p" ]] || refuse "exclude '$raw' is empty"
+    [[ "$p" != *//* ]] || refuse "exclude '$raw' contains '//'"
+    [[ "$p" != *'..'* ]] || refuse "exclude '$raw' has a '.' or '..' component"
+    [[ "$p" != *'/./'* && "$p" != ./* && "$p" != */. && "$p" != . ]]         || refuse "exclude '$raw' has a '.' or '..' component"
+    [[ "$p" != *'*'* && "$p" != *'?'* && "$p" != *'['* && "$p" != *']'* ]]         || refuse "exclude '$raw' contains a glob"
+    [[ "$p" =~ ^[A-Za-z0-9._][A-Za-z0-9._/-]*$ ]] || refuse "exclude '$raw' has unsupported characters"
+    if [[ "$p" != */* && "$p" != data && "$p" != .* ]]; then
+        p="data/$p"
+    fi
+    [[ "$p" != *'..'* ]] || refuse "exclude '$raw' has a '..' component"
+    printf '%s\n' "$p"
+}
+
+# rel is already normalised; refuse if it lexically leaves $1, or if an
+# existing path (or symlink) resolves outside the instance folder.
+check_exclude_inside() {
+    local inst="$1" rel="$2" lex real target
+    inst=${inst%/}
+    [[ -n "$inst" ]] || inst=/
+    target="$inst/$rel"
+    lex=$($REALPATH -m -s -- "$target" 2>/dev/null) || lex="$target"
+    if [[ "$lex" != "$inst" && "$lex" != "$inst"/* ]]; then
+        refuse "exclude '$rel' leaves the instance folder"
+    fi
+    if [[ -e "$target" || -L "$target" ]]; then
+        real=$($REALPATH -e -- "$target" 2>/dev/null) || real=""
+        if [[ -n "$real" && "$real" != "$inst" && "$real" != "$inst"/* ]]; then
+            refuse "exclude '$rel' points outside the instance folder"
+        fi
+        # A symlink anywhere in the path: exact_path fails; realpath -e already
+        # checked the final target. Also refuse if a parent component is a
+        # symlink that left the instance (covered by $real). If the path exists
+        # but cannot be resolved, refuse rather than pack it.
+        if [[ -z "$real" ]]; then
+            refuse "exclude '$rel' cannot be resolved under the instance folder"
+        fi
+    fi
 }
 
 check_id() { [[ "$1" =~ $RE_ID ]] || refuse "instance id '$1' does not match $RE_ID"; }
@@ -1272,7 +1331,7 @@ case "$SUB" in
         ;;
 
     borg-create)
-        need 4 $(($# - 1)) "<bdev> <id> <archive> <srcRoot>"
+        need_min 4 $(($# - 1)) "<bdev> <id> <archive> <srcRoot> [exclude…]"
         check_id "$3"
         [[ "$4" =~ $RE_ARCHIVE ]] || refuse "archive name '$4' does not match $RE_ARCHIVE"
         resolve_root "$2" backup; B_DIR="$R_DIR"
@@ -1282,8 +1341,32 @@ case "$SUB" in
         [[ -f "$REPO/config" ]] || refuse "$REPO is not a Borg repository"
         SRC=$(inst_dir "$S_DIR" "$3")
         existing_dir "$SRC" "source instance folder"
+        EXCLUDES=()
+        if (( $# > 5 )); then
+            i=6
+            while (( i <= $# )); do
+                rel=$(normalize_exclude "${!i}") || exit 2
+                check_exclude_inside "$SRC" "$rel"
+                EXCLUDES+=("$rel")
+                i=$((i + 1))
+            done
+        fi
         take_locks "repo.$2.$3" "inst.$5.$3"
         borg_env
+        PAT=""
+        cleanup_pat() { [[ -n "$PAT" && -e "$PAT" ]] && $RM -f -- "$PAT"; PAT=""; }
+        if (( ${#EXCLUDES[@]} > 0 )); then
+            lock_ready
+            PAT=$($MKTEMP -- "$LOCK_DIR/borg-exclude.XXXXXX") || refuse "cannot create a borg exclude pattern file"
+            $CHMOD 600 -- "$PAT" || { cleanup_pat; refuse "cannot chmod the borg exclude pattern file"; }
+            for rel in "${EXCLUDES[@]}"; do
+                printf -- '- pp:%s\n' "$SRC/$rel" >> "$PAT" || { cleanup_pat; refuse "cannot write the borg exclude pattern file"; }
+            done
+            EC=0
+            run_child $BORG create --numeric-ids --patterns-from "$PAT" -- "$REPO::$4" "$SRC" || EC=$?
+            cleanup_pat
+            exit "$EC"
+        fi
         run_child $BORG create --numeric-ids -- "$REPO::$4" "$SRC"
         exit $?
         ;;

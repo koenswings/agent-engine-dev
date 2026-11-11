@@ -1,10 +1,10 @@
 # idea#411: idea-usage contract (hook runner, store, export)
 
-**Status:** Authoritative (`idea-usage` on main since [#308](https://github.com/koenswings/agent-engine-dev/pull/308) / `16c3174`; helper v7 shipped, `APP_DATA_HELPER_VERSION` `'7'`)  ·  **Maintained by:** Axle
+**Status:** Authoritative (`idea-usage` on main since [#308](https://github.com/koenswings/agent-engine-dev/pull/308) / `16c3174`; helper v8 shipped (v7 usage-export key plus idea#443 excludes), `APP_DATA_HELPER_VERSION` `'8'`)  ·  **Maintained by:** Axle
 **Audience:** Kid (hooks, #413; dashboard collector, #414), Atlas (helper v7 / keys, #412), Pixel (D2 later, #417)
 **Sources:** [idea PR #410](https://github.com/koenswings/idea/pull/410) (`proposals/2026-11-09-field-usage-monitoring.md`, especially §7.2–§7.6 and §10), [idea#411](https://github.com/koenswings/idea/issues/411), [idea#412](https://github.com/koenswings/idea/issues/412), [idea#413](https://github.com/koenswings/idea/issues/413), Design Review 2026-11-10.
 
-This document is the Engine ⇄ App ⇄ collector contract. `idea-usage` is on `main` since [#308](https://github.com/koenswings/agent-engine-dev/pull/308). Helper v7 (idea#412) is shipped (`APP_DATA_HELPER_VERSION` is `'7'`). Nothing here is a secret, a key, or a token.
+This document is the Engine ⇄ App ⇄ collector contract. `idea-usage` is on `main` since [#308](https://github.com/koenswings/agent-engine-dev/pull/308). Helper v8 is shipped (`APP_DATA_HELPER_VERSION` is `'8'`): it includes the v7 usage-export key install (idea#412) and `borg-create` excludes (idea#443). Nothing here is a secret, a key, or a token.
 
 Field kits stay pinned at Engine `adfd9d3` until Koen approves idea#374. Proof work is on idea03 or idea04 only — never golden idea01, never idea, never the kits.
 
@@ -571,7 +571,7 @@ When `usageMonitoring` is `off` (missing file = off):
 
 ## 8. Helper v7 and the key drop-in (idea#412)
 
-Current `main` ships `idea-app-data` **v7** (`APP_DATA_HELPER_VERSION` is `'7'` in `src/utils/appDataHelper.ts`), which includes the usage-export key install (idea#412). [idea#401](https://github.com/koenswings/idea/issues/401) (borg prune/delete/compact) is tracked separately.
+Current `main` ships `idea-app-data` **v8** (`APP_DATA_HELPER_VERSION` is `'8'` in `src/utils/appDataHelper.ts`), which includes the usage-export key install (idea#412) and `borg-create` exclude passthrough (idea#443). [idea#401](https://github.com/koenswings/idea/issues/401) (borg prune/delete/compact) is tracked for helper v9.
 
 The usage-pull public key must not live in `~/.ssh/authorized_keys` or `/etc/ssh/idea_authorized_keys/pi`: `sync-peers` rewrites that file in one atomic swap. It must not go through `idea-peer-gate`: every peer Engine key shares that gate, and making export a gate verb would let any kit pull another school’s summaries.
 
