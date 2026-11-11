@@ -47,8 +47,12 @@ Started via pm2, auto-starts on boot.
 Key-only SSH (idea#146). The Pi must already accept this machine's key and give `pi` passwordless sudo. The script never uses a password, never edits `/etc/hosts` on the runner, and never writes `~/.ssh/config`.
 
 ```bash
-# Pi 5 reached through idea03 as a jump host; fleet Tailscale key from a local file
-./script/provision-fleet.sh --jump pi@100.126.117.80 --authkey-file ~/fleet-authkey.txt \
+# Pi 5 reached through idea03 as a jump host; fleet key from ~/.config/idea/fleet-authkey
+./script/provision-fleet.sh --jump pi@100.126.117.80 \
+  idea01=192.168.0.138,model=pi5
+
+# Same, with an explicit key file (override)
+./script/provision-fleet.sh --jump pi@100.126.117.80 --authkey-file /path/to/key \
   idea01=192.168.0.138,model=pi5
 
 # Two Pis on the same LAN; the Pi already holds the Tailscale key
@@ -58,11 +62,17 @@ Key-only SSH (idea#146). The Pi must already accept this machine's key and give 
 What it does per node:
 1. Checks key-based SSH (`BatchMode`) and passwordless sudo
 2. Bootstraps apt packages, Node 22.20.0 and the pinned pnpm from `package.json` (`packageManager`, currently 10.33.0), then clones `/home/pi/idea/agents/<repo>`
-3. Stores the Tailscale fleet key over stdin when `--authkey-file` is given (idea#115)
+3. Stores the Tailscale fleet key over stdin from `--authkey-file` or, by default, `~/.config/idea/fleet-authkey` (idea#115). If the default file is absent and `--authkey-file` is not given, the Pi must already hold the key
 4. Runs `build-engine` in **local mode on the Pi** with explicit `--no-argon` / `--no-gadget` (unless you pass `--argon` / `--gadget`; `--gadget` is refused on pi5)
 5. Waits for the reboot and checks that pm2's `engine` is online and the Console HTTP port returns 200
 
 Allow 15–20 minutes per node. The Pi reboots at the end.
+
+**Fleet key file on the operator machine.** The box/operator fleet Tailscale key lives at `~/.config/idea/fleet-authkey` (mode `0600`, `tag:idea`, reusable, non-ephemeral, about 90-day expiry). `provision-fleet.sh` uses this file by default; `--authkey-file <path>` overrides it. The file is preflighted (must exist, be mode `600`, owned by you, and non-empty) and sent over stdin into `/etc/tailscale/debug-authkey` on the Pi. A missing default file is not fatal by itself; a missing explicit `--authkey-file` is.
+
+The router enrol tool (`tools/router-image/idea-router-enrol` in koenswings/idea) reads `~/.config/idea-router/fleet-authkey`. On the ops box that path is a **hard link** to the same file (one inode, one copy) — not a symlink. Enrol's preflight runs `stat -c %a` without `-L`, which would see a symlink's mode `777` and refuse it.
+
+To rotate the key, replace the file content in place so both names keep pointing at the same inode: write the new key to a temp file, then `cat tmp > ~/.config/idea/fleet-authkey` (or re-create the hard link after replacing the file). A plain `mv` onto one name would leave the other name on the old inode.
 
 Off flags for a manual local `build-engine` run (same as the provisioner):
 
