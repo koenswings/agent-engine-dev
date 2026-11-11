@@ -50,8 +50,14 @@ export const trackedStoreIdentity = async (repo: string, commit: string): Promis
     return out
 }
 
+const consoleCommitOf = async (consoleRepo: string | undefined): Promise<string | undefined> => {
+    if (!consoleRepo) return undefined
+    if (await git(consoleRepo, ['status', '--porcelain', '--untracked-files=no']) !== '') throw new Error(`${consoleRepo} has uncommitted changes: a lock is for a commit`)
+    return git(consoleRepo, ['rev-parse', 'HEAD'])
+}
+
 /** Build the lock from a CLEAN checkout (its HEAD) plus the docker-save tarballs in <cache>/docker. */
-export const buildLock = async (repo: string, E: any, images: string[], cache: string | undefined, pm2Env: EngineLock['pm2Env']): Promise<EngineLock> => {
+export const buildLock = async (repo: string, E: any, images: string[], cache: string | undefined, pm2Env: EngineLock['pm2Env'], consoleRepo?: string): Promise<EngineLock> => {
     if (await git(repo, ['status', '--porcelain', '--untracked-files=no']) !== '') throw new Error(`${repo} has uncommitted changes: a lock is for a commit`)
     const engineCommit = await git(repo, ['rev-parse', 'HEAD'])
     const pkg = await fs.readJson(path.join(repo, 'package.json'))
@@ -88,6 +94,7 @@ export const buildLock = async (repo: string, E: any, images: string[], cache: s
         aptPins: E.parseAptPins(await fs.readFile(path.join(assets, 'apt-rpi-pins.tsv'), 'utf8')),
         dockerDebs: parseDockerPins(await fs.readFile(path.join(assets, 'docker-pins.tsv'), 'utf8')),
         dockerImages, pm2Env, files, enabledUnits: [...IMAGE_ENABLED_UNITS].sort(), npmTools, sparseCheckout: [...IMAGE_SPARSE_PATTERNS],
+        ...(await (async () => { const c = await consoleCommitOf(consoleRepo); return c ? { consoleCommit: c } : {} })()),
     }
 }
 
@@ -146,14 +153,25 @@ export const dryRunner = (lock: EngineLock, log: string[], appDataVersion: strin
     }
 }
 
+/** Prefer --console-repo, then $IDEA_CONSOLE_REPO, then a sibling agent-console-dev next to the Engine repo. */
+export const resolveConsoleRepo = async (explicit: string | undefined, engineRepo: string): Promise<string | undefined> => {
+    if (explicit) return explicit
+    const env = process.env.IDEA_CONSOLE_REPO
+    if (env && path.isAbsolute(env) && await fs.pathExists(path.join(env, '.git'))) return env
+    const sibling = path.resolve(engineRepo, '../agent-console-dev')
+    if (await fs.pathExists(path.join(sibling, '.git'))) return sibling
+    return undefined
+}
+
 /** Run an image mode. Returns the exit code (0 ok, 1 failed, 2 usage). */
 export const runImageMode = async (a: ImageArgs, repo: string): Promise<number> => {
     process.env.IDEA_IMAGE_BUILD = '1'
     const E: any = await import('../data/Engine.js')
     const { APP_DATA_HELPER_VERSION } = await import('../utils/appDataHelper.js')
     const enginePath = config.defaults.enginePath ?? '/home/pi/idea/agents/agent-engine-dev'
+    const consoleRepo = await resolveConsoleRepo(a.consoleRepo, repo)
     if (a.mode === 'write-lock') {
-        const lock = await buildLock(repo, E, a.images, a.cache, a.pm2Env)
+        const lock = await buildLock(repo, E, a.images, a.cache, a.pm2Env, consoleRepo)
         await fs.writeFile(a.lock!, serialiseLock(lock))
         console.log(`lock written: ${a.lock} (${lock.engineCommit})`)
         return 0
@@ -163,7 +181,7 @@ export const runImageMode = async (a: ImageArgs, repo: string): Promise<number> 
     if (a.mode === 'verify') {
         const lock = await readLock(a.lock!)
         const commit = lock.engineCommit
-        const checks = await verifyRootfsChecks({ root, enginePath, lock, storeIdentity: await trackedStoreIdentity(repo, commit), piUid: await piUidOf(root) })
+        const checks = await verifyRootfsChecks({ root, enginePath, lock, storeIdentity: await trackedStoreIdentity(repo, commit), piUid: await piUidOf(root), boot: a.boot ?? path.join(root, 'boot/firmware') })
         const problems = checks.flatMap(x => x.problems)
         problems.forEach(p => console.error(`verify: ${p}`))
         await writeReport(a.report, lock, await fs.readFile(a.lock!, 'utf8'), problems, checks.filter(x => !x.problems.length).length)
@@ -176,7 +194,9 @@ export const runImageMode = async (a: ImageArgs, repo: string): Promise<number> 
         if (process.getuid?.() !== 0) throw new UsageError('--root builds run as root')
     }
     if ((await piUidOf(root)) === undefined) throw new UsageError(`${root}/etc/passwd has no pi user`)
-    let lock = a.lock ? await readLock(a.lock) : await buildLock(repo, E, a.images, a.cache, a.pm2Env)
+    let lock = a.lock ? await readLock(a.lock) : await buildLock(repo, E, a.images, a.cache, a.pm2Env, consoleRepo)
+    if (!lock.consoleCommit && consoleRepo) lock = { ...lock, consoleCommit: await consoleCommitOf(consoleRepo) }
+    if (a.mode === 'rootfs' && !lock.consoleCommit) throw new UsageError('Console commit unknown: pass --console-repo <absolute path to a clean agent-console-dev checkout> (sibling agent-console-dev or $IDEA_CONSOLE_REPO also work)')
     const bad = validateLock(lock); if (bad.length) throw new UsageError(`lock: ${bad.join('; ')}`)
     let cache = a.cache
     if (!cache && !a.dryRun) {
@@ -192,6 +212,7 @@ export const runImageMode = async (a: ImageArgs, repo: string): Promise<number> 
         rootfs: root, lock, cache: cache ?? '/nonexistent-cache', repo, enginePath,
         language: config.defaults.language, keyboard: config.defaults.keyboard, timezone: config.defaults.timezone,
         trackedStoreIdentity: Object.keys(storeIdentity), storeIdentity,
+        boot: a.boot ?? path.join(root, 'boot/firmware'), consoleRepo,
     }
     const log: string[] = []
     const runner = a.dryRun ? dryRunner(lock, log, APP_DATA_HELPER_VERSION) : realRunner(root)

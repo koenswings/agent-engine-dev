@@ -9,10 +9,10 @@ import os from 'os'
 import crypto from 'crypto'
 import {
     parseImageArgs, UsageError, validateLock, serialiseLock, writeLock, readLock, LOCK_SCHEMA, EngineLock,
-    sanitiseRootfs, verifyRootfs, IDENTITY_PATHS, GENERIC_HOSTNAME, IMAGE_ENABLED_UNITS, PM2_UNIT, SSH_REGEN_UNIT,
-    pm2UnitText, preloadManifest, imageIdFromManifest, imageTarName, readDpkgStatus, unitEnabled, unitLinks, unitInstallTargets, verifyRootfsChecks, VERIFY_CHECKS, IMAGE_SPARSE_PATTERNS, filesWithAuthKeyShape, PRELOAD_DOCKER_DIR, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH,
+    sanitiseRootfs, verifyRootfs, IDENTITY_PATHS, GENERIC_HOSTNAME, IMAGE_ENABLED_UNITS, PM2_UNIT, SSH_REGEN_UNIT, SSH_HOSTKEYS_UNIT,
+    pm2UnitText, sshHostKeysUnitText, sshHostKeyUnitIsUnconditional, DEFAULT_CONSOLE_PATH, preloadManifest, imageIdFromManifest, imageTarName, readDpkgStatus, unitEnabled, unitLinks, unitInstallTargets, verifyRootfsChecks, VERIFY_CHECKS, IMAGE_SPARSE_PATTERNS, filesWithAuthKeyShape, PRELOAD_DOCKER_DIR, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH,
 } from '../../src/install/engineImage.js'
-import { rootfsSteps, runRootfsBuild, engineCloneCommand, Runner, Installers, SHIMS, quoteTemplate } from '../../src/install/engineRootfs.js'
+import { rootfsSteps, runRootfsBuild, engineCloneCommand, consoleCloneCommand, Runner, Installers, SHIMS, quoteTemplate } from '../../src/install/engineRootfs.js'
 import { pinNpmTools, writeReport } from '../../src/install/engineImageCli.js'
 import { diskIdWithoutHardware, hasDiskId, ensureSystemMeta } from '../../src/data/Meta.js'
 
@@ -44,6 +44,8 @@ describe('parseImageArgs', () => {
         const a = parseImageArgs({ root: '/mnt/r', boot: '/mnt/r/boot/firmware', report: '/out/engine-build.json' })!
         expect(a).toMatchObject({ mode: 'rootfs', rootfs: '/mnt/r', boot: '/mnt/r/boot/firmware', report: '/out/engine-build.json', pm2Env: 'production', dryRun: false })
         expect(a.lock).toBeUndefined()
+        expect(parseImageArgs({ root: '/mnt/r', 'console-repo': '/src/agent-console-dev' })!.consoleRepo).toBe('/src/agent-console-dev')
+        expect(() => parseImageArgs({ root: '/mnt/r', 'console-repo': 'relative' })).toThrow(/absolute/)
     })
     it('refuses device or remote options with a UsageError', () => {
         for (const bad of [{ m: 'x' }, { u: 'pi' }, { hostname: 'h' }, { personalize: true }, { peer: 'p' }])
@@ -68,6 +70,8 @@ describe('lock', () => {
     it('validates and round-trips sorted, stable JSON', async () => {
         expect(validateLock(lock())).toEqual([])
         expect(validateLock(lock({ engineCommit: 'abc' }))).toContain('engineCommit must be a full 40-hex git SHA')
+        expect(validateLock(lock({ consoleCommit: 'abc' }))).toContain('consoleCommit must be a full 40-hex git SHA')
+        expect(validateLock(lock({ consoleCommit: 'b'.repeat(40) }))).toEqual([])
         expect(validateLock(lock({ dockerImages: [{ ref: 'nginx:1', imageId: 'x', tar: '../t', tarSha256: 'z' } as any] })).length).toBe(4)
         const d = await fs.mkdtemp(path.join(os.tmpdir(), 'lock-'))
         await writeLock(path.join(d, 'l.json'), lock())
@@ -103,8 +107,16 @@ const goodRootfs = async (root: string) => {
     await fs.ensureDir(path.join(eng, 'store-identity'))
     for (const [k, v] of Object.entries(STORE)) await fs.writeFile(path.join(eng, 'store-identity', k), v)
     await fs.ensureDir(R('etc/systemd/system/multi-user.target.wants'))
+    await fs.ensureDir(R('etc/systemd/system/sysinit.target.wants'))
     await fs.writeFile(R(`etc/systemd/system/${PM2_UNIT}`), pm2UnitText())
-    for (const u of IMAGE_ENABLED_UNITS) await fs.writeFile(R(`etc/systemd/system/multi-user.target.wants/${u}`), '')
+    await fs.writeFile(R(`etc/systemd/system/${SSH_HOSTKEYS_UNIT}`), sshHostKeysUnitText())
+    for (const u of IMAGE_ENABLED_UNITS) {
+        const dir = u === SSH_HOSTKEYS_UNIT || u === SSH_REGEN_UNIT ? 'sysinit.target.wants' : 'multi-user.target.wants'
+        await fs.ensureDir(R(`etc/systemd/system/${dir}`))
+        await fs.writeFile(R(`etc/systemd/system/${dir}/${u}`), '')
+    }
+    await fs.ensureDir(R('boot/firmware')); await fs.writeFile(R('boot/firmware/ssh'), '')
+    await fs.ensureDir(R(DEFAULT_CONSOLE_PATH.slice(1))); await fs.writeFile(R(`${DEFAULT_CONSOLE_PATH.slice(1)}/index.html`), '<!doctype html>')
     await fs.writeFile(R('etc/machine-id'), ''); await fs.writeFile(R('etc/hostname'), GENERIC_HOSTNAME + '\n')
     await fs.writeFile(R('etc/hosts'), '127.0.0.1\tlocalhost\n127.0.1.1\traspberrypi\n')
     await fs.ensureDir(R('etc/idea')); await fs.writeFile(R(IMAGE_LOCK_PATH.slice(1)), serialiseLock(lock())); await fs.writeFile(R(IMAGE_VERSION_PATH.slice(1)), '1.0\n')
@@ -153,7 +165,7 @@ describe('sanitise + verify', () => {
         await fs.remove(path.join(root, ENGINE, 'dist'))
         await fs.writeFile(path.join(root, `etc/systemd/system/${PM2_UNIT}`), '[Service]\nUser=root\n')
         await fs.writeFile(path.join(root, 'etc/systemd/system/pm2-root.service'), '')
-        await fs.remove(path.join(root, `etc/systemd/system/multi-user.target.wants/${SSH_REGEN_UNIT}`))
+        await fs.remove(path.join(root, `etc/systemd/system/sysinit.target.wants/${SSH_REGEN_UNIT}`))
         await fs.ensureDir(path.join(root, 'usr/local/sbin')); await fs.writeFile(path.join(root, 'usr/local/sbin/idea-app-data'), 'v5')
         await fs.chmod(path.join(root, 'usr/local/sbin/idea-app-data'), 0o755)
         const l = lock({
@@ -194,6 +206,7 @@ describe('verify: held packages, units enabled via [Install], per-check count', 
         await fs.writeFile(R(`${W}/own.service`), '[Service]\nExecStart=/bin/true\n# WantedBy=fake.target\n[Install]\nWantedBy=multi-user.target\n')
         // sysinit.target.wants: enabled; multi-user only: not (its [Install] says sysinit)
         await fs.remove(R(`${W}/multi-user.target.wants/regenerate_ssh_host_keys.service`))
+        await fs.remove(R(`${W}/sysinit.target.wants/regenerate_ssh_host_keys.service`))
         await fs.ensureDir(R(`${W}/sysinit.target.wants`)); await fs.symlink('/lib/systemd/system/regenerate_ssh_host_keys.service', R(`${W}/sysinit.target.wants/regenerate_ssh_host_keys.service`))
         expect(await unitEnabled(root, 'regenerate_ssh_host_keys.service')).toBe(true)
         expect(await verifyRootfs({ root, enginePath: ENGINE, lock: lock(), storeIdentity: storeShas })).toEqual([])
@@ -226,6 +239,31 @@ describe('verify: held packages, units enabled via [Install], per-check count', 
         const rep = path.join(root, 'r.json')
         await writeReport(rep, lock(), 'x', bad.flatMap(x => x.problems), bad.filter(x => !x.problems.length).length)
         expect((await fs.readJson(rep)).verify.passed).toBe(VERIFY_CHECKS.length - 2)
+    })
+})
+
+describe('ssh first-boot and Console verify (build 6 failures)', () => {
+    let root: string
+    beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'rootfs-')); await goodRootfs(root) })
+    afterEach(async () => { await fs.remove(root) })
+    const ctx = () => ({ root, enginePath: ENGINE, lock: lock(), storeIdentity: storeShas })
+    it('fails if the Console dist index.html is missing', async () => {
+        await fs.remove(path.join(root, DEFAULT_CONSOLE_PATH.slice(1), 'index.html'))
+        expect((await verifyRootfs(ctx())).join('\n')).toContain('Console dist index.html missing')
+    })
+    it('fails if idea-ssh-host-keys.service is missing, has ConditionFirstBoot, or is not enabled', async () => {
+        await fs.remove(path.join(root, `etc/systemd/system/${SSH_HOSTKEYS_UNIT}`))
+        expect((await verifyRootfs(ctx())).join('\n')).toMatch(/idea-ssh-host-keys\.service is missing/)
+        await goodRootfs(root)
+        await fs.writeFile(path.join(root, `etc/systemd/system/${SSH_HOSTKEYS_UNIT}`), '[Unit]\nConditionFirstBoot=yes\n[Service]\nExecStart=/usr/bin/ssh-keygen -A\n[Install]\nWantedBy=sysinit.target\n')
+        expect((await verifyRootfs(ctx())).join('\n')).toMatch(/without ConditionFirstBoot=yes/)
+        await fs.writeFile(path.join(root, `etc/systemd/system/${SSH_HOSTKEYS_UNIT}`), sshHostKeysUnitText())
+        await fs.remove(path.join(root, `etc/systemd/system/sysinit.target.wants/${SSH_HOSTKEYS_UNIT}`))
+        expect((await verifyRootfs(ctx())).join('\n')).toContain(`unit ${SSH_HOSTKEYS_UNIT} is not enabled`)
+    })
+    it('fails if the bootfs ssh trigger is missing when a boot dir is present', async () => {
+        await fs.remove(path.join(root, 'boot/firmware/ssh'))
+        expect((await verifyRootfs(ctx())).join('\n')).toMatch(/bootfs has no ssh/)
     })
 })
 
@@ -292,7 +330,8 @@ describe('rootfs build plan (stubbed runner and installers)', () => {
         const inst = new Proxy({}, { get: (_t, k) => async (exec: any) => { calls.push(String(k)); await exec`echo ${String(k)}` } }) as Installers
         return { log, r, inst, calls }
     }
-    const opts = () => ({ rootfs: root, lock: lock(), cache: '/cache', repo: '/repo', enginePath: ENGINE, language: 'en_GB.UTF-8', keyboard: 'gb', timezone: 'Europe/Brussels', trackedStoreIdentity: Object.keys(STORE), storeIdentity: storeShas })
+    const CONSOLE = 'b'.repeat(40)
+    const opts = () => ({ rootfs: root, lock: lock({ consoleCommit: CONSOLE }), cache: '/cache', repo: '/repo', enginePath: ENGINE, language: 'en_GB.UTF-8', keyboard: 'gb', timezone: 'Europe/Brussels', trackedStoreIdentity: Object.keys(STORE), storeIdentity: storeShas, boot: path.join(root, 'boot/firmware'), consoleRepo: '/console-repo' })
 
     it('quotes template args like zx (arrays one word each)', () => {
         const t = (p: TemplateStringsArray, ...a: unknown[]) => quoteTemplate(p, a)
@@ -327,8 +366,14 @@ describe('rootfs build plan (stubbed runner and installers)', () => {
         expect(log.filter(l => l.startsWith("chroot:")).join("\n")).not.toMatch(/pm2 (--version|install|start|ls)|(^|[^p])npm (install|i) (?!-g)/m)
         expect(all).toContain('pnpm install --frozen-lockfile --offline')
         expect(all).toContain('npm_config_manage_package_manager_versions=false')
+        expect(all).toContain(`fetch -q --depth 1 'file:///console-repo' '${CONSOLE}'`)
+        expect(all).toContain('cd /home/pi/idea/agents/agent-console-dev && pnpm install --frozen-lockfile && pnpm build')
+        expect(all).toContain(`etc/systemd/system/${SSH_HOSTKEYS_UNIT}`)
+        expect(sshHostKeyUnitIsUnconditional(sshHostKeysUnitText())).toBe(true)
+        expect(sshHostKeyUnitIsUnconditional('[Unit]\nConditionFirstBoot=yes\n[Service]\nExecStart=/usr/bin/ssh-keygen -A\n')).toBe(false)
+        expect(consoleCloneCommand('/console-repo', '/mnt/agent-console-dev', CONSOLE)).toContain("remote add origin https://github.com/koenswings/agent-console-dev.git")
         expect(calls).toEqual(['pinAptSnapshot', 'updateSystem', 'installRpiPins', 'installAvahi', 'localiseSystem', 'installCrontabs', 'installUdev', 'installVarious', 'installVarious2', 'buildAppsInfrastructure', 'grantNetBindCapability'])
-        expect(await fs.readFile(path.join(root, IMAGE_LOCK_PATH.slice(1)), 'utf8')).toBe(serialiseLock({ ...lock(), packages: [], rpiPackages: [] }))
+        expect(await fs.readFile(path.join(root, IMAGE_LOCK_PATH.slice(1)), 'utf8')).toBe(serialiseLock({ ...lock({ consoleCommit: CONSOLE }), packages: [], rpiPackages: [] }))
         expect(await fs.readFile(path.join(root, IMAGE_VERSION_PATH.slice(1)), 'utf8')).toBe(`1.0 ${COMMIT}\n`)
     })
     it('records every package version and the Raspberry Pi archive set in the lock; a lock with rpiPackages installs exactly those', async () => {
@@ -343,7 +388,7 @@ describe('rootfs build plan (stubbed runner and installers)', () => {
         expect(written.rpiPackages).toEqual([{ pkg: 'raspi-config', version: '20261001' }])
         expect(res.lockText).toBe(await fs.readFile(path.join(root, IMAGE_LOCK_PATH.slice(1)), 'utf8'))
         const again = record()
-        await runRootfsBuild({ ...opts(), lock: lock({ rpiPackages: [{ pkg: 'raspi-config', version: '20261001' }] }) }, again.r, again.inst, '')
+        await runRootfsBuild({ ...opts(), lock: lock({ consoleCommit: CONSOLE, rpiPackages: [{ pkg: 'raspi-config', version: '20261001' }] }) }, again.r, again.inst, '')
         expect(again.log.join('\n')).toContain(`apt-get install -y --allow-downgrades 'raspi-config=20261001'`)
     })
     it('the build stops at the first failing step', async () => {
