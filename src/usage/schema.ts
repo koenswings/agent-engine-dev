@@ -80,6 +80,20 @@ function rejectPluralRoleKeys(obj: Record<string, unknown>, label: string): stri
     return null
 }
 
+/** Plain-number role map: {admin, teacher, learner} (not {total, beyondSeed}). */
+function expectPlainByGroup(value: unknown, label: string): string | null {
+    const map = expectObj(value, label)
+    if (typeof map === 'string') return map
+    const plural = rejectPluralRoleKeys(map, label)
+    if (plural) return plural
+    for (const [k, v] of Object.entries(map)) {
+        if (!isNonNegInt(v)) return `${label}.${k} must be a non-negative integer`
+    }
+    return null
+}
+
+const NEXTCLOUD_WORKFLOW_BYGROUP_METRICS = ['worksheetShares', 'editShares', 'fileDropUploads', 'schoolFilesShares'] as const
+
 function validateKolibri(body: Record<string, unknown>): string | null {
     const setup = expectObj(body.setup, 'setup')
     if (typeof setup === 'string') return setup
@@ -148,6 +162,19 @@ function validateNextcloud(body: Record<string, unknown>): string | null {
         const oErr = validateOfficeLike(body.office, 'office', false)
         if (oErr) return oErr
     }
+    // idea#431: workflows.byGroup is additive (same singular role keys as office.byGroup).
+    if (body.workflows && typeof body.workflows === 'object' && !Array.isArray(body.workflows)) {
+        const wf = body.workflows as Record<string, unknown>
+        if (wf.byGroup !== undefined) {
+            const byGroup = expectObj(wf.byGroup, 'workflows.byGroup')
+            if (typeof byGroup === 'string') return byGroup
+            for (const metric of NEXTCLOUD_WORKFLOW_BYGROUP_METRICS) {
+                if (byGroup[metric] === undefined) continue
+                const mErr = expectPlainByGroup(byGroup[metric], `workflows.byGroup.${metric}`)
+                if (mErr) return mErr
+            }
+        }
+    }
     if (body.appsOpened !== undefined) {
         const apps = expectObj(body.appsOpened, 'appsOpened')
         if (typeof apps === 'string') return apps
@@ -173,13 +200,8 @@ function validateOfficeLike(value: unknown, label: string, requireTokens: boolea
         }
     }
     if (obj.byGroup !== undefined) {
-        const map = expectObj(obj.byGroup, `${label}.byGroup`)
-        if (typeof map === 'string') return map
-        const plural = rejectPluralRoleKeys(map, `${label}.byGroup`)
-        if (plural) return plural
-        for (const [k, v] of Object.entries(map)) {
-            if (!isNonNegInt(v)) return `${label}.byGroup.${k} must be a non-negative integer`
-        }
+        const bgErr = expectPlainByGroup(obj.byGroup, `${label}.byGroup`)
+        if (bgErr) return bgErr
     }
     if (obj.mime !== undefined) {
         const map = expectObj(obj.mime, `${label}.mime`)
