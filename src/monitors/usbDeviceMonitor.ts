@@ -724,6 +724,7 @@ const undockDiskInner = async (storeHandle: DocHandle<Store>, disk: Disk, opts: 
                 dsk.device = null
                 dsk.diskTypes = []
                 dsk.backupConfig = null
+                dsk.backupStaleLocks = null // idea#446
                 dsk.filesConfig = null      // idea#131
                 dsk.sizeBytes = null
                 dsk.freeBytes = null

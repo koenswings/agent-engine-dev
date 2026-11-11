@@ -162,6 +162,32 @@ export const borgExtractArgs = (bdev: string, id: string, archive: string, strip
     return ['borg-extract', checkRoot(bdev), checkId(id), checkArchive(archive), String(strip), checkRoot(dstRoot)]
 }
 
+/** idea#446 / helper v9: archive inventory, or member list when <archive> is given. */
+export const borgListArgs = (bdev: string, id: string, archive?: string): string[] => {
+    const args = ['borg-list', checkRoot(bdev), checkId(id)]
+    if (archive !== undefined) args.push(checkArchive(archive))
+    return args
+}
+
+/** UTC stamp for .idea-verify/<id>-<stamp>/ (idea#446). */
+const VERIFY_STAMP = /^[0-9]{8}T[0-9]{6,9}Z$/
+export const checkVerifyStamp = (stamp: string): string => {
+    if (!VERIFY_STAMP.test(stamp)) throw new Error(`'${stamp}' is not a verify stamp the app-data helper accepts`)
+    return stamp
+}
+export const verifyStampNow = (at: Date = new Date()): string => {
+    const s = at.toISOString().replace(/[-:]/g, '').replace('.', '')
+    return checkVerifyStamp(s.endsWith('Z') ? s : `${s}Z`)
+}
+
+/** idea#446 / helper v9: extract into <backup disk>/.idea-verify/<id>-<stamp>/, never instances/<id>. */
+export const borgExtractVerifyArgs = (bdev: string, id: string, archive: string, stamp: string): string[] =>
+    ['borg-extract-verify', checkRoot(bdev), checkId(id), checkArchive(archive), checkVerifyStamp(stamp)]
+
+/** idea#446 / helper v9: move backups/ to .idea-quarantine/backups-<stamp>/; never deletes. */
+export const quarantineBackupsArgs = (bdev: string): string[] =>
+    ['quarantine-backups', checkRoot(bdev)]
+
 /** The argv for `sudo`: sudo -n /usr/local/sbin/idea-app-data <args…> */
 export const appDataSudoArgv = (args: string[]): string[] => ['-n', APP_DATA_HELPER, ...args]
 
