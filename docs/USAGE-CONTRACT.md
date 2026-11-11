@@ -65,7 +65,7 @@ The flag means “this Engine build can export usage”. It is advertised even w
 
 The directory `/var/lib/idea/usage/` is created at install, owned by `pi` (0750). Creating the empty directory at install is allowed even when the switch is off. When the switch is off, `idea-usage` checks the file at start and then idles: no sampler, no hooks, no day / sample / presence files written. Existing files are left untouched. The export command returns `disabled` (see §7.4).
 
-`idea-usage` re-reads the file at start, on SIGHUP, and at least once a minute, so a toggle takes effect without restarting pm2. An operator command over SSH (a `tools/fleet` script writing this file, and/or a helper verb that is **not** the forced-command binary) flips the value.
+`idea-usage` re-reads the file at start, on SIGHUP, and at least once a minute, so a toggle takes effect without restarting pm2. The operator helper is root-owned `/usr/local/sbin/idea-usage-settings` (installed by `installRootHelpers` from `script/build_image_assets/idea-usage-settings`). It accepts only `on`, `off` and `status` (via argv or `$SSH_ORIGINAL_COMMAND`). A missing file is `off`; repeating `on` or `off` is idempotent (exit 0, no rewrite when the value is already set; `off` against a missing file creates nothing). It writes only this settings file and never restarts the Engine, any App, or the `idea-usage` process. It is **not** the collector forced-command binary (`idea-usage-export` still accepts only `since` and `archive-and-clear`). Operators call it over SSH through `tools/fleet/usage-monitoring.sh` in the idea repo.
 
 ---
 
