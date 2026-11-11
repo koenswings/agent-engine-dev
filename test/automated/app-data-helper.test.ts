@@ -19,7 +19,7 @@ import { fs, os, path } from 'zx'
 import { Repo, DocHandle } from '@automerge/automerge-repo'
 import {
     APP_DATA_HELPER, APP_DATA_HELPER_VERSION, sizeArgs, copyArgs, sendArgs, deleteArgs, eraseSlotArgs,
-    borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgListArgs, borgDeleteArgs, borgCompactArgs, appDataSudoArgv, remoteDeleteSshArgs,
+    borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgListArgs, borgExtractVerifyArgs, borgDeleteArgs, borgCompactArgs, quarantineBackupsArgs, appDataSudoArgv, remoteDeleteSshArgs,
     runAppData, appDataErrorMessage, appDataHelperProblem, assertAppDataHelper,
     instanceDataBytes, deleteInstanceData, deleteRemoteInstanceData,
     remoteEnsureDirsSshArgs, ensureDirsArgs, receiveAppArgs, receiveServiceArgs, receiveFilesArgs, putFilesArgs,
@@ -106,9 +106,12 @@ describe('helper argv builders', () => {
         ])
         expect(borgExtractArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', 3, 'sdb1')).toEqual(['borg-extract', 'sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', '3', 'sdb1'])
         expect(borgListArgs('sdc1', 'inst-1')).toEqual(['borg-list', 'sdc1', 'inst-1'])
+        expect(borgListArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z')).toEqual(['borg-list', 'sdc1', 'inst-1', '2026-10-06T10-18-00-123Z'])
+        expect(borgExtractVerifyArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', '20261112T001825Z')).toEqual(['borg-extract-verify', 'sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', '20261112T001825Z'])
         expect(borgDeleteArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z')).toEqual(['borg-delete', 'sdc1', 'inst-1', '2026-10-06T10-18-00-123Z'])
         expect(borgDeleteArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', 3)).toEqual(['borg-delete', 'sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', '3'])
         expect(borgCompactArgs('sdc1', 'inst-1')).toEqual(['borg-compact', 'sdc1', 'inst-1'])
+        expect(quarantineBackupsArgs('sdc1')).toEqual(['quarantine-backups', 'sdc1'])
         expect(appDataSudoArgv(['size', 'sdb1', 'x'])).toEqual(['-n', '/usr/local/sbin/idea-app-data', 'size', 'sdb1', 'x'])
     })
 
@@ -139,6 +142,11 @@ describe('helper argv builders', () => {
         expect(() => borgExtractArgs('sdc1', 'x', '2026-10-06T10-18-00-123Z', 1.5, 'sdb1')).toThrow(/out of range/)
         expect(() => borgDeleteArgs('sdc1', 'inst-1', 'latest')).toThrow(/not a backup archive name/)
         expect(() => borgDeleteArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', 0)).toThrow(/keepMin/)
+        expect(() => borgListArgs('sdc1', 'inst-1', 'latest')).toThrow(/not a backup archive name/)
+        expect(() => borgExtractVerifyArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', '../etc')).toThrow(/not a UTC stamp/)
+        expect(() => borgExtractVerifyArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', '-20261112T001825Z')).toThrow(/not a UTC stamp/)
+        expect(() => borgExtractVerifyArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', '2026-11-12T00:18:25Z')).toThrow(/not a UTC stamp/)
+        expect(() => quarantineBackupsArgs('/disks/sdc1')).toThrow(/not a disk root/)
     })
 
     it('instanceDataTransferArgs maps copy and send', () => {

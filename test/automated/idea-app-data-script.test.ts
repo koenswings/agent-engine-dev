@@ -108,7 +108,7 @@ describe('idea-app-data: argument checks', () => {
     it('refuses the wrong argument count for every subcommand', async () => {
         const cases: [string, number][] = [
             ['version', 0], ['size', 2], ['copy', 4], ['send', 6], ['delete', 2], ['quarantine', 2], ['snapshot', 2], ['restore-snapshot', 2], ['snapshots', 1], ['estimate', 2],
-            ['borg-init', 2], ['borg-info', 2], ['borg-extract', 5], ['borg-list', 2], ['borg-compact', 2],
+            ['borg-init', 2], ['borg-info', 2], ['borg-extract', 5], ['borg-extract-verify', 4], ['borg-compact', 2], ['quarantine-backups', 1],
             ['ensure-dirs', 1], ['erase-slot', 2], ['put-files', 3], ['peer-delete', 3], ['sync-peers', 0], ['install-usage-key', 3],
         ]
         for (const [sub, n] of cases) {
@@ -122,6 +122,8 @@ describe('idea-app-data: argument checks', () => {
         refused(await sb.run(['borg-create', 'x', 'x', 'x']), /borg-create takes at least 4 argument/)
         refused(await sb.run(['borg-delete', 'x', 'x']), /borg-delete takes 3 or 4 argument/)
         refused(await sb.run(['borg-delete', 'x', 'x', 'x', 'x', 'x']), /borg-delete takes 3 or 4 argument/)
+        refused(await sb.run(['borg-list', 'x']), /borg-list takes 2 or 3 argument/)
+        refused(await sb.run(['borg-list', 'x', 'x', 'x', 'x']), /borg-list takes 2 or 3 argument/)
     })
 
     it('refuses bad roots, ids, archives, strips and hosts (.., leading -, /, case, length)', async () => {
@@ -135,6 +137,9 @@ describe('idea-app-data: argument checks', () => {
         await sb.addDisk('sdc1', { backup: true })
         for (const archive of ['latest', '2026-10-06', '../2026-10-06T10-00-00-000Z', '-2026-10-06T10-00-00Z', '2026-10-06T10:00:00Z']) {
             refused(await sb.run(['borg-create', 'sdc1', 'inst1', archive, 'sdb1']), /archive name '.*' does not match/)
+        }
+        for (const stamp of ['../etc', '2026-11-12T001825Z', '-20261112T001825Z', '20261112T00:18:25Z', '20261112T001825Z/../x', 'latest']) {
+            refused(await sb.run(['borg-extract-verify', 'sdc1', 'inst1', '2026-10-06T10-00-00-000Z', stamp]), /stamp '.*'/)
         }
         for (const strip of ['0', '10', '-1', 'a', '']) {
             refused(await sb.run(['borg-extract', 'sdc1', 'inst1', '2026-10-06T10-00-00-000Z', strip, 'sdb1']), /strip '.*' does not match/)
@@ -852,6 +857,87 @@ describe('idea-app-data: borg-list / borg-delete / borg-compact (idea#401, helpe
         expect((await sb.run(['borg-compact', 'sdc1', 'inst1'])).exitCode).toBe(0)
         const [c] = await sb.calls('borg')
         expect(c.argv).toEqual(['compact', '--', repo])
+    })
+
+    it('borg-list <archive> prints a member list (borg list --short); 2-arg inventory is unchanged', async () => {
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        const members = 'instances/inst1/compose.yaml\ninstances/inst1/data/usage.sqlite\n'
+        const r = await sb.run(['borg-list', 'sdc1', 'inst1', A[0]], listEnv([A[0], A[1], A[2]]))
+        // listEnv sets FAKE_BORG_LIST, used both for the existence probe and the member list
+        expect(r.exitCode, r.stderr).toBe(0)
+        const calls = await sb.calls('borg')
+        expect(calls[0].argv).toEqual(['list', '--format', '{name}{NL}', '--sort-by', 'timestamp', '--', repo])
+        expect(calls[1].argv).toEqual(['list', '--short', '--', `${repo}::${A[0]}`])
+        refused(await sb.run(['borg-list', 'sdc1', 'inst1', A[3]], listEnv(A.slice(0, 3))), /archive '.*' is not in the repository/)
+        // 2-arg form is still borg info --json, no --last
+        const payload = JSON.stringify({ archives: [{ name: A[0] }] })
+        const inv = await sb.run(['borg-list', 'sdc1', 'inst1'], { FAKE_BORG_INFO: payload })
+        expect(inv.exitCode, inv.stderr).toBe(0)
+        expect(JSON.parse(inv.stdout)).toEqual(JSON.parse(payload))
+        const info = (await sb.calls('borg')).at(-1)!
+        expect(info.argv).toEqual(['info', '--json', '--', repo])
+        expect(info.argv).not.toContain('--last')
+    })
+
+    it('borg-extract-verify extracts into .idea-verify/<id>-<stamp>/, never instances/<id>, and refuses an existing target', async () => {
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        const live = path.join(bk, 'instances', 'inst1')
+        await fs.ensureDir(live)
+        await fs.writeFile(path.join(live, 'keep.txt'), 'live')
+        const stamp = '20261112T001825000Z'
+        const dest = path.join(bk, '.idea-verify', `inst1-${stamp}`)
+        const r = await sb.run(['borg-extract-verify', 'sdc1', 'inst1', A[0], stamp], { FAKE_BORG_EXTRACT: 'instances/inst1' })
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(await fs.pathExists(path.join(dest, 'instances', 'inst1', 'data.txt'))).toBe(true)
+        expect(await fs.readFile(path.join(live, 'keep.txt'), 'utf8')).toBe('live')
+        expect(await fs.pathExists(path.join(live, 'data.txt'))).toBe(false)
+        const st = await fs.stat(dest)
+        expect((st.mode & 0o777).toString(8)).toBe('700')
+        const [extract] = await sb.calls('borg')
+        expect(extract.argv).toEqual(['extract', '--numeric-ids', '--', `${repo}::${A[0]}`])
+        expect(extract.argv).not.toContain('--strip-components')
+        expect(extract.cwd).toBe(dest)
+        refused(await sb.run(['borg-extract-verify', 'sdc1', 'inst1', A[0], stamp]), /already exists/)
+        refused(await sb.run(['borg-extract-verify', 'system', 'inst1', A[0], stamp]), /a Backup Disk is never the system disk/)
+    })
+
+    it('borg-extract-verify leaves a partial tree on failure (never rm)', async () => {
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        const stamp = '20261112T001826000Z'
+        const dest = path.join(bk, '.idea-verify', `inst1-${stamp}`)
+        const r = await sb.run(['borg-extract-verify', 'sdc1', 'inst1', A[0], stamp], { FAKE_BORG_EXTRACT: 'instances/inst1', FAKE_BORG_EXIT: '1' })
+        expect(r.exitCode).toBe(1)
+        expect(await fs.pathExists(dest)).toBe(true)
+        expect(await fs.pathExists(path.join(dest, 'instances', 'inst1', 'data.txt'))).toBe(true)
+    })
+
+    it('quarantine-backups moves backups/ to .idea-quarantine/backups-<stamp>/ (mv only) and refuses a lock or the system disk', async () => {
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        await fs.writeFile(path.join(repo, 'kept.txt'), 'keep-me')
+        const r = await sb.run(['quarantine-backups', 'sdc1'])
+        expect(r.exitCode, r.stderr).toBe(0)
+        const dest = r.stdout.trim()
+        expect(dest.startsWith(path.join(bk, '.idea-quarantine', 'backups-'))).toBe(true)
+        expect(path.basename(dest)).toMatch(/^backups-[0-9]{8}T[0-9]{6,15}Z$/)
+        expect(await fs.pathExists(path.join(dest, 'inst1', 'kept.txt'))).toBe(true)
+        expect(await fs.pathExists(path.join(bk, 'backups'))).toBe(false)
+        // recreate backups with a lock — must refuse and leave backups/ in place
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        await fs.writeFile(path.join(repo, '.backup-in-progress'), JSON.stringify({ instanceId: 'inst1' }))
+        refused(await sb.run(['quarantine-backups', 'sdc1']), /\.backup-in-progress lock exists/)
+        expect(await fs.pathExists(path.join(repo, 'config'))).toBe(true)
+        refused(await sb.run(['quarantine-backups', 'system']), /a Backup Disk is never the system disk/)
+        // no rm of the quarantined tree
+        expect(await fs.pathExists(path.join(dest, 'inst1', 'kept.txt'))).toBe(true)
     })
 })
 

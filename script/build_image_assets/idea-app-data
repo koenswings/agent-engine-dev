@@ -56,9 +56,12 @@
 #   idea-app-data borg-info    <bdev> <id>
 #   idea-app-data borg-create  <bdev> <id> <archive> <srcRoot> [exclude…]   (v8, idea#443)
 #   idea-app-data borg-extract <bdev> <id> <archive> <strip> <dstRoot>
-#   idea-app-data borg-list    <bdev> <id>                                   (v9, idea#401)
+#   idea-app-data borg-list    <bdev> <id>                                   (v9, idea#401: archive inventory)
+#   idea-app-data borg-list    <bdev> <id> <archive>                         (v9, idea#446: member list of one archive)
+#   idea-app-data borg-extract-verify <bdev> <id> <archive> <stamp>          (v9, idea#446: extract into .idea-verify/<id>-<stamp>/, never instances/<id>)
 #   idea-app-data borg-delete  <bdev> <id> <archive> [keepMin]               (v9, idea#401; keepMin default 3)
 #   idea-app-data borg-compact <bdev> <id>                                   (v9, idea#401)
+#   idea-app-data quarantine-backups <bdev>                                 (v9, idea#446: move backups/ to .idea-quarantine/backups-<UTC stamp>/; never rm)
 #
 # Tokens (none can start with '-' or hold '..'; only trailing borg-create
 # excludes may hold '/'):
@@ -69,6 +72,7 @@
 #   bdev     like root but never 'system'; the disk must hold BACKUP.yaml
 #   id       ^[a-z0-9][a-z0-9-]{0,63}$
 #   archive  ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9-]{8,16}Z$   (backupInstance's format)
+#   stamp    ^[0-9]{8}T[0-9]{6,15}Z$   (UTC stamp for .idea-verify/<id>-<stamp>/; no '/', no '..')
 #   strip    ^[1-9]$
 #   exclude  instance-relative path (v8, idea#443): no leading '/', no '..',
 #            no globs; a bare name other than 'data' is treated as data/<name>.
@@ -216,6 +220,7 @@ RE_DEV='^sd[a-z][12]$'
 RE_ID='^[a-z0-9][a-z0-9-]{0,63}$'
 RE_SLOT='^[a-z0-9][a-z0-9-]{0,63}$'
 RE_ARCHIVE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9-]{8,16}Z$'
+RE_STAMP='^[0-9]{8}T[0-9]{6,15}Z$'
 RE_STRIP='^[1-9]$'
 RE_IPV4='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$'
 RE_HOST='^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$'
@@ -423,6 +428,11 @@ check_exclude_inside() {
 }
 
 check_id() { [[ "$1" =~ $RE_ID ]] || refuse "instance id '$1' does not match $RE_ID"; }
+check_stamp() {
+    [[ "$1" != -* ]] || refuse "stamp '$1' looks like an option"
+    [[ "$1" != */* && "$1" != *..* ]] || refuse "stamp '$1' is not a UTC stamp (no path, no '..')"
+    [[ "$1" =~ $RE_STAMP ]] || refuse "stamp '$1' does not match $RE_STAMP"
+}
 
 check_root_shape() {
     [[ "$1" == system || "$1" =~ $RE_DEV || "$1" =~ $RE_SLOT ]] \
@@ -1423,16 +1433,31 @@ case "$SUB" in
         ;;
 
     borg-list)
-        # idea#401 / helper v9: JSON of every archive (borg info --json, no --last)
-        # so the Engine can pick what to delete. Oldest-first sorting is Engine-side.
-        need 2 $(($# - 1)) "<bdev> <id>"
+        # idea#401 / helper v9: 2-arg form prints JSON of every archive
+        # (borg info --json, no --last). idea#446: 3-arg form lists members
+        # of one archive (borg list --short). The 2-arg inventory is unchanged.
+        given=$(($# - 1))
+        (( given == 2 || given == 3 )) || refuse "$SUB takes 2 or 3 argument(s) (<bdev> <id> [<archive>]), got $given"
         check_id "$3"
+        if (( given == 3 )); then
+            [[ "$4" =~ $RE_ARCHIVE ]] || refuse "archive name '$4' does not match $RE_ARCHIVE"
+        fi
         resolve_root "$2" backup
         REPO="$R_DIR/backups/$3"
         existing_dir "$REPO" "repository folder"
         [[ -f "$REPO/config" ]] || refuse "$REPO is not a Borg repository"
         borg_env
-        run_child $BORG info --json -- "$REPO"
+        if (( given == 2 )); then
+            run_child $BORG info --json -- "$REPO"
+            exit $?
+        fi
+        LIST=$($BORG list --format '{name}{NL}' --sort-by timestamp -- "$REPO") || refuse "cannot list archives in $REPO"
+        FOUND=0
+        while IFS= read -r n; do
+            [[ "$n" == "$4" ]] && FOUND=1 && break
+        done <<< "$LIST"
+        (( FOUND == 1 )) || refuse "archive '$4' is not in the repository"
+        run_child $BORG list --short -- "$REPO::$4"
         exit $?
         ;;
 
@@ -1486,6 +1511,74 @@ case "$SUB" in
         borg_env
         run_child $BORG compact -- "$REPO"
         exit $?
+        ;;
+
+    borg-extract-verify)
+        # idea#446 / helper v9: extract one archive into
+        # <backup disk>/.idea-verify/<id>-<stamp>/ (root-owned 0700).
+        # Never writes under instances/<id>, never replaces an existing tree,
+        # never deletes a partial extract on failure.
+        need 4 $(($# - 1)) "<bdev> <id> <archive> <stamp>"
+        check_id "$3"
+        [[ "$4" =~ $RE_ARCHIVE ]] || refuse "archive name '$4' does not match $RE_ARCHIVE"
+        check_stamp "$5"
+        resolve_root "$2" backup
+        REPO="$R_DIR/backups/$3"
+        existing_dir "$REPO" "repository folder"
+        [[ -f "$REPO/config" ]] || refuse "$REPO is not a Borg repository"
+        # Destination is on the Backup Disk only — never any instances/ folder.
+        VDIR="$R_DIR/.idea-verify"
+        DEST="$VDIR/$3-$5"
+        case "$DEST" in
+            "$R_DIR/instances"|"$R_DIR/instances"/*) refuse "internal error: verify path would write under instances/" ;;
+        esac
+        if [[ -e "$DEST" || -L "$DEST" ]]; then refuse "verify folder $DEST already exists"; fi
+        root_dir "$VDIR" 0700 "verify folder"
+        $CHMOD 0700 -- "$VDIR" || refuse "cannot set mode 0700 on $VDIR"
+        take_locks "repo.$2.$3"
+        $MKDIR -m 0700 -- "$DEST" || refuse "cannot create $DEST"
+        [[ -d "$DEST" && ! -L "$DEST" ]] || refuse "verify folder $DEST is missing or a symlink"
+        read -r DEST_UID _ DEST_MODE <<<"$(stat_fields "$DEST")"
+        [[ "$DEST_UID" == "$ROOT_UID" && "$DEST_MODE" == 700 ]] || refuse "verify folder $DEST must be owned by root with mode 0700"
+        pin_cwd "$DEST"
+        borg_env
+        EC=0
+        # Extract the archive as stored (no --strip-components, no instances/ replace).
+        run_child $BORG extract --numeric-ids -- "$REPO::$4" || EC=$?
+        cd /
+        # On failure leave the partial tree (never rm). On success leave it too.
+        exit "$EC"
+        ;;
+
+    quarantine-backups)
+        # idea#446 / helper v9: move <disk>/backups/ to
+        # <disk>/.idea-quarantine/backups-<UTC stamp>/ (mv only, never rm).
+        need 1 $(($# - 1)) "<bdev>"
+        resolve_root "$2" backup
+        BACKUPS="$R_DIR/backups"
+        existing_dir "$BACKUPS" "backups folder"
+        if [[ -e "$BACKUPS/.backup-in-progress" || -L "$BACKUPS/.backup-in-progress" ]]; then
+            refuse "a .backup-in-progress lock exists at $BACKUPS/.backup-in-progress"
+        fi
+        shopt -s nullglob
+        for instdir in "$BACKUPS"/*; do
+            if [[ -e "$instdir/.backup-in-progress" || -L "$instdir/.backup-in-progress" ]]; then
+                shopt -u nullglob
+                refuse "a .backup-in-progress lock exists at $instdir/.backup-in-progress"
+            fi
+        done
+        shopt -u nullglob
+        QDIR="$R_DIR/.idea-quarantine"
+        root_dir "$QDIR" 0700 "quarantine folder"
+        $CHMOD 0700 -- "$QDIR" || refuse "cannot set mode 0700 on $QDIR"
+        QDEST="$QDIR/backups-$($DATE -u +%Y%m%dT%H%M%S%NZ)"
+        [[ ! -e "$QDEST" && ! -L "$QDEST" ]] || refuse "$QDEST already exists"
+        take_locks "backups.$2"
+        $MV -T -- "$BACKUPS" "$QDEST" || refuse "cannot move $BACKUPS to $QDEST"
+        $CHMOD 0700 -- "$QDEST" || true
+        journal "quarantine-backups: $BACKUPS -> $QDEST"
+        echo "$QDEST"
+        exit 0
         ;;
 
     erase-slot)
@@ -1579,7 +1672,7 @@ case "$SUB" in
         ;;
 
     "")
-        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, borg-init, borg-info, borg-create, borg-extract, borg-list, borg-delete, borg-compact, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, sync-peers, install-usage-key)"
+        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, borg-init, borg-info, borg-create, borg-extract, borg-list, borg-extract-verify, borg-delete, borg-compact, quarantine-backups, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, sync-peers, install-usage-key)"
         ;;
     *)
         refuse "unknown subcommand '$(printf '%q' "$SUB")'"
