@@ -44,8 +44,16 @@ describe('idea#332: committed WS doc fixtures', () => {
         expect(fs.existsSync(commandLogFixturePath(3))).toBe(false)
         const generated = generateCommandLogDoc(3)
         const loaded = commandLogDoc(3)
-        const doc = A.load(loaded) as { logs: unknown[] }
-        expect(doc.logs.length).toBe(3)
-        expect(loaded.byteLength).toBe(generated.byteLength)
+        type LogDoc = { logs: Array<{ ts: number, msg: string }> }
+        const generatedJs = A.toJS(A.load(generated)) as LogDoc
+        const loadedJs = A.toJS(A.load(loaded)) as LogDoc
+        expect(loadedJs.logs.length).toBe(3)
+        expect(generatedJs.logs.length).toBe(3)
+        const expected = [0, 1, 2].map((i) => ({
+            ts: 1791000000000 + i,
+            msg: `step ${i}: docker compose pull kolibri ... ok`,
+        }))
+        expect(loadedJs.logs).toEqual(expected)
+        expect(generatedJs.logs).toEqual(expected)
     })
 })
