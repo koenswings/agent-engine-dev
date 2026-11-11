@@ -10,6 +10,7 @@
  *  - shims in /root/.idea-build/shims (first on PATH) turn udevadm, systemd-tmpfiles,
  *    reboot and hostnamectl into no-ops/refusals and refuse every pm2/docker daemon
  *    command, so the existing installers in Engine.ts can be reused unchanged
+ *  - /run/sshd is created (sshd -t needs the privilege-separation dir; the host /run is bind-mounted)
  *  - SSH host keys are made only so `sshd -t` can check the peer drop-in, then removed
  * After the install: sanitiseRootfs + verifyRootfs (engineImage.ts). Exit non-zero on any problem.
  */
@@ -130,10 +131,12 @@ export const rootfsSteps = (o: RootfsBuildOptions, r: Runner, inst: Installers):
     const E = o.enginePath
     const L = o.lock
     return [
-        { name: 'guards: policy-rc.d, shims, temporary ssh host keys', run: async () => {
+        { name: 'guards: policy-rc.d, shims, /run/sshd, temporary ssh host keys', run: async () => {
             await r.host(`install -d -m 0700 ${q(R('/root/.idea-build'))} && install -d -m 0755 ${q(R(SHIM_DIR))}`)
             for (const [n, body] of Object.entries(SHIMS)) await r.host(`printf %s ${q(body)} > ${q(R(`${SHIM_DIR}/${n}`))} && chmod 0755 ${q(R(`${SHIM_DIR}/${n}`))}`)
             await r.host(`printf '#!/bin/sh\\nexit 101\\n' > ${q(R('/usr/sbin/policy-rc.d'))} && chmod 0755 ${q(R('/usr/sbin/policy-rc.d'))}`)
+            // idea build.sh bind-mounts the host /run; sshd -t (installPeerAccess) needs /run/sshd
+            await r.host(`install -d -m 0755 ${q(R('/run/sshd'))}`)
             await r.chroot('ssh-keygen -A >/dev/null')
         } },
         { name: 'Engine source at the locked commit + offline caches', run: async () => {

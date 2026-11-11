@@ -29,7 +29,9 @@ No SSH, nothing started, no device identity. Inside `chroot <MNT>`:
 1. Guards: `usr/sbin/policy-rc.d` (exit 101: apt never starts a service), shims first on PATH
    (`/root/.idea-build/shims`: `sudo` without secure_path, `udevadm`/`systemd-tmpfiles`/`reboot` no-ops,
    `hostnamectl` refused, `timedatectl set-timezone` as a symlink, `pm2` and `docker` refuse anything but `--version`),
-   temporary SSH host keys so `sshd -t` can check the peer drop-in. `systemctl` in a chroot only enables.
+   temporary SSH host keys so `sshd -t` can check the peer drop-in, and `/run/sshd` (sshd's
+   privilege-separation directory; idea `build.sh` bind-mounts the host `/run`, which may not have it).
+   `systemctl` in a chroot only enables.
 2. The Engine at the locked commit, as current Engines have it (a git checkout, like provision-fleet.sh and install.sh):
    a SHALLOW clone (`git init` + `git fetch --depth 1 file://<engine-src> <commit>`) into
    `/home/pi/idea/agents/agent-engine-dev`, detached at the commit, origin set to the GitHub URL. `.git` holds that
