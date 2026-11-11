@@ -4,7 +4,7 @@ import { $, YAML, chalk, fs, os, sleep } from "zx";
 
 $.verbose = false;
 import { ensureNcAdminPassword } from "./AppSecrets.js";
-import { addOrUpdateEnvVariable, deepPrint, log, randomPort, readEnvVariable, uuid, print, isEngineOnline } from "../utils/utils.js";
+import { addOrUpdateEnvVariable, deepPrint, log, randomPort, readEnvVariable, uuid, print, isEngineOnline, isHttpPortReady } from "../utils/utils.js";
 import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber, ServiceImage, Timestamp, Version, DeviceName, InstanceName, AppName, Hostname, DiskID, OperationCause, EngineID } from "./CommonTypes.js";
 import { createOperation, updateOperation } from './Operations.js'
 import { composeFileEnv } from './FilesMount.js'
@@ -769,17 +769,38 @@ export const assertComposeContainersHealthy = async (instanceDir: string, instan
 
 
 /**
- * Prefer A r40: after compose up, require the instance host port to accept TCP
- * for a short stable window before Automerge Running. Covers the Kolibri
- * `start && tail -f` pattern where ZeroConfPlugin dies (~8s) but Docker stays
- * Up (r40 FAIL@102). When the port stays dead, force-recreate once and
- * re-probe; still dead → throw (startInstance marks Error).
+ * After compose up, require the instance host port to stay ready for a short
+ * stable window before Automerge Running (r40 / idea#437).
+ *
+ * Ready means the port accepts TCP and, by default, answers with an HTTP
+ * status line (any 1xx–5xx). docker-proxy accepts TCP before the app inside
+ * serves (seen on Nextcloud 1.4's first start: occ works in the
+ * before-starting hooks, apache2-foreground has not started, and a GET
+ * fails with a connection error). 503 counts: Nextcloud returns it during
+ * maintenance/install, which still means the HTTP server is speaking.
+ * Port-ready is not "fully installed"; Files-mount already holds remounts
+ * until occ reports installed and not in maintenance (idea#133).
+ *
+ * instance.port is the Console URL (`http://<lanAddress>:<port>`), so HTTP
+ * is the existing convention. Pass `probe: 'tcp'` to keep the r40 TCP-only
+ * check. There is no META / x-app field for a non-HTTP instance port;
+ * adding one would be a contract change.
+ *
+ * If TCP itself never comes up, force-recreate once (r40 Kolibri
+ * `start && tail -f`). If TCP is up but HTTP has not answered, do not
+ * force-recreate: that would kill a long entrypoint (Nextcloud first install).
  */
 export const assertInstancePortReady = async (
   instanceId: InstanceID,
   port: number,
   instanceDir: string,
-  opts: { readyTimeoutMs?: number; stableMs?: number; forceRecreate?: boolean } = {},
+  opts: {
+    readyTimeoutMs?: number
+    stableMs?: number
+    forceRecreate?: boolean
+    probe?: 'http' | 'tcp'
+    probeTimeoutMs?: number
+  } = {},
 ): Promise<void> => {
   if (!port || !Number.isFinite(port) || port <= 0) {
     log(`assertInstancePortReady: no port for ${instanceId}; skipping sidecar probe`)
@@ -788,40 +809,59 @@ export const assertInstancePortReady = async (
   const readyTimeoutMs = opts.readyTimeoutMs ?? 60_000
   const stableMs = opts.stableMs ?? 10_000
   const forceRecreate = opts.forceRecreate !== false
+  const probe = opts.probe ?? 'http'
+  const probeTimeoutMs = opts.probeTimeoutMs ?? 2_000
 
-  const probeStable = async (budgetMs: number): Promise<boolean> => {
+  const probeOnce = async (): Promise<{ tcp: boolean; ready: boolean }> => {
+    const tcp = await isEngineOnline('127.0.0.1', port)
+    if (!tcp) return { tcp: false, ready: false }
+    if (probe === 'tcp') return { tcp: true, ready: true }
+    return { tcp: true, ready: await isHttpPortReady('127.0.0.1', port, probeTimeoutMs) }
+  }
+
+  const probeStable = async (budgetMs: number): Promise<'ready' | 'tcp-only' | 'down'> => {
     const deadline = Date.now() + budgetMs
     let firstReadyAt: number | null = null
+    let sawTcp = false
     while (Date.now() < deadline) {
-      const up = await isEngineOnline('127.0.0.1', port)
-      if (up) {
+      const { tcp, ready } = await probeOnce()
+      if (tcp) sawTcp = true
+      if (ready) {
         if (firstReadyAt === null) firstReadyAt = Date.now()
-        else if (Date.now() - firstReadyAt >= stableMs) return true
+        else if (Date.now() - firstReadyAt >= stableMs) return 'ready'
       } else {
         firstReadyAt = null
       }
-      await sleep(1000)
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) break
+      await sleep(Math.min(1000, remaining))
     }
-    return false
+    return sawTcp ? 'tcp-only' : 'down'
   }
 
-  if (await probeStable(readyTimeoutMs)) {
-    log(`assertInstancePortReady: ${instanceId} :${port} stable for ${stableMs}ms`)
+  let outcome = await probeStable(readyTimeoutMs)
+  if (outcome === 'ready') {
+    log(`assertInstancePortReady: ${instanceId} :${port} stable for ${stableMs}ms (${probe})`)
     return
   }
 
-  if (forceRecreate) {
+  let didRecreate = false
+  if (forceRecreate && outcome === 'down') {
     log(`assertInstancePortReady: ${instanceId} :${port} not ready — force-recreate once (r40/r22)`)
+    didRecreate = true
     try {
       await $({ cwd: instanceDir } as any)`docker compose up -d --force-recreate`
     } catch (e: any) {
       log(`assertInstancePortReady: force-recreate failed: ${e?.message ?? e}`)
     }
     await assertComposeContainersHealthy(instanceDir, instanceId)
-    if (await probeStable(readyTimeoutMs)) {
+    outcome = await probeStable(readyTimeoutMs)
+    if (outcome === 'ready') {
       log(`assertInstancePortReady: ${instanceId} :${port} stable after force-recreate`)
       return
     }
+  } else if (forceRecreate && outcome === 'tcp-only' && probe === 'http') {
+    log(`assertInstancePortReady: ${instanceId} :${port} accepted TCP but HTTP never answered — skipping force-recreate (idea#437)`)
   }
 
   // Pull a short log tail to surface ZeroConf / NonUniqueNameException in the Error.
@@ -845,9 +885,18 @@ export const assertInstancePortReady = async (
     }
   } catch { /* ignore */ }
 
+  const recreateNote = didRecreate ? ' (and after one force-recreate)' : ''
+  if (probe === 'http' && outcome === 'tcp-only') {
+    throw new Error(
+      `Instance ${instanceId} container is up but host port ${port} accepted TCP without answering HTTP ` +
+      `for ${stableMs}ms within ${readyTimeoutMs}ms${recreateNote}. ` +
+      `docker-proxy can accept TCP before the app serves (idea#437). ` +
+      `Automerge must not stay Running until an HTTP status line is seen.${hint}`,
+    )
+  }
   throw new Error(
     `Instance ${instanceId} container is up but host port ${port} never stayed ready ` +
-    `for ${stableMs}ms within ${readyTimeoutMs}ms (and after one force-recreate). ` +
+    `for ${stableMs}ms within ${readyTimeoutMs}ms${recreateNote}. ` +
     `Automerge must not stay Running with a dead sidecar.${hint} ` +
     `If this is Kolibri after copyApp, the copy likely still shares the original morango ` +
     `instance id (zeroconf NonUniqueNameException); see rebindKolibriMorangoInstanceId.`,
@@ -1503,9 +1552,11 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
 
 /**
  * Start the containers of an instance (`docker compose up -d`) and set it to
- * Running. Running is written only after `compose up` has succeeded (idea#109):
- * an instance never shows Running while its containers failed to start.
- * Errors from `compose up` propagate to the caller, which sets Error
+ * Running. Running is written only after `compose up` has succeeded (idea#109)
+ * and the instance host port has answered HTTP for a stable window (idea#437):
+ * an instance never shows Running while its containers failed to start, or
+ * while docker-proxy accepts TCP before the app serves. Errors from `compose
+ * up` or the port probe propagate to the caller, which sets Error
  * (startInstance also records a failed command-log trace).
  */
 export const runInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk): Promise<void> => {
