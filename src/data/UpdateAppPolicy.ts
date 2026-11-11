@@ -61,14 +61,42 @@ export interface CheckFacts {
 
 export const BACKUP_MAX_AGE_MS = 60 * 60 * 1000
 
+/** createAppId(undefined, undefined) stringifies missing x-app.name / x-app.version as "undefined". */
+const isMissingAppField = (value: string): boolean => value === '' || value === 'undefined'
+
+const showAppField = (value: string): string => isMissingAppField(value) ? '(missing)' : value
+
+/**
+ * Why updateApp should refuse DIFFERENT_APP: missing or mismatched x-app.name
+ * and/or x-app.version, with the instance's actual values and the bundle's expected ones.
+ * createOrUpdateInstance sets instanceOf from those compose fields, so a bundle
+ * without them becomes `undefined-undefined` (seen on idea04 during #311).
+ */
+export const appIdentityProblems = (currentAppId: string, newAppId: string): string | null => {
+    const cur = parseAppId(currentAppId), nxt = parseAppId(newAppId)
+    const problems: string[] = []
+    if (isMissingAppField(cur.name) || isMissingAppField(nxt.name)) {
+        problems.push(`x-app.name is missing (actual: ${showAppField(cur.name)}, expected: ${showAppField(nxt.name)})`)
+    } else if (cur.name !== nxt.name) {
+        problems.push(`x-app.name mismatch (actual: ${cur.name}, expected: ${nxt.name})`)
+    }
+    if (isMissingAppField(cur.version) || isMissingAppField(nxt.version)) {
+        problems.push(`x-app.version is missing (actual: ${showAppField(cur.version)}, expected: ${showAppField(nxt.version)})`)
+    } else if (cur.name !== nxt.name && cur.version !== nxt.version) {
+        problems.push(`x-app.version mismatch (actual: ${cur.version}, expected: ${nxt.version})`)
+    }
+    return problems.length ? problems.join('; ') : null
+}
+
 /** First refusal in the agreed order, or null when the update may go ahead. */
 export const checkUpdate = (f: CheckFacts): UpdateAppError | null => {
     if (!f.diskDocked) return new UpdateAppError('NOT_DOCKED', 'the App Disk is not docked to this Engine')
     if (f.busy) return new UpdateAppError('BUSY', 'another operation is running on this instance')
     if (!f.sourcePresent) return new UpdateAppError('SOURCE_MISSING', `bundle ${f.newAppId} was not found on the source`)
     if (!f.sumsValid) return new UpdateAppError('NO_SUMS', `bundle ${f.newAppId} has no valid SHA256SUMS`)
+    const identity = appIdentityProblems(f.currentAppId, f.newAppId)
+    if (identity) return new UpdateAppError('DIFFERENT_APP', identity)
     const cur = parseAppId(f.currentAppId), nxt = parseAppId(f.newAppId)
-    if (cur.name !== nxt.name) return new UpdateAppError('DIFFERENT_APP', `${f.newAppId} is not a version of ${cur.name}`)
     if (!isUpgrade(cur.version, nxt.version)) return new UpdateAppError('NOT_NEWER', `${nxt.version} is not newer than ${cur.version}`)
     const major = isMajorChange(cur.version, nxt.version)
     if (major && !f.allowMajor) return new UpdateAppError('MAJOR_NOT_ALLOWED', `${cur.version} -> ${nxt.version} is a major update; pass --allow-major`)

@@ -148,7 +148,13 @@ if [[ "\${1:-}" == volume && "\${2:-}" == inspect ]]; then echo "\${FAKE_DOCKER_
 [[ -n "\${FAKE_DOCKER_PS:-}" ]] && echo "$FAKE_DOCKER_PS"
 exit \${FAKE_DOCKER_EXIT:-0}`)
     // df -Pk -- <dir>: header + one line, Available = FAKE_DF_AVAIL_KB (default: plenty)
+    // GNU df refuses an empty path (`df -Pk -- ""`); SYSTEM_ROOT='' must not reach it (idea#427).
     await fake('df', `${RECORD('df', callsDir)}
+target="\${@: -1}"
+if [[ -z "$target" || "$target" == -- ]]; then
+  echo "df: '': No such file or directory" >&2
+  exit 1
+fi
 echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
 echo "/dev/fake 99999999 1 \${FAKE_DF_AVAIL_KB:-99999998} 1% /"`)
     // runuser -u <user> -- <cmd…>: record, then run <cmd…> as the test user
