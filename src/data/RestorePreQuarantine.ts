@@ -13,10 +13,10 @@
  * lives on the target, the old folder exists, and the old copy is not running.
  * A helper older than v4 refuses the restore up front with HELPER_OUTDATED.
  */
-import { fs, path } from 'zx'
+import { fs } from 'zx'
 import type { Store } from './Store.js'
 import type { InstanceID } from './CommonTypes.js'
-import { Disk, diskMountRoot, appDataRoot } from './Disk.js'
+import { Disk, diskPath, appDataRoot } from './Disk.js'
 import { runAppData, quarantineArgs, helperAtLeast } from '../utils/appDataHelper.js'
 import { log } from '../utils/utils.js'
 
@@ -30,7 +30,7 @@ export interface PreQuarantineDeps {
 
 export const defaultPreQuarantineDeps: PreQuarantineDeps = {
     helperProblem: () => helperAtLeast(RESTORE_QUARANTINE_HELPER_MIN, 'restoreApp to another disk'),
-    folderExists: async (disk, id) => fs.pathExists(path.join(await diskMountRoot(disk), 'instances', String(id))),
+    folderExists: async (disk, id) => fs.pathExists(await diskPath(disk, 'instances', String(id))),
     quarantine: async (disk, id) => (await runAppData(quarantineArgs(await appDataRoot(disk), String(id)))).trim(),
 }
 
