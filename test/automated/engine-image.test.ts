@@ -133,7 +133,7 @@ const goodRootfs = async (root: string) => {
     await addSshLogin(root)
 }
 /** The repo's sshd assets as the build installs them (idea#453): Debian sshd_config, login + peer drop-ins, operator keys. */
-const ASSETS = path.join(__dirname, '../../script/build_image_assets')
+const ASSETS = path.resolve('script/build_image_assets') // cwd = repo root (vitest and the dist-test gate)
 const DEBIAN_SSHD_CONFIG = 'Include /etc/ssh/sshd_config.d/*.conf\n#PasswordAuthentication yes\nKbdInteractiveAuthentication no\nUsePAM yes\nSubsystem sftp /usr/lib/openssh/sftp-server\n'
 const addSshLogin = async (root: string) => {
     const R = (p: string) => path.join(root, p)
