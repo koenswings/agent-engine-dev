@@ -11,7 +11,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { spawn } from 'child_process'
 import { fs, path } from 'zx'
 import { makeAppDataSandbox, AppDataSandbox, HELPER_SOURCE } from '../harness/appDataSandbox.js'
-import { APP_DATA_HELPER, APP_DATA_HELPER_VERSION } from '../../src/utils/appDataHelper.js'
+import { APP_DATA_HELPER, APP_DATA_HELPER_VERSION, borgListArgs, borgExtractVerifyArgs, quarantineBackupsArgs, verifyStampNow, checkStamp } from '../../src/utils/appDataHelper.js'
+import { parseBorgListInventory, parseBorgMemberList, instanceRelativeMember, newestArchive, verifyDir } from '../../src/data/BackupVerify.js'
 import { peerSshOptions, PEER_KNOWN_HOSTS } from '../../src/utils/peerSsh.js'
 
 let sb: AppDataSandbox
@@ -1082,6 +1083,107 @@ describe('idea-app-data: borg-list / borg-delete / borg-compact (idea#401, helpe
         refused(await sb.run(['quarantine-backups', 'system']), /a Backup Disk is never the system disk/)
         // no rm of the quarantined tree
         expect(await fs.pathExists(path.join(dest, 'inst1', 'kept.txt'))).toBe(true)
+    })
+})
+
+
+describe('Engine argv builders agree with helper v9 (idea#446)', () => {
+    const A = [
+        '2026-01-01T00-00-00-000Z',
+        '2026-01-02T00-00-00-000Z',
+        '2026-01-03T00-00-00-000Z',
+    ]
+    const membersText = [
+        `disks/sdc1/instances/inst1/compose.yaml`,
+        `disks/sdc1/instances/inst1/data/hello.txt`,
+        `disks/sdc1/instances/inst1/.env`,
+    ].join('\n')
+    let bk: string
+    beforeEach(async () => {
+        bk = await sb.addDisk('sdc1', { backup: true })
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+    })
+
+    it('borgListArgs inventory: helper prints borg info --json --glob-archives * and the Engine parses sizes / newest', async () => {
+        const payload = JSON.stringify({
+            archives: [
+                { name: A[0], start: '2026-01-01T00:00:00.000000', stats: { original_size: 100, compressed_size: 40 } },
+                { name: A[2], start: '2026-01-03T00:00:00.000000', stats: { original_size: 300, compressed_size: 90 } },
+                { name: A[1], start: '2026-01-02T00:00:00.000000', stats: { original_size: 200, compressed_size: 80 } },
+            ],
+        })
+        const r = await sb.run(borgListArgs('sdc1', 'inst1'), { FAKE_BORG_INFO: payload })
+        expect(r.exitCode, r.stderr).toBe(0)
+        const archives = parseBorgListInventory(r.stdout)
+        expect(archives.map(a => a.name)).toEqual([A[0], A[2], A[1]])
+        expect(archives[2].originalSize).toBe(200)
+        expect(newestArchive(archives).name).toBe(A[2])
+        const [info] = await sb.calls('borg')
+        expect(info.argv).toEqual(['info', '--json', '--glob-archives', '*', '--', path.join(bk, 'backups', 'inst1')])
+        expect(info.argv).not.toContain('--last')
+    })
+
+    it('borgListArgs with archive: helper member list (borg list --short) parses as instance-relative paths', async () => {
+        const r = await sb.run(borgListArgs('sdc1', 'inst1', A[0]), {
+            FAKE_BORG_LIST: A.join('\n'),
+            FAKE_BORG_MEMBERS: membersText,
+        })
+        expect(r.exitCode, r.stderr).toBe(0)
+        const members = parseBorgMemberList(r.stdout)
+        expect(members).toEqual(membersText.split('\n'))
+        expect(instanceRelativeMember(members[0], 'inst1')).toBe('compose.yaml')
+        expect(instanceRelativeMember(members[1], 'inst1')).toBe('data/hello.txt')
+        const calls = await sb.calls('borg')
+        expect(calls[0].argv[0]).toBe('list')
+        expect(calls[1].argv).toEqual(['list', '--short', '--', `${path.join(bk, 'backups', 'inst1')}::${A[0]}`])
+        refused(await sb.run(borgListArgs('sdc1', 'inst1', '2026-12-31T00-00-00-000Z'), { FAKE_BORG_LIST: A.join('\n') }), /archive '.*' is not in the repository/)
+    })
+
+    it('borgExtractVerifyArgs uses checkStamp / verifyStampNow and extracts into Engine verifyDir, never instances/<id>', async () => {
+        const live = path.join(bk, 'instances', 'inst1')
+        await fs.ensureDir(live)
+        await fs.writeFile(path.join(live, 'keep.txt'), 'live')
+        const stamp = verifyStampNow(new Date('2026-11-12T00:18:25.000Z'))
+        expect(stamp).toBe('20261112T001825000Z')
+        expect(checkStamp(stamp)).toBe(stamp)
+        const dest = verifyDir('sdc1', 'inst1', stamp)
+        // disksRoot in the sandbox is sb.disks, not the Engine's live disksRoot(); compare the helper's dest.
+        const helperDest = path.join(bk, '.idea-verify', `inst1-${stamp}`)
+        expect(path.basename(dest)).toBe(`inst1-${stamp}`)
+        const r = await sb.run(borgExtractVerifyArgs('sdc1', 'inst1', A[0], stamp), { FAKE_BORG_EXTRACT: 'instances/inst1' })
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(r.stdout.trim()).toBe('') // helper does not print the dest path
+        expect(await fs.pathExists(path.join(helperDest, 'instances', 'inst1', 'data.txt'))).toBe(true)
+        expect(await fs.readFile(path.join(live, 'keep.txt'), 'utf8')).toBe('live')
+        expect(await fs.pathExists(path.join(live, 'data.txt'))).toBe(false)
+        const [extract] = await sb.calls('borg')
+        expect(extract.argv).toEqual(['extract', '--numeric-ids', '--', `${path.join(bk, 'backups', 'inst1')}::${A[0]}`])
+        expect(extract.argv).not.toContain('--strip-components')
+        expect(extract.cwd).toBe(helperDest)
+        refused(await sb.run(borgExtractVerifyArgs('sdc1', 'inst1', A[0], stamp)), /already exists/)
+        refused(await sb.run(borgExtractVerifyArgs('system', 'inst1', A[0], '20261112T001825001Z')), /a Backup Disk is never the system disk/)
+    })
+
+    it('quarantineBackupsArgs moves backups/ and prints the dest path the Engine reads', async () => {
+        await fs.writeFile(path.join(bk, 'backups', 'inst1', 'kept.txt'), 'keep-me')
+        const r = await sb.run(quarantineBackupsArgs('sdc1'))
+        expect(r.exitCode, r.stderr).toBe(0)
+        const dest = r.stdout.trim().split(/\r?\n/).filter(Boolean).pop() as string
+        expect(dest.startsWith(path.join(bk, '.idea-quarantine', 'backups-'))).toBe(true)
+        expect(path.basename(dest)).toMatch(/^backups-[0-9]{8}T[0-9]{6,15}Z$/)
+        expect(await fs.pathExists(path.join(dest, 'inst1', 'kept.txt'))).toBe(true)
+        expect(await fs.pathExists(path.join(bk, 'backups'))).toBe(false)
+        refused(await sb.run(quarantineBackupsArgs('system')), /a Backup Disk is never the system disk/)
+    })
+
+    it('Engine builders refuse bad tokens before the helper runs, with the same token rules as RE_ARCHIVE / RE_STAMP', async () => {
+        expect(() => borgListArgs('sdc1', 'inst1', 'latest')).toThrow(/not a backup archive name/)
+        expect(() => borgExtractVerifyArgs('sdc1', 'inst1', A[0], '2026-11-12T00:18:25Z')).toThrow(/not a UTC stamp/)
+        expect(() => borgExtractVerifyArgs('sdc1', 'inst1', A[0], '-20261112T001825Z')).toThrow(/not a UTC stamp/)
+        expect(() => quarantineBackupsArgs('/disks/sdc1')).toThrow(/not a disk root/)
+        expect(await sb.calls('borg')).toEqual([])
     })
 })
 

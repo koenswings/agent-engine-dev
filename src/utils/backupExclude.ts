@@ -126,3 +126,36 @@ export const excludeStaysInside = (instanceRoot: string, rel: string): boolean =
     // Lexical resolve of . / .. already refused; this is a prefix guard.
     return joined === root || joined.startsWith(`${root}/`)
 }
+
+/**
+ * Read optional `x-app.backup.verify.present` / `verify.absent` (idea#446).
+ * Same path rules as `exclude`. Missing verify block or missing lists → empty.
+ * A present but malformed list or a non-mapping `verify` throws (fail closed).
+ */
+export const parseBackupVerifyLists = (xapp: unknown): { present: string[]; absent: string[] } => {
+    const backup = backupMapping(xapp)
+    if (!backup) return { present: [], absent: [] }
+    const raw = backup.verify
+    if (raw === undefined || raw === null) return { present: [], absent: [] }
+    if (typeof raw !== 'object' || Array.isArray(raw)) {
+        throw new Error('x-app.backup.verify is not a mapping')
+    }
+    const v = raw as Record<string, unknown>
+    const parse = (field: 'present' | 'absent'): string[] => {
+        const ex = v[field]
+        if (ex === undefined || ex === null) return []
+        if (!Array.isArray(ex)) throw new Error(`x-app.backup.verify.${field} must be a list of paths`)
+        const out: string[] = []
+        const seen = new Set<string>()
+        for (const item of ex) {
+            const n = normalizeBackupExclude(item, `verify.${field}`)
+            if (!seen.has(n)) {
+                seen.add(n)
+                out.push(n)
+            }
+        }
+        return out
+    }
+    return { present: parse('present'), absent: parse('absent') }
+}
+
