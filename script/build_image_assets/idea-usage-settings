@@ -1,0 +1,163 @@
+#!/usr/bin/python3
+# idea-usage-settings — operator toggle for usageMonitoring (idea#411).
+#
+# Installed as a root-owned COPY at /usr/local/sbin/idea-usage-settings (0755,
+# never a symlink) by build-engine (installRootHelpers). Operators and
+# tools/fleet/usage-monitoring.sh invoke it as pi. It is NOT the collector
+# forced command (that is idea-usage-export) and is not a verb of
+# idea-app-data, so a usage-pull key cannot flip the switch.
+#
+# Accepts only (via SSH_ORIGINAL_COMMAND, or argv so tests can call it directly):
+#   on
+#   off
+#   status
+# Missing settings.json is off. on/off are idempotent (exit 0; no rewrite when
+# the file already has that value; off against a missing file creates nothing).
+# Writes atomically to /var/lib/idea/usage/settings.json (or IDEA_USAGE_ROOT).
+# Mode 0640; owner pi:pi when running as root. Never starts, stops or restarts
+# pm2, docker, systemd or any App. idea-usage re-reads the file at least once
+# a minute (and on SIGHUP).
+#
+# Exit 0 success; exit 2 invalid arguments; exit 1 unexpected failure.
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+DEFAULT_ROOT = "/var/lib/idea/usage"
+SHELL_META = set("|;&<>`$(){}[]!*?~#\\'\"\n\r")
+ALLOWED = ("on", "off", "status")
+
+
+def usage_root() -> Path:
+    raw = os.environ.get("IDEA_USAGE_ROOT") or DEFAULT_ROOT
+    return Path(raw)
+
+
+def reject_args() -> None:
+    sys.stderr.write("invalid arguments\n")
+    raise SystemExit(2)
+
+
+def fail(reason: str) -> None:
+    sys.stderr.write(reason + "\n")
+    raise SystemExit(1)
+
+
+def original_command() -> str:
+    env_cmd = os.environ.get("SSH_ORIGINAL_COMMAND")
+    if env_cmd:
+        return env_cmd
+    return " ".join(sys.argv[1:])
+
+
+def parse_command(raw: str) -> str:
+    if raw is None:
+        reject_args()
+    if any(ch in SHELL_META for ch in raw):
+        reject_args()
+    tokens = raw.split()
+    if len(tokens) == 1 and tokens[0] in ALLOWED:
+        return tokens[0]
+    reject_args()
+    raise AssertionError("unreachable")
+
+
+def payload_for(value: str) -> str:
+    return json.dumps({"usageMonitoring": value}, separators=(",", ":")) + "\n"
+
+
+def read_status(root: Path) -> str:
+    settings = root / "settings.json"
+    if not settings.exists():
+        return "off"
+    if settings.is_symlink() or not settings.is_file():
+        fail("unreadable settings")
+    try:
+        data = json.loads(settings.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        fail("unreadable settings")
+    if not isinstance(data, dict):
+        fail("unreadable settings")
+    value = data.get("usageMonitoring", "off")
+    if value not in ("on", "off"):
+        fail("unreadable settings")
+    return value
+
+
+def already_set(root: Path, value: str) -> bool:
+    settings = root / "settings.json"
+    if value == "off" and not settings.exists():
+        return True
+    if not settings.exists():
+        return False
+    if settings.is_symlink() or not settings.is_file():
+        fail("settings.json is not a regular file")
+    try:
+        return settings.read_text(encoding="utf-8") == payload_for(value)
+    except (OSError, UnicodeError):
+        return False
+
+
+def chown_pi(path: Path) -> None:
+    if os.geteuid() != 0:
+        return
+    try:
+        import grp
+        import pwd
+        uid = pwd.getpwnam("pi").pw_uid
+        gid = grp.getgrnam("pi").gr_gid
+    except (KeyError, ImportError):
+        return
+    os.chown(path, uid, gid)
+
+
+def write_switch(root: Path, value: str) -> None:
+    if already_set(root, value):
+        return
+    try:
+        root.mkdir(parents=True, exist_ok=True, mode=0o750)
+    except OSError:
+        fail("cannot create usage directory")
+    if root.exists() and (root.is_symlink() or not root.is_dir()):
+        fail("usage root is not a directory")
+    dest = root / "settings.json"
+    if dest.exists() and (dest.is_symlink() or not dest.is_file()):
+        fail("settings.json is not a regular file")
+    tmp = root / "settings.json.tmp"
+    if tmp.exists() and (tmp.is_symlink() or not tmp.is_file()):
+        fail("settings.json.tmp is not a regular file")
+    try:
+        tmp.write_text(payload_for(value), encoding="utf-8")
+        os.chmod(tmp, 0o640)
+        chown_pi(tmp)
+        os.replace(tmp, dest)
+    except OSError:
+        try:
+            if tmp.exists() and tmp.is_file() and not tmp.is_symlink():
+                tmp.unlink()
+        except OSError:
+            pass
+        fail("cannot write settings")
+
+
+def main() -> None:
+    verb = parse_command(original_command())
+    root = usage_root()
+    if verb == "status":
+        sys.stdout.write(read_status(root) + "\n")
+        return
+    write_switch(root, verb)
+    sys.stdout.write(verb + "\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        fail("unexpected error")

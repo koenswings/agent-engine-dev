@@ -1,0 +1,567 @@
+idea04 PR #313 live proof — 2026-11-11 (Europe/Brussels, UTC+1)
+================================================================================
+Verdict: PASS
+PR:     https://github.com/koenswings/agent-engine-dev/pull/313
+Head:   94e5405bf199ee32ff8e4ed6b8d5d488fb7fae14
+        Merge origin/main (85476a0) into fix/system-root-avail-427
+Fix:    84bef14 (idea#427: treat empty SYSTEM_ROOT as / in helper df)
+Main:   825c66cc09743cc380a34c33fb5c3fdbaff7fcc5  (production Engine left here)
+Pi:     idea04 (100.108.39.45), claimed as Axle
+Issue:  https://github.com/koenswings/idea/issues/427
+Claim:  idea repo 22e22b7 fleet-state: Axle claims idea04 for agent-engine-dev#313 proof (idea#427)
+
+Box tests (this session, after the merge, started 2026-11-11 04:16:18 Europe/Brussels)
+--------------------------------------------------------------------------------
+Merged origin/main 85476a0 into fix/system-root-avail-427 with a merge commit
+(no rebase, no force-push): 94e5405.
+npx tsc --noEmit: OK
+npx vitest run --maxWorkers=1:
+  test/automated/idea-app-data-script.test.ts
+  test/automated/update-app-policy.test.ts
+  test/automated/update-app.test.ts
+  test/automated/app-data-helper.test.ts
+  4 files / 122 tests passed
+Pushed 84bef14..94e5405 to origin/fix/system-root-avail-427.
+
+Engine / helper under test
+--------------------------------------------------------------------------------
+pm2 name=engine user=pi (never root)
+script: /home/pi/axle-313/dist/src/index.js   (detached worktree of 94e5405)
+cwd:    /home/pi/idea/agents/agent-engine-dev (so relative store-data / store-identity resolve)
+env:    IDEA_CONFIG_FILE=/home/pi/axle-313-config.yaml
+        IDEA_NETWORK_TESTS=0
+        NODE_ENV=development VERBOSITY=3
+        IDEA_USAGE_AS_MAIN unset
+        outside config copy: systemDiskSkip: false; store paths kept relative
+real /home/pi/idea/agents/agent-engine-dev/config.yaml: untouched (systemDiskSkip: true, mdns: true)
+production tree HEAD left at 825c66cc09743cc380a34c33fb5c3fdbaff7fcc5 the whole time
+usageMonitoring: on (left on); idea-usage left running throughout (pid 846813)
+mDNS: on
+Temperature: 43–51 °C (pause threshold 75 °C; never approached)
+Not touched: WD SSD 20070Q450002, /disks, ~/atlas-322*, ~/idea-proof-322,
+             /apps/kolibri-channel-builder-2551b7d, existing named volumes (no docker volume rm),
+             existing axle-311.quarantine-* trees
+
+System disk id: 5vyahbut147hw5dp4e1 (sda2)
+Engine id: ENGINE_5vyahbut147hw5dp4e1
+
+Helper install note
+--------------------------------------------------------------------------------
+PR report step 2 mentioned ./install-root-helpers. This proof installed only
+/usr/local/sbin/idea-app-data (sudo -n install -o root -g root -m 0755 of the
+branch file). Full ./install-root-helpers would also rewrite erase-disk /
+flash-card / peer-gate and may reload sshd; not needed to prove estimate /
+snapshot / DIFFERENT_APP, and would make a single-file restore harder.
+sudo -n idea-app-data version still printed "idea-app-data 7" (no protocol bump).
+
+STEP 1 — claim  PASS
+--------------------------------------------------------------------------------
+BOT_NAME=Axle tools/fleet/update-fleet-state.sh from /workspace/idea-fleet-311
+(not /workspace/idea). idea04.status=testing, claim="Axle: agent-engine-dev#313
+idea#427 proof", note left unchanged (includes Atlas 03:45 CET post-#311 verify
+/ engine 825c66c). Commit 22e22b7 on idea origin/main (AuthorDate 2026-11-11
+04:16:50 Europe/Brussels). SSH to 100.108.39.45 (Tailscale), never a jump host.
+
+STEP 2 — helper backup + install  PASS
+--------------------------------------------------------------------------------
+Before install:
+  /usr/local/sbin/idea-app-data sha256
+    c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c
+  backup /home/pi/idea-app-data.main-825c66c.bak same hash (main's helper).
+Installed branch helper (94e5405 script/build_image_assets/idea-app-data):
+  sha256 05886f4efc830e284961c5335074ed3ec148e3a53020ba21aaf4f736e1571766
+  version: idea-app-data 7
+  avail_kb / free_floor contain: local dir="${1:-/}"
+
+STEP 3 — PR engine  PASS
+--------------------------------------------------------------------------------
+Worktree ~/axle-313 at 94e5405, node_modules symlink to production, built as pi.
+pm2 engine as pi: script ~/axle-313/dist/src/index.js, cwd production tree,
+IDEA_CONFIG_FILE=/home/pi/axle-313-config.yaml (systemDiskSkip: false).
+http://127.0.0.1:8080/ -> 200 (after ~30s boot). idea-usage stayed online.
+Production tree still 825c66c; real config.yaml still systemDiskSkip: true.
+
+STEP 4 — installApp axle427-1.0 --name axle427-est --fresh  PASS
+--------------------------------------------------------------------------------
+Instance 9vd2q5x8mdky9bpzjvn on System Disk, port 52935.
+The wait_instance helper printed the new id on try 1 (folder appeared) and then
+grepped engine-out before assertInstancePortReady finished (~10s). The script
+therefore wrote "FAIL: STEP4 installApp did not produce a running instance".
+That was a waiter race, not an install failure. Confirmed in engine-out.log:
+
+  App 9vd2q5x8mdky9bpzjvn running
+  installApp: installed 'axle427-1.0' as instance 'axle427-est' on disk 'System Disk'
+
+Non-fatal: createOrUpdateApp hit
+  RangeError: Cannot assign undefined value at /appDB/axle427-1.0/title
+because the scratch compose has no x-app.title. Install continued.
+
+STEP 5 — estimate system 9vd2q5x8mdky9bpzjvn  PASS
+--------------------------------------------------------------------------------
+sudo -n idea-app-data estimate system 9vd2q5x8mdky9bpzjvn
+  stdout: 16 4 84872844
+  stderr: (empty)
+  rc=0
+Three integers <folder_kb> <volumes_kb> <free_kb>. No
+"refused: cannot tell the free space of ".
+
+STEP 6 — stopInstance then snapshot system  PASS
+--------------------------------------------------------------------------------
+stopInstance axle427-est 5vyahbut147hw5dp4e1
+  9vd2q5x8mdky9bpzjvn-web-1  Exited (137)
+sudo -n idea-app-data snapshot system 9vd2q5x8mdky9bpzjvn
+  rc=0
+  stderr: (empty)
+  VOLUME 9vd2q5x8mdky9bpzjvn_data 10240 22
+  last line: /.pre-update/9vd2q5x8mdky9bpzjvn 44 none
+Got past the free-space check (no avail_kb refuse).
+
+STEP 7a — DIFFERENT_APP missing x-app.name and x-app.version  PASS
+--------------------------------------------------------------------------------
+installApp axle427anon-1.0 (compose omits x-app.name and x-app.version)
+  -> ekngtrq0b6nb59vh3d6 as axle427-anon
+  engine-out: App ekngtrq0b6nb59vh3d6 running
+updateApp axle427-anon axle427-1.1
+  Error: DIFFERENT_APP: x-app.name is missing (actual: (missing), expected: axle427); x-app.version is missing (actual: (missing), expected: 1.1)
+
+STEP 7b — DIFFERENT_APP x-app.name / x-app.version mismatch  PASS
+--------------------------------------------------------------------------------
+installApp axle427-1.0 --name axle427-mm
+  -> s7fk0ccrtffba2h8fqh
+  engine-out: App s7fk0ccrtffba2h8fqh running
+updateApp axle427-mm other427-1.1
+  Error: DIFFERENT_APP: x-app.name mismatch (actual: axle427, expected: other427); x-app.version mismatch (actual: 1.0, expected: 1.1)
+
+STEP 8 — quarantine + restore  PASS
+--------------------------------------------------------------------------------
+stopInstance + removeInstance (quarantine, never delete):
+  9vd2q5x8mdky9bpzjvn -> /.idea-quarantine/9vd2q5x8mdky9bpzjvn-20261111T032536Z
+    (UTC 03:25:36 = 04:25:36 Europe/Brussels); kept volume 9vd2q5x8mdky9bpzjvn_data
+  ekngtrq0b6nb59vh3d6 -> /.idea-quarantine/ekngtrq0b6nb59vh3d6-20261111T032554Z
+  s7fk0ccrtffba2h8fqh -> /.idea-quarantine/s7fk0ccrtffba2h8fqh-20261111T032610Z
+  /instances empty afterwards.
+
+Scratch app bundles axle427-1.0, axle427-1.1, axle427anon-1.0, other427-1.1
+moved to /home/pi/axle-313.quarantine-20261111T032424Z/apps/
+(kolibri-channel-builder-2551b7d left in /apps).
+
+Helper restored from /home/pi/idea-app-data.main-825c66c.bak:
+  sha256 c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c
+  matches_main True
+  version: idea-app-data 7
+
+pm2 engine restored:
+  script /home/pi/idea/agents/agent-engine-dev/dist/src/index.js
+  cwd    /home/pi/idea/agents/agent-engine-dev
+  HEAD   825c66cc09743cc380a34c33fb5c3fdbaff7fcc5
+  user   pi
+  no IDEA_CONFIG_FILE, no IDEA_USAGE_AS_MAIN, no IDEA_NETWORK_TESTS
+  NODE_ENV=development VERBOSITY=3
+  http://127.0.0.1:8080/ -> 200 (try 8, ~40s)
+  pm2 save
+idea-usage still online (pid 846813).
+usage settings: {"usageMonitoring":"on"}
+real config.yaml still systemDiskSkip: true, mdns: true.
+updtest-i76stale / minor / major still Up ~5h (healthy).
+Checkout ~/axle-313, outside config, scripts, and helper bak quarantined under
+/home/pi/axle-313.quarantine-20261111T032424Z. Production worktree pruned
+(only /home/pi/idea/agents/agent-engine-dev at 825c66c remains).
+Named volumes left in place on purpose. System-disk store row created while
+systemDiskSkip was false was not hand-deleted.
+
+STEP 9 — temperature / reserved paths  PASS
+--------------------------------------------------------------------------------
+Observed 43.8–51.1 °C. Never paused. Did not write to WD SSD 20070Q450002,
+did not touch /disks contents, ~/atlas-322*, ~/idea-proof-322, or kolibri.
+
+Release health check (2026-11-11 04:28:10 Europe/Brussels)
+--------------------------------------------------------------------------------
+temp_c=47.225
+HEAD 825c66cc09743cc380a34c33fb5c3fdbaff7fcc5
+helper c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c
+:8080 200
+engine online as pi, production dist, IDEA_CONFIG_FILE unset
+idea-usage online as pi
+/instances empty; /apps only kolibri-channel-builder-2551b7d
+
+================================================================================
+Raw live transcript from idea04 /tmp/idea04-pr313-proof-2026-11-11.log
+(setup 04:18:06, steps 4-7 done 04:23:41, cleanup complete 04:26:55 Europe/Brussels)
+================================================================================
+============================================================
+idea04 PR #313 setup 2026-11-11T04:18:06+01:00 temp=45.277C
+============================================================
+temp_c=43.816
+production HEAD 825c66cc09743cc380a34c33fb5c3fdbaff7fcc5 (must stay 825c66c)
+==== backup helper ====
+c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c  /usr/local/sbin/idea-app-data
+c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c  /home/pi/idea-app-data.main-825c66c.bak
+live c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c
+bak  c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c
+match_main True
+==== fetch PR head and add worktree ~/axle-313 ====
+From https://github.com/koenswings/agent-engine-dev
+ * branch            94e5405bf199ee32ff8e4ed6b8d5d488fb7fae14 -> FETCH_HEAD
+Preparing worktree (detached HEAD 94e5405)
+HEAD is now at 94e5405 Merge origin/main (85476a0) into fix/system-root-avail-427
+94e5405bf199ee32ff8e4ed6b8d5d488fb7fae14
+94e5405 Merge origin/main (85476a0) into fix/system-root-avail-427
+==== outside config (copy only; real config.yaml untouched) ====
+outside systemDiskSkip: ['mdns: true      # atlas 2026-10-06: test pool mirrors production idea02 (mdns: true), Koen 03:50; static peers removed', 'systemDiskSkip: false  # axle-313 outside copy for idea#427 proof; real config.yaml untouched']
+production config.yaml still systemDiskSkip: true
+==== build PR head ====
+built dist/src/index.js
+==== setup part 1 done 2026-11-11T04:19:12+01:00 ====
+==== install branch helper (sudo install of idea-app-data only; not full install-root-helpers) ====
+temp_c=46.738
+version: idea-app-data 7
+05886f4efc830e284961c5335074ed3ec148e3a53020ba21aaf4f736e1571766  /usr/local/sbin/idea-app-data
+c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c  /home/pi/idea-app-data.main-825c66c.bak
+308:    local dir="${1:-/}" a
+651:    local dir="${1:-/}" avail
+installed 05886f4efc830e284961c5335074ed3ec148e3a53020ba21aaf4f736e1571766
+backup    c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c
+changed_from_main True
+==== switch pm2 engine to PR checkout, cwd production, IDEA_CONFIG_FILE outside copy ====
+[PM2] Applying action deleteProcessId on app [engine](ids: [ 7 ])
+[PM2] [engine](7) ✓
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 10 │ idea-usage       │ default     │ 1.0     │ fork    │ 846813   │ 9m     │ 0    │ online    │ 0%       │ 62.4mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 0%       │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 31.4% | ram usage: 22% | eth0: ⇓ 0.002mb/s ⇑ 0.001mb/s drop 220/min | disk: ⇓ 0mb/s ⇑ 0.217mb/s / 61.58%
+[PM2] Starting /home/pi/axle-313/dist/src/index.js in fork_mode (1 instance)
+[PM2] Done.
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 11 │ engine           │ default     │ 1.0     │ fork    │ 854431   │ 0s     │ 0    │ online    │ 0%       │ 23.7mb   │ pi       │ disabled │
+│ 10 │ idea-usage       │ default     │ 1.0     │ fork    │ 846813   │ 9m     │ 0    │ online    │ 0%       │ 62.4mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 0%       │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 31.4% | ram usage: 22% | eth0: ⇓ 0.002mb/s ⇑ 0.001mb/s drop 220/min | disk: ⇓ 0mb/s ⇑ 0.217mb/s / 61.58%
+status online restarts 0 pid 854431
+cwd /home/pi/idea/agents/agent-engine-dev
+script /home/pi/axle-313/dist/src/index.js
+username pi
+IDEA_CONFIG_FILE /home/pi/axle-313-config.yaml
+IDEA_USAGE_AS_MAIN None
+IDEA_NETWORK_TESTS 0
+NODE_ENV development
+VERBOSITY 3
+engine env OK
+try 1: :8080 -> 000fail temp=48.199C
+try 2: :8080 -> 000fail temp=49.173C
+try 3: :8080 -> 000fail temp=49.660C
+try 4: :8080 -> 000fail temp=48.199C
+try 5: :8080 -> 000fail temp=50.147C
+try 6: :8080 -> 000fail temp=49.173C
+try 7: :8080 -> 200 temp=49.660C
+production tree still 825c66c
+==== engine ready 2026-11-11T04:20:09+01:00 ====
+temp_c=44.79
+============================================================
+idea04 PR #313 proof steps 4-7 2026-11-11T04:21:22+01:00
+============================================================
+apps:
+total 28
+drwxr-xr-x  7 pi   pi   4096 Nov 11 04:21 .
+drwxr-xr-x 24 root root 4096 Nov 11 03:30 ..
+drwxr-xr-x  2 pi   pi   4096 Nov 11 04:21 axle427-1.0
+drwxr-xr-x  2 pi   pi   4096 Nov 11 04:21 axle427-1.1
+drwxr-xr-x  2 pi   pi   4096 Nov 11 04:21 axle427anon-1.0
+drwxrwxr-x  7 pi   pi   4096 Oct 15 08:28 kolibri-channel-builder-2551b7d
+drwxr-xr-x  2 pi   pi   4096 Nov 11 04:21 other427-1.1
+existing instances: <none>
+==== STEP4 installApp axle427-1.0 on system disk ====
+>> push-command: installApp axle427-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle427-est --fresh
+{"pushed":"installApp axle427-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle427-est --fresh","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+wait_instance est found 9vd2q5x8mdky9bpzjvn (try 1)
+ID_EST=9vd2q5x8mdky9bpzjvn
+engine-error tail:
+ Network y8uio8lxoa74p9pcsip_default Creating 
+ Network y8uio8lxoa74p9pcsip_default Created 
+ Network y8uio8lxoa74p9pcsip_default Created 
+ Container y8uio8lxoa74p9pcsip-web-1 Creating 
+ Container y8uio8lxoa74p9pcsip-web-1 Created 
+ Container y8uio8lxoa74p9pcsip-web-1 Starting 
+ Container y8uio8lxoa74p9pcsip-web-1 Started 
+Error: ROLLED BACK: Start failed: start failed: Engine error: Container(s) exited after compose up for y8uio8lxoa74p9pcsip. Automerge must not stay Running. y8uio8lxoa74p9pcsip-web-1: Exited (42) 2 seconds ago. axleproof-1.0 and its data were restored from /.pre-update/y8uio8lxoa74p9pcsip
+Error: Disk 'System Disk' (5vyahbut147hw5dp4e1) is docked to ENGINE_5vyahbut147hw5dp4e1; only an undocked disk can be forgotten. Eject or unplug it first.
+RangeError: Cannot assign undefined value at /appDB/axle427-1.0/title, because `undefined` is not a valid JSON data type. You might consider setting the property's value to `null`, or using `delete` to remove it altogether.
+    at import_value (file:///home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/@automerge+automerge@3.2.4/node_modules/@automerge/automerge/dist/mjs/proxies.js:116:19)
+    at Object.set (file:///home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/@automerge+automerge@3.2.4/node_modules/@automerge/automerge/dist/mjs/proxies.js:187:35)
+    at Object.set (file:///home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/@automerge+automerge@3.2.4/node_modules/@automerge/automerge/dist/mjs/proxies.js:205:35)
+    at file:///home/pi/axle-313/dist/src/data/App.js:73:34
+    at _change (file:///home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/@automerge+automerge@3.2.4/node_modules/@automerge/automerge/dist/mjs/implementation.js:370:9)
+    at Module.change (file:///home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/@automerge+automerge@3.2.4/node_modules/@automerge/automerge/dist/mjs/implementation.js:245:16)
+    at file:///home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/@automerge+automerge-repo@2.3.1/node_modules/@automerge/automerge-repo/dist/DocHandle.js:486:35
+    at callback (file:///home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/@automerge+automerge-repo@2.3.1/node_modules/@automerge/automerge-repo/dist/DocHandle.js:172:32)
+    at file:///home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/@automerge+automerge-repo@2.3.1/node_modules/@automerge/automerge-repo/dist/DocHandle.js:62:33
+    at Function.resolveAssign [as resolve] (/home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/xstate@5.28.0/node_modules/xstate/dist/assign-6b5249c3.cjs.js:70:21)
+ Network 9vd2q5x8mdky9bpzjvn_default Creating 
+ Network 9vd2q5x8mdky9bpzjvn_default Creating 
+ Volume 9vd2q5x8mdky9bpzjvn_data Creating 
+ Volume 9vd2q5x8mdky9bpzjvn_data Creating 
+ Volume 9vd2q5x8mdky9bpzjvn_data Created 
+ Volume 9vd2q5x8mdky9bpzjvn_data Created 
+ Network 9vd2q5x8mdky9bpzjvn_default Created 
+ Network 9vd2q5x8mdky9bpzjvn_default Created 
+ Container 9vd2q5x8mdky9bpzjvn-web-1 Creating 
+ Container 9vd2q5x8mdky9bpzjvn-web-1 Created 
+engine-out tail:
+Read variable port from .env file /instances/9vd2q5x8mdky9bpzjvn/.env: not set
+No port number has previously been generated.
+Generating a new port number for instance 9vd2q5x8mdky9bpzjvn.
+Checking if port 52935 is in use
+Port 52935 is not in use. Checking if it is reserved by another instance
+Port 52935 is not reserved by another instance
+Added or updated variable port in .env file /instances/9vd2q5x8mdky9bpzjvn/.env
+Found a port number for instance 9vd2q5x8mdky9bpzjvn: 52935
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+Trying to find a pass for instance 9vd2q5x8mdky9bpzjvn in the .env file
+Read variable pass from .env file /instances/9vd2q5x8mdky9bpzjvn/.env: not set
+No pass has previously been generated. Generating a new pass.
+Generated a new pass for instance 9vd2q5x8mdky9bpzjvn
+Added or updated variable pass in .env file /instances/9vd2q5x8mdky9bpzjvn/.env
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+Preloading the service images of the services from the compose file
+Reading and parsing the compose.yaml file of the app instance
+Warning while starting instance '9vd2q5x8mdky9bpzjvn': Service image busybox:1.36.1: saved image /services/busybox:1.36.1.tar not found; continuing (Docker pulls the image if it is not local and the Engine has internet)
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+Creating the containers for the services of the app instance
+Host identity for instance 9vd2q5x8mdky9bpzjvn: IDEA_HOSTNAME=idea04 IDEA_HOST_IPS=192.168.0.113,100.108.39.45
+IDEA_NEXTCLOUD_URL for instance 9vd2q5x8mdky9bpzjvn: http://idea03.local:18080
+Added or updated variable hostname in .env file /instances/9vd2q5x8mdky9bpzjvn/.env
+Found IP address 192.168.0.113 for instance 9vd2q5x8mdky9bpzjvn
+Added or updated variable ip in .env file /instances/9vd2q5x8mdky9bpzjvn/.env
+Creating containers of app instance '9vd2q5x8mdky9bpzjvn' on disk 5vyahbut147hw5dp4e1 of engine ENGINE_5vyahbut147hw5dp4e1.
+Instance 9vd2q5x8mdky9bpzjvn status changed to: 
+┌────────────────────────────────────┐
+│  Step 6/6  │  Starting containers  │
+└────────────────────────────────────┘
+Running instance '9vd2q5x8mdky9bpzjvn' on disk 5vyahbut147hw5dp4e1 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+Read variable port from .env file /instances/9vd2q5x8mdky9bpzjvn/.env: found
+Ports: [32m'52935'[39m
+Port number extracted from .env file for instance 9vd2q5x8mdky9bpzjvn: 52935
+FAIL: STEP4 installApp did not produce a running instance
+==== STEP5 estimate system 9vd2q5x8mdky9bpzjvn ====
+estimate stdout: [16 4 84872844]
+estimate stderr:
+estimate rc=0
+PASS: STEP5 estimate system 9vd2q5x8mdky9bpzjvn -> 16 4 84872844
+==== STEP6 stopInstance then snapshot system ====
+>> push-command: stopInstance axle427-est 5vyahbut147hw5dp4e1
+{"pushed":"stopInstance axle427-est 5vyahbut147hw5dp4e1","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+NAMES                       STATUS
+9vd2q5x8mdky9bpzjvn-web-1   Exited (137) Less than a second ago
+snapshot rc=0
+snapshot stdout:
+
+            177  34%    0.00kB/s    0:00:00  
+            177  34%    0.00kB/s    0:00:00 (xfr#1, to-chk=2/4)
+            256  49%   77.15kB/s    0:00:00 (xfr#2, to-chk=1/4)
+            519 100%  333.98kB/s    0:00:00 (xfr#3, to-chk=0/4)
+            519 100%  333.98kB/s    0:00:00 (xfr#3, to-chk=0/4)
+            519 100%  333.98kB/s    0:00:00 (xfr#3, to-chk=0/4)
+            519 100%  333.98kB/s    0:00:00 (xfr#3, to-chk=0/4)
+VOLUME 9vd2q5x8mdky9bpzjvn_data 10240 22
+/.pre-update/9vd2q5x8mdky9bpzjvn 44 none
+snapshot stderr:
+PASS: STEP6 snapshot system 9vd2q5x8mdky9bpzjvn got past free-space check (rc=0)
+==== STEP7a install unnamed bundle (no x-app.name/version) then updateApp to axle427-1.1 ====
+>> push-command: installApp axle427anon-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle427-anon --fresh
+{"pushed":"installApp axle427anon-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle427-anon --fresh","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+wait_instance anon found ekngtrq0b6nb59vh3d6 (try 1)
+ID_ANON=ekngtrq0b6nb59vh3d6
+>> push-command: updateApp axle427-anon axle427-1.1
+{"pushed":"updateApp axle427-anon axle427-1.1","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+DIFFERENT_APP missing-fields line: Error: DIFFERENT_APP: x-app.name is missing (actual: (missing), expected: axle427); x-app.version is missing (actual: (missing), expected: 1.1)
+PASS: STEP7a DIFFERENT_APP missing x-app.name and x-app.version
+==== STEP7b name mismatch: axle427-1.0 instance -> updateApp other427-1.1 ====
+>> push-command: installApp axle427-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle427-mm --fresh
+{"pushed":"installApp axle427-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle427-mm --fresh","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+wait_instance mm found s7fk0ccrtffba2h8fqh (try 1)
+ID_MM=s7fk0ccrtffba2h8fqh
+>> push-command: updateApp axle427-mm other427-1.1
+{"pushed":"updateApp axle427-mm other427-1.1","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+DIFFERENT_APP mismatch line: Error: DIFFERENT_APP: x-app.name mismatch (actual: axle427, expected: other427); x-app.version mismatch (actual: 1.0, expected: 1.1)
+PASS: STEP7b DIFFERENT_APP x-app.name mismatch
+==== step results ====
+FAIL: STEP4 installApp did not produce a running instance
+PASS: STEP5 estimate system 9vd2q5x8mdky9bpzjvn -> 16 4 84872844
+PASS: STEP6 snapshot system 9vd2q5x8mdky9bpzjvn got past free-space check (rc=0)
+PASS: STEP7a DIFFERENT_APP missing x-app.name and x-app.version
+PASS: STEP7b DIFFERENT_APP x-app.name mismatch
+==== proof steps 4-7 done 2026-11-11T04:23:41+01:00 temp=47.225C ====
+temp_c=44.79
+============================================================
+idea04 PR #313 cleanup + restore 2026-11-11T04:24:24+01:00
+============================================================
+==== stop + remove proof instances (quarantine, never delete) ====
+>> push-command: stopInstance axle427-est 5vyahbut147hw5dp4e1
+{"pushed":"stopInstance axle427-est 5vyahbut147hw5dp4e1","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+>> push-command: stopInstance axle427-anon 5vyahbut147hw5dp4e1
+{"pushed":"stopInstance axle427-anon 5vyahbut147hw5dp4e1","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+>> push-command: stopInstance axle427-mm 5vyahbut147hw5dp4e1
+{"pushed":"stopInstance axle427-mm 5vyahbut147hw5dp4e1","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+>> push-command: removeInstance 9vd2q5x8mdky9bpzjvn
+{"pushed":"removeInstance 9vd2q5x8mdky9bpzjvn","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+>> push-command: removeInstance ekngtrq0b6nb59vh3d6
+{"pushed":"removeInstance ekngtrq0b6nb59vh3d6","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+>> push-command: removeInstance s7fk0ccrtffba2h8fqh
+{"pushed":"removeInstance s7fk0ccrtffba2h8fqh","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+instances left:
+Removed instance 3iyi1r8bmvlyl7lvvpb; its folder is kept at /.idea-quarantine/3iyi1r8bmvlyl7lvvpb-20261111T021938Z
+Removed instance h7wd4t350auta0dfnbg; its folder is kept at /.idea-quarantine/h7wd4t350auta0dfnbg-20261111T022829Z
+Removed instance y8uio8lxoa74p9pcsip; its folder is kept at /.idea-quarantine/y8uio8lxoa74p9pcsip-20261111T023701Z
+Removed instance 9vd2q5x8mdky9bpzjvn; its folder is kept at /.idea-quarantine/9vd2q5x8mdky9bpzjvn-20261111T032536Z
+Removed instance ekngtrq0b6nb59vh3d6; its folder is kept at /.idea-quarantine/ekngtrq0b6nb59vh3d6-20261111T032554Z
+Removed instance s7fk0ccrtffba2h8fqh; its folder is kept at /.idea-quarantine/s7fk0ccrtffba2h8fqh-20261111T032610Z
+==== quarantine scratch app bundles (not kolibri-channel-builder) ====
+total 12
+drwxr-xr-x  3 pi   pi   4096 Nov 11 04:26 .
+drwxr-xr-x 24 root root 4096 Nov 11 03:30 ..
+drwxrwxr-x  7 pi   pi   4096 Oct 15 08:28 kolibri-channel-builder-2551b7d
+total 24
+drwxrwxr-x 6 pi pi 4096 Nov 11 04:26 .
+drwxrwxr-x 3 pi pi 4096 Nov 11 04:26 ..
+drwxr-xr-x 2 pi pi 4096 Nov 11 04:21 axle427-1.0
+drwxr-xr-x 2 pi pi 4096 Nov 11 04:21 axle427-1.1
+drwxr-xr-x 2 pi pi 4096 Nov 11 04:21 axle427anon-1.0
+drwxr-xr-x 2 pi pi 4096 Nov 11 04:21 other427-1.1
+==== restore main helper ====
+c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c  /usr/local/sbin/idea-app-data
+c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c  /home/pi/idea-app-data.main-825c66c.bak
+restored c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c
+matches_main True
+version idea-app-data 7
+==== restore pm2 engine to production 825c66c, no IDEA_CONFIG_FILE ====
+production HEAD 825c66cc09743cc380a34c33fb5c3fdbaff7fcc5
+2:  mdns: true      # atlas 2026-10-06: test pool mirrors production idea02 (mdns: true), Koen 03:50; static peers removed
+6:  systemDiskSkip: true   # Stage 2 pin (was IDEA_SYSTEM_DISK_SKIP env; PLAN 5 unchanged)
+[PM2] Applying action deleteProcessId on app [engine](ids: [ 11 ])
+[PM2] [engine](11) ✓
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 10 │ idea-usage       │ default     │ 1.0     │ fork    │ 846813   │ 16m    │ 0    │ online    │ 0%       │ 62.6mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 3.7%     │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 38.4% | ram usage: 30.8% | lo: ⇓ 0.069mb/s ⇑ 0.069mb/s | eth0: ⇓ 0.002mb/s ⇑ 0.002mb/s drop 214/min | disk: ⇓ 0.003mb/s ⇑ 0.089mb/s / 61.58%
+[PM2] Starting /home/pi/idea/agents/agent-engine-dev/dist/src/index.js in fork_mode (1 instance)
+[PM2] Done.
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 12 │ engine           │ default     │ 1.0     │ fork    │ 861782   │ 0s     │ 0    │ online    │ 0%       │ 23.7mb   │ pi       │ disabled │
+│ 10 │ idea-usage       │ default     │ 1.0     │ fork    │ 846813   │ 16m    │ 0    │ online    │ 0%       │ 62.6mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 0%       │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 38.4% | ram usage: 30.8% | lo: ⇓ 0.069mb/s ⇑ 0.069mb/s | eth0: ⇓ 0.002mb/s ⇑ 0.002mb/s drop 214/min | disk: ⇓ 0.003mb/s ⇑ 0.089mb/s / 61.58%
+status online restarts 0 pid 861782
+cwd /home/pi/idea/agents/agent-engine-dev
+script /home/pi/idea/agents/agent-engine-dev/dist/src/index.js
+username pi
+IDEA_CONFIG_FILE None
+IDEA_USAGE_AS_MAIN None
+IDEA_NETWORK_TESTS None
+NODE_ENV development
+VERBOSITY 3
+restored engine env OK
+try 1: :8080 -> 000fail temp=51.121C
+try 2: :8080 -> 000fail temp=49.660C
+try 3: :8080 -> 000fail temp=48.686C
+try 4: :8080 -> 000fail temp=49.173C
+try 5: :8080 -> 000fail temp=49.173C
+try 6: :8080 -> 000fail temp=49.660C
+try 7: :8080 -> 000fail temp=49.660C
+try 8: :8080 -> 200 temp=49.173C
+[PM2] Saving current process list...
+[PM2] Successfully saved in /home/pi/.pm2/dump.pm2
+pm2 save done
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 12 │ engine           │ default     │ 1.0     │ fork    │ 861782   │ 40s    │ 0    │ online    │ 100%     │ 358.6mb  │ pi       │ disabled │
+│ 10 │ idea-usage       │ default     │ 1.0     │ fork    │ 846813   │ 17m    │ 0    │ online    │ 0%       │ 62.6mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 0%       │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 29.8% | ram usage: 21.4% | eth0: ⇓ 0.002mb/s ⇑ 0.001mb/s drop 216/min | disk: ⇓ 0mb/s ⇑ 0.08mb/s / 61.58%
+==== updtest still healthy ====
+NAMES                    STATUS
+updtest-i76stale-web-1   Up 5 hours (healthy)
+updtest-i76minor-web-1   Up 5 hours (healthy)
+updtest-i76major-web-1   Up 5 hours (healthy)
+==== quarantine checkout, outside config, scripts, helper bak ====
+Removing worktrees/axle-313: gitdir file points to non-existent location
+worktrees:
+/home/pi/idea/agents/agent-engine-dev  825c66c (detached HEAD)
+ls: cannot access '/home/pi/axle-313': No such file or directory
+ls: cannot access '/home/pi/axle-313-config.yaml': No such file or directory
+real config.yaml still:
+2:  mdns: true      # atlas 2026-10-06: test pool mirrors production idea02 (mdns: true), Koen 03:50; static peers removed
+6:  systemDiskSkip: true   # Stage 2 pin (was IDEA_SYSTEM_DISK_SKIP env; PLAN 5 unchanged)
+usage settings:
+{"usageMonitoring":"on"}
+HEAD production: 825c66cc09743cc380a34c33fb5c3fdbaff7fcc5
+curl :8080 -> 200
+helper sha c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c  /usr/local/sbin/idea-app-data
+quarantine home /home/pi/axle-313.quarantine-20261111T032424Z
+==== release-script complete 2026-11-11T04:26:55+01:00 ====
+
+
+================================================================================
+engine-out.log excerpts (STEP4 success after the waiter race; STEP7 installs)
+================================================================================
+8512:Processing command for engine ENGINE_5vyahbut147hw5dp4e1: installApp axle427-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle427-est --fresh
+8575:App 9vd2q5x8mdky9bpzjvn running
+8576:installApp: installed 'axle427-1.0' as instance 'axle427-est' on disk 'System Disk'
+
+8660:App ekngtrq0b6nb59vh3d6 running
+8661:installApp: installed 'axle427anon-1.0' as instance 'axle427-anon' on disk 'System Disk'
+
+8739:App s7fk0ccrtffba2h8fqh running
+8740:installApp: installed 'axle427-1.0' as instance 'axle427-mm' on disk 'System Disk'
+
+8819:removeInstance: 9vd2q5x8mdky9bpzjvn ('axle427-est') quarantined at /.idea-quarantine/9vd2q5x8mdky9bpzjvn-20261111T032536Z; kept volumes: 9vd2q5x8mdky9bpzjvn_data
+8821:Removed instance 9vd2q5x8mdky9bpzjvn; its folder is kept at /.idea-quarantine/9vd2q5x8mdky9bpzjvn-20261111T032536Z
+8831:Removed instance ekngtrq0b6nb59vh3d6; its folder is kept at /.idea-quarantine/ekngtrq0b6nb59vh3d6-20261111T032554Z
+8844:Removed instance s7fk0ccrtffba2h8fqh; its folder is kept at /.idea-quarantine/s7fk0ccrtffba2h8fqh-20261111T032610Z
+
+engine-error.log DIFFERENT_APP lines from this proof:
+646:Error: DIFFERENT_APP: x-app.name is missing (actual: (missing), expected: axle427); x-app.version is missing (actual: (missing), expected: 1.1)
+670:Error: DIFFERENT_APP: x-app.name mismatch (actual: axle427, expected: other427); x-app.version mismatch (actual: 1.0, expected: 1.1)

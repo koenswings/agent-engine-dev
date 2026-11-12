@@ -36,6 +36,12 @@ export interface CommandTrace {
   completedAt: number | null
   status: TraceStatus
   errorMessage: string | null
+  /**
+   * Same text as errorMessage when status is 'error'; null otherwise (idea#428).
+   * Some CLIs read `error` (the Operation field name) and were seeing null while
+   * the reason lived only in errorMessage. closeTrace sets both together.
+   */
+  error?: string | null
   /** JSON result for commands that return data (summariseDisk, idea#134); null otherwise */
   result?: string | null
   logs: LogEntry[]          // Automerge list — appended in batches via flushLogs
@@ -493,7 +499,15 @@ export const closeTrace = (
     if (trace.status === 'error' && status === 'ok') return
     trace.status = status
     trace.completedAt = Date.now()
-    if (errorMessage) trace.errorMessage = redactString(errorMessage)
+    if (status === 'error') {
+      const msg = errorMessage ? redactString(errorMessage) : (trace.errorMessage ?? null)
+      if (msg) {
+        trace.errorMessage = msg
+        trace.error = msg
+      }
+    } else if (errorMessage) {
+      trace.errorMessage = redactString(errorMessage)
+    }
     if (fromStash !== undefined && fromStash !== null) trace.result = redactString(fromStash)
   })
 }

@@ -1,5 +1,5 @@
 import { isCommitSha } from './AppIdParse.js'
-import { buildImageSteps, checkLoadedDigest, legacyServiceImageTarName, saveFailedMessage, saveName, serviceImageTarName } from './ImageRef.js'
+import { buildImageSteps, checkLoadedDigest, checkServiceTarPin, digestInspectRef, legacyServiceImageTarName, parseImageRef, planExistingTarOnInstall, planPinnedServiceImageLoad, saveFailedMessage, saveName, serviceImageTarName, serviceTarQuarantineName, type TarPinState } from './ImageRef.js'
 import { $, YAML, chalk, fs, os, sleep } from "zx";
 
 $.verbose = false;
@@ -441,31 +441,24 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     const services = compose.services
     for (const serviceName in services) {
       const serviceImage = services[serviceName].image
-      // Pull the sercice image
       const serviceImageTar = serviceImageTarPath(`${root}`, serviceImage)
-      if (fs.existsSync(serviceImageTar)) {
-        print(`Service image ${serviceImage} already exists`)
-      } else {
-        // idea#322: pull by the full ref, tag a pinned ref as repo:tag, save by repo:tag
-        // (a tar saved by digest has no name after docker image load)
-        const [pull, ...rest] = buildImageSteps(serviceImage)
-        print(`Pulling service image ${serviceImage}`)
-        await $`${pull}`
-        for (const step of rest) {
-          if (step[1] === 'save') {
-            // Plain save (never --platform, see ImageRef.ts). Write to a .partial file so a failed save
-            // never leaves a tar under the real name (which a later build would treat as done).
-            const partial = `${serviceImageTar}.partial`
-            const r = await $`${step} > ${partial}`.nothrow()
-            if (r.exitCode !== 0) {
-              const v = await $`docker version --format ${'{{.Server.Version}}'}`.nothrow()
-              throw new Error(saveFailedMessage(serviceImage, v.exitCode === 0 ? v.stdout.trim() : '', r.stderr || r.stdout))
-            }
-            await $`mv -f ${partial} ${serviceImageTar}`
-          } else await $`${step}`
-        }
-        await verifyServiceImageDigest(serviceImage)
+      const pin = parseImageRef(serviceImage).digest
+      const existingState: TarPinState | 'absent' = !fs.existsSync(serviceImageTar)
+        ? 'absent'
+        : pin ? (await inspectServiceTar(serviceImageTar, serviceImage)).state : 'matches'
+      const action = planExistingTarOnInstall(Boolean(pin), existingState)
+      if (action === 'use') {
+        print(`Service image ${serviceImage} already exists${pin ? ' and matches the pin' : ''}`)
+        continue
       }
+      if (action === 'quarantine-and-create') {
+        const inspected = pin ? await inspectServiceTar(serviceImageTar, serviceImage) : { digest: null, reason: 'stale', state: 'mismatch' as const }
+        const q = await quarantineServiceTar(serviceImageTar)
+        print(`Service image ${serviceImage}: existing tar is stale or unreadable (${inspected.digest ?? inspected.reason ?? existingState}); quarantined at ${q}; pulling a fresh one (idea#445)`)
+      }
+      // idea#322: pull by the full ref, tag a pinned ref as repo:tag, save by repo:tag
+      // (a tar saved by digest has no name after docker image load)
+      await persistServiceImageTar(serviceImage, serviceImageTar)
     }
 
     // **************************
@@ -531,7 +524,53 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
 export const serviceImageTarPath = (diskRoot: string, serviceImage: string): string =>
   `${diskRoot}/services/${serviceImageTarName(serviceImage)}`
 
-/** `docker image inspect` of the save name (repo:tag): RepoDigests and Id, or nulls if absent. */
+/** Read a named file from a docker-save tar as exact bytes (index.json is hashed as stored). */
+export const readTarEntry = async (tarPath: string, entry: string): Promise<Buffer | null> => {
+  const { execFile } = await import('node:child_process')
+  const { promisify } = await import('node:util')
+  const execFileAsync = promisify(execFile)
+  try {
+    const { stdout } = await execFileAsync('tar', ['-xOf', tarPath, entry], { encoding: 'buffer', maxBuffer: 16 * 1024 * 1024 })
+    return stdout as Buffer
+  } catch {
+    return null
+  }
+}
+
+/** Compare a services/*.tar with a compose pin without docker load (idea#445; Kid PR #15). */
+export const inspectServiceTar = async (tarPath: string, serviceImage: string): Promise<{ state: TarPinState, digest: string | null, layout?: string | null, reason?: string }> => {
+  if (!fs.existsSync(tarPath)) return { state: 'missing', digest: null }
+  const members = new Map<string, Buffer>()
+  for (const name of ['index.json', 'manifest.json'] as const) {
+    const bytes = await readTarEntry(tarPath, name) ?? await readTarEntry(tarPath, `./${name}`)
+    if (bytes) members.set(name, bytes)
+  }
+  const index = members.get('index.json')
+  if (index) {
+    let parsed: any
+    try { parsed = JSON.parse(index.toString('utf8')) } catch { parsed = null }
+    const entries = Array.isArray(parsed?.manifests) ? parsed.manifests : []
+    const digests = entries.map((e: any) => e?.digest).filter((d: any) => typeof d === 'string' && d.startsWith('sha256:'))
+    for (const d of new Set<string>(digests)) {
+      const blobName = `blobs/sha256/${d.slice('sha256:'.length)}`
+      const blob = await readTarEntry(tarPath, blobName) ?? await readTarEntry(tarPath, `./${blobName}`)
+      if (blob) members.set(blobName, blob)
+    }
+  }
+  const r = checkServiceTarPin(serviceImage, members)
+  return { state: r.state, digest: r.digest, layout: r.layout, reason: r.reason }
+}
+
+/** Rename a stale service tar aside; never delete. */
+export const quarantineServiceTar = async (tarPath: string, now = Date.now()): Promise<string> => {
+  let dest = serviceTarQuarantineName(tarPath, now)
+  let n = 2
+  while (fs.existsSync(dest)) dest = `${serviceTarQuarantineName(tarPath, now)}-${n++}`
+  await fs.rename(tarPath, dest)
+  return dest
+}
+
+/** `docker image inspect` of a name (repo:tag, repo@digest, or sha256:…): RepoDigests and Id, or nulls if absent. */
 export const inspectServiceImage = async (saveAs: string): Promise<{ repoDigests: string[] | null, id: string | null }> => {
   const r = await $`docker image inspect ${saveAs} --format ${'{{json .RepoDigests}}|{{.Id}}'}`.nothrow()
   if (r.exitCode !== 0) return { repoDigests: null, id: null }
@@ -541,14 +580,153 @@ export const inspectServiceImage = async (saveAs: string): Promise<{ repoDigests
   return { repoDigests, id: id || null }
 }
 
-/** idea#322: a pinned service image must carry its digest locally; throws a clear error if not. */
+/** idea#445: the pin is present if `docker image inspect repo@digest` (or the digest id) succeeds. */
+export const pinnedImageIsPresent = async (serviceImage: string): Promise<boolean> => {
+  const digestRef = digestInspectRef(serviceImage)
+  if (!digestRef) return false
+  const byRef = await inspectServiceImage(digestRef)
+  if (byRef.repoDigests !== null) return true
+  const pin = parseImageRef(serviceImage).digest
+  if (!pin) return false
+  const byId = await inspectServiceImage(pin)
+  return byId.repoDigests !== null || byId.id === pin
+}
+
+/** Point repo:tag at the already-local pin when a stale tar had moved the tag. */
+export const ensureSaveTag = async (serviceImage: string): Promise<void> => {
+  const p = parseImageRef(serviceImage)
+  if (!p.digest || !p.tag) return
+  const name = saveName(serviceImage)
+  const current = await inspectServiceImage(name)
+  if (current.repoDigests !== null && checkLoadedDigest(serviceImage, current.repoDigests, current.id).ok) return
+  const digestRef = digestInspectRef(serviceImage)!
+  const r = await $`docker image tag ${digestRef} ${name}`.nothrow()
+  if (r.exitCode !== 0) {
+    const r2 = await $`docker image tag ${p.digest} ${name}`.nothrow()
+    if (r2.exitCode !== 0) {
+      const detail = (r.stderr || r.stdout || r2.stderr || r2.stdout || '').trim()
+      throw new Error(`Service image ${serviceImage}: pinned digest is local but tagging ${name} failed: ${detail} (idea#445)`)
+    }
+  }
+}
+
+/** idea#322/#445: a pinned service image must be present as repo@digest; throws a clear error if not. */
 export const verifyServiceImageDigest = async (serviceImage: string, opts: { requirePresent: boolean } = { requirePresent: true }): Promise<void> => {
   if (!serviceImage.includes('@')) return
-  const { repoDigests, id } = await inspectServiceImage(saveName(serviceImage))
+  const digestRef = digestInspectRef(serviceImage)
+  let repoDigests: string[] | null = null
+  let id: string | null = null
+  if (digestRef) {
+    const byDigest = await inspectServiceImage(digestRef)
+    repoDigests = byDigest.repoDigests
+    id = byDigest.id
+  }
+  if (repoDigests === null) {
+    const pin = parseImageRef(serviceImage).digest
+    if (pin) {
+      const byId = await inspectServiceImage(pin)
+      if (byId.repoDigests !== null || byId.id) {
+        repoDigests = byId.repoDigests
+        id = byId.id
+      }
+    }
+  }
   // Not present at start: leave it to compose (pulls if pull_policy allows, else fails as before)
   if (repoDigests === null && !opts.requirePresent) return
+  if (repoDigests === null) {
+    // Name what repo:tag actually points at when the pin itself is missing
+    const byTag = await inspectServiceImage(saveName(serviceImage))
+    const c = checkLoadedDigest(serviceImage, byTag.repoDigests, byTag.id)
+    if (!c.ok) throw new Error(c.reason)
+    return
+  }
   const c = checkLoadedDigest(serviceImage, repoDigests, id)
   if (!c.ok) throw new Error(c.reason)
+}
+
+/** idea#322: pull by the full ref, tag a pinned ref as repo:tag, save by repo:tag. */
+export const persistServiceImageTar = async (serviceImage: string, serviceImageTar: string): Promise<void> => {
+  const [pull, ...rest] = buildImageSteps(serviceImage)
+  print(`Pulling service image ${serviceImage}`)
+  await $`${pull}`
+  for (const step of rest) {
+    if (step[1] === 'save') {
+      // Plain save (never --platform, see ImageRef.ts). Write to a .partial file so a failed save
+      // never leaves a tar under the real name (which a later build would treat as done).
+      const partial = `${serviceImageTar}.partial`
+      const r = await $`${step} > ${partial}`.nothrow()
+      if (r.exitCode !== 0) {
+        const v = await $`docker version --format ${'{{.Server.Version}}'}`.nothrow()
+        throw new Error(saveFailedMessage(serviceImage, v.exitCode === 0 ? v.stdout.trim() : '', r.stderr || r.stdout))
+      }
+      await $`mv -f ${partial} ${serviceImageTar}`
+    } else await $`${step}`
+  }
+  await verifyServiceImageDigest(serviceImage)
+}
+
+/**
+ * Start-path preload of one service image (idea#81, idea#322, idea#445).
+ * Pinned: skip the load when the pin is already local (retag repo:tag); otherwise
+ * check the tar against the pin before any `docker image load`. A mismatch is
+ * quarantined and never loaded. Unpinned images keep the idea#81/#109 behaviour.
+ */
+export const preloadServiceImageFromTar = async (
+  serviceImage: string,
+  mountRoot: string,
+  startWarning: (msg: string) => Promise<void>,
+): Promise<void> => {
+  const tarPath = serviceImageTarPath(mountRoot, serviceImage)
+  const legacyTar = `${mountRoot}/services/${legacyServiceImageTarName(serviceImage)}`
+  if (!fs.existsSync(tarPath) && legacyTar !== tarPath && fs.existsSync(legacyTar)) {
+    await startWarning(`Service image ${serviceImage}: only a tar saved by digest (${legacyTar}) is on the disk; it loads without a name and cannot satisfy the pin. Re-save it by repo:tag (idea#322)`)
+  }
+  const p = parseImageRef(serviceImage)
+  if (p.digest) {
+    const pinPresent = await pinnedImageIsPresent(serviceImage)
+    const inspected = await inspectServiceTar(tarPath, serviceImage)
+    const plan = planPinnedServiceImageLoad({
+      ref: serviceImage,
+      pin: p.digest,
+      tarPath,
+      pinPresent,
+      tarState: inspected.state,
+      tarDigest: inspected.digest,
+      tarReason: inspected.reason,
+    })
+    let quarantinedAt: string | undefined
+    if (plan.quarantine) quarantinedAt = await quarantineServiceTar(tarPath)
+    const withPath = (msg: string) => quarantinedAt && !msg.includes(quarantinedAt) ? `${msg} (${quarantinedAt})` : msg
+    if (plan.action === 'stale-fail') throw new Error(withPath(plan.error!))
+    if (plan.action === 'skip-retag') {
+      if (plan.warning) await startWarning(withPath(plan.warning))
+      await ensureSaveTag(serviceImage)
+      return
+    }
+    if (plan.action === 'missing') {
+      await startWarning(`Service image ${serviceImage}: saved image ${tarPath} not found; continuing (Docker pulls the image if it is not local and the Engine has internet)`)
+      return
+    }
+    log(`Loading the service image ${serviceImage} from ${tarPath}`)
+    try {
+      await $`docker image load < ${tarPath}`
+    } catch (e) {
+      const reason = (e instanceof Error ? e.message : String(e)).trim().split('\n')[0]
+      await startWarning(`Service image ${serviceImage}: loading ${tarPath} failed (${reason}); continuing (Docker pulls the image if it is not local and the Engine has internet)`)
+    }
+    return
+  }
+  if (!fs.existsSync(tarPath)) {
+    await startWarning(`Service image ${serviceImage}: saved image ${tarPath} not found; continuing (Docker pulls the image if it is not local and the Engine has internet)`)
+    return
+  }
+  log(`Loading the service image ${serviceImage} from ${tarPath}`)
+  try {
+    await $`docker image load < ${tarPath}`
+  } catch (e) {
+    const reason = (e instanceof Error ? e.message : String(e)).trim().split('\n')[0]
+    await startWarning(`Service image ${serviceImage}: loading ${tarPath} failed (${reason}); continuing (Docker pulls the image if it is not local and the Engine has internet)`)
+  }
 }
 
 export const createInstanceId = (appName: AppName): InstanceID => {
@@ -1236,34 +1414,22 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
     if (!skipImageLoad()) {
       // Load images from pre-saved tar files on the disk (no internet required).
       // Always on in production; tests turn it on with settings.skipImageLoad = false (idea#81).
-      // A missing tar or a failed load does not stop the start (idea#109 follow-up):
+      // Unpinned: a missing tar or a failed load does not stop the start (idea#109):
       // it becomes a warning in the start's History entry, and compose create/up
       // pull the image if it is not local and the Engine has internet. The start
       // fails only if create or up fails.
+      // Pinned (idea#445): skip the load when repo@digest is already local (and
+      // retag repo:tag); otherwise check the tar against the pin before loading.
+      // A mismatched tar is quarantined and never loaded; start fails if the pin
+      // is not already local.
       for (const serviceName in services) {
-        const serviceImage = services[serviceName].image
-        const tarPath = serviceImageTarPath(mountRoot, serviceImage)
-        const legacyTar = `${mountRoot}/services/${legacyServiceImageTarName(serviceImage)}`
-        if (!fs.existsSync(tarPath) && legacyTar !== tarPath && fs.existsSync(legacyTar)) {
-          await startWarning(`Service image ${serviceImage}: only a tar saved by digest (${legacyTar}) is on the disk; it loads without a name and cannot satisfy the pin. Re-save it by repo:tag (idea#322)`)
-        }
-        if (!fs.existsSync(tarPath)) {
-          await startWarning(`Service image ${serviceImage}: saved image ${tarPath} not found; continuing (Docker pulls the image if it is not local and the Engine has internet)`)
-          continue
-        }
-        log(`Loading the service image ${serviceImage} from ${tarPath}`)
-        try {
-          await $`docker image load < ${tarPath}`
-        } catch (e) {
-          const reason = (e instanceof Error ? e.message : String(e)).trim().split('\n')[0]
-          await startWarning(`Service image ${serviceImage}: loading ${tarPath} failed (${reason}); continuing (Docker pulls the image if it is not local and the Engine has internet)`)
-        }
+        await preloadServiceImageFromTar(services[serviceName].image, mountRoot, startWarning)
       }
     } else {
       // Tests by default: fixtures have no tar files — Docker pulls the image at create time if not cached
       log(`skipImageLoad: skipping image load from tar; Docker will pull images as needed`)
     }
-    // idea#322: a digest-pinned image must be present with its pinned digest before compose
+    // idea#322/#445: a digest-pinned image must be present as repo@digest before compose
     // create (pull_policy: never). Tag-only refs are not checked, as before.
     if (!skipImageLoad()) {
       for (const serviceName in services) await verifyServiceImageDigest(services[serviceName].image, { requirePresent: false })

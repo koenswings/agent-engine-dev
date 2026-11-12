@@ -103,7 +103,7 @@ describe('idea-peer-gate: everything outside the allow-list is refused, sudo nev
         [`sudo -n ${H} receive-service sdb1 --server --sender . .`, /write-only/],
         [`sudo -n ${H} receive-service sdb1`, /receive-service takes <root>/],
         // helper subcommands a peer must never reach directly
-        ...['send', 'copy', 'size', 'sync-peers', 'peer-delete', 'peer-receive', 'peer-receive-files',
+        ...['send', 'copy', 'size', 'sync-peers', 'install-usage-key', 'peer-delete', 'peer-receive', 'peer-receive-files',
             'borg-init', 'borg-info', 'borg-create', 'borg-extract', 'unknown'].map(s =>
             [`sudo -n ${H} ${s} sdb1 new1 x y z`, new RegExp(`subcommand '${s}' is not allowed for a peer Engine key`)] as [string, RegExp]),
         [`sudo -n ${H} peer-delete ENGINE_other sdb1 new1`, /subcommand 'peer-delete' is not allowed/],

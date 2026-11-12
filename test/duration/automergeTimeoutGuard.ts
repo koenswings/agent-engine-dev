@@ -55,7 +55,7 @@
 import { DocHandle } from '@automerge/automerge-repo'
 import { TimeoutError } from '@automerge/automerge-repo/helpers/withTimeout.js'
 
-/** Production fleet store doc id (Engine src/data/StoreIdentity.ts:18 FLEET_STORE_URL). */
+/** idea02's store doc id (4GQm…): the Engine's FLEET_STORE_URL until idea#452 moved it to the kit store 3Vvv…; kept as a label for foreign docs from idea02. */
 export const PRODUCTION_FLEET_STORE_DOC_ID = '4GQmEZehPDfryGDxkFo9XixbvmAC'
 
 export type TimeoutClass = 'own' | 'foreign' | 'unknown'
