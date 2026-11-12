@@ -28,10 +28,12 @@ import { Disk, processInstance, diskMountRoot, diskFsRoot, appDataRoot } from '.
 import { stopInstance, startInstance } from './Instance.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { uuid } from '../utils/utils.js'
+import { beginUsageSkip, endUsageSkip } from '../usage/opFlags.js'
 import { createOperation, updateOperation } from './Operations.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
 import { sendCommand } from '../utils/commandUtils.js'
 import { getEngineAddress } from './Network.js'
+import { serviceImageTarName } from './ImageRef.js'
 import { Instance, Status } from './Instance.js'
 import { IPAddress } from './CommonTypes.js'
 import { lookupInstanceArg, describeInstanceCandidates } from './InstanceArg.js'
@@ -222,6 +224,7 @@ export const copyApp = async (
         targetDiskId: targetDisk.id,
     }, cause, { type: 'instance', id: instance.id })
     let copyError: Error | null = null
+    beginUsageSkip('move')
 
     const newInstanceId = uuid() as InstanceID
     let wasRunning = false
@@ -389,6 +392,7 @@ export const copyApp = async (
         // 5b. rsync service image tars needed by this instance
         //     services/ holds the Docker image tars that startInstance loads via
         //     `docker image load`. Without them the copied instance cannot start.
+        //     Names come from serviceImageTarName (repo:tag, not @sha256; idea#445).
         setCopyStep(4)
         const sourceMountRootCopy = await diskMountRoot(sourceDisk)
         const copyServicesSrcDir = `${sourceMountRootCopy}/services`
@@ -396,7 +400,7 @@ export const copyApp = async (
         if (instance.serviceImages?.length) {
             let servicesDone = 0
             for (const serviceImage of instance.serviceImages) {
-                const tarName = (serviceImage as string).replace(/\//g, '_') + '.tar'
+                const tarName = serviceImageTarName(serviceImage as string)
                 const tarSrc = `${copyServicesSrcDir}/${tarName}`
                 if (await fs.pathExists(tarSrc)) {
                     log(`copyApp: syncing service image ${tarName}`)
@@ -495,6 +499,7 @@ export const copyApp = async (
         }
     } finally {
         resourceLock.releaseAll(lockKeys)
+        endUsageSkip('move')
         // Always restart the source if we stopped it and the success path did not
         if (wasRunning && !sourceRestarted && (copyError || !opts.keepSourceStopped)) await restartSource('after a failed copy')
     }
@@ -546,6 +551,7 @@ export const moveApp = async (
         sourceDiskId: sourceDisk.id,
         targetDiskId: targetDisk.id,
     }, cause, { type: 'instance', id: instance.id })
+    beginUsageSkip('move')
 
     let wasRunning = false
     // idea#168: set once the helper copy into the target started, cleared when the
@@ -617,6 +623,7 @@ export const moveApp = async (
         // 5b. rsync service image tars needed by this instance
         //     services/ holds the Docker image tars that startInstance loads via
         //     `docker image load`. Without them the moved instance cannot start.
+        //     Names come from serviceImageTarName (repo:tag, not @sha256; idea#445).
         setMoveStep(4)
         const sourceMountRootMove = await diskMountRoot(sourceDisk)
         const moveServicesSrcDir = `${sourceMountRootMove}/services`
@@ -624,7 +631,7 @@ export const moveApp = async (
         if (instance.serviceImages?.length) {
             let servicesDone = 0
             for (const serviceImage of instance.serviceImages) {
-                const tarName = (serviceImage as string).replace(/\//g, '_') + '.tar'
+                const tarName = serviceImageTarName(serviceImage as string)
                 const tarSrc = `${moveServicesSrcDir}/${tarName}`
                 if (await fs.pathExists(tarSrc)) {
                     log(`moveApp: syncing service image ${tarName}`)
@@ -721,6 +728,7 @@ export const moveApp = async (
         }
     } finally {
         resourceLock.releaseAll(moveLockKeys)
+        endUsageSkip('move')
     }
 }
 

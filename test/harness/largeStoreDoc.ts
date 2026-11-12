@@ -13,8 +13,9 @@
  * production stall: a fresh peer's full sync costs a few hundred ms of
  * synchronous Automerge work on a fast x86 core, several seconds on a Pi 4.
  *
- * Generating takes ~15-60 s, so the binary is cached in os.tmpdir() keyed by
- * the generator version and parameters.
+ * Generating takes ~33 s on the box and several minutes on a Pi 4, so the
+ * default binary is committed at test/fixtures/ws-large-store-v1.bin (idea#332).
+ * Non-default parameters still cache in os.tmpdir() keyed by version and options.
  */
 
 import os from 'os'
@@ -83,8 +84,39 @@ export const generateLargeStoreDoc = (opts: LargeStoreDocOptions = {}): Uint8Arr
     return A.save(final)
 }
 
-/** generateLargeStoreDoc(), cached in os.tmpdir() (generation is slow). */
+/** Committed default fixture (idea#332). Regenerating: write generateLargeStoreDoc() to this path. */
+export const LARGE_STORE_FIXTURE_NAME = 'ws-large-store-v1.bin'
+
+export const defaultLargeStoreFixturePath = (): string =>
+    path.resolve(process.cwd(), 'test/fixtures', LARGE_STORE_FIXTURE_NAME)
+
+const usesDefaultParams = (opts: LargeStoreDocOptions = {}): boolean =>
+    opts.heartbeats === undefined && opts.operations === undefined && opts.mergeEvery === undefined
+
+/**
+ * Default params: the committed fixture at test/fixtures/ws-large-store-v1.bin.
+ *
+ * The previous os.tmpdir() cache (`/tmp/idea-wsconc-store-v1-d-d-d.bin`) vanished
+ * after reboot and systemd-tmpfiles cleanup. Generating ~96 000 changes then
+ * costs ~33 s on the box and several minutes on a Pi 4; ws-post-burst's
+ * beforeAll also builds extra command-log docs, so a cold generate blew the
+ * 360 s Pi budget under test:full. An isolated retry then hit the cache and
+ * passed (idea#332, idea04 2026-10-28 and 2026-11-10).
+ *
+ * Non-default params (WSCONC_HEARTBEATS) still generate and cache in tmpdir.
+ */
 export const largeStoreDoc = (opts: LargeStoreDocOptions = {}): Uint8Array => {
+    if (usesDefaultParams(opts)) {
+        const file = defaultLargeStoreFixturePath()
+        if (!fs.existsSync(file)) {
+            throw new Error(`idea#332: missing committed fixture ${file}. Write generateLargeStoreDoc() output there.`)
+        }
+        const cached = fs.readFileSync(file)
+        if (cached.byteLength < 100_000) {
+            throw new Error(`idea#332: fixture ${file} is too small (${cached.byteLength} bytes)`)
+        }
+        return new Uint8Array(cached)
+    }
     const key = `v${GENERATOR_VERSION}-${opts.heartbeats ?? 'd'}-${opts.operations ?? 'd'}-${opts.mergeEvery ?? 'd'}`
     const file = path.join(os.tmpdir(), `idea-wsconc-store-${key}.bin`)
     try {

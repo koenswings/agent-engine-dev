@@ -35,7 +35,7 @@ export const RECOVERY_STRATEGY: Record<OperationKind, RecoveryStrategy> = {
     moveApp:       'retry',   // rsync-based — idempotent
     backupApp:     'retry',   // BorgBackup — idempotent; lock file already guards double-run
     restoreApp:    'fail',    // restore may have partially written target — safer to fail
-    upgradeApp:    'fail',    // not yet implemented
+    upgradeApp:    'fail',    // legacy kind, never issued: superseded by updateApp (#230); kept so old store Operations still parse (idea#76)
     updateApp:     'fail',    // #230: recoverInterruptedUpdates rolls back from the .pre-update snapshot first
     upgradeEngine: 'fail',    // not yet implemented
     startApp:      'fail',    // partial start state unknown — operator must re-issue

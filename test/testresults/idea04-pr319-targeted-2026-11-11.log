@@ -1,0 +1,32 @@
+Suite: targeted | Wed 11 Nov 2026 14:15:16 UTC | Branch:  | Commit: f29b03cff407d92d6e8c9d11edd665940a1ee018
+Host: idea04 root_src=/dev/sdb2 temp=50.6'C load=1.49 1.00 0.88 2/339 93674
+Isolation: IDEA_SYSTEM_DISK_SKIP=true IDEA_WATCH_DIR=/tmp/idea-test-Slihd4/watch IDEA_DISKS_ROOT=/tmp/idea-test-Slihd4/disks IDEA_CONFIG_FILE=/tmp/idea-test-Slihd4/config.yaml IDEA_TEST_ALLOW_LIVE=1 IDEA_NETWORK_TESTS=<unset> build=dist-test maxWorkers=1
+Files: dist-test/test/automated/idea-usage-settings.test.js dist-test/test/automated/install-root-helpers.test.js
+---
+
+ RUN  v4.1.2 /home/pi/axle-319
+
+ ✓ dist-test/test/automated/install-root-helpers.test.js > ensureAptPackages > installs only the missing packages (borgbackup on a Pi that has rsync) 16ms
+ ✓ dist-test/test/automated/install-root-helpers.test.js > ensureAptPackages > is a no-op when everything is installed (no apt at all) 3ms
+ ✓ dist-test/test/automated/install-root-helpers.test.js > ensureAptPackages > lists borgbackup and rsync 2ms
+ ✓ dist-test/test/automated/install-root-helpers.test.js > installRootHelpers > installs packages, sudoers, both helpers and peer access, then verifies borg + helper version 11ms
+ ✓ dist-test/test/automated/install-root-helpers.test.js > installRootHelpers > a second run reinstalls the helper (upgrade) but runs no apt 5ms
+ ✓ dist-test/test/automated/install-root-helpers.test.js > installRootHelpers > fails loudly when borg is still missing afterwards 9ms
+ ✓ dist-test/test/automated/install-root-helpers.test.js > installRootHelpers > fails loudly when the installed helper reports another version 4ms
+ ✓ dist-test/test/automated/install-root-helpers.test.js > installRootHelpers applies the DHCP vendor class on every update (idea#284) > installs and runs idea-dhcp-vendor-class, only reloads NM config, before the final checks 10ms
+ ✓ dist-test/test/automated/install-root-helpers.test.js > installRootHelpers applies the DHCP vendor class on every update (idea#284) > runs it again on a second update (the helper itself is idempotent) 7ms
+ ✓ dist-test/test/automated/install-root-helpers.test.js > installRootHelpers applies the DHCP vendor class on every update (idea#284) > a failing vendor-class step does not abort the update (the fleet health check reports it) 7ms
+ ✓ dist-test/test/automated/install-root-helpers.test.js > borgProblem (startup + backup preflight) > null when /usr/bin/borg exists 1ms
+ ✓ dist-test/test/automated/install-root-helpers.test.js > borgProblem (startup + backup preflight) > names the binary and the fix when it is missing (instead of exit 127 at backup time) 1ms
+ ✓ dist-test/test/automated/idea-usage-settings.test.js > idea-usage-settings: argument checks > rejects anything but on, off and status 1067ms
+ ✓ dist-test/test/automated/idea-usage-settings.test.js > idea-usage-settings: argument checks > rejects shell metacharacters and empty SSH_ORIGINAL_COMMAND with no argv 714ms
+ ✓ dist-test/test/automated/idea-usage-settings.test.js > idea-usage-settings: argument checks > accepts the three verbs via argv and via SSH_ORIGINAL_COMMAND 318ms
+ ✓ dist-test/test/automated/idea-usage-settings.test.js > idea-usage-settings: default off and idempotency > missing file is off and off does not create it 213ms
+ ✓ dist-test/test/automated/idea-usage-settings.test.js > idea-usage-settings: default off and idempotency > on twice and off twice exit 0 without rewriting 486ms
+ ✓ dist-test/test/automated/idea-usage-settings.test.js > idea-usage-settings: no process restarts > never mentions or invokes a pm2/docker restart command 340ms
+
+ Test Files  2 passed (2)
+      Tests  18 passed (18)
+   Start at  15:15:17
+   Duration  6.36s (transform 617ms, setup 0ms, import 2.11s, tests 3.23s, environment 1ms)
+

@@ -22,6 +22,7 @@ import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websoc
 import { cbor, Message, PeerId, PeerMetadata } from '@automerge/automerge-repo'
 import { parseRefusalMessage, peerVerdict, PeerVerdict } from './StoreScope.js'
 import { WsLiveness, wsDeadMs, wsPingMs } from './WsLiveness.js'
+import { log } from '../utils/utils.js'
 
 export interface ClientRefusal {
     url: string
@@ -44,6 +45,27 @@ export interface StoreScopedClientOptions {
 
 /** Small messages are peeked before the stock adapter sees them (handshake/error replies are tiny). */
 const PEEK_MAX_BYTES = 4096
+
+const WS_CONNECTING = 0
+const WS_CLOSED = 3
+
+/**
+ * idea#332: the stock adapter strips its own 'error' listener before it closes or
+ * abandons a socket. Closing a ws socket that is still CONNECTING makes ws emit
+ * 'WebSocket was closed before the connection was established' on the next tick,
+ * and with no listener left that 'error' event is an uncaught exception (it failed
+ * the idea04 test:full run). Give the socket we let go of a listener that logs the
+ * error instead, once.
+ */
+const guardReleasedSocket = (socket: any, url: string): void => {
+    if (!socket || socket.readyState === WS_CLOSED || socket.__ideaReleaseGuard) return
+    socket.__ideaReleaseGuard = true
+    const onError = (e: any) => {
+        log(`WS ${url}: error on a released socket (readyState ${socket.readyState}): ${e?.message ?? e?.error?.message ?? e}`, 2)
+    }
+    if (typeof socket.on === 'function') socket.on('error', onError)
+    else socket.addEventListener?.('error', onError)
+}
 
 export const guardOutgoing = (message: Message, docGuard: ((id: string) => boolean) | undefined): Message | undefined => {
     const docId = (message as any).documentId
@@ -74,6 +96,17 @@ export class StoreScopedWebSocketClientAdapter extends WebSocketClientAdapter {
 
     /** #168: every (re)connect gets a fresh socket; watch it for silence. */
     override connect(peerId: PeerId, peerMetadata?: PeerMetadata): void {
+        // idea#332: on a redial the stock connect() drops the previous socket (often still
+        // CONNECTING) without closing it and without an error listener. Guard and close it.
+        const previous: any = this.socket
+        if (previous && this.peerId) {
+            guardReleasedSocket(previous, this.url)
+            if (previous.readyState === WS_CONNECTING) {
+                try { previous.terminate ? previous.terminate() : previous.close() } catch (e: any) {
+                    log(`WS ${this.url}: closing the previous connecting socket failed: ${e?.message ?? e}`, 2)
+                }
+            }
+        }
         super.connect(peerId, peerMetadata)
         if (this.socket && !this.refusal) this.#liveness.attach(this.socket as any)
     }
@@ -129,6 +162,8 @@ export class StoreScopedWebSocketClientAdapter extends WebSocketClientAdapter {
     override disconnect(): void {
         this.#liveness.detach()
         if (!this.socket || !this.peerId) return
+        // idea#332: close-before-connect must not surface as an uncaught 'error'.
+        guardReleasedSocket(this.socket, this.url)
         super.disconnect()
     }
 

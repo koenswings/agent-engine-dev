@@ -27,6 +27,8 @@ import {
 } from '../../src/data/FlashCard.js'
 import { recoverInterruptedOperations, createOperation, updateOperation } from '../../src/data/Operations.js'
 import { setUnformattedOpsForTests, scanUnformattedDisks, clearGeneratedUnformattedIdsForTests, clearCardReaderMemoryForTests, candidateIdFor } from '../../src/data/UnformattedDisks.js'
+import { setRootDeviceForTests } from '../../src/data/Disk.js'
+import { setSystemDiskOpsForTests } from '../../src/data/SystemDisk.js'
 
 const LOCAL = localEngineId as EngineID
 const newStore = async (): Promise<DocHandle<Store>> => {
@@ -80,6 +82,20 @@ const useDevices = (devs: CardLsblkDevice[], docked: string[] = ['sdf1'], sys: (
         hardwareId: async () => undefined,
     })
 }
+
+// flashCard / processDisk fall back to the real findmnt / unless these are pinned.
+// On idea04 the root can enumerate as sdb2, so an sdb card would be SYSTEM_DISK.
+beforeEach(() => {
+    setRootDeviceForTests('sda2')
+    setSystemDiskOpsForTests({
+        findmntSource: async (mp) => mp === '/' ? '/dev/sda2' : mp === '/boot/firmware' ? '/dev/sda1' : null,
+        pkname: async () => 'sda',
+    })
+})
+afterEach(() => {
+    setRootDeviceForTests(null)
+    setSystemDiskOpsForTests(null)
+})
 
 describe('client cards scanner (idea#201 §10)', () => {
     beforeEach(() => { clearClientCardStateForTests(); clearGeneratedUnformattedIdsForTests(); resetClientCardWriteCacheForTests() })
@@ -276,9 +292,10 @@ describe('flashCard / cancelFlash (idea#201 §10)', () => {
         expect(await code(flashCard(h, cardId, 'current', String(16 * GB)))).toBe('SIZE_CHANGED')
         expect(await code(flashCard(h, cardId, '26.04-20990101-abcdef0', size))).toBe('IMAGE_NOT_FOUND')
         expect(await code(flashCard(h, cardId, 'current', 'abc'))).toBe('BAD_ARGS')
-        setFlashCardOpsForTests({ helperInstalled: () => false, images: async () => ({ current: V2, previous: null, images: [IMG] }) })
+        // Keep isSystemDevice: setFlashCardOpsForTests starts from defaultOps (real findmnt /).
+        setFlashCardOpsForTests({ helperInstalled: () => false, images: async () => ({ current: V2, previous: null, images: [IMG] }), isSystemDevice: async (d) => d.startsWith('sda') })
         expect(await code(flashCard(h, cardId, 'current', size))).toBe('HELPER_MISSING')
-        setFlashCardOpsForTests({ helperInstalled: () => true, images: async () => ({ current: V2, previous: null, images: [{ ...IMG, imageSizeBytes: 64 * GB }] }) })
+        setFlashCardOpsForTests({ helperInstalled: () => true, images: async () => ({ current: V2, previous: null, images: [{ ...IMG, imageSizeBytes: 64 * GB }] }), isSystemDevice: async (d) => d.startsWith('sda') })
         expect(await code(flashCard(h, cardId, 'current', size))).toBe('IMAGE_TOO_LARGE')
         expect(Object.keys(h.doc()!.operationDB)).toHaveLength(0)
         expect(spawned).toHaveLength(0)

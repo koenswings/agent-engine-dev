@@ -1,0 +1,2 @@
+{"schema":"idea-usage-presence/1","engine":"happy-zebra","ts":"2026-11-12T10:00:00+01:00","bootId":"boot-1","uptimeS":1000,"ntpSynced":true,"engineUp":true,"instancesUp":["kolibri-a","nextcloud-z"],"tempC":48.5,"throttled":"0x0"}
+{"schema":"idea-usage-presence/1","engine":"happy-zebra","ts":"2026-11-12T10:05:00+01:00","bootId":"boot-1","uptimeS":1300,"ntpSynced":true,"engineUp":true,"instancesUp":["kolibri-a","nextcloud-z","kolibri-timeout"],"tempC":49.1,"throttled":"0x0"}

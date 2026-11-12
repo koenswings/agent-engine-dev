@@ -47,8 +47,12 @@ Started via pm2, auto-starts on boot.
 Key-only SSH (idea#146). The Pi must already accept this machine's key and give `pi` passwordless sudo. The script never uses a password, never edits `/etc/hosts` on the runner, and never writes `~/.ssh/config`.
 
 ```bash
-# Pi 5 reached through idea03 as a jump host; fleet Tailscale key from a local file
-./script/provision-fleet.sh --jump pi@100.126.117.80 --authkey-file ~/fleet-authkey.txt \
+# Pi 5 reached through idea03 as a jump host; fleet key from ~/.config/idea/fleet-authkey
+./script/provision-fleet.sh --jump pi@100.126.117.80 \
+  idea01=192.168.0.138,model=pi5
+
+# Same, with an explicit key file (override)
+./script/provision-fleet.sh --jump pi@100.126.117.80 --authkey-file /path/to/key \
   idea01=192.168.0.138,model=pi5
 
 # Two Pis on the same LAN; the Pi already holds the Tailscale key
@@ -58,11 +62,17 @@ Key-only SSH (idea#146). The Pi must already accept this machine's key and give 
 What it does per node:
 1. Checks key-based SSH (`BatchMode`) and passwordless sudo
 2. Bootstraps apt packages, Node 22.20.0 and the pinned pnpm from `package.json` (`packageManager`, currently 10.33.0), then clones `/home/pi/idea/agents/<repo>`
-3. Stores the Tailscale fleet key over stdin when `--authkey-file` is given (idea#115)
+3. Stores the Tailscale fleet key over stdin from `--authkey-file` or, by default, `~/.config/idea/fleet-authkey` (idea#115). If the default file is absent and `--authkey-file` is not given, the Pi must already hold the key
 4. Runs `build-engine` in **local mode on the Pi** with explicit `--no-argon` / `--no-gadget` (unless you pass `--argon` / `--gadget`; `--gadget` is refused on pi5)
 5. Waits for the reboot and checks that pm2's `engine` is online and the Console HTTP port returns 200
 
 Allow 15–20 minutes per node. The Pi reboots at the end.
+
+**Fleet key file on the operator machine.** The box/operator fleet Tailscale key lives at `~/.config/idea/fleet-authkey` (mode `0600`, `tag:idea`, reusable, non-ephemeral, about 90-day expiry). `provision-fleet.sh` uses this file by default; `--authkey-file <path>` overrides it. The file is preflighted (must exist, be mode `600`, owned by you, and non-empty) and sent over stdin into `/etc/tailscale/debug-authkey` on the Pi. A missing default file is not fatal by itself; a missing explicit `--authkey-file` is.
+
+The router enrol tool (`tools/router-image/idea-router-enrol` in koenswings/idea) reads `~/.config/idea-router/fleet-authkey`. On the ops box that path is a **hard link** to the same file (one inode, one copy) — not a symlink. Enrol's preflight runs `stat -c %a` without `-L`, which would see a symlink's mode `777` and refuse it.
+
+To rotate the key, replace the file content in place so both names keep pointing at the same inode: write the new key to a temp file, then `cat tmp > ~/.config/idea/fleet-authkey` (or re-create the hard link after replacing the file). A plain `mv` onto one name would leave the other name on the old inode.
 
 Off flags for a manual local `build-engine` run (same as the provisioner):
 
@@ -140,7 +150,7 @@ Tailscale latent remote-access is **installed and ready** on all three fleet nod
 ssh pi@idea01.local
 sudo /usr/local/bin/tailscale-debug-activate.sh
 ```
-The script checks internet connectivity, joins the IDEA Tailnet (ephemeral), and prints the Tailscale IP. Press Enter when done — Pi leaves the Tailnet automatically.
+The script checks internet connectivity, joins the IDEA Tailnet with `--advertise-tags=tag:idea` (not `--ephemeral`: an ephemeral node vanishes after it has been offline, and the D-2 key is non-ephemeral), and prints the Tailscale IP. Press Enter when done — the script runs `tailscale down` and stops tailscaled; the node stays registered.
 
 **Fresh Pi provisioning:** `buildEngine` now calls `installTailscale()` automatically. Auth key is read from `TAILSCALE_AUTHKEY` env var or `/home/pi/openclaw/secrets/tailscale_authkey.txt` on wizardly-hugle.
 
@@ -150,15 +160,20 @@ The script checks internet connectivity, joins the IDEA Tailnet (ephemeral), and
 - The key never reaches pm2: build-engine drops `TAILSCALE_AUTHKEY` from its environment once `installTailscale()` has read it, and runs pm2 under `env -u TAILSCALE_AUTHKEY`, so it is not in `~/.pm2/dump.pm2` (idea#273).
 - Never put the key on a command line yourself, e.g. `tailscale up --authkey tskey-…` or `echo tskey-… | …`.
 
-**Field Pis use one reusable, ephemeral fleet auth key (idea#117).** Every field Pi stores the same key at `/etc/tailscale/debug-authkey` (`0600 root:root`, never on a command line, see above).
-- **Why:** during an intervention, someone at the school runs `tailscale-debug-activate.sh`, and the Pi joins the tailnet with that key.
-- **Reusable:** the key has to work for every session on every field Pi. We usually can't reach a Pi in the field to give it a new key, so a single-use key would be spent after its first session.
-- **Ephemeral:** the Pi drops off the tailnet when the session ends. That way it doesn't keep using a device slot, which keeps the licence count low.
-- **The current key:** "idea fleet authentication", created in the Tailscale admin console (Settings → Keys). It expires 2026-12-20. Koen is keeping it, so don't revoke it.
+**Target design: Tailscale always on, one fleet tag and one fleet key (Koen, 2026-10-13, idea#117).** See `proposals/2026-10-13-tailscale-single-fleet-tag.md` in koenswings/idea.
+- Tailscale is always on at schools, on the router and on every Pi. There are no per-school tags or keys, so a Pi can move between schools without admin work.
+- **One fleet tag, `tag:idea`, and one fleet auth key** tagged `tag:idea`. Every field Pi stores the same key at `/etc/tailscale/debug-authkey` (`0600 root:root`, never on a command line, see above).
+- **ACL:** admins → `tag:idea` allowed; `tag:idea` → anything denied. Pis talk to each other only over the school LAN websocket, never over Tailscale.
+- The key is a secret: never in docs, issues or chat.
 
-The permanent fleet Pis (idea02, idea03) didn't join with this key and aren't ephemeral.
+**Current state (not yet the target design).**
+- The routers already enrol with `--advertise-tags=tag:idea` and no `--ephemeral` (`tools/router-image/idea-router-enrol` in koenswings/idea). The kit Engines' nodes carry `tag:idea` and stay registered while offline.
+- The Engine still uses the latent-debug activate script during an intervention (`tailscale-debug-activate.sh` starts tailscaled, joins, then `tailscale down`). It joins with `--advertise-tags=tag:idea` and no `--ephemeral` (an ephemeral node vanishes after it has been offline, and the D-2 key is non-ephemeral; idea#117 D-2 option 3). Always-on first-boot join remains [engine#291](https://github.com/koenswings/agent-engine-dev/pull/291).
+- The fleet Pis (idea01–idea04) and the ops box are untagged members of the tailnet.
 
-**Refresh the key before it expires.** Tailscale auth keys expire after at most 90 days. Once the stored key has expired, a field Pi can no longer join the tailnet, so every Pi's stored key must be replaced with a new fleet key before that happens. How the refresh works in the field is still open in [idea#117](https://github.com/koenswings/idea/issues/117). That issue also covers the key's tag and the tailnet access rules. Options for the refresh include refreshing during site visits or pushing a new key while a Pi is connected.
+**Not yet confirmed (idea#117 audit, 2026-10-29).** The fleet key's expiry, whether it is reusable or ephemeral, whether it carries `tag:idea`, and what the ACL allows `tag:idea` to reach have not been checked in the admin console. Treat any expiry date or the "at most 90 days" limit as unverified until Koen's console read (idea#375) is recorded on idea#117. Don't revoke the current key ("idea fleet authentication"): Koen is keeping it.
+
+**Refresh the key before it expires.** Once the stored key has expired, a Pi that still has to join with it can't, so every Pi's stored key has to be replaced with the new fleet key before the real expiry date. Atlas writes the rotation plan on idea#117 once the console facts are known.
 
 To replace the stored key on a Pi you can reach, without the key appearing on any command line:
 1. Put the new key in a local file only you can read (`chmod 600`).

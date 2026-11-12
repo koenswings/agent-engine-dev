@@ -123,8 +123,20 @@ export const parseRefusalMessage = (message: unknown): { theirTag: string, kind:
  */
 export const isForeignStoreDocContent = (ownStoreDocId: string, docId: string, doc: unknown): boolean => {
     if (String(docId) === String(ownStoreDocId).replace(/^automerge:/, '')) return false
-    return !!doc && typeof doc === 'object' && 'engineDB' in (doc as object)
-        && typeof (doc as any).engineDB === 'object' && (doc as any).engineDB !== null
+    if (!doc || typeof doc !== 'object') return false
+    if ('engineDB' in (doc as object) && typeof (doc as any).engineDB === 'object' && (doc as any).engineDB !== null) return true
+    return isForeignCommandLogContent(ownStoreDocId, doc)
+}
+
+/**
+ * #158: a command log (`{ traces, recentTraceIds }`) stamped with another fleet's storeTag.
+ * An untagged log (written before the tag existed) cannot be judged and is let through;
+ * existing foreign copies on disk are handled by the store-data quarantine.
+ */
+export const isForeignCommandLogContent = (ownStoreDocId: string, doc: unknown): boolean => {
+    const d = doc as any
+    if (!d || typeof d !== 'object' || typeof d.traces !== 'object' || !Array.isArray(d.recentTraceIds)) return false
+    return typeof d.storeTag === 'string' && d.storeTag !== storeTag(ownStoreDocId)
 }
 
 /**

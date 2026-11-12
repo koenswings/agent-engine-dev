@@ -10,7 +10,7 @@ import { DocHandle, Repo } from '@automerge/automerge-repo'
 import { fs, path, YAML } from 'zx'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId, ENGINE_CAPABILITIES } from '../../src/data/Engine.js'
-import { createOrUpdateDisk, processDisk } from '../../src/data/Disk.js'
+import { createOrUpdateDisk, processDisk, setRootDeviceForTests } from '../../src/data/Disk.js'
 import {
     eraseDisk, setEraseOpsForTests, clearStaleEraseStaging, ERASE_STAGING_ROOT,
     eraseBlocker, IDEA_DISK_LABEL, isEraseDeviceLocked, isSlotEraseDevice,
@@ -38,7 +38,7 @@ const newStore = async () => {
 }
 
 describe('system disk helper + mount command (idea#134)', () => {
-    afterEach(() => setSystemDiskOpsForTests(null))
+    afterEach(() => { setSystemDiskOpsForTests(null); setRootDeviceForTests(null) })
 
     it('driveNameOf handles sd / mmcblk / nvme', () => {
         expect(driveNameOf('sda2')).toBe('sda')
@@ -64,7 +64,7 @@ describe('system disk helper + mount command (idea#134)', () => {
     })
 
     it('ENGINE_CAPABILITIES includes eraseDisk', () => {
-        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'moveAppCrossEngine'])
+        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'moveAppCrossEngine', 'usageSummaries', 'backupVerify'])
     })
 })
 
@@ -200,11 +200,13 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
             findmntSource: async (mp) => mp === '/' ? '/dev/sda2' : null,
             pkname: async () => 'sda',
         })
+        setRootDeviceForTests('sda2')
     })
     afterEach(async () => {
         vi.restoreAllMocks()
         setEraseOpsForTests(null)
         setSystemDiskOpsForTests(null)
+        setRootDeviceForTests(null)
         setCommandLogHandle(null)
         resourceLock.releaseAll([...resourceLock.allLocks().keys()])
         for (const r of roots.splice(0)) await fs.remove(r).catch(() => {})

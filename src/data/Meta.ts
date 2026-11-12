@@ -138,6 +138,27 @@ export const newHardwareDiskId = async (
   return r.diskId
 }
 
+const isValidTimestamp = (v: unknown): v is number =>
+  typeof v === 'number' && Number.isFinite(v) && v > 0
+
+/**
+ * Default META fields that get copied into the Automerge store, so none is ever
+ * assigned as undefined (Automerge rejects undefined values; idea#394, idea#139).
+ * Must run before lastDocked is refreshed, so a missing `created` can fall back to
+ * the previous lastDocked. Returns true when META was changed (the caller persists
+ * it with the normal lastDocked rewrite, unless skipMetaUpdate()).
+ */
+export const applyMetaDefaults = (meta: DiskMeta, path: string, now: () => number = () => Date.now()): boolean => {
+  let changed = false
+  if (!isValidTimestamp(meta.created)) {
+    const fallback = isValidTimestamp(meta.lastDocked) ? meta.lastDocked : now()
+    log(`WARNING: META.yaml of disk ${meta.diskId} (${path}) has no valid 'created' (${String(meta.created)}); defaulting to ${isValidTimestamp(meta.lastDocked) ? 'its lastDocked' : 'now'} (${fallback})`)
+    meta.created = fallback as Timestamp
+    changed = true
+  }
+  return changed
+}
+
 export interface MetaIdDeps {
   /** Hardware identity of an App Disk partition (serial + partition facts) */
   readIdentity: (device: DeviceName) => Promise<HardwareIdentity | undefined>
@@ -243,12 +264,15 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName, depsIn: Partial<
         update = true
       }
 
+      // Optional-in-practice fields: never hand undefined to Automerge (idea#394)
+      if (applyMetaDefaults(meta, path)) update = true
+
       // Update the lastDocked timestamp
       meta.lastDocked = new Date().getTime() as Timestamp
       update = true  // Always update the lastDocked timestamp
 
       // Upgrade older META files that do not have the diskName field
-      if (!meta.hasOwnProperty('diskName')) {
+      if (meta.diskName == null || String(meta.diskName) === '') {
         log(`Upgrading older META file format to include diskName field and remove obsolete properties`)
         meta.diskName = diskId.toString() as DiskName
         // Remove the properties engineId and hostname
