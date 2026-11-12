@@ -180,7 +180,11 @@ case "$1" in
   init) mkdir -p "\${@: -1}" && echo '[repository]' > "\${@: -1}/config" ;;
   info) if [[ -n "\${FAKE_BORG_INFO:-}" ]]; then echo "$FAKE_BORG_INFO"; else echo '{"archives":[]}'; fi ;;
   extract) for e in \${FAKE_BORG_EXTRACT:-}; do mkdir -p "$e" && echo restored > "$e/data.txt"; done ;;
-  list) if [[ -n "\${FAKE_BORG_LIST:-}" ]]; then echo "\${FAKE_BORG_LIST}"; fi ;;
+  list)
+    short=0
+    for a in "$@"; do [[ "$a" == --short ]] && short=1; done
+    if [[ \$short -eq 1 && -n "\${FAKE_BORG_MEMBERS:-}" ]]; then echo "\${FAKE_BORG_MEMBERS}"
+    elif [[ -n "\${FAKE_BORG_LIST:-}" ]]; then echo "\${FAKE_BORG_LIST}"; fi ;;
   delete) ;;
   compact) ;;
   create)
