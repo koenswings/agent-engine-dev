@@ -170,6 +170,13 @@ export interface BackupHookRunSpec {
     service: string
     command: string[]
     user?: string
+    /**
+     * idea#448 pre-update backup: run the hook declared in the NEW bundle's compose
+     * against the live compose project. `docker compose -p <project>
+     * --project-directory <projectDir> -f <composeFile> exec ...`, so the running
+     * containers of instance <project> are used and the live .env is read.
+     */
+    compose?: { project: string, projectDir: string, file: string }
 }
 
 export interface BackupHookRunResult {
@@ -186,8 +193,10 @@ export const backupHookArgv = (spec: BackupHookRunSpec): string[] => {
     const timeout = Number.isInteger(spec.timeoutS) && spec.timeoutS >= 1 ? spec.timeoutS : DEFAULT_HOOK_TIMEOUT_S
     const argv = [
         'timeout', '--signal=TERM', '--kill-after=10s', String(timeout),
-        'docker', 'compose', 'exec', '-T',
+        'docker', 'compose',
     ]
+    if (spec.compose) argv.push('-p', spec.compose.project, '--project-directory', spec.compose.projectDir, '-f', spec.compose.file)
+    argv.push('exec', '-T')
     if (spec.user !== undefined) argv.push('--user', spec.user)
     argv.push('--', spec.service, ...spec.command)
     return argv
