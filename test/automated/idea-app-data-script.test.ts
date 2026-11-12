@@ -939,7 +939,7 @@ describe('idea-app-data: borg-list / borg-delete / borg-compact (idea#401, helpe
         bk = await sb.addDisk('sdc1', { backup: true })
     })
 
-    it('borg-list prints borg info --json (no --last) for the repo', async () => {
+    it('borg-list prints borg info --json --glob-archives * (no --last) for the repo', async () => {
         const payload = JSON.stringify({
             archives: [
                 { name: A[1], start: '2026-01-02T00:00:00.000000', stats: { original_size: 200, compressed_size: 80 } },
@@ -953,7 +953,7 @@ describe('idea-app-data: borg-list / borg-delete / borg-compact (idea#401, helpe
         expect(r.exitCode, r.stderr).toBe(0)
         expect(JSON.parse(r.stdout)).toEqual(JSON.parse(payload))
         const [info] = await sb.calls('borg')
-        expect(info.argv).toEqual(['info', '--json', '--', repo])
+        expect(info.argv).toEqual(['info', '--json', '--glob-archives', '*', '--', repo])
         expect(info.argv).not.toContain('--last')
     })
 
@@ -1015,13 +1015,13 @@ describe('idea-app-data: borg-list / borg-delete / borg-compact (idea#401, helpe
         expect(calls[0].argv).toEqual(['list', '--format', '{name}{NL}', '--sort-by', 'timestamp', '--', repo])
         expect(calls[1].argv).toEqual(['list', '--short', '--', `${repo}::${A[0]}`])
         refused(await sb.run(['borg-list', 'sdc1', 'inst1', A[3]], listEnv(A.slice(0, 3))), /archive '.*' is not in the repository/)
-        // 2-arg form is still borg info --json, no --last
+        // 2-arg form is borg info --json --glob-archives '*', no --last
         const payload = JSON.stringify({ archives: [{ name: A[0] }] })
         const inv = await sb.run(['borg-list', 'sdc1', 'inst1'], { FAKE_BORG_INFO: payload })
         expect(inv.exitCode, inv.stderr).toBe(0)
         expect(JSON.parse(inv.stdout)).toEqual(JSON.parse(payload))
         const info = (await sb.calls('borg')).at(-1)!
-        expect(info.argv).toEqual(['info', '--json', '--', repo])
+        expect(info.argv).toEqual(['info', '--json', '--glob-archives', '*', '--', repo])
         expect(info.argv).not.toContain('--last')
     })
 
