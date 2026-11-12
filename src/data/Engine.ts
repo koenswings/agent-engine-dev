@@ -664,6 +664,32 @@ export const installDhcpVendorClass = async (exec: any, enginePath: string) => {
   }
 }
 
+/** sysctl.d drop-in (idea#467): raise IGMP group memberships so multicast-heavy
+ *  containers (Kolibri zeroconf) do not hit OSError 105 on busy Docker hosts. */
+export const IGMP_SYSCTL_CONF = '/etc/sysctl.d/90-idea-igmp.conf'
+export const IGMP_SYSCTL_ASSET = '90-idea-igmp.conf'
+export const IGMP_MAX_MEMBERSHIPS = 1024
+
+/**
+ * idea#467: write /etc/sysctl.d/90-idea-igmp.conf (net.ipv4.igmp_max_memberships=1024)
+ * and apply it with `sysctl -p` on that file. Idempotent. Root install step only
+ * (no sudoers change; the Engine process never applies sysctl at runtime).
+ * In an image-build chroot (IDEA_IMAGE_BUILD=1) the file is still installed, but
+ * `sysctl -p` is skipped so the bind-mounted /proc cannot change the build host;
+ * systemd-sysctl applies the file at first boot.
+ */
+export const installIgmpSysctl = async (exec: any, enginePath: string) => {
+  print(chalk.blue('  - Installing /etc/sysctl.d/90-idea-igmp.conf...'))
+  await exec`sudo install -o root -g root -m 0644 ${enginePath}/script/build_image_assets/${IGMP_SYSCTL_ASSET} ${IGMP_SYSCTL_CONF}`
+  if (process.env.IDEA_IMAGE_BUILD === '1') {
+    print(chalk.blue('  - Skipping sysctl -p (image build; the file is applied at first boot)'))
+    print(chalk.green(`  - ${IGMP_SYSCTL_CONF} installed`))
+    return
+  }
+  await exec`sudo sysctl -p ${IGMP_SYSCTL_CONF}`
+  print(chalk.green(`  - ${IGMP_SYSCTL_CONF} installed and applied (igmp_max_memberships=${IGMP_MAX_MEMBERSHIPS})`))
+}
+
 /** Installed copy of script/build_image_assets/idea-avahi-lan-only (idea#203). */
 export const AVAHI_LAN_ONLY_HELPER = '/usr/local/sbin/idea-avahi-lan-only'
 export const AVAHI_CONF = '/etc/avahi/avahi-daemon.conf'
@@ -797,7 +823,7 @@ export const ensureAptPackages = async (exec: any, pkgs: string[]): Promise<stri
  * install AND every update (build-engine installUdev, ./install-root-helpers,
  * sync-engine): rsync + borgbackup, the sudoers files, /usr/local/sbin/idea-erase-disk,
  * /usr/local/sbin/idea-app-data, the peer-access parts and the DHCP vendor class
- * (idea#284). `install` overwrites
+ * (idea#284), and the IGMP sysctl drop-in (idea#467). `install` overwrites
  * the helpers with the checkout's copies, so an outdated helper is upgraded.
  * Ends by checking /usr/bin/borg and `idea-app-data version`; throws if either is wrong.
  */
@@ -858,6 +884,10 @@ export const installRootHelpers = async (exec: any, enginePath: string) => {
   // never restarts NM or touches a link. A failure is logged, not fatal: the fleet
   // health check reports an Engine whose drop-in is missing.
   await installDhcpVendorClass(exec, enginePath)
+  // IGMP group limit (idea#467). Here, not only in an image build, so pool
+  // Engines get it from a normal update. Idempotent. Applying sysctl needs
+  // root and is skipped when IDEA_IMAGE_BUILD=1 (chroot /proc is the build host).
+  await installIgmpSysctl(exec, enginePath)
   // Verify, so a broken install stops here and not at the first backup (exit 127)
   try {
     await exec`test -x ${BORG_PATH}`
