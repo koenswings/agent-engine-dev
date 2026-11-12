@@ -137,6 +137,27 @@ const writeBackupYaml = async (backupDevice: string, yaml: BackupYaml): Promise<
 // ── Core backup logic ─────────────────────────────────────────────────────────
 
 /**
+ * idea#448: the backup updateApp takes itself before a major update.
+ *  - `composePath`: read x-app.backup (exclude, hookExclude, method, hooks) from the NEW
+ *    bundle's compose instead of the instance's; the hook runs from that compose
+ *    against the live compose project (BackupHookRunSpec.compose).
+ *  - updateApp already holds the instance lock: only the Backup Disk lock is taken.
+ *  - A failed preHook never stops the instance here (fallback is treated as `fail`).
+ *  - `instanceStopped`: updateApp stopped the instance for its Snapshot (stop-mode new
+ *    compose, or an instance that was not running): Borg runs directly, no hook, no
+ *    stop and no start (one stop for backup and snapshot).
+ *  - A `.backup-in-progress` left by an earlier backup refuses (no auto-retry, #446).
+ * Errors are thrown to updateApp (no own trace).
+ */
+export interface PreUpdateBackupOptions {
+    composePath: string
+    instanceStopped: boolean
+}
+
+/** Text that starts a refusal of the pre-update backup because of a stale lock. */
+export const BACKUP_STALE_LOCK = 'BACKUP_STALE_LOCK'
+
+/**
  * Run a Borg backup of one instance to a Backup Disk.
  * Idempotent: if interrupted and re-triggered, Borg deduplicates against
  * existing chunks and completes in near-O(delta) time.
@@ -147,10 +168,12 @@ export const backupInstance = async (
     backupDisk: Disk,
     existingOpId?: string,  // pass when retrying an interrupted op
     cause: OperationCause = 'console-command',
+    preUpdate?: PreUpdateBackupOptions,
 ): Promise<void> => {
     // If there is no active trace (called from backup monitor, not via Console command),
     // create one so that step markers and log lines land in the Console log panel.
-    if (!getActiveTrace()) {
+    // The pre-update backup reports its errors to updateApp, so it never swallows them.
+    if (!getActiveTrace() && !preUpdate) {
         const cmdLogHandle = getCommandLogHandle()
         const traceId = crypto.randomUUID()
         const traceArgs = JSON.stringify({ instanceId, backupDiskId: backupDisk.id, cause })
@@ -172,11 +195,15 @@ export const backupInstance = async (
     }
     activeBackups.add(instanceId)
     let didStop = false
+    // idea#448: a pre-update backup that fails before Borg ran (e.g. HOOK_FAILED) clears
+    // its own lock file, so it is no stale lock; after Borg started it stays (boot-resume).
+    let wroteLock: string | null = null
+    let borgStarted = false
 
     // Take the instance lock and the Backup Disk lock together, as restore does
     // (idea#126, Files Disk step 0): nothing else may change the instance or the
     // Backup Disk (eject, erase, another backup or restore) while Borg writes.
-    const backupLockKeys = backupLockKeysFor(instanceId, backupDisk.id)
+    const backupLockKeys = preUpdate ? [diskKey(backupDisk.id)] : backupLockKeysFor(instanceId, backupDisk.id)
     if (!resourceLock.acquireAll(backupLockKeys, 'backupApp')) {
         activeBackups.delete(instanceId)
         const held = backupLockKeys.map(k => resourceLock.getLockInfo(k)).find(Boolean)
@@ -186,6 +213,7 @@ export const backupInstance = async (
     const opId = existingOpId ?? createOperation(storeHandle, 'backupApp', {
         instanceId,
         backupDiskId: backupDisk.id,
+        ...(preUpdate ? { reason: 'pre-update' } : {}),
     }, cause, { type: 'instance', id: instanceId })
     beginUsageSkip('backup')
 
@@ -240,11 +268,14 @@ export const backupInstance = async (
         // (idea#444). Fail closed: a non-empty exclude list on a helper older
         // than v8, or a malformed method/hook block, refuses before any hook
         // or stop, and without writing lastBackup.
-        const composePath = joinMountRoot(await diskMountRoot(appDisk as Disk), 'instances', instanceId, 'compose.yaml')
         const instanceDir = joinMountRoot(await diskMountRoot(appDisk as Disk), 'instances', instanceId)
+        const composePath = preUpdate?.composePath ?? joinMountRoot(instanceDir, 'compose.yaml')
         let backupExcludes: string[] = []
         let hookExcludes: string[] = []
         let backupSpec = defaultBackupSpec()
+        if (preUpdate && !await fs.pathExists(composePath)) {
+            throw new Error(`backupApp: the new bundle's ${composePath} is missing`)
+        }
         if (await fs.pathExists(composePath)) {
             let parsed: unknown
             try {
@@ -269,6 +300,11 @@ export const backupInstance = async (
             } catch (e: any) {
                 throw new Error(`backupApp: invalid x-app.backup (${e?.message ?? e})`)
             }
+        }
+        // idea#448 (Steve Q4): inside updateApp a failed preHook refuses, it never stops.
+        if (preUpdate) backupSpec.fallback = 'fail'
+        if (preUpdate && !preUpdate.instanceStopped && backupSpec.method !== 'hook') {
+            throw new Error(`backupApp: the pre-update backup of ${instanceId} needs method 'hook' while the instance runs (updateApp takes a stop-mode backup inside its Snapshot stop)`)
         }
         if ((backupExcludes.length || hookExcludes.length) && !skipBorg()) {
             const helper = await helperAtLeast(BACKUP_EXCLUDE_HELPER_MIN, 'backupApp with x-app.backup.exclude')
@@ -301,9 +337,13 @@ export const backupInstance = async (
         }
 
         // 2. Write lock file (signals in-progress backup for boot-resume)
-        await fs.writeFile(lockPath, JSON.stringify({ instanceId, startedAt: Date.now() }))
+        if (preUpdate && await fs.pathExists(lockPath)) {
+            throw new Error(`${BACKUP_STALE_LOCK}: ${lockPath} is left from an earlier backup of ${instanceId}; it is not retried here (idea#446)`)
+        }
+        await fs.writeFile(lockPath, JSON.stringify({ instanceId, startedAt: Date.now(), ...(preUpdate ? { reason: 'pre-update' } : {}) }))
+        wroteLock = lockPath
 
-        const wasRunningAtStart = instance.status === 'Running'
+        const wasRunningAtStart = instance.status === 'Running' && !preUpdate?.instanceStopped
         let hookResult: 'stop' | 'hook' | 'HOOK_FALLBACK' = 'stop'
         let hookWarning: string | null = null
 
@@ -319,6 +359,7 @@ export const backupInstance = async (
                     service: hook.service,
                     command: hook.command,
                     user: hook.user,
+                    ...(preUpdate ? { compose: { project: String(instanceId), projectDir: instanceDir, file: composePath } } : {}),
                 })
                 return { failed: r.code !== 0 || r.timedOut, timedOut: r.timedOut, code: r.code, stderr: r.stderr }
             } catch (e: any) {
@@ -334,6 +375,7 @@ export const backupInstance = async (
 
         const runBorgCreate = async (excludes: string[]): Promise<void> => {
             setBackupStep(2, BACKUP_STEPS[2])
+            borgStarted = true
             const archiveName = new Date().toISOString().replace(/[:.]/g, '-')
             if (!skipBorg()) {
                 log(`Running borg create for instance ${instanceId}${excludes.length ? ` (${excludes.length} exclude(s))` : ''}`)
@@ -361,7 +403,12 @@ export const backupInstance = async (
         // 3–5. Copy: method hook runs preHook (no stop) then borg then postHook;
         // a failed/timed-out preHook always runs postHook, then either HOOK_FALLBACK
         // (short stop) or HOOK_FAILED (no stop), per x-app.backup.fallback.
-        if (backupSpec.method === 'hook') {
+        if (preUpdate?.instanceStopped) {
+            // updateApp stopped the instance for its Snapshot: Borg only, the hook dump is not
+            // needed (the live files are quiet), so hookExclude does not apply.
+            hookResult = 'stop'
+            await runBorgCreate(backupExcludes)
+        } else if (backupSpec.method === 'hook') {
             setBackupStep(1, 'Running pre-backup hook')
             const pre = await runDeclaredHook(backupSpec.preHook, 'preHook')
             if (!pre.failed) {
@@ -451,6 +498,9 @@ export const backupInstance = async (
             } catch (restartErr) {
                 log(chalk.red(`Failed to restart instance ${instanceId} after backup error: ${restartErr}`))
             }
+        }
+        if (preUpdate && wroteLock && !borgStarted) {
+            await fs.remove(wroteLock).catch(() => { /* best effort; the next updateApp reports it */ })
         }
         // Lock file intentionally left in place — signals boot-resume on next dock
         // Rethrow so the backup's trace ends with status 'error' and this message

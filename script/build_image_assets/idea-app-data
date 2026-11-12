@@ -59,7 +59,7 @@
 #   idea-app-data borg-info    <bdev> <id>
 #   idea-app-data borg-create  <bdev> <id> <archive> <srcRoot> [exclude…]   (v8, idea#443)
 #   idea-app-data borg-extract <bdev> <id> <archive> <strip> <dstRoot>
-#   idea-app-data borg-list    <bdev> <id>                                   (v9, idea#401: archive inventory)
+#   idea-app-data borg-list    <bdev> <id>                                   (v9, idea#401: archive inventory; v10, idea#450: --glob-archives '*')
 #   idea-app-data borg-list    <bdev> <id> <archive>                         (v9, idea#446: member list of one archive)
 #   idea-app-data borg-extract-verify <bdev> <id> <archive> <stamp>          (v9, idea#446: extract into .idea-verify/<id>-<stamp>/, never instances/<id>)
 #   idea-app-data borg-delete  <bdev> <id> <archive> [keepMin]               (v9, idea#401; keepMin default 3)
@@ -137,7 +137,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=9
+readonly IDEA_APP_DATA_VERSION=10
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -1497,8 +1497,10 @@ case "$SUB" in
 
     borg-list)
         # idea#401 / helper v9: 2-arg form prints JSON of every archive
-        # (borg info --json, no --last). idea#446: 3-arg form lists members
-        # of one archive (borg list --short). The 2-arg inventory is unchanged.
+        # (borg info --json --glob-archives '*', no --last; v10, idea#450). Borg 1.x
+        # `info REPO` with no archive selector prints repository info only
+        # (no "archives" key), so the selector is required. idea#446: 3-arg
+        # form lists members of one archive (borg list --short).
         given=$(($# - 1))
         (( given == 2 || given == 3 )) || refuse "$SUB takes 2 or 3 argument(s) (<bdev> <id> [<archive>]), got $given"
         check_id "$3"
@@ -1511,7 +1513,7 @@ case "$SUB" in
         [[ -f "$REPO/config" ]] || refuse "$REPO is not a Borg repository"
         borg_env
         if (( given == 2 )); then
-            run_child $BORG info --json -- "$REPO"
+            run_child $BORG info --json --glob-archives '*' -- "$REPO"
             exit $?
         fi
         LIST=$($BORG list --format '{name}{NL}' --sort-by timestamp -- "$REPO") || refuse "cannot list archives in $REPO"
