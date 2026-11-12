@@ -22,8 +22,10 @@
 #                                  (root 0600, the existing latent-debug key path,
 #                                  idea#115) and wiped from the card at once; then
 #                                  `systemctl enable --now tailscaled` and `tailscale up
-#                                  --auth-key=file:...` runs. Offline / failed: the
-#                                  join is retried on later boots until it succeeds.
+#                                  --auth-key=file:...` runs. After a successful join
+#                                  the key file is deleted (`shred -u`, else `rm -f`).
+#                                  Offline / failed: the key is kept and the join is
+#                                  retried on later boots until it succeeds.
 #   idea-identity.txt              informational, never read.
 #
 # The key is never logged and never a command-line argument. Invalid values are
@@ -172,6 +174,15 @@ join_tailnet() {
     out=$(printf '%s\n' "$out" | grep -v -F -f "$KEY_DST" | grep -v 'tskey-' | tail -n 3)
     if [ "$rc" -eq 0 ]; then
         rm -f "$TS_PENDING"
+        # idea#117 D-2: delete the key only after a successful join so a failed
+        # join can be retried. shred -u when available, else rm -f. No quarantine.
+        if [ -e "$KEY_DST" ]; then
+            if [ -x "$SHRED" ]; then
+                "$SHRED" -u -- "$KEY_DST" 2>/dev/null || rm -f -- "$KEY_DST"
+            else
+                rm -f -- "$KEY_DST"
+            fi
+        fi
         log "joined the tailnet"
     else
         log "tailscale up failed (exit $rc; offline?); will retry next boot${out:+: $out}"
