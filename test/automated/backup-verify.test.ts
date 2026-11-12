@@ -138,9 +138,9 @@ describe('parse helpers (idea#446)', () => {
         expect(parseBackupExcludeList({ backup: { exclude: ['keys'] } })).toEqual(['data/keys'])
     })
 
-    it('registers the four commands and the backupVerify capability; Engine speaks helper v10 (idea#450)', () => {
+    it('registers the four commands and the backupVerify capability; Engine speaks helper v11', () => {
         expect(BACKUP_VERIFY_HELPER_MIN).toBe(10)
-        expect(APP_DATA_HELPER_VERSION).toBe('10')
+        expect(APP_DATA_HELPER_VERSION).toBe('11')
         expect(ENGINE_CAPABILITIES).toContain('backupVerify')
         for (const name of ['listBackup', 'verifyBackup', 'clearBackupLock', 'removeBackupRole']) {
             expect(commands.find(c => c.name === name), name).toBeTruthy()
