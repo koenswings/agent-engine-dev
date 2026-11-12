@@ -27,6 +27,9 @@ and chosen for fast startup in tests, not for production use.
 | `disk-sample-v1.1/` | Minor upgrade of `disk-sample-v1` — same instance at version 1.1 |
 | `disk-files/` | Files Disk (idea#131): `META.yaml`, `FILES.yaml` (share "School Files") and `files/` |
 | `disk-files-app/` | App Disk that is also a Files Disk: `sample-files-1.0` opts in with `x-app.filesMount` (used from Files Disk step 2), no instance |
+| `ws-large-store-v1.bin` | Synthetic Automerge store (~96k changes) for ws-post-burst / ws-concurrent-sync (idea#332). Loaded by `largeStoreDoc()`. |
+| `borg-1.4.0/` | Not synthetic: real borg 1.4.0 `info --json` output (repo-level without `archives`, and with `--glob-archives '*'`), paths/host/user sanitised. Used by `borg-info-140-fixture.test.ts` (idea#450). |
+| `ws-command-log-1000.bin`, `ws-command-log-6000.bin` | Command-log-like extra docs for ws-post-burst (idea#332). Loaded by `commandLogDoc(N)`. |
 
 ## Adding fixtures
 

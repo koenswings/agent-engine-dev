@@ -70,6 +70,7 @@ describe('command refusals end the trace as error (idea#168 r29@97)', () => {
         expect(t.status).toBe('error')
         if (typeof message === 'string') expect(t.errorMessage).toContain(message)
         else expect(t.errorMessage).toMatch(message)
+        expect(t.error).toBe(t.errorMessage)
         expect(t.completedAt).not.toBeNull()
     }
 

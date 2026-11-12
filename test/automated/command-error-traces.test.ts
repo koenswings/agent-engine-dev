@@ -51,6 +51,7 @@ describe('handleCommand error traces (idea#122)', () => {
         expect(t!.command).toBe('createFilesDisk')
         expect(t!.status).toBe('error')
         expect(t!.errorMessage).toBe('Unknown command: createFilesDisk')
+        expect(t!.error).toBe(t!.errorMessage)
         expect(t!.completedAt).not.toBeNull()
     })
 

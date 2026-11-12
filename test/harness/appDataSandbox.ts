@@ -25,6 +25,8 @@ import os from 'os'
 import { spawn } from 'child_process'
 
 export const HELPER_SOURCE = path.resolve('script/build_image_assets/idea-app-data')
+/** the real rsync the realRsync sandbox runs (the helper's own RSYNC= path) */
+export const REAL_RSYNC = '/usr/bin/rsync'
 export const GATE_SOURCE = path.resolve('script/build_image_assets/idea-peer-gate')
 
 export interface RunResult { exitCode: number | null, signal: string | null, stdout: string, stderr: string }
@@ -45,6 +47,13 @@ export interface AppDataSandbox {
     /** /etc/ssh/idea_authorized_keys (the folder) and its pi file */
     peerAuthDir: string
     peerAuthFile: string
+    /** /etc/ssh/idea_usage_keys (the folder) and its pi file (idea#412) */
+    usageAuthDir: string
+    usageAuthFile: string
+    /** installed path of idea-usage-export in the sandbox */
+    usageExport: string
+    /** live sshd drop-in path in the sandbox */
+    peerSshdDropin: string
     /** /etc/idea/peer_known_hosts */
     peerKnownHosts: string
     /** /var/lib/idea-app-data (the receive ledger folder) */
@@ -67,6 +76,11 @@ export interface AppDataSandbox {
 export interface SandboxOptions {
     /** use the real /usr/bin/borg (when installed) instead of the fake */
     realBorg?: boolean
+    /** with realBorg: this borg binary instead of /usr/bin/borg (e.g. IDEA_TEST_BORG) */
+    borgPath?: string
+    /** record, then run the real rsync (REAL_RSYNC, /usr/bin/rsync): needed where --exclude,
+     *  --delete and --backup-dir semantics matter (idea#448 snapshot / in-place restore) */
+    realRsync?: boolean
     /** the uid/gid the rewritten script treats as root (default: the test user) */
     rootUid?: number
     rootGid?: number
@@ -121,7 +135,11 @@ done < ${hosts}
 if [[ $found -ne 0 && "$2" =~ ^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$ ]]; then echo "$2      STREAM $2"; found=0; fi
 exit $(( found ? 2 : 0 ))`)
     // rsync: record; a local copy (dest /proc/self/fd/N/) really copies with cp -a
-    await fake('rsync', `${RECORD('rsync', callsDir)}
+    if (opts.realRsync) {
+        if (!await fs.pathExists(REAL_RSYNC)) throw new Error(`realRsync: ${REAL_RSYNC} is not installed`)
+        await fake('rsync', `${RECORD('rsync', callsDir)}
+exec ${REAL_RSYNC} "$@"`)
+    } else await fake('rsync', `${RECORD('rsync', callsDir)}
 [[ -n "\${FAKE_RSYNC_SLEEP:-}" ]] && exec /bin/sleep "$FAKE_RSYNC_SLEEP"
 echo "      1,024 100%   1.00MB/s    0:00:00 (xfr#1, to-chk=0/1)"
 last="\${@: -1}"
@@ -141,7 +159,13 @@ if [[ "\${1:-}" == volume && "\${2:-}" == inspect ]]; then echo "\${FAKE_DOCKER_
 [[ -n "\${FAKE_DOCKER_PS:-}" ]] && echo "$FAKE_DOCKER_PS"
 exit \${FAKE_DOCKER_EXIT:-0}`)
     // df -Pk -- <dir>: header + one line, Available = FAKE_DF_AVAIL_KB (default: plenty)
+    // GNU df refuses an empty path (`df -Pk -- ""`); SYSTEM_ROOT='' must not reach it (idea#427).
     await fake('df', `${RECORD('df', callsDir)}
+target="\${@: -1}"
+if [[ -z "$target" || "$target" == -- ]]; then
+  echo "df: '': No such file or directory" >&2
+  exit 1
+fi
 echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
 echo "/dev/fake 99999999 1 \${FAKE_DF_AVAIL_KB:-99999998} 1% /"`)
     // runuser -u <user> -- <cmd…>: record, then run <cmd…> as the test user
@@ -156,8 +180,35 @@ exit \${FAKE_RRSYNC_EXIT:-0}`)
     await fake('borg', `${RECORD('borg', callsDir)}
 case "$1" in
   init) mkdir -p "\${@: -1}" && echo '[repository]' > "\${@: -1}/config" ;;
-  info) if [[ -n "\${FAKE_BORG_INFO:-}" ]]; then echo "$FAKE_BORG_INFO"; else echo '{"archives":[]}'; fi ;;
+  info)
+    # like borg 1.x: without an archive selector (--last/--first/--glob-archives/-a/REPO::ARCHIVE)
+    # \`borg info --json REPO\` prints repository info only, with no "archives" key
+    sel=0
+    for a in "$@"; do case "$a" in --last|--first|--glob-archives|-a|*::*) sel=1 ;; esac; done
+    if [[ \$sel -eq 0 ]]; then
+      if [[ -n "\${FAKE_BORG_INFO_REPO:-}" ]]; then echo "$FAKE_BORG_INFO_REPO"
+      else echo '{"repository":{"id":"fake","location":"fake"},"encryption":{"mode":"none"},"cache":{"stats":{}}}'; fi
+    elif [[ -n "\${FAKE_BORG_INFO:-}" ]]; then echo "$FAKE_BORG_INFO"; else echo '{"archives":[]}'; fi ;;
   extract) for e in \${FAKE_BORG_EXTRACT:-}; do mkdir -p "$e" && echo restored > "$e/data.txt"; done ;;
+  list)
+    short=0
+    for a in "$@"; do [[ "$a" == --short ]] && short=1; done
+    if [[ \$short -eq 1 && -n "\${FAKE_BORG_MEMBERS:-}" ]]; then echo "\${FAKE_BORG_MEMBERS}"
+    elif [[ -n "\${FAKE_BORG_LIST:-}" ]]; then echo "\${FAKE_BORG_LIST}"; fi ;;
+  delete) ;;
+  compact) ;;
+  create)
+    i=1
+    while [[ $i -le $# ]]; do
+      ev="\${!i}"
+      if [[ "$ev" == --patterns-from ]]; then
+        i=$((i + 1))
+        pat="\${!i}"
+        if [[ -f "$pat" ]]; then cp -- "$pat" "${callsDir}/borg.patterns"; fi
+      fi
+      i=$((i + 1))
+    done
+    ;;
 esac
 exit \${FAKE_BORG_EXIT:-0}`)
 
@@ -180,6 +231,11 @@ exit \${FAKE_MKFS_EXIT:-0}`)
 if [[ -n "\${FAKE_LOSETUP_BACKING:-}" ]]; then echo "\${FAKE_LOSETUP_BACKING}"; exit 0; fi
 exit 1`)
 
+    await fake('sshd', `${RECORD('sshd', callsDir)}
+exit \${FAKE_SSHD_T_EXIT:-0}`)
+    await fake('systemctl', `${RECORD('systemctl', callsDir)}
+exit \${FAKE_SYSTEMCTL_EXIT:-0}`)
+
     const uid = opts.rootUid ?? process.getuid!()
     const gid = opts.rootGid ?? process.getgid!()
     let text = await fs.readFile(HELPER_SOURCE, 'utf8')
@@ -189,10 +245,13 @@ exit 1`)
         text = text.replace(re, `${name}=${value}`)
     }
     for (const tool of ['rsync', 'rrsync', 'findmnt', 'logger', 'getent', 'df', 'runuser', 'umount', 'mount', 'losetup', 'docker']) setConst(tool.toUpperCase(), path.join(bin, tool))
+    setConst('SSHD', path.join(bin, 'sshd'))
+    setConst('SYSTEMCTL', path.join(bin, 'systemctl'))
     setConst('VOLUMES_DIR', path.join(tmp, 'volumes'))
     await fs.ensureDir(path.join(tmp, 'volumes'))
     setConst('MKFS', path.join(bin, 'mkfs.ext4'))
     if (!opts.realBorg) setConst('BORG', path.join(bin, 'borg'))
+    else if (opts.borgPath) setConst('BORG', opts.borgPath)
     setConst('DISKS_DIR', disks)
     setConst('SYSTEM_ROOT', sys)
     setConst('ROOTS_FILE', rootsFile)
@@ -204,9 +263,26 @@ exit 1`)
     const peerAuthDir = path.join(etc, 'ssh-idea_authorized_keys')
     const peerKnownHosts = path.join(etc, 'idea', 'peer_known_hosts')
     const ledgerDir = path.join(tmp, 'var-lib-idea-app-data')
+    const usageAuthDir = path.join(etc, 'ssh-idea_usage_keys')
+    const usageExport = path.join(tmp, 'sbin', 'idea-usage-export')
+    const peerSshdDropin = path.join(etc, 'ssh', 'sshd_config.d', '10-idea-peer.conf')
     setConst('PEER_AUTH_DIR', peerAuthDir)
     setConst('PEER_KNOWN_HOSTS', peerKnownHosts)
     setConst('LEDGER_DIR', ledgerDir)
+    setConst('USAGE_AUTH_DIR', usageAuthDir)
+    setConst('USAGE_EXPORT', usageExport)
+    setConst('USAGE_EXPORT_SRC', path.resolve('script/build_image_assets/idea-usage-export'))
+    setConst('PEER_SSHD_DROPIN', peerSshdDropin)
+    await fs.ensureDir(path.dirname(usageExport))
+    await fs.ensureDir(path.dirname(peerSshdDropin))
+    await fs.writeFile(peerSshdDropin, [
+        '# sandbox copy of 10-idea-peer.conf (without the usage-keys token, so install-usage-key must add it)',
+        'AuthorizedKeysFile .ssh/authorized_keys .ssh/authorized_keys2 /etc/ssh/idea_authorized_keys/%u',
+        '',
+    ].join('\n'))
+    // Production drop-ins are 0644. writeFile's default 0666 becomes 0664 under
+    // Debian's pi umask 0002; usage_akf_content then refuses the file (idea#412).
+    await fs.chmod(peerSshdDropin, 0o644)
     setConst('ENGINE_USER', os.userInfo().username)
     // erase-slot: allow staging under <tmp>/erase-staging/<id> instead of /home/pi/...
     const stagingRootEscaped = path.join(tmp, 'erase-staging').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
@@ -293,7 +369,9 @@ SUDO_USER=pi exec ${script} "$@"`)
     const journalText = async () => (await fs.pathExists(journal)) ? fs.readFile(journal, 'utf8') : ''
     return {
         tmp, bin, script, disks, sys, rootsFile, lockDir: path.join(lockParent, 'idea-app-data'), mounts, hosts, journal,
-        peerAuthDir, peerAuthFile: path.join(peerAuthDir, 'pi'), peerKnownHosts, ledgerDir, gateScript, volumesDir: path.join(tmp, 'volumes'),
+        peerAuthDir, peerAuthFile: path.join(peerAuthDir, 'pi'),
+        usageAuthDir, usageAuthFile: path.join(usageAuthDir, 'pi'), usageExport, peerSshdDropin,
+        peerKnownHosts, ledgerDir, gateScript, volumesDir: path.join(tmp, 'volumes'),
         run, runGate, calls, fake, addDisk, addInstance, journalText,
     }
 }

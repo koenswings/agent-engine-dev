@@ -26,6 +26,7 @@ import { localEngineId } from './Engine.js'
 import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
 import { log } from '../utils/utils.js'
 import { usbRoot } from './Config.js'
+import { appForInstance, resolveInstanceApp, resolveAllInstanceApps } from './InstanceApp.js'
 
 /** Grouping window for runtime Files Disk docks (open Q2). Documented in ARCHITECTURE.md. */
 export const FILES_REMOUNT_GROUP_MS = 3_000
@@ -188,7 +189,7 @@ export const optedInInstances = (store: Store, engineId: string = localEngineId)
         if (inst.status === 'Undocked' || inst.status === 'Missing') return false
         const disk = inst.storedOn ? store.diskDB[inst.storedOn] : null
         if (!disk || disk.dockedTo !== engineId) return false
-        const app = store.appDB[inst.instanceOf]
+        const app = appForInstance(store, inst)
         return !!(app?.filesMount)
     })
 
@@ -228,7 +229,7 @@ export const shouldHoldFilesRemount = async (
     )
     if (opsRunning) return true
 
-    const app = store.appDB[instance.instanceOf]
+    const app = await resolveInstanceApp(store, instance)
     if (app?.name === 'nextcloud' || app?.filesMount?.services.includes('nextcloud-app')) {
         // Only apply the occ gate when the instance is (or was) Running: a Pauzed
         // recreate doesn't need Nextcloud ready yet; the next start will remount.
@@ -290,7 +291,7 @@ export const writeInstanceOverride = async (
     instance: Instance,
     excludeDiskId?: DiskID,
 ): Promise<{ overridePath: string; diskIds: DiskID[] } | null> => {
-    const app = store.appDB[instance.instanceOf]
+    const app = await resolveInstanceApp(store, instance)
     if (!app?.filesMount && !app?.usbMount) return null
     await ensureEngineStateDir()
     const usb = app.usbMount ? { usbMount: app.usbMount, hostRoot: usbRoot() } : null
@@ -348,7 +349,7 @@ export const remountInstance = async (
     const instance = store.instanceDB[instanceId]
     if (!instance) return 'skipped'
     if (opts.skipSameDiskId && instance.storedOn === opts.skipSameDiskId) return 'skipped'
-    const app = store.appDB[instance.instanceOf]
+    const app = await resolveInstanceApp(store, instance)
     if (!app?.filesMount) return 'skipped'
 
     const held = await shouldHoldFilesRemount(store, instance)
@@ -396,6 +397,39 @@ export const remountInstance = async (
     } finally {
         resourceLock.release(lockKey)
     }
+}
+
+/**
+ * Bring one opted-in instance's Files mounts up to date (idea#139 step 9).
+ *
+ * Instance.filesMounts is the set of Files Disks its containers were last
+ * created with. When that set differs from the Files Disks docked now (or was
+ * never written, null), rewrite the override and recreate through
+ * remountInstance: exactly one compose call. When it already matches, do
+ * nothing, so calling this again never recreates the containers again.
+ *
+ * Used where an instance on a disk that just gained, or docked with, the Files
+ * role would otherwise keep containers created without it: startInstance's
+ * "containers already running" shortcut (Add Files on a running App Disk, and
+ * a dock where the containers survived). A held remount is retried through the
+ * grouped schedule.
+ */
+export const reconcileFilesMounts = async (
+    storeHandle: DocHandle<Store>,
+    instanceId: InstanceID,
+): Promise<'unchanged' | 'done' | 'skipped' | 'held' | 'failed'> => {
+    const store = storeHandle.doc()!
+    const instance = store.instanceDB[instanceId]
+    if (!instance) return 'skipped'
+    const app = await resolveInstanceApp(store, instance)
+    if (!app?.filesMount) return 'skipped'
+    const want = mountableFilesDisks(store).map(d => String(d.id)).sort()
+    const have = instance.filesMounts ? [...instance.filesMounts].map(String).sort() : null
+    if (have && have.length === want.length && have.every((id, i) => id === want[i])) return 'unchanged'
+    log(`Files mounts of ${instanceId} are out of date (have ${have ? have.join(',') || '(none)' : 'null'}, want ${want.join(',') || '(none)'}): remounting`)
+    const result = await remountInstance(storeHandle, instanceId)
+    if (result === 'held') scheduleFilesRemount(storeHandle)
+    return result
 }
 
 // ── Grouped runtime remount (Q2: FILES_REMOUNT_GROUP_MS) ─────────────────────
@@ -449,6 +483,7 @@ const flushFilesRemount = async (): Promise<void> => {
     pending = null
     if (!h || !job) return
     flushInFlight = (async () => {
+        await resolveAllInstanceApps(h.doc()!)
         const store = h.doc()!
         const targets = new Set<InstanceID>([
             ...optedInInstances(store).map(i => i.id),

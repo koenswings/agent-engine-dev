@@ -226,6 +226,33 @@ describe('updateApp (#230)', () => {
         expect(await codeOf(updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps()))).toMatch(/^SOURCE_MISSING/)
         expect(calls).toEqual([])
     })
+    it('system-disk rollback (idea#424): recoverInterruptedUpdates downs /instances/<id>, not a relative path', async () => {
+        const opId = createOperation(h, 'updateApp', { instanceId: 'i1', diskId: 'd1', fromAppId: 'kolibri-1.0', toAppId: 'kolibri-1.1' }, 'console-command', { type: 'instance', id: 'i1' as any })
+        updateOperation(h, opId, { status: 'Running', currentStep: 4, totalSteps: 6, stepLabel: 'Start' })
+        const downDirs: string[] = []
+        const out = await recoverInterruptedUpdates(h, ME, deps({
+            mountRoot: async () => '',
+            composeDown: async (dir, id) => { downDirs.push(`${dir} ${id}`); calls.push('down') },
+        }))
+        expect(downDirs).toEqual(['/instances/i1 i1'])
+        expect(path.join('', 'instances', 'i1')).toBe('instances/i1')
+        expect(path.isAbsolute(downDirs[0].split(' ')[0])).toBe(true)
+        expect(out[0]).toMatch(/^i1: ROLLED BACK: /)
+        expect(calls).toContain('restore')
+        expect(calls).toContain('start')
+        expect(inst().instanceOf).toBe('kolibri-1.0')
+    })
+    it('compose down uses -p and -f on the live file via joinMountRoot, never a relative path.join (idea#424)', async () => {
+        const src = await fs.readFile(path.join(process.cwd(), 'src/data/UpdateApp.ts'), 'utf8')
+        expect(src).toMatch(/joinMountRoot\(instRoot, 'instances', String\(inst.id\)\)/)
+        // recoverInterruptedUpdates (idea#448 keeps the root in a const for the compose read)
+        expect(src).toMatch(/const root = await d\.mountRoot\(disk\)\n\s*const instDir = joinMountRoot\(root, 'instances', String\(inst.id\)\)/)
+        expect(src).toMatch(/'compose', '-p', String\(id\), '-f', composeFile, 'down'/)
+        expect(src).not.toMatch(/path\.join\(instRoot, 'instances'/)
+        expect(src).not.toMatch(/path\.join\(await d\.mountRoot\(disk\), 'instances'/)
+        expect(src).not.toMatch(/path\.join\(await d\.mountRoot\(disk\), 'apps'/)
+        expect(src).not.toMatch(/down -v|--volumes/)
+    })
     it('wiring: command, capability, args, health aggregation, scans ignore .pre-update', () => {
         expect(commands.find(c => c.name === 'updateApp')).toBeTruthy()
         expect(ENGINE_CAPABILITIES).toContain('updateApp')

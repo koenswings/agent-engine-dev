@@ -17,5 +17,21 @@ module.exports = {
        NODE_ENV: "development",
        VERBOSITY: "3" 
     }
+  }, {
+    // idea-usage (idea#411): separate process so a hung hook cannot stall the Engine.
+    name   : "idea-usage",
+    script : "./dist/src/usage/main.js",
+    kill_timeout: 10000,
+    env: {
+       NODE_ENV: "development",
+       VERBOSITY: "3"
+    },
+    env_production: {
+       NODE_ENV: "production"
+    },
+    env_development: {
+       NODE_ENV: "development",
+       VERBOSITY: "3"
+    }
   }]
 }

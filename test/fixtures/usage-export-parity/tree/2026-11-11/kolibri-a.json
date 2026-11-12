@@ -1,0 +1,79 @@
+{
+  "schema": "idea-usage-day/1",
+  "engine": "happy-zebra",
+  "day": "2026-11-11",
+  "app": "kolibri",
+  "instance": "kolibri-a",
+  "name": "Kolibri",
+  "demo": false,
+  "listed": true,
+  "clock": {
+    "synced": true,
+    "correctedBoots": 0
+  },
+  "collectedAt": "2026-11-12T02:00:00+01:00",
+  "hookStatus": "ok",
+  "setup": {
+    "classes": 1,
+    "classesDelta": 1,
+    "learner": {
+      "total": 4,
+      "beyondSeed": 3
+    },
+    "learnerDelta": 1,
+    "learnerEnrolled": 4,
+    "teacher": {
+      "total": 1,
+      "beyondSeed": 1
+    },
+    "teacherDelta": 0,
+    "admin": {
+      "total": 1,
+      "beyondSeed": 1
+    }
+  },
+  "signins": {
+    "learner": {
+      "total": 2,
+      "beyondSeed": 2,
+      "sessions": 3,
+      "minutes": 20
+    },
+    "coach": {
+      "total": 1,
+      "beyondSeed": 1,
+      "sessions": 1,
+      "minutes": 8
+    },
+    "admin": {
+      "total": 0,
+      "beyondSeed": 0,
+      "sessions": 0,
+      "minutes": 0
+    }
+  },
+  "content": [
+    {
+      "channel": "Maths",
+      "title": "Intro",
+      "kind": "video",
+      "role": "learner",
+      "visits": 2,
+      "seconds": 40,
+      "completions": 1,
+      "assigned": true
+    }
+  ],
+  "teaching": {
+    "lessonsCreated": 1,
+    "lessonsVisible": 1,
+    "quizzesCreated": 0,
+    "quizzesStarted": 0,
+    "quizzesEnded": 0
+  },
+  "guest": {
+    "visits": 1,
+    "seconds": 12
+  },
+  "flags": []
+}

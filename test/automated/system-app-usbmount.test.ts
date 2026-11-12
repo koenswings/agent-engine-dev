@@ -70,4 +70,19 @@ describe('processSystemApp reads x-app like createOrUpdateApp', () => {
         expect(app.url).toBe(null)
         expect(app.author).toBe(null)
     })
+
+    it('create: missing x-app.title defaults to the app name and does not throw (idea#428)', async () => {
+        const { title: _t, ...noTitle } = baseXapp
+        await writeCompose(root, noTitle)
+        const app = await processSystemApp(h, disk, APP as any, root)
+        expect(app?.title).toBe('nextcloud')
+        expect(h.doc().appDB[APP as any].title).toBe('nextcloud')
+    })
+
+    it('create: no x-app block at all still stores a title (idea#428)', async () => {
+        await fs.mkdirp(path.join(root, APP))
+        await fs.writeFile(path.join(root, APP, 'compose.yaml'), YAML.stringify({ services: { web: { image: 'busybox' } } }))
+        const app = await processSystemApp(h, disk, APP as any, root)
+        expect(app?.title).toBe('nextcloud')
+    })
 })
