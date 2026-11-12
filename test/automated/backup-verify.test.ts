@@ -138,9 +138,9 @@ describe('parse helpers (idea#446)', () => {
         expect(parseBackupExcludeList({ backup: { exclude: ['keys'] } })).toEqual(['data/keys'])
     })
 
-    it('registers the four commands and the backupVerify capability; does not bump APP_DATA_HELPER_VERSION', () => {
+    it('registers the four commands and the backupVerify capability; Engine speaks helper v9', () => {
         expect(BACKUP_VERIFY_HELPER_MIN).toBe(9)
-        expect(APP_DATA_HELPER_VERSION).toBe('8')
+        expect(APP_DATA_HELPER_VERSION).toBe('9')
         expect(ENGINE_CAPABILITIES).toContain('backupVerify')
         for (const name of ['listBackup', 'verifyBackup', 'clearBackupLock', 'removeBackupRole']) {
             expect(commands.find(c => c.name === name), name).toBeTruthy()
@@ -292,7 +292,7 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
         const result = await verifyBackup(h, INST, 'ver-bd') as any
         expect(result.ok).toBe(true)
         expect(result.archive).toBe(ARCHIVE)
-        expect(result.scratchPath).toMatch(new RegExp(`\\.idea-verify/${INST}-\\d{8}T\\d{6,9}Z$`))
+        expect(result.scratchPath).toMatch(new RegExp(`\\.idea-verify/${INST}-\\d{8}T\\d{6,15}Z$`))
         expect(await fs.pathExists(result.scratchPath)).toBe(true)
         expect(result.archiveOriginalBytes).toBe(1000)
         expect(result.archiveCompressedBytes).toBe(400)

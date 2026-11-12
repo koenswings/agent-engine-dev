@@ -335,10 +335,11 @@ export const verifyBackup = async (
     const scratchPath = verifyDir(device, instance.id, stamp)
     let extractOk = false
     try {
-        const out = await run(borgExtractVerifyArgs(device, instance.id, arch.name, stamp))
+        // Helper v9 does not print the dest path; it extracts in-place under
+        // .idea-verify/<id>-<stamp>/ (no --strip-components) and exits 0.
+        await run(borgExtractVerifyArgs(device, instance.id, arch.name, stamp))
         extractOk = true
-        const printed = out.trim().split(/\r?\n/).filter(Boolean).pop()
-        const usedPath = (printed && printed.includes('.idea-verify')) ? printed : scratchPath
+        const usedPath = scratchPath
 
         let members: string[] = []
         try {
