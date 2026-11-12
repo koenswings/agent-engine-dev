@@ -24,6 +24,11 @@
  * The dock pass applies the same rule (shouldAutoStart in tracedStartInstance),
  * so the testMode/dev startup undock + re-add of every disk, a boot where a disk
  * is gone or renamed, and a real unplug + replug keep the Stop too.
+ *
+ * idea#449: with `systemDiskSkip` set (config.yaml or IDEA_SYSTEM_DISK_SKIP) the system
+ * disk gets no dock pass, so an instance on it is never marked Starting (nobody would set
+ * it Running again). One that is already Starting (an earlier boot) is set Running when
+ * its containers are up and healthy; nothing is started or recreated.
  */
 import { $ } from 'zx'
 import { DocHandle } from '@automerge/automerge-repo'
@@ -33,6 +38,9 @@ import { isUserStopped, lastStopOperation, shouldAutoStart, userStopInForce } fr
 import { Instance, Status } from './Instance.js'
 import { Store } from './Store.js'
 import { localEngineId } from './Engine.js'
+import { config } from './Config.js'
+import type { Disk } from './Disk.js'
+import type { Timestamp } from './CommonTypes.js'
 
 /** True when the instance's disk is docked on `engineId` according to the store. */
 export const isInstanceDockedOn = (store: Store, instance: Instance | undefined | null, engineId: EngineID): boolean => {
@@ -53,11 +61,40 @@ const dockerContainerRunning: ContainerRunningCheck = async (instanceId) => {
     return result.stdout.trim() !== ''
 }
 
+/**
+ * idea#449: every container of compose project <id> is running and healthy (or has no
+ * healthcheck). Read-only: docker ps + inspect, nothing is started or recreated.
+ */
+export const dockerContainersHealthy: ContainerRunningCheck = async (instanceId) => {
+    const ids = (await $`docker ps -aq --filter ${`label=com.docker.compose.project=${instanceId}`}`).stdout.split('\n').map(x => x.trim()).filter(Boolean)
+    if (!ids.length) return false
+    const info = JSON.parse((await $`docker inspect ${ids}`).stdout) as any[]
+    return info.every(c => c?.State?.Status === 'running' && (!c?.State?.Health || c.State.Health.Status === 'healthy'))
+}
+
+/** idea#449: the system disk record (its 'system' marker, idea#152). */
+export const isSystemDiskMarked = (disk: Pick<Disk, 'diskTypes'> | undefined | null): boolean =>
+    !!disk && (disk.diskTypes ?? []).includes('system')
+
+export interface UndockedAppsOptions {
+    /** config.settings.systemDiskSkip by default */
+    systemDiskSkip?: boolean
+    /** dockerContainersHealthy by default */
+    containersHealthy?: ContainerRunningCheck
+}
+
+/** idea#449: will a dock pass (processDisk → startInstance) re-check this instance after boot? */
+export const dockPassWillRun = (store: Store, instance: Instance, systemDiskSkip: boolean): boolean =>
+    !(systemDiskSkip && isSystemDiskMarked(instance.storedOn ? store.diskDB?.[instance.storedOn] : null))
+
 export const checkAndSetUndockedApps = async (
     storeHandle: DocHandle<Store>,
     engineId: EngineID = localEngineId,
     containerRunning: ContainerRunningCheck = dockerContainerRunning,
+    opts: UndockedAppsOptions = {},
 ): Promise<void> => {
+    const systemDiskSkip = opts.systemDiskSkip ?? !!config.settings.systemDiskSkip
+    const containersHealthy = opts.containersHealthy ?? dockerContainersHealthy
     const store = storeHandle.doc()
     const all = Object.values(store.instanceDB ?? {}).filter(Boolean)
     const mine = all.filter(inst => isInstanceDockedOn(store, inst, engineId))
@@ -83,8 +120,36 @@ export const checkAndSetUndockedApps = async (
             inst.status = 'Starting' as Status
             inst.statusCondition = null
         })
+        // idea#449: no dock pass will follow (systemDiskSkip and a system-disk instance), so
+        // never mark it Starting; heal one left Starting by an earlier boot when its
+        // containers are up and healthy (no start, no recreate).
+        const noDockPass = !dockPassWillRun(store, instance, systemDiskSkip)
+        const healStarting = async () => {
+            let healthy = false
+            try { healthy = await containersHealthy(instanceId) } catch (e) {
+                log(`checkAndSetUndockedApps: cannot read the container health of ${instanceId} (${e}); leaving it ${instance.status}`)
+                return
+            }
+            if (!healthy) {
+                log(`checkAndSetUndockedApps: ${instanceId} stays ${instance.status}: its containers are not all running and healthy, and no dock pass follows (systemDiskSkip)`)
+                return
+            }
+            storeHandle.change(doc => {
+                const inst = doc.instanceDB[instanceId]
+                if (!inst || inst.status !== 'Starting' || !isInstanceDockedOn(doc, inst, engineId)) return
+                log(`Setting status of instance ${instanceId} to Running: its containers are up and healthy and no dock pass follows (systemDiskSkip); nothing was restarted`)
+                inst.status = 'Running' as Status
+                inst.statusCondition = null
+                inst.lastStarted = Date.now() as Timestamp
+            })
+        }
         try {
-            if (await containerRunning(instanceId)) { markStarting('containers found after restart'); return }
+            if (await containerRunning(instanceId)) {
+                if (!noDockPass) { markStarting('containers found after restart'); return }
+                if (instance.status === 'Starting') { await healStarting(); return }
+                log(`checkAndSetUndockedApps: leaving ${instanceId} ${instance.status}: it is on the system disk and no dock pass follows (systemDiskSkip)`)
+                return
+            }
             storeHandle.change(doc => {
                 const inst = doc.instanceDB[instanceId]
                 // Re-check inside the change: the disk may have been undocked or moved
@@ -104,6 +169,7 @@ export const checkAndSetUndockedApps = async (
             })
         } catch (error) {
             log(`Error checking docker status for ${instance.name}: ${error}`)
+            if (noDockPass) { log(`checkAndSetUndockedApps: leaving ${instanceId} ${instance.status}: docker is not answering and no dock pass follows (systemDiskSkip)`); return }
             markStarting('docker not answering')
         }
     }))
