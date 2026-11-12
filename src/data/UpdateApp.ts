@@ -618,10 +618,10 @@ export const publishAppBundles = async (storeHandle: DocHandle<Store>, disk: Dis
     const d = { ...defaultPublishDeps, ...deps }
     let list: AppBundleInfo[]
     try {
-        const apps = path.join(await d.mountRoot(disk), 'apps')
+        const apps = joinMountRoot(await d.mountRoot(disk), 'apps')
         list = []
         for (const appId of (await d.listApps(apps).catch(() => [] as string[])).sort()) {
-            const dir = path.join(apps, appId)
+            const dir = joinMountRoot(apps, appId)
             if (!await d.isBundle(dir).catch(() => false)) continue
             list.push(bundleInfo(appId, await d.readSums(dir), await d.dirBytes(dir).catch(() => 0), await d.readXApp(dir).catch(() => ({}))))
         }

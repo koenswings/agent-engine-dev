@@ -65,6 +65,8 @@ const deps = (over: Partial<UpdateDeps> = {}): Partial<UpdateDeps> => ({
     },
     start: async () => { calls.push('start'); h.change(d => { (d.instanceDB[ID as any] as any).status = 'Running' }) },
     health: async () => ({ state: 'healthy', restartCount: 0 }),
+    // idea#76 health fallback probes the main URL; without this mock the default fetch hangs the box gate
+    probe: async () => ({ status: 200, body: 'ok' }),
     broadcast: () => {},
     now: () => Date.now(),
     sleep: async () => {},
