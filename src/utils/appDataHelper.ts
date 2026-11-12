@@ -38,7 +38,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '9'
+export const APP_DATA_HELPER_VERSION = '10'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -169,7 +169,7 @@ export const borgExtractArgs = (bdev: string, id: string, archive: string, strip
     if (!Number.isInteger(strip) || strip < 1 || strip > 9) throw new Error(`strip ${strip} is out of range (1-9)`)
     return ['borg-extract', checkRoot(bdev), checkId(id), checkArchive(archive), String(strip), checkRoot(dstRoot)]
 }
-/** idea#401 / helper v9: JSON of archives (borg info --json) so the Engine can pick.
+/** idea#401 / helper v9, fixed in v10 (idea#450): JSON of every archive (borg info --json --glob-archives '*') so the Engine can pick.
  *  idea#446: pass `archive` for a member list of that one archive (`borg list --short`). */
 export const borgListArgs = (bdev: string, id: string, archive?: string): string[] => {
     const args = ['borg-list', checkRoot(bdev), checkId(id)]
@@ -194,8 +194,10 @@ export const borgDeleteArgs = (bdev: string, id: string, archive: string, keepMi
 }
 export const borgCompactArgs = (bdev: string, id: string): string[] => ['borg-compact', checkRoot(bdev), checkId(id)]
 
-/** Helper protocol that adds borg-list / borg-delete / borg-compact (idea#401) and the idea#446 verbs. */
-export const BACKUP_CLEANUP_HELPER_MIN = 9
+/** Helper protocol that adds borg-list / borg-delete / borg-compact (idea#401) and the idea#446 verbs.
+ *  v10 (idea#450): the v9 2-arg borg-list printed repository info without an archives list on real borg,
+ *  so cleanup requires v10 and a v9 helper gets HELPER_OUTDATED. */
+export const BACKUP_CLEANUP_HELPER_MIN = 10
 
 /** The argv for `sudo`: sudo -n /usr/local/sbin/idea-app-data <args…> */
 export const appDataSudoArgv = (args: string[]): string[] => ['-n', APP_DATA_HELPER, ...args]

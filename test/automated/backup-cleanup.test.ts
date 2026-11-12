@@ -1,5 +1,5 @@
 /**
- * backup-cleanup.test.ts (idea#401, helper v9)
+ * backup-cleanup.test.ts (idea#401, helper v9; v10 required since idea#450)
  *
  * Parse/pick helpers, and backupInstance cleanup: helper < 9 skips delete
  * and compact (backup still Done); Engine picks the oldest archive that is
@@ -93,7 +93,7 @@ const FAKE_SUDO = `#!/usr/bin/env bash
 shift 2
 echo "$*" >> "$FAKE_BORG_LOG"
 case "$1" in
-  version) echo "idea-app-data \${FAKE_HELPER_VERSION:-9}" ;;
+  version) echo "idea-app-data \${FAKE_HELPER_VERSION:-10}" ;;
   borg-init)
     mkdir -p "$IDEA_DISKS_ROOT/$2/backups/$3"
     echo '[repository]' > "$IDEA_DISKS_ROOT/$2/backups/$3/config"
@@ -175,7 +175,7 @@ describe('backupInstance cleanup (idea#401)', () => {
         process.env.PATH = `${binDir}:${saved.path}`
         process.env.FAKE_BORG_LOG = borgLog
         process.env.FAKE_BORG_LIST_DIR = listDir
-        process.env.FAKE_HELPER_VERSION = '9'
+        process.env.FAKE_HELPER_VERSION = '10'
         config.settings.testMode = true
         config.settings.skipBorg = false
         backupCleanupIO.enableInTests = true
@@ -239,8 +239,8 @@ describe('backupInstance cleanup (idea#401)', () => {
     const opOf = (h: DocHandle<Store>) =>
         Object.values(h.doc()!.operationDB ?? {}).find((o: any) => o.kind === 'backupApp') as any
 
-    it('helper older than v9: no borg-delete or borg-compact, backup still Done, HELPER_OUTDATED recorded', async () => {
-        process.env.FAKE_HELPER_VERSION = '8'
+    it('helper older than v10 (v9, idea#450): no borg-delete or borg-compact, backup still Done, HELPER_OUTDATED recorded', async () => {
+        process.env.FAKE_HELPER_VERSION = '9'
         await seedRepo()
         await writeArchives(listDir, INST, [
             '2026-01-01T00-00-00-000Z', '2026-01-02T00-00-00-000Z',

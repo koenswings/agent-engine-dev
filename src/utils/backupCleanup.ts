@@ -14,7 +14,7 @@
  * archive's compressed size; if it still does not fit after cleanup, refuse
  * with BACKUP_DISK_FULL.
  *
- * helperAtLeast(9) runs before any list/delete/compact. An older helper
+ * helperAtLeast(10) runs before any list/delete/compact (v9's borg-list was broken on real borg, idea#450). An older helper
  * skips cleanup and the backup still runs (HELPER_OUTDATED recorded).
  */
 
