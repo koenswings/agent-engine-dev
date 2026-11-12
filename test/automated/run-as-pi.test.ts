@@ -150,17 +150,17 @@ describe('Engine sudoers asset (idea#80)', () => {
         const files = fs.readFileSync(path.join(ROOT, 'script/build_image_assets/11-engine-files.sudoers'), 'utf8')
         const rules = files.split('\n').filter(l => l.trim() && !l.trimStart().startsWith('#'))
         expect(rules).toEqual([
-            'pi ALL=(root) NOPASSWD: /usr/bin/tee /disks/sd[a-z][12]/META.yaml',
-            'pi ALL=(root) NOPASSWD: /usr/bin/rmdir /disks/sd[a-z][12]',
+            'pi ALL=(root) NOPASSWD: /usr/bin/tee /disks/sd[a-z][1-9]/META.yaml',
+            'pi ALL=(root) NOPASSWD: /usr/bin/rmdir /disks/sd[a-z][1-9]',
             // createFilesDisk: the disk root folder only, never recursive (idea#131)
-            'pi ALL=(root) NOPASSWD: /usr/bin/chown -h pi\\:pi /disks/sd[a-z][12]',
+            'pi ALL=(root) NOPASSWD: /usr/bin/chown -h pi\\:pi /disks/sd[a-z][1-9]',
             'pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-erase-disk',
             'pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-flash-card',
             // app data as root (idea#168): one helper, no argument list (the helper validates)
             'pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-app-data',
-            'pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]',
+            'pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 /dev/sd[a-z][1-9] /disks/sd[a-z][1-9]',
             // read-only look for META.yaml before any rw mount (idea#201 §10 rule 1)
-            'pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 -o ro\\,noload /dev/sd[a-z][12] /disks/sd[a-z][12]',
+            'pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 -o ro\\,noload /dev/sd[a-z][1-9] /disks/sd[a-z][1-9]',
             // teacher USB sticks (idea#193): typed read-only mounts under /run/idea-usb only
             'pi ALL=(root) NOPASSWD: /usr/bin/mount -t vfat -o ro\\,nosuid\\,nodev\\,noexec\\,uid\\=1000\\,gid\\=1000\\,fmask\\=0222\\,dmask\\=0222\\,iocharset\\=utf8\\,shortname\\=mixed /dev/sd[a-z][12] /run/idea-usb/sd[a-z][12]',
             'pi ALL=(root) NOPASSWD: /usr/bin/mount -t vfat -o ro\\,nosuid\\,nodev\\,noexec\\,uid\\=1000\\,gid\\=1000\\,fmask\\=0222\\,dmask\\=0222\\,iocharset\\=utf8\\,shortname\\=mixed /dev/sd[a-z] /run/idea-usb/sd[a-z]',
@@ -168,6 +168,12 @@ describe('Engine sudoers asset (idea#80)', () => {
             'pi ALL=(root) NOPASSWD: /usr/bin/mount -t exfat -o ro\\,nosuid\\,nodev\\,noexec\\,uid\\=1000\\,gid\\=1000\\,fmask\\=0222\\,dmask\\=0222\\,iocharset\\=utf8 /dev/sd[a-z] /run/idea-usb/sd[a-z]',
             'pi ALL=(root) NOPASSWD: /usr/bin/umount /run/idea-usb/sd[a-z][12], /usr/bin/umount /run/idea-usb/sd[a-z]',
             'pi ALL=(root) NOPASSWD: /usr/bin/umount -l /run/idea-usb/sd[a-z][12], /usr/bin/umount -l /run/idea-usb/sd[a-z]',
+            // partitions 3-9 (idea#76 fixture): the 10-engine commands, which stays sd[a-z][12]
+            'pi ALL=(root) NOPASSWD: /usr/bin/umount /disks/sd[a-z][3-9]',
+            'pi ALL=(root) NOPASSWD: /usr/bin/mkdir -p /disks/sd[a-z][3-9]',
+            'pi ALL=(root) NOPASSWD: /usr/bin/mv /disks/sd[a-z][3-9] /disks/old/sd[a-z][3-9]',
+            'pi ALL=(root) NOPASSWD: /usr/bin/rm -fr /disks/sd[a-z][3-9]',
+            'pi ALL=(root) NOPASSWD: /usr/sbin/hdparm -I /dev/sd[a-z][3-9]',
         ])
         expect(rulesText).not.toMatch(/tee \/disks/)
         expect(rulesText).not.toMatch(/rmdir/)   // the rmdir entry lives in 11-engine-files (idea#126)
