@@ -240,6 +240,26 @@ const findBundleDisk = async (store: Store, d: UpdateDeps, engineId: string, ins
 }
 
 /**
+ * idea#448 (Steve): the new bundle must not ship a path in the snapshot exclude list. Swap
+ * copies the bundle over the instance folder, so such a path would overwrite the identity
+ * (e.g. data/tailscale) that the snapshot and the rollback deliberately leave alone. A path is
+ * hit when it exists in the bundle (any type, symlinks not followed) or when one of its parent
+ * components exists there as something other than a directory. Returns the hit paths.
+ */
+export const bundleExcludedPaths = async (bundleDir: string, excludes: string[]): Promise<string[]> => {
+    const hits: string[] = []
+    for (const rel of excludes) {
+        const parts = rel.split('/').filter(Boolean)
+        for (let i = 1; i <= parts.length; i++) {
+            const st = await fs.lstat(path.join(bundleDir, ...parts.slice(0, i))).catch(() => null)
+            if (!st) break
+            if (i === parts.length || !st.isDirectory()) { hits.push(rel); break }
+        }
+    }
+    return hits
+}
+
+/**
  * idea#448: x-app.backup of a compose file: its exclude list and method. A missing file or
  * x-app.backup gives [] / 'stop'; a malformed one refuses BAD_BACKUP_SPEC (fail closed).
  */
@@ -326,6 +346,9 @@ export const updateApp = async (
         const live = await readComposeBackup(path.join(instDir, 'compose.yaml'), 'live')
         const next = await readComposeBackup(newCompose, 'new')
         const snapExcludes = mergeBackupExcludeLists(live.exclude, next.exclude)
+        // idea#448: refuse before anything stops or is written when the bundle ships an excluded path
+        const shipped = await bundleExcludedPaths(bundle!.dir, snapExcludes)
+        if (shipped.length) throw new UpdateAppError('BUNDLE_CONTAINS_EXCLUDED', `the bundle ${bundle!.dir} contains ${shipped.join(', ')}, which the snapshot and rollback leave out (x-app.backup.exclude); remove ${shipped.length === 1 ? 'it' : 'them'} from the bundle. Nothing was stopped or changed`)
         progress('Check')
 
         const fromAppId = inst.instanceOf

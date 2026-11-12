@@ -12,7 +12,7 @@ import { DocHandle, Repo } from '@automerge/automerge-repo'
 import { fs, path, os, YAML } from 'zx'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
-import { updateApp, UpdateDeps, recoverInterruptedUpdates, UPDATE_HELPER_MIN, readComposeBackup, linkedBackupDisk } from '../../src/data/UpdateApp.js'
+import { updateApp, UpdateDeps, recoverInterruptedUpdates, UPDATE_HELPER_MIN, readComposeBackup, linkedBackupDisk, bundleExcludedPaths } from '../../src/data/UpdateApp.js'
 import { snapshotArgs, restoreSnapshotArgs } from '../../src/utils/appDataHelper.js'
 import { createOperation, updateOperation } from '../../src/data/Operations.js'
 
@@ -212,5 +212,67 @@ describe('updateApp identity (idea#448)', () => {
         expect(linkedBackupDisk(h.doc(), ME, inst())).toBeNull()
         linkBackupDisk()
         expect(String(linkedBackupDisk(h.doc(), ME, inst())!.id)).toBe('bd1')
+    })
+
+    describe('a bundle that ships an excluded path is refused before Snapshot (idea#448, Steve)', () => {
+        const bundle = () => `${tmp}/apps/usage-dashboard-1.1`
+
+        it('BUNDLE_CONTAINS_EXCLUDED names the paths; nothing is stopped, backed up, snapshotted or written', async () => {
+            linkBackupDisk()
+            await fs.outputFile(`${instDir()}/data/tailscale/tailscaled.state`, 'live-identity')
+            await fs.outputFile(`${bundle()}/data/tailscale/tailscaled.state`, 'stale-identity')
+            await fs.ensureDir(`${tmp}/elsewhere`)
+            await fs.symlink(`${tmp}/elsewhere`, `${bundle()}/data/tailscale-run`)
+            const inodeBefore = (await fs.stat(`${instDir()}/data/tailscale/tailscaled.state`)).ino
+            const composeBefore = await fs.readFile(`${instDir()}/compose.yaml`, 'utf8')
+            const msg = await codeOf(updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps()))
+            expect(msg).toMatch(/^BUNDLE_CONTAINS_EXCLUDED: /)
+            expect(msg).toContain('data/tailscale,')
+            expect(msg).toContain('data/tailscale-run')
+            expect(msg).not.toContain('data/keys')
+            expect(msg).toMatch(/Nothing was stopped or changed/)
+            expect(calls).toEqual([])
+            expect(snapEx).toEqual([])
+            expect(backups).toEqual([])
+            expect(inst().status).toBe('Running')
+            expect(inst().instanceOf).toBe(`usage-dashboard-${SHA}`)
+            expect(Object.keys(h.doc().operationDB ?? {})).toEqual([])
+            expect(await fs.readFile(`${instDir()}/data/tailscale/tailscaled.state`, 'utf8')).toBe('live-identity')
+            expect((await fs.stat(`${instDir()}/data/tailscale/tailscaled.state`)).ino).toBe(inodeBefore)
+            expect(await fs.readFile(`${instDir()}/compose.yaml`, 'utf8')).toBe(composeBefore)
+            expect(await fs.pathExists(`${tmp}/.pre-update`)).toBe(false)
+        })
+
+        it('a live-only exclude counts too (the union): a bundle shipping data/keys is refused', async () => {
+            linkBackupDisk()
+            await fs.writeFile(newCompose(), composeYaml('1.1', { ...hook, exclude: ['tailscale'] }))
+            await fs.outputFile(`${bundle()}/data/keys/id`, 'k')
+            expect(await codeOf(updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps()))).toMatch(/^BUNDLE_CONTAINS_EXCLUDED: .*data\/keys/)
+            expect(calls).toEqual([])
+        })
+
+        it('a bundle with other data (and look-alike names) passes and updates', async () => {
+            linkBackupDisk()
+            await fs.outputFile(`${bundle()}/data/seed/defaults.json`, '{}')
+            await fs.outputFile(`${bundle()}/data/tailscale-notes.txt`, 'not the identity')
+            await fs.outputFile(`${bundle()}/tailscale/README`, 'top-level, not data/tailscale')
+            const r = await updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps())
+            expect(calls).toEqual(['backup:hook', 'stop', 'snapshot', 'reread', 'start'])
+            expect(r.snapshotExcludes).toEqual(['data/keys', 'data/tailscale', 'data/tailscale-run'])
+            expect(inst().instanceOf).toBe('usage-dashboard-1.1')
+            expect(await fs.pathExists(`${instDir()}/data/seed/defaults.json`)).toBe(true)
+        })
+
+        it('bundleExcludedPaths: a parent that is a file or symlink hides the path, a plain directory does not', async () => {
+            const b = `${tmp}/b`
+            await fs.ensureDir(`${b}/data`)
+            expect(await bundleExcludedPaths(b, ['data/tailscale', 'data/keys'])).toEqual([])
+            await fs.outputFile(`${tmp}/b2/data`, 'a file where the data folder should be')
+            expect(await bundleExcludedPaths(`${tmp}/b2`, ['data/tailscale'])).toEqual(['data/tailscale'])
+            await fs.ensureDir(`${tmp}/b3`)
+            await fs.symlink(`${tmp}/elsewhere2`, `${tmp}/b3/data`)
+            expect(await bundleExcludedPaths(`${tmp}/b3`, ['data/keys'])).toEqual(['data/keys'])
+            expect(await bundleExcludedPaths(`${tmp}/missing`, ['data/keys'])).toEqual([])
+        })
     })
 })

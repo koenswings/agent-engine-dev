@@ -23,6 +23,8 @@ export type UpdateRefusal =
     | 'NOT_FOUND' | 'AMBIGUOUS' | 'HELPER_OUTDATED' | 'TRANSFER_FAILED'
     // idea#448: the backup updateApp takes itself before a major update
     | 'BAD_BACKUP_SPEC' | 'HOOK_FAILED' | 'BACKUP_FAILED'
+    // idea#448: the new bundle ships a path the snapshot and rollback leave out
+    | 'BUNDLE_CONTAINS_EXCLUDED'
 
 /** Error text starts with the code; the two rollback outcomes use the console#168 wording. */
 export const ROLLED_BACK_PREFIX = 'ROLLED BACK:'
