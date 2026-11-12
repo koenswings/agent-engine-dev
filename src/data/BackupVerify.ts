@@ -5,6 +5,10 @@
  * helper v9 (`borg-extract-verify`). It never stops the live instance, never
  * takes the instance lock, never writes instances/<id>, and never starts
  * containers. Archive inventory reuses helper `borg-list` (v10, idea#450).
+ * scratchBytes comes from the helper (v12, idea#460: `scratchBytes=<n>` on
+ * stdout after `du -sb -x` of the root:root 0700 dest). An older helper that
+ * prints no count still verifies; scratchBytes is then null. The Engine (pi)
+ * does not walk that tree for the size — it cannot read it.
  */
 
 import { YAML, chalk, fs } from 'zx'
@@ -25,7 +29,9 @@ import {
 import { parseBackupExcludeList, parseBackupVerifyLists } from '../utils/backupExclude.js'
 import { isBackupActive, runningBackupOnDisk, BACKUP_IN_PROGRESS, recordBackupStaleLocks, clearBackupStaleLock } from '../monitors/backupMonitor.js'
 
-/** idea#450: v9's 2-arg borg-list printed no archives list on real borg; require the fixed v10. */
+/** idea#450: v9's 2-arg borg-list printed no archives list on real borg; require the fixed v10.
+ *  idea#460 / helper v12 adds scratchBytes on borg-extract-verify stdout, but verify
+ *  itself still works on v10 (scratchBytes is then null). Do not raise this min. */
 export const BACKUP_VERIFY_HELPER_MIN = 10
 export const VERIFY_MEMBER_CAP = 10_000
 export const VERIFY_SPACE_MARGIN = 0.10
@@ -169,6 +175,23 @@ export const pathsFoundInMembers = (members: string[], instanceId: string, decla
         if (rel && memberMatchesPath(rel, declared)) return true
     }
     return false
+}
+
+/**
+ * Parse `scratchBytes=<n>` from helper v12 `borg-extract-verify` stdout.
+ * Last matching line wins. Missing, unparseable, or non-safe-integer values
+ * return null so an older helper (no count) does not break verify (idea#460).
+ */
+export const parseScratchBytes = (stdout: string): number | null => {
+    const lines = stdout.split(/\r?\n/)
+    for (let i = lines.length - 1; i >= 0; i--) {
+        const m = lines[i].match(/^scratchBytes=([0-9]+)$/)
+        if (!m) continue
+        const n = Number(m[1])
+        if (Number.isSafeInteger(n)) return n
+        return null
+    }
+    return null
 }
 
 const walkFiles = async (root: string): Promise<{ rels: string[], bytes: number }> => {
@@ -336,11 +359,12 @@ export const verifyBackup = async (
     const scratchPath = verifyDir(device, instance.id, stamp)
     let extractOk = false
     try {
-        // Helper v9 does not print the dest path; it extracts in-place under
-        // .idea-verify/<id>-<stamp>/ (no --strip-components) and exits 0.
-        await run(borgExtractVerifyArgs(device, instance.id, arch.name, stamp))
+        // Helper v9 extracts in-place under .idea-verify/<id>-<stamp>/
+        // (no --strip-components) and exits 0. v12 also prints scratchBytes=<n>.
+        const extractOut = await run(borgExtractVerifyArgs(device, instance.id, arch.name, stamp))
         extractOk = true
         const usedPath = scratchPath
+        const helperBytes = parseScratchBytes(extractOut)
 
         let members: string[] = []
         try {
@@ -374,7 +398,7 @@ export const verifyBackup = async (
             archiveCompressedBytes: arch.compressedSize ?? null,
             neededBytes: needed,
             freeBytes: free,
-            scratchBytes: walked.bytes,
+            scratchBytes: helperBytes,
             members: memberCap,
             memberCount: (members.length ? members : scratchRels).length,
             partial: (members.length ? members : scratchRels).length > VERIFY_MEMBER_CAP,

@@ -61,7 +61,8 @@
 #   idea-app-data borg-extract <bdev> <id> <archive> <strip> <dstRoot>
 #   idea-app-data borg-list    <bdev> <id>                                   (v9, idea#401: archive inventory; v10, idea#450: --glob-archives '*')
 #   idea-app-data borg-list    <bdev> <id> <archive>                         (v9, idea#446: member list of one archive)
-#   idea-app-data borg-extract-verify <bdev> <id> <archive> <stamp>          (v9, idea#446: extract into .idea-verify/<id>-<stamp>/, never instances/<id>)
+#   idea-app-data borg-extract-verify <bdev> <id> <archive> <stamp>          (v9, idea#446: extract into .idea-verify/<id>-<stamp>/, never instances/<id>;
+#                                                                           v12, idea#460: on success prints scratchBytes=<bytes> from du -sb -x of the dest)
 #   idea-app-data borg-delete  <bdev> <id> <archive> [keepMin]               (v9, idea#401; keepMin default 3)
 #   idea-app-data borg-compact <bdev> <id>                                   (v9, idea#401)
 #   idea-app-data quarantine-backups <bdev>                                 (v9, idea#446: move backups/ to .idea-quarantine/backups-<UTC stamp>/; never rm)
@@ -137,7 +138,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=10
+readonly IDEA_APP_DATA_VERSION=12
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -1583,6 +1584,8 @@ case "$SUB" in
         # <backup disk>/.idea-verify/<id>-<stamp>/ (root-owned 0700).
         # Never writes under instances/<id>, never replaces an existing tree,
         # never deletes a partial extract on failure.
+        # idea#460 / helper v12: on success print scratchBytes=<n> from du -sb -x
+        # of the dest so the Engine (pi) can report the size of a 0700 tree.
         need 4 $(($# - 1)) "<bdev> <id> <archive> <stamp>"
         check_id "$3"
         [[ "$4" =~ $RE_ARCHIVE ]] || refuse "archive name '$4' does not match $RE_ARCHIVE"
@@ -1612,7 +1615,18 @@ case "$SUB" in
         run_child $BORG extract --numeric-ids -- "$REPO::$4" || EC=$?
         cd /
         # On failure leave the partial tree (never rm). On success leave it too.
-        exit "$EC"
+        # idea#460 / helper v12: print the extract size so the Engine (running as
+        # pi) can report scratchBytes. The dest is root:root 0700, so a walk as
+        # pi sums nothing. A failed size measurement does not fail the extract.
+        if (( EC != 0 )); then
+            exit "$EC"
+        fi
+        OUT=$($DU -sb -x -- "$DEST") || OUT=""
+        BYTES=${OUT%%[[:space:]]*}
+        if [[ "$BYTES" =~ ^[0-9]+$ ]]; then
+            echo "scratchBytes=$BYTES"
+        fi
+        exit 0
         ;;
 
     quarantine-backups)
