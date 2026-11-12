@@ -21,6 +21,8 @@ export type UpdateRefusal =
     | 'NOT_DOCKED' | 'BUSY' | 'SOURCE_MISSING' | 'DIFFERENT_APP' | 'NOT_NEWER'
     | 'MAJOR_NOT_ALLOWED' | 'NEEDS_BACKUP' | 'NO_SPACE' | 'NO_SUMS'
     | 'NOT_FOUND' | 'AMBIGUOUS' | 'HELPER_OUTDATED' | 'TRANSFER_FAILED'
+    // idea#448: the backup updateApp takes itself before a major update
+    | 'BAD_BACKUP_SPEC' | 'HOOK_FAILED' | 'BACKUP_FAILED'
 
 /** Error text starts with the code; the two rollback outcomes use the console#168 wording. */
 export const ROLLED_BACK_PREFIX = 'ROLLED BACK:'
@@ -57,9 +59,24 @@ export interface CheckFacts {
     backupAgeMs: number | null
     /** disks that lack space (name), empty when all fit */
     shortDisks: string[]
+    /**
+     * idea#448: a Backup Disk linked to the instance is docked here, so updateApp takes the
+     * required backup itself (hook before the stop, or Borg inside the Snapshot stop).
+     */
+    backupPlanned?: boolean
 }
 
 export const BACKUP_MAX_AGE_MS = 60 * 60 * 1000
+
+/**
+ * idea#448: true when this update needs a fresh backup (a major upgrade, idea#76: an
+ * unversioned SHA to a tag stays major, and no backup in the last hour).
+ */
+export const backupIsDue = (currentAppId: string, newAppId: string, backupAgeMs: number | null): boolean => {
+    const cur = parseAppId(currentAppId).version, nxt = parseAppId(newAppId).version
+    if (!isUpgrade(cur, nxt) || !isMajorChange(cur, nxt)) return false
+    return backupAgeMs === null || backupAgeMs > BACKUP_MAX_AGE_MS
+}
 
 /** createAppId(undefined, undefined) stringifies missing x-app.name / x-app.version as "undefined". */
 const isMissingAppField = (value: string): boolean => value === '' || value === 'undefined'
@@ -100,7 +117,8 @@ export const checkUpdate = (f: CheckFacts): UpdateAppError | null => {
     if (!isUpgrade(cur.version, nxt.version)) return new UpdateAppError('NOT_NEWER', `${nxt.version} is not newer than ${cur.version}`)
     const major = isMajorChange(cur.version, nxt.version)
     if (major && !f.allowMajor) return new UpdateAppError('MAJOR_NOT_ALLOWED', `${cur.version} -> ${nxt.version} is a major update; pass --allow-major`)
-    if (major && (f.backupAgeMs === null || f.backupAgeMs > BACKUP_MAX_AGE_MS)) return new UpdateAppError('NEEDS_BACKUP', 'Dock a Backup Disk and make a backup first')
+    if (major && (f.backupAgeMs === null || f.backupAgeMs > BACKUP_MAX_AGE_MS) && !f.backupPlanned)
+        return new UpdateAppError('NEEDS_BACKUP', 'Dock a Backup Disk linked to this instance (updateApp then takes the backup itself), or make a backup first')
     if (f.shortDisks.length) return new UpdateAppError('NO_SPACE', `not enough free space on ${f.shortDisks.join(', ')}`)
     return null
 }

@@ -12,11 +12,20 @@
  *  - Swap: copy the new bundle files over the instance folder (.env kept), set
  *    x-app.instanceName again, re-read the record (instanceOf = newAppId).
  *  - Start, Health: startInstance, then the health gate (healthGate) within healthTimeout.
- * Any failure from Snapshot on rolls back: compose down (no -v), `restore-snapshot` (the
- * current folder is moved aside to .idea-quarantine first, so even that is undoable), re-read
- * the record, start the old version. Result text: "ROLLED BACK: <why>"; when the rollback
- * itself fails the instance is left Stopped with statusCondition "ROLLBACK FAILED: ...".
+ * Any failure from Snapshot on rolls back: compose down (no -v), `restore-snapshot` (in place,
+ * helper v9: instances/<id> is never moved; replaced or deleted files go to .idea-quarantine
+ * first, so even that is undoable), re-read the record, start the old version. Result text:
+ * "ROLLED BACK: <why>"; when the rollback itself fails the instance is left Stopped with
+ * statusCondition "ROLLBACK FAILED: ...".
  * Nothing is ever deleted; snapshots are kept (cleanup is a backlog item, quarantine only).
+ *
+ * Identity (idea#448): the snapshot leaves out the union of the live and the new compose's
+ * x-app.backup.exclude (e.g. data/tailscale, data/keys), and restore-snapshot never writes,
+ * deletes or moves those paths, so their inodes survive a rollback. A major update that needs
+ * a fresh backup takes it here, from the NEW compose's x-app.backup, to a docked Backup Disk
+ * linked to the instance: method hook runs before anything is stopped (a failed preHook
+ * refuses, HOOK_FAILED; it never falls back to a stop); method stop (or an instance that is
+ * not running) runs Borg inside the one Snapshot stop.
  *
  * Named Docker volumes of the instance are exported into the snapshot too (helper v5, offline host
  * tar, verified before COMPLETE) and restored on rollback; a previous snapshot is renamed into
@@ -38,14 +47,18 @@ import { createOperation, updateOperation } from './Operations.js'
 import { log } from '../utils/utils.js'
 import {
     UpdateAppError, UpdateStep, UPDATE_STEPS, checkUpdate, healthGate, healthTimeoutSeconds, rollbackPlan,
-    HealthSample, ContainerHealth, offerable, compareVersions, isMajorChange,
+    HealthSample, ContainerHealth, offerable, compareVersions, isMajorChange, backupIsDue,
 } from './UpdateAppPolicy.js'
 import { parseAppId } from './App.js'
 import { setComposeInstanceName } from './InstanceCopy.js'
 import { isUnfinishedFetch } from './UpdateFetch.js'
 import { beginUsageSkip, endUsageSkip } from '../usage/opFlags.js'
+import { parseBackupExcludeList, mergeBackupExcludeLists } from '../utils/backupExclude.js'
+import { parseBackupSpec, BackupMethod } from '../utils/backupMethod.js'
+import type { PreUpdateBackupOptions } from '../monitors/backupMonitor.js'
 
-export const UPDATE_HELPER_MIN = 5
+/** v9 (idea#448): snapshot excludes and the in-place restore-snapshot. */
+export const UPDATE_HELPER_MIN = 9
 export const UPDATE_PROGRESS_TYPE = 'idea/updateProgress'
 export const PRE_UPDATE_DIR = '.pre-update'
 export const UPDATE_APP_USAGE = 'Usage: updateApp <instanceId|name> <newAppId> [--allow-major] [--source <diskId>]'
@@ -66,6 +79,10 @@ export interface UpdateResult {
     previousSnapshotQuarantinedAt: string | null
     /** named Docker volumes exported into the snapshot, with their export time */
     volumes: { name: string, bytes: number, exportMs: number }[]
+    /** idea#448: paths left out of the snapshot and never written back on rollback */
+    snapshotExcludes: string[]
+    /** idea#448: the backup updateApp took itself (null when none was due) */
+    preUpdateBackup: { backupDiskId: string, method: BackupMethod, duringStop: boolean } | null
 }
 export interface SnapshotsInfo { snapshots: PreUpdateSnapshot[], preUpdateBytes: number | null, quarantineBytes: number | null }
 
@@ -82,8 +99,10 @@ export interface UpdateDeps {
     composeDown: (dir: string, id: InstanceID) => Promise<void>
     /** #263: cross-Engine Fetch onto the instance's disk; resolves with the local bundle folder */
     fetch: (req: import('./UpdateFetch.js').FetchRequest) => Promise<string>
-    snapshot: (disk: Disk, id: InstanceID) => Promise<SnapshotResult>
-    restoreSnapshot: (disk: Disk, id: InstanceID) => Promise<string>
+    snapshot: (disk: Disk, id: InstanceID, excludes: string[]) => Promise<SnapshotResult>
+    restoreSnapshot: (disk: Disk, id: InstanceID, excludes: string[]) => Promise<string>
+    /** idea#448: backupInstance in its pre-update mode (only the Backup Disk lock; errors thrown) */
+    backup: (inst: Instance, backupDisk: Disk, opts: PreUpdateBackupOptions) => Promise<void>
     listSnapshots: (disk: Disk) => Promise<SnapshotsInfo>
     reread: (disk: Disk, id: InstanceID) => Promise<void>
     start: (inst: Instance, disk: Disk) => Promise<void>
@@ -148,8 +167,10 @@ export const defaultUpdateDeps = (storeHandle: DocHandle<Store>): UpdateDeps => 
         // quarantine glob. No -v (named volumes stay).
         await docker(['compose', '-p', String(id), '-f', composeFile, 'down'])
     },
-    snapshot: async (disk, id) => parseSnapshotResult(await runAppData(snapshotArgs(await appDataRoot(disk), String(id)))),
-    restoreSnapshot: async (disk, id) => lastLine(await runAppData(restoreSnapshotArgs(await appDataRoot(disk), String(id)))),
+    snapshot: async (disk, id, excludes) => parseSnapshotResult(await runAppData(snapshotArgs(await appDataRoot(disk), String(id), excludes))),
+    restoreSnapshot: async (disk, id, excludes) => lastLine(await runAppData(restoreSnapshotArgs(await appDataRoot(disk), String(id), excludes))),
+    backup: async (inst, backupDisk, opts) =>
+        (await import('../monitors/backupMonitor.js')).backupInstance(storeHandle, inst.id, backupDisk, undefined, 'console-command', opts),
     listSnapshots: async (disk) => parseSnapshotsList(await runAppData(snapshotsArgs(await appDataRoot(disk)))) as SnapshotsInfo,
     reread: async (disk, id) => { await (await import('./Instance.js')).createOrUpdateInstance(storeHandle, id, disk) },
     start: async (inst, disk) => (await import('./Instance.js')).startInstance(storeHandle, inst, disk),
@@ -218,6 +239,26 @@ const findBundleDisk = async (store: Store, d: UpdateDeps, engineId: string, ins
     return null
 }
 
+/**
+ * idea#448: x-app.backup of a compose file: its exclude list and method. A missing file or
+ * x-app.backup gives [] / 'stop'; a malformed one refuses BAD_BACKUP_SPEC (fail closed).
+ */
+export const readComposeBackup = async (composePath: string, which: string): Promise<{ exclude: string[], method: BackupMethod }> => {
+    if (!await fs.pathExists(composePath)) return { exclude: [], method: 'stop' }
+    try {
+        const xapp = YAML.parse(await fs.readFile(composePath, 'utf8'))?.['x-app']
+        return { exclude: parseBackupExcludeList(xapp), method: parseBackupSpec(xapp).method }
+    } catch (e) {
+        throw new UpdateAppError('BAD_BACKUP_SPEC', `the ${which} compose ${composePath} has an invalid x-app.backup: ${(e as Error).message}`)
+    }
+}
+
+/** idea#448: a Backup Disk docked to this Engine and linked to the instance (backupApp's default choice). */
+export const linkedBackupDisk = (store: Store, engineId: string, inst: Instance): Disk | null =>
+    (Object.values(store.diskDB ?? {}).find(x =>
+        x && x.device && String(x.dockedTo) === engineId && x.diskTypes?.includes('backup') &&
+        (x.backupConfig?.links ?? []).some(l => String(l) === String(inst.id))) as Disk | undefined) ?? null
+
 const readHealthTimeout = async (composePath: string, appName: string): Promise<number> => {
     try { return healthTimeoutSeconds(appName, YAML.parse(await fs.readFile(composePath, 'utf8'))?.['x-app']?.healthTimeout) }
     catch { return healthTimeoutSeconds(appName) }
@@ -268,14 +309,23 @@ export const updateApp = async (
             const need = dataBytes + snapshotMarginBytes(dataBytes) + bundleBytes
             if (est.freeBytes < need) shortDisks = [`${disk.name} (snapshot needs ${need}, free ${est.freeBytes})`]
         }
+        const backupAgeMs = inst.lastBackup ? d.now() - Number(inst.lastBackup) : null
+        const backupDisk = backupIsDue(String(inst.instanceOf), newAppId, backupAgeMs) ? linkedBackupDisk(store, engineId, inst) : null
         const refusal = checkUpdate({
             diskDocked: true, busy: !gotLock, currentAppId: String(inst.instanceOf), newAppId,
             sourcePresent: !!bundle, sumsValid: bundle ? await d.verifySums(bundle.dir) : false,
             allowMajor: !!opts.allowMajor,
-            backupAgeMs: inst.lastBackup ? d.now() - Number(inst.lastBackup) : null,
+            backupAgeMs,
             shortDisks,
+            backupPlanned: !!backupDisk,
         })
         if (refusal) throw refusal
+        // idea#448: the snapshot leaves out the union of the live and the new compose's
+        // x-app.backup.exclude (Steve Q5); the new compose also decides the backup method.
+        const newCompose = path.join(bundle!.dir, 'compose.yaml')
+        const live = await readComposeBackup(path.join(instDir, 'compose.yaml'), 'live')
+        const next = await readComposeBackup(newCompose, 'new')
+        const snapExcludes = mergeBackupExcludeLists(live.exclude, next.exclude)
         progress('Check')
 
         const fromAppId = inst.instanceOf
@@ -284,13 +334,30 @@ export const updateApp = async (
         const setStep = (step: UpdateStep) => updateOperation(storeHandle, opId, { currentStep: UPDATE_STEPS.indexOf(step), totalSteps: UPDATE_STEPS.length, stepLabel: step })
         let step: UpdateStep = 'Snapshot'
         let snap: SnapshotResult | null = null
+        let stopped = false
+        let preUpdateBackup: UpdateResult['preUpdateBackup'] = null
         const done: UpdateStep[] = ['Fetch', 'Check']
+        const wasUp = inst.status === 'Running' || inst.status === 'Starting'
+        // hook: before anything stops; stop (or not running): inside the one Snapshot stop (Steve Q3)
+        const hookFirst = !!backupDisk && wasUp && next.method === 'hook'
+        const takeBackup = async (instanceStopped: boolean) => {
+            updateOperation(storeHandle, opId, { stepLabel: `Pre-update backup to ${backupDisk!.name} (${instanceStopped ? 'inside the snapshot stop' : 'hook, no stop'})` })
+            try { await d.backup(inst, backupDisk!, { composePath: newCompose, instanceStopped }) } catch (e) {
+                const m = String((e as Error).message)
+                if (/HOOK_FAILED: /.test(m)) throw new UpdateAppError('HOOK_FAILED', `${m.replace(/^.*?HOOK_FAILED: /, '')}; nothing was stopped or changed`)
+                throw new UpdateAppError('BACKUP_FAILED', `the pre-update backup to ${backupDisk!.name} failed: ${m}`)
+            }
+            preUpdateBackup = { backupDiskId: String(backupDisk!.id), method: instanceStopped ? 'stop' : 'hook', duringStop: instanceStopped }
+            log(`updateApp: ${inst.id}: pre-update backup to ${backupDisk!.id} done (${instanceStopped ? 'inside the snapshot stop' : 'hook, no stop'})`)
+        }
         try {
+            if (hookFirst) await takeBackup(false)
             // ── Snapshot
             setStep('Snapshot'); progress('Snapshot', 0, dataBytes)
-            if (inst.status === 'Running' || inst.status === 'Starting') await d.stop(inst, disk)
+            if (wasUp) { stopped = true; await d.stop(inst, disk) }
             await waitContainersGone(d, inst.id)
-            try { snap = await d.snapshot(disk, inst.id) } catch (e) {
+            if (backupDisk && !hookFirst) await takeBackup(true)
+            try { snap = await d.snapshot(disk, inst.id, snapExcludes) } catch (e) {
                 const m = String((e as Error).message)
                 const ns = m.match(/NO_SPACE: [^\n]*/)
                 if (ns) throw new UpdateAppError('NO_SPACE', ns[0].replace(/^NO_SPACE: /, ''))
@@ -332,20 +399,20 @@ export const updateApp = async (
             done.push('Health')
             updateOperation(storeHandle, opId, { status: 'Done', completedAt: d.now() as Timestamp })
             log(`updateApp: ${inst.id} ('${inst.name}') ${fromAppId} -> ${newAppId}; snapshot ${snap.path} (${snap.sizeBytes} bytes) kept`)
-            return { instanceId: inst.id, name: String(inst.name), fromAppId, toAppId: newAppId as AppID, snapshotPath: snap.path, snapshotBytes: snap.sizeBytes, steps: done, previousSnapshotQuarantinedAt: snap.previousQuarantinedAt, volumes: snap.volumes }
+            return { instanceId: inst.id, name: String(inst.name), fromAppId, toAppId: newAppId as AppID, snapshotPath: snap.path, snapshotBytes: snap.sizeBytes, steps: done, previousSnapshotQuarantinedAt: snap.previousQuarantinedAt, volumes: snap.volumes, snapshotExcludes: snapExcludes, preUpdateBackup }
         } catch (e) {
             const why = e instanceof UpdateAppError && e.code === 'NO_SPACE' ? null : String((e as Error).message)
             if (!why || !snap) {
                 // Before a complete snapshot nothing was swapped: the old version is intact.
                 // It may have been stopped for the snapshot: start the old version again.
-                if (inst.status === 'Running' || inst.status === 'Starting') {
+                if (stopped) {
                     try { await d.start(storeHandle.doc().instanceDB[inst.id] as Instance, disk) } catch (se) { log(`updateApp: restarting ${inst.id} failed: ${(se as Error).message}`) }
                 }
                 const err = e instanceof UpdateAppError ? e : new UpdateAppError('ROLLED_BACK', `${step} failed: ${why}; nothing was changed`)
                 updateOperation(storeHandle, opId, { status: 'Failed', error: err.message, completedAt: d.now() as Timestamp })
                 throw err
             }
-            const err = await rollBack(storeHandle, d, inst, disk, instDir, step, why, snap)
+            const err = await rollBack(storeHandle, d, inst, disk, instDir, step, why, snap, snapExcludes)
             updateOperation(storeHandle, opId, { status: 'Failed', error: err.message, completedAt: d.now() as Timestamp })
             throw err
         }
@@ -360,7 +427,7 @@ export const updateApp = async (
 /** Restore the snapshot and start the old version. Returns the error to report. */
 const rollBack = async (
     storeHandle: DocHandle<Store>, d: UpdateDeps, inst: Instance, disk: Disk, instDir: string,
-    failedAt: UpdateStep, why: string, snap: { path: string, sizeBytes: number },
+    failedAt: UpdateStep, why: string, snap: { path: string, sizeBytes: number }, excludes: string[],
 ): Promise<UpdateAppError> => {
     const plan = rollbackPlan(failedAt)
     log(`updateApp: ${failedAt} failed for ${inst.id} (${why}); rolling back from ${snap.path}`)
@@ -368,8 +435,9 @@ const rollBack = async (
         await d.composeDown(instDir, inst.id)
         await waitContainersGone(d, inst.id)
         if (plan.restoreData) {
-            const aside = await d.restoreSnapshot(disk, inst.id)
-            log(`updateApp: ${inst.id} restored from ${snap.path}; the updated folder is kept at ${aside}`)
+            // In place (idea#448): excluded paths keep their inodes; replaced files go to `aside`.
+            const aside = await d.restoreSnapshot(disk, inst.id, excludes)
+            log(`updateApp: ${inst.id} restored in place from ${snap.path}; the replaced files are kept at ${aside}`)
         }
         await d.reread(disk, inst.id)
         if (plan.startOld && (inst.status === 'Running' || inst.status === 'Starting')) {
@@ -409,7 +477,15 @@ export const recoverInterruptedUpdates = async (storeHandle: DocHandle<Store>, e
         const complete = snaps.some(s => String(s.instanceId) === String(inst.id) && s.complete)
         const swapped = UPDATE_STEPS.indexOf(step) >= UPDATE_STEPS.indexOf('Swap')
         if (!complete || !swapped) { out.push(`${inst.id}: interrupted at ${step}; old version untouched`); continue }
-        const err = await rollBack(storeHandle, d, inst, disk, joinMountRoot(await d.mountRoot(disk), 'instances', String(inst.id)), step, 'the Engine restarted during the update', { path: joinMountRoot(await d.mountRoot(disk), PRE_UPDATE_DIR, String(inst.id)), sizeBytes: 0 })
+        const root = await d.mountRoot(disk)
+        const instDir = joinMountRoot(root, 'instances', String(inst.id))
+        // idea#448: the snapshot's EXCLUDE already holds the live ∪ new list; the compose now in
+        // the folder (old or swapped) is added so nothing it excludes is written back.
+        let excludes: string[] = []
+        try { excludes = (await readComposeBackup(path.join(instDir, 'compose.yaml'), 'current')).exclude } catch (e) {
+            log(`updateApp: ${inst.id}: ${(e as Error).message}; restoring with the snapshot's own EXCLUDE list only`)
+        }
+        const err = await rollBack(storeHandle, d, inst, disk, instDir, step, 'the Engine restarted during the update', { path: joinMountRoot(root, PRE_UPDATE_DIR, String(inst.id)), sizeBytes: 0 }, excludes)
         updateOperation(storeHandle, op.id, { status: 'Failed', error: `INTERRUPTED: ${err.message}`, completedAt: d.now() as Timestamp })
         out.push(`${inst.id}: ${err.message}`)
     }
