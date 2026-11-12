@@ -9,8 +9,11 @@
 #   final summary: write it on the sticker on the case.
 #
 # Examples:
-#   # Pi 5 reached through idea03 as a jump host, fleet Tailscale key from a local file
-#   ./script/provision-fleet.sh --jump pi@100.126.117.80 --authkey-file ~/fleet-authkey.txt \
+#   # Pi 5 reached through idea03 as a jump host; fleet key from ~/.config/idea/fleet-authkey
+#   ./script/provision-fleet.sh --jump pi@100.126.117.80 \
+#       idea01=192.168.0.138,model=pi5
+#   # Same, with an explicit key file (override)
+#   ./script/provision-fleet.sh --jump pi@100.126.117.80 --authkey-file /path/to/key \
 #       idea01=192.168.0.138,model=pi5
 #   # Two Pis on the same LAN as this machine, Pi already holds the key
 #   ./script/provision-fleet.sh idea04=192.168.0.113,model=pi4 idea05=192.168.0.120,model=pi5
@@ -18,10 +21,13 @@
 # Options:
 #   --jump <user@host>       SSH jump host (ProxyJump), e.g. pi@100.126.117.80
 #   --user <name>            SSH user on the Pi (default: pi)
-#   --authkey-file <path>    Tailscale fleet auth key on THIS machine. It is sent over
-#                            stdin into /etc/tailscale/debug-authkey (0600 root) on the
-#                            Pi, never as an argument. Omit it when the Pi already
-#                            holds the key; the build stops if neither is true.
+#   --authkey-file <path>    Override the fleet Tailscale key file on THIS machine
+#                            (default: ~/.config/idea/fleet-authkey). The key is sent
+#                            over stdin into /etc/tailscale/debug-authkey (0600 root)
+#                            on the Pi, never as an argument. The file must exist,
+#                            be mode 600, owned by you, and non-empty. If the default
+#                            file is absent and this option is omitted, the Pi must
+#                            already hold the key; the build stops if neither is true.
 #   --engine-ref <ref>       agent-engine-dev branch/tag/commit to install (default: main)
 #   --console-ref <ref>      agent-console-dev branch/tag/commit to install (default: main)
 #   --timezone <tz>          (default: Europe/Brussels)
@@ -36,7 +42,8 @@
 #   2. Bootstraps the Pi: apt prerequisites, Node (n) and the pinned pnpm from
 #      package.json "packageManager", the canonical checkout under
 #      /home/pi/idea/agents/<repo> at the requested refs, Console build
-#   3. Stores the Tailscale fleet key (if --authkey-file) over stdin
+#   3. Stores the Tailscale fleet key (from --authkey-file or ~/.config/idea/fleet-authkey)
+#      over stdin; if neither file is present, reuses the key already on the Pi
 #   4. Runs build-engine in LOCAL mode on the Pi, with explicit on/off flags
 #      (--no-argon/--no-gadget unless asked; --model passes the Pi model)
 #   5. Waits for the reboot, then checks pm2 and the Console HTTP port
@@ -62,6 +69,8 @@ NODE_VERSION="22.20.0"   # keep in sync with NODE_VERSION in src/data/Engine.ts
 SSH_USER="pi"
 JUMP=""
 AUTHKEY_FILE=""
+AUTHKEY_EXPLICIT=0
+DEFAULT_FLEET_AUTHKEY=""  # set in resolve_fleet_authkey from $HOME
 ENGINE_REF="main"
 CONSOLE_REF="main"
 TIMEZONE="Europe/Brussels"
@@ -71,29 +80,68 @@ GADGET=0
 WAIT=1
 NODES=()
 
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --jump)          JUMP="${2:?--jump needs user@host}"; shift 2 ;;
-    --user)          SSH_USER="${2:?--user needs a name}"; shift 2 ;;
-    --authkey-file)  AUTHKEY_FILE="${2:?--authkey-file needs a path}"; shift 2 ;;
-    --engine-ref)    ENGINE_REF="${2:?--engine-ref needs a ref}"; shift 2 ;;
-    --console-ref)   CONSOLE_REF="${2:?--console-ref needs a ref}"; shift 2 ;;
-    --timezone)      TIMEZONE="${2:?--timezone needs a value}"; shift 2 ;;
-    --keyboard)      KEYBOARD="${2:?--keyboard needs a value}"; shift 2 ;;
-    --argon)         ARGON=1; shift ;;
-    --gadget)        GADGET=1; shift ;;
-    --no-wait)       WAIT=0; shift ;;
-    -h|--help)       usage; exit 0 ;;
-    --)              shift; NODES+=("$@"); break ;;
-    -*)              die "unknown option: $1 (see --help)" ;;
-    *)               NODES+=("$1"); shift ;;
-  esac
-done
+# Preflight whichever key file will be used. stat -c %a has no -L, so a symlink
+# (mode 777) is refused, matching tools/router-image/idea-router-enrol.
+preflight_authkey_file() {
+  local file="$1"
+  local mode owner
+  [[ -f "$file" ]] || die "auth key file $file is missing or not a regular file"
+  mode="$(stat -c %a "$file")"
+  [[ "$mode" == 600 ]] || die "auth key file $file has mode $mode, must be 600 (chmod 600 it)"
+  owner="$(stat -c %u "$file")"
+  [[ "$owner" == "$(id -u)" ]] || die "auth key file $file is not owned by $(id -un)"
+  [[ -s "$file" ]] || die "auth key file $file is empty"
+}
 
-[[ ${#NODES[@]} -gt 0 ]] || { usage; die "no Pi given"; }
-if [[ -n "$AUTHKEY_FILE" ]]; then
-  [[ -s "$AUTHKEY_FILE" ]] || die "auth key file $AUTHKEY_FILE is missing or empty"
+# Default: $HOME/.config/idea/fleet-authkey when that file is present.
+# A missing default is not fatal (the Pi may already hold the key).
+# An explicit --authkey-file is always required to exist and pass preflight.
+resolve_fleet_authkey() {
+  DEFAULT_FLEET_AUTHKEY="${HOME}/.config/idea/fleet-authkey"
+  if [[ "${AUTHKEY_EXPLICIT:-0}" -eq 1 ]]; then
+    preflight_authkey_file "$AUTHKEY_FILE"
+    return
+  fi
+  if [[ -e "$DEFAULT_FLEET_AUTHKEY" || -L "$DEFAULT_FLEET_AUTHKEY" ]]; then
+    AUTHKEY_FILE="$DEFAULT_FLEET_AUTHKEY"
+    preflight_authkey_file "$AUTHKEY_FILE"
+  else
+    AUTHKEY_FILE=""
+  fi
+}
+
+parse_provision_fleet_args() {
+  AUTHKEY_EXPLICIT=0
+  AUTHKEY_FILE=""
+  NODES=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --jump)          JUMP="${2:?--jump needs user@host}"; shift 2 ;;
+      --user)          SSH_USER="${2:?--user needs a name}"; shift 2 ;;
+      --authkey-file)  AUTHKEY_FILE="${2:?--authkey-file needs a path}"; AUTHKEY_EXPLICIT=1; shift 2 ;;
+      --engine-ref)    ENGINE_REF="${2:?--engine-ref needs a ref}"; shift 2 ;;
+      --console-ref)   CONSOLE_REF="${2:?--console-ref needs a ref}"; shift 2 ;;
+      --timezone)      TIMEZONE="${2:?--timezone needs a value}"; shift 2 ;;
+      --keyboard)      KEYBOARD="${2:?--keyboard needs a value}"; shift 2 ;;
+      --argon)         ARGON=1; shift ;;
+      --gadget)        GADGET=1; shift ;;
+      --no-wait)       WAIT=0; shift ;;
+      -h|--help)       usage; exit 0 ;;
+      --)              shift; NODES+=("$@"); break ;;
+      -*)              die "unknown option: $1 (see --help)" ;;
+      *)               NODES+=("$1"); shift ;;
+    esac
+  done
+}
+
+# Sourced by tests (temp HOME, fake keys only). When executed, run the provisioner.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
 fi
+
+parse_provision_fleet_args "$@"
+[[ ${#NODES[@]} -gt 0 ]] || { usage; die "no Pi given"; }
+resolve_fleet_authkey
 
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30)
 [[ -n "$JUMP" ]] && SSH_OPTS+=(-J "$JUMP")

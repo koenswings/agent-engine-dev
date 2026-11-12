@@ -6,16 +6,20 @@ import { config } from './Config.js'
 import { log } from '../utils/utils.js'
 
 /**
- * The shared fleet store (idea#120).
+ * The shared fleet store (idea#120): the kit store (idea#452).
  *
- * Every Engine opens the same Automerge document, so they all merge into one
- * store (AGENTS.md, docs/ARCHITECTURE.md). Its URL is tracked in
- * store-identity/store-url.txt; this constant is the same value, so an Engine
- * whose store-url.txt is missing can write it back. A test checks that the two
- * match. The document's initial content comes from store-template.json, which is
+ * Every field Engine opens the same Automerge document, so they all merge into one
+ * store (AGENTS.md, docs/ARCHITECTURE.md). Since idea#452 (Koen, 2026-11-12) this
+ * is the kit store 3Vvv… that the Zimbabwe kits (kind-panda, happy-zebra,
+ * sunny-robin) share, so a Pi flashed from an Engine image joins the kits. It
+ * replaces 4GQm…, which no deployed Engine uses. Its URL is tracked in
+ * store-identity/store-url.txt (the file an Engine image ships); this constant is
+ * the same value, and a test checks that the two match. The dev pool (2VroE…) and
+ * production keep their own store in their local store-url.txt, which a deploy
+ * keeps. The document's initial content comes from store-template.json, which is
  * never written by the Engine.
  */
-export const FLEET_STORE_URL = 'automerge:4GQmEZehPDfryGDxkFo9XixbvmAC'
+export const FLEET_STORE_URL = 'automerge:3Vvvigx8bKcuwKALqMVz85GhDqrk'
 
 export interface StoreIdentityPaths {
     urlPath: string
@@ -85,7 +89,8 @@ export const restoredMarkerPath = (paths: StoreIdentityPaths): string =>
 /**
  * Env flag that lets the Engine write the fleet store URL into a missing
  * store-url.txt (engine#193). Off by default: without the file the Engine refuses
- * to start, so a dev/pool Pi that lost its file never silently joins production.
+ * to start, so a dev/pool Pi that lost its file never silently joins the kit store
+ * (the field Engines' store, idea#452).
  */
 export const STORE_URL_FALLBACK_ENV = 'IDEA_ALLOW_STORE_URL_FALLBACK'
 
@@ -108,7 +113,7 @@ export const prepareStoreIdentity = async (
         if (!allowFallback) {
             throw new Error(
                 `Store URL file ${paths.urlPath} is missing: refusing to start (engine#193). ` +
-                `Without it the Engine would join the fleet store ${FLEET_STORE_URL}. Restore the file ` +
+                `Without it the Engine would join the fleet (kit) store ${FLEET_STORE_URL}. Restore the file ` +
                 `(e.g. 'git checkout -- store-identity/store-url.txt', or the pool's store URL), or set ` +
                 `${STORE_URL_FALLBACK_ENV}=true to write the fleet store URL deliberately.`)
         }
