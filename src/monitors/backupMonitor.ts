@@ -10,7 +10,7 @@
  *  - skipBorg() (settings.skipBorg / IDEA_SKIP_BORG, default testMode): skips borg commands but
  *    exercises all other logic (store updates, YAML, lock files)
  *  - Borg runs as root through the app-data helper (idea#168):
- *    `sudo -n /usr/local/sbin/idea-app-data borg-init|borg-info|borg-create|borg-extract`,
+ *    `sudo -n /usr/local/sbin/idea-app-data borg-init|borg-info|borg-create|borg-extract|borg-list|borg-delete|borg-compact`,
  *    so it can read instance data written by root/999/www-data and restores owners
  *    (--numeric-ids). Repositories become root-owned; the repo folder and the
  *    .backup-in-progress lock file stay the Engine's (pi).
@@ -22,6 +22,7 @@ import { disksRoot, skipBorg } from '../data/Config.js'
 import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot, appDataRoot, joinMountRoot } from '../data/Disk.js'
 import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgProblem, helperAtLeast } from '../utils/appDataHelper.js'
 import { parseBackupExcludeList, parseBackupHookExcludeList, mergeBackupExcludeLists, BACKUP_EXCLUDE_HELPER_MIN } from '../utils/backupExclude.js'
+import { backupCleanupRunner, backupDiskFullError, cleanupIsEnabled } from '../utils/backupCleanup.js'
 import { parseBackupSpec, assertHookServicesExist, backupHookRunner, defaultBackupSpec } from '../utils/backupMethod.js'
 import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { ensureAppFilesOnTarget } from '../data/RestoreAppFiles.js'
@@ -184,8 +185,8 @@ export const backupInstance = async (
 
         // 0b. Honour x-app.backup.exclude (idea#443) and x-app.backup.method
         // (idea#444). Fail closed: a non-empty exclude list on a helper older
-        // than v8, or a malformed method/hook block, refuses before the instance
-        // is stopped or lastBackup is written.
+        // than v8, or a malformed method/hook block, refuses before any hook
+        // or stop, and without writing lastBackup.
         const composePath = joinMountRoot(await diskMountRoot(appDisk as Disk), 'instances', instanceId, 'compose.yaml')
         const instanceDir = joinMountRoot(await diskMountRoot(appDisk as Disk), 'instances', instanceId)
         let backupExcludes: string[] = []
@@ -219,6 +220,18 @@ export const backupInstance = async (
         if ((backupExcludes.length || hookExcludes.length) && !skipBorg()) {
             const helper = await helperAtLeast(BACKUP_EXCLUDE_HELPER_MIN, 'backupApp with x-app.backup.exclude')
             if (helper) throw new Error(`HELPER_OUTDATED: ${helper}`)
+        }
+
+        // 0c. Fullness cleanup (idea#401, helper v9) before any hook or stop.
+        // An older helper skips cleanup and the backup still runs.
+        let cleanupWarning: string | null = null
+        const backupMountRoot = joinMountRoot(await diskMountRoot(backupDisk as Disk))
+        if (cleanupIsEnabled()) {
+            const before = await backupCleanupRunner.run({
+                backupDevice, mountRoot: backupMountRoot, currentInstanceId: instanceId, phase: 'before',
+            })
+            if (before.status === 'HELPER_OUTDATED') cleanupWarning = before.warning ?? 'HELPER_OUTDATED'
+            if (before.status === 'full') throw backupDiskFullError()
         }
 
         // 1. Init Borg repo if this is the first backup
@@ -343,11 +356,20 @@ export const backupInstance = async (
         // 8. Remove lock file (success)
         await fs.remove(lockPath)
 
+        if (cleanupIsEnabled()) {
+            const after = await backupCleanupRunner.run({
+                backupDevice, mountRoot: backupMountRoot, currentInstanceId: instanceId, phase: 'after',
+            })
+            if (after.status === 'HELPER_OUTDATED' && !cleanupWarning) {
+                cleanupWarning = after.warning ?? 'HELPER_OUTDATED'
+            }
+        }
         storeHandle.change(doc => {
             const op = doc.operationDB?.[opId]
             if (!op) return
             op.args.hookResult = hookResult
             if (hookWarning) op.args.warning = hookWarning
+            if (cleanupWarning) op.args.cleanup = cleanupWarning as string
         })
         updateOperation(storeHandle, opId, {
             status: 'Done',
