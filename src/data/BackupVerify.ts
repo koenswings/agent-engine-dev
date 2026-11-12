@@ -4,7 +4,7 @@
  * Scratch verify extracts into <Backup Disk>/.idea-verify/<id>-<stamp>/ through
  * helper v9 (`borg-extract-verify`). It never stops the live instance, never
  * takes the instance lock, never writes instances/<id>, and never starts
- * containers. Archive inventory reuses helper v9 `borg-list`.
+ * containers. Archive inventory reuses helper `borg-list` (v10, idea#450).
  */
 
 import { YAML, chalk, fs } from 'zx'
@@ -25,7 +25,8 @@ import {
 import { parseBackupExcludeList, parseBackupVerifyLists } from '../utils/backupExclude.js'
 import { isBackupActive, runningBackupOnDisk, BACKUP_IN_PROGRESS, recordBackupStaleLocks, clearBackupStaleLock } from '../monitors/backupMonitor.js'
 
-export const BACKUP_VERIFY_HELPER_MIN = 9
+/** idea#450: v9's 2-arg borg-list printed no archives list on real borg; require the fixed v10. */
+export const BACKUP_VERIFY_HELPER_MIN = 10
 export const VERIFY_MEMBER_CAP = 10_000
 export const VERIFY_SPACE_MARGIN = 0.10
 

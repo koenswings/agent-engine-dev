@@ -13,6 +13,7 @@ import { describe, it, expect, afterEach } from 'vitest'
 import { execFileSync } from 'child_process'
 import { fs, path } from 'zx'
 import { parseBorgListJson } from '../../src/utils/backupCleanup.js'
+import { parseBorgListInventory, newestArchive, parseBorgMemberList, pathsFoundInMembers } from '../../src/data/BackupVerify.js'
 import { borgListArgs } from '../../src/utils/appDataHelper.js'
 import { makeAppDataSandbox, AppDataSandbox } from '../harness/appDataSandbox.js'
 
@@ -49,8 +50,14 @@ describe.skipIf(!borgVersion)(`helper borg-list inventory with a real borg (${bo
         const archives = parseBorgListJson(out)
         expect(archives.map(a => a.name)).toEqual(names)
         for (const a of archives) expect(a.originalSize).toBeGreaterThan(0)
+        // idea#446 listBackup / verifyBackup parser on the same real output
+        const inv = parseBorgListInventory(out)
+        expect(inv.map(a => a.name)).toEqual(names)
+        for (const a of inv) expect(a.originalSize).toBeGreaterThan(0)
+        expect(newestArchive(inv).name).toBe(names[2])
         // and the 3-arg member list still works on the same repo
         const members = await run(borgListArgs('sdc1', 'inst-1', names[2]))
         expect(members).toMatch(/instances\/inst-1\/data\/a\.txt/)
+        expect(pathsFoundInMembers(parseBorgMemberList(members), 'inst-1', 'data/a.txt')).toBe(true)
     }, 60_000)
 })
