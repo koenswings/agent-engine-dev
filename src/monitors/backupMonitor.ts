@@ -146,19 +146,20 @@ const writeBackupYaml = async (backupDevice: string, yaml: BackupYaml): Promise<
 
 /**
  * idea#448: the backup updateApp takes itself before a major update.
- *  - `composePath`: read x-app.backup (exclude, hookExclude, method, hooks) from the NEW
- *    bundle's compose instead of the instance's; the hook runs from that compose
- *    against the live compose project (BackupHookRunSpec.compose).
+ *  - idea#458: it is a backup of the CURRENT (old) instance, so x-app.backup (exclude,
+ *    hookExclude, method, hooks) comes from the instance's own compose.yaml, never from the
+ *    new bundle: a hook that only the new version ships would run inside the old containers
+ *    (exit 127). An old version without a hook means stop mode. The hook runs from that
+ *    compose against the live compose project (BackupHookRunSpec.compose).
  *  - updateApp already holds the instance lock: only the Backup Disk lock is taken.
  *  - A failed preHook never stops the instance here (fallback is treated as `fail`).
- *  - `instanceStopped`: updateApp stopped the instance for its Snapshot (stop-mode new
+ *  - `instanceStopped`: updateApp stopped the instance for its Snapshot (stop-mode current
  *    compose, or an instance that was not running): Borg runs directly, no hook, no
  *    stop and no start (one stop for backup and snapshot).
  *  - A `.backup-in-progress` left by an earlier backup refuses (no auto-retry, #446).
  * Errors are thrown to updateApp (no own trace).
  */
 export interface PreUpdateBackupOptions {
-    composePath: string
     instanceStopped: boolean
 }
 
@@ -277,12 +278,12 @@ export const backupInstance = async (
         // than v8, or a malformed method/hook block, refuses before any hook
         // or stop, and without writing lastBackup.
         const instanceDir = joinMountRoot(await diskMountRoot(appDisk as Disk), 'instances', instanceId)
-        const composePath = preUpdate?.composePath ?? joinMountRoot(instanceDir, 'compose.yaml')
+        const composePath = joinMountRoot(instanceDir, 'compose.yaml')
         let backupExcludes: string[] = []
         let hookExcludes: string[] = []
         let backupSpec = defaultBackupSpec()
         if (preUpdate && !await fs.pathExists(composePath)) {
-            throw new Error(`backupApp: the new bundle's ${composePath} is missing`)
+            throw new Error(`backupApp: the instance's ${composePath} is missing (the pre-update backup reads x-app.backup from the current version)`)
         }
         if (await fs.pathExists(composePath)) {
             let parsed: unknown
@@ -312,7 +313,7 @@ export const backupInstance = async (
         // idea#448 (Steve Q4): inside updateApp a failed preHook refuses, it never stops.
         if (preUpdate) backupSpec.fallback = 'fail'
         if (preUpdate && !preUpdate.instanceStopped && backupSpec.method !== 'hook') {
-            throw new Error(`backupApp: the pre-update backup of ${instanceId} needs method 'hook' while the instance runs (updateApp takes a stop-mode backup inside its Snapshot stop)`)
+            throw new Error(`backupApp: the pre-update backup of ${instanceId} needs method 'hook' in the current compose while the instance runs (updateApp takes a stop-mode backup inside its Snapshot stop)`)
         }
         if ((backupExcludes.length || hookExcludes.length) && !skipBorg()) {
             const helper = await helperAtLeast(BACKUP_EXCLUDE_HELPER_MIN, 'backupApp with x-app.backup.exclude')
