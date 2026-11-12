@@ -16,7 +16,7 @@ import {
     EngineLock, FIRSTBOOT_SCRIPT, IMAGE_ENABLED_UNITS, ImageArgs, LOCK_SCHEMA, LockedFile, LockedImage, UsageError,
     imageIdFromManifest, imageTarName, parseDockerPins, readLock, serialiseLock, sha256File, validateLock, verifyRootfsChecks, VERIFY_CHECKS, QEMU_AARCH64_STATIC, rootfsHostProblem,
 } from './engineImage.js'
-import { NpmTool, NPM_TOOL_INSTALL, IMAGE_SPARSE_PATTERNS } from './engineImage.js'
+import { NpmTool, NPM_TOOL_INSTALL, IMAGE_SPARSE_PATTERNS, LOGIN_SSHD_ASSET, LOGIN_SSHD_DROPIN, OPERATOR_KEYS_ASSET, OPERATOR_KEYS_FILE } from './engineImage.js'
 import { Installers, Runner, realRunner, runRootfsBuild } from './engineRootfs.js'
 
 export const STORE_IDENTITY_DIR = 'store-identity'
@@ -32,6 +32,8 @@ export const LOCKED_FILE_SPECS: { asset: string, path: string, mode: string }[] 
     { asset: 'idea-dhcp-vendor-class', path: '/usr/local/sbin/idea-dhcp-vendor-class', mode: '0755' },
     { asset: 'idea-avahi-lan-only', path: '/usr/local/sbin/idea-avahi-lan-only', mode: '0755' },
     { asset: '10-idea-peer.conf', path: '/etc/ssh/sshd_config.d/10-idea-peer.conf', mode: '0644' },
+    { asset: LOGIN_SSHD_ASSET, path: LOGIN_SSHD_DROPIN, mode: '0644' },
+    { asset: OPERATOR_KEYS_ASSET, path: OPERATOR_KEYS_FILE, mode: '0644' },
     { asset: '10-engine.sudoers', path: '/etc/sudoers.d/10-engine', mode: '0440' },
     { asset: '11-engine-files.sudoers', path: '/etc/sudoers.d/11-engine-files', mode: '0440' },
     { asset: 'idea-engine-firstboot', path: FIRSTBOOT_SCRIPT, mode: '0755' },

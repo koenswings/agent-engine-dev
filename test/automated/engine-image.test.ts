@@ -11,9 +11,11 @@ import {
     parseImageArgs, UsageError, validateLock, serialiseLock, writeLock, readLock, LOCK_SCHEMA, EngineLock,
     sanitiseRootfs, verifyRootfs, IDENTITY_PATHS, GENERIC_HOSTNAME, IMAGE_ENABLED_UNITS, PM2_UNIT, SSH_REGEN_UNIT, SSH_HOSTKEYS_UNIT,
     pm2UnitText, sshHostKeysUnitText, sshHostKeyUnitIsUnconditional, DEFAULT_CONSOLE_PATH, preloadManifest, imageIdFromManifest, imageTarName, readDpkgStatus, unitEnabled, unitLinks, unitInstallTargets, verifyRootfsChecks, VERIFY_CHECKS, IMAGE_SPARSE_PATTERNS, filesWithAuthKeyShape, PRELOAD_DOCKER_DIR, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH, rootfsHostProblem,
+    OPERATOR_KEYS_DIR, OPERATOR_KEYS_FILE, OPERATOR_KEYS_ASSET, LOGIN_SSHD_DROPIN, LOGIN_SSHD_ASSET, PEER_SSHD_DROPIN_PATH, REQUIRED_OPERATOR_KEY_FPS,
+    publicKeyFingerprint, operatorKeysProblems, sshdEffectiveConfig,
 } from '../../src/install/engineImage.js'
 import { rootfsSteps, runRootfsBuild, engineCloneCommand, consoleCloneCommand, Runner, Installers, SHIMS, quoteTemplate } from '../../src/install/engineRootfs.js'
-import { pinNpmTools, writeReport } from '../../src/install/engineImageCli.js'
+import { pinNpmTools, writeReport, LOCKED_FILE_SPECS } from '../../src/install/engineImageCli.js'
 import { diskIdWithoutHardware, hasDiskId, ensureSystemMeta } from '../../src/data/Meta.js'
 
 const ENGINE = '/home/pi/idea/agents/agent-engine-dev'
@@ -133,6 +135,19 @@ const goodRootfs = async (root: string) => {
     await fs.writeFile(R('etc/machine-id'), ''); await fs.writeFile(R('etc/hostname'), GENERIC_HOSTNAME + '\n')
     await fs.writeFile(R('etc/hosts'), '127.0.0.1\tlocalhost\n127.0.1.1\traspberrypi\n')
     await fs.ensureDir(R('etc/idea')); await fs.writeFile(R(IMAGE_LOCK_PATH.slice(1)), serialiseLock(lock())); await fs.writeFile(R(IMAGE_VERSION_PATH.slice(1)), '1.0\n')
+    await addSshLogin(root)
+}
+/** The repo's sshd assets as the build installs them (idea#453): Debian sshd_config, login + peer drop-ins, operator keys. */
+const ASSETS = path.resolve('script/build_image_assets') // cwd = repo root (vitest and the dist-test gate)
+const DEBIAN_SSHD_CONFIG = 'Include /etc/ssh/sshd_config.d/*.conf\n#PasswordAuthentication yes\nKbdInteractiveAuthentication no\nUsePAM yes\nSubsystem sftp /usr/lib/openssh/sftp-server\n'
+const addSshLogin = async (root: string) => {
+    const R = (p: string) => path.join(root, p)
+    await fs.ensureDir(R('etc/ssh/sshd_config.d'))
+    await fs.writeFile(R('etc/ssh/sshd_config'), DEBIAN_SSHD_CONFIG)
+    await fs.copy(path.join(ASSETS, LOGIN_SSHD_ASSET), R(LOGIN_SSHD_DROPIN.slice(1)))
+    await fs.copy(path.join(ASSETS, '10-idea-peer.conf'), R(PEER_SSHD_DROPIN_PATH.slice(1)))
+    await fs.ensureDir(R(OPERATOR_KEYS_DIR.slice(1))); await fs.chmod(R(OPERATOR_KEYS_DIR.slice(1)), 0o755)
+    await fs.copy(path.join(ASSETS, OPERATOR_KEYS_ASSET), R(OPERATOR_KEYS_FILE.slice(1))); await fs.chmod(R(OPERATOR_KEYS_FILE.slice(1)), 0o644)
 }
 const addIdentity = async (root: string) => {
     const R = (p: string) => path.join(root, p)
@@ -145,6 +160,10 @@ const addIdentity = async (root: string) => {
     await fs.ensureDir(R('home/pi/.pm2')); await fs.writeFile(R('home/pi/.pm2/dump.pm2'), '[]')
     await fs.ensureDir(R(`${ENGINE}/store-data`)); await fs.writeFile(R(`${ENGINE}/store-identity/extra-store.txt`), 'x')
     await fs.ensureDir(R('root/.idea-build/shims')); await fs.ensureDir(R('usr/sbin')); await fs.writeFile(R('usr/sbin/policy-rc.d'), 'exit 101')
+    // login keys a build host or a used Pi would leave behind (idea#453: sanitise strips them, not the operator list)
+    await fs.ensureDir(R('etc/ssh/idea_authorized_keys')); await fs.writeFile(R('etc/ssh/idea_authorized_keys/pi'), 'restrict,command="/usr/local/sbin/idea-peer-gate" ssh-ed25519 AAAA peer\n')
+    await fs.ensureDir(R('home/pi/.ssh'))
+    for (const n of ['id_ed25519', 'id_ed25519.pub', 'authorized_keys']) await fs.writeFile(R(`home/pi/.ssh/${n}`), 'x\n')
 }
 
 describe('sanitise + verify', () => {
@@ -157,7 +176,8 @@ describe('sanitise + verify', () => {
     it('verify fails on every kind of identity, sanitise removes it, then verify passes', async () => {
         await addIdentity(root)
         const p = await verifyRootfs(ctx())
-        for (const s of ['/META.yaml', 'ssh_host_ed25519_key', 'tailscaled.state', 'debug-authkey', 'machine-id is not empty', 'hostname', 'dump.pm2', 'store-data', 'extra-store.txt', 'policy-rc.d', '.idea-build'])
+        for (const s of ['/META.yaml', 'ssh_host_ed25519_key', 'tailscaled.state', 'debug-authkey', 'machine-id is not empty', 'hostname', 'dump.pm2', 'store-data', 'extra-store.txt', 'policy-rc.d', '.idea-build',
+            '/etc/ssh/idea_authorized_keys/pi', '/home/pi/.ssh/id_ed25519', '/home/pi/.ssh/id_ed25519.pub', '/home/pi/.ssh/authorized_keys'])
             expect(p.join('\n')).toContain(s)
         const done = await sanitiseRootfs({ root, enginePath: ENGINE, trackedStoreIdentity: Object.keys(STORE) })
         expect(done.length).toBeGreaterThan(5)
@@ -165,6 +185,9 @@ describe('sanitise + verify', () => {
         expect(await fs.readFile(path.join(root, 'etc/machine-id'), 'utf8')).toBe('')
         expect(await fs.readlink(path.join(root, 'var/lib/dbus/machine-id'))).toBe('/etc/machine-id')
         expect(await sanitiseRootfs({ root, enginePath: ENGINE, trackedStoreIdentity: Object.keys(STORE) })).toEqual([]) // idempotent
+        // idea#453: the baked operator list survives sanitise; per-device login keys do not
+        expect(await fs.readFile(path.join(root, OPERATOR_KEYS_FILE.slice(1)), 'utf8')).toBe(await fs.readFile(path.join(ASSETS, OPERATOR_KEYS_ASSET), 'utf8'))
+        for (const n of ['etc/ssh/idea_authorized_keys/pi', 'home/pi/.ssh/id_ed25519', 'home/pi/.ssh/id_ed25519.pub', 'home/pi/.ssh/authorized_keys']) expect(await fs.pathExists(path.join(root, n))).toBe(false)
     })
     it('sanitise never touches store-template.json; verify fails if it changed', async () => {
         const f = path.join(root, ENGINE, 'store-identity/store-template.json')
@@ -188,6 +211,151 @@ describe('sanitise + verify', () => {
         const p = (await verifyRootfs({ ...ctx(), lock: l })).join('\n')
         for (const s of ['not detached', 'dist/src/index.js missing', 'User=pi', 'pm2-root', SSH_REGEN_UNIT, 'content differs', 'mode 0755', 'preload nginx', 'images.lock missing'])
             expect(p).toContain(s)
+    })
+})
+
+const ATLAS_LINE = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP5pJ426w/HVTUBn4wIfxv4XGnRjoQnihRAavat+ww/p atlas-box@grok-bot'
+const KOEN_LINE = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMlIyR5gN9KVEOeQl4cAsJOho/2ZprcyXhxTof8BKBQ2 koenswings@Macbook-Air-15.local'
+const WALKER_LINE = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIIyC4cm+Pt+aOqYtDpgwBZ30O5LIUlbvZfshpa/WoE4 walker@idea02'
+const KOEN_FP = 'SHA256:yPqCMHCaXih7uMHxpXd469dAmgkDChOntKkQQVMF90I'
+const ATLAS_FP = 'SHA256:L+pEPj+XrDyBzbKiA9CdsXK9cTuos9EHUSTWKUDfNkg'
+const REQUIRED_LINES = `${KOEN_LINE}\n${ATLAS_LINE}\n`
+const OTHER_LINE = `ssh-ed25519 ${Buffer.concat([Buffer.from([0, 0, 0, 11]), Buffer.from('ssh-ed25519'), Buffer.from([0, 0, 0, 32]), Buffer.alloc(32, 7)]).toString('base64')} other@x`
+
+describe('operator SSH login (idea#453, option B)', () => {
+    let root: string
+    beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'rootfs-')); await goodRootfs(root) })
+    afterEach(async () => { await fs.remove(root) })
+    const R = (p: string) => path.join(root, p)
+    const ctx = (over: object = {}) => ({ root, enginePath: ENGINE, lock: lock(), storeIdentity: storeShas, ...over })
+    const problemsOf = async (name: string, over: object = {}) => (await verifyRootfsChecks(ctx(over))).find(x => x.name === name)!.problems.join('\n')
+
+    it('the committed list is public keys only: Koen, Atlas box, idea02 walker (in that order); Koen + Atlas required', async () => {
+        const text = await fs.readFile(path.join(ASSETS, OPERATOR_KEYS_ASSET), 'utf8')
+        expect(text).not.toMatch(/PRIVATE KEY/)
+        const keys = text.split('\n').filter(l => l.trim() && !l.startsWith('#'))
+        expect(keys).toEqual([KOEN_LINE, ATLAS_LINE, WALKER_LINE])
+        expect(keys.map(publicKeyFingerprint)).toEqual([KOEN_FP, ATLAS_FP, 'SHA256:d0DTf5fVFugD9vBG5DyZxSd+6YQy91Sv3/TLfavbcig'])
+        expect([...REQUIRED_OPERATOR_KEY_FPS]).toEqual([KOEN_FP, ATLAS_FP])
+        expect(operatorKeysProblems(text)).toEqual([])
+        // the walker key is allowed, not required
+        expect(operatorKeysProblems(REQUIRED_LINES)).toEqual([])
+    })
+    it('fingerprints like ssh-keygen -lf; options, junk and a type/blob mismatch are not plain keys', () => {
+        expect(publicKeyFingerprint(ATLAS_LINE)).toBe(ATLAS_FP)
+        expect(publicKeyFingerprint(KOEN_LINE)).toBe(KOEN_FP)
+        expect(publicKeyFingerprint(`restrict ${ATLAS_LINE}`)).toBeUndefined()
+        expect(publicKeyFingerprint(ATLAS_LINE.replace('ssh-ed25519', 'ssh-rsa'))).toBeUndefined()
+        expect(publicKeyFingerprint('ssh-ed25519 not*base64')).toBeUndefined()
+        expect(operatorKeysProblems(OTHER_LINE).join()).toContain('lacks the required operator key')
+        expect(operatorKeysProblems('# only a comment\n').join()).toContain('has no operator key')
+        expect(operatorKeysProblems(`${ATLAS_LINE}\n`).join()).toContain(`lacks the required operator key ${KOEN_FP}`)
+        expect(operatorKeysProblems(`${KOEN_LINE}\n${WALKER_LINE}\n`).join()).toContain(`lacks the required operator key ${ATLAS_FP}`)
+        expect(operatorKeysProblems(`${REQUIRED_LINES}command="x" ${OTHER_LINE}`).join()).toContain('line 3 is not a plain public key')
+        expect(operatorKeysProblems(`${REQUIRED_LINES}-----BEGIN OPENSSH PRIVATE KEY-----`).join()).toContain('private key material')
+    })
+    it('several operator keys: all required ones must be present, each key once, comments and blank lines allowed', async () => {
+        const fpOther = publicKeyFingerprint(OTHER_LINE)!
+        const two = `# fleet\n${ATLAS_LINE}\n\n${OTHER_LINE}\n`
+        expect(operatorKeysProblems(two, [ATLAS_FP, fpOther])).toEqual([])
+        expect(operatorKeysProblems(`${ATLAS_LINE}\n`, [ATLAS_FP, fpOther]).join()).toContain(`lacks the required operator key ${fpOther}`)
+        expect(operatorKeysProblems(`${OTHER_LINE}\n`, [ATLAS_FP, fpOther]).join()).toContain('lacks the required operator key SHA256:L+pE')
+        expect(operatorKeysProblems(`${ATLAS_LINE}\n${ATLAS_LINE.replace('atlas-box@grok-bot', 'copy')}\n`).join()).toContain('line 2 repeats key')
+        // the installed file may carry more keys than the required set
+        await fs.writeFile(R(OPERATOR_KEYS_FILE.slice(1)), `${REQUIRED_LINES}${WALKER_LINE}\n${OTHER_LINE}\n`)
+        expect(await problemsOf('operator-keys')).toBe('')
+    })
+    it('every required fingerprint is in the committed list', async () => {
+        const text = await fs.readFile(path.join(ASSETS, OPERATOR_KEYS_ASSET), 'utf8')
+        const fps = text.split('\n').map(publicKeyFingerprint).filter(Boolean)
+        for (const fp of REQUIRED_OPERATOR_KEY_FPS) expect(fps).toContain(fp)
+    })
+    it('a clean rootfs passes operator-keys and ssh-no-password', async () => {
+        expect(await problemsOf('operator-keys')).toBe('')
+        expect(await problemsOf('ssh-no-password')).toBe('')
+        const e = await sshdEffectiveConfig(root)
+        expect(e.first.get('passwordauthentication')).toEqual({ value: 'no', file: LOGIN_SSHD_DROPIN })
+        expect(e.first.get('authorizedkeysfile')!.file).toBe(PEER_SSHD_DROPIN_PATH)
+    })
+    it('the sshd assets and the operator list are locked files; sanitise never lists the operator keys', () => {
+        expect(LOCKED_FILE_SPECS).toContainEqual({ asset: OPERATOR_KEYS_ASSET, path: OPERATOR_KEYS_FILE, mode: '0644' })
+        expect(LOCKED_FILE_SPECS).toContainEqual({ asset: LOGIN_SSHD_ASSET, path: LOGIN_SSHD_DROPIN, mode: '0644' })
+        expect(IDENTITY_PATHS.some(p => p.includes('idea_operator_keys'))).toBe(false)
+    })
+    it('operator-keys fails when the file is missing, empty, a symlink, the wrong mode, not root (real rootfs) or lacks the Atlas key', async () => {
+        const f = R(OPERATOR_KEYS_FILE.slice(1))
+        await fs.remove(f)
+        expect(await problemsOf('operator-keys')).toContain(`${OPERATOR_KEYS_FILE} missing`)
+        await fs.writeFile(f, ''); await fs.chmod(f, 0o644)
+        expect(await problemsOf('operator-keys')).toContain('has no operator key')
+        await fs.writeFile(f, OTHER_LINE + '\n')
+        expect(await problemsOf('operator-keys')).toContain('lacks the required operator key SHA256:L+pE')
+        await fs.writeFile(f, REQUIRED_LINES); await fs.chmod(f, 0o664)
+        expect(await problemsOf('operator-keys')).toContain('mode 0664, must be 0644')
+        await fs.chmod(f, 0o644); await fs.chmod(R(OPERATOR_KEYS_DIR.slice(1)), 0o775)
+        expect(await problemsOf('operator-keys')).toContain(`${OPERATOR_KEYS_DIR} mode 0775`)
+        await fs.chmod(R(OPERATOR_KEYS_DIR.slice(1)), 0o755)
+        expect(await problemsOf('operator-keys')).toBe('')
+        if (process.getuid?.() !== 0) expect(await problemsOf('operator-keys', { piUid: 1000 })).toContain(`${OPERATOR_KEYS_FILE} must be owned by root:root`)
+        await fs.remove(f); await fs.symlink('/home/pi/keys', f)
+        expect(await problemsOf('operator-keys')).toContain('must be a regular file')
+        await fs.remove(R(OPERATOR_KEYS_DIR.slice(1)))
+        expect(await problemsOf('operator-keys')).toContain(`${OPERATOR_KEYS_DIR} missing`)
+    })
+    it('operator-keys fails when AuthorizedKeysFile lacks the operator, peer or user path, or another file sets it first', async () => {
+        const peer = R(PEER_SSHD_DROPIN_PATH.slice(1))
+        const orig = await fs.readFile(peer, 'utf8')
+        await fs.writeFile(peer, orig.replace(' /etc/ssh/idea_operator_keys/%u', ''))
+        expect(await problemsOf('operator-keys')).toContain('lacks /etc/ssh/idea_operator_keys/%u')
+        await fs.writeFile(peer, orig.replace(' /etc/ssh/idea_authorized_keys/%u', ''))
+        expect(await problemsOf('operator-keys')).toContain('lacks /etc/ssh/idea_authorized_keys/%u')
+        await fs.writeFile(peer, orig.replace('AuthorizedKeysFile .ssh/authorized_keys ', 'AuthorizedKeysFile '))
+        expect(await problemsOf('operator-keys')).toContain('lacks .ssh/authorized_keys')
+        await fs.writeFile(peer, orig)
+        await fs.writeFile(R('etc/ssh/sshd_config.d/05-other.conf'), 'AuthorizedKeysFile .ssh/authorized_keys\n')
+        expect(await problemsOf('operator-keys')).toContain('AuthorizedKeysFile is set first by /etc/ssh/sshd_config.d/05-other.conf')
+        await fs.remove(R('etc/ssh/sshd_config.d/05-other.conf')); await fs.remove(peer)
+        expect(await problemsOf('operator-keys')).toContain(`${PEER_SSHD_DROPIN_PATH} missing`)
+    })
+    it('ssh-no-password fails when the drop-in is missing, says yes, or loses to an earlier file or a Match block', async () => {
+        const login = R(LOGIN_SSHD_DROPIN.slice(1))
+        const orig = await fs.readFile(login, 'utf8')
+        await fs.remove(login)
+        let p = await problemsOf('ssh-no-password')
+        expect(p).toContain(`${LOGIN_SSHD_DROPIN} missing`)
+        expect(p).toContain('PasswordAuthentication is unset (sshd default yes)')
+        await fs.writeFile(login, orig.replace('PasswordAuthentication no', 'PasswordAuthentication yes'))
+        expect(await problemsOf('ssh-no-password')).toContain(`PasswordAuthentication is yes (${LOGIN_SSHD_DROPIN})`)
+        await fs.writeFile(login, orig)
+        await fs.writeFile(R('etc/ssh/sshd_config.d/01-cloud.conf'), 'PasswordAuthentication yes\nChallengeResponseAuthentication yes\n')
+        p = await problemsOf('ssh-no-password')
+        expect(p).toContain('PasswordAuthentication is yes (/etc/ssh/sshd_config.d/01-cloud.conf)')
+        expect(p).toContain('yes (/etc/ssh/sshd_config.d/01-cloud.conf); must be no')
+        await fs.remove(R('etc/ssh/sshd_config.d/01-cloud.conf'))
+        // a value in sshd_config BEFORE the Include wins over every drop-in
+        await fs.writeFile(R('etc/ssh/sshd_config'), 'PasswordAuthentication yes\n' + DEBIAN_SSHD_CONFIG)
+        expect(await problemsOf('ssh-no-password')).toContain('PasswordAuthentication is yes (/etc/ssh/sshd_config)')
+        await fs.writeFile(R('etc/ssh/sshd_config'), DEBIAN_SSHD_CONFIG + 'Match User pi\n  PasswordAuthentication yes\n')
+        expect(await problemsOf('ssh-no-password')).toContain('a Match block sets passwordauthentication yes')
+        await fs.writeFile(R('etc/ssh/sshd_config'), DEBIAN_SSHD_CONFIG)
+        expect(await problemsOf('ssh-no-password')).toBe('')
+        await fs.remove(R('etc/ssh/sshd_config'))
+        expect(await problemsOf('ssh-no-password')).toContain('/etc/ssh/sshd_config missing')
+    })
+    it('the build installs the list and the drop-in root-owned after peer access, then checks sshd -t', async () => {
+        const log: string[] = []
+        const r: Runner = { host: async c => { log.push(`host: ${c}`); return { stdout: '' } }, chroot: async c => { log.push(`chroot: ${c}`); return { stdout: '' } } }
+        const inst = new Proxy({}, { get: (_t, k) => async (exec: any) => { await exec`echo ${String(k)}` } }) as Installers
+        const steps = rootfsSteps({ rootfs: root, lock: lock(), cache: '/c', repo: '/r', enginePath: ENGINE, language: 'en_GB.UTF-8', keyboard: 'gb', timezone: 'Europe/Brussels', trackedStoreIdentity: [], storeIdentity: storeShas, boot: R('boot/firmware') } as any, r, inst)
+        const i = steps.findIndex(s => /idea#453/.test(s.name))
+        expect(i).toBeGreaterThan(steps.findIndex(s => /peer access/.test(s.name)))
+        await steps[i].run()
+        expect(log).toEqual([
+            `chroot: install -d -o root -g root -m 0755 '${OPERATOR_KEYS_DIR}'`,
+            `chroot: install -o root -g root -m 0644 '${ENGINE}/script/build_image_assets/${OPERATOR_KEYS_ASSET}' '${OPERATOR_KEYS_FILE}'`,
+            `chroot: install -o root -g root -m 0644 '${ENGINE}/script/build_image_assets/${LOGIN_SSHD_ASSET}' '${LOGIN_SSHD_DROPIN}'`,
+            'chroot: sshd -t',
+        ])
     })
 })
 
