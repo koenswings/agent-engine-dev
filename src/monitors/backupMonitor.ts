@@ -6,7 +6,9 @@
  * Key design points:
  *  - BorgBackup for deduplicating, atomic, resumable archives
  *  - activeBackups Set prevents double-backup on reboot race
- *  - Lock file (.backup-in-progress) enables boot-resume after interrupted backup
+ *  - Lock file (.backup-in-progress) marks an interrupted backup; idea#446 records
+ *    it on Disk.backupStaleLocks at dock/boot and does not auto-retry (clearBackupLock
+ *    then an explicit backupApp resumes it)
  *  - skipBorg() (settings.skipBorg / IDEA_SKIP_BORG, default testMode): skips borg commands but
  *    exercises all other logic (store updates, YAML, lock files)
  *  - Borg runs as root through the app-data helper (idea#168):
@@ -58,7 +60,58 @@ interface BackupYaml {
 }
 
 const BACKUP_YAML = 'BACKUP.yaml'
-const LOCK_FILE = '.backup-in-progress'
+export const BACKUP_IN_PROGRESS = '.backup-in-progress'
+const LOCK_FILE = BACKUP_IN_PROGRESS
+
+/** True while backupInstance holds the in-memory mutex for this instance. */
+export const isBackupActive = (instanceId: string): boolean => activeBackups.has(instanceId as InstanceID)
+
+const readLockStartedAt = async (lockPath: string): Promise<Timestamp | null> => {
+    try {
+        const raw = JSON.parse(await fs.readFile(lockPath, 'utf-8'))
+        const n = Number(raw?.startedAt)
+        return Number.isFinite(n) ? n as Timestamp : null
+    } catch {
+        return null
+    }
+}
+
+/**
+ * Scan backups/ for leftover .backup-in-progress files and record them on
+ * Disk.backupStaleLocks. Does not start a backup (idea#446).
+ */
+export const recordBackupStaleLocks = async (storeHandle: DocHandle<Store>, backupDisk: Disk): Promise<void> => {
+    if (!backupDisk.device) return
+    const backupsBase = `${disksRoot()}/${backupDisk.device}/backups`
+    const found: { instanceId: InstanceID; startedAt: Timestamp | null; detectedAt: Timestamp }[] = []
+    const detectedAt = Date.now() as Timestamp
+    if (await fs.pathExists(backupsBase)) {
+        for (const entry of await fs.readdir(backupsBase)) {
+            const lockPath = `${backupsBase}/${entry}/${LOCK_FILE}`
+            if (await fs.pathExists(lockPath)) {
+                found.push({ instanceId: entry as InstanceID, startedAt: await readLockStartedAt(lockPath), detectedAt })
+                log(`Stale lock file found for instance ${entry} on Backup Disk ${backupDisk.id} — recorded, not retried (idea#446)`)
+            }
+        }
+    }
+    storeHandle.change(doc => {
+        const d = doc.diskDB[backupDisk.id]
+        if (d) d.backupStaleLocks = found
+    })
+}
+
+/** Drop one instance's entry from Disk.backupStaleLocks after clearBackupLock. Never assign undefined. */
+export const clearBackupStaleLock = (storeHandle: DocHandle<Store>, diskId: string, instanceId: string): void => {
+    storeHandle.change(doc => {
+        const d = doc.diskDB[diskId]
+        if (!d) return
+        d.backupStaleLocks = (d.backupStaleLocks ?? []).filter(l => String(l.instanceId) !== String(instanceId))
+    })
+}
+
+export const hasBackupStaleLock = (disk: Disk, instanceId: string): boolean =>
+    (disk.backupStaleLocks ?? []).some(l => String(l.instanceId) === String(instanceId))
+
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -497,8 +550,8 @@ const triggerBackup = async (
 /**
  * Called by processDisk when a Backup Disk is detected.
  * - Reads BACKUP.yaml and sets backupConfig in the store
- * - Scans for stale lock files and re-queues interrupted backups
- * - Triggers backupInstance for immediate mode
+ * - Scans for stale lock files and records them on Disk.backupStaleLocks (no auto-retry, idea#446)
+ * - Triggers backupInstance for immediate mode (linked instances without a stale lock)
  */
 export const processBackupDisk = async (
     storeHandle: DocHandle<Store>,
@@ -525,33 +578,18 @@ export const processBackupDisk = async (
     // Phase 2: index any app bundles on this disk into appDB for installApp / Console
     await indexBackupDiskApps(storeHandle, backupDisk)
 
-    // Scan for stale lock files (interrupted backups from before a reboot)
-    const backupsBase = `${disksRoot()}/${backupDevice}/backups`
-    if (await fs.pathExists(backupsBase)) {
-        const entries = await fs.readdir(backupsBase)
-        for (const entry of entries) {
-            const lockPath = `${backupsBase}/${entry}/${LOCK_FILE}`
-            if (await fs.pathExists(lockPath)) {
-                const staleInstanceId = entry as InstanceID
-                log(`Stale lock file found for instance ${staleInstanceId} — re-triggering backup`)
-                const store = storeHandle.doc()
-                const instance = getInstance(store, staleInstanceId)
-                const appDiskDocked = instance?.storedOn
-                    ? store.diskDB[instance.storedOn]?.device != null
-                    : false
-                if (appDiskDocked) {
-                    await triggerBackup(storeHandle, staleInstanceId, backupDisk, 'backup-stale-lock')
-                } else {
-                    log(`App Disk for ${staleInstanceId} not yet docked — stale lock will be handled when App Disk docks`)
-                }
-            }
-        }
-    }
+    // Scan for stale lock files (interrupted backups). Record only; do not re-run backupApp (idea#446).
+    await recordBackupStaleLocks(storeHandle, backupDisk)
 
-    // Trigger immediate backups for all linked instances whose App Disk is docked
+    // Trigger immediate backups for linked instances whose App Disk is docked and that have no stale lock
     if (mode === 'immediate') {
         const store = storeHandle.doc()
+        const staleIds = new Set((store.diskDB[backupDisk.id]?.backupStaleLocks ?? []).map(l => String(l.instanceId)))
         for (const instanceId of links) {
+            if (staleIds.has(String(instanceId))) {
+                log(`Instance ${instanceId}: stale lock present — not auto-backing up; use clearBackupLock then backupApp (idea#446)`)
+                continue
+            }
             const instance = getInstance(store, instanceId)
             if (!instance?.storedOn) continue
             const appDisk = store.diskDB[instance.storedOn]
@@ -588,31 +626,21 @@ export const checkPendingBackups = async (
         const instancesOnAppDisk = Object.values(store.instanceDB)
             .filter(inst => String(inst.storedOn) === String(appDisk.id))
 
+        const staleIds = new Set((candidate.backupStaleLocks ?? []).map(l => String(l.instanceId)))
         for (const instance of instancesOnAppDisk) {
-            if (candidate.backupConfig.links.includes(instance.id)) {
-                log(`checkPendingBackups: triggering backup for instance ${instance.id}`)
-                await triggerBackup(storeHandle, instance.id, candidate as Disk, 'backup-app-docked')
+            if (!candidate.backupConfig.links.includes(instance.id)) continue
+            const lockPath = candidate.device
+                ? `${disksRoot()}/${candidate.device}/backups/${instance.id}/${LOCK_FILE}`
+                : ''
+            if (staleIds.has(String(instance.id)) || (lockPath && await fs.pathExists(lockPath))) {
+                log(`checkPendingBackups: stale lock for ${instance.id} — not auto-backing up; use clearBackupLock then backupApp (idea#446)`)
+                continue
             }
+            log(`checkPendingBackups: triggering backup for instance ${instance.id}`)
+            await triggerBackup(storeHandle, instance.id, candidate as Disk, 'backup-app-docked')
         }
-
-        // Also check for stale locks for instances on this App Disk
-        if (candidate.device) {
-            const backupsBase = `${disksRoot()}/${candidate.device}/backups`
-            if (await fs.pathExists(backupsBase)) {
-                const entries = await fs.readdir(backupsBase)
-                for (const entry of entries) {
-                    const lockPath = `${backupsBase}/${entry}/${LOCK_FILE}`
-                    if (await fs.pathExists(lockPath)) {
-                        const staleId = entry as InstanceID
-                        const staleInstance = getInstance(store, staleId)
-                        if (String(staleInstance?.storedOn) === String(appDisk.id)) {
-                            log(`checkPendingBackups: stale lock for ${staleId} — re-triggering backup`)
-                            await triggerBackup(storeHandle, staleId, candidate as Disk, 'backup-stale-lock')
-                        }
-                    }
-                }
-            }
-        }
+        // Stale .backup-in-progress locks are recorded on Disk.backupStaleLocks at
+        // Backup Disk dock (processBackupDisk) and are not retried here (idea#446).
     }
 }
 

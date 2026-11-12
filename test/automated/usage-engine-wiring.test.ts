@@ -14,7 +14,7 @@ const read = (rel: string) => fs.readFileSync(path.join(repo, rel), 'utf8')
 describe('usageSummaries capability', () => {
     it('is on ENGINE_CAPABILITIES (boolean flag, advertised even when monitoring is off)', () => {
         expect(ENGINE_CAPABILITIES).toContain('usageSummaries')
-        expect(ENGINE_CAPABILITIES[ENGINE_CAPABILITIES.length - 1]).toBe('usageSummaries')
+        expect(ENGINE_CAPABILITIES).toContain('backupVerify')
     })
 })
 

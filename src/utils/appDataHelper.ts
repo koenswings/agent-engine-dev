@@ -70,11 +70,17 @@ const checkArchive = (archive: string): string => {
     if (!ARCHIVE_TOKEN.test(archive)) throw new Error(`'${archive}' is not a backup archive name the app-data helper accepts`)
     return archive
 }
-const checkStamp = (stamp: string): string => {
+export const checkStamp = (stamp: string): string => {
     if (stamp.startsWith('-') || stamp.includes('/') || stamp.includes('..') || !STAMP_TOKEN.test(stamp)) {
         throw new Error(`'${stamp}' is not a UTC stamp the app-data helper accepts`)
     }
     return stamp
+}
+
+/** Compact UTC stamp for .idea-verify/<id>-<stamp>/ (idea#446). Matches helper RE_STAMP. */
+export const verifyStampNow = (at: Date = new Date()): string => {
+    const s = at.toISOString().replace(/[-:]/g, '').replace('.', '')
+    return checkStamp(s.endsWith('Z') ? s : `${s}Z`)
 }
 
 // ── Helper arguments (subcommand first) ──────────────────────────────────────
