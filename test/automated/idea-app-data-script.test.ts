@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { spawn } from 'child_process'
+import { spawn, spawnSync } from 'child_process'
 import { fs, path } from 'zx'
 import { makeAppDataSandbox, AppDataSandbox, HELPER_SOURCE } from '../harness/appDataSandbox.js'
 import { APP_DATA_HELPER, APP_DATA_HELPER_VERSION, borgListArgs, borgExtractVerifyArgs, quarantineBackupsArgs, verifyStampNow, checkStamp } from '../../src/utils/appDataHelper.js'
@@ -1059,6 +1059,11 @@ describe('idea-app-data: borg-list / borg-delete / borg-compact (idea#401, helpe
         const dest = path.join(bk, '.idea-verify', `inst1-${stamp}`)
         const r = await sb.run(['borg-extract-verify', 'sdc1', 'inst1', A[0], stamp], { FAKE_BORG_EXTRACT: 'instances/inst1' })
         expect(r.exitCode, r.stderr).toBe(0)
+        const du = spawnSync('du', ['-sb', '-x', '--', dest], { encoding: 'utf8' })
+        expect(du.status, du.stderr).toBe(0)
+        const duBytes = du.stdout.trim().split(/\s+/)[0]
+        expect(r.stdout.trim()).toBe(`scratchBytes=${duBytes}`)
+        expect(Number(duBytes)).toBeGreaterThan(0)
         expect(await fs.pathExists(path.join(dest, 'instances', 'inst1', 'data.txt'))).toBe(true)
         expect(await fs.readFile(path.join(live, 'keep.txt'), 'utf8')).toBe('live')
         expect(await fs.pathExists(path.join(live, 'data.txt'))).toBe(false)
@@ -1080,6 +1085,7 @@ describe('idea-app-data: borg-list / borg-delete / borg-compact (idea#401, helpe
         const dest = path.join(bk, '.idea-verify', `inst1-${stamp}`)
         const r = await sb.run(['borg-extract-verify', 'sdc1', 'inst1', A[0], stamp], { FAKE_BORG_EXTRACT: 'instances/inst1', FAKE_BORG_EXIT: '1' })
         expect(r.exitCode).toBe(1)
+        expect(r.stdout).not.toMatch(/scratchBytes=/)
         expect(await fs.pathExists(dest)).toBe(true)
         expect(await fs.pathExists(path.join(dest, 'instances', 'inst1', 'data.txt'))).toBe(true)
     })
@@ -1176,7 +1182,11 @@ describe('Engine argv builders agree with helper v9 (idea#446)', () => {
         expect(path.basename(dest)).toBe(`inst1-${stamp}`)
         const r = await sb.run(borgExtractVerifyArgs('sdc1', 'inst1', A[0], stamp), { FAKE_BORG_EXTRACT: 'instances/inst1' })
         expect(r.exitCode, r.stderr).toBe(0)
-        expect(r.stdout.trim()).toBe('') // helper does not print the dest path
+        const du = spawnSync('du', ['-sb', '-x', '--', helperDest], { encoding: 'utf8' })
+        expect(du.status, du.stderr).toBe(0)
+        const duBytes = du.stdout.trim().split(/\s+/)[0]
+        expect(r.stdout.trim()).toBe(`scratchBytes=${duBytes}`)
+        expect(Number(duBytes)).toBeGreaterThan(0)
         expect(await fs.pathExists(path.join(helperDest, 'instances', 'inst1', 'data.txt'))).toBe(true)
         expect(await fs.readFile(path.join(live, 'keep.txt'), 'utf8')).toBe('live')
         expect(await fs.pathExists(path.join(live, 'data.txt'))).toBe(false)
