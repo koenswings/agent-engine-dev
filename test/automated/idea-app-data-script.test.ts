@@ -1106,7 +1106,7 @@ describe('Engine argv builders agree with helper v9 (idea#446)', () => {
         await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
     })
 
-    it('borgListArgs inventory: helper prints borg info --json and the Engine parses sizes / newest', async () => {
+    it('borgListArgs inventory: helper prints borg info --json --glob-archives * and the Engine parses sizes / newest', async () => {
         const payload = JSON.stringify({
             archives: [
                 { name: A[0], start: '2026-01-01T00:00:00.000000', stats: { original_size: 100, compressed_size: 40 } },
@@ -1121,7 +1121,7 @@ describe('Engine argv builders agree with helper v9 (idea#446)', () => {
         expect(archives[2].originalSize).toBe(200)
         expect(newestArchive(archives).name).toBe(A[2])
         const [info] = await sb.calls('borg')
-        expect(info.argv).toEqual(['info', '--json', '--', path.join(bk, 'backups', 'inst1')])
+        expect(info.argv).toEqual(['info', '--json', '--glob-archives', '*', '--', path.join(bk, 'backups', 'inst1')])
         expect(info.argv).not.toContain('--last')
     })
 

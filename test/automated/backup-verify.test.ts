@@ -34,7 +34,7 @@ const FAKE_SUDO = `#!/usr/bin/env bash
 shift 2
 echo "$*" >> "$FAKE_BORG_LOG"
 case "$1" in
-  version) echo "idea-app-data \${FAKE_HELPER_VERSION:-9}" ;;
+  version) echo "idea-app-data \${FAKE_HELPER_VERSION:-10}" ;;
   borg-list)
     bdev="$2"; id="$3"; archive="$4"
     if [ -n "\$archive" ]; then
@@ -138,9 +138,9 @@ describe('parse helpers (idea#446)', () => {
         expect(parseBackupExcludeList({ backup: { exclude: ['keys'] } })).toEqual(['data/keys'])
     })
 
-    it('registers the four commands and the backupVerify capability; Engine speaks helper v9', () => {
-        expect(BACKUP_VERIFY_HELPER_MIN).toBe(9)
-        expect(APP_DATA_HELPER_VERSION).toBe('9')
+    it('registers the four commands and the backupVerify capability; Engine speaks helper v10 (idea#450)', () => {
+        expect(BACKUP_VERIFY_HELPER_MIN).toBe(10)
+        expect(APP_DATA_HELPER_VERSION).toBe('10')
         expect(ENGINE_CAPABILITIES).toContain('backupVerify')
         for (const name of ['listBackup', 'verifyBackup', 'clearBackupLock', 'removeBackupRole']) {
             expect(commands.find(c => c.name === name), name).toBeTruthy()
@@ -213,7 +213,7 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
         await fs.writeFile(path.join(binDir, 'sudo'), FAKE_SUDO, { mode: 0o755 })
         process.env.PATH = `${binDir}:${saved.path}`
         process.env.FAKE_BORG_LOG = borgLog
-        process.env.FAKE_HELPER_VERSION = '9'
+        process.env.FAKE_HELPER_VERSION = '10'
         process.env.IDEA_DISKS_ROOT = DISKS_ROOT
         config.settings.testMode = true
         config.settings.skipBorg = false
@@ -273,9 +273,9 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
         await expect(listBackup(h, INST, 'ver-bd')).rejects.toThrow(/skipBorg/)
         config.settings.skipBorg = false
 
-        process.env.FAKE_HELPER_VERSION = '8'
+        process.env.FAKE_HELPER_VERSION = '9'   // idea#450: v9's borg-list is broken on real borg
         await expect(listBackup(h, INST, 'ver-bd')).rejects.toThrow(/HELPER_OUTDATED/)
-        process.env.FAKE_HELPER_VERSION = '9'
+        process.env.FAKE_HELPER_VERSION = '10'
 
         h.change(doc => { doc.diskDB['sys' as DiskID] = makeDisk('sys', backupDevice, ['system', 'backup']) as any })
         await expect(listBackup(h, INST, 'sys')).rejects.toThrow(/system disk/)
@@ -393,7 +393,7 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
 shift 2
 echo "$*" >> "$FAKE_BORG_LOG"
 case "$1" in
-  version) echo "idea-app-data \${FAKE_HELPER_VERSION:-9}" ;;
+  version) echo "idea-app-data \${FAKE_HELPER_VERSION:-10}" ;;
   borg-init) mkdir -p "$IDEA_DISKS_ROOT/$2/backups/$3" && echo '[repository]' > "$IDEA_DISKS_ROOT/$2/backups/$3/config" ;;
   borg-create)
     while [ -f "$FAKE_BORG_HOLD" ]; do sleep 0.05; done
