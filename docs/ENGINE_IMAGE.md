@@ -31,7 +31,7 @@ No SSH, nothing started, no device identity. Inside `chroot <MNT>`:
    `hostnamectl` refused, `timedatectl set-timezone` as a symlink, `pm2` and `docker` refuse anything but `--version`),
    temporary SSH host keys so `sshd -t` can check the peer drop-in, and `/run/sshd` (sshd's
    privilege-separation directory; idea `build.sh` bind-mounts the host `/run`, which may not have it).
-   `systemctl` in a chroot only enables.
+   `systemctl` in a chroot only enables or masks.
 2. The Engine at the locked commit, as current Engines have it (a git checkout, like provision-fleet.sh and install.sh):
    a SHALLOW clone (`git init` + `git fetch --depth 1 file://<engine-src> <commit>`) into
    `/home/pi/idea/agents/agent-engine-dev`, detached at the commit, origin set to the GitHub URL. `.git` holds that
@@ -60,6 +60,14 @@ No SSH, nothing started, no device identity. Inside `chroot <MNT>`:
    boot, which is what sanitise writes so idea `verify-sanitised.sh` still passes), all enabled with docker,
    avahi-daemon and ssh. An empty `ssh` file is written on the boot partition so `sshswitch.service` will also enable
    ssh (the official Raspberry Pi OS trigger; the unit is already enabled in the image).
+8c. pi login (idea#453 approach B, build 9): `usermod -s /bin/bash pi`, `passwd -l pi`, then
+   `systemctl disable` + `systemctl mask userconfig.service` so the RPi OS first-boot wizard cannot re-lock,
+   rename or prompt, and `/etc/ssh/sshd_config.d/rename_user.conf` is removed. If
+   `/etc/ssh/sshd_config.d/10-idea-login.conf` is not already installed, write `PasswordAuthentication no` and
+   `KbdInteractiveAuthentication no`. Password auth stays off and pi stays password-locked (key-only SSH).
+   Verify's `pi-login` check fails the build unless the shell is `/bin/bash`, the shadow hash is locked
+   (`passwd -S pi` would show L), `userconfig.service` is masked to `/dev/null`, `rename_user.conf` is absent,
+   and the key-only drop-in is present.
 8b. Console UI: a shallow clone of `agent-console-dev` at the lock's `consoleCommit` into
    `/home/pi/idea/agents/agent-console-dev`, then `pnpm install --frozen-lockfile && pnpm build` as pi. Pass
    `--console-repo` (or a sibling checkout / `$IDEA_CONSOLE_REPO`). Verify fails if `dist/index.html` is missing
@@ -75,7 +83,8 @@ No SSH, nothing started, no device identity. Inside `chroot <MNT>`:
    never written), build guards removed.
 10. `/etc/idea/engine.lock`, `/etc/idea/engine-version`, then verify (`verifyRootfs`): any identity, a store-identity
     file that differs from git, a wrong commit, a missing build, pm2 as root, a unit not enabled, a locked file whose
-    content/mode/owner differs, a preload tarball whose sha256 differs: exit 1.
+    content/mode/owner differs, a preload tarball whose sha256 differs, or `pi-login` (pi's shell is not
+    `/bin/bash`, the password is not locked, userconfig is not masked, or password auth is not off): exit 1.
 
 `engine-build.json`: `{engine_commit, engine_version, lock_sha256, verify: {passed, failed}}` (failed = the problems).
 
@@ -85,7 +94,8 @@ No SSH, nothing started, no device identity. Inside `chroot <MNT>`:
 Raspberry Pi OS's `regenerate_ssh_host_keys.service` is still enabled, but on systemd 257 it will *not* run when
 `/etc/machine-id` is an empty file (machine-id(5) first-boot rule 4) — that was the build 6 sshd failure on idea04.
 The bootfs `ssh` trigger is present at flash time; `sshswitch.service` enables ssh if needed and then deletes it.
-systemd writes a machine-id. `idea-engine-firstboot`
+`userconfig.service` is masked, so the first-boot wizard does not run; `ssh pi@…` gets a bash shell, and
+`passwd -S pi` shows L (key-only; password auth is off). systemd writes a machine-id. `idea-engine-firstboot`
 (`script/build_image_assets/idea-engine-firstboot`) loads the preloaded images (sha256 and image id checked), creates
 the docker networks, installs pm2-logrotate from the preloaded tarball and, as pi, starts the Engine with
 `pm2.config.cjs` and `pm2 save`; `pm2-pi.service` resurrects it on later boots. The Engine creates `/META.yaml` itself
