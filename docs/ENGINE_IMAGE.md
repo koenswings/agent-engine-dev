@@ -27,7 +27,7 @@ The Engine side of the idea repo's Engine image builder (`tools/engine-image/bui
 No SSH, nothing started, no device identity. Inside `chroot <MNT>`:
 
 1. Guards: `usr/sbin/policy-rc.d` (exit 101: apt never starts a service), shims first on PATH
-   (`/root/.idea-build/shims`: `sudo` without secure_path, `udevadm`/`systemd-tmpfiles`/`reboot` no-ops,
+   (`/root/.idea-build/shims`: `sudo` without secure_path, `udevadm`/`systemd-tmpfiles`/`sysctl`/`reboot` no-ops,
    `hostnamectl` refused, `timedatectl set-timezone` as a symlink, `pm2` and `docker` refuse anything but `--version`),
    temporary SSH host keys so `sshd -t` can check the peer drop-in, and `/run/sshd` (sshd's
    privilege-separation directory; idea `build.sh` bind-mounts the host `/run`, which may not have it).
@@ -121,6 +121,19 @@ the docker networks, installs pm2-logrotate from the preloaded tarball and, as p
 `pm2.config.cjs` and `pm2 save`; `pm2-pi.service` resurrects it on later boots. The Engine creates `/META.yaml` itself
 at its first start (`ensureSystemMeta`: root drive serial, else a UUID); a `/META.yaml` without a diskId also gets a
 UUID (`diskIdWithoutHardware`), never `ENGINE_undefined`.
+
+## Build 10 (idea#467)
+
+The chroot shims include `sysctl` (no-op, logged) so `installRootHelpers` cannot write through the bind-mounted
+`/proc` to the build-host kernel. Verify's `igmp-sysctl` check requires `/etc/sysctl.d/90-idea-igmp.conf` to exist,
+mode 0644, and set `net.ipv4.igmp_max_memberships=1024`. systemd-sysctl applies the file at first boot.
+
+**engineCommit pin:** left as it is on this branch for now. Steve wants it pinned to main once
+agent-engine-dev#342 (the install-root-helpers / self-check change that writes that conf) merges; #342 is not
+merged yet. After that merge, pin `engineCommit` to that main tip so the baked checkout actually contains
+`script/build_image_assets/90-idea-igmp.conf` and `installUdev` → `installRootHelpers` writes the file into the
+image. Until then, a build of this branch still installs whatever `installRootHelpers` at the current pin does
+(no IGMP conf yet), and verify will fail unless the file is present.
 
 ## Other modes
 

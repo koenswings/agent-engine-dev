@@ -8,7 +8,7 @@
  *  - apt postinst service starts are refused by usr/sbin/policy-rc.d (exit 101)
  *  - systemctl inside a chroot only enables or masks (it ignores start/restart/reload)
  *  - shims in /root/.idea-build/shims (first on PATH) turn udevadm, systemd-tmpfiles,
- *    reboot and hostnamectl into no-ops/refusals and refuse every pm2/docker daemon
+ *    sysctl, reboot and hostnamectl into no-ops/refusals and refuse every pm2/docker daemon
  *    command, so the existing installers in Engine.ts can be reused unchanged
  *  - /run/sshd is created (sshd -t needs the privilege-separation dir; the host /run is bind-mounted)
  *  - SSH host keys are made only so `sshd -t` can check the peer drop-in, then removed
@@ -60,6 +60,8 @@ export const SHIMS: Record<string, string> = {
     'sudo': `#!/bin/bash\nwhile [ $# -gt 0 ]; do case "$1" in -n|-E|-H) shift;; -u) u="$2"; shift 2;; --) shift; break;; *) break;; esac; done\nif [ -n "\${u:-}" ] && [ "$u" != root ]; then exec runuser -u "$u" -- "$@"; fi\nif [ $# -gt 0 ] && [[ "$1" == *=* ]]; then exec env "$@"; fi\nexec "$@"\n`,
     'udevadm': `#!/bin/sh\necho "udevadm $* (skipped: image build)" >> /root/.idea-build/shims.log\nexit 0\n`,
     'systemd-tmpfiles': `#!/bin/sh\necho "systemd-tmpfiles $* (skipped: applied at boot)" >> /root/.idea-build/shims.log\nexit 0\n`,
+    // idea#467: installRootHelpers may still call sysctl -p; /proc is the build host.
+    'sysctl': `#!/bin/sh\necho "sysctl $* (skipped: image build; /etc/sysctl.d is applied at boot)" >> /root/.idea-build/shims.log\nexit 0\n`,
     'reboot': `#!/bin/sh\necho "reboot (skipped: image build)" >> /root/.idea-build/shims.log\nexit 0\n`,
     'hostnamectl': `#!/bin/sh\necho "hostnamectl refused: an image has no hostname (idea#322)" >&2\nexit 1\n`,
     'timedatectl': `#!/bin/sh\n# set-timezone in a chroot: /etc/localtime + /etc/timezone, like timedatectl\nif [ "$1" = set-timezone ] && [ -f "/usr/share/zoneinfo/$2" ]; then ln -sf "/usr/share/zoneinfo/$2" /etc/localtime; echo "$2" > /etc/timezone; exit 0; fi\necho "timedatectl $* (skipped: image build)" >> /root/.idea-build/shims.log\nexit 0\n`,

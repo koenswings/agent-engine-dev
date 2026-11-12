@@ -138,6 +138,9 @@ const goodRootfs = async (root: string) => {
     await fs.ensureDir(R('etc/idea')); await fs.writeFile(R(IMAGE_LOCK_PATH.slice(1)), serialiseLock(lock())); await fs.writeFile(R(IMAGE_VERSION_PATH.slice(1)), '1.0\n')
     await addSshLogin(root)
     await addPiLogin(root)
+    await fs.ensureDir(R('etc/sysctl.d'))
+    await fs.writeFile(R('etc/sysctl.d/90-idea-igmp.conf'), 'net.ipv4.igmp_max_memberships = 1024\n')
+    await fs.chmod(R('etc/sysctl.d/90-idea-igmp.conf'), 0o644)
 }
 /** The repo's sshd assets as the build installs them (idea#453): Debian sshd_config, login + peer drop-ins, operator keys. */
 const ASSETS = path.resolve('script/build_image_assets') // cwd = repo root (vitest and the dist-test gate)
@@ -528,6 +531,18 @@ describe('verify: held packages, units enabled via [Install], per-check count', 
         const rep = path.join(root, 'r.json')
         await writeReport(rep, lock(), 'x', bad.flatMap(x => x.problems), bad.filter(x => !x.problems.length).length)
         expect((await fs.readJson(rep)).verify.passed).toBe(VERIFY_CHECKS.length - 2)
+    })
+    it('igmp-sysctl (idea#467) fails when the conf is missing or does not set 1024', async () => {
+        const all = await verifyRootfsChecks({ root, enginePath: ENGINE, lock: lock(), storeIdentity: storeShas })
+        expect(all.find(x => x.name === 'igmp-sysctl')!.problems).toEqual([])
+        await fs.remove(R('etc/sysctl.d/90-idea-igmp.conf'))
+        expect((await verifyRootfsChecks({ root, enginePath: ENGINE, lock: lock(), storeIdentity: storeShas })).find(x => x.name === 'igmp-sysctl')!.problems).toContain('/etc/sysctl.d/90-idea-igmp.conf missing')
+        await fs.writeFile(R('etc/sysctl.d/90-idea-igmp.conf'), 'net.ipv4.igmp_max_memberships = 20\n')
+        await fs.chmod(R('etc/sysctl.d/90-idea-igmp.conf'), 0o644)
+        expect((await verifyRootfsChecks({ root, enginePath: ENGINE, lock: lock(), storeIdentity: storeShas })).find(x => x.name === 'igmp-sysctl')!.problems).toContain('/etc/sysctl.d/90-idea-igmp.conf must set net.ipv4.igmp_max_memberships=1024')
+        await fs.writeFile(R('etc/sysctl.d/90-idea-igmp.conf'), 'net.ipv4.igmp_max_memberships = 1024\n')
+        await fs.chmod(R('etc/sysctl.d/90-idea-igmp.conf'), 0o644)
+        expect((await verifyRootfsChecks({ root, enginePath: ENGINE, lock: lock(), storeIdentity: storeShas })).find(x => x.name === 'igmp-sysctl')!.problems).toEqual([])
     })
 })
 

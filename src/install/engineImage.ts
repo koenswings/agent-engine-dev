@@ -638,7 +638,7 @@ export const piLoginProblems = async (root: string): Promise<string[]> => {
 
 /** Every check a built rootfs must pass. Returns problems; empty = OK. Read-only. */
 /** verify's checks, in order; the report counts how many passed (VERIFY_CHECKS.length in all). */
-export const VERIFY_CHECKS = ['identity', 'store-identity', 'engine-tree', 'pm2-as-pi', 'enabled-units', 'identity-boot', 'tailscaled-off', 'locked-files', 'permissions', 'npm-tools', 'docker-preload', 'packages', 'no-dev-files', 'lock-in-image', 'ssh-first-boot', 'console-ui', 'operator-keys', 'ssh-no-password', 'pi-login'] as const
+export const VERIFY_CHECKS = ['identity', 'store-identity', 'engine-tree', 'pm2-as-pi', 'enabled-units', 'identity-boot', 'tailscaled-off', 'locked-files', 'permissions', 'npm-tools', 'docker-preload', 'packages', 'no-dev-files', 'lock-in-image', 'ssh-first-boot', 'console-ui', 'operator-keys', 'ssh-no-password', 'pi-login', 'igmp-sysctl'] as const
 export interface VerifyCheckResult { name: string, problems: string[] }
 
 export const verifyRootfs = async (c: VerifyContext): Promise<string[]> => (await verifyRootfsChecks(c)).flatMap(x => x.problems)
@@ -840,6 +840,19 @@ export const verifyRootfsChecks = async (c: VerifyContext): Promise<VerifyCheckR
     check('pi-login')
     // 14. pi can log in with a key: bash shell, password locked, userconfig masked, password auth off (idea#453 approach B)
     p.push(...await piLoginProblems(c.root))
+    check('igmp-sysctl')
+    // idea#467: Kolibri zeroconf needs net.ipv4.igmp_max_memberships=1024. The file is
+    // written by installRootHelpers (via installUdev) and applied at first boot.
+    const igmp = R('etc/sysctl.d/90-idea-igmp.conf')
+    if (!(await fs.pathExists(igmp))) p.push('/etc/sysctl.d/90-idea-igmp.conf missing')
+    else {
+        const body = await fs.readFile(igmp, 'utf8')
+        if (!/^\s*net\.ipv4\.igmp_max_memberships\s*=\s*1024\s*$/m.test(body)) {
+            p.push('/etc/sysctl.d/90-idea-igmp.conf must set net.ipv4.igmp_max_memberships=1024')
+        }
+        const st = await fs.lstat(igmp)
+        if (modeOf(st) !== '0644') p.push(`/etc/sysctl.d/90-idea-igmp.conf mode ${modeOf(st)}, must be 0644`)
+    }
     return results
 }
 
