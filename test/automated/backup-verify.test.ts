@@ -367,7 +367,13 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
         const log = await calls()
         expect(log.some(l => l.startsWith('borg-create'))).toBe(false)
 
-        await expect(clearBackupLock(h, INST, 'ver-bd')).rejects.toThrow(/no \.backup-in-progress/)
+        // Nothing left to clear: still a refusal (cleared: false) but not an error
+        const empty = await clearBackupLock(h, INST, 'ver-bd') as any
+        expect(empty.cleared).toBe(false)
+        expect(empty.lockFileRemoved).toBe(false)
+        expect(empty.message).toBe(`no backup lock to clear for ${INST}`)
+        expect(h.doc()!.diskDB[backupDisk.id].backupStaleLocks).toEqual([])
+        expect(await fs.pathExists(lockPath)).toBe(false)
     })
 
     it('clearBackupLock is refused while a backup of that instance is already in progress, and leaves the lock file and store entry untouched', async () => {
@@ -489,8 +495,19 @@ exit 0
         expect(h.doc()!.diskDB[backupDisk.id].backupStaleLocks).toEqual([])
         expect(await fs.pathExists(lockPath)).toBe(false)
         expect((await calls()).some(l => l.startsWith('borg-create'))).toBe(false)
-        // Nothing left to clear: the usual refusal
-        await expect(clearBackupLock(h, INST, 'ver-bd')).rejects.toThrow(/no \.backup-in-progress/)
+        // Nothing left to clear: still a refusal (cleared: false) but not an error
+        const infoSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
+        let empty: any
+        try {
+            empty = await clearBackupLock(h, INST, 'ver-bd') as any
+            expect(infoSpy.mock.calls.some(c => String(c[0]) === `no backup lock to clear for ${INST}`)).toBe(true)
+        } finally {
+            infoSpy.mockRestore()
+        }
+        expect(empty.cleared).toBe(false)
+        expect(empty.lockFileRemoved).toBe(false)
+        expect(empty.message).toBe(`no backup lock to clear for ${INST}`)
+        expect(h.doc()!.diskDB[backupDisk.id].backupStaleLocks).toEqual([])
 
         const removed = await removeBackupRole(h, 'ver-bd') as any
         expect(removed.diskTypes).not.toContain('backup')
@@ -509,7 +526,10 @@ exit 0
         expect(await fs.pathExists(lockPath)).toBe(false)
         expect(h.doc()!.instanceDB[INST as InstanceID].lastBackup).toBeGreaterThan(0)
         expect(h.doc()!.diskDB[backupDisk.id].backupStaleLocks).toEqual([])
-        await expect(clearBackupLock(h, INST, 'ver-bd')).rejects.toThrow(/no \.backup-in-progress/)
+        const empty = await clearBackupLock(h, INST, 'ver-bd') as any
+        expect(empty.cleared).toBe(false)
+        expect(empty.lockFileRemoved).toBe(false)
+        expect(empty.message).toBe(`no backup lock to clear for ${INST}`)
         const removed = await removeBackupRole(h, 'ver-bd') as any
         expect(removed.diskTypes).not.toContain('backup')
     })

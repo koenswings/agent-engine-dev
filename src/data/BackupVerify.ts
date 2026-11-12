@@ -416,7 +416,23 @@ export const clearBackupLock = async (
     const staleEntry = (storeHandle.doc().diskDB[disk.id]?.backupStaleLocks ?? [])
         .find(l => String(l.instanceId) === String(instance.id))
     if (!lockPresent && !staleEntry) {
-        throw new Error(`clearBackupLock: no .backup-in-progress lock for instance ${instance.id} on disk ${disk.id}`)
+        // Refusal: nothing was cleared. Do not throw — a thrown Error closes the
+        // command trace as 'error' and the Console shows it as an error (✗).
+        // TraceStatus has no 'info'; print() is console.info, so the message is
+        // an info log line and the wrapper closes the trace as 'ok' (idea#454).
+        const message = `no backup lock to clear for ${instance.id}`
+        const result = {
+            instanceId: instance.id,
+            backupDiskId: disk.id,
+            lockPath,
+            startedAt: null,
+            cleared: false,
+            lockFileRemoved: false,
+            message,
+        }
+        attachTraceResult(result)
+        print(message)
+        return result
     }
     const startedAt = lockPresent ? await readLockStartedAt(lockPath) : (staleEntry?.startedAt ?? null)
 

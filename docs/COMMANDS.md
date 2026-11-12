@@ -131,8 +131,8 @@ These commands perform actions on the system. Some are restricted to an `engine`
 - **Scope:** `engine`
 
 ### `clearBackupLock`
-- **Description:** Removes only the `.backup-in-progress` lock file for an instance on a docked Backup Disk, and drops the matching `Disk.backupStaleLocks` entry. Never starts a backup (idea#446: boot no longer auto-retries a leftover lock). When the lock file is already gone but `Disk.backupStaleLocks` still lists the instance, it drops only the store entry (result `lockFileRemoved: false`, idea#454). Refuses if a `backupApp` of that instance to this disk is Pending/Running, the in-memory backup mutex is held, the disk is locked, or there is neither a lock file nor a stale-lock entry. Capability `backupVerify`.
-- **Usage:** `clearBackupLock <instanceId|instanceName> <backupDiskId>`. Every refusal ends the command trace as `error` with the reason.
+- **Description:** Removes only the `.backup-in-progress` lock file for an instance on a docked Backup Disk, and drops the matching `Disk.backupStaleLocks` entry. Never starts a backup (idea#446: boot no longer auto-retries a leftover lock). When the lock file is already gone but `Disk.backupStaleLocks` still lists the instance, it drops only the store entry (result `lockFileRemoved: false`, idea#454). Refuses if a `backupApp` of that instance to this disk is Pending/Running, the in-memory backup mutex is held, or the disk is locked (those still end the trace as `error`). When there is neither a lock file nor a stale-lock entry, nothing is cleared (`cleared: false`); the command returns the plain message `no backup lock to clear for <instance>`, writes it as an info log line, and ends the trace as `ok` with that result, so the Console does not show an error (idea#454). Capability `backupVerify`.
+- **Usage:** `clearBackupLock <instanceId|instanceName> <backupDiskId>`. Refusals other than "nothing to clear" end the command trace as `error` with the reason.
 - **Scope:** `engine`
 
 ### `removeBackupRole`
