@@ -11,6 +11,7 @@ import { fs } from 'zx'
 import { log } from '../utils/utils.js'
 import { rsyncDirectory } from '../utils/rsync.js'
 import { Disk, diskMountRoot } from './Disk.js'
+import { serviceImageTarName } from './ImageRef.js'
 
 export interface RestoreAppFilesResult {
     appMasterFrom: string | null
@@ -18,7 +19,8 @@ export interface RestoreAppFilesResult {
     servicesMissing: string[]
 }
 
-export const serviceTarName = (serviceImage: string): string => serviceImage.replace(/\//g, '_') + '.tar'
+/** Same as install/start: repo:tag only, so a pinned @sha256 ref finds the tar (idea#445). */
+export const serviceTarName = (serviceImage: string): string => serviceImageTarName(serviceImage)
 
 /**
  * Make `target` hold apps/<appId> and the service tars of `serviceImages`.

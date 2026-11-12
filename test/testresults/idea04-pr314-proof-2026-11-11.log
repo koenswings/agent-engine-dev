@@ -1,0 +1,884 @@
+temp_c=45.277
+============================================================
+idea04 PR #314 setup 2026-11-11T04:47:43+01:00 temp=44.790C
+============================================================
+production HEAD e91467dcb9dd455274d2da7d7aadc2c7a2efe34f (must stay e91467dcb9dd455274d2da7d7aadc2c7a2efe34f)
+==== helper must already be main e91467d sha ====
+live 05886f4efc830e284961c5335074ed3ec148e3a53020ba21aaf4f736e1571766
+want 05886f4efc830e284961c5335074ed3ec148e3a53020ba21aaf4f736e1571766
+version idea-app-data 7
+==== fetch PR head and add worktree ~/axle-428 ====
+From https://github.com/koenswings/agent-engine-dev
+ * branch            901c51fde2c25a587f32f6b42a96e94c341b2665 -> FETCH_HEAD
+Preparing worktree (detached HEAD 901c51f)
+HEAD is now at 901c51f idea#428: drop the removed instance from Disk.preUpdateSnapshots
+worktree HEAD 901c51fde2c25a587f32f6b42a96e94c341b2665
+901c51f idea#428: drop the removed instance from Disk.preUpdateSnapshots
+==== outside config (copy only; real config.yaml untouched) ====
+outside systemDiskSkip: ['  mdns: true      # atlas 2026-10-06: test pool mirrors production idea02 (mdns: true), Koen 03:50; static peers removed', '  systemDiskSkip: false  # axle-428 outside copy for idea#428 proof; real config.yaml untouched   # Stage 2 pin (was IDEA_SYSTEM_DISK_SKIP env; PLAN 5 unchanged)']
+production config.yaml still:
+2:  mdns: true      # atlas 2026-10-06: test pool mirrors production idea02 (mdns: true), Koen 03:50; static peers removed
+6:  systemDiskSkip: true   # Stage 2 pin (was IDEA_SYSTEM_DISK_SKIP env; PLAN 5 unchanged)
+==== symlink node_modules and build PR head ====
+built dist/src/index.js
+==== switch pm2 engine to PR checkout, cwd production, IDEA_CONFIG_FILE outside copy ====
+[PM2] Applying action deleteProcessId on app [engine](ids: [ 13 ])
+[PM2] [engine](13) ✓
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 14 │ idea-usage       │ default     │ 1.0     │ fork    │ 868635   │ 14m    │ 0    │ online    │ 0%       │ 73.2mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 0%       │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 53.3% | ram usage: 34.2% | eth0: ⇓ 0.002mb/s ⇑ 0.001mb/s drop 224/min | disk: ⇓ 0mb/s ⇑ 1.885mb/s / 61.61%
+[PM2] Starting /home/pi/axle-428/dist/src/index.js in fork_mode (1 instance)
+[PM2] Done.
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 15 │ engine           │ default     │ 1.0     │ fork    │ 879394   │ 0s     │ 0    │ online    │ 0%       │ 21.4mb   │ pi       │ disabled │
+│ 14 │ idea-usage       │ default     │ 1.0     │ fork    │ 868635   │ 14m    │ 0    │ online    │ 0%       │ 73.2mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 0%       │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 53.3% | ram usage: 34.2% | eth0: ⇓ 0.002mb/s ⇑ 0.001mb/s drop 224/min | disk: ⇓ 0mb/s ⇑ 1.885mb/s / 61.61%
+status online restarts 0 pid 879394
+cwd /home/pi/idea/agents/agent-engine-dev
+script /home/pi/axle-428/dist/src/index.js
+username pi
+IDEA_CONFIG_FILE /home/pi/axle-428-config.yaml
+IDEA_USAGE_AS_MAIN None
+IDEA_NETWORK_TESTS 0
+NODE_ENV development
+VERBOSITY 3
+engine env OK
+try 1: :8080 -> 000fail temp=50.634C
+try 2: :8080 -> 000fail temp=49.173C
+try 3: :8080 -> 000fail temp=49.173C
+try 4: :8080 -> 000fail temp=48.686C
+try 5: :8080 -> 000fail temp=49.173C
+try 6: :8080 -> 000fail temp=49.660C
+try 7: :8080 -> 000fail temp=49.660C
+try 8: :8080 -> 000fail temp=49.660C
+try 9: :8080 -> 200 temp=50.147C
+production tree still e91467d
+production config.yaml still:
+2:  mdns: true      # atlas 2026-10-06: test pool mirrors production idea02 (mdns: true), Koen 03:50; static peers removed
+6:  systemDiskSkip: true   # Stage 2 pin (was IDEA_SYSTEM_DISK_SKIP env; PLAN 5 unchanged)
+==== setup done 2026-11-11T04:49:34+01:00 ====
+temp_c=47.712
+============================================================
+idea04 PR #314 proof 2026-11-11T04:49:44+01:00
+============================================================
+apps:
+total 12
+drwxr-xr-x  3 pi   pi   4096 Nov 11 04:26 .
+drwxr-xr-x 24 root root 4096 Nov 11 03:30 ..
+drwxrwxr-x  7 pi   pi   4096 Oct 15 08:28 kolibri-channel-builder-2551b7d
+existing instances: <none>
+engine-error lines before proof: 670
+engine-out lines before proof: 15278
+==== ITEM3 installApp axle428-1.0 (no x-app.title) ====
+wrote /apps/axle428-1.0 (233 bytes compose)
+wrote /apps/axle428-1.1 (229 bytes compose)
+apps now: ['axle428-1.0', 'axle428-1.1', 'kolibri-channel-builder-2551b7d']
+>> push-command: installApp axle428-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle428-t --fresh
+{"pushed":"installApp axle428-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle428-t --fresh","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+wait_instance title found 287zlp4mhphtliqikvu (try 1)
+ID=287zlp4mhphtliqikvu
+---- new engine-error since mark ----
+ Network 287zlp4mhphtliqikvu_default Creating 
+ Network 287zlp4mhphtliqikvu_default Creating 
+ Volume 287zlp4mhphtliqikvu_data Creating 
+ Volume 287zlp4mhphtliqikvu_data Creating 
+ Volume 287zlp4mhphtliqikvu_data Created 
+ Volume 287zlp4mhphtliqikvu_data Created 
+ Network 287zlp4mhphtliqikvu_default Created 
+ Network 287zlp4mhphtliqikvu_default Created 
+ Container 287zlp4mhphtliqikvu-web-1 Creating 
+ Container 287zlp4mhphtliqikvu-web-1 Created 
+---- new engine-out tail ----
+Read variable port from .env file /instances/287zlp4mhphtliqikvu/.env: not set
+No port number has previously been generated.
+Generating a new port number for instance 287zlp4mhphtliqikvu.
+Checking if port 62495 is in use
+Port 62495 is not in use. Checking if it is reserved by another instance
+Port 62495 is not reserved by another instance
+Added or updated variable port in .env file /instances/287zlp4mhphtliqikvu/.env
+Found a port number for instance 287zlp4mhphtliqikvu: 62495
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+Trying to find a pass for instance 287zlp4mhphtliqikvu in the .env file
+Read variable pass from .env file /instances/287zlp4mhphtliqikvu/.env: not set
+No pass has previously been generated. Generating a new pass.
+Generated a new pass for instance 287zlp4mhphtliqikvu
+Added or updated variable pass in .env file /instances/287zlp4mhphtliqikvu/.env
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+Preloading the service images of the services from the compose file
+Reading and parsing the compose.yaml file of the app instance
+Warning while starting instance '287zlp4mhphtliqikvu': Service image busybox:1.36.1: saved image /services/busybox:1.36.1.tar not found; continuing (Docker pulls the image if it is not local and the Engine has internet)
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+Creating the containers for the services of the app instance
+Host identity for instance 287zlp4mhphtliqikvu: IDEA_HOSTNAME=idea04 IDEA_HOST_IPS=192.168.0.113,100.108.39.45
+IDEA_NEXTCLOUD_URL for instance 287zlp4mhphtliqikvu: http://idea03.local:18080
+Added or updated variable hostname in .env file /instances/287zlp4mhphtliqikvu/.env
+Found IP address 192.168.0.113 for instance 287zlp4mhphtliqikvu
+Added or updated variable ip in .env file /instances/287zlp4mhphtliqikvu/.env
+Creating containers of app instance '287zlp4mhphtliqikvu' on disk 5vyahbut147hw5dp4e1 of engine ENGINE_5vyahbut147hw5dp4e1.
+Instance 287zlp4mhphtliqikvu status changed to: 
+┌────────────────────────────────────┐
+│  Step 6/6  │  Starting containers  │
+└────────────────────────────────────┘
+Running instance '287zlp4mhphtliqikvu' on disk 5vyahbut147hw5dp4e1 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+Read variable port from .env file /instances/287zlp4mhphtliqikvu/.env: found
+Ports: [32m'62495'[39m
+Port number extracted from .env file for instance 287zlp4mhphtliqikvu: 62495
+new RangeError count=0 title-path errors=0
+>>>> dump all
+node:internal/modules/cjs/loader:1383
+  const err = new Error(message);
+              ^
+
+Error: Cannot find module '@automerge/automerge-repo'
+Require stack:
+- /tmp/axle428-proof/dump.ts
+    at node:internal/modules/cjs/loader:1383:15
+    at nextResolveSimple (/home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-D46fvsV_.cjs:4:1004)
+    at /home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-D46fvsV_.cjs:3:2630
+    at /home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-D46fvsV_.cjs:3:1542
+    at resolveTsPaths (/home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-D46fvsV_.cjs:4:760)
+    at /home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-D46fvsV_.cjs:4:1102
+    at m._resolveFilename (file:///home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-B7jrtLTO.mjs:1:789)
+    at defaultResolveImpl (node:internal/modules/cjs/loader:1025:19)
+    at resolveForCJSWithHooks (node:internal/modules/cjs/loader:1030:22)
+    at Function._load (node:internal/modules/cjs/loader:1192:37) {
+  code: 'MODULE_NOT_FOUND',
+  requireStack: [ '/tmp/axle428-proof/dump.ts' ]
+}
+
+Node.js v22.20.0
+Traceback (most recent call last):
+  File "<stdin>", line 2, in <module>
+  File "/usr/lib/python3.13/json/__init__.py", line 293, in load
+    return loads(fp.read(),
+        cls=cls, object_hook=object_hook,
+        parse_float=parse_float, parse_int=parse_int,
+        parse_constant=parse_constant, object_pairs_hook=object_pairs_hook, **kw)
+  File "/usr/lib/python3.13/json/__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+parsed title block: 
+Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+    import json; d=json.load(open("/tmp/pr314-after-install.json")); print(((d.get("apps") or {}).get("axle428-1.0") or {}).get("title") or "")
+                   ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/__init__.py", line 293, in load
+    return loads(fp.read(),
+        cls=cls, object_hook=object_hook,
+        parse_float=parse_float, parse_int=parse_int,
+        parse_constant=parse_constant, object_pairs_hook=object_pairs_hook, **kw)
+  File "/usr/lib/python3.13/json/__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+FAIL: ITEM3 RangeError=0 titleErr=0 appDB.title='' (want axle428, no RangeError)
+==== ATLAS estimate system 287zlp4mhphtliqikvu (main helper) ====
+helper 05886f4efc830e284961c5335074ed3ec148e3a53020ba21aaf4f736e1571766  /usr/local/sbin/idea-app-data idea-app-data 7
+estimate stdout: [16 4 84801680]
+estimate stderr:
+estimate rc=0
+PASS: ATLAS estimate system 287zlp4mhphtliqikvu -> 16 4 84801680
+==== ITEM1a failing updateApp to create a preUpdateSnapshot ====
+helper snapshots before update:
+9vd2q5x8mdky9bpzjvn 48 complete
+y8uio8lxoa74p9pcsip 52 complete
+TOTAL pre-update 104
+TOTAL quarantine 132
+>>>> dump disk
+node:internal/modules/cjs/loader:1383
+  const err = new Error(message);
+              ^
+
+Error: Cannot find module '@automerge/automerge-repo'
+Require stack:
+- /tmp/axle428-proof/dump.ts
+    at node:internal/modules/cjs/loader:1383:15
+    at nextResolveSimple (/home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-D46fvsV_.cjs:4:1004)
+    at /home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-D46fvsV_.cjs:3:2630
+    at /home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-D46fvsV_.cjs:3:1542
+    at resolveTsPaths (/home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-D46fvsV_.cjs:4:760)
+    at /home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-D46fvsV_.cjs:4:1102
+    at m._resolveFilename (file:///home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-B7jrtLTO.mjs:1:789)
+    at defaultResolveImpl (node:internal/modules/cjs/loader:1025:19)
+    at resolveForCJSWithHooks (node:internal/modules/cjs/loader:1030:22)
+    at Function._load (node:internal/modules/cjs/loader:1192:37) {
+  code: 'MODULE_NOT_FOUND',
+  requireStack: [ '/tmp/axle428-proof/dump.ts' ]
+}
+
+Node.js v22.20.0
+>> push-command: updateApp axle428-t axle428-1.1
+{"pushed":"updateApp axle428-t axle428-1.1","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+updateApp failure line: 
+helper snapshots after update:
+287zlp4mhphtliqikvu 48 complete
+9vd2q5x8mdky9bpzjvn 48 complete
+y8uio8lxoa74p9pcsip 52 complete
+TOTAL pre-update 152
+TOTAL quarantine 132
+no /.pre-update
+>>>> dump disk
+node:internal/modules/cjs/loader:1383
+  const err = new Error(message);
+              ^
+
+Error: Cannot find module '@automerge/automerge-repo'
+Require stack:
+- /tmp/axle428-proof/dump.ts
+    at node:internal/modules/cjs/loader:1383:15
+    at nextResolveSimple (/home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-D46fvsV_.cjs:4:1004)
+    at /home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-D46fvsV_.cjs:3:2630
+    at /home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-D46fvsV_.cjs:3:1542
+    at resolveTsPaths (/home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-D46fvsV_.cjs:4:760)
+    at /home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-D46fvsV_.cjs:4:1102
+    at m._resolveFilename (file:///home/pi/idea/agents/agent-engine-dev/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-B7jrtLTO.mjs:1:789)
+    at defaultResolveImpl (node:internal/modules/cjs/loader:1025:19)
+    at resolveForCJSWithHooks (node:internal/modules/cjs/loader:1030:22)
+    at Function._load (node:internal/modules/cjs/loader:1192:37) {
+  code: 'MODULE_NOT_FOUND',
+  requireStack: [ '/tmp/axle428-proof/dump.ts' ]
+}
+
+Node.js v22.20.0
+Traceback (most recent call last):
+  File "<stdin>", line 2, in <module>
+  File "/usr/lib/python3.13/json/__init__.py", line 293, in load
+    return loads(fp.read(),
+        cls=cls, object_hook=object_hook,
+        parse_float=parse_float, parse_int=parse_int,
+        parse_constant=parse_constant, object_pairs_hook=object_pairs_hook, **kw)
+  File "/usr/lib/python3.13/json/__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+temp_c=45.277
+============================================================
+idea04 PR #314 proof continuation 2026-11-11T04:53:52+01:00
+============================================================
+==== ITEM3 title + ITEM1a disk row after rollback ====
+>>>> dump all
+dump: TypeError: fetch failed
+    at node:internal/deps/undici/undici:13510:13
+    at async main (/home/pi/axle-428/script/dump-428.ts:69:24)
+Traceback (most recent call last):
+  File "<stdin>", line 2, in <module>
+  File "/usr/lib/python3.13/json/__init__.py", line 293, in load
+    return loads(fp.read(),
+        cls=cls, object_hook=object_hook,
+        parse_float=parse_float, parse_int=parse_int,
+        parse_constant=parse_constant, object_pairs_hook=object_pairs_hook, **kw)
+  File "/usr/lib/python3.13/json/__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+cat: /tmp/pr314-title.txt: No such file or directory
+cat: /tmp/pr314-has-snap.txt: No such file or directory
+TITLE= HAS_SNAPSHOT=
+FAIL: ITEM3 appDB.title='' (want axle428)
+FAIL: ITEM1a disk row has no preUpdateSnapshot for 287zlp4mhphtliqikvu
+==== ITEM2 refused forgetDisk on live System Disk ====
+>> push-command: forgetDisk 5vyahbut147hw5dp4e1
+{"pushed":"forgetDisk 5vyahbut147hw5dp4e1","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+forgetDisk error log: Error: Disk 'System Disk' (5vyahbut147hw5dp4e1) is docked to ENGINE_5vyahbut147hw5dp4e1; only an undocked disk can be forgotten. Eject or unplug it first.
+>>>> dump traces
+{
+  "mode": "traces",
+  "storeId": "2VroEUvDkmYsDAwE5oG9YeFNadWH",
+  "wsPort": 4321,
+  "commandLogId": "hTLncty913FpF6QNVnSbJR3Di3D",
+  "traces": [
+    {
+      "traceId": "8d19c2db-72c7-484d-80f1-7cf091b913cb",
+      "command": "installApp",
+      "args": "[\"axleproof-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle311-upd3 --fresh\"]",
+      "status": "ok",
+      "error": null,
+      "errorMessage": null,
+      "completedAt": 1794364188570,
+      "startedAt": 1794364171808
+    },
+    {
+      "traceId": "0300c957-6014-4c0d-b741-98032b721be6",
+      "command": "updateApp",
+      "args": "[\"axle311-upd3 axleproof-1.1\"]",
+      "status": "error",
+      "error": null,
+      "errorMessage": "ROLLED BACK: Start failed: start failed: Engine error: Container(s) exited after compose up for y8uio8lxoa74p9pcsip. Automerge must not stay Running. y8uio8lxoa74p9pcsip-web-1: Exited (42) 2 seconds ago. axleproof-1.0 and its data were restored from /.pre-update/y8uio8lxoa74p9pcsip",
+      "completedAt": 1794364239964,
+      "startedAt": 1794364206517
+    },
+    {
+      "traceId": "e6f5ac49-082b-45a3-bfea-5d366dfa5aa6",
+      "command": "stopInstance",
+      "args": "{\"instanceName\":\"axle311-upd3\",\"diskId\":\"5vyahbut147hw5dp4e1\"}",
+      "status": "ok",
+      "error": null,
+      "errorMessage": null,
+      "completedAt": 1794364605363,
+      "startedAt": 1794364594530
+    },
+    {
+      "traceId": "babdec3b-e01a-4ecd-83ea-85a1de04e84e",
+      "command": "removeInstance",
+      "args": "{\"instanceId\":\"y8uio8lxoa74p9pcsip\"}",
+      "status": "ok",
+      "error": null,
+      "errorMessage": null,
+      "completedAt": 1794364621067,
+      "startedAt": 1794364620190
+    },
+    {
+      "traceId": "ab8c275e-e557-45ad-a839-2df608ceec74",
+      "command": "forgetDisk",
+      "args": "{\"diskId\":\"5vyahbut147hw5dp4e1\"}",
+      "status": "error",
+      "error": null,
+      "errorMessage": "Disk 'System Disk' (5vyahbut147hw5dp4e1) is docked to ENGINE_5vyahbut147hw5dp4e1; only an undocked disk can be forgotten. Eject or unplug it first.",
+      "completedAt": 1794365764101,
+      "startedAt": 1794365764084
+    },
+    {
+      "traceId": "0c6733a0-79b3-4be7-8c09-04a9dbf51488",
+      "command": "installApp",
+      "args": "[\"axle427-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle427-est --fresh\"]",
+      "status": "ok",
+      "error": null,
+      "errorMessage": null,
+      "completedAt": 1794367314615,
+      "startedAt": 1794367297431
+    },
+    {
+      "traceId": "98927f13-f887-480d-a2a5-bfa1c7126c82",
+      "command": "stopInstance",
+      "args": "{\"instanceName\":\"axle427-est\",\"diskId\":\"5vyahbut147hw5dp4e1\"}",
+      "status": "ok",
+      "error": null,
+      "errorMessage": null,
+      "completedAt": 1794367325856,
+      "startedAt": 1794367315035
+    },
+    {
+      "traceId": "babf699b-de13-47af-a682-8ec36ccdb1cd",
+      "command": "installApp",
+      "args": "[\"axle427anon-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle427-anon --fresh\"]",
+      "status": "ok",
+      "error": null,
+      "errorMessage": null,
+      "completedAt": 1794367357039,
+      "startedAt": 1794367340597
+    },
+    {
+      "traceId": "06638540-ef41-417e-9508-4303a236ed90",
+      "command": "updateApp",
+      "args": "[\"axle427-anon axle427-1.1\"]",
+      "status": "error",
+      "error": null,
+      "errorMessage": "DIFFERENT_APP: x-app.name is missing (actual: (missing), expected: axle427); x-app.version is missing (actual: (missing), expected: 1.1)",
+      "completedAt": 1794367371815,
+      "startedAt": 1794367371425
+    },
+    {
+      "traceId": "1e5e4eae-c029-4d3e-b711-3a1815ab8be2",
+      "command": "installApp",
+      "args": "[\"axle427-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle427-mm --fresh\"]",
+      "status": "ok",
+      "error": null,
+      "errorMessage": null,
+      "completedAt": 1794367403692,
+      "startedAt": 1794367387645
+    },
+    {
+      "traceId": "95155bdb-7c58-4010-8a75-9cd28eba88f2",
+      "command": "updateApp",
+      "args": "[\"axle427-mm other427-1.1\"]",
+      "status": "error",
+      "error": null,
+      "errorMessage": "DIFFERENT_APP: x-app.name mismatch (actual: axle427, expected: other427); x-app.version mismatch (actual: 1.0, expected: 1.1)",
+      "completedAt": 1794367418702,
+      "startedAt": 1794367418362
+    },
+    {
+      "traceId": "c8cff0bf-42dc-43b4-9cfd-06e1d177d1b2",
+      "command": "stopInstance",
+      "args": "{\"instanceName\":\"axle427-est\",\"diskId\":\"5vyahbut147hw5dp4e1\"}",
+      "status": "ok",
+      "error": null,
+      "errorMessage": null,
+      "completedAt": 1794367479258,
+      "startedAt": 1794367478849
+    },
+    {
+      "traceId": "ee88fa77-b76c-452c-965a-24dbed55998b",
+      "command": "stopInstance",
+      "args": "{\"instanceName\":\"axle427-anon\",\"diskId\":\"5vyahbut147hw5dp4e1\"}",
+      "status": "ok",
+      "error": null,
+      "errorMessage": null,
+      "completedAt": 1794367506684,
+      "startedAt": 1794367495902
+    },
+    {
+      "traceId": "ca0608a2-5a5a-4968-8616-c9834d4d25c2",
+      "command": "stopInstance",
+      "args": "{\"instanceName\":\"axle427-mm\",\"diskId\":\"5vyahbut147hw5dp4e1\"}",
+      "status": "ok",
+      "error": null,
+      "errorMessage": null,
+      "completedAt": 1794367523862,
+      "startedAt": 1794367512527
+    },
+    {
+      "traceId": "435edf38-9eba-4aff-aa93-6b1c3a940123",
+      "command": "removeInstance",
+      "args": "{\"instanceId\":\"9vd2q5x8mdky9bpzjvn\"}",
+      "status": "ok",
+      "error": null,
+      "errorMessage": null,
+      "completedAt": 1794367536946,
+      "startedAt": 1794367536025
+    },
+    {
+      "traceId": "25c866c7-0302-45b7-bb3f-41ba839aa3ef",
+      "command": "removeInstance",
+      "args": "{\"instanceId\":\"ekngtrq0b6nb59vh3d6\"}",
+      "status": "ok",
+      "error": null,
+      "errorMessage": null,
+      "completedAt": 1794367554273,
+      "startedAt": 1794367553190
+    },
+    {
+      "traceId": "9b712490-d062-4bdf-b4c7-2403d9f4fd18",
+      "command": "removeInstance",
+      "args": "{\"instanceId\":\"s7fk0ccrtffba2h8fqh\"}",
+      "status": "ok",
+      "error": null,
+      "errorMessage": null,
+      "completedAt": 1794367570888,
+      "startedAt": 1794367569935
+    },
+    {
+      "traceId": "6e377875-1389-49a3-b9bf-d5ded81a65b5",
+      "command": "installApp",
+      "args": "[\"axle428-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle428-t --fresh\"]",
+      "status": "ok",
+      "error": null,
+      "errorMessage": null,
+      "completedAt": 1794369015166,
+      "startedAt": 1794368998819
+    },
+    {
+      "traceId": "d2ccabea-5e00-4354-ac1d-0263d4f8b928",
+      "command": "updateApp",
+      "args": "[\"axle428-t axle428-1.1\"]",
+      "status": "error",
+      "error": "ROLLED BACK: Start failed: start failed: Engine error: Instance 287zlp4mhphtliqikvu container is up but host port 62495 never stayed ready for 10000ms within 60000ms (and after one force-recreate). Automerge must not stay Running with a dead sidecar. If this is Kolibri after copyApp, the copy likely still shares the original morango instance id (zeroconf NonUniqueNameException); see rebindKolibriMorangoInstanceId.. axle428-1.0 and its data were restored from /.pre-update/287zlp4mhphtliqikvu",
+      "errorMessage": "ROLLED BACK: Start failed: start failed: Engine error: Instance 287zlp4mhphtliqikvu container is up but host port 62495 never stayed ready for 10000ms within 60000ms (and after one force-recreate). Automerge must not stay Running with a dead sidecar. If this is Kolibri after copyApp, the copy likely still shares the original morango instance id (zeroconf NonUniqueNameException); see rebindKolibriMorangoInstanceId.. axle428-1.0 and its data were restored from /.pre-update/287zlp4mhphtliqikvu",
+      "completedAt": 1794369180391,
+      "startedAt": 1794369022257
+    },
+    {
+      "traceId": "9029ceac-0186-4998-ba55-045b5cef168b",
+      "command": "forgetDisk",
+      "args": "{\"diskId\":\"5vyahbut147hw5dp4e1\"}",
+      "status": "error",
+      "error": "Disk 'System Disk' (5vyahbut147hw5dp4e1) is docked to ENGINE_5vyahbut147hw5dp4e1; only an undocked disk can be forgotten. Eject or unplug it first.",
+      "errorMessage": "Disk 'System Disk' (5vyahbut147hw5dp4e1) is docked to ENGINE_5vyahbut147hw5dp4e1; only an undocked disk can be forgotten. Eject or unplug it first.",
+      "completedAt": 1794369261011,
+      "startedAt": 1794369260987
+    }
+  ]
+}
+Traceback (most recent call last):
+  File "<stdin>", line 2, in <module>
+  File "/usr/lib/python3.13/json/__init__.py", line 293, in load
+    return loads(fp.read(),
+        cls=cls, object_hook=object_hook,
+        parse_float=parse_float, parse_int=parse_int,
+        parse_constant=parse_constant, object_pairs_hook=object_pairs_hook, **kw)
+  File "/usr/lib/python3.13/json/__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+cat: /tmp/pr314-item2.txt: No such file or directory
+>>>> dump disk
+{
+  "mode": "disk",
+  "storeId": "2VroEUvDkmYsDAwE5oG9YeFNadWH",
+  "wsPort": 4321,
+  "disk": {
+    "id": "5vyahbut147hw5dp4e1",
+    "name": "System Disk",
+    "dockedTo": "ENGINE_5vyahbut147hw5dp4e1",
+    "device": "sda2",
+    "diskTypes": [
+      "system"
+    ],
+    "preUpdateSnapshots": [
+      {
+        "complete": true,
+        "instanceId": "287zlp4mhphtliqikvu",
+        "sizeBytes": 49152
+      },
+      {
+        "complete": true,
+        "instanceId": "9vd2q5x8mdky9bpzjvn",
+        "sizeBytes": 49152
+      },
+      {
+        "complete": true,
+        "instanceId": "y8uio8lxoa74p9pcsip",
+        "sizeBytes": 53248
+      }
+    ],
+    "preUpdateBytes": 155648,
+    "quarantineBytes": 135168
+  },
+  "apps": {
+    "axle428-1.0": {
+      "id": "axle428-1.0",
+      "name": "axle428",
+      "title": "axle428",
+      "version": "1.0",
+      "category": ""
+    }
+  },
+  "instances": {
+    "287zlp4mhphtliqikvu": {
+      "id": "287zlp4mhphtliqikvu",
+      "name": "axle428-t",
+      "instanceOf": "axle428-1.0",
+      "storedOn": "5vyahbut147hw5dp4e1",
+      "status": "Running"
+    }
+  },
+  "diskStillPresent": true
+}
+Traceback (most recent call last):
+  File "<stdin>", line 2, in <module>
+  File "/usr/lib/python3.13/json/__init__.py", line 293, in load
+    return loads(fp.read(),
+        cls=cls, object_hook=object_hook,
+        parse_float=parse_float, parse_int=parse_int,
+        parse_constant=parse_constant, object_pairs_hook=object_pairs_hook, **kw)
+  File "/usr/lib/python3.13/json/__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+cat: /tmp/pr314-disk-present.txt: No such file or directory
+FAIL: ITEM2 forgetDisk check failed:  disk_present=
+==== ITEM1b stop + removeInstance ====
+>>>> dump disk
+{
+  "mode": "disk",
+  "storeId": "2VroEUvDkmYsDAwE5oG9YeFNadWH",
+  "wsPort": 4321,
+  "disk": {
+    "id": "5vyahbut147hw5dp4e1",
+    "name": "System Disk",
+    "dockedTo": "ENGINE_5vyahbut147hw5dp4e1",
+    "device": "sda2",
+    "diskTypes": [
+      "system"
+    ],
+    "preUpdateSnapshots": [
+      {
+        "complete": true,
+        "instanceId": "287zlp4mhphtliqikvu",
+        "sizeBytes": 49152
+      },
+      {
+        "complete": true,
+        "instanceId": "9vd2q5x8mdky9bpzjvn",
+        "sizeBytes": 49152
+      },
+      {
+        "complete": true,
+        "instanceId": "y8uio8lxoa74p9pcsip",
+        "sizeBytes": 53248
+      }
+    ],
+    "preUpdateBytes": 155648,
+    "quarantineBytes": 135168
+  },
+  "apps": {
+    "axle428-1.0": {
+      "id": "axle428-1.0",
+      "name": "axle428",
+      "title": "axle428",
+      "version": "1.0",
+      "category": ""
+    }
+  },
+  "instances": {
+    "287zlp4mhphtliqikvu": {
+      "id": "287zlp4mhphtliqikvu",
+      "name": "axle428-t",
+      "instanceOf": "axle428-1.0",
+      "storedOn": "5vyahbut147hw5dp4e1",
+      "status": "Running"
+    }
+  },
+  "diskStillPresent": true
+}
+BEFORE remove:
+Traceback (most recent call last):
+  File "<stdin>", line 2, in <module>
+  File "/usr/lib/python3.13/json/__init__.py", line 293, in load
+    return loads(fp.read(),
+        cls=cls, object_hook=object_hook,
+        parse_float=parse_float, parse_int=parse_int,
+        parse_constant=parse_constant, object_pairs_hook=object_pairs_hook, **kw)
+  File "/usr/lib/python3.13/json/__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+>> push-command: stopInstance axle428-t 5vyahbut147hw5dp4e1
+{"pushed":"stopInstance axle428-t 5vyahbut147hw5dp4e1","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+NAMES                       STATUS
+287zlp4mhphtliqikvu-web-1   Exited (137) Less than a second ago
+>> push-command: removeInstance 287zlp4mhphtliqikvu
+{"pushed":"removeInstance 287zlp4mhphtliqikvu","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+instances left:
+helper snapshots after remove:
+287zlp4mhphtliqikvu 52 complete
+9vd2q5x8mdky9bpzjvn 48 complete
+y8uio8lxoa74p9pcsip 52 complete
+TOTAL pre-update 156
+TOTAL quarantine 164
+/.pre-update after remove:
+total 20
+drwx------  5 root root 4096 Nov 11 04:50 .
+drwxr-xr-x 24 root root 4096 Nov 11 03:30 ..
+drwx------  4 root root 4096 Nov 11 04:52 287zlp4mhphtliqikvu
+drwx------  4 root root 4096 Nov 11 04:22 9vd2q5x8mdky9bpzjvn
+drwx------  4 root root 4096 Nov 11 03:30 y8uio8lxoa74p9pcsip
+/.idea-quarantine after remove:
+total 48
+drwx------ 12 root root 4096 Nov 11 04:55 .
+drwxr-xr-x 24 root root 4096 Nov 11 03:30 ..
+drwx------  2 root root 4096 Nov 11 04:52 287zlp4mhphtliqikvu-20261111T035538Z
+drwx------  2 pi   pi   4096 Nov 11 04:50 287zlp4mhphtliqikvu-before-restore-20261111T035244884226280Z
+drwx------  2 root root 4096 Nov 11 03:07 3iyi1r8bmvlyl7lvvpb-20261111T021938Z
+drwx------  2 root root 4096 Nov 11 03:04 5ie6xpi5wh42mgsbx7u-20261111T020718Z
+drwx------  2 root root 4096 Nov 11 04:21 9vd2q5x8mdky9bpzjvn-20261111T032536Z
+drwx------  2 root root 4096 Nov 11 04:22 ekngtrq0b6nb59vh3d6-20261111T032554Z
+drwx------  2 root root 4096 Nov 11 03:19 h7wd4t350auta0dfnbg-20261111T022829Z
+drwx------  2 root root 4096 Nov 11 04:23 s7fk0ccrtffba2h8fqh-20261111T032610Z
+drwx------  2 root root 4096 Nov 11 03:30 y8uio8lxoa74p9pcsip-20261111T023701Z
+drwx------  2 pi   pi   4096 Nov 11 03:30 y8uio8lxoa74p9pcsip-before-restore-20261111T023024684363928Z
+Removed instance 5ie6xpi5wh42mgsbx7u; its folder is kept at /.idea-quarantine/5ie6xpi5wh42mgsbx7u-20261111T020718Z
+Removed instance 3iyi1r8bmvlyl7lvvpb; its folder is kept at /.idea-quarantine/3iyi1r8bmvlyl7lvvpb-20261111T021938Z
+Removed instance h7wd4t350auta0dfnbg; its folder is kept at /.idea-quarantine/h7wd4t350auta0dfnbg-20261111T022829Z
+Removed instance y8uio8lxoa74p9pcsip; its folder is kept at /.idea-quarantine/y8uio8lxoa74p9pcsip-20261111T023701Z
+removeInstance: 9vd2q5x8mdky9bpzjvn ('axle427-est') quarantined at /.idea-quarantine/9vd2q5x8mdky9bpzjvn-20261111T032536Z; kept volumes: 9vd2q5x8mdky9bpzjvn_data
+Removed instance 9vd2q5x8mdky9bpzjvn; its folder is kept at /.idea-quarantine/9vd2q5x8mdky9bpzjvn-20261111T032536Z
+removeInstance: ekngtrq0b6nb59vh3d6 ('axle427-anon') quarantined at /.idea-quarantine/ekngtrq0b6nb59vh3d6-20261111T032554Z; kept volumes: ekngtrq0b6nb59vh3d6_data
+Removed instance ekngtrq0b6nb59vh3d6; its folder is kept at /.idea-quarantine/ekngtrq0b6nb59vh3d6-20261111T032554Z
+removeInstance: s7fk0ccrtffba2h8fqh ('axle427-mm') quarantined at /.idea-quarantine/s7fk0ccrtffba2h8fqh-20261111T032610Z; kept volumes: s7fk0ccrtffba2h8fqh_data
+Removed instance s7fk0ccrtffba2h8fqh; its folder is kept at /.idea-quarantine/s7fk0ccrtffba2h8fqh-20261111T032610Z
+removeInstance: 287zlp4mhphtliqikvu ('axle428-t') quarantined at /.idea-quarantine/287zlp4mhphtliqikvu-20261111T035538Z; kept volumes: 287zlp4mhphtliqikvu_data
+Removed instance 287zlp4mhphtliqikvu; its folder is kept at /.idea-quarantine/287zlp4mhphtliqikvu-20261111T035538Z
+>>>> dump all
+dump: TypeError: fetch failed
+    at node:internal/deps/undici/undici:13510:13
+    at async main (/home/pi/axle-428/script/dump-428.ts:69:24)
+Traceback (most recent call last):
+  File "<stdin>", line 2, in <module>
+  File "/usr/lib/python3.13/json/__init__.py", line 293, in load
+    return loads(fp.read(),
+        cls=cls, object_hook=object_hook,
+        parse_float=parse_float, parse_int=parse_int,
+        parse_constant=parse_constant, object_pairs_hook=object_pairs_hook, **kw)
+  File "/usr/lib/python3.13/json/__init__.py", line 346, in loads
+    return _default_decoder.decode(s)
+           ~~~~~~~~~~~~~~~~~~~~~~~^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 345, in decode
+    obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+               ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.13/json/decoder.py", line 363, in raw_decode
+    raise JSONDecodeError("Expecting value", s, err.value) from None
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+cat: /tmp/pr314-item1b.txt: No such file or directory
+FAIL: ITEM1b disk row still has snapshot or instance residue for 287zlp4mhphtliqikvu
+==== step results ====
+FAIL: ITEM3 RangeError=0 titleErr=0 appDB.title='' (want axle428, no RangeError)
+PASS: ATLAS estimate system 287zlp4mhphtliqikvu -> 16 4 84801680
+FAIL: ITEM3 appDB.title='' (want axle428)
+FAIL: ITEM1a disk row has no preUpdateSnapshot for 287zlp4mhphtliqikvu
+FAIL: ITEM2 forgetDisk check failed:  disk_present=
+FAIL: ITEM1b disk row still has snapshot or instance residue for 287zlp4mhphtliqikvu
+==== continuation done 2026-11-11T04:55:54+01:00 fails=5 ====
+temp_c=46.738
+============================================================
+idea04 PR #314 cleanup + restore 2026-11-11T04:56:52+01:00
+============================================================
+==== stop + remove proof instances (quarantine, never delete) ====
+>> push-command: stopInstance axle428-t 5vyahbut147hw5dp4e1
+{"pushed":"stopInstance axle428-t 5vyahbut147hw5dp4e1","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+instances after name-based remove: <none>
+==== quarantine scratch app bundles (not kolibri-channel-builder) ====
+apps now:
+total 12
+drwxr-xr-x  3 pi   pi   4096 Nov 11 04:57 .
+drwxr-xr-x 24 root root 4096 Nov 11 03:30 ..
+drwxrwxr-x  7 pi   pi   4096 Oct 15 08:28 kolibri-channel-builder-2551b7d
+quarantined apps:
+total 16
+drwxrwxr-x 4 pi pi 4096 Nov 11 04:57 .
+drwxrwxr-x 3 pi pi 4096 Nov 11 04:57 ..
+drwxr-xr-x 2 pi pi 4096 Nov 11 04:49 axle428-1.0
+drwxr-xr-x 2 pi pi 4096 Nov 11 04:49 axle428-1.1
+==== helper must still be main sha (we never replaced it) ====
+live 05886f4efc830e284961c5335074ed3ec148e3a53020ba21aaf4f736e1571766
+version idea-app-data 7
+==== restore pm2 engine to production e91467d, no IDEA_CONFIG_FILE ====
+production HEAD e91467dcb9dd455274d2da7d7aadc2c7a2efe34f
+2:  mdns: true      # atlas 2026-10-06: test pool mirrors production idea02 (mdns: true), Koen 03:50; static peers removed
+6:  systemDiskSkip: true   # Stage 2 pin (was IDEA_SYSTEM_DISK_SKIP env; PLAN 5 unchanged)
+[PM2] Applying action deleteProcessId on app [engine](ids: [ 15 ])
+[PM2] [engine](15) ✓
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 14 │ idea-usage       │ default     │ 1.0     │ fork    │ 868635   │ 22m    │ 0    │ online    │ 0%       │ 73.8mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 0%       │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 27.5% | ram usage: 22.8% | lo: ⇓ 0.036mb/s ⇑ 0.036mb/s | eth0: ⇓ 0.003mb/s ⇑ 0.002mb/s drop 214/min | disk: ⇓ 0mb/s ⇑ 0.07mb/s / 61.61%
+[PM2] Starting /home/pi/idea/agents/agent-engine-dev/dist/src/index.js in fork_mode (1 instance)
+[PM2] Done.
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 16 │ engine           │ default     │ 1.0     │ fork    │ 890326   │ 0s     │ 0    │ online    │ 0%       │ 21.0mb   │ pi       │ disabled │
+│ 14 │ idea-usage       │ default     │ 1.0     │ fork    │ 868635   │ 22m    │ 0    │ online    │ 0%       │ 73.8mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 0%       │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 27.5% | ram usage: 22.8% | lo: ⇓ 0.036mb/s ⇑ 0.036mb/s | eth0: ⇓ 0.003mb/s ⇑ 0.002mb/s drop 214/min | disk: ⇓ 0mb/s ⇑ 0.07mb/s / 61.61%
+status online restarts 0 pid 890326
+cwd /home/pi/idea/agents/agent-engine-dev
+script /home/pi/idea/agents/agent-engine-dev/dist/src/index.js
+username pi
+IDEA_CONFIG_FILE None
+IDEA_USAGE_AS_MAIN None
+IDEA_NETWORK_TESTS None
+NODE_ENV development
+VERBOSITY 3
+restored engine env OK
+try 1: :8080 -> 000fail temp=50.147C
+try 2: :8080 -> 000fail temp=48.686C
+try 3: :8080 -> 000fail temp=49.173C
+try 4: :8080 -> 000fail temp=48.686C
+try 5: :8080 -> 000fail temp=49.660C
+try 6: :8080 -> 000fail temp=49.173C
+try 7: :8080 -> 000fail temp=50.147C
+try 8: :8080 -> 000fail temp=48.686C
+try 9: :8080 -> 200 temp=48.686C
+[PM2] Saving current process list...
+[PM2] Successfully saved in /home/pi/.pm2/dump.pm2
+pm2 save done
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 16 │ engine           │ default     │ 1.0     │ fork    │ 890326   │ 45s    │ 0    │ online    │ 0%       │ 362.4mb  │ pi       │ disabled │
+│ 14 │ idea-usage       │ default     │ 1.0     │ fork    │ 868635   │ 23m    │ 0    │ online    │ 0%       │ 73.8mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 0%       │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 28.9% | ram usage: 21.3% | eth0: ⇓ 0.003mb/s ⇑ 0.001mb/s drop 208/min | disk: ⇓ 0mb/s ⇑ 0.03mb/s / 61.61%
+==== updtest still healthy ====
+NAMES                    STATUS
+updtest-i76stale-web-1   Up 6 hours (healthy)
+updtest-i76minor-web-1   Up 6 hours (healthy)
+updtest-i76major-web-1   Up 6 hours (healthy)
+==== helper + production confirmation ====
+HEAD production: e91467dcb9dd455274d2da7d7aadc2c7a2efe34f
+helper sha 05886f4efc830e284961c5335074ed3ec148e3a53020ba21aaf4f736e1571766  /usr/local/sbin/idea-app-data
+helper version idea-app-data 7
+2:  mdns: true      # atlas 2026-10-06: test pool mirrors production idea02 (mdns: true), Koen 03:50; static peers removed
+6:  systemDiskSkip: true   # Stage 2 pin (was IDEA_SYSTEM_DISK_SKIP env; PLAN 5 unchanged)
+usage settings:
+{"usageMonitoring":"on"}
+curl :8080 -> 200
+==== quarantine checkout, outside config, scripts ====
+Removing worktrees/axle-428: gitdir file points to non-existent location
+worktrees:
+/home/pi/idea/agents/agent-engine-dev  e91467d (detached HEAD)
+ls: cannot access '/home/pi/axle-428': No such file or directory
+ls: cannot access '/home/pi/axle-428-config.yaml': No such file or directory
+quarantine home /home/pi/axle-428.quarantine-20261111T035652Z
+==== release-script complete 2026-11-11T04:58:02+01:00 ====

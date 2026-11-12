@@ -9,7 +9,7 @@
 # WHAT THIS DOES:
 #   1. Verifies internet connectivity (wlan0 should be connected to Starlink)
 #   2. Starts tailscaled
-#   3. Joins the IDEA Tailnet (ephemeral — Pi is removed automatically on disconnect)
+#   3. Joins the IDEA Tailnet with --advertise-tags=tag:idea (not ephemeral)
 #   4. Prints the Tailscale IP for Tapiwa to relay to IDEA staff
 #   5. Waits for Enter (Tapiwa presses it when the session is done)
 #   6. Runs tailscale down, stops tailscaled — Pi is isolated again
@@ -54,12 +54,13 @@ info "Starting tailscaled..."
 systemctl start tailscaled
 sleep 2
 
-info "Joining IDEA Tailnet (ephemeral)..."
+info "Joining IDEA Tailnet..."
 # --auth-key=file:<path>: tailscale reads the key from the root-only file, so the
 # key itself is never a command-line argument (visible with ps) (idea#115).
+# No --ephemeral: an ephemeral node vanishes after it has been offline, and
+# the D-2 key is non-ephemeral.
 tailscale up \
   --auth-key="file:$AUTH_KEY_FILE" \
-  --ephemeral \
   --advertise-tags=tag:idea \
   --hostname="$(hostname)"
 

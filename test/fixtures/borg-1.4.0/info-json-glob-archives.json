@@ -1,0 +1,125 @@
+{
+    "archives": [
+        {
+            "chunker_params": [
+                "buzhash",
+                19,
+                23,
+                21,
+                4095
+            ],
+            "command_line": [
+                "/usr/bin/borg",
+                "create",
+                "--numeric-ids",
+                "--",
+                "/disks/sdc1/backups/inst-1::2026-11-12T02-14-50-000Z",
+                "instances/inst1"
+            ],
+            "comment": "",
+            "duration": 0.002053,
+            "end": "2026-11-12T03:27:21.000000",
+            "hostname": "idea03",
+            "id": "d71ad35c80cc5d6df92ab48882d7d3220b687570480b9af03d8f92ffea53bf3e",
+            "limits": {
+                "max_archive_size": 2.5796940692642612e-05
+            },
+            "name": "2026-11-12T02-14-50-000Z",
+            "start": "2026-11-12T03:27:21.000000",
+            "stats": {
+                "compressed_size": 11,
+                "deduplicated_size": 541,
+                "nfiles": 2,
+                "original_size": 5
+            },
+            "username": "root"
+        },
+        {
+            "chunker_params": [
+                "buzhash",
+                19,
+                23,
+                21,
+                4095
+            ],
+            "command_line": [
+                "/usr/bin/borg",
+                "create",
+                "--numeric-ids",
+                "--",
+                "/disks/sdc1/backups/inst-1::2026-11-12T02-16-00-000Z",
+                "instances/inst1"
+            ],
+            "comment": "",
+            "duration": 0.001705,
+            "end": "2026-11-12T03:27:21.000000",
+            "hostname": "idea03",
+            "id": "6c17db483f9b2f059a186ef42010cde4fde9a8cd670f3cadaa8762bf955e0d4e",
+            "limits": {
+                "max_archive_size": 2.5796940692642612e-05
+            },
+            "name": "2026-11-12T02-16-00-000Z",
+            "start": "2026-11-12T03:27:21.000000",
+            "stats": {
+                "compressed_size": 11,
+                "deduplicated_size": 541,
+                "nfiles": 2,
+                "original_size": 5
+            },
+            "username": "root"
+        },
+        {
+            "chunker_params": [
+                "buzhash",
+                19,
+                23,
+                21,
+                4095
+            ],
+            "command_line": [
+                "/usr/bin/borg",
+                "create",
+                "--numeric-ids",
+                "--",
+                "/disks/sdc1/backups/inst-1::2026-11-12T02-16-01-000Z",
+                "instances/inst1"
+            ],
+            "comment": "",
+            "duration": 0.002119,
+            "end": "2026-11-12T03:27:22.000000",
+            "hostname": "idea03",
+            "id": "c6a9f8ac1c12752ebe67a24c60bb28123ef8f4a95bcb6279272d6bfe7294a29d",
+            "limits": {
+                "max_archive_size": 2.5796940692642612e-05
+            },
+            "name": "2026-11-12T02-16-01-000Z",
+            "start": "2026-11-12T03:27:22.000000",
+            "stats": {
+                "compressed_size": 11,
+                "deduplicated_size": 541,
+                "nfiles": 2,
+                "original_size": 5
+            },
+            "username": "root"
+        }
+    ],
+    "cache": {
+        "path": "/root/.cache/borg/e402d571c3822d1a930681f935a92871a2e253d876facbad812baa7aa2f766b8",
+        "stats": {
+            "total_chunks": 12,
+            "total_csize": 33,
+            "total_size": 15,
+            "total_unique_chunks": 6,
+            "unique_csize": 1900,
+            "unique_size": 2383
+        }
+    },
+    "encryption": {
+        "mode": "none"
+    },
+    "repository": {
+        "id": "e402d571c3822d1a930681f935a92871a2e253d876facbad812baa7aa2f766b8",
+        "last_modified": "2026-11-12T03:27:22.000000",
+        "location": "/disks/sdc1/backups/inst-1"
+    }
+}

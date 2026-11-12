@@ -21,6 +21,10 @@ export type UpdateRefusal =
     | 'NOT_DOCKED' | 'BUSY' | 'SOURCE_MISSING' | 'DIFFERENT_APP' | 'NOT_NEWER'
     | 'MAJOR_NOT_ALLOWED' | 'NEEDS_BACKUP' | 'NO_SPACE' | 'NO_SUMS'
     | 'NOT_FOUND' | 'AMBIGUOUS' | 'HELPER_OUTDATED' | 'TRANSFER_FAILED'
+    // idea#448: the backup updateApp takes itself before a major update
+    | 'BAD_BACKUP_SPEC' | 'HOOK_FAILED' | 'BACKUP_FAILED'
+    // idea#448: the new bundle ships a path the snapshot and rollback leave out
+    | 'BUNDLE_CONTAINS_EXCLUDED'
 
 /** Error text starts with the code; the two rollback outcomes use the console#168 wording. */
 export const ROLLED_BACK_PREFIX = 'ROLLED BACK:'
@@ -59,6 +63,11 @@ export interface CheckFacts {
     shortDisks: string[]
     /** x-app.updatesFrom of the NEW bundle (idea#76); absent = no extra rule */
     updatesFrom?: unknown
+    /**
+     * idea#448: a Backup Disk linked to the instance is docked here, so updateApp takes the
+     * required backup itself (hook before the stop, or Borg inside the Snapshot stop).
+     */
+    backupPlanned?: boolean
 }
 
 /**
@@ -75,19 +84,58 @@ export const majorAllowedByUpdatesFrom = (fromVersion: string, updatesFrom: unkn
 
 export const BACKUP_MAX_AGE_MS = 60 * 60 * 1000
 
+/**
+ * idea#448: true when this update needs a fresh backup (a major upgrade, idea#76: an
+ * unversioned SHA to a tag stays major, and no backup in the last hour).
+ */
+export const backupIsDue = (currentAppId: string, newAppId: string, backupAgeMs: number | null): boolean => {
+    const cur = parseAppId(currentAppId).version, nxt = parseAppId(newAppId).version
+    if (!isUpgrade(cur, nxt) || !isMajorChange(cur, nxt)) return false
+    return backupAgeMs === null || backupAgeMs > BACKUP_MAX_AGE_MS
+}
+
+/** createAppId(undefined, undefined) stringifies missing x-app.name / x-app.version as "undefined". */
+const isMissingAppField = (value: string): boolean => value === '' || value === 'undefined'
+
+const showAppField = (value: string): string => isMissingAppField(value) ? '(missing)' : value
+
+/**
+ * Why updateApp should refuse DIFFERENT_APP: missing or mismatched x-app.name
+ * and/or x-app.version, with the instance's actual values and the bundle's expected ones.
+ * createOrUpdateInstance sets instanceOf from those compose fields, so a bundle
+ * without them becomes `undefined-undefined` (seen on idea04 during #311).
+ */
+export const appIdentityProblems = (currentAppId: string, newAppId: string): string | null => {
+    const cur = parseAppId(currentAppId), nxt = parseAppId(newAppId)
+    const problems: string[] = []
+    if (isMissingAppField(cur.name) || isMissingAppField(nxt.name)) {
+        problems.push(`x-app.name is missing (actual: ${showAppField(cur.name)}, expected: ${showAppField(nxt.name)})`)
+    } else if (cur.name !== nxt.name) {
+        problems.push(`x-app.name mismatch (actual: ${cur.name}, expected: ${nxt.name})`)
+    }
+    if (isMissingAppField(cur.version) || isMissingAppField(nxt.version)) {
+        problems.push(`x-app.version is missing (actual: ${showAppField(cur.version)}, expected: ${showAppField(nxt.version)})`)
+    } else if (cur.name !== nxt.name && cur.version !== nxt.version) {
+        problems.push(`x-app.version mismatch (actual: ${cur.version}, expected: ${nxt.version})`)
+    }
+    return problems.length ? problems.join('; ') : null
+}
+
 /** First refusal in the agreed order, or null when the update may go ahead. */
 export const checkUpdate = (f: CheckFacts): UpdateAppError | null => {
     if (!f.diskDocked) return new UpdateAppError('NOT_DOCKED', 'the App Disk is not docked to this Engine')
     if (f.busy) return new UpdateAppError('BUSY', 'another operation is running on this instance')
     if (!f.sourcePresent) return new UpdateAppError('SOURCE_MISSING', `bundle ${f.newAppId} was not found on the source`)
     if (!f.sumsValid) return new UpdateAppError('NO_SUMS', `bundle ${f.newAppId} has no valid SHA256SUMS`)
+    const identity = appIdentityProblems(f.currentAppId, f.newAppId)
+    if (identity) return new UpdateAppError('DIFFERENT_APP', identity)
     const cur = parseAppId(f.currentAppId), nxt = parseAppId(f.newAppId)
-    if (cur.name !== nxt.name) return new UpdateAppError('DIFFERENT_APP', `${f.newAppId} is not a version of ${cur.name}`)
     if (!isUpgrade(cur.version, nxt.version)) return new UpdateAppError('NOT_NEWER', `${nxt.version} is not newer than ${cur.version}`)
     const major = isMajorChange(cur.version, nxt.version)
     if (major && !f.allowMajor) return new UpdateAppError('MAJOR_NOT_ALLOWED', `${cur.version} -> ${nxt.version} is a major update; pass --allow-major`)
     if (major && !majorAllowedByUpdatesFrom(cur.version, f.updatesFrom)) return new UpdateAppError('MAJOR_NOT_ALLOWED', `version ${nxt.version} cannot update directly from major ${parseVersion(cur.version)?.[0]}; supported: ${(f.updatesFrom as unknown[]).join(', ') || 'none'}`)
-    if (major && (f.backupAgeMs === null || f.backupAgeMs > BACKUP_MAX_AGE_MS)) return new UpdateAppError('NEEDS_BACKUP', 'Dock a Backup Disk and make a backup first')
+    if (major && (f.backupAgeMs === null || f.backupAgeMs > BACKUP_MAX_AGE_MS) && !f.backupPlanned)
+        return new UpdateAppError('NEEDS_BACKUP', 'Dock a Backup Disk linked to this instance (updateApp then takes the backup itself), or make a backup first')
     if (f.shortDisks.length) return new UpdateAppError('NO_SPACE', `not enough free space on ${f.shortDisks.join(', ')}`)
     return null
 }

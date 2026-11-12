@@ -53,6 +53,13 @@ Teacher USB sticks (idea#193): Engine ⇄ app interface — `/run/idea-usb` moun
 vfat/exFAT mount options, store fields and what apps (Nextcloud, Kolibri) see.
 → [docs/USB-STICKS.md](USB-STICKS.md)
 
+## USAGE-CONTRACT.md
+**Status:** Authoritative (idea-usage process on main since #308 / `16c3174`; `/usr/local/sbin/idea-usage-export` is the Python asset, idea#412)  ·  **Maintained by:** Axle
+Field usage monitoring (idea#411 / idea#412): `x-app.usage` hook shape and invocation,
+day/sample/presence JSON schemas, on-disk layout under `/var/lib/idea/usage/`,
+export wire format (`since`, `archive-and-clear`), off switch (`idea-usage-settings` `on`/`off`/`status`) and `usageSummaries`.
+→ [docs/USAGE-CONTRACT.md](USAGE-CONTRACT.md)
+
 ## interfaces.json
 **Status:** Static snapshot (intentionally not updated; idea#308)  ·  **Maintained by:** Axle
 A one-off sample of Node's `os.networkInterfaces()` output from a Pi, kept as an example of the

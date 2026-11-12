@@ -1,0 +1,2616 @@
+idea04 PR #311 live proof — 2026-11-11 (Europe/Brussels, UTC+1)
+================================================================================
+Verdict: PASS (with pre-existing helper avail_kb caveat; see below)
+PR:     https://github.com/koenswings/agent-engine-dev/pull/311
+Head:   e57fd17a9e21e397c0d81da609bf623c5b73613f
+        idea#424: use diskPath/joinMountRoot for updateApp rollback and siblings
+Parent: f4659fd idea#424: compose down before quarantine on removeInstance
+Main:   82412214ddcaefe25bf34d9407479ecb9c130202
+Pi:     idea04 (100.108.39.45), claimed as Axle
+Issue:  https://github.com/koenswings/idea/issues/424
+
+Box tests (this session, 2026-11-11 ~03:34 Europe/Brussels)
+--------------------------------------------------------------------------------
+tsc: OK
+vitest --maxWorkers=1:
+  test/data/remove-instance.test.ts
+  test/data/update-app.test.ts
+  test/data/rename-instance.test.ts
+  test/data/restore-pre-quarantine.test.ts
+  test/data/update-fetch.test.ts
+  (plus the matching sibling file already in the suite)
+  6 files / 62 tests passed
+
+Engine under test
+--------------------------------------------------------------------------------
+pm2 name=engine user=pi (never root)
+script: /home/pi/axle-311/dist/src/index.js   (checkout of e57fd17)
+cwd:    /home/pi/idea/agents/agent-engine-dev (so relative store-data / store-identity resolve)
+env:    IDEA_CONFIG_FILE=/home/pi/axle-311-config.yaml
+        IDEA_NETWORK_TESTS=0
+        outside config copy: systemDiskSkip: false; store paths kept relative
+real /home/pi/idea/agents/agent-engine-dev/config.yaml: untouched (systemDiskSkip: true, mdns: true)
+usageMonitoring: on (left on); idea-usage left running throughout
+mDNS: on
+Temperature: 43–51 °C (pause threshold 75 °C; never approached)
+Not touched: WD SSD 20070Q450002, /disks, ~/atlas-322*, ~/idea-proof-322,
+             /apps/kolibri-channel-builder-2551b7d, existing named volumes (no docker volume rm)
+
+System disk registered for the proof: id 5vyahbut147hw5dp4e1 (sda2, diskTypes [system])
+Engine id: ENGINE_5vyahbut147hw5dp4e1
+
+removeInstance steps 1–8
+--------------------------------------------------------------------------------
+Instance: 5ie6xpi5wh42mgsbx7u  name=axle311-rm  app=axleproof-1.0  disk=system
+
+STEP1 PASS  installApp axleproof-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle311-rm --fresh
+            engine-out: "App 5ie6xpi5wh42mgsbx7u running"  port 55889
+
+STEP2 PASS  stopInstance axle311-rm 5vyahbut147hw5dp4e1
+            docker ps -a --filter label=com.docker.compose.project=5ie6xpi5wh42mgsbx7u
+            showed 5ie6xpi5wh42mgsbx7u-web-1  Exited (137)
+            (An early wait helper polluted stdout and first marked this FAIL; the real
+            container was Exited. Later wait helpers print progress to stderr.)
+
+STEP3 PASS  removeInstance 5ie6xpi5wh42mgsbx7u  under the pm2 engine as pi
+            engine-out: "Removed instance 5ie6xpi5wh42mgsbx7u; its folder is kept at
+            /.idea-quarantine/5ie6xpi5wh42mgsbx7u-20261111T020718Z"
+            (UTC 02:07:18 = 03:07:18 Europe/Brussels)
+
+STEP4 PASS  compose down ran before quarantine (pass-by-effect).
+            docker compose down uses zx .quiet(), so a successful CLI invocation is not
+            echoed on engine-out. Order is proved because the Exited leftovers disappeared
+            and the tree then appeared under /.idea-quarantine (Kid's bug on idea03 left
+            six Exited containers after the root:root 0700 move, because a path glob as
+            pi matched nothing).
+
+STEP5 PASS  docker ps -a --filter label=com.docker.compose.project=5ie6xpi5wh42mgsbx7u
+            is empty after removeInstance.
+
+STEP6 PASS  named volume 5ie6xpi5wh42mgsbx7u_axle311data is still present (down without -v).
+
+STEP7 PASS  sudo ls -ld /.idea-quarantine/5ie6xpi5wh42mgsbx7u-20261111T020718Z
+            -> drwx------ root root
+
+STEP8 PASS  Forced compose down to fail without editing Engine source:
+            instance 3iyi1r8bmvlyl7lvvpb (axle311-upd) was stopped, then compose.yaml
+            replaced with the invalid document `this is not valid yaml: [[`.
+            removeInstance threw:
+              COMPOSE_DOWN_FAILED: docker compose down failed for 'axle311-upd':
+              failed to parse /instances/3iyi1r8bmvlyl7lvvpb/compose.yaml: go-yaml load
+              error in parser (while parsing a flow node) at L2.C1: did not find expected
+              node content
+            The absolute -f path /instances/<id>/compose.yaml is in that error.
+            Folder stayed at /instances/3iyi1r8bmvlyl7lvvpb and the store row stayed.
+            compose.yaml was then restored from backup and the scratch instance was
+            later removeInstance'd to
+            /.idea-quarantine/3iyi1r8bmvlyl7lvvpb-20261111T021938Z.
+
+UpdateApp system-disk rollback
+--------------------------------------------------------------------------------
+PASS on y8uio8lxoa74p9pcsip (axle311-upd3).
+
+Caveats required to reach the rollback path (neither is part of this PR):
+  1. idea-app-data v7 SYSTEM_ROOT='' makes avail_kb "" call `df` on an empty path.
+     `estimate system <id>` printed only `16 8` plus stderr
+     `refused: cannot tell the free space of ` and parseEstimate threw
+     `idea-app-data estimate gave no result line: 16 8`.
+     Temporary one-line patch: avail_kb uses `local dir="${1:-/}"`.
+     Same helper is used by snapshot, so the patch was required for rollback too.
+     Original helper was restored before release
+     (sha256 c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c).
+  2. Scratch bundles initially lacked x-app.name / x-app.version, so createOrUpdateInstance
+     set instanceOf to undefined-undefined and updateApp checkUpdate threw DIFFERENT_APP.
+     Both /apps/axleproof-1.0 and /apps/axleproof-1.1 were given
+     x-app.name: axleproof and version 1.0 / 1.1.
+     Intermediate instance h7wd4t350auta0dfnbg (axle311-upd2) was installed then
+     removeInstance'd to /.idea-quarantine/h7wd4t350auta0dfnbg-20261111T022829Z.
+
+Successful sequence (engine-out / engine-error):
+  App y8uio8lxoa74p9pcsip running          (1.0, port 50589)
+  Step 3/6 Snapshot  + stopInstance
+  Step 4/6 Swap
+  Step 5/6 Start of 1.1
+    "Container(s) exited after compose up ... y8uio8lxoa74p9pcsip-web-1: Exited (42)"
+    (1.1 compose used `command: ["sh","-c","exit 42"]` and restart: "no" so
+    assertComposeContainersHealthy fails fast instead of the 600s health timeout)
+  Starting instance 'y8uio8lxoa74p9pcsip' on disk 5vyahbut147hw5dp4e1 ...  (rollback start)
+  App y8uio8lxoa74p9pcsip running          (restored 1.0, unless-stopped httpd)
+  engine-error:
+    ROLLED BACK: Start failed: start failed: Engine error: Container(s) exited after
+    compose up for y8uio8lxoa74p9pcsip. Automerge must not stay Running.
+    y8uio8lxoa74p9pcsip-web-1: Exited (42) 2 seconds ago. axleproof-1.0 and its data
+    were restored from /.pre-update/y8uio8lxoa74p9pcsip
+  Failed 1.1 tree:
+    /.idea-quarantine/y8uio8lxoa74p9pcsip-before-restore-20261111T023024684363928Z
+
+compose down / up on rollback also use zx .quiet(), so `-f /instances/<id>/compose.yaml`
+is not echoed. This head's UpdateApp.composeDown builds that absolute -f via
+joinMountRoot/diskPath; startInstance cwd is /instances/<id> on the system disk.
+The STEP8 COMPOSE_DOWN_FAILED line is the live echo of the same absolute -f pattern.
+
+Cleanup and release (2026-11-11 03:36–03:38 Europe/Brussels)
+--------------------------------------------------------------------------------
+- stopInstance axle311-upd3 then removeInstance y8uio8lxoa74p9pcsip
+  -> /.idea-quarantine/y8uio8lxoa74p9pcsip-20261111T023701Z
+  label filter empty; folder gone from /instances
+- Scratch quarantined (never deleted) to
+  /home/pi/axle-311.quarantine-20261111T023620Z
+  (axle-311 checkout, axle-311-config.yaml, proof/setup scripts,
+   /apps/axleproof-1.0 and 1.1, helper backup + patched copy)
+- /apps now contains only kolibri-channel-builder-2551b7d
+- Helper restored: sha256 c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c
+- production worktree pruned (axle-311 was a git worktree of the production tree)
+- pm2 delete engine; start /home/pi/idea/agents/agent-engine-dev/dist/src/index.js
+  --name engine --cwd that tree as pi; IDEA_CONFIG_FILE unset
+- production HEAD 82412214ddcaefe25bf34d9407479ecb9c130202
+- http://127.0.0.1:8080/ -> 200 (after ~30s startup); then pm2 save
+- idea-usage still online from production dist/src/usage/main.js
+- usage settings still {"usageMonitoring":"on"}
+- real config.yaml still systemDiskSkip: true, mdns: true
+- updtest-i76stale/minor/major still Up ~4h (healthy) on the WD fixtures
+- leftover named volumes (kept on purpose; down without -v):
+    5ie6xpi5wh42mgsbx7u_axle311data
+    3iyi1r8bmvlyl7lvvpb_axle311data
+    h7wd4t350auta0dfnbg_axle311data
+    y8uio8lxoa74p9pcsip_axle311data
+- The system-disk store row created while systemDiskSkip was false remains in the
+  shared store (lastDocked written to /META.yaml during the proof). Production
+  with systemDiskSkip: true will not re-register sda2; the row was not hand-deleted.
+
+Raw session log from the Pi follows (setup, proof scripts, cleanup).
+================================================================================
+
+2026-11-11T02:53:12+01:00
+==== idea04 PR #311 setup (Axle) ====
+user=pi host=idea04 pwd=/home/pi
+temperature 43.816 C
+temp_c=44.303
+==== disks (do not touch WD 20070Q450002 or /disks) ====
+NAME     SIZE MODEL                  SERIAL               MOUNTPOINT
+loop0      2G                                             
+sda    223.6G JAJS300M240C           AA202000000000002167 
+├─sda1   512M                                             /boot/firmware
+└─sda2 223.1G                                             /
+sdb    111.8G WDC WDS120G2G0A-00JH30 20070Q450002         
+├─sdb1     1G                                             /disks/sdb1
+├─sdb2     1G                                             /disks/sdb2
+├─sdb3     1G                                             
+└─sdb4 108.8G                                             
+zram0      2G                                             [SWAP]
+==== helper version ====
+idea-app-data 7
+-r--r----- 1 root root  4727 Nov 10 23:44 /etc/sudoers.d/11-engine-files
+-rwxr-xr-x 1 root root 71490 Nov 10 23:44 /usr/local/sbin/idea-app-data
+==== current engine ====
+82412214ddcaefe25bf34d9407479ecb9c130202
+8241221 idea#411: idea-usage always starts under pm2 (#310)
+IDEA_CONFIG_FILE in this shell: unset
+ Describing process with id 1 - name engine 
+┌───────────────────┬─────────────────────────────────────────────────────────┐
+│ status            │ online                                                  │
+│ name              │ engine                                                  │
+│ namespace         │ default                                                 │
+│ version           │ 1.0                                                     │
+│ restarts          │ 8                                                       │
+│ uptime            │ 2h                                                      │
+│ script path       │ /home/pi/idea/agents/agent-engine-dev/dist/src/index.js │
+│ script args       │ N/A                                                     │
+│ error log path    │ /home/pi/.pm2/logs/engine-error.log                     │
+│ out log path      │ /home/pi/.pm2/logs/engine-out.log                       │
+│ pid path          │ /home/pi/.pm2/pids/engine-1.pid                         │
+│ interpreter       │ node                                                    │
+│ interpreter args  │ N/A                                                     │
+│ script id         │ 1                                                       │
+│ exec cwd          │ /home/pi/idea/agents/agent-engine-dev                   │
+│ exec mode         │ fork_mode                                               │
+│ node.js version   │ 22.20.0                                                 │
+│ node env          │ development                                             │
+│ watch & reload    │ ✘                                                       │
+│ unstable restarts │ 0                                                       │
+│ created at        │ 2026-11-10T23:40:16.874Z                                │
+└───────────────────┴─────────────────────────────────────────────────────────┘
+ Actions available 
+┌────────────────────────┐
+│ km:heapdump            │
+│ km:cpu:profiling:start │
+│ km:cpu:profiling:stop  │
+│ km:heap:sampling:start │
+│ km:heap:sampling:stop  │
+└────────────────────────┘
+ Trigger via: pm2 trigger engine <action_name>
+
+ Code metrics value 
+┌────────────────────────┬───────────┐
+│ Heap Size              │ 88.09 MiB │
+│ Heap Usage             │ 54.99 %   │
+│ Used Heap Size         │ 48.44 MiB │
+│ Active requests        │ 0         │
+│ Active handles         │ 13        │
+│ Event Loop Latency     │ 0.25 ms   │
+│ Event Loop Latency p95 │ 1.92 ms   │
+│ HTTP Mean Latency      │ 7 ms      │
+│ HTTP P95 Latency       │ 8 ms      │
+│ HTTP                   │ 0 req/min │
+└────────────────────────┴───────────┘
+ Divergent env variables from local env 
+┌────────────────┬───────────────────────────────────────┐
+│ PWD            │ /home/pi/idea/agents/agent-engine-dev │
+│ SSH_CONNECTION │ 100.64.66.119 56108 100.108.39.45 22  │
+│ XDG_SESSION_ID │ 1672                                  │
+│ SSH_CLIENT     │ 100.64.66.119 56108 22                │
+└────────────────┴───────────────────────────────────────┘
+
+ Add your own code metrics: http://bit.ly/code-metrics
+ Use `pm2 logs engine [--lines 1000]` to display logs
+ Use `pm2 env 1` to display environment variables
+ Use `pm2 monit` to monitor CPU and Memory usage engine
+==== docker images (busybox/whoami/nginx) ====
+traefik/whoami:latest	c4717a8d1f01	18MB
+alpine:3.20	d9e853e87e55	13.7MB
+busybox:1.36.1	73aaf090f3d8	6.14MB
+==== stop pm2 engine as pi (leave idea-usage running) ====
+[PM2] Applying action stopProcessId on app [engine](ids: [ 1 ])
+[PM2] [engine](1) ✓
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 1  │ engine           │ default     │ 1.0     │ fork    │ 0        │ 0      │ 8    │ stopped   │ 0%       │ 0b       │ pi       │ disabled │
+│ 3  │ idea-usage       │ default     │ 1.0     │ fork    │ 702964   │ 108m   │ 1    │ online    │ 0%       │ 71.7mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 0%       │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 5.6% | ram usage: 21.7% | eth0: ⇓ 0.002mb/s ⇑ 0.001mb/s drop 212/min | disk: ⇓ 0mb/s ⇑ 0.027mb/s / 61.4%
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 1  │ engine           │ default     │ 1.0     │ fork    │ 0        │ 0      │ 8    │ stopped   │ 0%       │ 0b       │ pi       │ disabled │
+│ 3  │ idea-usage       │ default     │ 1.0     │ fork    │ 702964   │ 108m   │ 1    │ online    │ 0%       │ 71.7mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 0%       │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 5.6% | ram usage: 21.7% | eth0: ⇓ 0.002mb/s ⇑ 0.001mb/s drop 212/min | disk: ⇓ 0mb/s ⇑ 0.027mb/s / 61.4%
+==== fetch PR head and create separate checkout /home/pi/axle-311 ====
+From https://github.com/koenswings/agent-engine-dev
+ * branch            e57fd17a9e21e397c0d81da609bf623c5b73613f -> FETCH_HEAD
+commit
+Preparing worktree (detached HEAD e57fd17)
+HEAD is now at e57fd17 idea#424: use diskPath/joinMountRoot for updateApp rollback and siblings
+e57fd17a9e21e397c0d81da609bf623c5b73613f
+e57fd17 idea#424: use diskPath/joinMountRoot for updateApp rollback and siblings
+==== pnpm install (reuse production node_modules as cache) ====
+Lockfile is up to date, resolution step is skipped
+Already up to date
+
+╭ Warning ─────────────────────────────────────────────────────────────────────╮
+│                                                                              │
+│   Ignored build scripts: cbor-extract@2.2.0, esbuild@0.27.3.                 │
+│   Run "pnpm approve-builds" to pick which dependencies should be allowed     │
+│   to run scripts.                                                            │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+Done in 2.4s using pnpm v10.33.0
+==== pnpm build ====
+temperature 45.764 C
+temp_c=45.764
+
+> engine@1.0 tsc /home/pi/axle-311
+> tsc
+
+build ok: -rw-rw-r-- 1 pi pi 637 Nov 11 02:54 dist/src/index.js
+==== outside config copy (do not edit real config.yaml) ====
+wrote /home/pi/axle-311-config.yaml bytes 7468
+orig sha256 58a4ff4455ecfb64d397673d9d601d839ac9605d2713931dafbdf0d2f1974cb7
+copy sha256 dee550f407905ba99590c33b97bee9b6a4283cb175055e82d22fc240cfbea8ff
+--- relevant lines ---
+  mdns: true      # atlas 2026-10-06: test pool mirrors production idea02 (mdns: true), Koen 03:50; static peers removed
+  testMode: false   # Stage 2 real disks (switchover v2 2026-10-09)
+  systemDiskSkip: false   # Stage 2 pin (was IDEA_SYSTEM_DISK_SKIP env; PLAN 5 unchanged)
+  peerAccess: true       # r39 per-Pi Engine keys (46d4d57): testMode would switch it off (peerAccessEnabled)
+  httpPort: 8080      # idea04 local override (Console URL http://idea04:8080/)
+  storeDataFolder: /home/pi/idea/agents/agent-engine-dev/store-data
+  storeIdentityFolder: /home/pi/idea/agents/agent-engine-dev/store-identity
+real config.yaml unchanged OK
+==== scratch app bundle /apps/axleproof-1.0 ====
+/home/pi/axle-311-setup.sh: line 121: /apps/axleproof-1.0/compose.yaml: Permission denied
+==== continue setup after /apps permission fix ====
+2026-11-11T02:54:45+01:00
+drwxr-xr-x 4 pi   pi   4096 Nov 11 02:54 /apps
+drwxr-xr-x 2 root root 4096 Nov 11 02:54 /apps/axleproof-1.0
+drwxr-xr-x 2 pi pi 4096 Nov 11 02:54 /apps/axleproof-1.0
+--- axleproof-1.0 ---
+total 16
+drwxr-xr-x 2 pi pi 4096 Nov 11 02:54 .
+drwxr-xr-x 4 pi pi 4096 Nov 11 02:54 ..
+-rw-rw-r-- 1 pi pi  526 Nov 11 02:54 compose.yaml
+-rw-rw-r-- 1 pi pi   79 Nov 11 02:54 SHA256SUMS
+14dd06ff483a185d423e986fdab93ad0febb62427fd1ca3eb173be8d59a7bdc8  compose.yaml
+---- compose.yaml ----
+services:
+  web:
+    image: busybox:1.36.1
+    command: ["sh", "-c", "mkdir -p /data && echo axle311-ok > /data/index.html && httpd -f -p 80 -h /data"]
+    ports:
+      - "${port}:80"
+    volumes:
+      - axle311data:/data
+    restart: unless-stopped
+volumes:
+  axle311data:
+x-app:
+  title: "Axle 311 proof"
+  description: "Scratch app for idea#424 / agent-engine-dev#311 proof on idea04"
+  category: "utilities"
+  url: "https://github.com/koenswings/agent-engine-dev/pull/311"
+  icon: ""
+  author: "Axle"
+  healthTimeout: 30
+==== ensure busybox:1.36.1 present ====
+sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662 [busybox:1.36.1]
+==== start PR engine under pm2 as pi ====
+[PM2] Applying action deleteProcessId on app [engine](ids: [ 1 ])
+[PM2] [engine](1) ✓
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 3  │ idea-usage       │ default     │ 1.0     │ fork    │ 702964   │ 109m   │ 1    │ online    │ 0%       │ 71.9mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 0%       │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 41.5% | ram usage: 31.3% | eth0: ⇓ 0.003mb/s ⇑ 0mb/s drop 222/min | disk: ⇓ 0mb/s ⇑ 6.037mb/s / 61.52%
+[PM2] Starting /home/pi/axle-311/dist/src/index.js in fork_mode (1 instance)
+[PM2] Done.
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 4  │ engine           │ default     │ 1.0     │ fork    │ 781290   │ 0s     │ 0    │ online    │ 0%       │ 25.1mb   │ pi       │ disabled │
+│ 3  │ idea-usage       │ default     │ 1.0     │ fork    │ 702964   │ 109m   │ 1    │ online    │ 0%       │ 71.9mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 0%       │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 41.5% | ram usage: 31.3% | eth0: ⇓ 0.003mb/s ⇑ 0mb/s drop 222/min | disk: ⇓ 0mb/s ⇑ 6.037mb/s / 61.52%
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 4  │ engine           │ default     │ 1.0     │ fork    │ 781290   │ 0s     │ 0    │ online    │ 300%     │ 79.3mb   │ pi       │ disabled │
+│ 3  │ idea-usage       │ default     │ 1.0     │ fork    │ 702964   │ 109m   │ 1    │ online    │ 0%       │ 71.9mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 0%       │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 41.5% | ram usage: 31.3% | eth0: ⇓ 0.003mb/s ⇑ 0mb/s drop 222/min | disk: ⇓ 0mb/s ⇑ 6.037mb/s / 61.52%
+==== wait for :8080 ====
+try 1: :8080 -> 000fail  temp=48.199C
+try 2: :8080 -> 000fail  temp=48.199C
+try 3: :8080 -> 000fail  temp=47.712C
+try 4: :8080 -> 000fail  temp=48.199C
+try 5: :8080 -> 000fail  temp=49.173C
+try 6: :8080 -> 000fail  temp=49.660C
+try 7: :8080 -> 000fail  temp=49.173C
+try 8: :8080 -> 000fail  temp=50.147C
+try 9: :8080 -> 000fail  temp=50.634C
+try 10: :8080 -> 000fail  temp=48.686C
+try 11: :8080 -> 000fail  temp=51.121C
+try 12: :8080 -> 000fail  temp=50.147C
+try 13: :8080 -> 000fail  temp=49.660C
+try 14: :8080 -> 000fail  temp=49.660C
+try 15: :8080 -> 000fail  temp=48.686C
+try 16: :8080 -> 000fail  temp=49.660C
+try 17: :8080 -> 000fail  temp=49.173C
+try 18: :8080 -> 000fail  temp=51.608C
+try 19: :8080 -> 000fail  temp=50.634C
+try 20: :8080 -> 000fail  temp=49.660C
+try 21: :8080 -> 000fail  temp=51.121C
+try 22: :8080 -> 000fail  temp=50.147C
+try 23: :8080 -> 000fail  temp=50.147C
+try 24: :8080 -> 000fail  temp=50.634C
+try 25: :8080 -> 000fail  temp=49.660C
+try 26: :8080 -> 000fail  temp=49.660C
+try 27: :8080 -> 000fail  temp=50.147C
+try 28: :8080 -> 000fail  temp=50.634C
+try 29: :8080 -> 000fail  temp=49.660C
+try 30: :8080 -> 000fail  temp=50.634C
+try 31: :8080 -> 000fail  temp=51.121C
+try 32: :8080 -> 000fail  temp=49.660C
+try 33: :8080 -> 000fail  temp=50.147C
+try 34: :8080 -> 000fail  temp=51.608C
+try 35: :8080 -> 000fail  temp=50.634C
+try 36: :8080 -> 000fail  temp=51.121C
+try 37: :8080 -> 000fail  temp=50.634C
+try 38: :8080 -> 000fail  temp=50.634C
+try 39: :8080 -> 000fail  temp=50.634C
+try 40: :8080 -> 000fail  temp=50.634C
+try 41: :8080 -> 000fail  temp=49.660C
+try 42: :8080 -> 000fail  temp=50.634C
+try 43: :8080 -> 000fail  temp=49.660C
+try 44: :8080 -> 000fail  temp=50.147C
+try 45: :8080 -> 000fail  temp=50.634C
+try 46: :8080 -> 000fail  temp=50.147C
+try 47: :8080 -> 000fail  temp=49.660C
+==== fix IDEA_CONFIG_FILE store paths and restart ====
+2026-11-11T02:58:41+01:00
+stopping crash-looping engine (restarts were high)
+[PM2] Applying action deleteProcessId on app [engine](ids: [ 4 ])
+[PM2] [engine](4) ✓
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 3  │ idea-usage       │ default     │ 1.0     │ fork    │ 702964   │ 113m   │ 1    │ online    │ 0%       │ 71.9mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 0%       │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 45.5% | ram usage: 16.5% | eth0: ⇓ 0.002mb/s ⇑ 0.002mb/s drop 214/min | tailscale0: ⇓ 0mb/s ⇑ 0.001mb/s | disk: ⇓ 0mb/s ⇑ 0.071mb/s / 61.52%
+rewrote /home/pi/axle-311-config.yaml
+copy sha256 20cf0a420cba8236447365c2e2bf09fa923b28c9f4ef39a42a794f9ba4f76dfd
+  mdns: true      # atlas 2026-10-06: test pool mirrors production idea02 (mdns: true), Koen 03:50; static peers removed
+  testMode: false   # Stage 2 real disks (switchover v2 2026-10-09)
+  systemDiskSkip: false   # Stage 2 pin (was IDEA_SYSTEM_DISK_SKIP env; PLAN 5 unchanged)
+  peerAccess: true       # r39 per-Pi Engine keys (46d4d57): testMode would switch it off (peerAccessEnabled)
+  httpPort: 8080      # idea04 local override (Console URL http://idea04:8080/)
+  storeDataFolder: store-data
+  storeIdentityFolder: store-identity
+real config.yaml unchanged OK
+==== start engine: script from ~/axle-311, cwd production so ./store-identity resolves ====
+[PM2] Starting /home/pi/axle-311/dist/src/index.js in fork_mode (1 instance)
+[PM2] Done.
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 5  │ engine           │ default     │ 1.0     │ fork    │ 786225   │ 0s     │ 0    │ online    │ 0%       │ 23.7mb   │ pi       │ disabled │
+│ 3  │ idea-usage       │ default     │ 1.0     │ fork    │ 702964   │ 113m   │ 1    │ online    │ 0%       │ 71.9mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 0%       │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 45.5% | ram usage: 16.5% | eth0: ⇓ 0.002mb/s ⇑ 0.002mb/s drop 214/min | tailscale0: ⇓ 0mb/s ⇑ 0.001mb/s | disk: ⇓ 0mb/s ⇑ 0.071mb/s / 61.52%
+try 48: :8080 -> 000fail  temp=50.147C
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 5  │ engine           │ default     │ 1.0     │ fork    │ 786225   │ 2s     │ 0    │ online    │ 150%     │ 156.4mb  │ pi       │ disabled │
+│ 3  │ idea-usage       │ default     │ 1.0     │ fork    │ 702964   │ 113m   │ 1    │ online    │ 0%       │ 71.9mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 0%       │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 45.5% | ram usage: 16.5% | eth0: ⇓ 0.002mb/s ⇑ 0.002mb/s drop 214/min | tailscale0: ⇓ 0mb/s ⇑ 0.001mb/s | disk: ⇓ 0mb/s ⇑ 0.071mb/s / 61.52%
+status online restarts 0 pid 786225
+cwd /home/pi/idea/agents/agent-engine-dev
+script /home/pi/axle-311/dist/src/index.js
+IDEA_CONFIG_FILE /home/pi/axle-311-config.yaml
+username pi
+try 1: :8080 -> 000fail  temp=51.608C
+try 49: :8080 -> 000fail  temp=50.147C
+try 2: :8080 -> 000fail  temp=51.608C
+try 50: :8080 -> 000fail  temp=51.121C
+try 3: :8080 -> 000fail  temp=50.634C
+try 51: :8080 -> 000fail  temp=51.121C
+try 4: :8080 -> 000fail  temp=51.121C
+try 52: :8080 -> 000fail  temp=51.608C
+try 5: :8080 -> 200  temp=48.686C
+==== :8080 is 200 ====
+try 53: :8080 -> 200  temp=50.147C
+==== engine env check ====
+[TAILING] Tailing last 40 lines for [engine] process (change the value with --lines option)
+/home/pi/.pm2/logs/engine-error.log last 40 lines:
+5|engine   | Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+5|engine   |     at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+5|engine   |     at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+5|engine   |     at processTicksAndRejections (node:internal/process/task_queues:105:5)
+5|engine   |     at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+5|engine   | Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+5|engine   |     at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+5|engine   |     at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+5|engine   |     at processTicksAndRejections (node:internal/process/task_queues:105:5)
+5|engine   |     at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+5|engine   | Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+5|engine   |     at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+5|engine   |     at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+5|engine   |     at processTicksAndRejections (node:internal/process/task_queues:105:5)
+5|engine   |     at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+5|engine   | Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+5|engine   |     at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+5|engine   |     at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+5|engine   |     at processTicksAndRejections (node:internal/process/task_queues:105:5)
+5|engine   |     at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+5|engine   | Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+5|engine   |     at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+5|engine   |     at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+5|engine   |     at processTicksAndRejections (node:internal/process/task_queues:105:5)
+5|engine   |     at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+5|engine   | Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+5|engine   |     at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+5|engine   |     at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+5|engine   |     at processTicksAndRejections (node:internal/process/task_queues:105:5)
+5|engine   |     at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+5|engine   | Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+5|engine   |     at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+5|engine   |     at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+5|engine   |     at processTicksAndRejections (node:internal/process/task_queues:105:5)
+5|engine   |     at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+5|engine   | Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+5|engine   |     at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+5|engine   |     at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+5|engine   |     at processTicksAndRejections (node:internal/process/task_queues:105:5)
+5|engine   |     at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+
+/home/pi/.pm2/logs/engine-out.log last 40 lines:
+5|engine   | Discovered engines:
+5|engine   |   - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+5|engine   |   - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+5|engine   | Discovered engines:
+5|engine   |   - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+5|engine   |   - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+5|engine   | Discovered engines:
+5|engine   |   - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+5|engine   |   - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+5|engine   | Discovered engines:
+5|engine   |   - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+5|engine   |   - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+5|engine   | Discovered engines:
+5|engine   |   - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+5|engine   |   - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+5|engine   | Discovered engines:
+5|engine   |   - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+5|engine   |   - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+5|engine   | Discovered engines:
+5|engine   |   - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+5|engine   |   - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+5|engine   | Discovered engines:
+5|engine   |   - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+5|engine   |   - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+5|engine   | Discovered engines:
+5|engine   |   - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+5|engine   |   - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+5|engine   | Discovered engines:
+5|engine   |   - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+5|engine   |   - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+5|engine   | Shutting down automerge
+5|engine   | *** SIGINT received ****
+5|engine   | [idea.local] withdrew idea.local
+5|engine   | *** Engine is now closing ***
+5|engine   | mDNS service ended
+5|engine   | HTTP server closed
+5|engine   | [repo] shutdown flush failed (DocHandle is not ready); flushing the ready documents only
+5|engine   | peer access: sync-peers: 2 peer(s); authorized_keys unchanged; known_hosts unchanged
+5|engine   | peer access: peer key added: Engine ENGINE_gge6zxyl6ftmnri4qx6 (key SHA256:OSVG4OYoQ8FqPMO185xlJ2+rNtrFq/xWsuRRhXzW8Mk, host key SHA256:mhGh3+YUbBZfqwpmUTba86GieAcJh3v+AaR9Fk1r/Ho)
+5|engine   | peer access: peer key added: Engine ENGINE_i3qlubws0txx4k23wje (key SHA256:RbqCc+6kIff2+FzpZ+PuWV2biBnVKvpotM1uZiJ/ADw, host key SHA256:jAw4Wp9TCTqdNomwt6pc8z4a7bvP/vzO4MMSZdCUYnI)
+
+temperature 50.634 C
+2026-11-11T02:59:10+01:00
+│ status            │ online                                │
+│ script path       │ /home/pi/axle-311/dist/src/index.js   │
+│ exec cwd          │ /home/pi/idea/agents/agent-engine-dev │
+│ node env          │ N/A                                   │
+│ unstable restarts │ 0                                     │
+idea-usage status online cwd /home/pi/idea/agents/agent-engine-dev script /home/pi/idea/agents/agent-engine-dev/dist/src/usage/main.js
+  IDEA_CONFIG_FILE None None
+  IDEA_NETWORK_TESTS None
+  username pi
+engine status online cwd /home/pi/idea/agents/agent-engine-dev script /home/pi/axle-311/dist/src/index.js
+  IDEA_CONFIG_FILE /home/pi/axle-311-config.yaml /home/pi/axle-311-config.yaml
+  IDEA_NETWORK_TESTS 0
+  username pi
+==== recent engine log ====
+[TAILING] Tailing last 40 lines for [engine] process (change the value with --lines option)
+/home/pi/.pm2/logs/engine-error.log last 40 lines:
+5|engine   | Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+5|engine   |     at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+5|engine   |     at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+5|engine   |     at processTicksAndRejections (node:internal/process/task_queues:105:5)
+5|engine   |     at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+5|engine   | Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+5|engine   |     at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+5|engine   |     at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+5|engine   |     at processTicksAndRejections (node:internal/process/task_queues:105:5)
+5|engine   |     at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+5|engine   | Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+5|engine   |     at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+5|engine   |     at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+5|engine   |     at processTicksAndRejections (node:internal/process/task_queues:105:5)
+5|engine   |     at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+5|engine   | Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+5|engine   |     at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+5|engine   |     at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+5|engine   |     at processTicksAndRejections (node:internal/process/task_queues:105:5)
+5|engine   |     at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+5|engine   | Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+5|engine   |     at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+5|engine   |     at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+5|engine   |     at processTicksAndRejections (node:internal/process/task_queues:105:5)
+5|engine   |     at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+5|engine   | Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+5|engine   |     at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+5|engine   |     at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+5|engine   |     at processTicksAndRejections (node:internal/process/task_queues:105:5)
+5|engine   |     at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+5|engine   | Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+5|engine   |     at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+5|engine   |     at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+5|engine   |     at processTicksAndRejections (node:internal/process/task_queues:105:5)
+5|engine   |     at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+5|engine   | Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+5|engine   |     at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+5|engine   |     at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+5|engine   |     at processTicksAndRejections (node:internal/process/task_queues:105:5)
+5|engine   |     at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+
+/home/pi/.pm2/logs/engine-out.log last 40 lines:
+5|engine   |   - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+5|engine   |   - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+5|engine   | Discovered engines:
+5|engine   |   - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+5|engine   |   - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+5|engine   | Discovered engines:
+5|engine   |   - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+5|engine   |   - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+5|engine   | Discovered engines:
+5|engine   |   - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+5|engine   |   - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+5|engine   | Discovered engines:
+5|engine   |   - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+5|engine   |   - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+5|engine   | Discovered engines:
+5|engine   |   - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+5|engine   |   - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+5|engine   | Discovered engines:
+5|engine   |   - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+5|engine   |   - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+5|engine   | Discovered engines:
+5|engine   |   - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+5|engine   |   - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+5|engine   | Discovered engines:
+5|engine   |   - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+5|engine   |   - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+5|engine   | Discovered engines:
+5|engine   |   - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+5|engine   |   - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+5|engine   | Shutting down automerge
+5|engine   | *** SIGINT received ****
+5|engine   | [idea.local] withdrew idea.local
+5|engine   | *** Engine is now closing ***
+5|engine   | mDNS service ended
+5|engine   | HTTP server closed
+5|engine   | [repo] shutdown flush failed (DocHandle is not ready); flushing the ready documents only
+5|engine   | peer access: sync-peers: 2 peer(s); authorized_keys unchanged; known_hosts unchanged
+5|engine   | peer access: peer key added: Engine ENGINE_gge6zxyl6ftmnri4qx6 (key SHA256:OSVG4OYoQ8FqPMO185xlJ2+rNtrFq/xWsuRRhXzW8Mk, host key SHA256:mhGh3+YUbBZfqwpmUTba86GieAcJh3v+AaR9Fk1r/Ho)
+5|engine   | peer access: peer key added: Engine ENGINE_i3qlubws0txx4k23wje (key SHA256:RbqCc+6kIff2+FzpZ+PuWV2biBnVKvpotM1uZiJ/ADw, host key SHA256:jAw4Wp9TCTqdNomwt6pc8z4a7bvP/vzO4MMSZdCUYnI)
+5|engine   | Starting instance 'updtest-i76major' on disk updtest10i76 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+
+==== continue-setup complete ====
+2026-11-11T02:59:14+01:00
+temperature 52.095 C
+==== post-start check ====
+2026-11-11T02:59:28+01:00
+temp 48.199 C
+idea-usage status online restarts 1 pid 702964 cwd /home/pi/idea/agents/agent-engine-dev script /home/pi/idea/agents/agent-engine-dev/dist/src/usage/main.js user pi IDEA_CONFIG_FILE None IDEA_NETWORK_TESTS None
+engine status online restarts 0 pid 786225 cwd /home/pi/idea/agents/agent-engine-dev script /home/pi/axle-311/dist/src/index.js user pi IDEA_CONFIG_FILE /home/pi/axle-311-config.yaml IDEA_NETWORK_TESTS 0
+curl :8080 -> 200
+==== grep engine logs for system disk / config / errors ====
+Config file is valid.
+Device sda2 is the system disk — skipping registration (IDEA_SYSTEM_DISK_SKIP=true)
+---- recent error log (last 15) ----
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+    at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+    at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+    at processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+    at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+    at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+    at processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+    at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+    at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+    at processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+==== dump engines + disks + system-disk instances via peer-verify-store ====
+
+node:internal/modules/run_main:123
+    triggerUncaughtException(
+    ^
+Error: Transform failed with 5 errors:
+/tmp/dump-all-store.ts:4:12: ERROR: Top-level await is currently not supported with the "cjs" output format
+/tmp/dump-all-store.ts:6:13: ERROR: Top-level await is currently not supported with the "cjs" output format
+/tmp/dump-all-store.ts:11:31: ERROR: Top-level await is currently not supported with the "cjs" output format
+/tmp/dump-all-store.ts:12:0: ERROR: Top-level await is currently not supported with the "cjs" output format
+/tmp/dump-all-store.ts:26:0: ERROR: Top-level await is currently not supported with the "cjs" output format
+    at failureErrorWithLog (/home/pi/axle-311/node_modules/.pnpm/esbuild@0.27.3/node_modules/esbuild/lib/main.js:1467:15)
+    at /home/pi/axle-311/node_modules/.pnpm/esbuild@0.27.3/node_modules/esbuild/lib/main.js:736:50
+    at responseCallbacks.<computed> (/home/pi/axle-311/node_modules/.pnpm/esbuild@0.27.3/node_modules/esbuild/lib/main.js:603:9)
+    at handleIncomingPacket (/home/pi/axle-311/node_modules/.pnpm/esbuild@0.27.3/node_modules/esbuild/lib/main.js:658:12)
+    at Socket.readFromStdout (/home/pi/axle-311/node_modules/.pnpm/esbuild@0.27.3/node_modules/esbuild/lib/main.js:581:7)
+    at Socket.emit (node:events:519:28)
+    at addChunk (node:internal/streams/readable:561:12)
+    at readableAddChunkPushByteMode (node:internal/streams/readable:512:3)
+    at Readable.push (node:internal/streams/readable:392:5)
+    at Pipe.onStreamRead (node:internal/stream_base_commons:189:23) {
+  name: 'TransformError'
+}
+
+Node.js v22.20.0
+==== current engine environ and recent logs ====
+engine pid=786225
+---- /proc/pid/environ IDEA_* ----
+bash: line 8: /proc/786225/environ: Permission denied
+---- config copy systemDiskSkip ----
+/home/pi/axle-311-config.yaml:6:  systemDiskSkip: false   # Stage 2 pin (was IDEA_SYSTEM_DISK_SKIP env; PLAN 5 unchanged)
+/home/pi/idea/agents/agent-engine-dev/config.yaml:6:  systemDiskSkip: true   # Stage 2 pin (was IDEA_SYSTEM_DISK_SKIP env; PLAN 5 unchanged)
+---- pm2 log lines from process 5 only (current) mentioning system/config ----
+==== engine process env via pm2 ====
+2026-11-11T03:00:10+01:00
+[ 5 ]
+pid 786225 status online restarts 0
+cwd /home/pi/idea/agents/agent-engine-dev
+script /home/pi/axle-311/dist/src/index.js
+IDEA_CONFIG_FILE='/home/pi/axle-311-config.yaml'
+IDEA_NETWORK_TESTS='0'
+IDEA_SYSTEM_DISK_SKIP=None
+IDEA_STORE_DIR=None
+IDEA_TEST_MODE=None
+IDEA_MDNS_DISABLE=None
+IDEA_DISKS_ROOT=None
+==== pm2 env IDEA_ / relevant ====
+IDEA_NETWORK_TESTS: 0
+IDEA_CONFIG_FILE: /home/pi/axle-311-config.yaml
+==== last 80 lines of engine-out.log ====
+Discovered engines:
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+Instance m7mhutyviv1z5xgryc4 status changed to: 
+Instance m7mhutyviv1z5xgryc4 status changed to: 
+Instance m7mhutyviv1z5xgryc4 status changed to: 
+Discovered engines:
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+Instance m7mhutyviv1z5xgryc4 status changed to: 
+Discovered engines:
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+Discovered engines:
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+Discovered engines:
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+Discovered engines:
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+Discovered engines:
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+Discovered engines:
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+Discovered engines:
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+Discovered engines:
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+Discovered engines:
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+Discovered engines:
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+Discovered engines:
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+Discovered engines:
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+Discovered engines:
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+Discovered engines:
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+Discovered engines:
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+Discovered engines:
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+Discovered engines:
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+Discovered engines:
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+Discovered engines:
+  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+Shutting down automerge
+*** SIGINT received ****
+[idea.local] withdrew idea.local
+*** Engine is now closing ***
+mDNS service ended
+HTTP server closed
+[repo] shutdown flush failed (DocHandle is not ready); flushing the ready documents only
+peer access: sync-peers: 2 peer(s); authorized_keys unchanged; known_hosts unchanged
+peer access: peer key added: Engine ENGINE_gge6zxyl6ftmnri4qx6 (key SHA256:OSVG4OYoQ8FqPMO185xlJ2+rNtrFq/xWsuRRhXzW8Mk, host key SHA256:mhGh3+YUbBZfqwpmUTba86GieAcJh3v+AaR9Fk1r/Ho)
+peer access: peer key added: Engine ENGINE_i3qlubws0txx4k23wje (key SHA256:RbqCc+6kIff2+FzpZ+PuWV2biBnVKvpotM1uZiJ/ADw, host key SHA256:jAw4Wp9TCTqdNomwt6pc8z4a7bvP/vzO4MMSZdCUYnI)
+Starting instance 'updtest-i76major' on disk updtest10i76 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+Starting instance 'updtest-i76minor' on disk updtest10i76 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+Starting instance 'updtest-i76stale' on disk updtest10i76 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+==== grep system disk in last 400 out lines ====
+==== docker updtest containers (should still be the long-running ones) ====
+NAMES                    STATUS                 CONTAINER ID
+updtest-i76stale-web-1   Up 4 hours (healthy)   688a6436fa95
+updtest-i76minor-web-1   Up 4 hours (healthy)   081b1834aa3b
+updtest-i76major-web-1   Up 4 hours (healthy)   84ddd0473170
+==== grep key lines in full engine-out.log ====
+log lines: 3971
+-- Config file is valid --
+575:Config file is valid.
+-- skipping registration / Processing system --
+1957:Device sda2 is the system disk — skipping registration (IDEA_SYSTEM_DISK_SKIP=true)
+-- Starting instance --
+2035:Starting instance 'updtest-i76major' on disk updtest10i76 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+2050:Starting instance 'updtest-i76minor' on disk updtest10i76 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+2073:Starting instance 'updtest-i76stale' on disk updtest10i76 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+3969:Starting instance 'updtest-i76major' on disk updtest10i76 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+3970:Starting instance 'updtest-i76minor' on disk updtest10i76 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+3971:Starting instance 'updtest-i76stale' on disk updtest10i76 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+-- axleproof --
+==== last 30 out after Starting instance ====
+3892:Discovered engines:
+3893:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3894:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3895:Instance m7mhutyviv1z5xgryc4 status changed to: 
+3896:Instance m7mhutyviv1z5xgryc4 status changed to: 
+3897:Instance m7mhutyviv1z5xgryc4 status changed to: 
+3898:Discovered engines:
+3899:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3900:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3901:Instance m7mhutyviv1z5xgryc4 status changed to: 
+3902:Discovered engines:
+3903:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3904:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3905:Discovered engines:
+3906:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3907:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3908:Discovered engines:
+3909:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3910:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3911:Discovered engines:
+3912:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3913:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3914:Discovered engines:
+3915:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3916:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3917:Discovered engines:
+3918:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3919:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3920:Discovered engines:
+3921:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3922:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3923:Discovered engines:
+3924:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3925:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3926:Discovered engines:
+3927:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3928:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3929:Discovered engines:
+3930:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3931:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3932:Discovered engines:
+3933:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3934:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3935:Discovered engines:
+3936:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3937:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3938:Discovered engines:
+3939:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3940:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3941:Discovered engines:
+3942:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3943:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3944:Discovered engines:
+3945:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3946:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3947:Discovered engines:
+3948:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3949:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3950:Discovered engines:
+3951:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3952:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3953:Discovered engines:
+3954:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3955:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3956:Discovered engines:
+3957:  - Name: idea01, ID: ENGINE_i3qlubws0txx4k23wje, Store: 2VroE-ad6a983cd735, Address: 192.168.0.138:4321
+3958:  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+3959:Shutting down automerge
+3960:*** SIGINT received ****
+3961:[idea.local] withdrew idea.local
+3962:*** Engine is now closing ***
+3963:mDNS service ended
+3964:HTTP server closed
+3965:[repo] shutdown flush failed (DocHandle is not ready); flushing the ready documents only
+3966:peer access: sync-peers: 2 peer(s); authorized_keys unchanged; known_hosts unchanged
+3967:peer access: peer key added: Engine ENGINE_gge6zxyl6ftmnri4qx6 (key SHA256:OSVG4OYoQ8FqPMO185xlJ2+rNtrFq/xWsuRRhXzW8Mk, host key SHA256:mhGh3+YUbBZfqwpmUTba86GieAcJh3v+AaR9Fk1r/Ho)
+3968:peer access: peer key added: Engine ENGINE_i3qlubws0txx4k23wje (key SHA256:RbqCc+6kIff2+FzpZ+PuWV2biBnVKvpotM1uZiJ/ADw, host key SHA256:jAw4Wp9TCTqdNomwt6pc8z4a7bvP/vzO4MMSZdCUYnI)
+3969:Starting instance 'updtest-i76major' on disk updtest10i76 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+3970:Starting instance 'updtest-i76minor' on disk updtest10i76 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+3971:Starting instance 'updtest-i76stale' on disk updtest10i76 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+==== wait for disk processing then inspect ====
+temp 44.303 C
+engine status:
+online restarts 0 pid 786225
+curl :8080 -> 200
+==== /META.yaml and /dev/engine ====
+-rw-r--r-- 1 root root 139 Nov 11 02:59 /META.yaml
+---- /dev/engine ----
+total 0
+lrwxrwxrwx 1 root root 6 Oct 30 10:36 sda -> ../sda
+lrwxrwxrwx 1 root root 7 Oct 30 10:36 sda1 -> ../sda1
+lrwxrwxrwx 1 root root 7 Oct 30 10:36 sda2 -> ../sda2
+lrwxrwxrwx 1 root root 6 Oct 30 18:07 sdb -> ../sdb
+lrwxrwxrwx 1 root root 7 Oct 30 18:11 sdb1 -> ../sdb1
+lrwxrwxrwx 1 root root 7 Oct 30 18:11 sdb2 -> ../sdb2
+==== new engine-out lines after 3965 ====
+peer access: sync-peers: 2 peer(s); authorized_keys unchanged; known_hosts unchanged
+peer access: peer key added: Engine ENGINE_gge6zxyl6ftmnri4qx6 (key SHA256:OSVG4OYoQ8FqPMO185xlJ2+rNtrFq/xWsuRRhXzW8Mk, host key SHA256:mhGh3+YUbBZfqwpmUTba86GieAcJh3v+AaR9Fk1r/Ho)
+peer access: peer key added: Engine ENGINE_i3qlubws0txx4k23wje (key SHA256:RbqCc+6kIff2+FzpZ+PuWV2biBnVKvpotM1uZiJ/ADw, host key SHA256:jAw4Wp9TCTqdNomwt6pc8z4a7bvP/vzO4MMSZdCUYnI)
+Starting instance 'updtest-i76major' on disk updtest10i76 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+Starting instance 'updtest-i76minor' on disk updtest10i76 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+Starting instance 'updtest-i76stale' on disk updtest10i76 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+==== system-disk related in whole log (last 15) ====
+1957:Device sda2 is the system disk — skipping registration (IDEA_SYSTEM_DISK_SKIP=true)
+==== /META.yaml ====
+diskId: 5vyahbut147hw5dp4e1
+diskName: 5vyahbut147hw5dp4e1
+hostname: idea04
+created: 1790602314154
+version: "1.0"
+lastDocked: 1794362351092
+
+==== dump store (async wrapper) ====
+node:internal/modules/cjs/loader:1383
+  const err = new Error(message);
+              ^
+
+Error: Cannot find module '@automerge/automerge-repo'
+Require stack:
+- /tmp/dump-all-store.ts
+    at node:internal/modules/cjs/loader:1383:15
+    at nextResolveSimple (/home/pi/axle-311/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-D46fvsV_.cjs:4:1004)
+    at /home/pi/axle-311/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-D46fvsV_.cjs:3:2630
+    at /home/pi/axle-311/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-D46fvsV_.cjs:3:1542
+    at resolveTsPaths (/home/pi/axle-311/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-D46fvsV_.cjs:4:760)
+    at /home/pi/axle-311/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-D46fvsV_.cjs:4:1102
+    at m._resolveFilename (file:///home/pi/axle-311/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/register-B7jrtLTO.mjs:1:789)
+    at defaultResolveImpl (node:internal/modules/cjs/loader:1025:19)
+    at resolveForCJSWithHooks (node:internal/modules/cjs/loader:1030:22)
+    at Function._load (node:internal/modules/cjs/loader:1192:37) {
+  code: 'MODULE_NOT_FOUND',
+  requireStack: [ '/tmp/dump-all-store.ts' ]
+}
+
+Node.js v22.20.0
+==== lastDocked and disk dump ====
+lastDocked CET 2026-11-11 02:59:11.092000+01:00
+created CET 2026-09-28 14:31:54.154000+01:00
+{
+  "docId": "2VroEUvDkmYsDAwE5oG9YeFNadWH",
+  "engines": [
+    {
+      "id": "ENGINE_5vyahbut147hw5dp4e1",
+      "hostname": "idea04",
+      "lastRun": 1794362359920,
+      "version": "1.0",
+      "nCommands": 0
+    },
+    {
+      "id": "ENGINE_gge6zxyl6ftmnri4qx6",
+      "hostname": "idea03",
+      "lastRun": 1794361565250,
+      "version": "1",
+      "nCommands": 0
+    },
+    {
+      "id": "ENGINE_i3qlubws0txx4k23wje",
+      "hostname": "idea01",
+      "lastRun": 1794362056957,
+      "version": "1.0",
+      "nCommands": 0
+    }
+  ],
+  "disks": [
+    {
+      "id": "5vyahbut147hw5dp4e1",
+      "name": "System Disk",
+      "dockedTo": "ENGINE_5vyahbut147hw5dp4e1",
+      "device": "sda2",
+      "diskTypes": [
+        "system"
+      ]
+    },
+    {
+      "id": "9bgojj2asocyf7gxtci",
+      "name": "IDEA Disk",
+      "dockedTo": null,
+      "device": null,
+      "diskTypes": []
+    },
+    {
+      "id": "AA000000000000001354",
+      "name": "IDEA Disk",
+      "dockedTo": null,
+      "device": null,
+      "diskTypes": []
+    },
+    {
+      "id": "axle-235-data",
+      "name": "IDEA Disk",
+      "dockedTo": null,
+      "device": null,
+      "diskTypes": []
+    },
+    {
+      "id": "axle-235-esp",
+      "name": "Axle 235 esp",
+      "dockedTo": null,
+      "device": null,
+      "diskTypes": []
+    },
+    {
+      "id": "cd8787b352df466b86d91975fe3a372b",
+      "name": "IDEA Disk",
+      "dockedTo": "ENGINE_i3qlubws0txx4k23wje",
+      "device": "sdb1",
+      "diskTypes": [
+        "empty"
+      ]
+    },
+    {
+      "id": "diskb202610301247",
+      "name": "IDEA Disk",
+      "dockedTo": "ENGINE_gge6zxyl6ftmnri4qx6",
+      "device": "sdb1",
+      "diskTypes": [
+        "app",
+        "files"
+      ]
+    },
+    {
+      "id": "duration-add-files-001",
+      "name": "Duration Tests — Add Files App",
+      "dockedTo": null,
+      "device": null,
+      "diskTypes": []
+    },
+    {
+      "id": "duration-empty-001",
+      "name": "Duration Tests — Empty Disk 001",
+      "dockedTo": null,
+      "device": null,
+      "diskTypes": []
+    },
+    {
+      "id": "duration-empty-002",
+      "name": "Duration Tests — Empty Disk 002",
+      "dockedTo": null,
+      "device": null,
+      "diskTypes": []
+    },
+    {
+      "id": "duration-empty-003",
+      "name": "Duration Tests — Empty Disk 003",
+      "dockedTo": null,
+      "device": null,
+      "diskTypes": []
+    },
+    {
+      "id": "duration-kolibri-grade5a-001",
+      "name": "Duration Tests — Kolibri Grade 5A",
+      "dockedTo": null,
+      "device": null,
+      "diskTypes": []
+    },
+    {
+      "id": "duration-nextcloud-grade5a-001",
+      "name": "Duration Tests — Nextcloud Grade 5A",
+      "dockedTo": null,
+      "device": null,
+      "diskTypes": []
+    },
+    {
+      "id": "files-disk-a-erase-20260929085050-4f38fe",
+      "name": "IDEA Disk",
+      "dockedTo": null,
+      "device": null,
+      "diskTypes": []
+    },
+    {
+      "id": "files-disk-b-nextcloud-20260929085050-4f38fe",
+      "name": "Files Disk B Nextcloud",
+      "dockedTo": null,
+      "device": null,
+      "diskTypes": []
+    },
+    {
+      "id": "gge6zxyl6ftmnri4qx6",
+      "name": "System Disk",
+      "dockedTo": "ENGINE_gge6zxyl6ftmnri4qx6",
+      "device": "sda2",
+      "diskTypes": [
+        "system"
+      ]
+    },
+    {
+      "id": "i3qlubws0txx4k23wje",
+      "name": "System Disk",
+      "dockedTo": null,
+      "device": null,
+      "diskTypes": []
+    },
+    {
+      "id": "o2nw4vkdx63ri45vjzu",
+      "name": "IDEA Disk",
+      "dockedTo": null,
+      "device": null,
+      "diskTypes": []
+    },
+    {
+      "id": "t17syw75c3micoa96gi",
+      "name": "rootfs",
+      "dockedTo": null,
+      "device": null,
+      "diskTypes": []
+    },
+    {
+      "id": "updtest10i76",
+      "name": "Update Test 1.0",
+      "dockedTo": "ENGINE_5vyahbut147hw5dp4e1",
+      "device": "sdb1",
+      "diskTypes": [
+        "app"
+      ]
+    },
+    {
+      "id": "updtest11i76",
+      "name": "Update Test 1.1",
+      "dockedTo": "ENGINE_5vyahbut147hw5dp4e1",
+      "device": "sdb2",
+      "diskTypes": [
+        "app"
+      ]
+    }
+  ],
+  "instances": [
+    {
+      "id": "fixture188d-001",
+      "name": "fixture188d",
+      "instanceOf": "fixture188d-1.0",
+      "storedOn": null,
+      "status": "Missing"
+    },
+    {
+      "id": "hqx4d21mg94s2sos87p",
+      "name": "Kolibri",
+      "instanceOf": "kolibri-1.0-duration",
+      "storedOn": null,
+      "status": "Missing"
+    },
+    {
+      "id": "kiwix-4fneg7mp9nw6oum9ymj",
+      "name": "move79-a",
+      "instanceOf": "kiwix-1.0",
+      "storedOn": "9bgojj2asocyf7gxtci",
+      "status": "Undocked"
+    },
+    {
+      "id": "kiwix-ideaa-001",
+      "name": "kiwix",
+      "instanceOf": "kiwix-1.0-duration",
+      "storedOn": "duration-nextcloud-grade5a-001",
+      "status": "Undocked"
+    },
+    {
+      "id": "kolibri-0prcel7j4mpis8dvr3o",
+      "name": "kolibri-1.0",
+      "instanceOf": "kolibri-1.0",
+      "storedOn": null,
+      "status": "Missing"
+    },
+    {
+      "id": "kolibri-1ldqclaiwifqw7oqdzo",
+      "name": "move79-a",
+      "instanceOf": "kolibri-1.0",
+      "storedOn": "9bgojj2asocyf7gxtci",
+      "status": "Stopped"
+    },
+    {
+      "id": "kolibri-4yg1le2s3elh8ri6ea0",
+      "name": "Kolibri Demo",
+      "instanceOf": "kolibri-5833a12f62f4b719f219b57fe608b342cb9bbaec",
+      "storedOn": "duration-nextcloud-grade5a-001",
+      "status": "Undocked"
+    },
+    {
+      "id": "kolibri-grade5a-001",
+      "name": "kolibri",
+      "instanceOf": "kolibri-1.0-duration",
+      "storedOn": "duration-kolibri-grade5a-001",
+      "status": "Undocked"
+    },
+    {
+      "id": "kolibri-p38dttolr4jlg60uoik",
+      "name": "kolibri-demo",
+      "instanceOf": "kolibri-5833a12f62f4b719f219b57fe608b342cb9bbaec",
+      "storedOn": "duration-nextcloud-grade5a-001",
+      "status": "Undocked"
+    },
+    {
+      "id": "kolibri-u4zf3qhku3d7zi5b9ku",
+      "name": "Morango Test",
+      "instanceOf": "kolibri-e7aa23116808760e97667c90f16088b14c2751d3",
+      "storedOn": null,
+      "status": "Missing"
+    },
+    {
+      "id": "kolibri-ux0jijfpfcd0rxbahxd",
+      "name": "kolibri-1.0",
+      "instanceOf": "kolibri-1.0",
+      "storedOn": null,
+      "status": "Missing"
+    },
+    {
+      "id": "kolibri-yo7fpv042jbp2gka73h",
+      "name": "Kolibri-Demo",
+      "instanceOf": "kolibri-5833a12f62f4b719f219b57fe608b342cb9bbaec",
+      "storedOn": null,
+      "status": "Missing"
+    },
+    {
+      "id": "kolibri-z94w312q7fvnu4wlaig",
+      "name": "kolibri-1.0",
+      "instanceOf": "kolibri-1.0",
+      "storedOn": null,
+      "status": "Missing"
+    },
+    {
+      "id": "m7mhutyviv1z5xgryc4",
+      "name": "usage-dashboard-tar-e2e",
+      "instanceOf": "usage-dashboard-1.0",
+      "storedOn": "gge6zxyl6ftmnri4qx6",
+      "status": "Running"
+    },
+    {
+      "id": "nextcloud-2bwmc1zvlqseamxjafn",
+      "name": "Nextcloud-Demo",
+      "instanceOf": "nextcloud-21d7f75efaaa6590efb93098120626e677732903",
+      "storedOn": null,
+      "status": "Missing"
+    },
+    {
+      "id": "nextcloud-files-b-001",
+      "name": "nextcloud-files-b-001",
+      "instanceOf": "nextcloud-1.0",
+      "storedOn": "diskb202610301247",
+      "status": "Running"
+    },
+    {
+      "id": "nextcloud-grade5a-001",
+      "name": "nextcloud",
+      "instanceOf": "nextcloud-1.1-31.0.1",
+      "storedOn": "duration-nextcloud-grade5a-001",
+      "status": "Undocked"
+    },
+    {
+      "id": "nextcloud-hsh7runwkw5ip815h2e",
+      "name": "Nextcloud Demo",
+      "instanceOf": "nextcloud-d7daffd7abb24bb6db336a9cf0022880fc2be787",
+      "storedOn": "duration-nextcloud-grade5a-001",
+      "status": "Undocked"
+    },
+    {
+      "id": "nextcloud-hw37icj82p9z6xqv9qn",
+      "name": "Nextcloud Demo",
+      "instanceOf": "nextcloud-41d039dc5fcb7560837e2af8d2ddb484c7cd0b75",
+      "storedOn": null,
+      "status": "Missing"
+    },
+    {
+      "id": "nextcloud-xaqdy96fy1xyf17q8ws",
+      "name": "kid-nc-main",
+      "instanceOf": "nextcloud-21d7f75efaaa6590efb93098120626e677732903",
+      "storedOn": "duration-nextcloud-grade5a-001",
+      "status": "Undocked"
+    },
+    {
+      "id": "seafile-j7l5tahobxf0bs6jd5c",
+      "name": "kid-seafile-main",
+      "instanceOf": "Seafile-f3817b7669269abe2dfd3bcc347d0db8d2033ad6",
+      "storedOn": "duration-nextcloud-grade5a-001",
+      "status": "Undocked"
+    },
+    {
+      "id": "updtest-i76major",
+      "name": "updtest-major",
+      "instanceOf": "updtest-1.0",
+      "storedOn": "updtest10i76",
+      "status": "Running"
+    },
+    {
+      "id": "updtest-i76minor",
+      "name": "updtest-minor",
+      "instanceOf": "updtest-1.0",
+      "storedOn": "updtest10i76",
+      "status": "Running"
+    },
+    {
+      "id": "updtest-i76stale",
+      "name": "updtest-stale",
+      "instanceOf": "updtest-1.0",
+      "storedOn": "updtest10i76",
+      "status": "Running"
+    },
+    {
+      "id": "x3un9ouw2wzh3cf9gfo",
+      "name": "kolibri-2",
+      "instanceOf": "kolibri-1.0-duration",
+      "storedOn": null,
+      "status": "Missing"
+    }
+  ]
+}
+==== filter local engine + system disk + recent instances ====
+docId 2VroEUvDkmYsDAwE5oG9YeFNadWH
+-- engines --
+{'id': 'ENGINE_5vyahbut147hw5dp4e1', 'hostname': 'idea04', 'lastRun': 1794362359920, 'version': '1.0', 'nCommands': 0}
+{'id': 'ENGINE_gge6zxyl6ftmnri4qx6', 'hostname': 'idea03', 'lastRun': 1794361565250, 'version': '1', 'nCommands': 0}
+{'id': 'ENGINE_i3qlubws0txx4k23wje', 'hostname': 'idea01', 'lastRun': 1794362056957, 'version': '1.0', 'nCommands': 0}
+-- disks (system / this engine / sda2) --
+{'id': '5vyahbut147hw5dp4e1', 'name': 'System Disk', 'dockedTo': 'ENGINE_5vyahbut147hw5dp4e1', 'device': 'sda2', 'diskTypes': ['system']}
+{'id': 'gge6zxyl6ftmnri4qx6', 'name': 'System Disk', 'dockedTo': 'ENGINE_gge6zxyl6ftmnri4qx6', 'device': 'sda2', 'diskTypes': ['system']}
+{'id': 'updtest10i76', 'name': 'Update Test 1.0', 'dockedTo': 'ENGINE_5vyahbut147hw5dp4e1', 'device': 'sdb1', 'diskTypes': ['app']}
+{'id': 'updtest11i76', 'name': 'Update Test 1.1', 'dockedTo': 'ENGINE_5vyahbut147hw5dp4e1', 'device': 'sdb2', 'diskTypes': ['app']}
+-- all disks count 21 --
+ docked 5vyahbut147hw5dp4e1 name System Disk dev sda2 types ['system'] to ENGINE_5vyahbut147hw5dp4e1
+ docked cd8787b352df466b86d91975fe3a372b name IDEA Disk dev sdb1 types ['empty'] to ENGINE_i3qlubws0txx4k23wje
+ docked diskb202610301247 name IDEA Disk dev sdb1 types ['app', 'files'] to ENGINE_gge6zxyl6ftmnri4qx6
+ docked gge6zxyl6ftmnri4qx6 name System Disk dev sda2 types ['system'] to ENGINE_gge6zxyl6ftmnri4qx6
+ docked updtest10i76 name Update Test 1.0 dev sdb1 types ['app'] to ENGINE_5vyahbut147hw5dp4e1
+ docked updtest11i76 name Update Test 1.1 dev sdb2 types ['app'] to ENGINE_5vyahbut147hw5dp4e1
+-- instances stored on system disk id 5vyahbut147hw5dp4e1 --
+instances total 25
+============================================================
+idea04 PR #311 Pi proof  2026-11-11T03:04:02+01:00
+head e57fd17a9e21e397c0d81da609bf623c5b73613f
+engine ENGINE_5vyahbut147hw5dp4e1 disk 5vyahbut147hw5dp4e1
+============================================================
+temperature 45.277 C
+
+########## 1. installApp axleproof-1.0 on system disk (name axle311-rm --fresh) ##########
+time 2026-11-11T03:04:03+01:00 temp 44.790C
+temperature 44.303 C
+instances before:
+total 8
+drwxr-xr-x  2 pi   pi   4096 Oct 28 08:26 .
+drwxr-xr-x 22 root root 4096 Oct 30 10:36 ..
+>> push-command: installApp axleproof-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle311-rm --fresh
+{"pushed":"installApp axleproof-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle311-rm --fresh","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+ID1=(saw /instances/5ie6xpi5wh42mgsbx7u but container not up yet)
+5ie6xpi5wh42mgsbx7u
+ls: cannot access '/instances/(saw /instances/5ie6xpi5wh42mgsbx7u but container not up yet)'$'\n''5ie6xpi5wh42mgsbx7u': No such file or directory
+NAMES     STATUS    project
+DRIVER    VOLUME NAME
+---- engine-out from line 3972 ----
+Starting instance '5ie6xpi5wh42mgsbx7u' on disk 5vyahbut147hw5dp4e1 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌────────────────────────────────┐
+│  Step 2/6  │  Generating port  │
+└────────────────────────────────┘
+Found a port number for instance 5ie6xpi5wh42mgsbx7u: 55889
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 6/6  │  Starting containers  │
+└────────────────────────────────────┘
+Ports: [32m'55889'[39m
+---- engine-error last 30 ----
+    at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+    at processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+    at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+    at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+    at processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+    at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+    at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+    at processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+    at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+    at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+    at processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+ Network 5ie6xpi5wh42mgsbx7u_default Creating 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Creating 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Creating 
+ Network 5ie6xpi5wh42mgsbx7u_default Creating 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Created 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Created 
+ Network 5ie6xpi5wh42mgsbx7u_default Created 
+ Network 5ie6xpi5wh42mgsbx7u_default Created 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Creating 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Created 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Starting 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Started 
+STEP1 PASS installApp system-disk instance (saw /instances/5ie6xpi5wh42mgsbx7u but container not up yet)
+5ie6xpi5wh42mgsbx7u (axle311-rm)
+
+########## 2. stopInstance then docker ps -a shows Exited containers ##########
+time 2026-11-11T03:04:23+01:00 temp 47.225C
+temperature 47.712 C
+>> push-command: stopInstance axle311-rm 5vyahbut147hw5dp4e1
+{"pushed":"stopInstance axle311-rm 5vyahbut147hw5dp4e1","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+try 1 status: 
+try 2 status: 
+try 3 status: 
+try 4 status: 
+try 5 status: 
+try 6 status: 
+try 7 status: 
+try 8 status: 
+try 9 status: 
+try 10 status: 
+try 11 status: 
+try 12 status: 
+try 13 status: 
+try 14 status: 
+try 15 status: 
+try 16 status: 
+try 17 status: 
+try 18 status: 
+try 19 status: 
+try 20 status: 
+try 21 status: 
+try 22 status: 
+try 23 status: 
+try 24 status: 
+try 25 status: 
+try 26 status: 
+try 27 status: 
+try 28 status: 
+try 29 status: 
+try 30 status: 
+NAMES     STATUS
+---- engine-out from line 3990 ----
+App 5ie6xpi5wh42mgsbx7u running
+Stopping app '5ie6xpi5wh42mgsbx7u' on disk '5vyahbut147hw5dp4e1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+---- engine-error last 30 ----
+    at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+    at processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+    at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+    at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+    at processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+    at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+    at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+    at processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+    at prepareStoreIdentity (file:///home/pi/axle-311/dist/src/data/StoreIdentity.js:82:15)
+    at startEngine (file:///home/pi/axle-311/dist/src/start.js:82:54)
+    at processTicksAndRejections (node:internal/process/task_queues:105:5)
+    at main (file:///home/pi/axle-311/dist/src/index.js:6:9)
+ Network 5ie6xpi5wh42mgsbx7u_default Creating 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Creating 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Creating 
+ Network 5ie6xpi5wh42mgsbx7u_default Creating 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Created 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Created 
+ Network 5ie6xpi5wh42mgsbx7u_default Created 
+ Network 5ie6xpi5wh42mgsbx7u_default Created 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Creating 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Created 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Starting 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Started 
+STEP2 FAIL no Exited containers after stopInstance
+==== inspect actual instance 5ie6xpi5wh42mgsbx7u ====
+2026-11-11T03:06:26+01:00
+drwxr-xr-x 2 pi pi 4096 Nov 11 03:04 /instances/5ie6xpi5wh42mgsbx7u
+total 12
+drwxr-xr-x  3 pi   pi   4096 Nov 11 03:04 .
+drwxr-xr-x 22 root root 4096 Oct 30 10:36 ..
+drwxr-xr-x  2 pi   pi   4096 Nov 11 03:04 5ie6xpi5wh42mgsbx7u
+---- docker ps -a label ----
+NAMES                       STATUS                            project
+5ie6xpi5wh42mgsbx7u-web-1   Exited (137) About a minute ago   5ie6xpi5wh42mgsbx7u
+---- docker ps -a name ----
+NAMES                       STATUS
+5ie6xpi5wh42mgsbx7u-web-1   Exited (137) About a minute ago
+---- volumes ----
+DRIVER    VOLUME NAME
+local     5ie6xpi5wh42mgsbx7u_axle311data
+---- last 40 engine-out ----
+  - Name: idea03, ID: ENGINE_gge6zxyl6ftmnri4qx6, Store: 2VroE-ad6a983cd735, Address: 192.168.0.228:4321
+Shutting down automerge
+*** SIGINT received ****
+[idea.local] withdrew idea.local
+*** Engine is now closing ***
+mDNS service ended
+HTTP server closed
+[repo] shutdown flush failed (DocHandle is not ready); flushing the ready documents only
+peer access: sync-peers: 2 peer(s); authorized_keys unchanged; known_hosts unchanged
+peer access: peer key added: Engine ENGINE_gge6zxyl6ftmnri4qx6 (key SHA256:OSVG4OYoQ8FqPMO185xlJ2+rNtrFq/xWsuRRhXzW8Mk, host key SHA256:mhGh3+YUbBZfqwpmUTba86GieAcJh3v+AaR9Fk1r/Ho)
+peer access: peer key added: Engine ENGINE_i3qlubws0txx4k23wje (key SHA256:RbqCc+6kIff2+FzpZ+PuWV2biBnVKvpotM1uZiJ/ADw, host key SHA256:jAw4Wp9TCTqdNomwt6pc8z4a7bvP/vzO4MMSZdCUYnI)
+Starting instance 'updtest-i76major' on disk updtest10i76 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+Starting instance 'updtest-i76minor' on disk updtest10i76 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+Starting instance 'updtest-i76stale' on disk updtest10i76 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+Starting instance '5ie6xpi5wh42mgsbx7u' on disk 5vyahbut147hw5dp4e1 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌────────────────────────────────┐
+│  Step 2/6  │  Generating port  │
+└────────────────────────────────┘
+Found a port number for instance 5ie6xpi5wh42mgsbx7u: 55889
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 6/6  │  Starting containers  │
+└────────────────────────────────────┘
+Ports: [32m'55889'[39m
+App 5ie6xpi5wh42mgsbx7u running
+Stopping app '5ie6xpi5wh42mgsbx7u' on disk '5vyahbut147hw5dp4e1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+---- temp ----
+45.277 C
+============================================================
+idea04 PR #311 proof continuation  2026-11-11T03:07:03+01:00
+correcting STEP1/STEP2 IDs; continuing from removeInstance
+============================================================
+STEP1 PASS installApp system-disk instance 5ie6xpi5wh42mgsbx7u (axle311-rm); engine log: App 5ie6xpi5wh42mgsbx7u running on disk 5vyahbut147hw5dp4e1
+current stop evidence:
+NAMES                       STATUS                       project
+5ie6xpi5wh42mgsbx7u-web-1   Exited (137) 2 minutes ago   5ie6xpi5wh42mgsbx7u
+DRIVER    VOLUME NAME
+local     5ie6xpi5wh42mgsbx7u_axle311data
+STEP2 PASS stopInstance left Exited containers for 5ie6xpi5wh42mgsbx7u (Exited 137, volume 5ie6xpi5wh42mgsbx7u_axle311data present)
+
+########## 3-7. removeInstance 5ie6xpi5wh42mgsbx7u under pm2 as pi ##########
+time 2026-11-11T03:07:04+01:00 temp 44.790C
+temperature 43.816 C
+volumes BEFORE remove:
+5ie6xpi5wh42mgsbx7u_axle311data
+-rw-rw-r-- 1 pi pi 601 Nov 11 03:04 /instances/5ie6xpi5wh42mgsbx7u/compose.yaml
+>> push-command: removeInstance 5ie6xpi5wh42mgsbx7u
+{"pushed":"removeInstance 5ie6xpi5wh42mgsbx7u","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+---- removeInstance logs ----
+---- engine-out from line 3998 ----
+Removed instance 5ie6xpi5wh42mgsbx7u; its folder is kept at /.idea-quarantine/5ie6xpi5wh42mgsbx7u-20261111T020718Z
+---- engine-error last 20 (compose/docker only) ----
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+ Network 5ie6xpi5wh42mgsbx7u_default Creating 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Creating 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Creating 
+ Network 5ie6xpi5wh42mgsbx7u_default Creating 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Created 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Created 
+ Network 5ie6xpi5wh42mgsbx7u_default Created 
+ Network 5ie6xpi5wh42mgsbx7u_default Created 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Creating 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Created 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Starting 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Started 
+---- docker ps -a after remove (must be empty) ----
+<empty>
+---- volumes AFTER remove (must still be present) ----
+5ie6xpi5wh42mgsbx7u_axle311data
+ls: cannot access '/instances/5ie6xpi5wh42mgsbx7u': No such file or directory
+quarantine path from log: /.idea-quarantine/5ie6xpi5wh42mgsbx7u-20261111T020718Z
+drwx------ 2 root root 4096 Nov 11 03:04 /.idea-quarantine/5ie6xpi5wh42mgsbx7u-20261111T020718Z
+STEP4 PASS-by-effect compose down before quarantine (Exited leftovers gone; folder left /instances)
+STEP5 PASS label filter empty
+STEP6 PASS named volumes still present: 5ie6xpi5wh42mgsbx7u_axle311data
+STEP7 PASS folder logged at /.idea-quarantine/5ie6xpi5wh42mgsbx7u-20261111T020718Z
+STEP3 PASS removeInstance under pm2 as pi (5ie6xpi5wh42mgsbx7u)
+
+########## prepare axleproof-1.1 failing bundle + install axle311-upd ##########
+time 2026-11-11T03:07:21+01:00 temp 47.225C
+temperature 46.251 C
+--- axleproof-1.1 ---
+total 8
+-rw-rw-r-- 1 pi pi 446 Nov 11 03:07 compose.yaml
+-rw-rw-r-- 1 pi pi  79 Nov 11 03:07 SHA256SUMS
+23b31bea04a68ca96deadceb09922c604a7f1ad5771de4b62b9ce0b6ba2f59e2  compose.yaml
+>> push-command: installApp axleproof-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle311-upd --fresh
+{"pushed":"installApp axleproof-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle311-upd --fresh","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+(saw /instances/3iyi1r8bmvlyl7lvvpb but container not up yet)
+ID2=3iyi1r8bmvlyl7lvvpb
+NAMES                       STATUS
+3iyi1r8bmvlyl7lvvpb-web-1   Up 4 seconds
+STEP_UPD_INSTALL PASS 3iyi1r8bmvlyl7lvvpb (axle311-upd)
+
+########## updateApp axle311-upd axleproof-1.1 (expect ROLLED_BACK, instance comes back) ##########
+time 2026-11-11T03:07:41+01:00 temp 47.712C
+temperature 47.712 C
+>> push-command: updateApp axle311-upd axleproof-1.1
+{"pushed":"updateApp axle311-upd axleproof-1.1","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+try 1 waiting for rollback+start... temp=47.712C
+try 2 waiting for rollback+start... temp=45.764C
+try 3 waiting for rollback+start... temp=45.764C
+try 4 waiting for rollback+start... temp=45.764C
+try 5 waiting for rollback+start... temp=45.764C
+try 6 waiting for rollback+start... temp=44.790C
+try 7 waiting for rollback+start... temp=44.790C
+try 8 waiting for rollback+start... temp=44.790C
+try 9 waiting for rollback+start... temp=44.790C
+try 10 waiting for rollback+start... temp=44.790C
+try 11 waiting for rollback+start... temp=44.790C
+try 12 waiting for rollback+start... temp=43.816C
+try 13 waiting for rollback+start... temp=45.277C
+try 14 waiting for rollback+start... temp=43.816C
+try 15 waiting for rollback+start... temp=44.303C
+try 16 waiting for rollback+start... temp=44.303C
+try 17 waiting for rollback+start... temp=44.303C
+try 18 waiting for rollback+start... temp=43.816C
+try 19 waiting for rollback+start... temp=44.303C
+try 20 waiting for rollback+start... temp=44.303C
+try 21 waiting for rollback+start... temp=43.816C
+try 22 waiting for rollback+start... temp=44.303C
+try 23 waiting for rollback+start... temp=43.816C
+try 24 waiting for rollback+start... temp=43.329C
+try 25 waiting for rollback+start... temp=43.816C
+try 26 waiting for rollback+start... temp=43.816C
+try 27 waiting for rollback+start... temp=44.303C
+try 28 waiting for rollback+start... temp=44.303C
+try 29 waiting for rollback+start... temp=44.790C
+try 30 waiting for rollback+start... temp=43.816C
+try 31 waiting for rollback+start... temp=43.816C
+try 32 waiting for rollback+start... temp=44.303C
+try 33 waiting for rollback+start... temp=43.816C
+try 34 waiting for rollback+start... temp=43.816C
+try 35 waiting for rollback+start... temp=44.303C
+try 36 waiting for rollback+start... temp=43.329C
+try 37 waiting for rollback+start... temp=43.816C
+try 38 waiting for rollback+start... temp=43.816C
+try 39 waiting for rollback+start... temp=43.816C
+try 40 waiting for rollback+start... temp=43.329C
+try 41 waiting for rollback+start... temp=43.329C
+try 42 waiting for rollback+start... temp=43.329C
+try 43 waiting for rollback+start... temp=43.816C
+try 44 waiting for rollback+start... temp=43.329C
+try 45 waiting for rollback+start... temp=43.329C
+try 46 waiting for rollback+start... temp=44.303C
+try 47 waiting for rollback+start... temp=42.842C
+try 48 waiting for rollback+start... temp=44.790C
+try 49 waiting for rollback+start... temp=43.816C
+try 50 waiting for rollback+start... temp=43.329C
+try 51 waiting for rollback+start... temp=43.816C
+try 52 waiting for rollback+start... temp=44.790C
+try 53 waiting for rollback+start... temp=44.303C
+try 54 waiting for rollback+start... temp=42.842C
+try 55 waiting for rollback+start... temp=43.816C
+try 56 waiting for rollback+start... temp=42.355C
+try 57 waiting for rollback+start... temp=44.790C
+try 58 waiting for rollback+start... temp=43.329C
+try 59 waiting for rollback+start... temp=43.816C
+try 60 waiting for rollback+start... temp=42.842C
+try 61 waiting for rollback+start... temp=43.816C
+try 62 waiting for rollback+start... temp=42.842C
+try 63 waiting for rollback+start... temp=45.277C
+try 64 waiting for rollback+start... temp=42.842C
+try 65 waiting for rollback+start... temp=42.842C
+try 66 waiting for rollback+start... temp=43.816C
+try 67 waiting for rollback+start... temp=43.816C
+try 68 waiting for rollback+start... temp=43.816C
+try 69 waiting for rollback+start... temp=44.303C
+try 70 waiting for rollback+start... temp=43.816C
+try 71 waiting for rollback+start... temp=42.842C
+try 72 waiting for rollback+start... temp=43.816C
+try 73 waiting for rollback+start... temp=43.816C
+try 74 waiting for rollback+start... temp=44.303C
+try 75 waiting for rollback+start... temp=42.842C
+try 76 waiting for rollback+start... temp=42.842C
+try 77 waiting for rollback+start... temp=43.816C
+try 78 waiting for rollback+start... temp=42.842C
+try 79 waiting for rollback+start... temp=43.816C
+try 80 waiting for rollback+start... temp=44.303C
+---- updateApp logs ----
+---- engine-out from line 4017 ----
+App 3iyi1r8bmvlyl7lvvpb running
+---- engine-error last 20 (compose/docker only) ----
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+ Network 5ie6xpi5wh42mgsbx7u_default Creating 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Creating 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Creating 
+ Network 5ie6xpi5wh42mgsbx7u_default Creating 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Created 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Created 
+ Network 5ie6xpi5wh42mgsbx7u_default Created 
+ Network 5ie6xpi5wh42mgsbx7u_default Created 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Creating 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Created 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Starting 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Started 
+ Volume 3iyi1r8bmvlyl7lvvpb_axle311data Creating 
+ Volume 3iyi1r8bmvlyl7lvvpb_axle311data Creating 
+ Network 3iyi1r8bmvlyl7lvvpb_default Creating 
+ Network 3iyi1r8bmvlyl7lvvpb_default Creating 
+ Volume 3iyi1r8bmvlyl7lvvpb_axle311data Created 
+ Volume 3iyi1r8bmvlyl7lvvpb_axle311data Created 
+ Network 3iyi1r8bmvlyl7lvvpb_default Created 
+ Network 3iyi1r8bmvlyl7lvvpb_default Created 
+ Container 3iyi1r8bmvlyl7lvvpb-web-1 Creating 
+ Container 3iyi1r8bmvlyl7lvvpb-web-1 Created 
+ Container 3iyi1r8bmvlyl7lvvpb-web-1 Starting 
+ Container 3iyi1r8bmvlyl7lvvpb-web-1 Started 
+Error: idea-app-data estimate gave no result line: 16 8
+---- absolute path mentions ----
+---- docker after update ----
+NAMES                       STATUS
+3iyi1r8bmvlyl7lvvpb-web-1   Up 7 minutes
+drwxr-xr-x 2 pi pi 4096 Nov 11 03:07 /instances/3iyi1r8bmvlyl7lvvpb
+WARNING: compose.yaml does not look like 1.0
+services:
+  web:
+    image: busybox:1.36.1
+    command:
+      [
+        "sh",
+        "-c",
+        "mkdir -p /data && echo axle311-ok > /data/index.html && httpd -f -p
+          80 -h /data"
+      ]
+    ports:
+      - "${port}:80"
+    volumes:
+      - axle311data:/data
+    restart: unless-stopped
+volumes:
+  axle311data:
+x-app:
+  title: "Axle 311 proof"
+  description: "Scratch app for idea#424 / agent-engine-dev#311 proof on idea04"
+STEP_UPD FAIL rollback did not restore running 1.0 instance (ok=0 compose1.0=0)
+
+########## 8. force compose down to fail (broken compose.yaml, no source edit) ##########
+time 2026-11-11T03:14:39+01:00 temp 43.816C
+temperature 45.277 C
+>> push-command: stopInstance axle311-upd 5vyahbut147hw5dp4e1
+{"pushed":"stopInstance axle311-upd 5vyahbut147hw5dp4e1","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+writing deliberately broken compose.yaml
+broken compose.yaml:
+this is not valid yaml: [[
+>> push-command: removeInstance 3iyi1r8bmvlyl7lvvpb
+{"pushed":"removeInstance 3iyi1r8bmvlyl7lvvpb","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+---- removeInstance-fail logs ----
+---- engine-out from line 4025 ----
+---- engine-error last 20 (compose/docker only) ----
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+ Network 5ie6xpi5wh42mgsbx7u_default Creating 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Creating 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Creating 
+ Network 5ie6xpi5wh42mgsbx7u_default Creating 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Created 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Created 
+ Network 5ie6xpi5wh42mgsbx7u_default Created 
+ Network 5ie6xpi5wh42mgsbx7u_default Created 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Creating 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Created 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Starting 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Started 
+ Volume 3iyi1r8bmvlyl7lvvpb_axle311data Creating 
+ Volume 3iyi1r8bmvlyl7lvvpb_axle311data Creating 
+ Network 3iyi1r8bmvlyl7lvvpb_default Creating 
+ Network 3iyi1r8bmvlyl7lvvpb_default Creating 
+ Volume 3iyi1r8bmvlyl7lvvpb_axle311data Created 
+ Volume 3iyi1r8bmvlyl7lvvpb_axle311data Created 
+ Network 3iyi1r8bmvlyl7lvvpb_default Created 
+ Network 3iyi1r8bmvlyl7lvvpb_default Created 
+ Container 3iyi1r8bmvlyl7lvvpb-web-1 Creating 
+ Container 3iyi1r8bmvlyl7lvvpb-web-1 Created 
+ Container 3iyi1r8bmvlyl7lvvpb-web-1 Starting 
+ Container 3iyi1r8bmvlyl7lvvpb-web-1 Started 
+Error: idea-app-data estimate gave no result line: 16 8
+Error: COMPOSE_DOWN_FAILED: docker compose down failed for 'axle311-upd': failed to parse /instances/3iyi1r8bmvlyl7lvvpb/compose.yaml: go-yaml load error in parser (while parsing a flow node) at L2.C1: did not find expected node content
+---- folder should still be at /instances/3iyi1r8bmvlyl7lvvpb ----
+drwxr-xr-x 2 pi pi 4096 Nov 11 03:07 /instances/3iyi1r8bmvlyl7lvvpb
+STEP8a PASS instance folder stayed at /instances/3iyi1r8bmvlyl7lvvpb
+STEP8b FAIL COMPOSE_DOWN_FAILED not found in logs
+{"docId":"2VroEUvDkmYsDAwE5oG9YeFNadWH","engineDB":{"ENGINE_5vyahbut147hw5dp4e1":{"hostname":"idea04","lastRun":1794362359920,"lastBooted":1794362346754,"version":"1.0","commands":[],"peerAccess":{"sshKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAFyGpxISXAOT6tEv1BDF1uLWr3gk5JXJeX9JxRWw7nS","hostKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGmlf2+xFRtA7oVssh8MIRHg7gZgC68X73AVfASfrI60","publishedAt":1791293420762,"authorized":["ENGINE_gge6zxyl6ftmnri4qx6 SHA256:OSVG4OYoQ8FqPMO185xlJ2+rNtrFq/xWsuRRhXzW8Mk SHA256:mhGh3+YUbBZfqwpmUTba86GieAcJh3v+AaR9Fk1r/Ho","ENGINE_i3qlubws0txx4k23wje SHA256:RbqCc+6kIff2+FzpZ+PuWV2biBnVKvpotM1uZiJ/ADw SHA256:jAw4Wp9TCTqdNomwt6pc8z4a7bvP/vzO4MMSZdCUYnI"]}},"ENGINE_gge6zxyl6ftmnri4qx6":{"hostname":"idea03","lastRun":1794362785888,"lastBooted":1794362780577,"version":"1","commands":[],"peerAccess":{"sshKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDdBO04PeAl0spladOLWwQVsal88Zh2k6I35/4QgrySa","hostKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOLJSy9jnf1WNRo6sjZUaD/iuGjBu9EEJY5Nrm/66S6X","publishedAt":1791293262506,"authorized":["ENGINE_5vyahbut147hw5dp4e1 SHA256:Q6yVaj4vdapzcj9alvY0GEuyPjOagMfxHWrqhQ6o8d0 SHA256:uEeP7Igiq/fqWVaRs4XpmrYkBJI8y8Narwik1MWXTqc","ENGINE_i3qlubws0txx4k23wje SHA256:RbqCc+6kIff2+FzpZ+PuWV2biBnVKvpotM1uZiJ/ADw SHA256:jAw4Wp9TCTqdNomwt6pc8z4a7bvP/vzO4MMSZdCUYnI"]}},"ENGINE_i3qlubws0txx4k23wje":{"hostname":"idea01","lastRun":1794362056957,"lastBooted":1793271214203,"version":"1.0","commands":[],"peerAccess":{"sshKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILn1NbKZjfZ0ndgb0PMIj+RjSljN6oxyi6eB7e7fPvdI","hostKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILgXWGtjb2Cqg6d4p5aVZ0ahUofz3MpG/sRgZyplI9eI","publishedAt":1791301072278,"authorized":["ENGINE_5vyahbut147hw5dp4e1 SHA256:Q6yVaj4vdapzcj9alvY0GEuyPjOagMfxHWrqhQ6o8d0 SHA256:uEeP7Igiq/fqWVaRs4XpmrYkBJI8y8Narwik1MWXTqc","ENGINE_gge6zxyl6ftmnri4qx6 SHA256:OSVG4OYoQ8FqPMO185xlJ2+rNtrFq/xWsuRRhXzW8Mk SHA256:mhGh3+YUbBZfqwpmUTba86GieAcJh3v+AaR9Fk1r/Ho"]}}},"diskDB":{},"instanceDB":{"3iyi1r8bmvlyl7lvvpb":{"id":"3iyi1r8bmvlyl7lvvpb","name":"axle311-upd","instanceOf":"undefined-undefined","storedOn":"5vyahbut147hw5dp4e1","status":"Stopped","created":1794362855029}},"operations":[]}
+STEP8c PASS instance still in the store
+restoring working compose.yaml so cleanup removeInstance can succeed
+
+========== STEP RESULTS ==========
+STEP1 PASS installApp system-disk instance (saw /instances/5ie6xpi5wh42mgsbx7u but container not up yet)
+5ie6xpi5wh42mgsbx7u (axle311-rm)
+STEP2 FAIL no Exited containers after stopInstance
+STEP1 PASS installApp system-disk instance 5ie6xpi5wh42mgsbx7u (axle311-rm); engine log: App 5ie6xpi5wh42mgsbx7u running on disk 5vyahbut147hw5dp4e1
+STEP2 PASS stopInstance left Exited containers for 5ie6xpi5wh42mgsbx7u (Exited 137, volume 5ie6xpi5wh42mgsbx7u_axle311data present)
+STEP4 PASS-by-effect compose down before quarantine (Exited leftovers gone; folder left /instances)
+STEP5 PASS label filter empty
+STEP6 PASS named volumes still present: 5ie6xpi5wh42mgsbx7u_axle311data
+STEP7 PASS folder logged at /.idea-quarantine/5ie6xpi5wh42mgsbx7u-20261111T020718Z
+STEP3 PASS removeInstance under pm2 as pi (5ie6xpi5wh42mgsbx7u)
+STEP_UPD_INSTALL PASS 3iyi1r8bmvlyl7lvvpb (axle311-upd)
+STEP_UPD FAIL rollback did not restore running 1.0 instance (ok=0 compose1.0=0)
+STEP8a PASS instance folder stayed at /instances/3iyi1r8bmvlyl7lvvpb
+STEP8b FAIL COMPOSE_DOWN_FAILED not found in logs
+STEP8c PASS instance still in the store
+=================================
+ID1=5ie6xpi5wh42mgsbx7u ID2=3iyi1r8bmvlyl7lvvpb
+2026-11-11T03:16:35+01:00
+temperature 46.738 C
+==== helper estimate on system / 3iyi1r8bmvlyl7lvvpb ====
+refused: cannot tell the free space of 
+16 8 
+exit:0
+==== df / ====
+Filesystem     1K-blocks      Used Available Use% Mounted on
+/dev/sda2      230304208 135914568  84997964  62% /
+==== instance + compose now ====
+drwxr-xr-x 2 pi pi 4096 Nov 11 03:07 /instances/3iyi1r8bmvlyl7lvvpb
+----- compose.yaml head -----
+services:
+  web:
+    image: busybox:1.36.1
+    command:
+      [
+        "sh",
+        "-c",
+        "mkdir -p /data && echo axle311-ok > /data/index.html && httpd -f -p
+          80 -h /data"
+      ]
+    ports:
+      - "${port}:80"
+    volumes:
+      - axle311data:/data
+    restart: unless-stopped
+volumes:
+  axle311data:
+x-app:
+  title: "Axle 311 proof"
+  description: "Scratch app for idea#424 / agent-engine-dev#311 proof on idea04"
+  category: "utilities"
+  url: "https://github.com/koenswings/agent-engine-dev/pull/311"
+  icon: ""
+  author: "Axle"
+  healthTimeout: 30
+==== docker ====
+NAMES                       STATUS
+3iyi1r8bmvlyl7lvvpb-web-1   Exited (137) 2 minutes ago
+==== grep estimate / ROLLED / COMPOSE_DOWN in logs ====
+/home/pi/.pm2/logs/engine-error.log:556:Error: idea-app-data estimate gave no result line: 16 8
+/home/pi/.pm2/logs/engine-error.log:557:Error: COMPOSE_DOWN_FAILED: docker compose down failed for 'axle311-upd': failed to parse /instances/3iyi1r8bmvlyl7lvvpb/compose.yaml: go-yaml load error in parser (while parsing a flow node) at L2.C1: did not find expected node content
+==== installed helper estimate vs repo helper (first lines of estimate case) ====
+df -Pk /
+Filesystem     1024-blocks      Used Available Capacity Mounted on
+/dev/sda2        230304208 135914568  84997964      62% /
+
+============================================================
+updateApp rollback proof + STEP8 log correction
+2026-11-11T03:19:23+01:00 temp 44.303C
+============================================================
+temperature 43.816 C
+STEP8b PASS COMPOSE_DOWN_FAILED thrown with absolute -f path /instances/3iyi1r8bmvlyl7lvvpb/compose.yaml (was in engine-error.log)
+==== patch helper avail_kb so SYSTEM_ROOT='' is treated as / (save+restore) ====
+c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c  /usr/local/sbin/idea-app-data
+c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c  /home/pi/idea-app-data.main-8241221.bak
+wrote patched helper 70866 bytes
+installed patched helper; estimate retry:
+16 8 84997884
+exit:0
+==== quarantine leftover axle311-upd 3iyi1r8bmvlyl7lvvpb (compose restored) ====
+-rw-rw-r-- 1 pi pi 602 Nov 11 03:16 /instances/3iyi1r8bmvlyl7lvvpb/compose.yaml
+>> push-command: removeInstance 3iyi1r8bmvlyl7lvvpb
+{"pushed":"removeInstance 3iyi1r8bmvlyl7lvvpb","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+---- engine-out from line 4025 ----
+Removed instance 3iyi1r8bmvlyl7lvvpb; its folder is kept at /.idea-quarantine/3iyi1r8bmvlyl7lvvpb-20261111T021938Z
+ls: cannot access '/instances/3iyi1r8bmvlyl7lvvpb': No such file or directory
+ID2 quarantined OK
+==== install fresh axle311-upd2 for updateApp rollback ====
+>> push-command: installApp axleproof-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle311-upd2 --fresh
+{"pushed":"installApp axleproof-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle311-upd2 --fresh","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+(saw /instances/h7wd4t350auta0dfnbg, container not up yet)
+ID3=h7wd4t350auta0dfnbg
+NAMES                       STATUS
+h7wd4t350auta0dfnbg-web-1   Up 4 seconds
+STEP_UPD_INSTALL2 PASS h7wd4t350auta0dfnbg
+==== estimate on the new instance (must be three integers) ====
+16 8 84997804
+==== updateApp axle311-upd2 axleproof-1.1 ====
+>> push-command: updateApp axle311-upd2 axleproof-1.1
+{"pushed":"updateApp axle311-upd2 axleproof-1.1","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+try 1 waiting for rollback+start temp=46.738C
+try 2 waiting for rollback+start temp=46.251C
+try 3 waiting for rollback+start temp=45.277C
+try 4 waiting for rollback+start temp=45.764C
+try 5 waiting for rollback+start temp=44.790C
+try 6 waiting for rollback+start temp=44.790C
+try 7 waiting for rollback+start temp=44.790C
+try 8 waiting for rollback+start temp=44.303C
+try 9 waiting for rollback+start temp=44.790C
+try 10 waiting for rollback+start temp=44.790C
+try 11 waiting for rollback+start temp=44.303C
+try 12 waiting for rollback+start temp=44.303C
+try 13 waiting for rollback+start temp=43.816C
+try 14 waiting for rollback+start temp=43.816C
+try 15 waiting for rollback+start temp=43.816C
+try 16 waiting for rollback+start temp=44.790C
+try 17 waiting for rollback+start temp=43.816C
+try 18 waiting for rollback+start temp=43.816C
+try 19 waiting for rollback+start temp=44.303C
+try 20 waiting for rollback+start temp=43.816C
+try 21 waiting for rollback+start temp=44.303C
+try 22 waiting for rollback+start temp=43.329C
+try 23 waiting for rollback+start temp=42.842C
+try 24 waiting for rollback+start temp=42.842C
+try 25 waiting for rollback+start temp=44.303C
+try 26 waiting for rollback+start temp=44.303C
+try 27 waiting for rollback+start temp=42.842C
+try 28 waiting for rollback+start temp=42.842C
+try 29 waiting for rollback+start temp=44.303C
+try 30 waiting for rollback+start temp=43.329C
+try 31 waiting for rollback+start temp=43.816C
+try 32 waiting for rollback+start temp=42.842C
+try 33 waiting for rollback+start temp=44.790C
+try 34 waiting for rollback+start temp=43.816C
+try 35 waiting for rollback+start temp=43.816C
+try 36 waiting for rollback+start temp=42.842C
+try 37 waiting for rollback+start temp=44.303C
+try 38 waiting for rollback+start temp=44.303C
+try 39 waiting for rollback+start temp=42.355C
+try 40 waiting for rollback+start temp=43.816C
+try 41 waiting for rollback+start temp=42.842C
+try 42 waiting for rollback+start temp=42.842C
+try 43 waiting for rollback+start temp=43.816C
+try 44 waiting for rollback+start temp=44.303C
+try 45 waiting for rollback+start temp=43.816C
+try 46 waiting for rollback+start temp=43.816C
+try 47 waiting for rollback+start temp=43.329C
+try 48 waiting for rollback+start temp=42.842C
+try 49 waiting for rollback+start temp=43.329C
+try 50 waiting for rollback+start temp=44.303C
+try 51 waiting for rollback+start temp=43.816C
+try 52 waiting for rollback+start temp=43.329C
+try 53 waiting for rollback+start temp=44.303C
+try 54 waiting for rollback+start temp=43.329C
+try 55 waiting for rollback+start temp=42.842C
+try 56 waiting for rollback+start temp=42.355C
+try 57 waiting for rollback+start temp=43.329C
+try 58 waiting for rollback+start temp=44.303C
+try 59 waiting for rollback+start temp=42.355C
+try 60 waiting for rollback+start temp=44.303C
+try 61 waiting for rollback+start temp=42.842C
+try 62 waiting for rollback+start temp=42.355C
+try 63 waiting for rollback+start temp=43.329C
+try 64 waiting for rollback+start temp=44.303C
+try 65 waiting for rollback+start temp=42.842C
+try 66 waiting for rollback+start temp=43.329C
+try 67 waiting for rollback+start temp=43.329C
+try 68 waiting for rollback+start temp=43.329C
+try 69 waiting for rollback+start temp=42.842C
+try 70 waiting for rollback+start temp=43.816C
+try 71 waiting for rollback+start temp=43.329C
+try 72 waiting for rollback+start temp=43.816C
+try 73 waiting for rollback+start temp=43.329C
+try 74 waiting for rollback+start temp=43.329C
+try 75 waiting for rollback+start temp=43.329C
+try 76 waiting for rollback+start temp=44.303C
+try 77 waiting for rollback+start temp=43.329C
+try 78 waiting for rollback+start temp=43.816C
+try 79 waiting for rollback+start temp=43.329C
+try 80 waiting for rollback+start temp=44.790C
+try 81 waiting for rollback+start temp=44.303C
+try 82 waiting for rollback+start temp=42.842C
+try 83 waiting for rollback+start temp=42.842C
+try 84 waiting for rollback+start temp=43.816C
+try 85 waiting for rollback+start temp=43.816C
+try 86 waiting for rollback+start temp=43.329C
+try 87 waiting for rollback+start temp=43.816C
+try 88 waiting for rollback+start temp=43.329C
+try 89 waiting for rollback+start temp=43.329C
+try 90 waiting for rollback+start temp=43.329C
+---- updateApp engine-out ----
+---- engine-out from line 4044 ----
+App h7wd4t350auta0dfnbg running
+---- updateApp engine-error new lines ----
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Creating 
+ Network 5ie6xpi5wh42mgsbx7u_default Creating 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Created 
+ Volume 5ie6xpi5wh42mgsbx7u_axle311data Created 
+ Network 5ie6xpi5wh42mgsbx7u_default Created 
+ Network 5ie6xpi5wh42mgsbx7u_default Created 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Creating 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Created 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Starting 
+ Container 5ie6xpi5wh42mgsbx7u-web-1 Started 
+ Volume 3iyi1r8bmvlyl7lvvpb_axle311data Creating 
+ Volume 3iyi1r8bmvlyl7lvvpb_axle311data Creating 
+ Network 3iyi1r8bmvlyl7lvvpb_default Creating 
+ Network 3iyi1r8bmvlyl7lvvpb_default Creating 
+ Volume 3iyi1r8bmvlyl7lvvpb_axle311data Created 
+ Volume 3iyi1r8bmvlyl7lvvpb_axle311data Created 
+ Network 3iyi1r8bmvlyl7lvvpb_default Created 
+ Network 3iyi1r8bmvlyl7lvvpb_default Created 
+ Container 3iyi1r8bmvlyl7lvvpb-web-1 Creating 
+ Container 3iyi1r8bmvlyl7lvvpb-web-1 Created 
+ Container 3iyi1r8bmvlyl7lvvpb-web-1 Starting 
+ Container 3iyi1r8bmvlyl7lvvpb-web-1 Started 
+Error: idea-app-data estimate gave no result line: 16 8
+Error: COMPOSE_DOWN_FAILED: docker compose down failed for 'axle311-upd': failed to parse /instances/3iyi1r8bmvlyl7lvvpb/compose.yaml: go-yaml load error in parser (while parsing a flow node) at L2.C1: did not find expected node content
+
+    at dockerQuiet (file:///home/pi/axle-311/dist/src/data/RemoveInstance.js:18:53)
+    exit code: 1; nothing changed
+ Network h7wd4t350auta0dfnbg_default Creating 
+ Network h7wd4t350auta0dfnbg_default Creating 
+ Volume h7wd4t350auta0dfnbg_axle311data Creating 
+ Volume h7wd4t350auta0dfnbg_axle311data Creating 
+ Volume h7wd4t350auta0dfnbg_axle311data Created 
+ Volume h7wd4t350auta0dfnbg_axle311data Created 
+ Network h7wd4t350auta0dfnbg_default Created 
+ Network h7wd4t350auta0dfnbg_default Created 
+ Container h7wd4t350auta0dfnbg-web-1 Creating 
+ Container h7wd4t350auta0dfnbg-web-1 Created 
+ Container h7wd4t350auta0dfnbg-web-1 Starting 
+ Container h7wd4t350auta0dfnbg-web-1 Started 
+Error: DIFFERENT_APP: axleproof-1.1 is not a version of undefined
+---- absolute path mentions ----
+---- docker ----
+NAMES                       STATUS
+h7wd4t350auta0dfnbg-web-1   Up 7 minutes
+---- compose.yaml (expect 1.0 unless-stopped / httpd) ----
+8:        "mkdir -p /data && echo axle311-ok > /data/index.html && httpd -f -p
+15:    restart: unless-stopped
+STEP_UPD FAIL ok=0 (see logs)
+==== cleanup: stop + removeInstance h7wd4t350auta0dfnbg ====
+>> push-command: stopInstance axle311-upd2 5vyahbut147hw5dp4e1
+{"pushed":"stopInstance axle311-upd2 5vyahbut147hw5dp4e1","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+>> push-command: removeInstance h7wd4t350auta0dfnbg
+{"pushed":"removeInstance h7wd4t350auta0dfnbg","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+---- engine-out from line 4052 ----
+Removed instance h7wd4t350auta0dfnbg; its folder is kept at /.idea-quarantine/h7wd4t350auta0dfnbg-20261111T022829Z
+==== restore original helper ====
+c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c  /usr/local/sbin/idea-app-data
+c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c  /home/pi/idea-app-data.main-8241221.bak
+helper restored to main backup
+
+========== STEP RESULTS ==========
+STEP1 PASS installApp system-disk instance (saw /instances/5ie6xpi5wh42mgsbx7u but container not up yet)
+5ie6xpi5wh42mgsbx7u (axle311-rm)
+STEP2 FAIL no Exited containers after stopInstance
+STEP1 PASS installApp system-disk instance 5ie6xpi5wh42mgsbx7u (axle311-rm); engine log: App 5ie6xpi5wh42mgsbx7u running on disk 5vyahbut147hw5dp4e1
+STEP2 PASS stopInstance left Exited containers for 5ie6xpi5wh42mgsbx7u (Exited 137, volume 5ie6xpi5wh42mgsbx7u_axle311data present)
+STEP4 PASS-by-effect compose down before quarantine (Exited leftovers gone; folder left /instances)
+STEP5 PASS label filter empty
+STEP6 PASS named volumes still present: 5ie6xpi5wh42mgsbx7u_axle311data
+STEP7 PASS folder logged at /.idea-quarantine/5ie6xpi5wh42mgsbx7u-20261111T020718Z
+STEP3 PASS removeInstance under pm2 as pi (5ie6xpi5wh42mgsbx7u)
+STEP_UPD_INSTALL PASS 3iyi1r8bmvlyl7lvvpb (axle311-upd)
+STEP_UPD FAIL rollback did not restore running 1.0 instance (ok=0 compose1.0=0)
+STEP8a PASS instance folder stayed at /instances/3iyi1r8bmvlyl7lvvpb
+STEP8b FAIL COMPOSE_DOWN_FAILED not found in logs
+STEP8c PASS instance still in the store
+STEP8b PASS COMPOSE_DOWN_FAILED thrown with absolute -f path /instances/3iyi1r8bmvlyl7lvvpb/compose.yaml (was in engine-error.log)
+STEP_UPD_INSTALL2 PASS h7wd4t350auta0dfnbg
+STEP_UPD FAIL ok=0 (see logs)
+=================================
+ID3=h7wd4t350auta0dfnbg
+2026-11-11T03:28:31+01:00
+temperature 48.686 C
+============================================================
+updateApp rollback retry with x-app.name/version
+2026-11-11T03:29:17+01:00
+temp 43.329C
+============================================================
+==== rewrite bundles with x-app.name + x-app.version ====
+1.0 sums 85e31884bb77bcea5b8a30a5e81d8ab4cf666f7415d9073c441ae8ad239760af  compose.yaml
+1.1 sums 6c700950bf7248b3dc77bac1949420c2d08d0edeff6b645f89d0ec9d0a6393d5  compose.yaml
+==== re-apply avail_kb helper patch (restore afterwards) ====
+c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c  /usr/local/sbin/idea-app-data
+c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c  /home/pi/idea-app-data.main-8241221.bak
+==== install axle311-upd3 ====
+>> push-command: installApp axleproof-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle311-upd3 --fresh
+{"pushed":"installApp axleproof-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle311-upd3 --fresh","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+(saw /instances/y8uio8lxoa74p9pcsip, container not up yet)
+ID=y8uio8lxoa74p9pcsip
+NAMES                       STATUS
+y8uio8lxoa74p9pcsip-web-1   Up 3 seconds
+{"docId":"2VroEUvDkmYsDAwE5oG9YeFNadWH","engineDB":{"ENGINE_5vyahbut147hw5dp4e1":{"hostname":"idea04","lastRun":1794362359920,"lastBooted":1794362346754,"version":"1.0","commands":["installApp axleproof-1.0 5vyahbut147hw5dp4e1 --source 5vyahbut147hw5dp4e1 --name axle311-upd3 --fresh"],"peerAccess":{"sshKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAFyGpxISXAOT6tEv1BDF1uLWr3gk5JXJeX9JxRWw7nS","hostKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGmlf2+xFRtA7oVssh8MIRHg7gZgC68X73AVfASfrI60","publishedAt":1791293420762,"authorized":["ENGINE_gge6zxyl6ftmnri4qx6 SHA256:OSVG4OYoQ8FqPMO185xlJ2+rNtrFq/xWsuRRhXzW8Mk SHA256:mhGh3+YUbBZfqwpmUTba86GieAcJh3v+AaR9Fk1r/Ho","ENGINE_i3qlubws0txx4k23wje SHA256:RbqCc+6kIff2+FzpZ+PuWV2biBnVKvpotM1uZiJ/ADw SHA256:jAw4Wp9TCTqdNomwt6pc8z4a7bvP/vzO4MMSZdCUYnI"]}},"ENGINE_gge6zxyl6ftmnri4qx6":{"hostname":"idea03","lastRun":1794362785888,"lastBooted":1794362780577,"version":"1","commands":[],"peerAccess":{"sshKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDdBO04PeAl0spladOLWwQVsal88Zh2k6I35/4QgrySa","hostKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOLJSy9jnf1WNRo6sjZUaD/iuGjBu9EEJY5Nrm/66S6X","publishedAt":1791293262506,"authorized":["ENGINE_5vyahbut147hw5dp4e1 SHA256:Q6yVaj4vdapzcj9alvY0GEuyPjOagMfxHWrqhQ6o8d0 SHA256:uEeP7Igiq/fqWVaRs4XpmrYkBJI8y8Narwik1MWXTqc","ENGINE_i3qlubws0txx4k23wje SHA256:RbqCc+6kIff2+FzpZ+PuWV2biBnVKvpotM1uZiJ/ADw SHA256:jAw4Wp9TCTqdNomwt6pc8z4a7bvP/vzO4MMSZdCUYnI"]}},"ENGINE_i3qlubws0txx4k23wje":{"hostname":"idea01","lastRun":1794362056957,"lastBooted":1793271214203,"version":"1.0","commands":[],"peerAccess":{"sshKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILn1NbKZjfZ0ndgb0PMIj+RjSljN6oxyi6eB7e7fPvdI","hostKey":"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILgXWGtjb2Cqg6d4p5aVZ0ahUofz3MpG/sRgZyplI9eI","publishedAt":1791301072278,"authorized":["ENGINE_5vyahbut147hw5dp4e1 SHA256:Q6yVaj4vdapzcj9alvY0GEuyPjOagMfxHWrqhQ6o8d0 SHA256:uEeP7Igiq/fqWVaRs4XpmrYkBJI8y8Narwik1MWXTqc","ENGINE_gge6zxyl6ftmnri4qx6 SHA256:OSVG4OYoQ8FqPMO185xlJ2+rNtrFq/xWsuRRhXzW8Mk SHA256:mhGh3+YUbBZfqwpmUTba86GieAcJh3v+AaR9Fk1r/Ho"]}}},"diskDB":{},"instanceDB":{"y8uio8lxoa74p9pcsip":{"id":"y8uio8lxoa74p9pcsip","name":"axle311-upd3","instanceOf":"axleproof-1.0","storedOn":"5vyahbut147hw5dp4e1","status":"Pauzed","created":1794364172038}},"operations":[]}
+==== estimate ====
+16 8 84997584
+==== updateApp axle311-upd3 axleproof-1.1 ====
+>> push-command: updateApp axle311-upd3 axleproof-1.1
+{"pushed":"updateApp axle311-upd3 axleproof-1.1","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+try 1 waiting rollback+start temp=48.686C
+early failure:
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: idea-app-data estimate gave no result line: 16 8
+Error: COMPOSE_DOWN_FAILED: docker compose down failed for 'axle311-upd': failed to parse /instances/3iyi1r8bmvlyl7lvvpb/compose.yaml: go-yaml load error in parser (while parsing a flow node) at L2.C1: did not find expected node content
+Error: DIFFERENT_APP: axleproof-1.1 is not a version of undefined
+try 2 waiting rollback+start temp=46.738C
+early failure:
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: idea-app-data estimate gave no result line: 16 8
+Error: COMPOSE_DOWN_FAILED: docker compose down failed for 'axle311-upd': failed to parse /instances/3iyi1r8bmvlyl7lvvpb/compose.yaml: go-yaml load error in parser (while parsing a flow node) at L2.C1: did not find expected node content
+Error: DIFFERENT_APP: axleproof-1.1 is not a version of undefined
+try 3 waiting rollback+start temp=47.225C
+early failure:
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: idea-app-data estimate gave no result line: 16 8
+Error: COMPOSE_DOWN_FAILED: docker compose down failed for 'axle311-upd': failed to parse /instances/3iyi1r8bmvlyl7lvvpb/compose.yaml: go-yaml load error in parser (while parsing a flow node) at L2.C1: did not find expected node content
+Error: DIFFERENT_APP: axleproof-1.1 is not a version of undefined
+try 4 waiting rollback+start temp=47.225C
+early failure:
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: Store template home/pi/idea/agents/agent-engine-dev/store-identity/store-template.json is missing. Every Engine must start from the shared store-template.json (never regenerate it): restore it from git, e.g. 'git checkout -- store-identity/store-template.json'.
+Error: idea-app-data estimate gave no result line: 16 8
+Error: COMPOSE_DOWN_FAILED: docker compose down failed for 'axle311-upd': failed to parse /instances/3iyi1r8bmvlyl7lvvpb/compose.yaml: go-yaml load error in parser (while parsing a flow node) at L2.C1: did not find expected node content
+Error: DIFFERENT_APP: axleproof-1.1 is not a version of undefined
+try 5 waiting rollback+start temp=47.225C
+try 6 waiting rollback+start temp=46.251C
+try 7 waiting rollback+start temp=45.764C
+try 8 waiting rollback+start temp=44.303C
+try 9 waiting rollback+start temp=45.764C
+try 10 waiting rollback+start temp=44.303C
+try 11 waiting rollback+start temp=43.816C
+try 12 waiting rollback+start temp=44.303C
+try 13 waiting rollback+start temp=45.277C
+try 14 waiting rollback+start temp=44.303C
+try 15 waiting rollback+start temp=43.816C
+try 16 waiting rollback+start temp=44.303C
+try 17 waiting rollback+start temp=44.303C
+try 18 waiting rollback+start temp=43.816C
+try 19 waiting rollback+start temp=43.816C
+try 20 waiting rollback+start temp=44.303C
+try 21 waiting rollback+start temp=44.303C
+try 22 waiting rollback+start temp=43.816C
+try 23 waiting rollback+start temp=43.816C
+try 24 waiting rollback+start temp=43.816C
+try 25 waiting rollback+start temp=43.816C
+try 26 waiting rollback+start temp=43.816C
+try 27 waiting rollback+start temp=43.816C
+try 28 waiting rollback+start temp=43.329C
+try 29 waiting rollback+start temp=45.277C
+try 30 waiting rollback+start temp=44.303C
+try 31 waiting rollback+start temp=44.303C
+try 32 waiting rollback+start temp=43.329C
+============================================================
+idea04 PR #311 cleanup + restore  2026-11-11T03:36:20+01:00  temp 43.329C
+============================================================
+temp_c=43.816
+==== extra evidence: compose-down / directory paths ====
+3998:Removed instance 5ie6xpi5wh42mgsbx7u; its folder is kept at /.idea-quarantine/5ie6xpi5wh42mgsbx7u-20261111T020718Z
+4025:Removed instance 3iyi1r8bmvlyl7lvvpb; its folder is kept at /.idea-quarantine/3iyi1r8bmvlyl7lvvpb-20261111T021938Z
+4052:Removed instance h7wd4t350auta0dfnbg; its folder is kept at /.idea-quarantine/h7wd4t350auta0dfnbg-20261111T022829Z
+544: Volume 3iyi1r8bmvlyl7lvvpb_axle311data Creating 
+545: Volume 3iyi1r8bmvlyl7lvvpb_axle311data Creating 
+546: Network 3iyi1r8bmvlyl7lvvpb_default Creating 
+547: Network 3iyi1r8bmvlyl7lvvpb_default Creating 
+548: Volume 3iyi1r8bmvlyl7lvvpb_axle311data Created 
+549: Volume 3iyi1r8bmvlyl7lvvpb_axle311data Created 
+550: Network 3iyi1r8bmvlyl7lvvpb_default Created 
+551: Network 3iyi1r8bmvlyl7lvvpb_default Created 
+552: Container 3iyi1r8bmvlyl7lvvpb-web-1 Creating 
+553: Container 3iyi1r8bmvlyl7lvvpb-web-1 Created 
+554: Container 3iyi1r8bmvlyl7lvvpb-web-1 Starting 
+555: Container 3iyi1r8bmvlyl7lvvpb-web-1 Started 
+557:Error: COMPOSE_DOWN_FAILED: docker compose down failed for 'axle311-upd': failed to parse /instances/3iyi1r8bmvlyl7lvvpb/compose.yaml: go-yaml load error in parser (while parsing a flow node) at L2.C1: did not find expected node content
+598:Error: ROLLED BACK: Start failed: start failed: Engine error: Container(s) exited after compose up for y8uio8lxoa74p9pcsip. Automerge must not stay Running. y8uio8lxoa74p9pcsip-web-1: Exited (42) 2 seconds ago. axleproof-1.0 and its data were restored from /.pre-update/y8uio8lxoa74p9pcsip
+==== stop + remove leftover y8uio8lxoa74p9pcsip (axle311-upd3) ====
+NAMES                       STATUS
+y8uio8lxoa74p9pcsip-web-1   Up 5 minutes
+>> push-command: stopInstance axle311-upd3 5vyahbut147hw5dp4e1
+{"pushed":"stopInstance axle311-upd3 5vyahbut147hw5dp4e1","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+NAMES                       STATUS
+y8uio8lxoa74p9pcsip-web-1   Exited (137) Less than a second ago
+>> push-command: removeInstance y8uio8lxoa74p9pcsip
+{"pushed":"removeInstance y8uio8lxoa74p9pcsip","engineId":"ENGINE_5vyahbut147hw5dp4e1"}
+ls: cannot access '/instances/y8uio8lxoa74p9pcsip': No such file or directory
+instance folder gone from /instances
+Removed instance y8uio8lxoa74p9pcsip; its folder is kept at /.idea-quarantine/y8uio8lxoa74p9pcsip-20261111T023701Z
+==== quarantine scratch app bundles (not kolibri-channel-builder) ====
+total 12
+drwxr-xr-x  3 pi   pi   4096 Nov 11 03:37 .
+drwxr-xr-x 24 root root 4096 Nov 11 03:30 ..
+drwxrwxr-x  7 pi   pi   4096 Oct 15 08:28 kolibri-channel-builder-2551b7d
+total 16
+drwxrwxr-x 4 pi pi 4096 Nov 11 03:37 .
+drwxrwxr-x 3 pi pi 4096 Nov 11 03:37 ..
+drwxr-xr-x 2 pi pi 4096 Nov 11 02:54 axleproof-1.0
+drwxrwxr-x 2 pi pi 4096 Nov 11 03:07 axleproof-1.1
+==== restore original helper ====
+installed:
+c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c  /usr/local/sbin/idea-app-data
+backup:   
+c8ca658b21501e548b1877e715dbbf699b42eafb9120b110d6aece52e6d8530c  /home/pi/idea-app-data.main-8241221.bak
+helper match
+==== restore pm2 engine to main 8241221, no IDEA_CONFIG_FILE ====
+production HEAD:
+82412214ddcaefe25bf34d9407479ecb9c130202
+8241221 idea#411: idea-usage always starts under pm2 (#310)
+2:  mdns: true      # atlas 2026-10-06: test pool mirrors production idea02 (mdns: true), Koen 03:50; static peers removed
+6:  systemDiskSkip: true   # Stage 2 pin (was IDEA_SYSTEM_DISK_SKIP env; PLAN 5 unchanged)
+[PM2] Applying action deleteProcessId on app [engine](ids: [ 5 ])
+[PM2] [engine](5) ✓
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 3  │ idea-usage       │ default     │ 1.0     │ fork    │ 702964   │ 2h     │ 1    │ online    │ 0%       │ 76.2mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 0%       │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 29.8% | ram usage: 28.6% | lo: ⇓ 0.069mb/s ⇑ 0.069mb/s | eth0: ⇓ 0.002mb/s ⇑ 0.002mb/s drop 210/min | disk: ⇓ 0mb/s ⇑ 0.071mb/s / 61.52%
+[PM2] Starting /home/pi/idea/agents/agent-engine-dev/dist/src/index.js in fork_mode (1 instance)
+[PM2] Done.
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 6  │ engine           │ default     │ 1.0     │ fork    │ 820842   │ 0s     │ 0    │ online    │ 0%       │ 21.4mb   │ pi       │ disabled │
+│ 3  │ idea-usage       │ default     │ 1.0     │ fork    │ 702964   │ 2h     │ 1    │ online    │ 0%       │ 76.2mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 0%       │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 29.8% | ram usage: 28.6% | lo: ⇓ 0.069mb/s ⇑ 0.069mb/s | eth0: ⇓ 0.002mb/s ⇑ 0.002mb/s drop 210/min | disk: ⇓ 0mb/s ⇑ 0.071mb/s / 61.52%
+status online restarts 0 pid 820842
+cwd /home/pi/idea/agents/agent-engine-dev
+script /home/pi/idea/agents/agent-engine-dev/dist/src/index.js
+username pi
+IDEA_CONFIG_FILE None
+IDEA_NETWORK_TESTS None
+try 1: :8080 -> 000fail  temp=48.686C
+try 2: :8080 -> 000fail  temp=48.199C
+try 3: :8080 -> 000fail  temp=48.686C
+try 4: :8080 -> 000fail  temp=47.225C
+try 5: :8080 -> 000fail  temp=49.173C
+try 6: :8080 -> 000fail  temp=48.686C
+try 7: :8080 -> 200  temp=48.686C
+==== :8080 is 200 on restored main ====
+[PM2] Saving current process list...
+[PM2] Successfully saved in /home/pi/.pm2/dump.pm2
+pm2 save done
+┌────┬──────────────────┬─────────────┬─────────┬─────────┬──────────┬────────┬──────┬───────────┬──────────┬──────────┬──────────┬──────────┐
+│ id │ name             │ namespace   │ version │ mode    │ pid      │ uptime │ ↺    │ status    │ cpu      │ mem      │ user     │ watching │
+├────┼──────────────────┼─────────────┼─────────┼─────────┼──────────┼────────┼──────┼───────────┼──────────┼──────────┼──────────┼──────────┤
+│ 6  │ engine           │ default     │ 1.0     │ fork    │ 820842   │ 40s    │ 0    │ online    │ 133.3%   │ 353.6mb  │ pi       │ disabled │
+│ 3  │ idea-usage       │ default     │ 1.0     │ fork    │ 702964   │ 2h     │ 1    │ online    │ 0%       │ 76.2mb   │ pi       │ disabled │
+└────┴──────────────────┴─────────────┴─────────┴─────────┴──────────┴────────┴──────┴───────────┴──────────┴──────────┴──────────┴──────────┘
+Module
+┌────┬──────────────────────────────┬───────────────┬──────────┬──────────┬──────┬──────────┬──────────┬──────────┐
+│ id │ module                       │ version       │ pid      │ status   │ ↺    │ cpu      │ mem      │ user     │
+├────┼──────────────────────────────┼───────────────┼──────────┼──────────┼──────┼──────────┼──────────┼──────────┤
+│ 0  │ pm2-logrotate                │ 3.0.0         │ 1054     │ online   │ 0    │ 0%       │ 79.7mb   │ pi       │
+└────┴──────────────────────────────┴───────────────┴──────────┴──────────┴──────┴──────────┴──────────┴──────────┘
+host metrics | cpu: 38.2% | ram usage: 21.7% | eth0: ⇓ 0.004mb/s ⇑ 0.002mb/s drop 214/min | disk: ⇓ 0mb/s ⇑ 0.062mb/s / 61.52%
+==== updtest containers still healthy (untouched WD) ====
+NAMES                    STATUS
+updtest-i76stale-web-1   Up 4 hours (healthy)
+updtest-i76minor-web-1   Up 4 hours (healthy)
+updtest-i76major-web-1   Up 4 hours (healthy)
+==== quarantine checkout, outside config, scripts ====
+total 220
+drwxrwxr-x  4 pi   pi    4096 Nov 11 03:37 .
+drwx------ 49 pi   pi    4096 Nov 11 03:37 ..
+drwxrwxr-x  4 pi   pi    4096 Nov 11 03:37 apps
+drwxrwxr-x 16 pi   pi    4096 Nov 11 03:02 axle-311
+-rw-rw-r--  1 pi   pi    7392 Nov 11 02:58 axle-311-config.yaml
+-rwxr-xr-x  1 pi   pi   10926 Nov 11 03:06 axle-311-proof-cont.sh
+-rwxr-xr-x  1 pi   pi   13341 Nov 11 03:03 axle-311-proof.sh
+-rwxr-xr-x  1 pi   pi    6719 Nov 11 02:53 axle-311-setup.sh
+-rwxr-xr-x  1 pi   pi    6601 Nov 11 03:29 axle-311-upd-proof2.sh
+-rwxr-xr-x  1 pi   pi    7317 Nov 11 03:19 axle-311-upd-proof.sh
+-rw-rw-r--  1 pi   pi   71574 Nov 11 03:19 idea-app-data.axle311-availkb
+-rwxr-xr-x  1 root root 71490 Nov 10 23:44 idea-app-data.main-8241221.bak
+ls: cannot access '/home/pi/axle-311': No such file or directory
+ls: cannot access '/home/pi/axle-311-config.yaml': No such file or directory
+real config.yaml still:
+2:  mdns: true      # atlas 2026-10-06: test pool mirrors production idea02 (mdns: true), Koen 03:50; static peers removed
+6:  systemDiskSkip: true   # Stage 2 pin (was IDEA_SYSTEM_DISK_SKIP env; PLAN 5 unchanged)
+usage settings (must stay on):
+{"usageMonitoring":"on"}
+==== final env check ====
+idea-usage online /home/pi/idea/agents/agent-engine-dev /home/pi/idea/agents/agent-engine-dev/dist/src/usage/main.js IDEA_CONFIG_FILE= None
+engine online /home/pi/idea/agents/agent-engine-dev /home/pi/idea/agents/agent-engine-dev/dist/src/index.js IDEA_CONFIG_FILE= None
+HEAD production: 82412214ddcaefe25bf34d9407479ecb9c130202
+curl :8080 -> 200
+temp 51.121C
+quarantine home /home/pi/axle-311.quarantine-20261111T023620Z
+==== release-script complete ====
+2026-11-11T03:37:46+01:00
+
+
+================================================================================
+Engine-out excerpt (install / stop / remove / updateApp rollback / cleanup)
+================================================================================
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 6/6  │  Starting containers  │
+└────────────────────────────────────┘
+Ports: [32m'55889'[39m
+App 5ie6xpi5wh42mgsbx7u running
+Stopping app '5ie6xpi5wh42mgsbx7u' on disk '5vyahbut147hw5dp4e1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+Removed instance 5ie6xpi5wh42mgsbx7u; its folder is kept at /.idea-quarantine/5ie6xpi5wh42mgsbx7u-20261111T020718Z
+Starting instance '3iyi1r8bmvlyl7lvvpb' on disk 5vyahbut147hw5dp4e1 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌────────────────────────────────┐
+│  Step 2/6  │  Generating port  │
+└────────────────────────────────┘
+Found a port number for instance 3iyi1r8bmvlyl7lvvpb: 54418
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 6/6  │  Starting containers  │
+└────────────────────────────────────┘
+Ports: [32m'54418'[39m
+App 3iyi1r8bmvlyl7lvvpb running
+Stopping app '3iyi1r8bmvlyl7lvvpb' on disk '5vyahbut147hw5dp4e1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+Removed instance 3iyi1r8bmvlyl7lvvpb; its folder is kept at /.idea-quarantine/3iyi1r8bmvlyl7lvvpb-20261111T021938Z
+Starting instance 'h7wd4t350auta0dfnbg' on disk 5vyahbut147hw5dp4e1 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌────────────────────────────────┐
+│  Step 2/6  │  Generating port  │
+└────────────────────────────────┘
+Found a port number for instance h7wd4t350auta0dfnbg: 56265
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 6/6  │  Starting containers  │
+└────────────────────────────────────┘
+Ports: [32m'56265'[39m
+App h7wd4t350auta0dfnbg running
+Stopping app 'h7wd4t350auta0dfnbg' on disk '5vyahbut147hw5dp4e1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+Removed instance h7wd4t350auta0dfnbg; its folder is kept at /.idea-quarantine/h7wd4t350auta0dfnbg-20261111T022829Z
+Starting instance 'y8uio8lxoa74p9pcsip' on disk 5vyahbut147hw5dp4e1 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌────────────────────────────────┐
+│  Step 2/6  │  Generating port  │
+└────────────────────────────────┘
+Found a port number for instance y8uio8lxoa74p9pcsip: 50589
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 6/6  │  Starting containers  │
+└────────────────────────────────────┘
+Ports: [32m'50589'[39m
+App y8uio8lxoa74p9pcsip running
+┌─────────────────────────┐
+│  Step 3/6  │  Snapshot  │
+└─────────────────────────┘
+Stopping app 'y8uio8lxoa74p9pcsip' on disk '5vyahbut147hw5dp4e1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+┌─────────────────────┐
+│  Step 4/6  │  Swap  │
+└─────────────────────┘
+┌──────────────────────┐
+│  Step 5/6  │  Start  │
+└──────────────────────┘
+Starting instance 'y8uio8lxoa74p9pcsip' on disk 5vyahbut147hw5dp4e1 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌────────────────────────────────┐
+│  Step 2/6  │  Generating port  │
+└────────────────────────────────┘
+Found a port number for instance y8uio8lxoa74p9pcsip: 50589
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 6/6  │  Starting containers  │
+└────────────────────────────────────┘
+Ports: [32m'50589'[39m
+Error running app instance y8uio8lxoa74p9pcsip
+Error starting app instance 'y8uio8lxoa74p9pcsip': Container(s) exited after compose up for y8uio8lxoa74p9pcsip. Automerge must not stay Running. y8uio8lxoa74p9pcsip-web-1: Exited (42) 2 seconds ago
+Starting instance 'y8uio8lxoa74p9pcsip' on disk 5vyahbut147hw5dp4e1 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌────────────────────────────────┐
+│  Step 2/6  │  Generating port  │
+└────────────────────────────────┘
+Found a port number for instance y8uio8lxoa74p9pcsip: 50589
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 6/6  │  Starting containers  │
+└────────────────────────────────────┘
+Ports: [32m'50589'[39m
+App y8uio8lxoa74p9pcsip running
+Stopping app 'y8uio8lxoa74p9pcsip' on disk '5vyahbut147hw5dp4e1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+Removed instance y8uio8lxoa74p9pcsip; its folder is kept at /.idea-quarantine/y8uio8lxoa74p9pcsip-20261111T023701Z
+*** Engine is now closing ***
+
+
+================================================================================
+Engine log hits (Removed instance / Starting instance / COMPOSE_DOWN_FAILED / ROLLED BACK)
+================================================================================
+/home/pi/.pm2/logs/engine-out.log:3972:Starting instance '5ie6xpi5wh42mgsbx7u' on disk 5vyahbut147hw5dp4e1 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+/home/pi/.pm2/logs/engine-out.log:3998:Removed instance 5ie6xpi5wh42mgsbx7u; its folder is kept at /.idea-quarantine/5ie6xpi5wh42mgsbx7u-20261111T020718Z
+/home/pi/.pm2/logs/engine-out.log:3999:Starting instance '3iyi1r8bmvlyl7lvvpb' on disk 5vyahbut147hw5dp4e1 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+/home/pi/.pm2/logs/engine-out.log:4025:Removed instance 3iyi1r8bmvlyl7lvvpb; its folder is kept at /.idea-quarantine/3iyi1r8bmvlyl7lvvpb-20261111T021938Z
+/home/pi/.pm2/logs/engine-out.log:4026:Starting instance 'h7wd4t350auta0dfnbg' on disk 5vyahbut147hw5dp4e1 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+/home/pi/.pm2/logs/engine-out.log:4052:Removed instance h7wd4t350auta0dfnbg; its folder is kept at /.idea-quarantine/h7wd4t350auta0dfnbg-20261111T022829Z
+/home/pi/.pm2/logs/engine-out.log:4053:Starting instance 'y8uio8lxoa74p9pcsip' on disk 5vyahbut147hw5dp4e1 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+/home/pi/.pm2/logs/engine-out.log:4088:Starting instance 'y8uio8lxoa74p9pcsip' on disk 5vyahbut147hw5dp4e1 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+/home/pi/.pm2/logs/engine-out.log:4108:Starting instance 'y8uio8lxoa74p9pcsip' on disk 5vyahbut147hw5dp4e1 of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+/home/pi/.pm2/logs/engine-out.log:4134:Removed instance y8uio8lxoa74p9pcsip; its folder is kept at /.idea-quarantine/y8uio8lxoa74p9pcsip-20261111T023701Z
+/home/pi/.pm2/logs/engine-error.log:557:Error: COMPOSE_DOWN_FAILED: docker compose down failed for 'axle311-upd': failed to parse /instances/3iyi1r8bmvlyl7lvvpb/compose.yaml: go-yaml load error in parser (while parsing a flow node) at L2.C1: did not find expected node content
+/home/pi/.pm2/logs/engine-error.log:598:Error: ROLLED BACK: Start failed: start failed: Engine error: Container(s) exited after compose up for y8uio8lxoa74p9pcsip. Automerge must not stay Running. y8uio8lxoa74p9pcsip-web-1: Exited (42) 2 seconds ago. axleproof-1.0 and its data were restored from /.pre-update/y8uio8lxoa74p9pcsip

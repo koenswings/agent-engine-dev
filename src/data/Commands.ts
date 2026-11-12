@@ -22,6 +22,7 @@ import { copyApp, moveApp } from './CopyMoveApp.js';
 import { resourceLock, diskKey } from '../utils/ResourceLock.js';
 import { undockDisk } from "../monitors/usbDeviceMonitor.js";
 import { backupInstance, restoreApp, createBackupDiskConfig, runningBackupOnDisk } from "../monitors/backupMonitor.js";
+import { listBackup, verifyBackup, clearBackupLock, removeBackupRole } from "./BackupVerify.js";
 import { cancelOperation } from './Operations.js';
 import { DiskArgResult, lookupDiskArg, resolveDiskArg } from './DiskArg.js';
 import { createFilesDisk } from './CreateFilesDisk.js';
@@ -359,6 +360,44 @@ const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, dis
 }
 
 /**
+ * listBackup <instanceIdOrName> <backupDiskIdOrName> [archive] (idea#446).
+ * Lists archives (and optional members) on a docked Backup Disk via helper v9 borg-list.
+ */
+const listBackupWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: string, backupDiskId: string, ...archiveTokens: string[]) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    if (archiveTokens.length > 1) throw new Error('listBackup: at most one archive name')
+    await listBackup(storeHandle, instanceArg, backupDiskId, archiveTokens[0])
+}
+
+/**
+ * verifyBackup <instanceIdOrName> <backupDiskIdOrName> [archive] (idea#446).
+ * Extracts the archive into <Backup Disk>/.idea-verify/<id>-<stamp>/ and checks exclude / verify paths.
+ */
+const verifyBackupWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: string, backupDiskId: string, ...archiveTokens: string[]) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    if (archiveTokens.length > 1) throw new Error('verifyBackup: at most one archive name')
+    await verifyBackup(storeHandle, instanceArg, backupDiskId, archiveTokens[0])
+}
+
+/**
+ * clearBackupLock <instanceIdOrName> <backupDiskIdOrName> (idea#446).
+ * Removes only .backup-in-progress and the matching Disk.backupStaleLocks entry; never starts a backup.
+ */
+const clearBackupLockWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: string, backupDiskId: string) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    await clearBackupLock(storeHandle, instanceArg, backupDiskId)
+}
+
+/**
+ * removeBackupRole <diskIdOrName> (idea#446). Quarantines backups/, unlinks BACKUP.yaml, processDisk.
+ * App and Files roles are left unchanged.
+ */
+const removeBackupRoleWrapper = async (storeHandle: DocHandle<Store> | null, diskId: string) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    await removeBackupRole(storeHandle, diskId)
+}
+
+/**
  * createFilesDisk <diskId> [<shareName…>] (idea#131). The disk ID only (the
  * command has no old name form); the share name takes the rest of the line and
  * defaults to "School Files". Refusals throw, so the trace ends as `error`.
@@ -539,6 +578,10 @@ export const commands: CommandDefinition[] = [
     { name: "backupApp", execute: backupAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "mode" }, { type: "string", name: "instanceNames", variadic: true }], scope: 'engine' },
+    { name: "listBackup", execute: listBackupWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }, { type: "string", name: "archive", variadic: true, optional: true }], scope: 'engine' },
+    { name: "verifyBackup", execute: verifyBackupWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }, { type: "string", name: "archive", variadic: true, optional: true }], scope: 'engine' },
+    { name: "clearBackupLock", execute: clearBackupLockWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
+    { name: "removeBackupRole", execute: removeBackupRoleWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
     { name: "createFilesDisk", execute: createFilesDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "shareName", variadic: true, optional: true }], scope: 'engine' },
     { name: "removeInstance", execute: removeInstanceWrapper, args: [{ type: "string", name: "instanceId" }], scope: 'engine' },
     { name: "renameInstance", execute: renameInstanceWrapper, args: [{ type: "string", name: "instanceId" }, { type: "string", name: "newName", variadic: true }], scope: 'engine' },
