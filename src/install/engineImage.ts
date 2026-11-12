@@ -402,7 +402,7 @@ export const OPERATOR_KEYS_FILE = `${OPERATOR_KEYS_DIR}/pi`
 export const OPERATOR_KEYS_ASSET = 'idea-operator-keys.pub'
 /** The AuthorizedKeysFile token in 10-idea-peer.conf that makes sshd read OPERATOR_KEYS_FILE. */
 export const OPERATOR_KEYS_TOKEN = `${OPERATOR_KEYS_DIR}/%u`
-/** Keys every image must carry: the Atlas box key comes first (idea#453). */
+/** Keys every image must carry (every one must be in the list; order is not checked). The Atlas box key comes first in the list (idea#453). */
 export const REQUIRED_OPERATOR_KEY_FPS = ['SHA256:L+pEPj+XrDyBzbKiA9CdsXK9cTuos9EHUSTWKUDfNkg'] as const
 /** Key-only sshd drop-in (sorted before the peer drop-in and any 50-cloud-init.conf). */
 export const LOGIN_SSHD_DROPIN = '/etc/ssh/sshd_config.d/10-idea-login.conf'
@@ -433,6 +433,7 @@ export const operatorKeysProblems = (text: string, required: readonly string[] =
         if (!l || l.startsWith('#')) return
         const fp = publicKeyFingerprint(l)
         if (!fp) p.push(`${OPERATOR_KEYS_FILE} line ${i + 1} is not a plain public key (no options allowed)`)
+        else if (fps.includes(fp)) p.push(`${OPERATOR_KEYS_FILE} line ${i + 1} repeats key ${fp}`)
         else fps.push(fp)
     })
     if (!fps.length) p.push(`${OPERATOR_KEYS_FILE} has no operator key`)

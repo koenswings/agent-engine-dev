@@ -239,6 +239,22 @@ describe('operator SSH login (idea#453, option B)', () => {
         expect(operatorKeysProblems(`${ATLAS_LINE}\ncommand="x" ${OTHER_LINE}`).join()).toContain('line 2 is not a plain public key')
         expect(operatorKeysProblems(`${ATLAS_LINE}\n-----BEGIN OPENSSH PRIVATE KEY-----`).join()).toContain('private key material')
     })
+    it('several operator keys: all required ones must be present, each key once, comments and blank lines allowed', async () => {
+        const fpOther = publicKeyFingerprint(OTHER_LINE)!
+        const two = `# fleet\n${ATLAS_LINE}\n\n${OTHER_LINE}\n`
+        expect(operatorKeysProblems(two, [REQUIRED_OPERATOR_KEY_FPS[0], fpOther])).toEqual([])
+        expect(operatorKeysProblems(`${ATLAS_LINE}\n`, [REQUIRED_OPERATOR_KEY_FPS[0], fpOther]).join()).toContain(`lacks the required operator key ${fpOther}`)
+        expect(operatorKeysProblems(`${OTHER_LINE}\n`, [REQUIRED_OPERATOR_KEY_FPS[0], fpOther]).join()).toContain('lacks the required operator key SHA256:L+pE')
+        expect(operatorKeysProblems(`${ATLAS_LINE}\n${ATLAS_LINE.replace('atlas-box@grok-bot', 'copy')}\n`).join()).toContain('line 2 repeats key')
+        // the installed file may carry more keys than the required set
+        await fs.writeFile(R(OPERATOR_KEYS_FILE.slice(1)), two)
+        expect(await problemsOf('operator-keys')).toBe('')
+    })
+    it('every required fingerprint is in the committed list', async () => {
+        const text = await fs.readFile(path.join(ASSETS, OPERATOR_KEYS_ASSET), 'utf8')
+        const fps = text.split('\n').map(publicKeyFingerprint).filter(Boolean)
+        for (const fp of REQUIRED_OPERATOR_KEY_FPS) expect(fps).toContain(fp)
+    })
     it('a clean rootfs passes operator-keys and ssh-no-password', async () => {
         expect(await problemsOf('operator-keys')).toBe('')
         expect(await problemsOf('ssh-no-password')).toBe('')
