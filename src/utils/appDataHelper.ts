@@ -47,7 +47,7 @@ export const APP_DATA_HELPER_UPDATE =
 /** The borg binary idea-app-data runs by absolute path (BORG= in the helper; Debian package borgbackup). */
 export const BORG_PATH = '/usr/bin/borg'
 
-const ROOT_TOKEN = /^(system|sd[a-z][12]|[a-z0-9][a-z0-9-]{0,63})$/
+const ROOT_TOKEN = /^(system|sd[a-z][1-9]|[a-z0-9][a-z0-9-]{0,63})$/
 const ID_TOKEN = /^[a-z0-9][a-z0-9-]{0,63}$/
 const ARCHIVE_TOKEN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9-]{8,16}Z$/
 /** UTC stamp for .idea-verify/<id>-<stamp>/ (idea#446). No path separators. */
@@ -101,7 +101,7 @@ export const ensureDirsArgs = (root: string): string[] => ['ensure-dirs', checkR
  */
 export const eraseSlotArgs = (slot: string, stagingDir: string): string[] => {
     checkRoot(slot)
-    if (slot === 'system' || /^sd[a-z][12]$/.test(slot)) {
+    if (slot === 'system' || /^sd[a-z][1-9]$/.test(slot)) {
         throw new Error(`'${slot}' is not a test slot name erase-slot accepts`)
     }
     if (!stagingDir || stagingDir.includes('\0')) throw new Error('stagingDir is required for erase-slot')

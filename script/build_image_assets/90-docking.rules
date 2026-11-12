@@ -1,1 +1,5 @@
-KERNEL=="sd?|sd?1|sd?2", SYMLINK+="engine/%k"
+# /dev/engine/<name> links for the USB device monitor (idea#82, idea#76 fixture).
+# Whole USB disk (sda) and each of its partitions 1-9 (sda1..sda9), one rule each,
+# so a node never matches twice. nvme*/mmcblk* (system disks) never match.
+SUBSYSTEM=="block", KERNEL=="sd[a-z]", ENV{DEVTYPE}=="disk", SYMLINK+="engine/%k"
+SUBSYSTEM=="block", KERNEL=="sd[a-z][1-9]", ENV{DEVTYPE}=="partition", SYMLINK+="engine/%k"
