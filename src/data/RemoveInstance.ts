@@ -21,6 +21,11 @@
  * Nothing is deleted: the quarantine is never purged automatically; clearing it is
  * manual and needs Koen's OK.
  *
+ * After a successful remove, unused Docker networks labelled
+ * `com.docker.compose.project=<id>` on this Engine are pruned (idea#468). Shared
+ * frontend/backend networks are never removed, nor a network that still has
+ * containers attached. A prune failure is logged and does not fail the command.
+ *
  * If compose down or the label cleanup fails: COMPOSE_DOWN_FAILED is logged and
  * thrown, the folder is left in place, and the store is untouched.
  *
@@ -29,7 +34,7 @@
  *   COMPOSE_DOWN_FAILED, QUARANTINE_FAILED, HELPER_OUTDATED (helper older than v4).
  */
 import { DocHandle } from '@automerge/automerge-repo'
-import { $, fs, path } from 'zx'
+import { $ } from 'zx'
 import type { Store } from './Store.js'
 import type { Instance } from './Instance.js'
 import type { InstanceID } from './CommonTypes.js'
@@ -38,6 +43,9 @@ import { diskPath, appDataRoot, Disk } from './Disk.js'
 import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
 import { runAppData, quarantineArgs, helperAtLeast } from '../utils/appDataHelper.js'
 import { log } from '../utils/utils.js'
+import { composeDownAt, pruneUnusedInstanceNetworks } from '../utils/instanceNetworks.js'
+
+export { composeDownAt } from '../utils/instanceNetworks.js'
 
 export const QUARANTINE_DIR = '.idea-quarantine'
 
@@ -55,22 +63,6 @@ export const defaultInstanceDir = (disk: Disk, id: InstanceID): Promise<string> 
 
 export const dockerQuiet = async (args: string[]): Promise<string> =>
     (await $`docker ${args}`.quiet()).stdout
-
-/**
- * Bring the compose project down using the live instance path and file
- * (idea#424). Does not glob the quarantine directory. Missing compose.yaml is
- * not an error — the caller still runs label cleanup.
- */
-export const composeDownAt = async (
-    dir: string, id: InstanceID, run: (args: string[]) => Promise<string> = dockerQuiet,
-): Promise<void> => {
-    const composeFile = path.join(dir, 'compose.yaml')
-    if (!fs.existsSync(composeFile)) {
-        log(`removeInstance: no compose.yaml at ${composeFile}; will clean containers by project label ${id}`)
-        return
-    }
-    await run(['compose', '-p', String(id), '-f', composeFile, 'down'])
-}
 
 /** Fallback: remove leftover containers of this compose project. No -v (volumes stay). */
 export const removeContainersByComposeProject = async (
@@ -91,6 +83,8 @@ export interface RemoveDeps {
     quarantine: (disk: Disk, id: InstanceID) => Promise<string>
     /** Refresh Disk.preUpdateSnapshots / preUpdateBytes / quarantineBytes (idea#428). */
     refreshSnapshots: (disk: Disk) => Promise<void>
+    /** idea#468: prune unused compose-project networks for this instance, locally. */
+    pruneNetworks: (id: InstanceID) => Promise<void>
 }
 
 const defaultDeps: RemoveDeps = {
@@ -106,6 +100,7 @@ const defaultDeps: RemoveDeps = {
     },
     quarantine: async (disk, id) => (await runAppData(quarantineArgs(await appDataRoot(disk), String(id)))).trim(),
     refreshSnapshots: async () => { /* replaced in removeInstance with a storeHandle-bound default */ },
+    pruneNetworks: async (id) => { await pruneUnusedInstanceNetworks(String(id)) },
 }
 
 const RUNNING_STATES = new Set(['Running', 'Starting'])
@@ -183,6 +178,9 @@ export const removeInstance = async (
             row.preUpdateBytes = Math.max(0, (Number(row.preUpdateBytes) || 0) - droppedBytes)
         })
         log(`removeInstance: ${inst.id} ('${inst.name}') quarantined at ${quarantinePath}; kept volumes: ${keptVolumes.length ? keptVolumes.join(', ') : 'none'}`)
+        try { await d.pruneNetworks(inst.id) } catch (e) {
+            log(`removeInstance: network prune for ${inst.id}: ${(e as Error).message ?? e}`)
+        }
         return { instanceId: inst.id, name: String(inst.name), quarantinePath, keptVolumes }
     } finally {
         resourceLock.release(key)

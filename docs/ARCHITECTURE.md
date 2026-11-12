@@ -127,7 +127,16 @@ The system forms a self-organising mesh on the local network with no configurati
 | **App Execution:** Docker Containers | **Implemented:** `Instance.ts` uses `node-docker-api` and `zx` shell scripts to manage Docker containers. Apps are defined by `compose.yaml` files found on the disk. |
 | **Remote Commands:** Shell scripts via SSH | **Refined:** While SSH/rsync keys are generated, the primary command interface is now data-driven. `Commands.ts` defines commands that are processed by the `storeMonitor`, allowing remote UIs to trigger actions by writing to the shared Automerge document. |
 
+#### Instance Docker networks (idea#468)
+
+Each started instance is a Docker Compose project named after the instance id (the Engine starts compose with `cwd=instances/<id>` and no `-p`, so the default project name is the id). Compose labels those project networks `com.docker.compose.project=<instanceId>`. The Engine also creates two shared networks, `frontend` and `backend`, once per host (`buildDockerInfrastructure`); those must never be removed.
+
+`removeInstance`, `eraseDisk`, and `forgetDisk --with-instances` prune unused networks with that project label on the Engine that runs the command: `docker network ls --filter label=com.docker.compose.project=<id> --filter dangling=true`, skip any name `frontend` or `backend`, then `docker network rm`. Docker itself refuses to remove a network that still has containers attached. There is no host-wide `docker network prune`. A prune failure is logged and does not fail the parent command. This is conservative and local-only: `forgetDisk --with-instances` is a store edit and may run on an Engine that does not host the forgotten instance's networks, so leftover networks on other Engines stay until those Engines themselves run a prune for those ids. The Engine does not yet watch the store for a disappeared instance row (that would be an architectural call beyond idea#468).
+
+`moveApp` takes the source compose project down after a successful copy and before `processInstance` on the target (`docker compose -p <id> down`, never `-v`). The same instance id is the compose project name on both disks, and `processInstance` may auto-start it on the target, so a down after register would stop the moved instance. Named volumes are kept so a later rollback can still restart the source. A down failure is logged and does not fail the move. Helper: `src/utils/instanceNetworks.ts`.
+
 ### **4. Summary of Data Flow**
+
 
 #### Scenario A — Disk insertion propagates across the network
 
