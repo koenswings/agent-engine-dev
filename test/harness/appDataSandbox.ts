@@ -185,7 +185,9 @@ case "$1" in
     # \`borg info --json REPO\` prints repository info only, with no "archives" key
     sel=0
     for a in "$@"; do case "$a" in --last|--first|--glob-archives|-a|*::*) sel=1 ;; esac; done
-    if [[ \$sel -eq 0 ]]; then echo '{"repository":{"id":"fake","location":"fake"},"encryption":{"mode":"none"},"cache":{"stats":{}}}'
+    if [[ \$sel -eq 0 ]]; then
+      if [[ -n "\${FAKE_BORG_INFO_REPO:-}" ]]; then echo "$FAKE_BORG_INFO_REPO"
+      else echo '{"repository":{"id":"fake","location":"fake"},"encryption":{"mode":"none"},"cache":{"stats":{}}}'; fi
     elif [[ -n "\${FAKE_BORG_INFO:-}" ]]; then echo "$FAKE_BORG_INFO"; else echo '{"archives":[]}'; fi ;;
   extract) for e in \${FAKE_BORG_EXTRACT:-}; do mkdir -p "$e" && echo restored > "$e/data.txt"; done ;;
   list) if [[ -n "\${FAKE_BORG_LIST:-}" ]]; then echo "\${FAKE_BORG_LIST}"; fi ;;
