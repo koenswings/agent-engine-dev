@@ -93,6 +93,9 @@ export const parseImageArgs = (argv: Record<string, any>): ImageArgs | null => {
 
 export const LOCK_SCHEMA = 'idea-engine-lock/1'
 
+/** Engine source baked into this image (origin/main after #342 / idea#467). Not the image-branch tip. */
+export const PINNED_ENGINE_COMMIT = '71fc2c670deff487af721ba46758fb0981aac38d'
+
 export interface LockedImage {
     /** name[:tag]@sha256:<manifest or index digest> */
     ref: string

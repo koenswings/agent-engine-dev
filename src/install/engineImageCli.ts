@@ -13,7 +13,7 @@ import os from 'os'
 import crypto from 'crypto'
 import { config } from '../data/Config.js'
 import {
-    EngineLock, FIRSTBOOT_SCRIPT, IMAGE_ENABLED_UNITS, ImageArgs, LOCK_SCHEMA, LockedFile, LockedImage, UsageError,
+    EngineLock, FIRSTBOOT_SCRIPT, IMAGE_ENABLED_UNITS, ImageArgs, LOCK_SCHEMA, PINNED_ENGINE_COMMIT, LockedFile, LockedImage, UsageError,
     imageIdFromManifest, imageTarName, parseDockerPins, readLock, serialiseLock, sha256File, validateLock, verifyRootfsChecks, VERIFY_CHECKS, QEMU_AARCH64_STATIC, rootfsHostProblem,
 } from './engineImage.js'
 import { NpmTool, NPM_TOOL_INSTALL, IMAGE_SPARSE_PATTERNS, LOGIN_SSHD_ASSET, LOGIN_SSHD_DROPIN, OPERATOR_KEYS_ASSET, OPERATOR_KEYS_FILE } from './engineImage.js'
@@ -42,6 +42,25 @@ export const LOCKED_FILE_SPECS: { asset: string, path: string, mode: string }[] 
 
 const git = async (repo: string, args: string[]) => (await $({ cwd: repo })`git ${args}`).stdout.trim()
 
+/**
+ * Commit baked into the image as lock.engineCommit. This branch pins origin/main
+ * at 71fc2c6 (idea#467 / #342 merged). The image-builder checkout can be a
+ * different commit; the Engine tree cloned into the rootfs is this pin.
+ */
+export const resolveEngineCommit = async (repo: string): Promise<string> => {
+    if (!PINNED_ENGINE_COMMIT) return git(repo, ['rev-parse', 'HEAD'])
+    let full = ''
+    try {
+        full = await git(repo, ['rev-parse', '--verify', `${PINNED_ENGINE_COMMIT}^{commit}`])
+    } catch {
+        throw new Error(`PINNED_ENGINE_COMMIT ${PINNED_ENGINE_COMMIT} is not in ${repo}; fetch origin/main and retry`)
+    }
+    if (full !== PINNED_ENGINE_COMMIT) {
+        throw new Error(`PINNED_ENGINE_COMMIT ${PINNED_ENGINE_COMMIT} resolved to ${full}`)
+    }
+    return PINNED_ENGINE_COMMIT
+}
+
 /** sha256 of each git-tracked store-identity file at <commit> (never read from, or written to, the work tree). */
 export const trackedStoreIdentity = async (repo: string, commit: string): Promise<Record<string, string>> => {
     const names = (await git(repo, ['ls-tree', '--name-only', `${commit}:${STORE_IDENTITY_DIR}`])).split('\n').filter(Boolean)
@@ -62,7 +81,7 @@ const consoleCommitOf = async (consoleRepo: string | undefined): Promise<string 
 /** Build the lock from a CLEAN checkout (its HEAD) plus the docker-save tarballs in <cache>/docker. */
 export const buildLock = async (repo: string, E: any, images: string[], cache: string | undefined, pm2Env: EngineLock['pm2Env'], consoleRepo?: string): Promise<EngineLock> => {
     if (await git(repo, ['status', '--porcelain', '--untracked-files=no']) !== '') throw new Error(`${repo} has uncommitted changes: a lock is for a commit`)
-    const engineCommit = await git(repo, ['rev-parse', 'HEAD'])
+    const engineCommit = await resolveEngineCommit(repo)
     const pkg = await fs.readJson(path.join(repo, 'package.json'))
     const assets = path.join(repo, 'script/build_image_assets')
     const dockerImages: LockedImage[] = []

@@ -128,12 +128,12 @@ The chroot shims include `sysctl` (no-op, logged) so `installRootHelpers` cannot
 `/proc` to the build-host kernel. Verify's `igmp-sysctl` check requires `/etc/sysctl.d/90-idea-igmp.conf` to exist,
 mode 0644, and set `net.ipv4.igmp_max_memberships=1024`. systemd-sysctl applies the file at first boot.
 
-**engineCommit pin:** left as it is on this branch for now. Steve wants it pinned to main once
-agent-engine-dev#342 (the install-root-helpers / self-check change that writes that conf) merges; #342 is not
-merged yet. After that merge, pin `engineCommit` to that main tip so the baked checkout actually contains
-`script/build_image_assets/90-idea-igmp.conf` and `installUdev` → `installRootHelpers` writes the file into the
-image. Until then, a build of this branch still installs whatever `installRootHelpers` at the current pin does
-(no IGMP conf yet), and verify will fail unless the file is present.
+**engineCommit pin:** `PINNED_ENGINE_COMMIT` / `lock.engineCommit` is
+`71fc2c670deff487af721ba46758fb0981aac38d` (`origin/main` after #342 merged idea#467).
+`build-engine --write-lock` and a build without `--lock` use that commit, not this image
+branch's tip, so the baked Engine checkout contains `script/build_image_assets/90-idea-igmp.conf`
+and `installUdev` → `installRootHelpers` writes the file into the image. The builder
+must be able to resolve that SHA (`git fetch origin main` if it is missing).
 
 ## Other modes
 

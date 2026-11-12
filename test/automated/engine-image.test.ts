@@ -8,7 +8,7 @@ import { fs, path } from 'zx'
 import os from 'os'
 import crypto from 'crypto'
 import {
-    parseImageArgs, UsageError, validateLock, serialiseLock, writeLock, readLock, LOCK_SCHEMA, EngineLock,
+    parseImageArgs, UsageError, validateLock, serialiseLock, writeLock, readLock, LOCK_SCHEMA, PINNED_ENGINE_COMMIT, EngineLock,
     sanitiseRootfs, verifyRootfs, IDENTITY_PATHS, GENERIC_HOSTNAME, IMAGE_ENABLED_UNITS, PM2_UNIT, SSH_REGEN_UNIT, SSH_HOSTKEYS_UNIT,
     pm2UnitText, sshHostKeysUnitText, sshHostKeyUnitIsUnconditional, DEFAULT_CONSOLE_PATH, preloadManifest, imageIdFromManifest, imageTarName, readDpkgStatus, unitEnabled, unitLinks, unitInstallTargets, verifyRootfsChecks, VERIFY_CHECKS, IMAGE_SPARSE_PATTERNS, filesWithAuthKeyShape, PRELOAD_DOCKER_DIR, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH, rootfsHostProblem,
     OPERATOR_KEYS_DIR, OPERATOR_KEYS_FILE, OPERATOR_KEYS_ASSET, LOGIN_SSHD_DROPIN, LOGIN_SSHD_ASSET, PEER_SSHD_DROPIN_PATH, REQUIRED_OPERATOR_KEY_FPS,
@@ -16,7 +16,7 @@ import {
     PI_LOGIN_SHELL, USERCONFIG_UNIT, RENAME_USER_SSHD_DROPIN, shadowPasswordIsLocked, passwdShellOf, shadowHashOf, unitMasked, piLoginProblems,
 } from '../../src/install/engineImage.js'
 import { rootfsSteps, runRootfsBuild, engineCloneCommand, consoleCloneCommand, Runner, Installers, SHIMS, quoteTemplate } from '../../src/install/engineRootfs.js'
-import { pinNpmTools, writeReport, LOCKED_FILE_SPECS } from '../../src/install/engineImageCli.js'
+import { pinNpmTools, writeReport, LOCKED_FILE_SPECS, resolveEngineCommit } from '../../src/install/engineImageCli.js'
 import { diskIdWithoutHardware, hasDiskId, ensureSystemMeta } from '../../src/data/Meta.js'
 
 const ENGINE = '/home/pi/idea/agents/agent-engine-dev'
@@ -193,6 +193,17 @@ const addIdentity = async (root: string) => {
     await fs.ensureDir(R('home/pi/.ssh'))
     for (const n of ['id_ed25519', 'id_ed25519.pub', 'authorized_keys']) await fs.writeFile(R(`home/pi/.ssh/${n}`), 'x\n')
 }
+
+describe('engineCommit pin (idea#467, build 10)', () => {
+    it('is the full origin/main SHA after #342 and resolveEngineCommit returns it', async () => {
+        expect(PINNED_ENGINE_COMMIT).toMatch(/^[0-9a-f]{40}$/)
+        expect(PINNED_ENGINE_COMMIT).toBe('71fc2c670deff487af721ba46758fb0981aac38d')
+        expect(await resolveEngineCommit(process.cwd())).toBe(PINNED_ENGINE_COMMIT)
+        const src = await fs.readFile(path.join(process.cwd(), 'src/install/engineImageCli.ts'), 'utf8')
+        expect(src).toMatch(/const engineCommit = await resolveEngineCommit\(repo\)/)
+        expect(src).not.toMatch(/const engineCommit = await git\(repo, \['rev-parse', 'HEAD'\]\)/)
+    })
+})
 
 describe('sanitise + verify', () => {
     let root: string
