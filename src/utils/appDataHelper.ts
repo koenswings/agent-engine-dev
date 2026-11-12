@@ -388,8 +388,24 @@ export const reportBorgAtStartup = (exists: (p: string) => boolean = borgPresenc
 }
 
 // ── updateApp snapshots (helper v5, agent-engine-dev#230) ────────────────────
-export const snapshotArgs = (root: string, id: string): string[] => ['snapshot', checkRoot(root), checkId(id)]
-export const restoreSnapshotArgs = (root: string, id: string): string[] => ['restore-snapshot', checkRoot(root), checkId(id)]
+/** Normalised, de-duplicated exclude tokens (same rules as the helper; throws on a bad one). */
+const excludeTokens = (excludes: string[]): string[] => {
+    const out: string[] = []
+    const seen = new Set<string>()
+    for (const raw of excludes) {
+        const n = normalizeBackupExclude(raw)
+        if (seen.has(n)) continue
+        seen.add(n)
+        out.push(n)
+    }
+    return out
+}
+/** v9 (idea#448): trailing excludes are left out of the snapshot and recorded in its EXCLUDE file. */
+export const snapshotArgs = (root: string, id: string, excludes: string[] = []): string[] =>
+    ['snapshot', checkRoot(root), checkId(id), ...excludeTokens(excludes)]
+/** v9 (idea#448): in place; the snapshot's EXCLUDE plus these excludes are never written, deleted or moved. */
+export const restoreSnapshotArgs = (root: string, id: string, excludes: string[] = []): string[] =>
+    ['restore-snapshot', checkRoot(root), checkId(id), ...excludeTokens(excludes)]
 export const snapshotsArgs = (root: string): string[] => ['snapshots', checkRoot(root)]
 export const estimateArgs = (root: string, id: string): string[] => ['estimate', checkRoot(root), checkId(id)]
 /** `estimate` result: "<folder kb> <volumes kb> <free kb>" (read-only; nothing is stopped). */
