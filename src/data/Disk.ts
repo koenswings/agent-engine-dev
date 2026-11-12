@@ -45,6 +45,24 @@ export interface Disk {
     /** total bytes of the pre-update and quarantine folders on this disk (Atlas: Ops visibility; nothing auto-deletes) */
     preUpdateBytes?: number | null;
     quarantineBytes?: number | null;
+    /**
+     * App bundles under apps/ on this disk (idea#76 gap 1, Lead option A), written only by the docking
+     * Engine on dock or when the list changes, cleared on undock. Other Engines only read it for the
+     * cross-Engine update hint. null/absent = unknown (use an explicit --source).
+     */
+    appBundles?: AppBundleInfo[] | null;
+}
+
+export interface AppBundleInfo {
+    appId: AppID;
+    version: string;
+    /** SHA256SUMS exists and lists compose.yaml (read, not verified; full check at update start) */
+    sumsListed: boolean;
+    /** bytes of apps/<appId>/ (service image tars under services/ not included) */
+    sizeBytes: number;
+    updatesFrom?: number[];
+    healthTimeout?: number;
+    migrationNote?: string;
 }
 
 export interface PreUpdateSnapshot {
@@ -710,7 +728,8 @@ export const processAppDisk = async (storeHandle: DocHandle<Store>, disk: Disk):
     }
     // #230 call 3: dock-time updateAvailable from SHA256SUMS presence and versions only (cheap).
     try {
-        const { refreshUpdateAvailable } = await import('./UpdateApp.js')
+        const { refreshUpdateAvailable, publishAppBundles } = await import('./UpdateApp.js')
+        await publishAppBundles(storeHandle, disk)   // idea#76 gap 1: what other Engines may fetch
         if (disk.dockedTo) await refreshUpdateAvailable(storeHandle, String(disk.dockedTo))
     } catch (e) {
         log(`updateAvailable refresh failed on dock of ${disk.id}: ${(e as Error).message}`)

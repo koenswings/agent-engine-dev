@@ -727,6 +727,7 @@ const undockDiskInner = async (storeHandle: DocHandle<Store>, disk: Disk, opts: 
                 dsk.filesConfig = null      // idea#131
                 dsk.sizeBytes = null
                 dsk.freeBytes = null
+                if (dsk.appBundles != null) dsk.appBundles = null   // idea#76 gap 1: unknown while undocked
             }
         })
         // Stop all instances of the disk and move them to the 'Undocked' state
