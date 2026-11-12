@@ -267,3 +267,43 @@ describe('updateApp (#230)', () => {
         expect(isIdeaDiskPath('.pre-update/i1/data/x')).toBe(true)
     })
 })
+
+describe('updateAvailable after updateApp (idea#459)', () => {
+    const SUM = 'a'.repeat(64) + '  compose.yaml\n'
+    const avail = { mountRoot: async () => tmp }
+    const offerBundle = async (v: string) => {
+        await fs.outputFile(`${tmp}/apps/kolibri-${v}/compose.yaml`, compose(v))
+        await fs.outputFile(`${tmp}/apps/kolibri-${v}/SHA256SUMS`, SUM)
+    }
+    beforeEach(async () => {
+        await offerBundle('1.1')
+        await refreshUpdateAvailable(h, ME, avail)   // the dock-time offer
+        expect(inst().updateAvailable).toMatchObject({ appId: 'kolibri-1.1', fromVersion: '1.0', toVersion: '1.1' })
+    })
+    it('a successful update clears the offer of the version it now runs, and a later re-dock keeps it cleared', async () => {
+        await updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps())
+        expect(inst().instanceOf).toBe('kolibri-1.1')
+        expect(inst().updateAvailable).toBeNull()
+        await refreshUpdateAvailable(h, ME, avail)
+        expect(inst().updateAvailable).toBeNull()
+    })
+    it('a genuinely newer bundle is still offered after the update, from the new version', async () => {
+        await offerBundle('1.2')
+        await refreshUpdateAvailable(h, ME, avail)
+        expect(inst().updateAvailable).toMatchObject({ appId: 'kolibri-1.2', fromVersion: '1.0' })
+        await updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps())
+        expect(inst().updateAvailable).toMatchObject({ appId: 'kolibri-1.2', sourceDiskId: 'd1', fromVersion: '1.1', toVersion: '1.2', major: false })
+    })
+    it('a rolled-back update keeps the offer (the old version runs again)', async () => {
+        health = ['exited']
+        expect(await codeOf(updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps()))).toMatch(/^ROLLED BACK: /)
+        expect(inst().instanceOf).toBe('kolibri-1.0')
+        expect(inst().updateAvailable).toMatchObject({ appId: 'kolibri-1.1', fromVersion: '1.0', toVersion: '1.1' })
+    })
+    it('a failure before anything was swapped and a refusal keep the offer', async () => {
+        expect(await codeOf(updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps({ snapshot: async () => { throw new Error('helper crashed') } })))).toMatch(/^ROLLED BACK: Snapshot failed: helper crashed; nothing was changed/)
+        expect(inst().updateAvailable).toMatchObject({ appId: 'kolibri-1.1', fromVersion: '1.0' })
+        expect(await codeOf(updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps({ verifySums: async () => false })))).toMatch(/^NO_SUMS: /)
+        expect(inst().updateAvailable).toMatchObject({ appId: 'kolibri-1.1', fromVersion: '1.0' })
+    })
+})

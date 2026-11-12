@@ -18,6 +18,8 @@
  * "ROLLED BACK: <why>"; when the rollback itself fails the instance is left Stopped with
  * statusCondition "ROLLBACK FAILED: ...".
  * Nothing is ever deleted; snapshots are kept (cleanup is a backlog item, quarantine only).
+ * updateAvailable (idea#459): recomputed when an update that started its operation ends
+ * (done, failed or rolled back), so the record never keeps offering the version now running.
  *
  * Identity (idea#448): the snapshot leaves out the union of the live and the new compose's
  * x-app.backup.exclude (e.g. data/tailscale, data/keys), and restore-snapshot never writes,
@@ -307,6 +309,9 @@ export const updateApp = async (
     const key = instanceKey(inst.id)
     const gotLock = resourceLock.acquire(key, 'updateApp')
     if (gotLock) beginUsageSkip('update')
+    // idea#459: once an operation exists the instance may now run another version (or was rolled
+    // back); updateAvailable is recomputed from the record afterwards, never left from the dock.
+    let opened = false
     try {
         const progress = (step: UpdateStep, bytesDone = 0, bytesTotal = 0) =>
             d.broadcast({ type: UPDATE_PROGRESS_TYPE, engineId, instanceId: String(inst.id), step, bytesDone, bytesTotal })
@@ -357,6 +362,7 @@ export const updateApp = async (
 
         const fromAppId = inst.instanceOf
         const opId = createOperation(storeHandle, 'updateApp', { instanceId: String(inst.id), diskId: String(disk.id), fromAppId: String(fromAppId), toAppId: newAppId }, 'console-command', { type: 'instance', id: inst.id })
+        opened = true
         updateOperation(storeHandle, opId, { status: 'Running' })
         const setStep = (step: UpdateStep) => updateOperation(storeHandle, opId, { currentStep: UPDATE_STEPS.indexOf(step), totalSteps: UPDATE_STEPS.length, stepLabel: step })
         let step: UpdateStep = 'Snapshot'
@@ -448,6 +454,7 @@ export const updateApp = async (
             resourceLock.release(key)
             endUsageSkip('update')
         }
+        if (opened) await refreshOfferAfterUpdate(storeHandle, engineId, d)
     }
 }
 
@@ -516,6 +523,7 @@ export const recoverInterruptedUpdates = async (storeHandle: DocHandle<Store>, e
         updateOperation(storeHandle, op.id, { status: 'Failed', error: `INTERRUPTED: ${err.message}`, completedAt: d.now() as Timestamp })
         out.push(`${inst.id}: ${err.message}`)
     }
+    if (out.length) await refreshOfferAfterUpdate(storeHandle, engineId, d)
     return out
 }
 
@@ -577,4 +585,16 @@ export const refreshUpdateAvailable = async (storeHandle: DocHandle<Store>, engi
         }
     })
     return Object.values(updates).filter(Boolean).length
+}
+
+/**
+ * idea#459: recompute updateAvailable after an updateApp (done, failed or rolled back) or a
+ * startup recovery. Without it the dock-time offer stayed on the record, so an instance that
+ * now runs 1.1 was still offered 1.1. Uses the same mount root as the update; best effort (a
+ * failure is logged and the next dock recomputes it).
+ */
+export const refreshOfferAfterUpdate = async (storeHandle: DocHandle<Store>, engineId: string, d: Pick<UpdateDeps, 'mountRoot'>): Promise<void> => {
+    try { await refreshUpdateAvailable(storeHandle, engineId, { mountRoot: d.mountRoot }) } catch (e) {
+        log(`updateApp: updateAvailable refresh after the update failed: ${(e as Error).message}`)
+    }
 }
