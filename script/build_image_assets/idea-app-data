@@ -138,7 +138,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=10
+readonly IDEA_APP_DATA_VERSION=11
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
