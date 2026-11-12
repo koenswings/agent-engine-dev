@@ -16,7 +16,7 @@ import { findDiskByDevice, findDisksByDevice, Store, getDisksOfEngine, getLocalE
 import { DeviceName, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../data/CommonTypes.js'
 
 import { Instance, Status, stopInstance } from '../data/Instance.js';
-import { config, disksRoot } from '../data/Config.js'
+import { config, disksRoot, systemDiskSkipSource } from '../data/Config.js'
 import { DocHandle } from '@automerge/automerge-repo';
 import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js';
 import { runWithTrace } from '../utils/CommandLogger.js';
@@ -340,7 +340,7 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
                 // conflicts when a second engine runs alongside the production instance).
                 if (systemDevice && device === systemDevice) {
                     if (config.settings.systemDiskSkip) {
-                        log(`Device ${device} is the system disk — skipping registration (IDEA_SYSTEM_DISK_SKIP=true)`)
+                        log(`Device ${device} is the system disk — skipping registration (systemDiskSkip=true: ${systemDiskSkipSource()})`)
                         return
                     }
                     log(`Device ${device} is the system disk (root partition) — registering as system disk`)

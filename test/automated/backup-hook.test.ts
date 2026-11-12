@@ -14,7 +14,8 @@ import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import { DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/data/CommonTypes.js'
 import { Disk } from '../../src/data/Disk.js'
 import { config } from '../../src/data/Config.js'
-import { backupInstance, backupLifecycle } from '../../src/monitors/backupMonitor.js'
+import { backupInstance, backupLifecycle, BACKUP_STALE_LOCK } from '../../src/monitors/backupMonitor.js'
+import { resourceLock, instanceKey } from '../../src/utils/ResourceLock.js'
 import { borgPresence } from '../../src/utils/appDataHelper.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
 import {
@@ -124,6 +125,17 @@ describe('parseBackupSpec / parseBackupHookDecl / backupHookArgv', () => {
         ])
     })
 
+    it('idea#448: a hook from the new bundle runs against the live project (-p, --project-directory, -f)', () => {
+        expect(backupHookArgv({
+            cwd: '/instances/demo', timeoutS: 30, service: 'collector', command: ['/app/snap.sh'],
+            compose: { project: 'demo', projectDir: '/instances/demo', file: '/apps/usage-dashboard-1.1/compose.yaml' },
+        })).toEqual([
+            'timeout', '--signal=TERM', '--kill-after=10s', '30',
+            'docker', 'compose', '-p', 'demo', '--project-directory', '/instances/demo', '-f', '/apps/usage-dashboard-1.1/compose.yaml',
+            'exec', '-T', '--', 'collector', '/app/snap.sh',
+        ])
+    })
+
     it('assertHookServicesExist fails closed when the service is missing', () => {
         const spec = parseBackupSpec({
             backup: {
@@ -213,7 +225,7 @@ describe('backupInstance method hook (idea#444)', () => {
     let backupDevice: string
     let binDir: string
     let borgLog: string
-    const hookCalls: { which: string, cwd: string, timeoutS: number, service: string, command: string[], user?: string }[] = []
+    const hookCalls: { which: string, cwd: string, timeoutS: number, service: string, command: string[], user?: string, compose?: { project: string, projectDir: string, file: string } }[] = []
     let preOutcome: HookOutcome = { code: 0 }
     let postOutcome: HookOutcome = { code: 0 }
     let stopCount = 0
@@ -267,7 +279,7 @@ describe('backupInstance method hook (idea#444)', () => {
         backupLifecycle.startInstance = (async () => { startCount += 1 }) as typeof backupLifecycle.startInstance
         backupHookRunner.run = async (spec) => {
             const which = spec.command[0]?.includes('cleanup') ? 'postHook' : 'preHook'
-            hookCalls.push({ which, cwd: spec.cwd, timeoutS: spec.timeoutS, service: spec.service, command: [...spec.command], user: spec.user })
+            hookCalls.push({ which, cwd: spec.cwd, timeoutS: spec.timeoutS, service: spec.service, command: [...spec.command], user: spec.user, compose: spec.compose })
             const out = which === 'postHook' ? postOutcome : preOutcome
             return { code: out.code, timedOut: !!out.timedOut, stderr: out.stderr ?? '' }
         }
@@ -469,5 +481,115 @@ describe('backupInstance method hook (idea#444)', () => {
         expect(stopCount).toBe(0)
         expect(hookCalls).toEqual([])
     })
+
+    // ── idea#448: the pre-update backup updateApp takes itself ────────────────
+    const newBundleCompose = async (backup: Record<string, unknown>, services: Record<string, unknown> = { collector: {}, tailscale: {} }) => {
+        const dir = `${DISKS_ROOT}/${appDevice}/apps/usage-dashboard-1.1`
+        await fs.ensureDir(dir)
+        await fs.writeFile(`${dir}/compose.yaml`, YAML.stringify({ 'x-app': { name: 'usage-dashboard', version: '1.1', backup }, services }))
+        return `${dir}/compose.yaml`
+    }
+    /** As updateApp calls it: the caller holds the instance lock; errors are thrown. */
+    const runPreUpdate = async (composePath: string, instanceStopped: boolean, status: 'Running' | 'Starting' | 'Stopped' = 'Running') => {
+        const h = await createMinimalStore()
+        const appDisk = makeDisk('hook-ad', appDevice, false)
+        const backupDisk = makeDisk('hook-bd', backupDevice, true)
+        h.change(doc => {
+            doc.diskDB[appDisk.id] = appDisk
+            doc.diskDB[backupDisk.id] = backupDisk
+            doc.instanceDB[INST] = {
+                id: INST, instanceOf: 'usage-dashboard' as any, name: INST as any, status: status as any,
+                port: 8080 as any, serviceImages: [], created: Date.now() as Timestamp, lastBackup: null,
+                lastStarted: Date.now() as Timestamp, statusCondition: null, storedOn: appDisk.id,
+                currentStep: null, totalSteps: null, stepLabel: null, metrics: null,
+            } as any
+        })
+        expect(resourceLock.acquire(instanceKey(INST), 'updateApp')).toBe(true)
+        let error: string | null = null
+        try {
+            await backupInstance(h, INST, backupDisk, undefined, 'console-command', { composePath, instanceStopped })
+        } catch (e) {
+            error = String((e as Error).message)
+        } finally {
+            resourceLock.release(instanceKey(INST))
+        }
+        return { h, error }
+    }
+    const lockFile = () => `${DISKS_ROOT}/${backupDevice}/backups/${INST}/.backup-in-progress`
+
+    it('idea#448 pre-update hook: runs the NEW compose hook against the live project, its excludes, no stop, under the caller\'s instance lock', async () => {
+        const instDir = await writeCompose({ exclude: ['keys'] })   // live compose: no hook
+        const composePath = await newBundleCompose(hookBlock())
+        const { h, error } = await runPreUpdate(composePath, false)
+        expect(error).toBeNull()
+        const op = opOf(h)
+        expect(op?.status, op?.error).toBe('Done')
+        expect(op?.args?.reason).toBe('pre-update')
+        expect(op?.args?.hookResult).toBe('hook')
+        expect(stopCount).toBe(0)
+        expect(startCount).toBe(0)
+        expect(hookCalls.map(c => c.which)).toEqual(['preHook', 'postHook'])
+        expect(hookCalls[0].compose).toEqual({ project: INST, projectDir: instDir, file: composePath })
+        const create = (await calls()).find(l => l.startsWith('borg-create '))
+        expect(create).toMatch(/ data\/keys data\/tailscale data\/tailscale-run data\/backup\/daily data\/usage\.sqlite data\/usage\.sqlite-wal data\/usage\.sqlite-shm$/)
+        expect(h.doc()!.instanceDB[INST].lastBackup).not.toBeNull()
+        expect(await fs.pathExists(lockFile())).toBe(false)
+    })
+
+    it('idea#448 pre-update hook: a failed preHook with fallback stop refuses HOOK_FAILED; no stop, no borg, no lastBackup, own lock cleared', async () => {
+        preOutcome = { code: 2, stderr: 'db locked' }
+        await writeCompose({})
+        const composePath = await newBundleCompose(hookBlock({ fallback: 'stop' }))
+        const { h, error } = await runPreUpdate(composePath, false)
+        expect(error).toMatch(/^HOOK_FAILED: preHook exited 2: db locked/)
+        expect(stopCount).toBe(0)
+        expect(startCount).toBe(0)
+        expect((await calls()).some(l => l.startsWith('borg-create '))).toBe(false)
+        expect(h.doc()!.instanceDB[INST].lastBackup).toBeNull()
+        expect(h.doc()!.instanceDB[INST].status).toBe('Running')
+        expect(await fs.pathExists(lockFile())).toBe(false)
+    })
+
+    it('idea#448 inside the snapshot stop: Borg only (exclude, no hookExclude), no hook, no stop or start', async () => {
+        await writeCompose({})
+        const composePath = await newBundleCompose(hookBlock())
+        const { h, error } = await runPreUpdate(composePath, true, 'Stopped')
+        expect(error).toBeNull()
+        expect(hookCalls).toEqual([])
+        expect(stopCount).toBe(0)
+        expect(startCount).toBe(0)
+        const create = (await calls()).find(l => l.startsWith('borg-create '))
+        expect(create).toMatch(/ data\/keys data\/tailscale data\/tailscale-run data\/backup\/daily$/)
+        expect(h.doc()!.instanceDB[INST].lastBackup).not.toBeNull()
+    })
+
+    it('idea#448 a stop-mode new compose while the instance runs is refused (updateApp must take it inside its stop)', async () => {
+        await writeCompose({})
+        const composePath = await newBundleCompose({ exclude: ['keys'] })
+        const { error } = await runPreUpdate(composePath, false)
+        expect(error).toMatch(/needs method 'hook' while the instance runs/)
+        expect(stopCount).toBe(0)
+        expect((await calls()).some(l => l.startsWith('borg-create '))).toBe(false)
+    })
+
+    it('idea#448 a stale .backup-in-progress refuses the pre-update backup and is left alone (no auto-retry)', async () => {
+        await writeCompose({})
+        const composePath = await newBundleCompose(hookBlock())
+        await fs.outputFile(lockFile(), '{"instanceId":"x","startedAt":1}')
+        const { error } = await runPreUpdate(composePath, false)
+        expect(error).toMatch(new RegExp(`^${BACKUP_STALE_LOCK}: `))
+        expect(hookCalls).toEqual([])
+        expect(await fs.readFile(lockFile(), 'utf8')).toBe('{"instanceId":"x","startedAt":1}')
+    })
+
+    it('idea#448 a missing or invalid new compose fails closed before any hook', async () => {
+        await writeCompose({})
+        const missing = await runPreUpdate(`${DISKS_ROOT}/${appDevice}/apps/nope/compose.yaml`, false)
+        expect(missing.error).toMatch(/new bundle's .* is missing/)
+        const bad = await newBundleCompose({ exclude: ['../etc'] })
+        expect((await runPreUpdate(bad, false)).error).toMatch(/invalid x-app.backup.exclude/)
+        expect(hookCalls).toEqual([])
+    })
+
 })
 
