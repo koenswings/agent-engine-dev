@@ -1,0 +1,7 @@
+# /etc/ssh/idea_operator_keys/pi — fleet operator SSH public keys (idea#453, option B).
+# Installed root:root 0644 by the Engine image build (build-engine --root); sshd reads it via
+# AuthorizedKeysFile /etc/ssh/idea_operator_keys/%u in 10-idea-peer.conf. PUBLIC keys only,
+# one per line, no options. verify (operator-keys) requires the Atlas box key below.
+# Rotating this list needs a new image and a reflash. Further entries are Steve's call.
+# Atlas box key, SHA256:L+pEPj+XrDyBzbKiA9CdsXK9cTuos9EHUSTWKUDfNkg
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP5pJ426w/HVTUBn4wIfxv4XGnRjoQnihRAavat+ww/p atlas-box@grok-bot

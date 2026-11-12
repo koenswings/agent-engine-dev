@@ -39,6 +39,14 @@ No SSH, nothing started, no device identity. Inside `chroot <MNT>`:
 3. The existing installers from `src/data/Engine.ts`, unchanged: apt snapshot + Raspberry Pi pins, avahi, locale,
    crontabs, udev + root helpers + sudoers + peer access, packages, apps folders. A rebuild with `--lock` whose lock
    has `rpiPackages` installs exactly those versions from archive.raspberrypi.com (it has no snapshots).
+3b. Operator SSH login (idea#453, option B): `script/build_image_assets/idea-operator-keys.pub` (committed fleet
+   operator PUBLIC keys; the Atlas box key `SHA256:L+pEPj+XrDyBzbKiA9CdsXK9cTuos9EHUSTWKUDfNkg` first) is installed
+   as `/etc/ssh/idea_operator_keys/pi` (dir root:root 0755, file root:root 0644), which `10-idea-peer.conf` names in
+   `AuthorizedKeysFile` (`/etc/ssh/idea_operator_keys/%u`). `10-idea-login.conf` (sorted before `10-idea-peer.conf`
+   and any `50-cloud-init.conf`; the first value wins) sets `PasswordAuthentication no` and
+   `KbdInteractiveAuthentication no`. Then `sshd -t`. Both files are locked files. Sanitise never removes the
+   operator list (it is not in `IDENTITY_PATHS`); it still removes `~pi/.ssh/authorized_keys`, `id_ed25519*` and the
+   peer keys `idea_authorized_keys/pi`. Adding or rotating an operator key = edit the list, new image, reflash.
 4. Docker from the pinned debs, enabled, not started; pi in the docker group; `daemon.json`.
 5. Tailscale from the pinned tarball (`tailscale` in /usr/bin, `tailscaled` in /usr/sbin, as the Debian package) + unit, NOT enabled, no key, no state
    (idea-engine-identity enables it on first boot when the card carries a key, engine#291).
@@ -75,7 +83,14 @@ No SSH, nothing started, no device identity. Inside `chroot <MNT>`:
    never written), build guards removed.
 10. `/etc/idea/engine.lock`, `/etc/idea/engine-version`, then verify (`verifyRootfs`): any identity, a store-identity
     file that differs from git, a wrong commit, a missing build, pm2 as root, a unit not enabled, a locked file whose
-    content/mode/owner differs, a preload tarball whose sha256 differs: exit 1.
+    content/mode/owner differs, a preload tarball whose sha256 differs: exit 1. `operator-keys` fails if
+    `/etc/ssh/idea_operator_keys/pi` is missing, not a regular root:root 0644 file (dir root:root 0755), holds anything
+    but plain public keys, or lacks a key in `REQUIRED_OPERATOR_KEY_FPS`; or if the effective `AuthorizedKeysFile`
+    (read like sshd: sshd_config with its Include expanded in order, first value wins) is not set by `10-idea-peer.conf`
+    or lacks `.ssh/authorized_keys`, `/etc/ssh/idea_authorized_keys/%u` or `/etc/ssh/idea_operator_keys/%u`.
+    `ssh-no-password` fails if `10-idea-login.conf` is missing, or the effective `PasswordAuthentication` or
+    `KbdInteractiveAuthentication` (or its alias `ChallengeResponseAuthentication`) is not `no`, or a `Match` block
+    turns either back on.
 
 `engine-build.json`: `{engine_commit, engine_version, lock_sha256, verify: {passed, failed}}` (failed = the problems).
 

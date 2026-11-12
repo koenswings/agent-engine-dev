@@ -393,6 +393,101 @@ export const IDENTITY_PATHS = [
     'usr/sbin/policy-rc.d',
 ]
 
+// ── Operator SSH login (idea#453, option B) ─────────────────────────────────
+
+/** Fleet operator public keys, baked into the image root-owned (never under IDENTITY_PATHS). */
+export const OPERATOR_KEYS_DIR = '/etc/ssh/idea_operator_keys'
+export const OPERATOR_KEYS_FILE = `${OPERATOR_KEYS_DIR}/pi`
+/** The committed list (script/build_image_assets) installed as OPERATOR_KEYS_FILE. */
+export const OPERATOR_KEYS_ASSET = 'idea-operator-keys.pub'
+/** The AuthorizedKeysFile token in 10-idea-peer.conf that makes sshd read OPERATOR_KEYS_FILE. */
+export const OPERATOR_KEYS_TOKEN = `${OPERATOR_KEYS_DIR}/%u`
+/** Keys every image must carry: the Atlas box key comes first (idea#453). */
+export const REQUIRED_OPERATOR_KEY_FPS = ['SHA256:L+pEPj+XrDyBzbKiA9CdsXK9cTuos9EHUSTWKUDfNkg'] as const
+/** Key-only sshd drop-in (sorted before the peer drop-in and any 50-cloud-init.conf). */
+export const LOGIN_SSHD_DROPIN = '/etc/ssh/sshd_config.d/10-idea-login.conf'
+export const LOGIN_SSHD_ASSET = '10-idea-login.conf'
+export const PEER_SSHD_DROPIN_PATH = '/etc/ssh/sshd_config.d/10-idea-peer.conf'
+/** AuthorizedKeysFile entries the image must keep: operator files, peer forced-command keys, operator keys. */
+export const REQUIRED_AUTHORIZED_KEYS_FILES = ['.ssh/authorized_keys', '/etc/ssh/idea_authorized_keys/%u', OPERATOR_KEYS_TOKEN] as const
+
+const PUBKEY_TYPES = ['ssh-ed25519', 'ssh-rsa', 'ecdsa-sha2-nistp256', 'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521', 'sk-ssh-ed25519@openssh.com', 'sk-ecdsa-sha2-nistp256@openssh.com']
+
+/** OpenSSH SHA256 fingerprint of a public-key line (`type base64 [comment]`), or undefined if the line is not a plain public key. */
+export const publicKeyFingerprint = (line: string): string | undefined => {
+    const [type, b64] = line.trim().split(/\s+/)
+    if (!type || !b64 || !PUBKEY_TYPES.includes(type) || !/^[A-Za-z0-9+/]+={0,2}$/.test(b64)) return undefined
+    const blob = Buffer.from(b64, 'base64')
+    // the blob starts with the key type as an SSH string
+    if (blob.length < 4 + type.length || blob.readUInt32BE(0) !== type.length || blob.subarray(4, 4 + type.length).toString('latin1') !== type) return undefined
+    return 'SHA256:' + crypto.createHash('sha256').update(blob).digest('base64').replace(/=+$/, '')
+}
+
+/** Problems with an operator key list: public keys only, no options, no private key material, the required keys present. */
+export const operatorKeysProblems = (text: string, required: readonly string[] = REQUIRED_OPERATOR_KEY_FPS): string[] => {
+    const p: string[] = []
+    if (/PRIVATE KEY/.test(text)) p.push(`${OPERATOR_KEYS_FILE} contains private key material`)
+    const fps: string[] = []
+    text.split('\n').forEach((raw, i) => {
+        const l = raw.trim()
+        if (!l || l.startsWith('#')) return
+        const fp = publicKeyFingerprint(l)
+        if (!fp) p.push(`${OPERATOR_KEYS_FILE} line ${i + 1} is not a plain public key (no options allowed)`)
+        else fps.push(fp)
+    })
+    if (!fps.length) p.push(`${OPERATOR_KEYS_FILE} has no operator key`)
+    for (const fp of required) if (!fps.includes(fp)) p.push(`${OPERATOR_KEYS_FILE} lacks the required operator key ${fp}`)
+    return p
+}
+
+export interface SshdSetting { value: string, file: string }
+export interface SshdEffective {
+    /** first global value per lower-cased keyword (sshd: the first assignment wins) */
+    first: Map<string, SshdSetting>
+    /** settings inside Match blocks (file, keyword, value) */
+    inMatch: { keyword: string, value: string, file: string }[]
+    problems: string[]
+}
+
+/**
+ * The sshd settings a rootfs would apply, read like sshd: /etc/ssh/sshd_config top to bottom,
+ * an Include expanded in place (lexical order), the first global assignment of a keyword wins.
+ * Read-only; supports the absolute or sshd_config.d-relative `*.conf` globs Debian uses.
+ */
+export const sshdEffectiveConfig = async (root: string): Promise<SshdEffective> => {
+    const out: SshdEffective = { first: new Map(), inMatch: [], problems: [] }
+    const main = path.join(root, 'etc/ssh/sshd_config')
+    if (!(await fs.pathExists(main))) { out.problems.push('/etc/ssh/sshd_config missing'); return out }
+    const readOne = async (abs: string, depth: number): Promise<void> => {
+        const rel = '/' + path.relative(root, abs)
+        let inMatch = false
+        for (const raw of (await fs.readFile(abs, 'utf8')).split('\n')) {
+            const l = raw.trim()
+            if (!l || l.startsWith('#')) continue
+            const m = /^(\S+)\s*(?:=\s*|\s+)(.*)$/.exec(l)
+            if (!m) continue
+            const kw = m[1].toLowerCase(); const val = m[2].trim()
+            if (kw === 'match') { inMatch = true; continue }
+            if (kw === 'include' && !inMatch) {
+                if (depth > 4) { out.problems.push(`${rel}: Include nested too deep`); continue }
+                for (const pat of val.split(/\s+/)) {
+                    const absPat = pat.startsWith('/') ? pat : `/etc/ssh/${pat}`
+                    const dir = path.join(root, path.posix.dirname(absPat))
+                    const base = path.posix.basename(absPat)
+                    const re = new RegExp('^' + base.split('*').map(s => s.replace(/[.+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$')
+                    const names = (await fs.pathExists(dir)) ? (await fs.readdir(dir)).filter(n => re.test(n)).sort() : []
+                    for (const n of names) await readOne(path.join(dir, n), depth + 1)
+                }
+                continue
+            }
+            if (inMatch) out.inMatch.push({ keyword: kw, value: val, file: rel })
+            else if (!out.first.has(kw)) out.first.set(kw, { value: val, file: rel })
+        }
+    }
+    await readOne(main, 0)
+    return out
+}
+
 /** Under the Engine tree: runtime store state. store-identity/ keeps exactly the git-tracked files. */
 export const ENGINE_RUNTIME_PATHS = ['store-data', 'yjs-db', 'logs', 'test/testresults']
 
@@ -463,7 +558,7 @@ const modeOf = (st: { mode: number }) => '0' + (st.mode & 0o777).toString(8).pad
 
 /** Every check a built rootfs must pass. Returns problems; empty = OK. Read-only. */
 /** verify's checks, in order; the report counts how many passed (VERIFY_CHECKS.length in all). */
-export const VERIFY_CHECKS = ['identity', 'store-identity', 'engine-tree', 'pm2-as-pi', 'enabled-units', 'locked-files', 'permissions', 'npm-tools', 'docker-preload', 'packages', 'no-dev-files', 'lock-in-image', 'ssh-first-boot', 'console-ui'] as const
+export const VERIFY_CHECKS = ['identity', 'store-identity', 'engine-tree', 'pm2-as-pi', 'enabled-units', 'locked-files', 'permissions', 'npm-tools', 'docker-preload', 'packages', 'no-dev-files', 'lock-in-image', 'ssh-first-boot', 'console-ui', 'operator-keys', 'ssh-no-password'] as const
 export interface VerifyCheckResult { name: string, problems: string[] }
 
 export const verifyRootfs = async (c: VerifyContext): Promise<string[]> => (await verifyRootfsChecks(c)).flatMap(x => x.problems)
@@ -608,6 +703,52 @@ export const verifyRootfsChecks = async (c: VerifyContext): Promise<VerifyCheckR
     else if (c.lock.consoleCommit) {
         const head = path.join(c.root, 'home/pi/idea/agents/agent-console-dev/.git/HEAD')
         if (await fs.pathExists(head) && (await fs.readFile(head, 'utf8')).trim() !== c.lock.consoleCommit) p.push(`Console checkout is not detached at ${c.lock.consoleCommit}`)
+    }
+    check('operator-keys')
+    // 14. fleet operators can log in (idea#453): the baked root-owned key list, read by sshd
+    const owners = c.piUid !== undefined // a real rootfs (pi known): owners are checked; temp-dir tests run unprivileged
+    const kd = R(OPERATOR_KEYS_DIR.slice(1)), kf = R(OPERATOR_KEYS_FILE.slice(1))
+    if (!(await fs.pathExists(kd)) || !(await fs.lstat(kd)).isDirectory()) p.push(`${OPERATOR_KEYS_DIR} missing (operator SSH login)`)
+    else {
+        const st = await fs.lstat(kd)
+        if (modeOf(st) !== '0755') p.push(`${OPERATOR_KEYS_DIR} mode ${modeOf(st)}, must be 0755`)
+        if (owners && (st.uid !== 0 || st.gid !== 0)) p.push(`${OPERATOR_KEYS_DIR} must be owned by root:root`)
+    }
+    if (!(await fs.pathExists(kf)) && !(await isSymlink(kf))) p.push(`${OPERATOR_KEYS_FILE} missing (operator SSH login)`)
+    else {
+        const st = await fs.lstat(kf)
+        if (!st.isFile()) p.push(`${OPERATOR_KEYS_FILE} must be a regular file`)
+        else {
+            if (modeOf(st) !== '0644') p.push(`${OPERATOR_KEYS_FILE} mode ${modeOf(st)}, must be 0644`)
+            if (owners && (st.uid !== 0 || st.gid !== 0)) p.push(`${OPERATOR_KEYS_FILE} must be owned by root:root`)
+            p.push(...operatorKeysProblems(await fs.readFile(kf, 'utf8')))
+        }
+    }
+    for (const pat of IDENTITY_PATHS) if (pat.includes('idea_operator_keys')) p.push(`IDENTITY_PATHS must not strip the operator keys (${pat})`)
+    const sshd = await sshdEffectiveConfig(c.root)
+    p.push(...sshd.problems)
+    if (!(await fs.pathExists(R(PEER_SSHD_DROPIN_PATH.slice(1))))) p.push(`${PEER_SSHD_DROPIN_PATH} missing`)
+    const akf = sshd.first.get('authorizedkeysfile')
+    if (!sshd.problems.length) {
+        if (!akf) p.push('sshd has no AuthorizedKeysFile setting (10-idea-peer.conf must set it)')
+        else {
+            if (akf.file !== PEER_SSHD_DROPIN_PATH) p.push(`AuthorizedKeysFile is set first by ${akf.file}, not ${PEER_SSHD_DROPIN_PATH}`)
+            const toks = akf.value.split(/\s+/)
+            for (const t of REQUIRED_AUTHORIZED_KEYS_FILES) if (!toks.includes(t)) p.push(`AuthorizedKeysFile (${akf.file}) lacks ${t}`)
+        }
+    }
+    check('ssh-no-password')
+    // 15. key-only login (idea#453): password and keyboard-interactive off, set by our drop-in and not overridden
+    if (!(await fs.pathExists(R(LOGIN_SSHD_DROPIN.slice(1))))) p.push(`${LOGIN_SSHD_DROPIN} missing (key-only SSH login)`)
+    p.push(...sshd.problems)
+    if (!sshd.problems.length) {
+        const pw = sshd.first.get('passwordauthentication')
+        if (pw?.value.toLowerCase() !== 'no') p.push(`PasswordAuthentication is ${pw ? `${pw.value} (${pw.file})` : 'unset (sshd default yes)'}; must be no`)
+        // ChallengeResponseAuthentication is the deprecated alias; whichever comes first wins
+        const kb = [sshd.first.get('kbdinteractiveauthentication'), sshd.first.get('challengeresponseauthentication')].filter(Boolean) as SshdSetting[]
+        if (!kb.length || kb.some(x => x.value.toLowerCase() !== 'no')) p.push(`KbdInteractiveAuthentication is ${kb.length ? kb.map(x => `${x.value} (${x.file})`).join(', ') : 'unset (sshd default yes)'}; must be no`)
+        for (const m of sshd.inMatch) if (['passwordauthentication', 'kbdinteractiveauthentication', 'challengeresponseauthentication'].includes(m.keyword) && m.value.toLowerCase() !== 'no')
+            p.push(`${m.file}: a Match block sets ${m.keyword} ${m.value}`)
     }
     return results
 }
