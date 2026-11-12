@@ -7,7 +7,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { DocHandle, Repo } from '@automerge/automerge-repo'
-import { fs, os, path, YAML } from 'zx'
+import { fs, os, path, YAML, $ } from 'zx'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId, ENGINE_CAPABILITIES } from '../../src/data/Engine.js'
 import { DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/data/CommonTypes.js'
@@ -19,6 +19,7 @@ import {
     listBackup, verifyBackup, clearBackupLock, removeBackupRole,
     parseBorgListInventory, parseBorgMemberList, instanceRelativeMember,
     memberMatchesPath, pathsFoundInMembers, newestArchive, BACKUP_VERIFY_HELPER_MIN,
+    parseScratchBytes,
 } from '../../src/data/BackupVerify.js'
 import { parseBackupVerifyLists, parseBackupExcludeList } from '../../src/utils/backupExclude.js'
 import { resourceLock, diskKey, instanceKey } from '../../src/utils/ResourceLock.js'
@@ -34,7 +35,7 @@ const FAKE_SUDO = `#!/usr/bin/env bash
 shift 2
 echo "$*" >> "$FAKE_BORG_LOG"
 case "$1" in
-  version) echo "idea-app-data \${FAKE_HELPER_VERSION:-10}" ;;
+  version) echo "idea-app-data \${FAKE_HELPER_VERSION:-12}" ;;
   borg-list)
     bdev="$2"; id="$3"; archive="$4"
     if [ -n "\$archive" ]; then
@@ -51,7 +52,14 @@ case "$1" in
     mkdir -p "\$dest"
     src="$IDEA_DISKS_ROOT/\$bdev/.idea-verify-src/\$id/\$archive"
     if [ -d "\$src" ]; then cp -a "\$src/." "\$dest/"; fi
-    echo "\$dest"
+    if [ "\${FAKE_OMIT_SCRATCH_BYTES:-}" = 1 ]; then
+      :
+    elif [ -n "\${FAKE_SCRATCH_BYTES:-}" ]; then
+      echo "scratchBytes=\$FAKE_SCRATCH_BYTES"
+    else
+      bytes=\$(du -sb -- "\$dest" 2>/dev/null | awk '{print \$1}')
+      [ -n "\$bytes" ] && echo "scratchBytes=\$bytes"
+    fi
     ;;
   quarantine-backups)
     bdev="$2"
@@ -138,9 +146,21 @@ describe('parse helpers (idea#446)', () => {
         expect(parseBackupExcludeList({ backup: { exclude: ['keys'] } })).toEqual(['data/keys'])
     })
 
-    it('registers the four commands and the backupVerify capability; Engine speaks helper v11', () => {
+    it('parseScratchBytes reads the last scratchBytes=<n> line and returns null when missing (idea#460)', () => {
+        expect(parseScratchBytes('')).toBeNull()
+        expect(parseScratchBytes('ok\n')).toBeNull()
+        expect(parseScratchBytes('/disks/sdb1/.idea-verify/inst-1-20261112T000000Z\n')).toBeNull()
+        expect(parseScratchBytes('scratchBytes=11766739\n')).toBe(11766739)
+        expect(parseScratchBytes('scratchBytes=0\n')).toBe(0)
+        expect(parseScratchBytes('note\nscratchBytes=12\nscratchBytes=99\n')).toBe(99)
+        expect(parseScratchBytes('scratchBytes=12 extra\n')).toBeNull()
+        expect(parseScratchBytes('scratchBytes=not-a-number\n')).toBeNull()
+        expect(parseScratchBytes('scratchBytes=9007199254740992\n')).toBeNull() // > MAX_SAFE_INTEGER
+    })
+
+    it('registers the four commands and the backupVerify capability; Engine speaks helper v12 (idea#460), verify min stays v10', () => {
         expect(BACKUP_VERIFY_HELPER_MIN).toBe(10)
-        expect(APP_DATA_HELPER_VERSION).toBe('11')
+        expect(APP_DATA_HELPER_VERSION).toBe('12')
         expect(ENGINE_CAPABILITIES).toContain('backupVerify')
         for (const name of ['listBackup', 'verifyBackup', 'clearBackupLock', 'removeBackupRole']) {
             expect(commands.find(c => c.name === name), name).toBeTruthy()
@@ -213,7 +233,7 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
         await fs.writeFile(path.join(binDir, 'sudo'), FAKE_SUDO, { mode: 0o755 })
         process.env.PATH = `${binDir}:${saved.path}`
         process.env.FAKE_BORG_LOG = borgLog
-        process.env.FAKE_HELPER_VERSION = '10'
+        process.env.FAKE_HELPER_VERSION = '12'
         process.env.IDEA_DISKS_ROOT = DISKS_ROOT
         config.settings.testMode = true
         config.settings.skipBorg = false
@@ -230,6 +250,8 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
         else process.env.FAKE_BORG_LOG = saved.log
         if (saved.ver === undefined) delete process.env.FAKE_HELPER_VERSION
         else process.env.FAKE_HELPER_VERSION = saved.ver
+        delete process.env.FAKE_SCRATCH_BYTES
+        delete process.env.FAKE_OMIT_SCRATCH_BYTES
         resourceLock.releaseAll([diskKey('ver-bd'), instanceKey(INST)])
         await fs.remove(`${DISKS_ROOT}/${appDevice}`)
         await fs.remove(`${DISKS_ROOT}/${backupDevice}`)
@@ -298,6 +320,9 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
         expect(result.archiveCompressedBytes).toBe(400)
         expect(result.neededBytes).toBe(Math.ceil(1000 * 1.1))
         expect(result.freeBytes).toBeGreaterThan(result.neededBytes)
+        const duOut = (await $`du -sb -- ${result.scratchPath}`).stdout.trim()
+        const duBytes = Number(duOut.split(/\s+/)[0])
+        expect(result.scratchBytes).toBe(duBytes)
         expect(result.scratchBytes).toBeGreaterThan(0)
         expect(result.checks).toEqual(expect.arrayContaining([
             expect.objectContaining({ path: 'data/keys', expect: 'absent', source: 'exclude', ok: true }),
@@ -312,6 +337,29 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
         const log = await calls()
         expect(log.some(l => l.startsWith('borg-extract '))).toBe(false)
         expect(log.some(l => l.startsWith(`borg-extract-verify ${backupDevice} ${INST} ${ARCHIVE} `))).toBe(true)
+    })
+
+    it('verifyBackup uses the helper scratchBytes count, even when it differs from a local walk', async () => {
+        await seedRepo()
+        const { h } = await storeWithDisks()
+        process.env.FAKE_SCRATCH_BYTES = '11766739'
+        const result = await verifyBackup(h, INST, 'ver-bd') as any
+        expect(result.ok).toBe(true)
+        expect(result.scratchBytes).toBe(11766739)
+        delete process.env.FAKE_SCRATCH_BYTES
+    })
+
+    it('verifyBackup still succeeds on helper v10 with scratchBytes null (idea#460 backward compat)', async () => {
+        await seedRepo()
+        const { h } = await storeWithDisks()
+        process.env.FAKE_HELPER_VERSION = '10'
+        process.env.FAKE_OMIT_SCRATCH_BYTES = '1'
+        const result = await verifyBackup(h, INST, 'ver-bd') as any
+        expect(result.ok).toBe(true)
+        expect(result.scratchBytes).toBeNull()
+        expect(await fs.pathExists(result.scratchPath)).toBe(true)
+        delete process.env.FAKE_OMIT_SCRATCH_BYTES
+        process.env.FAKE_HELPER_VERSION = '12'
     })
 
     it('verifyBackup fails path checks when an excluded path is present, and refuses NO_SPACE / a running backup / a held disk lock', async () => {
@@ -399,7 +447,7 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
 shift 2
 echo "$*" >> "$FAKE_BORG_LOG"
 case "$1" in
-  version) echo "idea-app-data \${FAKE_HELPER_VERSION:-10}" ;;
+  version) echo "idea-app-data \${FAKE_HELPER_VERSION:-12}" ;;
   borg-init) mkdir -p "$IDEA_DISKS_ROOT/$2/backups/$3" && echo '[repository]' > "$IDEA_DISKS_ROOT/$2/backups/$3/config" ;;
   borg-create)
     while [ -f "$FAKE_BORG_HOLD" ]; do sleep 0.05; done
