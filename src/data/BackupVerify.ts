@@ -409,10 +409,16 @@ export const clearBackupLock = async (
     if (busy) throw new Error(`clearBackupLock: ${busy}`)
 
     const lockPath = backupLockPath(device, instance.id)
-    if (!(await fs.pathExists(lockPath))) {
+    const lockPresent = await fs.pathExists(lockPath)
+    // idea#454: the lock file can already be gone while Disk.backupStaleLocks still lists
+    // the instance (an older Engine's backup over a stale lock, or a lock removed by hand).
+    // Then only the store entry is dropped; with neither present there is nothing to clear.
+    const staleEntry = (storeHandle.doc().diskDB[disk.id]?.backupStaleLocks ?? [])
+        .find(l => String(l.instanceId) === String(instance.id))
+    if (!lockPresent && !staleEntry) {
         throw new Error(`clearBackupLock: no .backup-in-progress lock for instance ${instance.id} on disk ${disk.id}`)
     }
-    const startedAt = await readLockStartedAt(lockPath)
+    const startedAt = lockPresent ? await readLockStartedAt(lockPath) : (staleEntry?.startedAt ?? null)
 
     const lockKey = diskKey(disk.id)
     if (!resourceLock.acquireAll([lockKey], 'clearBackupLock')) {
@@ -420,11 +426,13 @@ export const clearBackupLock = async (
         throw new Error(`clearBackupLock: the Backup Disk is locked${held ? ` by '${held.kind}'` : ''}`)
     }
     try {
-        await fs.remove(lockPath)
+        if (lockPresent) await fs.remove(lockPath)
         clearBackupStaleLock(storeHandle, disk.id, instance.id)
-        const result = { instanceId: instance.id, backupDiskId: disk.id, lockPath, startedAt, cleared: true }
+        const result = { instanceId: instance.id, backupDiskId: disk.id, lockPath, startedAt, cleared: true, lockFileRemoved: lockPresent }
         attachTraceResult(result)
-        print(chalk.green(`clearBackupLock: removed ${lockPath}`))
+        print(chalk.green(lockPresent
+            ? `clearBackupLock: removed ${lockPath}`
+            : `clearBackupLock: no lock file left at ${lockPath}; removed the stale-lock entry from the store (idea#454)`))
         return result
     } finally {
         resourceLock.releaseAll([lockKey])

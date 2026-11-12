@@ -131,7 +131,7 @@ These commands perform actions on the system. Some are restricted to an `engine`
 - **Scope:** `engine`
 
 ### `clearBackupLock`
-- **Description:** Removes only the `.backup-in-progress` lock file for an instance on a docked Backup Disk, and drops the matching `Disk.backupStaleLocks` entry. Never starts a backup (idea#446: boot no longer auto-retries a leftover lock). Refuses if a `backupApp` of that instance to this disk is Pending/Running, the in-memory backup mutex is held, the disk is locked, or no lock file is present. Capability `backupVerify`.
+- **Description:** Removes only the `.backup-in-progress` lock file for an instance on a docked Backup Disk, and drops the matching `Disk.backupStaleLocks` entry. Never starts a backup (idea#446: boot no longer auto-retries a leftover lock). When the lock file is already gone but `Disk.backupStaleLocks` still lists the instance, it drops only the store entry (result `lockFileRemoved: false`, idea#454). Refuses if a `backupApp` of that instance to this disk is Pending/Running, the in-memory backup mutex is held, the disk is locked, or there is neither a lock file nor a stale-lock entry. Capability `backupVerify`.
 - **Usage:** `clearBackupLock <instanceId|instanceName> <backupDiskId>`. Every refusal ends the command trace as `error` with the reason.
 - **Scope:** `engine`
 

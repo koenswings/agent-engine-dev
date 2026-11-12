@@ -100,12 +100,20 @@ export const recordBackupStaleLocks = async (storeHandle: DocHandle<Store>, back
     })
 }
 
-/** Drop one instance's entry from Disk.backupStaleLocks after clearBackupLock. Never assign undefined. */
+/**
+ * Drop one instance's entry from Disk.backupStaleLocks (clearBackupLock, or a successful
+ * backup, idea#454). Never assign undefined. Entries are spliced out in place: re-assigning
+ * a filtered array would put the other instances' existing Automerge objects into a new
+ * list, which Automerge rejects, so a disk with two stale locks could not lose one.
+ */
 export const clearBackupStaleLock = (storeHandle: DocHandle<Store>, diskId: string, instanceId: string): void => {
     storeHandle.change(doc => {
         const d = doc.diskDB[diskId]
         if (!d) return
-        d.backupStaleLocks = (d.backupStaleLocks ?? []).filter(l => String(l.instanceId) !== String(instanceId))
+        if (!d.backupStaleLocks) { d.backupStaleLocks = []; return }
+        for (let i = d.backupStaleLocks.length - 1; i >= 0; i--) {
+            if (String(d.backupStaleLocks[i].instanceId) === String(instanceId)) d.backupStaleLocks.splice(i, 1)
+        }
     })
 }
 
@@ -453,8 +461,13 @@ export const backupInstance = async (
             await writeBackupYaml(backupDevice, yaml)
         }
 
-        // 8. Remove lock file (success)
+        // 8. Remove lock file (success). A backup over a stale lock also drops the
+        // instance's Disk.backupStaleLocks entry: the lock it recorded is gone (idea#454).
         await fs.remove(lockPath)
+        if (hasBackupStaleLock(storeHandle.doc().diskDB[backupDisk.id] ?? backupDisk, instanceId)) {
+            clearBackupStaleLock(storeHandle, backupDisk.id, instanceId)
+            log(`Backup of ${instanceId} succeeded over a stale lock — removed its Disk.backupStaleLocks entry (idea#454)`)
+        }
 
         if (cleanupIsEnabled()) {
             const after = await backupCleanupRunner.run({

@@ -469,4 +469,48 @@ exit 0
         expect(await fs.pathExists(`${DISKS_ROOT}/${backupDevice}/BACKUP.yaml`)).toBe(true)
         expect(await fs.pathExists(`${DISKS_ROOT}/${backupDevice}/backups/${INST}/config`)).toBe(true)
     })
+
+    it('clearBackupLock with no lock file but a stale store entry drops the entry instead of refusing, then removeBackupRole proceeds (idea#454)', async () => {
+        await seedRepo()
+        const { h, backupDisk } = await storeWithDisks()
+        const startedAt = Date.now() - 60000
+        const lockPath = `${DISKS_ROOT}/${backupDevice}/backups/${INST}/.backup-in-progress`
+        await fs.writeFile(lockPath, JSON.stringify({ instanceId: INST, startedAt }))
+        await processBackupDisk(h, backupDisk)
+        // The lock file goes (an older Engine's backup, or by hand); the store entry stays
+        await fs.remove(lockPath)
+        expect((h.doc()!.diskDB[backupDisk.id].backupStaleLocks ?? []).map(l => l.instanceId)).toEqual([INST])
+        await expect(removeBackupRole(h, 'ver-bd')).rejects.toThrow(/stale backup locks/)
+
+        const result = await clearBackupLock(h, INST, 'ver-bd') as any
+        expect(result.cleared).toBe(true)
+        expect(result.lockFileRemoved).toBe(false)
+        expect(result.startedAt).toBe(startedAt)
+        expect(h.doc()!.diskDB[backupDisk.id].backupStaleLocks).toEqual([])
+        expect(await fs.pathExists(lockPath)).toBe(false)
+        expect((await calls()).some(l => l.startsWith('borg-create'))).toBe(false)
+        // Nothing left to clear: the usual refusal
+        await expect(clearBackupLock(h, INST, 'ver-bd')).rejects.toThrow(/no \.backup-in-progress/)
+
+        const removed = await removeBackupRole(h, 'ver-bd') as any
+        expect(removed.diskTypes).not.toContain('backup')
+    })
+
+    it('a Console backupApp over a stale lock leaves no stale entry, so clearBackupLock has nothing to clear and removeBackupRole is not blocked (idea#454)', async () => {
+        await seedRepo()
+        const { h, backupDisk } = await storeWithDisks()
+        const lockPath = `${DISKS_ROOT}/${backupDevice}/backups/${INST}/.backup-in-progress`
+        await fs.writeFile(lockPath, JSON.stringify({ instanceId: INST, startedAt: Date.now() - 60000 }))
+        await processBackupDisk(h, backupDisk)
+        expect((h.doc()!.diskDB[backupDisk.id].backupStaleLocks ?? []).map(l => l.instanceId)).toEqual([INST])
+        config.settings.skipBorg = true
+        h.change(doc => { doc.instanceDB[INST as InstanceID].status = 'Stopped' as any })
+        await backupInstance(h, INST as InstanceID, h.doc()!.diskDB[backupDisk.id] as Disk)
+        expect(await fs.pathExists(lockPath)).toBe(false)
+        expect(h.doc()!.instanceDB[INST as InstanceID].lastBackup).toBeGreaterThan(0)
+        expect(h.doc()!.diskDB[backupDisk.id].backupStaleLocks).toEqual([])
+        await expect(clearBackupLock(h, INST, 'ver-bd')).rejects.toThrow(/no \.backup-in-progress/)
+        const removed = await removeBackupRole(h, 'ver-bd') as any
+        expect(removed.diskTypes).not.toContain('backup')
+    })
 })
