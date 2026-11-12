@@ -210,6 +210,11 @@ describe('sanitise + verify', () => {
 })
 
 const ATLAS_LINE = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP5pJ426w/HVTUBn4wIfxv4XGnRjoQnihRAavat+ww/p atlas-box@grok-bot'
+const KOEN_LINE = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMlIyR5gN9KVEOeQl4cAsJOho/2ZprcyXhxTof8BKBQ2 koenswings@Macbook-Air-15.local'
+const WALKER_LINE = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIIyC4cm+Pt+aOqYtDpgwBZ30O5LIUlbvZfshpa/WoE4 walker@idea02'
+const KOEN_FP = 'SHA256:yPqCMHCaXih7uMHxpXd469dAmgkDChOntKkQQVMF90I'
+const ATLAS_FP = 'SHA256:L+pEPj+XrDyBzbKiA9CdsXK9cTuos9EHUSTWKUDfNkg'
+const REQUIRED_LINES = `${KOEN_LINE}\n${ATLAS_LINE}\n`
 const OTHER_LINE = `ssh-ed25519 ${Buffer.concat([Buffer.from([0, 0, 0, 11]), Buffer.from('ssh-ed25519'), Buffer.from([0, 0, 0, 32]), Buffer.alloc(32, 7)]).toString('base64')} other@x`
 
 describe('operator SSH login (idea#453, option B)', () => {
@@ -220,34 +225,39 @@ describe('operator SSH login (idea#453, option B)', () => {
     const ctx = (over: object = {}) => ({ root, enginePath: ENGINE, lock: lock(), storeIdentity: storeShas, ...over })
     const problemsOf = async (name: string, over: object = {}) => (await verifyRootfsChecks(ctx(over))).find(x => x.name === name)!.problems.join('\n')
 
-    it('the committed list is public keys only and starts with the Atlas box key', async () => {
+    it('the committed list is public keys only: Koen, Atlas box, idea02 walker (in that order); Koen + Atlas required', async () => {
         const text = await fs.readFile(path.join(ASSETS, OPERATOR_KEYS_ASSET), 'utf8')
         expect(text).not.toMatch(/PRIVATE KEY/)
         const keys = text.split('\n').filter(l => l.trim() && !l.startsWith('#'))
-        expect(keys[0]).toBe(ATLAS_LINE)
-        expect(publicKeyFingerprint(keys[0])).toBe(REQUIRED_OPERATOR_KEY_FPS[0])
-        expect(REQUIRED_OPERATOR_KEY_FPS[0]).toBe('SHA256:L+pEPj+XrDyBzbKiA9CdsXK9cTuos9EHUSTWKUDfNkg')
+        expect(keys).toEqual([KOEN_LINE, ATLAS_LINE, WALKER_LINE])
+        expect(keys.map(publicKeyFingerprint)).toEqual([KOEN_FP, ATLAS_FP, 'SHA256:d0DTf5fVFugD9vBG5DyZxSd+6YQy91Sv3/TLfavbcig'])
+        expect([...REQUIRED_OPERATOR_KEY_FPS]).toEqual([KOEN_FP, ATLAS_FP])
         expect(operatorKeysProblems(text)).toEqual([])
+        // the walker key is allowed, not required
+        expect(operatorKeysProblems(REQUIRED_LINES)).toEqual([])
     })
     it('fingerprints like ssh-keygen -lf; options, junk and a type/blob mismatch are not plain keys', () => {
-        expect(publicKeyFingerprint(ATLAS_LINE)).toBe('SHA256:L+pEPj+XrDyBzbKiA9CdsXK9cTuos9EHUSTWKUDfNkg')
+        expect(publicKeyFingerprint(ATLAS_LINE)).toBe(ATLAS_FP)
+        expect(publicKeyFingerprint(KOEN_LINE)).toBe(KOEN_FP)
         expect(publicKeyFingerprint(`restrict ${ATLAS_LINE}`)).toBeUndefined()
         expect(publicKeyFingerprint(ATLAS_LINE.replace('ssh-ed25519', 'ssh-rsa'))).toBeUndefined()
         expect(publicKeyFingerprint('ssh-ed25519 not*base64')).toBeUndefined()
         expect(operatorKeysProblems(OTHER_LINE).join()).toContain('lacks the required operator key')
         expect(operatorKeysProblems('# only a comment\n').join()).toContain('has no operator key')
-        expect(operatorKeysProblems(`${ATLAS_LINE}\ncommand="x" ${OTHER_LINE}`).join()).toContain('line 2 is not a plain public key')
-        expect(operatorKeysProblems(`${ATLAS_LINE}\n-----BEGIN OPENSSH PRIVATE KEY-----`).join()).toContain('private key material')
+        expect(operatorKeysProblems(`${ATLAS_LINE}\n`).join()).toContain(`lacks the required operator key ${KOEN_FP}`)
+        expect(operatorKeysProblems(`${KOEN_LINE}\n${WALKER_LINE}\n`).join()).toContain(`lacks the required operator key ${ATLAS_FP}`)
+        expect(operatorKeysProblems(`${REQUIRED_LINES}command="x" ${OTHER_LINE}`).join()).toContain('line 3 is not a plain public key')
+        expect(operatorKeysProblems(`${REQUIRED_LINES}-----BEGIN OPENSSH PRIVATE KEY-----`).join()).toContain('private key material')
     })
     it('several operator keys: all required ones must be present, each key once, comments and blank lines allowed', async () => {
         const fpOther = publicKeyFingerprint(OTHER_LINE)!
         const two = `# fleet\n${ATLAS_LINE}\n\n${OTHER_LINE}\n`
-        expect(operatorKeysProblems(two, [REQUIRED_OPERATOR_KEY_FPS[0], fpOther])).toEqual([])
-        expect(operatorKeysProblems(`${ATLAS_LINE}\n`, [REQUIRED_OPERATOR_KEY_FPS[0], fpOther]).join()).toContain(`lacks the required operator key ${fpOther}`)
-        expect(operatorKeysProblems(`${OTHER_LINE}\n`, [REQUIRED_OPERATOR_KEY_FPS[0], fpOther]).join()).toContain('lacks the required operator key SHA256:L+pE')
+        expect(operatorKeysProblems(two, [ATLAS_FP, fpOther])).toEqual([])
+        expect(operatorKeysProblems(`${ATLAS_LINE}\n`, [ATLAS_FP, fpOther]).join()).toContain(`lacks the required operator key ${fpOther}`)
+        expect(operatorKeysProblems(`${OTHER_LINE}\n`, [ATLAS_FP, fpOther]).join()).toContain('lacks the required operator key SHA256:L+pE')
         expect(operatorKeysProblems(`${ATLAS_LINE}\n${ATLAS_LINE.replace('atlas-box@grok-bot', 'copy')}\n`).join()).toContain('line 2 repeats key')
         // the installed file may carry more keys than the required set
-        await fs.writeFile(R(OPERATOR_KEYS_FILE.slice(1)), two)
+        await fs.writeFile(R(OPERATOR_KEYS_FILE.slice(1)), `${REQUIRED_LINES}${WALKER_LINE}\n${OTHER_LINE}\n`)
         expect(await problemsOf('operator-keys')).toBe('')
     })
     it('every required fingerprint is in the committed list', async () => {
@@ -275,7 +285,7 @@ describe('operator SSH login (idea#453, option B)', () => {
         expect(await problemsOf('operator-keys')).toContain('has no operator key')
         await fs.writeFile(f, OTHER_LINE + '\n')
         expect(await problemsOf('operator-keys')).toContain('lacks the required operator key SHA256:L+pE')
-        await fs.writeFile(f, ATLAS_LINE + '\n'); await fs.chmod(f, 0o664)
+        await fs.writeFile(f, REQUIRED_LINES); await fs.chmod(f, 0o664)
         expect(await problemsOf('operator-keys')).toContain('mode 0664, must be 0644')
         await fs.chmod(f, 0o644); await fs.chmod(R(OPERATOR_KEYS_DIR.slice(1)), 0o775)
         expect(await problemsOf('operator-keys')).toContain(`${OPERATOR_KEYS_DIR} mode 0775`)

@@ -40,7 +40,9 @@ No SSH, nothing started, no device identity. Inside `chroot <MNT>`:
    crontabs, udev + root helpers + sudoers + peer access, packages, apps folders. A rebuild with `--lock` whose lock
    has `rpiPackages` installs exactly those versions from archive.raspberrypi.com (it has no snapshots).
 3b. Operator SSH login (idea#453, option B): `script/build_image_assets/idea-operator-keys.pub` (committed fleet
-   operator PUBLIC keys; the Atlas box key `SHA256:L+pEPj+XrDyBzbKiA9CdsXK9cTuos9EHUSTWKUDfNkg` first) is installed
+   operator PUBLIC keys, taken from idea01's `authorized_keys`: Koen's MacBook Air
+   `SHA256:yPqCMHCaXih7uMHxpXd469dAmgkDChOntKkQQVMF90I` and the Atlas box key
+   `SHA256:L+pEPj+XrDyBzbKiA9CdsXK9cTuos9EHUSTWKUDfNkg` (both required by verify), and the idea02 walker key (allowed)) is installed
    as `/etc/ssh/idea_operator_keys/pi` (dir root:root 0755, file root:root 0644), which `10-idea-peer.conf` names in
    `AuthorizedKeysFile` (`/etc/ssh/idea_operator_keys/%u`). `10-idea-login.conf` (sorted before `10-idea-peer.conf`
    and any `50-cloud-init.conf`; the first value wins) sets `PasswordAuthentication no` and

@@ -402,8 +402,15 @@ export const OPERATOR_KEYS_FILE = `${OPERATOR_KEYS_DIR}/pi`
 export const OPERATOR_KEYS_ASSET = 'idea-operator-keys.pub'
 /** The AuthorizedKeysFile token in 10-idea-peer.conf that makes sshd read OPERATOR_KEYS_FILE. */
 export const OPERATOR_KEYS_TOKEN = `${OPERATOR_KEYS_DIR}/%u`
-/** Keys every image must carry (every one must be in the list; order is not checked). The Atlas box key comes first in the list (idea#453). */
-export const REQUIRED_OPERATOR_KEY_FPS = ['SHA256:L+pEPj+XrDyBzbKiA9CdsXK9cTuos9EHUSTWKUDfNkg'] as const
+/**
+ * Keys every image must carry (each must be in the list; order is not checked; more keys are allowed).
+ * idea#453 (Atlas, idea01 authorized_keys 2026-11-12): Koen's MacBook Air, the Atlas box key.
+ * The idea02 walker key is in the list but not required.
+ */
+export const REQUIRED_OPERATOR_KEY_FPS = [
+    'SHA256:yPqCMHCaXih7uMHxpXd469dAmgkDChOntKkQQVMF90I', // koenswings@Macbook-Air-15.local
+    'SHA256:L+pEPj+XrDyBzbKiA9CdsXK9cTuos9EHUSTWKUDfNkg', // atlas-box@grok-bot
+] as const
 /** Key-only sshd drop-in (sorted before the peer drop-in and any 50-cloud-init.conf). */
 export const LOGIN_SSHD_DROPIN = '/etc/ssh/sshd_config.d/10-idea-login.conf'
 export const LOGIN_SSHD_ASSET = '10-idea-login.conf'
