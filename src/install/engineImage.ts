@@ -564,9 +564,81 @@ export interface VerifyContext {
 
 const modeOf = (st: { mode: number }) => '0' + (st.mode & 0o777).toString(8).padStart(3, '0')
 
+/** pi's login shell in the image (idea#453 approach B / build 9). */
+export const PI_LOGIN_SHELL = '/bin/bash'
+/** RPi OS first-boot user-setup / rename wizard (userconf-pi). Masked in the image so it cannot re-lock or rename pi. */
+export const USERCONFIG_UNIT = 'userconfig.service'
+/** sshd banner drop-in written by rename-user; cancel-rename removes it. The build removes it too. */
+export const RENAME_USER_SSHD_DROPIN = '/etc/ssh/sshd_config.d/rename_user.conf'
+/**
+ * Key-only sshd drop-in. Same path as idea#453 PR #334's LOGIN_SSHD_DROPIN; this branch writes the
+ * file only when it is missing, so both PRs can land on the same image.
+ */
+const KEY_ONLY_SSHD_DROPIN = '/etc/ssh/sshd_config.d/10-idea-login.conf'
+
+/** True when the shadow password field is locked (`passwd -S` would show L): a '!' prefix, or '*'. */
+export const shadowPasswordIsLocked = (hash: string): boolean => hash.startsWith('!') || hash === '*'
+
+/** Login shell of <user> in an /etc/passwd file, or undefined if the user is missing. */
+export const passwdShellOf = (passwdText: string, user: string): string | undefined => {
+    const line = passwdText.split('\n').find(l => l.startsWith(user + ':'))
+    return line === undefined ? undefined : line.split(':')[6]
+}
+
+/** Password hash of <user> in an /etc/shadow file, or undefined if the user is missing. */
+export const shadowHashOf = (shadowText: string, user: string): string | undefined => {
+    const line = shadowText.split('\n').find(l => l.startsWith(user + ':'))
+    return line === undefined ? undefined : line.split(':')[1]
+}
+
+/** Masked = /etc/systemd/system/<unit> is a symlink to /dev/null (`systemctl mask`). */
+export const unitMasked = async (root: string, unit: string): Promise<boolean> => {
+    const p = path.join(root, 'etc/systemd/system', unit)
+    if (!(await isSymlink(p))) return false
+    const t = await fs.readlink(p)
+    return t === '/dev/null' || t === '../dev/null' || /(?:^|\/)dev\/null$/.test(t)
+}
+
+/**
+ * idea#453 approach B (build 9): pi must have a bash shell, a locked password (key-only),
+ * userconfig masked, no rename_user banner, and PasswordAuthentication / KbdInteractiveAuthentication no.
+ */
+export const piLoginProblems = async (root: string): Promise<string[]> => {
+    const p: string[] = []
+    const R = (rel: string) => path.join(root, rel)
+    const pwFile = R('etc/passwd')
+    if (!(await fs.pathExists(pwFile))) p.push('/etc/passwd missing')
+    else {
+        const shell = passwdShellOf(await fs.readFile(pwFile, 'utf8'), 'pi')
+        if (shell === undefined) p.push('/etc/passwd has no pi user')
+        else if (shell !== PI_LOGIN_SHELL) p.push(`pi shell is ${shell}, must be ${PI_LOGIN_SHELL}`)
+    }
+    const shFile = R('etc/shadow')
+    if (!(await fs.pathExists(shFile))) p.push('/etc/shadow missing (pi password must be locked)')
+    else {
+        const hash = shadowHashOf(await fs.readFile(shFile, 'utf8'), 'pi')
+        if (hash === undefined) p.push('/etc/shadow has no pi user')
+        else if (!shadowPasswordIsLocked(hash)) p.push('pi password is not locked (passwd -S must show L)')
+    }
+    if (!(await unitMasked(root, USERCONFIG_UNIT))) {
+        p.push(`${USERCONFIG_UNIT} is not masked (must be a symlink to /dev/null so the first-boot wizard cannot re-lock or rename pi)`)
+    }
+    if (await fs.pathExists(R(RENAME_USER_SSHD_DROPIN.slice(1)))) {
+        p.push(`${RENAME_USER_SSHD_DROPIN} present (userconfig rename banner; must be removed)`)
+    }
+    const dropin = R(KEY_ONLY_SSHD_DROPIN.slice(1))
+    if (!(await fs.pathExists(dropin))) p.push(`${KEY_ONLY_SSHD_DROPIN} missing (key-only SSH login)`)
+    else {
+        const t = await fs.readFile(dropin, 'utf8')
+        if (!/^\s*PasswordAuthentication\s+no\s*$/mi.test(t)) p.push(`${KEY_ONLY_SSHD_DROPIN} must set PasswordAuthentication no`)
+        if (!/^\s*KbdInteractiveAuthentication\s+no\s*$/mi.test(t)) p.push(`${KEY_ONLY_SSHD_DROPIN} must set KbdInteractiveAuthentication no`)
+    }
+    return p
+}
+
 /** Every check a built rootfs must pass. Returns problems; empty = OK. Read-only. */
 /** verify's checks, in order; the report counts how many passed (VERIFY_CHECKS.length in all). */
-export const VERIFY_CHECKS = ['identity', 'store-identity', 'engine-tree', 'pm2-as-pi', 'enabled-units', 'identity-boot', 'tailscaled-off', 'locked-files', 'permissions', 'npm-tools', 'docker-preload', 'packages', 'no-dev-files', 'lock-in-image', 'ssh-first-boot', 'console-ui', 'operator-keys', 'ssh-no-password'] as const
+export const VERIFY_CHECKS = ['identity', 'store-identity', 'engine-tree', 'pm2-as-pi', 'enabled-units', 'identity-boot', 'tailscaled-off', 'locked-files', 'permissions', 'npm-tools', 'docker-preload', 'packages', 'no-dev-files', 'lock-in-image', 'ssh-first-boot', 'console-ui', 'operator-keys', 'ssh-no-password', 'pi-login'] as const
 export interface VerifyCheckResult { name: string, problems: string[] }
 
 export const verifyRootfs = async (c: VerifyContext): Promise<string[]> => (await verifyRootfsChecks(c)).flatMap(x => x.problems)
@@ -765,6 +837,9 @@ export const verifyRootfsChecks = async (c: VerifyContext): Promise<VerifyCheckR
         for (const m of sshd.inMatch) if (['passwordauthentication', 'kbdinteractiveauthentication', 'challengeresponseauthentication'].includes(m.keyword) && m.value.toLowerCase() !== 'no')
             p.push(`${m.file}: a Match block sets ${m.keyword} ${m.value}`)
     }
+    check('pi-login')
+    // 14. pi can log in with a key: bash shell, password locked, userconfig masked, password auth off (idea#453 approach B)
+    p.push(...await piLoginProblems(c.root))
     return results
 }
 
