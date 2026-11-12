@@ -3,9 +3,11 @@
  *
  * The snapshot leaves out the union of the live and the new compose's x-app.backup.exclude
  * (Steve Q5), rollback and power-loss recovery restore in place with the same list, and a
- * major update that needs a fresh backup takes it itself from the NEW compose: method hook
- * before anything stops (a failed preHook refuses, Q4), method stop inside the one Snapshot
- * stop (Q3). Docker, the helper and backupInstance are injected fakes.
+ * major update that needs a fresh backup takes it itself. idea#458: that backup is of the
+ * CURRENT instance, so its method comes from the live compose, never the new bundle: method
+ * hook before anything stops (a failed preHook refuses, Q4, no fallback), method stop (or an
+ * old version with no hook) inside the one Snapshot stop (Q3). Docker, the helper and
+ * backupInstance are injected fakes.
  */
 import { describe, it, beforeEach, afterEach, expect } from 'vitest'
 import { DocHandle, Repo } from '@automerge/automerge-repo'
@@ -20,7 +22,7 @@ const ME = String(localEngineId)
 const SHA = '69d40e913146ef5937fb89d8a4b4f64c217c9205'
 const ID = 'usage-dashboard-8fhwrslsrq78xtswed4'
 let h: DocHandle<Store>, tmp: string, calls: string[]
-let backups: { composePath: string, instanceStopped: boolean, backupDiskId: string }[]
+let backups: { opts: Record<string, unknown>, backupDiskId: string }[]
 let snapEx: string[][], restoreEx: string[][]
 
 const composeYaml = (version: string, backup?: Record<string, unknown>) => YAML.stringify({
@@ -32,6 +34,8 @@ const hook = {
     preHook: { service: 'collector', command: '/app/scripts/backup-snapshot.sh' },
     exclude: ['keys', 'tailscale', 'tailscale-run'],
 }
+/** idea#458: the old version's own hook (both versions ship one) */
+const oldHook = { ...hook, preHook: { service: 'collector', command: '/app/scripts/old-backup-snapshot.sh' } }
 const inst = () => h.doc().instanceDB[ID as any] as any
 const instDir = () => `${tmp}/instances/${ID}`
 const newCompose = () => `${tmp}/apps/usage-dashboard-1.1/compose.yaml`
@@ -50,7 +54,7 @@ const deps = (over: Partial<UpdateDeps> = {}): Partial<UpdateDeps> => ({
     restoreSnapshot: async (_d, _id, ex) => { calls.push('restore'); restoreEx.push(ex); await fs.writeFile(`${instDir()}/compose.yaml`, composeYaml(SHA, { exclude: ['keys', 'tailscale'] })); return `${tmp}/.idea-quarantine/${ID}-before-restore-x` },
     backup: async (_i, bd, o) => {
         calls.push(o.instanceStopped ? 'backup:in-stop' : 'backup:hook')
-        backups.push({ composePath: o.composePath, instanceStopped: o.instanceStopped, backupDiskId: String(bd.id) })
+        backups.push({ opts: { ...o }, backupDiskId: String(bd.id) })
         h.change(d => { (d.instanceDB[ID as any] as any).lastBackup = Date.now() })
     },
     listSnapshots: async () => ({ snapshots: [{ instanceId: ID as any, sizeBytes: 4096, complete: true }], preUpdateBytes: 4096, quarantineBytes: 0 }),
@@ -112,20 +116,41 @@ describe('updateApp identity (idea#448)', () => {
         expect(calls).toEqual([])
     })
 
-    it('hook-capable new compose: the backup runs from the NEW compose before the stop, then one stop for the snapshot with the union excludes', async () => {
+    it('idea#458 an update that adds a hook (old: no hook, new: hook) backs up in stop mode inside the one Snapshot stop, never with the new hook', async () => {
         linkBackupDisk()
+        // beforeEach: live compose has only an exclude list, the new bundle has method hook
         const r = await updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps())
-        expect(calls).toEqual(['backup:hook', 'stop', 'snapshot', 'reread', 'start'])
-        expect(backups).toEqual([{ composePath: newCompose(), instanceStopped: false, backupDiskId: 'bd1' }])
+        expect(calls).toEqual(['stop', 'backup:in-stop', 'snapshot', 'reread', 'start'])
+        expect(calls.filter(c => c === 'stop')).toHaveLength(1)
+        expect(backups).toEqual([{ opts: { instanceStopped: true }, backupDiskId: 'bd1' }])   // no new-bundle compose is handed over
         // live [keys, tailscale] ∪ new [keys, tailscale, tailscale-run]
         expect(snapEx).toEqual([['data/keys', 'data/tailscale', 'data/tailscale-run']])
         expect(r.snapshotExcludes).toEqual(['data/keys', 'data/tailscale', 'data/tailscale-run'])
-        expect(r.preUpdateBackup).toEqual({ backupDiskId: 'bd1', method: 'hook', duringStop: false })
+        expect(r.preUpdateBackup).toEqual({ backupDiskId: 'bd1', method: 'stop', duringStop: true })
         expect(inst().instanceOf).toBe('usage-dashboard-1.1')
         expect(inst().lastBackup).not.toBeNull()
     })
 
-    it('stop-mode new compose: the backup is taken inside the single Snapshot stop (one stop, Steve Q3)', async () => {
+    it('idea#458 both versions have a hook: the old compose decides, the backup runs as a hook before the stop, then one stop for the snapshot', async () => {
+        linkBackupDisk()
+        await fs.writeFile(`${instDir()}/compose.yaml`, composeYaml(SHA, oldHook))
+        const r = await updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps())
+        expect(calls).toEqual(['backup:hook', 'stop', 'snapshot', 'reread', 'start'])
+        expect(backups).toEqual([{ opts: { instanceStopped: false }, backupDiskId: 'bd1' }])
+        expect(r.preUpdateBackup).toEqual({ backupDiskId: 'bd1', method: 'hook', duringStop: false })
+        expect(inst().instanceOf).toBe('usage-dashboard-1.1')
+    })
+
+    it('idea#458 an update that drops the hook (old: hook, new: stop) still backs up with the old hook before the stop', async () => {
+        linkBackupDisk()
+        await fs.writeFile(`${instDir()}/compose.yaml`, composeYaml(SHA, oldHook))
+        await fs.writeFile(newCompose(), composeYaml('1.1', { exclude: ['keys', 'tailscale'] }))
+        const r = await updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps())
+        expect(calls).toEqual(['backup:hook', 'stop', 'snapshot', 'reread', 'start'])
+        expect(r.preUpdateBackup).toEqual({ backupDiskId: 'bd1', method: 'hook', duringStop: false })
+    })
+
+    it('stop-mode on both sides: the backup is taken inside the single Snapshot stop (one stop, Steve Q3)', async () => {
         linkBackupDisk()
         await fs.writeFile(newCompose(), composeYaml('1.1', { exclude: ['keys', 'tailscale'] }))
         const r = await updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps())
@@ -141,13 +166,17 @@ describe('updateApp identity (idea#448)', () => {
         expect(calls).toEqual(['backup:in-stop', 'snapshot', 'reread', 'start'])
     })
 
-    it('a failed preHook refuses HOOK_FAILED (fallback stop is treated as fail, Q4): no stop, no snapshot, no start', async () => {
+    it('idea#458 a failing OLD hook still refuses HOOK_FAILED (fallback stop is treated as fail, Q4): no fallback, no stop, no snapshot, no start', async () => {
         linkBackupDisk()
+        await fs.writeFile(`${instDir()}/compose.yaml`, composeYaml(SHA, oldHook))   // fallback: 'stop'
         const m = await codeOf(updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps({
             backup: async () => { calls.push('backup:hook'); throw new Error('HOOK_FAILED: preHook exited 2: db locked') },
         })))
-        expect(m).toMatch(/^HOOK_FAILED: preHook exited 2: db locked; nothing was stopped or changed/)
-        expect(calls).toEqual(['backup:hook'])
+        expect(m).toMatch(/^HOOK_FAILED: preHook exited 2: db locked \(the current version's backup hook\); nothing was stopped or changed, and the update does not fall back to a stop-mode backup$/)
+        expect(calls).toEqual(['backup:hook'])   // one attempt, no in-stop retry
+        expect(backups).toEqual([])
+        expect(snapEx).toEqual([])
+        expect(await fs.readFile(`${instDir()}/compose.yaml`, 'utf8')).toBe(composeYaml(SHA, oldHook))   // nothing changed
         expect(inst().status).toBe('Running')
         expect(inst().instanceOf).toBe(`usage-dashboard-${SHA}`)
         const op = Object.values(h.doc().operationDB).find(o => o.kind === 'updateApp')!
@@ -188,6 +217,16 @@ describe('updateApp identity (idea#448)', () => {
 
     it('rollback after a failed health gate restores in place with the same union excludes', async () => {
         linkBackupDisk()
+        const m = await codeOf(updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps({ health: async () => ({ state: 'exited', restartCount: 0 }) })))
+        expect(m).toMatch(/^ROLLED BACK: Health failed/)
+        expect(calls).toEqual(['stop', 'backup:in-stop', 'snapshot', 'reread', 'start', 'down', 'restore', 'reread', 'start'])
+        expect(restoreEx).toEqual([['data/keys', 'data/tailscale', 'data/tailscale-run']])
+        expect(inst().instanceOf).toBe(`usage-dashboard-${SHA}`)
+    })
+
+    it('idea#458 rollback is unchanged when the old hook took the backup: same steps after the backup, same union excludes', async () => {
+        linkBackupDisk()
+        await fs.writeFile(`${instDir()}/compose.yaml`, composeYaml(SHA, oldHook))
         const m = await codeOf(updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps({ health: async () => ({ state: 'exited', restartCount: 0 }) })))
         expect(m).toMatch(/^ROLLED BACK: Health failed/)
         expect(calls).toEqual(['backup:hook', 'stop', 'snapshot', 'reread', 'start', 'down', 'restore', 'reread', 'start'])
@@ -257,7 +296,7 @@ describe('updateApp identity (idea#448)', () => {
             await fs.outputFile(`${bundle()}/data/tailscale-notes.txt`, 'not the identity')
             await fs.outputFile(`${bundle()}/tailscale/README`, 'top-level, not data/tailscale')
             const r = await updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps())
-            expect(calls).toEqual(['backup:hook', 'stop', 'snapshot', 'reread', 'start'])
+            expect(calls).toEqual(['stop', 'backup:in-stop', 'snapshot', 'reread', 'start'])
             expect(r.snapshotExcludes).toEqual(['data/keys', 'data/tailscale', 'data/tailscale-run'])
             expect(inst().instanceOf).toBe('usage-dashboard-1.1')
             expect(await fs.pathExists(`${instDir()}/data/seed/defaults.json`)).toBe(true)

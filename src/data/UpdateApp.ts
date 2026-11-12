@@ -22,10 +22,13 @@
  * Identity (idea#448): the snapshot leaves out the union of the live and the new compose's
  * x-app.backup.exclude (e.g. data/tailscale, data/keys), and restore-snapshot never writes,
  * deletes or moves those paths, so their inodes survive a rollback. A major update that needs
- * a fresh backup takes it here, from the NEW compose's x-app.backup, to a docked Backup Disk
- * linked to the instance: method hook runs before anything is stopped (a failed preHook
- * refuses, HOOK_FAILED; it never falls back to a stop); method stop (or an instance that is
- * not running) runs Borg inside the one Snapshot stop.
+ * a fresh backup takes it here to a docked Backup Disk linked to the instance. It is a backup
+ * of the CURRENT instance, so it uses the current (live) compose's x-app.backup, never the
+ * new bundle's (idea#458: a hook only the new version ships ran inside the old containers,
+ * exit 127): method hook runs the old compose's preHook before anything is stopped (a failed
+ * preHook refuses, HOOK_FAILED; it never falls back to a stop); method stop, no x-app.backup
+ * (an old version without a hook) or an instance that is not running runs Borg inside the
+ * one Snapshot stop.
  *
  * Named Docker volumes of the instance are exported into the snapshot too (helper v5, offline host
  * tar, verified before COMPLETE) and restored on rollback; a previous snapshot is renamed into
@@ -341,7 +344,8 @@ export const updateApp = async (
         })
         if (refusal) throw refusal
         // idea#448: the snapshot leaves out the union of the live and the new compose's
-        // x-app.backup.exclude (Steve Q5); the new compose also decides the backup method.
+        // x-app.backup.exclude (Steve Q5). idea#458: the pre-update backup method comes from the
+        // LIVE compose (a backup of the current instance), never from the new bundle.
         const newCompose = path.join(bundle!.dir, 'compose.yaml')
         const live = await readComposeBackup(path.join(instDir, 'compose.yaml'), 'live')
         const next = await readComposeBackup(newCompose, 'new')
@@ -362,12 +366,12 @@ export const updateApp = async (
         const done: UpdateStep[] = ['Fetch', 'Check']
         const wasUp = inst.status === 'Running' || inst.status === 'Starting'
         // hook: before anything stops; stop (or not running): inside the one Snapshot stop (Steve Q3)
-        const hookFirst = !!backupDisk && wasUp && next.method === 'hook'
+        const hookFirst = !!backupDisk && wasUp && live.method === 'hook'
         const takeBackup = async (instanceStopped: boolean) => {
             updateOperation(storeHandle, opId, { stepLabel: `Pre-update backup to ${backupDisk!.name} (${instanceStopped ? 'inside the snapshot stop' : 'hook, no stop'})` })
-            try { await d.backup(inst, backupDisk!, { composePath: newCompose, instanceStopped }) } catch (e) {
+            try { await d.backup(inst, backupDisk!, { instanceStopped }) } catch (e) {
                 const m = String((e as Error).message)
-                if (/HOOK_FAILED: /.test(m)) throw new UpdateAppError('HOOK_FAILED', `${m.replace(/^.*?HOOK_FAILED: /, '')}; nothing was stopped or changed`)
+                if (/HOOK_FAILED: /.test(m)) throw new UpdateAppError('HOOK_FAILED', `${m.replace(/^.*?HOOK_FAILED: /, '')} (the current version's backup hook); nothing was stopped or changed, and the update does not fall back to a stop-mode backup`)
                 throw new UpdateAppError('BACKUP_FAILED', `the pre-update backup to ${backupDisk!.name} failed: ${m}`)
             }
             preUpdateBackup = { backupDiskId: String(backupDisk!.id), method: instanceStopped ? 'stop' : 'hook', duringStop: instanceStopped }
