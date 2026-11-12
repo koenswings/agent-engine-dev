@@ -76,6 +76,8 @@ export interface AppDataSandbox {
 export interface SandboxOptions {
     /** use the real /usr/bin/borg (when installed) instead of the fake */
     realBorg?: boolean
+    /** with realBorg: this borg binary instead of /usr/bin/borg (e.g. IDEA_TEST_BORG) */
+    borgPath?: string
     /** record, then run the real rsync (REAL_RSYNC, /usr/bin/rsync): needed where --exclude,
      *  --delete and --backup-dir semantics matter (idea#448 snapshot / in-place restore) */
     realRsync?: boolean
@@ -178,7 +180,13 @@ exit \${FAKE_RRSYNC_EXIT:-0}`)
     await fake('borg', `${RECORD('borg', callsDir)}
 case "$1" in
   init) mkdir -p "\${@: -1}" && echo '[repository]' > "\${@: -1}/config" ;;
-  info) if [[ -n "\${FAKE_BORG_INFO:-}" ]]; then echo "$FAKE_BORG_INFO"; else echo '{"archives":[]}'; fi ;;
+  info)
+    # like borg 1.x: without an archive selector (--last/--first/--glob-archives/-a/REPO::ARCHIVE)
+    # \`borg info --json REPO\` prints repository info only, with no "archives" key
+    sel=0
+    for a in "$@"; do case "$a" in --last|--first|--glob-archives|-a|*::*) sel=1 ;; esac; done
+    if [[ \$sel -eq 0 ]]; then echo '{"repository":{"id":"fake","location":"fake"},"encryption":{"mode":"none"},"cache":{"stats":{}}}'
+    elif [[ -n "\${FAKE_BORG_INFO:-}" ]]; then echo "$FAKE_BORG_INFO"; else echo '{"archives":[]}'; fi ;;
   extract) for e in \${FAKE_BORG_EXTRACT:-}; do mkdir -p "$e" && echo restored > "$e/data.txt"; done ;;
   list)
     short=0
@@ -241,6 +249,7 @@ exit \${FAKE_SYSTEMCTL_EXIT:-0}`)
     await fs.ensureDir(path.join(tmp, 'volumes'))
     setConst('MKFS', path.join(bin, 'mkfs.ext4'))
     if (!opts.realBorg) setConst('BORG', path.join(bin, 'borg'))
+    else if (opts.borgPath) setConst('BORG', opts.borgPath)
     setConst('DISKS_DIR', disks)
     setConst('SYSTEM_ROOT', sys)
     setConst('ROOTS_FILE', rootsFile)
