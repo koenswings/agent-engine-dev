@@ -14,7 +14,7 @@ import { DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/dat
 import { Disk } from '../../src/data/Disk.js'
 import { config } from '../../src/data/Config.js'
 import { commands } from '../../src/data/Commands.js'
-import { processBackupDisk } from '../../src/monitors/backupMonitor.js'
+import { processBackupDisk, backupInstance, isBackupActive } from '../../src/monitors/backupMonitor.js'
 import {
     listBackup, verifyBackup, clearBackupLock, removeBackupRole,
     parseBorgListInventory, parseBorgMemberList, instanceRelativeMember,
@@ -22,7 +22,7 @@ import {
 } from '../../src/data/BackupVerify.js'
 import { parseBackupVerifyLists, parseBackupExcludeList } from '../../src/utils/backupExclude.js'
 import { resourceLock, diskKey, instanceKey } from '../../src/utils/ResourceLock.js'
-import { APP_DATA_HELPER_VERSION } from '../../src/utils/appDataHelper.js'
+import { APP_DATA_HELPER_VERSION, borgPresence } from '../../src/utils/appDataHelper.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
 
 const INST = 'inst-ver-1' as InstanceID
@@ -368,6 +368,77 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
         expect(log.some(l => l.startsWith('borg-create'))).toBe(false)
 
         await expect(clearBackupLock(h, INST, 'ver-bd')).rejects.toThrow(/no \.backup-in-progress/)
+    })
+
+    it('clearBackupLock is refused while a backup of that instance is already in progress, and leaves the lock file and store entry untouched', async () => {
+        await seedRepo()
+        const { h, backupDisk } = await storeWithDisks()
+        // Stopped so backupInstance does not try to stop containers.
+        h.change(doc => { doc.instanceDB[INST].status = 'Stopped' as any })
+        const startedAt = Date.now() - 60000
+        const lockPath = `${DISKS_ROOT}/${backupDevice}/backups/${INST}/.backup-in-progress`
+        await fs.writeFile(lockPath, JSON.stringify({ instanceId: INST, startedAt }))
+        await processBackupDisk(h, backupDisk)
+        const staleBefore = JSON.parse(JSON.stringify(h.doc()!.diskDB[backupDisk.id].backupStaleLocks ?? []))
+        expect(staleBefore.map((l: any) => l.instanceId)).toEqual([INST])
+
+        const prevBorgExists = borgPresence.exists
+        borgPresence.exists = () => true
+
+        const hold = path.join(binDir, 'hold-create')
+        await fs.writeFile(hold, '')
+        process.env.FAKE_BORG_HOLD = hold
+        await fs.writeFile(path.join(binDir, 'sudo'), `#!/usr/bin/env bash
+[[ "$1" == -n && "$2" == /usr/local/sbin/idea-app-data ]] || exec /usr/bin/sudo "$@"
+shift 2
+echo "$*" >> "$FAKE_BORG_LOG"
+case "$1" in
+  version) echo "idea-app-data \${FAKE_HELPER_VERSION:-9}" ;;
+  borg-init) mkdir -p "$IDEA_DISKS_ROOT/$2/backups/$3" && echo '[repository]' > "$IDEA_DISKS_ROOT/$2/backups/$3/config" ;;
+  borg-create)
+    while [ -f "$FAKE_BORG_HOLD" ]; do sleep 0.05; done
+    ;;
+esac
+exit 0
+`, { mode: 0o755 })
+
+        const running = backupInstance(h, INST, backupDisk, undefined, 'console-command')
+        const deadline = Date.now() + 5000
+        // Wait until the mutex is held and backupInstance has written its lock
+        // (it overwrites the pre-seeded file), so the snapshot is stable.
+        while (Date.now() < deadline) {
+            if (isBackupActive(INST) && await fs.pathExists(lockPath)) {
+                try {
+                    const raw = JSON.parse(await fs.readFile(lockPath, 'utf8'))
+                    if (Number(raw?.startedAt) > startedAt) break
+                } catch { /* lock being rewritten */ }
+            }
+            await new Promise(r => setTimeout(r, 20))
+        }
+        try {
+            if (!isBackupActive(INST)) {
+                const settled = await Promise.race([
+                    running.then(() => 'resolved', (e: any) => `rejected: ${e?.message ?? e}`),
+                    new Promise<string>(r => setTimeout(() => r('still pending'), 20)),
+                ])
+                throw new Error(`backupInstance did not hold the in-memory mutex (promise ${settled})`)
+            }
+            expect(isBackupActive(INST)).toBe(true)
+            expect(await fs.pathExists(lockPath)).toBe(true)
+            const lockBefore = await fs.readFile(lockPath, 'utf8')
+            const staleAtCheck = JSON.parse(JSON.stringify(h.doc()!.diskDB[backupDisk.id].backupStaleLocks ?? []))
+
+            await expect(clearBackupLock(h, INST, 'ver-bd')).rejects.toThrow(
+                `clearBackupLock: a backup of instance ${INST} is already in progress`,
+            )
+            expect(await fs.readFile(lockPath, 'utf8')).toBe(lockBefore)
+            expect(JSON.parse(JSON.stringify(h.doc()!.diskDB[backupDisk.id].backupStaleLocks ?? []))).toEqual(staleAtCheck)
+        } finally {
+            await fs.remove(hold)
+            delete process.env.FAKE_BORG_HOLD
+            borgPresence.exists = prevBorgExists
+            await running
+        }
     })
 
     it('removeBackupRole quarantines backups/, drops BACKUP.yaml, and leaves the App role', async () => {
