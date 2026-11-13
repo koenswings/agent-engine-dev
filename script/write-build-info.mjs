@@ -6,6 +6,7 @@
 // the Engine skips that check.
 import { execFileSync } from 'node:child_process'
 import { mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { dirname } from 'node:path'
 
 const out = process.argv[2] ?? 'dist/build-info.json'
 const git = (...args) => execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
@@ -13,10 +14,10 @@ try {
     const commit = git('rev-parse', 'HEAD')
     const commitTimeS = Number(git('log', '-1', '--format=%ct', 'HEAD'))
     if (!/^[0-9a-f]{40}$/.test(commit) || !Number.isSafeInteger(commitTimeS) || commitTimeS <= 0) throw new Error('unexpected git output')
-    mkdirSync(out.replace(/\/[^/]*$/, '') || '.', { recursive: true })
+    mkdirSync(dirname(out), { recursive: true })   // dirname('build-info.json') is '.', never the file name
     writeFileSync(out, JSON.stringify({ commit, commitTimeMs: commitTimeS * 1000 }) + '\n')
     process.stdout.write(`build-info: ${commit.slice(0, 7)} committed ${new Date(commitTimeS * 1000).toISOString()}\n`)
 } catch (e) {
-    rmSync(out, { force: true })
+    rmSync(out, { force: true, recursive: false })
     process.stdout.write(`build-info: no git commit time (${e?.message ?? e}); the clock floor check is skipped\n`)
 }
