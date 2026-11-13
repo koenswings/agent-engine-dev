@@ -282,17 +282,19 @@ describe('processBackupDisk mirror and createBackupDisk (idea#400)', () => {
         const { storeHandle, backupDisk } = await setup()
         await processBackupDisk(storeHandle, backupDisk)
         const d = storeHandle.doc()!.diskDB[backupDisk.id]
-        expect(d.backupConfig).toEqual({ mode: 'scheduled', links: [INST, 'other-inst'], schedule: { daily: '03:15' } })
+        expect(d.backupConfig).toEqual({ mode: 'scheduled', links: [INST, 'other-inst'], schedule: { daily: '03:15' }, scheduleError: null })
         expect(d.missedRuns).toBe(2)
         expect(d.lastAttempt).toBe(1794447005000)
         expect(JSON.stringify(d)).not.toContain('uptimeCounter')
     })
 
-    it('an invalid schedule mirrors as null', async () => {
+    it('an invalid schedule mirrors as null, with backupConfig.scheduleError for the Console (PR C, #347 call 5)', async () => {
         await fs.writeFile(yamlPath(), BASE_YAML.replace('"03:15"', '"3pm"'))
         const { storeHandle, backupDisk } = await setup()
         await processBackupDisk(storeHandle, backupDisk)
-        expect(storeHandle.doc()!.diskDB[backupDisk.id].backupConfig?.schedule).toBeNull()
+        const cfg = storeHandle.doc()!.diskDB[backupDisk.id].backupConfig
+        expect(cfg?.schedule).toBeNull()
+        expect(cfg?.scheduleError).toMatch(/^BAD_TIME: '3pm' is not a 24-hour time/)
     })
 
     it('a stale lock is recorded as INTERRUPTED once, not on every dock', async () => {

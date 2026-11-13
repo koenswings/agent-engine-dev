@@ -257,6 +257,7 @@ describe('backupInstance cleanup (idea#401)', () => {
         expect(log.some(l => l.startsWith('borg-delete '))).toBe(false)
         expect(log.some(l => l.startsWith('borg-compact '))).toBe(false)
         expect(log.some(l => l.startsWith('borg-list '))).toBe(false)
+        expect(h.doc()!.diskDB['clean-bd' as any].cleaning ?? null).toBeNull() // nothing deleted: no cleaning flag (idea#400)
     })
 
     it('picks the oldest archive that is not in the newest 3, then compact', async () => {
@@ -286,6 +287,10 @@ describe('backupInstance cleanup (idea#401)', () => {
         expect(firstDelete).toBeGreaterThanOrEqual(0)
         expect(firstCompact).toBeGreaterThan(firstDelete)
         expect(log[firstCompact]).toBe(`borg-compact ${backupDevice} ${INST}`)
+        // idea#400 PR C: Disk.cleaning was set while archives were deleted and is cleared again
+        const d = h.doc()!.diskDB['clean-bd' as any]
+        expect(d.cleaning).toBe(false)
+        expect(typeof d.cleaningStartedAt).toBe('number')
     })
 
     it('round-robin deletes across two instances, oldest first', async () => {

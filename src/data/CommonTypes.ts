@@ -116,6 +116,9 @@ export type OperationKind =
  * usb-stick         — a FAT/exFAT stick with a top-level kolibri folder was mounted;
  *                     the Engine starts the docked channel builder (idea#193 §8.2a,
  *                     ChannelBuilderAutoStart.ts). Not an operator cause.
+ * scheduled-backup  — the scheduled Backup Disk tick ran a linked instance's backup (idea#400 PR C,
+ *                     backupScheduler.ts). No caller waits: a held lock records SKIPPED_LOCKED. Crash
+ *                     recovery never retries it (Steve, Q2): the stale lock goes to the idea#446 flow.
  * crash-recovery    — engine restarted with a Pending/Running operation in the store;
  *                     recoverInterruptedOperations() re-queues idempotent ops
  *                     (Operations.ts + start.ts)
@@ -133,6 +136,7 @@ export type OperationCause =
   | 'backup-stale-lock'
   | 'backup-app-docked'
   | 'crash-recovery'
+  | 'scheduled-backup'
   | 'usb-stick'
 
 export interface OperationSubject {
