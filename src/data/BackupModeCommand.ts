@@ -20,6 +20,7 @@ import { chalk } from 'zx'
 import { DocHandle } from '@automerge/automerge-repo'
 import { log, print } from '../utils/utils.js'
 import { Store } from './Store.js'
+import { setBackupOrphanLinks } from './Disk.js'
 import { BackupMode } from './CommonTypes.js'
 import { attachTraceResult } from './SummariseDisk.js'
 import { resourceLock, diskKey } from '../utils/ResourceLock.js'
@@ -127,13 +128,14 @@ export const setBackupMode = async (
             if (!d) return
             if (!d.backupConfig) {
                 d.backupConfig = { mode, links: [...parsed.ids] as any, schedule: schedule ? { daily: schedule.daily } : null, scheduleError }
-                return
+            } else {
+                if (d.backupConfig.mode !== mode) d.backupConfig.mode = mode
+                const daily = schedule?.daily ?? null
+                // undefined (a record from before idea#400) counts as different, so both keys are always present after
+                if (d.backupConfig.schedule === undefined || (d.backupConfig.schedule?.daily ?? null) !== daily) d.backupConfig.schedule = daily ? { daily } : null
+                if (d.backupConfig.scheduleError !== scheduleError) d.backupConfig.scheduleError = scheduleError
             }
-            if (d.backupConfig.mode !== mode) d.backupConfig.mode = mode
-            const daily = schedule?.daily ?? null
-            // undefined (a record from before idea#400) counts as different, so both keys are always present after
-            if (d.backupConfig.schedule === undefined || (d.backupConfig.schedule?.daily ?? null) !== daily) d.backupConfig.schedule = daily ? { daily } : null
-            if (d.backupConfig.scheduleError !== scheduleError) d.backupConfig.scheduleError = scheduleError
+            setBackupOrphanLinks(doc, d.backupConfig)
         })
 
         const result: SetBackupModeResult = {

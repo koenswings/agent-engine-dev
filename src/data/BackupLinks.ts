@@ -26,7 +26,7 @@ import { promises as fsp } from 'fs'
 import { DocHandle } from '@automerge/automerge-repo'
 import { log, print } from '../utils/utils.js'
 import { disksRoot } from './Config.js'
-import { Disk, isSystemDiskRecord } from './Disk.js'
+import { Disk, isSystemDiskRecord, setBackupOrphanLinks } from './Disk.js'
 import { Store, getLocalEngine } from './Store.js'
 import { lookupDiskArg } from './DiskArg.js'
 import { lookupInstanceArg, lookupLocalInstanceArg, describeInstanceCandidates } from './InstanceArg.js'
@@ -178,9 +178,10 @@ export const addBackupLink = async (
             if (!d) return
             if (!d.backupConfig) {
                 d.backupConfig = { mode: parsed.mode, links: links as InstanceID[] }
-                return
+            } else if (!d.backupConfig.links.some(l => String(l) === instanceId)) {
+                d.backupConfig.links.push(instanceId as InstanceID)
             }
-            if (!d.backupConfig.links.some(l => String(l) === instanceId)) d.backupConfig.links.push(instanceId as InstanceID)
+            setBackupOrphanLinks(doc, d.backupConfig)
         })
 
         const result: AddBackupLinkResult = { backupDiskId: disk.id, instanceId, links, added: true, note: BACKUP_LINK_NEXT_BACKUP_NOTE }
@@ -253,6 +254,7 @@ export const removeBackupLink = async (
             for (let i = d.backupConfig.links.length - 1; i >= 0; i--) {
                 if (String(d.backupConfig.links[i]) === instanceId) d.backupConfig.links.splice(i, 1)
             }
+            setBackupOrphanLinks(doc, d.backupConfig)
         })
 
         const repoLeft = await fs.pathExists(repo) ? repo : null
