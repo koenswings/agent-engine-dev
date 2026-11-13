@@ -118,6 +118,68 @@ describe('validateDayHook', () => {
             },
         }), '2026-11-12').ok).toBe(false)
     })
+    it('accepts Nextcloud without workflows and with workflows but no byGroup', () => {
+        expect(validateDayHook(nextcloud(), '2026-11-12').ok).toBe(true)
+        expect(validateDayHook(nextcloud({
+            workflows: { worksheetShares: 1, editShares: 0, fileDropLinks: 0, fileDropUploads: 0, schoolFilesShares: 1 },
+        }), '2026-11-12').ok).toBe(true)
+    })
+    it('accepts Nextcloud workflows.byGroup with singular role keys and plain counts', () => {
+        const r = validateDayHook(nextcloud({
+            workflows: {
+                worksheetShares: 1, editShares: 1, fileDropLinks: 1, fileDropUploads: 1, schoolFilesShares: 1,
+                byGroup: {
+                    worksheetShares: { admin: 0, teacher: 1, learner: 0 },
+                    editShares: { admin: 1, teacher: 0, learner: 0 },
+                    fileDropUploads: { admin: 0, teacher: 1, learner: 0 },
+                    schoolFilesShares: { admin: 0, teacher: 1, learner: 0 },
+                },
+            },
+        }), '2026-11-12')
+        expect(r.ok).toBe(true)
+    })
+    it('accepts a partial workflows.byGroup (only some known metrics)', () => {
+        expect(validateDayHook(nextcloud({
+            workflows: {
+                worksheetShares: 1,
+                byGroup: { worksheetShares: { teacher: 1 } },
+            },
+        }), '2026-11-12').ok).toBe(true)
+    })
+    it('rejects plural role keys in workflows.byGroup', () => {
+        const r = validateDayHook(nextcloud({
+            workflows: {
+                worksheetShares: 1,
+                byGroup: { worksheetShares: { teachers: 1, learner: 0 } },
+            },
+        }), '2026-11-12')
+        expect(r.ok).toBe(false)
+        if (!r.ok) expect(r.error).toMatch(/plural role key 'teachers'/)
+    })
+    it('rejects a negative workflows.byGroup count', () => {
+        const r = validateDayHook(nextcloud({
+            workflows: {
+                editShares: 1,
+                byGroup: { editShares: { admin: 0, teacher: -1, learner: 0 } },
+            },
+        }), '2026-11-12')
+        expect(r.ok).toBe(false)
+        if (!r.ok) expect(r.error).toMatch(/non-negative integer/)
+    })
+    it('rejects {total, beyondSeed} in workflows.byGroup', () => {
+        expect(validateDayHook(nextcloud({
+            workflows: {
+                fileDropUploads: 1,
+                byGroup: {
+                    fileDropUploads: {
+                        admin: { total: 0, beyondSeed: 0 },
+                        teacher: 1,
+                        learner: 0,
+                    },
+                },
+            },
+        }), '2026-11-12').ok).toBe(false)
+    })
 })
 
 describe('validateSampleHook', () => {

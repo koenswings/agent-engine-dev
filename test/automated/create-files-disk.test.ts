@@ -342,11 +342,11 @@ describe('createFilesDisk <diskId> [<shareName…>] (idea#131)', () => {
 })
 
 describe('the chown -h path (idea#131)', () => {
-    it('runs exactly sudo -n /usr/bin/chown -h pi:pi <mount point>, and only on /disks/sd[a-z][12]', async () => {
+    it('runs exactly sudo -n /usr/bin/chown -h pi:pi <mount point>, and only on /disks/sd[a-z][1-9]', async () => {
         expect(SUDO_CHOWN).toBe('/usr/bin/chown')
         expect(chownRootCommand('/disks/sdb1')).toBe('/usr/bin/chown -h pi:pi /disks/sdb1')
-        for (const ok of ['/disks/sda1', '/disks/sdb2', '/disks/sdz1']) expect(SUDO_CHOWN_ROOT.test(ok)).toBe(true)
-        for (const bad of ['/disks', '/disks/', '/disks/sdb3', '/disks/sdb1/', '/disks/sdb1/files', '/disks/old', '/', '/tmp/x', '/disks/../etc']) {
+        for (const ok of ['/disks/sda1', '/disks/sdb2', '/disks/sdb3', '/disks/sdb4', '/disks/sdz1']) expect(SUDO_CHOWN_ROOT.test(ok)).toBe(true)
+        for (const bad of ['/disks', '/disks/', '/disks/sdb10', '/disks/sdb0', '/disks/sdb1/', '/disks/sdb1/files', '/disks/old', '/', '/tmp/x', '/disks/../etc']) {
             expect(SUDO_CHOWN_ROOT.test(bad)).toBe(false)
             await expect(runSudoChownRoot(bad)).rejects.toThrow(/never changed/)
         }

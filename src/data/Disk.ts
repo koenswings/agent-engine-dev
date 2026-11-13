@@ -27,6 +27,13 @@ export interface BackupConfig {
     links: InstanceID[]
 }
 
+/** A leftover .backup-in-progress lock found when a Backup Disk docks or the Engine boots (idea#446). */
+export interface BackupStaleLock {
+    instanceId: InstanceID
+    startedAt: Timestamp | null
+    detectedAt: Timestamp
+}
+
 export interface Disk {
     id: DiskID;                   // The serial number of the disk, or a user-defined id if the disk has no serial number
     name: DiskName;               // The user-defined name of the disk.  Not necessarily unique  
@@ -36,6 +43,8 @@ export interface Disk {
     dockedTo: EngineID | null;    // The engine to which this disk is currently docked. null if it is not docked to an engine
     diskTypes: DiskType[];        // Types detected for this disk (may be multiple); empty until processDisk runs
     backupConfig: BackupConfig | null;  // Set when disk is a Backup Disk; null otherwise
+    /** Stale .backup-in-progress locks found at dock/boot (idea#446). Not auto-retried. null/absent when none or undocked. */
+    backupStaleLocks?: BackupStaleLock[] | null;
     unmountError?: UnmountError | null; // Set when the last undock could not unmount the disk (idea#126); null/absent otherwise
     filesConfig?: FilesConfig | null;   // Set when the disk is a Files Disk (FILES.yaml, idea#131); null otherwise
     sizeBytes?: number | null;          // Docked disks: size in bytes, rounded to MB (idea#131); null when undocked
@@ -146,6 +155,7 @@ export const clearDuplicateDiskRecords = (doc: Store, engineId: EngineID, device
         other.device = null
         other.diskTypes = []
         other.backupConfig = null
+        other.backupStaleLocks = null
         other.filesConfig = null
         other.sizeBytes = null
         other.freeBytes = null
@@ -172,6 +182,7 @@ export const createOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: Engi
                 lastDocked: new Date().getTime() as Timestamp,
                 diskTypes: [],
                 backupConfig: null,
+                backupStaleLocks: null,
                 unmountError: null,
                 filesConfig: null,
                 sizeBytes: null,
@@ -189,6 +200,7 @@ export const createOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: Engi
             disk.lastDocked = new Date().getTime() as Timestamp;
             disk.diskTypes = [];        // reset; will be repopulated by processDisk
             disk.backupConfig = null;   // reset; will be repopulated if Backup Disk
+            disk.backupStaleLocks = null; // reset; processBackupDisk records any locks still on disk (idea#446)
             disk.filesConfig = null;    // reset; will be repopulated if Files Disk (idea#131)
             disk.unmountError = null;   // mounted again: a previous busy unmount no longer applies (idea#126)
         }
@@ -308,6 +320,10 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
         if (!d) return
         d.diskTypes = detectedTypes
         if (!detectedTypes.includes('files') && d.filesConfig != null) d.filesConfig = null
+        if (!detectedTypes.includes('backup')) {
+            if (d.backupConfig != null) d.backupConfig = null
+            if (d.backupStaleLocks != null) d.backupStaleLocks = null
+        }
     })
 
     // Size and free space of every docked disk, on dock (idea#131)

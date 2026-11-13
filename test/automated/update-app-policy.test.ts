@@ -1,6 +1,6 @@
 /** update-app-policy.test.ts — pure rules for updateApp v1 (agent-engine-dev#230). */
 import { describe, it, expect } from 'vitest'
-import { compareVersions, parseVersion, healthTimeoutSeconds, checkUpdate, offerable, healthGate, rollbackPlan, appIdentityProblems, CheckFacts, BACKUP_MAX_AGE_MS } from '../../src/data/UpdateAppPolicy.js'
+import { compareVersions, parseVersion, healthTimeoutSeconds, checkUpdate, offerable, healthGate, rollbackPlan, appIdentityProblems, CheckFacts, BACKUP_MAX_AGE_MS, backupIsDue } from '../../src/data/UpdateAppPolicy.js'
 
 const ok: CheckFacts = { diskDocked: true, busy: false, currentAppId: 'kolibri-0.15.5', newAppId: 'kolibri-0.19.5', sourcePresent: true, sumsValid: true, allowMajor: false, backupAgeMs: null, shortDisks: [] }
 const code = (f: Partial<CheckFacts>) => checkUpdate({ ...ok, ...f })?.code ?? null
@@ -55,6 +55,20 @@ describe('checkUpdate refusals', () => {
         expect(code({ newAppId: 'kolibri-1.0.0', allowMajor: true })).toBe('NEEDS_BACKUP')
         expect(code({ newAppId: 'kolibri-1.0.0', allowMajor: true, backupAgeMs: BACKUP_MAX_AGE_MS + 1 })).toBe('NEEDS_BACKUP')
         expect(code({ newAppId: 'kolibri-1.0.0', allowMajor: true, backupAgeMs: 1000 })).toBeNull()
+    })
+    it('idea#448: a planned in-flow backup satisfies NEEDS_BACKUP; --allow-major is still required; SHA -> 1.x stays major', () => {
+        expect(code({ newAppId: 'kolibri-1.0.0', allowMajor: true, backupPlanned: true })).toBeNull()
+        expect(code({ newAppId: 'kolibri-1.0.0', allowMajor: false, backupPlanned: true })).toBe('MAJOR_NOT_ALLOWED')
+        const sha = { currentAppId: 'usage-dashboard-69d40e913146ef5937fb89d8a4b4f64c217c9205', newAppId: 'usage-dashboard-1.1' }
+        expect(code({ ...sha })).toBe('MAJOR_NOT_ALLOWED')
+        expect(code({ ...sha, allowMajor: true })).toBe('NEEDS_BACKUP')
+        expect(checkUpdate({ ...ok, ...sha, allowMajor: true })?.message).toMatch(/linked to this instance \(updateApp then takes the backup itself\)/)
+        expect(code({ ...sha, allowMajor: true, backupPlanned: true })).toBeNull()
+        expect(backupIsDue(sha.currentAppId, sha.newAppId, null)).toBe(true)
+        expect(backupIsDue(sha.currentAppId, sha.newAppId, 60_000)).toBe(false)
+        expect(backupIsDue(sha.currentAppId, sha.newAppId, BACKUP_MAX_AGE_MS + 1)).toBe(true)
+        expect(backupIsDue('kolibri-0.15.5', 'kolibri-0.19.5', null)).toBe(false)   // not major
+        expect(backupIsDue('kolibri-1.1', 'kolibri-1.0', null)).toBe(false)          // not newer
     })
     it('NO_SPACE names the disk', () => expect(checkUpdate({ ...ok, shortDisks: ['apps-1'] })?.message).toMatch(/NO_SPACE: .*apps-1/))
     it('never offers an App without valid sums (Milkwise today)', () => {

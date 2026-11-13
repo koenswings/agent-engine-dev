@@ -2,6 +2,7 @@ import { storeTag } from './data/StoreScope.js'
 import os from 'os'
 import { enableUsbDeviceMonitor } from './monitors/usbDeviceMonitor.js'
 import { runDiskDetectionSelfCheck, recordDiskDetectionFailure, errorMessage } from './monitors/diskDetection.js'
+import { runIgmpMaxMembershipsSelfCheck } from './monitors/igmpSelfCheck.js'
 import { enableTimeMonitor } from './monitors/timeMonitor.js'
 import { startLiveness, writeLastSeen } from './data/Liveness.js'
 import { $, chalk, fs, sleep } from 'zx'
@@ -245,6 +246,9 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // Read-only and not awaited: it may re-check after a delay.
     runDiskDetectionSelfCheck().catch(e =>
         recordDiskDetectionFailure('selfCheck', `Disk detection self-check crashed: ${errorMessage(e)}`))
+    // idea#467: warn if net.ipv4.igmp_max_memberships is below 1024 (Kolibri zeroconf).
+    // Read-only, no root, never blocks startup. Skipped when IDEA_WATCH_DIR is set.
+    runIgmpMaxMembershipsSelfCheck()
     // Not awaited (startup continues), but a start failure (e.g. `ls /dev/engine`
     // fails) is reported instead of silently disabling disk detection.
     enableUsbDeviceMonitor(storeHandle).catch(e =>

@@ -8,7 +8,7 @@ import { DocHandle, Repo } from '@automerge/automerge-repo'
 import { fs, path, YAML } from 'zx'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
-import { createOrUpdateDisk, processDisk } from '../../src/data/Disk.js'
+import { createOrUpdateDisk, processDisk, setRootDeviceForTests } from '../../src/data/Disk.js'
 import { eraseDisk, setEraseOpsForTests, instancesUsingDisk, composeVolumeHostPaths, instancesUsingDiskMessage, ERASE_STAGING_ROOT } from '../../src/data/EraseDisk.js'
 import { setSystemDiskOpsForTests } from '../../src/data/SystemDisk.js'
 import { CommandLogStore, setCommandLogHandle, addTrace } from '../../src/data/CommandLogStore.js'
@@ -66,10 +66,12 @@ describe('eraseDisk refuses a disk held by another instance (filesMounts / volum
             lsblkSizeSerial: async () => ({ sizeBytes: 32e9, serial: 'FAKE1' }),
         })
         setSystemDiskOpsForTests({ findmntSource: async (mp) => mp === '/' ? '/dev/sda2' : null, pkname: async () => 'sda' })
+        setRootDeviceForTests('sda2')
     })
     afterEach(async () => {
         setEraseOpsForTests(null)
         setSystemDiskOpsForTests(null)
+        setRootDeviceForTests(null)
         setCommandLogHandle(null)
         for (const r of roots.splice(0)) await fs.remove(r).catch(() => {})
         await fs.remove(ERASE_STAGING_ROOT).catch(() => {})

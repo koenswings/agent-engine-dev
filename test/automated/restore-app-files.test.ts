@@ -8,6 +8,7 @@ import { fs } from 'zx'
 import { disksRoot } from '../../src/data/Config.js'
 import { setRootDeviceForTests } from '../../src/data/Disk.js'
 import { ensureAppFilesOnTarget, serviceTarName } from '../../src/data/RestoreAppFiles.js'
+import { legacyServiceImageTarName, serviceImageTarName } from '../../src/data/ImageRef.js'
 
 const disk = (id: string, device: string) => ({ id, name: id, device, dockedTo: 'E', diskTypes: ['app'] }) as any
 const PREV = disk('DISK_prev', 'idea-test-81'), OTHER = disk('DISK_other', 'idea-test-82'), TGT = disk('DISK_tgt', 'idea-test-83')
@@ -47,5 +48,18 @@ describe('ensureAppFilesOnTarget (#189)', () => {
     it('restore onto the same disk it came from: nothing to copy', async () => {
         const r = await ensureAppFilesOnTarget('kolibri-1.0', [], TGT, [TGT])
         expect(r).toEqual({ appMasterFrom: null, servicesCopied: [], servicesMissing: [] })
+    })
+
+    it('a pinned @sha256 ref uses the repo:tag tar name, so copy/move/restore find the file (idea#445)', async () => {
+        const pin = 'sha256:9b5501f0690f02146217595f177496612d107aefd2bd56c181f84c7f1c678139'
+        const pinned = `ghcr.io/koenswings/usage-dashboard-web:1.0@${pin}`
+        expect(serviceTarName(pinned)).toBe(serviceImageTarName(pinned))
+        expect(serviceTarName(pinned)).toBe('ghcr.io_koenswings_usage-dashboard-web:1.0.tar')
+        expect(serviceTarName(pinned)).not.toBe(legacyServiceImageTarName(pinned))
+        await fs.outputFile(`${root(PREV)}/services/${serviceImageTarName(pinned)}`, 'web-tar')
+        const r = await ensureAppFilesOnTarget('usage-dashboard-1.0', [pinned], TGT, [PREV])
+        expect(r.servicesCopied).toEqual(['ghcr.io_koenswings_usage-dashboard-web:1.0.tar'])
+        expect(await fs.readFile(`${root(TGT)}/services/ghcr.io_koenswings_usage-dashboard-web:1.0.tar`, 'utf8')).toBe('web-tar')
+        expect(r.servicesMissing).toEqual([])
     })
 })

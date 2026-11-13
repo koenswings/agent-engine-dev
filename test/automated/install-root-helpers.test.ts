@@ -7,8 +7,8 @@
  *   - the step verifies /usr/bin/borg and `idea-app-data version` and fails loudly
  *   - borgProblem / reportBorgAtStartup name the missing binary and the fix
  */
-import { describe, it, expect, vi } from 'vitest'
-import { installRootHelpers, ensureAptPackages, ROOT_HELPER_PACKAGES } from '../../src/data/Engine.js'
+import { describe, it, expect, vi, afterEach } from 'vitest'
+import { installRootHelpers, ensureAptPackages, ROOT_HELPER_PACKAGES, IGMP_SYSCTL_CONF, IGMP_SYSCTL_ASSET } from '../../src/data/Engine.js'
 import { borgProblem, BORG_PATH, APP_DATA_HELPER_VERSION } from '../../src/utils/appDataHelper.js'
 
 const recordingExec = (opts: { installed?: string[], fail?: RegExp[], version?: string } = {}) => {
@@ -60,6 +60,7 @@ describe('installRootHelpers', () => {
         expect(idx(/visudo -cf \/e\/script\/build_image_assets\/11-engine-files.sudoers/)).toBeGreaterThan(idx(/apt-get install/))
         expect(cmds).toContain('sudo install -o root -g root -m 0755 /e/script/build_image_assets/idea-app-data /usr/local/sbin/idea-app-data')
         expect(cmds).toContain('sudo install -o root -g root -m 0755 /e/script/build_image_assets/idea-erase-disk /usr/local/sbin/idea-erase-disk')
+        expect(cmds).toContain('sudo install -o root -g root -m 0755 /e/script/build_image_assets/idea-usage-settings /usr/local/sbin/idea-usage-settings')
         expect(cmds).toContain('sudo install -d -o pi -g pi -m 0750 /var/lib/idea/usage')
         expect(cmds.some(c => /idea-usage\.tmpfiles\.conf/.test(c))).toBe(true)
         expect(idx(/idea-peer-gate/)).toBeGreaterThan(idx(/idea-app-data \/usr\/local/))
@@ -113,6 +114,47 @@ describe('installRootHelpers applies the DHCP vendor class on every update (idea
         const e = vi.spyOn(console, 'error').mockImplementation(() => undefined)
         try { await expect(installRootHelpers(exec, '/e')).resolves.toBeUndefined() } finally { q.mockRestore(); e.mockRestore() }
         expect(cmds.slice(-1)).toEqual(['sudo -n /usr/local/sbin/idea-app-data version'])
+    })
+})
+
+describe('installRootHelpers applies the IGMP sysctl drop-in on every update (idea#467)', () => {
+    const inst = `sudo install -o root -g root -m 0644 /e/script/build_image_assets/${IGMP_SYSCTL_ASSET} ${IGMP_SYSCTL_CONF}`
+    const apply = `sudo sysctl -p ${IGMP_SYSCTL_CONF}`
+    const imageBuild = process.env.IDEA_IMAGE_BUILD
+    afterEach(() => {
+        if (imageBuild === undefined) delete process.env.IDEA_IMAGE_BUILD
+        else process.env.IDEA_IMAGE_BUILD = imageBuild
+    })
+
+    it('installs 90-idea-igmp.conf and applies it with sysctl -p, before the final checks', async () => {
+        const { exec, cmds } = recordingExec({ installed: ['rsync', 'borgbackup'] })
+        const q = quiet()
+        try { await installRootHelpers(exec, '/e') } finally { q.mockRestore() }
+        const idx = (c: string) => cmds.indexOf(c)
+        expect(idx(inst)).toBeGreaterThanOrEqual(0)
+        expect(idx(apply)).toBeGreaterThan(idx(inst))
+        expect(idx(apply)).toBeLessThan(idx(`test -x ${BORG_PATH}`))
+    })
+    it('runs it again on a second update (idempotent)', async () => {
+        const { exec, cmds } = recordingExec({ installed: ['rsync', 'borgbackup'] })
+        const q = quiet()
+        try { await installRootHelpers(exec, '/e'); await installRootHelpers(exec, '/e') } finally { q.mockRestore() }
+        expect(cmds.filter(c => c === inst)).toHaveLength(2)
+        expect(cmds.filter(c => c === apply)).toHaveLength(2)
+    })
+    it('still installs the file in an image build, but skips sysctl -p (would touch the build host /proc)', async () => {
+        process.env.IDEA_IMAGE_BUILD = '1'
+        const { exec, cmds } = recordingExec({ installed: ['rsync', 'borgbackup'] })
+        const q = quiet()
+        try { await installRootHelpers(exec, '/e') } finally { q.mockRestore() }
+        expect(cmds).toContain(inst)
+        expect(cmds.some(c => c === apply)).toBe(false)
+        expect(cmds.slice(-2)).toEqual([`test -x ${BORG_PATH}`, 'sudo -n /usr/local/sbin/idea-app-data version'])
+    })
+    it('a failing sysctl -p aborts the update so the default of 20 is not left unnoticed', async () => {
+        const { exec } = recordingExec({ installed: ['rsync', 'borgbackup'], fail: [/^sudo sysctl -p \/etc\/sysctl\.d\/90-idea-igmp\.conf$/] })
+        const q = quiet()
+        try { await expect(installRootHelpers(exec, '/e')).rejects.toThrow(/sysctl -p/) } finally { q.mockRestore() }
     })
 })
 

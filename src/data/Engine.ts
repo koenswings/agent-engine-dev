@@ -152,13 +152,15 @@ export interface EraseInProgress {
  *               /usr/local/sbin/idea-flash-card is installed (checked at startup).
  *   clientImages: Engine.clientImages is published.
  *   usageSummaries: this Engine can export usage (idea#411). Advertised even when usageMonitoring is off.
+ *   backupVerify: listBackup, verifyBackup, clearBackupLock, removeBackupRole (idea#446).
+ *   forgetDiskWithInstances: forgetDisk <diskId> --with-instances (idea#466).
  * Written at every startup as a whole new list, with capabilitiesBootedAt set
  * to that startup's lastBooted. A Console counts a capability only when
  * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'usageSummaries']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'usageSummaries', 'backupVerify', 'forgetDiskWithInstances']
 /** idea#201 §10: advertised only when the flash helper is installed (HELPER_MISSING otherwise) */
 export const FLASH_CARD_CAPABILITY = 'flashCard'
 export const FLASH_HELPER_PATH = '/usr/local/sbin/idea-flash-card'
@@ -662,6 +664,32 @@ export const installDhcpVendorClass = async (exec: any, enginePath: string) => {
   }
 }
 
+/** sysctl.d drop-in (idea#467): raise IGMP group memberships so multicast-heavy
+ *  containers (Kolibri zeroconf) do not hit OSError 105 on busy Docker hosts. */
+export const IGMP_SYSCTL_CONF = '/etc/sysctl.d/90-idea-igmp.conf'
+export const IGMP_SYSCTL_ASSET = '90-idea-igmp.conf'
+export const IGMP_MAX_MEMBERSHIPS = 1024
+
+/**
+ * idea#467: write /etc/sysctl.d/90-idea-igmp.conf (net.ipv4.igmp_max_memberships=1024)
+ * and apply it with `sysctl -p` on that file. Idempotent. Root install step only
+ * (no sudoers change; the Engine process never applies sysctl at runtime).
+ * In an image-build chroot (IDEA_IMAGE_BUILD=1) the file is still installed, but
+ * `sysctl -p` is skipped so the bind-mounted /proc cannot change the build host;
+ * systemd-sysctl applies the file at first boot.
+ */
+export const installIgmpSysctl = async (exec: any, enginePath: string) => {
+  print(chalk.blue('  - Installing /etc/sysctl.d/90-idea-igmp.conf...'))
+  await exec`sudo install -o root -g root -m 0644 ${enginePath}/script/build_image_assets/${IGMP_SYSCTL_ASSET} ${IGMP_SYSCTL_CONF}`
+  if (process.env.IDEA_IMAGE_BUILD === '1') {
+    print(chalk.blue('  - Skipping sysctl -p (image build; the file is applied at first boot)'))
+    print(chalk.green(`  - ${IGMP_SYSCTL_CONF} installed`))
+    return
+  }
+  await exec`sudo sysctl -p ${IGMP_SYSCTL_CONF}`
+  print(chalk.green(`  - ${IGMP_SYSCTL_CONF} installed and applied (igmp_max_memberships=${IGMP_MAX_MEMBERSHIPS})`))
+}
+
 /** Installed copy of script/build_image_assets/idea-avahi-lan-only (idea#203). */
 export const AVAHI_LAN_ONLY_HELPER = '/usr/local/sbin/idea-avahi-lan-only'
 export const AVAHI_CONF = '/etc/avahi/avahi-daemon.conf'
@@ -795,7 +823,7 @@ export const ensureAptPackages = async (exec: any, pkgs: string[]): Promise<stri
  * install AND every update (build-engine installUdev, ./install-root-helpers,
  * sync-engine): rsync + borgbackup, the sudoers files, /usr/local/sbin/idea-erase-disk,
  * /usr/local/sbin/idea-app-data, the peer-access parts and the DHCP vendor class
- * (idea#284). `install` overwrites
+ * (idea#284), and the IGMP sysctl drop-in (idea#467). `install` overwrites
  * the helpers with the checkout's copies, so an outdated helper is upgraded.
  * Ends by checking /usr/bin/borg and `idea-app-data version`; throws if either is wrong.
  */
@@ -850,6 +878,12 @@ export const installRootHelpers = async (exec: any, enginePath: string) => {
   print(chalk.blue('  - Installing /etc/tmpfiles.d/idea-usage.conf...'))
   await exec`sudo install -o root -g root -m 0644 ${enginePath}/script/build_image_assets/idea-usage.tmpfiles.conf ${USAGE_TMPFILES_CONF}`
   await exec`sudo systemd-tmpfiles --create ${USAGE_TMPFILES_CONF}`
+  // idea-usage-settings: operator toggle for usageMonitoring (idea#411). Root-owned
+  // COPY, 0755. Not in sudoers: the Engine never calls it; operators and
+  // tools/fleet/usage-monitoring.sh run it as pi. /var/lib/idea/usage is pi:pi.
+  print(chalk.blue('  - Installing idea-usage-settings...'))
+  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-usage-settings ${USAGE_SETTINGS}`
+  print(chalk.green(`  - ${USAGE_SETTINGS} installed`))
   // Per-Pi Engine keys: the forced command for peer keys and the sshd drop-in
   await installPeerAccess(exec, enginePath)
   // DHCP option 60 "idea-engine" (idea#209 D8). Here, not only in build-engine, so
@@ -857,6 +891,10 @@ export const installRootHelpers = async (exec: any, enginePath: string) => {
   // never restarts NM or touches a link. A failure is logged, not fatal: the fleet
   // health check reports an Engine whose drop-in is missing.
   await installDhcpVendorClass(exec, enginePath)
+  // IGMP group limit (idea#467). Here, not only in an image build, so pool
+  // Engines get it from a normal update. Idempotent. Applying sysctl needs
+  // root and is skipped when IDEA_IMAGE_BUILD=1 (chroot /proc is the build host).
+  await installIgmpSysctl(exec, enginePath)
   // Verify, so a broken install stops here and not at the first backup (exit 127)
   try {
     await exec`test -x ${BORG_PATH}`
@@ -876,6 +914,8 @@ export const PEER_SSHD_DROPIN = '/etc/ssh/sshd_config.d/10-idea-peer.conf'
 export const PEER_LEDGER_DIR = '/var/lib/idea-app-data'
 /** Forced command for the usage-export key (idea#412); root-owned COPY, 0755. */
 export const USAGE_EXPORT = '/usr/local/sbin/idea-usage-export'
+/** Operator toggle for usageMonitoring (idea#411); root-owned COPY, 0755. */
+export const USAGE_SETTINGS = '/usr/local/sbin/idea-usage-settings'
 /** Directory of the usage-export authorized_keys file (idea#412); root 0755. */
 export const USAGE_AUTH_DIR = '/etc/ssh/idea_usage_keys'
 /** Usage-export public key file, written only by `idea-app-data install-usage-key`. */

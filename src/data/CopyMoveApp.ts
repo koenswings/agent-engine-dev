@@ -33,10 +33,12 @@ import { createOperation, updateOperation } from './Operations.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
 import { sendCommand } from '../utils/commandUtils.js'
 import { getEngineAddress } from './Network.js'
+import { serviceImageTarName } from './ImageRef.js'
 import { Instance, Status } from './Instance.js'
 import { IPAddress } from './CommonTypes.js'
 import { lookupInstanceArg, describeInstanceCandidates } from './InstanceArg.js'
 import { findExternalLinks, externalLinksMessage, uniqueCopyName, preparedCopyFiles, instanceDirLooksLikeKolibri } from './InstanceCopy.js'
+import { composeDownAt, pruneUnusedInstanceNetworks } from '../utils/instanceNetworks.js'
 import os from 'os'
 import path from 'path'
 
@@ -374,6 +376,7 @@ export const copyApp = async (
         // 5b. rsync service image tars needed by this instance
         //     services/ holds the Docker image tars that startInstance loads via
         //     `docker image load`. Without them the copied instance cannot start.
+        //     Names come from serviceImageTarName (repo:tag, not @sha256; idea#445).
         setCopyStep(4)
         const sourceMountRootCopy = await diskMountRoot(sourceDisk)
         const copyServicesSrcDir = `${sourceMountRootCopy}/services`
@@ -381,7 +384,7 @@ export const copyApp = async (
         if (instance.serviceImages?.length) {
             let servicesDone = 0
             for (const serviceImage of instance.serviceImages) {
-                const tarName = (serviceImage as string).replace(/\//g, '_') + '.tar'
+                const tarName = serviceImageTarName(serviceImage as string)
                 const tarSrc = `${copyServicesSrcDir}/${tarName}`
                 if (await fs.pathExists(tarSrc)) {
                     log(`copyApp: syncing service image ${tarName}`)
@@ -598,6 +601,7 @@ export const moveApp = async (
         // 5b. rsync service image tars needed by this instance
         //     services/ holds the Docker image tars that startInstance loads via
         //     `docker image load`. Without them the moved instance cannot start.
+        //     Names come from serviceImageTarName (repo:tag, not @sha256; idea#445).
         setMoveStep(4)
         const sourceMountRootMove = await diskMountRoot(sourceDisk)
         const moveServicesSrcDir = `${sourceMountRootMove}/services`
@@ -605,7 +609,7 @@ export const moveApp = async (
         if (instance.serviceImages?.length) {
             let servicesDone = 0
             for (const serviceImage of instance.serviceImages) {
-                const tarName = (serviceImage as string).replace(/\//g, '_') + '.tar'
+                const tarName = serviceImageTarName(serviceImage as string)
                 const tarSrc = `${moveServicesSrcDir}/${tarName}`
                 if (await fs.pathExists(tarSrc)) {
                     log(`moveApp: syncing service image ${tarName}`)
@@ -624,6 +628,17 @@ export const moveApp = async (
         //    This MUST succeed before we touch the source record — if cancelled before
         //    this point the source record is untouched and the operator can retry cleanly.
         setMoveStep(5)
+        // idea#468: take down the source compose project (no -v) after the copy
+        // succeeded and BEFORE processInstance, which may auto-start the same
+        // instance id on the target (same compose project name). Named volumes
+        // stay, so a failed register can still restart the source. A down
+        // failure is logged and does not fail the move or roll it back.
+        try {
+            await composeDownAt(instanceSrc, instance.id)
+        } catch (e: any) {
+            log(`moveApp: compose down of source project ${instance.id} failed: ${e?.message ?? e}; volumes were not removed, continuing`)
+        }
+
         log(`moveApp: registering instance ${instance.id} on disk '${targetDisk.name}' (${targetDisk.id})`)
         await processInstance(storeHandle, targetDisk, instance.id)
         partialTarget = false
@@ -657,6 +672,9 @@ export const moveApp = async (
             progressPercent: 100,
             completedAt: Date.now() as Timestamp,
         })
+        try { await pruneUnusedInstanceNetworks(instance.id) } catch (e: any) {
+            log(`moveApp: network prune for ${instance.id}: ${e?.message ?? e}`)
+        }
         log(chalk.green(`moveApp: done — instance ${instance.id} moved to '${targetDisk.name}' (${targetDisk.id})`))
 
     } catch (e: any) {
