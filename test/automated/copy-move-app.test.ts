@@ -73,7 +73,20 @@ vi.mock('../../src/data/Disk.js', async (importOriginal) => {
     }
 })
 
-// Mock Instance lifecycle — no Docker
+// Mock instance compose down / network prune (idea#468) — no real Docker
+const { composeDownAtMock, pruneUnusedInstanceNetworksMock } = vi.hoisted(() => ({
+    composeDownAtMock: vi.fn(async (..._args: any[]) => undefined),
+    pruneUnusedInstanceNetworksMock: vi.fn(async (..._args: any[]) => ({ removed: [], skipped: [], errors: [] })),
+}))
+vi.mock('../../src/utils/instanceNetworks.js', async (importOriginal) => {
+    const actual = await importOriginal<any>()
+    return {
+        ...actual,
+        composeDownAt: (...args: any[]) => composeDownAtMock(...args as [any, ...any[]]),
+        pruneUnusedInstanceNetworks: (...args: any[]) => pruneUnusedInstanceNetworksMock(...args as [any, ...any[]]),
+    }
+})
+
 vi.mock('../../src/data/Instance.js', async (importOriginal) => {
     const actual = await importOriginal<any>()
     return {
@@ -194,7 +207,13 @@ const getMockedFs = async () => (await import('zx')).fs
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('copyApp', () => {
-    beforeEach(() => { vi.clearAllMocks() })
+    beforeEach(() => {
+        vi.clearAllMocks()
+        composeDownAtMock.mockReset()
+        composeDownAtMock.mockImplementation(async () => undefined)
+        pruneUnusedInstanceNetworksMock.mockReset()
+        pruneUnusedInstanceNetworksMock.mockImplementation(async () => ({ removed: [], skipped: [], errors: [] }))
+    })
     afterEach(() => { vi.restoreAllMocks() })
 
     it('creates an operation record with status Done on success', async () => {
@@ -314,7 +333,13 @@ describe('copyApp', () => {
 })
 
 describe('moveApp', () => {
-    beforeEach(() => { vi.clearAllMocks() })
+    beforeEach(() => {
+        vi.clearAllMocks()
+        composeDownAtMock.mockReset()
+        composeDownAtMock.mockImplementation(async () => undefined)
+        pruneUnusedInstanceNetworksMock.mockReset()
+        pruneUnusedInstanceNetworksMock.mockImplementation(async () => ({ removed: [], skipped: [], errors: [] }))
+    })
     afterEach(() => { vi.restoreAllMocks() })
 
     it('creates an operation record with status Done on success', async () => {
@@ -347,6 +372,46 @@ describe('moveApp', () => {
             expect.objectContaining({ id: TARGET_DISK_ID }),
             INSTANCE_ID
         )
+    })
+
+    it('takes down the source compose project (no -v) after a successful copy and before processInstance (idea#468)', async () => {
+        const { handle } = await makeHandle()
+        const { processInstance } = await import('../../src/data/Disk.js')
+        const order: string[] = []
+        composeDownAtMock.mockImplementation(async () => { order.push('down') })
+        vi.mocked(processInstance).mockImplementationOnce(async (handle: any, disk: any, instanceId: any) => {
+            order.push('process')
+            handle.change((doc: any) => {
+                const inst = doc.instanceDB[instanceId]
+                if (inst) { inst.storedOn = disk.id; inst.status = 'Stopped' }
+            })
+            return undefined as any
+        })
+        pruneUnusedInstanceNetworksMock.mockImplementation(async () => { order.push('prune'); return { removed: [], skipped: [], errors: [] } })
+        await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
+        expect(order).toEqual(['down', 'process', 'prune'])
+        expect(composeDownAtMock).toHaveBeenCalledWith(expect.stringContaining(`/instances/${INSTANCE_ID}`), INSTANCE_ID)
+        expect(Object.values(handle.doc().operationDB)[0].status).toBe('Done')
+    })
+
+    it('a failed source compose down does not fail the move or skip processInstance (volumes are kept)', async () => {
+        const { handle } = await makeHandle()
+        const { processInstance } = await import('../../src/data/Disk.js')
+        composeDownAtMock.mockRejectedValueOnce(new Error('compose down failed'))
+        await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
+        expect(vi.mocked(processInstance)).toHaveBeenCalled()
+        expect(Object.values(handle.doc().operationDB)[0].status).toBe('Done')
+    })
+
+    it('does not take the source project down when the copy fails, so rollback can restart the source', async () => {
+        const { handle } = await makeHandle('Running')
+        const { rsyncInstanceData } = await import('../../src/utils/rsync.js')
+        const { startInstance } = await import('../../src/data/Instance.js')
+        vi.mocked(rsyncInstanceData).mockRejectedValueOnce(new Error('rsync (idea-app-data copy exited with code 23: some files vanished)'))
+        await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
+        expect(Object.values(handle.doc().operationDB)[0].status).toBe('Failed')
+        expect(composeDownAtMock).not.toHaveBeenCalled()
+        expect(vi.mocked(startInstance)).toHaveBeenCalled()
     })
 
     it('removes the source instance directory as root through the helper after a successful move (idea#168)', async () => {

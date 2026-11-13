@@ -28,6 +28,7 @@ import { log, print, uuid } from '../utils/utils.js'
 import { disksRoot, usbRoot } from './Config.js'
 import { APP_DATA_HELPER, eraseSlotArgs } from '../utils/appDataHelper.js'
 import { forgetMetaLook } from '../monitors/metaLookCache.js'
+import { pruneUnusedInstanceNetworks } from '../utils/instanceNetworks.js'
 
 /** Same pattern as TEST_DEVICE_PATTERN in usbDeviceMonitor (avoid a circular import). */
 export const SLOT_ERASE_DEVICE_PATTERN = /^idea-test-[0-9]+$/
@@ -71,6 +72,8 @@ export interface EraseOps {
     runSlotErase: (args: EraseSlotArgs) => Promise<{ stdout: string }>
     udevadmSettle: () => Promise<void>
     composeDownV: (instanceDir: string) => Promise<void>
+    /** idea#468: prune unused compose-project networks for this instance, locally. */
+    pruneNetworks: (instanceId: string) => Promise<void>
     lsblkSizeSerial: (wholeDevice: string) => Promise<{ sizeBytes: number; serial: string | null }>
     addDevice: (devicePath: string) => Promise<void>
     /** mountpoint -q; injectable so tests can simulate a still-mounted refusal */
@@ -124,6 +127,7 @@ const defaultOps: EraseOps = {
     composeDownV: async (instanceDir) => {
         await $({ cwd: instanceDir, nothrow: true })`docker compose down -v`
     },
+    pruneNetworks: async (instanceId) => { await pruneUnusedInstanceNetworks(instanceId) },
     lsblkSizeSerial: async (whole) => {
         const size = (await $`lsblk -dn -b -o SIZE /dev/${whole}`.nothrow()).stdout.trim()
         const serial = (await $`lsblk -dn -o SERIAL /dev/${whole}`.nothrow()).stdout.trim()
@@ -453,6 +457,9 @@ export const eraseDisk = async (
                 const instanceDir = await diskPath(disk, 'instances', inst.id)
                 try { await ops.composeDownV(instanceDir) } catch (e: any) {
                     log(`compose down -v for ${inst.id}: ${e.message ?? e}`)
+                }
+                try { await ops.pruneNetworks(inst.id) } catch (e: any) {
+                    log(`network prune for ${inst.id}: ${e.message ?? e}`)
                 }
             }
             // Capture apps on this disk before undock

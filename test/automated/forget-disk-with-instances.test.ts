@@ -230,3 +230,18 @@ describe('forgetDisk --with-instances command trace (idea#466)', () => {
         expect(h.doc()!.instanceDB['updtest-i76major' as any]).toBeUndefined()
     })
 })
+
+describe('forgetDisk --with-instances network prune (idea#468)', () => {
+    it('the command wrapper prunes local unused networks for forgotten instance ids after a successful store edit', async () => {
+        const { promises: fs } = await import('node:fs')
+        const { default: path } = await import('node:path')
+        const src = await fs.readFile(path.join(process.cwd(), 'src/data/Commands.ts'), 'utf8')
+        expect(src).toMatch(/await pruneUnusedInstanceNetworksForIds\(result\.removedInstances\.map/)
+        expect(src).toMatch(/idea#468/)
+        const wrapper = src.slice(src.indexOf('const forgetDiskWrapper'))
+        const withOpt = wrapper.slice(0, wrapper.indexOf('const removed = forgetDisk'))
+        expect(withOpt).toMatch(/forgetDiskWithInstances/)
+        expect(withOpt).toMatch(/pruneUnusedInstanceNetworksForIds/)
+        expect(withOpt.indexOf('forgetDiskWithInstances')).toBeLessThan(withOpt.indexOf('pruneUnusedInstanceNetworksForIds'))
+    })
+})

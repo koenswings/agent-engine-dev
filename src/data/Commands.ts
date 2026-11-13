@@ -29,6 +29,7 @@ import { createFilesDisk } from './CreateFilesDisk.js';
 import { summariseDisk, attachTraceResult } from './SummariseDisk.js';
 import { eraseDisk } from './EraseDisk.js';
 import { ForgetDiskError, WITH_INSTANCES_FLAG, forgetDisk, forgetDiskWithInstances } from './ForgetDisk.js';
+import { pruneUnusedInstanceNetworksForIds } from '../utils/instanceNetworks.js';
 import { removeInstance } from './RemoveInstance.js';
 import { renameInstance } from './RenameInstance.js';
 import { updateApp, parseUpdateAppArgs } from './UpdateApp.js';
@@ -515,6 +516,10 @@ const forgetDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskId: s
     if (opts.length) {
         const result = forgetDiskWithInstances(storeHandle, diskId)
         attachTraceResult(result)
+        // idea#468: prune only this Engine's local unused networks for the
+        // forgotten ids. The store edit is already done; a prune failure is logged
+        // and does not fail the command. Other Engines are not reached.
+        await pruneUnusedInstanceNetworksForIds(result.removedInstances.map(i => String(i.id)))
         print(chalk.green(`Forgot disk record ${result.diskId} and ${result.removedInstances.length} instance record(s)${result.removedInstances.length ? `: ${result.removedInstances.map(i => i.id).join(', ')}` : ''}`))
         return
     }
