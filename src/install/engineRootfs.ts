@@ -21,6 +21,7 @@ import {
     EngineLock, FIRSTBOOT_SCRIPT, FIRSTBOOT_UNIT, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH, PM2_UNIT, PRELOAD_DOCKER_DIR, PRELOAD_NPM_DIR, SSH_REGEN_UNIT, SSH_HOSTKEYS_UNIT, NPM_OFFLINE_ENV,
     firstbootUnitText, pm2UnitText, sshHostKeysUnitText, preloadManifest, readDpkgStatus, rpiArchivePackageNames, sanitiseRootfs, serialiseLock, verifyRootfsChecks,
     IMAGE_SPARSE_PATTERNS, writeBootSshTrigger, PI_LOGIN_SHELL, USERCONFIG_UNIT, RENAME_USER_SSHD_DROPIN,
+    LOGIN_SSHD_ASSET, LOGIN_SSHD_DROPIN, OPERATOR_KEYS_ASSET, OPERATOR_KEYS_DIR, OPERATOR_KEYS_FILE,
 } from './engineImage.js'
 
 export interface Out { stdout: string }
@@ -160,6 +161,14 @@ export const rootfsSteps = (o: RootfsBuildOptions, r: Runner, inst: Installers):
             await inst.installUdev(exec, E)
             await inst.installVarious(exec)
             await inst.installVarious2(exec)
+        } },
+        { name: 'operator SSH keys + key-only sshd (idea#453)', run: async () => {
+            // After installPeerAccess (10-idea-peer.conf names /etc/ssh/idea_operator_keys/%u). Public keys only.
+            const A = `${E}/script/build_image_assets`
+            await exec`install -d -o root -g root -m 0755 ${OPERATOR_KEYS_DIR}`
+            await exec`install -o root -g root -m 0644 ${`${A}/${OPERATOR_KEYS_ASSET}`} ${OPERATOR_KEYS_FILE}`
+            await exec`install -o root -g root -m 0644 ${`${A}/${LOGIN_SSHD_ASSET}`} ${LOGIN_SSHD_DROPIN}`
+            await exec`sshd -t`
         } },
         { name: 'Docker (pinned debs, enabled, not started)', run: async () => {
             await exec`bash ${E}/script/build_image_assets/install-docker-pinned.sh ${E}`
