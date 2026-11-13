@@ -8,7 +8,7 @@ import { startLiveness, writeLastSeen } from './data/Liveness.js'
 import { $, chalk, fs, sleep } from 'zx'
 import { deepPrint, log, print } from './utils/utils.js'
 import { config, peerAccessEnabled, peerStaleMs } from './data/Config.js'
-import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId } from './data/Engine.js'
+import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId, checkBackupCleanupCapability } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
 import { enableHttpMonitor } from './monitors/httpMonitor.js'
 import { enableIdeaLocalPublisher, IdeaLocalPublisher } from './monitors/ideaLocal.js'
@@ -118,6 +118,10 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
 
     log(`Initialising store`)
     const storeHandle = await createServerStore(repo, storeDocId, STORE_DATA_PATH, storeIdentity.templatePath)
+
+    // backupCleanup capability: one helper version check, never fatal (idea#400 §3.1).
+    // Must run before createOrUpdateEngine writes Engine.capabilities.
+    await checkBackupCleanupCapability()
 
     // Create or update the local engine object
     const engine = await createOrUpdateEngine(storeHandle, localEngineId)
