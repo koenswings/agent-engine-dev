@@ -6,7 +6,9 @@ argon_create_file() {
 		sudo rm $1
 	fi
 	sudo touch $1
-	sudo chmod 666 $1
+	# idea#456: 644, not world-writable (this script runs as root, so the writes below still work;
+	# every file made here gets its final mode further down)
+	sudo chmod 644 $1
 }
 argon_check_pkg() {
 	RESULT=$(dpkg-query -W -f='${Status}\n' "$1" 2> /dev/null | grep "installed")
@@ -17,6 +19,14 @@ argon_check_pkg() {
 		echo "OK"
 	fi
 }
+
+# idea#456: RPi.GPIO comes from python3-rpi-lgpio (the rpi-lgpio shim on lgpio / the gpiochip
+# device), not python3-rpi.gpio 0.7.1, which maps /dev/gpiomem and fails on the Pi 5 (RP1:
+# "Cannot determine SOC peripheral base address"). The shim supports every call the daemon
+# below uses (RPI_REVISION, setwarnings, setmode BCM, setup IN with PUD_DOWN, wait_for_edge
+# RISING without bouncetime, input, cleanup) on the Pi 4 and the Pi 5. The package
+# Conflicts with and Provides python3-rpi.gpio, so apt-get removes the old library when it
+# installs the shim. It comes from archive.raspberrypi.com (bookworm, trixie) and Ubuntu.
 
 # Check if Raspbian, Ubuntu, others
 CHECKPLATFORM="Others"
@@ -36,11 +46,10 @@ fi
 if [ "$CHECKPLATFORM" = "Raspbian" ]
 then
 	sudo rpi-eeprom-update -a
-	pkglist=(raspi-gpio python3-rpi.gpio python3-smbus i2c-tools)	
+	pkglist=(raspi-gpio python3-rpi-lgpio python3-smbus i2c-tools)
 else
-	# Todo handle lgpio
 	# Ubuntu has serial and i2c enabled
-	pkglist=(python3-rpi.gpio python3-smbus i2c-tools)
+	pkglist=(python3-rpi-lgpio python3-smbus i2c-tools)
 fi
 
 for curpkg in ${pkglist[@]}; do
@@ -256,6 +265,8 @@ echo "After=multi-user.target" >> $daemonfanservice
 echo '[Service]' >> $daemonfanservice
 echo 'Type=simple' >> $daemonfanservice
 echo "Restart=always" >> $daemonfanservice
+# idea#456: without RestartSec a failing daemon burns the start limit within 1 s
+echo "RestartSec=5" >> $daemonfanservice
 echo "RemainAfterExit=true" >> $daemonfanservice
 echo "ExecStart=/usr/bin/python3 $powerbuttonscript" >> $daemonfanservice
 echo '[Install]' >> $daemonfanservice

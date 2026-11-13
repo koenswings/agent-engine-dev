@@ -57,7 +57,7 @@ vfat/exFAT mount options, store fields and what apps (Nextcloud, Kolibri) see.
 **Status:** Authoritative (idea-usage process on main since #308 / `16c3174`; `/usr/local/sbin/idea-usage-export` is the Python asset, idea#412)  ·  **Maintained by:** Axle
 Field usage monitoring (idea#411 / idea#412): `x-app.usage` hook shape and invocation,
 day/sample/presence JSON schemas, on-disk layout under `/var/lib/idea/usage/`,
-export wire format (`since`, `archive-and-clear`), off switch and `usageSummaries`.
+export wire format (`since`, `archive-and-clear`), off switch (`idea-usage-settings` `on`/`off`/`status`) and `usageSummaries`.
 → [docs/USAGE-CONTRACT.md](USAGE-CONTRACT.md)
 
 ## interfaces.json

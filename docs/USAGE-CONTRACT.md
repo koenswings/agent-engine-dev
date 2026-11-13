@@ -1,10 +1,10 @@
 # idea#411: idea-usage contract (hook runner, store, export)
 
-**Status:** Contract for implementation (WIP)  ·  **Maintained by:** Axle
+**Status:** Authoritative (`idea-usage` on main since [#308](https://github.com/koenswings/agent-engine-dev/pull/308) / `16c3174`; helper v8 shipped (v7 usage-export key plus idea#443 excludes), `APP_DATA_HELPER_VERSION` `'8'`)  ·  **Maintained by:** Axle
 **Audience:** Kid (hooks, #413; dashboard collector, #414), Atlas (helper v7 / keys, #412), Pixel (D2 later, #417)
 **Sources:** [idea PR #410](https://github.com/koenswings/idea/pull/410) (`proposals/2026-11-09-field-usage-monitoring.md`, especially §7.2–§7.6 and §10), [idea#411](https://github.com/koenswings/idea/issues/411), [idea#412](https://github.com/koenswings/idea/issues/412), [idea#413](https://github.com/koenswings/idea/issues/413), Design Review 2026-11-10.
 
-This document is the Engine ⇄ App ⇄ collector contract. Implementation of `idea-usage` is on this branch; helper v7 (idea#412) follows separately. Nothing here is a secret, a key, or a token.
+This document is the Engine ⇄ App ⇄ collector contract. `idea-usage` is on `main` since [#308](https://github.com/koenswings/agent-engine-dev/pull/308). Helper v8 is shipped (`APP_DATA_HELPER_VERSION` is `'8'`): it includes the v7 usage-export key install (idea#412) and `borg-create` excludes (idea#443). Nothing here is a secret, a key, or a token.
 
 Field kits stay pinned at Engine `adfd9d3` until Koen approves idea#374. Proof work is on idea03 or idea04 only — never golden idea01, never idea, never the kits.
 
@@ -65,7 +65,7 @@ The flag means “this Engine build can export usage”. It is advertised even w
 
 The directory `/var/lib/idea/usage/` is created at install, owned by `pi` (0750). Creating the empty directory at install is allowed even when the switch is off. When the switch is off, `idea-usage` checks the file at start and then idles: no sampler, no hooks, no day / sample / presence files written. Existing files are left untouched. The export command returns `disabled` (see §7.4).
 
-`idea-usage` re-reads the file at start, on SIGHUP, and at least once a minute, so a toggle takes effect without restarting pm2. An operator command over SSH (a `tools/fleet` script writing this file, and/or a helper verb that is **not** the forced-command binary) flips the value.
+`idea-usage` re-reads the file at start, on SIGHUP, and at least once a minute, so a toggle takes effect without restarting pm2. The operator helper is root-owned `/usr/local/sbin/idea-usage-settings` (installed by `installRootHelpers` from `script/build_image_assets/idea-usage-settings`). It accepts only `on`, `off` and `status` (via argv or `$SSH_ORIGINAL_COMMAND`). A missing file is `off`; repeating `on` or `off` is idempotent (exit 0, no rewrite when the value is already set; `off` against a missing file creates nothing). It writes only this settings file and never restarts the Engine, any App, or the `idea-usage` process. It is **not** the collector forced-command binary (`idea-usage-export` still accepts only `since` and `archive-and-clear`). Operators call it over SSH through `tools/fleet/usage-monitoring.sh` in the idea repo.
 
 ---
 
@@ -249,7 +249,7 @@ App-specific payload fields sit alongside those three (plus optional `demo`). Nu
 
 These names refine proposal §7.6. Unknown extra keys are ignored (forward compatible); required keys missing from an app that should have them fail the schema.
 
-Role keys are singular everywhere — `admin`, `teacher`, `learner` — in `setup`, `logins` and `office.byGroup`, for every App (never `admins`, `teachers` or `learners`). `setup` and `logins` (and Kolibri `signins`) use `{total, beyondSeed}`: `total` includes demo-seed accounts, `beyondSeed` excludes them. `office.byGroup` holds open counts as plain numbers (`{admin: n, teacher: n, learner: n}`), not `{total, beyondSeed}`. Nextcloud `setup` also keeps `otherGroups`, a map of extra group names to `{total, beyondSeed}`. Kolibri `signins` also carry `sessions` and `minutes` on the same object (`coach` is an extra Kolibri role and uses the same shape).
+Role keys are singular everywhere — `admin`, `teacher`, `learner` — in `setup`, `logins`, `office.byGroup` and Nextcloud `workflows.byGroup`, for every App (never `admins`, `teachers` or `learners`). `setup` and `logins` (and Kolibri `signins`) use `{total, beyondSeed}`: `total` includes demo-seed accounts, `beyondSeed` excludes them. `office.byGroup` holds open counts as plain numbers (`{admin: n, teacher: n, learner: n}`), not `{total, beyondSeed}`. Nextcloud `workflows.byGroup` uses the same plain-number maps. Nextcloud `setup` also keeps `otherGroups`, a map of extra group names to `{total, beyondSeed}`. Kolibri `signins` also carry `sessions` and `minutes` on the same object (`coach` is an extra Kolibri role and uses the same shape).
 
 **Kolibri** (`app: "kolibri"`) — Q3, Q4, Q6:
 
@@ -316,10 +316,18 @@ Role keys are singular everywhere — `admin`, `teacher`, `learner` — in `setu
   },
   "workflows": {
     "worksheetShares": 0, "editShares": 0,
-    "fileDropLinks": 0, "fileDropUploads": 0, "schoolFilesShares": 0
+    "fileDropLinks": 0, "fileDropUploads": 0, "schoolFilesShares": 0,
+    "byGroup": {
+      "worksheetShares": { "admin": 0, "teacher": 0, "learner": 0 },
+      "editShares": { "admin": 0, "teacher": 0, "learner": 0 },
+      "fileDropUploads": { "admin": 0, "teacher": 0, "learner": 0 },
+      "schoolFilesShares": { "admin": 0, "teacher": 0, "learner": 0 }
+    }
   }
 }
 ```
+
+`workflows.byGroup` (idea#431, [app-nextcloud#21](https://github.com/koenswings/app-nextcloud/pull/21)) is additive: a day payload without `workflows`, or with `workflows` but no `byGroup`, stays valid. When present, each of `worksheetShares`, `editShares`, `fileDropUploads` and `schoolFilesShares` is a plain-number map with the same singular role keys as `office.byGroup` (not `{total, beyondSeed}`). `fileDropLinks` has no split.
 
 `office` from the day hook may be incomplete (WOPI rows expire). The Engine prefers its own reduction of that day’s samples when any samples exist (see §5.5). Nextcloud `appsOpened` is omitted for now.
 
@@ -563,17 +571,17 @@ When `usageMonitoring` is `off` (missing file = off):
 
 ## 8. Helper v7 and the key drop-in (idea#412)
 
-Current `main` ships `idea-app-data` **v5** (`APP_DATA_HELPER_VERSION` in `src/utils/appDataHelper.ts`). Open [agent-engine-dev#307](https://github.com/koenswings/agent-engine-dev/pull/307) takes **v6** (partitions 3–9). The usage-export key install (idea#412) is helper **v7** (Atlas). [idea#401](https://github.com/koenswings/idea/issues/401) (borg prune/delete/compact) is tracked separately.
+This change ships `idea-app-data` **v8** (`APP_DATA_HELPER_VERSION` is `'8'` in `src/utils/appDataHelper.ts`), which includes the usage-export key install (idea#412) and `borg-create` exclude passthrough (idea#443). Steve (19:19 CET, 2026-11-11) assigned v8 to idea#443 and moved [idea#401](https://github.com/koenswings/idea/issues/401) (borg prune/delete/compact) to helper v9.
 
 The usage-pull public key must not live in `~/.ssh/authorized_keys` or `/etc/ssh/idea_authorized_keys/pi`: `sync-peers` rewrites that file in one atomic swap. It must not go through `idea-peer-gate`: every peer Engine key shares that gate, and making export a gate verb would let any kit pull another school’s summaries.
 
 Current drop-in (`script/build_image_assets/10-idea-peer.conf` on `main`):
 
 ```
-AuthorizedKeysFile .ssh/authorized_keys .ssh/authorized_keys2 /etc/ssh/idea_authorized_keys/%u
+AuthorizedKeysFile .ssh/authorized_keys .ssh/authorized_keys2 /etc/ssh/idea_authorized_keys/%u /etc/ssh/idea_usage_keys/%u
 ```
 
-v7 adds `/etc/ssh/idea_usage_keys/%u` to that list without removing the existing entries, installs root-owned `/usr/local/sbin/idea-usage-export`, and writes the public key to root-owned `/etc/ssh/idea_usage_keys/pi` (directory 0755, file 0644, root:root). `sync-peers` does not touch that file.
+That line includes `/etc/ssh/idea_usage_keys/%u` without removing the existing entries. Helper v7 installs root-owned `/usr/local/sbin/idea-usage-export`, and writes the public key to root-owned `/etc/ssh/idea_usage_keys/pi` (directory 0755, file 0644, root:root). `sync-peers` does not touch that file.
 
 The key line (Atlas fills in the sidecar’s own Tailscale IPv4 during the idea#374 window; that is **not** idea’s Engine address `100.115.60.6`):
 
