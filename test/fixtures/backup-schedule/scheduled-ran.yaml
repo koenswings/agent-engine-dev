@@ -1,0 +1,24 @@
+# Scheduled Backup Disk after a run on 12 Nov 2026 02:30 CET (idea#400 fixture).
+# lastRun = 2026-11-12T01:30:05Z; the uptime counter was last written on a later boot.
+mode: scheduled
+schedule:
+  daily: "02:30"
+links:
+  - instanceId: sample-a1b2c3
+    lastBackup: 1794447005000
+  - instanceId: sample-d4e5f6
+    lastBackup: 1794447065000
+lastRun:
+  time: 1794447005000
+  uptimeS: 77405
+  bootId: 6f1c1d1e-0000-4000-8000-000000000001
+lastAttempt: 1794447005000
+missedRuns: 0
+uptimeCounter:
+  bootId: 6f1c1d1e-0000-4000-8000-000000000002
+  baseUptimeS: 0
+  seenUptimeS: 7200
+  carriedS: 9000
+# A key a later Engine may add: writers must keep it (#344 document-preserving writer).
+futureKey:
+  keep: true

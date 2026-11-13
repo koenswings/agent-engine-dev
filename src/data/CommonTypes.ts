@@ -39,6 +39,34 @@ export type UserID = Brand<string, "USERID">
 export type DiskType = 'app' | 'backup' | 'empty' | 'upgrade' | 'files' | 'system'
 export type BackupMode = 'immediate' | 'on-demand' | 'scheduled'
 
+/**
+ * Per-instance backup result code in Instance.lastResult / backupHistory (idea#400 contract,
+ * Steve's decisions 13 Nov 2026). HOOK_POST_WARNING is a success with a warning.
+ * Written from PR B on; the type lands first (PR A, type only).
+ */
+export type BackupResultCode =
+  | 'OK'
+  | 'HOOK_POST_WARNING'
+  | 'SKIPPED_LOCKED'
+  | 'HOOK_FALLBACK'
+  | 'INTERRUPTED'
+  | 'BACKUP_DISK_FULL'
+  | 'HELPER_OUTDATED'
+  | 'APP_DISK_NOT_DOCKED'
+
+/** The App's backup method that ran (x-app.backup.method), not packed with the result code. */
+export type BackupMethodUsed = 'stop' | 'hook' | 'live' | 'none'
+
+/** One backup result: Instance.lastResult and each Instance.backupHistory entry. */
+export interface BackupResult {
+  time: Timestamp
+  method: BackupMethodUsed
+  result: BackupResultCode
+}
+
+/** Instance.backupHistory keeps the newest this many results (proposal §3.6). */
+export const BACKUP_HISTORY_LENGTH = 7
+
 export type OperationStatus = 'Pending' | 'Running' | 'Done' | 'Failed' | 'Cancelled'
 export type OperationKind =
   | 'copyApp'

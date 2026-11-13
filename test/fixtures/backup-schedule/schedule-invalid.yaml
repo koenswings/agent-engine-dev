@@ -1,0 +1,9 @@
+# Invalid schedules (idea#400 fixture): each entry must be refused by parseBackupSchedule.
+cases:
+  - { daily: "2:30" }
+  - { daily: "24:00" }
+  - { daily: "02:60" }
+  - { daily: 230 }
+  - { cron: "30 2 * * *" }
+  - { daily: "02:30", weekly: "mon" }
+  - "02:30"
