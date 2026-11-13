@@ -18,7 +18,9 @@
  * If `consolePath` is empty, static requests get 404 "Console UI not configured". If it is
  * set but `<consolePath>/index.html` is missing (e.g. mid-rebuild), they get 503 "Console UI
  * not built yet" and the check is repeated on every request, so a Console built after the
- * Engine started is served without a restart (agent-engine-dev#264). /api/* always works.
+ * Engine started is served without a restart (agent-engine-dev#264). /api/* always works:
+ * known routes return JSON, and unknown /api/* paths return a JSON 404 (engine#357)
+ * instead of the Console SPA fallback, so a typo does not look like success.
  *
  * The Console uses /api/store-url as:
  *   GET http://<engine-hostname>/api/store-url
@@ -151,6 +153,15 @@ export const enableHttpMonitor = (
                 res.writeHead(503, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })  // Console on another Pi must see the 503 too
                 res.end(JSON.stringify({ error: 'Command log URL not available yet' }))
             }
+            return
+        }
+
+        // engine#357: unknown /api/* is a JSON 404, never the Console SPA fallback.
+        // Same error shape and CORS header as the 503s above ({ error: string }).
+        const apiPath = (url.split('?')[0] ?? '/')
+        if (apiPath === '/api' || apiPath.startsWith('/api/')) {
+            res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+            res.end(JSON.stringify({ error: 'Not found' }))
             return
         }
 
