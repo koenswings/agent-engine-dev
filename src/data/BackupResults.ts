@@ -38,15 +38,26 @@ export const recordBackupResult = (
 }
 
 /**
- * The code for a backup that completed. One code per result, most important first:
- * the App was briefly stopped (HOOK_FALLBACK), a postHook warning, cleanup skipped on
- * an old helper (HELPER_OUTDATED, the backup itself is good), else OK.
+ * Precedence when one attempt has several outcomes (Steve, #347 call 2): the first listed wins.
+ * BACKUP_DISK_FULL, APP_DISK_NOT_DOCKED and INTERRUPTED are single-outcome failures and never compete.
  */
+export const BACKUP_RESULT_PRECEDENCE: readonly BackupResultCode[] =
+    ['FAILED', 'SKIPPED_LOCKED', 'HOOK_FALLBACK', 'HOOK_POST_WARNING', 'HELPER_OUTDATED', 'OK']
+
+/** The highest-precedence code of `codes` (OK when empty). */
+export const pickResultCode = (codes: readonly BackupResultCode[]): BackupResultCode => {
+    for (const c of BACKUP_RESULT_PRECEDENCE) if (codes.includes(c)) return c
+    return codes.find(c => !BACKUP_RESULT_PRECEDENCE.includes(c)) ?? 'OK'
+}
+
+/** The code for a backup that completed: the App was briefly stopped, a postHook warning, cleanup skipped on an old helper, else OK. */
 export const successResultCode = (o: { hookFallback: boolean, hookWarning: boolean, cleanupHelperOutdated: boolean }): BackupResultCode =>
-    o.hookFallback ? 'HOOK_FALLBACK'
-        : o.hookWarning ? 'HOOK_POST_WARNING'
-            : o.cleanupHelperOutdated ? 'HELPER_OUTDATED'
-                : 'OK'
+    pickResultCode([
+        ...(o.hookFallback ? ['HOOK_FALLBACK' as const] : []),
+        ...(o.hookWarning ? ['HOOK_POST_WARNING' as const] : []),
+        ...(o.cleanupHelperOutdated ? ['HELPER_OUTDATED' as const] : []),
+        'OK',
+    ])
 
 /** The code for a backup that failed, from its error text (leading tokens first). */
 export const failureResultCode = (message: string): BackupResultCode => {
@@ -58,6 +69,6 @@ export const failureResultCode = (message: string): BackupResultCode => {
     return 'FAILED'
 }
 
-/** Causes a person started; a lock held for them refuses with BUSY (Q4). Others record SKIPPED_LOCKED. */
+/** Direct commands with a waiting caller (Console, CLI, a Console command forwarded by another Engine): a held lock refuses with BUSY and records nothing. Every other cause records SKIPPED_LOCKED (Steve, #347 call 4). */
 export const MANUAL_BACKUP_CAUSES: readonly string[] = ['console-command', 'cli-command', 'cross-engine-cmd']
 export const isManualBackupCause = (cause: string): boolean => MANUAL_BACKUP_CAUSES.includes(cause)

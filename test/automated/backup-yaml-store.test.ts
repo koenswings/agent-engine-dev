@@ -27,7 +27,7 @@ import {
     backupYamlIo, setLinkLastBackup, writeBackupScheduleState, readBackupYamlState, parseBackupYamlState,
 } from '../../src/data/BackupYamlDoc.js'
 import { backupLinkIo } from '../../src/data/BackupLinks.js'
-import { applyBackupResult, successResultCode, failureResultCode, isManualBackupCause } from '../../src/data/BackupResults.js'
+import { applyBackupResult, successResultCode, failureResultCode, isManualBackupCause, pickResultCode, BACKUP_RESULT_PRECEDENCE } from '../../src/data/BackupResults.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
 import { config } from '../../src/data/Config.js'
 
@@ -196,6 +196,20 @@ describe('BackupResults', () => {
         expect(failureResultCode('borg exited 2')).toBe('FAILED')
         expect(isManualBackupCause('console-command')).toBe(true)
         expect(isManualBackupCause('backup-app-docked')).toBe(false)
+        expect(isManualBackupCause('disk-docked')).toBe(false)
+        expect(isManualBackupCause('crash-recovery')).toBe(false)
+        expect(isManualBackupCause('cli-command')).toBe(true)
+    })
+
+    it('precedence is FAILED, SKIPPED_LOCKED, HOOK_FALLBACK, HOOK_POST_WARNING, HELPER_OUTDATED, OK (#347 call 2)', () => {
+        expect(BACKUP_RESULT_PRECEDENCE).toEqual(['FAILED', 'SKIPPED_LOCKED', 'HOOK_FALLBACK', 'HOOK_POST_WARNING', 'HELPER_OUTDATED', 'OK'])
+        expect(pickResultCode(['OK', 'HELPER_OUTDATED', 'FAILED', 'SKIPPED_LOCKED'])).toBe('FAILED')
+        expect(pickResultCode(['OK', 'HOOK_FALLBACK', 'SKIPPED_LOCKED'])).toBe('SKIPPED_LOCKED')
+        expect(pickResultCode(['HOOK_POST_WARNING', 'HOOK_FALLBACK'])).toBe('HOOK_FALLBACK')
+        expect(pickResultCode(['HELPER_OUTDATED', 'HOOK_POST_WARNING'])).toBe('HOOK_POST_WARNING')
+        expect(pickResultCode(['OK', 'HELPER_OUTDATED'])).toBe('HELPER_OUTDATED')
+        expect(pickResultCode([])).toBe('OK')
+        expect(pickResultCode(['BACKUP_DISK_FULL'])).toBe('BACKUP_DISK_FULL')
     })
 })
 
@@ -227,6 +241,24 @@ describe('backupInstance results (idea#400)', () => {
         const { storeHandle, backupDisk } = await setup()
         expect(resourceLock.acquire(diskKey(backupDisk.id), 'restoreApp')).toBe(true)
         await backupInstance(storeHandle, INST, backupDisk, undefined, 'backup-app-docked')
+        expect(storeHandle.doc()!.instanceDB[INST].lastResult?.result).toBe('SKIPPED_LOCKED')
+        expect(traces().find(x => x.command === 'backupApp')?.errorMessage).toMatch(/^SKIPPED_LOCKED: /)
+    })
+
+    it('a CLI backupApp while locked is refused with BUSY and records nothing', async () => {
+        const { storeHandle, backupDisk } = await setup()
+        expect(resourceLock.acquire(diskKey(backupDisk.id), 'restoreApp')).toBe(true)
+        await backupInstance(storeHandle, INST, backupDisk, undefined, 'cli-command')
+        expect(traces().find(x => x.command === 'backupApp')?.errorMessage).toMatch(/^BUSY: /)
+        expect(storeHandle.doc()!.instanceDB[INST].lastResult ?? null).toBeNull()
+    })
+
+    it('an immediate-mode dock backup that finds a lock records SKIPPED_LOCKED (#347 call 4)', async () => {
+        await fs.writeFile(yamlPath(), BASE_YAML.replace('mode: scheduled', 'mode: immediate'))
+        const { storeHandle, backupDisk } = await setup()
+        storeHandle.change(doc => { doc.instanceDB[INST].status = 'Running' as any })
+        expect(resourceLock.acquire(diskKey(backupDisk.id), 'restoreApp')).toBe(true)
+        await processBackupDisk(storeHandle, backupDisk)
         expect(storeHandle.doc()!.instanceDB[INST].lastResult?.result).toBe('SKIPPED_LOCKED')
         expect(traces().find(x => x.command === 'backupApp')?.errorMessage).toMatch(/^SKIPPED_LOCKED: /)
     })

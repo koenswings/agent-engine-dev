@@ -73,7 +73,7 @@ A jump is a wall-clock step of more than 2 min between two ticks, compared with 
 ## Locks, retries and catch-up (Steve, 13 Nov)
 
 - Each instance runs through `backupInstance` and takes the same instance lock and Backup Disk lock as a manual `backupApp`. Instances on one disk run one after another.
-- **A manual `backupApp` while a scheduled run holds the lock is refused with `BUSY`.**
+- **A manual `backupApp` (Console or CLI) while a scheduled run holds the lock is refused with `BUSY`.**
 - **A scheduled run that finds a lock held records `SKIPPED_LOCKED`**, then catches up **once, as soon as the lock frees, inside the same day's window**. Otherwise it waits for the next slot.
 - **Retry once on a transient failure, never on a stale lock.** A stale `.backup-in-progress` is reported (`Disk.backupStaleLocks`, `INTERRUPTED`) and left to the idea#446 flow (`clearBackupLock`, then `backupApp`).
 - A manual `backupApp` writes `lastResult` / `backupHistory` but never moves the schedule's `lastRun`.
@@ -86,9 +86,10 @@ The store gets one change per run (and a `clockTrusted` / `clockReason` change o
 - `Disk.freePct`, `clockTrusted`, `clockReason`, `missedRuns`, `lastAttempt`, `cleaning`, `cleaningStartedAt` (all optional and null-safe), plus the existing `backupStaleLocks`.
 - `Instance.lastResult`: `{ time, method, result }`.
 - `Instance.backupHistory`: the newest 7 results, oldest first. `Instance.lastBackup` stays as the last success.
-- `result` is one of `OK`, `HOOK_POST_WARNING` (success with a warning), `SKIPPED_LOCKED`, `HOOK_FALLBACK`, `INTERRUPTED`, `BACKUP_DISK_FULL`, `HELPER_OUTDATED`, `APP_DISK_NOT_DOCKED`, or `FAILED` for any other failure (proposed in PR B, pending Steve).
-- A completed backup with several outcomes gets one code, in this order: `HOOK_FALLBACK`, then `HOOK_POST_WARNING`, then `HELPER_OUTDATED` (cleanup skipped), then `OK`.
-- An invalid `schedule` in BACKUP.yaml is logged and mirrored as null.
+- `result` is one of `OK`, `HOOK_POST_WARNING` (success with a warning), `SKIPPED_LOCKED`, `HOOK_FALLBACK`, `INTERRUPTED`, `BACKUP_DISK_FULL`, `HELPER_OUTDATED`, `APP_DISK_NOT_DOCKED`, or `FAILED` for any other failure (Steve, #347 call 1).
+- One code per attempt, by precedence (Steve, #347 call 2): `FAILED`, `SKIPPED_LOCKED`, `HOOK_FALLBACK`, `HOOK_POST_WARNING`, `HELPER_OUTDATED` (cleanup skipped), `OK`.
+- A held lock: only a direct command with a waiting caller (Console, CLI) is refused with `BUSY` and records nothing. Everything without a caller, including an `immediate`-mode backup on dock, records `SKIPPED_LOCKED` (#347 call 4).
+- An invalid `schedule` in BACKUP.yaml is logged and mirrored as null. **PR C must make it visible with a marker the Console can show** (#347 call 5).
 - `method` is one of `stop`, `hook`, `live`, `none`.
 
 ## `setBackupMode` (draft; lands in PR D, then moves to COMMANDS.md)

@@ -223,8 +223,9 @@ export const backupInstance = async (
         activeBackups.delete(instanceId)
         const held = backupLockKeys.map(k => resourceLock.getLockInfo(k)).find(Boolean)
         const why = `Backup of instance ${instanceId} to disk ${backupDisk.id} not started: the instance or the Backup Disk is locked${held ? ` by '${held.kind}'` : ''} (another operation is running)`
-        // idea#400 Q4: a person's backupApp is refused with BUSY. An automatic trigger records
-        // SKIPPED_LOCKED as the instance's result (the scheduler's catch-up is PR C).
+        // idea#400 Q4 / #347 call 4: a direct command with a waiting caller is refused with BUSY and
+        // records nothing. Anything without a caller (dock, App Disk dock, crash recovery, the
+        // scheduler in PR C) records SKIPPED_LOCKED as the instance's result.
         if (isManualBackupCause(cause)) throw new Error(`BUSY: ${why}`)
         recordBackupResult(storeHandle, instanceId, 'stop', 'SKIPPED_LOCKED')
         throw new Error(`SKIPPED_LOCKED: ${why}`)
@@ -626,7 +627,8 @@ export const processBackupDisk = async (
             if (!instance?.storedOn) continue
             const appDisk = store.diskDB[instance.storedOn]
             if (appDisk?.device) {
-                await triggerBackup(storeHandle, instanceId, backupDisk, 'console-command')
+                // idea#400 (Steve, #347 call 4): no caller waits on a dock backup, so a held lock records SKIPPED_LOCKED
+                await triggerBackup(storeHandle, instanceId, backupDisk, 'disk-docked')
             } else {
                 log(`Instance ${instanceId}: App Disk not docked — backup will trigger when App Disk docks`)
             }

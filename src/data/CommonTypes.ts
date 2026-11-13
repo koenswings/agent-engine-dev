@@ -42,7 +42,7 @@ export type BackupMode = 'immediate' | 'on-demand' | 'scheduled'
 /**
  * Per-instance backup result code in Instance.lastResult / backupHistory (idea#400 contract,
  * Steve's decisions 13 Nov 2026). HOOK_POST_WARNING is a success with a warning.
- * FAILED: any other failure (borg error, bad x-app.backup, …); proposed in PR B, pending Steve.
+ * FAILED: any other failure (borg error, bad x-app.backup, …) (Steve, #347 call 1).
  */
 export type BackupResultCode =
   | 'OK'
@@ -100,7 +100,8 @@ export type OperationKind =
  * post-move         — automatic stop/restart issued by moveApp
  *                     (CopyMoveApp.ts: stop before move, restart on failure)
  * disk-docked       — disk plugged in; engine auto-starts all instances stored on it
- *                     (Disk.ts: tracedStartInstance via processInstance)
+ *                     (Disk.ts: tracedStartInstance via processInstance), and an immediate-mode
+ *                     Backup Disk backs up its links (backupMonitor.ts: processBackupDisk, idea#400)
  * disk-undocked     — disk removed; engine auto-stops all running instances on it
  *                     (usbDeviceMonitor.ts: stopInstance loop)
  * backup-pre-stop   — backup monitor stops instance before taking snapshot
