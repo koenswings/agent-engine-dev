@@ -1,0 +1,5 @@
+# Scheduled Backup Disk, never run yet (idea#400 fixture). No schedule: the 02:30 default applies.
+mode: scheduled
+links:
+  - instanceId: sample-a1b2c3
+    lastBackup: 0

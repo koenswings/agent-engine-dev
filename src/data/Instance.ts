@@ -5,7 +5,7 @@ import { $, YAML, chalk, fs, os, sleep } from "zx";
 $.verbose = false;
 import { ensureNcAdminPassword } from "./AppSecrets.js";
 import { addOrUpdateEnvVariable, deepPrint, log, randomPort, readEnvVariable, uuid, print, isEngineOnline, isHttpPortReady } from "../utils/utils.js";
-import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber, ServiceImage, Timestamp, Version, DeviceName, InstanceName, AppName, Hostname, DiskID, OperationCause, EngineID } from "./CommonTypes.js";
+import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber, ServiceImage, Timestamp, Version, DeviceName, InstanceName, AppName, Hostname, DiskID, OperationCause, EngineID, BackupResult } from "./CommonTypes.js";
 import { createOperation, updateOperation } from './Operations.js'
 import { composeFileEnv } from './FilesMount.js'
 import { appForInstance, instanceUsbSync } from './InstanceApp.js'
@@ -266,6 +266,10 @@ export interface Instance {
   serviceImages: ServiceImage[];
   created: Timestamp;       // We must use a timestamp number as Date objects are not supported in YJS
   lastBackup: Timestamp | null;  // Unix ms of last successful backup; null if never backed up
+  /** Latest backup result, manual or scheduled (idea#400); null/absent when none recorded yet. */
+  lastResult?: BackupResult | null;
+  /** The newest BACKUP_HISTORY_LENGTH (7) results, oldest first (idea#400); null/absent when none. */
+  backupHistory?: BackupResult[] | null;
   lastStarted: Timestamp;   // We must use a timestamp number as Date objects are not supported in YJS
   storedOn: DiskID | null;  // The disk that this instance is stored on. null if we do not know it yet
   /** Step-based progress for start/stop. Null when no active operation. */
