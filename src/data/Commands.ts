@@ -30,6 +30,7 @@ import { DiskArgResult, lookupDiskArg, resolveDiskArg } from './DiskArg.js';
 import { createFilesDisk } from './CreateFilesDisk.js';
 import { summariseDisk, attachTraceResult } from './SummariseDisk.js';
 import { eraseDisk } from './EraseDisk.js';
+import { makeBackupDisk } from './MakeBackupDisk.js';
 import { ForgetDiskError, WITH_INSTANCES_FLAG, forgetDisk, forgetDiskWithInstances } from './ForgetDisk.js';
 import { pruneUnusedInstanceNetworksForIds } from '../utils/instanceNetworks.js';
 import { removeInstance } from './RemoveInstance.js';
@@ -483,6 +484,20 @@ const appFetchResultWrapper = async (_storeHandle: DocHandle<Store> | null, requ
     handleAppFetchResult(requestId, status, why)
 }
 
+
+/**
+ * makeBackupDisk <targetId> [<summaryTraceId> <confirmName…>] (idea#404).
+ * One op: Check, Erase (skipped on an adopted IDEA disk), Re-dock, Create.
+ * Typed confirmation is required only when Erase will run. Capability makeBackupDisk.
+ */
+const makeBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, targetId: string, ...rest: string[]) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    const summaryTraceId = rest.length ? rest[0] : undefined
+    const confirmName = rest.length > 1 ? rest.slice(1).join(' ') : undefined
+    const result = await makeBackupDisk(storeHandle, targetId, summaryTraceId, confirmName)
+    print(chalk.green(`makeBackupDisk: disk ${result.diskId} is now a scheduled Backup Disk`))
+}
+
 /** summariseDisk <diskId|candidateId> (idea#134). Result in CommandTrace.result. */
 const summariseDiskWrapper = async (storeHandle: DocHandle<Store> | null, targetId: string) => {
     if (!storeHandle) throw new Error('Store is not available.')
@@ -658,6 +673,7 @@ export const commands: CommandDefinition[] = [
     { name: "appFetchResult", execute: appFetchResultWrapper, args: [{ type: "string", name: "requestId" }, { type: "string", name: "status" }, { type: "string", name: "why", variadic: true, optional: true }], scope: 'engine' },
     { name: "summariseDisk", execute: summariseDiskWrapper, args: [{ type: "string", name: "targetId" }], scope: 'engine' },
     { name: "eraseDisk", execute: eraseDiskWrapper, args: [{ type: "string", name: "targetId" }, { type: "string", name: "summaryTraceId" }, { type: "string", name: "confirmName", variadic: true }], scope: 'engine' },
+    { name: "makeBackupDisk", execute: makeBackupDiskWrapper, args: [{ type: "string", name: "targetId" }, { type: "string", name: "rest", variadic: true, optional: true }], scope: 'engine' },
     // idea#201 §10 (Engine API contract v2): ids only. Trace arg keys are the contract names.
     { name: "flashCard", execute: async (storeHandle: DocHandle<Store> | null, candidateId: string, version: string, confirmSizeBytes: string) => {
         if (!storeHandle) throw new Error('Store is not available.')
