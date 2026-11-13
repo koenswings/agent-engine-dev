@@ -4,6 +4,21 @@
 echo "Starting boot.sh" > /home/pi/boot.out
 
 FLAG="/boot/MASTER"
+# A clone of the master image carries the master's sticker name in
+# /etc/idea/sticker-name; drop it so this Pi gets its own unique name (idea#184).
+# Done before the flash-time identity below, which may set the name itself.
+if [[ -f $FLAG ]]; then
+  rm -f /etc/idea/sticker-name /home/pi/STICKER.txt
+fi
+
+# Flash-time identity (idea#322): idea-hostname.txt, idea-timezone.txt and the
+# Tailscale key that idea-flash.sh put on the boot partition. Does nothing when
+# none is there. A name it sets is kept by --personalize below (persisted name).
+if [[ -x /usr/local/sbin/idea-engine-identity ]]; then
+  echo "--> Applying flash-time identity" >> /home/pi/boot.out
+  /usr/local/sbin/idea-engine-identity >> /home/pi/boot.out 2>&1 || echo "idea-engine-identity failed" >> /home/pi/boot.out
+fi
+
 if [[ -f $FLAG ]]; then
   echo "*********************************" >> /home/pi/boot.out
   echo "Performing First-Boot Personalization" >> /home/pi/boot.out
@@ -25,9 +40,7 @@ if [[ -f $FLAG ]]; then
   #    the .js imports to .ts sources). /usr/local/bin holds the node from `n`.
   #    Runs as pi (sudo -u pi), not root, so it leaves no root-owned files in the
   #    Engine tree (idea#80). The root steps inside it use sudo themselves.
-  #    A clone of the master image carries the master's sticker name in
-  #    /etc/idea/sticker-name; drop it so this Pi gets its own unique name (idea#184).
-  rm -f /etc/idea/sticker-name /home/pi/STICKER.txt
+  #    The master's sticker name was dropped at the top of this script (idea#184).
   echo "--> Setting hostname and META.yaml via build-engine.ts --personalize" >> /home/pi/boot.out
   (cd /home/pi/idea/agents/agent-engine-dev && sudo -u pi -H env PATH=/usr/local/bin:$PATH ./node_modules/.bin/tsx script/build-engine.ts --personalize) >> /home/pi/boot.out 2>&1
 

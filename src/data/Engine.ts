@@ -154,13 +154,14 @@ export interface EraseInProgress {
  *   usageSummaries: this Engine can export usage (idea#411). Advertised even when usageMonitoring is off.
  *   backupVerify: listBackup, verifyBackup, clearBackupLock, removeBackupRole (idea#446).
  *   forgetDiskWithInstances: forgetDisk <diskId> --with-instances (idea#466).
+ *   backupLinks: addBackupLink, removeBackupLink (idea#451).
  * Written at every startup as a whole new list, with capabilitiesBootedAt set
  * to that startup's lastBooted. A Console counts a capability only when
  * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'usageSummaries', 'backupVerify', 'forgetDiskWithInstances']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'usageSummaries', 'backupVerify', 'forgetDiskWithInstances', 'backupLinks']
 /** idea#201 §10: advertised only when the flash helper is installed (HELPER_MISSING otherwise) */
 export const FLASH_CARD_CAPABILITY = 'flashCard'
 export const FLASH_HELPER_PATH = '/usr/local/sbin/idea-flash-card'
@@ -267,7 +268,9 @@ export const createOrUpdateEngine = async (storeHandle: DocHandle<Store>, engine
   }
 }
 
-export const localEngineId = await getLocalEngineId()
+// IDEA_IMAGE_BUILD=1 (build-engine --root/--rootfs, idea#322): this module is loaded on the image BUILD HOST
+// for its installers only; looking up the Engine id there would create /META.yaml on that host.
+export const localEngineId: EngineID = process.env.IDEA_IMAGE_BUILD === '1' ? undefined as unknown as EngineID : await getLocalEngineId()
 
 /**
  * Remove phantom engine entries from the shared CRDT store.
@@ -828,6 +831,8 @@ export const ensureAptPackages = async (exec: any, pkgs: string[]): Promise<stri
  * Ends by checking /usr/bin/borg and `idea-app-data version`; throws if either is wrong.
  */
 /** tmpfiles.d entry that creates /run/idea-usb at boot (idea#193). */
+/** Installed copy of script/build_image_assets/idea-engine-identity (idea#322). */
+export const ENGINE_IDENTITY_HELPER = '/usr/local/sbin/idea-engine-identity'
 export const USB_TMPFILES_CONF = '/etc/tmpfiles.d/idea-usb.conf'
 /** tmpfiles.d entry that creates /run/idea and /var/lib/idea/usage (idea#411). */
 export const USAGE_TMPFILES_CONF = '/etc/tmpfiles.d/idea-usage.conf'
@@ -850,6 +855,11 @@ export const installRootHelpers = async (exec: any, enginePath: string) => {
   print(chalk.blue('  - Installing idea-write-card-timezone...'))
   await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-write-card-timezone /usr/local/sbin/idea-write-card-timezone`
   print(chalk.green('  - /usr/local/sbin/idea-write-card-timezone installed'))
+  // idea-engine-identity (idea#322): applies the flash-time identity from the boot partition.
+  // Run as root by boot.sh on every boot; root-owned COPY, no sudoers entry (the Engine never calls it).
+  print(chalk.blue('  - Installing idea-engine-identity...'))
+  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-engine-identity ${ENGINE_IDENTITY_HELPER}`
+  print(chalk.green(`  - ${ENGINE_IDENTITY_HELPER} installed`))
   // idea-flash-card: client-card flash helper (idea#201 §10), root-owned COPY, 0755
   print(chalk.blue('  - Installing idea-flash-card...'))
   await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-flash-card ${FLASH_HELPER_PATH}`
