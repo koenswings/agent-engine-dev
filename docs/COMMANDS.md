@@ -214,9 +214,18 @@ Refusal codes (start of the error text): `NOT_FOUND`, `AMBIGUOUS`, `NOT_DOCKED`,
 
 ### `forgetDisk`
 - **Description:** Removes a stale disk record from the shared store (idea#279, idea#282), e.g. the record an older Engine created when it wrote `META.yaml` onto a client SD card. A store edit only: nothing on any disk is read or written. Refused (trace ends as `error`; `error` and `errorMessage` both carry the reason, like other commands) when there is no record with exactly that id (no name fallback, because forgetting cannot be undone), when the record is docked (`dockedTo` or `device` set: eject or unplug it first), or when instance records are still stored on the disk (they would be orphaned; forgetDisk never removes instances). If the disk is an IDEA disk and is plugged in again later, it docks and gets a new record from its `META.yaml` as usual.
-- **Usage:** `forgetDisk <diskId>`, e.g. `forgetDisk 7wt29vdzvj3b2xxt605`
+- **Usage:** `forgetDisk <diskId> [--with-instances]`, e.g. `forgetDisk 7wt29vdzvj3b2xxt605`
+- **`--with-instances` (idea#466):** for a disk that is gone (reflashed, lost), also drops every instance record `storedOn` the disk, in the same store change as the disk record. Still a store edit only: nothing on any disk is read, written or quarantined, and no container is touched. Allowed only when the disk is undocked on every Engine (no `dockedTo` and no `device` on the record) and none of its instances can have a running container anywhere: the instance status in the shared store (written by whichever Engine runs it) must be `Undocked`, `Docked`, `Stopped`, `Missing` or `Error`. Refusals throw `CODE: text`, end the trace as `error` and leave the store untouched:
+  - `NOT_FOUND`: no record with exactly that id (no name fallback).
+  - `DOCKED`: the record has `dockedTo` or `device` set (eject or unplug it first; a record left docked by a reused device name is cleared by an Engine restart since idea#465).
+  - `INSTANCE_RUNNING`: an instance on the disk is `Running`, `Starting` or `Pauzed` (its containers may still exist).
+  - `INSTANCE_STATUS_UNKNOWN`: an instance on the disk has no status or one this Engine does not know, so a running container cannot be ruled out.
+  - `BAD_OPTION`: any option other than `--with-instances`.
+  - `CHANGED`: the store changed between the check and the removal (re-checked inside the change); nothing removed.
+
+  On success the trace `result` is `{ diskId, diskName, removedInstances: [{ id, name, status }] }`. Without the option `forgetDisk` behaves as before (it refuses while instance records exist). `removeInstance` is not relaxed: it still needs the disk docked to this Engine. Any Engine attached to the store that advertises the capability may run it; the Console does not offer it yet. Example: `forgetDisk updtest10i76 --with-instances`.
 - **Scope:** `engine`
-- **Capability:** `forgetDisk`
+- **Capability:** `forgetDisk`; `--with-instances` needs `forgetDiskWithInstances` (idea#466)
 
 ### `reboot`
 - **Description:** Reboots the engine device.
