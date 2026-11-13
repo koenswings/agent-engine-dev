@@ -203,12 +203,17 @@ export interface ClockTrust {
 
 /**
  * Proposal §3.2. Checks run from "certainly wrong" to "not confirmed":
- * before build, before the store, ahead of a synced peer, a jump since sync, never synced.
+ * before build, before the store (only without NTP, #351 call 6), ahead of a synced peer,
+ * a jump since sync, never synced.
  */
 export const evaluateClockTrust = (i: ClockTrustInput): ClockTrust => {
     const untrusted = (clockReason: ClockReason): ClockTrust => ({ clockTrusted: false, clockReason })
     if (i.buildTimeMs != null && i.nowMs < i.buildTimeMs) return untrusted('BEFORE_BUILD')
-    if (i.newestStoreTimeMs != null && i.nowMs < i.newestStoreTimeMs - CLOCK_SKEW_TOLERANCE_MS) return untrusted('BEFORE_STORE')
+    // Steve, #351 call 6: an NTP-synchronised clock clears BEFORE_STORE (a real time source beats
+    // stored timestamps, which may come from a fast peer). A store sync carries no time and
+    // 24 h of uptime cannot fix a clock that is behind, so neither clears it; without NTP it
+    // clears only when the wall clock passes the newest stored timestamp.
+    if (!i.ntpSynced && i.newestStoreTimeMs != null && i.nowMs < i.newestStoreTimeMs - CLOCK_SKEW_TOLERANCE_MS) return untrusted('BEFORE_STORE')
     if (i.syncedPeerNowMs != null && i.nowMs > i.syncedPeerNowMs + PEER_AHEAD_LIMIT_MS) return untrusted('AHEAD_OF_PEER')
     if (i.jumpSinceSync) return untrusted('CLOCK_JUMP')
     if (!i.ntpSynced && !i.peerSynced) return untrusted('NEVER_SYNCED')

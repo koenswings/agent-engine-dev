@@ -103,7 +103,7 @@ uptimeCounter:              # uptime since lastRun, across reboots
 | Reason | When |
 |---|---|
 | `BEFORE_BUILD` | Wall time is before the Engine build time (the git commit time baked in at build, Q12). |
-| `BEFORE_STORE` | Wall time is more than 5 min before the newest store timestamp. |
+| `BEFORE_STORE` | Wall time is more than 5 min before the newest store timestamp, **and NTP has not synchronised the clock** since boot. An NTP sync clears it (a real time source beats stored timestamps). A store (Automerge) or peer sync does not, and neither does 24 h of uptime. Without NTP it clears once the wall clock passes the newest stored timestamp (Steve, #351 call 6). |
 | `AHEAD_OF_PEER` | Wall time is more than 24 h ahead of a synced peer. |
 | `CLOCK_JUMP` | A jump was detected, and trust has not come back yet. It comes back at the next sync **or** after 24 h of uptime with no further jump, whichever comes first (Steve, #346), because a lone school Engine may never sync. A further jump restarts the 24 h. |
 | `NEVER_SYNCED` | Neither NTP (`timedatectl NTPSynchronized`) nor a peer has confirmed the clock since boot. |
@@ -148,7 +148,7 @@ The full reference is in [COMMANDS.md](COMMANDS.md#setbackupmode). In short:
   - the slot firing once, with no store write on an idle tick and one summary change per run;
   - missed days, other Engines, and an invalid schedule;
   - the `SKIPPED_LOCKED` catch-up, retry once, stale locks, and `BUSY` naming the scheduled run;
-  - `NEVER_SYNCED` and the uptime path across a reboot, `BEFORE_BUILD`, `BEFORE_STORE`, and forward and backward jumps;
+  - `NEVER_SYNCED` and the uptime path across a reboot, `BEFORE_BUILD`, `BEFORE_STORE` without NTP and cleared by NTP (#351 call 6), and forward and backward jumps;
   - crash recovery, `Disk.cleaning`, and the build info.
 - **Command tests (PR D):** `test/automated/set-backup-mode.test.ts`: mode and time changes, the schedule rules, a preserved file, the store mirror, no write when nothing changed, and every refusal writing nothing.
 - **Unit tests:** `test/automated/backup-schedule.test.ts` (fake wall, monotonic and uptime clock in `test/harness/fakeScheduleClock.ts`; fixtures in `test/fixtures/backup-schedule/`). They run in `Europe/Brussels` for the DST cases.
