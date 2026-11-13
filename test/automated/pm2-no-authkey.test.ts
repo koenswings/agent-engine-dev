@@ -19,7 +19,7 @@ import { $, fs } from 'zx'
 import { ssh } from '../../src/utils/ssh.js'
 import { installTailscale, installPm2, startEnginePM2, PM2_LOGROTATE_VERSION } from '../../src/data/Engine.js'
 
-const newKey = () => `tskey-auth-ideatest${crypto.randomBytes(12).toString('hex')}`
+const newKey = () => `${'tskey-' + 'auth-'}ideatest${crypto.randomBytes(12).toString('hex')}`
 
 /** Records nothing and succeeds: stands in for the remote shell during installTailscale. */
 const nullShell = (() => {

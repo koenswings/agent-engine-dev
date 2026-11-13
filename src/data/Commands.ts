@@ -23,17 +23,19 @@ import { resourceLock, diskKey } from '../utils/ResourceLock.js';
 import { undockDisk } from "../monitors/usbDeviceMonitor.js";
 import { backupInstance, restoreApp, createBackupDiskConfig, runningBackupOnDisk } from "../monitors/backupMonitor.js";
 import { listBackup, verifyBackup, clearBackupLock, removeBackupRole } from "./BackupVerify.js";
+import { addBackupLink, removeBackupLink } from "./BackupLinks.js";
 import { cancelOperation } from './Operations.js';
 import { DiskArgResult, lookupDiskArg, resolveDiskArg } from './DiskArg.js';
 import { createFilesDisk } from './CreateFilesDisk.js';
 import { summariseDisk, attachTraceResult } from './SummariseDisk.js';
 import { eraseDisk } from './EraseDisk.js';
 import { ForgetDiskError, WITH_INSTANCES_FLAG, forgetDisk, forgetDiskWithInstances } from './ForgetDisk.js';
+import { pruneUnusedInstanceNetworksForIds } from '../utils/instanceNetworks.js';
 import { removeInstance } from './RemoveInstance.js';
 import { renameInstance } from './RenameInstance.js';
 import { updateApp, parseUpdateAppArgs } from './UpdateApp.js';
 import { flashCard, cancelFlash, initialiseDisk } from './FlashCard.js';
-import { testContext } from "../../test/testContext.js";
+import { testContext } from "./TestContext.js";
 
 
 import { BrowserWebSocketClientAdapter } from "@automerge/automerge-repo-network-websocket";
@@ -398,6 +400,24 @@ const removeBackupRoleWrapper = async (storeHandle: DocHandle<Store> | null, dis
 }
 
 /**
+ * addBackupLink <instanceIdOrName> <backupDiskIdOrName> (idea#451). Appends one link to
+ * BACKUP.yaml (other links, mode and unknown keys untouched); no processDisk, no backup.
+ */
+const addBackupLinkWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: string, backupDiskId: string) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    await addBackupLink(storeHandle, instanceArg, backupDiskId)
+}
+
+/**
+ * removeBackupLink <instanceIdOrRawId> <backupDiskIdOrName> (idea#451). Removes one link;
+ * never touches backups/<id>/.
+ */
+const removeBackupLinkWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: string, backupDiskId: string) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    await removeBackupLink(storeHandle, instanceArg, backupDiskId)
+}
+
+/**
  * createFilesDisk <diskId> [<shareName…>] (idea#131). The disk ID only (the
  * command has no old name form); the share name takes the rest of the line and
  * defaults to "School Files". Refusals throw, so the trace ends as `error`.
@@ -501,6 +521,10 @@ const forgetDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskId: s
     if (opts.length) {
         const result = forgetDiskWithInstances(storeHandle, diskId)
         attachTraceResult(result)
+        // idea#468: prune only this Engine's local unused networks for the
+        // forgotten ids. The store edit is already done; a prune failure is logged
+        // and does not fail the command. Other Engines are not reached.
+        await pruneUnusedInstanceNetworksForIds(result.removedInstances.map(i => String(i.id)))
         print(chalk.green(`Forgot disk record ${result.diskId} and ${result.removedInstances.length} instance record(s)${result.removedInstances.length ? `: ${result.removedInstances.map(i => i.id).join(', ')}` : ''}`))
         return
     }
@@ -595,6 +619,8 @@ export const commands: CommandDefinition[] = [
     { name: "verifyBackup", execute: verifyBackupWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }, { type: "string", name: "archive", variadic: true, optional: true }], scope: 'engine' },
     { name: "clearBackupLock", execute: clearBackupLockWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "removeBackupRole", execute: removeBackupRoleWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
+    { name: "addBackupLink", execute: addBackupLinkWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
+    { name: "removeBackupLink", execute: removeBackupLinkWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "createFilesDisk", execute: createFilesDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "shareName", variadic: true, optional: true }], scope: 'engine' },
     { name: "removeInstance", execute: removeInstanceWrapper, args: [{ type: "string", name: "instanceId" }], scope: 'engine' },
     { name: "renameInstance", execute: renameInstanceWrapper, args: [{ type: "string", name: "instanceId" }, { type: "string", name: "newName", variadic: true }], scope: 'engine' },
