@@ -188,7 +188,7 @@ describe('Docker-only paths follow dockerAvailable(), not testMode', () => {
         const inst = h.doc().instanceDB[INST]
         expect(inst.status).toBe('Running')
         expect(inst.port).toBe(18123)
-        expect(docker.calls).toEqual([`docker ps --filter name=${INST} --format {{.Names}}`])
+        expect(docker.calls).toEqual([`docker ps --filter label=com.docker.compose.project=${INST} --format {{.Names}}`])
     })
 
     it('startInstance: no Docker → the shortcut never asks docker ps', async () => {
@@ -196,7 +196,7 @@ describe('Docker-only paths follow dockerAvailable(), not testMode', () => {
         docker.available = false
         docker.running = `${INST}-kolibri-1\n`
         await startInstance(h, h.doc().instanceDB[INST] as any, h.doc().diskDB[DISK] as any).catch(() => undefined)
-        expect(docker.calls.filter(c => c.startsWith('docker ps --filter name='))).toEqual([])
+        expect(docker.calls.filter(c => c.startsWith('docker ps --filter '))).toEqual([])
     })
 
     it('diagnoseInstance: container logs under testMode when Docker answers; only the error without Docker', async () => {

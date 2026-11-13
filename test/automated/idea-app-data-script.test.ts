@@ -363,6 +363,26 @@ describe('idea-app-data: quarantine (idea#347)', () => {
         expect(await fs.pathExists(victim)).toBe(true)
     })
 
+    it('v13 (idea#479): quarantine accepts a legacy dotted id; every other subcommand stays strict; bad dotted forms are refused', async () => {
+        const root = await sb.addDisk('sdb1')
+        const dotted = 'nextcloud-yj8ral61js46bphogbi.backup-20261027-181633'
+        const inst = await sb.addInstance(root, dotted)
+        await fs.writeFile(path.join(inst, 'data.db'), 'keep')
+        refused(await sb.run(['size', 'sdb1', dotted]), /instance id '.*' does not match/)
+        refused(await sb.run(['snapshot', 'sdb1', dotted]), /instance id '.*' does not match/)
+        expect(await fs.pathExists(inst)).toBe(true)
+        const r = await sb.run(['quarantine', 'sdb1', dotted])
+        expect(r.exitCode, r.stderr).toBe(0)
+        const dest = r.stdout.trim()
+        expect(path.dirname(dest)).toBe(path.join(root, '.idea-quarantine'))
+        expect(path.basename(dest)).toMatch(/^nextcloud-yj8ral61js46bphogbi\.backup-20261027-181633-\d{8}T\d{6}Z$/)
+        expect(await fs.pathExists(inst)).toBe(false)
+        expect(await fs.readFile(path.join(dest, 'data.db'), 'utf8')).toBe('keep')
+        for (const id of ['a..b', '.a', 'a.', 'a./b', 'a.b/../c', 'A.b', '-a.b', 'a.-b', 'a b.c', `a.${'x'.repeat(127)}`]) {
+            refused(await sb.run(['quarantine', 'sdb1', id]), /instance id '.*' does not match/)
+        }
+    })
+
     it('has no code path that removes anything under .idea-quarantine', async () => {
         const body = await fs.readFile(path.join(process.cwd(), 'script/build_image_assets/idea-app-data'), 'utf8')
         const block = body.slice(body.indexOf('    quarantine)'), body.indexOf('    borg-init)'))

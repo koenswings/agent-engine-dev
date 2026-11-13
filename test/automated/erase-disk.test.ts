@@ -474,6 +474,41 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
         undockSpy.mockRestore()
     })
 
+    it('idea#479: eraseDisk refuses a disk holding a legacy dotted instance id before any compose, Docker or erase step', async () => {
+        const device = 'idea-test-4'
+        const diskId = 'duration-empty-002'
+        const root = `${DISKS_ROOT}/${device}`
+        await fs.ensureDir(root)
+        await fs.writeFile(path.join(root, 'META.yaml'), YAML.stringify({
+            diskId, diskName: 'Duration Tests — Empty Disk 002', isHardwareId: false, created: 1, version: '1.0',
+        }))
+        roots.push(root)
+        const disk = createOrUpdateDisk(h, LOCAL, device as DeviceName, diskId as DiskID, 'Duration Tests — Empty Disk 002' as DiskName, 1 as Timestamp)
+        await processDisk(h, disk)
+        const dotted = 'nextcloud-yj8ral61js46bphogbi.backup-20261027-181633'
+        h.change(doc => {
+            doc.instanceDB[dotted as any] = { id: dotted, name: 'nc backup', storedOn: diskId, instanceOf: 'nextcloud-1.0', status: 'Stopped' } as any
+        })
+        const tid = putSummary(diskId, 'Duration Tests — Empty Disk 002', null)
+        const downs: string[] = []
+        setEraseOpsForTests({
+            mountedPartitions: async () => [],
+            hiddenTablePartitions: async () => [],
+            runSlotErase: async () => { throw new Error('must not erase') },
+            isMountPoint: async () => false,
+            runScript: async () => { throw new Error('must not erase') },
+            addDevice: async () => {},
+            udevadmSettle: async () => {},
+            composeDownV: async (dir) => { downs.push(dir) },
+            pruneNetworks: async (id) => { downs.push(`prune ${id}`) },
+            lsblkSizeSerial: async () => ({ sizeBytes: 0, serial: null }),
+        })
+        await expect(eraseDisk(h, diskId, tid, 'Duration Tests — Empty Disk 002')).rejects.toThrow(/^INVALID_INSTANCE_ID: .*nextcloud-yj8ral61js46bphogbi\.backup-20261027-181633.*removeInstance first/)
+        expect(downs).toEqual([])
+        expect(h.doc()!.instanceDB[dotted as any]).toBeDefined()
+        expect(h.doc()!.engineDB[LOCAL].eraseInProgress ?? null).toBeNull()
+    })
+
     it('eraseDisk loop slot: still-mounted refusal when umount really fails', async () => {
         const device = 'idea-test-4'
         const diskId = 'duration-empty-002'

@@ -21,6 +21,7 @@ import { DocHandle } from "@automerge/automerge-repo";
 import { CommandLogStore, LogEntry, getCommandLogHandle, liveCommandLogHandle, addTrace, closeTrace, flushLogs } from './CommandLogStore.js'
 import { getActiveTrace, flushTrace } from '../utils/CommandLogger.js'
 import { dockerAvailable } from '../utils/dockerAvailable.js'
+import { composeProjectLabelFilter, containerInInstanceProject } from '../utils/instanceIds.js'
 import { rebindKolibriMorangoInstanceId } from './InstanceCopy.js'
 import { hostIdentity, writeHostIdentityEnv, nextcloudUrl, writeNextcloudUrlEnv, isNextcloudInstance, nextcloudTrustedDomainsBridge, hostNetworkInterfaces } from './HostIdentity.js'
 import { trackInFlight, startDiskGoneReason, dockIdentityOf } from './InstanceInFlight.js'
@@ -895,10 +896,17 @@ export const syncKolibriHostListenPort = async (composePath: string, port: PortN
 export const assertComposeContainersHealthy = async (instanceDir: string, instanceId: InstanceID): Promise<void> => {
   void instanceDir
   await sleep(2500)
+  // idea#479: exact com.docker.compose.project label, never a docker name filter (a
+  // substring match that hit a dotted legacy id's containers and marked this one Error).
+  const projectFilter = composeProjectLabelFilter(String(instanceId))
+  if (!projectFilter) {
+    log(`assertComposeContainersHealthy: no compose project name for ${instanceId}; skipping`)
+    return
+  }
   let psOut = ''
   try {
     const format = '{{.Names}}\t{{.Status}}\t{{.ID}}'
-    const r = await $`docker ps -a --filter name=${instanceId} --format ${format}`
+    const r = await $`docker ps -a --filter ${projectFilter} --format ${format}`
     psOut = (r.stdout || '').trim()
   } catch (e) {
     log(`assertComposeContainersHealthy: docker ps failed for ${instanceId}: ${e instanceof Error ? e.message : String(e)}`)
@@ -1006,7 +1014,8 @@ export const assertInstancePortReady = async (
   let hint = ''
   try {
     const format = '{{.Names}}'
-    const r = await $`docker ps -a --filter name=${instanceId} --format ${format}`.quiet()
+    const projectFilter = composeProjectLabelFilter(String(instanceId))
+    const r = projectFilter ? await $`docker ps -a --filter ${projectFilter} --format ${format}`.quiet() : { stdout: '' }
     const name = (r.stdout || '').trim().split('\n').filter(Boolean)[0]
     if (name) {
       const lr = await $`docker logs --tail 40 ${name}`.quiet()
@@ -1259,7 +1268,9 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
   // Gated on a Docker daemon, not testMode (idea#168: the duration pool runs testMode with real Docker).
   if (await dockerAvailable()) {
     try {
-      const ps = await $`docker ps --filter name=${instance.id} --format {{.Names}}`
+      // idea#479: exact compose-project label, not a name substring.
+      const projectFilter = composeProjectLabelFilter(String(instance.id))
+      const ps = projectFilter ? await $`docker ps --filter ${projectFilter} --format {{.Names}}` : { stdout: '' }
       if (ps.stdout.trim().length > 0) {
         log(`Instance '${instance.id}' containers already running — updating status to Running`)
         const port = parseInt(await readEnvVariable(`${await diskMountRoot(disk)}/instances/${instance.id}/.env`, 'port') as string) || 0
@@ -1828,15 +1839,14 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
   // New implementation using Docker API
   try {
     setStep(storeHandle, instance.id, 0, totalStopSteps, STOP_STEPS[0], stopOpId)
-    // Find all containers running in the compose started by the instance
-    // NOTE: this implementation requires all containers of an instance to be namespaced with the instance id
-    log(`Filter for all running containers whose names start with the instance id`)
+    // Find all running containers of the instance's compose project, matched
+    // exactly on the com.docker.compose.project label (idea#479), never by name
+    // prefix: `<id>-` also matched an instance whose id starts with `<id>-`.
+    log(`Filter for all running containers in the compose project of ${instance.id}`)
     const docker = new Docker({ socketPath: '/var/run/docker.sock' });
     const containers = await docker.container.list()
-    const instanceContainers = containers.filter(container => {
-      const name = container.data['Names'][0]
-      return name.startsWith(`/${instance.id}-`) || name.startsWith(`/${instance.id}_`)
-    })
+    const instanceContainers = containers.filter(container =>
+      containerInInstanceProject((container.data as any)['Labels'], String(instance.id)))
     // Log the containers
     log(`Found the following containers:`)
     instanceContainers.forEach(container => {
