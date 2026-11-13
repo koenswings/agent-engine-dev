@@ -24,8 +24,12 @@
 #                                  `systemctl enable --now tailscaled` and `tailscale up
 #                                  --auth-key=file:...` runs. After a successful join
 #                                  the key file is deleted (`shred -u`, else `rm -f`).
-#                                  Offline / failed: the key is kept and the join is
-#                                  retried on later boots until it succeeds.
+#                                  Offline / failed (idea#453): the key is kept and the
+#                                  join is retried on the SAME boot by a detached
+#                                  `idea-engine-identity --join-retry` (bounded: the
+#                                  delays in TS_RETRY_DELAYS, ~25 min), so boot.sh is
+#                                  not held up. If that budget runs out, later boots
+#                                  retry until it succeeds (tailscale-pending stays).
 #   idea-identity.txt              informational, never read.
 #
 # The key is never logged and never a command-line argument. Invalid values are
@@ -33,13 +37,14 @@
 # Idempotent: a second run with the same card changes nothing.
 #
 # Usage: idea-engine-identity [--version]
+#        idea-engine-identity --join-retry   (internal: the same-boot join retry loop)
 
 set -u
 umask 077
 export LC_ALL=C
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
-VERSION=1
+VERSION=2
 # Constants (tests rewrite these in a sandbox copy)
 BOOT_DIR=/boot/firmware
 ETC_DIR=/etc
@@ -51,8 +56,15 @@ SYSTEMCTL=/usr/bin/systemctl
 TAILSCALE=/usr/bin/tailscale
 SHRED=/usr/bin/shred
 SYNC=/usr/bin/sync
+SETSID=/usr/bin/setsid
+FLOCK=/usr/bin/flock
+SLEEP=/usr/bin/sleep
+# Same-boot join retry (idea#453): seconds to wait before each retry after the first
+# attempt. Bounded: 8 retries, ~23 min of waits (build 6 needed ~16 min to join).
+TS_RETRY_DELAYS="15 30 60 120 240 300 300 300"
 
 [ "${1:-}" = "--version" ] && { echo "idea-engine-identity $VERSION"; exit 0; }
+SELF=$(readlink -f -- "$0" 2>/dev/null || echo "$0")
 
 # Older Pi OS mounts the FAT partition at /boot
 [ -d "$BOOT_DIR" ] || [ ! -d /boot ] || [ "$BOOT_DIR" != /boot/firmware ] || BOOT_DIR=/boot
@@ -160,10 +172,13 @@ take_key() {
     log "Tailscale key moved to $KEY_DST and wiped from the boot partition"
 }
 
-join_tailnet() {
+# One join attempt. Returns 0 joined (or nothing to do), 1 failed (retry), 2 refused (do not retry).
+# Sets JOIN_DETAIL to the last lines of tailscale's output with any key line removed.
+try_join() {
+    JOIN_DETAIL=''
     [ -e "$TS_PENDING" ] || return 0
-    [ -f "$KEY_DST" ] || { rm -f "$TS_PENDING"; refuse NO_KEY "$KEY_DST is gone; not joining"; return 0; }
-    [ -x "$TAILSCALE" ] || { refuse NO_TAILSCALE "$TAILSCALE is not installed; will retry next boot"; return 0; }
+    [ -f "$KEY_DST" ] || { rm -f "$TS_PENDING"; refuse NO_KEY "$KEY_DST is gone; not joining"; return 2; }
+    [ -x "$TAILSCALE" ] || { refuse NO_TAILSCALE "$TAILSCALE is not installed; will retry next boot"; return 2; }
     # Always on (Koen 2026-10-13: one tag:idea, one fleet key; supersedes idea#115's
     # "tailscaled disabled on Engines"), so the join survives reboots. Not an ephemeral node.
     "$SYSTEMCTL" enable --now tailscaled >/dev/null 2>&1 || true
@@ -184,10 +199,59 @@ join_tailnet() {
             fi
         fi
         log "joined the tailnet"
+        return 0
+    fi
+    JOIN_RC=$rc
+    JOIN_DETAIL=$out
+    return 1
+}
+
+retry_total() { local a; read -r -a a <<< "$TS_RETRY_DELAYS"; echo $(( ${#a[@]} + 1 )); }
+
+# First attempt in the boot.sh run (as before); on failure hand the retries to a
+# detached process so the rest of boot.sh (partition grow, personalisation) goes on.
+join_tailnet() {
+    local n; n=$(retry_total)
+    try_join; local r=$?
+    [ "$r" -eq 1 ] || return 0
+    if [ "$n" -le 1 ]; then
+        log "tailscale up failed (exit $JOIN_RC; offline?); giving up this boot, will retry next boot${JOIN_DETAIL:+: $JOIN_DETAIL}"
+        return 0
+    fi
+    log "tailscale up failed (exit $JOIN_RC; offline?); retrying this boot (attempt 1/$n)${JOIN_DETAIL:+: $JOIN_DETAIL}"
+    if [ -x "$SETSID" ]; then
+        "$SETSID" "$SELF" --join-retry </dev/null &
     else
-        log "tailscale up failed (exit $rc; offline?); will retry next boot${out:+: $out}"
+        nohup "$SELF" --join-retry </dev/null >/dev/null 2>&1 &
     fi
 }
+
+# --join-retry: attempts 2..n, each after its delay; one loop per boot (flock).
+join_retry_loop() {
+    mkdir -p "$STATE_DIR" && chmod 0700 "$STATE_DIR"
+    if [ -x "$FLOCK" ]; then
+        exec 9>"$STATE_DIR/join-retry.lock"
+        "$FLOCK" -n 9 || { log "a same-boot join retry is already running"; return 0; }
+    fi
+    local n i=1 d r; n=$(retry_total)
+    for d in $TS_RETRY_DELAYS; do
+        i=$((i + 1))
+        [ -e "$TS_PENDING" ] || return 0
+        "$SLEEP" "$d"
+        try_join; r=$?
+        [ "$r" -eq 1 ] || return 0
+        if [ "$i" -lt "$n" ]; then
+            log "tailscale up failed (exit $JOIN_RC; offline?); retrying this boot (attempt $i/$n)${JOIN_DETAIL:+: $JOIN_DETAIL}"
+        else
+            log "tailscale up failed (exit $JOIN_RC; offline?); attempt $i/$n, giving up this boot, will retry next boot${JOIN_DETAIL:+: $JOIN_DETAIL}"
+        fi
+    done
+}
+
+if [ "${1:-}" = "--join-retry" ]; then
+    join_retry_loop
+    exit 0
+fi
 
 apply_hostname
 apply_timezone
