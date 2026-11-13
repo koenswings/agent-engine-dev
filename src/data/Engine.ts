@@ -151,6 +151,8 @@ export interface EraseInProgress {
  *   flashCard:  flashCard / cancelFlash; only when the root helper
  *               /usr/local/sbin/idea-flash-card is installed (checked at startup).
  *   clientImages: Engine.clientImages is published.
+ *   moveAppCrossEngine: moveApp to a disk on another Engine (copy, verify on the
+ *               target, quarantine the source; idea#79). Both Engines need it.
  *   usageSummaries: this Engine can export usage (idea#411). Advertised even when usageMonitoring is off.
  *   backupVerify: listBackup, verifyBackup, clearBackupLock, removeBackupRole (idea#446).
  *   forgetDiskWithInstances: forgetDisk <diskId> --with-instances (idea#466).
@@ -161,7 +163,7 @@ export interface EraseInProgress {
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'usageSummaries', 'backupVerify', 'forgetDiskWithInstances', 'backupLinks']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'moveAppCrossEngine', 'usageSummaries', 'backupVerify', 'forgetDiskWithInstances', 'backupLinks']
 /** idea#201 §10: advertised only when the flash helper is installed (HELPER_MISSING otherwise) */
 export const FLASH_CARD_CAPABILITY = 'flashCard'
 export const FLASH_HELPER_PATH = '/usr/local/sbin/idea-flash-card'
