@@ -13,7 +13,8 @@ import { Store, getDisk, getEngine, getLocalEngine, getInstancesOfEngine, } from
 import { Disk, diskMountRoot, diskFsRoot, deviceMountRoot } from "./Disk.js";
 import { localEngineId } from "./Engine.js";
 import { network } from "./Network.js";
-import { createAppId } from "./App.js";
+import { createAppId, parseAppId } from "./App.js";
+import { healthTimeoutSeconds, DEFAULT_HEALTH_TIMEOUT_S } from "./AppHealthTimeout.js";
 import { Docker } from "node-docker-api";
 import { createMeta } from '../data/Meta.js'
 import { config, disksRoot, skipImageLoad } from '../data/Config.js'
@@ -946,37 +947,24 @@ export const assertComposeContainersHealthy = async (instanceDir: string, instan
 }
 
 
-/**
- * Fallback port-ready budget when `x-app.healthTimeout` is absent or invalid
- * (idea#437). This is not updateApp's per-App default (Nextcloud 300 s,
- * Kolibri 900 s, others 600 s): those would make a dead sidecar wait many
- * minutes. Apps that need longer already declare the field (Nextcloud 1.4
- * sets `healthTimeout: 300`).
- */
-export const DEFAULT_PORT_READY_TIMEOUT_MS = 60_000
-
 /** Recreate a sidecar that never accepted TCP after this long, never later than the budget. */
 export const PORT_READY_RECREATE_AFTER_MS = 60_000
 
 /**
- * Convert `x-app.healthTimeout` (seconds) to the millisecond port-ready budget.
- * Absent, non-finite or non-positive values fall back to 60 s.
+ * The port-ready budget in ms (idea#437, Steve decision 3): `x-app.healthTimeout`
+ * (seconds) when valid, else updateApp's per-App default from the one shared table
+ * (AppHealthTimeout.ts: Nextcloud 300 s, Kolibri 900 s, others 600 s).
  */
-export const portReadyTimeoutMs = (declared: unknown): number => {
-  const n = Number(declared)
-  if (declared !== undefined && declared !== null && Number.isFinite(n) && n > 0) {
-    return Math.round(n * 1000)
-  }
-  return DEFAULT_PORT_READY_TIMEOUT_MS
-}
+export const portReadyTimeoutMs = (appName: string, declared?: unknown): number =>
+  Math.round(healthTimeoutSeconds(appName, declared) * 1000)
 
-/** Read `x-app.healthTimeout` from an instance compose.yaml; 60 s if missing or unreadable. */
-export const readPortReadyTimeoutMs = async (composePath: string): Promise<number> => {
+/** Read `x-app.healthTimeout` from an instance compose.yaml; the per-App default if missing or unreadable. */
+export const readPortReadyTimeoutMs = async (composePath: string, appName: string): Promise<number> => {
   try {
     const parsed = YAML.parse(await fs.readFile(composePath, 'utf8'))
-    return portReadyTimeoutMs(parsed?.['x-app']?.healthTimeout)
+    return portReadyTimeoutMs(appName, parsed?.['x-app']?.healthTimeout)
   } catch {
-    return DEFAULT_PORT_READY_TIMEOUT_MS
+    return portReadyTimeoutMs(appName)
   }
 }
 
@@ -1022,7 +1010,7 @@ export const assertInstancePortReady = async (
     log(`assertInstancePortReady: no port for ${instanceId}; skipping sidecar probe`)
     return
   }
-  const readyTimeoutMs = opts.readyTimeoutMs ?? DEFAULT_PORT_READY_TIMEOUT_MS
+  const readyTimeoutMs = opts.readyTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_S * 1000
   const stableMs = opts.stableMs ?? 10_000
   const forceRecreate = opts.forceRecreate !== false
   const probe = opts.probe ?? 'http'
@@ -1782,8 +1770,9 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
  * Start the containers of an instance (`docker compose up -d`) and set it to
  * Running. Running is written only after `compose up` has succeeded (idea#109)
  * and the instance host port has answered HTTP for a stable window (idea#437).
- * The wait budget is `x-app.healthTimeout` from the instance compose, or 60 s
- * when that field is absent or invalid. An instance never shows Running while
+ * The wait budget is `x-app.healthTimeout` from the instance compose, or the
+ * per-App default (AppHealthTimeout.ts, shared with updateApp) when that field is
+ * absent or invalid. An instance never shows Running while
  * its containers failed to start, or while docker-proxy accepts TCP before the
  * app serves. Errors from `compose up` or the port probe propagate to the
  * caller, which sets Error (startInstance also records a failed command-log
@@ -1868,7 +1857,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
     const readyPort = storeHandle.doc()?.instanceDB?.[instance.id]?.port
       ?? (port && !isNaN(parseInt(port)) ? parseInt(port) : 0)
     const instanceDir = `${mountRoot}/instances/${instance.id}`
-    const readyTimeoutMs = await readPortReadyTimeoutMs(`${instanceDir}/compose.yaml`)
+    const readyTimeoutMs = await readPortReadyTimeoutMs(`${instanceDir}/compose.yaml`, parseAppId(String(instance.instanceOf ?? "")).name)
     await assertInstancePortReady(
       instance.id,
       Number(readyPort) || 0,

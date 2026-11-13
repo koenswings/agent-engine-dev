@@ -49,35 +49,72 @@ const listenHttp = async (status: number): Promise<{ port: number; close: () => 
 }
 
 describe('portReadyTimeoutMs (idea#437)', () => {
-  it('takes a valid x-app.healthTimeout in seconds', async () => {
-    const { portReadyTimeoutMs, DEFAULT_PORT_READY_TIMEOUT_MS } = await import('../../src/data/Instance.js')
-    expect(portReadyTimeoutMs(300)).toBe(300_000)
-    expect(portReadyTimeoutMs('90')).toBe(90_000)
-    expect(DEFAULT_PORT_READY_TIMEOUT_MS).toBe(60_000)
+  it('takes a valid x-app.healthTimeout in seconds, whatever the App', async () => {
+    const { portReadyTimeoutMs } = await import('../../src/data/Instance.js')
+    expect(portReadyTimeoutMs('nextcloud', 300)).toBe(300_000)
+    expect(portReadyTimeoutMs('kiwix', '90')).toBe(90_000)
+    expect(portReadyTimeoutMs('kolibri', 120)).toBe(120_000)
   })
 
-  it('falls back to 60 s when healthTimeout is absent or invalid', async () => {
-    const { portReadyTimeoutMs, DEFAULT_PORT_READY_TIMEOUT_MS } = await import('../../src/data/Instance.js')
-    expect(portReadyTimeoutMs(undefined)).toBe(DEFAULT_PORT_READY_TIMEOUT_MS)
-    expect(portReadyTimeoutMs(null)).toBe(DEFAULT_PORT_READY_TIMEOUT_MS)
-    expect(portReadyTimeoutMs(0)).toBe(DEFAULT_PORT_READY_TIMEOUT_MS)
-    expect(portReadyTimeoutMs(-5)).toBe(DEFAULT_PORT_READY_TIMEOUT_MS)
-    expect(portReadyTimeoutMs(NaN)).toBe(DEFAULT_PORT_READY_TIMEOUT_MS)
-    expect(portReadyTimeoutMs('nope')).toBe(DEFAULT_PORT_READY_TIMEOUT_MS)
-    expect(portReadyTimeoutMs({})).toBe(DEFAULT_PORT_READY_TIMEOUT_MS)
+  it('falls back to updateApp\'s per-App defaults, not 60 s (Steve decision 3)', async () => {
+    const { portReadyTimeoutMs } = await import('../../src/data/Instance.js')
+    expect(portReadyTimeoutMs('nextcloud')).toBe(300_000)
+    expect(portReadyTimeoutMs('kolibri')).toBe(900_000)
+    expect(portReadyTimeoutMs('Kolibri')).toBe(900_000)
+    expect(portReadyTimeoutMs('kiwix')).toBe(600_000)
+    expect(portReadyTimeoutMs('')).toBe(600_000)
+    for (const bad of [undefined, null, 0, -5, NaN, 'nope', {}]) {
+      expect(portReadyTimeoutMs('kiwix', bad)).toBe(600_000)
+      expect(portReadyTimeoutMs('kolibri', bad)).toBe(900_000)
+      expect(portReadyTimeoutMs('nextcloud', bad)).toBe(300_000)
+    }
+    for (const app of ['nextcloud', 'kolibri', 'kiwix', 'milkwise', 'sample']) {
+      expect(portReadyTimeoutMs(app)).not.toBe(60_000)
+    }
   })
 
-  it('reads healthTimeout from compose.yaml and falls back when missing', async () => {
-    const { readPortReadyTimeoutMs, DEFAULT_PORT_READY_TIMEOUT_MS } = await import('../../src/data/Instance.js')
+  it('60 s fallback constant is gone from Instance.ts', async () => {
+    const instance: Record<string, unknown> = await import('../../src/data/Instance.js')
+    expect(instance.DEFAULT_PORT_READY_TIMEOUT_MS).toBeUndefined()
+  })
+
+  it('updateApp and the port-ready check read ONE shared table (AppHealthTimeout.ts)', async () => {
+    const shared = await import('../../src/data/AppHealthTimeout.js')
+    const policy = await import('../../src/data/UpdateAppPolicy.js')
+    const { portReadyTimeoutMs } = await import('../../src/data/Instance.js')
+    expect(policy.healthTimeoutSeconds).toBe(shared.healthTimeoutSeconds)
+    expect(policy.APP_HEALTH_TIMEOUT_S).toBe(shared.APP_HEALTH_TIMEOUT_S)
+    expect(shared.APP_HEALTH_TIMEOUT_S).toEqual({ kolibri: 900, nextcloud: 300 })
+    expect(shared.DEFAULT_HEALTH_TIMEOUT_S).toBe(600)
+    expect(Object.isFrozen(shared.APP_HEALTH_TIMEOUT_S)).toBe(true)
+    for (const app of ['nextcloud', 'kolibri', 'kiwix', 'milkwise']) {
+      for (const declared of [undefined, 45, 'junk']) {
+        expect(portReadyTimeoutMs(app, declared)).toBe(policy.healthTimeoutSeconds(app, declared) * 1000)
+      }
+    }
+  })
+
+  it('runInstance takes the App name from instanceOf the same way updateApp does (parseAppId)', async () => {
+    const { parseAppId } = await import('../../src/data/App.js')
+    const { portReadyTimeoutMs } = await import('../../src/data/Instance.js')
+    expect(portReadyTimeoutMs(parseAppId('kolibri-0.19.5').name)).toBe(900_000)
+    expect(portReadyTimeoutMs(parseAppId('nextcloud-1.4').name)).toBe(300_000)
+    expect(portReadyTimeoutMs(parseAppId('kiwix-3.7').name)).toBe(600_000)
+  })
+
+  it('reads healthTimeout from compose.yaml and falls back to the per-App default when missing', async () => {
+    const { readPortReadyTimeoutMs } = await import('../../src/data/Instance.js')
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-port-ready-compose-'))
     try {
       const withField = path.join(dir, 'with.yaml')
       const withoutField = path.join(dir, 'without.yaml')
       await fs.outputFile(withField, 'x-app:\n  name: nextcloud\n  healthTimeout: 300\n')
       await fs.outputFile(withoutField, 'x-app:\n  name: kiwix\n')
-      expect(await readPortReadyTimeoutMs(withField)).toBe(300_000)
-      expect(await readPortReadyTimeoutMs(withoutField)).toBe(DEFAULT_PORT_READY_TIMEOUT_MS)
-      expect(await readPortReadyTimeoutMs(path.join(dir, 'missing.yaml'))).toBe(DEFAULT_PORT_READY_TIMEOUT_MS)
+      expect(await readPortReadyTimeoutMs(withField, 'nextcloud')).toBe(300_000)
+      expect(await readPortReadyTimeoutMs(withoutField, 'kiwix')).toBe(600_000)
+      expect(await readPortReadyTimeoutMs(withoutField, 'kolibri')).toBe(900_000)
+      expect(await readPortReadyTimeoutMs(path.join(dir, 'missing.yaml'), 'nextcloud')).toBe(300_000)
+      expect(await readPortReadyTimeoutMs(path.join(dir, 'missing.yaml'), 'kiwix')).toBe(600_000)
     } finally {
       await fs.remove(dir)
     }
