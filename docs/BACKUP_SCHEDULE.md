@@ -94,7 +94,8 @@ uptimeCounter:              # uptime since lastRun, across reboots
 - `ntpSynced` latches once `timedatectl NTPSynchronized` has said `yes` since the Engine started. After a jump, a reading of `yes` counts as the sync that brings trust back.
 - The build floor is `dist/build-info.json`, written by `pnpm build` (`script/write-build-info.mjs`): the git commit time, Q12. A missing file skips the check.
 - The "newest store timestamp" is the newest of the disk's `lastAttempt` and its linked instances' `lastBackup` / `lastResult.time`.
-- There is no peer clock source in the store yet, so `AHEAD_OF_PEER` and the peer sync get no input (open call).
+- Peer clocks come from the ephemeral heartbeat (`idea/hb`), in memory only: `now`, plus `ntpSynced` and `clockTrusted` on engine#352 Engines. An old Engine's hb without those fields is not a time source. Estimated peer time is `hb.now + elapsed since receive`; a peer silent for 60 s is dropped. `Engine.lastRun` is not used, and nothing is written to the store for this.
+- A peer is a time source only if it reports `ntpSynced` or `clockTrusted` (trust from earlier NTP or an NTP-backed chain). Two never-synced Pis must not vouch for each other. `AHEAD_OF_PEER` and the `BEFORE_STORE` exception need an `ntpSynced` peer. If usable peers disagree with each other by more than 5 min, all peer input is ignored for that tick. The system clock is never stepped.
 
 ## Clock trust
 
@@ -103,10 +104,10 @@ uptimeCounter:              # uptime since lastRun, across reboots
 | Reason | When |
 |---|---|
 | `BEFORE_BUILD` | Wall time is before the Engine build time (the git commit time baked in at build, Q12). |
-| `BEFORE_STORE` | Wall time is more than 5 min before the newest store timestamp, **and NTP has not synchronised the clock** since boot. An NTP sync clears it (a real time source beats stored timestamps). A store (Automerge) or peer sync does not, and neither does 24 h of uptime. Without NTP it clears once the wall clock passes the newest stored timestamp (Steve, #351 call 6). |
-| `AHEAD_OF_PEER` | Wall time is more than 24 h ahead of a synced peer. |
-| `CLOCK_JUMP` | A jump was detected, and trust has not come back yet. It comes back at the next sync **or** after 24 h of uptime with no further jump, whichever comes first (Steve, #346), because a lone school Engine may never sync. A further jump restarts the 24 h. |
-| `NEVER_SYNCED` | Neither NTP (`timedatectl NTPSynchronized`) nor a peer has confirmed the clock since boot. |
+| `BEFORE_STORE` | Wall time is more than 5 min before the newest store timestamp, **and** neither NTP since boot nor an *NTP-synced* peer whose `now` agrees within 5 min has confirmed the clock. A real time source beats stored timestamps (#351 call 6, engine#352 call 3). A store (Automerge) sync, a `clockTrusted`-only peer, and 24 h of uptime do not clear it. Otherwise it clears once the wall clock passes the newest stored timestamp. |
+| `AHEAD_OF_PEER` | Wall time is more than 24 h ahead of a live *NTP-synced* peer (`PEER_AHEAD_LIMIT_MS`). |
+| `CLOCK_JUMP` | A jump was detected, and trust has not come back yet. It comes back at the next NTP sync or agreement with a usable peer (`ntpSynced` or `clockTrusted`) **or** after 24 h of uptime with no further jump, whichever comes first (Steve, #346 / engine#352 call 4), because a lone school Engine may never sync. A further jump restarts the 24 h. |
+| `NEVER_SYNCED` | Neither NTP (`timedatectl NTPSynchronized`) nor a usable peer (`ntpSynced` or `clockTrusted`, clock agreeing within 5 min) has confirmed the clock since boot. |
 
 A jump is a wall-clock step of more than 2 min between two ticks, compared with the monotonic clock. The reason tokens are Engine-internal; the Console keys off `clockTrusted`.
 
@@ -149,7 +150,7 @@ The full reference is in [COMMANDS.md](COMMANDS.md#setbackupmode). In short:
   - the slot firing once, with no store write on an idle tick and one summary change per run;
   - missed days, other Engines, and an invalid schedule;
   - the `SKIPPED_LOCKED` catch-up, retry once, stale locks, and `BUSY` naming the scheduled run;
-  - `NEVER_SYNCED` and the uptime path across a reboot, `BEFORE_BUILD`, `BEFORE_STORE` without NTP and cleared by NTP (#351 call 6), and forward and backward jumps;
+  - `NEVER_SYNCED` and the uptime path across a reboot, `BEFORE_BUILD`, `BEFORE_STORE` without NTP and cleared by NTP (#351 call 6) or by an agreeing NTP peer (engine#352), and forward and backward jumps;
   - crash recovery, `Disk.cleaning`, and the build info.
 - **Command tests (PR D):** `test/automated/set-backup-mode.test.ts`: mode and time changes, the schedule rules, a preserved file, the store mirror, no write when nothing changed, and every refusal writing nothing.
 - **Unit tests:** `test/automated/backup-schedule.test.ts` (fake wall, monotonic and uptime clock in `test/harness/fakeScheduleClock.ts`; fixtures in `test/fixtures/backup-schedule/`). They run in `Europe/Brussels` for the DST cases.

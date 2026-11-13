@@ -288,11 +288,11 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // Liveness without store history (store-design 2026-10-13): ephemeral hb every
     // 10 s, stored lastRun at boot + hourly (Liveness.ts)
     writeLastSeen(storeHandle, String(localEngineId), Date.now(), 0, true)
-    startLiveness(storeHandle, String(localEngineId))
+    // idea#400: scheduled Backup Disks run from a 60 s tick inside the Engine (never host cron)
+    const scheduler = startBackupScheduler(storeHandle)
+    startLiveness(storeHandle, String(localEngineId), { clockStatus: () => scheduler.clockStatus() })
     // The heartbeat timer still repairs this Engine's peerAccess, expires stale
     // peers and archives old operations; it no longer writes to the store itself
-    // idea#400: scheduled Backup Disks run from a 60 s tick inside the Engine (never host cron)
-    startBackupScheduler(storeHandle)
 
     enableTimeMonitor(heartbeatIntervalMs, () => {
         archiveOldOperations(storeHandle).catch(e => print(chalk.red(`archive operations: ${e}`)))

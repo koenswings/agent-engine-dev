@@ -280,6 +280,16 @@ describe('clock trust (proposal §3.2)', () => {
             expect(evaluateClockTrust({ ...ahead, ntpSynced: false, nowMs: ahead.newestStoreTimeMs - 4 * MIN }).clockReason).toBe('NEVER_SYNCED')
             expect(evaluateClockTrust({ ...ahead, ntpSynced: false, nowMs: ahead.newestStoreTimeMs + MIN }).clockReason).toBe('NEVER_SYNCED')
         })
+        it('an NTP-synced peer that agrees clears BEFORE_STORE; a clockTrusted-only peer does not (engine#352 call 3)', () => {
+            expect(evaluateClockTrust({ ...ahead, ntpSynced: false, peerSynced: true, peerNtpAgreed: true })).toEqual({ clockTrusted: true, clockReason: null })
+            expect(evaluateClockTrust({ ...ahead, ntpSynced: false, peerSynced: true, peerNtpAgreed: false }).clockReason).toBe('BEFORE_STORE')
+        })
+        it('BEFORE_BUILD is not overridden by NTP or peer input (engine#352 call 5)', () => {
+            expect(evaluateClockTrust({
+                ...ahead, nowMs: base.buildTimeMs! - 1, ntpSynced: true, peerSynced: true, peerNtpAgreed: true,
+                syncedPeerNowMs: base.buildTimeMs! - 1,
+            }).clockReason).toBe('BEFORE_BUILD')
+        })
         it('a peer (store) sync does not clear it, nor does trust coming back after 24 h of uptime', () => {
             expect(evaluateClockTrust({ ...ahead, ntpSynced: false, peerSynced: true }).clockReason).toBe('BEFORE_STORE')
             // 24 h with no further jump clears CLOCK_JUMP (jumpSinceSync false), never BEFORE_STORE

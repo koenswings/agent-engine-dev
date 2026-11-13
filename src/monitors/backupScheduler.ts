@@ -26,9 +26,9 @@
  *    starts the same window again; crash recovery does not retry a scheduled op either.
  *
  * Clock trust inputs here: NTP synchronised since this Engine started, the build's
- * git commit time (dist/build-info.json, Q12) and the newest backup timestamp of the
- * disk and its linked instances. No peer clock source exists in the store yet, so
- * the peer checks get no input (see docs/BACKUP_SCHEDULE.md, open call).
+ * git commit time (dist/build-info.json, Q12), the newest backup timestamp of the
+ * disk and its linked instances, and live peer clocks from the ephemeral hb
+ * (engine#352; in memory only, never a store field).
  */
 
 import { performance } from 'node:perf_hooks'
@@ -39,6 +39,7 @@ import { log } from '../utils/utils.js'
 import { disksRoot } from '../data/Config.js'
 import { Disk, diskMountRoot, joinMountRoot, syncBackupOrphanLinks } from '../data/Disk.js'
 import { localEngineId } from '../data/Engine.js'
+import { peerClockViews } from '../data/Liveness.js'
 import { Store, getInstance } from '../data/Store.js'
 import { BackupResultCode, DiskID, EngineID, InstanceID, OperationCause, Timestamp } from '../data/CommonTypes.js'
 import { readBackupYamlState, writeBackupScheduleState, BackupYamlState } from '../data/BackupYamlDoc.js'
@@ -49,7 +50,7 @@ import { defaultReadBootId, defaultReadNtpSynced, defaultReadUptimeS } from '../
 import {
     BackupDue, ClockJumpState, DEFAULT_BACKUP_TIME, ClockSample, ClockTrust, SkippedRun,
     advanceClockJumpState, advanceUptimeCounter, decideBackupDue, detectClockJump, effectiveSchedule,
-    evaluateClockTrust, noteClockJump, resetUptimeCounter, scheduleNowMs, shouldPersistUptimeCounter,
+    evaluateClockTrust, noteClockJump, peerClockInputs, resetUptimeCounter, scheduleNowMs, shouldPersistUptimeCounter,
     skippedCatchUpDue, testClockOffsetMs, windowIdFor, TEST_CLOCK_OFFSET_ENV,
 } from '../utils/backupSchedule.js'
 import {
@@ -188,31 +189,60 @@ export class BackupScheduler {
         }
     }
 
+    private peersFor(now: number) {
+        return peerClockInputs(now, peerClockViews(now, String(this.engineId)))
+    }
+
     /** Jump detection, the NTP latch and the jump recovery window (in memory). */
     private observeClock(now: number, bootId: string, uptime: number): void {
         const sample: ClockSample = { wallMs: now, monoMs: this.deps.monoMs() }
         const jumped = this.prev ? detectClockJump(this.prev, sample) : null
         this.prev = sample
+        if (!this.ntpSeen && this.deps.ntpSynced()) this.ntpSeen = true
+        const peerAgreed = this.peersFor(now).peerSynced
         if (jumped) {
             this.jump = noteClockJump(bootId, uptime)
             log(chalk.yellow(`Backup scheduler: clock jumped ${jumped}; schedule clock untrusted until the next sync or 24 h of uptime (idea#400)`))
         } else if (this.jump) {
-            this.jump = advanceClockJumpState(this.jump, bootId, uptime, this.deps.ntpSynced())
+            this.jump = advanceClockJumpState(this.jump, bootId, uptime, this.deps.ntpSynced() || peerAgreed)
             if (!this.jump) log('Backup scheduler: clock trusted again after the jump')
         }
-        if (!this.ntpSeen && this.deps.ntpSynced()) this.ntpSeen = true
     }
 
     private trustFor(store: Store, disk: Disk, now: number): ClockTrust {
+        const peers = this.peersFor(now)
         return evaluateClockTrust({
             nowMs: now,
             ntpSynced: this.ntpSeen,
-            peerSynced: false,
+            peerSynced: peers.peerSynced,
+            peerNtpAgreed: peers.peerNtpAgreed,
             buildTimeMs: this.deps.buildTimeMs(),
             newestStoreTimeMs: newestBackupTimeFor(store, disk),
-            syncedPeerNowMs: null,
+            syncedPeerNowMs: peers.syncedPeerNowMs,
             jumpSinceSync: this.jump != null,
         })
+    }
+
+    /**
+     * Engine-level clock flags for the ephemeral hb (engine#352). BEFORE_STORE is
+     * per-disk and is not included: this answers "do I have a confirmed clock
+     * (NTP or an NTP-backed peer chain) and is it not obviously wrong?"
+     */
+    clockStatus(): { ntpSynced: boolean, clockTrusted: boolean } {
+        if (!this.ntpSeen && this.deps.ntpSynced()) this.ntpSeen = true
+        const now = this.deps.wallMs()
+        const peers = this.peersFor(now)
+        const t = evaluateClockTrust({
+            nowMs: now,
+            ntpSynced: this.ntpSeen,
+            peerSynced: peers.peerSynced,
+            peerNtpAgreed: peers.peerNtpAgreed,
+            buildTimeMs: this.deps.buildTimeMs(),
+            newestStoreTimeMs: null,
+            syncedPeerNowMs: peers.syncedPeerNowMs,
+            jumpSinceSync: this.jump != null,
+        })
+        return { ntpSynced: this.ntpSeen, clockTrusted: t.clockTrusted }
     }
 
     private async tickDisk(disk: Disk, now: number, bootId: string, uptime: number): Promise<void> {
