@@ -578,11 +578,16 @@ export const localiseSystem = async (exec: any, enginePath: string, language: st
   print(chalk.green('System localised'));
 }
 
+/** Default engine tree baked into boot.sh; installCrontabs rewrites it to config.defaults.enginePath. */
+export const BOOT_SH_ENGINE_PATH = '/home/pi/idea/agents/agent-engine-dev'
+/** sed expression that rewrites BOOT_SH_ENGINE_PATH in boot.sh. Passed as a single exec argument so quoteTemplate/shellQuote wraps the whole expression, not the replacement — otherwise `${VAR:-/prefix/rest}` becomes `${VAR:-'/prefix'/rest}` and the default path keeps literal quotes (Atlas, build 9 image). The path has no spaces. */
+export const bootShEnginePathSed = (enginePath: string) => `s|${BOOT_SH_ENGINE_PATH}|${enginePath}|g`
+
 export const installCrontabs = async (exec: any, enginePath: string) => {
   print(chalk.blue('Installing crontabs...'));
   try {
     await copyAsset(exec, enginePath, 'boot.sh', '/usr/local/bin', true)
-    await exec`sudo sed -i "s|/home/pi/idea/agents/agent-engine-dev|${config.defaults.enginePath}|g" /usr/local/bin/boot.sh`
+    await exec`sudo sed -i ${bootShEnginePathSed(config.defaults.enginePath)} /usr/local/bin/boot.sh`
     await exec`sudo crontab ${enginePath}/script/build_image_assets/crondefs`
   } catch (e) {
     print(chalk.red('Error installing crontabs'));

@@ -17,6 +17,7 @@ import {
 } from '../../src/install/engineImage.js'
 import { rootfsSteps, runRootfsBuild, engineCloneCommand, consoleCloneCommand, Runner, Installers, SHIMS, quoteTemplate } from '../../src/install/engineRootfs.js'
 import { pinNpmTools, writeReport, LOCKED_FILE_SPECS, resolveEngineCommit } from '../../src/install/engineImageCli.js'
+import { bootShEnginePathSed, BOOT_SH_ENGINE_PATH } from '../../src/data/Engine.js'
 import { diskIdWithoutHardware, hasDiskId, ensureSystemMeta } from '../../src/data/Meta.js'
 
 const ENGINE = '/home/pi/idea/agents/agent-engine-dev'
@@ -689,6 +690,40 @@ describe('rootfs build plan (stubbed runner and installers)', () => {
         const t = (p: TemplateStringsArray, ...a: unknown[]) => quoteTemplate(p, a)
         expect(t`systemctl enable ${['a.service', "b c"]}`).toBe(`systemctl enable 'a.service' 'b c'`)
         expect(t`echo ${"it's"}`).toBe(`echo 'it'\\''s'`)
+    })
+    it('installCrontabs rewrite of boot.sh leaves the DOCKING_RULE_SRC default with no quote characters', async () => {
+        // Image-build chrootExec (and live ssh()) run installCrontabs through quoteTemplate.
+        // The old form interpolated only the path inside a double-quoted sed expression, so
+        // the replacement was shell-quoted and ${DOCKING_RULE_SRC:-/prefix/rest} became
+        // ${DOCKING_RULE_SRC:-'/prefix'/rest}. The udev self-repair then failed with
+        // "asset … not found". The sed expression is now one argument (plain path).
+        const enginePath = BOOT_SH_ENGINE_PATH
+        const t = (p: TemplateStringsArray, ...a: unknown[]) => quoteTemplate(p, a)
+        const cmd = t`sudo sed -i ${bootShEnginePathSed(enginePath)} /usr/local/bin/boot.sh`
+        expect(cmd).toBe(`sudo sed -i 's|${enginePath}|${enginePath}|g' /usr/local/bin/boot.sh`)
+        const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'bootsh-'))
+        try {
+            const boot = path.join(tmp, 'boot.sh')
+            await fs.copy(path.join(ASSETS, 'boot.sh'), boot)
+            const local = cmd.replaceAll('/usr/local/bin/boot.sh', boot).replace(/^sudo /, '')
+            const { execFileSync } = await import('node:child_process')
+            execFileSync('bash', ['-lc', local], { stdio: 'pipe' })
+            const text = await fs.readFile(boot, 'utf8')
+            for (const line of text.split('\n')) {
+                const start = line.indexOf(':-')
+                const end = start === -1 ? -1 : line.indexOf('}', start)
+                if (line.includes('${') && start !== -1 && end !== -1) {
+                    expect(line.slice(start + 2, end), line).not.toMatch(/['"]/)
+                }
+            }
+            const assign = text.split('\n').filter(l => l.startsWith('DOCKING_RULE_SRC=') || l.startsWith('ENGINE_DIR=')).join('\n')
+            expect(assign).toMatch(/DOCKING_RULE_SRC=/)
+            const resolved = execFileSync('bash', ['-lc', `unset DOCKING_RULE_SRC ENGINE_DIR\n${assign}\nprintf %s "$DOCKING_RULE_SRC"`], { encoding: 'utf8' })
+            expect(resolved).toBe(`${enginePath}/script/build_image_assets/90-docking.rules`)
+            expect(resolved).not.toMatch(/['"]/)
+        } finally {
+            await fs.remove(tmp)
+        }
     })
     it('guards come first, no SSH, nothing started, units enabled; sanitise last; verify passes', async () => {
         const { log, r, inst, calls } = record()
