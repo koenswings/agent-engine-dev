@@ -10,7 +10,7 @@ import { $, fs, path } from 'zx'
 import os from 'os'
 import { execSync } from 'child_process'
 
-const REPO = path.resolve(__dirname, '../..')
+const REPO = process.cwd()
 const TOOLS = path.join(REPO, 'script/build_image_assets/npm-tools')
 const online = (() => { try { execSync('npm view pm2@7.1.1 version --fetch-timeout=8000 --fetch-retries=0', { stdio: 'pipe', timeout: 15000 }); return true } catch { return false } })()
 
