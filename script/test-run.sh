@@ -68,13 +68,25 @@ if [ "$TEST_MODE" = "true" ]; then
     git show HEAD:config.yaml > "$TEST_TMP/config.yaml" 2>/dev/null \
         || { echo "test-run.sh: cannot read the committed config.yaml (git show HEAD:config.yaml)" >&2; exit 1; }
     export IDEA_CONFIG_FILE="$TEST_TMP/config.yaml"
+    # Test-local system META so the gate does not depend on /META.yaml on the host
+    # (the box has no live Engine; a missing /META.yaml used to fail Engine import).
+    # Honouring the path is gated on IDEA_TEST_MODE / NODE_ENV=test in Meta.ts.
+    printf '%s\n' \
+      'diskId: idea-test-engine' \
+      'isHardwareId: false' \
+      'diskName: idea-test-engine' \
+      'created: 1700000000000' \
+      'lastDocked: 1700000000000' \
+      'version: "1.0"' \
+      > "$TEST_TMP/META.yaml"
+    export IDEA_SYSTEM_META="$TEST_TMP/META.yaml"
 fi
 
 mkdir -p test/testresults
 OUT="test/testresults/test-$SUITE-$(date -u +%Y-%m-%d-%H%M).log"
 {
     echo "Suite: test:$SUITE | $(date -u) | Branch: $(git branch --show-current) | Commit: $(git rev-parse --short HEAD)"
-    echo "Isolation: IDEA_SYSTEM_DISK_SKIP=$IDEA_SYSTEM_DISK_SKIP IDEA_WATCH_DIR=$IDEA_WATCH_DIR IDEA_DISKS_ROOT=$IDEA_DISKS_ROOT IDEA_CONFIG_FILE=${IDEA_CONFIG_FILE:-./config.yaml} build=dist-test"
+    echo "Isolation: IDEA_SYSTEM_DISK_SKIP=$IDEA_SYSTEM_DISK_SKIP IDEA_WATCH_DIR=$IDEA_WATCH_DIR IDEA_DISKS_ROOT=$IDEA_DISKS_ROOT IDEA_CONFIG_FILE=${IDEA_CONFIG_FILE:-./config.yaml} IDEA_SYSTEM_META=${IDEA_SYSTEM_META:-} build=dist-test"
     echo "---"
     node_modules/.bin/vitest run "dist-test/test/$SUBDIR/"
 } 2>&1 | tee "$OUT"
