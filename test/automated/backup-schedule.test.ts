@@ -259,11 +259,37 @@ describe('clock trust (proposal §3.2)', () => {
     it('gives each reason', () => {
         expect(evaluateClockTrust({ ...base, ntpSynced: false }).clockReason).toBe('NEVER_SYNCED')
         expect(evaluateClockTrust({ ...base, nowMs: base.buildTimeMs! - 1 }).clockReason).toBe('BEFORE_BUILD')
-        expect(evaluateClockTrust({ ...base, newestStoreTimeMs: base.nowMs + 6 * MIN }).clockReason).toBe('BEFORE_STORE')
-        expect(evaluateClockTrust({ ...base, newestStoreTimeMs: base.nowMs + 4 * MIN }).clockTrusted).toBe(true)
+        expect(evaluateClockTrust({ ...base, ntpSynced: false, peerSynced: true, newestStoreTimeMs: base.nowMs + 6 * MIN }).clockReason).toBe('BEFORE_STORE')
+        expect(evaluateClockTrust({ ...base, ntpSynced: false, peerSynced: true, newestStoreTimeMs: base.nowMs + 4 * MIN }).clockTrusted).toBe(true)
         expect(evaluateClockTrust({ ...base, syncedPeerNowMs: base.nowMs - 25 * HOUR }).clockReason).toBe('AHEAD_OF_PEER')
         expect(evaluateClockTrust({ ...base, syncedPeerNowMs: base.nowMs - 23 * HOUR }).clockTrusted).toBe(true)
         expect(evaluateClockTrust({ ...base, jumpSinceSync: true }).clockReason).toBe('CLOCK_JUMP')
+    })
+    describe('BEFORE_STORE (Steve, #351 call 6)', () => {
+        const ahead = { ...base, newestStoreTimeMs: base.nowMs + 3 * HOUR }
+        it('NTP-synchronized clears BEFORE_STORE', () => {
+            expect(evaluateClockTrust({ ...ahead, ntpSynced: true })).toEqual({ clockTrusted: true, clockReason: null })
+            // other checks still apply with NTP
+            expect(evaluateClockTrust({ ...ahead, ntpSynced: true, jumpSinceSync: true }).clockReason).toBe('CLOCK_JUMP')
+            expect(evaluateClockTrust({ ...ahead, ntpSynced: true, nowMs: base.buildTimeMs! - 1 }).clockReason).toBe('BEFORE_BUILD')
+        })
+        it('without NTP it stays until the wall clock passes the newest stored timestamp', () => {
+            expect(evaluateClockTrust({ ...ahead, ntpSynced: false }).clockReason).toBe('BEFORE_STORE')
+            expect(evaluateClockTrust({ ...ahead, ntpSynced: false, nowMs: ahead.newestStoreTimeMs - 6 * MIN }).clockReason).toBe('BEFORE_STORE')
+            // within the 5 min tolerance and past it: no longer BEFORE_STORE (then NEVER_SYNCED decides)
+            expect(evaluateClockTrust({ ...ahead, ntpSynced: false, nowMs: ahead.newestStoreTimeMs - 4 * MIN }).clockReason).toBe('NEVER_SYNCED')
+            expect(evaluateClockTrust({ ...ahead, ntpSynced: false, nowMs: ahead.newestStoreTimeMs + MIN }).clockReason).toBe('NEVER_SYNCED')
+        })
+        it('a peer (store) sync does not clear it, nor does trust coming back after 24 h of uptime', () => {
+            expect(evaluateClockTrust({ ...ahead, ntpSynced: false, peerSynced: true }).clockReason).toBe('BEFORE_STORE')
+            // 24 h with no further jump clears CLOCK_JUMP (jumpSinceSync false), never BEFORE_STORE
+            const c = fakeScheduleClock(base.nowMs)
+            let st = advanceClockJumpState(noteClockJump(c.bootId, c.uptimeS), c.bootId, c.uptimeS, false)
+            c.advance(JUMP_TRUST_RECOVERY_S * 1000)
+            st = advanceClockJumpState(st, c.bootId, c.uptimeS, false)
+            expect(st).toBeNull()
+            expect(evaluateClockTrust({ ...ahead, ntpSynced: false, peerSynced: true, jumpSinceSync: st != null }).clockReason).toBe('BEFORE_STORE')
+        })
     })
     it('a certainly-wrong clock is reported before "never synced"', () => {
         expect(evaluateClockTrust({ ...base, ntpSynced: false, nowMs: base.buildTimeMs! - HOUR }).clockReason).toBe('BEFORE_BUILD')
