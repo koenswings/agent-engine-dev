@@ -37,6 +37,22 @@ const sampleMeta: DiskMeta = {
 
 export const SYSTEM_META_PATH = '/META.yaml'
 
+/**
+ * Where the Engine looks for the system-disk META (idea#145).
+ *
+ * `IDEA_SYSTEM_META` may point at a test-local file so the box gate does not
+ * depend on `/META.yaml` on the host. The override is honoured only when
+ * `NODE_ENV=test` or `IDEA_TEST_MODE=true`. On a Pi those are unset, so a
+ * stray env var cannot redirect production away from `/META.yaml`.
+ */
+export const systemMetaPath = (): string => {
+  const override = process.env.IDEA_SYSTEM_META
+  if (override && (process.env.NODE_ENV === 'test' || process.env.IDEA_TEST_MODE === 'true')) {
+    return override
+  }
+  return SYSTEM_META_PATH
+}
+
 /** What to do when /META.yaml is missing, shown in errors (idea#145). */
 export const SYSTEM_META_HELP =
   'Run ./build-engine --personalize on this Pi to create /META.yaml, or check that ' +
@@ -76,7 +92,7 @@ export const ensureSystemMeta = async (
   device: DeviceName,
   options: { path?: string, allowCreate?: boolean, deps?: Partial<SystemMetaDeps> } = {},
 ): Promise<DiskMeta | null> => {
-  const metaPath = options.path ?? SYSTEM_META_PATH
+  const metaPath = options.path ?? systemMetaPath()
   const deps = { ...defaultSystemMetaDeps, ...options.deps }
   if (deps.exists(metaPath)) return null
   if (options.allowCreate === false) {
@@ -196,7 +212,7 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName, depsIn: Partial<
       path = `${disksRoot()}/${deviceSpec}/META.yaml`
       device = deviceSpec as DeviceName
     } else {
-      path = `/META.yaml`
+      path = systemMetaPath()
       // findmnt may return /dev/sda2 (Pi) or "overlay"/tmpfs (containers/VMs).
       // Only /dev/... paths have a usable device name at split('/')[2].
       const rootSource = (await $`findmnt / -no SOURCE`).stdout.trim()
@@ -223,7 +239,7 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName, depsIn: Partial<
       // Read the META.yaml file
       // /META.yaml is root-owned (600) so we need sudo for the system disk.
       // Disk META files under /disks/ are pi-owned and don't need it.
-      const catCmd = path === '/META.yaml' ? $`sudo cat ${path}` : $`cat ${path}`
+      const catCmd = path === SYSTEM_META_PATH ? $`sudo cat ${path}` : $`cat ${path}`
       const metaContent = (await catCmd).stdout.trim()
       const meta: DiskMeta = YAML.parse(metaContent)
       // YAML 1.1 coerces unquoted 1.0 → number 1; Version is always a string.

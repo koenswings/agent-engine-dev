@@ -2,6 +2,7 @@ import util from 'util';
 import { $, chalk, fs, os, question } from 'zx';
 import { IPAddress, PortNumber } from '../data/CommonTypes.js';
 import net from 'net';
+import http from 'http';
 import crypto from 'crypto';
 import { redactSecrets, redactString } from './redact.js'
 
@@ -125,6 +126,46 @@ export const isEngineOnline = (hostname: string, port: number): Promise<boolean>
     });
 
     socket.connect(port, hostname);
+  });
+};
+
+/**
+ * True when hostname:port returns an HTTP status line (any 1xx–5xx).
+ * idea#437: docker-proxy accepts TCP before the app serves; a status line
+ * is the readiness signal. 503 counts — Nextcloud returns it during
+ * maintenance/install, which still means the HTTP server is speaking.
+ * The request is destroyed as soon as headers arrive so a long or
+ * never-ending body cannot hold the probe open.
+ */
+export const isHttpPortReady = (hostname: string, port: number, timeoutMs = 2000): Promise<boolean> => {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    const req = http.request({
+      hostname,
+      port,
+      path: '/',
+      method: 'GET',
+      timeout: timeoutMs,
+      headers: { Connection: 'close' },
+    }, (res) => {
+      const code = res.statusCode;
+      res.resume();
+      req.destroy();
+      done(typeof code === 'number' && code >= 100 && code < 600);
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      done(false);
+    });
+    req.on('error', () => {
+      done(false);
+    });
+    req.end();
   });
 };
 

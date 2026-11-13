@@ -29,6 +29,7 @@ import { disksRoot, usbRoot } from './Config.js'
 import { APP_DATA_HELPER, eraseSlotArgs } from '../utils/appDataHelper.js'
 import { forgetMetaLook } from '../monitors/metaLookCache.js'
 import { pruneUnusedInstanceNetworks } from '../utils/instanceNetworks.js'
+import { checkInstanceIdForDocker } from '../utils/instanceIds.js'
 
 /** Same pattern as TEST_DEVICE_PATTERN in usbDeviceMonitor (avoid a circular import). */
 export const SLOT_ERASE_DEVICE_PATTERN = /^idea-test-[0-9]+$/
@@ -333,6 +334,15 @@ export const eraseDisk = async (
             throw new Error(`${disk.name} is this Pi's system disk and cannot be erased.`)
         }
         if (!disk.device) throw new Error(`${disk.name} is not docked.`)
+        // idea#479: every instance id on the disk is checked before any compose or
+        // Docker action. A legacy dotted id is refused; remove it with removeInstance first.
+        const badIds = Object.values(store.instanceDB ?? {})
+            .filter(i => i && i.storedOn === disk!.id)
+            .map(i => ({ id: String(i.id), check: checkInstanceIdForDocker(String(i.id)) }))
+            .filter(x => !x.check.ok)
+        if (badIds.length) {
+            throw new Error(`INVALID_INSTANCE_ID: ${disk.name} holds instance id(s) ${badIds.map(x => `'${x.id}'`).join(', ')} that eraseDisk does not accept; remove them with removeInstance first. Nothing changed.`)
+        }
         if (await isSystemDevice(disk.device)) throw new Error(`${disk.name} is this Pi's system disk and cannot be erased.`)
         devicePartition = disk.device
         whole = wholeDeviceOf(disk.device)

@@ -6,7 +6,7 @@
  * <rootfs>/boot/firmware, bind-mounted /dev /dev/pts /proc /sys /run and provided
  * /etc/resolv.conf. This module never mounts, never uses SSH and starts nothing:
  *  - apt postinst service starts are refused by usr/sbin/policy-rc.d (exit 101)
- *  - systemctl inside a chroot only enables (it ignores start/restart/reload)
+ *  - systemctl inside a chroot only enables or masks (it ignores start/restart/reload)
  *  - shims in /root/.idea-build/shims (first on PATH) turn udevadm, systemd-tmpfiles,
  *    reboot and hostnamectl into no-ops/refusals and refuse every pm2/docker daemon
  *    command, so the existing installers in Engine.ts can be reused unchanged
@@ -20,7 +20,7 @@ import { print } from '../utils/utils.js'
 import {
     EngineLock, FIRSTBOOT_SCRIPT, FIRSTBOOT_UNIT, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH, PM2_UNIT, PRELOAD_DOCKER_DIR, PRELOAD_NPM_DIR, SSH_REGEN_UNIT, SSH_HOSTKEYS_UNIT, NPM_OFFLINE_ENV,
     firstbootUnitText, pm2UnitText, sshHostKeysUnitText, preloadManifest, readDpkgStatus, rpiArchivePackageNames, sanitiseRootfs, serialiseLock, verifyRootfsChecks,
-    IMAGE_SPARSE_PATTERNS, writeBootSshTrigger,
+    IMAGE_SPARSE_PATTERNS, writeBootSshTrigger, PI_LOGIN_SHELL, USERCONFIG_UNIT, RENAME_USER_SSHD_DROPIN,
 } from './engineImage.js'
 
 export interface Out { stdout: string }
@@ -234,6 +234,21 @@ export const rootfsSteps = (o: RootfsBuildOptions, r: Runner, inst: Installers):
         } },
         { name: 'ownership: the Engine tree belongs to pi', run: async () => {
             await exec`chown -R pi:pi /home/pi/idea`
+        } },
+        { name: 'pi login: /bin/bash, password locked, userconfig masked, key-only sshd (idea#453)', run: async () => {
+            // RPi OS leaves pi with /usr/sbin/nologin until userconfig.service / userconf.txt runs.
+            // idea-flash.sh writes no userconf.txt, so the build sets the shell, locks the password,
+            // and masks the wizard so it cannot re-lock or rename pi (idea#453 approach B, build 9).
+            await exec`usermod -s ${PI_LOGIN_SHELL} pi`
+            await exec`passwd -l pi`
+            await exec`systemctl disable ${USERCONFIG_UNIT}`
+            await exec`systemctl mask ${USERCONFIG_UNIT}`
+            await exec`rm -f ${RENAME_USER_SSHD_DROPIN}`
+            await exec`install -d -o root -g root -m 0755 /etc/ssh/sshd_config.d`
+            // #334 installs 10-idea-login.conf from the asset; write it only when missing.
+            await exec`test -f /etc/ssh/sshd_config.d/10-idea-login.conf || printf %s ${'PasswordAuthentication no\nKbdInteractiveAuthentication no\n'} > /etc/ssh/sshd_config.d/10-idea-login.conf`
+            await exec`chown root:root /etc/ssh/sshd_config.d/10-idea-login.conf`
+            await exec`chmod 0644 /etc/ssh/sshd_config.d/10-idea-login.conf`
         } },
         { name: 'sanitise (no device identity) + bootfs ssh trigger', run: async () => {
             await r.host(`rm -rf ${q(R(`${E}/deb-cache`))}`)

@@ -16,7 +16,7 @@ This document provides a reference for the main provisioning and utility scripts
 
 -   **Purpose:** Build the Engine into a mounted image root filesystem for the idea repo's Engine image builder (idea#322 Option A, idea `tools/engine-image/INTERFACE.md`). Thin wrapper around `build-engine --root`.
 -   **Usage:** as root on an arm64 host: `script/build-engine-offline --root <MNT> --boot <MNT>/boot/firmware --report <OUT>/engine-build.json [--cache <dir>] [--lock <file>] [--image <ref@sha256:d>]... [--dry-run]`
--   **Details:** No SSH, nothing started (units enabled only), no device identity; sanitises and verifies the result and writes `/etc/idea/engine.lock`, `/etc/idea/engine-version` and the report. Exit 0 ok, 1 build/verify failed, 2 usage. `build-engine --verify-rootfs <dir> --lock <file>` only verifies; `build-engine --write-lock --lock <file>` writes the lock. The live/SSH modes below are unchanged. See docs/ENGINE_IMAGE.md.
+-   **Details:** No SSH, nothing started (units enabled only), no device identity; sanitises and verifies the result and writes `/etc/idea/engine.lock`, `/etc/idea/engine-version` and the report. The build gives pi `/bin/bash`, locks the password, masks `userconfig.service`, and keeps SSH key-only; verify's `pi-login` check fails the build otherwise (idea#453 approach B). Exit 0 ok, 1 build/verify failed, 2 usage. `build-engine --verify-rootfs <dir> --lock <file>` only verifies; `build-engine --write-lock --lock <file>` writes the lock. The live/SSH modes below are unchanged. See docs/ENGINE_IMAGE.md.
 
 ### `build-engine` (`script/build-engine.ts`)
 
@@ -132,7 +132,7 @@ This document provides a reference for the main provisioning and utility scripts
     -   Runs `test-preflight.sh` first (skipped for `cross-engine`, which drives live fleet Engines by design).
     -   Compiles into `dist-test/` (`tsc --outDir dist-test`), never `dist/`.
     -   Creates a private temp folder per run and exports `IDEA_WATCH_DIR` (replaces `/dev/engine`) and `IDEA_DISKS_ROOT` (replaces `/disks`); removes it on exit.
-    -   Sets `IDEA_TEST_MODE=true` (not for `cross-engine`) and writes the log to `test/testresults/test-<suite>-<UTC timestamp>.log`.
+    -   Sets `IDEA_TEST_MODE=true` (not for `cross-engine`), writes a test-local system META in the temp folder and exports `IDEA_SYSTEM_META` so the gate does not depend on `/META.yaml` on the host (`systemMetaPath()` in `src/data/Meta.ts` honours it only under `IDEA_TEST_MODE` / `NODE_ENV=test`), and writes the log to `test/testresults/test-<suite>-<UTC timestamp>.log`.
 
 ---
 
@@ -208,6 +208,10 @@ Tests: `test/automated/idea-app-data-usage-key.test.ts`, `test/automated/idea-us
 ### `idea-app-data` v10: `borg-list` inventory selects every archive (idea#450)
 
 v9's 2-argument `borg-list <bdev> <id>` ran `borg info --json -- <repo>`. With no archive selector, borg 1.x (idea03 runs 1.4.0) prints repository info only: `cache`, `encryption`, `repository`, `security_dir`, and no `archives` key. So backup cleanup (idea#401) and listBackup/verifyBackup (idea#446) could never read an archive. v10 runs `borg info --json --glob-archives '*' -- <repo>`, which keeps the same JSON shape with `archives[]` and per-archive `stats`. `borg list --json` was not used because it has no sizes. No other verb changed and there is no new sudoers line; `install-root-helpers` replaces the binary and checks `idea-app-data version`. The Engine requires v10 for cleanup (`BACKUP_CLEANUP_HELPER_MIN`), so a v9 helper gets `HELPER_OUTDATED` instead of a silent empty inventory. updateApp (`UPDATE_HELPER_MIN`) is unchanged: it never calls `borg-list`. The test fake borg now behaves like real borg (no `archives` without a selector), and `test/automated/borg-list-real.test.ts` runs the real binary (`IDEA_TEST_BORG`, else `/usr/bin/borg`; skipped when neither exists). Rollout: install the helper before or together with the Engine; a v10 helper with an older Engine only logs the version mismatch warning at startup.
+
+### `idea-app-data` v13: `quarantine` accepts a legacy dotted instance id (idea#479)
+
+Older Engines wrote instance ids with a dot, e.g. `nextcloud-yj8ral61js46bphogbi.backup-20261027-181633`. v12 refused them everywhere (`RE_ID`), so `removeInstance` could never quarantine them. v13 adds `RE_LEGACY_ID` (`^[a-z0-9][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)+$`, at most 128 characters: no `..`, no leading or trailing dot, no `/`) and `check_removal_id`, used by `quarantine` only. Every other subcommand still uses `check_id`. Same argv, no sudoers change. The Engine asks for v13 only when it removes a dotted id (`REMOVE_LEGACY_ID_HELPER_MIN`); strict ids still need v4. Rollout: `./install-root-helpers` and confirm `idea-app-data 13`, together with or before the Engine.
 
 ### `idea-app-data` v12: `borg-extract-verify` prints `scratchBytes` (idea#460)
 

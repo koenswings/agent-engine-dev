@@ -11,6 +11,7 @@ import {
     parseImageArgs, UsageError, validateLock, serialiseLock, writeLock, readLock, LOCK_SCHEMA, EngineLock,
     sanitiseRootfs, verifyRootfs, IDENTITY_PATHS, GENERIC_HOSTNAME, IMAGE_ENABLED_UNITS, PM2_UNIT, SSH_REGEN_UNIT, SSH_HOSTKEYS_UNIT,
     pm2UnitText, sshHostKeysUnitText, sshHostKeyUnitIsUnconditional, DEFAULT_CONSOLE_PATH, preloadManifest, imageIdFromManifest, imageTarName, readDpkgStatus, unitEnabled, unitLinks, unitInstallTargets, verifyRootfsChecks, VERIFY_CHECKS, IMAGE_SPARSE_PATTERNS, filesWithAuthKeyShape, PRELOAD_DOCKER_DIR, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH, rootfsHostProblem,
+    PI_LOGIN_SHELL, USERCONFIG_UNIT, RENAME_USER_SSHD_DROPIN, shadowPasswordIsLocked, passwdShellOf, shadowHashOf, unitMasked, piLoginProblems,
 } from '../../src/install/engineImage.js'
 import { rootfsSteps, runRootfsBuild, engineCloneCommand, consoleCloneCommand, Runner, Installers, SHIMS, quoteTemplate } from '../../src/install/engineRootfs.js'
 import { pinNpmTools, writeReport } from '../../src/install/engineImageCli.js'
@@ -128,6 +129,30 @@ const goodRootfs = async (root: string) => {
     await fs.writeFile(R('etc/machine-id'), ''); await fs.writeFile(R('etc/hostname'), GENERIC_HOSTNAME + '\n')
     await fs.writeFile(R('etc/hosts'), '127.0.0.1\tlocalhost\n127.0.1.1\traspberrypi\n')
     await fs.ensureDir(R('etc/idea')); await fs.writeFile(R(IMAGE_LOCK_PATH.slice(1)), serialiseLock(lock())); await fs.writeFile(R(IMAGE_VERSION_PATH.slice(1)), '1.0\n')
+    await addPiLogin(root)
+}
+/** idea#453 approach B: pi has a bash shell, a locked password, userconfig is masked, key-only sshd. */
+const addPiLogin = async (root: string) => {
+    const R = (p: string) => path.join(root, p)
+    await fs.ensureDir(R('etc'))
+    if (!(await fs.pathExists(R('etc/passwd')))) {
+        await fs.writeFile(R('etc/passwd'), 'root:x:0:0:root:/root:/bin/bash\npi:x:1000:1000:,,,:/home/pi:/bin/bash\n')
+    }
+    if (!(await fs.pathExists(R('etc/shadow')))) {
+        await fs.writeFile(R('etc/shadow'), 'root:*:1:0:99999:7:::\npi:!:1:0:99999:7:::\n')
+    }
+    await fs.ensureDir(R('etc/systemd/system'))
+    const mask = R(`etc/systemd/system/${USERCONFIG_UNIT}`)
+    if (await fs.pathExists(mask)) await fs.remove(mask)
+    await fs.symlink('/dev/null', mask)
+    await fs.ensureDir(R('etc/ssh/sshd_config.d'))
+    if (!(await fs.pathExists(R('etc/ssh/sshd_config')))) {
+        await fs.writeFile(R('etc/ssh/sshd_config'), 'Include /etc/ssh/sshd_config.d/*.conf\nUsePAM yes\n')
+    }
+    const dropin = R('etc/ssh/sshd_config.d/10-idea-login.conf')
+    if (!(await fs.pathExists(dropin))) {
+        await fs.writeFile(dropin, 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n')
+    }
 }
 const addIdentity = async (root: string) => {
     const R = (p: string) => path.join(root, p)
@@ -183,6 +208,87 @@ describe('sanitise + verify', () => {
         const p = (await verifyRootfs({ ...ctx(), lock: l })).join('\n')
         for (const s of ['not detached', 'dist/src/index.js missing', 'User=pi', 'pm2-root', SSH_REGEN_UNIT, 'content differs', 'mode 0755', 'preload nginx', 'images.lock missing'])
             expect(p).toContain(s)
+    })
+})
+
+
+describe('verify: pi login (idea#453 approach B)', () => {
+    let root: string
+    beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'rootfs-')); await goodRootfs(root) })
+    afterEach(async () => { await fs.remove(root) })
+    const ctx = () => ({ root, enginePath: ENGINE, lock: lock(), storeIdentity: storeShas })
+    const problemsOf = async () => (await verifyRootfsChecks(ctx())).find(x => x.name === 'pi-login')!.problems
+
+    it('helpers: locked shadow hashes, passwd shell, unitMasked', async () => {
+        expect(shadowPasswordIsLocked('!')).toBe(true)
+        expect(shadowPasswordIsLocked('!!$6$abc')).toBe(true)
+        expect(shadowPasswordIsLocked('!$6$abc')).toBe(true)
+        expect(shadowPasswordIsLocked('*')).toBe(true)
+        expect(shadowPasswordIsLocked('')).toBe(false)
+        expect(shadowPasswordIsLocked('$6$abc')).toBe(false)
+        expect(passwdShellOf('pi:x:1000:1000::/home/pi:/bin/bash\n', 'pi')).toBe('/bin/bash')
+        expect(passwdShellOf('pi:x:1000:1000::/home/pi:/usr/sbin/nologin\n', 'pi')).toBe('/usr/sbin/nologin')
+        expect(passwdShellOf('root:x:0:0:root:/root:/bin/bash\n', 'pi')).toBeUndefined()
+        expect(shadowHashOf('pi:!:1:0:99999:7:::\n', 'pi')).toBe('!')
+        expect(shadowHashOf('root:*:1:0:99999:7:::\n', 'pi')).toBeUndefined()
+        expect(await unitMasked(root, USERCONFIG_UNIT)).toBe(true)
+        expect(await piLoginProblems(root)).toEqual([])
+    })
+
+    it('a clean rootfs passes pi-login', async () => {
+        expect(await problemsOf()).toEqual([])
+        expect((await verifyRootfs(ctx()))).toEqual([])
+    })
+
+    it('fails when pi has nologin, an unlocked password, userconfig is unmasked, rename_user.conf is present, or password auth is on', async () => {
+        const R = (p: string) => path.join(root, p)
+        await fs.writeFile(R('etc/passwd'), 'pi:x:1000:1000::/home/pi:/usr/sbin/nologin\n')
+        expect(await problemsOf()).toContain('pi shell is /usr/sbin/nologin, must be /bin/bash')
+        await fs.writeFile(R('etc/passwd'), 'pi:x:1000:1000::/home/pi:/bin/bash\n')
+
+        await fs.writeFile(R('etc/shadow'), 'pi:$6$abc:1:0:99999:7:::\n')
+        expect(await problemsOf()).toContain('pi password is not locked (passwd -S must show L)')
+        await fs.writeFile(R('etc/shadow'), 'pi:!:1:0:99999:7:::\n')
+
+        await fs.remove(R(`etc/systemd/system/${USERCONFIG_UNIT}`))
+        expect((await problemsOf()).join('\n')).toMatch(/userconfig\.service is not masked/)
+        await fs.symlink('/dev/null', R(`etc/systemd/system/${USERCONFIG_UNIT}`))
+
+        await fs.writeFile(R(RENAME_USER_SSHD_DROPIN.slice(1)), 'Banner /usr/share/userconf-pi/sshd_banner\n')
+        expect((await problemsOf()).join('\n')).toContain(`${RENAME_USER_SSHD_DROPIN} present`)
+        await fs.remove(R(RENAME_USER_SSHD_DROPIN.slice(1)))
+
+        await fs.remove(R('etc/ssh/sshd_config.d/10-idea-login.conf'))
+        expect((await problemsOf()).join('\n')).toContain('/etc/ssh/sshd_config.d/10-idea-login.conf missing')
+        await fs.writeFile(R('etc/ssh/sshd_config.d/10-idea-login.conf'), 'PasswordAuthentication yes\nKbdInteractiveAuthentication no\n')
+        expect((await problemsOf()).join('\n')).toContain('must set PasswordAuthentication no')
+        await fs.writeFile(R('etc/ssh/sshd_config.d/10-idea-login.conf'), 'PasswordAuthentication no\n')
+        expect((await problemsOf()).join('\n')).toContain('must set KbdInteractiveAuthentication no')
+        await fs.writeFile(R('etc/ssh/sshd_config.d/10-idea-login.conf'), 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n')
+        expect(await problemsOf()).toEqual([])
+    })
+
+    it('the build sets the shell, locks the password, masks userconfig, removes rename_user.conf, and writes the key-only drop-in if missing', async () => {
+        const R = (p: string) => path.join(root, p)
+        const log: string[] = []
+        const r: Runner = { host: async c => { log.push(`host: ${c}`); return { stdout: '' } }, chroot: async c => { log.push(`chroot: ${c}`); return { stdout: '' } } }
+        const inst = new Proxy({}, { get: (_t, k) => async (exec: any) => { await exec`echo ${String(k)}` } }) as Installers
+        const steps = rootfsSteps({ rootfs: root, lock: lock(), cache: '/c', repo: '/r', enginePath: ENGINE, language: 'en_GB.UTF-8', keyboard: 'gb', timezone: 'Europe/Brussels', trackedStoreIdentity: [], storeIdentity: storeShas, boot: R('boot/firmware') } as any, r, inst)
+        const i = steps.findIndex(s => /pi login:/.test(s.name))
+        expect(i).toBeGreaterThan(steps.findIndex(s => /ownership/.test(s.name)))
+        expect(i).toBeLessThan(steps.findIndex(s => /sanitise/.test(s.name)))
+        await steps[i].run()
+        expect(log).toEqual([
+            `chroot: usermod -s '${PI_LOGIN_SHELL}' pi`,
+            'chroot: passwd -l pi',
+            `chroot: systemctl disable '${USERCONFIG_UNIT}'`,
+            `chroot: systemctl mask '${USERCONFIG_UNIT}'`,
+            `chroot: rm -f '${RENAME_USER_SSHD_DROPIN}'`,
+            'chroot: install -d -o root -g root -m 0755 /etc/ssh/sshd_config.d',
+            `chroot: test -f /etc/ssh/sshd_config.d/10-idea-login.conf || printf %s 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n' > /etc/ssh/sshd_config.d/10-idea-login.conf`,
+            'chroot: chown root:root /etc/ssh/sshd_config.d/10-idea-login.conf',
+            'chroot: chmod 0644 /etc/ssh/sshd_config.d/10-idea-login.conf',
+        ])
     })
 })
 
@@ -362,6 +468,16 @@ describe('rootfs build plan (stubbed runner and installers)', () => {
         const cmds = log.filter(l => !l.startsWith('host: printf %s')).join('\n')
         expect(cmds).not.toMatch(/systemctl (start|restart)|pm2 (start|startup|save|resurrect)|docker (load|run|network create)|udevadm trigger|tailscale up/)
         expect(all).toContain(`systemctl enable ${[...IMAGE_ENABLED_UNITS].sort().map(u => `'${u}'`).join(' ')}`)
+        expect(all).toContain(`usermod -s '${PI_LOGIN_SHELL}' pi`)
+        expect(all).toContain('passwd -l pi')
+        expect(all).toContain(`systemctl disable '${USERCONFIG_UNIT}'`)
+        expect(all).toContain(`systemctl mask '${USERCONFIG_UNIT}'`)
+        expect(all).toContain(`rm -f '${RENAME_USER_SSHD_DROPIN}'`)
+        const enableAt = log.findIndex(l => l.includes('systemctl enable') && l.includes(PM2_UNIT))
+        const usermodAt = log.findIndex(l => l.includes(`usermod -s '${PI_LOGIN_SHELL}' pi`))
+        const chownAt = log.findIndex(l => l.includes("chown -R pi:pi /home/pi/idea"))
+        expect(usermodAt).toBeGreaterThan(chownAt)
+        expect(usermodAt).toBeGreaterThan(enableAt)
         expect(all).toContain('--frozen-lockfile --offline')
         expect(all).toContain(`fetch -q --depth 1 'file:///repo' '${COMMIT}'`)
         expect(all).toContain('checkout -q --detach FETCH_HEAD')
