@@ -8,8 +8,10 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { fs, path } from 'zx'
 import os from 'os'
-import { ENGINE_IMAGE_PLATFORM, buildImageSteps, saveFailedMessage, checkLoadedDigest, legacyServiceImageTarName, parseImageRef, saveName, serviceImageTarName } from '../../src/data/ImageRef.js'
-import { serviceImageTarPath, verifyServiceImageDigest } from '../../src/data/Instance.js'
+import { createHash } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
+import { ENGINE_IMAGE_PLATFORM, buildImageSteps, saveFailedMessage, checkLoadedDigest, checkServiceTarPin, digestInspectRef, legacyServiceImageTarName, parseImageRef, planExistingTarOnInstall, planPinnedServiceImageLoad, saveName, serviceImageTarName, serviceTarQuarantineName } from '../../src/data/ImageRef.js'
+import { inspectServiceTar, quarantineServiceTar, readTarEntry, serviceImageTarPath, verifyServiceImageDigest } from '../../src/data/Instance.js'
 
 const INDEX = 'sha256:a5ae1caf3e31b5bb9f2df9c94d45c4cf6fdb8ce3cfe8730364bd6648cdbadc31'
 const PLATFORM = 'sha256:2b1cb1ed1dda1d626ac7dc0b4c23c04d575eeac6fc208d848a10282ba2f64079'
@@ -36,6 +38,10 @@ describe('parseImageRef / saveName / tar names', () => {
         expect(serviceImageTarPath('/disks/sdb1', PINNED)).toBe('/disks/sdb1/services/koenswings_kolibri:1.1-0.19.5.tar')
         expect(serviceImageTarPath('/disks/sdb1', 'ghcr.io/kiwix/kiwix-serve:3.8.2')).toBe('/disks/sdb1/services/ghcr.io_kiwix_kiwix-serve:3.8.2.tar')
         expect(legacyServiceImageTarName(PINNED)).toBe(`koenswings_kolibri:1.1-0.19.5@${INDEX}.tar`)
+        const web = 'ghcr.io/koenswings/usage-dashboard-web:1.0@sha256:' + '9'.repeat(64)
+        expect(serviceImageTarName(web)).toBe('ghcr.io_koenswings_usage-dashboard-web:1.0.tar')
+        expect(legacyServiceImageTarName(web)).toContain('@sha256:')
+        expect(serviceImageTarName(web)).not.toBe(legacyServiceImageTarName(web))
     })
 })
 
@@ -164,5 +170,267 @@ describe('verifyServiceImageDigest (fake docker inspect)', () => {
         setInspect(null)
         await expect(verifyServiceImageDigest(PINNED)).rejects.toThrow(/not present/)
         await expect(verifyServiceImageDigest(PINNED, { requirePresent: false })).resolves.toBeUndefined()
+    })
+})
+
+// idea#445: verify inspects repo@digest, so a wrong :tag does not fail when the pin is present
+describe('verifyServiceImageDigest inspects repo@digest (idea#445)', () => {
+    let dir = ''
+    let oldPath = ''
+    beforeAll(() => {
+        dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-docker-445-'))
+        fs.writeFileSync(path.join(dir, 'docker'), '#!/bin/sh\n' +
+            'D=$(dirname "$0")\n' +
+            '[ "$1 $2" = "image inspect" ] || exit 2\n' +
+            'echo "$3" >> "$D/seen"\n' +
+            'img="$3"\n' +
+            'if echo "$img" | grep -q "@sha256:"; then\n' +
+            '  cat "$D/digest.out"\n' +
+            '  exit $(cat "$D/digest.rc")\n' +
+            'fi\n' +
+            'cat "$D/tag.out"\n' +
+            'exit $(cat "$D/tag.rc")\n', { mode: 0o755 })
+        fs.writeFileSync(path.join(dir, 'digest.out'), `["koenswings/kolibri@${INDEX}"]|${INDEX}`)
+        fs.writeFileSync(path.join(dir, 'digest.rc'), '0')
+        fs.writeFileSync(path.join(dir, 'tag.out'), `["koenswings/kolibri@${PLATFORM}"]|${PLATFORM}`)
+        fs.writeFileSync(path.join(dir, 'tag.rc'), '0')
+        oldPath = process.env.PATH ?? ''
+        process.env.PATH = `${dir}:${oldPath}`
+    })
+    afterAll(() => { process.env.PATH = oldPath; fs.removeSync(dir) })
+
+    it('passes when repo@digest has the pin even if repo:tag points at another build', async () => {
+        await expect(verifyServiceImageDigest(PINNED)).resolves.toBeUndefined()
+        const seen = fs.readFileSync(path.join(dir, 'seen'), 'utf8')
+        expect(seen).toContain(`koenswings/kolibri@${INDEX}`)
+        expect(seen).not.toContain('koenswings/kolibri:1.1-0.19.5')
+    })
+})
+
+
+const WEB_PIN = 'sha256:9b5501f0690f02146217595f177496612d107aefd2bd56c181f84c7f1c678139'
+const WEB_OLD = 'sha256:ef48f1faaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+const WEB = `ghcr.io/koenswings/usage-dashboard-web:1.0@${WEB_PIN}`
+
+const sha = (bytes: Buffer) => 'sha256:' + createHash('sha256').update(bytes).digest('hex')
+const hex = (digest: string) => digest.slice('sha256:'.length)
+const OCI_INDEX = 'application/vnd.oci.image.index.v1+json'
+const OCI_MANIFEST = 'application/vnd.oci.image.manifest.v1+json'
+const WEB_NAME = 'ghcr.io/koenswings/usage-dashboard-web:1.0'
+const buf = (v: unknown): Buffer => Buffer.isBuffer(v) ? v : Buffer.from(typeof v === 'string' ? v : JSON.stringify(v), 'utf8')
+const membersOf = (files: Record<string, unknown>): Map<string, Buffer> => {
+    const m = new Map<string, Buffer>()
+    for (const [k, v] of Object.entries(files)) m.set(k, buf(v))
+    return m
+}
+const indexWrapper = (name: string, digest: string, media: string, size: number) => ({
+    schemaVersion: 2,
+    mediaType: OCI_INDEX,
+    manifests: [{ mediaType: media, digest, size, annotations: { 'io.containerd.image.name': name } }],
+})
+const repoTags = (name: string) => [{ RepoTags: [name], Config: 'cfg', Layers: [] }]
+const withBlob = (name: string, media: string, blob: Buffer): Record<string, unknown> => {
+    const digest = sha(blob)
+    return {
+        'index.json': indexWrapper(name, digest, media, blob.length),
+        'manifest.json': repoTags(name),
+        [`blobs/sha256/${hex(digest)}`]: blob,
+    }
+}
+const packMembersTar = (tarPath: string, files: Record<string, unknown>): void => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'idea-445-tar-'))
+    for (const [rel, v] of Object.entries(files)) {
+        const dest = path.join(dir, rel)
+        fs.ensureDirSync(path.dirname(dest))
+        fs.writeFileSync(dest, buf(v))
+    }
+    const args = ['-C', dir, '-cf', tarPath, ...Object.keys(files)]
+    execFileSync('tar', args)
+    fs.removeSync(dir)
+}
+
+describe('digestInspectRef (idea#445)', () => {
+    it('addresses a pin as repo@digest, not repo:tag', () => {
+        expect(digestInspectRef(PINNED)).toBe(`koenswings/kolibri@${INDEX}`)
+        expect(digestInspectRef(WEB)).toBe(`ghcr.io/koenswings/usage-dashboard-web@${WEB_PIN}`)
+        expect(digestInspectRef(TAG)).toBeNull()
+    })
+})
+
+describe('planPinnedServiceImageLoad (idea#445, idea03 repro)', () => {
+    const base = { ref: WEB, pin: WEB_PIN, tarPath: '/services/ghcr.io_koenswings_usage-dashboard-web:1.0.tar' }
+    it('pin already local + stale tar: skip load, quarantine, do not fail (idea03)', () => {
+        const p = planPinnedServiceImageLoad({ ...base, pinPresent: true, tarState: 'mismatch', tarDigest: WEB_OLD })
+        expect(p.action).toBe('skip-retag')
+        expect(p.quarantine).toBe(true)
+        expect(p.warning).toMatch(/stale service tar/)
+        expect(p.warning).toMatch(/ef48f1fa/)
+        expect(p.warning).toMatch(/already local/)
+        expect(p.error).toBeUndefined()
+    })
+    it('pin already local + matching or missing tar: skip load, no quarantine', () => {
+        expect(planPinnedServiceImageLoad({ ...base, pinPresent: true, tarState: 'matches', tarDigest: WEB_PIN })).toEqual({ action: 'skip-retag', quarantine: false })
+        expect(planPinnedServiceImageLoad({ ...base, pinPresent: true, tarState: 'missing' })).toEqual({ action: 'skip-retag', quarantine: false })
+    })
+    it('pin absent + matching tar: load it', () => {
+        expect(planPinnedServiceImageLoad({ ...base, pinPresent: false, tarState: 'matches', tarDigest: WEB_PIN })).toEqual({ action: 'load', quarantine: false })
+    })
+    it('pin absent + stale tar: quarantine and fail, never load', () => {
+        const p = planPinnedServiceImageLoad({ ...base, pinPresent: false, tarState: 'mismatch', tarDigest: WEB_OLD })
+        expect(p.action).toBe('stale-fail')
+        expect(p.quarantine).toBe(true)
+        expect(p.error).toMatch(/stale service tar/)
+        expect(p.error).toMatch(/not loaded/)
+        expect(p.error).toContain(WEB_OLD)
+        expect(p.error).toContain(WEB_PIN)
+    })
+    it('pin absent + unreadable tar: fail without loading or quarantining', () => {
+        const p = planPinnedServiceImageLoad({ ...base, pinPresent: false, tarState: 'unreadable', tarReason: 'no index.json' })
+        expect(p.action).toBe('stale-fail')
+        expect(p.quarantine).toBe(false)
+        expect(p.error).toMatch(/cannot read a digest/)
+        expect(p.error).toMatch(/no index.json/)
+    })
+    it('pin absent + missing tar: idea#109 missing warning path', () => {
+        expect(planPinnedServiceImageLoad({ ...base, pinPresent: false, tarState: 'missing' })).toEqual({ action: 'missing', quarantine: false })
+    })
+})
+
+describe('planExistingTarOnInstall (idea#445)', () => {
+    it('unpinned existing tar is still reused', () => {
+        expect(planExistingTarOnInstall(false, 'matches')).toBe('use')
+        expect(planExistingTarOnInstall(false, 'absent')).toBe('create')
+    })
+    it('pinned: reuse only a matching tar; stale or unreadable is quarantined and replaced', () => {
+        expect(planExistingTarOnInstall(true, 'matches')).toBe('use')
+        expect(planExistingTarOnInstall(true, 'mismatch')).toBe('quarantine-and-create')
+        expect(planExistingTarOnInstall(true, 'unreadable')).toBe('quarantine-and-create')
+        expect(planExistingTarOnInstall(true, 'absent')).toBe('create')
+        expect(planExistingTarOnInstall(true, 'missing')).toBe('create')
+    })
+})
+
+describe('checkServiceTarPin (idea#445, aligned with Kid PR #15)', () => {
+    it('(a) named index-wrapper digest equal to the pin passes', () => {
+        const blob = buf({ schemaVersion: 2, mediaType: OCI_INDEX, manifests: [{ mediaType: OCI_MANIFEST, digest: PLATFORM, platform: { os: 'linux', architecture: 'arm64' } }] })
+        const pin = sha(blob)
+        const files = withBlob(WEB_NAME, OCI_INDEX, blob)
+        expect(checkServiceTarPin(`${WEB_NAME}@${pin}`, membersOf(files))).toEqual({ state: 'matches', digest: pin, layout: 'index' })
+        expect(checkServiceTarPin(`${WEB_NAME}@${WEB_OLD}`, membersOf(files))).toMatchObject({ state: 'mismatch', digest: pin, layout: 'index' })
+        expect(pin).not.toBe(sha(buf(files['index.json'])))
+    })
+    it('(b) single manifest digest equal to the pin passes (ef48-style, no index)', () => {
+        const blob = buf({ schemaVersion: 2, mediaType: OCI_MANIFEST, config: { digest: 'sha256:' + 'c'.repeat(64) }, layers: [] })
+        const pin = sha(blob)
+        const files = withBlob(WEB_NAME, OCI_MANIFEST, blob)
+        expect(checkServiceTarPin(`${WEB_NAME}@${pin}`, membersOf(files))).toEqual({ state: 'matches', digest: pin, layout: 'manifest' })
+    })
+    it('(c) platform-manifest only while the pin is an index: mismatch, refused (no --platform-digest hatch)', () => {
+        const blob = buf({ schemaVersion: 2, mediaType: OCI_MANIFEST, config: { digest: 'sha256:' + 'c'.repeat(64) }, layers: [], platform: { os: 'linux', architecture: 'arm64' } })
+        const files = withBlob(TAG, OCI_MANIFEST, blob)
+        const top = sha(blob)
+        const r = checkServiceTarPin(`${TAG}@${INDEX}`, membersOf(files))
+        expect(r.state).toBe('mismatch')
+        expect(r.layout).toBe('manifest')
+        expect(r.digest).toBe(top)
+        expect(r.reason).toMatch(/platform-manifest only/)
+        expect(r.reason).toContain(INDEX)
+        // The same tar matches if the pin is that manifest digest (b), not an index pin.
+        expect(checkServiceTarPin(`${TAG}@${top}`, membersOf(files)).state).toBe('matches')
+    })
+    it('(d) no index.json, no manifest.json, missing blob, corrupt blob, or duplicate names fail as unreadable', () => {
+        const blob = buf({ schemaVersion: 2, mediaType: OCI_INDEX, manifests: [] })
+        const pin = sha(blob)
+        const ref = `${WEB_NAME}@${pin}`
+        expect(checkServiceTarPin(ref, membersOf({ 'manifest.json': repoTags(WEB_NAME) }))).toMatchObject({ state: 'unreadable', reason: 'no index.json' })
+        expect(checkServiceTarPin(ref, membersOf({ 'index.json': indexWrapper(WEB_NAME, pin, OCI_INDEX, blob.length) }))).toMatchObject({ state: 'unreadable', reason: 'no manifest.json' })
+        expect(checkServiceTarPin(ref, membersOf({
+            'index.json': indexWrapper(WEB_NAME, pin, OCI_INDEX, blob.length),
+            'manifest.json': repoTags(WEB_NAME),
+        }))).toMatchObject({ state: 'unreadable', reason: /top-level blob .* is not in the tar/ })
+        const other = buf('not-the-index')
+        expect(checkServiceTarPin(ref, membersOf({
+            'index.json': indexWrapper(WEB_NAME, pin, OCI_INDEX, blob.length),
+            'manifest.json': repoTags(WEB_NAME),
+            [`blobs/sha256/${hex(pin)}`]: other,
+        }))).toMatchObject({ state: 'unreadable', reason: /hashes to/ })
+        const d1 = 'sha256:' + '1'.repeat(64)
+        const d2 = 'sha256:' + '2'.repeat(64)
+        const dup = {
+            schemaVersion: 2,
+            manifests: [
+                { mediaType: OCI_INDEX, digest: d1, size: 1, annotations: { 'io.containerd.image.name': WEB_NAME } },
+                { mediaType: OCI_INDEX, digest: d2, size: 1, annotations: { 'io.containerd.image.name': WEB_NAME } },
+            ],
+        }
+        expect(checkServiceTarPin(`${WEB_NAME}@${d1}`, membersOf({ 'index.json': dup, 'manifest.json': repoTags(WEB_NAME) }))).toMatchObject({ state: 'unreadable', reason: /duplicate name/ })
+    })
+    it('manifest.json RepoTags must name repo:tag', () => {
+        const blob = buf({ schemaVersion: 2, mediaType: OCI_INDEX, manifests: [] })
+        const pin = sha(blob)
+        const r = checkServiceTarPin(`${WEB_NAME}@${pin}`, membersOf({
+            'index.json': indexWrapper(WEB_NAME, pin, OCI_INDEX, blob.length),
+            'manifest.json': repoTags('other/image:1.0'),
+            [`blobs/sha256/${hex(pin)}`]: blob,
+        }))
+        expect(r.state).toBe('unreadable')
+        expect(r.reason).toMatch(/RepoTags/)
+    })
+    it('(a) extra: a bare image-index index.json whose file digest equals the pin matches, a nested platform digest does not', () => {
+        const index = {
+            schemaVersion: 2,
+            mediaType: OCI_INDEX,
+            manifests: [
+                { mediaType: OCI_MANIFEST, digest: 'sha256:' + 'a'.repeat(64), platform: { architecture: 'amd64', os: 'linux' } },
+                { mediaType: OCI_MANIFEST, digest: PLATFORM, platform: { architecture: 'arm64', os: 'linux' } },
+            ],
+        }
+        const bytes = buf(index)
+        const pin = sha(bytes)
+        const files = { 'index.json': bytes, 'manifest.json': repoTags(WEB_NAME) }
+        expect(checkServiceTarPin(`${WEB_NAME}@${pin}`, membersOf(files))).toEqual({ state: 'matches', digest: pin, layout: 'index' })
+        expect(checkServiceTarPin(`${WEB_NAME}@${PLATFORM}`, membersOf(files)).state).toBe('unreadable')
+    })
+})
+
+describe('service tar IO: inspectServiceTar and quarantine (idea#445)', () => {
+    let dir = ''
+    beforeAll(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'idea-445-io-')) })
+    afterAll(() => { fs.removeSync(dir) })
+
+    it('inspectServiceTar reads the wrapper index digest without docker load', async () => {
+        const blob = buf({ schemaVersion: 2, mediaType: OCI_INDEX, manifests: [] })
+        const pin = sha(blob)
+        const tar = path.join(dir, 'web:1.0.tar')
+        packMembersTar(tar, withBlob(WEB_NAME, OCI_INDEX, blob))
+        const bytes = await readTarEntry(tar, 'index.json')
+        expect(bytes).not.toBeNull()
+        expect(JSON.parse(bytes!.toString('utf8')).manifests[0].digest).toBe(pin)
+        await expect(inspectServiceTar(tar, `${WEB_NAME}@${pin}`)).resolves.toMatchObject({ state: 'matches', digest: pin, layout: 'index' })
+        await expect(inspectServiceTar(tar, `${WEB_NAME}@${WEB_OLD}`)).resolves.toMatchObject({ state: 'mismatch', digest: pin, layout: 'index' })
+    })
+    it('quarantine renames aside and never deletes; collision gets a suffix', async () => {
+        const tar = path.join(dir, 'stale:1.0.tar')
+        fs.writeFileSync(tar, 'old')
+        const now = Date.parse('2026-11-11T21:51:00.000Z')
+        expect(serviceTarQuarantineName(tar, now)).toBe(`${tar}.quarantine-20261111T215100Z`)
+        const q = await quarantineServiceTar(tar, now)
+        expect(q).toBe(`${tar}.quarantine-20261111T215100Z`)
+        expect(fs.existsSync(tar)).toBe(false)
+        expect(fs.readFileSync(q, 'utf8')).toBe('old')
+        fs.writeFileSync(tar, 'old2')
+        const q2 = await quarantineServiceTar(tar, now)
+        expect(q2).toBe(`${tar}.quarantine-20261111T215100Z-2`)
+        expect(fs.readFileSync(q, 'utf8')).toBe('old')
+        expect(fs.readFileSync(q2, 'utf8')).toBe('old2')
+    })
+    it('a tar without index.json is unreadable, not a match', async () => {
+        const tar = path.join(dir, 'classic.tar')
+        const empty = path.join(dir, 'empty-dir')
+        fs.ensureDirSync(empty)
+        fs.writeFileSync(path.join(empty, 'manifest.json'), '[]')
+        execFileSync('tar', ['-C', empty, '-cf', tar, 'manifest.json'])
+        await expect(inspectServiceTar(tar, WEB)).resolves.toMatchObject({ state: 'unreadable', reason: 'no index.json' })
+        await expect(inspectServiceTar(path.join(dir, 'missing.tar'), WEB)).resolves.toMatchObject({ state: 'missing', digest: null })
     })
 })

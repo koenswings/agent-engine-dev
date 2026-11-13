@@ -57,14 +57,14 @@ describe('system disk helper + mount command (idea#134)', () => {
     })
 
     it('Engine mount command matches the sudoers typed entry exactly', () => {
-        expect(SUDO_MOUNT_PATTERN).toBe('/usr/bin/mount -t ext4 /dev/sd[a-z][12] /disks/sd[a-z][12]')
+        expect(SUDO_MOUNT_PATTERN).toBe('/usr/bin/mount -t ext4 /dev/sd[a-z][1-9] /disks/sd[a-z][1-9]')
         expect(mountExt4Command('sdb2', '/disks/sdb2')).toEqual([
             '/usr/bin/mount', '-t', 'ext4', '/dev/sdb2', '/disks/sdb2',
         ])
     })
 
     it('ENGINE_CAPABILITIES includes eraseDisk', () => {
-        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'usageSummaries'])
+        expect(ENGINE_CAPABILITIES).toEqual(['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'usageSummaries', 'backupVerify', 'forgetDiskWithInstances'])
     })
 })
 
