@@ -24,11 +24,12 @@
 import { fs, path, $ } from 'zx'
 import { log } from './utils.js'
 import type { InstanceID } from '../data/CommonTypes.js'
+import { checkInstanceIdForDocker, composeProjectFor, InstanceIdCheckOptions, COMPOSE_PROJECT_LABEL } from './instanceIds.js'
 
 /** Shared Engine networks created by buildDockerInfrastructure; never pruned. */
 export const SHARED_DOCKER_NETWORKS = ['frontend', 'backend'] as const
 
-export const COMPOSE_PROJECT_LABEL = 'com.docker.compose.project'
+export { COMPOSE_PROJECT_LABEL }
 
 export type DockerRun = (args: string[]) => Promise<string>
 
@@ -38,7 +39,7 @@ export const defaultDockerRun: DockerRun = async (args) =>
 export const isSharedDockerNetwork = (name: string): boolean =>
     (SHARED_DOCKER_NETWORKS as readonly string[]).includes(name.trim())
 
-export interface PruneNetworksOptions {
+export interface PruneNetworksOptions extends InstanceIdCheckOptions {
     /** Injected docker argv runner. When omitted, tests (IDEA_WATCH_DIR) skip docker. */
     run?: DockerRun
     /** Call docker even when IDEA_WATCH_DIR is set (the unit tests pass `run` instead). */
@@ -66,13 +67,21 @@ export const pruneUnusedInstanceNetworks = async (
 ): Promise<PruneNetworksResult> => {
     const result: PruneNetworksResult = { removed: [], skipped: [], errors: [] }
     if (!instanceId) return result
+    // idea#479: check the id before any Docker call; label filter uses the compose project name.
+    const idCheck = checkInstanceIdForDocker(instanceId, opts)
+    if (!idCheck.ok) {
+        log(`pruneUnusedInstanceNetworks: skipped: ${idCheck.reason}`)
+        result.errors.push(idCheck.reason)
+        return result
+    }
+    const project = idCheck.project
     if (shouldSkipDocker(opts)) return result
     const run = opts.run ?? defaultDockerRun
     let raw = ''
     try {
         raw = await run([
             'network', 'ls',
-            '--filter', `label=${COMPOSE_PROJECT_LABEL}=${instanceId}`,
+            '--filter', `label=${COMPOSE_PROJECT_LABEL}=${project}`,
             '--filter', 'dangling=true',
             '--format', '{{.ID}}\t{{.Name}}',
         ])
@@ -141,15 +150,18 @@ export const pruneUnusedInstanceNetworksForIds = async (
  * Bring the compose project down using the live instance path and file
  * (idea#424 / idea#468). No `-v` (named volumes stay). Missing compose.yaml is
  * not an error — the caller still runs prune / label cleanup. Does not glob
- * the quarantine directory.
+ * the quarantine directory. The id is checked first (idea#479): an invalid id
+ * throws INVALID_INSTANCE_ID before docker runs, and `-p` is the compose
+ * project name (a legacy dotted id, removal path only, loses its dots).
  */
 export const composeDownAt = async (
-    dir: string, id: InstanceID, run: DockerRun = defaultDockerRun,
+    dir: string, id: InstanceID, run: DockerRun = defaultDockerRun, opts: InstanceIdCheckOptions = {},
 ): Promise<void> => {
+    const project = composeProjectFor(String(id), opts)
     const composeFile = path.join(dir, 'compose.yaml')
     if (!fs.existsSync(composeFile)) {
         log(`composeDownAt: no compose.yaml at ${composeFile}; will rely on label cleanup / prune for project ${id}`)
         return
     }
-    await run(['compose', '-p', String(id), '-f', composeFile, 'down'])
+    await run(['compose', '-p', project, '-f', composeFile, 'down'])
 }

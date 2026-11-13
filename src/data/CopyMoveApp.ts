@@ -37,6 +37,7 @@ import { serviceImageTarName } from './ImageRef.js'
 import { Instance, Status } from './Instance.js'
 import { IPAddress } from './CommonTypes.js'
 import { lookupInstanceArg, describeInstanceCandidates } from './InstanceArg.js'
+import { checkInstanceIdForDocker } from '../utils/instanceIds.js'
 import { findExternalLinks, externalLinksMessage, uniqueCopyName, preparedCopyFiles, instanceDirLooksLikeKolibri } from './InstanceCopy.js'
 import type { MoveResult } from './MoveAppShapes.js'
 import { composeDownAt, pruneUnusedInstanceNetworks } from '../utils/instanceNetworks.js'
@@ -103,6 +104,13 @@ export const validate = async (
     const instance = found.instance
     if (found.via === 'name-on-disk') {
         console.warn(`Instance name '${instanceName}' is shared by several instances; using ${instance.id}, the one on disk ${sourceDiskId}. Send the instance id.`)
+    }
+    // idea#479: moveApp takes the source compose project down, so the id is
+    // checked before any Docker action. A legacy dotted id is refused here
+    // (only removeInstance accepts it).
+    if (kind === 'move') {
+        const idCheck = checkInstanceIdForDocker(String(instance.id))
+        if (!idCheck.ok) return `INVALID_INSTANCE_ID: ${idCheck.reason}`
     }
 
     const sourceDisk = getDisk(store, sourceDiskId) as Disk | undefined
