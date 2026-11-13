@@ -36,6 +36,8 @@ export interface CommandTrace {
   completedAt: number | null
   status: TraceStatus
   errorMessage: string | null
+  /** Stable machine code of the error (e.g. moveApp's MoveCode, idea#79); absent when the error has none */
+  errorCode?: string | null
   /**
    * Same text as errorMessage when status is 'error'; null otherwise (idea#428).
    * Some CLIs read `error` (the Operation field name) and were seeing null while
@@ -491,6 +493,7 @@ export const closeTrace = (
   errorMessage?: string,
   /** When set, written in the same Automerge change as status (Console sees both together). */
   resultJson?: string | null,
+  errorCode?: string | null,
 ): void => {
   const fromStash = resultJson !== undefined ? resultJson : takePendingTraceResult(traceId)
   liveCommandLogHandle(handle).change(doc => {
@@ -508,6 +511,7 @@ export const closeTrace = (
     } else if (errorMessage) {
       trace.errorMessage = redactString(errorMessage)
     }
+    if (errorCode) trace.errorCode = errorCode
     if (fromStash !== undefined && fromStash !== null) trace.result = redactString(fromStash)
   })
 }

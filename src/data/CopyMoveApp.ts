@@ -38,6 +38,7 @@ import { Instance, Status } from './Instance.js'
 import { IPAddress } from './CommonTypes.js'
 import { lookupInstanceArg, describeInstanceCandidates } from './InstanceArg.js'
 import { findExternalLinks, externalLinksMessage, uniqueCopyName, preparedCopyFiles, instanceDirLooksLikeKolibri } from './InstanceCopy.js'
+import type { MoveResult } from './MoveAppShapes.js'
 import { composeDownAt, pruneUnusedInstanceNetworks } from '../utils/instanceNetworks.js'
 import os from 'os'
 import path from 'path'
@@ -83,7 +84,7 @@ interface ValidatedCopyMove {
     targetRoot: string
 }
 
-const validate = async (
+export const validate = async (
     store: Store,
     instanceName: InstanceName,
     sourceDiskId: DiskID,
@@ -173,6 +174,18 @@ const validate = async (
     return { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc, sourceRoot, targetRoot }
 }
 
+/** Options for copyApp when it runs as the copy step of a cross-Engine move (idea#79). */
+export interface CopyAppOptions {
+    /** write progress into this (moveApp) operation instead of creating a copyApp one */
+    journalOpId?: string
+    /** the copy keeps the source's name (the source is removed after verify) */
+    keepName?: boolean
+    /** throw the copy failure instead of only recording it */
+    rethrow?: boolean
+    /** a move keeps the source stopped after a good copy (it restarts it itself on failure) */
+    keepSourceStopped?: boolean
+}
+
 // ── copyApp ───────────────────────────────────────────────────────────────────
 
 /**
@@ -188,7 +201,8 @@ export const copyApp = async (
     sourceDiskId: DiskID,
     targetDiskId: DiskID,
     cause: OperationCause = 'console-command',
-): Promise<void> => {
+    opts: CopyAppOptions = {},
+): Promise<InstanceID | null> => {
     const store = storeHandle.doc()
 
     const v = await validate(store, instanceName, sourceDiskId, targetDiskId)
@@ -203,11 +217,14 @@ export const copyApp = async (
         throw new Error(`copyApp: resource locked — another operation is already running on instance '${instanceName}' or target disk '${targetDisk.name}'. Retry when it completes.`)
     }
 
-    const opId = createOperation(storeHandle, 'copyApp', {
+    // A cross-Engine move (idea#79) runs this copy inside its own moveApp operation
+    const journal = opts.journalOpId ?? null
+    const opId = journal ?? createOperation(storeHandle, 'copyApp', {
         instanceId: instance.id,
         sourceDiskId: sourceDisk.id,
         targetDiskId: targetDisk.id,
     }, cause, { type: 'instance', id: instance.id })
+    let copyError: Error | null = null
     beginUsageSkip('move')
 
     const newInstanceId = uuid() as InstanceID
@@ -252,7 +269,7 @@ export const copyApp = async (
         'Syncing service images',     // 4
         'Registering on target disk', // 5
     ]
-    const setCopyStep = (step: number) =>
+    const setCopyStep = (step: number) => journal ? undefined :
         updateOperation(storeHandle, opId, { currentStep: step, totalSteps: COPY_STEPS.length, stepLabel: COPY_STEPS[step] })
 
     try {
@@ -264,7 +281,7 @@ export const copyApp = async (
             await stopInstance(storeHandle, instance, sourceDisk, 'post-copy')
         }
 
-        updateOperation(storeHandle, opId, { status: 'Running' })
+        if (!journal) updateOperation(storeHandle, opId, { status: 'Running' })
 
         // 2. Check free space (local only — skip for cross-engine)
         setCopyStep(1)
@@ -324,7 +341,7 @@ export const copyApp = async (
         //     (port=). The copy gets a unique name (<name>-2, -3, …; see
         //     uniqueCopyName) and no port, so startInstance allocates one that is
         //     neither listening nor owned by another instance in the store.
-        const copyName = uniqueCopyName(storeHandle.doc(), String(instance.name))
+        const copyName = opts.keepName ? instance.name : uniqueCopyName(storeHandle.doc(), String(instance.name))
         const prepared = await preparedCopyFiles(instanceSrc, copyName)
         const preparedNames = Object.keys(prepared) as (keyof typeof prepared)[]
         if (preparedNames.length > 0) {
@@ -409,7 +426,7 @@ export const copyApp = async (
         // Restart the source BEFORE the copy starts (idea#168 r35): the
         // original takes its own port back first, and the copy can never grab
         // it while the original is down for the snapshot.
-        if (wasRunning) await restartSource('before the copy starts')
+        if (wasRunning && !opts.keepSourceStopped) await restartSource('before the copy starts')
 
         if (isCrossEngine) {
             // Cross-engine: create instance record in shared store (as Docked),
@@ -450,7 +467,7 @@ export const copyApp = async (
             await processInstance(storeHandle, targetDisk, newInstanceId)
         }
 
-        updateOperation(storeHandle, opId, {
+        if (!journal) updateOperation(storeHandle, opId, {
             status: 'Done',
             progressPercent: 100,
             completedAt: Date.now() as Timestamp,
@@ -459,8 +476,9 @@ export const copyApp = async (
 
     } catch (e: any) {
         // Don't overwrite Cancelled status (set by cancelOperation before SIGTERM completes)
+        copyError = e instanceof Error ? e : new Error(String(e))
         const currentStatus = storeHandle.doc()?.operationDB?.[opId]?.status
-        if (currentStatus !== 'Cancelled') {
+        if (currentStatus !== 'Cancelled' && !journal) {
             updateOperation(storeHandle, opId, {
                 status: 'Failed',
                 error: e.message ?? String(e),
@@ -484,8 +502,10 @@ export const copyApp = async (
         resourceLock.releaseAll(lockKeys)
         endUsageSkip('move')
         // Always restart the source if we stopped it and the success path did not
-        if (wasRunning && !sourceRestarted) await restartSource('after a failed copy')
+        if (wasRunning && !sourceRestarted && (copyError || !opts.keepSourceStopped)) await restartSource('after a failed copy')
     }
+    if (copyError && opts.rethrow) throw copyError
+    return copyError ? null : newInstanceId
 }
 
 // ── moveApp ───────────────────────────────────────────────────────────────────
@@ -502,8 +522,17 @@ export const moveApp = async (
     sourceDiskId: DiskID,
     targetDiskId: DiskID,
     cause: OperationCause = 'console-command',
-): Promise<void> => {
+): Promise<MoveResult | void> => {
     const store = storeHandle.doc()
+
+    // A target disk on another Engine is a cross-Engine move (idea#79): copy,
+    // verify on the target, then quarantine the source. See MoveAppRemote.ts.
+    const { localEngineId: localId } = await import('./Engine.js')
+    const tgt = getDisk(store, targetDiskId) as Disk | undefined
+    if (tgt?.dockedTo && String(tgt.dockedTo) !== String(localId)) {
+        const { moveAppCrossEngine } = await import('./MoveAppRemote.js')
+        return moveAppCrossEngine(storeHandle, instanceName, sourceDiskId, targetDiskId, cause)
+    }
 
     const v = await validate(store, instanceName, sourceDiskId, targetDiskId, 'move')
     // Validation refusals throw (idea#168 r29@97), so the command trace or
@@ -511,12 +540,6 @@ export const moveApp = async (
     if (typeof v === 'string') throw new Error(`moveApp: ${v}`)
     const { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc, sourceRoot, targetRoot } = v
 
-    // moveApp does not support cross-engine targets (data integrity risk if move fails midway).
-    // Use copyApp + manual delete instead.
-    const { localEngineId: localId } = await import('./Engine.js')
-    if (String(targetDisk.dockedTo) !== String(localId)) {
-        throw new Error(`moveApp: Target disk '${targetDisk.name}' is on a remote engine. Cross-engine move is not supported — use copyApp instead, then delete the source.`)
-    }
 
     // Acquire per-resource locks: instance + both disks
     const moveLockKeys = [instanceKey(instance.id), diskKey(sourceDisk.id), diskKey(targetDisk.id)]
