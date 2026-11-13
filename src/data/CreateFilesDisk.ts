@@ -37,7 +37,7 @@ import { log, print } from '../utils/utils.js'
 
 /** The one chown the Engine runs as root, and the mount points it may run on (11-engine-files). */
 export const SUDO_CHOWN = '/usr/bin/chown'
-export const SUDO_CHOWN_ROOT = /^\/disks\/sd[a-z][12]$/
+export const SUDO_CHOWN_ROOT = /^\/disks\/sd[a-z][1-9]$/
 export const chownRootCommand = (mountPoint: string): string => `${SUDO_CHOWN} -h pi:pi ${mountPoint}`
 
 export const MISSING_PERMISSION_MESSAGE =
@@ -47,11 +47,11 @@ export const MISSING_PERMISSION_MESSAGE =
  * Runs `sudo -n /usr/bin/chown -h pi:pi <mountPoint>`. sudo sees exactly
  * "/usr/bin/chown -h pi:pi /disks/<device>", which is what the 11-engine-files
  * entry matches; -n makes a missing entry fail at once instead of waiting for a
- * password. Refuses any path outside /disks/sd[a-z][12].
+ * password. Refuses any path outside /disks/sd[a-z][1-9].
  */
 export const runSudoChownRoot = async (mountPoint: string): Promise<void> => {
     if (!SUDO_CHOWN_ROOT.test(mountPoint)) {
-        throw new Error(`${mountPoint} is not an Engine disk mount point (/disks/sd[a-z][12]); its owner is never changed`)
+        throw new Error(`${mountPoint} is not an Engine disk mount point (/disks/sd[a-z][1-9]); its owner is never changed`)
     }
     await $`sudo -n ${SUDO_CHOWN} -h pi:pi ${mountPoint}`
 }

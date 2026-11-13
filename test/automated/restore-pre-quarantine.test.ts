@@ -4,6 +4,7 @@
  * refuses HELPER_OUTDATED below v4, and leaves everything alone in the other cases.
  */
 import { describe, it, expect, vi } from 'vitest'
+import { fs, path } from 'zx'
 import { assertPreQuarantineHelper, quarantinePreRestore, PreQuarantineDeps } from '../../src/data/RestorePreQuarantine.js'
 
 const E = 'ENGINE_local'
@@ -48,5 +49,10 @@ describe('restore to another disk: pre-restore quarantine (#190)', () => {
     it('a failing quarantine is logged, not thrown (the restore is already done)', async () => {
         const d = deps({ quarantine: async () => { throw new Error('ID_BUSY') } })
         expect(await quarantinePreRestore(store('DISK_new'), 'I1' as any, NEW, OLD, d)).toBeNull()
+    })
+    it('default folderExists uses diskPath so the system disk is /instances/<id> (idea#424)', async () => {
+        const src = await fs.readFile(path.join(process.cwd(), 'src/data/RestorePreQuarantine.ts'), 'utf8')
+        expect(src).toMatch(/diskPath\(disk, 'instances', String\(id\)\)/)
+        expect(src).not.toMatch(/path\.join\(await diskMountRoot/)
     })
 })

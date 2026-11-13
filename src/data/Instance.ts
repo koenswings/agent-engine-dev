@@ -1,17 +1,20 @@
 import { isCommitSha } from './AppIdParse.js'
+import { buildImageSteps, checkLoadedDigest, checkServiceTarPin, digestInspectRef, legacyServiceImageTarName, parseImageRef, planExistingTarOnInstall, planPinnedServiceImageLoad, saveFailedMessage, saveName, serviceImageTarName, serviceTarQuarantineName, type TarPinState } from './ImageRef.js'
 import { $, YAML, chalk, fs, os, sleep } from "zx";
 
 $.verbose = false;
 import { ensureNcAdminPassword } from "./AppSecrets.js";
-import { addOrUpdateEnvVariable, deepPrint, log, randomPort, readEnvVariable, uuid, print, isEngineOnline } from "../utils/utils.js";
+import { addOrUpdateEnvVariable, deepPrint, log, randomPort, readEnvVariable, uuid, print, isEngineOnline, isHttpPortReady } from "../utils/utils.js";
 import { DockerEvents, DockerMetrics, DockerLogs, InstanceID, AppID, PortNumber, ServiceImage, Timestamp, Version, DeviceName, InstanceName, AppName, Hostname, DiskID, OperationCause, EngineID } from "./CommonTypes.js";
 import { createOperation, updateOperation } from './Operations.js'
 import { composeFileEnv } from './FilesMount.js'
+import { appForInstance, instanceUsbSync } from './InstanceApp.js'
 import { Store, getDisk, getEngine, getLocalEngine, getInstancesOfEngine, } from "./Store.js";
 import { Disk, diskMountRoot, diskFsRoot, deviceMountRoot } from "./Disk.js";
 import { localEngineId } from "./Engine.js";
 import { network } from "./Network.js";
-import { createAppId } from "./App.js";
+import { createAppId, parseAppId } from "./App.js";
+import { healthTimeoutSeconds, DEFAULT_HEALTH_TIMEOUT_S } from "./AppHealthTimeout.js";
 import { Docker } from "node-docker-api";
 import { createMeta } from '../data/Meta.js'
 import { config, disksRoot, skipImageLoad } from '../data/Config.js'
@@ -19,6 +22,7 @@ import { DocHandle } from "@automerge/automerge-repo";
 import { CommandLogStore, LogEntry, getCommandLogHandle, liveCommandLogHandle, addTrace, closeTrace, flushLogs } from './CommandLogStore.js'
 import { getActiveTrace, flushTrace } from '../utils/CommandLogger.js'
 import { dockerAvailable } from '../utils/dockerAvailable.js'
+import { composeProjectLabelFilter, containerInInstanceProject } from '../utils/instanceIds.js'
 import { rebindKolibriMorangoInstanceId } from './InstanceCopy.js'
 import { hostIdentity, writeHostIdentityEnv, nextcloudUrl, writeNextcloudUrlEnv, isNextcloudInstance, nextcloudTrustedDomainsBridge, hostNetworkInterfaces } from './HostIdentity.js'
 import { trackInFlight, startDiskGoneReason, dockIdentityOf } from './InstanceInFlight.js'
@@ -439,16 +443,24 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     const services = compose.services
     for (const serviceName in services) {
       const serviceImage = services[serviceName].image
-      // Pull the sercice image
       const serviceImageTar = serviceImageTarPath(`${root}`, serviceImage)
-      if (fs.existsSync(serviceImageTar)) {
-        print(`Service image ${serviceImage} already exists`)
-      } else {
-        print(`Pulling service image ${serviceImage}`)
-        await $`docker image pull ${serviceImage}`
-        // Save the service image
-        await $`docker save ${serviceImage} > ${serviceImageTar}`
+      const pin = parseImageRef(serviceImage).digest
+      const existingState: TarPinState | 'absent' = !fs.existsSync(serviceImageTar)
+        ? 'absent'
+        : pin ? (await inspectServiceTar(serviceImageTar, serviceImage)).state : 'matches'
+      const action = planExistingTarOnInstall(Boolean(pin), existingState)
+      if (action === 'use') {
+        print(`Service image ${serviceImage} already exists${pin ? ' and matches the pin' : ''}`)
+        continue
       }
+      if (action === 'quarantine-and-create') {
+        const inspected = pin ? await inspectServiceTar(serviceImageTar, serviceImage) : { digest: null, reason: 'stale', state: 'mismatch' as const }
+        const q = await quarantineServiceTar(serviceImageTar)
+        print(`Service image ${serviceImage}: existing tar is stale or unreadable (${inspected.digest ?? inspected.reason ?? existingState}); quarantined at ${q}; pulling a fresh one (idea#445)`)
+      }
+      // idea#322: pull by the full ref, tag a pinned ref as repo:tag, save by repo:tag
+      // (a tar saved by digest has no name after docker image load)
+      await persistServiceImageTar(serviceImage, serviceImageTar)
     }
 
     // **************************
@@ -512,7 +524,212 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
  * (docker image load), so the two always agree.
  */
 export const serviceImageTarPath = (diskRoot: string, serviceImage: string): string =>
-  `${diskRoot}/services/${serviceImage.replace(/\//g, '_')}.tar`
+  `${diskRoot}/services/${serviceImageTarName(serviceImage)}`
+
+/** Read a named file from a docker-save tar as exact bytes (index.json is hashed as stored). */
+export const readTarEntry = async (tarPath: string, entry: string): Promise<Buffer | null> => {
+  const { execFile } = await import('node:child_process')
+  const { promisify } = await import('node:util')
+  const execFileAsync = promisify(execFile)
+  try {
+    const { stdout } = await execFileAsync('tar', ['-xOf', tarPath, entry], { encoding: 'buffer', maxBuffer: 16 * 1024 * 1024 })
+    return stdout as Buffer
+  } catch {
+    return null
+  }
+}
+
+/** Compare a services/*.tar with a compose pin without docker load (idea#445; Kid PR #15). */
+export const inspectServiceTar = async (tarPath: string, serviceImage: string): Promise<{ state: TarPinState, digest: string | null, layout?: string | null, reason?: string }> => {
+  if (!fs.existsSync(tarPath)) return { state: 'missing', digest: null }
+  const members = new Map<string, Buffer>()
+  for (const name of ['index.json', 'manifest.json'] as const) {
+    const bytes = await readTarEntry(tarPath, name) ?? await readTarEntry(tarPath, `./${name}`)
+    if (bytes) members.set(name, bytes)
+  }
+  const index = members.get('index.json')
+  if (index) {
+    let parsed: any
+    try { parsed = JSON.parse(index.toString('utf8')) } catch { parsed = null }
+    const entries = Array.isArray(parsed?.manifests) ? parsed.manifests : []
+    const digests = entries.map((e: any) => e?.digest).filter((d: any) => typeof d === 'string' && d.startsWith('sha256:'))
+    for (const d of new Set<string>(digests)) {
+      const blobName = `blobs/sha256/${d.slice('sha256:'.length)}`
+      const blob = await readTarEntry(tarPath, blobName) ?? await readTarEntry(tarPath, `./${blobName}`)
+      if (blob) members.set(blobName, blob)
+    }
+  }
+  const r = checkServiceTarPin(serviceImage, members)
+  return { state: r.state, digest: r.digest, layout: r.layout, reason: r.reason }
+}
+
+/** Rename a stale service tar aside; never delete. */
+export const quarantineServiceTar = async (tarPath: string, now = Date.now()): Promise<string> => {
+  let dest = serviceTarQuarantineName(tarPath, now)
+  let n = 2
+  while (fs.existsSync(dest)) dest = `${serviceTarQuarantineName(tarPath, now)}-${n++}`
+  await fs.rename(tarPath, dest)
+  return dest
+}
+
+/** `docker image inspect` of a name (repo:tag, repo@digest, or sha256:…): RepoDigests and Id, or nulls if absent. */
+export const inspectServiceImage = async (saveAs: string): Promise<{ repoDigests: string[] | null, id: string | null }> => {
+  const r = await $`docker image inspect ${saveAs} --format ${'{{json .RepoDigests}}|{{.Id}}'}`.nothrow()
+  if (r.exitCode !== 0) return { repoDigests: null, id: null }
+  const [rd, id] = r.stdout.trim().split('|')
+  let repoDigests: string[] = []
+  try { repoDigests = JSON.parse(rd) ?? [] } catch { repoDigests = [] }
+  return { repoDigests, id: id || null }
+}
+
+/** idea#445: the pin is present if `docker image inspect repo@digest` (or the digest id) succeeds. */
+export const pinnedImageIsPresent = async (serviceImage: string): Promise<boolean> => {
+  const digestRef = digestInspectRef(serviceImage)
+  if (!digestRef) return false
+  const byRef = await inspectServiceImage(digestRef)
+  if (byRef.repoDigests !== null) return true
+  const pin = parseImageRef(serviceImage).digest
+  if (!pin) return false
+  const byId = await inspectServiceImage(pin)
+  return byId.repoDigests !== null || byId.id === pin
+}
+
+/** Point repo:tag at the already-local pin when a stale tar had moved the tag. */
+export const ensureSaveTag = async (serviceImage: string): Promise<void> => {
+  const p = parseImageRef(serviceImage)
+  if (!p.digest || !p.tag) return
+  const name = saveName(serviceImage)
+  const current = await inspectServiceImage(name)
+  if (current.repoDigests !== null && checkLoadedDigest(serviceImage, current.repoDigests, current.id).ok) return
+  const digestRef = digestInspectRef(serviceImage)!
+  const r = await $`docker image tag ${digestRef} ${name}`.nothrow()
+  if (r.exitCode !== 0) {
+    const r2 = await $`docker image tag ${p.digest} ${name}`.nothrow()
+    if (r2.exitCode !== 0) {
+      const detail = (r.stderr || r.stdout || r2.stderr || r2.stdout || '').trim()
+      throw new Error(`Service image ${serviceImage}: pinned digest is local but tagging ${name} failed: ${detail} (idea#445)`)
+    }
+  }
+}
+
+/** idea#322/#445: a pinned service image must be present as repo@digest; throws a clear error if not. */
+export const verifyServiceImageDigest = async (serviceImage: string, opts: { requirePresent: boolean } = { requirePresent: true }): Promise<void> => {
+  if (!serviceImage.includes('@')) return
+  const digestRef = digestInspectRef(serviceImage)
+  let repoDigests: string[] | null = null
+  let id: string | null = null
+  if (digestRef) {
+    const byDigest = await inspectServiceImage(digestRef)
+    repoDigests = byDigest.repoDigests
+    id = byDigest.id
+  }
+  if (repoDigests === null) {
+    const pin = parseImageRef(serviceImage).digest
+    if (pin) {
+      const byId = await inspectServiceImage(pin)
+      if (byId.repoDigests !== null || byId.id) {
+        repoDigests = byId.repoDigests
+        id = byId.id
+      }
+    }
+  }
+  // Not present at start: leave it to compose (pulls if pull_policy allows, else fails as before)
+  if (repoDigests === null && !opts.requirePresent) return
+  if (repoDigests === null) {
+    // Name what repo:tag actually points at when the pin itself is missing
+    const byTag = await inspectServiceImage(saveName(serviceImage))
+    const c = checkLoadedDigest(serviceImage, byTag.repoDigests, byTag.id)
+    if (!c.ok) throw new Error(c.reason)
+    return
+  }
+  const c = checkLoadedDigest(serviceImage, repoDigests, id)
+  if (!c.ok) throw new Error(c.reason)
+}
+
+/** idea#322: pull by the full ref, tag a pinned ref as repo:tag, save by repo:tag. */
+export const persistServiceImageTar = async (serviceImage: string, serviceImageTar: string): Promise<void> => {
+  const [pull, ...rest] = buildImageSteps(serviceImage)
+  print(`Pulling service image ${serviceImage}`)
+  await $`${pull}`
+  for (const step of rest) {
+    if (step[1] === 'save') {
+      // Plain save (never --platform, see ImageRef.ts). Write to a .partial file so a failed save
+      // never leaves a tar under the real name (which a later build would treat as done).
+      const partial = `${serviceImageTar}.partial`
+      const r = await $`${step} > ${partial}`.nothrow()
+      if (r.exitCode !== 0) {
+        const v = await $`docker version --format ${'{{.Server.Version}}'}`.nothrow()
+        throw new Error(saveFailedMessage(serviceImage, v.exitCode === 0 ? v.stdout.trim() : '', r.stderr || r.stdout))
+      }
+      await $`mv -f ${partial} ${serviceImageTar}`
+    } else await $`${step}`
+  }
+  await verifyServiceImageDigest(serviceImage)
+}
+
+/**
+ * Start-path preload of one service image (idea#81, idea#322, idea#445).
+ * Pinned: skip the load when the pin is already local (retag repo:tag); otherwise
+ * check the tar against the pin before any `docker image load`. A mismatch is
+ * quarantined and never loaded. Unpinned images keep the idea#81/#109 behaviour.
+ */
+export const preloadServiceImageFromTar = async (
+  serviceImage: string,
+  mountRoot: string,
+  startWarning: (msg: string) => Promise<void>,
+): Promise<void> => {
+  const tarPath = serviceImageTarPath(mountRoot, serviceImage)
+  const legacyTar = `${mountRoot}/services/${legacyServiceImageTarName(serviceImage)}`
+  if (!fs.existsSync(tarPath) && legacyTar !== tarPath && fs.existsSync(legacyTar)) {
+    await startWarning(`Service image ${serviceImage}: only a tar saved by digest (${legacyTar}) is on the disk; it loads without a name and cannot satisfy the pin. Re-save it by repo:tag (idea#322)`)
+  }
+  const p = parseImageRef(serviceImage)
+  if (p.digest) {
+    const pinPresent = await pinnedImageIsPresent(serviceImage)
+    const inspected = await inspectServiceTar(tarPath, serviceImage)
+    const plan = planPinnedServiceImageLoad({
+      ref: serviceImage,
+      pin: p.digest,
+      tarPath,
+      pinPresent,
+      tarState: inspected.state,
+      tarDigest: inspected.digest,
+      tarReason: inspected.reason,
+    })
+    let quarantinedAt: string | undefined
+    if (plan.quarantine) quarantinedAt = await quarantineServiceTar(tarPath)
+    const withPath = (msg: string) => quarantinedAt && !msg.includes(quarantinedAt) ? `${msg} (${quarantinedAt})` : msg
+    if (plan.action === 'stale-fail') throw new Error(withPath(plan.error!))
+    if (plan.action === 'skip-retag') {
+      if (plan.warning) await startWarning(withPath(plan.warning))
+      await ensureSaveTag(serviceImage)
+      return
+    }
+    if (plan.action === 'missing') {
+      await startWarning(`Service image ${serviceImage}: saved image ${tarPath} not found; continuing (Docker pulls the image if it is not local and the Engine has internet)`)
+      return
+    }
+    log(`Loading the service image ${serviceImage} from ${tarPath}`)
+    try {
+      await $`docker image load < ${tarPath}`
+    } catch (e) {
+      const reason = (e instanceof Error ? e.message : String(e)).trim().split('\n')[0]
+      await startWarning(`Service image ${serviceImage}: loading ${tarPath} failed (${reason}); continuing (Docker pulls the image if it is not local and the Engine has internet)`)
+    }
+    return
+  }
+  if (!fs.existsSync(tarPath)) {
+    await startWarning(`Service image ${serviceImage}: saved image ${tarPath} not found; continuing (Docker pulls the image if it is not local and the Engine has internet)`)
+    return
+  }
+  log(`Loading the service image ${serviceImage} from ${tarPath}`)
+  try {
+    await $`docker image load < ${tarPath}`
+  } catch (e) {
+    const reason = (e instanceof Error ? e.message : String(e)).trim().split('\n')[0]
+    await startWarning(`Service image ${serviceImage}: loading ${tarPath} failed (${reason}); continuing (Docker pulls the image if it is not local and the Engine has internet)`)
+  }
+}
 
 export const createInstanceId = (appName: AppName): InstanceID => {
   const id = uuid()
@@ -680,10 +897,17 @@ export const syncKolibriHostListenPort = async (composePath: string, port: PortN
 export const assertComposeContainersHealthy = async (instanceDir: string, instanceId: InstanceID): Promise<void> => {
   void instanceDir
   await sleep(2500)
+  // idea#479: exact com.docker.compose.project label, never a docker name filter (a
+  // substring match that hit a dotted legacy id's containers and marked this one Error).
+  const projectFilter = composeProjectLabelFilter(String(instanceId))
+  if (!projectFilter) {
+    log(`assertComposeContainersHealthy: no compose project name for ${instanceId}; skipping`)
+    return
+  }
   let psOut = ''
   try {
     const format = '{{.Names}}\t{{.Status}}\t{{.ID}}'
-    const r = await $`docker ps -a --filter name=${instanceId} --format ${format}`
+    const r = await $`docker ps -a --filter ${projectFilter} --format ${format}`
     psOut = (r.stdout || '').trim()
   } catch (e) {
     log(`assertComposeContainersHealthy: docker ps failed for ${instanceId}: ${e instanceof Error ? e.message : String(e)}`)
@@ -731,67 +955,157 @@ export const assertComposeContainersHealthy = async (instanceDir: string, instan
 }
 
 
+/** Recreate a sidecar that never accepted TCP after this long, never later than the budget. */
+export const PORT_READY_RECREATE_AFTER_MS = 60_000
+
 /**
- * Prefer A r40: after compose up, require the instance host port to accept TCP
- * for a short stable window before Automerge Running. Covers the Kolibri
- * `start && tail -f` pattern where ZeroConfPlugin dies (~8s) but Docker stays
- * Up (r40 FAIL@102). When the port stays dead, force-recreate once and
- * re-probe; still dead → throw (startInstance marks Error).
+ * The port-ready budget in ms (idea#437, Steve decision 3): `x-app.healthTimeout`
+ * (seconds) when valid, else updateApp's per-App default from the one shared table
+ * (AppHealthTimeout.ts: Nextcloud 300 s, Kolibri 900 s, others 600 s).
+ */
+export const portReadyTimeoutMs = (appName: string, declared?: unknown): number =>
+  Math.round(healthTimeoutSeconds(appName, declared) * 1000)
+
+/** Read `x-app.healthTimeout` from an instance compose.yaml; the per-App default if missing or unreadable. */
+export const readPortReadyTimeoutMs = async (composePath: string, appName: string): Promise<number> => {
+  try {
+    const parsed = YAML.parse(await fs.readFile(composePath, 'utf8'))
+    return portReadyTimeoutMs(appName, parsed?.['x-app']?.healthTimeout)
+  } catch {
+    return portReadyTimeoutMs(appName)
+  }
+}
+
+/**
+ * After compose up, require the instance host port to stay ready for a short
+ * stable window before Automerge Running (r40 / idea#437).
+ *
+ * Ready means the port accepts TCP and, by default, answers with an HTTP
+ * status line (any 1xx–5xx). docker-proxy accepts TCP before the app inside
+ * serves (seen on Nextcloud 1.4's first start: occ works in the
+ * before-starting hooks, apache2-foreground has not started, and a GET
+ * fails with a connection error). 503 counts: Nextcloud returns it during
+ * maintenance/install, which still means the HTTP server is speaking.
+ * Port-ready is not "fully installed"; Files-mount already holds remounts
+ * until occ reports installed and not in maintenance (idea#133).
+ *
+ * instance.port is the Console URL (`http://<lanAddress>:<port>`), so HTTP
+ * is the existing convention. Pass `probe: 'tcp'` to keep the r40 TCP-only
+ * check. There is no META / x-app field for a non-HTTP instance port;
+ * adding one would be a contract change.
+ *
+ * If TCP itself never comes up within min(60 s, budget), force-recreate once
+ * (r40 Kolibri `start && tail -f`) and keep probing only until the original
+ * budget ends — never a second full wait, so a 300 s Nextcloud timeout cannot
+ * become 600 s. If TCP is up but HTTP has not answered, do not force-recreate:
+ * that would kill a long entrypoint (Nextcloud first install).
  */
 export const assertInstancePortReady = async (
   instanceId: InstanceID,
   port: number,
   instanceDir: string,
-  opts: { readyTimeoutMs?: number; stableMs?: number; forceRecreate?: boolean } = {},
+  opts: {
+    readyTimeoutMs?: number
+    stableMs?: number
+    forceRecreate?: boolean
+    probe?: 'http' | 'tcp'
+    probeTimeoutMs?: number
+    recreateAfterMs?: number
+    runForceRecreate?: () => Promise<void>
+  } = {},
 ): Promise<void> => {
   if (!port || !Number.isFinite(port) || port <= 0) {
     log(`assertInstancePortReady: no port for ${instanceId}; skipping sidecar probe`)
     return
   }
-  const readyTimeoutMs = opts.readyTimeoutMs ?? 60_000
+  const readyTimeoutMs = opts.readyTimeoutMs ?? DEFAULT_HEALTH_TIMEOUT_S * 1000
   const stableMs = opts.stableMs ?? 10_000
   const forceRecreate = opts.forceRecreate !== false
+  const probe = opts.probe ?? 'http'
+  const probeTimeoutMs = opts.probeTimeoutMs ?? 2_000
+  const recreateAfterMs = opts.recreateAfterMs ?? PORT_READY_RECREATE_AFTER_MS
 
-  const probeStable = async (budgetMs: number): Promise<boolean> => {
-    const deadline = Date.now() + budgetMs
-    let firstReadyAt: number | null = null
-    while (Date.now() < deadline) {
-      const up = await isEngineOnline('127.0.0.1', port)
-      if (up) {
-        if (firstReadyAt === null) firstReadyAt = Date.now()
-        else if (Date.now() - firstReadyAt >= stableMs) return true
-      } else {
-        firstReadyAt = null
+  const probeOnce = async (): Promise<{ tcp: boolean; ready: boolean }> => {
+    const tcp = await isEngineOnline('127.0.0.1', port)
+    if (!tcp) return { tcp: false, ready: false }
+    if (probe === 'tcp') return { tcp: true, ready: true }
+    return { tcp: true, ready: await isHttpPortReady('127.0.0.1', port, probeTimeoutMs) }
+  }
+
+  const startedAt = Date.now()
+  const deadline = startedAt + readyTimeoutMs
+  const recreateAt = startedAt + Math.min(recreateAfterMs, readyTimeoutMs)
+  let firstReadyAt: number | null = null
+  let sawTcp = false
+  let didRecreate = false
+
+  log(`assertInstancePortReady: ${instanceId} :${port} probing (${probe}, budget ${readyTimeoutMs}ms, stable ${stableMs}ms)`)
+
+  while (Date.now() < deadline) {
+    const { tcp, ready } = await probeOnce()
+    if (tcp) sawTcp = true
+    if (ready) {
+      if (firstReadyAt === null) firstReadyAt = Date.now()
+      else if (Date.now() - firstReadyAt >= stableMs) {
+        log(`assertInstancePortReady: ${instanceId} :${port} stable for ${stableMs}ms (${probe}${didRecreate ? ', after force-recreate' : ''})`)
+        return
       }
-      await sleep(1000)
+    } else {
+      firstReadyAt = null
     }
-    return false
+
+    // Recreate only when TCP never came up within min(60 s, budget), and only
+    // when that threshold is strictly inside the budget so some wait remains
+    // afterwards (no second full wait; a 60 s budget does not recreate at t=60 s).
+    if (
+      forceRecreate && !didRecreate && !sawTcp &&
+      Date.now() >= recreateAt &&
+      recreateAfterMs < readyTimeoutMs &&
+      deadline - Date.now() > 0
+    ) {
+      log(`assertInstancePortReady: ${instanceId} :${port} never accepted TCP within ${Math.min(recreateAfterMs, readyTimeoutMs)}ms — force-recreate once (r40/r22, idea#437)`)
+      didRecreate = true
+      try {
+        if (opts.runForceRecreate) {
+          await opts.runForceRecreate()
+        } else {
+          try {
+            await $({ cwd: instanceDir } as any)`docker compose up -d --force-recreate`
+          } catch (e: any) {
+            log(`assertInstancePortReady: force-recreate failed: ${e?.message ?? e}`)
+          }
+          await assertComposeContainersHealthy(instanceDir, instanceId)
+        }
+      } catch (e: any) {
+        log(`assertInstancePortReady: force-recreate failed: ${e?.message ?? e}`)
+      }
+      continue
+    }
+
+    const now = Date.now()
+    const remaining = deadline - now
+    if (remaining <= 0) break
+    // Wake at the recreate threshold instead of sleeping past it when the
+    // remaining budget is under the usual 1 s interval (short test budgets).
+    let sleepMs = Math.min(1000, remaining)
+    if (forceRecreate && !didRecreate && !sawTcp) {
+      const untilRecreate = recreateAt - now
+      if (untilRecreate > 0) sleepMs = Math.min(sleepMs, untilRecreate)
+    }
+    await sleep(sleepMs)
   }
 
-  if (await probeStable(readyTimeoutMs)) {
-    log(`assertInstancePortReady: ${instanceId} :${port} stable for ${stableMs}ms`)
-    return
-  }
-
-  if (forceRecreate) {
-    log(`assertInstancePortReady: ${instanceId} :${port} not ready — force-recreate once (r40/r22)`)
-    try {
-      await $({ cwd: instanceDir } as any)`docker compose up -d --force-recreate`
-    } catch (e: any) {
-      log(`assertInstancePortReady: force-recreate failed: ${e?.message ?? e}`)
-    }
-    await assertComposeContainersHealthy(instanceDir, instanceId)
-    if (await probeStable(readyTimeoutMs)) {
-      log(`assertInstancePortReady: ${instanceId} :${port} stable after force-recreate`)
-      return
-    }
+  const outcome = sawTcp ? 'tcp-only' : 'down'
+  if (forceRecreate && outcome === 'tcp-only' && probe === 'http') {
+    log(`assertInstancePortReady: ${instanceId} :${port} accepted TCP but HTTP never answered — skipping force-recreate (idea#437)`)
   }
 
   // Pull a short log tail to surface ZeroConf / NonUniqueNameException in the Error.
   let hint = ''
   try {
     const format = '{{.Names}}'
-    const r = await $`docker ps -a --filter name=${instanceId} --format ${format}`.quiet()
+    const projectFilter = composeProjectLabelFilter(String(instanceId))
+    const r = projectFilter ? await $`docker ps -a --filter ${projectFilter} --format ${format}`.quiet() : { stdout: '' }
     const name = (r.stdout || '').trim().split('\n').filter(Boolean)[0]
     if (name) {
       const lr = await $`docker logs --tail 40 ${name}`.quiet()
@@ -808,9 +1122,18 @@ export const assertInstancePortReady = async (
     }
   } catch { /* ignore */ }
 
+  const recreateNote = didRecreate ? ' (and after one force-recreate)' : ''
+  if (probe === 'http' && outcome === 'tcp-only') {
+    throw new Error(
+      `Instance ${instanceId} container is up but host port ${port} accepted TCP without answering HTTP ` +
+      `for ${stableMs}ms within ${readyTimeoutMs}ms${recreateNote}. ` +
+      `docker-proxy can accept TCP before the app serves (idea#437). ` +
+      `Automerge must not stay Running until an HTTP status line is seen.${hint}`,
+    )
+  }
   throw new Error(
     `Instance ${instanceId} container is up but host port ${port} never stayed ready ` +
-    `for ${stableMs}ms within ${readyTimeoutMs}ms (and after one force-recreate). ` +
+    `for ${stableMs}ms within ${readyTimeoutMs}ms${recreateNote}. ` +
     `Automerge must not stay Running with a dead sidecar.${hint} ` +
     `If this is Kolibri after copyApp, the copy likely still shares the original morango ` +
     `instance id (zeroconf NonUniqueNameException); see rebindKolibriMorangoInstanceId.`,
@@ -1044,7 +1367,9 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
   // Gated on a Docker daemon, not testMode (idea#168: the duration pool runs testMode with real Docker).
   if (await dockerAvailable()) {
     try {
-      const ps = await $`docker ps --filter name=${instance.id} --format {{.Names}}`
+      // idea#479: exact compose-project label, not a name substring.
+      const projectFilter = composeProjectLabelFilter(String(instance.id))
+      const ps = projectFilter ? await $`docker ps --filter ${projectFilter} --format {{.Names}}` : { stdout: '' }
       if (ps.stdout.trim().length > 0) {
         log(`Instance '${instance.id}' containers already running — updating status to Running`)
         const port = parseInt(await readEnvVariable(`${await diskMountRoot(disk)}/instances/${instance.id}/.env`, 'port') as string) || 0
@@ -1056,6 +1381,13 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
           if (port > 0) inst.port = port as PortNumber
           inst.lastStarted = Date.now() as Timestamp
         })
+        // idea#139 step 9: running containers may predate a Files role on this
+        // disk (Add Files) or carry a stale override; recreate once if needed.
+        const { resolveInstanceApp } = await import('./InstanceApp.js')
+        if ((await resolveInstanceApp(storeHandle.doc(), instance))?.filesMount) {
+          const { reconcileFilesMounts } = await import('./FilesMount.js')
+          await reconcileFilesMounts(storeHandle, instance.id)
+        }
         return
       } else {
         log(`Instance '${instance.id}' containers are not running — proceeding with full start`)
@@ -1192,28 +1524,25 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
     if (!skipImageLoad()) {
       // Load images from pre-saved tar files on the disk (no internet required).
       // Always on in production; tests turn it on with settings.skipImageLoad = false (idea#81).
-      // A missing tar or a failed load does not stop the start (idea#109 follow-up):
+      // Unpinned: a missing tar or a failed load does not stop the start (idea#109):
       // it becomes a warning in the start's History entry, and compose create/up
       // pull the image if it is not local and the Engine has internet. The start
       // fails only if create or up fails.
+      // Pinned (idea#445): skip the load when repo@digest is already local (and
+      // retag repo:tag); otherwise check the tar against the pin before loading.
+      // A mismatched tar is quarantined and never loaded; start fails if the pin
+      // is not already local.
       for (const serviceName in services) {
-        const serviceImage = services[serviceName].image
-        const tarPath = serviceImageTarPath(mountRoot, serviceImage)
-        if (!fs.existsSync(tarPath)) {
-          await startWarning(`Service image ${serviceImage}: saved image ${tarPath} not found; continuing (Docker pulls the image if it is not local and the Engine has internet)`)
-          continue
-        }
-        log(`Loading the service image ${serviceImage} from ${tarPath}`)
-        try {
-          await $`docker image load < ${tarPath}`
-        } catch (e) {
-          const reason = (e instanceof Error ? e.message : String(e)).trim().split('\n')[0]
-          await startWarning(`Service image ${serviceImage}: loading ${tarPath} failed (${reason}); continuing (Docker pulls the image if it is not local and the Engine has internet)`)
-        }
+        await preloadServiceImageFromTar(services[serviceName].image, mountRoot, startWarning)
       }
     } else {
       // Tests by default: fixtures have no tar files — Docker pulls the image at create time if not cached
       log(`skipImageLoad: skipping image load from tar; Docker will pull images as needed`)
+    }
+    // idea#322/#445: a digest-pinned image must be present as repo@digest before compose
+    // create (pull_policy: never). Tag-only refs are not checked, as before.
+    if (!skipImageLoad()) {
+      for (const serviceName in services) await verifyServiceImageDigest(services[serviceName].image, { requirePresent: false })
     }
 
     // **************************
@@ -1450,10 +1779,15 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
 
 /**
  * Start the containers of an instance (`docker compose up -d`) and set it to
- * Running. Running is written only after `compose up` has succeeded (idea#109):
- * an instance never shows Running while its containers failed to start.
- * Errors from `compose up` propagate to the caller, which sets Error
- * (startInstance also records a failed command-log trace).
+ * Running. Running is written only after `compose up` has succeeded (idea#109)
+ * and the instance host port has answered HTTP for a stable window (idea#437).
+ * The wait budget is `x-app.healthTimeout` from the instance compose, or the
+ * per-App default (AppHealthTimeout.ts, shared with updateApp) when that field is
+ * absent or invalid. An instance never shows Running while
+ * its containers failed to start, or while docker-proxy accepts TCP before the
+ * app serves. Errors from `compose up` or the port probe propagate to the
+ * caller, which sets Error (startInstance also records a failed command-log
+ * trace).
  */
 export const runInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk): Promise<void> => {
   const store: Store = storeHandle.doc()
@@ -1533,12 +1867,15 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
     // Prefer A r40: container Up is not enough (Kolibri start&&tail; ZeroConf death).
     const readyPort = storeHandle.doc()?.instanceDB?.[instance.id]?.port
       ?? (port && !isNaN(parseInt(port)) ? parseInt(port) : 0)
+    const instanceDir = `${mountRoot}/instances/${instance.id}`
+    const readyTimeoutMs = await readPortReadyTimeoutMs(`${instanceDir}/compose.yaml`, parseAppId(String(instance.instanceOf ?? "")).name)
     await assertInstancePortReady(
       instance.id,
       Number(readyPort) || 0,
-      `${mountRoot}/instances/${instance.id}`,
+      instanceDir,
+      { readyTimeoutMs },
     )
-    if (composeEnv && store.appDB[instance.instanceOf]?.filesMount) {
+    if (composeEnv && appForInstance(store, instance)?.filesMount) {
       // filesMounts only after success — read back from the override we just wrote
       const { mountableFilesDisks } = await import('./FilesMount.js')
       mountedDiskIds = mountableFilesDisks(store).map(d => d.id)
@@ -1562,7 +1899,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
   print(chalk.green(`App ${instance.id} running`))
   clearStep(storeHandle, instance.id)
   // idea#193 §4: reconcile USB stick storages once the App runs (x-app.usbMount.sync)
-  if (storeHandle.doc()?.appDB?.[instance.instanceOf]?.usbMount?.sync) {
+  if (await instanceUsbSync(storeHandle.doc(), instance)) {
     const { syncUsbApps } = await import('./UsbSticks.js')
     void syncUsbApps(storeHandle, 'start', true, instance.id)
   }
@@ -1609,15 +1946,14 @@ export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Inst
   // New implementation using Docker API
   try {
     setStep(storeHandle, instance.id, 0, totalStopSteps, STOP_STEPS[0], stopOpId)
-    // Find all containers running in the compose started by the instance
-    // NOTE: this implementation requires all containers of an instance to be namespaced with the instance id
-    log(`Filter for all running containers whose names start with the instance id`)
+    // Find all running containers of the instance's compose project, matched
+    // exactly on the com.docker.compose.project label (idea#479), never by name
+    // prefix: `<id>-` also matched an instance whose id starts with `<id>-`.
+    log(`Filter for all running containers in the compose project of ${instance.id}`)
     const docker = new Docker({ socketPath: '/var/run/docker.sock' });
     const containers = await docker.container.list()
-    const instanceContainers = containers.filter(container => {
-      const name = container.data['Names'][0]
-      return name.startsWith(`/${instance.id}-`) || name.startsWith(`/${instance.id}_`)
-    })
+    const instanceContainers = containers.filter(container =>
+      containerInInstanceProject((container.data as any)['Labels'], String(instance.id)))
     // Log the containers
     log(`Found the following containers:`)
     instanceContainers.forEach(container => {

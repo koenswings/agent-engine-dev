@@ -78,7 +78,7 @@ export type OperationKind =
  *                     (backupMonitor.ts: stopInstance before BorgBackup)
  * backup-post-start — backup monitor restarts instance after snapshot completes
  *                     (backupMonitor.ts: startInstance after BorgBackup)
- * backup-stale-lock — backup monitor retries a backup whose lock file survived a crash
+ * backup-stale-lock — historical: the monitor used to retry a backup whose lock file survived a crash; idea#446 records Disk.backupStaleLocks instead and no longer auto-retries
  *                     (backupMonitor.ts: checkPendingBackups stale-lock branch)
  * backup-app-docked — backup monitor triggers backup when App Disk docks while Backup
  *                     Disk is already present
@@ -135,6 +135,8 @@ export interface Operation {
    * (POWER_OFF_FAILED). Absent on other kinds.
    */
   safeToRemove?: boolean
+  /** cross-Engine moveApp only (idea#79): steps, verify verdict, result. See MoveAppShapes.ts. */
+  move?: import('./MoveAppShapes.js').MoveProgress
 }
 
 // References to top-level YMaps and YArrays in the Yjs document

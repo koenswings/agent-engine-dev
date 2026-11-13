@@ -35,7 +35,7 @@ export const RECOVERY_STRATEGY: Record<OperationKind, RecoveryStrategy> = {
     moveApp:       'retry',   // rsync-based — idempotent
     backupApp:     'retry',   // BorgBackup — idempotent; lock file already guards double-run
     restoreApp:    'fail',    // restore may have partially written target — safer to fail
-    upgradeApp:    'fail',    // not yet implemented
+    upgradeApp:    'fail',    // legacy kind, never issued: superseded by updateApp (#230); kept so old store Operations still parse (idea#76)
     updateApp:     'fail',    // #230: recoverInterruptedUpdates rolls back from the .pre-update snapshot first
     upgradeEngine: 'fail',    // not yet implemented
     startApp:      'fail',    // partial start state unknown — operator must re-issue
@@ -335,6 +335,21 @@ export const recoverInterruptedOperations = async (
     log(`recoverInterruptedOperations: ${interrupted.length} interrupted operation(s) found`)
 
     for (const op of interrupted) {
+        // idea#79: an interrupted cross-Engine move is never retried and never
+        // removes the source; only a recorded verify means the copy is good.
+        if (op.kind === 'moveApp' && op.move) {
+            const verified = op.move.verified === true
+            const text = verified
+                ? 'MOVED, source not removed: the Engine restarted before the old copy was removed'
+                : 'MOVE FAILED: the Engine restarted during the move; source kept'
+            log(chalk.yellow(`  ${op.id.slice(0, 8)} moveApp (cross-Engine): ${text}`))
+            storeHandle.change(doc => {
+                const m = (doc.operationDB?.[op.id] as any)?.move
+                if (m) { m.phase = verified ? 'done' : 'failed'; m.code = verified ? 'SOURCE_NOT_REMOVED' : 'INTERRUPTED'; m.resultText = text }
+            })
+            updateOperation(storeHandle, op.id, { status: verified ? 'Done' : 'Failed', error: text, completedAt: Date.now() as Timestamp })
+            continue
+        }
         const strategy = RECOVERY_STRATEGY[op.kind] ?? 'fail'
         const handler = retryHandlers[op.kind]
         const cmdLogHandle = getCommandLogHandle()

@@ -17,6 +17,8 @@
  * Docker is replaced by an in-memory container table and startInstance is recorded.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { setRootDeviceForTests } from '../../src/data/Disk.js'
+import { setSystemDiskOpsForTests } from '../../src/data/SystemDisk.js'
 
 const h = vi.hoisted(() => ({
     running: new Set<string>(),    // instance ids with a running container
@@ -28,7 +30,7 @@ vi.mock('node-docker-api', () => ({
     Docker: class {
         container = {
             list: async () => [...h.running].map(id => ({
-                data: { Names: [`/${id}-sample-1`] },
+                data: { Names: [`/${id}-sample-1`], Labels: { 'com.docker.compose.project': id } },
                 stop: async () => { h.running.delete(id) },
                 kill: async () => { h.running.delete(id) },
             })),
@@ -151,9 +153,16 @@ const firstBoot = async (device: string) => {
 
 beforeEach(() => {
     h.running.clear(); h.started.length = 0; h.sudo.length = 0
+    setRootDeviceForTests('sda2')
+    setSystemDiskOpsForTests({
+        findmntSource: async (mp) => mp === '/' ? '/dev/sda2' : mp === '/boot/firmware' ? '/dev/sda1' : null,
+        pkname: async () => 'sda',
+    })
 })
 
 afterEach(async () => {
+    setRootDeviceForTests(null)
+    setSystemDiskOpsForTests(null)
     await closeWatchers()
     for (const d of devices) {
         await fs.remove(sentinelPath(d)).catch(() => {})
@@ -286,7 +295,7 @@ describe('production mode (testMode off): real startup disk scan and USB add', (
         setMountOps(null)
     })
 
-    /** An sd* name that is not on this machine's system drive (the box/CI root is not sdq-sdz). */
+    /** sd* names away from the mocked root (sda2); no longer depends on the host's findmnt /. */
     const sdDevice = (() => { let n = 0; const letters = 'qrstuvwxyz'; return () => `sd${letters[n++ % letters.length]}1` })()
 
     const prodFirstBoot = async (device: string) => {

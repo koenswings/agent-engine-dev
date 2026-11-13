@@ -9,7 +9,7 @@ import { DocHandle, Repo } from '@automerge/automerge-repo'
 import { fs, path, YAML } from 'zx'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
-import { createOrUpdateDisk, processDisk } from '../../src/data/Disk.js'
+import { createOrUpdateDisk, processDisk, isSystemDisk, setRootDeviceForTests } from '../../src/data/Disk.js'
 import { eraseDisk, isEspPartType, parseHiddenPartitions, setEraseOpsForTests, setEraseAddDevice, ERASE_STAGING_ROOT, isEraseDeviceLocked } from '../../src/data/EraseDisk.js'
 import { setSystemDiskOpsForTests } from '../../src/data/SystemDisk.js'
 import { CommandLogStore, setCommandLogHandle, addTrace } from '../../src/data/CommandLogStore.js'
@@ -81,14 +81,28 @@ describe('eraseDisk whole-disk checks and remount on failure (#188)', () => {
             await processDisk(h, d)
         })
         setSystemDiskOpsForTests({ findmntSource: async (mp) => mp === '/' ? '/dev/sda2' : null, pkname: async () => 'sda' })
+        // processDisk uses Disk.getRootDevice (findmnt /), not the SystemDisk mock above.
+        setRootDeviceForTests('sda2')
     })
     afterEach(async () => {
         setEraseOpsForTests(null)
         setEraseAddDevice(null)
         setSystemDiskOpsForTests(null)
+        setRootDeviceForTests(null)
         setCommandLogHandle(null)
         for (const r of roots.splice(0)) await fs.remove(r).catch(() => {})
         await fs.remove(ERASE_STAGING_ROOT).catch(() => {})
+    })
+
+    it('processDisk follows the mocked root device, not the host findmnt / (sda2 or sdb2)', async () => {
+        const disk = (device: string) => ({ id: 'd', name: 'D', device, diskTypes: [], dockedTo: LOCAL } as any)
+        setRootDeviceForTests('sda2')
+        expect(await isSystemDisk(disk('sda2'))).toBe(true)
+        expect(await isSystemDisk(disk('sdb2'))).toBe(false)
+        setRootDeviceForTests('sdb2')
+        expect(await isSystemDisk(disk('sdb2'))).toBe(true)
+        expect(await isSystemDisk(disk('sda2'))).toBe(false)
+        setRootDeviceForTests('sda2')
     })
 
     it('refuses before any unmount or store change when a sibling partition on the same disk is mounted', async () => {

@@ -8,10 +8,12 @@
  *    data snapshot as well as the old bundle/image, never just the old image.
  *  - Health gate: during healthTimeout, `starting` and `unhealthy` are "not ready yet";
  *    fail only on container exit, crash-loop or timeout.
- *  - healthTimeout per App: kolibri 900 s, nextcloud 300 s, default 600 s.
+ *  - healthTimeout per App: kolibri 900 s, nextcloud 300 s, default 600 s (table in
+ *    AppHealthTimeout.ts, shared with the start-time port-ready check, idea#437).
  *  - An App without valid SHA256SUMS is never offered an update (NO_SUMS).
  */
 import { parseAppId } from './App.js'
+import { isUpgrade, isMajorChange } from './Version.js'
 
 export type UpdateStep = 'Fetch' | 'Check' | 'Snapshot' | 'Swap' | 'Start' | 'Health'
 export const UPDATE_STEPS: readonly UpdateStep[] = ['Fetch', 'Check', 'Snapshot', 'Swap', 'Start', 'Health']
@@ -20,6 +22,12 @@ export type UpdateRefusal =
     | 'NOT_DOCKED' | 'BUSY' | 'SOURCE_MISSING' | 'DIFFERENT_APP' | 'NOT_NEWER'
     | 'MAJOR_NOT_ALLOWED' | 'NEEDS_BACKUP' | 'NO_SPACE' | 'NO_SUMS'
     | 'NOT_FOUND' | 'AMBIGUOUS' | 'HELPER_OUTDATED' | 'TRANSFER_FAILED'
+    // idea#448: the backup updateApp takes itself before a major update
+    | 'BAD_BACKUP_SPEC' | 'HOOK_FAILED' | 'BACKUP_FAILED'
+    // idea#448: the new bundle ships a path the snapshot and rollback leave out
+    | 'BUNDLE_CONTAINS_EXCLUDED'
+    // idea#479: id checked before any compose or Docker action
+    | 'INVALID_INSTANCE_ID'
 
 /** Error text starts with the code; the two rollback outcomes use the console#168 wording. */
 export const ROLLED_BACK_PREFIX = 'ROLLED BACK:'
@@ -31,32 +39,11 @@ export class UpdateAppError extends Error {
     }
 }
 
-/** Numeric version parts from "1.2.3", "v1.2", or tool output like "kolibri, version 0.19.5"; null if none. */
-export const parseVersion = (raw: string | null | undefined): number[] | null => {
-    const m = String(raw ?? '').match(/(\d+(?:\.\d+)*)/)
-    return m ? m[1].split('.').map(n => Number(n)) : null
-}
+/** Version rules live in Version.ts (idea#76); re-exported for existing callers. */
+export { parseVersion, compareVersions, isUnversioned, isUpgrade, isMajorChange } from './Version.js'
 
-/** <0, 0, >0 like a comparator; null when either side can't be read. */
-export const compareVersions = (a: string, b: string): number | null => {
-    const x = parseVersion(a), y = parseVersion(b)
-    if (!x || !y) return null
-    for (let i = 0; i < Math.max(x.length, y.length); i++) {
-        const d = (x[i] ?? 0) - (y[i] ?? 0)
-        if (d !== 0) return d
-    }
-    return 0
-}
-
-const DEFAULT_HEALTH_TIMEOUT_S = 600
-const HEALTH_TIMEOUT_S: Record<string, number> = { kolibri: 900, nextcloud: 300 }
-
-/** x-app.healthTimeout (seconds) wins when valid; else the per-App default. */
-export const healthTimeoutSeconds = (appName: string, declared?: unknown): number => {
-    const n = Number(declared)
-    if (declared !== undefined && declared !== null && Number.isFinite(n) && n > 0) return n
-    return HEALTH_TIMEOUT_S[appName.toLowerCase()] ?? DEFAULT_HEALTH_TIMEOUT_S
-}
+/** The per-App timeout table lives in AppHealthTimeout.ts, shared with the start-time port-ready check (idea#437). */
+export { healthTimeoutSeconds, APP_HEALTH_TIMEOUT_S, DEFAULT_HEALTH_TIMEOUT_S } from './AppHealthTimeout.js'
 
 export interface CheckFacts {
     diskDocked: boolean
@@ -70,9 +57,51 @@ export interface CheckFacts {
     backupAgeMs: number | null
     /** disks that lack space (name), empty when all fit */
     shortDisks: string[]
+    /**
+     * idea#448: a Backup Disk linked to the instance is docked here, so updateApp takes the
+     * required backup itself (hook before the stop, or Borg inside the Snapshot stop).
+     */
+    backupPlanned?: boolean
 }
 
 export const BACKUP_MAX_AGE_MS = 60 * 60 * 1000
+
+/**
+ * idea#448: true when this update needs a fresh backup (a major upgrade, idea#76: an
+ * unversioned SHA to a tag stays major, and no backup in the last hour).
+ */
+export const backupIsDue = (currentAppId: string, newAppId: string, backupAgeMs: number | null): boolean => {
+    const cur = parseAppId(currentAppId).version, nxt = parseAppId(newAppId).version
+    if (!isUpgrade(cur, nxt) || !isMajorChange(cur, nxt)) return false
+    return backupAgeMs === null || backupAgeMs > BACKUP_MAX_AGE_MS
+}
+
+/** createAppId(undefined, undefined) stringifies missing x-app.name / x-app.version as "undefined". */
+const isMissingAppField = (value: string): boolean => value === '' || value === 'undefined'
+
+const showAppField = (value: string): string => isMissingAppField(value) ? '(missing)' : value
+
+/**
+ * Why updateApp should refuse DIFFERENT_APP: missing or mismatched x-app.name
+ * and/or x-app.version, with the instance's actual values and the bundle's expected ones.
+ * createOrUpdateInstance sets instanceOf from those compose fields, so a bundle
+ * without them becomes `undefined-undefined` (seen on idea04 during #311).
+ */
+export const appIdentityProblems = (currentAppId: string, newAppId: string): string | null => {
+    const cur = parseAppId(currentAppId), nxt = parseAppId(newAppId)
+    const problems: string[] = []
+    if (isMissingAppField(cur.name) || isMissingAppField(nxt.name)) {
+        problems.push(`x-app.name is missing (actual: ${showAppField(cur.name)}, expected: ${showAppField(nxt.name)})`)
+    } else if (cur.name !== nxt.name) {
+        problems.push(`x-app.name mismatch (actual: ${cur.name}, expected: ${nxt.name})`)
+    }
+    if (isMissingAppField(cur.version) || isMissingAppField(nxt.version)) {
+        problems.push(`x-app.version is missing (actual: ${showAppField(cur.version)}, expected: ${showAppField(nxt.version)})`)
+    } else if (cur.name !== nxt.name && cur.version !== nxt.version) {
+        problems.push(`x-app.version mismatch (actual: ${cur.version}, expected: ${nxt.version})`)
+    }
+    return problems.length ? problems.join('; ') : null
+}
 
 /** First refusal in the agreed order, or null when the update may go ahead. */
 export const checkUpdate = (f: CheckFacts): UpdateAppError | null => {
@@ -80,13 +109,14 @@ export const checkUpdate = (f: CheckFacts): UpdateAppError | null => {
     if (f.busy) return new UpdateAppError('BUSY', 'another operation is running on this instance')
     if (!f.sourcePresent) return new UpdateAppError('SOURCE_MISSING', `bundle ${f.newAppId} was not found on the source`)
     if (!f.sumsValid) return new UpdateAppError('NO_SUMS', `bundle ${f.newAppId} has no valid SHA256SUMS`)
+    const identity = appIdentityProblems(f.currentAppId, f.newAppId)
+    if (identity) return new UpdateAppError('DIFFERENT_APP', identity)
     const cur = parseAppId(f.currentAppId), nxt = parseAppId(f.newAppId)
-    if (cur.name !== nxt.name) return new UpdateAppError('DIFFERENT_APP', `${f.newAppId} is not a version of ${cur.name}`)
-    const cmp = compareVersions(nxt.version, cur.version)
-    if (cmp === null || cmp <= 0) return new UpdateAppError('NOT_NEWER', `${nxt.version} is not newer than ${cur.version}`)
-    const major = (parseVersion(nxt.version)![0] ?? 0) !== (parseVersion(cur.version)![0] ?? 0)
+    if (!isUpgrade(cur.version, nxt.version)) return new UpdateAppError('NOT_NEWER', `${nxt.version} is not newer than ${cur.version}`)
+    const major = isMajorChange(cur.version, nxt.version)
     if (major && !f.allowMajor) return new UpdateAppError('MAJOR_NOT_ALLOWED', `${cur.version} -> ${nxt.version} is a major update; pass --allow-major`)
-    if (major && (f.backupAgeMs === null || f.backupAgeMs > BACKUP_MAX_AGE_MS)) return new UpdateAppError('NEEDS_BACKUP', 'Dock a Backup Disk and make a backup first')
+    if (major && (f.backupAgeMs === null || f.backupAgeMs > BACKUP_MAX_AGE_MS) && !f.backupPlanned)
+        return new UpdateAppError('NEEDS_BACKUP', 'Dock a Backup Disk linked to this instance (updateApp then takes the backup itself), or make a backup first')
     if (f.shortDisks.length) return new UpdateAppError('NO_SPACE', `not enough free space on ${f.shortDisks.join(', ')}`)
     return null
 }
@@ -96,8 +126,7 @@ export const offerable = (f: Pick<CheckFacts, 'currentAppId' | 'newAppId' | 'sum
     if (!f.sumsValid) return false
     const cur = parseAppId(f.currentAppId), nxt = parseAppId(f.newAppId)
     if (cur.name !== nxt.name) return false
-    const cmp = compareVersions(nxt.version, cur.version)
-    return cmp !== null && cmp > 0
+    return isUpgrade(cur.version, nxt.version)
 }
 
 export type ContainerHealth = 'starting' | 'healthy' | 'unhealthy' | 'none' | 'exited' | 'restarting'

@@ -1,0 +1,68 @@
+{
+  "schema": "idea-usage-day/1",
+  "engine": "happy-zebra",
+  "day": "2026-11-10",
+  "app": "kolibri",
+  "instance": "kolibri-a",
+  "name": "Kolibri",
+  "demo": false,
+  "listed": true,
+  "clock": {
+    "synced": true,
+    "correctedBoots": 0
+  },
+  "collectedAt": "2026-11-11T02:00:00+01:00",
+  "hookStatus": "ok",
+  "setup": {
+    "classes": 0,
+    "classesDelta": 0,
+    "learner": {
+      "total": 0,
+      "beyondSeed": 0
+    },
+    "learnerDelta": 0,
+    "learnerEnrolled": 0,
+    "teacher": {
+      "total": 0,
+      "beyondSeed": 0
+    },
+    "teacherDelta": 0,
+    "admin": {
+      "total": 1,
+      "beyondSeed": 1
+    }
+  },
+  "signins": {
+    "learner": {
+      "total": 0,
+      "beyondSeed": 0,
+      "sessions": 0,
+      "minutes": 0
+    },
+    "coach": {
+      "total": 0,
+      "beyondSeed": 0,
+      "sessions": 0,
+      "minutes": 0
+    },
+    "admin": {
+      "total": 0,
+      "beyondSeed": 0,
+      "sessions": 0,
+      "minutes": 0
+    }
+  },
+  "content": [],
+  "teaching": {
+    "lessonsCreated": 0,
+    "lessonsVisible": 0,
+    "quizzesCreated": 0,
+    "quizzesStarted": 0,
+    "quizzesEnded": 0
+  },
+  "guest": {
+    "visits": 0,
+    "seconds": 0
+  },
+  "flags": []
+}

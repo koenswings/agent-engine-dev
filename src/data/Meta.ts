@@ -37,6 +37,22 @@ const sampleMeta: DiskMeta = {
 
 export const SYSTEM_META_PATH = '/META.yaml'
 
+/**
+ * Where the Engine looks for the system-disk META (idea#145).
+ *
+ * `IDEA_SYSTEM_META` may point at a test-local file so the box gate does not
+ * depend on `/META.yaml` on the host. The override is honoured only when
+ * `NODE_ENV=test` or `IDEA_TEST_MODE=true`. On a Pi those are unset, so a
+ * stray env var cannot redirect production away from `/META.yaml`.
+ */
+export const systemMetaPath = (): string => {
+  const override = process.env.IDEA_SYSTEM_META
+  if (override && (process.env.NODE_ENV === 'test' || process.env.IDEA_TEST_MODE === 'true')) {
+    return override
+  }
+  return SYSTEM_META_PATH
+}
+
 /** What to do when /META.yaml is missing, shown in errors (idea#145). */
 export const SYSTEM_META_HELP =
   'Run ./build-engine --personalize on this Pi to create /META.yaml, or check that ' +
@@ -76,7 +92,7 @@ export const ensureSystemMeta = async (
   device: DeviceName,
   options: { path?: string, allowCreate?: boolean, deps?: Partial<SystemMetaDeps> } = {},
 ): Promise<DiskMeta | null> => {
-  const metaPath = options.path ?? SYSTEM_META_PATH
+  const metaPath = options.path ?? systemMetaPath()
   const deps = { ...defaultSystemMetaDeps, ...options.deps }
   if (deps.exists(metaPath)) return null
   if (options.allowCreate === false) {
@@ -153,6 +169,27 @@ export const diskIdWithoutHardware = (meta: Partial<DiskMeta>, newId: () => stri
   return { diskId: meta.diskId as DiskID, generated: false, reason: 'The disk id in the META file is a user-assigned id. Keeping it as is' }
 }
 
+const isValidTimestamp = (v: unknown): v is number =>
+  typeof v === 'number' && Number.isFinite(v) && v > 0
+
+/**
+ * Default META fields that get copied into the Automerge store, so none is ever
+ * assigned as undefined (Automerge rejects undefined values; idea#394, idea#139).
+ * Must run before lastDocked is refreshed, so a missing `created` can fall back to
+ * the previous lastDocked. Returns true when META was changed (the caller persists
+ * it with the normal lastDocked rewrite, unless skipMetaUpdate()).
+ */
+export const applyMetaDefaults = (meta: DiskMeta, path: string, now: () => number = () => Date.now()): boolean => {
+  let changed = false
+  if (!isValidTimestamp(meta.created)) {
+    const fallback = isValidTimestamp(meta.lastDocked) ? meta.lastDocked : now()
+    log(`WARNING: META.yaml of disk ${meta.diskId} (${path}) has no valid 'created' (${String(meta.created)}); defaulting to ${isValidTimestamp(meta.lastDocked) ? 'its lastDocked' : 'now'} (${fallback})`)
+    meta.created = fallback as Timestamp
+    changed = true
+  }
+  return changed
+}
+
 export interface MetaIdDeps {
   /** Hardware identity of an App Disk partition (serial + partition facts) */
   readIdentity: (device: DeviceName) => Promise<HardwareIdentity | undefined>
@@ -175,7 +212,7 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName, depsIn: Partial<
       path = `${disksRoot()}/${deviceSpec}/META.yaml`
       device = deviceSpec as DeviceName
     } else {
-      path = `/META.yaml`
+      path = systemMetaPath()
       // findmnt may return /dev/sda2 (Pi) or "overlay"/tmpfs (containers/VMs).
       // Only /dev/... paths have a usable device name at split('/')[2].
       const rootSource = (await $`findmnt / -no SOURCE`).stdout.trim()
@@ -202,7 +239,7 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName, depsIn: Partial<
       // Read the META.yaml file
       // /META.yaml is root-owned (600) so we need sudo for the system disk.
       // Disk META files under /disks/ are pi-owned and don't need it.
-      const catCmd = path === '/META.yaml' ? $`sudo cat ${path}` : $`cat ${path}`
+      const catCmd = path === SYSTEM_META_PATH ? $`sudo cat ${path}` : $`cat ${path}`
       const metaContent = (await catCmd).stdout.trim()
       const meta: DiskMeta = YAML.parse(metaContent)
       // YAML 1.1 coerces unquoted 1.0 → number 1; Version is always a string.
@@ -255,12 +292,15 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName, depsIn: Partial<
         update = true
       }
 
+      // Optional-in-practice fields: never hand undefined to Automerge (idea#394)
+      if (applyMetaDefaults(meta, path)) update = true
+
       // Update the lastDocked timestamp
       meta.lastDocked = new Date().getTime() as Timestamp
       update = true  // Always update the lastDocked timestamp
 
       // Upgrade older META files that do not have the diskName field
-      if (!meta.hasOwnProperty('diskName')) {
+      if (meta.diskName == null || String(meta.diskName) === '') {
         log(`Upgrading older META file format to include diskName field and remove obsolete properties`)
         meta.diskName = diskId.toString() as DiskName
         // Remove the properties engineId and hostname
@@ -407,11 +447,11 @@ export const createMeta = async (device: DeviceName, engineVersion: Version | un
  *
  * Mount roots under /disks are root:root, so the Engine (running as pi) cannot
  * create META.yaml there. /etc/sudoers.d/11-engine-files allows exactly
- * `/usr/bin/tee /disks/sd[a-z][12]/META.yaml`; this regex is the same pattern.
+ * `/usr/bin/tee /disks/sd[a-z][1-9]/META.yaml`; this regex is the same pattern.
  * Other roots (test and fixture roots set with IDEA_DISKS_ROOT) are pi-owned and
  * are not covered by that entry, so they are written without sudo.
  */
-export const SUDO_META_PATH = /^\/disks\/sd[a-z][12]\/META\.yaml$/
+export const SUDO_META_PATH = /^\/disks\/sd[a-z][1-9]\/META\.yaml$/
 export const SUDO_TEE = '/usr/bin/tee'
 
 /**
@@ -430,7 +470,7 @@ export const runSudoTee: SudoTeeRunner = async (metaPath, content) => {
  * disk without META.yaml) use this; writeMeta() below logs and swallows errors.
  *
  *   - /META.yaml (system disk): `sudo tee /META.yaml` (10-engine, idea#80)
- *   - /disks/sd[a-z][12]/META.yaml (App Disk mount roots, root:root):
+ *   - /disks/sd[a-z][1-9]/META.yaml (App Disk mount roots, root:root):
  *     `sudo /usr/bin/tee <path>` (11-engine-files, idea#121)
  *   - any other path (test/fixture roots owned by pi): a plain write as pi
  */

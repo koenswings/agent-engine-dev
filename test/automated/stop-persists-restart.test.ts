@@ -28,7 +28,7 @@ vi.mock('node-docker-api', () => ({
     Docker: class {
         container = {
             list: async () => [...h.running].map(id => ({
-                data: { Names: [`/${id}-app-1`] },
+                data: { Names: [`/${id}-app-1`], Labels: { 'com.docker.compose.project': id } },
                 stop: async () => { h.running.delete(id) },
                 kill: async () => { h.running.delete(id) },
             })),
@@ -266,9 +266,18 @@ describe('regression: normal autostart and interrupted operations', () => {
 
     it('Running instances whose containers survived keep running (the already-running path)', async () => {
         const handle = await makeStore()
-        await checkAndSetUndockedApps(handle, localEngineId, async (id) => h.running.has(String(id)))
+        // a dock pass follows for every disk (systemDiskSkip off)
+        await checkAndSetUndockedApps(handle, localEngineId, async (id) => h.running.has(String(id)), { systemDiskSkip: false })
         // #167: Starting until the dock pass confirms them (startInstance's already-running path)
         for (const id of [MILKWISE, KOLIBRI, NEXTCLOUD]) expect(status(handle, id)).toBe('Starting')
+    })
+
+    it('idea#449: under systemDiskSkip a running system-disk instance is not marked Starting', async () => {
+        const handle = await makeStore()
+        await checkAndSetUndockedApps(handle, localEngineId, async (id) => h.running.has(String(id)), { systemDiskSkip: true })
+        // no dock pass follows for the system disk, so nobody would set it Running again
+        expect(status(handle, MILKWISE)).toBe('Running')
+        for (const id of [KOLIBRI, NEXTCLOUD]) expect(status(handle, id)).toBe('Starting')
     })
 
     for (const cause of ['backup-pre-stop', 'post-copy', 'post-move', 'disk-undocked'] as OperationCause[]) {

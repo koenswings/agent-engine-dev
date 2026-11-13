@@ -10,6 +10,8 @@ import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import { CommandLogStore, CommandTrace } from '../../src/data/CommandLogStore.js'
 import { enableStoreMonitor } from '../../src/monitors/storeMonitor.js'
 import { forgetDisk } from '../../src/data/ForgetDisk.js'
+import { commands } from '../../src/data/Commands.js'
+import { handleCommand } from '../../src/utils/commandUtils.js'
 
 const DISK = '20070Q450002'
 const disk = (id: string) => ({ id, name: `stale ${id}`, dockedTo: null, device: null, created: 1, lastDocked: 1, diskType: 'app' })
@@ -50,5 +52,19 @@ describe('forgetDisk reports what it did (#262)', () => {
         expect(h.doc()!.diskDB[DISK as any]).toBeUndefined()
         const ts = traces(log).filter(t => t.command?.startsWith('forgetDisk'))
         for (const t of ts) expect({ c: t.command, s: t.status, e: t.errorMessage ?? null }).toEqual({ c: t.command, s: "ok", e: null })
+    })
+
+    it('refused forgetDisk (docked disk): trace status error and error carries the reason (idea#428)', async () => {
+        h.change(d => {
+            (d.diskDB as any)['docked-1'] = { id: 'docked-1', name: 'System Disk', dockedTo: localEngineId, device: 'sda2', created: 1, lastDocked: 1, diskType: 'system' }
+        })
+        const log = new Repo({ network: [], storage: undefined }).create<CommandLogStore>({ traces: {}, recentTraceIds: [] })
+        await handleCommand(commands, h, 'engine', 'forgetDisk docked-1', log)
+        const t = traces(log).find(x => x.command === 'forgetDisk')
+        expect(t).toBeTruthy()
+        expect(t!.status).toBe('error')
+        expect(t!.errorMessage).toMatch(/is docked/)
+        expect(t!.error).toBe(t!.errorMessage)
+        expect(h.doc()!.diskDB['docked-1' as any]).toBeTruthy()
     })
 })

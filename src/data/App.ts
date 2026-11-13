@@ -1,4 +1,5 @@
 import { splitAppId } from './AppIdParse.js'
+import { parseVersion, isMajorChange } from './Version.js'
 import { $, YAML, chalk } from 'zx';
 import { Version, URL, AppID, AppName, Hostname, DeviceName, DiskName, DiskID } from './CommonTypes.js';
 import { log } from '../utils/utils.js';
@@ -29,6 +30,12 @@ export const createAppId = (appName: AppName, version: Version): AppID => {
     return appName + "-" + version as AppID
 }
 
+/** Display title from x-app.title, or the app name when the compose omits it (idea#428). Automerge rejects undefined. */
+export const appTitleFromXapp = (xapp: { title?: unknown } | null | undefined, fallbackName: string): string => {
+    const title = xapp && typeof xapp.title === 'string' ? xapp.title.trim() : ''
+    return title || fallbackName
+}
+
 /** Split an app id into name and version (rules in AppIdParse.ts). */
 export const parseAppId = (appId: string): { name: AppName, version: Version } => {
     const { name, version } = splitAppId(appId)
@@ -45,8 +52,7 @@ export const extractAppVersion = (appId: AppID): Version => parseAppId(appId).ve
  * integer-major style (1.x, 2.x). No 0.x or pre-release versions in use.
  */
 export const extractMajorVersion = (appId: AppID): number => {
-    const version = extractAppVersion(appId)   // e.g. "1.0"
-    return parseInt(version.split('.')[0], 10)
+    return parseVersion(extractAppVersion(appId))?.[0] ?? NaN   // e.g. "1.0" -> 1; NaN when unversioned (idea#76)
 }
 
 /**
@@ -61,7 +67,7 @@ export const extractMajorVersion = (appId: AppID): number => {
  */
 export const isMajorUpgrade = (oldAppId: AppID, newAppId: AppID): boolean => {
     if (oldAppId === newAppId) return false
-    return extractMajorVersion(oldAppId) !== extractMajorVersion(newAppId)
+    return isMajorChange(extractAppVersion(oldAppId), extractAppVersion(newAppId))
 }
 
 export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: AppID, disk: Disk) => {
@@ -80,7 +86,7 @@ export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: Ap
         storeHandle.change(doc => {
             const storedApp: App | undefined = doc.appDB[appId]
             // Automerge rejects undefined — use null for absent optional fields
-            const xapp = appCompose['x-app']
+            const xapp = appCompose['x-app'] ?? {}
             if (!storedApp) {
                 // Create a new app object
                 log(chalk.green(`Creating new app ${appId} on disk ${diskID}`))
@@ -88,10 +94,10 @@ export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: Ap
                     id: appId as AppID,
                     name: appName,
                     version: appVersion,
-                    title: xapp.title,
+                    title: appTitleFromXapp(xapp, appName),
                     description: xapp.description ?? null,
                     url: xapp.url ?? null,
-                    category: xapp.category,
+                    category: xapp.category ?? '',
                     icon: xapp.icon ?? null,
                     author: xapp.author ?? null,
                     filesMount: parseFilesMount(xapp),
@@ -105,10 +111,10 @@ export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: Ap
                 app = storedApp
                 app.name = appName
                 app.version = appVersion
-                app.title = xapp.title
+                app.title = appTitleFromXapp(xapp, appName)
                 app.description = xapp.description ?? null
                 app.url = xapp.url ?? null
-                app.category = xapp.category
+                app.category = xapp.category ?? ''
                 app.icon = xapp.icon ?? null
                 app.author = xapp.author ?? null
                 app.filesMount = parseFilesMount(xapp)
