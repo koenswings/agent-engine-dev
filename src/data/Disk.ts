@@ -25,6 +25,8 @@ import { shouldAutoStart } from './AutoStart.js';
 export interface BackupConfig {
     mode: BackupMode
     links: InstanceID[]
+    /** BACKUP.yaml `schedule` mirrored by the docked Engine (idea#400); null/absent when not set. Daily only. */
+    schedule?: { daily: string } | null
 }
 
 /** A leftover .backup-in-progress lock found when a Backup Disk docks or the Engine boots (idea#446). */
@@ -54,6 +56,21 @@ export interface Disk {
     /** total bytes of the pre-update and quarantine folders on this disk (Atlas: Ops visibility; nothing auto-deletes) */
     preUpdateBytes?: number | null;
     quarantineBytes?: number | null;
+    // Scheduled Backup Disk summary (idea#400, proposal §3.6): written by the docked Engine once per run
+    // (clockTrusted/clockReason only on change), never per tick; null/absent on older Engines and when undocked.
+    /** Free space in percent, rounded; does not replace sizeBytes / freeBytes. */
+    freePct?: number | null;
+    /** This Engine's clock is trusted for the schedule (proposal §3.2). */
+    clockTrusted?: boolean | null;
+    /** Why the clock is not trusted (Engine-internal token); null when trusted. */
+    clockReason?: string | null;
+    /** Slots missed before the last scheduled run (BACKUP.yaml mirror). */
+    missedRuns?: number | null;
+    /** Unix ms of the last scheduled run attempt (BACKUP.yaml mirror). */
+    lastAttempt?: Timestamp | null;
+    /** True while fullness cleanup runs (idea#402), with its start time. */
+    cleaning?: boolean | null;
+    cleaningStartedAt?: Timestamp | null;
 }
 
 export interface PreUpdateSnapshot {
