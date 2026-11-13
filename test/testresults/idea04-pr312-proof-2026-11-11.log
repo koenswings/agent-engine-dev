@@ -1,0 +1,267 @@
+idea04 PR #312 live proof — 2026-11-11 (Europe/Brussels, UTC+1)
+================================================================================
+Verdict: PASS
+PR:     https://github.com/koenswings/agent-engine-dev/pull/312
+Head:   2ceadc0c49982760babba95f00d34241f3a0d943
+        Merge origin/main (825c66c) into fix/idea-usage-catchup-425
+Fix:    5de15c63d0424197e2ed6d80685513308b75e2a8
+        idea#425: catch-up must not stamp current inventory onto past days
+Main:   825c66cc09743cc380a34c33fb5c3fdbaff7fcc5
+Pi:     idea04 (100.108.39.45), claimed as Axle
+Issue:  https://github.com/koenswings/idea/issues/425
+Claim:  idea repo 5b1681b fleet-state: Axle claims idea04 for engine#312 catch-up proof
+
+Box tests (this session, 2026-11-11 03:59 Europe/Brussels)
+--------------------------------------------------------------------------------
+Merged origin/main 825c66c into fix/idea-usage-catchup-425 with a merge commit
+(no rebase, no force-push): 2ceadc0.
+npx tsc --noEmit --pretty false: OK
+npx vitest run --maxWorkers=1 (usage / export / parity):
+  test/automated/usage-process.test.ts
+  test/automated/usage-store.test.ts
+  test/automated/usage-discover.test.ts
+  test/automated/usage-runner.test.ts
+  test/automated/usage-export.test.ts
+  test/automated/usage-export-parity.test.ts
+  test/automated/idea-usage-export.test.ts
+  test/automated/idea-usage-export-parity.test.ts
+  test/automated/usage-schema.test.ts
+  test/automated/usage-no-automerge.test.ts
+  test/automated/usage-engine-wiring.test.ts
+  11 files / 112 tests passed (2.64s)
+Pushed 5de15c6..2ceadc0 to origin/fix/idea-usage-catchup-425.
+
+idea-usage under test
+--------------------------------------------------------------------------------
+pm2 name=idea-usage user=pi (never root)
+script: /home/pi/axle-312/dist/src/usage/main.js   (detached worktree of 2ceadc0)
+cwd:    /home/pi/axle-312
+env:    NODE_ENV=development VERBOSITY=3; no IDEA_CONFIG_FILE,
+        no IDEA_NETWORK_TESTS, no IDEA_USAGE_AS_MAIN
+Built on the Pi as pi: git fetch + worktree add --detach, symlink node_modules
+from the main engine checkout, npx tsc (exit 0). Confirmed instanceExistedOnDay
+is present in dist/src/usage/scheduler.js and paths.js.
+
+Engine left on main the whole time
+--------------------------------------------------------------------------------
+pm2 name=engine user=pi
+script: /home/pi/idea/agents/agent-engine-dev/dist/src/index.js
+HEAD:   825c66cc09743cc380a34c33fb5c3fdbaff7fcc5
+http://127.0.0.1:8080/ -> 200 throughout
+Fresh pm2 env (no IDEA_CONFIG_FILE). config.yaml not edited
+(settings.mdns=true, settings.systemDiskSkip=true).
+usageMonitoring: on ({"usageMonitoring":"on"})
+mDNS: on
+IDEA_NETWORK_TESTS: unset
+Temperature: 43.3–49.1 °C (pause threshold 75 °C; never approached)
+Not touched: WD SSD 20070Q450002 (no writes), /disks (read-only stat of the
+three compose working_dirs already identified by docker inspect),
+~/atlas-322*, ~/idea-proof-322, config.yaml.
+
+Backup
+--------------------------------------------------------------------------------
+cp -a /var/lib/idea/usage /home/pi/axle-312-backup-20261111T040432
+(2026-11-11 04:04:32 Europe/Brussels). settings.json and all live day files
+copied first. Subsequent quarantines went into subdirs of that backup
+(never deleted).
+
+STEP 1 — creation times  PASS (existing-inventory / mid-window case)
+--------------------------------------------------------------------------------
+No instance is installed today: /instances is empty (cleared 03:37 Europe/Brussels
+after the #311 scratches were removed).
+
+A scratch system-disk app would have required IDEA_CONFIG_FILE with
+systemDiskSkip false and an Engine restart. This proof is about idea-usage;
+the engine stayed on main 825c66c with the fresh pm2 env.
+
+A scratch data-disk app is not cleanly possible without the WD SSD
+20070Q450002 (the only data disk, docked at /disks/sdb1).
+
+Used the existing inventory, as allowed: the three listed updtest instances
+whose creation day falls inside the 14-day window (today-14 = 2026-10-28,
+yesterday = 2026-11-10).
+
+Current running listed instances (docker ps + compose working_dir):
+
+  updtest-i76major  docker CreatedAt 2026-11-10 23:21:19 +0100 CET
+                    inspect Created    2026-11-10T22:21:19Z
+                    dir /disks/sdb1/instances/updtest-i76major
+                    birth=2026-10-30 18:11:26.761976489 +0100
+                    ctime=2026-11-10 23:21:20.765196025 +0100
+                    mtime=2026-11-10 23:21:20.765196025 +0100
+
+  updtest-i76minor  docker CreatedAt 2026-11-10 23:21:37 +0100 CET
+                    dir /disks/sdb1/instances/updtest-i76minor
+                    birth=2026-10-30 18:11:26.761976489 +0100
+                    ctime=2026-11-10 23:21:38.397063425 +0100
+
+  updtest-i76stale  docker CreatedAt 2026-11-10 23:21:54 +0100 CET
+                    dir /disks/sdb1/instances/updtest-i76stale
+                    birth=2026-10-30 18:11:26.761976489 +0100
+                    ctime=2026-11-10 23:21:55.812932459 +0100
+
+All three directory birth timestamps are identical to the nanosecond
+(2026-10-30 18:11:26.761976489 +0100). ctime/mtime and docker CreatedAt all
+point at the 2026-11-10 23:21 install. The implementation uses directory
+birthtime (fallback ctime) for listed createdAt, so catch-up treated
+createdDay as 2026-10-30. That day is inside the 14-day window, which is
+enough to prove "created later than a past day": 2026-10-28 and 2026-10-29
+must stay empty.
+
+#311 scratches (installed today, then removed; leftover day files from main):
+  5ie6xpi5wh42mgsbx7u axle311-rm
+      /.idea-quarantine/... birth=2026-11-11 03:04:16 +0100
+  3iyi1r8bmvlyl7lvvpb axle311-upd
+      birth=2026-11-11 03:07:34 +0100
+  h7wd4t350auta0dfnbg axle311-upd2
+      birth=2026-11-11 03:19:54 +0100
+  y8uio8lxoa74p9pcsip axle311-upd3
+      birth=2026-11-11 03:30:24 +0100
+
+Main's catch-up had written no-hook stubs for every instance above onto every
+day from 2026-10-28 through 2026-11-10 (collectedAt 03:04 / 03:14 / 03:27 /
+03:29 / 03:45 Europe/Brussels). That is the bug under test.
+
+STEP 2 — make catch-up run  PASS
+--------------------------------------------------------------------------------
+Quarantined (mv, not delete) into the backup:
+
+  98 files total:
+  - all day files for the four #311 instances (created today) on
+    2026-10-28 .. 2026-11-10
+    -> ~/axle-312-backup-20261111T040432/quarantined-from-live/<day>/
+  - updtest-* files on 2026-10-28 .. 2026-11-09 (before birth day)
+    -> same quarantined-from-live tree
+  - the valid 2026-11-10 updtest stubs held aside so catch-up had to recreate them
+    -> ~/axle-312-backup-20261111T040432/held-aside-valid-1110/
+
+Live tree after quarantine: empty day dirs 2026-10-28 .. 2026-11-10,
+settings.json, and 2026-11-11/presence.ndjson only.
+
+Catch-up trigger: processTick runs catch-up whenever !didStartupCatchUp, so a
+restart is enough; the 02:00–03:30 night window is not required. Replaced the
+idea-usage pm2 entry (as pi) with the PR build at 04:07:10 Europe/Brussels
+and left the engine process alone.
+
+Startup catch-up wrote the 2026-10-30 .. 2026-11-10 files at 04:07:11
+Europe/Brussels (hookStatus=no-hook, collectedAt=2026-11-11T04:07:11+01:00).
+
+STEP 3 — no file before creation day; window is max(createdDay, today-14)..yesterday
+           PASS
+--------------------------------------------------------------------------------
+After PR catch-up (04:07 Europe/Brussels):
+
+  2026-10-28  0 json files   (before birth; main had 7 stubs here)
+  2026-10-29  0 json files   (before birth; main had 7 stubs here)
+  2026-10-30 .. 2026-11-10   3 json files/day = updtest-i76{major,minor,stale}
+  2026-11-11  presence.ndjson only (catch-up excludes today)
+  #311 leftovers (5ie6 / 3iyi / h7wd / y8uio) not rewritten
+
+Each current instance has files exactly on
+  max(createdDay=2026-10-30, today-14=2026-10-28) .. yesterday=2026-11-10
+  i.e. 2026-10-30 .. 2026-11-10 (12 days).
+
+Sample written file (2026-10-30/updtest-i76major.json):
+{"schema":"idea-usage-day/1","engine":"idea04","day":"2026-10-30","app":"updtest","instance":"updtest-i76major","name":"updtest-major","demo":false,"listed":true,"clock":{"synced":false,"correctedBoots":0},"collectedAt":"2026-11-11T04:07:11+01:00","hookStatus":"no-hook"}
+
+STEP 4 — existing ok file is not overwritten  PASS
+--------------------------------------------------------------------------------
+Pre-seeded /var/lib/idea/usage/2026-11-10/updtest-i76major.json as hookStatus=ok
+with a distinctive collectedAt (only those two fields changed):
+
+{"schema":"idea-usage-day/1","engine":"idea04","day":"2026-11-10","app":"updtest","instance":"updtest-i76major","name":"updtest-major","demo":false,"listed":true,"clock":{"synced":false,"correctedBoots":0},"collectedAt":"2026-11-11T04:08:08+01:00","hookStatus":"ok"}
+
+sha256 before restart: 8ea202cd4bf4e8a3f6289ab944f318a659caedec74674dc71d0c87c6e8c70672
+pm2 restart idea-usage as pi (startup catch-up ran again) at 04:08:41 Europe/Brussels.
+sha256 after  restart: 8ea202cd4bf4e8a3f6289ab944f318a659caedec74674dc71d0c87c6e8c70672
+collectedAt still 2026-11-11T04:08:08+01:00; bytes identical.
+
+Contrast (stub, expected to be rewritten):
+  2026-11-10/updtest-i76minor.json
+  before: collectedAt=2026-11-11T04:07:11+01:00  sha256 93f7244c...
+  after:  collectedAt=2026-11-11T04:08:41+01:00  sha256 6a514a92...
+
+STEP 3 still held after this second catch-up (same 12 days, no 10-28/10-29,
+no #311 leftovers, no today day-files).
+
+STEP 5 — idea-usage-export since <dates>  PASS
+--------------------------------------------------------------------------------
+sudo -n /usr/local/sbin/idea-usage-export  (main Python script, format unchanged)
+  -rwxr-xr-x 1 root root 10956 2026-11-10 23:44 /usr/local/sbin/idea-usage-export
+  shebang #!/usr/bin/python3; idea#412 forced command.
+
+All five invocations exited 0 with empty stderr.
+
+  since 2026-10-28  exit 0  76 lines
+    counts {day:36, sample:0, presence:39, errors:0}
+    day records only for 2026-10-30 .. 2026-11-10 × updtest-i76{major,minor,stale}
+    no record before 2026-10-30; no #311 instances; no today day-files
+    end: {"type":"end","schema":"idea-usage-export/1","since":"2026-10-28","engine":"idea04","usageMonitoring":"on","counts":{"day":36,"sample":0,"presence":39},"errors":0}
+
+  since 2026-10-30  exit 0  76 lines
+    same 36 day records (10-28 and 10-29 are empty, so the stream matches 10-28)
+    end counts {day:36, sample:0, presence:39, errors:0}
+
+  since 2026-11-10  exit 0  43 lines
+    3 day records (only 2026-11-10) + 39 presence + end
+    seeded ok file present unchanged:
+    {"type":"day","schema":"idea-usage-day/1","day":"2026-11-10","instance":"updtest-i76major","payload":{"schema":"idea-usage-day/1","engine":"idea04","day":"2026-11-10","app":"updtest","instance":"updtest-i76major","name":"updtest-major","demo":false,"listed":true,"clock":{"synced":false,"correctedBoots":0},"collectedAt":"2026-11-11T04:08:08+01:00","hookStatus":"ok"}}
+    end: {"type":"end","schema":"idea-usage-export/1","since":"2026-11-10","engine":"idea04","usageMonitoring":"on","counts":{"day":3,"sample":0,"presence":39},"errors":0}
+
+  since 2026-11-11  exit 0  40 lines
+    0 day records + 39 presence (all on 2026-11-11) + end
+    end: {"type":"end","schema":"idea-usage-export/1","since":"2026-11-11","engine":"idea04","usageMonitoring":"on","counts":{"day":0,"sample":0,"presence":39},"errors":0}
+
+  since 2026-11-12  exit 0   1 line
+    end only:
+    {"type":"end","schema":"idea-usage-export/1","since":"2026-11-12","engine":"idea04","usageMonitoring":"on","counts":{"day":0,"sample":0,"presence":0},"errors":0}
+
+First day record in the since-2026-10-28 stream (oldest written day):
+{"type":"day","schema":"idea-usage-day/1","day":"2026-10-30","instance":"updtest-i76major","payload":{"schema":"idea-usage-day/1","engine":"idea04","day":"2026-10-30","app":"updtest","instance":"updtest-i76major","name":"updtest-major","demo":false,"listed":true,"clock":{"synced":false,"correctedBoots":0},"collectedAt":"2026-11-11T04:08:41+01:00","hookStatus":"no-hook"}}
+
+First presence record (same stream; all 39 live on 2026-11-11):
+{"type":"presence","schema":"idea-usage-presence/1","day":"2026-11-11","payload":{"schema":"idea-usage-presence/1","engine":"idea04","ts":"2026-11-11T01:05:05+01:00","bootId":"124e637f-ba01-44df-89fe-04deaeaef6b0","uptimeS":998020,"ntpSynced":true,"engineUp":true,"instancesUp":["updtest-i76stale","updtest-i76minor","updtest-i76major"],"tempC":44.8,"throttled":"0x0"}}
+
+Envelope is the unchanged idea#412 format: type/schema/day/instance/payload
+plus a final type=end idea-usage-export/1 object.
+
+Release
+--------------------------------------------------------------------------------
+idea-usage restored to main under pm2 as pi:
+  script /home/pi/idea/agents/agent-engine-dev/dist/src/usage/main.js
+  cwd    /home/pi/idea/agents/agent-engine-dev
+  no IDEA_CONFIG_FILE / IDEA_NETWORK_TESTS / IDEA_USAGE_AS_MAIN
+  engine still 825c66c, :8080 = 200
+  pm2 save -> /home/pi/.pm2/dump.pm2
+
+Checkout quarantined (mv, not delete):
+  /home/pi/axle-312 -> /home/pi/axle-312.quarantine-20261111T040951
+  git worktree prune on the engine checkout (still detached 825c66c)
+No scratch instance was installed, so none to quarantine.
+/instances remains empty.
+
+Usage dir: left as the correct post-proof state (NOT restoring the pre-proof
+backup, which still contains main's incorrect 14-day stamp and the #311
+leftovers). After restoring main's idea-usage, main's own startup catch-up
+immediately re-wrote no-hook stubs onto 2026-10-28 and 2026-10-29
+(collectedAt=2026-11-11T04:09:48+01:00) — the same bug this PR fixes. Those
+six files were quarantined into
+  ~/axle-312-backup-20261111T040432/quarantined-main-restore-recatchup/
+The seeded ok file on 2026-11-10/updtest-i76major.json was left untouched by
+main (hasGoodDayFile already skipped hookStatus=ok). Live tree after that
+cleanup: empty 10-28 and 10-29, updtest files on 10-30 .. 11-10, today's
+presence, settings on. Main will stamp 10-28/10-29 again at the next
+idea-usage restart or the next 02:00–03:30 night window until this PR lands.
+
+Observation (not a failure)
+--------------------------------------------------------------------------------
+Listed createdAt uses directory birthtime. On this disk the three updtest
+instance directories share an inode birth of 2026-10-30 18:11:26 +0100, while
+ctime and docker CreatedAt show the 2026-11-10 23:21 install. Catch-up therefore
+wrote 2026-10-30 .. 2026-11-10 rather than only 2026-11-10. The existence check
+itself is correct against the timestamp the code uses; 2026-10-28 and
+2026-10-29 (which main had stamped) stayed empty. Whether listed createdAt
+should prefer ctime when it better reflects Engine install time is a follow-up,
+not this PR.
+
+Times are Europe/Brussels (CET, UTC+1). Temperature stayed 43–49 °C.

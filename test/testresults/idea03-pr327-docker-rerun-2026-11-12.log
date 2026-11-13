@@ -1,0 +1,1004 @@
+Suite: #327 Docker-dependent rerun | Wed Nov 11 23:07:28 UTC 2026 | Commit: 1f9ff921dfeeaa0a38174af2158320712cd5c229
+Isolation: IDEA_SYSTEM_DISK_SKIP=true IDEA_WATCH_DIR=/tmp/idea-test-95lUer/watch IDEA_DISKS_ROOT=/tmp/idea-test-95lUer/disks IDEA_CONFIG_FILE=/tmp/idea-test-95lUer/config.yaml IDEA_TEST_ALLOW_LIVE=1 IDEA_TEST_MODE=true IDEA_NETWORK_TESTS=<unset>
+mdns in config: mdns: true
+---
+temp=57.1C
+
+ RUN  v4.1.2 /home/pi/axle-327-docker-rerun/engine
+
+ ✓ dist-test/test/automated/instance-start-status.test.js > failed start → command log (idea#109, unit) > closeTrace keeps an error trace failed when it is closed again as ok 40ms
+ ✓ dist-test/test/automated/instance-start-status.test.js > failed start → command log (idea#109, unit) > adds a completed failed startInstance trace when no startInstance trace is active 15ms
+ ✓ dist-test/test/automated/instance-start-status.test.js > failed start → command log (idea#109, unit) > closes the active startInstance trace as failed instead of adding a second one 12ms
+ ✓ dist-test/test/automated/instance-start-status.test.js > failed start → command log (idea#109, unit) > inside another command trace (e.g. backupApp) it adds its own startInstance trace 15ms
+ ✓ dist-test/test/automated/instance-start-status.test.js > failed start → command log (idea#109, unit) > start warnings go into the active startInstance trace as warn log lines 22ms
+ ✓ dist-test/test/automated/instance-start-status.test.js > failed start → command log (idea#109, unit) > outside a trace, warnings of a successful start become an ok startInstance trace 33ms
+ ✓ dist-test/test/automated/instance-start-status.test.js > failed start → command log (idea#109, unit) > does nothing (and does not throw) without a command log 1ms
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > success: Running is written only once the container runs
+Starting instance 'startst-ok-beaeac04ab' on disk test-fixture-startst-beaeac04ab of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > success: Running is written only once the container runs
+┌────────────────────────────────┐
+│  Step 2/6  │  Generating port  │
+└────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > success: Running is written only once the container runs
+Found a port number for instance startst-ok-beaeac04ab: 56232
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > success: Running is written only once the container runs
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > success: Running is written only once the container runs
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+
+ Network startst-ok-beaeac04ab_default Creating 
+ Network startst-ok-beaeac04ab_default Created 
+ Container startst-ok-beaeac04ab-startst-1 Creating 
+ Container startst-ok-beaeac04ab-startst-1 Created 
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > success: Running is written only once the container runs
+┌────────────────────────────────────┐
+│  Step 6/6  │  Starting containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > success: Running is written only once the container runs
+Ports: [32m'56232'[39m
+
+ Container startst-ok-beaeac04ab-startst-1 Starting 
+ Container startst-ok-beaeac04ab-startst-1 Started 
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > success: Running is written only once the container runs
+App startst-ok-beaeac04ab running
+
+ ✓ dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > success: Running is written only once the container runs 13650ms
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > the saved image is missing: the start goes on, reaches Running, and History carries a warning
+Starting instance 'startst-notar-d6528a2e78' on disk test-fixture-startst-d6528a2e78 of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > the saved image is missing: the start goes on, reaches Running, and History carries a warning
+┌────────────────────────────────┐
+│  Step 2/6  │  Generating port  │
+└────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > the saved image is missing: the start goes on, reaches Running, and History carries a warning
+Found a port number for instance startst-notar-d6528a2e78: 51264
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > the saved image is missing: the start goes on, reaches Running, and History carries a warning
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > the saved image is missing: the start goes on, reaches Running, and History carries a warning
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+
+ Network startst-notar-d6528a2e78_default Creating 
+ Network startst-notar-d6528a2e78_default Created 
+ Container startst-notar-d6528a2e78-startst-1 Creating 
+ Container startst-notar-d6528a2e78-startst-1 Created 
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > the saved image is missing: the start goes on, reaches Running, and History carries a warning
+┌────────────────────────────────────┐
+│  Step 6/6  │  Starting containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > the saved image is missing: the start goes on, reaches Running, and History carries a warning
+Ports: [32m'51264'[39m
+
+ Container startst-notar-d6528a2e78-startst-1 Starting 
+ Container startst-notar-d6528a2e78-startst-1 Started 
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > the saved image is missing: the start goes on, reaches Running, and History carries a warning
+App startst-notar-d6528a2e78 running
+
+ ✓ dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > the saved image is missing: the start goes on, reaches Running, and History carries a warning 13448ms
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > docker image load fails: the start goes on, reaches Running, and History carries a warning
+Starting instance 'startst-badtar-5b730db040' on disk test-fixture-startst-5b730db040 of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > docker image load fails: the start goes on, reaches Running, and History carries a warning
+┌────────────────────────────────┐
+│  Step 2/6  │  Generating port  │
+└────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > docker image load fails: the start goes on, reaches Running, and History carries a warning
+Found a port number for instance startst-badtar-5b730db040: 49583
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > docker image load fails: the start goes on, reaches Running, and History carries a warning
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+
+unexpected EOF
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > docker image load fails: the start goes on, reaches Running, and History carries a warning
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+
+ Network startst-badtar-5b730db040_default Creating 
+ Network startst-badtar-5b730db040_default Created 
+ Container startst-badtar-5b730db040-startst-1 Creating 
+ Container startst-badtar-5b730db040-startst-1 Created 
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > docker image load fails: the start goes on, reaches Running, and History carries a warning
+┌────────────────────────────────────┐
+│  Step 6/6  │  Starting containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > docker image load fails: the start goes on, reaches Running, and History carries a warning
+Ports: [32m'49583'[39m
+
+ Container startst-badtar-5b730db040-startst-1 Starting 
+ Container startst-badtar-5b730db040-startst-1 Started 
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > docker image load fails: the start goes on, reaches Running, and History carries a warning
+App startst-badtar-5b730db040 running
+
+ ✓ dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > docker image load fails: the start goes on, reaches Running, and History carries a warning 13249ms
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > compose create fails (image not local, pull disallowed): Error, never Running, failed trace
+Starting instance 'startst-badcreate-91ddab18f4' on disk test-fixture-startst-91ddab18f4 of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > compose create fails (image not local, pull disallowed): Error, never Running, failed trace
+┌────────────────────────────────┐
+│  Step 2/6  │  Generating port  │
+└────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > compose create fails (image not local, pull disallowed): Error, never Running, failed trace
+Found a port number for instance startst-badcreate-91ddab18f4: 55098
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > compose create fails (image not local, pull disallowed): Error, never Running, failed trace
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > compose create fails (image not local, pull disallowed): Error, never Running, failed trace
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+
+ Network startst-badcreate-91ddab18f4_default Creating 
+ Network startst-badcreate-91ddab18f4_default Created 
+ Container startst-badcreate-91ddab18f4-startst-1 Creating 
+ Container startst-badcreate-91ddab18f4-startst-1 Error response from daemon: No such image: idea-test/not-local:91ddab18f4 
+Error response from daemon: No such image: idea-test/not-local:91ddab18f4
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > compose create fails (image not local, pull disallowed): Error, never Running, failed trace
+Error creating the containers of app instance startst-badcreate-91ddab18f4
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > compose create fails (image not local, pull disallowed): Error, never Running, failed trace
+Error starting app instance 'startst-badcreate-91ddab18f4':  Network startst-badcreate-91ddab18f4_default Creating 
+ Network startst-badcreate-91ddab18f4_default Created 
+ Container startst-badcreate-91ddab18f4-startst-1 Creating 
+ Container startst-badcreate-91ddab18f4-startst-1 Error response from daemon: No such image: idea-test/not-local:91ddab18f4 
+Error response from daemon: No such image: idea-test/not-local:91ddab18f4
+
+    at AsyncLocalStorage.run (node:internal/async_local_storage/async_hooks:91:14)
+    exit code: 1
+
+ ✓ dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > compose create fails (image not local, pull disallowed): Error, never Running, failed trace 446ms
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > compose up fails (bad entrypoint): Error, never Running, failed trace
+Starting instance 'startst-badup-df6d6bfe04' on disk test-fixture-startst-df6d6bfe04 of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > compose up fails (bad entrypoint): Error, never Running, failed trace
+┌────────────────────────────────┐
+│  Step 2/6  │  Generating port  │
+└────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > compose up fails (bad entrypoint): Error, never Running, failed trace
+Found a port number for instance startst-badup-df6d6bfe04: 50645
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > compose up fails (bad entrypoint): Error, never Running, failed trace
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > compose up fails (bad entrypoint): Error, never Running, failed trace
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+
+ Network startst-badup-df6d6bfe04_default Creating 
+ Network startst-badup-df6d6bfe04_default Created 
+ Container startst-badup-df6d6bfe04-startst-1 Creating 
+ Container startst-badup-df6d6bfe04-startst-1 Created 
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > compose up fails (bad entrypoint): Error, never Running, failed trace
+┌────────────────────────────────────┐
+│  Step 6/6  │  Starting containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > compose up fails (bad entrypoint): Error, never Running, failed trace
+Ports: [32m'50645'[39m
+
+ Container startst-badup-df6d6bfe04-startst-1 Starting 
+Error response from daemon: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: exec: "/idea-test-no-such-binary": stat /idea-test-no-such-binary: no such file or directory
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > compose up fails (bad entrypoint): Error, never Running, failed trace
+Error running app instance startst-badup-df6d6bfe04
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > compose up fails (bad entrypoint): Error, never Running, failed trace
+Error starting app instance 'startst-badup-df6d6bfe04':  Container startst-badup-df6d6bfe04-startst-1 Starting 
+Error response from daemon: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: exec: "/idea-test-no-such-binary": stat /idea-test-no-such-binary: no such file or directory
+
+    at AsyncLocalStorage.run (node:internal/async_local_storage/async_hooks:91:14)
+    exit code: 1
+
+ ✓ dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > compose up fails (bad entrypoint): Error, never Running, failed trace 664ms
+ Container startst-badcreate-91ddab18f4-startst-1 Creating 
+ Container startst-badcreate-91ddab18f4-startst-1 Error response from daemon: No such image: idea-test/not-local:91ddab18f4 
+Error response from daemon: No such image: idea-test/not-local:91ddab18f4
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > createInstanceContainers rejects instead of swallowing the compose create error
+Error creating the containers of app instance startst-badcreate-91ddab18f4
+
+ ✓ dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers) > createInstanceContainers rejects instead of swallowing the compose create error 112ms
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers)
+Stopping app 'startst-ok-beaeac04ab' on disk 'test-fixture-startst-beaeac04ab' of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+Stopping app 'startst-notar-d6528a2e78' on disk 'test-fixture-startst-d6528a2e78' of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+Stopping app 'startst-badtar-5b730db040' on disk 'test-fixture-startst-5b730db040' of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+Stopping app 'startst-badcreate-91ddab18f4' on disk 'test-fixture-startst-91ddab18f4' of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+Stopping app 'startst-badup-df6d6bfe04' on disk 'test-fixture-startst-df6d6bfe04' of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers)
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers)
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers)
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers)
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-start-status.test.js > Running only after compose up; failures end in Error (idea#109, real containers)
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > v1.0 dock: version is read from disk and stored in instanceOf
+Starting instance 'sample-00000000-test1' on disk test-fixture-sample-v1 of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+
+stdout | dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > v1.0 dock: version is read from disk and stored in instanceOf
+┌────────────────────────────────┐
+│  Step 2/6  │  Generating port  │
+└────────────────────────────────┘
+
+stdout | dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > v1.0 dock: version is read from disk and stored in instanceOf
+Found a port number for instance sample-00000000-test1: 56546
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > v1.0 dock: version is read from disk and stored in instanceOf
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+
+stdout | dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > v1.0 dock: version is read from disk and stored in instanceOf
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+
+ Container sample-00000000-test1-sample-1 Creating 
+ Container sample-00000000-test1-sample-1 Created 
+stdout | dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > v1.0 dock: version is read from disk and stored in instanceOf
+┌────────────────────────────────────┐
+│  Step 6/6  │  Starting containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > v1.0 dock: version is read from disk and stored in instanceOf
+Ports: [32m'56546'[39m
+
+ Container sample-00000000-test1-sample-1 Starting 
+ Container sample-00000000-test1-sample-1 Started 
+stdout | dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > v1.0 dock: version is read from disk and stored in instanceOf
+App sample-00000000-test1 running
+
+ ✓ dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > v1.0 dock: version is read from disk and stored in instanceOf 13454ms
+stdout | dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > v1.0 undock: instance reaches Undocked
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > v1.0 undock: instance reaches Undocked
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+ ✓ dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > v1.0 undock: instance reaches Undocked 609ms
+stdout | dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > minor upgrade (v1.0→v1.1): instanceOf updated, lastStarted refreshed
+Starting instance 'sample-00000000-test1' on disk test-fixture-sample-v1.1 of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+
+stdout | dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > minor upgrade (v1.0→v1.1): instanceOf updated, lastStarted refreshed
+┌────────────────────────────────┐
+│  Step 2/6  │  Generating port  │
+└────────────────────────────────┘
+
+stdout | dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > minor upgrade (v1.0→v1.1): instanceOf updated, lastStarted refreshed
+Found a port number for instance sample-00000000-test1: 56546
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > minor upgrade (v1.0→v1.1): instanceOf updated, lastStarted refreshed
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+
+stdout | dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > minor upgrade (v1.0→v1.1): instanceOf updated, lastStarted refreshed
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > minor upgrade (v1.0→v1.1): instanceOf updated, lastStarted refreshed
+┌────────────────────────────────────┐
+│  Step 6/6  │  Starting containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > minor upgrade (v1.0→v1.1): instanceOf updated, lastStarted refreshed
+Ports: [32m'56546'[39m
+
+ Container sample-00000000-test1-sample-1 Starting 
+ Container sample-00000000-test1-sample-1 Started 
+stdout | dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > minor upgrade (v1.0→v1.1): instanceOf updated, lastStarted refreshed
+App sample-00000000-test1 running
+
+ ✓ dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > minor upgrade (v1.0→v1.1): instanceOf updated, lastStarted refreshed 13234ms
+stdout | dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > minor upgrade: undock v1.1
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1.1' of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > minor upgrade: undock v1.1
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+ ✓ dist-test/test/automated/app-versioning.test.js > App versioning (automated, real containers) > minor upgrade: undock v1.1 405ms
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > no .env values in logs (idea#111, unit) > readEnvVariable logs the variable name, not the value
+Read variable pass from .env file /tmp/idea-test-envlog-Eg1s6X/.env: found
+
+ ✓ dist-test/test/automated/no-env-values-in-logs.test.js > no .env values in logs (idea#111, unit) > readEnvVariable logs the variable name, not the value 46ms
+ ✓ dist-test/test/automated/no-env-values-in-logs.test.js > no .env values in logs (idea#111, unit) > redactValues replaces every occurrence and ignores empty values 1ms
+ ✓ dist-test/test/automated/no-env-values-in-logs.test.js > no .env values in logs (idea#111, unit) > a config.yaml parse error keeps only its first line, not the quoted file lines 3ms
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers)
+Reading metadata for device sda2 at path /META.yaml
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers)
+metaContent: diskId: gge6zxyl6ftmnri4qx6
+diskName: gge6zxyl6ftmnri4qx6
+created: 1775740646263
+lastDocked: 1794430156681
+version: "1"
+meta: {
+  diskId: [32m'gge6zxyl6ftmnri4qx6'[39m,
+  diskName: [32m'gge6zxyl6ftmnri4qx6'[39m,
+  created: [33m1775740646263[39m,
+  lastDocked: [33m1794430156681[39m,
+  version: [32m'1'[39m
+}
+skipHardwareId: using diskId from META file (gge6zxyl6ftmnri4qx6), skipping hardware id lookup
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers)
+Engine lanAddress unset → 192.168.0.228 (eth0)
+Engine lanAddresses unset → [192.168.0.228]
+Creating new engine object for local engine ENGINE_gge6zxyl6ftmnri4qx6
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers)
+System disk detected: root=sda2, boot=sda1, drives=sda
+Actual devices: 
+Removing from the network database disks that were attached before the current boot but are no longer attached now...
+No previous disks found in the network database
+Cleaning the mount points...
+Previously mounted devices: 
+Device watcher attached to /tmp/idea-test-95lUer/watch
+Watching /tmp/idea-test-95lUer/watch for USB devices
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+A disk on device /tmp/idea-test-95lUer/watch/idea-test-464269 has been added
+The disk on device idea-test-464269 has a valid device name
+Processing the disk on device idea-test-464269
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+testMode: skipping mount for device idea-test-464269 — fixture expected at /tmp/idea-test-95lUer/disks/idea-test-464269
+Found a META file on device idea-test-464269. This disk has been processed by the system before.
+Reading metadata for device idea-test-464269 at path /tmp/idea-test-95lUer/disks/idea-test-464269/META.yaml
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+metaContent: diskId: test-fixture-envlog-300b1b38f6
+isHardwareId: false
+diskName: test-envlog-300b1b38f6
+created: 1700000000000
+lastDocked: 1700000000000
+meta: {
+  diskId: [32m'test-fixture-envlog-300b1b38f6'[39m,
+  isHardwareId: [33mfalse[39m,
+  diskName: [32m'test-envlog-300b1b38f6'[39m,
+  created: [33m1700000000000[39m,
+  lastDocked: [33m1700000000000[39m
+}
+skipHardwareId: using diskId from META file (test-fixture-envlog-300b1b38f6), skipping hardware id lookup
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Creating disk test-fixture-envlog-300b1b38f6 on engine ENGINE_gge6zxyl6ftmnri4qx6
+Processing disk test-fixture-envlog-300b1b38f6 on engine ENGINE_gge6zxyl6ftmnri4qx6
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Disk test-fixture-envlog-300b1b38f6 is an app disk
+Processing the apps and instances of App Disk test-fixture-envlog-300b1b38f6 on device idea-test-464269
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Apps folder found on disk test-fixture-envlog-300b1b38f6
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+App ids found on disk test-fixture-envlog-300b1b38f6: envlog-1.0,
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Creating new app envlog-1.0 on disk test-fixture-envlog-300b1b38f6
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Actual apps: envlog-1.0
+Stored apps: 
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Instance Ids found on disk test-fixture-envlog-300b1b38f6: envlog-existing-300b1b38f6,
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Creating new instance object envlog-existing-300b1b38f6 on disk test-fixture-envlog-300b1b38f6
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Starting instance 'envlog-existing-300b1b38f6' on disk test-fixture-envlog-300b1b38f6 of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+dockerAvailable: docker answers (docker info)
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Instance 'envlog-existing-300b1b38f6' containers are not running — proceeding with full start
+Setting instance 'envlog-existing-300b1b38f6' status to Starting
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Checking instance directory at '/tmp/idea-test-95lUer/disks/idea-test-464269/instances/envlog-existing-300b1b38f6'
+Instance directory found — proceeding
+┌────────────────────────────────┐
+│  Step 2/6  │  Generating port  │
+└────────────────────────────────┘
+Trying to find a port number for instance envlog-existing-300b1b38f6 in the .env file
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Read variable port from .env file /tmp/idea-test-95lUer/disks/idea-test-464269/instances/envlog-existing-300b1b38f6/.env: not set
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+No port number has previously been generated.
+Generating a new port number for instance envlog-existing-300b1b38f6.
+Checking if port 58321 is in use
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Port 58321 is not in use. Checking if it is reserved by another instance
+Port 58321 is not reserved by another instance
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Added or updated variable port in .env file /tmp/idea-test-95lUer/disks/idea-test-464269/instances/envlog-existing-300b1b38f6/.env
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Found a port number for instance envlog-existing-300b1b38f6: 58321
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+Trying to find a pass for instance envlog-existing-300b1b38f6 in the .env file
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Read variable pass from .env file /tmp/idea-test-95lUer/disks/idea-test-464269/instances/envlog-existing-300b1b38f6/.env: found
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Found a pass for instance envlog-existing-300b1b38f6 in the .env file
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+Preloading the service images of the services from the compose file
+Reading and parsing the compose.yaml file of the app instance
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+skipImageLoad: skipping image load from tar; Docker will pull images as needed
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Creating the containers for the services of the app instance
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Host identity for instance envlog-existing-300b1b38f6: IDEA_HOSTNAME=idea03 IDEA_HOST_IPS=192.168.0.228,100.126.117.80
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+IDEA_NEXTCLOUD_URL for instance envlog-existing-300b1b38f6: (none)
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Added or updated variable hostname in .env file /tmp/idea-test-95lUer/disks/idea-test-464269/instances/envlog-existing-300b1b38f6/.env
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Found IP address 192.168.0.228 for instance envlog-existing-300b1b38f6
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Added or updated variable ip in .env file /tmp/idea-test-95lUer/disks/idea-test-464269/instances/envlog-existing-300b1b38f6/.env
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Creating containers of app instance 'envlog-existing-300b1b38f6' on disk test-fixture-envlog-300b1b38f6 of engine ENGINE_gge6zxyl6ftmnri4qx6.
+
+ Network envlog-existing-300b1b38f6_default Creating 
+ Network envlog-existing-300b1b38f6_default Created 
+ Container envlog-existing-300b1b38f6-envlog-1 Creating 
+ Container envlog-existing-300b1b38f6-envlog-1 Created 
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+┌────────────────────────────────────┐
+│  Step 6/6  │  Starting containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Running instance 'envlog-existing-300b1b38f6' on disk test-fixture-envlog-300b1b38f6 of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Read variable port from .env file /tmp/idea-test-95lUer/disks/idea-test-464269/instances/envlog-existing-300b1b38f6/.env: found
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Ports: [32m'58321'[39m
+Port number extracted from .env file for instance envlog-existing-300b1b38f6: 58321
+
+ Container envlog-existing-300b1b38f6-envlog-1 Starting 
+ Container envlog-existing-300b1b38f6-envlog-1 Started 
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+assertInstancePortReady: envlog-existing-300b1b38f6 :58321 stable for 10000ms
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+App envlog-existing-300b1b38f6 running
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+Actual instances: envlog-existing-300b1b38f6
+Stored instances: 
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+sudo -n /usr/local/sbin/idea-app-data snapshots idea-test-464269
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only
+updateApp: cannot list .pre-update snapshots on test-fixture-envlog-300b1b38f6: idea-app-data snapshots refused: unknown root 'idea-test-464269': not sd[a-z][12] or system, and not listed in a valid test-only root bridge file (/etc/idea/app-data-roots)
+
+ ✓ dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > .env with pass and app secrets: History lists names only 13508ms
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+A disk on device /tmp/idea-test-95lUer/watch/idea-test-472178 has been added
+The disk on device idea-test-472178 has a valid device name
+Processing the disk on device idea-test-472178
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+testMode: skipping mount for device idea-test-472178 — fixture expected at /tmp/idea-test-95lUer/disks/idea-test-472178
+Found a META file on device idea-test-472178. This disk has been processed by the system before.
+Reading metadata for device idea-test-472178 at path /tmp/idea-test-95lUer/disks/idea-test-472178/META.yaml
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+metaContent: diskId: test-fixture-envlog-8b4fe497c0
+isHardwareId: false
+diskName: test-envlog-8b4fe497c0
+created: 1700000000000
+lastDocked: 1700000000000
+meta: {
+  diskId: [32m'test-fixture-envlog-8b4fe497c0'[39m,
+  isHardwareId: [33mfalse[39m,
+  diskName: [32m'test-envlog-8b4fe497c0'[39m,
+  created: [33m1700000000000[39m,
+  lastDocked: [33m1700000000000[39m
+}
+skipHardwareId: using diskId from META file (test-fixture-envlog-8b4fe497c0), skipping hardware id lookup
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Creating disk test-fixture-envlog-8b4fe497c0 on engine ENGINE_gge6zxyl6ftmnri4qx6
+Processing disk test-fixture-envlog-8b4fe497c0 on engine ENGINE_gge6zxyl6ftmnri4qx6
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Unformatted disks: (none)
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Disk test-fixture-envlog-8b4fe497c0 is an app disk
+Processing the apps and instances of App Disk test-fixture-envlog-8b4fe497c0 on device idea-test-472178
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Apps folder found on disk test-fixture-envlog-8b4fe497c0
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+App ids found on disk test-fixture-envlog-8b4fe497c0: envlog-1.0,
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Granularly updating existing app envlog-1.0 on disk test-fixture-envlog-8b4fe497c0
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Actual apps: envlog-1.0
+Stored apps: 
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Instance Ids found on disk test-fixture-envlog-8b4fe497c0: envlog-generated-8b4fe497c0,
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Creating new instance object envlog-generated-8b4fe497c0 on disk test-fixture-envlog-8b4fe497c0
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Starting instance 'envlog-generated-8b4fe497c0' on disk test-fixture-envlog-8b4fe497c0 of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Instance 'envlog-generated-8b4fe497c0' containers are not running — proceeding with full start
+Setting instance 'envlog-generated-8b4fe497c0' status to Starting
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Checking instance directory at '/tmp/idea-test-95lUer/disks/idea-test-472178/instances/envlog-generated-8b4fe497c0'
+Instance directory found — proceeding
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+┌────────────────────────────────┐
+│  Step 2/6  │  Generating port  │
+└────────────────────────────────┘
+Trying to find a port number for instance envlog-generated-8b4fe497c0 in the .env file
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Read variable port from .env file /tmp/idea-test-95lUer/disks/idea-test-472178/instances/envlog-generated-8b4fe497c0/.env: not set
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+No port number has previously been generated.
+Generating a new port number for instance envlog-generated-8b4fe497c0.
+Checking if port 58697 is in use
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Port 58697 is not in use. Checking if it is reserved by another instance
+Port 58697 is not reserved by another instance
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Added or updated variable port in .env file /tmp/idea-test-95lUer/disks/idea-test-472178/instances/envlog-generated-8b4fe497c0/.env
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Found a port number for instance envlog-generated-8b4fe497c0: 58697
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+Trying to find a pass for instance envlog-generated-8b4fe497c0 in the .env file
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Read variable pass from .env file /tmp/idea-test-95lUer/disks/idea-test-472178/instances/envlog-generated-8b4fe497c0/.env: not set
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+No pass has previously been generated. Generating a new pass.
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Generated a new pass for instance envlog-generated-8b4fe497c0
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Added or updated variable pass in .env file /tmp/idea-test-95lUer/disks/idea-test-472178/instances/envlog-generated-8b4fe497c0/.env
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+Preloading the service images of the services from the compose file
+Reading and parsing the compose.yaml file of the app instance
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+skipImageLoad: skipping image load from tar; Docker will pull images as needed
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Creating the containers for the services of the app instance
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Host identity for instance envlog-generated-8b4fe497c0: IDEA_HOSTNAME=idea03 IDEA_HOST_IPS=192.168.0.228,100.126.117.80
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+IDEA_NEXTCLOUD_URL for instance envlog-generated-8b4fe497c0: (none)
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Added or updated variable hostname in .env file /tmp/idea-test-95lUer/disks/idea-test-472178/instances/envlog-generated-8b4fe497c0/.env
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Found IP address 192.168.0.228 for instance envlog-generated-8b4fe497c0
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Added or updated variable ip in .env file /tmp/idea-test-95lUer/disks/idea-test-472178/instances/envlog-generated-8b4fe497c0/.env
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Creating containers of app instance 'envlog-generated-8b4fe497c0' on disk test-fixture-envlog-8b4fe497c0 of engine ENGINE_gge6zxyl6ftmnri4qx6.
+
+ Network envlog-generated-8b4fe497c0_default Creating 
+ Network envlog-generated-8b4fe497c0_default Created 
+ Container envlog-generated-8b4fe497c0-envlog-1 Creating 
+ Container envlog-generated-8b4fe497c0-envlog-1 Created 
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+┌────────────────────────────────────┐
+│  Step 6/6  │  Starting containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Running instance 'envlog-generated-8b4fe497c0' on disk test-fixture-envlog-8b4fe497c0 of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Read variable port from .env file /tmp/idea-test-95lUer/disks/idea-test-472178/instances/envlog-generated-8b4fe497c0/.env: found
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Ports: [32m'58697'[39m
+Port number extracted from .env file for instance envlog-generated-8b4fe497c0: 58697
+
+ Container envlog-generated-8b4fe497c0-envlog-1 Starting 
+ Container envlog-generated-8b4fe497c0-envlog-1 Started 
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+assertInstancePortReady: envlog-generated-8b4fe497c0 :58697 stable for 10000ms
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+App envlog-generated-8b4fe497c0 running
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+Actual instances: envlog-generated-8b4fe497c0
+Stored instances: 
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only
+sudo -n /usr/local/sbin/idea-app-data snapshots idea-test-472178
+
+ ✓ dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers) > no .env (pass generated): History lists names only 13321ms
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers)
+updateApp: cannot list .pre-update snapshots on test-fixture-envlog-8b4fe497c0: idea-app-data snapshots refused: unknown root 'idea-test-472178': not sd[a-z][12] or system, and not listed in a valid test-only root bridge file (/etc/idea/app-data-roots)
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers)
+Processing the removal of USB device idea-test-464269
+Processing the removal of USB device idea-test-472178
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers)
+Stopping app 'envlog-existing-300b1b38f6' on disk 'test-fixture-envlog-300b1b38f6' of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+Filter for all running containers whose names start with the instance id
+Stopping app 'envlog-generated-8b4fe497c0' on disk 'test-fixture-envlog-8b4fe497c0' of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+Filter for all running containers whose names start with the instance id
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers)
+Unformatted disks: (none)
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers)
+Found the following containers:
+/envlog-existing-300b1b38f6-envlog-1
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+Stopping container /envlog-existing-300b1b38f6-envlog-1 for instance envlog-existing-300b1b38f6
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers)
+Found the following containers:
+/envlog-generated-8b4fe497c0-envlog-1
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+Stopping container /envlog-generated-8b4fe497c0-envlog-1 for instance envlog-generated-8b4fe497c0
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers)
+Stopped container for instance envlog-existing-300b1b38f6
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers)
+Instance envlog-existing-300b1b38f6 stopped
+Instance envlog-existing-300b1b38f6 has been moved to the 'Undocked' state
+testMode: skipping umount and rmdir for device idea-test-464269
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers)
+Unformatted disks: (none)
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers)
+Stopped container for instance envlog-generated-8b4fe497c0
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers)
+Instance envlog-generated-8b4fe497c0 stopped
+Instance envlog-generated-8b4fe497c0 has been moved to the 'Undocked' state
+testMode: skipping umount and rmdir for device idea-test-472178
+
+stdout | dist-test/test/automated/no-env-values-in-logs.test.js > startInstance History entry holds no .env values (idea#111, real containers)
+Unformatted disks: (none)
+
+ ✓ dist-test/test/automated/service-image-tar-load.test.js > skipImageLoad / serviceImageTarPath (idea#81) > follows testMode when skipImageLoad is unset, and overrides it when set 2ms
+ ✓ dist-test/test/automated/service-image-tar-load.test.js > skipImageLoad / serviceImageTarPath (idea#81) > maps every / in the image name to _ 1ms
+ ✓ dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers) > the fixture tar uses the Engine file name 0ms
+stdout | dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers) > loads the image from the tar and reaches Running without network access
+Starting instance 'tarload-207dd4d3b2ce-idea81' on disk test-fixture-tarload-207dd4d3b2ce of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+
+stdout | dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers) > loads the image from the tar and reaches Running without network access
+┌────────────────────────────────┐
+│  Step 2/6  │  Generating port  │
+└────────────────────────────────┘
+
+stdout | dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers) > loads the image from the tar and reaches Running without network access
+Found a port number for instance tarload-207dd4d3b2ce-idea81: 58342
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers) > loads the image from the tar and reaches Running without network access
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+
+stdout | dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers) > loads the image from the tar and reaches Running without network access
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+
+ Network tarload-207dd4d3b2ce-idea81_default Creating 
+ Network tarload-207dd4d3b2ce-idea81_default Created 
+ Container tarload-207dd4d3b2ce-idea81-tarload-1 Creating 
+ Container tarload-207dd4d3b2ce-idea81-tarload-1 Created 
+stdout | dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers) > loads the image from the tar and reaches Running without network access
+┌────────────────────────────────────┐
+│  Step 6/6  │  Starting containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers) > loads the image from the tar and reaches Running without network access
+Ports: [32m'58342'[39m
+
+ Container tarload-207dd4d3b2ce-idea81-tarload-1 Starting 
+ Container tarload-207dd4d3b2ce-idea81-tarload-1 Started 
+stdout | dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers) > loads the image from the tar and reaches Running without network access
+App tarload-207dd4d3b2ce-idea81 running
+
+ ✓ dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers) > loads the image from the tar and reaches Running without network access 13756ms
+stdout | dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers) > missing tar: a History warning, then Error from compose create (pull_policy: never)
+Starting instance 'tarload-cffe137f4fc5-idea81' on disk test-fixture-tarload-cffe137f4fc5 of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+
+stdout | dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers) > missing tar: a History warning, then Error from compose create (pull_policy: never)
+┌────────────────────────────────┐
+│  Step 2/6  │  Generating port  │
+└────────────────────────────────┘
+
+stdout | dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers) > missing tar: a History warning, then Error from compose create (pull_policy: never)
+Found a port number for instance tarload-cffe137f4fc5-idea81: 56215
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers) > missing tar: a History warning, then Error from compose create (pull_policy: never)
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+
+stdout | dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers) > missing tar: a History warning, then Error from compose create (pull_policy: never)
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+
+ Network tarload-cffe137f4fc5-idea81_default Creating 
+ Network tarload-cffe137f4fc5-idea81_default Created 
+ Container tarload-cffe137f4fc5-idea81-tarload-1 Creating 
+ Container tarload-cffe137f4fc5-idea81-tarload-1 Error response from daemon: No such image: idea-test/tarload:cffe137f4fc5 
+Error response from daemon: No such image: idea-test/tarload:cffe137f4fc5
+stdout | dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers) > missing tar: a History warning, then Error from compose create (pull_policy: never)
+Error creating the containers of app instance tarload-cffe137f4fc5-idea81
+
+stdout | dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers) > missing tar: a History warning, then Error from compose create (pull_policy: never)
+Error starting app instance 'tarload-cffe137f4fc5-idea81':  Network tarload-cffe137f4fc5-idea81_default Creating 
+ Network tarload-cffe137f4fc5-idea81_default Created 
+ Container tarload-cffe137f4fc5-idea81-tarload-1 Creating 
+ Container tarload-cffe137f4fc5-idea81-tarload-1 Error response from daemon: No such image: idea-test/tarload:cffe137f4fc5 
+Error response from daemon: No such image: idea-test/tarload:cffe137f4fc5
+
+    at AsyncLocalStorage.run (node:internal/async_local_storage/async_hooks:91:14)
+    exit code: 1
+
+ ✓ dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers) > missing tar: a History warning, then Error from compose create (pull_policy: never) 451ms
+stdout | dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers)
+Stopping app 'tarload-207dd4d3b2ce-idea81' on disk 'test-fixture-tarload-207dd4d3b2ce' of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers)
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers)
+Stopping app 'tarload-cffe137f4fc5-idea81' on disk 'test-fixture-tarload-cffe137f4fc5' of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/service-image-tar-load.test.js > Service images load from services/*.tar on the App Disk (idea#81, real containers)
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-lifecycle.test.js > Instance lifecycle (automated, real containers) > instance reaches Running and container responds to HTTP after dock
+Starting instance 'sample-00000000-test1' on disk test-fixture-sample-v1 of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+
+stdout | dist-test/test/automated/instance-lifecycle.test.js > Instance lifecycle (automated, real containers) > instance reaches Running and container responds to HTTP after dock
+┌────────────────────────────────┐
+│  Step 2/6  │  Generating port  │
+└────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-lifecycle.test.js > Instance lifecycle (automated, real containers) > instance reaches Running and container responds to HTTP after dock
+Found a port number for instance sample-00000000-test1: 62918
+┌────────────────────────────────────┐
+│  Step 3/6  │  Generating password  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-lifecycle.test.js > Instance lifecycle (automated, real containers) > instance reaches Running and container responds to HTTP after dock
+┌───────────────────────────────────────┐
+│  Step 4/6  │  Loading service images  │
+└───────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-lifecycle.test.js > Instance lifecycle (automated, real containers) > instance reaches Running and container responds to HTTP after dock
+┌────────────────────────────────────┐
+│  Step 5/6  │  Creating containers  │
+└────────────────────────────────────┘
+
+ Container sample-00000000-test1-sample-1 Creating 
+ Container sample-00000000-test1-sample-1 Created 
+stdout | dist-test/test/automated/instance-lifecycle.test.js > Instance lifecycle (automated, real containers) > instance reaches Running and container responds to HTTP after dock
+┌────────────────────────────────────┐
+│  Step 6/6  │  Starting containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-lifecycle.test.js > Instance lifecycle (automated, real containers) > instance reaches Running and container responds to HTTP after dock
+Ports: [32m'62918'[39m
+
+ Container sample-00000000-test1-sample-1 Starting 
+ Container sample-00000000-test1-sample-1 Started 
+stdout | dist-test/test/automated/instance-lifecycle.test.js > Instance lifecycle (automated, real containers) > instance reaches Running and container responds to HTTP after dock
+App sample-00000000-test1 running
+
+ ✓ dist-test/test/automated/instance-lifecycle.test.js > Instance lifecycle (automated, real containers) > instance reaches Running and container responds to HTTP after dock 13474ms
+stdout | dist-test/test/automated/instance-lifecycle.test.js > Instance lifecycle (automated, real containers) > instance reaches Undocked and container stops responding after undock
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_gge6zxyl6ftmnri4qx6'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/instance-lifecycle.test.js > Instance lifecycle (automated, real containers) > instance reaches Undocked and container stops responding after undock
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+ ✓ dist-test/test/automated/instance-lifecycle.test.js > Instance lifecycle (automated, real containers) > instance reaches Undocked and container stops responding after undock 613ms
+
+ Test Files  5 passed (5)
+      Tests  29 passed (29)
+   Start at  00:07:29
+   Duration  139.99s (transform 929ms, setup 0ms, import 4.06s, tests 135.12s, environment 1ms)
+
+vitest_exit=0
+temp=49.4C

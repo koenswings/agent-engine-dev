@@ -68,8 +68,8 @@
  * Root: only the unplug simulation (a write to /sys/bus/usb/...) needs root.
  * It runs as `sudo -n tee <sysfs file>` with the tester's own sudo; it is NOT
  * in the Engine sudoers. Refuses to run on idea02 (golden). Touches only the
- * recorded test disk, matched by filesystem UUIDs, disk serial and USB serial
- * (never by a device name like sdb), checked before anything is ejected and again
+ * recorded test disk, matched by its disk serial (plus USB serial and filesystem
+ * UUIDs when given as flags; never by a device name like sdb), checked before anything is ejected and again
  * before every unplug; refuses the root SSD serial and the drive backing / or
  * /boot/firmware (hw-roundtrip-guard.ts).
  *
@@ -83,7 +83,7 @@ import os from 'os'
 import path from 'path'
 import { spawn, ChildProcess } from 'child_process'
 import { fileURLToPath } from 'url'
-import { collectBlockFacts, loadExpectation, resolveStick } from './hw-roundtrip-guard.js'
+import { collectBlockFacts, loadExpectation, planSystemRecordChecks, resolveStick, systemDiskSkipFromConfig } from './hw-roundtrip-guard.js'
 import { readHardwareId } from '../src/data/Meta.js'
 import { readPartitionFacts, resolveHardwareDiskId } from '../src/data/DiskIdentity.js'
 import { inflightPullChecks, inflightReplugChecks } from './hw-inflight-pull.js'
@@ -200,7 +200,7 @@ write(`hw-roundtrip on ${os.hostname()}: engine-dir=${ENGINE_DIR} port=${PORT} l
 info(`system drive: root=${rootSource} boot=${bootSource || '(none)'} disks=${[...systemDisks].join(',')} usb=${[...systemUsb].join(',') || '(not USB)'}`)
 
 const expected = loadExpectation(argv, STICK_CONFIG, os.hostname())
-info(`expected test disk: usbSerial=${expected.usbSerial || '?'} diskSerial=${expected.diskSerial || '?'} uuids=${expected.uuids.join(',') || '?'} refused serials=${expected.refuseSerials.join(',') || 'none'} (${STICK_CONFIG})`)
+info(`expected test disk: diskSerial=${expected.diskSerial || '?'} usbSerial=${expected.usbSerial || '(not checked)'} uuids=${expected.uuids.join(',') || '(not checked)'} refused serials=${expected.refuseSerials.join(',') || 'none'} (${STICK_CONFIG})`)
 
 /** Resolve the recorded test disk by its IDs; abort on any mismatch (before touching anything) */
 const verifyStick = async (when: string) => {
@@ -210,7 +210,7 @@ const verifyStick = async (when: string) => {
         if (DEVICE && r.disk !== DEVICE) info(`test disk is now ${r.disk} (was ${DEVICE})`)
         DEVICE = r.disk
         usbId = r.usbId
-        write(`PASS  test disk verified (${when}): ${r.disk} [${r.partitions.join(',')}] on USB ${r.usbId}, disk serial ${expected.diskSerial}, USB serial ${expected.usbSerial}`)
+        write(`PASS  test disk verified (${when}): ${r.disk} [${r.partitions.join(',')}] on USB ${r.usbId}, disk serial ${expected.diskSerial}, USB serial ${expected.usbSerial || '(not checked)'}`)
     }
 }
 let usbId = ''
@@ -231,6 +231,12 @@ const localEngine = Object.values(store().engineDB ?? {}).find((e: any) => e.hos
 if (!localEngine) abort(`no engine with hostname ${os.hostname()} in store ${storeUrl}`)
 const ENGINE_ID = localEngine.id as string
 info(`store ${storeUrl}, engine ${ENGINE_ID}`)
+
+const readConfigText = (): string | null => {
+    try { return fs.readFileSync(process.env.IDEA_CONFIG_FILE || path.join(ENGINE_DIR, 'config.yaml'), 'utf8') } catch { return null }
+}
+const SYSTEM_DISK_SKIP = systemDiskSkipFromConfig(readConfigText(), process.env)
+info(`systemDiskSkip: ${SYSTEM_DISK_SKIP}`)
 
 const disks = (): any[] => Object.values(store().diskDB ?? {})
 const dockedOn = (dev: string) => disks().filter(d => d.device === dev && d.dockedTo === ENGINE_ID)
@@ -321,9 +327,11 @@ const systemChecks = async (when: string) => {
     write(`== system disk checks (${when})`)
     const sysDevs = new Set<string>()
     for (const d of systemDisks) (await partitionsOf(d)).forEach(p => sysDevs.add(p))
-    const sysRecords = disks().filter(d => d.dockedTo === ENGINE_ID && d.device && sysDevs.has(d.device))
+    const plan = planSystemRecordChecks({ systemDiskSkip: SYSTEM_DISK_SKIP, allDisks: disks(), engineId: ENGINE_ID, systemDevs: sysDevs })
+    const sysRecords = plan.records
     info(`system drive records docked here: ${sysRecords.map(d => `${d.id} '${d.name}' ${d.device} [${(d.diskTypes ?? []).join(',')}]`).join('; ') || 'none'}`)
-    for (const d of sysRecords) {
+    if (!plan.checkRecords) write(`SKIP  system-record diskTypes/Console eject-rule checks: ${plan.reason} (engine#288)`)
+    for (const d of plan.checkRecords ? sysRecords : []) {
         check((d.diskTypes ?? []).includes('system'), `system record ${d.id} (${d.device}) carries diskTypes 'system'`, `diskTypes=${JSON.stringify(d.diskTypes)}`)
         check(!consoleCanEject(d), `system record ${d.id} fails the Console eject rule (Console #124 rule + 'system' gate)`)
         if (console124CanEject(d)) info(`note: the unchanged Console #124 rule would still show eject for ${d.id}; the Console needs the 'system' gate`)

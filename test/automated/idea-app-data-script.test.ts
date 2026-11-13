@@ -8,10 +8,11 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { spawn } from 'child_process'
+import { spawn, spawnSync } from 'child_process'
 import { fs, path } from 'zx'
 import { makeAppDataSandbox, AppDataSandbox, HELPER_SOURCE } from '../harness/appDataSandbox.js'
-import { APP_DATA_HELPER, APP_DATA_HELPER_VERSION } from '../../src/utils/appDataHelper.js'
+import { APP_DATA_HELPER, APP_DATA_HELPER_VERSION, borgListArgs, borgExtractVerifyArgs, quarantineBackupsArgs, verifyStampNow, checkStamp } from '../../src/utils/appDataHelper.js'
+import { parseBorgListInventory, parseBorgMemberList, instanceRelativeMember, newestArchive, verifyDir } from '../../src/data/BackupVerify.js'
 import { peerSshOptions, PEER_KNOWN_HOSTS } from '../../src/utils/peerSsh.js'
 
 let sb: AppDataSandbox
@@ -77,7 +78,8 @@ describe('idea-app-data: the source script (idea#168)', () => {
         // Every external command is a $VAR set to an absolute path
         for (const m of text.matchAll(/^([A-Z_]+)=(\/\S+)$/gm)) {
             if (['PATH', 'DISKS_DIR', 'ROOTS_FILE', 'LOCK_DIR', 'ROOT_HOME', 'HELPER_PATH',
-                'PEER_KEY', 'PEER_KNOWN_HOSTS', 'PEER_AUTH_DIR', 'PEER_GATE', 'LEDGER_DIR', 'VOLUMES_DIR'].includes(m[1])) continue
+                'PEER_KEY', 'PEER_KNOWN_HOSTS', 'PEER_AUTH_DIR', 'PEER_GATE', 'LEDGER_DIR', 'VOLUMES_DIR',
+                'USAGE_AUTH_DIR', 'USAGE_EXPORT', 'USAGE_EXPORT_CMD', 'USAGE_EXPORT_SRC', 'PEER_SSHD_DROPIN'].includes(m[1])) continue
             expect(m[2], m[1]).toMatch(/^\/usr\/(s?bin)\/[a-z0-9.]+$/)
         }
     })
@@ -106,9 +108,9 @@ describe('idea-app-data: argument checks', () => {
 
     it('refuses the wrong argument count for every subcommand', async () => {
         const cases: [string, number][] = [
-            ['version', 0], ['size', 2], ['copy', 4], ['send', 6], ['delete', 2], ['quarantine', 2], ['snapshot', 2], ['restore-snapshot', 2], ['snapshots', 1], ['estimate', 2],
-            ['borg-init', 2], ['borg-info', 2], ['borg-create', 4], ['borg-extract', 5],
-            ['ensure-dirs', 1], ['erase-slot', 2], ['put-files', 3], ['peer-delete', 3], ['sync-peers', 0],
+            ['version', 0], ['size', 2], ['copy', 4], ['send', 6], ['delete', 2], ['quarantine', 2], ['snapshots', 1], ['estimate', 2],
+            ['borg-init', 2], ['borg-info', 2], ['borg-extract', 5], ['borg-extract-verify', 4], ['borg-compact', 2], ['quarantine-backups', 1],
+            ['ensure-dirs', 1], ['erase-slot', 2], ['put-files', 3], ['peer-delete', 3], ['sync-peers', 0], ['install-usage-key', 3],
         ]
         for (const [sub, n] of cases) {
             for (const count of [n - 1, n + 1]) {
@@ -118,12 +120,19 @@ describe('idea-app-data: argument checks', () => {
             }
         }
         refused(await sb.run(['receive', 'sdb1', 'id1', '--server']), /receive takes <dstRoot> <dstId> and the rsync server arguments/)
+        refused(await sb.run(['borg-create', 'x', 'x', 'x']), /borg-create takes at least 4 argument/)
+        refused(await sb.run(['snapshot', 'x']), /snapshot takes at least 2 argument/)
+        refused(await sb.run(['restore-snapshot', 'x']), /restore-snapshot takes at least 2 argument/)
+        refused(await sb.run(['borg-delete', 'x', 'x']), /borg-delete takes 3 or 4 argument/)
+        refused(await sb.run(['borg-delete', 'x', 'x', 'x', 'x', 'x']), /borg-delete takes 3 or 4 argument/)
+        refused(await sb.run(['borg-list', 'x']), /borg-list takes 2 or 3 argument/)
+        refused(await sb.run(['borg-list', 'x', 'x', 'x', 'x']), /borg-list takes 2 or 3 argument/)
     })
 
     it('refuses bad roots, ids, archives, strips and hosts (.., leading -, /, case, length)', async () => {
         await sb.addDisk('sdb1')
         for (const root of ['..', '-x', '/disks/sdb1', 'sdb1/../..', 'SDB1', 'a b', '', '-rf']) {
-            refused(await sb.run(['size', root, 'inst1']), /root '.*' is not sd\[a-z\]\[12\]|unknown root/)
+            refused(await sb.run(['size', root, 'inst1']), /root '.*' is not sd\[a-z\]\[1-9\]|unknown root/)
         }
         for (const id of ['..', '-rf', 'a/b', 'Inst', 'a..b', 'x'.repeat(65), '', '.hidden']) {
             refused(await sb.run(['size', 'sdb1', id]), /instance id '.*' does not match/)
@@ -131,6 +140,9 @@ describe('idea-app-data: argument checks', () => {
         await sb.addDisk('sdc1', { backup: true })
         for (const archive of ['latest', '2026-10-06', '../2026-10-06T10-00-00-000Z', '-2026-10-06T10-00-00Z', '2026-10-06T10:00:00Z']) {
             refused(await sb.run(['borg-create', 'sdc1', 'inst1', archive, 'sdb1']), /archive name '.*' does not match/)
+        }
+        for (const stamp of ['../etc', '2026-11-12T001825Z', '-20261112T001825Z', '20261112T00:18:25Z', '20261112T001825Z/../x', 'latest']) {
+            refused(await sb.run(['borg-extract-verify', 'sdc1', 'inst1', '2026-10-06T10-00-00-000Z', stamp]), /stamp '.*'/)
         }
         for (const strip of ['0', '10', '-1', 'a', '']) {
             refused(await sb.run(['borg-extract', 'sdc1', 'inst1', '2026-10-06T10-00-00-000Z', strip, 'sdb1']), /strip '.*' does not match/)
@@ -358,6 +370,28 @@ describe('idea-app-data: quarantine (idea#347)', () => {
     })
 })
 
+describe('idea-app-data: device roots are partitions 1-9 (idea#406)', () => {
+    it('reports the current helper version', async () => {
+        const r = await sb.run(['version'])
+        expect(r.stdout.trim()).toBe(`idea-app-data ${APP_DATA_HELPER_VERSION}`)
+    })
+    it('size and snapshot work on partitions 3 and 4 (the #76 fixture layout)', async () => {
+        for (const dev of ['sdb3', 'sdb4', 'sdc9']) {
+            const root = await sb.addDisk(dev)
+            await sb.addInstance(root, 'inst1')
+            const sz = await sb.run(['size', dev, 'inst1'])
+            expect(sz.exitCode, `${dev}: ${sz.stderr}`).toBe(0)
+            const sn = await sb.run(['snapshot', dev, 'inst1'])
+            expect(sn.exitCode, `${dev}: ${sn.stderr}`).toBe(0)
+        }
+    })
+    it('refuses partition 0, 10+ and sdaa-style roots (no bridge entry)', async () => {
+        for (const root of ['sda0', 'sdb0', 'sda10', 'sdb12', 'sdaa', 'sdaa1']) {
+            refused(await sb.run(['size', root, 'inst1']), /unknown root|is not sd\[a-z\]\[1-9\]/)
+        }
+    })
+})
+
 describe('idea-app-data: updateApp snapshots (v5, idea#230)', () => {
     const snap = (root: string, id: string) => path.join(root, '.pre-update', id)
     it('snapshot copies the instance to .pre-update/<id>/data (0700), writes COMPLETE last, reports path and size', async () => {
@@ -480,19 +514,25 @@ describe('idea-app-data: updateApp snapshots (v5, idea#230)', () => {
         expect(await fs.readFile(path.join(root, '.idea-quarantine', q[0], 'data', 'half'), 'utf8')).toBe('x')
         expect(await fs.pathExists(path.join(snap(root, 'inst1'), 'data', 'half'))).toBe(false)
     })
-    it('restore-snapshot moves the current folder aside (undoable), then copies the snapshot back', async () => {
+    it('restore-snapshot restores in place (v9, idea#448): the folder keeps its inode, replaced/deleted files go to .idea-quarantine', async () => {
+        sb = await sandbox({ realRsync: true })
         const root = await sb.addDisk('sdb1')
         const inst = await sb.addInstance(root, 'inst1')
         await fs.writeFile(path.join(inst, 'db.sqlite3'), 'v1')
         expect((await sb.run(['snapshot', 'sdb1', 'inst1'])).exitCode).toBe(0)
+        const dirIno = (await fs.stat(inst)).ino
         await fs.writeFile(path.join(inst, 'db.sqlite3'), 'v2-migrated')
+        await fs.writeFile(path.join(inst, 'new-in-v2'), 'n')
         refused(await sb.run(['restore-snapshot', 'sdb1', 'inst1'], { FAKE_DOCKER_PS: 'abc' }), /RUNNING/)
         const r = await sb.run(['restore-snapshot', 'sdb1', 'inst1'])
         expect(r.exitCode, r.stderr).toBe(0)
         const aside = r.stdout.trim().split('\n').pop()!
         expect(aside).toMatch(/\.idea-quarantine\/inst1-before-restore-/)
         expect(await fs.readFile(path.join(aside, 'db.sqlite3'), 'utf8')).toBe('v2-migrated')
+        expect(await fs.readFile(path.join(aside, 'new-in-v2'), 'utf8')).toBe('n')   // deleted from live, kept aside
+        expect(await fs.pathExists(path.join(inst, 'new-in-v2'))).toBe(false)
         expect(await fs.readFile(path.join(inst, 'db.sqlite3'), 'utf8')).toBe('v1')
+        expect((await fs.stat(inst)).ino).toBe(dirIno)   // never moved
         expect(await fs.pathExists(path.join(snap(root, 'inst1'), 'COMPLETE'))).toBe(true)
         expect(await fs.readFile(path.join(snap(root, 'inst1'), 'JOURNAL'), 'utf8')).toMatch(/restore sdb1 inst1 done aside=/)
         // RESTORING is written at the start and renamed to RESTORED at "done" (no rm)
@@ -500,7 +540,22 @@ describe('idea-app-data: updateApp snapshots (v5, idea#230)', () => {
         expect(await fs.readFile(path.join(snap(root, 'inst1'), 'RESTORED'), 'utf8')).toMatch(/^restoring sdb1 inst1 since /)
         const body = await fs.readFile(path.join(process.cwd(), 'script/build_image_assets/idea-app-data'), 'utf8')
         const restore = body.slice(body.indexOf('    restore-snapshot)'), body.indexOf('    estimate)'))
-        expect(restore.indexOf('> "$SDIR/RESTORING"')).toBeLessThan(restore.indexOf('quarantine_aside'))
+        expect(restore.indexOf('> "$SDIR/RESTORING"')).toBeLessThan(restore.indexOf('--backup-dir'))
+        // the instance folder itself is never moved or quarantined aside
+        expect(restore).not.toMatch(/quarantine_aside/)
+        expect(restore).not.toMatch(/\$MV[^\n]*\$INST/)
+    })
+    it('restore-snapshot into a missing instance folder creates it and reports none', async () => {
+        sb = await sandbox({ realRsync: true })
+        const root = await sb.addDisk('sdb1')
+        const inst = await sb.addInstance(root, 'inst1')
+        await fs.writeFile(path.join(inst, 'db.sqlite3'), 'v1')
+        expect((await sb.run(['snapshot', 'sdb1', 'inst1'])).exitCode).toBe(0)
+        await fs.move(inst, path.join(sb.tmp, 'gone'))
+        const r = await sb.run(['restore-snapshot', 'sdb1', 'inst1'])
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(r.stdout.trim().split('\n').pop()).toBe('none')
+        expect(await fs.readFile(path.join(inst, 'db.sqlite3'), 'utf8')).toBe('v1')
     })
     it('estimate is read-only: folder + volume KB and free KB, even while the app runs; nothing written, no lock taken', async () => {
         const root = await sb.addDisk('sdb1')
@@ -515,6 +570,61 @@ describe('idea-app-data: updateApp snapshots (v5, idea#230)', () => {
         expect(await fs.pathExists(path.join(root, '.idea-quarantine'))).toBe(false)
         const body = await fs.readFile(path.join(process.cwd(), 'script/build_image_assets/idea-app-data'), 'utf8')
         expect(body.slice(body.indexOf('    estimate)'), body.indexOf('    snapshots)'))).not.toMatch(/take_locks|\$MV|\$MKDIR|\$RSYNC|\$TAR|>> "|> "/)
+    })
+    it('estimate system reports three integers; df is called on the system root not an empty path (idea#427)', async () => {
+        await sb.addInstance(sb.sys, 'inst1')
+        const r = await sb.run(['estimate', 'system', 'inst1'], { FAKE_DF_AVAIL_KB: '4242' })
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(r.stdout.trim()).toMatch(/^\d+ \d+ 4242$/)
+        const dfs = await sb.calls('df')
+        expect(dfs.length).toBeGreaterThan(0)
+        expect(dfs.every(c => c.argv.includes(sb.sys))).toBe(true)
+        expect(dfs.every(c => !c.argv.includes(''))).toBe(true)
+    })
+    it('avail_kb and free_floor treat an empty SYSTEM_ROOT as / so df is never called with "" (idea#427)', async () => {
+        const body = await fs.readFile(HELPER_SOURCE, 'utf8')
+        expect(body).toMatch(/^SYSTEM_ROOT=$/m)
+        expect(body).not.toMatch(/^SYSTEM_ROOT=\//m)
+        const avail = body.slice(body.indexOf('avail_kb() {'), body.indexOf('quarantine_aside() {'))
+        expect(avail).toContain('local dir="${1:-/}"')
+        expect(avail).toContain('$DF -Pk -- "$dir"')
+        const floor = body.slice(body.indexOf('free_floor() {'), body.indexOf('engine_user_dir() {'))
+        expect(floor).toContain('local dir="${1:-/}"')
+        expect(floor).toContain('$DF -Pk -- "$dir"')
+        expect(body).toContain('FREE_KB=$(avail_kb "${R_DIR:-/}")')
+        expect(body).toContain('$(avail_kb "${R_DIR:-/}")')
+
+        const lines = body.split('\n')
+        const start = lines.findIndex(l => l.startsWith('avail_kb()'))
+        let end = start + 1
+        while (end < lines.length && lines[end] !== '}') end++
+        const fn = lines.slice(start, end + 1).join('\n')
+        expect(fn).toContain('avail_kb()')
+        expect(fn).toContain('local dir="${1:-/}"')
+
+        const runner = path.join(sb.tmp, 'run-avail-kb.sh')
+        await fs.writeFile(runner, [
+            '#!/bin/bash',
+            'set -euo pipefail',
+            `DF=${sb.bin}/df`,
+            'refuse() { echo "refused: $*" >&2; exit 2; }',
+            fn,
+            'avail_kb ""',
+            '',
+        ].join('\n'), { mode: 0o755 })
+        const out = await new Promise<{ exitCode: number | null, stdout: string, stderr: string }>((resolve, reject) => {
+            const proc = spawn(runner, [], { stdio: ['ignore', 'pipe', 'pipe'] })
+            let stdout = '', stderr = ''
+            proc.stdout!.on('data', d => { stdout += d })
+            proc.stderr!.on('data', d => { stderr += d })
+            proc.on('error', reject)
+            proc.on('close', (exitCode) => resolve({ exitCode, stdout, stderr }))
+        })
+        expect(out.exitCode, out.stderr).toBe(0)
+        expect(out.stdout.trim()).toMatch(/^\d+$/)
+        const dfs = await sb.calls('df')
+        expect(dfs.some(c => c.argv[c.argv.length - 1] === '/')).toBe(true)
+        expect(dfs.every(c => c.argv[c.argv.length - 1] !== '')).toBe(true)
     })
     it('a volume mounted by any running container is refused for export and restore (IN_USE); a vanished volume is recreated on restore', async () => {
         const root = await sb.addDisk('sdb1')
@@ -553,6 +663,127 @@ describe('idea-app-data: updateApp snapshots (v5, idea#230)', () => {
         for (const [a, b] of [['    snapshot)', '    borg-init)'], ['containers_stopped() {', '# ── Checks']]) {
             expect(body.slice(body.indexOf(a), body.indexOf(b))).not.toMatch(/\$RM|\$RMDIR|rm -/)
         }
+    })
+})
+
+describe('idea-app-data: snapshot excludes and in-place restore keep identity (v9, idea#448)', () => {
+    const snap = (root: string, id: string) => path.join(root, '.pre-update', id)
+    const identity = async (inst: string) => {
+        await fs.ensureDir(path.join(inst, 'data', 'tailscale'))
+        await fs.ensureDir(path.join(inst, 'data', 'keys'))
+        await fs.writeFile(path.join(inst, 'data', 'tailscale', 'tailscaled.state'), 'nodekey-LIVE')
+        await fs.writeFile(path.join(inst, 'data', 'keys', 'id'), 'key-LIVE')
+        await fs.writeFile(path.join(inst, 'data', 'app.db'), 'db-v1')
+    }
+
+    it('snapshot leaves excluded paths out and records them in JOURNAL and EXCLUDE (before COMPLETE)', async () => {
+        sb = await sandbox({ realRsync: true })
+        const root = await sb.addDisk('sdb1')
+        const inst = await sb.addInstance(root, 'inst1')
+        await identity(inst)
+        const r = await sb.run(['snapshot', 'sdb1', 'inst1', 'tailscale', './data/keys/', 'data/tailscale'])
+        expect(r.exitCode, r.stderr).toBe(0)
+        const d = path.join(snap(root, 'inst1'), 'data')
+        expect(await fs.readFile(path.join(d, 'data', 'app.db'), 'utf8')).toBe('db-v1')
+        expect(await fs.pathExists(path.join(d, 'data', 'tailscale'))).toBe(false)
+        expect(await fs.pathExists(path.join(d, 'data', 'keys'))).toBe(false)
+        expect(await fs.readFile(path.join(snap(root, 'inst1'), 'EXCLUDE'), 'utf8')).toBe('data/tailscale\ndata/keys\n')   // normalised, de-duplicated
+        const journal = await fs.readFile(path.join(snap(root, 'inst1'), 'JOURNAL'), 'utf8')
+        expect(journal).toMatch(/excludes=2\nexclude data\/tailscale\nexclude data\/keys\n/)
+        const argv = (await sb.calls('rsync')).pop()!.argv
+        expect(argv).toEqual(expect.arrayContaining(['--exclude=/data/tailscale', '--exclude=/data/keys']))
+        const body = await fs.readFile(path.join(process.cwd(), 'script/build_image_assets/idea-app-data'), 'utf8')
+        const block = body.slice(body.indexOf('    snapshot)'), body.indexOf('    restore-snapshot)'))
+        expect(block.indexOf('"$SDIR/EXCLUDE"')).toBeLessThan(block.indexOf('"$SDIR/.COMPLETE.tmp"'))
+    })
+
+    it('snapshot without excludes writes an empty EXCLUDE', async () => {
+        const root = await sb.addDisk('sdb1')
+        await sb.addInstance(root, 'inst1')
+        expect((await sb.run(['snapshot', 'sdb1', 'inst1'])).exitCode).toBe(0)
+        expect(await fs.readFile(path.join(snap(root, 'inst1'), 'EXCLUDE'), 'utf8')).toBe('')
+    })
+
+    it('an invalid exclude fails closed: no snapshot, the previous snapshot is not moved, no rsync, no lock', async () => {
+        const root = await sb.addDisk('sdb1')
+        const inst = await sb.addInstance(root, 'inst1')
+        await identity(inst)
+        expect((await sb.run(['snapshot', 'sdb1', 'inst1'])).exitCode).toBe(0)
+        const before = await fs.readFile(path.join(snap(root, 'inst1'), 'JOURNAL'), 'utf8')
+        const rsyncCalls = (await sb.calls('rsync')).length
+        for (const [bad, re] of [
+            ['../etc', /'\.\.' component/], ['/etc/shadow', /absolute path/], ['data/*', /glob/], ['--delete', /looks like an option/], ['', /empty/],
+        ] as [string, RegExp][]) {
+            refused(await sb.run(['snapshot', 'sdb1', 'inst1', 'data/keys', bad]), re)
+        }
+        // an exclude that resolves outside the instance folder through a symlink
+        await fs.symlink(sb.tmp, path.join(inst, 'data', 'out'))
+        refused(await sb.run(['snapshot', 'sdb1', 'inst1', 'data/out']), /points outside the instance folder/)
+        expect(await fs.readFile(path.join(snap(root, 'inst1'), 'JOURNAL'), 'utf8')).toBe(before)
+        expect(await fs.pathExists(path.join(root, '.idea-quarantine'))).toBe(false)
+        expect((await sb.calls('rsync')).length).toBe(rsyncCalls)
+    })
+
+    it('snapshot + in-place restore: an excluded file keeps its inode and content; other files are restored', async () => {
+        sb = await sandbox({ realRsync: true })
+        const root = await sb.addDisk('sdb1')
+        const inst = await sb.addInstance(root, 'inst1')
+        await identity(inst)
+        const state = path.join(inst, 'data', 'tailscale', 'tailscaled.state')
+        const ino = (await fs.stat(state)).ino
+        const dirIno = (await fs.stat(inst)).ino
+        expect((await sb.run(['snapshot', 'sdb1', 'inst1', 'data/tailscale', 'data/keys'])).exitCode).toBe(0)
+        // the update changes data and the identity is rewritten in place (same inode) by the running app
+        await fs.writeFile(path.join(inst, 'data', 'app.db'), 'db-v2-migrated')
+        await fs.writeFile(state, 'nodekey-LIVE-2')
+        const r = await sb.run(['restore-snapshot', 'sdb1', 'inst1'])
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect((await fs.stat(state)).ino).toBe(ino)
+        expect(await fs.readFile(state, 'utf8')).toBe('nodekey-LIVE-2')
+        expect(await fs.readFile(path.join(inst, 'data', 'keys', 'id'), 'utf8')).toBe('key-LIVE')
+        expect(await fs.readFile(path.join(inst, 'data', 'app.db'), 'utf8')).toBe('db-v1')
+        expect((await fs.stat(inst)).ino).toBe(dirIno)
+        const aside = r.stdout.trim().split('\n').pop()!
+        expect(await fs.readFile(path.join(aside, 'data', 'app.db'), 'utf8')).toBe('db-v2-migrated')
+        expect(await fs.pathExists(path.join(aside, 'data', 'tailscale'))).toBe(false)
+        const argv = (await sb.calls('rsync')).pop()!.argv
+        expect(argv).toEqual(expect.arrayContaining(['--delete', '--backup', `--backup-dir=${aside}`, '--exclude=/data/tailscale', '--exclude=/data/keys']))
+        expect(await fs.readFile(path.join(snap(root, 'inst1'), 'JOURNAL'), 'utf8')).toMatch(/restore exclude data\/tailscale\nrestore exclude data\/keys\n/)
+    })
+
+    it('an older snapshot that still holds the identity never writes it back when the excludes are given on restore', async () => {
+        sb = await sandbox({ realRsync: true })
+        const root = await sb.addDisk('sdb1')
+        const inst = await sb.addInstance(root, 'inst1')
+        await identity(inst)
+        // a pre-v9 style snapshot: no excludes, so data/tailscale is inside it
+        expect((await sb.run(['snapshot', 'sdb1', 'inst1'])).exitCode).toBe(0)
+        const state = path.join(inst, 'data', 'tailscale', 'tailscaled.state')
+        await fs.writeFile(state, 'nodekey-NEWER')
+        const ino = (await fs.stat(state)).ino
+        await fs.writeFile(path.join(inst, 'data', 'keys', 'extra'), 'only-live')
+        const r = await sb.run(['restore-snapshot', 'sdb1', 'inst1', 'tailscale', 'data/keys'])
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect((await fs.stat(state)).ino).toBe(ino)
+        expect(await fs.readFile(state, 'utf8')).toBe('nodekey-NEWER')
+        expect(await fs.readFile(path.join(inst, 'data', 'keys', 'extra'), 'utf8')).toBe('only-live')   // --delete spares excluded paths
+    })
+
+    it('restore refuses a bad EXCLUDE entry or a bad given exclude before anything is written', async () => {
+        const root = await sb.addDisk('sdb1')
+        const inst = await sb.addInstance(root, 'inst1')
+        await identity(inst)
+        expect((await sb.run(['snapshot', 'sdb1', 'inst1', 'data/keys'])).exitCode).toBe(0)
+        const journal = await fs.readFile(path.join(snap(root, 'inst1'), 'JOURNAL'), 'utf8')
+        refused(await sb.run(['restore-snapshot', 'sdb1', 'inst1', '../x']), /'\.\.' component/)
+        await fs.writeFile(path.join(snap(root, 'inst1'), 'EXCLUDE'), 'data/keys\n/etc\n')
+        refused(await sb.run(['restore-snapshot', 'sdb1', 'inst1']), /absolute path/)
+        expect(await fs.readFile(path.join(snap(root, 'inst1'), 'JOURNAL'), 'utf8')).toBe(journal)
+        expect(await fs.pathExists(path.join(snap(root, 'inst1'), 'RESTORING'))).toBe(false)
+        expect(await fs.readFile(path.join(inst, 'data', 'app.db'), 'utf8')).toBe('db-v1')
+        await fs.remove(path.join(snap(root, 'inst1'), 'EXCLUDE'))
+        await fs.symlink(path.join(sb.tmp, 'x'), path.join(snap(root, 'inst1'), 'EXCLUDE'))
+        refused(await sb.run(['restore-snapshot', 'sdb1', 'inst1']), /EXCLUDE is not a regular file/)
     })
 })
 
@@ -668,6 +899,323 @@ describe('idea-app-data: borg', () => {
         expect(await fs.readdir(path.join(target, 'instances'))).toEqual([])
         expect(await fs.pathExists(path.join(target, '.idea-app-data-staging'))).toBe(false)
         refused(await sb.run(['borg-extract', 'sdc1', 'inst1', ARCHIVE, '2', 'sdd1'], { FAKE_BORG_EXTRACT: '' }), /got: nothing/)
+    })
+
+    it('borg-create with excludes writes path-prefix patterns and keeps a 4-arg create unchanged (idea#443)', async () => {
+        const repo = path.join(bk, 'backups', 'inst1')
+        const src = path.join(app, 'instances', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        expect((await sb.run(['borg-create', 'sdc1', 'inst1', ARCHIVE, 'sdb1', 'keys', 'data/tailscale', 'tailscale-run', 'data/backup/daily'])).exitCode).toBe(0)
+        const calls = await sb.calls('borg')
+        expect(calls).toHaveLength(1)
+        const snapshot = path.join(sb.tmp, 'calls', 'borg.patterns')
+        expect(await fs.readFile(snapshot, 'utf8')).toBe(
+            `- pp:${src}/data/keys\n- pp:${src}/data/tailscale\n- pp:${src}/data/tailscale-run\n- pp:${src}/data/backup/daily\n`,
+        )
+        const patIdx = calls[0].argv.indexOf('--patterns-from')
+        expect(patIdx).toBe(2)
+        const patArg = calls[0].argv[patIdx + 1]
+        expect(patArg.startsWith(path.join(sb.lockDir, 'borg-exclude.'))).toBe(true)
+        expect(calls[0].argv).toEqual([
+            'create', '--numeric-ids', '--patterns-from', patArg, '--', `${repo}::${ARCHIVE}`, src,
+        ])
+        // the temp pattern file itself is removed after borg returns
+        const leftover = (await fs.readdir(sb.lockDir)).filter(n => n.startsWith('borg-exclude.'))
+        expect(leftover).toEqual([])
+
+        await fs.remove(path.join(sb.tmp, 'calls', 'borg.log'))
+        expect((await sb.run(['borg-create', 'sdc1', 'inst1', '2026-10-06T11-00-00-000Z', 'sdb1'])).exitCode).toBe(0)
+        const [plain] = await sb.calls('borg')
+        expect(plain.argv).toEqual(['create', '--numeric-ids', '--', `${repo}::2026-10-06T11-00-00-000Z`, src])
+    })
+
+    it('borg-create refuses exclude paths that escape the instance folder or look like options (idea#443)', async () => {
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        for (const bad of ['/etc/passwd', '../etc', 'data/../../etc', '-patterns-from', 'data/*', 'foo//bar', '', '.']) {
+            refused(await sb.run(['borg-create', 'sdc1', 'inst1', ARCHIVE, 'sdb1', bad]), /exclude/)
+        }
+        const src = path.join(app, 'instances', 'inst1')
+        await fs.ensureDir(path.join(src, 'data'))
+        const outside = path.join(sb.tmp, 'outside-secret')
+        await fs.writeFile(outside, 'nope')
+        await fs.symlink(outside, path.join(src, 'data', 'keys'))
+        refused(await sb.run(['borg-create', 'sdc1', 'inst1', ARCHIVE, 'sdb1', 'keys']), /points outside the instance folder/)
+        expect(await sb.calls('borg')).toEqual([])
+    })
+})
+
+
+describe('idea-app-data: borg-list / borg-delete / borg-compact (idea#401, helper v9)', () => {
+    const A = [
+        '2026-01-01T00-00-00-000Z',
+        '2026-01-02T00-00-00-000Z',
+        '2026-01-03T00-00-00-000Z',
+        '2026-01-04T00-00-00-000Z',
+        '2026-01-05T00-00-00-000Z',
+    ]
+    const listEnv = (names: string[]) => ({ FAKE_BORG_LIST: names.join('\n') })
+    let bk: string
+    beforeEach(async () => {
+        bk = await sb.addDisk('sdc1', { backup: true })
+    })
+
+    it('borg-list prints borg info --json --glob-archives * (no --last) for the repo', async () => {
+        const payload = JSON.stringify({
+            archives: [
+                { name: A[1], start: '2026-01-02T00:00:00.000000', stats: { original_size: 200, compressed_size: 80 } },
+                { name: A[0], start: '2026-01-01T00:00:00.000000', stats: { original_size: 100, compressed_size: 40 } },
+            ],
+        })
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        const r = await sb.run(['borg-list', 'sdc1', 'inst1'], { FAKE_BORG_INFO: payload })
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(JSON.parse(r.stdout)).toEqual(JSON.parse(payload))
+        const [info] = await sb.calls('borg')
+        expect(info.argv).toEqual(['info', '--json', '--glob-archives', '*', '--', repo])
+        expect(info.argv).not.toContain('--last')
+    })
+
+    it('borg-delete of an older-than-newest-3 archive succeeds; a 3-argument call uses keepMin 3', async () => {
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        expect((await sb.run(['borg-delete', 'sdc1', 'inst1', A[0]], listEnv(A))).exitCode).toBe(0)
+        const [listCall, delCall] = await sb.calls('borg')
+        expect(listCall.argv[0]).toBe('list')
+        expect(listCall.argv).toContain('--sort-by')
+        expect(listCall.argv).toContain('timestamp')
+        expect(delCall.argv).toEqual(['delete', '--', `${repo}::${A[0]}`])
+    })
+
+    it('borg-delete refuses the newest 3, the last remaining archive, and a keepMin underflow', async () => {
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        for (const newest of A.slice(-3)) {
+            refused(await sb.run(['borg-delete', 'sdc1', 'inst1', newest], listEnv(A)), /among the newest 3/)
+        }
+        refused(await sb.run(['borg-delete', 'sdc1', 'inst1', A[0]], listEnv([A[0]])), /only archive/)
+        refused(await sb.run(['borg-delete', 'sdc1', 'inst1', A[0]], listEnv(A.slice(0, 3))), /fewer than 3 archives/)
+        refused(await sb.run(['borg-delete', 'sdc1', 'inst1', A[0], '5'], listEnv(A)), /fewer than 5 archives/)
+        const calls = await sb.calls('borg')
+        expect(calls.every(c => c.argv[0] === 'list')).toBe(true)
+        expect(calls.filter(c => c.argv[0] === 'delete')).toEqual([])
+    })
+
+    it('borg-delete refuses a bad archive token, a bad keepMin and a system target', async () => {
+        refused(await sb.run(['borg-delete', 'sdc1', 'inst1', 'latest']), /archive name 'latest' does not match/)
+        refused(await sb.run(['borg-delete', 'sdc1', 'inst1', A[0], '0']), /keepMin '0' is not a positive integer/)
+        refused(await sb.run(['borg-delete', 'sdc1', 'inst1', A[0], '-3']), /keepMin '-3' is not a positive integer/)
+        refused(await sb.run(['borg-delete', 'system', 'inst1', A[0]]), /a Backup Disk is never the system disk/)
+        refused(await sb.run(['borg-list', 'system', 'inst1']), /a Backup Disk is never the system disk/)
+        refused(await sb.run(['borg-compact', 'system', 'inst1']), /a Backup Disk is never the system disk/)
+        expect(await sb.calls('borg')).toEqual([])
+    })
+
+    it('borg-compact invokes borg compact on the repo', async () => {
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        expect((await sb.run(['borg-compact', 'sdc1', 'inst1'])).exitCode).toBe(0)
+        const [c] = await sb.calls('borg')
+        expect(c.argv).toEqual(['compact', '--', repo])
+    })
+
+    it('borg-list <archive> prints a member list (borg list --short); 2-arg inventory is unchanged', async () => {
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        const members = 'instances/inst1/compose.yaml\ninstances/inst1/data/usage.sqlite\n'
+        const r = await sb.run(['borg-list', 'sdc1', 'inst1', A[0]], listEnv([A[0], A[1], A[2]]))
+        // listEnv sets FAKE_BORG_LIST, used both for the existence probe and the member list
+        expect(r.exitCode, r.stderr).toBe(0)
+        const calls = await sb.calls('borg')
+        expect(calls[0].argv).toEqual(['list', '--format', '{name}{NL}', '--sort-by', 'timestamp', '--', repo])
+        expect(calls[1].argv).toEqual(['list', '--short', '--', `${repo}::${A[0]}`])
+        refused(await sb.run(['borg-list', 'sdc1', 'inst1', A[3]], listEnv(A.slice(0, 3))), /archive '.*' is not in the repository/)
+        // 2-arg form is borg info --json --glob-archives '*', no --last
+        const payload = JSON.stringify({ archives: [{ name: A[0] }] })
+        const inv = await sb.run(['borg-list', 'sdc1', 'inst1'], { FAKE_BORG_INFO: payload })
+        expect(inv.exitCode, inv.stderr).toBe(0)
+        expect(JSON.parse(inv.stdout)).toEqual(JSON.parse(payload))
+        const info = (await sb.calls('borg')).at(-1)!
+        expect(info.argv).toEqual(['info', '--json', '--glob-archives', '*', '--', repo])
+        expect(info.argv).not.toContain('--last')
+    })
+
+    it('borg-extract-verify extracts into .idea-verify/<id>-<stamp>/, never instances/<id>, and refuses an existing target', async () => {
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        const live = path.join(bk, 'instances', 'inst1')
+        await fs.ensureDir(live)
+        await fs.writeFile(path.join(live, 'keep.txt'), 'live')
+        const stamp = '20261112T001825000Z'
+        const dest = path.join(bk, '.idea-verify', `inst1-${stamp}`)
+        const r = await sb.run(['borg-extract-verify', 'sdc1', 'inst1', A[0], stamp], { FAKE_BORG_EXTRACT: 'instances/inst1' })
+        expect(r.exitCode, r.stderr).toBe(0)
+        const du = spawnSync('du', ['-sb', '-x', '--', dest], { encoding: 'utf8' })
+        expect(du.status, du.stderr).toBe(0)
+        const duBytes = du.stdout.trim().split(/\s+/)[0]
+        expect(r.stdout.trim()).toBe(`scratchBytes=${duBytes}`)
+        expect(Number(duBytes)).toBeGreaterThan(0)
+        expect(await fs.pathExists(path.join(dest, 'instances', 'inst1', 'data.txt'))).toBe(true)
+        expect(await fs.readFile(path.join(live, 'keep.txt'), 'utf8')).toBe('live')
+        expect(await fs.pathExists(path.join(live, 'data.txt'))).toBe(false)
+        const st = await fs.stat(dest)
+        expect((st.mode & 0o777).toString(8)).toBe('700')
+        const [extract] = await sb.calls('borg')
+        expect(extract.argv).toEqual(['extract', '--numeric-ids', '--', `${repo}::${A[0]}`])
+        expect(extract.argv).not.toContain('--strip-components')
+        expect(extract.cwd).toBe(dest)
+        refused(await sb.run(['borg-extract-verify', 'sdc1', 'inst1', A[0], stamp]), /already exists/)
+        refused(await sb.run(['borg-extract-verify', 'system', 'inst1', A[0], stamp]), /a Backup Disk is never the system disk/)
+    })
+
+    it('borg-extract-verify leaves a partial tree on failure (never rm)', async () => {
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        const stamp = '20261112T001826000Z'
+        const dest = path.join(bk, '.idea-verify', `inst1-${stamp}`)
+        const r = await sb.run(['borg-extract-verify', 'sdc1', 'inst1', A[0], stamp], { FAKE_BORG_EXTRACT: 'instances/inst1', FAKE_BORG_EXIT: '1' })
+        expect(r.exitCode).toBe(1)
+        expect(r.stdout).not.toMatch(/scratchBytes=/)
+        expect(await fs.pathExists(dest)).toBe(true)
+        expect(await fs.pathExists(path.join(dest, 'instances', 'inst1', 'data.txt'))).toBe(true)
+    })
+
+    it('quarantine-backups moves backups/ to .idea-quarantine/backups-<stamp>/ (mv only) and refuses a lock or the system disk', async () => {
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        await fs.writeFile(path.join(repo, 'kept.txt'), 'keep-me')
+        const r = await sb.run(['quarantine-backups', 'sdc1'])
+        expect(r.exitCode, r.stderr).toBe(0)
+        const dest = r.stdout.trim()
+        expect(dest.startsWith(path.join(bk, '.idea-quarantine', 'backups-'))).toBe(true)
+        expect(path.basename(dest)).toMatch(/^backups-[0-9]{8}T[0-9]{6,15}Z$/)
+        expect(await fs.pathExists(path.join(dest, 'inst1', 'kept.txt'))).toBe(true)
+        expect(await fs.pathExists(path.join(bk, 'backups'))).toBe(false)
+        // recreate backups with a lock — must refuse and leave backups/ in place
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        await fs.writeFile(path.join(repo, '.backup-in-progress'), JSON.stringify({ instanceId: 'inst1' }))
+        refused(await sb.run(['quarantine-backups', 'sdc1']), /\.backup-in-progress lock exists/)
+        expect(await fs.pathExists(path.join(repo, 'config'))).toBe(true)
+        refused(await sb.run(['quarantine-backups', 'system']), /a Backup Disk is never the system disk/)
+        // no rm of the quarantined tree
+        expect(await fs.pathExists(path.join(dest, 'inst1', 'kept.txt'))).toBe(true)
+    })
+})
+
+
+describe('Engine argv builders agree with helper v9 (idea#446)', () => {
+    const A = [
+        '2026-01-01T00-00-00-000Z',
+        '2026-01-02T00-00-00-000Z',
+        '2026-01-03T00-00-00-000Z',
+    ]
+    const membersText = [
+        `disks/sdc1/instances/inst1/compose.yaml`,
+        `disks/sdc1/instances/inst1/data/hello.txt`,
+        `disks/sdc1/instances/inst1/.env`,
+    ].join('\n')
+    let bk: string
+    beforeEach(async () => {
+        bk = await sb.addDisk('sdc1', { backup: true })
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+    })
+
+    it('borgListArgs inventory: helper prints borg info --json --glob-archives * and the Engine parses sizes / newest', async () => {
+        const payload = JSON.stringify({
+            archives: [
+                { name: A[0], start: '2026-01-01T00:00:00.000000', stats: { original_size: 100, compressed_size: 40 } },
+                { name: A[2], start: '2026-01-03T00:00:00.000000', stats: { original_size: 300, compressed_size: 90 } },
+                { name: A[1], start: '2026-01-02T00:00:00.000000', stats: { original_size: 200, compressed_size: 80 } },
+            ],
+        })
+        const r = await sb.run(borgListArgs('sdc1', 'inst1'), { FAKE_BORG_INFO: payload })
+        expect(r.exitCode, r.stderr).toBe(0)
+        const archives = parseBorgListInventory(r.stdout)
+        expect(archives.map(a => a.name)).toEqual([A[0], A[2], A[1]])
+        expect(archives[2].originalSize).toBe(200)
+        expect(newestArchive(archives).name).toBe(A[2])
+        const [info] = await sb.calls('borg')
+        expect(info.argv).toEqual(['info', '--json', '--glob-archives', '*', '--', path.join(bk, 'backups', 'inst1')])
+        expect(info.argv).not.toContain('--last')
+    })
+
+    it('borgListArgs with archive: helper member list (borg list --short) parses as instance-relative paths', async () => {
+        const r = await sb.run(borgListArgs('sdc1', 'inst1', A[0]), {
+            FAKE_BORG_LIST: A.join('\n'),
+            FAKE_BORG_MEMBERS: membersText,
+        })
+        expect(r.exitCode, r.stderr).toBe(0)
+        const members = parseBorgMemberList(r.stdout)
+        expect(members).toEqual(membersText.split('\n'))
+        expect(instanceRelativeMember(members[0], 'inst1')).toBe('compose.yaml')
+        expect(instanceRelativeMember(members[1], 'inst1')).toBe('data/hello.txt')
+        const calls = await sb.calls('borg')
+        expect(calls[0].argv[0]).toBe('list')
+        expect(calls[1].argv).toEqual(['list', '--short', '--', `${path.join(bk, 'backups', 'inst1')}::${A[0]}`])
+        refused(await sb.run(borgListArgs('sdc1', 'inst1', '2026-12-31T00-00-00-000Z'), { FAKE_BORG_LIST: A.join('\n') }), /archive '.*' is not in the repository/)
+    })
+
+    it('borgExtractVerifyArgs uses checkStamp / verifyStampNow and extracts into Engine verifyDir, never instances/<id>', async () => {
+        const live = path.join(bk, 'instances', 'inst1')
+        await fs.ensureDir(live)
+        await fs.writeFile(path.join(live, 'keep.txt'), 'live')
+        const stamp = verifyStampNow(new Date('2026-11-12T00:18:25.000Z'))
+        expect(stamp).toBe('20261112T001825000Z')
+        expect(checkStamp(stamp)).toBe(stamp)
+        const dest = verifyDir('sdc1', 'inst1', stamp)
+        // disksRoot in the sandbox is sb.disks, not the Engine's live disksRoot(); compare the helper's dest.
+        const helperDest = path.join(bk, '.idea-verify', `inst1-${stamp}`)
+        expect(path.basename(dest)).toBe(`inst1-${stamp}`)
+        const r = await sb.run(borgExtractVerifyArgs('sdc1', 'inst1', A[0], stamp), { FAKE_BORG_EXTRACT: 'instances/inst1' })
+        expect(r.exitCode, r.stderr).toBe(0)
+        const du = spawnSync('du', ['-sb', '-x', '--', helperDest], { encoding: 'utf8' })
+        expect(du.status, du.stderr).toBe(0)
+        const duBytes = du.stdout.trim().split(/\s+/)[0]
+        expect(r.stdout.trim()).toBe(`scratchBytes=${duBytes}`)
+        expect(Number(duBytes)).toBeGreaterThan(0)
+        expect(await fs.pathExists(path.join(helperDest, 'instances', 'inst1', 'data.txt'))).toBe(true)
+        expect(await fs.readFile(path.join(live, 'keep.txt'), 'utf8')).toBe('live')
+        expect(await fs.pathExists(path.join(live, 'data.txt'))).toBe(false)
+        const [extract] = await sb.calls('borg')
+        expect(extract.argv).toEqual(['extract', '--numeric-ids', '--', `${path.join(bk, 'backups', 'inst1')}::${A[0]}`])
+        expect(extract.argv).not.toContain('--strip-components')
+        expect(extract.cwd).toBe(helperDest)
+        refused(await sb.run(borgExtractVerifyArgs('sdc1', 'inst1', A[0], stamp)), /already exists/)
+        refused(await sb.run(borgExtractVerifyArgs('system', 'inst1', A[0], '20261112T001825001Z')), /a Backup Disk is never the system disk/)
+    })
+
+    it('quarantineBackupsArgs moves backups/ and prints the dest path the Engine reads', async () => {
+        await fs.writeFile(path.join(bk, 'backups', 'inst1', 'kept.txt'), 'keep-me')
+        const r = await sb.run(quarantineBackupsArgs('sdc1'))
+        expect(r.exitCode, r.stderr).toBe(0)
+        const dest = r.stdout.trim().split(/\r?\n/).filter(Boolean).pop() as string
+        expect(dest.startsWith(path.join(bk, '.idea-quarantine', 'backups-'))).toBe(true)
+        expect(path.basename(dest)).toMatch(/^backups-[0-9]{8}T[0-9]{6,15}Z$/)
+        expect(await fs.pathExists(path.join(dest, 'inst1', 'kept.txt'))).toBe(true)
+        expect(await fs.pathExists(path.join(bk, 'backups'))).toBe(false)
+        refused(await sb.run(quarantineBackupsArgs('system')), /a Backup Disk is never the system disk/)
+    })
+
+    it('Engine builders refuse bad tokens before the helper runs, with the same token rules as RE_ARCHIVE / RE_STAMP', async () => {
+        expect(() => borgListArgs('sdc1', 'inst1', 'latest')).toThrow(/not a backup archive name/)
+        expect(() => borgExtractVerifyArgs('sdc1', 'inst1', A[0], '2026-11-12T00:18:25Z')).toThrow(/not a UTC stamp/)
+        expect(() => borgExtractVerifyArgs('sdc1', 'inst1', A[0], '-20261112T001825Z')).toThrow(/not a UTC stamp/)
+        expect(() => quarantineBackupsArgs('/disks/sdc1')).toThrow(/not a disk root/)
+        expect(await sb.calls('borg')).toEqual([])
     })
 })
 

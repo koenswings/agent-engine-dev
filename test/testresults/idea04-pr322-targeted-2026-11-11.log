@@ -1,0 +1,597 @@
+Suite: targeted | Wed 11 Nov 2026 14:13:00 UTC | Branch:  | Commit: 40ca28bee02d3a9e66822766c2938f606500bfc5
+Host: idea04 root_src=/dev/sdb2 temp=50.1'C load=1.10 0.62 0.74 1/342 90527
+Isolation: IDEA_SYSTEM_DISK_SKIP=true IDEA_WATCH_DIR=/tmp/idea-test-vkKaPm/watch IDEA_DISKS_ROOT=/tmp/idea-test-vkKaPm/disks IDEA_CONFIG_FILE=/tmp/idea-test-vkKaPm/config.yaml IDEA_TEST_ALLOW_LIVE=1 IDEA_NETWORK_TESTS=<unset> build=dist-test maxWorkers=1
+Files: dist-test/test/automated/client-cards.test.js dist-test/test/automated/erase-whole-disk-checks.test.js dist-test/test/automated/erase-disk.test.js dist-test/test/automated/erase-busy-files-mounts.test.js dist-test/test/automated/stop-persists-redock.test.js dist-test/test/automated/files-disk-detection.test.js dist-test/test/automated/system-disk-eject.test.js dist-test/test/automated/system-disk-paths.test.js
+---
+
+ RUN  v4.1.2 /home/pi/axle-322
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > a user-stopped instance stays Stopped across the startup undock + re-add (the r49 pool failure)
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > a user-stopped instance stays Stopped across the startup undock + re-add (the r49 pool failure)
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > a user-stopped instance stays Stopped across the startup undock + re-add (the r49 pool failure)
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > a user-stopped instance stays Stopped across the startup undock + re-add (the r49 pool failure)
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+ ✓ dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > a user-stopped instance stays Stopped across the startup undock + re-add (the r49 pool failure) 2609ms
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > stays Stopped over repeated restarts
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > stays Stopped over repeated restarts
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > stays Stopped over repeated restarts
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > stays Stopped over repeated restarts
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > stays Stopped over repeated restarts
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > stays Stopped over repeated restarts
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > stays Stopped over repeated restarts
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > stays Stopped over repeated restarts
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+ ✓ dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > stays Stopped over repeated restarts 3948ms
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > regression: a Running instance whose container is gone is auto-started after the restart
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > regression: a Running instance whose container is gone is auto-started after the restart
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+ ✓ dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > regression: a Running instance whose container is gone is auto-started after the restart 1941ms
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > replug: a user-stopped instance stays Stopped after a physical unplug + replug
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > replug: a user-stopped instance stays Stopped after a physical unplug + replug
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > replug: a user-stopped instance stays Stopped after a physical unplug + replug
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > replug: a user-stopped instance stays Stopped after a physical unplug + replug
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+ ✓ dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > replug: a user-stopped instance stays Stopped after a physical unplug + replug 2104ms
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > replug: a Running instance is auto-started again (regression)
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > replug: a Running instance is auto-started again (regression)
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+ ✓ dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > replug: a Running instance is auto-started again (regression) 2039ms
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > replug: an instance the Engine stopped itself (backup-pre-stop, interrupted) is started again
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > replug: an instance the Engine stopped itself (backup-pre-stop, interrupted) is started again
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > replug: an instance the Engine stopped itself (backup-pre-stop, interrupted) is started again
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > replug: an instance the Engine stopped itself (backup-pre-stop, interrupted) is started again
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+ ✓ dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > replug: an instance the Engine stopped itself (backup-pre-stop, interrupted) is started again 2056ms
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > a user start after the user stop ends it: the next restart auto-starts again
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > a user start after the user stop ends it: the next restart auto-starts again
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > a user start after the user stop ends it: the next restart auto-starts again
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > a user start after the user stop ends it: the next restart auto-starts again
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > a user start after the user stop ends it: the next restart auto-starts again
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > a user start after the user stop ends it: the next restart auto-starts again
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+ ✓ dist-test/test/automated/stop-persists-redock.test.js > testMode (Path A pool): restart undocks and re-adds every disk > a user start after the user stop ends it: the next restart auto-starts again 2846ms
+lsblk: /dev/sdq1: not a block device
+stdout | dist-test/test/automated/stop-persists-redock.test.js > production mode (testMode off): real startup disk scan and USB add > normal boot, disk still attached: no startup undock, the initial add keeps it Stopped
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > production mode (testMode off): real startup disk scan and USB add > normal boot, disk still attached: no startup undock, the initial add keeps it Stopped
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+lsblk: /dev/sdq1: not a block device
+lsblk: /dev/sdr1: not a block device
+stdout | dist-test/test/automated/stop-persists-redock.test.js > production mode (testMode off): real startup disk scan and USB add > boot where the disk shows up late or under another device name: startup undock, then add, stays Stopped
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > production mode (testMode off): real startup disk scan and USB add > boot where the disk shows up late or under another device name: startup undock, then add, stays Stopped
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > production mode (testMode off): real startup disk scan and USB add > boot where the disk shows up late or under another device name: startup undock, then add, stays Stopped
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > production mode (testMode off): real startup disk scan and USB add > boot where the disk shows up late or under another device name: startup undock, then add, stays Stopped
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+lsblk: /dev/sds1: not a block device
+ ✓ dist-test/test/automated/stop-persists-redock.test.js > production mode (testMode off): real startup disk scan and USB add > normal boot, disk still attached: no startup undock, the initial add keeps it Stopped 1897ms
+ ✓ dist-test/test/automated/stop-persists-redock.test.js > production mode (testMode off): real startup disk scan and USB add > boot where the disk shows up late or under another device name: startup undock, then add, stays Stopped 2074ms
+lsblk: /dev/sdt1: not a block device
+stdout | dist-test/test/automated/stop-persists-redock.test.js > production mode (testMode off): real startup disk scan and USB add > regression: the same late/renamed boot still auto-starts a Running instance
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > production mode (testMode off): real startup disk scan and USB add > regression: the same late/renamed boot still auto-starts a Running instance
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+lsblk: /dev/sdu1: not a block device
+ ✓ dist-test/test/automated/stop-persists-redock.test.js > production mode (testMode off): real startup disk scan and USB add > regression: the same late/renamed boot still auto-starts a Running instance 1885ms
+lsblk: /dev/sdv1: not a block device
+stdout | dist-test/test/automated/stop-persists-redock.test.js > production mode (testMode off): real startup disk scan and USB add > hot unplug + replug of the USB disk: a user-stopped instance stays Stopped
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > production mode (testMode off): real startup disk scan and USB add > hot unplug + replug of the USB disk: a user-stopped instance stays Stopped
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > production mode (testMode off): real startup disk scan and USB add > hot unplug + replug of the USB disk: a user-stopped instance stays Stopped
+Stopping app 'sample-00000000-test1' on disk 'test-fixture-sample-v1' of engine 'ENGINE_5vyahbut147hw5dp4e1'.
+┌───────────────────────────────────┐
+│  Step 1/2  │  Finding containers  │
+└───────────────────────────────────┘
+
+stdout | dist-test/test/automated/stop-persists-redock.test.js > production mode (testMode off): real startup disk scan and USB add > hot unplug + replug of the USB disk: a user-stopped instance stays Stopped
+┌────────────────────────────────────┐
+│  Step 2/2  │  Stopping containers  │
+└────────────────────────────────────┘
+
+lsblk: /dev/sdv1: not a block device
+ ✓ dist-test/test/automated/stop-persists-redock.test.js > production mode (testMode off): real startup disk scan and USB add > hot unplug + replug of the USB disk: a user-stopped instance stays Stopped 2143ms
+ ✓ dist-test/test/automated/client-cards.test.js > client cards scanner (idea#201 §10) > lists a removable card as a clientCard with its reader; never the system disk or an IDEA disk 28ms
+ ✓ dist-test/test/automated/client-cards.test.js > client cards scanner (idea#201 §10) > a non-removable disk without META is a newDisk with the unformattedDisks candidateId (one id space) 10ms
+ ✓ dist-test/test/automated/client-cards.test.js > client cards scanner (idea#201 §10) > a mounted card (teacher stick) carries refusal MOUNTED; busy Engine → BUSY; no helper → HELPER_MISSING 6ms
+ ✓ dist-test/test/automated/client-cards.test.js > client cards scanner (idea#201 §10) > card id changes when the medium is swapped (same reader serial, other PTUUID) 4ms
+ ✓ dist-test/test/automated/client-cards.test.js > client cards scanner (idea#201 §10) > classifies contents read-only from labels 4ms
+ ✓ dist-test/test/automated/client-cards.test.js > client cards scanner (idea#201 §10) > refreshClientCards publishes the contract shapes on the Engine (no device/byId on ClientCard) 614ms
+ ✓ dist-test/test/automated/client-cards.test.js > client cards scanner (idea#201 §10) > no stale BUSY: a slow scan started while busy cannot overwrite the refresh that follows the flash 330ms
+ ✓ dist-test/test/automated/client-cards.test.js > client images (idea#201 §10, idea#202) > verifies SHA; current = newest verified, previous = next; bad/arriving never offered and never deleted 82ms
+ ✓ dist-test/test/automated/client-cards.test.js > client images (idea#201 §10, idea#202) > hashes an image once (cache by size+mtime), again when the file changes 14ms
+ ✓ dist-test/test/automated/client-cards.test.js > client images (idea#201 §10, idea#202) > parses sha256sum lines 4ms
+ ✓ dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > refuses with contract codes before any Operation exists 402ms
+stdout | dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > idea#208: passes the Engine's own validated zone as timezone; empty/invalid/missing → no timezone, flash still runs
+flashCard: idea-home.txt skipped: /usr/local/sbin/idea-flash-card is too old (version 3, needs >= 4); the client has no home Engine
+┌─────────────────────────┐
+│  Step 1/6  │  checking  │
+└─────────────────────────┘
+Flashing idea-client-26.04-20261016-f00748e.img.xz to sdb (/dev/disk/by-id/usb-STORAGE_DEVICE_000000001206-0:0, 32000000000 bytes), operation mutypfnlirae18xtr43
+
+stdout | dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > idea#208: passes the Engine's own validated zone as timezone; empty/invalid/missing → no timezone, flash still runs
+flashCard: idea-home.txt skipped: /usr/local/sbin/idea-flash-card is too old (version 3, needs >= 4); the client has no home Engine
+┌─────────────────────────┐
+│  Step 1/6  │  checking  │
+└─────────────────────────┘
+Flashing idea-client-26.04-20261016-f00748e.img.xz to sdb (/dev/disk/by-id/usb-STORAGE_DEVICE_000000001206-0:0, 32000000000 bytes), operation vw03hx9e5berfstravk
+
+stdout | dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > idea#208: passes the Engine's own validated zone as timezone; empty/invalid/missing → no timezone, flash still runs
+flashCard: idea-home.txt skipped: /usr/local/sbin/idea-flash-card is too old (version 3, needs >= 4); the client has no home Engine
+┌─────────────────────────┐
+│  Step 1/6  │  checking  │
+└─────────────────────────┘
+Flashing idea-client-26.04-20261016-f00748e.img.xz to sdb (/dev/disk/by-id/usb-STORAGE_DEVICE_000000001206-0:0, 32000000000 bytes), operation 4rxyv3uhvqquno0j40k
+
+stdout | dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > idea#208: passes the Engine's own validated zone as timezone; empty/invalid/missing → no timezone, flash still runs
+flashCard: idea-home.txt skipped: /usr/local/sbin/idea-flash-card is too old (version 3, needs >= 4); the client has no home Engine
+┌─────────────────────────┐
+│  Step 1/6  │  checking  │
+└─────────────────────────┘
+Flashing idea-client-26.04-20261016-f00748e.img.xz to sdb (/dev/disk/by-id/usb-STORAGE_DEVICE_000000001206-0:0, 32000000000 bytes), operation jqvunj7kw1lvam4u7q0
+
+stdout | dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > idea#208: passes the Engine's own validated zone as timezone; empty/invalid/missing → no timezone, flash still runs
+flashCard: idea-home.txt skipped: /usr/local/sbin/idea-flash-card is too old (version 3, needs >= 4); the client has no home Engine
+┌─────────────────────────┐
+│  Step 1/6  │  checking  │
+└─────────────────────────┘
+Flashing idea-client-26.04-20261016-f00748e.img.xz to sdb (/dev/disk/by-id/usb-STORAGE_DEVICE_000000001206-0:0, 32000000000 bytes), operation poaimokupjakp011r9f
+
+stdout | dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > idea#208: passes the Engine's own validated zone as timezone; empty/invalid/missing → no timezone, flash still runs
+flashCard: idea-home.txt skipped: /usr/local/sbin/idea-flash-card is too old (version 3, needs >= 4); the client has no home Engine
+┌─────────────────────────┐
+│  Step 1/6  │  checking  │
+└─────────────────────────┘
+Flashing idea-client-26.04-20261016-f00748e.img.xz to sdb (/dev/disk/by-id/usb-STORAGE_DEVICE_000000001206-0:0, 32000000000 bytes), operation chiy438lnusm2js1euj
+
+stdout | dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > idea#208: passes the Engine's own validated zone as timezone; empty/invalid/missing → no timezone, flash still runs
+flashCard: idea-home.txt skipped: /usr/local/sbin/idea-flash-card is too old (version 3, needs >= 4); the client has no home Engine
+┌─────────────────────────┐
+│  Step 1/6  │  checking  │
+└─────────────────────────┘
+Flashing idea-client-26.04-20261016-f00748e.img.xz to sdb (/dev/disk/by-id/usb-STORAGE_DEVICE_000000001206-0:0, 32000000000 bytes), operation r6w30irmsd0vxqhz6hh
+
+ ✓ dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > idea#208: passes the Engine's own validated zone as timezone; empty/invalid/missing → no timezone, flash still runs 782ms
+ ✓ dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > idea#203 §2: --home <engine name> only with helper v4+ and a valid name; otherwise skipped, logged, flash still ok 796ms
+ ✓ dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > never flashes the system disk even if it were listed as a card 161ms
+stdout | dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > runs the helper with the re-resolvable by-id, steps → Operation, Done with safeToRemove true; log line
+flashCard: idea-home.txt skipped: /usr/local/sbin/idea-flash-card is too old (version 3, needs >= 4); the client has no home Engine
+┌─────────────────────────┐
+│  Step 1/6  │  checking  │
+└─────────────────────────┘
+Flashing idea-client-26.04-20261016-f00748e.img.xz to sdb (/dev/disk/by-id/usb-STORAGE_DEVICE_000000001206-0:0, 32000000000 bytes), operation vv97us09czqx4bli25c
+
+stdout | dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > runs the helper with the re-resolvable by-id, steps → Operation, Done with safeToRemove true; log line
+┌────────────────────────┐
+│  Step 3/6  │  writing  │
+└────────────────────────┘
+
+stdout | dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > power-off failure: Done, safeToRemove false, POWER_OFF_FAILED in the message
+flashCard: idea-home.txt skipped: /usr/local/sbin/idea-flash-card is too old (version 3, needs >= 4); the client has no home Engine
+┌─────────────────────────┐
+│  Step 1/6  │  checking  │
+└─────────────────────────┘
+Flashing idea-client-26.04-20261016-f00748e.img.xz to sdb (/dev/disk/by-id/usb-STORAGE_DEVICE_000000001206-0:0, 32000000000 bytes), operation nj8pgggpip3xtf5gg4i
+
+ ✓ dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > runs the helper with the re-resolvable by-id, steps → Operation, Done with safeToRemove true; log line 223ms
+ ✓ dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > power-off failure: Done, safeToRemove false, POWER_OFF_FAILED in the message 208ms
+stdout | dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > helper refusal / failure → Failed "CODE: text"
+flashCard: idea-home.txt skipped: /usr/local/sbin/idea-flash-card is too old (version 3, needs >= 4); the client has no home Engine
+┌─────────────────────────┐
+│  Step 1/6  │  checking  │
+└─────────────────────────┘
+Flashing idea-client-26.04-20261016-f00748e.img.xz to sdb (/dev/disk/by-id/usb-STORAGE_DEVICE_000000001206-0:0, 32000000000 bytes), operation pj9lismpds3b4jikxog
+
+stdout | dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > one flash at a time: a second flashCard while one runs is BUSY
+flashCard: idea-home.txt skipped: /usr/local/sbin/idea-flash-card is too old (version 3, needs >= 4); the client has no home Engine
+┌─────────────────────────┐
+│  Step 1/6  │  checking  │
+└─────────────────────────┘
+Flashing idea-client-26.04-20261016-f00748e.img.xz to sdb (/dev/disk/by-id/usb-STORAGE_DEVICE_000000001206-0:0, 32000000000 bytes), operation 350o4xbyxgqpfx81ku1
+
+ ✓ dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > helper refusal / failure → Failed "CODE: text" 222ms
+ ✓ dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > one flash at a time: a second flashCard while one runs is BUSY 198ms
+stdout | dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > cancelFlash during writing → SIGTERM, Failed "CANCELLED: ..." (no Cancelled status)
+flashCard: idea-home.txt skipped: /usr/local/sbin/idea-flash-card is too old (version 3, needs >= 4); the client has no home Engine
+┌─────────────────────────┐
+│  Step 1/6  │  checking  │
+└─────────────────────────┘
+Flashing idea-client-26.04-20261016-f00748e.img.xz to sdb (/dev/disk/by-id/usb-STORAGE_DEVICE_000000001206-0:0, 32000000000 bytes), operation 7k6qvw73pr2ozuudoj9
+
+stdout | dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > cancelFlash during writing → SIGTERM, Failed "CANCELLED: ..." (no Cancelled status)
+┌────────────────────────┐
+│  Step 3/6  │  writing  │
+└────────────────────────┘
+
+stdout | dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > cancelFlash during writing → SIGTERM, Failed "CANCELLED: ..." (no Cancelled status)
+Cancel sent to flash 7k6qvw73pr2ozuudoj9
+
+stdout | dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > cancelFlash is refused once the write is done (reading-back) and for unknown ids
+flashCard: idea-home.txt skipped: /usr/local/sbin/idea-flash-card is too old (version 3, needs >= 4); the client has no home Engine
+┌─────────────────────────┐
+│  Step 1/6  │  checking  │
+└─────────────────────────┘
+Flashing idea-client-26.04-20261016-f00748e.img.xz to sdb (/dev/disk/by-id/usb-STORAGE_DEVICE_000000001206-0:0, 32000000000 bytes), operation zat9ky39unxdyffy3u0
+
+stdout | dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > cancelFlash is refused once the write is done (reading-back) and for unknown ids
+┌─────────────────────────────┐
+│  Step 4/6  │  reading-back  │
+└─────────────────────────────┘
+
+ ✓ dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > cancelFlash during writing → SIGTERM, Failed "CANCELLED: ..." (no Cancelled status) 216ms
+ ✓ dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > cancelFlash is refused once the write is done (reading-back) and for unknown ids 210ms
+ ✓ dist-test/test/automated/client-cards.test.js > flashCard / cancelFlash (idea#201 §10) > an interrupted flash is failed INTERRUPTED with safeToRemove false at startup (never retried) 123ms
+stdout | dist-test/test/automated/client-cards.test.js > initialiseDisk (idea#201 §10, NOT_EXT4) > ro look, rw mount and META.yaml only then; registers the disk; Operation Done
+┌─────────────────────────┐
+│  Step 1/3  │  checking  │
+└─────────────────────────┘
+
+stdout | dist-test/test/automated/client-cards.test.js > initialiseDisk (idea#201 §10, NOT_EXT4) > ro look, rw mount and META.yaml only then; registers the disk; Operation Done
+┌──────────────────────────────────┐
+│  Step 2/3  │  writing META.yaml  │
+└──────────────────────────────────┘
+
+stdout | dist-test/test/automated/client-cards.test.js > initialiseDisk (idea#201 §10, NOT_EXT4) > ro look, rw mount and META.yaml only then; registers the disk; Operation Done
+┌────────────────────────────┐
+│  Step 3/3  │  registering  │
+└────────────────────────────┘
+
+stdout | dist-test/test/automated/client-cards.test.js > initialiseDisk (idea#201 §10, NOT_EXT4) > ro look, rw mount and META.yaml only then; registers the disk; Operation Done
+Initialised sdd1 (SSD9) as IDEA disk 4cre8txccx123v7cjjw (empty)
+
+ ✓ dist-test/test/automated/client-cards.test.js > initialiseDisk (idea#201 §10, NOT_EXT4) > ro look, rw mount and META.yaml only then; registers the disk; Operation Done 255ms
+stdout | dist-test/test/automated/client-cards.test.js > initialiseDisk (idea#201 §10, NOT_EXT4) > ALREADY_IDEA when the ro look finds META.yaml: never mounted rw, nothing written
+┌─────────────────────────┐
+│  Step 1/3  │  checking  │
+└─────────────────────────┘
+
+ ✓ dist-test/test/automated/client-cards.test.js > initialiseDisk (idea#201 §10, NOT_EXT4) > NOT_EXT4 for a non-ext4 new disk (also listed in unformattedDisks with the same id); nothing mounted or written 205ms
+ ✓ dist-test/test/automated/client-cards.test.js > initialiseDisk (idea#201 §10, NOT_EXT4) > ALREADY_IDEA when the ro look finds META.yaml: never mounted rw, nothing written 200ms
+ ✓ dist-test/test/automated/client-cards.test.js > initialiseDisk (idea#201 §10, NOT_EXT4) > refuses cards, unknown ids and bad roles 173ms
+ ✓ dist-test/test/automated/client-cards.test.js > capabilities + helper script (idea#201 §10) > parseFlashHelperVersion: "idea-flash-card N" only; anything else is unknown (null) 2ms
+ ✓ dist-test/test/automated/client-cards.test.js > capabilities + helper script (idea#201 §10) > clientCards and clientImages always; flashCard only with the helper installed 3ms
+ ✓ dist-test/test/automated/client-cards.test.js > capabilities + helper script (idea#201 §10) > helper parses (bash -n) and reports its version 26ms
+ ✓ dist-test/test/automated/client-cards.test.js > capabilities + helper script (idea#201 §10) > helper refuses bad arguments before touching any device (exit 2, BAD_ARGS) 125ms
+ ✓ dist-test/test/automated/client-cards.test.js > capabilities + helper script (idea#201 §10) > sudoers allows the helper (validated by itself) 3ms
+ ✓ dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > one candidate per physical disk with its actions; same candidateId across the legacy lists 99ms
+ ✓ dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > card reader vs stick: reader-like model, or seen without a medium, stays an SD card 95ms
+stdout | dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > SSD flash target: the helper gets the SSD by-id (usb-*), size and image
+flashCard: idea-home.txt skipped: /usr/local/sbin/idea-flash-card is too old (version 3, needs >= 4); the client has no home Engine
+┌─────────────────────────┐
+│  Step 1/6  │  checking  │
+└─────────────────────────┘
+Flashing idea-client-26.04-20261016-f00748e.img.xz to sdd (/dev/disk/by-id/usb-Foreign_SSD_SSD9-0:0, 240000000000 bytes), operation qw845sq0rjvwvehspkq
+
+stdout | dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > old Engine disk (OS rootfs on sdX2, idea#303 Steve 2026-10-25): flash or erase (idea#310), no initialise; initialiseDisk refuses OS_ROOTFS
+┌─────────────────────────┐
+│  Step 1/3  │  checking  │
+└─────────────────────────┘
+
+ ✓ dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > SSD flash target: the helper gets the SSD by-id (usb-*), size and image 150ms
+stdout | dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > #236: a non-empty root-owned ext4 (not an OS disk) is refused NOT_EMPTY, naming what was found; nothing written
+┌─────────────────────────┐
+│  Step 1/3  │  checking  │
+└─────────────────────────┘
+
+ ✓ dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > old Engine disk (OS rootfs on sdX2, idea#303 Steve 2026-10-25): flash or erase (idea#310), no initialise; initialiseDisk refuses OS_ROOTFS 191ms
+stdout | dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > #236: an empty root-owned ext4 (only lost+found) and a non-root-owned one are not refused NOT_EMPTY
+┌─────────────────────────┐
+│  Step 1/3  │  checking  │
+└─────────────────────────┘
+
+stdout | dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > #236: an empty root-owned ext4 (only lost+found) and a non-root-owned one are not refused NOT_EMPTY
+┌──────────────────────────────────┐
+│  Step 2/3  │  writing META.yaml  │
+└──────────────────────────────────┘
+
+stdout | dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > #236: an empty root-owned ext4 (only lost+found) and a non-root-owned one are not refused NOT_EMPTY
+┌─────────────────────────┐
+│  Step 1/3  │  checking  │
+└─────────────────────────┘
+
+stdout | dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > #236: an empty root-owned ext4 (only lost+found) and a non-root-owned one are not refused NOT_EMPTY
+┌──────────────────────────────────┐
+│  Step 2/3  │  writing META.yaml  │
+└──────────────────────────────────┘
+
+ ✓ dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > #236: a non-empty root-owned ext4 (not an OS disk) is refused NOT_EMPTY, naming what was found; nothing written 150ms
+ ✓ dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > #236: an empty root-owned ext4 (only lost+found) and a non-root-owned one are not refused NOT_EMPTY 177ms
+ ✓ dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > idea#311: an ejected IDEA disk (valid META.yaml, no IDEA-IGNORE) left plugged in is not offered initialise 94ms
+ ✓ dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > idea#311: a disk with META.yaml and an IDEA-IGNORE marker keeps initialise (teacher may re-take it) 91ms
+ ✓ dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > console#163: an IDEA-IGNORE disk is published with ignored: true and keeps its actions 96ms
+ ✓ dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > console#163: a disk without IDEA-IGNORE has no ignored key (omitted, not false) 90ms
+ ✓ dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > refuses a docked IDEA SSD, a mounted USB disk and the system disk; nothing is spawned 175ms
+ ✓ dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > reader first seen WITH a card in it: a reader-like model is an SD card at once (flash only) 99ms
+ ✓ dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > empty reader that gets a card later: remembered from size 0, the card is an SD card (flash only) 95ms
+stdout | dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > old Engine stick (OS rootfs + META.yaml, the "anna" case) is flashable: not HAS_IDEA_META, helper told --os-rootfs
+flashCard: idea-home.txt skipped: /usr/local/sbin/idea-flash-card is too old (version 3, needs >= 4); the client has no home Engine
+┌─────────────────────────┐
+│  Step 1/6  │  checking  │
+└─────────────────────────┘
+Flashing idea-client-26.04-20261016-f00748e.img.xz to sdk (/dev/disk/by-id/usb-Flash_Drive_ANNA1-0:0, 64000000000 bytes), operation l8yxaa6ownrm88zk57q
+
+ ✓ dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > old Engine stick (OS rootfs + META.yaml, the "anna" case) is flashable: not HAS_IDEA_META, helper told --os-rootfs 156ms
+stdout | dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > a real App/Files/Backup disk (META.yaml, no OS rootfs) that is not docked: helper gets no --os-rootfs, so it refuses HAS_IDEA_META
+flashCard: idea-home.txt skipped: /usr/local/sbin/idea-flash-card is too old (version 3, needs >= 4); the client has no home Engine
+┌─────────────────────────┐
+│  Step 1/6  │  checking  │
+└─────────────────────────┘
+Flashing idea-client-26.04-20261016-f00748e.img.xz to sdl (/dev/disk/by-id/usb-App_SSD_APP1-0:0, 240000000000 bytes), operation 0grxukxwvjasadle9a6
+
+ ✓ dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > a real App/Files/Backup disk (META.yaml, no OS rootfs) that is not docked: helper gets no --os-rootfs, so it refuses HAS_IDEA_META 167ms
+ ✓ dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > helper META check (the real bash block): META.yaml refused unless that partition is named --os-rootfs 185ms
+ ✓ dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > helper: --os-rootfs must be partition 1 or 2 of the target device 147ms
+ ✓ dist-test/test/automated/client-cards.test.js > disk roles: USB disks get both roles, SD cards flash only (idea#303) > helper: accepts removable=1 or tran=usb, everything else unchanged 91ms
+ ✓ dist-test/test/automated/files-disk-detection.test.js > Files Disk detection (idea#131) > a Files Disk gets [files], filesConfig from FILES.yaml, and its size and free space 572ms
+ ✓ dist-test/test/automated/files-disk-detection.test.js > Files Disk detection (idea#131) > a password in FILES.yaml: passwordProtected with the error; the password never reaches the store 349ms
+ ✓ dist-test/test/automated/files-disk-detection.test.js > Files Disk detection (idea#131) > a missing shareName falls back to the disk name 194ms
+ ✓ dist-test/test/automated/files-disk-detection.test.js > Files Disk detection (idea#131) > an empty disk stays [empty] with no filesConfig 182ms
+ ✓ dist-test/test/automated/files-disk-detection.test.js > Files Disk detection (idea#131) > combined disks: [app, files] and [app, backup, files], in that order 967ms
+ ✓ dist-test/test/automated/files-disk-detection.test.js > Files Disk detection (idea#131) > processDisk runs Files before App: filesConfig is written before the App is registered 429ms
+ ✓ dist-test/test/automated/files-disk-detection.test.js > Files Disk detection (idea#131) > a Files-role error (bad FILES.yaml) is recorded as a failed diskDetection trace; App and Backup still run 502ms
+ ✓ dist-test/test/automated/files-disk-detection.test.js > Files Disk detection (idea#131) > FILES.yaml removed at runtime: the next processDisk drops the role and filesConfig 664ms
+ ✓ dist-test/test/automated/files-disk-detection.test.js > Files Disk detection (idea#131) > undock clears filesConfig, sizeBytes and freeBytes; a redock resets filesConfig until processDisk 256ms
+ ✓ dist-test/test/automated/files-disk-detection.test.js > Files Disk detection (idea#131) > a stale record cleared from the same device loses filesConfig and size too 188ms
+ ✓ dist-test/test/automated/files-disk-detection.test.js > Disk size and free space (idea#131) > write rule: first value, size change, or free space moved by more than 1% of the size or 100 MB 2ms
+ ✓ dist-test/test/automated/files-disk-detection.test.js > Disk size and free space (idea#131) > readDiskSize uses statfs and rounds to whole MB 1ms
+ ✓ dist-test/test/automated/files-disk-detection.test.js > Disk size and free space (idea#131) > updateDiskSize skips a small change unless forced; the 10-minute pass only touches disks docked here 138ms
+ ✓ dist-test/test/automated/files-disk-detection.test.js > Disk size and free space (idea#131) > diskFsRoot gives the mount point the size is read from 1ms
+ ✓ dist-test/test/automated/files-disk-detection.test.js > share name rule (idea#131, E6) > accepts 1–16 characters from A–Z a–z 0–9 space - _ ( ) 2ms
+ ✓ dist-test/test/automated/files-disk-detection.test.js > share name rule (idea#131, E6) > refuses over 16 bytes, other characters, empty, and a leading or trailing space 2ms
+cat: /sys/block/sdd/device/model: No such file or directory
+ ✓ dist-test/test/automated/erase-disk.test.js > system disk helper + mount command (idea#134) > driveNameOf handles sd / mmcblk / nvme 9ms
+ ✓ dist-test/test/automated/erase-disk.test.js > system disk helper + mount command (idea#134) > isSystemDevice uses findmnt + PKNAME (USB system disk) 4ms
+ ✓ dist-test/test/automated/erase-disk.test.js > system disk helper + mount command (idea#134) > Engine mount command matches the sudoers typed entry exactly 3ms
+ ✓ dist-test/test/automated/erase-disk.test.js > system disk helper + mount command (idea#134) > ENGINE_CAPABILITIES includes eraseDisk 3ms
+cat: /sys/block/sde/device/model: No such file or directory
+ ✓ dist-test/test/automated/erase-disk.test.js > unformattedDisks scan (idea#134) > lists whole non-system disks without ext4; skips system and ext4 disks 80ms
+ ✓ dist-test/test/automated/erase-disk.test.js > unformattedDisks scan (idea#134) > a removable medium (client card / card reader) is never listed (idea#201 §10) 20ms
+ ✓ dist-test/test/automated/erase-disk.test.js > unformattedDisks scan (idea#134) > labels get (2) on a clash (display only) 2ms
+ ✓ dist-test/test/automated/erase-disk.test.js > unformattedDisks scan (idea#134) > a disk with ext4 on partition 3 is not listed 2ms
+ ✓ dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > summariseDisk on an unformatted candidate: readable false, no walk 396ms
+ ✓ dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > eraseDisk refuses: unknown target, label mismatch, missing/old summary, system disk 347ms
+stdout | dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > eraseDisk success on unformatted: fake script, staging META-only, empty disk published
+Erased SanDisk 32 GB → empty IDEA disk CAND1
+
+ ✓ dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > eraseDisk success on unformatted: fake script, staging META-only, empty disk published 493ms
+ ✓ dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > idea#310: summariseDisk finds an OS-rootfs diskCandidate (readable false, label from model + size) 200ms
+stdout | dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > idea#310: eraseDisk erases an OS-rootfs diskCandidate through the normal helper path
+Erased WDS120G2G0A 120 GB → empty IDEA disk OLDENG
+
+ ✓ dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > idea#310: eraseDisk erases an OS-rootfs diskCandidate through the normal helper path 413ms
+ ✓ dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > idea#310: a diskCandidate without the erase action (e.g. plain ext4 → initialise) is not resolved 155ms
+ ✓ dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > idea#310: OS-rootfs diskCandidate keeps the system-disk and mounted refusals 233ms
+stdout | dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > post-erase add goes through the real erase-lock guard and is not refused (wh 2026-10-12)
+Erased SanDisk 32 GB → empty IDEA disk CAND1
+
+ ✓ dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > post-erase add goes through the real erase-lock guard and is not refused (wh 2026-10-12) 313ms
+ ✓ dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > eraseLockRefusesAdd: partition and whole drive of a locked erase are refused, others not 129ms
+ ✓ dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > second concurrent erase is refused 133ms
+stdout | dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > post-erase add looks again: a "no META.yaml" look cached before the erase does not decide it (happy-zebra 2026-10-17)
+Erased SanDisk 32 GB → empty IDEA disk CAND1
+
+ ✓ dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > post-erase add looks again: a "no META.yaml" look cached before the erase does not decide it (happy-zebra 2026-10-17) 256ms
+ ✓ dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > clearStaleEraseStaging removes leftover folders 109ms
+ ✓ dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > isSlotEraseDevice detects idea-test-N only 114ms
+stdout | dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > eraseDisk loop slot success: runSlotErase, not runScript; remounts as empty
+Erased Duration Tests — Empty Disk 002 → empty IDEA disk duration-empty-002
+
+ ✓ dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > eraseDisk loop slot success: runSlotErase, not runScript; remounts as empty 439ms
+ ✓ dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > eraseDisk loop slot: still-mounted refusal when umount really fails 200ms
+ ✓ dist-test/test/automated/erase-disk.test.js > summariseDisk + eraseDisk (idea#134) > eraseDisk USB path refuses when still mounted (unchanged) 217ms
+ ✓ dist-test/test/automated/erase-whole-disk-checks.test.js > eraseDisk whole-disk checks and remount on failure (#188) > processDisk follows the mocked root device, not the host findmnt / (sda2 or sdb2) 410ms
+ ✓ dist-test/test/automated/erase-whole-disk-checks.test.js > eraseDisk whole-disk checks and remount on failure (#188) > refuses before any unmount or store change when a sibling partition on the same disk is mounted 518ms
+ ✓ dist-test/test/automated/erase-whole-disk-checks.test.js > eraseDisk whole-disk checks and remount on failure (#188) > refuses a disk whose store record is the system disk even when its device name now points at another drive 222ms
+ ✓ dist-test/test/automated/erase-whole-disk-checks.test.js > eraseDisk whole-disk checks and remount on failure (#188) > #235: a teacher-stick sibling under the USB root does not block; it is unmounted before the wipe 466ms
+ ✓ dist-test/test/automated/erase-whole-disk-checks.test.js > eraseDisk whole-disk checks and remount on failure (#188) > #235: a stick that is still mounted after the stick unmount refuses, nothing wiped 278ms
+ ✓ dist-test/test/automated/erase-whole-disk-checks.test.js > eraseDisk whole-disk checks and remount on failure (#188) > #235: a mounted EFI System Partition (even as a stick) means an OS disk: refuse, nothing wiped 205ms
+ ✓ dist-test/test/automated/erase-whole-disk-checks.test.js > eraseDisk whole-disk checks and remount on failure (#188) > #235: a partition type that cannot be read refuses (fail closed) 184ms
+ ✓ dist-test/test/automated/erase-whole-disk-checks.test.js > eraseDisk whole-disk checks and remount on failure (#188) > #235: isEspPartType recognises GPT and MBR ESP types only 109ms
+ ✓ dist-test/test/automated/erase-whole-disk-checks.test.js > eraseDisk whole-disk checks and remount on failure (#188) > #235: a sibling mounted anywhere else (not a stick) still refuses up front 217ms
+ ✓ dist-test/test/automated/erase-whole-disk-checks.test.js > eraseDisk whole-disk checks and remount on failure (#188) > the target partition itself being mounted is not a sibling 261ms
+ ✓ dist-test/test/automated/erase-whole-disk-checks.test.js > eraseDisk whole-disk checks and remount on failure (#188) > refuses an unformatted candidate whose partition is mounted 135ms
+ ✓ dist-test/test/automated/erase-whole-disk-checks.test.js > eraseDisk whole-disk checks and remount on failure (#188) > a failure after unmounting mounts and registers the partition again 252ms
+stdout | dist-test/test/automated/erase-whole-disk-checks.test.js > eraseDisk whole-disk checks and remount on failure (#188) > a successful erase does not trigger the failure remount
+Erased Files F → empty IDEA disk f-disk
+
+ ✓ dist-test/test/automated/erase-whole-disk-checks.test.js > eraseDisk whole-disk checks and remount on failure (#188) > a successful erase does not trigger the failure remount 307ms
+ ✓ dist-test/test/automated/erase-whole-disk-checks.test.js > eraseDisk whole-disk checks and remount on failure (#188) > refuses before any unmount when the partition table has a partition the kernel does not show (idea01 sda1) 164ms
+ ✓ dist-test/test/automated/erase-whole-disk-checks.test.js > eraseDisk whole-disk checks and remount on failure (#188) > fails closed when the partition table cannot be checked (old root helper) 154ms
+ ✓ dist-test/test/automated/erase-whole-disk-checks.test.js > eraseDisk whole-disk checks and remount on failure (#188) > refuses an unformatted candidate with a hidden partition 126ms
+ ✓ dist-test/test/automated/erase-whole-disk-checks.test.js > eraseDisk whole-disk checks and remount on failure (#188) > parseHiddenPartitions reads the helper output 98ms
+ ✓ dist-test/test/automated/erase-busy-files-mounts.test.js > eraseDisk refuses a disk held by another instance (filesMounts / volumes) > refuses before touching anything and names the Nextcloud instance using the Files Disk 695ms
+ ✓ dist-test/test/automated/erase-busy-files-mounts.test.js > eraseDisk refuses a disk held by another instance (filesMounts / volumes) > ignores stopped instances and instances stored on the target disk itself 426ms
+ ✓ dist-test/test/automated/erase-busy-files-mounts.test.js > eraseDisk refuses a disk held by another instance (filesMounts / volumes) > detects an app volume whose host path is under the disk mount root (compose.yaml) 246ms
+ ✓ dist-test/test/automated/erase-busy-files-mounts.test.js > eraseDisk refuses a disk held by another instance (filesMounts / volumes) > message lists several instances 124ms
+ ✓ dist-test/test/automated/system-disk-eject.test.js > system drive detection (idea#152) > driveOf strips the partition number 9ms
+ ✓ dist-test/test/automated/system-disk-eject.test.js > system drive detection (idea#152) > root sda2: sda2 and sda1 are on the system drive, sdb1 and test devices are not 4ms
+ ✓ dist-test/test/automated/system-disk-eject.test.js > system drive detection (idea#152) > root on SD card: mmcblk0p1 counts, sda1 does not 1ms
+ ✓ dist-test/test/automated/system-disk-eject.test.js > system drive detection (idea#152) > an unrecognised root (overlay, container) matches nothing 1ms
+ ✓ dist-test/test/automated/system-disk-eject.test.js > system drive detection (idea#152) > isSystemDiskRecord: by marker or by device 3ms
+ ✓ dist-test/test/automated/system-disk-eject.test.js > ejectDisk never ejects the system disk (idea#152) > by id: refused, trace ends as error, record stays docked 474ms
+stderr | dist-test/test/automated/system-disk-eject.test.js > ejectDisk never ejects the system disk (idea#152) > by name: refused the same way
+ejectDisk: disk 'System Disk' was given by name; use the disk id sys (names are deprecated, idea#128).
+
+ ✓ dist-test/test/automated/system-disk-eject.test.js > ejectDisk never ejects the system disk (idea#152) > by name: refused the same way 310ms
+ ✓ dist-test/test/automated/system-disk-eject.test.js > ejectDisk never ejects the system disk (idea#152) > by device: a record on the root or boot partition is refused even without the marker 250ms
+stdout | dist-test/test/automated/system-disk-eject.test.js > ejectDisk never ejects the system disk (idea#152) > another disk still ejects
+Ejecting disk 'writable' (usb)...
+
+stdout | dist-test/test/automated/system-disk-eject.test.js > ejectDisk never ejects the system disk (idea#152) > another disk still ejects
+Disk 'writable' (usb) ejected successfully.
+
+ ✓ dist-test/test/automated/system-disk-eject.test.js > ejectDisk never ejects the system disk (idea#152) > another disk still ejects 166ms
+ ✓ dist-test/test/automated/system-disk-eject.test.js > ejectDisk never ejects the system disk (idea#152) > undock on device removal leaves the system disk record docked 167ms
+ ✓ dist-test/test/automated/system-disk-paths.test.js > joinMountRoot / diskPath (idea#237) > system disk: /instances/<id>, absolute; diskMountRoot itself stays "" 10ms
+ ✓ dist-test/test/automated/system-disk-paths.test.js > joinMountRoot / diskPath (idea#237) > regular disk: <disksRoot>/<device>/… unchanged 3ms
+
+ Test Files  8 passed (8)
+      Tests  132 passed (132)
+   Start at  15:13:01
+   Duration  70.37s (transform 2.98s, setup 0ms, import 17.05s, tests 49.31s, environment 3ms)
+

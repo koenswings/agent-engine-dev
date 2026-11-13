@@ -149,6 +149,8 @@ describe('tailscale-debug-activate.sh (idea#115)', () => {
         expect(script).to.include('--auth-key="file:$AUTH_KEY_FILE"')
         expect(script).to.not.match(/\$\(cat "\$AUTH_KEY_FILE"\)/)
         expect(script).to.not.match(/--authkey /)
+        expect(script).to.match(/^\s*--advertise-tags=tag:idea\s*\\?$/m)
+        expect(script).to.not.match(/^\s*--ephemeral\b/m)
     })
 
     it('installTailscale no longer builds an echo <key> | tee command', () => {

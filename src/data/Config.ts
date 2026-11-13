@@ -276,9 +276,18 @@ if (process.env.IDEA_STORE_DIR) {
 
 // Allow IDEA_SYSTEM_DISK_SKIP=true to skip registering the Pi boot disk as a system disk.
 // Used by Kit's test harness to avoid conflicts with the production engine on the same Pi.
+const systemDiskSkipInConfigFile = config.settings.systemDiskSkip === true;
 if (process.env.IDEA_SYSTEM_DISK_SKIP === 'true') {
     config.settings.systemDiskSkip = true;
 }
+
+/** idea#449: where settings.systemDiskSkip came from, for log lines (config.yaml or the env). */
+export const systemDiskSkipSource = (): string => {
+    const env = process.env.IDEA_SYSTEM_DISK_SKIP === 'true';
+    if (env && systemDiskSkipInConfigFile) return 'config.yaml settings.systemDiskSkip and IDEA_SYSTEM_DISK_SKIP=true';
+    if (env) return 'IDEA_SYSTEM_DISK_SKIP=true';
+    return 'config.yaml settings.systemDiskSkip';
+};
 
 // Allow IDEA_MDNS_DISABLE=true to suppress mDNS advertisement and peer discovery.
 // Used by Kit's test harness to prevent the test engine from conflicting with the
@@ -417,7 +426,7 @@ export const skipHardwareId = (): boolean => config.settings.skipHardwareId ?? (
  * diskId / format rewrite) and whether a missing system /META.yaml may NOT be
  * created (idea#168). Unset: follows isDev || testMode (the old gate). Disk META
  * files under a pi-owned IDEA_DISKS_ROOT are written as pi; /META.yaml and
- * /disks/sd[a-z][12]/META.yaml go through the sudoers-allowed tee (writeMetaFile).
+ * /disks/sd[a-z][1-9]/META.yaml go through the sudoers-allowed tee (writeMetaFile).
  * Separate from skipMetaWrite (the FIRST write on a disk without META.yaml).
  */
 export const skipMetaUpdate = (): boolean => config.settings.skipMetaUpdate ?? (config.settings.isDev || config.settings.testMode);

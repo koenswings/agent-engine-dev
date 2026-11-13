@@ -1,0 +1,22 @@
+{
+    "cache": {
+        "path": "/root/.cache/borg/e402d571c3822d1a930681f935a92871a2e253d876facbad812baa7aa2f766b8",
+        "stats": {
+            "total_chunks": 12,
+            "total_csize": 33,
+            "total_size": 15,
+            "total_unique_chunks": 6,
+            "unique_csize": 1900,
+            "unique_size": 2383
+        }
+    },
+    "encryption": {
+        "mode": "none"
+    },
+    "repository": {
+        "id": "e402d571c3822d1a930681f935a92871a2e253d876facbad812baa7aa2f766b8",
+        "last_modified": "2026-11-12T03:27:22.000000",
+        "location": "/disks/sdc1/backups/inst-1"
+    },
+    "security_dir": "/root/.config/borg/security/e402d571c3822d1a930681f935a92871a2e253d876facbad812baa7aa2f766b8"
+}

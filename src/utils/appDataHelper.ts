@@ -27,7 +27,8 @@ import fs from 'fs'
 import { $ } from 'zx'
 import { log } from './utils.js'
 import { config } from '../data/Config.js'
-import { peerSshArgv, checkEngineId } from './peerSsh.js'
+import { peerSshArgv, checkEngineId, normaliseEd25519 } from './peerSsh.js'
+import { normalizeBackupExclude } from './backupExclude.js'
 
 /** Installed path of the helper (a root-owned copy, 0755; build-engine installUdev). */
 export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
@@ -37,7 +38,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '5'
+export const APP_DATA_HELPER_VERSION = '12'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -46,9 +47,11 @@ export const APP_DATA_HELPER_UPDATE =
 /** The borg binary idea-app-data runs by absolute path (BORG= in the helper; Debian package borgbackup). */
 export const BORG_PATH = '/usr/bin/borg'
 
-const ROOT_TOKEN = /^(system|sd[a-z][12]|[a-z0-9][a-z0-9-]{0,63})$/
+const ROOT_TOKEN = /^(system|sd[a-z][1-9]|[a-z0-9][a-z0-9-]{0,63})$/
 const ID_TOKEN = /^[a-z0-9][a-z0-9-]{0,63}$/
 const ARCHIVE_TOKEN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9-]{8,16}Z$/
+/** UTC stamp for .idea-verify/<id>-<stamp>/ (idea#446). No path separators. */
+const STAMP_TOKEN = /^[0-9]{8}T[0-9]{6,15}Z$/
 const APP_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 
 const checkRoot = (root: string): string => {
@@ -66,6 +69,18 @@ const checkApp = (appId: string): string => {
 const checkArchive = (archive: string): string => {
     if (!ARCHIVE_TOKEN.test(archive)) throw new Error(`'${archive}' is not a backup archive name the app-data helper accepts`)
     return archive
+}
+export const checkStamp = (stamp: string): string => {
+    if (stamp.startsWith('-') || stamp.includes('/') || stamp.includes('..') || !STAMP_TOKEN.test(stamp)) {
+        throw new Error(`'${stamp}' is not a UTC stamp the app-data helper accepts`)
+    }
+    return stamp
+}
+
+/** Compact UTC stamp for .idea-verify/<id>-<stamp>/ (idea#446). Matches helper RE_STAMP. */
+export const verifyStampNow = (at: Date = new Date()): string => {
+    const s = at.toISOString().replace(/[-:]/g, '').replace('.', '')
+    return checkStamp(s.endsWith('Z') ? s : `${s}Z`)
 }
 
 // ── Helper arguments (subcommand first) ──────────────────────────────────────
@@ -86,7 +101,7 @@ export const ensureDirsArgs = (root: string): string[] => ['ensure-dirs', checkR
  */
 export const eraseSlotArgs = (slot: string, stagingDir: string): string[] => {
     checkRoot(slot)
-    if (slot === 'system' || /^sd[a-z][12]$/.test(slot)) {
+    if (slot === 'system' || /^sd[a-z][1-9]$/.test(slot)) {
         throw new Error(`'${slot}' is not a test slot name erase-slot accepts`)
     }
     if (!stagingDir || stagingDir.includes('\0')) throw new Error('stagingDir is required for erase-slot')
@@ -107,17 +122,88 @@ export const putFilesArgs = (root: string, id: string, stagingDir: string): stri
     if (!stagingDir.startsWith('/tmp/')) throw new Error('stagingDir for put-files must be under /tmp')
     return ['put-files', checkRoot(root), checkId(id), stagingDir]
 }
+
+/**
+ * Tailscale CGNAT (100.64.0.0/10): the sidecar node's own Tailscale IPv4
+ * (idea#412). The helper constructs from= itself; callers must not pass options.
+ */
+export const checkUsageFromIpv4 = (ip: string): string => {
+    const m = /^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$/.exec(ip)
+    if (!m) throw new Error(`'${ip}' is not an IPv4 address the usage-key helper accepts`)
+    const o1 = Number(m[1]), o2 = Number(m[2]), o3 = Number(m[3]), o4 = Number(m[4])
+    if (o1 > 255 || o2 > 255 || o3 > 255 || o4 > 255) {
+        throw new Error(`'${ip}' is not an IPv4 address the usage-key helper accepts`)
+    }
+    if (!(o1 === 100 && o2 >= 64 && o2 <= 127)) {
+        throw new Error(`'${ip}' is not a Tailscale IPv4 address (100.64/10) the usage-key helper accepts`)
+    }
+    return ip
+}
+
+/**
+ * idea#412: argv for `idea-app-data install-usage-key`. The helper writes
+ * restrict,from="<ipv4>",command="/usr/local/sbin/idea-usage-export" itself.
+ * `pubKey` is `ssh-ed25519 <base64>` or just the base64 blob (test fixtures;
+ * never a real usage-pull key).
+ */
+export const installUsageKeyArgs = (ipv4: string, pubKey: string): string[] => {
+    const ip = checkUsageFromIpv4(ipv4)
+    const trimmed = pubKey.trim()
+    const line = trimmed.startsWith('ssh-ed25519 ') ? trimmed : `ssh-ed25519 ${trimmed}`
+    const normalised = normaliseEd25519(line)
+    if (!normalised) throw new Error(`'${pubKey}' is not an ed25519 public key the usage-key helper accepts`)
+    return ['install-usage-key', ip, 'ssh-ed25519', normalised.split(' ')[1]]
+}
+
 /** idea#347: rename instances/<id> to <disk>/.idea-quarantine/<id>-<UTC stamp>; prints the new path. */
 export const quarantineArgs = (root: string, id: string): string[] => ['quarantine', checkRoot(root), checkId(id)]
 export const deleteArgs = (root: string, id: string): string[] => ['delete', checkRoot(root), checkId(id)]
 export const borgInitArgs = (bdev: string, id: string): string[] => ['borg-init', checkRoot(bdev), checkId(id)]
 export const borgInfoArgs = (bdev: string, id: string): string[] => ['borg-info', checkRoot(bdev), checkId(id)]
-export const borgCreateArgs = (bdev: string, id: string, archive: string, srcRoot: string): string[] =>
-    ['borg-create', checkRoot(bdev), checkId(id), checkArchive(archive), checkRoot(srcRoot)]
+export const borgCreateArgs = (bdev: string, id: string, archive: string, srcRoot: string, excludes: string[] = []): string[] => {
+    const args = ['borg-create', checkRoot(bdev), checkId(id), checkArchive(archive), checkRoot(srcRoot)]
+    const seen = new Set<string>()
+    for (const raw of excludes) {
+        const n = normalizeBackupExclude(raw)
+        if (seen.has(n)) continue
+        seen.add(n)
+        args.push(n)
+    }
+    return args
+}
 export const borgExtractArgs = (bdev: string, id: string, archive: string, strip: number, dstRoot: string): string[] => {
     if (!Number.isInteger(strip) || strip < 1 || strip > 9) throw new Error(`strip ${strip} is out of range (1-9)`)
     return ['borg-extract', checkRoot(bdev), checkId(id), checkArchive(archive), String(strip), checkRoot(dstRoot)]
 }
+/** idea#401 / helper v9, fixed in v10 (idea#450): JSON of every archive (borg info --json --glob-archives '*') so the Engine can pick.
+ *  idea#446: pass `archive` for a member list of that one archive (`borg list --short`). */
+export const borgListArgs = (bdev: string, id: string, archive?: string): string[] => {
+    const args = ['borg-list', checkRoot(bdev), checkId(id)]
+    if (archive !== undefined) args.push(checkArchive(archive))
+    return args
+}
+/** idea#446 / helper v9: extract into <backup disk>/.idea-verify/<id>-<stamp>/; never instances/<id>. */
+export const borgExtractVerifyArgs = (bdev: string, id: string, archive: string, stamp: string): string[] =>
+    ['borg-extract-verify', checkRoot(bdev), checkId(id), checkArchive(archive), checkStamp(stamp)]
+/** idea#446 / helper v9: move <disk>/backups/ to <disk>/.idea-quarantine/backups-<UTC stamp>/. */
+export const quarantineBackupsArgs = (bdev: string): string[] => ['quarantine-backups', checkRoot(bdev)]
+/** idea#401: delete one archive. Omit keepMin to use the helper default (3). */
+export const borgDeleteArgs = (bdev: string, id: string, archive: string, keepMin?: number): string[] => {
+    const args = ['borg-delete', checkRoot(bdev), checkId(id), checkArchive(archive)]
+    if (keepMin !== undefined) {
+        if (!Number.isInteger(keepMin) || keepMin < 1 || keepMin > 9999) {
+            throw new Error(`keepMin ${keepMin} is not a positive integer`)
+        }
+        args.push(String(keepMin))
+    }
+    return args
+}
+export const borgCompactArgs = (bdev: string, id: string): string[] => ['borg-compact', checkRoot(bdev), checkId(id)]
+
+/** Helper protocol that adds borg-list / borg-delete / borg-compact (idea#401) and the idea#446 verbs.
+ *  v10 (idea#450): the v9 2-arg borg-list printed repository info without an archives list on real borg,
+ *  so cleanup requires v10 and a v9 helper gets HELPER_OUTDATED. */
+export const BACKUP_CLEANUP_HELPER_MIN = 10
 
 /** The argv for `sudo`: sudo -n /usr/local/sbin/idea-app-data <args…> */
 export const appDataSudoArgv = (args: string[]): string[] => ['-n', APP_DATA_HELPER, ...args]
@@ -302,8 +388,24 @@ export const reportBorgAtStartup = (exists: (p: string) => boolean = borgPresenc
 }
 
 // ── updateApp snapshots (helper v5, agent-engine-dev#230) ────────────────────
-export const snapshotArgs = (root: string, id: string): string[] => ['snapshot', checkRoot(root), checkId(id)]
-export const restoreSnapshotArgs = (root: string, id: string): string[] => ['restore-snapshot', checkRoot(root), checkId(id)]
+/** Normalised, de-duplicated exclude tokens (same rules as the helper; throws on a bad one). */
+const excludeTokens = (excludes: string[]): string[] => {
+    const out: string[] = []
+    const seen = new Set<string>()
+    for (const raw of excludes) {
+        const n = normalizeBackupExclude(raw)
+        if (seen.has(n)) continue
+        seen.add(n)
+        out.push(n)
+    }
+    return out
+}
+/** v9 (idea#448): trailing excludes are left out of the snapshot and recorded in its EXCLUDE file. */
+export const snapshotArgs = (root: string, id: string, excludes: string[] = []): string[] =>
+    ['snapshot', checkRoot(root), checkId(id), ...excludeTokens(excludes)]
+/** v9 (idea#448): in place; the snapshot's EXCLUDE plus these excludes are never written, deleted or moved. */
+export const restoreSnapshotArgs = (root: string, id: string, excludes: string[] = []): string[] =>
+    ['restore-snapshot', checkRoot(root), checkId(id), ...excludeTokens(excludes)]
 export const snapshotsArgs = (root: string): string[] => ['snapshots', checkRoot(root)]
 export const estimateArgs = (root: string, id: string): string[] => ['estimate', checkRoot(root), checkId(id)]
 /** `estimate` result: "<folder kb> <volumes kb> <free kb>" (read-only; nothing is stopped). */
