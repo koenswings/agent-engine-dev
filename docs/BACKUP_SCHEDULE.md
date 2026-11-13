@@ -65,7 +65,7 @@ uptimeCounter:              # uptime since lastRun, across reboots
 | `BEFORE_BUILD` | Wall time is before the Engine build time (the git commit time baked in at build, Q12). |
 | `BEFORE_STORE` | Wall time is more than 5 min before the newest store timestamp. |
 | `AHEAD_OF_PEER` | Wall time is more than 24 h ahead of a synced peer. |
-| `CLOCK_JUMP` | A jump was detected since the last sync. |
+| `CLOCK_JUMP` | A jump was detected, and trust has not come back yet. It comes back at the next sync **or** after 24 h of uptime with no further jump, whichever comes first (Steve, #346), because a lone school Engine may never sync. A further jump restarts the 24 h. |
 | `NEVER_SYNCED` | Neither NTP (`timedatectl NTPSynchronized`) nor a peer has confirmed the clock since boot. |
 
 A jump is a wall-clock step of more than 2 min between two ticks, compared with the monotonic clock. The reason tokens are Engine-internal; the Console keys off `clockTrusted`.
@@ -99,3 +99,4 @@ The store gets one change per run (and a `clockTrusted` / `clockReason` change o
 
 - **Unit tests:** `test/automated/backup-schedule.test.ts` (fake wall, monotonic and uptime clock in `test/harness/fakeScheduleClock.ts`; fixtures in `test/fixtures/backup-schedule/`). They run in `Europe/Brussels` for the DST cases.
 - **Test clock offset:** `IDEA_TEST_CLOCK_OFFSET_MS` is honoured only when `NODE_ENV=test` (Q10). It shifts only the scheduler's and the clock-trust check's view of the time, never the system clock.
+- **Wrong-clock cases are proven in unit tests only** (Steve, #346 call 3). Under pm2 the Engine never runs with `NODE_ENV=test`, so the offset is inert on a Pi. The on-Pi proof runs on the real clock: slot, catch-up after a pm2 restart and a reboot, locks, undock and `APP_DISK_NOT_DOCKED`.

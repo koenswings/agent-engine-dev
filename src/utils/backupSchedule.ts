@@ -192,7 +192,7 @@ export interface ClockTrustInput {
     newestStoreTimeMs: number | null
     /** A synced peer's current time estimate (hb `now`), or null when no synced peer. */
     syncedPeerNowMs: number | null
-    /** A clock jump was detected since the last sync; cleared by the caller on a new sync. */
+    /** An outstanding jump (advanceClockJumpState returned non-null): untrusted until sync or 24 h. */
     jumpSinceSync?: boolean
 }
 
@@ -213,6 +213,37 @@ export const evaluateClockTrust = (i: ClockTrustInput): ClockTrust => {
     if (i.jumpSinceSync) return untrusted('CLOCK_JUMP')
     if (!i.ntpSynced && !i.peerSynced) return untrusted('NEVER_SYNCED')
     return { clockTrusted: true, clockReason: null }
+}
+
+/**
+ * After a clock jump the clock is untrusted (CLOCK_JUMP) until the next sync OR
+ * 24 h of uptime with no further jump, whichever comes first (Steve, #346 call 2):
+ * a lone school Engine may never sync, and its trust must not stay lost forever.
+ * A further jump restarts the 24 h. null = no outstanding jump. Kept in memory by
+ * the tick (PR C); uptime is counted with the same counter rules as the schedule.
+ */
+export interface ClockJumpState {
+    counter: BackupUptimeCounter
+}
+
+/** Uptime with no further jump after which trust returns without a sync. */
+export const JUMP_TRUST_RECOVERY_S = 24 * 60 * 60
+
+/** A jump was detected now: (re)start the recovery window. */
+export const noteClockJump = (bootId: string, uptimeS: number): ClockJumpState =>
+    ({ counter: resetUptimeCounter(bootId, uptimeS) })
+
+/**
+ * Advance an outstanding jump. `syncedSinceJump`: an NTP sync or a peer agreement
+ * observed after the jump. Returns null once trust is back.
+ */
+export const advanceClockJumpState = (
+    state: ClockJumpState | null | undefined, bootId: string, uptimeS: number, syncedSinceJump: boolean,
+): ClockJumpState | null => {
+    if (!state) return null
+    if (syncedSinceJump) return null
+    const counter = advanceUptimeCounter(state.counter, bootId, uptimeS)
+    return (uptimeElapsedS(counter) ?? 0) >= JUMP_TRUST_RECOVERY_S ? null : { counter }
 }
 
 /** One tick's reading: wall clock and a monotonic clock (performance.now()). */

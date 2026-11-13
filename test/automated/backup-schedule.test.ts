@@ -14,7 +14,7 @@ import {
     parseDailyTime, parseBackupSchedule, effectiveSchedule, BackupScheduleError,
     mostRecentSlot, nextSlotAfter, slotsBetween,
     resetUptimeCounter, advanceUptimeCounter, uptimeElapsedS, shouldPersistUptimeCounter,
-    evaluateClockTrust, detectClockJump, decideBackupDue, skippedCatchUpDue, windowIdFor,
+    evaluateClockTrust, detectClockJump, noteClockJump, advanceClockJumpState, JUMP_TRUST_RECOVERY_S, decideBackupDue, skippedCatchUpDue, windowIdFor,
     testClockOffsetMs, scheduleNowMs,
     BackupLastRun, BackupUptimeCounter, ClockTrustInput,
 } from '../../src/utils/backupSchedule.js'
@@ -285,6 +285,60 @@ describe('clock jumps', () => {
         prev = c.sample()
         c.advance(MIN); c.jumpWall(-HOUR)
         expect(detectClockJump(prev, c.sample())).toBe('backward')
+    })
+})
+
+describe('trust after a clock jump (Steve #346 call 2)', () => {
+    const trustWith = (jump: unknown) => evaluateClockTrust({
+        nowMs: local(2026, 11, 13, 10, 0), ntpSynced: true, peerSynced: false,
+        buildTimeMs: null, newestStoreTimeMs: null, syncedPeerNowMs: null, jumpSinceSync: jump != null,
+    })
+
+    it('comes back at the next sync', () => {
+        const c = fakeScheduleClock(local(2026, 11, 13, 1, 0))
+        let st = advanceClockJumpState(noteClockJump(c.bootId, c.uptimeS), c.bootId, c.uptimeS, false)
+        expect(trustWith(st).clockReason).toBe('CLOCK_JUMP')
+        c.advance(HOUR)
+        st = advanceClockJumpState(st, c.bootId, c.uptimeS, true)
+        expect(st).toBeNull()
+        expect(trustWith(st)).toEqual({ clockTrusted: true, clockReason: null })
+    })
+
+    it('comes back after 24 h of uptime with no further jump, across a 05:00 reboot, with no sync', () => {
+        const c = fakeScheduleClock(local(2026, 11, 13, 1, 0))
+        let st = noteClockJump(c.bootId, c.uptimeS) as ReturnType<typeof advanceClockJumpState>
+        let back: number | null = null
+        for (let i = 0; i < 26 * 60 && back == null; i++) {
+            c.advance(MIN)
+            const t = new Date(c.wallMs)
+            if (t.getHours() === 5 && t.getMinutes() === 0) c.reboot(2 * MIN)
+            st = advanceClockJumpState(st, c.bootId, c.uptimeS, false)
+            if (st == null) back = i + 1
+            else expect(trustWith(st).clockReason).toBe('CLOCK_JUMP')
+        }
+        // 24 h of uptime: 1440 ticks, plus the ~2 min the reboot was down (not uptime)
+        expect(back).not.toBeNull()
+        expect(back!).toBeGreaterThanOrEqual(JUMP_TRUST_RECOVERY_S / 60)
+        expect(back!).toBeLessThanOrEqual(JUMP_TRUST_RECOVERY_S / 60 + 5)
+    })
+
+    it('a second jump restarts the 24 h', () => {
+        const c = fakeScheduleClock(local(2026, 11, 13, 1, 0))
+        let st = advanceClockJumpState(noteClockJump(c.bootId, c.uptimeS), c.bootId, c.uptimeS, false)
+        c.advance(20 * HOUR)
+        st = advanceClockJumpState(st, c.bootId, c.uptimeS, false)
+        expect(st).not.toBeNull()
+        st = noteClockJump(c.bootId, c.uptimeS) // second jump at 20 h
+        c.advance(20 * HOUR) // 40 h after the first jump, 20 h after the second
+        st = advanceClockJumpState(st, c.bootId, c.uptimeS, false)
+        expect(st).not.toBeNull()
+        expect(trustWith(st).clockReason).toBe('CLOCK_JUMP')
+        c.advance(4 * HOUR)
+        expect(advanceClockJumpState(st, c.bootId, c.uptimeS, false)).toBeNull()
+    })
+
+    it('no outstanding jump stays null', () => {
+        expect(advanceClockJumpState(null, 'b', 10, false)).toBeNull()
     })
 })
 
