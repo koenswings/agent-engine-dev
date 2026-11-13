@@ -82,6 +82,7 @@ export type OperationKind =
   // idea#201 §10 (client cards)
   | 'flashCard'
   | 'initialiseDisk'
+  | 'makeBackupDisk'  // idea#404 Engine PR 4: blank stick / adopted disk → scheduled Backup Disk
 
 /**
  * What triggered an operation.

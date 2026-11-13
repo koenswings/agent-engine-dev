@@ -42,6 +42,7 @@ export const RECOVERY_STRATEGY: Record<OperationKind, RecoveryStrategy> = {
     stopApp:       'fail',    // partial stop state unknown — operator must re-issue
     flashCard:     'fail',    // idea#201: never retried; Failed 'INTERRUPTED: ...'
     initialiseDisk:'fail',    // idea#201: operator re-issues
+    makeBackupDisk:'fail',    // idea#404: no resume; operator re-issues after an unplug
 }
 
 // ── Operation CRUD ────────────────────────────────────────────────────────────
