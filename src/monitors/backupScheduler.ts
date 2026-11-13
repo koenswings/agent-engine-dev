@@ -37,7 +37,7 @@ import { DocHandle } from '@automerge/automerge-repo'
 import { chalk, fs } from 'zx'
 import { log } from '../utils/utils.js'
 import { disksRoot } from '../data/Config.js'
-import { Disk, diskMountRoot, joinMountRoot } from '../data/Disk.js'
+import { Disk, diskMountRoot, joinMountRoot, syncBackupOrphanLinks } from '../data/Disk.js'
 import { localEngineId } from '../data/Engine.js'
 import { Store, getInstance } from '../data/Store.js'
 import { BackupResultCode, DiskID, EngineID, InstanceID, OperationCause, Timestamp } from '../data/CommonTypes.js'
@@ -322,7 +322,8 @@ export class BackupScheduler {
             return null
         }
         if (!getInstance(store, instanceId as InstanceID)) {
-            log(`Backup scheduler: linked instance ${instanceId} is not in the store; skipped`)
+            log(`Backup scheduler: linked instance ${instanceId} is not in the store; skipped (orphanLinks)`)
+            syncBackupOrphanLinks(this.storeHandle, diskId as DiskID)
             return null
         }
         const lockFile = `${disksRoot()}/${disk.device}/backups/${instanceId}/${BACKUP_IN_PROGRESS}`

@@ -21,7 +21,7 @@
 import { $, YAML, chalk, fs } from 'zx'
 import { log, print } from '../utils/utils.js'
 import { disksRoot, skipBorg } from '../data/Config.js'
-import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot, appDataRoot, joinMountRoot } from '../data/Disk.js'
+import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot, appDataRoot, joinMountRoot, backupOrphanLinks, syncBackupOrphanLinks } from '../data/Disk.js'
 import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgProblem, helperAtLeast } from '../utils/appDataHelper.js'
 import { parseBackupExcludeList, parseBackupHookExcludeList, mergeBackupExcludeLists, BACKUP_EXCLUDE_HELPER_MIN } from '../utils/backupExclude.js'
 import { backupCleanupRunner, backupDiskFullError, cleanupIsEnabled } from '../utils/backupCleanup.js'
@@ -632,10 +632,19 @@ export const processBackupDisk = async (
         const d = doc.diskDB[backupDisk.id]
         if (!d) return
         // scheduleError: the marker the Console shows for an invalid schedule (Steve, #347 call 5)
-        d.backupConfig = { mode, links, schedule: yaml.schedule ? { daily: yaml.schedule.daily } : null, scheduleError: yaml.scheduleError }
+        d.backupConfig = {
+            mode, links,
+            schedule: yaml.schedule ? { daily: yaml.schedule.daily } : null,
+            scheduleError: yaml.scheduleError,
+            orphanLinks: backupOrphanLinks(doc, links),
+        }
         if ((d.missedRuns ?? null) !== yaml.missedRuns) d.missedRuns = yaml.missedRuns
         if ((d.lastAttempt ?? null) !== yaml.lastAttempt) d.lastAttempt = yaml.lastAttempt as Timestamp | null
     })
+    const orphans = storeHandle.doc()!.diskDB[backupDisk.id]?.backupConfig?.orphanLinks ?? []
+    if (orphans.length) {
+        log(`Backup Disk ${backupDisk.id}: ${orphans.length} linked instance(s) not in the store (orphanLinks): ${orphans.join(', ')}`)
+    }
 
     // Phase 2: index any app bundles on this disk into appDB for installApp / Console
     await indexBackupDiskApps(storeHandle, backupDisk)
@@ -653,7 +662,11 @@ export const processBackupDisk = async (
                 continue
             }
             const instance = getInstance(store, instanceId)
-            if (!instance?.storedOn) continue
+            if (!instance) {
+                log(`Instance ${instanceId}: not in the store; skipped (orphanLinks)`)
+                continue
+            }
+            if (!instance.storedOn) continue
             const appDisk = store.diskDB[instance.storedOn]
             if (appDisk?.device) {
                 // idea#400 (Steve, #347 call 4): no caller waits on a dock backup, so a held lock records SKIPPED_LOCKED
@@ -677,6 +690,9 @@ export const checkPendingBackups = async (
     appDisk: Disk
 ): Promise<void> => {
     const store = storeHandle.doc()
+
+    // Instances may have just appeared (this App Disk docked); refresh orphanLinks without touching BACKUP.yaml.
+    syncBackupOrphanLinks(storeHandle)
 
     // Find all currently docked Backup Disks
     const dockedDisks = Object.values(store.diskDB).filter(d => d.device != null)

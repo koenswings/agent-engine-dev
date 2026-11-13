@@ -123,6 +123,7 @@ A jump is a wall-clock step of more than 2 min between two ticks, compared with 
 The store gets one change per run (and a `clockTrusted` / `clockReason` change only when the value changes), never one per tick. Progress during a run stays in `operationDB`. There is no `nextRun` and no per-App schedule in the store (Q7, Q8).
 
 - `Disk.backupConfig.schedule`: `{ daily }` or null; `Disk.backupConfig.scheduleError`: the error text for an invalid schedule, else null (PR C).
+- `Disk.backupConfig.orphanLinks`: instance ids listed in BACKUP.yaml (and in `backupConfig.links`) that are not in the store. The file is never rewritten or pruned for this; scheduled and immediate runs still skip those links, and this list is how the Console shows why. It is written when `processBackupDisk` mirrors the config, and refreshed (store only) when an App Disk docks (`checkPendingBackups`) or a scheduled run skips a missing instance.
 - `Disk.freePct`, `clockTrusted`, `clockReason`, `missedRuns`, `lastAttempt`, `cleaning`, `cleaningStartedAt` (all optional and null-safe), plus the existing `backupStaleLocks`.
 - `Instance.lastResult`: `{ time, method, result }`.
 - `Instance.backupHistory`: the newest 7 results, oldest first. `Instance.lastBackup` stays as the last success.

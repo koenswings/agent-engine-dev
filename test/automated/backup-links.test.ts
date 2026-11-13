@@ -334,7 +334,7 @@ describe('createBackupDisk keeps lastBackup of links it keeps (idea#451, Steve d
             futureKey: { nested: [1, 2] },
         })
         expect(processDisk).toHaveBeenCalledTimes(1)
-        expect(h.doc().diskDB[BACKUP_DISK].backupConfig).toEqual({ mode: 'on-demand', links: [A, C], schedule: { daily: '02:30' }, scheduleError: null })
+        expect(h.doc().diskDB[BACKUP_DISK].backupConfig).toEqual({ mode: 'on-demand', links: [A, C], schedule: { daily: '02:30' }, scheduleError: null, orphanLinks: [] })
     })
 
     it('starts every link at 0 on a disk without a readable BACKUP.yaml', async () => {
