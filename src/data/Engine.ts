@@ -2,7 +2,7 @@ import { $, chalk, os, YAML, fs, path, sleep } from 'zx';
 
 $.verbose = false;
 import { deepPrint, log, uuid, print } from '../utils/utils.js';
-import { APP_DATA_HELPER, APP_DATA_HELPER_VERSION, BORG_PATH } from '../utils/appDataHelper.js';
+import { APP_DATA_HELPER, APP_DATA_HELPER_VERSION, BORG_PATH, helperAtLeast, BACKUP_CLEANUP_HELPER_MIN, type AppDataRunner } from '../utils/appDataHelper.js';
 import { PEER_GATE, PEER_AUTHORIZED_KEYS, PEER_KNOWN_HOSTS } from '../utils/peerSsh.js';
 import { readMetaUpdateId, DiskMeta, addMeta, readRemoteDiskId } from './Meta.js';
 import { Version, Command, Hostname, Timestamp, DiskID, EngineID } from './CommonTypes.js';
@@ -159,6 +159,12 @@ export interface EraseInProgress {
  *   backupLinks: addBackupLink, removeBackupLink (idea#451).
  *   scheduledBackups: the daily scheduled Backup Disk mode (tick, BACKUP.yaml schedule,
  *     Disk/Instance schedule fields) and setBackupMode (idea#400).
+ *   backupCleanup: fullness-driven Backup Disk cleanup (idea#401 / idea#400 §3.1);
+ *               advertised only when the app-data root helper is at
+ *               BACKUP_CLEANUP_HELPER_MIN (v10, idea#450) or newer, checked once
+ *               at startup (same pattern as flashCard). An older, missing, failing
+ *               or timed-out helper leaves it out; runtime cleanup still records
+ *               HELPER_OUTDATED and the backup still runs.
  * Written at every startup as a whole new list, with capabilitiesBootedAt set
  * to that startup's lastBooted. A Console counts a capability only when
  * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
@@ -170,9 +176,64 @@ export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk'
 export const FLASH_CARD_CAPABILITY = 'flashCard'
 export const FLASH_HELPER_PATH = '/usr/local/sbin/idea-flash-card'
 const flashHelperInstalled = (): boolean => { try { fs.accessSync(FLASH_HELPER_PATH, fs.constants.X_OK); return true } catch { return false } }
+
+/** idea#400 §3.1: advertised only when the app-data helper is at BACKUP_CLEANUP_HELPER_MIN or newer */
+export const BACKUP_CLEANUP_CAPABILITY = 'backupCleanup'
+const BACKUP_CLEANUP_HELPER_CHECK_MS = 5_000
+/** Cached result of the one startup version check; null = not yet checked (omit the capability). */
+let backupCleanupHelperOk: boolean | null = null
+
+const withTimeout = async <T>(promise: Promise<T>, ms: number): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), ms) }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+/**
+ * Once at startup, decide whether to advertise `backupCleanup`. Never throws:
+ * an older, missing, failing or timed-out helper leaves the capability out
+ * (HELPER_OUTDATED remains the runtime fallback in backupCleanup.ts).
+ */
+export const checkBackupCleanupCapability = async (
+  run?: AppDataRunner,
+  timeoutMs: number = BACKUP_CLEANUP_HELPER_CHECK_MS,
+): Promise<boolean> => {
+  try {
+    const outdated = await withTimeout(
+      helperAtLeast(BACKUP_CLEANUP_HELPER_MIN, 'backupCleanup', run),
+      timeoutMs,
+    )
+    backupCleanupHelperOk = outdated === null
+  } catch {
+    backupCleanupHelperOk = false
+  }
+  if (backupCleanupHelperOk) {
+    log(`backupCleanup capability advertised (app-data helper v${BACKUP_CLEANUP_HELPER_MIN}+)`)
+  } else {
+    log(`backupCleanup capability omitted (app-data helper older than v${BACKUP_CLEANUP_HELPER_MIN}, missing, error or timeout)`)
+  }
+  return backupCleanupHelperOk
+}
+
+/** Test seam: drop the cached startup check so later cases start from "not checked". */
+export const resetBackupCleanupCapabilityForTests = (): void => { backupCleanupHelperOk = null }
+
 /** The capability list written at this startup */
-export const engineCapabilities = (helperInstalled: boolean = flashHelperInstalled()): string[] =>
-  helperInstalled ? [...ENGINE_CAPABILITIES, FLASH_CARD_CAPABILITY] : [...ENGINE_CAPABILITIES]
+export const engineCapabilities = (
+  helperInstalled: boolean = flashHelperInstalled(),
+  cleanupHelperOk: boolean = backupCleanupHelperOk === true,
+): string[] => {
+  const caps = [...ENGINE_CAPABILITIES]
+  if (helperInstalled) caps.push(FLASH_CARD_CAPABILITY)
+  if (cleanupHelperOk) caps.push(BACKUP_CLEANUP_CAPABILITY)
+  return caps
+}
 
 import { config } from './Config.js';
 
