@@ -103,7 +103,7 @@ uptimeCounter:              # uptime since lastRun, across reboots
 | Reason | When |
 |---|---|
 | `BEFORE_BUILD` | Wall time is before the Engine build time (the git commit time baked in at build, Q12). |
-| `BEFORE_STORE` | Wall time is more than 5 min before the newest store timestamp. |
+| `BEFORE_STORE` | Wall time is more than 5 min before the newest store timestamp, **and NTP has not synchronised the clock** since boot. An NTP sync clears it (a real time source beats stored timestamps). A store (Automerge) or peer sync does not, and neither does 24 h of uptime. Without NTP it clears once the wall clock passes the newest stored timestamp (Steve, #351 call 6). |
 | `AHEAD_OF_PEER` | Wall time is more than 24 h ahead of a synced peer. |
 | `CLOCK_JUMP` | A jump was detected, and trust has not come back yet. It comes back at the next sync **or** after 24 h of uptime with no further jump, whichever comes first (Steve, #346), because a lone school Engine may never sync. A further jump restarts the 24 h. |
 | `NEVER_SYNCED` | Neither NTP (`timedatectl NTPSynchronized`) nor a peer has confirmed the clock since boot. |
