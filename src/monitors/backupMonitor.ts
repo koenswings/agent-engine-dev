@@ -815,6 +815,7 @@ export const restoreApp = async (
 
 /**
  * Write BACKUP.yaml on a disk and trigger processDisk to register it as a Backup Disk.
+ * Links that were already in the file keep their lastBackup (idea#451).
  * Called by the createBackupDisk command from Console.
  */
 export const createBackupDiskConfig = async (
@@ -825,9 +826,16 @@ export const createBackupDiskConfig = async (
 ): Promise<void> => {
     if (!disk.device) throw new Error(`createBackupDiskConfig: disk ${disk.id} is not docked`)
 
+    // idea#451 (Steve, decision 6): a link that is kept keeps its lastBackup; new links start at 0.
+    const previous = await readBackupYaml(disk.device)
+    const kept = new Map<string, number>()
+    for (const l of Array.isArray(previous?.links) ? previous!.links : []) {
+        const t = Number(l?.lastBackup)
+        if (l?.instanceId != null && Number.isFinite(t)) kept.set(String(l.instanceId), t)
+    }
     const yaml: BackupYaml = {
         mode,
-        links: instanceIds.map(id => ({ instanceId: id, lastBackup: 0 }))
+        links: instanceIds.map(id => ({ instanceId: id, lastBackup: kept.get(String(id)) ?? 0 }))
     }
 
     await writeBackupYaml(disk.device, yaml)
