@@ -61,6 +61,11 @@ live Engine (idea#105):
 - Each run gets a private temp folder: `IDEA_WATCH_DIR` (replaces `/dev/engine`)
   and `IDEA_DISKS_ROOT` (replaces `/disks`). `test/harness/diskSim.ts` refuses to
   load without them. Nothing in the tests touches `/dev/engine`, `/disks` or `/disks/old`.
+- `script/test-run.sh` also writes a test-local system META and sets
+  `IDEA_SYSTEM_META` to it, so `pnpm test:full` on the Grok Bot box does not
+  depend on `/META.yaml` on the host. `src/data/Meta.ts` `systemMetaPath()`
+  honours that env only when `NODE_ENV=test` or `IDEA_TEST_MODE=true`; on a Pi
+  the Engine always reads `/META.yaml`. Do not delete a host `/META.yaml`.
 - Pretend disks are named `idea-test-N`; a live Engine (testMode off) ignores such names.
 - Tests compile into `dist-test/`, never `dist/` (which pm2 runs the live Engine from).
   `pnpm build` is no longer part of `test:*`.

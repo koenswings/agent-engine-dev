@@ -132,7 +132,7 @@ This document provides a reference for the main provisioning and utility scripts
     -   Runs `test-preflight.sh` first (skipped for `cross-engine`, which drives live fleet Engines by design).
     -   Compiles into `dist-test/` (`tsc --outDir dist-test`), never `dist/`.
     -   Creates a private temp folder per run and exports `IDEA_WATCH_DIR` (replaces `/dev/engine`) and `IDEA_DISKS_ROOT` (replaces `/disks`); removes it on exit.
-    -   Sets `IDEA_TEST_MODE=true` (not for `cross-engine`) and writes the log to `test/testresults/test-<suite>-<UTC timestamp>.log`.
+    -   Sets `IDEA_TEST_MODE=true` (not for `cross-engine`), writes a test-local system META in the temp folder and exports `IDEA_SYSTEM_META` so the gate does not depend on `/META.yaml` on the host (`systemMetaPath()` in `src/data/Meta.ts` honours it only under `IDEA_TEST_MODE` / `NODE_ENV=test`), and writes the log to `test/testresults/test-<suite>-<UTC timestamp>.log`.
 
 ---
 
