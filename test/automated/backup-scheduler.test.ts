@@ -27,6 +27,7 @@ import { CommandLogStore, CommandTrace, setCommandLogHandle } from '../../src/da
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
 import { fakeScheduleClock, FakeScheduleClock } from '../harness/fakeScheduleClock.js'
 import { config } from '../../src/data/Config.js'
+import { clearPeerPings, notePing, HB_TYPE } from '../../src/data/Liveness.js'
 
 const A = 'sched-a' as InstanceID
 const B = 'sched-b' as InstanceID
@@ -152,6 +153,7 @@ afterEach(async () => {
     setCommandLogHandle(null)
     resourceLock.releaseAll([diskKey(BD), instanceKey(A), instanceKey(B)])
     await fs.remove(`${DISKS_ROOT}/${appDevice}`)
+    clearPeerPings()
     await fs.remove(`${DISKS_ROOT}/${backupDevice}`)
 })
 
@@ -560,3 +562,163 @@ describe('real backupInstance, crash recovery, helpers', () => {
         }
     })
 })
+
+const ping = (id: string, o: { ntp?: boolean, trusted?: boolean, now?: number, receivedAt?: number, omitFields?: boolean } = {}) => {
+    const now = o.now ?? clock.wallMs
+    const msg: Record<string, unknown> = { type: HB_TYPE, v: 1, engineId: id, now, bootedAt: now }
+    if (!o.omitFields) {
+        msg.ntpSynced = o.ntp ?? false
+        msg.clockTrusted = o.trusted ?? false
+    }
+    notePing(msg, o.receivedAt ?? clock.wallMs)
+}
+
+describe('peer clock as a time source (engine#352)', () => {
+    it('two untrusted non-NTP peers do not clear NEVER_SYNCED (call 2)', async () => {
+        ntp = false
+        await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1) }))
+        const h = await setup()
+        ping('ENGINE_p1', { ntp: false, trusted: false })
+        ping('ENGINE_p2', { ntp: false, trusted: false })
+        clock.advance(MIN)
+        await tick(new BackupScheduler(h, deps(), localEngineId))
+        expect(disk(h).clockReason).toBe('NEVER_SYNCED')
+        expect(runs).toEqual([])
+    })
+
+    it('a clockTrusted non-NTP peer that agrees clears NEVER_SYNCED (call 2)', async () => {
+        ntp = false
+        await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1) }))
+        const h = await setup()
+        ping('ENGINE_trusted', { ntp: false, trusted: true })
+        clock.advance(MIN)
+        await tick(new BackupScheduler(h, deps(), localEngineId))
+        expect(disk(h).clockTrusted).toBe(true)
+        expect(disk(h).clockReason).toBeNull()
+        expect(runs).toHaveLength(2)
+    })
+
+    it('two untrusted non-NTP peers do not clear CLOCK_JUMP; a clockTrusted peer does (calls 2 and 4)', async () => {
+        ntp = false
+        await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1) }))
+        const h = await setup()
+        ping('ENGINE_trusted', { ntp: false, trusted: true })
+        const s = new BackupScheduler(h, deps(), localEngineId)
+        clock.advance(MIN); await tick(s)
+        expect(disk(h).clockTrusted).toBe(true)
+        const afterFirst = runs.length
+        // jump, and only never-synced peers are present
+        clearPeerPings()
+        clock.advance(MIN); clock.jumpWall(3 * HOUR)
+        ping('ENGINE_u1', { ntp: false, trusted: false })
+        ping('ENGINE_u2', { ntp: false, trusted: false })
+        await tick(s)
+        expect(disk(h).clockReason).toBe('CLOCK_JUMP')
+        clock.advance(MIN)
+        ping('ENGINE_u1', { ntp: false, trusted: false, now: clock.wallMs })
+        ping('ENGINE_u2', { ntp: false, trusted: false, now: clock.wallMs })
+        await tick(s)
+        expect(disk(h).clockReason).toBe('CLOCK_JUMP')
+        clearPeerPings()
+        ping('ENGINE_trusted', { ntp: false, trusted: true, now: clock.wallMs })
+        clock.advance(MIN); await tick(s)
+        expect(disk(h).clockTrusted).toBe(true)
+        expect(disk(h).clockReason).toBeNull()
+        expect(runs).toHaveLength(afterFirst)
+    })
+
+    it('BEFORE_STORE is cleared only by an NTP peer within 5 min, not by a clockTrusted-only peer (call 3)', async () => {
+        ntp = false
+        await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1) }))
+        const h = await setup()
+        h.change(doc => { doc.instanceDB[A].lastBackup = (slot(0) + 3 * HOUR) as Timestamp })
+        ping('ENGINE_trusted', { ntp: false, trusted: true })
+        clock.advance(MIN)
+        const s = new BackupScheduler(h, deps(), localEngineId)
+        await tick(s)
+        expect(disk(h).clockReason).toBe('BEFORE_STORE')
+        expect(runs).toEqual([])
+        clearPeerPings()
+        ping('ENGINE_ntp', { ntp: true, trusted: true, now: clock.wallMs })
+        await tick(s)
+        expect(disk(h).clockTrusted).toBe(true)
+        expect(disk(h).clockReason).toBeNull()
+        expect(runs).toHaveLength(2)
+    })
+
+    it('an NTP peer more than 5 min away does not clear BEFORE_STORE (call 3 / 6)', async () => {
+        ntp = false
+        await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1) }))
+        const h = await setup()
+        h.change(doc => { doc.instanceDB[A].lastBackup = (slot(0) + 3 * HOUR) as Timestamp })
+        ping('ENGINE_ntp', { ntp: true, trusted: true, now: clock.wallMs + 6 * MIN })
+        clock.advance(MIN)
+        await tick(new BackupScheduler(h, deps(), localEngineId))
+        expect(disk(h).clockReason).toBe('BEFORE_STORE')
+        expect(runs).toEqual([])
+    })
+
+    it('usable peers that disagree by more than 5 min are all ignored (call 7)', async () => {
+        ntp = false
+        await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1) }))
+        const h = await setup()
+        ping('ENGINE_a', { ntp: true, trusted: true, now: clock.wallMs })
+        ping('ENGINE_b', { ntp: true, trusted: true, now: clock.wallMs + 6 * MIN })
+        clock.advance(MIN)
+        await tick(new BackupScheduler(h, deps(), localEngineId))
+        expect(disk(h).clockReason).toBe('NEVER_SYNCED')
+        expect(runs).toEqual([])
+    })
+
+    it('a peer silent for more than 60 s is dropped (call 10)', async () => {
+        ntp = false
+        await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1) }))
+        const h = await setup()
+        ping('ENGINE_trusted', { ntp: false, trusted: true, receivedAt: clock.wallMs })
+        clock.advance(61_000)
+        await tick(new BackupScheduler(h, deps(), localEngineId))
+        expect(disk(h).clockReason).toBe('NEVER_SYNCED')
+        expect(runs).toEqual([])
+    })
+
+    it('BEFORE_BUILD is untouched by an agreeing NTP peer (call 5)', async () => {
+        ntp = false
+        buildTime = slot(30)
+        await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1) }))
+        const h = await setup()
+        ping('ENGINE_ntp', { ntp: true, trusted: true })
+        clock.advance(MIN)
+        await tick(new BackupScheduler(h, deps(), localEngineId))
+        expect(disk(h).clockReason).toBe('BEFORE_BUILD')
+        expect(runs).toEqual([])
+    })
+
+    it('an old Engine heartbeat without the new fields is not a time source', async () => {
+        ntp = false
+        await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1) }))
+        const h = await setup()
+        ping('ENGINE_old', { omitFields: true })
+        clock.advance(MIN)
+        await tick(new BackupScheduler(h, deps(), localEngineId))
+        expect(disk(h).clockReason).toBe('NEVER_SYNCED')
+        expect(runs).toEqual([])
+    })
+
+    it('ours more than 24 h ahead of an NTP peer is AHEAD_OF_PEER; a clockTrusted-only peer does not set it', async () => {
+        ntp = false
+        await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1) }))
+        const h = await setup()
+        ping('ENGINE_trusted', { ntp: false, trusted: true, now: clock.wallMs - 25 * HOUR })
+        clock.advance(MIN)
+        const s = new BackupScheduler(h, deps(), localEngineId)
+        await tick(s)
+        // clockTrusted-only and 25 h behind: not a source for AHEAD_OF_PEER; also does not agree within 5 min, so NEVER_SYNCED
+        expect(disk(h).clockReason).toBe('NEVER_SYNCED')
+        clearPeerPings()
+        ping('ENGINE_ntp', { ntp: true, trusted: true, now: clock.wallMs - 25 * HOUR })
+        await tick(s)
+        expect(disk(h).clockReason).toBe('AHEAD_OF_PEER')
+        expect(runs).toEqual([])
+    })
+})
+
