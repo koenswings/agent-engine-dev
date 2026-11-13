@@ -7,8 +7,8 @@
  *
  *  - One `setInterval` inside the Engine (pm2, as pi), never a host cron job.
  *  - Only Backup Disks docked to this Engine in `scheduled` mode. A disk whose
- *    BACKUP.yaml schedule does not parse does not run; backupConfig.scheduleError
- *    says why (Steve, #347 call 5).
+ *    BACKUP.yaml schedule does not parse runs at the 02:30 default, and
+ *    backupConfig.scheduleError says why (Steve, #347 call 5 and #351 call 1).
  *  - A tick that has nothing to do writes nothing to the store. A run writes
  *    BACKUP.yaml (lastRun, lastAttempt, missedRuns, the uptime counter reset) when
  *    it starts, the per-instance results as PR B does, and ONE store change when it
@@ -47,7 +47,7 @@ import { resourceLock } from '../utils/ResourceLock.js'
 import { readBuildInfo } from '../utils/buildInfo.js'
 import { defaultReadBootId, defaultReadNtpSynced, defaultReadUptimeS } from '../usage/sampler.js'
 import {
-    BackupDue, ClockJumpState, ClockSample, ClockTrust, SkippedRun,
+    BackupDue, ClockJumpState, DEFAULT_BACKUP_TIME, ClockSample, ClockTrust, SkippedRun,
     advanceClockJumpState, advanceUptimeCounter, decideBackupDue, detectClockJump, effectiveSchedule,
     evaluateClockTrust, noteClockJump, resetUptimeCounter, scheduleNowMs, shouldPersistUptimeCounter,
     skippedCatchUpDue, testClockOffsetMs, windowIdFor, TEST_CLOCK_OFFSET_ENV,
@@ -223,15 +223,19 @@ export class BackupScheduler {
         if (!yaml) return
         this.mirrorScheduleIfChanged(disk.id, yaml)
         if (yaml.mode !== 'scheduled') return
+        // Steve, #351 call 1: an invalid schedule runs at the 02:30 default (a missed nightly backup is
+        // worse than the default time) and stays visible as backupConfig.scheduleError.
         if (yaml.scheduleError) {
             if (this.loggedScheduleError.get(disk.id) !== yaml.scheduleError) {
-                log(chalk.yellow(`Backup scheduler: disk ${disk.id} not run: BACKUP.yaml schedule is invalid (${yaml.scheduleError}); shown as backupConfig.scheduleError`))
+                log(chalk.yellow(`Backup scheduler: disk ${disk.id}: BACKUP.yaml schedule is invalid (${yaml.scheduleError}); running at the default ${DEFAULT_BACKUP_TIME}, shown as backupConfig.scheduleError`))
                 this.loggedScheduleError.set(disk.id, yaml.scheduleError)
             }
-            return
+        } else {
+            this.loggedScheduleError.delete(disk.id)
         }
-        this.loggedScheduleError.delete(disk.id)
         const counter = yaml.uptimeCounter ? advanceUptimeCounter(yaml.uptimeCounter, bootId, uptime) : resetUptimeCounter(bootId, uptime)
+        // Worked out from the stored lastRun / counter on every tick, so after an Engine restart a window
+        // missed while it was down is caught up once, and a window already run is not run again (#351 call 8).
         const due = decideBackupDue({
             nowMs: now, clockTrusted: trust.clockTrusted, schedule: effectiveSchedule(yaml.schedule),
             lastRun: yaml.lastRun, uptimeCounter: counter,
@@ -271,6 +275,9 @@ export class BackupScheduler {
     private async runDisk(diskId: string, yaml: BackupYamlState, due: BackupDue, now: number, bootId: string, uptime: number): Promise<void> {
         const device = this.storeHandle.doc().diskDB[diskId]?.device
         if (!device) return
+        // lastAttempt and lastRun.time hold the same value (the run start) on purpose (PR B contract,
+        // Steve #351 call 7): lastAttempt is the plain timestamp the store mirrors for the Console;
+        // lastRun stays on the disk only, with the uptime and boot id the untrusted-clock path needs.
         const claimed = await writeBackupScheduleState(device, {
             lastRun: { time: now, uptimeS: uptime, bootId },
             lastAttempt: now,

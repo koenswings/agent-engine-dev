@@ -217,20 +217,60 @@ describe('scheduled run on a trusted clock', () => {
         expect(other.doc()!.diskDB[BD].clockTrusted ?? null).toBeNull()
     })
 
-    it('an invalid schedule does not run and is shown as backupConfig.scheduleError until it is fixed (Steve, #347 call 5)', async () => {
+    it('an invalid schedule runs at the 02:30 default and is shown as backupConfig.scheduleError until fixed (#347 call 5, #351 call 1)', async () => {
         await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1), daily: '25:99' }))
         const h = await setup()
-        clock.advance(MIN)
         const s = new BackupScheduler(h, deps(), localEngineId)
-        await tick(s)
+        await tick(s)                                   // 02:29: the default slot is not due yet
         expect(runs).toEqual([])
         expect(disk(h).backupConfig?.schedule).toBeNull()
         expect(disk(h).backupConfig?.scheduleError).toMatch(/^BAD_TIME: '25:99'/)
-        await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1), daily: '02:30' }))
-        await tick(s)
-        expect(disk(h).backupConfig?.scheduleError).toBeNull()
-        expect(disk(h).backupConfig?.schedule).toEqual({ daily: '02:30' })
+        clock.advance(MIN); await tick(s)               // 02:30: runs at the default
         expect(runs).toHaveLength(2)
+        expect(disk(h).backupConfig?.scheduleError).toMatch(/^BAD_TIME: '25:99'/)
+        await fs.writeFile(yamlPath(), (await fs.readFile(yamlPath(), 'utf-8')).replace('"25:99"', '"03:00"'))
+        clock.advance(MIN); await tick(s)
+        expect(disk(h).backupConfig?.scheduleError).toBeNull()
+        expect(disk(h).backupConfig?.schedule).toEqual({ daily: '03:00' })
+        expect(runs).toHaveLength(2)                    // 03:00 today is after this run's 02:30 slot: next at 03:00
+        clock.advance(30 * MIN); await tick(s)
+        expect(runs).toHaveLength(4)
+    })
+
+    it('Engine restarts after the slot: the catch-up is worked out from the stored lastRun and runs once (#351 call 8)', async () => {
+        await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1) }))
+        const h = await setup()
+        // the Engine was down across 02:30 and comes back at 04:10 (after the 05:00-style reboot pattern, any time works)
+        clock.advance(100 * MIN)
+        clock.reboot()
+        let s = new BackupScheduler(h, deps(), localEngineId)
+        await tick(s)
+        expect(runs).toHaveLength(2)                    // one catch-up for the missed window
+        expect((await readYaml()).missedRuns).toBe(0)
+        clock.advance(MIN); await tick(s)
+        expect(runs).toHaveLength(2)
+        // a second restart inside the same window: lastRun on the disk says it ran, so no second run
+        clock.reboot()
+        s = new BackupScheduler(h, deps(), localEngineId)
+        for (let i = 0; i < 3; i++) { await tick(s); clock.advance(MIN) }
+        expect(runs).toHaveLength(2)
+    })
+
+    it('a restart in the middle of a run never runs that window again (lastRun is claimed at the start)', async () => {
+        await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1) }))
+        const h = await setup()
+        clock.advance(MIN)
+        // the first instance's backup "crashes the Engine": the run never finishes
+        const crashing = new BackupScheduler(h, deps({ runBackup: (_h, id) => { runs.push({ id, cause: 'x', at: clock.wallMs }); return new Promise<void>(() => {}) } }), localEngineId)
+        await crashing.tick()                           // the run hangs in A's backup; the Engine then "dies"
+        await new Promise(r => setTimeout(r, 50))
+        expect((await readYaml()).lastRun.time).toBe(slot(0))
+        clock.advance(MIN); clock.reboot()
+        const runsBefore = runs.length
+        expect(runsBefore).toBe(1)
+        const s = new BackupScheduler(h, deps(), localEngineId)
+        for (let i = 0; i < 3; i++) { await tick(s); clock.advance(MIN) }
+        expect(runs.length).toBe(runsBefore)
     })
 })
 

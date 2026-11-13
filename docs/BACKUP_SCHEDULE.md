@@ -63,7 +63,7 @@ uptimeCounter:              # uptime since lastRun, across reboots
 1. Reads the wall clock (plus the test offset, only under `NODE_ENV=test`), the monotonic clock, uptime and the boot id, and checks for a jump.
 2. Takes every disk with `dockedTo === localEngineId`, a device, disk type `backup` and `backupConfig.mode === 'scheduled'`. A disk with a run already in progress is left alone.
 3. Works out clock trust for the disk and writes `clockTrusted` / `clockReason` only when the value changes.
-4. Reads BACKUP.yaml (the source of truth). If `schedule` or `scheduleError` changed while the disk was docked, it mirrors them. **An invalid schedule does not run.** The store shows `backupConfig.scheduleError` (the `BAD_TIME` / `BAD_SCHEDULE` text, `schedule: null`) and the log says so once, until BACKUP.yaml is fixed (Steve, #347 call 5).
+4. Reads BACKUP.yaml (the source of truth). If `schedule` or `scheduleError` changed while the disk was docked, it mirrors them. **An invalid schedule runs at the 02:30 default** (a missed nightly backup is worse than the default time, Steve #351 call 1). The store shows `backupConfig.scheduleError` (the `BAD_TIME` / `BAD_SCHEDULE` text, `schedule: null`) and the log says so once, until BACKUP.yaml is fixed (Steve, #347 call 5).
 5. Decides if a run is due (PR A). If it is not, the tick writes the uptime counter to BACKUP.yaml when it should (hourly, or on a new boot), checks the `SKIPPED_LOCKED` catch-ups, and writes nothing to the store.
 
 **A run:**
@@ -78,7 +78,11 @@ uptimeCounter:              # uptime since lastRun, across reboots
 
 **Store changes:** at most one change per run per disk, plus one result change per attempt (`lastResult` / `backupHistory`). A tick with nothing to do changes nothing.
 
-**Retry and catch-up** (Q2, Q3), both kept in memory only, so a restart drops them:
+**After a restart** (Steve, #351 call 8): every tick decides from the `lastRun` / uptime counter stored in BACKUP.yaml, not from memory. A window missed while the Engine was down is caught up **once** at the first tick after the restart. A window that was already run (or claimed by a run the crash interrupted) is not run again.
+
+**`lastAttempt` and `lastRun.time`** hold the same value (the run start) on purpose (PR B contract, #351 call 7). `lastAttempt` is the plain timestamp the store mirrors for the Console. `lastRun` stays on the disk only, with the uptime and boot id that the untrusted-clock path needs.
+
+**Retry and catch-up after a lock** (Q2, Q3), both kept in memory only, so a restart drops them (#351 call 8: OK, because the window itself is worked out again from `lastRun`):
 - **FAILED:** retried once, 60 s after the pass over the links. A second failure waits for the next slot. `BACKUP_DISK_FULL`, `HELPER_OUTDATED`, `APP_DISK_NOT_DOCKED`, `INTERRUPTED` and `SKIPPED_LOCKED` are never retried.
 - **SKIPPED_LOCKED:** the instance is remembered with the run's window, which is the slot on the clock basis and the run start on the uptime basis. At the first tick where the instance lock, the Backup Disk lock and the in-memory mutex are all free, inside the same window, it runs once more. That catch-up is used even if it is skipped again. A new window drops the entry.
 
@@ -125,7 +129,7 @@ The store gets one change per run (and a `clockTrusted` / `clockReason` change o
 - `result` is one of `OK`, `HOOK_POST_WARNING` (success with a warning), `SKIPPED_LOCKED`, `HOOK_FALLBACK`, `INTERRUPTED`, `BACKUP_DISK_FULL`, `HELPER_OUTDATED`, `APP_DISK_NOT_DOCKED`, or `FAILED` for any other failure (Steve, #347 call 1).
 - One code per attempt, by precedence (Steve, #347 call 2): `FAILED`, `SKIPPED_LOCKED`, `HOOK_FALLBACK`, `HOOK_POST_WARNING`, `HELPER_OUTDATED` (cleanup skipped), `OK`.
 - A held lock: only a direct command with a waiting caller (Console, CLI) is refused with `BUSY` and records nothing. Everything without a caller, including an `immediate`-mode backup on dock, records `SKIPPED_LOCKED` (#347 call 4).
-- An invalid `schedule` in BACKUP.yaml is logged and mirrored as `schedule: null`, with `backupConfig.scheduleError` set to the error text (PR C, #347 call 5). The Console shows it; the disk does not run until it is fixed.
+- An invalid `schedule` in BACKUP.yaml is logged and mirrored as `schedule: null`, with `backupConfig.scheduleError` set to the error text (PR C, #347 call 5). The Console shows it; the disk runs at the 02:30 default until it is fixed (#351 call 1).
 - `method` is one of `stop`, `hook`, `live`, `none`.
 
 ## `setBackupMode` (draft; lands in PR D, then moves to COMMANDS.md)

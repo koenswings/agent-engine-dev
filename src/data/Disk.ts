@@ -29,7 +29,7 @@ export interface BackupConfig {
     schedule?: { daily: string } | null
     /**
      * Set when BACKUP.yaml has a `schedule` that does not parse (BAD_TIME / BAD_SCHEDULE text); null when valid
-     * or absent (idea#400 PR C, Steve #347 call 5). A scheduled disk with an error does not run until it is fixed.
+     * or absent (idea#400 PR C, Steve #347 call 5). A scheduled disk with an error runs at the 02:30 default until it is fixed (#351 call 1).
      */
     scheduleError?: string | null
 }
