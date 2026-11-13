@@ -144,7 +144,7 @@ The store gets one change per run (and a `clockTrusted` / `clockReason` change o
   - the slot firing once, with no store write on an idle tick and one summary change per run;
   - missed days, other Engines, and an invalid schedule;
   - the `SKIPPED_LOCKED` catch-up, retry once, stale locks, and `BUSY` naming the scheduled run;
-  - `NEVER_SYNCED` and the uptime path across a reboot, `BEFORE_BUILD`, `BEFORE_STORE`, and forward and backward jumps;
+  - `NEVER_SYNCED` and the uptime path across a reboot, `BEFORE_BUILD`, `BEFORE_STORE` without NTP and cleared by NTP (#351 call 6), and forward and backward jumps;
   - crash recovery, `Disk.cleaning`, and the build info.
 - **Unit tests:** `test/automated/backup-schedule.test.ts` (fake wall, monotonic and uptime clock in `test/harness/fakeScheduleClock.ts`; fixtures in `test/fixtures/backup-schedule/`). They run in `Europe/Brussels` for the DST cases.
 - **Test clock offset:** `IDEA_TEST_CLOCK_OFFSET_MS` is honoured only when `NODE_ENV=test` (Q10). It shifts only the scheduler's and the clock-trust check's view of the time, never the system clock.

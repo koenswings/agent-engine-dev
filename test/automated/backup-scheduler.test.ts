@@ -407,30 +407,51 @@ describe('clock trust and the uptime path (fake clock only)', () => {
         expect(runs).toEqual([])
     })
 
-    it('a clock before the newest backup timestamp is BEFORE_STORE', async () => {
+    it('without NTP, a clock before the newest backup timestamp is BEFORE_STORE and the slot does not fire', async () => {
+        ntp = false
         await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1) }))
         const h = await setup()
-        h.change(doc => { doc.instanceDB[A].lastBackup = slot(5) as Timestamp })
-        expect(newestBackupTimeFor(h.doc()!, disk(h))).toBe(slot(5))
-        clock.advance(MIN)
-        await tick(new BackupScheduler(h, deps(), localEngineId))
+        h.change(doc => { doc.instanceDB[A].lastBackup = (slot(0) + 7 * MIN) as Timestamp })
+        expect(newestBackupTimeFor(h.doc()!, disk(h))).toBe(slot(0) + 7 * MIN)
+        clock.advance(MIN)                                          // 02:30, newest backup 02:37
+        const s = new BackupScheduler(h, deps(), localEngineId)
+        await tick(s)
         expect(disk(h).clockReason).toBe('BEFORE_STORE')
+        expect(runs).toEqual([])
+        clock.advance(3 * MIN); await tick(s)                       // 02:33: within the 5 min tolerance, BEFORE_STORE gone; NEVER_SYNCED
+        expect(disk(h).clockReason).toBe('NEVER_SYNCED')
         expect(runs).toEqual([])
     })
 
-    it('a backward jump after a run never runs again: the clock is behind the run (BEFORE_STORE) and lastRun is stale', async () => {
+    it('NTP-synchronized clears BEFORE_STORE: the slot fires (Steve, #351 call 6)', async () => {
+        await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1) }))
+        const h = await setup()
+        h.change(doc => { doc.instanceDB[A].lastBackup = (slot(0) + 3 * HOUR) as Timestamp })
+        clock.advance(MIN)
+        await tick(new BackupScheduler(h, deps(), localEngineId))
+        expect(disk(h).clockTrusted).toBe(true)
+        expect(disk(h).clockReason).toBeNull()
+        expect(runs).toHaveLength(2)
+    })
+
+    it('a backward jump after a run never runs again: CLOCK_JUMP until NTP confirms, and lastRun is stale', async () => {
         await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1) }))
         const h = await setup()
         clock.advance(MIN)
         const s = new BackupScheduler(h, deps(), localEngineId)
         await tick(s)
         expect(runs).toHaveLength(2)
+        ntp = false                                                   // the step happens while NTP no longer confirms
         clock.advance(MIN); clock.jumpWall(-2 * DAY)
         for (let i = 0; i < 3; i++) { await tick(s); clock.advance(MIN) }
         expect(disk(h).clockTrusted).toBe(false)
-        expect(disk(h).clockReason).toBe('BEFORE_STORE')              // certainly wrong comes before CLOCK_JUMP
+        expect(disk(h).clockReason).toBe('CLOCK_JUMP')                // NTP was seen this boot, so not BEFORE_STORE (#351 call 6)
         clock.advance(12 * HOUR)                                      // the old day's slot passes again: still no run
         await tick(s)                                                 // (only 24 h of uptime would allow one, by design)
+        expect(runs).toHaveLength(2)
+        ntp = true                                                    // trusted again, but lastRun lies in the future: stale, no run
+        clock.advance(MIN); await tick(s)
+        expect(disk(h).clockTrusted).toBe(true)
         expect(runs).toHaveLength(2)
     })
 
