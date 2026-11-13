@@ -31,6 +31,9 @@ import { ensureAppFilesOnTarget } from '../data/RestoreAppFiles.js'
 import { localEngineId } from '../data/Engine.js'
 import { assertPreQuarantineHelper, quarantinePreRestore } from '../data/RestorePreQuarantine.js'
 import { createOperation, updateOperation } from '../data/Operations.js'
+import { readBackupYamlState, setLinkLastBackup, editBackupYaml } from '../data/BackupYamlDoc.js'
+import { applyBackupResult, recordBackupResult, successResultCode, failureResultCode, isManualBackupCause } from '../data/BackupResults.js'
+import { DEFAULT_BACKUP_TIME } from '../utils/backupSchedule.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
 import { stopInstance as stopInstanceImpl, startInstance as startInstanceImpl, BACKUP_STEPS } from '../data/Instance.js'
 
@@ -39,7 +42,7 @@ export const backupLifecycle = {
     stopInstance: stopInstanceImpl,
     startInstance: startInstanceImpl,
 }
-import { BackupMode, DiskID, DiskName, InstanceID, Timestamp, OperationCause, Operation } from '../data/CommonTypes.js'
+import { BackupMode, BackupMethodUsed, DiskID, DiskName, InstanceID, Timestamp, OperationCause, Operation } from '../data/CommonTypes.js'
 import { Store, getInstance, getDisks, findDiskByName, getLocalEngine } from '../data/Store.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js'
@@ -57,6 +60,7 @@ const activeBackups = new Set<InstanceID>()
 interface BackupYaml {
     mode: BackupMode
     links: Array<{ instanceId: string; lastBackup: number }>
+    schedule?: { daily: string }
 }
 
 const BACKUP_YAML = 'BACKUP.yaml'
@@ -97,6 +101,15 @@ export const recordBackupStaleLocks = async (storeHandle: DocHandle<Store>, back
     storeHandle.change(doc => {
         const d = doc.diskDB[backupDisk.id]
         if (d) d.backupStaleLocks = found
+        // idea#400: an interrupted backup is the instance's latest result, recorded once per
+        // lock (a later dock of the same disk with the same lock adds nothing).
+        for (const l of found) {
+            const inst = doc.instanceDB?.[l.instanceId]
+            if (!inst) continue
+            const last = inst.lastResult
+            if (last && Number(last.time) >= (l.startedAt ?? 0)) continue // already recorded, or a newer result stands
+            applyBackupResult(inst, { time: detectedAt, method: 'stop', result: 'INTERRUPTED' })
+        }
     })
 }
 
@@ -128,15 +141,6 @@ const backupDir = (backupDevice: string, instanceId: InstanceID) =>
 
 const lockFilePath = (backupDevice: string, instanceId: InstanceID) =>
     `${backupDir(backupDevice, instanceId)}/${LOCK_FILE}`
-
-const readBackupYaml = async (backupDevice: string): Promise<BackupYaml | null> => {
-    try {
-        const raw = await fs.readFile(`${disksRoot()}/${backupDevice}/${BACKUP_YAML}`, 'utf-8')
-        return YAML.parse(raw) as BackupYaml
-    } catch {
-        return null
-    }
-}
 
 const writeBackupYaml = async (backupDevice: string, yaml: BackupYaml): Promise<void> => {
     await fs.writeFile(`${disksRoot()}/${backupDevice}/${BACKUP_YAML}`, YAML.stringify(yaml))
@@ -204,6 +208,8 @@ export const backupInstance = async (
     }
     activeBackups.add(instanceId)
     let didStop = false
+    // idea#400: the App method for Instance.lastResult (x-app.backup.method; stop by default)
+    let methodUsed: BackupMethodUsed = 'stop'
     // idea#448: a pre-update backup that fails before Borg ran (e.g. HOOK_FAILED) clears
     // its own lock file, so it is no stale lock; after Borg started it stays (boot-resume).
     let wroteLock: string | null = null
@@ -216,7 +222,13 @@ export const backupInstance = async (
     if (!resourceLock.acquireAll(backupLockKeys, 'backupApp')) {
         activeBackups.delete(instanceId)
         const held = backupLockKeys.map(k => resourceLock.getLockInfo(k)).find(Boolean)
-        throw new Error(`Backup of instance ${instanceId} to disk ${backupDisk.id} not started: the instance or the Backup Disk is locked${held ? ` by '${held.kind}'` : ''} (another operation is running)`)
+        const why = `Backup of instance ${instanceId} to disk ${backupDisk.id} not started: the instance or the Backup Disk is locked${held ? ` by '${held.kind}'` : ''} (another operation is running)`
+        // idea#400 Q4 / #347 call 4: a direct command with a waiting caller is refused with BUSY and
+        // records nothing. Anything without a caller (dock, App Disk dock, crash recovery, the
+        // scheduler in PR C) records SKIPPED_LOCKED as the instance's result.
+        if (isManualBackupCause(cause)) throw new Error(`BUSY: ${why}`)
+        recordBackupResult(storeHandle, instanceId, 'stop', 'SKIPPED_LOCKED')
+        throw new Error(`SKIPPED_LOCKED: ${why}`)
     }
 
     const opId = existingOpId ?? createOperation(storeHandle, 'backupApp', {
@@ -310,6 +322,7 @@ export const backupInstance = async (
                 throw new Error(`backupApp: invalid x-app.backup (${e?.message ?? e})`)
             }
         }
+        methodUsed = backupSpec.method
         // idea#448 (Steve Q4): inside updateApp a failed preHook refuses, it never stops.
         if (preUpdate) backupSpec.fallback = 'fail'
         if (preUpdate && !preUpdate.instanceStopped && backupSpec.method !== 'hook') {
@@ -453,14 +466,8 @@ export const backupInstance = async (
         })
 
         // 7. Update BACKUP.yaml on the disk
-        const yaml = await readBackupYaml(backupDevice)
-        if (yaml) {
-            const link = yaml.links.find(l => l.instanceId === instanceId)
-            if (link) {
-                link.lastBackup = Date.now()
-            }
-            await writeBackupYaml(backupDevice, yaml)
-        }
+        // idea#400: a document edit, so schedule / lastRun / uptimeCounter and unknown keys stay
+        await setLinkLastBackup(backupDevice, instanceId, Date.now())
 
         // 8. Remove lock file (success). A backup over a stale lock also drops the
         // instance's Disk.backupStaleLocks entry: the lock it recorded is gone (idea#454).
@@ -485,6 +492,11 @@ export const backupInstance = async (
             if (hookWarning) op.args.warning = hookWarning
             if (cleanupWarning) op.args.cleanup = cleanupWarning as string
         })
+        recordBackupResult(storeHandle, instanceId, methodUsed, successResultCode({
+            hookFallback: hookResult === 'HOOK_FALLBACK',
+            hookWarning: !!hookWarning,
+            cleanupHelperOutdated: !!cleanupWarning && String(cleanupWarning).startsWith('HELPER_OUTDATED'),
+        }))
         updateOperation(storeHandle, opId, {
             status: 'Done',
             progressPercent: 100,
@@ -499,6 +511,7 @@ export const backupInstance = async (
             completedAt: Date.now() as Timestamp,
         })
         log(chalk.red(`Backup of instance ${instanceId} failed: ${e.message ?? e}`))
+        recordBackupResult(storeHandle, instanceId, methodUsed, failureResultCode(String(e?.message ?? e)))
         // Always restart instance if this run stopped it (even on failure)
         if (didStop) {
             try {
@@ -574,7 +587,7 @@ export const processBackupDisk = async (
     const backupDevice = backupDisk.device!
     log(`Processing Backup Disk ${backupDisk.id} on device ${backupDevice}`)
 
-    const yaml = await readBackupYaml(backupDevice)
+    const yaml = await readBackupYamlState(backupDevice)
     if (!yaml) {
         log(`No BACKUP.yaml found on disk ${backupDisk.id} — skipping backup processing`)
         return
@@ -582,11 +595,17 @@ export const processBackupDisk = async (
 
     const mode = yaml.mode
     const links = yaml.links.map(l => l.instanceId as InstanceID)
+    if (yaml.scheduleError) {
+        log(chalk.yellow(`Backup Disk ${backupDisk.id}: BACKUP.yaml schedule ignored (${yaml.scheduleError}); mirrored as null (idea#400)`))
+    }
 
-    // Set backupConfig in store
+    // Set backupConfig in store, and mirror the scheduled-run summary kept on the disk (idea#400)
     storeHandle.change(doc => {
         const d = doc.diskDB[backupDisk.id]
-        if (d) d.backupConfig = { mode, links }
+        if (!d) return
+        d.backupConfig = { mode, links, schedule: yaml.schedule ? { daily: yaml.schedule.daily } : null }
+        if ((d.missedRuns ?? null) !== yaml.missedRuns) d.missedRuns = yaml.missedRuns
+        if ((d.lastAttempt ?? null) !== yaml.lastAttempt) d.lastAttempt = yaml.lastAttempt as Timestamp | null
     })
 
     // Phase 2: index any app bundles on this disk into appDB for installApp / Console
@@ -608,7 +627,8 @@ export const processBackupDisk = async (
             if (!instance?.storedOn) continue
             const appDisk = store.diskDB[instance.storedOn]
             if (appDisk?.device) {
-                await triggerBackup(storeHandle, instanceId, backupDisk, 'console-command')
+                // idea#400 (Steve, #347 call 4): no caller waits on a dock backup, so a held lock records SKIPPED_LOCKED
+                await triggerBackup(storeHandle, instanceId, backupDisk, 'disk-docked')
             } else {
                 log(`Instance ${instanceId}: App Disk not docked — backup will trigger when App Disk docks`)
             }
@@ -827,19 +847,32 @@ export const createBackupDiskConfig = async (
     if (!disk.device) throw new Error(`createBackupDiskConfig: disk ${disk.id} is not docked`)
 
     // idea#451 (Steve, decision 6): a link that is kept keeps its lastBackup; new links start at 0.
-    const previous = await readBackupYaml(disk.device)
+    // idea#400: an existing BACKUP.yaml is edited as a document, so lastRun, the uptime
+    // counter, unknown keys and an existing schedule stay. A scheduled disk without a valid
+    // schedule gets 02:30.
+    const previous = await readBackupYamlState(disk.device)
     const kept = new Map<string, number>()
-    for (const l of Array.isArray(previous?.links) ? previous!.links : []) {
-        const t = Number(l?.lastBackup)
-        if (l?.instanceId != null && Number.isFinite(t)) kept.set(String(l.instanceId), t)
-    }
-    const yaml: BackupYaml = {
-        mode,
-        links: instanceIds.map(id => ({ instanceId: id, lastBackup: kept.get(String(id)) ?? 0 }))
-    }
+    for (const l of previous?.links ?? []) kept.set(String(l.instanceId), l.lastBackup)
+    const links = instanceIds.map(id => ({ instanceId: id, lastBackup: kept.get(String(id)) ?? 0 }))
+    const schedule = mode === 'scheduled' ? { daily: previous?.schedule?.daily ?? DEFAULT_BACKUP_TIME } : null
 
-    await writeBackupYaml(disk.device, yaml)
-    log(`Written BACKUP.yaml to disk ${disk.name} (mode: ${mode}, links: ${instanceIds.join(', ')})`)
+    let edited = false
+    try {
+        edited = await editBackupYaml(disk.device, doc => {
+            doc.set('mode', mode)
+            doc.set('links', doc.createNode(links))
+            // other modes keep an existing schedule, so switching back to scheduled keeps the time
+            if (schedule && !doc.has('schedule')) doc.set('schedule', doc.createNode(schedule))
+            else if (schedule && previous?.scheduleError) doc.set('schedule', doc.createNode(schedule))
+        })
+    } catch (e: any) {
+        log(chalk.yellow(`createBackupDisk: existing BACKUP.yaml on ${disk.name} is not a mapping (${e?.message ?? e}); writing a new one`))
+    }
+    if (!edited) {
+        const fresh: BackupYaml = { mode, links, ...(schedule ? { schedule } : {}) }
+        await writeBackupYaml(disk.device, fresh)
+    }
+    log(`Written BACKUP.yaml to disk ${disk.name} (mode: ${mode}${schedule ? ` at ${schedule.daily}` : ''}, links: ${instanceIds.join(', ')})`)
 
     // Re-process the disk so diskTypes and backupConfig are set in the store
     await processDisk(storeHandle, disk)

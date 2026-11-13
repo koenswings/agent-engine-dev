@@ -325,12 +325,16 @@ describe('createBackupDisk keeps lastBackup of links it keeps (idea#451, Steve d
     it('kept links keep their lastBackup, new links start at 0, dropped links go, processDisk still runs', async () => {
         const disk = h.doc().diskDB[BACKUP_DISK] as any
         await createBackupDiskConfig(h, disk, 'on-demand', [A, C])
+        // idea#400 PR B: createBackupDisk edits an existing BACKUP.yaml as a document, so
+        // the schedule and unknown keys stay (mode and links are replaced as before).
         expect((await readYaml())).toEqual({
             mode: 'on-demand',
             links: [{ instanceId: A, lastBackup: 1762900000111 }, { instanceId: C, lastBackup: 0 }],
+            schedule: { daily: '02:30' },
+            futureKey: { nested: [1, 2] },
         })
         expect(processDisk).toHaveBeenCalledTimes(1)
-        expect(h.doc().diskDB[BACKUP_DISK].backupConfig).toEqual({ mode: 'on-demand', links: [A, C] })
+        expect(h.doc().diskDB[BACKUP_DISK].backupConfig).toEqual({ mode: 'on-demand', links: [A, C], schedule: { daily: '02:30' } })
     })
 
     it('starts every link at 0 on a disk without a readable BACKUP.yaml', async () => {

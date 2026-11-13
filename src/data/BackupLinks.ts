@@ -34,6 +34,7 @@ import { BackupMode, InstanceID } from './CommonTypes.js'
 import { localEngineId } from './Engine.js'
 import { attachTraceResult } from './SummariseDisk.js'
 import { resourceLock, diskKey } from '../utils/ResourceLock.js'
+import { backupYamlIo, writeBackupDocumentAtomic } from './BackupYamlDoc.js'
 import { runningBackupOnDisk, BACKUP_IN_PROGRESS, hasBackupStaleLock } from '../monitors/backupMonitor.js'
 
 export const BACKUP_LINK_NEXT_BACKUP_NOTE = 'next backup on the next dock / backupApp'
@@ -45,10 +46,8 @@ export type BackupLinkRefusal =
 const refuse = (code: BackupLinkRefusal, command: string, why: string): Error =>
     new Error(`${code}: ${command}: ${why}`)
 
-/** File operations of the atomic write. Tests replace `rename` to simulate a failure. */
-export const backupLinkIo = {
-    rename: (from: string, to: string): Promise<void> => fsp.rename(from, to),
-}
+/** File operations of the atomic write (shared with BackupYamlDoc.ts; tests replace `rename`). */
+export const backupLinkIo = backupYamlIo
 
 const yamlPathFor = (device: string): string => `${disksRoot()}/${device}/BACKUP.yaml`
 const repoPathFor = (device: string, instanceId: string): string => `${disksRoot()}/${device}/backups/${instanceId}`
@@ -85,26 +84,6 @@ const readBackupDocument = async (device: string, command: string): Promise<Pars
         ids.push(String(id))
     }
     return { doc, links, mode: mode as BackupMode, ids }
-}
-
-/** Temp file in the same folder, fsync, rename over BACKUP.yaml. A failure leaves the old file. */
-const writeBackupDocumentAtomic = async (device: string, text: string): Promise<void> => {
-    const target = yamlPathFor(device)
-    const tmp = `${disksRoot()}/${device}/.BACKUP.yaml.tmp-${process.pid}-${Date.now()}`
-    const fh = await fsp.open(tmp, 'w')
-    try {
-        await fh.writeFile(text, 'utf-8')
-        await fh.sync()
-    } finally {
-        await fh.close()
-    }
-    try {
-        await backupLinkIo.rename(tmp, target)
-    } catch (e) {
-        // Our own temp file only; BACKUP.yaml itself is untouched.
-        await fs.remove(tmp).catch(() => { /* best effort */ })
-        throw e
-    }
 }
 
 /** Disk argument checks shared by both commands: docked here, not the system disk, a Backup Disk. */
