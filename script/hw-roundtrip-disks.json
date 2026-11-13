@@ -1,9 +1,22 @@
 {
   "idea03": {
-    "source": "idea fleet-state.json idea03 note @6970af8; idea PR #154",
-    "usbSerial": "26A1EE83197F",
+    "source": "idea fleet-state.json idea03 note @a74d6e4; idea docs/grok-bot-setup.md \u00a74.6 @e0ee92b (idea#393); earlier idea PR #154",
+    "note": "This is the idea#139 dd test disk holding Disk B. hw-roundtrip does not erase, format or repartition it, but it ejects it and simulates an unplug/re-plug (sysfs USB unbind). Do not run hw-roundtrip on idea03 while idea#139 is running.",
     "diskSerial": "3813430-532011020",
-    "uuids": ["3E50-902A", "378383c9-0612-4c82-9c07-8c34d15253ba"],
-    "refuseSerials": ["AA202000000000004820"]
+    "refuseSerials": [
+      "AA202000000000004820",
+      "AA000000000000005638"
+    ],
+    "informational": {
+      "comment": "Not matched on. The USB bridge changes with the enclosure and the UUID with every idea#139 dd rewrite.",
+      "usbSerial": "26A1EE830E37",
+      "uuids": [
+        "b3e90dc7-d00a-4465-9ccf-d8e8d9993bbb"
+      ],
+      "refuseSerialsNotes": {
+        "AA202000000000004820": "idea03 root SSD (sda)",
+        "AA000000000000005638": "protected Intenso hw fixture, USB bridge 26A1EE830C13"
+      }
+    }
   }
 }

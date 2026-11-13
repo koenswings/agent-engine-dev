@@ -33,6 +33,7 @@ import { enginePeerId } from '../../src/data/StoreScope.js'
 import { pruneDepartedMessages, QueuedEvent } from '../../src/wsServerThread.js'
 import { PortNumber } from '../../src/data/CommonTypes.js'
 import { largeStoreDoc } from '../harness/largeStoreDoc.js'
+import { commandLogDoc } from '../harness/commandLogDoc.js'
 import type { WsSyncClientInput, WsSyncClientResult } from '../harness/wsSyncClientWorker.js'
 
 const BURST = Number(process.env.POSTBURST_CLIENTS ?? 10)
@@ -50,12 +51,6 @@ const freePort = (): Promise<number> => new Promise((resolve, reject) => {
     const s = net.createServer(); s.once('error', reject)
     s.listen(0, '127.0.0.1', () => { const { port } = s.address() as net.AddressInfo; s.close(() => resolve(port)) })
 })
-
-const extraDoc = (changes: number): Uint8Array => {
-    let d = A.from<any>({ logs: [] })
-    for (let i = 0; i < changes; i++) d = A.change(d, (x: any) => { x.logs.push({ ts: 1791000000000 + i, msg: `step ${i}: docker compose pull kolibri ... ok` }) })
-    return A.save(d)
-}
 
 /** One fresh storage-less client in its own thread; resolves with its result (it exits right after 'ready'). */
 const runClient = (input: WsSyncClientInput): Promise<WsSyncClientResult> => new Promise(resolve => {
@@ -83,16 +78,26 @@ describe('Automerge WS server after a burst of short-lived clients (r34 POST-BUR
     const extraIds: DocumentId[] = []
 
     beforeAll(async () => {
+        // Phase logs: a hook timeout used to be silent about which step was still
+        // running (idea#332). Docs come from committed fixtures, so this should
+        // stay well under the budget; the stamps prove it if it does not.
+        const t0 = performance.now()
+        const phase = (label: string) => { console.log(`[post-burst] ${label} at ${Math.round(performance.now() - t0)} ms`) }
         dataDir = tempDir('idea-postburst-')
         const seed = new Repo({ network: [], storage: new NodeFSStorageAdapter(dataDir) })
         mainId = seed.import(largeStoreDoc()).documentId
-        extraIds.push(seed.import(extraDoc(6_000)).documentId, seed.import(extraDoc(1_000)).documentId)
+        phase('largeStoreDoc imported')
+        extraIds.push(seed.import(commandLogDoc(6_000)).documentId, seed.import(commandLogDoc(1_000)).documentId)
+        phase('command-log docs imported')
         await seed.flush()
+        phase('seed.flush')
         const port = await freePort()
         repo = await startAutomergeServer(dataDir, port as PortNumber, { storeDocId: mainId, engineId: 'ENGINE_postburst' })
+        phase('startAutomergeServer')
         for (const id of [mainId, ...extraIds]) await (await repo.find(id)).whenReady()
+        phase('whenReady')
         url = `ws://127.0.0.1:${port}`
-    }, envTimeoutMs('IDEA_TEST_POST_BURST_SETUP_MS', 180_000 * PI_TIMING_FACTOR))   // IDEA_TEST_POST_BURST_SETUP_MS overrides (idea#332: >360 s in the full suite on idea04, 76 s alone). setup only (large doc import + server start): timed out at 180 s on a Pi 4 under the full suite (on-Pi triage idea04 2026-10-25)
+    }, envTimeoutMs('IDEA_TEST_POST_BURST_SETUP_MS', 180_000 * PI_TIMING_FACTOR))   // IDEA_TEST_POST_BURST_SETUP_MS overrides. Setup used to generate largeStoreDoc (~96k changes) into /tmp plus extraDoc(6000) in-process; a cold /tmp cache timed out at 360 s on idea04 under test:full (idea#332). Fixtures are now committed.
 
     afterAll(async () => {
         const adapter: any = repo?.networkSubsystem.adapters[0]
@@ -155,7 +160,7 @@ describe('storage-less clients still get docs their Engine relays (Console remot
         const dirA = tempDir('idea-postburst-a-')
         const dirB = tempDir('idea-postburst-b-')
         const seedB = new Repo({ network: [], storage: new NodeFSStorageAdapter(dirB) })
-        onlyOnB = seedB.import(extraDoc(200)).documentId
+        onlyOnB = seedB.import(commandLogDoc(200)).documentId
         await seedB.flush()
         const [portA, portB] = [await freePort(), await freePort()]
         // Both Engines in one store (store-scoped peering: A and B must share a store to sync)
