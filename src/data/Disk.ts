@@ -27,6 +27,11 @@ export interface BackupConfig {
     links: InstanceID[]
     /** BACKUP.yaml `schedule` mirrored by the docked Engine (idea#400); null/absent when not set. Daily only. */
     schedule?: { daily: string } | null
+    /**
+     * Set when BACKUP.yaml has a `schedule` that does not parse (BAD_TIME / BAD_SCHEDULE text); null when valid
+     * or absent (idea#400 PR C, Steve #347 call 5). A scheduled disk with an error does not run until it is fixed.
+     */
+    scheduleError?: string | null
 }
 
 /** A leftover .backup-in-progress lock found when a Backup Disk docks or the Engine boots (idea#446). */

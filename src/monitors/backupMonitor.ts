@@ -226,7 +226,10 @@ export const backupInstance = async (
         // idea#400 Q4 / #347 call 4: a direct command with a waiting caller is refused with BUSY and
         // records nothing. Anything without a caller (dock, App Disk dock, crash recovery, the
         // scheduler in PR C) records SKIPPED_LOCKED as the instance's result.
-        if (isManualBackupCause(cause)) throw new Error(`BUSY: ${why}`)
+        if (isManualBackupCause(cause)) {
+            const running = runningBackupOnDisk(storeHandle.doc(), backupDisk.id)
+            throw new Error(`BUSY: ${why}${running?.cause === 'scheduled-backup' ? '; a scheduled backup is running on this Backup Disk' : ''}`)
+        }
         recordBackupResult(storeHandle, instanceId, 'stop', 'SKIPPED_LOCKED')
         throw new Error(`SKIPPED_LOCKED: ${why}`)
     }
@@ -338,7 +341,7 @@ export const backupInstance = async (
         let cleanupWarning: string | null = null
         const backupMountRoot = joinMountRoot(await diskMountRoot(backupDisk as Disk))
         if (cleanupIsEnabled()) {
-            const before = await backupCleanupRunner.run({
+            const before = await runCleanupTracked(storeHandle, backupDisk.id, {
                 backupDevice, mountRoot: backupMountRoot, currentInstanceId: instanceId, phase: 'before',
             })
             if (before.status === 'HELPER_OUTDATED') cleanupWarning = before.warning ?? 'HELPER_OUTDATED'
@@ -478,7 +481,7 @@ export const backupInstance = async (
         }
 
         if (cleanupIsEnabled()) {
-            const after = await backupCleanupRunner.run({
+            const after = await runCleanupTracked(storeHandle, backupDisk.id, {
                 backupDevice, mountRoot: backupMountRoot, currentInstanceId: instanceId, phase: 'after',
             })
             if (after.status === 'HELPER_OUTDATED' && !cleanupWarning) {
@@ -539,6 +542,31 @@ export const backupInstance = async (
     }
 }
 
+/**
+ * Fullness cleanup with Disk.cleaning / cleaningStartedAt (idea#400 PR C): set when the cleanup
+ * starts deleting archives and cleared when it ends, so the store changes only when cleanup
+ * deletes. cleaningStartedAt stays as the time of the last cleanup.
+ */
+export const runCleanupTracked = async (
+    storeHandle: DocHandle<Store>, diskId: DiskID, opts: Parameters<typeof backupCleanupRunner.run>[0],
+): ReturnType<typeof backupCleanupRunner.run> => {
+    let marked = false
+    try {
+        return await backupCleanupRunner.run({
+            ...opts,
+            onDeleteStart: () => {
+                marked = true
+                storeHandle.change(doc => {
+                    const d = doc.diskDB[diskId]
+                    if (d) { d.cleaning = true; d.cleaningStartedAt = Date.now() as Timestamp }
+                })
+            },
+        })
+    } finally {
+        if (marked) storeHandle.change(doc => { const d = doc.diskDB[diskId]; if (d) d.cleaning = false })
+    }
+}
+
 /** Lock keys a backup holds: the instance and the Backup Disk (idea#126). */
 export const backupLockKeysFor = (instanceId: string, backupDiskId: string): string[] =>
     [instanceKey(instanceId), diskKey(backupDiskId)]
@@ -596,14 +624,15 @@ export const processBackupDisk = async (
     const mode = yaml.mode
     const links = yaml.links.map(l => l.instanceId as InstanceID)
     if (yaml.scheduleError) {
-        log(chalk.yellow(`Backup Disk ${backupDisk.id}: BACKUP.yaml schedule ignored (${yaml.scheduleError}); mirrored as null (idea#400)`))
+        log(chalk.yellow(`Backup Disk ${backupDisk.id}: BACKUP.yaml schedule ignored (${yaml.scheduleError}); mirrored as null with backupConfig.scheduleError (idea#400)`))
     }
 
     // Set backupConfig in store, and mirror the scheduled-run summary kept on the disk (idea#400)
     storeHandle.change(doc => {
         const d = doc.diskDB[backupDisk.id]
         if (!d) return
-        d.backupConfig = { mode, links, schedule: yaml.schedule ? { daily: yaml.schedule.daily } : null }
+        // scheduleError: the marker the Console shows for an invalid schedule (Steve, #347 call 5)
+        d.backupConfig = { mode, links, schedule: yaml.schedule ? { daily: yaml.schedule.daily } : null, scheduleError: yaml.scheduleError }
         if ((d.missedRuns ?? null) !== yaml.missedRuns) d.missedRuns = yaml.missedRuns
         if ((d.lastAttempt ?? null) !== yaml.lastAttempt) d.lastAttempt = yaml.lastAttempt as Timestamp | null
     })

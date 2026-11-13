@@ -144,6 +144,9 @@ This document provides a reference for the main provisioning and utility scripts
 
 ---
 
+### `write-build-info.mjs` (`script/write-build-info.mjs`)
+-   **Description:** Run by `pnpm build` after `tsc` (idea#400 PR C, Steve Q12). Writes `dist/build-info.json` = `{ commit, commitTimeMs }` from `git rev-parse HEAD` and `git log -1 --format=%ct`. The scheduled-backup clock check uses `commitTimeMs` as its floor (`BEFORE_BUILD`). Without git the file is removed and the check is skipped. Optional argument: the output path.
+
 ### Root helpers `idea-flash-card` (v3) and `idea-write-card-timezone` (`script/build_image_assets/`, idea#208)
 
 Installed by build-engine (`installRootHelpers`) as root-owned 0755 copies in `/usr/local/sbin`. `idea-flash-card` is the only one in sudoers (`11-engine-files`, unchanged). v3 adds `--timezone <Area/City>`: re-validated as root (tz regex, no `..`, file under `/usr/share/zoneinfo`; else `refused: BAD_ARGS`), then after the verified write and before power-off it calls `idea-write-card-timezone <byId> /dev/sdX <sizeBytes> <zone>`, which writes `idea-timezone.txt` = `<zone>\n` on FAT partition 1 (same identity checks as `idea-write-home-engine`). A failed timezone write leaves the flash `ok` with `"timezoneFile":"failed"`. Tests: `test/automated/client-timezone.test.ts`. Any Pi that flashes cards needs both helpers redeployed (`installRootHelpers`).

@@ -23,7 +23,7 @@
     "test1": "mocha --require ts-node/register --extensions ts,tsx --loader ts-node/esm --reporter list 'test/*.ts' --exit",
     "cleanOld": "tsc --build --clean",
     "clean": "rm -fr dist/*",
-    "build": "pnpm clean && tsc",
+    "build": "pnpm clean && tsc && node script/write-build-info.mjs",
     "testold": "tsc --build --clean && tsc && mocha 'dist/test/*.js' --exit",
     "testdev": "tsc --build --clean && tsc && VERBOSITY=3 mocha --reporter list 'dist/test/*.js' --exit",
     "testDB": "tsc --build --clean && tsc && YPERSISTENCE=./yjs-db mocha 'dist/test/*.js' --exit",

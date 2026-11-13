@@ -20,6 +20,7 @@ import { createServerStore } from './data/Store.js'
 import { prepareStoreIdentity, storeIdentityPaths } from './data/StoreIdentity.js'
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
 import { recoverInterruptedOperations, archiveOldOperations } from './data/Operations.js'
+import { startBackupScheduler } from './monitors/backupScheduler.js'
 import { enableDockerMetricsMonitor } from './monitors/dockerMetricsMonitor.js'
 import { enableDiskSizeMonitor } from './data/DiskSize.js'
 import { ensureEngineStateDir, setFilesMountStore } from './data/FilesMount.js'
@@ -286,6 +287,9 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     startLiveness(storeHandle, String(localEngineId))
     // The heartbeat timer still repairs this Engine's peerAccess, expires stale
     // peers and archives old operations; it no longer writes to the store itself
+    // idea#400: scheduled Backup Disks run from a 60 s tick inside the Engine (never host cron)
+    startBackupScheduler(storeHandle)
+
     enableTimeMonitor(heartbeatIntervalMs, () => {
         archiveOldOperations(storeHandle).catch(e => print(chalk.red(`archive operations: ${e}`)))
         peerAccess.onHeartbeat().catch(e => print(chalk.red(`peer access heartbeat: ${e}`)))
