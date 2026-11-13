@@ -552,6 +552,9 @@ describe('real backupInstance, crash recovery, helpers', () => {
             expect(readBuildInfo(path.join(dir, 'missing.json'))).toBeNull()
             expect(parseBuildInfo({ commit: 'abc', commitTimeMs: 1 })).toBeNull()
             expect(parseBuildInfo({ commit: 'a'.repeat(40), commitTimeMs: -5 })).toBeNull()
+            // a bare file name (no directory part) is written in the working directory, not made a directory
+            execFileSync('node', [path.resolve('script/write-build-info.mjs'), 'bare-build-info.json'], { stdio: 'ignore', cwd: dir, env: { ...process.env, GIT_DIR: path.resolve('.git') } })
+            expect(readBuildInfo(path.join(dir, 'bare-build-info.json'))?.commitTimeMs).toBe(ct)
         } finally {
             await fs.remove(dir)
         }
