@@ -7,5 +7,3 @@
 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMlIyR5gN9KVEOeQl4cAsJOho/2ZprcyXhxTof8BKBQ2 koenswings@Macbook-Air-15.local
 # Atlas box key (bot computer), SHA256:L+pEPj+XrDyBzbKiA9CdsXK9cTuos9EHUSTWKUDfNkg (required)
 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP5pJ426w/HVTUBn4wIfxv4XGnRjoQnihRAavat+ww/p atlas-box@grok-bot
-# idea02 test-walk walker (probably; Steve decides whether it stays), SHA256:d0DTf5fVFugD9vBG5DyZxSd+6YQy91Sv3/TLfavbcig (allowed, not required)
-ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIIyC4cm+Pt+aOqYtDpgwBZ30O5LIUlbvZfshpa/WoE4 walker@idea02
