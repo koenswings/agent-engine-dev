@@ -408,7 +408,7 @@ export const OPERATOR_KEYS_TOKEN = `${OPERATOR_KEYS_DIR}/%u`
 /**
  * Keys every image must carry (each must be in the list; order is not checked; more keys are allowed).
  * idea#453 (Atlas, idea01 authorized_keys 2026-11-12): Koen's MacBook Air, the Atlas box key.
- * The idea02 walker key is in the list but not required.
+ * The idea02 walker key is not baked in; if a pool Pi needs it, Atlas adds it per device through the fleet scripts.
  */
 export const REQUIRED_OPERATOR_KEY_FPS = [
     'SHA256:yPqCMHCaXih7uMHxpXd469dAmgkDChOntKkQQVMF90I', // koenswings@Macbook-Air-15.local

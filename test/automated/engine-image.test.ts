@@ -269,15 +269,17 @@ describe('operator SSH login (idea#453, option B)', () => {
     const ctx = (over: object = {}) => ({ root, enginePath: ENGINE, lock: lock(), storeIdentity: storeShas, ...over })
     const problemsOf = async (name: string, over: object = {}) => (await verifyRootfsChecks(ctx(over))).find(x => x.name === name)!.problems.join('\n')
 
-    it('the committed list is public keys only: Koen, Atlas box, idea02 walker (in that order); Koen + Atlas required', async () => {
+    it('the committed list is public keys only: Koen and Atlas box (in that order); both required; walker@idea02 is not present', async () => {
         const text = await fs.readFile(path.join(ASSETS, OPERATOR_KEYS_ASSET), 'utf8')
         expect(text).not.toMatch(/PRIVATE KEY/)
+        expect(text).not.toMatch(/walker@idea02/)
         const keys = text.split('\n').filter(l => l.trim() && !l.startsWith('#'))
-        expect(keys).toEqual([KOEN_LINE, ATLAS_LINE, WALKER_LINE])
-        expect(keys.map(publicKeyFingerprint)).toEqual([KOEN_FP, ATLAS_FP, 'SHA256:d0DTf5fVFugD9vBG5DyZxSd+6YQy91Sv3/TLfavbcig'])
+        expect(keys).toEqual([KOEN_LINE, ATLAS_LINE])
+        expect(keys.map(publicKeyFingerprint)).toEqual([KOEN_FP, ATLAS_FP])
+        expect(keys).not.toContain(WALKER_LINE)
+        expect(keys.map(publicKeyFingerprint)).not.toContain('SHA256:d0DTf5fVFugD9vBG5DyZxSd+6YQy91Sv3/TLfavbcig')
         expect([...REQUIRED_OPERATOR_KEY_FPS]).toEqual([KOEN_FP, ATLAS_FP])
         expect(operatorKeysProblems(text)).toEqual([])
-        // the walker key is allowed, not required
         expect(operatorKeysProblems(REQUIRED_LINES)).toEqual([])
     })
     it('fingerprints like ssh-keygen -lf; options, junk and a type/blob mismatch are not plain keys', () => {

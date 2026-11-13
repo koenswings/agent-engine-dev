@@ -42,7 +42,7 @@ No SSH, nothing started, no device identity. Inside `chroot <MNT>`:
 3b. Operator SSH login (idea#453, option B): `script/build_image_assets/idea-operator-keys.pub` (committed fleet
    operator PUBLIC keys, taken from idea01's `authorized_keys`: Koen's MacBook Air
    `SHA256:yPqCMHCaXih7uMHxpXd469dAmgkDChOntKkQQVMF90I` and the Atlas box key
-   `SHA256:L+pEPj+XrDyBzbKiA9CdsXK9cTuos9EHUSTWKUDfNkg` (both required by verify), and the idea02 walker key (allowed)) is installed
+   `SHA256:L+pEPj+XrDyBzbKiA9CdsXK9cTuos9EHUSTWKUDfNkg` (both required by verify). The idea02 walker key is not baked in; if a pool Pi needs it, Atlas adds it per device through the fleet scripts.) is installed
    as `/etc/ssh/idea_operator_keys/pi` (dir root:root 0755, file root:root 0644), which `10-idea-peer.conf` names in
    `AuthorizedKeysFile` (`/etc/ssh/idea_operator_keys/%u`). `10-idea-login.conf` (sorted before `10-idea-peer.conf`
    and any `50-cloud-init.conf`; the first value wins) sets `PasswordAuthentication no` and
