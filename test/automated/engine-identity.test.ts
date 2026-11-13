@@ -22,7 +22,11 @@ const fake = (bin: string, name: string, body = '') => {
     return p
 }
 
-const mk = (opts: { tailscaleRc?: number, tailscaleEcho?: boolean, noTailscale?: boolean } = {}): Sb => {
+/**
+ * tailscaleFail: the first N `tailscale up` calls fail (exit 1), later ones succeed (counter in <tmp>/ts-count).
+ * runRetry: the fake setsid runs the same-boot retry in the foreground (otherwise it is only recorded).
+ */
+const mk = (opts: { tailscaleRc?: number, tailscaleEcho?: boolean, noTailscale?: boolean, tailscaleFail?: number, runRetry?: boolean, delays?: string } = {}): Sb => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'idea-test-identity-'))
     const s: Sb = { tmp, boot: path.join(tmp, 'boot'), etc: path.join(tmp, 'etc'), state: path.join(tmp, 'state'),
         zi: path.join(tmp, 'zoneinfo'), calls: path.join(tmp, 'calls'), script: path.join(tmp, 'idea-engine-identity'), bin: path.join(tmp, 'bin') }
@@ -32,7 +36,9 @@ const mk = (opts: { tailscaleRc?: number, tailscaleEcho?: boolean, noTailscale?:
     fs.writeFileSync(path.join(s.etc, 'hosts'), '127.0.0.1\tlocalhost\n127.0.1.1\tidea-default\n')
     fs.writeFileSync(path.join(s.etc, 'timezone'), 'UTC\n')
     fs.writeFileSync(s.calls, '')
-    const tsBody = `${opts.tailscaleEcho ? 'echo "using key $(cat \${2#--auth-key=file:})"; echo "key file \${2}"' : ''}\nexit ${opts.tailscaleRc ?? 0}`
+    const tsBody = opts.tailscaleFail !== undefined
+        ? `n=$(cat "${tmp}/ts-count" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "${tmp}/ts-count"; [ $n -gt ${opts.tailscaleFail} ] || { echo "backend error: no network ${KEY}"; exit 1; }; exit 0`
+        : `${opts.tailscaleEcho ? 'echo "using key $(cat \${2#--auth-key=file:})"; echo "key file \${2}"' : ''}\nexit ${opts.tailscaleRc ?? 0}`
     const bins = {
         HOSTNAMECTL: fake(s.bin, 'hostnamectl'),
         TIMEDATECTL: fake(s.bin, 'timedatectl', `printf '%s\\n' "$2" > "${s.etc}/timezone"`),
@@ -40,6 +46,9 @@ const mk = (opts: { tailscaleRc?: number, tailscaleEcho?: boolean, noTailscale?:
         TAILSCALE: opts.noTailscale ? path.join(s.bin, 'missing-tailscale') : fake(s.bin, 'tailscale', tsBody),
         SHRED: fake(s.bin, 'shred', 'for a; do f=$a; done; : > "$f"; rm -f -- "$f"'),
         SYNC: fake(s.bin, 'sync'),
+        SETSID: fake(s.bin, 'setsid', opts.runRetry ? 'exec bash "$@"' : ''),
+        FLOCK: fake(s.bin, 'flock'),
+        SLEEP: fake(s.bin, 'sleep'),
     }
     let t = fs.readFileSync(SRC, 'utf8')
     const set = (k: string, v: string) => {
@@ -47,6 +56,7 @@ const mk = (opts: { tailscaleRc?: number, tailscaleEcho?: boolean, noTailscale?:
     }
     set('BOOT_DIR', s.boot); set('ETC_DIR', s.etc); set('STATE_DIR', s.state); set('ZONEINFO', s.zi)
     for (const [k, v] of Object.entries(bins)) set(k, v)
+    if (opts.delays !== undefined) set('TS_RETRY_DELAYS', `"${opts.delays}"`)
     fs.writeFileSync(s.script, t, { mode: 0o755 })
     return s
 }
@@ -65,7 +75,7 @@ describe('idea-engine-identity (idea#322)', () => {
     describe('basic', () => {
         beforeEach(() => { sb = mk() })
         it('prints its version', () => {
-            expect(spawnSync('bash', [SRC, '--version'], { encoding: 'utf8' }).stdout.trim()).toBe('idea-engine-identity 1')
+            expect(spawnSync('bash', [SRC, '--version'], { encoding: 'utf8' }).stdout.trim()).toBe('idea-engine-identity 2')
         })
         it('does nothing when no identity files are present', () => {
             const r = run()
@@ -192,11 +202,15 @@ describe('idea-engine-identity (idea#322)', () => {
             expect(fs.readFileSync(e('tailscale/debug-authkey'), 'utf8')).toBe(KEY + '\n')
             expect(fs.existsSync(path.join(sb.state, 'tailscale-pending'))).toBe(true)
         })
-        it('offline: key wiped from the card at once, join retried next boot', () => {
+        it('offline: key wiped from the card at once, first attempt fails, the same-boot retry is started detached', () => {
             sb = mk({ tailscaleRc: 1 })
             writeKey()
             const r = run()
-            expect(r.out).toMatch(/tailscale up failed \(exit 1; offline\?\); will retry next boot/)
+            expect(r.out).toMatch(/Tailscale key moved to .*debug-authkey and wiped from the boot partition/)
+            expect(r.out).toMatch(/tailscale up failed \(exit 1; offline\?\); retrying this boot \(attempt 1\/9\)/)
+            expect(r.out).not.toMatch(/will retry next boot/)
+            expect(r.calls).toMatch(new RegExp(`^setsid ${sb.script} --join-retry$`, 'm'))
+            expect(r.calls.match(/^tailscale up /mg)!.length).toBe(1)
             expect(fs.existsSync(b('idea-secrets/tailscale-authkey'))).toBe(false)
             const dst = e('tailscale/debug-authkey')
             expect(fs.readFileSync(dst, 'utf8')).toBe(KEY + '\n')
@@ -207,6 +221,77 @@ describe('idea-engine-identity (idea#322)', () => {
             expect(run().calls).toMatch(/^tailscale up /m)
             // still failing, so the dest key stays for the retry
             expect(fs.readFileSync(dst, 'utf8')).toBe(KEY + '\n')
+        })
+        it('same boot: retries with backoff and joins when the network comes up; key wiped first, tag:idea, never ephemeral, never logged', () => {
+            sb = mk({ tailscaleFail: 3, runRetry: true })
+            writeKey()
+            const r = run()
+            expect(r.status).toBe(0)
+            expect(r.out).not.toContain(KEY)
+            expect(r.out).not.toMatch(/tskey-/)
+            const lines = r.out.split('\n').filter(Boolean)
+            expect(lines[0]).toMatch(/Tailscale key moved to .* and wiped from the boot partition/)
+            expect(lines[1]).toMatch(/tailscale up failed \(exit 1; offline\?\); retrying this boot \(attempt 1\/9\)/)
+            expect(r.out).toMatch(/retrying this boot \(attempt 2\/9\)/)
+            expect(r.out).toMatch(/retrying this boot \(attempt 3\/9\)/)
+            expect(r.out).not.toMatch(/attempt 4\/9/)
+            expect(lines.at(-1)).toMatch(/joined the tailnet/)
+            expect(r.calls.match(/^sleep \d+$/mg)).toEqual(['sleep 15', 'sleep 30', 'sleep 60'])
+            const ups = r.calls.match(/^tailscale up .*$/mg)!
+            expect(ups.length).toBe(4)
+            for (const u of ups) { expect(u).toMatch(/--advertise-tags=tag:idea/); expect(u).not.toMatch(/ephemeral/) }
+            expect(r.calls).toMatch(/^flock -n 9$/m)
+            // the card key was wiped before the first attempt
+            expect(r.calls.indexOf('shred -u -z -n 1')).toBeLessThan(r.calls.indexOf('tailscale up'))
+            expect(fs.existsSync(e('tailscale/debug-authkey'))).toBe(false)
+            expect(fs.existsSync(path.join(sb.state, 'tailscale-pending'))).toBe(false)
+        })
+        it('same boot: a bounded budget; when it runs out, gives up this boot and the next boot retries from debug-authkey', () => {
+            sb = mk({ tailscaleFail: 100, runRetry: true, delays: '5 10' })
+            writeKey()
+            const r = run()
+            expect(r.out).toMatch(/retrying this boot \(attempt 1\/3\)/)
+            expect(r.out).toMatch(/retrying this boot \(attempt 2\/3\)/)
+            expect(r.out).toMatch(/attempt 3\/3, giving up this boot, will retry next boot/)
+            expect(r.out).not.toContain(KEY)
+            expect(r.calls.match(/^sleep \d+$/mg)).toEqual(['sleep 5', 'sleep 10'])
+            expect(r.calls.match(/^tailscale up /mg)!.length).toBe(3)
+            expect(fs.existsSync(path.join(sb.state, 'tailscale-pending'))).toBe(true)
+            expect(fs.readFileSync(e('tailscale/debug-authkey'), 'utf8')).toBe(KEY + '\n')
+            // next boot: no card key any more, joins from /etc/tailscale/debug-authkey
+            fs.writeFileSync(path.join(sb.tmp, 'ts-count'), '1000')
+            const t = fs.readFileSync(path.join(sb.bin, 'tailscale'), 'utf8').replace('-gt 100 ]', '-gt 0 ]')
+            fs.writeFileSync(path.join(sb.bin, 'tailscale'), t)
+            const next = run()
+            expect(next.out).toMatch(/joined the tailnet/)
+            expect(next.out).not.toMatch(/Tailscale key moved/)
+            expect(fs.existsSync(path.join(sb.state, 'tailscale-pending'))).toBe(false)
+            expect(fs.existsSync(e('tailscale/debug-authkey'))).toBe(false)
+        })
+        it('no retry budget (TS_RETRY_DELAYS empty): one attempt, then next boot', () => {
+            sb = mk({ tailscaleRc: 1, delays: '' })
+            writeKey()
+            const r = run()
+            expect(r.out).toMatch(/tailscale up failed \(exit 1; offline\?\); giving up this boot, will retry next boot/)
+            expect(r.calls).not.toMatch(/^setsid /m)
+        })
+        it('--join-retry stops at once when already joined, or when the key is gone (NO_KEY)', () => {
+            sb = mk({ tailscaleRc: 1 })
+            const rr = (args: string[]) => spawnSync('bash', [sb.script, ...args], { encoding: 'utf8', env: { PATH: process.env.PATH ?? '', CALLS: sb.calls } })
+            expect(rr(['--join-retry']).stdout).toBe('')
+            expect(fs.readFileSync(sb.calls, 'utf8')).not.toMatch(/^(sleep|tailscale) /m)
+            fs.ensureDirSync(sb.state); fs.writeFileSync(path.join(sb.state, 'tailscale-pending'), '')
+            const r = rr(['--join-retry'])
+            expect(r.stdout).toMatch(/refused: NO_KEY/)
+            expect(fs.readFileSync(sb.calls, 'utf8').match(/^tailscale up /mg)).toBeNull()
+            expect(fs.existsSync(path.join(sb.state, 'tailscale-pending'))).toBe(false)
+        })
+        it('the default budget is bounded (8 retries, under 30 minutes of waits)', () => {
+            const m = /^TS_RETRY_DELAYS="([0-9 ]+)"$/m.exec(fs.readFileSync(SRC, 'utf8'))!
+            const d = m[1].split(' ').map(Number)
+            expect(d.length).toBe(8)
+            expect(d.reduce((a, x) => a + x, 0)).toBeLessThan(30 * 60)
+            expect(Math.max(...d)).toBeLessThanOrEqual(300)
         })
         it('no tailscale installed: refused, retried later', () => {
             sb = mk({ noTailscale: true })
