@@ -29,6 +29,7 @@ import { log } from './utils.js'
 import { config } from '../data/Config.js'
 import { peerSshArgv, checkEngineId, normaliseEd25519 } from './peerSsh.js'
 import { normalizeBackupExclude } from './backupExclude.js'
+import { isStrictInstanceId, isLegacyDottedInstanceId } from './instanceIds.js'
 
 /** Installed path of the helper (a root-owned copy, 0755; build-engine installUdev). */
 export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
@@ -38,7 +39,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '12'
+export const APP_DATA_HELPER_VERSION = '13'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -157,6 +158,14 @@ export const installUsageKeyArgs = (ipv4: string, pubKey: string): string[] => {
 
 /** idea#347: rename instances/<id> to <disk>/.idea-quarantine/<id>-<UTC stamp>; prints the new path. */
 export const quarantineArgs = (root: string, id: string): string[] => ['quarantine', checkRoot(root), checkId(id)]
+/**
+ * removeInstance only (idea#479, helper v13): `quarantine` with a strict id or a
+ * legacy dotted id (`RE_LEGACY_ID` in the helper). Every other subcommand stays strict.
+ */
+export const removalQuarantineArgs = (root: string, id: string): string[] => {
+    if (!isStrictInstanceId(id) && !isLegacyDottedInstanceId(id)) throw new Error(`'${id}' is not an instance id the app-data helper accepts for removal`)
+    return ['quarantine', checkRoot(root), id]
+}
 export const deleteArgs = (root: string, id: string): string[] => ['delete', checkRoot(root), checkId(id)]
 export const borgInitArgs = (bdev: string, id: string): string[] => ['borg-init', checkRoot(bdev), checkId(id)]
 export const borgInfoArgs = (bdev: string, id: string): string[] => ['borg-info', checkRoot(bdev), checkId(id)]

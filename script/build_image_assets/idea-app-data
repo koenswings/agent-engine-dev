@@ -27,7 +27,8 @@
 #   idea-app-data delete       <root> <id>
 #   idea-app-data quarantine   <root> <id>   (v4, idea#347: rename instances/<id> to
 #                                            .idea-quarantine/<id>-<UTC stamp> on the same disk,
-#                                            root-owned 0700; never deletes from .idea-quarantine)
+#                                            root-owned 0700; never deletes from .idea-quarantine;
+#                                            v13, idea#479: <id> may also be a legacy dotted id, see below)
 #   Peer side (through idea-peer-gate; every receive refuses below the free-space floor):
 #   idea-app-data peer-receive       <peerEngineId> <dstRoot> <dstId> <rsync server args...>
 #                                    (a NEW instance folder; recorded in the ledger)
@@ -76,6 +77,9 @@
 #            <slot name>  → TEST-ONLY root bridge (see below), e.g. idea-test-1
 #   bdev     like root but never 'system'; the disk must hold BACKUP.yaml
 #   id       ^[a-z0-9][a-z0-9-]{0,63}$
+#   legacy id (quarantine only, v13, idea#479) ^[a-z0-9][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)+$, at most
+#            128 characters: an older Engine's dotted id such as <id>.backup-<stamp>.
+#            No '..', no leading/trailing dot, no '/'. Every other subcommand stays strict.
 #   archive  ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9-]{8,16}Z$   (backupInstance's format)
 #   stamp    ^[0-9]{8}T[0-9]{6,15}Z$   (UTC stamp for .idea-verify/<id>-<stamp>/; no '/', no '..')
 #   strip    ^[1-9]$
@@ -139,7 +143,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=12
+readonly IDEA_APP_DATA_VERSION=13
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -223,6 +227,7 @@ export HOME="$ROOT_HOME"
 
 RE_DEV='^sd[a-z][1-9]$'
 RE_ID='^[a-z0-9][a-z0-9-]{0,63}$'
+RE_LEGACY_ID='^[a-z0-9][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)+$'
 RE_SLOT='^[a-z0-9][a-z0-9-]{0,63}$'
 RE_ARCHIVE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9-]{8,16}Z$'
 RE_STAMP='^[0-9]{8}T[0-9]{6,15}Z$'
@@ -450,6 +455,11 @@ parse_excludes() {
 }
 
 check_id() { [[ "$1" =~ $RE_ID ]] || refuse "instance id '$1' does not match $RE_ID"; }
+# Removal only (quarantine, v13, idea#479): a strict id, or a legacy dotted id of at most 128 characters.
+check_removal_id() {
+    [[ "$1" =~ $RE_ID ]] && return 0
+    [[ ${#1} -le 128 && "$1" =~ $RE_LEGACY_ID ]] || refuse "instance id '$1' does not match $RE_ID or the legacy dotted form $RE_LEGACY_ID"
+}
 check_stamp() {
     [[ "$1" != -* ]] || refuse "stamp '$1' looks like an option"
     [[ "$1" != */* && "$1" != *..* ]] || refuse "stamp '$1' is not a UTC stamp (no path, no '..')"
@@ -1133,7 +1143,7 @@ case "$SUB" in
 
     quarantine)
         need 2 $(($# - 1)) "<root> <id>"
-        check_id "$3"
+        check_removal_id "$3"
         resolve_root "$2" instances
         PARENT="$R_DIR/instances"
         existing_dir "$PARENT" "instances folder"

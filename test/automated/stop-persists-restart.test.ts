@@ -28,7 +28,7 @@ vi.mock('node-docker-api', () => ({
     Docker: class {
         container = {
             list: async () => [...h.running].map(id => ({
-                data: { Names: [`/${id}-app-1`] },
+                data: { Names: [`/${id}-app-1`], Labels: { 'com.docker.compose.project': id } },
                 stop: async () => { h.running.delete(id) },
                 kill: async () => { h.running.delete(id) },
             })),
