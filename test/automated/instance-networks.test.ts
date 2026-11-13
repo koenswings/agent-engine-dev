@@ -21,6 +21,9 @@ const recordingRun = (opts: {
     list?: string
     failLs?: boolean
     failRm?: string[]
+    /** network id -> container ids that still reference it (running or stopped) */
+    users?: Record<string, string>
+    failPs?: boolean
 } = {}): { run: DockerRun, cmds: string[][] } => {
     const cmds: string[][] = []
     const run: DockerRun = async (args) => {
@@ -34,6 +37,11 @@ const recordingRun = (opts: {
             const id = args[2]
             if ((opts.failRm ?? []).includes(id)) throw new Error(`Error response from daemon: network ${id} has active endpoints`)
             return id
+        }
+        if (args[0] === 'ps') {
+            if (opts.failPs) throw new Error('ps failed')
+            const f = args.find(a => a.startsWith('network='))!.slice('network='.length)
+            return opts.users?.[f] ?? ''
         }
         if (args[0] === 'compose') return ''
         throw new Error(`unexpected docker ${cmd}`)
@@ -61,7 +69,10 @@ describe('pruneUnusedInstanceNetworks (idea#468)', () => {
             '--filter', 'dangling=true',
             '--format', '{{.ID}}\t{{.Name}}',
         ])
-        expect(cmds.slice(1)).toEqual([['network', 'rm', 'aaa'], ['network', 'rm', 'bbb']])
+        expect(cmds.slice(1)).toEqual([
+            ['ps', '-a', '-q', '--filter', 'network=aaa'], ['network', 'rm', 'aaa'],
+            ['ps', '-a', '-q', '--filter', 'network=bbb'], ['network', 'rm', 'bbb'],
+        ])
         expect(r.removed).toEqual(['inst1_default', 'inst1_internal'])
         expect(r.skipped).toEqual([])
         expect(r.errors).toEqual([])
@@ -86,6 +97,20 @@ describe('pruneUnusedInstanceNetworks (idea#468)', () => {
         expect(cmds).toContainEqual(['network', 'rm', 'aaa'])
         expect(r.removed).toEqual([])
         expect(r.errors[0]).toMatch(/inst1_default: .*active endpoints/)
+    })
+    it('leaves a network that a stopped container still references (dangling=true does not see it)', async () => {
+        const { run, cmds } = recordingRun({ list: 'aaa\tinst1_default\nbbb\tinst1_stale\n', users: { aaa: 'c0ffee\n' } })
+        const r = await pruneUnusedInstanceNetworks('inst1', { run })
+        expect(cmds.filter(c => c[0] === 'network' && c[1] === 'rm').map(c => c[2])).toEqual(['bbb'])
+        expect(r.skipped).toEqual(['inst1_default'])
+        expect(r.removed).toEqual(['inst1_stale'])
+    })
+    it('a container-check failure leaves the network (fail closed)', async () => {
+        const { run, cmds } = recordingRun({ list: 'aaa\tinst1_default\n', failPs: true })
+        const r = await pruneUnusedInstanceNetworks('inst1', { run })
+        expect(cmds.some(c => c[0] === 'network' && c[1] === 'rm')).toBe(false)
+        expect(r.removed).toEqual([])
+        expect(r.errors[0]).toMatch(/inst1_default: container check failed: ps failed/)
     })
     it('a listing failure is logged and does not throw; nothing is removed', async () => {
         const { run } = recordingRun({ failLs: true })

@@ -4,9 +4,15 @@
  * After removeInstance, eraseDisk, or forgetDisk --with-instances, and after a
  * successful moveApp source-project down: remove unused networks labelled
  * `com.docker.compose.project=<instanceId>`. Never the shared frontend/backend
- * networks. Never a host-wide sweep. Never a network that still has containers
- * attached: we use Docker's `dangling=true` filter and `docker network rm`'s
- * own refusal. A prune failure is logged and does not fail the command.
+ * networks. Never a host-wide sweep. Never a network that any container still
+ * references, running OR stopped. Docker's `dangling=true` filter and
+ * `docker network rm` only look at running containers (endpoints): on idea03
+ * (#343 proof) they removed the network of a stopped container left by an
+ * undock, and the next dock of that disk failed in compose up with "network
+ * <id> not found". So each candidate is also checked with
+ * `docker ps -a --filter network=<id>`, which sees stopped containers, and is
+ * left when that finds one or cannot be read. A prune failure is logged and
+ * does not fail the command.
  *
  * forgetDisk --with-instances is a store edit. The executing Engine prunes only
  * its own local unused label-matched networks for the forgotten instance ids.
@@ -50,8 +56,9 @@ const shouldSkipDocker = (opts: PruneNetworksOptions): boolean =>
 
 /**
  * List unused networks labelled as this compose project, skip frontend/backend,
- * and `docker network rm` each one. `docker network rm` refuses if a container
- * is still attached (including a race after the dangling filter). Never throws.
+ * leave any network a container (running or stopped) still references, and
+ * `docker network rm` the rest. `docker network rm` also refuses if a container
+ * is still attached (including a race after the checks). Never throws.
  */
 export const pruneUnusedInstanceNetworks = async (
     instanceId: string,
@@ -83,6 +90,22 @@ export const pruneUnusedInstanceNetworks = async (
         if (isSharedDockerNetwork(name) || isSharedDockerNetwork(id)) {
             result.skipped.push(name || id)
             log(`pruneUnusedInstanceNetworks: skipping shared network ${name || id}`)
+            continue
+        }
+        // Fail closed: a stopped container still references the network by id
+        // and could not start again without it (idea#468, #343 proof on idea03).
+        let users = ''
+        try {
+            users = (await run(['ps', '-a', '-q', '--filter', `network=${id}`])).trim()
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e)
+            result.errors.push(`${name || id}: container check failed: ${msg}`)
+            log(`pruneUnusedInstanceNetworks: left ${name || id} for ${instanceId}: could not check its containers: ${msg}`)
+            continue
+        }
+        if (users) {
+            result.skipped.push(name || id)
+            log(`pruneUnusedInstanceNetworks: left ${name || id} for ${instanceId}: still used by stopped container(s) ${users.split(/\s+/).join(', ')}`)
             continue
         }
         try {
