@@ -24,6 +24,7 @@ import { undockDisk } from "../monitors/usbDeviceMonitor.js";
 import { backupInstance, restoreApp, createBackupDiskConfig, runningBackupOnDisk } from "../monitors/backupMonitor.js";
 import { listBackup, verifyBackup, clearBackupLock, removeBackupRole } from "./BackupVerify.js";
 import { addBackupLink, removeBackupLink } from "./BackupLinks.js";
+import { setBackupMode } from './BackupModeCommand.js'
 import { cancelOperation } from './Operations.js';
 import { DiskArgResult, lookupDiskArg, resolveDiskArg } from './DiskArg.js';
 import { createFilesDisk } from './CreateFilesDisk.js';
@@ -418,6 +419,18 @@ const removeBackupLinkWrapper = async (storeHandle: DocHandle<Store> | null, ins
 }
 
 /**
+ * setBackupMode <diskIdOrName> <immediate|on-demand|scheduled> [HH:MM] (idea#400 PR D).
+ * Switches a docked Backup Disk's mode; the time is valid only with scheduled.
+ * Trace args: { backupDiskId, mode, time: [] | ["HH:MM"] }.
+ */
+const setBackupModeWrapper = async (storeHandle: DocHandle<Store> | null, backupDiskId: string, mode: string, ...time: string[]) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    // time is an optional variadic arg (the parser's only optional form): zero or one token
+    if (time.length > 1) throw new Error(`BAD_TIME: setBackupMode: one time "HH:MM" at most (got ${time.length} tokens)`)
+    await setBackupMode(storeHandle, backupDiskId, mode, time[0])
+}
+
+/**
  * createFilesDisk <diskId> [<shareName…>] (idea#131). The disk ID only (the
  * command has no old name form); the share name takes the rest of the line and
  * defaults to "School Files". Refusals throw, so the trace ends as `error`.
@@ -636,6 +649,7 @@ export const commands: CommandDefinition[] = [
     { name: "removeBackupRole", execute: removeBackupRoleWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
     { name: "addBackupLink", execute: addBackupLinkWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "removeBackupLink", execute: removeBackupLinkWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
+    { name: "setBackupMode", execute: setBackupModeWrapper, args: [{ type: "string", name: "backupDiskId" }, { type: "string", name: "mode" }, { type: "string", name: "time", variadic: true, optional: true }], scope: 'engine' },
     { name: "createFilesDisk", execute: createFilesDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "shareName", variadic: true, optional: true }], scope: 'engine' },
     { name: "removeInstance", execute: removeInstanceWrapper, args: [{ type: "string", name: "instanceId" }], scope: 'engine' },
     { name: "renameInstance", execute: renameInstanceWrapper, args: [{ type: "string", name: "instanceId" }, { type: "string", name: "newName", variadic: true }], scope: 'engine' },

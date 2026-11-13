@@ -1,6 +1,6 @@
 # Scheduled Backup Disk (idea#400)
 
-**Status:** Draft. It describes the design as agreed and grows with each PR (A to D). Only the parts marked *landed* exist in the code (A, B and C on this branch; D is planned).
+**Status:** Draft. It describes the design as agreed and grows with each PR (A to D). Only the parts marked *landed* exist in the code (A, B, C and D on this branch).
 
 **Sources:**
 - [`proposals/scheduled-backup-disk.md`](https://github.com/koenswings/idea/blob/main/proposals/scheduled-backup-disk.md) (idea repo, accepted by Koen 30 Oct 2026).
@@ -18,7 +18,7 @@ A Backup Disk in `scheduled` mode, docked to an Engine, backs up its linked inst
 | A | `src/utils/backupSchedule.ts`: schedule parsing, Pi-local slots, the due decision, missed runs, the uptime counter, clock trust, jump detection, the skipped-run catch-up rule and the test clock offset. Pure functions, with unit tests (`test/automated/backup-schedule.test.ts`), plus the type-only store fields below. | *landed with PR A* |
 | B | `src/data/BackupYamlDoc.ts`: document-preserving BACKUP.yaml edits (#344's atomic writer, now shared) for the link `lastBackup` and the state keys `schedule` / `lastRun` / `uptimeCounter` / `missedRuns` / `lastAttempt`, plus a lenient state reader. `processBackupDisk` mirrors `schedule` / `missedRuns` / `lastAttempt`. `src/data/BackupResults.ts` and `backupInstance` write `lastResult` / `backupHistory` for every attempt. Manual refusals start with `BUSY`; automatic ones record `SKIPPED_LOCKED`; a stale lock found at dock is recorded once as `INTERRUPTED`. `createBackupDisk scheduled` adds the 02:30 default. | *landed with PR B* |
 | C | `src/monitors/backupScheduler.ts`: the tick, sequential runs per disk, locks, retry and catch-up, a one-change-per-run store summary (`freePct`, `clockTrusted` / `clockReason`, `cleaning` / `cleaningStartedAt`), `backupConfig.scheduleError`, and the build timestamp baked in at build (`script/write-build-info.mjs`, `src/utils/buildInfo.ts`). Tests: `test/automated/backup-scheduler.test.ts`. | *landed with PR C* |
-| D | The `setBackupMode` command and the `scheduledBackups` capability. | planned |
+| D | `src/data/BackupModeCommand.ts`: the `setBackupMode` command (registered in `Commands.ts`) and the `scheduledBackups` capability. Tests: `test/automated/set-backup-mode.test.ts`. | *landed with PR D* |
 
 The 05:00 reboot wrapper (it waits while `/run/idea/backup-running` exists, with a 90-minute cap) is its own small PR, separate from #292 and from this work. The Engine already writes that marker for every backup (`beginUsageSkip('backup')`, idea#411).
 
@@ -132,11 +132,15 @@ The store gets one change per run (and a `clockTrusted` / `clockReason` change o
 - An invalid `schedule` in BACKUP.yaml is logged and mirrored as `schedule: null`, with `backupConfig.scheduleError` set to the error text (PR C, #347 call 5). The Console shows it; the disk runs at the 02:30 default until it is fixed (#351 call 1).
 - `method` is one of `stop`, `hook`, `live`, `none`.
 
-## `setBackupMode` (draft; lands in PR D, then moves to COMMANDS.md)
+## `setBackupMode` (PR D)
 
-- **Usage:** `setBackupMode <diskIdOrName> <immediate|on-demand|scheduled> [HH:MM]`. It runs on the Engine the disk is docked to. Only `mode` and `schedule` in BACKUP.yaml change, and the time is valid only with `scheduled`.
-- **Planned refusal codes:** `NOT_DOCKED`, `NOT_A_BACKUP_DISK`, `BAD_BACKUP_YAML`, `BAD_MODE`, `BAD_TIME`, `BUSY`, as leading tokens in #344 style.
-- **Capability:** `scheduledBackups`.
+The full reference is in [COMMANDS.md](COMMANDS.md#setbackupmode). In short:
+
+- **Usage:** `setBackupMode <backupDiskId> <immediate|on-demand|scheduled> [HH:MM]`, on the Engine the disk is docked to. It changes only `mode` and `schedule` in BACKUP.yaml, through the preserving writer. The time is valid only with `scheduled`.
+- **Schedule:** a given time is written. `scheduled` with no time keeps a valid schedule, or writes 02:30. Other modes keep the schedule in the file.
+- **Refusal codes:** `NOT_DOCKED`, `AMBIGUOUS`, `SYSTEM_DISK`, `NOT_A_BACKUP_DISK`, `BAD_BACKUP_YAML`, `BAD_MODE`, `BAD_TIME`, `BUSY` (leading tokens, #344 style).
+- **Result:** `{ backupDiskId, previousMode, mode, schedule, scheduleError, changed, note }`.
+- **Capability:** `scheduledBackups`, advertised by an Engine that has the tick and the command. A Console shows the schedule controls only when the docked Engine advertises it.
 
 ## Tests
 
@@ -146,6 +150,7 @@ The store gets one change per run (and a `clockTrusted` / `clockReason` change o
   - the `SKIPPED_LOCKED` catch-up, retry once, stale locks, and `BUSY` naming the scheduled run;
   - `NEVER_SYNCED` and the uptime path across a reboot, `BEFORE_BUILD`, `BEFORE_STORE` without NTP and cleared by NTP (#351 call 6), and forward and backward jumps;
   - crash recovery, `Disk.cleaning`, and the build info.
+- **Command tests (PR D):** `test/automated/set-backup-mode.test.ts`: mode and time changes, the schedule rules, a preserved file, the store mirror, no write when nothing changed, and every refusal writing nothing.
 - **Unit tests:** `test/automated/backup-schedule.test.ts` (fake wall, monotonic and uptime clock in `test/harness/fakeScheduleClock.ts`; fixtures in `test/fixtures/backup-schedule/`). They run in `Europe/Brussels` for the DST cases.
 - **Test clock offset:** `IDEA_TEST_CLOCK_OFFSET_MS` is honoured only when `NODE_ENV=test` (Q10). It shifts only the scheduler's and the clock-trust check's view of the time, never the system clock.
 - **Wrong-clock cases are proven in unit tests only** (Steve, #346 call 3). Under pm2 the Engine never runs with `NODE_ENV=test`, so the offset is inert on a Pi. The on-Pi proof runs on the real clock: slot, catch-up after a pm2 restart and a reboot, locks, undock and `APP_DISK_NOT_DOCKED`.

@@ -60,7 +60,7 @@ interface ParsedBackupYaml {
 }
 
 /** Read BACKUP.yaml as a document. Refuses BAD_BACKUP_YAML unless it is `{mode, links[]}`. */
-const readBackupDocument = async (device: string, command: string): Promise<ParsedBackupYaml> => {
+export const readBackupDocument = async (device: string, command: string): Promise<ParsedBackupYaml> => {
     const path = yamlPathFor(device)
     let raw: string
     try {
@@ -86,8 +86,8 @@ const readBackupDocument = async (device: string, command: string): Promise<Pars
     return { doc, links, mode: mode as BackupMode, ids }
 }
 
-/** Disk argument checks shared by both commands: docked here, not the system disk, a Backup Disk. */
-const resolveBackupLinkDisk = async (store: Store, arg: string, command: string): Promise<Disk & { device: string }> => {
+/** Disk argument checks shared by the link commands and setBackupMode: docked here, not the system disk, a Backup Disk. */
+export const resolveBackupLinkDisk = async (store: Store, arg: string, command: string): Promise<Disk & { device: string }> => {
     const engineId = getLocalEngine(store)?.id
     const r = lookupDiskArg(store, engineId, arg)
     if (!r.ok) {
@@ -108,7 +108,7 @@ const resolveBackupLinkDisk = async (store: Store, arg: string, command: string)
 }
 
 /** BUSY when the disk lock is held or a backupApp to this disk is Pending/Running. */
-const busyReason = (store: Store, diskId: string): string | null => {
+export const busyReason = (store: Store, diskId: string): string | null => {
     const held = resourceLock.getLockInfo(diskKey(diskId))
     if (resourceLock.isLocked(diskKey(diskId))) return `the Backup Disk is locked${held ? ` by '${held.kind}'` : ''}`
     const op = runningBackupOnDisk(store, diskId)
@@ -116,7 +116,7 @@ const busyReason = (store: Store, diskId: string): string | null => {
     return null
 }
 
-const takeDiskLock = (store: Store, diskId: string, command: string): void => {
+export const takeDiskLock = (store: Store, diskId: string, command: string): void => {
     const busy = busyReason(store, diskId)
     if (busy) throw refuse('BUSY', command, busy)
     if (!resourceLock.acquireAll([diskKey(diskId)], command)) {
