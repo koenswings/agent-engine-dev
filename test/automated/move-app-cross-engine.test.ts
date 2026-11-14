@@ -11,10 +11,10 @@ import { Repo, DocHandle } from '@automerge/automerge-repo'
 import { Store } from '../../src/data/Store.js'
 import { localEngineId } from '../../src/data/Engine.js'
 import { InstanceID, DiskID, DiskName, EngineID, Timestamp, AppID } from '../../src/data/CommonTypes.js'
-import { moveAppCrossEngine, verifyMoveTarget, MoveDeps, refusalCode, moveCommandOutcome, MOVE_PROGRESS_TYPE, isInFlightKeepIdMove } from '../../src/data/MoveAppRemote.js'
+import { moveAppCrossEngine, verifyMoveTarget, cleanupMoveTarget, MoveDeps, refusalCode, moveCommandOutcome, MOVE_PROGRESS_TYPE, isInFlightKeepIdMove } from '../../src/data/MoveAppRemote.js'
 import { removeInstance as dropInstanceFromDisk } from '../../src/data/Disk.js'
 import { checkingProgressMessage, setPortReadyProgress, resetPortReadyProgressForTests } from '../../src/data/PortReadyProgress.js'
-import { MoveError, MOVE_CODES, MOVE_FAILURE_CODES, MOVE_REFUSAL_CODES, MOVE_DONE_CODES, MOVE_CROSS_ENGINE_CAPABILITY, moveFailedText, sourceNotRemovedText, sizesMatch } from '../../src/data/MoveAppShapes.js'
+import { MoveError, MOVE_CODES, MOVE_FAILURE_CODES, MOVE_REFUSAL_CODES, MOVE_DONE_CODES, MOVE_CROSS_ENGINE_CAPABILITY, moveFailedText, sourceNotRemovedText, sourceKeptText, withTargetCleanupText, sizesMatch } from '../../src/data/MoveAppShapes.js'
 import { recoverInterruptedOperations } from '../../src/data/Operations.js'
 import { RemoveError } from '../../src/data/RemoveInstance.js'
 
@@ -51,7 +51,7 @@ const makeStore = (opts: { status?: string, targetCaps?: string[] } = {}): DocHa
 }
 
 /** Two-Engine wiring: copy keeps the same id and does not flip storedOn; verify runs as TARGET. */
-const twoEngines = (h: DocHandle<Store>, o: { targetStatus?: string, targetBytes?: number, copyFails?: string, verifyReply?: boolean, removeFails?: boolean, sourceBytesSeq?: number[], duringVerify?: (sh: DocHandle<Store>) => void, folderExists?: boolean } = {}) => {
+const twoEngines = (h: DocHandle<Store>, o: { targetStatus?: string, targetBytes?: number, copyFails?: string, verifyReply?: boolean, removeFails?: boolean, sourceBytesSeq?: number[], sourceBytesThrows?: string, cleanupFails?: string, duringVerify?: (sh: DocHandle<Store>) => void, folderExists?: boolean } = {}) => {
     const removeSource = vi.fn(async (_sh: DocHandle<Store>, id: InstanceID) => {
         if (o.removeFails) throw new RemoveError('QUARANTINE_FAILED', 'cannot quarantine /disks/sda1/instances/inst-src: busy; the store is unchanged')
         // engine#381: quarantine the source folder only; never delete instanceDB[id]
@@ -59,11 +59,26 @@ const twoEngines = (h: DocHandle<Store>, o: { targetStatus?: string, targetBytes
     })
     const startSource = vi.fn(async (sh: DocHandle<Store>, i: any) => { sh.change(d => { (d.instanceDB as any)[i.id].status = 'Running' }) })
     const requestStart = vi.fn()
+    const stopAndQuarantine = vi.fn(async (disk: any, id: InstanceID) => {
+        if (o.cleanupFails) throw new Error(o.cleanupFails)
+        return { quarantinePath: `/disks/sdb1/.idea-quarantine/${id}` }
+    })
+    const requestCleanup = vi.fn(async (sh: DocHandle<Store>, engineId: string, command: string) => {
+        expect(engineId).toBe(String(TGT))
+        const parts = command.split(' ')
+        expect(parts[0]).toBe('cleanupMoveTarget')
+        const [, opId, id, diskId] = parts
+        await cleanupMoveTarget(sh, opId, id, diskId, { localEngineId: async () => String(TGT), stopAndQuarantine })
+    })
     const deps: Partial<MoveDeps> = {
         localEngineId: async () => SRC,
         validate: async (store) => ({ instance: store.instanceDB[INST] as any, sourceDisk: store.diskDB[SRC_DISK] as any, targetDisk: store.diskDB[TGT_DISK] as any }),
         helperProblem: async () => null,
-        sourceBytes: async () => (o.sourceBytesSeq?.shift() ?? BYTES),
+        sourceBytes: async () => {
+            if (o.sourceBytesSeq && o.sourceBytesSeq.length === 0 && o.sourceBytesThrows) throw new Error(o.sourceBytesThrows)
+            if (o.sourceBytesThrows && !o.sourceBytesSeq) throw new Error(o.sourceBytesThrows)
+            return o.sourceBytesSeq?.shift() ?? BYTES
+        },
         targetFolderExists: async () => o.folderExists === true,
         copy: async (sh) => {
             // like copyApp with keepSourceStopped + dstId: source stopped, same id, storedOn unchanged
@@ -81,12 +96,14 @@ const twoEngines = (h: DocHandle<Store>, o: { targetStatus?: string, targetBytes
             if (healthy) setPortReadyProgress(id, { firstReadyAt: Date.now() - 10_000, stableMs: 10_000, stableReached: true })
             void verifyMoveTarget(sh, opId, id, bytes, running, { localEngineId: async () => String(TGT), targetBytes: async () => o.targetBytes ?? BYTES, timeoutMs: 50, pollMs: 5 })
         },
+        requestCleanup: requestCleanup as any,
         startSource: startSource as any,
         removeSource: removeSource as any,
         verifyTimeoutMs: 300,
+        cleanupTimeoutMs: 300,
         pollMs: 5,
     }
-    return { deps, removeSource, startSource, requestStart }
+    return { deps, removeSource, startSource, requestStart, requestCleanup, stopAndQuarantine }
 }
 const theOp = (h: DocHandle<Store>) => Object.values(h.doc().operationDB)[0] as any
 
@@ -95,12 +112,13 @@ describe('moveApp across Engines (idea#79)', () => {
 
     it('success: copies, verifies on the target, quarantines (never deletes) the source', async () => {
         const h = makeStore()
-        const { deps, removeSource } = twoEngines(h)
+        const { deps, removeSource, requestCleanup } = twoEngines(h)
         const r = await moveAppCrossEngine(h, 'my-kolibri' as any, SRC_DISK, TGT_DISK, 'console-command', deps)
         expect(r.code).toBe('MOVED')
         expect(r.text).toBe('MOVED to idea04')
         expect(r.quarantinePath).toContain('.idea-quarantine')
         expect(removeSource).toHaveBeenCalledTimes(1)
+        expect(requestCleanup).not.toHaveBeenCalled()
         expect(h.doc().instanceDB[INST]?.storedOn).toBe(TGT_DISK)
         expect(h.doc().instanceDB[INST]?.lastBackup).toBe(1_700_000_000_000)
         expect(h.doc().instanceDB[NEW]).toBeUndefined()
@@ -108,39 +126,56 @@ describe('moveApp across Engines (idea#79)', () => {
         expect(op.kind).toBe('moveApp')
         expect(op.status).toBe('Done')
         expect(op.error).toBeNull()
-        expect(op.move).toMatchObject({ phase: 'done', verified: true, sourceRemoved: true, code: 'MOVED', targetInstanceId: INST, expectedBytes: BYTES })
+        expect(op.move).toMatchObject({ phase: 'done', verified: true, sourceRemoved: true, code: 'MOVED', targetInstanceId: INST, expectedBytes: BYTES, targetCleanup: null })
         expect(op.move.verify.ok).toBe(true)
     })
 
-    it('verify fails (size mismatch): source stays intact, nothing removed', async () => {
+    it('verify fails (size mismatch): source stays intact, target copy stopped and quarantined', async () => {
         const h = makeStore()
-        const { deps, removeSource } = twoEngines(h, { targetBytes: 10 * 1024 * 1024 })
+        const { deps, removeSource, requestCleanup, stopAndQuarantine, requestStart } = twoEngines(h, { targetBytes: 10 * 1024 * 1024 })
         const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)
         expect(r.code).toBe('VERIFY_SIZE')
-        expect(r.text).toMatch(/^MOVE FAILED: .*; source kept$/)
+        expect(r.text).toBe(withTargetCleanupText(moveFailedText('the copy on idea04 did not check out (size 10485760 bytes, expected 52428800)'), 'quarantined', 'idea04'))
+        expect(requestStart).toHaveBeenCalled()
+        expect(requestCleanup).toHaveBeenCalledTimes(1)
+        expect(stopAndQuarantine).toHaveBeenCalledTimes(1)
+        expect(stopAndQuarantine.mock.calls[0][0].id).toBe(TGT_DISK)
         expect(removeSource).not.toHaveBeenCalled()
         expect(h.doc().instanceDB[INST]?.storedOn).toBe(SRC_DISK)
+        expect(h.doc().instanceDB[INST]?.lastBackup).toBe(1_700_000_000_000)
         expect(theOp(h)).toMatchObject({ status: 'Failed', error: r.text })
-        expect(theOp(h).move.verified).toBe(false)
+        expect(theOp(h).move).toMatchObject({ verified: false, targetCleanup: 'quarantined', code: 'VERIFY_SIZE' })
     })
 
-    it('verify fails (copy did not start healthy while the source was running): source kept', async () => {
+    it('Checking fails with a running target: VERIFY_NOT_RUNNING, target stopped and quarantined, source kept', async () => {
         const h = makeStore({ status: 'Running' })
-        const { deps, removeSource } = twoEngines(h, { targetStatus: 'Error' })
+        const { deps, removeSource, requestCleanup, stopAndQuarantine, requestStart, startSource } = twoEngines(h, { targetStatus: 'Error' })
         const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)
         expect(r.code).toBe('VERIFY_NOT_RUNNING')
         expect(r.text).toMatch(/did not start|failed to start/)
+        expect(r.text).toMatch(/source kept, the copy on idea04 was quarantined$/)
+        expect(requestStart).toHaveBeenCalled()
+        expect(requestCleanup).toHaveBeenCalledTimes(1)
+        expect(stopAndQuarantine).toHaveBeenCalledTimes(1)
         expect(removeSource).not.toHaveBeenCalled()
+        expect(startSource).toHaveBeenCalledTimes(1)
+        expect(h.doc().instanceDB[INST]?.storedOn).toBe(SRC_DISK)
+        expect(h.doc().instanceDB[INST]?.status).toBe('Running')
+        expect(theOp(h).move.targetCleanup).toBe('quarantined')
     })
 
-    it('target never answers the verify: VERIFY_TIMEOUT, source kept', async () => {
+    it('target never answers the verify: VERIFY_TIMEOUT, target copy stopped and quarantined, source kept', async () => {
         const h = makeStore()
-        const { deps, removeSource } = twoEngines(h, { verifyReply: false })
+        const { deps, removeSource, requestCleanup, stopAndQuarantine, requestStart } = twoEngines(h, { verifyReply: false })
         const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)
         expect(r.code).toBe('VERIFY_TIMEOUT')
-        expect(r.text).toMatch(/source kept$/)
+        expect(r.text).toBe(withTargetCleanupText(moveFailedText('idea04 did not confirm the copy in time'), 'quarantined', 'idea04'))
+        expect(requestStart).toHaveBeenCalled()
+        expect(requestCleanup).toHaveBeenCalledTimes(1)
+        expect(stopAndQuarantine).toHaveBeenCalledTimes(1)
         expect(removeSource).not.toHaveBeenCalled()
-        expect(h.doc().instanceDB[INST]).toBeDefined()
+        expect(h.doc().instanceDB[INST]?.storedOn).toBe(SRC_DISK)
+        expect(theOp(h).move.targetCleanup).toBe('quarantined')
     })
 
     it('target unreachable: refused before anything happens (TARGET_UNREACHABLE), no operation', async () => {
@@ -222,46 +257,120 @@ describe('moveApp across Engines (idea#79)', () => {
         expect(h.doc().instanceDB[INST]?.lastBackup).toBe(1_700_000_000_000)
     })
 
-    it('removal fails after a good copy: MOVED, source not removed', async () => {
+    it('removal fails after a good copy: MOVED, source not removed, no target cleanup', async () => {
         const h = makeStore()
-        const { deps } = twoEngines(h, { removeFails: true })
+        const { deps, requestCleanup, stopAndQuarantine } = twoEngines(h, { removeFails: true })
         const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)
         expect(r.code).toBe('SOURCE_NOT_REMOVED')
         expect(r.text.startsWith('MOVED, source not removed: QUARANTINE_FAILED')).toBe(true)
+        expect(requestCleanup).not.toHaveBeenCalled()
+        expect(stopAndQuarantine).not.toHaveBeenCalled()
         expect(theOp(h).status).toBe('Done')
-        expect(theOp(h).move).toMatchObject({ verified: true, sourceRemoved: false })
+        expect(theOp(h).move).toMatchObject({ verified: true, sourceRemoved: false, targetCleanup: null })
         expect(h.doc().instanceDB[INST]).toBeDefined()
         expect(h.doc().instanceDB[INST]?.storedOn).toBe(TGT_DISK)
+        expect(h.doc().instanceDB[INST]?.lastBackup).toBe(1_700_000_000_000)
     })
 
-    it('source started during the move: SOURCE_CHANGED, MOVED, source not removed, nothing quarantined', async () => {
+    it('source started during the move: SOURCE_CHANGED, source kept, target copy quarantined', async () => {
         const h = makeStore()
-        const { deps, removeSource } = twoEngines(h, { duringVerify: sh => sh.change(d => { const i = (d.instanceDB as any)[INST]; i.status = 'Running'; i.lastStarted = 999 }) })
+        const { deps, removeSource, requestCleanup, stopAndQuarantine, startSource } = twoEngines(h, { duringVerify: sh => sh.change(d => { const i = (d.instanceDB as any)[INST]; i.status = 'Running'; i.lastStarted = 999 }) })
         const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)
         expect(r.code).toBe('SOURCE_CHANGED')
-        expect(r.text).toMatch(/^MOVED, source not removed: the source was started during the move/)
+        expect(r.text).toBe(withTargetCleanupText(sourceKeptText('the source was started during the move (status Running); it may hold newer data than the copy'), 'quarantined', 'idea04'))
+        expect(requestCleanup).toHaveBeenCalledTimes(1)
+        expect(stopAndQuarantine).toHaveBeenCalledTimes(1)
         expect(removeSource).not.toHaveBeenCalled()
+        // already Running, so restartIfNeeded does not start it again
+        expect(startSource).not.toHaveBeenCalled()
         expect(theOp(h)).toMatchObject({ status: 'Done', error: r.text })
-        expect(theOp(h).move).toMatchObject({ verified: true, sourceRemoved: false, code: 'SOURCE_CHANGED' })
-        expect(h.doc().instanceDB[INST]).toBeDefined()
+        expect(theOp(h).move).toMatchObject({ verified: true, sourceRemoved: false, code: 'SOURCE_CHANGED', targetCleanup: 'quarantined' })
+        expect(h.doc().instanceDB[INST]?.storedOn).toBe(SRC_DISK)
+        expect(h.doc().instanceDB[INST]?.lastBackup).toBe(1_700_000_000_000)
     })
 
-    it('source started and stopped again during the move (lastStarted moved): SOURCE_CHANGED', async () => {
+    it('source started and stopped again during the move (lastStarted moved): SOURCE_CHANGED, target quarantined', async () => {
         const h = makeStore()
-        const { deps, removeSource } = twoEngines(h, { duringVerify: sh => sh.change(d => { (d.instanceDB as any)[INST].lastStarted = 999 }) })
+        const { deps, removeSource, requestCleanup, stopAndQuarantine, startSource } = twoEngines(h, { duringVerify: sh => sh.change(d => { (d.instanceDB as any)[INST].lastStarted = 999 }) })
         const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)
         expect(r.code).toBe('SOURCE_CHANGED')
+        expect(r.text).toMatch(/^MOVE STOPPED: the source was started during the move/)
+        expect(r.text).toMatch(/source kept, the copy on idea04 was quarantined$/)
+        expect(requestCleanup).toHaveBeenCalledTimes(1)
+        expect(stopAndQuarantine).toHaveBeenCalledTimes(1)
         expect(removeSource).not.toHaveBeenCalled()
+        // status is still Stopped after the copy, so restartIfNeeded restarts it
+        expect(startSource).toHaveBeenCalledTimes(1)
+        expect(h.doc().instanceDB[INST]?.storedOn).toBe(SRC_DISK)
+        expect(theOp(h).move.targetCleanup).toBe('quarantined')
     })
 
-    it('source written to during the move (size changed): SOURCE_CHANGED, source kept', async () => {
+    it('source written to during the move (size changed): SOURCE_CHANGED, source kept, target quarantined', async () => {
         const h = makeStore()
-        const { deps, removeSource } = twoEngines(h, { sourceBytesSeq: [BYTES, BYTES + 4096] })
+        const { deps, removeSource, requestCleanup, stopAndQuarantine } = twoEngines(h, { sourceBytesSeq: [BYTES, BYTES + 4096] })
         const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)
         expect(r.code).toBe('SOURCE_CHANGED')
-        expect(r.text).toMatch(/^MOVED, source not removed: the source was written to during the move/)
+        expect(r.text).toBe(withTargetCleanupText(sourceKeptText(`the source was written to during the move (${BYTES} → ${BYTES + 4096} bytes); it may hold newer data than the copy`), 'quarantined', 'idea04'))
+        expect(requestCleanup).toHaveBeenCalledTimes(1)
+        expect(stopAndQuarantine).toHaveBeenCalledTimes(1)
         expect(removeSource).not.toHaveBeenCalled()
-        expect(h.doc().instanceDB[INST]).toBeDefined()
+        expect(h.doc().instanceDB[INST]?.storedOn).toBe(SRC_DISK)
+        expect(theOp(h).move.targetCleanup).toBe('quarantined')
+    })
+
+    it('source record is gone before the flip: SOURCE_CHANGED, target quarantined, source not quarantined', async () => {
+        const h = makeStore()
+        const { deps, removeSource, requestCleanup, stopAndQuarantine } = twoEngines(h)
+        // Record a good verify and drop the source row in the same change so
+        // step 3 sees SOURCE_CHANGED rather than a VERIFY_NOT_FOUND race.
+        deps.requestVerify = (sh, engineId, command) => {
+            expect(engineId).toBe(String(TGT))
+            const [, opId] = command.split(' ')
+            sh.change(d => {
+                const op = (d.operationDB as any)?.[opId]
+                if (op?.move) op.move.verify = { ok: true, code: null, bytes: BYTES, detail: null, at: Date.now() }
+                delete (d.instanceDB as any)[INST]
+            })
+        }
+        const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)
+        expect(r.code).toBe('SOURCE_CHANGED')
+        expect(r.text).toBe(withTargetCleanupText(sourceKeptText('the source instance record is gone'), 'quarantined', 'idea04'))
+        expect(requestCleanup).toHaveBeenCalledTimes(1)
+        expect(stopAndQuarantine).toHaveBeenCalledTimes(1)
+        expect(removeSource).not.toHaveBeenCalled()
+        expect(h.doc().instanceDB[INST]).toBeUndefined()
+        expect(theOp(h).move).toMatchObject({ code: 'SOURCE_CHANGED', targetCleanup: 'quarantined', sourceRemoved: false })
+    })
+
+    it('failed source-size measurement before the flip: SOURCE_KEPT, target quarantined, storedOn unchanged', async () => {
+        const h = makeStore()
+        const { deps, removeSource, requestCleanup, stopAndQuarantine, startSource } = twoEngines(h, { sourceBytesSeq: [BYTES], sourceBytesThrows: 'du failed' })
+        const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)
+        expect(r.code).toBe('SOURCE_KEPT')
+        expect(r.text).toBe(withTargetCleanupText(moveFailedText('du failed'), 'quarantined', 'idea04'))
+        expect(requestCleanup).toHaveBeenCalledTimes(1)
+        expect(stopAndQuarantine).toHaveBeenCalledTimes(1)
+        expect(stopAndQuarantine.mock.calls[0][0].id).toBe(TGT_DISK)
+        expect(removeSource).not.toHaveBeenCalled()
+        expect(startSource).toHaveBeenCalledTimes(1)
+        expect(h.doc().instanceDB[INST]?.storedOn).toBe(SRC_DISK)
+        expect(h.doc().instanceDB[INST]?.lastBackup).toBe(1_700_000_000_000)
+        expect(theOp(h)).toMatchObject({ status: 'Failed', error: r.text })
+        expect(theOp(h).move).toMatchObject({ verified: true, sourceRemoved: false, code: 'SOURCE_KEPT', targetCleanup: 'quarantined' })
+    })
+
+    it('target cleanup itself failing: leftover copy is named in the result, storedOn unchanged', async () => {
+        const h = makeStore()
+        const { deps, removeSource, requestCleanup, stopAndQuarantine } = twoEngines(h, { sourceBytesSeq: [BYTES, BYTES * 2], cleanupFails: 'cannot quarantine: busy' })
+        const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)
+        expect(r.code).toBe('SOURCE_CHANGED')
+        expect(r.text).toBe(withTargetCleanupText(sourceKeptText(`the source was written to during the move (${BYTES} → ${BYTES * 2} bytes); it may hold newer data than the copy`), 'failed', 'idea04'))
+        expect(r.text).toMatch(/the leftover copy is on idea04$/)
+        expect(requestCleanup).toHaveBeenCalledTimes(1)
+        expect(stopAndQuarantine).toHaveBeenCalledTimes(1)
+        expect(removeSource).not.toHaveBeenCalled()
+        expect(h.doc().instanceDB[INST]?.storedOn).toBe(SRC_DISK)
+        expect(theOp(h).move).toMatchObject({ targetCleanup: 'failed', targetCleanupDetail: 'cannot quarantine: busy', code: 'SOURCE_CHANGED' })
     })
 
     it('a failed verify restarts a source that was running (it was kept stopped for the copy)', async () => {
@@ -285,6 +394,9 @@ describe('moveApp across Engines (idea#79)', () => {
     it('texts, codes and size tolerance', () => {
         expect(moveFailedText('x.')).toBe('MOVE FAILED: x; source kept')
         expect(sourceNotRemovedText('y')).toBe('MOVED, source not removed: y')
+        expect(sourceKeptText('the source was started during the move.')).toBe('MOVE STOPPED: the source was started during the move; source kept')
+        expect(withTargetCleanupText(moveFailedText('x'), 'quarantined', 'idea04')).toBe('MOVE FAILED: x; source kept, the copy on idea04 was quarantined')
+        expect(withTargetCleanupText(sourceKeptText('x'), 'failed', 'idea04')).toBe('MOVE STOPPED: x; source kept, the leftover copy is on idea04')
         expect(refusalCode("Instance name 'a' is ambiguous: …")).toBe('AMBIGUOUS')
         expect(refusalCode("Source disk 'x' is docked to a remote engine. Copy/move must be initiated from that engine.")).toBe('SOURCE_REMOTE')
         expect(refusalCode(`instance ${INST} already exists on idea04`)).toBe('TARGET_EXISTS')
@@ -312,6 +424,7 @@ describe('moveApp across Engines (idea#79)', () => {
         ['COPY_FAILED', { copyFails: 'rsync died' }, () => {}, 'COPY_FAILED'],
         ['SOURCE_NOT_REMOVED', { removeFails: true }, () => {}, 'SOURCE_NOT_REMOVED'],
         ['SOURCE_CHANGED', { sourceBytesSeq: [BYTES, BYTES * 2] }, () => {}, 'SOURCE_CHANGED'],
+        ['SOURCE_KEPT', { sourceBytesSeq: [BYTES], sourceBytesThrows: 'du failed' }, () => {}, 'SOURCE_KEPT'],
         ['HELPER_OUTDATED (refusal)', {}, (_h, d) => { d.helperProblem = async () => 'needs helper v4' }, 'HELPER_OUTDATED'],
         ['TARGET_UNREACHABLE (refusal)', {}, (_h, d) => { d.validate = async () => `Target engine '${TGT}' is not currently reachable (not in network connections).` }, 'TARGET_UNREACHABLE'],
         ['TARGET_EXISTS (refusal)', { folderExists: true }, () => {}, 'TARGET_EXISTS'],
@@ -337,7 +450,7 @@ describe('moveApp across Engines (idea#79)', () => {
         if (failed) {
             expect(t.errorCode).toBe(code)
             expect(t.errorMessage).toBe(result.text)
-            expect(t.errorMessage).toMatch(/^MOVE FAILED: .*source kept$/)
+            expect(t.errorMessage).toMatch(/^MOVE FAILED: .*source kept/)
         } else {
             expect(t.errorCode ?? null).toBeNull()
         }
@@ -442,7 +555,10 @@ describe('moveApp across Engines (idea#79)', () => {
     it('MOVE_CODES is the single list: refusals + failures + done, no duplicates', () => {
         expect(MOVE_CODES).toEqual([...MOVE_REFUSAL_CODES, ...MOVE_FAILURE_CODES, ...MOVE_DONE_CODES])
         expect(new Set(MOVE_CODES).size).toBe(MOVE_CODES.length)
-        expect(MOVE_CODES).toEqual(expect.arrayContaining(['VERIFY_SIZE', 'VERIFY_NOT_RUNNING', 'VERIFY_NOT_FOUND', 'VERIFY_TIMEOUT', 'TARGET_EXISTS']))
+        expect(MOVE_CODES).toEqual(expect.arrayContaining(['VERIFY_SIZE', 'VERIFY_NOT_RUNNING', 'VERIFY_NOT_FOUND', 'VERIFY_TIMEOUT', 'TARGET_EXISTS', 'SOURCE_KEPT']))
+        expect(MOVE_FAILURE_CODES).toContain('SOURCE_KEPT')
+        expect(MOVE_DONE_CODES).toContain('SOURCE_CHANGED')
+        expect(MOVE_DONE_CODES).toContain('SOURCE_NOT_REMOVED')
     })
 
     it('the source picks up the verify result on the store change, without waiting for the 2 s poll (idea#498)', async () => {
@@ -488,6 +604,70 @@ describe('moveApp across Engines (idea#79)', () => {
     })
 })
 
+
+describe('cleanupMoveTarget (engine#388)', () => {
+    it('stops and quarantines the target folder when storedOn still names the source', async () => {
+        const h = makeStore()
+        h.change(d => {
+            (d.operationDB as any)['op-c'] = {
+                id: 'op-c', kind: 'moveApp',
+                args: { instanceId: INST, sourceDiskId: SRC_DISK, targetDiskId: TGT_DISK, crossEngine: 'true' },
+                status: 'Running',
+                move: { phase: 'checking', sourceInstanceId: INST, targetInstanceId: INST, verified: false, sourceRemoved: false, targetCleanup: null, targetCleanupDetail: null },
+            } as any
+        })
+        const stopAndQuarantine = vi.fn(async (disk: any, id: InstanceID) => {
+            expect(disk.id).toBe(TGT_DISK)
+            expect(id).toBe(INST)
+            return { quarantinePath: `/disks/sdb1/.idea-quarantine/${id}` }
+        })
+        const r = await cleanupMoveTarget(h, 'op-c', INST, TGT_DISK, { localEngineId: async () => String(TGT), stopAndQuarantine })
+        expect(r).toEqual({ status: 'quarantined', detail: `/disks/sdb1/.idea-quarantine/${INST}` })
+        expect(stopAndQuarantine).toHaveBeenCalledTimes(1)
+        expect(h.doc().instanceDB[INST]?.storedOn).toBe(SRC_DISK)
+        expect((h.doc().operationDB as any)['op-c'].move).toMatchObject({
+            targetCleanup: 'quarantined',
+            targetCleanupDetail: `/disks/sdb1/.idea-quarantine/${INST}`,
+        })
+    })
+
+    it('refuses to touch the folder when the row says the id is stored on the target', async () => {
+        const h = makeStore()
+        h.change(d => { (d.instanceDB as any)[INST].storedOn = TGT_DISK })
+        h.change(d => {
+            (d.operationDB as any)['op-c'] = {
+                id: 'op-c', kind: 'moveApp',
+                args: { instanceId: INST, sourceDiskId: SRC_DISK, targetDiskId: TGT_DISK, crossEngine: 'true' },
+                status: 'Running',
+                move: { phase: 'removing', sourceInstanceId: INST, targetInstanceId: INST, verified: true, sourceRemoved: false, targetCleanup: null, targetCleanupDetail: null },
+            } as any
+        })
+        const stopAndQuarantine = vi.fn(async () => ({ quarantinePath: '/should-not-run' }))
+        const r = await cleanupMoveTarget(h, 'op-c', INST, TGT_DISK, { localEngineId: async () => String(TGT), stopAndQuarantine })
+        expect(r.status).toBe('failed')
+        expect(r.detail).toMatch(/stored on the target/)
+        expect(stopAndQuarantine).not.toHaveBeenCalled()
+        expect(h.doc().instanceDB[INST]?.storedOn).toBe(TGT_DISK)
+        expect((h.doc().operationDB as any)['op-c'].move.targetCleanup).toBe('failed')
+    })
+
+    it('does not quarantine when the target disk is not docked to this Engine', async () => {
+        const h = makeStore()
+        h.change(d => {
+            (d.operationDB as any)['op-c'] = {
+                id: 'op-c', kind: 'moveApp',
+                args: { instanceId: INST, targetDiskId: TGT_DISK },
+                status: 'Running',
+                move: { phase: 'checking', sourceInstanceId: INST, targetInstanceId: INST, verified: false, targetCleanup: null, targetCleanupDetail: null },
+            } as any
+        })
+        const stopAndQuarantine = vi.fn(async () => ({ quarantinePath: '/should-not-run' }))
+        const r = await cleanupMoveTarget(h, 'op-c', INST, TGT_DISK, { localEngineId: async () => SRC, stopAndQuarantine })
+        expect(r.status).toBe('failed')
+        expect(r.detail).toMatch(/not docked to this Engine/)
+        expect(stopAndQuarantine).not.toHaveBeenCalled()
+    })
+})
 
 describe('verifyMoveTarget Checking idea/progress (idea#498 option 3)', () => {
     afterEach(() => { resetPortReadyProgressForTests() })

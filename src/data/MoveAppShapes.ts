@@ -53,11 +53,12 @@ export const MOVE_FAILURE_CODES = [
     'VERIFY_TIMEOUT',     // the target did not report a verdict in time
     'VERIFY_FAILED',      // fallback only: the target could not check (e.g. sizing error) or sent no code
     'INTERRUPTED',        // the Engine restarted before verify was recorded
+    'SOURCE_KEPT',        // pre-flip failure that is not SOURCE_CHANGED (engine#388): source kept, not moved
 ] as const
 export const MOVE_DONE_CODES = [
     'MOVED',              // copied, verified, source quarantined
-    'SOURCE_NOT_REMOVED', // copied and verified, but removing the source failed (or restart after verify)
-    'SOURCE_CHANGED',     // copied and verified, but the source was started or written to during the move: kept
+    'SOURCE_NOT_REMOVED', // copied and verified, storedOn flipped, but removing the source failed (or restart after verify)
+    'SOURCE_CHANGED',     // copied and verified, but the source was started or written to during the move: kept (not flipped)
 ] as const
 export const MOVE_CODES = [...MOVE_REFUSAL_CODES, ...MOVE_FAILURE_CODES, ...MOVE_DONE_CODES] as const
 
@@ -98,8 +99,12 @@ export interface MoveProgress {
     sourceRemoved: boolean
     /** where the source folder was quarantined (the instance record is kept) */
     quarantinePath: string | null
+    /** Pre-flip failure only: whether the target copy was stopped and quarantined (engine#388). */
+    targetCleanup: 'quarantined' | 'failed' | null
+    /** Quarantine path on success, or why cleanup failed. */
+    targetCleanupDetail: string | null
     code: MoveCode | null
-    /** final text: MOVED to …, MOVE FAILED: … source kept, MOVED, source not removed: … */
+    /** final text: MOVED to …, MOVE FAILED: … source kept, MOVE STOPPED: … source kept, MOVED, source not removed: … */
     resultText: string | null
 }
 
@@ -117,6 +122,11 @@ export interface MoveResult {
 export const movedText = (engineName: string): string => `MOVED to ${engineName}`
 export const moveFailedText = (reason: string): string => `MOVE FAILED: ${reason.replace(/[.;\s]+$/, '')}; source kept`
 export const sourceNotRemovedText = (reason: string): string => `MOVED, source not removed: ${reason.replace(/[.;\s]+$/, '')}`
+/** SOURCE_CHANGED (pre-flip; source kept, not moved). */
+export const sourceKeptText = (reason: string): string => `MOVE STOPPED: ${reason.replace(/[.;\s]+$/, '')}; source kept`
+/** Append the engine#388 target-cleanup clause to a source-kept result text. */
+export const withTargetCleanupText = (text: string, cleanup: 'quarantined' | 'failed', targetName: string): string =>
+    `${text.replace(/[.;\s]+$/, '')}, ${cleanup === 'failed' ? `the leftover copy is on ${targetName}` : `the copy on ${targetName} was quarantined`}`
 
 export class MoveError extends Error {
     /** published as CommandTrace.result when the command fails (commandUtils.handleCommand) */
