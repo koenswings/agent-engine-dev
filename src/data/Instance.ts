@@ -1441,9 +1441,12 @@ export type StartInstanceOpts = { deferStoreStatus?: boolean }
 /** #179: every start is tracked in flight on its disk so an eject waits for it to settle. */
 export const startInstance = (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command', opts: StartInstanceOpts = {}): Promise<void> =>
   trackInFlight(String(disk.id), `startInstance ${instance.id}`, (async () => {
-    // Skip refresh-from-compose when deferring: that path would try to claim storedOn.
-    const inst = opts.deferStoreStatus ? instance : await refreshInstanceFromCompose(storeHandle, instance, disk)
-    return startInstanceTracked(storeHandle, inst, disk, cause, opts)
+    // engine#381: a deferred start skips refresh-from-compose so it cannot claim storedOn.
+    if (opts.deferStoreStatus) {
+      return startInstanceTracked(storeHandle, instance, disk, cause, opts)
+    }
+    const inst = await refreshInstanceFromCompose(storeHandle, instance, disk)
+    return startInstanceTracked(storeHandle, inst, disk, cause)
   })())
 
 const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command', opts: StartInstanceOpts = {}): Promise<void> => {
