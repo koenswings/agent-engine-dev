@@ -39,7 +39,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '14'
+export const APP_DATA_HELPER_VERSION = '16'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -50,7 +50,10 @@ export const BORG_PATH = '/usr/bin/borg'
 
 const ROOT_TOKEN = /^(system|sd[a-z][1-9]|[a-z0-9][a-z0-9-]{0,63})$/
 const ID_TOKEN = /^[a-z0-9][a-z0-9-]{0,63}$/
-const ARCHIVE_TOKEN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9-]{8,16}Z$/
+/** engine#401 (helper v16): an optional -hook / -stop / -cold mode suffix. */
+const ARCHIVE_TOKEN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9-]{8,16}Z(-(hook|stop|cold))?$/
+/** engine#401: the helper version that accepts a mode suffix on archive names. */
+export const ARCHIVE_MODE_HELPER_MIN = 16
 /** UTC stamp for .idea-verify/<id>-<stamp>/ (idea#446). No path separators. */
 const STAMP_TOKEN = /^[0-9]{8}T[0-9]{6,15}Z$/
 const APP_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
@@ -214,6 +217,24 @@ export const borgCompactArgs = (bdev: string, id: string): string[] => ['borg-co
  *  so cleanup requires v10 and a v9 helper gets HELPER_OUTDATED. */
 export const BACKUP_CLEANUP_HELPER_MIN = 10
 
+/**
+ * Helper protocol whose sync-peers takes the caller's Engine id and store document id,
+ * keeps an owner stamp and never empties the host-wide peer files (engine#376). An older
+ * helper would rewrite (or empty) the files from any caller, so the Engine does not call
+ * sync-peers at all below this version and logs HELPER_OUTDATED.
+ */
+export const PEER_FILES_HELPER_MIN = 15
+
+/** Store document ids as the helper accepts them (bare base58 Automerge id; helper RE_STORE_DOC). */
+export const STORE_DOC_ID_RE = /^[1-9A-HJ-NP-Za-km-z]{16,64}$/
+
+/** v15 (engine#376): `sync-peers <engineId> <storeDocId>`; the peer set goes on stdin. */
+export const syncPeersArgs = (engineId: string, storeDocId: string): string[] => {
+    const doc = storeDocId.trim().replace(/^automerge:/, '')
+    if (!STORE_DOC_ID_RE.test(doc)) throw new Error(`'${storeDocId}' is not a store document id the app-data helper accepts (${STORE_DOC_ID_RE})`)
+    return ['sync-peers', checkEngineId(engineId), doc]
+}
+
 /** The argv for `sudo`: sudo -n /usr/local/sbin/idea-app-data <args…> */
 export const appDataSudoArgv = (args: string[]): string[] => ['-n', APP_DATA_HELPER, ...args]
 
@@ -370,7 +391,7 @@ export const appDataHelperProblem = async (run: AppDataRunner = runAppData): Pro
  * Startup check (softened, Steve 2026-10-28): the Engine ALWAYS starts. A missing,
  * unrunnable or different helper is logged loudly and returned; each command that
  * needs a newer helper refuses on its own with HELPER_OUTDATED (helperAtLeast):
- * removeInstance needs v4, updateApp v14. isDev machines skip the check.
+ * removeInstance needs v4, updateApp v14, peer-file sync v15 (engine#376). isDev machines skip the check.
  */
 export const assertAppDataHelper = async (run: AppDataRunner = runAppData): Promise<string | null> => {
     if (config.settings.isDev) {

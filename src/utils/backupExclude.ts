@@ -159,6 +159,31 @@ export const parseBackupVerifyLists = (xapp: unknown): { present: string[]; abse
     return { present: parse('present'), absent: parse('absent') }
 }
 
+/**
+ * engine#401: optional per-mode verify lists, `x-app.backup.verify.<mode>.present` /
+ * `.absent` for mode hook, stop or cold (the archive name's suffix). They ADD to the
+ * flat `verify.present` / `verify.absent` lists, which apply to every archive. An
+ * untagged (older) archive uses the flat lists only, exactly as before. Same path
+ * rules; a present but malformed block or list throws (fail closed).
+ */
+export const parseBackupVerifyModeLists = (xapp: unknown): Partial<Record<'hook' | 'stop' | 'cold', { present: string[]; absent: string[] }>> => {
+    const backup = backupMapping(xapp)
+    const raw = backup?.verify
+    if (raw === undefined || raw === null || typeof raw !== 'object' || Array.isArray(raw)) return {}
+    const out: Partial<Record<'hook' | 'stop' | 'cold', { present: string[]; absent: string[] }>> = {}
+    for (const mode of ['hook', 'stop', 'cold'] as const) {
+        const block = (raw as Record<string, unknown>)[mode]
+        if (block === undefined || block === null) continue
+        if (typeof block !== 'object' || Array.isArray(block)) throw new Error(`x-app.backup.verify.${mode} is not a mapping`)
+        try {
+            out[mode] = parseBackupVerifyLists({ backup: { verify: block } })
+        } catch (e: any) {
+            throw new Error(String(e?.message ?? e).replace(/verify\./g, `verify.${mode}.`))
+        }
+    }
+    return out
+}
+
 
 
 // ── idea#396: snapshot / estimate excludes (helper v14) ──────────────────────

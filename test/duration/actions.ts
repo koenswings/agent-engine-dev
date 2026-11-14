@@ -2086,7 +2086,11 @@ type BackupOps = FleetOps & {
     listCommandTraces?: (engineId: string) => Promise<DurationCommandTrace[]>
 }
 
-/** Tokens of a trace's args: a JSON array as is, a named object's values (arrays flattened). */
+/**
+ * Tokens of a trace's args: a JSON array as is, a named object's values (arrays flattened).
+ * engine#399: when a named object has `instanceId`, its `instanceName` is the display name
+ * the Engine added, not a token that was sent, so it is left out.
+ */
 export const traceArgTokens = (args: string): string[] => {
     let v: unknown
     try {
@@ -2096,7 +2100,11 @@ export const traceArgTokens = (args: string): string[] => {
     }
     const flat = (x: unknown): string[] => (Array.isArray(x) ? x.flatMap(flat) : x == null ? [] : [String(x)])
     if (Array.isArray(v)) return flat(v)
-    if (v && typeof v === 'object') return Object.values(v as Record<string, unknown>).flatMap(flat)
+    if (v && typeof v === 'object') {
+        const o = v as Record<string, unknown>
+        const sent = 'instanceId' in o ? Object.entries(o).filter(([k]) => k !== 'instanceName').map(([, x]) => x) : Object.values(o)
+        return sent.flatMap(flat)
+    }
     return v == null ? [] : [String(v)]
 }
 

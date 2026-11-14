@@ -160,6 +160,10 @@ export interface EraseInProgress {
  *   backupLinks: addBackupLink, removeBackupLink (idea#451).
  *   scheduledBackups: the daily scheduled Backup Disk mode (tick, BACKUP.yaml schedule,
  *     Disk/Instance schedule fields) and setBackupMode (idea#400).
+ *   traceInstanceId: command traces carry the instance as args.instanceId (the id)
+ *               plus args.instanceName (the display name, null when the argument
+ *               did not resolve); older Engines put what was sent under
+ *               args.instanceName (engine#399).
  *   demoApps:     setupDemo / removeDemo (engine#369); advertised only when
  *               python3 is on PATH, checked once at startup (same pattern as
  *               backupCleanup / flashCard). The Console counts it only when
@@ -183,7 +187,7 @@ export interface EraseInProgress {
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'moveAppCrossEngine', 'usageSummaries', 'backupVerify', 'forgetDiskWithInstances', 'backupLinks', 'scheduledBackups', 'makeBackupDisk']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'moveAppCrossEngine', 'usageSummaries', 'backupVerify', 'forgetDiskWithInstances', 'backupLinks', 'scheduledBackups', 'traceInstanceId', 'makeBackupDisk']
 /** idea#201 §10: advertised only when the flash helper is installed (HELPER_MISSING otherwise) */
 export const FLASH_CARD_CAPABILITY = 'flashCard'
 export const FLASH_HELPER_PATH = '/usr/local/sbin/idea-flash-card'

@@ -447,6 +447,9 @@ export const updateApp = async (
         let live: Awaited<ReturnType<typeof readComposeBackup>> | undefined
         const newCompose = bundle ? path.join(bundle.dir, 'compose.yaml') : ''
         const backupAgeMs = inst.lastBackup ? d.now() - Number(inst.lastBackup) : null
+        // idea#403: method none has nothing to back up (no NEEDS_BACKUP). Read best-effort here so
+        // NEEDS_BACKUP / MAJOR / NO_SUMS keep their order; a malformed spec refuses BAD_BACKUP_SPEC below.
+        const liveBackupMethod = await readComposeBackup(path.join(instDir, 'compose.yaml'), 'live').then(r => r.method, () => undefined)
         const backupDisk = backupIsDue(String(inst.instanceOf), newAppId, backupAgeMs) ? linkedBackupDisk(store, engineId, inst) : null
         const facts = {
             diskDocked: true, busy: !gotLock, currentAppId: String(inst.instanceOf), newAppId,
@@ -456,6 +459,7 @@ export const updateApp = async (
             shortDisks: [] as string[],
             updatesFrom: bundle ? (await readXApp(path.join(bundle.dir, 'compose.yaml'))).updatesFrom : undefined,
             backupPlanned: !!backupDisk,
+            backupMethod: liveBackupMethod,
         }
         // NEEDS_BACKUP / MAJOR / NO_SUMS still win over exclude parsing (existing agreed order).
         const early = checkUpdate(facts)
@@ -518,7 +522,8 @@ export const updateApp = async (
                 if (/HOOK_FAILED: /.test(m)) throw new UpdateAppError('HOOK_FAILED', `${m.replace(/^.*?HOOK_FAILED: /, '')} (the current version's backup hook); nothing was stopped or changed, and the update does not fall back to a stop-mode backup`)
                 throw new UpdateAppError('BACKUP_FAILED', `the pre-update backup to ${backupDisk!.name} failed: ${m}`)
             }
-            preUpdateBackup = { backupDiskId: String(backupDisk!.id), method: instanceStopped ? 'stop' : 'hook', duringStop: instanceStopped }
+            // idea#403: method none copies nothing; the result says so instead of 'stop'
+            preUpdateBackup = { backupDiskId: String(backupDisk!.id), method: live?.method === 'none' ? 'none' : (instanceStopped ? 'stop' : 'hook'), duringStop: instanceStopped }
             log(`updateApp: ${inst.id}: pre-update backup to ${backupDisk!.id} done (${instanceStopped ? 'inside the snapshot stop' : 'hook, no stop'})`)
         }
         try {

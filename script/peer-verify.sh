@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2317  # functions run from the EXIT trap and through poll()
-# peer-verify.sh — cross-Pi verify of per-Pi Engine keys (rollout step 7, 46d4d57).
+# peer-verify.sh — cross-Pi verify of per-Pi Engine keys (rollout step 7).
 #
 #   script/peer-verify.sh [options] <host> <host> [<host>]
 #
@@ -11,11 +11,16 @@
 # Engine's store (script/peer-verify-store.ts over HTTP + WebSocket).
 #
 # Checks (one PASS/FAIL/BLOCKED line each, then a summary):
-#   1 install   helper v2, sshd -t, AuthorizedKeysFile, owners/modes, peerAccess: true
-#   2 peers     each Pi authorizes/pins exactly the other given Pis; store matches
+#   1 install   helper, sshd -t, AuthorizedKeysFile, owners/modes, peerAccess: true;
+#               helper/gate/drop-in shas are compared to each Pi's Engine pin
+#   2 peers     each Pi authorizes/pins the other given Pis, and may also
+#               authorize the golden Pi (role golden in fleet-state); store matches
 #   3 copy      real Engine copyApp both ways between Atlas-provided scratch disks
 #   4 refusals  plain ssh → exit 2 + journal; peer delete → "did not create";
-#               receive into an existing folder → "already exists"
+#               receive into an existing folder → "already exists".
+#               Engine-to-Engine ssh over Tailscale 100.x is EXPECTED-BLOCKED
+#               under the tag:idea ACL (tag:idea→nothing); refusals are checked
+#               over Engine.lanAddress instead.
 #   5 stale     peerStaleHours 0.05 on host 1, stop host 2's Engine, drop-out,
 #               start, return within one heartbeat, revert, original state
 #
@@ -31,17 +36,41 @@
 #   --skip-install --skip-peers --skip-copy --skip-refusals --skip-stale
 #   --scratch-slot <name>  slot holding the Atlas scratch disk (default idea-test-9)
 #   --stale-timeout <s>    drop-out wait (default 480)
+#   --required-commit <sha>
+#                          Engine pin for check 1 on every given Pi (overrides
+#                          fleet-state). Default, when fleet-state has no pin:
+#                          4522d7ff9a2652a44e2135ed279e55302b2b90a7 (current
+#                          Engine main).
+#   --fleet-state <path>   fleet-state.json used for each Pi's version pin and
+#                          the golden role (default: $PV_FLEET_STATE)
+#   --fleet-from-main      fetch fleet-state.json from koenswings/idea main
+#   --print-pins           print the resolved pin and golden, then exit
 #   --guards-only          check arguments only, touch nothing, exit
 #   --preflight-only       guards + read-only identity checks, exit
 # Exit: 0 all PASS (BLOCKED allowed), 1 a FAIL, 2 refused/usage, 3 cannot reach,
 #       4 revert incomplete (state left in ~pi/.peer-verify; re-run to finish it).
 # Env: PV_EVIDENCE_ROOT (/workspace/duration-evidence), PV_SSH (ssh), PV_SSH_KEY,
-#      PV_STORE (store tool command), PV_POLL (5).
+#      PV_STORE (store tool command), PV_POLL (5), PV_REPO_DIR (agent-engine-dev
+#      checkout when this script is a copy outside the repo), PV_FLEET_STATE,
+#      PV_FLEET_FROM_MAIN (1 = same as --fleet-from-main).
 set -uo pipefail
 
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
-REPO_DIR=$(cd "$(dirname "$SELF")/.." && pwd)
-REQUIRED_COMMIT=46d4d57b1191906ab8796c07e671d7feb50c34b2
+# When this file is a copy outside the repo (e.g. /tmp/peer-verify.sh), set
+# PV_REPO_DIR to an agent-engine-dev checkout that contains the Engine pin so
+# check 1 can `git show <pin>:script/build_image_assets/…`. --help, --guards-only
+# and --print-pins work without it.
+DEFAULT_ENGINE_PIN=4522d7ff9a2652a44e2135ed279e55302b2b90a7
+DEFAULT_GOLDEN_NAME=idea01
+if [[ -n "${PV_REPO_DIR:-}" ]]; then
+    REPO_DIR=$(cd "$PV_REPO_DIR" && pwd) || { echo "PV_REPO_DIR is not a directory: $PV_REPO_DIR" >&2; exit 2; }
+else
+    REPO_DIR=$(cd "$(dirname "$SELF")/.." && pwd)
+fi
+REPO_HAS_ASSETS=0
+if [[ -d "$REPO_DIR/.git" || -f "$REPO_DIR/script/build_image_assets/idea-app-data" ]]; then
+    REPO_HAS_ASSETS=1
+fi
 ENGINE_DIR=/home/pi/idea/agents/agent-engine-dev
 STATE=/home/pi/.peer-verify
 HELPER=/usr/local/sbin/idea-app-data
@@ -61,9 +90,11 @@ PV_POLL=${PV_POLL:-5}
 EVIDENCE_ROOT=${PV_EVIDENCE_ROOT:-/workspace/duration-evidence}
 
 SKIP_INSTALL=0 SKIP_PEERS=0 SKIP_COPY=0 SKIP_REFUSALS=0 SKIP_STALE=0
-GUARDS_ONLY=0 PREFLIGHT_ONLY=0
+GUARDS_ONLY=0 PREFLIGHT_ONLY=0 PRINT_PINS=0 FLEET_FROM_MAIN=0
 SCRATCH_SLOT=idea-test-9
 STALE_TIMEOUT=480
+REQUIRED_COMMIT_OVERRIDE=
+FLEET_STATE_PATH=${PV_FLEET_STATE:-}
 RUN_ID=$(date +%Y%m%d-%H%M%S)
 
 usage() { sed -n '3,/^set -uo/p' "$SELF" | sed '$d; s/^# \{0,1\}//'; }
@@ -82,6 +113,14 @@ while (( $# )); do
         --skip-stale) SKIP_STALE=1 ;;
         --guards-only) GUARDS_ONLY=1 ;;
         --preflight-only) PREFLIGHT_ONLY=1 ;;
+        --print-pins) PRINT_PINS=1 ;;
+        --fleet-from-main) FLEET_FROM_MAIN=1 ;;
+        --required-commit)
+            [[ "${2:-}" =~ ^[0-9a-fA-F]{7,40}$ ]] || refuse "--required-commit needs a 7–40 character hex sha"
+            REQUIRED_COMMIT_OVERRIDE=$2; shift ;;
+        --fleet-state)
+            [[ -n "${2:-}" ]] || refuse "--fleet-state needs a path"
+            FLEET_STATE_PATH=$2; shift ;;
         --scratch-slot) [[ "${2:-}" =~ ^idea-test-[0-9]+$ ]] || refuse "--scratch-slot needs idea-test-N"; SCRATCH_SLOT=$2; shift ;;
         --stale-timeout) [[ "${2:-}" =~ ^[0-9]+$ ]] || refuse "--stale-timeout needs seconds"; STALE_TIMEOUT=$2; shift ;;
         --) shift; ARGS+=("$@"); break ;;
@@ -112,6 +151,70 @@ guard_args() {
 guard_args
 if (( GUARDS_ONLY )); then
     for i in "${!NAMES[@]}"; do echo "GUARDS OK: ${NAMES[$i]} ${IPS[$i]}"; done
+    exit 0
+fi
+
+# ── fleet-state: per-Pi Engine pin and golden role ───────────────────────────
+# "engine <ref>@<sha>, console …" on each Pi's version field. The golden Pi
+# (role == golden) may appear as an extra authorised peer in check 2.
+parse_engine_pin() {
+    local v=$1
+    if [[ "$v" =~ engine[[:space:]][^@]*@([0-9a-fA-F]{7,40}) ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    fi
+}
+fetch_fleet_from_main() {
+    curl -fsSL --max-time 8 https://raw.githubusercontent.com/koenswings/idea/main/fleet-state.json
+}
+load_fleet_state() {
+    FLEET_JSON=
+    FLEET_SOURCE=none
+    GOLDEN_NAME=$DEFAULT_GOLDEN_NAME
+    if [[ -n "$FLEET_STATE_PATH" ]]; then
+        [[ -f "$FLEET_STATE_PATH" ]] || refuse "fleet-state file not found: $FLEET_STATE_PATH"
+        FLEET_JSON=$(cat "$FLEET_STATE_PATH") || refuse "cannot read $FLEET_STATE_PATH"
+        FLEET_SOURCE=$FLEET_STATE_PATH
+    elif (( FLEET_FROM_MAIN )) || [[ "${PV_FLEET_FROM_MAIN:-}" == 1 ]]; then
+        FLEET_JSON=$(fetch_fleet_from_main) || refuse "cannot fetch fleet-state.json from koenswings/idea main"
+        FLEET_SOURCE=koenswings/idea@main
+    fi
+    if [[ -n "$FLEET_JSON" ]]; then
+        jq -e . >/dev/null 2>&1 <<<"$FLEET_JSON" || refuse "fleet-state is not valid JSON ($FLEET_SOURCE)"
+        local g
+        g=$(jq -r 'to_entries[] | select((.value | type)=="object" and .value.role=="golden") | .key' <<<"$FLEET_JSON" | head -1)
+        if [[ -n "$g" && "$g" != "null" ]]; then
+            GOLDEN_NAME=$g
+        fi
+        [[ "$GOLDEN_NAME" != "$FORBIDDEN_NAME" ]] || GOLDEN_NAME=
+    fi
+}
+pin_for_name() {
+    local name=$1 pin=
+    if [[ -n "$REQUIRED_COMMIT_OVERRIDE" ]]; then
+        printf '%s\n' "$REQUIRED_COMMIT_OVERRIDE"
+        return
+    fi
+    if [[ -n "$FLEET_JSON" ]]; then
+        pin=$(parse_engine_pin "$(jq -r --arg n "$name" '.[$n].version // empty' <<<"$FLEET_JSON")")
+    fi
+    printf '%s\n' "${pin:-$DEFAULT_ENGINE_PIN}"
+}
+
+load_fleet_state
+declare -A PIN
+for i in "${!NAMES[@]}"; do
+    PIN[$i]=$(pin_for_name "${NAMES[$i]}")
+    [[ "${PIN[$i]}" =~ ^[0-9a-fA-F]{7,40}$ ]] || refuse "could not resolve an Engine pin for ${NAMES[$i]}"
+done
+if (( PRINT_PINS )); then
+    echo "FLEET_SOURCE=$FLEET_SOURCE"
+    echo "GOLDEN_NAME=$GOLDEN_NAME"
+    echo "DEFAULT_ENGINE_PIN=$DEFAULT_ENGINE_PIN"
+    echo "REPO_DIR=$REPO_DIR"
+    echo "REPO_HAS_ASSETS=$REPO_HAS_ASSETS"
+    for i in "${!NAMES[@]}"; do
+        echo "PIN ${NAMES[$i]}=${PIN[$i]}"
+    done
     exit 0
 fi
 
@@ -270,11 +373,26 @@ wait_engine_up() {  # wait_engine_up <idx> <previous lastBooted> <timeout>
     poll "$3" _up
 }
 slot_dir() { echo "${DISKS_ROOT[$1]}/$SCRATCH_SLOT"; }
-# peer_ssh <fromIdx> <toIdx> <command>: from <from>, the way its Engine reaches <to>
-peer_ssh() {
+# peer_ssh_to <fromIdx> <toIdx> <host> <command>: Engine-key ssh to <host>, host key pinned by Engine id.
+peer_ssh_to() {
     rsh "$1" ssh -i "$ENGINE_KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
         -o UserKnownHostsFile="$KH_FILE" -o HostKeyAlias="${ENGINE_ID[$2]}" -o ConnectTimeout=10 \
-        "pi@${IPS[$2]}" "$3" </dev/null
+        "pi@$3" "$4" </dev/null
+}
+# peer_ssh <fromIdx> <toIdx> <command>: the Tailscale 100.x address from POOL_IP.
+peer_ssh() { peer_ssh_to "$1" "$2" "${IPS[$2]}" "$3"; }
+
+# True when Engine-to-Engine ssh to a Tailscale 100.x address failed the way the
+# tag:idea ACL (tag:idea→nothing) does: the SYN is dropped, not an auth error.
+ts_acl_blocked() {
+    local rc=$1 out=$2
+    (( rc != 0 )) || return 1
+    grep -Eqi 'connection timed out|no route to host|network is unreachable|network unreachable' <<<"$out"
+}
+
+# Engine.lanAddress for host idx, from the preflight store dump.
+lan_of() {
+    jq -r --arg id "${ENGINE_ID[$1]}" '.engineDB[$id].lanAddress // empty' "$EVID/store-pre-${NAMES[$1]}.json"
 }
 
 # ── post-state and summary ───────────────────────────────────────────────────
@@ -285,7 +403,7 @@ post_state() {
     for i in "${!NAMES[@]}"; do
         bad=()
         _settled() {
-            out=$(rsh "$i" bash -s <<<"$ENGPROBE" 2>&1) || return 1
+            out=$(rsh "$i" bash -s <<<"$(engine_probe_script "${PIN[$i]}")" 2>&1) || return 1
             [[ "$(sed -n 's/^AUTHSHA=//p' <<<"$out")" == "${AUTH_SHA[$i]}" && "$(sed -n 's/^KHSHA=//p' <<<"$out")" == "${KH_SHA[$i]}" ]]
         }
         poll 150 _settled || bad+=("peer files differ from the start of the run")
@@ -367,11 +485,13 @@ for i in "${!NAMES[@]}"; do
     done
 done
 
-# Engine state (read-only)
-ENGPROBE=$(cat <<RS
+# Engine state (read-only). The ancestor check uses this Pi's Engine pin.
+engine_probe_script() {
+    local pin=$1
+    cat <<RS
 cd $ENGINE_DIR || exit 1
 echo "HEAD=\$(git rev-parse HEAD)"
-git merge-base --is-ancestor $REQUIRED_COMMIT HEAD 2>/dev/null && echo HAS_COMMIT=yes || echo HAS_COMMIT=no
+git merge-base --is-ancestor $pin HEAD 2>/dev/null && echo HAS_COMMIT=yes || echo HAS_COMMIT=no
 echo "STOREURL=\$(cat store-identity/store-url.txt 2>/dev/null)"
 [ -e store-identity/store-url.restored ] && echo RESTORED=yes || echo RESTORED=no
 echo "CFGSHA=\$(sha256sum config.yaml | cut -c1-64)"
@@ -389,10 +509,10 @@ for p in json.load(sys.stdin):
         print("PM2=%s" % e["status"]); print("CWD=%s" % e["pm_cwd"]); print("LOG=%s" % e["pm_out_log_path"])
         print("DISKSROOT=%s" % env.get("IDEA_DISKS_ROOT","/disks"))'
 RS
-)
+}
 declare -a HB_MS
 for i in "${!NAMES[@]}"; do
-    out=$(rsh "$i" bash -s <<<"$ENGPROBE" 2>&1) || { echo "engine probe failed on ${NAMES[$i]}: $out" >&2; exit 3; }
+    out=$(rsh "$i" bash -s <<<"$(engine_probe_script "${PIN[$i]}")" 2>&1) || { echo "engine probe failed on ${NAMES[$i]}: $out" >&2; exit 3; }
     echo "$out" > "$EVID/engine-pre-${NAMES[$i]}.txt"
     g() { sed -n "s/^$1=//p" <<<"$out"; }
     [[ "$(g PM2)" == online && "$(g CWD)" == "$ENGINE_DIR" ]] || { echo "${NAMES[$i]}: pm2 'engine' is not online in $ENGINE_DIR (status $(g PM2), cwd $(g CWD))" >&2; exit 3; }
@@ -435,8 +555,19 @@ echo "SHA_GATE=\$(sha256sum $GATE | cut -c1-64)"
 echo "SHA_DROPIN=\$(sha256sum /etc/ssh/sshd_config.d/10-idea-peer.conf | cut -c1-64)"
 RS
 )
-want_sha() { git -C "$REPO_DIR" show "$REQUIRED_COMMIT:script/build_image_assets/$1" | sha256sum | cut -c1-64; }
-W_HELPER=$(want_sha idea-app-data); W_GATE=$(want_sha idea-peer-gate); W_DROPIN=$(want_sha 10-idea-peer.conf)
+want_sha() {  # want_sha <pin> <asset>
+    local pin=$1 asset=$2 sha
+    if (( ! REPO_HAS_ASSETS )); then
+        echo "NO_REPO"
+        return
+    fi
+    sha=$(git -C "$REPO_DIR" show "$pin:script/build_image_assets/$asset" 2>/dev/null | sha256sum | cut -c1-64) || true
+    if [[ -z "$sha" || "$sha" == "$(printf '' | sha256sum | cut -c1-64)" ]]; then
+        echo "MISSING"
+        return
+    fi
+    printf '%s\n' "$sha"
+}
 declare -A WANT_STAT=(
     [$HELPER]="root:root 755 regular file" [$GATE]="root:root 755 regular file"
     [/etc/ssh/sshd_config.d/10-idea-peer.conf]="root:root 644 regular file"
@@ -447,23 +578,35 @@ declare -A WANT_STAT=(
 for i in "${!NAMES[@]}"; do
     out=$(rsh "$i" bash -s <<<"$INSTALL_PROBE" 2>&1); echo "$out" > "$EVID/1-install-${NAMES[$i]}.txt"
     bad=()
-    [[ "$(sed -n 's/^VERSION=//p' <<<"$out")" == "idea-app-data 14" ]] || bad+=("helper version: $(sed -n 's/^VERSION=//p' <<<"$out")")
+    [[ "$(sed -n 's/^VERSION=//p' <<<"$out")" == "idea-app-data 16" ]] || bad+=("helper version: $(sed -n 's/^VERSION=//p' <<<"$out")")
     [[ "$(sed -n 's/^SSHD_T=//p' <<<"$out")" == ok ]] || bad+=("sshd -t: $(sed -n 's/^SSHD_T=//p' <<<"$out")")
     grep -q '/etc/ssh/idea_authorized_keys/%u' <<<"$(sed -n 's/^AKF=//p' <<<"$out")" || bad+=("AuthorizedKeysFile is '$(sed -n 's/^AKF=//p' <<<"$out")'")
     for p in "${!WANT_STAT[@]}"; do
         got=$(sed -n "s|^STAT=\(.*\) $p\$|\1|p" <<<"$out")
         [[ "$got" == "${WANT_STAT[$p]}" ]] || bad+=("$p is '$got', want '${WANT_STAT[$p]}'")
     done
-    [[ "$(sed -n 's/^SHA_HELPER=//p' <<<"$out")" == "$W_HELPER" ]] || bad+=("installed helper differs from ${REQUIRED_COMMIT:0:7}")
-    [[ "$(sed -n 's/^SHA_GATE=//p' <<<"$out")" == "$W_GATE" ]] || bad+=("installed gate differs from ${REQUIRED_COMMIT:0:7}")
-    [[ "$(sed -n 's/^SHA_DROPIN=//p' <<<"$out")" == "$W_DROPIN" ]] || bad+=("installed sshd drop-in differs from ${REQUIRED_COMMIT:0:7}")
-    v="PRE_${i}_HAS"; [[ "${!v}" == yes ]] || bad+=("Engine checkout does not contain ${REQUIRED_COMMIT:0:7}")
+    pin=${PIN[$i]}; pin7=${pin:0:7}
+    if (( ! REPO_HAS_ASSETS )); then
+        bad+=("cannot read pin $pin7 assets: this script is not inside an agent-engine-dev checkout (set PV_REPO_DIR)")
+    else
+        W_HELPER=$(want_sha "$pin" idea-app-data)
+        W_GATE=$(want_sha "$pin" idea-peer-gate)
+        W_DROPIN=$(want_sha "$pin" 10-idea-peer.conf)
+        if [[ "$W_HELPER" == MISSING || "$W_GATE" == MISSING || "$W_DROPIN" == MISSING ]]; then
+            bad+=("cannot git show $pin7:script/build_image_assets/… from $REPO_DIR (fetch that commit or set PV_REPO_DIR)")
+        else
+            [[ "$(sed -n 's/^SHA_HELPER=//p' <<<"$out")" == "$W_HELPER" ]] || bad+=("installed helper differs from $pin7")
+            [[ "$(sed -n 's/^SHA_GATE=//p' <<<"$out")" == "$W_GATE" ]] || bad+=("installed gate differs from $pin7")
+            [[ "$(sed -n 's/^SHA_DROPIN=//p' <<<"$out")" == "$W_DROPIN" ]] || bad+=("installed sshd drop-in differs from $pin7")
+        fi
+    fi
+    v="PRE_${i}_HAS"; [[ "${!v}" == yes ]] || bad+=("Engine checkout does not contain $pin7")
     v="PRE_${i}_PA"; [[ "${!v}" == true ]] || bad+=("config.yaml has no 'peerAccess: true' under settings (testMode turns key exchange off)")
     v="PRE_${i}_RESTORED"; [[ "${!v}" == no ]] || bad+=("store-identity/store-url.restored exists (peer access fails closed)")
     v="PRE_${i}_URL"; v0="PRE_0_URL"; [[ -n "${!v}" && "${!v}" == "${!v0}" ]] || bad+=("store-url.txt '${!v}' differs from ${NAMES[0]}'s '${!v0}'")
     [[ -n "$(jq -r --arg id "${ENGINE_ID[$i]}" '.engineDB[$id].peerAccess.sshKey // empty' "$EVID/store-pre-${NAMES[$i]}.json")" ]] || bad+=("Engine has not published peerAccess in the store")
     if (( ${#bad[@]} )); then result "1 install ${NAMES[$i]}" FAIL "$(IFS=';'; echo "${bad[*]}")"
-    else result "1 install ${NAMES[$i]}" PASS "helper 2, sshd -t ok, AuthorizedKeysFile has idea_authorized_keys/%u, 11 owners/modes ok, files = ${REQUIRED_COMMIT:0:7}, peerAccess: true, shared store"; fi
+    else result "1 install ${NAMES[$i]}" PASS "helper, sshd -t ok, AuthorizedKeysFile has idea_authorized_keys/%u, 11 owners/modes ok, files = ${PIN[$i]:0:7}, peerAccess: true, shared store"; fi
 done
 fi
 
@@ -489,33 +632,76 @@ peer_ids() {
 }
 if (( SKIP_PEERS )); then result "2 peers" BLOCKED "skipped (--skip-peers)"; else
 step "2 peers"
+# Golden Engine id from the store (hostname == GOLDEN_NAME). Allowed as an extra
+# authorised peer when that Pi is not one of the given hosts. Never idea02.
+GOLDEN_ID=
+if [[ -n "${GOLDEN_NAME:-}" && "$GOLDEN_NAME" != "$FORBIDDEN_NAME" ]]; then
+    GOLDEN_ID=$(jq -r --arg h "$GOLDEN_NAME" '.engineDB|to_entries|map(select(.value.hostname==$h))|sort_by(.value.lastBooted // .value.lastRun // 0)|reverse|.[0].key // empty' "$EVID/store-pre-${NAMES[0]}.json")
+    if [[ -z "$GOLDEN_ID" || "${GOLDEN_ID,,}" == *"$FORBIDDEN_NAME"* ]]; then GOLDEN_ID=; fi
+fi
+GOLDEN_PUB=; GOLDEN_HOST=
+if [[ -n "$GOLDEN_ID" ]]; then
+    GOLDEN_PUB=$(jq -r --arg id "$GOLDEN_ID" '.engineDB[$id].peerAccess.sshKey // empty' "$EVID/store-pre-${NAMES[0]}.json" | awk '{print $1" "$2}')
+    GOLDEN_HOST=$(jq -r --arg id "$GOLDEN_ID" '.engineDB[$id].peerAccess.hostKey // empty' "$EVID/store-pre-${NAMES[0]}.json" | awk '{print $1" "$2}')
+fi
+id_in_list() {  # id_in_list <id> <newline-list>
+    grep -qxF "$1" <<<"$2"
+}
 for i in "${!NAMES[@]}"; do collect_peers "$i" || { result "2 peers ${NAMES[$i]}" FAIL "cannot read the peer files"; continue; }; done
 for i in "${!NAMES[@]}"; do
     { echo "# authorized_keys"; echo "${P_AUTH[$i]}"; echo "# peer_known_hosts"; echo "${P_KH[$i]}"; echo "# engine key"; echo "${P_PUB[$i]}"; echo "# host key"; echo "${P_HOST[$i]}"; } > "$EVID/2-peers-${NAMES[$i]}.txt"
-    bad=(); want_ids=(); want_auth=()
+    bad=(); required_ids=(); want_auth=()
     for j in "${!NAMES[@]}"; do
         (( i == j )) && continue
-        want_ids+=("${ENGINE_ID[$j]}")
+        required_ids+=("${ENGINE_ID[$j]}")
         want_auth+=("${ENGINE_ID[$j]} $(fp "$(awk '{print $2}' <<<"${P_PUB[$j]}")") $(fp "$(awk '{print $2}' <<<"${P_HOST[$j]}")")")
         aline="restrict,command=\"$GATE ${ENGINE_ID[$j]}\" ${P_PUB[$j]} idea-peer:${ENGINE_ID[$j]}"
         grep -qxF "$aline" <<<"${P_AUTH[$i]}" || bad+=("authorized_keys lacks the exact gate line for ${NAMES[$j]} (${ENGINE_ID[$j]}) with its ${ENGINE_KEY##*/}.pub")
         grep -qxF "${ENGINE_ID[$j]} ${P_HOST[$j]}" <<<"${P_KH[$i]}" || bad+=("peer_known_hosts lacks ${NAMES[$j]}'s host key under ${ENGINE_ID[$j]}")
     done
-    want=$(printf '%s\n' "${want_ids[@]}" | LC_ALL=C sort)
+    allowed_ids=("${required_ids[@]}")
+    if [[ -n "$GOLDEN_ID" && "$GOLDEN_ID" != "${ENGINE_ID[$i]}" ]] && ! id_in_list "$GOLDEN_ID" "$(printf '%s\n' "${required_ids[@]}")"; then
+        allowed_ids+=("$GOLDEN_ID")
+        if [[ -n "$GOLDEN_PUB" && -n "$GOLDEN_HOST" ]]; then
+            want_auth+=("$GOLDEN_ID $(fp "$(awk '{print $2}' <<<"$GOLDEN_PUB")") $(fp "$(awk '{print $2}' <<<"$GOLDEN_HOST")")")
+        fi
+    fi
+    required=$(printf '%s\n' "${required_ids[@]}" | LC_ALL=C sort)
+    allowed=$(printf '%s\n' "${allowed_ids[@]}" | LC_ALL=C sort)
     for src in auth kh store; do
         got=$(peer_ids "$i" "$src")
-        [[ "$got" == "$want" ]] || bad+=("$src lists [$(tr '\n' ' ' <<<"$got")] not exactly [$(tr '\n' ' ' <<<"$want")]")
+        missing=$(comm -23 <(printf '%s\n' "$required") <(printf '%s\n' "$got"))
+        extra=$(comm -13 <(printf '%s\n' "$allowed") <(printf '%s\n' "$got"))
+        [[ -z "$missing" ]] || bad+=("$src missing [$(tr '\n' ' ' <<<"$missing")]")
+        [[ -z "$extra" ]] || bad+=("$src has unexpected [$(tr '\n' ' ' <<<"$extra")] (allowed the given peers and golden ${GOLDEN_NAME:-none})")
         grep -qi "$FORBIDDEN_NAME" <<<"$got" && bad+=("$src names idea02")
     done
-    [[ $(grep -c . <<<"${P_AUTH[$i]}") == "${#want_ids[@]}" ]] || bad+=("authorized_keys has $(grep -c . <<<"${P_AUTH[$i]}") key lines, want ${#want_ids[@]}")
-    [[ $(grep -c . <<<"${P_KH[$i]}") == "${#want_ids[@]}" ]] || bad+=("peer_known_hosts has $(grep -c . <<<"${P_KH[$i]}") lines, want ${#want_ids[@]}")
-    got_auth=$(store_authorized "$i" "$i"); want_auth_s=$(printf '%s\n' "${want_auth[@]}" | LC_ALL=C sort)
-    echo "# store authorized"$'\n'"$got_auth"$'\n'"# expected"$'\n'"$want_auth_s" >> "$EVID/2-peers-${NAMES[$i]}.txt"
-    [[ "$got_auth" == "$want_auth_s" ]] || bad+=("store peerAccess.authorized does not match the fingerprints of the peers' real keys")
+    # If the golden Pi is authorised, its gate line and host key must match the store.
+    if [[ -n "$GOLDEN_ID" && -n "$GOLDEN_PUB" && -n "$GOLDEN_HOST" ]] && id_in_list "$GOLDEN_ID" "$(peer_ids "$i" auth)"; then
+        galine="restrict,command=\"$GATE $GOLDEN_ID\" $GOLDEN_PUB idea-peer:$GOLDEN_ID"
+        grep -qxF "$galine" <<<"${P_AUTH[$i]}" || bad+=("authorized_keys golden line for $GOLDEN_NAME ($GOLDEN_ID) does not match the store-published key")
+        grep -qxF "$GOLDEN_ID $GOLDEN_HOST" <<<"${P_KH[$i]}" || bad+=("peer_known_hosts golden line for $GOLDEN_NAME ($GOLDEN_ID) does not match the store-published host key")
+    fi
+    got_auth=$(store_authorized "$i" "$i")
+    # Required fingerprints must be present; a golden extra is allowed when it matches the store keys.
+    want_auth_s=$(printf '%s\n' "${want_auth[@]}" | LC_ALL=C sort)
+    echo "# store authorized"$'\n'"$got_auth"$'\n'"# expected (required + optional golden)"$'\n'"$want_auth_s" >> "$EVID/2-peers-${NAMES[$i]}.txt"
+    for ((k=0; k<${#required_ids[@]}; k++)); do
+        grep -qxF "${want_auth[$k]}" <<<"$got_auth" || bad+=("store peerAccess.authorized lacks '${want_auth[$k]}'")
+    done
+    # Check the golden store line only when that id is listed.
+    if [[ -n "$GOLDEN_ID" && -n "$GOLDEN_PUB" && -n "$GOLDEN_HOST" ]] && id_in_list "$GOLDEN_ID" "$(peer_ids "$i" store)"; then
+        gline="$GOLDEN_ID $(fp "$(awk '{print $2}' <<<"$GOLDEN_PUB")") $(fp "$(awk '{print $2}' <<<"$GOLDEN_HOST")")"
+        grep -qxF "$gline" <<<"$got_auth" || bad+=("store peerAccess.authorized golden line for $GOLDEN_NAME does not match the store-published keys")
+    fi
     pub_store=$(jq -r --arg id "${ENGINE_ID[$i]}" '.engineDB[$id].peerAccess.sshKey // ""' <<<"$DUMP" | awk '{print $1" "$2}')
     [[ "$pub_store" == "${P_PUB[$i]}" ]] || bad+=("published sshKey differs from ${ENGINE_KEY##*/}.pub")
     if (( ${#bad[@]} )); then result "2 peers ${NAMES[$i]}" FAIL "$(IFS=';'; echo "${bad[*]}")"
-    else result "2 peers ${NAMES[$i]}" PASS "exactly [$(tr '\n' ' ' <<<"$want" | sed 's/ $//')] in authorized_keys, peer_known_hosts and store; keys and fingerprints match"; fi
+    else
+        extra_note=
+        [[ -n "$GOLDEN_ID" ]] && extra_note="; golden $GOLDEN_NAME ($GOLDEN_ID) allowed"
+        result "2 peers ${NAMES[$i]}" PASS "given peers [$(tr '\n' ' ' <<<"$required" | sed 's/ $//')] present; no unexpected ids$extra_note; keys and fingerprints match"
+    fi
 done
 fi
 
@@ -598,14 +784,43 @@ fi
 # for "existing folder" (marker written first; rmdir right after and in the trap).
 refusals() {  # refusals <fromIdx> <toIdx>
     local a=$1 b=$2 tag="4 refusals ${NAMES[$1]}->${NAMES[$2]}" bad=() out rc since tmpid tmp
+    local ts_host lan_host check_host ts_blocked=0 ts_note path_note
     tmpid="pv-verify-${RUN_ID//[^0-9]/}-$a$b"; tmp=/instances/$tmpid
+    ts_host=${IPS[$b]}
+    lan_host=$(lan_of "$b")
     since=$(rsh "$b" "date '+%Y-%m-%d %H:%M:%S'")
-    # control: the key works and the gate passes an allowed call
-    out=$(peer_ssh "$a" "$b" "sudo -n $HELPER version" 2>&1); rc=$?
-    echo "== version rc=$rc"$'\n'"$out" > "$EVID/4-refusals-${NAMES[$a]}-${NAMES[$b]}.txt"
-    [[ $rc == 0 && "$out" == *"idea-app-data 14"* ]] || bad+=("control 'version' through the gate failed (rc $rc: ${out:0:120})")
+    # Probe Tailscale 100.x first. tag:idea → nothing drops those packets
+    # (Connection timed out); that is EXPECTED-BLOCKED, not a FAIL. The
+    # actual gate checks then run over Engine.lanAddress.
+    out=$(peer_ssh_to "$a" "$b" "$ts_host" "sudo -n $HELPER version" 2>&1); rc=$?
+    echo "== tailscale $ts_host version rc=$rc"$'\n'"$out" > "$EVID/4-refusals-${NAMES[$a]}-${NAMES[$b]}.txt"
+    if ts_acl_blocked "$rc" "$out"; then
+        ts_blocked=1
+        ts_note="EXPECTED-BLOCKED under the tag:idea ACL (tag:idea→nothing) on $ts_host"
+        if [[ -n "$lan_host" && "$lan_host" != "$ts_host" ]]; then
+            check_host=$lan_host
+            path_note="refusals checked over LAN $lan_host instead"
+        else
+            result "$tag" BLOCKED "$ts_note; no Engine.lanAddress to check instead"
+            return
+        fi
+    elif (( rc != 0 )); then
+        bad+=("control 'version' through the gate on $ts_host failed (rc $rc: ${out:0:120})")
+        check_host=$ts_host
+        path_note="over Tailscale $ts_host"
+    else
+        check_host=$ts_host
+        path_note="over Tailscale $ts_host"
+        # already have a successful version probe; reuse it below
+    fi
+    if (( ts_blocked )); then
+        echo "== $ts_note"$'\n'"== $path_note" >> "$EVID/4-refusals-${NAMES[$a]}-${NAMES[$b]}.txt"
+        out=$(peer_ssh_to "$a" "$b" "$check_host" "sudo -n $HELPER version" 2>&1); rc=$?
+        echo "== LAN $check_host version rc=$rc"$'\n'"$out" >> "$EVID/4-refusals-${NAMES[$a]}-${NAMES[$b]}.txt"
+    fi
+    [[ $rc == 0 && "$out" == *"idea-app-data 16"* ]] || bad+=("control 'version' through the gate on $check_host failed (rc $rc: ${out:0:120})")
     # a) plain command → gate refusal, exit 2, journal
-    out=$(peer_ssh "$a" "$b" "id" 2>&1); rc=$?
+    out=$(peer_ssh_to "$a" "$b" "$check_host" "id" 2>&1); rc=$?
     echo "== id rc=$rc"$'\n'"$out" >> "$EVID/4-refusals-${NAMES[$a]}-${NAMES[$b]}.txt"
     [[ $rc == 2 && "$out" == *"refused:"* ]] || bad+=("plain 'id' gave rc $rc: ${out:0:120}")
     [[ "$out" != *"uid="* ]] || bad+=("plain 'id' RAN on ${NAMES[$b]}")
@@ -614,16 +829,16 @@ refusals() {  # refusals <fromIdx> <toIdx>
     echo "== journal on ${NAMES[$b]} since $since"$'\n'"$out" >> "$EVID/4-refusals-${NAMES[$a]}-${NAMES[$b]}.txt"
     grep -q "refused peer=${ENGINE_ID[$a]} .*cmd=id " <<<"$out" || bad+=("no 'refused peer=${ENGINE_ID[$a]} … cmd=id' in journalctl -t idea-peer-gate on ${NAMES[$b]}")
     # b) remote delete of something this peer did not create (ledger refusal; nothing exists to lose)
-    out=$(peer_ssh "$a" "$b" "sudo -n $HELPER delete system ${tmpid}x" 2>&1); rc=$?
+    out=$(peer_ssh_to "$a" "$b" "$check_host" "sudo -n $HELPER delete system ${tmpid}x" 2>&1); rc=$?
     echo "== delete system ${tmpid}x (absent) rc=$rc"$'\n'"$out" >> "$EVID/4-refusals-${NAMES[$a]}-${NAMES[$b]}.txt"
     [[ $rc == 2 && "$out" == *"did not create"* ]] || bad+=("delete of a non-received id gave rc $rc: ${out:0:160}")
     # c) existing folder: marker, mkdir, refused delete + refused receive, rmdir
     if rsh "$b" "mkdir -p $STATE && echo $tmp > $STATE/tempdir.$tmpid && sudo -n mkdir -m 0755 -- $tmp && sudo -n chown pi:pi -- $tmp"; then
-        out=$(peer_ssh "$a" "$b" "sudo -n $HELPER delete system $tmpid" 2>&1); rc=$?
+        out=$(peer_ssh_to "$a" "$b" "$check_host" "sudo -n $HELPER delete system $tmpid" 2>&1); rc=$?
         echo "== delete system $tmpid (exists) rc=$rc"$'\n'"$out" >> "$EVID/4-refusals-${NAMES[$a]}-${NAMES[$b]}.txt"
         [[ $rc == 2 && "$out" == *"did not create"* ]] || bad+=("delete of an existing non-received folder gave rc $rc: ${out:0:160}")
         rsh "$b" "test -d $tmp" || bad+=("the existing folder $tmp is GONE after a refused delete")
-        out=$(peer_ssh "$a" "$b" "sudo -n $HELPER receive system $tmpid --server -logDtpre.iLsfxCIvu . ." 2>&1 </dev/null); rc=$?
+        out=$(peer_ssh_to "$a" "$b" "$check_host" "sudo -n $HELPER receive system $tmpid --server -logDtpre.iLsfxCIvu . ." 2>&1 </dev/null); rc=$?
         echo "== receive system $tmpid (exists) rc=$rc"$'\n'"$out" >> "$EVID/4-refusals-${NAMES[$a]}-${NAMES[$b]}.txt"
         [[ $rc == 2 && "$out" == *"already exists"* ]] || bad+=("receive into an existing folder gave rc $rc: ${out:0:160}")
         [[ -z "$(rsh "$b" "ls -A $tmp")" ]] || bad+=("$tmp is no longer empty")
@@ -632,9 +847,17 @@ refusals() {  # refusals <fromIdx> <toIdx>
     else
         bad+=("cannot create the scratch folder $tmp on ${NAMES[$b]}")
     fi
-    if (( ${#bad[@]} )); then result "$tag" FAIL "$(IFS=';'; echo "${bad[*]}")"
-    else result "$tag" PASS "version ok; 'id' exit 2 + journal; delete → 'did not create' (absent and existing); receive into existing → 'already exists'"; fi
+    local detail="version ok; 'id' exit 2 + journal; delete → 'did not create' (absent and existing); receive into existing → 'already exists'; $path_note"
+    if (( ${#bad[@]} )); then
+        if (( ts_blocked )); then detail="$ts_note; $path_note; $(IFS=';'; echo "${bad[*]}")"; fi
+        result "$tag" FAIL "$detail"
+    elif (( ts_blocked )); then
+        result "$tag" BLOCKED "$ts_note; $path_note; $detail"
+    else
+        result "$tag" PASS "$detail"
+    fi
 }
+
 if (( SKIP_REFUSALS )); then result "4 refusals" BLOCKED "skipped (--skip-refusals)"
 else
     step "4 refusals"

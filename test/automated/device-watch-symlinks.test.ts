@@ -115,7 +115,9 @@ describe('udev watch folder watcher (idea#110)', () => {
         // agent-engine-dev#228: through watchDeviceFolderWhenPresent, which attaches
         // watchDeviceFolder once the folder exists
         expect(src).toMatch(/const watcher = watchDeviceFolderWhenPresent\(watchDir,/)
-        expect(src).toMatch(/const w = watchDeviceFolder\(root\)/)
+        // idea#398: the factory is injectable for the race test; its default is watchDeviceFolder
+        expect(src).toMatch(/watchFolder: \(dir: string\) => FSWatcher = watchDeviceFolder,/)
+        expect(src).toMatch(/const w = watchFolder\(root\)/)
         expect(src.match(/chokidar\.watch\(/g) ?? []).toHaveLength(1)
     })
 })

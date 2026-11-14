@@ -1,8 +1,16 @@
 /**
  * backupMethod.ts — parse x-app.backup method/hooks (idea#444)
  *
- * Methods: `stop` (default, today's short stop) and `hook`. `live` and `none`
- * fail closed until an App needs them (Steve, idea#444).
+ * Methods: `stop` (default, today's short stop), `hook` and `none` (idea#403:
+ * nothing is copied to the Backup Disk because the App's content is on the App
+ * Disk and can be rebuilt, e.g. Kiwix ZIMs). `live` fails closed until an App
+ * needs it (Steve, idea#444).
+ *
+ * idea#403: `preHook` and `postHook` are ordered lists of {service, command,
+ * user}; a single mapping is still accepted and means a list of one. preHook
+ * steps run in order and stop at the first failure. Every postHook step always
+ * runs, even after a failed pre step, a failed earlier post step or a failed
+ * borg run.
  *
  * `fallback: stop|fail` (default `stop`) applies when method is `hook` and the
  * preHook fails or times out. `stop` then takes the existing short-stop path
@@ -23,7 +31,7 @@ export const DEFAULT_HOOK_TIMEOUT_S = 300
 const SERVICE_TOKEN = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/
 const USER_TOKEN = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/
 
-export type BackupMethod = 'stop' | 'hook'
+export type BackupMethod = 'stop' | 'hook' | 'none'
 export type BackupFallback = 'stop' | 'fail'
 
 export interface BackupHookDecl {
@@ -35,16 +43,18 @@ export interface BackupHookDecl {
 export interface BackupSpec {
     method: BackupMethod
     fallback: BackupFallback
-    preHook: BackupHookDecl | null
-    postHook: BackupHookDecl | null
+    /** Ordered pre steps (idea#403); empty when none is declared. */
+    preHook: BackupHookDecl[]
+    /** Ordered post steps (idea#403); every step always runs. Empty when none is declared. */
+    postHook: BackupHookDecl[]
     hookTimeout: number
 }
 
 export const defaultBackupSpec = (): BackupSpec => ({
     method: 'stop',
     fallback: 'stop',
-    preHook: null,
-    postHook: null,
+    preHook: [],
+    postHook: [],
     hookTimeout: DEFAULT_HOOK_TIMEOUT_S,
 })
 
@@ -103,6 +113,18 @@ export const parseBackupHookDecl = (raw: unknown, which: string): BackupHookDecl
     return hook
 }
 
+/**
+ * idea#403: a hook is one mapping (a list of one, as before) or an ordered,
+ * non-empty list of mappings. Each step is validated as parseBackupHookDecl;
+ * errors name the step as `<which>[<i>]`.
+ */
+export const parseBackupHookList = (raw: unknown, which: string): BackupHookDecl[] => {
+    if (raw === undefined || raw === null) return []
+    if (!Array.isArray(raw)) return [parseBackupHookDecl(raw, which)]
+    if (raw.length === 0) throw backupMethodError(`${which} is an empty list`)
+    return raw.map((step, i) => parseBackupHookDecl(step, `${which}[${i}]`))
+}
+
 export const parseBackupSpec = (xapp: unknown): BackupSpec => {
     const spec = defaultBackupSpec()
     if (xapp === undefined || xapp === null) return spec
@@ -117,11 +139,11 @@ export const parseBackupSpec = (xapp: unknown): BackupSpec => {
     const b = backup as Record<string, unknown>
 
     if (b.method !== undefined && b.method !== null) {
-        if (b.method === 'stop' || b.method === 'hook') spec.method = b.method
-        else if (b.method === 'live' || b.method === 'none') {
-            throw backupMethodError(`method '${b.method}' is not implemented (idea#444); only 'stop' (default) and 'hook' are supported`)
+        if (b.method === 'stop' || b.method === 'hook' || b.method === 'none') spec.method = b.method
+        else if (b.method === 'live') {
+            throw backupMethodError(`method '${b.method}' is not implemented (idea#444); only 'stop' (default), 'hook' and 'none' are supported`)
         } else {
-            throw backupMethodError(`method '${String(b.method)}' is not allowed (use 'stop' or 'hook')`)
+            throw backupMethodError(`method '${String(b.method)}' is not allowed (use 'stop', 'hook' or 'none')`)
         }
     }
 
@@ -138,10 +160,10 @@ export const parseBackupSpec = (xapp: unknown): BackupSpec => {
         spec.hookTimeout = n
     }
 
-    if (b.preHook !== undefined && b.preHook !== null) spec.preHook = parseBackupHookDecl(b.preHook, 'preHook')
-    if (b.postHook !== undefined && b.postHook !== null) spec.postHook = parseBackupHookDecl(b.postHook, 'postHook')
+    spec.preHook = parseBackupHookList(b.preHook, 'preHook')
+    spec.postHook = parseBackupHookList(b.postHook, 'postHook')
 
-    if (spec.method === 'hook' && !spec.preHook) {
+    if (spec.method === 'hook' && !spec.preHook.length) {
         throw backupMethodError("method is 'hook' but preHook is missing")
     }
     return spec
@@ -149,7 +171,7 @@ export const parseBackupSpec = (xapp: unknown): BackupSpec => {
 
 /** Fail closed if a declared hook names a service that is not in compose `services`. */
 export const assertHookServicesExist = (compose: unknown, spec: BackupSpec): void => {
-    const hooks = [spec.preHook, spec.postHook].filter((h): h is BackupHookDecl => !!h)
+    const hooks = [...spec.preHook, ...spec.postHook]
     if (!hooks.length) return
     const services = (compose && typeof compose === 'object' && !Array.isArray(compose))
         ? (compose as { services?: unknown }).services

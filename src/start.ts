@@ -156,9 +156,13 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // Per-Pi Engine key (design-per-pi-engine-key.md): make it if missing, publish
     // it with the host key in this Engine's entry, and sync peers' keys into the
     // root-owned authorized_keys/known_hosts through idea-app-data sync-peers.
-    // Fails closed (no key published, nobody authorized) on a restored store URL.
+    // Fails closed (no key published; the keys already on the Pi are kept) on a restored
+    // store URL. Never rewrites the host files from a non-fleet store, testMode or
+    // IDEA_WATCH_DIR, or with an empty peer set (engine#376).
     const peerAccess = await startPeerAccess(storeHandle, String(localEngineId), {
         enabled: peerAccessEnabled(), fallbackStore: fallback, storeUrlPath: storeIdentity.urlPath, staleMs: peerStaleMs(),
+        // engine#376: the host peer files only for a known fleet store, never in testMode / IDEA_WATCH_DIR
+        storeDocId, testMode: config.settings.testMode, watchDirSet: !!process.env.IDEA_WATCH_DIR,
     })
 
     // Clear unmount errors (idea#126) this Engine recorded for disks whose mount

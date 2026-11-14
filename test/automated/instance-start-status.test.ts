@@ -82,7 +82,7 @@ const traces = (h: DocHandle<CommandLogStore>): CommandTrace[] =>
 const tracesOf = (h: DocHandle<CommandLogStore>, instanceId: string): CommandTrace[] =>
     traces(h).filter(t => {
         if (t.command !== START_INSTANCE_COMMAND) return false
-        // The dock auto-start trace carries instanceName only; standalone failures carry both.
+        // Start traces carry instanceId and instanceName (engine#399); match either.
         try {
             const args = JSON.parse(t.args)
             return args.instanceId === instanceId || args.instanceName === `${instanceId}-name`

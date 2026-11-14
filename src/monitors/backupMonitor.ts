@@ -22,10 +22,11 @@ import { $, YAML, chalk, fs } from 'zx'
 import { log, print } from '../utils/utils.js'
 import { disksRoot, skipBorg } from '../data/Config.js'
 import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot, appDataRoot, joinMountRoot, backupOrphanLinks, syncBackupOrphanLinks } from '../data/Disk.js'
-import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgProblem, helperAtLeast } from '../utils/appDataHelper.js'
+import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgProblem, helperAtLeast, ARCHIVE_MODE_HELPER_MIN } from '../utils/appDataHelper.js'
 import { parseBackupExcludeList, parseBackupHookExcludeList, mergeBackupExcludeLists, BACKUP_EXCLUDE_HELPER_MIN } from '../utils/backupExclude.js'
 import { backupCleanupRunner, backupDiskFullError, cleanupIsEnabled } from '../utils/backupCleanup.js'
-import { parseBackupSpec, assertHookServicesExist, backupHookRunner, defaultBackupSpec } from '../utils/backupMethod.js'
+import { backupArchiveName, type ArchiveMode } from '../utils/backupArchiveName.js'
+import { parseBackupSpec, assertHookServicesExist, backupHookRunner, defaultBackupSpec, type BackupHookDecl } from '../utils/backupMethod.js'
 import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { ensureAppFilesOnTarget } from '../data/RestoreAppFiles.js'
 import { localEngineId } from '../data/Engine.js'
@@ -197,7 +198,7 @@ export const backupInstance = async (
     if (!getActiveTrace() && !preUpdate) {
         const cmdLogHandle = getCommandLogHandle()
         const traceId = crypto.randomUUID()
-        const traceArgs = JSON.stringify({ instanceId, backupDiskId: backupDisk.id, cause })
+        const traceArgs = JSON.stringify({ instanceId, instanceName: instRecEarly?.name != null ? String(instRecEarly.name) : null, backupDiskId: backupDisk.id, cause })
         if (cmdLogHandle) addTrace(cmdLogHandle, { traceId, command: 'backupApp', args: traceArgs, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
         return runWithTrace({ traceId, command: 'backupApp', args: traceArgs }, async () => {
             await backupInstance(storeHandle, instanceId, backupDisk, existingOpId, cause)
@@ -294,12 +295,6 @@ export const backupInstance = async (
 
         log(`Starting backup of instance ${instanceId} from ${appDevice} to ${backupDevice}`)
 
-        // 0. Preflight: no borg means exit 127 from the helper; say so plainly instead
-        if (!skipBorg()) {
-            const borgMissing = borgProblem()
-            if (borgMissing) throw new Error(borgMissing)
-        }
-
         // 0b. Honour x-app.backup.exclude (idea#443) and x-app.backup.method
         // (idea#444). Fail closed: a non-empty exclude list on a helper older
         // than v8, or a malformed method/hook block, refuses before any hook
@@ -338,6 +333,35 @@ export const backupInstance = async (
             }
         }
         methodUsed = backupSpec.method
+
+        // idea#403: method none — nothing goes to the Backup Disk (the App's content is on
+        // the App Disk and can be rebuilt). No borg, no lock file, no hook, no stop, no
+        // cleanup and no lastBackup; the run is recorded as method none, result OK, so the
+        // Console shows it neutral ("Not backed up: its content is on the App Disk").
+        if (backupSpec.method === 'none') {
+            log(`Backup of instance ${instanceId}: x-app.backup.method is none — nothing is copied to the Backup Disk`)
+            storeHandle.change(doc => {
+                const op = doc.operationDB?.[opId]
+                if (!op) return
+                op.args.hookResult = 'none'
+                op.stepLabel = 'Not backed up: method none'
+            })
+            recordBackupResult(storeHandle, instanceId, 'none', 'OK')
+            updateOperation(storeHandle, opId, {
+                status: 'Done',
+                progressPercent: 100,
+                completedAt: Date.now() as Timestamp,
+            })
+            return
+        }
+
+        // 0. Preflight: no borg means exit 127 from the helper; say so plainly instead
+        // (idea#403: after x-app.backup is read, so method none never needs borg).
+        if (!skipBorg()) {
+            const borgMissing = borgProblem()
+            if (borgMissing) throw new Error(borgMissing)
+        }
+
         // idea#448 (Steve Q4): inside updateApp a failed preHook refuses, it never stops.
         if (preUpdate) backupSpec.fallback = 'fail'
         if (preUpdate && !preUpdate.instanceStopped && backupSpec.method !== 'hook') {
@@ -381,14 +405,15 @@ export const backupInstance = async (
         wroteLock = lockPath
 
         const wasRunningAtStart = instance.status === 'Running' && !preUpdate?.instanceStopped
-        let hookResult: 'stop' | 'hook' | 'HOOK_FALLBACK' = 'stop'
+        // idea#403: hooks exec into the App's containers, so they only run while the instance
+        // is up. A stopped instance is backed up cold (its files are quiet): no hook, no stop.
+        const instanceUp = (instance.status === 'Running' || instance.status === 'Starting') && !preUpdate?.instanceStopped
+        let hookResult: 'stop' | 'hook' | 'cold' | 'HOOK_FALLBACK' = 'stop'
         let hookWarning: string | null = null
 
-        const runDeclaredHook = async (
-            hook: typeof backupSpec.preHook,
-            _which: 'preHook' | 'postHook',
-        ): Promise<{ failed: boolean, timedOut: boolean, code: number, stderr: string }> => {
-            if (!hook) return { failed: false, timedOut: false, code: 0, stderr: '' }
+        type HookStepResult = { failed: boolean, timedOut: boolean, code: number, stderr: string }
+
+        const runDeclaredHook = async (hook: BackupHookDecl): Promise<HookStepResult> => {
             try {
                 const r = await backupHookRunner.run({
                     cwd: instanceDir,
@@ -410,10 +435,44 @@ export const backupInstance = async (
             return `${which} ${why}${detail ? `: ${detail}` : ''}`
         }
 
-        const runBorgCreate = async (excludes: string[]): Promise<void> => {
+        /** A step's name in messages: `preHook` for a list of one (as before), else `preHook[i]`. */
+        const stepName = (which: 'preHook' | 'postHook', steps: BackupHookDecl[], i: number): string =>
+            steps.length > 1 ? `${which}[${i}]` : which
+
+        /** idea#403: pre steps in order; stops at the first failure. Returns that failure's message, or null. */
+        const runPreHooks = async (): Promise<string | null> => {
+            const steps = backupSpec.preHook
+            for (let i = 0; i < steps.length; i++) {
+                const r = await runDeclaredHook(steps[i])
+                if (r.failed) {
+                    const skipped = steps.length - i - 1
+                    return `${hookFailureMessage(stepName('preHook', steps, i), r)}${skipped ? ` (${skipped} later preHook step(s) not run)` : ''}`
+                }
+            }
+            return null
+        }
+
+        /** idea#403: EVERY post step always runs, whatever failed before. Returns the failure messages. */
+        const runPostHooks = async (): Promise<string[]> => {
+            const steps = backupSpec.postHook
+            const failures: string[] = []
+            for (let i = 0; i < steps.length; i++) {
+                const r = await runDeclaredHook(steps[i])
+                if (r.failed) failures.push(hookFailureMessage(stepName('postHook', steps, i), r))
+            }
+            return failures
+        }
+
+        // engine#401: the archive name carries the backup mode (-hook / -stop / -cold) when
+        // the helper accepts it (v16); an older helper gets today's untagged name.
+        const tagArchives = skipBorg() || !(await helperAtLeast(ARCHIVE_MODE_HELPER_MIN, 'a backup-mode archive name'))
+        if (!tagArchives) log(`Backup of ${instanceId}: app-data helper older than v${ARCHIVE_MODE_HELPER_MIN}; the archive name gets no mode suffix`)
+        let archiveName: string | null = null
+
+        const runBorgCreate = async (excludes: string[], mode: ArchiveMode): Promise<void> => {
             setBackupStep(2, BACKUP_STEPS[2])
             borgStarted = true
-            const archiveName = new Date().toISOString().replace(/[:.]/g, '-')
+            archiveName = backupArchiveName(new Date(), tagArchives ? mode : null)
             if (!skipBorg()) {
                 log(`Running borg create for instance ${instanceId}${excludes.length ? ` (${excludes.length} exclude(s))` : ''}`)
                 await runAppData(borgCreateArgs(backupDevice, instanceId, archiveName, await appDataRoot(appDisk as Disk), excludes))
@@ -437,40 +496,52 @@ export const backupInstance = async (
             }
         }
 
-        // 3–5. Copy: method hook runs preHook (no stop) then borg then postHook;
-        // a failed/timed-out preHook always runs postHook, then either HOOK_FALLBACK
-        // (short stop) or HOOK_FAILED (no stop), per x-app.backup.fallback.
+        // 3–5. Copy: method hook runs the preHook steps (no stop) then borg then every
+        // postHook step; a failed/timed-out pre step runs every postHook step, then either
+        // HOOK_FALLBACK (short stop) or HOOK_FAILED (no stop), per x-app.backup.fallback.
+        // A failed borg run also runs every postHook step before the failure is reported.
         if (preUpdate?.instanceStopped) {
             // updateApp stopped the instance for its Snapshot: Borg only, the hook dump is not
             // needed (the live files are quiet), so hookExclude does not apply.
             hookResult = 'stop'
-            await runBorgCreate(backupExcludes)
+            await runBorgCreate(backupExcludes, 'stop')
+        } else if (backupSpec.method === 'hook' && !instanceUp) {
+            // idea#403: the instance is not running: skip the hooks and back up cold. No dump
+            // was made, so hookExclude does not apply. Not HOOK_FALLBACK (nothing failed).
+            hookResult = 'cold'
+            log(`Instance ${instanceId} is not running (${instance.status}): hooks skipped, backing up cold`)
+            await runBorgCreate(backupExcludes, 'cold')
         } else if (backupSpec.method === 'hook') {
             setBackupStep(1, 'Running pre-backup hook')
-            const pre = await runDeclaredHook(backupSpec.preHook, 'preHook')
-            if (!pre.failed) {
+            const preFailure = await runPreHooks()
+            if (!preFailure) {
                 hookResult = 'hook'
-                await runBorgCreate(mergeBackupExcludeLists(backupExcludes, hookExcludes))
+                try {
+                    await runBorgCreate(mergeBackupExcludeLists(backupExcludes, hookExcludes), 'hook')
+                } catch (borgErr) {
+                    setBackupStep(3, 'Running post-backup hook')
+                    const postFailures = await runPostHooks()
+                    for (const f of postFailures) log(chalk.yellow(`postHook failed after a failed borg run on ${instanceId}: ${f}`))
+                    throw borgErr
+                }
                 setBackupStep(3, 'Running post-backup hook')
-                const post = await runDeclaredHook(backupSpec.postHook, 'postHook')
-                if (post.failed) {
-                    hookWarning = `HOOK_POST_WARNING: ${hookFailureMessage('postHook', post)}`
+                const postFailures = await runPostHooks()
+                if (postFailures.length) {
+                    hookWarning = `HOOK_POST_WARNING: ${postFailures.join('; ')}`
                     log(chalk.yellow(`Backup of ${instanceId} succeeded with a postHook warning: ${hookWarning}`))
                 }
             } else {
-                const post = await runDeclaredHook(backupSpec.postHook, 'postHook')
-                if (post.failed) {
-                    log(chalk.yellow(`postHook failed after a failed preHook on ${instanceId}: ${hookFailureMessage('postHook', post)}`))
-                }
+                const postFailures = await runPostHooks()
+                for (const f of postFailures) log(chalk.yellow(`postHook failed after a failed preHook on ${instanceId}: ${f}`))
                 if (backupSpec.fallback === 'fail') {
-                    throw new Error(`HOOK_FAILED: ${hookFailureMessage('preHook', pre)}`)
+                    throw new Error(`HOOK_FAILED: ${preFailure}`)
                 }
                 hookResult = 'HOOK_FALLBACK'
-                log(`HOOK_FALLBACK: ${hookFailureMessage('preHook', pre)}; falling back to a short stop`)
-                await stopThenStartAround(() => runBorgCreate(backupExcludes))
+                log(`HOOK_FALLBACK: ${preFailure}; falling back to a short stop`)
+                await stopThenStartAround(() => runBorgCreate(backupExcludes, 'stop'))
             }
         } else {
-            await stopThenStartAround(() => runBorgCreate(backupExcludes))
+            await stopThenStartAround(() => runBorgCreate(backupExcludes, 'stop'))
         }
 
         // 6. Update store: set lastBackup on the instance
@@ -504,6 +575,7 @@ export const backupInstance = async (
             const op = doc.operationDB?.[opId]
             if (!op) return
             op.args.hookResult = hookResult
+            if (archiveName) op.args.archive = archiveName   // engine#401
             if (hookWarning) op.args.warning = hookWarning
             if (cleanupWarning) op.args.cleanup = cleanupWarning as string
         })

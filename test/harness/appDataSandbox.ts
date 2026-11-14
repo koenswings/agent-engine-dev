@@ -56,6 +56,10 @@ export interface AppDataSandbox {
     peerSshdDropin: string
     /** /etc/idea/peer_known_hosts */
     peerKnownHosts: string
+    /** /etc/idea/peer-owner (v15, engine#376) */
+    peerOwner: string
+    /** /etc/idea/.peer-quarantine (v15, engine#376) */
+    peerQuarantineDir: string
     /** /var/lib/idea-app-data (the receive ledger folder) */
     ledgerDir: string
     /** /var/lib/docker/volumes: the fake docker reports <volumesDir>/<v>/_data */
@@ -274,6 +278,10 @@ exit \${FAKE_SYSTEMCTL_EXIT:-0}`)
     const peerSshdDropin = path.join(etc, 'ssh', 'sshd_config.d', '10-idea-peer.conf')
     setConst('PEER_AUTH_DIR', peerAuthDir)
     setConst('PEER_KNOWN_HOSTS', peerKnownHosts)
+    const peerOwner = path.join(etc, 'idea', 'peer-owner')
+    const peerQuarantineDir = path.join(etc, 'idea', '.peer-quarantine')
+    setConst('PEER_OWNER', peerOwner)
+    setConst('PEER_QUARANTINE_DIR', peerQuarantineDir)
     setConst('LEDGER_DIR', ledgerDir)
     setConst('USAGE_AUTH_DIR', usageAuthDir)
     setConst('USAGE_EXPORT', usageExport)
@@ -377,7 +385,7 @@ SUDO_USER=pi exec ${script} "$@"`)
         tmp, bin, script, disks, sys, rootsFile, lockDir: path.join(lockParent, 'idea-app-data'), mounts, hosts, journal,
         peerAuthDir, peerAuthFile: path.join(peerAuthDir, 'pi'),
         usageAuthDir, usageAuthFile: path.join(usageAuthDir, 'pi'), usageExport, peerSshdDropin,
-        peerKnownHosts, ledgerDir, gateScript, volumesDir: path.join(tmp, 'volumes'),
+        peerKnownHosts, peerOwner, peerQuarantineDir, ledgerDir, gateScript, volumesDir: path.join(tmp, 'volumes'),
         run, runGate, calls, fake, addDisk, addInstance, journalText,
     }
 }

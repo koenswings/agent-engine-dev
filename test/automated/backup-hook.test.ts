@@ -19,7 +19,7 @@ import { resourceLock, instanceKey } from '../../src/utils/ResourceLock.js'
 import { borgPresence } from '../../src/utils/appDataHelper.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
 import {
-    parseBackupSpec, parseBackupHookDecl, backupHookArgv, backupHookRunner,
+    parseBackupSpec, parseBackupHookDecl, parseBackupHookList, backupHookArgv, backupHookRunner,
     defaultBackupSpec, DEFAULT_HOOK_TIMEOUT_S,
     assertHookServicesExist,
 } from '../../src/utils/backupMethod.js'
@@ -49,8 +49,9 @@ describe('parseBackupSpec / parseBackupHookDecl / backupHookArgv', () => {
         expect(spec.method).toBe('hook')
         expect(spec.fallback).toBe('stop')
         expect(spec.hookTimeout).toBe(300)
-        expect(spec.preHook).toEqual({ service: 'collector', command: ['/app/scripts/backup-snapshot.sh'] })
-        expect(spec.postHook).toEqual({ service: 'collector', command: ['/app/scripts/backup-snapshot-cleanup.sh'] })
+        // idea#403: a single mapping is a list of one
+        expect(spec.preHook).toEqual([{ service: 'collector', command: ['/app/scripts/backup-snapshot.sh'] }])
+        expect(spec.postHook).toEqual([{ service: 'collector', command: ['/app/scripts/backup-snapshot-cleanup.sh'] }])
     })
 
     it('defaults fallback to stop and accepts fallback fail', () => {
@@ -69,14 +70,71 @@ describe('parseBackupSpec / parseBackupHookDecl / backupHookArgv', () => {
         }).fallback).toBe('fail')
     })
 
-    it('fails closed on live and none, and on unknown method/fallback', () => {
+    it('fails closed on live, and on unknown method/fallback', () => {
         expect(() => parseBackupSpec({ backup: { method: 'live' } })).toThrow(/not implemented \(idea#444\)/)
-        expect(() => parseBackupSpec({ backup: { method: 'none' } })).toThrow(/not implemented \(idea#444\)/)
         expect(() => parseBackupSpec({ backup: { method: 'snapshot' } })).toThrow(/not allowed/)
         expect(() => parseBackupSpec({ backup: { fallback: 'retry' } })).toThrow(/fallback/)
         expect(() => parseBackupSpec({
             backup: { method: 'hook' },
         })).toThrow(/preHook is missing/)
+    })
+
+    it('idea#403 accepts method none (no hooks needed)', () => {
+        const spec = parseBackupSpec({ backup: { method: 'none' } })
+        expect(spec.method).toBe('none')
+        expect(spec.preHook).toEqual([])
+        expect(spec.postHook).toEqual([])
+    })
+
+    it('idea#403 preHook and postHook accept ordered lists of {service, command, user}', () => {
+        const spec = parseBackupSpec({
+            backup: {
+                method: 'hook',
+                preHook: [
+                    { service: 'app', command: ['php', 'occ', 'maintenance:mode', '--on'], user: 33 },
+                    { service: 'db', command: ['/backup/dump.sh'] },
+                ],
+                postHook: [
+                    { service: 'db', command: '/backup/cleanup.sh' },
+                    { service: 'app', command: ['php', 'occ', 'maintenance:mode', '--off'], user: '33' },
+                ],
+            },
+        })
+        expect(spec.preHook).toEqual([
+            { service: 'app', command: ['php', 'occ', 'maintenance:mode', '--on'], user: '33' },
+            { service: 'db', command: ['/backup/dump.sh'] },
+        ])
+        expect(spec.postHook).toEqual([
+            { service: 'db', command: ['/backup/cleanup.sh'] },
+            { service: 'app', command: ['php', 'occ', 'maintenance:mode', '--off'], user: '33' },
+        ])
+        expect(parseBackupHookList(undefined, 'postHook')).toEqual([])
+        expect(parseBackupHookList({ service: 'app', command: 'x' }, 'postHook')).toEqual([{ service: 'app', command: ['x'] }])
+    })
+
+    it('idea#403 refuses an empty hook list and names the bad step', () => {
+        expect(() => parseBackupSpec({ backup: { method: 'hook', preHook: [] } })).toThrow(/preHook is an empty list/)
+        expect(() => parseBackupSpec({
+            backup: { method: 'hook', preHook: { service: 'app', command: 'x' }, postHook: [] },
+        })).toThrow(/postHook is an empty list/)
+        expect(() => parseBackupSpec({
+            backup: { method: 'hook', preHook: [{ service: 'app', command: 'x' }, { service: '-T', command: 'y' }] },
+        })).toThrow(/preHook\[1\]\.service/)
+        expect(() => parseBackupSpec({
+            backup: { method: 'hook', preHook: [{ service: 'app', command: 'x' }, 'not-a-mapping'] },
+        })).toThrow(/preHook\[1\] is not a mapping/)
+    })
+
+    it('idea#403 assertHookServicesExist checks every step of both lists', () => {
+        const spec = parseBackupSpec({
+            backup: {
+                method: 'hook',
+                preHook: [{ service: 'app', command: 'x' }],
+                postHook: [{ service: 'app', command: 'y' }, { service: 'db', command: 'z' }],
+            },
+        })
+        expect(() => assertHookServicesExist({ services: { app: {} } }, spec)).toThrow(/hook service 'db'/)
+        expect(() => assertHookServicesExist({ services: { app: {}, db: {} } }, spec)).not.toThrow()
     })
 
     it('rejects a bad hookTimeout', () => {
@@ -193,6 +251,7 @@ echo "$*" >> "$FAKE_BORG_LOG"
 case "$1" in
   version) echo "idea-app-data \${FAKE_HELPER_VERSION:-8}" ;;
   borg-init) mkdir -p "$IDEA_DISKS_ROOT/$2/backups/$3" && echo '[repository]' > "$IDEA_DISKS_ROOT/$2/backups/$3/config" ;;
+  borg-create) [[ -n "\${FAKE_BORG_CREATE_FAIL:-}" ]] && { echo 'borg create failed' >&2; exit 2; } ;;
 esac
 exit 0
 `
@@ -228,6 +287,8 @@ describe('backupInstance method hook (idea#444)', () => {
     const hookCalls: { which: string, cwd: string, timeoutS: number, service: string, command: string[], user?: string, compose?: { project: string, projectDir: string, file: string } }[] = []
     let preOutcome: HookOutcome = { code: 0 }
     let postOutcome: HookOutcome = { code: 0 }
+    /** idea#403: outcome per command (first word), overriding preOutcome/postOutcome. */
+    let outcomeByCmd: Record<string, HookOutcome> = {}
     let stopCount = 0
     let startCount = 0
     const saved = {
@@ -273,6 +334,8 @@ describe('backupInstance method hook (idea#444)', () => {
         hookCalls.length = 0
         preOutcome = { code: 0 }
         postOutcome = { code: 0 }
+        outcomeByCmd = {}
+        delete process.env.FAKE_BORG_CREATE_FAIL
         stopCount = 0
         startCount = 0
         backupLifecycle.stopInstance = (async () => { stopCount += 1 }) as typeof backupLifecycle.stopInstance
@@ -280,7 +343,7 @@ describe('backupInstance method hook (idea#444)', () => {
         backupHookRunner.run = async (spec) => {
             const which = spec.command[0]?.includes('cleanup') ? 'postHook' : 'preHook'
             hookCalls.push({ which, cwd: spec.cwd, timeoutS: spec.timeoutS, service: spec.service, command: [...spec.command], user: spec.user, compose: spec.compose })
-            const out = which === 'postHook' ? postOutcome : preOutcome
+            const out = outcomeByCmd[spec.command[0]] ?? (which === 'postHook' ? postOutcome : preOutcome)
             return { code: out.code, timedOut: !!out.timedOut, stderr: out.stderr ?? '' }
         }
         vi.spyOn(console, 'info').mockImplementation(() => {})
@@ -297,6 +360,7 @@ describe('backupInstance method hook (idea#444)', () => {
         process.env.PATH = saved.path
         if (saved.log === undefined) delete process.env.FAKE_BORG_LOG
         else process.env.FAKE_BORG_LOG = saved.log
+        delete process.env.FAKE_BORG_CREATE_FAIL
         if (saved.ver === undefined) delete process.env.FAKE_HELPER_VERSION
         else process.env.FAKE_HELPER_VERSION = saved.ver
         await fs.remove(`${DISKS_ROOT}/${appDevice}`)
@@ -307,7 +371,7 @@ describe('backupInstance method hook (idea#444)', () => {
     const calls = async (): Promise<string[]> =>
         (await fs.pathExists(borgLog)) ? (await fs.readFile(borgLog, 'utf8')).split('\n').filter(Boolean) : []
 
-    const runBackup = async (status: 'Stopped' | 'Running' = 'Running') => {
+    const runBackup = async (status: 'Stopped' | 'Running' | 'Starting' = 'Running') => {
         const h = await createMinimalStore()
         const appDisk = makeDisk('hook-ad', appDevice, false)
         const backupDisk = makeDisk('hook-bd', backupDevice, true)
@@ -482,6 +546,171 @@ describe('backupInstance method hook (idea#444)', () => {
         expect(hookCalls).toEqual([])
     })
 
+    // ── idea#403: ordered hook lists, method none, stopped instances ──────────
+    const listBlock = (extra: Record<string, unknown> = {}) => hookBlock({
+        preHook: [
+            { service: 'collector', command: '/app/pre-1.sh' },
+            { service: 'collector', command: '/app/pre-2.sh' },
+            { service: 'collector', command: '/app/pre-3.sh' },
+        ],
+        postHook: [
+            { service: 'collector', command: '/app/cleanup-1.sh' },
+            { service: 'collector', command: '/app/cleanup-2.sh' },
+        ],
+        ...extra,
+    })
+    const cmds = () => hookCalls.map(c => c.command[0])
+    const lastResultOf = (h: DocHandle<Store>) => (h.doc()!.instanceDB[INST] as any).lastResult
+
+    it('idea#403 list: pre steps in order, borg, then every post step in order; no stop', async () => {
+        await writeCompose(listBlock())
+        const h = await runBackup('Running')
+        const op = opOf(h)
+        expect(op?.status, op?.error).toBe('Done')
+        expect(op?.args?.hookResult).toBe('hook')
+        expect(cmds()).toEqual(['/app/pre-1.sh', '/app/pre-2.sh', '/app/pre-3.sh', '/app/cleanup-1.sh', '/app/cleanup-2.sh'])
+        expect(stopCount).toBe(0)
+        expect((await calls()).some(l => l.startsWith('borg-create '))).toBe(true)
+        expect(lastResultOf(h)).toMatchObject({ method: 'hook', result: 'OK' })
+    })
+
+    it('idea#403 list: a failed pre step stops the later pre steps, every post step still runs, then HOOK_FALLBACK', async () => {
+        outcomeByCmd = { '/app/pre-2.sh': { code: 4, stderr: 'dump failed' } }
+        await writeCompose(listBlock())
+        const h = await runBackup('Running')
+        const op = opOf(h)
+        expect(op?.status, op?.error).toBe('Done')
+        expect(op?.args?.hookResult).toBe('HOOK_FALLBACK')
+        expect(cmds()).toEqual(['/app/pre-1.sh', '/app/pre-2.sh', '/app/cleanup-1.sh', '/app/cleanup-2.sh'])
+        expect(stopCount).toBe(1)
+        expect(startCount).toBe(1)
+        expect(lastResultOf(h)).toMatchObject({ method: 'hook', result: 'HOOK_FALLBACK' })
+    })
+
+    it('idea#403 list with fallback fail: HOOK_FAILED names the step; every post step runs; no borg', async () => {
+        outcomeByCmd = { '/app/pre-1.sh': { code: 9, stderr: 'occ down' } }
+        await writeCompose(listBlock({ fallback: 'fail' }))
+        const h = await runBackup('Running')
+        const op = opOf(h)
+        expect(op?.status).toBe('Failed')
+        expect(op?.error).toMatch(/^HOOK_FAILED: preHook\[0\] exited 9: occ down \(2 later preHook step\(s\) not run\)/)
+        expect(cmds()).toEqual(['/app/pre-1.sh', '/app/cleanup-1.sh', '/app/cleanup-2.sh'])
+        expect(stopCount).toBe(0)
+        expect((await calls()).some(l => l.startsWith('borg-create'))).toBe(false)
+    })
+
+    it('idea#403 list: a failed post step does not stop the later post steps; HOOK_POST_WARNING names it', async () => {
+        outcomeByCmd = { '/app/cleanup-1.sh': { code: 5, stderr: 'rm failed' } }
+        await writeCompose(listBlock())
+        const h = await runBackup('Running')
+        const op = opOf(h)
+        expect(op?.status, op?.error).toBe('Done')
+        expect(op?.args?.warning).toMatch(/^HOOK_POST_WARNING: postHook\[0\] exited 5: rm failed$/)
+        expect(cmds()).toEqual(['/app/pre-1.sh', '/app/pre-2.sh', '/app/pre-3.sh', '/app/cleanup-1.sh', '/app/cleanup-2.sh'])
+        expect(lastResultOf(h)).toMatchObject({ method: 'hook', result: 'HOOK_POST_WARNING' })
+    })
+
+    it('idea#403 a failed borg run still runs every post step, then the backup fails (no lastBackup)', async () => {
+        process.env.FAKE_BORG_CREATE_FAIL = '1'
+        await writeCompose(listBlock())
+        const h = await runBackup('Running')
+        const op = opOf(h)
+        expect(op?.status).toBe('Failed')
+        expect(cmds()).toEqual(['/app/pre-1.sh', '/app/pre-2.sh', '/app/pre-3.sh', '/app/cleanup-1.sh', '/app/cleanup-2.sh'])
+        expect((await calls()).some(l => l.startsWith('borg-create '))).toBe(true)
+        expect(h.doc()!.instanceDB[INST].lastBackup).toBeNull()
+        expect(stopCount).toBe(0)
+        expect(lastResultOf(h)).toMatchObject({ method: 'hook', result: 'FAILED' })
+    })
+
+    it('idea#403 a failed borg run with a single postHook still runs it', async () => {
+        process.env.FAKE_BORG_CREATE_FAIL = '1'
+        await writeCompose(hookBlock())
+        const h = await runBackup('Running')
+        expect(opOf(h)?.status).toBe('Failed')
+        expect(hookCalls.map(c => c.which)).toEqual(['preHook', 'postHook'])
+    })
+
+    it('idea#403 method none: nothing copied (no borg, no lock, no hook, no stop, no lastBackup); recorded as none / OK', async () => {
+        borgPresence.exists = () => false   // none never needs borg
+        await writeCompose({ method: 'none', exclude: ['keys'] })
+        const h = await runBackup('Running')
+        const op = opOf(h)
+        expect(op?.status, op?.error).toBe('Done')
+        expect(op?.args?.hookResult).toBe('none')
+        expect(lastResultOf(h)).toMatchObject({ method: 'none', result: 'OK' })
+        expect(h.doc()!.instanceDB[INST].lastBackup).toBeNull()
+        expect(hookCalls).toEqual([])
+        expect(stopCount).toBe(0)
+        expect(startCount).toBe(0)
+        expect(await calls()).toEqual([])
+        expect(await fs.pathExists(`${DISKS_ROOT}/${backupDevice}/backups/${INST}`)).toBe(false)
+    })
+
+    it('idea#403 stopped instance with method hook: hooks skipped, backed up cold (only exclude; hookExclude paths stay IN the archive), not HOOK_FALLBACK', async () => {
+        await writeCompose(listBlock())
+        const h = await runBackup('Stopped')
+        const op = opOf(h)
+        expect(op?.status, op?.error).toBe('Done')
+        expect(op?.args?.hookResult).toBe('cold')
+        expect(hookCalls).toEqual([])
+        expect(stopCount).toBe(0)
+        expect(startCount).toBe(0)
+        const create = (await calls()).find(l => l.startsWith('borg-create '))
+        expect(create).toMatch(/ data\/keys data\/tailscale data\/tailscale-run data\/backup\/daily$/)
+        // no hook copies were made, so the live dbs that hookExclude lists must be packed (e.g. Kolibri)
+        expect(create).not.toMatch(/usage\.sqlite/)
+        expect(h.doc()!.instanceDB[INST].lastBackup).not.toBeNull()
+        expect(lastResultOf(h)).toMatchObject({ method: 'hook', result: 'OK' })
+    })
+
+    it('idea#403 a Starting instance still runs its hooks (not cold)', async () => {
+        await writeCompose(hookBlock())
+        const h = await runBackup('Starting')
+        expect(opOf(h)?.args?.hookResult).toBe('hook')
+        expect(hookCalls.map(c => c.which)).toEqual(['preHook', 'postHook'])
+    })
+
+    // ── engine#401: the archive name carries the backup mode ─────────────────
+    const createdArchive = async () => (await calls()).find(l => l.startsWith('borg-create '))?.split(' ')[3] ?? ''
+
+    it('engine#401 helper v16: a hook backup is named <ts>-hook and recorded in op.args.archive', async () => {
+        process.env.FAKE_HELPER_VERSION = '16'
+        await writeCompose(hookBlock())
+        const h = await runBackup('Running')
+        const name = await createdArchive()
+        expect(name).toMatch(/^\d{4}-\d{2}-\d{2}T[0-9-]+Z-hook$/)
+        expect(opOf(h)?.args?.archive).toBe(name)
+    })
+
+    it('engine#401 helper v16: a HOOK_FALLBACK backup is named <ts>-stop', async () => {
+        process.env.FAKE_HELPER_VERSION = '16'
+        preOutcome = { code: 1, stderr: 'no dump' }
+        await writeCompose(hookBlock())
+        const h = await runBackup('Running')
+        expect(opOf(h)?.args?.hookResult).toBe('HOOK_FALLBACK')
+        expect(await createdArchive()).toMatch(/Z-stop$/)
+    })
+
+    it('engine#401 helper v16: a stopped hook instance is named <ts>-cold; method stop is <ts>-stop', async () => {
+        process.env.FAKE_HELPER_VERSION = '16'
+        await writeCompose(hookBlock())
+        await runBackup('Stopped')
+        expect(await createdArchive()).toMatch(/Z-cold$/)
+        await fs.remove(borgLog)
+        await writeCompose({ exclude: ['keys'] })
+        await runBackup('Running')
+        expect(await createdArchive()).toMatch(/Z-stop$/)
+    })
+
+    it('engine#401 an older helper (v8) gets today\'s untagged name', async () => {
+        await writeCompose(hookBlock())
+        const h = await runBackup('Running')
+        const name = await createdArchive()
+        expect(name).toMatch(/^\d{4}-\d{2}-\d{2}T[0-9-]+Z$/)
+        expect(opOf(h)?.args?.archive).toBe(name)
+    })
+
     // ── idea#448: the pre-update backup updateApp takes itself ────────────────
     const newBundleCompose = async (backup: Record<string, unknown>, services: Record<string, unknown> = { collector: {}, tailscale: {} }) => {
         const dir = `${DISKS_ROOT}/${appDevice}/apps/usage-dashboard-1.1`
@@ -563,6 +792,15 @@ describe('backupInstance method hook (idea#444)', () => {
         const create = (await calls()).find(l => l.startsWith('borg-create '))
         expect(create).toMatch(/ data\/keys data\/tailscale data\/tailscale-run data\/backup\/daily$/)
         expect(h.doc()!.instanceDB[INST].lastBackup).not.toBeNull()
+    })
+
+    it('idea#403 pre-update backup of a method none instance copies nothing and does not fail', async () => {
+        await writeCompose({ method: 'none' })
+        const { h, error } = await runPreUpdate(true, 'Stopped')
+        expect(error).toBeNull()
+        expect(opOf(h)?.args?.hookResult).toBe('none')
+        expect(await calls()).toEqual([])
+        expect(await fs.pathExists(lockFile())).toBe(false)
     })
 
     it('idea#458 a stop-mode CURRENT compose while the instance runs is refused, even when the new bundle has a hook (updateApp must take it inside its stop)', async () => {

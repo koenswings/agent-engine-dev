@@ -23,8 +23,9 @@ import {
     runAppData, appDataErrorMessage, appDataHelperProblem, assertAppDataHelper,
     instanceDataBytes, deleteInstanceData, deleteRemoteInstanceData,
     remoteEnsureDirsSshArgs, ensureDirsArgs, receiveAppArgs, receiveServiceArgs, receiveFilesArgs, putFilesArgs,
-    remoteHelperCommand, remoteHelperRsyncPath, runAppDataWithInput,
+    remoteHelperCommand, remoteHelperRsyncPath, runAppDataWithInput, syncPeersArgs,
 } from '../../src/utils/appDataHelper.js'
+import { peerLine } from '../harness/peerKeys.js'
 import { peerSshOptions } from '../../src/utils/peerSsh.js'
 import { rsyncInstanceData, instanceDataTransferArgs } from '../../src/utils/rsync.js'
 import { config } from '../../src/data/Config.js'
@@ -110,6 +111,15 @@ describe('helper argv builders', () => {
         expect(borgExtractVerifyArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', '20261111T231806123Z')).toEqual(['borg-extract-verify', 'sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', '20261111T231806123Z'])
         expect(borgExtractVerifyArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', '20261112T001825Z')).toEqual(['borg-extract-verify', 'sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', '20261112T001825Z'])
         expect(borgDeleteArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z')).toEqual(['borg-delete', 'sdc1', 'inst-1', '2026-10-06T10-18-00-123Z'])
+        // engine#401: tagged archive names (helper v16) pass; anything else after the Z does not
+        for (const mode of ['hook', 'stop', 'cold']) {
+            const n = `2026-10-06T10-18-00-123Z-${mode}`
+            expect(borgCreateArgs('sdc1', 'inst-1', n, 'system')[3]).toBe(n)
+            expect(borgDeleteArgs('sdc1', 'inst-1', n)[3]).toBe(n)
+            expect(borgExtractArgs('sdc1', 'inst-1', n, 3, 'sdb1')[3]).toBe(n)
+        }
+        expect(() => borgCreateArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z-live', 'system')).toThrow(/archive name/)
+        expect(() => borgListArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z-hook;x')).toThrow(/archive name/)
         expect(borgDeleteArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', 3)).toEqual(['borg-delete', 'sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', '3'])
         expect(borgCompactArgs('sdc1', 'inst-1')).toEqual(['borg-compact', 'sdc1', 'inst-1'])
         expect(quarantineBackupsArgs('sdc1')).toEqual(['quarantine-backups', 'sdc1'])
@@ -125,7 +135,7 @@ describe('helper argv builders', () => {
 
     it('refuse paths, option-looking tokens and bad archives/strips before anything runs', () => {
         for (const d of ['sdb3', 'sdb4', 'sdz9']) expect(sizeArgs(d, 'inst-1')).toEqual(['size', d, 'inst-1'])
-        expect(APP_DATA_HELPER_VERSION).toBe('14')
+        expect(APP_DATA_HELPER_VERSION).toBe('16')
         for (const d of ['sdb3', 'sdb9']) expect(() => eraseSlotArgs(d, '/tmp/x')).toThrow(/not a test slot name/)
         expect(() => sizeArgs('/disks/sdb1', 'x')).toThrow(/not a disk root/)
         expect(() => sizeArgs('..', 'x')).toThrow(/not a disk root/)
@@ -277,10 +287,14 @@ describe('runAppDataWithInput (sync-peers)', () => {
         try {
             process.env.FAKE_HELPER = sb.script
             process.env.SUDO_USER = 'pi'
-            const out = await runAppDataWithInput(['sync-peers'], '')
-            expect(out.trim()).toBe('sync-peers: 0 peer(s); authorized_keys updated; known_hosts updated')
-            expect(await sudoCalls()).toEqual([['-n', '/usr/local/sbin/idea-app-data', 'sync-peers']])
-            await expect(runAppDataWithInput(['sync-peers'], 'garbage\n')).rejects.toThrow(/^idea-app-data sync-peers refused: peer line 1 is not/)
+            const out = await runAppDataWithInput(syncPeersArgs('ENGINE_me', '2VroEUvDkmYsDAwE5oG9YeFNadWH'), `${peerLine('ENGINE_b')}\n`)
+            expect(out.trim()).toBe('sync-peers: 1 peer(s); authorized_keys updated; known_hosts updated; owner ENGINE_me 2VroEUvDkmYsDAwE5oG9YeFNadWH recorded')
+            expect(await sudoCalls()).toEqual([['-n', '/usr/local/sbin/idea-app-data', 'sync-peers', 'ENGINE_me', '2VroEUvDkmYsDAwE5oG9YeFNadWH']])
+            await expect(runAppDataWithInput(syncPeersArgs('ENGINE_me', 'automerge:2VroEUvDkmYsDAwE5oG9YeFNadWH'), 'garbage\n')).rejects.toThrow(/^idea-app-data sync-peers refused: peer line 1 is not/)
+            await expect(runAppDataWithInput(syncPeersArgs('ENGINE_me', '2VroEUvDkmYsDAwE5oG9YeFNadWH'), '')).rejects.toThrow(/^idea-app-data sync-peers refused: PEER_SHRINK_TO_EMPTY: /)
+            await expect(runAppDataWithInput(syncPeersArgs('ENGINE_other', '2VroEUvDkmYsDAwE5oG9YeFNadWH'), `${peerLine('ENGINE_b')}\n`)).rejects.toThrow(/^idea-app-data sync-peers refused: PEER_OWNER_MISMATCH: /)
+            expect(() => syncPeersArgs('ENGINE_me', '../etc')).toThrow(/not a store document id/)
+            expect(() => syncPeersArgs('-x', '2VroEUvDkmYsDAwE5oG9YeFNadWH')).toThrow(/not an Engine id/)
         } finally { await fs.remove(sb.tmp) }
     })
 })

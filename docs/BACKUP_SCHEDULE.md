@@ -133,7 +133,7 @@ The store gets one change per run (and a `clockTrusted` / `clockReason` change o
 - One code per attempt, by precedence (Steve, #347 call 2): `FAILED`, `SKIPPED_LOCKED`, `HOOK_FALLBACK`, `HOOK_POST_WARNING`, `HELPER_OUTDATED` (cleanup skipped), `OK`.
 - A held lock: only a direct command with a waiting caller (Console, CLI) is refused with `BUSY` and records nothing. Everything without a caller, including an `immediate`-mode backup on dock, records `SKIPPED_LOCKED` (#347 call 4).
 - An invalid `schedule` in BACKUP.yaml is logged and mirrored as `schedule: null`, with `backupConfig.scheduleError` set to the error text (PR C, #347 call 5). The Console shows it; the disk runs at the 02:30 default until it is fixed (#351 call 1).
-- `method` is one of `stop`, `hook`, `live`, `none`.
+- `method` is one of `stop`, `hook`, `live`, `none`. idea#403: a `method: none` App records `{method: 'none', result: 'OK'}` and copies nothing (no `lastBackup`); the Console shows it neutral. A `hook` App whose instance is not running is backed up cold (hooks skipped) and records `result: 'OK'`, not `HOOK_FALLBACK`; the operation's `args.hookResult` is `cold` (`none` for a `none` App). See [COMMANDS.md](COMMANDS.md#backupapp) for the ordered hook lists.
 
 ## `setBackupMode` (PR D)
 
