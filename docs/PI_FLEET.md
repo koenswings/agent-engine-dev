@@ -122,6 +122,12 @@ Test targets are configured in `config.yaml` under `testSetup.engines`.
 The run-tests.sh SSH restriction on wizardly-hugle does **not** apply here —  
 fleet Pis have direct SSH access for all commands.
 
+A scratch Engine checkout that must share another tree's `config.yaml`,
+`store-identity` or `store-data` should use `script/link-scratch-store.sh`
+(`ln -sfnT`, refuses if the destination exists as a non-symlink directory).
+Plain `ln -sfn` into an existing `store-identity/` directory nests the link
+(engine#321). Tests normally stay off the fleet store; see AGENTS.md.
+
 ## Maintenance
 
 - **Engine update:** `./script/sync-engine idea01 idea02 idea03 idea04`
