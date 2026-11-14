@@ -112,12 +112,13 @@ const parseStatsLine = (line: string): { name: string; metrics: DockerMetrics } 
 
 // ── Collect metrics for a set of instance IDs ─────────────────────────────────
 
-const collectMetrics = async (
+/** idea#492 / engine#367: exported for tests. */
+export const collectMetrics = async (
     instanceIds: string[]
 ): Promise<{ metrics: Map<string, DockerMetrics>, runningContainers: string[] | null }> => {
-    // docker stats container names follow `<project>-<service>-1`. Match by
-    // exact compose project (idea#479 / engine#367), never `name=<id>` or
-    // startsWith(id): those also hit `<id>backup-…` containers of a dotted copy.
+    // Match only the exact `com.docker.compose.project` label (idea#492, idea#479).
+    // Never `name=<id>` or startsWith(id): those also hit `<id>backup-…`.
+    // Containers without the label are not counted.
     const result = new Map<string, DockerMetrics>()
     // null = docker ps did not answer: never conclude anything about container state
     let runningContainers: string[] | null = null
@@ -134,8 +135,9 @@ const collectMetrics = async (
             const tab = line.indexOf('\t')
             const name = tab === -1 ? line : line.slice(0, tab)
             const project = tab === -1 ? '' : line.slice(tab + 1)
-            const instanceId = instanceIds.find(id =>
-                (project && project === composeProjectName(id)) || containerNameBelongsToInstance(name, id))
+            const instanceId = project
+                ? instanceIds.find(id => project === composeProjectName(id))
+                : undefined
             if (!instanceId) continue
             containerNames.push(name)
             nameToInstance.set(name, instanceId)
@@ -149,7 +151,7 @@ const collectMetrics = async (
             const parsed = parseStatsLine(line)
             if (!parsed) continue
             // Map container back to instance by exact compose project, never a name prefix.
-            const instanceId = nameToInstance.get(parsed.name) ?? instanceIds.find(id => containerNameBelongsToInstance(parsed.name, id))
+            const instanceId = nameToInstance.get(parsed.name)
             if (!instanceId) continue
             // Merge: if multiple containers belong to the same instance, accumulate
             const existing = result.get(instanceId)
