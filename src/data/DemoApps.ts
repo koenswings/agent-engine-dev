@@ -60,9 +60,17 @@ export interface DemoAppProgress {
     detail: string | null
 }
 
+export interface DemoSkipped {
+    app: DemoAppName
+    code: 'NO_SOURCE'
+    detail: string
+}
+
 export interface DemoProgress {
     targetDiskId: string | null
     apps: DemoAppProgress[]
+    /** Always present. Apps skipped at pre-check (NO_SOURCE only, and only when --apps was omitted). */
+    skipped: DemoSkipped[]
     code: DemoCode | null
     resultText: string | null
 }
@@ -249,10 +257,11 @@ const writeDemo = (storeHandle: DocHandle<Store>, opId: string, patch: Partial<D
     storeHandle.change(doc => {
         const op = doc.operationDB?.[opId] as (typeof doc.operationDB[string] & { demo?: DemoProgress }) | undefined
         if (!op) return
-        const cur: DemoProgress = op.demo ?? { targetDiskId: null, apps: [], code: null, resultText: null }
+        const cur: DemoProgress = op.demo ?? { targetDiskId: null, apps: [], skipped: [], code: null, resultText: null }
         op.demo = {
             targetDiskId: patch.targetDiskId !== undefined ? patch.targetDiskId : cur.targetDiskId,
             apps: appsPlain ?? asPlain(cur.apps),
+            skipped: patch.skipped !== undefined ? asPlain(patch.skipped) : asPlain(cur.skipped ?? []),
             code: patch.code !== undefined ? patch.code : cur.code,
             resultText: patch.resultText !== undefined ? patch.resultText : cur.resultText,
         }
@@ -399,11 +408,13 @@ export const setupDemo = async (
     apps: DemoAppName[] = [...DEMO_APP_NAMES],
     engineId?: string,
     deps: Partial<SetupDemoDeps> = {},
-): Promise<{ code: 'DEMO_READY', apps: { app: DemoAppName, instanceId: string, name: string, port: number, source: string | null, packVersion: string | null }[] }> => {
+    opts: { explicitApps?: boolean } = {},
+): Promise<{ code: 'DEMO_READY', apps: { app: DemoAppName, instanceId: string, name: string, port: number, source: string | null, packVersion: string | null }[], skipped: string }> => {
     const d: SetupDemoDeps = { ...defaultDeps(storeHandle), ...deps }
     const store = storeHandle.doc()
     const eng = localEngine(store, engineId)
     if (!apps.length) apps = [...DEMO_APP_NAMES]
+    const explicitApps = opts.explicitApps === true
 
     // Refusals — no Operation yet
     const diskRes = lookupDiskArg(store, eng as any, targetDiskId)
@@ -453,7 +464,14 @@ export const setupDemo = async (
     const online = await d.hasInternet()
     const roots = await dockedIdeaDemoRoots(store, eng, d.mountRoot)
     const plans: { app: DemoAppName, bundle: { disk: Disk, dir: string, appId: string, spec: AppDemoSpec } | null, local: LocatedPack | null, source: 'local' | 'github' | null }[] = []
+    const skipped: DemoSkipped[] = []
     try {
+        const skippedPre = skipped
+        const noSourceOrSkip = (app: DemoAppName, detail: string): boolean => {
+            if (explicitApps) throw new DemoError('NO_SOURCE', detail)
+            skippedPre.push({ app, code: 'NO_SOURCE', detail })
+            return true
+        }
         for (const app of apps) {
             const bundle = await findDockedBundle(store, eng, app, d.mountRoot)
             const spec = bundle?.spec ?? null
@@ -467,14 +485,20 @@ export const setupDemo = async (
             else if (online && spec?.pack?.url) source = 'github'
             else if (outdatedLocal && !online) throw new DemoError('PACK_OUTDATED', `the only local ${app} pack is older than minVersion ${minVersion} and this Engine is offline`)
             else if (!local && !(online && spec?.pack?.url)) {
-                throw new DemoError('NO_SOURCE', `no usable local pack or GitHub asset for ${app}, and ${online ? 'the app bundle has no pack pin' : 'no internet'}`)
+                if (noSourceOrSkip(app, `no usable local pack or GitHub asset for ${app}, and ${online ? 'the app bundle has no pack pin' : 'no internet'}`)) continue
             }
             // A brand-new install also needs the app bundle on a docked disk (or a later GitHub install — not used for demo offline).
             const existing = dockedDemoInstances(store, eng, app).find(i => String(i.storedOn) === String(disk.id))
             if (!existing && !bundle) {
-                throw new DemoError('NO_SOURCE', `no ${app} app bundle is on a disk docked to this Engine (needed to install the demo)`)
+                if (noSourceOrSkip(app, `no ${app} app bundle is on a disk docked to this Engine (needed to install the demo)`)) continue
             }
             plans.push({ app, bundle, local, source })
+        }
+        if (!plans.length) {
+            const detail = skippedPre.length
+                ? skippedPre.map(s => s.detail).join('; ')
+                : 'no demo app has a usable source'
+            throw new DemoError('NO_SOURCE', detail)
         }
         let need = 0
         try {
@@ -511,7 +535,7 @@ export const setupDemo = async (
     }))
     const args: Record<string, string> = { targetDiskId: String(disk.id), apps: apps.join(',') }
     const opId = createOperation(storeHandle, 'setupDemo', args, 'console-command', { type: 'engine', id: eng as EngineID })
-    writeDemo(storeHandle, opId, { targetDiskId: String(disk.id), apps: appsProgress, code: null, resultText: null })
+    writeDemo(storeHandle, opId, { targetDiskId: String(disk.id), apps: appsProgress, skipped, code: null, resultText: null })
     updateOperation(storeHandle, opId, { status: 'Running', currentStep: 0, totalSteps: appsProgress.reduce((s, a) => s + a.steps.length, 0), stepLabel: 'Starting' } as any)
 
     const dock = dockIdentityOf(disk)
@@ -748,8 +772,10 @@ export const setupDemo = async (
         throw new DemoError(code, text)
     }
 
-    const result = { code: 'DEMO_READY' as const, apps: resultApps }
-    writeDemo(storeHandle, opId, { code: 'DEMO_READY', resultText: 'DEMO_READY', apps: ((storeHandle.doc().operationDB[opId] as any).demo as DemoProgress).apps.map(a => ({ ...a, code: a.code ?? 'DEMO_READY' })) })
+    const skippedStr = skipped.map(s => `${s.app}:${s.code}`).join(',')
+    const skipNote = skipped.length ? ` (skipped ${skipped.map(s => `${s.app}: ${s.code}`).join(', ')})` : ''
+    const result = { code: 'DEMO_READY' as const, apps: resultApps, skipped: skippedStr }
+    writeDemo(storeHandle, opId, { code: 'DEMO_READY', resultText: `DEMO_READY${skipNote}`, apps: ((storeHandle.doc().operationDB[opId] as any).demo as DemoProgress).apps.map(a => ({ ...a, code: a.code ?? 'DEMO_READY' })) })
     updateOperation(storeHandle, opId, { status: 'Done', completedAt: d.now() as Timestamp })
     attachTraceResult(result)
     resourceLock.releaseAll(lockKeys)
@@ -801,7 +827,7 @@ export const removeDemo = async (
         code: null,
         detail: null,
     }) )
-    writeDemo(storeHandle, opId, { targetDiskId: null, apps: appsProgress, code: null, resultText: null })
+    writeDemo(storeHandle, opId, { targetDiskId: null, apps: appsProgress, skipped: [], code: null, resultText: null })
     updateOperation(storeHandle, opId, { status: 'Running', currentStep: 0, totalSteps: targets.length * 2, stepLabel: 'Removing' } as any)
 
     const removed: { instanceId: string, quarantinePath: string, keptVolumes: string[] }[] = []

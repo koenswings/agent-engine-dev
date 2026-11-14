@@ -344,3 +344,41 @@ describe('stampComposeInstanceIdentity', () => {
         expect(cleared).not.toMatch(/demo:/)
     })
 })
+
+describe('setupDemo default skips NO_SOURCE (engine#369 follow-up)', () => {
+    it('without --apps, nextcloud with no source is skipped and kolibri is set up', async () => {
+        await writeValidPack(path.join(tmp, 'IDEA-DEMO', 'kolibri'), 4)
+        const r = await setupDemo(h, 'd1', ['kolibri', 'nextcloud'], ME, deps(), { explicitApps: false })
+        expect(r.code).toBe('DEMO_READY')
+        expect(r.apps.map(a => a.app)).toEqual(['kolibri'])
+        expect(r.skipped).toBe('nextcloud:NO_SOURCE')
+        const op = Object.values(h.doc().operationDB)[0] as any
+        expect(op.status).toBe('Done')
+        expect(op.demo.apps.map((a: any) => a.app)).toEqual(['kolibri'])
+        expect(op.demo.skipped).toEqual([
+            expect.objectContaining({ app: 'nextcloud', code: 'NO_SOURCE' }),
+        ])
+        expect(op.demo.skipped[0].detail).toMatch(/nextcloud/)
+        expect(op.demo.resultText).toMatch(/skipped nextcloud/i)
+        expect(op.demo.resultText).toMatch(/NO_SOURCE/)
+        expect(op.demo.code).toBe('DEMO_READY')
+    })
+
+    it('NO_SOURCE when every app has no source (no Operation)', async () => {
+        expect(await codeOf(setupDemo(h, 'd1', ['kolibri', 'nextcloud'], ME, deps(), { explicitApps: false }))).toMatch(/^NO_SOURCE: /)
+        expect(Object.keys(h.doc().operationDB ?? {})).toHaveLength(0)
+    })
+
+    it('explicit --apps nextcloud with no source gives NO_SOURCE (no Operation)', async () => {
+        await writeValidPack(path.join(tmp, 'IDEA-DEMO', 'kolibri'), 4)
+        expect(await codeOf(setupDemo(h, 'd1', ['nextcloud'], ME, deps(), { explicitApps: true }))).toMatch(/^NO_SOURCE: /)
+        expect(Object.keys(h.doc().operationDB ?? {})).toHaveLength(0)
+    })
+
+    it('explicit --apps kolibri,nextcloud with nextcloud missing gives NO_SOURCE (no Operation, kolibri not installed)', async () => {
+        await writeValidPack(path.join(tmp, 'IDEA-DEMO', 'kolibri'), 4)
+        expect(await codeOf(setupDemo(h, 'd1', ['kolibri', 'nextcloud'], ME, deps(), { explicitApps: true }))).toMatch(/^NO_SOURCE: /)
+        expect(Object.keys(h.doc().operationDB ?? {})).toHaveLength(0)
+        expect(h.doc().instanceDB['inst-k' as any]).toBeUndefined()
+    })
+})
