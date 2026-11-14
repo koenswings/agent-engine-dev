@@ -4,7 +4,7 @@ import { $, YAML, chalk, fs, os } from 'zx';
 import path from 'path';
 import { deepPrint, log } from '../utils/utils.js';
 import { App, appTitleFromXapp, createAppId, createOrUpdateApp, extractAppName, extractAppVersion } from './App.js'
-import { Instance, Status, createOrUpdateInstance, startInstance } from './Instance.js'
+import { Instance, Status, createOrUpdateInstance, startInstance, markLegacyDottedInstance } from './Instance.js'
 import { AppID, BackupMode, DeviceName, DiskID, DiskType, EngineID, DiskName, InstanceID, PortNumber, ServiceImage, Timestamp } from './CommonTypes.js';
 import { Store, getAppsOfDisk, getInstance, getInstancesOfDisk } from './Store.js';
 import { DocHandle } from '@automerge/automerge-repo';
@@ -17,6 +17,7 @@ import { parseFilesMount, parseUsbMount } from './FilesMount.js';
 import { updateDiskSize } from './DiskSize.js';
 import { recordDiskDetectionFailure } from '../monitors/diskDetection.js';
 import { shouldAutoStart } from './AutoStart.js';
+import { isLegacyDottedInstanceId, LEGACY_DOTTED_INSTANCE_MESSAGE } from '../utils/instanceIds.js';
 
 
 
@@ -838,6 +839,14 @@ const tracedStartInstance = async (storeHandle: DocHandle<Store>, instance: Inst
     // resets that to Docked, so the gate also reads the operator's last stop
     // (AutoStart.ts). The instance is put back to Stopped so the Console shows it.
     const current = storeHandle.doc()?.instanceDB?.[instance.id] ?? instance
+    // idea#494: listed (removeInstance can clear it) but no compose up, no .env
+    // rewrite, no port allocation. Do this before shouldAutoStart so a Stopped
+    // dotted record is still marked Error with the legacy statusCondition.
+    if (isLegacyDottedInstanceId(String(current.id))) {
+        log(`tracedStartInstance: leaving '${current.id}' listed as Error — ${LEGACY_DOTTED_INSTANCE_MESSAGE} (idea#494)`)
+        markLegacyDottedInstance(storeHandle, current.id)
+        return
+    }
     const gate = shouldAutoStart(storeHandle.doc(), current)
     if (!gate.start) {
         log(`tracedStartInstance: skipping auto-start of '${current.name}' (${current.id}) on disk ${disk.id}: ${gate.reason}`)

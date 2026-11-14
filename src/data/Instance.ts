@@ -22,7 +22,7 @@ import { DocHandle } from "@automerge/automerge-repo";
 import { CommandLogStore, LogEntry, getCommandLogHandle, liveCommandLogHandle, addTrace, closeTrace, flushLogs } from './CommandLogStore.js'
 import { getActiveTrace, flushTrace } from '../utils/CommandLogger.js'
 import { dockerAvailable } from '../utils/dockerAvailable.js'
-import { composeProjectLabelFilter, containerInInstanceProject } from '../utils/instanceIds.js'
+import { composeProjectLabelFilter, containerInInstanceProject, isLegacyDottedInstanceId, LEGACY_DOTTED_INSTANCE_MESSAGE } from '../utils/instanceIds.js'
 import { rebindKolibriMorangoInstanceId } from './InstanceCopy.js'
 import { hostIdentity, writeHostIdentityEnv, nextcloudUrl, writeNextcloudUrlEnv, isNextcloudInstance, nextcloudTrustedDomainsBridge, hostNetworkInterfaces } from './HostIdentity.js'
 import { trackInFlight, startDiskGoneReason, dockIdentityOf } from './InstanceInFlight.js'
@@ -202,6 +202,16 @@ let deviceExistsCheck: ((dev: string) => boolean) | null | undefined = undefined
 export const setDeviceExistsCheckForTests = (fn: ((dev: string) => boolean) | null | undefined): void => { deviceExistsCheck = fn }
 const deviceExists = (): ((dev: string) => boolean) | null =>
   deviceExistsCheck !== undefined ? deviceExistsCheck : (config.settings.testMode ? null : (dev: string) => fs.existsSync(`/dev/${dev}`))
+
+/** idea#494: leave a legacy dotted instance listed as Error; no Docker, no .env write. */
+export const markLegacyDottedInstance = (storeHandle: DocHandle<Store>, instanceId: InstanceID): void => {
+  storeHandle.change(doc => {
+    const inst = doc.instanceDB[instanceId]
+    if (!inst) return
+    inst.status = 'Error' as Status
+    inst.statusCondition = LEGACY_DOTTED_INSTANCE_MESSAGE
+  })
+}
 
 export const markInstanceError = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, e: unknown): Promise<void> => {
   // hw180: a start that fails because its disk was pulled (undock pending, record undocked or
@@ -1364,6 +1374,14 @@ export const startInstance = (storeHandle: DocHandle<Store>, instance: Instance,
 
 const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> => {
   const store: Store = storeHandle.doc()
+
+  // idea#494: a legacy dotted id is listed so removeInstance can clear it, but
+  // it must never compose up, rewrite .env, or allocate a port.
+  if (isLegacyDottedInstanceId(String(instance.id))) {
+    markLegacyDottedInstance(storeHandle, instance.id)
+    throw new Error(LEGACY_DOTTED_INSTANCE_MESSAGE)
+  }
+
   print(`Starting instance '${instance.id}' on disk ${disk.id} of engine '${localEngineId}'.`)
 
   // Short-circuit: if containers are already running (e.g. engine restarted while app was up),

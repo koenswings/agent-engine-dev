@@ -18,7 +18,7 @@ import { moveApp } from '../../src/data/CopyMoveApp.js'
 import { composeDownAt, pruneUnusedInstanceNetworks } from '../../src/utils/instanceNetworks.js'
 import {
     composeProjectName, checkInstanceIdForDocker, isLegacyDottedInstanceId, isStrictInstanceId,
-    composeProjectLabelFilter, containerInInstanceProject, composeProjectFor,
+    composeProjectLabelFilter, containerInInstanceProject, composeProjectFor, containerNameBelongsToInstance,
 } from '../../src/utils/instanceIds.js'
 import { quarantineArgs, removalQuarantineArgs } from '../../src/utils/appDataHelper.js'
 import { assertComposeContainersHealthy } from '../../src/data/Instance.js'
@@ -196,6 +196,17 @@ describe('container matching is by exact compose-project label, never a name pre
         expect(containerInInstanceProject({ 'com.docker.compose.project': 'kolibri-a' }, 'kolibri-a')).toBe(true)
         expect(containerInInstanceProject(undefined, 'kolibri-a')).toBe(false)
     })
+    it('containerNameBelongsToInstance is exact-project, never a live-id prefix of <id>backup-… (engine#367)', () => {
+        const liveC = `${LIVE}-nextcloud-1`
+        const bakC = `${DOTTED_PROJECT}-nextcloud-1`
+        expect(bakC.startsWith(LIVE)).toBe(true) // the prefix trap: name= and startsWith(id) would both hit this
+        expect(containerNameBelongsToInstance(liveC, LIVE)).toBe(true)
+        expect(containerNameBelongsToInstance(LIVE, LIVE)).toBe(true)
+        expect(containerNameBelongsToInstance(bakC, LIVE)).toBe(false)
+        expect(containerNameBelongsToInstance(bakC, DOTTED)).toBe(true)
+        expect(containerNameBelongsToInstance('a-builder-1', 'a')).toBe(true)
+        expect(containerNameBelongsToInstance('ab-builder-1', 'a')).toBe(false)
+    })
     it('Instance.ts has no docker name filter and no name-prefix container match left', async () => {
         const src = await fs.readFile(path.join(process.cwd(), 'src/data/Instance.ts'), 'utf8')
         expect(src).not.toMatch(/--filter name=/)
@@ -237,6 +248,13 @@ exit 1
         it('the live instance is not marked Error by the dotted backup stack\'s exited container', async () => {
             await expect(assertComposeContainersHealthy('/fake', LIVE as any)).resolves.toBeUndefined()
         }, 15_000)
+        // engine#367 ask 2: the start check ("Container(s) exited after compose up")
+        // for a live strict id <id> must not match containers of project <id>backup-…
+        // (exact project-label match from idea#479, already on main).
+        it('engine#367: start check for live <id> does not match containers of project <id>backup-…', async () => {
+            await expect(assertComposeContainersHealthy('/fake', LIVE as any)).resolves.toBeUndefined()
+            await expect(assertComposeContainersHealthy('/fake', DOTTED as any)).rejects.toThrow(/Container\(s\) exited after compose up/)
+        }, 20_000)
         it('the dotted instance still sees its own exited container', async () => {
             await expect(assertComposeContainersHealthy('/fake', DOTTED as any)).rejects.toThrow(/exited after compose up/)
         }, 15_000)
