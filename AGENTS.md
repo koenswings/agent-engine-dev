@@ -131,6 +131,7 @@ Engine test rules on a claimed Pi:
 - Leave the Pi's isolated store, `mdns: false` and its local `config.yaml` untouched.
 - Stop the pm2 Engine as pi before testing (`pm2 stop engine idea-usage`, never `sudo pm2`): the Engine needs exclusive USB/udev and `/disks`, and the test pre-flight refuses to run next to a live Engine or a live `idea-usage` process (idea#411).
 - Test from a separate checkout, not the deployed tree (`/home/pi/idea/agents/agent-engine-dev`), kept off the fleet store.
+- If a scratch checkout must reuse another tree's `config.yaml`, `store-identity` or `store-data`, link them with `script/link-scratch-store.sh --from <live-tree> --to <scratch-tree>` (uses `ln -sfnT`, and refuses if the destination already exists as a non-symlink directory). Never use plain `ln -sfn`: when the checkout already has a `store-identity/` directory, that nests a symlink inside it and the Engine can pair the local store-url with the shared store-data (engine#321).
 - Keep `IDEA_NETWORK_TESTS` off unless an issue asks for it.
 - Sudoers: you may install your PR's version of `11-engine-files` with `installEngineSudoers` **only** on a Pi you have claimed, and must restore main's version before releasing it. Golden idea02 sudoers stays with Atlas.
 - Never modify `store-identity/store-template.json`, on any Pi or in the repo.

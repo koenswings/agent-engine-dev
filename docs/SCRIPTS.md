@@ -144,6 +144,14 @@ This document provides a reference for the main provisioning and utility scripts
 
 ---
 
+### `link-scratch-store.sh` (`script/link-scratch-store.sh`)
+
+-   **Purpose:** Safely symlink `config.yaml`, `store-identity` and/or `store-data` from a live Engine tree into a scratch checkout (engine#321).
+-   **Usage:** `script/link-scratch-store.sh --from <live-tree> --to <scratch-tree> [name ...]` (default names: `config.yaml`, `store-identity`, `store-data`) or `script/link-scratch-store.sh <source> <dest>`.
+-   **Details:** Uses `ln -sfnT` so the destination is always treated as a symlink to replace, never as a directory to link into. If the destination already exists as a non-symlink directory, the script refuses (exit 2) and leaves it untouched. In `--from`/`--to` mode every destination is checked before any link is created. Names must be basenames (no `/` or `..`). Tests: `test/automated/link-scratch-store-script.test.ts`. See also AGENTS.md ("Testing on a fleet Pi").
+
+---
+
 ### `write-build-info.mjs` (`script/write-build-info.mjs`)
 -   **Description:** Run by `pnpm build` after `tsc` (idea#400 PR C, Steve Q12). Writes `dist/build-info.json` = `{ commit, commitTimeMs }` from `git rev-parse HEAD` and `git log -1 --format=%ct`. The scheduled-backup clock check uses `commitTimeMs` as its floor (`BEFORE_BUILD`). Without git the file is removed and the check is skipped. Optional argument: the output path.
 
