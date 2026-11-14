@@ -60,6 +60,10 @@ const parsePercent = (raw: string): number | null => {
     return isNaN(v) ? null : v
 }
 
+/** Sum known values; null if both sides are unknown (idea#518). */
+const sumNullable = (a: number | null, b: number | null): number | null =>
+    a == null && b == null ? null : (a ?? 0) + (b ?? 0)
+
 // ── docker stats output shape ─────────────────────────────────────────────────
 // `docker stats --no-stream --format json` outputs one JSON object per line.
 // Fields (from Docker docs): Container, Name, CPUPerc, MemUsage, MemPerc,
@@ -95,11 +99,22 @@ const parseStatsLine = (line: string): { name: string; metrics: DockerMetrics } 
     // BlockIO: "10MB / 5MB"
     const [blockReadStr, blockWriteStr] = (raw.BlockIO ?? '').split('/').map(s => s.trim())
 
+    let memUsageBytes = parseBytes(memUsageStr ?? '')
+    let memLimitBytes = parseBytes(memLimitStr ?? '')
+    let memPercent = parsePercent(raw.MemPerc ?? '')
+    // idea#518: 0B / 0B (no memory cgroup) or a 0-byte limit is unknown, not a real 0.
+    // docker stats reports "0B / 0B" and "0.00%" when the memory controller is off.
+    if (memLimitBytes === 0 || (memUsageBytes === 0 && memLimitBytes == null)) {
+        memUsageBytes = null
+        memLimitBytes = null
+        memPercent = null
+    }
+
     const metrics: DockerMetrics = {
         cpuPercent:     parsePercent(raw.CPUPerc ?? ''),
-        memUsageBytes:  parseBytes(memUsageStr ?? ''),
-        memLimitBytes:  parseBytes(memLimitStr ?? ''),
-        memPercent:     parsePercent(raw.MemPerc ?? ''),
+        memUsageBytes,
+        memLimitBytes,
+        memPercent,
         netRxBytes:     parseBytes(netRxStr ?? ''),
         netTxBytes:     parseBytes(netTxStr ?? ''),
         blockReadBytes: parseBytes(blockReadStr ?? ''),
@@ -160,7 +175,8 @@ export const collectMetrics = async (
             } else {
                 // Sum CPU and net/block across containers; use latest sampledAt
                 existing.cpuPercent     = (existing.cpuPercent    ?? 0) + (parsed.metrics.cpuPercent    ?? 0)
-                existing.memUsageBytes  = (existing.memUsageBytes ?? 0) + (parsed.metrics.memUsageBytes ?? 0)
+                // idea#518: two unknowns stay null; do not coerce missing memory data to 0
+                existing.memUsageBytes  = sumNullable(existing.memUsageBytes, parsed.metrics.memUsageBytes)
                 existing.netRxBytes     = (existing.netRxBytes    ?? 0) + (parsed.metrics.netRxBytes    ?? 0)
                 existing.netTxBytes     = (existing.netTxBytes    ?? 0) + (parsed.metrics.netTxBytes    ?? 0)
                 existing.blockReadBytes = (existing.blockReadBytes ?? 0) + (parsed.metrics.blockReadBytes ?? 0)
