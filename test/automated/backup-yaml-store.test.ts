@@ -282,7 +282,7 @@ describe('processBackupDisk mirror and createBackupDisk (idea#400)', () => {
         const { storeHandle, backupDisk } = await setup()
         await processBackupDisk(storeHandle, backupDisk)
         const d = storeHandle.doc()!.diskDB[backupDisk.id]
-        expect(d.backupConfig).toEqual({ mode: 'scheduled', links: [INST, 'other-inst'], schedule: { daily: '03:15' }, scheduleError: null })
+        expect(d.backupConfig).toEqual({ mode: 'scheduled', links: [INST, 'other-inst'], schedule: { daily: '03:15' }, scheduleError: null, orphanLinks: ['other-inst'] })
         expect(d.missedRuns).toBe(2)
         expect(d.lastAttempt).toBe(1794447005000)
         expect(JSON.stringify(d)).not.toContain('uptimeCounter')

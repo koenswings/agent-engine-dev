@@ -20,6 +20,7 @@ import { DockerMetrics } from '../data/CommonTypes.js'
 import { localEngineId } from '../data/Engine.js'
 import { dockerAvailable } from '../utils/dockerAvailable.js'
 import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
+import { composeProjectName, containerNameBelongsToInstance } from '../utils/instanceIds.js'
 
 $.verbose = false
 
@@ -59,6 +60,10 @@ const parsePercent = (raw: string): number | null => {
     return isNaN(v) ? null : v
 }
 
+/** Sum known values; null if both sides are unknown (idea#518). */
+const sumNullable = (a: number | null, b: number | null): number | null =>
+    a == null && b == null ? null : (a ?? 0) + (b ?? 0)
+
 // ── docker stats output shape ─────────────────────────────────────────────────
 // `docker stats --no-stream --format json` outputs one JSON object per line.
 // Fields (from Docker docs): Container, Name, CPUPerc, MemUsage, MemPerc,
@@ -94,11 +99,22 @@ const parseStatsLine = (line: string): { name: string; metrics: DockerMetrics } 
     // BlockIO: "10MB / 5MB"
     const [blockReadStr, blockWriteStr] = (raw.BlockIO ?? '').split('/').map(s => s.trim())
 
+    let memUsageBytes = parseBytes(memUsageStr ?? '')
+    let memLimitBytes = parseBytes(memLimitStr ?? '')
+    let memPercent = parsePercent(raw.MemPerc ?? '')
+    // idea#518: 0B / 0B (no memory cgroup) or a 0-byte limit is unknown, not a real 0.
+    // docker stats reports "0B / 0B" and "0.00%" when the memory controller is off.
+    if (memLimitBytes === 0 || (memUsageBytes === 0 && memLimitBytes == null)) {
+        memUsageBytes = null
+        memLimitBytes = null
+        memPercent = null
+    }
+
     const metrics: DockerMetrics = {
         cpuPercent:     parsePercent(raw.CPUPerc ?? ''),
-        memUsageBytes:  parseBytes(memUsageStr ?? ''),
-        memLimitBytes:  parseBytes(memLimitStr ?? ''),
-        memPercent:     parsePercent(raw.MemPerc ?? ''),
+        memUsageBytes,
+        memLimitBytes,
+        memPercent,
         netRxBytes:     parseBytes(netRxStr ?? ''),
         netTxBytes:     parseBytes(netTxStr ?? ''),
         blockReadBytes: parseBytes(blockReadStr ?? ''),
@@ -111,21 +127,36 @@ const parseStatsLine = (line: string): { name: string; metrics: DockerMetrics } 
 
 // ── Collect metrics for a set of instance IDs ─────────────────────────────────
 
-const collectMetrics = async (
+/** idea#492 / engine#367: exported for tests. */
+export const collectMetrics = async (
     instanceIds: string[]
 ): Promise<{ metrics: Map<string, DockerMetrics>, runningContainers: string[] | null }> => {
-    // docker stats container names follow the pattern: <instanceId>-<service>-1
-    // We filter containers by name prefix matching any of the instance IDs.
+    // Match only the exact `com.docker.compose.project` label (idea#492, idea#479).
+    // Never `name=<id>` or startsWith(id): those also hit `<id>backup-…`.
+    // Containers without the label are not counted.
     const result = new Map<string, DockerMetrics>()
     // null = docker ps did not answer: never conclude anything about container state
     let runningContainers: string[] | null = null
     if (instanceIds.length === 0) return { metrics: result, runningContainers: [] }
 
     try {
-        // docker stats does not support --filter; resolve container names via docker ps first
-        const filterArgs = instanceIds.flatMap(id => ['--filter', `name=${id}`])
-        const psProc = await $`docker ps --format {{.Names}} ${filterArgs}`
-        const containerNames = psProc.stdout.split('\n').map(l => l.trim()).filter(Boolean)
+        // docker stats does not support --filter. One `docker ps` (multiple
+        // `--filter label=` would be ANDed), then pick rows by exact project.
+        const format = '{{.Names}}\t{{.Label "com.docker.compose.project"}}'
+        const psProc = await $`docker ps --format ${format}`
+        const containerNames: string[] = []
+        const nameToInstance = new Map<string, string>()
+        for (const line of psProc.stdout.split('\n').map(l => l.trim()).filter(Boolean)) {
+            const tab = line.indexOf('\t')
+            const name = tab === -1 ? line : line.slice(0, tab)
+            const project = tab === -1 ? '' : line.slice(tab + 1)
+            const instanceId = project
+                ? instanceIds.find(id => project === composeProjectName(id))
+                : undefined
+            if (!instanceId) continue
+            containerNames.push(name)
+            nameToInstance.set(name, instanceId)
+        }
         runningContainers = containerNames
         if (containerNames.length === 0) return { metrics: result, runningContainers }
         const proc = await $`docker stats --no-stream --format json ${containerNames}`
@@ -134,8 +165,8 @@ const collectMetrics = async (
         for (const line of lines) {
             const parsed = parseStatsLine(line)
             if (!parsed) continue
-            // Map container name back to instance ID
-            const instanceId = instanceIds.find(id => parsed.name.startsWith(id))
+            // Map container back to instance by exact compose project, never a name prefix.
+            const instanceId = nameToInstance.get(parsed.name)
             if (!instanceId) continue
             // Merge: if multiple containers belong to the same instance, accumulate
             const existing = result.get(instanceId)
@@ -144,7 +175,8 @@ const collectMetrics = async (
             } else {
                 // Sum CPU and net/block across containers; use latest sampledAt
                 existing.cpuPercent     = (existing.cpuPercent    ?? 0) + (parsed.metrics.cpuPercent    ?? 0)
-                existing.memUsageBytes  = (existing.memUsageBytes ?? 0) + (parsed.metrics.memUsageBytes ?? 0)
+                // idea#518: two unknowns stay null; do not coerce missing memory data to 0
+                existing.memUsageBytes  = sumNullable(existing.memUsageBytes, parsed.metrics.memUsageBytes)
                 existing.netRxBytes     = (existing.netRxBytes    ?? 0) + (parsed.metrics.netRxBytes    ?? 0)
                 existing.netTxBytes     = (existing.netTxBytes    ?? 0) + (parsed.metrics.netTxBytes    ?? 0)
                 existing.blockReadBytes = (existing.blockReadBytes ?? 0) + (parsed.metrics.blockReadBytes ?? 0)
@@ -187,7 +219,7 @@ export const detectExternalStops = (
     for (const inst of instances) {
         if (inst.status !== 'Running') continue
         seen.add(inst.id)
-        const hasContainer = runningContainers.some(n => n.startsWith(inst.id))
+        const hasContainer = runningContainers.some(n => containerNameBelongsToInstance(n, inst.id))
         if (hasContainer || isLocked(inst.id) || now - (inst.lastStarted ?? 0) < EXTERNAL_STOP_GRACE_MS) {
             externalStopMisses.delete(inst.id)
             continue

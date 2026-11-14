@@ -56,6 +56,19 @@
 #                                               are replaced or deleted go to .idea-quarantine/<id>-before-restore-<stamp>/;
 #                                               EXCLUDE ∪ given excludes are never written, deleted or moved)
 #   idea-app-data snapshots        <root>        (v5: "<id> <kb> complete|incomplete" per .pre-update snapshot)
+#   idea-app-data estimate         <root> <id> [exclude…]   (read-only: "<folder kb> <volumes kb> <free kb>";
+#                                               v14, idea#396: optional excludes; the folder kb is then net of the
+#                                               excluded paths, and the output is still that one line)
+#   idea-app-data quarantine-snapshot <root> <id>   (v14, idea#396: move .pre-update/<id> to
+#                                               .idea-quarantine/<id>-pre-update-<UTC stamp> on the same disk by one
+#                                               mv -T; a missing snapshot is exit 0; never deletes, never overwrites)
+#   v14 (idea#396): snapshot and estimate excludes must be 'data' or 'data/<rel>' after the v8
+#            normalisation below (a bare name becomes data/<name>), at most 256 characters each
+#            (after trimming), at most 32 after de-duplication, and an existing path (or any
+#            symlink in it) must resolve inside the instance's data/ folder. NO_SPACE and the
+#            estimate subtract the excluded bytes (du -sk -x; a nested path under another
+#            excluded path is not counted twice). restore-snapshot keeps the v9 rules, so a
+#            rollback of an older snapshot is never refused for its recorded EXCLUDE.
 #   (v6, idea#406: device roots are partitions 1-9, RE_DEV ^sd[a-z][1-9]$; was [12])
 #   idea-app-data borg-init    <bdev> <id>
 #   idea-app-data borg-info    <bdev> <id>
@@ -143,7 +156,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=13
+readonly IDEA_APP_DATA_VERSION=14
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -219,6 +232,8 @@ LEDGER_DIR=/var/lib/idea-app-data
 LEDGER_TTL_SECONDS=86400
 FREE_FLOOR_KB=1048576
 SNAPSHOT_MARGIN_PCT=10
+SNAP_EXCLUDE_MAX=32
+SNAP_EXCLUDE_MAX_LEN=256
 EXIT_NO_SPACE=3
 VOLUMES_DIR=/var/lib/docker/volumes
 PEER_MAX=256
@@ -451,6 +466,66 @@ parse_excludes() {
         for e in ${EXCLUDES[@]+"${EXCLUDES[@]}"}; do [[ "$e" == "$rel" ]] && seen=1; done
         (( seen )) && continue
         EXCLUDES+=("$rel"); RSYNC_EXCL+=("--exclude=/$rel")
+    done
+}
+
+# v14 (idea#396): snapshot / estimate excludes. Same normalisation and rsync anchors as
+# parse_excludes, plus: at most SNAP_EXCLUDE_MAX_LEN characters per token (after trim),
+# only 'data' or 'data/<rel>', at most SNAP_EXCLUDE_MAX entries after de-duplication, and
+# the path must resolve (every existing symlink followed) inside <inst>/data. Every token
+# is checked before anything is locked, stopped, moved, written or sized (fail closed).
+parse_snapshot_excludes() {
+    local inst="$1" tok trimmed rel e seen
+    shift
+    for tok in "$@"; do
+        trimmed=${tok#"${tok%%[![:space:]]*}"}
+        trimmed=${trimmed%"${trimmed##*[![:space:]]}"}
+        (( ${#trimmed} <= SNAP_EXCLUDE_MAX_LEN )) || refuse "exclude '${tok:0:64}…' is longer than $SNAP_EXCLUDE_MAX_LEN characters"
+        rel=$(normalize_exclude "$tok") || exit 2
+        [[ "$rel" == data || "$rel" == data/* ]] || refuse "exclude '$tok' must be data or a path under data/ (helper v14 snapshot excludes)"
+        check_exclude_inside "$inst" "$rel"
+        check_exclude_in_data "$inst" "$rel"
+        seen=0
+        for e in ${EXCLUDES[@]+"${EXCLUDES[@]}"}; do [[ "$e" == "$rel" ]] && seen=1; done
+        (( seen )) && continue
+        EXCLUDES+=("$rel"); RSYNC_EXCL+=("--exclude=/$rel")
+        (( ${#EXCLUDES[@]} <= SNAP_EXCLUDE_MAX )) || refuse "exclude list has more than $SNAP_EXCLUDE_MAX entries"
+    done
+}
+
+# check_exclude_in_data <inst> <rel>: <rel> is data or data/…; follow every existing
+# symlink in the path (realpath -m) and refuse unless the result is <inst>/data or below.
+# A path that exists but cannot be resolved (a loop) is refused too.
+check_exclude_in_data() {
+    local inst="${1%/}" rel="$2" real
+    real=$($REALPATH -m -- "$inst/$rel" 2>/dev/null) || refuse "exclude '$rel' cannot be resolved under $inst/data"
+    [[ "$real" == "$inst/data" || "$real" == "$inst/data/"* ]] || refuse "exclude '$rel' points outside the instance's data folder"
+    if [[ -e "$inst/$rel" || -L "$inst/$rel" ]]; then
+        $REALPATH -e -- "$inst/$rel" >/dev/null 2>&1 || refuse "exclude '$rel' cannot be resolved under $inst/data"
+    fi
+}
+
+# excluded_kb <inst>: KB of the EXCLUDES that exist under <inst> (du -sk -x of the path
+# itself; a symlink counts as the link, never its target). A path under another excluded
+# path is skipped, so nested excludes are not counted twice. Sets EXCL_KB; one stderr
+# trace line per counted path ("exclude <rel> <kb> KB").
+EXCL_KB=0
+excluded_kb() {
+    local inst="${1%/}" rel e k nested
+    EXCL_KB=0
+    for rel in ${EXCLUDES[@]+"${EXCLUDES[@]}"}; do
+        nested=0
+        for e in "${EXCLUDES[@]}"; do
+            [[ "$e" != "$rel" && "$rel" == "$e/"* ]] && nested=1
+        done
+        (( nested )) && continue
+        if [[ -e "$inst/$rel" || -L "$inst/$rel" ]]; then
+            k=$(dir_kb "$inst/$rel"); [[ "$k" =~ ^[0-9]+$ ]] || refuse "cannot tell the size of $inst/$rel"
+        else
+            k=0
+        fi
+        echo "exclude $rel $k KB" >&2
+        EXCL_KB=$(( EXCL_KB + k ))
     done
 }
 
@@ -1174,7 +1249,8 @@ case "$SUB" in
         [[ ! -L "$INST" ]] || refuse "$INST is a symlink"
         existing_dir "$INST" "instance folder"
         # v9 (idea#448): excludes are checked before anything is locked, moved or written.
-        parse_excludes "$INST" "${@:4}"
+        # v14 (idea#396): only data / data/<rel>, at most 32, and they count out of NO_SPACE.
+        parse_snapshot_excludes "$INST" "${@:4}"
         refuse_external_links "$INST"
         take_locks "inst.$2.$3"
         containers_stopped "$3"
@@ -1192,6 +1268,9 @@ case "$SUB" in
         pin_cwd "$INST"
         INST_KB=$(dir_kb .)
         [[ "$INST_KB" =~ ^[0-9]+$ ]] || refuse "cannot tell the size of $INST"
+        # v14 (idea#396): the same net arithmetic as estimate (folder minus excluded paths).
+        excluded_kb "$INST"
+        INST_KB=$(( INST_KB > EXCL_KB ? INST_KB - EXCL_KB : 0 ))
         # Volumes may live on the system SSD; the check is against THIS (destination) App Disk.
         NEED_KB=$(( INST_KB + VOL_KB ))
         MARGIN_KB=$(( NEED_KB * SNAPSHOT_MARGIN_PCT / 100 ))
@@ -1199,7 +1278,7 @@ case "$SUB" in
         FREE_KB=$(avail_kb "${R_DIR:-/}")
         if (( FREE_KB < NEED_KB + MARGIN_KB )); then
             REFUSAL="NO_SPACE"
-            echo "NO_SPACE: snapshot needs $(( (NEED_KB + MARGIN_KB) * 1024 )) bytes ($INST_KB KB folder + $VOL_KB KB volumes + $MARGIN_KB KB margin), free $(( FREE_KB * 1024 )) bytes" >&2
+            echo "NO_SPACE: snapshot needs $(( (NEED_KB + MARGIN_KB) * 1024 )) bytes ($INST_KB KB folder + $VOL_KB KB volumes + $MARGIN_KB KB margin; $EXCL_KB KB excluded), free $(( FREE_KB * 1024 )) bytes" >&2
             exit $EXIT_NO_SPACE
         fi
         # A previous snapshot (complete or interrupted) is moved aside by a same-filesystem
@@ -1215,7 +1294,7 @@ case "$SUB" in
         $MKDIR -m 0700 -- "$SDIR" || refuse "cannot create $SDIR"
         $CHOWN root:root -- "$SDIR" 2>/dev/null || true
         STAMP=$($DATE -u +%Y-%m-%dT%H:%M:%SZ)
-        echo "snapshot $2 $3 started $STAMP need_kb=$NEED_KB volumes=${#VOL_NAMES[@]} old=$OLD excludes=${#EXCLUDES[@]}" > "$SDIR/JOURNAL" || refuse "cannot write $SDIR/JOURNAL"
+        echo "snapshot $2 $3 started $STAMP need_kb=$NEED_KB excluded_kb=$EXCL_KB volumes=${#VOL_NAMES[@]} old=$OLD excludes=${#EXCLUDES[@]}" > "$SDIR/JOURNAL" || refuse "cannot write $SDIR/JOURNAL"
         for rel in ${EXCLUDES[@]+"${EXCLUDES[@]}"}; do
             echo "exclude $rel" >> "$SDIR/JOURNAL" || refuse "cannot write $SDIR/JOURNAL"
         done
@@ -1348,12 +1427,15 @@ case "$SUB" in
     estimate)
         # Read-only (no lock, nothing stopped or written): "<folder kb> <volumes kb> <free kb>"
         # so updateApp can refuse NO_SPACE before it stops anything; snapshot re-checks.
-        need 2 $(($# - 1)) "<root> <id>"
+        # v14 (idea#396): optional excludes (the snapshot's rules); the folder kb is then net of
+        # them, exactly as snapshot counts it. The two-argument call is unchanged.
+        need_min 2 $(($# - 1)) "<root> <id> [exclude…]"
         check_id "$3"
         resolve_root "$2" instances
         INST=$(inst_dir "$R_DIR" "$3")
         [[ ! -L "$INST" ]] || refuse "$INST is a symlink"
         existing_dir "$INST" "instance folder"
+        parse_snapshot_excludes "$INST" "${@:4}"
         list_volumes "$3"
         VOL_KB=0
         for v in ${VOL_NAMES[@]+"${VOL_NAMES[@]}"}; do
@@ -1362,6 +1444,8 @@ case "$SUB" in
             VOL_KB=$(( VOL_KB + k ))
         done
         INST_KB=$(dir_kb "$INST"); [[ "$INST_KB" =~ ^[0-9]+$ ]] || refuse "cannot tell the size of $INST"
+        excluded_kb "$INST"
+        INST_KB=$(( INST_KB > EXCL_KB ? INST_KB - EXCL_KB : 0 ))
         echo "$INST_KB $VOL_KB $(avail_kb "${R_DIR:-/}")"
         exit 0
         ;;
@@ -1387,6 +1471,49 @@ case "$SUB" in
         echo "TOTAL pre-update $(dir_kb "$PDIR")"
         QDIR="$R_DIR/.idea-quarantine"
         if [[ -d "$QDIR" && ! -L "$QDIR" ]]; then echo "TOTAL quarantine $(dir_kb "$QDIR")"; else echo "TOTAL quarantine 0"; fi
+        exit 0
+        ;;
+
+    quarantine-snapshot)
+        # v14 (idea#396): the Engine calls this 24 h after an update passed its health gate.
+        # One same-filesystem mv -T of .pre-update/<id> (complete or not) to
+        # <same disk>/.idea-quarantine/<id>-pre-update-<UTC stamp>. Containers are not
+        # stopped or inspected. A missing snapshot is exit 0 with nothing on stdout (a
+        # retry after a move is this path); an existing destination is refused, never
+        # overwritten. Nothing is ever removed.
+        need 2 $(($# - 1)) "<root> <id>"
+        check_id "$3"
+        resolve_root "$2" instances
+        PDIR="$R_DIR/.pre-update"
+        SDIR="$PDIR/$3"
+        QDIR="$R_DIR/.idea-quarantine"
+        [[ ! -L "$PDIR" ]] || refuse "$PDIR is a symlink"
+        [[ ! -L "$SDIR" ]] || refuse "$SDIR is a symlink"
+        [[ ! -L "$QDIR" ]] || refuse "$QDIR is a symlink"
+        if [[ ! -e "$SDIR" ]]; then
+            echo "ok: $SDIR does not exist; nothing to quarantine" >&2
+            exit 0
+        fi
+        existing_dir "$SDIR" "snapshot of $3"
+        take_locks "inst.$2.$3"
+        # Re-checked under the lock: a snapshot run that held it may have moved it already.
+        [[ ! -L "$SDIR" ]] || refuse "$SDIR is a symlink"
+        if [[ ! -e "$SDIR" ]]; then
+            echo "ok: $SDIR does not exist; nothing to quarantine" >&2
+            exit 0
+        fi
+        existing_dir "$SDIR" "snapshot of $3"
+        if [[ -f "$SDIR/COMPLETE" && ! -L "$SDIR/COMPLETE" ]]; then STATE=complete; else STATE=incomplete; fi
+        root_dir "$QDIR" 0700 "quarantine folder"
+        $CHMOD 0700 -- "$QDIR" || refuse "cannot set mode 0700 on $QDIR"
+        QDEST="$QDIR/$3-pre-update-$($DATE -u +%Y%m%dT%H%M%SZ)"
+        [[ ! -e "$QDEST" && ! -L "$QDEST" ]] || refuse "$QDEST already exists"
+        pin_cwd "$PDIR"
+        $MV -T -- "./$3" "$QDEST" || refuse "cannot move $SDIR to $QDEST"
+        $CHOWN root:root -- "$QDEST" 2>/dev/null || true
+        $CHMOD 0700 -- "$QDEST" || true
+        journal "quarantine-snapshot: $SDIR -> $QDEST ($STATE)"
+        echo "$QDEST"
         exit 0
         ;;
 
@@ -1762,7 +1889,7 @@ case "$SUB" in
         ;;
 
     "")
-        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, borg-init, borg-info, borg-create, borg-extract, borg-list, borg-extract-verify, borg-delete, borg-compact, quarantine-backups, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, sync-peers, install-usage-key)"
+        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, quarantine-snapshot, borg-init, borg-info, borg-create, borg-extract, borg-list, borg-extract-verify, borg-delete, borg-compact, quarantine-backups, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, sync-peers, install-usage-key)"
         ;;
     *)
         refuse "unknown subcommand '$(printf '%q' "$SUB")'"

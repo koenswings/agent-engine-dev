@@ -11,6 +11,8 @@
  *   - spaced commands run as before, in order, each once
  *   - the startup replay uses the same path: each pending command runs once,
  *     also when live patches arrive during the replay
+ * idea#498: read-only verifyMoveTarget runs outside the serial queue, so it is
+ * answered while a startInstance is still in progress; mutating commands stay serial.
  */
 
 import { describe, it, beforeEach, afterEach, expect, vi } from 'vitest'
@@ -21,8 +23,20 @@ vi.mock('../../src/data/Engine.js', async (importOriginal) => {
     return { ...actual, rebootEngine: vi.fn(async () => {}) }
 })
 
+vi.mock('../../src/data/Instance.js', async (importOriginal) => {
+    const actual = await importOriginal<any>()
+    return { ...actual, startInstance: vi.fn(async () => {}) }
+})
+
+vi.mock('../../src/data/MoveAppRemote.js', async (importOriginal) => {
+    const actual = await importOriginal<any>()
+    return { ...actual, verifyMoveTarget: vi.fn(async () => ({ ok: true, code: null, bytes: 1, detail: null, at: Date.now() })) }
+})
+
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId, rebootEngine } from '../../src/data/Engine.js'
+import { startInstance } from '../../src/data/Instance.js'
+import { verifyMoveTarget } from '../../src/data/MoveAppRemote.js'
 import { CommandLogStore, CommandTrace } from '../../src/data/CommandLogStore.js'
 import { enableStoreMonitor } from '../../src/monitors/storeMonitor.js'
 
@@ -47,6 +61,8 @@ describe('engine command queue (idea#168)', () => {
     let err: ReturnType<typeof vi.spyOn>
     beforeEach(async () => {
         vi.mocked(rebootEngine).mockClear()
+        vi.mocked(startInstance).mockClear().mockResolvedValue(undefined as any)
+        vi.mocked(verifyMoveTarget).mockClear().mockResolvedValue({ ok: true, code: null, bytes: 1, detail: null, at: Date.now() } as any)
         err = vi.spyOn(console, 'error').mockImplementation(() => {})
         h = await newStore()
         log = newLog()
@@ -111,5 +127,35 @@ describe('engine command queue (idea#168)', () => {
         expect(vi.mocked(rebootEngine)).toHaveBeenCalledTimes(2)
         const cmds = traces(log).map(t => t.command)
         expect(cmds).toEqual(['reboot', 'bogusword', 'ejectDisk', 'reboot'])
+    })
+
+    it('verifyMoveTarget is answered while a startInstance is in progress (idea#498); reboot stays serial', async () => {
+        const instId = 'kolibri-498start01'
+        h.change(doc => {
+            doc.diskDB['d1' as any] = { id: 'd1', name: 'Apps', device: 'idea-test-1', dockedTo: String(localEngineId), diskTypes: ['app'] } as any
+            doc.instanceDB[instId as any] = {
+                id: instId, name: 'kolibri', storedOn: 'd1', instanceOf: 'kolibri-1.0', status: 'Stopped', port: 50001,
+            } as any
+        })
+        let releaseStart!: () => void
+        let startBegan = false
+        vi.mocked(startInstance).mockImplementation(() => {
+            startBegan = true
+            return new Promise(resolve => { releaseStart = () => resolve(undefined as any) })
+        })
+        enableStoreMonitor(h, log)
+        push(h, `startInstance ${instId} d1`)
+        await vi.waitFor(() => expect(startBegan).toBe(true))
+        expect(vi.mocked(verifyMoveTarget)).not.toHaveBeenCalled()
+        push(h, 'verifyMoveTarget op-498 inst-new 12345 true', 'reboot')
+        await vi.waitFor(() => expect(vi.mocked(verifyMoveTarget)).toHaveBeenCalled())
+        expect(startBegan).toBe(true)
+        expect(vi.mocked(rebootEngine)).not.toHaveBeenCalled()
+        const vt = traces(log).find(x => x.command === 'verifyMoveTarget')
+        expect(vt?.status).toBe('ok')
+        releaseStart()
+        await vi.waitFor(() => expect(queue(h)).toEqual([]))
+        expect(vi.mocked(rebootEngine)).toHaveBeenCalledOnce()
+        expect(vi.mocked(startInstance)).toHaveBeenCalledOnce()
     })
 })

@@ -39,7 +39,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '13'
+export const APP_DATA_HELPER_VERSION = '14'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -231,6 +231,9 @@ export const remoteHelperRsyncPath = (args: string[]): string => remoteHelperCom
 export const remoteDeleteSshArgs = (host: string, peerEngineId: string, root: string, id: string): string[] =>
     peerSshArgv(host, peerEngineId, remoteHelperCommand(deleteArgs(root, id)))
 
+export const remoteSizeSshArgs = (host: string, peerEngineId: string, root: string, id: string): string[] =>
+    peerSshArgv(host, peerEngineId, remoteHelperCommand(sizeArgs(root, id)))
+
 /** The ssh argv that creates apps/, instances/ and services/ on the peer's target disk (idea#80). */
 export const remoteEnsureDirsSshArgs = (host: string, peerEngineId: string, root: string): string[] =>
     peerSshArgv(host, peerEngineId, remoteHelperCommand(ensureDirsArgs(root)))
@@ -295,6 +298,17 @@ export const deleteRemoteInstanceData = async (host: string, peerEngineId: strin
     await $`${remoteDeleteSshArgs(host, peerEngineId, root, id)}`
 }
 
+/** True when `idea-app-data size` on the peer succeeds (the instance folder exists). */
+export const remoteInstanceFolderExists = async (host: string, peerEngineId: string, root: string, id: string): Promise<boolean> => {
+    try {
+        const out = String((await $`${remoteSizeSshArgs(host, peerEngineId, root, id)}`).stdout ?? '').trim()
+        const last = out.split('\n').pop() ?? out
+        return /^[0-9]+$/.test(last)
+    } catch {
+        return false
+    }
+}
+
 /** Creates apps/, instances/ and services/ on a peer's disk (through its gate). */
 export const ensureRemoteDirs = async (host: string, peerEngineId: string, root: string): Promise<void> => {
     await $`${remoteEnsureDirsSshArgs(host, peerEngineId, root)}`
@@ -356,7 +370,7 @@ export const appDataHelperProblem = async (run: AppDataRunner = runAppData): Pro
  * Startup check (softened, Steve 2026-10-28): the Engine ALWAYS starts. A missing,
  * unrunnable or different helper is logged loudly and returned; each command that
  * needs a newer helper refuses on its own with HELPER_OUTDATED (helperAtLeast):
- * removeInstance needs v4, updateApp v5. isDev machines skip the check.
+ * removeInstance needs v4, updateApp v14. isDev machines skip the check.
  */
 export const assertAppDataHelper = async (run: AppDataRunner = runAppData): Promise<string | null> => {
     if (config.settings.isDev) {
@@ -416,7 +430,15 @@ export const snapshotArgs = (root: string, id: string, excludes: string[] = []):
 export const restoreSnapshotArgs = (root: string, id: string, excludes: string[] = []): string[] =>
     ['restore-snapshot', checkRoot(root), checkId(id), ...excludeTokens(excludes)]
 export const snapshotsArgs = (root: string): string[] => ['snapshots', checkRoot(root)]
-export const estimateArgs = (root: string, id: string): string[] => ['estimate', checkRoot(root), checkId(id)]
+export const estimateArgs = (root: string, id: string, excludes: string[] = []): string[] =>
+    ['estimate', checkRoot(root), checkId(id), ...excludeTokens(excludes)]
+/**
+ * idea#396 / helper v14: move `.pre-update/<id>` to
+ * `.idea-quarantine/pre-update-<id>-<stamp>/`. Strict ids only. A missing
+ * snapshot is success with empty stdout (nothing to quarantine).
+ */
+export const quarantineSnapshotArgs = (root: string, id: string): string[] =>
+    ['quarantine-snapshot', checkRoot(root), checkId(id)]
 /** `estimate` result: "<folder kb> <volumes kb> <free kb>" (read-only; nothing is stopped). */
 export const parseEstimate = (out: string): { folderBytes: number, volumeBytes: number, freeBytes: number } => {
     const m = lastLine(out).match(/^(\d+) (\d+) (\d+)$/)
@@ -426,6 +448,9 @@ export const parseEstimate = (out: string): { folderBytes: number, volumeBytes: 
 
 /** The helper prints rsync progress first; its result is the last non-empty line. */
 export const lastLine = (out: string): string => out.trim().split('\n').map(s => s.trim()).filter(Boolean).pop() ?? ''
+
+/** Destination path from quarantine-snapshot stdout, or '' when there was nothing to move. */
+export const parseQuarantineSnapshot = (out: string): string => lastLine(out)
 
 export interface SnapshotVolume { name: string, bytes: number, exportMs: number }
 export interface SnapshotResult {

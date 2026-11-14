@@ -34,7 +34,7 @@ vi.mock('zx', async (importOriginal) => {
             docker.calls.push(c)
             let stdout = ''
             if (c.startsWith('docker ps')) stdout = docker.running
-            else if (c.startsWith('docker stats')) stdout = JSON.stringify({ Name: `${docker.running.trim()}`, CPUPerc: '12.5%', MemUsage: '256MiB / 1GiB', MemPerc: '25%', NetIO: '1kB / 2kB', BlockIO: '10MB / 5MB' }) + '\n'
+            else if (c.startsWith('docker stats')) stdout = JSON.stringify({ Name: docker.running.trim().split('\t')[0], CPUPerc: '12.5%', MemUsage: '256MiB / 1GiB', MemPerc: '25%', NetIO: '1kB / 2kB', BlockIO: '10MB / 5MB' }) + '\n'
             else if (c.startsWith('docker logs')) stdout = 'kolibri: boot failed: database is locked\n'
             const p: any = Promise.resolve({ stdout, stderr: '', exitCode: 0 })
             p.quiet = () => p
@@ -163,7 +163,8 @@ describe('dockerAvailable() (real module)', () => {
 describe('Docker-only paths follow dockerAvailable(), not testMode', () => {
     it('metrics poll: testMode + Docker → metrics broadcast (ephemeral, not stored); no Docker → no docker command at all', async () => {
         const h = await makeHandle('Running')
-        docker.running = `${INST}-kolibri-1\n`
+        // idea#492: collectMetrics matches the exact compose-project label, not the name.
+        docker.running = `${INST}-kolibri-1\t${INST}\n`
         const sent: any[] = []
         ;(h as any).broadcast = (msg: any) => { sent.push(msg) }
         await pollDockerMetricsOnce(h)

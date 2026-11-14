@@ -35,6 +35,7 @@ import { log, error, print } from './utils/utils.js'
 import type { WsServerThreadData, StoreRefusal } from './wsServerThreadWorker.js'
 import { describeRefusal, RefusalLog } from './data/StoreScope.js'
 import { guardOutgoing } from './data/StoreScopedClientAdapter.js'
+import { createEphemeralSendDedupe } from './utils/ephemeralDedupe.js'
 
 const RESTART_DELAY_MS = 1000
 
@@ -97,6 +98,7 @@ export class ThreadedWebSocketServerAdapter extends NetworkAdapter {
     #listeningReject!: (e: Error) => void
 
     #scope: ThreadedServerStoreScope
+    #ephemeralDedupe = createEphemeralSendDedupe()
     /** Joins refused by the store check (diagnostics/tests). */
     readonly refusals: StoreRefusal[] = []
 
@@ -130,7 +132,7 @@ export class ThreadedWebSocketServerAdapter extends NetworkAdapter {
     send(message: Message): void {
         if ('data' in message && message.data?.byteLength === 0) throw new Error('Tried to send a zero-length message')
         const out = guardOutgoing(message, this.#scope.docGuard)
-        if (out) this.#worker.postMessage({ type: 'send', message: out })
+        if (out && this.#ephemeralDedupe.shouldSend(out)) this.#worker.postMessage({ type: 'send', message: out })
     }
 
     disconnect(): void {

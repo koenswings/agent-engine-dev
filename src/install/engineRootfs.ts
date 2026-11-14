@@ -20,7 +20,7 @@ import { print } from '../utils/utils.js'
 import {
     EngineLock, FIRSTBOOT_SCRIPT, FIRSTBOOT_UNIT, IMAGE_LOCK_PATH, IMAGE_VERSION_PATH, PM2_UNIT, PRELOAD_DOCKER_DIR, PRELOAD_NPM_DIR, SSH_REGEN_UNIT, SSH_HOSTKEYS_UNIT, NPM_OFFLINE_ENV,
     firstbootUnitText, pm2UnitText, sshHostKeysUnitText, preloadManifest, readDpkgStatus, rpiArchivePackageNames, sanitiseRootfs, serialiseLock, verifyRootfsChecks,
-    IMAGE_SPARSE_PATTERNS, writeBootSshTrigger, PI_LOGIN_SHELL, USERCONFIG_UNIT, RENAME_USER_SSHD_DROPIN,
+    IMAGE_SPARSE_PATTERNS, writeBootSshTrigger, writeKernelCmdlineFlags, PI_LOGIN_SHELL, USERCONFIG_UNIT, RENAME_USER_SSHD_DROPIN,
     LOGIN_SSHD_ASSET, LOGIN_SSHD_DROPIN, OPERATOR_KEYS_ASSET, OPERATOR_KEYS_DIR, OPERATOR_KEYS_FILE,
 } from './engineImage.js'
 
@@ -259,13 +259,14 @@ export const rootfsSteps = (o: RootfsBuildOptions, r: Runner, inst: Installers):
             await exec`chown root:root /etc/ssh/sshd_config.d/10-idea-login.conf`
             await exec`chmod 0644 /etc/ssh/sshd_config.d/10-idea-login.conf`
         } },
-        { name: 'sanitise (no device identity) + bootfs ssh trigger', run: async () => {
+        { name: 'sanitise (no device identity) + bootfs ssh trigger + kernel cmdline', run: async () => {
             await r.host(`rm -rf ${q(R(`${E}/deb-cache`))}`)
             const changed = await sanitiseRootfs({ root: o.rootfs, enginePath: E, trackedStoreIdentity: o.trackedStoreIdentity })
             print(`sanitise: ${changed.length ? changed.join(', ') : 'nothing to do'}`)
             const boot = o.boot ?? R('boot/firmware')
             const trigger = await writeBootSshTrigger(boot)
             print(`bootfs ssh trigger: ${trigger}`)
+            print(`kernel cmdline: ${await writeKernelCmdlineFlags(boot)}`) // koenswings/idea#518 memory cgroup
         } },
     ]
 }

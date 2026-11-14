@@ -27,6 +27,7 @@ import { addBackupLink, removeBackupLink } from "./BackupLinks.js";
 import { setBackupMode } from './BackupModeCommand.js'
 import { cancelOperation } from './Operations.js';
 import { DiskArgResult, lookupDiskArg, resolveDiskArg } from './DiskArg.js';
+import { pickLocalBackupDisk, localBackupDisks, localEngineName, noLocalBackupDiskMessage } from './LocalBackupDisk.js';
 import { createFilesDisk } from './CreateFilesDisk.js';
 import { summariseDisk, attachTraceResult } from './SummariseDisk.js';
 import { eraseDisk } from './EraseDisk.js';
@@ -229,14 +230,26 @@ const startInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instan
         : 'console-command'
     const store = storeHandle.doc()
     const instance = resolveInstanceArg(store, instanceName, 'startInstance', diskName)
+    const requested = (getDisk(store, diskName as unknown as DiskID) ?? findDiskByName(store, diskName))
+    // engine#381: during a keep-id cross-Engine move, start the folder on the
+    // command's target disk (not storedOn, which still names the source) and
+    // do not write Running/lastStarted onto the shared row until after verify.
+    let deferStoreStatus = false
+    if (requested && String(requested.dockedTo) === String(localEngineId)) {
+        const { isInFlightKeepIdMove } = await import('./MoveAppRemote.js')
+        deferStoreStatus = isInFlightKeepIdMove(store, String(instance.id), String(requested.id))
+    }
     // Look up disk by ID from instance.storedOn — same fix as stopInstanceWrapper.
     // findDiskByName uses getDisks() which filters dockedTo != null and misses
     // disks that appear undocked in the CRDT but are physically still attached.
-    const disk = (instance.storedOn ? getDisk(store, instance.storedOn) : undefined) ?? findDiskByName(store, diskName)
+    // An in-flight keep-id move is the exception: prefer the requested disk.
+    const disk = (deferStoreStatus ? requested : undefined)
+        ?? (instance.storedOn ? getDisk(store, instance.storedOn) : undefined)
+        ?? findDiskByName(store, diskName)
     if (!disk) throw new Error(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`)
     // #239 (Steve): await the start too, so a stopInstance queued behind it cannot run mid-start
     // and the start trace closes only once the start is done.
-    await startInstance(storeHandle, instance, disk, cause)
+    await startInstance(storeHandle, instance, disk, cause, deferStoreStatus ? { deferStoreStatus: true } : {})
 }
 
 const runInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName) => {
@@ -291,9 +304,11 @@ const rebootWrapper = async (storeHandle: DocHandle<Store> | null) => {
 export { resolveInstanceArg } from './InstanceArg.js'
 
 /**
- * backupApp <instanceIdOrName> <backupDiskIdOrName> (idea#168 r29@97). The
+ * backupApp <instanceIdOrName> [backupDiskIdOrName] (idea#168 r29@97, engine#394). The
  * instance goes through resolveInstanceArg, the disk through resolveDiskArg:
- * an id, or a unique name (a disk name with a warning).
+ * an id, or a unique name (a disk name with a warning). With no disk argument,
+ * only a Backup Disk docked on this Engine is used, preferring the instance's
+ * linked disk (engine#394).
  */
 const backupAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: string, backupDiskId?: string) => {
     // Refusals throw so the command-log trace closes as error (idea#122).
@@ -301,17 +316,18 @@ const backupAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceAr
     const store = storeHandle.doc()
     const instance = resolveInstanceArg(store, instanceArg, 'backupApp')
     const instanceName = instance.name
+    const engineId = getLocalEngine(store)?.id
 
-    // Find backup disk: by id or unique name, or first linked docked Backup Disk
+    // Find backup disk: by id or unique name, or a Backup Disk docked on this
+    // Engine (prefer the instance's linked disk). Never a disk docked elsewhere.
     let backupDisk = backupDiskId
-        ? resolveDiskArg(store, getLocalEngine(store)?.id, backupDiskId, 'backupApp')
-        : Object.values(store.diskDB).find(d =>
-            d.device != null &&
-            d.diskTypes?.includes('backup') &&
-            d.backupConfig?.links.includes(instance.id)
-          )
+        ? resolveDiskArg(store, engineId, backupDiskId, 'backupApp')
+        : pickLocalBackupDisk(store, engineId, instance.id)
 
     if (!backupDisk) {
+        if (!backupDiskId && localBackupDisks(store, engineId).length === 0) {
+            throw new Error(noLocalBackupDiskMessage(localEngineName(store)))
+        }
         throw new Error(`No docked Backup Disk found linked to instance '${instanceName}'.`)
     }
     print(chalk.blue(`Backing up instance '${instanceName}' to disk '${backupDisk.name}' (${backupDisk.id})...`))
@@ -547,6 +563,17 @@ const verifyMoveTargetWrapper = async (storeHandle: DocHandle<Store> | null, opI
     print(v.ok ? chalk.green(`Move copy ${instanceId} checks out`) : chalk.yellow(`Move copy ${instanceId} does not check out: ${v.detail}`))
 }
 
+/** cleanupMoveTarget <opId> <instanceId> <targetDiskId> (engine#388): sent Engine → Engine after a pre-flip move failure. The target refuses a late or duplicate cleanup unless this op is the latest moveApp for the instance and is in a terminal non-success state. */
+const cleanupMoveTargetWrapper = async (storeHandle: DocHandle<Store> | null, opId: string, instanceId: string, targetDiskId: string) => {
+    if (!storeHandle) throw new Error('Store is not available.')
+    const { cleanupMoveTarget } = await import('./MoveAppRemote.js')
+    const r = await cleanupMoveTarget(storeHandle, opId, instanceId, targetDiskId)
+    attachTraceResult(r)
+    print(r.status === 'quarantined'
+        ? chalk.green(`Move target copy ${instanceId} quarantined`)
+        : chalk.yellow(`Move target copy ${instanceId} was not quarantined: ${r.detail}`))
+}
+
 export type EjectTarget = DiskArgResult
 
 /**
@@ -613,6 +640,25 @@ const ejectDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskIdOrNa
     print(chalk.green(`Disk ${label} ejected successfully.`));
 }
 
+/** setupDemo <targetDiskId> [--apps kolibri,nextcloud] (engine#369). Trace args: { targetDiskId, apps }. */
+const setupDemoWrapper = async (storeHandle: DocHandle<Store> | null, targetDiskId: string, ...rest: string[]) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    const { setupDemo, parseAppsFlag } = await import('./DemoApps.js')
+    const apps = parseAppsFlag(rest)
+    const result = await setupDemo(storeHandle, targetDiskId, apps, undefined, {}, { explicitApps: rest.includes('--apps') })
+    attachTraceResult(result)
+    print(chalk.green(`setupDemo: ${result.code} (${result.apps.map(a => `${a.app} ${a.instanceId}`).join(', ')})`))
+}
+
+/** removeDemo [<instanceId>...] (engine#369). Trace args: { instanceIds }. Bare form removes every docked demo. */
+const removeDemoWrapper = async (storeHandle: DocHandle<Store> | null, ...instanceIds: string[]) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    const { removeDemo } = await import('./DemoApps.js')
+    const result = await removeDemo(storeHandle, instanceIds)
+    attachTraceResult(result)
+    print(chalk.green(`removeDemo: ${result.code} (${result.removed.length} instance(s))`))
+}
+
 export const commands: CommandDefinition[] = [
     { name: "ls", execute: ls, args: [], scope: 'any' },
     { name: "engines", execute: lsEngines, args: [], scope: 'any' },
@@ -650,12 +696,15 @@ export const commands: CommandDefinition[] = [
     { name: "copyApp", execute: copyAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
     { name: "moveApp", execute: moveAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
     { name: "verifyMoveTarget", execute: verifyMoveTargetWrapper, args: [{ type: "string", name: "opId" }, { type: "string", name: "instanceId" }, { type: "string", name: "expectedBytes" }, { type: "string", name: "expectRunning" }], scope: 'engine' },
+    { name: "cleanupMoveTarget", execute: cleanupMoveTargetWrapper, args: [{ type: "string", name: "opId" }, { type: "string", name: "instanceId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
     { name: "ejectDisk", execute: ejectDiskWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
     { name: "forgetDisk", execute: forgetDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "options", variadic: true, optional: true }], scope: 'engine' },
     // backupApp / restoreApp (idea#168): the instance is an id or unique name, the disk
-    // an id or unique docked name (resolveInstanceArg / resolveDiskArg). The trace arg
-    // keys stay 'instanceName' / 'backupDiskId' (Console trace filters read them).
-    { name: "backupApp", execute: backupAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
+    // an id or unique docked name (resolveInstanceArg / resolveDiskArg). backupApp's
+    // disk is optional (engine#394): omitted, the wrapper picks a Backup Disk docked
+    // on this Engine. The trace arg keys stay 'instanceName' / 'backupDiskId'
+    // (Console trace filters read them; backupDiskId is null when omitted).
+    { name: "backupApp", execute: backupAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId", optional: true }], scope: 'engine' },
     { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "mode" }, { type: "string", name: "instanceNames", variadic: true }], scope: 'engine' },
     { name: "listBackup", execute: listBackupWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }, { type: "string", name: "archive", variadic: true, optional: true }], scope: 'engine' },
@@ -688,11 +737,14 @@ export const commands: CommandDefinition[] = [
     { name: "initialiseDisk", execute: async (storeHandle: DocHandle<Store> | null, candidateId: string, role?: string) => {
         if (!storeHandle) throw new Error('Store is not available.')
         await initialiseDisk(storeHandle, candidateId, role ?? 'empty')
-    }, args: [{ type: "string", name: "candidateId" }, { type: "string", name: "role", optional: true }], scope: 'engine' },
+    }, args: [{ type: "string", name: "candidateId" }, { type: "string", name: "role" }], scope: 'engine' },
+
     { name: "cancelOperation", execute: async (storeHandle: DocHandle<Store> | null, opId: string) => {
         if (!storeHandle) throw new Error('Store is not available.')
         const err = cancelOperation(storeHandle, opId)
         if (err) throw new Error(`cancelOperation: ${err}`)
         print(chalk.green(`Operation ${opId} cancelled`))
     }, args: [{ type: "string" }], scope: 'engine' },
+    { name: "setupDemo", execute: setupDemoWrapper, args: [{ type: "string", name: "targetDiskId" }, { type: "string", name: "apps", optional: true, variadic: true }], scope: 'engine' },
+    { name: "removeDemo", execute: removeDemoWrapper, args: [{ type: "string", name: "instanceIds", variadic: true, optional: true }], scope: 'engine' },
 ];

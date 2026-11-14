@@ -17,6 +17,8 @@ import { borgPresence } from '../../src/utils/appDataHelper.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
 import {
     normalizeBackupExclude, parseBackupExcludeList, excludeStaysInside, BACKUP_EXCLUDE_HELPER_MIN,
+    parseSnapshotExcludeList, parseSnapshotExcludeTokens, normalizeSnapshotExclude, isSnapshotExcludePath,
+    SNAPSHOT_EXCLUDE_MAX, SNAPSHOT_EXCLUDE_MAX_LEN,
 } from '../../src/utils/backupExclude.js'
 
 describe('normalizeBackupExclude / parseBackupExcludeList', () => {
@@ -207,5 +209,44 @@ describe('backupInstance honours x-app.backup.exclude (idea#443)', () => {
         const log = await calls()
         expect(log.some(l => l === 'version' || l.startsWith('version '))).toBe(false)
         expect(log.find(l => l.startsWith('borg-create '))).toMatch(new RegExp(`^borg-create ${backupDevice} ${INST} \\d{4}-\\d{2}-\\d{2}T[0-9-]+Z ${appDevice}$`))
+    })
+})
+
+
+describe('snapshot / estimate excludes (idea#396, helper v14)', () => {
+    it('a bare name becomes data/<name>; only data or data/<rel> is allowed', () => {
+        expect(normalizeSnapshotExclude('keys')).toBe('data/keys')
+        expect(normalizeSnapshotExclude('data/keys')).toBe('data/keys')
+        expect(normalizeSnapshotExclude('data')).toBe('data')
+        expect(isSnapshotExcludePath('data/keys')).toBe(true)
+        expect(isSnapshotExcludePath('.env')).toBe(false)
+        expect(() => normalizeSnapshotExclude('.env')).toThrow(/must be data or a path under data/)
+        expect(() => normalizeSnapshotExclude('volumes/db')).toThrow(/must be data or a path under data/)
+        expect(() => normalizeSnapshotExclude('backup/daily')).toThrow(/must be data or a path under data/)
+        expect(() => normalizeSnapshotExclude('../etc')).toThrow()
+        expect(() => normalizeSnapshotExclude('-rf')).toThrow(/option/)
+    })
+
+    it('limits are 256 characters after trim and 32 unique entries', () => {
+        expect(SNAPSHOT_EXCLUDE_MAX).toBe(32)
+        expect(SNAPSHOT_EXCLUDE_MAX_LEN).toBe(256)
+        expect(() => normalizeSnapshotExclude('x'.repeat(257))).toThrow(/longer than 256/)
+        expect(normalizeSnapshotExclude('  ' + 'k'.repeat(250) + '  ')).toBe(`data/${'k'.repeat(250)}`)
+        const many = Array.from({ length: 33 }, (_, i) => `p${i}`)
+        expect(() => parseSnapshotExcludeTokens(many)).toThrow(/more than 32 entries/)
+        const thirtyTwo = Array.from({ length: 32 }, (_, i) => `p${i}`)
+        expect(parseSnapshotExcludeTokens(thirtyTwo)).toHaveLength(32)
+        // de-duplication is first-occurrence; duplicates do not count toward the cap
+        expect(parseSnapshotExcludeTokens([...thirtyTwo, 'p0', 'p1'])).toHaveLength(32)
+    })
+
+    it('reads top-level x-app.snapshotExclude, not backup.exclude, and fails closed', () => {
+        expect(parseSnapshotExcludeList(undefined)).toEqual([])
+        expect(parseSnapshotExcludeList({})).toEqual([])
+        expect(parseSnapshotExcludeList({ backup: { exclude: ['keys'] } })).toEqual([])
+        expect(parseSnapshotExcludeList({ snapshotExclude: ['cache', './data/cache', 'tmp'] })).toEqual(['data/cache', 'data/tmp'])
+        expect(() => parseSnapshotExcludeList({ snapshotExclude: 'cache' })).toThrow(/must be a list/)
+        expect(() => parseSnapshotExcludeList({ snapshotExclude: [1] })).toThrow(/must be strings/)
+        expect(() => parseSnapshotExcludeList({ snapshotExclude: ['volumes/x'] })).toThrow(/must be data or a path under data/)
     })
 })

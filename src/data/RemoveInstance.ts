@@ -51,7 +51,7 @@ import type { InstanceID } from './CommonTypes.js'
 import { lookupLocalInstanceArg } from './InstanceArg.js'
 import { diskPath, appDataRoot, Disk } from './Disk.js'
 import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
-import { runAppData, removalQuarantineArgs, helperAtLeast } from '../utils/appDataHelper.js'
+import { runAppData, removalQuarantineArgs, quarantineSnapshotArgs, parseQuarantineSnapshot, helperAtLeast } from '../utils/appDataHelper.js'
 import { log } from '../utils/utils.js'
 import { composeDownAt, pruneUnusedInstanceNetworks, COMPOSE_PROJECT_LABEL } from '../utils/instanceNetworks.js'
 import { checkInstanceIdForDocker, composeProjectFor } from '../utils/instanceIds.js'
@@ -103,10 +103,19 @@ export interface RemoveDeps {
     removeProjectContainers: (id: InstanceID) => Promise<void>
     listVolumes: (id: InstanceID) => Promise<string[]>
     quarantine: (disk: Disk, id: InstanceID) => Promise<string>
+    /** idea#396 / helper v14: move .pre-update/<id> aside (strict ids only). */
+    quarantineSnapshot: (disk: Disk, id: InstanceID) => Promise<string>
     /** Refresh Disk.preUpdateSnapshots / preUpdateBytes / quarantineBytes (idea#428). */
     refreshSnapshots: (disk: Disk) => Promise<void>
     /** idea#468: prune unused compose-project networks for this instance, locally. */
     pruneNetworks: (id: InstanceID) => Promise<void>
+    /**
+     * Internal callers only (removeDemo): reuse the instance lock the caller
+     * already holds. The CLI / other commands must not set this. The lock is
+     * reused only when it is already held by `removeDemo`; a different holder
+     * still refuses BUSY. This function does not release a reused lock.
+     */
+    alreadyLocked?: boolean
 }
 
 const defaultDeps: RemoveDeps = {
@@ -121,8 +130,35 @@ const defaultDeps: RemoveDeps = {
         } catch { return [] }
     },
     quarantine: async (disk, id) => (await runAppData(removalQuarantineArgs(await appDataRoot(disk), String(id)))).trim(),
+    quarantineSnapshot: async (disk, id) => parseQuarantineSnapshot(await runAppData(quarantineSnapshotArgs(await appDataRoot(disk), String(id)))),
     refreshSnapshots: async () => { /* replaced in removeInstance with a storeHandle-bound default */ },
     pruneNetworks: async (id) => { await pruneUnusedInstanceNetworks(String(id), REMOVAL) },
+}
+
+/**
+ * Compose-down and quarantine the instance folder on `disk` without deleting
+ * the instanceDB row (engine#381: source of a same-id cross-Engine move).
+ */
+export const quarantineInstanceOnDisk = async (
+    disk: Disk, instanceId: InstanceID, opts: { composeTimeoutSec?: number } = {},
+): Promise<{ quarantinePath: string }> => {
+    const timed = async <T>(step: string, fn: () => Promise<T>): Promise<T> => {
+        const t0 = Date.now()
+        try { return await fn() }
+        finally { log(`quarantineInstanceOnDisk ${instanceId}: ${step} ${Date.now() - t0}ms`) }
+    }
+    const dir = await defaultDeps.instanceDir(disk, instanceId)
+    // composeTimeoutSec 0 is for a source that is already stopped (moveApp remove);
+    // cleanupMoveTarget omits it so a still-running Checking container is stopped normally.
+    if (opts.composeTimeoutSec !== undefined) {
+        await timed('composeDown', () => composeDownAt(dir, instanceId, undefined, { timeoutSec: opts.composeTimeoutSec }))
+    } else {
+        await timed('composeDown', () => defaultDeps.composeDown(dir, instanceId))
+    }
+    await timed('removeProjectContainers', () => defaultDeps.removeProjectContainers(instanceId))
+    const quarantinePath = await timed('quarantine', () => defaultDeps.quarantine(disk, instanceId))
+    try { await timed('pruneNetworks', () => defaultDeps.pruneNetworks(instanceId)) } catch { /* best effort */ }
+    return { quarantinePath }
 }
 
 const RUNNING_STATES = new Set(['Running', 'Starting'])
@@ -165,11 +201,15 @@ export const removeInstance = async (
     if (helper) throw new RemoveError('HELPER_OUTDATED', helper)
 
     const key = instanceKey(inst.id)
-    if (!resourceLock.acquire(key, 'removeInstance')) {
-        const kind = resourceLock.getLockInfo(key)?.kind ?? ''
-        if (BACKUP_KINDS.has(kind)) throw new RemoveError('BUSY_BACKUP', `instance '${inst.name}' is being backed up or restored; retry when it completes`)
-        if (MOVE_KINDS.has(kind)) throw new RemoveError('BUSY_MOVE', `instance '${inst.name}' is being copied or moved; retry when it completes`)
-        throw new RemoveError('BUSY', `instance '${inst.name}' is busy (${kind || 'another operation'}); retry when it completes`)
+    const held = resourceLock.getLockInfo(key)
+    const reused = d.alreadyLocked === true && held?.kind === 'removeDemo'
+    if (!reused) {
+        if (!resourceLock.acquire(key, 'removeInstance')) {
+            const kind = resourceLock.getLockInfo(key)?.kind ?? ''
+            if (BACKUP_KINDS.has(kind)) throw new RemoveError('BUSY_BACKUP', `instance '${inst.name}' is being backed up or restored; retry when it completes`)
+            if (MOVE_KINDS.has(kind)) throw new RemoveError('BUSY_MOVE', `instance '${inst.name}' is being copied or moved; retry when it completes`)
+            throw new RemoveError('BUSY', `instance '${inst.name}' is busy (${kind || 'another operation'}); retry when it completes`)
+        }
     }
     try {
         const disk = store.diskDB[inst.storedOn!] as Disk
@@ -183,6 +223,19 @@ export const removeInstance = async (
             throw new RemoveError('COMPOSE_DOWN_FAILED', msg)
         }
         const keptVolumes = await d.listVolumes(inst.id)
+        if (!idCheck.legacy) {
+            const snapHelper = await d.helperProblem(14)
+            if (!snapHelper) {
+                try {
+                    const dest = await d.quarantineSnapshot(disk, inst.id)
+                    log(dest
+                        ? `removeInstance: ${inst.id}: pre-update snapshot moved to ${dest}`
+                        : `removeInstance: ${inst.id}: no pre-update snapshot to quarantine`)
+                } catch (e) {
+                    log(`removeInstance: ${inst.id}: quarantine-snapshot failed: ${(e as Error).message}; continuing with the instance quarantine`)
+                }
+            }
+        }
         let quarantinePath: string
         try {
             quarantinePath = await d.quarantine(disk, inst.id)
@@ -216,6 +269,6 @@ export const removeInstance = async (
         }
         return { instanceId: inst.id, name: String(inst.name), quarantinePath, keptVolumes }
     } finally {
-        resourceLock.release(key)
+        if (!reused) resourceLock.release(key)
     }
 }

@@ -43,6 +43,8 @@ export const RECOVERY_STRATEGY: Record<OperationKind, RecoveryStrategy> = {
     flashCard:     'fail',    // idea#201: never retried; Failed 'INTERRUPTED: ...'
     initialiseDisk:'fail',    // idea#201: operator re-issues
     makeBackupDisk:'fail',    // idea#404: no resume; operator re-issues after an unplug
+    setupDemo:     'fail',    // engine#369: INTERRUPTED; press again to resume
+    removeDemo:    'fail',
 }
 
 // ── Operation CRUD ────────────────────────────────────────────────────────────
@@ -340,6 +342,14 @@ export const recoverInterruptedOperations = async (
         // removes the source; only a recorded verify means the copy is good.
         if (op.kind === 'moveApp' && op.move) {
             const verified = op.move.verified === true
+            const { cleanupUnverifiedMoveTarget, flipStoredOnAfterVerify } = await import('./MoveAppRemote.js')
+            if (!verified) {
+                await cleanupUnverifiedMoveTarget(storeHandle, op as any)
+            } else {
+                const id = String(op.move.sourceInstanceId ?? op.args?.instanceId ?? '')
+                const tgt = String(op.args?.targetDiskId ?? '')
+                if (id && tgt) flipStoredOnAfterVerify(storeHandle, id, tgt)
+            }
             const text = verified
                 ? 'MOVED, source not removed: the Engine restarted before the old copy was removed'
                 : 'MOVE FAILED: the Engine restarted during the move; source kept'
@@ -388,12 +398,17 @@ export const recoverInterruptedOperations = async (
                 : 'Engine restarted while operation was in progress — re-issue manually'
             // idea#201 §10: client-card operations carry a code the Console can map
             const isCardOp = op.kind === 'flashCard' || op.kind === 'initialiseDisk'
+            const isDemoOp = op.kind === 'setupDemo' || op.kind === 'removeDemo'
             const message = scheduledBackup
                 ? 'INTERRUPTED: Engine restarted during a scheduled backup — not retried; the stale lock is left for clearBackupLock, then backupApp (idea#446)'
-                : isCardOp ? `INTERRUPTED: ${base}` : base
+                : (isCardOp || isDemoOp) ? `INTERRUPTED: ${base}` : base
             if (cmdLogHandle) {
                 addTrace(cmdLogHandle, { traceId, command: op.kind, args: traceArgs, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
-                closeTrace(cmdLogHandle, traceId, 'error', message)
+                closeTrace(cmdLogHandle, traceId, 'error', message, null, isDemoOp ? 'INTERRUPTED' : undefined)
+            }
+            if (isDemoOp) {
+                const { markDemoInterrupted } = await import('./DemoApps.js')
+                markDemoInterrupted(storeHandle, op.id, message)
             }
             updateOperation(storeHandle, op.id, {
                 status: 'Failed',

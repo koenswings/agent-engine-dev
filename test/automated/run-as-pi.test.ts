@@ -116,7 +116,8 @@ describe('Engine sudoers asset (idea#80)', () => {
         // Meta.ts and Engine.ts runtime calls
         const meta = src('src/data/Meta.ts')
         expect(meta).toContain('$`sudo cat ${path}`')
-        expect(meta).toContain("$`sudo hdparm -I /dev/${device} | grep 'Serial\\ Number'`")
+        // engine#360: full path, via injected exec (defaults to zx $)
+        expect(meta).toContain("exec`sudo /usr/sbin/hdparm -I /dev/${device} | grep 'Serial\\ Number'`")
         expect(meta).toContain('$({ input: yamlContent })`sudo tee /META.yaml > /dev/null`')
         // App Disk META.yaml through 11-engine-files (idea#121)
         expect(meta).toContain('$({ input: content })`sudo ${SUDO_TEE} ${metaPath} > /dev/null`')

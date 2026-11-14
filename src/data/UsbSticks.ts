@@ -258,6 +258,12 @@ const publishToStore = async (storeHandle: DocHandle<Store>): Promise<void> => {
         const eng = doc.engineDB[id as any]
         if (eng) eng.usbSticks = list
     })
+    try {
+        const { refreshDemoHb } = await import('./DemoApps.js')
+        await refreshDemoHb(storeHandle, id)
+    } catch (e: any) {
+        log(`demo hb after USB update: ${e?.message ?? e}`)
+    }
 }
 
 /** The .idea-usb.json Apps read (Kid's contract, see docs/USB-STICKS.md). */

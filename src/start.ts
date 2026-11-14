@@ -8,7 +8,7 @@ import { startLiveness, writeLastSeen } from './data/Liveness.js'
 import { $, chalk, fs, sleep } from 'zx'
 import { deepPrint, log, print } from './utils/utils.js'
 import { config, peerAccessEnabled, peerStaleMs } from './data/Config.js'
-import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId, checkBackupCleanupCapability } from './data/Engine.js'
+import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId, checkBackupCleanupCapability, checkPreUpdateQuarantineCapability, checkDemoAppsCapability } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
 import { enableHttpMonitor } from './monitors/httpMonitor.js'
 import { enableIdeaLocalPublisher, IdeaLocalPublisher } from './monitors/ideaLocal.js'
@@ -17,10 +17,11 @@ import { startAutomergeServer } from './repo.js'
 import { enableMulticastDNSEngineMonitor } from './monitors/mdnsMonitor.js'
 import { startStaticPeers, staticPeersSetting } from './data/StaticPeers.js'
 import { createServerStore } from './data/Store.js'
-import { prepareStoreIdentity, storeIdentityPaths } from './data/StoreIdentity.js'
+import { assertStoreIdentityMatchesData, prepareStoreIdentity, refuseFleetStoreInIsolatedMode, storeIdentityPaths } from './data/StoreIdentity.js'
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
 import { recoverInterruptedOperations, archiveOldOperations } from './data/Operations.js'
 import { startBackupScheduler } from './monitors/backupScheduler.js'
+import { startPreUpdateQuarantine } from './monitors/preUpdateQuarantine.js'
 import { enableDockerMetricsMonitor } from './monitors/dockerMetricsMonitor.js'
 import { enableDiskSizeMonitor } from './data/DiskSize.js'
 import { ensureEngineStateDir, setFilesMountStore } from './data/FilesMount.js'
@@ -76,6 +77,14 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     const STORE_IDENTITY_PATH = "./"+config.settings.storeIdentityFolder
     const storeIdentity = storeIdentityPaths(STORE_IDENTITY_PATH)
 
+    // engine#391: if store-data already holds documents, refuse when the identity
+    // is unusable or names a document that is not in store-data. Read-only, and
+    // runs before any mkdir or prepareStoreIdentity write. Override:
+    // --allow-new-store or IDEA_ALLOW_NEW_STORE=1 (never set by the image or pm2).
+    // Throws StoreIdentityMismatchError (code STORE_IDENTITY_MISMATCH); index.ts
+    // logs it and process.exit(1), so pm2 restarts are visible in the Engine log.
+    assertStoreIdentityMatchesData({ identityDir: STORE_IDENTITY_PATH, dataDir: STORE_DATA_PATH })
+
     // Create the store data directory if it does not yet exist
     if (!fs.existsSync(STORE_DATA_PATH)) {
         log(`Creating the store data folder at ${STORE_DATA_PATH}`)
@@ -88,12 +97,19 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         await $`mkdir -p ${STORE_IDENTITY_PATH}`
     }
 
-    // Store identity (idea#120): a missing store-url.txt is written back with the
-    // shared fleet store URL; an existing one is used as it is. store-template.json
-    // is never written; if it is missing, startup stops with a clear error.
+    // Store identity (idea#120): a missing store-url.txt stops startup unless
+    // IDEA_ALLOW_STORE_URL_FALLBACK=true, in which case it is written back with
+    // the shared fleet store URL; an existing one is used as it is.
+    // store-template.json is never written; if it is missing, startup stops
+    // with a clear error.
     // Read BEFORE the Automerge server starts: the Repo's peerId carries the store
     // tag, so the Engine only ever peers with Engines of this store (StoreScope.ts).
     const { storeDocId, restored, fallback } = await prepareStoreIdentity(storeIdentity)
+    // engine#362: a test/fixture Engine must not open a known fleet store
+    refuseFleetStoreInIsolatedMode(storeDocId, {
+        testMode: config.settings.testMode,
+        watchDirSet: !!process.env.IDEA_WATCH_DIR,
+    })
     if (restored) print(chalk.yellow(`store-url.txt was missing: restored the fleet store URL`))
     if (fallback) print(chalk.bgRed.white(`store-url.txt was restored by the Engine (store-identity/store-url.restored): peer access fails closed until Ops confirms the store`))
     log(`Using document ID: ${storeDocId}`)
@@ -122,10 +138,13 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // backupCleanup capability: one helper version check, never fatal (idea#400 §3.1).
     // Must run before createOrUpdateEngine writes Engine.capabilities.
     await checkBackupCleanupCapability()
+    await checkPreUpdateQuarantineCapability()
+    checkDemoAppsCapability()
 
     // Create or update the local engine object
     const engine = await createOrUpdateEngine(storeHandle, localEngineId)
     await storeHandle.whenReady()
+    await import('./data/DemoApps.js').then(m => m.refreshDemoHb(storeHandle, String(localEngineId))).catch(e => log(`demo hb: ${e}`))
     const store = storeHandle.doc()
 
     // Remove any phantom engine entries and orphan disks that accumulated
@@ -156,6 +175,9 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     await import('./data/UpdateApp.js').then(m => m.recoverInterruptedUpdates(storeHandle, String(localEngineId)))
         .then(r => r.forEach(line => log(`recoverInterruptedUpdates: ${line}`)))
         .catch(e => log(`recoverInterruptedUpdates failed: ${e}`))
+    // idea#76: recompute updateAvailable at boot (stale hints from before the restart go)
+    await import('./data/UpdateApp.js').then(m => m.refreshUpdateAvailable(storeHandle, String(localEngineId)))
+        .catch(e => log(`updateAvailable refresh at boot failed: ${e}`))
 
     // Crash recovery: retry idempotent interrupted ops; mark others Failed
     await recoverInterruptedOperations(storeHandle, {
@@ -288,11 +310,12 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // Liveness without store history (store-design 2026-10-13): ephemeral hb every
     // 10 s, stored lastRun at boot + hourly (Liveness.ts)
     writeLastSeen(storeHandle, String(localEngineId), Date.now(), 0, true)
-    startLiveness(storeHandle, String(localEngineId))
+    // idea#400: scheduled Backup Disks run from a 60 s tick inside the Engine (never host cron)
+    const scheduler = startBackupScheduler(storeHandle)
+    startLiveness(storeHandle, String(localEngineId), { clockStatus: () => scheduler.clockStatus() })
+    startPreUpdateQuarantine(storeHandle)
     // The heartbeat timer still repairs this Engine's peerAccess, expires stale
     // peers and archives old operations; it no longer writes to the store itself
-    // idea#400: scheduled Backup Disks run from a 60 s tick inside the Engine (never host cron)
-    startBackupScheduler(storeHandle)
 
     enableTimeMonitor(heartbeatIntervalMs, () => {
         archiveOldOperations(storeHandle).catch(e => print(chalk.red(`archive operations: ${e}`)))

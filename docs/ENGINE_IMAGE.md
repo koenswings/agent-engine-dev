@@ -102,6 +102,12 @@ No SSH, nothing started, no device identity. Inside `chroot <MNT>`:
     `ssh-no-password` fails if `10-idea-login.conf` is missing, or the effective `PasswordAuthentication` or
     `KbdInteractiveAuthentication` (or its alias `ChallengeResponseAuthentication`) is not `no`, or a `Match` block
     turns either back on.
+    `kernel-cmdline` (koenswings/idea#518) fails unless `<boot>/cmdline.txt` is exactly one line carrying
+    `cgroup_enable=memory` exactly once, and also fails when a `cgroup_disable=memory` follows it (the later one wins; the firmware's
+    earlier one is fine). Both `ssh-first-boot` and `kernel-cmdline` find the bootfs the same way (`--boot`, else
+    `<root>/boot/firmware`, else `<root>/boot`) and fail when none is found. The sanitise step appends it (`KERNEL_CMDLINE_FLAGS`; same line, idempotent),
+    because the Raspberry Pi firmware passes `cgroup_disable=memory` and Docker then has no memory accounting
+    (`docker stats` 0B, `idea/metrics` memUsageBytes 0). Post-boot check: `memory` in `/sys/fs/cgroup/cgroup.controllers`.
 
 `engine-build.json`: `{engine_commit, engine_version, lock_sha256, verify: {passed, failed}}` (failed = the problems).
 
@@ -115,7 +121,13 @@ The bootfs `ssh` trigger is present at flash time; `sshswitch.service` enables s
 `passwd -S pi` shows L (key-only; password auth is off). systemd writes a machine-id. `idea-engine-firstboot`
 (`script/build_image_assets/idea-engine-firstboot`) loads the preloaded images (sha256 and image id checked), creates
 the docker networks, installs pm2-logrotate from the preloaded tarball and, as pi, starts the Engine with
-`pm2.config.cjs` and `pm2 save`; `pm2-pi.service` resurrects it on later boots. The Engine creates `/META.yaml` itself
+`pm2.config.cjs` and `pm2 save`; `pm2-pi.service` resurrects it on later boots. Sanitise has already removed
+`store-data`, so first boot starts with an empty store-data and the git-tracked `store-identity/` (including
+`store-url.txt`). The engine#391 store-identity guard lets that start: empty store-data takes the normal create
+path, which imports `store-template.json` under the shipped store-url document. A pre-seeded `store-data` is not
+part of the image; if one is added, it must already contain that document, or the Engine refuses with
+`STORE_IDENTITY_MISMATCH`. The first-boot unit and `pm2.config.cjs` must not set `--allow-new-store` or
+`IDEA_ALLOW_NEW_STORE`. The Engine creates `/META.yaml` itself
 at its first start (`ensureSystemMeta`: root drive serial, else a UUID); a `/META.yaml` without a diskId also gets a
 UUID (`diskIdWithoutHardware`), never `ENGINE_undefined`.
 

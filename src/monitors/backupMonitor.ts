@@ -21,7 +21,7 @@
 import { $, YAML, chalk, fs } from 'zx'
 import { log, print } from '../utils/utils.js'
 import { disksRoot, skipBorg } from '../data/Config.js'
-import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot, appDataRoot, joinMountRoot } from '../data/Disk.js'
+import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot, appDataRoot, joinMountRoot, backupOrphanLinks, syncBackupOrphanLinks } from '../data/Disk.js'
 import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgProblem, helperAtLeast } from '../utils/appDataHelper.js'
 import { parseBackupExcludeList, parseBackupHookExcludeList, mergeBackupExcludeLists, BACKUP_EXCLUDE_HELPER_MIN } from '../utils/backupExclude.js'
 import { backupCleanupRunner, backupDiskFullError, cleanupIsEnabled } from '../utils/backupCleanup.js'
@@ -44,6 +44,7 @@ export const backupLifecycle = {
 }
 import { BackupMode, BackupMethodUsed, DiskID, DiskName, InstanceID, Timestamp, OperationCause, Operation } from '../data/CommonTypes.js'
 import { Store, getInstance, getDisks, findDiskByName, getLocalEngine } from '../data/Store.js'
+import { isDockedOnEngine, localEngineName, noLocalBackupDiskMessage } from '../data/LocalBackupDisk.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js'
 import { runWithTrace, flushTrace, getActiveTrace } from '../utils/CommandLogger.js'
@@ -183,6 +184,13 @@ export const backupInstance = async (
     cause: OperationCause = 'console-command',
     preUpdate?: PreUpdateBackupOptions,
 ): Promise<void> => {
+    const instRecEarly = getInstance(storeHandle.doc(), instanceId)
+    if (instRecEarly && (instRecEarly as any).demo === true) {
+        if (cause === 'console-command') throw new Error(`NOT_DEMO: instance ${instanceId} is a demo instance; demo instances are excluded from backups`)
+        log(`Backup of demo instance ${instanceId} skipped`)
+        return
+    }
+
     // If there is no active trace (called from backup monitor, not via Console command),
     // create one so that step markers and log lines land in the Console log panel.
     // The pre-update backup reports its errors to updateApp, so it never swallows them.
@@ -253,8 +261,12 @@ export const backupInstance = async (
         }
 
         const appDisk = store.diskDB[instance.storedOn]
-        if (!appDisk || !appDisk.device) {
+        const localId = getLocalEngine(store)?.id ?? localEngineId
+        if (!isDockedOnEngine(appDisk, localId)) {
             throw new Error(`App Disk for instance ${instanceId} is not docked`)
+        }
+        if (!isDockedOnEngine(backupDisk, localId)) {
+            throw new Error(noLocalBackupDiskMessage(localEngineName(store)))
         }
 
         const backupDevice = backupDisk.device!
@@ -632,10 +644,19 @@ export const processBackupDisk = async (
         const d = doc.diskDB[backupDisk.id]
         if (!d) return
         // scheduleError: the marker the Console shows for an invalid schedule (Steve, #347 call 5)
-        d.backupConfig = { mode, links, schedule: yaml.schedule ? { daily: yaml.schedule.daily } : null, scheduleError: yaml.scheduleError }
+        d.backupConfig = {
+            mode, links,
+            schedule: yaml.schedule ? { daily: yaml.schedule.daily } : null,
+            scheduleError: yaml.scheduleError,
+            orphanLinks: backupOrphanLinks(doc, links),
+        }
         if ((d.missedRuns ?? null) !== yaml.missedRuns) d.missedRuns = yaml.missedRuns
         if ((d.lastAttempt ?? null) !== yaml.lastAttempt) d.lastAttempt = yaml.lastAttempt as Timestamp | null
     })
+    const orphans = storeHandle.doc()!.diskDB[backupDisk.id]?.backupConfig?.orphanLinks ?? []
+    if (orphans.length) {
+        log(`Backup Disk ${backupDisk.id}: ${orphans.length} linked instance(s) not in the store (orphanLinks): ${orphans.join(', ')}`)
+    }
 
     // Phase 2: index any app bundles on this disk into appDB for installApp / Console
     await indexBackupDiskApps(storeHandle, backupDisk)
@@ -653,7 +674,15 @@ export const processBackupDisk = async (
                 continue
             }
             const instance = getInstance(store, instanceId)
-            if (!instance?.storedOn) continue
+            if (!instance) {
+                log(`Instance ${instanceId}: not in the store; skipped (orphanLinks)`)
+                continue
+            }
+            if ((instance as any).demo === true) {
+                log(`Instance ${instanceId}: demo instance — skipped (engine#369)`)
+                continue
+            }
+            if (!instance.storedOn) continue
             const appDisk = store.diskDB[instance.storedOn]
             if (appDisk?.device) {
                 // idea#400 (Steve, #347 call 4): no caller waits on a dock backup, so a held lock records SKIPPED_LOCKED
@@ -678,6 +707,9 @@ export const checkPendingBackups = async (
 ): Promise<void> => {
     const store = storeHandle.doc()
 
+    // Instances may have just appeared (this App Disk docked); refresh orphanLinks without touching BACKUP.yaml.
+    syncBackupOrphanLinks(storeHandle)
+
     // Find all currently docked Backup Disks
     const dockedDisks = Object.values(store.diskDB).filter(d => d.device != null)
     for (const candidate of dockedDisks) {
@@ -691,6 +723,7 @@ export const checkPendingBackups = async (
 
         const staleIds = new Set((candidate.backupStaleLocks ?? []).map(l => String(l.instanceId)))
         for (const instance of instancesOnAppDisk) {
+            if ((instance as any).demo === true) continue
             if (!candidate.backupConfig.links.includes(instance.id)) continue
             const lockPath = candidate.device
                 ? `${disksRoot()}/${candidate.device}/backups/${instance.id}/${LOCK_FILE}`

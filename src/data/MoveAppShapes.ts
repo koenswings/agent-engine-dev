@@ -2,14 +2,19 @@
  * MoveAppShapes.ts — the cross-Engine moveApp contract (idea#79). See SHAPES.md
  * at the repo root of PR "moveApp across Engines" for the Console-facing summary.
  *
- * A cross-Engine move is a copy followed by a delete:
+ * A cross-Engine move keeps the same instance id (engine#381): the app moves,
+ * it is not copied. The target folder is instances/<same id>; there is no second
+ * instanceDB row, and lastBackup / Backup Disk links stay on that id.
  *   1. copying  — the existing cross-Engine copyApp path (ensure-dirs, receive-app,
  *                 send/receive, receive-files, receive-service on the peer helper)
- *   2. checking — the target Engine verifies the copy (registered on its disk,
- *                 instance data size matches, healthy when the source was running)
- *                 and records the verdict in this operation
- *   3. removing — only after a recorded, complete verify: the source is removed with
- *                 the safe removeInstance (helper v4 quarantine, never rm)
+ *                 with an internal dstId equal to the source id (not on the CLI)
+ *   2. checking — the target Engine verifies the folder on operation.args.targetDiskId
+ *                 (not storedOn: the source stays authoritative until after verify),
+ *                 instance data size matches, and the port-ready registry is stable
+ *                 when the source was running; the verdict is recorded here
+ *   3. removing — only after a recorded, complete verify: storedOn flips to the
+ *                 target disk, then only the source folder is quarantined (helper v4,
+ *                 never rm). removeInstance is not used, so the store row is kept.
  */
 
 /** Engine capability: this Engine can move an App to a disk on another Engine. */
@@ -38,20 +43,22 @@ export const MOVE_REFUSAL_CODES = [
     'HELPER_OUTDATED',    // this Engine's idea-app-data helper is older than v4
     'BUSY',               // the instance or target disk is locked by another operation
     'INVALID',            // other validation refusal (same disk, external links, ...)
+    'TARGET_EXISTS',      // the same id is already on the target disk / Engine (engine#381)
 ] as const
 export const MOVE_FAILURE_CODES = [
-    'COPY_FAILED',        // the copy failed
+    'COPY_FAILED',        // the copy did not finish (no target cleanup)
     'VERIFY_NOT_FOUND',   // the copy is not registered, or not on a disk docked to the target
     'VERIFY_NOT_RUNNING', // the source was running but the copy did not reach Running
     'VERIFY_SIZE',        // the copy's instance data size does not match
     'VERIFY_TIMEOUT',     // the target did not report a verdict in time
     'VERIFY_FAILED',      // fallback only: the target could not check (e.g. sizing error) or sent no code
     'INTERRUPTED',        // the Engine restarted before verify was recorded
+    'SOURCE_KEPT',        // pre-flip failure that is not SOURCE_CHANGED (engine#388), including a failed size measurement after a finished copy: source kept, not moved
 ] as const
 export const MOVE_DONE_CODES = [
     'MOVED',              // copied, verified, source quarantined
-    'SOURCE_NOT_REMOVED', // copied and verified, but removing the source failed (or restart after verify)
-    'SOURCE_CHANGED',     // copied and verified, but the source was started or written to during the move: kept
+    'SOURCE_NOT_REMOVED', // copied and verified, storedOn flipped, but removing the source failed (or restart after verify)
+    'SOURCE_CHANGED',     // copied and verified, but the source was started or written to during the move: kept (not flipped)
 ] as const
 export const MOVE_CODES = [...MOVE_REFUSAL_CODES, ...MOVE_FAILURE_CODES, ...MOVE_DONE_CODES] as const
 
@@ -80,7 +87,7 @@ export interface MoveProgress {
     phase: MovePhase
     targetEngineId: string
     sourceInstanceId: string
-    /** the instance id on the target (a fresh id, set once copying registered it) */
+    /** equal to the source id, set once the target folder is in place (engine#381) */
     targetInstanceId: string | null
     /** source instance data bytes measured before the copy */
     expectedBytes: number | null
@@ -90,10 +97,14 @@ export interface MoveProgress {
     /** true only after verify.ok was recorded — the one gate for removing the source */
     verified: boolean
     sourceRemoved: boolean
-    /** where removeInstance quarantined the source folder */
+    /** where the source folder was quarantined (the instance record is kept) */
     quarantinePath: string | null
+    /** Pre-flip failure only: whether the target copy was stopped and quarantined (engine#388). */
+    targetCleanup: 'quarantined' | 'failed' | null
+    /** Quarantine path on success, or why cleanup failed. */
+    targetCleanupDetail: string | null
     code: MoveCode | null
-    /** final text: MOVED to …, MOVE FAILED: … source kept, MOVED, source not removed: … */
+    /** final text: MOVED to …, MOVE FAILED: … source kept, MOVE STOPPED: … source kept, MOVED, source not removed: … */
     resultText: string | null
 }
 
@@ -111,6 +122,11 @@ export interface MoveResult {
 export const movedText = (engineName: string): string => `MOVED to ${engineName}`
 export const moveFailedText = (reason: string): string => `MOVE FAILED: ${reason.replace(/[.;\s]+$/, '')}; source kept`
 export const sourceNotRemovedText = (reason: string): string => `MOVED, source not removed: ${reason.replace(/[.;\s]+$/, '')}`
+/** SOURCE_CHANGED (pre-flip; source kept, not moved). */
+export const sourceKeptText = (reason: string): string => `MOVE STOPPED: ${reason.replace(/[.;\s]+$/, '')}; source kept`
+/** Append the engine#388 target-cleanup clause to a source-kept result text. */
+export const withTargetCleanupText = (text: string, cleanup: 'quarantined' | 'failed', targetName: string): string =>
+    `${text.replace(/[.;\s]+$/, '')}, ${cleanup === 'failed' ? `the leftover copy is on ${targetName}` : `the copy on ${targetName} was quarantined`}`
 
 export class MoveError extends Error {
     /** published as CommandTrace.result when the command fails (commandUtils.handleCommand) */

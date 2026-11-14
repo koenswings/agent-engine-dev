@@ -22,10 +22,11 @@ import { DocHandle } from "@automerge/automerge-repo";
 import { CommandLogStore, LogEntry, getCommandLogHandle, liveCommandLogHandle, addTrace, closeTrace, flushLogs } from './CommandLogStore.js'
 import { getActiveTrace, flushTrace } from '../utils/CommandLogger.js'
 import { dockerAvailable } from '../utils/dockerAvailable.js'
-import { composeProjectLabelFilter, containerInInstanceProject } from '../utils/instanceIds.js'
+import { composeProjectLabelFilter, containerInInstanceProject, isLegacyDottedInstanceId, LEGACY_DOTTED_INSTANCE_MESSAGE } from '../utils/instanceIds.js'
 import { rebindKolibriMorangoInstanceId } from './InstanceCopy.js'
 import { hostIdentity, writeHostIdentityEnv, nextcloudUrl, writeNextcloudUrlEnv, isNextcloudInstance, nextcloudTrustedDomainsBridge, hostNetworkInterfaces } from './HostIdentity.js'
 import { trackInFlight, startDiskGoneReason, dockIdentityOf } from './InstanceInFlight.js'
+import { setPortReadyProgress } from './PortReadyProgress.js'
 
 // ── Step-progress helpers ─────────────────────────────────────────────────────
 
@@ -203,6 +204,16 @@ export const setDeviceExistsCheckForTests = (fn: ((dev: string) => boolean) | nu
 const deviceExists = (): ((dev: string) => boolean) | null =>
   deviceExistsCheck !== undefined ? deviceExistsCheck : (config.settings.testMode ? null : (dev: string) => fs.existsSync(`/dev/${dev}`))
 
+/** idea#494: leave a legacy dotted instance listed as Error; no Docker, no .env write. */
+export const markLegacyDottedInstance = (storeHandle: DocHandle<Store>, instanceId: InstanceID): void => {
+  storeHandle.change(doc => {
+    const inst = doc.instanceDB[instanceId]
+    if (!inst) return
+    inst.status = 'Error' as Status
+    inst.statusCondition = LEGACY_DOTTED_INSTANCE_MESSAGE
+  })
+}
+
 export const markInstanceError = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, e: unknown): Promise<void> => {
   // hw180: a start that fails because its disk was pulled (undock pending, record undocked or
   // moved, device node gone) is not an app failure: the instance goes to Undocked, never Error.
@@ -282,6 +293,26 @@ export interface Instance {
   filesMounts?: DiskID[] | null;
   /** A newer, offerable bundle of this App on a docked disk (agent-engine-dev#230, console#168 shape); null when none. */
   updateAvailable?: UpdateAvailable | null;
+  /** App ID before the last successful updateApp ("Updated from 0.15.5", idea#76); null/absent otherwise. */
+  previousAppId?: AppID | null;
+  /**
+   * idea#396: when the Health gate last passed. `at` is wall ms if the clock was
+   * trusted then, otherwise null. Cleared after a successful (or no-op)
+   * quarantine-snapshot, a new snapshot of this id, a rollback, or removeInstance.
+   * Optional: do not add to store-template.json.
+   */
+  preUpdateGate?: { at: number | null, bootId: string, uptimeS: number } | null;
+  /** True only for a setupDemo instance (engine#369); mirrored from compose.yaml x-app.demo. Present only when true, never false. */
+  demo?: true;
+  /** On-disk demo pack is older than the running bundle's demo.pack.minVersion (engine#369). Set by updateApp, cleared by setupDemo. */
+  demoPackWarning?: DemoPackWarning | null;
+}
+
+/** engine#369 addendum decision 5 / contract: warning only, no auto-download. */
+export interface DemoPackWarning {
+  code: 'PACK_OUTDATED'
+  packVersion: number
+  minVersion: number
 }
 
 export interface UpdateAvailable {
@@ -746,6 +777,19 @@ export const extractAppName = (instanceId: InstanceID): InstanceName => {
   return instanceId.split('-')[0] as InstanceName
 }
 
+
+/** engine#369: Instance.demo is present only when compose x-app.demo is the boolean true. */
+export const demoFlagFromCompose = (compose: any): true | undefined =>
+  compose?.['x-app']?.demo === true ? true : undefined
+
+export const applyDemoFlag = (instance: Instance, compose: any): void => {
+  if (demoFlagFromCompose(compose)) instance.demo = true
+  else {
+    if ('demo' in instance) delete instance.demo
+    if (instance.demoPackWarning) instance.demoPackWarning = null
+  }
+}
+
 export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, instanceId: InstanceID, disk: Disk): Promise<Instance | undefined> => {
   let instance: Instance
   try {
@@ -778,8 +822,16 @@ export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, inst
           metrics: null,
           filesMounts: null,
         }
+        applyDemoFlag(instance, compose)
         doc.instanceDB[instanceId] = instance
       } else {
+        // engine#381: never claim an id whose storedOn is already a different disk
+        // (in-flight keep-id move, or a leftover source folder after storedOn flipped).
+        if (storedInstance.storedOn && String(storedInstance.storedOn) !== String(disk.id)) {
+          log(`createOrUpdateInstance: not claiming ${instanceId} on ${disk.id}; storedOn is already ${storedInstance.storedOn}`)
+          instance = storedInstance
+          return
+        }
         // Granularly update the existing instance object
         log(`Updating existing instance object ${instanceId} on disk ${disk.id}`)
         instance = storedInstance
@@ -794,6 +846,7 @@ export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, inst
         }
         instance.storedOn = disk.id
         instance.serviceImages = servicesImages as ServiceImage[]
+        applyDemoFlag(instance, compose)
 
       }
     })
@@ -1044,18 +1097,26 @@ export const assertInstancePortReady = async (
   let didRecreate = false
 
   log(`assertInstancePortReady: ${instanceId} :${port} probing (${probe}, budget ${readyTimeoutMs}ms, stable ${stableMs}ms)`)
+  const publishPortReady = (stableReached = false) => {
+    setPortReadyProgress(String(instanceId), { firstReadyAt, stableMs, stableReached })
+  }
+  publishPortReady()
 
   while (Date.now() < deadline) {
     const { tcp, ready } = await probeOnce()
     if (tcp) sawTcp = true
     if (ready) {
-      if (firstReadyAt === null) firstReadyAt = Date.now()
-      else if (Date.now() - firstReadyAt >= stableMs) {
+      if (firstReadyAt === null) {
+        firstReadyAt = Date.now()
+        publishPortReady()
+      } else if (Date.now() - firstReadyAt >= stableMs) {
         log(`assertInstancePortReady: ${instanceId} :${port} stable for ${stableMs}ms (${probe}${didRecreate ? ', after force-recreate' : ''})`)
+        publishPortReady(true)
         return
       }
-    } else {
+    } else if (firstReadyAt !== null) {
       firstReadyAt = null
+      publishPortReady()
     }
 
     // Recreate only when TCP never came up within min(60 s, budget), and only
@@ -1358,12 +1419,47 @@ export const versionDirName = (ref: string): string => {
 export const appCloneArgs = (gitAccount: string, appName: string, ref: string, dest: string): string[] =>
   ['clone', '--branch', ref, '--', `https://github.com/${gitAccount}/app-${appName}`, dest]
 
-/** #179: every start is tracked in flight on its disk so an eject waits for it to settle. */
-export const startInstance = (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> =>
-  trackInFlight(String(disk.id), `startInstance ${instance.id}`, startInstanceTracked(storeHandle, instance, disk, cause))
+/**
+ * idea#473: re-read x-app from the instance compose.yaml and update the store
+ * record through createOrUpdateInstance (no direct instanceOf edit). After a
+ * manual restore-snapshot the files can be an older version while the store
+ * still names the newer app; startInstance uses this so they agree again.
+ * If compose cannot be read, the existing record is kept and start continues.
+ */
+export const refreshInstanceFromCompose = async (
+  storeHandle: DocHandle<Store>,
+  instance: Instance,
+  disk: Disk,
+): Promise<Instance> => {
+  const updated = await createOrUpdateInstance(storeHandle, instance.id, disk)
+  return storeHandle.doc()?.instanceDB?.[instance.id] ?? updated ?? instance
+}
 
-const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> => {
+/** When true, compose/port-ready run on `disk` but instanceDB status, port, lastStarted and Error are not written (engine#381: keep-id move during Checking). */
+export type StartInstanceOpts = { deferStoreStatus?: boolean }
+
+/** #179: every start is tracked in flight on its disk so an eject waits for it to settle. */
+export const startInstance = (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command', opts: StartInstanceOpts = {}): Promise<void> =>
+  trackInFlight(String(disk.id), `startInstance ${instance.id}`, (async () => {
+    // engine#381: a deferred start skips refresh-from-compose so it cannot claim storedOn.
+    if (opts.deferStoreStatus) {
+      return startInstanceTracked(storeHandle, instance, disk, cause, opts)
+    }
+    const inst = await refreshInstanceFromCompose(storeHandle, instance, disk)
+    return startInstanceTracked(storeHandle, inst, disk, cause)
+  })())
+
+const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command', opts: StartInstanceOpts = {}): Promise<void> => {
   const store: Store = storeHandle.doc()
+  const deferStore = opts.deferStoreStatus === true
+
+  // idea#494: a legacy dotted id is listed so removeInstance can clear it, but
+  // it must never compose up, rewrite .env, or allocate a port.
+  if (isLegacyDottedInstanceId(String(instance.id))) {
+    markLegacyDottedInstance(storeHandle, instance.id)
+    throw new Error(LEGACY_DOTTED_INSTANCE_MESSAGE)
+  }
+
   print(`Starting instance '${instance.id}' on disk ${disk.id} of engine '${localEngineId}'.`)
 
   // Short-circuit: if containers are already running (e.g. engine restarted while app was up),
@@ -1375,9 +1471,9 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
       const projectFilter = composeProjectLabelFilter(String(instance.id))
       const ps = projectFilter ? await $`docker ps --filter ${projectFilter} --format {{.Names}}` : { stdout: '' }
       if (ps.stdout.trim().length > 0) {
-        log(`Instance '${instance.id}' containers already running — updating status to Running`)
+        log(`Instance '${instance.id}' containers already running — ${deferStore ? 'leaving store status unchanged (deferred start)' : 'updating status to Running'}`)
         const port = parseInt(await readEnvVariable(`${await diskMountRoot(disk)}/instances/${instance.id}/.env`, 'port') as string) || 0
-        storeHandle.change(doc => {
+        if (!deferStore) storeHandle.change(doc => {
           const inst = doc.instanceDB[instance.id]
           if (!inst) return  // #179: never write to (or resurrect) a deleted row
           inst.status = 'Running' as Status
@@ -1403,21 +1499,26 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
 
   // Create an Operation record so start progress appears in operationDB
   // alongside copy/move/backup ops and is visible to the UI uniformly.
-  const startOpId = createOperation(
+  // engine#381: a deferred start during a keep-id move must not write Starting
+  // (or a startApp op) onto the shared source-authoritative row.
+  const startOpId = deferStore ? null : createOperation(
     storeHandle, 'startApp',
     { instanceId: instance.id, diskId: disk.id },
     cause,
     { type: 'instance', id: instance.id },
   )
-  updateOperation(storeHandle, startOpId, { status: 'Running' })
+  if (startOpId) updateOperation(storeHandle, startOpId, { status: 'Running' })
 
-  // Set the instance status to Starting
-  log(`Setting instance '${instance.id}' status to Starting`)
-  storeHandle.change(doc => {
-    const inst = doc.instanceDB[instance.id]
-    if (!inst) return  // #179: never write to (or resurrect) a deleted row
-    inst.status = 'Starting' as Status
-  })
+  if (!deferStore) {
+    log(`Setting instance '${instance.id}' status to Starting`)
+    storeHandle.change(doc => {
+      const inst = doc.instanceDB[instance.id]
+      if (!inst) return  // #179: never write to (or resurrect) a deleted row
+      inst.status = 'Starting' as Status
+    })
+  } else {
+    log(`Starting instance '${instance.id}' on ${disk.id} without writing store status (deferred)`)
+  }
 
   // Start warnings not yet in a History entry (the start runs outside a
   // startInstance trace); recorded when the start ends.
@@ -1446,7 +1547,7 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
     // **************************
     // STEP 1 - Port generation
     // **************************
-    setStep(storeHandle, instance.id, 1, totalStartSteps, START_STEPS[1], startOpId)
+    if (!deferStore) setStep(storeHandle, instance.id, 1, totalStartSteps, START_STEPS[1], startOpId ?? undefined)
 
     // Generate a port  number for the app  and assign it to the variable port
     // Start from port number 3000 and check if the port is already in use by another app
@@ -1482,7 +1583,7 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
     // **************************
     // STEP 2 - Password generation
     // **************************
-    setStep(storeHandle, instance.id, 2, totalStartSteps, START_STEPS[2], startOpId)
+    if (!deferStore) setStep(storeHandle, instance.id, 2, totalStartSteps, START_STEPS[2], startOpId ?? undefined)
 
     // **************************
     // STEP 1b - Generate a password for the app
@@ -1516,7 +1617,7 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
     // **************************
     // STEP 3 - Preloading of services
     // **************************
-    setStep(storeHandle, instance.id, 3, totalStartSteps, START_STEPS[3], startOpId)
+    if (!deferStore) setStep(storeHandle, instance.id, 3, totalStartSteps, START_STEPS[3], startOpId ?? undefined)
 
     log(`Preloading the service images of the services from the compose file`)
     // Extract the service images of the services from the compose file, and pull them
@@ -1552,17 +1653,17 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
     // **************************
     // STEP 4 - Container creation
     // **************************
-    setStep(storeHandle, instance.id, 4, totalStartSteps, START_STEPS[4], startOpId)
+    if (!deferStore) setStep(storeHandle, instance.id, 4, totalStartSteps, START_STEPS[4], startOpId ?? undefined)
 
     await createInstanceContainers(storeHandle, instance, disk)
 
     // **************************
     // STEP 5 - Run the Instance
     // **************************
-    setStep(storeHandle, instance.id, 5, totalStartSteps, START_STEPS[5], startOpId)
+    if (!deferStore) setStep(storeHandle, instance.id, 5, totalStartSteps, START_STEPS[5], startOpId ?? undefined)
 
-    await runInstance(storeHandle, instance, disk)
-    updateOperation(storeHandle, startOpId, {
+    await runInstance(storeHandle, instance, disk, opts)
+    if (startOpId) updateOperation(storeHandle, startOpId, {
       status: 'Done',
       completedAt: Date.now() as Timestamp,
     })
@@ -1574,9 +1675,9 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
     print(chalk.red(`Error starting app instance '${instance.id}': ${errMsg}`))
     // Any failure (port, tar load, compose create, compose up) ends in Error,
     // never Running, and is recorded in the command log (idea#109).
-    await markInstanceError(storeHandle, instance, disk, e)
-    clearStep(storeHandle, instance.id)
-    updateOperation(storeHandle, startOpId, {
+    if (!deferStore) await markInstanceError(storeHandle, instance, disk, e)
+    if (!deferStore) clearStep(storeHandle, instance.id)
+    if (startOpId) updateOperation(storeHandle, startOpId, {
       status: 'Failed',
       error: errMsg,
       completedAt: Date.now() as Timestamp,
@@ -1793,8 +1894,9 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
  * caller, which sets Error (startInstance also records a failed command-log
  * trace).
  */
-export const runInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk): Promise<void> => {
+export const runInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, opts: StartInstanceOpts = {}): Promise<void> => {
   const store: Store = storeHandle.doc()
+  const deferStore = opts.deferStoreStatus === true
   const mountRoot = await diskMountRoot(disk)
 
   log(`Running instance '${instance.id}' on disk ${disk.id} of engine '${localEngineId}'.`)
@@ -1806,7 +1908,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
     // If parsedPort is not NaN, assign it to the instance port
     if (!isNaN(parsedPort)) {
       log(`Port number extracted from .env file for instance ${instance.id}: ${parsedPort}`)
-      storeHandle.change(doc => {
+      if (!deferStore) storeHandle.change(doc => {
         const inst = doc.instanceDB[instance.id]
         if (!inst) return  // #179: never write to (or resurrect) a deleted row
         inst.port = parsedPort as PortNumber
@@ -1869,8 +1971,10 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
     // Prefer A r30: fail loud if host-net process Exits immediately (port occupied, etc.)
     await assertComposeContainersHealthy(`${mountRoot}/instances/${instance.id}`, instance.id)
     // Prefer A r40: container Up is not enough (Kolibri start&&tail; ZeroConf death).
-    const readyPort = storeHandle.doc()?.instanceDB?.[instance.id]?.port
-      ?? (port && !isNaN(parseInt(port)) ? parseInt(port) : 0)
+    const readyPort = deferStore
+      ? (port && !isNaN(parseInt(port)) ? parseInt(port) : 0)
+      : (storeHandle.doc()?.instanceDB?.[instance.id]?.port
+        ?? (port && !isNaN(parseInt(port)) ? parseInt(port) : 0))
     const instanceDir = `${mountRoot}/instances/${instance.id}`
     const readyTimeoutMs = await readPortReadyTimeoutMs(`${instanceDir}/compose.yaml`, parseAppId(String(instance.instanceOf ?? "")).name)
     await assertInstancePortReady(
@@ -1891,7 +1995,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
 
   // The disk may have been undocked while compose up ran.
   if (!stillStartable('after compose up')) return
-  storeHandle.change(doc => {
+  if (!deferStore) storeHandle.change(doc => {
     const inst = doc.instanceDB[instance.id]
     if (!inst) return  // #179: never write to (or resurrect) a deleted row
     inst.lastStarted = new Date().getTime() as Timestamp
@@ -1901,7 +2005,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
   })
 
   print(chalk.green(`App ${instance.id} running`))
-  clearStep(storeHandle, instance.id)
+  if (!deferStore) clearStep(storeHandle, instance.id)
   // idea#193 §4: reconcile USB stick storages once the App runs (x-app.usbMount.sync)
   if (await instanceUsbSync(storeHandle.doc(), instance)) {
     const { syncUsbApps } = await import('./UsbSticks.js')

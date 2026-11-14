@@ -4,7 +4,7 @@ import { $, YAML, chalk, fs, os } from 'zx';
 import path from 'path';
 import { deepPrint, log } from '../utils/utils.js';
 import { App, appTitleFromXapp, createAppId, createOrUpdateApp, extractAppName, extractAppVersion } from './App.js'
-import { Instance, Status, createOrUpdateInstance, startInstance } from './Instance.js'
+import { Instance, Status, createOrUpdateInstance, startInstance, markLegacyDottedInstance, applyDemoFlag } from './Instance.js'
 import { AppID, BackupMode, DeviceName, DiskID, DiskType, EngineID, DiskName, InstanceID, PortNumber, ServiceImage, Timestamp } from './CommonTypes.js';
 import { Store, getAppsOfDisk, getInstance, getInstancesOfDisk } from './Store.js';
 import { DocHandle } from '@automerge/automerge-repo';
@@ -17,6 +17,7 @@ import { parseFilesMount, parseUsbMount } from './FilesMount.js';
 import { updateDiskSize } from './DiskSize.js';
 import { recordDiskDetectionFailure } from '../monitors/diskDetection.js';
 import { shouldAutoStart } from './AutoStart.js';
+import { isLegacyDottedInstanceId, LEGACY_DOTTED_INSTANCE_MESSAGE } from '../utils/instanceIds.js';
 
 
 
@@ -32,6 +33,43 @@ export interface BackupConfig {
      * or absent (idea#400 PR C, Steve #347 call 5). A scheduled disk with an error runs at the 02:30 default until it is fixed (#351 call 1).
      */
     scheduleError?: string | null
+    /**
+     * Instance ids listed in BACKUP.yaml (and in `links`) that are not in the store (idea#400 follow-up).
+     * The yaml is never rewritten or pruned for this; scheduled and immediate runs still skip those links,
+     * and this list is how the Console shows why. Empty when every link has an instance record.
+     */
+    orphanLinks?: InstanceID[]
+}
+
+const sameLinkIds = (a: readonly string[] | undefined, b: readonly string[]): boolean => {
+    const x = a ?? []
+    return x.length === b.length && x.every((id, i) => String(id) === String(b[i]))
+}
+
+/** Links whose instance id is not in instanceDB, in the same order as `links`. */
+export const backupOrphanLinks = (store: Store, links: readonly string[]): InstanceID[] =>
+    (links ?? []).filter(id => !getInstance(store, id as InstanceID)) as InstanceID[]
+
+/** Write `orphanLinks` onto a BackupConfig inside an open store change. Never touches BACKUP.yaml. */
+export const setBackupOrphanLinks = (store: Store, cfg: BackupConfig): void => {
+    const next = backupOrphanLinks(store, cfg.links)
+    if (!sameLinkIds(cfg.orphanLinks, next)) cfg.orphanLinks = next
+}
+
+/**
+ * Refresh `backupConfig.orphanLinks` for one Backup Disk, or every docked Backup Disk.
+ * Store only; BACKUP.yaml is not read or written.
+ */
+export const syncBackupOrphanLinks = (storeHandle: DocHandle<Store>, diskId?: DiskID): void => {
+    storeHandle.change(doc => {
+        const ids = diskId ? [diskId] : (Object.keys(doc.diskDB) as DiskID[])
+        for (const id of ids) {
+            const d = doc.diskDB[id]
+            if (!d?.backupConfig) continue
+            if (!diskId && !d.device) continue
+            setBackupOrphanLinks(doc, d.backupConfig)
+        }
+    })
 }
 
 /** A leftover .backup-in-progress lock found when a Backup Disk docks or the Engine boots (idea#446). */
@@ -61,6 +99,12 @@ export interface Disk {
     /** total bytes of the pre-update and quarantine folders on this disk (Atlas: Ops visibility; nothing auto-deletes) */
     preUpdateBytes?: number | null;
     quarantineBytes?: number | null;
+    /**
+     * App bundles under apps/ on this disk (idea#76 gap 1, Lead option A), written only by the docking
+     * Engine on dock or when the list changes, cleared on undock. Other Engines only read it for the
+     * cross-Engine update hint. null/absent = unknown (use an explicit --source).
+     */
+    appBundles?: AppBundleInfo[] | null;
     // Scheduled Backup Disk summary (idea#400, proposal §3.6): written by the docked Engine once per run
     // (clockTrusted/clockReason only on change), never per tick; null/absent on older Engines and when undocked.
     /** Free space in percent, rounded; does not replace sizeBytes / freeBytes. */
@@ -76,6 +120,18 @@ export interface Disk {
     /** True while fullness cleanup runs (idea#402), with its start time. */
     cleaning?: boolean | null;
     cleaningStartedAt?: Timestamp | null;
+}
+
+export interface AppBundleInfo {
+    appId: AppID;
+    version: string;
+    /** SHA256SUMS exists and lists compose.yaml (read, not verified; full check at update start) */
+    sumsListed: boolean;
+    /** bytes of apps/<appId>/ (service image tars under services/ not included) */
+    sizeBytes: number;
+    updatesFrom?: number[];
+    healthTimeout?: number;
+    migrationNote?: string;
 }
 
 export interface PreUpdateSnapshot {
@@ -354,6 +410,14 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
     } catch (e: any) {
         log(`Could not read the size of disk ${disk.id}: ${e.message ?? e}`)
     }
+    try {
+        const { getLocalEngine } = await import('./Store.js')
+        const { refreshDemoHb } = await import('./DemoApps.js')
+        const eng = getLocalEngine(storeHandle.doc())
+        if (eng) await refreshDemoHb(storeHandle, String(eng.id))
+    } catch (e: any) {
+        log(`demo hb after processDisk: ${e.message ?? e}`)
+    }
 }
 
 /**
@@ -603,6 +667,7 @@ export const upsertSystemInstanceRecord = (storeHandle: DocHandle<Store>, disk: 
                 stepLabel: null,
                 metrics: null,
             }
+            applyDemoFlag(newInst, compose)
             doc.instanceDB[instanceId] = newInst
             instance = newInst
         } else {
@@ -617,6 +682,7 @@ export const upsertSystemInstanceRecord = (storeHandle: DocHandle<Store>, disk: 
             if (stored.status === 'Missing' || stored.status === 'Undocked' || stored.status === 'Error') {
                 stored.status = 'Docked' as Status
             }
+            applyDemoFlag(stored, compose)
             instance = stored
         }
     })
@@ -749,10 +815,17 @@ export const processAppDisk = async (storeHandle: DocHandle<Store>, disk: Disk):
     }
     // #230 call 3: dock-time updateAvailable from SHA256SUMS presence and versions only (cheap).
     try {
-        const { refreshUpdateAvailable } = await import('./UpdateApp.js')
+        const { refreshUpdateAvailable, publishAppBundles } = await import('./UpdateApp.js')
+        await publishAppBundles(storeHandle, disk)   // idea#76 gap 1: what other Engines may fetch
         if (disk.dockedTo) await refreshUpdateAvailable(storeHandle, String(disk.dockedTo))
     } catch (e) {
         log(`updateAvailable refresh failed on dock of ${disk.id}: ${(e as Error).message}`)
+    }
+    try {
+        const { scanPreUpdateQuarantine } = await import('../monitors/preUpdateQuarantine.js')
+        await scanPreUpdateQuarantine(storeHandle, {}, String(disk.id))
+    } catch (e) {
+        log(`preUpdateQuarantine on dock of ${disk.id}: ${(e as Error).message}`)
     }
 
     // Trigger backups on any docked Backup Disk linked to instances on this App Disk
@@ -801,6 +874,14 @@ const tracedStartInstance = async (storeHandle: DocHandle<Store>, instance: Inst
     // resets that to Docked, so the gate also reads the operator's last stop
     // (AutoStart.ts). The instance is put back to Stopped so the Console shows it.
     const current = storeHandle.doc()?.instanceDB?.[instance.id] ?? instance
+    // idea#494: listed (removeInstance can clear it) but no compose up, no .env
+    // rewrite, no port allocation. Do this before shouldAutoStart so a Stopped
+    // dotted record is still marked Error with the legacy statusCondition.
+    if (isLegacyDottedInstanceId(String(current.id))) {
+        log(`tracedStartInstance: leaving '${current.id}' listed as Error — ${LEGACY_DOTTED_INSTANCE_MESSAGE} (idea#494)`)
+        markLegacyDottedInstance(storeHandle, current.id)
+        return
+    }
     const gate = shouldAutoStart(storeHandle.doc(), current)
     if (!gate.start) {
         log(`tracedStartInstance: skipping auto-start of '${current.name}' (${current.id}) on disk ${disk.id}: ${gate.reason}`)
@@ -855,10 +936,18 @@ export const dropInstancesWithoutFiles = async (storeHandle: DocHandle<Store>, d
 }
 
 export const removeInstance = (storeHandle: DocHandle<Store>, disk: Disk, instanceId: InstanceID): void => {
+    const current = getInstance(storeHandle.doc(), instanceId)
+    // engine#381: after a keep-id move flips storedOn, a leftover folder (or a
+    // missing folder) on this disk must not mark the instance Missing.
+    if (current?.storedOn && String(current.storedOn) !== String(disk.id)) {
+        log(`Instance ${instanceId} is stored on ${current.storedOn}, not ${disk.id} — not marking Missing`)
+        return
+    }
     log(`Instance ${instanceId} no longer found on disk ${disk.id}`)
     storeHandle.change(doc => {
         const instance = getInstance(doc, instanceId)
         if (instance) {
+            if (instance.storedOn && String(instance.storedOn) !== String(disk.id)) return
             // Mark as Missing — the instance directory is no longer on this disk (deleted or moved).
             // We preserve the instanceDB entry so that:
             //   1. Instance history is not lost.

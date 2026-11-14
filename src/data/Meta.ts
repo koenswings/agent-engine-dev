@@ -385,15 +385,45 @@ export const readHardwareIdSamsungFIT = async (device: DeviceName): Promise<Disk
   }
 }
 
-export const readHardwareIdIntenso = async (device: DeviceName): Promise<DiskID | undefined> => {
+/** Full path matching the 10-engine / 11-engine-files sudoers NOPASSWD entries. */
+export const HDPARM_BIN = '/usr/sbin/hdparm'
+
+/** zx `$` / a test fake. */
+export type ShellExec = (pieces: TemplateStringsArray, ...args: unknown[]) => Promise<{ stdout: string }>
+
+/**
+ * A useful one-line description of a thrown shell error. zx ProcessOutput often
+ * stringifies to empty (`${e}` was logging "Error reading disk id of device sdb: "
+ * with nothing after the colon) even when exitCode / stderr are set (engine#360).
+ */
+export const describeShellError = (e: unknown): string => {
+  if (e && typeof e === 'object') {
+    const err = e as { message?: unknown, shortMessage?: unknown, exitCode?: unknown, stderr?: unknown, stdout?: unknown }
+    const parts: string[] = []
+    const text = String(err.shortMessage ?? err.message ?? '').trim()
+    if (text) parts.push(text)
+    if (err.exitCode != null && err.exitCode !== '') parts.push(`exit ${err.exitCode}`)
+    const stderr = String(err.stderr ?? '').trim()
+    if (stderr && stderr !== text) parts.push(stderr)
+    if (parts.length) return parts.join(': ')
+    const stdout = String(err.stdout ?? '').trim()
+    if (stdout) return stdout
+  }
+  const s = String(e ?? '').trim()
+  return s || 'unknown error'
+}
+
+export const readHardwareIdIntenso = async (
+  device: DeviceName,
+  deps: { exec?: ShellExec } = {},
+): Promise<DiskID | undefined> => {
+  const exec = deps.exec ?? ($ as ShellExec)
   try {
-    const hdparm = (await $`which hdparm`).stdout
-    log(`hdparm is at ${hdparm}`)
-    //const info = (await $`hdparm -I /dev/${device}`).stdout
-    //log(`Info is ${info}`)
     // hdparm -I requires read access to the block device (root-only on Linux).
-    // The engine runs as pi with passwordless sudo, so prefix with sudo.
-    const sn = (await $`sudo hdparm -I /dev/${device} | grep 'Serial\ Number'`).stdout
+    // Call the full path so this matches the 10-engine / 11-engine-files sudoers
+    // NOPASSWD entry (`/usr/sbin/hdparm -I /dev/sd…`) and does not depend on PATH:
+    // hdparm lives only in /usr/sbin, which is not on the pi/pm2 PATH (engine#360).
+    const sn = (await exec`sudo /usr/sbin/hdparm -I /dev/${device} | grep 'Serial\ Number'`).stdout
     log(`Serial number is ${sn}`)
     const id = sn.trim().split(':')
     log(`split ID is ${id}`)
@@ -404,7 +434,7 @@ export const readHardwareIdIntenso = async (device: DeviceName): Promise<DiskID 
       return undefined
     }
   } catch (e) {
-    log(`Error reading disk id of device ${device}: ${e}`)
+    log(`Error reading disk id of device ${device}: ${describeShellError(e)}`)
     return undefined
   }
 }

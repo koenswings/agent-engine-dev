@@ -38,6 +38,7 @@ import { Instance, Status } from './Instance.js'
 import { IPAddress } from './CommonTypes.js'
 import { lookupInstanceArg, describeInstanceCandidates } from './InstanceArg.js'
 import { checkInstanceIdForDocker } from '../utils/instanceIds.js'
+import { MoveError, moveFailedText } from './MoveAppShapes.js'
 import { findExternalLinks, externalLinksMessage, uniqueCopyName, preparedCopyFiles, instanceDirLooksLikeKolibri } from './InstanceCopy.js'
 import type { MoveResult } from './MoveAppShapes.js'
 import { composeDownAt, pruneUnusedInstanceNetworks } from '../utils/instanceNetworks.js'
@@ -102,6 +103,9 @@ export const validate = async (
     }
     if (!found.ok) return `Instance '${instanceName}' not found`
     const instance = found.instance
+    if ((instance as any).demo === true) {
+        return `NOT_DEMO: cannot ${kind} a demo instance (${instance.id}); demo instances are not copied or moved`
+    }
     if (found.via === 'name-on-disk') {
         console.warn(`Instance name '${instanceName}' is shared by several instances; using ${instance.id}, the one on disk ${sourceDiskId}. Send the instance id.`)
     }
@@ -182,7 +186,7 @@ export const validate = async (
     return { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc, sourceRoot, targetRoot }
 }
 
-/** Options for copyApp when it runs as the copy step of a cross-Engine move (idea#79). */
+/** Options for copyApp when it runs as the copy step of a cross-Engine move (idea#79, engine#381). */
 export interface CopyAppOptions {
     /** write progress into this (moveApp) operation instead of creating a copyApp one */
     journalOpId?: string
@@ -192,16 +196,54 @@ export interface CopyAppOptions {
     rethrow?: boolean
     /** a move keeps the source stopped after a good copy (it restarts it itself on failure) */
     keepSourceStopped?: boolean
+    /**
+     * Internal only (not on the CLI). Cross-Engine moveApp passes the source id so
+     * the target folder is instances/<same id> and no second instanceDB row is written.
+     * A plain copyApp omits this and still mints a fresh id.
+     */
+    dstId?: InstanceID
+    /** Ephemeral copy byte progress for moveApp (engine#387). Not stored. */
+    onByteProgress?: (p: { bytesDone: number, bytesTotal: number }) => void
+}
+
+/** Accumulate rsync --info=progress2 bytes across the app-master and instance stages. */
+export const accumulateCopyByteProgress = (
+    onByteProgress: ((p: { bytesDone: number, bytesTotal: number }) => void) | undefined,
+    bytesTotal: number,
+) => {
+    let completed = 0
+    const report = (bytesDone: number) => {
+        if (!onByteProgress) return
+        const total = bytesTotal > 0 ? bytesTotal : Math.max(0, bytesDone)
+        onByteProgress({ bytesDone: total > 0 ? Math.min(Math.max(0, bytesDone), total) : Math.max(0, bytesDone), bytesTotal: total })
+    }
+    const stage = (stageBytes: number) => {
+        let finished = false
+        return (p: { progressPercent: number, bytesDone?: number }) => {
+            const chunk = p.bytesDone != null ? p.bytesDone : Math.round(Math.max(0, stageBytes) * (p.progressPercent / 100))
+            report(completed + chunk)
+            if (!finished && p.progressPercent >= 100) {
+                finished = true
+                completed += Math.max(0, stageBytes)
+            }
+        }
+    }
+    const finish = () => report(bytesTotal > 0 ? bytesTotal : completed)
+    return { stage, finish }
 }
 
 // ── copyApp ───────────────────────────────────────────────────────────────────
 
 /**
  * Copy an app instance from sourceDisk to targetDisk.
- * The copy receives a fresh InstanceID — it is a brand new instance — and its
+ * A plain copyApp receives a fresh InstanceID — it is a brand new instance — and its
  * own name (`<name>-2`, `<name>-3`, …) and port (idea#168 r35).
+ * When called as the copy step of a cross-Engine move with dstId set to the source
+ * id (engine#381), the target folder uses that same id: no second instanceDB row,
+ * lastBackup is kept, and Kolibri morango is not rebound. storedOn is not flipped
+ * here; the move flips it only after verify.
  * The original keeps running: it is stopped during the file copy and restarted
- * before the copy starts, so it keeps its port.
+ * before the copy starts, so it keeps its port (unless keepSourceStopped).
  */
 export const copyApp = async (
     storeHandle: DocHandle<Store>,
@@ -231,11 +273,13 @@ export const copyApp = async (
         instanceId: instance.id,
         sourceDiskId: sourceDisk.id,
         targetDiskId: targetDisk.id,
+        instanceName: String(instance.name),
     }, cause, { type: 'instance', id: instance.id })
     let copyError: Error | null = null
     beginUsageSkip('move')
 
-    const newInstanceId = uuid() as InstanceID
+    const newInstanceId = (opts.dstId ?? uuid()) as InstanceID
+    const preserveId = Boolean(opts.dstId) && String(opts.dstId) === String(instance.id)
     let wasRunning = false
     let sourceRestarted = false
     // idea#168 r36: the folder this copy creates on the target disk. A failed copy
@@ -322,8 +366,18 @@ export const copyApp = async (
         setCopyStep(2)
         const appMasterDest = `${targetMountRoot}/apps/${appId}`
         log(`copyApp: syncing app master ${appMasterSrc} → ${isCrossEngine ? remoteAddress + ':' : ''}${appMasterDest}`)
-        const appMasterProgress = ({ progressPercent }: { progressPercent: number }) => {
-            updateOperation(storeHandle, opId, { progressPercent: Math.round(progressPercent * 0.25) })
+        let appMasterBytes = 0
+        let instanceBytes = 0
+        if (opts.onByteProgress) {
+            try { appMasterBytes = await directoryBytes(appMasterSrc) } catch { appMasterBytes = 0 }
+            try { instanceBytes = await instanceDataBytes(sourceRoot, instance.id) } catch { instanceBytes = 0 }
+        }
+        const copyBytes = accumulateCopyByteProgress(opts.onByteProgress, appMasterBytes + instanceBytes)
+        if (opts.onByteProgress) opts.onByteProgress({ bytesDone: 0, bytesTotal: appMasterBytes + instanceBytes })
+        const appMasterByteProgress = copyBytes.stage(appMasterBytes)
+        const appMasterProgress = (p: { progressPercent: number, bytesDone?: number }) => {
+            updateOperation(storeHandle, opId, { progressPercent: Math.round(p.progressPercent * 0.25) })
+            appMasterByteProgress(p)
         }
         if (peer) await rsyncToPeer(appMasterSrc.replace(/\/*$/, '/'), peer, receiveAppArgs(targetRoot, appId), appMasterProgress, opId)
         else await rsyncDirectory(appMasterSrc, appMasterDest, appMasterProgress, opId)
@@ -336,12 +390,14 @@ export const copyApp = async (
         const instanceDest = `${targetMountRoot}/instances/${newInstanceId}`
         createdInstanceDest = instanceDest
         log(`copyApp: syncing instance data ${instanceSrc} → ${isCrossEngine ? remoteAddress + ':' : ''}${instanceDest} (idea-app-data ${isCrossEngine ? 'send' : 'copy'})`)
+        const instanceByteProgress = copyBytes.stage(instanceBytes)
         await rsyncInstanceData(
             peer
                 ? { kind: 'send', srcRoot: sourceRoot, srcId: instance.id, host: peer.host, peerEngineId: peer.engineId, dstRoot: targetRoot, dstId: newInstanceId }
                 : { kind: 'copy', srcRoot: sourceRoot, srcId: instance.id, dstRoot: targetRoot, dstId: newInstanceId },
-            ({ progressPercent }) => {
-                updateOperation(storeHandle, opId, { progressPercent: 25 + Math.round(progressPercent * 0.30) })
+            (p) => {
+                updateOperation(storeHandle, opId, { progressPercent: 25 + Math.round(p.progressPercent * 0.30) })
+                instanceByteProgress(p)
             }, opId)
 
         // 5a. Give the copy its own name and port (idea#168 r35). The rsync
@@ -375,7 +431,7 @@ export const copyApp = async (
         const kolibriCopy = peer
             ? await instanceDirLooksLikeKolibri(instanceSrc)
             : await instanceDirLooksLikeKolibri(instanceDest)
-        if (kolibriCopy) {
+        if (kolibriCopy && !preserveId) {
             // Flat marker at instance root (receive-files / put-files place basenames).
             // Peer: receive-files through the gate. Local: put-files as root (app-data policy).
             const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-kolibri-rebind-'))
@@ -428,6 +484,8 @@ export const copyApp = async (
             }
         }
 
+        if (opts.onByteProgress) copyBytes.finish()
+
         // 6. Register/start the new instance
         setCopyStep(5)
 
@@ -436,7 +494,12 @@ export const copyApp = async (
         // it while the original is down for the snapshot.
         if (wasRunning && !opts.keepSourceStopped) await restartSource('before the copy starts')
 
-        if (isCrossEngine) {
+        if (preserveId) {
+            // engine#381: the existing instanceDB row stays the source of truth
+            // until moveApp flips storedOn after verify. Do not start the target
+            // here (the move starts it on the target disk during Checking).
+            log(`copyApp: kept instance id ${newInstanceId} on '${targetDisk.name}' (${targetDisk.id}); storedOn is unchanged until verify`)
+        } else if (isCrossEngine) {
             // Cross-engine: create instance record in shared store (as Docked),
             // then tell the remote engine to start it via sendCommand.
             log(`copyApp: registering new instance ${newInstanceId} on remote disk '${targetDisk.name}' (${targetDisk.id})`)
@@ -494,10 +557,12 @@ export const copyApp = async (
             })
         }
         console.error(chalk.red(`copyApp: failed — ${e.message ?? e}`))
-        // Remove the partial copy unless it was already registered (fresh id, so the
-        // folder holds only what this op wrote). As root through the app-data helper
-        // (idea#168): the copy holds files owned by root, 999 and www-data.
-        if (createdInstanceDest && !storeHandle.doc()?.instanceDB?.[newInstanceId]) {
+        // Remove the partial copy unless a *new* id was already registered (fresh
+        // id, so the folder holds only what this op wrote). When preserveId, the
+        // existing instanceDB[id] is the source row — still delete only the target
+        // folder, never the source, never the store row (engine#381).
+        const registeredFresh = !preserveId && storeHandle.doc()?.instanceDB?.[newInstanceId]
+        if (createdInstanceDest && !registeredFresh) {
             try {
                 if (peer) await deleteRemoteInstanceData(peer.host, peer.engineId, targetRoot, newInstanceId)
                 else await deleteInstanceData(targetRoot, newInstanceId)
@@ -559,6 +624,7 @@ export const moveApp = async (
         instanceId: instance.id,
         sourceDiskId: sourceDisk.id,
         targetDiskId: targetDisk.id,
+        instanceName: String(instance.name),
     }, cause, { type: 'instance', id: instance.id })
     beginUsageSkip('move')
 
@@ -655,7 +721,7 @@ export const moveApp = async (
             }
         }
 
-        // 6. Register on target disk (storedOn + status set here; instance starts).
+        // 6. Register on target disk (storedOn set here). A previously running instance is started just below (idea#474).
         //    This MUST succeed before we touch the source record — if cancelled before
         //    this point the source record is untouched and the operator can retry cleanly.
         setMoveStep(5)
@@ -673,6 +739,19 @@ export const moveApp = async (
         log(`moveApp: registering instance ${instance.id} on disk '${targetDisk.name}' (${targetDisk.id})`)
         await processInstance(storeHandle, targetDisk, instance.id)
         partialTarget = false
+
+        // idea#474: processInstance does not auto-start a just-stopped instance
+        // (shouldAutoStart skips status Stopped). If it was running before the
+        // move, start it on the target — running in, running out. Do this
+        // before the source folder is removed, so a failed start can still
+        // leave the source data in place.
+        if (wasRunning) {
+            const moved = getInstance(storeHandle.doc(), instance.id)
+            if (moved) {
+                log(`moveApp: starting moved instance '${instanceName}' on '${targetDisk.name}'`)
+                await startInstance(storeHandle, moved, targetDisk, 'post-move')
+            }
+        }
 
         // 8. Remove source instance directory
         setMoveStep(6)
@@ -736,8 +815,10 @@ export const moveApp = async (
             }
         }
 
-        // On failure, try to restart the source instance if we stopped it
-        if (wasRunning) {
+        // On failure, restart the source only if we stopped it and it is still
+        // registered there (idea#474: after a successful register, a later
+        // start-on-target failure must not start the old source project).
+        if (wasRunning && stillOnSource) {
             try {
                 const freshStore = storeHandle.doc()
                 const freshInstance = getInstance(freshStore, instance.id)
@@ -749,6 +830,11 @@ export const moveApp = async (
                 console.error(chalk.red(`moveApp: failed to restart source instance: ${restartErr.message}`))
             }
         }
+        // idea#475: rethrow so the command trace ends as error (not ok) with a
+        // leading result code in the same style as a cross-Engine move.
+        if (e instanceof MoveError) throw e
+        const reason = e?.message ?? String(e)
+        throw new MoveError('COPY_FAILED', moveFailedText(reason))
     } finally {
         resourceLock.releaseAll(moveLockKeys)
         endUsageSkip('move')

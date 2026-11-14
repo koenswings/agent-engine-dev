@@ -194,6 +194,63 @@ export interface ClockTrustInput {
     syncedPeerNowMs: number | null
     /** An outstanding jump (advanceClockJumpState returned non-null): untrusted until sync or 24 h. */
     jumpSinceSync?: boolean
+    /**
+     * An NTP-synced peer's estimated now agrees with us within CLOCK_SKEW_TOLERANCE_MS
+     * (Steve, engine#352 call 3). Clears BEFORE_STORE; a clockTrusted-only peer does not.
+     */
+    peerNtpAgreed?: boolean
+}
+
+/** A peer's clock as the trust check sees it (from a live ephemeral hb). */
+export interface PeerClockView {
+    nowMs: number
+    ntpSynced: boolean
+    clockTrusted: boolean
+    /** False when the hb omitted ntpSynced/clockTrusted (old Engine: not a source). */
+    hasClockFields: boolean
+}
+
+export interface PeerClockInputs {
+    /** A usable peer (ntpSynced or clockTrusted) agreed with us within skew. */
+    peerSynced: boolean
+    /** An ntpSynced peer agreed with us within skew. */
+    peerNtpAgreed: boolean
+    /** Estimated now of ntpSynced usable peers, for AHEAD_OF_PEER; null if none or disagreement. */
+    syncedPeerNowMs: number | null
+    /** Usable peers disagreed with each other by more than the skew: all peer input ignored. */
+    ignoredForDisagreement: boolean
+}
+
+const emptyPeerClockInputs = (): PeerClockInputs => ({
+    peerSynced: false, peerNtpAgreed: false, syncedPeerNowMs: null, ignoredForDisagreement: false,
+})
+
+/**
+ * Fold live peer clocks into the inputs evaluateClockTrust needs (engine#352).
+ * A peer is a time source only if it carries the new fields and is ntpSynced or
+ * clockTrusted (Steve, call 2): two never-synced Pis must not vouch for each other.
+ * AHEAD_OF_PEER and BEFORE_STORE use only ntpSynced peers. If usable peers
+ * disagree with each other by more than the skew, every peer input is ignored (call 7).
+ */
+export const peerClockInputs = (
+    ourNowMs: number,
+    peers: readonly PeerClockView[],
+    skewMs = CLOCK_SKEW_TOLERANCE_MS,
+): PeerClockInputs => {
+    const usable = peers.filter(p => p.hasClockFields && (p.ntpSynced || p.clockTrusted))
+    if (!usable.length) return emptyPeerClockInputs()
+    const nows = usable.map(p => p.nowMs)
+    if (Math.max(...nows) - Math.min(...nows) > skewMs) {
+        return { ...emptyPeerClockInputs(), ignoredForDisagreement: true }
+    }
+    const agrees = (p: PeerClockView) => Math.abs(p.nowMs - ourNowMs) <= skewMs
+    const ntp = usable.filter(p => p.ntpSynced)
+    return {
+        peerSynced: usable.some(agrees),
+        peerNtpAgreed: ntp.some(agrees),
+        syncedPeerNowMs: ntp.length ? Math.min(...ntp.map(p => p.nowMs)) : null,
+        ignoredForDisagreement: false,
+    }
 }
 
 export interface ClockTrust {
@@ -209,11 +266,13 @@ export interface ClockTrust {
 export const evaluateClockTrust = (i: ClockTrustInput): ClockTrust => {
     const untrusted = (clockReason: ClockReason): ClockTrust => ({ clockTrusted: false, clockReason })
     if (i.buildTimeMs != null && i.nowMs < i.buildTimeMs) return untrusted('BEFORE_BUILD')
-    // Steve, #351 call 6: an NTP-synchronised clock clears BEFORE_STORE (a real time source beats
-    // stored timestamps, which may come from a fast peer). A store sync carries no time and
-    // 24 h of uptime cannot fix a clock that is behind, so neither clears it; without NTP it
-    // clears only when the wall clock passes the newest stored timestamp.
-    if (!i.ntpSynced && i.newestStoreTimeMs != null && i.nowMs < i.newestStoreTimeMs - CLOCK_SKEW_TOLERANCE_MS) return untrusted('BEFORE_STORE')
+    // Steve, #351 call 6 and engine#352 call 3: an NTP-synchronised clock, or an
+    // NTP-synced peer whose now agrees with us within 5 min, clears BEFORE_STORE
+    // (a real time source beats stored timestamps). A store (Automerge) sync
+    // carries no time, a clockTrusted-only peer is not enough, and 24 h of uptime
+    // cannot fix a clock that is behind; without those it clears only when the
+    // wall clock passes the newest stored timestamp.
+    if (!i.ntpSynced && !i.peerNtpAgreed && i.newestStoreTimeMs != null && i.nowMs < i.newestStoreTimeMs - CLOCK_SKEW_TOLERANCE_MS) return untrusted('BEFORE_STORE')
     if (i.syncedPeerNowMs != null && i.nowMs > i.syncedPeerNowMs + PEER_AHEAD_LIMIT_MS) return untrusted('AHEAD_OF_PEER')
     if (i.jumpSinceSync) return untrusted('CLOCK_JUMP')
     if (!i.ntpSynced && !i.peerSynced) return untrusted('NEVER_SYNCED')

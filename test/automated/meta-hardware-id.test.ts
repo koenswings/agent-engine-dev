@@ -5,10 +5,12 @@
  * Intenso vendor compare was `vendor === 'INTENSO'`, but idea01 reports
  * 'Intenso', so its stick got no hardware id. The compare is now case-insensitive.
  * sysfs reads and the readers are injected: no /sys, no sudo hdparm.
+ * engine#360: readHardwareIdIntenso is tested with an injected exec (full
+ * /usr/sbin/hdparm path, no `which`).
  */
 
 import { describe, it, expect, vi } from 'vitest'
-import { hardwareIdReaderFor, readHardwareId } from '../../src/data/Meta.js'
+import { hardwareIdReaderFor, readHardwareId, readHardwareIdIntenso, describeShellError, HDPARM_BIN } from '../../src/data/Meta.js'
 import { DeviceName, DiskID } from '../../src/data/CommonTypes.js'
 
 const sysfs = (model: string, vendor: string) => async (p: string) => {
@@ -46,5 +48,53 @@ describe('readHardwareId', () => {
         expect(await readHardwareId('sdb1' as DeviceName, { readSysfs: sysfs('Ultra', 'SanDisk'), intenso })).toBeUndefined()
         expect(await readHardwareId('sdb1' as DeviceName, { readSysfs: async () => { throw new Error('No such file') }, intenso })).toBeUndefined()
         expect(intenso).toHaveBeenCalledTimes(1)
+    })
+})
+
+const joinCmd = (pieces: TemplateStringsArray, args: unknown[]): string => {
+    let cmd = pieces[0] ?? ''
+    for (let i = 0; i < args.length; i++) cmd += String(args[i]) + (pieces[i + 1] ?? '')
+    return cmd
+}
+
+describe('readHardwareIdIntenso (engine#360)', () => {
+    it('calls sudo /usr/sbin/hdparm -I by full path and never runs which', async () => {
+        const commands: string[] = []
+        const exec = async (pieces: TemplateStringsArray, ...args: unknown[]) => {
+            const cmd = joinCmd(pieces, args)
+            commands.push(cmd)
+            return { stdout: 'Serial Number: 3813430-532011020\n' }
+        }
+        const id = await readHardwareIdIntenso('sdb' as DeviceName, { exec })
+        expect(id).toBe('3813430-532011020')
+        expect(commands).toHaveLength(1)
+        expect(commands[0]).toContain(`sudo ${HDPARM_BIN} -I /dev/sdb`)
+        expect(commands[0]).not.toMatch(/\bwhich\b/)
+    })
+
+    it('uses the same full-path form for a partition device', async () => {
+        const commands: string[] = []
+        const exec = async (pieces: TemplateStringsArray, ...args: unknown[]) => {
+            commands.push(joinCmd(pieces, args))
+            return { stdout: 'Serial Number: ABCD1234\n' }
+        }
+        expect(await readHardwareIdIntenso('sdb1' as DeviceName, { exec })).toBe('ABCD1234')
+        expect(commands[0]).toContain(`sudo ${HDPARM_BIN} -I /dev/sdb1`)
+        expect(commands[0]).not.toMatch(/\bwhich\b/)
+    })
+
+    it('returns undefined when the command fails', async () => {
+        const exec = async () => {
+            throw Object.assign(new Error(''), { exitCode: 1, stderr: '', stdout: '', message: '' })
+        }
+        expect(await readHardwareIdIntenso('sdb' as DeviceName, { exec })).toBeUndefined()
+    })
+})
+
+describe('describeShellError (engine#360)', () => {
+    it('uses exit code and stderr when zx ProcessOutput stringifies empty', () => {
+        expect(describeShellError({ message: '', exitCode: 1, stderr: '', stdout: '' })).toBe('exit 1')
+        expect(describeShellError({ message: '', exitCode: 1, stderr: 'sudo: hdparm: command not found\n', stdout: '' })).toBe('exit 1: sudo: hdparm: command not found')
+        expect(describeShellError(undefined)).toBe('unknown error')
     })
 })

@@ -491,7 +491,12 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     // failure here is reported but never stops the system disk registration or
     // the watcher below (agent-engine-dev#228).
     try {
-        const actualDevices = (config.settings.isDev || config.settings.testMode) ? [] : (await listDeviceFolder(watchDir)).filter(device => validDevice(device))
+        const listedWatch = (await listDeviceFolder(watchDir).catch(() => [] as string[])).filter(device => validDevice(device))
+        // testMode / isDev still force actualDevices to [] so fixture disks in
+        // a set IDEA_WATCH_DIR keep the existing undock-then-re-add restart path.
+        // engine#362: devices outside that dir (and, in isDev, every device when
+        // IDEA_WATCH_DIR is unset) are not treated as gone.
+        const actualDevices = (config.settings.isDev || config.settings.testMode) ? [] : listedWatch
         log(`Actual devices: ${actualDevices}`)
 
         log(`Removing from the network database disks that were attached before the current boot but are no longer attached now...`)
@@ -504,7 +509,14 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
 
             // idea#465: a record stays docked only when the device at that name is
             // really that disk (META.yaml diskId); the OS boot/root partition never is.
-            await reconcileStartupDocks(storeHandle, localEngine.id, storedDevices, actualDevices as DeviceName[], { systemDevice, systemBootDevice })
+            const leaveUntouched = (config.settings.testMode || config.settings.isDev)
+                ? (device: DeviceName) => shouldLeaveDeviceUntouched(device, listedWatch, {
+                    testMode: config.settings.testMode,
+                    isDev: config.settings.isDev,
+                    watchDirSet: !!process.env.IDEA_WATCH_DIR,
+                })
+                : undefined
+            await reconcileStartupDocks(storeHandle, localEngine.id, storedDevices, actualDevices as DeviceName[], { systemDevice, systemBootDevice, leaveUntouched })
         } else {
             log(`No previous disks found in the network database`)
         }
@@ -611,6 +623,36 @@ export const resolveDuplicateDisksOnDevice = async (
     return cleared
 }
 
+
+/** True when this stored device is represented in the watch-dir listing (engine#362). */
+export const watchDirContainsDevice = (listed: string[], device: DeviceName): boolean => {
+    const drive = driveNameOf(device)
+    return listed.some(name => name === device || name === drive || driveNameOf(name) === drive)
+}
+
+/**
+ * engine#362: whether startup reconcile must leave this device alone (no dock,
+ * undock or instance store write, and no process stop).
+ *
+ * Applies in testMode and in isDev, same shape, except when IDEA_WATCH_DIR is
+ * unset. The default watch path `/dev/engine` is the live udev folder, not an
+ * isolated sandbox: there is then no watch dir to be "inside". In isDev that
+ * means every device is left untouched (otherwise actualDevices=[] would
+ * undock real disks that happen to be listed in /dev/engine). testMode with
+ * IDEA_WATCH_DIR unset is unchanged from #363: membership uses listedWatch
+ * (built from the `/dev/engine` default). If testMode and isDev are both on
+ * and the env is unset, the safer isDev rule wins (leave all).
+ */
+export const shouldLeaveDeviceUntouched = (
+    device: DeviceName,
+    listedWatch: string[],
+    opts: { testMode: boolean, isDev: boolean, watchDirSet: boolean },
+): boolean => {
+    if (!opts.testMode && !opts.isDev) return false
+    if (!opts.watchDirSet && opts.isDev) return true
+    return !watchDirContainsDevice(listedWatch, device)
+}
+
 /** What reconcileStartupDocks did with one previously docked device (idea#465). */
 export type StartupDockAction =
     | 'system-disk'        // the system disk record: always present, left as is
@@ -619,6 +661,7 @@ export type StartupDockAction =
     | 'kept'               // META.yaml on the device names one of the records: kept; others store-only undocked
     | 'identity-mismatch'  // META.yaml names none of the records: store-only undock of all
     | 'identity-unknown'   // no readable META.yaml (not mounted): store-only undock; the dock re-adds it if it is that disk
+    | 'outside-watch-dir'  // testMode/isDev: leave store and processes alone (engine#362)
 
 export type StartupDockResult = { device: DeviceName; action: StartupDockAction; kept: DiskID | null; undocked: DiskID[] }
 
@@ -629,6 +672,12 @@ export type StartupDockDeps = {
     readMetaDiskId?: (device: DeviceName) => Promise<DiskID | null>
     /** Run undockAllOnDevice for a device that is gone. Default: undockAllOnDevice */
     undockGone?: (storeHandle: DocHandle<Store>, engineId: EngineID, device: DeviceName) => Promise<DiskID[]>
+    /**
+     * engine#362: in testMode or isDev, devices the Engine must not dock,
+     * undock, or publish instance state for. Return true to leave the record
+     * and its processes untouched. See shouldLeaveDeviceUntouched.
+     */
+    leaveUntouched?: (device: DeviceName) => boolean
 }
 
 /**
@@ -637,6 +686,15 @@ export type StartupDockDeps = {
  * mounts, unmounts or writes the device: it is not (or not known to be) that
  * disk, and may be the OS boot partition. Returns the ids changed.
  */
+
+const refreshDemoHbQuiet = (storeHandle: DocHandle<Store>, engineId?: string): void => {
+    void import('../data/DemoApps.js').then(async m => {
+        const { getLocalEngine } = await import('../data/Store.js')
+        const id = engineId ?? (getLocalEngine(storeHandle.doc())?.id as string | undefined)
+        if (id) await m.refreshDemoHb(storeHandle, String(id))
+    }).catch((e: any) => log(`demo hb: ${e?.message ?? e}`))
+}
+
 export const undockRecordsStoreOnly = (storeHandle: DocHandle<Store>, engineId: EngineID, device: DeviceName, diskIds: DiskID[], reason: string): DiskID[] => {
     const changed: DiskID[] = []
     if (diskIds.length === 0) return changed
@@ -663,6 +721,7 @@ export const undockRecordsStoreOnly = (storeHandle: DocHandle<Store>, engineId: 
         }
     })
     if (changed.length) log(`Undocked stale disk record(s) ${changed.join(', ')} on ${device} in the store only (${reason}); ${device} was not mounted, unmounted or written`)
+    if (changed.length) refreshDemoHbQuiet(storeHandle, String(engineId))
     return changed
 }
 
@@ -698,6 +757,11 @@ export const reconcileStartupDocks = async (
         if (systemDisk) {
             log(`Skipping undock of system disk ${systemDisk.id} on device ${device} — system disk is always present`)
             results.push({ device, action: 'system-disk', kept: systemDisk.id, undocked: [] })
+            continue
+        }
+        if (deps.leaveUntouched?.(device)) {
+            log(`leaving ${ids.join(', ')} on ${device} untouched (engine#362)`)
+            results.push({ device, action: 'outside-watch-dir', kept: disks[0]!.id, undocked: [] })
             continue
         }
         if (!actualDevices.includes(device)) {
@@ -764,7 +828,10 @@ const liveMountChangedReason = async (device: string): Promise<string | null> =>
 
 export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk, opts: { waitInFlight?: boolean } = {}): Promise<UndockResult | void> => {
     markUndockPending(String(disk.id))
-    try { return await undockDiskInner(storeHandle, disk, opts) } finally { clearUndockPending(String(disk.id)) }
+    try { return await undockDiskInner(storeHandle, disk, opts) } finally {
+        clearUndockPending(String(disk.id))
+        refreshDemoHbQuiet(storeHandle)
+    }
 }
 
 const undockDiskInner = async (storeHandle: DocHandle<Store>, disk: Disk, opts: { waitInFlight?: boolean }): Promise<UndockResult> => {
@@ -829,6 +896,7 @@ const undockDiskInner = async (storeHandle: DocHandle<Store>, disk: Disk, opts: 
                 dsk.filesConfig = null      // idea#131
                 dsk.sizeBytes = null
                 dsk.freeBytes = null
+                if (dsk.appBundles != null) dsk.appBundles = null   // idea#76 gap 1: unknown while undocked
             }
         })
         // Stop all instances of the disk and move them to the 'Undocked' state
@@ -855,6 +923,12 @@ const undockDiskInner = async (storeHandle: DocHandle<Store>, disk: Disk, opts: 
             })
             log(`Instance ${instance.id} has been moved to the 'Undocked' state`)
         }
+        // idea#76: hints that pointed at this disk, or that sit on its instances, are recomputed
+        try {
+            const { refreshUpdateAvailable } = await import('../data/UpdateApp.js')
+            const me = getLocalEngine(storeHandle.doc())?.id ?? disk.dockedTo
+            if (me) await refreshUpdateAvailable(storeHandle, String(me))
+        } catch (e) { log(`updateAvailable refresh failed on undock of ${disk.id}: ${(e as Error).message}`) }
         // Unmount after the instances are stopped (their containers keep files on
         // the disk open). Repeat umount until the folder is no longer a mount
         // point, then rmdir it; never rm -fr (idea#126).
