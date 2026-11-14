@@ -61,9 +61,11 @@ live Engine (idea#105):
 - Each run gets a private temp folder: `IDEA_WATCH_DIR` (replaces `/dev/engine`)
   and `IDEA_DISKS_ROOT` (replaces `/disks`). `test/harness/diskSim.ts` refuses to
   load without them. Nothing in the tests touches `/dev/engine`, `/disks` or `/disks/old`.
-- In `testMode`, startup reconcile does not publish dock, undock, or instance
-  state for devices outside `IDEA_WATCH_DIR` (engine#362); those records and
-  their processes are left alone. A testMode Engine, or any Engine with
+- In `testMode` or `isDev`, startup reconcile does not publish dock, undock, or
+  instance state for devices outside `IDEA_WATCH_DIR` (engine#362); those
+  records and their processes are left alone. If `isDev` is on and
+  `IDEA_WATCH_DIR` is unset, every real device is left untouched (`/dev/engine`
+  is not treated as an isolated watch dir). A testMode Engine, or any Engine with
   `IDEA_WATCH_DIR` set, refuses to start if `store-url.txt` is a known fleet
   store (dev pool 2VroE, kit 3Vvv, production 6f8m, retired 4GQm — full IDs in
   `KNOWN_FLEET_STORE_IDS`). Use a scratch store-url. `store-template.json` is

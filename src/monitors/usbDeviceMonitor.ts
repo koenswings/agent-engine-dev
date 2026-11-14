@@ -493,8 +493,9 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
     try {
         const listedWatch = (await listDeviceFolder(watchDir).catch(() => [] as string[])).filter(device => validDevice(device))
         // testMode / isDev still force actualDevices to [] so fixture disks in
-        // the watch dir keep the existing undock-then-re-add restart path.
-        // engine#362: devices *outside* the watch dir are not treated as gone.
+        // a set IDEA_WATCH_DIR keep the existing undock-then-re-add restart path.
+        // engine#362: devices outside that dir (and, in isDev, every device when
+        // IDEA_WATCH_DIR is unset) are not treated as gone.
         const actualDevices = (config.settings.isDev || config.settings.testMode) ? [] : listedWatch
         log(`Actual devices: ${actualDevices}`)
 
@@ -508,8 +509,12 @@ export const enableUsbDeviceMonitor = async (storeHandle: DocHandle<Store>) => {
 
             // idea#465: a record stays docked only when the device at that name is
             // really that disk (META.yaml diskId); the OS boot/root partition never is.
-            const leaveUntouched = config.settings.testMode
-                ? (device: DeviceName) => !watchDirContainsDevice(listedWatch, device)
+            const leaveUntouched = (config.settings.testMode || config.settings.isDev)
+                ? (device: DeviceName) => shouldLeaveDeviceUntouched(device, listedWatch, {
+                    testMode: config.settings.testMode,
+                    isDev: config.settings.isDev,
+                    watchDirSet: !!process.env.IDEA_WATCH_DIR,
+                })
                 : undefined
             await reconcileStartupDocks(storeHandle, localEngine.id, storedDevices, actualDevices as DeviceName[], { systemDevice, systemBootDevice, leaveUntouched })
         } else {
@@ -625,6 +630,29 @@ export const watchDirContainsDevice = (listed: string[], device: DeviceName): bo
     return listed.some(name => name === device || name === drive || driveNameOf(name) === drive)
 }
 
+/**
+ * engine#362: whether startup reconcile must leave this device alone (no dock,
+ * undock or instance store write, and no process stop).
+ *
+ * Applies in testMode and in isDev, same shape, except when IDEA_WATCH_DIR is
+ * unset. The default watch path `/dev/engine` is the live udev folder, not an
+ * isolated sandbox: there is then no watch dir to be "inside". In isDev that
+ * means every device is left untouched (otherwise actualDevices=[] would
+ * undock real disks that happen to be listed in /dev/engine). testMode with
+ * IDEA_WATCH_DIR unset is unchanged from #363: membership uses listedWatch
+ * (built from the `/dev/engine` default). If testMode and isDev are both on
+ * and the env is unset, the safer isDev rule wins (leave all).
+ */
+export const shouldLeaveDeviceUntouched = (
+    device: DeviceName,
+    listedWatch: string[],
+    opts: { testMode: boolean, isDev: boolean, watchDirSet: boolean },
+): boolean => {
+    if (!opts.testMode && !opts.isDev) return false
+    if (!opts.watchDirSet && opts.isDev) return true
+    return !watchDirContainsDevice(listedWatch, device)
+}
+
 /** What reconcileStartupDocks did with one previously docked device (idea#465). */
 export type StartupDockAction =
     | 'system-disk'        // the system disk record: always present, left as is
@@ -633,7 +661,7 @@ export type StartupDockAction =
     | 'kept'               // META.yaml on the device names one of the records: kept; others store-only undocked
     | 'identity-mismatch'  // META.yaml names none of the records: store-only undock of all
     | 'identity-unknown'   // no readable META.yaml (not mounted): store-only undock; the dock re-adds it if it is that disk
-    | 'outside-watch-dir'  // testMode: device is not in IDEA_WATCH_DIR; store and processes left alone (engine#362)
+    | 'outside-watch-dir'  // testMode/isDev: leave store and processes alone (engine#362)
 
 export type StartupDockResult = { device: DeviceName; action: StartupDockAction; kept: DiskID | null; undocked: DiskID[] }
 
@@ -645,9 +673,9 @@ export type StartupDockDeps = {
     /** Run undockAllOnDevice for a device that is gone. Default: undockAllOnDevice */
     undockGone?: (storeHandle: DocHandle<Store>, engineId: EngineID, device: DeviceName) => Promise<DiskID[]>
     /**
-     * engine#362: in testMode, devices not in IDEA_WATCH_DIR must not be
-     * docked, undocked, or have instance state published. Return true to leave
-     * the record and its processes untouched.
+     * engine#362: in testMode or isDev, devices the Engine must not dock,
+     * undock, or publish instance state for. Return true to leave the record
+     * and its processes untouched. See shouldLeaveDeviceUntouched.
      */
     leaveUntouched?: (device: DeviceName) => boolean
 }
@@ -722,7 +750,7 @@ export const reconcileStartupDocks = async (
             continue
         }
         if (deps.leaveUntouched?.(device)) {
-            log(`testMode: leaving ${ids.join(', ')} on ${device} untouched — not in IDEA_WATCH_DIR (engine#362)`)
+            log(`leaving ${ids.join(', ')} on ${device} untouched (engine#362)`)
             results.push({ device, action: 'outside-watch-dir', kept: disks[0]!.id, undocked: [] })
             continue
         }
