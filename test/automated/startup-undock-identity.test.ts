@@ -17,7 +17,7 @@ import { describe, it, beforeEach, expect, vi } from 'vitest'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Store } from '../../src/data/Store.js'
 import { localEngineId } from '../../src/data/Engine.js'
-import { reconcileStartupDocks, undockRecordsStoreOnly, watchDirContainsDevice } from '../../src/monitors/usbDeviceMonitor.js'
+import { reconcileStartupDocks, undockRecordsStoreOnly, watchDirContainsDevice, shouldLeaveDeviceUntouched } from '../../src/monitors/usbDeviceMonitor.js'
 import { DeviceName, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/data/CommonTypes.js'
 import { createTestStore } from '../harness/diskSim.js'
 
@@ -229,5 +229,45 @@ describe('reconcileStartupDocks: testMode leaves disks outside IDEA_WATCH_DIR al
         expect(watchDirContainsDevice(['sdb'], dev('sdb1'))).toBe(true)
         expect(watchDirContainsDevice(['sdb2'], dev('sdb1'))).toBe(true)
         expect(watchDirContainsDevice(['sdc1'], dev('sdb1'))).toBe(false)
+    })
+})
+
+
+describe('reconcileStartupDocks: isDev also leaves real disks alone (engine#362)', () => {
+    it('isDev, docked sdb1, does not undock (IDEA_WATCH_DIR unset: no watch dir to be inside)', async () => {
+        const h = (await createTestStore()).storeHandle
+        addDisk(h, 'diskb202610301247', 'sdb1', LOCAL)
+        addInstance(h, 'nextcloud-files-b-001', 'diskb202610301247', 'Running')
+        const undockGone = vi.fn(async () => ['diskb202610301247' as DiskID])
+        const change = vi.spyOn(h, 'change')
+        change.mockClear()
+        // Typical isDev: actualDevices forced [], and /dev/engine may even list sdb1.
+        // Because IDEA_WATCH_DIR is unset, shouldLeaveDeviceUntouched is true for every device.
+        const listedAsIfDevEngine = ['sdb', 'sdb1']
+        const leaveUntouched = (d: DeviceName) => shouldLeaveDeviceUntouched(d, listedAsIfDevEngine, {
+            testMode: false, isDev: true, watchDirSet: false,
+        })
+        const before = JSON.stringify({ disk: disk(h, 'diskb202610301247'), status: status(h, 'nextcloud-files-b-001') })
+        const res = await reconcileStartupDocks(h, LOCAL, [dev('sdb1')], [], { ...ssdPi, undockGone, leaveUntouched })
+        expect(res).toEqual([{ device: 'sdb1', action: 'outside-watch-dir', kept: 'diskb202610301247', undocked: [] }])
+        expect(isDocked(h, 'diskb202610301247')).toBe(true)
+        expect(disk(h, 'diskb202610301247').device).toBe('sdb1')
+        expect(status(h, 'nextcloud-files-b-001')).toBe('Running')
+        expect(undockGone).not.toHaveBeenCalled()
+        expect(change).not.toHaveBeenCalled()
+        expect(JSON.stringify({ disk: disk(h, 'diskb202610301247'), status: status(h, 'nextcloud-files-b-001') })).toBe(before)
+    })
+
+    it('isDev with IDEA_WATCH_DIR set matches testMode: only devices outside the listing are left alone', () => {
+        const opts = { testMode: false, isDev: true, watchDirSet: true }
+        expect(shouldLeaveDeviceUntouched(dev('sdb1'), [], opts)).toBe(true)
+        expect(shouldLeaveDeviceUntouched(dev('sdb1'), ['sdb1'], opts)).toBe(false)
+        // Unset WATCH_DIR: even if /dev/engine lists sdb1, leave it untouched
+        expect(shouldLeaveDeviceUntouched(dev('sdb1'), ['sdb', 'sdb1'], { testMode: false, isDev: true, watchDirSet: false })).toBe(true)
+        // testMode without WATCH_DIR is still the #363 listing rule
+        expect(shouldLeaveDeviceUntouched(dev('sdb1'), ['sdb1'], { testMode: true, isDev: false, watchDirSet: false })).toBe(false)
+        expect(shouldLeaveDeviceUntouched(dev('sdb1'), [], { testMode: true, isDev: false, watchDirSet: false })).toBe(true)
+        // both flags, WATCH_DIR unset: safer isDev rule (leave all)
+        expect(shouldLeaveDeviceUntouched(dev('sdb1'), ['sdb1'], { testMode: true, isDev: true, watchDirSet: false })).toBe(true)
     })
 })
