@@ -9,8 +9,8 @@
  *  - Snapshot: stop the instance, wait until its containers are really gone (the
  *    restart: unless-stopped race), then `idea-app-data snapshot` copies instances/<id>
  *    (bundle files, .env and data) to <disk>/.pre-update/<id>/ with a COMPLETE marker last.
- *  - Swap: copy the new bundle files over the instance folder (.env kept), set
- *    x-app.instanceName again, re-read the record (instanceOf = newAppId).
+ *  - Swap: copy the new bundle files over the instance folder (.env kept), restamp
+ *    x-app.instanceName and x-app.demo from the old instance compose, re-read the record (instanceOf = newAppId).
  *  - Start, Health: startInstance, then the health gate (healthGate) within healthTimeout.
  * Any failure from Snapshot on rolls back: compose down (no -v), `restore-snapshot` (in place,
  * helper v9: instances/<id> is never moved; replaced or deleted files go to .idea-quarantine
@@ -57,7 +57,7 @@ import {
     HealthSample, ContainerHealth, offerable, compareVersions, isMajorChange, backupIsDue,
 } from './UpdateAppPolicy.js'
 import { parseAppId } from './App.js'
-import { setComposeInstanceName } from './InstanceCopy.js'
+import { stampComposeInstanceIdentity } from './InstanceCopy.js'
 import { isUnfinishedFetch } from './UpdateFetch.js'
 import { beginUsageSkip, endUsageSkip } from '../usage/opFlags.js'
 import { parseBackupExcludeList, parseSnapshotExcludeList, mergeBackupExcludeLists, assertSnapshotExcludeList } from '../utils/backupExclude.js'
@@ -272,6 +272,39 @@ const findBundleDisk = async (store: Store, d: UpdateDeps, engineId: string, ins
 }
 
 /** x-app of a compose file; {} when unreadable. */
+
+/** engine#369 decision 5: warn (do not download) when the on-disk pack is below the new bundle minVersion. */
+export const refreshDemoPackWarning = async (
+    storeHandle: DocHandle<Store>, instanceDir: string, bundleDir: string, instanceId: InstanceID,
+): Promise<void> => {
+    try {
+        const { readAppDemoSpec, parsePackJson } = await import('./DemoPack.js')
+        const spec = await readAppDemoSpec(bundleDir)
+        const minVersion = spec?.pack?.minVersion
+        const packPath = path.join(instanceDir, 'demo-pack', 'x', 'pack.json')
+        const hasPack = await fs.pathExists(packPath)
+        storeHandle.change(doc => {
+            const i = doc.instanceDB[instanceId] as any
+            if (!i) return
+            if (i.demo !== true || minVersion === undefined || !hasPack) {
+                if (i.demoPackWarning) i.demoPackWarning = null
+                return
+            }
+        })
+        if (minVersion === undefined || !hasPack) return
+        let packVersion: number
+        try { packVersion = parsePackJson(await fs.readFile(packPath, 'utf8')).packVersion } catch { return }
+        storeHandle.change(doc => {
+            const i = doc.instanceDB[instanceId] as any
+            if (!i || i.demo !== true) return
+            if (packVersion < minVersion) i.demoPackWarning = { code: 'PACK_OUTDATED', packVersion, minVersion }
+            else if (i.demoPackWarning) i.demoPackWarning = null
+        })
+    } catch (e) {
+        log(`updateApp: demoPackWarning for ${instanceId}: ${(e as Error).message}`)
+    }
+}
+
 export const readXApp = async (composePath: string): Promise<Record<string, any>> => {
     try { const x = YAML.parse(await fs.readFile(composePath, 'utf8'))?.['x-app']; return x && typeof x === 'object' ? x : {} }
     catch { return {} }
@@ -510,13 +543,17 @@ export const updateApp = async (
             writePreUpdateGate(storeHandle, inst.id, null)
             // ── Swap
             step = 'Swap'; setStep('Swap'); progress('Swap')
+            const liveComposePath = path.join(instDir, 'compose.yaml')
+            const oldX = await readXApp(liveComposePath)
+            const oldDemo = oldX.demo === true ? true as const : undefined
             const targetApps = joinMountRoot(instRoot, 'apps', newAppId)
             if (bundle!.dir !== targetApps) await d.copyBundle(bundle!.dir, targetApps)
             await d.copyBundle(bundle!.dir, instDir)
             const composePath = path.join(instDir, 'compose.yaml')
-            await fs.writeFile(composePath, setComposeInstanceName(await fs.readFile(composePath, 'utf8'), String(inst.name)))
+            await fs.writeFile(composePath, stampComposeInstanceIdentity(await fs.readFile(composePath, 'utf8'), { instanceName: String(inst.name), demo: oldDemo }))
             await d.reread(disk, inst.id)
             done.push('Swap')
+            if (oldDemo) await refreshDemoPackWarning(storeHandle, instDir, bundle!.dir, inst.id)
             // ── Start
             step = 'Start'; setStep('Start'); progress('Start')
             const fresh = storeHandle.doc().instanceDB[inst.id] as Instance

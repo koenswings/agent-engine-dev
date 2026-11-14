@@ -183,6 +183,13 @@ export const backupInstance = async (
     cause: OperationCause = 'console-command',
     preUpdate?: PreUpdateBackupOptions,
 ): Promise<void> => {
+    const instRecEarly = getInstance(storeHandle.doc(), instanceId)
+    if (instRecEarly && (instRecEarly as any).demo === true) {
+        if (cause === 'console-command') throw new Error(`NOT_DEMO: instance ${instanceId} is a demo instance; demo instances are excluded from backups`)
+        log(`Backup of demo instance ${instanceId} skipped`)
+        return
+    }
+
     // If there is no active trace (called from backup monitor, not via Console command),
     // create one so that step markers and log lines land in the Console log panel.
     // The pre-update backup reports its errors to updateApp, so it never swallows them.
@@ -666,6 +673,10 @@ export const processBackupDisk = async (
                 log(`Instance ${instanceId}: not in the store; skipped (orphanLinks)`)
                 continue
             }
+            if ((instance as any).demo === true) {
+                log(`Instance ${instanceId}: demo instance — skipped (engine#369)`)
+                continue
+            }
             if (!instance.storedOn) continue
             const appDisk = store.diskDB[instance.storedOn]
             if (appDisk?.device) {
@@ -707,6 +718,7 @@ export const checkPendingBackups = async (
 
         const staleIds = new Set((candidate.backupStaleLocks ?? []).map(l => String(l.instanceId)))
         for (const instance of instancesOnAppDisk) {
+            if ((instance as any).demo === true) continue
             if (!candidate.backupConfig.links.includes(instance.id)) continue
             const lockPath = candidate.device
                 ? `${disksRoot()}/${candidate.device}/backups/${instance.id}/${LOCK_FILE}`

@@ -5,7 +5,7 @@
  * Before: every 30 s each Engine wrote engineDB[self].lastRun into the shared
  * store doc (8.6k changes/day for 3 Pis, kept forever). Now:
  *   - every HB_INTERVAL_MS (10 s) an automerge-repo ephemeral message on the
- *     store handle: { type: 'idea/hb', v: 1, engineId, now, bootedAt }. Engines
+ *     store handle: { type: 'idea/hb', v: 1, engineId, now, bootedAt } (engine#369 also optional internet and demoLocal). Engines
  *     relay it to every peer of the doc (test/automated/ephemeral-relay.test.ts),
  *     so a Console on any Pi sees every Pi. It is never stored.
  *   - engineDB[self].lastRun is still the stored "last seen" (written at boot and
@@ -20,6 +20,7 @@ import { Store } from './Store.js'
 import { Timestamp } from './CommonTypes.js'
 import { log } from '../utils/utils.js'
 import { currentLanSelection, lanChangeLines, LanSelection } from './LanAddress.js'
+import { peekDemoHbFields } from './DemoApps.js'
 
 export const HB_INTERVAL_MS = 10_000
 export const LAST_SEEN_INTERVAL_MS = 60 * 60 * 1000
@@ -37,6 +38,10 @@ export interface HbMessage {
     /** engine#352; absent on old Engines (those are not a time source). */
     ntpSynced?: boolean
     clockTrusted?: boolean
+    /** engine#369: cached hasInternet(), re-probed at most every 60 s. Absent on old Engines. */
+    internet?: boolean
+    /** engine#369: setupDemo can finish fully offline. Recomputed on dock/undock/USB plug. */
+    demoLocal?: boolean
 }
 
 /** A live peer's clock as the scheduler sees it (estimated now, not stored). */
@@ -154,6 +159,9 @@ export const hbMessage = (
         msg.ntpSynced = !!clock.ntpSynced
         msg.clockTrusted = !!clock.clockTrusted
     }
+    const d = peekDemoHbFields()
+    if (typeof d.internet === 'boolean') msg.internet = d.internet
+    if (typeof d.demoLocal === 'boolean') msg.demoLocal = d.demoLocal
     return msg
 }
 

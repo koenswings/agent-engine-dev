@@ -598,6 +598,25 @@ const ejectDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskIdOrNa
     print(chalk.green(`Disk ${label} ejected successfully.`));
 }
 
+/** setupDemo <targetDiskId> [--apps kolibri,nextcloud] (engine#369). Trace args: { targetDiskId, apps }. */
+const setupDemoWrapper = async (storeHandle: DocHandle<Store> | null, targetDiskId: string, ...rest: string[]) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    const { setupDemo, parseAppsFlag } = await import('./DemoApps.js')
+    const apps = parseAppsFlag(rest)
+    const result = await setupDemo(storeHandle, targetDiskId, apps)
+    attachTraceResult(result)
+    print(chalk.green(`setupDemo: ${result.code} (${result.apps.map(a => `${a.app} ${a.instanceId}`).join(', ')})`))
+}
+
+/** removeDemo [<instanceId>...] (engine#369). Trace args: { instanceIds }. Bare form removes every docked demo. */
+const removeDemoWrapper = async (storeHandle: DocHandle<Store> | null, ...instanceIds: string[]) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    const { removeDemo } = await import('./DemoApps.js')
+    const result = await removeDemo(storeHandle, instanceIds)
+    attachTraceResult(result)
+    print(chalk.green(`removeDemo: ${result.code} (${result.removed.length} instance(s))`))
+}
+
 export const commands: CommandDefinition[] = [
     { name: "ls", execute: ls, args: [], scope: 'any' },
     { name: "engines", execute: lsEngines, args: [], scope: 'any' },
@@ -673,10 +692,13 @@ export const commands: CommandDefinition[] = [
         if (!storeHandle) throw new Error('Store is not available.')
         await initialiseDisk(storeHandle, candidateId, role ?? 'empty')
     }, args: [{ type: "string", name: "candidateId" }, { type: "string", name: "role", optional: true }], scope: 'engine' },
+
     { name: "cancelOperation", execute: async (storeHandle: DocHandle<Store> | null, opId: string) => {
         if (!storeHandle) throw new Error('Store is not available.')
         const err = cancelOperation(storeHandle, opId)
         if (err) throw new Error(`cancelOperation: ${err}`)
         print(chalk.green(`Operation ${opId} cancelled`))
     }, args: [{ type: "string" }], scope: 'engine' },
+    { name: "setupDemo", execute: setupDemoWrapper, args: [{ type: "string", name: "targetDiskId" }, { type: "string", name: "apps", optional: true, variadic: true }], scope: 'engine' },
+    { name: "removeDemo", execute: removeDemoWrapper, args: [{ type: "string", name: "instanceIds", variadic: true, optional: true }], scope: 'engine' },
 ];

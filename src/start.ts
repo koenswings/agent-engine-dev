@@ -8,7 +8,7 @@ import { startLiveness, writeLastSeen } from './data/Liveness.js'
 import { $, chalk, fs, sleep } from 'zx'
 import { deepPrint, log, print } from './utils/utils.js'
 import { config, peerAccessEnabled, peerStaleMs } from './data/Config.js'
-import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId, checkBackupCleanupCapability, checkPreUpdateQuarantineCapability } from './data/Engine.js'
+import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId, checkBackupCleanupCapability, checkPreUpdateQuarantineCapability, checkDemoAppsCapability } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
 import { enableHttpMonitor } from './monitors/httpMonitor.js'
 import { enableIdeaLocalPublisher, IdeaLocalPublisher } from './monitors/ideaLocal.js'
@@ -129,10 +129,12 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // Must run before createOrUpdateEngine writes Engine.capabilities.
     await checkBackupCleanupCapability()
     await checkPreUpdateQuarantineCapability()
+    checkDemoAppsCapability()
 
     // Create or update the local engine object
     const engine = await createOrUpdateEngine(storeHandle, localEngineId)
     await storeHandle.whenReady()
+    await import('./data/DemoApps.js').then(m => m.refreshDemoHb(storeHandle, String(localEngineId))).catch(e => log(`demo hb: ${e}`))
     const store = storeHandle.doc()
 
     // Remove any phantom engine entries and orphan disks that accumulated
