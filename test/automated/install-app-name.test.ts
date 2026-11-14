@@ -8,6 +8,7 @@
  *      record; the instance id and folder (= Docker project name) stay the
  *      generated id, free of spaces.
  *   4. --fresh starts from the app bundle: no source instance data is copied.
+ *   5. --source without --fresh also copies the whole bundle when there is no source instance (idea#495).
  *
  * Real files in pretend disks under the disks root (idea-test-7x);
  * processInstance registers the instance from compose.yaml but never runs Docker.
@@ -183,6 +184,18 @@ describe('installApp --name / --fresh (Kid, idea#235)', () => {
             const [id] = await newInstanceIds()
             expect(await fs.readFile(`${tgtRoot()}/instances/${id}/data/kolibri/db.sqlite3`, 'utf8')).toBe('school-data')
             expect(YAML.parse(await fs.readFile(`${tgtRoot()}/instances/${id}/compose.yaml`, 'utf8'))['x-app'].instanceName).toBe('Kolibri Copy')
+        })
+
+        it('--source without --fresh still copies a bind-mounted bundle script when there is no source instance (idea#495)', async () => {
+            h.change(doc => { delete (doc.instanceDB as any)[ORIG] })
+            await installAppFromDisk(h, APP, h.doc().diskDB[SRC] as any, h.doc().diskDB[TGT] as any, 'Nextcloud' as any)
+            const [id] = await newInstanceIds()
+            const inst = `${tgtRoot()}/instances/${id}`
+            expect((await fs.readdir(inst)).sort()).toEqual(
+                ['bundled-apps', 'compose.yaml', 'docker-entrypoint-hooks.d', 'idea-files-entrypoint.sh', 'usb-sync.sh'])
+            expect(await fs.pathExists(`${inst}/idea-files-entrypoint.sh`)).toBe(true)
+            expect(await fs.readFile(`${inst}/idea-files-entrypoint.sh`, 'utf8')).toBe('#!/bin/sh\n')
+            expect(await fs.pathExists(`${inst}/data`)).toBe(false)
         })
     })
 })
