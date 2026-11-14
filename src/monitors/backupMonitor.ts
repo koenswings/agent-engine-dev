@@ -198,7 +198,7 @@ export const backupInstance = async (
     if (!getActiveTrace() && !preUpdate) {
         const cmdLogHandle = getCommandLogHandle()
         const traceId = crypto.randomUUID()
-        const traceArgs = JSON.stringify({ instanceId, backupDiskId: backupDisk.id, cause })
+        const traceArgs = JSON.stringify({ instanceId, instanceName: instRecEarly?.name != null ? String(instRecEarly.name) : null, backupDiskId: backupDisk.id, cause })
         if (cmdLogHandle) addTrace(cmdLogHandle, { traceId, command: 'backupApp', args: traceArgs, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
         return runWithTrace({ traceId, command: 'backupApp', args: traceArgs }, async () => {
             await backupInstance(storeHandle, instanceId, backupDisk, existingOpId, cause)

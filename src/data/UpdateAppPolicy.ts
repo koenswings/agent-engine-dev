@@ -67,6 +67,11 @@ export interface CheckFacts {
      * required backup itself (hook before the stop, or Borg inside the Snapshot stop).
      */
     backupPlanned?: boolean
+    /**
+     * idea#403: the live compose's x-app.backup.method. 'none' declares there is nothing to
+     * back up, so a major update never refuses NEEDS_BACKUP for it.
+     */
+    backupMethod?: 'stop' | 'hook' | 'none'
 }
 
 /**
@@ -133,7 +138,7 @@ export const checkUpdate = (f: CheckFacts): UpdateAppError | null => {
     const major = isMajorChange(cur.version, nxt.version)
     if (major && !f.allowMajor) return new UpdateAppError('MAJOR_NOT_ALLOWED', `${cur.version} -> ${nxt.version} is a major update; pass --allow-major`)
     if (major && !majorAllowedByUpdatesFrom(cur.version, f.updatesFrom)) return new UpdateAppError('MAJOR_NOT_ALLOWED', `version ${nxt.version} cannot update directly from major ${parseVersion(cur.version)?.[0]}; supported: ${(f.updatesFrom as unknown[]).join(', ') || 'none'}`)
-    if (major && (f.backupAgeMs === null || f.backupAgeMs > BACKUP_MAX_AGE_MS) && !f.backupPlanned)
+    if (major && f.backupMethod !== 'none' && (f.backupAgeMs === null || f.backupAgeMs > BACKUP_MAX_AGE_MS) && !f.backupPlanned)
         return new UpdateAppError('NEEDS_BACKUP', 'Dock a Backup Disk linked to this instance (updateApp then takes the backup itself), or make a backup first')
     if (f.shortDisks.length) return new UpdateAppError('NO_SPACE', `not enough free space on ${f.shortDisks.join(', ')}`)
     return null

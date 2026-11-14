@@ -524,14 +524,14 @@ const createFilesDiskWrapper = async (storeHandle: DocHandle<Store> | null, disk
     print(chalk.green(`'${disk.name}' (${disk.id}) is now a Files Disk (disk types: ${disk.diskTypes.join(', ')}).`))
 }
 
-const copyAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, sourceDiskId: DiskID, targetDiskId: DiskID) => {
+const copyAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: InstanceName, sourceDiskId: DiskID, targetDiskId: DiskID) => {
     if (!storeHandle) throw new Error('Store is not available.')
-    await copyApp(storeHandle, instanceName, sourceDiskId, targetDiskId, 'console-command')
+    await copyApp(storeHandle, instanceArg, sourceDiskId, targetDiskId, 'console-command')
 }
 
-const moveAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, sourceDiskId: DiskID, targetDiskId: DiskID) => {
+const moveAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: InstanceName, sourceDiskId: DiskID, targetDiskId: DiskID) => {
     if (!storeHandle) throw new Error('Store is not available.')
-    const result = await moveApp(storeHandle, instanceName, sourceDiskId, targetDiskId, 'console-command')
+    const result = await moveApp(storeHandle, instanceArg, sourceDiskId, targetDiskId, 'console-command')
     if (result) {
         const { moveCommandOutcome } = await import('./MoveAppRemote.js')
         moveCommandOutcome(result)
@@ -658,12 +658,14 @@ export const commands: CommandDefinition[] = [
     },
     { name: "installApp", execute: installAppWrapper, args: [{ type: "string" }], scope: 'engine' },
     { name: "createInstance", execute: createInstanceWrapper, args: [{ type: "string" }, { type: "string" }, { type: "string" }, { type: "string" }, { type: "string" }], scope: 'engine' },
-    // Instance args resolve id-first (idea#168, InstanceArg.ts). The trace arg key stays
-    // 'instanceName' (Console trace filters read it). startInstance takes optional flags
+    // Instance args resolve id-first (idea#168, InstanceArg.ts). The trace arg key is
+    // 'instanceId' (engine#399; it was 'instanceName' but held whatever was sent, usually
+    // the id); the trace also gets 'instanceName', the display name (commandUtils
+    // addTraceInstanceIdentity). startInstance takes optional flags
     // (`--cause <cause>`, sent by the cross-engine copyApp dispatch).
-    { name: "startInstance", execute: startInstanceWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "diskId" }, { type: "string", name: "options", variadic: true, optional: true }], scope: 'engine' },
-    { name: "runInstance", execute: runInstanceWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "diskId" }], scope: 'engine' },
-    { name: "stopInstance", execute: stopInstanceWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "diskId" }], scope: 'engine' },
+    { name: "startInstance", execute: startInstanceWrapper, args: [{ type: "string", name: "instanceId" }, { type: "string", name: "diskId" }, { type: "string", name: "options", variadic: true, optional: true }], scope: 'engine' },
+    { name: "runInstance", execute: runInstanceWrapper, args: [{ type: "string", name: "instanceId" }, { type: "string", name: "diskId" }], scope: 'engine' },
+    { name: "stopInstance", execute: stopInstanceWrapper, args: [{ type: "string", name: "instanceId" }, { type: "string", name: "diskId" }], scope: 'engine' },
     {
         name: "reboot",
         execute: rebootWrapper,
@@ -678,8 +680,8 @@ export const commands: CommandDefinition[] = [
     },
     { name: "connect", execute: connect, args: [{ type: "string" }], scope: 'any' },
     { name: "disconnect", execute: disconnect, args: [], scope: 'any' },
-    { name: "copyApp", execute: copyAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
-    { name: "moveApp", execute: moveAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
+    { name: "copyApp", execute: copyAppWrapper, args: [{ type: "string", name: "instanceId" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
+    { name: "moveApp", execute: moveAppWrapper, args: [{ type: "string", name: "instanceId" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
     { name: "verifyMoveTarget", execute: verifyMoveTargetWrapper, args: [{ type: "string", name: "opId" }, { type: "string", name: "instanceId" }, { type: "string", name: "expectedBytes" }, { type: "string", name: "expectRunning" }], scope: 'engine' },
     { name: "cleanupMoveTarget", execute: cleanupMoveTargetWrapper, args: [{ type: "string", name: "opId" }, { type: "string", name: "instanceId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
     { name: "ejectDisk", execute: ejectDiskWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
@@ -687,17 +689,17 @@ export const commands: CommandDefinition[] = [
     // backupApp / restoreApp (idea#168): the instance is an id or unique name, the disk
     // an id or unique docked name (resolveInstanceArg / resolveDiskArg). backupApp's
     // disk is optional (engine#394): omitted, the wrapper picks a Backup Disk docked
-    // on this Engine. The trace arg keys stay 'instanceName' / 'backupDiskId'
-    // (Console trace filters read them; backupDiskId is null when omitted).
-    { name: "backupApp", execute: backupAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId", optional: true }], scope: 'engine' },
-    { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
+    // on this Engine. The trace arg keys are 'instanceId' (plus the derived
+    // 'instanceName', engine#399) / 'backupDiskId' (null when omitted).
+    { name: "backupApp", execute: backupAppWrapper, args: [{ type: "string", name: "instanceId" }, { type: "string", name: "backupDiskId", optional: true }], scope: 'engine' },
+    { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string", name: "instanceId" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "mode" }, { type: "string", name: "instanceNames", variadic: true }], scope: 'engine' },
-    { name: "listBackup", execute: listBackupWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }, { type: "string", name: "archive", variadic: true, optional: true }], scope: 'engine' },
-    { name: "verifyBackup", execute: verifyBackupWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }, { type: "string", name: "archive", variadic: true, optional: true }], scope: 'engine' },
-    { name: "clearBackupLock", execute: clearBackupLockWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
+    { name: "listBackup", execute: listBackupWrapper, args: [{ type: "string", name: "instanceId" }, { type: "string", name: "backupDiskId" }, { type: "string", name: "archive", variadic: true, optional: true }], scope: 'engine' },
+    { name: "verifyBackup", execute: verifyBackupWrapper, args: [{ type: "string", name: "instanceId" }, { type: "string", name: "backupDiskId" }, { type: "string", name: "archive", variadic: true, optional: true }], scope: 'engine' },
+    { name: "clearBackupLock", execute: clearBackupLockWrapper, args: [{ type: "string", name: "instanceId" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "removeBackupRole", execute: removeBackupRoleWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
-    { name: "addBackupLink", execute: addBackupLinkWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
-    { name: "removeBackupLink", execute: removeBackupLinkWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
+    { name: "addBackupLink", execute: addBackupLinkWrapper, args: [{ type: "string", name: "instanceId" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
+    { name: "removeBackupLink", execute: removeBackupLinkWrapper, args: [{ type: "string", name: "instanceId" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "setBackupMode", execute: setBackupModeWrapper, args: [{ type: "string", name: "backupDiskId" }, { type: "string", name: "mode" }, { type: "string", name: "time", variadic: true, optional: true }], scope: 'engine' },
     { name: "createFilesDisk", execute: createFilesDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "shareName", variadic: true, optional: true }], scope: 'engine' },
     { name: "removeInstance", execute: removeInstanceWrapper, args: [{ type: "string", name: "instanceId" }], scope: 'engine' },

@@ -136,12 +136,12 @@ describe('registration and capability (idea#451)', () => {
         expect(ENGINE_CAPABILITIES).toContain('backupVerify')
     })
 
-    it('registers both commands with instanceName + backupDiskId trace args, engine scope', () => {
+    it('registers both commands with instanceId + backupDiskId trace args, engine scope (engine#399)', () => {
         for (const name of ['addBackupLink', 'removeBackupLink']) {
             const def = commands.find(c => c.name === name)
             expect(def, name).toBeDefined()
             expect(def!.scope).toBe('engine')
-            expect(def!.args.map((a: any) => a.name)).toEqual(['instanceName', 'backupDiskId'])
+            expect(def!.args.map((a: any) => a.name)).toEqual(['instanceId', 'backupDiskId'])
         }
     })
 })

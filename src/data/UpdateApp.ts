@@ -447,6 +447,9 @@ export const updateApp = async (
         let live: Awaited<ReturnType<typeof readComposeBackup>> | undefined
         const newCompose = bundle ? path.join(bundle.dir, 'compose.yaml') : ''
         const backupAgeMs = inst.lastBackup ? d.now() - Number(inst.lastBackup) : null
+        // idea#403: method none has nothing to back up (no NEEDS_BACKUP). Read best-effort here so
+        // NEEDS_BACKUP / MAJOR / NO_SUMS keep their order; a malformed spec refuses BAD_BACKUP_SPEC below.
+        const liveBackupMethod = await readComposeBackup(path.join(instDir, 'compose.yaml'), 'live').then(r => r.method, () => undefined)
         const backupDisk = backupIsDue(String(inst.instanceOf), newAppId, backupAgeMs) ? linkedBackupDisk(store, engineId, inst) : null
         const facts = {
             diskDocked: true, busy: !gotLock, currentAppId: String(inst.instanceOf), newAppId,
@@ -456,6 +459,7 @@ export const updateApp = async (
             shortDisks: [] as string[],
             updatesFrom: bundle ? (await readXApp(path.join(bundle.dir, 'compose.yaml'))).updatesFrom : undefined,
             backupPlanned: !!backupDisk,
+            backupMethod: liveBackupMethod,
         }
         // NEEDS_BACKUP / MAJOR / NO_SUMS still win over exclude parsing (existing agreed order).
         const early = checkUpdate(facts)

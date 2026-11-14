@@ -23,8 +23,9 @@ import {
     runAppData, appDataErrorMessage, appDataHelperProblem, assertAppDataHelper,
     instanceDataBytes, deleteInstanceData, deleteRemoteInstanceData,
     remoteEnsureDirsSshArgs, ensureDirsArgs, receiveAppArgs, receiveServiceArgs, receiveFilesArgs, putFilesArgs,
-    remoteHelperCommand, remoteHelperRsyncPath, runAppDataWithInput,
+    remoteHelperCommand, remoteHelperRsyncPath, runAppDataWithInput, syncPeersArgs,
 } from '../../src/utils/appDataHelper.js'
+import { peerLine } from '../harness/peerKeys.js'
 import { peerSshOptions } from '../../src/utils/peerSsh.js'
 import { rsyncInstanceData, instanceDataTransferArgs } from '../../src/utils/rsync.js'
 import { config } from '../../src/data/Config.js'
@@ -286,10 +287,14 @@ describe('runAppDataWithInput (sync-peers)', () => {
         try {
             process.env.FAKE_HELPER = sb.script
             process.env.SUDO_USER = 'pi'
-            const out = await runAppDataWithInput(['sync-peers'], '')
-            expect(out.trim()).toBe('sync-peers: 0 peer(s); authorized_keys updated; known_hosts updated')
-            expect(await sudoCalls()).toEqual([['-n', '/usr/local/sbin/idea-app-data', 'sync-peers']])
-            await expect(runAppDataWithInput(['sync-peers'], 'garbage\n')).rejects.toThrow(/^idea-app-data sync-peers refused: peer line 1 is not/)
+            const out = await runAppDataWithInput(syncPeersArgs('ENGINE_me', '2VroEUvDkmYsDAwE5oG9YeFNadWH'), `${peerLine('ENGINE_b')}\n`)
+            expect(out.trim()).toBe('sync-peers: 1 peer(s); authorized_keys updated; known_hosts updated; owner ENGINE_me 2VroEUvDkmYsDAwE5oG9YeFNadWH recorded')
+            expect(await sudoCalls()).toEqual([['-n', '/usr/local/sbin/idea-app-data', 'sync-peers', 'ENGINE_me', '2VroEUvDkmYsDAwE5oG9YeFNadWH']])
+            await expect(runAppDataWithInput(syncPeersArgs('ENGINE_me', 'automerge:2VroEUvDkmYsDAwE5oG9YeFNadWH'), 'garbage\n')).rejects.toThrow(/^idea-app-data sync-peers refused: peer line 1 is not/)
+            await expect(runAppDataWithInput(syncPeersArgs('ENGINE_me', '2VroEUvDkmYsDAwE5oG9YeFNadWH'), '')).rejects.toThrow(/^idea-app-data sync-peers refused: PEER_SHRINK_TO_EMPTY: /)
+            await expect(runAppDataWithInput(syncPeersArgs('ENGINE_other', '2VroEUvDkmYsDAwE5oG9YeFNadWH'), `${peerLine('ENGINE_b')}\n`)).rejects.toThrow(/^idea-app-data sync-peers refused: PEER_OWNER_MISMATCH: /)
+            expect(() => syncPeersArgs('ENGINE_me', '../etc')).toThrow(/not a store document id/)
+            expect(() => syncPeersArgs('-x', '2VroEUvDkmYsDAwE5oG9YeFNadWH')).toThrow(/not an Engine id/)
         } finally { await fs.remove(sb.tmp) }
     })
 })

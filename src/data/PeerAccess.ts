@@ -26,8 +26,21 @@
  *
  * Fail closed: when store-url.txt was missing and the Engine wrote back the fleet
  * store URL (StoreIdentity), this Engine does not know it is in the right store:
- * it publishes no key (peerAccess = null), authorizes nobody (sync-peers with the
- * empty set) and says so loudly until Ops confirms the store.
+ * it publishes no key (peerAccess = null) and says so loudly until Ops confirms the
+ * store. It does NOT touch the host peer files: the keys already there stay
+ * (engine#376, Koen 2026-11-14: emptying them could lock out the pool's peers).
+ *
+ * The host peer files are host-wide, one pair per Pi (engine#376). A second Engine on
+ * the same Pi (another checkout, an isolated store) must never rewrite them, so:
+ *   - host-file mode 'on' only for a known fleet store (isKnownFleetStoreId), never in
+ *     testMode or with IDEA_WATCH_DIR (startPeerAccess);
+ *   - an empty peer set never calls sync-peers; the files stay as they are (only Ops
+ *     empties them, by hand, with idea-app-data clear-peers);
+ *   - sync-peers names this Engine's id and store (helper v15), and the helper refuses
+ *     another owner (PEER_OWNER_MISMATCH) or an empty set over a non-empty file
+ *     (PEER_SHRINK_TO_EMPTY);
+ *   - below helper v15 (PEER_FILES_HELPER_MIN) the Engine does not call sync-peers and
+ *     logs HELPER_OUTDATED.
  */
 
 import { peerLiveSeen } from './Liveness.js'
@@ -39,7 +52,8 @@ import { print } from '../utils/utils.js'
 import type { Store } from './Store.js'
 import type { Engine, PeerAccess } from './Engine.js'
 import type { Timestamp } from './CommonTypes.js'
-import { AppDataInputRunner, runAppDataWithInput } from '../utils/appDataHelper.js'
+import { AppDataInputRunner, runAppDataWithInput, helperAtLeast, syncPeersArgs, PEER_FILES_HELPER_MIN, STORE_DOC_ID_RE } from '../utils/appDataHelper.js'
+import { isKnownFleetStoreId, storeDocIdFromUrl } from './StoreIdentity.js'
 import {
     PEER_KEY_PATH, HOST_KEY_PUB, ENGINE_ID_RE,
     normaliseEd25519, keyFingerprint,
@@ -264,6 +278,16 @@ export interface PeerAccessOptions {
     /** why peer access is not 'on' (shown in copy refusals) */
     reason?: string
     run?: AppDataInputRunner
+    /**
+     * This Engine's store document id (bare or automerge: URL). sync-peers names it
+     * (helper v15, engine#376); without it mode 'on' never calls sync-peers.
+     */
+    storeDocId?: string
+    /**
+     * null when the installed helper is at least PEER_FILES_HELPER_MIN, else the
+     * HELPER_OUTDATED message. Default: `version` through `run`.
+     */
+    checkHelper?: () => Promise<string | null>
     now?: () => number
     staleMs?: number
     /** last live ping per peer (default Liveness.peerLiveSeen) */
@@ -289,11 +313,17 @@ export class PeerAccessController {
     private chain: Promise<void> = Promise.resolve()
     private unsubscribe: (() => void) | null = null
     private readonly run: AppDataInputRunner
+    private readonly checkHelper: () => Promise<string | null>
+    private helperOk = false
+    private lastHelperProblem: string | null = null
+    private lastSyncError: string | null = null
     private readonly now: () => number
     private readonly say: (line: string) => void
 
     constructor(private readonly handle: DocHandle<Store>, private readonly localEngineId: string, private readonly opts: PeerAccessOptions) {
         this.run = opts.run ?? runAppDataWithInput
+        this.checkHelper = opts.checkHelper ?? (() => helperAtLeast(PEER_FILES_HELPER_MIN,
+            'Peer access (sync-peers with the owner check and shrink guard, engine#376)', args => this.run(args, '')))
         this.now = opts.now ?? Date.now
         this.say = opts.logger ?? ((l: string) => print(l))
     }
@@ -309,9 +339,9 @@ export class PeerAccessController {
         }
         if (this.opts.mode === 'fail-closed') {
             localProblem = this.opts.reason ?? 'this Engine is not sure it is in the right store'
-            this.say(chalk.bgRed.white(`PEER ACCESS FAIL-CLOSED: ${localProblem}. This Engine publishes no Engine key and authorizes no peer.`))
+            this.say(chalk.bgRed.white(`PEER ACCESS FAIL-CLOSED: ${localProblem}. This Engine publishes no Engine key and authorizes no new peer; ` +
+                `the peer keys already on this Pi are kept as they are (engine#376).`))
             publishPeerAccess(this.handle, this.localEngineId, null, this.now(), this.say)
-            await this.syncNow()
             return
         }
         localProblem = null
@@ -382,30 +412,65 @@ export class PeerAccessController {
     }
 
     private async sync(): Promise<void> {
+        // engine#376: only mode 'on' ever touches the host peer files (fail-closed and off never do)
+        if (this.opts.mode !== 'on') return
         const store = this.handle.doc()
         if (!store) return
-        const { peers, skipped } = this.opts.mode === 'on'
-            ? computePeerSet(store, this.localEngineId, this.now(), this.opts.staleMs ?? PEER_STALE_MS, this.opts.liveSeen ?? peerLiveSeen)
-            : { peers: [] as PeerLine[], skipped: [] as SkippedPeer[] }
+        const { peers, skipped } = computePeerSet(store, this.localEngineId, this.now(), this.opts.staleMs ?? PEER_STALE_MS, this.opts.liveSeen ?? peerLiveSeen)
         const input = peerSetInput(peers)
         if (input !== this.lastInput) {
             for (const s of skipped) this.say(chalk.yellow(`peer access: not authorizing Engine ${s.engineId}: ${s.reason}`))
+            if (peers.length === 0) {
+                // engine#376: never call sync-peers with an empty set (a fresh or isolated
+                // store view would empty this Pi's host-wide files). Keep them; say so loudly.
+                const from = this.lastInput !== null && this.lastPeers.length > 0 ? ` (it went from ${this.lastPeers.length} to 0: store reset, or every peer stale/removed)` : ''
+                this.say(chalk.bgRed.white(`peer access: the peer set in this Engine's store is empty${from}; NOT calling sync-peers, the peer keys already on this Pi are kept as they are. ` +
+                    `Only Ops empties them, by hand, with idea-app-data clear-peers (engine#376)`))
+                for (const l of describePeerChanges(this.lastInput === null ? [] : this.lastPeers, peers, skipped)) this.say(`peer access: ${l} (in this Engine's store; the host files are unchanged)`)
+                this.lastInput = input
+                this.lastPeers = peers
+                return
+            }
+            if (!this.helperOk) {
+                const problem = await this.checkHelper().catch((e: any) => `cannot check the app-data helper version: ${e?.message ?? e}`)
+                if (problem) {
+                    if (problem !== this.lastHelperProblem) {
+                        this.say(chalk.bgRed.white(`peer access: HELPER_OUTDATED: ${problem} Not calling sync-peers; the peer keys already on this Pi are kept as they are (engine#376).`))
+                    }
+                    this.lastHelperProblem = problem
+                    return   // retried on the next change or heartbeat
+                }
+                this.helperOk = true
+                this.lastHelperProblem = null
+            }
+            const docId = this.opts.storeDocId ? storeDocIdFromUrl(this.opts.storeDocId) : ''
+            if (!STORE_DOC_ID_RE.test(docId)) {
+                this.say(chalk.red(`peer access: this Engine's store document id '${docId || '(none)'}' is not one sync-peers accepts; not calling sync-peers (engine#376)`))
+                return
+            }
             try {
-                const out = await this.run(['sync-peers'], input)
+                const out = await this.run(syncPeersArgs(this.localEngineId, docId), input)
                 if (out.trim()) this.say(`peer access: ${out.trim()}`)
+                this.lastSyncError = null
             } catch (e: any) {
-                this.say(chalk.red(`peer access: idea-app-data sync-peers failed (${peers.length} peer(s)); retrying on the next change or heartbeat: ${e?.message ?? e}`))
+                const msg = String(e?.message ?? e)
+                const loud = /PEER_OWNER_MISMATCH|PEER_SHRINK_TO_EMPTY/.test(msg)
+                if (msg !== this.lastSyncError || !loud) {
+                    const line = `peer access: idea-app-data sync-peers failed (${peers.length} peer(s)); retrying on the next change or heartbeat: ${msg}`
+                    this.say(loud ? chalk.bgRed.white(line) : chalk.red(line))
+                }
+                this.lastSyncError = msg
                 return
             }
             for (const l of describePeerChanges(this.lastInput === null ? [] : this.lastPeers, peers, skipped)) {
                 this.say(/CHANGED/.test(l) ? chalk.bgRed.white(`peer access: ${l}`) : `peer access: ${l}`)
             }
-            if (this.lastInput !== null && this.lastPeers.length > 0 && peers.length === 0) {
-                this.say(chalk.yellow(`peer access: the peer set went from ${this.lastPeers.length} to 0 (store reset, or every peer stale/removed); keys come back as peers re-publish`))
-            }
             this.lastInput = input
             this.lastPeers = peers
         }
+        // engine#376: with an empty set the host files were not touched, so what this
+        // Engine listed as authorized is still what they hold
+        if (peers.length === 0) return
         this.writeAuthorized(peers)
     }
 
@@ -428,15 +493,48 @@ export class PeerAccessController {
  * Start peer access for this Engine (start.ts). `fallbackStore`: store-url.txt was
  * missing and the fleet store URL was written back (fail closed).
  */
-export const startPeerAccess = async (handle: DocHandle<Store>, localEngineId: string, o: { enabled: boolean, fallbackStore: boolean, storeUrlPath?: string, staleMs?: number }): Promise<PeerAccessController> => {
-    const mode: PeerAccessMode = !o.enabled ? 'off' : o.fallbackStore ? 'fail-closed' : 'on'
-    const reason = mode === 'off'
-        ? 'peer access is off on this machine (dev container or test mode, or settings.peerAccess=false)'
-        : mode === 'fail-closed'
-            ? `store-url.txt was missing, so the Engine wrote back the fleet store URL and cannot tell it is in its own store. ` +
-              `Check ${o.storeUrlPath ?? 'store-identity/store-url.txt'}, then delete store-identity/store-url.restored and restart the Engine`
-            : undefined
-    const c = new PeerAccessController(handle, localEngineId, { mode, reason, staleMs: o.staleMs })
+export interface StartPeerAccessOptions {
+    enabled: boolean
+    fallbackStore: boolean
+    storeUrlPath?: string
+    staleMs?: number
+    /** This Engine's store document id or URL (engine#376: host files only for a known fleet store). */
+    storeDocId?: string
+    /** config.settings.testMode / IDEA_WATCH_DIR set (engine#376: never touch the host files then). */
+    testMode?: boolean
+    watchDirSet?: boolean
+    /** Tests: helper runner, helper version check, logger, key paths, clock. */
+    run?: AppDataInputRunner
+    checkHelper?: () => Promise<string | null>
+    logger?: (line: string) => void
+    keyPath?: string
+    hostKeyPath?: string
+    now?: () => number
+}
+
+/** Mode and reason for startPeerAccess (pure; engine#376). */
+export const peerAccessModeFor = (o: StartPeerAccessOptions): { mode: PeerAccessMode, reason?: string } => {
+    if (!o.enabled) return { mode: 'off', reason: 'peer access is off on this machine (dev container or test mode, or settings.peerAccess=false)' }
+    if (o.testMode || o.watchDirSet) {
+        return { mode: 'off', reason: `${o.testMode ? 'testMode is on' : 'IDEA_WATCH_DIR is set'}, so this Engine never rewrites this Pi's host-wide peer files (engine#376)` }
+    }
+    if (o.fallbackStore) {
+        return { mode: 'fail-closed', reason: `store-url.txt was missing, so the Engine wrote back the fleet store URL and cannot tell it is in its own store. ` +
+            `Check ${o.storeUrlPath ?? 'store-identity/store-url.txt'}, then delete store-identity/store-url.restored and restart the Engine` }
+    }
+    if (!o.storeDocId || !isKnownFleetStoreId(o.storeDocId)) {
+        return { mode: 'off', reason: `this Engine's store ${o.storeDocId ? `automerge:${storeDocIdFromUrl(o.storeDocId)}` : '(unknown)'} is not a known fleet store, ` +
+            `so it never rewrites this Pi's host-wide peer files (engine#376)` }
+    }
+    return { mode: 'on' }
+}
+
+export const startPeerAccess = async (handle: DocHandle<Store>, localEngineId: string, o: StartPeerAccessOptions): Promise<PeerAccessController> => {
+    const { mode, reason } = peerAccessModeFor(o)
+    const c = new PeerAccessController(handle, localEngineId, {
+        mode, reason, staleMs: o.staleMs, storeDocId: o.storeDocId,
+        run: o.run, checkHelper: o.checkHelper, logger: o.logger, keyPath: o.keyPath, hostKeyPath: o.hostKeyPath, now: o.now,
+    })
     await c.start()
     return c
 }

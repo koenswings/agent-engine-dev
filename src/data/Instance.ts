@@ -27,6 +27,7 @@ import { rebindKolibriMorangoInstanceId } from './InstanceCopy.js'
 import { hostIdentity, writeHostIdentityEnv, nextcloudUrl, writeNextcloudUrlEnv, isNextcloudInstance, nextcloudTrustedDomainsBridge, hostNetworkInterfaces } from './HostIdentity.js'
 import { trackInFlight, startDiskGoneReason, dockIdentityOf } from './InstanceInFlight.js'
 import { setPortReadyProgress } from './PortReadyProgress.js'
+import { parseBackupSpec, type BackupMethod } from '../utils/backupMethod.js'
 
 // ── Step-progress helpers ─────────────────────────────────────────────────────
 
@@ -120,7 +121,7 @@ const addStandaloneStartTrace = (
   addTrace(handle, {
     traceId,
     command: START_INSTANCE_COMMAND,
-    args: JSON.stringify({ instanceName: instance.name, instanceId: instance.id, diskId: disk.id, cause }),
+    args: JSON.stringify({ instanceId: instance.id, instanceName: instance.name, diskId: disk.id, cause }),
     startedAt: pendingWarnings[0]?.timestamp ?? Date.now(),
     completedAt: null,
     status: 'running',
@@ -140,7 +141,7 @@ const addStandaloneStartTrace = (
  *   closeTrace never turns an 'error' trace back into 'ok', so the caller's
  *   own closing call cannot hide the failure.
  * - Otherwise: a completed `startInstance` trace with status 'error' is added,
- *   with args { instanceName, instanceId, diskId, cause } and the pending
+ *   with args { instanceId, instanceName, diskId, cause } and the pending
  *   warnings as 'warn' log lines.
  *
  * Never throws: recording the failure must not break the caller.
@@ -306,6 +307,13 @@ export interface Instance {
   demo?: true;
   /** On-disk demo pack is older than the running bundle's demo.pack.minVersion (engine#369). Set by updateApp, cleared by setupDemo. */
   demoPackWarning?: DemoPackWarning | null;
+  /**
+   * idea#403: the App's declared backup method, mirrored from compose.yaml x-app.backup.method
+   * ('stop' when x-app.backup or its method is absent, the same default the backup code uses).
+   * Absent when the compose's x-app.backup is invalid (backups then refuse BAD_BACKUP_SPEC) and
+   * on records written before idea#403. Optional: do not add to store-template.json.
+   */
+  backupMethod?: BackupMethod;
 }
 
 /** engine#369 addendum decision 5 / contract: warning only, no auto-download. */
@@ -790,6 +798,17 @@ export const applyDemoFlag = (instance: Instance, compose: any): void => {
   }
 }
 
+/** idea#403: mirror x-app.backup.method onto the record; an invalid x-app.backup leaves it unset. */
+export const backupMethodFromCompose = (compose: any): BackupMethod | undefined => {
+  try { return parseBackupSpec(compose?.['x-app']).method } catch { return undefined }
+}
+
+export const applyBackupMethod = (instance: Instance, compose: any): void => {
+  const method = backupMethodFromCompose(compose)
+  if (method) { if (instance.backupMethod !== method) instance.backupMethod = method }
+  else if ('backupMethod' in instance) delete instance.backupMethod
+}
+
 export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, instanceId: InstanceID, disk: Disk): Promise<Instance | undefined> => {
   let instance: Instance
   try {
@@ -823,6 +842,7 @@ export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, inst
           filesMounts: null,
         }
         applyDemoFlag(instance, compose)
+        applyBackupMethod(instance, compose)
         doc.instanceDB[instanceId] = instance
       } else {
         // engine#381: never claim an id whose storedOn is already a different disk
@@ -847,6 +867,7 @@ export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, inst
         instance.storedOn = disk.id
         instance.serviceImages = servicesImages as ServiceImage[]
         applyDemoFlag(instance, compose)
+        applyBackupMethod(instance, compose)
 
       }
     })

@@ -290,6 +290,22 @@ describe('idea#76 gaps', () => {
         expect(offerable({ currentAppId: 'nextcloud-1.0', newAppId: 'nextcloud-3.0', sumsValid: true, updatesFrom: [2] })).toBe(false)
         expect(offerable({ currentAppId: 'nextcloud-1.0', newAppId: 'nextcloud-3.0', sumsValid: true })).toBe(true)
     })
+    it("idea#403: a major update of an App with backup method 'none' and no lastBackup is not refused NEEDS_BACKUP", async () => {
+        await fs.outputFile(`${tmp}/apps/kolibri-2.0/compose.yaml`, compose('2.0'))
+        await fs.outputFile(`${tmp}/apps/kolibri-2.0/.env`, 'port=1\n')
+        expect(await codeOf(updateApp(h, 'i1', 'kolibri-2.0', ME, { allowMajor: true }, deps()))).toMatch(/^NEEDS_BACKUP: /)
+        expect(calls).toEqual([])
+        await fs.outputFile(`${tmp}/instances/i1/compose.yaml`, compose('1.0') + '  backup:\n    method: none\n')
+        expect(await codeOf(updateApp(h, 'i1', 'kolibri-2.0', ME, { allowMajor: true }, deps()))).toBe('ok')
+        expect(calls).toContain('snapshot')
+        expect(inst().instanceOf).toBe('kolibri-2.0')
+    })
+    it('idea#403: a malformed live x-app.backup still refuses NEEDS_BACKUP first (agreed order)', async () => {
+        await fs.outputFile(`${tmp}/apps/kolibri-2.0/compose.yaml`, compose('2.0'))
+        await fs.outputFile(`${tmp}/instances/i1/compose.yaml`, compose('1.0') + '  backup:\n    method: rsync\n')
+        expect(await codeOf(updateApp(h, 'i1', 'kolibri-2.0', ME, { allowMajor: true }, deps()))).toMatch(/^NEEDS_BACKUP: /)
+        expect(calls).toEqual([])
+    })
     it('updateApp refuses a major the new bundle does not list in updatesFrom, before anything changes', async () => {
         await fs.outputFile(`${tmp}/apps/kolibri-2.0/compose.yaml`, compose('2.0') + '  updatesFrom: [7]\n')
         h.change(d => { (d.instanceDB['i1' as any] as any).lastBackup = Date.now() })

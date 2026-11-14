@@ -56,6 +56,14 @@ describe('checkUpdate refusals', () => {
         expect(code({ newAppId: 'kolibri-1.0.0', allowMajor: true, backupAgeMs: BACKUP_MAX_AGE_MS + 1 })).toBe('NEEDS_BACKUP')
         expect(code({ newAppId: 'kolibri-1.0.0', allowMajor: true, backupAgeMs: 1000 })).toBeNull()
     })
+    it("idea#403: backup method 'none' has nothing to back up: no NEEDS_BACKUP; stop / hook / unknown still refuse", () => {
+        expect(code({ newAppId: 'kolibri-1.0.0', allowMajor: true, backupMethod: 'none' })).toBeNull()
+        expect(code({ newAppId: 'kolibri-1.0.0', allowMajor: true, backupMethod: 'stop' })).toBe('NEEDS_BACKUP')
+        expect(code({ newAppId: 'kolibri-1.0.0', allowMajor: true, backupMethod: 'hook' })).toBe('NEEDS_BACKUP')
+        expect(code({ newAppId: 'kolibri-1.0.0', allowMajor: true, backupMethod: undefined })).toBe('NEEDS_BACKUP')
+        // --allow-major is still required for method none
+        expect(code({ newAppId: 'kolibri-1.0.0', backupMethod: 'none' })).toBe('MAJOR_NOT_ALLOWED')
+    })
     it('idea#448: a planned in-flow backup satisfies NEEDS_BACKUP; --allow-major is still required; SHA -> 1.x stays major', () => {
         expect(code({ newAppId: 'kolibri-1.0.0', allowMajor: true, backupPlanned: true })).toBeNull()
         expect(code({ newAppId: 'kolibri-1.0.0', allowMajor: false, backupPlanned: true })).toBe('MAJOR_NOT_ALLOWED')
