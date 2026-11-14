@@ -213,17 +213,12 @@ export const installAppFromDisk = async (
     if (copyFromSourceInstance) {
         log(`Copying instance data from ${sourceInstanceId} to new instance ${instanceId}`)
         await fs.copy(`${sourceInstanceBase}/${sourceInstanceId}`, instanceDir, { overwrite: true })
-    } else if (opts.fresh) {
-        // --fresh: the whole app bundle is the instance's starting point (entrypoint
-        // scripts, hooks, bundled apps; Nextcloud needs them), never a source instance's data
-        log(`Fresh instance ${instanceId}: copying the whole app bundle ${targetAppPath}`)
-        await fs.copy(targetAppPath, instanceDir, { overwrite: true })
     } else {
-        // No existing instance data — copy compose.yaml from app bundle as baseline
-        const composeSrc = `${targetAppPath}/compose.yaml`
-        if (await fs.pathExists(composeSrc)) {
-            await fs.copy(composeSrc, `${instanceDir}/compose.yaml`)
-        }
+        // No existing instance data (and --fresh never uses one): the whole app
+        // bundle is the starting point — entrypoint scripts, hooks, bundled apps;
+        // Nextcloud bind-mounts them. idea#495: not just compose.yaml / .env.
+        log(`Instance ${instanceId}: copying the whole app bundle ${targetAppPath}`)
+        await fs.copy(targetAppPath, instanceDir, { overwrite: true })
     }
 
     // Write the requested display name (Kid, idea#235). Only x-app.instanceName
