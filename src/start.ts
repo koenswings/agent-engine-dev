@@ -17,7 +17,7 @@ import { startAutomergeServer } from './repo.js'
 import { enableMulticastDNSEngineMonitor } from './monitors/mdnsMonitor.js'
 import { startStaticPeers, staticPeersSetting } from './data/StaticPeers.js'
 import { createServerStore } from './data/Store.js'
-import { prepareStoreIdentity, refuseFleetStoreInIsolatedMode, storeIdentityPaths } from './data/StoreIdentity.js'
+import { assertStoreIdentityMatchesData, prepareStoreIdentity, refuseFleetStoreInIsolatedMode, storeIdentityPaths } from './data/StoreIdentity.js'
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
 import { recoverInterruptedOperations, archiveOldOperations } from './data/Operations.js'
 import { startBackupScheduler } from './monitors/backupScheduler.js'
@@ -77,6 +77,14 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     const STORE_IDENTITY_PATH = "./"+config.settings.storeIdentityFolder
     const storeIdentity = storeIdentityPaths(STORE_IDENTITY_PATH)
 
+    // engine#391: if store-data already holds documents, refuse when the identity
+    // is unusable or names a document that is not in store-data. Read-only, and
+    // runs before any mkdir or prepareStoreIdentity write. Override:
+    // --allow-new-store or IDEA_ALLOW_NEW_STORE=1 (never set by the image or pm2).
+    // Throws StoreIdentityMismatchError (code STORE_IDENTITY_MISMATCH); index.ts
+    // logs it and process.exit(1), so pm2 restarts are visible in the Engine log.
+    assertStoreIdentityMatchesData({ identityDir: STORE_IDENTITY_PATH, dataDir: STORE_DATA_PATH })
+
     // Create the store data directory if it does not yet exist
     if (!fs.existsSync(STORE_DATA_PATH)) {
         log(`Creating the store data folder at ${STORE_DATA_PATH}`)
@@ -89,9 +97,11 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         await $`mkdir -p ${STORE_IDENTITY_PATH}`
     }
 
-    // Store identity (idea#120): a missing store-url.txt is written back with the
-    // shared fleet store URL; an existing one is used as it is. store-template.json
-    // is never written; if it is missing, startup stops with a clear error.
+    // Store identity (idea#120): a missing store-url.txt stops startup unless
+    // IDEA_ALLOW_STORE_URL_FALLBACK=true, in which case it is written back with
+    // the shared fleet store URL; an existing one is used as it is.
+    // store-template.json is never written; if it is missing, startup stops
+    // with a clear error.
     // Read BEFORE the Automerge server starts: the Repo's peerId carries the store
     // tag, so the Engine only ever peers with Engines of this store (StoreScope.ts).
     const { storeDocId, restored, fallback } = await prepareStoreIdentity(storeIdentity)
