@@ -351,9 +351,14 @@ export class BackupScheduler {
             log(`Backup scheduler: disk ${diskId} is no longer docked here in scheduled mode; ${instanceId} not run`)
             return null
         }
-        if (!getInstance(store, instanceId as InstanceID)) {
+        const inst = getInstance(store, instanceId as InstanceID)
+        if (!inst) {
             log(`Backup scheduler: linked instance ${instanceId} is not in the store; skipped (orphanLinks)`)
             syncBackupOrphanLinks(this.storeHandle, diskId as DiskID)
+            return null
+        }
+        if ((inst as any).demo === true) {
+            log(`Backup scheduler: ${instanceId} is a demo instance — skipped (engine#369)`)
             return null
         }
         const lockFile = `${disksRoot()}/${disk.device}/backups/${instanceId}/${BACKUP_IN_PROGRESS}`

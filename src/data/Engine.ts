@@ -1,4 +1,5 @@
 import { $, chalk, os, YAML, fs, path, sleep } from 'zx';
+import { execFileSync } from 'node:child_process';
 
 $.verbose = false;
 import { deepPrint, log, uuid, print } from '../utils/utils.js';
@@ -159,6 +160,10 @@ export interface EraseInProgress {
  *   backupLinks: addBackupLink, removeBackupLink (idea#451).
  *   scheduledBackups: the daily scheduled Backup Disk mode (tick, BACKUP.yaml schedule,
  *     Disk/Instance schedule fields) and setBackupMode (idea#400).
+ *   demoApps:     setupDemo / removeDemo (engine#369); advertised only when
+ *               python3 is on PATH, checked once at startup (same pattern as
+ *               backupCleanup / flashCard). The Console counts it only when
+ *               capabilitiesBootedAt === lastBooted.
  *   backupCleanup: fullness-driven Backup Disk cleanup (idea#401 / idea#400 §3.1);
  *               advertised only when the app-data root helper is at
  *               BACKUP_CLEANUP_HELPER_MIN (v10, idea#450) or newer, checked once
@@ -179,6 +184,9 @@ const flashHelperInstalled = (): boolean => { try { fs.accessSync(FLASH_HELPER_P
 
 /** idea#400 §3.1: advertised only when the app-data helper is at BACKUP_CLEANUP_HELPER_MIN or newer */
 export const BACKUP_CLEANUP_CAPABILITY = 'backupCleanup'
+
+/** engine#369: advertised when python3 is on PATH (demo hook). See checkDemoAppsCapability. */
+export const DEMO_APPS_CAPABILITY = 'demoApps'
 const BACKUP_CLEANUP_HELPER_CHECK_MS = 5_000
 /** Cached result of the one startup version check; null = not yet checked (omit the capability). */
 let backupCleanupHelperOk: boolean | null = null
@@ -225,13 +233,37 @@ export const checkBackupCleanupCapability = async (
 export const resetBackupCleanupCapabilityForTests = (): void => { backupCleanupHelperOk = null }
 
 /** The capability list written at this startup */
+let demoAppsPythonOk: boolean | null = null
+
+const python3OnPath = (): boolean => {
+  try {
+    execFileSync('python3', ['-c', 'import sys'], { timeout: 3000, stdio: 'ignore' })
+    return true
+  } catch { return false }
+}
+
+/** Once at startup, before createOrUpdateEngine: advertise demoApps when python3 is on PATH. */
+export const checkDemoAppsCapability = (which: () => boolean = python3OnPath): boolean => {
+  try { demoAppsPythonOk = which() } catch { demoAppsPythonOk = false }
+  if (demoAppsPythonOk) log('demoApps capability advertised (python3 on PATH)')
+  else log('demoApps capability omitted (python3 not on PATH)')
+  return demoAppsPythonOk === true
+}
+
+export const resetDemoAppsCapabilityForTests = (): void => { demoAppsPythonOk = null }
+
+/** null until checkDemoAppsCapability runs; then true/false. */
+export const isDemoAppsCapabilityOn = (): boolean | null => demoAppsPythonOk
+
 export const engineCapabilities = (
   helperInstalled: boolean = flashHelperInstalled(),
   cleanupHelperOk: boolean = backupCleanupHelperOk === true,
+  demoAppsOk: boolean = demoAppsPythonOk === true,
 ): string[] => {
   const caps = [...ENGINE_CAPABILITIES]
   if (helperInstalled) caps.push(FLASH_CARD_CAPABILITY)
   if (cleanupHelperOk) caps.push(BACKUP_CLEANUP_CAPABILITY)
+  if (demoAppsOk) caps.push(DEMO_APPS_CAPABILITY)
   return caps
 }
 
