@@ -12,6 +12,9 @@
  *   3. watchDeviceFolderWhenPresent: attaches when the folder appears later,
  *      reports links already in it and new ones, detaches (unlinking what it
  *      reported) when the folder goes, and re-attaches when it comes back
+ *   3b. idea#398: a link created between chokidar's initial readdir and its
+ *      fs.watch arming is caught on 'ready' and reported by one rescan (scripted
+ *      watcher replays the race; a real-chokidar loop checks no add is repeated)
  *   4. enableUsbDeviceMonitor starts with a missing watch folder and docks a disk
  *      whose link appears after the folder is created
  *   5. Source checks: no `ls` of the watch folder or /disks is left, and the
@@ -23,6 +26,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import os from 'os'
 import path from 'path'
+import { EventEmitter } from 'events'
+import type { FSWatcher } from 'chokidar'
 import { fs, sleep } from 'zx'
 import {
     listDeviceFolder, registerUnlinkedSystemDisk, watchDeviceFolderWhenPresent, enableUsbDeviceMonitor,
@@ -102,6 +107,84 @@ describe('registerUnlinkedSystemDisk', () => {
     })
 })
 
+/**
+ * idea#398: chokidar 3 reads the folder and only then arms fs.watch, so a link
+ * created in between is never reported. A scripted watcher replays that: each
+ * generation reports only the names it is given, then 'ready'.
+ */
+describe('watchDeviceFolderWhenPresent: the attach race (idea#398)', () => {
+    let w: DeviceFolderWatch | null = null
+    afterEach(async () => { await w?.close(); w = null })
+
+    const scripted = (generations: string[][]) => {
+        const made: EventEmitter[] = []
+        const factory = (dir: string) => {
+            const em = new EventEmitter() as EventEmitter & { close: () => Promise<void> }
+            em.close = async () => { em.removeAllListeners() }
+            const names = generations[made.length] ?? []
+            made.push(em)
+            setImmediate(() => {
+                for (const n of names) em.emit('add', path.join(dir, n))
+                em.emit('ready')
+            })
+            return em as unknown as FSWatcher
+        }
+        return { factory, made }
+    }
+    const touch = async (p: string) => { await fs.writeFile(p, '') }
+
+    it('a link the initial scan missed is reported by one rescan, without repeating the others', async () => {
+        const dir = path.join(tmp, 'engine')
+        await fs.ensureDir(dir)
+        await touch(path.join(dir, 'sda'))
+        await touch(path.join(dir, 'sda1'))
+        const events: string[] = []
+        const { factory, made } = scripted([['sda'], ['sda', 'sda1']])
+        w = watchDeviceFolderWhenPresent(dir, {
+            add: p => { events.push(`add ${path.basename(p)}`) },
+            unlink: p => { events.push(`unlink ${path.basename(p)}`) },
+            error: () => {},
+        }, POLL_MS, factory)
+        expect(await until(() => made.length === 2 && events.length === 2)).toBe(true)
+        await sleep(20)
+        expect(events).toEqual(['add sda', 'add sda1'])
+        expect(made).toHaveLength(2)   // no further rescan once nothing is missed
+        expect(w.isAttached()).toBe(true)
+    })
+
+    it('a link removed between the scans is reported as unlinked', async () => {
+        const dir = path.join(tmp, 'engine')
+        await fs.ensureDir(dir)
+        await touch(path.join(dir, 'sda'))
+        await touch(path.join(dir, 'sdb'))
+        const events: string[] = []
+        // generation 1 reports sda only (sdb missed); sda is gone before generation 2 scans
+        const { factory, made } = scripted([['sda'], ['sdb']])
+        w = watchDeviceFolderWhenPresent(dir, {
+            add: p => {
+                events.push(`add ${path.basename(p)}`)
+                if (path.basename(p) === 'sda') fs.removeSync(path.join(dir, 'sda'))
+            },
+            unlink: p => { events.push(`unlink ${path.basename(p)}`) },
+            error: () => {},
+        }, POLL_MS, factory)
+        expect(await until(() => events.length === 3)).toBe(true)
+        expect(events).toEqual(['add sda', 'add sdb', 'unlink sda'])
+        expect(made).toHaveLength(2)
+    })
+
+    it('dangling links are not counted as missed (chokidar never reports them)', async () => {
+        const dir = path.join(tmp, 'engine')
+        await fs.ensureDir(dir)
+        await fs.symlink('/nonexistent/sdz', path.join(dir, 'sdz'))
+        const { factory, made } = scripted([[]])
+        w = watchDeviceFolderWhenPresent(dir, { add: () => {}, unlink: () => {}, error: () => {} }, POLL_MS, factory)
+        expect(await until(() => made.length >= 1)).toBe(true)
+        await sleep(20)
+        expect(made).toHaveLength(1)
+    })
+})
+
 describe('watchDeviceFolderWhenPresent', () => {
     let w: DeviceFolderWatch | null = null
     afterEach(async () => { await w?.close(); w = null })
@@ -143,6 +226,20 @@ describe('watchDeviceFolderWhenPresent', () => {
         await link(path.join(dir, 'sdb2'))
         expect(await until(() => events.includes('add sdb2'))).toBe(true)
         expect(errors).toEqual([])
+    })
+
+    it('idea#398 links created while the folder appears are all reported (10 rounds, real chokidar)', async () => {
+        for (let round = 0; round < 10; round++) {
+            const dir = path.join(tmp, `engine-${round}`)
+            const { events, errors } = start(dir)
+            await fs.ensureDir(dir)
+            await link(path.join(dir, 'sda'))
+            await link(path.join(dir, 'sda1'))
+            expect(await until(() => events.includes('add sda') && events.includes('add sda1')), `round ${round}: ${events.join(', ')}`).toBe(true)
+            expect(events.filter(e => e === 'add sda')).toHaveLength(1)
+            expect(errors).toEqual([])
+            await w!.close(); w = null
+        }
     })
 
     it('an existing folder is watched at once', async () => {

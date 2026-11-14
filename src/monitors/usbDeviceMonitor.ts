@@ -94,13 +94,16 @@ export interface DeviceFolderWatch {
  * removed and recreated stays blind. So: one stat every `pollMs`; when the
  * folder is there (and not yet watched, or replaced by a new inode) a watcher is
  * attached with watchDeviceFolder, whose initial scan reports the links already
- * in it; when it is gone the watcher is closed and every link it had reported is
+ * in it (a link created while that scan runs is caught when the watcher is ready
+ * and rescanned, idea#398); when it is gone the watcher is closed and every link it had reported is
  * reported as unlinked (udev removes the folder only after its last link).
  */
 export const watchDeviceFolderWhenPresent = (
     watchDir: string,
     handlers: DeviceFolderHandlers,
     pollMs: number = DEVICE_FOLDER_POLL_MS,
+    /** The watcher factory; tests pass a scripted one to replay the attach race (idea#398). */
+    watchFolder: (dir: string) => FSWatcher = watchDeviceFolder,
 ): DeviceFolderWatch => {
     const root = nodePath.resolve(watchDir)
     let watcher: FSWatcher | null = null
@@ -127,14 +130,59 @@ export const watchDeviceFolderWhenPresent = (
         log(`${root} is gone — device watcher detached${gone.length ? `; ${gone.length} device(s) unlinked` : ''}`)
         for (const p of gone) handlers.unlink(p)
     }
+    /**
+     * idea#398: links chokidar's initial scan cannot report. chokidar 3 reads the
+     * folder first and only then arms its fs.watch on it (_handleDir), so a link
+     * udev creates in between (the folder appears together with its first links)
+     * gives no event and stays unreported until something else changes in the
+     * folder. Once the watcher is `ready` (scan done, fs.watch armed) the folder
+     * is listed once; every entry chokidar would report (it skips dangling links)
+     * that was not reported is a miss.
+     */
+    const missedEntries = (): string[] => {
+        let names: string[]
+        try { names = fs.readdirSync(root) } catch { return [] }
+        return names
+            .map(n => nodePath.join(root, n))
+            .filter(p => {
+                if (present.has(p)) return false
+                try { fs.realpathSync(p); return true } catch { return false }
+            })
+    }
     const attach = (i: number): void => {
         ino = i
-        const w = watchDeviceFolder(root)
+        const w = watchFolder(root)
         watcher = w
-        w.on('add', p => { if (watcher !== w) return; present.add(p); handlers.add(p) })
-            .on('unlink', p => { if (watcher !== w) return; present.delete(p); handlers.unlink(p) })
+        // Paths this watcher reported; on a rescan, `present` still holds what the
+        // previous watcher reported, so an add already reported is not repeated.
+        const seen = new Set<string>()
+        w.on('add', p => {
+            if (watcher !== w) return
+            seen.add(p)
+            if (present.has(p)) return
+            present.add(p)
+            handlers.add(p)
+        })
+            .on('unlink', p => { if (watcher !== w) return; seen.delete(p); if (present.delete(p)) handlers.unlink(p) })
             .on('unlinkDir', p => { if (watcher === w && nodePath.resolve(p) === root) detach() })
             .on('error', e => { if (watcher === w) handlers.error(e) })
+            .on('ready', () => {
+                if (watcher !== w) return
+                // After a rescan: a link the previous watcher reported that this
+                // watcher's scan did not find was removed in between.
+                for (const p of [...present]) {
+                    if (!seen.has(p)) { present.delete(p); handlers.unlink(p) }
+                }
+                const missed = missedEntries()
+                if (!missed.length) return
+                // Rescan with a fresh watcher: these links exist now, so its initial
+                // scan reports them. Repeats only while links keep appearing in that
+                // same window; no timer is involved.
+                log(`Device watcher on ${root} missed ${missed.length} link(s) created while it attached (${missed.map(p => nodePath.basename(p)).join(', ')}) — rescanning`)
+                watcher = null
+                void w.close().catch(e => log(`Closing the watcher on ${root}: ${errorMessage(e)}`))
+                attach(i)
+            })
         log(`Device watcher attached to ${root}`)
     }
     const check = (): void => {
