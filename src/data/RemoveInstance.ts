@@ -139,12 +139,25 @@ const defaultDeps: RemoveDeps = {
  * Compose-down and quarantine the instance folder on `disk` without deleting
  * the instanceDB row (engine#381: source of a same-id cross-Engine move).
  */
-export const quarantineInstanceOnDisk = async (disk: Disk, instanceId: InstanceID): Promise<{ quarantinePath: string }> => {
+export const quarantineInstanceOnDisk = async (
+    disk: Disk, instanceId: InstanceID, opts: { composeTimeoutSec?: number } = {},
+): Promise<{ quarantinePath: string }> => {
+    const timed = async <T>(step: string, fn: () => Promise<T>): Promise<T> => {
+        const t0 = Date.now()
+        try { return await fn() }
+        finally { log(`quarantineInstanceOnDisk ${instanceId}: ${step} ${Date.now() - t0}ms`) }
+    }
     const dir = await defaultDeps.instanceDir(disk, instanceId)
-    await defaultDeps.composeDown(dir, instanceId)
-    await defaultDeps.removeProjectContainers(instanceId)
-    const quarantinePath = await defaultDeps.quarantine(disk, instanceId)
-    try { await defaultDeps.pruneNetworks(instanceId) } catch { /* best effort */ }
+    // composeTimeoutSec 0 is for a source that is already stopped (moveApp remove);
+    // cleanupMoveTarget omits it so a still-running Checking container is stopped normally.
+    if (opts.composeTimeoutSec !== undefined) {
+        await timed('composeDown', () => composeDownAt(dir, instanceId, undefined, { timeoutSec: opts.composeTimeoutSec }))
+    } else {
+        await timed('composeDown', () => defaultDeps.composeDown(dir, instanceId))
+    }
+    await timed('removeProjectContainers', () => defaultDeps.removeProjectContainers(instanceId))
+    const quarantinePath = await timed('quarantine', () => defaultDeps.quarantine(disk, instanceId))
+    try { await timed('pruneNetworks', () => defaultDeps.pruneNetworks(instanceId)) } catch { /* best effort */ }
     return { quarantinePath }
 }
 

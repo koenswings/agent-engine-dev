@@ -154,8 +154,13 @@ export const pruneUnusedInstanceNetworksForIds = async (
  * throws INVALID_INSTANCE_ID before docker runs, and `-p` is the compose
  * project name (a legacy dotted id, removal path only, loses its dots).
  */
+export type ComposeDownOptions = InstanceIdCheckOptions & {
+    /** docker compose down --timeout in seconds. 0 = do not wait for a graceful stop. */
+    timeoutSec?: number
+}
+
 export const composeDownAt = async (
-    dir: string, id: InstanceID, run: DockerRun = defaultDockerRun, opts: InstanceIdCheckOptions = {},
+    dir: string, id: InstanceID, run: DockerRun = defaultDockerRun, opts: ComposeDownOptions = {},
 ): Promise<void> => {
     const project = composeProjectFor(String(id), opts)
     const composeFile = path.join(dir, 'compose.yaml')
@@ -163,5 +168,7 @@ export const composeDownAt = async (
         log(`composeDownAt: no compose.yaml at ${composeFile}; will rely on label cleanup / prune for project ${id}`)
         return
     }
-    await run(['compose', '-p', project, '-f', composeFile, 'down'])
+    const args = ['compose', '-p', project, '-f', composeFile, 'down']
+    if (opts.timeoutSec !== undefined) args.push('-t', String(opts.timeoutSec))
+    await run(args)
 }

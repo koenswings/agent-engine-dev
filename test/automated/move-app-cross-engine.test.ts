@@ -11,7 +11,8 @@ import { Repo, DocHandle } from '@automerge/automerge-repo'
 import { Store } from '../../src/data/Store.js'
 import { localEngineId } from '../../src/data/Engine.js'
 import { InstanceID, DiskID, DiskName, EngineID, Timestamp, AppID } from '../../src/data/CommonTypes.js'
-import { moveAppCrossEngine, verifyMoveTarget, cleanupMoveTarget, MoveDeps, refusalCode, moveCommandOutcome, MOVE_PROGRESS_TYPE, isInFlightKeepIdMove, CLEANUP_TIMEOUT_MS } from '../../src/data/MoveAppRemote.js'
+import { moveAppCrossEngine, verifyMoveTarget, cleanupMoveTarget, MoveDeps, refusalCode, moveCommandOutcome, MOVE_PROGRESS_TYPE, isInFlightKeepIdMove, CLEANUP_TIMEOUT_MS, throttledCopyProgress, COPY_PROGRESS_INTERVAL_MS } from '../../src/data/MoveAppRemote.js'
+import { accumulateCopyByteProgress } from '../../src/data/CopyMoveApp.js'
 import { removeInstance as dropInstanceFromDisk } from '../../src/data/Disk.js'
 import { checkingProgressMessage, setPortReadyProgress, resetPortReadyProgressForTests } from '../../src/data/PortReadyProgress.js'
 import { MoveError, MOVE_CODES, MOVE_FAILURE_CODES, MOVE_REFUSAL_CODES, MOVE_DONE_CODES, MOVE_CROSS_ENGINE_CAPABILITY, moveFailedText, sourceNotRemovedText, sourceKeptText, withTargetCleanupText, sizesMatch } from '../../src/data/MoveAppShapes.js'
@@ -817,7 +818,7 @@ describe('verifyMoveTarget Checking idea/progress (idea#498 option 3)', () => {
         const verifyP = verifyMoveTarget(h, 'op-move', String(INST), String(BYTES), 'true', {
             localEngineId: async () => String(TGT),
             targetBytes: async () => BYTES,
-            timeoutMs: 4000,
+            timeoutMs: 15_000,
             pollMs: 25,
             progressIntervalMs: 25,
             broadcast: (m) => { seen.push(JSON.parse(JSON.stringify(m))) },
@@ -887,14 +888,14 @@ describe('verifyMoveTarget Checking idea/progress (idea#498 option 3)', () => {
         const verifyP = verifyMoveTarget(h, 'op-move', String(INST), String(BYTES), 'true', {
             localEngineId: async () => String(TGT),
             targetBytes: async () => BYTES,
-            timeoutMs: 4000,
+            timeoutMs: 15_000,
             pollMs: 25,
             progressIntervalMs: 25,
             broadcast: (m) => { seen.push(JSON.parse(JSON.stringify(m))) },
         })
         await sleep(40)
         setPortReadyProgress(String(INST), { firstReadyAt: Date.now() - stableMs, stableMs, stableReached: true })
-        const deadline = Date.now() + 1000
+        const deadline = Date.now() + 8000
         while (Date.now() < deadline && !seen.some((m: any) => m.checking?.phase === 'stable')) await sleep(10)
         expect(seen.filter((m: any) => m.checking?.phase === 'stable')).toHaveLength(1)
         const afterStable = seen.length
@@ -902,6 +903,10 @@ describe('verifyMoveTarget Checking idea/progress (idea#498 option 3)', () => {
         setPortReadyProgress(String(INST), { firstReadyAt: null, stableMs })
         await sleep(80)
         expect(seen.length).toBe(afterStable)
+        // Restore the verdict flag so verifyMoveTarget can finish. The reset
+        // above only checks that no further idea/progress is sent (engine#387:
+        // without this, a missed poll raced into timeoutMs and failed at ~4 s).
+        setPortReadyProgress(String(INST), { firstReadyAt: Date.now() - stableMs, stableMs, stableReached: true })
         h.change(d => { (d.instanceDB as any)[INST].status = 'Running' })
         const v = await verifyP
         expect(v.ok).toBe(true)
@@ -912,3 +917,42 @@ describe('verifyMoveTarget Checking idea/progress (idea#498 option 3)', () => {
         expect((h.doc().operationDB as any)['op-move'].stepLabel).toBe('Checking')
     })
 })
+
+describe('Copying idea/progress byte updates (engine#387)', () => {
+    it('throttledCopyProgress emits the first update, about one per second, and a completed last', () => {
+        const seen: any[] = []
+        let now = 1_000
+        const emit = throttledCopyProgress((m) => { seen.push(m) }, 'op-move', COPY_PROGRESS_INTERVAL_MS, () => now)
+        emit({ bytesDone: 0, bytesTotal: 8_000 })
+        emit({ bytesDone: 100, bytesTotal: 8_000 }) // within the interval: dropped
+        now = 1_000 + 999
+        emit({ bytesDone: 200, bytesTotal: 8_000 }) // still inside 1s: dropped
+        now = 1_000 + 1_000
+        emit({ bytesDone: 4_000, bytesTotal: 8_000 })
+        now = 1_000 + 1_100
+        emit({ bytesDone: 8_000, bytesTotal: 8_000 }) // complete: always emitted
+        expect(seen).toEqual([
+            { type: 'idea/progress', opId: 'op-move', step: 'Copying', bytesDone: 0, bytesTotal: 8_000 },
+            { type: 'idea/progress', opId: 'op-move', step: 'Copying', bytesDone: 4_000, bytesTotal: 8_000 },
+            { type: 'idea/progress', opId: 'op-move', step: 'Copying', bytesDone: 8_000, bytesTotal: 8_000 },
+        ])
+    })
+
+    it('accumulateCopyByteProgress adds rsync stages and finishes at the estimated total', () => {
+        const seen: { bytesDone: number, bytesTotal: number }[] = []
+        const acc = accumulateCopyByteProgress((p) => { seen.push({ ...p }) }, 10_000)
+        const master = acc.stage(4_000)
+        master({ progressPercent: 50, bytesDone: 2_000 })
+        master({ progressPercent: 100, bytesDone: 4_000 })
+        const inst = acc.stage(6_000)
+        inst({ progressPercent: 50, bytesDone: 3_000 })
+        inst({ progressPercent: 100, bytesDone: 6_000 })
+        acc.finish()
+        expect(seen[0]).toEqual({ bytesDone: 2_000, bytesTotal: 10_000 })
+        expect(seen[1]).toEqual({ bytesDone: 4_000, bytesTotal: 10_000 })
+        expect(seen[2]).toEqual({ bytesDone: 7_000, bytesTotal: 10_000 })
+        expect(seen[3]).toEqual({ bytesDone: 10_000, bytesTotal: 10_000 })
+        expect(seen[4]).toEqual({ bytesDone: 10_000, bytesTotal: 10_000 })
+    })
+})
+

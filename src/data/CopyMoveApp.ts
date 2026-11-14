@@ -202,6 +202,34 @@ export interface CopyAppOptions {
      * A plain copyApp omits this and still mints a fresh id.
      */
     dstId?: InstanceID
+    /** Ephemeral copy byte progress for moveApp (engine#387). Not stored. */
+    onByteProgress?: (p: { bytesDone: number, bytesTotal: number }) => void
+}
+
+/** Accumulate rsync --info=progress2 bytes across the app-master and instance stages. */
+export const accumulateCopyByteProgress = (
+    onByteProgress: ((p: { bytesDone: number, bytesTotal: number }) => void) | undefined,
+    bytesTotal: number,
+) => {
+    let completed = 0
+    const report = (bytesDone: number) => {
+        if (!onByteProgress) return
+        const total = bytesTotal > 0 ? bytesTotal : Math.max(0, bytesDone)
+        onByteProgress({ bytesDone: total > 0 ? Math.min(Math.max(0, bytesDone), total) : Math.max(0, bytesDone), bytesTotal: total })
+    }
+    const stage = (stageBytes: number) => {
+        let finished = false
+        return (p: { progressPercent: number, bytesDone?: number }) => {
+            const chunk = p.bytesDone != null ? p.bytesDone : Math.round(Math.max(0, stageBytes) * (p.progressPercent / 100))
+            report(completed + chunk)
+            if (!finished && p.progressPercent >= 100) {
+                finished = true
+                completed += Math.max(0, stageBytes)
+            }
+        }
+    }
+    const finish = () => report(bytesTotal > 0 ? bytesTotal : completed)
+    return { stage, finish }
 }
 
 // ── copyApp ───────────────────────────────────────────────────────────────────
@@ -337,8 +365,18 @@ export const copyApp = async (
         setCopyStep(2)
         const appMasterDest = `${targetMountRoot}/apps/${appId}`
         log(`copyApp: syncing app master ${appMasterSrc} → ${isCrossEngine ? remoteAddress + ':' : ''}${appMasterDest}`)
-        const appMasterProgress = ({ progressPercent }: { progressPercent: number }) => {
-            updateOperation(storeHandle, opId, { progressPercent: Math.round(progressPercent * 0.25) })
+        let appMasterBytes = 0
+        let instanceBytes = 0
+        if (opts.onByteProgress) {
+            try { appMasterBytes = await directoryBytes(appMasterSrc) } catch { appMasterBytes = 0 }
+            try { instanceBytes = await instanceDataBytes(sourceRoot, instance.id) } catch { instanceBytes = 0 }
+        }
+        const copyBytes = accumulateCopyByteProgress(opts.onByteProgress, appMasterBytes + instanceBytes)
+        if (opts.onByteProgress) opts.onByteProgress({ bytesDone: 0, bytesTotal: appMasterBytes + instanceBytes })
+        const appMasterByteProgress = copyBytes.stage(appMasterBytes)
+        const appMasterProgress = (p: { progressPercent: number, bytesDone?: number }) => {
+            updateOperation(storeHandle, opId, { progressPercent: Math.round(p.progressPercent * 0.25) })
+            appMasterByteProgress(p)
         }
         if (peer) await rsyncToPeer(appMasterSrc.replace(/\/*$/, '/'), peer, receiveAppArgs(targetRoot, appId), appMasterProgress, opId)
         else await rsyncDirectory(appMasterSrc, appMasterDest, appMasterProgress, opId)
@@ -351,12 +389,14 @@ export const copyApp = async (
         const instanceDest = `${targetMountRoot}/instances/${newInstanceId}`
         createdInstanceDest = instanceDest
         log(`copyApp: syncing instance data ${instanceSrc} → ${isCrossEngine ? remoteAddress + ':' : ''}${instanceDest} (idea-app-data ${isCrossEngine ? 'send' : 'copy'})`)
+        const instanceByteProgress = copyBytes.stage(instanceBytes)
         await rsyncInstanceData(
             peer
                 ? { kind: 'send', srcRoot: sourceRoot, srcId: instance.id, host: peer.host, peerEngineId: peer.engineId, dstRoot: targetRoot, dstId: newInstanceId }
                 : { kind: 'copy', srcRoot: sourceRoot, srcId: instance.id, dstRoot: targetRoot, dstId: newInstanceId },
-            ({ progressPercent }) => {
-                updateOperation(storeHandle, opId, { progressPercent: 25 + Math.round(progressPercent * 0.30) })
+            (p) => {
+                updateOperation(storeHandle, opId, { progressPercent: 25 + Math.round(p.progressPercent * 0.30) })
+                instanceByteProgress(p)
             }, opId)
 
         // 5a. Give the copy its own name and port (idea#168 r35). The rsync
@@ -442,6 +482,8 @@ export const copyApp = async (
                 })
             }
         }
+
+        if (opts.onByteProgress) copyBytes.finish()
 
         // 6. Register/start the new instance
         setCopyStep(5)
