@@ -103,7 +103,9 @@ No SSH, nothing started, no device identity. Inside `chroot <MNT>`:
     `KbdInteractiveAuthentication` (or its alias `ChallengeResponseAuthentication`) is not `no`, or a `Match` block
     turns either back on.
     `kernel-cmdline` (koenswings/idea#518) fails unless `<boot>/cmdline.txt` is exactly one line carrying
-    `cgroup_enable=memory` exactly once. The sanitise step appends it (`KERNEL_CMDLINE_FLAGS`; same line, idempotent),
+    `cgroup_enable=memory` exactly once, and also fails when a `cgroup_disable=memory` follows it (the later one wins; the firmware's
+    earlier one is fine). Both `ssh-first-boot` and `kernel-cmdline` find the bootfs the same way (`--boot`, else
+    `<root>/boot/firmware`, else `<root>/boot`) and fail when none is found. The sanitise step appends it (`KERNEL_CMDLINE_FLAGS`; same line, idempotent),
     because the Raspberry Pi firmware passes `cgroup_disable=memory` and Docker then has no memory accounting
     (`docker stats` 0B, `idea/metrics` memUsageBytes 0). Post-boot check: `memory` in `/sys/fs/cgroup/cgroup.controllers`.
 
