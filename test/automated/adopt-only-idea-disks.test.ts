@@ -292,10 +292,11 @@ describe('forgetDisk: remove a stale, undocked disk record (idea#279, idea#282)'
         expect(checkForgetDisk(h.doc()!, '7wt29vdzvj3b2xxt605')).toEqual({ ok: true })
     })
 
-    it('is registered as an engine-scoped command taking a diskId', () => {
+    it('is registered as an engine-scoped command taking a diskId (plus optional --with-instances, idea#466)', () => {
         const def = commands.find(c => c.name === 'forgetDisk')
         expect(def?.scope).toBe('engine')
-        expect(def?.args.map(a => a.name)).toEqual(['diskId'])
+        expect(def?.args.map(a => a.name)).toEqual(['diskId', 'options'])
+        expect(def?.args[1]).toMatchObject({ optional: true, variadic: true })
     })
 })
 

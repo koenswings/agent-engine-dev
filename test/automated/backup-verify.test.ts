@@ -35,7 +35,7 @@ const FAKE_SUDO = `#!/usr/bin/env bash
 shift 2
 echo "$*" >> "$FAKE_BORG_LOG"
 case "$1" in
-  version) echo "idea-app-data \${FAKE_HELPER_VERSION:-12}" ;;
+  version) echo "idea-app-data \${FAKE_HELPER_VERSION:-13}" ;;
   borg-list)
     bdev="$2"; id="$3"; archive="$4"
     if [ -n "\$archive" ]; then
@@ -158,9 +158,9 @@ describe('parse helpers (idea#446)', () => {
         expect(parseScratchBytes('scratchBytes=9007199254740992\n')).toBeNull() // > MAX_SAFE_INTEGER
     })
 
-    it('registers the four commands and the backupVerify capability; Engine speaks helper v12 (idea#460), verify min stays v10', () => {
+    it('registers the four commands and the backupVerify capability; Engine speaks helper v13 (idea#479), verify min stays v10', () => {
         expect(BACKUP_VERIFY_HELPER_MIN).toBe(10)
-        expect(APP_DATA_HELPER_VERSION).toBe('12')
+        expect(APP_DATA_HELPER_VERSION).toBe('13')
         expect(ENGINE_CAPABILITIES).toContain('backupVerify')
         for (const name of ['listBackup', 'verifyBackup', 'clearBackupLock', 'removeBackupRole']) {
             expect(commands.find(c => c.name === name), name).toBeTruthy()
@@ -447,7 +447,7 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
 shift 2
 echo "$*" >> "$FAKE_BORG_LOG"
 case "$1" in
-  version) echo "idea-app-data \${FAKE_HELPER_VERSION:-12}" ;;
+  version) echo "idea-app-data \${FAKE_HELPER_VERSION:-13}" ;;
   borg-init) mkdir -p "$IDEA_DISKS_ROOT/$2/backups/$3" && echo '[repository]' > "$IDEA_DISKS_ROOT/$2/backups/$3/config" ;;
   borg-create)
     while [ -f "$FAKE_BORG_HOLD" ]; do sleep 0.05; done

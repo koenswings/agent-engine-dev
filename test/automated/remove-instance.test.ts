@@ -33,6 +33,7 @@ const deps = (over: Partial<RemoveDeps> = {}): Partial<RemoveDeps> => ({
     listVolumes: async (id) => [`${id}_data`],
     quarantine: async (_d, id) => { calls.push(`quarantine ${id}`); return `/fake/.idea-quarantine/${id}-20261028T130000Z` },
     refreshSnapshots: async () => { calls.push('refresh') },
+    pruneNetworks: async (id) => { calls.push(`prune ${id}`) },
     ...over,
 })
 const add = (id: string, name: string, disk: string, status = 'Stopped') => h.change(doc => {
@@ -55,15 +56,19 @@ describe('removeInstance', () => {
     it('downs without -v, cleans leftover project containers, quarantines, then drops the record', async () => {
         add('i1', 'kolibri', 'd1')
         const r = await removeInstance(h, 'i1', ME, deps())
-        expect(calls).toEqual(['down /fake/instances/i1', 'rm-project i1', 'quarantine i1', 'refresh'])
+        expect(calls).toEqual(['down /fake/instances/i1', 'rm-project i1', 'quarantine i1', 'refresh', 'prune i1'])
         expect(r).toEqual({ instanceId: 'i1', name: 'kolibri', quarantinePath: '/fake/.idea-quarantine/i1-20261028T130000Z', keptVolumes: ['i1_data'] })
         expect(h.doc().instanceDB['i1' as any]).toBeUndefined()
     })
     it('the real compose down uses -p and -f on the live file, never -v, and never globs the quarantine dir', async () => {
         const src = await fs.readFile(path.join(process.cwd(), 'src/data/RemoveInstance.ts'), 'utf8')
-        expect(src).toMatch(/'compose', '-p', String\(id\), '-f', composeFile, 'down'/)
+        const helper = await fs.readFile(path.join(process.cwd(), 'src/utils/instanceNetworks.ts'), 'utf8')
+        expect(helper).toMatch(/'compose', '-p', project, '-f', composeFile, 'down'/)
+        expect(helper).toMatch(/const project = composeProjectFor\(String\(id\), opts\)/)
+        expect(helper).not.toMatch(/'down', '-v'|--volumes/)
+        expect(src).toMatch(/pruneUnusedInstanceNetworks/)
         expect(src).toMatch(/diskPath\(disk, 'instances', String\(id\)\)/)
-        expect(src).toMatch(/label=com\.docker\.compose\.project=\$\{id\}/)
+        expect(src).toMatch(/label=\$\{COMPOSE_PROJECT_LABEL\}=\$\{project\}/)
         expect(src).toMatch(/'rm', '-f', cid/)
         expect(src).not.toMatch(/down -v|--volumes/)
         expect(src).not.toMatch(/'rm', '-f', '-v'/)

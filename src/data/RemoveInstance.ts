@@ -21,23 +21,42 @@
  * Nothing is deleted: the quarantine is never purged automatically; clearing it is
  * manual and needs Koen's OK.
  *
+ * After a successful remove, unused Docker networks labelled
+ * `com.docker.compose.project=<id>` on this Engine are pruned (idea#468). Shared
+ * frontend/backend networks are never removed, nor a network that still has
+ * containers attached. A prune failure is logged and does not fail the command.
+ *
  * If compose down or the label cleanup fails: COMPOSE_DOWN_FAILED is logged and
  * thrown, the folder is left in place, and the store is untouched.
  *
+ * idea#479: the instance id is checked BEFORE any compose or Docker action.
+ * removeInstance is the only command that accepts a legacy dotted id (e.g.
+ * `<id>.backup-<stamp>`); it needs helper v13 for that, whose `quarantine`
+ * accepts the same dotted form. Compose `-p`, the leftover-container fallback,
+ * the kept-volume list and the network prune all use the compose project name
+ * (composeProjectName: the dots dropped, as compose does), matched exactly on
+ * the com.docker.compose.project label, never by container name prefix. A
+ * dotted id whose project name equals another instance's project is refused.
+ *
  * Refusals throw `CODE: text`, and the store is untouched on any failure:
- *   NOT_FOUND, NOT_LOCAL, AMBIGUOUS, RUNNING, BUSY_BACKUP, BUSY_MOVE, BUSY,
- *   COMPOSE_DOWN_FAILED, QUARANTINE_FAILED, HELPER_OUTDATED (helper older than v4).
+ *   NOT_FOUND, NOT_LOCAL, AMBIGUOUS, INVALID_INSTANCE_ID, PROJECT_CLASH, RUNNING,
+ *   BUSY_BACKUP, BUSY_MOVE, BUSY, COMPOSE_DOWN_FAILED, QUARANTINE_FAILED,
+ *   HELPER_OUTDATED (helper older than v4, or older than v13 for a dotted id).
  */
 import { DocHandle } from '@automerge/automerge-repo'
-import { $, fs, path } from 'zx'
+import { $ } from 'zx'
 import type { Store } from './Store.js'
 import type { Instance } from './Instance.js'
 import type { InstanceID } from './CommonTypes.js'
 import { lookupLocalInstanceArg } from './InstanceArg.js'
 import { diskPath, appDataRoot, Disk } from './Disk.js'
 import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
-import { runAppData, quarantineArgs, helperAtLeast } from '../utils/appDataHelper.js'
+import { runAppData, removalQuarantineArgs, helperAtLeast } from '../utils/appDataHelper.js'
 import { log } from '../utils/utils.js'
+import { composeDownAt, pruneUnusedInstanceNetworks, COMPOSE_PROJECT_LABEL } from '../utils/instanceNetworks.js'
+import { checkInstanceIdForDocker, composeProjectFor } from '../utils/instanceIds.js'
+
+export { composeDownAt } from '../utils/instanceNetworks.js'
 
 export const QUARANTINE_DIR = '.idea-quarantine'
 
@@ -48,6 +67,11 @@ export class RemoveError extends Error {
 export interface RemoveResult { instanceId: InstanceID; name: string; quarantinePath: string; keptVolumes: string[] }
 
 export const REMOVE_HELPER_MIN = 4
+/** Helper `quarantine` accepts a legacy dotted id from v13 (idea#479). */
+export const REMOVE_LEGACY_ID_HELPER_MIN = 13
+
+/** The removal path is the only place a legacy dotted id is accepted (idea#479). */
+const REMOVAL = { allowLegacyDotted: true } as const
 
 /** Live instance folder. Absolute even on the system disk (idea#424 / idea#237). */
 export const defaultInstanceDir = (disk: Disk, id: InstanceID): Promise<string> =>
@@ -57,33 +81,23 @@ export const dockerQuiet = async (args: string[]): Promise<string> =>
     (await $`docker ${args}`.quiet()).stdout
 
 /**
- * Bring the compose project down using the live instance path and file
- * (idea#424). Does not glob the quarantine directory. Missing compose.yaml is
- * not an error — the caller still runs label cleanup.
+ * Fallback: remove leftover containers of this compose project, matched exactly
+ * on the com.docker.compose.project label (never a name prefix). No -v (volumes
+ * stay). The id is checked before docker runs (idea#479).
  */
-export const composeDownAt = async (
-    dir: string, id: InstanceID, run: (args: string[]) => Promise<string> = dockerQuiet,
-): Promise<void> => {
-    const composeFile = path.join(dir, 'compose.yaml')
-    if (!fs.existsSync(composeFile)) {
-        log(`removeInstance: no compose.yaml at ${composeFile}; will clean containers by project label ${id}`)
-        return
-    }
-    await run(['compose', '-p', String(id), '-f', composeFile, 'down'])
-}
-
-/** Fallback: remove leftover containers of this compose project. No -v (volumes stay). */
 export const removeContainersByComposeProject = async (
     id: InstanceID, run: (args: string[]) => Promise<string> = dockerQuiet,
 ): Promise<void> => {
-    const raw = await run(['ps', '-aq', '--filter', `label=com.docker.compose.project=${id}`])
+    const project = composeProjectFor(String(id), REMOVAL)
+    const raw = await run(['ps', '-aq', '--filter', `label=${COMPOSE_PROJECT_LABEL}=${project}`])
     for (const cid of raw.split('\n').map(s => s.trim()).filter(Boolean)) {
         await run(['rm', '-f', cid])
     }
 }
 
 export interface RemoveDeps {
-    helperProblem: () => Promise<string | null>
+    /** null when the helper is at least `min`, else the problem text. */
+    helperProblem: (min: number) => Promise<string | null>
     instanceDir: (disk: Disk, id: InstanceID) => Promise<string>
     composeDown: (dir: string, id: InstanceID) => Promise<void>
     removeProjectContainers: (id: InstanceID) => Promise<void>
@@ -91,21 +105,24 @@ export interface RemoveDeps {
     quarantine: (disk: Disk, id: InstanceID) => Promise<string>
     /** Refresh Disk.preUpdateSnapshots / preUpdateBytes / quarantineBytes (idea#428). */
     refreshSnapshots: (disk: Disk) => Promise<void>
+    /** idea#468: prune unused compose-project networks for this instance, locally. */
+    pruneNetworks: (id: InstanceID) => Promise<void>
 }
 
 const defaultDeps: RemoveDeps = {
-    helperProblem: () => helperAtLeast(REMOVE_HELPER_MIN, 'removeInstance'),
+    helperProblem: (min) => helperAtLeast(min, 'removeInstance'),
     instanceDir: defaultInstanceDir,
-    composeDown: (dir, id) => composeDownAt(dir, id),
+    composeDown: (dir, id) => composeDownAt(dir, id, undefined, REMOVAL),
     removeProjectContainers: (id) => removeContainersByComposeProject(id),
     listVolumes: async (id) => {
         try {
-            const out = await dockerQuiet(['volume', 'ls', '-q', '--filter', `label=com.docker.compose.project=${id}`])
+            const out = await dockerQuiet(['volume', 'ls', '-q', '--filter', `label=${COMPOSE_PROJECT_LABEL}=${composeProjectFor(String(id), REMOVAL)}`])
             return out.split('\n').map(s => s.trim()).filter(Boolean)
         } catch { return [] }
     },
-    quarantine: async (disk, id) => (await runAppData(quarantineArgs(await appDataRoot(disk), String(id)))).trim(),
+    quarantine: async (disk, id) => (await runAppData(removalQuarantineArgs(await appDataRoot(disk), String(id)))).trim(),
     refreshSnapshots: async () => { /* replaced in removeInstance with a storeHandle-bound default */ },
+    pruneNetworks: async (id) => { await pruneUnusedInstanceNetworks(String(id), REMOVAL) },
 }
 
 const RUNNING_STATES = new Set(['Running', 'Starting'])
@@ -131,9 +148,20 @@ export const removeInstance = async (
         throw new RemoveError('AMBIGUOUS', `instance name '${instanceArg}' is shared by several instances on this Engine; use the instance id`)
     }
     const inst: Instance = r.instance
+    // idea#479: the id is checked before anything else touches compose or Docker.
+    const idCheck = checkInstanceIdForDocker(String(inst.id), REMOVAL)
+    if (!idCheck.ok) throw new RemoveError('INVALID_INSTANCE_ID', `${idCheck.reason}; nothing changed`)
+    if (idCheck.legacy) {
+        const clash = Object.values(store.instanceDB ?? {}).find(o => {
+            if (!o || String(o.id) === String(inst.id)) return false
+            const c = checkInstanceIdForDocker(String(o.id), REMOVAL)
+            return c.ok && c.project === idCheck.project
+        })
+        if (clash) throw new RemoveError('PROJECT_CLASH', `instance '${inst.id}' has compose project '${idCheck.project}', which instance '${clash.id}' also has; nothing changed`)
+    }
     if (RUNNING_STATES.has(String(inst.status))) throw new RemoveError('RUNNING', `instance '${inst.name}' is ${inst.status}; stop it first`)
 
-    const helper = await d.helperProblem()
+    const helper = await d.helperProblem(idCheck.legacy ? REMOVE_LEGACY_ID_HELPER_MIN : REMOVE_HELPER_MIN)
     if (helper) throw new RemoveError('HELPER_OUTDATED', helper)
 
     const key = instanceKey(inst.id)
@@ -183,6 +211,9 @@ export const removeInstance = async (
             row.preUpdateBytes = Math.max(0, (Number(row.preUpdateBytes) || 0) - droppedBytes)
         })
         log(`removeInstance: ${inst.id} ('${inst.name}') quarantined at ${quarantinePath}; kept volumes: ${keptVolumes.length ? keptVolumes.join(', ') : 'none'}`)
+        try { await d.pruneNetworks(inst.id) } catch (e) {
+            log(`removeInstance: network prune for ${inst.id}: ${(e as Error).message ?? e}`)
+        }
         return { instanceId: inst.id, name: String(inst.name), quarantinePath, keptVolumes }
     } finally {
         resourceLock.release(key)

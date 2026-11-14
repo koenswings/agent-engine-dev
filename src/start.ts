@@ -2,12 +2,13 @@ import { storeTag } from './data/StoreScope.js'
 import os from 'os'
 import { enableUsbDeviceMonitor } from './monitors/usbDeviceMonitor.js'
 import { runDiskDetectionSelfCheck, recordDiskDetectionFailure, errorMessage } from './monitors/diskDetection.js'
+import { runIgmpMaxMembershipsSelfCheck } from './monitors/igmpSelfCheck.js'
 import { enableTimeMonitor } from './monitors/timeMonitor.js'
 import { startLiveness, writeLastSeen } from './data/Liveness.js'
 import { $, chalk, fs, sleep } from 'zx'
 import { deepPrint, log, print } from './utils/utils.js'
 import { config, peerAccessEnabled, peerStaleMs } from './data/Config.js'
-import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId } from './data/Engine.js'
+import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId, checkBackupCleanupCapability } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
 import { enableHttpMonitor } from './monitors/httpMonitor.js'
 import { enableIdeaLocalPublisher, IdeaLocalPublisher } from './monitors/ideaLocal.js'
@@ -16,9 +17,10 @@ import { startAutomergeServer } from './repo.js'
 import { enableMulticastDNSEngineMonitor } from './monitors/mdnsMonitor.js'
 import { startStaticPeers, staticPeersSetting } from './data/StaticPeers.js'
 import { createServerStore } from './data/Store.js'
-import { prepareStoreIdentity, storeIdentityPaths } from './data/StoreIdentity.js'
+import { prepareStoreIdentity, refuseFleetStoreInIsolatedMode, storeIdentityPaths } from './data/StoreIdentity.js'
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
 import { recoverInterruptedOperations, archiveOldOperations } from './data/Operations.js'
+import { startBackupScheduler } from './monitors/backupScheduler.js'
 import { enableDockerMetricsMonitor } from './monitors/dockerMetricsMonitor.js'
 import { enableDiskSizeMonitor } from './data/DiskSize.js'
 import { ensureEngineStateDir, setFilesMountStore } from './data/FilesMount.js'
@@ -92,6 +94,11 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // Read BEFORE the Automerge server starts: the Repo's peerId carries the store
     // tag, so the Engine only ever peers with Engines of this store (StoreScope.ts).
     const { storeDocId, restored, fallback } = await prepareStoreIdentity(storeIdentity)
+    // engine#362: a test/fixture Engine must not open a known fleet store
+    refuseFleetStoreInIsolatedMode(storeDocId, {
+        testMode: config.settings.testMode,
+        watchDirSet: !!process.env.IDEA_WATCH_DIR,
+    })
     if (restored) print(chalk.yellow(`store-url.txt was missing: restored the fleet store URL`))
     if (fallback) print(chalk.bgRed.white(`store-url.txt was restored by the Engine (store-identity/store-url.restored): peer access fails closed until Ops confirms the store`))
     log(`Using document ID: ${storeDocId}`)
@@ -116,6 +123,10 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
 
     log(`Initialising store`)
     const storeHandle = await createServerStore(repo, storeDocId, STORE_DATA_PATH, storeIdentity.templatePath)
+
+    // backupCleanup capability: one helper version check, never fatal (idea#400 §3.1).
+    // Must run before createOrUpdateEngine writes Engine.capabilities.
+    await checkBackupCleanupCapability()
 
     // Create or update the local engine object
     const engine = await createOrUpdateEngine(storeHandle, localEngineId)
@@ -248,6 +259,9 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // Read-only and not awaited: it may re-check after a delay.
     runDiskDetectionSelfCheck().catch(e =>
         recordDiskDetectionFailure('selfCheck', `Disk detection self-check crashed: ${errorMessage(e)}`))
+    // idea#467: warn if net.ipv4.igmp_max_memberships is below 1024 (Kolibri zeroconf).
+    // Read-only, no root, never blocks startup. Skipped when IDEA_WATCH_DIR is set.
+    runIgmpMaxMembershipsSelfCheck()
     // Not awaited (startup continues), but a start failure (e.g. `ls /dev/engine`
     // fails) is reported instead of silently disabling disk detection.
     enableUsbDeviceMonitor(storeHandle).catch(e =>
@@ -282,9 +296,12 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // Liveness without store history (store-design 2026-10-13): ephemeral hb every
     // 10 s, stored lastRun at boot + hourly (Liveness.ts)
     writeLastSeen(storeHandle, String(localEngineId), Date.now(), 0, true)
-    startLiveness(storeHandle, String(localEngineId))
+    // idea#400: scheduled Backup Disks run from a 60 s tick inside the Engine (never host cron)
+    const scheduler = startBackupScheduler(storeHandle)
+    startLiveness(storeHandle, String(localEngineId), { clockStatus: () => scheduler.clockStatus() })
     // The heartbeat timer still repairs this Engine's peerAccess, expires stale
     // peers and archives old operations; it no longer writes to the store itself
+
     enableTimeMonitor(heartbeatIntervalMs, () => {
         archiveOldOperations(storeHandle).catch(e => print(chalk.red(`archive operations: ${e}`)))
         peerAccess.onHeartbeat().catch(e => print(chalk.red(`peer access heartbeat: ${e}`)))

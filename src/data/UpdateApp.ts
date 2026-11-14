@@ -42,6 +42,7 @@ import type { Store } from './Store.js'
 import type { Instance } from './Instance.js'
 import type { AppID, DiskID, InstanceID, Timestamp } from './CommonTypes.js'
 import { lookupLocalInstanceArg } from './InstanceArg.js'
+import { checkInstanceIdForDocker, composeProjectFor, COMPOSE_PROJECT_LABEL } from '../utils/instanceIds.js'
 import { diskMountRoot, appDataRoot, Disk, PreUpdateSnapshot, AppBundleInfo, joinMountRoot } from './Disk.js'
 import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
 import {
@@ -164,7 +165,7 @@ export const defaultUpdateDeps = (storeHandle: DocHandle<Store>): UpdateDeps => 
         }
     },
     stop: async (inst, disk) => (await import('./Instance.js')).stopInstance(storeHandle, inst, disk),
-    containerIds: async (id) => (await docker(['ps', '-q', '--filter', `label=com.docker.compose.project=${id}`])).split('\n').map(s => s.trim()).filter(Boolean),
+    containerIds: async (id) => (await docker(['ps', '-q', '--filter', `label=${COMPOSE_PROJECT_LABEL}=${composeProjectFor(String(id))}`])).split('\n').map(s => s.trim()).filter(Boolean),
     composeDown: async (dir, id) => {
         const composeFile = path.join(dir, 'compose.yaml')
         if (!await fs.pathExists(composeFile)) {
@@ -173,7 +174,7 @@ export const defaultUpdateDeps = (storeHandle: DocHandle<Store>): UpdateDeps => 
         }
         // idea#424: -p and -f with the live absolute path; never cwd-only or a
         // quarantine glob. No -v (named volumes stay).
-        await docker(['compose', '-p', String(id), '-f', composeFile, 'down'])
+        await docker(['compose', '-p', composeProjectFor(String(id)), '-f', composeFile, 'down'])
     },
     snapshot: async (disk, id, excludes) => parseSnapshotResult(await runAppData(snapshotArgs(await appDataRoot(disk), String(id), excludes))),
     restoreSnapshot: async (disk, id, excludes) => lastLine(await runAppData(restoreSnapshotArgs(await appDataRoot(disk), String(id), excludes))),
@@ -317,6 +318,9 @@ export const updateApp = async (
         throw new UpdateAppError('AMBIGUOUS', `instance name '${instanceArg}' is shared by several instances on this Engine; use the instance id`)
     }
     const inst: Instance = r.instance
+    // idea#479: check the id before any compose or Docker action; a legacy dotted id is refused (removeInstance only).
+    const idCheck = checkInstanceIdForDocker(String(inst.id))
+    if (!idCheck.ok) throw new UpdateAppError('INVALID_INSTANCE_ID', idCheck.reason)
     const disk = store.diskDB[inst.storedOn as DiskID] as Disk
     const helper = await d.helperProblem()
     if (helper) throw new UpdateAppError('HELPER_OUTDATED', helper)

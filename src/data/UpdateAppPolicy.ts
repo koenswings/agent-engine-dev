@@ -8,10 +8,12 @@
  *    data snapshot as well as the old bundle/image, never just the old image.
  *  - Health gate: during healthTimeout, `starting` and `unhealthy` are "not ready yet";
  *    fail only on container exit, crash-loop or timeout.
- *  - healthTimeout per App: kolibri 900 s, nextcloud 300 s, default 600 s.
+ *  - healthTimeout per App: kolibri 900 s, nextcloud 300 s, default 600 s (table in
+ *    AppHealthTimeout.ts, shared with the start-time port-ready check, idea#437).
  *  - An App without valid SHA256SUMS is never offered an update (NO_SUMS).
  */
 import { parseAppId } from './App.js'
+import { APP_HEALTH_TIMEOUT_S } from './AppHealthTimeout.js'
 import { isUpgrade, isMajorChange, parseVersion } from './Version.js'
 
 export type UpdateStep = 'Fetch' | 'Check' | 'Snapshot' | 'Swap' | 'Start' | 'Health'
@@ -25,6 +27,8 @@ export type UpdateRefusal =
     | 'BAD_BACKUP_SPEC' | 'HOOK_FAILED' | 'BACKUP_FAILED'
     // idea#448: the new bundle ships a path the snapshot and rollback leave out
     | 'BUNDLE_CONTAINS_EXCLUDED'
+    // idea#479: id checked before any compose or Docker action
+    | 'INVALID_INSTANCE_ID'
 
 /** Error text starts with the code; the two rollback outcomes use the console#168 wording. */
 export const ROLLED_BACK_PREFIX = 'ROLLED BACK:'
@@ -39,15 +43,8 @@ export class UpdateAppError extends Error {
 /** Version rules live in Version.ts (idea#76); re-exported for existing callers. */
 export { parseVersion, compareVersions, isUnversioned, isUpgrade, isMajorChange } from './Version.js'
 
-const DEFAULT_HEALTH_TIMEOUT_S = 600
-const HEALTH_TIMEOUT_S: Record<string, number> = { kolibri: 900, nextcloud: 300 }
-
-/** x-app.healthTimeout (seconds) wins when valid; else the per-App default. */
-export const healthTimeoutSeconds = (appName: string, declared?: unknown): number => {
-    const n = Number(declared)
-    if (declared !== undefined && declared !== null && Number.isFinite(n) && n > 0) return n
-    return HEALTH_TIMEOUT_S[appName.toLowerCase()] ?? DEFAULT_HEALTH_TIMEOUT_S
-}
+/** The per-App timeout table lives in AppHealthTimeout.ts, shared with the start-time port-ready check (idea#437). */
+export { healthTimeoutSeconds, APP_HEALTH_TIMEOUT_S, DEFAULT_HEALTH_TIMEOUT_S } from './AppHealthTimeout.js'
 
 export interface CheckFacts {
     diskDocked: boolean
@@ -169,7 +166,7 @@ export const FALLBACK_HEALTH_TIMEOUT_S = 300
 export const fallbackHealthTimeoutSeconds = (appName: string, declared?: unknown): number => {
     const n = Number(declared)
     if (declared !== undefined && declared !== null && Number.isFinite(n) && n > 0) return n
-    return HEALTH_TIMEOUT_S[appName.toLowerCase()] ?? FALLBACK_HEALTH_TIMEOUT_S
+    return APP_HEALTH_TIMEOUT_S[String(appName ?? '').toLowerCase()] ?? FALLBACK_HEALTH_TIMEOUT_S
 }
 
 /** Rough snapshot copy rate until Kid's measured timings (idea#351 §10.1). */

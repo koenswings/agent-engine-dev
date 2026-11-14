@@ -2,7 +2,7 @@ import { $, chalk, os, YAML, fs, path, sleep } from 'zx';
 
 $.verbose = false;
 import { deepPrint, log, uuid, print } from '../utils/utils.js';
-import { APP_DATA_HELPER, APP_DATA_HELPER_VERSION, BORG_PATH } from '../utils/appDataHelper.js';
+import { APP_DATA_HELPER, APP_DATA_HELPER_VERSION, BORG_PATH, helperAtLeast, BACKUP_CLEANUP_HELPER_MIN, type AppDataRunner } from '../utils/appDataHelper.js';
 import { PEER_GATE, PEER_AUTHORIZED_KEYS, PEER_KNOWN_HOSTS } from '../utils/peerSsh.js';
 import { readMetaUpdateId, DiskMeta, addMeta, readRemoteDiskId } from './Meta.js';
 import { Version, Command, Hostname, Timestamp, DiskID, EngineID } from './CommonTypes.js';
@@ -151,22 +151,89 @@ export interface EraseInProgress {
  *   flashCard:  flashCard / cancelFlash; only when the root helper
  *               /usr/local/sbin/idea-flash-card is installed (checked at startup).
  *   clientImages: Engine.clientImages is published.
+ *   moveAppCrossEngine: moveApp to a disk on another Engine (copy, verify on the
+ *               target, quarantine the source; idea#79). Both Engines need it.
  *   usageSummaries: this Engine can export usage (idea#411). Advertised even when usageMonitoring is off.
  *   backupVerify: listBackup, verifyBackup, clearBackupLock, removeBackupRole (idea#446).
+ *   forgetDiskWithInstances: forgetDisk <diskId> --with-instances (idea#466).
+ *   backupLinks: addBackupLink, removeBackupLink (idea#451).
+ *   scheduledBackups: the daily scheduled Backup Disk mode (tick, BACKUP.yaml schedule,
+ *     Disk/Instance schedule fields) and setBackupMode (idea#400).
+ *   backupCleanup: fullness-driven Backup Disk cleanup (idea#401 / idea#400 §3.1);
+ *               advertised only when the app-data root helper is at
+ *               BACKUP_CLEANUP_HELPER_MIN (v10, idea#450) or newer, checked once
+ *               at startup (same pattern as flashCard). An older, missing, failing
+ *               or timed-out helper leaves it out; runtime cleanup still records
+ *               HELPER_OUTDATED and the backup still runs.
  * Written at every startup as a whole new list, with capabilitiesBootedAt set
  * to that startup's lastBooted. A Console counts a capability only when
  * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'usageSummaries', 'backupVerify']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'moveAppCrossEngine', 'usageSummaries', 'backupVerify', 'forgetDiskWithInstances', 'backupLinks', 'scheduledBackups']
 /** idea#201 §10: advertised only when the flash helper is installed (HELPER_MISSING otherwise) */
 export const FLASH_CARD_CAPABILITY = 'flashCard'
 export const FLASH_HELPER_PATH = '/usr/local/sbin/idea-flash-card'
 const flashHelperInstalled = (): boolean => { try { fs.accessSync(FLASH_HELPER_PATH, fs.constants.X_OK); return true } catch { return false } }
+
+/** idea#400 §3.1: advertised only when the app-data helper is at BACKUP_CLEANUP_HELPER_MIN or newer */
+export const BACKUP_CLEANUP_CAPABILITY = 'backupCleanup'
+const BACKUP_CLEANUP_HELPER_CHECK_MS = 5_000
+/** Cached result of the one startup version check; null = not yet checked (omit the capability). */
+let backupCleanupHelperOk: boolean | null = null
+
+const withTimeout = async <T>(promise: Promise<T>, ms: number): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), ms) }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+/**
+ * Once at startup, decide whether to advertise `backupCleanup`. Never throws:
+ * an older, missing, failing or timed-out helper leaves the capability out
+ * (HELPER_OUTDATED remains the runtime fallback in backupCleanup.ts).
+ */
+export const checkBackupCleanupCapability = async (
+  run?: AppDataRunner,
+  timeoutMs: number = BACKUP_CLEANUP_HELPER_CHECK_MS,
+): Promise<boolean> => {
+  try {
+    const outdated = await withTimeout(
+      helperAtLeast(BACKUP_CLEANUP_HELPER_MIN, 'backupCleanup', run),
+      timeoutMs,
+    )
+    backupCleanupHelperOk = outdated === null
+  } catch {
+    backupCleanupHelperOk = false
+  }
+  if (backupCleanupHelperOk) {
+    log(`backupCleanup capability advertised (app-data helper v${BACKUP_CLEANUP_HELPER_MIN}+)`)
+  } else {
+    log(`backupCleanup capability omitted (app-data helper older than v${BACKUP_CLEANUP_HELPER_MIN}, missing, error or timeout)`)
+  }
+  return backupCleanupHelperOk
+}
+
+/** Test seam: drop the cached startup check so later cases start from "not checked". */
+export const resetBackupCleanupCapabilityForTests = (): void => { backupCleanupHelperOk = null }
+
 /** The capability list written at this startup */
-export const engineCapabilities = (helperInstalled: boolean = flashHelperInstalled()): string[] =>
-  helperInstalled ? [...ENGINE_CAPABILITIES, FLASH_CARD_CAPABILITY] : [...ENGINE_CAPABILITIES]
+export const engineCapabilities = (
+  helperInstalled: boolean = flashHelperInstalled(),
+  cleanupHelperOk: boolean = backupCleanupHelperOk === true,
+): string[] => {
+  const caps = [...ENGINE_CAPABILITIES]
+  if (helperInstalled) caps.push(FLASH_CARD_CAPABILITY)
+  if (cleanupHelperOk) caps.push(BACKUP_CLEANUP_CAPABILITY)
+  return caps
+}
 
 import { config } from './Config.js';
 
@@ -266,7 +333,9 @@ export const createOrUpdateEngine = async (storeHandle: DocHandle<Store>, engine
   }
 }
 
-export const localEngineId = await getLocalEngineId()
+// IDEA_IMAGE_BUILD=1 (build-engine --root/--rootfs, idea#322): this module is loaded on the image BUILD HOST
+// for its installers only; looking up the Engine id there would create /META.yaml on that host.
+export const localEngineId: EngineID = process.env.IDEA_IMAGE_BUILD === '1' ? undefined as unknown as EngineID : await getLocalEngineId()
 
 /**
  * Remove phantom engine entries from the shared CRDT store.
@@ -576,11 +645,16 @@ export const localiseSystem = async (exec: any, enginePath: string, language: st
   print(chalk.green('System localised'));
 }
 
+/** Default engine tree baked into boot.sh; installCrontabs rewrites it to config.defaults.enginePath. */
+export const BOOT_SH_ENGINE_PATH = '/home/pi/idea/agents/agent-engine-dev'
+/** sed expression that rewrites BOOT_SH_ENGINE_PATH in boot.sh. Passed as a single exec argument so quoteTemplate/shellQuote wraps the whole expression, not the replacement — otherwise `${VAR:-/prefix/rest}` becomes `${VAR:-'/prefix'/rest}` and the default path keeps literal quotes (Atlas, build 9 image). The path has no spaces. */
+export const bootShEnginePathSed = (enginePath: string) => `s|${BOOT_SH_ENGINE_PATH}|${enginePath}|g`
+
 export const installCrontabs = async (exec: any, enginePath: string) => {
   print(chalk.blue('Installing crontabs...'));
   try {
     await copyAsset(exec, enginePath, 'boot.sh', '/usr/local/bin', true)
-    await exec`sudo sed -i "s|/home/pi/idea/agents/agent-engine-dev|${config.defaults.enginePath}|g" /usr/local/bin/boot.sh`
+    await exec`sudo sed -i ${bootShEnginePathSed(config.defaults.enginePath)} /usr/local/bin/boot.sh`
     await exec`sudo crontab ${enginePath}/script/build_image_assets/crondefs`
   } catch (e) {
     print(chalk.red('Error installing crontabs'));
@@ -661,6 +735,32 @@ export const installDhcpVendorClass = async (exec: any, enginePath: string) => {
     print(chalk.red('Error setting the DHCP vendor class'));
     console.error(e);
   }
+}
+
+/** sysctl.d drop-in (idea#467): raise IGMP group memberships so multicast-heavy
+ *  containers (Kolibri zeroconf) do not hit OSError 105 on busy Docker hosts. */
+export const IGMP_SYSCTL_CONF = '/etc/sysctl.d/90-idea-igmp.conf'
+export const IGMP_SYSCTL_ASSET = '90-idea-igmp.conf'
+export const IGMP_MAX_MEMBERSHIPS = 1024
+
+/**
+ * idea#467: write /etc/sysctl.d/90-idea-igmp.conf (net.ipv4.igmp_max_memberships=1024)
+ * and apply it with `sysctl -p` on that file. Idempotent. Root install step only
+ * (no sudoers change; the Engine process never applies sysctl at runtime).
+ * In an image-build chroot (IDEA_IMAGE_BUILD=1) the file is still installed, but
+ * `sysctl -p` is skipped so the bind-mounted /proc cannot change the build host;
+ * systemd-sysctl applies the file at first boot.
+ */
+export const installIgmpSysctl = async (exec: any, enginePath: string) => {
+  print(chalk.blue('  - Installing /etc/sysctl.d/90-idea-igmp.conf...'))
+  await exec`sudo install -o root -g root -m 0644 ${enginePath}/script/build_image_assets/${IGMP_SYSCTL_ASSET} ${IGMP_SYSCTL_CONF}`
+  if (process.env.IDEA_IMAGE_BUILD === '1') {
+    print(chalk.blue('  - Skipping sysctl -p (image build; the file is applied at first boot)'))
+    print(chalk.green(`  - ${IGMP_SYSCTL_CONF} installed`))
+    return
+  }
+  await exec`sudo sysctl -p ${IGMP_SYSCTL_CONF}`
+  print(chalk.green(`  - ${IGMP_SYSCTL_CONF} installed and applied (igmp_max_memberships=${IGMP_MAX_MEMBERSHIPS})`))
 }
 
 /** Installed copy of script/build_image_assets/idea-avahi-lan-only (idea#203). */
@@ -796,11 +896,13 @@ export const ensureAptPackages = async (exec: any, pkgs: string[]): Promise<stri
  * install AND every update (build-engine installUdev, ./install-root-helpers,
  * sync-engine): rsync + borgbackup, the sudoers files, /usr/local/sbin/idea-erase-disk,
  * /usr/local/sbin/idea-app-data, the peer-access parts and the DHCP vendor class
- * (idea#284). `install` overwrites
+ * (idea#284), and the IGMP sysctl drop-in (idea#467). `install` overwrites
  * the helpers with the checkout's copies, so an outdated helper is upgraded.
  * Ends by checking /usr/bin/borg and `idea-app-data version`; throws if either is wrong.
  */
 /** tmpfiles.d entry that creates /run/idea-usb at boot (idea#193). */
+/** Installed copy of script/build_image_assets/idea-engine-identity (idea#322). */
+export const ENGINE_IDENTITY_HELPER = '/usr/local/sbin/idea-engine-identity'
 export const USB_TMPFILES_CONF = '/etc/tmpfiles.d/idea-usb.conf'
 /** tmpfiles.d entry that creates /run/idea and /var/lib/idea/usage (idea#411). */
 export const USAGE_TMPFILES_CONF = '/etc/tmpfiles.d/idea-usage.conf'
@@ -823,6 +925,11 @@ export const installRootHelpers = async (exec: any, enginePath: string) => {
   print(chalk.blue('  - Installing idea-write-card-timezone...'))
   await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-write-card-timezone /usr/local/sbin/idea-write-card-timezone`
   print(chalk.green('  - /usr/local/sbin/idea-write-card-timezone installed'))
+  // idea-engine-identity (idea#322): applies the flash-time identity from the boot partition.
+  // Run as root by boot.sh on every boot; root-owned COPY, no sudoers entry (the Engine never calls it).
+  print(chalk.blue('  - Installing idea-engine-identity...'))
+  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-engine-identity ${ENGINE_IDENTITY_HELPER}`
+  print(chalk.green(`  - ${ENGINE_IDENTITY_HELPER} installed`))
   // idea-flash-card: client-card flash helper (idea#201 §10), root-owned COPY, 0755
   print(chalk.blue('  - Installing idea-flash-card...'))
   await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-flash-card ${FLASH_HELPER_PATH}`
@@ -857,6 +964,10 @@ export const installRootHelpers = async (exec: any, enginePath: string) => {
   // never restarts NM or touches a link. A failure is logged, not fatal: the fleet
   // health check reports an Engine whose drop-in is missing.
   await installDhcpVendorClass(exec, enginePath)
+  // IGMP group limit (idea#467). Here, not only in an image build, so pool
+  // Engines get it from a normal update. Idempotent. Applying sysctl needs
+  // root and is skipped when IDEA_IMAGE_BUILD=1 (chroot /proc is the build host).
+  await installIgmpSysctl(exec, enginePath)
   // Verify, so a broken install stops here and not at the first backup (exit 127)
   try {
     await exec`test -x ${BORG_PATH}`

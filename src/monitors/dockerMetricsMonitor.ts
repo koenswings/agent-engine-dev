@@ -20,6 +20,7 @@ import { DockerMetrics } from '../data/CommonTypes.js'
 import { localEngineId } from '../data/Engine.js'
 import { dockerAvailable } from '../utils/dockerAvailable.js'
 import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
+import { composeProjectName, containerNameBelongsToInstance } from '../utils/instanceIds.js'
 
 $.verbose = false
 
@@ -114,18 +115,31 @@ const parseStatsLine = (line: string): { name: string; metrics: DockerMetrics } 
 const collectMetrics = async (
     instanceIds: string[]
 ): Promise<{ metrics: Map<string, DockerMetrics>, runningContainers: string[] | null }> => {
-    // docker stats container names follow the pattern: <instanceId>-<service>-1
-    // We filter containers by name prefix matching any of the instance IDs.
+    // docker stats container names follow `<project>-<service>-1`. Match by
+    // exact compose project (idea#479 / engine#367), never `name=<id>` or
+    // startsWith(id): those also hit `<id>backup-…` containers of a dotted copy.
     const result = new Map<string, DockerMetrics>()
     // null = docker ps did not answer: never conclude anything about container state
     let runningContainers: string[] | null = null
     if (instanceIds.length === 0) return { metrics: result, runningContainers: [] }
 
     try {
-        // docker stats does not support --filter; resolve container names via docker ps first
-        const filterArgs = instanceIds.flatMap(id => ['--filter', `name=${id}`])
-        const psProc = await $`docker ps --format {{.Names}} ${filterArgs}`
-        const containerNames = psProc.stdout.split('\n').map(l => l.trim()).filter(Boolean)
+        // docker stats does not support --filter. One `docker ps` (multiple
+        // `--filter label=` would be ANDed), then pick rows by exact project.
+        const format = '{{.Names}}\t{{.Label "com.docker.compose.project"}}'
+        const psProc = await $`docker ps --format ${format}`
+        const containerNames: string[] = []
+        const nameToInstance = new Map<string, string>()
+        for (const line of psProc.stdout.split('\n').map(l => l.trim()).filter(Boolean)) {
+            const tab = line.indexOf('\t')
+            const name = tab === -1 ? line : line.slice(0, tab)
+            const project = tab === -1 ? '' : line.slice(tab + 1)
+            const instanceId = instanceIds.find(id =>
+                (project && project === composeProjectName(id)) || containerNameBelongsToInstance(name, id))
+            if (!instanceId) continue
+            containerNames.push(name)
+            nameToInstance.set(name, instanceId)
+        }
         runningContainers = containerNames
         if (containerNames.length === 0) return { metrics: result, runningContainers }
         const proc = await $`docker stats --no-stream --format json ${containerNames}`
@@ -134,8 +148,8 @@ const collectMetrics = async (
         for (const line of lines) {
             const parsed = parseStatsLine(line)
             if (!parsed) continue
-            // Map container name back to instance ID
-            const instanceId = instanceIds.find(id => parsed.name.startsWith(id))
+            // Map container back to instance by exact compose project, never a name prefix.
+            const instanceId = nameToInstance.get(parsed.name) ?? instanceIds.find(id => containerNameBelongsToInstance(parsed.name, id))
             if (!instanceId) continue
             // Merge: if multiple containers belong to the same instance, accumulate
             const existing = result.get(instanceId)
@@ -187,7 +201,7 @@ export const detectExternalStops = (
     for (const inst of instances) {
         if (inst.status !== 'Running') continue
         seen.add(inst.id)
-        const hasContainer = runningContainers.some(n => n.startsWith(inst.id))
+        const hasContainer = runningContainers.some(n => containerNameBelongsToInstance(n, inst.id))
         if (hasContainer || isLocked(inst.id) || now - (inst.lastStarted ?? 0) < EXTERNAL_STOP_GRACE_MS) {
             externalStopMisses.delete(inst.id)
             continue

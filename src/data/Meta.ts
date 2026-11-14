@@ -37,6 +37,22 @@ const sampleMeta: DiskMeta = {
 
 export const SYSTEM_META_PATH = '/META.yaml'
 
+/**
+ * Where the Engine looks for the system-disk META (idea#145).
+ *
+ * `IDEA_SYSTEM_META` may point at a test-local file so the box gate does not
+ * depend on `/META.yaml` on the host. The override is honoured only when
+ * `NODE_ENV=test` or `IDEA_TEST_MODE=true`. On a Pi those are unset, so a
+ * stray env var cannot redirect production away from `/META.yaml`.
+ */
+export const systemMetaPath = (): string => {
+  const override = process.env.IDEA_SYSTEM_META
+  if (override && (process.env.NODE_ENV === 'test' || process.env.IDEA_TEST_MODE === 'true')) {
+    return override
+  }
+  return SYSTEM_META_PATH
+}
+
 /** What to do when /META.yaml is missing, shown in errors (idea#145). */
 export const SYSTEM_META_HELP =
   'Run ./build-engine --personalize on this Pi to create /META.yaml, or check that ' +
@@ -76,7 +92,7 @@ export const ensureSystemMeta = async (
   device: DeviceName,
   options: { path?: string, allowCreate?: boolean, deps?: Partial<SystemMetaDeps> } = {},
 ): Promise<DiskMeta | null> => {
-  const metaPath = options.path ?? SYSTEM_META_PATH
+  const metaPath = options.path ?? systemMetaPath()
   const deps = { ...defaultSystemMetaDeps, ...options.deps }
   if (deps.exists(metaPath)) return null
   if (options.allowCreate === false) {
@@ -138,6 +154,21 @@ export const newHardwareDiskId = async (
   return r.diskId
 }
 
+/** A META file's diskId is usable (an Engine image ships /META.yaml without one, idea#322). */
+export const hasDiskId = (meta: Partial<DiskMeta> | null | undefined): boolean =>
+  !!meta && meta.diskId !== undefined && meta.diskId !== null && String(meta.diskId).trim() !== '' && String(meta.diskId) !== 'undefined'
+
+/**
+ * The disk id when no hardware id was found: a fresh UUID for a clone of a hardware id
+ * or for a META file without a diskId (an Engine image's first boot, idea#322);
+ * otherwise the user-assigned id from the file.
+ */
+export const diskIdWithoutHardware = (meta: Partial<DiskMeta>, newId: () => string = uuid): { diskId: DiskID, generated: boolean, reason: string } => {
+  if (meta.isHardwareId) return { diskId: newId() as DiskID, generated: true, reason: 'The disk id in the META file is a hardware id from another disk (a clone on media without one): generating a new id' }
+  if (!hasDiskId(meta)) return { diskId: newId() as DiskID, generated: true, reason: 'The META file has no diskId (e.g. an Engine image first boot, idea#322): generating a new id' }
+  return { diskId: meta.diskId as DiskID, generated: false, reason: 'The disk id in the META file is a user-assigned id. Keeping it as is' }
+}
+
 const isValidTimestamp = (v: unknown): v is number =>
   typeof v === 'number' && Number.isFinite(v) && v > 0
 
@@ -181,7 +212,7 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName, depsIn: Partial<
       path = `${disksRoot()}/${deviceSpec}/META.yaml`
       device = deviceSpec as DeviceName
     } else {
-      path = `/META.yaml`
+      path = systemMetaPath()
       // findmnt may return /dev/sda2 (Pi) or "overlay"/tmpfs (containers/VMs).
       // Only /dev/... paths have a usable device name at split('/')[2].
       const rootSource = (await $`findmnt / -no SOURCE`).stdout.trim()
@@ -208,7 +239,7 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName, depsIn: Partial<
       // Read the META.yaml file
       // /META.yaml is root-owned (600) so we need sudo for the system disk.
       // Disk META files under /disks/ are pi-owned and don't need it.
-      const catCmd = path === '/META.yaml' ? $`sudo cat ${path}` : $`cat ${path}`
+      const catCmd = path === SYSTEM_META_PATH ? $`sudo cat ${path}` : $`cat ${path}`
       const metaContent = (await catCmd).stdout.trim()
       const meta: DiskMeta = YAML.parse(metaContent)
       // YAML 1.1 coerces unquoted 1.0 → number 1; Version is always a string.
@@ -227,6 +258,8 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName, depsIn: Partial<
       if (skipHardwareId()) {
         log(`skipHardwareId: using diskId from META file (${meta.diskId}), skipping hardware id lookup`)
         diskId = meta.diskId
+        // An image's /META.yaml carries no diskId (idea#322): generate one, never ENGINE_undefined
+        if (!hasDiskId(meta)) { diskId = uuid() as DiskID; meta.isHardwareId = false; log(`META file has no diskId: generated ${diskId}`) }
       } else {
         // App Disk partitions: serial + partition identity (idea#168 D4, DiskIdentity.ts).
         // The system disk keeps the bare root-drive serial (the Engine id depends on it).
@@ -241,15 +274,10 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName, depsIn: Partial<
         }
         if (!diskId) {
           log(`No hardware id found for device ${device}`)
-          if (meta.hasOwnProperty('isHardwareId') && meta.isHardwareId) {
-            log(`The disk id in the META file is a hardware id, so must come from another disk. So this disk is a clone and it is cloned onto media without a hardware id. Generating a new hardware id`)
-            diskId = uuid() as DiskID
-            // Resetting the isHardwareId flag
-            meta.isHardwareId = false
-          } else {
-            log(`The disk id in the META file is a user-assigned id. Keeping it as is`)
-            diskId = meta.diskId
-          }
+          const r = diskIdWithoutHardware(meta)
+          log(r.reason)
+          diskId = r.diskId
+          if (r.generated) meta.isHardwareId = false
         }
       }
 
@@ -357,15 +385,45 @@ export const readHardwareIdSamsungFIT = async (device: DeviceName): Promise<Disk
   }
 }
 
-export const readHardwareIdIntenso = async (device: DeviceName): Promise<DiskID | undefined> => {
+/** Full path matching the 10-engine / 11-engine-files sudoers NOPASSWD entries. */
+export const HDPARM_BIN = '/usr/sbin/hdparm'
+
+/** zx `$` / a test fake. */
+export type ShellExec = (pieces: TemplateStringsArray, ...args: unknown[]) => Promise<{ stdout: string }>
+
+/**
+ * A useful one-line description of a thrown shell error. zx ProcessOutput often
+ * stringifies to empty (`${e}` was logging "Error reading disk id of device sdb: "
+ * with nothing after the colon) even when exitCode / stderr are set (engine#360).
+ */
+export const describeShellError = (e: unknown): string => {
+  if (e && typeof e === 'object') {
+    const err = e as { message?: unknown, shortMessage?: unknown, exitCode?: unknown, stderr?: unknown, stdout?: unknown }
+    const parts: string[] = []
+    const text = String(err.shortMessage ?? err.message ?? '').trim()
+    if (text) parts.push(text)
+    if (err.exitCode != null && err.exitCode !== '') parts.push(`exit ${err.exitCode}`)
+    const stderr = String(err.stderr ?? '').trim()
+    if (stderr && stderr !== text) parts.push(stderr)
+    if (parts.length) return parts.join(': ')
+    const stdout = String(err.stdout ?? '').trim()
+    if (stdout) return stdout
+  }
+  const s = String(e ?? '').trim()
+  return s || 'unknown error'
+}
+
+export const readHardwareIdIntenso = async (
+  device: DeviceName,
+  deps: { exec?: ShellExec } = {},
+): Promise<DiskID | undefined> => {
+  const exec = deps.exec ?? ($ as ShellExec)
   try {
-    const hdparm = (await $`which hdparm`).stdout
-    log(`hdparm is at ${hdparm}`)
-    //const info = (await $`hdparm -I /dev/${device}`).stdout
-    //log(`Info is ${info}`)
     // hdparm -I requires read access to the block device (root-only on Linux).
-    // The engine runs as pi with passwordless sudo, so prefix with sudo.
-    const sn = (await $`sudo hdparm -I /dev/${device} | grep 'Serial\ Number'`).stdout
+    // Call the full path so this matches the 10-engine / 11-engine-files sudoers
+    // NOPASSWD entry (`/usr/sbin/hdparm -I /dev/sd…`) and does not depend on PATH:
+    // hdparm lives only in /usr/sbin, which is not on the pi/pm2 PATH (engine#360).
+    const sn = (await exec`sudo /usr/sbin/hdparm -I /dev/${device} | grep 'Serial\ Number'`).stdout
     log(`Serial number is ${sn}`)
     const id = sn.trim().split(':')
     log(`split ID is ${id}`)
@@ -376,7 +434,7 @@ export const readHardwareIdIntenso = async (device: DeviceName): Promise<DiskID 
       return undefined
     }
   } catch (e) {
-    log(`Error reading disk id of device ${device}: ${e}`)
+    log(`Error reading disk id of device ${device}: ${describeShellError(e)}`)
     return undefined
   }
 }

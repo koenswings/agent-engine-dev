@@ -63,7 +63,7 @@ describe('installPeerAccess (build-engine)', () => {
 
     it('the drop-in adds the root-owned file and keeps the users\' own authorized_keys; the gate asset is executable', async () => {
         const conf = await fs.readFile(path.resolve('script/build_image_assets/10-idea-peer.conf'), 'utf8')
-        expect(conf.split('\n').filter(l => l && !l.startsWith('#'))).toEqual(['AuthorizedKeysFile .ssh/authorized_keys .ssh/authorized_keys2 /etc/ssh/idea_authorized_keys/%u /etc/ssh/idea_usage_keys/%u'])
+        expect(conf.split('\n').filter(l => l && !l.startsWith('#'))).toEqual(['AuthorizedKeysFile .ssh/authorized_keys .ssh/authorized_keys2 /etc/ssh/idea_authorized_keys/%u /etc/ssh/idea_usage_keys/%u /etc/ssh/idea_operator_keys/%u'])
         expect((await fs.stat(path.resolve('script/build_image_assets/idea-peer-gate'))).mode & 0o111).not.toBe(0)
         expect((await fs.stat(path.resolve('script/build_image_assets/idea-usage-export'))).mode & 0o111).not.toBe(0)
     })

@@ -335,7 +335,26 @@ export const recoverInterruptedOperations = async (
     log(`recoverInterruptedOperations: ${interrupted.length} interrupted operation(s) found`)
 
     for (const op of interrupted) {
-        const strategy = RECOVERY_STRATEGY[op.kind] ?? 'fail'
+        // idea#79: an interrupted cross-Engine move is never retried and never
+        // removes the source; only a recorded verify means the copy is good.
+        if (op.kind === 'moveApp' && op.move) {
+            const verified = op.move.verified === true
+            const text = verified
+                ? 'MOVED, source not removed: the Engine restarted before the old copy was removed'
+                : 'MOVE FAILED: the Engine restarted during the move; source kept'
+            log(chalk.yellow(`  ${op.id.slice(0, 8)} moveApp (cross-Engine): ${text}`))
+            storeHandle.change(doc => {
+                const m = (doc.operationDB?.[op.id] as any)?.move
+                if (m) { m.phase = verified ? 'done' : 'failed'; m.code = verified ? 'SOURCE_NOT_REMOVED' : 'INTERRUPTED'; m.resultText = text }
+            })
+            updateOperation(storeHandle, op.id, { status: verified ? 'Done' : 'Failed', error: text, completedAt: Date.now() as Timestamp })
+            continue
+        }
+        // idea#400 (Steve, Q2): a scheduled backup is never retried after a restart. Its
+        // .backup-in-progress stays as a stale lock (INTERRUPTED at dock) for the idea#446
+        // flow (clearBackupLock, then backupApp); the next slot runs as usual.
+        const scheduledBackup = op.kind === 'backupApp' && op.cause === 'scheduled-backup'
+        const strategy = scheduledBackup ? 'fail' : (RECOVERY_STRATEGY[op.kind] ?? 'fail')
         const handler = retryHandlers[op.kind]
         const cmdLogHandle = getCommandLogHandle()
         const traceId = crypto.randomUUID()
@@ -368,7 +387,9 @@ export const recoverInterruptedOperations = async (
                 : 'Engine restarted while operation was in progress — re-issue manually'
             // idea#201 §10: client-card operations carry a code the Console can map
             const isCardOp = op.kind === 'flashCard' || op.kind === 'initialiseDisk'
-            const message = isCardOp ? `INTERRUPTED: ${base}` : base
+            const message = scheduledBackup
+                ? 'INTERRUPTED: Engine restarted during a scheduled backup — not retried; the stale lock is left for clearBackupLock, then backupApp (idea#446)'
+                : isCardOp ? `INTERRUPTED: ${base}` : base
             if (cmdLogHandle) {
                 addTrace(cmdLogHandle, { traceId, command: op.kind, args: traceArgs, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
                 closeTrace(cmdLogHandle, traceId, 'error', message)

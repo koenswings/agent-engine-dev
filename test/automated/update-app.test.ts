@@ -251,7 +251,7 @@ describe('updateApp (#230)', () => {
         expect(src).toMatch(/joinMountRoot\(instRoot, 'instances', String\(inst.id\)\)/)
         // recoverInterruptedUpdates (idea#448 keeps the root in a const for the compose read)
         expect(src).toMatch(/const root = await d\.mountRoot\(disk\)\n\s*const instDir = joinMountRoot\(root, 'instances', String\(inst.id\)\)/)
-        expect(src).toMatch(/'compose', '-p', String\(id\), '-f', composeFile, 'down'/)
+        expect(src).toMatch(/'compose', '-p', composeProjectFor\(String\(id\)\), '-f', composeFile, 'down'/)
         expect(src).not.toMatch(/path\.join\(instRoot, 'instances'/)
         expect(src).not.toMatch(/path\.join\(await d\.mountRoot\(disk\), 'instances'/)
         expect(src).not.toMatch(/path\.join\(await d\.mountRoot\(disk\), 'apps'/)

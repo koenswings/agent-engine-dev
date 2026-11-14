@@ -23,17 +23,20 @@ import { resourceLock, diskKey } from '../utils/ResourceLock.js';
 import { undockDisk } from "../monitors/usbDeviceMonitor.js";
 import { backupInstance, restoreApp, createBackupDiskConfig, runningBackupOnDisk } from "../monitors/backupMonitor.js";
 import { listBackup, verifyBackup, clearBackupLock, removeBackupRole } from "./BackupVerify.js";
+import { addBackupLink, removeBackupLink } from "./BackupLinks.js";
+import { setBackupMode } from './BackupModeCommand.js'
 import { cancelOperation } from './Operations.js';
 import { DiskArgResult, lookupDiskArg, resolveDiskArg } from './DiskArg.js';
 import { createFilesDisk } from './CreateFilesDisk.js';
 import { summariseDisk, attachTraceResult } from './SummariseDisk.js';
 import { eraseDisk } from './EraseDisk.js';
-import { forgetDisk } from './ForgetDisk.js';
+import { ForgetDiskError, WITH_INSTANCES_FLAG, forgetDisk, forgetDiskWithInstances } from './ForgetDisk.js';
+import { pruneUnusedInstanceNetworksForIds } from '../utils/instanceNetworks.js';
 import { removeInstance } from './RemoveInstance.js';
 import { renameInstance } from './RenameInstance.js';
 import { updateApp, parseUpdateAppArgs } from './UpdateApp.js';
 import { flashCard, cancelFlash, initialiseDisk } from './FlashCard.js';
-import { testContext } from "../../test/testContext.js";
+import { testContext } from "./TestContext.js";
 
 
 import { BrowserWebSocketClientAdapter } from "@automerge/automerge-repo-network-websocket";
@@ -398,6 +401,36 @@ const removeBackupRoleWrapper = async (storeHandle: DocHandle<Store> | null, dis
 }
 
 /**
+ * addBackupLink <instanceIdOrName> <backupDiskIdOrName> (idea#451). Appends one link to
+ * BACKUP.yaml (other links, mode and unknown keys untouched); no processDisk, no backup.
+ */
+const addBackupLinkWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: string, backupDiskId: string) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    await addBackupLink(storeHandle, instanceArg, backupDiskId)
+}
+
+/**
+ * removeBackupLink <instanceIdOrRawId> <backupDiskIdOrName> (idea#451). Removes one link;
+ * never touches backups/<id>/.
+ */
+const removeBackupLinkWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: string, backupDiskId: string) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    await removeBackupLink(storeHandle, instanceArg, backupDiskId)
+}
+
+/**
+ * setBackupMode <diskIdOrName> <immediate|on-demand|scheduled> [HH:MM] (idea#400 PR D).
+ * Switches a docked Backup Disk's mode; the time is valid only with scheduled.
+ * Trace args: { backupDiskId, mode, time: [] | ["HH:MM"] }.
+ */
+const setBackupModeWrapper = async (storeHandle: DocHandle<Store> | null, backupDiskId: string, mode: string, ...time: string[]) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    // time is an optional variadic arg (the parser's only optional form): zero or one token
+    if (time.length > 1) throw new Error(`BAD_TIME: setBackupMode: one time "HH:MM" at most (got ${time.length} tokens)`)
+    await setBackupMode(storeHandle, backupDiskId, mode, time[0])
+}
+
+/**
  * createFilesDisk <diskId> [<shareName…>] (idea#131). The disk ID only (the
  * command has no old name form); the share name takes the rest of the line and
  * defaults to "School Files". Refusals throw, so the trace ends as `error`.
@@ -482,15 +515,46 @@ const copyAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName
 
 const moveAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, sourceDiskId: DiskID, targetDiskId: DiskID) => {
     if (!storeHandle) throw new Error('Store is not available.')
-    await moveApp(storeHandle, instanceName, sourceDiskId, targetDiskId, 'console-command')
+    const result = await moveApp(storeHandle, instanceName, sourceDiskId, targetDiskId, 'console-command')
+    if (result) {
+        const { moveCommandOutcome } = await import('./MoveAppRemote.js')
+        moveCommandOutcome(result)
+        print(result.code === 'MOVED' ? chalk.green(result.text) : chalk.yellow(result.text))
+    }
+}
+
+/** verifyMoveTarget <opId> <instanceId> <expectedBytes> <expectRunning> (idea#79): sent Engine → Engine by a cross-Engine moveApp. */
+const verifyMoveTargetWrapper = async (storeHandle: DocHandle<Store> | null, opId: string, instanceId: string, expectedBytes: string, expectRunning: string) => {
+    if (!storeHandle) throw new Error('Store is not available.')
+    const { verifyMoveTarget } = await import('./MoveAppRemote.js')
+    const v = await verifyMoveTarget(storeHandle, opId, instanceId, expectedBytes, expectRunning)
+    attachTraceResult(v)
+    print(v.ok ? chalk.green(`Move copy ${instanceId} checks out`) : chalk.yellow(`Move copy ${instanceId} does not check out: ${v.detail}`))
 }
 
 export type EjectTarget = DiskArgResult
 
-/** forgetDisk <diskId> (idea#279): remove an undocked, stale disk record. Refusals throw. */
-const forgetDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskId: string) => {
+/**
+ * forgetDisk <diskId> [--with-instances] (idea#279, idea#466): remove an undocked,
+ * stale disk record; with --with-instances also its instance records (only when
+ * the disk is undocked everywhere and no instance can be running). Refusals throw.
+ */
+const forgetDiskWrapper = async (storeHandle: DocHandle<Store> | null, diskId: string, ...options: string[]) => {
     if (!storeHandle) throw new Error("Store is not available. Please connect first.")
-    if (!diskId) throw new Error("Usage: forgetDisk <diskId>")
+    if (!diskId) throw new Error(`Usage: forgetDisk <diskId> [${WITH_INSTANCES_FLAG}]`)
+    const opts = (options ?? []).filter(o => o !== undefined && o !== null && String(o) !== '')
+    const unknown = opts.filter(o => String(o) !== WITH_INSTANCES_FLAG)
+    if (unknown.length) throw new ForgetDiskError('BAD_OPTION', `Unknown option(s) ${unknown.join(' ')}. Usage: forgetDisk <diskId> [${WITH_INSTANCES_FLAG}]`)
+    if (opts.length) {
+        const result = forgetDiskWithInstances(storeHandle, diskId)
+        attachTraceResult(result)
+        // idea#468: prune only this Engine's local unused networks for the
+        // forgotten ids. The store edit is already done; a prune failure is logged
+        // and does not fail the command. Other Engines are not reached.
+        await pruneUnusedInstanceNetworksForIds(result.removedInstances.map(i => String(i.id)))
+        print(chalk.green(`Forgot disk record ${result.diskId} and ${result.removedInstances.length} instance record(s)${result.removedInstances.length ? `: ${result.removedInstances.map(i => i.id).join(', ')}` : ''}`))
+        return
+    }
     const removed = forgetDisk(storeHandle, diskId)
     print(chalk.green(`Forgot disk record ${removed}`))
 }
@@ -570,8 +634,9 @@ export const commands: CommandDefinition[] = [
     { name: "disconnect", execute: disconnect, args: [], scope: 'any' },
     { name: "copyApp", execute: copyAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
     { name: "moveApp", execute: moveAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
+    { name: "verifyMoveTarget", execute: verifyMoveTargetWrapper, args: [{ type: "string", name: "opId" }, { type: "string", name: "instanceId" }, { type: "string", name: "expectedBytes" }, { type: "string", name: "expectRunning" }], scope: 'engine' },
     { name: "ejectDisk", execute: ejectDiskWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
-    { name: "forgetDisk", execute: forgetDiskWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
+    { name: "forgetDisk", execute: forgetDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "options", variadic: true, optional: true }], scope: 'engine' },
     // backupApp / restoreApp (idea#168): the instance is an id or unique name, the disk
     // an id or unique docked name (resolveInstanceArg / resolveDiskArg). The trace arg
     // keys stay 'instanceName' / 'backupDiskId' (Console trace filters read them).
@@ -582,6 +647,9 @@ export const commands: CommandDefinition[] = [
     { name: "verifyBackup", execute: verifyBackupWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }, { type: "string", name: "archive", variadic: true, optional: true }], scope: 'engine' },
     { name: "clearBackupLock", execute: clearBackupLockWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "removeBackupRole", execute: removeBackupRoleWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
+    { name: "addBackupLink", execute: addBackupLinkWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
+    { name: "removeBackupLink", execute: removeBackupLinkWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
+    { name: "setBackupMode", execute: setBackupModeWrapper, args: [{ type: "string", name: "backupDiskId" }, { type: "string", name: "mode" }, { type: "string", name: "time", variadic: true, optional: true }], scope: 'engine' },
     { name: "createFilesDisk", execute: createFilesDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "shareName", variadic: true, optional: true }], scope: 'engine' },
     { name: "removeInstance", execute: removeInstanceWrapper, args: [{ type: "string", name: "instanceId" }], scope: 'engine' },
     { name: "renameInstance", execute: renameInstanceWrapper, args: [{ type: "string", name: "instanceId" }, { type: "string", name: "newName", variadic: true }], scope: 'engine' },

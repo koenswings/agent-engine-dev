@@ -24,11 +24,23 @@ Reference for all Engine CLI commands: inspection, management, and diagnostic co
 with usage examples.
 → [docs/COMMANDS.md](COMMANDS.md)
 
+## BACKUP_SCHEDULE.md
+**Status:** Draft (grows with idea#400 PRs A–D)  ·  **Maintained by:** Axle
+Scheduled Backup Disk: in-Engine daily schedule, due/catch-up rules, uptime fallback and clock
+trust, locks and retries, BACKUP.yaml fields, store summary fields and the `setBackupMode` command.
+→ [docs/BACKUP_SCHEDULE.md](BACKUP_SCHEDULE.md)
+
 ## SCRIPTS.md
 **Status:** Authoritative  ·  **Maintained by:** Axle
 Reference for provisioning and utility scripts (`build-engine`, the `install.sh` wrapper, archive/release scripts): purpose,
 parameters, and usage.
 → [docs/SCRIPTS.md](SCRIPTS.md)
+
+## ENGINE_IMAGE.md
+**Status:** Authoritative  ·  **Maintained by:** Axle
+The offline Engine build into a mounted root filesystem for the release image builder (idea#322 Option A):
+`script/build-engine-offline`, steps, sanitise/verify, lock, first boot, exit codes.
+→ [docs/ENGINE_IMAGE.md](ENGINE_IMAGE.md)
 
 ## PI_FLEET.md
 **Status:** Authoritative  ·  **Maintained by:** Axle

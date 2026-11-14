@@ -4,7 +4,7 @@ import { $, YAML, chalk, fs, os } from 'zx';
 import path from 'path';
 import { deepPrint, log } from '../utils/utils.js';
 import { App, appTitleFromXapp, createAppId, createOrUpdateApp, extractAppName, extractAppVersion } from './App.js'
-import { Instance, Status, createOrUpdateInstance, startInstance } from './Instance.js'
+import { Instance, Status, createOrUpdateInstance, startInstance, markLegacyDottedInstance } from './Instance.js'
 import { AppID, BackupMode, DeviceName, DiskID, DiskType, EngineID, DiskName, InstanceID, PortNumber, ServiceImage, Timestamp } from './CommonTypes.js';
 import { Store, getAppsOfDisk, getInstance, getInstancesOfDisk } from './Store.js';
 import { DocHandle } from '@automerge/automerge-repo';
@@ -17,6 +17,7 @@ import { parseFilesMount, parseUsbMount } from './FilesMount.js';
 import { updateDiskSize } from './DiskSize.js';
 import { recordDiskDetectionFailure } from '../monitors/diskDetection.js';
 import { shouldAutoStart } from './AutoStart.js';
+import { isLegacyDottedInstanceId, LEGACY_DOTTED_INSTANCE_MESSAGE } from '../utils/instanceIds.js';
 
 
 
@@ -25,6 +26,50 @@ import { shouldAutoStart } from './AutoStart.js';
 export interface BackupConfig {
     mode: BackupMode
     links: InstanceID[]
+    /** BACKUP.yaml `schedule` mirrored by the docked Engine (idea#400); null/absent when not set. Daily only. */
+    schedule?: { daily: string } | null
+    /**
+     * Set when BACKUP.yaml has a `schedule` that does not parse (BAD_TIME / BAD_SCHEDULE text); null when valid
+     * or absent (idea#400 PR C, Steve #347 call 5). A scheduled disk with an error runs at the 02:30 default until it is fixed (#351 call 1).
+     */
+    scheduleError?: string | null
+    /**
+     * Instance ids listed in BACKUP.yaml (and in `links`) that are not in the store (idea#400 follow-up).
+     * The yaml is never rewritten or pruned for this; scheduled and immediate runs still skip those links,
+     * and this list is how the Console shows why. Empty when every link has an instance record.
+     */
+    orphanLinks?: InstanceID[]
+}
+
+const sameLinkIds = (a: readonly string[] | undefined, b: readonly string[]): boolean => {
+    const x = a ?? []
+    return x.length === b.length && x.every((id, i) => String(id) === String(b[i]))
+}
+
+/** Links whose instance id is not in instanceDB, in the same order as `links`. */
+export const backupOrphanLinks = (store: Store, links: readonly string[]): InstanceID[] =>
+    (links ?? []).filter(id => !getInstance(store, id as InstanceID)) as InstanceID[]
+
+/** Write `orphanLinks` onto a BackupConfig inside an open store change. Never touches BACKUP.yaml. */
+export const setBackupOrphanLinks = (store: Store, cfg: BackupConfig): void => {
+    const next = backupOrphanLinks(store, cfg.links)
+    if (!sameLinkIds(cfg.orphanLinks, next)) cfg.orphanLinks = next
+}
+
+/**
+ * Refresh `backupConfig.orphanLinks` for one Backup Disk, or every docked Backup Disk.
+ * Store only; BACKUP.yaml is not read or written.
+ */
+export const syncBackupOrphanLinks = (storeHandle: DocHandle<Store>, diskId?: DiskID): void => {
+    storeHandle.change(doc => {
+        const ids = diskId ? [diskId] : (Object.keys(doc.diskDB) as DiskID[])
+        for (const id of ids) {
+            const d = doc.diskDB[id]
+            if (!d?.backupConfig) continue
+            if (!diskId && !d.device) continue
+            setBackupOrphanLinks(doc, d.backupConfig)
+        }
+    })
 }
 
 /** A leftover .backup-in-progress lock found when a Backup Disk docks or the Engine boots (idea#446). */
@@ -60,6 +105,21 @@ export interface Disk {
      * cross-Engine update hint. null/absent = unknown (use an explicit --source).
      */
     appBundles?: AppBundleInfo[] | null;
+    // Scheduled Backup Disk summary (idea#400, proposal §3.6): written by the docked Engine once per run
+    // (clockTrusted/clockReason only on change), never per tick; null/absent on older Engines and when undocked.
+    /** Free space in percent, rounded; does not replace sizeBytes / freeBytes. */
+    freePct?: number | null;
+    /** This Engine's clock is trusted for the schedule (proposal §3.2). */
+    clockTrusted?: boolean | null;
+    /** Why the clock is not trusted (Engine-internal token); null when trusted. */
+    clockReason?: string | null;
+    /** Slots missed before the last scheduled run (BACKUP.yaml mirror). */
+    missedRuns?: number | null;
+    /** Unix ms of the last scheduled run attempt (BACKUP.yaml mirror). */
+    lastAttempt?: Timestamp | null;
+    /** True while fullness cleanup runs (idea#402), with its start time. */
+    cleaning?: boolean | null;
+    cleaningStartedAt?: Timestamp | null;
 }
 
 export interface AppBundleInfo {
@@ -798,6 +858,14 @@ const tracedStartInstance = async (storeHandle: DocHandle<Store>, instance: Inst
     // resets that to Docked, so the gate also reads the operator's last stop
     // (AutoStart.ts). The instance is put back to Stopped so the Console shows it.
     const current = storeHandle.doc()?.instanceDB?.[instance.id] ?? instance
+    // idea#494: listed (removeInstance can clear it) but no compose up, no .env
+    // rewrite, no port allocation. Do this before shouldAutoStart so a Stopped
+    // dotted record is still marked Error with the legacy statusCondition.
+    if (isLegacyDottedInstanceId(String(current.id))) {
+        log(`tracedStartInstance: leaving '${current.id}' listed as Error — ${LEGACY_DOTTED_INSTANCE_MESSAGE} (idea#494)`)
+        markLegacyDottedInstance(storeHandle, current.id)
+        return
+    }
     const gate = shouldAutoStart(storeHandle.doc(), current)
     if (!gate.start) {
         log(`tracedStartInstance: skipping auto-start of '${current.name}' (${current.id}) on disk ${disk.id}: ${gate.reason}`)

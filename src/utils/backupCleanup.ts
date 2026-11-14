@@ -210,6 +210,8 @@ export const defaultRunBackupCleanup = async (opts: {
     mountRoot: string
     currentInstanceId: string
     phase: 'before' | 'after'
+    /** Called once, just before the first archive is deleted (Disk.cleaning, idea#400 PR C). */
+    onDeleteStart?: () => void
 }): Promise<CleanupResult> => {
     const empty: CleanupResult = { status: 'ok', deleted: [], compacted: false }
     if (!cleanupIsEnabled()) return { ...empty, status: 'skipped' }
@@ -259,6 +261,7 @@ export const defaultRunBackupCleanup = async (opts: {
         return true
     }
 
+    if (!enough(usage.freeBytes + reclaimed)) opts.onDeleteStart?.()
     while (!enough(usage.freeBytes + reclaimed)) {
         const next = pickRoundRobinDeletion(byInstance, deletedCount)
         if (!next) break

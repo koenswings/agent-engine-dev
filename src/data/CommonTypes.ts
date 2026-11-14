@@ -39,6 +39,35 @@ export type UserID = Brand<string, "USERID">
 export type DiskType = 'app' | 'backup' | 'empty' | 'upgrade' | 'files' | 'system'
 export type BackupMode = 'immediate' | 'on-demand' | 'scheduled'
 
+/**
+ * Per-instance backup result code in Instance.lastResult / backupHistory (idea#400 contract,
+ * Steve's decisions 13 Nov 2026). HOOK_POST_WARNING is a success with a warning.
+ * FAILED: any other failure (borg error, bad x-app.backup, …) (Steve, #347 call 1).
+ */
+export type BackupResultCode =
+  | 'OK'
+  | 'HOOK_POST_WARNING'
+  | 'SKIPPED_LOCKED'
+  | 'HOOK_FALLBACK'
+  | 'INTERRUPTED'
+  | 'BACKUP_DISK_FULL'
+  | 'HELPER_OUTDATED'
+  | 'APP_DISK_NOT_DOCKED'
+  | 'FAILED'
+
+/** The App's backup method that ran (x-app.backup.method), not packed with the result code. */
+export type BackupMethodUsed = 'stop' | 'hook' | 'live' | 'none'
+
+/** One backup result: Instance.lastResult and each Instance.backupHistory entry. */
+export interface BackupResult {
+  time: Timestamp
+  method: BackupMethodUsed
+  result: BackupResultCode
+}
+
+/** Instance.backupHistory keeps the newest this many results (proposal §3.6). */
+export const BACKUP_HISTORY_LENGTH = 7
+
 export type OperationStatus = 'Pending' | 'Running' | 'Done' | 'Failed' | 'Cancelled'
 export type OperationKind =
   | 'copyApp'
@@ -71,7 +100,8 @@ export type OperationKind =
  * post-move         — automatic stop/restart issued by moveApp
  *                     (CopyMoveApp.ts: stop before move, restart on failure)
  * disk-docked       — disk plugged in; engine auto-starts all instances stored on it
- *                     (Disk.ts: tracedStartInstance via processInstance)
+ *                     (Disk.ts: tracedStartInstance via processInstance), and an immediate-mode
+ *                     Backup Disk backs up its links (backupMonitor.ts: processBackupDisk, idea#400)
  * disk-undocked     — disk removed; engine auto-stops all running instances on it
  *                     (usbDeviceMonitor.ts: stopInstance loop)
  * backup-pre-stop   — backup monitor stops instance before taking snapshot
@@ -86,6 +116,9 @@ export type OperationKind =
  * usb-stick         — a FAT/exFAT stick with a top-level kolibri folder was mounted;
  *                     the Engine starts the docked channel builder (idea#193 §8.2a,
  *                     ChannelBuilderAutoStart.ts). Not an operator cause.
+ * scheduled-backup  — the scheduled Backup Disk tick ran a linked instance's backup (idea#400 PR C,
+ *                     backupScheduler.ts). No caller waits: a held lock records SKIPPED_LOCKED. Crash
+ *                     recovery never retries it (Steve, Q2): the stale lock goes to the idea#446 flow.
  * crash-recovery    — engine restarted with a Pending/Running operation in the store;
  *                     recoverInterruptedOperations() re-queues idempotent ops
  *                     (Operations.ts + start.ts)
@@ -103,6 +136,7 @@ export type OperationCause =
   | 'backup-stale-lock'
   | 'backup-app-docked'
   | 'crash-recovery'
+  | 'scheduled-backup'
   | 'usb-stick'
 
 export interface OperationSubject {
@@ -135,6 +169,8 @@ export interface Operation {
    * (POWER_OFF_FAILED). Absent on other kinds.
    */
   safeToRemove?: boolean
+  /** cross-Engine moveApp only (idea#79): steps, verify verdict, result. See MoveAppShapes.ts. */
+  move?: import('./MoveAppShapes.js').MoveProgress
 }
 
 // References to top-level YMaps and YArrays in the Yjs document
