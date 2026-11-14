@@ -51,7 +51,7 @@ import type { InstanceID } from './CommonTypes.js'
 import { lookupLocalInstanceArg } from './InstanceArg.js'
 import { diskPath, appDataRoot, Disk } from './Disk.js'
 import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
-import { runAppData, removalQuarantineArgs, helperAtLeast } from '../utils/appDataHelper.js'
+import { runAppData, removalQuarantineArgs, quarantineSnapshotArgs, parseQuarantineSnapshot, helperAtLeast } from '../utils/appDataHelper.js'
 import { log } from '../utils/utils.js'
 import { composeDownAt, pruneUnusedInstanceNetworks, COMPOSE_PROJECT_LABEL } from '../utils/instanceNetworks.js'
 import { checkInstanceIdForDocker, composeProjectFor } from '../utils/instanceIds.js'
@@ -103,6 +103,8 @@ export interface RemoveDeps {
     removeProjectContainers: (id: InstanceID) => Promise<void>
     listVolumes: (id: InstanceID) => Promise<string[]>
     quarantine: (disk: Disk, id: InstanceID) => Promise<string>
+    /** idea#396 / helper v14: move .pre-update/<id> aside (strict ids only). */
+    quarantineSnapshot: (disk: Disk, id: InstanceID) => Promise<string>
     /** Refresh Disk.preUpdateSnapshots / preUpdateBytes / quarantineBytes (idea#428). */
     refreshSnapshots: (disk: Disk) => Promise<void>
     /** idea#468: prune unused compose-project networks for this instance, locally. */
@@ -121,6 +123,7 @@ const defaultDeps: RemoveDeps = {
         } catch { return [] }
     },
     quarantine: async (disk, id) => (await runAppData(removalQuarantineArgs(await appDataRoot(disk), String(id)))).trim(),
+    quarantineSnapshot: async (disk, id) => parseQuarantineSnapshot(await runAppData(quarantineSnapshotArgs(await appDataRoot(disk), String(id)))),
     refreshSnapshots: async () => { /* replaced in removeInstance with a storeHandle-bound default */ },
     pruneNetworks: async (id) => { await pruneUnusedInstanceNetworks(String(id), REMOVAL) },
 }
@@ -183,6 +186,19 @@ export const removeInstance = async (
             throw new RemoveError('COMPOSE_DOWN_FAILED', msg)
         }
         const keptVolumes = await d.listVolumes(inst.id)
+        if (!idCheck.legacy) {
+            const snapHelper = await d.helperProblem(14)
+            if (!snapHelper) {
+                try {
+                    const dest = await d.quarantineSnapshot(disk, inst.id)
+                    log(dest
+                        ? `removeInstance: ${inst.id}: pre-update snapshot moved to ${dest}`
+                        : `removeInstance: ${inst.id}: no pre-update snapshot to quarantine`)
+                } catch (e) {
+                    log(`removeInstance: ${inst.id}: quarantine-snapshot failed: ${(e as Error).message}; continuing with the instance quarantine`)
+                }
+            }
+        }
         let quarantinePath: string
         try {
             quarantinePath = await d.quarantine(disk, inst.id)

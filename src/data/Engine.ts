@@ -224,14 +224,50 @@ export const checkBackupCleanupCapability = async (
 /** Test seam: drop the cached startup check so later cases start from "not checked". */
 export const resetBackupCleanupCapabilityForTests = (): void => { backupCleanupHelperOk = null }
 
+/** idea#396: advertised only when the app-data helper is at v14 or newer */
+export const PRE_UPDATE_QUARANTINE_CAPABILITY = 'preUpdateQuarantine'
+const PRE_UPDATE_QUARANTINE_HELPER_MIN = 14
+const PRE_UPDATE_QUARANTINE_HELPER_CHECK_MS = 5_000
+let preUpdateQuarantineHelperOk: boolean | null = null
+
+/**
+ * Once at startup, decide whether to advertise `preUpdateQuarantine`. Never throws:
+ * an older, missing, failing or timed-out helper leaves the capability out.
+ */
+export const checkPreUpdateQuarantineCapability = async (
+  run?: AppDataRunner,
+  timeoutMs: number = PRE_UPDATE_QUARANTINE_HELPER_CHECK_MS,
+): Promise<boolean> => {
+  try {
+    const outdated = await withTimeout(
+      helperAtLeast(PRE_UPDATE_QUARANTINE_HELPER_MIN, 'preUpdateQuarantine', run),
+      timeoutMs,
+    )
+    preUpdateQuarantineHelperOk = outdated === null
+  } catch {
+    preUpdateQuarantineHelperOk = false
+  }
+  if (preUpdateQuarantineHelperOk) {
+    log(`preUpdateQuarantine capability advertised (app-data helper v${PRE_UPDATE_QUARANTINE_HELPER_MIN}+)`)
+  } else {
+    log(`preUpdateQuarantine capability omitted (app-data helper older than v${PRE_UPDATE_QUARANTINE_HELPER_MIN}, missing, error or timeout)`)
+  }
+  return preUpdateQuarantineHelperOk
+}
+
+/** Test seam: drop the cached startup check so later cases start from "not checked". */
+export const resetPreUpdateQuarantineCapabilityForTests = (): void => { preUpdateQuarantineHelperOk = null }
+
 /** The capability list written at this startup */
 export const engineCapabilities = (
   helperInstalled: boolean = flashHelperInstalled(),
   cleanupHelperOk: boolean = backupCleanupHelperOk === true,
+  quarantineHelperOk: boolean = preUpdateQuarantineHelperOk === true,
 ): string[] => {
   const caps = [...ENGINE_CAPABILITIES]
   if (helperInstalled) caps.push(FLASH_CARD_CAPABILITY)
   if (cleanupHelperOk) caps.push(BACKUP_CLEANUP_CAPABILITY)
+  if (quarantineHelperOk) caps.push(PRE_UPDATE_QUARANTINE_CAPABILITY)
   return caps
 }
 

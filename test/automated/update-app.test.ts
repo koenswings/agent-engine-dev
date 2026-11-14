@@ -458,3 +458,54 @@ describe('updateAvailable after updateApp (idea#459)', () => {
 
     })
 })
+
+describe('updateApp excludes and preUpdateGate (idea#396)', () => {
+    it('INVALID_EXCLUDE for a volumes/ path in backup.exclude before estimate or stop', async () => {
+        await fs.outputFile(`${tmp}/instances/i1/compose.yaml`, compose('1.0') + '  backup:\n    exclude: [volumes/db]\n')
+        const estimated: string[][] = []
+        const msg = await codeOf(updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps({
+            estimate: async (_d, _id, ex = []) => { estimated.push(ex); return { folderBytes: 1000, volumeBytes: 0, freeBytes: 50 * 1024 ** 3 } },
+        })))
+        expect(msg).toMatch(/^INVALID_EXCLUDE: /)
+        expect(msg).toMatch(/volumes\/db/)
+        expect(msg).toMatch(/nothing was stopped or changed/)
+        expect(calls).toEqual([])
+        expect(estimated).toEqual([])
+        expect(inst().status).toBe('Running')
+        expect(Object.keys(h.doc().operationDB ?? {})).toEqual([])
+    })
+
+    it('maps a helper refused: from estimate to INVALID_EXCLUDE; nothing is stopped', async () => {
+        const msg = await codeOf(updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps({
+            estimate: async () => { throw new Error('idea-app-data estimate refused: exclude \'data/keys\' points outside the instance\'s data folder') },
+        })))
+        expect(msg).toMatch(/^INVALID_EXCLUDE: /)
+        expect(msg).toMatch(/points outside the instance's data folder/)
+        expect(msg).toMatch(/nothing was stopped or changed/)
+        expect(calls).toEqual([])
+    })
+
+    it('BUNDLE_CONTAINS_EXCLUDED names x-app.snapshotExclude when that list is hit', async () => {
+        await fs.outputFile(`${tmp}/instances/i1/compose.yaml`, compose('1.0') + '  snapshotExclude: [secret]\n')
+        await fs.outputFile(`${tmp}/apps/kolibri-1.1/data/secret/token`, 'x')
+        const msg = await codeOf(updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps()))
+        expect(msg).toMatch(/^BUNDLE_CONTAINS_EXCLUDED: /)
+        expect(msg).toMatch(/x-app\.snapshotExclude/)
+        expect(msg).toMatch(/data\/secret/)
+        expect(calls).toEqual([])
+    })
+
+    it('writes preUpdateGate on a trusted clock and leaves at null when untrusted', async () => {
+        const r = await updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps({
+            clockTrusted: () => true, bootId: () => 'boot-a', uptimeS: () => 12, now: () => 1_000_000,
+        }))
+        expect(r.steps).toContain('Health')
+        expect(inst().preUpdateGate).toEqual({ at: 1_000_000, bootId: 'boot-a', uptimeS: 12 })
+        // a second update's snapshot clears the previous gate, then Health writes a new one
+        await fs.outputFile(`${tmp}/apps/kolibri-1.2/compose.yaml`, compose('1.2'))
+        await updateApp(h, 'i1', 'kolibri-1.2', ME, {}, deps({
+            clockTrusted: () => false, bootId: () => 'boot-a', uptimeS: () => 40, now: () => 2_000_000,
+        }))
+        expect(inst().preUpdateGate).toEqual({ at: null, bootId: 'boot-a', uptimeS: 40 })
+    })
+})

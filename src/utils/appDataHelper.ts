@@ -356,7 +356,7 @@ export const appDataHelperProblem = async (run: AppDataRunner = runAppData): Pro
  * Startup check (softened, Steve 2026-10-28): the Engine ALWAYS starts. A missing,
  * unrunnable or different helper is logged loudly and returned; each command that
  * needs a newer helper refuses on its own with HELPER_OUTDATED (helperAtLeast):
- * removeInstance needs v4, updateApp v5. isDev machines skip the check.
+ * removeInstance needs v4, updateApp v14. isDev machines skip the check.
  */
 export const assertAppDataHelper = async (run: AppDataRunner = runAppData): Promise<string | null> => {
     if (config.settings.isDev) {
@@ -416,7 +416,15 @@ export const snapshotArgs = (root: string, id: string, excludes: string[] = []):
 export const restoreSnapshotArgs = (root: string, id: string, excludes: string[] = []): string[] =>
     ['restore-snapshot', checkRoot(root), checkId(id), ...excludeTokens(excludes)]
 export const snapshotsArgs = (root: string): string[] => ['snapshots', checkRoot(root)]
-export const estimateArgs = (root: string, id: string): string[] => ['estimate', checkRoot(root), checkId(id)]
+export const estimateArgs = (root: string, id: string, excludes: string[] = []): string[] =>
+    ['estimate', checkRoot(root), checkId(id), ...excludeTokens(excludes)]
+/**
+ * idea#396 / helper v14: move `.pre-update/<id>` to
+ * `.idea-quarantine/pre-update-<id>-<stamp>/`. Strict ids only. A missing
+ * snapshot is success with empty stdout (nothing to quarantine).
+ */
+export const quarantineSnapshotArgs = (root: string, id: string): string[] =>
+    ['quarantine-snapshot', checkRoot(root), checkId(id)]
 /** `estimate` result: "<folder kb> <volumes kb> <free kb>" (read-only; nothing is stopped). */
 export const parseEstimate = (out: string): { folderBytes: number, volumeBytes: number, freeBytes: number } => {
     const m = lastLine(out).match(/^(\d+) (\d+) (\d+)$/)
@@ -426,6 +434,9 @@ export const parseEstimate = (out: string): { folderBytes: number, volumeBytes: 
 
 /** The helper prints rsync progress first; its result is the last non-empty line. */
 export const lastLine = (out: string): string => out.trim().split('\n').map(s => s.trim()).filter(Boolean).pop() ?? ''
+
+/** Destination path from quarantine-snapshot stdout, or '' when there was nothing to move. */
+export const parseQuarantineSnapshot = (out: string): string => lastLine(out)
 
 export interface SnapshotVolume { name: string, bytes: number, exportMs: number }
 export interface SnapshotResult {
