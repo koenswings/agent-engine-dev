@@ -5,7 +5,10 @@
  * Engines also wrote legacy dotted ids such as
  * `nextcloud-yj8ral61js46bphogbi.backup-20261027-181633`. Those are accepted on
  * the removal path only (removeInstance and helper `quarantine`, v13), never for
- * install, start, update, copy, move or erase.
+ * install, start, update, copy, move or erase. On dock or boot they stay listed
+ * (so removeInstance can clear them) with status Error, and they get no compose
+ * up, no .env rewrite and no port allocation (idea#494). Manual startInstance
+ * is refused with the same message.
  *
  * Compose does not keep the dot. A project started with `docker compose up` in
  * `instances/<id>` gets the folder name normalised the way compose-go
@@ -81,3 +84,18 @@ export const containerInInstanceProject = (labels: Record<string, string> | null
     const p = composeProjectName(id)
     return Boolean(p) && (labels ?? {})[COMPOSE_PROJECT_LABEL] === p
 }
+
+/**
+ * Compose default container name is `<project>-<service>-<n>`. Exact project
+ * only: `nextcloud-…bi-nextcloud-1` belongs to the live id, but
+ * `nextcloud-…bibackup-…-nextcloud-1` does not (idea#479, engine#367).
+ * Never `startsWith(id)`: that is a prefix match on the backup stack.
+ */
+export const containerNameBelongsToInstance = (name: string, id: string): boolean => {
+    const p = composeProjectName(id)
+    if (!p || !name) return false
+    return name === p || name.startsWith(`${p}-`)
+}
+
+/** statusCondition / startInstance refusal for a legacy dotted id (idea#494). */
+export const LEGACY_DOTTED_INSTANCE_MESSAGE = 'Legacy instance id with a dot; remove it and reinstall'
