@@ -488,3 +488,59 @@ describe('removeDemo uses the real removeInstance lock check (engine#369 follow-
         }
     })
 })
+
+describe('setupDemo local-pack name filter (engine#369)', () => {
+    const writeAppTar = async (app: 'kolibri' | 'nextcloud', ver: number, dest: string) => {
+        const root = path.join(tmp, `${app}-pack-v${ver}`)
+        await fs.outputFile(path.join(root, 'CREDITS.txt'), CREDITS)
+        const doc = {
+            schemaVersion: 1, packVersion: ver, app, minAppVersion: '1.2',
+            bytes: Buffer.byteLength(CREDITS), credits: 'CREDITS.txt',
+            hooks: [{ id: 'seed', needs: 'stopped' }, { id: 'classwork', needs: 'running' }],
+            files: [{ path: 'CREDITS.txt', sha256: sha(CREDITS), bytes: Buffer.byteLength(CREDITS) }],
+        }
+        await fs.outputFile(path.join(root, 'pack.json'), JSON.stringify(doc, null, 2))
+        const { $ } = await import('zx')
+        await fs.ensureDir(path.dirname(dest))
+        await $`tar -cf ${dest} -C ${root} pack.json CREDITS.txt`
+    }
+
+    it('a nextcloud-only stick for kolibri falls back to GitHub, or NO_SOURCE when offline', async () => {
+        const idea = path.join(tmp, 'IDEA-DEMO')
+        await writeAppTar('nextcloud', 1, path.join(idea, 'idea-demo-nextcloud-v1.tar'))
+        expect(await codeOf(setupDemo(h, 'd1', ['kolibri'], ME, deps({ hasInternet: async () => false })))).toMatch(/^NO_SOURCE: /)
+        expect(Object.keys(h.doc().operationDB ?? {})).toHaveLength(0)
+
+        const payload = path.join(tmp, 'payload')
+        await writeValidPack(payload, 4)
+        const ghTar = path.join(tmp, 'idea-demo-kolibri-v4.tar')
+        const { $ } = await import('zx')
+        await $`tar -cf ${ghTar} -C ${payload} pack.json CREDITS.txt`
+        const digest = sha(await fs.readFile(ghTar))
+        await fs.outputFile(path.join(tmp, 'apps', 'kolibri-1.2-0.19.5', 'app.yaml'), appYaml(digest, (await fs.stat(ghTar)).size, 3))
+        const r = await setupDemo(h, 'd1', ['kolibri'], ME, deps({
+            hasInternet: async () => true,
+            download: async (url: string, dest: string) => { downloads.push(url); await fs.copy(ghTar, dest) },
+        }))
+        expect(r.code).toBe('DEMO_READY')
+        expect(r.apps[0].source).toBe('github')
+        expect(downloads).toEqual(['https://example.invalid/idea-demo-kolibri-v4.tar'])
+    })
+
+    it('the matching kolibri tar is still used, even when a nextcloud tar is beside it', async () => {
+        const idea = path.join(tmp, 'IDEA-DEMO')
+        await writeAppTar('nextcloud', 1, path.join(idea, 'idea-demo-nextcloud-v1.tar'))
+        const kTar = path.join(idea, 'idea-demo-kolibri-v4.tar')
+        await writeAppTar('kolibri', 4, kTar)
+        const digest = sha(await fs.readFile(kTar))
+        await fs.outputFile(path.join(tmp, 'apps', 'kolibri-1.2-0.19.5', 'app.yaml'), appYaml(digest, (await fs.stat(kTar)).size, 3))
+        const r = await setupDemo(h, 'd1', ['kolibri'], ME, deps({
+            hasInternet: async () => true,
+            download: async (url: string) => { downloads.push(url); throw new Error('should not download') },
+        }))
+        expect(r.code).toBe('DEMO_READY')
+        expect(r.apps[0].source).toBe('local')
+        expect(r.apps[0].packVersion).toBe('4')
+        expect(downloads).toEqual([])
+    })
+})

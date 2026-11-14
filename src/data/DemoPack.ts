@@ -326,23 +326,38 @@ const packJsonAt = async (dir: string, expectedApp: DemoAppName): Promise<PackJs
 }
 
 const considerDir = async (dir: string, app: DemoAppName, minVersion: number, out: LocatedPack[]): Promise<void> => {
+    const packPath = path.join(dir, 'pack.json')
+    if (!await fs.pathExists(packPath)) return
     const pack = await packJsonAt(dir, app)
-    if (!pack) return
+    if (!pack) {
+        log(`setupDemo: skipping ${packPath} (not a usable ${app} pack)`)
+        return
+    }
     if (pack.packVersion < minVersion) return
     out.push({ source: 'local', packVersion: pack.packVersion, kind: 'dir', path: dir })
+}
+
+/** Release tar for one demo app: idea-demo-<app>-vN.tar (N is a non-negative integer). */
+export const ideaDemoTarName = (app: DemoAppName, name: string): number | null => {
+    const m = String(name).match(new RegExp(`^idea-demo-${app}-v(\\d+)\\.tar$`))
+    return m ? Number(m[1]) : null
 }
 
 const considerTar = async (tar: string, app: DemoAppName, minVersion: number, pin: AppDemoPackPin | null, out: LocatedPack[]): Promise<void> => {
     if (!await fs.pathExists(tar) || !(await fs.stat(tar)).isFile()) return
     const base = path.basename(tar)
-    // A name like idea-demo-kolibri-v4.tar is enough to try; version is confirmed after extract.
-    const m = base.match(new RegExp(`^idea-demo-${app}-v(\\d+)\\.tar$`))
-    const namedVersion = m ? Number(m[1]) : null
-    if (namedVersion !== null && namedVersion < minVersion) return
+    // Only this app's release-named tar. A nextcloud tar on a kolibri setup must
+    // not be offered (that used to extract as INVALID_PACK instead of GitHub / NO_SOURCE).
+    const namedVersion = ideaDemoTarName(app, base)
+    if (namedVersion === null) {
+        log(`setupDemo: skipping ${tar} (not idea-demo-${app}-vN.tar)`)
+        return
+    }
+    if (namedVersion < minVersion) return
     const tarSha256 = pin && base === pin.file ? pin.sha256 : undefined
     out.push({
         source: 'local',
-        packVersion: namedVersion ?? minVersion,
+        packVersion: namedVersion,
         kind: 'tar',
         path: tar,
         tarSha256,
