@@ -20,6 +20,7 @@ import { rootfsSteps, runRootfsBuild, engineCloneCommand, consoleCloneCommand, R
 import { pinNpmTools, writeReport, LOCKED_FILE_SPECS } from '../../src/install/engineImageCli.js'
 import { bootShEnginePathSed, BOOT_SH_ENGINE_PATH } from '../../src/data/Engine.js'
 import { diskIdWithoutHardware, hasDiskId, ensureSystemMeta } from '../../src/data/Meta.js'
+import { PEER_KEY_PATH } from '../../src/utils/peerSsh.js'
 
 const ENGINE = '/home/pi/idea/agents/agent-engine-dev'
 const COMMIT = 'a'.repeat(40)
@@ -188,6 +189,9 @@ const addIdentity = async (root: string) => {
     await fs.ensureDir(R('etc/ssh/idea_authorized_keys')); await fs.writeFile(R('etc/ssh/idea_authorized_keys/pi'), 'restrict,command="/usr/local/sbin/idea-peer-gate" ssh-ed25519 AAAA peer\n')
     await fs.ensureDir(R('home/pi/.ssh'))
     for (const n of ['id_ed25519', 'id_ed25519.pub', 'authorized_keys']) await fs.writeFile(R(`home/pi/.ssh/${n}`), 'x\n')
+    // idea#524: the per-Pi Engine peer key and the v15 peer-owner stamp of a Pi that has run
+    for (const n of ['idea_engine_ed25519', 'idea_engine_ed25519.pub']) await fs.writeFile(R(`home/pi/.ssh/${n}`), 'x\n')
+    await fs.ensureDir(R('etc/idea')); await fs.writeFile(R('etc/idea/peer-owner'), 'ENGINE_AA000000000000055000 2VroEUvDkmYsDAwE5oG9YeFNadWH\n')
 }
 
 describe('sanitise + verify', () => {
@@ -201,7 +205,8 @@ describe('sanitise + verify', () => {
         await addIdentity(root)
         const p = await verifyRootfs(ctx())
         for (const s of ['/META.yaml', 'ssh_host_ed25519_key', 'tailscaled.state', 'debug-authkey', 'machine-id is not empty', 'hostname', 'dump.pm2', 'store-data', 'extra-store.txt', 'policy-rc.d', '.idea-build',
-            '/etc/ssh/idea_authorized_keys/pi', '/home/pi/.ssh/id_ed25519', '/home/pi/.ssh/id_ed25519.pub', '/home/pi/.ssh/authorized_keys'])
+            '/etc/ssh/idea_authorized_keys/pi', '/home/pi/.ssh/id_ed25519', '/home/pi/.ssh/id_ed25519.pub', '/home/pi/.ssh/authorized_keys',
+            '/home/pi/.ssh/idea_engine_ed25519', '/home/pi/.ssh/idea_engine_ed25519.pub', '/etc/idea/peer-owner'])
             expect(p.join('\n')).toContain(s)
         const done = await sanitiseRootfs({ root, enginePath: ENGINE, trackedStoreIdentity: Object.keys(STORE) })
         expect(done.length).toBeGreaterThan(5)
@@ -211,7 +216,8 @@ describe('sanitise + verify', () => {
         expect(await sanitiseRootfs({ root, enginePath: ENGINE, trackedStoreIdentity: Object.keys(STORE) })).toEqual([]) // idempotent
         // idea#453: the baked operator list survives sanitise; per-device login keys do not
         expect(await fs.readFile(path.join(root, OPERATOR_KEYS_FILE.slice(1)), 'utf8')).toBe(await fs.readFile(path.join(ASSETS, OPERATOR_KEYS_ASSET), 'utf8'))
-        for (const n of ['etc/ssh/idea_authorized_keys/pi', 'home/pi/.ssh/id_ed25519', 'home/pi/.ssh/id_ed25519.pub', 'home/pi/.ssh/authorized_keys']) expect(await fs.pathExists(path.join(root, n))).toBe(false)
+        for (const n of ['etc/ssh/idea_authorized_keys/pi', 'home/pi/.ssh/id_ed25519', 'home/pi/.ssh/id_ed25519.pub', 'home/pi/.ssh/authorized_keys',
+            'home/pi/.ssh/idea_engine_ed25519', 'home/pi/.ssh/idea_engine_ed25519.pub', 'etc/idea/peer-owner']) expect(await fs.pathExists(path.join(root, n))).toBe(false)
     })
     it('sanitise never touches store-template.json; verify fails if it changed', async () => {
         const f = path.join(root, ENGINE, 'store-identity/store-template.json')
@@ -747,6 +753,8 @@ describe('rootfs build plan (stubbed runner and installers)', () => {
     })
     it('identity list covers the INTERFACE.md items', () => {
         for (const p of ['META.yaml', 'etc/ssh/ssh_host_*', 'var/lib/tailscale/*', 'etc/tailscale/debug-authkey']) expect(IDENTITY_PATHS).toContain(p)
+        // idea#524: the per-Pi Engine peer key (PeerAccess PEER_KEY_PATH) + .pub and the peer-owner stamp
+        for (const p of [PEER_KEY_PATH.slice(1), PEER_KEY_PATH.slice(1) + '.pub', 'etc/idea/peer-owner']) expect(IDENTITY_PATHS).toContain(p)
         expect(PRELOAD_DOCKER_DIR).toBe('/var/lib/idea/preload/docker')
     })
 })

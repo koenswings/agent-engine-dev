@@ -47,8 +47,10 @@ No SSH, nothing started, no device identity. Inside `chroot <MNT>`:
    `AuthorizedKeysFile` (`/etc/ssh/idea_operator_keys/%u`). `10-idea-login.conf` (sorted before `10-idea-peer.conf`
    and any `50-cloud-init.conf`; the first value wins) sets `PasswordAuthentication no` and
    `KbdInteractiveAuthentication no`. Then `sshd -t`. Both files are locked files. Sanitise never removes the
-   operator list (it is not in `IDENTITY_PATHS`); it still removes `~pi/.ssh/authorized_keys`, `id_ed25519*` and the
-   peer keys `idea_authorized_keys/pi`. Adding or rotating an operator key = edit the list, new image, reflash.
+   operator list (it is not in `IDENTITY_PATHS`); it still removes `~pi/.ssh/authorized_keys`, `id_ed25519*`, the
+   peer keys `idea_authorized_keys/pi`, and (koenswings/idea#524) the per-Pi Engine peer key
+   `~pi/.ssh/idea_engine_ed25519` (+ `.pub`) and the peer-owner stamp `/etc/idea/peer-owner`, which a Pi that has run
+   would otherwise copy into every card (peers distrust a shared key; sync-peers refuses PEER_OWNER_MISMATCH). Adding or rotating an operator key = edit the list, new image, reflash.
 4. Docker from the pinned debs, enabled, not started; pi in the docker group; `daemon.json`.
 5. Tailscale from the pinned tarball (`tailscale` in /usr/bin, `tailscaled` in /usr/sbin, as the Debian package) + unit, NOT enabled, no key, no state
    (idea-engine-identity enables it on first boot when the card carries a key, engine#291).

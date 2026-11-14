@@ -453,6 +453,12 @@ export const IDENTITY_PATHS = [
     'home/pi/.ssh/id_ed25519',
     'home/pi/.ssh/id_ed25519.pub',
     'home/pi/.ssh/authorized_keys',
+    // idea#524: the per-Pi Engine key (PeerAccess.ts PEER_KEY_PATH) and the v15 peer-owner stamp
+    // (idea-app-data sync-peers). A copied key makes peers distrust every copy (shared key);
+    // a copied owner stamp makes sync-peers refuse PEER_OWNER_MISMATCH on every copy.
+    'home/pi/.ssh/idea_engine_ed25519',
+    'home/pi/.ssh/idea_engine_ed25519.pub',
+    'etc/idea/peer-owner',
     'root/.idea-build',
     'usr/sbin/policy-rc.d',
 ]
