@@ -303,7 +303,7 @@ const rebootWrapper = async (storeHandle: DocHandle<Store> | null) => {
 export { resolveInstanceArg } from './InstanceArg.js'
 
 /**
- * backupApp <instanceIdOrName> <backupDiskIdOrName> (idea#168 r29@97). The
+ * backupApp <instanceIdOrName> [backupDiskIdOrName] (idea#168 r29@97, engine#394). The
  * instance goes through resolveInstanceArg, the disk through resolveDiskArg:
  * an id, or a unique name (a disk name with a warning). With no disk argument,
  * only a Backup Disk docked on this Engine is used, preferring the instance's
@@ -685,9 +685,11 @@ export const commands: CommandDefinition[] = [
     { name: "ejectDisk", execute: ejectDiskWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
     { name: "forgetDisk", execute: forgetDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "options", variadic: true, optional: true }], scope: 'engine' },
     // backupApp / restoreApp (idea#168): the instance is an id or unique name, the disk
-    // an id or unique docked name (resolveInstanceArg / resolveDiskArg). The trace arg
-    // keys stay 'instanceName' / 'backupDiskId' (Console trace filters read them).
-    { name: "backupApp", execute: backupAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
+    // an id or unique docked name (resolveInstanceArg / resolveDiskArg). backupApp's
+    // disk is optional (engine#394): omitted, the wrapper picks a Backup Disk docked
+    // on this Engine. The trace arg keys stay 'instanceName' / 'backupDiskId'
+    // (Console trace filters read them; backupDiskId is null when omitted).
+    { name: "backupApp", execute: backupAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId", optional: true }], scope: 'engine' },
     { name: "restoreApp", execute: restoreAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }], scope: 'engine' },
     { name: "createBackupDisk", execute: createBackupDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "mode" }, { type: "string", name: "instanceNames", variadic: true }], scope: 'engine' },
     { name: "listBackup", execute: listBackupWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "backupDiskId" }, { type: "string", name: "archive", variadic: true, optional: true }], scope: 'engine' },
